@@ -1,0 +1,345 @@
+-- | A program, from text to what the tools report:
+-- |
+-- |   text -[Heff.Parse]-> notation -[Heff.Elab]-> core -[Heff.Eval | Heff.Compile]-> values, code
+-- |
+-- | A program is files; a file is elaborated on top of the definitions of
+-- | the files it imports (`Heff.Load` finds them, in order).
+module Heff.Driver
+  ( Source
+  , Checked
+  , elabProgram
+  , errorsIn
+  , renderFileDiags
+  , definitions
+  , WatchInfo
+  , watches
+  , TestReport
+  , testFile
+  , promote
+  , evaluate
+  , findApp
+  , findProgram
+  , explain
+  , typeAt
+  , definitionAt
+  ) where
+
+import Prelude
+
+import Data.Array as A
+import Data.Lazy (force)
+import Data.List (List(..))
+import Data.Map as Map
+import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
+import Data.String as S
+import Data.String.CodeUnits as SCU
+import Data.Tuple (Tuple(..))
+import Heff.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
+import Heff.Core.Readback (readbTy)
+import Heff.Core.Rename (renameTy)
+import Heff.Core.Syntax (El(..), Ty(..))
+import Heff.Elab.Environment (Info)
+import Heff.Elab.Top (TopResult, topModule, topWith)
+import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
+import Heff.Parse.Notation (Diag, Ntn, Severity(..))
+import Heff.Parse.Notation as F
+import Heff.Parse.Fixity (Fixities, emptyFixities, union)
+import Heff.Support.Common (operatorName)
+import Heff.Parse.Surface (readProgram, readProgramWith)
+import Heff.Print.Surface (printTy)
+import Heff.Support.Diagnostic (lineCol, renderDiag)
+import Heff.Support.Pretty as P
+
+-- | a file as the loader found it: `module` is its name (`parse.surface`
+-- | for `parse/surface.hf`), `text` its source with the import lines blanked
+-- | out, `deps` the modules it imports
+type Source = { path :: String, module :: String, source :: String, text :: String, deps :: Array String }
+
+-- | a file, elaborated: `top.globals` has everything it needs, `own` its
+-- | own definitions (by name, and the key each is stored under,
+-- | `module.name`), `fixities` the fixities it declares
+type Checked = { path :: String, module :: String, source :: String, text :: String, ntns :: Array Ntn, top :: TopResult, diags :: Array Diag, own :: Array { name :: String, key :: String }, deps :: Array String, fixities :: Fixities }
+
+-- | read a file into notation; a capitalised name is a definition if
+-- | `known` says so; `fixities`: those of what it imports
+readSource :: (String -> Boolean) -> Fixities -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
+readSource known fixities src = readProgramWith { known, fixities, lenient: false } src
+
+-- | the files of a program, in the order `Heff.Load` gives (each after what
+-- | it imports), elaborated.  A file sees its own definitions and those of
+-- | the modules it imports, by name; what those need is there too, by key,
+-- | but not in scope
+elabProgram :: Array Source -> Array Checked
+elabProgram = A.foldl step []
+  where
+  step done s =
+    let
+      direct = A.filter (\c -> A.elem c.module s.deps) done
+      needed = A.filter (\c -> A.elem c.module (closure done s.deps)) done
+      env = A.foldl (\g c -> A.foldl (\g' o -> maybe g' (\e -> addGlobalEntry o.key e g') (lookupGlobal c.top.globals o.key)) g c.own) emptyGlobals needed
+      imported = A.concatMap (\c -> map (\o -> { name: o.name, key: o.key, module: c.module }) c.own) direct
+      -- a name two modules imported define, each its own way, is in scope
+      -- as neither
+      clashes = A.nubByEq (\a b -> a.name == b.name) (A.filter (\o -> A.any (\p -> p.name == o.name && p.key /= o.key) imported) imported)
+      clash o =
+        { code: 330, severity: SError, span: { start: 0, end: 0 }, note: Nothing
+        , msg: P.text ("`" <> o.name <> "` is defined by more than one module imported: " <> S.joinWith ", " (A.nub (map _.module (A.filter (\p -> p.name == o.name) imported))))
+        }
+      g0 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
+      r = readSource (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
+      key x = s.module <> "." <> x
+      t = topModule key g0 r.ntns
+    in
+      A.snoc done
+        { path: s.path, module: s.module, source: s.source, text: s.text, ntns: r.ntns, top: t
+        , diags: map clash clashes <> map hint (r.diags <> t.diags)
+        , own: A.zipWith (\(Tuple x _) k -> { name: x, key: k }) t.spans t.keys
+        , deps: s.deps
+        , fixities: r.fixities
+        }
+  -- the modules reached from some, through their imports
+  closure done = go []
+    where
+    go seen ms = case A.uncons ms of
+      Nothing -> seen
+      Just { head, tail }
+        | A.elem head seen -> go seen tail
+        | otherwise -> go (A.snoc seen head) (tail <> maybe [] _.deps (A.find (\c -> c.module == head) done))
+
+-- | the tools add advice on how to fix the common cases
+hint :: Diag -> Diag
+hint d = case d.code, d.note of
+  319, Nothing -> d { note = Just (P.text "if this is a recursive call, guard the whole call: rec (f ...)") }
+  _, _ -> d
+
+errorsIn :: Checked -> Array Diag
+errorsIn c = A.filter (\d -> d.severity == SError) c.diags
+
+-- | each diagnostic under `path:line:col`
+renderFileDiags :: String -> String -> Array Diag -> String
+renderFileDiags path src ds = S.joinWith "" (map one ds)
+  where
+  one d =
+    let lc = lineCol src d.span.start
+    in path <> ":" <> show (lc.line + 1) <> ":" <> show (lc.col + 1) <> "\n" <> P.render (renderDiag src d) <> "\n\n"
+
+-- | a type, its globals by the names they have in the file (else by key)
+showTy :: Globals -> Ty -> String
+showTy g = printTy { names: \_ _ -> [], hide: true } 0 Nil <<< renameTy shown
+  where
+  names = Map.fromFoldable (map (\(Tuple x k) -> Tuple k x) (Map.toUnfoldable g.aliases :: Array (Tuple String String)))
+  shown k = fromMaybe k (Map.lookup k names)
+
+-- | a file's own definitions and their types
+-- | (`name`: as a signature has it, an operator in parentheses)
+definitions :: Checked -> Array { name :: String, type :: String }
+definitions c = A.mapMaybe (\o -> lookupGlobal c.top.globals o.key <#> \e -> { name: named o.name, type: showTy c.top.globals (readbTy 0 e.type_) }) c.own
+
+-- | a name as written alone: an operator in parentheses, `(+)`
+named :: String -> String
+named x = if isJust (operatorName x) then "(" <> x <> ")" else x
+
+-- Watches and tests
+--------------------------------------------------------------------------------
+
+-- | a watch `-- >>> e`, with the `-- ...` lines under it, its expectation
+-- | (a doctest): `expectFrom`..`expectTo` is where those lines are, or
+-- | where they would go
+type WatchInfo =
+  { from :: Int
+  , to :: Int
+  , expr :: String
+  , type :: String
+  , value :: String
+  , expected :: Maybe String
+  , holds :: Boolean
+  , expectFrom :: Int
+  , expectTo :: Int
+  }
+
+-- | the `-- ...` lines after the line that `end` is on, up to a blank one
+expectation :: String -> Int -> { expected :: Maybe String, from :: Int, to :: Int }
+expectation src end =
+  let
+    lineEnd i = fromMaybe (SCU.length src) (SCU.indexOf' (S.Pattern "\n") i src)
+    start = min (SCU.length src) (lineEnd end + 1)
+    go i acc =
+      let
+        e = lineEnd i
+        line = S.trim (SCU.slice i e src)
+      in
+        if i < SCU.length src && S.take 2 line == "--" && S.take 6 line /= "-- >>>" && S.trim (S.drop 2 line) /= "" then go (min (SCU.length src) (e + 1)) (A.snoc acc (S.trim (S.drop 2 line)))
+        else { lines: acc, stop: i }
+    r = go start []
+  in
+    { expected: if A.null r.lines then Nothing else Just (S.joinWith "\n" r.lines), from: start, to: r.stop }
+
+watches :: Checked -> Array WatchInfo
+watches c = A.mapWithIndex info c.top.watches
+  where
+  src = c.source
+  info i w =
+    let
+      name = "> " <> show i
+      value = evalWatch name (addGlobalEntry name w.entry c.top.globals)
+      ex = expectation src w.span.end
+      ty = showTy c.top.globals (readbTy 0 w.entry.type_)
+      -- an expectation is Hippogriff: it holds when it evaluates to the
+      -- same, however it is written; what cannot be read (`#fun`) is
+      -- compared as text
+      holds = case ex.expected of
+        Just e -> e == value || readExpectation c.top.globals ty e == Just value
+        Nothing -> true
+    in
+      { from: w.span.start
+      , to: w.span.end
+      , expr: S.trim (fromMaybe "" (S.stripPrefix (S.Pattern "-- >>>") (S.trim (SCU.slice w.span.start w.span.end src))))
+      , type: ty
+      , value
+      , expected: ex.expected
+      , holds
+      , expectFrom: ex.from
+      , expectTo: ex.to
+      }
+
+-- | a file's own definitions, evaluated (by value), as a watch shows them
+evaluate :: Checked -> Array { name :: String, value :: String }
+evaluate c =
+  let
+    keys = map _.key c.own
+    results = evalGlobalsWhere (\k -> A.elem k keys) c.top.globals
+  in
+    A.mapMaybe (\o -> A.find (\(Tuple k _) -> k == o.key) results <#> \(Tuple _ r) -> { name: named o.name, value: P.render (showResult r) }) c.own
+
+evalWatch :: String -> Globals -> String
+evalWatch name g = maybe "" (\(Tuple _ res) -> P.render (showResult res)) (A.head (evalGlobalsWhere (_ == name) g))
+
+-- | the value of an expectation, read as `(e :: T)`
+readExpectation :: Globals -> String -> String -> Maybe String
+readExpectation g ty e =
+  let
+    r = readProgram (\x -> isJust (lookupGlobal g x)) ("-- >>> (" <> e <> " :: " <> ty <> ")\n")
+    t = topWith g r.ntns
+  in
+    if not (A.null r.diags && A.null t.diags) then Nothing
+    else (A.head t.watches) <#> \w -> evalWatch "> expectation" (addGlobalEntry "> expectation" w.entry g)
+
+-- | a file's tests: the watches with an expectation, each under the name of
+-- | the `test` before it (if any)
+type TestReport = { test :: Maybe String, watch :: WatchInfo }
+
+testFile :: Checked -> Array TestReport
+testFile c = A.mapMaybe one (watches c)
+  where
+  one w = if isJust w.expected then Just { test: owner w, watch: w } else Nothing
+  starts = map (\(Tuple _ sp) -> sp.start) c.top.spans
+  owner w = _.name <$> A.last (A.filter (\m -> m.span.start < w.from && not (A.any (\p -> m.span.start < p && p < w.from) starts)) c.top.tests)
+
+-- | write every watch's value under it as its expectation (the "promote" of
+-- | an expect test)
+promote :: Checked -> String
+promote c = A.foldr put c.source (watches c)
+  where
+  -- from the last watch back, so earlier offsets stay right
+  put w s =
+    let
+      lines = map ("-- " <> _) (S.split (S.Pattern "\n") w.value)
+      before = SCU.take w.expectFrom s
+      -- the watch may be the last line, with no newline after it
+      sep = if before /= "" && SCU.takeRight 1 before /= "\n" then "\n" else ""
+    in
+      before <> sep <> S.joinWith "" (map (_ <> "\n") lines) <> SCU.drop w.expectTo s
+
+-- | an app is a definition that takes a `Handler (dom <+> (state s))`
+-- | (lib/dom.hf):
+-- | the first of a file's, or the one named
+findApp :: Checked -> Maybe String -> Maybe String
+findApp = findTaking case _ of
+  App (Global h) (App (App (Global p) (Global d)) (App (Global st) _)) ->
+    short h == "Handler" && (short p == "<+>" || short p == "plus") && short d == "dom" && short st == "state"
+  _ -> false
+
+-- | a program is a definition that takes a `Handler io` (lib/io.hf): the
+-- | first of a file's, or the one named
+findProgram :: Checked -> Maybe String -> Maybe String
+findProgram = findTaking case _ of
+  App (Global h) (Global e) -> short h == "Handler" && short e == "io"
+  _ -> false
+
+-- | the definition named, else the first of a file's whose parameter's type
+-- | is one the test says
+findTaking :: (El -> Boolean) -> Checked -> Maybe String -> Maybe String
+findTaking takes c = case _ of
+  Just x -> _.key <$> A.find (\o -> o.name == x) c.own
+  Nothing -> _.key <$> A.find (ok <<< _.key) c.own
+  where
+  ok k = case lookupGlobal c.top.globals k <#> \e -> readbTy 0 e.type_ of
+    Just (Function ft) -> case ft.dom of
+      Decode d -> takes d
+      _ -> false
+    _ -> false
+
+short :: String -> String
+short k = fromMaybe k (A.last (S.split (S.Pattern ".") k))
+
+-- Semantic queries
+--------------------------------------------------------------------------------
+
+-- | the elaboration trace of a file, one line per event: where, what
+explain :: Checked -> Array String
+explain c =
+  map (\ev -> at ev.span <> "  " <> ev.kind <> "  " <> force ev.text) c.top.trace
+    <> map (\d -> at d.span <> "  error  " <> P.render (P.text "" <> d.msg)) c.diags
+  where
+  at sp = let lc = lineCol c.source sp.start in show (lc.line + 1) <> ":" <> show (lc.col + 1)
+
+-- | what the name at an offset resolved to, and its type
+-- | the name at an offset: one written there, the innermost.  (What `do`
+-- | is read into, `bind`, is no name written: its span is the block's, wider
+-- | than the name, and it must not hide what is in the block -- its binders,
+-- | say, of which nothing is recorded.)
+infoAt :: Checked -> Int -> Maybe Info
+infoAt c off = A.head (A.sortWith (\i -> i.span.end - i.span.start) (A.filter (\i -> written i && i.span.start <= off && off <= i.span.end) c.top.infos))
+  where
+  -- (a tag may be written with its `'`)
+  written i = i.span.end - i.span.start <= S.length i.name + 1
+
+typeAt :: Checked -> Int -> Maybe String
+typeAt c off =
+  infoAt c off <#> \i ->
+    named i.name <> " :: " <> force i.ty <> (case i.key of
+      Just _ -> "   (global)"
+      Nothing -> "   (local)")
+
+-- | where the global the name at an offset resolved to is defined, in a
+-- | program (the file last): its file, and the span of its name there.
+-- | (A local's binder is not kept by the elaborator: nothing, for one.)
+definitionAt :: Array Checked -> Int -> Maybe { path :: String, source :: String, span :: F.Span }
+definitionAt program off = do
+  c <- A.last program
+  i <- infoAt c off
+  k <- i.key
+  -- (a primitive may be declared by more than one file: this one's first)
+  d <- A.head (A.mapMaybe (defines k) (A.reverse program))
+  -- (the name looked for is the one at the offset: a tag's is in its type's
+  -- declaration)
+  pure { path: d.c.path, source: d.c.source, span: nameIn d.c.source i.name d.span }
+  where
+  defines k c = do
+    j <- A.findIndex (\o -> o.key == k) c.own
+    o <- A.index c.own j
+    Tuple _ sp <- A.index c.top.spans j
+    pure { c, name: o.name, span: sp }
+  -- the first occurrence of the name, as a word, in the declaration
+  nameIn src x sp =
+    let
+      word p = not (isNameChar (SCU.charAt p src))
+      go from = case SCU.indexOf' (S.Pattern x) from src of
+        Just p | p + SCU.length x <= sp.end ->
+          if (p == 0 || word (p - 1)) && word (p + SCU.length x) then { start: p, end: p + SCU.length x } else go (p + 1)
+        _ -> sp
+    in
+      go sp.start
+  isNameChar = case _ of
+    Just ch -> ch == '_' || ch == '\'' || ch == '/' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+    Nothing -> false

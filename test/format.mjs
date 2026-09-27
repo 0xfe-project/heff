@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The formatter (src/Hg/Format.purs): every .hf file of the repository is
+// The formatter (src/Heff/Format.purs): every .hf file of the repository is
 // formatted (the formatter checks itself that the result means the same and
 // keeps the comments) and formatting it again changes nothing; then cases
 // of comments, blank lines, blocks and watches, some with the exact result.
@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { format } from "../output/Hg.Format/index.js";
+import { format } from "../output/Heff.Format/index.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 let checks = 0, failed = 0;
