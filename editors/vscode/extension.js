@@ -2,7 +2,11 @@
 const fs = require("fs");
 const path = require("path");
 const vscode = require("vscode");
-const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
+
+// (not there before `npm install` in editors/vscode: said, not thrown, or
+// the extension fails to load with nothing on the screen)
+let languageclient;
+try { languageclient = require("vscode-languageclient/node"); } catch (_) { languageclient = null; }
 
 let client;
 
@@ -14,13 +18,19 @@ function serverPath(context) {
 }
 
 async function start(context) {
+  if (!languageclient) {
+    vscode.window.showErrorMessage(`heff: vscode-languageclient is not installed; run \`npm install\` in ${context.extensionPath}`);
+    return;
+  }
+  const { LanguageClient } = languageclient;
   const config = vscode.workspace.getConfiguration("heff");
   const script = serverPath(context);
   if (!fs.existsSync(script)) {
     vscode.window.showErrorMessage(`heff: no language server at ${script}; set heff.serverPath to heff's bin/hg.mjs`);
     return;
   }
-  const run = { command: config.get("nodePath") || "node", args: [script, "lsp"], transport: TransportKind.stdio };
+  // (no `transport`: with one, the client adds `--stdio` to the arguments)
+  const run = { command: config.get("nodePath") || "node", args: [script, "lsp"] };
   client = new LanguageClient("heff", "heff language server", { run, debug: run }, {
     documentSelector: [{ scheme: "file", language: "heff" }],
   });

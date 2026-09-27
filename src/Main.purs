@@ -130,7 +130,8 @@ main = do
       let r = refReport src
       void (writeString stdout UTF8 r.out)
       void (writeString stderr UTF8 r.err)
-    [ "lsp" ] -> libDir >>= Lsp.serve
+    -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
+    a | A.head a == Just "lsp" && A.all (\x -> S.take 2 x == "--") (A.drop 1 a) -> libDir >>= Lsp.serve
     a | A.head a == Just "fmt" && A.length a > 1 -> do
       let
         checkOnly = A.index a 1 == Just "--check"
