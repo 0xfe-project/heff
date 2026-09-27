@@ -33,7 +33,8 @@ import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
 import Hg.Parse.FNotation (Ntn(..))
 import Hg.Parse.Import (readImports)
-import Hg.Parse.Surface (lex, readProgram)
+import Hg.Parse.Fixity (emptyFixities, reserved)
+import Hg.Parse.Surface (lex, readProgramWith)
 import Hg.Support.BigInt as BI
 import Hg.Support.Pretty (Doc, (<+>))
 import Hg.Support.Pretty as P
@@ -70,7 +71,9 @@ check src out = do
     read s =
       let
         h = readImports s
-        r = readProgram (const false) h.text
+        -- (without what it imports, whose fixities are not known: operators
+        -- bind the same way in both, whatever way)
+        r = readProgramWith { known: const false, fixities: emptyFixities, lenient: true } h.text
       in
         { imports: map _.name h.imports, ntns: map ntnKey r.ntns, diags: map (\d -> P.render d.msg) r.diags }
     a = read src
@@ -179,6 +182,7 @@ data E
   | Field E T
   | App E (Array E)
   | Op E T E
+  | Ops E (Array { op :: T, e :: E }) -- ^ declared operators, `a + b * c`
   | Ann E T E
   | Lam T (Array Bnd) T E
   | Case T E T (Array Alt)
@@ -199,10 +203,14 @@ data Stmt = SBind T T E | SExpr E
 
 type TheoryField = { name :: T, colons :: T, ty :: E }
 
+-- | (a declaration's name: `f`, or `(`, `+`, `)`)
+type Nm = Array T
+
 data D
   = DImport T
-  | DSig T T E
-  | DEqn T (Array Pat) T E
+  | DFixity T (Array T) -- ^ `infixl + - above ==`
+  | DSig Nm T E
+  | DEqn Nm (Array Pat) T E
   | DData T T (Array E) (Maybe (Tuple T E)) (Maybe { eq :: T, alts :: Array Con, bars :: Array T })
   | DType T T (Array E) T E
   | DTheory T T (Array E) T (Array TheoryField)
@@ -221,6 +229,7 @@ firstE = case _ of
   Field e _ -> firstE e
   App h _ -> firstE h
   Op a _ _ -> firstE a
+  Ops a _ -> firstE a
   Ann e _ _ -> firstE e
   Lam t _ _ _ -> t
   Case t _ _ _ -> t
@@ -238,6 +247,7 @@ lastE = case _ of
   Field _ t -> t
   App h args -> maybe (lastE h) lastE (A.last args)
   Op _ _ b -> lastE b
+  Ops a rest -> maybe (lastE a) (\r -> lastE r.e) (A.last rest)
   Ann _ _ t -> lastE t
   Lam _ _ _ b -> lastE b
   Case _ _ o alts -> maybe o (\a -> lastE a.body) (A.last alts)
@@ -255,6 +265,7 @@ lastCon c = maybe c.con lastE (A.last c.args)
 lastD :: D -> T
 lastD = case _ of
   DImport t -> t
+  DFixity kw ts -> fromMaybe kw (A.last ts)
   DSig _ _ ty -> lastE ty
   DEqn _ _ _ e -> lastE e
   DData _ name params universe alts -> case alts, universe of
@@ -266,6 +277,9 @@ lastD = case _ of
   DForeign _ _ _ _ ty -> lastE ty
   DTest _ x -> x
   DWatch _ e -> lastE e
+
+nmFirst :: Nm -> T
+nmFirst n = fromMaybe eofTok (A.head n)
 
 firstP :: Pat -> T
 firstP = case _ of
@@ -281,8 +295,9 @@ firstStmt = case _ of
 firstD :: D -> T
 firstD = case _ of
   DImport t -> t
-  DSig t _ _ -> t
-  DEqn t _ _ _ -> t
+  DFixity t _ -> t
+  DSig n _ _ -> nmFirst n
+  DEqn n _ _ _ -> nmFirst n
   DData t _ _ _ _ -> t
   DType t _ _ _ _ -> t
   DTheory t _ _ _ _ -> t
@@ -344,18 +359,31 @@ decl = lazyP \_ -> do
     "watch", _ -> do
       w <- next
       DWatch w <$> expr
-    _, _ | t.kind == "var" || t.kind == "con" -> do
+    "kw", _ | A.elem t.text [ "infixl", "infixr", "infix" ] -> do
+      kw <- next
+      let
+        rest acc = do
+          u <- peek
+          if u.kind == "eof" || (u.first && u.col == 0) then pure acc else next >>= \v -> rest (A.snoc acc v)
+      DFixity kw <$> rest []
+    _, _ -> do
       t2 <- peekAt 1
-      if t2.text == "::" then do
-        f <- next
+      t3 <- peekAt 2
+      len <-
+        if t.kind == "var" || t.kind == "con" then pure 1
+        else if t.text == "(" && isOperator t2 && t3.text == ")" then pure 3
+        else failAt t
+      name <- A.replicate len unit # traverseNext
+      u <- peek
+      if u.text == "::" then do
         cc <- next
-        DSig f cc <$> expr
+        DSig name cc <$> expr
       else do
-        f <- next
         pats <- many patAtom
         eq <- expectSym "="
-        DEqn f pats eq <$> expr
-    _, _ -> failAt t
+        DEqn name pats eq <$> expr
+  where
+  traverseNext = A.foldM (\acc _ -> next <#> A.snoc acc) []
 
 dataDecl :: P D
 dataDecl = do
@@ -409,7 +437,7 @@ operators =
 
 opExpr :: Int -> P E
 opExpr minPrec = do
-  lhs <- app
+  lhs <- userOps
   loop lhs
   where
   loop lhs = do
@@ -424,6 +452,32 @@ opExpr minPrec = do
   arrowRhs = do
     t <- peek
     if t.text == "\\" || (t.kind == "kw" && A.elem t.text [ "case", "if", "do" ]) then expr else opExpr 1
+
+-- | declared operators, as they are written (how they bind is the
+-- | parser's business)
+userOps :: P E
+userOps = lazyP \_ -> do
+  e0 <- app
+  rest <- operands
+  pure (if A.null rest then e0 else Ops e0 rest)
+  where
+  operands = do
+    t <- peek
+    b <- atBoundary
+    if isOperator t && not b then do
+      op <- next
+      u <- peek
+      if u.text == "\\" || (u.kind == "kw" && A.elem u.text [ "case", "if", "do" ]) then do
+        e <- expr
+        pure [ { op, e } ]
+      else do
+        e <- app
+        more <- operands
+        pure (A.cons { op, e } more)
+    else pure []
+
+isOperator :: T -> Boolean
+isOperator t = t.kind == "sym" && not (A.elem t.text reserved)
 
 app :: P E
 app = lazyP \_ -> do
@@ -464,7 +518,10 @@ parens = lazyP \_ -> do
   inBrackets do
     t <- peek
     t2 <- peekAt 1
-    if t.kind == "var" && t2.text == ":=" then do
+    if isOperator t && t2.text == ")" then do
+      op <- next
+      Paren o (Atom op) <$> next
+    else if t.kind == "var" && t2.text == ":=" then do
       x <- next
       k <- next
       e <- expr
@@ -751,8 +808,9 @@ topLevel env ds eof =
 pD :: Env -> D -> Doc
 pD env = case _ of
   DImport t -> tok env t
-  DSig f cc ty -> tok env f <+> sig env cc ty
-  DEqn f pats eq rhs -> tok env f <> foldMap (\p -> P.text " " <> pP env p) pats <+> tok env eq <> rhsOf env rhs
+  DFixity kw ts -> tok env kw <> foldMap (\t -> P.text " " <> tok env t) ts
+  DSig f cc ty -> nm f <+> sig env cc ty
+  DEqn f pats eq rhs -> nm f <> foldMap (\p -> P.text " " <> pP env p) pats <+> tok env eq <> rhsOf env rhs
   DData kw name params universe alts ->
     tok env kw <+> tok env name <> params' params
       <> maybe mempty (\(Tuple cc u) -> P.text " " <> tok env cc <+> pE env u) universe
@@ -767,6 +825,7 @@ pD env = case _ of
   DWatch w e -> tok env w <> comment (SCU.slice w.end (lastE e).end env.src)
   where
   params' = foldMap (\p -> P.text " " <> pE env p)
+  nm = foldMap (tok env)
   headOr xs = fromMaybe { con: eofTok, args: [] } (A.head xs)
 
 -- | `:: A -> B`, the arrows under `::` if it does not fit
@@ -816,6 +875,7 @@ pE env = case _ of
           _ -> pE env e
       in
         P.group (operand first <> foldMap (\r -> P.line <> tok env r.op <+> operand r.e) rest)
+  Ops first rest -> P.group (pE env first <> foldMap (\r -> P.line <> tok env r.op <+> pE env r.e) rest)
   Ann e cc ty -> P.group (pE env e <+> tok env cc <> P.nest 2 (P.line <> pE env ty))
   Lam bs binders arrow body ->
     tok env bs <> P.concatWith (<+>) (map pB binders) <+> tok env arrow

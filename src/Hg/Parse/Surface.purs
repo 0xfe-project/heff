@@ -13,8 +13,14 @@
 -- |
 -- | A capitalised name is a constructor (a tag) unless it names something in
 -- | scope: a definition of the file or of what it imports, or a binder.
+-- |
+-- | Operators (`a + b`, which is `(+) a b`) bind as the fixity declarations
+-- | of the file and of what it imports say (`Hg.Parse.Fixity`); `(+)` names
+-- | one, in a signature, an equation or an expression.
 module Hg.Parse.Surface
   ( readProgram
+  , readProgramWith
+  , Options
   , Tok
   , Comment
   , lex
@@ -32,6 +38,7 @@ import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String as S
 import Data.Tuple (Tuple(..))
 import Hg.Parse.FNotation (Diag, Ntn(..), Severity(..), Span, getGroup, group, ntnSpan)
+import Hg.Parse.Fixity (Assoc(..), Fixities, Relation(..), bindsTighter, emptyFixities, groupOf, relate, reserved, union)
 import Hg.Support.BigInt as BI
 import Hg.Support.Pretty as P
 
@@ -50,22 +57,90 @@ lex = lexImpl
 -- | `binders`: the names each signature binds (in its equations' patterns,
 -- | a capitalised one is that variable, not a constructor); `patVars`: those
 -- | of the equation being read
-type St = { toks :: Array Tok, i :: Int, stack :: Array Int, scope :: Array String, known :: String -> Boolean, start :: Int, binders :: Array { f :: String, names :: Array String }, patVars :: Array String }
+-- | `fix`: the fixities in scope; `lenient`: an operator with none, or two
+-- | unrelated, bind as one left-associative group (for reading a file on its
+-- | own, without what it imports: the formatter's)
+type St = { toks :: Array Tok, i :: Int, stack :: Array Int, scope :: Array String, known :: String -> Boolean, start :: Int, binders :: Array { f :: String, names :: Array String }, patVars :: Array String, fix :: Fixities, lenient :: Boolean }
 
 type P a = ExceptT Diag (State St) a
 
 -- | the program, as declarations the elaborator takes; `known` says which
 -- | capitalised names are imported definitions
 readProgram :: (String -> Boolean) -> String -> { ntns :: Array Ntn, diags :: Array Diag }
-readProgram known src =
+readProgram known src = let r = readProgramWith { known, fixities: emptyFixities, lenient: false } src in { ntns: r.ntns, diags: r.diags }
+
+-- | `fixities`: those of what the file imports; the result's, the file's own
+type Options = { known :: String -> Boolean, fixities :: Fixities, lenient :: Boolean }
+
+readProgramWith :: Options -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
+readProgramWith o src =
   let
     l = lexImpl src
     lexDiags = map (\e -> diag { start: e.start, end: e.end } e.msg) l.errors
     declared = prescan l.tokens
-    st0 = { toks: l.tokens, i: 0, stack: [ 0 ], scope: [], known: \x -> known x || A.elem x declared, start: 0, binders: [], patVars: [] }
+    own = fixityDecls o.fixities l.tokens
+    st0 = { toks: l.tokens, i: 0, stack: [ 0 ], scope: [], known: \x -> o.known x || A.elem x declared, start: 0, binders: [], patVars: [], fix: union o.fixities own.fixities, lenient: o.lenient }
     r = evalState (program []) st0
   in
-    { ntns: assemble r.items r.diags, diags: lexDiags <> r.diags <> assembleDiags r.items }
+    { ntns: assemble r.items r.diags, diags: lexDiags <> own.diags <> r.diags <> assembleDiags r.items, fixities: own.fixities }
+
+-- | the fixity declarations of a file, `infixl + - above ==`, read before
+-- | the rest (an operator may be used before its declaration); `imported`:
+-- | those in scope already
+fixityDecls :: Fixities -> Array Tok -> { fixities :: Fixities, diags :: Array Diag }
+fixityDecls imported ts =
+  let
+    decls = A.catMaybes (A.mapWithIndex one ts)
+    groups = map (\d -> { id: fromMaybe "" (A.head (map _.text d.ops)), assoc: d.assoc, ops: map _.text d.ops }) (A.filter (\d -> not (A.null d.ops)) decls)
+    scope = union imported { groups, above: [] }
+    -- (an operator's group, among those of the file and those imported)
+    ref t = groupOf scope t.text
+    edges = A.concatMap (\d -> case A.head d.ops of
+      Just op -> A.mapMaybe (\r -> ref r <#> \g -> { tighter: op.text, looser: g.id }) d.above
+        <> A.mapMaybe (\r -> ref r <#> \g -> { tighter: g.id, looser: op.text }) d.below
+      Nothing -> []) decls
+    fixities = { groups, above: edges }
+    all = union imported fixities
+    diags = A.concatMap (\d ->
+      map (\t -> diag (spanOf t) ("`" <> t.text <> "` is syntax, not an operator")) (A.filter (\t -> A.elem t.text reserved) d.ops)
+        <> map (\t -> diag (spanOf t) ("`" <> t.text <> "` has no fixity to be above or below: declare it first")) (A.filter (\t -> ref t == Nothing) (d.above <> d.below))
+        <> (if A.null d.ops then [ diag d.span "a fixity declaration names its operators: `infixl + -`" ] else [])
+        <> d.errors
+        <> case A.head d.ops of
+          Just g ->
+            map (\t -> diag (spanOf t) ("the fixity of `" <> t.text <> "` is declared twice")) (A.filter (\t -> A.any (\h -> h.id /= g.text && A.elem t.text h.ops) all.groups) d.ops)
+              <> (if bindsTighter all g.text g.text then [ diag d.span ("these fixities go round: `" <> g.text <> "` ends up above itself") ] else [])
+          Nothing -> []) decls
+  in
+    { fixities, diags }
+  where
+  at k = A.index ts k
+  one k t
+    | t.first && t.col == 0 && t.kind == "kw" && A.elem t.text [ "infixl", "infixr", "infix" ] =
+        let
+          assoc = case t.text of
+            "infixl" -> AssocLeft
+            "infixr" -> AssocRight
+            _ -> AssocNone
+          -- the rest of the declaration: up to the next one
+          rest = A.takeWhile (\u -> not (u.kind == "eof" || (u.first && u.col == 0))) (A.drop (k + 1) ts)
+          ops = A.takeWhile (\u -> u.kind == "sym") rest
+          after = A.drop (A.length ops) rest
+          -- `above ...`, `below ...`, in any order
+          go acc xs = case A.uncons xs of
+            Nothing -> acc
+            Just { head: w, tail } | w.kind == "var" && (w.text == "above" || w.text == "below") ->
+              let
+                these = A.takeWhile (\u -> u.kind == "sym") tail
+                acc' = if w.text == "above" then acc { above = acc.above <> these } else acc { below = acc.below <> these }
+              in
+                go acc' (A.drop (A.length these) tail)
+            Just { head: u } -> acc { errors = A.snoc acc.errors (diag (spanOf u) ("expected `above` or `below` and operators, not `" <> u.text <> "`")) }
+          r = go { above: [], below: [], errors: [] } after
+          end = fromMaybe t.end (A.last rest <#> _.end)
+        in
+          Just { assoc, ops, above: r.above, below: r.below, errors: r.errors, span: { start: t.start, end } }
+    | otherwise = const Nothing (at k)
 
 diag :: Span -> String -> Diag
 diag span msg = { code: 150, severity: SError, msg: P.text msg, span, note: Nothing }
@@ -125,6 +200,15 @@ decl = lazyP \_ -> do
     "kw", "type" -> A.singleton <<< Decl <$> typeDecl
     "kw", "theory" -> A.singleton <<< Decl <$> theoryDecl
     "kw", "foreign" -> A.singleton <<< Decl <$> foreignDecl
+    -- (read before the rest, by `fixityDecls`)
+    "kw", _ | A.elem t.text [ "infixl", "infixr", "infix" ] -> do
+      let
+        skip = do
+          u <- peek
+          unless (u.kind == "eof" || (u.first && u.col == 0)) (next *> skip)
+      _ <- next
+      skip
+      pure []
     "kw", "test" -> do
       _ <- next
       n <- expectKind "var" "a test's name"
@@ -134,31 +218,50 @@ decl = lazyP \_ -> do
       e <- expr
       end <- prevEnd
       pure [ Decl (MDecl [] ">" e { start: t.start, end }) ]
-    _, _ | t.kind == "var" || t.kind == "con" -> do
-      t2 <- peekAt 1
-      if t2.text == "::" then do
-        _ <- next
-        _ <- next
-        ty <- expr
-        end <- prevEnd
-        modify_ \s -> s { binders = A.snoc s.binders { f: t.text, names: piBinders ty } }
-        pure [ Sig t.text ty { start: t.start, end } ]
-      else equation
-    _, _ -> throwError (diag (spanOf t) ("a declaration cannot start with `" <> t.text <> "`"))
+    _, _ -> do
+      name <- declName
+      case name of
+        Nothing -> throwError (diag (spanOf t) ("a declaration cannot start with `" <> t.text <> "`"))
+        Just f -> do
+          t2 <- peekAt f.len
+          if t2.text == "::" then do
+            modify_ \s -> s { i = s.i + f.len + 1 }
+            ty <- expr
+            end <- prevEnd
+            modify_ \s -> s { binders = A.snoc s.binders { f: f.name, names: piBinders ty } }
+            pure [ Sig f.name ty { start: t.start, end } ]
+          else equation f
+
+-- | what a signature or an equation defines: `f`, `C`, or `(+)` (`len`: its
+-- | tokens, `span`: the name's)
+declName :: P (Maybe { name :: String, len :: Int, span :: Span })
+declName = do
+  t <- peek
+  t2 <- peekAt 1
+  t3 <- peekAt 2
+  pure
+    if t.kind == "var" || t.kind == "con" then Just { name: t.text, len: 1, span: spanOf t }
+    else if t.text == "(" && isOperator t2 && t3.text == ")" then Just { name: t2.text, len: 3, span: spanOf t2 }
+    else Nothing
 
 -- | `f p ... = e`
-equation :: P (Array Item)
-equation = lazyP \_ -> do
-  f <- next
-  bound <- gets \s -> A.concatMap _.names (A.filter (\b -> b.f == f.text) s.binders)
+equation :: { name :: String, len :: Int, span :: Span } -> P (Array Item)
+equation f = lazyP \_ -> do
+  start <- gets \s -> (cur s).start
+  modify_ \s -> s { i = s.i + f.len }
+  bound <- gets \s -> A.concatMap _.names (A.filter (\b -> b.f == f.name) s.binders)
   modify_ \s -> s { patVars = bound }
   pats <- many patAtom
   modify_ \s -> s { patVars = [] }
   _ <- expectSym "="
   withScope (A.concatMap patVars pats) do
     rhs <- expr
-    let sp = { start: f.start, end: (ntnSpan rhs).end }
-    pure [ Eqn f.text (Infix (group (NEA.cons' (Ident f.text (spanOf f)) pats)) (Keyword ":=" sp) rhs) sp ]
+    let sp = { start, end: (ntnSpan rhs).end }
+    pure [ Eqn f.name (Infix (group (NEA.cons' (Ident f.name f.span) pats)) (Keyword ":=" sp) rhs) sp ]
+
+-- | a symbol that is an operator (not syntax)
+isOperator :: Tok -> Boolean
+isOperator t = t.kind == "sym" && not (A.elem t.text reserved)
 
 -- | `data T a (n :: Nat) = C x y | D`, and `data T :: U 1 = …` (its
 -- | universe, given)
@@ -325,18 +428,17 @@ expr = lazyP \_ -> do
     pure (Infix e (Keyword ":" (spanOf t')) ty)
   else pure e
 
--- | the operators, loosest first: `->` (right), `~` (right)
+-- | the syntax's operators, loosest first: `->` (right), `~` (right); those
+-- | declared bind tighter than both
 operators :: Array { sym :: String, prec :: Int, right :: Boolean }
 operators =
   [ { sym: "->", prec: 1, right: true }
   , { sym: "~", prec: 2, right: true }
-  -- (HOTT's Σ types: `A * B`, `(x :: A) * B`)
-  , { sym: "*", prec: 3, right: true }
   ]
 
 opExpr :: Int -> P Ntn
 opExpr minPrec = do
-  lhs <- app
+  lhs <- userOps
   loop lhs
   where
   loop lhs = do
@@ -380,6 +482,64 @@ binop "~" sp lhs rhs = case rhs of
   _ -> Infix lhs (Keyword "~" sp) rhs
 binop o sp lhs rhs = Infix lhs (Keyword o sp) rhs
 
+-- | `a + b * c`, as the fixities say: `(+) a ((*) b c)`.  An operand is an
+-- | application, or, last, a lambda, `case`, `if` or `do`
+userOps :: P Ntn
+userOps = lazyP \_ -> do
+  e0 <- app
+  rest <- operands
+  if A.null rest then pure e0 else resolve e0 rest
+  where
+  operands = do
+    t <- peek
+    b <- atBoundary
+    if isOperator t && not b then do
+      _ <- next
+      u <- peek
+      if u.text == "\\" || (u.kind == "kw" && A.elem u.text [ "case", "if", "do" ]) then do
+        e <- expr
+        pure [ { op: t, e } ]
+      else do
+        e <- app
+        more <- operands
+        pure (A.cons { op: t, e } more)
+    else pure []
+
+-- | operators and operands into a tree (the shunting yard), refusing
+-- | operators that do not go together
+resolve :: Ntn -> Array { op :: Tok, e :: Ntn } -> P Ntn
+resolve e0 rest = do
+  fix <- gets _.fix
+  lenient <- gets _.lenient
+  let
+    apply op l r = Juxt (Juxt (Ident op.text (spanOf op)) l) r
+    reduce st = case A.unsnoc st.ops, A.unsnoc st.out of
+      Just o, Just r | Just l <- A.unsnoc r.init -> st { ops = o.init, out = A.snoc l.init (apply o.last l.last r.last) }
+      _, _ -> st
+    -- `before` is on the stack, `op` comes: does `before` reduce first?
+    first before op = case relate fix before.text op.text of
+      Tighter -> pure true
+      Looser -> pure false
+      Same AssocLeft -> pure true
+      Same AssocRight -> pure false
+      Same AssocNone -> throwError (diag (spanOf op) (if before.text == op.text then "`" <> op.text <> "` does not associate: add parentheses" else "`" <> before.text <> "` and `" <> op.text <> "` do not associate: add parentheses"))
+      _ | lenient -> pure true
+      Unrelated -> throwError (diag (spanOf op) ("`" <> before.text <> "` and `" <> op.text <> "` are not related: add parentheses, or declare which binds tighter (`above`, `below`)"))
+      Undeclared x -> throwError (diag (spanOf (if x == op.text then op else before)) ("`" <> x <> "` has no fixity: declare it (`infixl " <> x <> "`), or import the module that does"))
+    push st r = do
+      done <- case A.last st.ops of
+        Just before -> first before r.op
+        Nothing -> pure false
+      if done then push (reduce st) r else pure st { ops = A.snoc st.ops r.op, out = A.snoc st.out r.e }
+  -- (an operator alone still needs a fixity)
+  for_ rest \r -> unless lenient $ when (groupOf fix r.op.text == Nothing) $
+    throwError (diag (spanOf r.op) ("`" <> r.op.text <> "` has no fixity: declare it (`infixl " <> r.op.text <> "`), or import the module that does"))
+  st <- A.foldM push { ops: [], out: [ e0 ] } rest
+  let
+    final = go st
+    go s = if A.null s.ops then s else go (reduce s)
+  pure (fromMaybe e0 (A.head final.out))
+
 -- | application: a head and its arguments
 app :: P Ntn
 app = lazyP \_ -> do
@@ -419,14 +579,19 @@ startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "str" ]
   || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "String", "sum", "abandon" ])
   || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
 
--- | `( e )`, `( e :: T )`, `(x := e)` (a named argument)
+-- | `( e )`, `( e :: T )`, `(x := e)` (a named argument), `(+)` (an
+-- | operator, named)
 parens :: P Ntn
 parens = lazyP \_ -> do
   o <- next
   inBrackets do
     t <- peek
     t2 <- peekAt 1
-    if t.kind == "var" && t2.text == ":=" then do
+    if isOperator t && t2.text == ")" then do
+      _ <- next
+      _ <- next
+      pure (Ident t.text (spanOf t))
+    else if t.kind == "var" && t2.text == ":=" then do
       _ <- next
       _ <- next
       e <- expr

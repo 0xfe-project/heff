@@ -36,6 +36,26 @@ under it are its expectation (a doctest); `test name` names the watches
 after it.  The reference's syntax (fnotation, `.hpgf`) is still read, for
 comparing with it.
 
+Operators are declared, and bind relatively: no numbers, only which binds
+tighter than which.
+
+```haskell
+infixl + - above ==
+infixl * / above + -
+infixr ++ above ==
+
+(+) :: Int -> Int -> Int
+(+) = intAdd
+```
+
+An operator's declaration makes a group, of one associativity; `above` and
+`below` relate it to the groups of other operators, transitively.  Two
+operators of unrelated groups do not go together without parentheses: with
+the prelude's, `a + b ++ c` is refused.  `a + b` is `(+) a b`; fixities are
+seen by the files that import the module declaring them.  `lib/prelude.hg`
+has the arithmetic, comparisons, `&&`, `||`, `++` and `$`, with `Maybe`,
+`Either`, lists and their functions.
+
 ## The stages
 
 ```

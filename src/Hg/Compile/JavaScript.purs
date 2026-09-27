@@ -35,7 +35,7 @@ import Hg.Elab.Prims (prims)
 import Hg.Lower (lower)
 import Hg.Lower.IR (Def, Expr(..), baseOf, globalsIn, isValue)
 import Hg.Support.BigInt as BI
-import Hg.Support.Common (quoteString)
+import Hg.Support.Common (quoteString, spellOperator)
 
 type Output = { source :: String, errors :: Array String }
 
@@ -93,8 +93,10 @@ reserved =
   ]
 
 safe :: String -> String
-safe x =
+safe x0 =
   let
+    -- (an operator is spelt out: `+` and `-` are not both `_`)
+    x = spellOperator x0
     s = SCU.fromCharArray (map (\c -> if isWordChar c then c else '_') (SCU.toCharArray x))
     s' = if s == "" then "x" else s
   in

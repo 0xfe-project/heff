@@ -165,6 +165,32 @@ formats("a long signature: the arrows under `::`", [
   "",
 ].join("\n"));
 
+formats("operators and their fixities", [
+  "infixl   +  -",
+  "infixl * above + -",
+  "(+) :: Int -> Int -> Int",
+  "(+) = plus",
+  "x :: Int",
+  "x = 1+2 * (3 -  4)",
+  "long :: Int",
+  "long = aaaaaaaaaaaaaaaaaaaa + bbbbbbbbbbbbbbbbbbbbbbbbb * cccccccccccccccccccccc - dddddddddddddddd",
+  "",
+].join("\n"), [
+  "infixl + -",
+  "infixl * above + -",
+  "(+) :: Int -> Int -> Int",
+  "(+) = plus",
+  "x :: Int",
+  "x = 1 + 2 * (3 - 4)",
+  "long :: Int",
+  "long =",
+  "  aaaaaaaaaaaaaaaaaaaa",
+  "  + bbbbbbbbbbbbbbbbbbbbbbbbb",
+  "  * cccccccccccccccccccccc",
+  "  - dddddddddddddddd",
+  "",
+].join("\n"));
+
 const bad = run("x :: Bool\nx = (\n");
 expect("what does not parse is left", !bad.ok && bad.why.includes("does not parse"), JSON.stringify(bad));
 

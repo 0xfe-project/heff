@@ -49,7 +49,8 @@ import Hg.Eval.Interpreter (EvalResult, evalGlobals, evalGlobalsWhere, prettyRes
 import Hg.Parse.Config (lexConfig, readConfig)
 import Hg.Parse.FNotation (Diag, Ntn, Severity(..))
 import Hg.Parse.FNotation as F
-import Hg.Parse.Surface (readProgram)
+import Hg.Parse.Fixity (Fixities, emptyFixities, union)
+import Hg.Parse.Surface (readProgram, readProgramWith)
 import Hg.Print.Surface (printTy)
 import Hg.Support.Diagnostic (lineCol, renderDiag, renderDiags)
 import Hg.Support.Pretty ((<+>))
@@ -71,19 +72,19 @@ type Source = { path :: String, module :: String, source :: String, text :: Stri
 
 -- | a file, elaborated: `top.globals` has everything it needs, `own` its
 -- | own definitions (by name, and the key each is stored under,
--- | `module.name`)
-type Checked = { path :: String, module :: String, source :: String, text :: String, ntns :: Array Ntn, top :: TopResult, diags :: Array Diag, own :: Array { name :: String, key :: String }, deps :: Array String }
+-- | `module.name`), `fixities` the fixities it declares
+type Checked = { path :: String, module :: String, source :: String, text :: String, ntns :: Array Ntn, top :: TopResult, diags :: Array Diag, own :: Array { name :: String, key :: String }, deps :: Array String, fixities :: Fixities }
 
 -- | read a file into notation; a capitalised name is a definition if
--- | `known` says so
-readSource :: Syntax -> (String -> Boolean) -> String -> { ntns :: Array Ntn, diags :: Array Diag }
-readSource Reference _ src =
+-- | `known` says so; `fixities`: those of what it imports
+readSource :: Syntax -> (String -> Boolean) -> Fixities -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
+readSource Reference _ _ src =
   let
     l = F.lex lexConfig src
     r = F.parse readConfig l.tokens
   in
-    { ntns: r.ntns, diags: l.diags <> r.diags }
-readSource Surface known src = readProgram known src
+    { ntns: r.ntns, diags: l.diags <> r.diags, fixities: emptyFixities }
+readSource Surface known fixities src = readProgramWith { known, fixities, lenient: false } src
 
 -- | the files of a program, in the order `Hg.Load` gives (each after what
 -- | it imports), elaborated.  A file sees its own definitions and those of
@@ -106,7 +107,7 @@ elabProgram = A.foldl step []
         , msg: P.text ("`" <> o.name <> "` is defined by more than one module imported: " <> S.joinWith ", " (A.nub (map _.module (A.filter (\p -> p.name == o.name) imported))))
         }
       g0 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
-      r = readSource (syntaxOf s.path) (\x -> isJust (lookupGlobal g0 x)) s.text
+      r = readSource (syntaxOf s.path) (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
       -- (a file in the reference's syntax is a program on its own, as the
       -- reference has it: its definitions keep their names)
       key x = if syntaxOf s.path == Reference then x else s.module <> "." <> x
@@ -117,6 +118,7 @@ elabProgram = A.foldl step []
         , diags: map clash clashes <> map hint (r.diags <> t.diags)
         , own: A.zipWith (\(Tuple x _) k -> { name: x, key: k }) t.spans t.keys
         , deps: s.deps
+        , fixities: r.fixities
         }
   -- the modules reached from some, through their imports
   closure done = go []
@@ -335,7 +337,7 @@ definitionAt program off = do
 checkReference :: String -> { ntns :: Array Ntn, globals :: Globals, diags :: Array Diag }
 checkReference src =
   let
-    r = readSource Reference (const false) src
+    r = readSource Reference (const false) emptyFixities src
     t = top r.ntns
   in
     { ntns: r.ntns, globals: t.globals, diags: r.diags <> t.diags }

@@ -16,6 +16,8 @@ module Hg.Support.Common
   , dictTraverse
   , Name
   , quoteString
+  , operatorName
+  , spellOperator
   ) where
 
 import Prelude
@@ -101,3 +103,40 @@ quoteString s = "\"" <> S.joinWith "" (map esc (SCU.toCharArray s)) <> "\""
     '\r' -> "\\r"
     '\t' -> "\\t"
     c -> SCU.singleton c
+
+-- | a name, or a key (`module.name`), with its name spelt out if it is an
+-- | operator: `lib.prelude.+` is `lib.prelude.op_plus`
+spellOperator :: String -> String
+spellOperator k = case S.lastIndexOf (S.Pattern ".") k of
+  Just i | Just w <- operatorName (S.drop (i + 1) k) -> S.take (i + 1) k <> w
+  _ -> fromMaybe k (operatorName k)
+
+-- | an operator's name as a word, for the languages compiled to: `+` is
+-- | `op_plus`, `<=` `op_lt_eq`; nothing for a name that is not an operator
+operatorName :: String -> Maybe String
+operatorName x =
+  let words = map word (SCU.toCharArray x)
+  in if x /= "" && A.all (_ /= Nothing) words then Just ("op_" <> S.joinWith "_" (A.catMaybes words)) else Nothing
+  where
+  word = case _ of
+    '+' -> Just "plus"
+    '-' -> Just "minus"
+    '*' -> Just "times"
+    '/' -> Just "slash"
+    '%' -> Just "percent"
+    '=' -> Just "eq"
+    '<' -> Just "lt"
+    '>' -> Just "gt"
+    '&' -> Just "amp"
+    '|' -> Just "bar"
+    '!' -> Just "bang"
+    '^' -> Just "caret"
+    '?' -> Just "q"
+    '@' -> Just "at"
+    '#' -> Just "hash"
+    '$' -> Just "dollar"
+    '~' -> Just "tilde"
+    ':' -> Just "colon"
+    '.' -> Just "dot"
+    '\\' -> Just "backslash"
+    _ -> Nothing

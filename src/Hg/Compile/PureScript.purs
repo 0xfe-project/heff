@@ -43,7 +43,7 @@ import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..), fst, snd)
-import Hg.Support.Common (Name, dictToList, dictKeyIndex)
+import Hg.Support.Common (Name, dictToList, dictKeyIndex, spellOperator)
 import Hg.Core.Evaluation (eval)
 import Hg.Core.Globals (Globals, GlobalEntry, globalsList, lookupGlobal)
 import Hg.Core.Params (Case(..), Universe(..), Variants(..))
@@ -75,8 +75,10 @@ isIdentChar c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' &&
 
 -- | `Bwd/elemAt` -> `bwd'elemAt` style: `/` and `-` become `'` and `_`
 mangle :: String -> String
-mangle x = SCU.fromCharArray (map f (SCU.toCharArray x))
+mangle x0 = SCU.fromCharArray (map f (SCU.toCharArray x))
   where
+  -- (an operator is spelt out: `+` and `-` are not both `_`)
+  x = spellOperator x0
   f '/' = '\''
   f '-' = '_'
   f c = if isIdentChar c then c else '_'
