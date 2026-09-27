@@ -1,13 +1,13 @@
 // Generated from Hippogriff; do not edit.
 
-const textIn = (parent, tag, str, hd, k) => hd.bind(hd.malg({ $: "Create", a: [tag, (n) => n] }))((x) => hd.bind(hd.malg({ $: "Text", a: [x, str, { $: "MkUnit", a: [] }] }))((x1) => hd.bind(hd.malg({ $: "Append", a: [parent, x, { $: "MkUnit", a: [] }] }))((x2) => k(x))));
+const textIn = (parent, tag, str, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Create", a: [tag, (n) => n] }] }))((x) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [x, str, { $: "MkUnit", a: [] }] }] }))((x1) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Append", a: [parent, x, { $: "MkUnit", a: [] }] }] }))((x2) => k(x))));
 
-const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "Sleep", a: [100n, { $: "MkUnit", a: [] }] }))((x) => {
+const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", a: [100n, { $: "MkUnit", a: [] }] }] }))((x) => {
   const str = n.toString() + " ticks";
-  return hd.bind(hd.malg({ $: "Text", a: [label, str, { $: "MkUnit", a: [] }] }))((x1) => tick(label, n + 1n, hd, k));
+  return hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [label, str, { $: "MkUnit", a: [] }] }] }))((x1) => tick(label, n + 1n, hd, k));
 });
 
-const clock = (hd, k) => hd.bind(hd.malg({ $: "Root", a: [(n) => n] }))((x) => textIn(x, "p", "0 ticks", hd, (x1) => tick(x1, 1n, hd, k)));
+const clock = (hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Root", a: [(n) => n] }] }))((x) => textIn(x, "p", "0 ticks", hd, (x1) => tick(x1, 1n, hd, k)));
 const clock$c = (hd) => (k) => clock(hd, k);
 
 const $runDom = (main, rootEl) => {
@@ -16,7 +16,9 @@ const $runDom = (main, rootEl) => {
   const node = (n) => nodes[Number(n)];
   const found = (el) => { if (!el) return { $: "Nothing", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: "Just", a: [BigInt(i)] }; };
   const done = () => {};
-  const perform = (p, k) => {
+  const perform = (p0, k) => {
+    // (the effects' sum: either's operation, whose names are distinct)
+    const p = p0.$ === "InL" || p0.$ === "InR" ? p0.a[0] : p0;
     const a = p.a;
     switch (p.$) {
       case "Create": nodes.push(document.createElement(a[0])); return k(a[1](BigInt(nodes.length - 1)));
@@ -33,7 +35,7 @@ const $runDom = (main, rootEl) => {
       case "Put": state = a[0]; return k(a[1]);
       case "Sleep": setTimeout(() => k(a[1]), Number(a[0])); return;
       case "Fetch": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;
-      default: throw new Error("heff: not a dom operation: " + (p && p.$));
+      default: throw new Error("heff: not an operation of the app's effect: " + (p && p.$));
     }
   };
   // the handler: its monad's return and bind, and its algebra

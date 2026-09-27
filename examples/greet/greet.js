@@ -2,14 +2,14 @@
 const $T = { $: "True", a: [] }, $F = { $: "False", a: [] };
 const $nomatch = (s) => { throw new Error("heff: no case for '" + (s && s.$) + "'"); };
 
-const greet = (hd, k) => hd.bind(hd.malg({ $: "XPath", a: ["//p[@id='greeting']", (n) => n] }))((x) => hd.bind(hd.malg({ $: "Select", a: ["#name", (n) => n] }))((x1) => {
+const greet = (hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "XPath", a: ["//p[@id='greeting']", (n) => n] }] }))((x) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Select", a: ["#name", (n) => n] }] }))((x1) => {
   switch (x.$) {
     case "Nothing": {
       return k({ $: "MkUnit", a: [] });
     }
     case "Just": {
       const n = x.a[0];
-      return hd.bind(hd.malg({ $: "Text", a: [n, (() => {
+      return hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [n, (() => {
         const s = "" === "" ? $T : $F;
         switch (s.$) {
           case "True": {
@@ -20,16 +20,16 @@ const greet = (hd, k) => hd.bind(hd.malg({ $: "XPath", a: ["//p[@id='greeting']"
           }
         }
         return $nomatch(s);
-      })(), { $: "MkUnit", a: [] }] }))((x2) => {
+      })(), { $: "MkUnit", a: [] }] }] }))((x2) => {
         switch (x1.$) {
           case "Nothing": {
             return k({ $: "MkUnit", a: [] });
           }
           case "Just": {
             const n1 = x1.a[0];
-            return hd.bind(hd.malg({ $: "On", a: [n1, "input", (v) => {
+            return hd.bind(hd.malg({ $: "InL", a: [{ $: "On", a: [n1, "input", (v) => {
               const k2 = hd.ret;
-              return hd.bind(hd.malg({ $: "Text", a: [n, (() => {
+              return hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [n, (() => {
                 const s = v === "" ? $T : $F;
                 switch (s.$) {
                   case "True": {
@@ -40,8 +40,8 @@ const greet = (hd, k) => hd.bind(hd.malg({ $: "XPath", a: ["//p[@id='greeting']"
                   }
                 }
                 return $nomatch(s);
-              })(), { $: "MkUnit", a: [] }] }))((x3) => k2(x3));
-            }, { $: "MkUnit", a: [] }] }))((x3) => k(x3));
+              })(), { $: "MkUnit", a: [] }] }] }))((x3) => k2(x3));
+            }, { $: "MkUnit", a: [] }] }] }))((x3) => k(x3));
           }
         }
         return $nomatch(x1);
@@ -58,7 +58,9 @@ const $runDom = (main, rootEl) => {
   const node = (n) => nodes[Number(n)];
   const found = (el) => { if (!el) return { $: "Nothing", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: "Just", a: [BigInt(i)] }; };
   const done = () => {};
-  const perform = (p, k) => {
+  const perform = (p0, k) => {
+    // (the effects' sum: either's operation, whose names are distinct)
+    const p = p0.$ === "InL" || p0.$ === "InR" ? p0.a[0] : p0;
     const a = p.a;
     switch (p.$) {
       case "Create": nodes.push(document.createElement(a[0])); return k(a[1](BigInt(nodes.length - 1)));
@@ -75,7 +77,7 @@ const $runDom = (main, rootEl) => {
       case "Put": state = a[0]; return k(a[1]);
       case "Sleep": setTimeout(() => k(a[1]), Number(a[0])); return;
       case "Fetch": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;
-      default: throw new Error("heff: not a dom operation: " + (p && p.$));
+      default: throw new Error("heff: not an operation of the app's effect: " + (p && p.$));
     }
   };
   // the handler: its monad's return and bind, and its algebra

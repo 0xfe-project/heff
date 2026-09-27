@@ -142,7 +142,7 @@ implementation: build it with GHC ≥ 9.12 and put the path of the
 gone, and what is known at compile time is computed then.  `examples/clock/clock.hg`
 
 ```haskell
-tick :: Int -> Int -> Co (dom Int) Unit
+tick :: Int -> Int -> Co (plus dom (state Int)) Unit
 tick label n = do
   sleep 100
   text label (showInt n ++ " ticks")
@@ -153,9 +153,9 @@ becomes (the handler `hd` is the page's, given at run time; `Co`'s `bind`,
 the operations and the effect's `hmap` are computed away)
 
 ```js
-const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "Sleep", a: [100n, { $: "MkUnit", a: [] }] }))((x) => {
+const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", a: [100n, { $: "MkUnit", a: [] }] }] }))((x) => {
   const str = n.toString() + " ticks";
-  return hd.bind(hd.malg({ $: "Text", a: [label, str, { $: "MkUnit", a: [] }] }))((x1) => tick(label, n + 1n, hd, k));
+  return hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [label, str, { $: "MkUnit", a: [] }] }] }))((x1) => tick(label, n + 1n, hd, k));
 });
 ```
 
@@ -207,9 +207,10 @@ everything else is checked byte for byte against the reference.
   (impredicative), which is what makes `Co h a` a small type.
   `test/surface/exc.hg`: exceptions with `catch`, handled by `Maybe`.
 - Apps: `lib/dom.hg` is the DOM as an effect (create, text, attr, append,
-  on, root, select and xpath to find an element of the page, get/put the
-  app's state, sleep, fetch).  A computation with it is an
-  app: `hg app` writes it, with all it uses, as a script for a page (into
+  on, root, select and xpath to find an element of the page, sleep,
+  fetch), and `lib/state.hg` a state (get, put); an app is a computation with the
+  two as one, `Co (plus dom (state s)) Unit` (`plus`, the sum of two
+  effects, is in `lib/co.hg`): `hg app` writes it, with all it uses, as a script for a page (into
   `<div id="hg-app">`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a
   handler).  The same app runs under a handler written in Hippogriff for

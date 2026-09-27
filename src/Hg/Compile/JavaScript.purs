@@ -54,7 +54,7 @@ compileJs g exports0 =
     , errors: l.errors
     }
 
--- | a script that runs an app (a computation with the `dom` effect) in the
+-- | a script that runs an app (a computation with `plus dom (state s)`) in the
 -- | element `#hg-app`, else the page's body
 compileApp :: Globals -> String -> Output
 compileApp g key =
@@ -337,7 +337,8 @@ uncurryJs = go []
       _ -> { params: ps, body: s }
     Nothing -> { params: ps, body: s }
 
--- | the handler of the `dom` effect (lib/dom.hg) that acts on the page.  Its
+-- | the handler of an app's effect (`plus dom (state s)`, lib/dom.hg: the
+-- | DOM's and a state's, as one) that acts on the page.  Its
 -- | (raw) monad is the continuation monad, `(a -> ()) -> ()`: an operation
 -- | may finish later (`Sleep`, `Fetch`), and the rest of the computation --
 -- | its continuation -- runs then.  That is JavaScript's asynchrony, as a
@@ -352,7 +353,9 @@ domRuntime = S.joinWith "\n"
   , "  const node = (n) => nodes[Number(n)];"
   , "  const found = (el) => { if (!el) return { $: \"Nothing\", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: \"Just\", a: [BigInt(i)] }; };"
   , "  const done = () => {};"
-  , "  const perform = (p, k) => {"
+  , "  const perform = (p0, k) => {"
+  , "    // (the effects' sum: either's operation, whose names are distinct)"
+  , "    const p = p0.$ === \"InL\" || p0.$ === \"InR\" ? p0.a[0] : p0;"
   , "    const a = p.a;"
   , "    switch (p.$) {"
   , "      case \"Create\": nodes.push(document.createElement(a[0])); return k(a[1](BigInt(nodes.length - 1)));"
@@ -369,7 +372,7 @@ domRuntime = S.joinWith "\n"
   , "      case \"Put\": state = a[0]; return k(a[1]);"
   , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
   , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
-  , "      default: throw new Error(\"heff: not a dom operation: \" + (p && p.$));"
+  , "      default: throw new Error(\"heff: not an operation of the app's effect: \" + (p && p.$));"
   , "    }"
   , "  };"
   , "  // the handler: its monad's return and bind, and its algebra"

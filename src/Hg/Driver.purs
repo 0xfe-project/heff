@@ -259,7 +259,8 @@ promote c = A.foldr put c.source (watches c)
     in
       before <> sep <> S.joinWith "" (map (_ <> "\n") lines) <> SCU.drop w.expectTo s
 
--- | an app is a definition that takes a `Handler (dom s)` (lib/dom.hg):
+-- | an app is a definition that takes a `Handler (plus dom (state s))`
+-- | (lib/dom.hg):
 -- | the first of a file's, or the one named
 findApp :: Checked -> Maybe String -> Maybe String
 findApp c = case _ of
@@ -268,7 +269,8 @@ findApp c = case _ of
   where
   isApp k = case lookupGlobal c.top.globals k <#> \e -> readbTy 0 e.type_ of
     Just (Function ft) -> case ft.dom of
-      Decode (App (Global h) (App (Global d) _)) -> short h == "Handler" && short d == "dom"
+      Decode (App (Global h) (App (App (Global p) (Global d)) (App (Global st) _))) ->
+        short h == "Handler" && short p == "plus" && short d == "dom" && short st == "state"
       _ -> false
     _ -> false
   short k = fromMaybe k (A.last (S.split (S.Pattern ".") k))
