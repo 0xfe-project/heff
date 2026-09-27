@@ -145,8 +145,8 @@ gone, and what is known at compile time is computed then.  `examples/clock.hg`
 tick :: Int -> Int -> Co (dom Int) Unit
 tick label n = do
   sleep 100
-  text label (strAppend (intShow n) " ticks")
-  tick label (intAdd n 1)
+  text label (showInt n ++ " ticks")
+  tick label (n + 1)
 ```
 
 becomes (the handler `hd` is the page's, given at run time; `Co`'s `bind`,
@@ -165,7 +165,8 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "Sleep", a: [100n, { $: "
 - `test/surface.mjs`: the library, examples and `test/surface`, `test/modules`
   elaborate and their expectations hold; the module rules reject what they
   should.
-- `test/app-run.mjs`: the example apps, compiled and run on a pretend page.
+- `test/app-run.mjs`: the example apps and `test/apps`, compiled and run on
+  a pretend page.
 - `test/compile-check.mjs`, `test/compile-check-js.mjs`: the golden corpus,
   `test/programs` and generated programs, compiled and run; every value
   computed must be the interpreter's.
@@ -205,7 +206,8 @@ everything else is checked byte for byte against the reference.
   (impredicative), which is what makes `Co h a` a small type.
   `test/surface/exc.hg`: exceptions with `catch`, handled by `Maybe`.
 - Apps: `lib/dom.hg` is the DOM as an effect (create, text, attr, append,
-  on, get/put the app's state, sleep, fetch).  A computation with it is an
+  on, root, select and xpath to find an element of the page, get/put the
+  app's state, sleep, fetch).  A computation with it is an
   app: `hg app` writes it, with all it uses, as a script for a page (into
   `<div id="hg-app">`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a

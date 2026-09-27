@@ -342,13 +342,15 @@ uncurryJs = go []
 -- | may finish later (`Sleep`, `Fetch`), and the rest of the computation --
 -- | its continuation -- runs then.  That is JavaScript's asynchrony, as a
 -- | handler: the computation is the same whatever handles it.  Nodes are
--- | numbered, 0 being the root.
+-- | numbered, 0 being the root; an element of the page found (`Select`,
+-- | `XPath`) is numbered when first found.
 domRuntime :: String
 domRuntime = S.joinWith "\n"
   [ "const $runDom = (main, rootEl) => {"
   , "  const nodes = [rootEl];"
   , "  let state;"
   , "  const node = (n) => nodes[Number(n)];"
+  , "  const found = (el) => { if (!el) return { $: \"Nothing\", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: \"Just\", a: [BigInt(i)] }; };"
   , "  const done = () => {};"
   , "  const perform = (p, k) => {"
   , "    const a = p.a;"
@@ -361,6 +363,8 @@ domRuntime = S.joinWith "\n"
   , "      case \"Value\": return k(a[1](String(node(a[0]).value ?? \"\")));"
   , "      case \"On\": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : \"\"))(done)); return k(a[3]); }"
   , "      case \"Root\": return k(a[0](0n));"
+  , "      case \"Select\": return k(a[1](found(document.querySelector(a[0]))));"
+  , "      case \"XPath\": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));"
   , "      case \"Get\": return k(a[0](state));"
   , "      case \"Put\": state = a[0]; return k(a[1]);"
   , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"

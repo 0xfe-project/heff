@@ -18,7 +18,16 @@ class Node {
   addEventListener(e, h) { (this.listeners[e] ??= []).push(h); }
   fire(e) { for (const h of this.listeners[e] ?? []) h({ target: this }); }
   get text() { return this.textContent + this.children.map((c) => c.text).join(""); }
+  // (the elements under this one, this one first)
+  *all() { yield this; for (const c of this.children) yield* c.all(); }
 }
+// what the pretend page finds: `#id` (querySelector), `//tag[@id='id']` (evaluate)
+const byId = (page, id, tag) => [...page.all()].find((n) => n.attrs.id === id && (!tag || n.tag === tag)) ?? null;
+const pretendDocument = (page) => ({
+  body: page, getElementById: (id) => byId(page, id), createElement: (t) => new Node(t),
+  querySelector: (q) => { const m = /^#([\w-]+)$/.exec(q); return m ? byId(page, m[1]) : null; },
+  evaluate: (q) => { const m = /^\/\/(\w+)\[@id='([\w-]+)'\]$/.exec(q); return { singleNodeValue: m ? byId(page, m[2], m[1]) : null }; },
+});
 let timers = [];
 globalThis.setTimeout = (f, ms) => { timers.push(f); };
 const tick = () => { const ts = timers; timers = []; for (const f of ts) f(); };
@@ -27,12 +36,13 @@ let failed = 0;
 const check = (what, got, want) => {
   if (got !== want) { failed++; console.log(`FAIL ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
-async function run(file, name) {
+async function run(file, name, fill = () => {}) {
   const out = join(work, `${name}.mjs`);
   const r = spawnSync("node", [join(root, "bin", "hg.mjs"), "app", file, name, out], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL hg app ${file}\n${r.stdout}${r.stderr}`); return null; }
   const page = new Node("body");
-  globalThis.document = { body: page, getElementById: () => null, createElement: (t) => new Node(t) };
+  fill(page);
+  globalThis.document = pretendDocument(page);
   await import(pathToFileURL(out) + `?${Date.now()}`);
   return page;
 }
@@ -51,5 +61,16 @@ if (clock) {
   for (let i = 0; i < 5; i++) tick();
   check("clock after 5 ticks", label.text, "5 ticks");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter and clock run"}`);
+// elements already on the page, found by a CSS selector and an XPath
+const withParagraphs = (page) => {
+  for (const id of ["out", "log"]) { const p = new Node("p"); p.setAttribute("id", id); page.appendChild(p); }
+};
+const finder = await run("test/apps/select.hg", "finder", withParagraphs);
+if (finder) {
+  const [out, log] = finder.children;
+  check("found by css", out.text, "found by css");
+  check("found by xpath", log.text, "found by xpath");
+  check("nothing else written", finder.children.length, 2);
+}
+console.log(`apps: ${failed ? "FAILED" : "counter, clock and finder run"}`);
 process.exit(failed ? 1 : 0);
