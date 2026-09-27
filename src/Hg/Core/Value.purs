@@ -177,6 +177,7 @@ toBare n = { head: n.head, spine: n.spine }
 data El
   = Neu Neutral
   | Code Ty
+  -- | annotated with its whole function type, as `S.Lam` is (see `lamDom`)
   | Lam (Lazy Ty) (Clo El)
   | Cons (Dict (Ev El))
   | Opaque
@@ -325,6 +326,14 @@ behavior = case _ of
   Sum st -> LikeSum st
   PrimInt -> LikeInt
   PrimString -> LikeString
+
+-- | the domain of a lambda's function type annotation; a metavariable
+-- | solution's lambdas are annotated with a placeholder universe instead, which
+-- | is taken as the domain itself
+lamDom :: Ty -> Ty
+lamDom t = case behavior t of
+  LikeFunction ft -> ft.dom
+  _ -> t
 
 -- | decoding an element of case N
 decodeN :: El -> Ty

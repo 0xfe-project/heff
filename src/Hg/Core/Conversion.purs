@@ -110,7 +110,7 @@ canon v = case v of
     V.LikeRecord _ -> case force n.expansion of
       V.IntoCons fields -> V.Cons (dictMap V.Nom fields)
       V.NotApplicable -> panic "neutral of record type was never expanded"
-    V.LikeFunction f -> V.Lam (pure f.dom) (V.Clo "x" V.LNil (\w -> V.app v (defer \_ -> V.localsAt w 0)))
+    V.LikeFunction _ -> V.Lam n.ty (V.Clo "x" V.LNil (\w -> V.app v (defer \_ -> V.localsAt w 0)))
     _ -> v
   _ -> v
 
@@ -122,7 +122,7 @@ defEqEl cs v v' = case canon v, canon v' of
   V.Neu _, _ -> Left (UnequalEls cs v v' Nothing)
   V.Code a, V.Code a' -> defEqTy cs a a'
   V.Code _, _ -> Left (UnequalEls cs v v' Nothing)
-  V.Lam a c, V.Lam _ c' -> defEqCloEl cs (force a) c c'
+  V.Lam a c, V.Lam _ c' -> defEqCloEl cs (V.lamDom (force a)) c c'
   V.Lam _ _, _ -> Left (UnequalEls cs v v' Nothing)
   V.Cons d, V.Cons d' -> sequence_ (A.zipWith (\x y -> defEqEl cs (V.nom x) (V.nom y)) d.values d'.values)
   V.Cons _, _ -> Left (UnequalEls cs v v' Nothing)

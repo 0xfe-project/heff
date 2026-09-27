@@ -66,7 +66,7 @@ readbEl :: CtxLen -> V.El -> S.El
 readbEl n = case _ of
   V.Neu ne -> readbBare n (V.toBare ne)
   V.Code a -> S.Code (readbTy n a)
-  V.Lam dom body -> S.Lam (readbTy n (force dom)) (readbCloEl n (force dom) body)
+  V.Lam fty body -> S.Lam (readbTy n (force fty)) (readbCloEl n (V.lamDom (force fty)) body)
   V.Cons d -> S.Cons (dictMap (readbEv n) d)
   V.Opaque -> S.Opaque
 

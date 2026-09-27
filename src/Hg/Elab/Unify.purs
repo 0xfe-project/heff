@@ -176,7 +176,7 @@ canon v = case v of
       V.LikeRecord _ -> case L.force n.expansion of
         V.IntoCons fields -> V.Cons (dictMap V.Nom fields)
         V.NotApplicable -> v
-      V.LikeFunction f -> V.Lam (pure f.dom) (V.Clo "x" V.LNil (\w -> V.app v (pure (V.localsAt w 0))))
+      V.LikeFunction _ -> V.Lam n.ty (V.Clo "x" V.LNil (\w -> V.app v (pure (V.localsAt w 0))))
       _ -> v
   _ -> v
 
@@ -195,7 +195,7 @@ uEl g cs a0 b0 = do
         V.Code t, V.Code t' -> uTy g cs t t'
         V.Lam d c, V.Lam _ c' -> do
           let
-            x = V.local cs.len (L.force d)
+            x = V.local cs.len (V.lamDom (L.force d))
             cs' = { len: cs.len + 1, names: fromMaybe "x" (V.cloName c) : cs.names }
           uEl g cs' (V.nom (V.appClo c (pure x))) (V.nom (V.appClo c' (pure x)))
         V.Cons d, V.Cons d' -> for_ (A.zip d.values d'.values) \(Tuple x y) -> uEl g cs (V.nom x) (V.nom y)
@@ -281,9 +281,9 @@ rename g m r v0 = do
         h <- renameHead r n.head
         renameSpine g m r n.spine h
     V.Code t -> S.Code <$> renameTy g m r t
-    V.Lam dom body -> do
-      d <- renameTy g m r (L.force dom)
-      b <- renameClo g m r (L.force dom) body
+    V.Lam fty body -> do
+      d <- renameTy g m r (L.force fty)
+      b <- renameClo g m r (V.lamDom (L.force fty)) body
       pure (S.Lam d b)
     V.Cons d -> S.Cons <$> dictTraverse (renameEv g m r) d
     V.Opaque -> pure S.Opaque
