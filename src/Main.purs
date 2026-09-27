@@ -24,7 +24,7 @@ import Hg.Lsp as Lsp
 import Hg.Support.Diff (mismatch, useColor)
 import Hg.Support.Pretty as P
 import Node.Encoding (Encoding(..))
-import Node.FS.Sync (readTextFile, writeTextFile)
+import Node.FS.Sync (readTextFile, realpath, writeTextFile)
 import Node.Process (argv, exit', stderr, stdout)
 import Node.Stream (writeString)
 
@@ -50,11 +50,12 @@ usage = S.joinWith "\n"
 err :: String -> Effect Unit
 err s = void (writeString stderr UTF8 s)
 
--- | the standard library, next to `bin/`
+-- | the standard library, next to `bin/` (the script's own, not that of a
+-- | link to it: `npm link` makes one)
 libDir :: Effect String
 libDir = do
   args <- argv
-  let script = fromMaybe "bin/hg.mjs" (A.index args 1)
+  script <- realpath (fromMaybe "bin/hg.mjs" (A.index args 1))
   pure (S.joinWith "/" (A.dropEnd 2 (S.split (S.Pattern "/") script) <> [ "lib" ]))
 
 -- | a file and what it imports, elaborated, the file itself last.  What
