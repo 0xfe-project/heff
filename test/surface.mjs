@@ -12,7 +12,8 @@ const hg = (...args) => spawnSync("node", [join(root, "bin", "hg.mjs"), ...args]
 const hgIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hg")).map((f) => join(dir, f));
 let failed = 0;
 
-const files = [...hgIn("lib"), ...hgIn("examples"), ...hgIn("test/surface"), "test/modules/app/main.hg"];
+const examples = readdirSync(join(root, "examples"), { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => hgIn(join("examples", d.name)));
+const files = [...hgIn("lib"), ...examples, ...hgIn("test/surface"), "test/modules/app/main.hg"];
 const t = hg("test", ...files);
 console.log(t.stdout.trim().split("\n").pop());
 if (t.status !== 0) { failed++; console.log(t.stdout + t.stderr); }

@@ -117,12 +117,12 @@ try {
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hg") } });
 
   // in a `do` block, the name hovered, not the `bind` it is read into
-  const counter = disk("examples/counter.hg");
-  open("examples/counter.hg", counter);
-  await diagnosticsOf(uri("examples/counter.hg"));
-  const inDo = await request("textDocument/hover", { textDocument: { uri: uri("examples/counter.hg") }, position: pos(counter, "showCount 0") });
+  const counter = disk("examples/counter/counter.hg");
+  open("examples/counter/counter.hg", counter);
+  await diagnosticsOf(uri("examples/counter/counter.hg"));
+  const inDo = await request("textDocument/hover", { textDocument: { uri: uri("examples/counter/counter.hg") }, position: pos(counter, "showCount 0") });
   expect("hover in a do block", inDo.result && inDo.result.contents.value.includes("showCount :: Int -> String"), inDo.result);
-  const defInDo = await request("textDocument/definition", { textDocument: { uri: uri("examples/counter.hg") }, position: pos(counter, "showCount 0") });
+  const defInDo = await request("textDocument/definition", { textDocument: { uri: uri("examples/counter/counter.hg") }, position: pos(counter, "showCount 0") });
   expect("definition in a do block", defInDo.result && defInDo.result.range.start.line === pos(counter, "showCount ::").line, defInDo.result);
 
   // a constructor, in an expression and in a pattern: where its type declares it

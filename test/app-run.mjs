@@ -47,14 +47,14 @@ async function run(file, name, fill = () => {}) {
   return page;
 }
 
-const counter = await run("examples/counter.hg", "counter");
+const counter = await run("examples/counter/counter.hg", "counter");
 if (counter) {
   const [label, button] = counter.children;
   check("counter at first", label.text, "count: 0");
   button.fire("click"); button.fire("click"); button.fire("click");
   check("counter after 3 clicks", label.text, "count: 3");
 }
-const clock = await run("examples/clock.hg", "clock");
+const clock = await run("examples/clock/clock.hg", "clock");
 if (clock) {
   const [label] = clock.children;
   check("clock at first", label.text, "0 ticks");
@@ -72,5 +72,18 @@ if (finder) {
   check("found by xpath", log.text, "found by xpath");
   check("nothing else written", finder.children.length, 2);
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock and finder run"}`);
+// the page's own input and paragraph (examples/greet/index.html)
+const greetPage = (page) => {
+  const input = new Node("input"); input.setAttribute("id", "name"); input.value = "";
+  const p = new Node("p"); p.setAttribute("id", "greeting");
+  page.appendChild(input); page.appendChild(p);
+};
+const greet = await run("examples/greet/greet.hg", "greet", greetPage);
+if (greet) {
+  const [input, p] = greet.children;
+  check("greet at first", p.text, "Hello, whoever you are.");
+  input.value = "Ada"; input.fire("input");
+  check("greet after typing", p.text, "Hello, Ada!");
+}
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder and greet run"}`);
 process.exit(failed ? 1 : 0);

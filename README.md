@@ -139,7 +139,7 @@ implementation: build it with GHC ≥ 9.12 and put the path of the
 ## Compiling
 
 `hg compile-js` and `hg app` compile, not transliterate: what is a type is
-gone, and what is known at compile time is computed then.  `examples/clock.hg`
+gone, and what is known at compile time is computed then.  `examples/clock/clock.hg`
 
 ```haskell
 tick :: Int -> Int -> Co (dom Int) Unit
@@ -166,7 +166,8 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "Sleep", a: [100n, { $: "
   elaborate and their expectations hold; the module rules reject what they
   should.
 - `test/app-run.mjs`: the example apps and `test/apps`, compiled and run on
-  a pretend page.
+  a pretend page; `examples/build.mjs --check`: the apps built in
+  `examples/` are up to date.
 - `test/compile-check.mjs`, `test/compile-check-js.mjs`: the golden corpus,
   `test/programs` and generated programs, compiled and run; every value
   computed must be the interpreter's.
@@ -212,7 +213,13 @@ everything else is checked byte for byte against the reference.
   `<div id="hg-app">`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a
   handler).  The same app runs under a handler written in Hippogriff for
-  tests (`test/surface/dom-trace.hg`).  See `examples/`.
+  tests (`test/surface/dom-trace.hg`).
+- Examples: each of `examples/counter`, `examples/clock`, `examples/greet`
+  is a project (`hg.json`, the program, `index.html`) with its app built:
+  open `index.html` in a browser, from the disk as it is (the app is a
+  plain script, importing nothing).  `npm run examples` builds the apps
+  again; `npm test` fails if one is not what its program compiles to.
+  `greet` finds the page's own elements, by a CSS selector and an XPath.
 - In the tools (not `hg golden` or `hg ref`, which stay the reference): a
   call of the definition being defined is checked as `rec (...)`, so
   recursion needs no `rec`.

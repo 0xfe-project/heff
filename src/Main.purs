@@ -156,7 +156,7 @@ main = do
         for_ r.errors \e -> err ("hg: not compiled: " <> e <> "\n")
         when (not (A.null r.errors)) (exit' 1)
         writeTextFile UTF8 out r.source
-        log ("wrote " <> out <> ": load it in a page with <script type=\"module\" src=\"...\">, into <div id=\"hg-app\">")
+        log ("wrote " <> out <> ": load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too), after a <div id=\"hg-app\"> (else it uses the body)")
   -- | 1 if the file is not formatted (with `--check`) or cannot be
   fmtOne checkOnly f = do
     src <- readTextFile UTF8 f
