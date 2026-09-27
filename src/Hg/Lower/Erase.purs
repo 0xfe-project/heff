@@ -2,8 +2,7 @@
 -- | placeholder, but gone, with the parameter that took it and the argument
 -- | given for it.  Which is which is read off the types (Hippogriff's phase
 -- | distinction: a small type is never computed from a value), so the core
--- | is checked again, with the elaborator's NbE, as `Hg.Compile.PureScript`
--- | does.
+-- | is checked again, with the elaborator's NbE.
 -- |
 -- | A term is a type when its type classifies types: a universe (`Type`,
 -- | `Theory`), or a function into one.  So `(a :: Type) -> ...` loses its

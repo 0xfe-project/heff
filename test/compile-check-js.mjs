@@ -14,7 +14,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "nod
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setSeed, genProgram } from "./gen.mjs";
-import { flat } from "./runtime-inspect.mjs";
+import { flat } from "./flat.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const [nArg = "100", seedArg = "7"] = process.argv.slice(2);

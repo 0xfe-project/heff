@@ -14,7 +14,6 @@ import Data.Tuple (Tuple(..))
 import Effect (Effect)
 import Effect.Console (log)
 import Hg.Compile.JavaScript (compileApp, compileJs, compileNode)
-import Hg.Compile.PureScript (compileModule, psValueName)
 import Hg.Core.Globals (globalsList)
 import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp, findProgram, goldenReport, goldenReportWith, promote, refReport, renderFileDiags, testFile, typeAt, watches)
 import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
@@ -40,7 +39,6 @@ commands =
   , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hf", flags: [] }
   , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: [] }
   , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (lib/io.hf)", files: ".hf", flags: [] }
-  , { name: "compile", args: "FILE MOD OUT", doc: "a PureScript module", files: ".hf", flags: [] }
   , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: [] }
   , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: [] }
   , { name: "golden", args: "[--tools] FILE", doc: "the reference's golden report (.hpgf)", files: ".hpgf", flags: [ { flag: "tools", doc: "with the tools' extensions" } ] }
@@ -116,19 +114,6 @@ main = do
     [ "app", f, n, out ] -> app f (Just n) out
     [ "node", f, out ] -> program f Nothing out
     [ "node", f, n, out ] -> program f (Just n) out
-    [ "compile", f, modName, outFile ] -> do
-      l <- load f
-      let
-        g = l.file.top.globals
-        r = compileModule modName g identity
-        -- (each global: its name, its PureScript name, whether it is delayed)
-        names = map (\(Tuple x _) -> J.fromArray [ J.fromString x, J.fromString (psValueName x), J.fromBoolean (A.elem x r.delayed) ]) (globalsList g)
-      writeTextFile UTF8 outFile r.source
-      writeTextFile UTF8 (outFile <> ".json") (J.stringify (J.fromArray names))
-      -- (what does not elaborate is left out, and said so)
-      for_ (r.skipped <> map (\d -> "(not elaborated) " <> P.render d.msg) l.file.diags) \x -> log ("skipped " <> x)
-      for_ r.errors \x -> log ("error " <> x)
-      when (not (A.null r.errors)) (exit' 1)
     [ "explain", f ] -> do
       -- the trace is kept outside the state too, so an internal error does
       -- not take it along

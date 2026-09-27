@@ -3,7 +3,7 @@
 heff is Hippogriff (Lynch & Staton, arXiv:2608.19728), ported from the reference
 Haskell implementation to PureScript and checked against it by differential
 testing, with a text-based toolchain: files, modules, a checker, doctests,
-an interpreter, and compilers to JavaScript and PureScript.
+an interpreter, and a compiler to JavaScript.
 
 Extracted from `hippogriff-lab`, where the same language lived in a
 content-addressed codebase with a card-based IDE and a HOTT₁ theorem prover.
@@ -60,8 +60,7 @@ has the arithmetic, comparisons, `&&`, `||`, `++` and `$`, with `Maybe`,
 
 ```
 text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
-                                             ├─[Hg.Lower]→ IR ─[Hg.Compile.JavaScript]→ JavaScript
-                                             └─[Hg.Compile.PureScript]→ PureScript
+                                             └─[Hg.Lower]→ IR ─[Hg.Compile.JavaScript]→ JavaScript
 ```
 
 | path | stage |
@@ -72,7 +71,7 @@ text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
 | `src/Hg/Print` | core → `.hf` text (`Surface`, `Resugar`: `match`es back to equations) |
 | `src/Hg/Eval` | the interpreter: by value (heff's), or by need (the reference's) |
 | `src/Hg/Lower` | core → an untyped IR, and computing on it: `Erase` (types, with the parameters that take them and the arguments given for them, read off the types with the elaborator's NbE), `Shake` (only what is reached), `Simplify` (β, inlining what is not recursive, known fields and tags), `Arity` (a definition of n parameters called with n arguments at once) |
-| `src/Hg/Compile` | `JavaScript` (the IR emitted as an ES module; a DOM runtime for apps), `PureScript` (typed, from the core) |
+| `src/Hg/Compile` | `JavaScript` (the IR emitted as an ES module; runtimes for a page's apps and for Node.js programs) |
 | `src/Hg/Support` | pretty printing, diagnostics, big integers |
 | `src/Hg/Format.purs` | the formatter: `.hf` read again keeping every token and comment, laid out anew; refused if the result would not read as the same notation with the same comments |
 | `src/Hg/Lsp.purs` | the language server: diagnostics, hover, go to definition, formatting |
@@ -121,7 +120,6 @@ heff promote FILE            # write each watch's value under it
 heff compile-js FILE OUT.js  # an ES module; its default export has FILE's definitions
 heff app FILE [NAME] OUT.js  # a script running an app (lib/dom.hf) in a page
 heff node FILE [NAME] OUT.mjs  # a Node.js program running NAME (lib/io.hf)
-heff compile FILE MOD OUT    # a PureScript module
 heff explain FILE            # the elaboration trace: metavariables, unifications, delays
 heff type-at FILE OFFSET     # what the name there resolved to, and its type
 heff golden [--tools] FILE   # the reference's golden report (.hpgf)
@@ -171,7 +169,7 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", 
 - `test/app-run.mjs`: the example apps and `test/apps`, compiled and run on
   a pretend page.
 - `test/node-run.mjs`: `test/node` compiled for Node.js and run.
-- `test/compile-check.mjs`, `test/compile-check-js.mjs`: the golden corpus,
+- `test/compile-check-js.mjs`: the golden corpus,
   `test/programs` and generated programs, compiled and run; each value must
   be the interpreter's (by value): the same value, or both abandon.
 - `test/fuzz.mjs`: generated programs, against the reference executable.
