@@ -15,6 +15,7 @@
 module Hg.Compile.JavaScript
   ( compileJs
   , compileApp
+  , compileNode
   , Output
   ) where
 
@@ -63,6 +64,18 @@ compileApp g key =
     m = emitDefs l.defs [ key ]
   in
     { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit." ] <> m.lines <> [ "", domRuntime, "", "$runDom(" <> ref m.globals key <> ");", "" ])
+    , errors: l.errors
+    }
+
+-- | a Node.js program (an ES module) that runs a computation with `io`
+-- | (lib/io.hg)
+compileNode :: Globals -> String -> Output
+compileNode g key =
+  let
+    l = lower g [ key ]
+    m = emitDefs l.defs [ key ]
+  in
+    { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit.", "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";" ] <> m.lines <> [ "", nodeRuntime, "", "$runNode(" <> ref m.globals key <> ");", "" ])
     , errors: l.errors
     }
 
@@ -373,6 +386,47 @@ domRuntime = S.joinWith "\n"
   , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
   , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
   , "      default: throw new Error(\"heff: not an operation of the app's effect: \" + (p && p.$));"
+  , "    }"
+  , "  };"
+  , "  // the handler: its monad's return and bind, and its algebra"
+  , "  const hd = {"
+  , "    ret: (x) => (k) => k(x),"
+  , "    bind: (m) => (f) => (k) => m((x) => f(x)(k)),"
+  , "    malg: (p) => (k) => perform(p, k),"
+  , "  };"
+  , "  return main(hd)(hd.ret)(done);"
+  , "};"
+  ]
+
+-- | the handler of `io` (lib/io.hg) that acts on the process: as the page's
+-- | (`domRuntime`), its monad is the continuation monad, so what Node does
+-- | asynchronously (writing, reading the standard input, files) goes on in
+-- | the continuation.  `Exit` does not go on: the process ends when what is
+-- | pending (output being written) is done.  (An operation done at once goes
+-- | on at once, the stack deeper each time: every so often, it goes on after
+-- | the stack is let go of, lest a long loop of them overflow it.)
+nodeRuntime :: String
+nodeRuntime = S.joinWith "\n"
+  [ "const $runNode = (main) => {"
+  , "  const nothing = { $: \"Nothing\", a: [] };"
+  , "  const just = (x) => ({ $: \"Just\", a: [x] });"
+  , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
+  , "  const bool = (b) => ({ $: b ? \"True\" : \"False\", a: [] });"
+  , "  const done = () => {};"
+  , "  let depth = 0;"
+  , "  const now = (k) => (x) => { if (depth > 1000) { depth = 0; setImmediate(() => k(x)); return; } depth++; k(x); };"
+  , "  const perform = (p, k0) => {"
+  , "    const a = p.a, k = now(k0);"
+  , "    switch (p.$) {"
+  , "      case \"Write\": process.stdout.write(a[0], () => k(a[1])); return;"
+  , "      case \"WriteErr\": process.stderr.write(a[0], () => k(a[1])); return;"
+  , "      case \"ReadStdin\": { let text = \"\"; process.stdin.setEncoding(\"utf8\"); process.stdin.on(\"data\", (d) => { text += d; }); process.stdin.on(\"end\", () => k(a[0](text))); return; }"
+  , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
+  , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
+  , "      case \"ReadFile\": $readFile(a[0], \"utf8\", (e, t) => k(a[1](e ? nothing : just(t)))); return;"
+  , "      case \"WriteFile\": $writeFile(a[0], a[1], (e) => k(a[2](bool(!e)))); return;"
+  , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
+  , "      default: throw new Error(\"heff: not an operation of io: \" + (p && p.$));"
   , "    }"
   , "  };"
   , "  // the handler: its monad's return and bind, and its algebra"

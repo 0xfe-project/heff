@@ -13,10 +13,10 @@ import Data.Traversable (for_)
 import Data.Tuple (Tuple(..))
 import Effect (Effect)
 import Effect.Console (log)
-import Hg.Compile.JavaScript (compileApp, compileJs)
+import Hg.Compile.JavaScript (compileApp, compileJs, compileNode)
 import Hg.Compile.PureScript (compileModule, psValueName)
 import Hg.Core.Globals (globalsList)
-import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp, goldenReport, goldenReportWith, promote, refReport, renderFileDiags, testFile, typeAt, watches)
+import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp, findProgram, goldenReport, goldenReportWith, promote, refReport, renderFileDiags, testFile, typeAt, watches)
 import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
 import Hg.Format (format)
 import Hg.Load (loadProgram, pathsFor)
@@ -38,6 +38,7 @@ commands =
   , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hg", flags: [] }
   , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hg", flags: [] }
   , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hg) in a page", files: ".hg", flags: [] }
+  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (lib/io.hg)", files: ".hg", flags: [] }
   , { name: "compile", args: "FILE MOD OUT", doc: "a PureScript module", files: ".hg", flags: [] }
   , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hg", flags: [] }
   , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hg", flags: [] }
@@ -112,6 +113,8 @@ main = do
       when (not l.ok || not (A.null r.errors)) (exit' 1)
     [ "app", f, out ] -> app f Nothing out
     [ "app", f, n, out ] -> app f (Just n) out
+    [ "node", f, out ] -> program f Nothing out
+    [ "node", f, n, out ] -> program f (Just n) out
     [ "compile", f, modName, outFile ] -> do
       l <- load f
       let
@@ -181,6 +184,16 @@ main = do
         when (not (A.null r.errors)) (exit' 1)
         writeTextFile UTF8 out r.source
         log ("wrote " <> out <> ": load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)")
+  program f n out = do
+    l <- load f
+    case findProgram l.file n of
+      Nothing -> err ("hg: no program " <> fromMaybe "" n <> " in " <> f <> " (a program takes a `Handler io`, lib/io.hg)\n") *> exit' 1
+      Just k -> do
+        let r = compileNode l.file.top.globals k
+        for_ r.errors \e -> err ("hg: not compiled: " <> e <> "\n")
+        when (not (A.null r.errors)) (exit' 1)
+        writeTextFile UTF8 out r.source
+        log ("wrote " <> out <> ": run it with `node " <> out <> " ARGS...`")
   -- | 1 if the file is not formatted (with `--check`) or cannot be
   fmtOne checkOnly f = do
     src <- readTextFile UTF8 f

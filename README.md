@@ -120,6 +120,7 @@ hg test FILE...            # do the expectations hold?
 hg promote FILE            # write each watch's value under it
 hg compile-js FILE OUT.js  # an ES module; its default export has FILE's definitions
 hg app FILE [NAME] OUT.js  # a script running an app (lib/dom.hg) in a page
+hg node FILE [NAME] OUT.mjs  # a Node.js program running NAME (lib/io.hg)
 hg compile FILE MOD OUT    # a PureScript module
 hg explain FILE            # the elaboration trace: metavariables, unifications, delays
 hg type-at FILE OFFSET     # what the name there resolved to, and its type
@@ -169,6 +170,7 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", 
   should.
 - `test/app-run.mjs`: the example apps and `test/apps`, compiled and run on
   a pretend page.
+- `test/node-run.mjs`: `test/node` compiled for Node.js and run.
 - `test/compile-check.mjs`, `test/compile-check-js.mjs`: the golden corpus,
   `test/programs` and generated programs, compiled and run; every value
   computed must be the interpreter's.
@@ -216,6 +218,13 @@ everything else is checked byte for byte against the reference.
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a
   handler).  The same app runs under a handler written in Hippogriff for
   tests (`test/surface/dom-trace.hg`).
+- Programs: `lib/io.hg` is a program's world as an effect (write to the
+  standard output or error, read the standard input, the arguments, an
+  environment variable, read and write files, exit with a status); a
+  program is a computation with it, `Co io Unit`: `hg node` writes it as
+  a Node.js program (an ES module), whose runtime is a handler of `io`
+  (again the continuation monad: Node's asynchrony is plain `do`).
+  `test/node/echo.hg` does each operation once.
 - Examples: each of `examples/counter`, `examples/clock`, `examples/greet`
   is a project (`project.hg`, the program, `index.html`): `npm run examples`
   builds the apps, then open `index.html` in a browser, from the disk as

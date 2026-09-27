@@ -19,6 +19,7 @@ module Hg.Driver
   , testFile
   , promote
   , findApp
+  , findProgram
   , explain
   , typeAt
   , definitionAt
@@ -269,17 +270,33 @@ promote c = A.foldr put c.source (watches c)
 -- | (lib/dom.hg):
 -- | the first of a file's, or the one named
 findApp :: Checked -> Maybe String -> Maybe String
-findApp c = case _ of
+findApp = findTaking case _ of
+  App (Global h) (App (App (Global p) (Global d)) (App (Global st) _)) ->
+    short h == "Handler" && (short p == "<+>" || short p == "plus") && short d == "dom" && short st == "state"
+  _ -> false
+
+-- | a program is a definition that takes a `Handler io` (lib/io.hg): the
+-- | first of a file's, or the one named
+findProgram :: Checked -> Maybe String -> Maybe String
+findProgram = findTaking case _ of
+  App (Global h) (Global e) -> short h == "Handler" && short e == "io"
+  _ -> false
+
+-- | the definition named, else the first of a file's whose parameter's type
+-- | is one the test says
+findTaking :: (El -> Boolean) -> Checked -> Maybe String -> Maybe String
+findTaking takes c = case _ of
   Just x -> _.key <$> A.find (\o -> o.name == x) c.own
-  Nothing -> _.key <$> A.find (isApp <<< _.key) c.own
+  Nothing -> _.key <$> A.find (ok <<< _.key) c.own
   where
-  isApp k = case lookupGlobal c.top.globals k <#> \e -> readbTy 0 e.type_ of
+  ok k = case lookupGlobal c.top.globals k <#> \e -> readbTy 0 e.type_ of
     Just (Function ft) -> case ft.dom of
-      Decode (App (Global h) (App (App (Global p) (Global d)) (App (Global st) _))) ->
-        short h == "Handler" && (short p == "<+>" || short p == "plus") && short d == "dom" && short st == "state"
+      Decode d -> takes d
       _ -> false
     _ -> false
-  short k = fromMaybe k (A.last (S.split (S.Pattern ".") k))
+
+short :: String -> String
+short k = fromMaybe k (A.last (S.split (S.Pattern ".") k))
 
 -- Semantic queries
 --------------------------------------------------------------------------------
