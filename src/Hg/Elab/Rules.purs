@@ -342,7 +342,8 @@ recordFormation fieldTyps = Typ \e -> do
   Tuple l fields <- go (e { elabFor = ForNominative }) fieldTyps
   pure (M.record (evalEnv e) { level: l, fieldTypes: dictFromList fields })
 
-type FieldSetting = { name :: Name, chk :: Chk, span :: Span }
+-- | (`nameSpan`: the field's name, where it is written)
+type FieldSetting = { name :: Name, chk :: Chk, span :: Span, nameSpan :: Span }
 
 recordIntro :: Span -> Array FieldSetting -> Chk
 recordIntro sp fieldSettings = Chk \e a0 -> do
@@ -355,6 +356,7 @@ recordIntro sp fieldSettings = Chk \e a0 -> do
             let
               field = fieldC vs
               elabFor' = projElabFor e.elabFor x
+            recordName e a fs.name fs.nameSpan field.ty
             m <- runChk fs.chk (e { elabFor = elabFor' }) field.ty
             let v = createNominative elabFor' (force m.val) field.ty
             case field.value of
@@ -387,7 +389,9 @@ recordElim sp projectee x = Syn \e -> do
     V.LikeRecord rt -> do
       when (not (dictContains rt.fieldTypes x)) $
         failWith sp 7 (txt "no such field" <+> txt x <+> txt "in type" <+> prtIn e a)
-      pure (Tuple (M.proj eprojectee x) (V.projTy a (M.valN eprojectee) x))
+      let fieldTy = V.projTy a (M.valN eprojectee) x
+      recordName e a x sp fieldTy
+      pure (Tuple (M.proj eprojectee x) fieldTy)
     _ -> failWith sp 6 (txt "tried to project from a value that was not of a record type")
 
 recordSpec :: Span -> Syn -> Name -> Chk -> Syn
@@ -427,7 +431,7 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
   case V.behavior a of
     V.LikeSum (Variants vs) -> case dictLookup vs x of
       Just ts -> do
-        recordTag e a x tsp
+        recordName e a x tsp a
         tagArgs
         where
         tagArgs =
@@ -440,13 +444,14 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
     _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt ("'" <> x) <> txt " ... : T)`")
     _ -> failWith sp 14 (txt "cannot check tag syntax at non-sum type")
 
--- | a tag, where it is written, as a name of the sum type it is of (defined
--- | where that type is); not one put there by a desugaring (`if`'s), whose
--- | span is not the tag's
-recordTag :: ElabEnv -> V.Ty -> Name -> Span -> E Unit
-recordTag e a x tsp = case a of
-  V.Decode dn | V.Global k <- dn.head, tsp.end - tsp.start == S.length x || tsp.end - tsp.start == S.length x + 1 ->
-    record { span: tsp, name: x, key: Just k, ty: defer \_ -> P.render (prtIn e a) }
+-- | a tag or a field, where it is written, as a name of the type it is of
+-- | (a sum's, a record's), defined where that type is (the type named by a
+-- | global); `ty` the name's type.  Not one put there by a desugaring
+-- | (`if`'s tags), whose span is not the name's
+recordName :: ElabEnv -> V.Ty -> Name -> Span -> V.Ty -> E Unit
+recordName e a x sp ty = case a of
+  V.Decode dn | V.Global k <- dn.head, sp.end - sp.start == S.length x || sp.end - sp.start == S.length x + 1 ->
+    record { span: sp, name: x, key: Just k, ty: defer \_ -> P.render (prtIn e ty) }
   _ -> pure unit
 
 -- | `tags`: where the cases' tags are written
@@ -459,7 +464,7 @@ sumElim sp scrutSyn tags casesChk = Chk \e b -> do
   vs <- case V.behavior a of
     V.LikeSum (Variants vs) -> pure vs
     _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e a)
-  for_ tags \(Tuple x tsp) -> when (isJust (dictLookup vs x)) (recordTag e a x tsp)
+  for_ tags \(Tuple x tsp) -> when (isJust (dictLookup vs x)) (recordName e a x tsp a)
   cases <- map dictFromList $ flip traverse (dictToList vs) \(Tuple x ts) ->
     case dictLookup casesChk x of
       Just (Tuple xs bodyChk) ->

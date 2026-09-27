@@ -68,9 +68,9 @@ fieldDeclaration (Infix (Ident x _) (Keyword ":" _) n) = do
 fieldDeclaration n = failP (ntnSpan n) 1 (P.text "expected a field declaration of the form `x : A`")
 
 fieldSetting :: Case -> Ntn -> E R.FieldSetting
-fieldSetting c (Infix (Ident x _) (Keyword ":=" _) n) = do
+fieldSetting c (Infix (Ident x xsp) (Keyword ":=" _) n) = do
   v <- chk c n
-  pure { name: x, chk: v, span: ntnSpan n }
+  pure { name: x, chk: v, span: ntnSpan n, nameSpan: xsp }
 fieldSetting _ n = failP (ntnSpan n) 2 (P.text "expected a field setting of the form `x := v`")
 
 data Judgment

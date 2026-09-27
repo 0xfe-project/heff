@@ -147,6 +147,16 @@ try {
   const plusAt = pos(disk("lib/prelude.hg"), "(+) ::");
   expect("definition of an operator", plusDef.result && plusDef.result.uri === uri("lib/prelude.hg") && plusDef.result.range.start.line === plusAt.line, plusDef.result);
 
+  // a field, set in a record and projected: where its theory declares it
+  const co = disk("lib/co.hg");
+  open("lib/co.hg", co);
+  await diagnosticsOf(uri("lib/co.hg"));
+  const hmapAt = pos(co, "hmap ::");
+  for (const [what, at] of [["set in a record", pos(co, "hmap = ")], ["projected", pos(co, "hmap nt x")]]) {
+    const d = await request("textDocument/definition", { textDocument: { uri: uri("lib/co.hg") }, position: at });
+    expect("definition of a field " + what, d.result && d.result.range.start.line === hmapAt.line && d.result.range.start.character === hmapAt.character, d.result);
+  }
+
   // formatting: one edit, the whole text; what does not parse is left, with a warning
   const messy = "data Bool = True | False\n\nnot :: Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";
   open("test/surface/lsp-fmt.hg", messy);
