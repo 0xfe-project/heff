@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Programs compiled for Node.js (`hg node`, lib/io.hg) and run: what they
+// Programs compiled for Node.js (`heff node`, lib/io.hg) and run: what they
 // write, their exit status, and a long loop of operations done at once.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -15,8 +15,8 @@ const check = (what, got, want) => {
   if (got !== want) { failed++; console.log(`FAIL ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
 const build = (file, name, out) => {
-  const r = spawnSync("node", [join(root, "bin", "hg.mjs"), "node", file, name, out], { encoding: "utf8" });
-  if (r.status !== 0) { failed++; console.log(`FAIL hg node ${file}\n${r.stdout}${r.stderr}`); return false; }
+  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "node", file, name, out], { encoding: "utf8" });
+  if (r.status !== 0) { failed++; console.log(`FAIL heff node ${file}\n${r.stdout}${r.stderr}`); return false; }
   return true;
 };
 

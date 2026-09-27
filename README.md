@@ -114,26 +114,26 @@ module (a record type), and an instance is a record.
 npm install
 npx spago build
 
-hg check FILE              # elaborate FILE and what it imports; its definitions' types
-hg run FILE                # what each watch evaluates to
-hg test FILE...            # do the expectations hold?
-hg promote FILE            # write each watch's value under it
-hg compile-js FILE OUT.js  # an ES module; its default export has FILE's definitions
-hg app FILE [NAME] OUT.js  # a script running an app (lib/dom.hg) in a page
-hg node FILE [NAME] OUT.mjs  # a Node.js program running NAME (lib/io.hg)
-hg compile FILE MOD OUT    # a PureScript module
-hg explain FILE            # the elaboration trace: metavariables, unifications, delays
-hg type-at FILE OFFSET     # what the name there resolved to, and its type
-hg golden [--tools] FILE   # the reference's golden report (.hpgf)
-hg ref FILE                # what the reference executable prints (.hpgf)
-hg fmt [--check] FILE...   # format in place (--check: list what is not formatted)
-hg lsp                     # a language server on stdio (editors/vscode is a client)
-hg completions fish        # hg completions fish > ~/.config/fish/completions/hg.fish
+heff check FILE              # elaborate FILE and what it imports; its definitions' types
+heff run FILE                # what each watch evaluates to
+heff test FILE...            # do the expectations hold?
+heff promote FILE            # write each watch's value under it
+heff compile-js FILE OUT.js  # an ES module; its default export has FILE's definitions
+heff app FILE [NAME] OUT.js  # a script running an app (lib/dom.hg) in a page
+heff node FILE [NAME] OUT.mjs  # a Node.js program running NAME (lib/io.hg)
+heff compile FILE MOD OUT    # a PureScript module
+heff explain FILE            # the elaboration trace: metavariables, unifications, delays
+heff type-at FILE OFFSET     # what the name there resolved to, and its type
+heff golden [--tools] FILE   # the reference's golden report (.hpgf)
+heff ref FILE                # what the reference executable prints (.hpgf)
+heff fmt [--check] FILE...   # format in place (--check: list what is not formatted)
+heff lsp                     # a language server on stdio (editors/vscode is a client)
+heff completions fish        # heff completions fish > ~/.config/fish/completions/hg.fish
 
 npm test
 ```
 
-(`hg` is `node bin/hg.mjs`, or `npm link` it.)
+(`heff` is `node bin/heff.mjs`, or `npm link` it.)
 
 The differential fuzzer (`npm run fuzz`) needs the reference
 implementation: build it with GHC ≥ 9.12 and put the path of the
@@ -141,7 +141,7 @@ implementation: build it with GHC ≥ 9.12 and put the path of the
 
 ## Compiling
 
-`hg compile-js` and `hg app` compile, not transliterate: what is a type is
+`heff compile-js` and `heff app` compile, not transliterate: what is a type is
 gone, and what is known at compile time is computed then.  `examples/clock/clock.hg`
 
 ```haskell
@@ -213,7 +213,7 @@ everything else is checked byte for byte against the reference.
   on, select and xpath to find an element of the page, sleep,
   fetch), and `lib/state.hg` a state (get, put); an app is a computation with the
   two as one, `Co (dom <+> (state s)) Unit` (`<+>`, the sum of two
-  effects, is in `lib/co.hg`): `hg app` writes it, with all it uses, as a script for a page (where
+  effects, is in `lib/co.hg`): `heff app` writes it, with all it uses, as a script for a page (where
   it goes on the page is the app's to find, by `select` or `xpath`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a
   handler).  The same app runs under a handler written in Hippogriff for
@@ -221,7 +221,7 @@ everything else is checked byte for byte against the reference.
 - Programs: `lib/io.hg` is a program's world as an effect (write to the
   standard output or error, read the standard input, the arguments, an
   environment variable, read and write files, exit with a status); a
-  program is a computation with it, `Co io Unit`: `hg node` writes it as
+  program is a computation with it, `Co io Unit`: `heff node` writes it as
   a Node.js program (an ES module), whose runtime is a handler of `io`
   (again the continuation monad: Node's asynchrony is plain `do`).
   `test/node/echo.hg` does each operation once.
@@ -230,7 +230,7 @@ everything else is checked byte for byte against the reference.
   builds the apps, then open `index.html` in a browser, from the disk as
   it is (the app is a plain script, importing nothing).
   `greet` finds the page's own elements, by a CSS selector and an XPath.
-- In the tools (not `hg golden` or `hg ref`, which stay the reference): a
+- In the tools (not `heff golden` or `heff ref`, which stay the reference): a
   call of the definition being defined is checked as `rec (...)`, so
   recursion needs no `rec`.
 - The compiled code is call-by-value; the reference interpreter is lazy.

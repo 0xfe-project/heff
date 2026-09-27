@@ -33,7 +33,7 @@ for (const f of readdirSync(join(root, "test", "programs")).filter((f) => f.ends
 }
 for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genProgram() });
 
-const hg = (args) => spawnSync("node", [join(root, "bin", "hg.mjs"), ...args], { encoding: "utf8" });
+const heff = (args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8" });
 const modName = (name) => "Gen.M" + name.replace(/[^A-Za-z0-9]/g, "");
 
 // 1. compile each case to PureScript; keep those that compile
@@ -43,9 +43,9 @@ for (const c of cases) {
   const file = join(work, `${c.name}.hpgf`);
   writeFileSync(file, c.src);
   const out = join(work, "src", `${c.name}.purs`);
-  const r = hg(["compile", file, modName(c.name), out]);
+  const r = heff(["compile", file, modName(c.name), out]);
   // compiled as the tools elaborate, so compared with what they evaluate
-  const check = hg(["golden", "--tools", file]);
+  const check = heff(["golden", "--tools", file]);
   if (r.status !== 0) {
     rmSync(out, { force: true });
     compileErrors++;

@@ -156,7 +156,7 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
           , Tuple "definitionProvider" J.jsonTrue
           , Tuple "documentFormattingProvider" J.jsonTrue
           ]
-      , Tuple "serverInfo" (obj [ Tuple "name" (J.fromString "hg") ])
+      , Tuple "serverInfo" (obj [ Tuple "name" (J.fromString "heff") ])
       ]
     "shutdown" -> Ref.modify_ (_ { shutdown = true }) st *> reply id J.jsonNull
     "textDocument/hover" -> withProgram p \src program ->
@@ -172,7 +172,7 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
         Nothing -> reply id (J.fromArray [])
         Just d -> case format d.text of
           Left why -> do
-            notify "window/showMessage" (obj [ Tuple "type" (num 2), Tuple "message" (J.fromString ("hg: not formatted: " <> why)) ])
+            notify "window/showMessage" (obj [ Tuple "type" (num 2), Tuple "message" (J.fromString ("heff: not formatted: " <> why)) ])
             reply id (J.fromArray [])
           Right t
             | t == d.text -> reply id (J.fromArray [])
@@ -271,7 +271,7 @@ diagnostic :: String -> Diag -> Json
 diagnostic src d = obj $
   [ Tuple "range" (range src d.span)
   , Tuple "severity" (num sev)
-  , Tuple "source" (J.fromString "hg")
+  , Tuple "source" (J.fromString "heff")
   , Tuple "message" (J.fromString (P.render (renderDiagMessage d)))
   ] <> (if d.code == 0 then [] else [ Tuple "code" (J.fromString code) ])
   where

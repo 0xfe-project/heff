@@ -56,7 +56,7 @@ mkdirSync(tmp, { recursive: true });
 const snap = join(tmp, "snapshot");
 cpSync(join(root, "output"), join(snap, "output"), { recursive: true });
 mkdirSync(join(snap, "bin"), { recursive: true });
-cpSync(join(root, "bin", "hg.mjs"), join(snap, "bin", "hg.mjs"));
+cpSync(join(root, "bin", "heff.mjs"), join(snap, "bin", "heff.mjs"));
 writeFileSync(join(snap, "package.json"), JSON.stringify({ type: "module" }));
 
 function run(cmd, args) {
@@ -72,7 +72,7 @@ for (let i = 0; i < N; i++) {
   const file = join(tmp, `case${i}.hpgf`);
   writeFileSync(file, src);
   const ref = run(refExe, [file]);
-  const ours = run("node", [join(snap, "bin", "hg.mjs"), "ref", file]);
+  const ours = run("node", [join(snap, "bin", "heff.mjs"), "ref", file]);
   // Both diverging counts as agreeing: the reference loops (Haskell's stack
   // lives on the heap), the port runs out of JavaScript stack.
   const oursDiverged = ours.timedOut || /RangeError: Maximum call stack size exceeded/.test(ours.err || "") || /<diverged>/.test(ours.out || "");

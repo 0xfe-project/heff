@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Each example is a project (examples/NAME: project.hg, NAME.hg, index.html);
-// this writes its app, NAME.js, with `hg app`, after which index.html opens
+// this writes its app, NAME.js, with `heff app`, after which index.html opens
 // as it is.  (The apps are built, not kept: test/app-run.mjs runs them.)
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
@@ -13,7 +13,7 @@ let failed = 0;
 for (const name of readdirSync(here).sort()) {
   const dir = join(here, name), src = join(dir, `${name}.hg`), app = join(dir, `${name}.js`);
   if (!existsSync(join(dir, "project.hg")) || !existsSync(src)) continue;
-  const r = spawnSync("node", [join(root, "bin", "hg.mjs"), "app", src, name, app], { encoding: "utf8" });
+  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "app", src, name, app], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL examples/${name}: ${r.stdout}${r.stderr}`); continue; }
   console.log(`examples/${name}/${name}.js`);
 }

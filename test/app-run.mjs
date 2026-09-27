@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The example apps, compiled (`hg app`) and run on a pretend page: a DOM of
+// The example apps, compiled (`heff app`) and run on a pretend page: a DOM of
 // plain objects, events fired by hand, and time that passes when told to.
 import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
@@ -38,8 +38,8 @@ const check = (what, got, want) => {
 };
 async function run(file, name, fill = () => {}) {
   const out = join(work, `${name}.mjs`);
-  const r = spawnSync("node", [join(root, "bin", "hg.mjs"), "app", file, name, out], { encoding: "utf8" });
-  if (r.status !== 0) { failed++; console.log(`FAIL hg app ${file}\n${r.stdout}${r.stderr}`); return null; }
+  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "app", file, name, out], { encoding: "utf8" });
+  if (r.status !== 0) { failed++; console.log(`FAIL heff app ${file}\n${r.stdout}${r.stderr}`); return null; }
   const page = new Node("body");
   fill(page);
   globalThis.document = pretendDocument(page);

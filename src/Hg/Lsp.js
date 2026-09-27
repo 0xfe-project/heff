@@ -17,7 +17,7 @@ export const listenImpl = (onMessage) => () => {
       if (buf.length < end) return;
       const body = buf.subarray(sep + 4, end).toString("utf8");
       buf = buf.subarray(end);
-      try { onMessage(body)(); } catch (e) { process.stderr.write("hg lsp: " + (e && e.stack || e) + "\n"); }
+      try { onMessage(body)(); } catch (e) { process.stderr.write("heff lsp: " + (e && e.stack || e) + "\n"); }
     }
   });
   // (the client went away without `exit`)
@@ -29,7 +29,7 @@ export const sendImpl = (s) => () => {
   process.stdout.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "ascii"), body]));
 };
 
-export const logImpl = (s) => () => { process.stderr.write("hg lsp: " + s + "\n"); };
+export const logImpl = (s) => () => { process.stderr.write("heff lsp: " + s + "\n"); };
 
 export const setTimeoutImpl = (ms) => (k) => () => setTimeout(() => k(), ms);
 export const clearTimeoutImpl = (t) => () => clearTimeout(t);

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The language server (`hg lsp`), spoken to as an editor would: diagnostics
+// The language server (`heff lsp`), spoken to as an editor would: diagnostics
 // (of the editor's text, and of an import's unsaved text), hover and go to
 // definition (across modules, past non-ASCII text), formatting, shutdown.
 import { spawn } from "node:child_process";
@@ -12,7 +12,7 @@ const uri = (f) => pathToFileURL(join(root, f)).href;
 const disk = (f) => readFileSync(join(root, f), "utf8");
 
 // (as vscode-languageclient starts it, with `--stdio`)
-const server = spawn("node", [join(root, "bin", "hg.mjs"), "lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"] });
+const server = spawn("node", [join(root, "bin", "heff.mjs"), "lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"] });
 let buf = Buffer.alloc(0), nextId = 1, failed = 0, checks = 0;
 const waiting = new Map(), notes = [], noteWaiters = [];
 server.stdout.on("data", (chunk) => {

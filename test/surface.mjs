@@ -8,13 +8,13 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const hg = (...args) => spawnSync("node", [join(root, "bin", "hg.mjs"), ...args], { cwd: root, encoding: "utf8" });
+const heff = (...args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { cwd: root, encoding: "utf8" });
 const hgIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hg")).map((f) => join(dir, f));
 let failed = 0;
 
 const examples = readdirSync(join(root, "examples"), { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => hgIn(join("examples", d.name)));
 const files = [...hgIn("lib"), ...examples, ...hgIn("test/surface"), "test/modules/app/main.hg"];
-const t = hg("test", ...files);
+const t = heff("test", ...files);
 console.log(t.stdout.trim().split("\n").pop());
 if (t.status !== 0) { failed++; console.log(t.stdout + t.stderr); }
 
@@ -24,7 +24,7 @@ const rejected = [
   ["test/modules/clash.hg", "`Bool` is defined by more than one module imported: a, c"],
 ];
 for (const [f, msg] of rejected) {
-  const r = hg("check", f);
+  const r = heff("check", f);
   if (r.status === 0 || !r.stderr.includes(msg)) { failed++; console.log(`FAIL ${f}: expected an error "${msg}"\n${r.stderr}`); }
 }
 console.log(`modules: ${rejected.length} rejected as they should${failed ? " (with failures)" : ""}`);
@@ -33,7 +33,7 @@ console.log(`modules: ${rejected.length} rejected as they should${failed ? " (wi
 mkdirSync(join(root, "ref"), { recursive: true });
 const wrong = join(root, "ref", "wrong-expectation.hg");
 writeFileSync(wrong, `import prelude\n\n-- >>> "${"x".repeat(60)} on click"\n-- "${"x".repeat(60)} onn click"\n`);
-const w = hg("test", wrong);
+const w = heff("test", wrong);
 const report = w.stdout.slice(w.stdout.indexOf("  expected"));
 if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…") || report.includes("x".repeat(60))) {
   failed++;

@@ -29,14 +29,14 @@ for (const dir of ["golden", "programs"])
     cases.push({ name: `${dir}-${f.replace(".hpgf", "")}`, src: readFileSync(join(root, "test", dir, f), "utf8") });
 for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genProgram() });
 
-const hg = (args) => spawnSync("node", [join(root, "bin", "hg.mjs"), ...args], { encoding: "utf8" });
+const heff = (args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8" });
 
 let agree = 0, differ = 0, compileErrors = 0, compared = 0, failedCBV = 0, timeouts = 0;
 for (const c of cases) {
   const file = join(work, `${c.name}.hpgf`), out = join(work, `${c.name}.mjs`);
   writeFileSync(file, c.src);
-  const r = hg(["compile-js", file, out]);
-  const golden = hg(["golden", "--tools", file]).stdout;
+  const r = heff(["compile-js", file, out]);
+  const golden = heff(["golden", "--tools", file]).stdout;
   if (!golden.includes("-- evaluated\n")) continue;
   const interp = new Map();
   // a value's lines after the first are indented, or start with `,`/`]`

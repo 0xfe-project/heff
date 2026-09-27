@@ -387,7 +387,7 @@ refReport src =
 goldenReport :: String -> String
 goldenReport = goldenReportWith (\src -> let c = checkReference src in { globals: c.globals, diags: c.diags })
 
--- | the same, of what the tools elaborate (`hg golden --tools`)
+-- | the same, of what the tools elaborate (`heff golden --tools`)
 goldenReportWith :: (String -> { globals :: Globals, diags :: Array Diag }) -> String -> String
 goldenReportWith check src =
   let

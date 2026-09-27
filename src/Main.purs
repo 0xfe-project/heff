@@ -50,20 +50,20 @@ commands =
   ]
 
 usage :: String
-usage = S.joinWith "\n" ([ "usage: hg COMMAND FILE ...", "" ] <> map line commands)
+usage = S.joinWith "\n" ([ "usage: heff COMMAND FILE ...", "" ] <> map line commands)
   where
   line c = let head = c.name <> (if c.args == "" then "" else " " <> c.args) in "  " <> head <> S.joinWith "" (A.replicate (max 1 (24 - S.length head)) " ") <> c.doc
 
--- | fish's completions of hg: `hg completions fish > ~/.config/fish/completions/hg.fish`
+-- | fish's completions of heff: `heff completions fish > ~/.config/fish/completions/hg.fish`
 fishCompletions :: String
-fishCompletions = S.joinWith "\n" ([ "# hg (heff): written by `hg completions fish`", "complete -c hg -e", "complete -c hg -f" ] <> A.concatMap one commands) <> "\n"
+fishCompletions = S.joinWith "\n" ([ "# heff: written by `heff completions fish`", "complete -c heff -e", "complete -c heff -f" ] <> A.concatMap one commands) <> "\n"
   where
   quote x = "'" <> S.replaceAll (S.Pattern "'") (S.Replacement "\\'") x <> "'"
   one c =
-    [ "complete -c hg -n __fish_use_subcommand -a " <> c.name <> " -d " <> quote c.doc ]
-      <> (if c.files == "" then [] else [ "complete -c hg -n '__fish_seen_subcommand_from " <> c.name <> "' -a '(__fish_complete_suffix " <> c.files <> ")'" ])
-      <> map (\f -> "complete -c hg -n '__fish_seen_subcommand_from " <> c.name <> "' -l " <> f.flag <> " -d " <> quote f.doc) c.flags
-      <> (if c.name == "completions" then [ "complete -c hg -n '__fish_seen_subcommand_from completions' -a fish" ] else [])
+    [ "complete -c heff -n __fish_use_subcommand -a " <> c.name <> " -d " <> quote c.doc ]
+      <> (if c.files == "" then [] else [ "complete -c heff -n '__fish_seen_subcommand_from " <> c.name <> "' -a '(__fish_complete_suffix " <> c.files <> ")'" ])
+      <> map (\f -> "complete -c heff -n '__fish_seen_subcommand_from " <> c.name <> "' -l " <> f.flag <> " -d " <> quote f.doc) c.flags
+      <> (if c.name == "completions" then [ "complete -c heff -n '__fish_seen_subcommand_from completions' -a fish" ] else [])
 
 err :: String -> Effect Unit
 err s = void (writeString stderr UTF8 s)
@@ -73,7 +73,7 @@ err s = void (writeString stderr UTF8 s)
 libDir :: Effect String
 libDir = do
   args <- argv
-  script <- realpath (fromMaybe "bin/hg.mjs" (A.index args 1))
+  script <- realpath (fromMaybe "bin/heff.mjs" (A.index args 1))
   pure (S.joinWith "/" (A.dropEnd 2 (S.split (S.Pattern "/") script) <> [ "lib" ]))
 
 -- | a file and what it imports, elaborated, the file itself last.  What
@@ -109,7 +109,7 @@ main = do
       l <- load f
       let r = compileJs l.file.top.globals l.file.own
       writeTextFile UTF8 out r.source
-      for_ r.errors \e -> err ("hg: not compiled: " <> e <> "\n")
+      for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")
       when (not l.ok || not (A.null r.errors)) (exit' 1)
     [ "app", f, out ] -> app f Nothing out
     [ "app", f, n, out ] -> app f (Just n) out
@@ -177,20 +177,20 @@ main = do
   app f n out = do
     l <- load f
     case findApp l.file n of
-      Nothing -> err ("hg: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (dom <+> (state s))`, lib/dom.hg)\n") *> exit' 1
+      Nothing -> err ("heff: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (dom <+> (state s))`, lib/dom.hg)\n") *> exit' 1
       Just k -> do
         let r = compileApp l.file.top.globals k
-        for_ r.errors \e -> err ("hg: not compiled: " <> e <> "\n")
+        for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")
         when (not (A.null r.errors)) (exit' 1)
         writeTextFile UTF8 out r.source
         log ("wrote " <> out <> ": load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)")
   program f n out = do
     l <- load f
     case findProgram l.file n of
-      Nothing -> err ("hg: no program " <> fromMaybe "" n <> " in " <> f <> " (a program takes a `Handler io`, lib/io.hg)\n") *> exit' 1
+      Nothing -> err ("heff: no program " <> fromMaybe "" n <> " in " <> f <> " (a program takes a `Handler io`, lib/io.hg)\n") *> exit' 1
       Just k -> do
         let r = compileNode l.file.top.globals k
-        for_ r.errors \e -> err ("hg: not compiled: " <> e <> "\n")
+        for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")
         when (not (A.null r.errors)) (exit' 1)
         writeTextFile UTF8 out r.source
         log ("wrote " <> out <> ": run it with `node " <> out <> " ARGS...`")
@@ -198,7 +198,7 @@ main = do
   fmtOne checkOnly f = do
     src <- readTextFile UTF8 f
     case format src of
-      Left why -> err ("hg: " <> f <> " not formatted: " <> why <> "\n") $> 1
+      Left why -> err ("heff: " <> f <> " not formatted: " <> why <> "\n") $> 1
       Right out
         | out == src -> pure 0
         | checkOnly -> log f $> 1
