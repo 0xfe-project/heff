@@ -850,6 +850,14 @@ opensBlock = case _ of
   Do _ _ -> true
   _ -> false
 
+-- | a `do` or `case`, or a lambda to one: its items are lines of their own
+hangs :: E -> Boolean
+hangs = case _ of
+  Lam _ _ _ b -> hangs b
+  Case _ _ _ _ -> true
+  Do _ _ -> true
+  _ -> false
+
 pCon :: Env -> Con -> Doc
 pCon env c = tok env c.con <> foldMap (\a -> P.text " " <> pE env a) c.args
 
@@ -866,6 +874,12 @@ pE env = case _ of
   Sum kw o alts bars c ->
     tok env kw <+> P.group (P.align (tok env o <+> pCon env (headC alts) <> fold (A.zipWith (\bar a -> P.line <> tok env bar <+> pCon env a) bars (A.drop 1 alts)) <+> tok env c))
   Field e f -> pE env e <> tok env f
+  -- (a block last, `f x (\y -> do`, stays on the line, and its items are
+  -- indented from the line, not from the parenthesis)
+  App h args | Just { init, last: Paren o e c } <- A.unsnoc args, hangs e ->
+    P.group (pE env h <> P.nest 2 (foldMap (\a -> P.line <> pE env a) init)) <+> tok env o <> pE env e <> tok env c
+  App h args | Just { init, last } <- A.unsnoc args, hangs last ->
+    P.group (pE env h <> P.nest 2 (foldMap (\a -> P.line <> pE env a) init)) <+> pE env last
   App h args -> P.group (pE env h <> P.nest 2 (foldMap (\a -> P.line <> pE env a) args))
   op@(Op _ _ _) -> case chain op of
     { first, rest } ->

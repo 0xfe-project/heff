@@ -149,6 +149,30 @@ formats("do, nested blocks", [
   "",
 ].join("\n"));
 
+// (its items two columns in from the line, not from the parenthesis)
+formats("a block, the last argument", [
+  "import co",
+  "data Unit = MkUnit",
+  "k :: {h :: HFunctor} -> Co h Unit",
+  "k = do",
+  "  x <- val MkUnit",
+  "  bind (val x) (\\y ->",
+  "     do",
+  "       z <- val y",
+  "       val z)",
+  "",
+].join("\n"), [
+  "import co",
+  "data Unit = MkUnit",
+  "k :: {h :: HFunctor} -> Co h Unit",
+  "k = do",
+  "  x <- val MkUnit",
+  "  bind (val x) (\\y -> do",
+  "    z <- val y",
+  "    val z)",
+  "",
+].join("\n"));
+
 formats("a long signature: the arrows under `::`", [
   "import co",
   "handle2 :: {h :: HFunctor} -> {a b :: Type} -> h.f (Co h) a -> (a -> Co h b) -> Co h b",
