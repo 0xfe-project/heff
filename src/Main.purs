@@ -20,6 +20,7 @@ import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp,
 import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
 import Hg.Format (format)
 import Hg.Load (loadProgram, pathsFor)
+import Hg.Lsp as Lsp
 import Hg.Support.Pretty as P
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (readTextFile, writeTextFile)
@@ -42,6 +43,7 @@ usage = S.joinWith "\n"
   , "  golden [--tools] FILE   the reference's golden report (.hpgf)"
   , "  ref FILE                what the reference executable prints (.hpgf)"
   , "  fmt [--check] FILE...   format FILEs in place (--check: only say which are not formatted)"
+  , "  lsp                     a language server, on stdin/stdout"
   ]
 
 err :: String -> Effect Unit
@@ -128,6 +130,7 @@ main = do
       let r = refReport src
       void (writeString stdout UTF8 r.out)
       void (writeString stderr UTF8 r.err)
+    [ "lsp" ] -> libDir >>= Lsp.serve
     a | A.head a == Just "fmt" && A.length a > 1 -> do
       let
         checkOnly = A.index a 1 == Just "--check"

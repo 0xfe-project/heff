@@ -7,6 +7,7 @@ module Hg.Load
   ( Paths
   , pathsFor
   , loadProgram
+  , loadProgramWith
   ) where
 
 import Prelude
@@ -54,13 +55,18 @@ moduleOf ps file =
 -- | a file and every module it imports, directly or not, each after what it
 -- | imports
 loadProgram :: Paths -> String -> Effect { sources :: Array Source, errors :: Array String }
-loadProgram ps file = do
+loadProgram = loadProgramWith (readTextFile UTF8)
+
+-- | the same, reading each file with the function given (an editor's
+-- | unsaved text, say)
+loadProgramWith :: (String -> Effect String) -> Paths -> String -> Effect { sources :: Array Source, errors :: Array String }
+loadProgramWith read ps file = do
   done <- Ref.new ([] :: Array Source)
   errors <- Ref.new ([] :: Array String)
   let
     err e = Ref.modify_ (_ <> [ e ]) errors
     visit stack m path = do
-      src <- readTextFile UTF8 path
+      src <- read path
       let
         r = if syntaxOf path == Reference then { imports: [], text: src } else readImports src
         deps = map _.name r.imports

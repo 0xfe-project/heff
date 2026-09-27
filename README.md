@@ -55,6 +55,7 @@ text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
 | `src/Hg/Compile` | `JavaScript` (the IR emitted as an ES module; a DOM runtime for apps), `PureScript` (typed, from the core) |
 | `src/Hg/Support` | pretty printing, diagnostics, big integers |
 | `src/Hg/Format.purs` | the formatter: `.hg` read again keeping every token and comment, laid out anew; refused if the result would not read as the same notation with the same comments |
+| `src/Hg/Lsp.purs` | the language server: diagnostics, hover, go to definition, formatting |
 | `src/Hg/Load.purs`, `src/Hg/Driver.purs`, `src/Main.purs` | finding a program's files; running the stages over them; the CLI |
 
 ## Modules
@@ -104,6 +105,7 @@ hg type-at FILE OFFSET     # what the name there resolved to, and its type
 hg golden [--tools] FILE   # the reference's golden report (.hpgf)
 hg ref FILE                # what the reference executable prints (.hpgf)
 hg fmt [--check] FILE...   # format in place (--check: list what is not formatted)
+hg lsp                     # a language server on stdio (editors/vscode is a client)
 
 npm test
 ```

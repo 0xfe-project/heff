@@ -21,6 +21,7 @@ module Hg.Driver
   , findApp
   , explain
   , typeAt
+  , definitionAt
   , goldenReport
   , goldenReportWith
   , refReport
@@ -287,6 +288,37 @@ typeAt c off =
     i.name <> " :: " <> force i.ty <> (case i.key of
       Just _ -> "   (global)"
       Nothing -> "   (local)")
+
+-- | where the global the name at an offset resolved to is defined, in a
+-- | program (the file last): its file, and the span of its name there.
+-- | (A local's binder is not kept by the elaborator: nothing, for one.)
+definitionAt :: Array Checked -> Int -> Maybe { path :: String, source :: String, span :: F.Span }
+definitionAt program off = do
+  c <- A.last program
+  i <- A.last (A.filter (\i -> i.span.start <= off && off <= i.span.end) c.top.infos)
+  k <- i.key
+  -- (a primitive may be declared by more than one file: this one's first)
+  d <- A.head (A.mapMaybe (defines k) (A.reverse program))
+  pure { path: d.c.path, source: d.c.source, span: nameIn d.c.source d.name d.span }
+  where
+  defines k c = do
+    j <- A.findIndex (\o -> o.key == k) c.own
+    o <- A.index c.own j
+    Tuple _ sp <- A.index c.top.spans j
+    pure { c, name: o.name, span: sp }
+  -- the first occurrence of the name, as a word, in the declaration
+  nameIn src x sp =
+    let
+      word p = not (isNameChar (SCU.charAt p src))
+      go from = case SCU.indexOf' (S.Pattern x) from src of
+        Just p | p + SCU.length x <= sp.end ->
+          if (p == 0 || word (p - 1)) && word (p + SCU.length x) then { start: p, end: p + SCU.length x } else go (p + 1)
+        _ -> sp
+    in
+      go sp.start
+  isNameChar = case _ of
+    Just ch -> ch == '_' || ch == '\'' || ch == '/' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+    Nothing -> false
 
 -- The reference's reports
 --------------------------------------------------------------------------------
