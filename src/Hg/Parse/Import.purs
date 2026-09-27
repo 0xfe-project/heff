@@ -1,5 +1,5 @@
 -- | The header of a file: the `import m` lines before its first
--- | declaration.  `m` names the file `m.hg` (`a.b` names `a/b.hg`); where it
+-- | declaration.  `m` names the file `m.hf` (`a.b` names `a/b.hf`); where it
 -- | is looked for is the loader's business (`Hg.Load`).
 module Hg.Parse.Import
   ( Import
@@ -45,4 +45,4 @@ readImports src = go 0 []
 
 -- | the path, relative to a directory searched, of the file an import names
 importPath :: String -> String
-importPath name = S.replaceAll (S.Pattern ".") (S.Replacement "/") name <> ".hg"
+importPath name = S.replaceAll (S.Pattern ".") (S.Replacement "/") name <> ".hf"

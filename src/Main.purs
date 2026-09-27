@@ -32,19 +32,19 @@ import Node.Stream (writeString)
 -- | complete to (`files`: the files' suffix; `flags`)
 commands :: Array { name :: String, args :: String, doc :: String, files :: String, flags :: Array { flag :: String, doc :: String } }
 commands =
-  [ { name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its definitions' types", files: ".hg", flags: [] }
-  , { name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hg", flags: [] }
-  , { name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hg", flags: [] }
-  , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hg", flags: [] }
-  , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hg", flags: [] }
-  , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hg) in a page", files: ".hg", flags: [] }
-  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (lib/io.hg)", files: ".hg", flags: [] }
-  , { name: "compile", args: "FILE MOD OUT", doc: "a PureScript module", files: ".hg", flags: [] }
-  , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hg", flags: [] }
-  , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hg", flags: [] }
+  [ { name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its definitions' types", files: ".hf", flags: [] }
+  , { name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hf", flags: [] }
+  , { name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hf", flags: [] }
+  , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hf", flags: [] }
+  , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hf", flags: [] }
+  , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: [] }
+  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (lib/io.hf)", files: ".hf", flags: [] }
+  , { name: "compile", args: "FILE MOD OUT", doc: "a PureScript module", files: ".hf", flags: [] }
+  , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: [] }
+  , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: [] }
   , { name: "golden", args: "[--tools] FILE", doc: "the reference's golden report (.hpgf)", files: ".hpgf", flags: [ { flag: "tools", doc: "with the tools' extensions" } ] }
   , { name: "ref", args: "FILE", doc: "what the reference executable prints (.hpgf)", files: ".hpgf", flags: [] }
-  , { name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hg", flags: [ { flag: "check", doc: "only say which are not formatted" } ] }
+  , { name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hf", flags: [ { flag: "check", doc: "only say which are not formatted" } ] }
   , { name: "lsp", args: "", doc: "a language server, on stdin/stdout", files: "", flags: [] }
   , { name: "completions", args: "fish", doc: "a completion script for the shell", files: "", flags: [] }
   ]
@@ -177,7 +177,7 @@ main = do
   app f n out = do
     l <- load f
     case findApp l.file n of
-      Nothing -> err ("heff: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (dom <+> (state s))`, lib/dom.hg)\n") *> exit' 1
+      Nothing -> err ("heff: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (dom <+> (state s))`, lib/dom.hf)\n") *> exit' 1
       Just k -> do
         let r = compileApp l.file.top.globals k
         for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")
@@ -187,7 +187,7 @@ main = do
   program f n out = do
     l <- load f
     case findProgram l.file n of
-      Nothing -> err ("heff: no program " <> fromMaybe "" n <> " in " <> f <> " (a program takes a `Handler io`, lib/io.hg)\n") *> exit' 1
+      Nothing -> err ("heff: no program " <> fromMaybe "" n <> " in " <> f <> " (a program takes a `Handler io`, lib/io.hf)\n") *> exit' 1
       Just k -> do
         let r = compileNode l.file.top.globals k
         for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")

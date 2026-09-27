@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The formatter (src/Hg/Format.purs): every .hg file of the repository is
+// The formatter (src/Hg/Format.purs): every .hf file of the repository is
 // formatted (the formatter checks itself that the result means the same and
 // keeps the comments) and formatting it again changes nothing; then cases
 // of comments, blank lines, blocks and watches, some with the exact result.
@@ -25,7 +25,7 @@ const formats = (what, src, want) => {
   if (want !== undefined) expect(what, r.out === want, r.out);
 };
 
-const files = execFileSync("git", ["ls-files", "*.hg"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
+const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
 for (const f of files) formats(f, readFileSync(join(root, f), "utf8"));
 
 formats("spacing", "data Bool = True | False\nnot :: Bool -> Bool\nnot   True =    False\nnot False = True\n",

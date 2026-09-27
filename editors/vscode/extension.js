@@ -1,4 +1,4 @@
-// The client: runs `node <heff.serverPath> lsp` for `.hg` files.
+// The client: runs `node <heff.serverPath> lsp` for `.hf` files.
 const fs = require("fs");
 const path = require("path");
 const vscode = require("vscode");

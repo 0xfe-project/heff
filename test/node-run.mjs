@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Programs compiled for Node.js (`heff node`, lib/io.hg) and run: what they
+// Programs compiled for Node.js (`heff node`, lib/io.hf) and run: what they
 // write, their exit status, and a long loop of operations done at once.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -21,7 +21,7 @@ const build = (file, name, out) => {
 };
 
 const echo = join(work, "echo.mjs"), copied = join(work, "copied.txt");
-if (build("test/node/echo.hg", "echo", echo)) {
+if (build("test/node/echo.hf", "echo", echo)) {
   const r = spawnSync("node", [echo, copied, "two words"], { input: "from stdin", encoding: "utf8", env: { ...process.env, GREETING: "hi" } });
   check("echo: stdout", r.stdout, `${copied}\ntwo words\nhi\ncopied: from stdin\nmissing: not read\n`);
   check("echo: stderr", r.stderr, "to stderr\n");
@@ -30,7 +30,7 @@ if (build("test/node/echo.hg", "echo", echo)) {
 }
 
 // (each operation goes on at once: the stack must not overflow)
-const loop = join(work, "loop.hg"), loopJs = join(work, "loop.mjs");
+const loop = join(work, "loop.hf"), loopJs = join(work, "loop.mjs");
 writeFileSync(loop, [
   "import co", "import io", "import prelude", "",
   "loop :: Int -> Int -> Co io Unit",

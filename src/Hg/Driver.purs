@@ -58,7 +58,7 @@ import Hg.Support.Diagnostic (lineCol, renderDiag, renderDiags)
 import Hg.Support.Pretty ((<+>))
 import Hg.Support.Pretty as P
 
--- | the two syntaxes: ours (`.hg`, `Hg.Parse.Surface`) and the reference's
+-- | the two syntaxes: ours (`.hf`, `Hg.Parse.Surface`) and the reference's
 -- | (`.hpgf`, fnotation; for comparing with it)
 data Syntax = Surface | Reference
 
@@ -68,7 +68,7 @@ syntaxOf :: String -> Syntax
 syntaxOf path = if S.contains (S.Pattern ".hpgf") (S.drop (S.length path - 5) path) then Reference else Surface
 
 -- | a file as the loader found it: `module` is its name (`parse.surface`
--- | for `parse/surface.hg`), `text` its source with the import lines blanked
+-- | for `parse/surface.hf`), `text` its source with the import lines blanked
 -- | out, `deps` the modules it imports
 type Source = { path :: String, module :: String, source :: String, text :: String, deps :: Array String }
 
@@ -267,7 +267,7 @@ promote c = A.foldr put c.source (watches c)
       before <> sep <> S.joinWith "" (map (_ <> "\n") lines) <> SCU.drop w.expectTo s
 
 -- | an app is a definition that takes a `Handler (dom <+> (state s))`
--- | (lib/dom.hg):
+-- | (lib/dom.hf):
 -- | the first of a file's, or the one named
 findApp :: Checked -> Maybe String -> Maybe String
 findApp = findTaking case _ of
@@ -275,7 +275,7 @@ findApp = findTaking case _ of
     short h == "Handler" && (short p == "<+>" || short p == "plus") && short d == "dom" && short st == "state"
   _ -> false
 
--- | a program is a definition that takes a `Handler io` (lib/io.hg): the
+-- | a program is a definition that takes a `Handler io` (lib/io.hf): the
 -- | first of a file's, or the one named
 findProgram :: Checked -> Maybe String -> Maybe String
 findProgram = findTaking case _ of

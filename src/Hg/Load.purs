@@ -1,6 +1,6 @@
 -- | Finding a program's files.  A module is a file, named by its path from
--- | the project's root: `parse.surface` is `ROOT/parse/surface.hg`.  The root
--- | is the nearest directory above the file given with a `project.hg`, else
+-- | the project's root: `parse.surface` is `ROOT/parse/surface.hf`.  The root
+-- | is the nearest directory above the file given with a `project.hf`, else
 -- | the file's own directory.  A module not in the project is looked for in
 -- | the standard library (`lib/`).
 module Hg.Load
@@ -36,7 +36,7 @@ pathsFor lib file = do
   let start = dirname file
   let
     up d = do
-      found <- exists (d <> "/project.hg")
+      found <- exists (d <> "/project.hf")
       if found then pure d
       else if d == "/" || d == "." || d == "" then pure start
       else up (dirname d)
@@ -48,7 +48,7 @@ moduleOf :: Paths -> String -> String
 moduleOf ps file =
   let
     rel = fromMaybe file (S.stripPrefix (S.Pattern (ps.root <> "/")) file)
-    base = fromMaybe rel (S.stripSuffix (S.Pattern ".hg") rel)
+    base = fromMaybe rel (S.stripSuffix (S.Pattern ".hf") rel)
   in
     S.replaceAll (S.Pattern "/") (S.Replacement ".") (fromMaybe base (S.stripSuffix (S.Pattern ".hpgf") base))
 

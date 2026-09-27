@@ -52,7 +52,7 @@ An operator's declaration makes a group, of one associativity; `above` and
 `below` relate it to the groups of other operators, transitively.  Two
 operators of unrelated groups do not go together without parentheses: with
 the prelude's, `a + b ++ c` is refused.  `a + b` is `(+) a b`; fixities are
-seen by the files that import the module declaring them.  `lib/prelude.hg`
+seen by the files that import the module declaring them.  `lib/prelude.hf`
 has the arithmetic, comparisons, `&&`, `||`, `++` and `$`, with `Maybe`,
 `Either`, lists and their functions.
 
@@ -66,23 +66,23 @@ text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
 
 | path | stage |
 | --- | --- |
-| `src/Hg/Parse` | text → notation: `Surface` (`.hg`), `FNotation` and `Config` (the reference's `.hpgf`), `Import` (a file's header) |
+| `src/Hg/Parse` | text → notation: `Surface` (`.hf`), `FNotation` and `Config` (the reference's `.hpgf`), `Import` (a file's header) |
 | `src/Hg/Elab` | notation → core: `Top` (declarations), `Clauses` (equations → `match`), `Rules`, `Unify` (implicit arguments), `Environment`, `Prims` |
 | `src/Hg/Core` | the core: syntax, values (normalisation by evaluation), conversion, readback, the reference's printer |
-| `src/Hg/Print` | core → `.hg` text (`Surface`, `Resugar`: `match`es back to equations) |
+| `src/Hg/Print` | core → `.hf` text (`Surface`, `Resugar`: `match`es back to equations) |
 | `src/Hg/Eval` | the interpreter (lazy, as the reference's) |
 | `src/Hg/Lower` | core → an untyped IR, and computing on it: `Erase` (types, with the parameters that take them and the arguments given for them, read off the types with the elaborator's NbE), `Shake` (only what is reached), `Simplify` (β, inlining what is not recursive, known fields and tags), `Arity` (a definition of n parameters called with n arguments at once) |
 | `src/Hg/Compile` | `JavaScript` (the IR emitted as an ES module; a DOM runtime for apps), `PureScript` (typed, from the core) |
 | `src/Hg/Support` | pretty printing, diagnostics, big integers |
-| `src/Hg/Format.purs` | the formatter: `.hg` read again keeping every token and comment, laid out anew; refused if the result would not read as the same notation with the same comments |
+| `src/Hg/Format.purs` | the formatter: `.hf` read again keeping every token and comment, laid out anew; refused if the result would not read as the same notation with the same comments |
 | `src/Hg/Lsp.purs` | the language server: diagnostics, hover, go to definition, formatting |
 | `src/Hg/Load.purs`, `src/Hg/Driver.purs`, `src/Main.purs` | finding a program's files; running the stages over them; the CLI |
 
 ## Modules
 
 A module is a file, named by its path from the project's root:
-`parse/surface.hg` is `parse.surface`.  The root is the nearest directory
-above the file given that has a `project.hg` (a module like any other,
+`parse/surface.hf` is `parse.surface`.  The root is the nearest directory
+above the file given that has a `project.hf` (a module like any other,
 `project`: the project's `name`), else the file's own directory.
 A module not in the project is looked for in `lib/` (the standard library:
 `prelude`, `co`, `dom`).
@@ -119,8 +119,8 @@ heff run FILE                # what each watch evaluates to
 heff test FILE...            # do the expectations hold?
 heff promote FILE            # write each watch's value under it
 heff compile-js FILE OUT.js  # an ES module; its default export has FILE's definitions
-heff app FILE [NAME] OUT.js  # a script running an app (lib/dom.hg) in a page
-heff node FILE [NAME] OUT.mjs  # a Node.js program running NAME (lib/io.hg)
+heff app FILE [NAME] OUT.js  # a script running an app (lib/dom.hf) in a page
+heff node FILE [NAME] OUT.mjs  # a Node.js program running NAME (lib/io.hf)
 heff compile FILE MOD OUT    # a PureScript module
 heff explain FILE            # the elaboration trace: metavariables, unifications, delays
 heff type-at FILE OFFSET     # what the name there resolved to, and its type
@@ -142,7 +142,7 @@ implementation: build it with GHC ≥ 9.12 and put the path of the
 ## Compiling
 
 `heff compile-js` and `heff app` compile, not transliterate: what is a type is
-gone, and what is known at compile time is computed then.  `examples/clock/clock.hg`
+gone, and what is known at compile time is computed then.  `examples/clock/clock.hf`
 
 ```haskell
 tick :: Int -> Int -> Co (dom <+> (state Int)) Unit
@@ -200,7 +200,7 @@ everything else is checked byte for byte against the reference.
   - `do` ... : `x <- e` then the rest is `bind e (\x -> rest)`, with
     whichever `bind` is in scope (so any monad written in Hippogriff).
   - Modules (above).
-- Effects (`lib/co.hg`), after Yang and Wu, "Handling Higher-Order
+- Effects (`lib/co.hf`), after Yang and Wu, "Handling Higher-Order
   Effectful Operations with Judgemental Monadic Laws" (POPL 2026): an
   effect's signature is a higher-order functor (`HFunctor`), a handler is a
   raw monad with an algebra (`Handler h`, no laws asked), and a computation
@@ -208,25 +208,25 @@ everything else is checked byte for byte against the reference.
   continuation into its monad -- so `val`/`bind` satisfy the monad laws by
   beta and eta.  Hippogriff's Π takes the level of its codomain
   (impredicative), which is what makes `Co h a` a small type.
-  `test/surface/exc.hg`: exceptions with `catch`, handled by `Maybe`.
-- Apps: `lib/dom.hg` is the DOM as an effect (create, text, attr, append,
+  `test/surface/exc.hf`: exceptions with `catch`, handled by `Maybe`.
+- Apps: `lib/dom.hf` is the DOM as an effect (create, text, attr, append,
   on, select and xpath to find an element of the page, sleep,
-  fetch), and `lib/state.hg` a state (get, put); an app is a computation with the
+  fetch), and `lib/state.hf` a state (get, put); an app is a computation with the
   two as one, `Co (dom <+> (state s)) Unit` (`<+>`, the sum of two
-  effects, is in `lib/co.hg`): `heff app` writes it, with all it uses, as a script for a page (where
+  effects, is in `lib/co.hf`): `heff app` writes it, with all it uses, as a script for a page (where
   it goes on the page is the app's to find, by `select` or `xpath`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a
   handler).  The same app runs under a handler written in Hippogriff for
-  tests (`test/surface/dom-trace.hg`).
-- Programs: `lib/io.hg` is a program's world as an effect (write to the
+  tests (`test/surface/dom-trace.hf`).
+- Programs: `lib/io.hf` is a program's world as an effect (write to the
   standard output or error, read the standard input, the arguments, an
   environment variable, read and write files, exit with a status); a
   program is a computation with it, `Co io Unit`: `heff node` writes it as
   a Node.js program (an ES module), whose runtime is a handler of `io`
   (again the continuation monad: Node's asynchrony is plain `do`).
-  `test/node/echo.hg` does each operation once.
+  `test/node/echo.hf` does each operation once.
 - Examples: each of `examples/counter`, `examples/clock`, `examples/greet`
-  is a project (`project.hg`, the program, `index.html`): `npm run examples`
+  is a project (`project.hf`, the program, `index.html`): `npm run examples`
   builds the apps, then open `index.html` in a browser, from the disk as
   it is (the app is a plain script, importing nothing).
   `greet` finds the page's own elements, by a CSS selector and an XPath.

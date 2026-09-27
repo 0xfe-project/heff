@@ -1,4 +1,4 @@
--- | The formatter of the Haskell-like syntax (`.hg`).  The text is read
+-- | The formatter of the Haskell-like syntax (`.hf`).  The text is read
 -- | again, into a concrete syntax that keeps every token (the notation the
 -- | elaborator takes drops parentheses and sugar), each comment attached to
 -- | a token, and laid out anew with `Hg.Support.Pretty`.

@@ -1,4 +1,4 @@
--- | A language server (the Language Server Protocol, over stdio) for `.hg`
+-- | A language server (the Language Server Protocol, over stdio) for `.hf`
 -- | files: diagnostics, hover (`typeAt`), go to definition
 -- | (`definitionAt`), formatting (`Hg.Format`).
 -- |

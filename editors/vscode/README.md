@@ -1,6 +1,6 @@
 # heff for VS Code
 
-Highlighting for `.hg` files, and a client for heff's language server
+Highlighting for `.hf` files, and a client for heff's language server
 (`heff lsp`): diagnostics as you type, the type of a name on hover, go to
 definition (of globals, across modules and `lib/`), and formatting.
 

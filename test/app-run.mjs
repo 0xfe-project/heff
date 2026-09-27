@@ -49,7 +49,7 @@ async function run(file, name, fill = () => {}) {
 
 // (an element with an id, to be found: `#counter`, `#clock`)
 const withBox = (id) => (page) => { const d = new Node("div"); d.setAttribute("id", id); page.appendChild(d); };
-const counter = await run("examples/counter/counter.hg", "counter", withBox("counter"));
+const counter = await run("examples/counter/counter.hf", "counter", withBox("counter"));
 if (counter) {
   const [label, plus, minus] = counter.children[0].children;
   check("counter at first", label.text, "count: 0");
@@ -58,7 +58,7 @@ if (counter) {
   minus.fire("click");
   check("counter after -1", label.text, "count: 2");
 }
-const clock = await run("examples/clock/clock.hg", "clock", withBox("clock"));
+const clock = await run("examples/clock/clock.hf", "clock", withBox("clock"));
 if (clock) {
   const [label] = clock.children[0].children;
   check("clock at first", label.text, "0 ticks");
@@ -69,7 +69,7 @@ if (clock) {
 const withParagraphs = (page) => {
   for (const id of ["out", "log"]) { const p = new Node("p"); p.setAttribute("id", id); page.appendChild(p); }
 };
-const finder = await run("test/apps/select.hg", "finder", withParagraphs);
+const finder = await run("test/apps/select.hf", "finder", withParagraphs);
 if (finder) {
   const [out, log] = finder.children;
   check("found by css", out.text, "found by css");
@@ -82,7 +82,7 @@ const greetPage = (page) => {
   const p = new Node("p"); p.setAttribute("id", "greeting");
   page.appendChild(input); page.appendChild(p);
 };
-const greet = await run("examples/greet/greet.hg", "greet", greetPage);
+const greet = await run("examples/greet/greet.hf", "greet", greetPage);
 if (greet) {
   const [input, p] = greet.children;
   check("greet at first", p.text, "Hello, whoever you are.");

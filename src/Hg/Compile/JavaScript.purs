@@ -68,7 +68,7 @@ compileApp g key =
     }
 
 -- | a Node.js program (an ES module) that runs a computation with `io`
--- | (lib/io.hg)
+-- | (lib/io.hf)
 compileNode :: Globals -> String -> Output
 compileNode g key =
   let
@@ -350,7 +350,7 @@ uncurryJs = go []
       _ -> { params: ps, body: s }
     Nothing -> { params: ps, body: s }
 
--- | the handler of an app's effect (`dom <+> (state s)`, lib/dom.hg: the
+-- | the handler of an app's effect (`dom <+> (state s)`, lib/dom.hf: the
 -- | DOM's and a state's, as one) that acts on the page.  Its
 -- | (raw) monad is the continuation monad, `(a -> ()) -> ()`: an operation
 -- | may finish later (`Sleep`, `Fetch`), and the rest of the computation --
@@ -398,7 +398,7 @@ domRuntime = S.joinWith "\n"
   , "};"
   ]
 
--- | the handler of `io` (lib/io.hg) that acts on the process: as the page's
+-- | the handler of `io` (lib/io.hf) that acts on the process: as the page's
 -- | (`domRuntime`), its monad is the continuation monad, so what Node does
 -- | asynchronously (writing, reading the standard input, files) goes on in
 -- | the continuation.  `Exit` does not go on: the process ends when what is
