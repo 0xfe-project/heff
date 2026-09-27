@@ -824,7 +824,8 @@ pD env = case _ of
   -- (as written: its expectation is the lines under it)
   DWatch w e -> tok env w <> comment (SCU.slice w.end (lastE e).end env.src)
   where
-  params' = foldMap (\p -> P.text " " <> pE env p)
+  -- (a declaration's parameters are not broken: on one line, however long)
+  params' = foldMap (\p -> P.text " " <> P.flatten (pE env p))
   nm = foldMap (tok env)
   headOr xs = fromMaybe { con: eofTok, args: [] } (A.head xs)
 

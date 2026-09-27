@@ -12,6 +12,7 @@ module Hg.Support.Pretty
   , hardline
   , nest
   , group
+  , flatten
   , flatAlt
   , align
   , hang
