@@ -123,15 +123,17 @@ decl = lazyP \_ -> do
     "watch", _ -> do
       _ <- next
       e <- expr
-      pure [ Decl (MDecl [] ">" e { start: t.start, end: (ntnSpan e).end }) ]
+      end <- prevEnd
+      pure [ Decl (MDecl [] ">" e { start: t.start, end }) ]
     _, _ | t.kind == "var" || t.kind == "con" -> do
       t2 <- peekAt 1
       if t2.text == "::" then do
         _ <- next
         _ <- next
         ty <- expr
+        end <- prevEnd
         modify_ \s -> s { binders = A.snoc s.binders { f: t.text, names: piBinders ty } }
-        pure [ Sig t.text ty { start: t.start, end: (ntnSpan ty).end } ]
+        pure [ Sig t.text ty { start: t.start, end } ]
       else equation
     _, _ -> throwError (diag (spanOf t) ("a declaration cannot start with `" <> t.text <> "`"))
 
@@ -648,6 +650,11 @@ peek = gets cur
 
 peekAt :: Int -> P Tok
 peekAt k = gets \s -> fromMaybe eofTok (A.index s.toks (s.i + k))
+
+-- | where the last token read ends (a closing parenthesis, which the span of
+-- | what is in it leaves out, included)
+prevEnd :: P Int
+prevEnd = (_.end) <$> peekAt (-1)
 
 next :: P Tok
 next = do
