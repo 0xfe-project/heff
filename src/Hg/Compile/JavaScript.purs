@@ -304,9 +304,9 @@ primCall p as = case p, as of
 runtime :: String -> Array String
 runtime code = A.catMaybes
   [ when' "$T" "const $T = { $: \"True\", a: [] }, $F = { $: \"False\", a: [] };"
-  , when' "$abandon" "const $abandon = () => { throw new Error(\"hippogriff:abandon\"); };"
-  , when' "$nomatch" "const $nomatch = (s) => { throw new Error(\"hippogriff: no case for '\" + (s && s.$) + \"'\"); };"
-  , when' "$lazy" "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"hippogriff: defined by itself\"); state = 1; try { v = f(); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
+  , when' "$abandon" "const $abandon = () => { throw new Error(\"heff:abandon\"); };"
+  , when' "$nomatch" "const $nomatch = (s) => { throw new Error(\"heff: no case for '\" + (s && s.$) + \"'\"); };"
+  , when' "$lazy" "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"heff: defined by itself\"); state = 1; try { v = f(); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
   ]
   where
   when' k line = if S.contains (S.Pattern k) code then Just line else Nothing
@@ -363,7 +363,7 @@ domRuntime = S.joinWith "\n"
   , "      case \"Put\": state = a[0]; return k(a[1]);"
   , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
   , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
-  , "      default: throw new Error(\"hippogriff: not a dom operation: \" + (p && p.$));"
+  , "      default: throw new Error(\"heff: not a dom operation: \" + (p && p.$));"
   , "    }"
   , "  };"
   , "  // the handler: its monad's return and bind, and its algebra"

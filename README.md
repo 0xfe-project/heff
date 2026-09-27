@@ -1,6 +1,6 @@
-# Hippogriff
+# heff
 
-Hippogriff (Lynch & Staton, arXiv:2608.19728), ported from the reference
+heff is Hippogriff (Lynch & Staton, arXiv:2608.19728), ported from the reference
 Haskell implementation to PureScript and checked against it by differential
 testing, with a text-based toolchain: files, modules, a checker, doctests,
 an interpreter, and compilers to JavaScript and PureScript.

@@ -78,7 +78,7 @@ bindMulti e vs = e { local = A.foldl (\acc v -> v : acc) e.local vs }
 
 -- | `abandon` escapes as a JavaScript exception, like `throw Abandon`
 abandonMarker :: String
-abandonMarker = "hippogriff:abandon"
+abandonMarker = "heff:abandon"
 
 match :: Env -> Val -> Dict (Tuple (Array Name) S.El) -> Val
 match e (Tag x vs) cases = case dictLookup cases x of
