@@ -125,6 +125,10 @@ try {
   const defInDo = await request("textDocument/definition", { textDocument: { uri: uri("examples/counter/counter.hg") }, position: pos(counter, "showCount 0") });
   expect("definition in a do block", defInDo.result && defInDo.result.range.start.line === pos(counter, "showCount ::").line, defInDo.result);
 
+  // a name bound in a `do` block: nothing is recorded of it, and `bind` is not there
+  const onBinder = await request("textDocument/hover", { textDocument: { uri: uri("examples/counter/counter.hg") }, position: pos(counter, "label <-") });
+  expect("hover on a do binder is not bind's", onBinder.result === null || !onBinder.result.contents.value.includes("bind ::"), onBinder.result);
+
   // a constructor, in an expression and in a pattern: where its type declares it
   const consAt = pos(basics, "Cons a (List a)");
   for (const [what, at] of [["in an expression", pos(basics, "Cons (f y)")], ["in a pattern", pos(basics, "Cons y ys) = Cons")]]) {

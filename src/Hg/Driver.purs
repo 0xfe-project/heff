@@ -293,10 +293,15 @@ explain c =
   at sp = let lc = lineCol c.source sp.start in show (lc.line + 1) <> ":" <> show (lc.col + 1)
 
 -- | what the name at an offset resolved to, and its type
--- | the name at an offset: the innermost (what `do` is read into, `bind`,
--- | spans the whole block, and must not hide the names in it)
+-- | the name at an offset: one written there, the innermost.  (What `do`
+-- | is read into, `bind`, is no name written: its span is the block's, wider
+-- | than the name, and it must not hide what is in the block -- its binders,
+-- | say, of which nothing is recorded.)
 infoAt :: Checked -> Int -> Maybe Info
-infoAt c off = A.head (A.sortWith (\i -> i.span.end - i.span.start) (A.filter (\i -> i.span.start <= off && off <= i.span.end) c.top.infos))
+infoAt c off = A.head (A.sortWith (\i -> i.span.end - i.span.start) (A.filter (\i -> written i && i.span.start <= off && off <= i.span.end) c.top.infos))
+  where
+  -- (a tag may be written with its `'`)
+  written i = i.span.end - i.span.start <= S.length i.name + 1
 
 typeAt :: Checked -> Int -> Maybe String
 typeAt c off =
