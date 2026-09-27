@@ -11,7 +11,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const uri = (f) => pathToFileURL(join(root, f)).href;
 const disk = (f) => readFileSync(join(root, f), "utf8");
 
-const server = spawn("node", [join(root, "bin", "hg.mjs"), "lsp"], { cwd: root, stdio: ["pipe", "pipe", "inherit"] });
+// (as vscode-languageclient starts it, with `--stdio`)
+const server = spawn("node", [join(root, "bin", "hg.mjs"), "lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"] });
 let buf = Buffer.alloc(0), nextId = 1, failed = 0, checks = 0;
 const waiting = new Map(), notes = [], noteWaiters = [];
 server.stdout.on("data", (chunk) => {
@@ -114,6 +115,15 @@ try {
   const dependent = await diagnosticsOf(uri("test/modules/b.hg"));
   expect("an import's unsaved text", dependent.some((d) => d.message.includes("no such variable not")), dependent);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hg") } });
+
+  // in a `do` block, the name hovered, not the `bind` it is read into
+  const counter = disk("examples/counter.hg");
+  open("examples/counter.hg", counter);
+  await diagnosticsOf(uri("examples/counter.hg"));
+  const inDo = await request("textDocument/hover", { textDocument: { uri: uri("examples/counter.hg") }, position: pos(counter, "showCount 0") });
+  expect("hover in a do block", inDo.result && inDo.result.contents.value.includes("showCount :: Int -> String"), inDo.result);
+  const defInDo = await request("textDocument/definition", { textDocument: { uri: uri("examples/counter.hg") }, position: pos(counter, "showCount 0") });
+  expect("definition in a do block", defInDo.result && defInDo.result.range.start.line === pos(counter, "showCount ::").line, defInDo.result);
 
   // formatting: one edit, the whole text; what does not parse is left, with a warning
   const messy = "data Bool = True | False\n\nnot :: Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";

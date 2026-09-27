@@ -43,6 +43,7 @@ import Hg.Core.Print (prettyEl, prtTy)
 import Hg.Core.Readback (readbTy)
 import Hg.Core.Rename (renameTy)
 import Hg.Core.Syntax (El(..), Ty(..))
+import Hg.Elab.Environment (Info)
 import Hg.Elab.Top (TopResult, top, topModule, topWith)
 import Hg.Eval.Interpreter (EvalResult, evalGlobals, evalGlobalsWhere, prettyResult, showResult)
 import Hg.Parse.Config (lexConfig, readConfig)
@@ -282,9 +283,14 @@ explain c =
   at sp = let lc = lineCol c.source sp.start in show (lc.line + 1) <> ":" <> show (lc.col + 1)
 
 -- | what the name at an offset resolved to, and its type
+-- | the name at an offset: the innermost (what `do` is read into, `bind`,
+-- | spans the whole block, and must not hide the names in it)
+infoAt :: Checked -> Int -> Maybe Info
+infoAt c off = A.head (A.sortWith (\i -> i.span.end - i.span.start) (A.filter (\i -> i.span.start <= off && off <= i.span.end) c.top.infos))
+
 typeAt :: Checked -> Int -> Maybe String
 typeAt c off =
-  A.last (A.filter (\i -> i.span.start <= off && off <= i.span.end) c.top.infos) <#> \i ->
+  infoAt c off <#> \i ->
     i.name <> " :: " <> force i.ty <> (case i.key of
       Just _ -> "   (global)"
       Nothing -> "   (local)")
@@ -295,7 +301,7 @@ typeAt c off =
 definitionAt :: Array Checked -> Int -> Maybe { path :: String, source :: String, span :: F.Span }
 definitionAt program off = do
   c <- A.last program
-  i <- A.last (A.filter (\i -> i.span.start <= off && off <= i.span.end) c.top.infos)
+  i <- infoAt c off
   k <- i.key
   -- (a primitive may be declared by more than one file: this one's first)
   d <- A.head (A.mapMaybe (defines k) (A.reverse program))
