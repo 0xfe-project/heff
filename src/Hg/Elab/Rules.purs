@@ -12,7 +12,9 @@ import Data.Array as A
 import Data.Either (Either(..))
 import Data.Lazy (defer, force)
 import Data.List ((:))
-import Data.Maybe (Maybe(..))
+import Data.Foldable (for_)
+import Data.Maybe (Maybe(..), isJust)
+import Data.String as S
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..))
 import Hg.Support.Common (Dict, Name, dictContains, dictFromList, dictLength, dictLookup, dictToList)
@@ -412,29 +414,44 @@ sumFormation (Variants vs) = Typ \e -> do
   vs' <- traverse (traverse (\t -> runSmall t (e { elabFor = ForNominative, scope = undelay e.scope }))) vs.values
   pure (M.sum (Variants (vs { values = vs' })))
 
-sumIntro :: Span -> Name -> Array Chk -> Chk
-sumIntro sp x cs = Chk \e a0 -> do
+-- | `sp`: the tag applied, `tsp`: the tag
+sumIntro :: Span -> Span -> Name -> Array Chk -> Chk
+sumIntro sp tsp x cs = Chk \e a0 -> do
   a <- forceT a0
   -- extension: at a type not known yet, the tag waits for it (once)
-  if isFlexTy a then delayChk e sp "tag" (sumIntroNow sp x cs) a else runChk (sumIntroNow sp x cs) e a
+  if isFlexTy a then delayChk e sp "tag" (sumIntroNow sp tsp x cs) a else runChk (sumIntroNow sp tsp x cs) e a
 
-sumIntroNow :: Span -> Name -> Array Chk -> Chk
-sumIntroNow sp x cs = Chk \e a0 -> do
+sumIntroNow :: Span -> Span -> Name -> Array Chk -> Chk
+sumIntroNow sp tsp x cs = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
     V.LikeSum (Variants vs) -> case dictLookup vs x of
-      Just ts ->
-        if A.length ts == A.length cs then do
-          args <- sequence (A.zipWith (\c t -> runChk c e (force t)) cs ts)
-          pure (M.tag x args)
-        else
-          failWith sp 16 (txt "wrong number of arguments for tag" <+> txt x <+> txt "in type" <+> prtIn e a)
+      Just ts -> do
+        recordTag e a x tsp
+        tagArgs
+        where
+        tagArgs =
+          if A.length ts == A.length cs then do
+            args <- sequence (A.zipWith (\c t -> runChk c e (force t)) cs ts)
+            pure (M.tag x args)
+          else
+            failWith sp 16 (txt "wrong number of arguments for tag" <+> txt x <+> txt "in type" <+> prtIn e a)
       Nothing -> failWith sp 15 (txt "no such tag" <+> txt x <+> txt "in type" <+> prtIn e a)
     _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt ("'" <> x) <> txt " ... : T)`")
     _ -> failWith sp 14 (txt "cannot check tag syntax at non-sum type")
 
-sumElim :: Span -> Syn -> Dict (Tuple (Array Name) Chk) -> Chk
-sumElim sp scrutSyn casesChk = Chk \e b -> do
+-- | a tag, where it is written, as a name of the sum type it is of (defined
+-- | where that type is); not one put there by a desugaring (`if`'s), whose
+-- | span is not the tag's
+recordTag :: ElabEnv -> V.Ty -> Name -> Span -> E Unit
+recordTag e a x tsp = case a of
+  V.Decode dn | V.Global k <- dn.head, tsp.end - tsp.start == S.length x || tsp.end - tsp.start == S.length x + 1 ->
+    record { span: tsp, name: x, key: Just k, ty: defer \_ -> P.render (prtIn e a) }
+  _ -> pure unit
+
+-- | `tags`: where the cases' tags are written
+sumElim :: Span -> Syn -> Array (Tuple Name Span) -> Dict (Tuple (Array Name) Chk) -> Chk
+sumElim sp scrutSyn tags casesChk = Chk \e b -> do
   when (not (leq (V.levelOf b) Small)) $
     failWith sp 23 (txt "cannot eliminate from sum type into large type")
   Tuple scrut a0 <- runSyn scrutSyn e
@@ -442,6 +459,7 @@ sumElim sp scrutSyn casesChk = Chk \e b -> do
   vs <- case V.behavior a of
     V.LikeSum (Variants vs) -> pure vs
     _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e a)
+  for_ tags \(Tuple x tsp) -> when (isJust (dictLookup vs x)) (recordTag e a x tsp)
   cases <- map dictFromList $ flip traverse (dictToList vs) \(Tuple x ts) ->
     case dictLookup casesChk x of
       Just (Tuple xs bodyChk) ->

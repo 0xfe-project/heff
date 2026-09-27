@@ -125,6 +125,13 @@ try {
   const defInDo = await request("textDocument/definition", { textDocument: { uri: uri("examples/counter.hg") }, position: pos(counter, "showCount 0") });
   expect("definition in a do block", defInDo.result && defInDo.result.range.start.line === pos(counter, "showCount ::").line, defInDo.result);
 
+  // a constructor, in an expression and in a pattern: where its type declares it
+  const consAt = pos(basics, "Cons a (List a)");
+  for (const [what, at] of [["in an expression", pos(basics, "Cons (f y)")], ["in a pattern", pos(basics, "Cons y ys) = Cons")]]) {
+    const d = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/basics.hg") }, position: at });
+    expect("definition of a constructor " + what, d.result && d.result.range.start.line === consAt.line && d.result.range.start.character === consAt.character, d.result);
+  }
+
   // formatting: one edit, the whole text; what does not parse is left, with a warning
   const messy = "data Bool = True | False\n\nnot :: Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";
   open("test/surface/lsp-fmt.hg", messy);

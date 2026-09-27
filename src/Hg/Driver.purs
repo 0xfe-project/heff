@@ -305,7 +305,9 @@ definitionAt program off = do
   k <- i.key
   -- (a primitive may be declared by more than one file: this one's first)
   d <- A.head (A.mapMaybe (defines k) (A.reverse program))
-  pure { path: d.c.path, source: d.c.source, span: nameIn d.c.source d.name d.span }
+  -- (the name looked for is the one at the offset: a tag's is in its type's
+  -- declaration)
+  pure { path: d.c.path, source: d.c.source, span: nameIn d.c.source i.name d.span }
   where
   defines k c = do
     j <- A.findIndex (\o -> o.key == k) c.own

@@ -177,7 +177,11 @@ parseHead c n = case n of
   NBlock "match" (Just scrutN) casesN sp -> do
     scrut <- syn N scrutN
     cases <- traverse doCase casesN
-    pure (fromChkN c (R.sumElim sp scrut (dictFromList cases)))
+    let
+      tags = A.mapMaybe (case _ of
+        Infix p (Keyword "=>" _) _ | NTag x tsp <- NEA.head (getGroup p) -> Just (Tuple x tsp)
+        _ -> Nothing) casesN
+    pure (fromChkN c (R.sumElim sp scrut tags (dictFromList cases)))
   -- Misc.
   Keyword "abandon" sp -> pure (fromChkN c (R.abandonChk sp))
   Infix n0 (Keyword "~" _) n1 -> do
@@ -197,8 +201,8 @@ parseHead c n = case n of
 
 parse :: Case -> Ntn -> E Judgment
 parse c n = case NEA.uncons (getGroup n) of
-  { head: NTag x _, tail: ns } ->
-    (\args -> fromChkN c (R.sumIntro (ntnSpan n) x args)) <$> traverse (chk N) ns
+  { head: NTag x tsp, tail: ns } ->
+    (\args -> fromChkN c (R.sumIntro (ntnSpan n) tsp x args)) <$> traverse (chk N) ns
   { head: Keyword "rec" _, tail: [ n0 ] } ->
     (\b -> fromChkN c (R.recChk (ntnSpan n) b)) <$> chk N n0
   { head: n0, tail: [] } -> parseHead c n0
