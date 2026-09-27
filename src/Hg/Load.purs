@@ -1,6 +1,6 @@
 -- | Finding a program's files.  A module is a file, named by its path from
 -- | the project's root: `parse.surface` is `ROOT/parse/surface.hg`.  The root
--- | is the nearest directory above the file given with an `hg.json`, else
+-- | is the nearest directory above the file given with a `project.hg`, else
 -- | the file's own directory.  A module not in the project is looked for in
 -- | the standard library (`lib/`).
 module Hg.Load
@@ -36,7 +36,7 @@ pathsFor lib file = do
   let start = dirname file
   let
     up d = do
-      found <- exists (d <> "/hg.json")
+      found <- exists (d <> "/project.hg")
       if found then pure d
       else if d == "/" || d == "." || d == "" then pure start
       else up (dirname d)

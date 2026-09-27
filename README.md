@@ -82,7 +82,8 @@ text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
 
 A module is a file, named by its path from the project's root:
 `parse/surface.hg` is `parse.surface`.  The root is the nearest directory
-above the file given that has an `hg.json`, else the file's own directory.
+above the file given that has a `project.hg` (a module like any other,
+`project`: the project's `name`), else the file's own directory.
 A module not in the project is looked for in `lib/` (the standard library:
 `prelude`, `co`, `dom`).
 
@@ -216,7 +217,7 @@ everything else is checked byte for byte against the reference.
   handler).  The same app runs under a handler written in Hippogriff for
   tests (`test/surface/dom-trace.hg`).
 - Examples: each of `examples/counter`, `examples/clock`, `examples/greet`
-  is a project (`hg.json`, the program, `index.html`): `npm run examples`
+  is a project (`project.hg`, the program, `index.html`): `npm run examples`
   builds the apps, then open `index.html` in a browser, from the disk as
   it is (the app is a plain script, importing nothing).
   `greet` finds the page's own elements, by a CSS selector and an XPath.
