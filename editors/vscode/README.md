@@ -29,7 +29,8 @@ npx vsce package          # heff-0.1.0.vsix
 code --install-extension heff-0.1.0.vsix
 ```
 
-An installed extension is not in the repository any more: set
+An installed extension is not in the repository any more: it runs the `hg`
+on the `PATH` (`npm link` at the repository's root puts it there), or set
 `heff.serverPath` to the absolute path of `bin/hg.mjs` (and `heff.nodePath`
 if `node` is not on the `PATH`).
 
@@ -37,5 +38,5 @@ if `node` is not on the `PATH`).
 
 | setting | |
 | --- | --- |
-| `heff.serverPath` | heff's `bin/hg.mjs`, run as `node <path> lsp`; empty: `../../bin/hg.mjs` from the extension |
+| `heff.serverPath` | heff's `bin/hg.mjs`, run as `node <path> lsp`; empty: `../../bin/hg.mjs` from the extension, else the `hg` on the `PATH` |
 | `heff.nodePath` | the Node.js that runs it (`node`) |

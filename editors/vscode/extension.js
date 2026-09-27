@@ -10,11 +10,26 @@ try { languageclient = require("vscode-languageclient/node"); } catch (_) { lang
 
 let client;
 
+// the `hg` on the PATH, through its links (`npm link`, `npm install -g`), when
+// it is heff's bin/hg.mjs (and not, say, Mercurial's)
+function hgOnPath() {
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    let real;
+    try { real = fs.realpathSync(path.join(dir, "hg")); } catch (_) { continue; }
+    if (path.basename(real) === "hg.mjs") return real;
+  }
+  return null;
+}
+
 // the server's script: the setting, else the repository's (in development,
-// this extension is its editors/vscode)
+// this extension is its editors/vscode), else the `hg` on the PATH
 function serverPath(context) {
   const configured = vscode.workspace.getConfiguration("heff").get("serverPath");
-  return configured || path.join(context.extensionPath, "..", "..", "bin", "hg.mjs");
+  if (configured) return configured;
+  const repository = path.join(context.extensionPath, "..", "..", "bin", "hg.mjs");
+  if (fs.existsSync(repository)) return repository;
+  return hgOnPath() || repository;
 }
 
 async function start(context) {
@@ -26,7 +41,7 @@ async function start(context) {
   const config = vscode.workspace.getConfiguration("heff");
   const script = serverPath(context);
   if (!fs.existsSync(script)) {
-    vscode.window.showErrorMessage(`heff: no language server at ${script}; set heff.serverPath to heff's bin/hg.mjs`);
+    vscode.window.showErrorMessage(`heff: no language server at ${script}; put heff's \`hg\` on the PATH (\`npm link\`), or set heff.serverPath to its bin/hg.mjs`);
     return;
   }
   // (no `transport`: with one, the client adds `--stdio` to the arguments)
