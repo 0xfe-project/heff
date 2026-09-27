@@ -4,6 +4,7 @@ import Prelude
 
 import Data.Argonaut.Core as J
 import Data.Array as A
+import Data.Either (Either(..))
 import Data.Int as Int
 import Data.Lazy (force)
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
@@ -17,6 +18,7 @@ import Hg.Compile.PureScript (compileModule, psValueName)
 import Hg.Core.Globals (globalsList)
 import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp, goldenReport, goldenReportWith, promote, refReport, renderFileDiags, testFile, typeAt, watches)
 import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
+import Hg.Format (format)
 import Hg.Load (loadProgram, pathsFor)
 import Hg.Support.Pretty as P
 import Node.Encoding (Encoding(..))
@@ -39,6 +41,7 @@ usage = S.joinWith "\n"
   , "  type-at FILE OFFSET     what the name at OFFSET resolved to, and its type"
   , "  golden [--tools] FILE   the reference's golden report (.hpgf)"
   , "  ref FILE                what the reference executable prints (.hpgf)"
+  , "  fmt [--check] FILE...   format FILEs in place (--check: only say which are not formatted)"
   ]
 
 err :: String -> Effect Unit
@@ -125,6 +128,12 @@ main = do
       let r = refReport src
       void (writeString stdout UTF8 r.out)
       void (writeString stderr UTF8 r.err)
+    a | A.head a == Just "fmt" && A.length a > 1 -> do
+      let
+        checkOnly = A.index a 1 == Just "--check"
+        files = A.drop (if checkOnly then 2 else 1) a
+      bad <- A.foldM (\n f -> (n + _) <$> fmtOne checkOnly f) 0 files
+      when (bad > 0) (exit' 1)
     a | A.head a == Just "test" && A.length a > 1 -> do
       results <- A.foldM (\acc f -> (\r -> acc <> [ r ]) <$> testOne f) [] (A.drop 1 a)
       let
@@ -144,6 +153,15 @@ main = do
         when (not (A.null r.errors)) (exit' 1)
         writeTextFile UTF8 out r.source
         log ("wrote " <> out <> ": load it in a page with <script type=\"module\" src=\"...\">, into <div id=\"hg-app\">")
+  -- | 1 if the file is not formatted (with `--check`) or cannot be
+  fmtOne checkOnly f = do
+    src <- readTextFile UTF8 f
+    case format src of
+      Left why -> err ("hg: " <> f <> " not formatted: " <> why <> "\n") $> 1
+      Right out
+        | out == src -> pure 0
+        | checkOnly -> log f $> 1
+        | otherwise -> writeTextFile UTF8 f out $> 0
   testOne f = do
     l <- load f
     let

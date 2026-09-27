@@ -13,6 +13,8 @@
 //          let in test sum Type Int String
 //   watch  `-- >>>`, at the start of a doctest line (the rest of the line is
 //          an expression)
+//
+// Comments are not tokens; they are returned apart, for the formatter.
 const keywords = new Set(["data", "type", "theory", "foreign", "import", "case", "of", "if", "then", "else",
   "do", "where", "let", "in", "test", "sum", "Type", "Int", "String", "abandon"]);
 const symChars = new Set("!#$%&*+./<=>?@\\^|-~:");
@@ -23,7 +25,7 @@ const isDigit = (c) => c >= "0" && c <= "9";
 const isNameChar = (c) => isLetter(c) || isDigit(c) || c === "'";
 
 export const lexImpl = (src) => {
-  const tokens = [], errors = [];
+  const tokens = [], errors = [], comments = [];
   let i = 0, line = 0, lineStart = 0, first = true;
   const push = (kind, text, start, end) => {
     tokens.push({ kind, text, start, end, line, col: start - lineStart, first });
@@ -46,7 +48,9 @@ export const lexImpl = (src) => {
     while (src[dashes] === "-") dashes++;
     if (c === "-" && dashes - i >= 2 && !symChars.has(src[dashes] ?? " ") || (c === "-" && src.startsWith("-- >>>", i))) {
       if (src.startsWith("-- >>>", i)) { push("watch", "-- >>>", i, i + 6); i += 6; continue; }
+      const s = i;
       while (i < src.length && src[i] !== "\n") i++;
+      comments.push({ start: s, end: i, text: src.slice(s, i) });
       continue;
     }
     if (c === "{" && src[i + 1] === "-") {
@@ -59,6 +63,7 @@ export const lexImpl = (src) => {
         i++;
       }
       if (depth > 0) errors.push({ start: s, end: i, msg: "a `{-` comment is never closed" });
+      comments.push({ start: s, end: i, text: src.slice(s, i) });
       continue;
     }
     const s = i;
@@ -112,5 +117,5 @@ export const lexImpl = (src) => {
     i++;
   }
   tokens.push({ kind: "eof", text: "", start: src.length, end: src.length, line: line + 1, col: 0, first: true });
-  return { tokens, errors };
+  return { tokens, errors, comments };
 };

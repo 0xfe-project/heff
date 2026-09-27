@@ -15,6 +15,9 @@
 -- | scope: a definition of the file or of what it imports, or a binder.
 module Hg.Parse.Surface
   ( readProgram
+  , Tok
+  , Comment
+  , lex
   ) where
 
 import Prelude
@@ -34,7 +37,13 @@ import Hg.Support.Pretty as P
 
 type Tok = { kind :: String, text :: String, start :: Int, end :: Int, line :: Int, col :: Int, first :: Boolean }
 
-foreign import lexImpl :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String } }
+type Comment = { start :: Int, end :: Int, text :: String }
+
+foreign import lexImpl :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String }, comments :: Array Comment }
+
+-- | the tokens, and apart from them the comments (`--` and `{- -}`)
+lex :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String }, comments :: Array Comment }
+lex = lexImpl
 
 -- | `start`: the token that starts the current item (it is at the start of
 -- | its line, yet it does not end anything)

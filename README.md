@@ -54,6 +54,7 @@ text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
 | `src/Hg/Lower` | core → an untyped IR, and computing on it: `Erase` (types, with the parameters that take them and the arguments given for them, read off the types with the elaborator's NbE), `Shake` (only what is reached), `Simplify` (β, inlining what is not recursive, known fields and tags), `Arity` (a definition of n parameters called with n arguments at once) |
 | `src/Hg/Compile` | `JavaScript` (the IR emitted as an ES module; a DOM runtime for apps), `PureScript` (typed, from the core) |
 | `src/Hg/Support` | pretty printing, diagnostics, big integers |
+| `src/Hg/Format.purs` | the formatter: `.hg` read again keeping every token and comment, laid out anew; refused if the result would not read as the same notation with the same comments |
 | `src/Hg/Load.purs`, `src/Hg/Driver.purs`, `src/Main.purs` | finding a program's files; running the stages over them; the CLI |
 
 ## Modules
@@ -102,6 +103,7 @@ hg explain FILE            # the elaboration trace: metavariables, unifications,
 hg type-at FILE OFFSET     # what the name there resolved to, and its type
 hg golden [--tools] FILE   # the reference's golden report (.hpgf)
 hg ref FILE                # what the reference executable prints (.hpgf)
+hg fmt [--check] FILE...   # format in place (--check: list what is not formatted)
 
 npm test
 ```
