@@ -40,7 +40,7 @@ import Data.Tuple (Tuple(..))
 import Hg.Parse.FNotation (Span)
 import Hg.Support.Common (Name, dictMap, dictTraverse)
 import Hg.Core.Conversion (DefEqCheckError(..))
-import Hg.Core.Evaluation (eval)
+import Hg.Core.Evaluation (eval, evalTy)
 import Hg.Core.Globals (Globals)
 import Hg.Core.Params (Case(..), CtxShape, Universe(..), Variants(..), variantsMap)
 import Hg.Core.Readback (readbTy)
@@ -327,24 +327,24 @@ renameFlex g m r m' sp = do
         Just e -> pure e
         Nothing -> scopeError
       -- only a metavariable whose type does not mention the pruned
-      -- variables can be pruned; for an implicit type argument, the type is
-      -- a universe
-      case entry.ty of
-        V.U _ -> pure unit
-        _ -> scopeError
+      -- variables can be pruned; here, one whose type is closed (a universe,
+      -- `Type -> Type`, a theory such as `HFunctor`): read back into the
+      -- empty context, or a scope error
+      tyStx <- renameTy g m { dom: entry.arity, cod: 0, ren: Map.empty } entry.ty
       let
+        ty = V.nom (evalTy { local: V.LNil, global: g } N tyStx)
         keep = A.filter (\l -> Map.member l r.ren) args
         kept = A.mapMaybe (\(Tuple i l) -> if Map.member l r.ren then Just i else Nothing) (A.mapWithIndex Tuple args)
         n = A.length args
       new <- gets _.nextMeta
       modify_ \s -> s
         { nextMeta = new + 1
-        , metas = Map.insert new { ty: entry.ty, sol: Nothing, solStx: Nothing, arity: A.length keep, name: entry.name, span: entry.span } s.metas
+        , metas = Map.insert new { ty, sol: Nothing, solStx: Nothing, arity: A.length keep, name: entry.name, span: entry.span } s.metas
         }
       -- ?m' := λx₁…xₙ. ?new x_kept
       let
         idxs = map (\i -> n - i - 1) kept
-        stx = lams n (S.MetaApp new idxs (S.U SmallU))
+        stx = lams n (S.MetaApp new idxs tyStx)
         val = V.nom (eval { local: V.LNil, global: g } N stx)
       modify_ \s -> s { metas = Map.update (\e -> Just e { sol = Just val, solStx = Just stx }) m' s.metas }
       traceSolve m' stx
