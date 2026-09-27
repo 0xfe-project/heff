@@ -18,7 +18,7 @@ import Data.String as S
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Dict, Name, dictContains, dictFromList, dictLength, dictLookup, dictToList)
-import Heff.Core.Conversion (prettyDefEqError)
+import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
 import Control.Monad.State (gets, modify_)
@@ -263,7 +263,9 @@ apply sp syn = Chk \e a0 -> do
   a <- forceT a0
   -- implicit arguments are inserted, unless an implicit function is wanted
   Tuple m a' <- if isImplicitPi a then pure (Tuple m0 a1) else insertImplicits e sp m0 a1
-  r <- unifyTy e.globals (shape e.scope) a a'
+  r <- unifyTy e.globals (shape e.scope) a a' >>= case _ of
+    Left err -> specialized e (M.valN m) a a' (Left err)
+    ok -> pure ok
   mc <- gets _.metas
   traceE sp "unify" (defer \_ -> P.render (zonked mc e a) <> "  =?=  " <> P.render (zonked mc e a') <> (case r of
     Right _ -> "   ok"
@@ -277,6 +279,28 @@ apply sp syn = Chk \e a0 -> do
       got <- prtInZ e a'
       let msg = txt "expected type" <+> want <> txt ", but got type" <+> got
       conversionFail sp msg (prettyDefEqError (displayName e.globals) err)
+
+-- | `v : B ~ { x = f, … }` when `v : B` and `v.x` is `f`: the type
+-- | expected, specialized, is peeled of its specializations one by one (the
+-- | last first) until what is left is the type `v` has; then `v`'s fields
+-- | are what is left over asks.  (`err`: why the whole type did not do.)
+specialized :: ElabEnv -> V.El -> V.Ty -> V.Ty -> Either DefEqCheckError Unit -> E (Either DefEqCheckError Unit)
+specialized e v a a' err = case a of
+  V.Decode n -> go n []
+  _ -> pure err
+  where
+  go n fields = case n.spine of
+    V.Specialize sq x f -> do
+      let
+        n' = n { spine = sq }
+        fields' = A.cons (Tuple x f) fields
+      r <- unifyTy e.globals (shape e.scope) (V.Decode n') a'
+      case r of
+        Right _ -> A.foldM (\acc (Tuple y g) -> case acc of
+            Right _ -> unifyEl e.globals (shape e.scope) (V.nom (V.proj v y)) g
+            left -> pure left) (Right unit) fields'
+        Left _ -> go n' fields'
+    _ -> pure err
 
 annot :: Typ -> Chk -> Syn
 annot typ chk = Syn \e -> do

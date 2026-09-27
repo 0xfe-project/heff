@@ -25,6 +25,8 @@ const rejected = [
   ["test/errors/large-elim.hf", "cannot eliminate from sum type into large type"],
   ["test/errors/odd-and-even.hf", "no such tag zero in type OddAndEven.odd"],
   ["test/errors/rec.hf", "variable a is bound in delayed mode"],
+  ["test/errors/specialize.hf", "neutrals Bool and Unit are not equal"],
+  ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
 ];
 for (const [f, msg] of rejected) {
   const r = heff("check", f);
