@@ -3,7 +3,6 @@
 module Hg.Elab.Top
   ( Judgment(..)
   , elabDecl
-  , top
   , topWith
   , topModule
   , TopResult
@@ -21,7 +20,7 @@ import Control.Lazy (fix)
 import Data.Maybe (Maybe(..), isJust)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
-import Hg.Parse.FNotation (Diag, Ntn(..), Severity(..), Span, getGroup, ntnHead, ntnSpan)
+import Hg.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, ntnHead, ntnSpan)
 import Hg.Support.Common (Name, dictFromList)
 import Hg.Core.Evaluation (eval, evalTy)
 import Hg.Core.Readback (readbTy)
@@ -351,12 +350,11 @@ declJ = case _ of
 elabDecl :: (Name -> Name) -> Globals -> Ntn -> E { name :: Name, key :: Name, prim :: Boolean, entry :: GlobalEntry }
 elabDecl key g n = do
   d <- declJ n
-  surface <- gets _.autoRec
-  a <- R.runTyp d.ty ((emptyElabEnv g) { surface = surface })
+  a <- R.runTyp d.ty (emptyElabEnv g)
   let
     aval = M.tyN a
     k = if d.prim then d.name else key d.name
-    tmE = (emptyElabEnvFor g k) { surface = surface }
+    tmE = emptyElabEnvFor g k
     tmE' = tmE { scope = bindAt (BDelayedBy 1) d.name aval tmE.scope }
   t <- R.runChk d.tm tmE' aval
   -- the implicit arguments: every one inferred, and substituted in
@@ -397,8 +395,7 @@ elabWatch g n = do
   s <- case j of
     SynJ s -> pure s
     _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `> (e : T)`")
-  surface <- gets _.autoRec
-  Tuple t ty <- R.runSyn s ((emptyElabEnv g) { surface = surface })
+  Tuple t ty <- R.runSyn s (emptyElabEnv g)
   runDelayed true
   stuck <- retryPostponed g
   for_ (A.head stuck) \_ -> throwError
@@ -422,22 +419,14 @@ type Watch = { span :: Span, entry :: GlobalEntry }
 -- | what each is stored under
 type TopResult = { globals :: Globals, diags :: Array Diag, spans :: Array (Tuple Name Span), infos :: Array Info, trace :: Array TraceEvent, watches :: Array Watch, tests :: Array { name :: Name, span :: Span }, keys :: Array Name }
 
--- | as the reference does
-top :: Array Ntn -> TopResult
-top = topIn false identity emptyGlobals
-
--- | elaborate on top of some existing globals (what a file imports), for the tools:
--- | with the extensions that change what the reference accepts
+-- | elaborate on top of some existing globals (what a file imports)
 topWith :: Globals -> Array Ntn -> TopResult
-topWith = topIn true identity
+topWith = topModule identity
 
 -- | the same, for a module: each definition `x` is stored under `key x`,
 -- | and `x` is an alias of it
 topModule :: (Name -> Name) -> Globals -> Array Ntn -> TopResult
-topModule = topIn true
-
-topIn :: Boolean -> (Name -> Name) -> Globals -> Array Ntn -> TopResult
-topIn ext key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [] }
+topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [] }
   where
   -- extension: `test name`, the watches after it (with expectations) are a
   -- test, stored as a definition of its own
@@ -455,7 +444,7 @@ topIn ext key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
   tryDecl acc n = case tryPure (\_ -> runE (elabDecl key acc.globals n) st0) of
     Left msg -> acc { diags = A.snoc acc.diags { code: 399, severity: SError, span: ntnSpan n, note: Nothing, msg: P.text ("internal error while elaborating this: " <> msg) } }
     -- (a primitive declared again, by another module, is the same one)
-    Right (Tuple (Right d) st) | ext && d.prim && isJust (lookupGlobal acc.globals d.key) -> acc
+    Right (Tuple (Right d) st) | d.prim && isJust (lookupGlobal acc.globals d.key) -> acc
       { spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))
       , keys = A.snoc acc.keys d.key
       , infos = acc.infos <> st.infos
@@ -469,4 +458,4 @@ topIn ext key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
       , trace = acc.trace <> st.trace
       }
     Right (Tuple (Left d) st) -> acc { diags = A.snoc acc.diags d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
-  st0 = emptySt { autoRec = ext }
+  st0 = emptySt

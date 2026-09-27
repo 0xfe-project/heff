@@ -22,7 +22,7 @@ import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
-import Hg.Parse.FNotation (Ntn(..), Span, getGroup, group, ntnSpan)
+import Hg.Parse.Notation (Ntn(..), Span, getGroup, group, ntnSpan)
 import Hg.Support.Common (Name)
 
 -- | `T where ... end`, the type of a definition by equations: the type and

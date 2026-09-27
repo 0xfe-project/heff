@@ -2,7 +2,6 @@ module Main where
 
 import Prelude
 
-import Data.Argonaut.Core as J
 import Data.Array as A
 import Data.Either (Either(..))
 import Data.Int as Int
@@ -10,19 +9,15 @@ import Data.Lazy (force)
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String as S
 import Data.Traversable (for_)
-import Data.Tuple (Tuple(..))
 import Effect (Effect)
 import Effect.Console (log)
 import Hg.Compile.JavaScript (compileApp, compileJs, compileNode)
-import Hg.Core.Globals (globalsList)
-import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp, findProgram, goldenReport, goldenReportWith, promote, refReport, renderFileDiags, testFile, typeAt, watches)
+import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, evaluate, findApp, findProgram, promote, renderFileDiags, testFile, typeAt, watches)
 import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
-import Hg.Eval.Interpreter (Strategy(..))
 import Hg.Format (format)
 import Hg.Load (loadProgram, pathsFor)
 import Hg.Lsp as Lsp
 import Hg.Support.Diff (mismatch, useColor)
-import Hg.Support.Pretty as P
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (readTextFile, realpath, writeTextFile)
 import Node.Process (argv, exit', stderr, stdout)
@@ -33,6 +28,7 @@ import Node.Stream (writeString)
 commands :: Array { name :: String, args :: String, doc :: String, files :: String, flags :: Array { flag :: String, doc :: String } }
 commands =
   [ { name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its definitions' types", files: ".hf", flags: [] }
+  , { name: "eval", args: "FILE", doc: "print what each definition of FILE evaluates to", files: ".hf", flags: [] }
   , { name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hf", flags: [] }
   , { name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hf", flags: [] }
   , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hf", flags: [] }
@@ -41,8 +37,6 @@ commands =
   , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (lib/io.hf)", files: ".hf", flags: [] }
   , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: [] }
   , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: [] }
-  , { name: "golden", args: "[--tools] FILE", doc: "the reference's golden report (.hpgf)", files: ".hpgf", flags: [ { flag: "tools", doc: "with the tools' extensions" } ] }
-  , { name: "ref", args: "FILE", doc: "what the reference executable prints (.hpgf)", files: ".hpgf", flags: [] }
   , { name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hf", flags: [ { flag: "check", doc: "only say which are not formatted" } ] }
   , { name: "lsp", args: "", doc: "a language server, on stdin/stdout", files: "", flags: [] }
   , { name: "completions", args: "fish", doc: "a completion script for the shell", files: "", flags: [] }
@@ -97,6 +91,10 @@ main = do
       l <- load f
       for_ (definitions l.file) \d -> log (d.name <> " :: " <> d.type)
       when (not l.ok) (exit' 1)
+    [ "eval", f ] -> do
+      l <- load f
+      for_ (evaluate l.file) \d -> log (d.name <> " = " <> d.value)
+      when (not l.ok) (exit' 1)
     [ "run", f ] -> do
       l <- load f
       for_ (watches l.file) \w -> log (">>> " <> w.expr <> "\n" <> w.value)
@@ -128,17 +126,6 @@ main = do
     [ "type-at", f, o ] -> do
       l <- load f
       log (fromMaybe "nothing there" (Int.fromString o >>= typeAt l.file))
-    [ "golden", f ] -> do
-      src <- readTextFile UTF8 f
-      log (goldenReport src)
-    [ "golden", "--tools", f ] -> do
-      l <- load f
-      log (goldenReportWith ByValue (\_ -> { globals: l.file.top.globals, diags: l.file.diags }) l.file.source)
-    [ "ref", f ] -> do
-      src <- readTextFile UTF8 f
-      let r = refReport src
-      void (writeString stdout UTF8 r.out)
-      void (writeString stderr UTF8 r.err)
     -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
     a | A.head a == Just "lsp" && A.all (\x -> S.take 2 x == "--") (A.drop 1 a) -> libDir >>= Lsp.serve
     a | A.head a == Just "fmt" && A.length a > 1 -> do

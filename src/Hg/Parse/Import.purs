@@ -13,7 +13,7 @@ import Data.Array as A
 import Data.Maybe (Maybe(..))
 import Data.String as S
 import Data.String.CodeUnits as SCU
-import Hg.Parse.FNotation (Span)
+import Hg.Parse.Notation (Span)
 
 type Import = { name :: String, span :: Span }
 

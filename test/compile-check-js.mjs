@@ -3,10 +3,9 @@
 //
 //   node test/compile-check-js.mjs [N] [SEED]
 //
-// Compiles the golden corpus, the hand-written programs and N generated
-// programs to JavaScript, loads each module (in a child process, with a
-// timeout) and compares every definition's value with the interpreter's,
-// by value (`heff golden --tools`).  Both are call-by-value, so they agree
+// Compiles the programs of test/programs and N generated ones to JavaScript,
+// loads each module (in a child process, with a timeout) and compares every
+// definition's value with the interpreter's (`heff eval`).  Both are call-by-value, so they agree
 // exactly: the same value, or both abandon.  (What the interpreter finds
 // to diverge is not read.)
 import { spawnSync } from "node:child_process";
@@ -14,7 +13,6 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "nod
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setSeed, genProgram } from "./gen.mjs";
-import { flat } from "./flat.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const [nArg = "100", seedArg = "7"] = process.argv.slice(2);
@@ -24,27 +22,26 @@ rmSync(work, { recursive: true, force: true });
 mkdirSync(work, { recursive: true });
 
 const cases = [];
-for (const dir of ["golden", "programs"])
-  for (const f of readdirSync(join(root, "test", dir)).filter((f) => f.endsWith(".hpgf")).sort())
-    cases.push({ name: `${dir}-${f.replace(".hpgf", "")}`, src: readFileSync(join(root, "test", dir, f), "utf8") });
+for (const f of readdirSync(join(root, "test", "programs")).filter((f) => f.endsWith(".hf")).sort())
+  cases.push({ name: f.replace(".hf", ""), src: readFileSync(join(root, "test", "programs", f), "utf8") });
 for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genProgram() });
 
 const heff = (args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8" });
 
-let agree = 0, differ = 0, compileErrors = 0, compared = 0, failedCBV = 0, timeouts = 0;
+let agree = 0, differ = 0, compileErrors = 0, compared = 0, timeouts = 0;
 for (const c of cases) {
-  const file = join(work, `${c.name}.hpgf`), out = join(work, `${c.name}.mjs`);
+  const file = join(work, `${c.name}.hf`), out = join(work, `${c.name}.mjs`);
   writeFileSync(file, c.src);
   const r = heff(["compile-js", file, out]);
-  const golden = heff(["golden", "--tools", file]).stdout;
-  if (!golden.includes("-- evaluated\n")) continue;
+  const ev = heff(["eval", file]);
+  if (r.status !== 0 || ev.status !== 0) { compileErrors++; console.log(`NOT COMPILED ${c.name}:\n${r.stderr}${ev.stderr}`); continue; }
+  // `name = value`, a value going on over the lines that do not start so;
+  // an operator's name without its parentheses, as the module exports it
   const interp = new Map();
-  // a value's lines after the first are indented, or start with `,`/`]`
-  for (const block of golden.split("-- evaluated\n")[1].split("-- messages")[0].split(/\n(?=[^\s,\]])/)) {
+  for (const block of ev.stdout.split(/\n(?=\S+ = )/)) {
     const m = /^(\S+) = ([\s\S]*)$/.exec(block.trim());
-    if (m) interp.set(m[1], flat(m[2]));
+    if (m) interp.set(m[1].replace(/^\((.*)\)$/, "$1"), m[2].replace(/\s*\n\s*/g, " "));
   }
-  if (r.status !== 0 && interp.size === 0) { compileErrors++; continue; }
   // (what the interpreter found to diverge is not read: compiled, with its
   // loops as loops, it may run for ever)
   const wanted = [...interp.keys()].filter((n) => interp.get(n) !== "<diverged>");
@@ -61,7 +58,7 @@ for (const c of cases) {
       if (!(g && g.threw && g.threw.includes("heff:abandon"))) { ok = false; console.log(`DIFF ${c.name}.${name}: compiled ${g && (g.value ?? g.threw)}, interpreted <abandoned>`); }
       continue;
     }
-    if (g && g.threw) { failedCBV++; ok = false; console.log(`DIFF ${c.name}.${name}: compiled threw ${g.threw}, interpreted ${want}`); continue; }
+    if (g && g.threw) { ok = false; console.log(`DIFF ${c.name}.${name}: compiled threw ${g.threw}, interpreted ${want}`); continue; }
     // (what is a type is not in the compiled code at all)
     want = erasedOut(want);
     // (a function shows nothing but that it is one; a type family, erased,
@@ -75,10 +72,10 @@ for (const c of cases) {
   if (ok) agree++; else differ++;
 }
 function funsOut(v) {
-  return v.replace(/\w+ := #fun(, )?/g, "").replace(/, \]/g, "]");
+  return v.replace(/\w+ = #fun(, )?/g, "").replace(/, \}/g, " }");
 }
 function erasedOut(v) {
-  return v.replace(/\w+ := #erased(, )?/g, "").replace(/, \]/g, "]").replace(/ #erased/g, "");
+  return v.replace(/\w+ = #erased(, )?/g, "").replace(/, \}/g, " }").replace(/ #erased/g, "");
 }
-console.log(JSON.stringify({ cases: cases.length, modulesAgree: agree, modulesDiffer: differ, compileErrors, timeouts, valuesCompared: compared, valuesFailedCBV: failedCBV }));
-process.exit(differ ? 1 : 0);
+console.log(JSON.stringify({ cases: cases.length, modulesAgree: agree, modulesDiffer: differ, compileErrors, timeouts, valuesCompared: compared }));
+process.exit(differ || compileErrors || timeouts ? 1 : 0);

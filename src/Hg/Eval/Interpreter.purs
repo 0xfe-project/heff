@@ -1,21 +1,12 @@
 -- | A port of `Hippogriff.Backend.Interpreter`: an untyped evaluator for
 -- | elaborated syntax.  Types evaluate to `Erased`.
 -- |
--- | Two ways to evaluate, told apart by what is observable -- whether an
--- | unused `abandon` (or a computation without end) happens:
--- |
--- |   `ByNeed`   the reference's (it is Haskell): arguments, constructor
--- |              fields and record fields are thunks, evaluated at most once;
--- |              for `heff golden` and `heff ref`, which must print what the
--- |              reference prints
--- |   `ByValue`  heff's own, as its compiled code runs: each of them is
--- |              evaluated before it is passed, or put in its constructor or
--- |              record, in order
--- |
--- | Either way, a global is evaluated when first used.
+-- | Evaluation is by value, as the compiled code runs: an argument, a
+-- | constructor's field and a record's field are evaluated before they are
+-- | passed or put, in order, used or not.  A global is evaluated when first
+-- | used.
 module Hg.Eval.Interpreter
-  ( Strategy(..)
-  , Val(..)
+  ( Val(..)
   , EvalResult(..)
   , evalGlobals
   , evalGlobalsWhere
@@ -81,15 +72,11 @@ type LocalEnv = List (Lazy Val)
 
 type GlobalEnv = Map Name (Lazy Val)
 
-data Strategy = ByNeed | ByValue
+type Env = { local :: LocalEnv, global :: GlobalEnv }
 
-type Env = { local :: LocalEnv, global :: GlobalEnv, strategy :: Strategy }
-
--- | an argument, or a field: a thunk, or (by value) evaluated now
+-- | an argument, or a field: evaluated now
 arg :: Env -> S.El -> Lazy Val
-arg e t = case e.strategy of
-  ByNeed -> defer \_ -> evalIn e t
-  ByValue -> let v = evalIn e t in defer \_ -> v
+arg e t = let v = evalIn e t in defer \_ -> v
 
 bindMulti :: Env -> Array (Lazy Val) -> Env
 bindMulti e vs = e { local = A.foldl (\acc v -> v : acc) e.local vs }
@@ -208,8 +195,8 @@ prettyResult = case _ of
 foreign import tryAbandon :: forall a. String -> (Unit -> a) -> (a -> Either Unit a) -> Either Unit a -> Either Unit a
 foreign import tryEval :: forall a r. String -> (Unit -> a) -> (a -> r) -> r -> r -> r
 
-evalFix :: Strategy -> GlobalEnv -> S.El -> Lazy Val
-evalFix strategy g t = fix \self -> defer \_ -> evalIn { local: self : Nil, global: g, strategy } t
+evalFix :: GlobalEnv -> S.El -> Lazy Val
+evalFix g t = fix \self -> defer \_ -> evalIn { local: self : Nil, global: g } t
 
 -- | everything a printed result will show, forced now so that an `abandon` in
 -- | it is caught here (the reference instead crashes while printing)
@@ -219,19 +206,19 @@ deepForce v = case v of
   Tag _ vs -> const v (map (deepForce <<< force) vs)
   _ -> v
 
-evalGlobals :: Strategy -> Globals -> Array (Tuple Name EvalResult)
-evalGlobals strategy = evalGlobalsWhere strategy (const true)
+evalGlobals :: Globals -> Array (Tuple Name EvalResult)
+evalGlobals = evalGlobalsWhere (const true)
 
 -- | every global is evaluated (lazily), but only those `wanted` are forced
 -- | and reported
-evalGlobalsWhere :: Strategy -> (Name -> Boolean) -> Globals -> Array (Tuple Name EvalResult)
-evalGlobalsWhere strategy wanted gs = go Map.empty (globalsList gs) []
+evalGlobalsWhere :: (Name -> Boolean) -> Globals -> Array (Tuple Name EvalResult)
+evalGlobalsWhere wanted gs = go Map.empty (globalsList gs) []
   where
   go ge es acc = case A.uncons es of
     Nothing -> acc
     Just { head: Tuple x entry, tail } ->
       let
-        lv = evalFix strategy ge entry.syntax
+        lv = evalFix ge entry.syntax
         ge' = Map.insert x lv ge
       in
         if not (wanted x) then go ge' tail acc

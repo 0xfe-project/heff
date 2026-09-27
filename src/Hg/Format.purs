@@ -31,7 +31,7 @@ import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
-import Hg.Parse.FNotation (Ntn(..))
+import Hg.Parse.Notation (Ntn(..))
 import Hg.Parse.Import (readImports)
 import Hg.Parse.Fixity (emptyFixities, reserved)
 import Hg.Parse.Surface (lex, readProgramWith)

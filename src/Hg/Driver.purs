@@ -5,9 +5,7 @@
 -- | A program is files; a file is elaborated on top of the definitions of
 -- | the files it imports (`Hg.Load` finds them, in order).
 module Hg.Driver
-  ( Syntax(..)
-  , syntaxOf
-  , Source
+  ( Source
   , Checked
   , elabProgram
   , errorsIn
@@ -18,54 +16,39 @@ module Hg.Driver
   , TestReport
   , testFile
   , promote
+  , evaluate
   , findApp
   , findProgram
   , explain
   , typeAt
   , definitionAt
-  , goldenReport
-  , goldenReportWith
-  , refReport
-  , checkReference
   ) where
 
 import Prelude
 
 import Data.Array as A
 import Data.Lazy (force)
-import Data.List (List(..), (:))
+import Data.List (List(..))
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
 import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
-import Hg.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, globalsList, lookupGlobal)
-import Hg.Core.Print (prettyEl, prtTy)
+import Hg.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
 import Hg.Core.Readback (readbTy)
 import Hg.Core.Rename (renameTy)
 import Hg.Core.Syntax (El(..), Ty(..))
 import Hg.Elab.Environment (Info)
-import Hg.Elab.Top (TopResult, top, topModule, topWith)
-import Hg.Eval.Interpreter (EvalResult, Strategy(..), evalGlobals, evalGlobalsWhere, prettyResult, showResult)
-import Hg.Parse.Config (lexConfig, readConfig)
-import Hg.Parse.FNotation (Diag, Ntn, Severity(..))
-import Hg.Parse.FNotation as F
+import Hg.Elab.Top (TopResult, topModule, topWith)
+import Hg.Eval.Interpreter (evalGlobalsWhere, showResult)
+import Hg.Parse.Notation (Diag, Ntn, Severity(..))
+import Hg.Parse.Notation as F
 import Hg.Parse.Fixity (Fixities, emptyFixities, union)
 import Hg.Support.Common (operatorName)
 import Hg.Parse.Surface (readProgram, readProgramWith)
 import Hg.Print.Surface (printTy)
-import Hg.Support.Diagnostic (lineCol, renderDiag, renderDiags)
-import Hg.Support.Pretty ((<+>))
+import Hg.Support.Diagnostic (lineCol, renderDiag)
 import Hg.Support.Pretty as P
-
--- | the two syntaxes: ours (`.hf`, `Hg.Parse.Surface`) and the reference's
--- | (`.hpgf`, fnotation; for comparing with it)
-data Syntax = Surface | Reference
-
-derive instance eqSyntax :: Eq Syntax
-
-syntaxOf :: String -> Syntax
-syntaxOf path = if S.contains (S.Pattern ".hpgf") (S.drop (S.length path - 5) path) then Reference else Surface
 
 -- | a file as the loader found it: `module` is its name (`parse.surface`
 -- | for `parse/surface.hf`), `text` its source with the import lines blanked
@@ -79,14 +62,8 @@ type Checked = { path :: String, module :: String, source :: String, text :: Str
 
 -- | read a file into notation; a capitalised name is a definition if
 -- | `known` says so; `fixities`: those of what it imports
-readSource :: Syntax -> (String -> Boolean) -> Fixities -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
-readSource Reference _ _ src =
-  let
-    l = F.lex lexConfig src
-    r = F.parse readConfig l.tokens
-  in
-    { ntns: r.ntns, diags: l.diags <> r.diags, fixities: emptyFixities }
-readSource Surface known fixities src = readProgramWith { known, fixities, lenient: false } src
+readSource :: (String -> Boolean) -> Fixities -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
+readSource known fixities src = readProgramWith { known, fixities, lenient: false } src
 
 -- | the files of a program, in the order `Hg.Load` gives (each after what
 -- | it imports), elaborated.  A file sees its own definitions and those of
@@ -109,10 +86,8 @@ elabProgram = A.foldl step []
         , msg: P.text ("`" <> o.name <> "` is defined by more than one module imported: " <> S.joinWith ", " (A.nub (map _.module (A.filter (\p -> p.name == o.name) imported))))
         }
       g0 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
-      r = readSource (syntaxOf s.path) (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
-      -- (a file in the reference's syntax is a program on its own, as the
-      -- reference has it: its definitions keep their names)
-      key x = if syntaxOf s.path == Reference then x else s.module <> "." <> x
+      r = readSource (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
+      key x = s.module <> "." <> x
       t = topModule key g0 r.ntns
     in
       A.snoc done
@@ -227,8 +202,17 @@ watches c = A.mapWithIndex info c.top.watches
       , expectTo: ex.to
       }
 
+-- | a file's own definitions, evaluated (by value), as a watch shows them
+evaluate :: Checked -> Array { name :: String, value :: String }
+evaluate c =
+  let
+    keys = map _.key c.own
+    results = evalGlobalsWhere (\k -> A.elem k keys) c.top.globals
+  in
+    A.mapMaybe (\o -> A.find (\(Tuple k _) -> k == o.key) results <#> \(Tuple _ r) -> { name: named o.name, value: P.render (showResult r) }) c.own
+
 evalWatch :: String -> Globals -> String
-evalWatch name g = maybe "" (\(Tuple _ res) -> P.render (showResult res)) (A.head (evalGlobalsWhere ByValue (_ == name) g))
+evalWatch name g = maybe "" (\(Tuple _ res) -> P.render (showResult res)) (A.head (evalGlobalsWhere (_ == name) g))
 
 -- | the value of an expectation, read as `(e :: T)`
 readExpectation :: Globals -> String -> String -> Maybe String
@@ -359,59 +343,3 @@ definitionAt program off = do
   isNameChar = case _ of
     Just ch -> ch == '_' || ch == '\'' || ch == '/' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
     Nothing -> false
-
--- The reference's reports
---------------------------------------------------------------------------------
-
--- | a file in the reference's syntax, as the reference elaborates it
-checkReference :: String -> { ntns :: Array Ntn, globals :: Globals, diags :: Array Diag }
-checkReference src =
-  let
-    r = readSource Reference (const false) emptyFixities src
-    t = top r.ntns
-  in
-    { ntns: r.ntns, globals: t.globals, diags: r.diags <> t.diags }
-
--- | what the reference executable prints: the report on stdout, the
--- | diagnostics on stderr
-refReport :: String -> { out :: String, err :: String }
-refReport src =
-  let
-    c = checkReference src
-  in
-    { out: P.render $ P.vsep [ P.text "-- elaborated", P.vsep (declsDoc c.globals), P.text "-- evaluated", P.vsep (resultsDoc (evalGlobals ByNeed c.globals)) ]
-    , err: renderDiags src c.diags
-    }
-
--- | what the reference's golden tests print
-goldenReport :: String -> String
-goldenReport = goldenReportWith ByNeed (\src -> let c = checkReference src in { globals: c.globals, diags: c.diags })
-
--- | the same, of what the tools elaborate, evaluated as heff does, by value
--- | (`heff golden --tools`)
-goldenReportWith :: Strategy -> (String -> { globals :: Globals, diags :: Array Diag }) -> String -> String
-goldenReportWith strategy check src =
-  let
-    c = check src
-  in
-    P.render $ P.vsep
-      [ P.text "-- elaborated"
-      , P.vsep (declsDoc c.globals)
-      , P.text "-- evaluated"
-      , P.vsep (resultsDoc (evalGlobals strategy c.globals))
-      , P.text "-- messages"
-      , P.pretty (renderDiags src c.diags)
-      ]
-
-declsDoc :: Globals -> Array P.Doc
-declsDoc gs = A.concatMap
-  ( \(Tuple x e) ->
-      [ P.text "name:" <+> P.text x
-      , P.text "type:" <+> prtTy { len: 0, names: Nil } e.type_
-      , P.text "syntax:" <+> prettyEl (x : Nil) e.syntax
-      ]
-  )
-  (globalsList gs)
-
-resultsDoc :: Array (Tuple String EvalResult) -> Array P.Doc
-resultsDoc = map (\(Tuple x r) -> P.text x <+> P.text "=" <+> prettyResult r)

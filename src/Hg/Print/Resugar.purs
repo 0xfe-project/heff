@@ -3,8 +3,7 @@
 -- | inverse of `Hg.Elab.Clauses`, so an equation-defined function reads
 -- | as it was written.
 module Hg.Print.Resugar
-  ( equations
-  , equationsWith
+  ( equationsWith
   , Style
   ) where
 
@@ -24,12 +23,6 @@ import Hg.Support.Pretty as P
 data Pat = PVar Int | PTag Name (Array Pat)
 
 type Row = { pats :: Array Pat, names :: List Name, body :: Syn.El }
-
--- | the equations of `f` (whose body is `el`), one per line, or nothing when
--- | `el` is not a definition by cases; `names` are the locals in scope
--- | (innermost first; the definition itself is one)
-equations :: (List Name -> Syn.El -> P.Doc) -> Name -> List Name -> Syn.Ty -> Syn.El -> Maybe (Array String)
-equations prettyEl = equationsWith { tag: \t -> "'" <> t, sep: ":=", minRows: 2, body: \ns e -> P.render (prettyEl ns e) }
 
 -- | how equations are written: a tag in a pattern, what separates the sides,
 -- | how many equations it takes to write a definition so (one: any function

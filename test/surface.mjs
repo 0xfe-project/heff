@@ -22,6 +22,9 @@ if (t.status !== 0) { failed++; console.log(t.stdout + t.stderr); }
 const rejected = [
   ["test/modules/transitive.hf", "no such variable not in scope"],
   ["test/modules/clash.hf", "`Bool` is defined by more than one module imported: a, c"],
+  ["test/errors/large-elim.hf", "cannot eliminate from sum type into large type"],
+  ["test/errors/odd-and-even.hf", "no such tag zero in type OddAndEven.odd"],
+  ["test/errors/rec.hf", "variable a is bound in delayed mode"],
 ];
 for (const [f, msg] of rejected) {
   const r = heff("check", f);

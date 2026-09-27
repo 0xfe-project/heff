@@ -1,6 +1,6 @@
 -- | The part of Haskell's `prettyprinter` that hippogriff and fnotation use,
 -- | with the same layout algorithm (`layoutPretty`, width 80, ribbon 1.0), so
--- | that output matches the reference implementation's golden files.
+-- | that its output is laid out as the original's.
 module Hg.Support.Pretty
   ( Doc
   , text

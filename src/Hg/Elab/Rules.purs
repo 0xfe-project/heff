@@ -26,13 +26,13 @@ import Data.Maybe (fromMaybe)
 import Hg.Core.Globals (lookupGlobalKey)
 import Hg.Core.Memoed as M
 import Hg.Core.Params (Case(..), Level(..), Universe(..), Variants(..), decodesInto, leq, maxLevel)
-import Hg.Core.Print (prettyTy, prtElR, prtTyR)
+import Hg.Core.Print (prtElR, prtTyR)
 import Hg.Core.Rename (displayName, renameTy)
 import Hg.Core.Syntax as S
 import Hg.Core.Value as V
 import Hg.Elab.Environment as Env
 import Hg.Elab.Environment (BindingMode(..), Ctx(..), E, record, traceE, ElabEnv, ElabFor(..), appElabFor, caseOf, createNominative, evalEnv, failWith, failWithNote, multiBind, projElabFor, shape, undelay, withBound)
-import Hg.Parse.FNotation (Span)
+import Hg.Parse.Notation (Span)
 import Hg.Support.Pretty (Doc, (<+>))
 import Hg.Support.Pretty as P
 
@@ -64,19 +64,15 @@ txt = P.text
 
 -- | a type printed in the scope of the environment
 prtIn :: ElabEnv -> V.Ty -> Doc
-prtIn e t
-  | e.surface = txt (printTy surfaceIm 0 e.scope.names (renameTy (displayName e.globals) (readbTy e.scope.len t)))
-  | otherwise = prtTyR (displayName e.globals) (shape e.scope) t
+prtIn e t = txt (printTy surfaceIm 0 e.scope.names (renameTy (displayName e.globals) (readbTy e.scope.len t)))
 
--- | the tools' messages leave implicit arguments out
+-- | messages leave implicit arguments out
 surfaceIm :: Implicits
 surfaceIm = { names: \_ _ -> [], hide: true }
 
 -- | a type in the syntax of the messages
 prtSyn :: ElabEnv -> S.Ty -> Doc
-prtSyn e t
-  | e.surface = txt (printTy surfaceIm 0 e.scope.names t)
-  | otherwise = prettyTy e.scope.names t
+prtSyn e t = txt (printTy surfaceIm 0 e.scope.names t)
 
 -- | a memoized type printed by its syntax (as `Readback` does for `Memoed`)
 prtInM :: ElabEnv -> M.Ty -> Doc
@@ -296,13 +292,12 @@ recChk sp c = Chk \e a ->
   if leq (V.levelOf a) Small then M.rec <$> runChk c (e { scope = undelay e.scope }) a
   else failWith sp 20 (txt "can only use rec when checking at a small type")
 
--- | extension: a call `f a ...` of a delayed variable `f` (a recursive call)
--- | is checked as `rec (f a ...)`, when the tools ask for it
+-- | a call `f a ...` of a delayed variable `f` (a recursive call) is
+-- | checked as `rec (f a ...)`
 autoRec :: Span -> Name -> Chk -> Chk
-autoRec sp x c = Chk \e a -> do
-  on <- gets _.autoRec
+autoRec sp x c = Chk \e a ->
   case findLocal e x of
-    Left Delayed | on && leq (V.levelOf a) Small -> runChk (recChk sp c) e a
+    Left Delayed | leq (V.levelOf a) Small -> runChk (recChk sp c) e a
     _ -> runChk c e a
 
 abandonChk :: Span -> Chk

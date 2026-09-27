@@ -12,7 +12,7 @@ import Data.Array as A
 import Data.Foldable (foldMap)
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String.CodeUnits as SCU
-import Hg.Parse.FNotation (Diag, Severity(..))
+import Hg.Parse.Notation (Diag, Severity(..))
 import Hg.Support.Pretty (Doc, (<+>))
 import Hg.Support.Pretty as P
 

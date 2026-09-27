@@ -230,8 +230,9 @@ typeFormer t body ns params = case t, body of
     Syn.Code d -> Just { params, names: ns, def: unIs d, large: u == LargeU }
     _ -> Nothing
   Syn.Function f, Syn.Lam _ (Syn.Abs x b) | not f.implicit, Syn.Abs _ cod <- f.cod ->
+    -- (a parameter of type `Type` is bare if it is lower case: `data List a`)
     let param = case f.dom of
-          Syn.U SmallU -> x
+          Syn.U SmallU | not (upper x) -> x
           d -> "(" <> x <> " :: " <> printTy { names: \_ _ -> [], hide: false } 0 ns d <> ")"
     in typeFormer cod b (x : ns) (A.snoc params param)
   _, Syn.Is b -> typeFormer t b ns params
@@ -243,6 +244,11 @@ typeFormer t body ns params = case t, body of
   unIs = case _ of
     Syn.IsTy d -> unIs d
     d -> d
+
+upper :: String -> Boolean
+upper x = case SCU.charAt 0 x of
+  Just c -> c >= 'A' && c <= 'Z'
+  Nothing -> false
 
 isImplicit :: Syn.El -> Boolean
 isImplicit = case _ of

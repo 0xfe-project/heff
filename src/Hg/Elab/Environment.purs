@@ -14,7 +14,7 @@ import Data.Tuple (Tuple)
 import Data.Foldable (foldr)
 import Data.List (List(..), (:))
 import Data.Maybe (Maybe(..))
-import Hg.Parse.FNotation (Diag, Severity(..), Span)
+import Hg.Parse.Notation (Diag, Severity(..), Span)
 import Hg.Support.Common (Name)
 import Hg.Core.Evaluation (EvalEnv)
 import Hg.Core.Globals (Globals)
@@ -99,19 +99,17 @@ createNominative :: ElabFor -> V.Ev V.El -> V.Ty -> V.El
 createNominative ForNominative v _ = V.nom v
 createNominative (ForDescriptive n) ev a = V.reflect n.head (pure n.spine) (pure a) (Just ev)
 
--- | `surface`: messages are for the tools, in their syntax (else in the
--- | reference's, as it prints them)
-type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor, surface :: Boolean }
+type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor }
 
 evalEnv :: ElabEnv -> EvalEnv
 evalEnv e = { local: e.scope.locals, global: e.globals }
 
 emptyElabEnv :: Globals -> ElabEnv
-emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals, surface: false }
+emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals }
 
 emptyElabEnvFor :: Globals -> Name -> ElabEnv
 emptyElabEnvFor globals x =
-  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals, surface: false }
+  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals }
 
 -- Failure
 --------------------------------------------------------------------------------
@@ -136,7 +134,6 @@ type ElabSt =
   , postponed :: Array { shape :: CtxShape, left :: V.El, right :: V.El }
   , delayed :: Array Delayed
   , trace :: Array TraceEvent
-  , autoRec :: Boolean -- ^ extension: a call of a delayed variable is guarded by `rec` for you
   }
 
 -- | an argument whose check waits until the type it is checked at (`ty`)
@@ -144,7 +141,7 @@ type ElabSt =
 newtype Delayed = Delayed { ty :: V.Ty, check :: ExceptT Diag (State ElabSt) Unit }
 
 emptySt :: ElabSt
-emptySt = { infos: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], autoRec: false }
+emptySt = { infos: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [] }
 
 
 

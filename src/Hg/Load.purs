@@ -17,7 +17,7 @@ import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String as S
 import Effect (Effect)
 import Effect.Ref as Ref
-import Hg.Driver (Source, Syntax(..), syntaxOf)
+import Hg.Driver (Source)
 import Hg.Parse.Import (importPath, readImports)
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (exists, readTextFile)
@@ -50,7 +50,7 @@ moduleOf ps file =
     rel = fromMaybe file (S.stripPrefix (S.Pattern (ps.root <> "/")) file)
     base = fromMaybe rel (S.stripSuffix (S.Pattern ".hf") rel)
   in
-    S.replaceAll (S.Pattern "/") (S.Replacement ".") (fromMaybe base (S.stripSuffix (S.Pattern ".hpgf") base))
+    S.replaceAll (S.Pattern "/") (S.Replacement ".") base
 
 -- | a file and every module it imports, directly or not, each after what it
 -- | imports
@@ -68,7 +68,7 @@ loadProgramWith read ps file = do
     visit stack m path = do
       src <- read path
       let
-        r = if syntaxOf path == Reference then { imports: [], text: src } else readImports src
+        r = readImports src
         deps = map _.name r.imports
       A.foldM (\_ d -> dep (A.snoc stack m) path d) unit deps
       Ref.modify_ (_ <> [ { path, module: m, source: src, text: r.text, deps } ]) done

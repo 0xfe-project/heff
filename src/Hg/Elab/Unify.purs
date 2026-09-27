@@ -37,7 +37,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, isNothing)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
-import Hg.Parse.FNotation (Span)
+import Hg.Parse.Notation (Span)
 import Hg.Support.Common (Name, dictMap, dictTraverse)
 import Hg.Core.Conversion (DefEqCheckError(..))
 import Hg.Core.Evaluation (eval, evalTy)

@@ -32,7 +32,7 @@ import Foreign.Object as FO
 import Hg.Driver (Checked, definitionAt, elabProgram, typeAt)
 import Hg.Format (format)
 import Hg.Load (loadProgramWith, pathsFor)
-import Hg.Parse.FNotation (Diag, Severity(..), Span)
+import Hg.Parse.Notation (Diag, Severity(..), Span)
 import Hg.Parse.Import (readImports)
 import Hg.Support.Diagnostic (lineCol, renderDiagMessage)
 import Hg.Support.Pretty as P

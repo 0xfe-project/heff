@@ -1,5 +1,5 @@
 -- | The Haskell-like syntax, read into the notation (`Ntn`) the elaborator
--- | takes: the reference's notation and this one elaborate the same way.
+-- | takes.
 -- |
 -- |   data List a = Nil | Cons a (List a)
 -- |   map :: {a b :: Type} -> (a -> b) -> List a -> List b
@@ -37,7 +37,7 @@ import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String as S
 import Data.Tuple (Tuple(..))
-import Hg.Parse.FNotation (Diag, Ntn(..), Severity(..), Span, getGroup, group, ntnSpan)
+import Hg.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, group, ntnSpan)
 import Hg.Parse.Fixity (Assoc(..), Fixities, Relation(..), bindsTighter, emptyFixities, groupOf, relate, reserved, union)
 import Hg.Support.BigInt as BI
 import Hg.Support.Pretty as P
@@ -55,12 +55,13 @@ lex = lexImpl
 -- | `start`: the token that starts the current item (it is at the start of
 -- | its line, yet it does not end anything)
 -- | `binders`: the names each signature binds (in its equations' patterns,
--- | a capitalised one is that variable, not a constructor); `patVars`: those
+-- | a capitalised one is that variable, not a constructor), and which of them
+-- | are implicit (in scope in the equations, unwritten); `patVars`: those
 -- | of the equation being read
 -- | `fix`: the fixities in scope; `lenient`: an operator with none, or two
 -- | unrelated, bind as one left-associative group (for reading a file on its
 -- | own, without what it imports: the formatter's)
-type St = { toks :: Array Tok, i :: Int, stack :: Array Int, scope :: Array String, known :: String -> Boolean, start :: Int, binders :: Array { f :: String, names :: Array String }, patVars :: Array String, fix :: Fixities, lenient :: Boolean }
+type St = { toks :: Array Tok, i :: Int, stack :: Array Int, scope :: Array String, known :: String -> Boolean, start :: Int, binders :: Array { f :: String, names :: Array String, implicits :: Array String }, patVars :: Array String, fix :: Fixities, lenient :: Boolean }
 
 type P a = ExceptT Diag (State St) a
 
@@ -228,7 +229,7 @@ decl = lazyP \_ -> do
             modify_ \s -> s { i = s.i + f.len + 1 }
             ty <- expr
             end <- prevEnd
-            modify_ \s -> s { binders = A.snoc s.binders { f: f.name, names: piBinders ty } }
+            modify_ \s -> s { binders = A.snoc s.binders { f: f.name, names: piBinders ty, implicits: piImplicits ty } }
             pure [ Sig f.name ty { start: t.start, end } ]
           else equation f
 
@@ -249,12 +250,14 @@ equation :: { name :: String, len :: Int, span :: Span } -> P (Array Item)
 equation f = lazyP \_ -> do
   start <- gets \s -> (cur s).start
   modify_ \s -> s { i = s.i + f.len }
-  bound <- gets \s -> A.concatMap _.names (A.filter (\b -> b.f == f.name) s.binders)
-  modify_ \s -> s { patVars = bound }
+  sig <- gets \s -> A.filter (\b -> b.f == f.name) s.binders
+  modify_ \s -> s { patVars = A.concatMap _.names sig }
   pats <- many patAtom
   modify_ \s -> s { patVars = [] }
   _ <- expectSym "="
-  withScope (A.concatMap patVars pats) do
+  -- (an implicit parameter is not written, but bound all the same, by the
+  -- name the signature gives it)
+  withScope (A.concatMap patVars pats <> A.concatMap _.implicits sig) do
     rhs <- expr
     let sp = { start, end: (ntnSpan rhs).end }
     pure [ Eqn f.name (Infix (group (NEA.cons' (Ident f.name f.span) pats)) (Keyword ":=" sp) rhs) sp ]
@@ -322,6 +325,13 @@ dataParam = lazyP \_ -> do
 piBinders :: Ntn -> Array String
 piBinders = case _ of
   Infix b (Keyword "->" _) rest -> binderNames b <> piBinders rest
+  _ -> []
+
+-- | the names of the implicit parameters, `{x :: A} -> …`
+piImplicits :: Ntn -> Array String
+piImplicits = case _ of
+  Infix b@(NBrace _ _) (Keyword "->" _) rest -> binderNames b <> piImplicits rest
+  Infix _ (Keyword "->" _) rest -> piImplicits rest
   _ -> []
 
 binderNames :: Ntn -> Array String
@@ -591,7 +601,8 @@ parens = lazyP \_ -> do
       _ <- next
       _ <- next
       pure (Ident t.text (spanOf t))
-    else if t.kind == "var" && t2.text == ":=" then do
+    -- (`(x := e)`: the implicit argument named `x`, capitalised or not)
+    else if (t.kind == "var" || t.kind == "con") && t2.text == ":=" then do
       _ <- next
       _ <- next
       e <- expr
@@ -634,9 +645,10 @@ binderOrExpr = lazyP \_ -> do
     _ -> pure unit
   pure e
   where
+  -- (a capitalised name, not a tag: `'x` is written one longer than `x`)
   isName = case _ of
     Ident _ _ -> true
-    NTag _ _ -> true
+    NTag x sp -> sp.end - sp.start == S.length x
     _ -> false
   asNames g = group (map (case _ of
     NTag x sp -> Ident x sp
@@ -701,13 +713,17 @@ lambda = lazyP \_ -> do
     body <- expr
     pure (A.foldr (\b e -> Infix b (Keyword "=>" (ntnSpan b)) e) body bs)
   where
+  -- (a binder is a name, capitalised or not: a lambda has no patterns)
   binder = do
     t <- peek
     case t.kind, t.text of
       "var", _ -> next *> pure (Ident t.text (spanOf t))
+      "con", _ -> next *> pure (Ident t.text (spanOf t))
       "punct", "{" -> do
         _ <- next
-        x <- expectKind "var" "an implicit argument's name"
+        x <- peek
+        when (x.kind /= "var" && x.kind /= "con") $ throwError (diag (spanOf x) "expected an implicit argument's name")
+        _ <- next
         c <- expectPunct "}"
         pure (NBrace (Ident x.text (spanOf x)) (spanTo t c))
       _, _ -> throwError (diag (spanOf t) "a lambda binds names: `\\x y -> e`")
