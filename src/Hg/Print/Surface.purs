@@ -18,7 +18,7 @@ import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
-import Hg.Support.Common (Name, dictToList, quoteString)
+import Hg.Support.Common (Name, dictToList, operatorName, quoteString)
 import Hg.Core.Params (Universe(..), Variants(..))
 import Hg.Core.Syntax as Syn
 import Hg.Print.Resugar (equationsWith)
@@ -30,7 +30,8 @@ type Implicits = { names :: List Name -> Syn.El -> Array (Maybe Name), hide :: B
 
 type Ctx = { im :: Implicits, indent :: Int }
 
--- | precedences: 0 anything, 1 an operand of `->` or `~`, 2 an argument
+-- | precedences: 0 anything, 1 an operand of `->`, `~` or an operator, 2 an
+-- | argument
 paren :: Boolean -> String -> String
 paren b s = if b then "(" <> s <> ")" else s
 
@@ -61,6 +62,8 @@ printTy im = ty { im, indent: 0 }
 el :: Ctx -> Int -> List Name -> Syn.El -> String
 el c p xs = case _ of
   Syn.Local i -> local xs i
+  -- (an operator, alone: `(+)`)
+  Syn.Global x | isJust (operatorName x) -> "(" <> x <> ")"
   Syn.Global x -> x
   Syn.Code t -> ty c p xs t
   t@(Syn.App _ _) | Just stmts <- doBlock t ->
@@ -72,6 +75,13 @@ el c p xs = case _ of
         _ -> "") <> el inner 0 st.names st.e
     in
       paren (p >= 1) ("do" <> S.joinWith "" (map stmt stmts))
+  -- `a + b`: an operator applied to two (its fixity unknown here, an
+  -- operand that is an operator's is parenthesised)
+  t@(Syn.App _ _)
+    | { head: Syn.Global x, args: [ l, r ] } <- spine t []
+    , isJust (operatorName x)
+    , not (isImplicit l || isImplicit r) ->
+        paren (p >= 1) (el c 1 xs l <> " " <> x <> " " <> el c 1 xs r)
   t@(Syn.App _ _) ->
     let
       sp = spine t []
@@ -233,3 +243,8 @@ typeFormer t body ns params = case t, body of
   unIs = case _ of
     Syn.IsTy d -> unIs d
     d -> d
+
+isImplicit :: Syn.El -> Boolean
+isImplicit = case _ of
+  Syn.Implicit _ _ -> true
+  _ -> false
