@@ -1,11 +1,21 @@
 -- | A port of `Hippogriff.Backend.Interpreter`: an untyped evaluator for
 -- | elaborated syntax.  Types evaluate to `Erased`.
 -- |
--- | The reference is lazy (it is Haskell), and that is observable: an unused
--- | `abandon` never happens.  So arguments, constructor fields and record
--- | fields are thunks here, evaluated at most once.
+-- | Two ways to evaluate, told apart by what is observable -- whether an
+-- | unused `abandon` (or a computation without end) happens:
+-- |
+-- |   `ByNeed`   the reference's (it is Haskell): arguments, constructor
+-- |              fields and record fields are thunks, evaluated at most once;
+-- |              for `heff golden` and `heff ref`, which must print what the
+-- |              reference prints
+-- |   `ByValue`  heff's own, as its compiled code runs: each of them is
+-- |              evaluated before it is passed, or put in its constructor or
+-- |              record, in order
+-- |
+-- | Either way, a global is evaluated when first used.
 module Hg.Eval.Interpreter
-  ( Val(..)
+  ( Strategy(..)
+  , Val(..)
   , EvalResult(..)
   , evalGlobals
   , evalGlobalsWhere
@@ -71,7 +81,15 @@ type LocalEnv = List (Lazy Val)
 
 type GlobalEnv = Map Name (Lazy Val)
 
-type Env = { local :: LocalEnv, global :: GlobalEnv }
+data Strategy = ByNeed | ByValue
+
+type Env = { local :: LocalEnv, global :: GlobalEnv, strategy :: Strategy }
+
+-- | an argument, or a field: a thunk, or (by value) evaluated now
+arg :: Env -> S.El -> Lazy Val
+arg e t = case e.strategy of
+  ByNeed -> defer \_ -> evalIn e t
+  ByValue -> let v = evalIn e t in defer \_ -> v
 
 bindMulti :: Env -> Array (Lazy Val) -> Env
 bindMulti e vs = e { local = A.foldl (\acc v -> v : acc) e.local vs }
@@ -96,10 +114,10 @@ evalIn e = case _ of
     Nothing -> panic ("no global " <> x)
   S.Lam _ (S.Abs _ body) -> Lam (\v -> evalIn (e { local = v : e.local }) body)
   S.Lam _ (S.AbsConst body) -> let v = defer \_ -> evalIn e body in Lam (\_ -> force v)
-  S.App t1 t2 -> app (evalIn e t1) (defer \_ -> evalIn e t2)
-  S.Cons fs -> Cons (dictMap (\t -> defer \_ -> evalIn e t) fs)
+  S.App t1 t2 -> let f = evalIn e t1 in app f (arg e t2)
+  S.Cons fs -> Cons (dictMap (arg e) fs)
   S.Proj t x -> proj (evalIn e t) x
-  S.Tag x ts -> Tag x (map (\t -> defer \_ -> evalIn e t) ts)
+  S.Tag x ts -> Tag x (map (arg e) ts)
   S.Match scrut cases -> match e (evalIn e scrut) cases
   S.Code _ -> Erased
   S.Opaque -> panic "opaque should never be elaborated, it only exists for readback"
@@ -190,8 +208,8 @@ prettyResult = case _ of
 foreign import tryAbandon :: forall a. String -> (Unit -> a) -> (a -> Either Unit a) -> Either Unit a -> Either Unit a
 foreign import tryEval :: forall a r. String -> (Unit -> a) -> (a -> r) -> r -> r -> r
 
-evalFix :: GlobalEnv -> S.El -> Lazy Val
-evalFix g t = fix \self -> defer \_ -> evalIn { local: self : Nil, global: g } t
+evalFix :: Strategy -> GlobalEnv -> S.El -> Lazy Val
+evalFix strategy g t = fix \self -> defer \_ -> evalIn { local: self : Nil, global: g, strategy } t
 
 -- | everything a printed result will show, forced now so that an `abandon` in
 -- | it is caught here (the reference instead crashes while printing)
@@ -201,19 +219,19 @@ deepForce v = case v of
   Tag _ vs -> const v (map (deepForce <<< force) vs)
   _ -> v
 
-evalGlobals :: Globals -> Array (Tuple Name EvalResult)
-evalGlobals = evalGlobalsWhere (const true)
+evalGlobals :: Strategy -> Globals -> Array (Tuple Name EvalResult)
+evalGlobals strategy = evalGlobalsWhere strategy (const true)
 
 -- | every global is evaluated (lazily), but only those `wanted` are forced
 -- | and reported
-evalGlobalsWhere :: (Name -> Boolean) -> Globals -> Array (Tuple Name EvalResult)
-evalGlobalsWhere wanted gs = go Map.empty (globalsList gs) []
+evalGlobalsWhere :: Strategy -> (Name -> Boolean) -> Globals -> Array (Tuple Name EvalResult)
+evalGlobalsWhere strategy wanted gs = go Map.empty (globalsList gs) []
   where
   go ge es acc = case A.uncons es of
     Nothing -> acc
     Just { head: Tuple x entry, tail } ->
       let
-        lv = evalFix ge entry.syntax
+        lv = evalFix strategy ge entry.syntax
         ge' = Map.insert x lv ge
       in
         if not (wanted x) then go ge' tail acc

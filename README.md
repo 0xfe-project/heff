@@ -70,7 +70,7 @@ text ─[Hg.Parse]→ notation ─[Hg.Elab]→ core ─┬─[Hg.Eval]→ values
 | `src/Hg/Elab` | notation → core: `Top` (declarations), `Clauses` (equations → `match`), `Rules`, `Unify` (implicit arguments), `Environment`, `Prims` |
 | `src/Hg/Core` | the core: syntax, values (normalisation by evaluation), conversion, readback, the reference's printer |
 | `src/Hg/Print` | core → `.hf` text (`Surface`, `Resugar`: `match`es back to equations) |
-| `src/Hg/Eval` | the interpreter (lazy, as the reference's) |
+| `src/Hg/Eval` | the interpreter: by value (heff's), or by need (the reference's) |
 | `src/Hg/Lower` | core → an untyped IR, and computing on it: `Erase` (types, with the parameters that take them and the arguments given for them, read off the types with the elaborator's NbE), `Shake` (only what is reached), `Simplify` (β, inlining what is not recursive, known fields and tags), `Arity` (a definition of n parameters called with n arguments at once) |
 | `src/Hg/Compile` | `JavaScript` (the IR emitted as an ES module; a DOM runtime for apps), `PureScript` (typed, from the core) |
 | `src/Hg/Support` | pretty printing, diagnostics, big integers |
@@ -172,8 +172,8 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", 
   a pretend page.
 - `test/node-run.mjs`: `test/node` compiled for Node.js and run.
 - `test/compile-check.mjs`, `test/compile-check-js.mjs`: the golden corpus,
-  `test/programs` and generated programs, compiled and run; every value
-  computed must be the interpreter's.
+  `test/programs` and generated programs, compiled and run; each value must
+  be the interpreter's (by value): the same value, or both abandon.
 - `test/fuzz.mjs`: generated programs, against the reference executable.
 
 ## Deviations from the reference implementation
@@ -233,9 +233,15 @@ everything else is checked byte for byte against the reference.
 - In the tools (not `heff golden` or `heff ref`, which stay the reference): a
   call of the definition being defined is checked as `rec (...)`, so
   recursion needs no `rec`.
-- The compiled code is call-by-value; the reference interpreter is lazy.
-  What the compiler finds unused is not computed, so compiled code may
-  abandon less often than call-by-value would.
+- Evaluation is call-by-value (the reference, in Haskell, is lazy):
+  arguments, and the fields of constructors and records, are computed
+  before they are passed or put, in order, used or not; a global is
+  computed when first used.  `heff run`, `heff test` and
+  `heff golden --tools` evaluate so, as the compiled code runs; only
+  `heff golden` and `heff ref`, which must print what the reference
+  prints, evaluate by need.  The compiler drops or moves only what cannot
+  fail (a value), so compiled code abandons exactly when the interpreter
+  does.
 - In JavaScript, a definition that calls itself last is a loop: directly
   (`count (n - 1) (acc + 1)`), or as a constructor's last argument
   (`Cons x (map f xs)`: the cell is made first, its tail filled by the

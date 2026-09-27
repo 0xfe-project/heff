@@ -5,10 +5,10 @@
 //
 // Compiles the golden corpus and N generated programs to PureScript, builds
 // them all with purs, loads each module, and compares every definition's
-// value with the interpreter's.  The invariant: whenever the compiled
-// (call-by-value) module computes a value, it is exactly the interpreter's.
-// A module that crashes or diverges while loading is counted separately --
-// the interpreter is lazy, so it may well have a value there.
+// value with the interpreter's, by value (`heff golden --tools`).  Both are
+// call-by-value, with each global computed when first used, so they agree
+// exactly: the same value, or both abandon.  (What the interpreter finds to
+// diverge is not read; a module that does not load is a failure.)
 import { spawnSync, execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -60,7 +60,8 @@ for (const c of cases) {
 const pkgs = readdirSync(join(root, ".spago", "p")).map((p) => join(root, ".spago", "p", p, "src", "**", "*.purs"));
 const purs = spawnSync("npx", ["purs", "compile", join(work, "src", "*.purs"), join(root, "src", "Hg", "Support", "BigInt.purs"), ...pkgs, "-o", join(work, "output")], { encoding: "utf8", cwd: root });
 if (purs.status !== 0) {
-  console.log("purs rejected generated code:\n" + purs.stderr.split("\n").filter((l) => /Error|src\/|^\s{2}/.test(l)).slice(0, 80).join("\n"));
+  // (all it says but its progress)
+  console.log("purs rejected generated code:\n" + purs.stderr.split("\n").filter((l) => !/^\[\s*\d+ of/.test(l)).slice(0, 80).join("\n"));
   process.exit(1);
 }
 
@@ -74,19 +75,20 @@ for (const c of compiled) {
     const m = /^(\S+) = ([\s\S]*)$/.exec(block.trim());
     if (m) interp.set(m[1], flat(m[2]));
   }
-  const load = spawnSync("node", [join(root, "test", "load-module.mjs"), join(work, "output", modName(c.name), "index.js"), ...c.manifest.map((m) => m[1])], { encoding: "utf8", timeout: 10000 });
-  if (load.status !== 0) { loadFailed++; continue; }
+  const wanted = c.manifest.filter(([hgName]) => interp.get(hgName) !== "<diverged>").map(([, psName, delayed]) => (delayed ? "!" : "") + psName);
+  const load = spawnSync("node", [join(root, "test", "load-module.mjs"), join(work, "output", modName(c.name), "index.js"), ...wanted], { encoding: "utf8", timeout: 10000 });
+  if (load.status !== 0 || load.error) { loadFailed++; console.log(`LOAD FAILED ${c.name}: ${(load.stderr || String(load.error)).split("\n").slice(0, 6).join("\n")}`); continue; }
   const mod = JSON.parse(load.stdout);
   let ok = true;
   for (const [hgName, psName] of c.manifest) {
     if (!(psName in mod)) continue;
     const want = interp.get(hgName);
-    if (want === undefined || want === "#erased") continue;
+    if (want === undefined || want === "#erased" || want === "<diverged>") continue;
     compared++;
     const got = mod[psName];
     if (got !== want) { ok = false; console.log(`DIFF ${c.name}.${hgName}: compiled ${got}, interpreted ${want}`); }
   }
   if (ok) same++; else differ++;
 }
-console.log(JSON.stringify({ cases: cases.length, compiled: compiled.length, compileErrors, modulesAgree: same, modulesDiffer: differ, loadFailedCBV: loadFailed, interpreterFailed: interpFailed, valuesCompared: compared }));
-process.exit(differ || compileErrors ? 1 : 0);
+console.log(JSON.stringify({ cases: cases.length, compiled: compiled.length, compileErrors, modulesAgree: same, modulesDiffer: differ, loadFailed, interpreterFailed: interpFailed, valuesCompared: compared }));
+process.exit(differ || compileErrors || loadFailed ? 1 : 0);

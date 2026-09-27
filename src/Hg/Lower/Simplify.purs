@@ -3,10 +3,11 @@
 -- | bigger than a little), a field of a known record, the arm of a match on
 -- | a known tag.
 -- |
--- | Hippogriff's programs are pure, but for `abandon` and divergence: a
--- | binding no one uses is dropped, and one used once, not under a lambda,
--- | is moved to where it is used.  So the compiled code may compute less
--- | than call-by-value would -- as the (lazy) interpreter does.
+-- | Hippogriff's programs are pure, but for `abandon` and divergence, and
+-- | they are call-by-value: what is computed is computed, in order, even if
+-- | no one uses it.  So only what cannot fail (`pure`: a value, of globals
+-- | that cannot) is dropped where no one uses it, or moved to where it is
+-- | used; what could fail stays where it was.
 module Hg.Lower.Simplify
   ( simplifyProgram
   ) where
@@ -18,11 +19,13 @@ import Data.Array as A
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
+import Data.Set (Set)
+import Data.Set as Set
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Hg.Lower.IR (Def, Expr(..), Supply, freshen, globalsIn, isValue, occurrences, size, subst)
 
-type St = { supply :: Supply, fuel :: Int, defs :: Map String Expr }
+type St = { supply :: Supply, fuel :: Int, defs :: Map String Expr, safe :: Set String }
 
 type M a = State St a
 
@@ -36,7 +39,7 @@ budget = 24
 simplifyProgram :: Supply -> Array Def -> { defs :: Array Def, supply :: Supply }
 simplifyProgram n0 defs =
   let
-    Tuple out st = runState (traverse one defs) { supply: n0, fuel: 0, defs: Map.empty }
+    Tuple out st = runState (traverse one defs) { supply: n0, fuel: 0, defs: Map.empty, safe: safeGlobals defs }
   in
     { defs: out, supply: st.supply }
   where
@@ -76,6 +79,32 @@ attempt orig m = do
     n <- gets _.supply
     put saved { supply = n }
     pure orig
+
+-- | the globals that cannot fail when used: functions, and values of such
+-- | globals (each definition after those it uses; one using itself is not)
+safeGlobals :: Array Def -> Set String
+safeGlobals = A.foldl one Set.empty
+  where
+  one safe d = case d.body of
+    Lam _ _ -> Set.insert d.key safe
+    b | pureIn safe b && not (A.elem d.key (globalsIn b)) -> Set.insert d.key safe
+    _ -> safe
+
+-- | what cannot fail: evaluating it gives a value, at once
+pureIn :: Set String -> Expr -> Boolean
+pureIn safe = case _ of
+  Var _ -> true
+  Global g -> Set.member g safe
+  Lam _ _ -> true
+  Record fs -> A.all (\(Tuple _ e) -> pureIn safe e) fs
+  Tag _ as -> A.all (pureIn safe) as
+  Prim _ -> true
+  Int _ -> true
+  Str _ -> true
+  _ -> false
+
+isPure :: Expr -> M Boolean
+isPure e = gets \s -> pureIn s.safe e
 
 atomic :: Expr -> Boolean
 atomic = case _ of
@@ -147,15 +176,17 @@ apply f as
   -- (not simplified yet: `simp` does it once all are bound)
   bind' x a body = pure (Let x a body)
 
--- | a binding, its value simplified
+-- | a binding, its value simplified: what could fail is computed where it
+-- | was, used or not
 letIn :: String -> Expr -> Expr -> M Expr
-letIn x a b =
+letIn x a b = do
+  p <- isPure a
   let o = occurrences x b
-  in
-    if o.count == 0 then simp b
-    else if atomic a || (o.count == 1 && (not o.underLam || isValue a)) then simp (subst (Map.singleton x a) b)
-    else if isValue a && size a <= 12 then substCopies x a b >>= simp
-    else Let x a <$> simp b
+  if not p then Let x a <$> simp b
+  else if o.count == 0 then simp b
+  else if atomic a || o.count == 1 then simp (subst (Map.singleton x a) b)
+  else if isValue a && size a <= 12 then substCopies x a b >>= simp
+  else Let x a <$> simp b
 
 -- | `x` replaced by `a`, a copy of it for each occurrence
 substCopies :: String -> Expr -> Expr -> M Expr
@@ -176,8 +207,11 @@ substCopies x a = go
 
 project :: String -> Expr -> M Expr
 project l e = case e of
+  -- (the other fields are computed too: dropped only if they cannot fail)
   Record fs -> case A.find (\(Tuple k _) -> k == l) fs of
-    Just (Tuple _ v) -> pure v
+    Just (Tuple _ v) -> do
+      others <- A.all identity <$> traverse (\(Tuple k f) -> if k == l then pure true else isPure f) fs
+      pure (if others then v else Proj e l)
     Nothing -> pure (Proj e l)
   Let x a b -> Let x a <$> project l b
   Global g -> do

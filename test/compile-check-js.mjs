@@ -5,10 +5,10 @@
 //
 // Compiles the golden corpus, the hand-written programs and N generated
 // programs to JavaScript, loads each module (in a child process, with a
-// timeout) and compares every definition's value with the interpreter's.
-// The invariant: whenever the compiled (call-by-value) code computes a
-// value, it is exactly the interpreter's.  A value whose computation throws
-// (an `abandon` the lazy interpreter never reaches, a loop) is counted apart.
+// timeout) and compares every definition's value with the interpreter's,
+// by value (`heff golden --tools`).  Both are call-by-value, so they agree
+// exactly: the same value, or both abandon.  (What the interpreter finds
+// to diverge is not read.)
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -53,11 +53,17 @@ for (const c of cases) {
   const got = JSON.parse(load.stdout);
   let ok = true;
   for (let [name, want] of interp) {
-    if (want === "#erased" || want === "<abandoned>" || want === "<diverged>") continue;
+    if (want === "#erased" || want === "<diverged>") continue;
+    const g = got[name];
+    // (both are call-by-value: what abandons in one abandons in the other)
+    if (want === "<abandoned>") {
+      compared++;
+      if (!(g && g.threw && g.threw.includes("heff:abandon"))) { ok = false; console.log(`DIFF ${c.name}.${name}: compiled ${g && (g.value ?? g.threw)}, interpreted <abandoned>`); }
+      continue;
+    }
+    if (g && g.threw) { failedCBV++; ok = false; console.log(`DIFF ${c.name}.${name}: compiled threw ${g.threw}, interpreted ${want}`); continue; }
     // (what is a type is not in the compiled code at all)
     want = erasedOut(want);
-    const g = got[name];
-    if (g && g.threw) { failedCBV++; continue; }
     // (a function shows nothing but that it is one; a type family, erased,
     // is not there at all)
     if (want === "#fun" && (!g || g.value === "#fun" || g.value === "undefined")) continue;

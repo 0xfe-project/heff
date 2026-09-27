@@ -46,7 +46,7 @@ import Hg.Core.Rename (renameTy)
 import Hg.Core.Syntax (El(..), Ty(..))
 import Hg.Elab.Environment (Info)
 import Hg.Elab.Top (TopResult, top, topModule, topWith)
-import Hg.Eval.Interpreter (EvalResult, evalGlobals, evalGlobalsWhere, prettyResult, showResult)
+import Hg.Eval.Interpreter (EvalResult, Strategy(..), evalGlobals, evalGlobalsWhere, prettyResult, showResult)
 import Hg.Parse.Config (lexConfig, readConfig)
 import Hg.Parse.FNotation (Diag, Ntn, Severity(..))
 import Hg.Parse.FNotation as F
@@ -228,7 +228,7 @@ watches c = A.mapWithIndex info c.top.watches
       }
 
 evalWatch :: String -> Globals -> String
-evalWatch name g = maybe "" (\(Tuple _ res) -> P.render (showResult res)) (A.head (evalGlobalsWhere (_ == name) g))
+evalWatch name g = maybe "" (\(Tuple _ res) -> P.render (showResult res)) (A.head (evalGlobalsWhere ByValue (_ == name) g))
 
 -- | the value of an expectation, read as `(e :: T)`
 readExpectation :: Globals -> String -> String -> Maybe String
@@ -379,17 +379,18 @@ refReport src =
   let
     c = checkReference src
   in
-    { out: P.render $ P.vsep [ P.text "-- elaborated", P.vsep (declsDoc c.globals), P.text "-- evaluated", P.vsep (resultsDoc (evalGlobals c.globals)) ]
+    { out: P.render $ P.vsep [ P.text "-- elaborated", P.vsep (declsDoc c.globals), P.text "-- evaluated", P.vsep (resultsDoc (evalGlobals ByNeed c.globals)) ]
     , err: renderDiags src c.diags
     }
 
 -- | what the reference's golden tests print
 goldenReport :: String -> String
-goldenReport = goldenReportWith (\src -> let c = checkReference src in { globals: c.globals, diags: c.diags })
+goldenReport = goldenReportWith ByNeed (\src -> let c = checkReference src in { globals: c.globals, diags: c.diags })
 
--- | the same, of what the tools elaborate (`heff golden --tools`)
-goldenReportWith :: (String -> { globals :: Globals, diags :: Array Diag }) -> String -> String
-goldenReportWith check src =
+-- | the same, of what the tools elaborate, evaluated as heff does, by value
+-- | (`heff golden --tools`)
+goldenReportWith :: Strategy -> (String -> { globals :: Globals, diags :: Array Diag }) -> String -> String
+goldenReportWith strategy check src =
   let
     c = check src
   in
@@ -397,7 +398,7 @@ goldenReportWith check src =
       [ P.text "-- elaborated"
       , P.vsep (declsDoc c.globals)
       , P.text "-- evaluated"
-      , P.vsep (resultsDoc (evalGlobals c.globals))
+      , P.vsep (resultsDoc (evalGlobals strategy c.globals))
       , P.text "-- messages"
       , P.pretty (renderDiags src c.diags)
       ]

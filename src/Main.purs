@@ -18,6 +18,7 @@ import Hg.Compile.PureScript (compileModule, psValueName)
 import Hg.Core.Globals (globalsList)
 import Hg.Driver (Checked, definitions, elabProgram, errorsIn, explain, findApp, findProgram, goldenReport, goldenReportWith, promote, refReport, renderFileDiags, testFile, typeAt, watches)
 import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
+import Hg.Eval.Interpreter (Strategy(..))
 import Hg.Format (format)
 import Hg.Load (loadProgram, pathsFor)
 import Hg.Lsp as Lsp
@@ -120,7 +121,8 @@ main = do
       let
         g = l.file.top.globals
         r = compileModule modName g identity
-        names = map (\(Tuple x _) -> J.fromArray [ J.fromString x, J.fromString (psValueName x) ]) (globalsList g)
+        -- (each global: its name, its PureScript name, whether it is delayed)
+        names = map (\(Tuple x _) -> J.fromArray [ J.fromString x, J.fromString (psValueName x), J.fromBoolean (A.elem x r.delayed) ]) (globalsList g)
       writeTextFile UTF8 outFile r.source
       writeTextFile UTF8 (outFile <> ".json") (J.stringify (J.fromArray names))
       -- (what does not elaborate is left out, and said so)
@@ -146,7 +148,7 @@ main = do
       log (goldenReport src)
     [ "golden", "--tools", f ] -> do
       l <- load f
-      log (goldenReportWith (\_ -> { globals: l.file.top.globals, diags: l.file.diags }) l.file.source)
+      log (goldenReportWith ByValue (\_ -> { globals: l.file.top.globals, diags: l.file.diags }) l.file.source)
     [ "ref", f ] -> do
       src <- readTextFile UTF8 f
       let r = refReport src

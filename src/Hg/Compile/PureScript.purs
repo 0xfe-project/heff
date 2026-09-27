@@ -20,7 +20,10 @@
 -- | Not yet translated (reported as errors, never silently approximated):
 -- | theories used as values (`M.t`, record types with type fields),
 -- | specialization, sums defined inside a `struct`, and anything whose type
--- | mentions a value.  The generated code is call-by-value.
+-- | mentions a value.  The generated code is call-by-value; a global is
+-- | computed when first used, so one that may fail (`abandon`, or no end) is
+-- | delayed: `HgL.Lazy t`, forced where it is used (`Unit -> t`, if it is
+-- | polymorphic, as PureScript has no `Lazy (forall a. t)`).
 module Hg.Compile.PureScript
   ( compileModule
   , CompileResult
@@ -38,7 +41,7 @@ import Data.List (List(..), (:))
 import Data.List as L
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Traversable (traverse)
@@ -52,7 +55,9 @@ import Hg.Core.Syntax as S
 import Hg.Elab.Prims (prims)
 import Hg.Core.Value as V
 
-type CompileResult = { source :: String, errors :: Array String, skipped :: Array String }
+-- | (`delayed`: the globals computed when first used, `HgL.Lazy` or
+-- | `Unit -> t`)
+type CompileResult = { source :: String, errors :: Array String, skipped :: Array String, delayed :: Array Name }
 
 -- Names
 --------------------------------------------------------------------------------
@@ -110,7 +115,9 @@ constructorName :: String -> String -> String
 constructorName psTy tag = psTy <> "'" <> mangle tag
 
 -- | global keys that are hashes (`#...`) are named by their display name
-type Names = { value :: Name -> String, typ :: Name -> String }
+-- | a value global's name, a type's, and how a value global is used (forced,
+-- | if it is delayed)
+type Names = { value :: Name -> String, typ :: Name -> String, use :: Name -> String }
 
 -- Types
 --------------------------------------------------------------------------------
@@ -345,7 +352,7 @@ syn c = case _ of
     Just { name: Nothing } -> Left "a type variable used as a value"
     Nothing -> Left "unbound local"
   S.Global x -> case lookupGlobal c.globals x of
-    Just e -> pure (Tuple (c.names.value x) e.type_)
+    Just e -> pure (Tuple (c.names.use x) e.type_)
     Nothing -> Left ("unknown global " <> x)
   S.App f a -> do
     Tuple f' fty <- syn c f
@@ -776,8 +783,48 @@ typeDecl nm x syntax = do
       rhs <- elTyPS nm ctx other
       pure ("type " <> header <> " = " <> rhs)
 
-valueDecl :: Globals -> Names -> Name -> GlobalEntry -> E String
-valueDecl g nm x entry = do
+-- | how a global that may fail is delayed: `HgL.Lazy t`, or, if `forall`
+-- | is anywhere in its type (a record's polymorphic field, say: `force`d,
+-- | PureScript would not keep it polymorphic), `Unit -> t`
+data Delay = Monomorphic | Polymorphic
+
+derive instance Eq Delay
+
+-- | the value globals that may fail when computed (each after those it
+-- | uses): all but functions, and values made of literals, constructors,
+-- | records, functions and globals that cannot fail; each with how it is
+-- | delayed, by its PureScript type (`sig`)
+delayedGlobals :: Globals -> (Name -> GlobalEntry -> Maybe String) -> Map Name Delay
+delayedGlobals g sig = A.foldl one Map.empty (globalsList g)
+  where
+  one acc (Tuple x e) = case kindOf e.type_ of
+    Value | not (safeAt acc 0 e.syntax e.type_) ->
+      Map.insert x (if maybe true (S.contains (S.Pattern "forall")) (sig x e) then Polymorphic else Monomorphic) acc
+    _ -> acc
+  -- (under the lambdas of its types, which are erased)
+  safeAt acc len t ty = case t of
+    S.Lam _ abs -> case V.behavior ty of
+      V.LikeFunction ft | isTypeDom ft.dom -> safeAt acc (len + 1) (bodyOf abs) (V.nom (V.appClo ft.cod (pure (V.local len ft.dom))))
+      _ -> true
+    _ -> safeEl acc t
+  bodyOf = case _ of
+    S.Abs _ b -> b
+    S.AbsConst b -> b
+  safeEl acc = case _ of
+    S.Global y -> not (Map.member y acc)
+    S.Lam _ _ -> true
+    S.Cons fs -> A.all (\(Tuple _ f) -> safeEl acc f) (dictToList fs)
+    S.Tag _ ts -> A.all (safeEl acc) ts
+    S.LitInt _ -> true
+    S.LitString _ -> true
+    S.Code _ -> true
+    S.Prim _ -> true
+    S.Is t -> safeEl acc t
+    S.Implicit _ t -> safeEl acc t
+    _ -> false
+
+valueDecl :: Globals -> Names -> Maybe Delay -> Name -> GlobalEntry -> E String
+valueDecl g nm delay x entry = do
   let n = nm.value x
   ty <- sigOf { vars: Map.empty, used: Nil, names: nm, len: 0 } entry.value entry.type_
   let
@@ -790,7 +837,17 @@ valueDecl g nm x entry = do
       , used: n : Nil
       }
   body <- chkD c0 entry.syntax entry.type_ entry.value
-  pure (n <> " :: " <> ty <> "\n" <> n <> " = " <> body)
+  pure case delay of
+    Nothing -> n <> " :: " <> ty <> "\n" <> n <> " = " <> body
+    Just Monomorphic -> n <> " :: HgL.Lazy (" <> ty <> ")\n" <> n <> " = HgL.defer \\_ -> " <> body
+    -- (`forall a. t` as `forall a. Unit -> t`)
+    Just _ ->
+      let
+        ty' = case S.indexOf (S.Pattern ". ") ty of
+          Just i | S.take 7 ty == "forall " -> S.take (i + 2) ty <> "HgP.Unit -> " <> S.drop (i + 2) ty
+          _ -> "HgP.Unit -> " <> ty
+      in
+        n <> " :: " <> ty' <> "\n" <> n <> " _ = " <> body
 
 -- | whether (after its parameters) a theory has type fields, possibly nested
 theoryHasTypeFields :: V.El -> V.Ty -> Boolean
@@ -860,7 +917,17 @@ compileModule :: String -> Globals -> (Name -> Name) -> CompileResult
 compileModule modName g display =
   let
     entries = globalsList g
-    nm = { value: \x -> psValueName (display x), typ: \x -> psTypeName (display x) }
+    value x = psValueName (display x)
+    typ x = psTypeName (display x)
+    sig _ e = case sigOf { vars: Map.empty, used: Nil, names: { value, typ, use: value }, len: 0 } e.value e.type_ of
+      Right t -> Just t
+      Left _ -> Nothing
+    delayed = delayedGlobals g sig
+    use x = case Map.lookup x delayed of
+      Nothing -> value x
+      Just Monomorphic -> "(HgL.force " <> value x <> ")"
+      Just Polymorphic -> "(" <> value x <> " HgP.unit)"
+    nm = { value, typ, use }
     one (Tuple x e) = case kindOf e.type_ of
       TypeCon _ -> case typeDecl nm x e.syntax of
         Right d -> { decl: Just d, err: Nothing, skip: Nothing }
@@ -872,7 +939,7 @@ compileModule modName g display =
         Left err -> { decl: Nothing, err: Nothing, skip: Just (display x <> ": " <> err) }
       Value -> case do
           nested <- nestedDecls { vars: Map.empty, used: Nil, names: nm, len: 0 } [] e.value e.type_
-          d <- valueDecl g nm x e
+          d <- valueDecl g nm (Map.lookup x delayed) x e
           pure (S.joinWith "\n\n" (A.snoc nested d)) of
         Right d -> { decl: Just d, err: Nothing, skip: Nothing }
         Left err -> { decl: Nothing, err: Just (display x <> ": " <> err), skip: Nothing }
@@ -889,6 +956,7 @@ compileModule modName g display =
       , "import Data.Maybe as HgM"
       , "import Data.Ord as HgO"
       , "import Hg.Support.BigInt as HgBI"
+      , "import Data.Lazy as HgL"
       , ""
       , ""
       ]
@@ -896,5 +964,6 @@ compileModule modName g display =
     { source: S.joinWith "\n" header <> S.joinWith "\n\n" (A.mapMaybe _.decl results) <> "\n"
     , errors: A.mapMaybe _.err results
     , skipped: A.mapMaybe _.skip results
+    , delayed: A.fromFoldable (Map.keys delayed)
     }
 
