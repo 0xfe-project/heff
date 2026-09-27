@@ -200,7 +200,8 @@ enclose l r d = l <> d <> r
 -- layout
 -- ===========================================================================
 
-data SDoc = SEmpty | SText String (Lazy SDoc) | SLine Int (Lazy SDoc)
+-- | (`SFail`: a flattened hard line break, which never fits)
+data SDoc = SEmpty | SFail | SText String (Lazy SDoc) | SLine Int (Lazy SDoc)
 
 render :: Doc -> String
 render = renderWidth 80
@@ -215,7 +216,7 @@ best :: Int -> Int -> Int -> List Tuple3 -> SDoc
 best w nl k = case _ of
   Nil -> SEmpty
   Tuple3 i d : ds -> case d of
-    Fail -> SEmpty
+    Fail -> SFail
     Empty -> best w nl k ds
     Text s -> SText s (defer \_ -> best w nl (k + S.length s) ds)
     Line -> SLine i (defer \_ -> best w i i ds)
@@ -238,6 +239,7 @@ fits w nl k s0 = go (min (w - k) (w - (k - nl))) s0
     | rem < 0 = false
     | otherwise = case s of
         SEmpty -> true
+        SFail -> false
         SLine _ _ -> true
         SText t rest -> go (rem - S.length t) (force rest)
 
@@ -246,5 +248,6 @@ display s0 = go s0 ""
   where
   go s acc = case s of
     SEmpty -> acc
+    SFail -> acc
     SText t rest -> go (force rest) (acc <> t)
     SLine i rest -> go (force rest) (acc <> "\n" <> SCU.fromCharArray (A.replicate i ' '))
