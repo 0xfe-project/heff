@@ -1,4 +1,5 @@
 // Generated from Hippogriff; do not edit.
+const $nomatch = (s) => { throw new Error("heff: no case for '" + (s && s.$) + "'"); };
 
 const textIn = (parent, tag, str, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Create", a: [tag, (n) => n] }] }))((x) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [x, str, { $: "MkUnit", a: [] }] }] }))((x1) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Append", a: [parent, x, { $: "MkUnit", a: [] }] }] }))((x2) => k(x))));
 
@@ -7,11 +8,22 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", 
   return hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [label, str, { $: "MkUnit", a: [] }] }] }))((x1) => tick(label, n + 1n, hd, k));
 });
 
-const clock = (hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Root", a: [(n) => n] }] }))((x) => textIn(x, "p", "0 ticks", hd, (x1) => tick(x1, 1n, hd, k)));
+const clock = (hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Select", a: ["#clock", (n) => n] }] }))((x) => {
+  switch (x.$) {
+    case "Nothing": {
+      return k({ $: "MkUnit", a: [] });
+    }
+    case "Just": {
+      const n = x.a[0];
+      return textIn(n, "p", "0 ticks", hd, (x1) => tick(x1, 1n, hd, k));
+    }
+  }
+  return $nomatch(x);
+});
 const clock$c = (hd) => (k) => clock(hd, k);
 
-const $runDom = (main, rootEl) => {
-  const nodes = [rootEl];
+const $runDom = (main) => {
+  const nodes = [];
   let state;
   // (a `Node` is `MkNode i`: the element is nodes[i])
   const node = (n) => nodes[Number(n.a[0])];
@@ -30,7 +42,6 @@ const $runDom = (main, rootEl) => {
       case "Clear": node(a[0]).replaceChildren(); return k(a[1]);
       case "Value": return k(a[1](String(node(a[0]).value ?? "")));
       case "On": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : ""))(done)); return k(a[3]); }
-      case "Root": return k(a[0](mk(0)));
       case "Select": return k(a[1](found(document.querySelector(a[0]))));
       case "XPath": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));
       case "Get": return k(a[0](state));
@@ -49,4 +60,4 @@ const $runDom = (main, rootEl) => {
   return main(hd)(hd.ret)(done);
 };
 
-$runDom(clock$c, document.getElementById("hg-app") || document.body);
+$runDom(clock$c);

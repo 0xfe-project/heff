@@ -54,15 +54,15 @@ compileJs g exports0 =
     , errors: l.errors
     }
 
--- | a script that runs an app (a computation with `dom <+> (state s)`) in the
--- | element `#hg-app`, else the page's body
+-- | a script that runs an app (a computation with `dom <+> (state s)`): where
+-- | it goes on the page is the app's to find (`select`, `xpath`)
 compileApp :: Globals -> String -> Output
 compileApp g key =
   let
     l = lower g [ key ]
     m = emitDefs l.defs [ key ]
   in
-    { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit." ] <> m.lines <> [ "", domRuntime, "", "$runDom(" <> ref m.globals key <> ", document.getElementById(\"hg-app\") || document.body);", "" ])
+    { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit." ] <> m.lines <> [ "", domRuntime, "", "$runDom(" <> ref m.globals key <> ");", "" ])
     , errors: l.errors
     }
 
@@ -343,12 +343,11 @@ uncurryJs = go []
 -- | may finish later (`Sleep`, `Fetch`), and the rest of the computation --
 -- | its continuation -- runs then.  That is JavaScript's asynchrony, as a
 -- | handler: the computation is the same whatever handles it.  Nodes are
--- | numbered, 0 being the root; an element of the page found (`Select`,
--- | `XPath`) is numbered when first found.
+-- | numbered as they are made, or (`Select`, `XPath`) first found.
 domRuntime :: String
 domRuntime = S.joinWith "\n"
-  [ "const $runDom = (main, rootEl) => {"
-  , "  const nodes = [rootEl];"
+  [ "const $runDom = (main) => {"
+  , "  const nodes = [];"
   , "  let state;"
   , "  // (a `Node` is `MkNode i`: the element is nodes[i])"
   , "  const node = (n) => nodes[Number(n.a[0])];"
@@ -367,7 +366,6 @@ domRuntime = S.joinWith "\n"
   , "      case \"Clear\": node(a[0]).replaceChildren(); return k(a[1]);"
   , "      case \"Value\": return k(a[1](String(node(a[0]).value ?? \"\")));"
   , "      case \"On\": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : \"\"))(done)); return k(a[3]); }"
-  , "      case \"Root\": return k(a[0](mk(0)));"
   , "      case \"Select\": return k(a[1](found(document.querySelector(a[0]))));"
   , "      case \"XPath\": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));"
   , "      case \"Get\": return k(a[0](state));"

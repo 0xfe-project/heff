@@ -1,4 +1,5 @@
 // Generated from Hippogriff; do not edit.
+const $nomatch = (s) => { throw new Error("heff: no case for '" + (s && s.$) + "'"); };
 
 const textIn = (parent, tag, str, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Create", a: [tag, (n) => n] }] }))((x) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [x, str, { $: "MkUnit", a: [] }] }] }))((x1) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Append", a: [parent, x, { $: "MkUnit", a: [] }] }] }))((x2) => k(x))));
 
@@ -12,11 +13,22 @@ const decrement = (label, hd, k) => hd.bind(hd.malg({ $: "InR", a: [{ $: "Get", 
   return hd.bind(hd.malg({ $: "InR", a: [{ $: "Put", a: [st, { $: "MkUnit", a: [] }] }] }))((x1) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Text", a: [label, "count: " + (x - 1n).toString(), { $: "MkUnit", a: [] }] }] }))((x2) => k(x2)));
 });
 
-const counter = (hd, k) => hd.bind(hd.malg({ $: "InR", a: [{ $: "Put", a: [0n, { $: "MkUnit", a: [] }] }] }))((x) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Root", a: [(n) => n] }] }))((x1) => textIn(x1, "p", "count: " + 0n.toString(), hd, (x2) => textIn(x1, "button", "+1", hd, (x3) => hd.bind(hd.malg({ $: "InL", a: [{ $: "On", a: [x3, "click", (v) => increment(x2, hd, hd.ret), { $: "MkUnit", a: [] }] }] }))((x4) => textIn(x1, "button", "-1", hd, (x5) => hd.bind(hd.malg({ $: "InL", a: [{ $: "On", a: [x5, "click", (v) => decrement(x2, hd, hd.ret), { $: "MkUnit", a: [] }] }] }))((x6) => k(x6))))))));
+const counter = (hd, k) => hd.bind(hd.malg({ $: "InR", a: [{ $: "Put", a: [0n, { $: "MkUnit", a: [] }] }] }))((x) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Select", a: ["#counter", (n) => n] }] }))((x1) => {
+  switch (x1.$) {
+    case "Nothing": {
+      return k({ $: "MkUnit", a: [] });
+    }
+    case "Just": {
+      const n = x1.a[0];
+      return textIn(n, "p", "count: " + 0n.toString(), hd, (x2) => textIn(n, "button", "+1", hd, (x3) => hd.bind(hd.malg({ $: "InL", a: [{ $: "On", a: [x3, "click", (v) => increment(x2, hd, hd.ret), { $: "MkUnit", a: [] }] }] }))((x4) => textIn(n, "button", "-1", hd, (x5) => hd.bind(hd.malg({ $: "InL", a: [{ $: "On", a: [x5, "click", (v) => decrement(x2, hd, hd.ret), { $: "MkUnit", a: [] }] }] }))((x6) => k(x6))))));
+    }
+  }
+  return $nomatch(x1);
+}));
 const counter$c = (hd) => (k) => counter(hd, k);
 
-const $runDom = (main, rootEl) => {
-  const nodes = [rootEl];
+const $runDom = (main) => {
+  const nodes = [];
   let state;
   // (a `Node` is `MkNode i`: the element is nodes[i])
   const node = (n) => nodes[Number(n.a[0])];
@@ -35,7 +47,6 @@ const $runDom = (main, rootEl) => {
       case "Clear": node(a[0]).replaceChildren(); return k(a[1]);
       case "Value": return k(a[1](String(node(a[0]).value ?? "")));
       case "On": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : ""))(done)); return k(a[3]); }
-      case "Root": return k(a[0](mk(0)));
       case "Select": return k(a[1](found(document.querySelector(a[0]))));
       case "XPath": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));
       case "Get": return k(a[0](state));
@@ -54,4 +65,4 @@ const $runDom = (main, rootEl) => {
   return main(hd)(hd.ret)(done);
 };
 
-$runDom(counter$c, document.getElementById("hg-app") || document.body);
+$runDom(counter$c);

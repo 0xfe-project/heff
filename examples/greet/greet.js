@@ -52,8 +52,8 @@ const greet = (hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "XPath", a: ["//p[
 }));
 const greet$c = (hd) => (k) => greet(hd, k);
 
-const $runDom = (main, rootEl) => {
-  const nodes = [rootEl];
+const $runDom = (main) => {
+  const nodes = [];
   let state;
   // (a `Node` is `MkNode i`: the element is nodes[i])
   const node = (n) => nodes[Number(n.a[0])];
@@ -72,7 +72,6 @@ const $runDom = (main, rootEl) => {
       case "Clear": node(a[0]).replaceChildren(); return k(a[1]);
       case "Value": return k(a[1](String(node(a[0]).value ?? "")));
       case "On": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : ""))(done)); return k(a[3]); }
-      case "Root": return k(a[0](mk(0)));
       case "Select": return k(a[1](found(document.querySelector(a[0]))));
       case "XPath": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));
       case "Get": return k(a[0](state));
@@ -91,4 +90,4 @@ const $runDom = (main, rootEl) => {
   return main(hd)(hd.ret)(done);
 };
 
-$runDom(greet$c, document.getElementById("hg-app") || document.body);
+$runDom(greet$c);

@@ -47,18 +47,20 @@ async function run(file, name, fill = () => {}) {
   return page;
 }
 
-const counter = await run("examples/counter/counter.hg", "counter");
+// (an element with an id, to be found: `#counter`, `#clock`)
+const withBox = (id) => (page) => { const d = new Node("div"); d.setAttribute("id", id); page.appendChild(d); };
+const counter = await run("examples/counter/counter.hg", "counter", withBox("counter"));
 if (counter) {
-  const [label, plus, minus] = counter.children;
+  const [label, plus, minus] = counter.children[0].children;
   check("counter at first", label.text, "count: 0");
   plus.fire("click"); plus.fire("click"); plus.fire("click");
   check("counter after 3 clicks", label.text, "count: 3");
   minus.fire("click");
   check("counter after -1", label.text, "count: 2");
 }
-const clock = await run("examples/clock/clock.hg", "clock");
+const clock = await run("examples/clock/clock.hg", "clock", withBox("clock"));
 if (clock) {
-  const [label] = clock.children;
+  const [label] = clock.children[0].children;
   check("clock at first", label.text, "0 ticks");
   for (let i = 0; i < 5; i++) tick();
   check("clock after 5 ticks", label.text, "5 ticks");

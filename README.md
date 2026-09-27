@@ -208,11 +208,11 @@ everything else is checked byte for byte against the reference.
   (impredicative), which is what makes `Co h a` a small type.
   `test/surface/exc.hg`: exceptions with `catch`, handled by `Maybe`.
 - Apps: `lib/dom.hg` is the DOM as an effect (create, text, attr, append,
-  on, root, select and xpath to find an element of the page, sleep,
+  on, select and xpath to find an element of the page, sleep,
   fetch), and `lib/state.hg` a state (get, put); an app is a computation with the
   two as one, `Co (dom <+> (state s)) Unit` (`<+>`, the sum of two
-  effects, is in `lib/co.hg`): `hg app` writes it, with all it uses, as a script for a page (into
-  `<div id="hg-app">`), whose JavaScript runtime is a handler of the effect
+  effects, is in `lib/co.hg`): `hg app` writes it, with all it uses, as a script for a page (where
+  it goes on the page is the app's to find, by `select` or `xpath`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a
   handler).  The same app runs under a handler written in Hippogriff for
   tests (`test/surface/dom-trace.hg`).
