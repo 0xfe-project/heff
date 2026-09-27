@@ -167,8 +167,7 @@ const tick = (label, n, hd, k) => hd.bind(hd.malg({ $: "InL", a: [{ $: "Sleep", 
   elaborate and their expectations hold; the module rules reject what they
   should.
 - `test/app-run.mjs`: the example apps and `test/apps`, compiled and run on
-  a pretend page; `examples/build.mjs --check`: the apps built in
-  `examples/` are up to date.
+  a pretend page.
 - `test/compile-check.mjs`, `test/compile-check-js.mjs`: the golden corpus,
   `test/programs` and generated programs, compiled and run; every value
   computed must be the interpreter's.
@@ -217,10 +216,9 @@ everything else is checked byte for byte against the reference.
   handler).  The same app runs under a handler written in Hippogriff for
   tests (`test/surface/dom-trace.hg`).
 - Examples: each of `examples/counter`, `examples/clock`, `examples/greet`
-  is a project (`hg.json`, the program, `index.html`) with its app built:
-  open `index.html` in a browser, from the disk as it is (the app is a
-  plain script, importing nothing).  `npm run examples` builds the apps
-  again; `npm test` fails if one is not what its program compiles to.
+  is a project (`hg.json`, the program, `index.html`): `npm run examples`
+  builds the apps, then open `index.html` in a browser, from the disk as
+  it is (the app is a plain script, importing nothing).
   `greet` finds the page's own elements, by a CSS selector and an XPath.
 - In the tools (not `hg golden` or `hg ref`, which stay the reference): a
   call of the definition being defined is checked as `rec (...)`, so
