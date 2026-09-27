@@ -50,6 +50,7 @@ import Hg.Parse.Config (lexConfig, readConfig)
 import Hg.Parse.FNotation (Diag, Ntn, Severity(..))
 import Hg.Parse.FNotation as F
 import Hg.Parse.Fixity (Fixities, emptyFixities, union)
+import Hg.Support.Common (operatorName)
 import Hg.Parse.Surface (readProgram, readProgramWith)
 import Hg.Print.Surface (printTy)
 import Hg.Support.Diagnostic (lineCol, renderDiag, renderDiags)
@@ -154,8 +155,13 @@ showTy g = printTy { names: \_ _ -> [], hide: true } 0 Nil <<< renameTy shown
   shown k = fromMaybe k (Map.lookup k names)
 
 -- | a file's own definitions and their types
+-- | (`name`: as a signature has it, an operator in parentheses)
 definitions :: Checked -> Array { name :: String, type :: String }
-definitions c = A.mapMaybe (\o -> lookupGlobal c.top.globals o.key <#> \e -> { name: o.name, type: showTy c.top.globals (readbTy 0 e.type_) }) c.own
+definitions c = A.mapMaybe (\o -> lookupGlobal c.top.globals o.key <#> \e -> { name: named o.name, type: showTy c.top.globals (readbTy 0 e.type_) }) c.own
+
+-- | a name as written alone: an operator in parentheses, `(+)`
+named :: String -> String
+named x = if isJust (operatorName x) then "(" <> x <> ")" else x
 
 -- Watches and tests
 --------------------------------------------------------------------------------
@@ -295,7 +301,7 @@ infoAt c off = A.head (A.sortWith (\i -> i.span.end - i.span.start) (A.filter (\
 typeAt :: Checked -> Int -> Maybe String
 typeAt c off =
   infoAt c off <#> \i ->
-    i.name <> " :: " <> force i.ty <> (case i.key of
+    named i.name <> " :: " <> force i.ty <> (case i.key of
       Just _ -> "   (global)"
       Nothing -> "   (local)")
 

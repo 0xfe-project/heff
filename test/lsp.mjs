@@ -138,7 +138,7 @@ try {
   ds = await diagnosticsOf(uri("test/surface/lsp-ops.hg"));
   expect("operators of the prelude", ds.length === 0, ds);
   const plusHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-ops.hg") }, position: pos(withOps, "+") });
-  expect("hover on an operator", plusHover.result && plusHover.result.contents.value.includes("+ :: Int -> Int -> Int"), plusHover.result);
+  expect("hover on an operator", plusHover.result && plusHover.result.contents.value.includes("(+) :: Int -> Int -> Int"), plusHover.result);
   const plusDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-ops.hg") }, position: pos(withOps, "+") });
   const plusAt = pos(disk("lib/prelude.hg"), "(+) ::");
   expect("definition of an operator", plusDef.result && plusDef.result.uri === uri("lib/prelude.hg") && plusDef.result.range.start.line === plusAt.line, plusDef.result);
