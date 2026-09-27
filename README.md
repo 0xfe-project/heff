@@ -142,7 +142,7 @@ implementation: build it with GHC ≥ 9.12 and put the path of the
 gone, and what is known at compile time is computed then.  `examples/clock/clock.hg`
 
 ```haskell
-tick :: Int -> Int -> Co (plus dom (state Int)) Unit
+tick :: Int -> Int -> Co (dom <+> (state Int)) Unit
 tick label n = do
   sleep 100
   text label (showInt n ++ " ticks")
@@ -209,7 +209,7 @@ everything else is checked byte for byte against the reference.
 - Apps: `lib/dom.hg` is the DOM as an effect (create, text, attr, append,
   on, root, select and xpath to find an element of the page, sleep,
   fetch), and `lib/state.hg` a state (get, put); an app is a computation with the
-  two as one, `Co (plus dom (state s)) Unit` (`plus`, the sum of two
+  two as one, `Co (dom <+> (state s)) Unit` (`<+>`, the sum of two
   effects, is in `lib/co.hg`): `hg app` writes it, with all it uses, as a script for a page (into
   `<div id="hg-app">`), whose JavaScript runtime is a handler of the effect
   (its monad: the continuation monad `(a -> ()) -> ()`, so asynchrony is a

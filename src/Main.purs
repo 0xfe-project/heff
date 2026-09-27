@@ -150,7 +150,7 @@ main = do
   app f n out = do
     l <- load f
     case findApp l.file n of
-      Nothing -> err ("hg: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (plus dom (state s))`, lib/dom.hg)\n") *> exit' 1
+      Nothing -> err ("hg: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (dom <+> (state s))`, lib/dom.hg)\n") *> exit' 1
       Just k -> do
         let r = compileApp l.file.top.globals k
         for_ r.errors \e -> err ("hg: not compiled: " <> e <> "\n")

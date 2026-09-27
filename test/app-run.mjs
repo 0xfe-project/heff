@@ -49,10 +49,12 @@ async function run(file, name, fill = () => {}) {
 
 const counter = await run("examples/counter/counter.hg", "counter");
 if (counter) {
-  const [label, button] = counter.children;
+  const [label, plus, minus] = counter.children;
   check("counter at first", label.text, "count: 0");
-  button.fire("click"); button.fire("click"); button.fire("click");
+  plus.fire("click"); plus.fire("click"); plus.fire("click");
   check("counter after 3 clicks", label.text, "count: 3");
+  minus.fire("click");
+  check("counter after -1", label.text, "count: 2");
 }
 const clock = await run("examples/clock/clock.hg", "clock");
 if (clock) {
