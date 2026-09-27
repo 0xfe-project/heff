@@ -236,6 +236,11 @@ everything else is checked byte for byte against the reference.
 - The compiled code is call-by-value; the reference interpreter is lazy.
   What the compiler finds unused is not computed, so compiled code may
   abandon less often than call-by-value would.
+- In JavaScript, a definition that calls itself last is a loop: directly
+  (`count (n - 1) (acc + 1)`), or as a constructor's last argument
+  (`Cons x (map f xs)`: the cell is made first, its tail filled by the
+  next round).  So `foldl`, `map`, `filter` go a million deep
+  (`test/node/deep.hf`); `foldr`, which is neither, does not.
 - `Int` is an integer of any size (JavaScript's BigInt; the reference has a
   64-bit `Int`, and no arithmetic).  Division is floor division, as
   Haskell's `div`/`mod`; by zero it abandons.

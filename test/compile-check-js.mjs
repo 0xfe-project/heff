@@ -45,7 +45,10 @@ for (const c of cases) {
     if (m) interp.set(m[1], flat(m[2]));
   }
   if (r.status !== 0 && interp.size === 0) { compileErrors++; continue; }
-  const load = spawnSync("node", [join(root, "test", "load-js.mjs"), out, ...interp.keys()], { encoding: "utf8", timeout: 10000 });
+  // (what the interpreter found to diverge is not read: compiled, with its
+  // loops as loops, it may run for ever)
+  const wanted = [...interp.keys()].filter((n) => interp.get(n) !== "<diverged>");
+  const load = spawnSync("node", [join(root, "test", "load-js.mjs"), out, ...wanted], { encoding: "utf8", timeout: 10000 });
   if (load.status !== 0 || load.error) { timeouts++; console.log(`LOAD FAILED ${c.name}: ${(load.stderr || String(load.error)).split("\n").slice(0, 6).join("\n")}`); continue; }
   const got = JSON.parse(load.stdout);
   let ok = true;

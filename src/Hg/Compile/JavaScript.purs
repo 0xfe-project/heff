@@ -179,7 +179,7 @@ defLines :: Map String GInfo -> Set String -> Set String -> Def -> Array String
 defLines gs curried globalNames d = case Map.lookup d.key gs of
   Nothing -> []
   Just i ->
-    let env0 = { gs, names: Map.empty, used: globalNames }
+    let env0 = { gs, names: Map.empty, used: globalNames, self: Nothing }
     in
       case d.body of
         Lam xs b ->
@@ -189,8 +189,20 @@ defLines gs curried globalNames d = case Map.lookup d.key gs of
             wrapper =
               if i.arity >= 2 && Set.member d.key curried then [ "const " <> i.js <> "$c = " <> S.joinWith "" (map (\p -> "(" <> p <> ") => ") r.js) <> i.js <> "(" <> params <> ");" ]
               else []
+            loops = tailSelf d.key (A.length xs) b
+            trmc = consSelf d.key (A.length xs) b
+            -- (a call of itself last: a loop; its parameters `x$`, each
+            -- round's own `const`, which what it closes over keeps)
+            vars = map (_ <> "$") r.js
+            env' = r.env { self = Just { key: d.key, params: vars, trmc } }
+            looped =
+              [ "", "const " <> i.js <> " = (" <> S.joinWith ", " vars <> ") => {" ]
+                <> (if trmc then [ "  let $root, $hole = null, $at = 0;" ] else [])
+                <> [ "  for (;;) {", "    const " <> S.joinWith ", " (A.zipWith (\x v -> x <> " = " <> v) r.js vars) <> ";" ]
+                <> stmts env' 2 b
+                <> [ "  }", "};" ]
           in
-            [ "", "const " <> i.js <> " = (" <> params <> ") => " <> body r.env 0 b <> ";" ] <> wrapper
+            (if loops then looped else [ "", "const " <> i.js <> " = (" <> params <> ") => " <> body r.env 0 b <> ";" ]) <> wrapper
         b
           | i.lazy -> [ "", "const " <> i.js <> " = $lazy(() => " <> body env0 0 b <> ");" ]
           | otherwise -> [ "", "const " <> i.js <> " = " <> (expr env0 0 b).code <> ";" ]
@@ -199,8 +211,31 @@ defLines gs curried globalNames d = case Map.lookup d.key gs of
 --------------------------------------------------------------------------------
 
 -- | the names in scope: the JavaScript name of each variable, and every
--- | name taken
-type Env = { gs :: Map String GInfo, names :: Map String String, used :: Set String }
+-- | name taken; and, in a function that is a loop, the function (where a
+-- | call of it is last, it goes round again)
+type Env = { gs :: Map String GInfo, names :: Map String String, used :: Set String, self :: Maybe Self }
+
+-- | a function that is a loop: its parameters (`x$`), and whether a
+-- | constructor with a call of it last is built in place, its hole filled by
+-- | the next round (`$root`, `$hole`, `$at`)
+type Self = { key :: String, params :: Array String, trmc :: Boolean }
+
+-- | whether the function `key` calls itself last somewhere: directly, or as
+-- | a constructor's last argument
+tailSelf :: String -> Int -> Expr -> Boolean
+tailSelf key n = case _ of
+  Let _ _ b -> tailSelf key n b
+  Match _ arms -> A.any (tailSelf key n <<< _.body) arms
+  Call k as -> k == key && A.length as == n
+  e -> consSelf key n e
+
+-- | whether it does as a constructor's last argument
+consSelf :: String -> Int -> Expr -> Boolean
+consSelf key n = case _ of
+  Let _ _ b -> consSelf key n b
+  Match _ arms -> A.any (consSelf key n <<< _.body) arms
+  Tag _ as | Just (Call k bs) <- A.last as -> k == key && A.length bs == n
+  _ -> false
 
 bindName :: Env -> String -> { js :: String, env :: Env }
 bindName env x =
@@ -263,10 +298,40 @@ stmts env ind = case _ of
           <> [ indent ind <> "switch (" <> scrut.js <> ".$) {" ]
           <> A.concatMap arm arms
           <> [ indent ind <> "}", indent ind <> "return $nomatch(" <> scrut.js <> ");" ]
-  e -> [ indent ind <> "return " <> (expr env ind e).code <> ";" ]
+  e -> last env ind e
+
+-- | what is last in a function: returned, or, in a loop, the next round
+last :: Env -> Int -> Expr -> Array String
+last env ind e = case env.self, e of
+  Just s, Call k as | k == s.key && A.length as == A.length s.params -> again s as
+  Just s, Tag t as
+    | s.trmc
+    , Just { init, last: Call k bs } <- A.unsnoc as
+    , k == s.key && A.length bs == A.length s.params ->
+        let
+          r = bindName env "cell"
+          args = map (\a -> (expr env ind a).code) init <> [ "undefined" ]
+        in
+          [ indent ind <> "const " <> r.js <> " = { $: " <> quoteString t <> ", a: [" <> S.joinWith ", " args <> "] };"
+          , indent ind <> "if ($hole) $hole.a[$at] = " <> r.js <> "; else $root = " <> r.js <> ";"
+          , indent ind <> "$hole = " <> r.js <> "; $at = " <> show (A.length init) <> ";"
+          ]
+            <> again s bs
+  Just s, _ | s.trmc ->
+    let r = bindName env "r"
+    in
+      [ indent ind <> "const " <> r.js <> " = " <> (expr env ind e).code <> ";"
+      , indent ind <> "if ($hole) { $hole.a[$at] = " <> r.js <> "; return $root; }"
+      , indent ind <> "return " <> r.js <> ";"
+      ]
+  _, _ -> [ indent ind <> "return " <> (expr env ind e).code <> ";" ]
+  where
+  -- (the arguments are of this round's `const`s: assigned one by one)
+  again s as =
+    [ indent ind <> S.joinWith " " (A.zipWith (\p a -> p <> " = " <> (expr env ind a).code <> ";") s.params as) <> " continue;" ]
 
 expr :: Env -> Int -> Expr -> Code
-expr env ind = case _ of
+expr env0 ind = case _ of
   Var x -> p3 (fromMaybe (safe x) (Map.lookup x env.names))
   Global g -> p3 (ref env.gs g)
   Lam xs b ->
@@ -287,6 +352,8 @@ expr env ind = case _ of
   e@(Let _ _ _) -> p3 ("(() => " <> block env ind e <> ")()")
   e@(Match _ _) -> p3 ("(() => " <> block env ind e <> ")()")
   where
+  -- (what is inside an expression is not last in the function)
+  env = env0 { self = Nothing }
   p3 code = { code, prec: 3 }
   maybe'' g = case _ of
     Just i -> i.js

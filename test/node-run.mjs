@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Programs compiled for Node.js (`heff node`, lib/io.hf) and run: what they
-// write, their exit status, and a long loop of operations done at once.
+// write, their exit status, loops a million rounds deep, and a long loop
+// of operations done at once.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -27,6 +28,13 @@ if (build("test/node/echo.hf", "echo", echo)) {
   check("echo: stderr", r.stderr, "to stderr\n");
   check("echo: status", r.status, 3);
   check("echo: the file", readFileSync(copied, "utf8"), "from stdin");
+}
+
+// loops, compiled as loops: a million rounds, and the stack does not overflow
+const deep = join(work, "deep.mjs");
+if (build("test/node/deep.hf", "deep", deep)) {
+  const r = spawnSync("node", [deep], { encoding: "utf8" });
+  check("deep loops", r.stdout + r.stderr, "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n");
 }
 
 // (each operation goes on at once: the stack must not overflow)
