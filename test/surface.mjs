@@ -3,7 +3,7 @@
 // their expectations hold; the module rules reject what they should.
 // (The apps are run by test/app-run.mjs.)
 import { spawnSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -28,5 +28,16 @@ for (const [f, msg] of rejected) {
   if (r.status === 0 || !r.stderr.includes(msg)) { failed++; console.log(`FAIL ${f}: expected an error "${msg}"\n${r.stderr}`); }
 }
 console.log(`modules: ${rejected.length} rejected as they should${failed ? " (with failures)" : ""}`);
+
+// an expectation that does not hold: what differs is shown, cut to it
+mkdirSync(join(root, "ref"), { recursive: true });
+const wrong = join(root, "ref", "wrong-expectation.hg");
+writeFileSync(wrong, `import prelude\n\n-- >>> "${"x".repeat(60)} on click"\n-- "${"x".repeat(60)} onn click"\n`);
+const w = hg("test", wrong);
+const report = w.stdout.slice(w.stdout.indexOf("  expected"));
+if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…") || report.includes("x".repeat(60))) {
+  failed++;
+  console.log(`FAIL the report of an expectation that does not hold:\n${report}`);
+}
 
 process.exit(failed ? 1 : 0);

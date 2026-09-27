@@ -21,6 +21,7 @@ import Hg.Elab.Environment (enableTraceSink, takeTraceSink)
 import Hg.Format (format)
 import Hg.Load (loadProgram, pathsFor)
 import Hg.Lsp as Lsp
+import Hg.Support.Diff (mismatch, useColor)
 import Hg.Support.Pretty as P
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (readTextFile, writeTextFile)
@@ -171,9 +172,11 @@ main = do
     let
       ts = testFile l.file
       bad = A.filter (not <<< _.watch.holds) ts
-    for_ bad \t ->
+    color <- useColor
+    for_ bad \t -> do
+      let m = mismatch color (fromMaybe "" t.watch.expected) t.watch.value
       log ("FAIL " <> f <> (case t.test of
         Just n -> " (" <> n <> ")"
-        Nothing -> "") <> ": " <> t.watch.expr <> "\n  expected " <> fromMaybe "" t.watch.expected <> "\n  but got  " <> t.watch.value)
+        Nothing -> "") <> ": " <> t.watch.expr <> "\n  expected " <> m.expected <> "\n  but got  " <> m.got <> "\n  diff     " <> m.diff)
     log ((if A.null bad && l.ok then "ok    " else "FAIL  ") <> f <> "  " <> show (A.length ts - A.length bad) <> "/" <> show (A.length ts))
     pure { total: A.length ts, failed: A.length bad, ok: l.ok && A.all (isJust <<< _.watch.expected) ts }
