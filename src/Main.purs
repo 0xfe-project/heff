@@ -28,24 +28,41 @@ import Node.FS.Sync (readTextFile, realpath, writeTextFile)
 import Node.Process (argv, exit', stderr, stdout)
 import Node.Stream (writeString)
 
-usage :: String
-usage = S.joinWith "\n"
-  [ "usage: hg COMMAND FILE ..."
-  , ""
-  , "  check FILE              elaborate FILE and what it imports; print its definitions' types"
-  , "  run FILE                print what each watch (`-- >>> e`) of FILE evaluates to"
-  , "  test FILE...            check the watches' expectations (the `-- ...` lines under them)"
-  , "  promote FILE            write each watch's value under it as its expectation"
-  , "  compile-js FILE OUT.js  an ES module of FILE and what it imports"
-  , "  app FILE [NAME] OUT.js  a script running the app NAME (lib/dom.hg) in a page"
-  , "  compile FILE MOD OUT    a PureScript module"
-  , "  explain FILE            the elaboration trace"
-  , "  type-at FILE OFFSET     what the name at OFFSET resolved to, and its type"
-  , "  golden [--tools] FILE   the reference's golden report (.hpgf)"
-  , "  ref FILE                what the reference executable prints (.hpgf)"
-  , "  fmt [--check] FILE...   format FILEs in place (--check: only say which are not formatted)"
-  , "  lsp                     a language server, on stdin/stdout"
+-- | the commands: how each is called, what it does, and what its words
+-- | complete to (`files`: the files' suffix; `flags`)
+commands :: Array { name :: String, args :: String, doc :: String, files :: String, flags :: Array { flag :: String, doc :: String } }
+commands =
+  [ { name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its definitions' types", files: ".hg", flags: [] }
+  , { name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hg", flags: [] }
+  , { name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hg", flags: [] }
+  , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hg", flags: [] }
+  , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hg", flags: [] }
+  , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hg) in a page", files: ".hg", flags: [] }
+  , { name: "compile", args: "FILE MOD OUT", doc: "a PureScript module", files: ".hg", flags: [] }
+  , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hg", flags: [] }
+  , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hg", flags: [] }
+  , { name: "golden", args: "[--tools] FILE", doc: "the reference's golden report (.hpgf)", files: ".hpgf", flags: [ { flag: "tools", doc: "with the tools' extensions" } ] }
+  , { name: "ref", args: "FILE", doc: "what the reference executable prints (.hpgf)", files: ".hpgf", flags: [] }
+  , { name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hg", flags: [ { flag: "check", doc: "only say which are not formatted" } ] }
+  , { name: "lsp", args: "", doc: "a language server, on stdin/stdout", files: "", flags: [] }
+  , { name: "completions", args: "fish", doc: "a completion script for the shell", files: "", flags: [] }
   ]
+
+usage :: String
+usage = S.joinWith "\n" ([ "usage: hg COMMAND FILE ...", "" ] <> map line commands)
+  where
+  line c = let head = c.name <> (if c.args == "" then "" else " " <> c.args) in "  " <> head <> S.joinWith "" (A.replicate (max 1 (24 - S.length head)) " ") <> c.doc
+
+-- | fish's completions of hg: `hg completions fish > ~/.config/fish/completions/hg.fish`
+fishCompletions :: String
+fishCompletions = S.joinWith "\n" ([ "# hg (heff): written by `hg completions fish`", "complete -c hg -e", "complete -c hg -f" ] <> A.concatMap one commands) <> "\n"
+  where
+  quote x = "'" <> S.replaceAll (S.Pattern "'") (S.Replacement "\\'") x <> "'"
+  one c =
+    [ "complete -c hg -n __fish_use_subcommand -a " <> c.name <> " -d " <> quote c.doc ]
+      <> (if c.files == "" then [] else [ "complete -c hg -n '__fish_seen_subcommand_from " <> c.name <> "' -a '(__fish_complete_suffix " <> c.files <> ")'" ])
+      <> map (\f -> "complete -c hg -n '__fish_seen_subcommand_from " <> c.name <> "' -l " <> f.flag <> " -d " <> quote f.doc) c.flags
+      <> (if c.name == "completions" then [ "complete -c hg -n '__fish_seen_subcommand_from completions' -a fish" ] else [])
 
 err :: String -> Effect Unit
 err s = void (writeString stderr UTF8 s)
@@ -147,7 +164,12 @@ main = do
         failed = A.foldl (\n r -> n + r.failed) 0 results
       log (show (total - failed) <> "/" <> show total <> " expectations hold")
       when (failed > 0 || A.any (not <<< _.ok) results) (exit' 1)
-    _ -> log usage *> exit' 1
+    [ "completions", "fish" ] -> void (writeString stdout UTF8 fishCompletions)
+    [] -> log usage
+    [ "help" ] -> log usage
+    -- (on stderr: what reads the output, a shell's completion, say, does not
+    -- take it for an answer)
+    _ -> err (usage <> "\n") *> exit' 1
   where
   app f n out = do
     l <- load f

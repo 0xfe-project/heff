@@ -126,6 +126,7 @@ hg golden [--tools] FILE   # the reference's golden report (.hpgf)
 hg ref FILE                # what the reference executable prints (.hpgf)
 hg fmt [--check] FILE...   # format in place (--check: list what is not formatted)
 hg lsp                     # a language server on stdio (editors/vscode is a client)
+hg completions fish        # hg completions fish > ~/.config/fish/completions/hg.fish
 
 npm test
 ```
