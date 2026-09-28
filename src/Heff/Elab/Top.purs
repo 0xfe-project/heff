@@ -33,7 +33,10 @@ import Control.Monad.State (gets)
 import Data.Foldable (for_)
 import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
 import Heff.Core.Memoed as M
-import Heff.Core.Params (Case(..), Universe(..), Variants(..))
+import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
+import Heff.Core.Print (prtElR)
+import Heff.Core.Rename (displayName)
+import Data.Map as Map
 import Heff.Core.Value as V
 import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, bindAt, emptyElabEnv, emptyElabEnvFor, emptySt, runE, tryPure)
 import Control.Monad.Except (throwError)
@@ -211,15 +214,16 @@ parse c n = case NEA.uncons (getGroup n) of
   { head: n0, tail: [] } -> parseHead c n0
   { head: n0, tail: ns } -> do
     s0 <- parseHead N n0 >>= intoSyn (ntnSpan n0)
-    fromSynN c <$> foldM elim s0 ns
+    fromSynN c <$> foldM (elim (ntnSpan n0).start) s0 ns
 
-elim :: R.Syn -> Ntn -> E R.Syn
-elim s (NField x sp) = pure (R.recordElim sp s x)
+-- | an application to `n`, from `start` (where the function is) to it
+elim :: Int -> R.Syn -> Ntn -> E R.Syn
+elim _ s (NField x sp) = pure (R.recordElim sp s x)
 -- extension: `f (x := a)` (the new syntax) gives the implicit argument `x`
-elim s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed sp x s <$> chk N n
+elim start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> chk N n
 -- extension: `f {a}` gives an implicit argument
-elim s (NBrace n sp) = R.functionElimImplicit sp s <$> chk N n
-elim s n = R.functionElimC (checksOnly n) (ntnSpan n) s <$> chk N n
+elim start s (NBrace n sp) = R.functionElimImplicit { start, end: sp.end } s <$> chk N n
+elim start s n = R.functionElimC (checksOnly n) { start, end: (ntnSpan n).end } s <$> chk N n
 
 -- | notation that can only be checked, never synthesised
 checksOnly :: Ntn -> Boolean
@@ -364,10 +368,7 @@ elabDecl key g n = do
   -- the implicit arguments: every one inferred, and substituted in
   runDelayed true
   stuck <- retryPostponed g
-  for_ (A.head stuck) \p -> throwError
-    { code: 327, severity: SError, span: ntnSpan n, note: Nothing
-    , msg: P.text "cannot infer an implicit argument: a constraint on it is not a pattern (annotate the argument with `{...}`)"
-    }
+  for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError
     { code: 328, severity: SError, span: u.span, note: Nothing
@@ -390,6 +391,41 @@ elabDecl key g n = do
     }
   pure { name: d.name, key: k, prim: d.prim, entry: { syntax: bodyStx, value, type_: aval' } }
 
+-- | a constraint unification could not solve, said where the implicit
+-- | argument it is about was to be inferred (else where the declaration is)
+stuckDiag :: Globals -> Span -> { shape :: CtxShape, left :: V.El, right :: V.El } -> E Diag
+stuckDiag g fallback p = do
+  mc <- gets _.metas
+  let
+    shown v = P.render (prtElR (displayName g) p.shape (V.forceEl mc v))
+    known = shown p.left <> " = " <> shown p.right
+    about = A.head (A.nub (metasIn mc p.left <> metasIn mc p.right)) >>= \m -> Map.lookup m mc
+  pure case about of
+    Just me ->
+      { code: 327, severity: SError, span: me.span
+      , note: Just (P.text ("what is known of it, " <> known <> ", does not say what it is"))
+      , msg: P.text ("cannot infer the implicit argument `" <> me.name <> "`: give it, `(" <> me.name <> " := ...)`")
+      }
+    Nothing ->
+      { code: 327, severity: SError, span: fallback, note: Nothing
+      , msg: P.text ("cannot infer an implicit argument: " <> known <> " does not say what it is")
+      }
+
+-- | the metavariables not yet solved in a value: at its head, or in its
+-- | spine's arguments
+metasIn :: V.MetaCtx -> V.El -> Array Int
+metasIn mc v = case V.forceEl mc v of
+  V.Neu n -> (case n.head of
+    V.Meta m -> [ m ]
+    _ -> []) <> spine n.spine
+  _ -> []
+  where
+  spine = case _ of
+    V.Id -> []
+    V.App sp e -> spine sp <> metasIn mc e
+    V.Proj sp _ -> spine sp
+    V.Specialize sp _ e -> spine sp <> metasIn mc e
+
 -- | extension: `> e`, a watch -- an expression to evaluate and show, as in
 -- | a playground; it is elaborated like a definition body but never becomes
 -- | a global
@@ -402,10 +438,7 @@ elabWatch g n = do
   Tuple t ty <- R.runSyn s (emptyElabEnv g)
   runDelayed true
   stuck <- retryPostponed g
-  for_ (A.head stuck) \_ -> throwError
-    { code: 327, severity: SError, span: ntnSpan n, note: Nothing
-    , msg: P.text "cannot infer an implicit argument: a constraint on it is not a pattern (annotate the argument with `{...}`)"
-    }
+  for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError
     { code: 328, severity: SError, span: u.span, note: Nothing

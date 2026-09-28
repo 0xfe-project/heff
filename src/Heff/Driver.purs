@@ -18,6 +18,7 @@ module Heff.Driver
   , promote
   , evaluate
   , findRunnable
+  , completionsAt
   , explain
   , typeAt
   , definitionAt
@@ -29,6 +30,7 @@ import Data.Array as A
 import Data.Either (Either(..))
 import Data.Lazy (force)
 import Data.List (List(..))
+import Control.Alt ((<|>))
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
 import Data.String as S
@@ -323,6 +325,26 @@ infoAt c off = A.head (A.sortWith (\i -> i.span.end - i.span.start) (A.filter (\
   where
   -- (a tag may be written with its `'`)
   written i = i.span.end - i.span.start <= S.length i.name + 1
+
+-- | What may be written where the name being typed ends, at `offset`: the
+-- | names in scope that start as it does, each with its type.  After `M.`,
+-- | the definitions of the module imported as `M`, without the `M.`.
+completionsAt :: Checked -> Int -> Array { label :: String, detail :: String }
+completionsAt c offset =
+  A.sortWith _.label (A.mapMaybe one (A.nub names))
+  where
+  typed = SCU.fromCharArray (A.reverse (A.takeWhile isNameChar (A.reverse (SCU.toCharArray (SCU.take offset c.source)))))
+  isNameChar ch = ch == '_' || ch == '\'' || ch == '.' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+  -- (`M.fo`: the qualifier `M.`, and `fo`)
+  qualifier = case S.lastIndexOf (S.Pattern ".") typed of
+    Just i -> S.take (i + 1) typed
+    Nothing -> ""
+  names = map _.name c.own <> A.fromFoldable (Map.keys c.top.globals.aliases)
+  one x = case S.stripPrefix (S.Pattern typed) x of
+    Just _ | qualifier /= "" || not (S.contains (S.Pattern ".") x) ->
+      let label = fromMaybe x (S.stripPrefix (S.Pattern qualifier) x)
+      in Just { label, detail: maybe "" (\e -> showTy c.top.globals (readbTy 0 e.type_)) (lookupGlobal c.top.globals x <|> lookupGlobal c.top.globals (c.module <> "." <> x)) }
+    _ -> Nothing
 
 typeAt :: Checked -> Int -> Maybe String
 typeAt c off =

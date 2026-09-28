@@ -29,7 +29,7 @@ import Effect.Exception (message, try)
 import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Foreign.Object as FO
-import Heff.Driver (Checked, definitionAt, elabProgram, typeAt)
+import Heff.Driver (Checked, completionsAt, definitionAt, elabProgram, typeAt)
 import Heff.Format (format)
 import Heff.Load (loadProgramWith, pathsFor)
 import Heff.Parse.Notation (Diag, Severity(..), Span)
@@ -155,6 +155,8 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
           , Tuple "hoverProvider" J.jsonTrue
           , Tuple "definitionProvider" J.jsonTrue
           , Tuple "documentFormattingProvider" J.jsonTrue
+          -- (after `M.`, the module's definitions)
+          , Tuple "completionProvider" (obj [ Tuple "triggerCharacters" (J.fromArray [ J.fromString "." ]) ])
           ]
       , Tuple "serverInfo" (obj [ Tuple "name" (J.fromString "heff") ])
       ]
@@ -166,6 +168,8 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
       s <- Ref.read st
       reply id $ maybe J.jsonNull (\d -> obj [ Tuple "uri" (J.fromString (maybe (pathUri d.path) _.uri (Map.lookup d.path s.docs))), Tuple "range" (range d.source d.span) ])
         (definitionAt program (offsetIn src p))
+    "textDocument/completion" -> withProgram p \src program ->
+      reply id $ J.fromArray $ maybe [] (\c -> map (\i -> obj [ Tuple "label" (J.fromString i.label), Tuple "kind" (num 3), Tuple "detail" (J.fromString i.detail) ]) (completionsAt c (offsetIn src p))) (A.last program)
     "textDocument/formatting" -> do
       s <- Ref.read st
       case docPath p >>= \f -> Map.lookup f s.docs of

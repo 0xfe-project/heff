@@ -98,6 +98,20 @@ try {
   const qHover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
   expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.not :: A.Bool -> A.Bool"), qHover.result);
 
+  // completion: the names in scope that start as the one being typed; after
+  // `A.`, the definitions of the module imported as `A`
+  const typing = "import prelude\n\nx :: Int\nx = len";
+  open("test/surface/lsp-complete.hf", typing);
+  await diagnosticsOf(uri("test/surface/lsp-complete.hf"));
+  const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 3, character: 7 } });
+  const lengthItem = comp.result && comp.result.find((i) => i.label === "length");
+  expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("List a -> Int") && !comp.result.some((i) => i.label === "map"), comp.result && comp.result.map((i) => i.label));
+  const dotted = "import a as A\n\nx :: A.Bool\nx = A.";
+  open("test/modules/lsp-dot.hf", dotted);
+  await diagnosticsOf(uri("test/modules/lsp-dot.hf"));
+  const dot = await request("textDocument/completion", { textDocument: { uri: uri("test/modules/lsp-dot.hf") }, position: { line: 3, character: 6 } });
+  expect("completion after `A.`", dot.result && dot.result.some((i) => i.label === "not") && dot.result.every((i) => !i.label.includes(".")), dot.result && dot.result.map((i) => i.label));
+
   // a global of the file itself, and the standard library's
   const basics = disk("test/surface/basics.hf");
   open("test/surface/basics.hf", basics);

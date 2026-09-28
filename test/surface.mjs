@@ -28,6 +28,7 @@ const rejected = [
   ["test/errors/specialize.hf", "neutrals Bool and Unit are not equal"],
   ["test/modules/qualified-only.hf", "no such variable not in scope"],
   ["test/errors/literals.hf", "one of them must match every other value"],
+  ["test/errors/implicit.hf", "test/errors/implicit.hf:33:8\nerror[E0327]: cannot infer the implicit argument `h`: give it, `(h := ...)`"],
   ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
 ];
 for (const [f, msg] of rejected) {
