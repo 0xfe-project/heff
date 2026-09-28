@@ -292,6 +292,7 @@ data Ty
   | PrimInt
   | PrimFloat
   | PrimString
+  | PrimArray Ty
 
 levelOf :: Ty -> Level
 levelOf = case _ of
@@ -303,6 +304,7 @@ levelOf = case _ of
   PrimInt -> Small
   PrimFloat -> Small
   PrimString -> Small
+  PrimArray a -> levelOf a
 
 levelOfEv :: Ev Ty -> Level
 levelOfEv = case _ of
@@ -318,6 +320,7 @@ data TypeBehavior
   | LikeInt
   | LikeFloat
   | LikeString
+  | LikeArray Ty
   | NoRules
 
 behavior :: Ty -> TypeBehavior
@@ -330,6 +333,7 @@ behavior = case _ of
   PrimInt -> LikeInt
   PrimFloat -> LikeFloat
   PrimString -> LikeString
+  PrimArray a -> LikeArray a
 
 -- | the domain of a lambda's function type annotation; a metavariable
 -- | solution's lambdas are annotated with a placeholder universe instead, which

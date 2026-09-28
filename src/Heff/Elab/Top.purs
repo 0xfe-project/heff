@@ -204,6 +204,8 @@ parse :: Case -> Ntn -> E Judgment
 parse c n = case NEA.uncons (getGroup n) of
   { head: NTag x tsp, tail: ns } ->
     (\args -> fromChkN c (R.sumIntro (ntnSpan n) tsp x args)) <$> traverse (chk N) ns
+  { head: Keyword "Array" _, tail: [ n0 ] } ->
+    (\a -> fromTypN c (R.primArray a)) <$> typ N n0
   { head: Keyword "rec" _, tail: [ n0 ] } ->
     (\b -> fromChkN c (R.recChk (ntnSpan n) b)) <$> chk N n0
   { head: n0, tail: [] } -> parseHead c n0

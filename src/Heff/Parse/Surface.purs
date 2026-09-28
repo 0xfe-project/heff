@@ -584,7 +584,7 @@ atom = lazyP \_ -> do
     "int" -> next *> pure (NInt (BI.fromDigits t.text) (spanOf t))
     "float" -> next *> pure (NFloat (fromMaybe 0.0 (Number.fromString t.text)) (spanOf t))
     "str" -> next *> pure (NString t.text (spanOf t))
-    "kw" | A.elem t.text [ "Type", "Int", "Float", "String", "abandon" ] -> next *> pure (Keyword t.text (spanOf t))
+    "kw" | A.elem t.text [ "Type", "Int", "Float", "String", "Array", "abandon" ] -> next *> pure (Keyword t.text (spanOf t))
     "kw" | t.text == "sum" -> anonymousSum
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
@@ -597,7 +597,7 @@ atom = lazyP \_ -> do
 
 startsAtom :: Tok -> Boolean
 startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
-  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "sum", "abandon" ])
+  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "Array", "sum", "abandon" ])
   || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
 
 -- | `( e )`, `( e :: T )`, `(x := e)` (a named argument), `(+)` (an

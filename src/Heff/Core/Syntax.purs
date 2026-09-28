@@ -48,3 +48,4 @@ data Ty
   | PrimInt
   | PrimFloat
   | PrimString
+  | PrimArray Ty

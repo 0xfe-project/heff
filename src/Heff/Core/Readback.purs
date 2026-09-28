@@ -104,3 +104,4 @@ readbTy n = case _ of
   V.PrimInt -> S.PrimInt
   V.PrimFloat -> S.PrimFloat
   V.PrimString -> S.PrimString
+  V.PrimArray a -> S.PrimArray (readbTy n a)

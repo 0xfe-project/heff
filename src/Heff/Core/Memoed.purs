@@ -123,6 +123,9 @@ primInt = { stx: S.PrimInt, val: pure (V.Nom V.PrimInt) }
 primFloat :: Ty
 primFloat = { stx: S.PrimFloat, val: pure (V.Nom V.PrimFloat) }
 
+primArray :: Ty -> Ty
+primArray a = { stx: S.PrimArray a.stx, val: defer \_ -> V.Nom (V.PrimArray (tyN a)) }
+
 primString :: Ty
 primString = { stx: S.PrimString, val: pure (V.Nom V.PrimString) }
 

@@ -49,6 +49,7 @@ data Val
   | LitInt BigInt
   | LitFloat Number
   | LitString String
+  | ArrayV (Array Val)
   | Erased
 
 prettyVal :: Val -> Doc
@@ -60,6 +61,7 @@ prettyVal = case _ of
   -- (`2.0`, not `2`: as a literal writes it)
   LitFloat x -> P.text (show x)
   LitString s -> P.text (show s)
+  ArrayV xs -> P.text ("[" <> A.intercalate ", " (map (P.render <<< prettyVal) xs) <> "]")
   Erased -> P.text "#erased"
 
 app :: Val -> Lazy Val -> Val
@@ -148,6 +150,15 @@ prim = case _ of
   "floatSqrt" -> Lam \a -> LitFloat (Number.sqrt (float a))
   -- (of what is not a number, or not finite, `abandon`)
   "floatFloor" -> Lam \a -> let x = float a in if Number.isFinite x then LitInt (floorToBig x) else unsafeThrow abandonMarker
+  -- (an array's element type is given first, erased)
+  "arrayLength" -> ty \_ -> Lam \a -> LitInt (BI.fromInt (A.length (arr a)))
+  "arrayIndex" -> ty \_ -> Lam \a -> Lam \i -> orAbandon' (at (arr a) (int i) >>= A.index (arr a))
+  "arraySet" -> ty \_ -> Lam \a -> Lam \i -> Lam \x -> orAbandon' (at (arr a) (int i) >>= \k -> ArrayV <$> A.updateAt k (force x) (arr a))
+  "arrayGenerate" -> ty \_ -> Lam \n -> Lam \f ->
+    let k = BI.toIntClamped (int n)
+    in ArrayV (if k <= 0 then [] else map (\j -> app (force f) (pure (LitInt (BI.fromInt j)))) (A.range 0 (k - 1)))
+  "arrayFromList" -> ty \_ -> Lam \l -> ArrayV (fromList (force l) [])
+  "arrayToList" -> ty \_ -> Lam \a -> A.foldr (\x rest -> Tag "Cons" [ pure x, pure rest ]) (Tag "Nil" []) (arr a)
   "strAppend" -> str2 \a b -> LitString (a <> b)
   "strLength" -> Lam \a -> LitInt (BI.fromInt (Str.length (str a)))
   "strSlice" -> Lam \a -> Lam \i -> Lam \j -> LitString (Str.slice (small i) (small j) (str a))
@@ -171,6 +182,19 @@ prim = case _ of
     LitFloat x -> x
     _ -> panic "a primitive expected a float"
   float2 f = Lam \a -> Lam \b -> f (float a) (float b)
+  arr v = case force v of
+    ArrayV xs -> xs
+    _ -> panic "a primitive expected an array"
+  ty k = Lam \_ -> k unit
+  -- (an index in range)
+  at xs i = if i >= BI.fromInt 0 && i < BI.fromInt (A.length xs) then Just (BI.toIntClamped i) else Nothing
+  orAbandon' = case _ of
+    Just v -> v
+    Nothing -> unsafeThrow abandonMarker
+  -- (a list's cells, `Cons`/`Nil`, as the prelude has them)
+  fromList v acc = case v of
+    Tag "Cons" [ x, rest ] -> fromList (force rest) (A.snoc acc (force x))
+    _ -> acc
   int2 f = Lam \a -> Lam \b -> f (int a) (int b)
   small v = BI.toIntClamped (int v)
   -- (a `case`: an argument would be thrown before the call)
@@ -194,6 +218,7 @@ showVal = go false
       in if inArg then P.text "(" <> d <> P.text ")" else d
     Tag x _ -> P.text (tag x)
     Cons fs -> P.text ("{ " <> A.intercalate ", " (map (\(Tuple x v) -> x <> " = " <> P.render (go false (force v))) (dictToList fs)) <> " }")
+    ArrayV xs -> P.text ("[" <> A.intercalate ", " (map (P.render <<< go false) xs) <> "]")
     v -> prettyVal v
 
 -- | a tag as the surface syntax writes it: a capitalised one bare

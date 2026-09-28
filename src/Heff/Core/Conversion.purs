@@ -82,6 +82,7 @@ defEqTy cs a a' = case a, a' of
   V.PrimInt, V.PrimInt -> ok
   V.PrimFloat, V.PrimFloat -> ok
   V.PrimString, V.PrimString -> ok
+  V.PrimArray b, V.PrimArray b' -> defEqTy cs b b'
   _, _ -> Left (UnequalTys cs a a' Nothing)
 
 defEqHead :: CtxShape -> V.Head -> V.Head -> DefEqM

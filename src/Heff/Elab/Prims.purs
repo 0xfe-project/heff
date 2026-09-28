@@ -42,6 +42,12 @@ prims =
   , Tuple "floatFromInt" { arity: 1, js: "(a) => Number(a)" }
   , Tuple "floatSqrt" { arity: 1, js: "(a) => Math.sqrt(a)" }
   , Tuple "floatFloor" { arity: 1, js: "(a) => Number.isFinite(a) ? BigInt(Math.floor(a)) : $abandon()" }
+  , Tuple "arrayLength" { arity: 1, js: "(a) => BigInt(a.length)" }
+  , Tuple "arrayIndex" { arity: 2, js: "(a) => (i) => i >= 0n && i < BigInt(a.length) ? a[Number(i)] : $abandon()" }
+  , Tuple "arraySet" { arity: 3, js: "(a) => (i) => (x) => { if (!(i >= 0n && i < BigInt(a.length))) return $abandon(); const b = a.slice(); b[Number(i)] = x; return b; }" }
+  , Tuple "arrayGenerate" { arity: 2, js: "(n) => (f) => Array.from({ length: n > 0n ? Number(n) : 0 }, (_, k) => f(BigInt(k)))" }
+  , Tuple "arrayFromList" { arity: 1, js: "(l) => { const r = []; while (l.$ === \"Cons\") { r.push(l.a[0]); l = l.a[1]; } return r; }" }
+  , Tuple "arrayToList" { arity: 1, js: "(a) => a.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] })" }
   , Tuple "strAppend" { arity: 2, js: "(a) => (b) => a + b" }
   , Tuple "strLength" { arity: 1, js: "(a) => BigInt(a.length)" }
   , Tuple "strSlice" { arity: 3, js: "(a) => (i) => (j) => a.slice(Number(i), Number(j))" }

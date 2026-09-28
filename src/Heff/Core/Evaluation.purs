@@ -119,3 +119,6 @@ compileTy g c = case _ of
   S.PrimInt -> \_ -> V.Nom V.PrimInt
   S.PrimFloat -> \_ -> V.Nom V.PrimFloat
   S.PrimString -> \_ -> V.Nom V.PrimString
+  S.PrimArray a ->
+    let k = compileTy g N a
+    in \vs -> V.Nom (V.PrimArray (V.nom (k vs)))

@@ -10,6 +10,7 @@ export const show = (v, arg = false) => {
   // (a float as a literal writes it: `2.0`, not `2`)
   if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
   if (typeof v === "string") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {
       const tag = /^[A-Z]/.test(v.$) ? v.$ : "'" + v.$;

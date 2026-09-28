@@ -179,6 +179,7 @@ ty c p xs = case _ of
   Syn.PrimInt -> "Int"
   Syn.PrimFloat -> "Float"
   Syn.PrimString -> "String"
+  Syn.PrimArray a -> paren (p >= 2) ("Array " <> ty c 2 xs a)
   where
   arrow f = case f.cod of
     Syn.Abs x b | f.implicit ->

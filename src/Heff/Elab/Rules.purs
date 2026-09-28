@@ -344,6 +344,10 @@ primFloat = Typ \_ -> pure M.primFloat
 litFloat :: Number -> Syn
 litFloat x = Syn \_ -> pure (Tuple (M.litFloat x) V.PrimFloat)
 
+-- | `Array a`
+primArray :: Typ -> Typ
+primArray a = Typ \e -> M.primArray <$> runTyp a e
+
 primString :: Typ
 primString = Typ \_ -> pure M.primString
 

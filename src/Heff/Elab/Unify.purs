@@ -152,6 +152,7 @@ uTy g cs a0 b0 = do
       V.PrimInt, V.PrimInt -> pure unit
       V.PrimFloat, V.PrimFloat -> pure unit
       V.PrimString, V.PrimString -> pure unit
+      V.PrimArray a', V.PrimArray b' -> uTy g cs a' b'
       _, _ -> throwError (UnequalTys cs a b Nothing)
 
 uBare :: Globals -> CtxShape -> V.BareNeutral -> V.BareNeutral -> U Unit
@@ -409,6 +410,7 @@ renameTy g m r t0 = do
     V.PrimInt -> pure S.PrimInt
     V.PrimFloat -> pure S.PrimFloat
     V.PrimString -> pure S.PrimString
+    V.PrimArray a -> S.PrimArray <$> renameTy g m r a
   where
   iterateLift i rr = if i <= 0 then rr else iterateLift (i - 1) (lift1 rr)
 

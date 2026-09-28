@@ -510,7 +510,7 @@ atom = lazyP \_ -> do
 
 startsAtom :: T -> Boolean
 startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
-  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "sum", "abandon" ])
+  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "Array", "sum", "abandon" ])
   || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
 
 parens :: P E
