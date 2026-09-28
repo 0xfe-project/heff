@@ -76,6 +76,10 @@ if (finder) {
   check("found by xpath", log.text, "found by xpath");
   check("nothing else written", finder.children.length, 2);
 }
+// an app whose effect is a definition, `page = dom <+> (state Int)`
+const withOut = (page) => { const p = new Node("p"); p.setAttribute("id", "out"); page.appendChild(p); };
+const aliased = await run("test/apps/aliased.hf", "aliased", withOut);
+if (aliased) check("an effect by its definition", aliased.children[0].text, "42");
 // the page's own input and paragraph (examples/greet/index.html)
 const greetPage = (page) => {
   const input = new Node("input"); input.setAttribute("id", "name"); input.value = "";
@@ -89,5 +93,5 @@ if (greet) {
   input.value = "Ada"; input.fire("input");
   check("greet after typing", p.text, "Hello, Ada!");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder and greet run"}`);
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased and greet run"}`);
 process.exit(failed ? 1 : 0);

@@ -30,6 +30,12 @@ if (build("test/node/echo.hf", "echo", echo)) {
   check("echo: the file", readFileSync(copied, "utf8"), "from stdin");
 }
 
+// a computation of an effect Node has no handler for is refused, and why
+{
+  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "node", "examples/counter/counter.hf", join(work, "counter.mjs")], { cwd: root, encoding: "utf8" });
+  check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom, which is not handled here"), true);
+}
+
 // loops, compiled as loops: a million rounds, and the stack does not overflow
 const deep = join(work, "deep.mjs");
 if (build("test/node/deep.hf", "deep", deep)) {

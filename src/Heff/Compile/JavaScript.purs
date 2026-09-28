@@ -32,6 +32,7 @@ import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
 import Heff.Core.Globals (Globals, globalsList)
+import Heff.Effect (Effect(..), leaves)
 import Heff.Elab.Prims (prims)
 import Heff.Lower (lower)
 import Heff.Lower.IR (Def, Expr(..), baseOf, globalsIn, isValue)
@@ -55,29 +56,32 @@ compileJs g exports0 =
     , errors: l.errors
     }
 
--- | a script that runs an app (a computation with `dom <+> (state s)`): where
--- | it goes on the page is the app's to find (`select`, `xpath`)
-compileApp :: Globals -> String -> Output
-compileApp g key =
-  let
-    l = lower g [ key ]
-    m = emitDefs l.defs [ key ]
-  in
-    { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit." ] <> m.lines <> [ "", domRuntime, "", "$runDom(" <> ref m.globals key <> ");", "" ])
-    , errors: l.errors
-    }
+-- | a script for a page that runs a computation (`key`) of the effect
+-- | `eff` (of `dom` and `state`): where it goes on the page is its to find
+-- | (`select`, `xpath`)
+compileApp :: Globals -> String -> Effect -> Output
+compileApp = compileRun []
 
--- | a Node.js program (an ES module) that runs a computation with `io`
--- | (lib/io.hf)
-compileNode :: Globals -> String -> Output
-compileNode g key =
+-- | a Node.js program (an ES module) that runs a computation of the effect
+-- | `eff` (of `io` and `state`)
+compileNode :: Globals -> String -> Effect -> Output
+compileNode g key eff =
+  compileRun (if A.elem "io" (leaves eff) then [ "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";" ] else []) g key eff
+
+compileRun :: Array String -> Globals -> String -> Effect -> Output
+compileRun imports g key eff =
   let
     l = lower g [ key ]
     m = emitDefs l.defs [ key ]
   in
-    { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit.", "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";" ] <> m.lines <> [ "", nodeRuntime, "", "$runNode(" <> ref m.globals key <> ");", "" ])
+    { source: S.joinWith "\n" ([ "// Generated from Hippogriff; do not edit." ] <> imports <> m.lines <> [ "", runtimeFor eff, "", "$run(" <> ref m.globals key <> ", " <> handlerOf eff <> ");", "" ])
     , errors: l.errors
     }
+  where
+  -- (each effect's handler, an operation of a sum going to its side's)
+  handlerOf = case _ of
+    Leaf x -> "$" <> x <> "()"
+    Plus a b -> "$sum(" <> handlerOf a <> ", " <> handlerOf b <> ")"
 
 -- Globals
 --------------------------------------------------------------------------------
@@ -417,91 +421,105 @@ uncurryJs = go []
       _ -> { params: ps, body: s }
     Nothing -> { params: ps, body: s }
 
--- | the handler of an app's effect (`dom <+> (state s)`, lib/dom.hf: the
--- | DOM's and a state's, as one) that acts on the page.  Its
--- | (raw) monad is the continuation monad, `(a -> ()) -> ()`: an operation
--- | may finish later (`Sleep`, `Fetch`), and the rest of the computation --
--- | its continuation -- runs then.  That is JavaScript's asynchrony, as a
--- | handler: the computation is the same whatever handles it.  Nodes are
--- | numbered as they are made, or (`Select`, `XPath`) first found.
-domRuntime :: String
-domRuntime = S.joinWith "\n"
-  [ "const $runDom = (main) => {"
-  , "  const nodes = [];"
-  , "  let state;"
-  , "  // (a `Node` is `MkNode i`: the element is nodes[i])"
-  , "  const node = (n) => nodes[Number(n.a[0])];"
-  , "  const mk = (i) => ({ $: \"MkNode\", a: [BigInt(i)] });"
-  , "  const found = (el) => { if (!el) return { $: \"Nothing\", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: \"Just\", a: [mk(i)] }; };"
-  , "  const done = () => {};"
-  , "  const perform = (p0, k) => {"
-  , "    // (the effects' sum: either's operation, whose names are distinct)"
-  , "    const p = p0.$ === \"InL\" || p0.$ === \"InR\" ? p0.a[0] : p0;"
-  , "    const a = p.a;"
-  , "    switch (p.$) {"
-  , "      case \"Create\": nodes.push(document.createElement(a[0])); return k(a[1](mk(nodes.length - 1)));"
-  , "      case \"Text\": node(a[0]).textContent = a[1]; return k(a[2]);"
-  , "      case \"Attr\": node(a[0]).setAttribute(a[1], a[2]); return k(a[3]);"
-  , "      case \"Append\": node(a[0]).appendChild(node(a[1])); return k(a[2]);"
-  , "      case \"Clear\": node(a[0]).replaceChildren(); return k(a[1]);"
-  , "      case \"Value\": return k(a[1](String(node(a[0]).value ?? \"\")));"
-  , "      case \"On\": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : \"\"))(done)); return k(a[3]); }"
-  , "      case \"Select\": return k(a[1](found(document.querySelector(a[0]))));"
-  , "      case \"XPath\": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));"
-  , "      case \"Get\": return k(a[0](state));"
-  , "      case \"Put\": state = a[0]; return k(a[1]);"
-  , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
-  , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
-  , "      default: throw new Error(\"heff: not an operation of the app's effect: \" + (p && p.$));"
-  , "    }"
-  , "  };"
-  , "  // the handler: its monad's return and bind, and its algebra"
-  , "  const hd = {"
-  , "    ret: (x) => (k) => k(x),"
-  , "    bind: (m) => (f) => (k) => m((x) => f(x)(k)),"
-  , "    malg: (p) => (k) => perform(p, k),"
-  , "  };"
-  , "  return main(hd)(hd.ret)(done);"
-  , "};"
-  ]
-
--- | the handler of `io` (lib/io.hf) that acts on the process: as the page's
--- | (`domRuntime`), its monad is the continuation monad, so what Node does
--- | asynchronously (writing, reading the standard input, files) goes on in
--- | the continuation.  `Exit` does not go on: the process ends when what is
--- | pending (output being written) is done.  (An operation done at once goes
--- | on at once, the stack deeper each time: every so often, it goes on after
--- | the stack is let go of, lest a long loop of them overflow it.)
-nodeRuntime :: String
-nodeRuntime = S.joinWith "\n"
-  [ "const $runNode = (main) => {"
-  , "  const nothing = { $: \"Nothing\", a: [] };"
-  , "  const just = (x) => ({ $: \"Just\", a: [x] });"
-  , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
-  , "  const bool = (b) => ({ $: b ? \"True\" : \"False\", a: [] });"
-  , "  const done = () => {};"
-  , "  let depth = 0;"
-  , "  const now = (k) => (x) => { if (depth > 1000) { depth = 0; setImmediate(() => k(x)); return; } depth++; k(x); };"
-  , "  const perform = (p, k0) => {"
-  , "    const a = p.a, k = now(k0);"
-  , "    switch (p.$) {"
-  , "      case \"Write\": process.stdout.write(a[0], () => k(a[1])); return;"
-  , "      case \"WriteErr\": process.stderr.write(a[0], () => k(a[1])); return;"
-  , "      case \"ReadStdin\": { let text = \"\"; process.stdin.setEncoding(\"utf8\"); process.stdin.on(\"data\", (d) => { text += d; }); process.stdin.on(\"end\", () => k(a[0](text))); return; }"
-  , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
-  , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
-  , "      case \"ReadFile\": $readFile(a[0], \"utf8\", (e, t) => k(a[1](e ? nothing : just(t)))); return;"
-  , "      case \"WriteFile\": $writeFile(a[0], a[1], (e) => k(a[2](bool(!e)))); return;"
-  , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
-  , "      default: throw new Error(\"heff: not an operation of io: \" + (p && p.$));"
-  , "    }"
-  , "  };"
-  , "  // the handler: its monad's return and bind, and its algebra"
-  , "  const hd = {"
-  , "    ret: (x) => (k) => k(x),"
-  , "    bind: (m) => (f) => (k) => m((x) => f(x)(k)),"
-  , "    malg: (p) => (k) => perform(p, k),"
-  , "  };"
-  , "  return main(hd)(hd.ret)(done);"
-  , "};"
-  ]
+-- | The runtime: a computation run by a handler whose (raw) monad is the
+-- | continuation monad, `(a -> ()) -> ()`.  An operation may finish later
+-- | (`Sleep`, `Fetch`, reading a file), and the rest of the computation --
+-- | its continuation -- runs then: JavaScript's asynchrony, as a handler,
+-- | and the computation is the same whatever handles it.  `perform` does an
+-- | operation of the computation's effect: `$sum` of two effects' handlers
+-- | gives each of its operations (`InL`, `InR`) to its side's, and each
+-- | effect's handler (`$dom`, `$state`, `$io`) knows its own operations.
+-- | (An operation done at once goes on at once, the stack deeper each time:
+-- | every so often it goes on after the stack is let go of, lest a long
+-- | loop of them overflow it.)
+runtimeFor :: Effect -> String
+runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []) <> A.mapMaybe handler (A.nub (leaves eff)))
+  where
+  hasSum = case _ of
+    Plus _ _ -> true
+    Leaf _ -> false
+  handler = case _ of
+    "dom" -> Just dom
+    "state" -> Just state
+    "io" -> Just io
+    _ -> Nothing
+  run = S.joinWith "\n"
+    [ "const $run = (main, perform) => {"
+    , "  const done = () => {};"
+    , "  const later = typeof setImmediate === \"function\" ? setImmediate : (f) => setTimeout(f, 0);"
+    , "  let depth = 0;"
+    , "  const now = (k) => (x) => { if (depth > 1000) { depth = 0; later(() => k(x)); return; } depth++; k(x); };"
+    , "  // the handler: its monad's return and bind, and its algebra"
+    , "  const hd = {"
+    , "    ret: (x) => (k) => k(x),"
+    , "    bind: (m) => (f) => (k) => m((x) => f(x)(k)),"
+    , "    malg: (p) => (k) => perform(p, now(k)),"
+    , "  };"
+    , "  return main(hd)(hd.ret)(done);"
+    , "};"
+    ]
+  sum = "const $sum = (l, r) => (p, k) => p.$ === \"InL\" ? l(p.a[0], k) : r(p.a[0], k);"
+  -- (a `Node` is `MkNode i`: the element is nodes[i], numbered as it is
+  -- made, or first found)
+  dom = S.joinWith "\n"
+    [ "const $dom = () => {"
+    , "  const nodes = [];"
+    , "  const node = (n) => nodes[Number(n.a[0])];"
+    , "  const mk = (i) => ({ $: \"MkNode\", a: [BigInt(i)] });"
+    , "  const found = (el) => { if (!el) return { $: \"Nothing\", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: \"Just\", a: [mk(i)] }; };"
+    , "  const done = () => {};"
+    , "  return (p, k) => {"
+    , "    const a = p.a;"
+    , "    switch (p.$) {"
+    , "      case \"Create\": nodes.push(document.createElement(a[0])); return k(a[1](mk(nodes.length - 1)));"
+    , "      case \"Text\": node(a[0]).textContent = a[1]; return k(a[2]);"
+    , "      case \"Attr\": node(a[0]).setAttribute(a[1], a[2]); return k(a[3]);"
+    , "      case \"Append\": node(a[0]).appendChild(node(a[1])); return k(a[2]);"
+    , "      case \"Clear\": node(a[0]).replaceChildren(); return k(a[1]);"
+    , "      case \"Value\": return k(a[1](String(node(a[0]).value ?? \"\")));"
+    , "      case \"On\": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : \"\"))(done)); return k(a[3]); }"
+    , "      case \"Select\": return k(a[1](found(document.querySelector(a[0]))));"
+    , "      case \"XPath\": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));"
+    , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
+    , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
+    , "      default: throw new Error(\"heff: not an operation of dom: \" + (p && p.$));"
+    , "    }"
+    , "  };"
+    , "};"
+    ]
+  state = S.joinWith "\n"
+    [ "const $state = () => {"
+    , "  let state;"
+    , "  return (p, k) => {"
+    , "    switch (p.$) {"
+    , "      case \"Get\": return k(p.a[0](state));"
+    , "      case \"Put\": state = p.a[0]; return k(p.a[1]);"
+    , "      default: throw new Error(\"heff: not an operation of state: \" + (p && p.$));"
+    , "    }"
+    , "  };"
+    , "};"
+    ]
+  -- (`Exit` does not go on: the process ends when what is pending, output
+  -- being written, is done)
+  io = S.joinWith "\n"
+    [ "const $io = () => {"
+    , "  const nothing = { $: \"Nothing\", a: [] };"
+    , "  const just = (x) => ({ $: \"Just\", a: [x] });"
+    , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
+    , "  const bool = (b) => ({ $: b ? \"True\" : \"False\", a: [] });"
+    , "  return (p, k) => {"
+    , "    const a = p.a;"
+    , "    switch (p.$) {"
+    , "      case \"Write\": process.stdout.write(a[0], () => k(a[1])); return;"
+    , "      case \"WriteErr\": process.stderr.write(a[0], () => k(a[1])); return;"
+    , "      case \"ReadStdin\": { let text = \"\"; process.stdin.setEncoding(\"utf8\"); process.stdin.on(\"data\", (d) => { text += d; }); process.stdin.on(\"end\", () => k(a[0](text))); return; }"
+    , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
+    , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
+    , "      case \"ReadFile\": $readFile(a[0], \"utf8\", (e, t) => k(a[1](e ? nothing : just(t)))); return;"
+    , "      case \"WriteFile\": $writeFile(a[0], a[1], (e) => k(a[2](bool(!e)))); return;"
+    , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
+    , "      default: throw new Error(\"heff: not an operation of io: \" + (p && p.$));"
+    , "    }"
+    , "  };"
+    , "};"
+    ]

@@ -17,8 +17,7 @@ module Heff.Driver
   , testFile
   , promote
   , evaluate
-  , findApp
-  , findProgram
+  , findRunnable
   , explain
   , typeAt
   , definitionAt
@@ -27,6 +26,7 @@ module Heff.Driver
 import Prelude
 
 import Data.Array as A
+import Data.Either (Either(..))
 import Data.Lazy (force)
 import Data.List (List(..))
 import Data.Map as Map
@@ -38,6 +38,7 @@ import Heff.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, looku
 import Heff.Core.Readback (readbTy)
 import Heff.Core.Rename (renameTy)
 import Heff.Core.Syntax (El(..), Ty(..))
+import Heff.Effect (Effect(..), leaves)
 import Heff.Elab.Environment (Info)
 import Heff.Elab.Top (TopResult, topModule, topWith)
 import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
@@ -250,37 +251,50 @@ promote c = A.foldr put c.source (watches c)
     in
       before <> sep <> S.joinWith "" (map (_ <> "\n") lines) <> SCU.drop w.expectTo s
 
--- | an app is a definition that takes a `Handler (dom <+> (state s))`
--- | (lib/dom.hf):
--- | the first of a file's, or the one named
-findApp :: Checked -> Maybe String -> Maybe String
-findApp = findTaking case _ of
-  App (Global h) (App (App (Global p) (Global d)) (App (Global st) _)) ->
-    short h == "Handler" && (short p == "<+>" || short p == "plus") && short d == "dom" && short st == "state"
-  _ -> false
+-- | `h`, an effect (`Heff.Effect`): a sum, a leaf -- by what it is, a
+-- | global's key, not its name -- or a definition that is one of those
+effectOf :: Globals -> El -> Maybe Effect
+effectOf g e = case e of
+  Is e' -> effectOf g e'
+  App (App (Global p) a) b | p == "co.plus" || p == "co.<+>" -> Plus <$> effectOf g a <*> effectOf g b
+  Global "dom.dom" -> Just (Leaf "dom")
+  Global "io.io" -> Just (Leaf "io")
+  App (Global "state.state") _ -> Just (Leaf "state")
+  Global k -> lookupGlobal g k >>= \entry -> effectOf g entry.syntax
+  _ -> Nothing
 
--- | a program is a definition that takes a `Handler io` (lib/io.hf): the
--- | first of a file's, or the one named
-findProgram :: Checked -> Maybe String -> Maybe String
-findProgram = findTaking case _ of
-  App (Global h) (Global e) -> short h == "Handler" && short e == "io"
-  _ -> false
+-- | a computation's effect, from its type: `Co h a`, which is a function
+-- | taking a `Handler h`
+computationEffect :: Globals -> Ty -> Maybe Effect
+computationEffect g = case _ of
+  Function ft -> case ft.dom of
+    Decode (App (Global "co.Handler") h) -> effectOf g h
+    _ -> Nothing
+  Decode (App (App (Global "co.Co") h) _) -> effectOf g h
+  _ -> Nothing
 
--- | the definition named, else the first of a file's whose parameter's type
--- | is one the test says
-findTaking :: (El -> Boolean) -> Checked -> Maybe String -> Maybe String
-findTaking takes c = case _ of
-  Just x -> _.key <$> A.find (\o -> o.name == x) c.own
-  Nothing -> _.key <$> A.find (ok <<< _.key) c.own
+-- | a definition to run where there are handlers for the effects
+-- | `handled`: the one named, else the first of a file's that fits
+findRunnable :: Array String -> Checked -> Maybe String -> Either String { key :: String, effect :: Effect }
+findRunnable handled c = case _ of
+  Just x -> case A.find (\o -> o.name == x) c.own of
+    Nothing -> Left ("no definition " <> x)
+    Just o -> case effectOf' o.key of
+      Nothing -> Left (x <> " is not a computation, `Co h a`, of the effects " <> known)
+      Just eff -> fits { name: x, key: o.key, effect: eff }
+  Nothing -> case A.find (\r -> A.null (missing r.effect)) computations, A.head computations of
+    Just r, _ -> Right { key: r.key, effect: r.effect }
+    -- (the first there is, said why it does not do)
+    Nothing, Just r -> fits r
+    Nothing, Nothing -> Left ("no computation, `Co h a`, of the effects " <> S.joinWith ", " handled)
   where
-  ok k = case lookupGlobal c.top.globals k <#> \e -> readbTy 0 e.type_ of
-    Just (Function ft) -> case ft.dom of
-      Decode d -> takes d
-      _ -> false
-    _ -> false
-
-short :: String -> String
-short k = fromMaybe k (A.last (S.split (S.Pattern ".") k))
+  known = "dom, io, state s and their sums"
+  computations = A.mapMaybe (\o -> effectOf' o.key <#> \eff -> { name: o.name, key: o.key, effect: eff }) c.own
+  missing eff = A.nub (A.filter (\l -> not (A.elem l handled)) (leaves eff))
+  fits r = case missing r.effect of
+    [] -> Right { key: r.key, effect: r.effect }
+    ms -> Left (r.name <> " has the effect " <> S.joinWith ", " ms <> ", which is not handled here (only " <> S.joinWith ", " handled <> ")")
+  effectOf' k = lookupGlobal c.top.globals k >>= \e -> computationEffect c.top.globals (readbTy 0 e.type_)
 
 -- Semantic queries
 --------------------------------------------------------------------------------

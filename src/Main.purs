@@ -12,7 +12,7 @@ import Data.Traversable (for_)
 import Effect (Effect)
 import Effect.Console (log)
 import Heff.Compile.JavaScript (compileApp, compileJs, compileNode)
-import Heff.Driver (Checked, definitions, elabProgram, errorsIn, explain, evaluate, findApp, findProgram, promote, renderFileDiags, testFile, typeAt, watches)
+import Heff.Driver (Checked, definitions, elabProgram, errorsIn, explain, evaluate, findRunnable, promote, renderFileDiags, testFile, typeAt, watches)
 import Heff.Elab.Environment (enableTraceSink, takeTraceSink)
 import Heff.Format (format)
 import Heff.Load (loadProgram, pathsFor)
@@ -148,26 +148,19 @@ main = do
     -- take it for an answer)
     _ -> err (usage <> "\n") *> exit' 1
   where
-  app f n out = do
+  app f n out = run [ "dom", "state" ] compileApp f n out "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
+  program f n out = run [ "io", "state" ] compileNode f n out ("run it with `node " <> out <> " ARGS...`")
+  -- (a computation of the effects `handled`, compiled with their handlers)
+  run handled compile f n out how = do
     l <- load f
-    case findApp l.file n of
-      Nothing -> err ("heff: no app " <> fromMaybe "" n <> " in " <> f <> " (an app takes a `Handler (dom <+> (state s))`, lib/dom.hf)\n") *> exit' 1
-      Just k -> do
-        let r = compileApp l.file.top.globals k
-        for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")
-        when (not (A.null r.errors)) (exit' 1)
-        writeTextFile UTF8 out r.source
-        log ("wrote " <> out <> ": load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)")
-  program f n out = do
-    l <- load f
-    case findProgram l.file n of
-      Nothing -> err ("heff: no program " <> fromMaybe "" n <> " in " <> f <> " (a program takes a `Handler io`, lib/io.hf)\n") *> exit' 1
-      Just k -> do
-        let r = compileNode l.file.top.globals k
-        for_ r.errors \e -> err ("heff: not compiled: " <> e <> "\n")
-        when (not (A.null r.errors)) (exit' 1)
-        writeTextFile UTF8 out r.source
-        log ("wrote " <> out <> ": run it with `node " <> out <> " ARGS...`")
+    case findRunnable handled l.file n of
+      Left why -> err ("heff: " <> f <> ": " <> why <> "\n") *> exit' 1
+      Right r -> do
+        let c = compile l.file.top.globals r.key r.effect
+        for_ c.errors \e -> err ("heff: not compiled: " <> e <> "\n")
+        when (not (A.null c.errors)) (exit' 1)
+        writeTextFile UTF8 out c.source
+        log ("wrote " <> out <> ": " <> how)
   -- | 1 if the file is not formatted (with `--check`) or cannot be
   fmtOne checkOnly f = do
     src <- readTextFile UTF8 f
