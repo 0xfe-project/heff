@@ -314,7 +314,9 @@ dataParam = lazyP \_ -> do
     _ <- next
     pure (Infix (Ident t.text (spanOf t)) (Keyword ":" (spanOf t)) (Keyword "Type" (spanOf t)))
   else if t.text == "(" || t.text == "{" then do
-    p <- atom
+    -- (a type's parameter in parentheses is a binder, `->` after it or not)
+    p0 <- atom
+    p <- if t.text == "(" then asBinder p0 else pure p0
     case p of
       Infix (Ident _ _) (Keyword ":" _) _ -> pure p
       NBlock "sig" Nothing [ f@(Infix (Ident _ _) (Keyword ":" _) _) ] sp -> pure (NBrace f sp)
@@ -633,7 +635,7 @@ parens = lazyP \_ -> do
       c <- expectPunct ")"
       pure (NBrace (Infix (Ident t.text (spanOf t)) (Keyword ":=" (spanOf t2)) e) (spanTo o c))
     else do
-      e <- binderOrExpr
+      e <- expr
       t' <- peek
       -- `(a, b)`: a pair (HOTT)
       if t'.text == "," then do
@@ -642,7 +644,9 @@ parens = lazyP \_ -> do
         pure (NTuple (A.cons e rest) (spanTo o c))
       else do
         _ <- expectPunct ")"
-        pure e
+        -- (`(A :: T) -> B` binds `A`; `(C :: T)` alone annotates `C`)
+        after <- peek
+        if after.kind == "sym" && after.text == "->" then asBinder e else pure e
 
 -- | `, e, e ...` (after the first of a tuple's components)
 many1Sep :: P (Array Ntn)
@@ -657,9 +661,12 @@ many1Sep = lazyP \_ -> do
 
 -- | `x :: T` in a binder's parentheses names its variable (in scope after)
 binderOrExpr :: P Ntn
-binderOrExpr = lazyP \_ -> do
-  e0 <- expr
-  -- `(A :: T)`: what is left of `::` in a binder is names, capitalised or not
+binderOrExpr = lazyP \_ -> expr >>= asBinder
+
+-- | `A :: T` as a binder: what is left of `::` is names, capitalised or not
+-- | (in scope after)
+asBinder :: Ntn -> P Ntn
+asBinder e0 = do
   let
     e = case e0 of
       Infix g k@(Keyword ":" _) t | A.all isName (NEA.toArray (getGroup g)) -> Infix (asNames g) k t
