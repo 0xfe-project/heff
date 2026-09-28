@@ -37,7 +37,6 @@ import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Number as Number
 import Data.String as S
-import Data.Tuple (Tuple(..))
 import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, group, ntnSpan)
 import Heff.Parse.Fixity (Assoc(..), Fixities, Relation(..), bindsTighter, emptyFixities, groupOf, relate, reserved, union)
 import Heff.Support.BigInt as BI

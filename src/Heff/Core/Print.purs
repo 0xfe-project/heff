@@ -9,8 +9,6 @@ module Heff.Core.Print
   , prtBareR
   ) where
 
-import Prelude
-
 import Data.List (List)
 import Heff.Core.Params (CtxShape)
 import Heff.Core.Readback (readbBare, readbEl, readbTy)

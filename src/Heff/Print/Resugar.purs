@@ -10,19 +10,18 @@ module Heff.Print.Resugar
 import Prelude
 
 import Data.Array as A
-import Data.List (List(..), (:))
+import Data.List (List, (:))
 import Data.List as L
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String as S
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Name, dictToList)
 import Heff.Core.Syntax as Syn
-import Heff.Support.Pretty as P
 
 -- | a pattern: a variable (by de Bruijn level) or a tag of patterns
 data Pat = PVar Int | PTag Name (Array Pat)
 
-type Row = { pats :: Array Pat, names :: List Name, body :: Syn.El }
+type Clause = { pats :: Array Pat, names :: List Name, body :: Syn.El }
 
 -- | how equations are written: a tag in a pattern, what separates the sides,
 -- | how many equations it takes to write a definition so (one: any function
@@ -66,7 +65,7 @@ equationsWith style f names0 ty0 el =
     _, _ -> { names: ns, pats: ps, body: b }
 
   -- refine the patterns by every `match` on one of their variables
-  go :: List Name -> Array Pat -> Syn.El -> Array Row
+  go :: List Name -> Array Pat -> Syn.El -> Array Clause
   go ns ps body = case body of
     -- `is` marks where a description is made; equations do not show it
     Syn.Is e | A.length ps > 0 && isMatch e -> go ns ps e

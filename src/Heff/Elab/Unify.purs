@@ -31,7 +31,7 @@ import Data.Array as A
 import Data.Either (Either(..))
 import Data.Foldable (for_)
 import Data.Lazy (force) as L
-import Data.List ((:))
+import Data.List (List(..), (:))
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, isNothing)
@@ -42,10 +42,9 @@ import Heff.Support.Common (Name, dictMap, dictTraverse)
 import Heff.Core.Conversion (DefEqCheckError(..))
 import Heff.Core.Evaluation (eval, evalTy)
 import Heff.Core.Globals (Globals)
-import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..), variantsMap)
+import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
 import Heff.Core.Readback (readbTy)
 import Heff.Core.Print (prettyEl, prettyTy)
-import Data.List (List(..))
 import Data.Lazy (defer)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V

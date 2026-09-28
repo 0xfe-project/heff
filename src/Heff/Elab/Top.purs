@@ -14,7 +14,7 @@ import Prelude
 import Data.Array as A
 import Data.Array.NonEmpty as NEA
 import Data.Either (Either(..))
-import Data.Foldable (foldM, foldl)
+import Data.Foldable (foldM, foldl, for_)
 import Data.Lazy (Lazy, defer, force)
 import Control.Lazy (fix)
 import Data.Maybe (Maybe(..), isJust)
@@ -30,8 +30,7 @@ import Data.String as Str
 import Heff.Core.Syntax as Syn
 import Heff.Elab.Unify (retryPostponed, runDelayed, unsolvedMetas, zonkEl, zonkTy)
 import Control.Monad.State (gets)
-import Data.Foldable (for_)
-import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
+import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, lookupGlobal)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
 import Heff.Core.Print (prtElR)
@@ -289,7 +288,7 @@ argBinding n@(Infix n0 (Keyword ":" _) n1) = do
   a <- typ N n1
   pure { span: ntnSpan n, name: x, typ: a, implicit: false }
 -- extension: `def f {A : Type} ...`
-argBinding (NBrace n@(Infix n0 (Keyword ":" _) n1) sp) = do
+argBinding (NBrace (Infix n0 (Keyword ":" _) n1) sp) = do
   x <- ident n0
   a <- typ N n1
   pure { span: sp, name: x, typ: a, implicit: true }

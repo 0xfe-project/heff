@@ -23,23 +23,22 @@ import Prelude
 
 import Control.Lazy (fix)
 import Data.Array as A
-import Data.Either (Either(..))
+import Data.Either (Either)
 import Data.Lazy (Lazy, defer, force)
 import Data.List (List(Nil), (:))
 import Data.List as L
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), maybe)
 import Data.Number as Number
 import Data.Tuple (Tuple(..))
 import Effect.Exception.Unsafe (unsafeThrow)
 import Heff.Support.Common (Dict, Name, dictElemAt, dictLookup, dictMap, dictToList, panic)
 import Heff.Core.Globals (Globals, globalsList)
 import Heff.Core.Syntax as S
-import Data.Maybe (maybe)
 import Data.Char (fromCharCode, toCharCode)
 import Data.String.CodeUnits as Str
-import Data.String as S
+import Data.String as Text
 import Heff.Support.Pretty (Doc, (<+>))
 import Heff.Support.Pretty as P
 
@@ -221,7 +220,7 @@ showVal = go false
     Cons fs -> P.text ("{ " <> A.intercalate ", " (map (\(Tuple x v) -> x <> " = " <> P.render (go false (force v))) (dictToList fs)) <> " }")
     ArrayV xs -> P.text ("[" <> A.intercalate ", " (map (P.render <<< go false) xs) <> "]")
     -- (a negative number, an argument: `Just (-7)`)
-    v | inArg && S.take 1 (P.render (prettyVal v)) == "-" -> P.text ("(" <> P.render (prettyVal v) <> ")")
+    v | inArg && Text.take 1 (P.render (prettyVal v)) == "-" -> P.text ("(" <> P.render (prettyVal v) <> ")")
     v -> prettyVal v
 
 -- | a tag as the surface syntax writes it: a capitalised one bare

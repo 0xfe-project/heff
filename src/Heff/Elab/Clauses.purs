@@ -38,7 +38,7 @@ stripWhere = case _ of
 -- | `bind` in scope)
 data Pat = PVar Name | PTag Name (Array Pat) Span | PLit Ntn
 
-type Row = { pats :: Array Pat, rhs :: Ntn }
+type Clause = { pats :: Array Pat, rhs :: Ntn }
 
 type Err = { span :: Span, msg :: String }
 
@@ -67,7 +67,7 @@ sameLit a b = case a, b of
   _, _ -> false
 
 -- | `f p ... := e`
-equation :: Name -> Ntn -> Either Err Row
+equation :: Name -> Ntn -> Either Err Clause
 equation f n = case n of
   Infix lhs (Keyword ":=" _) rhs -> case NEA.uncons (getGroup lhs) of
     { head: Ident g _, tail: ps }
@@ -130,7 +130,7 @@ fresh :: Array Name -> Name -> Name
 fresh used x = if A.elem x used then fresh used (x <> "'") else x
 
 -- | the match tree for `rows` over the variables `vars`, column by column
-compile :: Array Name -> Span -> Array Name -> Array Row -> Either Err Ntn
+compile :: Array Name -> Span -> Array Name -> Array Clause -> Either Err Ntn
 compile used sp vars rows = case A.head rows of
   Nothing -> Right (Keyword "abandon" sp) -- unreachable: a missing tag is the match's error
   Just r -> case A.findIndex (\p -> isTag p || isLit p) r.pats of

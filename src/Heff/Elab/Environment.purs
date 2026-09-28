@@ -40,15 +40,15 @@ emptyScope = { len: 0, names: Nil, locals: V.LNil, ctx: CEmpty }
 undelay :: Scope -> Scope
 undelay sd = sd { ctx = CUndelay sd.ctx }
 
-bind :: Name -> V.Ty -> Scope -> Scope
-bind = bindAt (BDelayedBy 0)
+bindName :: Name -> V.Ty -> Scope -> Scope
+bindName = bindAt (BDelayedBy 0)
 
 multiBind :: Array Name -> Array V.Ty -> Scope -> Scope
 multiBind xs as sc = go (listOf xs) (listOf as) sc
   where
   listOf :: forall a. Array a -> List a
   listOf = foldrArr (:) Nil
-  go (x : xs') (a : as') s = go xs' as' (bind x a s)
+  go (x : xs') (a : as') s = go xs' as' (bindName x a s)
   go _ _ s = s
 
 foldrArr :: forall a b. (a -> b -> b) -> b -> Array a -> b

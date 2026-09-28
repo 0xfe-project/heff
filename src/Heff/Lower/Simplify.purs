@@ -123,7 +123,7 @@ simp = case _ of
   App f as -> do
     f' <- simp f
     as' <- traverse simp as
-    apply f' as'
+    applyTo f' as'
   Let x a b -> do
     a' <- simp a
     letIn x a' b
@@ -144,11 +144,11 @@ lam xs = case _ of
   b -> Lam xs b
 
 -- | an application of simplified parts
-apply :: Expr -> Array Expr -> M Expr
-apply f as
+applyTo :: Expr -> Array Expr -> M Expr
+applyTo f as
   | A.null as = pure f
   | otherwise = case f of
-      App g bs -> apply g (bs <> as)
+      App g bs -> applyTo g (bs <> as)
       Lam xs b ->
         let
           k = min (A.length xs) (A.length as)
@@ -157,21 +157,21 @@ apply f as
         in
           A.foldr (\(Tuple x a) m -> m >>= \body -> bind' x a body) (pure inner) binds
             >>= simp
-            >>= \r -> apply r (A.drop k as)
-      Let x a b -> Let x a <$> apply b as
+            >>= \r -> applyTo r (A.drop k as)
+      Let x a b -> Let x a <$> applyTo b as
       -- (the arguments go into every arm: only when that copies nothing)
-      Match s arms | A.all atomic as -> Match s <$> traverse (\a -> (a { body = _ }) <$> apply a.body as) arms
+      Match s arms | A.all atomic as -> Match s <$> traverse (\a -> (a { body = _ }) <$> applyTo a.body as) arms
       Global g -> do
         mb <- known g
         case mb of
-          Just b -> attempt (App f as) (apply b as)
+          Just b -> attempt (App f as) (applyTo b as)
           Nothing -> pure (App f as)
       -- (a field of a known record, applied: judged by what the application
       -- comes to, not by the size of the field)
       Proj (Global g) l -> do
         mb <- known g
         case mb of
-          Just b -> attempt (App f as) (project l b >>= \h -> apply h as)
+          Just b -> attempt (App f as) (project l b >>= \h -> applyTo h as)
           Nothing -> pure (App f as)
       _ -> pure (App f as)
   where

@@ -6,7 +6,7 @@ import Heff.Support.BigInt (BigInt)
 import Prelude
 
 import Data.Lazy (Lazy, defer, force)
-import Data.Tuple (Tuple(..))
+import Data.Tuple (Tuple)
 import Heff.Support.Common (Dict, Name, dictMap)
 import Heff.Core.Evaluation (EvalEnv, compile, compileRecordType, compileTy)
 import Heff.Core.Params (Case(..), Level, Universe, Variants, variantsMap)

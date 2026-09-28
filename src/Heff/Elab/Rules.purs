@@ -13,8 +13,8 @@ import Data.Either (Either(..))
 import Data.Lazy (defer, force)
 import Data.List ((:))
 import Data.Foldable (for_)
-import Data.Maybe (Maybe(..), isJust)
-import Data.String as S
+import Data.Maybe (Maybe(..), fromMaybe, isJust)
+import Data.String as Text
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Dict, Name, dictContains, dictFromList, dictLength, dictLookup, dictToList)
@@ -22,11 +22,10 @@ import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
 import Control.Monad.State (gets, modify_)
-import Data.Maybe (fromMaybe)
 import Heff.Core.Globals (lookupGlobalKey)
 import Heff.Core.Memoed as M
-import Heff.Core.Params (Case(..), Level(..), Universe(..), Variants(..), decodesInto, leq, maxLevel)
-import Heff.Core.Print (prtElR, prtTyR)
+import Heff.Core.Params (Case(..), Level(..), Universe, Variants(..), decodesInto, leq, maxLevel)
+import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName, renameTy)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
@@ -117,7 +116,7 @@ functionFormation (Anonymous dom) cod = Typ \e -> do
   pure (M.function (evalEnv e) edom (S.AbsConst ecod))
 functionFormation (Named x dom) cod = Typ \e -> do
   edom <- runTyp dom e
-  ecod <- runTyp cod (e { scope = Env.bind x (M.tyN edom) e.scope })
+  ecod <- runTyp cod (e { scope = Env.bindName x (M.tyN edom) e.scope })
   pure (M.function (evalEnv e) edom (S.Abs x ecod))
 -- extension: an implicit argument, inferred at each use.  Its type must be
 -- large: a value of a small type is statically irrelevant, so nothing could
@@ -126,7 +125,7 @@ functionFormation (NamedImplicit sp x dom) cod = Typ \e -> do
   edom <- runTyp dom e
   when (leq (M.levelOf edom) Small) $
     failWith sp 24 (txt "an implicit argument must have a large type (a small one could never be inferred: its values are statically irrelevant)")
-  ecod <- runTyp cod (e { scope = Env.bind x (M.tyN edom) e.scope })
+  ecod <- runTyp cod (e { scope = Env.bindName x (M.tyN edom) e.scope })
   pure (M.functionI true (evalEnv e) edom (S.Abs x ecod))
 
 -- | extension: checked at an implicit function type, anything is under the
@@ -366,7 +365,7 @@ recordFormation fieldTyps = Typ \e -> do
       Nothing -> pure (Tuple Small [])
       Just { head: fd, tail: rest } -> do
         ty <- runTyp fd.typ e'
-        Tuple l fieldTys <- go (e' { scope = Env.bind fd.name (M.tyN ty) e'.scope }) rest
+        Tuple l fieldTys <- go (e' { scope = Env.bindName fd.name (M.tyN ty) e'.scope }) rest
         pure (Tuple (maxLevel l (M.levelOf ty)) (A.cons (Tuple fd.name ty.stx) fieldTys))
   Tuple l fields <- go (e { elabFor = ForNominative }) fieldTyps
   pure (M.record (evalEnv e) { level: l, fieldTypes: dictFromList fields })
@@ -479,7 +478,7 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
 -- | (`if`'s tags), whose span is not the name's
 recordName :: ElabEnv -> V.Ty -> Name -> Span -> V.Ty -> E Unit
 recordName e a x sp ty = case a of
-  V.Decode dn | V.Global k <- dn.head, sp.end - sp.start == S.length x || sp.end - sp.start == S.length x + 1 ->
+  V.Decode dn | V.Global k <- dn.head, sp.end - sp.start == Text.length x || sp.end - sp.start == Text.length x + 1 ->
     record { span: sp, name: x, key: Just k, ty: defer \_ -> P.render (prtIn e ty) }
   _ -> pure unit
 
