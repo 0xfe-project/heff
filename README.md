@@ -57,7 +57,8 @@ heff completions fish          # > ~/.config/fish/completions/heff.fish
 `::` annotates, everywhere; a capitalised name is a constructor unless it
 names a definition or a binder; `f (a := T)` gives an implicit argument by
 name; `case`/`of`, `if`, `do`, `\x -> e`, records `{ x = 1 }` and record
-types `{ x :: Int }`.  A function is defined by equations, each a case; a
+types `{ x :: Int }`, lists `[1, 2, 3]` (`Cons 1 (Cons 2 (Cons 3 Nil))`,
+in patterns too).  A function is defined by equations, each a case; a
 call of itself is recursion.  A pattern may be a literal, `fib 0 = 0`,
 compared by the equality in scope (`intEq`, `strEq`, `floatEq`); one of
 the equations must then match every other value.  Functions that call one

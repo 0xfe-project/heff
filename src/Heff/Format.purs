@@ -198,7 +198,7 @@ type Con = { con :: T, args :: Array E }
 
 type Alt = { pat :: Pat, arrow :: T, body :: E }
 
-data Pat = PCon T (Array Pat) | PAtom T | PParen T Pat T
+data Pat = PCon T (Array Pat) | PAtom T | PParen T Pat T | PList T (Array Pat) (Array T) T
 
 data Stmt = SBind T T E | SExpr E
 
@@ -287,6 +287,7 @@ firstP = case _ of
   PCon t _ -> t
   PAtom t -> t
   PParen o _ _ -> o
+  PList o _ _ _ -> o
 
 firstStmt :: Stmt -> T
 firstStmt = case _ of
@@ -501,6 +502,17 @@ atom = lazyP \_ -> do
         pure (Sum kw o r.items r.seps c)
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
+    -- (`[a, b]`: a list, laid out as a tuple is)
+    "punct" | t.text == "[" -> do
+      o <- next
+      inBrackets do
+        t' <- peek
+        if t'.text == "]" then (\c -> Tup o [] [] c) <$> next
+        else do
+          e <- expr
+          rest <- commaSepE
+          c <- expectPunct "]"
+          pure (Tup o (A.cons e (map _.e rest)) (map _.comma rest) c)
     _ -> Atom <$> next
   fields base
   where
@@ -511,7 +523,18 @@ atom = lazyP \_ -> do
 startsAtom :: T -> Boolean
 startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
   || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "Array", "data", "abandon" ])
-  || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
+  || (t.kind == "punct" && (t.text == "(" || t.text == "{" || t.text == "["))
+
+-- | `, e` …
+commaSepE :: P (Array { comma :: T, e :: E })
+commaSepE = do
+  t <- peek
+  if t.text == "," then do
+    comma <- next
+    e <- expr
+    rest <- commaSepE
+    pure (A.cons { comma, e } rest)
+  else pure []
 
 parens :: P E
 parens = lazyP \_ -> do
@@ -627,6 +650,17 @@ pattern = lazyP \_ -> do
     PCon c <$> many patAtom
   else patAtom
 
+-- | `, p` …
+morePats :: P (Array { comma :: T, p :: Pat })
+morePats = do
+  t <- peek
+  if t.text == "," then do
+    comma <- next
+    p <- pattern
+    rest <- morePats
+    pure (A.cons { comma, p } rest)
+  else pure []
+
 patAtom :: P Pat
 patAtom = lazyP \_ -> do
   t <- peek
@@ -638,6 +672,16 @@ patAtom = lazyP \_ -> do
       inBrackets do
         p <- pattern
         PParen o p <$> expectPunct ")"
+    "punct", "[" -> do
+      o <- next
+      inBrackets do
+        t' <- peek
+        if t'.text == "]" then (\c -> PList o [] [] c) <$> next
+        else do
+          p <- pattern
+          rest <- morePats
+          c <- expectPunct "]"
+          pure (PList o (A.cons p (map _.p rest)) (map _.comma rest) c)
     _, _ | A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ] -> PAtom <$> next
     _, _ -> failAt t
 
@@ -871,6 +915,7 @@ pE env = case _ of
   Atom t -> tok env t
   Paren o e c -> tok env o <> P.align (pE env e) <> tok env c
   Named o x k e c -> tok env o <> tok env x <+> tok env k <+> pE env e <> tok env c
+  Tup o [] _ c -> tok env o <> tok env c
   Tup o es commas c ->
     P.group (tok env o <> P.align (pE env (headE es) <> fold (A.zipWith (\comma e -> tok env comma <> P.line <> pE env e) commas (A.drop 1 es))) <> tok env c)
   Braces o [] _ c -> tok env o <> tok env c
@@ -938,3 +983,4 @@ pP env = case _ of
   PCon c args -> tok env c <> foldMap (\p -> P.text " " <> pP env p) args
   PAtom t -> tok env t
   PParen o p c -> tok env o <> pP env p <> tok env c
+  PList o ps commas c -> tok env o <> fold (A.mapWithIndex (\i p -> (if i > 0 then maybe mempty (\comma -> tok env comma <> P.text " ") (A.index commas (i - 1)) else mempty) <> pP env p) ps) <> tok env c

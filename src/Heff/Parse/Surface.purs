@@ -589,6 +589,7 @@ atom = lazyP \_ -> do
     "kw" | t.text == "data" -> anonymousSum
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
+    "punct" | t.text == "[" -> listOf expr
     _ -> throwError (diag (spanOf t) ("expected an expression, not `" <> t.text <> "`"))
   fields base
   where
@@ -599,7 +600,19 @@ atom = lazyP \_ -> do
 startsAtom :: Tok -> Boolean
 startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
   || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "Array", "data", "abandon" ])
-  || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
+  || (t.kind == "punct" && (t.text == "(" || t.text == "{" || t.text == "["))
+
+-- | `[a, b, c]`, `Cons a (Cons b (Cons c Nil))` (whichever type has those
+-- | tags), and `[]`, `Nil`: of expressions, or of patterns
+listOf :: P Ntn -> P Ntn
+listOf item = lazyP \_ -> do
+  o <- next
+  inBrackets do
+    t <- peek
+    xs <- if t.text == "]" then pure [] else sepBy1 "," item
+    c <- expectPunct "]"
+    let sp = spanTo o c
+    pure (A.foldr (\x rest -> group (NEA.cons' (NTag "Cons" sp) [ x, rest ])) (NTag "Nil" sp) xs)
 
 -- | `( e )`, `( e :: T )`, `(x := e)` (a named argument), `(+)` (an
 -- | operator, named)
@@ -824,6 +837,7 @@ patAtom = lazyP \_ -> do
     "int", _ -> next *> pure (NInt (BI.fromDigits t.text) (spanOf t))
     "float", _ -> next *> pure (NFloat (fromMaybe 0.0 (Number.fromString t.text)) (spanOf t))
     "str", _ -> next *> pure (NString t.text (spanOf t))
+    "punct", "[" -> listOf pattern
     "punct", "(" -> do
       _ <- next
       inBrackets do
