@@ -585,7 +585,8 @@ atom = lazyP \_ -> do
     "float" -> next *> pure (NFloat (fromMaybe 0.0 (Number.fromString t.text)) (spanOf t))
     "str" -> next *> pure (NString t.text (spanOf t))
     "kw" | A.elem t.text [ "Type", "Int", "Float", "String", "Array", "abandon" ] -> next *> pure (Keyword t.text (spanOf t))
-    "kw" | t.text == "sum" -> anonymousSum
+    -- (`data { A | B }`: a sum type with no name, where a type goes)
+    "kw" | t.text == "data" -> anonymousSum
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
     _ -> throwError (diag (spanOf t) ("expected an expression, not `" <> t.text <> "`"))
@@ -597,7 +598,7 @@ atom = lazyP \_ -> do
 
 startsAtom :: Tok -> Boolean
 startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
-  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "Array", "sum", "abandon" ])
+  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "Array", "data", "abandon" ])
   || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
 
 -- | `( e )`, `( e :: T )`, `(x := e)` (a named argument), `(+)` (an
@@ -701,7 +702,7 @@ braces = lazyP \_ -> do
       Infix _ (Keyword ":" _) _ -> pure e
       _ -> throwError (diag (ntnSpan e) "a field is `name :: Type`")
 
--- | `sum { A x | B }`, a sum type without a name
+-- | `data { A x | B }`, a sum type without a name (`data`, where a type goes)
 anonymousSum :: P Ntn
 anonymousSum = lazyP \_ -> do
   kw <- next

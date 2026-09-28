@@ -174,7 +174,7 @@ ty c p xs = case _ of
       fields = A.foldl (\acc (Tuple l t) -> { names: l : acc.names, out: A.snoc acc.out (l <> " :: " <> ty c 0 acc.names t) })
         { names: xs, out: [] } (dictToList r.fieldTypes)
     in "{ " <> S.joinWith ", " fields.out <> " }"
-  Syn.Sum (Variants vs) -> "sum { " <> S.joinWith " | " (map (\(Tuple t ts) -> S.joinWith " " (A.cons (tagText t) (map (ty c 2 xs) ts))) (dictToList vs)) <> " }"
+  Syn.Sum (Variants vs) -> "data { " <> S.joinWith " | " (map (\(Tuple t ts) -> S.joinWith " " (A.cons (tagText t) (map (ty c 2 xs) ts))) (dictToList vs)) <> " }"
   Syn.IsTy t -> ty c p xs t
   Syn.PrimInt -> "Int"
   Syn.PrimFloat -> "Float"

@@ -11,13 +11,13 @@
 //   sym    ->, ::, =, <-, \, |, :=, ~, and any other run of symbol characters
 //   punct  ( ) [ ] { } ,
 //   kw     data type theory foreign import case of if then else do where
-//          let in test sum Type Int Float String Array infixl infixr infix
+//          let in test Type Int Float String Array infixl infixr infix
 //   watch  `-- >>>`, at the start of a doctest line (the rest of the line is
 //          an expression)
 //
 // Comments are not tokens; they are returned apart, for the formatter.
 const keywords = new Set(["data", "type", "theory", "foreign", "import", "case", "of", "if", "then", "else",
-  "do", "where", "let", "in", "test", "sum", "Type", "Int", "Float", "String", "Array", "abandon", "infixl", "infixr", "infix"]);
+  "do", "where", "let", "in", "test", "Type", "Int", "Float", "String", "Array", "abandon", "infixl", "infixr", "infix"]);
 const symChars = new Set("!#$%&*+./<=>?@\\^|-~:");
 const isLower = (c) => (c >= "a" && c <= "z") || c === "_";
 const isUpper = (c) => c >= "A" && c <= "Z";
