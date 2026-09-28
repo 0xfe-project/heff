@@ -70,7 +70,7 @@ fieldSetting :: Case -> Ntn -> E R.FieldSetting
 fieldSetting c (Infix (Ident x xsp) (Keyword ":=" _) n) = do
   v <- chk c n
   pure { name: x, chk: v, span: ntnSpan n, nameSpan: xsp }
-fieldSetting _ n = failP (ntnSpan n) 2 (P.text "expected a field setting of the form `x := v`")
+fieldSetting _ n = failP (ntnSpan n) 2 (P.text "expected a field setting of the form `x = v`")
 
 data Judgment
   = ChkJ R.Chk
@@ -398,7 +398,7 @@ elabWatch g n = do
   j <- parse N n
   s <- case j of
     SynJ s -> pure s
-    _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `> (e : T)`")
+    _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `-- >>> (e :: T)`")
   Tuple t ty <- R.runSyn s (emptyElabEnv g)
   runDelayed true
   stuck <- retryPostponed g

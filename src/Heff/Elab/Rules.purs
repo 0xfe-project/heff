@@ -5,7 +5,7 @@
 module Heff.Elab.Rules where
 
 import Heff.Support.BigInt (BigInt)
-import Heff.Print.Surface (Implicits, printTy)
+import Heff.Print.Surface (Implicits, printTy, tagText)
 import Prelude
 
 import Data.Array as A
@@ -176,7 +176,7 @@ functionIntroImplicit sp x body = Chk \e a0 -> do
           (e { scope = scope', elabFor = appElabFor e.elabFor v })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
-    _ -> failWith sp 25 (txt "an implicit lambda `{x} => ...` checked at a type that takes no implicit argument")
+    _ -> failWith sp 25 (txt "an implicit lambda `\\{x} -> ...` checked at a type that takes no implicit argument")
 
 -- | `f {a}`: giving an implicit argument explicitly
 functionElimImplicit :: Span -> Syn -> Chk -> Syn
@@ -470,7 +470,7 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
           else
             failWith sp 16 (txt "wrong number of arguments for tag" <+> txt x <+> txt "in type" <+> prtIn e a)
       Nothing -> failWith sp 15 (txt "no such tag" <+> txt x <+> txt "in type" <+> prtIn e a)
-    _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt ("'" <> x) <> txt " ... : T)`")
+    _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt (tagText x) <> txt " ... :: T)`")
     _ -> failWith sp 14 (txt "cannot check tag syntax at non-sum type")
 
 -- | a tag or a field, where it is written, as a name of the type it is of

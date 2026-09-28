@@ -149,6 +149,37 @@ formats("do, nested blocks", [
   "",
 ].join("\n"));
 
+// (`else if`: a chain, at one depth)
+formats("else if", [
+  "data Bool = True | False",
+  "pick :: Bool -> Bool -> Bool -> Bool",
+  "pick a b c = if a then b else if b then c else if c then a else False",
+  "",
+].join("\n"), [
+  "data Bool = True | False",
+  "pick :: Bool -> Bool -> Bool -> Bool",
+  "pick a b c = if a then b else if b then c else if c then a else False",
+  "",
+].join("\n"));
+formats("else if, broken", [
+  "data Bool = True | False",
+  "pick :: Bool -> Bool -> Bool -> Bool",
+  "pick a b c = if a then (if b then c else a) else if b then (if c then a else b) else if c then (if a then b else c) else False",
+  "",
+].join("\n"), [
+  "data Bool = True | False",
+  "pick :: Bool -> Bool -> Bool -> Bool",
+  "pick a b c =",
+  "  if a",
+  "    then (if b then c else a)",
+  "    else if b",
+  "    then (if c then a else b)",
+  "    else if c",
+  "    then (if a then b else c)",
+  "    else False",
+  "",
+].join("\n"));
+
 // (its items two columns in from the line, not from the parenthesis)
 formats("a block, the last argument", [
   "import co",

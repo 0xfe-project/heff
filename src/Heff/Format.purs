@@ -948,10 +948,14 @@ pE env = case _ of
   Case kw scrut of_ alts ->
     tok env kw <+> pE env scrut <+> tok env of_
       <> items env (\a -> firstP a.pat) (\a -> lastE a.body) (\e a -> pP e a.pat <+> tok e a.arrow <> rhsOf e a.body) alts
+  -- (`else if` goes on at the same depth: a chain, not a staircase)
   If kw c th a el b ->
-    P.group (tok env kw <+> pE env c <> P.nest 2 (P.line <> tok env th <+> P.nest 2 (pE env a) <> P.line <> tok env el <+> P.nest 2 (pE env b)))
+    P.group (tok env kw <+> pE env c <> P.nest 2 (P.line <> tok env th <+> P.nest 2 (pE env a) <> elseOf el b))
   Do kw stmts -> tok env kw <> items env firstStmt lastStmt pS stmts
   where
+  elseOf el b = case b of
+    If kw c th a el' b' -> P.line <> tok env el <+> tok env kw <+> pE env c <> P.line <> tok env th <+> P.nest 2 (pE env a) <> elseOf el' b'
+    _ -> P.line <> tok env el <+> P.nest 2 (pE env b)
   headE es = fromMaybe (Atom eofTok) (A.head es)
   headF fs = fromMaybe (FDecl (Atom eofTok)) (A.head fs)
   headC cs = fromMaybe { con: eofTok, args: [] } (A.head cs)

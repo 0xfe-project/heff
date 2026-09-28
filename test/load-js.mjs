@@ -6,6 +6,8 @@ const g = (await import(pathToFileURL(file))).default;
 // (a tag with arguments is parenthesized where it is an argument)
 export const show = (v, arg = false) => {
   if (typeof v === "function") return v.$erased ? "#erased" : "#fun";
+  // (a negative number, an argument: `Just (-7)`)
+  if ((typeof v === "bigint" || typeof v === "number") && arg && String(v).startsWith("-")) return "(" + show(v) + ")";
   if (typeof v === "bigint") return v.toString();
   // (a float as a literal writes it: `2.0`, not `2`)
   if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }

@@ -73,7 +73,7 @@ equation f n = case n of
     { head: Ident g _, tail: ps }
       | g == f -> ps # traverse pat <#> \pats -> { pats, rhs }
     _ -> Left { span: ntnSpan lhs, msg: "an equation of `" <> f <> "` starts with `" <> f <> "`" }
-  _ -> Left { span: ntnSpan n, msg: "an equation has the form `" <> f <> " <patterns> := <body>`" }
+  _ -> Left { span: ntnSpan n, msg: "an equation has the form `" <> f <> " <patterns> = <body>`" }
 
 -- | the body of `f` from its equations: `params` are the parameters named in
 -- | the head of the definition, which the first equations' patterns match

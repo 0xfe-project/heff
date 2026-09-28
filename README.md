@@ -92,6 +92,13 @@ integers' with a `.`: `+.`, `*.`, `<.`.  `Array a` is an array, each
 element reached at once by its index, and never changed (`set` makes
 another): `lib/array.hf`, imported as `import array as A`.
 
+`lib/prelude.hf` has `Bool`, `Maybe`, `Either`, pairs and lists, the
+arithmetic, and the functions on lists (`map`, `foldl`, `foldr`,
+`filter`, `take`, `zip`, `range`, `sortBy`, …) and on text (`split`,
+`lines`, `words`, `trim`, `indexOf`, `parseInt`, …).  There are no type
+classes: what needs an equality or an order is given one (`elemBy`,
+`sortBy`).
+
 ## Modules
 
 A module is a file, named by its path from the project's root:
