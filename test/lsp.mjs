@@ -89,6 +89,15 @@ try {
   expect("definition in another module", def.result && def.result.uri === uri("test/modules/a.hf") &&
     def.result.range.start.line === notAt.line && def.result.range.start.character === notAt.character && def.result.range.end.character === notAt.character + 3, def.result);
 
+  // a global of a module imported as `A`: `A.not`
+  const qualified = disk("test/modules/qualified.hf");
+  open("test/modules/qualified.hf", qualified);
+  await diagnosticsOf(uri("test/modules/qualified.hf"));
+  const qDef = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
+  expect("definition of a qualified name", qDef.result && qDef.result.uri === uri("test/modules/a.hf") && qDef.result.range.start.line === notAt.line, qDef.result);
+  const qHover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
+  expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.not :: A.Bool -> A.Bool"), qHover.result);
+
   // a global of the file itself, and the standard library's
   const basics = disk("test/surface/basics.hf");
   open("test/surface/basics.hf", basics);

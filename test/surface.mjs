@@ -13,7 +13,7 @@ const hfIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hf
 let failed = 0;
 
 const examples = readdirSync(join(root, "examples"), { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => hfIn(join("examples", d.name)));
-const files = [...hfIn("lib"), ...examples, ...hfIn("test/surface"), "test/modules/app/main.hf"];
+const files = [...hfIn("lib"), ...examples, ...hfIn("test/surface"), "test/modules/app/main.hf", "test/modules/qualified.hf"];
 const t = heff("test", ...files);
 console.log(t.stdout.trim().split("\n").pop());
 if (t.status !== 0) { failed++; console.log(t.stdout + t.stderr); }
@@ -26,6 +26,7 @@ const rejected = [
   ["test/errors/odd-and-even.hf", "no such tag zero in type OddAndEven.odd"],
   ["test/errors/rec.hf", "variable a is bound in delayed mode"],
   ["test/errors/specialize.hf", "neutrals Bool and Unit are not equal"],
+  ["test/modules/qualified-only.hf", "no such variable not in scope"],
   ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
 ];
 for (const [f, msg] of rejected) {

@@ -518,6 +518,8 @@ runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []
     , "      case \"ReadFile\": $readFile(a[0], \"utf8\", (e, t) => k(a[1](e ? nothing : just(t)))); return;"
     , "      case \"WriteFile\": $writeFile(a[0], a[1], (e) => k(a[2](bool(!e)))); return;"
     , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
+    , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
+    , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
     , "      default: throw new Error(\"heff: not an operation of io: \" + (p && p.$));"
     , "    }"
     , "  };"

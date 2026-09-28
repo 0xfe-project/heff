@@ -53,8 +53,10 @@ import Heff.Support.Pretty as P
 
 -- | a file as the loader found it: `module` is its name (`parse.surface`
 -- | for `parse/surface.hf`), `text` its source with the import lines blanked
--- | out, `deps` the modules it imports
-type Source = { path :: String, module :: String, source :: String, text :: String, deps :: Array String }
+-- | out, `deps` the modules it imports: `opens` those imported to be in
+-- | scope by their names, `aliases` those imported as `M` (`import m as M`),
+-- | in scope as `M.x`
+type Source = { path :: String, module :: String, source :: String, text :: String, deps :: Array String, opens :: Array String, aliases :: Array { module :: String, alias :: String } }
 
 -- | a file, elaborated: `top.globals` has everything it needs, `own` its
 -- | own definitions (by name, and the key each is stored under,
@@ -75,7 +77,7 @@ elabProgram = A.foldl step []
   where
   step done s =
     let
-      direct = A.filter (\c -> A.elem c.module s.deps) done
+      direct = A.filter (\c -> A.elem c.module s.opens) done
       needed = A.filter (\c -> A.elem c.module (closure done s.deps)) done
       env = A.foldl (\g c -> A.foldl (\g' o -> maybe g' (\e -> addGlobalEntry o.key e g') (lookupGlobal c.top.globals o.key)) g c.own) emptyGlobals needed
       imported = A.concatMap (\c -> map (\o -> { name: o.name, key: o.key, module: c.module }) c.own) direct
@@ -86,7 +88,11 @@ elabProgram = A.foldl step []
         { code: 330, severity: SError, span: { start: 0, end: 0 }, note: Nothing
         , msg: P.text ("`" <> o.name <> "` is defined by more than one module imported: " <> S.joinWith ", " (A.nub (map _.module (A.filter (\p -> p.name == o.name) imported))))
         }
-      g0 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
+      g1 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
+      -- (`import m as M`: `m`'s definitions as `M.x`)
+      g0 = A.foldl (\g q -> case A.find (\c -> c.module == q.module) done of
+          Just c -> A.foldl (\g' o -> addAlias (q.alias <> "." <> o.name) o.key g') g c.own
+          Nothing -> g) g1 s.aliases
       r = readSource (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
       key x = s.module <> "." <> x
       t = topModule key g0 r.ntns

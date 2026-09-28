@@ -568,8 +568,17 @@ atom = lazyP \_ -> do
     "var" -> next *> pure (Ident t.text (spanOf t))
     "con" -> do
       _ <- next
-      inScope <- gets \s -> A.elem t.text s.scope || s.known t.text
-      pure (if inScope then Ident t.text (spanOf t) else NTag t.text (spanOf t))
+      t2 <- peek
+      local <- gets \s -> A.elem t.text s.scope
+      qualified <- gets \s -> t2.kind == "field" && s.known (t.text <> "." <> t2.text)
+      -- (`M.x`, a definition of the module imported as `M`, unless `M` is
+      -- a variable here)
+      if qualified && not local then do
+        _ <- next
+        pure (Ident (t.text <> "." <> t2.text) (spanTo t t2))
+      else do
+        inScope <- gets \s -> local || s.known t.text
+        pure (if inScope then Ident t.text (spanOf t) else NTag t.text (spanOf t))
     "tag" -> next *> pure (NTag t.text (spanOf t))
     "int" -> next *> pure (NInt (BI.fromDigits t.text) (spanOf t))
     "str" -> next *> pure (NString t.text (spanOf t))

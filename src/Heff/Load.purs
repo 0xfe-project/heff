@@ -13,7 +13,7 @@ module Heff.Load
 import Prelude
 
 import Data.Array as A
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Maybe (Maybe(..), fromMaybe, isNothing)
 import Data.String as S
 import Effect (Effect)
 import Effect.Ref as Ref
@@ -69,9 +69,11 @@ loadProgramWith read ps file = do
       src <- read path
       let
         r = readImports src
-        deps = map _.name r.imports
+        deps = A.nub (map _.name r.imports)
+        opens = A.nub (map _.name (A.filter (\i -> isNothing i.alias) r.imports))
+        aliases = A.mapMaybe (\i -> i.alias <#> \a -> { module: i.name, alias: a }) r.imports
       A.foldM (\_ d -> dep (A.snoc stack m) path d) unit deps
-      Ref.modify_ (_ <> [ { path, module: m, source: src, text: r.text, deps } ]) done
+      Ref.modify_ (_ <> [ { path, module: m, source: src, text: r.text, deps, opens, aliases } ]) done
     dep stack from m = do
       seen <- Ref.read done
       if A.elem m stack then err (from <> ": importing " <> m <> " is a cycle: " <> S.joinWith " -> " (A.snoc stack m))

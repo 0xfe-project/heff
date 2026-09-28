@@ -30,6 +30,13 @@ if (build("test/node/echo.hf", "echo", echo)) {
   check("echo: the file", readFileSync(copied, "utf8"), "from stdin");
 }
 
+// time and the network: done later, the rest going on then
+const timed = join(work, "timed.mjs");
+if (build("test/node/timed.hf", "timed", timed)) {
+  const r = spawnSync("node", [timed], { encoding: "utf8" });
+  check("sleep and fetch", r.stdout + r.stderr, "fetched\n");
+}
+
 // a computation of an effect Node has no handler for is refused, and why
 {
   const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "node", "examples/counter/counter.hf", join(work, "counter.mjs")], { cwd: root, encoding: "utf8" });

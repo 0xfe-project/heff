@@ -93,10 +93,12 @@ project's `name`), else the file's own directory.  What is not in the
 project is looked for in the standard library, `lib/`.
 
 - Imports come first in a file, one per line: `import dom`.
+- `import dom as D` brings `dom`'s definitions in as `D.sleep`, `D.Node`,
+  … only.  (A constructor is not qualified: `True` is found by its type.)
 - A file sees its own definitions and those of the modules it imports --
   not what those import.
-- A name defined by two modules imported is an error; a file's own
-  definition shadows an imported one.
+- A name defined by two modules imported by name is an error: import one
+  of them `as`.  A file's own definition shadows an imported one.
 - Everything a module defines is exported.
 
 A `theory` is a first-class module (a record type), and an instance of it
@@ -116,8 +118,8 @@ its effect.  `do` is `bind`.  `h <+> k` is two effects as one.
   a page.  Where it goes on the page is the app's to find, by `select` or
   `xpath`.
 - `lib/io.hf`: a program's world (standard output and input, arguments,
-  environment, files, exit): a program is a `Co io Unit`, and `heff node`
-  writes it as a Node.js program.
+  environment, files, time, the network, exit): a program is a
+  `Co io Unit`, and `heff node` writes it as a Node.js program.
 
 The page's handler and Node's are written in JavaScript; asynchrony is
 the handler's, and the program is plain `do`.  The same computation runs
