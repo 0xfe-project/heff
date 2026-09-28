@@ -1,0 +1,106 @@
+-- Parallel composition (lib/par.hf) with a log: one program, two handlers
+-- -- one runs what is in parallel one after the other, the other lets the
+-- two take turns at each line logged.
+
+import co
+import par
+import prelude
+
+data LogF (m :: Type -> Type) x = Say String x | P ((parOf Int String).f m x)
+
+logging :: HFunctor
+logging =
+  { f = LogF
+  , hfmap = \fm g p -> case p of
+      Say s x -> Say s (g x)
+      P q -> P ((parOf Int String).hfmap fm g q)
+  , hmap = \nt p -> case p of
+      Say s x -> Say s x
+      P q -> P ((parOf Int String).hmap nt q)
+  }
+
+say :: String -> Co logging Unit
+say s = op (Say s (MkUnit :: Unit)) val
+
+both :: Co logging String
+both = do
+  say "start"
+  answers <-
+    parIn
+      (\p -> P p)
+      (do
+       say "a1"
+       say "a2"
+       pure 7) (do
+    say "b1"
+    say "b2"
+    pure "seven")
+  say "end"
+  pure (showInt (fst answers) ++ " " ++ snd answers)
+
+-- the one after the other --------------------------------------------------
+
+sequential :: Handler logging
+sequential =
+  { M = \a -> Pair a (List String)
+  , ret = \x -> MkPair x []
+  , bind = \m k -> case m of
+      MkPair x out ->
+        (case k x of
+         MkPair y out' -> MkPair y (concatList out out'))
+  , malg = \p -> case p of
+      Say s x -> MkPair x [s]
+      P q ->
+        (case q of
+         Par l r k ->
+           (case l of
+            MkPair a outL ->
+              (case r of
+               MkPair b outR -> MkPair (k a b) (concatList outL outR))))
+  }
+
+-- taking turns -------------------------------------------------------------
+
+-- | A thread: done, or it said something and goes on.
+data Thread a = Done a | Said String (Thread a)
+
+thenDo :: {a b :: Type} -> Thread a -> (a -> Thread b) -> Thread b
+thenDo (Done x) k = k x
+thenDo (Said s t) k = Said s (thenDo t k)
+
+-- | Two threads, each saying one thing in turn, and both their answers.
+interleave :: {a b :: Type} -> Thread a -> Thread b -> Thread (Pair a b)
+interleave (Said s t1) (Said s' t2) = Said s (Said s' (interleave t1 t2))
+interleave (Done x) t2 = thenDo t2 (\y -> Done (MkPair x y))
+interleave t1 (Done y) = thenDo t1 (\x -> Done (MkPair x y))
+
+answer :: {a :: Type} -> Thread a -> a
+answer (Done x) = x
+answer (Said _ t) = answer t
+
+lines :: {a :: Type} -> Thread a -> List String
+lines (Done _) = []
+lines (Said s t) = Cons s (lines t)
+
+-- | What a thread comes to, and what it said.
+said :: {a :: Type} -> Thread a -> Pair a (List String)
+said t = MkPair (answer t) (lines t)
+
+interleaving :: Handler logging
+interleaving =
+  { M = Thread
+  , ret = \x -> Done x
+  , bind = \m k -> thenDo m k
+  , malg = \p -> case p of
+      Say s x -> Said s (Done x)
+      P q ->
+        (case q of
+         Par l r k ->
+           thenDo (interleave l r) (\ab -> case ab of
+           MkPair a b -> Done (k a b)))
+  }
+
+-- >>> handle sequential both
+-- MkPair "7 seven" (Cons "start" (Cons "a1" (Cons "a2" (Cons "b1" (Cons "b2" (Cons "end" Nil))))))
+-- >>> said (handle interleaving both)
+-- MkPair "7 seven" (Cons "start" (Cons "a1" (Cons "b1" (Cons "a2" (Cons "b2" (Cons "end" Nil))))))

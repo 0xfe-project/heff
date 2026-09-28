@@ -97,8 +97,12 @@ match e (Tag x vs) cases = case dictLookup cases x of
   Nothing -> panic "tag not found"
 match _ _ _ = panic "expected a tag value"
 
+-- | (one level deeper: see `deeper`)
 evalIn :: Env -> S.El -> Val
-evalIn e = case _ of
+evalIn e t = deeper \_ -> evalHere e t
+
+evalHere :: Env -> S.El -> Val
+evalHere e = case _ of
   S.Local i -> case L.index e.local i of
     Just v -> force v
     Nothing -> panic "no such local"
@@ -240,6 +244,7 @@ prettyResult = case _ of
   Abandoned -> P.text "<abandoned>"
   Diverged -> P.text "<diverged>"
 
+foreign import deeper :: forall a. (Unit -> a) -> a
 foreign import bigToNumber :: BigInt -> Number
 foreign import floorToBig :: Number -> BigInt
 foreign import tryAbandon :: forall a. String -> (Unit -> a) -> (a -> Either Unit a) -> Either Unit a -> Either Unit a

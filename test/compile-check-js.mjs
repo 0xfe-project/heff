@@ -26,15 +26,17 @@ for (const f of readdirSync(join(root, "test", "programs")).filter((f) => f.ends
   cases.push({ name: f.replace(".hf", ""), src: readFileSync(join(root, "test", "programs", f), "utf8") });
 for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genProgram() });
 
-const heff = (args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8" });
+// (a generated program needs no depth: one that goes deep diverges, and is
+// said to sooner; and heff that does not finish is a failure, not a wait)
+const heff = (args, depth) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8", timeout: 120000, env: depth ? { ...process.env, HEFF_DEPTH: String(depth) } : process.env });
 
 let agree = 0, differ = 0, compileErrors = 0, compared = 0, timeouts = 0;
 for (const c of cases) {
   const file = join(work, `${c.name}.hf`), out = join(work, `${c.name}.mjs`);
   writeFileSync(file, c.src);
   const r = heff(["compile-js", file, out]);
-  const ev = heff(["eval", file]);
-  if (r.status !== 0 || ev.status !== 0) { compileErrors++; console.log(`NOT COMPILED ${c.name}:\n${r.stderr}${ev.stderr}`); continue; }
+  const ev = heff(["eval", file], c.name.startsWith("gen") ? 100000 : 0);
+  if (r.status !== 0 || ev.status !== 0) { compileErrors++; console.log(`NOT COMPILED ${c.name}:\n${r.stderr}${ev.stderr}${r.error || ""}${ev.error || ""}`); continue; }
   // `name = value`, a value going on over the lines that do not start so;
   // an operator's name without its parentheses, as the module exports it
   const interp = new Map();
