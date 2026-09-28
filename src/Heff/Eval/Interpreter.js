@@ -18,3 +18,6 @@ export const tryEval = (marker) => (thunk) => (ok) => (abandoned) => (diverged) 
     throw e;
   }
 };
+
+export const bigToNumber = (b) => Number(b);
+export const floorToBig = (x) => BigInt(Math.floor(x));

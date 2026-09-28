@@ -96,6 +96,7 @@ ntnKey = case _ of
   NField x _ -> "f:" <> x
   NTag x _ -> "t:" <> x
   NInt i _ -> "n:" <> BI.toString i
+  NFloat x _ -> "f:" <> show x
   NString s _ -> "s:" <> show s
   NError _ -> "error"
 
@@ -508,8 +509,8 @@ atom = lazyP \_ -> do
     if t.kind == "field" then next >>= \f -> fields (Field e f) else pure e
 
 startsAtom :: T -> Boolean
-startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "str" ]
-  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "String", "sum", "abandon" ])
+startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
+  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "sum", "abandon" ])
   || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
 
 parens :: P E

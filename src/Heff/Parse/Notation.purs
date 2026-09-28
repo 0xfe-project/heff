@@ -50,6 +50,7 @@ data Ntn
   | NField String Span
   | NTag String Span
   | NInt BigInt Span
+  | NFloat Number Span
   | NString String Span
   | NError Span
 
@@ -78,6 +79,7 @@ ntnSpan n = { start: startPos n, end: endPos n }
     NField _ s -> s.start
     NTag _ s -> s.start
     NInt _ s -> s.start
+    NFloat _ s -> s.start
     NString _ s -> s.start
     NError s -> s.start
   endPos = case _ of
@@ -92,6 +94,7 @@ ntnSpan n = { start: startPos n, end: endPos n }
     NField _ s -> s.end
     NTag _ s -> s.end
     NInt _ s -> s.end
+    NFloat _ s -> s.end
     NString _ s -> s.end
     NError s -> s.end
 
@@ -106,7 +109,8 @@ ntnHead = case _ of
   NField x _ -> P.text "Field" <+> P.text x
   NTag x _ -> P.text "Tag" <+> P.text x
   NInt i _ -> P.text "Int" <+> P.text (show i)
-  NString i _ -> P.text "Int" <+> P.text i
+  NFloat x _ -> P.text "Float" <+> P.text (show x)
+  NString i _ -> P.text "String" <+> P.text i
   NTuple _ _ -> P.text "Tuple"
   NBrace _ _ -> P.text "Brace"
   NError _ -> P.text "Error"

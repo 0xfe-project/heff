@@ -150,6 +150,7 @@ uTy g cs a0 b0 = do
           cs' = { len: cs.len + 1, names: fromMaybe "x" (V.cloName f.cod) : cs.names }
         uTy g cs' (V.nom (V.appClo f.cod (pure x))) (V.nom (V.appClo f'.cod (pure x)))
       V.PrimInt, V.PrimInt -> pure unit
+      V.PrimFloat, V.PrimFloat -> pure unit
       V.PrimString, V.PrimString -> pure unit
       _, _ -> throwError (UnequalTys cs a b Nothing)
 
@@ -406,6 +407,7 @@ renameTy g m r t0 = do
       pure (S.Record { level: rt.level, fieldTypes: { keys: rt.fieldTypes.keys, byName: rt.fieldTypes.byName, values: tys } })
     V.Sum (Variants vs) -> S.Sum <<< Variants <$> dictTraverse (traverse (renameTy g m r <<< L.force)) vs
     V.PrimInt -> pure S.PrimInt
+    V.PrimFloat -> pure S.PrimFloat
     V.PrimString -> pure S.PrimString
   where
   iterateLift i rr = if i <= 0 then rr else iterateLift (i - 1) (lift1 rr)

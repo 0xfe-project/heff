@@ -47,6 +47,7 @@ data Expr
   | PrimCall String (Array Expr) -- ^ a primitive, given all its arguments
   | Call String (Array Expr) -- ^ a global of that arity, given all its arguments at once (`Heff.Lower.Arity`)
   | Int BigInt
+  | Float Number
   | Str String
   | Abandon
 
@@ -224,6 +225,7 @@ isValue = case _ of
   Tag _ as -> A.all isValue as
   Prim _ -> true
   Int _ -> true
+  Float _ -> true
   Str _ -> true
   _ -> false
 

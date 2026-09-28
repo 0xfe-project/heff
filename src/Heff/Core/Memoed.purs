@@ -78,6 +78,9 @@ abandon = { stx: S.Abandon, val: pure (V.Nom V.Opaque) }
 litInt :: BigInt -> El
 litInt i = { stx: S.LitInt i, val: pure (V.Nom V.Opaque) }
 
+litFloat :: Number -> El
+litFloat x = { stx: S.LitFloat x, val: pure (V.Nom V.Opaque) }
+
 litString :: String -> El
 litString s = { stx: S.LitString s, val: pure (V.Nom V.Opaque) }
 
@@ -116,6 +119,9 @@ isTy m = { stx: S.IsTy m.stx, val: defer \_ -> V.Become (tyN m) }
 
 primInt :: Ty
 primInt = { stx: S.PrimInt, val: pure (V.Nom V.PrimInt) }
+
+primFloat :: Ty
+primFloat = { stx: S.PrimFloat, val: pure (V.Nom V.PrimFloat) }
 
 primString :: Ty
 primString = { stx: S.PrimString, val: pure (V.Nom V.PrimString) }

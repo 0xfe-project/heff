@@ -338,6 +338,12 @@ primInt = Typ \_ -> pure M.primInt
 litInt :: BigInt -> Syn
 litInt i = Syn \_ -> pure (Tuple (M.litInt i) V.PrimInt)
 
+primFloat :: Typ
+primFloat = Typ \_ -> pure M.primFloat
+
+litFloat :: Number -> Syn
+litFloat x = Syn \_ -> pure (Tuple (M.litFloat x) V.PrimFloat)
+
 primString :: Typ
 primString = Typ \_ -> pure M.primString
 

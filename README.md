@@ -82,7 +82,9 @@ Operators of unrelated groups do not go together without parentheses:
 Evaluation is call-by-value: arguments, and the fields of constructors and
 records, are computed before they are passed, used or not; a definition
 that is not a function is computed when first used.  `Int` is an integer
-of any size; division is floor division, and by zero it abandons.
+of any size; division is floor division, and by zero it abandons.  `Float`
+is a 64-bit floating-point number (`1.5`, `6.02e23`), its operators the
+integers' with a `.`: `+.`, `*.`, `<.`.
 
 ## Modules
 

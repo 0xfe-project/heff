@@ -102,4 +102,5 @@ readbTy n = case _ of
   V.Record rt -> S.Record (readbRecordType n rt)
   V.Sum st -> S.Sum (variantsMap (readbTy n <<< force) st)
   V.PrimInt -> S.PrimInt
+  V.PrimFloat -> S.PrimFloat
   V.PrimString -> S.PrimString

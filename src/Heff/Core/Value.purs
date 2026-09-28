@@ -290,6 +290,7 @@ data Ty
   | Record RecordType
   | Sum SumType
   | PrimInt
+  | PrimFloat
   | PrimString
 
 levelOf :: Ty -> Level
@@ -300,6 +301,7 @@ levelOf = case _ of
   Record rt -> rt.level
   Sum _ -> Small
   PrimInt -> Small
+  PrimFloat -> Small
   PrimString -> Small
 
 levelOfEv :: Ev Ty -> Level
@@ -314,6 +316,7 @@ data TypeBehavior
   | LikeRecord RecordType
   | LikeSum SumType
   | LikeInt
+  | LikeFloat
   | LikeString
   | NoRules
 
@@ -325,6 +328,7 @@ behavior = case _ of
   Record rt -> LikeRecord rt
   Sum st -> LikeSum st
   PrimInt -> LikeInt
+  PrimFloat -> LikeFloat
   PrimString -> LikeString
 
 -- | the domain of a lambda's function type annotation; a metavariable

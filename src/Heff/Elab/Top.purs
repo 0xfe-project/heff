@@ -194,6 +194,8 @@ parseHead c n = case n of
   Keyword "Int" _ -> pure (fromTypN c R.primInt)
   NInt i _ -> pure (fromSynN c (R.litInt i))
   -- extension: strings
+  Keyword "Float" _ -> pure (fromTypN c R.primFloat)
+  NFloat x _ -> pure (fromSynN c (R.litFloat x))
   Keyword "String" _ -> pure (fromTypN c R.primString)
   NString s _ -> pure (fromSynN c (R.litString s))
   _ -> failP (ntnSpan n) 3 (P.text "unexpected notation")

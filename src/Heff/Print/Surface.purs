@@ -120,6 +120,7 @@ el c p xs = case _ of
   Syn.Abandon -> "abandon"
   Syn.MetaApp m _ _ -> "?" <> show m
   Syn.LitInt i -> show i
+  Syn.LitFloat x -> show x
   Syn.LitString s -> quoteString s
   Syn.Implicit _ e -> el c p xs e
   Syn.Prim x -> "<primitive " <> x <> ">"
@@ -176,6 +177,7 @@ ty c p xs = case _ of
   Syn.Sum (Variants vs) -> "sum { " <> S.joinWith " | " (map (\(Tuple t ts) -> S.joinWith " " (A.cons (tagText t) (map (ty c 2 xs) ts))) (dictToList vs)) <> " }"
   Syn.IsTy t -> ty c p xs t
   Syn.PrimInt -> "Int"
+  Syn.PrimFloat -> "Float"
   Syn.PrimString -> "String"
   where
   arrow f = case f.cod of

@@ -146,6 +146,7 @@ syn c = case _ of
   S.Rec t -> syn c t
   S.Implicit _ t -> syn c t
   S.LitInt i -> pure (Tuple (Int i) V.PrimInt)
+  S.LitFloat x -> pure (Tuple (Float x) V.PrimFloat)
   S.LitString s -> pure (Tuple (Str s) V.PrimString)
   _ -> failWith "this needs an expected type"
 

@@ -6,17 +6,18 @@
 //   tag    'cons              (a tag, written as such)
 //   field  .x                 (right after what it projects, no space)
 //   int    42, -3             (`-` right before a digit, not after an operand)
+//   float  1.5, -0.25, 6.02e23 (digits on both sides of the `.`)
 //   str    "…"
 //   sym    ->, ::, =, <-, \, |, :=, ~, and any other run of symbol characters
 //   punct  ( ) [ ] { } ,
 //   kw     data type theory foreign import case of if then else do where
-//          let in test sum Type Int String infixl infixr infix
+//          let in test sum Type Int Float String infixl infixr infix
 //   watch  `-- >>>`, at the start of a doctest line (the rest of the line is
 //          an expression)
 //
 // Comments are not tokens; they are returned apart, for the formatter.
 const keywords = new Set(["data", "type", "theory", "foreign", "import", "case", "of", "if", "then", "else",
-  "do", "where", "let", "in", "test", "sum", "Type", "Int", "String", "abandon", "infixl", "infixr", "infix"]);
+  "do", "where", "let", "in", "test", "sum", "Type", "Int", "Float", "String", "abandon", "infixl", "infixr", "infix"]);
 const symChars = new Set("!#$%&*+./<=>?@\\^|-~:");
 const isLower = (c) => (c >= "a" && c <= "z") || c === "_";
 const isUpper = (c) => c >= "A" && c <= "Z";
@@ -35,7 +36,7 @@ export const lexImpl = (src) => {
   const operandBefore = (start) => {
     const t = tokens[tokens.length - 1];
     if (!t || t.end !== start) return false;
-    return t.kind === "var" || t.kind === "con" || t.kind === "int" || t.kind === "str" || t.kind === "field" ||
+    return t.kind === "var" || t.kind === "con" || t.kind === "int" || t.kind === "float" || t.kind === "str" || t.kind === "field" ||
       (t.kind === "punct" && (t.text === ")" || t.text === "]" || t.text === "}"));
   };
   while (i < src.length) {
@@ -88,7 +89,17 @@ export const lexImpl = (src) => {
     if (isDigit(c) || (c === "-" && isDigit(src[i + 1] ?? "") && !operandBefore(s))) {
       i++;
       while (i < src.length && isDigit(src[i])) i++;
-      push("int", src.slice(s, i), s, i);
+      let kind = "int";
+      if (src[i] === "." && isDigit(src[i + 1] ?? "")) {
+        kind = "float";
+        i++;
+        while (i < src.length && isDigit(src[i])) i++;
+      }
+      if (kind === "float" && (src[i] === "e" || src[i] === "E") && (isDigit(src[i + 1] ?? "") || ((src[i + 1] === "-" || src[i + 1] === "+") && isDigit(src[i + 2] ?? "")))) {
+        i += 2;
+        while (i < src.length && isDigit(src[i])) i++;
+      }
+      push(kind, src.slice(s, i), s, i);
       continue;
     }
     if (c === '"') {

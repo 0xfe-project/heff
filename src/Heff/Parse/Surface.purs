@@ -35,6 +35,7 @@ import Data.Array.NonEmpty as NEA
 import Data.Foldable (for_)
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Number as Number
 import Data.String as S
 import Data.Tuple (Tuple(..))
 import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, group, ntnSpan)
@@ -581,8 +582,9 @@ atom = lazyP \_ -> do
         pure (if inScope then Ident t.text (spanOf t) else NTag t.text (spanOf t))
     "tag" -> next *> pure (NTag t.text (spanOf t))
     "int" -> next *> pure (NInt (BI.fromDigits t.text) (spanOf t))
+    "float" -> next *> pure (NFloat (fromMaybe 0.0 (Number.fromString t.text)) (spanOf t))
     "str" -> next *> pure (NString t.text (spanOf t))
-    "kw" | A.elem t.text [ "Type", "Int", "String", "abandon" ] -> next *> pure (Keyword t.text (spanOf t))
+    "kw" | A.elem t.text [ "Type", "Int", "Float", "String", "abandon" ] -> next *> pure (Keyword t.text (spanOf t))
     "kw" | t.text == "sum" -> anonymousSum
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
@@ -594,8 +596,8 @@ atom = lazyP \_ -> do
     if t.kind == "field" then next *> fields (Juxt n (NField t.text (spanOf t))) else pure n
 
 startsAtom :: Tok -> Boolean
-startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "str" ]
-  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "String", "sum", "abandon" ])
+startsAtom t = A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ]
+  || (t.kind == "kw" && A.elem t.text [ "Type", "Int", "Float", "String", "sum", "abandon" ])
   || (t.kind == "punct" && (t.text == "(" || t.text == "{"))
 
 -- | `( e )`, `( e :: T )`, `(x := e)` (a named argument), `(+)` (an

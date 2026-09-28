@@ -156,9 +156,11 @@ emitDefs defs roots =
     curried = Set.fromFoldable (A.concatMap (\d -> valueRefs d.body) defs <> roots)
     globalNames = Set.fromFoldable (map (\d -> jsName d) defs)
     code = A.concatMap (\d -> defLines info curried globalNames d) defs
-    used = S.joinWith "\n" code
+    -- (a primitive's helper may use the runtime too: `$abandon`, `$T`)
+    helpers = primHelpers (S.joinWith "\n" code)
+    used = S.joinWith "\n" (helpers <> code)
   in
-    { lines: runtime used <> primHelpers used <> code, globals: info }
+    { lines: runtime used <> helpers <> code, globals: info }
   where
   maybe' f = case _ of
     Just x -> f x
@@ -349,6 +351,10 @@ expr env0 ind = case _ of
   Int i ->
     let s = BI.toString i
     in if SCU.take 1 s == "-" then { code: s <> "n", prec: 2 } else p3 (s <> "n")
+  -- (`2.0` is `2`, a number, not a BigInt)
+  Float x ->
+    let s = show x
+    in if SCU.take 1 s == "-" then { code: s, prec: 2 } else p3 s
   Str s -> p3 (quoteString s)
   Abandon -> p3 "$abandon()"
   Prim p -> p3 ("$" <> p <> "$c")
@@ -376,6 +382,13 @@ primCall p as = case p, as of
   "intLt", [ a, b ] -> test "<" a b
   "strLt", [ a, b ] -> test "<" a b
   "intLe", [ a, b ] -> test "<=" a b
+  "floatAdd", [ a, b ] -> bin "+" a b
+  "floatSub", [ a, b ] -> bin "-" a b
+  "floatMul", [ a, b ] -> bin "*" a b
+  "floatDiv", [ a, b ] -> bin "/" a b
+  "floatEq", [ a, b ] -> test "===" a b
+  "floatLt", [ a, b ] -> test "<" a b
+  "floatLe", [ a, b ] -> test "<=" a b
   "intShow", [ a ] -> { code: atLeast 3 a <> ".toString()", prec: 3 }
   "strLength", [ a ] -> { code: "BigInt(" <> atLeast 3 a <> ".length)", prec: 3 }
   _, _ -> { code: "$" <> p <> "(" <> S.joinWith ", " (map _.code as) <> ")", prec: 3 }

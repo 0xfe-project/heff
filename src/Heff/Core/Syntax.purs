@@ -29,6 +29,7 @@ data El
   | Prim String -- ^ extension: a primitive, implemented by the runtime (see `Heff.Elab.Prims`)
   | MetaApp Int (Array Int) Ty -- ^ an implicit argument being inferred: a metavariable applied to some locals (by index), at a type; zonked away before a definition is stored
   | LitInt BigInt
+  | LitFloat Number
   | LitString String
 
 type FunctionType = { level :: Level, dom :: Ty, cod :: Abs Ty, implicit :: Boolean }
@@ -45,4 +46,5 @@ data Ty
   | Sum SumType
   | IsTy Ty
   | PrimInt
+  | PrimFloat
   | PrimString

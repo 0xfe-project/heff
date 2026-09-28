@@ -100,6 +100,7 @@ pureIn safe = case _ of
   Tag _ as -> A.all (pureIn safe) as
   Prim _ -> true
   Int _ -> true
+  Float _ -> true
   Str _ -> true
   _ -> false
 
@@ -111,6 +112,7 @@ atomic = case _ of
   Var _ -> true
   Global _ -> true
   Int _ -> true
+  Float _ -> true
   Str _ -> true
   Prim _ -> true
   _ -> false

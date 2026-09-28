@@ -7,7 +7,8 @@ const g = (await import(pathToFileURL(file))).default;
 export const show = (v, arg = false) => {
   if (typeof v === "function") return v.$erased ? "#erased" : "#fun";
   if (typeof v === "bigint") return v.toString();
-  if (typeof v === "number") return String(v);
+  // (a float as a literal writes it: `2.0`, not `2`)
+  if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
   if (typeof v === "string") return JSON.stringify(v);
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {

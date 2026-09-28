@@ -31,6 +31,17 @@ prims =
   , Tuple "intLt" { arity: 2, js: "(a) => (b) => a < b ? $T : $F" }
   , Tuple "intLe" { arity: 2, js: "(a) => (b) => a <= b ? $T : $F" }
   , Tuple "intShow" { arity: 1, js: "(a) => a.toString()" }
+  , Tuple "floatAdd" { arity: 2, js: "(a) => (b) => a + b" }
+  , Tuple "floatSub" { arity: 2, js: "(a) => (b) => a - b" }
+  , Tuple "floatMul" { arity: 2, js: "(a) => (b) => a * b" }
+  , Tuple "floatDiv" { arity: 2, js: "(a) => (b) => a / b" }
+  , Tuple "floatEq" { arity: 2, js: "(a) => (b) => a === b ? $T : $F" }
+  , Tuple "floatLt" { arity: 2, js: "(a) => (b) => a < b ? $T : $F" }
+  , Tuple "floatLe" { arity: 2, js: "(a) => (b) => a <= b ? $T : $F" }
+  , Tuple "floatShow" { arity: 1, js: "(a) => { const s = String(a); return isNaN(s + \".0\") ? s : s + \".0\"; }" }
+  , Tuple "floatFromInt" { arity: 1, js: "(a) => Number(a)" }
+  , Tuple "floatSqrt" { arity: 1, js: "(a) => Math.sqrt(a)" }
+  , Tuple "floatFloor" { arity: 1, js: "(a) => Number.isFinite(a) ? BigInt(Math.floor(a)) : $abandon()" }
   , Tuple "strAppend" { arity: 2, js: "(a) => (b) => a + b" }
   , Tuple "strLength" { arity: 1, js: "(a) => BigInt(a.length)" }
   , Tuple "strSlice" { arity: 3, js: "(a) => (i) => (j) => a.slice(Number(i), Number(j))" }

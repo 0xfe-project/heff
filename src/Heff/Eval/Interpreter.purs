@@ -30,6 +30,7 @@ import Data.List as L
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
+import Data.Number as Number
 import Data.Tuple (Tuple(..))
 import Effect.Exception.Unsafe (unsafeThrow)
 import Heff.Support.Common (Dict, Name, dictElemAt, dictLookup, dictMap, dictToList, panic)
@@ -46,6 +47,7 @@ data Val
   | Cons (Dict (Lazy Val))
   | Tag Name (Array (Lazy Val))
   | LitInt BigInt
+  | LitFloat Number
   | LitString String
   | Erased
 
@@ -55,6 +57,8 @@ prettyVal = case _ of
   Cons fs -> P.list (map (\(Tuple x v) -> P.text x <+> P.text ":=" <+> prettyVal (force v)) (dictToList fs))
   Tag x vs -> P.text "'" <> P.text x <> A.foldMap (\v -> P.text " " <> prettyVal (force v)) vs
   LitInt i -> P.text (show i)
+  -- (`2.0`, not `2`: as a literal writes it)
+  LitFloat x -> P.text (show x)
   LitString s -> P.text (show s)
   Erased -> P.text "#erased"
 
@@ -114,6 +118,7 @@ evalIn e = case _ of
   S.Prim x -> prim x
   S.MetaApp _ _ _ -> panic "an implicit argument was never inferred"
   S.LitInt i -> LitInt i
+  S.LitFloat x -> LitFloat x
   S.LitString s -> LitString s
   S.Implicit _ t -> evalIn e t
   S.Specialize _ _ _ -> Erased
@@ -131,6 +136,18 @@ prim = case _ of
   "intLt" -> int2 \a b -> bool (a < b)
   "intLe" -> int2 \a b -> bool (a <= b)
   "intShow" -> Lam \a -> LitString (BI.toString (int a))
+  "floatAdd" -> float2 \a b -> LitFloat (a + b)
+  "floatSub" -> float2 \a b -> LitFloat (a - b)
+  "floatMul" -> float2 \a b -> LitFloat (a * b)
+  "floatDiv" -> float2 \a b -> LitFloat (a / b)
+  "floatEq" -> float2 \a b -> bool (a == b)
+  "floatLt" -> float2 \a b -> bool (a < b)
+  "floatLe" -> float2 \a b -> bool (a <= b)
+  "floatShow" -> Lam \a -> LitString (show (float a))
+  "floatFromInt" -> Lam \a -> LitFloat (bigToNumber (int a))
+  "floatSqrt" -> Lam \a -> LitFloat (Number.sqrt (float a))
+  -- (of what is not a number, or not finite, `abandon`)
+  "floatFloor" -> Lam \a -> let x = float a in if Number.isFinite x then LitInt (floorToBig x) else unsafeThrow abandonMarker
   "strAppend" -> str2 \a b -> LitString (a <> b)
   "strLength" -> Lam \a -> LitInt (BI.fromInt (Str.length (str a)))
   "strSlice" -> Lam \a -> Lam \i -> Lam \j -> LitString (Str.slice (small i) (small j) (str a))
@@ -150,6 +167,10 @@ prim = case _ of
   str v = case force v of
     LitString t -> t
     _ -> panic "a primitive expected a string"
+  float v = case force v of
+    LitFloat x -> x
+    _ -> panic "a primitive expected a float"
+  float2 f = Lam \a -> Lam \b -> f (float a) (float b)
   int2 f = Lam \a -> Lam \b -> f (int a) (int b)
   small v = BI.toIntClamped (int v)
   -- (a `case`: an argument would be thrown before the call)
@@ -192,6 +213,8 @@ prettyResult = case _ of
   Abandoned -> P.text "<abandoned>"
   Diverged -> P.text "<diverged>"
 
+foreign import bigToNumber :: BigInt -> Number
+foreign import floorToBig :: Number -> BigInt
 foreign import tryAbandon :: forall a. String -> (Unit -> a) -> (a -> Either Unit a) -> Either Unit a -> Either Unit a
 foreign import tryEval :: forall a r. String -> (Unit -> a) -> (a -> r) -> r -> r -> r
 

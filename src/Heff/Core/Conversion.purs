@@ -80,6 +80,7 @@ defEqTy cs a a' = case a, a' of
     defEqTy cs f.dom f'.dom
     defEqCloTy cs f.dom f.cod f'.cod
   V.PrimInt, V.PrimInt -> ok
+  V.PrimFloat, V.PrimFloat -> ok
   V.PrimString, V.PrimString -> ok
   _, _ -> Left (UnequalTys cs a a' Nothing)
 

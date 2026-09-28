@@ -73,6 +73,7 @@ compile g c = case _ of
     let k = compile g N t
     in \vs -> V.Become (V.nom (k vs))
   S.LitInt _ -> \_ -> V.Nom V.Opaque
+  S.LitFloat _ -> \_ -> V.Nom V.Opaque
   S.LitString _ -> \_ -> V.Nom V.Opaque
   S.Implicit _ e -> compile g c e
   S.Prim _ -> \_ -> V.Nom V.Opaque
@@ -116,4 +117,5 @@ compileTy g c = case _ of
     let k = compileTy g N t
     in \vs -> V.Become (V.nom (k vs))
   S.PrimInt -> \_ -> V.Nom V.PrimInt
+  S.PrimFloat -> \_ -> V.Nom V.PrimFloat
   S.PrimString -> \_ -> V.Nom V.PrimString
