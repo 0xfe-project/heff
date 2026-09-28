@@ -97,7 +97,9 @@ arithmetic, and the functions on lists (`map`, `foldl`, `foldr`,
 `filter`, `take`, `zip`, `range`, `sortBy`, …) and on text (`split`,
 `lines`, `words`, `trim`, `indexOf`, `parseInt`, …).  There are no type
 classes: what needs an equality or an order is given one (`elemBy`,
-`sortBy`).
+`sortBy`, `compareInt`).  `lib/map.hf` and `lib/set.hf` are maps and sets
+by an order of their keys (balanced trees), to be imported by a name:
+`import map as M`, then `M.insert compareString "k" 1 m`.
 
 ## Modules
 
