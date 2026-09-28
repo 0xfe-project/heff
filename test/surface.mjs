@@ -27,6 +27,7 @@ const rejected = [
   ["test/errors/rec.hf", "variable a is bound in delayed mode"],
   ["test/errors/specialize.hf", "neutrals Bool and Unit are not equal"],
   ["test/modules/qualified-only.hf", "no such variable not in scope"],
+  ["test/errors/literals.hf", "one of them must match every other value"],
   ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
 ];
 for (const [f, msg] of rejected) {

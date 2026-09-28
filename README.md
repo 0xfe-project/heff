@@ -58,7 +58,10 @@ heff completions fish          # > ~/.config/fish/completions/heff.fish
 names a definition or a binder; `f (a := T)` gives an implicit argument by
 name; `case`/`of`, `if`, `do`, `\x -> e`, records `{ x = 1 }` and record
 types `{ x :: Int }`.  A function is defined by equations, each a case; a
-call of itself is recursion.
+call of itself is recursion.  A pattern may be a literal, `fib 0 = 0`,
+compared by the equality in scope (`intEq`, `strEq`, `floatEq`); one of
+the equations must then match every other value.  Functions that call one
+another are fields of one record.
 
 A `-- >>> e` line is a watch, and the `--` lines under it are its
 expectation: a doctest, checked by `heff test`.  `test name` names the

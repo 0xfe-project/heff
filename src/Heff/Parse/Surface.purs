@@ -820,6 +820,10 @@ patAtom = lazyP \_ -> do
       isVar <- gets \s -> A.elem t.text s.patVars
       pure (if isVar then Ident t.text (spanOf t) else NTag t.text (spanOf t))
     "tag", _ -> next *> pure (NTag t.text (spanOf t))
+    -- (a literal: matched by the equality in scope, `Heff.Elab.Clauses`)
+    "int", _ -> next *> pure (NInt (BI.fromDigits t.text) (spanOf t))
+    "float", _ -> next *> pure (NFloat (fromMaybe 0.0 (Number.fromString t.text)) (spanOf t))
+    "str", _ -> next *> pure (NString t.text (spanOf t))
     "punct", "(" -> do
       _ <- next
       inBrackets do

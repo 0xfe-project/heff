@@ -33,7 +33,10 @@ stripWhere = case _ of
   Infix l op r -> stripWhere r <#> \(Tuple r' eqs) -> Tuple (Infix l op r') eqs
   _ -> Nothing
 
-data Pat = PVar Name | PTag Name (Array Pat) Span
+-- | a literal pattern (`0`, `"yes"`, `1.5`) is matched by the equality in
+-- | scope for its kind, `intEq`, `strEq` or `floatEq` (as `do` takes the
+-- | `bind` in scope)
+data Pat = PVar Name | PTag Name (Array Pat) Span | PLit Ntn
 
 type Row = { pats :: Array Pat, rhs :: Ntn }
 
@@ -44,7 +47,24 @@ pat n = case NEA.uncons (getGroup n) of
   { head: NTuple [ p ] _, tail: [] } -> pat p
   { head: Ident x _, tail: [] } -> Right (PVar x)
   { head: NTag t sp, tail: ps } -> PTag t <$> traverse pat ps <@> sp
-  _ -> Left { span: ntnSpan n, msg: "a pattern is a variable, or a tag applied to patterns" }
+  { head: l@(NInt _ _), tail: [] } -> Right (PLit l)
+  { head: l@(NString _ _), tail: [] } -> Right (PLit l)
+  { head: l@(NFloat _ _), tail: [] } -> Right (PLit l)
+  _ -> Left { span: ntnSpan n, msg: "a pattern is a variable, a literal, or a tag applied to patterns" }
+
+-- | the equality a literal is matched by
+equalityOf :: Ntn -> Name
+equalityOf = case _ of
+  NString _ _ -> "strEq"
+  NFloat _ _ -> "floatEq"
+  _ -> "intEq"
+
+sameLit :: Ntn -> Ntn -> Boolean
+sameLit a b = case a, b of
+  NInt x _, NInt y _ -> x == y
+  NString x _, NString y _ -> x == y
+  NFloat x _, NFloat y _ -> x == y
+  _, _ -> false
 
 -- | `f p ... := e`
 equation :: Name -> Ntn -> Either Err Row
@@ -93,6 +113,7 @@ patVars :: Pat -> Array Name
 patVars = case _ of
   PVar x -> [ x ]
   PTag _ ps _ -> A.concatMap patVars ps
+  PLit _ -> []
 
 identsOf :: Ntn -> Array Name
 identsOf = case _ of
@@ -112,15 +133,19 @@ fresh used x = if A.elem x used then fresh used (x <> "'") else x
 compile :: Array Name -> Span -> Array Name -> Array Row -> Either Err Ntn
 compile used sp vars rows = case A.head rows of
   Nothing -> Right (Keyword "abandon" sp) -- unreachable: a missing tag is the match's error
-  Just r -> case A.findIndex isTag r.pats of
+  Just r -> case A.findIndex (\p -> isTag p || isLit p) r.pats of
     -- the first equation matches whatever is left: it is the answer
     Nothing -> Right (A.foldl (\e (Tuple v p) -> bindVar v p e) r.rhs (A.zip vars r.pats))
+    Just c | Just (PLit l) <- A.index r.pats c -> literal c l
     Just c -> do
       let
         v = fromMaybe "_" (A.index vars c)
         tags = A.nubByEq (\a b -> a.tag == b.tag) (A.mapMaybe (\r' -> A.index r'.pats c >>= tagOf) rows)
         -- rows whose column `c` is a variable go on in every other case
         rest = A.filter (\r' -> not (maybe' isTag (A.index r'.pats c))) rows
+      for_' rows \r' -> case A.index r'.pats c of
+        Just (PLit l) -> Left { span: ntnSpan l, msg: "a literal and a tag match the same argument" }
+        _ -> Right unit
       arms <- traverse (arm c v) tags
       dflt <-
         if A.null rest then pure []
@@ -132,6 +157,31 @@ compile used sp vars rows = case A.head rows of
   isTag = case _ of
     PTag _ _ _ -> true
     _ -> false
+  isLit = case _ of
+    PLit _ -> true
+    _ -> false
+  -- a column of literals: equal to the first equation's, or not (the
+  -- equations whose column is a variable go on either way)
+  literal c l = do
+    let
+      v = fromMaybe "_" (A.index vars c)
+      column = A.mapMaybe (\r' -> A.index r'.pats c) rows
+      lsp = ntnSpan l
+    when (A.any isTag column) $ Left { span: lsp, msg: "a literal and a tag match the same argument" }
+    when (not (A.any (not <<< isLit) column)) $ Left { span: lsp, msg: "the equations match literals here: one of them must match every other value (a variable)" }
+    let
+      yes = A.mapMaybe (\r' -> case A.index r'.pats c of
+        Just (PLit l') | sameLit l l' -> Just r' { pats = dropAt c r'.pats }
+        Just (PLit _) -> Nothing
+        Just p -> Just r' { pats = dropAt c r'.pats, rhs = bindVar v p r'.rhs }
+        Nothing -> Nothing) rows
+      no = A.filter (\r' -> case A.index r'.pats c of
+        Just (PLit l') -> not (sameLit l l')
+        _ -> true) rows
+    yesB <- compile used sp (dropAt c vars) yes
+    noB <- compile used sp vars no
+    let cond = group (NEA.cons' (Ident (equalityOf l) lsp) [ Ident v lsp, l ])
+    pure (NBlock "match" (Just cond) [ Infix (NTag "True" lsp) (Keyword "=>" lsp) yesB, Infix (NTag "False" lsp) (Keyword "=>" lsp) noB ] lsp)
   tagOf = case _ of
     PTag t ps s -> Just { tag: t, arity: A.length ps, pats: ps, span: s }
     _ -> Nothing

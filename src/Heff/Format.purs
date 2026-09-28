@@ -638,7 +638,7 @@ patAtom = lazyP \_ -> do
       inBrackets do
         p <- pattern
         PParen o p <$> expectPunct ")"
-    _, _ | A.elem t.kind [ "var", "con", "tag" ] -> PAtom <$> next
+    _, _ | A.elem t.kind [ "var", "con", "tag", "int", "float", "str" ] -> PAtom <$> next
     _, _ -> failAt t
 
 -- (layout, as `Heff.Parse.Surface`'s)
