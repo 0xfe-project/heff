@@ -1,10 +1,11 @@
 # heff
 
 heff is a language and its toolchain: Hippogriff (Lynch & Staton,
-arXiv:2608.19728), a dependently typed language with a phase distinction,
-with a Haskell-like syntax, modules, doctests, effects and handlers, a
-formatter, a language server, and a compiler to JavaScript -- for web
-pages and for Node.js.
+arXiv:2608.19728), a typed language with a phase distinction -- types are
+computed in the static phase, never from a runtime value -- with a
+Haskell-like syntax, modules, doctests, effects and handlers, a formatter,
+a language server, and a compiler to JavaScript -- for web pages and for
+Node.js.
 
 ```haskell
 import co
