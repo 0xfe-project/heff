@@ -123,11 +123,16 @@ doBlock sp stmts = case A.unsnoc stmts of
 doPat :: Ntn -> E (Tuple Name (Array Name))
 doPat n = case NEA.uncons (getGroup n) of
   { head: NTag x _, tail: ns } -> do
-    xs <- traverse ident ns
+    xs <- traverse patName ns
     pure (Tuple x xs)
   -- extension: `_ => e` handles every tag not listed
   { head: Ident "_" _, tail: [] } -> pure (Tuple "_" [])
-  _ -> unexpectedNotation n "pattern in a match statement"
+  { head: Ident x sp, tail: [] } ->
+    failP sp 3 (P.text ("`" <> x <> "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already"))
+  _ -> failP (ntnSpan n) 3 (P.text "a `case` pattern is flat: a constructor or a tag applied to names, or `_` -- an equation of a definition matches nested patterns")
+  where
+  patName (Ident x _) = pure x
+  patName p = failP (ntnSpan p) 3 (P.text "an argument of a `case` pattern is a name: match a nested pattern in an equation of a definition, or bind a name here and `case` on it")
 
 doCase :: Ntn -> E (Tuple Name (Tuple (Array Name) R.Chk))
 doCase (Infix pat (Keyword "=>" _) bodyN) = do
