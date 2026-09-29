@@ -1,0 +1,1101 @@
+-- The concrete syntax of the `.hf` files, for the formatter: a port of the
+-- reading part of `Heff.Format`.  The text is read again, into a syntax
+-- that keeps every token (the notation the elaborator takes drops
+-- parentheses and sugar); nothing is resolved, and how declared operators
+-- bind is the real parser's business (`Ops` keeps them as written).
+--
+-- A parser is `P a`: a function of the token state, giving the rest of the
+-- state and a value, or why the file does not parse.  `bind` makes `do`
+-- notation read as the reference does.  The grammar's functions call one
+-- another, so they are the fields of one record, `gram`; each `xxxF`
+-- function takes that record.
+--
+-- The sums are flatter than the reference's: a `case` alternative, a `do`
+-- statement, a brace field, a constructor's arguments and an operator's
+-- right side are constructors of `E` (`EAlt`, `ESBind`, `EFSet`, `ECon`,
+-- `OpRhs`), as the language defines types one after another.
+
+import prelude
+import array as A
+import fmt.lex as L
+import fmt.imports as I
+import fmt.toks as Tk
+
+type T = Tk.T
+
+type St = { toks :: Array T, i :: Int, stack :: List Int, start :: Int }
+
+data Res a = MkRes St a
+
+type P a = St -> Either String (Res a)
+
+mkSt :: Array T -> Int -> List Int -> Int -> St
+mkSt toks i stack start = { toks = toks, i = i, stack = stack, start = start }
+
+val :: {a :: Type} -> a -> P a
+val x = \st -> Right (MkRes st x)
+
+bindStep :: {a b :: Type}
+         -> Either String (Res a)
+         -> (a -> P b)
+         -> Either String (Res b)
+bindStep (Left e) f = Left e
+bindStep (Right (MkRes st x)) f = f x st
+
+bind :: {a b :: Type} -> P a -> (a -> P b) -> P b
+bind p f = \st -> bindStep (p st) f
+
+fail :: {a :: Type} -> String -> P a
+fail msg = \st -> Left msg
+
+eofT :: T
+eofT = Tk.dummy (-1)
+
+tokAt :: Array T -> Int -> T
+tokAt ts i = if i >= 0 && i < A.length ts then A.index ts i else eofT
+
+peek :: P T
+peek = \st -> Right (MkRes st (tokAt st.toks st.i))
+
+peekAt :: Int -> P T
+peekAt k = \st -> Right (MkRes st (tokAt st.toks (st.i + k)))
+
+next :: P T
+next = \st ->
+    Right
+      (MkRes (mkSt st.toks (st.i + 1) st.stack st.start) (tokAt st.toks st.i))
+
+getSt :: P St
+getSt = \st -> Right (MkRes st st)
+
+isKind :: T -> String -> Bool
+isKind t k = strEq t.kind k
+
+isText :: T -> String -> Bool
+isText t x = strEq t.text x
+
+isKw :: T -> String -> Bool
+isKw t x = isKind t "kw" && isText t x
+
+reservedSyms :: List String
+reservedSyms = ["->", "~", "::", "=", "|", "<-", "\\", ":=", "=>", "."]
+
+isOperatorT :: T -> Bool
+isOperatorT t = isKind t "sym" && not (elemBy strEq t.text reservedSyms)
+
+startsAtomT :: T -> Bool
+startsAtomT t =
+  elemBy strEq t.kind ["var", "con", "tag", "int", "float", "str"]
+  || (isKind t "kw"
+      && elemBy
+        strEq
+        t.text
+        ["Type", "Int", "Float", "String", "Array", "data", "abandon"])
+  || (isKind t "punct" && (isText t "(" || isText t "{" || isText t "["))
+
+manyStart :: T -> Bool
+manyStart t =
+  startsAtomT t || isKind t "var" || (isKind t "punct" && isText t "(")
+
+stackTop :: List Int -> Int
+stackTop s = fromMaybe 0 (head s)
+
+boundaryT :: St -> T -> Bool
+boundaryT st t =
+  isKind t "eof"
+  || (t.first && t.col <= stackTop st.stack && not (st.i == st.start))
+
+boundary :: St -> Bool
+boundary st = boundaryT st (tokAt st.toks st.i)
+
+atBoundary :: P Bool
+atBoundary = \st -> Right (MkRes st (boundary st))
+
+failAt :: {a :: Type} -> T -> P a
+failAt t =
+  fail
+    ("the file does not parse (at `"
+     ++ t.raw
+     ++ "`, offset "
+     ++ showInt t.start
+     ++ ")")
+
+pushCol :: Int -> P Unit
+pushCol c = \st ->
+    Right (MkRes (mkSt st.toks st.i (Cons c st.stack) st.start) MkUnit)
+
+popCol :: P Unit
+popCol = \st ->
+    Right (MkRes (mkSt st.toks st.i (drop 1 st.stack) st.start) MkUnit)
+
+setStart :: P Unit
+setStart = \st -> Right (MkRes (mkSt st.toks st.i st.stack st.i) MkUnit)
+
+resetDecl :: P Unit
+resetDecl = \st -> Right (MkRes (mkSt st.toks st.i (Cons 0 Nil) st.i) MkUnit)
+
+-- (layout, as the reference's: a block's items start at one column, and an
+-- item ends where a token is first on its line, no deeper than the block)
+
+-- (the block goes on: a token first on its line, at the block's column;
+-- these are apart from `blockGo` and `block`, which are generic -- a
+-- projection inside a generic function trips the elaborator today)
+blockMore :: T -> Int -> Bool
+blockMore t col = not (isKind t "eof") && t.first && t.col == col
+
+blockBad :: St -> T -> Bool
+blockBad st t = isKind t "eof" || (t.first && t.col <= stackTop st.stack)
+
+blockCol :: T -> Int
+blockCol t = t.col
+
+blockGo :: {a :: Type} -> P a -> Int -> List a -> P (List a)
+blockGo one col acc = do
+  setStart
+  x <- one
+  t <- peek
+  if blockMore t col
+      then blockGo one col (Cons x acc)
+      else val (reverse (Cons x acc))
+
+block :: {a :: Type} -> P a -> P (List a)
+block one = do
+  t <- peek
+  st <- getSt
+  if blockBad st t
+      then failAt t
+      else do
+        pushCol (blockCol t)
+        xs <- blockGo one (blockCol t) Nil
+        popCol
+        val xs
+
+inBrackets :: {a :: Type} -> P a -> P a
+inBrackets p = do
+  pushCol (-1)
+  x <- p
+  popCol
+  val x
+
+manyGo :: {a :: Type} -> P a -> List a -> P (List a)
+manyGo p acc = do
+  b <- atBoundary
+  t <- peek
+  if b || not (manyStart t)
+      then val (reverse acc)
+      else do
+        x <- p
+        manyGo p (Cons x acc)
+
+many :: {a :: Type} -> P a -> P (List a)
+many p = manyGo p Nil
+
+many1 :: {a :: Type} -> P a -> P (List a)
+many1 p = do
+  x <- p
+  xs <- many p
+  val (Cons x xs)
+
+data Sep a = MkSep (List a) (List T)
+
+sepGo :: {a :: Type} -> String -> P a -> List a -> List T -> P (Sep a)
+sepGo sep p items seps = do
+  t <- peek
+  if isText t sep
+      then do
+        s <- next
+        y <- p
+        sepGo sep p (Cons y items) (Cons s seps)
+      else val (MkSep (reverse items) (reverse seps))
+
+sepBy1 :: {a :: Type} -> String -> P a -> P (Sep a)
+sepBy1 sep p = do
+  x <- p
+  sepGo sep p (Cons x Nil) Nil
+
+expectSym :: String -> P T
+expectSym x = do
+  t <- peek
+  if isKind t "sym" && isText t x then next else failAt t
+
+expectPunct :: String -> P T
+expectPunct x = do
+  t <- peek
+  if isKind t "punct" && isText t x then next else failAt t
+
+expectKw :: String -> P T
+expectKw x = do
+  t <- peek
+  if isKind t "kw" && isText t x then next else failAt t
+
+expectKind :: String -> P T
+expectKind k = do
+  t <- peek
+  if isKind t k then next else failAt t
+
+nextN :: Int -> P (List T)
+nextN n =
+  if n <= 0
+    then val Nil
+    else do
+      t <- next
+      ts <- nextN (n - 1)
+      val (Cons t ts)
+
+-- The concrete syntax
+--------------------------------------------------------------------------------
+
+data Pat
+  = PCon T (List Pat)
+  | PAtom T
+  | PParen T Pat T
+  | PList T (List Pat) (List T) T
+
+data Bnd = BVar T | BImp T T T
+
+data E
+  = Atom T
+  | EParen T E T
+  | Named T T T E T
+  | Tup T (List E) (List T) T
+  | Braces T (List E) (List T) T
+  | EFSet T T E
+  | Sum T T (List E) (List T) T
+  | ECon T (List E)
+  | EField E T
+  | App E (List E)
+  | Op E T E
+  | Ops E (List E)
+  | OpRhs T E
+  | Ann E T E
+  | Lam T (List Bnd) T E
+  | Case T E T (List E)
+  | EAlt Pat T E
+  | If T E T E T E
+  | Do T (List E)
+  | ESBind T T E
+
+data CE = MkCE T E
+
+data CP = MkCP T Pat
+
+data TF = MkTF T T E
+
+data DAlts = MkDAlts T (List E) (List T)
+
+data D
+  = DImport T
+  | DFixity T (List T)
+  | DSig (List T) T E
+  | DEqn (List T) (List Pat) T E
+  | DData T T (List E) (Maybe (Pair T E)) (Maybe DAlts)
+  | DType T T (List E) T E
+  | DTheory T T (List E) T (List TF)
+  | DForeign T T T T E
+  | DTest T T
+  | DWatch T E
+
+ceE :: CE -> E
+ceE (MkCE c e) = e
+
+ceT :: CE -> T
+ceT (MkCE c e) = c
+
+cpP :: CP -> Pat
+cpP (MkCP c p) = p
+
+cpT :: CP -> T
+cpT (MkCP c p) = c
+
+-- The first and the last token of a piece, for the comments' sake
+
+firstP :: Pat -> T
+firstP (PCon t args) = t
+firstP (PAtom t) = t
+firstP (PParen o p c) = o
+firstP (PList o ps commas c) = o
+
+firstE :: E -> T
+firstE (Atom t) = t
+firstE (EParen o e c) = o
+firstE (Named o x k e c) = o
+firstE (Tup o es commas c) = o
+firstE (Braces o fs commas c) = o
+firstE (EFSet x eq e) = x
+firstE (Sum kw o alts bars c) = kw
+firstE (ECon c args) = c
+firstE (EField e f) = firstE e
+firstE (App h args) = firstE h
+firstE (Op a op b) = firstE a
+firstE (Ops a rest) = firstE a
+firstE (OpRhs op e) = op
+firstE (Ann e cc ty) = firstE e
+firstE (Lam bs binders arrow body) = bs
+firstE (Case kw scrut of2 alts) = kw
+firstE (EAlt p arrow body) = firstP p
+firstE (If kw c th a el b) = kw
+firstE (Do kw stmts) = kw
+firstE (ESBind x arrow e) = x
+
+lastE :: E -> T
+lastE (Atom t) = t
+lastE (EParen o e c) = c
+lastE (Named o x k e c) = c
+lastE (Tup o es commas c) = c
+lastE (Braces o fs commas c) = c
+lastE (EFSet x eq e) = lastE e
+lastE (Sum kw o alts bars c) = c
+lastE (ECon c args) =
+  (case last args of
+   Just e -> lastE e
+   Nothing -> c)
+lastE (EField e f) = f
+lastE (App h args) =
+  (case last args of
+   Just e -> lastE e
+   Nothing -> lastE h)
+lastE (Op a op b) = lastE b
+lastE (Ops a rest) =
+  (case last rest of
+   Just e -> lastE e
+   Nothing -> lastE a)
+lastE (OpRhs op e) = lastE e
+lastE (Ann e cc ty) = lastE ty
+lastE (Lam bs binders arrow body) = lastE body
+lastE (Case kw scrut of2 alts) =
+  (case last alts of
+   Just e -> lastE e
+   Nothing -> of2)
+lastE (EAlt p arrow body) = lastE body
+lastE (If kw c th a el b) = lastE b
+lastE (Do kw stmts) =
+  (case last stmts of
+   Just e -> lastE e
+   Nothing -> kw)
+lastE (ESBind x arrow e) = lastE e
+
+-- (`lastE` of the element, if there is one; the fallback otherwise)
+lastEOr :: T -> Maybe E -> T
+lastEOr t Nothing = t
+lastEOr t (Just e) = lastE e
+
+nmFirst :: List T -> T
+nmFirst n = fromMaybe eofT (head n)
+
+firstD :: D -> T
+firstD (DImport t) = t
+firstD (DFixity kw ts) = kw
+firstD (DSig n cc ty) = nmFirst n
+firstD (DEqn n pats eq rhs) = nmFirst n
+firstD (DData kw name params universe alts) = kw
+firstD (DType kw name params eq body) = kw
+firstD (DTheory kw name params w fields) = kw
+firstD (DForeign kw imp x cc ty) = kw
+firstD (DTest kw x) = kw
+firstD (DWatch w e) = w
+
+tfLast :: TF -> T
+tfLast (MkTF x cc ty) = lastE ty
+
+dataLastPlain :: T -> List E -> Maybe (Pair T E) -> T
+dataLastPlain name params (Just (MkPair cc u)) = lastE u
+dataLastPlain name params Nothing = lastEOr name (last params)
+
+dataLast :: T -> List E -> Maybe (Pair T E) -> Maybe DAlts -> T
+dataLast name params universe (Just (MkDAlts eq alts bars)) =
+  lastEOr (dataLastPlain name params universe) (last alts)
+dataLast name params universe Nothing = dataLastPlain name params universe
+
+lastTF :: T -> Maybe TF -> T
+lastTF t Nothing = t
+lastTF t (Just f) = tfLast f
+
+lastD :: D -> T
+lastD (DImport t) = t
+lastD (DFixity kw ts) = fromMaybe kw (last ts)
+lastD (DSig n cc ty) = lastE ty
+lastD (DEqn n pats eq rhs) = lastE rhs
+lastD (DData kw name params universe alts) = dataLast name params universe alts
+lastD (DType kw name params eq body) = lastE body
+lastD (DTheory kw name params w fields) = lastTF w (last fields)
+lastD (DForeign kw imp x cc ty) = lastE ty
+lastD (DTest kw x) = x
+lastD (DWatch w e) = lastE e
+
+-- The grammar
+--------------------------------------------------------------------------------
+
+-- (`->`, `~` and `*` are built in and bind right; 1 is loosest)
+opPrec :: String -> Int
+opPrec "->" = 1
+opPrec "~" = 2
+opPrec "*" = 3
+opPrec s = -1
+
+theory Gram where
+  expr :: P E
+  opExpr :: Int -> P E
+  opLoop :: Int -> E -> P E
+  arrowRhs :: P E
+  userOps :: P E
+  operands :: P (List E)
+  app :: P E
+  atom :: P E
+  fieldsOf :: E -> P E
+  parens :: P E
+  braces :: P E
+  lambda :: P E
+  caseExpr :: P E
+  ifExpr :: P E
+  doExpr :: P E
+  stmt :: P E
+  alt :: P E
+  commaSepE :: P (List CE)
+  pattern :: P Pat
+  morePats :: P (List CP)
+  patAtom :: P Pat
+  con :: P E
+
+-- (a projection on a `do`-bound variable trips the elaborator, so these
+-- helpers read the token's fields through an annotated binder)
+opPrecT :: T -> Int
+opPrecT t = opPrec t.text
+
+isPatAtomT :: T -> Bool
+isPatAtomT t = elemBy strEq t.kind ["var", "con", "tag", "int", "float", "str"]
+
+-- (the end of a declaration: eof, or a token first on its line at column 0)
+atDeclEnd :: T -> Bool
+atDeclEnd t = isKind t "eof" || (t.first && t.col == 0)
+
+mkSum :: T -> T -> Sep E -> T -> E
+mkSum kw o (MkSep items seps) c = Sum kw o items seps c
+
+mkBraces :: T -> Sep E -> T -> E
+mkBraces o (MkSep items seps) c = Braces o items seps c
+
+-- (a binder is a name, capitalised or not, or `{x}`)
+binderP :: P Bnd
+binderP = do
+  t <- peek
+  if isKind t "var" || isKind t "con"
+      then do
+        x <- next
+        val (BVar x)
+      else if isKind t "punct" && isText t "{"
+      then do
+        o <- next
+        x <- peek
+        if not (isKind x "var" || isKind x "con")
+            then failAt x
+            else do
+              x2 <- next
+              c <- expectPunct "}"
+              val (BImp o x2 c)
+      else failAt t
+
+-- The grammar's functions call one another, so they are the fields of one
+-- record, and each calls the others as `gram.f`.
+gram :: Gram
+gram =
+  { expr = do
+      t <- peek
+      e <-
+        (if isText t "\\" && isKind t "sym"
+           then gram.lambda
+           else if isKw t "case"
+           then gram.caseExpr
+           else if isKw t "if"
+           then gram.ifExpr
+           else if isKw t "do"
+           then gram.doExpr
+           else gram.opExpr 0)
+      t2 <- peek
+      b <- atBoundary
+      if isText t2 "::" && isKind t2 "sym" && not b
+          then do
+            cc <- next
+            ty <- gram.expr
+            val (Ann e cc ty)
+          else val e
+  , opExpr = \minPrec -> do
+      lhs <- gram.userOps
+      gram.opLoop minPrec lhs
+  , opLoop = \minPrec lhs -> do
+      t <- peek
+      b <- atBoundary
+      if isKind t "sym" && opPrecT t >= 1 && opPrecT t >= minPrec && not b
+          then do
+            op <- next
+            rhs <-
+              (if opPrecT op == 1
+                 then gram.arrowRhs
+                 else gram.opExpr (opPrecT op))
+            gram.opLoop minPrec (Op lhs op rhs)
+          else val lhs
+  , arrowRhs = do
+      t <- peek
+      if isText t "\\" || isKw t "case" || isKw t "if" || isKw t "do"
+          then gram.expr
+          else gram.opExpr 1
+  -- (a field whose first step already reads the record must go under a
+  -- lambda: `rec` is the definition itself dynamically, and the record is
+  -- still being built)
+  , userOps = \st ->
+        (do
+         e0 <- gram.app
+         rest <- gram.operands
+         val (if null rest then e0 else Ops e0 rest))
+          st
+  , operands = do
+      t <- peek
+      b <- atBoundary
+      if isOperatorT t && not b
+          then do
+            op <- next
+            u <- peek
+            if isText u "\\" || isKw u "case" || isKw u "if" || isKw u "do"
+                then do
+                  e <- gram.expr
+                  val (Cons (OpRhs op e) Nil)
+                else do
+                  e <- gram.app
+                  more <- gram.operands
+                  val (Cons (OpRhs op e) more)
+          else val Nil
+  , app = \st ->
+        (do
+         h <- gram.atom
+         args <- many gram.atom
+         val (if null args then h else App h args))
+          st
+  , atom = do
+      t <- peek
+      b <- atBoundary
+      if b || not (startsAtomT t)
+          then failAt t
+          else do
+            base <-
+              (if isKw t "data"
+                 then do
+                   kw <- next
+                   o <- expectPunct "{"
+                   inBrackets (do
+                     r <- sepBy1 "|" gram.con
+                     c <- expectPunct "}"
+                     val (mkSum kw o r c))
+                 else if isKind t "punct" && isText t "("
+                 then gram.parens
+                 else if isKind t "punct" && isText t "{"
+                 then gram.braces
+                 else if isKind t "punct" && isText t "["
+                 then do
+                   o <- next
+                   inBrackets (do
+                     t2 <- peek
+                     if isText t2 "]"
+                         then do
+                           c <- next
+                           val (Tup o Nil Nil c)
+                         else do
+                           e <- gram.expr
+                           rest <- gram.commaSepE
+                           c <- expectPunct "]"
+                           val (Tup o (Cons e (map ceE rest)) (map ceT rest) c))
+                 else do
+                   a <- next
+                   val (Atom a))
+            gram.fieldsOf base
+  , fieldsOf = \e -> do
+      t <- peek
+      if isKind t "field"
+          then do
+            f <- next
+            gram.fieldsOf (EField e f)
+          else val e
+  , parens = do
+      o <- next
+      inBrackets (do
+        t <- peek
+        t2 <- peekAt 1
+        if isOperatorT t && isText t2 ")"
+            then do
+              op <- next
+              c <- next
+              val (EParen o (Atom op) c)
+            else if (isKind t "var" || isKind t "con") && isText t2 ":="
+            then do
+              x <- next
+              k <- next
+              e <- gram.expr
+              c <- expectPunct ")"
+              val (Named o x k e c)
+            else do
+              e <- gram.expr
+              t3 <- peek
+              if isText t3 ","
+                  then do
+                    rest <- gram.commaSepE
+                    c <- expectPunct ")"
+                    val (Tup o (Cons e (map ceE rest)) (map ceT rest) c)
+                  else do
+                    c <- expectPunct ")"
+                    val (EParen o e c))
+  , braces = do
+      o <- next
+      inBrackets (do
+        t <- peek
+        t2 <- peekAt 1
+        if isText t "}"
+            then do
+              c <- next
+              val (Braces o Nil Nil c)
+            else do
+              r <-
+                (if isText t2 "="
+                   then sepBy1 "," (do
+                     x <- next
+                     eq <- expectSym "="
+                     e <- gram.expr
+                     val (EFSet x eq e))
+                   else sepBy1 "," gram.expr)
+              c <- expectPunct "}"
+              val (mkBraces o r c))
+  , lambda = do
+      bs <- next
+      binders <- many1 binderP
+      arrow <- expectSym "->"
+      body <- gram.expr
+      val (Lam bs binders arrow body)
+  , caseExpr = do
+      kw <- next
+      scrut <- gram.expr
+      of2 <- expectKw "of"
+      alts <- block gram.alt
+      val (Case kw scrut of2 alts)
+  , ifExpr = do
+      kw <- next
+      c <- gram.expr
+      th <- expectKw "then"
+      a <- gram.expr
+      el <- expectKw "else"
+      b <- gram.expr
+      val (If kw c th a el b)
+  , doExpr = do
+      kw <- next
+      stmts <- block gram.stmt
+      val (Do kw stmts)
+  , stmt = do
+      t <- peek
+      t2 <- peekAt 1
+      if isKind t "var" && isText t2 "<-"
+          then do
+            x <- next
+            arrow <- next
+            e <- gram.expr
+            val (ESBind x arrow e)
+          else gram.expr
+  , alt = \st ->
+        (do
+         p <- gram.pattern
+         arrow <- expectSym "->"
+         body <- gram.expr
+         val (EAlt p arrow body))
+          st
+  , commaSepE = do
+      t <- peek
+      if isText t ","
+          then do
+            comma <- next
+            e <- gram.expr
+            rest <- gram.commaSepE
+            val (Cons (MkCE comma e) rest)
+          else val Nil
+  , pattern = do
+      t <- peek
+      if isKind t "con" || isKind t "tag"
+          then do
+            c <- next
+            args <- many gram.patAtom
+            val (PCon c args)
+          else gram.patAtom
+  , morePats = do
+      t <- peek
+      if isText t ","
+          then do
+            comma <- next
+            p <- gram.pattern
+            rest <- gram.morePats
+            val (Cons (MkCP comma p) rest)
+          else val Nil
+  , patAtom = do
+      t <- peek
+      b <- atBoundary
+      if b
+          then failAt t
+          else if isKind t "punct" && isText t "("
+          then do
+            o <- next
+            inBrackets (do
+              p <- gram.pattern
+              c <- expectPunct ")"
+              val (PParen o p c))
+          else if isKind t "punct" && isText t "["
+          then do
+            o <- next
+            inBrackets (do
+              t2 <- peek
+              if isText t2 "]"
+                  then do
+                    c <- next
+                    val (PList o Nil Nil c)
+                  else do
+                    p <- gram.pattern
+                    rest <- gram.morePats
+                    c <- expectPunct "]"
+                    val (PList o (Cons p (map cpP rest)) (map cpT rest) c))
+          else if isPatAtomT t
+          then do
+            x <- next
+            val (PAtom x)
+          else failAt t
+  , con = do
+      c <- next
+      args <- many gram.atom
+      val (ECon c args)
+  }
+
+-- The declarations
+--------------------------------------------------------------------------------
+
+theoryFieldP :: P TF
+theoryFieldP = do
+  x <- next
+  cc <- expectSym "::"
+  ty <- gram.expr
+  val (MkTF x cc ty)
+
+fixityRest :: List T -> P (List T)
+fixityRest acc = do
+  u <- peek
+  if atDeclEnd u
+      then val (reverse acc)
+      else do
+        v <- next
+        fixityRest (Cons v acc)
+
+mkDAlts :: T -> Sep E -> DAlts
+mkDAlts eq (MkSep items seps) = MkDAlts eq items seps
+
+dataDeclP :: P D
+dataDeclP = do
+  kw <- next
+  name <- expectKind "con"
+  params <- many gram.atom
+  t0 <- peek
+  universe <-
+    (if isText t0 "::" && isKind t0 "sym"
+       then do
+         cc <- next
+         u <- gram.app
+         val (Just (MkPair cc u))
+       else val Nothing)
+  t <- peek
+  alts <-
+    (if isText t "="
+       then do
+         eq <- next
+         r <- sepBy1 "|" gram.con
+         val (Just (mkDAlts eq r))
+       else val Nothing)
+  val (DData kw name params universe alts)
+
+declNameP :: T -> P D
+declNameP t = do
+  t2 <- peekAt 1
+  t3 <- peekAt 2
+  len <-
+    (if isKind t "var" || isKind t "con"
+       then val 1
+       else if isText t "(" && isOperatorT t2 && isText t3 ")"
+       then val 3
+       else failAt t)
+  name <- nextN len
+  u <- peek
+  if isText u "::"
+      then do
+        cc <- next
+        ty <- gram.expr
+        val (DSig name cc ty)
+      else do
+        pats <- many gram.patAtom
+        eq <- expectSym "="
+        rhs <- gram.expr
+        val (DEqn name pats eq rhs)
+
+declAt :: T -> P D
+declAt t =
+  if isKind t "import"
+    then do
+      i2 <- next
+      val (DImport i2)
+    else if isKw t "data"
+    then dataDeclP
+    else if isKw t "type"
+    then do
+      kw <- next
+      name <- expectKind "con"
+      params <- many gram.atom
+      eq <- expectSym "="
+      body <- gram.expr
+      val (DType kw name params eq body)
+    else if isKw t "theory"
+    then do
+      kw <- next
+      name <- expectKind "con"
+      params <- many gram.atom
+      w <- expectKw "where"
+      fields <- block theoryFieldP
+      val (DTheory kw name params w fields)
+    else if isKw t "foreign"
+    then do
+      kw <- next
+      imp <- expectKw "import"
+      x <- expectKind "var"
+      cc <- expectSym "::"
+      ty <- gram.expr
+      val (DForeign kw imp x cc ty)
+    else if isKw t "test"
+    then do
+      kw <- next
+      x <- expectKind "var"
+      val (DTest kw x)
+    else if isKind t "watch"
+    then do
+      w <- next
+      e <- gram.expr
+      val (DWatch w e)
+    else if isKw t "infixl" || isKw t "infixr" || isKw t "infix"
+    then do
+      kw <- next
+      ts <- fixityRest Nil
+      val (DFixity kw ts)
+    else declNameP t
+
+declP :: P D
+declP = do
+  t <- peek
+  declAt t
+
+declLoop :: List D -> P (List D)
+declLoop acc = do
+  t <- peek
+  if isKind t "eof"
+      then val (reverse acc)
+      else do
+        resetDecl
+        d <- declP
+        t2 <- peek
+        if atDeclEnd t2 then declLoop (Cons d acc) else failAt t2
+
+program :: P (List D)
+program = declLoop Nil
+
+stripRes :: {a :: Type} -> Either String (Res a) -> Either String a
+stripRes (Left e) = Left e
+stripRes (Right (MkRes st x)) = Right x
+
+runP :: {a :: Type} -> P a -> St -> Either String a
+runP p st = stripRes (p st)
+
+-- | The declarations of the tokens (`Tk.attach`'s, imports merged in).
+parseToks :: Array T -> Either String (List D)
+parseToks ts = runP program (mkSt ts 0 (Cons 0 Nil) 0)
+
+parseAttached :: Tk.Attached -> Either String (List D)
+parseAttached at = parseToks at.toks
+
+parseLexed :: String -> I.Header -> L.Lexed -> Either String (List D)
+parseLexed src hdr l =
+  parseAttached (Tk.attach src (I.withImports hdr.imports l.tokens) l.comments)
+
+parseHeader :: String -> I.Header -> Either String (List D)
+parseHeader src hdr = parseLexed src hdr (L.lex hdr.text)
+
+-- | A file's declarations: its imports read off, the rest lexed and read.
+parseFile :: String -> Either String (List D)
+parseFile src = parseHeader src (I.readImports src)
+
+-- Every token, in order: reading loses none
+--------------------------------------------------------------------------------
+
+interleaveT :: List (List T) -> List T -> List T
+interleaveT Nil seps = Nil
+interleaveT (Cons e es) Nil = concatList e (interleaveT es Nil)
+interleaveT (Cons e es) (Cons s ss) =
+  if null es then e else concatList e (Cons s (interleaveT es ss))
+
+tsP :: Pat -> List T
+tsP (PCon t args) = Cons t (concatMap tsP args)
+tsP (PAtom t) = Cons t Nil
+tsP (PParen o p c) = Cons o (concatList (tsP p) (Cons c Nil))
+tsP (PList o ps commas c) =
+  Cons o (concatList (interleaveT (map tsP ps) commas) (Cons c Nil))
+
+tsB :: Bnd -> List T
+tsB (BVar t) = Cons t Nil
+tsB (BImp o x c) = Cons o (Cons x (Cons c Nil))
+
+tsE :: E -> List T
+tsE (Atom t) = Cons t Nil
+tsE (EParen o e c) = Cons o (concatList (tsE e) (Cons c Nil))
+tsE (Named o x k e c) =
+  Cons o (Cons x (Cons k (concatList (tsE e) (Cons c Nil))))
+tsE (Tup o es commas c) =
+  Cons o (concatList (interleaveT (map tsE es) commas) (Cons c Nil))
+tsE (Braces o fs commas c) =
+  Cons o (concatList (interleaveT (map tsE fs) commas) (Cons c Nil))
+tsE (EFSet x eq e) = Cons x (Cons eq (tsE e))
+tsE (Sum kw o alts bars c) =
+  Cons kw (Cons o (concatList (interleaveT (map tsE alts) bars) (Cons c Nil)))
+tsE (ECon c args) = Cons c (concatMap tsE args)
+tsE (EField e f) = concatList (tsE e) (Cons f Nil)
+tsE (App h args) = concatList (tsE h) (concatMap tsE args)
+tsE (Op a op b) = concatList (tsE a) (Cons op (tsE b))
+tsE (Ops a rest) = concatList (tsE a) (concatMap tsE rest)
+tsE (OpRhs op e) = Cons op (tsE e)
+tsE (Ann e cc ty) = concatList (tsE e) (Cons cc (tsE ty))
+tsE (Lam bs binders arrow body) =
+  Cons bs (concatList (concatMap tsB binders) (Cons arrow (tsE body)))
+tsE (Case kw scrut of2 alts) =
+  Cons kw (concatList (tsE scrut) (Cons of2 (concatMap tsE alts)))
+tsE (EAlt p arrow body) = concatList (tsP p) (Cons arrow (tsE body))
+tsE (If kw c th a el b) =
+  Cons kw (concatList (tsE c) (Cons th (concatList (tsE a) (Cons el (tsE b)))))
+tsE (Do kw stmts) = Cons kw (concatMap tsE stmts)
+tsE (ESBind x arrow e) = Cons x (Cons arrow (tsE e))
+
+tsTF :: TF -> List T
+tsTF (MkTF x cc ty) = Cons x (Cons cc (tsE ty))
+
+tsUniverse :: Maybe (Pair T E) -> List T
+tsUniverse Nothing = Nil
+tsUniverse (Just (MkPair cc u)) = Cons cc (tsE u)
+
+tsDAlts :: Maybe DAlts -> List T
+tsDAlts Nothing = Nil
+tsDAlts (Just (MkDAlts eq alts bars)) =
+  Cons eq (interleaveT (map tsE alts) bars)
+
+tsD :: D -> List T
+tsD (DImport t) = Cons t Nil
+tsD (DFixity kw ts) = Cons kw ts
+tsD (DSig n cc ty) = concatList n (Cons cc (tsE ty))
+tsD (DEqn n pats eq rhs) =
+  concatList n (concatList (concatMap tsP pats) (Cons eq (tsE rhs)))
+tsD (DData kw name params universe alts) =
+  Cons
+    kw
+    (Cons
+       name
+       (concatList
+          (concatMap tsE params)
+          (concatList (tsUniverse universe) (tsDAlts alts))))
+tsD (DType kw name params eq body) =
+  Cons kw (Cons name (concatList (concatMap tsE params) (Cons eq (tsE body))))
+tsD (DTheory kw name params w fields) =
+  Cons
+    kw
+    (Cons
+       name
+       (concatList (concatMap tsE params) (Cons w (concatMap tsTF fields))))
+tsD (DForeign kw imp x cc ty) = Cons kw (Cons imp (Cons x (Cons cc (tsE ty))))
+tsD (DTest kw x) = Cons kw (Cons x Nil)
+tsD (DWatch w e) = Cons w (tsE e)
+
+tokIx :: T -> Int
+tokIx t = t.ix
+
+listEqInt :: List Int -> List Int -> Bool
+listEqInt Nil Nil = True
+listEqInt (Cons x xs) (Cons y ys) = if x == y then listEqInt xs ys else False
+listEqInt a b = False
+
+notEof :: T -> Bool
+notEof t = not (strEq t.kind "eof")
+
+-- | "ok" when reading the file keeps every token, in order; the parse
+-- | error, or "differ", otherwise.
+roundtripD :: Array T -> List D -> String
+roundtripD ts ds =
+  if listEqInt
+    (map tokIx (concatMap tsD ds))
+    (map tokIx (filter notEof (A.toList ts)))
+    then "ok"
+    else "differ"
+
+roundtripAttached :: Tk.Attached -> String
+roundtripAttached at = case parseToks at.toks of
+  Left e -> e
+  Right ds -> roundtripD at.toks ds
+
+roundtripLexed :: String -> I.Header -> L.Lexed -> String
+roundtripLexed src hdr l =
+  roundtripAttached
+    (Tk.attach src (I.withImports hdr.imports l.tokens) l.comments)
+
+roundtripHeader :: String -> I.Header -> String
+roundtripHeader src hdr = roundtripLexed src hdr (L.lex hdr.text)
+
+roundtrip :: String -> String
+roundtrip src = roundtripHeader src (I.readImports src)
+
+-- (how many declarations, and each one's kind, for the doctests)
+dKind :: D -> String
+dKind (DImport t) = "import"
+dKind (DFixity kw ts) = "fixity"
+dKind (DSig n cc ty) = "sig"
+dKind (DEqn n pats eq rhs) = "eqn"
+dKind (DData kw name params universe alts) = "data"
+dKind (DType kw name params eq body) = "type"
+dKind (DTheory kw name params w fields) = "theory"
+dKind (DForeign kw imp x cc ty) = "foreign"
+dKind (DTest kw x) = "test"
+dKind (DWatch w e) = "watch"
+
+dKinds :: String -> String
+dKinds src = case parseFile src of
+  Left e -> e
+  Right ds -> joinWith " " (map dKind ds)
+
+test reading
+
+-- >>> dKinds "import a\n\nf :: Int -> Int\nf x = x + 1"
+-- "import sig eqn"
+
+-- >>> dKinds "data List a = Nil | Cons a (List a)"
+-- "data"
+
+-- >>> dKinds "theory M where\n  t :: Type\n  m :: t -> t -> t"
+-- "theory"
+
+-- >>> dKinds "infixl + - above ==\n\nforeign import intAdd :: Int -> Int -> Int"
+-- "fixity foreign"
+
+-- >>> dKinds "f = case x of\n  Nil -> 0\n  Cons y ys -> 1 + f ys"
+-- "eqn"
+
+-- >>> dKinds "g = do\n  x <- f 1\n  pure (\\y -> { a = 1, b = [1, 2] })"
+-- "eqn"
+
+-- >>> dKinds "-- >>> map f [1]\n-- [2]"
+-- "watch"
+
+-- >>> dKinds "f = ("
+-- "the file does not parse (at ``, offset 5)"
+
+-- >>> roundtrip "import a\n\nf :: {a :: Type} -> a -> Int\nf x = if p x then 1 else g (x := 2) r.y\n\ndata T = A | B Int\n\n-- >>> f 'tag\n-- 1"
+-- "ok"
+
+-- >>> roundtrip "f = \\x {y} -> case h x of\n  P (Q r) [a, b] -> do\n    u <- k 1.5 \"s\"\n    m { f = 1, g = 2 } {- c -} (data { X | Y Int })\n  'tag -> (a + b * c, [x, 2, -3])"
+-- "ok"
