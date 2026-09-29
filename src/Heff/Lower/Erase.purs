@@ -19,7 +19,7 @@ import Control.Monad.State (StateT, get, put, runStateT)
 import Control.Monad.Trans.Class (lift)
 import Data.Array as A
 import Data.Either (Either(..))
-import Data.Lazy (defer, force)
+import Data.Lazy (Lazy, defer, force)
 import Data.List (List(..), (:))
 import Data.List as L
 import Data.Maybe (Maybe(..))
@@ -31,7 +31,7 @@ import Heff.Core.Params (Case(..), Variants(..))
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
 import Heff.Lower.IR (Def, Expr(..), Supply, fresh)
-import Heff.Support.Common (Name, dictToList)
+import Heff.Support.Common (Dict, Name, dictToList)
 import Heff.Elab.Environment (tryPure)
 
 type M a = StateT Supply (Either String) a
@@ -43,6 +43,15 @@ type Ctx = { locals :: List Local, env :: V.Locals, len :: Int, globals :: Globa
 
 failWith :: forall a. String -> M a
 failWith = lift <<< Left
+
+-- | the computation, or `Nothing` if it fails (the supply advances only
+-- | when it succeeds)
+try :: forall a. M a -> M (Maybe a)
+try m = do
+  n <- get
+  case runStateT m n of
+    Left _ -> pure Nothing
+    Right (Tuple a n') -> put n' *> pure (Just a)
 
 freshName :: String -> M String
 freshName x = do
@@ -114,6 +123,47 @@ chkD c t ty v = case t of
     pure (Record fields)
   _ -> chk c t ty
 
+matchVariants :: V.Ty -> M (Dict (Array (Lazy V.Ty)))
+matchVariants sty = case V.behavior sty of
+  V.LikeSum (Variants vs) -> pure vs
+  _ -> failWith "matching on something that is not of a sum type"
+
+-- (an alternative's context: its pattern's variables bound, the type
+-- arguments erased)
+armBind :: Ctx -> Dict (Array (Lazy V.Ty)) -> Name -> Array Name -> M { c :: Ctx, vars :: Array String }
+armBind c vs tag xs =
+  A.foldM
+    ( \acc (Tuple x aty) ->
+        if isType acc.c.len aty then pure acc { c = extend acc.c Nothing aty }
+        else do
+          v <- freshName x
+          pure { c: extend acc.c (Just (Var v)) aty, vars: A.snoc acc.vars v }
+    )
+    { c, vars: [] }
+    (A.zip xs argTys)
+  where
+  argTys = case A.find (\(Tuple k _) -> k == tag) (dictToList vs) of
+    Just (Tuple _ ts) -> map force ts
+    Nothing -> []
+
+arm :: Ctx -> Dict (Array (Lazy V.Ty)) -> V.Ty -> Tuple Name (Tuple (Array Name) S.El) -> M { tag :: Name, vars :: Array String, body :: Expr }
+arm c vs ty (Tuple tag (Tuple xs body)) = do
+  r <- armBind c vs tag xs
+  b <- chk r.c body ty
+  pure { tag, vars: r.vars, body: b }
+
+-- (the type of a match nothing expects: the first alternative's that can
+-- say it -- `a && b` desugars to such a match)
+armsTy :: Ctx -> Dict (Array (Lazy V.Ty)) -> Array (Tuple Name (Tuple (Array Name) S.El)) -> M V.Ty
+armsTy c vs alts = case A.uncons alts of
+  Nothing -> failWith "this needs an expected type"
+  Just { head: Tuple tag (Tuple xs body), tail } -> do
+    r <- armBind c vs tag xs
+    m <- try (syn r.c body)
+    case m of
+      Just (Tuple _ ty) -> pure ty
+      Nothing -> armsTy c vs tail
+
 syn :: Ctx -> S.El -> M (Tuple Expr V.Ty)
 syn c = case _ of
   S.Local i -> case L.index c.locals i of
@@ -148,6 +198,14 @@ syn c = case _ of
   S.LitInt i -> pure (Tuple (Int i) V.PrimInt)
   S.LitFloat x -> pure (Tuple (Float x) V.PrimFloat)
   S.LitString s -> pure (Tuple (Str s) V.PrimString)
+  -- a match where a value is expected and no type given (`a && b`
+  -- desugars to one): its type is the first alternative's that says it
+  S.Match scrut cases -> do
+    Tuple s' sty <- syn c scrut
+    vs <- matchVariants sty
+    ty <- armsTy c vs (dictToList cases)
+    arms <- traverse (arm c vs ty) (dictToList cases)
+    pure (Tuple (Match s' arms) ty)
   _ -> failWith "this needs an expected type"
 
 chk :: Ctx -> S.El -> V.Ty -> M Expr
@@ -194,28 +252,8 @@ chk c t ty = case t of
     _ -> failWith "a record checked against a non-record type"
   S.Match scrut cases -> do
     Tuple s' sty <- syn c scrut
-    vs <- case V.behavior sty of
-      V.LikeSum (Variants vs) -> pure vs
-      _ -> failWith "matching on something that is not of a sum type"
-    arms <- traverse
-      ( \(Tuple tag (Tuple xs body)) -> do
-          let
-            argTys = case A.find (\(Tuple k _) -> k == tag) (dictToList vs) of
-              Just (Tuple _ ts) -> map force ts
-              Nothing -> []
-          r <- A.foldM
-            ( \acc (Tuple x aty) ->
-                if isType acc.c.len aty then pure acc { c = extend acc.c Nothing aty }
-                else do
-                  v <- freshName x
-                  pure { c: extend acc.c (Just (Var v)) aty, vars: A.snoc acc.vars v }
-            )
-            { c, vars: [] }
-            (A.zip xs argTys)
-          b <- chk r.c body ty
-          pure { tag, vars: r.vars, body: b }
-      )
-      (dictToList cases)
+    vs <- matchVariants sty
+    arms <- traverse (arm c vs ty) (dictToList cases)
     pure (Match s' arms)
   S.Abandon -> pure Abandon
   S.Opaque -> failWith "an opaque term"

@@ -84,6 +84,11 @@ infixr ++ above ==
 Operators of unrelated groups do not go together without parentheses:
 `a + b ++ c` is refused.
 
+`a && b` and `a || b` are `if`: the right side is computed only if it is
+needed (`False && e` is `False`, whatever `e`), and a call of itself
+there is a tail call.  `(&&)` written alone is still the prelude's
+function, for `foldl (&&) True`.
+
 Evaluation is call-by-value: arguments, and the fields of constructors and
 records, are computed before they are passed, used or not; a definition
 that is not a function is computed when first used.  `Int` is an integer

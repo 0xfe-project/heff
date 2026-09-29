@@ -524,7 +524,22 @@ resolve e0 rest = do
   fix <- gets _.fix
   lenient <- gets _.lenient
   let
-    apply op l r = Juxt (Juxt (Ident op.text (spanOf op)) l) r
+    -- `&&` and `||` are `if`: the right side is computed only if it is
+    -- needed (`False && e` is `False`, whatever `e`), and a call of
+    -- itself there is a tail call
+    apply op l r = case op.text of
+      "&&" -> shortcut op l r (NTag "False" (spanOf op))
+      "||" -> shortcut op l (NTag "True" (spanOf op)) r
+      _ -> Juxt (Juxt (Ident op.text (spanOf op)) l) r
+    -- (the sides are annotated with the `Bool` in scope: the left, so that
+    -- a constructor alone can be a scrutinee; the whole, so that it
+    -- synthesises where an application would, as an `if` condition does)
+    shortcut op c a b =
+      let
+        sp = { start: (ntnSpan c).start, end: max (ntnSpan a).end (ntnSpan b).end }
+        osp = spanOf op
+        bool n = Infix n (Keyword ":" osp) (Ident "Bool" osp)
+      in bool (NBlock "match" (Just (bool c)) [ Infix (NTag "True" osp) (Keyword "=>" osp) a, Infix (NTag "False" osp) (Keyword "=>" osp) b ] sp)
     reduce st = case A.unsnoc st.ops, A.unsnoc st.out of
       Just o, Just r | Just l <- A.unsnoc r.init -> st { ops = o.init, out = A.snoc l.init (apply o.last l.last r.last) }
       _, _ -> st
