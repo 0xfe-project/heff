@@ -1,0 +1,539 @@
+-- The lexer of the `.hf` syntax, a port of `Heff.Parse.Surface.js` -- the
+-- first piece of the formatter written in heff itself.  Every token knows
+-- its column and whether it is the first on its line: all the layout rule
+-- needs.  Comments are not tokens; they are returned apart, for the
+-- formatter.  The kinds are the reference's: var, con, tag, field, int,
+-- float, str, sym, punct, kw, watch, and one eof at the end.
+--
+-- The loop is one self-recursion: `step` reads one thing and says where to
+-- go on (a `Step`), and `lexGo` applies each step to what has been read.
+
+import prelude
+
+type Tok =
+  { kind :: String
+  , text :: String
+  , start :: Int
+  , end :: Int
+  , line :: Int
+  , col :: Int
+  , first :: Bool
+  }
+
+type Err = { start :: Int, end :: Int, msg :: String }
+
+type Cmt = { start :: Int, end :: Int, text :: String }
+
+type Lexed = { tokens :: List Tok, errors :: List Err, comments :: List Cmt }
+
+-- | One thing read: where the loop is after it, the line bookkeeping, and
+-- | the token, error or comment it found, if any.
+type Step =
+  { i :: Int
+  , line :: Int
+  , lineStart :: Int
+  , first :: Bool
+  , tok :: Maybe Tok
+  , err :: Maybe Err
+  , cmt :: Maybe Cmt
+  }
+
+-- (the small results of the scanners)
+type NumEnd = { end :: Int, isFloat :: Bool }
+
+type StrEnd = { i :: Int, text :: String, closed :: Bool }
+
+type BlockEnd =
+  { i :: Int, line :: Int, lineStart :: Int, first :: Bool, closed :: Bool }
+
+keywords :: List String
+keywords =
+  ["data",
+   "type",
+   "theory",
+   "foreign",
+   "import",
+   "case",
+   "of",
+   "if",
+   "then",
+   "else",
+   "do",
+   "where",
+   "let",
+   "in",
+   "test",
+   "Type",
+   "Int",
+   "Float",
+   "String",
+   "Array",
+   "abandon",
+   "infixl",
+   "infixr",
+   "infix"]
+
+symChars :: String
+symChars = "!#$%&*+./<=>?@\\^|-~:"
+
+isLowerC :: Int -> Bool
+isLowerC c = c >= 97 && c <= 122 || c == 95
+
+isUpperC :: Int -> Bool
+isUpperC c = c >= 65 && c <= 90
+
+isLetterC :: Int -> Bool
+isLetterC c = isLowerC c || isUpperC c
+
+isDigitC :: Int -> Bool
+isDigitC c = c >= 48 && c <= 57
+
+isNameC :: Int -> Bool
+isNameC c = isLetterC c || isDigitC c || c == 39
+
+isSymC :: Int -> Bool
+isSymC c = c >= 0 && contains (fromCharCode c) symChars
+
+isPunctC :: Int -> Bool
+isPunctC c = c >= 0 && contains (fromCharCode c) "()[]{},"
+
+-- (a name goes on over letters, digits and primes, and over a `/` right
+-- before a letter: `Bwd/elemAt`)
+nameEnd :: String -> Int -> Int
+nameEnd s j =
+  if isNameC (charCode s j)
+    then nameEnd s (j + 1)
+    else if charCode s j == 47 && isLetterC (charCode s (j + 1))
+    then nameEnd s (j + 2)
+    else j
+
+-- (a field's name: letters, digits and primes only)
+plainEnd :: String -> Int -> Int
+plainEnd s j = if isNameC (charCode s j) then plainEnd s (j + 1) else j
+
+-- (a tag may have `-` inside: `'cons-case`)
+tagEnd :: String -> Int -> Int
+tagEnd s j =
+  if isNameC (charCode s j) || charCode s j == 45 then tagEnd s (j + 1) else j
+
+digitsEnd :: String -> Int -> Int
+digitsEnd s j = if isDigitC (charCode s j) then digitsEnd s (j + 1) else j
+
+dashesEnd :: String -> Int -> Int
+dashesEnd s j = if charCode s j == 45 then dashesEnd s (j + 1) else j
+
+eolEnd :: String -> Int -> Int
+eolEnd s j =
+  if j < strLength s && not (charCode s j == 10) then eolEnd s (j + 1) else j
+
+-- (a run of symbol characters, stopped before `--`: `-->` is one operator,
+-- `a --b` is an operand and a comment)
+symEnd :: String -> Int -> Int
+symEnd s j =
+  if isSymC (charCode s j)
+  && not (charCode s j == 45 && charCode s (j + 1) == 45)
+    then symEnd s (j + 1)
+    else j
+
+-- (the exponent, if one is at `b`, after a dot: `6.02e23`, `1.5e-3`)
+numExp :: String -> Int -> NumEnd
+numExp s b =
+  if (charCode s b == 101 || charCode s b == 69)
+  && (isDigitC (charCode s (b + 1))
+      || (charCode s (b + 1) == 43 || charCode s (b + 1) == 45)
+      && isDigitC (charCode s (b + 2)))
+    then { end = digitsEnd s (b + 2), isFloat = True }
+    else { end = b, isFloat = True }
+
+numFrac :: String -> Int -> NumEnd
+numFrac s a =
+  if charCode s a == 46 && isDigitC (charCode s (a + 1))
+    then numExp s (digitsEnd s (a + 2))
+    else { end = a, isFloat = False }
+
+-- (from the first character of the number, a digit or a `-`)
+numScan :: String -> Int -> NumEnd
+numScan s i = numFrac s (digitsEnd s (i + 1))
+
+escChar :: String -> String
+escChar "n" = "\n"
+escChar "t" = "\t"
+escChar "r" = "\r"
+escChar e = e
+
+-- (the text of a string literal, escapes done; `i` is at the closing quote,
+-- or where the line or the file ended)
+strScan :: String -> Int -> String -> StrEnd
+strScan s j acc =
+  if j >= strLength s || charCode s j == 10
+    then { i = j, text = acc, closed = False }
+    else if charCode s j == 34
+    then { i = j, text = acc, closed = True }
+    else if charCode s j == 92 && j + 1 < strLength s
+    then strScan s (j + 2) (acc ++ escChar (strSlice s (j + 1) (j + 2)))
+    else strScan s (j + 1) (acc ++ strSlice s j (j + 1))
+
+-- (a `{- -}` comment, nested; from its `{-`, with the line bookkeeping)
+blockScan :: String -> Int -> Int -> Int -> Int -> Bool -> BlockEnd
+blockScan s j depth line lineStart first =
+  if j >= strLength s
+    then { i = j
+         , line = line
+         , lineStart = lineStart
+         , first = first
+         , closed = False
+         }
+    else if charCode s j == 123 && charCode s (j + 1) == 45
+    then blockScan s (j + 2) (depth + 1) line lineStart first
+    else if charCode s j == 45 && charCode s (j + 1) == 125
+    then (if depth == 1
+            then { i = j + 2
+                 , line = line
+                 , lineStart = lineStart
+                 , first = first
+                 , closed = True
+                 }
+            else blockScan s (j + 2) (depth - 1) line lineStart first)
+    else if charCode s j == 10
+    then blockScan s (j + 1) depth (line + 1) (j + 1) True
+    else blockScan s (j + 1) depth line lineStart first
+
+-- (`-` right after an operand is subtraction; right before a digit
+-- otherwise, a negative number)
+operandBefore :: List Tok -> Int -> Bool
+operandBefore Nil start = False
+operandBefore (Cons t _) start =
+  t.end
+  == start
+  && (elemBy strEq t.kind ["var", "con", "int", "float", "str", "field"]
+      || strEq t.kind "punct"
+      && elemBy strEq t.text [")", "]", "}"])
+
+mkTok :: String -> String -> Int -> Int -> Int -> Int -> Bool -> Tok
+mkTok kind text start end line col first =
+  { kind = kind
+  , text = text
+  , start = start
+  , end = end
+  , line = line
+  , col = col
+  , first = first
+  }
+
+-- (a step that read the one token, from `i` to `j`)
+tokStep :: Int -> Int -> Int -> Tok -> Step
+tokStep j line lineStart t =
+  { i = j
+  , line = line
+  , lineStart = lineStart
+  , first = False
+  , tok = Just t
+  , err = Nothing
+  , cmt = Nothing
+  }
+
+nameKind :: String -> Int -> String
+nameKind text c =
+  if elemBy strEq text keywords
+    then "kw"
+    else if isUpperC c
+    then "con"
+    else "var"
+
+nameStep :: String -> Int -> Int -> Int -> Bool -> Int -> Step
+nameStep src i line lineStart first j =
+  tokStep
+    j
+    line
+    lineStart
+    (mkTok
+       (nameKind (strSlice src i j) (charCode src i))
+       (strSlice src i j)
+       i
+       j
+       line
+       (i - lineStart)
+       first)
+
+tagStep :: String -> Int -> Int -> Int -> Bool -> Int -> Step
+tagStep src i line lineStart first j =
+  tokStep
+    j
+    line
+    lineStart
+    (mkTok "tag" (strSlice src (i + 1) j) i j line (i - lineStart) first)
+
+fieldStep :: String -> Int -> Int -> Int -> Bool -> Int -> Step
+fieldStep src i line lineStart first j =
+  tokStep
+    j
+    line
+    lineStart
+    (mkTok "field" (strSlice src (i + 1) j) i j line (i - lineStart) first)
+
+numStep :: String -> Int -> Int -> Int -> Bool -> NumEnd -> Step
+numStep src i line lineStart first r =
+  tokStep
+    r.end
+    line
+    lineStart
+    (mkTok
+       (if r.isFloat then "float" else "int")
+       (strSlice src i r.end)
+       i
+       r.end
+       line
+       (i - lineStart)
+       first)
+
+symStep :: String -> Int -> Int -> Int -> Bool -> Int -> Step
+symStep src i line lineStart first j =
+  tokStep
+    j
+    line
+    lineStart
+    (mkTok "sym" (strSlice src i j) i j line (i - lineStart) first)
+
+strStep :: String -> Int -> Int -> Int -> Bool -> StrEnd -> Step
+strStep src i line lineStart first r =
+  { i = if r.closed then r.i + 1 else r.i
+  , line = line
+  , lineStart = lineStart
+  , first = False
+  , tok =
+      Just
+        (mkTok
+           "str"
+           r.text
+           i
+           (if r.closed then r.i + 1 else r.i)
+           line
+           (i - lineStart)
+           first)
+  , err =
+      if r.closed
+        then Nothing
+        else Just { start = i, end = r.i, msg = "a string is never closed" }
+  , cmt = Nothing
+  }
+
+lineCmtStep :: String -> Int -> Int -> Int -> Bool -> Int -> Step
+lineCmtStep src i line lineStart first e =
+  { i = e
+  , line = line
+  , lineStart = lineStart
+  , first = first
+  , tok = Nothing
+  , err = Nothing
+  , cmt = Just { start = i, end = e, text = strSlice src i e }
+  }
+
+blockCmtStep :: String -> Int -> BlockEnd -> Step
+blockCmtStep src i r =
+  { i = r.i
+  , line = r.line
+  , lineStart = r.lineStart
+  , first = r.first
+  , tok = Nothing
+  , err =
+      if r.closed
+        then Nothing
+        else Just
+            { start = i, end = r.i, msg = "a `{-` comment is never closed" }
+  , cmt = Just { start = i, end = r.i, text = strSlice src i r.i }
+  }
+
+-- | One thing read at `i`: a token, a comment, whitespace, or an error.
+stepAt :: String -> Int -> Int -> Int -> Bool -> List Tok -> Int -> Step
+stepAt src i line lineStart first toks c =
+  if c == 10
+    then { i = i + 1
+         , line = line + 1
+         , lineStart = i + 1
+         , first = True
+         , tok = Nothing
+         , err = Nothing
+         , cmt = Nothing
+         }
+    else if c == 32 || c == 9 || c == 13
+    then { i = i + 1
+         , line = line
+         , lineStart = lineStart
+         , first = first
+         , tok = Nothing
+         , err = Nothing
+         , cmt = Nothing
+         }
+    -- a doctest line `-- >>> e` is a watch token; two dashes or more, not part
+    -- of an operator, are a comment to the end of the line
+    else if c == 45 && strEq (strSlice src i (i + 6)) "-- >>>"
+    then tokStep
+        (i + 6)
+        line
+        lineStart
+        (mkTok "watch" "-- >>>" i (i + 6) line (i - lineStart) first)
+    else if c
+    == 45
+    && dashesEnd src i
+    - i
+    >= 2
+    && not (isSymC (charCode src (dashesEnd src i)))
+    then lineCmtStep src i line lineStart first (eolEnd src i)
+    else if c == 123 && charCode src (i + 1) == 45
+    then blockCmtStep src i (blockScan src i 0 line lineStart first)
+    else if isLetterC c
+    then nameStep src i line lineStart first (nameEnd src i)
+    else if c == 39 && isLetterC (charCode src (i + 1))
+    then tagStep src i line lineStart first (tagEnd src (i + 1))
+    else if c == 46 && isLetterC (charCode src (i + 1)) && operandBefore toks i
+    then fieldStep src i line lineStart first (plainEnd src (i + 1))
+    else if isDigitC c
+    || c
+    == 45
+    && isDigitC (charCode src (i + 1))
+    && not (operandBefore toks i)
+    then numStep src i line lineStart first (numScan src i)
+    else if c == 34
+    then strStep src i line lineStart first (strScan src (i + 1) "")
+    else if isPunctC c
+    then tokStep
+        (i + 1)
+        line
+        lineStart
+        (mkTok
+           "punct"
+           (strSlice src i (i + 1))
+           i
+           (i + 1)
+           line
+           (i - lineStart)
+           first)
+    else if isSymC c
+    then symStep src i line lineStart first (symEnd src (i + 1))
+    else { i = i + 1
+         , line = line
+         , lineStart = lineStart
+         , first = first
+         , tok = Nothing
+         , err =
+             Just
+               { start = i
+               , end = i + 1
+               , msg = "unexpected character " ++ strSlice src i (i + 1)
+               }
+         , cmt = Nothing
+         }
+
+step :: String -> Int -> Int -> Int -> Bool -> List Tok -> Step
+step src i line lineStart first toks =
+  stepAt src i line lineStart first toks (charCode src i)
+
+maybeCons :: {a :: Type} -> Maybe a -> List a -> List a
+maybeCons Nothing xs = xs
+maybeCons (Just x) xs = Cons x xs
+
+-- (apply the step just taken, and take the next; each list holds what has
+-- been read, last first)
+lexGo :: String -> Step -> List Tok -> List Err -> List Cmt -> Lexed
+lexGo src st toks errs cmts =
+  if st.i >= strLength src
+    then { tokens =
+             reverse
+               (Cons
+                  (mkTok
+                     "eof"
+                     ""
+                     (strLength src)
+                     (strLength src)
+                     (st.line + 1)
+                     0
+                     True)
+                  (maybeCons st.tok toks))
+         , errors = reverse (maybeCons st.err errs)
+         , comments = reverse (maybeCons st.cmt cmts)
+         }
+    else lexGo
+        src
+        (step src st.i st.line st.lineStart st.first (maybeCons st.tok toks))
+        (maybeCons st.tok toks)
+        (maybeCons st.err errs)
+        (maybeCons st.cmt cmts)
+
+-- | The tokens of a file, and apart from them the comments.
+lex :: String -> Lexed
+lex src =
+  lexGo
+    src
+    { i = 0
+    , line = 0
+    , lineStart = 0
+    , first = True
+    , tok = Nothing
+    , err = Nothing
+    , cmt = Nothing
+    }
+    Nil
+    Nil
+    Nil
+
+-- (kind:text, for the doctests)
+showTok :: Tok -> String
+showTok t = t.kind ++ ":" ++ t.text
+
+-- (`(lex src).tokens` in one step panics the elaborator today: an
+-- ill-typed projection; through a binder it is fine)
+showLexed :: Lexed -> String
+showLexed l = joinWith " " (map showTok l.tokens)
+
+showToks :: String -> String
+showToks src = showLexed (lex src)
+
+cmtText :: Cmt -> String
+cmtText c = c.text
+
+tokCol :: Tok -> Int
+tokCol t = t.col
+
+tokFirst :: Tok -> Bool
+tokFirst t = t.first
+
+cmtTexts :: Lexed -> List String
+cmtTexts l = map cmtText l.comments
+
+tokCols :: Lexed -> List Int
+tokCols l = map tokCol l.tokens
+
+tokFirsts :: Lexed -> List Bool
+tokFirsts l = map tokFirst l.tokens
+
+test lexing
+
+-- >>> showToks "f x = x + 1"
+-- "var:f var:x sym:= var:x sym:+ int:1 eof:"
+
+-- >>> showToks "data List a = Nil | Cons a (List a)"
+-- "kw:data con:List var:a sym:= con:Nil sym:| con:Cons var:a punct:( con:List var:a punct:) eof:"
+
+-- >>> showToks "map f 'nil = r.x"
+-- "var:map var:f tag:nil sym:= var:r field:x eof:"
+
+-- >>> showToks "f -3 - 4 -. 6.02e23"
+-- "var:f int:-3 sym:- int:4 sym:-. float:6.02e23 eof:"
+
+-- >>> showToks "x' Bwd/elemAt \"a\\nb\""
+-- "var:x' con:Bwd/elemAt str:a\nb eof:"
+
+-- >>> showToks "a --> b --- c"
+-- "var:a sym:--> var:b eof:"
+
+-- >>> cmtTexts (lex "x -- hi\n{- one {- two -} -} y")
+-- Cons "-- hi" (Cons "{- one {- two -} -}" Nil)
+
+-- >>> showToks "-- >>> 1 + 2"
+-- "watch:-- >>> int:1 sym:+ int:2 eof:"
+
+-- >>> tokCols (lex "ab cd\n  ef")
+-- Cons 0 (Cons 3 (Cons 2 (Cons 0 Nil)))
+
+-- >>> tokFirsts (lex "ab cd\n  ef")
+-- Cons True (Cons False (Cons True (Cons True Nil)))
