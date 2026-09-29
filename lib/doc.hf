@@ -1,0 +1,271 @@
+-- Pretty-printing documents: Wadler's algorithm as Haskell's `prettyprinter`
+-- has it (`layoutPretty`, ribbon 1.0), a port of `Heff.Support.Pretty` -- so
+-- that what lays text out can be written in heff.  A `Doc` is built with
+-- `text`, `line`, `group`, `nest` and `align`, and `render` lays it out at a
+-- width: a `group` goes on one line if it fits, and breaks otherwise.
+-- The language is call-by-value, so the layout's laziness -- `fits` looks at
+-- the first line only -- is a `Unit -> SDoc` at each step.
+
+import prelude
+
+infixr <>
+infixr <+> above <>
+
+data Doc
+  = Fail
+  | None
+  | Text String
+  | Line
+  | FlatAlt Doc Doc
+  | Cat Doc Doc
+  | Nest Int Doc
+  | Union Doc Doc
+  | Column (Int -> Doc)
+  | Nesting (Int -> Doc)
+
+emptyDoc :: Doc
+emptyDoc = None
+
+-- | Text without newlines (`pretty` takes text with them).
+text :: String -> Doc
+text "" = None
+text s = Text s
+
+-- | A line break, kept when its group is flattened.
+hardline :: Doc
+hardline = Line
+
+-- | A line break, a space when its group is flattened.
+line :: Doc
+line = FlatAlt Line (Text " ")
+
+-- | A line break, nothing when its group is flattened.
+linebreak :: Doc
+linebreak = FlatAlt Line None
+
+-- | A space if what follows fits on the line, a line break otherwise.
+softline :: Doc
+softline = Union (Text " ") Line
+
+(<>) :: Doc -> Doc -> Doc
+(<>) None d = d
+(<>) d None = d
+(<>) a b = Cat a b
+
+(<+>) :: Doc -> Doc -> Doc
+(<+>) a b = a <> Text " " <> b
+
+-- | The document, its line breaks after `nest`'s further columns in.
+nest :: Int -> Doc -> Doc
+nest 0 d = d
+nest i d = Nest i d
+
+-- | The first when flattened, the second when not.
+flatAlt :: Doc -> Doc -> Doc
+flatAlt a b = FlatAlt a b
+
+-- | The document on one line: each `line` a space, each `linebreak` nothing,
+-- | each `hardline` a failure the layout backs out of.
+flatten :: Doc -> Doc
+flatten (FlatAlt _ y) = flatten y
+flatten (Cat x y) = Cat (flatten x) (flatten y)
+flatten (Nest i x) = Nest i (flatten x)
+flatten Line = Fail
+flatten (Union x _) = flatten x
+flatten (Column f) = Column (\k -> flatten (f k))
+flatten (Nesting f) = Nesting (\k -> flatten (f k))
+flatten other = other
+
+data Flat = Flattened Doc | AlreadyFlat | NeverFlat
+
+mapFlat :: (Doc -> Doc) -> Flat -> Flat
+mapFlat f (Flattened d) = Flattened (f d)
+mapFlat f other = other
+
+-- (the flattenings of a `Cat`'s sides, put together)
+catFlat :: Flat -> Doc -> Flat -> Doc -> Flat
+catFlat fx x fy y = case fx of
+  NeverFlat -> NeverFlat
+  Flattened x2 ->
+    (case fy of
+     NeverFlat -> NeverFlat
+     Flattened y2 -> Flattened (Cat x2 y2)
+     AlreadyFlat -> Flattened (Cat x2 y))
+  AlreadyFlat ->
+    (case fy of
+     NeverFlat -> NeverFlat
+     Flattened y2 -> Flattened (Cat x y2)
+     AlreadyFlat -> AlreadyFlat)
+
+-- (`changesUponFlattening` of prettyprinter)
+changes :: Doc -> Flat
+changes (FlatAlt _ y) = Flattened (flatten y)
+changes Line = NeverFlat
+changes (Union x _) = Flattened x
+changes (Nest i x) = mapFlat (\d -> Nest i d) (changes x)
+changes (Cat x y) = catFlat (changes x) x (changes y) y
+changes (Column f) = Flattened (Column (\k -> flatten (f k)))
+changes (Nesting f) = Flattened (Nesting (\k -> flatten (f k)))
+changes Fail = NeverFlat
+changes _ = AlreadyFlat
+
+-- | On one line if it fits, as written otherwise.
+group :: Doc -> Doc
+group d = case d of
+  Union _ _ -> d
+  FlatAlt a b ->
+    (case changes b of
+     Flattened b2 -> Union b2 a
+     AlreadyFlat -> Union b a
+     NeverFlat -> a)
+  _ ->
+    (case changes d of
+     Flattened d2 -> Union d2 d
+     AlreadyFlat -> d
+     NeverFlat -> d)
+
+-- | The document, its line breaks at the column where it starts.
+align :: Doc -> Doc
+align d = Column (\k -> Nesting (\i -> nest (k - i) d))
+
+hang :: Int -> Doc -> Doc
+hang i d = align (nest i d)
+
+spacesInto :: Int -> String -> String
+spacesInto n acc = if n <= 0 then acc else spacesInto (n - 1) (acc ++ " ")
+
+spacesText :: Int -> String
+spacesText n = spacesInto n ""
+
+indent :: Int -> Doc -> Doc
+indent i d = hang i (text (spacesText i) <> d)
+
+concatWith :: (Doc -> Doc -> Doc) -> List Doc -> Doc
+concatWith f Nil = None
+concatWith f (Cons d Nil) = d
+concatWith f (Cons d ds) = f d (concatWith f ds)
+
+-- | Text, its newlines hard line breaks.
+pretty :: String -> Doc
+pretty s = concatWith (\x y -> x <> hardline <> y) (map text (split "\n" s))
+
+vsep :: List Doc -> Doc
+vsep = concatWith (\x y -> x <> line <> y)
+
+hsep :: List Doc -> Doc
+hsep = concatWith (\x y -> x <+> y)
+
+vcat :: List Doc -> Doc
+vcat = concatWith (\x y -> x <> linebreak <> y)
+
+sep :: List Doc -> Doc
+sep ds = group (vsep ds)
+
+enclose :: Doc -> Doc -> Doc -> Doc
+enclose l r d = l <> d <> r
+
+-- Layout
+--------------------------------------------------------------------------------
+
+-- (`SFail`: a flattened hard line break, which never fits; what follows a
+-- text or a break is computed only when looked at)
+data SDoc
+  = SEmpty
+  | SFail
+  | SText String (Unit -> SDoc)
+  | SLine Int (Unit -> SDoc)
+
+-- only the first line of the rest is inspected, as in `layoutPretty`
+fitsGo :: Int -> SDoc -> Bool
+fitsGo rem s =
+  if rem < 0
+    then False
+    else case s of
+      SEmpty -> True
+      SFail -> False
+      SLine i c -> True
+      SText t c -> fitsGo (rem - strLength t) (c MkUnit)
+
+fits :: Int -> Int -> Int -> SDoc -> Bool
+fits w nl k s = fitsGo (min (w - k) (w - (k - nl))) s
+
+pick :: Int -> Int -> Int -> SDoc -> (Unit -> SDoc) -> SDoc
+pick w nl k l alt = if fits w nl k l then l else alt MkUnit
+
+-- `nl` is the nesting of the line being laid out, `k` the current column
+best :: Int -> Int -> Int -> List (Pair Int Doc) -> SDoc
+best w nl k Nil = SEmpty
+best w nl k (Cons (MkPair i d) ds) = case d of
+  Fail -> SFail
+  None -> best w nl k ds
+  Text s -> SText s (\u -> best w nl (k + strLength s) ds)
+  Line -> SLine i (\u -> best w i i ds)
+  FlatAlt x y -> best w nl k (Cons (MkPair i x) ds)
+  Cat x y -> best w nl k (Cons (MkPair i x) (Cons (MkPair i y) ds))
+  Nest j x -> best w nl k (Cons (MkPair (i + j) x) ds)
+  Union x y ->
+    pick
+      w
+      nl
+      k
+      (best w nl k (Cons (MkPair i x) ds))
+      (\u -> best w nl k (Cons (MkPair i y) ds))
+  Column f -> best w nl k (Cons (MkPair i (f k)) ds)
+  Nesting f -> best w nl k (Cons (MkPair i (f i)) ds)
+
+displayInto :: String -> SDoc -> String
+displayInto acc SEmpty = acc
+displayInto acc SFail = acc
+displayInto acc (SText t c) = displayInto (acc ++ t) (c MkUnit)
+displayInto acc (SLine i c) =
+  displayInto (acc ++ "\n" ++ spacesText i) (c MkUnit)
+
+display :: SDoc -> String
+display s = displayInto "" s
+
+renderWidth :: Int -> Doc -> String
+renderWidth w d = display (best w 0 0 (Cons (MkPair 0 d) Nil))
+
+render :: Doc -> String
+render d = renderWidth 80 d
+
+test layout
+
+-- >>> render (text "ab" <+> text "cd")
+-- "ab cd"
+
+-- >>> renderWidth 10 (group (text "aaaa" <> line <> text "bbbb"))
+-- "aaaa bbbb"
+
+-- >>> renderWidth 8 (group (text "aaaa" <> line <> text "bbbb"))
+-- "aaaa\nbbbb"
+
+-- >>> renderWidth 8 (group (text "ab" <> nest 2 (line <> text "cd" <> line <> text "ef")))
+-- "ab cd ef"
+
+-- >>> renderWidth 5 (group (text "ab" <> nest 2 (line <> text "cd" <> line <> text "ef")))
+-- "ab\n  cd\n  ef"
+
+-- >>> renderWidth 20 (text "sig ::" <+> align (text "A" <> line <> text "-> B"))
+-- "sig :: A\n       -> B"
+
+-- >>> render (group (text "a" <> hardline <> text "b"))
+-- "a\nb"
+
+-- >>> renderWidth 6 (sep (Cons (text "one") (Cons (text "two") (Cons (text "three") Nil))))
+-- "one\ntwo\nthree"
+
+-- >>> renderWidth 20 (sep (Cons (text "one") (Cons (text "two") (Cons (text "three") Nil))))
+-- "one two three"
+
+-- >>> renderWidth 8 (group (text "{" <> flatAlt (text "x") (text " x ") <> text "}"))
+-- "{ x }"
+
+-- >>> render (nest 2 (text "a" <> hardline <> text "b") <> hardline <> text "c")
+-- "a\n  b\nc"
+
+-- >>> renderWidth 3 (group (text "aa" <> softline <> text "bb"))
+-- "aa\nbb"
+
+-- >>> render (indent 4 (text "deep"))
+-- "    deep"
