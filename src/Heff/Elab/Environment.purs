@@ -99,17 +99,20 @@ createNominative :: ElabFor -> V.Ev V.El -> V.Ty -> V.El
 createNominative ForNominative v _ = V.nom v
 createNominative (ForDescriptive n) ev a = V.reflect n.head (pure n.spine) (pure a) (Just ev)
 
-type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor }
+-- | `lams`: how many lambdas the elaboration has entered in this
+-- | definition -- under none, a recursive use would be computed while the
+-- | definition itself is (evaluation is by value), so `rec` refuses it
+type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor, lams :: Int }
 
 evalEnv :: ElabEnv -> EvalEnv
 evalEnv e = { local: e.scope.locals, global: e.globals }
 
 emptyElabEnv :: Globals -> ElabEnv
-emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals }
+emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals, lams: 0 }
 
 emptyElabEnvFor :: Globals -> Name -> ElabEnv
 emptyElabEnvFor globals x =
-  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals }
+  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals, lams: 0 }
 
 -- Failure
 --------------------------------------------------------------------------------

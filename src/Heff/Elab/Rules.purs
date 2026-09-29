@@ -153,13 +153,13 @@ functionIntro sp x body = Chk \e a0 -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (functionIntro sp x body)
-          (e { scope = scope', elabFor = appElabFor e.elabFor v })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs y ebody))
     V.LikeFunction ft -> do
       ebody <- withBound x ft.dom e.scope \v scope' ->
         runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
@@ -172,7 +172,7 @@ functionIntroImplicit sp x body = Chk \e a0 -> do
     V.LikeFunction ft | ft.implicit -> do
       ebody <- withBound x ft.dom e.scope \v scope' ->
         runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 25 (txt "an implicit lambda `\\{x} -> ...` checked at a type that takes no implicit argument")
@@ -312,8 +312,11 @@ annot typ chk = Syn \e -> do
 
 recChk :: Span -> Chk -> Chk
 recChk sp c = Chk \e a ->
-  if leq (V.levelOf a) Small then M.rec <$> runChk c (e { scope = undelay e.scope }) a
-  else failWith sp 20 (txt "can only use rec when checking at a small type")
+  if not (leq (V.levelOf a) Small) then failWith sp 20 (txt "can only use rec when checking at a small type")
+  -- evaluation is by value: a recursive use under no lambda would be
+  -- computed while the definition itself is, and never end
+  else if e.lams == 0 then failWith sp 31 (txt "the definition would need itself while it is being computed: put the recursive use under a lambda")
+  else M.rec <$> runChk c (e { scope = undelay e.scope }) a
 
 -- | a call `f a ...` of a delayed variable `f` (a recursive call) is
 -- | checked as `rec (f a ...)`
