@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 // The formatter written in heff (fmt/) against the PureScript reference:
-// `fmt/layout.hf` is compiled to JavaScript, and its `formatUnchecked` must
+// the artifact `heff fmt` itself runs (`output/heff-fmt.mjs`) must
 // lay out every `.hf` file of the repository exactly as `Heff.Format`'s
 // does -- the same text, or the same refusal.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const out = join(mkdtempSync(join(tmpdir(), "heff-fmt-")), "layout.mjs");
-const c = spawnSync("node", [join(root, "bin", "heff.mjs"), "compile-js", "fmt/layout.hf", out], { cwd: root, encoding: "utf8" });
-if (c.status !== 0) { console.log("fmt port: fmt/layout.hf does not compile\n" + c.stdout + c.stderr); process.exit(1); }
+// the CLI compiles output/heff-fmt.mjs when it is stale (bin/heff.mjs);
+// have it do so, and hold that artifact -- the one `heff fmt` runs -- to
+// the reference
+const c = spawnSync("node", [join(root, "bin", "heff.mjs"), "fmt", "--check", join(root, "lib", "doc.hf")], { cwd: root, encoding: "utf8" });
+if (c.status !== 0) { console.log("fmt port: heff fmt could not run\n" + c.stdout + c.stderr); process.exit(1); }
 
-const lay = (await import(pathToFileURL(out))).default;
+const lay = (await import(pathToFileURL(join(root, "output", "heff-fmt.mjs")))).default;
 const { formatUnchecked } = await import(pathToFileURL(join(root, "output", "Heff.Format", "index.js")));
 
 const files = [];
