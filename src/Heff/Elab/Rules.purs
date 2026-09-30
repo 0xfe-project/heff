@@ -382,7 +382,10 @@ recordFormation fieldTyps = Typ \e -> do
         ty <- runTyp fd.typ e'
         Tuple l fieldTys <- go (e' { scope = Env.bindName fd.name (M.tyN ty) e'.scope }) rest
         pure (Tuple (maxLevel l (M.levelOf ty)) (A.cons (Tuple fd.name ty.stx) fieldTys))
-  Tuple l fields <- go (e { elabFor = ForNominative }) fieldTyps
+  -- (the fields may name the definition being elaborated, as a sum's
+  -- variants may: the record type is nominative, so the recursion is
+  -- guarded by its name)
+  Tuple l fields <- go (e { elabFor = ForNominative, scope = undelay e.scope }) fieldTyps
   pure (M.record (evalEnv e) { level: l, fieldTypes: dictFromList fields })
 
 -- | (`nameSpan`: the field's name, where it is written)
