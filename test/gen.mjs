@@ -45,13 +45,13 @@ export function genProgram() {
   // a theory, and a record of it
   if (chance(0.7)) {
     const carrier = pick(sums);
-    out.push("theory Th where\n  t :: Type\n  op :: t -> t -> t\n  pick :: t -> Bool\n");
+    out.push("theory Th where\n  t : Type\n  op : t -> t -> t\n  pick : t -> Bool\n");
     const env = [{ name: "x", ty: carrier }, { name: "y", ty: carrier }];
-    out.push(`Inst :: Th\nInst = { t = ${carrier.name}, op = \\x y -> ${genExpr(carrier, env, fns, 2, null, 2)}, pick = \\x -> ${genExpr(bool, env.slice(0, 1), fns, 2, null, 2)} }\n`);
-    if (chance(0.5)) out.push(`Spec :: Th ~ { t = ${carrier.name} }\nSpec = Inst\n`);
+    out.push(`Inst : Th\nInst = { t = ${carrier.name}, op = \\x y -> ${genExpr(carrier, env, fns, 2, null, 2)}, pick = \\x -> ${genExpr(bool, env.slice(0, 1), fns, 2, null, 2)} }\n`);
+    if (chance(0.5)) out.push(`Spec : Th ~ { t = ${carrier.name} }\nSpec = Inst\n`);
     if (chance(0.6)) {
-      out.push(`useTh :: (m :: Th) -> m.t -> Bool\nuseTh m a = m.pick (m.op a a)\n`);
-      out.push(`usedTh :: Bool\nusedTh = useTh Inst ${paren(genExpr(carrier, [], fns, 2, null, 2))}\n`);
+      out.push(`useTh : (m : Th) -> m.t -> Bool\nuseTh m a = m.pick (m.op a a)\n`);
+      out.push(`usedTh : Bool\nusedTh = useTh Inst ${paren(genExpr(carrier, [], fns, 2, null, 2))}\n`);
     }
   }
   const nFns = range(1, 4);
@@ -63,15 +63,15 @@ export function genProgram() {
     const f = { name: `f${i}`, params, ret };
     const env = params.map((t, p) => ({ name: `p${p}`, ty: t }));
     const body = genExpr(ret, env, fns, 3, f, 0);
-    out.push(`${f.name} :: ${[...params, ret].map(tyStr).join(" -> ")}\n${f.name} ${params.map((_, p) => `p${p}`).join(" ")} = ${body}\n`);
+    out.push(`${f.name} : ${[...params, ret].map(tyStr).join(" -> ")}\n${f.name} ${params.map((_, p) => `p${p}`).join(" ")} = ${body}\n`);
     fns.push(f);
   }
   const nVals = range(1, 3);
   for (let i = 0; i < nVals; i++) {
     const ty = pick(sums);
-    out.push(`v${i} :: ${tyStr(ty)}\nv${i} = ${genExpr(ty, [], fns, 3, null, 0)}\n`);
+    out.push(`v${i} : ${tyStr(ty)}\nv${i} = ${genExpr(ty, [], fns, 3, null, 0)}\n`);
   }
-  if (chance(0.3)) out.push(`ann :: Bool\nann = (${genExpr(bool, [], fns, 2, null, 2)} :: Bool)\n`);
+  if (chance(0.3)) out.push(`ann : Bool\nann = (${genExpr(bool, [], fns, 2, null, 2)} : Bool)\n`);
   return out.join("\n");
 }
 

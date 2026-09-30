@@ -55,7 +55,7 @@ heff completions fish          # > ~/.config/fish/completions/heff.fish
 
 ## The language
 
-`:` annotates, everywhere (`::` is still read, and written back as `:` by the formatter); a capitalised name is a constructor unless it
+`:` annotates, everywhere; `x :: xs` is `Cons x xs` (in patterns too), right, below the arithmetic and `++`; a capitalised name is a constructor unless it
 names a definition or a binder; `f (a := T)` gives an implicit argument by
 name; `case`/`of`, `if`, `do`, `\x -> e`, records `{ x = 1 }` and record
 types `{ x : Int }`, lists `[1, 2, 3]` (`Cons 1 (Cons 2 (Cons 3 Nil))`,

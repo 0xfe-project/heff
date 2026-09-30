@@ -49,9 +49,9 @@ type Comment = { start :: Int, end :: Int, text :: String }
 foreign import lexImpl :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String }, comments :: Array Comment }
 
 
--- | `:` annotates (`::` is still read, and written back as `:`)
+-- | `:` annotates (`::` is an operator: the prelude's cons)
 isAnnText :: String -> Boolean
-isAnnText x = x == ":" || x == "::"
+isAnnText x = x == ":"
 
 -- | the tokens, and apart from them the comments (`--` and `{- -}`)
 lex :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String }, comments :: Array Comment }
@@ -850,12 +850,26 @@ doExpr = lazyP \_ -> do
 -- | a pattern: `C p …`, or an atomic one
 pattern :: P Ntn
 pattern = lazyP \_ -> do
-  t <- peek
-  if t.kind == "con" || t.kind == "tag" then do
-    _ <- next
-    args <- many patAtom
-    pure (group (NEA.cons' (NTag t.text (spanOf t)) args))
-  else patAtom
+  p <- patHead
+  consTail p
+  where
+  patHead = do
+    t <- peek
+    if t.kind == "con" || t.kind == "tag" then do
+      _ <- next
+      args <- many patAtom
+      pure (group (NEA.cons' (NTag t.text (spanOf t)) args))
+    else patAtom
+  -- `x :: xs` is the `Cons` in scope (as a literal is the equality in
+  -- scope), and binds right: `x :: y :: rest`
+  consTail l = do
+    t <- peek
+    b <- atBoundary
+    if t.kind == "sym" && t.text == "::" && not b then do
+      _ <- next
+      r <- pattern
+      pure (group (NEA.cons' (NTag "Cons" (spanOf t)) [ l, r ]))
+    else pure l
 
 -- | `x`, `_`, `C` (with no arguments), `(p)`
 patAtom :: P Ntn

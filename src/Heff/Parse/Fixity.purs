@@ -87,4 +87,4 @@ bindsTighter f from to = go [ from ] []
 
 -- | symbols that are syntax, never operators
 reserved :: Array String
-reserved = [ "->", "~", "::", ":", "=", "|", "<-", "\\", ":=", "=>", "." ]
+reserved = [ "->", "~", ":", "=", "|", "<-", "\\", ":=", "=>", "." ]

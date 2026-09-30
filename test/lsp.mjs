@@ -181,7 +181,7 @@ try {
   }
 
   // formatting: one edit, the whole text; what does not parse is left, with a warning
-  const messy = "data Bool = True | False\n\nnot :: Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";
+  const messy = "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";
   open("test/surface/lsp-fmt.hf", messy);
   await diagnosticsOf(uri("test/surface/lsp-fmt.hf"));
   const fmt = await request("textDocument/formatting", { textDocument: { uri: uri("test/surface/lsp-fmt.hf") }, options: { tabSize: 2, insertSpaces: true } });

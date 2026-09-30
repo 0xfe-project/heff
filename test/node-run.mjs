@@ -54,11 +54,11 @@ if (build("test/node/deep.hf", "deep", deep)) {
 const loop = join(work, "loop.hf"), loopJs = join(work, "loop.mjs");
 writeFileSync(loop, [
   "import co", "import io", "import prelude", "",
-  "loop :: Int -> Int -> Co io Unit",
+  "loop : Int -> Int -> Co io Unit",
   "loop n acc = if n == 0 then print (showInt acc) else do",
   "  v <- getEnv \"X\"",
   "  loop (n - 1) (acc + 1)", "",
-  "main :: Co io Unit",
+  "main : Co io Unit",
   "main = loop 100000 0", "",
 ].join("\n"));
 if (build(loop, "main", loopJs)) {

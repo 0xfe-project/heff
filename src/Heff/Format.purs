@@ -212,7 +212,7 @@ type Con = { con :: T, args :: Array E }
 
 type Alt = { pat :: Pat, arrow :: T, body :: E }
 
-data Pat = PCon T (Array Pat) | PAtom T | PParen T Pat T | PList T (Array Pat) (Array T) T
+data Pat = PCon T (Array Pat) | PAtom T | PParen T Pat T | PList T (Array Pat) (Array T) T | POp Pat T Pat
 
 data Stmt = SBind T T E | SExpr E
 
@@ -302,6 +302,7 @@ firstP = case _ of
   PAtom t -> t
   PParen o _ _ -> o
   PList o _ _ _ -> o
+  POp l _ _ -> firstP l
 
 firstStmt :: Stmt -> T
 firstStmt = case _ of
@@ -668,11 +669,22 @@ doExpr = lazyP \_ -> do
 
 pattern :: P Pat
 pattern = lazyP \_ -> do
-  t <- peek
-  if t.kind == "con" || t.kind == "tag" then do
-    c <- next
-    PCon c <$> many patAtom
-  else patAtom
+  p <- patHead
+  consTail p
+  where
+  patHead = do
+    t <- peek
+    if t.kind == "con" || t.kind == "tag" then do
+      c <- next
+      PCon c <$> many patAtom
+    else patAtom
+  consTail l = do
+    t <- peek
+    b <- atBoundary
+    if t.kind == "sym" && t.text == "::" && not b then do
+      op <- next
+      POp l op <$> pattern
+    else pure l
 
 -- | `, p` …
 morePats :: P (Array { comma :: T, p :: Pat })
@@ -789,7 +801,7 @@ sepBy1 sep p = do
   go { items: [ x ], seps: [] }
 
 isAnnText :: String -> Boolean
-isAnnText x = x == ":" || x == "::"
+isAnnText x = x == ":"
 
 expectAnn :: P T
 expectAnn = do
@@ -847,7 +859,7 @@ blankLine = P.text blankMark <> P.hardline
 -- | a token, with its comments: those before it on lines of their own, and
 -- | the one after it on its line (after which the line ends)
 tok :: Env -> T -> Doc
-tok env t = leading <> foldMap (\c -> comment c <> P.text " ") (fromMaybe [] (Map.lookup t.ix env.inline)) <> P.text (if t.kind == "sym" && t.text == "::" then ":" else t.raw) <> trailing
+tok env t = leading <> foldMap (\c -> comment c <> P.text " ") (fromMaybe [] (Map.lookup t.ix env.inline)) <> P.text t.raw <> trailing
   where
   cs = if t.ix == env.noLead then [] else fromMaybe [] (Map.lookup t.ix env.lead)
   leading = if A.null cs then mempty else foldMap (\c -> P.hardline <> comment c.text) cs <> P.hardline
@@ -1019,5 +1031,6 @@ pP :: Env -> Pat -> Doc
 pP env = case _ of
   PCon c args -> tok env c <> foldMap (\p -> P.text " " <> pP env p) args
   PAtom t -> tok env t
+  POp l op r -> pP env l <+> tok env op <+> pP env r
   PParen o p c -> tok env o <> pP env p <> tok env c
   PList o ps commas c -> tok env o <> fold (A.mapWithIndex (\i p -> (if i > 0 then maybe mempty (\comma -> tok env comma <> P.text " ") (A.index commas (i - 1)) else mempty) <> pP env p) ps) <> tok env c
