@@ -205,19 +205,32 @@ uEl g cs a0 b0 = do
 -- Solving
 --------------------------------------------------------------------------------
 
--- | the arguments of a flexible neutral, if they are distinct variables (a
--- | Miller pattern): their levels
-patternArgs :: V.MetaCtx -> V.Spine -> Maybe (Array Int)
-patternArgs mc sp = do
+-- | an argument of a flexible neutral, in a Miller pattern: a variable
+-- | (its level), or the definition being elaborated itself -- let-bound
+-- | to the global it will be, closed, so it needs no abstraction, and
+-- | the lambda at its position goes unused
+data PatArg = PVar Int | PSelf
+
+derive instance eqPatArg :: Eq PatArg
+
+-- | the arguments of a flexible neutral, if they are distinct variables
+-- | (or the self) -- a Miller pattern
+patternArgs :: Maybe Name -> V.MetaCtx -> V.Spine -> Maybe (Array PatArg)
+patternArgs selfKey mc sp = do
   items <- go sp
-  if A.length (A.nub items) == A.length items then Just items else Nothing
+  let
+    vars = A.mapMaybe (case _ of
+      PVar l -> Just l
+      PSelf -> Nothing) items
+  if A.length (A.nub vars) == A.length vars then Just items else Nothing
   where
   go = case _ of
     V.Id -> Just []
     V.App s v -> do
       rest <- go s
       case V.forceEl mc v of
-        V.Neu { head: V.Local l, spine: V.Id } -> Just (A.snoc rest l)
+        V.Neu { head: V.Local l, spine: V.Id } -> Just (A.snoc rest (PVar l))
+        V.Neu { head: V.Global k, spine: V.Id } | Just k == selfKey -> Just (A.snoc rest PSelf)
         _ -> Nothing
     _ -> Nothing
 
@@ -225,13 +238,16 @@ patternArgs mc sp = do
 solve :: Globals -> CtxShape -> Int -> V.Spine -> V.El -> V.El -> U Unit
 solve g cs m sp rhs self = do
   mc <- gets _.metas
-  case patternArgs mc sp of
+  sk <- gets _.selfKey
+  case patternArgs sk mc sp of
     Nothing -> postponeU cs self rhs
     Just args -> case flexOf rhs of
       -- `?m args =?= ?m args`
-      Just (Tuple m' sp') | m' == m && patternArgs mc sp' == Just args -> pure unit
+      Just (Tuple m' sp') | m' == m && patternArgs sk mc sp' == Just args -> pure unit
       _ -> do
-        let ren = { dom: cs.len, cod: A.length args, ren: Map.fromFoldable (A.mapWithIndex (\i l -> Tuple l i) args) }
+        let ren = { dom: cs.len, cod: A.length args, ren: Map.fromFoldable (A.mapMaybe (\(Tuple i a) -> case a of
+              PVar l -> Just (Tuple l i)
+              PSelf -> Nothing) (A.mapWithIndex Tuple args)) }
         body <- rename g m ren rhs
         let
           k = A.length args
@@ -322,8 +338,13 @@ renameSpine g m r sp h = case sp of
 renameFlex :: Globals -> Int -> PRen -> Int -> V.Spine -> U S.El
 renameFlex g m r m' sp = do
   mc <- gets _.metas
-  case patternArgs mc sp of
-    Just args | A.any (\l -> not (Map.member l r.ren)) args -> do
+  sk <- gets _.selfKey
+  case patternArgs sk mc sp of
+    Just args | A.any (case _ of
+        PVar l -> not (Map.member l r.ren)
+        -- (a self in the spine is pruned too: the pruned solution can
+        -- only apply the new metavariable to variables)
+        PSelf -> true) args -> do
       entry <- case Map.lookup m' mc of
         Just e -> pure e
         Nothing -> scopeError
@@ -334,8 +355,11 @@ renameFlex g m r m' sp = do
       tyStx <- renameTy g m { dom: entry.arity, cod: 0, ren: Map.empty } entry.ty
       let
         ty = V.nom (evalTy { local: V.LNil, global: g } N tyStx)
-        keep = A.filter (\l -> Map.member l r.ren) args
-        kept = A.mapMaybe (\(Tuple i l) -> if Map.member l r.ren then Just i else Nothing) (A.mapWithIndex Tuple args)
+        inRen = case _ of
+          PVar l -> Map.member l r.ren
+          PSelf -> false
+        keep = A.filter inRen args
+        kept = A.mapMaybe (\(Tuple i a) -> if inRen a then Just i else Nothing) (A.mapWithIndex Tuple args)
         n = A.length args
       new <- gets _.nextMeta
       modify_ \s -> s
@@ -356,9 +380,11 @@ renameFlex g m r m' sp = do
         Just e -> pure e
         Nothing -> scopeError
       ty <- renameTy g m r entry.ty
-      idxs <- traverse (\l -> case Map.lookup l r.ren of
-        Just l' -> pure (r.cod - l' - 1)
-        Nothing -> scopeError) args
+      idxs <- traverse (case _ of
+        PVar l -> case Map.lookup l r.ren of
+          Just l' -> pure (r.cod - l' - 1)
+          Nothing -> scopeError
+        PSelf -> scopeError) args
       pure (S.MetaApp m' idxs ty)
     Nothing -> scopeError
 

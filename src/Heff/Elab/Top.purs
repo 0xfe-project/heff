@@ -29,7 +29,7 @@ import Heff.Elab.Prims (isPrim, primNames)
 import Data.String as Str
 import Heff.Core.Syntax as Syn
 import Heff.Elab.Unify (retryPostponed, runDelayed, unsolvedMetas, zonkEl, zonkTy)
-import Control.Monad.State (gets)
+import Control.Monad.State (gets, modify_)
 import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, lookupGlobal)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
@@ -37,8 +37,8 @@ import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName)
 import Data.Map as Map
 import Heff.Core.Value as V
-import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, bindAt, emptyElabEnv, emptyElabEnvFor, emptySt, runE, tryPure)
-import Control.Monad.Except (throwError)
+import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, emptyElabEnv, emptyElabEnvFor, emptySt, letAt, runE, tryPure)
+import Control.Monad.Except (catchError, throwError)
 import Heff.Elab.Rules as R
 import Heff.Support.Pretty (Doc, (<+>))
 import Heff.Support.Pretty as P
@@ -368,14 +368,22 @@ declJ = case _ of
 -- | primitive keeps its own, the runtime's
 elabDecl :: (Name -> Name) -> Globals -> Ntn -> E { name :: Name, key :: Name, prim :: Boolean, entry :: GlobalEntry }
 elabDecl key g n = do
+  modify_ \st -> st { selfKey = Nothing }
   d <- declJ n
   a <- R.runTyp d.ty (emptyElabEnv g)
   let
     aval = M.tyN a
     k = if d.prim then d.name else key d.name
     tmE = emptyElabEnvFor g k
-    tmE' = tmE { scope = bindAt (BDelayedBy 1) d.name aval tmE.scope }
-  t <- R.runChk d.tm tmE' aval
+    -- the definition mentions itself as the global it will be, not as a
+    -- local of another name (the two would not convert); pattern
+    -- unification knows it by its key, and passes it through
+    self = V.reflect (V.Global k) (pure V.Id) (pure aval) Nothing
+    tmE' = tmE { scope = letAt (BDelayedBy 1) d.name self aval tmE.scope }
+  modify_ \st -> st { selfKey = Just k }
+  t <- R.runChk d.tm tmE' aval `catchError` \e -> do
+    modify_ \st -> st { selfKey = Nothing }
+    throwError e
   -- the implicit arguments: every one inferred, and substituted in
   runDelayed true
   stuck <- retryPostponed g
@@ -400,6 +408,7 @@ elabDecl key g n = do
     { code: 329, severity: SError, span: ntnSpan n, note: Nothing
     , msg: P.text ("there is no primitive called `" <> d.name <> "` (the runtime has: " <> Str.joinWith ", " primNames <> ")")
     }
+  modify_ \st -> st { selfKey = Nothing }
   pure { name: d.name, key: k, prim: d.prim, entry: { syntax: bodyStx, value, type_: aval' } }
 
 -- | a constraint unification could not solve, said where the implicit

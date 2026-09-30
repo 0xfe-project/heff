@@ -137,6 +137,9 @@ type ElabSt =
   , postponed :: Array { shape :: CtxShape, left :: V.El, right :: V.El }
   , delayed :: Array Delayed
   , trace :: Array TraceEvent
+  -- the definition being elaborated: let-bound to the global it will
+  -- be, which pattern unification passes through (`Unify.patternArgs`)
+  , selfKey :: Maybe Name
   }
 
 -- | an argument whose check waits until the type it is checked at (`ty`)
@@ -144,7 +147,7 @@ type ElabSt =
 newtype Delayed = Delayed { ty :: V.Ty, check :: ExceptT Diag (State ElabSt) Unit }
 
 emptySt :: ElabSt
-emptySt = { infos: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [] }
+emptySt = { infos: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], selfKey: Nothing }
 
 
 
