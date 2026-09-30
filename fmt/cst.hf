@@ -432,29 +432,30 @@ opPrec "~" = 2
 opPrec "*" = 3
 opPrec s = -1
 
-theory Gram where
-  expr :: P E
-  opExpr :: Int -> P E
-  opLoop :: Int -> E -> P E
-  arrowRhs :: P E
-  userOps :: P E
-  operands :: P (List E)
-  app :: P E
-  atom :: P E
-  fieldsOf :: E -> P E
-  parens :: P E
-  braces :: P E
-  lambda :: P E
-  caseExpr :: P E
-  ifExpr :: P E
-  doExpr :: P E
-  stmt :: P E
-  alt :: P E
-  commaSepE :: P (List CE)
-  pattern :: P Pat
-  morePats :: P (List CP)
-  patAtom :: P Pat
-  con :: P E
+type Gram =
+  { expr :: P E
+  , opExpr :: Int -> P E
+  , opLoop :: Int -> E -> P E
+  , arrowRhs :: P E
+  , userOps :: P E
+  , operands :: P (List E)
+  , app :: P E
+  , atom :: P E
+  , fieldsOf :: E -> P E
+  , parens :: P E
+  , braces :: P E
+  , lambda :: P E
+  , caseExpr :: P E
+  , ifExpr :: P E
+  , doExpr :: P E
+  , stmt :: P E
+  , alt :: P E
+  , commaSepE :: P (List CE)
+  , pattern :: P Pat
+  , morePats :: P (List CP)
+  , patAtom :: P Pat
+  , con :: P E
+  }
 
 -- (a projection on a `do`-bound variable trips the elaborator, so these
 -- helpers read the token's fields through an annotated binder)
@@ -494,275 +495,331 @@ binderP = do
               val (BImp o x2 c)
       else failAt t
 
--- The grammar's functions call one another, so they are the fields of one
--- record, and each calls the others as `gram.f`.
+-- The grammar's functions call one another, so each takes the record of
+-- them all, and `gram` ties the knot: a `type` record (its fields are all
+-- small) can be passed whole, where a `theory` (large) cannot.
+
+exprF :: Gram -> P E
+exprF g = do
+  t <- peek
+  e <-
+    (if isText t "\\" && isKind t "sym"
+       then g.lambda
+       else if isKw t "case"
+       then g.caseExpr
+       else if isKw t "if"
+       then g.ifExpr
+       else if isKw t "do"
+       then g.doExpr
+       else g.opExpr 0)
+  t2 <- peek
+  b <- atBoundary
+  if isText t2 "::" && isKind t2 "sym" && not b
+      then do
+        cc <- next
+        ty <- g.expr
+        val (Ann e cc ty)
+      else val e
+
+opExprF :: Gram -> Int -> P E
+opExprF g minPrec = do
+  lhs <- g.userOps
+  g.opLoop minPrec lhs
+
+opLoopF :: Gram -> Int -> E -> P E
+opLoopF g minPrec lhs = do
+  t <- peek
+  b <- atBoundary
+  if isKind t "sym" && opPrecT t >= 1 && opPrecT t >= minPrec && not b
+      then do
+        op <- next
+        rhs <- (if opPrecT op == 1 then g.arrowRhs else g.opExpr (opPrecT op))
+        g.opLoop minPrec (Op lhs op rhs)
+      else val lhs
+
+arrowRhsF :: Gram -> P E
+arrowRhsF g = do
+  t <- peek
+  if isText t "\\" || isKw t "case" || isKw t "if" || isKw t "do"
+      then g.expr
+      else g.opExpr 1
+
+userOpsF :: Gram -> P E
+userOpsF g = do
+  e0 <- g.app
+  rest <- g.operands
+  val (if null rest then e0 else Ops e0 rest)
+
+operandsF :: Gram -> P (List E)
+operandsF g = do
+  t <- peek
+  b <- atBoundary
+  if isOperatorT t && not b
+      then do
+        op <- next
+        u <- peek
+        if isText u "\\" || isKw u "case" || isKw u "if" || isKw u "do"
+            then do
+              e <- g.expr
+              val (Cons (OpRhs op e) Nil)
+            else do
+              e <- g.app
+              more <- g.operands
+              val (Cons (OpRhs op e) more)
+      else val Nil
+
+appF :: Gram -> P E
+appF g = do
+  h <- g.atom
+  args <- many g.atom
+  val (if null args then h else App h args)
+
+atomF :: Gram -> P E
+atomF g = do
+  t <- peek
+  b <- atBoundary
+  if b || not (startsAtomT t)
+      then failAt t
+      else do
+        base <-
+          (if isKw t "data"
+             then do
+               kw <- next
+               o <- expectPunct "{"
+               inBrackets (do
+                 r <- sepBy1 "|" g.con
+                 c <- expectPunct "}"
+                 val (mkSum kw o r c))
+             else if isKind t "punct" && isText t "("
+             then g.parens
+             else if isKind t "punct" && isText t "{"
+             then g.braces
+             else if isKind t "punct" && isText t "["
+             then do
+               o <- next
+               inBrackets (do
+                 t2 <- peek
+                 if isText t2 "]"
+                     then do
+                       c <- next
+                       val (Tup o Nil Nil c)
+                     else do
+                       e <- g.expr
+                       rest <- g.commaSepE
+                       c <- expectPunct "]"
+                       val (Tup o (Cons e (map ceE rest)) (map ceT rest) c))
+             else do
+               a <- next
+               val (Atom a))
+        g.fieldsOf base
+
+fieldsOfF :: Gram -> E -> P E
+fieldsOfF g e = do
+  t <- peek
+  if isKind t "field"
+      then do
+        f <- next
+        g.fieldsOf (EField e f)
+      else val e
+
+parensF :: Gram -> P E
+parensF g = do
+  o <- next
+  inBrackets (do
+    t <- peek
+    t2 <- peekAt 1
+    if isOperatorT t && isText t2 ")"
+        then do
+          op <- next
+          c <- next
+          val (EParen o (Atom op) c)
+        else if (isKind t "var" || isKind t "con") && isText t2 ":="
+        then do
+          x <- next
+          k <- next
+          e <- g.expr
+          c <- expectPunct ")"
+          val (Named o x k e c)
+        else do
+          e <- g.expr
+          t3 <- peek
+          if isText t3 ","
+              then do
+                rest <- g.commaSepE
+                c <- expectPunct ")"
+                val (Tup o (Cons e (map ceE rest)) (map ceT rest) c)
+              else do
+                c <- expectPunct ")"
+                val (EParen o e c))
+
+bracesF :: Gram -> P E
+bracesF g = do
+  o <- next
+  inBrackets (do
+    t <- peek
+    t2 <- peekAt 1
+    if isText t "}"
+        then do
+          c <- next
+          val (Braces o Nil Nil c)
+        else do
+          r <-
+            (if isText t2 "="
+               then sepBy1 "," (do
+                 x <- next
+                 eq <- expectSym "="
+                 e <- g.expr
+                 val (EFSet x eq e))
+               else sepBy1 "," g.expr)
+          c <- expectPunct "}"
+          val (mkBraces o r c))
+
+lambdaF :: Gram -> P E
+lambdaF g = do
+  bs <- next
+  binders <- many1 binderP
+  arrow <- expectSym "->"
+  body <- g.expr
+  val (Lam bs binders arrow body)
+
+caseExprF :: Gram -> P E
+caseExprF g = do
+  kw <- next
+  scrut <- g.expr
+  of2 <- expectKw "of"
+  alts <- block g.alt
+  val (Case kw scrut of2 alts)
+
+ifExprF :: Gram -> P E
+ifExprF g = do
+  kw <- next
+  c <- g.expr
+  th <- expectKw "then"
+  a <- g.expr
+  el <- expectKw "else"
+  b <- g.expr
+  val (If kw c th a el b)
+
+doExprF :: Gram -> P E
+doExprF g = do
+  kw <- next
+  stmts <- block g.stmt
+  val (Do kw stmts)
+
+stmtF :: Gram -> P E
+stmtF g = do
+  t <- peek
+  t2 <- peekAt 1
+  if isKind t "var" && isText t2 "<-"
+      then do
+        x <- next
+        arrow <- next
+        e <- g.expr
+        val (ESBind x arrow e)
+      else g.expr
+
+altF :: Gram -> P E
+altF g = do
+  p <- g.pattern
+  arrow <- expectSym "->"
+  body <- g.expr
+  val (EAlt p arrow body)
+
+commaSepEF :: Gram -> P (List CE)
+commaSepEF g = do
+  t <- peek
+  if isText t ","
+      then do
+        comma <- next
+        e <- g.expr
+        rest <- g.commaSepE
+        val (Cons (MkCE comma e) rest)
+      else val Nil
+
+patternF :: Gram -> P Pat
+patternF g = do
+  t <- peek
+  if isKind t "con" || isKind t "tag"
+      then do
+        c <- next
+        args <- many g.patAtom
+        val (PCon c args)
+      else g.patAtom
+
+morePatsF :: Gram -> P (List CP)
+morePatsF g = do
+  t <- peek
+  if isText t ","
+      then do
+        comma <- next
+        p <- g.pattern
+        rest <- g.morePats
+        val (Cons (MkCP comma p) rest)
+      else val Nil
+
+patAtomF :: Gram -> P Pat
+patAtomF g = do
+  t <- peek
+  b <- atBoundary
+  if b
+      then failAt t
+      else if isKind t "punct" && isText t "("
+      then do
+        o <- next
+        inBrackets (do
+          p <- g.pattern
+          c <- expectPunct ")"
+          val (PParen o p c))
+      else if isKind t "punct" && isText t "["
+      then do
+        o <- next
+        inBrackets (do
+          t2 <- peek
+          if isText t2 "]"
+              then do
+                c <- next
+                val (PList o Nil Nil c)
+              else do
+                p <- g.pattern
+                rest <- g.morePats
+                c <- expectPunct "]"
+                val (PList o (Cons p (map cpP rest)) (map cpT rest) c))
+      else if isPatAtomT t
+      then do
+        x <- next
+        val (PAtom x)
+      else failAt t
+
+conF :: Gram -> P E
+conF g = do
+  c <- next
+  args <- many g.atom
+  val (ECon c args)
+
 gram :: Gram
 gram =
-  { expr = do
-      t <- peek
-      e <-
-        (if isText t "\\" && isKind t "sym"
-           then gram.lambda
-           else if isKw t "case"
-           then gram.caseExpr
-           else if isKw t "if"
-           then gram.ifExpr
-           else if isKw t "do"
-           then gram.doExpr
-           else gram.opExpr 0)
-      t2 <- peek
-      b <- atBoundary
-      if isText t2 "::" && isKind t2 "sym" && not b
-          then do
-            cc <- next
-            ty <- gram.expr
-            val (Ann e cc ty)
-          else val e
-  , opExpr = \minPrec -> do
-      lhs <- gram.userOps
-      gram.opLoop minPrec lhs
-  , opLoop = \minPrec lhs -> do
-      t <- peek
-      b <- atBoundary
-      if isKind t "sym" && opPrecT t >= 1 && opPrecT t >= minPrec && not b
-          then do
-            op <- next
-            rhs <-
-              (if opPrecT op == 1
-                 then gram.arrowRhs
-                 else gram.opExpr (opPrecT op))
-            gram.opLoop minPrec (Op lhs op rhs)
-          else val lhs
-  , arrowRhs = do
-      t <- peek
-      if isText t "\\" || isKw t "case" || isKw t "if" || isKw t "do"
-          then gram.expr
-          else gram.opExpr 1
-  -- (a field whose first step already reads the record must go under a
-  -- lambda: `rec` is the definition itself dynamically, and the record is
-  -- still being built)
-  , userOps = \st ->
-        (do
-         e0 <- gram.app
-         rest <- gram.operands
-         val (if null rest then e0 else Ops e0 rest))
-          st
-  , operands = do
-      t <- peek
-      b <- atBoundary
-      if isOperatorT t && not b
-          then do
-            op <- next
-            u <- peek
-            if isText u "\\" || isKw u "case" || isKw u "if" || isKw u "do"
-                then do
-                  e <- gram.expr
-                  val (Cons (OpRhs op e) Nil)
-                else do
-                  e <- gram.app
-                  more <- gram.operands
-                  val (Cons (OpRhs op e) more)
-          else val Nil
-  , app = \st ->
-        (do
-         h <- gram.atom
-         args <- many gram.atom
-         val (if null args then h else App h args))
-          st
-  , atom = do
-      t <- peek
-      b <- atBoundary
-      if b || not (startsAtomT t)
-          then failAt t
-          else do
-            base <-
-              (if isKw t "data"
-                 then do
-                   kw <- next
-                   o <- expectPunct "{"
-                   inBrackets (do
-                     r <- sepBy1 "|" gram.con
-                     c <- expectPunct "}"
-                     val (mkSum kw o r c))
-                 else if isKind t "punct" && isText t "("
-                 then gram.parens
-                 else if isKind t "punct" && isText t "{"
-                 then gram.braces
-                 else if isKind t "punct" && isText t "["
-                 then do
-                   o <- next
-                   inBrackets (do
-                     t2 <- peek
-                     if isText t2 "]"
-                         then do
-                           c <- next
-                           val (Tup o Nil Nil c)
-                         else do
-                           e <- gram.expr
-                           rest <- gram.commaSepE
-                           c <- expectPunct "]"
-                           val (Tup o (Cons e (map ceE rest)) (map ceT rest) c))
-                 else do
-                   a <- next
-                   val (Atom a))
-            gram.fieldsOf base
-  , fieldsOf = \e -> do
-      t <- peek
-      if isKind t "field"
-          then do
-            f <- next
-            gram.fieldsOf (EField e f)
-          else val e
-  , parens = do
-      o <- next
-      inBrackets (do
-        t <- peek
-        t2 <- peekAt 1
-        if isOperatorT t && isText t2 ")"
-            then do
-              op <- next
-              c <- next
-              val (EParen o (Atom op) c)
-            else if (isKind t "var" || isKind t "con") && isText t2 ":="
-            then do
-              x <- next
-              k <- next
-              e <- gram.expr
-              c <- expectPunct ")"
-              val (Named o x k e c)
-            else do
-              e <- gram.expr
-              t3 <- peek
-              if isText t3 ","
-                  then do
-                    rest <- gram.commaSepE
-                    c <- expectPunct ")"
-                    val (Tup o (Cons e (map ceE rest)) (map ceT rest) c)
-                  else do
-                    c <- expectPunct ")"
-                    val (EParen o e c))
-  , braces = do
-      o <- next
-      inBrackets (do
-        t <- peek
-        t2 <- peekAt 1
-        if isText t "}"
-            then do
-              c <- next
-              val (Braces o Nil Nil c)
-            else do
-              r <-
-                (if isText t2 "="
-                   then sepBy1 "," (do
-                     x <- next
-                     eq <- expectSym "="
-                     e <- gram.expr
-                     val (EFSet x eq e))
-                   else sepBy1 "," gram.expr)
-              c <- expectPunct "}"
-              val (mkBraces o r c))
-  , lambda = do
-      bs <- next
-      binders <- many1 binderP
-      arrow <- expectSym "->"
-      body <- gram.expr
-      val (Lam bs binders arrow body)
-  , caseExpr = do
-      kw <- next
-      scrut <- gram.expr
-      of2 <- expectKw "of"
-      alts <- block gram.alt
-      val (Case kw scrut of2 alts)
-  , ifExpr = do
-      kw <- next
-      c <- gram.expr
-      th <- expectKw "then"
-      a <- gram.expr
-      el <- expectKw "else"
-      b <- gram.expr
-      val (If kw c th a el b)
-  , doExpr = do
-      kw <- next
-      stmts <- block gram.stmt
-      val (Do kw stmts)
-  , stmt = do
-      t <- peek
-      t2 <- peekAt 1
-      if isKind t "var" && isText t2 "<-"
-          then do
-            x <- next
-            arrow <- next
-            e <- gram.expr
-            val (ESBind x arrow e)
-          else gram.expr
-  , alt = \st ->
-        (do
-         p <- gram.pattern
-         arrow <- expectSym "->"
-         body <- gram.expr
-         val (EAlt p arrow body))
-          st
-  , commaSepE = do
-      t <- peek
-      if isText t ","
-          then do
-            comma <- next
-            e <- gram.expr
-            rest <- gram.commaSepE
-            val (Cons (MkCE comma e) rest)
-          else val Nil
-  , pattern = do
-      t <- peek
-      if isKind t "con" || isKind t "tag"
-          then do
-            c <- next
-            args <- many gram.patAtom
-            val (PCon c args)
-          else gram.patAtom
-  , morePats = do
-      t <- peek
-      if isText t ","
-          then do
-            comma <- next
-            p <- gram.pattern
-            rest <- gram.morePats
-            val (Cons (MkCP comma p) rest)
-          else val Nil
-  , patAtom = do
-      t <- peek
-      b <- atBoundary
-      if b
-          then failAt t
-          else if isKind t "punct" && isText t "("
-          then do
-            o <- next
-            inBrackets (do
-              p <- gram.pattern
-              c <- expectPunct ")"
-              val (PParen o p c))
-          else if isKind t "punct" && isText t "["
-          then do
-            o <- next
-            inBrackets (do
-              t2 <- peek
-              if isText t2 "]"
-                  then do
-                    c <- next
-                    val (PList o Nil Nil c)
-                  else do
-                    p <- gram.pattern
-                    rest <- gram.morePats
-                    c <- expectPunct "]"
-                    val (PList o (Cons p (map cpP rest)) (map cpT rest) c))
-          else if isPatAtomT t
-          then do
-            x <- next
-            val (PAtom x)
-          else failAt t
-  , con = do
-      c <- next
-      args <- many gram.atom
-      val (ECon c args)
+  { expr = \st -> exprF gram st
+  , opExpr = \minPrec st -> opExprF gram minPrec st
+  , opLoop = \minPrec lhs st -> opLoopF gram minPrec lhs st
+  , arrowRhs = \st -> arrowRhsF gram st
+  , userOps = \st -> userOpsF gram st
+  , operands = \st -> operandsF gram st
+  , app = \st -> appF gram st
+  , atom = \st -> atomF gram st
+  , fieldsOf = \e st -> fieldsOfF gram e st
+  , parens = \st -> parensF gram st
+  , braces = \st -> bracesF gram st
+  , lambda = \st -> lambdaF gram st
+  , caseExpr = \st -> caseExprF gram st
+  , ifExpr = \st -> ifExprF gram st
+  , doExpr = \st -> doExprF gram st
+  , stmt = \st -> stmtF gram st
+  , alt = \st -> altF gram st
+  , commaSepE = \st -> commaSepEF gram st
+  , pattern = \st -> patternF gram st
+  , morePats = \st -> morePatsF gram st
+  , patAtom = \st -> patAtomF gram st
+  , con = \st -> conF gram st
   }
 
 -- The declarations
