@@ -2,11 +2,43 @@
 // heff runs in a thread of its own, whose stack is deep enough for the
 // interpreter to go as deep as a program does (a list of a million, say);
 // the language server, which speaks on stdin and stdout, runs here.
+//
+// The formatter is written in heff (fmt/): before `fmt` or `lsp`, it is
+// compiled -- by heff itself -- when output/heff-fmt.mjs is missing or
+// older than its sources or the compiler, then loaded for Heff.Format.
 import { Worker, isMainThread } from "node:worker_threads";
-import { main } from "../output/Main/index.js";
+import { spawnSync } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-if (!isMainThread || process.argv[2] === "lsp") main();
-else {
+const here = fileURLToPath(import.meta.url);
+const root = join(dirname(here), "..");
+const fmtJs = join(root, "output", "heff-fmt.mjs");
+
+const ensureFmt = () => {
+  const mtime = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
+  const srcs = [
+    join(root, "output", "Main", "index.js"),
+    ...["prelude", "array", "map", "doc"].map((m) => join(root, "lib", m + ".hf")),
+    ...readdirSync(join(root, "fmt")).filter((f) => f.endsWith(".hf")).map((f) => join(root, "fmt", f)),
+  ];
+  const out = mtime(fmtJs);
+  if (out >= 0 && srcs.every((s) => mtime(s) <= out)) return;
+  const r = spawnSync(process.execPath, [ here, "compile-js", join(root, "fmt", "layout.hf"), fmtJs ], { stdio: "inherit" });
+  if (r.status !== 0) process.exit(r.status ?? 1);
+};
+
+const cmd = process.argv[2];
+if (!isMainThread || cmd === "lsp") {
+  if (cmd === "fmt" || cmd === "lsp") {
+    ensureFmt();
+    const m = await import(pathToFileURL(fmtJs));
+    globalThis.$heffFormatUnchecked = m.default.formatUnchecked;
+  }
+  const { main } = await import(pathToFileURL(join(root, "output", "Main", "index.js")));
+  main();
+} else {
   const worker = new Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: { stackSizeMb: 512 } });
   worker.on("error", (e) => { console.error(e); process.exitCode = 1; });
   worker.on("exit", (code) => { if (code !== 0) process.exitCode = code; });

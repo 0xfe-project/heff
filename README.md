@@ -154,3 +154,9 @@ under a handler written in heff (`test/surface/dom-trace.hf`).
 ## Developing
 
 `npm test` runs the tests.
+
+The formatter is written in heff itself (`fmt/`): `heff fmt` and the
+language server compile it -- with heff -- when it is missing or stale
+(`output/heff-fmt.mjs`), and lay files out through it.  The layout in
+`Heff.Format` stays as the reference: `test/fmt-port.mjs` holds the two
+byte for byte the same over every `.hf` file of the repository.

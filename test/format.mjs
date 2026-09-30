@@ -6,10 +6,15 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { format } from "../output/Heff.Format/index.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// `format` lays out through the formatter written in heff: have the CLI
+// compile it if it is stale, then load it, as `bin/heff.mjs` does
+execFileSync("node", [ join(root, "bin", "heff.mjs"), "fmt", "--check", join(root, "lib", "doc.hf") ]);
+globalThis.$heffFormatUnchecked = (await import(pathToFileURL(join(root, "output", "heff-fmt.mjs")))).default.formatUnchecked;
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}:\n${got}`); } };
 const run = (src) => {

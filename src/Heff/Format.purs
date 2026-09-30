@@ -39,10 +39,24 @@ import Heff.Support.BigInt as BI
 import Heff.Support.Pretty (Doc, (<+>))
 import Heff.Support.Pretty as P
 
+-- | the layout of the formatter written in heff (`fmt/`, compiled by the
+-- | build), if it is loaded
+foreign import heffLayoutImpl :: String -> { available :: Boolean, ok :: Boolean, value :: String }
+
+-- | a file laid out by the formatter written in heff; the layout below
+-- | stands in until the build has compiled it (they are the same, byte
+-- | for byte: test/fmt-port.mjs)
+layout :: String -> Either String String
+layout src =
+  let r = heffLayoutImpl src
+  in
+    if r.available then (if r.ok then Right r.value else Left r.value)
+    else formatUnchecked src
+
 -- | a file formatted, or why it was left as it is
 format :: String -> Either String String
 format src = do
-  out <- formatUnchecked src
+  out <- layout src
   check src out
   pure out
 
