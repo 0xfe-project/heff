@@ -171,7 +171,7 @@ ty c p xs = case _ of
   Syn.Function f -> paren (p >= 1) (arrow f)
   Syn.Record r ->
     let
-      fields = A.foldl (\acc (Tuple l t) -> { names: l : acc.names, out: A.snoc acc.out (l <> " :: " <> ty c 0 acc.names t) })
+      fields = A.foldl (\acc (Tuple l t) -> { names: l : acc.names, out: A.snoc acc.out (l <> " : " <> ty c 0 acc.names t) })
         { names: xs, out: [] } (dictToList r.fieldTypes)
     in "{ " <> S.joinWith ", " fields.out <> " }"
   Syn.Sum (Variants vs) -> "data { " <> S.joinWith " | " (map (\(Tuple t ts) -> S.joinWith " " (A.cons (tagText t) (map (ty c 2 xs) ts))) (dictToList vs)) <> " }"
@@ -185,8 +185,8 @@ ty c p xs = case _ of
     Syn.Abs x b | f.implicit ->
       -- `{a b :: T}`: implicit binders of the same type, together
       let r = implicits [ x ] f.dom b (x : xs)
-      in "{" <> S.joinWith " " r.names <> " :: " <> ty c 0 xs f.dom <> "} -> " <> ty c 0 r.ctx r.rest
-    Syn.Abs x b -> "(" <> x <> " :: " <> ty c 0 xs f.dom <> ") -> " <> ty c 0 (x : xs) b
+      in "{" <> S.joinWith " " r.names <> " : " <> ty c 0 xs f.dom <> "} -> " <> ty c 0 r.ctx r.rest
+    Syn.Abs x b -> "(" <> x <> " : " <> ty c 0 xs f.dom <> ") -> " <> ty c 0 (x : xs) b
     Syn.AbsConst b -> ty c 1 xs f.dom <> " -> " <> ty c 0 xs b
   -- (only binders of a universe: their types cannot mention one another)
   implicits names dom rest ctx = case rest, dom of
@@ -199,14 +199,14 @@ ty c p xs = case _ of
 printDef :: Implicits -> Name -> Syn.Ty -> Syn.El -> String
 printDef im name t body =
   case primitive body of
-    Just _ -> "foreign import " <> name <> " :: " <> printTy im 0 Nil t <> "\n"
+    Just _ -> "foreign import " <> name <> " : " <> printTy im 0 Nil t <> "\n"
     Nothing -> case typeFormer t body (name : Nil) [] of
       Just tf -> case tf.def of
         Syn.Sum (Variants vs) | not tf.large ->
           "data " <> head tf.params <> (if A.null (dictToList vs) then "" else " = " <> S.joinWith " | " (map (\(Tuple x ts) -> S.joinWith " " (A.cons (tagText x) (map (ty c 2 tf.names) ts))) (dictToList vs))) <> "\n"
         Syn.Record r | tf.large ->
           let
-            fields = A.foldl (\acc (Tuple l ft) -> { names: l : acc.names, out: A.snoc acc.out ("  " <> l <> " :: " <> ty c 0 acc.names ft) })
+            fields = A.foldl (\acc (Tuple l ft) -> { names: l : acc.names, out: A.snoc acc.out ("  " <> l <> " : " <> ty c 0 acc.names ft) })
               { names: tf.names, out: [] } (dictToList r.fieldTypes)
           in "theory " <> head tf.params <> " where\n" <> S.joinWith "\n" fields.out <> "\n"
         other | not tf.large -> "type " <> head tf.params <> " = " <> ty c 0 tf.names other <> "\n"
@@ -215,7 +215,7 @@ printDef im name t body =
   where
   c = { im, indent: 0 }
   general =
-    name <> " :: " <> printTy im 0 Nil t <> "\n"
+    name <> " : " <> printTy im 0 Nil t <> "\n"
       <> case equationsWith { tag: tagText, sep: "=", minRows: 1, body: \ns e -> el { im, indent: 0 } 0 ns e } name (name : Nil) t body of
         Just eqs -> S.joinWith "" (map (_ <> "\n") eqs)
         Nothing -> name <> " = " <> el { im, indent: 0 } 0 (name : Nil) body <> "\n"
@@ -236,7 +236,7 @@ typeFormer t body ns params = case t, body of
     -- (a parameter of type `Type` is bare if it is lower case: `data List a`)
     let param = case f.dom of
           Syn.U SmallU | not (upper x) -> x
-          d -> "(" <> x <> " :: " <> printTy { names: \_ _ -> [], hide: false } 0 ns d <> ")"
+          d -> "(" <> x <> " : " <> printTy { names: \_ _ -> [], hide: false } 0 ns d <> ")"
     in typeFormer cod b (x : ns) (A.snoc params param)
   _, Syn.Is b -> typeFormer t b ns params
   _, _ -> Nothing

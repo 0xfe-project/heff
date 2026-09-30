@@ -360,14 +360,14 @@ decl = lazyP \_ -> do
       w <- expectKw "where"
       DTheory kw name params w <$> block do
         x <- next
-        cc <- expectSym "::"
+        cc <- expectAnn
         ty <- expr
         pure { name: x, colons: cc, ty }
     "kw", "foreign" -> do
       kw <- next
       imp <- expectKw "import"
       x <- expectKind "var"
-      cc <- expectSym "::"
+      cc <- expectAnn
       DForeign kw imp x cc <$> expr
     "kw", "test" -> do
       kw <- next
@@ -391,7 +391,7 @@ decl = lazyP \_ -> do
         else failAt t
       name <- A.replicate len unit # traverseNext
       u <- peek
-      if u.text == "::" then do
+      if isAnnText u.text then do
         cc <- next
         DSig name cc <$> expr
       else do
@@ -408,7 +408,7 @@ dataDecl = do
   params <- many atom
   t0 <- peek
   universe <-
-    if t0.text == "::" && t0.kind == "sym" then do
+    if isAnnText t0.text && t0.kind == "sym" then do
       cc <- next
       u <- app
       pure (Just (Tuple cc u))
@@ -439,7 +439,7 @@ expr = lazyP \_ -> do
     _, _ -> opExpr 0
   t' <- peek
   b <- atBoundary
-  if t'.text == "::" && t'.kind == "sym" && not b then do
+  if isAnnText t'.text && t'.kind == "sym" && not b then do
     cc <- next
     Ann e cc <$> expr
   else pure e
@@ -621,7 +621,7 @@ lambda = lazyP \_ -> do
           x <- peek
           when (x.kind /= "var" && x.kind /= "con") (failAt x)
           x' <- next
-          cc <- expectSym "::"
+          cc <- expectAnn
           ty <- expr
           c <- expectPunct ")"
           pure (BAnn o x' cc ty c)
@@ -788,6 +788,14 @@ sepBy1 sep p = do
       else pure acc
   go { items: [ x ], seps: [] }
 
+isAnnText :: String -> Boolean
+isAnnText x = x == ":" || x == "::"
+
+expectAnn :: P T
+expectAnn = do
+  t <- peek
+  if t.kind == "sym" && isAnnText t.text then next else failAt t
+
 expectSym :: String -> P T
 expectSym x = do
   t <- peek
@@ -839,7 +847,7 @@ blankLine = P.text blankMark <> P.hardline
 -- | a token, with its comments: those before it on lines of their own, and
 -- | the one after it on its line (after which the line ends)
 tok :: Env -> T -> Doc
-tok env t = leading <> foldMap (\c -> comment c <> P.text " ") (fromMaybe [] (Map.lookup t.ix env.inline)) <> P.text t.raw <> trailing
+tok env t = leading <> foldMap (\c -> comment c <> P.text " ") (fromMaybe [] (Map.lookup t.ix env.inline)) <> P.text (if t.kind == "sym" && t.text == "::" then ":" else t.raw) <> trailing
   where
   cs = if t.ix == env.noLead then [] else fromMaybe [] (Map.lookup t.ix env.lead)
   leading = if A.null cs then mempty else foldMap (\c -> P.hardline <> comment c.text) cs <> P.hardline

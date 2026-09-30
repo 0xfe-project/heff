@@ -34,7 +34,7 @@ import Data.Array as A
 import Data.Array.NonEmpty as NEA
 import Data.Foldable (for_)
 import Data.Either (Either(..))
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Number as Number
 import Data.String as S
 import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, group, ntnSpan)
@@ -47,6 +47,11 @@ type Tok = { kind :: String, text :: String, start :: Int, end :: Int, line :: I
 type Comment = { start :: Int, end :: Int, text :: String }
 
 foreign import lexImpl :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String }, comments :: Array Comment }
+
+
+-- | `:` annotates (`::` is still read, and written back as `:`)
+isAnnText :: String -> Boolean
+isAnnText x = x == ":" || x == "::"
 
 -- | the tokens, and apart from them the comments (`--` and `{- -}`)
 lex :: String -> { tokens :: Array Tok, errors :: Array { start :: Int, end :: Int, msg :: String }, comments :: Array Comment }
@@ -153,7 +158,7 @@ prescan ts = A.catMaybes (A.mapWithIndex one ts)
   at k = A.index ts k
   one k t
     | t.first && t.col == 0 && t.kind == "kw" && A.elem t.text [ "data", "type", "theory" ] = at (k + 1) <#> _.text
-    | t.first && t.col == 0 && (t.kind == "var" || t.kind == "con") && ((at (k + 1) <#> _.text) == Just "::") = Just t.text
+    | t.first && t.col == 0 && (t.kind == "var" || t.kind == "con") && (maybe false isAnnText (at (k + 1) <#> _.text)) = Just t.text
     | otherwise = Nothing
 
 -- Declarations
@@ -225,7 +230,7 @@ decl = lazyP \_ -> do
         Nothing -> throwError (diag (spanOf t) ("a declaration cannot start with `" <> t.text <> "`"))
         Just f -> do
           t2 <- peekAt f.len
-          if t2.text == "::" then do
+          if isAnnText t2.text then do
             modify_ \s -> s { i = s.i + f.len + 1 }
             ty <- expr
             end <- prevEnd
@@ -277,7 +282,7 @@ dataDecl = lazyP \_ -> do
   withScope (A.concatMap binderNames params) do
     t0 <- peek
     universe <-
-      if t0.text == "::" && t0.kind == "sym" then next *> app
+      if isAnnText t0.text && t0.kind == "sym" then next *> app
       else pure (Keyword "Type" (spanOf name))
     t <- peek
     alts <-
@@ -320,7 +325,7 @@ dataParam = lazyP \_ -> do
     case p of
       Infix (Ident _ _) (Keyword ":" _) _ -> pure p
       NBlock "sig" Nothing [ f@(Infix (Ident _ _) (Keyword ":" _) _) ] sp -> pure (NBrace f sp)
-      _ -> throwError (diag (ntnSpan p) "a parameter is `a`, `(x :: T)` or `{x :: T}`")
+      _ -> throwError (diag (ntnSpan p) "a parameter is `a`, `(x : T)` or `{x : T}`")
   else throwError (diag (spanOf t) "no parameter here")
 
 -- | the names a (function) type binds: `(x :: A) -> …`, `{x :: A} -> …`
@@ -373,7 +378,7 @@ theoryDecl = lazyP \_ -> do
   field = do
     x <- next
     unless (x.kind == "var" || x.kind == "con") $ throwError (diag (spanOf x) "a field is `name :: Type`")
-    _ <- expectSym "::"
+    _ <- expectAnn
     ty <- expr
     modify_ \s -> s { scope = A.cons x.text s.scope }
     pure (Infix (Ident x.text (spanOf x)) (Keyword ":" (spanOf x)) ty)
@@ -384,7 +389,7 @@ foreignDecl = lazyP \_ -> do
   kw <- next
   _ <- expectKw "import"
   x <- expectKind "var" "the primitive's name"
-  _ <- expectSym "::"
+  _ <- expectAnn
   ty <- expr
   let sp = { start: kw.start, end: (ntnSpan ty).end }
   pure (MDecl [] "primitive" (Infix (Ident x.text (spanOf x)) (Keyword ":" sp) ty) sp)
@@ -415,7 +420,7 @@ assembleDiags items = A.mapMaybe one items
     _ -> Nothing) items
   one = case _ of
     Sig f _ sp | not (A.elem f eqNames) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
-    Eqn f _ sp | not (A.elem f sigs) -> Just (diag sp ("`" <> f <> "` needs a type: `" <> f <> " :: …`"))
+    Eqn f _ sp | not (A.elem f sigs) -> Just (diag sp ("`" <> f <> "` needs a type: `" <> f <> " : …`"))
     _ -> Nothing
 
 -- Expressions
@@ -434,7 +439,7 @@ expr = lazyP \_ -> do
   -- `e :: T`, an annotation
   t' <- peek
   b <- atBoundary
-  if t'.text == "::" && t'.kind == "sym" && not b then do
+  if isAnnText t'.text && t'.kind == "sym" && not b then do
     _ <- next
     ty <- expr
     pure (Infix e (Keyword ":" (spanOf t')) ty)
@@ -777,13 +782,13 @@ lambda = lazyP \_ -> do
         _ <- next
         inBrackets do
           x <- peek
-          when (x.kind /= "var" && x.kind /= "con") $ throwError (diag (spanOf x) "expected a binder's name: `\\(x :: T) -> e`")
+          when (x.kind /= "var" && x.kind /= "con") $ throwError (diag (spanOf x) "expected a binder's name: `\\(x : T) -> e`")
           _ <- next
-          cc <- expectSym "::"
+          cc <- expectAnn
           ty <- expr
           _ <- expectPunct ")"
           pure (Infix (Ident x.text (spanOf x)) (Keyword ":" (spanOf cc)) ty)
-      _, _ -> throwError (diag (spanOf t) "a lambda binds names: `\\x y -> e`, `\\(x :: T) -> e`")
+      _, _ -> throwError (diag (spanOf t) "a lambda binds names: `\\x y -> e`, `\\(x : T) -> e`")
   bound = case _ of
     Ident x _ -> [ x ]
     NBrace (Ident x _) _ -> [ x ]
@@ -984,6 +989,11 @@ sepBy1 sep p = do
       t <- peek
       if t.text == sep then next *> p >>= \y -> go (A.snoc acc y) else pure acc
   go [ x ]
+
+expectAnn :: P Tok
+expectAnn = do
+  t <- peek
+  if t.kind == "sym" && isAnnText t.text then next else throwError (diag (spanOf t) "expected `:`")
 
 expectSym :: String -> P Tok
 expectSym x = do

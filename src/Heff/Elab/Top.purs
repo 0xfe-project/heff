@@ -454,7 +454,7 @@ elabWatch g n = do
   j <- parse N n
   s <- case j of
     SynJ s -> pure s
-    _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `-- >>> (e :: T)`")
+    _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `-- >>> (e : T)`")
   Tuple t ty <- R.runSyn s (emptyElabEnv g)
   runDelayed true
   stuck <- retryPostponed g

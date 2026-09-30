@@ -227,7 +227,7 @@ evalWatch name g = maybe "" (\(Tuple _ res) -> P.render (showResult res)) (A.hea
 readExpectation :: Globals -> String -> String -> Maybe String
 readExpectation g ty e =
   let
-    r = readProgram (\x -> isJust (lookupGlobal g x)) ("-- >>> (" <> e <> " :: " <> ty <> ")\n")
+    r = readProgram (\x -> isJust (lookupGlobal g x)) ("-- >>> (" <> e <> " : " <> ty <> ")\n")
     t = topWith g r.ntns
   in
     if not (A.null r.diags && A.null t.diags) then Nothing
@@ -349,7 +349,7 @@ completionsAt c offset =
 typeAt :: Checked -> Int -> Maybe String
 typeAt c off =
   infoAt c off <#> \i ->
-    named i.name <> " :: " <> force i.ty <> (case i.key of
+    named i.name <> " : " <> force i.ty <> (case i.key of
       Just _ -> "   (global)"
       Nothing -> "   (local)")
 

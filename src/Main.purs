@@ -89,7 +89,7 @@ main = do
   case A.drop 2 args of
     [ "check", f ] -> do
       l <- load f
-      for_ (definitions l.file) \d -> log (d.name <> " :: " <> d.type)
+      for_ (definitions l.file) \d -> log (d.name <> " : " <> d.type)
       when (not l.ok) (exit' 1)
     [ "eval", f ] -> do
       l <- load f

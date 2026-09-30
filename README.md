@@ -12,15 +12,15 @@ import co
 
 data List a = Nil | Cons a (List a)
 
-map :: {a b :: Type} -> (a -> b) -> List a -> List b   -- {…}: implicit
+map : {a b : Type} -> (a -> b) -> List a -> List b   -- {…}: implicit
 map f Nil = Nil
 map f (Cons y ys) = Cons (f y) (map f ys)
 
 theory Monoid where
-  t :: Type
-  m :: t -> t -> t
+  t : Type
+  m : t -> t -> t
 
-foreign import intAdd :: Int -> Int -> Int              -- a primitive
+foreign import intAdd : Int -> Int -> Int              -- a primitive
 
 -- >>> map not (Cons False Nil)
 -- Cons True Nil
@@ -55,11 +55,11 @@ heff completions fish          # > ~/.config/fish/completions/heff.fish
 
 ## The language
 
-`::` annotates, everywhere; a capitalised name is a constructor unless it
+`:` annotates, everywhere (`::` is still read, and written back as `:` by the formatter); a capitalised name is a constructor unless it
 names a definition or a binder; `f (a := T)` gives an implicit argument by
 name; `case`/`of`, `if`, `do`, `\x -> e`, records `{ x = 1 }` and record
-types `{ x :: Int }`, lists `[1, 2, 3]` (`Cons 1 (Cons 2 (Cons 3 Nil))`,
-in patterns too).  `\(x :: T) -> e` annotates a lambda's binder: the
+types `{ x : Int }`, lists `[1, 2, 3]` (`Cons 1 (Cons 2 (Cons 3 Nil))`,
+in patterns too).  `\(x : T) -> e` annotates a lambda's binder: the
 lambda then says its own type, where an argument of `map` would
 otherwise be checked before the type is known (a projection `x.field`
 there needs it -- the error says so).  A function is defined by equations, each a case; a
@@ -80,7 +80,7 @@ infixl + - above ==
 infixl * / above + -
 infixr ++ above ==
 
-(+) :: Int -> Int -> Int
+(+) : Int -> Int -> Int
 (+) = intAdd
 ```
 

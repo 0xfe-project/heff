@@ -446,7 +446,7 @@ recordElim sp projectee x = Syn \e -> do
     _ -> failWith sp 6 (txt "tried to project from a value that was not of a record type")
   where
   notInHand f =
-    txt ("the record's shape is not in hand here for `." <> f <> "`: annotate the binder, `\\(x :: T) -> ...`, or give the implicit argument, `(a := T)`")
+    txt ("the record's shape is not in hand here for `." <> f <> "`: annotate the binder, `\\(x : T) -> ...`, or give the implicit argument, `(a := T)`")
 
 recordSpec :: Span -> Syn -> Name -> Chk -> Syn
 recordSpec sp s x c = Syn \e -> do
@@ -495,7 +495,7 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
           else
             failWith sp 16 (txt "wrong number of arguments for tag" <+> txt x <+> txt "in type" <+> prtIn e a)
       Nothing -> failWith sp 15 (txt "no such tag" <+> txt x <+> txt "in type" <+> prtIn e a)
-    _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt (tagText x) <> txt " ... :: T)`")
+    _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt (tagText x) <> txt " ... : T)`")
     _ -> failWith sp 14 (txt "cannot check tag syntax at non-sum type")
 
 -- | a tag or a field, where it is written, as a name of the type it is of

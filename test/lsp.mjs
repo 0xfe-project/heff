@@ -62,7 +62,7 @@ try {
   notify("initialized", {});
 
   // a type error, in the editor's text (not the file's)
-  const bad = 'import a\n\ntwice :: Bool -> Bool\ntwice b = not (not "x")\n';
+  const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = not (not "x")\n';
   open("test/modules/b.hf", bad);
   let ds = await diagnosticsOf(uri("test/modules/b.hf"));
   const at = pos(bad, '"x"');
@@ -71,15 +71,15 @@ try {
     ds[0].message.includes("expected type Bool, but got type String"), ds);
 
   // fixed, with a change (full sync, debounced), and non-ASCII before a name
-  const good = "import a\n\ntwice :: Bool -> Bool\ntwice b = {- 😀 λ -} not (not b)\n";
+  const good = "import a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} not (not b)\n";
   notify("textDocument/didChange", { textDocument: { uri: uri("test/modules/b.hf"), version: 2 }, contentChanges: [{ text: good }] });
   ds = await diagnosticsOf(uri("test/modules/b.hf"));
   expect("no diagnostics once fixed", ds.length === 0, ds);
 
   const hover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/b.hf") }, position: pos(good, "not", 1) });
-  expect("hover past non-ASCII text", hover.result && hover.result.contents.value.includes("not :: Bool -> Bool") && hover.result.contents.value.includes("(global)"), hover.result);
+  expect("hover past non-ASCII text", hover.result && hover.result.contents.value.includes("not : Bool -> Bool") && hover.result.contents.value.includes("(global)"), hover.result);
   const local = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/b.hf") }, position: pos(good, "b)") });
-  expect("hover on a local", local.result && local.result.contents.value.includes("b :: Bool") && local.result.contents.value.includes("(local)"), local.result);
+  expect("hover on a local", local.result && local.result.contents.value.includes("b : Bool") && local.result.contents.value.includes("(local)"), local.result);
   const nothing = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/b.hf") }, position: { line: 1, character: 0 } });
   expect("hover on nothing", nothing.result === null, nothing.result);
 
@@ -96,17 +96,17 @@ try {
   const qDef = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
   expect("definition of a qualified name", qDef.result && qDef.result.uri === uri("test/modules/a.hf") && qDef.result.range.start.line === notAt.line, qDef.result);
   const qHover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
-  expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.not :: A.Bool -> A.Bool"), qHover.result);
+  expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.not : A.Bool -> A.Bool"), qHover.result);
 
   // completion: the names in scope that start as the one being typed; after
   // `A.`, the definitions of the module imported as `A`
-  const typing = "import prelude\n\nx :: Int\nx = len";
+  const typing = "import prelude\n\nx : Int\nx = len";
   open("test/surface/lsp-complete.hf", typing);
   await diagnosticsOf(uri("test/surface/lsp-complete.hf"));
   const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 3, character: 7 } });
   const lengthItem = comp.result && comp.result.find((i) => i.label === "length");
   expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("List a -> Int") && !comp.result.some((i) => i.label === "map"), comp.result && comp.result.map((i) => i.label));
-  const dotted = "import a as A\n\nx :: A.Bool\nx = A.";
+  const dotted = "import a as A\n\nx : A.Bool\nx = A.";
   open("test/modules/lsp-dot.hf", dotted);
   await diagnosticsOf(uri("test/modules/lsp-dot.hf"));
   const dot = await request("textDocument/completion", { textDocument: { uri: uri("test/modules/lsp-dot.hf") }, position: { line: 3, character: 6 } });
@@ -118,12 +118,12 @@ try {
   ds = await diagnosticsOf(uri("test/surface/basics.hf"));
   expect("basics.hf elaborates", ds.length === 0, ds);
   const own = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)") });
-  const ownAt = pos(basics, "not ::");
+  const ownAt = pos(basics, "not :");
   expect("definition in the same file", own.result && own.result.uri === uri("test/surface/basics.hf") && own.result.range.start.line === ownAt.line && own.result.range.start.character === 0, own.result);
   const loc = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
   expect("no definition for a local", loc.result === null, loc.result);
 
-  const withLib = "import prelude\n\nx :: Bool\nx = True\n";
+  const withLib = "import prelude\n\nx : Bool\nx = True\n";
   open("test/surface/lsp-lib.hf", withLib);
   ds = await diagnosticsOf(uri("test/surface/lsp-lib.hf"));
   expect("an unsaved file importing the library", ds.length === 0, ds);
@@ -144,13 +144,13 @@ try {
   open("examples/counter/counter.hf", counter);
   await diagnosticsOf(uri("examples/counter/counter.hf"));
   const inDo = await request("textDocument/hover", { textDocument: { uri: uri("examples/counter/counter.hf") }, position: pos(counter, "showCount 0") });
-  expect("hover in a do block", inDo.result && inDo.result.contents.value.includes("showCount :: Int -> String"), inDo.result);
+  expect("hover in a do block", inDo.result && inDo.result.contents.value.includes("showCount : Int -> String"), inDo.result);
   const defInDo = await request("textDocument/definition", { textDocument: { uri: uri("examples/counter/counter.hf") }, position: pos(counter, "showCount 0") });
-  expect("definition in a do block", defInDo.result && defInDo.result.range.start.line === pos(counter, "showCount ::").line, defInDo.result);
+  expect("definition in a do block", defInDo.result && defInDo.result.range.start.line === pos(counter, "showCount :").line, defInDo.result);
 
   // a name bound in a `do` block: nothing is recorded of it, and `bind` is not there
   const onBinder = await request("textDocument/hover", { textDocument: { uri: uri("examples/counter/counter.hf") }, position: pos(counter, "label <-") });
-  expect("hover on a do binder is not bind's", onBinder.result === null || !onBinder.result.contents.value.includes("bind ::"), onBinder.result);
+  expect("hover on a do binder is not bind's", onBinder.result === null || !onBinder.result.contents.value.includes("bind :"), onBinder.result);
 
   // a constructor, in an expression and in a pattern: where its type declares it
   const consAt = pos(basics, "Cons a (List a)");
@@ -160,21 +160,21 @@ try {
   }
 
   // an operator: `+` of the prelude
-  const withOps = "import prelude\n\nx :: Int\nx = 1 + 2 * 3\n";
+  const withOps = "import prelude\n\nx : Int\nx = 1 + 2 * 3\n";
   open("test/surface/lsp-ops.hf", withOps);
   ds = await diagnosticsOf(uri("test/surface/lsp-ops.hf"));
   expect("operators of the prelude", ds.length === 0, ds);
   const plusHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-ops.hf") }, position: pos(withOps, "+") });
-  expect("hover on an operator", plusHover.result && plusHover.result.contents.value.includes("(+) :: Int -> Int -> Int"), plusHover.result);
+  expect("hover on an operator", plusHover.result && plusHover.result.contents.value.includes("(+) : Int -> Int -> Int"), plusHover.result);
   const plusDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-ops.hf") }, position: pos(withOps, "+") });
-  const plusAt = pos(disk("lib/prelude.hf"), "(+) ::");
+  const plusAt = pos(disk("lib/prelude.hf"), "(+) :");
   expect("definition of an operator", plusDef.result && plusDef.result.uri === uri("lib/prelude.hf") && plusDef.result.range.start.line === plusAt.line, plusDef.result);
 
   // a field, set in a record and projected: where its theory declares it
   const co = disk("lib/co.hf");
   open("lib/co.hf", co);
   await diagnosticsOf(uri("lib/co.hf"));
-  const hmapAt = pos(co, "hmap ::");
+  const hmapAt = pos(co, "hmap :");
   for (const [what, at] of [["set in a record", pos(co, "hmap = ")], ["projected", pos(co, "hmap nt x")]]) {
     const d = await request("textDocument/definition", { textDocument: { uri: uri("lib/co.hf") }, position: at });
     expect("definition of a field " + what, d.result && d.result.range.start.line === hmapAt.line && d.result.range.start.character === hmapAt.character, d.result);
@@ -186,8 +186,8 @@ try {
   await diagnosticsOf(uri("test/surface/lsp-fmt.hf"));
   const fmt = await request("textDocument/formatting", { textDocument: { uri: uri("test/surface/lsp-fmt.hf") }, options: { tabSize: 2, insertSpaces: true } });
   expect("formatting", Array.isArray(fmt.result) && fmt.result.length === 1 &&
-    fmt.result[0].newText === "data Bool = True | False\n\nnot :: Bool -> Bool\nnot True = False -- c\nnot False = True\n", fmt.result);
-  open("test/surface/lsp-bad.hf", "x :: Bool\nx = (\n");
+    fmt.result[0].newText === "data Bool = True | False\n\nnot : Bool -> Bool\nnot True = False -- c\nnot False = True\n", fmt.result);
+  open("test/surface/lsp-bad.hf", "x : Bool\nx = (\n");
   await diagnosticsOf(uri("test/surface/lsp-bad.hf"));
   const refused = await request("textDocument/formatting", { textDocument: { uri: uri("test/surface/lsp-bad.hf") }, options: { tabSize: 2, insertSpaces: true } });
   const shown = await note((m) => m.method === "window/showMessage", "window/showMessage");
