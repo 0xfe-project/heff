@@ -206,7 +206,7 @@ data E
 
 data Fld = FSet T T E | FDecl E
 
-data Bnd = BVar T | BImp T T T
+data Bnd = BVar T | BImp T T T | BAnn T T T E T
 
 type Con = { con :: T, args :: Array E }
 
@@ -612,9 +612,19 @@ lambda = lazyP \_ -> do
   binder = do
     t <- peek
     case t.kind, t.text of
-      -- (a binder is a name, capitalised or not)
+      -- (a binder is a name, capitalised or not, or `(x :: T)`)
       "var", _ -> BVar <$> next
       "con", _ -> BVar <$> next
+      "punct", "(" -> do
+        o <- next
+        inBrackets do
+          x <- peek
+          when (x.kind /= "var" && x.kind /= "con") (failAt x)
+          x' <- next
+          cc <- expectSym "::"
+          ty <- expr
+          c <- expectPunct ")"
+          pure (BAnn o x' cc ty c)
       "punct", "{" -> do
         o <- next
         x <- peek
@@ -980,6 +990,7 @@ pE env = case _ of
   pB = case _ of
     BVar t -> tok env t
     BImp o x c -> tok env o <> tok env x <> tok env c
+    BAnn o x cc ty c -> tok env o <> tok env x <+> tok env cc <+> pE env ty <> tok env c
   pS e = case _ of
     SBind x arrow rhs -> tok e x <+> tok e arrow <> rhsOf e rhs
     SExpr rhs -> pE e rhs

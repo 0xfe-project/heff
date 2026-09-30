@@ -32,6 +32,7 @@ const rejected = [
   ["test/errors/knot-record.hf", "the definition would need itself while it is being computed"],
   ["test/errors/case-binds.hf", "which a `case` alternative cannot bind"],
   ["test/errors/case-nested.hf", "an argument of a `case` pattern is a name"],
+  ["test/errors/project-inferred.hf", "the record's shape is not in hand here for `.a`"],
   ["test/errors/implicit.hf", "test/errors/implicit.hf:33:8\nerror[E0327]: cannot infer the implicit argument `h`: give it, `(h := ...)`"],
   ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
 ];

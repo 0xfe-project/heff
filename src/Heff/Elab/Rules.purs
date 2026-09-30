@@ -164,6 +164,18 @@ functionIntro sp x body = Chk \e a0 -> do
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
 
+-- | extension: `\(x :: T) -> e`, the binder annotated.  The body
+-- | synthesises under it, and the function's type is `(x :: T) -> B` --
+-- | so where the expected type is not known yet (an argument of `map`,
+-- | say), the annotation says it, and nothing is postponed
+functionIntroSyn :: Span -> Name -> Typ -> Syn -> Syn
+functionIntroSyn sp x dom body = Syn \e -> do
+  edom <- runTyp dom e
+  Tuple ebody bty <- withBound x (M.tyN edom) e.scope \v scope' ->
+    runSyn body (e { scope = scope', elabFor = appElabFor e.elabFor v })
+  let fty = M.function (evalEnv e) edom (S.Abs x (M.fromVTy N (e.scope.len + 1) bty))
+  pure (Tuple (M.lam (caseOf e.elabFor) (evalEnv e) fty (S.Abs x ebody)) (M.tyN fty))
+
 -- | `{x} => e`: naming an implicit argument
 functionIntroImplicit :: Span -> Name -> Chk -> Chk
 functionIntroImplicit sp x body = Chk \e a0 -> do
@@ -420,10 +432,18 @@ recordElim sp projectee x = Syn \e -> do
     V.LikeRecord rt -> do
       when (not (dictContains rt.fieldTypes x)) $
         failWith sp 7 (txt "no such field" <+> txt x <+> txt "in type" <+> prtIn e a)
-      let fieldTy = V.projTy a (M.valN eprojectee) x
-      recordName e a x sp fieldTy
-      pure (Tuple (M.proj eprojectee x) fieldTy)
+      case V.projTyMaybe a (M.valN eprojectee) x of
+        Just fieldTy -> do
+          recordName e a x sp fieldTy
+          pure (Tuple (M.proj eprojectee x) fieldTy)
+        Nothing -> failWith sp 32 (notInHand x)
+    -- the type is a neutral nothing unfolds here: inferred, and too late
+    -- for its fields
+    V.NoRules -> failWith sp 32 (notInHand x)
     _ -> failWith sp 6 (txt "tried to project from a value that was not of a record type")
+  where
+  notInHand f =
+    txt ("the record's shape is not in hand here for `." <> f <> "`: annotate the binder, `\\(x :: T) -> ...`, or give the implicit argument, `(a := T)`")
 
 recordSpec :: Span -> Syn -> Name -> Chk -> Syn
 recordSpec sp s x c = Syn \e -> do

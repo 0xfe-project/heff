@@ -196,6 +196,15 @@ coerceToFields (Neu n) = case force n.expansion of
   _ -> panic "unexpanded neutral of record type"
 coerceToFields _ = panic "ill-typed projection"
 
+-- | as `coerceToFields`, for the elaborator: `Nothing` where evaluation
+-- | would panic -- a neutral whose record shape is not in hand
+coerceToFieldsMaybe :: El -> Maybe (Dict (Ev El))
+coerceToFieldsMaybe (Cons fields) = Just fields
+coerceToFieldsMaybe (Neu n) = case force n.expansion of
+  IntoCons fields -> Just (dictMap Nom fields)
+  _ -> Nothing
+coerceToFieldsMaybe _ = Nothing
+
 proj :: El -> Name -> Ev El
 proj Opaque _ = Nom Opaque
 proj v x = dictElemAt (coerceToFields v) x
@@ -388,3 +397,10 @@ projTy :: Ty -> El -> Name -> Ty
 projTy t v x = case behavior t of
   LikeRecord rt -> (typeForProjection rt x (dictMap nom (coerceToFields v))).ty
   _ -> panic "ill-typed projection"
+
+-- | as `projTy`, for the elaborator: `Nothing` where evaluation would
+-- | panic, so a projection the types cannot carry is an error, not a crash
+projTyMaybe :: Ty -> El -> Name -> Maybe Ty
+projTyMaybe t v x = case behavior t of
+  LikeRecord rt -> coerceToFieldsMaybe v <#> \fs -> (typeForProjection rt x (dictMap nom fs)).ty
+  _ -> Nothing

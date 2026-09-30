@@ -167,6 +167,13 @@ parseHead c n = case n of
   Infix (Ident x _) (Keyword "=>" _) bodyN -> do
     body <- chk c bodyN
     pure (ChkJ (R.functionIntro (ntnSpan n) x body))
+  -- extension: `\(x :: T) -> e` annotates the binder; the body
+  -- synthesises, so the lambda does, and says an argument type that
+  -- nothing else has said yet
+  Infix (Infix (Ident x _) (Keyword ":" _) tyN) (Keyword "=>" _) bodyN -> do
+    dom <- typ N tyN
+    body <- syn N bodyN
+    pure (fromSynN c (R.functionIntroSyn (ntnSpan n) x dom body))
   -- extension: `{x} => e` names an implicit argument
   Infix (NBrace (Ident x _) _) (Keyword "=>" _) bodyN -> do
     body <- chk c bodyN

@@ -759,7 +759,8 @@ lambda = lazyP \_ -> do
     body <- expr
     pure (A.foldr (\b e -> Infix b (Keyword "=>" (ntnSpan b)) e) body bs)
   where
-  -- (a binder is a name, capitalised or not: a lambda has no patterns)
+  -- (a binder is a name, capitalised or not -- a lambda has no
+  -- patterns -- or `(x :: T)`, the name annotated)
   binder = do
     t <- peek
     case t.kind, t.text of
@@ -772,10 +773,21 @@ lambda = lazyP \_ -> do
         _ <- next
         c <- expectPunct "}"
         pure (NBrace (Ident x.text (spanOf x)) (spanTo t c))
-      _, _ -> throwError (diag (spanOf t) "a lambda binds names: `\\x y -> e`")
+      "punct", "(" -> do
+        _ <- next
+        inBrackets do
+          x <- peek
+          when (x.kind /= "var" && x.kind /= "con") $ throwError (diag (spanOf x) "expected a binder's name: `\\(x :: T) -> e`")
+          _ <- next
+          cc <- expectSym "::"
+          ty <- expr
+          _ <- expectPunct ")"
+          pure (Infix (Ident x.text (spanOf x)) (Keyword ":" (spanOf cc)) ty)
+      _, _ -> throwError (diag (spanOf t) "a lambda binds names: `\\x y -> e`, `\\(x :: T) -> e`")
   bound = case _ of
     Ident x _ -> [ x ]
     NBrace (Ident x _) _ -> [ x ]
+    Infix (Ident x _) (Keyword ":" _) _ -> [ x ]
     _ -> []
 
 -- | `case e of` and its alternatives, `C x y -> e`

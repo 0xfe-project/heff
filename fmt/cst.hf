@@ -251,8 +251,6 @@ data Pat
   | PParen T Pat T
   | PList T (List Pat) (List T) T
 
-data Bnd = BVar T | BImp T T T
-
 data E
   = Atom T
   | EParen T E T
@@ -268,7 +266,10 @@ data E
   | Ops E (List E)
   | OpRhs T E
   | Ann E T E
-  | Lam T (List Bnd) T E
+  | BVar T
+  | BImp T T T
+  | BAnn T T T E T
+  | Lam T (List E) T E
   | Case T E T (List E)
   | EAlt Pat T E
   | If T E T E T E
@@ -330,6 +331,9 @@ firstE (Op a op b) = firstE a
 firstE (Ops a rest) = firstE a
 firstE (OpRhs op e) = op
 firstE (Ann e cc ty) = firstE e
+firstE (BVar t) = t
+firstE (BImp o x c) = o
+firstE (BAnn o x cc ty c) = o
 firstE (Lam bs binders arrow body) = bs
 firstE (Case kw scrut of2 alts) = kw
 firstE (EAlt p arrow body) = firstP p
@@ -361,6 +365,9 @@ lastE (Ops a rest) =
    Nothing -> lastE a)
 lastE (OpRhs op e) = lastE e
 lastE (Ann e cc ty) = lastE ty
+lastE (BVar t) = t
+lastE (BImp o x c) = c
+lastE (BAnn o x cc ty c) = c
 lastE (Lam bs binders arrow body) = lastE body
 lastE (Case kw scrut of2 alts) =
   (case last alts of
@@ -455,6 +462,7 @@ type Gram =
   , morePats :: P (List CP)
   , patAtom :: P Pat
   , con :: P E
+  , binder :: P E
   }
 
 -- (a projection on a `do`-bound variable trips the elaborator, so these
@@ -475,9 +483,13 @@ mkSum kw o (MkSep items seps) c = Sum kw o items seps c
 mkBraces :: T -> Sep E -> T -> E
 mkBraces o (MkSep items seps) c = Braces o items seps c
 
--- (a binder is a name, capitalised or not, or `{x}`)
-binderP :: P Bnd
-binderP = do
+-- The grammar's functions call one another, so each takes the record of
+-- them all, and `gram` ties the knot: a `type` record (its fields are all
+-- small) can be passed whole, where a `theory` (large) cannot.
+
+-- (a binder is a name, capitalised or not, `{x}`, or `(x :: T)`)
+binderF :: Gram -> P E
+binderF g = do
   t <- peek
   if isKind t "var" || isKind t "con"
       then do
@@ -493,11 +505,20 @@ binderP = do
               x2 <- next
               c <- expectPunct "}"
               val (BImp o x2 c)
+      else if isKind t "punct" && isText t "("
+      then do
+        o <- next
+        inBrackets (do
+          x <- peek
+          if not (isKind x "var" || isKind x "con")
+              then failAt x
+              else do
+                x2 <- next
+                cc <- expectSym "::"
+                ty <- g.expr
+                c <- expectPunct ")"
+                val (BAnn o x2 cc ty c))
       else failAt t
-
--- The grammar's functions call one another, so each takes the record of
--- them all, and `gram` ties the knot: a `type` record (its fields are all
--- small) can be passed whole, where a `theory` (large) cannot.
 
 exprF :: Gram -> P E
 exprF g = do
@@ -677,7 +698,7 @@ bracesF g = do
 lambdaF :: Gram -> P E
 lambdaF g = do
   bs <- next
-  binders <- many1 binderP
+  binders <- many1 g.binder
   arrow <- expectSym "->"
   body <- g.expr
   val (Lam bs binders arrow body)
@@ -820,6 +841,7 @@ gram =
   , morePats = \st -> morePatsF gram st
   , patAtom = \st -> patAtomF gram st
   , con = \st -> conF gram st
+  , binder = \st -> binderF gram st
   }
 
 -- The declarations
@@ -999,10 +1021,6 @@ tsP (PParen o p c) = Cons o (concatList (tsP p) (Cons c Nil))
 tsP (PList o ps commas c) =
   Cons o (concatList (interleaveT (map tsP ps) commas) (Cons c Nil))
 
-tsB :: Bnd -> List T
-tsB (BVar t) = Cons t Nil
-tsB (BImp o x c) = Cons o (Cons x (Cons c Nil))
-
 tsE :: E -> List T
 tsE (Atom t) = Cons t Nil
 tsE (EParen o e c) = Cons o (concatList (tsE e) (Cons c Nil))
@@ -1022,8 +1040,12 @@ tsE (Op a op b) = concatList (tsE a) (Cons op (tsE b))
 tsE (Ops a rest) = concatList (tsE a) (concatMap tsE rest)
 tsE (OpRhs op e) = Cons op (tsE e)
 tsE (Ann e cc ty) = concatList (tsE e) (Cons cc (tsE ty))
+tsE (BVar t) = Cons t Nil
+tsE (BImp o x c) = Cons o (Cons x (Cons c Nil))
+tsE (BAnn o x cc ty c) =
+  Cons o (Cons x (Cons cc (concatList (tsE ty) (Cons c Nil))))
 tsE (Lam bs binders arrow body) =
-  Cons bs (concatList (concatMap tsB binders) (Cons arrow (tsE body)))
+  Cons bs (concatList (concatMap tsE binders) (Cons arrow (tsE body)))
 tsE (Case kw scrut of2 alts) =
   Cons kw (concatList (tsE scrut) (Cons of2 (concatMap tsE alts)))
 tsE (EAlt p arrow body) = concatList (tsP p) (Cons arrow (tsE body))
