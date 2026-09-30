@@ -197,13 +197,15 @@ defLines gs curried globalNames d = case Map.lookup d.key gs of
               else []
             loops = tailSelf d.key (A.length xs) b
             trmc = consSelf d.key (A.length xs) b
+            sapp = appendSelf d.key (A.length xs) b
             -- (a call of itself last: a loop; its parameters `x$`, each
             -- round's own `const`, which what it closes over keeps)
             vars = map (_ <> "$") r.js
-            env' = r.env { self = Just { key: d.key, params: vars, trmc } }
+            env' = r.env { self = Just { key: d.key, params: vars, trmc, sapp } }
             looped =
               [ "", "const " <> i.js <> " = (" <> S.joinWith ", " vars <> ") => {" ]
                 <> (if trmc then [ "  let $root, $hole = null, $at = 0;" ] else [])
+                <> (if sapp then [ "  let $s = \"\";" ] else [])
                 <> [ "  for (;;) {", "    const " <> S.joinWith ", " (A.zipWith (\x v -> x <> " = " <> v) r.js vars) <> ";" ]
                 <> stmts env' 2 b
                 <> [ "  }", "};" ]
@@ -221,19 +223,20 @@ defLines gs curried globalNames d = case Map.lookup d.key gs of
 -- | call of it is last, it goes round again)
 type Env = { gs :: Map String GInfo, names :: Map String String, used :: Set String, self :: Maybe Self }
 
--- | a function that is a loop: its parameters (`x$`), and whether a
+-- | a function that is a loop: its parameters (`x$`), whether a
 -- | constructor with a call of it last is built in place, its hole filled by
--- | the next round (`$root`, `$hole`, `$at`)
-type Self = { key :: String, params :: Array String, trmc :: Boolean }
+-- | the next round (`$root`, `$hole`, `$at`), and whether a string append
+-- | ends in a call of it, gathered left to right (`$s`)
+type Self = { key :: String, params :: Array String, trmc :: Boolean, sapp :: Boolean }
 
--- | whether the function `key` calls itself last somewhere: directly, or as
--- | a constructor's last argument
+-- | whether the function `key` calls itself last somewhere: directly, as a
+-- | constructor's last argument, or right of a string append
 tailSelf :: String -> Int -> Expr -> Boolean
 tailSelf key n = case _ of
   Let _ _ b -> tailSelf key n b
   Match _ arms -> A.any (tailSelf key n <<< _.body) arms
   Call k as -> k == key && A.length as == n
-  e -> consSelf key n e
+  e -> consSelf key n e || appendSelf key n e
 
 -- | whether it does as a constructor's last argument
 consSelf :: String -> Int -> Expr -> Boolean
@@ -241,6 +244,21 @@ consSelf key n = case _ of
   Let _ _ b -> consSelf key n b
   Match _ arms -> A.any (consSelf key n <<< _.body) arms
   Tag _ as | Just (Call k bs) <- A.last as -> k == key && A.length bs == n
+  _ -> false
+
+-- | whether it does at the end of a chain of string appends,
+-- | `a ++ b ++ f xs`
+appendSelf :: String -> Int -> Expr -> Boolean
+appendSelf key n = case _ of
+  Let _ _ b -> appendSelf key n b
+  Match _ arms -> A.any (appendSelf key n <<< _.body) arms
+  PrimCall "strAppend" [ _, r ] -> appendEnd key n r
+  _ -> false
+
+appendEnd :: String -> Int -> Expr -> Boolean
+appendEnd key n = case _ of
+  Call k as -> k == key && A.length as == n
+  PrimCall "strAppend" [ _, r ] -> appendEnd key n r
   _ -> false
 
 bindName :: Env -> String -> { js :: String, env :: Env }
@@ -310,6 +328,10 @@ stmts env ind = case _ of
 last :: Env -> Int -> Expr -> Array String
 last env ind e = case env.self, e of
   Just s, Call k as | k == s.key && A.length as == A.length s.params -> again s as
+  -- `a ++ ... ++ f xs`: the left is gathered into `$s`, and the call goes
+  -- round; what returns gives `$s` its prefix back
+  Just s, PrimCall "strAppend" [ a, r ] | s.sapp && appendEnd s.key (A.length s.params) r ->
+    [ indent ind <> "$s += " <> (expr env ind a).code <> ";" ] <> last env ind r
   Just s, Tag t as
     | s.trmc
     , Just { init, last: Call k bs } <- A.unsnoc as
@@ -330,6 +352,7 @@ last env ind e = case env.self, e of
       , indent ind <> "if ($hole) { $hole.a[$at] = " <> r.js <> "; return $root; }"
       , indent ind <> "return " <> r.js <> ";"
       ]
+  Just s, _ | s.sapp -> [ indent ind <> "return $s + " <> atLeast 2 (expr env ind e) <> ";" ]
   _, _ -> [ indent ind <> "return " <> (expr env ind e).code <> ";" ]
   where
   -- (the arguments are of this round's `const`s: assigned one by one)
