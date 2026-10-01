@@ -10,7 +10,7 @@ import Prelude
 
 import Data.Array as A
 import Data.Either (Either(..))
-import Data.Lazy (defer, force)
+import Data.Lazy (Lazy, defer, force)
 import Data.List ((:))
 import Data.Foldable (for_)
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
@@ -22,6 +22,7 @@ import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
 import Control.Monad.State (gets, modify_)
+import Data.Map as Map
 import Heff.Core.Globals (lookupGlobalKey)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), Level(..), Universe, Variants(..), decodesInto, leq, maxLevel)
@@ -392,10 +393,10 @@ recordFormation fieldTyps = Typ \e -> do
 type FieldSetting = { name :: Name, chk :: Chk, span :: Span, nameSpan :: Span }
 
 recordIntro :: Span -> Array FieldSetting -> Chk
-recordIntro sp fieldSettings = Chk \e a0 -> do
+recordIntro sp fieldSettings = Chk \e0 a0 -> do
   a <- forceT a0
   let
-    go vs pairs = case A.uncons pairs of
+    go e done vs pairs = case A.uncons pairs of
       Nothing -> pure []
       Just { head: Tuple fs (Tuple x fieldC), tail: rest }
         | fs.name == x -> do
@@ -412,7 +413,9 @@ recordIntro sp fieldSettings = Chk \e a0 -> do
                 Left err -> do
                   let msg = txt "expected value" <+> prtElR (displayName e.globals) (shape e.scope) expected <> txt ", but got value" <+> prtElR (displayName e.globals) (shape e.scope) v
                   conversionFail fs.span msg (prettyDefEqError (displayName e.globals) err)
-            fields <- go (V.snoc vs v) rest
+            let done' = A.snoc done (Tuple x v)
+            e' <- selfAdvance e a done'
+            fields <- go e' done' (V.snoc vs v) rest
             pure (A.cons (Tuple x m) fields)
         | otherwise ->
             failWith fs.span 3 (txt "expected record field" <+> txt x <+> txt "got: " <+> txt fs.name)
@@ -423,9 +426,47 @@ recordIntro sp fieldSettings = Chk \e a0 -> do
         givenLength = A.length fieldSettings
       when (expectedLength /= givenLength) $
         failWith sp 4 (txt "expected" <+> txt (show expectedLength) <+> txt "fields, got: " <+> txt (show givenLength))
-      fields <- go rt.capture (A.zip fieldSettings (dictToList rt.fieldTypes))
-      pure (M.cons (caseOf e.elabFor) (dictFromList fields))
+      fields <- go e0 [] rt.capture (A.zip fieldSettings (dictToList rt.fieldTypes))
+      pure (M.cons (caseOf e0.elabFor) (dictFromList fields))
     _ -> failWith sp 5 (txt "tried to check a record expression at a non-record type")
+
+-- | While the record being checked is the definition's own body (the
+-- | elaboration is `ForDescriptive` at the definition itself, and the
+-- | record each field joins is the self), the self in scope is rebound
+-- | after each field: a projection of a field already checked is that
+-- | field's value, so a type field is in hand for the fields after it; a
+-- | projection of a field still to come stays the bare neutral it always
+-- | was.
+selfAdvance :: ElabEnv -> V.Ty -> Array (Tuple Name V.El) -> E ElabEnv
+selfAdvance e a done = case e.elabFor of
+  ForDescriptive { head: V.Global gk, spine: V.Id } -> do
+    sk <- gets _.selfKey
+    case V.behavior a of
+      V.LikeRecord rt | sk == Just gk ->
+        let
+          self0 = V.reflect (V.Global gk) (pure V.Id) (pure a) Nothing
+          fieldEv f = case A.find (\(Tuple x _) -> x == f) done of
+            Just (Tuple _ v) -> V.Nom v
+            Nothing -> V.proj self0 f
+          partial = V.Cons
+            { keys: rt.fieldTypes.keys
+            , byName: rt.fieldTypes.byName
+            , values: map fieldEv rt.fieldTypes.keys
+            }
+          self' = V.reflect (V.Global gk) (pure V.Id) (pure a) (Just (V.Describe partial))
+        in
+          pure (e { scope = e.scope { locals = rebottom (defer \_ -> self') e.scope.locals } })
+      _ -> pure e
+  _ -> pure e
+
+-- | the deepest local replaced: the self is the definition's first binding
+rebottom :: Lazy V.El -> V.Locals -> V.Locals
+rebottom v = case _ of
+  V.LSnoc V.LNil _ -> V.LSnoc V.LNil v
+  V.LSnoc rest x -> V.LSnoc (rebottom v rest) x
+  V.LChunkSnoc V.LNil xs | [ _ ] <- xs -> V.LSnoc V.LNil v
+  V.LChunkSnoc rest xs -> V.LChunkSnoc (rebottom v rest) xs
+  V.LNil -> V.LNil
 
 recordElim :: Span -> Syn -> Name -> Syn
 recordElim sp projectee x = Syn \e -> do

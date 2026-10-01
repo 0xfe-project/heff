@@ -143,6 +143,7 @@ elabProgramWith thaw = A.foldl step []
 hint :: Diag -> Diag
 hint d = case d.code, d.note of
   319, Nothing -> d { note = Just (P.text "if this is a recursive call, guard the whole call: rec (f ...)") }
+  204, Nothing -> d { note = Just (P.text "name the type: `type T = ...` at top level, or a type field of the struct it is in (`t = { ... }`, then `m.t` here)") }
   _, _ -> d
 
 errorsIn :: Checked -> Array Diag
