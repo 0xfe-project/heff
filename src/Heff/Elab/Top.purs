@@ -31,7 +31,7 @@ import Heff.Elab.Clauses (desugar, stripWhere)
 import Heff.Elab.Prims (isPrim, primNames)
 import Data.String as Str
 import Heff.Core.Syntax as Syn
-import Heff.Elab.Unify (retryPostponed, runDelayed, unsolvedMetas, zonkEl, zonkTy)
+import Heff.Elab.Unify (settle, unsolvedMetas, zonkEl, zonkTy)
 import Control.Monad.State (gets, modify_)
 import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, lookupGlobal)
 import Heff.Core.Memoed as M
@@ -170,13 +170,20 @@ parseHead c n = case n of
   Infix (Ident x _) (Keyword "=>" _) bodyN -> do
     body <- chk c bodyN
     pure (ChkJ (R.functionIntro (ntnSpan n) x body))
-  -- extension: `\(x :: T) -> e` annotates the binder; the body
-  -- synthesises, so the lambda does, and says an argument type that
-  -- nothing else has said yet
+  -- extension: `\(x :: T) -> e` annotates the binder; a body that
+  -- synthesises makes the lambda synthesise, and say an argument type
+  -- that nothing else has said yet; a body that can only be checked (a
+  -- `case`, say) makes the lambda check, where the annotation need only
+  -- agree with the argument type expected of it
   Infix (Infix (Ident x _) (Keyword ":" _) tyN) (Keyword "=>" _) bodyN -> do
     dom <- typ N tyN
-    body <- syn N bodyN
-    pure (fromSynN c (R.functionIntroSyn (ntnSpan n) x dom body))
+    bj <- parse N bodyN
+    case bj of
+      SynJ body -> pure (fromSynN c (R.functionIntroSyn (ntnSpan n) x dom body))
+      ChkJ j ->
+        let body = if implicitLambda bodyN then j else R.implicitLams j
+        in pure (fromChkN c (R.functionIntroAnn (ntnSpan n) x dom body))
+      TypJ j -> pure (fromChkN c (R.functionIntroAnn (ntnSpan n) x dom (R.universeIntro (ntnSpan bodyN) j)))
   -- extension: `{x} => e` names an implicit argument
   Infix (NBrace (Ident x _) _) (Keyword "=>" _) bodyN -> do
     body <- chk c bodyN
@@ -388,8 +395,7 @@ elabDecl key g n = do
     modify_ \st -> st { selfKey = Nothing }
     throwError e
   -- the implicit arguments: every one inferred, and substituted in
-  runDelayed true
-  stuck <- retryPostponed g
+  stuck <- settle g
   for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError
@@ -468,8 +474,7 @@ elabWatch g n = do
     SynJ s -> pure s
     _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `-- >>> (e : T)`")
   Tuple t ty <- R.runSyn s (emptyElabEnv g)
-  runDelayed true
-  stuck <- retryPostponed g
+  stuck <- settle g
   for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError

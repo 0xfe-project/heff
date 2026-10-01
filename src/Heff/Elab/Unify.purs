@@ -14,6 +14,7 @@ module Heff.Elab.Unify
   , forceT
   , freshMeta
   , retryPostponed
+  , settle
   , zonkEl
   , zonkTy
   , unsolvedMetas
@@ -441,6 +442,25 @@ renameTy g m r t0 = do
 
 -- Postponed problems, and zonking
 --------------------------------------------------------------------------------
+
+-- | Let the postponed problems and the delayed checks feed one another --
+-- | a retried problem may solve the type a check waits on, and a run check
+-- | may pose new problems -- until neither moves; then force what is left,
+-- | and retry once more.  The problems still stuck are returned.
+settle :: Globals -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El })
+settle g = go 0
+  where
+  go :: Int -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El })
+  go fuel = do
+    runDelayed false
+    _ <- retryPostponed g
+    ds <- gets _.delayed
+    mc <- gets _.metas
+    let ready = A.any (\(Delayed d) -> not (isFlexTy (V.forceTy mc d.ty))) ds
+    if ready && fuel <= 50 then go (fuel + 1)
+    else do
+      runDelayed true
+      retryPostponed g
 
 -- | Retry the postponed problems until no more are solved; the ones left
 -- | are reported.

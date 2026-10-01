@@ -177,6 +177,34 @@ functionIntroSyn sp x dom body = Syn \e -> do
   let fty = M.function (evalEnv e) edom (S.Abs x (M.fromVTy N (e.scope.len + 1) bty))
   pure (Tuple (M.lam (caseOf e.elabFor) (evalEnv e) fty (S.Abs x ebody)) (M.tyN fty))
 
+-- | `\(x : T) -> e` where the argument type is already expected of it:
+-- | the annotation need only agree, and the body is checked (it could
+-- | not synthesise -- a `case`, say -- or this lambda would).  An
+-- | expected type still unsolved is solved to the annotation.
+functionIntroAnn :: Span -> Name -> Typ -> Chk -> Chk
+functionIntroAnn sp x dom body = Chk \e a0 -> do
+  a <- forceT a0
+  case V.behavior a of
+    V.LikeFunction ft | ft.implicit -> do
+      let y = fromMaybe "_" (V.cloName ft.cod)
+      ebody <- withBound y ft.dom e.scope \v scope' ->
+        runChk (functionIntroAnn sp x dom body)
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
+          (V.nom (V.appClo ft.cod (pure v)))
+      pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs y ebody))
+    V.LikeFunction ft -> do
+      edom <- runTyp dom e
+      agree <- unifyTy e.globals (shape e.scope) ft.dom (M.tyN edom)
+      case agree of
+        Left err -> conversionFail sp (txt "the binder's annotation is not the argument type expected here") (prettyDefEqError (displayName e.globals) err)
+        Right _ -> pure unit
+      ebody <- withBound x ft.dom e.scope \v scope' ->
+        runChk body
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
+          (V.nom (V.appClo ft.cod (pure v)))
+      pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
+    _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
+
 -- | `{x} => e`: naming an implicit argument
 functionIntroImplicit :: Span -> Name -> Chk -> Chk
 functionIntroImplicit sp x body = Chk \e a0 -> do
@@ -247,7 +275,12 @@ functionElimC checksOnly sp callee arg = Syn \e -> do
 -- | check `c` at `ty` later, once `ty` (flexible now) is known: a hole
 -- | stands for the result until then
 delayChk :: ElabEnv -> Span -> String -> Chk -> V.Ty -> E M.El
-delayChk e sp what c ty = do
+delayChk e sp what c ty = delayChkOn e sp what c ty ty
+
+-- | ... waiting on another type than the one checked at: `keyTy` is the
+-- | unsolved one whose solution unblocks the check
+delayChkOn :: ElabEnv -> Span -> String -> Chk -> V.Ty -> V.Ty -> E M.El
+delayChkOn e sp what c keyTy ty = do
   hole <- freshMeta e.scope.len e.scope.locals ty what sp
   let
     m = case hole.stx of
@@ -259,7 +292,7 @@ delayChk e sp what c ty = do
       case r of
         Right _ -> pure unit
         Left err -> conversionFail sp (txt ("this " <> what <> " does not fit how it is used")) (prettyDefEqError (displayName e.globals) err)
-  modify_ \st -> st { delayed = A.snoc st.delayed (Env.Delayed { ty, check }) }
+  modify_ \st -> st { delayed = A.snoc st.delayed (Env.Delayed { ty: keyTy, check }) }
   traceE sp "delay" (defer \_ -> what <> " waits for its type ?" <> show m)
   pure { stx: hole.stx, val: pure (V.Nom hole.val) }
 
@@ -556,29 +589,40 @@ sumElim sp scrutSyn tags casesChk = Chk \e b -> do
     failWith sp 23 (txt "cannot eliminate from sum type into large type")
   Tuple scrut a0 <- runSyn scrutSyn e
   a <- forceT a0
-  vs <- case V.behavior a of
-    V.LikeSum (Variants vs) -> pure vs
+  case V.behavior a of
+    V.LikeSum (Variants vs) -> casesAt e b scrut a vs
+    -- the scrutinee's type is an unsolved implicit (a `do`-bound answer,
+    -- say): the cases wait for it, a hole standing for the match
+    _ | isFlexTy a -> delayChkOn e sp "match"
+        (Chk \e2 b2 -> do
+          a2 <- forceT a
+          case V.behavior a2 of
+            V.LikeSum (Variants vs) -> casesAt e2 b2 scrut a2 vs
+            _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e2 a2))
+        a b
     _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e a)
-  for_ tags \(Tuple x tsp) -> when (isJust (dictLookup vs x)) (recordName e a x tsp a)
-  cases <- map dictFromList $ flip traverse (dictToList vs) \(Tuple x ts) ->
-    case dictLookup casesChk x of
-      Just (Tuple xs bodyChk) ->
-        if A.length xs == A.length ts then do
-          let e' = e { scope = multiBind xs (map force ts) e.scope }
-          body <- runChk bodyChk e' b
-          pure (Tuple x (Tuple xs body.stx))
-        else failWith sp 16 (txt "wrong number of arguments provided for tag" <+> txt x)
-      -- extension: a default case `_ => e` covers the tags not listed; it
-      -- binds the tag's arguments to `_`, so it can be checked per tag
-      Nothing -> case dictLookup casesChk "_" of
-        Just (Tuple _ bodyChk) -> do
-          let
-            xs = map (const "_") ts
-            e' = e { scope = multiBind xs (map force ts) e.scope }
-          body <- runChk bodyChk e' b
-          pure (Tuple x (Tuple xs body.stx))
-        Nothing -> failWith sp 17 (txt "no case provided for tag" <+> txt x)
-  pure (M.match scrut cases)
+  where
+  casesAt e b scrut a vs = do
+    for_ tags \(Tuple x tsp) -> when (isJust (dictLookup vs x)) (recordName e a x tsp a)
+    cases <- map dictFromList $ flip traverse (dictToList vs) \(Tuple x ts) ->
+      case dictLookup casesChk x of
+        Just (Tuple xs bodyChk) ->
+          if A.length xs == A.length ts then do
+            let e' = e { scope = multiBind xs (map force ts) e.scope }
+            body <- runChk bodyChk e' b
+            pure (Tuple x (Tuple xs body.stx))
+          else failWith sp 16 (txt "wrong number of arguments provided for tag" <+> txt x)
+        -- extension: a default case `_ => e` covers the tags not listed; it
+        -- binds the tag's arguments to `_`, so it can be checked per tag
+        Nothing -> case dictLookup casesChk "_" of
+          Just (Tuple _ bodyChk) -> do
+            let
+              xs = map (const "_") ts
+              e' = e { scope = multiBind xs (map force ts) e.scope }
+            body <- runChk bodyChk e' b
+            pure (Tuple x (Tuple xs body.stx))
+          Nothing -> failWith sp 17 (txt "no case provided for tag" <+> txt x)
+    pure (M.match scrut cases)
 
 -- Universe
 --------------------------------------------------------------------------------
