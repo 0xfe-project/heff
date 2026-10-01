@@ -680,7 +680,7 @@ find sp x = Syn \e ->
       record { span: sp, name: x, key: Nothing, ty: defer \_ -> P.render (prtIn e ty) }
       pure res
     Left Delayed ->
-      failWith sp 19 (txt "variable" <+> txt x <+> txt "is bound in delayed mode and not available for use")
+      failWith sp 19 (txt "variable" <+> txt x <+> txt "is the definition being elaborated: it is in hand only under a lambda, where a type is expected of it (an argument, a branch, the result -- not a case scrutinee)")
     Left NotInScope -> case lookupGlobalKey e.globals x of
       Just (Tuple key ge) -> do
         record { span: sp, name: x, key: Just key, ty: defer \_ -> P.render (prtIn e ge.type_) }

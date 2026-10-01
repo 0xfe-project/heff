@@ -134,7 +134,8 @@ type ElabSt =
   { infos :: Array Info
   , metas :: V.MetaCtx
   , nextMeta :: Int
-  , postponed :: Array { shape :: CtxShape, left :: V.El, right :: V.El }
+  -- (`failed`: retried and found contradictory, kept to be reported)
+  , postponed :: Array { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean }
   , delayed :: Array Delayed
   , trace :: Array TraceEvent
   -- the definition being elaborated: let-bound to the global it will

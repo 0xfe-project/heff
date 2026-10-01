@@ -20,7 +20,7 @@ import Data.Either (Either(..))
 import Data.Foldable (foldM, foldl, for_)
 import Data.Lazy (Lazy, defer, force)
 import Control.Lazy (fix)
-import Data.Maybe (Maybe(..), isJust)
+import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, ntnHead, ntnSpan)
@@ -431,14 +431,22 @@ entryFor g k prim tyStx bodyStx =
 
 -- | a constraint unification could not solve, said where the implicit
 -- | argument it is about was to be inferred (else where the declaration is)
-stuckDiag :: Globals -> Span -> { shape :: CtxShape, left :: V.El, right :: V.El } -> E Diag
+stuckDiag :: Globals -> Span -> { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean } -> E Diag
 stuckDiag g fallback p = do
   mc <- gets _.metas
   let
     shown v = P.render (prtElR (displayName g) p.shape (V.forceEl mc v))
     known = shown p.left <> " = " <> shown p.right
     about = A.head (A.nub (metasIn mc p.left <> metasIn mc p.right)) >>= \m -> Map.lookup m mc
-  pure case about of
+  -- a problem that was retried and found contradictory: not missing
+  -- information, a mismatch -- say so, where the implicit was asked for
+  if p.failed then pure
+    { code: 311, severity: SError
+    , span: fromMaybe fallback (map _.span about)
+    , note: map (\me -> P.text ("found for `" <> me.name <> "`, it would need " <> known)) about
+    , msg: P.text ("the implicit arguments found do not fit together: " <> shown p.left <> " and " <> shown p.right <> " are not equal")
+    }
+  else pure case about of
     Just me ->
       { code: 327, severity: SError, span: me.span
       , note: Just (P.text ("what is known of it, " <> known <> ", does not say what it is"))

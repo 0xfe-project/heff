@@ -269,7 +269,7 @@ lams :: Int -> S.El -> S.El
 lams k body = if k <= 0 then body else lams (k - 1) (S.Lam (S.U SmallU) (S.Abs "x" body))
 
 postponeU :: CtxShape -> V.El -> V.El -> U Unit
-postponeU cs l r = modify_ \s -> s { postponed = A.snoc s.postponed { shape: cs, left: l, right: r } }
+postponeU cs l r = modify_ \s -> s { postponed = A.snoc s.postponed { shape: cs, left: l, right: r, failed: false } }
 
 -- | a partial renaming: the levels of `dom` that may appear, and what they
 -- | become in a context of `cod` levels
@@ -447,10 +447,10 @@ renameTy g m r t0 = do
 -- | a retried problem may solve the type a check waits on, and a run check
 -- | may pose new problems -- until neither moves; then force what is left,
 -- | and retry once more.  The problems still stuck are returned.
-settle :: Globals -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El })
+settle :: Globals -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean })
 settle g = go 0
   where
-  go :: Int -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El })
+  go :: Int -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean })
   go fuel = do
     runDelayed false
     _ <- retryPostponed g
@@ -464,14 +464,18 @@ settle g = go 0
 
 -- | Retry the postponed problems until no more are solved; the ones left
 -- | are reported.
-retryPostponed :: Globals -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El })
+retryPostponed :: Globals -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean })
 retryPostponed g = go 0
   where
-  go :: Int -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El })
+  go :: Int -> E (Array { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean })
   go fuel = do
     ps <- gets _.postponed
     modify_ (_ { postponed = [] })
-    for_ ps \p -> liftU (uEl g p.shape p.left p.right)
+    -- a problem that FAILS outright is kept, to be reported as stuck: it
+    -- holds the contradiction, and must not vanish into an unsolved meta
+    for_ ps \p -> liftU (uEl g p.shape p.left p.right) >>= case _ of
+      Left _ -> modify_ \s -> s { postponed = A.snoc s.postponed (p { failed = true }) }
+      Right _ -> pure unit
     left <- gets _.postponed
     if A.null left || A.length left == A.length ps || fuel > 50 then pure left else go (fuel + 1)
 
