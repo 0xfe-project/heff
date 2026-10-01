@@ -43,6 +43,14 @@ if (build("test/node/timed.hf", "timed", timed)) {
   check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom, which is not handled here"), true);
 }
 
+// one world handled at home (a counter: state, peeled off in the
+// language), the rest handed to Node: the program left over is stdio's
+const counted = join(work, "counted.mjs");
+if (build("test/node/counted.hf", "main", counted)) {
+  const r = spawnSync("node", [counted], { encoding: "utf8" });
+  check("state peeled in-language", r.stdout + r.stderr, "0: one\n1: two\n2: three\ncounted 3\n");
+}
+
 // loops, compiled as loops: a million rounds, and the stack does not overflow
 const deep = join(work, "deep.mjs");
 if (build("test/node/deep.hf", "deep", deep)) {
