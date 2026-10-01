@@ -5,6 +5,7 @@ module Heff.Core.Rename
   , renameTy
   , globalsInEl
   , globalsInTy
+  , describeKey
   , displayName
   ) where
 
@@ -13,6 +14,7 @@ import Prelude
 import Data.Array as A
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
+import Data.String as Str
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Name, dictMap, dictValues)
 import Heff.Core.Globals (Globals)
@@ -99,4 +101,13 @@ globalsInTy = A.nub <<< go
 -- | definition (`module.name`) by its alias, if it has one
 displayName :: Globals -> Name -> Name
 displayName g x =
-  fromMaybe x (A.head (A.mapMaybe (\(Tuple n k) -> if k == x then Just n else Nothing) (Map.toUnfoldable g.aliases)))
+  fromMaybe (describeKey x) (A.head (A.mapMaybe (\(Tuple n k) -> if k == x then Just n else Nothing) (Map.toUnfoldable g.aliases)))
+
+-- | a synthesized key (no surface spelling: `m#` is the module as a value,
+-- | `m#T` its theory, `Heff.Driver.moduleStruct`) said in words
+describeKey :: Name -> Name
+describeKey x = case Str.stripSuffix (Str.Pattern "#T") x of
+  Just m -> "the theory of " <> m
+  Nothing -> case Str.stripSuffix (Str.Pattern "#") x of
+    Just m -> "the module " <> m
+    Nothing -> x

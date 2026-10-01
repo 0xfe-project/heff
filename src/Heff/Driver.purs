@@ -40,16 +40,19 @@ import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
 import Heff.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
 import Heff.Core.Readback (readbTy)
-import Heff.Core.Rename (renameEl, renameTy)
-import Heff.Core.Syntax (El(..), Ty(..))
+import Heff.Core.Rename (describeKey, renameEl, renameTy)
+import Heff.Core.Syntax (Abs(..), El(..), Ty(..))
+import Heff.Core.Syntax as Syn
 import Heff.Effect (Effect(..), leaves)
 import Heff.Elab.Environment (Info)
-import Heff.Elab.Top (ThawedDef, TopResult, topModule, topThawed, topWith)
+import Heff.Core.Params (Level(..), Universe(..), Variants(..), maxLevel)
+import Heff.Core.Value as V
+import Heff.Elab.Top (ThawedDef, TopResult, entryFor, topModule, topThawed, topWith)
 import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
 import Heff.Parse.Notation (Diag, Ntn, Severity(..))
 import Heff.Parse.Notation as F
 import Heff.Parse.Fixity (Assoc(..), Fixities, emptyFixities, union)
-import Heff.Support.Common (operatorName)
+import Heff.Support.Common (Dict, dictFromList, dictMap, dictToList, operatorName)
 import Heff.Parse.Surface (readProgram, readProgramWith)
 import Heff.Print.Surface (printSig, printTy)
 import Heff.Support.Diagnostic (lineCol, renderDiag)
@@ -92,7 +95,9 @@ elabNext done s thaw =
   let
       direct = A.filter (\c -> A.elem c.module s.opens) done
       needed = A.filter (\c -> A.elem c.module (closure done s.deps)) done
-      env = A.foldl (\g c -> A.foldl (\g' o -> maybe g' (\e -> addGlobalEntry o.key e g') (lookupGlobal c.top.globals o.key)) g c.own) emptyGlobals needed
+      -- (each module's definitions, and the module itself, a struct of them)
+      env = A.foldl (\g c -> withEntry (c.module <> "#") c (withEntry (c.module <> "#T") c (A.foldl (\g' o -> withEntry o.key c g') g c.own))) emptyGlobals needed
+      withEntry k c g = maybe g (\e -> addGlobalEntry k e g) (lookupGlobal c.top.globals k)
       imported = A.concatMap (\c -> map (\o -> { name: o.name, key: o.key, module: c.module }) c.own) direct
       -- a name two modules imported define, each its own way, is in scope
       -- as neither
@@ -102,21 +107,26 @@ elabNext done s thaw =
         , msg: P.text ("`" <> o.name <> "` is defined by more than one module imported: " <> S.joinWith ", " (A.nub (map _.module (A.filter (\p -> p.name == o.name) imported))))
         }
       g1 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
-      -- (`import m as M`: `m`'s definitions as `M.x`)
+      -- (`import m as M`: `m`'s definitions as `M.x`, and `M` the module
+      -- itself, a value)
       g0 = A.foldl (\g q -> case A.find (\c -> c.module == q.module) done of
-          Just c -> A.foldl (\g' o -> addAlias (q.alias <> "." <> o.name) o.key g') g c.own
+          Just c -> A.foldl (\g' o -> addAlias (q.alias <> "." <> o.name) o.key g') (addAlias q.alias (q.module <> "#") g) c.own
           Nothing -> g) g1 s.aliases
       key x = s.module <> "." <> x
       checked t ntns diags fixities cached =
-        { path: s.path, module: s.module, source: s.source, text: s.text, ntns, top: t
-        , diags
-        , own: A.zipWith (\(Tuple x _) k -> { name: x, key: k }) t.spans t.keys
-        , deps: s.deps
-        , opens: s.opens
-        , aliases: s.aliases
-        , fixities
-        , cached
-        }
+        let
+          own = A.zipWith (\(Tuple x _) k -> { name: x, key: k }) t.spans t.keys
+        in
+          { path: s.path, module: s.module, source: s.source, text: s.text, ntns
+          , top: t { globals = moduleStruct s.module own t.globals }
+          , diags
+          , own
+          , deps: s.deps
+          , opens: s.opens
+          , aliases: s.aliases
+          , fixities
+          , cached
+          }
       -- a module the cache has was elaborated clean, and nothing it is
       -- made of has changed: its text is not even read
       thawed m = checked (topThawed g0 m.defs) [] [] m.fixities true
@@ -138,6 +148,72 @@ elabNext done s thaw =
         | A.elem head seen -> go seen tail
         | otherwise -> go (A.snoc seen head) (tail <> maybe [] _.deps (A.find (\c -> c.module == head) done'))
 
+-- | A file, after its definitions, as a value: a struct of them, under
+-- | the module's own name (importers reach it by their alias, `import m
+-- | as M`).  Its type is the file's theory -- the definitions' types as a
+-- | telescope, a reference to an earlier definition becoming a reference
+-- | to its field -- and its fields are the definitions themselves, so the
+-- | struct adds no equations: `M.x` and the global are one.
+moduleStruct :: String -> Array { name :: String, key :: String } -> Globals -> Globals
+moduleStruct mkey own g =
+  let
+    entries = A.mapMaybe (\o -> lookupGlobal g o.key <#> \e -> { name: o.name, key: o.key, ty: e.tySyntax, level: V.levelOf e.type_ }) own
+    level = A.foldl (\l r -> maxLevel l r.level) Small entries
+  in
+    -- (a file that defines theories has fields no universe holds: it is
+    -- its definitions only, not a struct of them)
+    if A.null entries || level == Top then g
+    else
+      let
+        idx = Map.fromFoldable (A.mapWithIndex (\i r -> Tuple r.key i) entries)
+        fieldTypes = dictFromList (A.mapWithIndex (\i r -> Tuple r.name (closeTy idx i 0 r.ty)) entries)
+        -- the file's theory, a definition of its own (`m#`), so that the
+        -- struct's type is a name, as every nominal type is
+        tkey = mkey <> "#T"
+        tEntry = entryFor g tkey false (U (if level == Large then LargeU else SmallU)) (Code (Record { level, fieldTypes }))
+        g' = addGlobalEntry tkey tEntry g
+        bodyStx = Syn.Cons (dictFromList (map (\r -> Tuple r.name (Global r.key)) entries))
+      in
+        addGlobalEntry (mkey <> "#") (entryFor g' (mkey <> "#") false (Decode (Global tkey)) bodyStx) g'
+
+-- | a definition's type, moved into the telescope of the fields before
+-- | field `i`: a reference to an earlier definition becomes its field, by
+-- | index from `depth` binders down; anything else stays the global it was
+closeTy :: Map.Map String Int -> Int -> Int -> Ty -> Ty
+closeTy idx i depth = case _ of
+  Decode e -> Decode (closeEl idx i depth e)
+  Function f -> Function { level: f.level, dom: closeTy idx i depth f.dom, cod: closeAbs (closeTy idx i) depth f.cod, implicit: f.implicit }
+  Record rt -> Record { level: rt.level, fieldTypes: dictFromList (A.mapWithIndex (\j (Tuple x t) -> Tuple x (closeTy idx i (depth + j) t)) (dictToList rt.fieldTypes)) }
+  Sum (Variants vs) -> Sum (Variants (dictMap (map (closeTy idx i depth)) vs))
+  IsTy t -> IsTy (closeTy idx i depth t)
+  PrimArray t -> PrimArray (closeTy idx i depth t)
+  other -> other
+
+closeAbs :: forall a. (Int -> a -> a) -> Int -> Abs a -> Abs a
+closeAbs f depth = case _ of
+  Abs x t -> Abs x (f (depth + 1) t)
+  -- (a constant abstraction does not bind: its body is a step shallower)
+  AbsConst t -> AbsConst (f depth t)
+
+closeEl :: Map.Map String Int -> Int -> Int -> El -> El
+closeEl idx i depth = case _ of
+  Global k -> case Map.lookup k idx of
+    Just j | j < i -> Local (depth + (i - 1 - j))
+    _ -> Global k
+  Code t -> Code (closeTy idx i depth t)
+  App f a -> App (closeEl idx i depth f) (closeEl idx i depth a)
+  Lam t b -> Lam (closeTy idx i depth t) (closeAbs (closeEl idx i) depth b)
+  Syn.Cons d -> Syn.Cons (dictMap (closeEl idx i depth) d)
+  Proj e l -> Proj (closeEl idx i depth e) l
+  Tag t as -> Tag t (map (closeEl idx i depth) as)
+  Match e cs -> Match (closeEl idx i depth e) (dictMap (\(Tuple xs b) -> Tuple xs (closeEl idx i (depth + A.length xs) b)) cs)
+  Specialize e l v -> Specialize (closeEl idx i depth e) l (closeEl idx i depth v)
+  Is e -> Is (closeEl idx i depth e)
+  Rec e -> Rec (closeEl idx i depth e)
+  Implicit x e -> Implicit x (closeEl idx i depth e)
+  MetaApp m xs t -> MetaApp m xs (closeTy idx i depth t)
+  other -> other
+
 -- | the tools add advice on how to fix the common cases
 hint :: Diag -> Diag
 hint d = case d.code, d.note of
@@ -156,9 +232,10 @@ renderFileDiags path src ds = S.joinWith "" (map one ds)
     let lc = lineCol src d.span.start
     in path <> ":" <> show (lc.line + 1) <> ":" <> show (lc.col + 1) <> "\n" <> P.render (renderDiag src d) <> "\n\n"
 
--- | a global key by the name it has in the file, else the key
+-- | a global key by the name it has in the file, else the key (a
+-- | synthesized one, which no file writes, in words)
 localName :: Globals -> String -> String
-localName g = \k -> fromMaybe k (Map.lookup k names)
+localName g = \k -> fromMaybe (describeKey k) (Map.lookup k names)
   where
   names = Map.fromFoldable (map (\(Tuple x k) -> Tuple k x) (Map.toUnfoldable g.aliases :: Array (Tuple String String)))
 

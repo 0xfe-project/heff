@@ -71,8 +71,13 @@ stampFor lib = do
 -- | transitively.  (A primitive declared again is the same one: the first
 -- | hash stands.)
 defHashesInto :: Map String String -> Checked -> Map String String
-defHashesInto hs c = A.foldl one hs c.own
+defHashesInto hs c = whole (A.foldl one hs c.own)
   where
+  -- the module itself, a struct of its definitions (`Driver.moduleStruct`),
+  -- and its theory: mentioned bare (`M`), they hash as all of it
+  whole m =
+    let h = sha256Hex (S.joinWith "," (map (\o -> o.key <> ":" <> fromMaybe "?" (Map.lookup o.key m)) c.own))
+    in Map.insert (c.module <> "#") h (Map.insert (c.module <> "#T") h m)
   one m o
     | Map.member o.key m = m
     | otherwise = case lookupGlobal c.top.globals o.key of
