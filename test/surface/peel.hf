@@ -1,0 +1,110 @@
+-- Effect polymorphism, by evidence (lib/co.hf): a program over any effect
+-- its operations are in (`<:`), run under two differently-shaped sums --
+-- and one world peeled off with `through`, the rest handled on its own.
+
+import co
+import prelude
+
+data TellF (m : Type -> Type) x = Tell String x
+
+teller : HFunctor
+teller =
+  { f = TellF
+  , hfmap = \fm g p -> case p of
+      Tell s x -> Tell s (g x)
+  , hmap = \nt p -> case p of
+      Tell s x -> Tell s x
+  }
+
+data TickF (m : Type -> Type) x = Tick (Int -> x)
+
+ticker : HFunctor
+ticker =
+  { f = TickF
+  , hfmap = \fm g p -> case p of
+      Tick k -> Tick (\n -> g (k n))
+  , hmap = \nt p -> case p of
+      Tick k -> Tick k
+  }
+
+tell : {e : HFunctor} -> (teller <: e) -> String -> Co e Unit
+tell ev s = op (ev (Tell s (MkUnit : Unit))) val
+
+tick : {e : HFunctor} -> (ticker <: e) -> Co e Int
+tick ev = op (ev (Tick (\n -> n))) val
+
+-- over any effect both are in: which world each operation belongs to is
+-- the evidence's say-so, not the type's
+prog : {e : HFunctor} -> (teller <: e) -> (ticker <: e) -> Co e String
+prog evT evC = do
+  tell evT "start"
+  a <- tick evC
+  b <- tick evC
+  tell evT "end"
+  pure (showInt a ++ showInt b)
+
+data Res a = MkRes a Int String
+
+render : Res String -> String
+render (MkRes s n log) = log ++ s ++ "@" ++ showInt n
+
+test evidence
+
+-- under teller <+> ticker ...
+runTT : Handler (teller <+> ticker)
+runTT =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> MkRes x n ""
+  , bind = \m k n -> case m n of
+      MkRes x n2 s1 -> case k x n2 of
+        MkRes y n3 s2 -> MkRes y n3 (s1 ++ s2)
+  , malg = \p n -> case p of
+      InL t -> case t of
+        Tell s x -> MkRes x n (s ++ ";")
+      InR t -> case t of
+        Tick k -> MkRes (k n) (n + 1) ""
+  }
+
+-- >>> render (handle runTT (prog (inl teller ticker) (inr teller ticker)) 0)
+-- "start;end;01@2"
+
+-- ... and under the sum the other way around: only the evidence moves
+runCT : Handler (ticker <+> teller)
+runCT =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> MkRes x n ""
+  , bind = \m k n -> case m n of
+      MkRes x n2 s1 -> case k x n2 of
+        MkRes y n3 s2 -> MkRes y n3 (s1 ++ s2)
+  , malg = \p n -> case p of
+      InL t -> case t of
+        Tick k -> MkRes (k n) (n + 1) ""
+      InR t -> case t of
+        Tell s x -> MkRes x n (s ++ ";")
+  }
+
+-- >>> render (handle runCT (prog (inr ticker teller) (inl ticker teller)) 0)
+-- "start;end;01@2"
+
+-- teller peeled off with `through` (what it tells, dropped), the ticker
+-- that is left handled on its own
+tickOnly : Handler ticker
+tickOnly =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> MkRes x n ""
+  , bind = \m k n -> case m n of
+      MkRes x n2 s1 -> case k x n2 of
+        MkRes y n3 s2 -> MkRes y n3 (s1 ++ s2)
+  , malg = \p n -> case p of
+      Tick k -> MkRes (k n) (n + 1) ""
+  }
+
+muffled : Co ticker String
+muffled =
+  handle
+    (through teller ticker (\t -> case t of
+     Tell s x -> val x))
+    (prog (inl teller ticker) (inr teller ticker))
+
+-- >>> render (handle tickOnly muffled 0)
+-- "01@2"

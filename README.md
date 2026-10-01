@@ -145,7 +145,13 @@ is a record.
 Higher-Order Effectful Operations with Judgemental Monadic Laws" (POPL
 2026): an effect is a higher-order functor, a handler is a monad with an
 algebra (`Handler h`), and a computation `Co h a` runs under any handler of
-its effect.  `do` is `bind`.  `h <+> k` is two effects as one.
+its effect.  `do` is `bind`.  `h <+> k` is two effects as one, and
+`h <: e` is the evidence that `h`'s operations are among `e`'s -- which
+world an operation belongs to is nowhere in its type, so the evidence is
+the program saying it; a computation polymorphic in its effect takes the
+evidence it needs (`{e : HFunctor} -> (stdio <: e) -> ...`).  `through`
+handles the left effect of a sum and no more: the rest is a computation
+again, for whoever handles it.
 
 - `lib/dom.hf`: a web page (create, text, attr, append, on, select,
   xpath, sleep, fetch), with `lib/state.hf`: an app is a
@@ -156,9 +162,9 @@ its effect.  `do` is `bind`.  `h <+> k` is two effects as one.
   `lib/net.hf`: a program's worlds, one effect each -- the standard
   streams, the process (arguments, environment, exit), files, time, the
   network.  A program sums the ones it lives in, `stdio <+> fs`, and
-  lifts each computation in by its evidence (`lift`, `inl`, `inr`,
-  lib/co.hf); `heff node` writes it as a Node.js program -- one monad,
-  an algebra per effect.
+  lifts each computation in by its evidence (`lift`, `inl`, `inr`:
+  values of `<:`, lib/co.hf); `heff node` writes it as a Node.js
+  program -- one monad, an algebra per effect.
 
 The page's handler and Node's are written in JavaScript; asynchrony is
 the handler's, and the program is plain `do`.  The same computation runs
