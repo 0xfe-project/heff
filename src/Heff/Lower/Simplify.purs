@@ -75,9 +75,12 @@ attempt orig m = do
   e <- m
   if size e <= size orig + budget then pure e
   else do
-    -- (the names drawn stay drawn: no name is ever given out twice)
-    n <- gets _.supply
-    put saved { supply = n }
+    -- (the names drawn stay drawn: no name is ever given out twice.  And
+    -- the fuel burnt stays burnt: a speculation that did not pay is not
+    -- free to try again inside every caller -- refunding it made the
+    -- simplifier exponential on a file of record-tied definitions)
+    st <- get
+    put saved { supply = st.supply, fuel = st.fuel }
     pure orig
 
 -- | the globals that cannot fail when used: functions, and values of such
