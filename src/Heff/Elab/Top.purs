@@ -3,8 +3,11 @@
 module Heff.Elab.Top
   ( Judgment(..)
   , elabDecl
+  , entryFor
   , topWith
   , topModule
+  , topThawed
+  , ThawedDef
   , TopResult
   , Watch
   ) where
@@ -397,19 +400,28 @@ elabDecl key g n = do
   let
     tyStx = zonkTy mc a.stx
     bodyStx = zonkEl mc t.stx
-    aval' = V.nom (evalTy { local: V.LNil, global: g } N tyStx)
-    vL :: Lazy V.El
-    vL = fix \self -> defer \_ ->
-      let fixed = eval { local: V.LSnoc V.LNil self, global: g } D bodyStx
-      in V.reflect (V.Global k) (pure V.Id) (pure aval') (Just fixed)
-    -- a primitive has no definition to unfold: it is a neutral
-    value = if d.prim then V.reflect (V.Global k) (pure V.Id) (pure aval') Nothing else force vL
   when (d.prim && not (isPrim d.name)) $ throwError
     { code: 329, severity: SError, span: ntnSpan n, note: Nothing
     , msg: P.text ("there is no primitive called `" <> d.name <> "` (the runtime has: " <> Str.joinWith ", " primNames <> ")")
     }
   modify_ \st -> st { selfKey = Nothing }
-  pure { name: d.name, key: k, prim: d.prim, entry: { syntax: bodyStx, value, type_: aval' } }
+  pure { name: d.name, key: k, prim: d.prim, entry: entryFor g k d.prim tyStx bodyStx }
+
+-- | the entry a definition is stored as, from its core syntax alone: the
+-- | type and the body, evaluated.  Elaboration ends here, and a definition
+-- | thawed from a cache comes back through here too: the syntax is all
+-- | either keeps.
+entryFor :: Globals -> Name -> Boolean -> Syn.Ty -> Syn.El -> GlobalEntry
+entryFor g k prim tyStx bodyStx =
+  let
+    aval = V.nom (evalTy { local: V.LNil, global: g } N tyStx)
+    vL :: Lazy V.El
+    vL = fix \self -> defer \_ ->
+      let fixed = eval { local: V.LSnoc V.LNil self, global: g } D bodyStx
+      in V.reflect (V.Global k) (pure V.Id) (pure aval) (Just fixed)
+    -- a primitive has no definition to unfold: it is a neutral
+    value = if prim then V.reflect (V.Global k) (pure V.Id) (pure aval) Nothing else force vL
+  in { syntax: bodyStx, tySyntax: tyStx, value, type_: aval }
 
 -- | a constraint unification could not solve, said where the implicit
 -- | argument it is about was to be inferred (else where the declaration is)
@@ -467,8 +479,9 @@ elabWatch g n = do
   mc <- gets _.metas
   let
     syntax = zonkEl mc t.stx
-    type_ = V.nom (evalTy { local: V.LNil, global: g } N (zonkTy mc (readbTy 0 (V.forceTy mc ty))))
-  pure { syntax, value: V.nom (eval { local: V.LNil, global: g } N syntax), type_ }
+    tySyntax = zonkTy mc (readbTy 0 (V.forceTy mc ty))
+    type_ = V.nom (evalTy { local: V.LNil, global: g } N tySyntax)
+  pure { syntax, tySyntax, value: V.nom (eval { local: V.LNil, global: g } N syntax), type_ }
 
 type Watch = { span :: Span, entry :: GlobalEntry }
 
@@ -516,3 +529,28 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
       }
     Right (Tuple (Left d) st) -> acc { diags = A.snoc acc.diags d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
   st0 = emptySt
+
+-- | a definition as a cache keeps it: its key, where it is, and its core
+-- | syntax (type and body)
+type ThawedDef = { name :: Name, key :: Name, span :: Span, ty :: Syn.Ty, body :: Syn.El }
+
+-- | a module thawed from a cache: its definitions' syntax evaluated back
+-- | into globals -- `topModule` with the elaboration already done
+topThawed :: Globals -> Array ThawedDef -> TopResult
+topThawed g0 = foldl one { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [] }
+  where
+  one acc d =
+    let
+      keep = acc { spans = A.snoc acc.spans (Tuple d.name d.span), keys = A.snoc acc.keys d.key }
+      prim = isForeign d.body
+    in
+      -- (a primitive declared again, by another module, is the same one)
+      if prim && isJust (lookupGlobal acc.globals d.key) then keep
+      else keep
+        { globals = (if d.key == d.name then identity else addAlias d.name d.key)
+            (addGlobalEntry d.key (entryFor acc.globals d.key prim d.ty d.body) acc.globals)
+        }
+  isForeign = case _ of
+    Syn.Prim _ -> true
+    Syn.Is e -> isForeign e
+    _ -> false

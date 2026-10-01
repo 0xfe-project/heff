@@ -14,8 +14,10 @@ import Heff.Core.Syntax as S
 import Heff.Core.Value as V
 
 -- | `syntax` is the definition at case D, with the definition itself bound
--- | as local 0 (the reference implementation's `FixMe`)
-type GlobalEntry = { syntax :: S.El, value :: V.El, type_ :: V.Ty }
+-- | as local 0 (the reference implementation's `FixMe`); `tySyntax` its
+-- | type, closed.  The two are the definition as a cache keeps it: `value`
+-- | and `type_` are their evaluations (`Heff.Elab.Top.entryFor`)
+type GlobalEntry = { syntax :: S.El, tySyntax :: S.Ty, value :: V.El, type_ :: V.Ty }
 
 -- | `aliases` maps a name to the key it stands for.  A module's definitions
 -- | are keyed `module.name`: a file reaches its own, and those of the

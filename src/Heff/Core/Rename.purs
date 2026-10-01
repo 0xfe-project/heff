@@ -39,6 +39,7 @@ renameEl r = go
     S.Is e -> S.Is (go e)
     S.Rec e -> S.Rec (go e)
     S.Implicit x e -> S.Implicit x (go e)
+    S.MetaApp m xs t -> S.MetaApp m xs (renameTy r t)
     other -> other
 
 renameTy :: (Name -> Name) -> S.Ty -> S.Ty
@@ -50,6 +51,7 @@ renameTy r = go
     S.Record rt -> S.Record { level: rt.level, fieldTypes: dictMap go rt.fieldTypes }
     S.Sum (Variants vs) -> S.Sum (Variants (dictMap (map go) vs))
     S.IsTy t -> S.IsTy (go t)
+    S.PrimArray t -> S.PrimArray (go t)
     other -> other
 
 

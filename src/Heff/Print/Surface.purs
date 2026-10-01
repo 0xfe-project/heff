@@ -6,6 +6,7 @@ module Heff.Print.Surface
   , printEl
   , printTy
   , printDef
+  , printSig
   , tagText
   ) where
 
@@ -200,30 +201,48 @@ printDef :: Implicits -> Name -> Syn.Ty -> Syn.El -> String
 printDef im name t body =
   case primitive body of
     Just _ -> "foreign import " <> name <> " : " <> printTy im 0 Nil t <> "\n"
-    Nothing -> case typeFormer t body (name : Nil) [] of
-      Just tf -> case tf.def of
-        Syn.Sum (Variants vs) | not tf.large ->
-          "data " <> head tf.params <> (if A.null (dictToList vs) then "" else " = " <> S.joinWith " | " (map (\(Tuple x ts) -> S.joinWith " " (A.cons (tagText x) (map (ty c 2 tf.names) ts))) (dictToList vs))) <> "\n"
-        Syn.Record r | tf.large ->
-          let
-            fields = A.foldl (\acc (Tuple l ft) -> { names: l : acc.names, out: A.snoc acc.out ("  " <> l <> " : " <> ty c 0 acc.names ft) })
-              { names: tf.names, out: [] } (dictToList r.fieldTypes)
-          in "theory " <> head tf.params <> " where\n" <> S.joinWith "\n" fields.out <> "\n"
-        other | not tf.large -> "type " <> head tf.params <> " = " <> ty c 0 tf.names other <> "\n"
-        _ -> general
-      Nothing -> general
+    Nothing -> fromMaybe general (former im name t body)
   where
-  c = { im, indent: 0 }
   general =
     name <> " : " <> printTy im 0 Nil t <> "\n"
       <> case equationsWith { tag: tagText, sep: "=", minRows: 1, body: \ns e -> el { im, indent: 0 } 0 ns e } name (name : Nil) t body of
         Just eqs -> S.joinWith "" (map (_ <> "\n") eqs)
         Nothing -> name <> " = " <> el { im, indent: 0 } 0 (name : Nil) body <> "\n"
+
+-- | a definition as an interface has it: `data`, `type` and
+-- | `theory` in full -- an importer sees through them -- and any other as
+-- | its signature.  `shown` is the name as a signature writes it (an
+-- | operator in parentheses)
+printSig :: Implicits -> Name -> String -> Syn.Ty -> Syn.El -> String
+printSig im name shown t body =
+  case primitive body of
+    Just _ -> sig
+    Nothing -> fromMaybe sig (former im name t body)
+  where
+  sig = shown <> " : " <> printTy im 0 Nil t <> "\n"
+
+-- | a definition written back as `data`, `type` or `theory`, where it has
+-- | their shape
+former :: Implicits -> Name -> Syn.Ty -> Syn.El -> Maybe String
+former im name t body = typeFormer t body (name : Nil) [] >>= \tf -> case tf.def of
+  Syn.Sum (Variants vs) | not tf.large ->
+    Just ("data " <> head tf.params <> (if A.null (dictToList vs) then "" else " = " <> S.joinWith " | " (map (\(Tuple x ts) -> S.joinWith " " (A.cons (tagText x) (map (ty c 2 tf.names) ts))) (dictToList vs))) <> "\n")
+  Syn.Record r | tf.large ->
+    let
+      fields = A.foldl (\acc (Tuple l ft) -> { names: l : acc.names, out: A.snoc acc.out ("  " <> l <> " : " <> ty c 0 acc.names ft) })
+        { names: tf.names, out: [] } (dictToList r.fieldTypes)
+    in Just ("theory " <> head tf.params <> " where\n" <> S.joinWith "\n" fields.out <> "\n")
+  other | not tf.large -> Just ("type " <> head tf.params <> " = " <> ty c 0 tf.names other <> "\n")
+  _ -> Nothing
+  where
+  c = { im, indent: 0 }
   head params = S.joinWith " " (A.cons name params)
-  primitive = case _ of
-    Syn.Prim x -> Just x
-    Syn.Is e -> primitive e
-    _ -> Nothing
+
+primitive :: Syn.El -> Maybe String
+primitive = case _ of
+  Syn.Prim x -> Just x
+  Syn.Is e -> primitive e
+  _ -> Nothing
 
 -- | `(p :: A) -> … -> Type` defined by lambdas and then a type: a `data`, a
 -- | `type` or a `theory` (`large`: into `Theory`)
@@ -231,7 +250,8 @@ typeFormer :: Syn.Ty -> Syn.El -> List Name -> Array String -> Maybe { params ::
 typeFormer t body ns params = case t, body of
   Syn.U u, _ -> case strip body of
     Syn.Code d -> Just { params, names: ns, def: unIs d, large: u == LargeU }
-    _ -> Nothing
+    -- (`type T = Tk.T`: a type-valued term, an alias among them)
+    b -> Just { params, names: ns, def: Syn.Decode b, large: u == LargeU }
   Syn.Function f, Syn.Lam _ (Syn.Abs x b) | not f.implicit, Syn.Abs _ cod <- f.cod ->
     -- (a parameter of type `Type` is bare if it is lower case: `data List a`)
     let param = case f.dom of

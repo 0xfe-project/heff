@@ -29,9 +29,10 @@ import Effect.Exception (message, try)
 import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Foreign.Object as FO
-import Heff.Driver (Checked, completionsAt, definitionAt, elabProgram, typeAt)
+import Heff.Cache (loadCached)
+import Heff.Driver (Checked, completionsAt, definitionAt, typeAt)
 import Heff.Format (format)
-import Heff.Load (loadProgramWith, pathsFor)
+import Heff.Load (pathsFor)
 import Heff.Parse.Notation (Diag, Severity(..), Span)
 import Heff.Parse.Import (readImports)
 import Heff.Support.Diagnostic (lineCol, renderDiagMessage)
@@ -243,8 +244,7 @@ check lib st f = do
     let read p = maybe (readTextFile UTF8 p) (pure <<< _.text) (Map.lookup p s.docs)
     r <- try do
       ps <- pathsFor lib f
-      l <- loadProgramWith read ps f
-      pure { program: elabProgram l.sources, errors: l.errors }
+      loadCached read ps f
     case r of
       Left e -> do
         logImpl (f <> ": " <> message e)

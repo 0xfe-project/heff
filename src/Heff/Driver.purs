@@ -7,10 +7,12 @@
 module Heff.Driver
   ( Source
   , Checked
+  , Thawed
   , elabProgram
+  , elabProgramWith
   , errorsIn
   , renderFileDiags
-  , definitions
+  , interface
   , WatchInfo
   , watches
   , TestReport
@@ -38,18 +40,18 @@ import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
 import Heff.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
 import Heff.Core.Readback (readbTy)
-import Heff.Core.Rename (renameTy)
+import Heff.Core.Rename (renameEl, renameTy)
 import Heff.Core.Syntax (El(..), Ty(..))
 import Heff.Effect (Effect(..), leaves)
 import Heff.Elab.Environment (Info)
-import Heff.Elab.Top (TopResult, topModule, topWith)
+import Heff.Elab.Top (ThawedDef, TopResult, topModule, topThawed, topWith)
 import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
 import Heff.Parse.Notation (Diag, Ntn, Severity(..))
 import Heff.Parse.Notation as F
-import Heff.Parse.Fixity (Fixities, emptyFixities, union)
+import Heff.Parse.Fixity (Assoc(..), Fixities, emptyFixities, union)
 import Heff.Support.Common (operatorName)
 import Heff.Parse.Surface (readProgram, readProgramWith)
-import Heff.Print.Surface (printTy)
+import Heff.Print.Surface (printSig, printTy)
 import Heff.Support.Diagnostic (lineCol, renderDiag)
 import Heff.Support.Pretty as P
 
@@ -63,7 +65,11 @@ type Source = { path :: String, module :: String, source :: String, text :: Stri
 -- | a file, elaborated: `top.globals` has everything it needs, `own` its
 -- | own definitions (by name, and the key each is stored under,
 -- | `module.name`), `fixities` the fixities it declares
-type Checked = { path :: String, module :: String, source :: String, text :: String, ntns :: Array Ntn, top :: TopResult, diags :: Array Diag, own :: Array { name :: String, key :: String }, deps :: Array String, fixities :: Fixities }
+type Checked = { path :: String, module :: String, source :: String, text :: String, ntns :: Array Ntn, top :: TopResult, diags :: Array Diag, own :: Array { name :: String, key :: String }, deps :: Array String, opens :: Array String, aliases :: Array { module :: String, alias :: String }, fixities :: Fixities, cached :: Boolean }
+
+-- | a module as a cache keeps it: its definitions' core syntax and its
+-- | fixities -- everything an importer needs, nothing a tool shows
+type Thawed = { fixities :: Fixities, defs :: Array ThawedDef }
 
 -- | read a file into notation; a capitalised name is a definition if
 -- | `known` says so; `fixities`: those of what it imports
@@ -75,7 +81,14 @@ readSource known fixities src = readProgramWith { known, fixities, lenient: fals
 -- | the modules it imports, by name; what those need is there too, by key,
 -- | but not in scope
 elabProgram :: Array Source -> Array Checked
-elabProgram = A.foldl step []
+elabProgram = elabProgramWith (const Nothing)
+
+-- | the same, around a cache: a module `thaw` has is not read or
+-- | elaborated -- its definitions come back through `topThawed` as they
+-- | were.  Which modules qualify is the caller's judgment (`Heff.Cache`
+-- | hashes source, dependencies and compiler).
+elabProgramWith :: (String -> Maybe Thawed) -> Array Source -> Array Checked
+elabProgramWith thaw = A.foldl step []
   where
   step done s =
     let
@@ -95,17 +108,28 @@ elabProgram = A.foldl step []
       g0 = A.foldl (\g q -> case A.find (\c -> c.module == q.module) done of
           Just c -> A.foldl (\g' o -> addAlias (q.alias <> "." <> o.name) o.key g') g c.own
           Nothing -> g) g1 s.aliases
-      r = readSource (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
       key x = s.module <> "." <> x
-      t = topModule key g0 r.ntns
-    in
-      A.snoc done
-        { path: s.path, module: s.module, source: s.source, text: s.text, ntns: r.ntns, top: t
-        , diags: map clash clashes <> map hint (r.diags <> t.diags)
+      checked t ntns diags fixities cached =
+        { path: s.path, module: s.module, source: s.source, text: s.text, ntns, top: t
+        , diags
         , own: A.zipWith (\(Tuple x _) k -> { name: x, key: k }) t.spans t.keys
         , deps: s.deps
-        , fixities: r.fixities
+        , opens: s.opens
+        , aliases: s.aliases
+        , fixities
+        , cached
         }
+      -- a module the cache has was elaborated clean, and nothing it is
+      -- made of has changed: its text is not even read
+      thawed m = checked (topThawed g0 m.defs) [] [] m.fixities true
+      fresh _ =
+        let
+          r = readSource (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
+          t = topModule key g0 r.ntns
+        in
+          checked t r.ntns (map clash clashes <> map hint (r.diags <> t.diags)) r.fixities false
+    in
+      A.snoc done (maybe (fresh unit) thawed (thaw s.module))
   -- the modules reached from some, through their imports
   closure done = go []
     where
@@ -132,17 +156,50 @@ renderFileDiags path src ds = S.joinWith "" (map one ds)
     let lc = lineCol src d.span.start
     in path <> ":" <> show (lc.line + 1) <> ":" <> show (lc.col + 1) <> "\n" <> P.render (renderDiag src d) <> "\n\n"
 
--- | a type, its globals by the names they have in the file (else by key)
-showTy :: Globals -> Ty -> String
-showTy g = printTy { names: \_ _ -> [], hide: true } 0 Nil <<< renameTy shown
+-- | a global key by the name it has in the file, else the key
+localName :: Globals -> String -> String
+localName g = \k -> fromMaybe k (Map.lookup k names)
   where
   names = Map.fromFoldable (map (\(Tuple x k) -> Tuple k x) (Map.toUnfoldable g.aliases :: Array (Tuple String String)))
-  shown k = fromMaybe k (Map.lookup k names)
 
--- | a file's own definitions and their types
--- | (`name`: as a signature has it, an operator in parentheses)
-definitions :: Checked -> Array { name :: String, type :: String }
-definitions c = A.mapMaybe (\o -> lookupGlobal c.top.globals o.key <#> \e -> { name: named o.name, type: showTy c.top.globals (readbTy 0 e.type_) }) c.own
+-- | a type, its globals by the names they have in the file (else by key)
+showTy :: Globals -> Ty -> String
+showTy g = printTy { names: \_ _ -> [], hide: true } 0 Nil <<< renameTy (localName g)
+
+-- | a file's interface: its imports and fixity declarations, its
+-- | types in full (`data`, `type`, `theory` -- an importer sees through
+-- | them), its values as signatures.  What `heff check` prints.
+interface :: Checked -> String
+interface c = S.joinWith "\n" (A.filter (_ /= "") [ imports, fixities, defs ])
+  where
+  imports = S.joinWith ""
+    (map (\m -> "import " <> m <> "\n") c.opens
+      <> map (\a -> "import " <> a.module <> " as " <> a.alias <> "\n") c.aliases)
+  -- `above` and `below` relate a group to groups declared before it, so
+  -- each relation is written on the group that came later
+  fixities = S.joinWith "" (A.mapWithIndex fixityLine c.fixities.groups)
+  fixityLine i g =
+    assocKw g.assoc <> " " <> S.joinWith " " g.ops
+      <> rel " above " (A.nub (A.mapMaybe (\e -> if e.tighter == g.id && earlier i e.looser then Just e.looser else Nothing) c.fixities.above))
+      <> rel " below " (A.nub (A.mapMaybe (\e -> if e.looser == g.id && earlier i e.tighter then Just e.tighter else Nothing) c.fixities.above))
+      <> "\n"
+  earlier i x = case A.findIndex (\h -> h.id == x) c.fixities.groups of
+    Just j -> j < i
+    Nothing -> true
+  rel kw ops = if A.null ops then "" else kw <> S.joinWith " " ops
+  assocKw = case _ of
+    AssocLeft -> "infixl"
+    AssocRight -> "infixr"
+    AssocNone -> "infix"
+  -- a definition of more lines than one keeps blank lines around it
+  defs = (A.foldl glue { out: "", multi: false, first: true } (A.mapMaybe entry c.own)).out
+  glue acc d =
+    let m = isJust (S.indexOf (S.Pattern "\n") (SCU.dropRight 1 d))
+    in { out: acc.out <> (if not acc.first && (m || acc.multi) then "\n" else "") <> d, multi: m, first: false }
+  entry o = lookupGlobal c.top.globals o.key <#> \e ->
+    printSig im o.name (named o.name) (renameTy ln (readbTy 0 e.type_)) (renameEl ln e.syntax)
+  ln = localName c.top.globals
+  im = { names: \_ _ -> [], hide: true }
 
 -- | a name as written alone: an operator in parentheses, `(+)`
 named :: String -> String

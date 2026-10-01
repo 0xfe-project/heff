@@ -12,10 +12,11 @@ import Data.Traversable (for_)
 import Effect (Effect)
 import Effect.Console (log)
 import Heff.Compile.JavaScript (compileApp, compileJs, compileNode)
-import Heff.Driver (Checked, definitions, elabProgram, errorsIn, explain, evaluate, findRunnable, promote, renderFileDiags, testFile, typeAt, watches)
+import Heff.Cache (loadCached)
+import Heff.Driver (Checked, errorsIn, explain, evaluate, findRunnable, interface, promote, renderFileDiags, testFile, typeAt, watches)
 import Heff.Elab.Environment (enableTraceSink, takeTraceSink)
 import Heff.Format (format)
-import Heff.Load (loadProgram, pathsFor)
+import Heff.Load (pathsFor)
 import Heff.Lsp as Lsp
 import Heff.Support.Diff (mismatch, useColor)
 import Node.Encoding (Encoding(..))
@@ -27,7 +28,7 @@ import Node.Stream (writeString)
 -- | complete to (`files`: the files' suffix; `flags`)
 commands :: Array { name :: String, args :: String, doc :: String, files :: String, flags :: Array { flag :: String, doc :: String } }
 commands =
-  [ { name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its definitions' types", files: ".hf", flags: [] }
+  [ { name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its interface", files: ".hf", flags: [] }
   , { name: "eval", args: "FILE", doc: "print what each definition of FILE evaluates to", files: ".hf", flags: [] }
   , { name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hf", flags: [] }
   , { name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hf", flags: [] }
@@ -75,12 +76,11 @@ load :: String -> Effect { program :: Array Checked, file :: Checked, ok :: Bool
 load f = do
   lib <- libDir
   ps <- pathsFor lib f
-  l <- loadProgram ps f
+  l <- loadCached (readTextFile UTF8) ps f
   for_ l.errors \e -> err (e <> "\n")
-  let program = elabProgram l.sources
-  for_ program \c -> when (not (A.null c.diags)) (err (renderFileDiags c.path c.source c.diags))
-  case A.last program of
-    Just file -> pure { program, file, ok: A.null l.errors && A.all (A.null <<< errorsIn) program }
+  for_ l.program \c -> when (not (A.null c.diags)) (err (renderFileDiags c.path c.source c.diags))
+  case A.last l.program of
+    Just file -> pure { program: l.program, file, ok: A.null l.errors && A.all (A.null <<< errorsIn) l.program }
     Nothing -> exit' 1
 
 main :: Effect Unit
@@ -89,7 +89,7 @@ main = do
   case A.drop 2 args of
     [ "check", f ] -> do
       l <- load f
-      for_ (definitions l.file) \d -> log (d.name <> " : " <> d.type)
+      void (writeString stdout UTF8 (interface l.file))
       when (not l.ok) (exit' 1)
     [ "eval", f ] -> do
       l <- load f

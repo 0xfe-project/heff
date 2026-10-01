@@ -40,7 +40,7 @@ language server (diagnostics, hover, go to definition, formatting).
 ## Commands
 
 ```sh
-heff check FILE                # the types of FILE's definitions
+heff check FILE                # FILE's interface: its types in full, its values' signatures
 heff eval FILE                 # what each definition evaluates to
 heff run FILE                  # what each watch evaluates to
 heff test FILE...              # do the watches' expectations hold?
@@ -52,6 +52,11 @@ heff node FILE [NAME] OUT.mjs  # a Node.js program
 heff lsp                       # the language server, on stdio
 heff completions fish          # > ~/.config/fish/completions/heff.fish
 ```
+
+Every command elaborates the file given and what it imports.  An imported
+module whose source, dependencies and compiler are unchanged is thawed
+from the cache the compiler keeps at the project root (`.heff/`, safe to
+delete, worth ignoring in git) instead of elaborated again.
 
 ## The language
 

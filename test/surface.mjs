@@ -42,6 +42,32 @@ for (const [f, msg] of rejected) {
 }
 console.log(`modules: ${rejected.length} rejected as they should${failed ? " (with failures)" : ""}`);
 
+// the interface `heff check` prints: imports and fixities, types in full,
+// values as signatures
+const iface = heff("check", "test/surface/module-struct.hf");
+const ifaceWant = `import prelude
+
+theory MOD where
+  tok : Type
+  mk : Int -> tok
+  size : tok -> Int
+  twice : tok -> Int
+  lexed : Type
+  lex : String -> lexed
+  toks : lexed -> List tok
+
+mod1 : MOD
+`;
+if (iface.status !== 0 || iface.stdout !== ifaceWant) {
+  failed++;
+  console.log(`FAIL the interface of test/surface/module-struct.hf:\n${iface.stdout}${iface.stderr}`);
+}
+const docIface = heff("check", "lib/doc.hf");
+for (const line of ["infixr <+> above <>", "data Doc = Fail | None | Text String | Line", "(<>) : Doc -> Doc -> Doc"]) {
+  if (!docIface.stdout.includes(line)) { failed++; console.log(`FAIL the interface of lib/doc.hf misses "${line}"`); }
+}
+console.log("interfaces: as `heff check` prints them");
+
 // an expectation that does not hold: what differs is shown, cut to it
 mkdirSync(join(root, "ref"), { recursive: true });
 const wrong = join(root, "ref", "wrong-expectation.hf");
