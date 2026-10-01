@@ -243,8 +243,34 @@ solve g cs m sp rhs self = do
   case patternArgs sk mc sp of
     Nothing -> postponeU cs self rhs
     Just args -> case flexOf rhs of
-      -- `?m args =?= ?m args`
-      Just (Tuple m' sp') | m' == m && patternArgs sk mc sp' == Just args -> pure unit
+      -- `?m` met on both sides: with the same pattern it is nothing; with
+      -- two DIFFERENT patterns it may depend only on the positions where
+      -- the two agree (pattern intersection) -- never an occurs error
+      Just (Tuple m' sp') | m' == m -> case patternArgs sk mc sp' of
+        Just args' | args' == args -> pure unit
+        Just args' | A.length args' == A.length args -> do
+          entry <- case Map.lookup m mc of
+            Just e -> pure e
+            Nothing -> scopeError
+          -- (as in pruning: only a closed type survives dropping arguments)
+          tyStx <- renameTy g m { dom: entry.arity, cod: 0, ren: Map.empty } entry.ty
+          let
+            ty = V.nom (evalTy { local: V.LNil, global: g } N tyStx)
+            n = A.length args
+            kept = A.mapMaybe (\(Tuple i (Tuple a1 a2)) -> if a1 == a2 then Just i else Nothing)
+              (A.mapWithIndex Tuple (A.zip args args'))
+          new <- gets _.nextMeta
+          modify_ \s -> s
+            { nextMeta = new + 1
+            , metas = Map.insert new { ty, sol: Nothing, solStx: Nothing, arity: A.length kept, name: entry.name, span: entry.span } s.metas
+            }
+          let
+            idxs = map (\i -> n - i - 1) kept
+            stx = lams n (S.MetaApp new idxs tyStx)
+            sol = V.nom (eval { local: V.LNil, global: g } N stx)
+          modify_ \s -> s { metas = Map.update (\e2 -> Just e2 { sol = Just sol, solStx = Just stx }) m s.metas }
+          traceSolve m stx
+        _ -> postponeU cs self rhs
       _ -> do
         let ren = { dom: cs.len, cod: A.length args, ren: Map.fromFoldable (A.mapMaybe (\(Tuple i a) -> case a of
               PVar l -> Just (Tuple l i)
