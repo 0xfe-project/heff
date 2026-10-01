@@ -1,0 +1,147 @@
+-- An interpreter with a choice in it, asked three ways: every answer
+-- (M = List -- the continuation is run once per branch by bind, nothing
+-- else multiplies it), the first answer liked (M = a continuation monad:
+-- backtracking that prunes), and the choices logged -- where the log
+-- BRANCHES with the world.  crawl.hf's log never branched: same Write,
+-- other monad.  Control lives in M: algebra per operation, control per
+-- monad.
+
+import co
+import prelude
+import stdio
+
+data Expr = Lit Int | Plus Expr Expr | Amb Expr Expr | Fail
+
+data PickF (m : Type -> Type) x = Flip (Bool -> x) | Stop
+
+pick : HFunctor
+pick =
+  { f = PickF
+  , hfmap = \fm g p -> case p of
+      Flip k -> Flip (\b -> g (k b))
+      Stop -> Stop
+  , hmap = \nt p -> case p of
+      Flip k -> Flip k
+      Stop -> Stop
+  }
+
+here : (pick <: pick)
+here p = p
+
+-- the operations, in any effect the choice is in
+flipC : {e : HFunctor} -> (pick <: e) -> Co e Bool
+flipC ev = op (ev (Flip (\(b : Bool) -> b))) val
+
+stop : {e : HFunctor} -> {a : Type} -> (pick <: e) -> Co e a
+stop = \{e} {a} ev -> op (ev ((Stop : PickF (Co e) a))) val
+
+-- the interpreter, over any effect its choices are in
+eval : {e : HFunctor} -> (pick <: e) -> Expr -> Co e Int
+eval ev (Lit n) = pure n
+eval ev (Plus l r) = do
+  a <- eval ev l
+  b <- eval ev r
+  pure (a + b)
+eval ev (Amb l r) = do
+  c <- flipC ev
+  if c then eval ev l else eval ev r
+eval ev Fail = stop ev
+
+threeWays : Expr
+threeWays = Amb (Lit 1) (Amb (Lit 2) (Lit 3))
+
+withDead : Expr
+withDead = Plus threeWays (Amb (Lit 10) Fail)
+
+-- every answer: the dead branch is no answer at all
+every : Handler pick
+every =
+  { M = List
+  , ret = \x -> [x]
+  , bind = \m k -> concatMap k m
+  , malg = \p -> case p of
+      Flip k -> [k True, k False]
+      Stop -> []
+  }
+
+test amb
+
+-- >>> handle every (eval here withDead)
+-- Cons 11 (Cons 12 (Cons 13 Nil))
+
+-- the first answer liked: `c` is the whole rest of the program, so a
+-- liked left branch never computes the right one
+first : Handler pick
+first =
+  { M = \a -> (a -> Maybe Int) -> Maybe Int
+  , ret = \x c -> c x
+  , bind = \m k c -> m (\x -> k x c)
+  , malg = \p c -> case p of
+      Flip k -> case c (k True) of
+        Just r -> Just r
+        Nothing -> c (k False)
+      Stop -> Nothing
+  }
+
+-- >>> handle first (eval here threeWays) (\n -> if 1 < n then Just n else Nothing)
+-- Just 2
+
+-- >>> handle first (eval here Fail) (\n -> Just n)
+-- Nothing
+
+-- choices with a log: the same Write as everywhere, but this monad
+-- carries a history PER BRANCH -- whether the world forks is the
+-- monad's say, not the operation's
+eff2 : HFunctor
+eff2 = pick <+> stdio
+
+coin : Co eff2 String
+coin = do
+  c <- flipC (inl pick stdio)
+  if c
+      then (do
+            lift (inr pick stdio) (write "heads")
+            pure "H")
+      else (do
+            lift (inr pick stdio) (write "tails")
+            pure "T")
+
+two : Co eff2 String
+two = do
+  x <- coin
+  y <- coin
+  pure (x ++ y)
+
+-- a branch's history goes on in front of what its future writes
+inherits : {y : Type}
+         -> List String
+         -> Pair y (List String)
+         -> Pair y (List String)
+inherits lg (MkPair y lg2) = MkPair y (concatList lg lg2)
+
+forks : {x y : Type}
+      -> (x -> List (Pair y (List String)))
+      -> Pair x (List String)
+      -> List (Pair y (List String))
+forks k (MkPair x lg) = map (inherits lg) (k x)
+
+branching : Handler eff2
+branching =
+  { M = \a -> List (Pair a (List String))
+  , ret = \x -> [MkPair x []]
+  , bind = \m k -> concatMap (forks k) m
+  , malg = \p -> case p of
+      InL t -> case t of
+        Flip k -> [MkPair (k True) [], MkPair (k False) []]
+        Stop -> []
+      InR t -> case t of
+        Write s x -> [MkPair x [s]]
+        WriteErr s x -> [MkPair x [s]]
+        ReadStdin k -> [MkPair (k "") []]
+  }
+
+showBranch : Pair String (List String) -> String
+showBranch (MkPair s lg) = s ++ "(" ++ joinWith "," lg ++ ")"
+
+-- >>> joinWith ";" (map showBranch (handle branching two))
+-- "HH(heads,heads);HT(heads,tails);TH(tails,heads);TT(tails,tails)"

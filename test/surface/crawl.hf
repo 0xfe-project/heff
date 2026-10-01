@@ -1,0 +1,194 @@
+-- A crawler: five worlds in one sum -- failure, a visited set, the
+-- network, a log, parallel fetching -- and one handler built world by
+-- world.  `extend` is the point to see: it never composes two monads; it
+-- stacks one more algebra on the ONE monad the whole sum shares
+-- (St -> R a, below).  What does not compose by itself -- failure over
+-- state, parallel over failure -- is composed by hand, in R and in the
+-- order the algebras read St.
+
+import co
+import exn
+import net
+import par
+import prelude
+import state
+import stdio
+
+-- the sum, right-nested so the handler stacks the same way
+par2 : HFunctor
+par2 = parOf String String
+
+r3 : HFunctor
+r3 = stdio <+> par2
+
+r2 : HFunctor
+r2 = net <+> r3
+
+r1 : HFunctor
+r1 = state (List String) <+> r2
+
+eff : HFunctor
+eff = exn <+> r1
+
+-- the program's declaration of its world structure
+onExn : (exn <: eff)
+onExn = inl exn r1
+
+onSt : (state (List String) <: eff)
+onSt p = inr exn r1 (inl (state (List String)) r2 p)
+
+onNet : (net <: eff)
+onNet p = inr exn r1 (inr (state (List String)) r2 (inl net r3 p))
+
+onOut : (stdio <: eff)
+onOut p =
+  inr exn r1 (inr (state (List String)) r2 (inr net r3 (inl stdio par2 p)))
+
+onPar : (par2 <: eff)
+onPar p =
+  inr exn r1 (inr (state (List String)) r2 (inr net r3 (inr stdio par2 p)))
+
+-- the operations, at the crawler's own effect
+visited : Co eff (List String)
+visited = op (onSt (Get (\v -> v))) val
+
+record : List String -> Co eff Unit
+record v = op (onSt (Put v (MkUnit : Unit))) val
+
+say : String -> Co eff Unit
+say s = lift onOut (write s)
+
+fetch : String -> Co eff String
+fetch u = lift onNet (fetchText u)
+
+-- a fetch that fails loudly on a missing page
+fetchBody : String -> Co eff String
+fetchBody u = do
+  c <- fetch u
+  if strEq c "404" then throw onExn u else pure c
+
+-- fetch one page, catching: a missing page is said, and is no page
+grab : String -> Co eff String
+grab u = do
+  say ("fetch " ++ u)
+  catch onExn (fetchBody u) (\bad -> do
+    say ("missing " ++ bad)
+    pure "")
+
+-- the links not yet seen, in order
+fresh : List String -> Co eff (List String)
+fresh Nil = pure Nil
+fresh (u :: us) = do
+  rest <- fresh us
+  v <- visited
+  if strEq u "" || elemBy strEq u v then pure rest else pure (u :: rest)
+
+-- breadth first, two pages at a time in parallel, while the fuel lasts
+crawl : Int -> List String -> Co eff Unit
+crawl 0 _ = say "fuel spent"
+crawl fuel Nil = say "done"
+crawl fuel (a :: b :: rest) = do
+  v <- visited
+  record (a :: b :: v)
+  bodies <- parIn onPar (grab a) (grab b)
+  more <- fresh (words (fst bodies ++ " " ++ snd bodies))
+  crawl (fuel - 1) (concatList rest more)
+crawl fuel (a :: Nil) = do
+  v <- visited
+  record (a :: v)
+  body <- grab a
+  more <- fresh (words body)
+  crawl (fuel - 1) more
+
+-- the handler ------------------------------------------------------------
+
+-- the one monad of the whole sum: a visited set and a log, threaded, and
+-- failure cutting the thread
+data St = MkSt (List String) (List String)
+
+data R a = ROk a St | RFail String St
+
+logged : String -> St -> St
+logged s (MkSt v lg) = MkSt v (concatList lg [s])
+
+-- the little web
+pageOf : String -> String
+pageOf "root" = "a b"
+pageOf "a" = "c d"
+pageOf "b" = "e"
+pageOf "c" = ""
+pageOf "e" = ""
+pageOf _ = "404"
+
+-- one more world on the same monad: never two monads composed, one
+-- algebra added to the handler there is
+extend : (k h : HFunctor)
+       -> (hd : Handler h)
+       -> ({a : Type} -> k.f hd.M a -> hd.M a)
+       -> Handler (plus k h)
+extend k h hd alg =
+  { M = hd.M
+  , ret = hd.ret
+  , bind = hd.bind
+  , malg = \p -> case p of
+      InL t -> alg t
+      InR q -> hd.malg q
+  }
+
+-- the base world: parallel fetching, here one after the other
+base : Handler par2
+base =
+  { M = \a -> St -> R a
+  , ret = \x st -> ROk x st
+  , bind = \m k st -> case m st of
+      RFail s st2 -> RFail s st2
+      ROk x st2 -> k x st2
+  , malg = \p st -> case p of
+      Par l r k -> case l st of
+        RFail s st2 -> RFail s st2
+        ROk x st2 -> case r st2 of
+          RFail s st3 -> RFail s st3
+          ROk y st3 -> ROk (k x y) st3
+  }
+
+h3 : Handler r3
+h3 =
+  extend stdio par2 base (\p st -> case p of
+  Write s x -> ROk x (logged s st)
+  WriteErr s x -> ROk x (logged s st)
+  ReadStdin k -> ROk (k "") st)
+
+h2 : Handler r2
+h2 =
+  extend net r3 h3 (\p st -> case p of
+  Fetch u k -> ROk (k (pageOf u)) st)
+
+h1 : Handler r1
+h1 =
+  extend (state (List String)) r2 h2 (\p st -> case p of
+  Get k -> case st of
+    MkSt v lg -> ROk (k v) st
+  Put v x -> case st of
+    MkSt old lg -> ROk x (MkSt v lg))
+
+-- failure keeps the world: what was fetched stays fetched
+hAll : Handler eff
+hAll =
+  extend exn r1 h1 (\p st -> case p of
+  Throw s -> RFail s st
+  Catch c h -> case c st of
+    RFail s st2 -> h s st2
+    ROk x st2 -> ROk x st2)
+
+render : R Unit -> String
+render (ROk u (MkSt v lg)) = joinWith ";" lg
+render (RFail s (MkSt v lg)) = "FAIL " ++ s ++ ": " ++ joinWith ";" lg
+
+test crawl
+
+-- >>> render (handle hAll (crawl 6 ["root"]) (MkSt [] []))
+-- "fetch root;fetch a;fetch b;fetch c;fetch d;missing d;fetch e;done"
+
+-- out of fuel before the queue is out
+-- >>> render (handle hAll (crawl 2 ["root"]) (MkSt [] []))
+-- "fetch root;fetch a;fetch b;fuel spent"
