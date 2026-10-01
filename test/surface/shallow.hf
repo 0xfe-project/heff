@@ -1,0 +1,147 @@
+-- A captured continuation is a value, and shallow handling is a library:
+-- `stepper` is a (deep) handler whose monad is "one step" -- done, or the
+-- first operation with the rest of the computation un-handled.  The rest
+-- is a `Co h a`: it can be handled by a different handler (shallow), or
+-- run in another par branch, or run twice (multi-shot).
+
+import co
+import par
+import prelude
+
+data TickF (m : Type -> Type) x = Tick (Int -> x)
+
+ticker : HFunctor
+ticker =
+  { f = TickF
+  , hfmap = \fm g p -> case p of
+      Tick k -> Tick (\n -> g (k n))
+  , hmap = \nt p -> case p of
+      Tick k -> Tick k
+  }
+
+idEv : (h : HFunctor) -> (h <: h)
+idEv h p = p
+
+tick : {e : HFunctor} -> (ticker <: e) -> Co e Int
+tick ev = op (ev (Tick (\n -> n))) val
+
+-- | One step of a computation: done, or its first operation, the
+-- | computations in it and the rest both un-handled (`c` is `Co h`).
+data StepF (f : (Type -> Type) -> Type -> Type) (c : Type -> Type) a
+  = SDone a
+  | SNext (f c (c a))
+
+-- | A step back into a computation.
+reflect : (h : HFunctor) -> {a : Type} -> StepF h.f (Co h) a -> Co h a
+reflect h s = case s of
+  SDone x -> val x
+  SNext p -> op p (\c -> c)
+
+-- rank-2 arguments to hfmap/hmap, named so their implicits have a say
+coMap : (h : HFunctor) -> {a b : Type} -> (a -> b) -> Co h a -> Co h b
+coMap h g c = bind c (\x -> val (g x))
+
+valIn : (h : HFunctor) -> {a : Type} -> a -> Co h a
+valIn h x = val x
+
+sExtend : (h : HFunctor)
+        -> {a b : Type}
+        -> (a -> StepF h.f (Co h) b)
+        -> Co h a
+        -> Co h b
+sExtend h k c = bind c (\x -> reflect h (k x))
+
+-- | The handler whose monad is steps: handling with it goes only as far
+-- | as the first operation, and hands back the rest as a computation.
+stepper : (h : HFunctor) -> Handler h
+stepper h =
+  { M = \a -> StepF h.f (Co h) a
+  , ret = \x -> SDone x
+  , bind = \m k -> case m of
+      SDone x -> k x
+      SNext q -> SNext (h.hfmap (coMap h) (sExtend h k) q)
+  , malg = \p -> SNext (h.hfmap (coMap h) (valIn h) (h.hmap (reflect h) p))
+  }
+
+prog1 : Co ticker Int
+prog1 = do
+  a <- tick (idEv ticker)
+  b <- tick (idEv ticker)
+  pure (a + b)
+
+test shallow
+
+-- deep, for contrast: one handler for every tick, counting up
+counter : Handler ticker
+counter =
+  { M = \a -> Int -> Pair a Int
+  , ret = \x n -> MkPair x n
+  , bind = \m k n -> case m n of
+      MkPair x n2 -> k x n2
+  , malg = \p n -> case p of
+      Tick k -> MkPair (k n) (n + 1)
+  }
+
+-- >>> handle counter prog1 0
+-- MkPair 1 2
+
+-- shallow, second half: every tick is 0
+restZero : {a : Type} -> Co ticker a -> a
+restZero c = case handle (stepper ticker) c of
+  SDone x -> x
+  SNext p -> case p of
+    Tick k -> restZero (k 0)
+
+-- shallow, the point: the first tick is 100, then the handler CHANGES --
+-- the rest is re-handled by restZero, which a deep handler cannot say
+firstTickBig : {a : Type} -> Co ticker a -> a
+firstTickBig c = case handle (stepper ticker) c of
+  SDone x -> x
+  SNext p -> case p of
+    Tick k -> restZero (k 100)
+
+-- >>> firstTickBig prog1
+-- 100
+
+test migration
+
+-- the rest of prog1 after its first tick: a captured delimited
+-- continuation, as a plain value in hand
+afterFirst : Int -> Co ticker Int
+afterFirst = case handle (stepper ticker) prog1 of
+  SDone x -> \v -> val x
+  SNext p -> case p of
+    Tick k -> k
+
+world : HFunctor
+world = ticker <+> parOf Int Int
+
+evT : ticker <: world
+evT = inl ticker (parOf Int Int)
+
+evP : parOf Int Int <: world
+evP = inr ticker (parOf Int Int)
+
+-- the same captured continuation, run in BOTH branches of a par: it
+-- carries no stack and no handler, so each branch's run is a fresh
+-- beta-reduction under whatever handler the par's handler gives it
+twice : Co world (Pair Int Int)
+twice = parIn evP (lift evT (afterFirst 10)) (lift evT (afterFirst 100))
+
+runWorld : Handler world
+runWorld =
+  { M = \a -> Int -> Pair a Int
+  , ret = \x n -> MkPair x n
+  , bind = \m k n -> case m n of
+      MkPair x n2 -> k x n2
+  , malg = \p n -> case p of
+      InL t -> case t of
+        Tick k -> MkPair (k n) (n + 1)
+      InR q -> case q of
+        Par l r k -> case l n of
+          MkPair x n2 -> case r n2 of
+            MkPair y n3 -> MkPair (k x y) n3
+  }
+
+-- >>> handle runWorld twice 0
+-- MkPair (MkPair 10 101) 2
