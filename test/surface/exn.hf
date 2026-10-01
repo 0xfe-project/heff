@@ -1,0 +1,111 @@
+-- The classic question asked of catch (lib/exn.hf): when the caught
+-- computation changed the world before it threw, does the world keep the
+-- change?  The framework does not say.  Two handlers of
+-- `exn <+> state Int`, one line apart, say it each way.
+
+import co
+import exn
+import prelude
+import state
+
+eff : HFunctor
+eff = exn <+> state Int
+
+onExn : (exn <: eff)
+onExn = inl exn (state Int)
+
+onSt : (state Int <: eff)
+onSt = inr exn (state Int)
+
+getN : Co eff Int
+getN = op (onSt (Get (\st -> st))) val
+
+putN : Int -> Co eff Unit
+putN st = op (onSt (Put st (MkUnit : Unit))) val
+
+-- bump the counter, then fail; the catch hears it and reads the counter
+bumpAndFail : Co eff Int
+bumpAndFail =
+  catch
+    onExn
+    (do
+     putN 1
+     throw onExn "boom")
+    (\s -> getN)
+
+-- no throw: catch is invisible
+quiet : Co eff Int
+quiet =
+  catch
+    onExn
+    (do
+     putN 7
+     getN)
+    (\s -> pure 0)
+
+-- a throw nobody catches
+loud : Co eff Int
+loud = do
+  putN 5
+  throw onExn "unheard"
+
+data Res a = Failed String Int | Done a Int
+
+render : Res Int -> String
+render (Failed s n) = "failed " ++ s ++ " @" ++ showInt n
+render (Done x n) = showInt x ++ " @" ++ showInt n
+
+-- the two handlers: one monad, Int -> Res a, and the same algebra but for
+-- the one line of Catch -- which world the recovery starts from
+
+rolledBack : Handler eff
+rolledBack =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> Done x n
+  , bind = \m k n -> case m n of
+      Failed s n2 -> Failed s n2
+      Done x n2 -> k x n2
+  , malg = \p n -> case p of
+      InL t -> case t of
+        Throw s -> Failed s n
+        Catch c h -> case c n of
+          Failed s n2 -> h s n
+          Done x n2 -> Done x n2
+      InR t -> case t of
+        Get k -> Done (k n) n
+        Put st x -> Done x st
+  }
+
+kept : Handler eff
+kept =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> Done x n
+  , bind = \m k n -> case m n of
+      Failed s n2 -> Failed s n2
+      Done x n2 -> k x n2
+  , malg = \p n -> case p of
+      InL t -> case t of
+        Throw s -> Failed s n
+        Catch c h -> case c n of
+          Failed s n2 -> h s n2
+          Done x n2 -> Done x n2
+      InR t -> case t of
+        Get k -> Done (k n) n
+        Put st x -> Done x st
+  }
+
+test catch/state
+
+-- the put inside the failed try is undone ...
+-- >>> render (handle rolledBack bumpAndFail 0)
+-- "0 @0"
+
+-- ... or it happened and stays: the handler's word, not the framework's
+-- >>> render (handle kept bumpAndFail 0)
+-- "1 @1"
+
+-- >>> render (handle rolledBack quiet 0)
+-- "7 @7"
+
+-- >>> render (handle kept loud 0)
+-- "failed unheard @5"
