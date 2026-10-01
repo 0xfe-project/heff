@@ -1,14 +1,25 @@
 -- | Separate compilation, as a cache the compiler manages: a module whose
--- | source, dependencies and compiler are unchanged since it last
--- | elaborated clean is thawed from `ROOT/.heff/` -- its definitions' core
--- | syntax evaluated back into globals -- instead of elaborated again.
--- | There is no interface file: what is kept is the elaborated module
--- | itself, and `heff check` remains the way to look at one.
+-- | making is unchanged since it last elaborated clean is thawed from
+-- | `ROOT/.heff/` -- its definitions' core syntax evaluated back into
+-- | globals -- instead of elaborated again.  There is no interface file:
+-- | what is kept is the elaborated module itself, and `heff check` remains
+-- | the way to look at one.
 -- |
--- | A module is valid under a hash of the compiler build, its source, and
--- | its dependencies' hashes, so staleness is transitive by construction.
--- | Whatever does not read, parse or match -- another build's cache, a torn
--- | write -- is treated as absent and elaborated over.
+-- | What a module is made of is tracked at the definitions it uses, not at
+-- | whole imports (the `~` of the plan: an importer depends on a module as
+-- | the specialization it actually took of it).  A definition's hash
+-- | covers its core syntax and, transitively, the definitions it mentions;
+-- | a module records the hash of each outside definition its own mention.
+-- | So a change to a dependency re-elaborates only what took that path:
+-- | touching a body no importer uses, or only comments, invalidates no
+-- | one.  What an importer's *parse* takes from a direct import -- which
+-- | names are defined, which operators have which fixity -- is one hash
+-- | per import (`nsHash`), so a new name appearing is seen (it may turn a
+-- | tag into a reference, or two imports into a clash).
+-- |
+-- | A module is thawed only under the same compiler, the same source, the
+-- | same namespaces and the same needed definitions.  Whatever does not
+-- | read, parse or match is treated as absent and elaborated over.
 module Heff.Cache
   ( loadCached
   ) where
@@ -24,6 +35,7 @@ import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Set as Set
 import Data.String as S
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
@@ -31,8 +43,9 @@ import Control.MonadPlus (guard)
 import Effect (Effect)
 import Effect.Exception (try)
 import Heff.Core.Globals (lookupGlobal)
+import Heff.Core.Rename (globalsInEl, globalsInTy)
 import Heff.Core.Serial (decodeEl, decodeTy, encodeEl, encodeTy)
-import Heff.Driver (Checked, Source, Thawed, elabProgramWith)
+import Heff.Driver (Checked, Source, Thawed, elabNext)
 import Heff.Load (Paths, loadProgramWith)
 import Heff.Parse.Fixity (Assoc(..), Fixities)
 import Node.Encoding (Encoding(..))
@@ -43,7 +56,7 @@ foreign import mtimeMs :: String -> Effect Number
 foreign import ensureDir :: String -> Effect Unit
 
 version :: String
-version = "heff-cache/1"
+version = "heff-cache/2"
 
 -- | what identifies the compiler build: its bundle's mtime (`lib` is
 -- | `ROOT/lib`, the bundle `ROOT/output/Main/index.js`)
@@ -53,14 +66,45 @@ stampFor lib = do
   m <- mtimeMs (root <> "/output/Main/index.js")
   pure (show m)
 
--- | each module's hash, over the modules in dependency order: the stamp,
--- | the source (length-prefixed), and the hashes of what it imports
-hashes :: String -> Array Source -> Map String String
-hashes stamp = A.foldl step Map.empty
+-- | each definition's hash: its core syntax, and the hashes of the
+-- | definitions it mentions -- so a hash covers a definition's making,
+-- | transitively.  (A primitive declared again is the same one: the first
+-- | hash stands.)
+defHashesInto :: Map String String -> Checked -> Map String String
+defHashesInto hs c = A.foldl one hs c.own
   where
-  step m s = Map.insert s.module
-    (sha256Hex (version <> "\n" <> stamp <> "\n" <> show (S.length s.source) <> ":" <> s.source <> "\n" <> S.joinWith "," (map (\d -> fromMaybe "?" (Map.lookup d m)) s.deps)))
-    m
+  one m o
+    | Map.member o.key m = m
+    | otherwise = case lookupGlobal c.top.globals o.key of
+        Nothing -> m
+        Just e ->
+          let refs = A.sort (A.nub (globalsInTy e.tySyntax <> globalsInEl e.syntax))
+          in Map.insert o.key
+            (sha256Hex
+              ( stringify (encodeTy e.tySyntax) <> "\n" <> stringify (encodeEl e.syntax) <> "\n"
+                  <> S.joinWith "," (map (\k -> k <> ":" <> fromMaybe "?" (Map.lookup k m)) refs)
+              ))
+            m
+
+-- | what a module's parse takes from a direct import: the names it
+-- | defines, and the fixities it declares
+nsHashOf :: Checked -> String
+nsHashOf c = sha256Hex (S.joinWith "," (map _.name c.own) <> "|" <> fixSig c.fixities)
+  where
+  fixSig f =
+    S.joinWith ";" (map (\g -> g.id <> ":" <> show (assocInt g.assoc) <> ":" <> S.joinWith " " g.ops) f.groups)
+      <> "|"
+      <> S.joinWith ";" (map (\e -> e.tighter <> ">" <> e.looser) f.above)
+
+assocInt :: Assoc -> Int
+assocInt = case _ of
+  AssocLeft -> 0
+  AssocRight -> 1
+  AssocNone -> 2
+
+-- | the modules a file imports directly, in scope by name or by alias
+directOf :: Source -> Array String
+directOf s = A.nub (s.opens <> map _.module s.aliases)
 
 -- | `loadProgram` and `elabProgram`, around the cache.  The file asked for
 -- | is always elaborated: its watches, spans and infos are wanted; the
@@ -71,19 +115,21 @@ loadCached read ps file = do
   l <- loadProgramWith read ps file
   stamp <- stampFor ps.lib
   let
-    hs = hashes stamp l.sources
     dir = ps.root <> "/.heff"
-    hashOf m = fromMaybe "?" (Map.lookup m hs)
-  thaws <- A.foldM (\acc s -> thawOne dir (hashOf s.module) s.module <#> maybe acc (\t -> Map.insert s.module t acc)) Map.empty (A.dropEnd 1 l.sources)
-  let program = elabProgramWith (\m -> Map.lookup m thaws) l.sources
-  for_ (A.filter (\c -> not c.cached && A.null c.diags) program) \c ->
-    for_ (freeze (hashOf c.module) c) \out -> write dir c.module out
-  pure { program, errors: l.errors }
+    final = A.length l.sources - 1
+    one acc (Tuple i s) = do
+      th <- if i == final then pure Nothing else thawOne dir stamp acc s
+      let c = elabNext acc.done s th
+      pure { done: A.snoc acc.done c, hashes: defHashesInto acc.hashes c }
+  r <- A.foldM one { done: [], hashes: Map.empty } (A.mapWithIndex Tuple l.sources)
+  for_ (A.filter (\c -> not c.cached && A.null c.diags) r.done) \c ->
+    for_ (freeze stamp r.hashes r.done c) \out -> write dir c.module out
+  pure { program: r.done, errors: l.errors }
 
-thawOne :: String -> String -> String -> Effect (Maybe Thawed)
-thawOne dir h m = do
-  r <- try (readTextFile UTF8 (dir <> "/" <> m <> ".json"))
-  pure (hush r >>= melt h)
+thawOne :: String -> String -> { done :: Array Checked, hashes :: Map String String } -> Source -> Effect (Maybe Thawed)
+thawOne dir stamp acc s = do
+  r <- try (readTextFile UTF8 (dir <> "/" <> s.module <> ".json"))
+  pure (hush r >>= melt stamp acc s)
 
 -- | written whole, then named: a torn write is never half read
 write :: String -> String -> String -> Effect Unit
@@ -93,26 +139,53 @@ write dir m out = void $ try do
   writeTextFile UTF8 (path <> ".tmp") out
   rename (path <> ".tmp") path
 
--- | a clean module as the cache file keeps it
-freeze :: String -> Checked -> Maybe String
-freeze h c = do
-  defs <- traverse one (A.zip c.own c.top.spans)
-  pure (stringify (fromArray [ fromString version, fromString h, encodeFixities c.fixities, fromArray defs ]))
+-- | a clean module as the cache file keeps it: under which compiler and
+-- | source it elaborated, what its parse took from each direct import,
+-- | which outside definitions it mentions (at which hashes), and its own
+-- | definitions' syntax
+freeze :: String -> Map String String -> Array Checked -> Checked -> Maybe String
+freeze stamp hashes done c = do
+  defs <- traverse def (A.zip c.own c.top.spans)
+  pure $ stringify $ fromArray
+    [ fromString version
+    , fromString stamp
+    , fromString (sha256Hex c.source)
+    , encodeFixities c.fixities
+    , fromArray (map (\m -> fromArray [ fromString m, fromString (maybe "?" nsHashOf (A.find (\d -> d.module == m) done)) ]) direct)
+    , fromArray (map (\k -> fromArray [ fromString k, fromString (fromMaybe "?" (Map.lookup k hashes)) ]) needs)
+    , fromArray defs
+    ]
   where
-  one (Tuple o (Tuple _ sp)) = lookupGlobal c.top.globals o.key <#> \e ->
+  direct = A.nub (c.opens <> map _.module c.aliases)
+  ownSet = Set.fromFoldable (map _.key c.own)
+  needs = A.sort $ A.filter (\k -> not (Set.member k ownSet)) $ A.nub $ A.concatMap
+    (\o -> maybe [] (\e -> globalsInTy e.tySyntax <> globalsInEl e.syntax) (lookupGlobal c.top.globals o.key))
+    c.own
+  def (Tuple o (Tuple _ sp)) = lookupGlobal c.top.globals o.key <#> \e ->
     fromArray [ fromString o.name, fromString o.key, int sp.start, int sp.end, encodeTy e.tySyntax, encodeEl e.syntax ]
 
-melt :: String -> String -> Maybe Thawed
-melt expected s = do
-  j <- hush (jsonParser s)
+melt :: String -> { done :: Array Checked, hashes :: Map String String } -> Source -> String -> Maybe Thawed
+melt stamp acc s text = do
+  j <- hush (jsonParser text)
   toArray j >>= case _ of
-    [ v, h, fx, ds ] -> do
-      guard (toString v == Just version && toString h == Just expected)
+    [ v, st, srcH, fx, ns, nd, ds ] -> do
+      guard (toString v == Just version && toString st == Just stamp)
+      guard (toString srcH == Just (sha256Hex s.source))
+      nsPairs <- toArray ns >>= traverse pair
+      -- every direct import's namespace as it was (the source is the same,
+      -- so the import list is too)
+      guard (A.all (\(Tuple m h) -> (nsHashOf <$> A.find (\d -> d.module == m) acc.done) == Just h) nsPairs)
+      guard (A.length nsPairs == A.length (directOf s))
+      needPairs <- toArray nd >>= traverse pair
+      guard (A.all (\(Tuple k h) -> Map.lookup k acc.hashes == Just h) needPairs)
       fixities <- decodeFixities fx
       defs <- toArray ds >>= traverse def
       pure { fixities, defs }
     _ -> Nothing
   where
+  pair j = toArray j >>= case _ of
+    [ x, h ] -> Tuple <$> toString x <*> toString h
+    _ -> Nothing
   def j = toArray j >>= case _ of
     [ n, k, s0, e0, t, b ] -> (\name key start end ty body -> { name, key, span: { start, end }, ty, body })
       <$> toString n <*> toString k <*> asInt s0 <*> asInt e0 <*> decodeTy t <*> decodeEl b
@@ -123,11 +196,6 @@ encodeFixities f = fromArray
   [ fromArray (map (\g -> fromArray [ fromString g.id, int (assocInt g.assoc), fromArray (map fromString g.ops) ]) f.groups)
   , fromArray (map (\e -> fromArray [ fromString e.tighter, fromString e.looser ]) f.above)
   ]
-  where
-  assocInt = case _ of
-    AssocLeft -> 0
-    AssocRight -> 1
-    AssocNone -> 2
 
 decodeFixities :: Json -> Maybe Fixities
 decodeFixities j = toArray j >>= case _ of

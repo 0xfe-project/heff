@@ -54,9 +54,13 @@ heff completions fish          # > ~/.config/fish/completions/heff.fish
 ```
 
 Every command elaborates the file given and what it imports.  An imported
-module whose source, dependencies and compiler are unchanged is thawed
-from the cache the compiler keeps at the project root (`.heff/`, safe to
-delete, worth ignoring in git) instead of elaborated again.
+module is thawed from the cache the compiler keeps at the project root
+(`.heff/`, safe to delete, worth ignoring in git) instead of elaborated
+again, when nothing it is made of has changed: its source, the compiler,
+each definition it mentions from other modules (hashed transitively, so a
+change to a body no one mentions, or to comments, invalidates no one), and
+what its parse takes from each direct import (the names defined, the
+fixities declared).
 
 ## The language
 

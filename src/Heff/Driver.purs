@@ -9,7 +9,7 @@ module Heff.Driver
   , Checked
   , Thawed
   , elabProgram
-  , elabProgramWith
+  , elabNext
   , errorsIn
   , renderFileDiags
   , interface
@@ -81,17 +81,15 @@ readSource known fixities src = readProgramWith { known, fixities, lenient: fals
 -- | the modules it imports, by name; what those need is there too, by key,
 -- | but not in scope
 elabProgram :: Array Source -> Array Checked
-elabProgram = elabProgramWith (const Nothing)
+elabProgram = A.foldl (\done s -> A.snoc done (elabNext done s Nothing)) []
 
 -- | the same, around a cache: a module `thaw` has is not read or
 -- | elaborated -- its definitions come back through `topThawed` as they
 -- | were.  Which modules qualify is the caller's judgment (`Heff.Cache`
--- | hashes source, dependencies and compiler).
-elabProgramWith :: (String -> Maybe Thawed) -> Array Source -> Array Checked
-elabProgramWith thaw = A.foldl step []
-  where
-  step done s =
-    let
+-- | hashes what each module is made of).
+elabNext :: Array Checked -> Source -> Maybe Thawed -> Checked
+elabNext done s thaw =
+  let
       direct = A.filter (\c -> A.elem c.module s.opens) done
       needed = A.filter (\c -> A.elem c.module (closure done s.deps)) done
       env = A.foldl (\g c -> A.foldl (\g' o -> maybe g' (\e -> addGlobalEntry o.key e g') (lookupGlobal c.top.globals o.key)) g c.own) emptyGlobals needed
@@ -129,15 +127,16 @@ elabProgramWith thaw = A.foldl step []
         in
           checked t r.ntns (map clash clashes <> map hint (r.diags <> t.diags)) r.fixities false
     in
-      A.snoc done (maybe (fresh unit) thawed (thaw s.module))
+      maybe (fresh unit) thawed thaw
+  where
   -- the modules reached from some, through their imports
-  closure done = go []
+  closure done' = go []
     where
     go seen ms = case A.uncons ms of
       Nothing -> seen
       Just { head, tail }
         | A.elem head seen -> go seen tail
-        | otherwise -> go (A.snoc seen head) (tail <> maybe [] _.deps (A.find (\c -> c.module == head) done))
+        | otherwise -> go (A.snoc seen head) (tail <> maybe [] _.deps (A.find (\c -> c.module == head) done'))
 
 -- | the tools add advice on how to fix the common cases
 hint :: Diag -> Diag

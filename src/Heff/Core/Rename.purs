@@ -3,6 +3,8 @@
 module Heff.Core.Rename
   ( renameEl
   , renameTy
+  , globalsInEl
+  , globalsInTy
   , displayName
   ) where
 
@@ -12,7 +14,7 @@ import Data.Array as A
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Tuple (Tuple(..))
-import Heff.Support.Common (Name, dictMap)
+import Heff.Support.Common (Name, dictMap, dictValues)
 import Heff.Core.Globals (Globals)
 import Heff.Core.Params (Variants(..))
 import Heff.Core.Syntax as S
@@ -54,6 +56,44 @@ renameTy r = go
     S.PrimArray t -> S.PrimArray (go t)
     other -> other
 
+
+-- | the globals a term mentions, in order of first mention, each once
+globalsInEl :: S.El -> Array Name
+globalsInEl = A.nub <<< go
+  where
+  abs f = case _ of
+    S.Abs _ t -> f t
+    S.AbsConst t -> f t
+  go = case _ of
+    S.Global x -> [ x ]
+    S.Code t -> globalsInTy t
+    S.App f a -> go f <> go a
+    S.Lam d b -> globalsInTy d <> abs go b
+    S.Cons d -> A.concatMap go (dictValues d)
+    S.Proj e _ -> go e
+    S.Tag _ as -> A.concatMap go as
+    S.Match e cs -> go e <> A.concatMap (\(Tuple _ b) -> go b) (dictValues cs)
+    S.Specialize e _ v -> go e <> go v
+    S.Is e -> go e
+    S.Rec e -> go e
+    S.Implicit _ e -> go e
+    S.MetaApp _ _ t -> globalsInTy t
+    _ -> []
+
+globalsInTy :: S.Ty -> Array Name
+globalsInTy = A.nub <<< go
+  where
+  abs f = case _ of
+    S.Abs _ t -> f t
+    S.AbsConst t -> f t
+  go = case _ of
+    S.Decode e -> globalsInEl e
+    S.Function f -> go f.dom <> abs go f.cod
+    S.Record rt -> A.concatMap go (dictValues rt.fieldTypes)
+    S.Sum (Variants vs) -> A.concatMap (A.concatMap go) (dictValues vs)
+    S.IsTy t -> go t
+    S.PrimArray t -> go t
+    _ -> []
 
 -- | a global key as the name it is known by where it is shown: a module's
 -- | definition (`module.name`) by its alias, if it has one
