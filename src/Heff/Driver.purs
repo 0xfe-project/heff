@@ -273,8 +273,10 @@ interface c = S.joinWith "\n" (A.filter (_ /= "") [ imports, fixities, defs ])
   glue acc d =
     let m = isJust (S.indexOf (S.Pattern "\n") (SCU.dropRight 1 d))
     in { out: acc.out <> (if not acc.first && (m || acc.multi) then "\n" else "") <> d, multi: m, first: false }
+  -- (the type as the signature wrote it -- `Co e Unit`, an alias folded --
+  -- not the readback of its evaluation, which would unfold every alias)
   entry o = lookupGlobal c.top.globals o.key <#> \e ->
-    printSig im o.name (named o.name) (renameTy ln (readbTy 0 e.type_)) (renameEl ln e.syntax)
+    printSig im o.name (named o.name) (renameTy ln e.tySyntax) (renameEl ln e.syntax)
   ln = localName c.top.globals
   im = { names: \_ _ -> [], hide: true }
 
