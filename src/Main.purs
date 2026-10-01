@@ -35,7 +35,7 @@ commands =
   , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hf", flags: [] }
   , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hf", flags: [] }
   , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: [] }
-  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (lib/io.hf)", files: ".hf", flags: [] }
+  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (stdio, fs, proc, time, net)", files: ".hf", flags: [] }
   , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: [] }
   , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: [] }
   , { name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hf", flags: [ { flag: "check", doc: "only say which are not formatted" } ] }
@@ -149,7 +149,7 @@ main = do
     _ -> err (usage <> "\n") *> exit' 1
   where
   app f n out = run [ "dom", "state" ] compileApp f n out "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
-  program f n out = run [ "io", "state" ] compileNode f n out ("run it with `node " <> out <> " ARGS...`")
+  program f n out = run [ "stdio", "fs", "proc", "time", "net", "state" ] compileNode f n out ("run it with `node " <> out <> " ARGS...`")
   -- (a computation of the effects `handled`, compiled with their handlers)
   run handled compile f n out how = do
     l <- load f

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Programs compiled for Node.js (`heff node`, lib/io.hf) and run: what they
+// Programs compiled for Node.js (`heff node`: stdio, proc, fs, time, net) and run: what they
 // write, their exit status, loops a million rounds deep, and a long loop
 // of operations done at once.
 import { spawnSync } from "node:child_process";
@@ -53,12 +53,14 @@ if (build("test/node/deep.hf", "deep", deep)) {
 // (each operation goes on at once: the stack must not overflow)
 const loop = join(work, "loop.hf"), loopJs = join(work, "loop.mjs");
 writeFileSync(loop, [
-  "import co", "import io", "import prelude", "",
-  "loop : Int -> Int -> Co io Unit",
-  "loop n acc = if n == 0 then print (showInt acc) else do",
-  "  v <- getEnv \"X\"",
+  "import co", "import prelude", "import proc", "import stdio", "",
+  "eff : HFunctor",
+  "eff = stdio <+> proc", "",
+  "loop : Int -> Int -> Co eff Unit",
+  "loop n acc = if n == 0 then lift (inl stdio proc) (print (showInt acc)) else do",
+  "  v <- lift (inr stdio proc) (getEnv \"X\")",
   "  loop (n - 1) (acc + 1)", "",
-  "main : Co io Unit",
+  "main : Co eff Unit",
   "main = loop 100000 0", "",
 ].join("\n"));
 if (build(loop, "main", loopJs)) {

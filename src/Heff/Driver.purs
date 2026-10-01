@@ -323,7 +323,11 @@ effectOf g e = case e of
   Is e' -> effectOf g e'
   App (App (Global p) a) b | p == "co.plus" || p == "co.<+>" -> Plus <$> effectOf g a <*> effectOf g b
   Global "dom.dom" -> Just (Leaf "dom")
-  Global "io.io" -> Just (Leaf "io")
+  Global "stdio.stdio" -> Just (Leaf "stdio")
+  Global "fs.fs" -> Just (Leaf "fs")
+  Global "proc.proc" -> Just (Leaf "proc")
+  Global "time.time" -> Just (Leaf "time")
+  Global "net.net" -> Just (Leaf "net")
   App (Global "state.state") _ -> Just (Leaf "state")
   Global k -> lookupGlobal g k >>= \entry -> effectOf g entry.syntax
   _ -> Nothing
@@ -353,7 +357,7 @@ findRunnable handled c = case _ of
     Nothing, Just r -> fits r
     Nothing, Nothing -> Left ("no computation, `Co h a`, of the effects " <> S.joinWith ", " handled)
   where
-  known = "dom, io, state s and their sums"
+  known = "dom, stdio, fs, proc, time, net, state s and their sums"
   computations = A.mapMaybe (\o -> effectOf' o.key <#> \eff -> { name: o.name, key: o.key, effect: eff }) c.own
   missing eff = A.nub (A.filter (\l -> not (A.elem l handled)) (leaves eff))
   fits r = case missing r.effect of

@@ -152,9 +152,13 @@ its effect.  `do` is `bind`.  `h <+> k` is two effects as one.
   `Co (dom <+> (state s)) Unit`, and `heff app` writes it as a script for
   a page.  Where it goes on the page is the app's to find, by `select` or
   `xpath`.
-- `lib/io.hf`: a program's world (standard output and input, arguments,
-  environment, files, time, the network, exit): a program is a
-  `Co io Unit`, and `heff node` writes it as a Node.js program.
+- `lib/stdio.hf`, `lib/proc.hf`, `lib/fs.hf`, `lib/time.hf`,
+  `lib/net.hf`: a program's worlds, one effect each -- the standard
+  streams, the process (arguments, environment, exit), files, time, the
+  network.  A program sums the ones it lives in, `stdio <+> fs`, and
+  lifts each computation in by its evidence (`lift`, `inl`, `inr`,
+  lib/co.hf); `heff node` writes it as a Node.js program -- one monad,
+  an algebra per effect.
 
 The page's handler and Node's are written in JavaScript; asynchrony is
 the handler's, and the program is plain `do`.  The same computation runs

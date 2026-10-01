@@ -63,10 +63,10 @@ compileApp :: Globals -> String -> Effect -> Output
 compileApp = compileRun []
 
 -- | a Node.js program (an ES module) that runs a computation of the effect
--- | `eff` (of `io` and `state`)
+-- | `eff` (of `stdio`, `fs`, `proc`, `time`, `net` and `state`)
 compileNode :: Globals -> String -> Effect -> Output
 compileNode g key eff =
-  compileRun (if A.elem "io" (leaves eff) then [ "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";" ] else []) g key eff
+  compileRun (if A.elem "fs" (leaves eff) then [ "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";" ] else []) g key eff
 
 compileRun :: Array String -> Globals -> String -> Effect -> Output
 compileRun imports g key eff =
@@ -461,10 +461,11 @@ uncurryJs = go []
 -- | continuation monad, `(a -> ()) -> ()`.  An operation may finish later
 -- | (`Sleep`, `Fetch`, reading a file), and the rest of the computation --
 -- | its continuation -- runs then: JavaScript's asynchrony, as a handler,
--- | and the computation is the same whatever handles it.  `perform` does an
--- | operation of the computation's effect: `$sum` of two effects' handlers
--- | gives each of its operations (`InL`, `InR`) to its side's, and each
--- | effect's handler (`$dom`, `$state`, `$io`) knows its own operations.
+-- | and the computation is the same whatever handles it.  There is one
+-- | monad for the whole program; each effect contributes an algebra.
+-- | `perform` does an operation of the computation's effect: `$sum` of two
+-- | algebras gives each operation (`InL`, `InR`) to its side's, and each
+-- | effect's (`$dom`, `$state`, `$stdio`, ...) knows its own operations.
 -- | (An operation done at once goes on at once, the stack deeper each time:
 -- | every so often it goes on after the stack is let go of, lest a long
 -- | loop of them overflow it.)
@@ -477,7 +478,11 @@ runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []
   handler = case _ of
     "dom" -> Just dom
     "state" -> Just state
-    "io" -> Just io
+    "stdio" -> Just stdio
+    "fs" -> Just fsA
+    "proc" -> Just proc
+    "time" -> Just time
+    "net" -> Just net
     _ -> Nothing
   run = S.joinWith "\n"
     [ "const $run = (main, perform) => {"
@@ -535,29 +540,59 @@ runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []
     , "  };"
     , "};"
     ]
-  -- (`Exit` does not go on: the process ends when what is pending, output
-  -- being written, is done)
-  io = S.joinWith "\n"
-    [ "const $io = () => {"
+  stdio = S.joinWith "\n"
+    [ "const $stdio = () => (p, k) => {"
+    , "  const a = p.a;"
+    , "  switch (p.$) {"
+    , "    case \"Write\": process.stdout.write(a[0], () => k(a[1])); return;"
+    , "    case \"WriteErr\": process.stderr.write(a[0], () => k(a[1])); return;"
+    , "    case \"ReadStdin\": { let text = \"\"; process.stdin.setEncoding(\"utf8\"); process.stdin.on(\"data\", (d) => { text += d; }); process.stdin.on(\"end\", () => k(a[0](text))); return; }"
+    , "    default: throw new Error(\"heff: not an operation of stdio: \" + (p && p.$));"
+    , "  }"
+    , "};"
+    ]
+  fsA = S.joinWith "\n"
+    [ "const $fs = () => {"
     , "  const nothing = { $: \"Nothing\", a: [] };"
     , "  const just = (x) => ({ $: \"Just\", a: [x] });"
-    , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
     , "  const bool = (b) => ({ $: b ? \"True\" : \"False\", a: [] });"
     , "  return (p, k) => {"
     , "    const a = p.a;"
     , "    switch (p.$) {"
-    , "      case \"Write\": process.stdout.write(a[0], () => k(a[1])); return;"
-    , "      case \"WriteErr\": process.stderr.write(a[0], () => k(a[1])); return;"
-    , "      case \"ReadStdin\": { let text = \"\"; process.stdin.setEncoding(\"utf8\"); process.stdin.on(\"data\", (d) => { text += d; }); process.stdin.on(\"end\", () => k(a[0](text))); return; }"
-    , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
-    , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
     , "      case \"ReadFile\": $readFile(a[0], \"utf8\", (e, t) => k(a[1](e ? nothing : just(t)))); return;"
     , "      case \"WriteFile\": $writeFile(a[0], a[1], (e) => k(a[2](bool(!e)))); return;"
-    , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
-    , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
-    , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
-    , "      default: throw new Error(\"heff: not an operation of io: \" + (p && p.$));"
+    , "      default: throw new Error(\"heff: not an operation of fs: \" + (p && p.$));"
     , "    }"
     , "  };"
+    , "};"
+    ]
+  -- (`Exit` does not go on: the process ends when what is pending, output
+  -- being written, is done)
+  proc = S.joinWith "\n"
+    [ "const $proc = () => {"
+    , "  const nothing = { $: \"Nothing\", a: [] };"
+    , "  const just = (x) => ({ $: \"Just\", a: [x] });"
+    , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
+    , "  return (p, k) => {"
+    , "    const a = p.a;"
+    , "    switch (p.$) {"
+    , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
+    , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
+    , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
+    , "      default: throw new Error(\"heff: not an operation of proc: \" + (p && p.$));"
+    , "    }"
+    , "  };"
+    , "};"
+    ]
+  time = S.joinWith "\n"
+    [ "const $time = () => (p, k) => {"
+    , "  if (p.$ === \"Sleep\") { setTimeout(() => k(p.a[1]), Number(p.a[0])); return; }"
+    , "  throw new Error(\"heff: not an operation of time: \" + (p && p.$));"
+    , "};"
+    ]
+  net = S.joinWith "\n"
+    [ "const $net = () => (p, k) => {"
+    , "  if (p.$ === \"Fetch\") { fetch(p.a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(p.a[1](t))); return; }"
+    , "  throw new Error(\"heff: not an operation of net: \" + (p && p.$));"
     , "};"
     ]
