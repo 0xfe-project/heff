@@ -25,7 +25,7 @@ import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Lower.IR (Def, Expr(..), Supply, freshen, globalsIn, isValue, occurrences, size, subst)
 
-type St = { supply :: Supply, fuel :: Int, defs :: Map String Expr, safe :: Set String }
+type St = { supply :: Supply, fuel :: Int, defs :: Map String Expr, safe :: Set String, total :: Map String Int }
 
 type M a = State St a
 
@@ -39,7 +39,8 @@ budget = 24
 simplifyProgram :: Supply -> Array Def -> { defs :: Array Def, supply :: Supply }
 simplifyProgram n0 defs =
   let
-    Tuple out st = runState (traverse one defs) { supply: n0, fuel: 0, defs: Map.empty, safe: safeGlobals defs }
+    sg = safeGlobals defs
+    Tuple out st = runState (traverse one defs) { supply: n0, fuel: 0, defs: Map.empty, safe: sg.safe, total: sg.total }
   in
     { defs: out, supply: st.supply }
   where
@@ -84,31 +85,54 @@ attempt orig m = do
     pure orig
 
 -- | the globals that cannot fail when used: functions, and values of such
--- | globals (each definition after those it uses; one using itself is not)
-safeGlobals :: Array Def -> Set String
-safeGlobals = A.foldl one Set.empty
+-- | globals (each definition after those it uses; one using itself is not).
+-- | `total`: the functions whose application cannot fail either -- their
+-- | body is pure under the lambdas (erased statics, record builders such
+-- | as co.hf's `plus`) -- with their arity
+safeGlobals :: Array Def -> { safe :: Set String, total :: Map String Int }
+safeGlobals = A.foldl one { safe: Set.empty, total: Map.empty }
   where
-  one safe d = case d.body of
-    Lam _ _ -> Set.insert d.key safe
-    b | pureIn safe b && not (A.elem d.key (globalsIn b)) -> Set.insert d.key safe
-    _ -> safe
+  one acc d = case flat d.body of
+    Tuple xs b | not (A.null xs) ->
+      let acc' = acc { safe = Set.insert d.key acc.safe }
+      in
+        if pureIn acc.safe acc.total b && not (A.elem d.key (globalsIn b)) then acc' { total = Map.insert d.key (A.length xs) acc.total }
+        else acc'
+    Tuple _ b
+      | pureIn acc.safe acc.total b && not (A.elem d.key (globalsIn b)) -> acc { safe = Set.insert d.key acc.safe }
+    _ -> acc
+  flat = case _ of
+    Lam xs b -> case flat b of
+      Tuple ys b' -> Tuple (xs <> ys) b'
+    b -> Tuple [] b
 
--- | what cannot fail: evaluating it gives a value, at once
-pureIn :: Set String -> Expr -> Boolean
-pureIn safe = case _ of
-  Var _ -> true
-  Global g -> Set.member g safe
-  Lam _ _ -> true
-  Record fs -> A.all (\(Tuple _ e) -> pureIn safe e) fs
-  Tag _ as -> A.all (pureIn safe) as
-  Prim _ -> true
-  Int _ -> true
-  Float _ -> true
-  Str _ -> true
-  _ -> false
+-- | what cannot fail: evaluating it gives a value, at once.  A projection
+-- | is of a record, always there; an application of a `total` function up
+-- | to its arity builds a closure or its pure body
+pureIn :: Set String -> Map String Int -> Expr -> Boolean
+pureIn safe total = go
+  where
+  go = case _ of
+    Var _ -> true
+    Global g -> Set.member g safe
+    Lam _ _ -> true
+    Record fs -> A.all (\(Tuple _ e) -> go e) fs
+    Tag _ as -> A.all go as
+    Proj e _ -> go e
+    App (Global g) as -> case Map.lookup g total of
+      Just ar -> A.length as <= ar && A.all go as
+      Nothing -> false
+    Call g as -> case Map.lookup g total of
+      Just ar -> A.length as <= ar && A.all go as
+      Nothing -> false
+    Prim _ -> true
+    Int _ -> true
+    Float _ -> true
+    Str _ -> true
+    _ -> false
 
 isPure :: Expr -> M Boolean
-isPure e = gets \s -> pureIn s.safe e
+isPure e = gets \s -> pureIn s.safe s.total e
 
 atomic :: Expr -> Boolean
 atomic = case _ of
