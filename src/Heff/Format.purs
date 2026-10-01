@@ -23,11 +23,12 @@ import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.State (State, evalState, gets, modify_)
 import Data.Array as A
 import Data.Either (Either(..))
-import Data.Foldable (fold, foldMap)
+import Data.Foldable (fold, foldMap, minimum)
 import Data.FoldableWithIndex (foldMapWithIndex)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Traversable (traverse)
 import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
@@ -954,6 +955,37 @@ hangs = case _ of
 pCon :: Env -> Con -> Doc
 pCon env c = tok env c.con <> foldMap (\a -> P.text " " <> pE env a) c.args
 
+-- | how tightly the standard library's operators bind, for layout alone
+-- | (how they bind is the parser's business): a chain of several
+-- | tightnesses breaks at its loosest operators, each tighter run kept
+-- | whole while it fits.  An operator not here lays the chain out flat.
+layoutPrec :: String -> Maybe Int
+layoutPrec = case _ of
+  "$" -> Just 0
+  "||" -> Just 10
+  "<>" -> Just 10
+  "&&" -> Just 20
+  "<+>" -> Just 20
+  "::" -> Just 35
+  s | A.elem s [ "==", "/=", "<", "<=", ">", ">=", "==.", "<.", "<=.", ">.", ">=." ] -> Just 30
+  s | A.elem s [ "+", "-", "++", "+.", "-." ] -> Just 40
+  s | A.elem s [ "*", "/", "%", "*.", "/." ] -> Just 50
+  _ -> Nothing
+
+-- | a chain of declared operators: flat when one tightness (or one not
+-- | known), else cut at the loosest, each piece a chain again
+pOps :: Env -> E -> Array { op :: T, e :: E } -> Doc
+pOps env first rest = case traverse (\r -> layoutPrec r.op.text) rest of
+  Just ps | A.length (A.nub ps) > 1 -> P.group (cuts (fromMaybe 0 (minimum ps)) first [] rest)
+  _ -> P.group (pE env first <> foldMap (\r -> P.line <> tok env r.op <+> pE env r.e) rest)
+  where
+  cuts m f acc rs = case A.uncons rs of
+    Nothing -> pOps env f (A.reverse acc)
+    Just { head: r, tail } ->
+      if layoutPrec r.op.text == Just m then
+        pOps env f (A.reverse acc) <> P.line <> tok env r.op <+> cuts m r.e [] tail
+      else cuts m f (A.cons r acc) tail
+
 pE :: Env -> E -> Doc
 pE env = case _ of
   Atom t -> tok env t
@@ -984,7 +1016,7 @@ pE env = case _ of
           _ -> pE env e
       in
         P.group (operand first <> foldMap (\r -> P.line <> tok env r.op <+> operand r.e) rest)
-  Ops first rest -> P.group (pE env first <> foldMap (\r -> P.line <> tok env r.op <+> pE env r.e) rest)
+  Ops first rest -> pOps env first rest
   Ann e cc ty -> P.group (pE env e <+> tok env cc <> P.nest 2 (P.line <> pE env ty))
   Lam bs binders arrow body ->
     tok env bs <> P.concatWith (<+>) (map pB binders) <+> tok env arrow

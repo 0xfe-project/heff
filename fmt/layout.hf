@@ -29,14 +29,10 @@ replaceAll pat rep s = joinWith rep (split pat s)
 
 rtrimEnd : String -> Int -> Int
 rtrimEnd s e =
-  if e
-  > 0
-  && (charCode s (e - 1)
-      == 32
-      || charCode s (e - 1)
-      == 9
-      || charCode s (e - 1)
-      == 13)
+  if e > 0
+  && (charCode s (e - 1) == 32
+      || charCode s (e - 1) == 9
+      || charCode s (e - 1) == 13)
     then rtrimEnd s (e - 1)
     else e
 
@@ -231,6 +227,60 @@ pP env (PParen o p c) = tok env o <> pP env p <> tok env c
 pP env (PList o ps commas c) =
   tok env o <> pListGo env (\p2 -> pP env p2) ps commas True <> tok env c
 
+-- | how tightly the standard library's operators bind, for layout alone
+-- | (how they bind is the parser's business): a chain of several
+-- | tightnesses breaks at its loosest operators, each tighter run kept
+-- | whole while it fits.  An operator not here lays the chain out flat.
+layoutPrec : String -> Maybe Int
+layoutPrec s =
+  if strEq s "$"
+    then Just 0
+    else if strEq s "||"
+    then Just 10
+    else if strEq s "<>"
+    then Just 10
+    else if strEq s "&&"
+    then Just 20
+    else if strEq s "<+>"
+    then Just 20
+    else if strEq s "::"
+    then Just 35
+    else if elemBy
+      strEq
+      s
+      ["==", "/=", "<", "<=", ">", ">=", "==.", "<.", "<=.", ">.", ">=."]
+    then Just 30
+    else if elemBy strEq s ["+", "-", "++", "+.", "-."]
+    then Just 40
+    else if elemBy strEq s ["*", "/", "%", "*.", "/."]
+    then Just 50
+    else Nothing
+
+consPrec : Maybe Int -> Maybe (List Int) -> Maybe (List Int)
+consPrec Nothing _ = Nothing
+consPrec (Just p) Nothing = Nothing
+consPrec (Just p) (Just ps) = Just (p :: ps)
+
+-- | each operator's tightness, if every one is known
+opPrecs : List C.E -> Maybe (List Int)
+opPrecs Nil = Just Nil
+opPrecs (r :: rs) = case r of
+  OpRhs op e -> consPrec (layoutPrec op.text) (opPrecs rs)
+  _ -> Nothing
+
+minList : Int -> List Int -> Int
+minList m Nil = m
+minList m (p :: ps) = minList (if p < m then p else m) ps
+
+allEq : Int -> List Int -> Bool
+allEq m Nil = True
+allEq m (p :: ps) = p == m && allEq m ps
+
+precEq : Int -> String -> Bool
+precEq m s = case layoutPrec s of
+  Just p -> p == m
+  Nothing -> False
+
 theory Lay where
   pE : Tk.Env -> C.E -> Doc
   rhsOf : Tk.Env -> C.E -> Doc
@@ -240,6 +290,8 @@ theory Lay where
   binderDoc : Tk.Env -> C.E -> Doc
   opRhsDoc : Tk.Env -> List C.E -> C.E -> Doc
   opsRhsDoc : Tk.Env -> C.E -> Doc
+  opsChainDoc : Tk.Env -> C.E -> List C.E -> Doc
+  opsCut : Tk.Env -> Int -> C.E -> List C.E -> List C.E -> Doc
   altDoc : Tk.Env -> C.E -> Doc
   stmtDoc : Tk.Env -> C.E -> Doc
   rhsField : Tk.Env -> C.E -> Doc
@@ -275,14 +327,12 @@ lay =
          Cons f1 more ->
            group
              (align
-                (tok env o
-                 <+> nest 4 (lay.rhsField env f1)
+                (tok env o <+> nest 4 (lay.rhsField env f1)
                  <> foldDocs
                    (zipWith
                       (\comma f ->
                          linebreak
-                         <> tok env comma
-                         <+> nest 4 (lay.rhsField env f))
+                         <> tok env comma <+> nest 4 (lay.rhsField env f))
                       commas
                       more)
                  <> line
@@ -295,8 +345,7 @@ lay =
            tok env kw
            <+> group
              (align
-                (tok env o
-                 <+> lay.pE env a1
+                (tok env o <+> lay.pE env a1
                  <> foldDocs
                    (zipWith
                       (\bar a -> line <> tok env bar <+> lay.pE env a)
@@ -313,10 +362,7 @@ lay =
            group
              (lay.chainOperand env rest first
               <> foldDocs (map (\r -> line <> lay.opRhsDoc env rest r) rest)))
-      Ops a rest ->
-        group
-          (lay.pE env a
-           <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
+      Ops a rest -> lay.opsChainDoc env a rest
       OpRhs op e -> tok env op <+> lay.pE env e
       Ann e cc ty ->
         group (lay.pE env e <+> tok env cc <> nest 2 (line <> lay.pE env ty))
@@ -328,20 +374,16 @@ lay =
               then text " " <> lay.pE env body
               else group (nest 2 (line <> lay.pE env body)))
       Case kw scrut of2 alts ->
-        tok env kw
-        <+> lay.pE env scrut
-        <+> tok env of2
+        tok env kw <+> lay.pE env scrut <+> tok env of2
         <> items env C.firstE C.lastE (\e a -> lay.altDoc e a) alts
       EAlt p arrow body -> pP env p <+> tok env arrow <> lay.rhsOf env body
       If kw c th a el b ->
         group
-          (tok env kw
-           <+> lay.pE env c
+          (tok env kw <+> lay.pE env c
            <> nest
              2
              (line
-              <> tok env th
-              <+> nest 2 (lay.pE env a)
+              <> tok env th <+> nest 2 (lay.pE env a)
               <> lay.elseOf env el b))
       Do kw stmts ->
         tok env kw <> items env C.firstE C.lastE (\e s -> lay.stmtDoc e s) stmts
@@ -354,12 +396,9 @@ lay =
   , elseOf = \env el b -> case b of
       If kw c th a el2 b2 ->
         line
-        <> tok env el
-        <+> tok env kw
-        <+> lay.pE env c
+        <> tok env el <+> tok env kw <+> lay.pE env c
         <> line
-        <> tok env th
-        <+> nest 2 (lay.pE env a)
+        <> tok env th <+> nest 2 (lay.pE env a)
         <> lay.elseOf env el2 b2
       _ -> line <> tok env el <+> nest 2 (lay.pE env b)
   -- (a block last, `f x (\y -> do`, stays on the line, and its items are
@@ -420,6 +459,33 @@ lay =
   , opsRhsDoc = \env r -> case r of
       OpRhs op e -> tok env op <+> lay.pE env e
       _ -> lay.pE env r
+  -- (a chain of declared operators: flat when one tightness, or one not
+  -- known; else cut at the loosest, each piece a chain again)
+  , opsChainDoc = \env first rest -> case opPrecs rest of
+      Nothing ->
+        group
+          (lay.pE env first
+           <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
+      Just ps ->
+        (case ps of
+         Nil -> group (lay.pE env first)
+         p :: more ->
+           if allEq p more
+             then group
+                 (lay.pE env first
+                  <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
+             else group (lay.opsCut env (minList p more) first Nil rest))
+  , opsCut = \env m f acc rs -> case rs of
+      Nil -> lay.opsChainDoc env f (reverse acc)
+      r :: rest2 ->
+        (case r of
+         OpRhs op e ->
+           if precEq m op.text
+             then lay.opsChainDoc env f (reverse acc)
+               <> line
+               <> tok env op <+> lay.opsCut env m e Nil rest2
+             else lay.opsCut env m f (r :: acc) rest2
+         _ -> lay.opsCut env m f (r :: acc) rest2)
   , altDoc = \env a -> case a of
       EAlt p arrow body -> pP env p <+> tok env arrow <> lay.rhsOf env body
       _ -> lay.pE env a
@@ -454,8 +520,7 @@ dataAltsDoc env (Just (MkDAlts eq alts bars)) = case alts of
   Cons a1 more ->
     group
       (line
-       <> tok env eq
-       <+> lay.pE env a1
+       <> tok env eq <+> lay.pE env a1
        <> foldDocs
          (zipWith (\bar a -> line <> tok env bar <+> lay.pE env a) bars more))
 
@@ -482,26 +547,20 @@ pD env (DFixity kw ts) =
 pD env (DSig n cc ty) = nmDoc env n <+> sig env cc ty
 pD env (DEqn n pats eq rhs) =
   nmDoc env n
-  <> foldDocs (map (\p -> text " " <> pP env p) pats)
-  <+> tok env eq
+  <> foldDocs (map (\p -> text " " <> pP env p) pats) <+> tok env eq
   <> lay.rhsOf env rhs
 pD env (DData kw name params universe alts) =
-  tok env kw
-  <+> tok env name
+  tok env kw <+> tok env name
   <> paramsDoc env params
   <> universeDoc env universe
   <> dataAltsDoc env alts
 pD env (DType kw name params eq body) =
-  tok env kw
-  <+> tok env name
-  <> paramsDoc env params
-  <+> tok env eq
+  tok env kw <+> tok env name
+  <> paramsDoc env params <+> tok env eq
   <> lay.rhsOf env body
 pD env (DTheory kw name params w fields) =
-  tok env kw
-  <+> tok env name
-  <> paramsDoc env params
-  <+> tok env w
+  tok env kw <+> tok env name
+  <> paramsDoc env params <+> tok env w
   <> items env tfFirst tfLast2 tfDoc fields
 pD env (DForeign kw imp x cc ty) =
   tok env kw <+> tok env imp <+> tok env x <+> sig env cc ty

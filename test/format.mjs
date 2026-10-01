@@ -245,8 +245,7 @@ formats("operators and their fixities", [
   "long : Int",
   "long =",
   "  aaaaaaaaaaaaaaaaaaaa",
-  "  + bbbbbbbbbbbbbbbbbbbbbbbbb",
-  "  * cccccccccccccccccccccc",
+  "  + bbbbbbbbbbbbbbbbbbbbbbbbb * cccccccccccccccccccccc",
   "  - dddddddddddddddd",
   "",
 ].join("\n"));
