@@ -183,6 +183,13 @@ The page's handler and Node's are written in JavaScript; asynchrony is
 the handler's, and the program is plain `do`.  The same computation runs
 under a handler written in heff (`test/surface/dom-trace.hf`).
 
+`lib/nanopass.hf` is how a compiler of many small passes is written:
+a language is a theory (its sorts, types; its productions, functions), a
+term what any handler of it gives a value for, and a pass a handler --
+of its source, into its target's terms.  It has fresh names, and the
+stages of a pipeline, each shown or not by the handler
+(`test/surface/nanopass.hf`).
+
 `examples/counter`, `examples/clock` and `examples/greet` are apps:
 `npm run examples` builds them, then open their `index.html`.
 

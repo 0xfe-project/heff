@@ -1,0 +1,238 @@
+-- A nanopass pipeline (lib/nanopass.hf): a language with two sorts, and
+-- three passes -- one takes a production away, one needs to know what its
+-- parts are, one puts a production back and needs fresh names -- then the
+-- pipeline, its stages shown.
+
+import co
+import nanopass
+import prelude
+
+-- | Expressions and patterns, a `case` of one pattern and a default.
+theory Core where
+  E : Type
+  P : Type
+  var : String -> E
+  int : Int -> E
+  add : E -> E -> E
+  lam : String -> E -> E
+  app : E -> E -> E
+  pvar : String -> P
+  pint : Int -> P
+  match : E -> P -> E -> E -> E
+
+-- | ... and `let`.
+theory WithLet where
+  core : Core
+  letIn : String -> core.E -> core.E -> core.E
+
+type Term = (l : Core) -> l.E
+
+type PTerm = (l : Core) -> l.P
+
+type LetTerm = (l : WithLet) -> l.core.E
+
+type LetPTerm = (l : WithLet) -> l.core.P
+
+-- Showing: a handler like any other
+--------------------------------------------------------------------------------
+
+shown : Core
+shown =
+  { E = String
+  , P = String
+  , var = \x -> x
+  , int = \n -> showInt n
+  , add = \a b -> "(" ++ a ++ " + " ++ b ++ ")"
+  , lam = \x b -> "(\\" ++ x ++ " -> " ++ b ++ ")"
+  , app = \f a -> "(" ++ f ++ " " ++ a ++ ")"
+  , pvar = \x -> x
+  , pint = \n -> showInt n
+  , match = \s p t e ->
+        "(case " ++ s ++ " of " ++ p ++ " -> " ++ t ++ "; _ -> " ++ e ++ ")"
+  }
+
+shownLet : WithLet
+shownLet =
+  { core = shown
+  , letIn = \x e b -> "(let " ++ x ++ " = " ++ e ++ " in " ++ b ++ ")"
+  }
+
+showTerm : Term -> String
+showTerm t = t shown
+
+showLet : LetTerm -> String
+showLet t = t shownLet
+
+-- the program: `let x = 1 + 2 in (\y -> y) (case x of 3 -> 10 + 1; _ -> 0)`
+example : LetTerm
+example l =
+  l.letIn
+    "x"
+    (l.core.add (l.core.int 1) (l.core.int 2))
+    (l.core.app
+       (l.core.lam "y" (l.core.var "y"))
+       (l.core.match
+          (l.core.var "x")
+          (l.core.pint 3)
+          (l.core.add (l.core.int 10) (l.core.int 1))
+          (l.core.int 0)))
+
+-- >>> showLet example
+-- "(let x = (1 + 2) in ((\\y -> y) (case x of 3 -> (10 + 1); _ -> 0)))"
+
+-- A production taken away
+--------------------------------------------------------------------------------
+
+-- | `let` is a lambda applied: the core is handed through whole, and only
+-- | `let` is said.  No term of `Core` has a `let`, by its type.
+removeLet : LetTerm -> Term
+removeLet t = \l -> t { core = l, letIn = \x e body -> l.app (l.lam x body) e }
+
+-- >>> showTerm (removeLet example)
+-- "((\\x -> ((\\y -> y) (case x of 3 -> (10 + 1); _ -> 0))) (1 + 2))"
+
+-- What its parts are
+--------------------------------------------------------------------------------
+
+-- | What folding needs to know of a part, beside the term it becomes: the
+-- | number it is, if it is one -- of an expression, and of a pattern.
+type Folded = { term : Term, asInt : Maybe Int }
+
+type FoldedP = { pterm : PTerm, pInt : Maybe Int }
+
+lit : Int -> Folded
+lit n = { term = \l -> l.int n, asInt = Just n }
+
+opaque : Term -> Folded
+opaque t = { term = t, asInt = Nothing }
+
+-- | Sums of numbers computed, and a `case` of a number on a number decided.
+folding : Core
+folding =
+  { E = Folded
+  , P = FoldedP
+  , var = \x -> opaque (\l -> l.var x)
+  , int = \n -> lit n
+  , add = \a b -> case a.asInt of
+      Just x -> case b.asInt of
+        Just y -> lit (x + y)
+        Nothing -> opaque (\l -> l.add (a.term l) (b.term l))
+      Nothing -> opaque (\l -> l.add (a.term l) (b.term l))
+  , lam = \x b -> opaque (\l -> l.lam x (b.term l))
+  , app = \f a -> opaque (\l -> l.app (f.term l) (a.term l))
+  , pvar = \x -> { pterm = \l -> l.pvar x, pInt = Nothing }
+  , pint = \n -> { pterm = \l -> l.pint n, pInt = Just n }
+  , match = \s p t e -> case s.asInt of
+      Just n -> case p.pInt of
+        Just m -> if n == m then t else e
+        Nothing ->
+          opaque (\l -> l.match (s.term l) (p.pterm l) (t.term l) (e.term l))
+      Nothing ->
+        opaque (\l -> l.match (s.term l) (p.pterm l) (t.term l) (e.term l))
+  }
+
+foldConstants : Term -> Term
+foldConstants t = (t folding).term
+
+-- >>> showTerm (foldConstants (removeLet example))
+-- "((\\x -> ((\\y -> y) (case x of 3 -> 11; _ -> 0))) 3)"
+
+-- >>> showTerm (foldConstants (\l -> l.match (l.add (l.int 1) (l.int 2)) (l.pint 3) (l.int 1) (l.int 0)))
+-- "1"
+
+-- A production put back, and fresh names
+--------------------------------------------------------------------------------
+
+-- | What naming needs to know of a part: the term it becomes, and whether it
+-- | is a variable or a number (what an argument may be as it is).
+type Named = { lterm : LetTerm, atomic : Bool }
+
+atom : LetTerm -> Named
+atom t = { lterm = t, atomic = True }
+
+compound : LetTerm -> Named
+compound t = { lterm = t, atomic = False }
+
+-- (a name a `do` block binds has its type only once it is inferred: what
+-- is asked of it, a function's argument says it is a `Named`)
+ltermOf : Named -> LetTerm
+ltermOf n = n.lterm
+
+isAtomic : Named -> Bool
+isAtomic n = n.atomic
+
+-- (the evidence that `fresh` is in `fresh`)
+here : fresh <: fresh
+here p = p
+
+-- | An argument that is not a variable or a number is named, by a `let`:
+-- | each part is a computation of fresh names.
+letifying : Core
+letifying =
+  { E = Co fresh Named
+  , P = LetPTerm
+  , var = \x -> pure (atom (\l -> l.core.var x))
+  , int = \n -> pure (atom (\l -> l.core.int n))
+  , add = \a b -> do
+      x <- a
+      y <- b
+      pure (compound (\l -> l.core.add (ltermOf x l) (ltermOf y l)))
+  , lam = \x b -> do
+      body <- b
+      pure (compound (\l -> l.core.lam x (ltermOf body l)))
+  , app = \f a -> do
+      g <- f
+      arg <- a
+      if isAtomic arg
+          then pure (compound (\l -> l.core.app (ltermOf g l) (ltermOf arg l)))
+          else do
+            v <- freshName here "a"
+            pure
+                (compound
+                   (\l ->
+                      l.letIn
+                        v
+                        (ltermOf arg l)
+                        (l.core.app (ltermOf g l) (l.core.var v))))
+  , pvar = \x -> \l -> l.core.pvar x
+  , pint = \n -> \l -> l.core.pint n
+  , match = \s p t e -> do
+      sv <- s
+      tv <- t
+      ev <- e
+      pure
+          (compound
+             (\l ->
+                l.core.match
+                  (ltermOf sv l)
+                  (p l)
+                  (ltermOf tv l)
+                  (ltermOf ev l)))
+  }
+
+letify : Term -> LetTerm
+letify t = ltermOf (named (t letifying))
+
+-- >>> showLet (letify (foldConstants (removeLet example)))
+-- "((\\x -> (let a%0 = (case x of 3 -> 11; _ -> 0) in ((\\y -> y) a%0))) 3)"
+
+-- The pipeline
+--------------------------------------------------------------------------------
+
+-- (the evidence that `stages` is in `stages`)
+told : stages <: stages
+told p = p
+
+-- | The passes, in order, each a stage.
+compile : LetTerm -> Co stages LetTerm
+compile src = do
+  a <- pass told "removeLet" showTerm removeLet src
+  b <- pass told "fold" showTerm foldConstants a
+  pass told "letify" showLet letify b
+
+-- >>> showLet (handle quietly (compile example))
+-- "((\\x -> (let a%0 = (case x of 3 -> 11; _ -> 0) in ((\\y -> y) a%0))) 3)"
+
+-- each stage, and what it gave
+-- >>> fst (handle dumping (compile example))
+-- ["removeLet: ((\\x -> ((\\y -> y) (case x of 3 -> (10 + 1); _ -> 0))) (1 + 2))", "fold: ((\\x -> ((\\y -> y) (case x of 3 -> 11; _ -> 0))) 3)", "letify: ((\\x -> (let a%0 = (case x of 3 -> 11; _ -> 0) in ((\\y -> y) a%0))) 3)"]
