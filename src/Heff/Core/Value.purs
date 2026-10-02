@@ -170,6 +170,11 @@ isErrorTy = case _ of
   Decode n -> n.head == Error
   _ -> false
 
+-- | the type an error hole of a universe decodes to: of what did not
+-- | elaborate, what is known of it is nothing
+errorTy :: Universe -> Ty
+errorTy u = decodeN (errorHole (U u))
+
 localL :: Int -> Lazy Ty -> El
 localL i a = reflect (Local i) (pure Id) a Nothing
 
@@ -202,7 +207,7 @@ data El
 app :: El -> Lazy El -> Ev El
 app (Lam _ clo) arg = appClo clo arg
 app (Neu n) arg =
-  Nom (reflect n.head (defer \_ -> App n.spine (force arg)) (defer \_ -> appTy (force n.ty) arg) (map (\d -> app d arg) (force n.description)))
+  Nom (reflect n.head (defer \_ -> App n.spine (force arg)) (defer \_ -> neuAppTy n.head (force n.ty) arg) (map (\d -> app d arg) (force n.description)))
 app Opaque _ = Nom Opaque
 app _ _ = panic "ill-typed application"
 
@@ -404,6 +409,16 @@ decodeEv = case _ of
   Nom x -> Nom (decodeN x)
   Describe x -> decodeD x
   Become x -> Become (decodeN x)
+
+-- | the type of a neutral applied.  A metavariable's is that of it
+-- | applied to all it is applied to (`metaEl`): one read back applied to
+-- | more than locals (`Heff.Core.Readback.readbBare`) is applied again to
+-- | them one by one, and its type stays what it is
+neuAppTy :: Head -> Ty -> Lazy El -> Ty
+neuAppTy h t arg = case h, behavior t of
+  Meta _, LikeFunction _ -> appTy t arg
+  Meta _, _ -> t
+  _, _ -> appTy t arg
 
 appTy :: Ty -> Lazy El -> Ty
 appTy t arg = case behavior t of

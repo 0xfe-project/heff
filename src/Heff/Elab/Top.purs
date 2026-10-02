@@ -20,7 +20,8 @@ import Data.Either (Either(..))
 import Data.Foldable (foldM, foldl, for_)
 import Data.Lazy (Lazy, defer, force)
 import Control.Lazy (fix)
-import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
+import Data.Maybe (Maybe(..), fromMaybe, isJust, isNothing, maybe)
+import Data.Set as Set
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, ntnHead, ntnSpan)
@@ -390,9 +391,9 @@ declJ = case _ of
 -- | primitive keeps its own, the runtime's.
 -- |
 -- | A definition whose type elaborates and whose body does not is a
--- | definition still, `failed`: of its type, opaque to what uses it (as a
--- | primitive is), and abandoning if it is ever computed -- so what uses it
--- | is checked against its type, not refused with it.
+-- | definition still, `failed`: an error hole of its type, equal to
+-- | anything, and abandoning if it is ever computed -- so what uses it is
+-- | checked against its type, and what unfolds it is not refused for it.
 elabDecl :: (Name -> Name) -> Globals -> Ntn -> E { name :: Name, key :: Name, prim :: Boolean, entry :: GlobalEntry, failed :: Maybe Diag }
 elabDecl key g n = do
   modify_ \st -> st { selfKey = Nothing }
@@ -420,6 +421,7 @@ elabDecl key g n = do
     -- (errors recovered from, settling too: reported, and what follows
     -- from them -- implicit arguments not inferred -- is not)
     recovered
+    poisonedLeft
     for_ (A.head stuck) \p -> stuckDiag gSelf (ntnSpan n) p >>= throwError
     unsolved <- unsolvedMetas
     for_ (A.head unsolved) \u -> throwError
@@ -436,9 +438,12 @@ elabDecl key g n = do
     , msg: P.text ("there is no primitive called `" <> d.name <> "` (the runtime has: " <> Str.joinWith ", " primNames <> ")")
     }
   pure case body of
-    -- (as a primitive is: nothing to unfold, a neutral)
+    -- (a definition that failed is an error hole of its type: equal to
+    -- anything -- what unfolds it, a type computed from it, is not refused
+    -- for it -- and abandoning if computed)
     Left failed ->
-      { name: d.name, key: k, prim: d.prim, failed: Just failed, entry: entryFor g k true tyStx Syn.Abandon }
+      let entry = entryFor g k true tyStx Syn.Abandon
+      in { name: d.name, key: k, prim: d.prim, failed: Just failed, entry: entry { value = V.errorHole entry.type_ } }
     Right t ->
       let
         -- (the global it was mentioned as, while it was not yet one: the
@@ -462,6 +467,15 @@ entryFor g k prim tyStx bodyStx =
     -- a primitive has no definition to unfold: it is a neutral
     value = if prim then V.reflect (V.Global k) (pure V.Id) (pure aval) Nothing else force vL
   in { syntax: bodyStx, tySyntax: tyStx, value, type_: aval }
+
+-- | fail, unreported, if an implicit argument is left that an error hole
+-- | kept from being inferred: that error is reported where it is
+poisonedLeft :: E Unit
+poisonedLeft = do
+  ps <- gets _.poisoned
+  mc <- gets _.metas
+  when (A.any (\m -> maybe false (\me -> isNothing me.sol) (Map.lookup m mc)) (Set.toUnfoldable ps :: Array Int)) $
+    failElsewhere { start: 0, end: 0 } (P.text "an implicit argument an error kept from being inferred")
 
 -- | fail, if errors were recovered from (they are reported, this is not:
 -- | `reportedElsewhere`)
@@ -526,6 +540,7 @@ elabWatch g n = do
   stuck <- settle g
   -- (what settling met that was recovered from, too)
   recovered
+  poisonedLeft
   for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError
@@ -565,7 +580,16 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
     Right (Tuple (Left d) st) -> after acc st (reported d)
   -- an internal error in one declaration is reported, not fatal
   tryDecl acc n = case tryPure (\_ -> runE (elabDecl key acc.globals n) st0) of
-    Left msg -> acc { diags = A.snoc acc.diags { code: 399, severity: SError, span: ntnSpan n, note: Nothing, msg: P.text ("internal error while elaborating this: " <> msg) } }
+    -- (and what it defines did not elaborate: a use of it is not an error
+    -- of its own)
+    Left msg ->
+      let acc' = acc { diags = A.snoc acc.diags { code: 399, severity: SError, span: ntnSpan n, note: Nothing, msg: P.text ("internal error while elaborating this: " <> msg) } }
+      in case declName n of
+        Just x -> acc'
+          { globals = addBroken (key x) (if key x == x then acc.globals else addAlias x (key x) acc.globals)
+          , broken = A.snoc acc.broken (Tuple x (ntnSpan n))
+          }
+        Nothing -> acc'
     -- (a primitive declared again, by another module, is the same one)
     Right (Tuple (Right d) st) | d.prim && isJust (lookupGlobal acc.globals d.key) -> (after acc st [])
       { spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))

@@ -20,13 +20,13 @@ import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Dict, Name, dictContains, dictFromList, dictLength, dictLookup, dictToList)
 import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
-import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
+import Heff.Elab.Unify (blockedTy, forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
 import Control.Monad.State (get, gets, modify_)
 import Control.Monad.Except (catchError)
 import Heff.Core.Globals (isBroken, lookupGlobalKey)
 import Heff.Core.Memoed as M
-import Heff.Core.Params (Case(..), Level(..), Universe, Variants(..), decodesInto, leq, maxLevel)
+import Heff.Core.Params (Case(..), Level(..), Universe(..), Variants(..), decodesInto, leq, maxLevel)
 import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName, renameTy)
 import Heff.Core.Syntax as S
@@ -68,8 +68,21 @@ recovering :: Chk -> Chk
 recovering c = Chk \e a -> do
   saved <- get
   catchError (runChk c e a) \d -> do
-    modify_ \s -> s { recovered = A.snoc s.recovered d, delayed = saved.delayed, postponed = saved.postponed }
-    pure { stx: S.Abandon, val: pure (V.Nom (V.errorHole a)) }
+    -- (checked at a type that did not elaborate, nothing is an error of its
+    -- own: kept, for the definition to fail, but reported elsewhere)
+    blocked <- blockedTy a
+    let kept = if blocked then d { code = -1 } else d
+    modify_ \s -> s { recovered = A.snoc s.recovered kept, delayed = saved.delayed, postponed = saved.postponed }
+    pure (errorHole a)
+
+-- | an error hole of a type: what did not elaborate, in its place
+errorHole :: V.Ty -> M.El
+errorHole a = { stx: S.Abandon, val: pure (V.Nom (V.errorHole a)) }
+
+-- | what is made of something whose type did not elaborate (applied,
+-- | projected): an error hole too, of a type nothing is known of
+errorOf :: E (Tuple M.El V.Ty)
+errorOf = let t = V.errorTy LargeU in pure (Tuple (errorHole t) t)
 
 txt :: String -> Doc
 txt = P.text
@@ -210,7 +223,9 @@ functionIntroAnn sp x dom body = Chk \e a0 -> do
       case agree of
         Left err -> conversionFail sp (txt "the binder's annotation is not the argument type expected here") (prettyDefEqError (displayName e.globals) err)
         Right _ -> pure unit
-      ebody <- withBound x ft.dom e.scope \v scope' ->
+      -- (bound at the annotation: the two are equal, and what is expected
+      -- may be known only later -- an implicit argument still unsolved)
+      ebody <- withBound x (M.tyN edom) e.scope \v scope' ->
         runChk body
           (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
@@ -278,7 +293,7 @@ functionElimC checksOnly sp callee arg = Syn \e -> do
         hole <- delayChk e sp "argument" arg dom
         pure (Tuple (M.app ecallee hole) (V.nom (V.appClo ft.cod (defer \_ -> M.valN hole))))
     V.LikeFunction ft -> plain e ecallee ft
-    _ -> failWith sp 2 (txt "tried to apply a value that was not of a function type")
+    _ -> blockedTy a >>= if _ then errorOf else failWith sp 2 (txt "tried to apply a value that was not of a function type")
   where
   plain e ecallee ft = do
       earg <- runChk arg e ft.dom
@@ -528,8 +543,8 @@ recordElim sp projectee x = Syn \e -> do
         Nothing -> failWith sp 32 (notInHand x)
     -- the type is a neutral nothing unfolds here: inferred, and too late
     -- for its fields
-    V.NoRules -> failWith sp 32 (notInHand x)
-    _ -> failWith sp 6 (txt "tried to project from a value that was not of a record type")
+    V.NoRules -> blockedTy a >>= if _ then errorOf else failWith sp 32 (notInHand x)
+    _ -> blockedTy a >>= if _ then errorOf else failWith sp 6 (txt "tried to project from a value that was not of a record type")
   where
   notInHand f =
     txt ("the record's shape is not in hand here for `." <> f <> "`: annotate the binder, `\\(x : T) -> ...`, or give the implicit argument, `(a := T)`")
@@ -610,16 +625,17 @@ sumElim sp scrutSyn tags casesChk = Chk \e b -> do
   a <- forceT a0
   case V.behavior a of
     V.LikeSum (Variants vs) -> casesAt e b scrut a vs
-    -- the scrutinee's type is an unsolved implicit (a `do`-bound answer,
-    -- say): the cases wait for it, a hole standing for the match
-    _ | isFlexTy a -> delayChkOn e sp "match"
-        (Chk \e2 b2 -> do
-          a2 <- forceT a
-          case V.behavior a2 of
-            V.LikeSum (Variants vs) -> casesAt e2 b2 scrut a2 vs
-            _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e2 a2))
-        a b
-    _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e a)
+    _ -> blockedTy a >>= if _ then pure (errorHole b) else case unit of
+      -- the scrutinee's type is an unsolved implicit (a `do`-bound answer,
+      -- say): the cases wait for it, a hole standing for the match
+      _ | isFlexTy a -> delayChkOn e sp "match"
+          (Chk \e2 b2 -> do
+            a2 <- forceT a
+            case V.behavior a2 of
+              V.LikeSum (Variants vs) -> casesAt e2 b2 scrut a2 vs
+              _ -> blockedTy a2 >>= if _ then pure (errorHole b2) else failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e2 a2))
+          a b
+      _ -> failWith sp 18 (txt "cannot match against non-sum type" <+> prtIn e a)
   where
   casesAt e b scrut a vs = do
     for_ tags \(Tuple x tsp) -> when (isJust (dictLookup vs x)) (recordName e a x tsp a)

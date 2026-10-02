@@ -93,6 +93,18 @@ console.log("interfaces: as `heff check` prints them");
   }
 }
 
+// one error, reported once: what depends on it -- a type that did not
+// elaborate, an implicit argument it kept from being inferred, a failed
+// definition unfolded -- is not an error again
+{
+  const r = heff("check", "test/errors/cascade.hf");
+  const errors = r.stderr.match(/error\[E\d+\]/g) || [];
+  if (r.status === 0 || errors.join() !== "error[E0314]") {
+    failed++;
+    console.log(`FAIL one error, reported once:\n${r.stderr}`);
+  }
+}
+
 // an expectation that does not hold: what differs is shown, cut to it
 mkdirSync(join(root, "ref"), { recursive: true });
 const wrong = join(root, "ref", "wrong-expectation.hf");

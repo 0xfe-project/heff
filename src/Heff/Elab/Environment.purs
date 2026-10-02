@@ -9,6 +9,8 @@ import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.State (State, modify_, runState)
 import Data.Array as A
 import Data.Map as Map
+import Data.Set (Set)
+import Data.Set as Set
 import Data.Lazy (Lazy)
 import Data.Tuple (Tuple)
 import Data.Foldable (foldr)
@@ -133,11 +135,14 @@ type TraceEvent = { span :: Span, kind :: String, text :: Lazy String }
 -- | The state of elaborating one definition: what it learned for the IDE,
 -- | its metacontext, the conversion problems waiting for a metavariable,
 -- | and the errors recovered from (`recovered`: each where it is, an error
--- | hole in its place).  It starts empty for every definition and is
--- | dropped at its end.
+-- | hole in its place; one reported elsewhere too, to make the definition
+-- | fail); `poisoned`: the metavariables an error hole met, which it did
+-- | not solve -- what fails for want of them is not an error of its own.
+-- | It starts empty for every definition and is dropped at its end.
 type ElabSt =
   { infos :: Array Info
   , recovered :: Array Diag
+  , poisoned :: Set Int
   , metas :: V.MetaCtx
   , nextMeta :: Int
   -- (`failed`: retried and found contradictory, kept to be reported)
@@ -154,7 +159,7 @@ type ElabSt =
 newtype Delayed = Delayed { ty :: V.Ty, check :: ExceptT Diag (State ElabSt) Unit }
 
 emptySt :: ElabSt
-emptySt = { infos: [], recovered: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], selfKey: Nothing }
+emptySt = { infos: [], recovered: [], poisoned: Set.empty, metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], selfKey: Nothing }
 
 
 

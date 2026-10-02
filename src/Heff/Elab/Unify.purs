@@ -9,6 +9,7 @@
 -- | constructor, or a module.
 module Heff.Elab.Unify
   ( unifyTy
+  , blockedTy
   , unifyEl
   , force
   , forceT
@@ -35,7 +36,8 @@ import Data.Lazy (force) as L
 import Data.List (List(..), (:))
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), fromMaybe, isNothing)
+import Data.Set as Set
+import Data.Maybe (Maybe(..), fromMaybe, isNothing, maybe)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Parse.Notation (Span)
@@ -49,7 +51,7 @@ import Heff.Core.Print (prettyEl, prettyTy)
 import Data.Lazy (defer)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
-import Heff.Elab.Environment (Delayed(..), E, ElabSt)
+import Heff.Elab.Environment (Delayed(..), E, ElabSt, tryPure)
 import Heff.Support.Pretty as P
 
 type U a = ExceptT DefEqCheckError (State ElabSt) a
@@ -138,7 +140,7 @@ uTy g cs a0 b0 = do
   b <- forceTU b0
   -- (an error hole is equal to anything: before a metavariable is solved
   -- with it)
-  if V.isErrorTy a || V.isErrorTy b then pure unit else case flexTy a, flexTy b of
+  if V.isErrorTy a || V.isErrorTy b then poisonTy cs.len a *> poisonTy cs.len b else case flexTy a, flexTy b of
     Just (Tuple m sp), _ -> solve g cs m sp (V.code b) (V.code a)
     _, Just (Tuple m sp) -> solve g cs m sp (V.code a) (V.code b)
     _, _ -> case a, b of
@@ -188,7 +190,7 @@ uEl :: Globals -> CtxShape -> V.El -> V.El -> U Unit
 uEl g cs a0 b0 = do
   a <- forceU a0
   b <- forceU b0
-  if V.isError a || V.isError b then pure unit else case a, b of
+  if V.isError a || V.isError b then poisonEl cs.len a *> poisonEl cs.len b else case a, b of
     V.Opaque, _ -> pure unit
     _, V.Opaque -> pure unit
     _, _ -> case flexOf a, flexOf b of
@@ -204,6 +206,63 @@ uEl g cs a0 b0 = do
           uEl g cs' (V.nom (V.appClo c (pure x))) (V.nom (V.appClo c' (pure x)))
         V.Cons d, V.Cons d' -> for_ (A.zip d.values d'.values) \(Tuple x y) -> uEl g cs (V.nom x) (V.nom y)
         _, _ -> throwError (UnequalEls cs a b Nothing)
+
+-- | the metavariables an error hole met -- in what it was compared with,
+-- | wherever they are in it -- not solved by it, and marked
+poisonTy :: Int -> V.Ty -> U Unit
+poisonTy len t = do
+  mc <- gets _.metas
+  poisonAll (\_ -> metasTy mc 20 len t)
+
+poisonEl :: Int -> V.El -> U Unit
+poisonEl len v = do
+  mc <- gets _.metas
+  poisonAll (\_ -> metasEl mc 20 len v)
+
+-- (looking into a value computes what it had not yet: what cannot be
+-- computed here -- the definition's own global, not stored yet, say -- is
+-- not looked into)
+poisonAll :: (Unit -> Array Int) -> U Unit
+poisonAll ms = case tryPure ms of
+  Right found -> modify_ \s -> s { poisoned = Set.union s.poisoned (Set.fromFoldable found) }
+  Left _ -> pure unit
+
+-- | the unsolved metavariables in a value, `depth` deep (under binders, a
+-- | local put for each; a record type's fields are not looked into)
+metasEl :: V.MetaCtx -> Int -> Int -> V.El -> Array Int
+metasEl mc depth len v0
+  | depth <= 0 = []
+  | otherwise = case V.forceEl mc v0 of
+      V.Neu n -> (case n.head of
+        V.Meta m -> [ m ]
+        _ -> []) <> spine n.spine
+      V.Code t -> metasTy mc (depth - 1) len t
+      V.Lam d c -> metasEl mc (depth - 1) (len + 1) (V.nom (V.appClo c (pure (V.local len (V.lamDom (L.force d))))))
+      V.Cons d -> A.concatMap (\x -> metasEl mc (depth - 1) len (V.nom x)) d.values
+      V.Opaque -> []
+  where
+  spine = case _ of
+    V.Id -> []
+    V.App sp a -> spine sp <> metasEl mc (depth - 1) len a
+    V.Proj sp _ -> spine sp
+    V.Specialize sp _ a -> spine sp <> metasEl mc (depth - 1) len a
+
+metasTy :: V.MetaCtx -> Int -> Int -> V.Ty -> Array Int
+metasTy mc depth len t0
+  | depth <= 0 = []
+  | otherwise = case V.forceTy mc t0 of
+      V.Decode n -> metasEl mc depth len (L.force n.el)
+      V.Function f -> metasTy mc (depth - 1) len f.dom <> metasTy mc (depth - 1) (len + 1) (V.nom (V.appClo f.cod (pure (V.local len f.dom))))
+      V.PrimArray a -> metasTy mc (depth - 1) len a
+      _ -> []
+
+-- | is a type one nothing can be asked of, for an error elsewhere: an
+-- | error hole's, or a metavariable an error hole kept from being solved?
+blockedTy :: V.Ty -> E Boolean
+blockedTy a0 = do
+  a <- forceT a0
+  ps <- gets _.poisoned
+  pure (V.isErrorTy a || maybe false (\(Tuple m _) -> Set.member m ps) (flexTy a))
 
 -- Solving
 --------------------------------------------------------------------------------
@@ -288,6 +347,10 @@ solve g cs m sp rhs self = do
             stx = lams k body
             val = V.nom (eval { local: V.LNil, global: g } N stx)
           modify_ \s -> s { metas = Map.update (\e -> Just e { sol = Just val, solStx = Just stx }) m s.metas }
+          -- (a metavariable an error hole met hands that on to those its
+          -- solution has: they stand for it now)
+          ps <- gets _.poisoned
+          when (Set.member m ps) (poisonEl 0 val)
           traceSolve m stx
 
 -- | record a solution in the trace, at the metavariable's span
