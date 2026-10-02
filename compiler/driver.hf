@@ -1,0 +1,413 @@
+-- The program, module by module: a port of `Heff.Driver`'s fold.  Each
+-- file sees its own definitions and those of the modules it imports, by
+-- name; what those need is there too, by key, but not in scope.  This
+-- slice: no cache, no module struct values, sources handed over in
+-- dependency order (the loader stays with the host).
+
+import compiler.fixity as F
+import compiler.globals as G
+import compiler.import as I
+import compiler.notation
+import compiler.params as Pm
+import compiler.surface as Su
+import compiler.syntax as Sx
+import compiler.toplevel as T
+import map as Mp
+import prelude
+
+type Source = { module : String, source : String }
+
+type Own = { name : String, key : String }
+
+mkOwn : String -> String -> Own
+mkOwn name key = { name = name, key = key }
+
+type AliasQ = { module : String, alias : String }
+
+type Checked =
+  { module : String
+  , top : T.TopResult
+  , diags : List Diag
+  , own : List Own
+  , deps : List String
+  , opens : List String
+  , aliases : List AliasQ
+  , fixities : F.Fixities
+  }
+
+appendD : {a : Type} -> List a -> List a -> List a
+appendD Nil ys = ys
+appendD (Cons x xs) ys = Cons x (appendD xs ys)
+
+concatMapD : {a b : Type} -> (a -> List b) -> List a -> List b
+concatMapD f Nil = Nil
+concatMapD f (Cons x xs) = appendD (f x) (concatMapD f xs)
+
+nubStrD : List String -> List String
+nubStrD Nil = Nil
+nubStrD (Cons x xs) = Cons x (nubStrD (filter (\y -> not (strEq y x)) xs))
+
+elemStr : String -> List String -> Bool
+elemStr x xs = elemBy strEq x xs
+
+findChecked : List Checked -> String -> Maybe Checked
+findChecked Nil m = Nothing
+findChecked (Cons c rest) m =
+  if strEq c.module m then Just c else findChecked rest m
+
+depsOf : List Checked -> String -> List String
+depsOf done m = case findChecked done m of
+  Just c -> c.deps
+  Nothing -> Nil
+
+-- | the modules reached from some, through their imports
+closureGo : List Checked -> List String -> List String -> List String
+closureGo done seen Nil = seen
+closureGo done seen (Cons m ms) =
+  if elemStr m seen
+    then closureGo done seen ms
+    else closureGo done (Cons m seen) (appendD ms (depsOf done m))
+
+closure : List Checked -> List String -> List String
+closure done ms = closureGo done Nil ms
+
+mergeBroken : Mp.Map String Unit -> G.Globals -> G.Globals
+mergeBroken b g = foldl (\g2 k -> G.addBroken k g2) g (Mp.keys b)
+
+withEntry : String -> Checked -> G.Globals -> G.Globals
+withEntry k c g = case G.lookupEntry c.top.globals k of
+  Just e -> G.addEntry k e g
+  Nothing -> g
+
+envOne : Checked -> G.Globals -> G.Globals
+envOne c g =
+  foldl
+    (\g2 (o : Own) -> withEntry o.key c g2)
+    (mergeBroken c.top.globals.broken g)
+    c.own
+
+-- | each needed module's definitions, by key, and its broken set
+envOf : List Checked -> List Checked -> G.Globals
+envOf done needed = foldl (\g c -> envOne c g) G.emptyGlobals needed
+
+type Imported = { name : String, key : String, module : String }
+
+mkImported : String -> String -> String -> Imported
+mkImported name key module2 = { name = name, key = key, module = module2 }
+
+importedOf : List Checked -> List Imported
+importedOf direct =
+  concatMapD
+    (\(c : Checked) ->
+       map (\(o : Own) -> mkImported o.name o.key c.module) c.own)
+    direct
+
+catMaybesD : {a : Type} -> List (Maybe a) -> List a
+catMaybesD Nil = Nil
+catMaybesD (Cons (Just x) xs) = Cons x (catMaybesD xs)
+catMaybesD (Cons Nothing xs) = catMaybesD xs
+
+brokenName : Checked -> String -> Maybe Imported
+brokenName c k =
+  if startsWith (c.module ++ ".") k
+    then Just
+        (mkImported
+           (strSlice k (strLength c.module + 1) (strLength k))
+           k
+           c.module)
+    else Nothing
+
+-- | what did not elaborate in a module imported, by its name there
+brokenIn : Checked -> List Imported
+brokenIn c =
+  catMaybesD (map (\k -> brokenName c k) (Mp.keys c.top.globals.broken))
+
+anyD : {a : Type} -> (a -> Bool) -> List a -> Bool
+anyD p Nil = False
+anyD p (Cons x xs) = p x || anyD p xs
+
+nubByName : List Imported -> List Imported
+nubByName Nil = Nil
+nubByName (Cons o rest) =
+  Cons
+    o
+    (nubByName (filter (\(p : Imported) -> not (strEq p.name o.name)) rest))
+
+-- | a name two modules imported define, each its own way, is in scope
+-- | as neither
+clashesOf : List Imported -> List Imported
+clashesOf imported =
+  nubByName
+    (filter
+       (\(o : Imported) ->
+          anyD
+            (\(p : Imported) -> strEq p.name o.name && not (strEq p.key o.key))
+            imported)
+       imported)
+
+joinComma : List String -> String
+joinComma Nil = ""
+joinComma (Cons x Nil) = x
+joinComma (Cons x rest) = x ++ ", " ++ joinComma rest
+
+clashDiag : List Imported -> Imported -> Diag
+clashDiag imported o =
+  { code = 330
+  , severity = SError
+  , msg =
+      "`"
+      ++ o.name
+      ++ "` is defined by more than one module imported: "
+      ++ joinComma
+        (nubStrD
+           (map
+              (\(p : Imported) -> p.module)
+              (filter (\(p : Imported) -> strEq p.name o.name) imported)))
+  , span = Pm.noSpan
+  , note = Nothing
+  }
+
+-- | the open imports' names, aliased in -- unless clashed, or already
+-- | the key
+aliasOpen : List Imported -> G.Globals -> List Imported -> G.Globals
+aliasOpen clashes g Nil = g
+aliasOpen clashes g (Cons o rest) =
+  aliasOpen
+    clashes
+    (if strEq o.key o.name
+     || anyD (\(cl : Imported) -> strEq cl.name o.name) clashes
+       then g
+       else G.addAlias o.name o.key g)
+    rest
+
+aliasQOne : List Checked -> G.Globals -> AliasQ -> G.Globals
+aliasQOne done g q = case findChecked done q.module of
+  Just c ->
+    foldl
+      (\g2 (o : Imported) -> G.addAlias (q.alias ++ "." ++ o.name) o.key g2)
+      g
+      (appendD
+         (map (\(o : Own) -> mkImported o.name o.key c.module) c.own)
+         (brokenIn c))
+  Nothing -> g
+
+-- | `import m as M`: `m`'s definitions as `M.x`
+aliasQualified : List Checked -> G.Globals -> List AliasQ -> G.Globals
+aliasQualified done g Nil = g
+aliasQualified done g (Cons q rest) =
+  aliasQualified done (aliasQOne done g q) rest
+
+knownIn : G.Globals -> String -> Bool
+knownIn g x = case G.lookupEntry g x of
+  Just _ -> True
+  Nothing -> False
+
+-- | what does not parse: a use of it is not an error of its own
+withParseBroken : (String -> String) -> G.Globals -> List String -> G.Globals
+withParseBroken key g Nil = g
+withParseBroken key g (Cons x rest) =
+  withParseBroken key (G.addBroken (key x) (G.addAlias x (key x) g)) rest
+
+-- (a primitive's key is its bare name, unprefixed)
+ownOf : String -> List String -> List Own
+ownOf modName keys =
+  map
+    (\k ->
+       if startsWith (modName ++ ".") k
+         then mkOwn (strSlice k (strLength modName + 1) (strLength k)) k
+         else mkOwn k k)
+    keys
+
+mkChecked : String
+          -> T.TopResult
+          -> List Diag
+          -> List Own
+          -> List String
+          -> List String
+          -> List AliasQ
+          -> F.Fixities
+          -> Checked
+mkChecked m top diags own deps opens aliases fixities =
+  { module = m
+  , top = top
+  , diags = diags
+  , own = own
+  , deps = deps
+  , opens = opens
+  , aliases = aliases
+  , fixities = fixities
+  }
+
+importNames : List I.Import -> List String
+importNames imps = nubStrD (map (\(i : I.Import) -> i.name) imps)
+
+openNames : List I.Import -> List String
+openNames Nil = Nil
+openNames (Cons i rest) = case i.alias of
+  Nothing -> Cons i.name (openNames rest)
+  Just a -> openNames rest
+
+aliasPairs : List I.Import -> List AliasQ
+aliasPairs Nil = Nil
+aliasPairs (Cons i rest) = case i.alias of
+  Just a -> Cons { module = i.name, alias = a } (aliasPairs rest)
+  Nothing -> aliasPairs rest
+
+directFix : List Checked -> F.Fixities
+directFix direct =
+  foldl (\f (c : Checked) -> F.union f c.fixities) F.emptyFixities direct
+
+elabTop : Source
+        -> I.Imports
+        -> List Checked
+        -> Su.Read
+        -> T.TopResult
+        -> Checked
+elabTop s imps direct r t =
+  mkChecked
+    s.module
+    t
+    (appendD
+       (map (clashDiag (importedOf direct)) (clashesOf (importedOf direct)))
+       (appendD r.diags t.diags))
+    (ownOf s.module t.keys)
+    (importNames imps.imports)
+    (openNames imps.imports)
+    (aliasPairs imps.imports)
+    r.fixities
+
+elabRead : List Checked
+         -> Source
+         -> I.Imports
+         -> List Checked
+         -> G.Globals
+         -> Su.Read
+         -> Checked
+elabRead done s imps direct g0 r =
+  elabTop
+    s
+    imps
+    direct
+    r
+    (T.topModule
+       s.module
+       (withParseBroken (\x -> s.module ++ "." ++ x) g0 r.broken)
+       r.ntns)
+
+elabEnv : List Checked
+        -> Source
+        -> I.Imports
+        -> List Checked
+        -> G.Globals
+        -> Checked
+elabEnv done s imps direct g0 =
+  elabRead
+    done
+    s
+    imps
+    direct
+    g0
+    (Su.readProgramWith
+       { known = \x -> knownIn g0 x
+       , fixities = directFix direct
+       , lenient = False
+       }
+       imps.text)
+
+elabDirect : List Checked
+           -> Source
+           -> I.Imports
+           -> List Checked
+           -> List Checked
+           -> Checked
+elabDirect done s imps direct needed =
+  elabEnv
+    done
+    s
+    imps
+    direct
+    (aliasQualified
+       done
+       (aliasOpen
+          (clashesOf (importedOf direct))
+          (aliasOpen
+             (clashesOf (importedOf direct))
+             (envOf done needed)
+             (importedOf direct))
+          (concatMapD (\(c : Checked) -> brokenIn c) direct))
+       (aliasPairs imps.imports))
+
+elabWith : List Checked -> Source -> I.Imports -> Checked
+elabWith done s imps =
+  elabDirect
+    done
+    s
+    imps
+    (filter (\(c : Checked) -> elemStr c.module (openNames imps.imports)) done)
+    (filter
+       (\(c : Checked) ->
+          elemStr c.module (closure done (importNames imps.imports)))
+       done)
+
+-- | one more module, elaborated after what it imports
+elabNext : List Checked -> Source -> Checked
+elabNext done s = elabWith done s (I.readImports s.source)
+
+-- | the files of a program, each after what it imports, elaborated
+checkProgram : List Source -> List Checked
+checkProgram sources =
+  foldl (\done s -> appendD done (Cons (elabNext done s) Nil)) Nil sources
+
+-- | a checked module's definition keys, in declaration order
+moduleKeys : Checked -> List String
+moduleKeys c = map (\(o : Own) -> o.key) c.own
+
+moduleName : Checked -> String
+moduleName c = c.module
+
+-- | a diagnostic, on one line
+diagLine : Diag -> String
+diagLine d = "error[" ++ showInt d.code ++ "]: " ++ d.msg
+
+diagLines : Checked -> List String
+diagLines c = map (\(d : Diag) -> diagLine d) c.diags
+
+-- | the stored core of one definition of a checked module, printed as
+-- | the reference's dump: `=def`/`=ty`/`=body` lines
+defKind : Checked -> String -> String
+defKind c k = case G.lookupEntry c.top.globals k of
+  Just e -> case e.syntax of
+    SPrim _ -> "prim"
+    _ -> "plain"
+  Nothing -> "plain"
+
+dumpLines : Checked -> String -> List String
+dumpLines c k =
+  Cons
+    ("=def " ++ k ++ " " ++ defKind c k)
+    (Cons
+       ("=ty " ++ T.tyDump c.top k)
+       (Cons ("=body " ++ T.bodyDump c.top k) Nil))
+
+-- | the last module's result, for the differential
+lastChecked : List Checked -> Maybe Checked
+lastChecked Nil = Nothing
+lastChecked (Cons c Nil) = Just c
+lastChecked (Cons c rest) = lastChecked rest
+
+-- | a definition's stored core, printed, from a checked program
+programBody : List Checked -> String -> String -> String
+programBody cs m k = case findChecked cs m of
+  Just c -> T.bodyDump c.top k
+  Nothing -> "<no such module>"
+
+programTy : List Checked -> String -> String -> String
+programTy cs m k = case findChecked cs m of
+  Just c -> T.tyDump c.top k
+  Nothing -> "<no such module>"
+
+-- >>> length (checkProgram [{ module = "a", source = "one : Int\none = 1\n" }, { module = "b", source = "import a\n\ntwo : Int\ntwo = one\n" }])
+-- 2
+
+-- >>> programBody (checkProgram [{ module = "a", source = "one : Int\none = 1\n" }, { module = "b", source = "import a\n\ntwo : Int\ntwo = one\n" }]) "b" "b.two"
+-- "(SIs (SGlobal \"a.one\"))"

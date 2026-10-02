@@ -1,0 +1,141 @@
+-- The header of a file: the `import m` lines before its first
+-- declaration.  A port of `Heff.Parse.Import`; the text comes back with
+-- the import lines blanked, so every offset stays where it was.
+
+import compiler.params as Pm
+import prelude
+
+type Import = { name : String, alias : Maybe String, span : Pm.Span }
+
+mkImport : String -> Maybe String -> Pm.Span -> Import
+mkImport name alias span = { name = name, alias = alias, span = span }
+
+type Imports = { imports : List Import, text : String }
+
+nameChar : Int -> Bool
+nameChar c =
+  c == 46
+  || c == 95
+  || c == 45
+  || (97 <= c && c <= 122)
+  || (65 <= c && c <= 90)
+  || (48 <= c && c <= 57)
+
+allChars : String -> Int -> (Int -> Bool) -> Bool
+allChars s i p =
+  if i >= strLength s then True else p (charCode s i) && allChars s (i + 1) p
+
+isName : String -> Bool
+isName x = strLength x > 0 && allChars x 0 nameChar
+
+hasDot : String -> Int -> Bool
+hasDot x i =
+  if i >= strLength x then False else charCode x i == 46 || hasDot x (i + 1)
+
+-- | (a module's alias is capitalised, a name of its own: `M`)
+isAlias : String -> Bool
+isAlias x =
+  strLength x > 0
+  && 65 <= charCode x 0
+  && charCode x 0 <= 90
+  && not (hasDot x 0)
+  && isName x
+
+lineEndAt : String -> Int -> Int
+lineEndAt src i =
+  if i >= strLength src
+    then strLength src
+    else if charCode src i == 10
+    then i
+    else lineEndAt src (i + 1)
+
+trimEnd : String -> String
+trimEnd s =
+  if strLength s > 0 && charCode s (strLength s - 1) == 32
+    then trimEnd (strSlice s 0 (strLength s - 1))
+    else s
+
+trimStart : String -> String
+trimStart s =
+  if strLength s > 0 && charCode s 0 == 32
+    then trimStart (strSlice s 1 (strLength s))
+    else s
+
+trim : String -> String
+trim s = trimEnd (trimStart s)
+
+wordKeep : String -> Int -> Int -> List String -> List String
+wordKeep s start i acc =
+  if i > start then Cons (strSlice s start i) acc else acc
+
+wordsGo : String -> Int -> Int -> List String -> List String
+wordsGo s start i acc =
+  if i >= strLength s
+    then reverse (wordKeep s start i acc)
+    else if charCode s i == 32
+    then wordsGo s (i + 1) (i + 1) (wordKeep s start i acc)
+    else wordsGo s start (i + 1) acc
+
+words : String -> List String
+words s = wordsGo s 0 0 Nil
+
+spaces : Int -> String
+spaces n = if n <= 0 then "" else " " ++ spaces (n - 1)
+
+blankOne : String -> Import -> String
+blankOne s imp =
+  strSlice s 0 imp.span.start
+  ++ spaces (imp.span.end - imp.span.start)
+  ++ strSlice s imp.span.end (strLength s)
+
+importOf : Int -> Int -> List String -> Maybe Import
+importOf i e (Cons m Nil) =
+  if isName m then Just (mkImport m Nothing { start = i, end = e }) else Nothing
+importOf i e (Cons m (Cons "as" (Cons a Nil))) =
+  if isName m && isAlias a
+    then Just (mkImport m (Just a) { start = i, end = e })
+    else Nothing
+importOf i e _ = Nothing
+
+withI : {a : Type} -> Int -> (Int -> a) -> a
+withI x k = k x
+
+withS : {a : Type} -> String -> (String -> a) -> a
+withS x k = k x
+
+doneI : String -> List Import -> Imports
+doneI src acc =
+  { imports = reverse acc, text = foldl blankOne src (reverse acc) }
+
+-- (the `import` prefix is of the line as written: an indented one ends
+-- the header, as the reference has it)
+importsGo : String -> Int -> List Import -> Imports
+importsGo src i acc =
+  if i >= strLength src
+    then doneI src acc
+    else withI
+        (lineEndAt src i)
+        (\e ->
+           withS
+             (strSlice src i e)
+             (\line ->
+                withS
+                  (trim line)
+                  (\trimmed ->
+                     if strEq trimmed "" || strEq (strSlice trimmed 0 2) "--"
+                       then importsGo src (e + 1) acc
+                       else if startsWith "import " line
+                       then case importOf
+                           i
+                           e
+                           (words (trim (strSlice line 7 (strLength line)))) of
+                         Just imp -> importsGo src (e + 1) (Cons imp acc)
+                         Nothing -> doneI src acc
+                       else doneI src acc)))
+
+-- | the imports of a file, and its text with the import lines blanked
+readImports : String -> Imports
+readImports src = importsGo src 0 Nil
+
+-- >>> map (\(i : Import) -> i.name) (readImports "import prelude\nimport map as M\n\nx : Int\nx = 1\n").imports
+-- ["prelude", "map"]

@@ -1,0 +1,95 @@
+-- The compiler, run: a Node.js program (`heff node compiler/main.hf
+-- selfcheck OUT.mjs`).  Given file paths in dependency order, it reads
+-- them, elaborates them with its own reader and elaborator, and prints
+-- every definition's stored core exactly as the reference's `dump-nbe`
+-- does -- so the two compilers can be held to the same text, file by
+-- file, by `test/self-check.mjs`.
+
+import co
+import compiler.driver as Dr
+import compiler.toplevel as T
+import fs
+import prelude
+import process
+import stdio
+
+eff : HFunctor
+eff = stdio <+> process <+> fs
+
+onStdio : {a : Type} -> Co stdio a -> Co eff a
+onStdio = lift (\p -> inl (stdio <+> process) fs (inl stdio process p))
+
+onProcess : {a : Type} -> Co process a -> Co eff a
+onProcess = lift (\p -> inl (stdio <+> process) fs (inr stdio process p))
+
+onFs : {a : Type} -> Co fs a -> Co eff a
+onFs = lift (inr (stdio <+> process) fs)
+
+dotsGo : String -> Int -> String -> String
+dotsGo p i acc =
+  if i >= strLength p
+    then acc
+    else if charCode p i == 47
+    then dotsGo p (i + 1) (acc ++ ".")
+    else dotsGo p (i + 1) (acc ++ strSlice p i (i + 1))
+
+dotsOf : String -> String
+dotsOf p = dotsGo p 0 ""
+
+dropLib : String -> String
+dropLib p = if startsWith "lib/" p then strSlice p 4 (strLength p) else p
+
+dropHf : String -> String
+dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
+
+-- | `lib/prelude.hf` is the module `prelude`; `compiler/dict.hf` is
+-- | `compiler.dict` (the root's paths, as `Heff.Load` names them)
+moduleOf : String -> String
+moduleOf path = dotsOf (dropLib (dropHf path))
+
+readAll : List String -> Co eff (List Dr.Source)
+readAll Nil = pure Nil
+readAll (Cons path rest) = do
+  mSrc <- onFs (readFile path)
+  case mSrc of
+    Nothing -> do
+      onStdio (printErr ("cannot read " ++ path))
+      onProcess (exit 1)
+      pure Nil
+    Just src -> do
+      more <- readAll rest
+      pure (Cons { module = moduleOf path, source = src } more)
+
+printLines : List String -> Co eff Unit
+printLines Nil = pure MkUnit
+printLines (Cons l rest) = do
+  onStdio (print l)
+  printLines rest
+
+printDefs : Dr.Checked -> List String -> Co eff Unit
+printDefs c Nil = pure MkUnit
+printDefs c (Cons k rest) = do
+  printLines (Dr.dumpLines c k)
+  printDefs c rest
+
+printErrs : String -> List String -> Int -> Co eff Int
+printErrs m Nil n = pure n
+printErrs m (Cons l rest) n = do
+  onStdio (printErr (m ++ ": " ++ l))
+  printErrs m rest (n + 1)
+
+printAll : List Dr.Checked -> Int -> Co eff Int
+printAll Nil bad = pure bad
+printAll (Cons c rest) bad = do
+  printDefs c (Dr.moduleKeys c)
+  n <- printErrs (Dr.moduleName c) (Dr.diagLines c) 0
+  printAll rest (bad + n)
+
+-- | check every file given, each after what it imports, and print the
+-- | stored core of every definition
+selfcheck : Co eff Unit
+selfcheck = do
+  paths <- onProcess args
+  sources <- readAll paths
+  bad <- printAll (Dr.checkProgram sources) 0
+  if bad == 0 then pure MkUnit else onProcess (exit 1)

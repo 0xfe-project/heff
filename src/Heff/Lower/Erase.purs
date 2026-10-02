@@ -22,8 +22,10 @@ import Data.Either (Either(..))
 import Data.Lazy (Lazy, defer, force)
 import Data.List (List(..), (:))
 import Data.List as L
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Traversable (traverse)
+import Heff.Core.Readback (readbTy)
+import Heff.Core.Rename (mentionsInnermost)
 import Data.Tuple (Tuple(..))
 import Heff.Core.Evaluation (eval, evalTy)
 import Heff.Core.Globals (Globals, GlobalEntry, globalsList, lookupGlobal)
@@ -31,7 +33,7 @@ import Heff.Core.Params (Case(..), Variants(..))
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
 import Heff.Lower.IR (Def, Expr(..), Supply, fresh)
-import Heff.Support.Common (Dict, Name, dictToList)
+import Heff.Support.Common (Dict, Name, dictToList, dictAt, dictKeyIndex)
 import Heff.Elab.Environment (tryPure)
 
 type M a = StateT Supply (Either String) a
@@ -115,13 +117,36 @@ chkD c t ty v = case t of
   S.Cons d | V.LikeRecord _ <- V.behavior ty -> do
     fields <- A.catMaybes <$> traverse
       ( \(Tuple l fe) -> do
-          let fty = V.projTy ty v l
+          fty <- projTyIn c.len ty v l
           if isType c.len fty then pure Nothing
           else Just <<< Tuple l <$> chkD c fe fty (V.nom (V.proj v l))
       )
       (dictToList d)
     pure (Record fields)
   _ -> chk c t ty
+
+-- | The type of field `l`: through the value's fields where they are in
+-- | hand; else -- the value is opaque here, computed through a match --
+-- | each field before it a local of its own, if the type depends on
+-- | none of them (as the elaborator's `fieldTyApart` reads it).
+projTyIn :: Int -> V.Ty -> V.El -> Name -> M V.Ty
+projTyIn len t v l = case V.projTyMaybe t v l of
+  Just ty -> pure ty
+  Nothing -> case V.behavior t of
+    V.LikeRecord rt -> case fieldTyApart len rt l of
+      Just ty -> pure ty
+      Nothing -> failWith ("the type of `." <> l <> "` depends on fields not in hand here")
+    _ -> failWith "projecting from something that is not of a record type"
+
+fieldTyApart :: Int -> V.RecordType -> Name -> Maybe V.Ty
+fieldTyApart len rt x =
+  let
+    i = dictKeyIndex rt.fieldTypes x
+    fieldAt j vs = (dictAt rt.fieldTypes j) (V.LChunkSnoc rt.capture vs)
+    before = A.foldl (\vs j -> let f = fieldAt j vs in A.snoc vs (fromMaybe (V.local (len + j) f.ty) f.value)) [] (if i == 0 then [] else A.range 0 (i - 1))
+    ty = (fieldAt i before).ty
+  in
+    if mentionsInnermost i (readbTy (len + i) ty) then Nothing else Just ty
 
 matchVariants :: V.Ty -> M (Dict (Array (Lazy V.Ty)))
 matchVariants sty = case V.behavior sty of
@@ -186,7 +211,8 @@ syn c = case _ of
       _ -> failWith "applying something that is not a function"
   S.Proj e l -> do
     Tuple e' ety <- syn c e
-    pure (Tuple (Proj e' l) (V.projTy ety (evalIn c e) l))
+    fty <- projTyIn c.len ety (evalIn c e) l
+    pure (Tuple (Proj e' l) fty)
   -- a lambda says its type
   t@(S.Lam ty _) -> do
     let fty = V.nom (evalTy { local: c.env, global: c.globals } N ty)
