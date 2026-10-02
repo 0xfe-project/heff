@@ -2,7 +2,8 @@
 // message a `Content-Length: n` header, a blank line, then n bytes of JSON.
 // stdout carries only the messages; logs go to stderr.
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 
 export const listenImpl = (onMessage) => () => {
   let buf = Buffer.alloc(0);
@@ -40,3 +41,28 @@ export const uriPathImpl = (just) => (nothing) => (uri) => {
 };
 export const pathUri = (p) => pathToFileURL(p).href;
 export const absPath = (p) => resolve(p);
+
+// the `.hf` files of the project at `root`: not in a directory of another
+// project (one with its own project.hf), a hidden one, or one the root's
+// .gitignore names (`/output`, `node_modules`: a name, not a pattern)
+export const projectFilesImpl = (root) => () => {
+  let ignored = ["node_modules"];
+  try {
+    ignored = ignored.concat(readFileSync(join(root, ".gitignore"), "utf8").split("\n")
+      .map((l) => l.trim().replace(/^\//, "").replace(/\/$/, ""))
+      .filter((l) => l && !l.startsWith("#") && !/[*?\[\/!]/.test(l)));
+  } catch (_) {}
+  const files = [];
+  const walk = (d) => {
+    let entries = [];
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      if (e.name.startsWith(".") || ignored.includes(e.name)) continue;
+      const p = join(d, e.name);
+      if (e.isDirectory()) { if (!existsSync(join(p, "project.hf"))) walk(p); }
+      else if (e.isFile() && e.name.endsWith(".hf")) files.push(p);
+    }
+  };
+  if (existsSync(join(root, "project.hf"))) walk(root);
+  return files;
+};

@@ -12,6 +12,7 @@ module Heff.Load
 
 import Prelude
 
+import Control.Alt ((<|>))
 import Data.Array as A
 import Data.Maybe (Maybe(..), fromMaybe, isNothing)
 import Data.String as S
@@ -43,11 +44,12 @@ pathsFor lib file = do
   root <- up start
   pure { root, lib }
 
--- | the module a file of the project is
+-- | the module a file of the project is; one of the standard library is
+-- | the library's (`lib/co.hf` is `co`), wherever the project's root is
 moduleOf :: Paths -> String -> String
 moduleOf ps file =
   let
-    rel = fromMaybe file (S.stripPrefix (S.Pattern (ps.root <> "/")) file)
+    rel = fromMaybe file (S.stripPrefix (S.Pattern (ps.lib <> "/")) file <|> S.stripPrefix (S.Pattern (ps.root <> "/")) file)
     base = fromMaybe rel (S.stripSuffix (S.Pattern ".hf") rel)
   in
     S.replaceAll (S.Pattern "/") (S.Replacement ".") base

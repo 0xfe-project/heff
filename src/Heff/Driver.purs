@@ -24,6 +24,13 @@ module Heff.Driver
   , explain
   , typeAt
   , definitionAt
+  , Target
+  , Occurrence
+  , targetAt
+  , occurrences
+  , renameRefused
+  , DocSymbol
+  , symbols
   ) where
 
 import Prelude
@@ -473,8 +480,8 @@ completionsAt :: Checked -> Int -> Array { label :: String, detail :: String }
 completionsAt c offset =
   A.sortWith _.label (A.mapMaybe one (A.nub names))
   where
-  typed = SCU.fromCharArray (A.reverse (A.takeWhile isNameChar (A.reverse (SCU.toCharArray (SCU.take offset c.source)))))
-  isNameChar ch = ch == '_' || ch == '\'' || ch == '.' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+  typed = SCU.fromCharArray (A.reverse (A.takeWhile isTypedChar (A.reverse (SCU.toCharArray (SCU.take offset c.source)))))
+  isTypedChar ch = ch == '_' || ch == '\'' || ch == '.' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
   -- (`M.fo`: the qualifier `M.`, and `fo`)
   qualifier = case S.lastIndexOf (S.Pattern ".") typed of
     Just i -> S.take (i + 1) typed
@@ -505,23 +512,205 @@ definitionAt program off = do
   d <- A.head (A.mapMaybe (defines k) (A.reverse program))
   -- (the name looked for is the one at the offset: a tag's is in its type's
   -- declaration)
-  pure { path: d.c.path, source: d.c.source, span: nameIn d.c.source i.name d.span }
+  let target = { key: k, member: if i.member then Just i.name else Nothing }
+  pure { path: d.c.path, source: d.c.source, span: maybe (nameIn d.c.source i.name d.span) _.span (A.find (\s -> s.target == target) (sites d.c)) }
   where
   defines k c = do
     j <- A.findIndex (\o -> o.key == k) c.own
     o <- A.index c.own j
     Tuple _ sp <- A.index c.top.spans j
     pure { c, name: o.name, span: sp }
-  -- the first occurrence of the name, as a word, in the declaration
-  nameIn src x sp =
+
+-- | the first occurrence of a name, as a word, in a span (else the span)
+nameIn :: String -> String -> F.Span -> F.Span
+nameIn src x sp = go sp.start
+  where
+  go from = case SCU.indexOf' (S.Pattern x) from src of
+    Just p | p + SCU.length x <= sp.end ->
+      if wordAt src p x then { start: p, end: p + SCU.length x } else go (p + 1)
+    _ -> sp
+
+-- | is `x`, at `p` in `src`, a word: not part of a longer name?
+wordAt :: String -> Int -> String -> Boolean
+wordAt src p x = (p == 0 || not (isNameChar (SCU.charAt (p - 1) src))) && not (isNameChar (SCU.charAt (p + SCU.length x) src))
+
+isNameChar :: Maybe Char -> Boolean
+isNameChar = case _ of
+  Just ch -> ch == '_' || ch == '\'' || ch == '/' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+  Nothing -> false
+
+-- References
+--------------------------------------------------------------------------------
+
+-- | What a name refers to: a global, by its key; or a tag or a field
+-- | (`member`) of the type `key` names.
+type Target = { key :: String, member :: Maybe String }
+
+-- | a name written in a file; the span is the name's alone (`not` of
+-- | `A.not`, `t` of `.t`, `x` of `'x`); `defines`: where it is defined
+type Occurrence = { path :: String, source :: String, span :: F.Span, defines :: Boolean }
+
+-- | Where a file defines its names: each declaration's name, at the start
+-- | of its signature's line and of each equation's (`not`, `(&&)`, `data
+-- | Bool`); a `data`'s tags, after its `=` and `|`; a `theory`'s fields, at
+-- | the start of their lines.  (Read from the text: the elaborator keeps
+-- | where a declaration is, not where in it its names are.)
+sites :: Checked -> Array { target :: Target, name :: String, span :: F.Span }
+sites c = A.concat (A.zipWith decl c.own c.top.spans)
+  where
+  src = c.source
+  starts = A.sort (map (\(Tuple _ sp) -> sp.start) c.top.spans)
+  -- (a declaration's span is its signature's; its equations follow, up to
+  -- the next declaration)
+  upToNext sp = sp { end = max sp.end (fromMaybe (SCU.length src) (A.find (_ > sp.start) starts)) }
+  decl o (Tuple _ sp) =
     let
-      word p = not (isNameChar (SCU.charAt p src))
-      go from = case SCU.indexOf' (S.Pattern x) from src of
-        Just p | p + SCU.length x <= sp.end ->
-          if (p == 0 || word (p - 1)) && word (p + SCU.length x) then { start: p, end: p + SCU.length x } else go (p + 1)
-        _ -> sp
+      text = SCU.slice sp.start sp.end src
+      heads = A.mapMaybe (headAt o.name) (lineStarts (upToNext sp))
+      self = map (\h -> { target: { key: o.key, member: Nothing }, name: o.name, span: h }) heads
+      members
+        | S.take 5 text == "data " = tags sp
+        | S.take 7 text == "theory " = fields sp
+        | otherwise = []
     in
-      go sp.start
-  isNameChar = case _ of
-    Just ch -> ch == '_' || ch == '\'' || ch == '/' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
-    Nothing -> false
+      self <> map (\m -> { target: { key: o.key, member: Just m.name }, name: m.name, span: m.span }) members
+  lineStarts sp = A.filter (\p -> p == 0 || SCU.charAt (p - 1) src == Just '\n') (A.range sp.start (max sp.start (sp.end - 1)))
+  headAt x p = A.findMap (\pre -> at (p + SCU.length pre) x pre) [ "", "(", "data ", "theory ", "foreign import " ]
+    where
+    at q y pre
+      | SCU.slice p q src /= pre || SCU.slice q (q + SCU.length y) src /= y = Nothing
+      | pre == "(" = if SCU.charAt (q + SCU.length y) src == Just ')' then Just { start: q, end: q + SCU.length y } else Nothing
+      | wordAt src q y = Just { start: q, end: q + SCU.length y }
+      | otherwise = Nothing
+  -- (a tag is the name after `=` or `|`, perhaps written with its `'`)
+  tags sp = A.mapMaybe tagAfter (A.filter (\p -> SCU.charAt p src == Just '=' || SCU.charAt p src == Just '|') (A.range sp.start (sp.end - 1)))
+  tagAfter p =
+    let
+      q0 = skipSpace (p + 1)
+      q = if SCU.charAt q0 src == Just '\'' then q0 + 1 else q0
+      e = nameEnd q
+    in
+      if e > q then Just { name: SCU.slice q e src, span: { start: q, end: e } } else Nothing
+  fields sp = A.mapMaybe fieldAt (A.drop 1 (lineStarts sp))
+  fieldAt p =
+    let
+      q = skipSpace' p
+      e = nameEnd q
+    in
+      if q > p && e > q && SCU.charAt (skipSpace' e) src == Just ':' && SCU.charAt (skipSpace' e + 1) src /= Just ':' then Just { name: SCU.slice q e src, span: { start: q, end: e } } else Nothing
+  skipSpace i = if A.elem (SCU.charAt i src) [ Just ' ', Just '\n', Just '\t' ] then skipSpace (i + 1) else i
+  skipSpace' i = if A.elem (SCU.charAt i src) [ Just ' ', Just '\t' ] then skipSpace' (i + 1) else i
+  nameEnd i = if isNameChar (SCU.charAt i src) && SCU.charAt i src /= Just '/' then nameEnd (i + 1) else i
+
+-- | the name at an offset, in a program (the file last), as what it refers
+-- | to: a name used there, or one the file defines there; and the name it
+-- | is defined as.  (A local: nothing.)
+targetAt :: Array Checked -> Int -> Maybe { target :: Target, name :: String }
+targetAt program off = do
+  c <- A.last program
+  t <- case infoAt c off of
+    Just i -> i.key <#> \k -> { key: k, member: if i.member then Just i.name else Nothing }
+    Nothing -> _.target <$> A.find (\s -> s.span.start <= off && off <= s.span.end) (sites c)
+  name <- case t.member of
+    Just m -> Just m
+    Nothing -> A.findMap (\c' -> _.name <$> A.find (\o -> o.key == t.key) c'.own) program
+  pure { target: t, name }
+
+-- | every occurrence in a program of what a name refers to (`name`, as it
+-- | is defined), by file, in order: its definition, its uses -- the
+-- | elaborator's record of each -- and, as text, in the files that use it,
+-- | in a fixity declaration (an operator) and in a watch's expectation
+occurrences :: Array Checked -> Target -> String -> Array Occurrence
+occurrences program t name = A.concatMap inFile (A.nubByEq (\a b -> a.path == b.path) program)
+  where
+  inFile c =
+    let
+      defs = map _.span (A.filter (\s -> s.target == t) (sites c))
+      found = A.mapMaybe use c.top.infos <> defs
+      more = if A.null found then [] else fixities c <> expected c
+    in
+      map (\sp -> { path: c.path, source: c.source, span: sp, defines: A.any (\d -> d.start == sp.start) defs }) (A.nubByEq (\a b -> a.start == b.start) (A.sortWith _.start (found <> more)))
+  len = SCU.length name
+  use i
+    | i.key == Just t.key && (if i.member then t.member == Just i.name else t.member == Nothing) =
+        Just { start: max i.span.start (i.span.end - len), end: i.span.end }
+    | otherwise = Nothing
+  operator = not (isNameChar (SCU.charAt 0 name))
+  -- (`infixl + - above ==`: its words)
+  fixities c
+    | operator && t.member == Nothing = A.concatMap (fixityLine c.source) (A.filter (\p -> p == 0 || SCU.charAt (p - 1) c.source == Just '\n') (A.range 0 (SCU.length c.source - 1)))
+    | otherwise = []
+  fixityLine src p =
+    let
+      e = fromMaybe (SCU.length src) (SCU.indexOf' (S.Pattern "\n") p src)
+      line = SCU.slice p e src
+      ws = wordsOf p line
+    in
+      if A.any (\w -> A.elem w.text [ "infixl", "infixr", "infix" ]) (A.take 1 ws) then map _.span (A.filter (\w -> w.text == name) ws) else []
+  wordsOf base line = go 0 []
+    where
+    n = SCU.length line
+    go i acc
+      | i >= n = acc
+      | SCU.charAt i line == Just ' ' = go (i + 1) acc
+      | otherwise =
+          let j = fromMaybe n (SCU.indexOf' (S.Pattern " ") i line)
+          in go j (A.snoc acc { text: SCU.slice i j line, span: { start: base + i, end: base + j } })
+  expected c
+    | operator = []
+    | otherwise = A.concatMap (\w -> let ex = expectation c.source w.span.end in wordsIn c.source ex.from ex.to) c.top.watches
+  wordsIn src from to = go from []
+    where
+    go i acc = case SCU.indexOf' (S.Pattern name) i src of
+      Just p | p + len <= to -> go (p + 1) (if wordAt src p name then A.snoc acc { start: p, end: p + len } else acc)
+      _ -> acc
+
+-- | why a name cannot be renamed to another, if it cannot: a primitive is
+-- | the runtime's; a name stays the kind it is (a variable, a capitalised
+-- | name, an operator), and is not qualified
+renameRefused :: Target -> String -> String -> Maybe String
+renameRefused t old new
+  | t.member == Nothing && not (S.contains (S.Pattern ".") t.key) = Just ("`" <> old <> "` is a primitive: its name is the runtime's")
+  | nameClass old /= nameClass new = Just ("`" <> new <> "` is not a name of the kind `" <> old <> "` is")
+  | otherwise = Nothing
+
+-- | a capitalised name (1), a variable (2), an operator (3), or none (0)
+nameClass :: String -> Int
+nameClass x = case SCU.charAt 0 x of
+  Just ch | ch >= 'A' && ch <= 'Z' -> if all isNameChar' then 1 else 0
+  Just ch | ch == '_' || (ch >= 'a' && ch <= 'z') -> if all isNameChar' then 2 else 0
+  Just _ | all (\d -> not (isNameChar' d) && not (A.elem d [ ' ', '\n', '(', ')', '[', ']', '{', '}', ',', '"', '`' ])) -> 3
+  _ -> 0
+  where
+  all p = SCU.length (SCU.takeWhile p x) == SCU.length x
+  isNameChar' d = d /= '/' && isNameChar (Just d)
+
+-- Symbols
+--------------------------------------------------------------------------------
+
+-- | a file's definitions, for an outline: each with where it is, where its
+-- | name is, and its tags or fields
+type DocSymbol = { name :: String, kind :: Int, span :: F.Span, selection :: F.Span, children :: Array { name :: String, kind :: Int, span :: F.Span } }
+
+-- | (the kinds are the Language Server Protocol's: enum, interface,
+-- | function, operator; enum member, field)
+symbols :: Checked -> Array DocSymbol
+symbols c = A.zipWith one c.own c.top.spans
+  where
+  ss = sites c
+  one o (Tuple _ sp) =
+    let
+      text = SCU.slice sp.start sp.end c.source
+      own = A.filter (\s -> s.span.start >= sp.start && s.span.end <= sp.end) ss
+      sel = maybe (nameIn c.source o.name sp) _.span (A.find (\s -> s.target.member == Nothing) own)
+      members = A.filter (\s -> isJust s.target.member) own
+      isData = S.take 5 text == "data "
+      kind
+        | isData = 10
+        | S.take 7 text == "theory " = 11
+        | not (isNameChar (SCU.charAt 0 o.name)) = 25
+        | otherwise = 12
+    in
+      { name: o.name, kind, span: sp, selection: sel
+      , children: map (\m -> { name: m.name, kind: if isData then 22 else 8, span: m.span }) members
+      }

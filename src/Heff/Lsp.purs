@@ -1,10 +1,14 @@
 -- | A language server (the Language Server Protocol, over stdio) for `.hf`
 -- | files: diagnostics, hover (`typeAt`), go to definition
--- | (`definitionAt`), formatting (`Heff.Format`).
+-- | (`definitionAt`), completion, formatting (`Heff.Format`), an outline
+-- | (`symbols`); and, over the whole project, references and renaming
+-- | (`occurrences`), and the symbols of every file.
 -- |
 -- | A document is elaborated with what it imports, from its text in the
 -- | editor; an import open in the editor is read from there too, else from
--- | disk.
+-- | disk.  The project -- every file under its root, with what each
+-- | imports -- is elaborated when it is asked about, and kept until a
+-- | document changes.
 module Heff.Lsp
   ( serve
   ) where
@@ -22,7 +26,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.String as S
 import Data.String.CodeUnits as SCU
-import Data.Traversable (for_)
+import Data.Traversable (for_, traverse)
 import Data.Tuple (Tuple(..))
 import Effect (Effect)
 import Effect.Exception (message, try)
@@ -30,9 +34,9 @@ import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Foreign.Object as FO
 import Heff.Cache (loadCached)
-import Heff.Driver (Checked, completionsAt, definitionAt, typeAt)
+import Heff.Driver (Checked, Occurrence, Target, completionsAt, definitionAt, elabProgram, errorsIn, occurrences, renameRefused, symbols, targetAt, typeAt)
 import Heff.Format (format)
-import Heff.Load (pathsFor)
+import Heff.Load (Paths, loadProgramWith, pathsFor)
 import Heff.Parse.Notation (Diag, Severity(..), Span)
 import Heff.Parse.Import (readImports)
 import Heff.Support.Diagnostic (lineCol, renderDiagMessage)
@@ -51,20 +55,23 @@ foreign import clearTimeoutImpl :: Timer -> Effect Unit
 foreign import uriPathImpl :: (String -> Maybe String) -> Maybe String -> String -> Maybe String
 foreign import pathUri :: String -> String
 foreign import absPath :: String -> String
+foreign import projectFilesImpl :: String -> Effect (Array String)
 
 -- | the documents open, by path; the last elaboration of each (of what
--- | text); the checks waiting for the typing to pause
+-- | text); the checks waiting for the typing to pause; the project last
+-- | elaborated, by its root (forgotten when a document changes)
 type St =
   { docs :: Map String { uri :: String, text :: String }
   , checked :: Map String { text :: String, program :: Array Checked }
   , timers :: Map String Timer
+  , project :: Maybe { root :: String, program :: Array Checked }
   , shutdown :: Boolean
   }
 
 -- | serve on stdin/stdout, with the standard library at `lib`
 serve :: String -> Effect Unit
 serve lib0 = do
-  st <- Ref.new { docs: Map.empty, checked: Map.empty, timers: Map.empty, shutdown: false }
+  st <- Ref.new { docs: Map.empty, checked: Map.empty, timers: Map.empty, project: Nothing, shutdown: false }
   listenImpl \body -> case jsonParser body of
     Left e -> logImpl ("not JSON: " <> e)
     Right msg -> handle (absPath lib0) st msg
@@ -158,6 +165,10 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
           , Tuple "documentFormattingProvider" J.jsonTrue
           -- (after `M.`, the module's definitions)
           , Tuple "completionProvider" (obj [ Tuple "triggerCharacters" (J.fromArray [ J.fromString "." ]) ])
+          , Tuple "referencesProvider" J.jsonTrue
+          , Tuple "renameProvider" (obj [ Tuple "prepareProvider" J.jsonTrue ])
+          , Tuple "documentSymbolProvider" J.jsonTrue
+          , Tuple "workspaceSymbolProvider" J.jsonTrue
           ]
       , Tuple "serverInfo" (obj [ Tuple "name" (J.fromString "heff") ])
       ]
@@ -171,6 +182,37 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
         (definitionAt program (offsetIn src p))
     "textDocument/completion" -> withProgram p \src program ->
       reply id $ J.fromArray $ maybe [] (\c -> map (\i -> obj [ Tuple "label" (J.fromString i.label), Tuple "kind" (num 3), Tuple "detail" (J.fromString i.detail) ]) (completionsAt c (offsetIn src p))) (A.last program)
+    "textDocument/documentSymbol" -> withProgram p \src program ->
+      reply id $ J.fromArray $ maybe [] (map (docSymbol src) <<< symbols) (A.last program)
+    -- (in the projects of the documents open)
+    "workspace/symbol" -> do
+      s <- Ref.read st
+      roots <- traverse (\f -> pathsFor lib f <#> \ps -> { root: ps.root, f }) (A.fromFoldable (Map.keys s.docs))
+      programs <- traverse (\r -> project lib st r.f) (A.nubByEq (\a b -> a.root == b.root) roots)
+      let query = S.toLower (fromMaybe "" (str [ "query" ] p))
+      reply id $ J.fromArray $ A.concatMap (\c ->
+        map (\y -> obj [ Tuple "name" (J.fromString y.name), Tuple "kind" (num y.kind), Tuple "containerName" (J.fromString c.module), Tuple "location" (obj [ Tuple "uri" (J.fromString (uriOf s c.path)), Tuple "range" (range c.source y.selection) ]) ])
+          (A.filter (\y -> S.contains (S.Pattern query) (S.toLower y.name)) (symbols c)))
+        (A.nubByEq (\a b -> a.path == b.path) (A.concat programs))
+    "textDocument/references" -> withTarget p \s _ t ->
+      let decl = fromMaybe true (path [ "context", "includeDeclaration" ] p >>= J.toBoolean)
+      in reply id $ J.fromArray $ map (location s) (A.filter (\o -> decl || not o.defines) t.occurrences)
+    "textDocument/prepareRename" -> withTarget p \_ off t ->
+      case renameRefused t.target t.name t.name, A.find (\o -> o.path == t.path && o.span.start <= off && off <= o.span.end) t.occurrences of
+        Just why, _ -> replyError id (-32803) why
+        Nothing, Just o -> reply id (obj [ Tuple "range" (range o.source o.span), Tuple "placeholder" (J.fromString t.name) ])
+        Nothing, Nothing -> replyError id (-32803) ("`" <> t.name <> "` is not written here")
+    "textDocument/rename" -> withTarget p \s _ t -> do
+      let new = fromMaybe "" (str [ "newName" ] p)
+      case renameRefused t.target t.name new of
+        Just why -> replyError id (-32803) why
+        Nothing -> do
+          checked <- renameChecked lib st t new
+          case checked of
+            Just why -> replyError id (-32803) why
+            Nothing -> reply id $ obj
+              [ Tuple "changes" $ J.fromObject $ FO.fromFoldable $ map (\os -> Tuple (uriOf s os.path) (J.fromArray (map (\o -> obj [ Tuple "range" (range o.source o.span), Tuple "newText" (J.fromString new) ]) os.occurrences))) (byFile t.occurrences)
+              ]
     "textDocument/formatting" -> do
       s <- Ref.read st
       case docPath p >>= \f -> Map.lookup f s.docs of
@@ -184,7 +226,12 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
             | otherwise -> reply id (J.fromArray [ obj [ Tuple "range" (range d.text { start: 0, end: SCU.length d.text }), Tuple "newText" (J.fromString t) ] ])
     _ -> replyError id (-32601) ("no method " <> m)
 
-  notification m p = case m of
+  notification m p = do
+    -- (a document changed: the project is elaborated again when asked about)
+    when (S.take 13 m == "textDocument/") (Ref.modify_ (_ { project = Nothing }) st)
+    notification' m p
+
+  notification' m p = case m of
     "exit" -> Ref.read st >>= \s -> exit' (if s.shutdown then 0 else 1)
     "textDocument/didOpen" -> for_ (docPath p) \f -> do
       let uri = fromMaybe "" (str [ "textDocument", "uri" ] p)
@@ -229,6 +276,24 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
           Just c | c.text == d.text -> k d.text c.program
           _ -> k d.text []
       _ -> k "" []
+
+  -- what the name at a request's position refers to, in the project of
+  -- its document: the name, and every occurrence of it
+  withTarget p k = do
+    s <- Ref.read st
+    case docPath p of
+      Just f | Just d <- Map.lookup f s.docs -> do
+        program <- project lib st f
+        let off = offsetIn d.text p
+        case A.find (\c -> c.path == f) program of
+          Just c | c.source == d.text, Just t <- targetAt (A.snoc (A.filter (\c' -> c'.path /= f) program) c) off ->
+            k s off { path: f, target: t.target, name: t.name, occurrences: occurrences program t.target t.name }
+          _ -> reply' J.jsonNull
+      _ -> reply' J.jsonNull
+    where
+    reply' r = case field "id" msg of
+      Just id -> reply id r
+      Nothing -> pure unit
 
 publish :: String -> Array Json -> Effect Unit
 publish uri ds = notify "textDocument/publishDiagnostics" (obj [ Tuple "uri" (J.fromString uri), Tuple "diagnostics" (J.fromArray ds) ])
@@ -288,3 +353,75 @@ diagnostic src d = obj $
     SWarning -> "W"
     SDebug -> "D"
   code = letter <> SCU.takeRight 4 ("0000" <> show d.code)
+
+-- The project
+--------------------------------------------------------------------------------
+
+-- | the project a document is in, every file of it elaborated, an open one
+-- | as its text is in the editor (the last one elaborated, if it is still
+-- | that project's)
+project :: String -> Ref St -> String -> Effect (Array Checked)
+project lib st f = do
+  ps <- pathsFor lib f
+  s <- Ref.read st
+  case s.project of
+    Just pr | pr.root == ps.root -> pure pr.program
+    _ -> do
+      program <- elabProject (readOpen s) ps f
+      Ref.modify_ (_ { project = Just { root: ps.root, program } }) st
+      pure program
+
+readOpen :: St -> String -> Effect String
+readOpen s p = maybe (readTextFile UTF8 p) (pure <<< _.text) (Map.lookup p s.docs)
+
+-- | every file of a project (and `f`, if it is not one), with what each
+-- | imports, elaborated as one program
+elabProject :: (String -> Effect String) -> Paths -> String -> Effect (Array Checked)
+elabProject read ps f = do
+  files <- projectFilesImpl ps.root
+  loads <- traverse (loadProgramWith read ps) (A.nub (A.snoc files f))
+  pure (elabProgram (A.nubByEq (\a b -> a.path == b.path) (A.concatMap _.sources loads)))
+
+-- | Why renaming would change what the program means, if it would: with
+-- | every occurrence renamed, the project is elaborated again, and the new
+-- | name must be written as often as the old one was, each time referring
+-- | to what was renamed -- not captured by a name already there -- and no
+-- | file may have more errors than it had.
+renameChecked :: String -> Ref St -> { path :: String, target :: Target, name :: String, occurrences :: Array Occurrence } -> String -> Effect (Maybe String)
+renameChecked lib st t new = do
+  s <- Ref.read st
+  ps <- pathsFor lib t.path
+  before <- project lib st t.path
+  let
+    texts = Map.fromFoldable (map (\os -> Tuple os.path (renamed os.occurrences)) (byFile t.occurrences))
+    renamed os = A.foldr (\o src -> SCU.take o.span.start src <> new <> SCU.drop o.span.end src) (maybe "" _.source (A.head os)) os
+  after <- elabProject (\p -> maybe (readOpen s p) pure (Map.lookup p texts)) ps t.path
+  let
+    target = case t.target.member of
+      Just _ -> t.target { member = Just new }
+      Nothing -> t.target { key = SCU.take (SCU.length t.target.key - SCU.length t.name) t.target.key <> new }
+    errors program = A.foldl (\n c -> n + A.length (errorsIn c)) 0 (A.nubByEq (\a b -> a.path == b.path) program)
+    count = A.length (occurrences after target new)
+  pure
+    if errors after > errors before then Just ("renaming `" <> t.name <> "` to `" <> new <> "` would make " <> show (errors after - errors before) <> " more error(s)")
+    else if count /= A.length t.occurrences then Just ("`" <> new <> "` is already a name some of these occurrences would refer to")
+    else Nothing
+
+-- | occurrences, by file
+byFile :: Array Occurrence -> Array { path :: String, occurrences :: Array Occurrence }
+byFile os = map (\p -> { path: p, occurrences: A.filter (\o -> o.path == p) os }) (A.nub (map _.path os))
+
+uriOf :: St -> String -> String
+uriOf s p = maybe (pathUri p) _.uri (Map.lookup p s.docs)
+
+location :: St -> Occurrence -> Json
+location s o = obj [ Tuple "uri" (J.fromString (uriOf s o.path)), Tuple "range" (range o.source o.span) ]
+
+docSymbol :: String -> { name :: String, kind :: Int, span :: Span, selection :: Span, children :: Array { name :: String, kind :: Int, span :: Span } } -> Json
+docSymbol src y = obj
+  [ Tuple "name" (J.fromString y.name)
+  , Tuple "kind" (num y.kind)
+  , Tuple "range" (range src { start: y.span.start, end: max y.span.end y.selection.end })
+  , Tuple "selectionRange" (range src y.selection)
+  , Tuple "children" (J.fromArray (map (\m -> obj [ Tuple "name" (J.fromString m.name), Tuple "kind" (num m.kind), Tuple "range" (range src m.span), Tuple "selectionRange" (range src m.span) ]) y.children))
+  ]

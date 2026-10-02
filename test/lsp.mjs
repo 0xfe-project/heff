@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // The language server (`heff lsp`), spoken to as an editor would: diagnostics
 // (of the editor's text, and of an import's unsaved text), hover and go to
-// definition (across modules, past non-ASCII text), formatting, shutdown.
+// definition (across modules, past non-ASCII text), completion, an outline,
+// references and renaming across the project, formatting, shutdown.
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -58,7 +59,8 @@ const open = (f, text) => notify("textDocument/didOpen", { textDocument: { uri: 
 try {
   const init = await request("initialize", { processId: process.pid, rootUri: pathToFileURL(root).href, capabilities: {} });
   const caps = init.result.capabilities;
-  expect("capabilities", caps.hoverProvider && caps.definitionProvider && caps.documentFormattingProvider && caps.textDocumentSync.change === 1, caps);
+  expect("capabilities", caps.hoverProvider && caps.definitionProvider && caps.documentFormattingProvider && caps.textDocumentSync.change === 1 &&
+    caps.referencesProvider && caps.renameProvider.prepareProvider && caps.documentSymbolProvider && caps.workspaceSymbolProvider, caps);
   notify("initialized", {});
 
   // a type error, in the editor's text (not the file's)
@@ -179,6 +181,54 @@ try {
     const d = await request("textDocument/definition", { textDocument: { uri: uri("lib/co.hf") }, position: at });
     expect("definition of a field " + what, d.result && d.result.range.start.line === hmapAt.line && d.result.range.start.character === hmapAt.character, d.result);
   }
+
+  // an outline: each definition, a data's tags and a theory's fields under it
+  const outline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/basics.hf") } });
+  const sym = (n) => outline.result && outline.result.find((s) => s.name === n);
+  expect("an outline", sym("Bool") && sym("Bool").kind === 10 && sym("Bool").children.map((c) => c.name).join() === "True,False" &&
+    sym("Monoid") && sym("Monoid").kind === 11 && sym("Monoid").children.map((c) => c.name).join() === "t,m" &&
+    sym("not") && sym("not").kind === 12 && sym("not").selectionRange.start.line === pos(basics, "not :").line, outline.result);
+  const wsym = await request("workspace/symbol", { query: "twic" });
+  expect("the project's symbols", wsym.result && wsym.result.some((s) => s.name === "twice" && s.location.uri === uri("test/surface/basics.hf")), wsym.result);
+
+  // a recursive call is the global it calls
+  const recDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "map f ys") });
+  expect("definition of a recursive call", recDef.result && recDef.result.range.start.line === pos(basics, "map :").line, recDef.result);
+
+  // references: the signature, each equation, each use, a watch; across modules
+  const where = (r) => `${r.uri.slice(r.uri.lastIndexOf("/") + 1)}:${r.range.start.line}:${r.range.start.character}-${r.range.end.character}`;
+  const refs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)"), context: { includeDeclaration: true } });
+  const notLines = refs.result && refs.result.filter((r) => r.uri === uri("test/surface/basics.hf")).map((r) => r.range.start.line);
+  expect("references in a file", notLines && [pos(basics, "not :"), pos(basics, "not True"), pos(basics, "not False"), pos(basics, "not (not"), pos(basics, ">>> not")].every((p) => notLines.includes(p.line)) && notLines.length === 6, refs.result);
+  const usesOnly = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)"), context: { includeDeclaration: false } });
+  expect("references without the definition", usesOnly.result && usesOnly.result.length === 3, usesOnly.result);
+  const a = disk("test/modules/a.hf");
+  open("test/modules/a.hf", a);
+  await diagnosticsOf(uri("test/modules/a.hf"));
+  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: true } });
+  const acrossAt = across.result ? across.result.map(where) : [];
+  const qNot = pos(qualified, "A.not");
+  expect("references across modules", acrossAt.includes(`b.hf:${pos(good, "not", 1).line}:${pos(good, "not", 1).character}-${pos(good, "not", 1).character + 3}`) &&
+    acrossAt.includes(`qualified.hf:${qNot.line}:${qNot.character + 2}-${qNot.character + 5}`) && acrossAt.filter((x) => x.startsWith("a.hf")).length === 3, acrossAt);
+
+  // renaming: every occurrence, in every file; refused for a local, a
+  // primitive, a name of another kind, and a name already there
+  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not True") });
+  expect("prepare a rename", prep.result && prep.result.placeholder === "not" && prep.result.range.start.line === pos(a, "not True").line, prep);
+  const prepLocal = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
+  expect("no rename of a local", !prepLocal.result, prepLocal);
+  const prepPrim = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "intAdd") });
+  expect("no rename of a primitive", prepPrim.error && prepPrim.error.message.includes("primitive"), prepPrim);
+  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "neg" });
+  const edits = ren.result && ren.result.changes;
+  expect("a rename", edits && edits[uri("test/modules/a.hf")].length === 3 && edits[uri("test/modules/b.hf")].length === 2 &&
+    edits[uri("test/modules/qualified.hf")].length === 2 && Object.values(edits).flat().every((e) => e.newText === "neg" && e.range.end.character - e.range.start.character === 3), edits);
+  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "Not" });
+  expect("no rename to another kind of name", wrongKind.error, wrongKind);
+  // (`b` defines `twice`, which would hide the imported `not` renamed to it)
+  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "twice" });
+  expect("no rename to a name already there", captured.error && captured.error.message.includes("twice"), captured);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hf") } });
 
   // formatting: one edit, the whole text; what does not parse is left, with a warning
   const messy = "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";

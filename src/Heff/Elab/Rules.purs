@@ -12,6 +12,7 @@ import Data.Array as A
 import Data.Either (Either(..))
 import Data.Lazy (Lazy, defer, force)
 import Data.List ((:))
+import Data.List as L
 import Data.Foldable (for_)
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String as Text
@@ -578,7 +579,7 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
 recordName :: ElabEnv -> V.Ty -> Name -> Span -> V.Ty -> E Unit
 recordName e a x sp ty = case a of
   V.Decode dn | V.Global k <- dn.head, sp.end - sp.start == Text.length x || sp.end - sp.start == Text.length x + 1 ->
-    record { span: sp, name: x, key: Just k, ty: defer \_ -> P.render (prtIn e ty) }
+    record { span: sp, name: x, key: Just k, member: true, ty: defer \_ -> P.render (prtIn e ty) }
   _ -> pure unit
 
 -- | `tags`: where the cases' tags are written
@@ -676,12 +677,14 @@ find :: Span -> Name -> Syn
 find sp x = Syn \e ->
   case findLocal e x of
     Right res@(Tuple _ ty) -> do
-      record { span: sp, name: x, key: Nothing, ty: defer \_ -> P.render (prtIn e ty) }
+      -- (the definition's own name, local 0: the global it is)
+      let self = if L.findIndex (_ == x) e.scope.names == Just (e.scope.len - 1) then e.self else Nothing
+      record { span: sp, name: x, key: self, member: false, ty: defer \_ -> P.render (prtIn e ty) }
       pure res
     Left Delayed ->
       failWith sp 19 (txt "variable" <+> txt x <+> txt "is the definition being elaborated: it is in hand only under a lambda, where a type is expected of it (an argument, a branch, the result -- not a case scrutinee)")
     Left NotInScope -> case lookupGlobalKey e.globals x of
       Just (Tuple key ge) -> do
-        record { span: sp, name: x, key: Just key, ty: defer \_ -> P.render (prtIn e ge.type_) }
+        record { span: sp, name: x, key: Just key, member: false, ty: defer \_ -> P.render (prtIn e ge.type_) }
         pure (Tuple (M.global key ge.value) ge.type_)
       Nothing -> failWith sp 8 (txt "no such variable" <+> txt x <+> txt "in scope")

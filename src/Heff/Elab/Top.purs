@@ -392,7 +392,7 @@ elabDecl key g n = do
     self = V.reflect (V.Global k) (pure V.Id) (pure aval) Nothing
     gSelf = addGlobalEntry k { syntax: Syn.Opaque, tySyntax: a.stx, value: self, type_: aval } g
     tmE = emptyElabEnvFor gSelf k
-    tmE' = tmE { scope = letAt (BDelayedBy 1) d.name self aval tmE.scope }
+    tmE' = tmE { scope = letAt (BDelayedBy 1) d.name self aval tmE.scope, self = Just k }
   modify_ \st -> st { selfKey = Just k }
   t <- R.runChk d.tm tmE' aval `catchError` \e -> do
     modify_ \st -> st { selfKey = Nothing }

@@ -35,7 +35,10 @@ npm link          # puts `heff` on the PATH
 ```
 
 For VS Code, `editors/vscode` is an extension: highlighting, and the
-language server (diagnostics, hover, go to definition, formatting).
+language server (diagnostics, hover, go to definition, completion,
+formatting, an outline; and over the whole project: references, renaming,
+symbols).  A rename is refused when it would change what the program
+means: a name captured by one already there, or a new error.
 
 ## Commands
 

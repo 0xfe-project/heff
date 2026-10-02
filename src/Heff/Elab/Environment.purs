@@ -101,26 +101,29 @@ createNominative (ForDescriptive n) ev a = V.reflect n.head (pure n.spine) (pure
 
 -- | `lams`: how many lambdas the elaboration has entered in this
 -- | definition -- under none, a recursive use would be computed while the
--- | definition itself is (evaluation is by value), so `rec` refuses it
-type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor, lams :: Int }
+-- | definition itself is (evaluation is by value), so `rec` refuses it;
+-- | `self`: the key of the definition being elaborated, bound as local 0,
+-- | so that a use of itself is recorded as the global it is
+type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor, lams :: Int, self :: Maybe Name }
 
 evalEnv :: ElabEnv -> EvalEnv
 evalEnv e = { local: e.scope.locals, global: e.globals }
 
 emptyElabEnv :: Globals -> ElabEnv
-emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals, lams: 0 }
+emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals, lams: 0, self: Nothing }
 
 emptyElabEnvFor :: Globals -> Name -> ElabEnv
 emptyElabEnvFor globals x =
-  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals, lams: 0 }
+  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals, lams: 0, self: Nothing }
 
 -- Failure
 --------------------------------------------------------------------------------
 
 -- | What elaboration learns along the way, for the IDE's queries: what a
 -- | name at a span resolved to, and its type (rendered lazily, since most
--- | are never asked for).
-type Info = { span :: Span, name :: Name, key :: Maybe Name, ty :: Lazy String }
+-- | are never asked for).  `member`: a tag or a field, `key` then the
+-- | type it is of.
+type Info = { span :: Span, name :: Name, key :: Maybe Name, member :: Boolean, ty :: Lazy String }
 
 -- | A step of elaboration, for explaining it: a metavariable created or
 -- | solved, a unification, an argument delayed.  The text is rendered on
