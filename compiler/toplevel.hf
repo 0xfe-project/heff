@@ -1,0 +1,959 @@
+-- Top-level elaboration: a port of `Heff.Elab.Top`.  Notation becomes
+-- judgments (the dispatcher's functions are one knot record, `tk`),
+-- declarations become globals, each elaborated in a fresh state; a
+-- definition whose body fails is an error hole of its type.  This first
+-- slice leaves out watches, tests and primitive-name validation.
+
+import array as A
+import compiler.clauses as Cl
+import compiler.conversion as C
+import compiler.dict as D
+import compiler.environment
+import compiler.globals as G
+import compiler.memoed as M
+import compiler.meta as Mt
+import compiler.notation
+import compiler.params as Pm
+import compiler.print as Pr
+import compiler.rules as R
+import compiler.surface as Su
+import compiler.syntax as Sx
+import compiler.top as T
+import compiler.unify as U
+import compiler.value as V
+import map as Mp
+import prelude
+
+-- Diagnostics (parser codes are numbered from 200)
+--------------------------------------------------------------------------------
+
+failP : {a : Type} -> Pm.Span -> Int -> String -> E a
+failP sp code msg =
+  throwE
+    { code = 200 + code
+    , severity = SError
+    , msg = msg
+    , span = sp
+    , note = Nothing
+    }
+
+unexpectedNotation : {a : Type} -> Ntn -> String -> E a
+unexpectedNotation n c = failP (ntnSpan n) 3 ("unexpected notation for " ++ c)
+
+tryStep : {a : Type}
+        -> Pair (Either Diag a) ElabSt
+        -> Pair (Either Diag (Either Diag a)) ElabSt
+tryStep (MkPair r st) = MkPair (Right r) st
+
+-- | a computation, its failure as a value (the state kept either way)
+tryE : {a : Type} -> E a -> E (Either Diag a)
+tryE m = \st -> tryStep (m st)
+
+-- The self, as local 0
+--------------------------------------------------------------------------------
+
+type SL = { el : Int -> Sx.Tm -> Sx.Tm, ty : Int -> Sx.Ty -> Sx.Ty }
+
+selfElF : SL -> String -> Int -> Sx.Tm -> Sx.Tm
+selfElF r k d t = case t of
+  SGlobal x -> if strEq x k then SLocal d else SGlobal x
+  SCode a -> SCode (r.ty d a)
+  SApp f a -> SApp (r.el d f) (r.el d a)
+  SLam dom (MkAbs x b) -> SLam (r.ty d dom) (MkAbs x (r.el (d + 1) b))
+  SLam dom (AbsConst b) -> SLam (r.ty d dom) (AbsConst (r.el d b))
+  SCons c -> SCons (D.mapD (r.el d) c)
+  SProj e l -> SProj (r.el d e) l
+  STag tg as -> STag tg (A.map (r.el d) as)
+  SMatch e cs ->
+    SMatch
+      (r.el d e)
+      (D.mapD
+         (\p -> case p of
+          MkPair xs b -> MkPair xs (r.el (d + A.length xs) b))
+         cs)
+  SSpecialize e l v -> SSpecialize (r.el d e) l (r.el d v)
+  SIs e -> SIs (r.el d e)
+  SRec e -> SRec (r.el d e)
+  SImplicit x e -> SImplicit x (r.el d e)
+  SMetaApp m ix ty2 -> SMetaApp m ix (r.ty d ty2)
+  _ -> t
+
+selfTyF : SL -> String -> Int -> Sx.Ty -> Sx.Ty
+selfTyF r k d t = case t of
+  SDecode e -> SDecode (r.el d e)
+  SFunction level dom (MkAbs x b) implicit ->
+    SFunction level (r.ty d dom) (MkAbs x (r.ty (d + 1) b)) implicit
+  SFunction level dom (AbsConst b) implicit ->
+    SFunction level (r.ty d dom) (AbsConst (r.ty d b)) implicit
+  SRecord level ft -> SRecord level (D.mapD (r.ty d) ft)
+  SSum vs -> SSum (D.mapD (A.map (r.ty d)) vs)
+  SIsTy a -> SIsTy (r.ty d a)
+  SPrimArray a -> SPrimArray (r.ty d a)
+  _ -> t
+
+selfWalk : String -> SL
+selfWalk k =
+  { el = \d t -> selfElF (selfWalk k) k d t
+  , ty = \d t -> selfTyF (selfWalk k) k d t
+  }
+
+-- | the global it was mentioned as, while it was not yet one: the
+-- | definition itself, local 0
+selfAsLocal : String -> Sx.Tm -> Sx.Tm
+selfAsLocal k t = (selfWalk k).el 0 t
+
+-- Judgments from notation
+--------------------------------------------------------------------------------
+
+data Judgment = ChkJ R.Chk | SynJ R.Syn | TypJ R.Typ
+
+fromSynN : Pm.Case -> R.Syn -> Judgment
+fromSynN N j = SynJ j
+fromSynN De j =
+  SynJ
+    (MkSyn (\e -> do
+     pr <- R.runSyn j (R.withFor e ForNominative)
+     case pr of
+       MkPair res a -> pure (MkPair (M.isM res) a)))
+
+fromChkN : Pm.Case -> R.Chk -> Judgment
+fromChkN N j = ChkJ j
+fromChkN De j =
+  ChkJ
+    (MkChk (\e a -> do
+     res <- R.runChk j (R.withFor e ForNominative) a
+     pure (M.isM res)))
+
+fromTypN : Pm.Case -> R.Typ -> Judgment
+fromTypN N j = TypJ j
+fromTypN De j =
+  TypJ
+    (MkTyp (\e -> do
+     res <- R.runTyp j (R.withFor e ForNominative)
+     pure (M.isTy res)))
+
+fromTypD : Pm.Case -> Pm.Span -> R.Typ -> E Judgment
+fromTypD N sp j = failP sp 4 "cannot use descriptive syntax in nominal position"
+fromTypD De sp j = pure (TypJ j)
+
+-- | notation that can only be checked, never synthesised
+checksOnly : Ntn -> Bool
+checksOnly n = case (getGroup n).head of
+  NTag _ _ -> True
+  NBlock "struct" _ _ _ -> True
+  NBlock "match" _ _ _ -> True
+  NTuple _ _ -> True
+  Keyword "abandon" _ -> True
+  Infix _ (Keyword "=>" _) _ -> True
+  _ -> False
+
+implicitLambda : Ntn -> Bool
+implicitLambda (Infix (NBrace _ _) (Keyword "=>" _) _) = True
+implicitLambda _ = False
+
+intoSyn : Pm.Span -> Judgment -> E R.Syn
+intoSyn sp (ChkJ _) =
+  failP sp 0 "this notation must be put in a checking position"
+intoSyn sp (SynJ j) = pure j
+intoSyn sp (TypJ _) =
+  failP sp 0 "a type used as an element must be in checking position"
+
+-- | the dispatcher's functions, knotted
+type TK =
+  { parseJ : Pm.Case -> Ntn -> E Judgment
+  , chkJ : Pm.Case -> Ntn -> E R.Chk
+  , synJ : Pm.Case -> Ntn -> E R.Syn
+  , typJ : Pm.Case -> Ntn -> E R.Typ
+  }
+
+-- | a check, recovered from where it fails -- where its notation is not
+-- | read, too
+recoveringChk : E R.Chk -> E R.Chk
+recoveringChk m = do
+  r <- tryE m
+  case r of
+    Right c -> pure (R.recovering c)
+    Left d -> pure (R.recovering (MkChk (\e a -> throwE d)))
+
+-- | an argument: where it does not check, an error hole
+argumentF : TK -> Ntn -> E R.Chk
+argumentF tk n = recoveringChk (tk.chkJ N n)
+
+-- | an application to `n`, from `start` (where the function is) to it
+elimF : TK -> Int -> R.Syn -> Ntn -> E R.Syn
+elimF tk start s (NField x sp) = pure (R.recordElim sp s x)
+elimF tk start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = do
+  a <- argumentF tk n
+  pure (R.functionElimNamed { start = start, end = sp.end } x s a)
+elimF tk start s (NBrace n sp) = do
+  a <- argumentF tk n
+  pure (R.functionElimImplicit { start = start, end = sp.end } s a)
+elimF tk start s n = do
+  a <- argumentF tk n
+  pure
+      (R.functionElimC
+         (checksOnly n)
+         { start = start, end = (ntnSpan n).end }
+         s
+         a)
+
+elimAll : TK -> Int -> R.Syn -> List Ntn -> E R.Syn
+elimAll tk start s Nil = pure s
+elimAll tk start s (Cons n rest) = do
+  s' <- elimF tk start s n
+  elimAll tk start s' rest
+
+binderF : TK -> Ntn -> E R.Binder
+binderF tk (Infix (Ident x _) (Keyword ":" _) n) = do
+  t <- tk.typJ N n
+  pure (Named x t)
+binderF tk (NBrace (Infix (Ident x _) (Keyword ":" _) n) sp) = do
+  t <- tk.typJ N n
+  pure (NamedImplicit sp x t)
+binderF tk n = do
+  t <- tk.typJ N n
+  pure (Anonymous t)
+
+fieldDeclF : TK -> Ntn -> E R.FieldDeclaration
+fieldDeclF tk (Infix (Ident x _) (Keyword ":" _) n) = do
+  a <- tk.typJ N n
+  pure { name = x, typ = a }
+fieldDeclF tk n =
+  failP (ntnSpan n) 1 "expected a field declaration of the form `x : A`"
+
+fieldSetF : TK -> Pm.Case -> Ntn -> E R.FieldSetting
+fieldSetF tk c (Infix (Ident x xsp) (Keyword ":=" _) n) = do
+  v <- recoveringChk (tk.chkJ c n)
+  pure { name = x, chk = v, span = ntnSpan n, nameSpan = xsp }
+fieldSetF tk c n =
+  failP (ntnSpan n) 2 "expected a field setting of the form `x = v`"
+
+traverseEL : {a b : Type} -> (a -> E b) -> List a -> E (List b)
+traverseEL f Nil = pure Nil
+traverseEL f (Cons x xs) = do
+  y <- f x
+  ys <- traverseEL f xs
+  pure (Cons y ys)
+
+smallF : TK -> Ntn -> E R.SmallTyp
+smallF tk n = do
+  t <- tk.typJ N n
+  pure (R.asSmall (ntnSpan n) t)
+
+variantF : TK -> Ntn -> E (Pair String (Array R.SmallTyp))
+variantF tk n = case (getGroup n).head of
+  NTag x _ -> do
+    typs <- traverseEL (\m -> smallF tk m) (getGroup n).args
+    pure (MkPair x (A.fromList typs))
+  _ -> unexpectedNotation n "variant in a sum type"
+
+foldlR : {a b : Type} -> (a -> b -> b) -> b -> List a -> b
+foldlR f z Nil = z
+foldlR f z (Cons x xs) = f x (foldlR f z xs)
+
+doBind : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
+doBind sp e x rest =
+  Juxt (Juxt (Ident "bind" sp) e) (Infix x (Keyword "=>" sp) rest)
+
+doStep : Pm.Span -> Ntn -> Ntn -> Ntn
+doStep sp (Infix x (Keyword "<-" _) e) rest = doBind sp e x rest
+doStep sp e rest = doBind sp e (Ident "_" sp) rest
+
+doLast : Pm.Span -> List Ntn -> Ntn -> Maybe Ntn
+doLast sp init (Infix _ (Keyword "<-" _) _) = Nothing
+doLast sp init last = Just (foldlR (\s rest -> doStep sp s rest) last init)
+
+-- | `do` ... with whichever `bind` is in scope
+doBlock : Pm.Span -> List Ntn -> Maybe Ntn
+doBlock sp stmts = case reverse stmts of
+  Nil -> Nothing
+  Cons last init -> doLast sp (reverse init) last
+
+-- | a whole value needs no new name: it is in hand already
+bareAltRefused : {a : Type} -> String -> Pm.Span -> E a
+bareAltRefused x sp =
+  failP
+    sp
+    3
+    ("`"
+     ++ x
+     ++ "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already")
+
+patName : Ntn -> E String
+patName (Ident x _) = pure x
+patName p =
+  failP (ntnSpan p) 3 "an argument of a `case` pattern is a pattern or a name"
+
+doPat : Ntn -> E (Pair String (List String))
+doPat n = case (getGroup n).head of
+  NTag x _ -> do
+    xs <- traverseEL (\p -> patName p) (getGroup n).args
+    pure (MkPair x xs)
+  -- extension: `_ => e` handles every tag not listed
+  Ident x sp ->
+    if strEq x "_" && length (getGroup n).args == 0
+      then pure (MkPair "_" Nil)
+      else bareAltRefused x sp
+  _ ->
+    failP
+      (ntnSpan n)
+      3
+      "a `case` pattern is a pattern: a tag applied to patterns, a literal, or `_`"
+
+doCase : TK -> Ntn -> E (Pair String (Pair (Array String) R.Chk))
+doCase tk (Infix p (Keyword "=>" _) bodyN) = do
+  px <- doPat p
+  case px of
+    MkPair x xs -> do
+      body <- recoveringChk (tk.chkJ N bodyN)
+      pure (MkPair x (MkPair (A.fromList xs) body))
+doCase tk n = unexpectedNotation n "case in a match statement"
+
+specializationF : TK -> Ntn -> E (Pair String R.Chk)
+specializationF tk (NTuple (Cons (Infix (NField x _) (Keyword ":=" _) n) Nil) _) = do
+  c <- tk.chkJ N n
+  pure (MkPair x c)
+specializationF tk n = unexpectedNotation n "specialization"
+
+allL : {a : Type} -> (a -> Bool) -> List a -> Bool
+allL p Nil = True
+allL p (Cons x xs) = p x && allL p xs
+
+isIdentA : Ntn -> Bool
+isIdentA (Ident _ _) = True
+isIdentA _ = False
+
+flatPat : Group -> Bool
+flatPat gr = case gr.head of
+  NTag _ _ -> allL isIdentA gr.args
+  Ident _ _ -> length gr.args == 0
+  _ -> False
+
+-- | flat: a tag applied to names, or `_`; anything else goes through the
+-- | match-tree compiler
+flatCaseAlt : Ntn -> Bool
+flatCaseAlt (Infix p (Keyword "=>" _) _) = flatPat (getGroup p)
+flatCaseAlt _ = True
+
+tagSpanOf : Ntn -> List (Pair String Pm.Span) -> List (Pair String Pm.Span)
+tagSpanOf p acc = case (getGroup p).head of
+  NTag x tsp -> Cons (MkPair x tsp) acc
+  _ -> acc
+
+tagSpans : List Ntn -> List (Pair String Pm.Span)
+tagSpans Nil = Nil
+tagSpans (Cons (Infix p (Keyword "=>" _) _) rest) = tagSpanOf p (tagSpans rest)
+tagSpans (Cons _ rest) = tagSpans rest
+
+checkBareOne : Group -> E Unit
+checkBareOne gr = case gr.head of
+  Ident x xsp ->
+    if length gr.args == 0 && not (strEq x "_")
+      then bareAltRefused x xsp
+      else pure MkUnit
+  _ -> pure MkUnit
+
+checkBareAlts : List Ntn -> E Unit
+checkBareAlts Nil = pure MkUnit
+checkBareAlts (Cons (Infix p (Keyword "=>" _) _) rest) = do
+  checkBareOne (getGroup p)
+  checkBareAlts rest
+checkBareAlts (Cons _ rest) = checkBareAlts rest
+
+-- | the head of a group, parsed
+parseHeadF : TK -> Pm.Case -> Ntn -> E Judgment
+parseHeadF tk c n = case n of
+  -- Variable rule
+  Ident x sp -> pure (fromSynN c (R.find sp x))
+  -- Type formers
+  Infix domN (Keyword "->" _) codN -> do
+    dom <- binderF tk domN
+    cod <- tk.typJ N codN
+    pure (fromTypN c (R.functionFormation dom cod))
+  NBlock "sig" Nothing fields sp -> do
+    fieldDecls <- traverseEL (\m -> fieldDeclF tk m) fields
+    fromTypD c sp (R.recordFormation fieldDecls)
+  NBlock "sum" Nothing variantNs sp -> do
+    variants <- traverseEL (\m -> variantF tk m) variantNs
+    fromTypD c sp (R.sumFormation (D.fromList variants))
+  Keyword "Type" _ -> pure (fromTypN c (R.universeFormation SmallU))
+  -- Introduction rules (except for tag)
+  Infix (Ident x _) (Keyword "=>" _) bodyN -> do
+    body <- recoveringChk (tk.chkJ c bodyN)
+    pure (ChkJ (R.functionIntro (ntnSpan n) x body))
+  -- extension: `\(x : T) -> e` annotates the binder
+  Infix (Infix (Ident x _) (Keyword ":" _) tyN) (Keyword "=>" _) bodyN -> do
+    dom <- tk.typJ N tyN
+    bj <- tk.parseJ N bodyN
+    case bj of
+      SynJ body -> pure (fromSynN c (R.functionIntroSyn x dom body))
+      ChkJ j ->
+        pure
+          (fromChkN
+             c
+             (R.functionIntroAnn
+                (ntnSpan n)
+                x
+                dom
+                (if implicitLambda bodyN then j else R.implicitLams j)))
+      TypJ j ->
+        pure
+          (fromChkN
+             c
+             (R.functionIntroAnn
+                (ntnSpan n)
+                x
+                dom
+                (R.universeIntro (ntnSpan bodyN) j)))
+  -- extension: `{x} => e` names an implicit argument
+  Infix (NBrace (Ident x _) _) (Keyword "=>" _) bodyN -> do
+    body <- recoveringChk (tk.chkJ c bodyN)
+    pure (ChkJ (R.functionIntroImplicit (ntnSpan n) x body))
+  NBlock "struct" Nothing fields sp -> do
+    fieldSettings <- traverseEL (\m -> fieldSetF tk c m) fields
+    pure (ChkJ (R.recordIntro sp fieldSettings))
+  -- extension: `do` ... with whichever `bind` is in scope
+  NBlock "do" Nothing stmts sp -> case doBlock sp stmts of
+    Just n' -> tk.parseJ c n'
+    Nothing -> failP sp 12 "a `do` block ends with an expression"
+  NBlock "match" (Just scrutN) casesN sp ->
+    if allL flatCaseAlt casesN
+      then do
+        scrut <- tk.synJ N scrutN
+        cases <- traverseEL (\m -> doCase tk m) casesN
+        pure
+            (fromChkN
+               c
+               (R.sumElim sp scrut (tagSpans casesN) (D.fromList cases)))
+      -- extension: nested patterns and literals, compiled into the flat
+      -- matches above, on a name for the scrutinee, bound once
+      else do
+        checkBareAlts casesN
+        case Cl.caseTree sp casesN of
+          Left err -> failP err.span 3 err.msg
+          Right r -> do
+            scrut <- tk.synJ N scrutN
+            body <- tk.chkJ N r.tree
+            pure (fromChkN c (R.caseLet r.scrutinee scrut body))
+  -- Misc.
+  Keyword "abandon" sp -> pure (fromChkN c (R.abandonChk sp))
+  Infix n0 (Keyword "~" _) n1 -> do
+    px <- specializationF tk n1
+    case px of
+      MkPair x cc -> do
+        s <- tk.synJ N n0
+        pure (fromSynN c (R.recordSpec (ntnSpan n) s x cc))
+  Infix n0 (Keyword ":" _) n1 -> do
+    cc <- tk.chkJ c n0
+    t <- tk.typJ N n1
+    pure (SynJ (R.annot t cc))
+  Keyword "Int" _ -> pure (fromTypN c R.primInt)
+  NInt i _ -> pure (fromSynN c (R.litInt i))
+  Keyword "Float" _ -> pure (fromTypN c R.primFloat)
+  NFloat x _ -> pure (fromSynN c (R.litFloat x))
+  Keyword "String" _ -> pure (fromTypN c R.primString)
+  NString s _ -> pure (fromSynN c (R.litString s))
+  _ -> failP (ntnSpan n) 3 "unexpected notation"
+
+parseArray : TK -> Pm.Case -> Ntn -> Pm.Span -> List Ntn -> E Judgment
+parseArray tk c n ksp (Cons n0 Nil) = do
+  a <- tk.typJ N n0
+  pure (fromTypN c (R.primArray a))
+parseArray tk c n ksp args = failP (ntnSpan n) 3 "`Array` takes one type"
+
+parseF : TK -> Pm.Case -> Ntn -> E Judgment
+parseF tk c n = case (getGroup n).head of
+  NTag x tsp -> do
+    args <- traverseEL (\m -> argumentF tk m) (getGroup n).args
+    pure (fromChkN c (R.sumIntro (ntnSpan n) tsp x args))
+  Keyword "Array" ksp -> parseArray tk c n ksp (getGroup n).args
+  _ ->
+    if length (getGroup n).args == 0
+      then parseHeadF tk c (getGroup n).head
+      else do
+        h <- parseHeadF tk N (getGroup n).head
+        s0 <- intoSyn (ntnSpan (getGroup n).head) h
+        s <- elimAll tk (ntnSpan (getGroup n).head).start s0 (getGroup n).args
+        pure (fromSynN c s)
+
+chkHeadOf : Ntn -> R.Syn -> R.Chk
+chkHeadOf n j = case (getGroup n).head of
+  Ident x _ -> R.autoRec (ntnSpan n) x (R.apply (ntnSpan n) j)
+  _ -> R.apply (ntnSpan n) j
+
+chkF : TK -> Pm.Case -> Ntn -> E R.Chk
+chkF tk c n = do
+  j <- tk.parseJ c n
+  case j of
+    -- (`{x} => e` binds the implicit argument itself)
+    ChkJ j2 -> pure (if implicitLambda n then j2 else R.implicitLams j2)
+    SynJ j2 -> pure (R.implicitLams (chkHeadOf n j2))
+    TypJ j2 -> pure (R.universeIntro (ntnSpan n) j2)
+
+synF : TK -> Pm.Case -> Ntn -> E R.Syn
+synF tk c n = do
+  j <- tk.parseJ c n
+  intoSyn (ntnSpan n) j
+
+typF : TK -> Pm.Case -> Ntn -> E R.Typ
+typF tk c n = do
+  j <- tk.parseJ c n
+  case j of
+    ChkJ j2 -> pure (R.universeElim LargeU j2)
+    SynJ j2 -> pure (R.universeElimSyn (ntnSpan n) j2)
+    TypJ j2 -> pure j2
+
+tk : TK
+tk =
+  { parseJ = \c n -> parseF tk c n
+  , chkJ = \c n -> chkF tk c n
+  , synJ = \c n -> synF tk c n
+  , typJ = \c n -> typF tk c n
+  }
+
+-- Declarations
+--------------------------------------------------------------------------------
+
+definition : Ntn -> E (Pair Ntn Ntn)
+definition (Infix n0 (Keyword ":=" _) n1) = pure (MkPair n0 n1)
+definition n = unexpectedNotation n "notation of the form `<head> := <body>`"
+
+annotN : Ntn -> E (Pair Ntn Ntn)
+annotN (Infix n0 (Keyword ":" _) n1) = pure (MkPair n0 n1)
+annotN n = unexpectedNotation n "type-annotated expression"
+
+identE : Ntn -> E String
+identE (Ident x _) = pure x
+identE n = unexpectedNotation n "identifier"
+
+type ArgBinding =
+  { span : Pm.Span, name : String, typ : R.Typ, implicit : Bool }
+
+mkArgBinding : Pm.Span -> String -> R.Typ -> Bool -> ArgBinding
+mkArgBinding span name typ implicit =
+  { span = span, name = name, typ = typ, implicit = implicit }
+
+argBinding : Ntn -> E ArgBinding
+argBinding (Infix n0 (Keyword ":" _) n1) = do
+  x <- identE n0
+  a <- tk.typJ N n1
+  pure (mkArgBinding (ntnSpan (Infix n0 (Keyword ":" Pm.noSpan) n1)) x a False)
+argBinding (NBrace (Infix n0 (Keyword ":" _) n1) sp) = do
+  x <- identE n0
+  a <- tk.typJ N n1
+  pure (mkArgBinding sp x a True)
+argBinding n =
+  unexpectedNotation n "argument binding of the form `<name> : <type>`"
+
+unpackArgs : Ntn -> E (Pair String (List ArgBinding))
+unpackArgs n = do
+  x <- identE (getGroup n).head
+  args <- traverseEL (\m -> argBinding m) (getGroup n).args
+  pure (MkPair x args)
+
+withOne : ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
+withOne ab (MkPair t c) =
+  if ab.implicit
+    then MkPair
+        (R.functionFormation (NamedImplicit ab.span ab.name ab.typ) t)
+        (R.functionIntroImplicit ab.span ab.name c)
+    else MkPair
+        (R.functionFormation (Named ab.name ab.typ) t)
+        (R.functionIntro ab.span ab.name c)
+
+withArgs : List ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
+withArgs Nil base = base
+withArgs (Cons ab rest) base = withOne ab (withArgs rest base)
+
+type DeclJ = { name : String, ty : R.Typ, tm : R.Chk, prim : Bool }
+
+mkDeclJ : String -> R.Typ -> R.Chk -> Bool -> DeclJ
+mkDeclJ name ty tm prim = { name = name, ty = ty, tm = tm, prim = prim }
+
+declOfParts : String -> Pair R.Typ R.Chk -> Bool -> E DeclJ
+declOfParts name (MkPair ty tm) prim = pure (mkDeclJ name ty tm prim)
+
+theoryD : Ntn -> E DeclJ
+theoryD n = do
+  pn <- definition n
+  case pn of
+    MkPair patN bodyN -> do
+      pa <- unpackArgs patN
+      case pa of
+        MkPair name args -> do
+          body <- tk.chkJ De bodyN
+          declOfParts
+              name
+              (withArgs args (MkPair (MkTyp (\e -> pure (M.univ LargeU))) body))
+              False
+
+explicitNames : List ArgBinding -> List String
+explicitNames Nil = Nil
+explicitNames (Cons ab rest) =
+  if ab.implicit then explicitNames rest else Cons ab.name (explicitNames rest)
+
+defPlain : Ntn -> E DeclJ
+defPlain n = do
+  pn <- definition n
+  case pn of
+    MkPair headN bodyN -> do
+      pt <- annotN headN
+      case pt of
+        MkPair patN tyN -> do
+          pa <- unpackArgs patN
+          case pa of
+            MkPair name args -> do
+              returnTyp <- tk.typJ N tyN
+              body <- tk.chkJ De bodyN
+              declOfParts name (withArgs args (MkPair returnTyp body)) False
+
+-- extension: a definition by equations, `def f : T where <equations> end`
+defD : Ntn -> E DeclJ
+defD (Infix headN (Keyword ":" ksp) tyW) = case Cl.stripWhere tyW of
+  Just (MkPair tyN eqs) -> do
+    pa <- unpackArgs headN
+    case pa of
+      MkPair name args -> do
+        bodyN <- case Cl.desugar name (explicitNames args) eqs (ntnSpan tyW) of
+          Left err -> failP err.span 10 err.msg
+          Right b -> pure b
+        returnTyp <- tk.typJ N tyN
+        body <- tk.chkJ De bodyN
+        declOfParts name (withArgs args (MkPair returnTyp body)) False
+  Nothing -> defPlain (Infix headN (Keyword ":" ksp) tyW)
+defD n = defPlain n
+
+declJ : Ntn -> E DeclJ
+declJ (MDecl Nil "theory" n _) = theoryD n
+declJ (MDecl Nil "def" n _) = defD n
+-- extension: `primitive name : T`, implemented by the runtime
+declJ (MDecl Nil "primitive" (Infix (Ident x _) (Keyword ":" _) tyN) _) = do
+  ty <- tk.typJ N tyN
+  pure
+      (mkDeclJ
+         x
+         ty
+         (MkChk (\e a -> pure { stx = SPrim x, val = \u -> Nom VOpaque }))
+         True)
+declJ n = unexpectedNotation n "top-level declaration"
+
+-- Elaborating one declaration
+--------------------------------------------------------------------------------
+
+-- | fail, if errors were recovered from (they are reported, this is not)
+recoveredCheck : E Unit
+recoveredCheck = do
+  ds <- gets (\st -> (core st).recovered)
+  if length ds == 0
+      then pure MkUnit
+      else failElsewhere Pm.noSpan "errors recovered from"
+
+anyL : {a : Type} -> (a -> Bool) -> List a -> Bool
+anyL p Nil = False
+anyL p (Cons x xs) = p x || anyL p xs
+
+unsolvedPoisoned : V.MetaCtx -> Int -> Bool
+unsolvedPoisoned mc m = case Mp.lookup compareInt m mc of
+  Just me -> case me.sol of
+    Just _ -> False
+    Nothing -> True
+  Nothing -> False
+
+-- | fail, unreported, if an implicit argument is left that an error hole
+-- | kept from being inferred
+poisonedLeft : E Unit
+poisonedLeft = do
+  ps <- gets (\st -> (core st).poisoned)
+  mc <- gets (\st -> (core st).metas)
+  if anyL (\m -> unsolvedPoisoned mc m) (Mp.keys ps)
+      then failElsewhere
+          Pm.noSpan
+          "an implicit argument an error kept from being inferred"
+      else pure MkUnit
+
+-- | a constraint unification could not solve (the messages are plainer
+-- | than the reference's until the printer is ported)
+stuckDiag : G.Globals -> Pm.Span -> Postponed -> E Diag
+stuckDiag g fallback p =
+  if p.failed
+    then pure
+        { code = 311
+        , severity = SError
+        , msg = "the implicit arguments found do not fit together"
+        , span = fallback
+        , note = Nothing
+        }
+    else pure
+        { code = 327
+        , severity = SError
+        , msg =
+            "cannot infer an implicit argument: what is known of it does not say what it is"
+        , span = fallback
+        , note = Nothing
+        }
+
+type Elaborated =
+  { name : String
+  , key : String
+  , prim : Bool
+  , entry : G.Entry
+  , failed : Maybe Diag
+  }
+
+mkElaborated : String -> String -> Bool -> G.Entry -> Maybe Diag -> Elaborated
+mkElaborated name key prim entry failed =
+  { name = name, key = key, prim = prim, entry = entry, failed = failed }
+
+-- | the entry a definition is stored as, from its core syntax alone
+entryFor : G.Globals -> String -> Bool -> Sx.Ty -> Sx.Tm -> G.Entry
+entryFor g k prim tyStx bodyStx =
+  { syntax = bodyStx
+  , tySyntax = tyStx
+  , value =
+      if prim then T.primValueOf g k tyStx else T.valueOf g k tyStx bodyStx
+  , type_ = T.typeOf g tyStx
+  }
+
+errEntry : G.Globals -> String -> Sx.Ty -> G.Entry
+errEntry g k tyStx =
+  { syntax = SAbandon
+  , tySyntax = tyStx
+  , value = V.errorHole (T.typeOf g tyStx)
+  , type_ = T.typeOf g tyStx
+  }
+
+checkStuck : G.Globals -> Pm.Span -> List Postponed -> E Unit
+checkStuck g sp Nil = pure MkUnit
+checkStuck g sp (Cons p rest) = do
+  d <- stuckDiag g sp p
+  throwE (a := Unit) d
+
+checkUnsolved : List Mt.Unsolved -> E Unit
+checkUnsolved Nil = pure MkUnit
+checkUnsolved (Cons u rest) =
+  throwE
+    { code = 328
+    , severity = SError
+    , msg =
+        "cannot infer the implicit argument `"
+        ++ u.name
+        ++ "`; give it as `{...}`"
+    , span = u.span
+    , note = Nothing
+    }
+
+withSelf : ElabEnv -> String -> Scope -> ElabEnv
+withSelf e k sc =
+  { scope = sc
+  , globals = e.globals
+  , elabFor = e.elabFor
+  , lams = e.lams
+  , self = Just k
+  }
+
+-- | the definition mentions itself as the global it will be; pattern
+-- | unification knows it by its key
+bodyEnv : G.Globals -> String -> String -> V.Ty -> ElabEnv
+bodyEnv gSelf k name aval =
+  withSelf
+    (emptyElabEnvFor gSelf k)
+    k
+    (letAt
+       (BDelayedBy 1)
+       name
+       (V.reflect (HGlobal k) (\u -> SpId) (\u -> aval) Nothing)
+       aval
+       (emptyElabEnvFor gSelf k).scope)
+
+-- | the whole body phase: checked, settled, zonk-ready
+bodyPhase : DeclJ -> G.Globals -> String -> V.Ty -> E M.El
+bodyPhase d gSelf k aval = do
+  t <- R.runChk d.tm (bodyEnv gSelf k d.name aval) aval
+  -- the implicit arguments: every one inferred, and substituted in
+  stuck <- Mt.settle gSelf
+  recoveredCheck
+  poisonedLeft
+  checkStuck gSelf Pm.noSpan stuck
+  unsolved <- Mt.unsolvedMetas
+  checkUnsolved unsolved
+  pure t
+
+keyOf : (String -> String) -> DeclJ -> String
+keyOf key d = if d.prim then d.name else key d.name
+
+elabOut : (String -> String)
+        -> G.Globals
+        -> DeclJ
+        -> Sx.Ty
+        -> V.MetaCtx
+        -> Either Diag M.El
+        -> E Elaborated
+elabOut key g d tyStx mc (Left failed) =
+  pure
+    (mkElaborated
+       d.name
+       (keyOf key d)
+       d.prim
+       (errEntry g (keyOf key d) tyStx)
+       (Just failed))
+elabOut key g d tyStx mc (Right t) =
+  pure
+    (mkElaborated
+       d.name
+       (keyOf key d)
+       d.prim
+       (entryFor
+          g
+          (keyOf key d)
+          d.prim
+          tyStx
+          (selfAsLocal (keyOf key d) (U.zonkEl mc t.stx)))
+       Nothing)
+
+elabBody : (String -> String)
+         -> G.Globals
+         -> Ntn
+         -> DeclJ
+         -> M.Ty
+         -> E Elaborated
+elabBody key g n d a = do
+  modify (withCore (setSelfKey (Just (keyOf key d))))
+  body <-
+    tryE
+      (bodyPhase
+         d
+         (G.addEntry
+            (keyOf key d)
+            { syntax = SOpaque
+            , tySyntax = a.stx
+            , value =
+                V.reflect
+                  (HGlobal (keyOf key d))
+                  (\u -> SpId)
+                  (\u -> M.tyN a)
+                  Nothing
+            , type_ = M.tyN a
+            }
+            g)
+         (keyOf key d)
+         (M.tyN a))
+  modify (withCore (setSelfKey Nothing))
+  mc <- gets (\st -> (core st).metas)
+  elabOut key g d (U.zonkTy mc a.stx) mc body
+
+-- | Elaborate one declaration.  A definition whose type elaborates and
+-- | whose body does not is a definition still, `failed`: an error hole
+-- | of its type.
+elabDecl : (String -> String) -> G.Globals -> Ntn -> E Elaborated
+elabDecl key g n = do
+  modify (withCore (setSelfKey Nothing))
+  d <- declJ n
+  a <- R.runTyp d.ty (emptyElabEnv g)
+  -- (a type with an error hole is no type to give the definition)
+  recoveredCheck
+  elabBody key g n d a
+
+-- The module
+--------------------------------------------------------------------------------
+
+type TopResult =
+  { globals : G.Globals
+  , diags : List Diag
+  , keys : List String
+  , broken : List String
+  }
+
+mkTop : G.Globals -> List Diag -> List String -> List String -> TopResult
+mkTop globals diags keys broken =
+  { globals = globals, diags = diags, keys = keys, broken = broken }
+
+failedDiag : Elaborated -> List Diag -> List Diag
+failedDiag r diags = case r.failed of
+  Just d -> Cons d diags
+  Nothing -> diags
+
+brokenOf : String -> Ntn -> List String -> List String
+brokenOf modName n broken = broken
+
+topTake : String
+        -> TopResult
+        -> Ntn
+        -> Pair (Either Diag Elaborated) ElabSt
+        -> TopResult
+topTake modName acc n (MkPair (Left d) st) =
+  mkTop acc.globals (Cons d acc.diags) acc.keys (brokenOf modName n acc.broken)
+topTake modName acc n (MkPair (Right r) st) =
+  mkTop
+    (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals))
+    (failedDiag r acc.diags)
+    (Cons r.key acc.keys)
+    acc.broken
+
+topOne : String -> TopResult -> Ntn -> TopResult
+topOne modName acc (MDecl Nil ">" n sp) = acc
+topOne modName acc (MDecl Nil "test" n sp) = acc
+topOne modName acc n =
+  topTake
+    modName
+    acc
+    n
+    (runE (elabDecl (\x -> modName ++ "." ++ x) acc.globals n) emptySt)
+
+topGo : String -> TopResult -> List Ntn -> TopResult
+topGo modName acc Nil =
+  mkTop acc.globals (reverse acc.diags) (reverse acc.keys) (reverse acc.broken)
+topGo modName acc (Cons n rest) = topGo modName (topOne modName acc n) rest
+
+-- | every declaration of a module, each elaborated in a fresh state
+topModule : String -> G.Globals -> List Ntn -> TopResult
+topModule modName g0 ntns = topGo modName (mkTop g0 Nil Nil Nil) ntns
+
+-- Checking source text, whole
+--------------------------------------------------------------------------------
+
+appendT : {a : Type} -> List a -> List a -> List a
+appendT Nil ys = ys
+appendT (Cons x xs) ys = Cons x (appendT xs ys)
+
+withParse : TopResult -> List Diag -> TopResult
+withParse t ds = mkTop t.globals (appendT ds t.diags) t.keys t.broken
+
+noImports : String -> Bool
+noImports x = False
+
+checkRead : String -> Su.Read -> TopResult
+checkRead modName r =
+  withParse (topModule modName G.emptyGlobals r.ntns) r.diags
+
+-- | a module's source, read and elaborated (this slice: no imports)
+checkSource : String -> String -> TopResult
+checkSource modName src = checkRead modName (Su.readProgram noImports src)
+
+-- | a definition's stored core, printed (the differential's probe)
+bodyDump : TopResult -> String -> String
+bodyDump t k = case G.lookupEntry t.globals k of
+  Just e -> Pr.showEl e.syntax
+  Nothing -> "<no such definition>"
+
+tyDump : TopResult -> String -> String
+tyDump t k = case G.lookupEntry t.globals k of
+  Just e -> Pr.showTy e.tySyntax
+  Nothing -> "<no such definition>"
+
+-- >>> length (topModule "m" G.emptyGlobals Nil).keys
+-- 0
+
+-- >>> (checkSource "m" "two : Int\ntwo = 2\n").keys
+-- ["m.two"]
+
+-- >>> tyDump (checkSource "m" "two : Int\ntwo = 2\n") "m.two"
+-- "SPrimInt"
+
+-- >>> bodyDump (checkSource "m" "two : Int\ntwo = 2\n") "m.two"
+-- "(SIs (SLitInt 2))"
+
+-- >>> bodyDump (checkSource "m" "idInt : Int -> Int\nidInt x = x\n") "m.idInt"
+-- "(SLam (SFunction Small SPrimInt (AbsConst SPrimInt) False) (MkAbs \"x\" (SIs (SLocal 0))))"
+
+-- >>> length (checkSource "m" "bad : Int\nbad = \"no\"\n").diags
+-- 1
