@@ -1,0 +1,106 @@
+-- Evaluation: a port of `Heff.Core.Evaluation`.  Syntax is evaluated
+-- against the local environment; the globals hold each definition's
+-- value.  Elements and types evaluate through one another, so the two
+-- functions are the fields of one record, `evaluator`, as fmt/cst.hf's
+-- grammar ties its own knot.  (The original stages: it compiles syntax
+-- once into a function of the environment.  The staging does not survive
+-- the knot's etas, so this port just evaluates; same meaning.)
+
+import array as A
+import compiler.dict as D
+import compiler.params as P
+import compiler.syntax as Sx
+import compiler.value as V
+import map as M
+import prelude
+
+type Globals = M.Map String V.V
+
+type Env = V.Locals V.V
+
+type Evaluator =
+  { el : Globals -> P.Case -> Sx.Tm -> Env -> V.Ev V.V
+  , ty : Globals -> P.Case -> Sx.Ty -> Env -> V.Ev V.Ty
+  }
+
+globalValue : Globals -> String -> V.V
+globalValue g x = case M.lookup compareString x g of
+  Just v -> v
+  Nothing -> abandon
+
+spineOfIdxs : Env -> Array Int -> V.Spine V.V
+spineOfIdxs vs idxs = A.foldl (\sp i -> SpApp sp (V.localsAt vs i)) SpId idxs
+
+evalElF : Evaluator -> Globals -> P.Case -> Sx.Tm -> Env -> V.Ev V.V
+evalElF r g c (SLocal i) vs = Nom (V.localsAt vs i)
+evalElF r g c (SGlobal x) vs = Nom (globalValue g x)
+evalElF r g c (SCode a) vs = V.emap (\t -> V.code t) (r.ty g c a vs)
+evalElF r g c (SApp t0 t1) vs =
+  V.ebind (\f -> V.app f (\u -> V.nom (r.el g N t1 vs))) (r.el g N t0 vs)
+evalElF r g c (SLam dom (MkAbs x t)) vs =
+  V.epure
+    c
+    (VLam (\u -> V.nom (r.ty g N dom vs)) (MkClo x vs (\vs2 -> r.el g c t vs2)))
+evalElF r g c (SLam dom (AbsConst t)) vs =
+  V.epure c (VLam (\u -> V.nom (r.ty g N dom vs)) (CloConst (r.el g c t vs)))
+evalElF r g c (SCons fields) vs =
+  V.epure c (VCons (D.mapD (\t -> r.el g c t vs) fields))
+evalElF r g c (SProj t x) vs = V.ebind (\v -> V.proj v x) (r.el g N t vs)
+evalElF r g c (SSpecialize t x t') vs =
+  Nom (V.specialize (V.nom (r.el g N t vs)) x (V.nom (r.el g N t' vs)))
+evalElF r g c (SIs t) vs = Become (V.nom (r.el g N t vs))
+evalElF r g c (SImplicit x e) vs = r.el g c e vs
+evalElF r g c (SMetaApp m idxs ty) vs =
+  Nom (V.metaEl m (spineOfIdxs vs idxs) (V.nom (r.ty g N ty vs)))
+-- statically opaque: data, its elimination, literals, primitives, and
+-- guarded recursion (which is also what keeps a self-call from unfolding
+-- forever)
+evalElF r g c (STag x ts) vs = Nom VOpaque
+evalElF r g c (SMatch t arms) vs = Nom VOpaque
+evalElF r g c SOpaque vs = Nom VOpaque
+evalElF r g c SAbandon vs = Nom VOpaque
+evalElF r g c (SRec t) vs = Nom VOpaque
+evalElF r g c (SPrim x) vs = Nom VOpaque
+evalElF r g c (SLitInt n) vs = Nom VOpaque
+evalElF r g c (SLitFloat n) vs = Nom VOpaque
+evalElF r g c (SLitString s) vs = Nom VOpaque
+
+evalAbsTy : Evaluator -> Globals -> Sx.Abs Sx.Ty -> Env -> V.Clo V.V V.Ty
+evalAbsTy r g (MkAbs x t) vs = MkClo x vs (\vs2 -> r.ty g N t vs2)
+evalAbsTy r g (AbsConst t) vs = CloConst (r.ty g N t vs)
+
+fieldOfTy : Evaluator -> Globals -> Sx.Ty -> Env -> V.Field
+fieldOfTy r g t vs2 = MkField (V.nom (r.ty g N t vs2)) Nothing
+
+sumArg : Evaluator -> Globals -> Env -> Sx.Ty -> P.Th V.Ty
+sumArg r g vs t u = V.nom (r.ty g N t vs)
+
+evalTyF : Evaluator -> Globals -> P.Case -> Sx.Ty -> Env -> V.Ev V.Ty
+evalTyF r g c (SU u) vs = Nom (VU u)
+evalTyF r g c (SDecode t) vs = V.decodeEv (r.el g c t vs)
+evalTyF r g c (SFunction level dom cod implicit) vs =
+  Nom
+    (VFunction level (V.nom (r.ty g N dom vs)) (evalAbsTy r g cod vs) implicit)
+evalTyF r g c (SRecord level fieldTypes) vs =
+  Describe (VRecord level vs (D.mapD (fieldOfTy r g) fieldTypes))
+evalTyF r g c (SSum st) vs = Describe (VSum (P.variantsMap (sumArg r g vs) st))
+evalTyF r g c (SIsTy t) vs = Become (V.nom (r.ty g N t vs))
+evalTyF r g c SPrimInt vs = Nom VPrimInt
+evalTyF r g c SPrimFloat vs = Nom VPrimFloat
+evalTyF r g c SPrimString vs = Nom VPrimString
+evalTyF r g c (SPrimArray a) vs = Nom (VPrimArray (V.nom (r.ty g N a vs)))
+
+evaluator : Evaluator
+evaluator =
+  { el = \g c s vs -> evalElF evaluator g c s vs
+  , ty = \g c s vs -> evalTyF evaluator g c s vs
+  }
+
+eval : Globals -> P.Case -> Sx.Tm -> Env -> V.Ev V.V
+eval g c s vs = evaluator.el g c s vs
+
+evalTy : Globals -> P.Case -> Sx.Ty -> Env -> V.Ev V.Ty
+evalTy g c s vs = evaluator.ty g c s vs
+
+-- >>> V.levelOf (V.nom (evalTy M.empty N SPrimInt LNil))
+-- Small
