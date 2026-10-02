@@ -15,7 +15,7 @@ const fail = (what, extra = "") => { failed++; console.log(`FAIL ${what}\n${extr
 
 rmSync(dir, { recursive: true, force: true });
 mkdirSync(dir, { recursive: true });
-writeFileSync(join(dir, "project.hf"), '-- a project of its own: the cache goes to its root\n\nname : String\nname = "cache-run"\n');
+writeFileSync(join(dir, "package.json"), '{ "name": "cache-run", "heff": {} }\n');
 writeFileSync(join(dir, "c.hf"), "import prelude\n\nn : Int\nn = 3\n");
 writeFileSync(join(dir, "b.hf"), "import prelude\nimport c\n\nm : Int\nm = n * 2\n");
 writeFileSync(join(dir, "a.hf"), "import prelude\nimport b\n\n-- >>> m + 1\n");

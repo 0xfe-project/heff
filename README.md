@@ -136,9 +136,11 @@ by an order of their keys (balanced trees), to be imported by a name:
 
 A module is a file, named by its path from the project's root:
 `parse/surface.hf` is `parse.surface`.  The root is the nearest directory
-above the file with a `project.hf` (a module like any other: the
-project's `name`), else the file's own directory.  What is not in the
-project is looked for in the standard library, `lib/`.
+above the file whose `package.json` has a `"heff"` field (a project is
+an npm package; see `"heff"` in this repository's own), else the file's
+own directory.  What is not in the project is looked for in the standard
+library, `lib/`, then among the installed packages (`node_modules/`):
+a package `foo` holds `foo.bar` at `node_modules/foo/bar.hf`.
 
 - Imports come first in a file, one per line: `import dom`.
 - `import dom as D` brings `dom`'s definitions in as `D.sleep`, `D.Node`,
@@ -171,7 +173,7 @@ again, for whoever handles it.
   `Co (dom <+> (state s)) Unit`, and `heff app` writes it as a script for
   a page.  Where it goes on the page is the app's to find, by `select` or
   `xpath`.
-- `lib/stdio.hf`, `lib/proc.hf`, `lib/fs.hf`, `lib/time.hf`,
+- `lib/stdio.hf`, `lib/process.hf`, `lib/fs.hf`, `lib/time.hf`,
   `lib/net.hf`: a program's worlds, one effect each -- the standard
   streams, the process (arguments, environment, exit), files, time, the
   network.  A program sums the ones it lives in, `stdio <+> fs`, and

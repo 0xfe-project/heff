@@ -1,7 +1,7 @@
 -- | Finding a program's files.  A module is a file, named by its path from
 -- | the project's root: `parse.surface` is `ROOT/parse/surface.hf`.  The root
--- | is the nearest directory above the file given with a `project.hf`, else
--- | the file's own directory.  A module not in the project is looked for in
+-- | is the nearest directory above the file given whose `package.json` has a
+-- | `"heff"` field, else the file's own directory.  A module not in the project is looked for in
 -- | the standard library (`lib/`), then among the installed packages
 -- | (`node_modules/`, npm's): a package `foo` holds `foo.bar` at
 -- | `node_modules/foo/bar.hf`, and its own files import one another by
@@ -34,18 +34,27 @@ dirname p = case S.lastIndexOf (S.Pattern "/") p of
   Just i -> S.take i p
   Nothing -> "."
 
--- | the root of the project a file is in
+-- | the root of the project a file is in: the nearest directory above
+-- | it whose `package.json` has a "heff" field (npm's, see the README)
 pathsFor :: String -> String -> Effect Paths
 pathsFor lib file = do
   let start = dirname file
   let
     up d = do
-      found <- exists (d <> "/project.hf")
+      found <- isRoot d
       if found then pure d
       else if d == "/" || d == "." || d == "" then pure start
       else up (dirname d)
   root <- up start
   pure { root, lib }
+
+isRoot :: String -> Effect Boolean
+isRoot d = do
+  pkg <- exists (d <> "/package.json")
+  if not pkg then pure false
+  else do
+    txt <- readTextFile UTF8 (d <> "/package.json")
+    pure (S.contains (S.Pattern "\"heff\"") txt)
 
 -- | the module a file of the project is; one of the standard library is
 -- | the library's (`lib/co.hf` is `co`), wherever the project's root is

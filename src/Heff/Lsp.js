@@ -45,9 +45,13 @@ export const absPath = (p) => resolve(p);
 // the `.hf` files of the project at `root`.  package.json's `"heff":
 // { "sources": [...] }` names the project's module directories: those are
 // walked, with the root's own `.hf` files.  Without it, every directory
-// is, except another project's (one with its own project.hf), a hidden
+// is, except another project's (one with a "heff" package.json of its own), a hidden
 // one, or one the root's .gitignore names (`/output`, `node_modules`: a
 // name, not a pattern).
+const isRoot = (d) => {
+  try { return JSON.parse(readFileSync(join(d, "package.json"), "utf8")).heff !== undefined; } catch (_) { return false; }
+};
+
 export const projectFilesImpl = (root) => () => {
   const files = [];
   const walk = (d) => {
@@ -56,7 +60,7 @@ export const projectFilesImpl = (root) => () => {
     for (const e of entries) {
       if (e.name.startsWith(".") || ignored.includes(e.name)) continue;
       const p = join(d, e.name);
-      if (e.isDirectory()) { if (!existsSync(join(p, "project.hf"))) walk(p); }
+      if (e.isDirectory()) { if (!isRoot(p)) walk(p); }
       else if (e.isFile() && e.name.endsWith(".hf")) files.push(p);
     }
   };
@@ -66,7 +70,7 @@ export const projectFilesImpl = (root) => () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
     if (pkg.heff && Array.isArray(pkg.heff.sources)) sources = pkg.heff.sources;
   } catch (_) {}
-  if (!existsSync(join(root, "project.hf"))) return files;
+  if (!isRoot(root)) return files;
   if (sources) {
     for (const e of readdirSync(root, { withFileTypes: true }))
       if (e.isFile() && e.name.endsWith(".hf")) files.push(join(root, e.name));
