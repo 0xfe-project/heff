@@ -34,6 +34,7 @@ import Data.Array as A
 import Data.Array.NonEmpty as NEA
 import Data.Foldable (for_)
 import Data.Either (Either(..))
+import Data.List (List(..), (:))
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Number as Number
 import Data.String as S
@@ -1018,16 +1019,19 @@ withScope xs p = do
   pure x
 
 -- | as many as there are (a failure that reads nothing ends them)
+-- | (`many` and `sepBy1` gather newest first, into a list: an array
+-- | copied per item is a copy live per pending continuation -- memory
+-- | quadratic in the count, for a list of thousands)
 many :: forall a. P a -> P (Array a)
-many p = go []
+many p = go Nil
   where
   go acc = do
     b <- atBoundary
     t <- peek
-    if b || not (startsItem t) then pure acc
+    if b || not (startsItem t) then pure (A.reverse (A.fromFoldable acc))
     else do
       x <- p
-      go (A.snoc acc x)
+      go (x : acc)
   startsItem t = startsAtom t || t.kind == "var" || (t.kind == "punct" && t.text == "(")
 
 many1 :: forall a. P a -> P (Array a)
@@ -1042,8 +1046,8 @@ sepBy1 sep p = do
   let
     go acc = do
       t <- peek
-      if t.text == sep then next *> p >>= \y -> go (A.snoc acc y) else pure acc
-  go [ x ]
+      if t.text == sep then next *> p >>= \y -> go (y : acc) else pure (A.reverse (A.fromFoldable acc))
+  go (x : Nil)
 
 expectAnn :: P Tok
 expectAnn = do

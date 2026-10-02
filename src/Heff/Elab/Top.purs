@@ -623,8 +623,9 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
   -- IDE, its trace, the errors it recovered from, then `ds`
   after acc st ds = acc
     { diags = acc.diags <> A.concatMap reported st.recovered <> ds
-    , infos = acc.infos <> st.infos
-    , trace = acc.trace <> st.trace
+    -- (newest first in the state; chronological here)
+    , infos = acc.infos <> A.reverse (A.fromFoldable st.infos)
+    , trace = acc.trace <> A.reverse (A.fromFoldable st.trace)
     }
   -- (a use of a definition that did not elaborate is that definition's
   -- error, reported there; so are errors recovered from, as they were)

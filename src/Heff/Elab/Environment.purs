@@ -7,7 +7,6 @@ import Data.Either (Either(..))
 import Effect (Effect)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
 import Control.Monad.State (State, modify_, runState)
-import Data.Array as A
 import Data.Map as Map
 import Data.Set (Set)
 import Data.Set as Set
@@ -139,8 +138,12 @@ type TraceEvent = { span :: Span, kind :: String, text :: Lazy String }
 -- | fail); `poisoned`: the metavariables an error hole met, which it did
 -- | not solve -- what fails for want of them is not an error of its own.
 -- | It starts empty for every definition and is dropped at its end.
+-- | `infos` and `trace` grow at every step of a recursion as deep as the
+-- | term: each is a list, newest first, so the versions the recursion's
+-- | frames hold share their tails (an array copied at each step is a copy
+-- | live per frame -- memory quadratic in the depth)
 type ElabSt =
-  { infos :: Array Info
+  { infos :: List Info
   , recovered :: Array Diag
   , poisoned :: Set Int
   , metas :: V.MetaCtx
@@ -148,7 +151,7 @@ type ElabSt =
   -- (`failed`: retried and found contradictory, kept to be reported)
   , postponed :: Array { shape :: CtxShape, left :: V.El, right :: V.El, failed :: Boolean }
   , delayed :: Array Delayed
-  , trace :: Array TraceEvent
+  , trace :: List TraceEvent
   -- the definition being elaborated: let-bound to the global it will
   -- be, which pattern unification passes through (`Unify.patternArgs`)
   , selfKey :: Maybe Name
@@ -159,7 +162,7 @@ type ElabSt =
 newtype Delayed = Delayed { ty :: V.Ty, check :: ExceptT Diag (State ElabSt) Unit }
 
 emptySt :: ElabSt
-emptySt = { infos: [], recovered: [], poisoned: Set.empty, metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], selfKey: Nothing }
+emptySt = { infos: Nil, recovered: [], poisoned: Set.empty, metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: Nil, selfKey: Nothing }
 
 
 
@@ -171,7 +174,7 @@ runE :: forall a. E a -> ElabSt -> Tuple (Either Diag a) ElabSt
 runE m st = runState (runExceptT m) st
 
 traceE :: Span -> String -> Lazy String -> E Unit
-traceE span kind text = modify_ (\s -> sinkPushImpl { span, kind, text } (s { trace = A.snoc s.trace { span, kind, text } }))
+traceE span kind text = modify_ (\s -> sinkPushImpl { span, kind, text } (s { trace = { span, kind, text } : s.trace }))
 
 foreign import enableSinkImpl :: Effect Unit
 foreign import sinkPushImpl :: forall a. TraceEvent -> a -> a
@@ -190,7 +193,7 @@ tryPure :: forall a. (Unit -> a) -> Either String a
 tryPure = tryPureImpl Right Left
 
 record :: Info -> E Unit
-record i = modify_ (\s -> s { infos = A.snoc s.infos i })
+record i = modify_ (\s -> s { infos = i : s.infos })
 
 -- | elaborator codes are numbered from 300
 failWith :: forall a. Span -> Int -> Doc -> E a

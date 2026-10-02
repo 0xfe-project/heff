@@ -96,7 +96,7 @@ freshMeta len locals ty name sp = do
     idxs = A.reverse (A.range 0 (len - 1)) # (\xs -> if len == 0 then [] else xs)
     spine = A.foldl (\sp' i -> V.App sp' (V.localsAt locals i)) V.Id idxs
   mc <- gets _.metas
-  modify_ \st -> st { trace = A.snoc st.trace { span: sp, kind: "meta", text: defer \_ -> "?" <> show m <> " (" <> name <> ") : " <> showTy mc len ty } }
+  modify_ \st -> st { trace = { span: sp, kind: "meta", text: defer \_ -> "?" <> show m <> " (" <> name <> ") : " <> showTy mc len ty } : st.trace }
   pure { stx: S.MetaApp m idxs (readbTy len ty), val: V.metaEl m spine ty }
 
 -- | a type, as the metacontext `mc` has it
@@ -358,7 +358,7 @@ traceSolve :: Int -> S.El -> U Unit
 traceSolve m stx = do
   mc <- gets _.metas
   case Map.lookup m mc of
-    Just e -> modify_ \st -> st { trace = A.snoc st.trace { span: e.span, kind: "solve", text: defer \_ -> "?" <> show m <> " (" <> e.name <> ") := " <> showSol mc stx } }
+    Just e -> modify_ \st -> st { trace = { span: e.span, kind: "solve", text: defer \_ -> "?" <> show m <> " (" <> e.name <> ") := " <> showSol mc stx } : st.trace }
     Nothing -> pure unit
 
 lams :: Int -> S.El -> S.El
