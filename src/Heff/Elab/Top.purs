@@ -37,7 +37,7 @@ import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, lookup
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
 import Heff.Core.Print (prtElR)
-import Heff.Core.Rename (displayName)
+import Heff.Core.Rename (displayName, selfAsLocal)
 import Data.Map as Map
 import Heff.Core.Value as V
 import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, emptyElabEnv, emptyElabEnvFor, emptySt, letAt, runE, tryPure)
@@ -179,7 +179,7 @@ parseHead c n = case n of
     dom <- typ N tyN
     bj <- parse N bodyN
     case bj of
-      SynJ body -> pure (fromSynN c (R.functionIntroSyn (ntnSpan n) x dom body))
+      SynJ body -> pure (fromSynN c (R.functionIntroSyn x dom body))
       ChkJ j ->
         let body = if implicitLambda bodyN then j else R.implicitLams j
         in pure (fromChkN c (R.functionIntroAnn (ntnSpan n) x dom body))
@@ -384,19 +384,22 @@ elabDecl key g n = do
   let
     aval = M.tyN a
     k = if d.prim then d.name else key d.name
-    tmE = emptyElabEnvFor g k
     -- the definition mentions itself as the global it will be, not as a
     -- local of another name (the two would not convert); pattern
-    -- unification knows it by its key, and passes it through
+    -- unification knows it by its key, and passes it through -- so a
+    -- solution may mention it, and the global is there, as it is now:
+    -- not yet defined
     self = V.reflect (V.Global k) (pure V.Id) (pure aval) Nothing
+    gSelf = addGlobalEntry k { syntax: Syn.Opaque, tySyntax: a.stx, value: self, type_: aval } g
+    tmE = emptyElabEnvFor gSelf k
     tmE' = tmE { scope = letAt (BDelayedBy 1) d.name self aval tmE.scope }
   modify_ \st -> st { selfKey = Just k }
   t <- R.runChk d.tm tmE' aval `catchError` \e -> do
     modify_ \st -> st { selfKey = Nothing }
     throwError e
   -- the implicit arguments: every one inferred, and substituted in
-  stuck <- settle g
-  for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
+  stuck <- settle gSelf
+  for_ (A.head stuck) \p -> stuckDiag gSelf (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError
     { code: 328, severity: SError, span: u.span, note: Nothing
@@ -405,7 +408,9 @@ elabDecl key g n = do
   mc <- gets _.metas
   let
     tyStx = zonkTy mc a.stx
-    bodyStx = zonkEl mc t.stx
+    -- (the global it was mentioned as, while it was not yet one: the
+    -- definition itself, local 0)
+    bodyStx = selfAsLocal k (zonkEl mc t.stx)
   when (d.prim && not (isPrim d.name)) $ throwError
     { code: 329, severity: SError, span: ntnSpan n, note: Nothing
     , msg: P.text ("there is no primitive called `" <> d.name <> "` (the runtime has: " <> Str.joinWith ", " primNames <> ")")

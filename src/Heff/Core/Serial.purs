@@ -19,7 +19,7 @@ import Data.Number as Number
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Support.BigInt as BigInt
-import Heff.Support.Common (Dict, Name, dictFromList, dictToList)
+import Heff.Support.Common (Dict, dictFromList, dictToList)
 import Heff.Core.Params (Level(..), Universe(..), Variants(..))
 import Heff.Core.Syntax as S
 
@@ -39,9 +39,6 @@ node j = do
   { head, tail } <- A.uncons a
   t <- toString head
   pure (Tuple t tail)
-
-at :: Array Json -> Int -> Maybe Json
-at = A.index
 
 encodeAbs :: forall a. (a -> Json) -> S.Abs a -> Json
 encodeAbs f = case _ of

@@ -5,6 +5,7 @@ module Heff.Core.Rename
   , renameTy
   , globalsInEl
   , globalsInTy
+  , selfAsLocal
   , describeKey
   , displayName
   ) where
@@ -96,6 +97,43 @@ globalsInTy = A.nub <<< go
     S.IsTy t -> go t
     S.PrimArray t -> go t
     _ -> []
+
+-- | A definition's body, the global it is being stored as (`k`) put back
+-- | as what it is in the body: local 0, the definition itself.  While it
+-- | is elaborated the definition is in scope as the global it will be (so
+-- | an implicit argument's solution may mention it, closed); its stored
+-- | body has it where its other locals are.
+selfAsLocal :: Name -> S.El -> S.El
+selfAsLocal k = el 0
+  where
+  under :: forall a. (Int -> a -> a) -> Int -> S.Abs a -> S.Abs a
+  under f d = case _ of
+    S.Abs x t -> S.Abs x (f (d + 1) t)
+    S.AbsConst t -> S.AbsConst (f d t)
+  el d = case _ of
+    S.Global x | x == k -> S.Local d
+    S.Code t -> S.Code (ty d t)
+    S.App f a -> S.App (el d f) (el d a)
+    S.Lam dom b -> S.Lam (ty d dom) (under el d b)
+    S.Cons c -> S.Cons (dictMap (el d) c)
+    S.Proj e l -> S.Proj (el d e) l
+    S.Tag t as -> S.Tag t (map (el d) as)
+    S.Match e cs -> S.Match (el d e) (dictMap (\(Tuple xs b) -> Tuple xs (el (d + A.length xs) b)) cs)
+    S.Specialize e l v -> S.Specialize (el d e) l (el d v)
+    S.Is e -> S.Is (el d e)
+    S.Rec e -> S.Rec (el d e)
+    S.Implicit x e -> S.Implicit x (el d e)
+    S.MetaApp m xs t -> S.MetaApp m xs (ty d t)
+    other -> other
+  ty d = case _ of
+    S.Decode e -> S.Decode (el d e)
+    S.Function f -> S.Function { level: f.level, dom: ty d f.dom, cod: under ty d f.cod, implicit: f.implicit }
+    -- (a record type is a telescope: each field's type sees the ones before)
+    S.Record rt -> S.Record { level: rt.level, fieldTypes: rt.fieldTypes { values = A.mapWithIndex (\i t -> ty (d + i) t) rt.fieldTypes.values } }
+    S.Sum (Variants vs) -> S.Sum (Variants (dictMap (map (ty d)) vs))
+    S.IsTy t -> S.IsTy (ty d t)
+    S.PrimArray t -> S.PrimArray (ty d t)
+    other -> other
 
 -- | a global key as the name it is known by where it is shown: a module's
 -- | definition (`module.name`) by its alias, if it has one

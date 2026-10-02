@@ -22,7 +22,6 @@ import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
 import Control.Monad.State (gets, modify_)
-import Data.Map as Map
 import Heff.Core.Globals (lookupGlobalKey)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), Level(..), Universe, Variants(..), decodesInto, leq, maxLevel)
@@ -169,8 +168,8 @@ functionIntro sp x body = Chk \e a0 -> do
 -- | synthesises under it, and the function's type is `(x :: T) -> B` --
 -- | so where the expected type is not known yet (an argument of `map`,
 -- | say), the annotation says it, and nothing is postponed
-functionIntroSyn :: Span -> Name -> Typ -> Syn -> Syn
-functionIntroSyn sp x dom body = Syn \e -> do
+functionIntroSyn :: Name -> Typ -> Syn -> Syn
+functionIntroSyn x dom body = Syn \e -> do
   edom <- runTyp dom e
   Tuple ebody bty <- withBound x (M.tyN edom) e.scope \v scope' ->
     runSyn body (e { scope = scope', elabFor = appElabFor e.elabFor v })

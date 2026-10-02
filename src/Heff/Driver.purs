@@ -52,7 +52,7 @@ import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
 import Heff.Parse.Notation (Diag, Ntn, Severity(..))
 import Heff.Parse.Notation as F
 import Heff.Parse.Fixity (Assoc(..), Fixities, emptyFixities, union)
-import Heff.Support.Common (Dict, dictFromList, dictMap, dictToList, operatorName)
+import Heff.Support.Common (dictFromList, dictMap, dictToList, operatorName)
 import Heff.Parse.Surface (readProgram, readProgramWith)
 import Heff.Print.Surface (printSig, printTy)
 import Heff.Support.Diagnostic (lineCol, renderDiag)
