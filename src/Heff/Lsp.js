@@ -42,16 +42,13 @@ export const uriPathImpl = (just) => (nothing) => (uri) => {
 export const pathUri = (p) => pathToFileURL(p).href;
 export const absPath = (p) => resolve(p);
 
-// the `.hf` files of the project at `root`: not in a directory of another
-// project (one with its own project.hf), a hidden one, or one the root's
-// .gitignore names (`/output`, `node_modules`: a name, not a pattern)
+// the `.hf` files of the project at `root`.  package.json's `"heff":
+// { "sources": [...] }` names the project's module directories: those are
+// walked, with the root's own `.hf` files.  Without it, every directory
+// is, except another project's (one with its own project.hf), a hidden
+// one, or one the root's .gitignore names (`/output`, `node_modules`: a
+// name, not a pattern).
 export const projectFilesImpl = (root) => () => {
-  let ignored = ["node_modules"];
-  try {
-    ignored = ignored.concat(readFileSync(join(root, ".gitignore"), "utf8").split("\n")
-      .map((l) => l.trim().replace(/^\//, "").replace(/\/$/, ""))
-      .filter((l) => l && !l.startsWith("#") && !/[*?\[\/!]/.test(l)));
-  } catch (_) {}
   const files = [];
   const walk = (d) => {
     let entries = [];
@@ -63,6 +60,24 @@ export const projectFilesImpl = (root) => () => {
       else if (e.isFile() && e.name.endsWith(".hf")) files.push(p);
     }
   };
-  if (existsSync(join(root, "project.hf"))) walk(root);
+  let ignored = ["node_modules"];
+  let sources = null;
+  try {
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    if (pkg.heff && Array.isArray(pkg.heff.sources)) sources = pkg.heff.sources;
+  } catch (_) {}
+  if (!existsSync(join(root, "project.hf"))) return files;
+  if (sources) {
+    for (const e of readdirSync(root, { withFileTypes: true }))
+      if (e.isFile() && e.name.endsWith(".hf")) files.push(join(root, e.name));
+    for (const d of sources) walk(join(root, d));
+    return files;
+  }
+  try {
+    ignored = ignored.concat(readFileSync(join(root, ".gitignore"), "utf8").split("\n")
+      .map((l) => l.trim().replace(/^\//, "").replace(/\/$/, ""))
+      .filter((l) => l && !l.startsWith("#") && !/[*?\[\/!]/.test(l)));
+  } catch (_) {}
+  walk(root);
   return files;
 };

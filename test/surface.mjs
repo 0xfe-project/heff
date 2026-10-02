@@ -3,7 +3,7 @@
 // their expectations hold; the module rules reject what they should.
 // (The apps are run by test/app-run.mjs.)
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -103,6 +103,26 @@ console.log("interfaces: as `heff check` prints them");
     failed++;
     console.log(`FAIL one error, reported once:\n${r.stderr}`);
   }
+}
+
+// an installed package (node_modules/, npm's): `hfpkg.greet` found at
+// node_modules/hfpkg/greet.hf, whose own files import one another by
+// those same names
+{
+  const pkg = join(root, "node_modules", "hfpkg");
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, "words.hf"), "word : String\nword = \"hello\"\n");
+  writeFileSync(join(pkg, "greet.hf"), "import hfpkg.words\nimport prelude\n\ngreet : String\ngreet = word ++ \"!\"\n");
+  mkdirSync(join(root, "ref"), { recursive: true });
+  const use = join(root, "ref", "pkg-use.hf");
+  writeFileSync(use, "import hfpkg.greet\nimport prelude\n\nshout : String\nshout = greet ++ \" world\"\n");
+  const r = heff("check", use);
+  if (r.status !== 0 || !r.stdout.includes("shout : String")) {
+    failed++;
+    console.log(`FAIL a module of an installed package:\n${r.stdout}${r.stderr}`);
+  }
+  rmSync(pkg, { recursive: true, force: true });
+  rmSync(use, { force: true });
 }
 
 // an expectation that does not hold: what differs is shown, cut to it

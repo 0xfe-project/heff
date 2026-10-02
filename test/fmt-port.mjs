@@ -18,16 +18,20 @@ if (c.status !== 0) { console.log("fmt port: heff fmt could not run\n" + c.stdou
 const lay = (await import(pathToFileURL(join(root, "output", "heff-fmt.mjs")))).default;
 const { formatUnchecked } = await import(pathToFileURL(join(root, "output", "Heff.Format", "index.js")));
 
+// the project's files, as package.json's `"heff"` names them: the source
+// directories and the scratch ones (ref/'s probes are laid out too), and
+// the root's own `.hf` files
 const files = [];
 const walk = (d) => {
   for (const e of readdirSync(d)) {
-    if (e === "node_modules" || e === "output" || e === ".git") continue;
     const p = join(d, e);
     if (statSync(p).isDirectory()) walk(p);
     else if (e.endsWith(".hf")) files.push(p);
   }
 };
-walk(root);
+const heffConfig = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).heff ?? {};
+for (const e of readdirSync(root)) if (e.endsWith(".hf")) files.push(join(root, e));
+for (const d of [...(heffConfig.sources ?? []), ...(heffConfig.scratch ?? [])]) walk(join(root, d));
 
 const psEither = (v) => v.constructor.name === "Left" ? { left: v.value0 } : { right: v.value0 };
 const hfEither = (v) => v.$ === "Left" ? { left: v.a[0] } : { right: v.a[0] };

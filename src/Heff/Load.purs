@@ -2,7 +2,10 @@
 -- | the project's root: `parse.surface` is `ROOT/parse/surface.hf`.  The root
 -- | is the nearest directory above the file given with a `project.hf`, else
 -- | the file's own directory.  A module not in the project is looked for in
--- | the standard library (`lib/`).
+-- | the standard library (`lib/`), then among the installed packages
+-- | (`node_modules/`, npm's): a package `foo` holds `foo.bar` at
+-- | `node_modules/foo/bar.hf`, and its own files import one another by
+-- | those same names.
 module Heff.Load
   ( Paths
   , pathsFor
@@ -49,7 +52,7 @@ pathsFor lib file = do
 moduleOf :: Paths -> String -> String
 moduleOf ps file =
   let
-    rel = fromMaybe file (S.stripPrefix (S.Pattern (ps.lib <> "/")) file <|> S.stripPrefix (S.Pattern (ps.root <> "/")) file)
+    rel = fromMaybe file (S.stripPrefix (S.Pattern (ps.lib <> "/")) file <|> S.stripPrefix (S.Pattern (ps.root <> "/node_modules/")) file <|> S.stripPrefix (S.Pattern (ps.root <> "/")) file)
     base = fromMaybe rel (S.stripSuffix (S.Pattern ".hf") rel)
   in
     S.replaceAll (S.Pattern "/") (S.Replacement ".") base
@@ -83,10 +86,13 @@ loadProgramWith read ps file = do
       else do
         let inRoot = ps.root <> "/" <> importPath m
         let inLib = ps.lib <> "/" <> importPath m
+        let inPkg = ps.root <> "/node_modules/" <> importPath m
         a <- exists inRoot
         b <- exists inLib
+        c <- exists inPkg
         if a then visit stack m inRoot
         else if b then visit stack m inLib
-        else err (from <> ": no module " <> m <> " (looked for " <> inRoot <> " and " <> inLib <> ")")
+        else if c then visit stack m inPkg
+        else err (from <> ": no module " <> m <> " (looked for " <> inRoot <> ", " <> inLib <> " and " <> inPkg <> ")")
   visit [] (moduleOf ps file) file
   { sources: _, errors: _ } <$> Ref.read done <*> Ref.read errors
