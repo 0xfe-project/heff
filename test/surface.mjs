@@ -35,7 +35,7 @@ const rejected = [
   ["test/errors/case-nested.hf", "literals are matched here: one of them must match every other value"],
   ["test/errors/project-inferred.hf", "the record's shape is not in hand here for `.a`"],
   ["test/errors/no-type.hf", "test/errors/no-type.hf:7:10\nerror[E0314]: expected type Type, but got the tag Nada"],
-  ["test/errors/implicit.hf", "test/errors/implicit.hf:33:8\nerror[E0327]: cannot infer the implicit argument `h`: give it, `(h := ...)`"],
+  ["test/errors/implicit.hf", "test/errors/implicit.hf:34:10\nerror[E0327]: cannot infer the implicit argument `e`: give it, `(e := ...)`"],
   ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
 ];
 for (const [f, msg] of rejected) {

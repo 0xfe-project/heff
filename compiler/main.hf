@@ -16,14 +16,35 @@ import stdio
 eff : HFunctor
 eff = stdio <+> process <+> fs
 
-onStdio : {a : Type} -> Co stdio a -> Co eff a
-onStdio = lift (\p -> inl (stdio <+> process) fs (inl stdio process p))
+-- the evidence, once per world: an operation then takes it itself
+-- (`print out s`, `args sys`), no wrapping call
+out : (stdio <: eff)
+out = first3 stdio process fs
 
-onProcess : {a : Type} -> Co process a -> Co eff a
-onProcess = lift (\p -> inl (stdio <+> process) fs (inr stdio process p))
+sys : (process <: eff)
+sys = mid3 stdio process fs
 
-onFs : {a : Type} -> Co fs a -> Co eff a
-onFs = lift (inr (stdio <+> process) fs)
+disk : (fs <: eff)
+disk = last3 stdio process fs
+
+-- the program's own theory of its world: the operations it uses, the
+-- evidence paid once (repacking, as modules do)
+type Io =
+  { print : String -> Co eff Unit
+  , printErr : String -> Co eff Unit
+  , readFile : String -> Co eff (Maybe String)
+  , args : Co eff (List String)
+  , exit : Int -> Co eff Unit
+  }
+
+io : Io
+io =
+  { print = print out
+  , printErr = printErr out
+  , readFile = readFile disk
+  , args = args sys
+  , exit = exit sys
+  }
 
 dotsGo : String -> Int -> String -> String
 dotsGo p i acc =
@@ -50,11 +71,11 @@ moduleOf path = dotsOf (dropLib (dropHf path))
 readAll : List String -> Co eff (List Dr.Source)
 readAll Nil = pure Nil
 readAll (Cons path rest) = do
-  mSrc <- onFs (readFile path)
+  mSrc <- io.readFile path
   case mSrc of
     Nothing -> do
-      onStdio (printErr ("cannot read " ++ path))
-      onProcess (exit 1)
+      io.printErr ("cannot read " ++ path)
+      io.exit 1
       pure Nil
     Just src -> do
       more <- readAll rest
@@ -63,7 +84,7 @@ readAll (Cons path rest) = do
 printLines : List String -> Co eff Unit
 printLines Nil = pure MkUnit
 printLines (Cons l rest) = do
-  onStdio (print l)
+  io.print l
   printLines rest
 
 printDefs : Dr.Checked -> List String -> Co eff Unit
@@ -75,7 +96,7 @@ printDefs c (Cons k rest) = do
 printErrs : String -> List String -> Int -> Co eff Int
 printErrs m Nil n = pure n
 printErrs m (Cons l rest) n = do
-  onStdio (printErr (m ++ ": " ++ l))
+  io.printErr (m ++ ": " ++ l)
   printErrs m rest (n + 1)
 
 printAll : List Dr.Checked -> Int -> Co eff Int
@@ -89,7 +110,7 @@ printAll (Cons c rest) bad = do
 -- | stored core of every definition
 selfcheck : Co eff Unit
 selfcheck = do
-  paths <- onProcess args
+  paths <- io.args
   sources <- readAll paths
   bad <- printAll (Dr.checkProgram sources) 0
-  if bad == 0 then pure MkUnit else onProcess (exit 1)
+  if bad == 0 then pure MkUnit else io.exit 1

@@ -107,6 +107,8 @@ reserved =
   , "while", "with", "yield", "let", "static", "implements", "interface", "package", "private", "protected"
   , "public", "await", "arguments", "eval", "undefined", "NaN", "Infinity", "document", "window", "BigInt"
   , "String", "Number", "Object", "Error", "Math", "JSON", "setTimeout", "fetch"
+  , "process", "console", "globalThis", "Promise", "Array", "Map", "Set", "Date", "Symbol", "RegExp"
+  , "Buffer", "setImmediate", "queueMicrotask", "structuredClone", "URL", "TextEncoder", "TextDecoder"
   ]
 
 safe :: String -> String
