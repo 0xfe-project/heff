@@ -58,7 +58,8 @@ import Heff.Core.Value as V
 import Heff.Locals (locals)
 import Heff.Elab.Top (ThawedDef, TopResult, entryFor, topModule, topThawed, topWith)
 import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
-import Heff.Parse.Notation (Diag, Ntn, Severity(..))
+import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), getGroup)
+import Data.Array.NonEmpty as NEA
 import Heff.Parse.Notation as F
 import Heff.Parse.Fixity (Assoc(..), Fixities, emptyFixities, union)
 import Heff.Support.Common (dictFromList, dictMap, dictToList, operatorName)
@@ -563,58 +564,42 @@ memberT k m = { key: k, member: Just m, local: Nothing }
 -- | `A.not`, `t` of `.t`, `x` of `'x`); `defines`: where it is defined
 type Occurrence = { path :: String, source :: String, span :: F.Span, defines :: Boolean }
 
--- | Where a file defines its names: each declaration's name, at the start
--- | of its signature's line and of each equation's (`not`, `(&&)`, `data
--- | Bool`); a `data`'s tags, after its `=` and `|`; a `theory`'s fields, at
--- | the start of their lines.  (Read from the text: the elaborator keeps
--- | where a declaration is, not where in it its names are.)
+-- | Where a file defines its names, as its notation says: each
+-- | declaration's name, in its signature and at the head of each equation
+-- | (`not`, `(&&)`, `data Bool`, `theory Monoid`); a `data`'s tags; a
+-- | `theory`'s fields.  (A declaration that did not elaborate defines
+-- | nothing to refer to.)
 sites :: Checked -> Array { target :: Target, name :: String, span :: F.Span }
-sites c = A.concat (A.zipWith decl c.own c.top.spans)
+sites c = A.concatMap decl c.ntns
   where
-  src = c.source
-  starts = A.sort (map (\(Tuple _ sp) -> sp.start) c.top.spans)
-  -- (a declaration's span is its signature's; its equations follow, up to
-  -- the next declaration)
-  upToNext sp = sp { end = max sp.end (fromMaybe (SCU.length src) (A.find (_ > sp.start) starts)) }
-  decl o (Tuple _ sp) =
-    let
-      text = SCU.slice sp.start sp.end src
-      heads = A.mapMaybe (headAt o.name) (lineStarts (upToNext sp))
-      self = map (\h -> { target: globalT o.key, name: o.name, span: h }) heads
-      members
-        | S.take 5 text == "data " = tags sp
-        | S.take 7 text == "theory " = fields sp
-        | otherwise = []
-    in
-      self <> map (\m -> { target: memberT o.key m.name, name: m.name, span: m.span }) members
-  lineStarts sp = A.filter (\p -> p == 0 || SCU.charAt (p - 1) src == Just '\n') (A.range sp.start (max sp.start (sp.end - 1)))
-  headAt x p = A.findMap (\pre -> at (p + SCU.length pre) x pre) [ "", "(", "data ", "theory ", "foreign import " ]
-    where
-    at q y pre
-      | SCU.slice p q src /= pre || SCU.slice q (q + SCU.length y) src /= y = Nothing
-      | pre == "(" = if SCU.charAt (q + SCU.length y) src == Just ')' then Just { start: q, end: q + SCU.length y } else Nothing
-      | wordAt src q y = Just { start: q, end: q + SCU.length y }
-      | otherwise = Nothing
-  -- (a tag is the name after `=` or `|`, perhaps written with its `'`)
-  tags sp = A.mapMaybe tagAfter (A.filter (\p -> SCU.charAt p src == Just '=' || SCU.charAt p src == Just '|') (A.range sp.start (sp.end - 1)))
-  tagAfter p =
-    let
-      q0 = skipSpace (p + 1)
-      q = if SCU.charAt q0 src == Just '\'' then q0 + 1 else q0
-      e = nameEnd q
-    in
-      if e > q then Just { name: SCU.slice q e src, span: { start: q, end: e } } else Nothing
-  fields sp = A.mapMaybe fieldAt (A.drop 1 (lineStarts sp))
-  fieldAt p =
-    let
-      q = skipSpace' p
-      e = nameEnd q
-    in
-      if q > p && e > q && SCU.charAt (skipSpace' e) src == Just ':' && SCU.charAt (skipSpace' e + 1) src /= Just ':' then Just { name: SCU.slice q e src, span: { start: q, end: e } } else Nothing
-  skipSpace i = if A.elem (SCU.charAt i src) [ Just ' ', Just '\n', Just '\t' ] then skipSpace (i + 1) else i
-  skipSpace' i = if A.elem (SCU.charAt i src) [ Just ' ', Just '\t' ] then skipSpace' (i + 1) else i
-  nameEnd i = if isNameChar (SCU.charAt i src) && SCU.charAt i src /= Just '/' then nameEnd (i + 1) else i
-
+  keyOf x = _.key <$> A.find (\o -> o.name == x) c.own
+  -- (the name alone: a tag's `'` is not part of it)
+  site t x sp = { target: t, name: x, span: { start: max sp.start (sp.end - SCU.length x), end: sp.end } }
+  global x sps = maybe [] (\k -> map (site (globalT k) x) sps) (keyOf x)
+  members x ms = maybe [] (\k -> map (\m -> site (memberT k m.name) m.name m.span) ms) (keyOf x)
+  decl = case _ of
+    MDecl _ "def" (Infix (Ident f fsp) (Keyword ":" _) (Juxt _ (NBlock "where" Nothing eqs _))) _ ->
+      global f (A.cons fsp (A.mapMaybe equationHead eqs))
+    MDecl _ "def" (Infix (Infix h (Keyword ":" _) _) (Keyword ":=" _) body) _ | Just x <- headOf h ->
+      global x.name [ x.span ] <> members x.name (case body of
+        NBlock "sum" _ alts _ -> A.mapMaybe tagOf alts
+        _ -> [])
+    MDecl _ "theory" (Infix h (Keyword ":=" _) (NBlock "sig" _ fs _)) _ | Just x <- headOf h ->
+      global x.name [ x.span ] <> members x.name (A.mapMaybe fieldOf fs)
+    MDecl _ "primitive" (Infix (Ident x sp) (Keyword ":" _) _) _ -> global x [ sp ]
+    _ -> []
+  headOf h = case NEA.head (getGroup h) of
+    Ident x sp -> Just { name: x, span: sp }
+    _ -> Nothing
+  equationHead = case _ of
+    Infix l (Keyword ":=" _) _ -> _.span <$> headOf l
+    _ -> Nothing
+  tagOf alt = case NEA.head (getGroup alt) of
+    NTag t sp -> Just { name: t, span: sp }
+    _ -> Nothing
+  fieldOf = case _ of
+    Infix (Ident x sp) (Keyword ":" _) _ -> Just { name: x, span: sp }
+    _ -> Nothing
 -- | the name at an offset, in a program (the file last), as what it refers
 -- | to: a global or a member used there, or one the file defines there; a
 -- | local, at its binder or a use (`Heff.Locals`); and the name it is

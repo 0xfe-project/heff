@@ -202,6 +202,10 @@ try {
   expect("an outline", sym("Bool") && sym("Bool").kind === 10 && sym("Bool").children.map((c) => c.name).join() === "True,False" &&
     sym("Monoid") && sym("Monoid").kind === 11 && sym("Monoid").children.map((c) => c.name).join() === "t,m" &&
     sym("not") && sym("not").kind === 12 && sym("not").selectionRange.start.line === pos(basics, "not :").line, outline.result);
+  // (a definition is its signature and its equations; a `data`, to its last `)`)
+  const listEnd = pos(basics, "Cons a (List a)");
+  expect("an outline's ranges", sym("not").range.end.line === pos(basics, "not False").line &&
+    sym("List").range.end.line === listEnd.line && sym("List").range.end.character === listEnd.character + "Cons a (List a)".length, outline.result && [sym("not"), sym("List")]);
   // what does not elaborate is in the outline too, where it is
   const recover = disk("test/errors/recover.hf");
   open("test/errors/recover.hf", recover);

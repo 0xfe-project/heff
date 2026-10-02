@@ -169,7 +169,7 @@ prescan ts = A.catMaybes (A.mapWithIndex one ts)
 
 -- | what a top-level declaration is, before signatures meet equations
 data Item
-  = Sig String Ntn Span
+  = Sig String Span Ntn Span -- ^ the name, where it is written, the type, where the signature is
   | Eqn String Ntn Span -- ^ `f p ... := e`, as the equations of `Heff.Elab.Clauses`
   | Decl Ntn
 
@@ -245,7 +245,7 @@ decl = lazyP \_ -> do
             ty <- expr
             end <- prevEnd
             modify_ \s -> s { binders = A.snoc s.binders { f: f.name, names: piBinders ty, implicits: piImplicits ty } }
-            pure [ Sig f.name ty { start: t.start, end } ]
+            pure [ Sig f.name f.span ty { start: t.start, end } ]
           else equation f
 
 -- | what a signature or an equation defines: `f`, `C`, or `(+)` (`len`: its
@@ -304,7 +304,8 @@ dataDecl = lazyP \_ -> do
     for_ alts \alt -> case NEA.head (getGroup alt) of
       NTag c csp | c == name.text -> throwError (diag csp ("`" <> c <> "` names the type; its constructor needs another name, e.g. `Mk" <> c <> "`"))
       _ -> pure unit
-    let sp = { start: kw.start, end: fromMaybe name.end (A.last alts <#> \a -> (ntnSpan a).end) }
+    end <- prevEnd
+    let sp = { start: kw.start, end }
     pure (MDecl [] "def" (Infix (Infix head (Keyword ":" sp) universe) (Keyword ":=" sp) (NBlock "sum" Nothing alts sp)) sp)
   where
   alternative = do
@@ -366,8 +367,9 @@ typeDecl = lazyP \_ -> do
   _ <- expectSym "="
   withScope (A.concatMap binderNames params) do
     body <- expr
+    end <- prevEnd
     let
-      sp = { start: kw.start, end: (ntnSpan body).end }
+      sp = { start: kw.start, end }
       head = group (NEA.cons' (Ident name.text (spanOf name)) params)
     pure (MDecl [] "def" (Infix (Infix head (Keyword ":" sp) (Keyword "Type" sp)) (Keyword ":=" sp) body) sp)
 
@@ -380,8 +382,9 @@ theoryDecl = lazyP \_ -> do
   _ <- expectKw "where"
   withScope (A.concatMap binderNames params) do
     fields <- block field
+    end <- prevEnd
     let
-      sp = { start: kw.start, end: fromMaybe name.end (A.last fields <#> \f -> (ntnSpan f).end) }
+      sp = { start: kw.start, end }
       head = group (NEA.cons' (Ident name.text (spanOf name)) params)
     pure (MDecl [] "theory" (Infix head (Keyword ":=" sp) (NBlock "sig" Nothing fields sp)) sp)
   where
@@ -401,7 +404,8 @@ foreignDecl = lazyP \_ -> do
   x <- expectKind "var" "the primitive's name"
   _ <- expectAnn
   ty <- expr
-  let sp = { start: kw.start, end: (ntnSpan ty).end }
+  end <- prevEnd
+  let sp = { start: kw.start, end }
   pure (MDecl [] "primitive" (Infix (Ident x.text (spanOf x)) (Keyword ":" sp) ty) sp)
 
 -- | signatures meet their equations: `def f : T where <equations> end`
@@ -410,30 +414,33 @@ assemble broken items = A.mapMaybe one items
   where
   one = case _ of
     Decl n -> Just n
-    Sig f ty sp ->
-      let eqs = A.mapMaybe (case _ of
-            Eqn g e _ | g == f -> Just e
-            _ -> Nothing) items
+    Sig f fsp ty sp ->
+      let
+        eqs = A.mapMaybe (case _ of
+          Eqn g e esp | g == f -> Just { e, span: esp }
+          _ -> Nothing) items
+        -- (the declaration is its signature and its equations)
+        whole = sp { end = A.foldl (\e q -> max e q.span.end) sp.end eqs }
       in
         -- (an equation that does not parse: `f = abandon`, not what the
         -- others match without it)
-        if A.elem f broken then Just (def f ty sp [ Infix (Ident f sp) (Keyword ":=" sp) (Keyword "abandon" sp) ])
+        if A.elem f broken then Just (def f fsp ty sp [ Infix (Ident f fsp) (Keyword ":=" sp) (Keyword "abandon" sp) ])
         else if A.null eqs then Nothing
-        else Just (def f ty sp eqs)
+        else Just (def f fsp ty whole (map _.e eqs))
     Eqn _ _ _ -> Nothing
-  def f ty sp eqs = MDecl [] "def" (Infix (Ident f sp) (Keyword ":" sp) (Juxt ty (NBlock "where" Nothing eqs sp))) sp
+  def f fsp ty sp eqs = MDecl [] "def" (Infix (Ident f fsp) (Keyword ":" sp) (Juxt ty (NBlock "where" Nothing eqs sp))) sp
 
 assembleDiags :: Array String -> Array Item -> Array Diag
 assembleDiags broken items = A.mapMaybe one items
   where
   sigs = A.mapMaybe (case _ of
-    Sig f _ _ -> Just f
+    Sig f _ _ _ -> Just f
     _ -> Nothing) items
   eqNames = A.mapMaybe (case _ of
     Eqn f _ _ -> Just f
     _ -> Nothing) items
   one = case _ of
-    Sig f _ sp | not (A.elem f eqNames) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
+    Sig f _ _ sp | not (A.elem f eqNames) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
     Eqn f _ sp | not (A.elem f sigs) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` needs a type: `" <> f <> " : …`"))
     _ -> Nothing
 
@@ -816,7 +823,8 @@ caseExpr = lazyP \_ -> do
   scrut <- expr
   _ <- expectKw "of"
   alts <- block alternative
-  let sp = { start: kw.start, end: fromMaybe (ntnSpan scrut).end (A.last alts <#> \a -> (ntnSpan a).end) }
+  end <- prevEnd
+  let sp = { start: kw.start, end }
   pure (NBlock "match" (Just scrut) alts sp)
   where
   alternative = do
@@ -835,7 +843,8 @@ ifExpr = lazyP \_ -> do
   a <- expr
   _ <- expectKw "else"
   b <- expr
-  let sp = { start: kw.start, end: (ntnSpan b).end }
+  end <- prevEnd
+  let sp = { start: kw.start, end }
   pure (NBlock "match" (Just c) [ Infix (NTag "True" sp) (Keyword "=>" sp) a, Infix (NTag "False" sp) (Keyword "=>" sp) b ] sp)
 
 -- | `do` and its statements, `x <- e` or `e`
@@ -843,7 +852,8 @@ doExpr :: P Ntn
 doExpr = lazyP \_ -> do
   kw <- next
   stmts <- block statement
-  let sp = { start: kw.start, end: fromMaybe kw.end (A.last stmts <#> \a -> (ntnSpan a).end) }
+  end <- prevEnd
+  let sp = { start: kw.start, end }
   pure (NBlock "do" Nothing stmts sp)
   where
   statement = do
