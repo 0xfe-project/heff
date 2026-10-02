@@ -12,6 +12,7 @@
 module Heff.Elab.Clauses
   ( stripWhere
   , desugar
+  , caseTree
   ) where
 
 import Prelude
@@ -101,6 +102,21 @@ desugar f params eqNs sp = do
   body <- compile used sp vars rows
   pure (A.foldr (\x b -> Infix (Ident x sp) (Keyword "=>" sp) b) body lambdas)
 
+-- | a `case` whose alternatives match nested patterns: compiled like the
+-- | equations, over one column -- a fresh name for the scrutinee, which
+-- | the caller binds (`Rules.caseLet`)
+caseTree :: Span -> Array Ntn -> Either Err { scrutinee :: Name, tree :: Ntn }
+caseTree sp altNs = do
+  rows <- traverse alt altNs
+  let used = A.concatMap (\r -> A.concatMap patVars r.pats <> identsOf r.rhs) rows
+  let x = fresh used "it"
+  tree <- compile used sp [ x ] rows
+  pure { scrutinee: x, tree }
+  where
+  alt = case _ of
+    Infix p (Keyword "=>" _) rhs -> pat p <#> \p' -> { pats: [ p' ], rhs }
+    n -> Left { span: ntnSpan n, msg: "a `case` alternative has the form `<pattern> => <body>`" }
+
 for_' :: forall a. Array a -> (a -> Either Err Unit) -> Either Err Unit
 for_' xs k = void (traverse k xs)
 
@@ -168,7 +184,7 @@ compile used sp vars rows = case A.head rows of
       column = A.mapMaybe (\r' -> A.index r'.pats c) rows
       lsp = ntnSpan l
     when (A.any isTag column) $ Left { span: lsp, msg: "a literal and a tag match the same argument" }
-    when (not (A.any (not <<< isLit) column)) $ Left { span: lsp, msg: "the equations match literals here: one of them must match every other value (a variable)" }
+    when (not (A.any (not <<< isLit) column)) $ Left { span: lsp, msg: "literals are matched here: one of them must match every other value (a variable, or `_`)" }
     let
       yes = A.mapMaybe (\r' -> case A.index r'.pats c of
         Just (PLit l') | sameLit l l' -> Just r' { pats = dropAt c r'.pats }

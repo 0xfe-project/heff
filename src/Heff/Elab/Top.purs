@@ -28,7 +28,7 @@ import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, ntnHead
 import Heff.Support.Common (Name, dictFromList)
 import Heff.Core.Evaluation (eval, evalTy)
 import Heff.Core.Readback (readbTy)
-import Heff.Elab.Clauses (desugar, stripWhere)
+import Heff.Elab.Clauses (caseTree, desugar, stripWhere)
 import Heff.Elab.Prims (isPrim, primNames)
 import Data.String as Str
 import Heff.Core.Syntax as Syn
@@ -132,12 +132,30 @@ doPat n = case NEA.uncons (getGroup n) of
     pure (Tuple x xs)
   -- extension: `_ => e` handles every tag not listed
   { head: Ident "_" _, tail: [] } -> pure (Tuple "_" [])
-  { head: Ident x sp, tail: [] } ->
-    failP sp 3 (P.text ("`" <> x <> "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already"))
-  _ -> failP (ntnSpan n) 3 (P.text "a `case` pattern is flat: a constructor or a tag applied to names, or `_` -- an equation of a definition matches nested patterns")
+  { head: Ident x sp, tail: [] } -> bareAltRefused x sp
+  _ -> failP (ntnSpan n) 3 (P.text "a `case` pattern is a pattern: a tag applied to patterns, a literal, or `_`")
   where
   patName (Ident x _) = pure x
-  patName p = failP (ntnSpan p) 3 (P.text "an argument of a `case` pattern is a name: match a nested pattern in an equation of a definition, or bind a name here and `case` on it")
+  patName p = failP (ntnSpan p) 3 (P.text "an argument of a `case` pattern is a pattern or a name")
+
+-- | a whole value needs no new name: it is in hand already
+bareAltRefused :: forall a. Name -> Span -> E a
+bareAltRefused x sp =
+  failP sp 3 (P.text ("`" <> x <> "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already"))
+
+-- | flat: a tag applied to names, or `_` (what `doCase` reads directly);
+-- | anything else is compiled through `Clauses.caseTree`
+flatCaseAlt :: Ntn -> Boolean
+flatCaseAlt = case _ of
+  Infix p (Keyword "=>" _) _ -> case NEA.uncons (getGroup p) of
+    { head: NTag _ _, tail: ps } -> A.all isName ps
+    { head: Ident _ _, tail: [] } -> true
+    _ -> false
+  _ -> true
+  where
+  isName = case _ of
+    Ident _ _ -> true
+    _ -> false
 
 doCase :: Ntn -> E (Tuple Name (Tuple (Array Name) R.Chk))
 doCase (Infix pat (Keyword "=>" _) bodyN) = do
@@ -199,7 +217,7 @@ parseHead c n = case n of
   NBlock "do" Nothing stmts sp -> case doBlock sp stmts of
     Just n' -> parse c n'
     Nothing -> failP sp 12 (P.text "a `do` block ends with an expression")
-  NBlock "match" (Just scrutN) casesN sp -> do
+  NBlock "match" (Just scrutN) casesN sp | A.all flatCaseAlt casesN -> do
     scrut <- syn N scrutN
     cases <- traverse doCase casesN
     let
@@ -207,6 +225,20 @@ parseHead c n = case n of
         Infix p (Keyword "=>" _) _ | NTag x tsp <- NEA.head (getGroup p) -> Just (Tuple x tsp)
         _ -> Nothing) casesN
     pure (fromChkN c (R.sumElim sp scrut tags (dictFromList cases)))
+  -- extension: an alternative may match a nested pattern or a literal; the
+  -- alternatives are compiled (`Clauses.caseTree`) into the flat matches
+  -- above, on a name for the scrutinee, bound once (`R.caseLet`)
+  NBlock "match" (Just scrutN) casesN sp -> do
+    for_ casesN case _ of
+      Infix p (Keyword "=>" _) _
+        | { head: Ident x xsp, tail: [] } <- NEA.uncons (getGroup p), x /= "_" -> bareAltRefused x xsp
+      _ -> pure unit
+    case caseTree sp casesN of
+      Left err -> failP err.span 3 (P.text err.msg)
+      Right r -> do
+        scrut <- syn N scrutN
+        body <- chk N r.tree
+        pure (fromChkN c (R.caseLet r.scrutinee scrut body))
   -- Misc.
   Keyword "abandon" sp -> pure (fromChkN c (R.abandonChk sp))
   Infix n0 (Keyword "~" _) n1 -> do

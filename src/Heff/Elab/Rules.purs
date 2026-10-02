@@ -680,6 +680,22 @@ sumElim sp scrutSyn tags casesChk = Chk \e b -> do
           Nothing -> failWith sp 17 (txt "no case provided for tag" <+> txt x)
     pure (M.match scrut cases)
 
+-- | extension: a `case` of nested patterns is compiled (`Clauses.caseTree`)
+-- | into the matches Hippogriff has, on a name for the scrutinee.  There
+-- | is no `let`: the name is bound by a beta-redex, `(\x -> <tree>) scrut`.
+-- | `lams` does not grow -- the redex computes at once, so a recursive
+-- | use inside it is as unguarded as it would be outside.
+caseLet :: Name -> Syn -> Chk -> Chk
+caseLet x scrutSyn body = Chk \e b -> do
+  Tuple scrut a0 <- runSyn scrutSyn e
+  a <- forceT a0
+  ebody <- withBound x a e.scope \_ scope' ->
+    runChk body (e { scope = scope' }) b
+  let
+    dom = M.fromVTy N e.scope.len a
+    fty = M.function (evalEnv e) dom (S.Abs x (M.fromVTy N (e.scope.len + 1) b))
+  pure (M.app (M.lam (caseOf e.elabFor) (evalEnv e) fty (S.Abs x ebody)) scrut)
+
 -- Universe
 --------------------------------------------------------------------------------
 

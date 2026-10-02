@@ -32,7 +32,7 @@ const rejected = [
   ["test/errors/knot.hf", "the definition would need itself while it is being computed"],
   ["test/errors/knot-record.hf", "the definition would need itself while it is being computed"],
   ["test/errors/case-binds.hf", "which a `case` alternative cannot bind"],
-  ["test/errors/case-nested.hf", "an argument of a `case` pattern is a name"],
+  ["test/errors/case-nested.hf", "literals are matched here: one of them must match every other value"],
   ["test/errors/project-inferred.hf", "the record's shape is not in hand here for `.a`"],
   ["test/errors/no-type.hf", "test/errors/no-type.hf:7:10\nerror[E0314]: expected type Type, but got the tag Nada"],
   ["test/errors/implicit.hf", "test/errors/implicit.hf:33:8\nerror[E0327]: cannot infer the implicit argument `h`: give it, `(h := ...)`"],
@@ -86,7 +86,7 @@ console.log("interfaces: as `heff check` prints them");
 {
   const r = heff("check", "test/errors/holes.hf");
   const errors = r.stderr.match(/error\[E\d+\]: [^\n]*/g) || [];
-  const want = ["error[E0311]: expected type Int, but got type String", "error[E0308]: no such variable undefinedThing", "error[E0203]: a `case` pattern is flat", "error[E0308]: no such variable nope"];
+  const want = ["error[E0311]: expected type Int, but got type String", "error[E0308]: no such variable undefinedThing", "error[E0315]: no such tag True", "error[E0308]: no such variable nope"];
   if (r.status === 0 || errors.length !== want.length || !want.every((w, i) => errors[i].startsWith(w)) || !["f : Int -> List Int", "g : Int", "h : Int"].every((t) => r.stdout.includes(t))) {
     failed++;
     console.log(`FAIL recovering inside a definition:\n${r.stderr}\n${r.stdout}`);
