@@ -20,7 +20,7 @@ import Data.Either (Either(..))
 import Data.Foldable (foldM, foldl, for_)
 import Data.Lazy (Lazy, defer, force)
 import Control.Lazy (fix)
-import Data.Maybe (Maybe(..), fromMaybe, isJust)
+import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Parse.Notation (Diag, Ntn(..), Severity(..), Span, getGroup, ntnHead, ntnSpan)
@@ -33,15 +33,16 @@ import Data.String as Str
 import Heff.Core.Syntax as Syn
 import Heff.Elab.Unify (settle, unsolvedMetas, zonkEl, zonkTy)
 import Control.Monad.State (gets, modify_)
-import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addGlobalEntry, lookupGlobal)
+import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addBroken, addGlobalEntry, lookupGlobal)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
 import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName, selfAsLocal)
 import Data.Map as Map
 import Heff.Core.Value as V
-import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, emptyElabEnv, emptyElabEnvFor, emptySt, letAt, runE, tryPure)
-import Control.Monad.Except (catchError, throwError)
+import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, emptyElabEnv, emptyElabEnvFor, emptySt, letAt, reportedElsewhere, runE, tryPure)
+import Control.Monad.Except (throwError)
+import Control.Monad.Error.Class (try)
 import Heff.Elab.Rules as R
 import Heff.Support.Pretty (Doc, (<+>))
 import Heff.Support.Pretty as P
@@ -375,8 +376,13 @@ declJ = case _ of
 -- | Elaborate one declaration.  The definition may mention itself, as local 0
 -- | in delayed mode; its value is the knot `v = reflect x (eval [v] body)`.
 -- | `key` is the name it is stored under (its module's, qualified); a
--- | primitive keeps its own, the runtime's
-elabDecl :: (Name -> Name) -> Globals -> Ntn -> E { name :: Name, key :: Name, prim :: Boolean, entry :: GlobalEntry }
+-- | primitive keeps its own, the runtime's.
+-- |
+-- | A definition whose type elaborates and whose body does not is a
+-- | definition still, `failed`: of its type, opaque to what uses it (as a
+-- | primitive is), and abandoning if it is ever computed -- so what uses it
+-- | is checked against its type, not refused with it.
+elabDecl :: (Name -> Name) -> Globals -> Ntn -> E { name :: Name, key :: Name, prim :: Boolean, entry :: GlobalEntry, failed :: Maybe Diag }
 elabDecl key g n = do
   modify_ \st -> st { selfKey = Nothing }
   d <- declJ n
@@ -394,29 +400,36 @@ elabDecl key g n = do
     tmE = emptyElabEnvFor gSelf k
     tmE' = tmE { scope = letAt (BDelayedBy 1) d.name self aval tmE.scope, self = Just k }
   modify_ \st -> st { selfKey = Just k }
-  t <- R.runChk d.tm tmE' aval `catchError` \e -> do
-    modify_ \st -> st { selfKey = Nothing }
-    throwError e
-  -- the implicit arguments: every one inferred, and substituted in
-  stuck <- settle gSelf
-  for_ (A.head stuck) \p -> stuckDiag gSelf (ntnSpan n) p >>= throwError
-  unsolved <- unsolvedMetas
-  for_ (A.head unsolved) \u -> throwError
-    { code: 328, severity: SError, span: u.span, note: Nothing
-    , msg: P.text ("cannot infer the implicit argument `" <> u.name <> "`; give it as `{...}`")
-    }
+  body <- try do
+    t <- R.runChk d.tm tmE' aval
+    -- the implicit arguments: every one inferred, and substituted in
+    stuck <- settle gSelf
+    for_ (A.head stuck) \p -> stuckDiag gSelf (ntnSpan n) p >>= throwError
+    unsolved <- unsolvedMetas
+    for_ (A.head unsolved) \u -> throwError
+      { code: 328, severity: SError, span: u.span, note: Nothing
+      , msg: P.text ("cannot infer the implicit argument `" <> u.name <> "`; give it as `{...}`")
+      }
+    pure t
+  modify_ \st -> st { selfKey = Nothing }
   mc <- gets _.metas
   let
     tyStx = zonkTy mc a.stx
-    -- (the global it was mentioned as, while it was not yet one: the
-    -- definition itself, local 0)
-    bodyStx = selfAsLocal k (zonkEl mc t.stx)
   when (d.prim && not (isPrim d.name)) $ throwError
     { code: 329, severity: SError, span: ntnSpan n, note: Nothing
     , msg: P.text ("there is no primitive called `" <> d.name <> "` (the runtime has: " <> Str.joinWith ", " primNames <> ")")
     }
-  modify_ \st -> st { selfKey = Nothing }
-  pure { name: d.name, key: k, prim: d.prim, entry: entryFor g k d.prim tyStx bodyStx }
+  pure case body of
+    -- (as a primitive is: nothing to unfold, a neutral)
+    Left failed ->
+      { name: d.name, key: k, prim: d.prim, failed: Just failed, entry: entryFor g k true tyStx Syn.Abandon }
+    Right t ->
+      let
+        -- (the global it was mentioned as, while it was not yet one: the
+        -- definition itself, local 0)
+        bodyStx = selfAsLocal k (zonkEl mc t.stx)
+      in
+        { name: d.name, key: k, prim: d.prim, failed: Nothing, entry: entryFor g k d.prim tyStx bodyStx }
 
 -- | the entry a definition is stored as, from its core syntax alone: the
 -- | type and the body, evaluated.  Elaboration ends here, and a definition
@@ -504,8 +517,9 @@ elabWatch g n = do
 type Watch = { span :: Span, entry :: GlobalEntry }
 
 -- | `spans` says where each successfully elaborated declaration is, `keys`
--- | what each is stored under
-type TopResult = { globals :: Globals, diags :: Array Diag, spans :: Array (Tuple Name Span), infos :: Array Info, trace :: Array TraceEvent, watches :: Array Watch, tests :: Array { name :: Name, span :: Span }, keys :: Array Name }
+-- | what each is stored under; `broken`: the declarations that did not
+-- | elaborate, not even their types (where each is)
+type TopResult = { globals :: Globals, diags :: Array Diag, spans :: Array (Tuple Name Span), infos :: Array Info, trace :: Array TraceEvent, watches :: Array Watch, tests :: Array { name :: Name, span :: Span }, keys :: Array Name, broken :: Array (Tuple Name Span) }
 
 -- | elaborate on top of some existing globals (what a file imports)
 topWith :: Globals -> Array Ntn -> TopResult
@@ -514,7 +528,7 @@ topWith = topModule identity
 -- | the same, for a module: each definition `x` is stored under `key x`,
 -- | and `x` is an alias of it
 topModule :: (Name -> Name) -> Globals -> Array Ntn -> TopResult
-topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [] }
+topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [], broken: [] }
   where
   -- extension: `test name`, the watches after it (with expectations) are a
   -- test, stored as a definition of its own
@@ -527,7 +541,7 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
       , infos = acc.infos <> st.infos
       , trace = acc.trace <> st.trace
       }
-    Right (Tuple (Left d) st) -> acc { diags = A.snoc acc.diags d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
+    Right (Tuple (Left d) st) -> acc { diags = acc.diags <> reported d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
   -- an internal error in one declaration is reported, not fatal
   tryDecl acc n = case tryPure (\_ -> runE (elabDecl key acc.globals n) st0) of
     Left msg -> acc { diags = A.snoc acc.diags { code: 399, severity: SError, span: ntnSpan n, note: Nothing, msg: P.text ("internal error while elaborating this: " <> msg) } }
@@ -540,13 +554,29 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
       }
     Right (Tuple (Right d) st) -> acc
       { globals = (if d.key == d.name then identity else addAlias d.name d.key) (addGlobalEntry d.key d.entry acc.globals)
+      , diags = acc.diags <> maybe [] reported d.failed
       , spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))
       , keys = A.snoc acc.keys d.key
       , infos = acc.infos <> st.infos
       , trace = acc.trace <> st.trace
       }
-    Right (Tuple (Left d) st) -> acc { diags = A.snoc acc.diags d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
+    -- (not even its type: what uses it is not checked, and not refused)
+    Right (Tuple (Left d) st) -> case declName n of
+      Just x -> acc
+        { globals = addBroken (key x) (if key x == x then acc.globals else addAlias x (key x) acc.globals)
+        , diags = acc.diags <> reported d
+        , broken = A.snoc acc.broken (Tuple x (ntnSpan n))
+        , infos = acc.infos <> st.infos
+        , trace = acc.trace <> st.trace
+        }
+      Nothing -> acc { diags = acc.diags <> reported d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
   st0 = emptySt
+  declName n = case runE (declJ n) st0 of
+    Tuple (Right d) _ -> Just d.name
+    _ -> Nothing
+  -- (a use of a definition that did not elaborate is that definition's
+  -- error, reported there)
+  reported d = if reportedElsewhere d then [] else [ d ]
 
 -- | a definition as a cache keeps it: its key, where it is, and its core
 -- | syntax (type and body)
@@ -555,7 +585,7 @@ type ThawedDef = { name :: Name, key :: Name, span :: Span, ty :: Syn.Ty, body :
 -- | a module thawed from a cache: its definitions' syntax evaluated back
 -- | into globals -- `topModule` with the elaboration already done
 topThawed :: Globals -> Array ThawedDef -> TopResult
-topThawed g0 = foldl one { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [] }
+topThawed g0 = foldl one { globals: g0, diags: [], spans: [], infos: [], trace: [], watches: [], tests: [], keys: [], broken: [] }
   where
   one acc d =
     let

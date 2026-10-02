@@ -7,7 +7,9 @@ import Prelude
 import Data.Array as A
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), maybe)
+import Data.Set (Set)
+import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Name, panic)
 import Heff.Core.Syntax as S
@@ -21,11 +23,21 @@ type GlobalEntry = { syntax :: S.El, tySyntax :: S.Ty, value :: V.El, type_ :: V
 
 -- | `aliases` maps a name to the key it stands for.  A module's definitions
 -- | are keyed `module.name`: a file reaches its own, and those of the
--- | modules it imports, through aliases (`Heff.Driver`).
-type Globals = { order :: Array Name, entries :: Map Name GlobalEntry, aliases :: Map Name Name }
+-- | modules it imports, through aliases (`Heff.Driver`).  `broken`: the
+-- | keys of definitions that did not elaborate, not even their types (a
+-- | use of one is not an error of its own)
+type Globals = { order :: Array Name, entries :: Map Name GlobalEntry, aliases :: Map Name Name, broken :: Set Name }
 
 emptyGlobals :: Globals
-emptyGlobals = { order: [], entries: Map.empty, aliases: Map.empty }
+emptyGlobals = { order: [], entries: Map.empty, aliases: Map.empty, broken: Set.empty }
+
+addBroken :: Name -> Globals -> Globals
+addBroken k g = g { broken = Set.insert k g.broken }
+
+-- | is a name (or the key it stands for) that of a definition that did not
+-- | elaborate?
+isBroken :: Globals -> Name -> Boolean
+isBroken g x = Set.member x g.broken || maybe false (\k -> Set.member k g.broken) (Map.lookup x g.aliases)
 
 addGlobalEntry :: Name -> GlobalEntry -> Globals -> Globals
 -- | (a redefinition moves the name to the end, as the reference

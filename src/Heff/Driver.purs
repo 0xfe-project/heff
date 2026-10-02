@@ -45,7 +45,8 @@ import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
 import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
-import Heff.Core.Globals (Globals, addAlias, addGlobalEntry, emptyGlobals, lookupGlobal)
+import Heff.Core.Globals (Globals, addAlias, addBroken, addGlobalEntry, emptyGlobals, lookupGlobal)
+import Data.Set as Set
 import Heff.Core.Readback (readbTy)
 import Heff.Core.Rename (describeKey, renameEl, renameTy)
 import Heff.Core.Syntax (Abs(..), El(..), Ty(..))
@@ -54,6 +55,7 @@ import Heff.Effect (Effect(..), leaves)
 import Heff.Elab.Environment (Info)
 import Heff.Core.Params (Level(..), Universe(..), Variants(..), maxLevel)
 import Heff.Core.Value as V
+import Heff.Locals (locals)
 import Heff.Elab.Top (ThawedDef, TopResult, entryFor, topModule, topThawed, topWith)
 import Heff.Eval.Interpreter (evalGlobalsWhere, showResult)
 import Heff.Parse.Notation (Diag, Ntn, Severity(..))
@@ -83,7 +85,7 @@ type Thawed = { fixities :: Fixities, defs :: Array ThawedDef }
 
 -- | read a file into notation; a capitalised name is a definition if
 -- | `known` says so; `fixities`: those of what it imports
-readSource :: (String -> Boolean) -> Fixities -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
+readSource :: (String -> Boolean) -> Fixities -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities, broken :: Array String }
 readSource known fixities src = readProgramWith { known, fixities, lenient: false } src
 
 -- | the files of a program, in the order `Heff.Load` gives (each after what
@@ -102,9 +104,12 @@ elabNext done s thaw =
   let
       direct = A.filter (\c -> A.elem c.module s.opens) done
       needed = A.filter (\c -> A.elem c.module (closure done s.deps)) done
-      -- (each module's definitions, and the module itself, a struct of them)
-      env = A.foldl (\g c -> withEntry (c.module <> "#") c (withEntry (c.module <> "#T") c (A.foldl (\g' o -> withEntry o.key c g') g c.own))) emptyGlobals needed
+      -- (each module's definitions, and the module itself, a struct of them;
+      -- and what did not elaborate in each)
+      env = A.foldl (\g c -> withEntry (c.module <> "#") c (withEntry (c.module <> "#T") c (A.foldl (\g' o -> withEntry o.key c g') (g { broken = Set.union g.broken c.top.globals.broken }) c.own))) emptyGlobals needed
       withEntry k c g = maybe g (\e -> addGlobalEntry k e g) (lookupGlobal c.top.globals k)
+      -- (what did not elaborate in a module imported, by its name there)
+      brokenIn c = A.mapMaybe (\k -> S.stripPrefix (S.Pattern (c.module <> ".")) k <#> \x -> { name: x, key: k }) (A.fromFoldable c.top.globals.broken)
       imported = A.concatMap (\c -> map (\o -> { name: o.name, key: o.key, module: c.module }) c.own) direct
       -- a name two modules imported define, each its own way, is in scope
       -- as neither
@@ -113,11 +118,11 @@ elabNext done s thaw =
         { code: 330, severity: SError, span: { start: 0, end: 0 }, note: Nothing
         , msg: P.text ("`" <> o.name <> "` is defined by more than one module imported: " <> S.joinWith ", " (A.nub (map _.module (A.filter (\p -> p.name == o.name) imported))))
         }
-      g1 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env imported
+      g1 = A.foldl (\g o -> if o.key == o.name || A.any (\c -> c.name == o.name) clashes then g else addAlias o.name o.key g) env (imported <> A.concatMap (\c -> map (\b -> { name: b.name, key: b.key, module: c.module }) (brokenIn c)) direct)
       -- (`import m as M`: `m`'s definitions as `M.x`, and `M` the module
       -- itself, a value)
       g0 = A.foldl (\g q -> case A.find (\c -> c.module == q.module) done of
-          Just c -> A.foldl (\g' o -> addAlias (q.alias <> "." <> o.name) o.key g') (addAlias q.alias (q.module <> "#") g) c.own
+          Just c -> A.foldl (\g' o -> addAlias (q.alias <> "." <> o.name) o.key g') (addAlias q.alias (q.module <> "#") g) (map (\o -> { name: o.name, key: o.key }) c.own <> brokenIn c)
           Nothing -> g) g1 s.aliases
       key x = s.module <> "." <> x
       checked t ntns diags fixities cached =
@@ -140,7 +145,8 @@ elabNext done s thaw =
       fresh _ =
         let
           r = readSource (\x -> isJust (lookupGlobal g0 x)) (A.foldl (\f c -> union f c.fixities) emptyFixities direct) s.text
-          t = topModule key g0 r.ntns
+          -- (what does not parse: a use of it is not an error of its own)
+          t = topModule key (A.foldl (\g x -> addBroken (key x) (addAlias x (key x) g)) g0 r.broken) r.ntns
         in
           checked t r.ntns (map clash clashes <> map hint (r.diags <> t.diags)) r.fixities false
     in
@@ -512,7 +518,7 @@ definitionAt program off = do
   d <- A.head (A.mapMaybe (defines k) (A.reverse program))
   -- (the name looked for is the one at the offset: a tag's is in its type's
   -- declaration)
-  let target = { key: k, member: if i.member then Just i.name else Nothing }
+  let target = if i.member then memberT k i.name else globalT k
   pure { path: d.c.path, source: d.c.source, span: maybe (nameIn d.c.source i.name d.span) _.span (A.find (\s -> s.target == target) (sites d.c)) }
   where
   defines k c = do
@@ -542,9 +548,16 @@ isNameChar = case _ of
 -- References
 --------------------------------------------------------------------------------
 
--- | What a name refers to: a global, by its key; or a tag or a field
--- | (`member`) of the type `key` names.
-type Target = { key :: String, member :: Maybe String }
+-- | What a name refers to: a global, by its key; a tag or a field
+-- | (`member`) of the type `key` names; or a local (`local`: where its
+-- | binder is) of the file `key` is the path of.
+type Target = { key :: String, member :: Maybe String, local :: Maybe F.Span }
+
+globalT :: String -> Target
+globalT k = { key: k, member: Nothing, local: Nothing }
+
+memberT :: String -> String -> Target
+memberT k m = { key: k, member: Just m, local: Nothing }
 
 -- | a name written in a file; the span is the name's alone (`not` of
 -- | `A.not`, `t` of `.t`, `x` of `'x`); `defines`: where it is defined
@@ -567,13 +580,13 @@ sites c = A.concat (A.zipWith decl c.own c.top.spans)
     let
       text = SCU.slice sp.start sp.end src
       heads = A.mapMaybe (headAt o.name) (lineStarts (upToNext sp))
-      self = map (\h -> { target: { key: o.key, member: Nothing }, name: o.name, span: h }) heads
+      self = map (\h -> { target: globalT o.key, name: o.name, span: h }) heads
       members
         | S.take 5 text == "data " = tags sp
         | S.take 7 text == "theory " = fields sp
         | otherwise = []
     in
-      self <> map (\m -> { target: { key: o.key, member: Just m.name }, name: m.name, span: m.span }) members
+      self <> map (\m -> { target: memberT o.key m.name, name: m.name, span: m.span }) members
   lineStarts sp = A.filter (\p -> p == 0 || SCU.charAt (p - 1) src == Just '\n') (A.range sp.start (max sp.start (sp.end - 1)))
   headAt x p = A.findMap (\pre -> at (p + SCU.length pre) x pre) [ "", "(", "data ", "theory ", "foreign import " ]
     where
@@ -603,30 +616,46 @@ sites c = A.concat (A.zipWith decl c.own c.top.spans)
   nameEnd i = if isNameChar (SCU.charAt i src) && SCU.charAt i src /= Just '/' then nameEnd (i + 1) else i
 
 -- | the name at an offset, in a program (the file last), as what it refers
--- | to: a name used there, or one the file defines there; and the name it
--- | is defined as.  (A local: nothing.)
+-- | to: a global or a member used there, or one the file defines there; a
+-- | local, at its binder or a use (`Heff.Locals`); and the name it is
+-- | defined as
 targetAt :: Array Checked -> Int -> Maybe { target :: Target, name :: String }
 targetAt program off = do
   c <- A.last program
-  t <- case infoAt c off of
-    Just i -> i.key <#> \k -> { key: k, member: if i.member then Just i.name else Nothing }
-    Nothing -> _.target <$> A.find (\s -> s.span.start <= off && off <= s.span.end) (sites c)
-  name <- case t.member of
-    Just m -> Just m
-    Nothing -> A.findMap (\c' -> _.name <$> A.find (\o -> o.key == t.key) c'.own) program
-  pure { target: t, name }
+  let
+    at sp = sp.start <= off && off <= sp.end
+    ls = locals c.ntns
+    withName t = case t.member of
+      Just m -> Just { target: t, name: m }
+      Nothing -> A.findMap (\c' -> _.name <$> A.find (\o -> o.key == t.key) c'.own) program <#> \x -> { target: t, name: x }
+    site = A.find (at <<< _.span) (sites c) >>= withName <<< _.target
+    -- (a field used by the fields after it: the field's)
+    field = A.find (at <<< _.use) ls.fields >>= \f -> A.find (\s -> s.span == f.field) (sites c) >>= withName <<< _.target
+    local = A.find (\l -> at l.binder || A.any at l.uses) ls.locals <#> \l -> { target: { key: c.path, member: Nothing, local: Just l.binder }, name: l.name }
+  case infoAt c off of
+    Just i | Just k <- i.key -> withName (if i.member then memberT k i.name else globalT k)
+    _ -> site <|> field <|> local
 
 -- | every occurrence in a program of what a name refers to (`name`, as it
 -- | is defined), by file, in order: its definition, its uses -- the
 -- | elaborator's record of each -- and, as text, in the files that use it,
 -- | in a fixity declaration (an operator) and in a watch's expectation
+-- | (a local: its binder and its uses, in its file)
 occurrences :: Array Checked -> Target -> String -> Array Occurrence
-occurrences program t name = A.concatMap inFile (A.nubByEq (\a b -> a.path == b.path) program)
+occurrences program t name = case t.local of
+  Just b -> fromMaybe [] do
+    c <- A.find (\c -> c.path == t.key) program
+    l <- A.find (\l -> l.binder == b) (locals c.ntns).locals
+    pure (map (\sp -> { path: c.path, source: c.source, span: sp, defines: sp == b }) (A.sortWith _.start (A.cons l.binder l.uses)))
+  Nothing -> A.concatMap inFile (A.nubByEq (\a b -> a.path == b.path) program)
   where
   inFile c =
     let
-      defs = map _.span (A.filter (\s -> s.target == t) (sites c))
-      found = A.mapMaybe use c.top.infos <> defs
+      ss = A.filter (\s -> s.target == t) (sites c)
+      defs = map _.span ss
+      -- (a field used by the fields after it)
+      fieldUses = map _.use (A.filter (\f -> A.any (\s -> s.span == f.field) ss) (locals c.ntns).fields)
+      found = A.mapMaybe use c.top.infos <> defs <> fieldUses
       more = if A.null found then [] else fixities c <> expected c
     in
       map (\sp -> { path: c.path, source: c.source, span: sp, defines: A.any (\d -> d.start == sp.start) defs }) (A.nubByEq (\a b -> a.start == b.start) (A.sortWith _.start (found <> more)))
@@ -670,7 +699,7 @@ occurrences program t name = A.concatMap inFile (A.nubByEq (\a b -> a.path == b.
 -- | name, an operator), and is not qualified
 renameRefused :: Target -> String -> String -> Maybe String
 renameRefused t old new
-  | t.member == Nothing && not (S.contains (S.Pattern ".") t.key) = Just ("`" <> old <> "` is a primitive: its name is the runtime's")
+  | t.member == Nothing && t.local == Nothing && not (S.contains (S.Pattern ".") t.key) = Just ("`" <> old <> "` is a primitive: its name is the runtime's")
   | nameClass old /= nameClass new = Just ("`" <> new <> "` is not a name of the kind `" <> old <> "` is")
   | otherwise = Nothing
 
@@ -695,8 +724,15 @@ type DocSymbol = { name :: String, kind :: Int, span :: F.Span, selection :: F.S
 -- | (the kinds are the Language Server Protocol's: enum, interface,
 -- | function, operator; enum member, field)
 symbols :: Checked -> Array DocSymbol
-symbols c = A.zipWith one c.own c.top.spans
+symbols c = A.sortWith _.span.start (A.zipWith one c.own c.top.spans <> map broken c.top.broken)
   where
+  -- (one that did not elaborate, not even its type: still where it is)
+  broken (Tuple x sp) = { name: x, kind: kindOf x (SCU.slice sp.start sp.end c.source), span: sp, selection: nameIn c.source x sp, children: [] }
+  kindOf x text
+    | S.take 5 text == "data " = 10
+    | S.take 7 text == "theory " = 11
+    | not (isNameChar (SCU.charAt 0 x)) = 25
+    | otherwise = 12
   ss = sites c
   one o (Tuple _ sp) =
     let
@@ -705,12 +741,7 @@ symbols c = A.zipWith one c.own c.top.spans
       sel = maybe (nameIn c.source o.name sp) _.span (A.find (\s -> s.target.member == Nothing) own)
       members = A.filter (\s -> isJust s.target.member) own
       isData = S.take 5 text == "data "
-      kind
-        | isData = 10
-        | S.take 7 text == "theory " = 11
-        | not (isNameChar (SCU.charAt 0 o.name)) = 25
-        | otherwise = 12
     in
-      { name: o.name, kind, span: sp, selection: sel
+      { name: o.name, kind: kindOf o.name text, span: sp, selection: sel
       , children: map (\m -> { name: m.name, kind: if isData then 22 else 8, span: m.span }) members
       }

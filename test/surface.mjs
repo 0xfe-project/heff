@@ -69,6 +69,18 @@ for (const line of ["infixr <+> above <>", "data Doc = Fail | None | Text String
 }
 console.log("interfaces: as `heff check` prints them");
 
+
+// errors, each reported once, where it is; the rest checked still
+{
+  const r = heff("check", "test/errors/recover.hf");
+  const errors = r.stderr.match(/error\[E\d+\]/g) || [];
+  const typed = ["f : Bool -> Bool", "g : Bool", "k : Bool", "bad : Bool", "m : Bool", "not : Bool -> Bool", "n : Bool"];
+  if (r.status === 0 || errors.join() !== "error[E0150],error[E0150],error[E0311],error[E0314]" || !typed.every((t) => r.stdout.includes(t))) {
+    failed++;
+    console.log(`FAIL recovering from errors:\n${r.stderr}\n${r.stdout}`);
+  }
+}
+
 // an expectation that does not hold: what differs is shown, cut to it
 mkdirSync(join(root, "ref"), { recursive: true });
 const wrong = join(root, "ref", "wrong-expectation.hf");

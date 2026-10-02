@@ -397,9 +397,14 @@ renameChecked lib st t new = do
     renamed os = A.foldr (\o src -> SCU.take o.span.start src <> new <> SCU.drop o.span.end src) (maybe "" _.source (A.head os)) os
   after <- elabProject (\p -> maybe (readOpen s p) pure (Map.lookup p texts)) ps t.path
   let
-    target = case t.target.member of
-      Just _ -> t.target { member = Just new }
-      Nothing -> t.target { key = SCU.take (SCU.length t.target.key - SCU.length t.name) t.target.key <> new }
+    shift = SCU.length new - SCU.length t.name
+    target = case t.target.local, t.target.member of
+      -- (the binder, moved by the occurrences renamed before it)
+      Just b, _ ->
+        let at = b.start + shift * A.length (A.filter (\o -> o.path == t.path && o.span.start < b.start) t.occurrences)
+        in t.target { local = Just { start: at, end: at + SCU.length new } }
+      _, Just _ -> t.target { member = Just new }
+      _, _ -> t.target { key = SCU.take (SCU.length t.target.key - SCU.length t.name) t.target.key <> new }
     errors program = A.foldl (\n c -> n + A.length (errorsIn c)) 0 (A.nubByEq (\a b -> a.path == b.path) program)
     count = A.length (occurrences after target new)
   pure

@@ -23,7 +23,7 @@ import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
 import Control.Monad.State (gets, modify_)
-import Heff.Core.Globals (lookupGlobalKey)
+import Heff.Core.Globals (isBroken, lookupGlobalKey)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), Level(..), Universe, Variants(..), decodesInto, leq, maxLevel)
 import Heff.Core.Print (prtElR)
@@ -31,7 +31,7 @@ import Heff.Core.Rename (displayName, renameTy)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
 import Heff.Elab.Environment as Env
-import Heff.Elab.Environment (BindingMode(..), Ctx(..), E, record, traceE, ElabEnv, ElabFor(..), appElabFor, caseOf, createNominative, evalEnv, failWith, failWithNote, multiBind, projElabFor, shape, undelay, withBound)
+import Heff.Elab.Environment (BindingMode(..), Ctx(..), E, record, traceE, ElabEnv, ElabFor(..), appElabFor, caseOf, createNominative, evalEnv, failElsewhere, failWith, failWithNote, multiBind, projElabFor, shape, undelay, withBound)
 import Heff.Parse.Notation (Span)
 import Heff.Support.Pretty (Doc, (<+>))
 import Heff.Support.Pretty as P
@@ -687,4 +687,7 @@ find sp x = Syn \e ->
       Just (Tuple key ge) -> do
         record { span: sp, name: x, key: Just key, member: false, ty: defer \_ -> P.render (prtIn e ge.type_) }
         pure (Tuple (M.global key ge.value) ge.type_)
-      Nothing -> failWith sp 8 (txt "no such variable" <+> txt x <+> txt "in scope")
+      Nothing
+        -- (not an error of its own: that of the definition is reported)
+        | isBroken e.globals x -> failElsewhere sp (txt "uses" <+> txt x <> txt ", which does not elaborate")
+        | otherwise -> failWith sp 8 (txt "no such variable" <+> txt x <+> txt "in scope")

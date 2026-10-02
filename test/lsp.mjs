@@ -188,6 +188,13 @@ try {
   expect("an outline", sym("Bool") && sym("Bool").kind === 10 && sym("Bool").children.map((c) => c.name).join() === "True,False" &&
     sym("Monoid") && sym("Monoid").kind === 11 && sym("Monoid").children.map((c) => c.name).join() === "t,m" &&
     sym("not") && sym("not").kind === 12 && sym("not").selectionRange.start.line === pos(basics, "not :").line, outline.result);
+  // what does not elaborate is in the outline too, where it is
+  const recover = disk("test/errors/recover.hf");
+  open("test/errors/recover.hf", recover);
+  await diagnosticsOf(uri("test/errors/recover.hf"));
+  const rOutline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/errors/recover.hf") } });
+  expect("an outline of what does not elaborate", rOutline.result && ["Bool", "f", "g", "h", "k", "bad", "m", "not", "n"].join() === rOutline.result.map((y) => y.name).join(), rOutline.result && rOutline.result.map((y) => y.name));
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/errors/recover.hf") } });
   const wsym = await request("workspace/symbol", { query: "twic" });
   expect("the project's symbols", wsym.result && wsym.result.some((s) => s.name === "twice" && s.location.uri === uri("test/surface/basics.hf")), wsym.result);
 
@@ -216,7 +223,7 @@ try {
   const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not True") });
   expect("prepare a rename", prep.result && prep.result.placeholder === "not" && prep.result.range.start.line === pos(a, "not True").line, prep);
   const prepLocal = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
-  expect("no rename of a local", !prepLocal.result, prepLocal);
+  expect("prepare a rename of a local", prepLocal.result && prepLocal.result.placeholder === "ys", prepLocal);
   const prepPrim = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "intAdd") });
   expect("no rename of a primitive", prepPrim.error && prepPrim.error.message.includes("primitive"), prepPrim);
   const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "neg" });
@@ -229,6 +236,35 @@ try {
   const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "twice" });
   expect("no rename to a name already there", captured.error && captured.error.message.includes("twice"), captured);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hf") } });
+
+  // a local: its binder and its uses, in its equation only (`f` is bound by
+  // each equation of `map`); renamed there, unless the new name would be
+  // captured, or capture a name used there
+  const lineOf = (r) => r.range.start.line;
+  const eq2 = pos(basics, "map f (Cons").line;
+  const fRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "f y"), context: { includeDeclaration: true } });
+  expect("references of a local", fRefs.result && fRefs.result.length === 3 && fRefs.result.every((r) => lineOf(r) === eq2), fRefs.result);
+  const yRen = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "y ys) = Cons"), newName: "z" });
+  const yEdits = yRen.result && yRen.result.changes[uri("test/surface/basics.hf")];
+  expect("a rename of a local", yEdits && yEdits.length === 2 && yEdits.every((e) => lineOf(e) === eq2 && e.newText === "z"), yRen);
+  const yCaught = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "y ys) = Cons"), newName: "ys" });
+  expect("no rename of a local to a name it would be captured by", yCaught.error, yCaught);
+  const yCaptures = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "y ys) = Cons"), newName: "map" });
+  expect("no rename of a local to a name used under it", yCaptures.error, yCaptures);
+
+  // a lambda's annotated binder, `\(r : R) -> ...`: its uses are its
+  const ann = disk("test/surface/binder-ann.hf");
+  open("test/surface/binder-ann.hf", ann);
+  await diagnosticsOf(uri("test/surface/binder-ann.hf"));
+  const rRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/binder-ann.hf") }, position: pos(ann, "r.a + r.b"), context: { includeDeclaration: true } });
+  const annLine = pos(ann, "r.a + r.b").line;
+  expect("references of an annotated binder", rRefs.result && rRefs.result.length === 3 && rRefs.result.every((r) => lineOf(r) === annLine), rRefs.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/binder-ann.hf") } });
+
+  // a theory's field, used by the fields after it and projected
+  const tRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "t -> t -> t"), context: { includeDeclaration: true } });
+  const tLines = tRefs.result ? tRefs.result.map(lineOf) : [];
+  expect("references of a field", tLines.includes(pos(basics, "t : Type").line) && tLines.filter((l) => l === pos(basics, "m : t").line).length === 3 && tLines.includes(pos(basics, "r.t").line), tRefs.result);
 
   // formatting: one edit, the whole text; what does not parse is left, with a warning
   const messy = "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";

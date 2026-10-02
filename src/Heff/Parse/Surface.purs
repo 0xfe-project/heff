@@ -66,7 +66,7 @@ lex = lexImpl
 -- | `fix`: the fixities in scope; `lenient`: an operator with none, or two
 -- | unrelated, bind as one left-associative group (for reading a file on its
 -- | own, without what it imports: the formatter's)
-type St = { toks :: Array Tok, i :: Int, stack :: Array Int, scope :: Array String, known :: String -> Boolean, start :: Int, binders :: Array { f :: String, names :: Array String, implicits :: Array String }, patVars :: Array String, fix :: Fixities, lenient :: Boolean }
+type St = { toks :: Array Tok, i :: Int, top :: Int, stack :: Array Int, scope :: Array String, known :: String -> Boolean, start :: Int, binders :: Array { f :: String, names :: Array String, implicits :: Array String }, patVars :: Array String, fix :: Fixities, lenient :: Boolean }
 
 type P a = ExceptT Diag (State St) a
 
@@ -78,17 +78,20 @@ readProgram known src = let r = readProgramWith { known, fixities: emptyFixities
 -- | `fixities`: those of what the file imports; the result's, the file's own
 type Options = { known :: String -> Boolean, fixities :: Fixities, lenient :: Boolean }
 
-readProgramWith :: Options -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities }
+-- | `broken`: the names of the declarations that do not parse (a signature
+-- | with an equation that does not is a declaration still, of `abandon`:
+-- | its type is known to what uses it)
+readProgramWith :: Options -> String -> { ntns :: Array Ntn, diags :: Array Diag, fixities :: Fixities, broken :: Array String }
 readProgramWith o src =
   let
     l = lexImpl src
     lexDiags = map (\e -> diag { start: e.start, end: e.end } e.msg) l.errors
     declared = prescan l.tokens
     own = fixityDecls o.fixities l.tokens
-    st0 = { toks: l.tokens, i: 0, stack: [ 0 ], scope: [], known: \x -> o.known x || A.elem x declared, start: 0, binders: [], patVars: [], fix: union o.fixities own.fixities, lenient: o.lenient }
+    st0 = { toks: l.tokens, i: 0, top: 0, stack: [ 0 ], scope: [], known: \x -> o.known x || A.elem x declared, start: 0, binders: [], patVars: [], fix: union o.fixities own.fixities, lenient: o.lenient }
     r = evalState (program []) st0
   in
-    { ntns: assemble r.items r.diags, diags: lexDiags <> own.diags <> r.diags <> assembleDiags r.items, fixities: own.fixities }
+    { ntns: assemble r.broken r.items, diags: lexDiags <> own.diags <> r.diags <> assembleDiags r.broken r.items, fixities: own.fixities, broken: r.broken }
 
 -- | the fixity declarations of a file, `infixl + - above ==`, read before
 -- | the rest (an operator may be used before its declaration); `imported`:
@@ -170,33 +173,40 @@ data Item
   | Eqn String Ntn Span -- ^ `f p ... := e`, as the equations of `Heff.Elab.Clauses`
   | Decl Ntn
 
-program :: Array Item -> State St { items :: Array Item, diags :: Array Diag }
-program acc = go acc []
+program :: Array Item -> State St { items :: Array Item, diags :: Array Diag, broken :: Array String }
+program acc = go acc [] []
   where
-  go items diags = do
+  go items diags broken = do
+    modify_ \s -> s { scope = [], stack = [ 0 ], start = s.i, top = s.i }
     t <- gets cur
-    if t.kind == "eof" then pure { items, diags }
+    if t.kind == "eof" then pure { items, diags, broken }
     else do
-      modify_ \s -> s { scope = [], stack = [ 0 ], start = s.i }
       r <- runExceptT decl
       case r of
         Right d -> do
           -- a declaration ends where the next begins
           t' <- gets cur
-          if t'.kind == "eof" || (t'.first && t'.col == 0) then go (items <> d) diags
+          if t'.kind == "eof" then go (items <> d) diags broken
           else do
             skipDecl
-            go (items <> d) (A.snoc diags (diag (spanOf t') ("unexpected `" <> t'.text <> "`")))
+            go (items <> d) (A.snoc diags (diag (spanOf t') ("unexpected `" <> t'.text <> "`"))) broken
         Left d -> do
+          x <- gets declared
           skipDecl
-          go items (A.snoc diags d)
+          go items (A.snoc diags d) (broken <> A.fromFoldable x)
+  -- the name the declaration starting at `top` defines, as far as it says
+  declared s = case A.index s.toks s.top, A.index s.toks (s.top + 1) of
+    Just t, Just u | t.kind == "kw" && A.elem t.text [ "data", "type", "theory" ] -> Just u.text
+    Just t, Just u | t.text == "(" && u.kind == "sym" -> Just u.text
+    Just t, _ | t.kind == "var" || t.kind == "con" -> Just t.text
+    _, _ -> Nothing
 
--- | on to the next declaration
+-- | on to the next declaration (the first token of this one, at least)
 skipDecl :: State St Unit
 skipDecl = do
-  modify_ \s -> s { i = s.i + 1, stack = [ 0 ], scope = [] }
+  modify_ \s -> s { i = max s.i (s.top + 1), stack = [ 0 ], scope = [] }
   t <- gets cur
-  unless (t.kind == "eof" || (t.first && t.col == 0)) skipDecl
+  unless (t.kind == "eof") (modify_ (\s -> s { i = s.i + 1 }) *> skipDecl)
 
 decl :: P (Array Item)
 decl = lazyP \_ -> do
@@ -395,8 +405,8 @@ foreignDecl = lazyP \_ -> do
   pure (MDecl [] "primitive" (Infix (Ident x.text (spanOf x)) (Keyword ":" sp) ty) sp)
 
 -- | signatures meet their equations: `def f : T where <equations> end`
-assemble :: Array Item -> Array Diag -> Array Ntn
-assemble items _ = A.mapMaybe one items
+assemble :: Array String -> Array Item -> Array Ntn
+assemble broken items = A.mapMaybe one items
   where
   one = case _ of
     Decl n -> Just n
@@ -405,12 +415,16 @@ assemble items _ = A.mapMaybe one items
             Eqn g e _ | g == f -> Just e
             _ -> Nothing) items
       in
-        if A.null eqs then Nothing
-        else Just (MDecl [] "def" (Infix (Ident f sp) (Keyword ":" sp) (Juxt ty (NBlock "where" Nothing eqs sp))) sp)
+        -- (an equation that does not parse: `f = abandon`, not what the
+        -- others match without it)
+        if A.elem f broken then Just (def f ty sp [ Infix (Ident f sp) (Keyword ":=" sp) (Keyword "abandon" sp) ])
+        else if A.null eqs then Nothing
+        else Just (def f ty sp eqs)
     Eqn _ _ _ -> Nothing
+  def f ty sp eqs = MDecl [] "def" (Infix (Ident f sp) (Keyword ":" sp) (Juxt ty (NBlock "where" Nothing eqs sp))) sp
 
-assembleDiags :: Array Item -> Array Diag
-assembleDiags items = A.mapMaybe one items
+assembleDiags :: Array String -> Array Item -> Array Diag
+assembleDiags broken items = A.mapMaybe one items
   where
   sigs = A.mapMaybe (case _ of
     Sig f _ _ -> Just f
@@ -419,8 +433,8 @@ assembleDiags items = A.mapMaybe one items
     Eqn f _ _ -> Just f
     _ -> Nothing) items
   one = case _ of
-    Sig f _ sp | not (A.elem f eqNames) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
-    Eqn f _ sp | not (A.elem f sigs) -> Just (diag sp ("`" <> f <> "` needs a type: `" <> f <> " : …`"))
+    Sig f _ sp | not (A.elem f eqNames) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
+    Eqn f _ sp | not (A.elem f sigs) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` needs a type: `" <> f <> " : …`"))
     _ -> Nothing
 
 -- Expressions
@@ -585,7 +599,7 @@ atom :: P Ntn
 atom = lazyP \_ -> do
   t <- peek
   b <- atBoundary
-  when (b || not (startsAtom t)) $ throwError (diag (spanOf t) ("expected an expression, not `" <> t.text <> "`"))
+  when (b || not (startsAtom t)) $ throwError (diag (spanOf t) ("expected an expression, not " <> shown t))
   base <- case t.kind of
     "var" -> next *> pure (Ident t.text (spanOf t))
     "con" -> do
@@ -611,7 +625,7 @@ atom = lazyP \_ -> do
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
     "punct" | t.text == "[" -> listOf expr
-    _ -> throwError (diag (spanOf t) ("expected an expression, not `" <> t.text <> "`"))
+    _ -> throwError (diag (spanOf t) ("expected an expression, not " <> shown t))
   fields base
   where
   fields n = do
@@ -896,7 +910,7 @@ patAtom = lazyP \_ -> do
         p <- pattern
         _ <- expectPunct ")"
         pure p
-    _, _ -> throwError (diag (spanOf t) ("expected a pattern, not `" <> t.text <> "`"))
+    _, _ -> throwError (diag (spanOf t) ("expected a pattern, not " <> shown t))
 
 patVars :: Ntn -> Array String
 patVars n = case NEA.uncons (getGroup n) of
@@ -912,7 +926,24 @@ lazyP :: forall a. (Unit -> P a) -> P a
 lazyP f = pure unit >>= f
 
 cur :: St -> Tok
-cur s = fromMaybe eofTok (A.index s.toks s.i)
+cur s = tokAt s s.i
+
+-- | the token at an index, as the declaration being read sees it: a line
+-- | starting at the left margin begins the next declaration, so it is the
+-- | end of this one -- in brackets too, where lines end nothing else.  (The
+-- | end is where the last token before it ends.)
+tokAt :: St -> Int -> Tok
+tokAt s j = case A.index s.toks j of
+  Just t | j > s.top && t.first && t.col == 0 && t.kind /= "eof" -> endAt
+  Just t | t.kind /= "eof" -> t
+  _ -> endAt
+  where
+  e = maybe 0 _.end (A.index s.toks (j - 1))
+  endAt = eofTok { start = e, end = e }
+
+-- | a token, as an error says what it found
+shown :: Tok -> String
+shown t = if t.kind == "eof" then "the end of the declaration" else "`" <> t.text <> "`"
 
 eofTok :: Tok
 eofTok = { kind: "eof", text: "", start: 0, end: 0, line: 0, col: 0, first: true }
@@ -921,7 +952,7 @@ peek :: P Tok
 peek = gets cur
 
 peekAt :: Int -> P Tok
-peekAt k = gets \s -> fromMaybe eofTok (A.index s.toks (s.i + k))
+peekAt k = gets \s -> tokAt s (s.i + k)
 
 -- | where the last token read ends (a closing parenthesis, which the span of
 -- | what is in it leaves out, included)
@@ -1012,22 +1043,22 @@ expectAnn = do
 expectSym :: String -> P Tok
 expectSym x = do
   t <- peek
-  if t.kind == "sym" && t.text == x then next else throwError (diag (spanOf t) ("expected `" <> x <> "`, not `" <> t.text <> "`"))
+  if t.kind == "sym" && t.text == x then next else throwError (diag (spanOf t) ("expected `" <> x <> "`, not " <> shown t))
 
 expectPunct :: String -> P Tok
 expectPunct x = do
   t <- peek
-  if t.kind == "punct" && t.text == x then next else throwError (diag (spanOf t) ("expected `" <> x <> "`, not `" <> t.text <> "`"))
+  if t.kind == "punct" && t.text == x then next else throwError (diag (spanOf t) ("expected `" <> x <> "`, not " <> shown t))
 
 expectKw :: String -> P Tok
 expectKw x = do
   t <- peek
-  if t.kind == "kw" && t.text == x then next else throwError (diag (spanOf t) ("expected `" <> x <> "`, not `" <> t.text <> "`"))
+  if t.kind == "kw" && t.text == x then next else throwError (diag (spanOf t) ("expected `" <> x <> "`, not " <> shown t))
 
 expectKind :: String -> String -> P Tok
 expectKind k what = do
   t <- peek
-  if t.kind == k then next else throwError (diag (spanOf t) ("expected " <> what <> ", not `" <> t.text <> "`"))
+  if t.kind == k then next else throwError (diag (spanOf t) ("expected " <> what <> ", not " <> shown t))
 
 spanOf :: Tok -> Span
 spanOf t = { start: t.start, end: t.end }

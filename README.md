@@ -36,9 +36,16 @@ npm link          # puts `heff` on the PATH
 
 For VS Code, `editors/vscode` is an extension: highlighting, and the
 language server (diagnostics, hover, go to definition, completion,
-formatting, an outline; and over the whole project: references, renaming,
-symbols).  A rename is refused when it would change what the program
-means: a name captured by one already there, or a new error.
+formatting, an outline; and over the whole project: references, renaming
+-- of globals, tags, fields and locals -- and symbols).  A rename is
+refused when it would change what the program means: a name captured by
+one already there, or a new error.
+
+An error is reported once, where it is, and the rest is checked still: a
+definition whose body does not elaborate keeps its type for what uses it
+(and abandons if computed); one whose type does not, or that does not
+parse, is not an error again where it is used; a declaration that does
+not parse ends where the next begins.
 
 ## Commands
 

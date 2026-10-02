@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// The formatter (src/Heff/Format.purs): every .hf file of the repository is
-// formatted (the formatter checks itself that the result means the same and
+// The formatter (src/Heff/Format.purs): every .hf file of the repository
+// (that parses) is formatted (the formatter checks itself that the result means the same and
 // keeps the comments) and formatting it again changes nothing; then cases
 // of comments, blank lines, blocks and watches, some with the exact result.
 import { execFileSync } from "node:child_process";
@@ -30,8 +30,14 @@ const formats = (what, src, want) => {
   if (want !== undefined) expect(what, r.out === want, r.out);
 };
 
+// (but those that do not parse on purpose, which are left)
+const unparsed = ["test/errors/recover.hf"];
 const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
-for (const f of files) formats(f, readFileSync(join(root, f), "utf8"));
+for (const f of files) {
+  const src = readFileSync(join(root, f), "utf8");
+  if (!unparsed.includes(f)) formats(f, src);
+  else { const r = run(src); expect(f + " is left", !r.ok && r.why.includes("does not parse"), JSON.stringify(r)); }
+}
 
 formats("spacing", "data Bool = True | False\nnot : Bool -> Bool\nnot   True =    False\nnot False = True\n",
   "data Bool = True | False\nnot : Bool -> Bool\nnot True = False\nnot False = True\n");

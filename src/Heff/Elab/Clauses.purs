@@ -180,7 +180,9 @@ compile used sp vars rows = case A.head rows of
         _ -> true) rows
     yesB <- compile used sp (dropAt c vars) yes
     noB <- compile used sp vars no
-    let cond = group (NEA.cons' (Ident (equalityOf l) lsp) [ Ident v lsp, l ])
+    -- (the variable matched is no name written here: its span is the
+    -- definition's, not the literal's)
+    let cond = group (NEA.cons' (Ident (equalityOf l) lsp) [ Ident v sp, l ])
     pure (NBlock "match" (Just cond) [ Infix (NTag "True" lsp) (Keyword "=>" lsp) yesB, Infix (NTag "False" lsp) (Keyword "=>" lsp) noB ] lsp)
   tagOf = case _ of
     PTag t ps s -> Just { tag: t, arity: A.length ps, pats: ps, span: s }

@@ -188,5 +188,15 @@ record i = modify_ (\s -> s { infos = A.snoc s.infos i })
 failWith :: forall a. Span -> Int -> Doc -> E a
 failWith sp code msg = throwError { code: 300 + code, severity: SError, msg, span: sp, note: Nothing }
 
+-- | a failure that is not an error of its own: what it comes of (a
+-- | definition that did not elaborate) is reported where it is.  Its code
+-- | is no diagnostic's
+failElsewhere :: forall a. Span -> Doc -> E a
+failElsewhere sp msg = throwError { code: -1, severity: SError, msg, span: sp, note: Nothing }
+
+-- | is a diagnostic one of `failElsewhere`'s, reported where it comes from?
+reportedElsewhere :: Diag -> Boolean
+reportedElsewhere d = d.code == -1
+
 failWithNote :: forall a. Span -> Int -> Doc -> Doc -> E a
 failWithNote sp code msg note = throwError { code: 300 + code, severity: SError, msg, span: sp, note: Just note }
