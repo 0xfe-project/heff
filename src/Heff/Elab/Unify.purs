@@ -25,7 +25,7 @@ module Heff.Elab.Unify
 
 import Prelude
 
-import Control.Monad.Except (ExceptT, runExceptT, throwError)
+import Control.Monad.Except (ExceptT, catchError, runExceptT, throwError)
 import Control.Monad.State (State, gets, modify_)
 import Control.Monad.Trans.Class (lift)
 import Data.Array as A
@@ -136,7 +136,9 @@ uTy :: Globals -> CtxShape -> V.Ty -> V.Ty -> U Unit
 uTy g cs a0 b0 = do
   a <- forceTU a0
   b <- forceTU b0
-  case flexTy a, flexTy b of
+  -- (an error hole is equal to anything: before a metavariable is solved
+  -- with it)
+  if V.isErrorTy a || V.isErrorTy b then pure unit else case flexTy a, flexTy b of
     Just (Tuple m sp), _ -> solve g cs m sp (V.code b) (V.code a)
     _, Just (Tuple m sp) -> solve g cs m sp (V.code a) (V.code b)
     _, _ -> case a, b of
@@ -156,7 +158,7 @@ uTy g cs a0 b0 = do
       _, _ -> throwError (UnequalTys cs a b Nothing)
 
 uBare :: Globals -> CtxShape -> V.BareNeutral -> V.BareNeutral -> U Unit
-uBare g cs n n' = case n.spine, n'.spine of
+uBare g cs n n' = if n.head == V.Error || n'.head == V.Error then pure unit else case n.spine, n'.spine of
   V.Id, V.Id -> if n.head == n'.head then pure unit else throwError (UnequalNeus cs n n' Nothing)
   V.App sq v, V.App sq' v' -> do
     uBare g cs (n { spine = sq }) (n' { spine = sq' })
@@ -186,7 +188,7 @@ uEl :: Globals -> CtxShape -> V.El -> V.El -> U Unit
 uEl g cs a0 b0 = do
   a <- forceU a0
   b <- forceU b0
-  case a, b of
+  if V.isError a || V.isError b then pure unit else case a, b of
     V.Opaque, _ -> pure unit
     _, V.Opaque -> pure unit
     _, _ -> case flexOf a, flexOf b of
@@ -275,13 +277,18 @@ solve g cs m sp rhs self = do
         let ren = { dom: cs.len, cod: A.length args, ren: Map.fromFoldable (A.mapMaybe (\(Tuple i a) -> case a of
               PVar l -> Just (Tuple l i)
               PSelf -> Nothing) (A.mapWithIndex Tuple args)) }
-        body <- rename g m ren rhs
-        let
-          k = A.length args
-          stx = lams k body
-          val = V.nom (eval { local: V.LNil, global: g } N stx)
-        modify_ \s -> s { metas = Map.update (\e -> Just e { sol = Just val, solStx = Just stx }) m s.metas }
-        traceSolve m stx
+        -- (one mentioning an error hole is no solution: the metavariable is
+        -- left as it is)
+        renamed <- catchError (Just <$> rename g m ren rhs) case _ of
+          MentionsError -> pure Nothing
+          err -> throwError err
+        for_ renamed \body -> do
+          let
+            k = A.length args
+            stx = lams k body
+            val = V.nom (eval { local: V.LNil, global: g } N stx)
+          modify_ \s -> s { metas = Map.update (\e -> Just e { sol = Just val, solStx = Just stx }) m s.metas }
+          traceSolve m stx
 
 -- | record a solution in the trace, at the metavariable's span
 traceSolve :: Int -> S.El -> U Unit
@@ -345,6 +352,7 @@ renameHead r = case _ of
     Nothing -> scopeError
   V.Global x -> pure (S.Global x)
   V.Meta _ -> scopeError
+  V.Error -> throwError MentionsError
 
 renameSpine :: Globals -> Int -> PRen -> V.Spine -> S.El -> U S.El
 renameSpine g m r sp h = case sp of

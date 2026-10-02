@@ -90,10 +90,11 @@ cloName (CloConst _) = Nothing
 -- Neutrals
 --------------------------------------------------------------------------------
 
--- | a local is a de Bruijn *level*
 -- | a local is a de Bruijn level; a meta is an implicit argument being
--- | inferred (see `Heff.Elab.Unify`)
-data Head = Local Int | Global Name | Meta Int
+-- | inferred (see `Heff.Elab.Unify`); an error is what did not elaborate,
+-- | of the type it was checked at -- so that what is around it is checked
+-- | still.  It is equal to anything, and never part of a solution.
+data Head = Local Int | Global Name | Meta Int | Error
 
 derive instance eqHead :: Eq Head
 
@@ -152,6 +153,22 @@ reflect head spineL ty edesc = case edesc of
 
 local :: Int -> Ty -> El
 local i a = reflect (Local i) (pure Id) (pure a) Nothing
+
+-- | an error hole, of a type
+errorHole :: Ty -> El
+errorHole a = reflect Error (pure Id) (pure a) Nothing
+
+-- | is it an error hole (applied, projected), or the type it decodes?
+isError :: El -> Boolean
+isError = case _ of
+  Neu n -> n.head == Error
+  Code (Decode n) -> n.head == Error
+  _ -> false
+
+isErrorTy :: Ty -> Boolean
+isErrorTy = case _ of
+  Decode n -> n.head == Error
+  _ -> false
 
 localL :: Int -> Lazy Ty -> El
 localL i a = reflect (Local i) (pure Id) a Nothing

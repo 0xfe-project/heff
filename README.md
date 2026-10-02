@@ -41,11 +41,14 @@ formatting, an outline; and over the whole project: references, renaming
 refused when it would change what the program means: a name captured by
 one already there, or a new error.
 
-An error is reported once, where it is, and the rest is checked still: a
-definition whose body does not elaborate keeps its type for what uses it
-(and abandons if computed); one whose type does not, or that does not
-parse, is not an error again where it is used; a declaration that does
-not parse ends where the next begins.
+An error is reported once, where it is, and the rest is checked still.
+Inside a definition, what does not elaborate -- an argument, a `case`
+alternative, a field, a lambda's body -- is an error hole of the type it
+was checked at: equal to anything, and never what an implicit argument is
+inferred to be.  A definition with an error keeps its type for what uses
+it (and abandons if computed); one whose type does not elaborate, or that
+does not parse, is not an error again where it is used; a declaration
+that does not parse ends where the next begins.
 
 ## Commands
 

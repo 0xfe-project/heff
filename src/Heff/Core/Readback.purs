@@ -19,6 +19,9 @@ readbHead n = case _ of
   V.Local i -> S.Local (n - i - 1)
   V.Global x -> S.Global x
   V.Meta m -> S.MetaApp m [] (S.U SmallU)
+  -- (computed, an error hole abandons: it is never, as the definitions
+  -- that have one are not)
+  V.Error -> S.Abandon
 
 readbSpine :: CtxLen -> V.Spine -> S.El -> S.El
 readbSpine n = case _ of

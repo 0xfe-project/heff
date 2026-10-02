@@ -40,7 +40,7 @@ import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName, selfAsLocal)
 import Data.Map as Map
 import Heff.Core.Value as V
-import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, emptyElabEnv, emptyElabEnvFor, emptySt, letAt, reportedElsewhere, runE, tryPure)
+import Heff.Elab.Environment (BindingMode(..), E, ElabFor(..), Info, TraceEvent, emptyElabEnv, emptyElabEnvFor, emptySt, failElsewhere, letAt, reportedElsewhere, runE, tryPure)
 import Control.Monad.Except (throwError)
 import Control.Monad.Error.Class (try)
 import Heff.Elab.Rules as R
@@ -74,7 +74,7 @@ fieldDeclaration n = failP (ntnSpan n) 1 (P.text "expected a field declaration o
 
 fieldSetting :: Case -> Ntn -> E R.FieldSetting
 fieldSetting c (Infix (Ident x xsp) (Keyword ":=" _) n) = do
-  v <- chk c n
+  v <- recoveringChk (chk c n)
   pure { name: x, chk: v, span: ntnSpan n, nameSpan: xsp }
 fieldSetting _ n = failP (ntnSpan n) 2 (P.text "expected a field setting of the form `x = v`")
 
@@ -141,7 +141,7 @@ doPat n = case NEA.uncons (getGroup n) of
 doCase :: Ntn -> E (Tuple Name (Tuple (Array Name) R.Chk))
 doCase (Infix pat (Keyword "=>" _) bodyN) = do
   Tuple x xs <- doPat pat
-  body <- chk N bodyN
+  body <- recoveringChk (chk N bodyN)
   pure (Tuple x (Tuple xs body))
 doCase n = unexpectedNotation n "case in a match statement"
 
@@ -169,7 +169,7 @@ parseHead c n = case n of
   Keyword "Type" _ -> pure (fromTypN c (R.universeFormation SmallU))
   -- Introduction rules (except for tag)
   Infix (Ident x _) (Keyword "=>" _) bodyN -> do
-    body <- chk c bodyN
+    body <- recoveringChk (chk c bodyN)
     pure (ChkJ (R.functionIntro (ntnSpan n) x body))
   -- extension: `\(x :: T) -> e` annotates the binder; a body that
   -- synthesises makes the lambda synthesise, and say an argument type
@@ -187,7 +187,7 @@ parseHead c n = case n of
       TypJ j -> pure (fromChkN c (R.functionIntroAnn (ntnSpan n) x dom (R.universeIntro (ntnSpan bodyN) j)))
   -- extension: `{x} => e` names an implicit argument
   Infix (NBrace (Ident x _) _) (Keyword "=>" _) bodyN -> do
-    body <- chk c bodyN
+    body <- recoveringChk (chk c bodyN)
     pure (ChkJ (R.functionIntroImplicit (ntnSpan n) x body))
   NBlock "struct" Nothing fields sp -> do
     fieldSettings <- traverse (fieldSetting c) fields
@@ -228,7 +228,7 @@ parseHead c n = case n of
 parse :: Case -> Ntn -> E Judgment
 parse c n = case NEA.uncons (getGroup n) of
   { head: NTag x tsp, tail: ns } ->
-    (\args -> fromChkN c (R.sumIntro (ntnSpan n) tsp x args)) <$> traverse (chk N) ns
+    (\args -> fromChkN c (R.sumIntro (ntnSpan n) tsp x args)) <$> traverse argument ns
   { head: Keyword "Array" _, tail: [ n0 ] } ->
     (\a -> fromTypN c (R.primArray a)) <$> typ N n0
   { head: Keyword "rec" _, tail: [ n0 ] } ->
@@ -242,10 +242,21 @@ parse c n = case NEA.uncons (getGroup n) of
 elim :: Int -> R.Syn -> Ntn -> E R.Syn
 elim _ s (NField x sp) = pure (R.recordElim sp s x)
 -- extension: `f (x := a)` (the new syntax) gives the implicit argument `x`
-elim start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> chk N n
+elim start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> argument n
 -- extension: `f {a}` gives an implicit argument
-elim start s (NBrace n sp) = R.functionElimImplicit { start, end: sp.end } s <$> chk N n
-elim start s n = R.functionElimC (checksOnly n) { start, end: (ntnSpan n).end } s <$> chk N n
+elim start s (NBrace n sp) = R.functionElimImplicit { start, end: sp.end } s <$> argument n
+elim start s n = R.functionElimC (checksOnly n) { start, end: (ntnSpan n).end } s <$> argument n
+
+-- | an argument: where it does not check, an error hole
+argument :: Ntn -> E R.Chk
+argument n = recoveringChk (chk N n)
+
+-- | a check, recovered from where it fails (`R.recovering`) -- where its
+-- | notation is not read (a pattern that is not flat, say) too
+recoveringChk :: E R.Chk -> E R.Chk
+recoveringChk m = try m <#> case _ of
+  Right c -> R.recovering c
+  Left d -> R.recovering (R.Chk \_ _ -> throwError d)
 
 -- | notation that can only be checked, never synthesised
 checksOnly :: Ntn -> Boolean
@@ -387,6 +398,8 @@ elabDecl key g n = do
   modify_ \st -> st { selfKey = Nothing }
   d <- declJ n
   a <- R.runTyp d.ty (emptyElabEnv g)
+  -- (a type with an error hole is no type to give the definition)
+  recovered
   let
     aval = M.tyN a
     k = if d.prim then d.name else key d.name
@@ -404,6 +417,9 @@ elabDecl key g n = do
     t <- R.runChk d.tm tmE' aval
     -- the implicit arguments: every one inferred, and substituted in
     stuck <- settle gSelf
+    -- (errors recovered from, settling too: reported, and what follows
+    -- from them -- implicit arguments not inferred -- is not)
+    recovered
     for_ (A.head stuck) \p -> stuckDiag gSelf (ntnSpan n) p >>= throwError
     unsolved <- unsolvedMetas
     for_ (A.head unsolved) \u -> throwError
@@ -446,6 +462,13 @@ entryFor g k prim tyStx bodyStx =
     -- a primitive has no definition to unfold: it is a neutral
     value = if prim then V.reflect (V.Global k) (pure V.Id) (pure aval) Nothing else force vL
   in { syntax: bodyStx, tySyntax: tyStx, value, type_: aval }
+
+-- | fail, if errors were recovered from (they are reported, this is not:
+-- | `reportedElsewhere`)
+recovered :: E Unit
+recovered = do
+  ds <- gets _.recovered
+  unless (A.null ds) $ failElsewhere { start: 0, end: 0 } (P.text "errors recovered from")
 
 -- | a constraint unification could not solve, said where the implicit
 -- | argument it is about was to be inferred (else where the declaration is)
@@ -501,6 +524,8 @@ elabWatch g n = do
     _ -> failP (ntnSpan n) 0 (P.text "a watch must say what type it has: write `-- >>> (e : T)`")
   Tuple t ty <- R.runSyn s (emptyElabEnv g)
   stuck <- settle g
+  -- (what settling met that was recovered from, too)
+  recovered
   for_ (A.head stuck) \p -> stuckDiag g (ntnSpan n) p >>= throwError
   unsolved <- unsolvedMetas
   for_ (A.head unsolved) \u -> throwError
@@ -536,46 +561,49 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
   tryDecl acc (MDecl [] "test" n _) = acc { diags = A.snoc acc.diags { code: 211, severity: SError, span: ntnSpan n, note: Nothing, msg: P.text "a test is named: `test <name>`" } }
   tryDecl acc (MDecl [] ">" e sp) = case tryPure (\_ -> runE (elabWatch acc.globals e) st0) of
     Left msg -> acc { diags = A.snoc acc.diags { code: 399, severity: SError, span: sp, note: Nothing, msg: P.text ("internal error while elaborating this: " <> msg) } }
-    Right (Tuple (Right entry) st) -> acc
-      { watches = A.snoc acc.watches { span: sp, entry }
-      , infos = acc.infos <> st.infos
-      , trace = acc.trace <> st.trace
-      }
-    Right (Tuple (Left d) st) -> acc { diags = acc.diags <> reported d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
+    Right (Tuple (Right entry) st) -> (after acc st []) { watches = A.snoc acc.watches { span: sp, entry } }
+    Right (Tuple (Left d) st) -> after acc st (reported d)
   -- an internal error in one declaration is reported, not fatal
   tryDecl acc n = case tryPure (\_ -> runE (elabDecl key acc.globals n) st0) of
     Left msg -> acc { diags = A.snoc acc.diags { code: 399, severity: SError, span: ntnSpan n, note: Nothing, msg: P.text ("internal error while elaborating this: " <> msg) } }
     -- (a primitive declared again, by another module, is the same one)
-    Right (Tuple (Right d) st) | d.prim && isJust (lookupGlobal acc.globals d.key) -> acc
+    Right (Tuple (Right d) st) | d.prim && isJust (lookupGlobal acc.globals d.key) -> (after acc st [])
       { spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))
       , keys = A.snoc acc.keys d.key
-      , infos = acc.infos <> st.infos
-      , trace = acc.trace <> st.trace
       }
-    Right (Tuple (Right d) st) -> acc
+    Right (Tuple (Right d) st) -> (after acc st (maybe [] reported d.failed))
       { globals = (if d.key == d.name then identity else addAlias d.name d.key) (addGlobalEntry d.key d.entry acc.globals)
-      , diags = acc.diags <> maybe [] reported d.failed
       , spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))
       , keys = A.snoc acc.keys d.key
-      , infos = acc.infos <> st.infos
-      , trace = acc.trace <> st.trace
       }
     -- (not even its type: what uses it is not checked, and not refused)
     Right (Tuple (Left d) st) -> case declName n of
-      Just x -> acc
+      Just x -> (after acc st (reported d))
         { globals = addBroken (key x) (if key x == x then acc.globals else addAlias x (key x) acc.globals)
-        , diags = acc.diags <> reported d
         , broken = A.snoc acc.broken (Tuple x (ntnSpan n))
-        , infos = acc.infos <> st.infos
-        , trace = acc.trace <> st.trace
         }
-      Nothing -> acc { diags = acc.diags <> reported d, infos = acc.infos <> st.infos, trace = acc.trace <> st.trace }
+      Nothing -> after acc st (reported d)
   st0 = emptySt
-  declName n = case runE (declJ n) st0 of
-    Tuple (Right d) _ -> Just d.name
+  -- (the name a declaration defines, from its notation: it may not be read
+  -- further)
+  declName = case _ of
+    MDecl _ _ (Infix h (Keyword ":=" _) _) _ -> headName h
+    MDecl _ _ h _ -> headName h
     _ -> Nothing
+  headName = case _ of
+    Infix h (Keyword ":" _) _ -> headName h
+    h -> case NEA.head (getGroup h) of
+      Ident x _ -> Just x
+      _ -> Nothing
+  -- what a declaration's elaboration learned, kept: what it found for the
+  -- IDE, its trace, the errors it recovered from, then `ds`
+  after acc st ds = acc
+    { diags = acc.diags <> A.concatMap reported st.recovered <> ds
+    , infos = acc.infos <> st.infos
+    , trace = acc.trace <> st.trace
+    }
   -- (a use of a definition that did not elaborate is that definition's
-  -- error, reported there)
+  -- error, reported there; so are errors recovered from, as they were)
   reported d = if reportedElsewhere d then [] else [ d ]
 
 -- | a definition as a cache keeps it: its key, where it is, and its core

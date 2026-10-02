@@ -22,7 +22,8 @@ import Heff.Support.Common (Dict, Name, dictContains, dictFromList, dictLength, 
 import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
-import Control.Monad.State (gets, modify_)
+import Control.Monad.State (get, gets, modify_)
+import Control.Monad.Except (catchError)
 import Heff.Core.Globals (isBroken, lookupGlobalKey)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), Level(..), Universe, Variants(..), decodesInto, leq, maxLevel)
@@ -58,6 +59,17 @@ runSyn (Syn f) = f
 
 runChk :: Chk -> ElabEnv -> V.Ty -> E M.El
 runChk (Chk f) = f
+
+-- | Where a check fails, the error is kept and an error hole of the type
+-- | checked at takes its place, so that what is around it is checked still.
+-- | What the failed check left waiting (a delayed argument, a postponed
+-- | problem) is dropped with it; the metavariables it made stay, unsolved.
+recovering :: Chk -> Chk
+recovering c = Chk \e a -> do
+  saved <- get
+  catchError (runChk c e a) \d -> do
+    modify_ \s -> s { recovered = A.snoc s.recovered d, delayed = saved.delayed, postponed = saved.postponed }
+    pure { stx: S.Abandon, val: pure (V.Nom (V.errorHole a)) }
 
 txt :: String -> Doc
 txt = P.text

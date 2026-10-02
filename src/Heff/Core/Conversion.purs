@@ -29,6 +29,8 @@ data DefEqCheckError
   = UnequalTys CtxShape V.Ty V.Ty (Maybe Doc)
   | UnequalEls CtxShape V.El V.El (Maybe Doc)
   | UnequalNeus CtxShape V.BareNeutral V.BareNeutral (Maybe Doc)
+  -- | a solution would mention an error hole (it is not given)
+  | MentionsError
 
 type DefEqM = Either DefEqCheckError Unit
 
@@ -37,6 +39,7 @@ prettyDefEqError rn = case _ of
   UnequalTys cs a a' r -> P.text "types" <+> prtTyR rn cs a <+> P.text "and" <+> prtTyR rn cs a' <+> P.text "are not equal" <+> because r
   UnequalEls cs a a' r -> P.text "elements" <+> prtElR rn cs a <+> P.text "and" <+> prtElR rn cs a' <+> P.text "are not equal" <+> because r
   UnequalNeus cs a a' r -> P.text "neutrals" <+> prtBareR rn cs a <+> P.text "and" <+> prtBareR rn cs a' <+> P.text "are not equal" <+> because r
+  MentionsError -> P.text "a solution would mention what did not elaborate"
   where
   because = case _ of
     Nothing -> mempty
@@ -87,7 +90,7 @@ defEqTy cs a a' = case a, a' of
 
 defEqHead :: CtxShape -> V.Head -> V.Head -> DefEqM
 defEqHead cs h h' =
-  if h == h' then ok
+  if h == h' || h == V.Error || h' == V.Error then ok
   else Left (UnequalNeus cs { head: h, spine: V.Id } { head: h', spine: V.Id } Nothing)
 
 defEqBare :: CtxShape -> V.BareNeutral -> V.BareNeutral -> DefEqM

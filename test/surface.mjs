@@ -82,6 +82,17 @@ console.log("interfaces: as `heff check` prints them");
   }
 }
 
+// errors inside a definition, each reported once; the rest checked still
+{
+  const r = heff("check", "test/errors/holes.hf");
+  const errors = r.stderr.match(/error\[E\d+\]: [^\n]*/g) || [];
+  const want = ["error[E0311]: expected type Int, but got type String", "error[E0308]: no such variable undefinedThing", "error[E0203]: a `case` pattern is flat", "error[E0308]: no such variable nope"];
+  if (r.status === 0 || errors.length !== want.length || !want.every((w, i) => errors[i].startsWith(w)) || !["f : Int -> List Int", "g : Int", "h : Int"].every((t) => r.stdout.includes(t))) {
+    failed++;
+    console.log(`FAIL recovering inside a definition:\n${r.stderr}\n${r.stdout}`);
+  }
+}
+
 // an expectation that does not hold: what differs is shown, cut to it
 mkdirSync(join(root, "ref"), { recursive: true });
 const wrong = join(root, "ref", "wrong-expectation.hf");

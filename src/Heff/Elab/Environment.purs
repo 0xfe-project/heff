@@ -131,10 +131,13 @@ type Info = { span :: Span, name :: Name, key :: Maybe Name, member :: Boolean, 
 type TraceEvent = { span :: Span, kind :: String, text :: Lazy String }
 
 -- | The state of elaborating one definition: what it learned for the IDE,
--- | its metacontext, and the conversion problems waiting for a metavariable.
--- | It starts empty for every definition and is dropped at its end.
+-- | its metacontext, the conversion problems waiting for a metavariable,
+-- | and the errors recovered from (`recovered`: each where it is, an error
+-- | hole in its place).  It starts empty for every definition and is
+-- | dropped at its end.
 type ElabSt =
   { infos :: Array Info
+  , recovered :: Array Diag
   , metas :: V.MetaCtx
   , nextMeta :: Int
   -- (`failed`: retried and found contradictory, kept to be reported)
@@ -151,7 +154,7 @@ type ElabSt =
 newtype Delayed = Delayed { ty :: V.Ty, check :: ExceptT Diag (State ElabSt) Unit }
 
 emptySt :: ElabSt
-emptySt = { infos: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], selfKey: Nothing }
+emptySt = { infos: [], recovered: [], metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: [], selfKey: Nothing }
 
 
 
