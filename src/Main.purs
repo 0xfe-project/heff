@@ -13,6 +13,8 @@ import Effect (Effect)
 import Effect.Console (log)
 import Heff.Compile.JavaScript (compileApp, compileJs, compileNode)
 import Heff.Cache (loadCached)
+import Heff.Core.Dump (dumpDef)
+import Heff.Core.Globals (lookupGlobal)
 import Heff.Driver (Checked, errorsIn, explain, evaluate, findRunnable, interface, promote, renderFileDiags, testFile, typeAt, watches)
 import Heff.Elab.Environment (enableTraceSink, takeTraceSink)
 import Heff.Format (format)
@@ -37,6 +39,7 @@ commands =
   , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: [] }
   , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (stdio, fs, proc, time, net)", files: ".hf", flags: [] }
   , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: [] }
+  , { name: "dump-nbe", args: "FILE", doc: "each definition over compiler/'s formers, with its normal forms (the port's differential)", files: ".hf", flags: [] }
   , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: [] }
   , { name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hf", flags: [ { flag: "check", doc: "only say which are not formatted" } ] }
   , { name: "lsp", args: "", doc: "a language server, on stdin/stdout", files: "", flags: [] }
@@ -112,6 +115,11 @@ main = do
     [ "app", f, n, out ] -> app f (Just n) out
     [ "node", f, out ] -> program f Nothing out
     [ "node", f, n, out ] -> program f (Just n) out
+    [ "dump-nbe", f ] -> do
+      l <- load f
+      for_ l.file.own \o -> for_ (lookupGlobal l.file.top.globals o.key) \e ->
+        log (dumpDef l.file.top.globals o.key e)
+      when (not l.ok) (exit' 1)
     [ "explain", f ] -> do
       -- the trace is kept outside the state too, so an internal error does
       -- not take it along
