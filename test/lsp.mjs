@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // The language server (`heff lsp`), spoken to as an editor would: diagnostics
-// (of the editor's text, and of an import's unsaved text), hover and go to
+// (of the editor's text, and of an import's unsaved text, of a file as deep
+// as the command line goes), files changed on disk, hover and go to
 // definition (across modules, past non-ASCII text), completion, an outline,
 // references and renaming across the project, formatting, shutdown.
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -56,17 +57,30 @@ const pos = (text, s, n = 0) => {
 };
 const open = (f, text) => notify("textDocument/didOpen", { textDocument: { uri: uri(f), languageId: "heff", version: 1, text } });
 
+let ds;
 try {
-  const init = await request("initialize", { processId: process.pid, rootUri: pathToFileURL(root).href, capabilities: {} });
+  const init = await request("initialize", { processId: process.pid, rootUri: pathToFileURL(root).href, capabilities: { workspace: { didChangeWatchedFiles: { dynamicRegistration: true } } } });
   const caps = init.result.capabilities;
   expect("capabilities", caps.hoverProvider && caps.definitionProvider && caps.documentFormattingProvider && caps.textDocumentSync.change === 1 &&
     caps.referencesProvider && caps.renameProvider.prepareProvider && caps.documentSymbolProvider && caps.workspaceSymbolProvider, caps);
   notify("initialized", {});
+  // (asked to be told of the files changed on disk)
+  const registration = await note((m) => m.method === "client/registerCapability", "client/registerCapability");
+  expect("watching files", registration.params.registrations[0].method === "workspace/didChangeWatchedFiles" && registration.params.registrations[0].registerOptions.watchers[0].globPattern === "**/*.hf", registration);
+  write({ id: registration.id, result: null });
+
+  // a file as deep as the elaborator must go deep for: the server's stack is
+  // the command line's
+  const deep = "import prelude\n\nxs : List Int\nxs = [" + Array.from({ length: 20000 }, (_, i) => i).join(", ") + "]\n";
+  open("test/surface/lsp-deep.hf", deep);
+  ds = await diagnosticsOf(uri("test/surface/lsp-deep.hf"));
+  expect("a deep file", ds.length === 0, ds);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-deep.hf") } });
 
   // a type error, in the editor's text (not the file's)
   const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = not (not "x")\n';
   open("test/modules/b.hf", bad);
-  let ds = await diagnosticsOf(uri("test/modules/b.hf"));
+  ds = await diagnosticsOf(uri("test/modules/b.hf"));
   const at = pos(bad, '"x"');
   expect("a type error's diagnostic", ds.length === 1 && ds[0].code === "E0311" && ds[0].severity === 1 &&
     ds[0].range.start.line === at.line && ds[0].range.start.character === at.character && ds[0].range.end.character === at.character + 3 &&
@@ -260,6 +274,21 @@ try {
   const annLine = pos(ann, "r.a + r.b").line;
   expect("references of an annotated binder", rRefs.result && rRefs.result.length === 3 && rRefs.result.every((r) => lineOf(r) === annLine), rRefs.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/binder-ann.hf") } });
+
+  // a file changed on disk, not in the editor: told of, the project is
+  // elaborated again
+  open("test/modules/a.hf", a);
+  await diagnosticsOf(uri("test/modules/a.hf"));
+  const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: false } })).result || [];
+  const watched = "test/modules/lsp-watched.hf";
+  expect("before a file is made", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
+  writeFileSync(join(root, watched), "import a\n\ny : Bool\ny = not True\n");
+  notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 1 }] });
+  expect("a file made on disk", (await refsOfNot()).some((r) => r.uri === uri(watched)), "");
+  unlinkSync(join(root, watched));
+  notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 3 }] });
+  expect("a file deleted on disk", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hf") } });
 
   // a theory's field, used by the fields after it and projected
   const tRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "t -> t -> t"), context: { includeDeclaration: true } });

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // heff runs in a thread of its own, whose stack is deep enough for the
-// interpreter to go as deep as a program does (a list of a million, say);
-// the language server, which speaks on stdin and stdout, runs here.
+// interpreter to go as deep as a program does (a list of a million, say),
+// and the elaborator as deep as a file does -- the language server too,
+// which speaks on stdin (given to its thread) and stdout.
 //
 // The formatter is written in heff (fmt/): before `fmt` or `lsp`, it is
 // compiled -- by heff itself -- when output/heff-fmt.mjs is missing or
@@ -30,7 +31,7 @@ const ensureFmt = () => {
 };
 
 const cmd = process.argv[2];
-if (!isMainThread || cmd === "lsp") {
+if (!isMainThread) {
   if (cmd === "fmt" || cmd === "lsp") {
     ensureFmt();
     const m = await import(pathToFileURL(fmtJs));
@@ -39,7 +40,10 @@ if (!isMainThread || cmd === "lsp") {
   const { main } = await import(pathToFileURL(join(root, "output", "Main", "index.js")));
   main();
 } else {
-  const worker = new Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: { stackSizeMb: 512 } });
+  const lsp = cmd === "lsp";
+  const worker = new Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: { stackSizeMb: 512 }, stdin: lsp });
+  // (the client's messages, to the server's thread; when it ends, heff does)
+  if (lsp) process.stdin.pipe(worker.stdin);
   worker.on("error", (e) => { console.error(e); process.exitCode = 1; });
-  worker.on("exit", (code) => { if (code !== 0) process.exitCode = code; });
+  worker.on("exit", (code) => { if (lsp) process.exit(code); else if (code !== 0) process.exitCode = code; });
 }

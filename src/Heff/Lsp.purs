@@ -59,19 +59,22 @@ foreign import projectFilesImpl :: String -> Effect (Array String)
 
 -- | the documents open, by path; the last elaboration of each (of what
 -- | text); the checks waiting for the typing to pause; the project last
--- | elaborated, by its root (forgotten when a document changes)
+-- | elaborated, by its root (forgotten when a document changes, in the
+-- | editor or on disk); whether the client tells of files changed on disk
+-- | when asked to (`watch`)
 type St =
   { docs :: Map String { uri :: String, text :: String }
   , checked :: Map String { text :: String, program :: Array Checked }
   , timers :: Map String Timer
   , project :: Maybe { root :: String, program :: Array Checked }
+  , watch :: Boolean
   , shutdown :: Boolean
   }
 
 -- | serve on stdin/stdout, with the standard library at `lib`
 serve :: String -> Effect Unit
 serve lib0 = do
-  st <- Ref.new { docs: Map.empty, checked: Map.empty, timers: Map.empty, project: Nothing, shutdown: false }
+  st <- Ref.new { docs: Map.empty, checked: Map.empty, timers: Map.empty, project: Nothing, watch: false, shutdown: false }
   listenImpl \body -> case jsonParser body of
     Left e -> logImpl ("not JSON: " <> e)
     Right msg -> handle (absPath lib0) st msg
@@ -157,7 +160,9 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
   params = fromMaybe J.jsonNull (field "params" msg)
 
   request m id p = case m of
-    "initialize" -> reply id $ obj
+    "initialize" -> do
+     Ref.modify_ (_ { watch = fromMaybe false (path [ "capabilities", "workspace", "didChangeWatchedFiles", "dynamicRegistration" ] p >>= J.toBoolean) }) st
+     reply id $ obj
       [ Tuple "capabilities" $ obj
           [ Tuple "textDocumentSync" (obj [ Tuple "openClose" J.jsonTrue, Tuple "change" (num 1), Tuple "save" (obj [ Tuple "includeText" J.jsonFalse ]) ])
           , Tuple "hoverProvider" J.jsonTrue
@@ -228,11 +233,29 @@ handle lib st msg = case str [ "method" ] msg, field "id" msg of
 
   notification m p = do
     -- (a document changed: the project is elaborated again when asked about)
-    when (S.take 13 m == "textDocument/") (Ref.modify_ (_ { project = Nothing }) st)
+    when (S.take 13 m == "textDocument/" || m == "workspace/didChangeWatchedFiles") (Ref.modify_ (_ { project = Nothing }) st)
     notification' m p
 
   notification' m p = case m of
     "exit" -> Ref.read st >>= \s -> exit' (if s.shutdown then 0 else 1)
+    -- (the files of a project, changed on disk -- by `jj`, `git`, another
+    -- editor -- are told of: the client is asked to)
+    "initialized" -> Ref.read st >>= \s -> when s.watch $
+      send
+        [ Tuple "id" (J.fromString "heff-watch")
+        , Tuple "method" (J.fromString "client/registerCapability")
+        , Tuple "params" $ obj
+            [ Tuple "registrations" $ J.fromArray
+                [ obj
+                    [ Tuple "id" (J.fromString "heff-watch")
+                    , Tuple "method" (J.fromString "workspace/didChangeWatchedFiles")
+                    , Tuple "registerOptions" (obj [ Tuple "watchers" (J.fromArray [ obj [ Tuple "globPattern" (J.fromString "**/*.hf") ] ]) ])
+                    ]
+                ]
+            ]
+        ]
+    -- (what the documents open import may be what changed)
+    "workspace/didChangeWatchedFiles" -> Ref.read st >>= \s -> for_ (Map.keys s.docs) (check lib st)
     "textDocument/didOpen" -> for_ (docPath p) \f -> do
       let uri = fromMaybe "" (str [ "textDocument", "uri" ] p)
       Ref.modify_ (\s -> s { docs = Map.insert f { uri, text: fromMaybe "" (str [ "textDocument", "text" ] p) } s.docs }) st
