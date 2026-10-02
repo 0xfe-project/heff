@@ -418,7 +418,7 @@ effectOf g e = case e of
   Global "dom.dom" -> Just (Leaf "dom")
   Global "stdio.stdio" -> Just (Leaf "stdio")
   Global "fs.fs" -> Just (Leaf "fs")
-  Global "proc.proc" -> Just (Leaf "proc")
+  Global "process.process" -> Just (Leaf "process")
   Global "time.time" -> Just (Leaf "time")
   Global "net.net" -> Just (Leaf "net")
   App (Global "state.state") _ -> Just (Leaf "state")
@@ -450,7 +450,7 @@ findRunnable handled c = case _ of
     Nothing, Just r -> fits r
     Nothing, Nothing -> Left ("no computation, `Co h a`, of the effects " <> S.joinWith ", " handled)
   where
-  known = "dom, stdio, fs, proc, time, net, state s and their sums"
+  known = "dom, stdio, fs, process, time, net, state s and their sums"
   computations = A.mapMaybe (\o -> effectOf' o.key <#> \eff -> { name: o.name, key: o.key, effect: eff }) c.own
   missing eff = A.nub (A.filter (\l -> not (A.elem l handled)) (leaves eff))
   fits r = case missing r.effect of

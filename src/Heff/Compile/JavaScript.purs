@@ -63,7 +63,7 @@ compileApp :: Globals -> String -> Effect -> Output
 compileApp = compileRun []
 
 -- | a Node.js program (an ES module) that runs a computation of the effect
--- | `eff` (of `stdio`, `fs`, `proc`, `time`, `net` and `state`)
+-- | `eff` (of `stdio`, `fs`, `process`, `time`, `net` and `state`)
 compileNode :: Globals -> String -> Effect -> Output
 compileNode g key eff =
   compileRun (if A.elem "fs" (leaves eff) then [ "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";" ] else []) g key eff
@@ -480,7 +480,7 @@ runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []
     "state" -> Just state
     "stdio" -> Just stdio
     "fs" -> Just fsA
-    "proc" -> Just proc
+    "process" -> Just proc
     "time" -> Just time
     "net" -> Just net
     _ -> Nothing
@@ -569,7 +569,7 @@ runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []
   -- (`Exit` does not go on: the process ends when what is pending, output
   -- being written, is done)
   proc = S.joinWith "\n"
-    [ "const $proc = () => {"
+    [ "const $process = () => {"
     , "  const nothing = { $: \"Nothing\", a: [] };"
     , "  const just = (x) => ({ $: \"Just\", a: [x] });"
     , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
@@ -579,7 +579,7 @@ runtimeFor eff = S.joinWith "\n" ([ run ] <> (if hasSum eff then [ sum ] else []
     , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
     , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
     , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
-    , "      default: throw new Error(\"heff: not an operation of proc: \" + (p && p.$));"
+    , "      default: throw new Error(\"heff: not an operation of process: \" + (p && p.$));"
     , "    }"
     , "  };"
     , "};"
