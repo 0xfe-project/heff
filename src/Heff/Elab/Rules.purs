@@ -18,7 +18,7 @@ import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String as Text
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..))
-import Heff.Support.Common (Dict, Name, dictContains, dictFromList, dictLength, dictLookup, dictToList)
+import Heff.Support.Common (Dict, Name, dictAt, dictContains, dictFromList, dictKeyIndex, dictLength, dictLookup, dictToList)
 import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
 import Heff.Elab.Unify (blockedTy, forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
 import Heff.Core.Readback (readbTy)
@@ -28,7 +28,7 @@ import Heff.Core.Globals (isBroken, lookupGlobalKey)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), Level(..), Universe(..), Variants(..), decodesInto, leq, maxLevel)
 import Heff.Core.Print (prtElR)
-import Heff.Core.Rename (displayName, renameTy)
+import Heff.Core.Rename (displayName, mentionsInnermost, renameTy)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
 import Heff.Elab.Environment as Env
@@ -540,7 +540,14 @@ recordElim sp projectee x = Syn \e -> do
         Just fieldTy -> do
           recordName e a x sp fieldTy
           pure (Tuple (M.proj eprojectee x) fieldTy)
-        Nothing -> failWith sp 32 (notInHand x)
+        -- (the value's fields are not in hand -- it was computed through
+        -- a `case` -- and the field's type is what it is without them, or
+        -- it depends on them)
+        Nothing -> case fieldTyApart e.scope.len rt x of
+          Just fieldTy -> do
+            recordName e a x sp fieldTy
+            pure (Tuple (M.proj eprojectee x) fieldTy)
+          Nothing -> failWith sp 32 (txt ("the type of `." <> x <> "` depends on the fields before it, and what this record's are is not known here"))
     -- the type is a neutral nothing unfolds here: inferred, and too late
     -- for its fields
     V.NoRules -> blockedTy a >>= if _ then errorOf else failWith sp 32 (notInHand x)
@@ -548,6 +555,20 @@ recordElim sp projectee x = Syn \e -> do
   where
   notInHand f =
     txt ("the record's shape is not in hand here for `." <> f <> "`: annotate the binder, `\\(x : T) -> ...`, or give the implicit argument, `(a := T)`")
+
+-- | The type of field `x`, in a context of `len` locals, of a record of
+-- | type `rt` whose fields are not known: each field before it a local of
+-- | its own (or the value the type fixes it to, `~ { t = ... }`), and the
+-- | type, if it mentions none of them
+fieldTyApart :: Int -> V.RecordType -> Name -> Maybe V.Ty
+fieldTyApart len rt x =
+  let
+    i = dictKeyIndex rt.fieldTypes x
+    fieldAt j vs = (dictAt rt.fieldTypes j) (V.LChunkSnoc rt.capture vs)
+    before = A.foldl (\vs j -> let f = fieldAt j vs in A.snoc vs (fromMaybe (V.local (len + j) f.ty) f.value)) [] (if i == 0 then [] else A.range 0 (i - 1))
+    ty = (fieldAt i before).ty
+  in
+    if mentionsInnermost i (readbTy (len + i) ty) then Nothing else Just ty
 
 recordSpec :: Span -> Syn -> Name -> Chk -> Syn
 recordSpec sp s x c = Syn \e -> do

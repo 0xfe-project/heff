@@ -6,6 +6,7 @@ module Heff.Core.Rename
   , globalsInEl
   , globalsInTy
   , selfAsLocal
+  , mentionsInnermost
   , describeKey
   , displayName
   ) where
@@ -134,6 +135,41 @@ selfAsLocal k = el 0
     S.IsTy t -> S.IsTy (ty d t)
     S.PrimArray t -> S.PrimArray (ty d t)
     other -> other
+
+-- | Does a type mention any of the `n` innermost locals (indices below
+-- | `n`, where it is)?
+mentionsInnermost :: Int -> S.Ty -> Boolean
+mentionsInnermost n = ty 0
+  where
+  hit d i = i >= d && i < d + n
+  under :: forall a. (Int -> a -> Boolean) -> Int -> S.Abs a -> Boolean
+  under f d = case _ of
+    S.Abs _ t -> f (d + 1) t
+    S.AbsConst t -> f d t
+  el d = case _ of
+    S.Local i -> hit d i
+    S.Code t -> ty d t
+    S.App f a -> el d f || el d a
+    S.Lam dom b -> ty d dom || under el d b
+    S.Cons c -> A.any (el d) (dictValues c)
+    S.Proj e _ -> el d e
+    S.Tag _ as -> A.any (el d) as
+    S.Match e cs -> el d e || A.any (\(Tuple xs b) -> el (d + A.length xs) b) (dictValues cs)
+    S.Specialize e _ v -> el d e || el d v
+    S.Is e -> el d e
+    S.Rec e -> el d e
+    S.Implicit _ e -> el d e
+    S.MetaApp _ xs t -> A.any (hit d) xs || ty d t
+    _ -> false
+  ty d = case _ of
+    S.Decode e -> el d e
+    S.Function f -> ty d f.dom || under ty d f.cod
+    -- (a record type is a telescope: each field's type sees the ones before)
+    S.Record rt -> A.any identity (A.mapWithIndex (\i t -> ty (d + i) t) rt.fieldTypes.values)
+    S.Sum (Variants vs) -> A.any (A.any (ty d)) (dictValues vs)
+    S.IsTy t -> ty d t
+    S.PrimArray t -> ty d t
+    _ -> false
 
 -- | a global key as the name it is known by where it is shown: a module's
 -- | definition (`module.name`) by its alias, if it has one
