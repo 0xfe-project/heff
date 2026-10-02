@@ -570,7 +570,14 @@ sumIntroNow sp tsp x cs = Chk \e a0 -> do
             failWith sp 16 (txt "wrong number of arguments for tag" <+> txt x <+> txt "in type" <+> prtIn e a)
       Nothing -> failWith sp 15 (txt "no such tag" <+> txt x <+> txt "in type" <+> prtIn e a)
     _ | isFlexTy a -> failWith sp 14 (txt "cannot check tag syntax at a type that is not known: annotate it, as in `(" <> txt (tagText x) <> txt " ... : T)`")
-    _ -> failWith sp 14 (txt "cannot check tag syntax at non-sum type")
+    -- (as any mismatch: what was expected, and what was given -- at `Type`
+    -- too, as `List Nope` gives `List` its argument; a capitalised name is
+    -- read as a tag when it names no definition or binder)
+    _ ->
+      let msg = txt "expected type" <+> prtIn e a <> txt ", but got the tag" <+> txt (tagText x)
+      in
+        if tagText x == x then failWithNote tsp 14 msg (txt x <+> txt "names no definition or binder in scope, so it is read as a tag")
+        else failWith tsp 14 msg
 
 -- | a tag or a field, where it is written, as a name of the type it is of
 -- | (a sum's, a record's), defined where that type is (the type named by a
