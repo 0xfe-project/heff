@@ -561,7 +561,7 @@ parens = lazyP \_ -> do
     if isOperator t && t2.text == ")" then do
       op <- next
       Paren o (Atom op) <$> next
-    else if (t.kind == "var" || t.kind == "con") && t2.text == ":=" then do
+    else if (t.kind == "var" || t.kind == "con") && t2.kind == "sym" && t2.text == ":=" then do
       x <- next
       k <- next
       e <- expr

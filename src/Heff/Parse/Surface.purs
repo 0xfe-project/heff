@@ -670,7 +670,7 @@ parens = lazyP \_ -> do
       _ <- next
       pure (Ident t.text (spanOf t))
     -- (`(x := e)`: the implicit argument named `x`, capitalised or not)
-    else if (t.kind == "var" || t.kind == "con") && t2.text == ":=" then do
+    else if (t.kind == "var" || t.kind == "con") && t2.kind == "sym" && t2.text == ":=" then do
       _ <- next
       _ <- next
       e <- expr
