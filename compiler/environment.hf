@@ -1,0 +1,360 @@
+-- The elaboration environment and state: a port of
+-- `Heff.Elab.Environment`.  `E` is the elaborator's monad -- the state
+-- threaded, a diagnostic thrown -- written out as a function, as
+-- fmt/cst.hf writes its parser's; this module's `bind` is what `do`
+-- takes in the modules that import it unqualified.  `ElabSt` holds
+-- delayed checks, which are themselves computations in `E`: the state is
+-- a `data` (`MkSt core delayed`) so the knot may be tied.
+
+import compiler.dict as D
+import compiler.eval as E
+import compiler.globals as G
+import compiler.params as P
+import compiler.syntax as Sx
+import compiler.value as V
+import map as M
+import prelude
+
+data Severity = SError | SWarning | SDebug
+
+-- | a diagnostic: its message is plain text here (the reference renders
+-- | documents; the port joins words)
+type Diag =
+  { code : Int
+  , severity : Severity
+  , msg : String
+  , span : P.Span
+  , note : Maybe String
+  }
+
+-- Scope
+--------------------------------------------------------------------------------
+
+data BindingMode = BDelayedBy Int
+
+data Ctx = CEmpty | CBind Ctx BindingMode V.Ty | CUndelay Ctx
+
+type Scope =
+  { len : Int, names : List String, locals : V.Locals V.V, ctx : Ctx }
+
+emptyScope : Scope
+emptyScope = { len = 0, names = Nil, locals = LNil, ctx = CEmpty }
+
+undelayScope : Scope -> Scope
+undelayScope sd =
+  { len = sd.len, names = sd.names, locals = sd.locals, ctx = CUndelay sd.ctx }
+
+letAt : BindingMode -> String -> V.V -> V.Ty -> Scope -> Scope
+letAt bm x v a c =
+  { len = c.len + 1
+  , names = Cons x c.names
+  , locals = V.snocL c.locals v
+  , ctx = CBind c.ctx bm a
+  }
+
+let_ : String -> V.V -> V.Ty -> Scope -> Scope
+let_ x v a c = letAt (BDelayedBy 0) x v a c
+
+bindAt : BindingMode -> String -> V.Ty -> Scope -> Scope
+bindAt bm x a c = letAt bm x (V.local c.len a) a c
+
+bindName : String -> V.Ty -> Scope -> Scope
+bindName x a c = bindAt (BDelayedBy 0) x a c
+
+multiBind : List String -> List V.Ty -> Scope -> Scope
+multiBind (Cons x xs) (Cons a as) s = multiBind xs as (bindName x a s)
+multiBind _ _ s = s
+
+withBound : {a : Type} -> String -> V.Ty -> Scope -> (V.V -> Scope -> a) -> a
+withBound x a c action = action (V.local c.len a) (let_ x (V.local c.len a) a c)
+
+shape : Scope -> P.CtxShape
+shape c = { len = c.len, names = c.names }
+
+-- Elaboration environment
+--------------------------------------------------------------------------------
+
+data ElabFor = ForNominative | ForDescriptive V.Head (V.Spine V.V)
+
+caseOf : ElabFor -> P.Case
+caseOf ForNominative = N
+caseOf (ForDescriptive _ _) = De
+
+projElabFor : ElabFor -> String -> ElabFor
+projElabFor ForNominative _ = ForNominative
+projElabFor (ForDescriptive h sp) x = ForDescriptive h (SpProj sp x)
+
+appElabFor : ElabFor -> V.V -> ElabFor
+appElabFor ForNominative _ = ForNominative
+appElabFor (ForDescriptive h sp) v = ForDescriptive h (SpApp sp v)
+
+createNominative : ElabFor -> V.Ev V.V -> V.Ty -> V.V
+createNominative ForNominative v _ = V.nom v
+createNominative (ForDescriptive h sp) ev a =
+  V.reflect h (\u -> sp) (\u -> a) (Just ev)
+
+-- | `lams`: how many lambdas the elaboration has entered; `self`: the
+-- | key of the definition being elaborated, bound as local 0
+type ElabEnv =
+  { scope : Scope
+  , globals : G.Globals
+  , elabFor : ElabFor
+  , lams : Int
+  , self : Maybe String
+  }
+
+evalEnv : ElabEnv -> V.Locals V.V
+evalEnv e = e.scope.locals
+
+emptyElabEnv : G.Globals -> ElabEnv
+emptyElabEnv globals =
+  { scope = emptyScope
+  , globals = globals
+  , elabFor = ForNominative
+  , lams = 0
+  , self = Nothing
+  }
+
+emptyElabEnvFor : G.Globals -> String -> ElabEnv
+emptyElabEnvFor globals x =
+  { scope = emptyScope
+  , globals = globals
+  , elabFor = ForDescriptive (HGlobal x) SpId
+  , lams = 0
+  , self = Nothing
+  }
+
+-- State
+--------------------------------------------------------------------------------
+
+-- | what elaboration learns for the IDE: what a name at a span resolved
+-- | to (the type's rendering waits for the printer)
+type Info = { span : P.Span, name : String, key : Maybe String, member : Bool }
+
+type TraceEvent = { span : P.Span, kind : String }
+
+type Postponed = { shape : P.CtxShape, left : V.V, right : V.V, failed : Bool }
+
+type StCore =
+  { infos : List Info
+  , recovered : List Diag
+  , poisoned : M.Map Int Unit
+  , metas : V.MetaCtx
+  , nextMeta : Int
+  , postponed : List Postponed
+  , trace : List TraceEvent
+  , selfKey : Maybe String
+  }
+
+-- | an argument whose check waits until the type it is checked at is
+-- | known.  It is a computation over the whole state, so the state is a
+-- | `data`, and the field parametric, to tie the knot.
+data Delayed st = MkDelayed V.Ty (st -> Pair (Either Diag Unit) st)
+
+data ElabSt = MkSt StCore (List (Delayed ElabSt))
+
+emptyCore : StCore
+emptyCore =
+  { infos = Nil
+  , recovered = Nil
+  , poisoned = M.empty
+  , metas = M.empty
+  , nextMeta = 0
+  , postponed = Nil
+  , trace = Nil
+  , selfKey = Nothing
+  }
+
+emptySt : ElabSt
+emptySt = MkSt emptyCore Nil
+
+core : ElabSt -> StCore
+core (MkSt c _) = c
+
+delayedOf : ElabSt -> List (Delayed ElabSt)
+delayedOf (MkSt _ d) = d
+
+withCore : (StCore -> StCore) -> ElabSt -> ElabSt
+withCore f (MkSt c d) = MkSt (f c) d
+
+withDelayed : (List (Delayed ElabSt) -> List (Delayed ElabSt))
+            -> ElabSt
+            -> ElabSt
+withDelayed f (MkSt c d) = MkSt c (f d)
+
+-- The monad
+--------------------------------------------------------------------------------
+
+-- | elaboration gives up with the one diagnostic that made it stop, and
+-- | keeps its state either way
+type E a = ElabSt -> Pair (Either Diag a) ElabSt
+
+val : {a : Type} -> a -> E a
+val x = \st -> MkPair (Right x) st
+
+bindStep : {a b : Type}
+         -> Pair (Either Diag a) ElabSt
+         -> (a -> E b)
+         -> Pair (Either Diag b) ElabSt
+bindStep (MkPair (Left e) st) f = MkPair (Left e) st
+bindStep (MkPair (Right x) st) f = f x st
+
+bind : {a b : Type} -> E a -> (a -> E b) -> E b
+bind m f = \st -> bindStep (m st) f
+
+pure : {a : Type} -> a -> E a
+pure x = val x
+
+gets : {a : Type} -> (ElabSt -> a) -> E a
+gets f = \st -> MkPair (Right (f st)) st
+
+modify : (ElabSt -> ElabSt) -> E Unit
+modify f = \st -> MkPair (Right MkUnit) (f st)
+
+throwE : {a : Type} -> Diag -> E a
+throwE d = \st -> MkPair (Left d) st
+
+catchStep : {a : Type}
+          -> (Diag -> E a)
+          -> Pair (Either Diag a) ElabSt
+          -> Pair (Either Diag a) ElabSt
+catchStep h (MkPair (Left e) st) = h e st
+catchStep h (MkPair (Right x) st) = MkPair (Right x) st
+
+catchE : {a : Type} -> E a -> (Diag -> E a) -> E a
+catchE m h = \st -> catchStep h (m st)
+
+runE : {a : Type} -> E a -> ElabSt -> Pair (Either Diag a) ElabSt
+runE m st = m st
+
+traceE : P.Span -> String -> E Unit
+traceE span kind =
+  modify
+    (withCore
+       (\c ->
+          { infos = c.infos
+          , recovered = c.recovered
+          , poisoned = c.poisoned
+          , metas = c.metas
+          , nextMeta = c.nextMeta
+          , postponed = c.postponed
+          , trace = Cons { span = span, kind = kind } c.trace
+          , selfKey = c.selfKey
+          }))
+
+record : Info -> E Unit
+record i =
+  modify
+    (withCore
+       (\c ->
+          { infos = Cons i c.infos
+          , recovered = c.recovered
+          , poisoned = c.poisoned
+          , metas = c.metas
+          , nextMeta = c.nextMeta
+          , postponed = c.postponed
+          , trace = c.trace
+          , selfKey = c.selfKey
+          }))
+
+-- | elaborator codes are numbered from 300
+failWith : {a : Type} -> P.Span -> Int -> String -> E a
+failWith sp code msg =
+  throwE
+    { code = 300 + code
+    , severity = SError
+    , msg = msg
+    , span = sp
+    , note = Nothing
+    }
+
+failWithNote : {a : Type} -> P.Span -> Int -> String -> String -> E a
+failWithNote sp code msg note =
+  throwE
+    { code = 300 + code
+    , severity = SError
+    , msg = msg
+    , span = sp
+    , note = Just note
+    }
+
+-- | a failure that is not an error of its own: what it comes of is
+-- | reported where it is.  Its code is no diagnostic's
+failElsewhere : {a : Type} -> P.Span -> String -> E a
+failElsewhere sp msg =
+  throwE
+    { code = 0 - 1, severity = SError, msg = msg, span = sp, note = Nothing }
+
+reportedElsewhere : Diag -> Bool
+reportedElsewhere d = d.code == (0 - 1)
+
+-- state field updates, spelled once
+setMetas : V.MetaCtx -> Int -> StCore -> StCore
+setMetas mc next c =
+  { infos = c.infos
+  , recovered = c.recovered
+  , poisoned = c.poisoned
+  , metas = mc
+  , nextMeta = next
+  , postponed = c.postponed
+  , trace = c.trace
+  , selfKey = c.selfKey
+  }
+
+setPostponed : List Postponed -> StCore -> StCore
+setPostponed ps c =
+  { infos = c.infos
+  , recovered = c.recovered
+  , poisoned = c.poisoned
+  , metas = c.metas
+  , nextMeta = c.nextMeta
+  , postponed = ps
+  , trace = c.trace
+  , selfKey = c.selfKey
+  }
+
+setPoisoned : M.Map Int Unit -> StCore -> StCore
+setPoisoned ps c =
+  { infos = c.infos
+  , recovered = c.recovered
+  , poisoned = ps
+  , metas = c.metas
+  , nextMeta = c.nextMeta
+  , postponed = c.postponed
+  , trace = c.trace
+  , selfKey = c.selfKey
+  }
+
+setRecovered : List Diag -> StCore -> StCore
+setRecovered ds c =
+  { infos = c.infos
+  , recovered = ds
+  , poisoned = c.poisoned
+  , metas = c.metas
+  , nextMeta = c.nextMeta
+  , postponed = c.postponed
+  , trace = c.trace
+  , selfKey = c.selfKey
+  }
+
+setSelfKey : Maybe String -> StCore -> StCore
+setSelfKey k c =
+  { infos = c.infos
+  , recovered = c.recovered
+  , poisoned = c.poisoned
+  , metas = c.metas
+  , nextMeta = c.nextMeta
+  , postponed = c.postponed
+  , trace = c.trace
+  , selfKey = k
+  }
+
+resultOf : Pair (Either Diag Int) ElabSt -> Int
+resultOf (MkPair (Right n) _) = n
+resultOf (MkPair (Left _) _) = 0 - 1
+
+-- >>> resultOf (runE (bind (val 20) (\x -> val (x + 22))) emptySt)
+-- 42
+
+-- >>> resultOf (runE (bind (failWith (a := Int) P.noSpan 8 "no") (\x -> val 1)) emptySt)
+-- -1
