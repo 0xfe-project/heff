@@ -24,6 +24,9 @@ const files = [
   "compiler/memoed.hf", "compiler/print.hf", "compiler/top.hf",
   "compiler/rules.hf", "compiler/fixity.hf", "compiler/import.hf",
   "compiler/surface.hf", "compiler/clauses.hf", "compiler/toplevel.hf",
+  "compiler/prims.hf", "compiler/ir.hf", "compiler/shake.hf",
+  "compiler/arity.hf", "compiler/erase.hf", "compiler/simplify.hf",
+  "compiler/effect.hf", "compiler/lower.hf", "compiler/emit.hf",
   "compiler/driver.hf", "compiler/main.hf",
 ];
 
@@ -38,7 +41,7 @@ for (const f of readdirSync(join(root, "compiler")).filter((f) => f.endsWith(".h
 // kept (output/, like the formatter's), the next generation's seed
 mkdirSync(join(root, "output"), { recursive: true });
 const bin = join(root, "output", "heff-selfcheck.mjs");
-const b = heff("node", "compiler/main.hf", "selfcheck", bin);
+const b = heff("node", "compiler/main.hf", "main", bin);
 if (b.status !== 0) { console.log(`FAIL self-check: could not compile compiler/main.hf\n${b.stdout}${b.stderr}`); process.exit(1); }
 
 // run over its own sources

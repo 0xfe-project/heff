@@ -4,11 +4,13 @@
 -- slice: no cache, no module struct values, sources handed over in
 -- dependency order (the loader stays with the host).
 
+import compiler.effect as Ef
 import compiler.fixity as F
 import compiler.globals as G
 import compiler.import as I
 import compiler.notation
 import compiler.params as Pm
+import compiler.readback as R
 import compiler.surface as Su
 import compiler.syntax as Sx
 import compiler.toplevel as T
@@ -405,6 +407,80 @@ programTy : List Checked -> String -> String -> String
 programTy cs m k = case findChecked cs m of
   Just c -> T.tyDump c.top k
   Nothing -> "<no such module>"
+
+-- Running
+--------------------------------------------------------------------------------
+
+type Runnable = { key : String, effect : Ef.Effect }
+
+type Candidate = { name : String, key : String, effect : Ef.Effect }
+
+runnableOf : Candidate -> Runnable
+runnableOf r = { key = r.key, effect = r.effect }
+
+-- | a computation's effect, from the type its key is stored with
+effectOfKey : Checked -> String -> Maybe Ef.Effect
+effectOfKey c k = case G.lookupEntry c.top.globals k of
+  Just e -> Ef.computationEffect c.top.globals (R.readbTy 0 e.type_)
+  Nothing -> Nothing
+
+candOf : Checked -> Own -> Maybe Candidate
+candOf c o = case effectOfKey c o.key of
+  Just eff -> Just { name = o.name, key = o.key, effect = eff }
+  Nothing -> Nothing
+
+candidatesOf : Checked -> List Candidate
+candidatesOf c = catMaybesD (map (\o -> candOf c o) c.own)
+
+missingOf : List String -> Ef.Effect -> List String
+missingOf handled eff =
+  nubStrD (filter (\l -> not (elemStr l handled)) (Ef.leaves eff))
+
+fitsMissing : List String -> Candidate -> List String -> Either String Runnable
+fitsMissing handled r Nil = Right (runnableOf r)
+fitsMissing handled r ms =
+  Left
+    (r.name
+     ++ " has the effect "
+     ++ joinWith ", " ms
+     ++ ", which is not handled here (only "
+     ++ joinWith ", " handled
+     ++ ")")
+
+fits : List String -> Candidate -> Either String Runnable
+fits handled r = fitsMissing handled r (missingOf handled r.effect)
+
+knownEffects : String
+knownEffects = "dom, stdio, fs, process, time, net, state s and their sums"
+
+findNamed : List String -> Checked -> String -> Own -> Either String Runnable
+findNamed handled c x o = case effectOfKey c o.key of
+  Nothing ->
+    Left
+      (x ++ " is not a computation, `Co h a`, of the effects " ++ knownEffects)
+  Just eff -> fits handled { name = x, key = o.key, effect = eff }
+
+findFirst : List String -> List Candidate -> Either String Runnable
+findFirst handled cands = case find
+    (\(r : Candidate) -> null (missingOf handled r.effect))
+    cands of
+  Just r -> Right (runnableOf r)
+  -- (the first there is, said why it does not do)
+  Nothing -> case head cands of
+    Just r -> fits handled r
+    Nothing ->
+      Left
+        ("no computation, `Co h a`, of the effects " ++ joinWith ", " handled)
+
+-- | a definition to run where there are handlers for the effects
+-- | `handled`: the one named, else the first of a file's that fits
+findRunnable : List String -> Checked -> Maybe String -> Either String Runnable
+findRunnable handled c (Just x) = case find
+    (\(o : Own) -> strEq o.name x)
+    c.own of
+  Nothing -> Left ("no definition " ++ x)
+  Just o -> findNamed handled c x o
+findRunnable handled c Nothing = findFirst handled (candidatesOf c)
 
 -- >>> length (checkProgram [{ module = "a", source = "one : Int\none = 1\n" }, { module = "b", source = "import a\n\ntwo : Int\ntwo = one\n" }])
 -- 2

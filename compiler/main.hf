@@ -1,12 +1,15 @@
 -- The compiler, run: a Node.js program (`heff node compiler/main.hf
--- selfcheck OUT.mjs`).  Given file paths in dependency order, it reads
--- them, elaborates them with its own reader and elaborator, and prints
+-- main OUT.mjs`).  Given file paths in dependency order, it reads them,
+-- elaborates them with its own reader and elaborator, and either prints
 -- every definition's stored core exactly as the reference's `dump-nbe`
 -- does -- so the two compilers can be held to the same text, file by
--- file, by `test/self-check.mjs`.
+-- file, by `test/self-check.mjs` -- or, as `node NAME OUT.mjs FILE...`,
+-- compiles the computation NAME of the last file to a Node.js program,
+-- with its own backend.
 
 import co
 import compiler.driver as Dr
+import compiler.emit as Em
 import compiler.toplevel as T
 import fs
 import prelude
@@ -33,6 +36,7 @@ type Io =
   { print : String -> Co eff Unit
   , printErr : String -> Co eff Unit
   , readFile : String -> Co eff (Maybe String)
+  , writeFile : String -> String -> Co eff Bool
   , args : Co eff (List String)
   , exit : Int -> Co eff Unit
   }
@@ -42,6 +46,7 @@ io =
   { print = print out
   , printErr = printErr out
   , readFile = readFile disk
+  , writeFile = writeFile disk
   , args = args sys
   , exit = exit sys
   }
@@ -108,9 +113,71 @@ printAll (Cons c rest) bad = do
 
 -- | check every file given, each after what it imports, and print the
 -- | stored core of every definition
-selfcheck : Co eff Unit
-selfcheck = do
-  paths <- io.args
+selfcheck : List String -> Co eff Unit
+selfcheck paths = do
   sources <- readAll paths
   bad <- printAll (Dr.checkProgram sources) 0
   if bad == 0 then pure MkUnit else io.exit 1
+
+-- (the errors said, the count comes back)
+diagCount : List Dr.Checked -> Co eff Int
+diagCount Nil = pure 0
+diagCount (Cons c rest) = do
+  n <- printErrs (Dr.moduleName c) (Dr.diagLines c) 0
+  m <- diagCount rest
+  pure (n + m)
+
+handledNode : List String
+handledNode = ["stdio", "fs", "process", "time", "net", "state"]
+
+emitErrs : List String -> Co eff Unit
+emitErrs Nil = pure MkUnit
+emitErrs (Cons e rest) = do
+  io.printErr ("heff: not compiled: " ++ e)
+  emitErrs rest
+
+writeOut : String -> Em.Output -> Co eff Unit
+writeOut outPath o = do
+  emitErrs o.errors
+  if null o.errors
+      then do
+        ok <- io.writeFile outPath o.source
+        if ok
+            then io.print ("wrote " ++ outPath)
+            else do
+              io.printErr ("cannot write " ++ outPath)
+              io.exit 1
+      else io.exit 1
+
+compileLast : String -> String -> List Dr.Checked -> Co eff Unit
+compileLast name outPath cs = case Dr.lastChecked cs of
+  Nothing -> do
+    io.printErr "no files given"
+    io.exit 1
+  Just c -> case Dr.findRunnable handledNode c (Just name) of
+    Left why -> do
+      io.printErr ("heff: " ++ why)
+      io.exit 1
+    Right r -> writeOut outPath (Em.compileNode c.top.globals r.key r.effect)
+
+compileChecked : String -> String -> List Dr.Checked -> Co eff Unit
+compileChecked name outPath cs = do
+  bad <- diagCount cs
+  if bad == 0 then compileLast name outPath cs else io.exit 1
+
+-- | compile the computation `name` of the last file given to a Node.js
+-- | program, the sources elaborated as `selfcheck` elaborates them
+compileCmd : String -> String -> List String -> Co eff Unit
+compileCmd name outPath paths = do
+  sources <- readAll paths
+  compileChecked name outPath (Dr.checkProgram sources)
+
+-- | the compiler's door: `FILE...` checks and dumps (the differential);
+-- | `node NAME OUT.mjs FILE...` compiles
+main : Co eff Unit
+main = do
+  as <- io.args
+  case as of
+    Cons "node" (Cons name (Cons outPath paths)) ->
+      compileCmd name outPath paths
+    _ -> selfcheck as

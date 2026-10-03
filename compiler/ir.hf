@@ -1,0 +1,323 @@
+-- The untyped intermediate language between the core and the backends:
+-- a port of `Heff.Lower.IR`.  Every bound variable has a name of its
+-- own in a whole program, so substitution never captures.
+
+import map as M
+import prelude
+
+-- | an alternative of a match: `vars` bind the tag's arguments, in order
+data ArmOf e = MkArm String (List String) e
+
+data Expr
+  = EVar String
+  | EGlobal String
+  | ELam (List String) Expr
+  | EApp Expr (List Expr)
+  | ELet String Expr Expr
+  | ERecord (List (Pair String Expr))
+  | EProj Expr String
+  | ETag String (List Expr)
+  | EMatch Expr (List (ArmOf Expr))
+  -- | a primitive, as a (curried) function
+  | EPrim String
+  -- | a primitive, given all its arguments
+  | EPrimCall String (List Expr)
+  -- | a global of that arity, given all its arguments at once
+  | ECall String (List Expr)
+  | EInt Int
+  | EFloat Float
+  | EStr String
+  | EAbandon
+
+type Arm = ArmOf Expr
+
+armTag : Arm -> String
+armTag (MkArm t _ _) = t
+
+armVars : Arm -> List String
+armVars (MkArm _ vs _) = vs
+
+armBody : Arm -> Expr
+armBody (MkArm _ _ b) = b
+
+-- | a definition: its key, the name it is known by, and its body
+type Def = { key : String, name : String, body : Expr }
+
+mkDef : String -> String -> Expr -> Def
+mkDef key name body = { key = key, name = name, body = body }
+
+-- | where fresh names come from (a counter)
+type Supply = Int
+
+fresh : String -> Supply -> Pair String Supply
+fresh base n = MkPair (base ++ "$" ++ showInt n) (n + 1)
+
+baseGo : String -> Int -> String
+baseGo x i =
+  if i >= strLength x
+    then x
+    else if charCode x i == 36
+    then strSlice x 0 i
+    else baseGo x (i + 1)
+
+-- | the base of a variable's name (what it was called in the source)
+baseOf : String -> String
+baseOf x = baseGo x 0
+
+appendI : {a : Type} -> List a -> List a -> List a
+appendI Nil ys = ys
+appendI (Cons x xs) ys = Cons x (appendI xs ys)
+
+concatMapI : {a b : Type} -> (a -> List b) -> List a -> List b
+concatMapI f Nil = Nil
+concatMapI f (Cons x xs) = appendI (f x) (concatMapI f xs)
+
+nubI : List String -> List String
+nubI Nil = Nil
+nubI (Cons x xs) = Cons x (nubI (filter (\y -> not (strEq y x)) xs))
+
+sumI : List Int -> Int
+sumI xs = foldl (\a b -> a + b) 0 xs
+
+-- Freshening (a copy with every binder renamed afresh)
+--------------------------------------------------------------------------------
+
+type Ren = M.Map String String
+
+renOf : Ren -> String -> String
+renOf m x = case M.lookup compareString x m of
+  Just y -> y
+  Nothing -> x
+
+type FreshSt = { m : Ren, n : Supply, xs : List String }
+
+freshBindOne : FreshSt -> String -> FreshSt
+freshBindOne acc x = case fresh (baseOf x) acc.n of
+  MkPair x' k ->
+    { m = M.insert compareString x x' acc.m, n = k, xs = Cons x' acc.xs }
+
+freshBinders : Ren -> Supply -> List String -> FreshSt
+freshBinders m n xs = foldl freshBindOne { m = m, n = n, xs = Nil } xs
+
+type FK = { go : Ren -> Supply -> Expr -> Pair Expr Supply }
+
+withFS : {a : Type} -> FreshSt -> (FreshSt -> a) -> a
+withFS v k = k v
+
+consPES : Expr -> Pair (List Expr) Supply -> Pair (List Expr) Supply
+consPES e (MkPair es n) = MkPair (Cons e es) n
+
+consPFS : Pair String Expr
+        -> Pair (List (Pair String Expr)) Supply
+        -> Pair (List (Pair String Expr)) Supply
+consPFS f (MkPair fs n) = MkPair (Cons f fs) n
+
+consPAS : Arm -> Pair (List Arm) Supply -> Pair (List Arm) Supply
+consPAS a (MkPair as n) = MkPair (Cons a as) n
+
+freshMany : FK -> Ren -> Supply -> List Expr -> Pair (List Expr) Supply
+freshMany r m n Nil = MkPair Nil n
+freshMany r m n (Cons e rest) = case r.go m n e of
+  MkPair e' n1 -> consPES e' (freshMany r m n1 rest)
+
+freshArms : FK -> Ren -> Supply -> List Arm -> Pair (List Arm) Supply
+freshArms r m n Nil = MkPair Nil n
+freshArms r m n (Cons (MkArm tag vars body) rest) =
+  withFS (freshBinders m n vars) (\bs -> case r.go bs.m bs.n body of
+  MkPair b' n1 ->
+    consPAS (MkArm tag (reverse bs.xs) b') (freshArms r m n1 rest))
+
+freshFields : FK
+            -> Ren
+            -> Supply
+            -> List (Pair String Expr)
+            -> Pair (List (Pair String Expr)) Supply
+freshFields r m n Nil = MkPair Nil n
+freshFields r m n (Cons (MkPair l e) rest) = case r.go m n e of
+  MkPair e' n1 -> consPFS (MkPair l e') (freshFields r m n1 rest)
+
+freshGo : FK -> Ren -> Supply -> Expr -> Pair Expr Supply
+freshGo r m n e = case e of
+  EVar x -> MkPair (EVar (renOf m x)) n
+  ELam xs b ->
+    withFS (freshBinders m n xs) (\bs -> case r.go bs.m bs.n b of
+    MkPair b' n' -> MkPair (ELam (reverse bs.xs) b') n')
+  ELet x a b -> case r.go m n a of
+    MkPair a' n1 -> case fresh (baseOf x) n1 of
+      MkPair x' n2 -> case r.go (M.insert compareString x x' m) n2 b of
+        MkPair b' n3 -> MkPair (ELet x' a' b') n3
+  EApp f as -> case r.go m n f of
+    MkPair f' n1 -> case freshMany r m n1 as of
+      MkPair as' n2 -> MkPair (EApp f' as') n2
+  ERecord fs -> case freshFields r m n fs of
+    MkPair fs' n1 -> MkPair (ERecord fs') n1
+  EProj e2 l -> case r.go m n e2 of
+    MkPair e' n1 -> MkPair (EProj e' l) n1
+  ETag t as -> case freshMany r m n as of
+    MkPair as' n1 -> MkPair (ETag t as') n1
+  EMatch s arms -> case r.go m n s of
+    MkPair s' n1 -> case freshArms r m n1 arms of
+      MkPair arms' n2 -> MkPair (EMatch s' arms') n2
+  EPrimCall p as -> case freshMany r m n as of
+    MkPair as' n1 -> MkPair (EPrimCall p as') n1
+  ECall g as -> case freshMany r m n as of
+    MkPair as' n1 -> MkPair (ECall g as') n1
+  _ -> MkPair e n
+
+fk : FK
+fk = { go = \m n e -> freshGo fk m n e }
+
+freshen : Supply -> Expr -> Pair Expr Supply
+freshen n e = fk.go M.empty n e
+
+-- Substitution (names are unique, so nothing is captured)
+--------------------------------------------------------------------------------
+
+substGo : M.Map String Expr -> Expr -> Expr
+substGo m e = case e of
+  EVar x -> case M.lookup compareString x m of
+    Just e2 -> e2
+    Nothing -> EVar x
+  ELam xs b -> ELam xs (substGo m b)
+  EApp f as -> EApp (substGo m f) (map (\a -> substGo m a) as)
+  ELet x a b -> ELet x (substGo m a) (substGo m b)
+  ERecord fs ->
+    ERecord
+      (map
+         (\p -> case p of
+          MkPair l e2 -> MkPair l (substGo m e2))
+         fs)
+  EProj e2 l -> EProj (substGo m e2) l
+  ETag t as -> ETag t (map (\a -> substGo m a) as)
+  EMatch s arms ->
+    EMatch
+      (substGo m s)
+      (map
+         (\a -> case a of
+          MkArm t vs b -> MkArm t vs (substGo m b))
+         arms)
+  EPrimCall p as -> EPrimCall p (map (\a -> substGo m a) as)
+  ECall g as -> ECall g (map (\a -> substGo m a) as)
+  _ -> e
+
+subst : M.Map String Expr -> Expr -> Expr
+subst m e = if M.size m == 0 then e else substGo m e
+
+-- Occurrences, size, globals, values
+--------------------------------------------------------------------------------
+
+pairSndI : Pair String Expr -> Expr
+pairSndI (MkPair _ e2) = e2
+
+type Occ = { count : Int, underLam : Bool }
+
+occNone : Occ
+occNone = { count = 0, underLam = False }
+
+occBoth : Occ -> Occ -> Occ
+occBoth a b = { count = a.count + b.count, underLam = a.underLam || b.underLam }
+
+occGo : String -> Bool -> Expr -> Occ
+occGo x lam e = case e of
+  EVar y -> if strEq y x then { count = 1, underLam = lam } else occNone
+  ELam _ b -> occGo x True b
+  EApp f as ->
+    foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone (Cons f as)
+  ELet _ a b -> occBoth (occGo x lam a) (occGo x lam b)
+  ERecord fs ->
+    foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone (map pairSndI fs)
+  EProj e2 _ -> occGo x lam e2
+  ETag _ as -> foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone as
+  EMatch s arms ->
+    occBoth
+      (occGo x lam s)
+      (foldl (\acc a -> occBoth acc (occGo x lam (armBody a))) occNone arms)
+  EPrimCall _ as -> foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone as
+  ECall _ as -> foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone as
+  _ -> occNone
+
+-- | how often a variable occurs, and whether any occurrence is under a
+-- | lambda (where it may be evaluated any number of times)
+occurrences : String -> Expr -> Occ
+occurrences x e = occGo x False e
+
+size : Expr -> Int
+size e = case e of
+  ELam _ b -> 1 + size b
+  EApp f as -> 1 + size f + sumI (map (\a -> size a) as)
+  ELet _ a b -> 1 + size a + size b
+  ERecord fs ->
+    1
+    + sumI
+      (map
+         (\p -> case p of
+          MkPair _ e2 -> size e2)
+         fs)
+  EProj e2 _ -> 1 + size e2
+  ETag _ as -> 1 + sumI (map (\a -> size a) as)
+  EMatch s arms -> 1 + size s + sumI (map (\a -> size (armBody a)) arms)
+  EPrimCall _ as -> 1 + sumI (map (\a -> size a) as)
+  ECall _ as -> 1 + sumI (map (\a -> size a) as)
+  _ -> 1
+
+globalsGo : Expr -> List String
+globalsGo e = case e of
+  EGlobal g -> Cons g Nil
+  ELam _ b -> globalsGo b
+  EApp f as -> appendI (globalsGo f) (concatMapI (\a -> globalsGo a) as)
+  ELet _ a b -> appendI (globalsGo a) (globalsGo b)
+  ERecord fs ->
+    concatMapI
+      (\p -> case p of
+       MkPair _ e2 -> globalsGo e2)
+      fs
+  EProj e2 _ -> globalsGo e2
+  ETag _ as -> concatMapI (\a -> globalsGo a) as
+  EMatch s arms ->
+    appendI (globalsGo s) (concatMapI (\a -> globalsGo (armBody a)) arms)
+  EPrimCall _ as -> concatMapI (\a -> globalsGo a) as
+  ECall g as -> Cons g (concatMapI (\a -> globalsGo a) as)
+  _ -> Nil
+
+globalsIn : Expr -> List String
+globalsIn e = nubI (globalsGo e)
+
+allI : List Bool -> Bool
+allI Nil = True
+allI (Cons b bs) = b && allI bs
+
+-- | evaluating it does nothing but build a value: it can be dropped,
+-- | moved, or duplicated (when it is small)
+isValue : Expr -> Bool
+isValue e = case e of
+  EVar _ -> True
+  EGlobal _ -> True
+  ELam _ _ -> True
+  ERecord fs ->
+    allI
+      (map
+         (\p -> case p of
+          MkPair _ e2 -> isValue e2)
+         fs)
+  ETag _ as -> allI (map (\a -> isValue a) as)
+  EPrim _ -> True
+  EInt _ -> True
+  EFloat _ -> True
+  EStr _ -> True
+  _ -> False
+
+-- | an application's head and all its arguments, the nested ones
+-- | flattened
+spineApp : List Expr -> Pair Expr (List Expr) -> Pair Expr (List Expr)
+spineApp as (MkPair h bs) = MkPair h (appendI bs as)
+
+spine : Expr -> Pair Expr (List Expr)
+spine e = case e of
+  EApp f as -> spineApp as (spine f)
+  _ -> MkPair e Nil
+
+-- >>> size (ELam ["x"] (EApp (EVar "x") [EInt 1]))
+-- 4
+
+-- >>> (occurrences "x" (ELam ["y"] (EVar "x"))).underLam
+-- True
