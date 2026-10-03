@@ -8,6 +8,7 @@
 -- Node.js program, with its own backend.
 
 import co
+import compiler.cache as Ca
 import compiler.diagnostic as Dg
 import compiler.driver as Dr
 import compiler.effect as Ef
@@ -15,6 +16,7 @@ import compiler.emit as Em
 import compiler.load as L
 import compiler.toplevel as T
 import fs
+import map as Mp
 import prelude
 import process
 import stdio
@@ -175,6 +177,67 @@ emitErrs (Cons e rest) = do
   heffM.printErr ("heff: not compiled: " ++ e)
   emitErrs rest
 
+-- The cache: a module whose making is unchanged is thawed from
+-- `.heff/<module>.hc` instead of elaborated again; a fresh module that
+-- elaborated clean is frozen back (`compiler.cache`).  The file asked
+-- for -- the last source -- is always elaborated: its watches and
+-- spans are wanted.
+type CacheAcc = { done : List Dr.Checked, hashes : Mp.Map String String }
+
+cachePath : String -> String
+cachePath m = ".heff/" ++ m ++ ".hc"
+
+thawTry : Dr.Source -> CacheAcc -> Co world (Maybe Dr.Thawed)
+thawTry s acc = do
+  mtxt <- heffM.readFile (cachePath s.module)
+  pure (case mtxt of
+    Just txt -> Ca.melt acc.hashes acc.done s txt
+    Nothing -> Nothing)
+
+cacheKeep : CacheAcc -> Dr.Checked -> CacheAcc
+cacheKeep acc c =
+  { done = concatList acc.done (Cons c Nil)
+  , hashes = Ca.defHashesInto acc.hashes c
+  }
+
+cacheStep : CacheAcc -> Dr.Source -> Maybe Dr.Thawed -> CacheAcc
+cacheStep acc s th = cacheKeep acc (Dr.elabNext acc.done s th)
+
+cachedGo : List Dr.Source -> CacheAcc -> Co world CacheAcc
+cachedGo Nil acc = pure acc
+cachedGo (Cons s Nil) acc = pure (cacheStep acc s Nothing)
+cachedGo (Cons s rest) acc = do
+  th <- thawTry s acc
+  cachedGo rest (cacheStep acc s th)
+
+freezeOne : CacheAcc -> Pair Dr.Source Dr.Checked -> Co world Unit
+freezeOne acc (MkPair s c) =
+  if c.cached || not (null c.diags) then pure MkUnit
+  else case Ca.freeze acc.hashes acc.done s c of
+    Just out -> do
+      ok <- heffM.writeFile (cachePath c.module) out
+      pure MkUnit
+    Nothing -> pure MkUnit
+
+freezeAll : CacheAcc -> List (Pair Dr.Source Dr.Checked) -> Co world Unit
+freezeAll acc Nil = pure MkUnit
+freezeAll acc (Cons p rest) = do
+  freezeOne acc p
+  freezeAll acc rest
+
+zipSC : List Dr.Source -> List Dr.Checked -> List (Pair Dr.Source Dr.Checked)
+zipSC (Cons s ss) (Cons c cs) = Cons (MkPair s c) (zipSC ss cs)
+zipSC _ _ = Nil
+
+-- | the program, each module elaborated or thawed, the fresh clean
+-- | ones frozen back
+cachedProgram : List Dr.Source -> Co world (List Dr.Checked)
+cachedProgram sources = do
+  acc <- cachedGo sources { done = Nil, hashes = Mp.empty }
+  ok <- mkDir disk ".heff"
+  freezeAll acc (zipSC sources acc.done)
+  pure acc.done
+
 putFileDiags : List Dr.Checked -> Co world Unit
 putFileDiags Nil = pure MkUnit
 putFileDiags (Cons c rest) = do
@@ -259,7 +322,8 @@ compileCmd : String
 compileCmd host name outPath how file = do
   l <- L.loadProgram disk file
   badL <- printErrs "heff" l.errors 0
-  compileDiags host file name outPath how (badL > 0) (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  compileDiags host file name outPath how (badL > 0) cs
 
 nodeCmd : Maybe String -> String -> String -> Co world Unit
 nodeCmd name outPath file =
@@ -304,7 +368,8 @@ compileJsCmd : String -> String -> Co world Unit
 compileJsCmd file outPath = do
   l <- L.loadProgram disk file
   badL <- printErrs "heff" l.errors 0
-  compileJsDiags file outPath (badL > 0) (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  compileJsDiags file outPath (badL > 0) cs
 
 printEvals : List Dr.Evaluated -> Co world Unit
 printEvals Nil = pure MkUnit
@@ -326,7 +391,8 @@ evalCmd : String -> Co world Unit
 evalCmd file = do
   l <- L.loadProgram disk file
   badL <- printErrs "heff" l.errors 0
-  evalDiags (badL > 0) (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  evalDiags (badL > 0) cs
 
 promoteDiags : String -> Bool -> List Dr.Checked -> Co world Unit
 promoteDiags file badL cs = do
@@ -344,7 +410,8 @@ promoteCmd : String -> Co world Unit
 promoteCmd file = do
   l <- L.loadProgram disk file
   badL <- printErrs "heff" l.errors 0
-  promoteDiags file (badL > 0) (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  promoteDiags file (badL > 0) cs
 
 printWatchVals : List Dr.WatchInfo -> Co world Unit
 printWatchVals Nil = pure MkUnit
@@ -368,7 +435,8 @@ runCmd : String -> Co world Unit
 runCmd file = do
   l <- L.loadProgram disk file
   badL <- printErrs "heff" l.errors 0
-  runChecked badL (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  runChecked badL cs
 
 type TestRes = { total : Int, failed : Int, ok : Bool }
 
@@ -420,7 +488,8 @@ testOneF : String -> Co world TestRes
 testOneF f = do
   l <- L.loadProgram disk f
   badL <- printErrs "heff" l.errors 0
-  testOneC f badL (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  testOneC f badL cs
 
 -- | check the watches' expectations of every file given
 testCmd : List String -> Int -> Int -> Bool -> Co world Unit
@@ -446,7 +515,8 @@ checkCmd : String -> Co world Unit
 checkCmd file = do
   l <- L.loadProgram disk file
   badL <- printErrs "heff" l.errors 0
-  checkLast (badL > 0) (Dr.checkProgram l.sources)
+  cs <- cachedProgram l.sources
+  checkLast (badL > 0) cs
 
 -- | the compiler's door: `FILE...` checks and dumps (the differential);
 -- | `node|app NAME OUT FILE` compiles, `compile-js FILE OUT` a module,
