@@ -8,21 +8,23 @@ import Data.Int as Int
 import Data.Lazy (force)
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String as S
-import Data.Traversable (for_)
+import Data.Traversable (for_, traverse)
 import Effect (Effect)
 import Effect.Console (log)
-import Heff.Compile.JavaScript (compileApp, compileJs, compileNode)
+import Heff.Compile.JavaScript (compileJs, compileProgram, exportedNames, hostOf)
 import Heff.Cache (loadCached)
 import Heff.Core.Dump (dumpDef)
 import Heff.Core.Globals (lookupGlobal)
-import Heff.Driver (Checked, errorsIn, explain, evaluate, findRunnable, interface, promote, renderFileDiags, testFile, typeAt, watches)
+import Heff.Driver (Checked, candidateLeaves, errorsIn, explain, evaluate, findRunnable, interface, promote, renderFileDiags, testFile, typeAt, watches)
+import Heff.Effect (moduleOfKey, nameOfKey)
 import Heff.Elab.Environment (enableTraceSink, takeTraceSink)
 import Heff.Format (format)
 import Heff.Load (pathsFor)
 import Heff.Lsp as Lsp
 import Heff.Support.Diff (mismatch, useColor)
 import Node.Encoding (Encoding(..))
-import Node.FS.Sync (readTextFile, realpath, writeTextFile)
+import Heff.Parse.Import (importPath)
+import Node.FS.Sync (exists, readTextFile, realpath, writeTextFile)
 import Node.Process (argv, exit', stderr, stdout)
 import Node.Stream (writeString)
 
@@ -37,7 +39,7 @@ commands =
   , { name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hf", flags: [] }
   , { name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hf", flags: [] }
   , { name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: [] }
-  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME (stdio, fs, process, time, net)", files: ".hf", flags: [] }
+  , { name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME, its worlds' providers bundled in", files: ".hf", flags: [] }
   , { name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: [] }
   , { name: "dump-nbe", args: "FILE", doc: "each definition over compiler/'s formers, with its normal forms (the port's differential)", files: ".hf", flags: [] }
   , { name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: [] }
@@ -156,19 +158,35 @@ main = do
     -- take it for an answer)
     _ -> err (usage <> "\n") *> exit' 1
   where
-  app f n out = run [ "dom", "state" ] compileApp f n out "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
-  program f n out = run [ "stdio", "fs", "process", "time", "net", "state" ] compileNode f n out ("run it with `node " <> out <> " ARGS...`")
-  -- (a computation of the effects `handled`, compiled with their handlers)
-  run handled compile f n out how = do
+  app f n out = runProg "page" f n out "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
+  program f n out = runProg "node" f n out ("run it with `node " <> out <> " ARGS...`")
+  -- (a computation whose effects all have providers for this host:
+  -- each world's algebra is bundled in from its module's M.provider.js)
+  runProg host f n out how = do
     l <- load f
+    lib <- libDir
+    ps <- pathsFor lib f
+    let ks = candidateLeaves l.file
+    found <- A.catMaybes <$> traverse (readProvider ps) (A.nub (map moduleOfKey ks))
+    let available = A.filter (\p -> fromMaybe host (hostOf p.text) == host) found
+    let handled = A.filter (\k -> A.any (\p -> p.module == moduleOfKey k && A.elem (nameOfKey k) (exportedNames p.text)) available) ks
     case findRunnable handled l.file n of
       Left why -> err ("heff: " <> f <> ": " <> why <> "\n") *> exit' 1
       Right r -> do
-        let c = compile l.file.top.globals r.key r.effect
+        let c = compileProgram available l.file.top.globals r.key r.effect
         for_ c.errors \e -> err ("heff: not compiled: " <> e <> "\n")
         when (not (A.null c.errors)) (exit' 1)
         writeTextFile UTF8 out c.source
         log ("wrote " <> out <> ": " <> how)
+  -- (the provider of the module m: M.provider.js beside M.hf, looked
+  -- for as the module itself is -- under the root, else lib/, else
+  -- node_modules/)
+  readProvider ps m =
+    let
+      p = fromMaybe (importPath m) (S.stripSuffix (S.Pattern ".hf") (importPath m)) <> ".provider.js"
+      try path rest = exists path >>= \ok -> if ok then readTextFile UTF8 path <#> \text -> Just { module: m, text } else rest
+    in
+      try (ps.root <> "/" <> p) (try (ps.lib <> "/" <> p) (try (ps.root <> "/node_modules/" <> p) (pure Nothing)))
   -- | 1 if the file is not formatted (with `--check`) or cannot be
   fmtOne checkOnly f = do
     src <- readTextFile UTF8 f

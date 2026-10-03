@@ -9,6 +9,7 @@
 
 import co
 import compiler.driver as Dr
+import compiler.effect as Ef
 import compiler.emit as Em
 import compiler.load as L
 import compiler.toplevel as T
@@ -106,8 +107,62 @@ diagCount (Cons c rest) = do
   m <- diagCount rest
   pure (n + m)
 
-handledNode : List String
-handledNode = ["stdio", "fs", "process", "time", "net", "state"]
+elemStrM : String -> List String -> Bool
+elemStrM x Nil = False
+elemStrM x (Cons y rest) = if strEq x y then True else elemStrM x rest
+
+nubStrGo : List String -> List String -> List String
+nubStrGo seen Nil = Nil
+nubStrGo seen (Cons x rest) =
+  if elemStrM x seen then nubStrGo seen rest
+  else Cons x (nubStrGo (Cons x seen) rest)
+
+nubStrM : List String -> List String
+nubStrM xs = nubStrGo Nil xs
+
+-- the provider of a module, M.provider.js beside M.hf: read as the
+-- module itself is found (under the root, else lib/, else
+-- node_modules/)
+providerPathOf : String -> String
+providerPathOf m = L.dropHf (L.importPath m) ++ ".provider.js"
+
+readProviderAt : String -> Co world (Maybe Em.Provider)
+readProviderAt m = do
+  a <- heffM.readFile (providerPathOf m)
+  case a of
+    Just t -> pure (Just { module = m, text = t })
+    Nothing -> do
+      b <- heffM.readFile ("lib/" ++ providerPathOf m)
+      case b of
+        Just t -> pure (Just { module = m, text = t })
+        Nothing -> do
+          mc <- heffM.readFile ("node_modules/" ++ providerPathOf m)
+          case mc of
+            Just t -> pure (Just { module = m, text = t })
+            Nothing -> pure Nothing
+
+readProviders : List String -> Co world (List Em.Provider)
+readProviders Nil = pure Nil
+readProviders (Cons m rest) = do
+  p <- readProviderAt m
+  ps <- readProviders rest
+  pure (case p of
+    Just pr -> Cons pr ps
+    Nothing -> ps)
+
+-- (a provider without `$host` lives anywhere; `heff node`'s is "node")
+forHost : String -> Em.Provider -> Bool
+forHost host p = case Em.hostOf p.text of
+  Nothing -> True
+  Just h -> strEq h host
+
+providesLeaf : List Em.Provider -> String -> Bool
+providesLeaf Nil k = False
+providesLeaf (Cons p rest) k =
+  if strEq p.module (Ef.moduleOfKey k)
+  && elemStrM (Ef.nameOfKey k) (Em.exportedNames p.text)
+    then True
+  else providesLeaf rest k
 
 emitErrs : List String -> Co world Unit
 emitErrs Nil = pure MkUnit
@@ -127,16 +182,31 @@ writeOut outPath o = do
             heffM.exit 1
     else heffM.exit 1
 
+compileFound : String
+             -> String
+             -> Dr.Checked
+             -> List Em.Provider
+             -> Co world Unit
+compileFound name outPath c available = case Dr.findRunnable
+    (filter (\k -> providesLeaf available k) (Dr.candidateLeaves c))
+    c
+    (Just name) of
+  Left why -> do
+    heffM.printErr ("heff: " ++ why)
+    heffM.exit 1
+  Right r ->
+    writeOut outPath (Em.compileProgram available c.top.globals r.key r.effect)
+
 compileLast : String -> String -> List Dr.Checked -> Co world Unit
 compileLast name outPath cs = case Dr.lastChecked cs of
   Nothing -> do
     heffM.printErr "no files given"
     heffM.exit 1
-  Just c -> case Dr.findRunnable handledNode c (Just name) of
-    Left why -> do
-      heffM.printErr ("heff: " ++ why)
-      heffM.exit 1
-    Right r -> writeOut outPath (Em.compileNode c.top.globals r.key r.effect)
+  Just c -> do
+    found <-
+      readProviders
+        (nubStrM (map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
+    compileFound name outPath c (filter (\p -> forHost "node" p) found)
 
 compileChecked : String -> String -> List Dr.Checked -> Co world Unit
 compileChecked name outPath cs = do

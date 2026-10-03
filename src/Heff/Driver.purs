@@ -20,6 +20,7 @@ module Heff.Driver
   , promote
   , evaluate
   , findRunnable
+  , candidateLeaves
   , completionsAt
   , explain
   , typeAt
@@ -409,20 +410,18 @@ promote c = A.foldr put c.source (watches c)
     in
       before <> sep <> S.joinWith "" (map (_ <> "\n") lines) <> SCU.drop w.expectTo s
 
--- | `h`, an effect (`Heff.Effect`): a sum, a leaf -- by what it is, a
--- | global's key, not its name -- or a definition that is one of those
+-- | `h`, an effect (`Heff.Effect`): a sum, or a leaf -- a global, by its
+-- | key, not its name (a definition that is a sum is seen through; one
+-- | that is not a sum is a leaf: whether its module provides it is the
+-- | caller's to ask, by the key)
 effectOf :: Globals -> El -> Maybe Effect
 effectOf g e = case e of
   Is e' -> effectOf g e'
   App (App (Global p) a) b | p == "co.plus" || p == "co.<+>" -> Plus <$> effectOf g a <*> effectOf g b
-  Global "dom.dom" -> Just (Leaf "dom")
-  Global "stdio.stdio" -> Just (Leaf "stdio")
-  Global "fs.fs" -> Just (Leaf "fs")
-  Global "process.process" -> Just (Leaf "process")
-  Global "time.time" -> Just (Leaf "time")
-  Global "net.net" -> Just (Leaf "net")
-  App (Global "state.state") _ -> Just (Leaf "state")
-  Global k -> lookupGlobal g k >>= \entry -> effectOf g entry.syntax
+  App (Global k) _ -> Just (Leaf k)
+  Global k -> case lookupGlobal g k >>= \entry -> effectOf g entry.syntax of
+    Just eff -> Just eff
+    Nothing -> Just (Leaf k)
   _ -> Nothing
 
 -- | a computation's effect, from its type: `Co h a`, which is a function
@@ -435,28 +434,39 @@ computationEffect g = case _ of
   Decode (App (App (Global "co.Co") h) _) -> effectOf g h
   _ -> Nothing
 
--- | a definition to run where there are handlers for the effects
--- | `handled`: the one named, else the first of a file's that fits
+-- | a computation's effect, from the type its key is stored with
+effectOfKey :: Checked -> String -> Maybe Effect
+effectOfKey c k = lookupGlobal c.top.globals k >>= \e -> computationEffect c.top.globals (readbTy 0 e.type_)
+
+-- | the file's computations, `Co h a`, each with its effect
+candidates :: Checked -> Array { name :: String, key :: String, effect :: Effect }
+candidates c = A.mapMaybe (\o -> effectOfKey c o.key <#> \eff -> { name: o.name, key: o.key, effect: eff }) c.own
+
+-- | every leaf of every candidate's effect, each once: what the caller
+-- | asks providers for, before it picks one to run
+candidateLeaves :: Checked -> Array String
+candidateLeaves c = A.nub (A.concatMap (\r -> leaves r.effect) (candidates c))
+
+-- | a definition to run where the effects `handled` (leaves, by their
+-- | keys) have providers: the one named, else the first of a file's
+-- | that fits
 findRunnable :: Array String -> Checked -> Maybe String -> Either String { key :: String, effect :: Effect }
 findRunnable handled c = case _ of
   Just x -> case A.find (\o -> o.name == x) c.own of
     Nothing -> Left ("no definition " <> x)
-    Just o -> case effectOf' o.key of
-      Nothing -> Left (x <> " is not a computation, `Co h a`, of the effects " <> known)
+    Just o -> case effectOfKey c o.key of
+      Nothing -> Left (x <> " is not a computation, `Co h a`")
       Just eff -> fits { name: x, key: o.key, effect: eff }
-  Nothing -> case A.find (\r -> A.null (missing r.effect)) computations, A.head computations of
+  Nothing -> case A.find (\r -> A.null (missing r.effect)) (candidates c), A.head (candidates c) of
     Just r, _ -> Right { key: r.key, effect: r.effect }
     -- (the first there is, said why it does not do)
     Nothing, Just r -> fits r
-    Nothing, Nothing -> Left ("no computation, `Co h a`, of the effects " <> S.joinWith ", " handled)
+    Nothing, Nothing -> Left "no computation, `Co h a`, to run"
   where
-  known = "dom, stdio, fs, process, time, net, state s and their sums"
-  computations = A.mapMaybe (\o -> effectOf' o.key <#> \eff -> { name: o.name, key: o.key, effect: eff }) c.own
   missing eff = A.nub (A.filter (\l -> not (A.elem l handled)) (leaves eff))
   fits r = case missing r.effect of
     [] -> Right { key: r.key, effect: r.effect }
-    ms -> Left (r.name <> " has the effect " <> S.joinWith ", " ms <> ", which is not handled here (only " <> S.joinWith ", " handled <> ")")
-  effectOf' k = lookupGlobal c.top.globals k >>= \e -> computationEffect c.top.globals (readbTy 0 e.type_)
+    ms -> Left (r.name <> " has the effect " <> S.joinWith ", " ms <> ", which is not provided here (a module M provides its effect in M.provider.js beside M.hf; `$host` says where it runs)")
 
 -- Semantic queries
 --------------------------------------------------------------------------------

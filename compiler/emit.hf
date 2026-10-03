@@ -1028,8 +1028,9 @@ emitDefs defs roots = emitWithShorts defs roots (shortsOf defs)
 -- is one monad for the whole program; each effect contributes an
 -- algebra.  `perform` does an operation of the computation's effect:
 -- `$sum` of two algebras gives each operation (`InL`, `InR`) to its
--- side's, and each effect's (`$dom`, `$state`, `$stdio`, ...) knows its
--- own operations.  (An operation done at once goes on at once, the
+-- side's, and each world's algebra -- a provider's text, bundled
+-- whole, its factories gathered (`$p0`, `$p1`, ...) -- knows its own
+-- operations.  (An operation done at once goes on at once, the
 -- stack deeper each time: every so often it goes on after the stack is
 -- let go of, lest a long loop of them overflow it.)
 
@@ -1056,210 +1057,159 @@ sumStr : String
 sumStr =
   "const $sum = (l, r) => (p, k) => p.$ === \"InL\" ? l(p.a[0], k) : r(p.a[0], k);"
 
--- (a `Node` is `MkNode i`: the element is nodes[i], numbered as it is
--- made, or first found)
-domStr : String
-domStr =
-  joinWith
-    "\n"
-    [ "const $dom = () => {"
-    , "  const nodes = [];"
-    , "  const node = (n) => nodes[Number(n.a[0])];"
-    , "  const mk = (i) => ({ $: \"MkNode\", a: [BigInt(i)] });"
-    , "  const found = (el) => { if (!el) return { $: \"Nothing\", a: [] }; let i = nodes.indexOf(el); if (i < 0) { nodes.push(el); i = nodes.length - 1; } return { $: \"Just\", a: [mk(i)] }; };"
-    , "  const done = () => {};"
-    , "  return (p, k) => {"
-    , "    const a = p.a;"
-    , "    switch (p.$) {"
-    , "      case \"Create\": nodes.push(document.createElement(a[0])); return k(a[1](mk(nodes.length - 1)));"
-    , "      case \"Text\": node(a[0]).textContent = a[1]; return k(a[2]);"
-    , "      case \"Attr\": node(a[0]).setAttribute(a[1], a[2]); return k(a[3]);"
-    , "      case \"Append\": node(a[0]).appendChild(node(a[1])); return k(a[2]);"
-    , "      case \"Clear\": node(a[0]).replaceChildren(); return k(a[1]);"
-    , "      case \"Value\": return k(a[1](String(node(a[0]).value ?? \"\")));"
-    , "      case \"On\": { const h = a[2]; node(a[0]).addEventListener(a[1], (ev) => h(String(ev && ev.target && ev.target.value !== undefined ? ev.target.value : \"\"))(done)); return k(a[3]); }"
-    , "      case \"Select\": return k(a[1](found(document.querySelector(a[0]))));"
-    , "      case \"XPath\": return k(a[1](found(document.evaluate(a[0], document, null, 9, null).singleNodeValue)));"
-    , "      case \"Sleep\": setTimeout(() => k(a[1]), Number(a[0])); return;"
-    , "      case \"Fetch\": fetch(a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(a[1](t))); return;"
-    , "      default: throw new Error(\"heff: not an operation of dom: \" + (p && p.$));"
-    , "    }"
-    , "  };"
-    , "};"
-    ]
-
-stateStr : String
-stateStr =
-  joinWith
-    "\n"
-    [ "const $state = () => {"
-    , "  let state;"
-    , "  return (p, k) => {"
-    , "    switch (p.$) {"
-    , "      case \"Get\": return k(p.a[0](state));"
-    , "      case \"Put\": state = p.a[0]; return k(p.a[1]);"
-    , "      default: throw new Error(\"heff: not an operation of state: \" + (p && p.$));"
-    , "    }"
-    , "  };"
-    , "};"
-    ]
-
-stdioStr : String
-stdioStr =
-  joinWith
-    "\n"
-    [ "const $stdio = () => (p, k) => {"
-    , "  const a = p.a;"
-    , "  switch (p.$) {"
-    , "    case \"Write\": process.stdout.write(a[0], () => k(a[1])); return;"
-    , "    case \"WriteErr\": process.stderr.write(a[0], () => k(a[1])); return;"
-    , "    case \"ReadStdin\": { let text = \"\"; process.stdin.setEncoding(\"utf8\"); process.stdin.on(\"data\", (d) => { text += d; }); process.stdin.on(\"end\", () => k(a[0](text))); return; }"
-    , "    default: throw new Error(\"heff: not an operation of stdio: \" + (p && p.$));"
-    , "  }"
-    , "};"
-    ]
-
-fsStr : String
-fsStr =
-  joinWith
-    "\n"
-    [ "const $fs = () => {"
-    , "  const nothing = { $: \"Nothing\", a: [] };"
-    , "  const just = (x) => ({ $: \"Just\", a: [x] });"
-    , "  const bool = (b) => ({ $: b ? \"True\" : \"False\", a: [] });"
-    , "  return (p, k) => {"
-    , "    const a = p.a;"
-    , "    switch (p.$) {"
-    , "      case \"ReadFile\": $readFile(a[0], \"utf8\", (e, t) => k(a[1](e ? nothing : just(t)))); return;"
-    , "      case \"WriteFile\": $writeFile(a[0], a[1], (e) => k(a[2](bool(!e)))); return;"
-    , "      default: throw new Error(\"heff: not an operation of fs: \" + (p && p.$));"
-    , "    }"
-    , "  };"
-    , "};"
-    ]
-
--- (`Exit` does not go on: the process ends when what is pending, output
--- being written, is done)
-processStr : String
-processStr =
-  joinWith
-    "\n"
-    [ "const $process = () => {"
-    , "  const nothing = { $: \"Nothing\", a: [] };"
-    , "  const just = (x) => ({ $: \"Just\", a: [x] });"
-    , "  const list = (xs) => xs.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] });"
-    , "  return (p, k) => {"
-    , "    const a = p.a;"
-    , "    switch (p.$) {"
-    , "      case \"Args\": return k(a[0](list(process.argv.slice(2))));"
-    , "      case \"GetEnv\": { const v = process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }"
-    , "      case \"Exit\": process.exitCode = Number(a[0]); return;"
-    , "      default: throw new Error(\"heff: not an operation of process: \" + (p && p.$));"
-    , "    }"
-    , "  };"
-    , "};"
-    ]
-
-timeStr : String
-timeStr =
-  joinWith
-    "\n"
-    [ "const $time = () => (p, k) => {"
-    , "  if (p.$ === \"Sleep\") { setTimeout(() => k(p.a[1]), Number(p.a[0])); return; }"
-    , "  throw new Error(\"heff: not an operation of time: \" + (p && p.$));"
-    , "};"
-    ]
-
-netStr : String
-netStr =
-  joinWith
-    "\n"
-    [ "const $net = () => (p, k) => {"
-    , "  if (p.$ === \"Fetch\") { fetch(p.a[0]).then((r) => r.text(), (e) => String(e)).then((t) => k(p.a[1](t))); return; }"
-    , "  throw new Error(\"heff: not an operation of net: \" + (p && p.$));"
-    , "};"
-    ]
-
-handlerStr : String -> Maybe String
-handlerStr x =
-  if strEq x "dom" then Just domStr
-  else if strEq x "state" then Just stateStr
-  else if strEq x "stdio" then Just stdioStr
-  else if strEq x "fs" then Just fsStr
-  else if strEq x "process" then Just processStr
-  else if strEq x "time" then Just timeStr
-  else if strEq x "net" then Just netStr
-  else Nothing
-
 hasSum : Ef.Effect -> Bool
 hasSum (Plus _ _) = True
 hasSum (Leaf _) = False
 
-runtimeFor : Ef.Effect -> String
-runtimeFor eff =
+-- | the world's side of an effect: a provider module's name and text
+-- | (`M.provider.js` beside `M.hf`; lib/dom.provider.js says the shape)
+type Provider = { module : String, text : String }
+
+isImportLine : String -> Bool
+isImportLine l = startsWith "import " l
+
+-- (after `export const `, up to the ` `)
+exportNameOf : String -> Maybe String
+exportNameOf l =
+  if startsWith "export const " l
+    then case indexOf " " (strSlice l 13 (strLength l)) of
+      Just i -> Just (strSlice l 13 (13 + i))
+      Nothing -> Just (strSlice l 13 (strLength l))
+  else Nothing
+
+-- | the factories a provider exports, in the order it declares them
+-- | (a `$`-named export is the provider speaking about itself, `$host`)
+exportedNames : String -> List String
+exportedNames text =
+  filter
+    (\n -> not (startsWith "$" n))
+    (catMaybesL (map (\l -> exportNameOf l) (lines text)))
+
+hostLineOf : String -> Maybe String
+hostLineOf l =
+  if startsWith "export const $host = \"" l
+    then case indexOf "\"" (strSlice l 22 (strLength l)) of
+      Just i -> Just (strSlice l 22 (22 + i))
+      Nothing -> Just (strSlice l 22 (strLength l))
+  else Nothing
+
+-- | the one host a provider's world lives in (`export const $host =
+-- | "page"`), if it says so; without it, any
+hostOf : String -> Maybe String
+hostOf text = head (catMaybesL (map (\l -> hostLineOf l) (lines text)))
+
+unexportLine : String -> String
+unexportLine l =
+  if startsWith "export const " l then "const " ++ strSlice l 13 (strLength l)
+  else l
+
+-- the provider's own module, in a scope of its own: its import lines
+-- are hoisted to the file's top, its exported factories handed out
+bundleProvider : Int -> Provider -> String
+bundleProvider i p =
+  joinWith
+    "\n"
+    (concatList
+       [ "// " ++ p.module ++ ".provider.js"
+       , "const $p" ++ showInt i ++ " = (() => {"
+       ]
+       (concatList
+          (map
+             (\l -> unexportLine l)
+             (filter (\l -> not (isImportLine l)) (lines p.text)))
+          [ "return { " ++ joinWith ", " (exportedNames p.text) ++ " };"
+          , "})();"
+          ]))
+
+bundleAll : Int -> List Provider -> List String
+bundleAll i Nil = Nil
+bundleAll i (Cons p rest) = Cons (bundleProvider i p) (bundleAll (i + 1) rest)
+
+runtimeFor : List Provider -> Ef.Effect -> String
+runtimeFor provs eff =
   joinWith
     "\n"
     (concatList
        (Cons runStr Nil)
        (concatList
           (if hasSum eff then Cons sumStr Nil else Nil)
-          (catMaybesL (map (\l -> handlerStr l) (nubStr (Ef.leaves eff))))))
+          (bundleAll 0 provs)))
 
--- (each effect's handler, an operation of a sum going to its side's)
-handlerOf : Ef.Effect -> String
-handlerOf (Leaf x) = "$" ++ x ++ "()"
-handlerOf (Plus a b) = "$sum(" ++ handlerOf a ++ ", " ++ handlerOf b ++ ")"
+provIndexGo : Int -> String -> List Provider -> Int
+provIndexGo i md Nil = 0
+provIndexGo i md (Cons p rest) =
+  if strEq p.module md then i else provIndexGo (i + 1) md rest
+
+-- (each effect's handler, an operation of a sum going to its side's; a
+-- leaf's is its provider's factory, called for a fresh algebra)
+handlerOf : List Provider -> Ef.Effect -> String
+handlerOf provs (Leaf k) =
+  "$p"
+  ++ showInt (provIndexGo 0 (Ef.moduleOfKey k) provs)
+  ++ "."
+  ++ Ef.nameOfKey k
+  ++ "()"
+handlerOf provs (Plus a b) =
+  "$sum(" ++ handlerOf provs a ++ ", " ++ handlerOf provs b ++ ")"
 
 -- Outputs
 --------------------------------------------------------------------------------
 
-runSource : List String -> Ef.Effect -> String -> Emitted -> String
-runSource imports eff key m =
+findProv : String -> List Provider -> Maybe Provider
+findProv md Nil = Nothing
+findProv md (Cons p rest) =
+  if strEq p.module md then Just p else findProv md rest
+
+provsForGo : List Provider -> List String -> List Provider
+provsForGo available Nil = Nil
+provsForGo available (Cons md rest) = case findProv md available of
+  Just p -> Cons p (provsForGo available rest)
+  Nothing -> provsForGo available rest
+
+-- (the chosen effect's providers, one per module, in the row's order)
+provsFor : List Provider -> Ef.Effect -> List Provider
+provsFor available eff =
+  provsForGo available (nubStr (map (\k -> Ef.moduleOfKey k) (Ef.leaves eff)))
+
+importLinesOf : List Provider -> List String
+importLinesOf Nil = Nil
+importLinesOf (Cons p rest) =
+  concatList (filter (\l -> isImportLine l) (lines p.text)) (importLinesOf rest)
+
+runSource : List Provider -> Ef.Effect -> String -> Emitted -> String
+runSource provs eff key m =
   joinWith
     "\n"
     (concatList
        (Cons "// Generated from Hippogriff; do not edit." Nil)
        (concatList
-          imports
+          (nubStr (importLinesOf provs))
           (concatList
              m.lines
              [ ""
-             , runtimeFor eff
+             , runtimeFor provs eff
              , ""
-             , "$run(" ++ ref m.globals key ++ ", " ++ handlerOf eff ++ ");"
+             , "$run("
+             ++ ref m.globals key
+             ++ ", "
+             ++ handlerOf provs eff
+             ++ ");"
              , ""
              ])))
 
-compileLowered : List String -> Ef.Effect -> String -> L.Lowered -> Output
-compileLowered imports eff key l =
-  { source = runSource imports eff key (emitDefs l.defs (Cons key Nil))
+compileLowered : List Provider -> Ef.Effect -> String -> L.Lowered -> Output
+compileLowered provs eff key l =
+  { source = runSource provs eff key (emitDefs l.defs (Cons key Nil))
   , errors = l.errors
   }
 
-compileRun : List String -> G.Globals -> String -> Ef.Effect -> Output
-compileRun imports g key eff =
-  compileLowered imports eff key (L.lower g (Cons key Nil))
-
--- | a script for a page that runs a computation (`key`) of the effect
--- | `eff` (of `dom` and `state`): where it goes on the page is its to
--- | find (`select`, `xpath`)
-compileApp : G.Globals -> String -> Ef.Effect -> Output
-compileApp g key eff = compileRun Nil g key eff
-
--- | a Node.js program (an ES module) that runs a computation of the
--- | effect `eff` (of `stdio`, `fs`, `process`, `time`, `net` and
--- | `state`)
-compileNode : G.Globals -> String -> Ef.Effect -> Output
-compileNode g key eff =
-  compileRun
-    (if elemStr "fs" (Ef.leaves eff)
-       then Cons
-           "import { readFile as $readFile, writeFile as $writeFile } from \"node:fs\";"
-           Nil
-     else Nil)
-    g
-    key
-    eff
+-- | one file that runs a computation (`key`) of the effect `eff`: the
+-- | program, the runtime, and each world's algebra from its provider --
+-- | it imports nothing but what the providers do (`node:` builtins,
+-- | hoisted), so a page loads it from file:// too
+compileProgram : List Provider -> G.Globals -> String -> Ef.Effect -> Output
+compileProgram available g key eff =
+  compileLowered (provsFor available eff) eff key (L.lower g (Cons key Nil))
 
 getterOf : M.Map String GInfo -> Export -> String
 getterOf gs o =
