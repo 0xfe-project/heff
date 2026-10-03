@@ -10,9 +10,12 @@ import compiler.effect as Ef
 import compiler.fixity as F
 import compiler.globals as G
 import compiler.import as I
+import compiler.interp as In
 import compiler.notation
 import compiler.params as Pm
+import compiler.psurface as Ps
 import compiler.readback as R
+import compiler.rename as Rn
 import compiler.surface as Su
 import compiler.syntax as Sx
 import compiler.top as Tp
@@ -32,6 +35,7 @@ type AliasQ = { module : String, alias : String }
 
 type Checked =
   { module : String
+  , source : String
   , top : T.TopResult
   , diags : List Diag
   , own : List Own
@@ -84,12 +88,20 @@ withEntry k c g = case G.lookupEntry c.top.globals k of
   Just e -> G.addEntry k e g
   Nothing -> g
 
+-- (the module's definitions, and the module itself as a value: its
+-- theory and its struct travel with it)
 envOne : Checked -> G.Globals -> G.Globals
 envOne c g =
-  foldl
-    (\g2 (o : Own) -> withEntry o.key c g2)
-    (mergeBroken c.top.globals.broken g)
-    c.own
+  withEntry
+    (c.module ++ "#")
+    c
+    (withEntry
+       (c.module ++ "#T")
+       c
+       (foldl
+          (\g2 (o : Own) -> withEntry o.key c g2)
+          (mergeBroken c.top.globals.broken g)
+          c.own))
 
 -- | each needed module's definitions, by key, and its broken set
 envOf : List Checked -> List Checked -> G.Globals
@@ -226,6 +238,7 @@ ownOf modName keys =
     keys
 
 mkChecked : String
+          -> String
           -> T.TopResult
           -> List Diag
           -> List Own
@@ -234,8 +247,9 @@ mkChecked : String
           -> List AliasQ
           -> F.Fixities
           -> Checked
-mkChecked m top diags own deps opens aliases fixities =
+mkChecked m source top diags own deps opens aliases fixities =
   { module = m
+  , source = source
   , top = top
   , diags = diags
   , own = own
@@ -409,7 +423,14 @@ moduleStruct mkey own g = structWith mkey g (structEntries g own)
 
 withStruct : String -> List Own -> T.TopResult -> T.TopResult
 withStruct m own t =
-  T.mkTop (moduleStruct m own t.globals) t.diags t.keys t.broken
+  T.mkTop
+    (moduleStruct m own t.globals)
+    t.diags
+    t.keys
+    t.broken
+    t.watches
+    t.tests
+    t.spans
 
 directFix : List Checked -> F.Fixities
 directFix direct =
@@ -424,6 +445,7 @@ elabTop : Source
 elabTop s imps direct r t =
   mkChecked
     s.module
+    s.source
     (withStruct s.module (ownOf s.module t.keys) t)
     (appendD
        (map (clashDiag (importedOf direct)) (clashesOf (importedOf direct)))
@@ -563,6 +585,195 @@ programTy : List Checked -> String -> String -> String
 programTy cs m k = case findChecked cs m of
   Just c -> T.tyDump c.top k
   Nothing -> "<no such module>"
+
+-- Watches and tests (`Heff.Driver`)
+--------------------------------------------------------------------------------
+
+-- | a global key by the name it has in the file, else the key (a
+-- | synthesized one, which no file writes, in words)
+localNames : G.Globals -> Mp.Map String String
+localNames g =
+  foldl
+    (\m (p : Pair String String) -> Mp.insert compareString (snd p) (fst p) m)
+    Mp.empty
+    (Mp.toList g.aliases)
+
+localNameIn : Mp.Map String String -> String -> String
+localNameIn m k = fromMaybe (Rn.describeKey k) (Mp.lookup compareString k m)
+
+-- | a type, its globals by the names they have in the file (else by
+-- | key)
+showTySx : G.Globals -> Sx.Ty -> String
+showTySx g t =
+  Ps.printTy
+    Ps.plainImplicits
+    0
+    Nil
+    (Rn.renameTy (localNameIn (localNames g)) t)
+
+-- | a watch `-- >>> e`, with the `-- ...` lines under it, its
+-- | expectation (a doctest): `expectFrom`..`expectTo` is where those
+-- | lines are, or where they would go
+type WatchInfo =
+  { from : Int
+  , to : Int
+  , expr : String
+  , ty : String
+  , value : String
+  , expected : Maybe String
+  , holds : Bool
+  , expectFrom : Int
+  , expectTo : Int
+  }
+
+type Expectation = { expected : Maybe String, from : Int, to : Int }
+
+lineEndFrom : String -> Int -> Int
+lineEndFrom src i = case indexFrom "\n" src i of
+  Just j -> j
+  Nothing -> strLength src
+
+type ExpGo = { lines : List String, stop : Int }
+
+expectLineAt : String -> Int -> String -> Maybe String
+expectLineAt src i line =
+  if i < strLength src
+  && strEq (strSlice line 0 2) "--"
+  && not (strEq (strSlice line 0 6) "-- >>>")
+  && not (strEq (trim (strSlice line 2 (strLength line))) "")
+    then Just (trim (strSlice line 2 (strLength line)))
+  else Nothing
+
+expectLine : String -> Int -> Maybe String
+expectLine src i =
+  expectLineAt src i (trim (strSlice src i (lineEndFrom src i)))
+
+expectGo : String -> Int -> List String -> ExpGo
+expectGo src i acc = case expectLine src i of
+  Just l ->
+    expectGo
+      src
+      (min (strLength src) (lineEndFrom src i + 1))
+      (concatList acc (Cons l Nil))
+  Nothing -> { lines = acc, stop = i }
+
+expectDone : Int -> ExpGo -> Expectation
+expectDone start r =
+  { expected = if null r.lines then Nothing else Just (joinWith "\n" r.lines)
+  , from = start
+  , to = r.stop
+  }
+
+-- | the `-- ...` lines after the line that `end` is on, up to a blank
+-- | one
+expectation : String -> Int -> Expectation
+expectation src end =
+  expectDone
+    (min (strLength src) (lineEndFrom src end + 1))
+    (expectGo src (min (strLength src) (lineEndFrom src end + 1)) Nil)
+
+evalWatch : String -> G.Globals -> String
+evalWatch name g = case In.evalGlobalsWhere (\k -> strEq k name) g of
+  Cons (MkPair _ res) _ -> In.showResult res
+  Nil -> ""
+
+knownG : G.Globals -> String -> Bool
+knownG g x = case G.lookupEntry g x of
+  Just _ -> True
+  Nothing -> False
+
+readExpTop : G.Globals -> T.TopResult -> Maybe String
+readExpTop g t =
+  if not (null t.diags) then Nothing
+  else case head t.watches of
+    Just w ->
+      Just (evalWatch "> expectation" (G.addEntry "> expectation" w.entry g))
+    Nothing -> Nothing
+
+readExpRead : G.Globals -> Su.Read -> Maybe String
+readExpRead g r =
+  if not (null r.diags) then Nothing else readExpTop g (T.topWith g r.ntns)
+
+-- | the value of an expectation, read as `(e : T)`
+readExpectation : G.Globals -> String -> String -> Maybe String
+readExpectation g ty e =
+  readExpRead
+    g
+    (Su.readProgram
+       (\x -> knownG g x)
+       ("-- >>> (" ++ e ++ " : " ++ ty ++ ")\n"))
+
+-- an expectation is Hippogriff: it holds when it evaluates to the same,
+-- however it is written; what cannot be read (`#fun`) is compared as
+-- text
+holdsOf : G.Globals -> String -> String -> Maybe String -> Bool
+holdsOf g ty value Nothing = True
+holdsOf g ty value (Just e) =
+  strEq e value
+  || (case readExpectation g ty e of
+      Just v -> strEq v value
+      Nothing -> False)
+
+dropWatchMark : String -> String
+dropWatchMark s =
+  if startsWith "-- >>>" s then strSlice s 6 (strLength s) else ""
+
+mkWatchInfo : Checked -> T.Watch -> String -> Expectation -> String -> WatchInfo
+mkWatchInfo c w value ex ty =
+  { from = w.span.start
+  , to = w.span.end
+  , expr =
+      trim (dropWatchMark (trim (strSlice c.source w.span.start w.span.end)))
+  , ty = ty
+  , value = value
+  , expected = ex.expected
+  , holds = holdsOf c.top.globals ty value ex.expected
+  , expectFrom = ex.from
+  , expectTo = ex.to
+  }
+
+watchInfo : Checked -> Int -> T.Watch -> WatchInfo
+watchInfo c i w =
+  mkWatchInfo
+    c
+    w
+    (evalWatch
+       ("> " ++ showInt i)
+       (G.addEntry ("> " ++ showInt i) w.entry c.top.globals))
+    (expectation c.source w.span.end)
+    (showTySx c.top.globals (R.readbTy 0 w.entry.type_))
+
+watchesGo : Checked -> Int -> List T.Watch -> List WatchInfo
+watchesGo c i Nil = Nil
+watchesGo c i (Cons w rest) = Cons (watchInfo c i w) (watchesGo c (i + 1) rest)
+
+watches : Checked -> List WatchInfo
+watches c = watchesGo c 0 c.top.watches
+
+-- | a file's tests: the watches with an expectation, each under the
+-- | name of the `test` before it (if any)
+type TestReport = { owner : Maybe String, watch : WatchInfo }
+
+declStarts : Checked -> List Int
+declStarts c = map (\(p : Pair String Pm.Span) -> (snd p).start) c.top.spans
+
+ownerOf : Checked -> Int -> Maybe String
+ownerOf c from = case last
+    (filter
+       (\(m : T.TestDecl) ->
+          m.span.start < from
+          && not (any (\p -> m.span.start < p && p < from) (declStarts c)))
+       c.top.tests) of
+  Just m -> Just m.name
+  Nothing -> Nothing
+
+testReportOf : Checked -> WatchInfo -> Maybe TestReport
+testReportOf c w = case w.expected of
+  Just _ -> Just { owner = ownerOf c w.from, watch = w }
+  Nothing -> Nothing
+
+testFile : Checked -> List TestReport
+testFile c = catMaybesD (map (\w -> testReportOf c w) (watches c))
 
 -- Running
 --------------------------------------------------------------------------------

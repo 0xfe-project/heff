@@ -27,6 +27,7 @@ const files = [
   "compiler/prims.hf", "compiler/ir.hf", "compiler/shake.hf",
   "compiler/arity.hf", "compiler/erase.hf", "compiler/simplify.hf",
   "compiler/effect.hf", "compiler/lower.hf", "compiler/emit.hf",
+  "compiler/rename.hf", "compiler/psurface.hf", "compiler/interp.hf",
   "compiler/driver.hf", "compiler/load.hf", "compiler/main.hf",
 ];
 

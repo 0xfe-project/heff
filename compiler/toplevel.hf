@@ -1,8 +1,9 @@
 -- Top-level elaboration: a port of `Heff.Elab.Top`.  Notation becomes
 -- judgments (the dispatcher's functions are one knot record, `tk`),
 -- declarations become globals, each elaborated in a fresh state; a
--- definition whose body fails is an error hole of its type.  This first
--- slice leaves out watches, tests and primitive-name validation.
+-- definition whose body fails is an error hole of its type.  A watch
+-- (`-- >>> e`) elaborates to an entry of its own, kept aside.  This
+-- slice leaves out primitive-name validation.
 
 import array as A
 import compiler.clauses as Cl
@@ -15,6 +16,7 @@ import compiler.meta as Mt
 import compiler.notation
 import compiler.params as Pm
 import compiler.print as Pr
+import compiler.readback as Rb
 import compiler.rules as R
 import compiler.surface as Su
 import compiler.syntax as Sx
@@ -849,19 +851,78 @@ elabDecl key g n = do
   recoveredCheck
   elabBody key g n d a
 
+watchSyn : Pm.Span -> Judgment -> Elab R.Syn
+watchSyn sp (SynJ j) = pure j
+watchSyn sp _ =
+  failP sp 0 "a watch must say what type it has: write `-- >>> (e : T)`"
+
+watchEntry : G.Globals -> V.MetaCtx -> M.El -> V.Ty -> G.Entry
+watchEntry g mc t ty =
+  entryFor
+    g
+    "> watch"
+    False
+    (U.zonkTy mc (Rb.readbTy 0 (V.forceTy mc ty)))
+    (U.zonkEl mc t.stx)
+
+watchPhase : G.Globals -> Pm.Span -> Pair M.El V.Ty -> Elab G.Entry
+watchPhase g sp (MkPair t ty) = do
+  stuck <- Mt.settle g
+  -- (what settling met that was recovered from, too)
+  recoveredCheck
+  poisonedLeft
+  checkStuck g sp stuck
+  unsolved <- Mt.unsolvedMetas
+  checkUnsolved unsolved
+  mc <- gets (\st -> (core st).metas)
+  pure (watchEntry g mc t ty)
+
+-- | a watch `-- >>> e`: elaborated as an anonymous definition, its
+-- | entry kept aside (never among the globals)
+elabWatch : G.Globals -> Ntn -> Elab G.Entry
+elabWatch g n = do
+  j <- tk.parseJ N n
+  s <- watchSyn (ntnSpan n) j
+  pr <- R.runSyn s (emptyElabEnv g)
+  watchPhase g (ntnSpan n) pr
+
 -- The module
 --------------------------------------------------------------------------------
+
+type Watch = { span : Pm.Span, entry : G.Entry }
+
+mkWatch : Pm.Span -> G.Entry -> Watch
+mkWatch span entry = { span = span, entry = entry }
+
+type TestDecl = { name : String, span : Pm.Span }
 
 type TopResult =
   { globals : G.Globals
   , diags : List Diag
   , keys : List String
   , broken : List String
+  , watches : List Watch
+  , tests : List TestDecl
+  , spans : List (Pair String Pm.Span)
   }
 
-mkTop : G.Globals -> List Diag -> List String -> List String -> TopResult
-mkTop globals diags keys broken =
-  { globals = globals, diags = diags, keys = keys, broken = broken }
+mkTop : G.Globals
+      -> List Diag
+      -> List String
+      -> List String
+      -> List Watch
+      -> List TestDecl
+      -> List (Pair String Pm.Span)
+      -> TopResult
+mkTop globals diags keys broken watches tests spans =
+  { globals = globals
+  , diags = diags
+  , keys = keys
+  , broken = broken
+  , watches = watches
+  , tests = tests
+  , spans = spans
+  }
 
 failedDiag : Elaborated -> List Diag -> List Diag
 failedDiag r diags = case r.failed of
@@ -871,38 +932,106 @@ failedDiag r diags = case r.failed of
 brokenOf : String -> Ntn -> List String -> List String
 brokenOf modName n broken = broken
 
-topTake : String
-        -> TopResult
-        -> Ntn
-        -> Pair (Either Diag Elaborated) ElabSt
-        -> TopResult
-topTake modName acc n (MkPair (Left d) st) =
-  mkTop acc.globals (Cons d acc.diags) acc.keys (brokenOf modName n acc.broken)
-topTake modName acc n (MkPair (Right r) st) =
+topTake : TopResult -> Ntn -> Pair (Either Diag Elaborated) ElabSt -> TopResult
+topTake acc n (MkPair (Left d) st) =
+  mkTop
+    acc.globals
+    (Cons d acc.diags)
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+topTake acc n (MkPair (Right r) st) =
   mkTop
     (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals))
     (failedDiag r acc.diags)
     (Cons r.key acc.keys)
     acc.broken
+    acc.watches
+    acc.tests
+    (Cons (MkPair r.name (ntnSpan n)) acc.spans)
 
-topOne : String -> TopResult -> Ntn -> TopResult
-topOne modName acc (MDecl Nil ">" n sp) = acc
-topOne modName acc (MDecl Nil "test" n sp) = acc
-topOne modName acc n =
-  topTake
-    modName
-    acc
-    n
-    (runE (elabDecl (\x -> modName ++ "." ++ x) acc.globals n) emptySt)
+watchTake : TopResult
+          -> Pm.Span
+          -> Pair (Either Diag G.Entry) ElabSt
+          -> TopResult
+watchTake acc sp (MkPair (Left d) st) =
+  mkTop
+    acc.globals
+    (Cons d acc.diags)
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+watchTake acc sp (MkPair (Right entry) st) =
+  mkTop
+    acc.globals
+    acc.diags
+    acc.keys
+    acc.broken
+    (Cons (mkWatch sp entry) acc.watches)
+    acc.tests
+    acc.spans
 
-topGo : String -> TopResult -> List Ntn -> TopResult
-topGo modName acc Nil =
-  mkTop acc.globals (reverse acc.diags) (reverse acc.keys) (reverse acc.broken)
-topGo modName acc (Cons n rest) = topGo modName (topOne modName acc n) rest
+testDiag : Ntn -> Diag
+testDiag n =
+  { code = 211
+  , severity = SError
+  , msg = "a test is named: `test <name>`"
+  , span = ntnSpan n
+  , note = Nothing
+  }
+
+topOne : (String -> String) -> TopResult -> Ntn -> TopResult
+topOne kf acc (MDecl Nil ">" n sp) =
+  watchTake acc sp (runE (elabWatch acc.globals n) emptySt)
+-- extension: `test name`, the watches after it (with expectations) are
+-- a test, named
+topOne kf acc (MDecl Nil "test" (Ident x xsp) sp) =
+  mkTop
+    acc.globals
+    acc.diags
+    acc.keys
+    acc.broken
+    acc.watches
+    (Cons { name = x, span = sp } acc.tests)
+    acc.spans
+topOne kf acc (MDecl Nil "test" n sp) =
+  mkTop
+    acc.globals
+    (Cons (testDiag n) acc.diags)
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+topOne kf acc n = topTake acc n (runE (elabDecl kf acc.globals n) emptySt)
+
+topGo : (String -> String) -> TopResult -> List Ntn -> TopResult
+topGo kf acc Nil =
+  mkTop
+    acc.globals
+    (reverse acc.diags)
+    (reverse acc.keys)
+    (reverse acc.broken)
+    (reverse acc.watches)
+    (reverse acc.tests)
+    (reverse acc.spans)
+topGo kf acc (Cons n rest) = topGo kf (topOne kf acc n) rest
+
+emptyTop : G.Globals -> TopResult
+emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil
 
 -- | every declaration of a module, each elaborated in a fresh state
 topModule : String -> G.Globals -> List Ntn -> TopResult
-topModule modName g0 ntns = topGo modName (mkTop g0 Nil Nil Nil) ntns
+topModule modName g0 ntns = topGo (\x -> modName ++ "." ++ x) (emptyTop g0) ntns
+
+-- | the same, on top of some existing globals, each definition under
+-- | its own name (what an expectation is read with)
+topWith : G.Globals -> List Ntn -> TopResult
+topWith g0 ntns = topGo (\x -> x) (emptyTop g0) ntns
 
 -- Checking source text, whole
 --------------------------------------------------------------------------------
@@ -912,7 +1041,8 @@ appendT Nil ys = ys
 appendT (Cons x xs) ys = Cons x (appendT xs ys)
 
 withParse : TopResult -> List Diag -> TopResult
-withParse t ds = mkTop t.globals (appendT ds t.diags) t.keys t.broken
+withParse t ds =
+  mkTop t.globals (appendT ds t.diags) t.keys t.broken t.watches t.tests t.spans
 
 noImports : String -> Bool
 noImports x = False

@@ -152,12 +152,101 @@ compileCmd name outPath file = do
   if bad == 0 then compileChecked name outPath (Dr.checkProgram l.sources)
     else heffM.exit 1
 
+printWatchVals : List Dr.WatchInfo -> Co world Unit
+printWatchVals Nil = pure MkUnit
+printWatchVals (Cons w rest) = do
+  heffM.print (">>> " ++ w.expr ++ "\n" ++ w.value)
+  printWatchVals rest
+
+runLast : Int -> Maybe Dr.Checked -> Co world Unit
+runLast bad Nothing = heffM.exit 1
+runLast bad (Just c) = do
+  printWatchVals (Dr.watches c)
+  if bad == 0 then pure MkUnit else heffM.exit 1
+
+runChecked : Int -> List Dr.Checked -> Co world Unit
+runChecked badL cs = do
+  bad <- diagCount cs
+  runLast (badL + bad) (Dr.lastChecked cs)
+
+-- | print what each watch (`-- >>> e`) of FILE evaluates to
+runCmd : String -> Co world Unit
+runCmd file = do
+  l <- L.loadProgram disk file
+  badL <- printErrs "heff" l.errors 0
+  runChecked badL (Dr.checkProgram l.sources)
+
+type TestRes = { total : Int, failed : Int, ok : Bool }
+
+failLine : String -> Dr.TestReport -> String
+failLine f r =
+  "FAIL "
+  ++ f
+  ++ (case r.owner of
+      Just n -> " (" ++ n ++ ")"
+      Nothing -> "")
+  ++ ": "
+  ++ r.watch.expr
+  ++ "\n  expected "
+  ++ fromMaybe "" r.watch.expected
+  ++ "\n  but got  "
+  ++ r.watch.value
+
+printFails : String -> List Dr.TestReport -> Co world Unit
+printFails f Nil = pure MkUnit
+printFails f (Cons r rest) = do
+  heffM.print (failLine f r)
+  printFails f rest
+
+badReports : List Dr.TestReport -> List Dr.TestReport
+badReports rs = filter (\(r : Dr.TestReport) -> not r.watch.holds) rs
+
+testReport : String -> Int -> List Dr.TestReport -> Co world TestRes
+testReport f bad ts = do
+  printFails f (badReports ts)
+  heffM.print
+      ((if null (badReports ts) && bad == 0 then "ok    " else "FAIL  ")
+       ++ f
+       ++ "  "
+       ++ showInt (length ts - length (badReports ts))
+       ++ "/"
+       ++ showInt (length ts))
+  pure { total = length ts, failed = length (badReports ts), ok = bad == 0 }
+
+testOneC : String -> Int -> List Dr.Checked -> Co world TestRes
+testOneC f bad0 cs = do
+  bad <- diagCount cs
+  case Dr.lastChecked cs of
+    Nothing -> do
+      heffM.print ("FAIL  " ++ f ++ "  0/0")
+      pure { total = 0, failed = 0, ok = False }
+    Just c -> testReport f (bad0 + bad) (Dr.testFile c)
+
+testOneF : String -> Co world TestRes
+testOneF f = do
+  l <- L.loadProgram disk f
+  badL <- printErrs "heff" l.errors 0
+  testOneC f badL (Dr.checkProgram l.sources)
+
+-- | check the watches' expectations of every file given
+testCmd : List String -> Int -> Int -> Bool -> Co world Unit
+testCmd Nil total failed anyBad = do
+  heffM.print
+      (showInt (total - failed) ++ "/" ++ showInt total ++ " expectations hold")
+  if failed > 0 || anyBad then heffM.exit 1 else pure MkUnit
+testCmd (Cons f rest) total failed anyBad = do
+  r <- testOneF f
+  testCmd rest (total + r.total) (failed + r.failed) (anyBad || not r.ok)
+
 -- | the compiler's door: `FILE...` checks and dumps (the differential);
--- | `node NAME OUT.mjs FILE` compiles
+-- | `node NAME OUT.mjs FILE` compiles, `run FILE` prints the watches'
+-- | values, `test FILE...` checks their expectations
 main : Co world Unit
 main = do
   as <- heffM.args
   case as of
     Cons "node" (Cons name (Cons outPath (Cons file Nil))) ->
       compileCmd name outPath file
+    Cons "run" (Cons file Nil) -> runCmd file
+    Cons "test" files -> testCmd files 0 0 False
     _ -> selfcheck as
