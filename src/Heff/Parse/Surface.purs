@@ -170,7 +170,7 @@ prescan ts = A.catMaybes (A.mapWithIndex one ts)
 
 -- | what a top-level declaration is, before signatures meet equations
 data Item
-  = Sig String Span Ntn Span -- ^ the name, where it is written, the type, where the signature is
+  = Sig String Span Ntn Span Boolean -- ^ the name, where it is written, the type, where the signature is; marked `instance`?
   | Eqn String Ntn Span -- ^ `f p ... := e`, as the equations of `Heff.Elab.Clauses`
   | Decl Ntn
 
@@ -236,6 +236,14 @@ decl = lazyP \_ -> do
       end <- prevEnd
       pure [ Decl (MDecl [] ">" e { start: t.start, end }) ]
     _, _ -> do
+      -- spike: `instance f : T` marks the signature's definition as a
+      -- witness for instance search
+      inst <- do
+        t2 <- peekAt 1
+        t3 <- peekAt 2
+        if t.kind == "var" && t.text == "instance" && (t2.kind == "var" || t2.kind == "con") && isAnnText t3.text
+          then next *> pure true
+          else pure false
       name <- declName
       case name of
         Nothing -> throwError (diag (spanOf t) ("a declaration cannot start with `" <> t.text <> "`"))
@@ -246,7 +254,7 @@ decl = lazyP \_ -> do
             ty <- expr
             end <- prevEnd
             modify_ \s -> s { binders = A.snoc s.binders { f: f.name, names: piBinders ty, implicits: piImplicits ty } }
-            pure [ Sig f.name f.span ty { start: t.start, end } ]
+            pure [ Sig f.name f.span ty { start: t.start, end } inst ]
           else equation f
 
 -- | what a signature or an equation defines: `f`, `C`, or `(+)` (`len`: its
@@ -415,7 +423,7 @@ assemble broken items = A.mapMaybe one items
   where
   one = case _ of
     Decl n -> Just n
-    Sig f fsp ty sp ->
+    Sig f fsp ty sp inst ->
       let
         eqs = A.mapMaybe (case _ of
           Eqn g e esp | g == f -> Just { e, span: esp }
@@ -425,23 +433,23 @@ assemble broken items = A.mapMaybe one items
       in
         -- (an equation that does not parse: `f = abandon`, not what the
         -- others match without it)
-        if A.elem f broken then Just (def f fsp ty sp [ Infix (Ident f fsp) (Keyword ":=" sp) (Keyword "abandon" sp) ])
+        if A.elem f broken then Just (def inst f fsp ty sp [ Infix (Ident f fsp) (Keyword ":=" sp) (Keyword "abandon" sp) ])
         else if A.null eqs then Nothing
-        else Just (def f fsp ty whole (map _.e eqs))
+        else Just (def inst f fsp ty whole (map _.e eqs))
     Eqn _ _ _ -> Nothing
-  def f fsp ty sp eqs = MDecl [] "def" (Infix (Ident f fsp) (Keyword ":" sp) (Juxt ty (NBlock "where" Nothing eqs sp))) sp
+  def inst f fsp ty sp eqs = MDecl (if inst then [ "instance" ] else []) "def" (Infix (Ident f fsp) (Keyword ":" sp) (Juxt ty (NBlock "where" Nothing eqs sp))) sp
 
 assembleDiags :: Array String -> Array Item -> Array Diag
 assembleDiags broken items = A.mapMaybe one items
   where
   sigs = A.mapMaybe (case _ of
-    Sig f _ _ _ -> Just f
+    Sig f _ _ _ _ -> Just f
     _ -> Nothing) items
   eqNames = A.mapMaybe (case _ of
     Eqn f _ _ -> Just f
     _ -> Nothing) items
   one = case _ of
-    Sig f _ _ sp | not (A.elem f eqNames) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
+    Sig f _ _ sp _ | not (A.elem f eqNames) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` has a type but no definition"))
     Eqn f _ sp | not (A.elem f sigs) && not (A.elem f broken) -> Just (diag sp ("`" <> f <> "` needs a type: `" <> f <> " : …`"))
     _ -> Nothing
 
@@ -632,7 +640,19 @@ atom = lazyP \_ -> do
     "kw" | t.text == "data" -> anonymousSum
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
-    "punct" | t.text == "[" -> listOf expr
+    -- spike: `[x : T]`, an instance binder (left of `->`); a list otherwise
+    "punct" | t.text == "[" -> do
+      t1 <- peekAt 1
+      t2 <- peekAt 2
+      if t1.kind == "var" && isAnnText t2.text then do
+        o <- next
+        inBrackets do
+          x <- next
+          _ <- next
+          ty <- expr
+          c <- expectPunct "]"
+          pure (NBracket (Infix (Ident x.text (spanOf x)) (Keyword ":" (spanOf x)) ty) (spanTo o c))
+      else listOf expr
     _ -> throwError (diag (spanOf t) ("expected an expression, not " <> shown t))
   fields base
   where

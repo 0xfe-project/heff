@@ -108,7 +108,7 @@ elabNext done s thaw =
       needed = A.filter (\c -> A.elem c.module (closure done s.deps)) done
       -- (each module's definitions, and the module itself, a struct of them;
       -- and what did not elaborate in each)
-      env = A.foldl (\g c -> withEntry (c.module <> "#") c (withEntry (c.module <> "#T") c (A.foldl (\g' o -> withEntry o.key c g') (g { broken = Set.union g.broken c.top.globals.broken }) c.own))) emptyGlobals needed
+      env = A.foldl (\g c -> withEntry (c.module <> "#") c (withEntry (c.module <> "#T") c (A.foldl (\g' o -> withEntry o.key c g') (g { broken = Set.union g.broken c.top.globals.broken, instances = A.nub (g.instances <> c.top.globals.instances) }) c.own))) emptyGlobals needed
       withEntry k c g = maybe g (\e -> addGlobalEntry k e g) (lookupGlobal c.top.globals k)
       -- (what did not elaborate in a module imported, by its name there)
       brokenIn c = A.mapMaybe (\k -> S.stripPrefix (S.Pattern (c.module <> ".")) k <#> \x -> { name: x, key: k }) (A.fromFoldable c.top.globals.broken)

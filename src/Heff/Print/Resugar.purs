@@ -16,6 +16,7 @@ import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String as S
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Name, dictToList)
+import Heff.Core.Params (Plicity(..))
 import Heff.Core.Syntax as Syn
 
 -- | a pattern: a variable (by de Bruijn level) or a tag of patterns
@@ -41,10 +42,10 @@ equationsWith style f names0 ty0 el =
   -- implicit one ends the equations' shape
   lambdas ns ps ty b = case ty, b of
     -- an implicit argument is not written in the equations: it is in scope
-    Syn.Function ft, Syn.Lam _ (Syn.Abs x body) | ft.implicit -> case ft.cod of
+    Syn.Function ft, Syn.Lam _ (Syn.Abs x body) | ft.implicit == Impl -> case ft.cod of
       Syn.Abs _ cod -> lambdas (x : ns) ps cod body
       Syn.AbsConst cod -> lambdas (x : ns) ps cod body
-    Syn.Function ft, Syn.Lam _ abs | not ft.implicit ->
+    Syn.Function ft, Syn.Lam _ abs | ft.implicit /= Impl ->
       let
         x = case abs of
           Syn.Abs y _ -> y

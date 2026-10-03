@@ -16,7 +16,7 @@ import Data.Map as Map
 import Heff.Core.Syntax as S
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Dict, Name, dictAt, dictElemAt, dictKeyIndex, dictMap, dictUpdate, panic)
-import Heff.Core.Params (Case(..), Level(..), Universe, Variants, codesInto, decodesInto)
+import Heff.Core.Params (Case(..), Level(..), Plicity, Universe, Variants, codesInto, decodesInto)
 
 -- Value environments
 --------------------------------------------------------------------------------
@@ -288,7 +288,7 @@ forceTy mc t = case t of
 -- Types
 --------------------------------------------------------------------------------
 
-type FunctionType = { level :: Level, dom :: Ty, cod :: Clo Ty, implicit :: Boolean }
+type FunctionType = { level :: Level, dom :: Ty, cod :: Clo Ty, implicit :: Plicity }
 
 type Field = { ty :: Ty, value :: Maybe El }
 

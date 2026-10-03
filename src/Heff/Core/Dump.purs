@@ -14,7 +14,7 @@ import Data.String as S
 import Data.Tuple (Tuple(..))
 import Heff.Core.Evaluation (eval)
 import Heff.Core.Globals (GlobalEntry, Globals)
-import Heff.Core.Params (Case(..), Level(..), Universe(..), Variants(..))
+import Heff.Core.Params (Case(..), Level(..), Plicity(..), Universe(..), Variants(..))
 import Heff.Core.Readback (readbEv, readbTy)
 import Heff.Core.Syntax as Sx
 import Heff.Core.Value as V
@@ -39,6 +39,12 @@ showUniverse = case _ of
 
 showBool :: Boolean -> String
 showBool b = if b then "True" else "False"
+
+showPlicityB :: Plicity -> String
+showPlicityB = case _ of
+  Expl -> "False"
+  Impl -> "True"
+  Inst -> "Inst"
 
 listOf :: Array String -> String
 listOf xs = "[" <> S.joinWith ", " xs <> "]"
@@ -84,7 +90,8 @@ dumpTy :: Sx.Ty -> String
 dumpTy = case _ of
   Sx.U u -> "(SU " <> showUniverse u <> ")"
   Sx.Decode t -> "(SDecode " <> dumpEl t <> ")"
-  Sx.Function ft -> "(SFunction " <> showLevel ft.level <> " " <> dumpTy ft.dom <> " " <> absOf dumpTy ft.cod <> " " <> showBool ft.implicit <> ")"
+  -- (the port prints the flag as a boolean still; `Inst` is spike-only)
+  Sx.Function ft -> "(SFunction " <> showLevel ft.level <> " " <> dumpTy ft.dom <> " " <> absOf dumpTy ft.cod <> " " <> showPlicityB ft.implicit <> ")"
   Sx.Record rt -> "(SRecord " <> showLevel rt.level <> " " <> dictOf dumpTy rt.fieldTypes <> ")"
   Sx.Sum (Variants d) -> "(SSum " <> dictOf (arrOf dumpTy) d <> ")"
   Sx.IsTy t -> "(SIsTy " <> dumpTy t <> ")"

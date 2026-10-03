@@ -34,9 +34,9 @@ import Data.String as Str
 import Heff.Core.Syntax as Syn
 import Heff.Elab.Unify (settle, unsolvedMetas, zonkEl, zonkTy)
 import Control.Monad.State (gets, modify_)
-import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addBroken, addGlobalEntry, lookupGlobal)
+import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addBroken, addGlobalEntry, lookupGlobal, markInstance)
 import Heff.Core.Memoed as M
-import Heff.Core.Params (Case(..), CtxShape, Universe(..), Variants(..))
+import Heff.Core.Params (Case(..), CtxShape, Plicity(..), Universe(..), Variants(..))
 import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName, selfAsLocal)
 import Data.Map as Map
@@ -65,6 +65,8 @@ binder :: Ntn -> E R.Binder
 binder (Infix (Ident x _) (Keyword ":" _) n) = R.Named x <$> typ N n
 -- extension: `{x : A} -> B`
 binder (NBrace (Infix (Ident x _) (Keyword ":" _) n) sp) = R.NamedImplicit sp x <$> typ N n
+-- spike: `[x : A] -> B`, an instance binder
+binder (NBracket (Infix (Ident x _) (Keyword ":" _) n) sp) = R.NamedInstance sp x <$> typ N n
 binder n = R.Anonymous <$> typ N n
 
 fieldDeclaration :: Ntn -> E R.FieldDeclaration
@@ -347,18 +349,23 @@ ident :: Ntn -> E Name
 ident (Ident x _) = pure x
 ident n = unexpectedNotation n "identifier"
 
-type ArgBinding = { span :: Span, name :: Name, typ :: R.Typ, implicit :: Boolean }
+type ArgBinding = { span :: Span, name :: Name, typ :: R.Typ, implicit :: Plicity }
 
 argBinding :: Ntn -> E ArgBinding
 argBinding n@(Infix n0 (Keyword ":" _) n1) = do
   x <- ident n0
   a <- typ N n1
-  pure { span: ntnSpan n, name: x, typ: a, implicit: false }
+  pure { span: ntnSpan n, name: x, typ: a, implicit: Expl }
 -- extension: `def f {A : Type} ...`
 argBinding (NBrace (Infix n0 (Keyword ":" _) n1) sp) = do
   x <- ident n0
   a <- typ N n1
-  pure { span: sp, name: x, typ: a, implicit: true }
+  pure { span: sp, name: x, typ: a, implicit: Impl }
+-- spike: an instance binder in a head, `[x : T]`
+argBinding (NBracket (Infix n0 (Keyword ":" _) n1) sp) = do
+  x <- ident n0
+  a <- typ N n1
+  pure { span: sp, name: x, typ: a, implicit: Inst }
 argBinding n = unexpectedNotation n "argument binding of the form `<name> : <type>`"
 
 unpackArgs :: Ntn -> E (Tuple Name (Array ArgBinding))
@@ -371,9 +378,10 @@ unpackArgs n = do
 withArgs :: Array ArgBinding -> Tuple R.Typ R.Chk -> Tuple R.Typ R.Chk
 withArgs args base = A.foldr go base args
   where
-  go ab (Tuple t c)
-    | ab.implicit = Tuple (R.functionFormation (R.NamedImplicit ab.span ab.name ab.typ) t) (R.functionIntroImplicit ab.span ab.name c)
-    | otherwise = Tuple (R.functionFormation (R.Named ab.name ab.typ) t) (R.functionIntro ab.span ab.name c)
+  go ab (Tuple t c) = case ab.implicit of
+    Impl -> Tuple (R.functionFormation (R.NamedImplicit ab.span ab.name ab.typ) t) (R.functionIntroImplicit ab.span ab.name c)
+    Inst -> Tuple (R.functionFormation (R.NamedInstance ab.span ab.name ab.typ) t) (R.functionIntro ab.span ab.name c)
+    Expl -> Tuple (R.functionFormation (R.Named ab.name ab.typ) t) (R.functionIntro ab.span ab.name c)
 
 type DeclJ = { name :: Name, ty :: R.Typ, tm :: R.Chk, prim :: Boolean }
 
@@ -390,7 +398,7 @@ def :: Ntn -> E DeclJ
 def (Infix headN (Keyword ":" _) tyW)
   | Just (Tuple tyN eqs) <- stripWhere tyW = do
       Tuple name args <- unpackArgs headN
-      let params = map _.name (A.filter (not <<< _.implicit) args)
+      let params = map _.name (A.filter (\ab -> ab.implicit /= Impl) args)
       bodyN <- case desugar name params eqs (ntnSpan tyW) of
         Left err -> failP err.span 10 (P.text err.msg)
         Right b -> pure b
@@ -410,7 +418,7 @@ def n = do
 declJ :: Ntn -> E DeclJ
 declJ = case _ of
   MDecl [] "theory" n _ -> theory n
-  MDecl [] "def" n _ -> def n
+  MDecl _ "def" n _ -> def n
   -- extension: `primitive name : T`, implemented by the runtime
   MDecl [] "primitive" (Infix (Ident x _) (Keyword ":" _) tyN) _ -> do
     ty <- typ N tyN
@@ -628,7 +636,8 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
       , keys = A.snoc acc.keys d.key
       }
     Right (Tuple (Right d) st) -> (after acc st (maybe [] reported d.failed))
-      { globals = (if d.key == d.name then identity else addAlias d.name d.key) (addGlobalEntry d.key d.entry acc.globals)
+      { globals = (if isInstanceDecl n then markInstance d.key else identity)
+          ((if d.key == d.name then identity else addAlias d.name d.key) (addGlobalEntry d.key d.entry acc.globals))
       , spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))
       , keys = A.snoc acc.keys d.key
       }
@@ -640,6 +649,10 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
         }
       Nothing -> after acc st (reported d)
   st0 = emptySt
+  -- spike: a declaration parsed from `instance f : T`
+  isInstanceDecl = case _ of
+    MDecl mods _ _ _ -> A.elem "instance" mods
+    _ -> false
   -- (the name a declaration defines, from its notation: it may not be read
   -- further)
   declName = case _ of

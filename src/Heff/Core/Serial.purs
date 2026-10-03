@@ -20,7 +20,7 @@ import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Support.BigInt as BigInt
 import Heff.Support.Common (Dict, dictFromList, dictToList)
-import Heff.Core.Params (Level(..), Universe(..), Variants(..))
+import Heff.Core.Params (Level(..), Plicity(..), Universe(..), Variants(..))
 import Heff.Core.Syntax as S
 
 tag :: String -> Array Json -> Json
@@ -73,6 +73,21 @@ decodeLevel j = asInt j >>= case _ of
   1 -> Just Large
   2 -> Just Top
   _ -> Nothing
+
+-- | spike: a plicity travels as an int (an old cache's boolean reads too)
+encodePlicity :: Plicity -> Json
+encodePlicity = int <<< case _ of
+  Expl -> 0
+  Impl -> 1
+  Inst -> 2
+
+decodePlicity :: Json -> Maybe Plicity
+decodePlicity j = case asInt j of
+  Just 0 -> Just Expl
+  Just 1 -> Just Impl
+  Just 2 -> Just Inst
+  Just _ -> Nothing
+  Nothing -> toBoolean j <#> if _ then Impl else Expl
 
 encodeEl :: S.El -> Json
 encodeEl = go
@@ -135,7 +150,7 @@ encodeTy = go
     S.U SmallU -> tag "u" [ int 0 ]
     S.U LargeU -> tag "u" [ int 1 ]
     S.Decode e -> tag "de" [ encodeEl e ]
-    S.Function f -> tag "fn" [ encodeLevel f.level, go f.dom, encodeAbs go f.cod, fromBoolean f.implicit ]
+    S.Function f -> tag "fn" [ encodeLevel f.level, go f.dom, encodeAbs go f.cod, encodePlicity f.implicit ]
     S.Record r -> tag "rc" [ encodeLevel r.level, encodeDict go r.fieldTypes ]
     S.Sum (Variants vs) -> tag "sm" [ encodeDict (fromArray <<< map go) vs ]
     S.IsTy t -> tag "is" [ go t ]
@@ -154,7 +169,7 @@ decodeTy = go
       _ -> Nothing
     Tuple "de" [ e ] -> S.Decode <$> decodeEl e
     Tuple "fn" [ l, d, c, i ] -> (\level dom cod implicit -> S.Function { level, dom, cod, implicit })
-      <$> decodeLevel l <*> go d <*> decodeAbs go c <*> toBoolean i
+      <$> decodeLevel l <*> go d <*> decodeAbs go c <*> decodePlicity i
     Tuple "rc" [ l, fs ] -> (\level fieldTypes -> S.Record { level, fieldTypes }) <$> decodeLevel l <*> decodeDict go fs
     Tuple "sm" [ vs ] -> S.Sum <<< Variants <$> decodeDict (\v -> toArray v >>= traverse go) vs
     Tuple "is" [ t ] -> S.IsTy <$> go t

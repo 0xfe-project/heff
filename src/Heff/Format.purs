@@ -106,6 +106,7 @@ ntnKey = case _ of
   MDecl ms s n _ -> "<" <> S.joinWith "," ms <> " " <> s <> " " <> ntnKey n <> ">"
   NTuple xs _ -> "(," <> S.joinWith ", " (map ntnKey xs) <> ")"
   NBrace n _ -> "{b " <> ntnKey n <> "}"
+  NBracket n _ -> "[b " <> ntnKey n <> "]"
   Ident x _ -> "i:" <> x
   Keyword x _ -> "k:" <> x
   NField x _ -> "f:" <> x

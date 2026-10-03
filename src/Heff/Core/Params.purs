@@ -43,6 +43,19 @@ data Universe = SmallU | LargeU
 
 derive instance eqUniverse :: Eq Universe
 
+-- | spike: how a function's argument is given -- written (`Expl`), inferred
+-- | by unification (`Impl`, `{x : A}`), or found by instance search among
+-- | the declared witnesses in scope (`Inst`, `[x : A]`)
+data Plicity = Expl | Impl | Inst
+
+derive instance eqPlicity :: Eq Plicity
+
+instance showPlicity :: Show Plicity where
+  show = case _ of
+    Expl -> "Expl"
+    Impl -> "Impl"
+    Inst -> "Inst"
+
 instance showUniverse :: Show Universe where
   show = case _ of
     SmallU -> "SmallU"

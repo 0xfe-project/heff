@@ -22,6 +22,8 @@ module Heff.Elab.Unify
   , runDelayed
   , solveHole
   , isFlexTy
+  , metasTy
+  , metasEl
   ) where
 
 import Prelude
@@ -51,7 +53,7 @@ import Heff.Core.Print (prettyEl, prettyTy)
 import Data.Lazy (defer)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
-import Heff.Elab.Environment (Delayed(..), E, ElabSt, tryPure)
+import Heff.Elab.Environment (Delayed(..), E, ElabSt, Wanted(..), tryPure)
 import Heff.Support.Pretty as P
 
 type U a = ExceptT DefEqCheckError (State ElabSt) a
@@ -551,13 +553,30 @@ settle g = go 0
   go fuel = do
     runDelayed false
     _ <- retryPostponed g
+    -- spike: find the instance arguments whose goals are determined now
+    moved <- resolveWanteds false
     ds <- gets _.delayed
     mc <- gets _.metas
     let ready = A.any (\(Delayed d) -> not (isFlexTy (V.forceTy mc d.ty))) ds
-    if ready && fuel <= 50 then go (fuel + 1)
+    if (ready || moved) && fuel <= 50 then go (fuel + 1)
     else do
       runDelayed true
+      _ <- resolveWanteds true
       retryPostponed g
+
+-- | spike: try each waiting instance argument; `final` refuses the ones
+-- | whose goals never became determined.  Answers whether any was found
+-- | (the loop then goes again).
+resolveWanteds :: Boolean -> E Boolean
+resolveWanteds final = do
+  ws <- gets _.wanted
+  if A.null ws then pure false
+  else do
+    modify_ (_ { wanted = [] })
+    results <- traverse (\(Wanted w) -> w.resolve final <#> \done -> Tuple done (Wanted w)) ws
+    let kept = map (\(Tuple _ w) -> w) (A.filter (\(Tuple done _) -> not done) results)
+    modify_ \s -> s { wanted = s.wanted <> kept }
+    pure (A.any (\(Tuple done _) -> done) results)
 
 -- | Retry the postponed problems until no more are solved; the ones left
 -- | are reported.

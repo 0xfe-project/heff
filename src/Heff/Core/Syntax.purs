@@ -4,7 +4,7 @@ module Heff.Core.Syntax where
 
 import Heff.Support.BigInt (BigInt)
 import Heff.Support.Common (Dict, Name)
-import Heff.Core.Params (Level, Universe, Variants)
+import Heff.Core.Params (Level, Plicity, Universe, Variants)
 import Data.Tuple (Tuple)
 
 -- | abstractions (syntactic closures)
@@ -32,7 +32,7 @@ data El
   | LitFloat Number
   | LitString String
 
-type FunctionType = { level :: Level, dom :: Ty, cod :: Abs Ty, implicit :: Boolean }
+type FunctionType = { level :: Level, dom :: Ty, cod :: Abs Ty, implicit :: Plicity }
 
 type RecordType = { level :: Level, fieldTypes :: Dict Ty }
 

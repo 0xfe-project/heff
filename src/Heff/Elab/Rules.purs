@@ -20,19 +20,19 @@ import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Dict, Name, dictAt, dictContains, dictFromList, dictKeyIndex, dictLength, dictLookup, dictToList)
 import Heff.Core.Conversion (DefEqCheckError, prettyDefEqError)
-import Heff.Elab.Unify (blockedTy, forceT, freshMeta, isFlexTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
-import Heff.Core.Readback (readbTy)
+import Heff.Elab.Unify (blockedTy, forceT, freshMeta, isFlexTy, metasTy, runDelayed, solveHole, unifyEl, unifyTy, zonkTy)
+import Heff.Core.Readback (readbEl, readbTy)
 import Control.Monad.State (get, gets, modify_)
 import Control.Monad.Except (catchError)
-import Heff.Core.Globals (isBroken, lookupGlobalKey)
+import Heff.Core.Globals (isBroken, lookupGlobal, lookupGlobalKey)
 import Heff.Core.Memoed as M
-import Heff.Core.Params (Case(..), Level(..), Universe(..), Variants(..), decodesInto, leq, maxLevel)
+import Heff.Core.Params (Case(..), Level(..), Plicity(..), Universe(..), Variants(..), decodesInto, leq, maxLevel)
 import Heff.Core.Print (prtElR)
 import Heff.Core.Rename (displayName, mentionsInnermost, renameTy)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
 import Heff.Elab.Environment as Env
-import Heff.Elab.Environment (BindingMode(..), Ctx(..), E, record, traceE, ElabEnv, ElabFor(..), appElabFor, caseOf, createNominative, evalEnv, failElsewhere, failWith, failWithNote, multiBind, projElabFor, shape, undelay, withBound)
+import Heff.Elab.Environment (BindingMode(..), Ctx(..), E, Wanted(..), record, traceE, ElabEnv, ElabFor(..), appElabFor, caseOf, createNominative, evalEnv, failElsewhere, failWith, failWithNote, multiBind, projElabFor, shape, undelay, withBound)
 import Heff.Parse.Notation (Span)
 import Heff.Support.Pretty (Doc, (<+>))
 import Heff.Support.Pretty as P
@@ -72,7 +72,7 @@ recovering c = Chk \e a -> do
     -- own: kept, for the definition to fail, but reported elsewhere)
     blocked <- blockedTy a
     let kept = if blocked then d { code = -1 } else d
-    modify_ \s -> s { recovered = A.snoc s.recovered kept, delayed = saved.delayed, postponed = saved.postponed }
+    modify_ \s -> s { recovered = A.snoc s.recovered kept, delayed = saved.delayed, postponed = saved.postponed, wanted = saved.wanted }
     pure (errorHole a)
 
 -- | an error hole of a type: what did not elaborate, in its place
@@ -106,7 +106,7 @@ prtInM e m = prtSyn e (renameTy (displayName e.globals) m.stx)
 -- Function
 --------------------------------------------------------------------------------
 
-data Binder = Anonymous Typ | Named Name Typ | NamedImplicit Span Name Typ
+data Binder = Anonymous Typ | Named Name Typ | NamedImplicit Span Name Typ | NamedInstance Span Name Typ
 
 -- | a type printed in the scope of the environment, with the current
 -- | metacontext's solutions substituted in
@@ -120,20 +120,78 @@ zonked mc e t = prtSyn e (renameTy (displayName e.globals) (zonkTy mc (readbTy e
 
 isImplicitPi :: V.Ty -> Boolean
 isImplicitPi t = case V.behavior t of
-  V.LikeFunction ft -> ft.implicit
+  V.LikeFunction ft -> ft.implicit /= Expl
   _ -> false
 
 -- | Apply `m : ty` to a fresh metavariable for each implicit argument it
--- | takes first.
+-- | takes first; an instance argument gets a hole, to be found (`settle`)
+-- | among the witnesses in scope once its goal type has no metas left.
 insertImplicits :: ElabEnv -> Span -> M.El -> V.Ty -> E (Tuple M.El V.Ty)
 insertImplicits e sp m ty0 = do
   ty <- forceT ty0
   case V.behavior ty of
-    V.LikeFunction ft | ft.implicit -> do
+    V.LikeFunction ft | ft.implicit == Impl -> do
       meta <- freshMeta e.scope.len e.scope.locals ft.dom (fromMaybe "_" (V.cloName ft.cod)) sp
       let arg = { stx: meta.stx, val: pure (V.Nom meta.val) }
       insertImplicits e sp (M.iapp (fromMaybe "_" (V.cloName ft.cod)) m arg) (V.nom (V.appClo ft.cod (pure meta.val)))
+    V.LikeFunction ft | ft.implicit == Inst -> do
+      arg <- insertInstance e sp ft
+      insertImplicits e sp (M.app m arg) (V.nom (V.appClo ft.cod (defer \_ -> M.valN arg)))
     _ -> pure (Tuple m ty)
+
+-- | an instance argument: a hole, and a `Wanted` that will find it
+insertInstance :: ElabEnv -> Span -> V.FunctionType -> E M.El
+insertInstance e sp ft = do
+  let goal = ft.dom
+  hole <- freshMeta e.scope.len e.scope.locals goal (fromMaybe "_" (V.cloName ft.cod)) sp
+  let
+    hm = case hole.stx of
+      S.MetaApp k _ _ -> k
+      _ -> -1
+  mc0 <- gets _.metas
+  -- (measured: a goal already determined here would need no deferral)
+  let readyNow = A.null (metasTy mc0 20 e.scope.len goal)
+  traceE sp "instance" (defer \_ ->
+    "wanted " <> P.render (zonked mc0 e goal) <> (if readyNow then "  [ready at the call]" else "  [waits for implicits]"))
+  modify_ \st -> st { wanted = A.snoc st.wanted (Wanted { span: sp, resolve: resolveWanted e sp hm hole.val goal }) }
+  pure { stx: hole.stx, val: pure (V.Nom hole.val) }
+
+-- | find the one witness in scope whose type is the goal: the instance
+-- | binders entered (`e.insts`) and the definitions marked `instance`.
+-- | More than one is refused (same-typed witnesses are definitionally
+-- | equal here -- small values are opaque -- so no tie-break can tell
+-- | them apart); none is refused too.
+resolveWanted :: ElabEnv -> Span -> Int -> V.El -> V.Ty -> Boolean -> E Boolean
+resolveWanted e sp hm holeVal goal final = do
+  mc <- gets _.metas
+  let left = metasTy mc 20 e.scope.len goal
+  if not (A.null left) then
+    if final then do
+      g <- prtInZ e goal
+      failWithNote sp 40 (txt "an instance argument's type is not determined here:" <+> g)
+        (txt "give the argument explicitly, or annotate so the implicits around it are solved")
+    else pure false
+  else do
+    let
+      locals = map (\c -> { name: c.name, ty: c.ty, sol: { stx: readbEl e.scope.len c.v, val: c.v } }) (A.fromFoldable e.insts)
+      globals = A.mapMaybe (\k -> lookupGlobal e.globals k <#> \ge ->
+        { name: k, ty: ge.type_, sol: { stx: S.Global k, val: ge.value } }) e.globals.instances
+    matches <- A.filterA (\c -> unifyTy e.globals (shape e.scope) goal c.ty <#> case _ of
+      Right _ -> true
+      Left _ -> false) (locals <> globals)
+    g <- prtInZ e goal
+    case matches of
+      [ one ] -> do
+        r <- solveHole e.globals (shape e.scope) hm holeVal one.sol
+        case r of
+          Right _ -> do
+            traceE sp "instance" (defer \_ -> "found " <> one.name <> " : " <> P.render g)
+            pure true
+          Left err -> conversionFail sp (txt ("the instance found, " <> one.name <> ", does not fit here")) (prettyDefEqError (displayName e.globals) err)
+      [] -> failWithNote sp 41 (txt "no instance for" <+> g <+> txt "in scope")
+        (txt "declare a witness with `instance <name> : ...`, or give the argument explicitly")
+      many -> failWithNote sp 42 (txt "more than one instance for" <+> g <+> txt "in scope:" <+> txt (Text.joinWith ", " (map _.name many)))
+        (txt "they cannot be told apart by type (small values are statically opaque): give the argument explicitly")
 
 functionFormation :: Binder -> Typ -> Typ
 functionFormation (Anonymous dom) cod = Typ \e -> do
@@ -152,7 +210,15 @@ functionFormation (NamedImplicit sp x dom) cod = Typ \e -> do
   when (leq (M.levelOf edom) Small) $
     failWith sp 24 (txt "an implicit argument must have a large type (a small one could never be inferred: its values are statically irrelevant)")
   ecod <- runTyp cod (e { scope = Env.bindName x (M.tyN edom) e.scope })
-  pure (M.functionI true (evalEnv e) edom (S.Abs x ecod))
+  pure (M.functionI Impl (evalEnv e) edom (S.Abs x ecod))
+-- spike: `[x : A] -> B`, an instance argument, found among the witnesses
+-- in scope at each use.  Its type may be small (the finding is by the
+-- goal TYPE, which is static; the small value found is the named
+-- witness's) -- the E0324 ban is about unification, which this never uses.
+functionFormation (NamedInstance _ x dom) cod = Typ \e -> do
+  edom <- runTyp dom e
+  ecod <- runTyp cod (e { scope = Env.bindName x (M.tyN edom) e.scope })
+  pure (M.functionI Inst (evalEnv e) edom (S.Abs x ecod))
 
 -- | extension: checked at an implicit function type, anything is under the
 -- | implicit lambdas it needs (not only a lambda)
@@ -160,7 +226,7 @@ implicitLams :: Chk -> Chk
 implicitLams c = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit -> do
+    V.LikeFunction ft | ft.implicit == Impl -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (implicitLams c)
@@ -175,17 +241,20 @@ functionIntro sp x body = Chk \e a0 -> do
   case V.behavior a of
     -- a lambda checked at an implicit function type: the implicit argument
     -- is bound silently, and the lambda is for the next argument
-    V.LikeFunction ft | ft.implicit -> do
+    V.LikeFunction ft | ft.implicit == Impl -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (functionIntro sp x body)
           (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs y ebody))
+    -- an instance argument is bound by the lambda like an ordinary one,
+    -- and becomes a witness in scope for the searches inside the body
     V.LikeFunction ft -> do
       ebody <- withBound x ft.dom e.scope \v scope' ->
         runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1
+             , insts = if ft.implicit == Inst then { name: x, ty: ft.dom, v } : e.insts else e.insts })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
@@ -210,7 +279,7 @@ functionIntroAnn :: Span -> Name -> Typ -> Chk -> Chk
 functionIntroAnn sp x dom body = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit -> do
+    V.LikeFunction ft | ft.implicit == Impl -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (functionIntroAnn sp x dom body)
@@ -227,7 +296,8 @@ functionIntroAnn sp x dom body = Chk \e a0 -> do
       -- may be known only later -- an implicit argument still unsolved)
       ebody <- withBound x (M.tyN edom) e.scope \v scope' ->
         runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1
+             , insts = if ft.implicit == Inst then { name: x, ty: ft.dom, v } : e.insts else e.insts })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
@@ -237,7 +307,7 @@ functionIntroImplicit :: Span -> Name -> Chk -> Chk
 functionIntroImplicit sp x body = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit -> do
+    V.LikeFunction ft | ft.implicit == Impl -> do
       ebody <- withBound x ft.dom e.scope \v scope' ->
         runChk body
           (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
@@ -251,9 +321,13 @@ functionElimImplicit sp callee arg = Syn \e -> do
   Tuple ecallee a0 <- runSyn callee e
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit -> do
+    V.LikeFunction ft | ft.implicit == Impl -> do
       earg <- runChk arg e ft.dom
       pure (Tuple (M.iapp (fromMaybe "_" (V.cloName ft.cod)) ecallee earg) (V.nom (V.appClo ft.cod (defer \_ -> M.valN earg))))
+    -- spike: `f {a}` also gives an instance argument explicitly
+    V.LikeFunction ft | ft.implicit == Inst -> do
+      earg <- runChk arg e ft.dom
+      pure (Tuple (M.app ecallee earg) (V.nom (V.appClo ft.cod (defer \_ -> M.valN earg))))
     _ -> failWith sp 26 (txt "`{...}` gives an implicit argument, but this takes none here")
 
 -- | extension: `f (x := a)` gives the implicit argument named `x`; the
@@ -266,12 +340,17 @@ functionElimNamed sp x callee arg = Syn \e -> do
   go e m ty0 = do
     ty <- forceT ty0
     case V.behavior ty of
-      V.LikeFunction ft | ft.implicit && V.cloName ft.cod == Just x -> do
+      V.LikeFunction ft | ft.implicit /= Expl && V.cloName ft.cod == Just x -> do
         earg <- runChk arg e ft.dom
-        pure (Tuple (M.iapp x m earg) (V.nom (V.appClo ft.cod (defer \_ -> M.valN earg))))
-      V.LikeFunction ft | ft.implicit -> do
+        let ap = if ft.implicit == Impl then M.iapp x m earg else M.app m earg
+        pure (Tuple ap (V.nom (V.appClo ft.cod (defer \_ -> M.valN earg))))
+      V.LikeFunction ft | ft.implicit == Impl -> do
         meta <- freshMeta e.scope.len e.scope.locals ft.dom (fromMaybe "_" (V.cloName ft.cod)) sp
         go e (M.iapp (fromMaybe "_" (V.cloName ft.cod)) m { stx: meta.stx, val: pure (V.Nom meta.val) }) (V.nom (V.appClo ft.cod (pure meta.val)))
+      -- spike: an instance argument before the named one is searched for
+      V.LikeFunction ft | ft.implicit == Inst -> do
+        earg <- insertInstance e sp ft
+        go e (M.app m earg) (V.nom (V.appClo ft.cod (defer \_ -> M.valN earg)))
       _ -> failWith sp 29 (txt ("`(" <> x <> " := ...)` names an implicit argument, but there is none named " <> x <> " here"))
 
 functionElim :: Span -> Syn -> Chk -> Syn

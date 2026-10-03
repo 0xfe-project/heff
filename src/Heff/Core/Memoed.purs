@@ -9,7 +9,7 @@ import Data.Lazy (Lazy, defer, force)
 import Data.Tuple (Tuple)
 import Heff.Support.Common (Dict, Name, dictMap)
 import Heff.Core.Evaluation (EvalEnv, compile, compileRecordType, compileTy)
-import Heff.Core.Params (Case(..), Level, Universe, Variants, variantsMap)
+import Heff.Core.Params (Case(..), Level, Plicity(..), Universe, Variants, variantsMap)
 import Heff.Core.Readback (CtxLen, readbEl, readbTy)
 import Heff.Core.Syntax as S
 import Heff.Core.Value as V
@@ -94,10 +94,10 @@ decode :: El -> Ty
 decode g = { stx: S.Decode g.stx, val: defer \_ -> V.decodeEv (force g.val) }
 
 function :: EvalEnv -> Ty -> S.Abs Ty -> Ty
-function e dom cod = functionI false e dom cod
+function e dom cod = functionI Expl e dom cod
 
--- | a function type whose argument may be implicit
-functionI :: Boolean -> EvalEnv -> Ty -> S.Abs Ty -> Ty
+-- | a function type whose argument may be implicit or an instance
+functionI :: Plicity -> EvalEnv -> Ty -> S.Abs Ty -> Ty
 functionI implicit e dom cod =
   let
     r = case cod of

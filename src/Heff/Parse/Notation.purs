@@ -45,6 +45,7 @@ data Ntn
   | MDecl (Array String) String Ntn Span
   | NTuple (Array Ntn) Span
   | NBrace Ntn Span -- ^ extension: `{ e }`, for implicit arguments
+  | NBracket Ntn Span -- ^ spike: `[x : T]`, an instance binder
   | Ident String Span
   | Keyword String Span
   | NField String Span
@@ -74,6 +75,7 @@ ntnSpan n = { start: startPos n, end: endPos n }
     MDecl _ _ _ s -> s.start
     NTuple _ s -> s.start
     NBrace _ s -> s.start
+    NBracket _ s -> s.start
     Ident _ s -> s.start
     Keyword _ s -> s.start
     NField _ s -> s.start
@@ -89,6 +91,7 @@ ntnSpan n = { start: startPos n, end: endPos n }
     MDecl _ _ _ s -> s.end
     NTuple _ s -> s.end
     NBrace _ s -> s.end
+    NBracket _ s -> s.end
     Ident _ s -> s.end
     Keyword _ s -> s.end
     NField _ s -> s.end
@@ -113,4 +116,5 @@ ntnHead = case _ of
   NString i _ -> P.text "String" <+> P.text i
   NTuple _ _ -> P.text "Tuple"
   NBrace _ _ -> P.text "Brace"
+  NBracket _ _ -> P.text "Bracket"
   NError _ -> P.text "Error"

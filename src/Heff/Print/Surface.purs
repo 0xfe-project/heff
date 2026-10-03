@@ -20,7 +20,7 @@ import Data.String as S
 import Data.String.CodeUnits as SCU
 import Data.Tuple (Tuple(..))
 import Heff.Support.Common (Name, dictToList, operatorName, quoteString)
-import Heff.Core.Params (Universe(..), Variants(..))
+import Heff.Core.Params (Plicity(..), Universe(..), Variants(..))
 import Heff.Core.Syntax as Syn
 import Heff.Print.Resugar (equationsWith)
 
@@ -159,7 +159,7 @@ el c p xs = case _ of
   spine (Syn.App f a) acc = spine f (A.cons a acc)
   spine h acc = { head: h, args: acc }
   lambdas ys bs = case _ of
-    Syn.Lam (Syn.Function ft) (Syn.Abs x b) | ft.implicit -> lambdas (x : ys) (A.snoc bs ("{" <> x <> "}")) b
+    Syn.Lam (Syn.Function ft) (Syn.Abs x b) | ft.implicit == Impl -> lambdas (x : ys) (A.snoc bs ("{" <> x <> "}")) b
     Syn.Lam _ (Syn.Abs x b) -> lambdas (x : ys) (A.snoc bs x) b
     Syn.Lam _ (Syn.AbsConst b) -> lambdas ys (A.snoc bs "_") b
     b -> { names: ys, binders: bs, body: b }
@@ -183,15 +183,19 @@ ty c p xs = case _ of
   Syn.PrimArray a -> paren (p >= 2) ("Array " <> ty c 2 xs a)
   where
   arrow f = case f.cod of
-    Syn.Abs x b | f.implicit ->
+    Syn.Abs x b | f.implicit == Impl ->
       -- `{a b :: T}`: implicit binders of the same type, together
       let r = implicits [ x ] f.dom b (x : xs)
       in "{" <> S.joinWith " " r.names <> " : " <> ty c 0 xs f.dom <> "} -> " <> ty c 0 r.ctx r.rest
+    -- spike: `[x : T] ->`, an instance binder
+    Syn.Abs x b | f.implicit == Inst ->
+      "[" <> x <> " : " <> ty c 0 xs f.dom <> "] -> " <> ty c 0 (x : xs) b
     Syn.Abs x b -> "(" <> x <> " : " <> ty c 0 xs f.dom <> ") -> " <> ty c 0 (x : xs) b
+    Syn.AbsConst b | f.implicit == Inst -> "[_ : " <> ty c 0 xs f.dom <> "] -> " <> ty c 0 xs b
     Syn.AbsConst b -> ty c 1 xs f.dom <> " -> " <> ty c 0 xs b
   -- (only binders of a universe: their types cannot mention one another)
   implicits names dom rest ctx = case rest, dom of
-    Syn.Function g, Syn.U u | g.implicit, Syn.Abs y b <- g.cod, Syn.U u' <- g.dom, u == u' ->
+    Syn.Function g, Syn.U u | g.implicit == Impl, Syn.Abs y b <- g.cod, Syn.U u' <- g.dom, u == u' ->
       implicits (A.snoc names y) dom b (y : ctx)
     _, _ -> { names, rest, ctx }
 
@@ -252,7 +256,7 @@ typeFormer t body ns params = case t, body of
     Syn.Code d -> Just { params, names: ns, def: unIs d, large: u == LargeU }
     -- (`type T = Tk.T`: a type-valued term, an alias among them)
     b -> Just { params, names: ns, def: Syn.Decode b, large: u == LargeU }
-  Syn.Function f, Syn.Lam _ (Syn.Abs x b) | not f.implicit, Syn.Abs _ cod <- f.cod ->
+  Syn.Function f, Syn.Lam _ (Syn.Abs x b) | f.implicit == Expl, Syn.Abs _ cod <- f.cod ->
     -- (a parameter of type `Type` is bare if it is lower case: `data List a`)
     let param = case f.dom of
           Syn.U SmallU | not (upper x) -> x

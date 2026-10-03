@@ -105,17 +105,21 @@ createNominative (ForDescriptive n) ev a = V.reflect n.head (pure n.spine) (pure
 -- | definition itself is (evaluation is by value), so `rec` refuses it;
 -- | `self`: the key of the definition being elaborated, bound as local 0,
 -- | so that a use of itself is recorded as the global it is
-type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor, lams :: Int, self :: Maybe Name }
+type ElabEnv = { scope :: Scope, globals :: Globals, elabFor :: ElabFor, lams :: Int, self :: Maybe Name, insts :: List InstLocal }
+
+-- | spike: an instance binder in scope -- a candidate for instance search.
+-- | `v` is the bound local's value, `ty` its type.
+type InstLocal = { name :: Name, ty :: V.Ty, v :: V.El }
 
 evalEnv :: ElabEnv -> EvalEnv
 evalEnv e = { local: e.scope.locals, global: e.globals }
 
 emptyElabEnv :: Globals -> ElabEnv
-emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals, lams: 0, self: Nothing }
+emptyElabEnv globals = { elabFor: ForNominative, scope: emptyScope, globals, lams: 0, self: Nothing, insts: Nil }
 
 emptyElabEnvFor :: Globals -> Name -> ElabEnv
 emptyElabEnvFor globals x =
-  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals, lams: 0, self: Nothing }
+  { elabFor: ForDescriptive { head: V.Global x, spine: V.Id }, scope: emptyScope, globals, lams: 0, self: Nothing, insts: Nil }
 
 -- Failure
 --------------------------------------------------------------------------------
@@ -155,14 +159,21 @@ type ElabSt =
   -- the definition being elaborated: let-bound to the global it will
   -- be, which pattern unification passes through (`Unify.patternArgs`)
   , selfKey :: Maybe Name
+  -- spike: instance arguments waiting to be found (resolved in `settle`)
+  , wanted :: Array Wanted
   }
 
 -- | an argument whose check waits until the type it is checked at (`ty`)
 -- | is known
 newtype Delayed = Delayed { ty :: V.Ty, check :: ExceptT Diag (State ElabSt) Unit }
 
+-- | spike: an instance argument to find.  `resolve final` searches once
+-- | the goal has no unsolved metavariables; it answers whether it is done
+-- | (solved), and on `final` it fails rather than wait longer.
+newtype Wanted = Wanted { span :: Span, resolve :: Boolean -> ExceptT Diag (State ElabSt) Boolean }
+
 emptySt :: ElabSt
-emptySt = { infos: Nil, recovered: [], poisoned: Set.empty, metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: Nil, selfKey: Nothing }
+emptySt = { infos: Nil, recovered: [], poisoned: Set.empty, metas: Map.empty, nextMeta: 0, postponed: [], delayed: [], trace: Nil, selfKey: Nothing, wanted: [] }
 
 
 
