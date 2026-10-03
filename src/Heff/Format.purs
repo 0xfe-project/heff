@@ -993,7 +993,7 @@ pE env = case _ of
   Named o x k e c -> tok env o <> tok env x <+> tok env k <+> pE env e <> tok env c
   Tup o [] _ c -> tok env o <> tok env c
   Tup o es commas c ->
-    P.group (tok env o <> P.align (pE env (headE es) <> fold (A.zipWith (\comma e -> tok env comma <> P.line <> pE env e) commas (A.drop 1 es))) <> tok env c)
+    P.group (P.align (tok env o <> P.flatAlt (P.text " ") mempty <> pE env (headE es) <> fold (A.zipWith (\comma e -> P.line' <> tok env comma <+> pE env e) commas (A.drop 1 es)) <> P.line' <> tok env c))
   Braces o [] _ c -> tok env o <> tok env c
   Braces o fs commas c ->
     P.group (P.align (tok env o <+> pF (headF fs) <> fold (A.zipWith (\comma f -> P.line' <> tok env comma <+> pF f) commas (A.drop 1 fs)) <> P.line <> tok env c))
@@ -1024,13 +1024,15 @@ pE env = case _ of
   Case kw scrut of_ alts ->
     tok env kw <+> pE env scrut <+> tok env of_
       <> items env (\a -> firstP a.pat) (\a -> lastE a.body) (\e a -> pP e a.pat <+> tok e a.arrow <> rhsOf e a.body) alts
-  -- (`else if` goes on at the same depth: a chain, not a staircase)
+  -- (`else if` goes on at the same depth: a chain, not a staircase, and
+  -- each link holds `if ... then ...` on one line while it fits)
   If kw c th a el b ->
-    P.group (tok env kw <+> pE env c <> P.nest 2 (P.line <> tok env th <+> P.nest 2 (pE env a) <> elseOf el b))
+    P.group (ifLink kw c th a <> elseOf el b)
   Do kw stmts -> tok env kw <> items env firstStmt lastStmt pS stmts
   where
+  ifLink kw c th a = P.group (tok env kw <+> pE env c <> P.nest 2 (P.line <> tok env th <+> P.nest 2 (pE env a)))
   elseOf el b = case b of
-    If kw c th a el' b' -> P.line <> tok env el <+> tok env kw <+> pE env c <> P.line <> tok env th <+> P.nest 2 (pE env a) <> elseOf el' b'
+    If kw c th a el' b' -> P.line <> tok env el <+> ifLink kw c th a <> elseOf el' b'
     _ -> P.line <> tok env el <+> P.nest 2 (pE env b)
   headE es = fromMaybe (Atom eofTok) (A.head es)
   headF fs = fromMaybe (FDecl (Atom eofTok)) (A.head fs)

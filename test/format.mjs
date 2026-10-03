@@ -181,13 +181,10 @@ formats("else if, broken", [
   "data Bool = True | False",
   "pick : Bool -> Bool -> Bool -> Bool",
   "pick a b c =",
-  "  if a",
-  "    then (if b then c else a)",
-  "    else if b",
-  "    then (if c then a else b)",
-  "    else if c",
-  "    then (if a then b else c)",
-  "    else False",
+  "  if a then (if b then c else a)",
+  "  else if b then (if c then a else b)",
+  "  else if c then (if a then b else c)",
+  "  else False",
   "",
 ].join("\n"));
 
