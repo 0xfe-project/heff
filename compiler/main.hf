@@ -175,35 +175,58 @@ emitErrs (Cons e rest) = do
   heffM.printErr ("heff: not compiled: " ++ e)
   emitErrs rest
 
-writeOut : String -> Em.Output -> Co world Unit
-writeOut outPath o = do
+putFileDiags : List Dr.Checked -> Co world Unit
+putFileDiags Nil = pure MkUnit
+putFileDiags (Cons c rest) = do
+  if null c.diags then pure MkUnit
+    else heffM.putErr (Dg.renderFileDiags c.path c.source c.diags)
+  putFileDiags rest
+
+anyErrors : List Dr.Checked -> Bool
+anyErrors cs = any (\(c : Dr.Checked) -> not (null (Dr.errorsIn c))) cs
+
+writeOut : String -> String -> Em.Output -> Co world Unit
+writeOut outPath how o = do
   emitErrs o.errors
   if null o.errors
       then do
         ok <- heffM.writeFile outPath o.source
-        if ok then heffM.print ("wrote " ++ outPath)
+        if ok then heffM.print ("wrote " ++ outPath ++ ": " ++ how)
           else do
             heffM.printErr ("cannot write " ++ outPath)
             heffM.exit 1
     else heffM.exit 1
 
 compileFound : String
+             -> Maybe String
+             -> String
              -> String
              -> Dr.Checked
              -> List Em.Provider
              -> Co world Unit
-compileFound name outPath c available = case Dr.findRunnable
+compileFound file name outPath how c available = case Dr.findRunnable
     (filter (\k -> providesLeaf available k) (Dr.candidateLeaves c))
     c
-    (Just name) of
+    name of
   Left why -> do
-    heffM.printErr ("heff: " ++ why)
+    heffM.printErr ("heff: " ++ file ++ ": " ++ why)
     heffM.exit 1
   Right r ->
-    writeOut outPath (Em.compileProgram available c.top.globals r.key r.effect)
+    writeOut
+      outPath
+      how
+      (Em.compileProgram available c.top.globals r.key r.effect)
 
-compileLast : String -> String -> List Dr.Checked -> Co world Unit
-compileLast name outPath cs = case Dr.lastChecked cs of
+-- (a computation whose effects all have providers for this host: each
+-- world's algebra is bundled in from its module's M.provider.js)
+compileLast : String
+            -> String
+            -> Maybe String
+            -> String
+            -> String
+            -> List Dr.Checked
+            -> Co world Unit
+compileLast host file name outPath how cs = case Dr.lastChecked cs of
   Nothing -> do
     heffM.printErr "no files given"
     heffM.exit 1
@@ -211,21 +234,117 @@ compileLast name outPath cs = case Dr.lastChecked cs of
     found <-
       readProviders
         (nubStrM (map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
-    compileFound name outPath c (filter (\p -> forHost "node" p) found)
+    compileFound file name outPath how c (filter (\p -> forHost host p) found)
 
-compileChecked : String -> String -> List Dr.Checked -> Co world Unit
-compileChecked name outPath cs = do
-  bad <- diagCount cs
-  if bad == 0 then compileLast name outPath cs else heffM.exit 1
+compileDiags : String
+             -> String
+             -> Maybe String
+             -> String
+             -> String
+             -> Bool
+             -> List Dr.Checked
+             -> Co world Unit
+compileDiags host file name outPath how badL cs = do
+  putFileDiags cs
+  if badL then heffM.exit 1 else compileLast host file name outPath how cs
 
--- | compile the computation `name` of FILE to a Node.js program:
+-- | compile the computation `name` of FILE to a program of `host`:
 -- | FILE's import closure loaded with the compiler's own loader
-compileCmd : String -> String -> String -> Co world Unit
-compileCmd name outPath file = do
+compileCmd : String
+           -> Maybe String
+           -> String
+           -> String
+           -> String
+           -> Co world Unit
+compileCmd host name outPath how file = do
   l <- L.loadProgram disk file
-  bad <- printErrs "heff" l.errors 0
-  if bad == 0 then compileChecked name outPath (Dr.checkProgram l.sources)
-    else heffM.exit 1
+  badL <- printErrs "heff" l.errors 0
+  compileDiags host file name outPath how (badL > 0) (Dr.checkProgram l.sources)
+
+nodeCmd : Maybe String -> String -> String -> Co world Unit
+nodeCmd name outPath file =
+  compileCmd
+    "node"
+    name
+    outPath
+    ("run it with `node " ++ outPath ++ " ARGS...`")
+    file
+
+appCmd : Maybe String -> String -> String -> Co world Unit
+appCmd name outPath file =
+  compileCmd
+    "page"
+    name
+    outPath
+    "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
+    file
+
+ownExport : Dr.Own -> Em.Export
+ownExport o = Em.mkExport o.name o.key
+
+compileJsOut : String -> Bool -> Em.Output -> Co world Unit
+compileJsOut outPath bad o = do
+  ok <- heffM.writeFile outPath o.source
+  emitErrs o.errors
+  if ok && not bad && null o.errors then pure MkUnit else heffM.exit 1
+
+compileJsDiags : String -> String -> Bool -> List Dr.Checked -> Co world Unit
+compileJsDiags file outPath badL cs = do
+  putFileDiags cs
+  case Dr.lastChecked cs of
+    Nothing -> heffM.exit 1
+    Just c ->
+      compileJsOut
+        outPath
+        (badL || anyErrors cs)
+        (Em.compileJs c.top.globals (map (\o -> ownExport o) c.own))
+
+-- | an ES module of FILE and what it imports
+compileJsCmd : String -> String -> Co world Unit
+compileJsCmd file outPath = do
+  l <- L.loadProgram disk file
+  badL <- printErrs "heff" l.errors 0
+  compileJsDiags file outPath (badL > 0) (Dr.checkProgram l.sources)
+
+printEvals : List Dr.Evaluated -> Co world Unit
+printEvals Nil = pure MkUnit
+printEvals (Cons d rest) = do
+  heffM.print (d.name ++ " = " ++ d.value)
+  printEvals rest
+
+evalDiags : Bool -> List Dr.Checked -> Co world Unit
+evalDiags badL cs = do
+  putFileDiags cs
+  case Dr.lastChecked cs of
+    Nothing -> heffM.exit 1
+    Just c -> do
+      printEvals (Dr.evaluate c)
+      if badL || anyErrors cs then heffM.exit 1 else pure MkUnit
+
+-- | print what each definition of FILE evaluates to
+evalCmd : String -> Co world Unit
+evalCmd file = do
+  l <- L.loadProgram disk file
+  badL <- printErrs "heff" l.errors 0
+  evalDiags (badL > 0) (Dr.checkProgram l.sources)
+
+promoteDiags : String -> Bool -> List Dr.Checked -> Co world Unit
+promoteDiags file badL cs = do
+  putFileDiags cs
+  case Dr.lastChecked cs of
+    Nothing -> heffM.exit 1
+    Just c ->
+      if badL || anyErrors cs then heffM.exit 1
+      else do
+        ok <- heffM.writeFile file (Dr.promote c)
+        if ok then pure MkUnit else heffM.exit 1
+
+-- | write each watch's value under it as its expectation
+promoteCmd : String -> Co world Unit
+promoteCmd file = do
+  l <- L.loadProgram disk file
+  badL <- printErrs "heff" l.errors 0
+  promoteDiags file (badL > 0) (Dr.checkProgram l.sources)
 
 printWatchVals : List Dr.WatchInfo -> Co world Unit
 printWatchVals Nil = pure MkUnit
@@ -313,16 +432,6 @@ testCmd (Cons f rest) total failed anyBad = do
   r <- testOneF f
   testCmd rest (total + r.total) (failed + r.failed) (anyBad || not r.ok)
 
-putFileDiags : List Dr.Checked -> Co world Unit
-putFileDiags Nil = pure MkUnit
-putFileDiags (Cons c rest) = do
-  if null c.diags then pure MkUnit
-    else heffM.putErr (Dg.renderFileDiags c.path c.source c.diags)
-  putFileDiags rest
-
-anyErrors : List Dr.Checked -> Bool
-anyErrors cs = any (\(c : Dr.Checked) -> not (null (Dr.errorsIn c))) cs
-
 checkLast : Bool -> List Dr.Checked -> Co world Unit
 checkLast badLoad cs = do
   putFileDiags cs
@@ -340,16 +449,25 @@ checkCmd file = do
   checkLast (badL > 0) (Dr.checkProgram l.sources)
 
 -- | the compiler's door: `FILE...` checks and dumps (the differential);
--- | `node NAME OUT.mjs FILE` compiles, `check FILE` prints the
--- | interface, `run FILE` prints the watches' values, `test FILE...`
--- | checks their expectations
+-- | `node|app NAME OUT FILE` compiles, `compile-js FILE OUT` a module,
+-- | `check FILE` prints the interface, `run FILE` the watches' values,
+-- | `eval FILE` the definitions', `promote FILE` writes expectations,
+-- | `test FILE...` checks them
 main : Co world Unit
 main = do
   as <- heffM.args
   case as of
     Cons "node" (Cons name (Cons outPath (Cons file Nil))) ->
-      compileCmd name outPath file
+      nodeCmd (Just name) outPath file
+    Cons "node" (Cons outPath (Cons file Nil)) -> nodeCmd Nothing outPath file
+    Cons "app" (Cons name (Cons outPath (Cons file Nil))) ->
+      appCmd (Just name) outPath file
+    Cons "app" (Cons outPath (Cons file Nil)) -> appCmd Nothing outPath file
+    Cons "compile-js" (Cons file (Cons outPath Nil)) ->
+      compileJsCmd file outPath
     Cons "check" (Cons file Nil) -> checkCmd file
     Cons "run" (Cons file Nil) -> runCmd file
+    Cons "eval" (Cons file Nil) -> evalCmd file
+    Cons "promote" (Cons file Nil) -> promoteCmd file
     Cons "test" files -> testCmd files 0 0 False
     _ -> selfcheck as
