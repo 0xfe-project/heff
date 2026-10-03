@@ -16,33 +16,33 @@ import prelude
 import process
 import stdio
 
-eff : HFunctor
-eff = stdio <+> process <+> fs
+world : HFunctor
+world = stdio <+> process <+> fs
 
 -- the evidence, once per world: an operation then takes it itself
 -- (`print out s`, `args sys`), no wrapping call
-out : (stdio <: eff)
-out = first3 stdio process fs
+out : (stdio <: world)
+out = \p -> InL (InL p)
 
-sys : (process <: eff)
-sys = mid3 stdio process fs
+sys : (process <: world)
+sys = \p -> InL (InR p)
 
-disk : (fs <: eff)
-disk = last3 stdio process fs
+disk : (fs <: world)
+disk = \p -> InR p
 
 -- the program's own theory of its world: the operations it uses, the
 -- evidence paid once (repacking, as modules do)
-type Io =
-  { print : String -> Co eff Unit
-  , printErr : String -> Co eff Unit
-  , readFile : String -> Co eff (Maybe String)
-  , writeFile : String -> String -> Co eff Bool
-  , args : Co eff (List String)
-  , exit : Int -> Co eff Unit
+type HeffM =
+  { print : String -> Co world Unit
+  , printErr : String -> Co world Unit
+  , readFile : String -> Co world (Maybe String)
+  , writeFile : String -> String -> Co world Bool
+  , args : Co world (List String)
+  , exit : Int -> Co world Unit
   }
 
-io : Io
-io =
+heffM : HeffM
+heffM =
   { print = print out
   , printErr = printErr out
   , readFile = readFile disk
@@ -71,38 +71,38 @@ dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
 moduleOf : String -> String
 moduleOf path = dotsOf (dropLib (dropHf path))
 
-readAll : List String -> Co eff (List Dr.Source)
+readAll : List String -> Co world (List Dr.Source)
 readAll Nil = pure Nil
 readAll (Cons path rest) = do
-  mSrc <- io.readFile path
+  mSrc <- heffM.readFile path
   case mSrc of
     Nothing -> do
-      io.printErr ("cannot read " ++ path)
-      io.exit 1
+      heffM.printErr ("cannot read " ++ path)
+      heffM.exit 1
       pure Nil
     Just src -> do
       more <- readAll rest
       pure (Cons { module = moduleOf path, source = src } more)
 
-printLines : List String -> Co eff Unit
+printLines : List String -> Co world Unit
 printLines Nil = pure MkUnit
 printLines (Cons l rest) = do
-  io.print l
+  heffM.print l
   printLines rest
 
-printDefs : Dr.Checked -> List String -> Co eff Unit
+printDefs : Dr.Checked -> List String -> Co world Unit
 printDefs c Nil = pure MkUnit
 printDefs c (Cons k rest) = do
   printLines (Dr.dumpLines c k)
   printDefs c rest
 
-printErrs : String -> List String -> Int -> Co eff Int
+printErrs : String -> List String -> Int -> Co world Int
 printErrs m Nil n = pure n
 printErrs m (Cons l rest) n = do
-  io.printErr (m ++ ": " ++ l)
+  heffM.printErr (m ++ ": " ++ l)
   printErrs m rest (n + 1)
 
-printAll : List Dr.Checked -> Int -> Co eff Int
+printAll : List Dr.Checked -> Int -> Co world Int
 printAll Nil bad = pure bad
 printAll (Cons c rest) bad = do
   printDefs c (Dr.moduleKeys c)
@@ -111,14 +111,14 @@ printAll (Cons c rest) bad = do
 
 -- | check every file given, each after what it imports, and print the
 -- | stored core of every definition
-selfcheck : List String -> Co eff Unit
+selfcheck : List String -> Co world Unit
 selfcheck paths = do
   sources <- readAll paths
   bad <- printAll (Dr.checkProgram sources) 0
-  if bad == 0 then pure MkUnit else io.exit 1
+  if bad == 0 then pure MkUnit else heffM.exit 1
 
 -- (the errors said, the count comes back)
-diagCount : List Dr.Checked -> Co eff Int
+diagCount : List Dr.Checked -> Co world Int
 diagCount Nil = pure 0
 diagCount (Cons c rest) = do
   n <- printErrs (Dr.moduleName c) (Dr.diagLines c) 0
@@ -128,52 +128,52 @@ diagCount (Cons c rest) = do
 handledNode : List String
 handledNode = ["stdio", "fs", "process", "time", "net", "state"]
 
-emitErrs : List String -> Co eff Unit
+emitErrs : List String -> Co world Unit
 emitErrs Nil = pure MkUnit
 emitErrs (Cons e rest) = do
-  io.printErr ("heff: not compiled: " ++ e)
+  heffM.printErr ("heff: not compiled: " ++ e)
   emitErrs rest
 
-writeOut : String -> Em.Output -> Co eff Unit
+writeOut : String -> Em.Output -> Co world Unit
 writeOut outPath o = do
   emitErrs o.errors
   if null o.errors
       then do
-        ok <- io.writeFile outPath o.source
-        if ok then io.print ("wrote " ++ outPath)
+        ok <- heffM.writeFile outPath o.source
+        if ok then heffM.print ("wrote " ++ outPath)
           else do
-            io.printErr ("cannot write " ++ outPath)
-            io.exit 1
-    else io.exit 1
+            heffM.printErr ("cannot write " ++ outPath)
+            heffM.exit 1
+    else heffM.exit 1
 
-compileLast : String -> String -> List Dr.Checked -> Co eff Unit
+compileLast : String -> String -> List Dr.Checked -> Co world Unit
 compileLast name outPath cs = case Dr.lastChecked cs of
   Nothing -> do
-    io.printErr "no files given"
-    io.exit 1
+    heffM.printErr "no files given"
+    heffM.exit 1
   Just c -> case Dr.findRunnable handledNode c (Just name) of
     Left why -> do
-      io.printErr ("heff: " ++ why)
-      io.exit 1
+      heffM.printErr ("heff: " ++ why)
+      heffM.exit 1
     Right r -> writeOut outPath (Em.compileNode c.top.globals r.key r.effect)
 
-compileChecked : String -> String -> List Dr.Checked -> Co eff Unit
+compileChecked : String -> String -> List Dr.Checked -> Co world Unit
 compileChecked name outPath cs = do
   bad <- diagCount cs
-  if bad == 0 then compileLast name outPath cs else io.exit 1
+  if bad == 0 then compileLast name outPath cs else heffM.exit 1
 
 -- | compile the computation `name` of the last file given to a Node.js
 -- | program, the sources elaborated as `selfcheck` elaborates them
-compileCmd : String -> String -> List String -> Co eff Unit
+compileCmd : String -> String -> List String -> Co world Unit
 compileCmd name outPath paths = do
   sources <- readAll paths
   compileChecked name outPath (Dr.checkProgram sources)
 
 -- | the compiler's door: `FILE...` checks and dumps (the differential);
 -- | `node NAME OUT.mjs FILE...` compiles
-main : Co eff Unit
+main : Co world Unit
 main = do
-  as <- io.args
+  as <- heffM.args
   case as of
     Cons "node" (Cons name (Cons outPath paths)) ->
       compileCmd name outPath paths
