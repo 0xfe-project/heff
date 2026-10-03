@@ -40,7 +40,7 @@ if (build("test/node/timed.hf", "timed", timed)) {
 // a computation of an effect Node has no handler for is refused, and why
 {
   const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "node", "examples/counter/counter.hf", join(work, "counter.mjs")], { cwd: root, encoding: "utf8" });
-  check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom, which is not handled here"), true);
+  check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom.dom, which is not provided here"), true);
 }
 
 // one world handled at home (a counter: state, peeled off in the
