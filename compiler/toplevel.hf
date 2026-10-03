@@ -27,7 +27,7 @@ import prelude
 -- Diagnostics (parser codes are numbered from 200)
 --------------------------------------------------------------------------------
 
-failP : {a : Type} -> Pm.Span -> Int -> String -> E a
+failP : {a : Type} -> Pm.Span -> Int -> String -> Elab a
 failP sp code msg =
   throwE
     { code = 200 + code
@@ -37,7 +37,7 @@ failP sp code msg =
     , note = Nothing
     }
 
-unexpectedNotation : {a : Type} -> Ntn -> String -> E a
+unexpectedNotation : {a : Type} -> Ntn -> String -> Elab a
 unexpectedNotation n c = failP (ntnSpan n) 3 ("unexpected notation for " ++ c)
 
 tryStep : {a : Type}
@@ -46,7 +46,7 @@ tryStep : {a : Type}
 tryStep (MkPair r st) = MkPair (Right r) st
 
 -- | a computation, its failure as a value (the state kept either way)
-tryE : {a : Type} -> E a -> E (Either Diag a)
+tryE : {a : Type} -> Elab a -> Elab (Either Diag a)
 tryE m = \st -> tryStep (m st)
 
 -- The self, as local 0
@@ -132,7 +132,7 @@ fromTypN De j =
      res <- R.runTyp j (R.withFor e ForNominative)
      pure (M.isTy res)))
 
-fromTypD : Pm.Case -> Pm.Span -> R.Typ -> E Judgment
+fromTypD : Pm.Case -> Pm.Span -> R.Typ -> Elab Judgment
 fromTypD N sp j = failP sp 4 "cannot use descriptive syntax in nominal position"
 fromTypD De sp j = pure (TypJ j)
 
@@ -151,7 +151,7 @@ implicitLambda : Ntn -> Bool
 implicitLambda (Infix (NBrace _ _) (Keyword "=>" _) _) = True
 implicitLambda _ = False
 
-intoSyn : Pm.Span -> Judgment -> E R.Syn
+intoSyn : Pm.Span -> Judgment -> Elab R.Syn
 intoSyn sp (ChkJ _) =
   failP sp 0 "this notation must be put in a checking position"
 intoSyn sp (SynJ j) = pure j
@@ -160,15 +160,15 @@ intoSyn sp (TypJ _) =
 
 -- | the dispatcher's functions, knotted
 type TK =
-  { parseJ : Pm.Case -> Ntn -> E Judgment
-  , chkJ : Pm.Case -> Ntn -> E R.Chk
-  , synJ : Pm.Case -> Ntn -> E R.Syn
-  , typJ : Pm.Case -> Ntn -> E R.Typ
+  { parseJ : Pm.Case -> Ntn -> Elab Judgment
+  , chkJ : Pm.Case -> Ntn -> Elab R.Chk
+  , synJ : Pm.Case -> Ntn -> Elab R.Syn
+  , typJ : Pm.Case -> Ntn -> Elab R.Typ
   }
 
 -- | a check, recovered from where it fails -- where its notation is not
 -- | read, too
-recoveringChk : E R.Chk -> E R.Chk
+recoveringChk : Elab R.Chk -> Elab R.Chk
 recoveringChk m = do
   r <- tryE m
   case r of
@@ -176,11 +176,11 @@ recoveringChk m = do
     Left d -> pure (R.recovering (MkChk (\e a -> throwE d)))
 
 -- | an argument: where it does not check, an error hole
-argumentF : TK -> Ntn -> E R.Chk
+argumentF : TK -> Ntn -> Elab R.Chk
 argumentF tk n = recoveringChk (tk.chkJ N n)
 
 -- | an application to `n`, from `start` (where the function is) to it
-elimF : TK -> Int -> R.Syn -> Ntn -> E R.Syn
+elimF : TK -> Int -> R.Syn -> Ntn -> Elab R.Syn
 elimF tk start s (NField x sp) = pure (R.recordElim sp s x)
 elimF tk start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = do
   a <- argumentF tk n
@@ -197,13 +197,13 @@ elimF tk start s n = do
          s
          a)
 
-elimAll : TK -> Int -> R.Syn -> List Ntn -> E R.Syn
+elimAll : TK -> Int -> R.Syn -> List Ntn -> Elab R.Syn
 elimAll tk start s Nil = pure s
 elimAll tk start s (Cons n rest) = do
   s' <- elimF tk start s n
   elimAll tk start s' rest
 
-binderF : TK -> Ntn -> E R.Binder
+binderF : TK -> Ntn -> Elab R.Binder
 binderF tk (Infix (Ident x _) (Keyword ":" _) n) = do
   t <- tk.typJ N n
   pure (Named x t)
@@ -214,33 +214,33 @@ binderF tk n = do
   t <- tk.typJ N n
   pure (Anonymous t)
 
-fieldDeclF : TK -> Ntn -> E R.FieldDeclaration
+fieldDeclF : TK -> Ntn -> Elab R.FieldDeclaration
 fieldDeclF tk (Infix (Ident x _) (Keyword ":" _) n) = do
   a <- tk.typJ N n
   pure { name = x, typ = a }
 fieldDeclF tk n =
   failP (ntnSpan n) 1 "expected a field declaration of the form `x : A`"
 
-fieldSetF : TK -> Pm.Case -> Ntn -> E R.FieldSetting
+fieldSetF : TK -> Pm.Case -> Ntn -> Elab R.FieldSetting
 fieldSetF tk c (Infix (Ident x xsp) (Keyword ":=" _) n) = do
   v <- recoveringChk (tk.chkJ c n)
   pure { name = x, chk = v, span = ntnSpan n, nameSpan = xsp }
 fieldSetF tk c n =
   failP (ntnSpan n) 2 "expected a field setting of the form `x = v`"
 
-traverseEL : {a b : Type} -> (a -> E b) -> List a -> E (List b)
+traverseEL : {a b : Type} -> (a -> Elab b) -> List a -> Elab (List b)
 traverseEL f Nil = pure Nil
 traverseEL f (Cons x xs) = do
   y <- f x
   ys <- traverseEL f xs
   pure (Cons y ys)
 
-smallF : TK -> Ntn -> E R.SmallTyp
+smallF : TK -> Ntn -> Elab R.SmallTyp
 smallF tk n = do
   t <- tk.typJ N n
   pure (R.asSmall (ntnSpan n) t)
 
-variantF : TK -> Ntn -> E (Pair String (Array R.SmallTyp))
+variantF : TK -> Ntn -> Elab (Pair String (Array R.SmallTyp))
 variantF tk n = case (getGroup n).head of
   NTag x _ -> do
     typs <- traverseEL (\m -> smallF tk m) (getGroup n).args
@@ -270,7 +270,7 @@ doBlock sp stmts = case reverse stmts of
   Cons last init -> doLast sp (reverse init) last
 
 -- | a whole value needs no new name: it is in hand already
-bareAltRefused : {a : Type} -> String -> Pm.Span -> E a
+bareAltRefused : {a : Type} -> String -> Pm.Span -> Elab a
 bareAltRefused x sp =
   failP
     sp
@@ -279,12 +279,12 @@ bareAltRefused x sp =
      ++ x
      ++ "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already")
 
-patName : Ntn -> E String
+patName : Ntn -> Elab String
 patName (Ident x _) = pure x
 patName p =
   failP (ntnSpan p) 3 "an argument of a `case` pattern is a pattern or a name"
 
-doPat : Ntn -> E (Pair String (List String))
+doPat : Ntn -> Elab (Pair String (List String))
 doPat n = case (getGroup n).head of
   NTag x _ -> do
     xs <- traverseEL (\p -> patName p) (getGroup n).args
@@ -299,7 +299,7 @@ doPat n = case (getGroup n).head of
       3
       "a `case` pattern is a pattern: a tag applied to patterns, a literal, or `_`"
 
-doCase : TK -> Ntn -> E (Pair String (Pair (Array String) R.Chk))
+doCase : TK -> Ntn -> Elab (Pair String (Pair (Array String) R.Chk))
 doCase tk (Infix p (Keyword "=>" _) bodyN) = do
   px <- doPat p
   case px of
@@ -308,7 +308,7 @@ doCase tk (Infix p (Keyword "=>" _) bodyN) = do
       pure (MkPair x (MkPair (A.fromList xs) body))
 doCase tk n = unexpectedNotation n "case in a match statement"
 
-specializationF : TK -> Ntn -> E (Pair String R.Chk)
+specializationF : TK -> Ntn -> Elab (Pair String R.Chk)
 specializationF tk (NTuple (Cons (Infix (NField x _) (Keyword ":=" _) n) Nil) _) = do
   c <- tk.chkJ N n
   pure (MkPair x c)
@@ -344,14 +344,14 @@ tagSpans Nil = Nil
 tagSpans (Cons (Infix p (Keyword "=>" _) _) rest) = tagSpanOf p (tagSpans rest)
 tagSpans (Cons _ rest) = tagSpans rest
 
-checkBareOne : Group -> E Unit
+checkBareOne : Group -> Elab Unit
 checkBareOne gr = case gr.head of
   Ident x xsp ->
     if length gr.args == 0 && not (strEq x "_") then bareAltRefused x xsp
     else pure MkUnit
   _ -> pure MkUnit
 
-checkBareAlts : List Ntn -> E Unit
+checkBareAlts : List Ntn -> Elab Unit
 checkBareAlts Nil = pure MkUnit
 checkBareAlts (Cons (Infix p (Keyword "=>" _) _) rest) = do
   checkBareOne (getGroup p)
@@ -359,7 +359,7 @@ checkBareAlts (Cons (Infix p (Keyword "=>" _) _) rest) = do
 checkBareAlts (Cons _ rest) = checkBareAlts rest
 
 -- | the head of a group, parsed
-parseHeadF : TK -> Pm.Case -> Ntn -> E Judgment
+parseHeadF : TK -> Pm.Case -> Ntn -> Elab Judgment
 parseHeadF tk c n = case n of
   -- Variable rule
   Ident x sp -> pure (fromSynN c (R.find sp x))
@@ -453,13 +453,13 @@ parseHeadF tk c n = case n of
   NString s _ -> pure (fromSynN c (R.litString s))
   _ -> failP (ntnSpan n) 3 "unexpected notation"
 
-parseArray : TK -> Pm.Case -> Ntn -> Pm.Span -> List Ntn -> E Judgment
+parseArray : TK -> Pm.Case -> Ntn -> Pm.Span -> List Ntn -> Elab Judgment
 parseArray tk c n ksp (Cons n0 Nil) = do
   a <- tk.typJ N n0
   pure (fromTypN c (R.primArray a))
 parseArray tk c n ksp args = failP (ntnSpan n) 3 "`Array` takes one type"
 
-parseF : TK -> Pm.Case -> Ntn -> E Judgment
+parseF : TK -> Pm.Case -> Ntn -> Elab Judgment
 parseF tk c n = case (getGroup n).head of
   NTag x tsp -> do
     args <- traverseEL (\m -> argumentF tk m) (getGroup n).args
@@ -478,7 +478,7 @@ chkHeadOf n j = case (getGroup n).head of
   Ident x _ -> R.autoRec (ntnSpan n) x (R.apply (ntnSpan n) j)
   _ -> R.apply (ntnSpan n) j
 
-chkF : TK -> Pm.Case -> Ntn -> E R.Chk
+chkF : TK -> Pm.Case -> Ntn -> Elab R.Chk
 chkF tk c n = do
   j <- tk.parseJ c n
   case j of
@@ -487,12 +487,12 @@ chkF tk c n = do
     SynJ j2 -> pure (R.implicitLams (chkHeadOf n j2))
     TypJ j2 -> pure (R.universeIntro (ntnSpan n) j2)
 
-synF : TK -> Pm.Case -> Ntn -> E R.Syn
+synF : TK -> Pm.Case -> Ntn -> Elab R.Syn
 synF tk c n = do
   j <- tk.parseJ c n
   intoSyn (ntnSpan n) j
 
-typF : TK -> Pm.Case -> Ntn -> E R.Typ
+typF : TK -> Pm.Case -> Ntn -> Elab R.Typ
 typF tk c n = do
   j <- tk.parseJ c n
   case j of
@@ -511,15 +511,15 @@ tk =
 -- Declarations
 --------------------------------------------------------------------------------
 
-definition : Ntn -> E (Pair Ntn Ntn)
+definition : Ntn -> Elab (Pair Ntn Ntn)
 definition (Infix n0 (Keyword ":=" _) n1) = pure (MkPair n0 n1)
 definition n = unexpectedNotation n "notation of the form `<head> := <body>`"
 
-annotN : Ntn -> E (Pair Ntn Ntn)
+annotN : Ntn -> Elab (Pair Ntn Ntn)
 annotN (Infix n0 (Keyword ":" _) n1) = pure (MkPair n0 n1)
 annotN n = unexpectedNotation n "type-annotated expression"
 
-identE : Ntn -> E String
+identE : Ntn -> Elab String
 identE (Ident x _) = pure x
 identE n = unexpectedNotation n "identifier"
 
@@ -530,7 +530,7 @@ mkArgBinding : Pm.Span -> String -> R.Typ -> Bool -> ArgBinding
 mkArgBinding span name typ implicit =
   { span = span, name = name, typ = typ, implicit = implicit }
 
-argBinding : Ntn -> E ArgBinding
+argBinding : Ntn -> Elab ArgBinding
 argBinding (Infix n0 (Keyword ":" _) n1) = do
   x <- identE n0
   a <- tk.typJ N n1
@@ -542,7 +542,7 @@ argBinding (NBrace (Infix n0 (Keyword ":" _) n1) sp) = do
 argBinding n =
   unexpectedNotation n "argument binding of the form `<name> : <type>`"
 
-unpackArgs : Ntn -> E (Pair String (List ArgBinding))
+unpackArgs : Ntn -> Elab (Pair String (List ArgBinding))
 unpackArgs n = do
   x <- identE (getGroup n).head
   args <- traverseEL (\m -> argBinding m) (getGroup n).args
@@ -567,10 +567,10 @@ type DeclJ = { name : String, ty : R.Typ, tm : R.Chk, prim : Bool }
 mkDeclJ : String -> R.Typ -> R.Chk -> Bool -> DeclJ
 mkDeclJ name ty tm prim = { name = name, ty = ty, tm = tm, prim = prim }
 
-declOfParts : String -> Pair R.Typ R.Chk -> Bool -> E DeclJ
+declOfParts : String -> Pair R.Typ R.Chk -> Bool -> Elab DeclJ
 declOfParts name (MkPair ty tm) prim = pure (mkDeclJ name ty tm prim)
 
-theoryD : Ntn -> E DeclJ
+theoryD : Ntn -> Elab DeclJ
 theoryD n = do
   pn <- definition n
   case pn of
@@ -589,7 +589,7 @@ explicitNames Nil = Nil
 explicitNames (Cons ab rest) =
   if ab.implicit then explicitNames rest else Cons ab.name (explicitNames rest)
 
-defPlain : Ntn -> E DeclJ
+defPlain : Ntn -> Elab DeclJ
 defPlain n = do
   pn <- definition n
   case pn of
@@ -605,7 +605,7 @@ defPlain n = do
               declOfParts name (withArgs args (MkPair returnTyp body)) False
 
 -- extension: a definition by equations, `def f : T where <equations> end`
-defD : Ntn -> E DeclJ
+defD : Ntn -> Elab DeclJ
 defD (Infix headN (Keyword ":" ksp) tyW) = case Cl.stripWhere tyW of
   Just (MkPair tyN eqs) -> do
     pa <- unpackArgs headN
@@ -620,7 +620,7 @@ defD (Infix headN (Keyword ":" ksp) tyW) = case Cl.stripWhere tyW of
   Nothing -> defPlain (Infix headN (Keyword ":" ksp) tyW)
 defD n = defPlain n
 
-declJ : Ntn -> E DeclJ
+declJ : Ntn -> Elab DeclJ
 declJ (MDecl Nil "theory" n _) = theoryD n
 declJ (MDecl Nil "def" n _) = defD n
 -- extension: `primitive name : T`, implemented by the runtime
@@ -638,7 +638,7 @@ declJ n = unexpectedNotation n "top-level declaration"
 --------------------------------------------------------------------------------
 
 -- | fail, if errors were recovered from (they are reported, this is not)
-recoveredCheck : E Unit
+recoveredCheck : Elab Unit
 recoveredCheck = do
   ds <- gets (\st -> (core st).recovered)
   if length ds == 0 then pure MkUnit
@@ -657,7 +657,7 @@ unsolvedPoisoned mc m = case Mp.lookup compareInt m mc of
 
 -- | fail, unreported, if an implicit argument is left that an error hole
 -- | kept from being inferred
-poisonedLeft : E Unit
+poisonedLeft : Elab Unit
 poisonedLeft = do
   ps <- gets (\st -> (core st).poisoned)
   mc <- gets (\st -> (core st).metas)
@@ -669,7 +669,7 @@ poisonedLeft = do
 
 -- | a constraint unification could not solve (the messages are plainer
 -- | than the reference's until the printer is ported)
-stuckDiag : G.Globals -> Pm.Span -> Postponed -> E Diag
+stuckDiag : G.Globals -> Pm.Span -> Postponed -> Elab Diag
 stuckDiag g fallback p =
   if p.failed
     then pure
@@ -718,13 +718,13 @@ errEntry g k tyStx =
   , type_ = T.typeOf g tyStx
   }
 
-checkStuck : G.Globals -> Pm.Span -> List Postponed -> E Unit
+checkStuck : G.Globals -> Pm.Span -> List Postponed -> Elab Unit
 checkStuck g sp Nil = pure MkUnit
 checkStuck g sp (Cons p rest) = do
   d <- stuckDiag g sp p
   throwE (a := Unit) d
 
-checkUnsolved : List Mt.Unsolved -> E Unit
+checkUnsolved : List Mt.Unsolved -> Elab Unit
 checkUnsolved Nil = pure MkUnit
 checkUnsolved (Cons u rest) =
   throwE
@@ -762,7 +762,7 @@ bodyEnv gSelf k name aval =
        (emptyElabEnvFor gSelf k).scope)
 
 -- | the whole body phase: checked, settled, zonk-ready
-bodyPhase : DeclJ -> G.Globals -> String -> V.Ty -> E M.El
+bodyPhase : DeclJ -> G.Globals -> String -> V.Ty -> Elab M.El
 bodyPhase d gSelf k aval = do
   t <- R.runChk d.tm (bodyEnv gSelf k d.name aval) aval
   -- the implicit arguments: every one inferred, and substituted in
@@ -783,7 +783,7 @@ elabOut : (String -> String)
         -> Sx.Ty
         -> V.MetaCtx
         -> Either Diag M.El
-        -> E Elaborated
+        -> Elab Elaborated
 elabOut key g d tyStx mc (Left failed) =
   pure
     (mkElaborated
@@ -811,7 +811,7 @@ elabBody : (String -> String)
          -> Ntn
          -> DeclJ
          -> M.Ty
-         -> E Elaborated
+         -> Elab Elaborated
 elabBody key g n d a = do
   modify (withCore (setSelfKey (Just (keyOf key d))))
   body <-
@@ -840,7 +840,7 @@ elabBody key g n d a = do
 -- | Elaborate one declaration.  A definition whose type elaborates and
 -- | whose body does not is a definition still, `failed`: an error hole
 -- | of its type.
-elabDecl : (String -> String) -> G.Globals -> Ntn -> E Elaborated
+elabDecl : (String -> String) -> G.Globals -> Ntn -> Elab Elaborated
 elabDecl key g n = do
   modify (withCore (setSelfKey Nothing))
   d <- declJ n
