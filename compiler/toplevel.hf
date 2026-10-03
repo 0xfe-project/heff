@@ -211,6 +211,9 @@ binderF : TK -> Ntn -> Elab R.Binder
 binderF tk (Infix (Ident x _) (Keyword ":" _) n) = do
   t <- tk.typJ N n
   pure (Named x t)
+binderF tk (NBracket (Infix (Ident x _) (Keyword ":" _) n) sp) = do
+  t <- tk.typJ N n
+  pure (NamedInstance sp x t)
 binderF tk (NBrace (Infix (Ident x _) (Keyword ":" _) n) sp) = do
   t <- tk.typJ N n
   pure (NamedImplicit sp x t)
@@ -528,9 +531,9 @@ identE (Ident x _) = pure x
 identE n = unexpectedNotation n "identifier"
 
 type ArgBinding =
-  { span : Pm.Span, name : String, typ : R.Typ, implicit : Bool }
+  { span : Pm.Span, name : String, typ : R.Typ, implicit : Pm.Plicity }
 
-mkArgBinding : Pm.Span -> String -> R.Typ -> Bool -> ArgBinding
+mkArgBinding : Pm.Span -> String -> R.Typ -> Pm.Plicity -> ArgBinding
 mkArgBinding span name typ implicit =
   { span = span, name = name, typ = typ, implicit = implicit }
 
@@ -538,11 +541,16 @@ argBinding : Ntn -> Elab ArgBinding
 argBinding (Infix n0 (Keyword ":" _) n1) = do
   x <- identE n0
   a <- tk.typJ N n1
-  pure (mkArgBinding (ntnSpan (Infix n0 (Keyword ":" Pm.noSpan) n1)) x a False)
+  pure (mkArgBinding (ntnSpan (Infix n0 (Keyword ":" Pm.noSpan) n1)) x a Expl)
 argBinding (NBrace (Infix n0 (Keyword ":" _) n1) sp) = do
   x <- identE n0
   a <- tk.typJ N n1
-  pure (mkArgBinding sp x a True)
+  pure (mkArgBinding sp x a Impl)
+-- spike: an instance binder in a head, `[x : T]`
+argBinding (NBracket (Infix n0 (Keyword ":" _) n1) sp) = do
+  x <- identE n0
+  a <- tk.typJ N n1
+  pure (mkArgBinding sp x a Inst)
 argBinding n =
   unexpectedNotation n "argument binding of the form `<name> : <type>`"
 
@@ -553,12 +561,17 @@ unpackArgs n = do
   pure (MkPair x args)
 
 withOne : ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
-withOne ab (MkPair t c) =
-  if ab.implicit
-    then MkPair
-        (R.functionFormation (NamedImplicit ab.span ab.name ab.typ) t)
-        (R.functionIntroImplicit ab.span ab.name c)
-  else MkPair
+withOne ab (MkPair t c) = case ab.implicit of
+  Impl ->
+    MkPair
+      (R.functionFormation (NamedImplicit ab.span ab.name ab.typ) t)
+      (R.functionIntroImplicit ab.span ab.name c)
+  Inst ->
+    MkPair
+      (R.functionFormation (NamedInstance ab.span ab.name ab.typ) t)
+      (R.functionIntro ab.span ab.name c)
+  Expl ->
+    MkPair
       (R.functionFormation (Named ab.name ab.typ) t)
       (R.functionIntro ab.span ab.name c)
 
@@ -591,7 +604,8 @@ theoryD n = do
 explicitNames : List ArgBinding -> List String
 explicitNames Nil = Nil
 explicitNames (Cons ab rest) =
-  if ab.implicit then explicitNames rest else Cons ab.name (explicitNames rest)
+  if Pm.eqPlicity ab.implicit Impl then explicitNames rest
+  else Cons ab.name (explicitNames rest)
 
 defPlain : Ntn -> Elab DeclJ
 defPlain n = do
@@ -854,6 +868,7 @@ withSelf e k sc =
   , elabFor = e.elabFor
   , lams = e.lams
   , self = Just k
+  , insts = e.insts
   }
 
 -- | the definition mentions itself as the global it will be; pattern
@@ -1089,6 +1104,15 @@ topBroken kf acc n diags = case declNameN n of
   Nothing ->
     mkTop acc.globals diags acc.keys acc.broken acc.watches acc.tests acc.spans
 
+-- spike: a declaration parsed from `instance f : T`
+isInstanceDecl : Ntn -> Bool
+isInstanceDecl (MDecl mods _ _ _) = elemBy strEq "instance" mods
+isInstanceDecl _ = False
+
+markIf : Bool -> String -> G.Globals -> G.Globals
+markIf True k g = G.markInstance k g
+markIf False k g = g
+
 topTake : (String -> String)
         -> TopResult
         -> Ntn
@@ -1098,7 +1122,10 @@ topTake kf acc n (MkPair (Left d) st) =
   topBroken kf acc n (consAll acc.diags (appendT (recChron st) (reportedD d)))
 topTake kf acc n (MkPair (Right r) st) =
   mkTop
-    (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals))
+    (markIf
+       (isInstanceDecl n)
+       r.key
+       (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals)))
     (consAll acc.diags (appendT (recChron st) (failedList r)))
     (Cons r.key acc.keys)
     acc.broken

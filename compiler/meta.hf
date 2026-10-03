@@ -135,15 +135,58 @@ anyDelayed : V.MetaCtx -> List (Delayed ElabSt) -> Bool
 anyDelayed mc Nil = False
 anyDelayed mc (Cons d rest) = delayedReady mc False d || anyDelayed mc rest
 
+resolveKept : List (Pair Bool (Wanted ElabSt)) -> List (Wanted ElabSt)
+resolveKept Nil = Nil
+resolveKept (Cons (MkPair True _) rest) = resolveKept rest
+resolveKept (Cons (MkPair False w) rest) = Cons w (resolveKept rest)
+
+resolveAny : List (Pair Bool (Wanted ElabSt)) -> Bool
+resolveAny rs = any (\(p : Pair Bool (Wanted ElabSt)) -> fst p) rs
+
+resolveTake : P.Span
+            -> (Bool -> ElabSt -> Pair (Either Diag Bool) ElabSt)
+            -> Pair (Either Diag Bool) ElabSt
+            -> Pair (Either Diag (Pair Bool (Wanted ElabSt))) ElabSt
+resolveTake sp f (MkPair (Right done) st) =
+  MkPair (Right (MkPair done (MkWanted sp f))) st
+resolveTake sp f (MkPair (Left d) st) = MkPair (Left d) st
+
+resolveOne : Bool -> Wanted ElabSt -> Elab (Pair Bool (Wanted ElabSt))
+resolveOne final (MkWanted sp f) = \st -> resolveTake sp f (f final st)
+
+resolveList : Bool -> List (Wanted ElabSt) -> Elab (List (Pair Bool (Wanted ElabSt)))
+resolveList final Nil = pure Nil
+resolveList final (Cons w rest) = do
+  r <- resolveOne final w
+  rs <- resolveList final rest
+  pure (Cons r rs)
+
+-- | spike: try each waiting instance argument; `final` refuses the
+-- | ones whose goals never became determined.  Answers whether any was
+-- | found (the loop then goes again).
+resolveWanteds : Bool -> Elab Bool
+resolveWanteds final = do
+  ws <- gets wantedOf
+  if null ws
+    then pure False
+    else do
+      modify (withWanted (\w -> Nil))
+      rs <- resolveList final ws
+      modify (withWanted (\w -> concatList w (resolveKept rs)))
+      pure (resolveAny rs)
+
 settleGo : G.Globals -> Int -> Elab (List Postponed)
 settleGo g fuel = do
   runDelayed False
   retryPostponed g
+  -- spike: find the instance arguments whose goals are determined now
+  moved <- resolveWanteds False
   ds <- gets delayedOf
   mc <- gets (\st -> (core st).metas)
-  if anyDelayed mc ds && fuel <= 50 then settleGo g (fuel + 1)
+  if (anyDelayed mc ds || moved) && fuel <= 50 then settleGo g (fuel + 1)
     else do
       runDelayed True
+      moved2 <- resolveWanteds True
       retryPostponed g
 
 -- | Let the postponed problems and the delayed checks feed one another
