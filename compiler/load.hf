@@ -1,0 +1,148 @@
+-- A file and every module it imports, directly or not, each after what
+-- it imports: a port of `Heff.Load`, over the fs effect.  A module
+-- `foo.bar` is looked for at `foo/bar.hf` under the root, then under
+-- `lib/`, then under `node_modules/` (paths are the working
+-- directory's; the root walk stays with the host for now).
+
+import co
+import compiler.driver as Dr
+import compiler.import as I
+import fs
+import prelude
+
+dotsGo : String -> Int -> String -> String
+dotsGo p i acc =
+  if i >= strLength p then acc
+  else if charCode p i == 47 then dotsGo p (i + 1) (acc ++ ".")
+  else dotsGo p (i + 1) (acc ++ strSlice p i (i + 1))
+
+dotsOf : String -> String
+dotsOf p = dotsGo p 0 ""
+
+dropLib : String -> String
+dropLib p = if startsWith "lib/" p then strSlice p 4 (strLength p) else p
+
+dropHf : String -> String
+dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
+
+-- | `lib/prelude.hf` is the module `prelude`; `compiler/dict.hf` is
+-- | `compiler.dict`
+moduleOf : String -> String
+moduleOf path = dotsOf (dropLib (dropHf path))
+
+slashGo : String -> Int -> String -> String
+slashGo m i acc =
+  if i >= strLength m then acc
+  else if charCode m i == 46 then slashGo m (i + 1) (acc ++ "/")
+  else slashGo m (i + 1) (acc ++ strSlice m i (i + 1))
+
+-- | where a module's file is: `foo.bar` is `foo/bar.hf`
+importPath : String -> String
+importPath m = slashGo m 0 "" ++ ".hf"
+
+elemL : String -> List String -> Bool
+elemL x xs = elemBy strEq x xs
+
+type LoadSt =
+  { done : List Dr.Source, doneMods : List String, errors : List String }
+
+emptySt : LoadSt
+emptySt = { done = Nil, doneMods = Nil, errors = Nil }
+
+addErr : LoadSt -> String -> LoadSt
+addErr st e =
+  { done = st.done
+  , doneMods = st.doneMods
+  , errors = concatList st.errors (Cons e Nil)
+  }
+
+pushDone : LoadSt -> String -> String -> LoadSt
+pushDone st m src =
+  { done = concatList st.done (Cons { module = m, source = src } Nil)
+  , doneMods = Cons m st.doneMods
+  , errors = st.errors
+  }
+
+-- (the module's file, read: under the root, else lib/, else
+-- node_modules/)
+resolveRead : {e : HFunctor} -> (fs <: e) -> String -> Co e (Maybe String)
+resolveRead ev m = do
+  a <- readFile ev (importPath m)
+  case a of
+    Just s -> val (Just s)
+    Nothing -> do
+      b <- readFile ev ("lib/" ++ importPath m)
+      case b of
+        Just s -> val (Just s)
+        Nothing -> readFile ev ("node_modules/" ++ importPath m)
+
+cycleMsg : String -> String -> List String -> String
+cycleMsg from m stack =
+  from
+  ++ ": importing "
+  ++ m
+  ++ " is a cycle: "
+  ++ joinWith " -> " (concatList (reverse stack) (Cons m Nil))
+
+missingMsg : String -> String -> String
+missingMsg from m =
+  from
+  ++ ": no module "
+  ++ m
+  ++ " (looked for "
+  ++ importPath m
+  ++ ", lib/"
+  ++ importPath m
+  ++ " and node_modules/"
+  ++ importPath m
+  ++ ")"
+
+-- | the modules `ms`, imported by `from`, each visited after what it
+-- | imports (`stack`: the modules being visited, newest first)
+loadMany : {e : HFunctor}
+         -> (fs <: e)
+         -> List String
+         -> String
+         -> List String
+         -> LoadSt
+         -> Co e LoadSt
+loadMany ev stack from Nil st = val st
+loadMany ev stack from (Cons m rest) st =
+  if elemL m st.doneMods then loadMany ev stack from rest st
+  else if elemL m stack
+    then loadMany ev stack from rest (addErr st (cycleMsg from m stack))
+  else do
+    found <- resolveRead ev m
+    case found of
+      Nothing -> loadMany ev stack from rest (addErr st (missingMsg from m))
+      Just src -> do
+        inner <-
+          loadMany
+            ev
+            (Cons m stack)
+            (importPath m)
+            (Dr.importNames (I.readImports src).imports)
+            st
+        loadMany ev stack from rest (pushDone inner m src)
+
+type Loaded = { sources : List Dr.Source, errors : List String }
+
+loadDone : LoadSt -> Loaded
+loadDone st = { sources = st.done, errors = st.errors }
+
+-- | the program rooted at `file`: its sources in dependency order, and
+-- | what could not be found
+loadProgram : {e : HFunctor} -> (fs <: e) -> String -> Co e Loaded
+loadProgram ev file = do
+  mSrc <- readFile ev file
+  case mSrc of
+    Nothing -> val (loadDone (addErr emptySt ("cannot read " ++ file)))
+    Just src -> do
+      st <-
+        loadMany
+          ev
+          (Cons (moduleOf file) Nil)
+          file
+          (Dr.importNames (I.readImports src).imports)
+          emptySt
+      val (loadDone (pushDone st (moduleOf file) src))

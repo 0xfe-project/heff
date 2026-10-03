@@ -15,26 +15,10 @@ const bin = join(root, "output", "heff-selfcheck.mjs");
 
 if (!existsSync(bin)) { console.log("FAIL gen-fixpoint: no output/heff-selfcheck.mjs (run test/self-check.mjs first)"); process.exit(1); }
 
-// the loader's order (Heff.Load): a post-order walk of the imports, each
-// file's in the order written, root before lib
-const importPath = (m) => m.replaceAll(".", "/") + ".hf";
-const pathOf = (m) => existsSync(join(root, importPath(m))) ? importPath(m) : "lib/" + importPath(m);
-const files = [];
-const seen = new Set();
-const visit = (path) => {
-  const src = readFileSync(join(root, path), "utf8");
-  for (const [, m] of src.matchAll(/^import ([A-Za-z0-9_.]+)/gm)) {
-    if (seen.has(m)) continue;
-    seen.add(m);
-    visit(pathOf(m));
-  }
-  files.push(path);
-};
-visit("compiler/main.hf");
-
-// generation 1: the compiler, compiled by itself
+// generation 1: the compiler, compiled by itself -- it loads its own
+// import closure (compiler/load.hf), no file list given
 const out = join(root, "output", "heff-gen1.mjs");
-const r = spawnSync("node", ["--stack-size=60000", bin, "node", "main", out, ...files], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
+const r = spawnSync("node", ["--stack-size=60000", bin, "node", "main", out, "compiler/main.hf"], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
 if (r.status !== 0) { console.log(`FAIL gen-fixpoint: generation 0 refused its own source\n${r.stdout}${r.stderr}`.split("\n").slice(0, 12).join("\n")); process.exit(1); }
 
 const g0 = readFileSync(bin, "utf8");

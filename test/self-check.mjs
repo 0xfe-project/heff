@@ -27,7 +27,7 @@ const files = [
   "compiler/prims.hf", "compiler/ir.hf", "compiler/shake.hf",
   "compiler/arity.hf", "compiler/erase.hf", "compiler/simplify.hf",
   "compiler/effect.hf", "compiler/lower.hf", "compiler/emit.hf",
-  "compiler/driver.hf", "compiler/main.hf",
+  "compiler/driver.hf", "compiler/load.hf", "compiler/main.hf",
 ];
 
 let failed = 0;

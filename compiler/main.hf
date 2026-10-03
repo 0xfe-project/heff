@@ -1,15 +1,16 @@
 -- The compiler, run: a Node.js program (`heff node compiler/main.hf
 -- main OUT.mjs`).  Given file paths in dependency order, it reads them,
--- elaborates them with its own reader and elaborator, and either prints
--- every definition's stored core exactly as the reference's `dump-nbe`
--- does -- so the two compilers can be held to the same text, file by
--- file, by `test/self-check.mjs` -- or, as `node NAME OUT.mjs FILE...`,
--- compiles the computation NAME of the last file to a Node.js program,
--- with its own backend.
+-- elaborates them with its own reader and elaborator, and prints every
+-- definition's stored core exactly as the reference's `dump-nbe` does
+-- -- so the two compilers can be held to the same text, file by file,
+-- by `test/self-check.mjs`.  As `node NAME OUT.mjs FILE`, it loads
+-- FILE's import closure itself and compiles the computation NAME to a
+-- Node.js program, with its own backend.
 
 import co
 import compiler.driver as Dr
 import compiler.emit as Em
+import compiler.load as L
 import compiler.toplevel as T
 import fs
 import prelude
@@ -51,26 +52,6 @@ heffM =
   , exit = exit sys
   }
 
-dotsGo : String -> Int -> String -> String
-dotsGo p i acc =
-  if i >= strLength p then acc
-  else if charCode p i == 47 then dotsGo p (i + 1) (acc ++ ".")
-  else dotsGo p (i + 1) (acc ++ strSlice p i (i + 1))
-
-dotsOf : String -> String
-dotsOf p = dotsGo p 0 ""
-
-dropLib : String -> String
-dropLib p = if startsWith "lib/" p then strSlice p 4 (strLength p) else p
-
-dropHf : String -> String
-dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
-
--- | `lib/prelude.hf` is the module `prelude`; `compiler/dict.hf` is
--- | `compiler.dict` (the root's paths, as `Heff.Load` names them)
-moduleOf : String -> String
-moduleOf path = dotsOf (dropLib (dropHf path))
-
 readAll : List String -> Co world (List Dr.Source)
 readAll Nil = pure Nil
 readAll (Cons path rest) = do
@@ -82,7 +63,7 @@ readAll (Cons path rest) = do
       pure Nil
     Just src -> do
       more <- readAll rest
-      pure (Cons { module = moduleOf path, source = src } more)
+      pure (Cons { module = L.moduleOf path, source = src } more)
 
 printLines : List String -> Co world Unit
 printLines Nil = pure MkUnit
@@ -162,19 +143,21 @@ compileChecked name outPath cs = do
   bad <- diagCount cs
   if bad == 0 then compileLast name outPath cs else heffM.exit 1
 
--- | compile the computation `name` of the last file given to a Node.js
--- | program, the sources elaborated as `selfcheck` elaborates them
-compileCmd : String -> String -> List String -> Co world Unit
-compileCmd name outPath paths = do
-  sources <- readAll paths
-  compileChecked name outPath (Dr.checkProgram sources)
+-- | compile the computation `name` of FILE to a Node.js program:
+-- | FILE's import closure loaded with the compiler's own loader
+compileCmd : String -> String -> String -> Co world Unit
+compileCmd name outPath file = do
+  l <- L.loadProgram disk file
+  bad <- printErrs "heff" l.errors 0
+  if bad == 0 then compileChecked name outPath (Dr.checkProgram l.sources)
+    else heffM.exit 1
 
 -- | the compiler's door: `FILE...` checks and dumps (the differential);
--- | `node NAME OUT.mjs FILE...` compiles
+-- | `node NAME OUT.mjs FILE` compiles
 main : Co world Unit
 main = do
   as <- heffM.args
   case as of
-    Cons "node" (Cons name (Cons outPath paths)) ->
-      compileCmd name outPath paths
+    Cons "node" (Cons name (Cons outPath (Cons file Nil))) ->
+      compileCmd name outPath file
     _ -> selfcheck as
