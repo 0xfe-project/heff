@@ -16,7 +16,9 @@ import compiler.meta as Mt
 import compiler.notation
 import compiler.params as Pm
 import compiler.print as Pr
+import compiler.psurface as Ps
 import compiler.readback as Rb
+import compiler.rename as Rnm
 import compiler.rules as R
 import compiler.surface as Su
 import compiler.syntax as Sx
@@ -671,24 +673,129 @@ poisonedLeft = do
 
 -- | a constraint unification could not solve (the messages are plainer
 -- | than the reference's until the printer is ported)
-stuckDiag : G.Globals -> Pm.Span -> Postponed -> Elab Diag
-stuckDiag g fallback p =
+appendM : {a : Type} -> List a -> List a -> List a
+appendM Nil ys = ys
+appendM (Cons x xs) ys = Cons x (appendM xs ys)
+
+concatMapM : {a b : Type} -> (a -> List b) -> List a -> List b
+concatMapM f Nil = Nil
+concatMapM f (Cons x xs) = appendM (f x) (concatMapM f xs)
+
+spineVals : V.Spine V.V -> List V.V
+spineVals SpId = Nil
+spineVals (SpApp sp e) = appendM (spineVals sp) (Cons e Nil)
+spineVals (SpProj sp _) = spineVals sp
+spineVals (SpSpec sp _ e) = appendM (spineVals sp) (Cons e Nil)
+
+headMeta : V.Head -> List Int
+headMeta (HMeta m) = Cons m Nil
+headMeta _ = Nil
+
+-- | the metavariables not yet solved in a value: at its head, or in
+-- | its spine's arguments
+metasInV : V.MetaCtx -> V.V -> List Int
+metasInV mc v = case V.forceEl mc v of
+  VNeu h sp ty expansion desc ->
+    appendM (headMeta h) (concatMapM (\v2 -> metasInV mc v2) (spineVals sp))
+  _ -> Nil
+
+nubInt : List Int -> List Int
+nubInt Nil = Nil
+nubInt (Cons x xs) = Cons x (nubInt (filter (\y -> not (y == x)) xs))
+
+shownV : G.Globals -> V.MetaCtx -> Pm.CtxShape -> V.V -> String
+shownV g mc cs v =
+  Ps.printEl
+    Ps.plainImplicits
+    0
+    cs.names
+    (Rnm.renameEl (Rnm.displayName g) (Rb.readbEl cs.len (V.forceEl mc v)))
+
+aboutMeta : V.MetaCtx -> Postponed -> Maybe V.MetaEntry
+aboutMeta mc p = case head
+    (nubInt (appendM (metasInV mc p.left) (metasInV mc p.right))) of
+  Just m -> Mp.lookup compareInt m mc
+  Nothing -> Nothing
+
+-- a problem that was retried and found contradictory: not missing
+-- information, a mismatch -- say so, where the implicit was asked for
+stuckWith : Pm.Span
+          -> Postponed
+          -> Maybe V.MetaEntry
+          -> String
+          -> String
+          -> Diag
+stuckWith fallback p about left right =
   if p.failed
-    then pure
-        { code = 311
-        , severity = SError
-        , msg = "the implicit arguments found do not fit together"
-        , span = fallback
-        , note = Nothing
-        }
-  else pure
+    then { code = 311
+         , severity = SError
+         , msg =
+             "the implicit arguments found do not fit together: "
+             ++ left
+             ++ " and "
+             ++ right
+             ++ " are not equal"
+         , span =
+             (case about of
+              Just me -> me.span
+              Nothing -> fallback)
+         , note =
+             (case about of
+              Just me ->
+                Just
+                  ("found for `"
+                   ++ me.name
+                   ++ "`, it would need "
+                   ++ left
+                   ++ " = "
+                   ++ right)
+              Nothing -> Nothing)
+         }
+  else case about of
+    Just me ->
       { code = 327
       , severity = SError
       , msg =
-          "cannot infer an implicit argument: what is known of it does not say what it is"
+          "cannot infer the implicit argument `"
+          ++ me.name
+          ++ "`: give it, `("
+          ++ me.name
+          ++ " := ...)`"
+      , span = me.span
+      , note =
+          Just
+            ("what is known of it, "
+             ++ left
+             ++ " = "
+             ++ right
+             ++ ", does not say what it is")
+      }
+    Nothing ->
+      { code = 327
+      , severity = SError
+      , msg =
+          "cannot infer an implicit argument: "
+          ++ left
+          ++ " = "
+          ++ right
+          ++ " does not say what it is"
       , span = fallback
       , note = Nothing
       }
+
+stuckAt : G.Globals -> Pm.Span -> Postponed -> V.MetaCtx -> Diag
+stuckAt g fallback p mc =
+  stuckWith
+    fallback
+    p
+    (aboutMeta mc p)
+    (shownV g mc p.shape p.left)
+    (shownV g mc p.shape p.right)
+
+stuckDiag : G.Globals -> Pm.Span -> Postponed -> Elab Diag
+stuckDiag g fallback p = do
+  mc <- gets (\st -> (core st).metas)
+  pure (stuckAt g fallback p mc)
 
 type Elaborated =
   { name : String
@@ -764,14 +871,14 @@ bodyEnv gSelf k name aval =
        (emptyElabEnvFor gSelf k).scope)
 
 -- | the whole body phase: checked, settled, zonk-ready
-bodyPhase : DeclJ -> G.Globals -> String -> V.Ty -> Elab M.El
-bodyPhase d gSelf k aval = do
+bodyPhase : Pm.Span -> DeclJ -> G.Globals -> String -> V.Ty -> Elab M.El
+bodyPhase dsp d gSelf k aval = do
   t <- R.runChk d.tm (bodyEnv gSelf k d.name aval) aval
   -- the implicit arguments: every one inferred, and substituted in
   stuck <- Mt.settle gSelf
   recoveredCheck
   poisonedLeft
-  checkStuck gSelf Pm.noSpan stuck
+  checkStuck gSelf dsp stuck
   unsolved <- Mt.unsolvedMetas
   checkUnsolved unsolved
   pure t
@@ -819,6 +926,7 @@ elabBody key g n d a = do
   body <-
     tryE
       (bodyPhase
+         (ntnSpan n)
          d
          (G.addEntry
             (keyOf key d)
@@ -924,28 +1032,74 @@ mkTop globals diags keys broken watches tests spans =
   , spans = spans
   }
 
-failedDiag : Elaborated -> List Diag -> List Diag
-failedDiag r diags = case r.failed of
-  Just d -> Cons d diags
-  Nothing -> diags
+appendT : {a : Type} -> List a -> List a -> List a
+appendT Nil ys = ys
+appendT (Cons x xs) ys = Cons x (appendT xs ys)
 
-brokenOf : String -> Ntn -> List String -> List String
-brokenOf modName n broken = broken
+-- (a `failElsewhere` marker is reported where it comes from, not here)
+reportedD : Diag -> List Diag
+reportedD d = if reportedElsewhere d then Nil else Cons d Nil
 
-topTake : TopResult -> Ntn -> Pair (Either Diag Elaborated) ElabSt -> TopResult
-topTake acc n (MkPair (Left d) st) =
-  mkTop
-    acc.globals
-    (Cons d acc.diags)
-    acc.keys
-    acc.broken
-    acc.watches
-    acc.tests
-    acc.spans
-topTake acc n (MkPair (Right r) st) =
+concatMapT : {a b : Type} -> (a -> List b) -> List a -> List b
+concatMapT f Nil = Nil
+concatMapT f (Cons x xs) = appendT (f x) (concatMapT f xs)
+
+-- what a declaration's elaboration recovered from, kept: chronological
+-- (the state holds them newest first)
+recChron : ElabSt -> List Diag
+recChron st = concatMapT reportedD (reverse (core st).recovered)
+
+-- (the accumulator holds diagnostics newest first)
+consAll : List Diag -> List Diag -> List Diag
+consAll ds xs = foldl (\a x -> Cons x a) ds xs
+
+failedList : Elaborated -> List Diag
+failedList r = case r.failed of
+  Just d -> reportedD d
+  Nothing -> Nil
+
+headNameN : Ntn -> Maybe String
+headNameN (Infix h (Keyword ":" _) _) = headNameN h
+headNameN h = case (getGroup h).head of
+  Ident x _ -> Just x
+  _ -> Nothing
+
+-- | the name a declaration defines, from its notation: it may not be
+-- | read further
+declNameN : Ntn -> Maybe String
+declNameN (MDecl _ _ (Infix h (Keyword ":=" _) _) _) = headNameN h
+declNameN (MDecl _ _ h _) = headNameN h
+declNameN _ = Nothing
+
+-- (not even its type: what uses it is not checked, and not refused)
+topBroken : (String -> String) -> TopResult -> Ntn -> List Diag -> TopResult
+topBroken kf acc n diags = case declNameN n of
+  Just x ->
+    mkTop
+      (G.addBroken
+         (kf x)
+         (if strEq (kf x) x then acc.globals
+          else G.addAlias x (kf x) acc.globals))
+      diags
+      acc.keys
+      (Cons x acc.broken)
+      acc.watches
+      acc.tests
+      acc.spans
+  Nothing ->
+    mkTop acc.globals diags acc.keys acc.broken acc.watches acc.tests acc.spans
+
+topTake : (String -> String)
+        -> TopResult
+        -> Ntn
+        -> Pair (Either Diag Elaborated) ElabSt
+        -> TopResult
+topTake kf acc n (MkPair (Left d) st) =
+  topBroken kf acc n (consAll acc.diags (appendT (recChron st) (reportedD d)))
+topTake kf acc n (MkPair (Right r) st) =
   mkTop
     (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals))
-    (failedDiag r acc.diags)
+    (consAll acc.diags (appendT (recChron st) (failedList r)))
     (Cons r.key acc.keys)
     acc.broken
     acc.watches
@@ -959,7 +1113,7 @@ watchTake : TopResult
 watchTake acc sp (MkPair (Left d) st) =
   mkTop
     acc.globals
-    (Cons d acc.diags)
+    (consAll acc.diags (appendT (recChron st) (reportedD d)))
     acc.keys
     acc.broken
     acc.watches
@@ -968,7 +1122,7 @@ watchTake acc sp (MkPair (Left d) st) =
 watchTake acc sp (MkPair (Right entry) st) =
   mkTop
     acc.globals
-    acc.diags
+    (consAll acc.diags (recChron st))
     acc.keys
     acc.broken
     (Cons (mkWatch sp entry) acc.watches)
@@ -1007,7 +1161,7 @@ topOne kf acc (MDecl Nil "test" n sp) =
     acc.watches
     acc.tests
     acc.spans
-topOne kf acc n = topTake acc n (runE (elabDecl kf acc.globals n) emptySt)
+topOne kf acc n = topTake kf acc n (runE (elabDecl kf acc.globals n) emptySt)
 
 topGo : (String -> String) -> TopResult -> List Ntn -> TopResult
 topGo kf acc Nil =
@@ -1035,10 +1189,6 @@ topWith g0 ntns = topGo (\x -> x) (emptyTop g0) ntns
 
 -- Checking source text, whole
 --------------------------------------------------------------------------------
-
-appendT : {a : Type} -> List a -> List a -> List a
-appendT Nil ys = ys
-appendT (Cons x xs) ys = Cons x (appendT xs ys)
 
 withParse : TopResult -> List Diag -> TopResult
 withParse t ds =

@@ -15,7 +15,9 @@ import compiler.memoed as M
 import compiler.meta as Mt
 import compiler.params as P
 import compiler.print as Pr
+import compiler.psurface as Ps
 import compiler.readback as R
+import compiler.rename as Rn
 import compiler.syntax as Sx
 import compiler.unify as U
 import compiler.value as V
@@ -180,11 +182,78 @@ solveHole g cs m holeVal argStx argVal = do
 
 -- | a type in a message: its readback, as constructors (the surface
 -- | printer is not ported yet)
+-- (messages leave implicit arguments out, and say globals by the names
+-- the file knows them by)
 tyStr : ElabEnv -> V.Ty -> String
-tyStr e t = Pr.showTy (R.readbTy e.scope.len t)
+tyStr e t =
+  Ps.printTy
+    Ps.plainImplicits
+    0
+    e.scope.names
+    (Rn.renameTy (Rn.displayName e.globals) (R.readbTy e.scope.len t))
 
 tyStrM : ElabEnv -> M.Ty -> String
-tyStrM e m = Pr.showTy m.stx
+tyStrM e m =
+  Ps.printTy
+    Ps.plainImplicits
+    0
+    e.scope.names
+    (Rn.renameTy (Rn.displayName e.globals) m.stx)
+
+eqTyStr : G.Globals -> P.CtxShape -> V.Ty -> String
+eqTyStr g cs t =
+  Ps.printTy
+    Ps.plainImplicits
+    0
+    cs.names
+    (Rn.renameTy (Rn.displayName g) (R.readbTy cs.len t))
+
+eqElStr : G.Globals -> P.CtxShape -> V.V -> String
+eqElStr g cs v =
+  Ps.printEl
+    Ps.plainImplicits
+    0
+    cs.names
+    (Rn.renameEl (Rn.displayName g) (R.readbEl cs.len v))
+
+eqBareStr : G.Globals -> P.CtxShape -> V.Head -> V.Spine V.V -> String
+eqBareStr g cs h sp =
+  Ps.printEl
+    Ps.plainImplicits
+    0
+    cs.names
+    (Rn.renameEl (Rn.displayName g) (R.readbBareN cs.len h sp))
+
+-- | a conversion failure, said with what was being compared (the
+-- | trailing space is the reference's, a reason that is not there)
+prettyEqErr : G.Globals -> C.EqErr -> String
+prettyEqErr g (UnequalTys cs a a2) =
+  "types " ++ eqTyStr g cs a ++ " and " ++ eqTyStr g cs a2 ++ " are not equal "
+prettyEqErr g (UnequalEls cs a a2) =
+  "elements "
+  ++ eqElStr g cs a
+  ++ " and "
+  ++ eqElStr g cs a2
+  ++ " are not equal "
+prettyEqErr g (UnequalNeus cs h sp h2 sp2) =
+  "neutrals "
+  ++ eqBareStr g cs h sp
+  ++ " and "
+  ++ eqBareStr g cs h2 sp2
+  ++ " are not equal "
+prettyEqErr g MentionsError = "a solution would mention what did not elaborate"
+
+tyStrZ : ElabEnv -> V.Ty -> Elab String
+tyStrZ e t = do
+  mc <- gets (\st -> (core st).metas)
+  pure
+      (Ps.printTy
+         Ps.plainImplicits
+         0
+         e.scope.names
+         (Rn.renameTy
+            (Rn.displayName e.globals)
+            (U.zonkTy mc (R.readbTy e.scope.len t))))
 
 -- | (checked at a type that did not elaborate, nothing is an error of
 -- | its own: kept, for the definition to fail, but reported elsewhere)
@@ -389,13 +458,14 @@ functionIntroSyn x dom body =
 
 -- | `\(x : T) -> e` where the argument type is already expected of it:
 -- | the annotation need only agree, and the body is checked
-requireAgree : P.Span -> Either C.EqErr Unit -> Elab Unit
-requireAgree sp (Right _) = pure MkUnit
-requireAgree sp (Left _) =
-  failWith
+requireAgree : ElabEnv -> P.Span -> Either C.EqErr Unit -> Elab Unit
+requireAgree e sp (Right _) = pure MkUnit
+requireAgree e sp (Left err) =
+  failWithNote
     sp
     11
     "the binder's annotation is not the argument type expected here"
+    (prettyEqErr e.globals err)
 
 functionIntroAnn : P.Span -> String -> Typ -> Chk -> Chk
 functionIntroAnn sp x dom body =
@@ -420,7 +490,7 @@ functionIntroAnn sp x dom body =
       else do
         edom <- runTyp dom e
         agree <- Mt.unifyTy e.globals (shape e.scope) fdom (M.tyN edom)
-        requireAgree sp agree
+        requireAgree e sp agree
         -- (bound at the annotation: the two are equal, and what is
         -- expected may be known only later)
         withBound x (M.tyN edom) e.scope (\v scope' -> do
@@ -575,7 +645,7 @@ delayedCheck e sp what c ty m hole = do
         sp
         11
         ("this " ++ what ++ " does not fit how it is used")
-        "the delayed argument disagrees with the solved hole"
+        (prettyEqErr e.globals err)
 
 metaOfStx : Sx.Tm -> Int
 metaOfStx (SMetaApp k _ _) = k
@@ -711,11 +781,14 @@ applyGo sp e a (MkPair m a') = do
     Right _ -> do
       Mt.runDelayed False
       pure m
-    Left err ->
-      failWith
-        sp
-        11
-        ("expected type " ++ tyStr e a ++ ", but got type " ++ tyStr e a')
+    Left err -> do
+      want <- tyStrZ e a
+      got <- tyStrZ e a'
+      failWithNote
+          sp
+          11
+          ("expected type " ++ want ++ ", but got type " ++ got)
+          (prettyEqErr e.globals err)
 
 apply : P.Span -> Syn -> Chk
 apply sp syn =
@@ -948,10 +1021,14 @@ checkFixed e fs v (Just expected) = do
   case r of
     Right _ -> pure MkUnit
     Left err ->
-      failWith
+      failWithNote
         fs.span
         11
-        "expected the value the type fixes this field to, but got another"
+        ("expected value "
+         ++ eqElStr e.globals (shape e.scope) expected
+         ++ ", but got value "
+         ++ eqElStr e.globals (shape e.scope) v)
+        (prettyEqErr e.globals err)
 
 introGo : ElabEnv
         -> V.Ty

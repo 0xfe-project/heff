@@ -22,12 +22,13 @@ const files = [
   "compiler/readback.hf", "compiler/conversion.hf", "compiler/notation.hf",
   "compiler/environment.hf", "compiler/unify.hf", "compiler/meta.hf",
   "compiler/memoed.hf", "compiler/print.hf", "compiler/top.hf",
+  "compiler/rename.hf", "compiler/psurface.hf",
   "compiler/rules.hf", "compiler/fixity.hf", "compiler/import.hf",
   "compiler/surface.hf", "compiler/clauses.hf", "compiler/toplevel.hf",
   "compiler/prims.hf", "compiler/ir.hf", "compiler/shake.hf",
   "compiler/arity.hf", "compiler/erase.hf", "compiler/simplify.hf",
   "compiler/effect.hf", "compiler/lower.hf", "compiler/emit.hf",
-  "compiler/rename.hf", "compiler/psurface.hf", "compiler/interp.hf",
+  "compiler/interp.hf", "compiler/diagnostic.hf",
   "compiler/driver.hf", "compiler/load.hf", "compiler/main.hf",
 ];
 

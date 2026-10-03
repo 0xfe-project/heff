@@ -8,6 +8,7 @@
 -- Node.js program, with its own backend.
 
 import co
+import compiler.diagnostic as Dg
 import compiler.driver as Dr
 import compiler.effect as Ef
 import compiler.emit as Em
@@ -37,6 +38,8 @@ disk = \p -> InR p
 type HeffM =
   { print : String -> Co world Unit
   , printErr : String -> Co world Unit
+  , put : String -> Co world Unit
+  , putErr : String -> Co world Unit
   , readFile : String -> Co world (Maybe String)
   , writeFile : String -> String -> Co world Bool
   , args : Co world (List String)
@@ -47,6 +50,8 @@ heffM : HeffM
 heffM =
   { print = print out
   , printErr = printErr out
+  , put = write out
+  , putErr = writeErr out
   , readFile = readFile disk
   , writeFile = writeFile disk
   , args = args sys
@@ -64,7 +69,7 @@ readAll (Cons path rest) = do
       pure Nil
     Just src -> do
       more <- readAll rest
-      pure (Cons { module = L.moduleOf path, source = src } more)
+      pure (Cons { module = L.moduleOf path, path = path, source = src } more)
 
 printLines : List String -> Co world Unit
 printLines Nil = pure MkUnit
@@ -308,15 +313,43 @@ testCmd (Cons f rest) total failed anyBad = do
   r <- testOneF f
   testCmd rest (total + r.total) (failed + r.failed) (anyBad || not r.ok)
 
+putFileDiags : List Dr.Checked -> Co world Unit
+putFileDiags Nil = pure MkUnit
+putFileDiags (Cons c rest) = do
+  if null c.diags then pure MkUnit
+    else heffM.putErr (Dg.renderFileDiags c.path c.source c.diags)
+  putFileDiags rest
+
+anyErrors : List Dr.Checked -> Bool
+anyErrors cs = any (\(c : Dr.Checked) -> not (null (Dr.errorsIn c))) cs
+
+checkLast : Bool -> List Dr.Checked -> Co world Unit
+checkLast badLoad cs = do
+  putFileDiags cs
+  case Dr.lastChecked cs of
+    Nothing -> heffM.exit 1
+    Just c -> do
+      heffM.put (Dr.interface c)
+      if badLoad || anyErrors cs then heffM.exit 1 else pure MkUnit
+
+-- | elaborate FILE and what it imports; print its interface
+checkCmd : String -> Co world Unit
+checkCmd file = do
+  l <- L.loadProgram disk file
+  badL <- printErrs "heff" l.errors 0
+  checkLast (badL > 0) (Dr.checkProgram l.sources)
+
 -- | the compiler's door: `FILE...` checks and dumps (the differential);
--- | `node NAME OUT.mjs FILE` compiles, `run FILE` prints the watches'
--- | values, `test FILE...` checks their expectations
+-- | `node NAME OUT.mjs FILE` compiles, `check FILE` prints the
+-- | interface, `run FILE` prints the watches' values, `test FILE...`
+-- | checks their expectations
 main : Co world Unit
 main = do
   as <- heffM.args
   case as of
     Cons "node" (Cons name (Cons outPath (Cons file Nil))) ->
       compileCmd name outPath file
+    Cons "check" (Cons file Nil) -> checkCmd file
     Cons "run" (Cons file Nil) -> runCmd file
     Cons "test" files -> testCmd files 0 0 False
     _ -> selfcheck as
