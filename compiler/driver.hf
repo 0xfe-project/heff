@@ -4,6 +4,8 @@
 -- slice: no cache, no module struct values, sources handed over in
 -- dependency order (the loader stays with the host).
 
+import array as A
+import compiler.dict as D
 import compiler.effect as Ef
 import compiler.fixity as F
 import compiler.globals as G
@@ -13,7 +15,9 @@ import compiler.params as Pm
 import compiler.readback as R
 import compiler.surface as Su
 import compiler.syntax as Sx
+import compiler.top as Tp
 import compiler.toplevel as T
+import compiler.value as V
 import map as Mp
 import prelude
 
@@ -181,12 +185,14 @@ aliasOpen clashes g (Cons o rest) =
      else G.addAlias o.name o.key g)
     rest
 
+-- (`import m as M`: `m`'s definitions as `M.x`, and `M` the module
+-- itself, a value)
 aliasQOne : List Checked -> G.Globals -> AliasQ -> G.Globals
 aliasQOne done g q = case findChecked done q.module of
   Just c ->
     foldl
       (\g2 (o : Imported) -> G.addAlias (q.alias ++ "." ++ o.name) o.key g2)
-      g
+      (G.addAlias q.alias (q.module ++ "#") g)
       (appendD
          (map (\(o : Own) -> mkImported o.name o.key c.module) c.own)
          (brokenIn c))
@@ -254,6 +260,157 @@ aliasPairs (Cons i rest) = case i.alias of
   Just a -> Cons { module = i.name, alias = a } (aliasPairs rest)
   Nothing -> aliasPairs rest
 
+-- A file, after its definitions, as a value (`Heff.Driver.moduleStruct`):
+-- a struct of them, under the module's own name (importers reach it by
+-- their alias, `import m as M`).  Its type is the file's theory -- the
+-- definitions' types as a telescope, a reference to an earlier
+-- definition becoming a reference to its field -- and its fields are
+-- the definitions themselves, so the struct adds no equations: `M.x`
+-- and the global are one.
+
+type SEntry = { name : String, key : String, ty : Sx.Ty, level : Pm.Level }
+
+structEntryOf : G.Globals -> Own -> Maybe SEntry
+structEntryOf g o = case G.lookupEntry g o.key of
+  Just e ->
+    Just
+      { name = o.name, key = o.key, ty = e.tySyntax, level = V.levelOf e.type_ }
+  Nothing -> Nothing
+
+structEntries : G.Globals -> List Own -> List SEntry
+structEntries g own = catMaybesD (map (\o -> structEntryOf g o) own)
+
+structLevel : List SEntry -> Pm.Level
+structLevel es = foldl (\l (r : SEntry) -> Pm.maxLevel l r.level) Small es
+
+structIdxGo : Int -> List SEntry -> Mp.Map String Int -> Mp.Map String Int
+structIdxGo i Nil m = m
+structIdxGo i (Cons r rest) m =
+  structIdxGo (i + 1) rest (Mp.insert compareString r.key i m)
+
+structIdx : List SEntry -> Mp.Map String Int
+structIdx es = structIdxGo 0 es Mp.empty
+
+-- | the closers, knotted over the index of the module's own keys
+type CK =
+  { ty : Int -> Int -> Sx.Ty -> Sx.Ty, el : Int -> Int -> Sx.Tm -> Sx.Tm }
+
+closeAbs : {a : Type} -> (Int -> a -> a) -> Int -> Sx.Abs a -> Sx.Abs a
+closeAbs f depth (MkAbs x t) = MkAbs x (f (depth + 1) t)
+-- (a constant abstraction does not bind: its body is a step shallower)
+closeAbs f depth (AbsConst t) = AbsConst (f depth t)
+
+closeFieldsGo : CK
+              -> Int
+              -> Int
+              -> Int
+              -> List (Pair String Sx.Ty)
+              -> List (Pair String Sx.Ty)
+closeFieldsGo r i depth j Nil = Nil
+closeFieldsGo r i depth j (Cons (MkPair x t) rest) =
+  Cons (MkPair x (r.ty i (depth + j) t)) (closeFieldsGo r i depth (j + 1) rest)
+
+-- | a definition's type, moved into the telescope of the fields before
+-- | field `i`: a reference to an earlier definition becomes its field,
+-- | by index from `depth` binders down; anything else stays the global
+-- | it was
+closeTyF : CK -> Mp.Map String Int -> Int -> Int -> Sx.Ty -> Sx.Ty
+closeTyF r idx i depth t = case t of
+  SDecode e -> SDecode (r.el i depth e)
+  SFunction level dom cod implicit ->
+    SFunction
+      level
+      (r.ty i depth dom)
+      (closeAbs (\d2 t2 -> r.ty i d2 t2) depth cod)
+      implicit
+  SRecord level fs ->
+    SRecord level (D.fromList (closeFieldsGo r i depth 0 (D.toList fs)))
+  SSum vs -> SSum (Pm.variantsMap (\t2 -> r.ty i depth t2) vs)
+  SIsTy t2 -> SIsTy (r.ty i depth t2)
+  SPrimArray t2 -> SPrimArray (r.ty i depth t2)
+  _ -> t
+
+closeCase : CK
+          -> Int
+          -> Int
+          -> Pair (Array String) Sx.Tm
+          -> Pair (Array String) Sx.Tm
+closeCase r i depth (MkPair xs b) =
+  MkPair xs (r.el i (depth + length (A.toList xs)) b)
+
+closeElF : CK -> Mp.Map String Int -> Int -> Int -> Sx.Tm -> Sx.Tm
+closeElF r idx i depth e = case e of
+  SGlobal k -> case Mp.lookup compareString k idx of
+    Just j -> if j < i then SLocal (depth + (i - 1 - j)) else SGlobal k
+    Nothing -> SGlobal k
+  SCode t -> SCode (r.ty i depth t)
+  SApp f a2 -> SApp (r.el i depth f) (r.el i depth a2)
+  SLam t b -> SLam (r.ty i depth t) (closeAbs (\d2 e2 -> r.el i d2 e2) depth b)
+  SCons d -> SCons (D.mapD (\e2 -> r.el i depth e2) d)
+  SProj e2 l -> SProj (r.el i depth e2) l
+  STag t as -> STag t (A.fromList (map (\e2 -> r.el i depth e2) (A.toList as)))
+  SMatch e2 cs ->
+    SMatch (r.el i depth e2) (D.mapD (\p -> closeCase r i depth p) cs)
+  SSpecialize e2 l v -> SSpecialize (r.el i depth e2) l (r.el i depth v)
+  SIs e2 -> SIs (r.el i depth e2)
+  SRec e2 -> SRec (r.el i depth e2)
+  SImplicit x e2 -> SImplicit x (r.el i depth e2)
+  SMetaApp m xs t -> SMetaApp m xs (r.ty i depth t)
+  _ -> e
+
+ckOf : Mp.Map String Int -> CK
+ckOf idx =
+  { ty = \i depth t -> closeTyF (ckOf idx) idx i depth t
+  , el = \i depth e -> closeElF (ckOf idx) idx i depth e
+  }
+
+structFieldsGo : Mp.Map String Int
+               -> Int
+               -> List SEntry
+               -> List (Pair String Sx.Ty)
+structFieldsGo idx i Nil = Nil
+structFieldsGo idx i (Cons r rest) =
+  Cons
+    (MkPair r.name ((ckOf idx).ty i 0 r.ty))
+    (structFieldsGo idx (i + 1) rest)
+
+structBody : String -> List SEntry -> G.Globals -> G.Globals
+structBody mkey es g' =
+  Tp.define
+    g'
+    (mkey ++ "#")
+    (SDecode (SGlobal (mkey ++ "#T")))
+    (SCons
+       (D.fromList (map (\(r : SEntry) -> MkPair r.name (SGlobal r.key)) es)))
+
+-- (the file's theory, a definition of its own (`m#T`), so that the
+-- struct's type is a name, as every nominal type is)
+structAdd : String -> G.Globals -> List SEntry -> Mp.Map String Int -> G.Globals
+structAdd mkey g es idx =
+  structBody
+    mkey
+    es
+    (Tp.define
+       g
+       (mkey ++ "#T")
+       (SU (if Pm.eqLevel (structLevel es) Large then LargeU else SmallU))
+       (SCode
+          (SRecord (structLevel es) (D.fromList (structFieldsGo idx 0 es)))))
+
+-- (a file that defines theories has fields no universe holds: it is its
+-- definitions only, not a struct of them)
+structWith : String -> G.Globals -> List SEntry -> G.Globals
+structWith mkey g es =
+  if null es || Pm.eqLevel (structLevel es) TopL then g
+  else structAdd mkey g es (structIdx es)
+
+moduleStruct : String -> List Own -> G.Globals -> G.Globals
+moduleStruct mkey own g = structWith mkey g (structEntries g own)
+
+withStruct : String -> List Own -> T.TopResult -> T.TopResult
+withStruct m own t =
+  T.mkTop (moduleStruct m own t.globals) t.diags t.keys t.broken
+
 directFix : List Checked -> F.Fixities
 directFix direct =
   foldl (\f (c : Checked) -> F.union f c.fixities) F.emptyFixities direct
@@ -267,7 +424,7 @@ elabTop : Source
 elabTop s imps direct r t =
   mkChecked
     s.module
-    t
+    (withStruct s.module (ownOf s.module t.keys) t)
     (appendD
        (map (clashDiag (importedOf direct)) (clashesOf (importedOf direct)))
        (appendD r.diags t.diags))

@@ -56,6 +56,27 @@ for (const f of files) {
   ps += r.stdout.split("\n").filter((l) => /^=(def|ty|body) /.test(l)).map((l) => l + "\n").join("");
 }
 
+// module values: a program that passes a module as a value (`import m as
+// M`, `M` the struct) elaborates byte-identically too -- the port
+// synthesizes `m#`/`m#T` as the reference does.  (Its own corpus: the
+// selfcheck mode names modules by path, so the files sit in a scratch
+// root whose lib/ holds prelude.)
+import { mkdtempSync, copyFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+const mroot = mkdtempSync(join(tmpdir(), "heff-modtest-"));
+mkdirSync(join(mroot, "lib"), { recursive: true });
+copyFileSync(join(root, "lib", "prelude.hf"), join(mroot, "lib", "prelude.hf"));
+for (const f of ["plain.hf", "value-use.hf"]) copyFileSync(join(root, "test", "modules", f), join(mroot, f));
+const mfiles = ["lib/prelude.hf", "plain.hf", "value-use.hf"];
+const mrun = spawnSync("node", ["--stack-size=60000", bin, ...mfiles], { cwd: mroot, encoding: "utf8", maxBuffer: 1e9 });
+let mref = "";
+for (const f of ["lib/prelude.hf", "test/modules/plain.hf", "test/modules/value-use.hf"]) {
+  const r = heff("dump-nbe", resolve(root, f));
+  mref += r.stdout.split("\n").filter((l) => /^=(def|ty|body) /.test(l)).map((l) => l + "\n").join("");
+}
+if (mrun.status !== 0 || mrun.stdout !== mref) { failed++; console.log(`FAIL self-check: module values differ (a program passing a module as a value)\n${mrun.stderr.split("\n").slice(0, 6).join("\n")}`); }
+rmSync(mroot, { recursive: true, force: true });
+
 const self = run.stdout;
 const defs = (self.match(/^=def /gm) || []).length;
 if (!failed && ps !== self) {
