@@ -42,8 +42,8 @@ showBool b = if b then "True" else "False"
 
 showPlicityB :: Plicity -> String
 showPlicityB = case _ of
-  Expl -> "False"
-  Impl -> "True"
+  Expl -> "Expl"
+  Impl -> "Impl"
   Inst -> "Inst"
 
 listOf :: Array String -> String
@@ -90,7 +90,7 @@ dumpTy :: Sx.Ty -> String
 dumpTy = case _ of
   Sx.U u -> "(SU " <> showUniverse u <> ")"
   Sx.Decode t -> "(SDecode " <> dumpEl t <> ")"
-  -- (the port prints the flag as a boolean still; `Inst` is spike-only)
+  -- (a plicity prints as its constructor: the dump stays readable back)
   Sx.Function ft -> "(SFunction " <> showLevel ft.level <> " " <> dumpTy ft.dom <> " " <> absOf dumpTy ft.cod <> " " <> showPlicityB ft.implicit <> ")"
   Sx.Record rt -> "(SRecord " <> showLevel rt.level <> " " <> dictOf dumpTy rt.fieldTypes <> ")"
   Sx.Sum (Variants d) -> "(SSum " <> dictOf (arrOf dumpTy) d <> ")"
