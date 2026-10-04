@@ -6,15 +6,13 @@
 // message differential: a definition both compilers store as an error
 // hole slips through the dump differential, and lands here.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, mkdirSync, copyFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, resolve, basename } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve, basename } from "node:path";
+import { root, bin, heff as heffP, port as portP, pool } from "./pool.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bin = join(root, "output", "heff-selfcheck.mjs");
-const heff = (...args) => spawnSync("node", ["--stack-size=60000", join(root, "bin", "heff.mjs"), ...args], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
-const portIn = (cwd, ...args) => spawnSync("node", [join(root, "test", "run-worker.mjs"), bin, ...args], { cwd, encoding: "utf8", maxBuffer: 1e9 });
+const heff = (...args) => heffP(args);
+const portIn = (cwd, ...args) => portP(args, { cwd });
 
 if (!existsSync(bin)) { console.log("FAIL check-port: no output/heff-selfcheck.mjs (run test/self-check.mjs first)"); process.exit(1); }
 
@@ -43,24 +41,28 @@ for (const d of dirs) {
 const canon = (f) => (f.startsWith("test/modules/") ? basename(f) : f);
 const normalize = (f, s) => s.replaceAll(resolve(root, f), canon(f));
 
-let failed = 0;
-let compared = 0;
-
-for (const f of files) {
-  const r = heff("check", resolve(root, f));
-  const p = port(f);
-  compared++;
+// (each file through both compilers, as many at once as there are
+// cores; what is said is said in the files' order)
+const one = async (f) => {
+  const [r, p] = await Promise.all([heff("check", resolve(root, f)), port(f)]);
   const rerr2 = normalize(f, r.stderr);
   const perr = p.stderr;
-  if (p.status !== r.status || p.stdout !== r.stdout || perr !== rerr2) {
-    failed++;
-    console.log(`FAIL check-port: ${f} (reference exit ${r.status}, port exit ${p.status})`);
-    const a = (r.stdout + "\n--stderr--\n" + rerr2).split("\n");
-    const b = (p.stdout + "\n--stderr--\n" + perr).split("\n");
-    for (let i = 0; i < Math.max(a.length, b.length); i++) {
-      if (a[i] !== b[i]) { console.log(`  line ${i + 1}\n  reference: ${(a[i] || "").slice(0, 140)}\n  port:      ${(b[i] || "").slice(0, 140)}`); break; }
-    }
+  if (p.status === r.status && p.stdout === r.stdout && perr === rerr2) return [];
+  const lines = [`FAIL check-port: ${f} (reference exit ${r.status}, port exit ${p.status})`];
+  const a = (r.stdout + "\n--stderr--\n" + rerr2).split("\n");
+  const b = (p.stdout + "\n--stderr--\n" + perr).split("\n");
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) { lines.push(`  line ${i + 1}\n  reference: ${(a[i] || "").slice(0, 140)}\n  port:      ${(b[i] || "").slice(0, 140)}`); break; }
   }
+  return lines;
+};
+
+const results = await pool(files, one);
+const compared = files.length;
+let failed = 0;
+for (const lines of results) {
+  if (lines.length) failed++;
+  for (const l of lines) console.log(l);
 }
 
 console.log(`check port: ${compared} files' interfaces and diagnostics ${failed ? "NOT " : ""}printed as the reference does`);

@@ -387,7 +387,12 @@ expr env0 ind = case _ of
   Lam xs b ->
     let r = bindAll env xs
     in { code: S.joinWith "" (map (\p -> "(" <> p <> ") => ") r.js) <> body r.env ind b, prec: 0 }
+  -- (a thunk forced: its value kept on it, so that forcing it again
+  -- does not compute it again -- the language is pure, `f MkUnit` is the
+  -- same value every time, and what abandons is not kept)
+  App f [ Tag "MkUnit" [] ] -> p3 ("$force(" <> (expr env ind f).code <> ")")
   App f as -> p3 (atLeast 3 (expr env ind f) <> S.joinWith "" (map (\a -> "(" <> (expr env ind a).code <> ")") as))
+  Call g [ Tag "MkUnit" [] ] -> p3 ("$force(" <> maybe'' g (Map.lookup g env.gs) <> ")")
   Call g as -> p3 (maybe'' g (Map.lookup g env.gs) <> "(" <> S.joinWith ", " (map (\a -> (expr env ind a).code) as) <> ")")
   Proj e l -> p3 (atLeast 3 (expr env ind e) <> (if isIdent l then "." <> l else "[" <> quoteString l <> "]"))
   Record fs -> p3 ("{ " <> S.joinWith ", " (map (\(Tuple l e) -> propName l <> ": " <> (expr env ind e).code) fs) <> " }")
@@ -449,6 +454,7 @@ runtime code = A.catMaybes
   [ when' "$T" "const $T = { $: \"True\", a: [] }, $F = { $: \"False\", a: [] };"
   , when' "$abandon" "const $abandon = () => { throw new Error(\"heff:abandon\"); };"
   , when' "$nomatch" "const $nomatch = (s) => { throw new Error(\"heff: no case for '\" + (s && s.$) + \"'\"); };"
+  , when' "$force" "const $force = (f) => { if (f.$m !== undefined) return f.$m; const v = f({ $: \"MkUnit\", a: [] }); f.$m = v; return v; };"
   , when' "$lazy" "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"heff: defined by itself\"); state = 1; try { v = f(); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
   ]
   where

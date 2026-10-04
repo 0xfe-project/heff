@@ -9,13 +9,11 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, mkdtempSync, mkdirSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, resolve, basename } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve, basename } from "node:path";
+import { root, bin, heff as heffP, port as portP, pool } from "./pool.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bin = join(root, "output", "heff-selfcheck.mjs");
-const heff = (...args) => spawnSync("node", ["--stack-size=60000", join(root, "bin", "heff.mjs"), ...args], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
-const portIn = (cwd, ...args) => spawnSync("node", [join(root, "test", "run-worker.mjs"), bin, ...args], { cwd, encoding: "utf8", maxBuffer: 1e9 });
+const heff = (...args) => heffP(args);
+const portIn = (cwd, ...args) => portP(args, { cwd });
 
 // the port's loader resolves from the working directory (the root walk
 // stays with the host): a file of a nested root, test/modules, runs
@@ -49,33 +47,34 @@ for (const d of dirs) {
   }
 }
 
-let failed = 0;
-let compared = 0;
-let watchesSeen = 0;
-
-for (const f of files) {
-  const r = heff("run", resolve(root, f));
-  const p = port("run", f);
-  if (r.status !== 0) continue; // a fixture the reference itself refuses is not this differential's
-  compared++;
-  watchesSeen += (r.stdout.match(/^>>> /gm) || []).length;
+// (each file through both compilers, as many files at once as there are
+// cores; what is said is said in the files' order)
+const one = async (f) => {
+  const [r, p] = await Promise.all([heff("run", resolve(root, f)), port("run", f)]);
+  // a fixture the reference itself refuses is not this differential's
+  if (r.status !== 0) return { compared: false, watches: 0, fails: [] };
+  const watches = (r.stdout.match(/^>>> /gm) || []).length;
   if (p.status !== 0 || p.stdout !== r.stdout) {
-    failed++;
     const a = r.stdout.split("\n"), b = p.stdout.split("\n");
     for (let i = 0; i < Math.max(a.length, b.length); i++) {
-      if (a[i] !== b[i]) { console.log(`FAIL watch-port: ${f} line ${i + 1}\n  reference: ${(a[i] || "").slice(0, 140)}\n  port:      ${(b[i] || "").slice(0, 140)}\n${p.stderr.split("\n").slice(0, 3).join("\n")}`); break; }
+      if (a[i] !== b[i]) return { compared: true, watches, fails: [`FAIL watch-port: ${f} line ${i + 1}\n  reference: ${(a[i] || "").slice(0, 140)}\n  port:      ${(b[i] || "").slice(0, 140)}\n${p.stderr.split("\n").slice(0, 3).join("\n")}`] };
     }
-    if (p.stdout === r.stdout) console.log(`FAIL watch-port: ${f} (port exit ${p.status})\n${p.stderr.split("\n").slice(0, 3).join("\n")}`);
-    continue;
+    return { compared: true, watches, fails: [`FAIL watch-port: ${f} (port exit ${p.status})\n${p.stderr.split("\n").slice(0, 3).join("\n")}`] };
   }
   // and `test` agrees on the counts
-  const rt = heff("test", resolve(root, f));
-  const pt = port("test", f);
+  const [rt, pt] = await Promise.all([heff("test", resolve(root, f)), port("test", f)]);
   const count = (s) => (s.match(/(\d+)\/(\d+) expectations hold/) || []).slice(1).join("/");
-  if (count(pt.stdout) !== count(rt.stdout) || pt.status !== rt.status) {
-    failed++;
-    console.log(`FAIL watch-port: ${f} test counts differ (reference ${count(rt.stdout)} exit ${rt.status}, port ${count(pt.stdout)} exit ${pt.status})`);
-  }
+  if (count(pt.stdout) !== count(rt.stdout) || pt.status !== rt.status)
+    return { compared: true, watches, fails: [`FAIL watch-port: ${f} test counts differ (reference ${count(rt.stdout)} exit ${rt.status}, port ${count(pt.stdout)} exit ${pt.status})`] };
+  return { compared: true, watches, fails: [] };
+};
+
+const results = await pool(files, one);
+let failed = 0, compared = 0, watchesSeen = 0;
+for (const r of results) {
+  if (r.compared) compared++;
+  watchesSeen += r.watches;
+  for (const m of r.fails) { failed++; console.log(m); }
 }
 
 console.log(`watch port: ${watchesSeen} watches of ${compared} files ${failed ? "NOT " : ""}printed and checked as the reference does`);
