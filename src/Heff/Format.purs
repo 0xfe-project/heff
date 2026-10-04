@@ -195,6 +195,7 @@ data E
   | Named T T T E T -- ^ `(x := e)`
   | Tup T (Array E) (Array T) T
   | Braces T (Array Fld) (Array T) T
+  | InstB T T E T T -- ^ `{{x : T}}`, an instance binder
   | Sum T T (Array Con) (Array T) T
   | Field E T
   | App E (Array E)
@@ -242,6 +243,7 @@ firstE = case _ of
   Named o _ _ _ _ -> o
   Tup o _ _ _ -> o
   Braces o _ _ _ -> o
+  InstB o _ _ _ _ -> o
   Sum kw _ _ _ _ -> kw
   Field e _ -> firstE e
   App h _ -> firstE h
@@ -260,6 +262,7 @@ lastE = case _ of
   Named _ _ _ _ c -> c
   Tup _ _ _ c -> c
   Braces _ _ _ c -> c
+  InstB _ _ _ _ c -> c
   Sum _ _ _ _ c -> c
   Field _ t -> t
   App h args -> maybe (lastE h) lastE (A.last args)
@@ -524,7 +527,15 @@ atom = lazyP \_ -> do
       o <- next
       inBrackets do
         t' <- peek
+        t2 <- peekAt 1
         if t'.text == "]" then (\c -> Tup o [] [] c) <$> next
+        -- `[x := e]`: an instance argument, given by name
+        else if (t'.kind == "var" || t'.kind == "con") && t2.text == ":=" then do
+          x <- next
+          k <- next
+          e <- expr
+          c <- expectPunct "]"
+          pure (Named o x k e c)
         else do
           e <- expr
           rest <- commaSepE
@@ -592,7 +603,14 @@ braces = lazyP \_ -> do
   inBrackets do
     t <- peek
     t2 <- peekAt 1
-    if t.text == "}" then do
+    -- `{{x : T}}`: an instance binder, laid out as one
+    if t.kind == "punct" && t.text == "{" then do
+      o2 <- next
+      d <- inBrackets expr
+      c1 <- expectPunct "}"
+      c <- expectPunct "}"
+      pure (InstB o o2 d c1 c)
+    else if t.text == "}" then do
       c <- next
       pure (Braces o [] [] c)
     else do
@@ -996,6 +1014,7 @@ pE env = case _ of
   Tup o es commas c ->
     P.group (P.align (tok env o <> P.flatAlt (P.text " ") mempty <> pE env (headE es) <> fold (A.zipWith (\comma e -> P.line' <> tok env comma <+> pE env e) commas (A.drop 1 es)) <> P.line' <> tok env c))
   Braces o [] _ c -> tok env o <> tok env c
+  InstB o o2 d c1 c -> tok env o <> tok env o2 <> pE env d <> tok env c1 <> tok env c
   Braces o fs commas c ->
     P.group (P.align (tok env o <+> pF (headF fs) <> fold (A.zipWith (\comma f -> P.line' <> tok env comma <+> pF f) commas (A.drop 1 fs)) <> P.line <> tok env c))
   Sum kw o alts bars c ->

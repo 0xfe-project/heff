@@ -45,6 +45,14 @@ if (build("test/node/timed.hf", "timed", timed)) {
 
 // one world handled at home (a counter: state, peeled off in the
 // language), the rest handed to Node: the program left over is stdio's
+// the evidence as instance implicits: `main` asks for it, its body finds
+// it, `run` gives it
+const evidence = join(work, "evidence.mjs");
+if (build("test/node/evidence.hf", "run", evidence)) {
+  const r = spawnSync("node", [evidence, "one", "two"], { encoding: "utf8" });
+  check("evidence found in scope", r.stdout + r.stderr, "args: one two\nbye\n");
+}
+
 const counted = join(work, "counted.mjs");
 if (build("test/node/counted.hf", "main", counted)) {
   const r = spawnSync("node", [counted], { encoding: "utf8" });

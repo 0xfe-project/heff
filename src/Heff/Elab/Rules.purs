@@ -157,7 +157,8 @@ insertInstance e sp ft = do
   pure { stx: hole.stx, val: pure (V.Nom hole.val) }
 
 -- | find the one witness in scope whose type is the goal: the instance
--- | binders entered (`e.insts`) and the definitions marked `instance`.
+-- | binders in scope (`e.insts`) -- never a global: what is in scope is
+-- | what the context gave, as Agda's instance arguments.
 -- | More than one is refused (same-typed witnesses are definitionally
 -- | equal here -- small values are opaque -- so no tie-break can tell
 -- | them apart); none is refused too.
@@ -174,11 +175,9 @@ resolveWanted e sp hm holeVal goal final = do
   else do
     let
       locals = map (\c -> { name: c.name, ty: c.ty, sol: { stx: readbEl e.scope.len c.v, val: c.v } }) (A.fromFoldable e.insts)
-      globals = A.mapMaybe (\k -> lookupGlobal e.globals k <#> \ge ->
-        { name: k, ty: ge.type_, sol: { stx: S.Global k, val: ge.value } }) e.globals.instances
     matches <- A.filterA (\c -> unifyTy e.globals (shape e.scope) goal c.ty <#> case _ of
       Right _ -> true
-      Left _ -> false) (locals <> globals)
+      Left _ -> false) locals
     g <- prtInZ e goal
     case matches of
       [ one ] -> do
@@ -189,9 +188,16 @@ resolveWanted e sp hm holeVal goal final = do
             pure true
           Left err -> conversionFail sp (txt ("the instance found, " <> one.name <> ", does not fit here")) (prettyDefEqError (displayName e.globals) err)
       [] -> failWithNote sp 41 (txt "no instance for" <+> g <+> txt "in scope")
-        (txt "declare a witness with `instance <name> : ...`, or give the argument explicitly")
+        (txt "bind one, `{{x : T}} -> ...`, where this is used, or give it: `[x := e]`")
       many -> failWithNote sp 42 (txt "more than one instance for" <+> g <+> txt "in scope:" <+> txt (Text.joinWith ", " (map _.name many)))
         (txt "they cannot be told apart by type (small values are statically opaque): give the argument explicitly")
+
+-- | under an implicit or instance binder, bound silently: an instance
+-- | one becomes a candidate for the searches under it
+intoSilent :: ElabEnv -> V.FunctionType -> Name -> V.El -> Env.Scope -> Boolean -> ElabEnv
+intoSilent e ft y v scope' counted =
+  e { scope = scope', elabFor = appElabFor e.elabFor v, lams = if counted then e.lams + 1 else e.lams
+    , insts = if ft.implicit == Inst then { name: y, ty: ft.dom, v } : e.insts else e.insts }
 
 functionFormation :: Binder -> Typ -> Typ
 functionFormation (Anonymous dom) cod = Typ \e -> do
@@ -226,11 +232,11 @@ implicitLams :: Chk -> Chk
 implicitLams c = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit == Impl -> do
+    V.LikeFunction ft | ft.implicit /= Expl -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (implicitLams c)
-          (e { scope = scope', elabFor = appElabFor e.elabFor v })
+          (intoSilent e ft y v scope' false)
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs y ebody))
     _ -> runChk c e a
@@ -239,22 +245,19 @@ functionIntro :: Span -> Name -> Chk -> Chk
 functionIntro sp x body = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    -- a lambda checked at an implicit function type: the implicit argument
-    -- is bound silently, and the lambda is for the next argument
-    V.LikeFunction ft | ft.implicit == Impl -> do
+    -- a lambda checked at an implicit (or instance) function type: that
+    -- argument is bound silently, and the lambda is for the next one
+    V.LikeFunction ft | ft.implicit /= Expl -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (functionIntro sp x body)
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
+          (intoSilent e ft y v scope' true)
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs y ebody))
-    -- an instance argument is bound by the lambda like an ordinary one,
-    -- and becomes a witness in scope for the searches inside the body
     V.LikeFunction ft -> do
       ebody <- withBound x ft.dom e.scope \v scope' ->
         runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1
-             , insts = if ft.implicit == Inst then { name: x, ty: ft.dom, v } : e.insts else e.insts })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
@@ -279,11 +282,11 @@ functionIntroAnn :: Span -> Name -> Typ -> Chk -> Chk
 functionIntroAnn sp x dom body = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit == Impl -> do
+    V.LikeFunction ft | ft.implicit /= Expl -> do
       let y = fromMaybe "_" (V.cloName ft.cod)
       ebody <- withBound y ft.dom e.scope \v scope' ->
         runChk (functionIntroAnn sp x dom body)
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
+          (intoSilent e ft y v scope' true)
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs y ebody))
     V.LikeFunction ft -> do
@@ -296,8 +299,7 @@ functionIntroAnn sp x dom body = Chk \e a0 -> do
       -- may be known only later -- an implicit argument still unsolved)
       ebody <- withBound x (M.tyN edom) e.scope \v scope' ->
         runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1
-             , insts = if ft.implicit == Inst then { name: x, ty: ft.dom, v } : e.insts else e.insts })
+          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
           (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 1 (txt "tried to check a lambda expression at a non-function type")
@@ -307,11 +309,9 @@ functionIntroImplicit :: Span -> Name -> Chk -> Chk
 functionIntroImplicit sp x body = Chk \e a0 -> do
   a <- forceT a0
   case V.behavior a of
-    V.LikeFunction ft | ft.implicit == Impl -> do
+    V.LikeFunction ft | ft.implicit /= Expl -> do
       ebody <- withBound x ft.dom e.scope \v scope' ->
-        runChk body
-          (e { scope = scope', elabFor = appElabFor e.elabFor v, lams = e.lams + 1 })
-          (V.nom (V.appClo ft.cod (pure v)))
+        runChk body (intoSilent e ft x v scope' true) (V.nom (V.appClo ft.cod (pure v)))
       pure (M.lam (caseOf e.elabFor) (evalEnv e) (M.fromVTy N e.scope.len a) (S.Abs x ebody))
     _ -> failWith sp 25 (txt "an implicit lambda `\\{x} -> ...` checked at a type that takes no implicit argument")
 

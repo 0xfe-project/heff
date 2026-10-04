@@ -34,7 +34,7 @@ import Data.String as Str
 import Heff.Core.Syntax as Syn
 import Heff.Elab.Unify (settle, unsolvedMetas, zonkEl, zonkTy)
 import Control.Monad.State (gets, modify_)
-import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addBroken, addGlobalEntry, lookupGlobal, markInstance)
+import Heff.Core.Globals (GlobalEntry, Globals, addAlias, addBroken, addGlobalEntry, lookupGlobal)
 import Heff.Core.Memoed as M
 import Heff.Core.Params (Case(..), CtxShape, Plicity(..), Universe(..), Variants(..))
 import Heff.Core.Print (prtElR)
@@ -278,6 +278,9 @@ elim :: Int -> R.Syn -> Ntn -> E R.Syn
 elim _ s (NField x sp) = pure (R.recordElim sp s x)
 -- extension: `f (x := a)` (the new syntax) gives the implicit argument `x`
 elim start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> argument n
+-- `f [x := e]`: the instance argument named `x`, given (those before it
+-- are searched for)
+elim start s (NBracket (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> argument n
 -- extension: `f {a}` gives an implicit argument
 elim start s (NBrace n sp) = R.functionElimImplicit { start, end: sp.end } s <$> argument n
 elim start s n = R.functionElimC (checksOnly n) { start, end: (ntnSpan n).end } s <$> argument n
@@ -380,7 +383,7 @@ withArgs args base = A.foldr go base args
   where
   go ab (Tuple t c) = case ab.implicit of
     Impl -> Tuple (R.functionFormation (R.NamedImplicit ab.span ab.name ab.typ) t) (R.functionIntroImplicit ab.span ab.name c)
-    Inst -> Tuple (R.functionFormation (R.NamedInstance ab.span ab.name ab.typ) t) (R.functionIntro ab.span ab.name c)
+    Inst -> Tuple (R.functionFormation (R.NamedInstance ab.span ab.name ab.typ) t) (R.functionIntroImplicit ab.span ab.name c)
     Expl -> Tuple (R.functionFormation (R.Named ab.name ab.typ) t) (R.functionIntro ab.span ab.name c)
 
 type DeclJ = { name :: Name, ty :: R.Typ, tm :: R.Chk, prim :: Boolean }
@@ -398,7 +401,7 @@ def :: Ntn -> E DeclJ
 def (Infix headN (Keyword ":" _) tyW)
   | Just (Tuple tyN eqs) <- stripWhere tyW = do
       Tuple name args <- unpackArgs headN
-      let params = map _.name (A.filter (\ab -> ab.implicit /= Impl) args)
+      let params = map _.name (A.filter (\ab -> ab.implicit == Expl) args)
       bodyN <- case desugar name params eqs (ntnSpan tyW) of
         Left err -> failP err.span 10 (P.text err.msg)
         Right b -> pure b
@@ -636,8 +639,7 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
       , keys = A.snoc acc.keys d.key
       }
     Right (Tuple (Right d) st) -> (after acc st (maybe [] reported d.failed))
-      { globals = (if isInstanceDecl n then markInstance d.key else identity)
-          ((if d.key == d.name then identity else addAlias d.name d.key) (addGlobalEntry d.key d.entry acc.globals))
+      { globals = (if d.key == d.name then identity else addAlias d.name d.key) (addGlobalEntry d.key d.entry acc.globals)
       , spans = A.snoc acc.spans (Tuple d.name (ntnSpan n))
       , keys = A.snoc acc.keys d.key
       }
@@ -649,10 +651,6 @@ topModule key g0 = foldl tryDecl { globals: g0, diags: [], spans: [], infos: [],
         }
       Nothing -> after acc st (reported d)
   st0 = emptySt
-  -- spike: a declaration parsed from `instance f : T`
-  isInstanceDecl = case _ of
-    MDecl mods _ _ _ -> A.elem "instance" mods
-    _ -> false
   -- (the name a declaration defines, from its notation: it may not be read
   -- further)
   declName = case _ of

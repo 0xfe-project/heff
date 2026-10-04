@@ -41,11 +41,12 @@ equationsWith style f names0 ty0 el =
   -- the lambdas of the explicit arguments (the type says which are); an
   -- implicit one ends the equations' shape
   lambdas ns ps ty b = case ty, b of
-    -- an implicit argument is not written in the equations: it is in scope
-    Syn.Function ft, Syn.Lam _ (Syn.Abs x body) | ft.implicit == Impl -> case ft.cod of
+    -- an implicit (or instance) argument is not written in the equations:
+    -- it is in scope
+    Syn.Function ft, Syn.Lam _ (Syn.Abs x body) | ft.implicit /= Expl -> case ft.cod of
       Syn.Abs _ cod -> lambdas (x : ns) ps cod body
       Syn.AbsConst cod -> lambdas (x : ns) ps cod body
-    Syn.Function ft, Syn.Lam _ abs | ft.implicit /= Impl ->
+    Syn.Function ft, Syn.Lam _ abs | ft.implicit == Expl ->
       let
         x = case abs of
           Syn.Abs y _ -> y

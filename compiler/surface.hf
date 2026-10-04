@@ -526,6 +526,7 @@ mkOperand t e = { op = t, e = e }
 binderNames : Ntn -> List String
 binderNames (Infix (Ident x _) (Keyword ":" _) _) = Cons x Nil
 binderNames (NBrace n _) = binderNames n
+binderNames (NBracket n _) = binderNames n
 binderNames _ = Nil
 
 -- | the names a (function) type binds: `(x : A) -> ...`, `{x : A} -> ...`
@@ -538,6 +539,8 @@ piBinders _ = Nil
 piImplicits : Ntn -> List String
 piImplicits (Infix (NBrace b bsp) (Keyword "->" _) rest) =
   appendS (binderNames (NBrace b bsp)) (piImplicits rest)
+piImplicits (Infix (NBracket b bsp) (Keyword "->" _) rest) =
+  appendS (binderNames (NBracket b bsp)) (piImplicits rest)
 piImplicits (Infix _ (Keyword "->" _) rest) = piImplicits rest
 piImplicits _ = Nil
 
@@ -958,7 +961,16 @@ bracesF g = do
   inBrackets (do
     t <- peek
     t2 <- peekAt 1
-    if strEq t.text "}"
+    -- `{{x : T}}`: an instance argument -- an implicit one, found among
+    -- the instance binders in scope rather than by unification
+    if strEq t.kind "punct" && strEq t.text "{"
+        then do
+          i <- next
+          d <- inBrackets (declarationF g)
+          c1 <- expectPunct "}"
+          c <- expectPunct "}"
+          pure (NBracket d (spanTT o c))
+      else if strEq t.text "}"
         then do
           c <- next
           pure (NBlock "struct" Nothing Nil (spanTT o c))
@@ -1077,21 +1089,23 @@ atomBase g t =
   else if strEq t.kind "punct" && strEq t.text "(" then parensF g
   else if strEq t.kind "punct" && strEq t.text "{" then bracesF g
   else if strEq t.kind "punct" && strEq t.text "["
-    -- spike: `[x : T]`, an instance binder (left of `->`); a list
+    -- `[x := e]`: the instance argument named `x`, given; a list
     -- otherwise
     then do
       t1 <- peekAt 1
       t2 <- peekAt 2
-      if strEq t1.kind "var" && isAnnText t2.text
+      if (strEq t1.kind "var" || strEq t1.kind "con")
+        && strEq t2.kind "sym"
+        && strEq t2.text ":="
           then do
             o <- next
             x <- next
-            cc <- next
-            ty <- g.expr
+            k <- next
+            e <- inBrackets g.expr
             c2 <- expectPunct "]"
             pure
                 (NBracket
-                   (Infix (Ident x.text (spanOf x)) (Keyword ":" (spanOf x)) ty)
+                   (Infix (Ident x.text (spanOf x)) (Keyword ":=" (spanOf k)) e)
                    (spanTT o c2))
         else listOfF g g.expr
   else throwP (diag (spanOf t) ("expected an expression, not " ++ shown t))
@@ -1337,10 +1351,7 @@ expr = \st -> gram.expr st
 -- | what a top-level declaration is, before signatures meet equations:
 -- | a signature (the name, where it is written, the type, where the
 -- | signature is), an equation, or a declaration whole
-data Item
-  = Sig String Pm.Span Ntn Pm.Span Bool
-  | Eqn String Ntn Pm.Span
-  | Decl Ntn
+data Item = Sig String Pm.Span Ntn Pm.Span | Eqn String Ntn Pm.Span | Decl Ntn
 
 -- | what a signature or an equation defines: `f`, `C`, or `(+)`
 type DeclName = { name : String, len : Int, span : Pm.Span }
@@ -1575,11 +1586,11 @@ skipFixity = do
       n <- next
       skipFixity
 
-declOf : Bool -> L.Tok -> Maybe DeclName -> P (List Item)
-declOf inst t Nothing =
+declOf : L.Tok -> Maybe DeclName -> P (List Item)
+declOf t Nothing =
   throwP
     (diag (spanOf t) ("a declaration cannot start with `" ++ t.text ++ "`"))
-declOf inst t (Just f) = do
+declOf t (Just f) = do
   t2 <- peekAt f.len
   if isAnnText t2.text
       then do
@@ -1593,7 +1604,7 @@ declOf inst t (Just f) = do
                     (mkBinders f.name (piBinders ty) (piImplicits ty))
                     s.binders)
                  s)
-        pure (Cons (Sig f.name f.span ty (spanTE t end) inst) Nil)
+        pure (Cons (Sig f.name f.span ty (spanTE t end)) Nil)
     else equation f
 
 decl : P (List Item)
@@ -1636,24 +1647,9 @@ decl = do
         e <- gram.expr
         end <- prevEnd
         pure (Cons (Decl (MDecl Nil ">" e (spanTE t end))) Nil)
-    -- spike: `instance f : T` marks the signature's definition as a
-    -- witness for instance search
-    else if strEq t.kind "var" && strEq t.text "instance"
-      then do
-        t2 <- peekAt 1
-        t3 <- peekAt 2
-        if (strEq t2.kind "var" || strEq t2.kind "con") && isAnnText t3.text
-            then do
-              n <- next
-              t2b <- peek
-              name <- declName
-              declOf True t2b name
-          else do
-            name <- declName
-            declOf False t name
     else do
       name <- declName
-      declOf False t name
+      declOf t name
 
 -- The program
 --------------------------------------------------------------------------------
@@ -1924,10 +1920,10 @@ fixityDecls imported ts = fixityFrom imported (fixDecls ts 0 Nil)
 -- Signatures meet their equations
 --------------------------------------------------------------------------------
 
-defOf : Bool -> String -> Pm.Span -> Ntn -> Pm.Span -> List Ntn -> Ntn
-defOf inst f fsp ty sp eqs =
+defOf : String -> Pm.Span -> Ntn -> Pm.Span -> List Ntn -> Ntn
+defOf f fsp ty sp eqs =
   MDecl
-    (if inst then Cons "instance" Nil else Nil)
+    Nil
     "def"
     (Infix
        (Ident f fsp)
@@ -1949,11 +1945,10 @@ eqnEnd f (Cons _ rest) e = eqnEnd f rest e
 
 assembleOne : List String -> List Item -> Item -> Maybe Ntn
 assembleOne broken items (Decl n) = Just n
-assembleOne broken items (Sig f fsp ty sp inst) =
+assembleOne broken items (Sig f fsp ty sp) =
   if elemBy strEq f broken
     then Just
         (defOf
-           inst
            f
            fsp
            ty
@@ -1964,7 +1959,6 @@ assembleOne broken items (Sig f fsp ty sp inst) =
   else if length (eqnsOf f items) == 0 then Nothing
   else Just
       (defOf
-         inst
          f
          fsp
          ty
@@ -1978,7 +1972,7 @@ assemble broken items =
 
 sigNames : List Item -> List String
 sigNames Nil = Nil
-sigNames (Cons (Sig f _ _ _ _) rest) = Cons f (sigNames rest)
+sigNames (Cons (Sig f _ _ _) rest) = Cons f (sigNames rest)
 sigNames (Cons _ rest) = sigNames rest
 
 eqnNames : List Item -> List String
@@ -1991,7 +1985,7 @@ assembleDiagOne : List String
                 -> List String
                 -> Item
                 -> Maybe Diag
-assembleDiagOne broken sigs eqns (Sig f _ _ sp _) =
+assembleDiagOne broken sigs eqns (Sig f _ _ sp) =
   if not (elemBy strEq f eqns) && not (elemBy strEq f broken)
     then Just (diag sp ("`" ++ f ++ "` has a type but no definition"))
   else Nothing

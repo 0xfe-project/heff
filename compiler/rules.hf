@@ -88,21 +88,27 @@ intoLamQuiet e sc v =
   , insts = e.insts
   }
 
--- spike: an instance argument is bound by the lambda like an ordinary
--- one, and becomes a witness in scope for the searches inside the body
-intoLamInst : ElabEnv -> Scope -> V.V -> String -> V.Ty -> ElabEnv
-intoLamInst e sc v x dom =
+-- | under an implicit or instance binder, bound silently: an instance
+-- | one becomes a candidate for the searches under it
+intoSilent : ElabEnv
+           -> P.Plicity
+           -> String
+           -> V.Ty
+           -> Scope
+           -> V.V
+           -> Bool
+           -> ElabEnv
+intoSilent e implicit y dom sc v counted =
   { scope = sc
   , globals = e.globals
   , elabFor = appElabFor e.elabFor v
-  , lams = e.lams + 1
+  , lams = if counted then e.lams + 1 else e.lams
   , self = e.self
-  , insts = Cons { name = x, ty = dom, v = v } e.insts
+  , insts =
+      if P.eqPlicity implicit Inst
+        then Cons { name = y, ty = dom, v = v } e.insts
+      else e.insts
   }
-
-intoLamOf : P.Plicity -> String -> V.Ty -> ElabEnv -> Scope -> V.V -> ElabEnv
-intoLamOf Inst x dom e sc v = intoLamInst e sc v x dom
-intoLamOf _ x dom e sc v = intoLam e sc v
 
 -- | an error hole of a type: what did not elaborate, in its place
 errorHole : V.Ty -> M.El
@@ -367,15 +373,6 @@ instLocals e =
     (\(c : InstLocal) -> mkWitness c.name c.ty (R.readbEl e.scope.len c.v) c.v)
     e.insts
 
-instGlobals : ElabEnv -> List Witness
-instGlobals e =
-  catMaybesR
-    (map
-       (\k -> case G.lookupEntry e.globals k of
-        Just ge -> Just (mkWitness k ge.type_ (SGlobal k) ge.value)
-        Nothing -> Nothing)
-       e.globals.instances)
-
 witnessMatches : ElabEnv -> V.Ty -> List Witness -> Elab (List Witness)
 witnessMatches e goal Nil = pure Nil
 witnessMatches e goal (Cons w rest) = do
@@ -386,7 +383,8 @@ witnessMatches e goal (Cons w rest) = do
     Left _ -> pure more
 
 -- | find the one witness in scope whose type is the goal: the instance
--- | binders entered (`e.insts`) and the definitions marked `instance`.
+-- | binders in scope (`e.insts`) -- never a global: what is in scope is
+-- | what the context gave, as Agda's instance arguments.
 -- | More than one is refused (same-typed witnesses are definitionally
 -- | equal here -- small values are opaque -- so no tie-break can tell
 -- | them apart); none is refused too.
@@ -404,8 +402,7 @@ resolveWanted e sp hm holeVal goal final = do
               "give the argument explicitly, or annotate so the implicits around it are solved"
         else pure False
     else do
-      matches <-
-        witnessMatches e goal (concatList (instLocals e) (instGlobals e))
+      matches <- witnessMatches e goal (instLocals e)
       case matches of
         Cons one Nil -> do
           r <- solveHole e.globals (shape e.scope) hm holeVal one.stx one.val
@@ -424,7 +421,7 @@ resolveWanted e sp hm holeVal goal final = do
             sp
             41
             ("no instance for " ++ instShown e mc goal ++ " in scope")
-            "declare a witness with `instance <name> : ...`, or give the argument explicitly"
+            "bind one, `{{x : T}} -> ...`, where this is used, or give it: `[x := e]`"
         _ ->
           failWithNote
             (a := Bool)
@@ -532,20 +529,21 @@ implicitLams c =
   MkChk (\e a0 -> do
   a <- Mt.forceT a0
   case V.behavior a of
-    LikeFunction level dom cod Impl ->
-      withBound (cloNameOr cod) dom e.scope (\v scope' -> do
-      ebody <-
-        runChk
-          (implicitLams c)
-          (intoLamQuiet e scope' v)
-          (V.nom (V.appClo cod (\u -> v)))
-      pure
-          (M.lam
-             (caseOf e.elabFor)
-             e.globals
-             e.scope.locals
-             (M.fromVTy N e.scope.len a)
-             (MkAbs (cloNameOr cod) ebody)))
+    LikeFunction level dom cod implicit ->
+      if P.eqPlicity implicit Expl then runChk c e a
+      else withBound (cloNameOr cod) dom e.scope (\v scope' -> do
+        ebody <-
+          runChk
+            (implicitLams c)
+            (intoSilent e implicit (cloNameOr cod) dom scope' v False)
+            (V.nom (V.appClo cod (\u -> v)))
+        pure
+            (M.lam
+               (caseOf e.elabFor)
+               e.globals
+               e.scope.locals
+               (M.fromVTy N e.scope.len a)
+               (MkAbs (cloNameOr cod) ebody)))
     _ -> runChk c e a)
 
 functionIntro : P.Span -> String -> Chk -> Chk
@@ -553,39 +551,34 @@ functionIntro sp x body =
   MkChk (\e a0 -> do
   a <- Mt.forceT a0
   case V.behavior a of
-    LikeFunction level dom cod Impl ->
-      -- a lambda checked at an implicit function type: the implicit
-      -- argument is bound silently, and the lambda is for the next one
-      withBound
-        (cloNameOr cod)
-        dom
-        e.scope (\v scope' -> do
-      ebody <-
-        runChk
-          (functionIntro sp x body)
-          (intoLam e scope' v)
-          (V.nom (V.appClo cod (\u -> v)))
-      pure
-          (M.lam
-             (caseOf e.elabFor)
-             e.globals
-             e.scope.locals
-             (M.fromVTy N e.scope.len a)
-             (MkAbs (cloNameOr cod) ebody)))
     LikeFunction level dom cod implicit ->
-      withBound x dom e.scope (\v scope' -> do
-      ebody <-
-        runChk
-          body
-          (intoLamOf implicit x dom e scope' v)
-          (V.nom (V.appClo cod (\u -> v)))
-      pure
-          (M.lam
-             (caseOf e.elabFor)
-             e.globals
-             e.scope.locals
-             (M.fromVTy N e.scope.len a)
-             (MkAbs x ebody)))
+      if P.eqPlicity implicit Expl
+        then withBound x dom e.scope (\v scope' -> do
+          ebody <-
+            runChk body (intoLam e scope' v) (V.nom (V.appClo cod (\u -> v)))
+          pure
+              (M.lam
+                 (caseOf e.elabFor)
+                 e.globals
+                 e.scope.locals
+                 (M.fromVTy N e.scope.len a)
+                 (MkAbs x ebody)))
+      -- a lambda checked at an implicit (or instance) function type:
+      -- that argument is bound silently, and the lambda is for the
+      -- next one
+      else withBound (cloNameOr cod) dom e.scope (\v scope' -> do
+        ebody <-
+          runChk
+            (functionIntro sp x body)
+            (intoSilent e implicit (cloNameOr cod) dom scope' v True)
+            (V.nom (V.appClo cod (\u -> v)))
+        pure
+            (M.lam
+               (caseOf e.elabFor)
+               e.globals
+               e.scope.locals
+               (M.fromVTy N e.scope.len a)
+               (MkAbs (cloNameOr cod) ebody)))
     _ ->
       failWith
         (a := M.El)
@@ -642,31 +635,29 @@ functionIntroAnn sp x dom body =
   MkChk (\e a0 -> do
   a <- Mt.forceT a0
   case V.behavior a of
-    LikeFunction level fdom cod Impl ->
-      withBound (cloNameOr cod) fdom e.scope (\v scope' -> do
-      ebody <-
-        runChk
-          (functionIntroAnn sp x dom body)
-          (intoLam e scope' v)
-          (V.nom (V.appClo cod (\u -> v)))
-      pure
-          (M.lam
-             (caseOf e.elabFor)
-             e.globals
-             e.scope.locals
-             (M.fromVTy N e.scope.len a)
-             (MkAbs (cloNameOr cod) ebody)))
-    LikeFunction level fdom cod implicit -> do
-      edom <- runTyp dom e
-      agree <- Mt.unifyTy e.globals (shape e.scope) fdom (M.tyN edom)
-      requireAgree e sp agree
-      -- (bound at the annotation: the two are equal, and what is
-      -- expected may be known only later)
-      withBound x (M.tyN edom) e.scope (\v scope' -> do
+    LikeFunction level fdom cod implicit ->
+      if P.eqPlicity implicit Expl
+        then do
+          edom <- runTyp dom e
+          agree <- Mt.unifyTy e.globals (shape e.scope) fdom (M.tyN edom)
+          requireAgree e sp agree
+          -- (bound at the annotation: the two are equal, and what is
+          -- expected may be known only later)
+          withBound x (M.tyN edom) e.scope (\v scope' -> do
+            ebody <-
+              runChk body (intoLam e scope' v) (V.nom (V.appClo cod (\u -> v)))
+            pure
+                (M.lam
+                   (caseOf e.elabFor)
+                   e.globals
+                   e.scope.locals
+                   (M.fromVTy N e.scope.len a)
+                   (MkAbs x ebody)))
+      else withBound (cloNameOr cod) fdom e.scope (\v scope' -> do
         ebody <-
           runChk
-            body
-            (intoLamOf implicit x (M.tyN edom) e scope' v)
+            (functionIntroAnn sp x dom body)
+            (intoSilent e implicit (cloNameOr cod) fdom scope' v True)
             (V.nom (V.appClo cod (\u -> v)))
         pure
             (M.lam
@@ -674,7 +665,7 @@ functionIntroAnn sp x dom body =
                e.globals
                e.scope.locals
                (M.fromVTy N e.scope.len a)
-               (MkAbs x ebody)))
+               (MkAbs (cloNameOr cod) ebody)))
     _ ->
       failWith
         (a := M.El)
@@ -688,21 +679,25 @@ functionIntroImplicit sp x body =
   MkChk (\e a0 -> do
   a <- Mt.forceT a0
   case V.behavior a of
-    LikeFunction level dom cod Impl ->
-      withBound x dom e.scope (\v scope' -> do
-      ebody <- runChk body (intoLam e scope' v) (V.nom (V.appClo cod (\u -> v)))
-      pure
-          (M.lam
-             (caseOf e.elabFor)
-             e.globals
-             e.scope.locals
-             (M.fromVTy N e.scope.len a)
-             (MkAbs x ebody)))
     LikeFunction level dom cod implicit ->
-      failWith
-        sp
-        25
-        "an implicit lambda `\\{x} -> ...` checked at a type that takes no implicit argument"
+      if P.eqPlicity implicit Expl
+        then failWith
+            sp
+            25
+            "an implicit lambda `\\{x} -> ...` checked at a type that takes no implicit argument"
+      else withBound x dom e.scope (\v scope' -> do
+        ebody <-
+          runChk
+            body
+            (intoSilent e implicit x dom scope' v True)
+            (V.nom (V.appClo cod (\u -> v)))
+        pure
+            (M.lam
+               (caseOf e.elabFor)
+               e.globals
+               e.scope.locals
+               (M.fromVTy N e.scope.len a)
+               (MkAbs x ebody)))
     _ ->
       failWith
         (a := M.El)

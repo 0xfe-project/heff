@@ -26,15 +26,11 @@ type GlobalEntry = { syntax :: S.El, tySyntax :: S.Ty, value :: V.El, type_ :: V
 -- | modules it imports, through aliases (`Heff.Driver`).  `broken`: the
 -- | keys of definitions that did not elaborate, not even their types (a
 -- | use of one is not an error of its own)
-type Globals = { order :: Array Name, entries :: Map Name GlobalEntry, aliases :: Map Name Name, broken :: Set Name, instances :: Array Name }
+type Globals = { order :: Array Name, entries :: Map Name GlobalEntry, aliases :: Map Name Name, broken :: Set Name }
 
 emptyGlobals :: Globals
-emptyGlobals = { order: [], entries: Map.empty, aliases: Map.empty, broken: Set.empty, instances: [] }
+emptyGlobals = { order: [], entries: Map.empty, aliases: Map.empty, broken: Set.empty }
 
--- | spike: mark a definition as an instance -- a candidate for instance
--- | search (`instance x : T`)
-markInstance :: Name -> Globals -> Globals
-markInstance k g = g { instances = A.snoc (A.filter (_ /= k) g.instances) k }
 
 addBroken :: Name -> Globals -> Globals
 addBroken k g = g { broken = Set.insert k g.broken }
