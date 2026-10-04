@@ -72,12 +72,12 @@ writeFileSync(loop, [
   "import co", "import prelude", "import process", "import stdio", "",
   "eff : HFunctor",
   "eff = stdio <+> process", "",
-  "loop : Int -> Int -> Co eff Unit",
-  "loop n acc = if n == 0 then print (inl stdio process) (showInt acc) else do",
-  "  v <- getEnv (inr stdio process) \"X\"",
+  "loop : {{io : stdio <: eff}} -> {{sys : process <: eff}} -> Int -> Int -> Co eff Unit",
+  "loop n acc = if n == 0 then print (showInt acc) else do",
+  "  v <- getEnv \"X\"",
   "  loop (n - 1) (acc + 1)", "",
   "main : Co eff Unit",
-  "main = loop 100000 0", "",
+  "main = loop [io := inl stdio process] [sys := inr stdio process] 100000 0", "",
 ].join("\n"));
 if (build(loop, "main", loopJs)) {
   const r = spawnSync("node", [loopJs], { encoding: "utf8" });

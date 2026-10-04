@@ -30,7 +30,7 @@ r1 = state (List String) <+> r2
 world : HFunctor
 world = exn <+> r1
 
--- the program's declaration of its world structure
+-- the world's structure: each sub-effect's evidence, given to `crawl`
 onExn : (exn <: world)
 onExn = inl exn r1
 
@@ -48,35 +48,44 @@ onPar : (par2 <: world)
 onPar p =
   inr exn r1 (inr (state (List String)) r2 (inr net r3 (inr stdio par2 p)))
 
--- the operations, at the crawler's own effect
-visited : Co world (List String)
-visited = get onSt
+-- the operations, each asking for the evidence of the world it uses
+visited : {{st : state (List String) <: world}} -> Co world (List String)
+visited = get
 
-record : List String -> Co world Unit
-record v = put onSt v
+record : {{st : state (List String) <: world}} -> List String -> Co world Unit
+record v = put v
 
-say : String -> Co world Unit
-say s = write onOut s
+say : {{io : stdio <: world}} -> String -> Co world Unit
+say s = write s
 
-fetch : String -> Co world String
-fetch u = fetchText onNet u
+fetch : {{nt : net <: world}} -> String -> Co world String
+fetch u = fetchText u
 
 -- a fetch that fails loudly on a missing page
-fetchBody : String -> Co world String
+fetchBody : {{nt : net <: world}}
+          -> {{ex : exn <: world}}
+          -> String
+          -> Co world String
 fetchBody u = do
   c <- fetch u
-  if strEq c "404" then throw onExn u else pure c
+  if strEq c "404" then throw u else pure c
 
 -- fetch one page, catching: a missing page is said, and is no page
-grab : String -> Co world String
+grab : {{io : stdio <: world}}
+     -> {{nt : net <: world}}
+     -> {{ex : exn <: world}}
+     -> String
+     -> Co world String
 grab u = do
   say ("fetch " ++ u)
-  catch onExn (fetchBody u) (\bad -> do
+  catch (fetchBody u) (\bad -> do
     say ("missing " ++ bad)
     pure "")
 
 -- the links not yet seen, in order
-fresh : List String -> Co world (List String)
+fresh : {{st : state (List String) <: world}}
+      -> List String
+      -> Co world (List String)
 fresh Nil = pure Nil
 fresh (u :: us) = do
   rest <- fresh us
@@ -84,21 +93,40 @@ fresh (u :: us) = do
   if strEq u "" || elemBy strEq u v then pure rest else pure (u :: rest)
 
 -- breadth first, two pages at a time in parallel, while the fuel lasts
-crawl : Int -> List String -> Co world Unit
-crawl 0 _ = say "fuel spent"
-crawl fuel Nil = say "done"
-crawl fuel (a :: b :: rest) = do
+crawlW : {{ex : exn <: world}}
+       -> {{st : state (List String) <: world}}
+       -> {{nt : net <: world}}
+       -> {{io : stdio <: world}}
+       -> {{pr : par2 <: world}}
+       -> Int
+       -> List String
+       -> Co world Unit
+crawlW 0 _ = say "fuel spent"
+crawlW fuel Nil = say "done"
+crawlW fuel (a :: b :: rest) = do
   v <- visited
   record (a :: b :: v)
-  bodies <- parIn onPar (grab a) (grab b)
+  bodies <- parIn (grab a) (grab b)
   more <- fresh (words (fst bodies ++ " " ++ snd bodies))
-  crawl (fuel - 1) (concatList rest more)
-crawl fuel (a :: Nil) = do
+  crawlW (fuel - 1) (concatList rest more)
+crawlW fuel (a :: Nil) = do
   v <- visited
   record (a :: v)
   body <- grab a
   more <- fresh (words body)
-  crawl (fuel - 1) more
+  crawlW (fuel - 1) more
+
+-- the crawler, its world's evidence given
+crawl : Int -> List String -> Co world Unit
+crawl fuel us =
+  crawlW
+    [ex := onExn]
+    [st := onSt]
+    [nt := onNet]
+    [io := onOut]
+    [pr := onPar]
+    fuel
+    us
 
 -- the handler ------------------------------------------------------------
 
