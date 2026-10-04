@@ -13,6 +13,7 @@ import compiler.diagnostic as Dg
 import compiler.driver as Dr
 import compiler.effect as Ef
 import compiler.emit as Em
+import compiler.format as Fm
 import compiler.load as L
 import compiler.toplevel as T
 import fs
@@ -486,11 +487,186 @@ checkCmd file = do
   cs <- cachedProgram l.sources
   checkLast (badL > 0) cs
 
--- | the compiler's door: `FILE...` checks and dumps (the differential);
--- | `node|app NAME OUT FILE` compiles, `compile-js FILE OUT` a module,
--- | `check FILE` prints the interface, `run FILE` the watches' values,
--- | `eval FILE` the definitions', `promote FILE` writes expectations,
--- | `test FILE...` checks them
+-- | a flag of a command, and what it does
+type Flag = { flag : String, doc : String }
+
+-- | a command: how it is called, what it does, and what its words
+-- | complete to (`files`: the files' suffix; `flags`)
+type Command =
+  { name : String
+  , args : String
+  , doc : String
+  , files : String
+  , flags : List Flag
+  }
+
+cmd : String -> String -> String -> String -> Command
+cmd name a doc files =
+  { name = name, args = a, doc = doc, files = files, flags = Nil }
+
+commands : List Command
+commands =
+  [ cmd
+    "check"
+    "FILE"
+    "elaborate FILE and what it imports; print its interface"
+    ".hf"
+  , cmd "eval" "FILE" "print what each definition of FILE evaluates to" ".hf"
+  , cmd
+    "run"
+    "FILE"
+    "print what each watch (`-- >>> e`) of FILE evaluates to"
+    ".hf"
+  , cmd
+    "test"
+    "FILE..."
+    "check the watches' expectations (the `-- ...` lines under them)"
+    ".hf"
+  , cmd
+    "promote"
+    "FILE"
+    "write each watch's value under it as its expectation"
+    ".hf"
+  , cmd
+    "compile-js"
+    "FILE OUT.js"
+    "an ES module of FILE and what it imports"
+    ".hf"
+  , cmd
+    "app"
+    "FILE [NAME] OUT.js"
+    "a script running the app NAME (lib/dom.hf) in a page"
+    ".hf"
+  , cmd
+    "node"
+    "FILE [NAME] OUT.mjs"
+    "a Node.js program running NAME, its worlds' providers bundled in"
+    ".hf"
+  , cmd "explain" "FILE" "the elaboration trace" ".hf"
+  , cmd
+    "dump-nbe"
+    "FILE"
+    "each definition over compiler/'s formers, with its normal forms (the port's differential)"
+    ".hf"
+  , cmd
+    "type-at"
+    "FILE OFFSET"
+    "what the name at OFFSET resolved to, and its type"
+    ".hf"
+  , { name = "fmt"
+    , args = "[--check] FILE..."
+    , doc = "format FILEs in place (--check: only say which are not formatted)"
+    , files = ".hf"
+    , flags = [{ flag = "check", doc = "only say which are not formatted" }]
+    }
+  , cmd "lsp" "" "a language server, on stdin/stdout" ""
+  , cmd "completions" "fish" "a completion script for the shell" ""
+  ]
+
+spaces : Int -> String
+spaces n = joinWith "" (replicate n " ")
+
+commandHead : Command -> String
+commandHead c = c.name ++ (if strEq c.args "" then "" else " " ++ c.args)
+
+-- (the head, padded to 24 columns -- a space at least -- and its doc)
+usageLine : Command -> String
+usageLine c =
+  "  "
+  ++ commandHead c
+  ++ spaces (max 1 (24 - strLength (commandHead c)))
+  ++ c.doc
+
+usage : String
+usage =
+  joinWith
+    "\n"
+    (Cons "usage: heff COMMAND FILE ..." (Cons "" (map usageLine commands)))
+
+-- (a fish string: quoted, its quotes escaped)
+fishQuote : String -> String
+fishQuote x = "'" ++ joinWith "\\'" (split "'" x) ++ "'"
+
+seenFrom : String -> String
+seenFrom name =
+  "complete -c heff -n '__fish_seen_subcommand_from " ++ name ++ "'"
+
+fishLines : Command -> List String
+fishLines c =
+  concatList
+    (Cons
+       ("complete -c heff -n __fish_use_subcommand -a "
+        ++ c.name
+        ++ " -d "
+        ++ fishQuote c.doc)
+       (if strEq c.files "" then Nil
+        else [ seenFrom c.name
+             ++ " -a '(__fish_complete_suffix "
+             ++ c.files
+             ++ ")'"
+             ]))
+    (concatList
+       (map
+          (\(f : Flag) ->
+             seenFrom c.name ++ " -l " ++ f.flag ++ " -d " ++ fishQuote f.doc)
+          c.flags)
+       (if strEq c.name "completions"
+          then [seenFrom "completions" ++ " -a fish"]
+        else Nil))
+
+-- | fish's completions of heff: `heff completions fish > ~/.config/fish/completions/heff.fish`
+fishCompletions : String
+fishCompletions =
+  joinWith
+    "\n"
+    (concatList
+       [ "# heff: written by `heff completions fish`"
+       , "complete -c heff -e"
+       , "complete -c heff -f"
+       ]
+       (concatMap fishLines commands))
+  ++ "\n"
+
+-- | 1 if the file is not formatted (with `--check`) or cannot be
+fmtOne : Bool -> String -> Heff Int
+fmtOne checkOnly f = do
+  mSrc <- readFile f
+  case mSrc of
+    Nothing -> do
+      printErr ("heff: cannot read " ++ f)
+      pure 1
+    Just src -> case Fm.format src of
+      Left why -> do
+        printErr ("heff: " ++ f ++ " not formatted: " ++ why)
+        pure 1
+      Right out ->
+        if strEq out src then pure 0
+        else if checkOnly
+          then do
+            print f
+            pure 1
+        else do
+          ok <- writeFile f out
+          pure 0
+
+fmtAll : Bool -> List String -> Int -> Heff Int
+fmtAll checkOnly Nil bad = pure bad
+fmtAll checkOnly (Cons f rest) bad = do
+  n <- fmtOne checkOnly f
+  fmtAll checkOnly rest (bad + n)
+
+-- | format FILEs in place; `--check`: only say which are not formatted
+fmtCmd : List String -> Heff Unit
+fmtCmd as = do
+  bad <- case as of
+    Cons "--check" files -> fmtAll True files 0
+    _ -> fmtAll False as 0
+  if bad > 0 then exit 1 else pure MkUnit
+
+-- | the compiler's door: the commands of `usage`, and `dump-core
+-- | FILE...`, which checks the files given (in dependency order) and
+-- | prints their stored core -- the differential `test/self-check.mjs`
+-- | holds to the reference's `dump-nbe`
 program : Heff Unit
 program = do
   as <- args
@@ -507,8 +683,17 @@ program = do
     Cons "run" (Cons file Nil) -> runCmd file
     Cons "eval" (Cons file Nil) -> evalCmd file
     Cons "promote" (Cons file Nil) -> promoteCmd file
-    Cons "test" files -> testCmd files 0 0 False
-    _ -> selfcheck as
+    Cons "test" (Cons f files) -> testCmd (Cons f files) 0 0 False
+    Cons "fmt" (Cons f files) -> fmtCmd (Cons f files)
+    Cons "completions" (Cons "fish" Nil) -> write fishCompletions
+    Cons "dump-core" files -> selfcheck files
+    Nil -> print usage
+    Cons "help" Nil -> print usage
+    -- (on stderr: what reads the output, a shell's completion, say, does
+    -- not take it for an answer)
+    _ -> do
+      printErr usage
+      exit 1
 
 -- | where the world is: each sub-effect's evidence, given
 main : Co world Unit

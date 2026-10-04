@@ -16,7 +16,8 @@ const heff = (...args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...a
 const files = [
   "lib/prelude.hf", "lib/array.hf", "lib/map.hf", "lib/co.hf",
   "lib/stdio.hf", "lib/process.hf", "lib/fs.hf",
-  "fmt/lex.hf",
+  "lib/doc.hf",
+  "fmt/lex.hf", "fmt/imports.hf", "fmt/toks.hf", "fmt/cst.hf", "fmt/layout.hf",
   "compiler/dict.hf", "compiler/params.hf", "compiler/syntax.hf",
   "compiler/value.hf", "compiler/globals.hf", "compiler/eval.hf",
   "compiler/readback.hf", "compiler/conversion.hf", "compiler/notation.hf",
@@ -30,7 +31,7 @@ const files = [
   "compiler/effect.hf", "compiler/lower.hf", "compiler/emit.hf",
   "compiler/interp.hf", "compiler/diagnostic.hf",
   "compiler/driver.hf", "compiler/serial.hf", "compiler/cache.hf",
-  "compiler/load.hf", "compiler/main.hf",
+  "compiler/load.hf", "compiler/format.hf", "compiler/main.hf",
 ];
 
 let failed = 0;
@@ -48,7 +49,7 @@ const b = heff("node", "compiler/main.hf", "main", bin);
 if (b.status !== 0) { console.log(`FAIL self-check: could not compile compiler/main.hf\n${b.stdout}${b.stderr}`); process.exit(1); }
 
 // run over its own sources
-const run = spawnSync("node", ["--stack-size=60000", bin, ...files], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
+const run = spawnSync("node", ["--stack-size=60000", bin, "dump-core", ...files], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
 if (run.status !== 0) { failed++; console.log(`FAIL self-check: the compiler refused its own source\n${run.stderr.split("\n").slice(0, 12).join("\n")}`); }
 
 // the reference, on the same files
@@ -71,7 +72,7 @@ mkdirSync(join(mroot, "lib"), { recursive: true });
 copyFileSync(join(root, "lib", "prelude.hf"), join(mroot, "lib", "prelude.hf"));
 for (const f of ["plain.hf", "value-use.hf"]) copyFileSync(join(root, "test", "modules", f), join(mroot, f));
 const mfiles = ["lib/prelude.hf", "plain.hf", "value-use.hf"];
-const mrun = spawnSync("node", ["--stack-size=60000", bin, ...mfiles], { cwd: mroot, encoding: "utf8", maxBuffer: 1e9 });
+const mrun = spawnSync("node", ["--stack-size=60000", bin, "dump-core", ...mfiles], { cwd: mroot, encoding: "utf8", maxBuffer: 1e9 });
 let mref = "";
 for (const f of ["lib/prelude.hf", "test/modules/plain.hf", "test/modules/value-use.hf"]) {
   const r = heff("dump-nbe", resolve(root, f));

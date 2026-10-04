@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // The rest of the CLI through both compilers: `compile-js` and
 // `app`/`node` write the same bytes, `eval` prints the same values,
-// and `promote` writes the same expectations back.
+// `promote` writes the same expectations back, `fmt` lays out (and
+// refuses) as the reference does, and `help`, `completions fish` and a
+// word that is no command say the same.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, mkdtempSync, mkdirSync, copyFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,5 +97,53 @@ for (const [mode, f] of [["node", "test/node/echo.hf"], ["node", "compiler/main.
   }
 }
 
-console.log(`cli port: ${compared} invocations of compile-js, node, app, eval and promote ${failed ? "NOT " : ""}matched the reference`);
+// fmt: each side formats its own copy of the same files in place (one
+// unformatted, one that does not parse); `--check` says the same names
+{
+  const cases = {
+    "messy.hf": "f :  Int -> Int\nf x   =  x + 1\n",
+    "broken.hf": "f : Int ->\n",
+    "clean.hf": "f : Int\nf = 1\n",
+  };
+  const mk = (name) => {
+    const d = join(tmp, name);
+    mkdirSync(d, { recursive: true });
+    for (const [f, t] of Object.entries(cases)) writeFileSync(join(d, f), t);
+    return d;
+  };
+  for (const check of [true, false]) {
+    compared++;
+    const rdir = mk(`fmt-ref-${check}`), pdir = mk(`fmt-port-${check}`);
+    const args = [...(check ? ["--check"] : []), ...Object.keys(cases)];
+    const r = spawnSync("node", ["--stack-size=60000", join(root, "bin", "heff.mjs"), "fmt", ...args], { cwd: rdir, encoding: "utf8" });
+    const p = portIn(pdir, "fmt", ...args);
+    const what = `fmt${check ? " --check" : ""}`;
+    if (p.status !== r.status) { fail(`${what} exit (reference ${r.status}, port ${p.status})`, p.stderr.split("\n").slice(0, 3).join("\n")); continue; }
+    if (p.stdout !== r.stdout) fail(`${what} stdout`, firstDiff(r.stdout, p.stdout));
+    if (p.stderr !== r.stderr) fail(`${what} stderr`, firstDiff(r.stderr, p.stderr));
+    for (const f of Object.keys(cases)) {
+      const a = readFileSync(join(rdir, f), "utf8"), b = readFileSync(join(pdir, f), "utf8");
+      if (a !== b) fail(`${what} ${f}`, firstDiff(a, b));
+    }
+  }
+  // and the repository's own files are formatted, by the port's word too
+  compared++;
+  const ls = spawnSync("bash", ["-c", "ls lib/*.hf fmt/*.hf compiler/*.hf"], { cwd: root, encoding: "utf8" });
+  const own = portIn(root, "fmt", "--check", ...ls.stdout.split("\n").filter(Boolean));
+  if (own.status !== 0) fail("fmt --check of lib/, fmt/ and compiler/", own.stdout + own.stderr.split("\n").slice(0, 3).join("\n"));
+}
+
+// help, completions, and what is no command: the same words, on the same
+// stream, with the same exit
+for (const args of [[], ["help"], ["completions", "fish"], ["no-such-command"], ["test"]]) {
+  compared++;
+  const r = heff(...args);
+  const p = portIn(root, ...args);
+  const what = args.length ? args.join(" ") : "(no arguments)";
+  if (p.status !== r.status) fail(`${what} exit (reference ${r.status}, port ${p.status})`, "");
+  if (p.stdout !== r.stdout) fail(`${what} stdout`, firstDiff(r.stdout, p.stdout));
+  if (p.stderr !== r.stderr) fail(`${what} stderr`, firstDiff(r.stderr, p.stderr));
+}
+
+console.log(`cli port: ${compared} invocations of compile-js, node, app, eval, promote, fmt, help and completions ${failed ? "NOT " : ""}matched the reference`);
 process.exit(failed ? 1 : 0);
