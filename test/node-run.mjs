@@ -77,7 +77,7 @@ writeFileSync(loop, [
   "  v <- getEnv \"X\"",
   "  loop (n - 1) (acc + 1)", "",
   "main : Co eff Unit",
-  "main = loop [io := inl stdio process] [sys := inr stdio process] 100000 0", "",
+  "main = loop (io := inl stdio process) (sys := inr stdio process) 100000 0", "",
 ].join("\n"));
 if (build(loop, "main", loopJs)) {
   const r = spawnSync("node", [loopJs], { encoding: "utf8" });

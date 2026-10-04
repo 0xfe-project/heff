@@ -527,15 +527,7 @@ atom = lazyP \_ -> do
       o <- next
       inBrackets do
         t' <- peek
-        t2 <- peekAt 1
         if t'.text == "]" then (\c -> Tup o [] [] c) <$> next
-        -- `[x := e]`: an instance argument, given by name
-        else if (t'.kind == "var" || t'.kind == "con") && t2.text == ":=" then do
-          x <- next
-          k <- next
-          e <- expr
-          c <- expectPunct "]"
-          pure (Named o x k e c)
         else do
           e <- expr
           rest <- commaSepE

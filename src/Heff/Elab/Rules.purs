@@ -188,7 +188,7 @@ resolveWanted e sp hm holeVal goal final = do
             pure true
           Left err -> conversionFail sp (txt ("the instance found, " <> one.name <> ", does not fit here")) (prettyDefEqError (displayName e.globals) err)
       [] -> failWithNote sp 41 (txt "no instance for" <+> g <+> txt "in scope")
-        (txt "bind one, `{{x : T}} -> ...`, where this is used, or give it: `[x := e]`")
+        (txt "bind one, `{{x : T}} -> ...`, where this is used, or give it: `(x := e)`")
       many -> failWithNote sp 42 (txt "more than one instance for" <+> g <+> txt "in scope:" <+> txt (Text.joinWith ", " (map _.name many)))
         (txt "they cannot be told apart by type (small values are statically opaque): give the argument explicitly")
 

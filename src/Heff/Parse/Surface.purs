@@ -634,19 +634,7 @@ atom = lazyP \_ -> do
     "kw" | t.text == "data" -> anonymousSum
     "punct" | t.text == "(" -> parens
     "punct" | t.text == "{" -> braces
-    -- `[x := e]`: the instance argument named `x`, given; a list otherwise
-    "punct" | t.text == "[" -> do
-      t1 <- peekAt 1
-      t2 <- peekAt 2
-      if (t1.kind == "var" || t1.kind == "con") && t2.kind == "sym" && t2.text == ":=" then do
-        o <- next
-        inBrackets do
-          x <- next
-          k <- next
-          e <- expr
-          c <- expectPunct "]"
-          pure (NBracket (Infix (Ident x.text (spanOf x)) (Keyword ":=" (spanOf k)) e) (spanTo o c))
-      else listOf expr
+    "punct" | t.text == "[" -> listOf expr
     _ -> throwError (diag (spanOf t) ("expected an expression, not " <> shown t))
   fields base
   where

@@ -278,9 +278,6 @@ elim :: Int -> R.Syn -> Ntn -> E R.Syn
 elim _ s (NField x sp) = pure (R.recordElim sp s x)
 -- extension: `f (x := a)` (the new syntax) gives the implicit argument `x`
 elim start s (NBrace (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> argument n
--- `f [x := e]`: the instance argument named `x`, given (those before it
--- are searched for)
-elim start s (NBracket (Infix (Ident x _) (Keyword ":=" _) n) sp) = R.functionElimNamed { start, end: sp.end } x s <$> argument n
 -- extension: `f {a}` gives an implicit argument
 elim start s (NBrace n sp) = R.functionElimImplicit { start, end: sp.end } s <$> argument n
 elim start s n = R.functionElimC (checksOnly n) { start, end: (ntnSpan n).end } s <$> argument n
