@@ -6,7 +6,8 @@
 // program does; the language server speaks on stdin, given to it.
 //
 // The standard library is the one beside bin/, told to the compiler by
-// HEFF_LIB.
+// HEFF_LIB.  HEFF_HEAP_MB, if set, bounds the thread's heap (the tests
+// run the language server under a bound, so a growth of it shows).
 import { Worker } from "node:worker_threads";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -21,7 +22,7 @@ process.env.HEFF_LIB ??= join(root, "lib");
 // (a worker's stdout is never a terminal: whether ours is, said)
 if (process.stdout.isTTY) process.env.HEFF_TTY = "1";
 const lsp = args[0] === "lsp";
-const worker = new Worker(compiler, { argv: args, resourceLimits: { stackSizeMb: 512 }, stdin: lsp });
+const worker = new Worker(compiler, { argv: args, resourceLimits: { stackSizeMb: 512, maxOldGenerationSizeMb: Number(process.env.HEFF_HEAP_MB) || undefined }, stdin: lsp });
 // (the client's messages, to the server's thread; when it ends, heff does)
 if (lsp) process.stdin.pipe(worker.stdin);
 worker.on("error", (e) => { console.error(e); process.exitCode = 1; });

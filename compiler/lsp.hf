@@ -296,13 +296,21 @@ readOpen st p = case M.lookup compareString p st.docs of
   Just d -> pure (Just d.text)
   Nothing -> readFile p
 
+keptOf : List Dr.Checked -> List Dr.Checked
+keptOf program = case last program of
+  Just c -> concatList (map Dr.lean (dropLast program)) [Dr.traceless c]
+  Nothing -> Nil
+
 -- | elaborate a document open, and publish what is wrong with it
 check : {e : HFunctor} -> St -> String -> Lsp e St
 check st f = case M.lookup compareString f st.docs of
   Nothing -> pure st
   Just d -> do
     l <- L.loadProgramWith (\p -> readOpen st p) st.lib f
-    program <- Se.cachedProgram l
+    full <- Se.cachedProgram l
+    -- (what is kept of it: the document's names with their types, for
+    -- hover; of what it imports, what a query over it needs)
+    program <- pure (keptOf full)
     publish
         d.uri
         (map (\x -> diagnostic d.text x) (diagsOf d.text program l.errors))
@@ -359,6 +367,16 @@ loadAll read lib (Cons f rest) = do
   more <- loadAll read lib rest
   pure (concatList l.sources more)
 
+-- | the files, with what each imports, elaborated as one program
+elabFiles : {e : HFunctor}
+          -> (String -> Co e (Maybe String))
+          -> String
+          -> List String
+          -> Lsp e (List Dr.Checked)
+elabFiles read lib files = do
+  sources <- loadAll read lib (nubPaths files)
+  pure (Dr.checkProgramLean (nubSources sources))
+
 -- | every file of a project (and `f`, if it is not one), with what each
 -- | imports, elaborated as one program
 elabProject : {e : HFunctor}
@@ -369,8 +387,7 @@ elabProject : {e : HFunctor}
             -> Lsp e (List Dr.Checked)
 elabProject read lib root f = do
   files <- R.projectFiles root
-  sources <- loadAll read lib (nubPaths (concatList files [f]))
-  pure (Dr.checkProgram (nubSources sources))
+  elabFiles read lib (concatList files [f])
 
 type WithProgram = { st : St, program : List Dr.Checked }
 
@@ -659,21 +676,68 @@ renamedTarget t new = case t.target.local of
         (strSlice t.target.key 0 (strLength t.target.key - strLength t.name)
          ++ new)
 
+renameVerdict : WithProgram
+              -> Pointed
+              -> String
+              -> Int
+              -> Int
+              -> List Dr.Checked
+              -> Pair St (Maybe String)
+renameVerdict before t new errorsBefore errorsAfter after =
+  (MkPair
+     before.st
+     (if errorsAfter > errorsBefore
+        then Just
+            ("renaming `"
+             ++ t.name
+             ++ "` to `"
+             ++ new
+             ++ "` would make "
+             ++ showInt (errorsAfter - errorsBefore)
+             ++ " more error(s)")
+      else if length (Q.occurrences after (renamedTarget t new) new)
+      /= length t.occurrences
+        then Just
+            ("`"
+             ++ new
+             ++ "` is already a name some of these occurrences would refer to")
+      else Nothing))
+
 -- | Why renaming would change what the program means, if it would: with
 -- | every occurrence renamed, the project is elaborated again, and the
 -- | new name must be written as often as the old one was, each time
 -- | referring to what was renamed -- not captured by a name already
 -- | there -- and no file may have more errors than it had.
+-- (the files of a program a renaming changes, and every file that
+-- imports one of them, directly or not: nothing else can have more
+-- errors, or another occurrence.  The program is in the order of its
+-- imports, so one pass finds them)
+affectedGo : List String -> List String -> List Dr.Checked -> List String
+affectedGo changed mods Nil = Nil
+affectedGo changed mods (Cons c rest) =
+  if elemBy strEq c.path changed || any (\d -> elemBy strEq d mods) c.deps
+    then Cons c.path (affectedGo changed (Cons c.module mods) rest)
+  else affectedGo changed mods rest
+
+inPaths : List String -> List Dr.Checked -> List Dr.Checked
+inPaths paths program =
+  filter (\(c : Dr.Checked) -> elemBy strEq c.path paths) program
+
 renameChecked : {e : HFunctor}
               -> St
               -> Pointed
               -> String
               -> Lsp e (Pair St (Maybe String))
 renameChecked st t new = do
-  ps <- L.pathsFor st.lib t.path
   before <- project st t.path
+  affected <-
+    pure
+      (affectedGo
+         (map (\(b : ByFile) -> b.path) (byFile t.occurrences))
+         Nil
+         before.program)
   after <-
-    elabProject
+    elabFiles
       (\p -> case textOf
          (map
             (\(b : ByFile) -> MkPair b.path (renamedText new b.occurrences))
@@ -682,27 +746,15 @@ renameChecked st t new = do
        Just txt -> pure (Just txt)
        Nothing -> readOpen st p)
       st.lib
-      ps.root
-      t.path
+      affected
   pure
-      (MkPair
-         before.st
-         (if errorCount after > errorCount before.program
-            then Just
-                ("renaming `"
-                 ++ t.name
-                 ++ "` to `"
-                 ++ new
-                 ++ "` would make "
-                 ++ showInt (errorCount after - errorCount before.program)
-                 ++ " more error(s)")
-          else if length (Q.occurrences after (renamedTarget t new) new)
-          /= length t.occurrences
-            then Just
-                ("`"
-                 ++ new
-                 ++ "` is already a name some of these occurrences would refer to")
-          else Nothing))
+      (renameVerdict
+         before
+         t
+         new
+         (errorCount (inPaths affected before.program))
+         (errorCount (inPaths affected after))
+         after)
 
 editOf : String -> Q.Occurrence -> Json
 editOf new o = obj [kv "range" (range o.source o.span), kv "newText" (jstr new)]

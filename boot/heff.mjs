@@ -17,8 +17,6 @@ const $intDiv = (a, b) => { if (b === 0n) return $abandon(); const q = a / b, r 
 const $intMod = (a, b) => { if (b === 0n) return $abandon(); const r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? r + b : r; };
 const $intEq = (a, b) => a === b ? $T : $F;
 const $intEq$c = (a) => (b) => $intEq(a, b);
-const $intShow = (a) => a.toString();
-const $intShow$c = (a) => $intShow(a);
 const $floatShow = (a) => { const s = String(a); return isNaN(s + ".0") ? s : s + ".0"; };
 const $floatFromInt = (a) => Number(a);
 const $floatSqrt = (a) => Math.sqrt(a);
@@ -91,30 +89,13 @@ const intSub = $intSub$c;
 
 const intEq = $intEq$c;
 
-const intShow = $intShow$c;
-
 const op_plus = intAdd;
 
 const op_minus = intSub;
 
 const op_eq_eq = intEq;
 
-const op_slash_eq = (a, b) => {
-  const x1 = a === b ? $T : $F;
-  switch (x1.$) {
-    case "True": {
-      return { $: "False", a: [] };
-    }
-    case "False": {
-      return { $: "True", a: [] };
-    }
-  }
-  return $nomatch(x1);
-};
-
 const op_gt = (a, b) => b < a ? $T : $F;
-
-const showInt = intShow;
 
 const compareInt = (a, b) => {
   const s = a < b ? $T : $F;
@@ -5018,6 +4999,704 @@ const computationEffect = (g, t) => {
     }
   }
   return $nomatch(t);
+};
+
+const evalElF = (r, g, c, x4, vs) => {
+  switch (x4.$) {
+    case "SLocal": {
+      const i = x4.a[0];
+      return { $: "Nom", a: [localsAt(vs, i)] };
+    }
+    case "SGlobal": {
+      const x = x4.a[0];
+      return { $: "Nom", a: [(() => {
+        const s = map_lookup(compareString$c, x, g.entries);
+        switch (s.$) {
+          case "Nothing": {
+            return $abandon();
+          }
+          case "Just": {
+            const e = s.a[0];
+            return e;
+          }
+        }
+        return $nomatch(s);
+      })().value] };
+    }
+    case "SCode": {
+      const a = x4.a[0];
+      const f = (t) => {
+        switch (t.$) {
+          case "VU": {
+            const x = t.a[0];
+            return { $: "VCode", a: [t] };
+          }
+          case "VDecode": {
+            const h = t.a[0];
+            const sp = t.a[1];
+            const u = t.a[2];
+            const described = t.a[3];
+            const el = t.a[4];
+            return $force(el);
+          }
+          case "VFunction": {
+            const x = t.a[0];
+            const x1 = t.a[1];
+            const x2 = t.a[2];
+            const x3 = t.a[3];
+            return { $: "VCode", a: [t] };
+          }
+          case "VRecord": {
+            const x = t.a[0];
+            const x1 = t.a[1];
+            const x2 = t.a[2];
+            return { $: "VCode", a: [t] };
+          }
+          case "VSum": {
+            const x = t.a[0];
+            return { $: "VCode", a: [t] };
+          }
+          case "VPrimInt": {
+            return { $: "VCode", a: [t] };
+          }
+          case "VPrimFloat": {
+            return { $: "VCode", a: [t] };
+          }
+          case "VPrimString": {
+            return { $: "VCode", a: [t] };
+          }
+          case "VPrimArray": {
+            const x = t.a[0];
+            return { $: "VCode", a: [t] };
+          }
+        }
+        return $nomatch(t);
+      };
+      const x2 = r.ty(g)(c)(a)(vs);
+      switch (x2.$) {
+        case "Nom": {
+          const x = x2.a[0];
+          return { $: "Nom", a: [f(x)] };
+        }
+        case "Describe": {
+          const x = x2.a[0];
+          return { $: "Describe", a: [f(x)] };
+        }
+        case "Become": {
+          const x = x2.a[0];
+          return { $: "Become", a: [f(x)] };
+        }
+      }
+      return $nomatch(x2);
+    }
+    case "SApp": {
+      const t0 = x4.a[0];
+      const t1 = x4.a[1];
+      const f = (f) => compiler_value_app(f, (u) => {
+        const x1 = r.el(g)({ $: "N", a: [] })(t1)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x = x1.a[0];
+            return x;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x = x1.a[0];
+            return x;
+          }
+        }
+        return $nomatch(x1);
+      });
+      const x2 = r.el(g)({ $: "N", a: [] })(t0)(vs);
+      switch (x2.$) {
+        case "Nom": {
+          const x = x2.a[0];
+          return f(x);
+        }
+        case "Describe": {
+          const x = x2.a[0];
+          return f(x);
+        }
+        case "Become": {
+          const x = x2.a[0];
+          return { $: "Become", a: [(() => {
+            const x1 = f(x);
+            switch (x1.$) {
+              case "Nom": {
+                const x3 = x1.a[0];
+                return x3;
+              }
+              case "Describe": {
+                const x11 = x1.a[0];
+                return $abandon();
+              }
+              case "Become": {
+                const x3 = x1.a[0];
+                return x3;
+              }
+            }
+            return $nomatch(x1);
+          })()] };
+        }
+      }
+      return $nomatch(x2);
+    }
+    case "SLam": {
+      const dom = x4.a[0];
+      const x42 = x4.a[1];
+      switch (x42.$) {
+        case "MkAbs": {
+          const x = x42.a[0];
+          const t = x42.a[1];
+          const x1 = { $: "VLam", a: [(u) => {
+            const x1 = r.ty(g)({ $: "N", a: [] })(dom)(vs);
+            switch (x1.$) {
+              case "Nom": {
+                const x2 = x1.a[0];
+                return x2;
+              }
+              case "Describe": {
+                const x11 = x1.a[0];
+                return $abandon();
+              }
+              case "Become": {
+                const x2 = x1.a[0];
+                return x2;
+              }
+            }
+            return $nomatch(x1);
+          }, { $: "MkClo", a: [x, vs, (vs2) => r.el(g)(c)(t)(vs2)] }] };
+          switch (c.$) {
+            case "N": {
+              return { $: "Nom", a: [x1] };
+            }
+            case "De": {
+              return { $: "Describe", a: [x1] };
+            }
+          }
+          return $nomatch(c);
+        }
+        case "AbsConst": {
+          const t = x42.a[0];
+          const x = { $: "VLam", a: [(u) => {
+            const x1 = r.ty(g)({ $: "N", a: [] })(dom)(vs);
+            switch (x1.$) {
+              case "Nom": {
+                const x = x1.a[0];
+                return x;
+              }
+              case "Describe": {
+                const x11 = x1.a[0];
+                return $abandon();
+              }
+              case "Become": {
+                const x = x1.a[0];
+                return x;
+              }
+            }
+            return $nomatch(x1);
+          }, { $: "CloConst", a: [r.el(g)(c)(t)(vs)] }] };
+          switch (c.$) {
+            case "N": {
+              return { $: "Nom", a: [x] };
+            }
+            case "De": {
+              return { $: "Describe", a: [x] };
+            }
+          }
+          return $nomatch(c);
+        }
+      }
+      return $nomatch(x42);
+    }
+    case "SCons": {
+      const fields = x4.a[0];
+      const x = { $: "VCons", a: [{ keys: fields.keys, byName: fields.byName, values: (() => {
+        const xs = fields.values;
+        return $arrayGenerate($arrayLength(xs), (i) => {
+          const t = $arrayIndex(xs, i);
+          return r.el(g)(c)(t)(vs);
+        });
+      })() }] };
+      switch (c.$) {
+        case "N": {
+          return { $: "Nom", a: [x] };
+        }
+        case "De": {
+          return { $: "Describe", a: [x] };
+        }
+      }
+      return $nomatch(c);
+    }
+    case "SProj": {
+      const t = x4.a[0];
+      const x = x4.a[1];
+      const x2 = r.el(g)({ $: "N", a: [] })(t)(vs);
+      switch (x2.$) {
+        case "Nom": {
+          const x1 = x2.a[0];
+          return compiler_value_proj(x1, x);
+        }
+        case "Describe": {
+          const x1 = x2.a[0];
+          return compiler_value_proj(x1, x);
+        }
+        case "Become": {
+          const x1 = x2.a[0];
+          return { $: "Become", a: [(() => {
+            const x11 = compiler_value_proj(x1, x);
+            switch (x11.$) {
+              case "Nom": {
+                const x3 = x11.a[0];
+                return x3;
+              }
+              case "Describe": {
+                const x111 = x11.a[0];
+                return $abandon();
+              }
+              case "Become": {
+                const x3 = x11.a[0];
+                return x3;
+              }
+            }
+            return $nomatch(x11);
+          })()] };
+        }
+      }
+      return $nomatch(x2);
+    }
+    case "STag": {
+      const x = x4.a[0];
+      const ts = x4.a[1];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SMatch": {
+      const t = x4.a[0];
+      const arms = x4.a[1];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SSpecialize": {
+      const t = x4.a[0];
+      const x = x4.a[1];
+      const t_ = x4.a[2];
+      return { $: "Nom", a: [specialize((() => {
+        const x1 = r.el(g)({ $: "N", a: [] })(t)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x2 = x1.a[0];
+            return x2;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x2 = x1.a[0];
+            return x2;
+          }
+        }
+        return $nomatch(x1);
+      })(), x, (() => {
+        const x1 = r.el(g)({ $: "N", a: [] })(t_)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x2 = x1.a[0];
+            return x2;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x2 = x1.a[0];
+            return x2;
+          }
+        }
+        return $nomatch(x1);
+      })())] };
+    }
+    case "SIs": {
+      const t = x4.a[0];
+      return { $: "Become", a: [(() => {
+        const x1 = r.el(g)({ $: "N", a: [] })(t)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x = x1.a[0];
+            return x;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x = x1.a[0];
+            return x;
+          }
+        }
+        return $nomatch(x1);
+      })()] };
+    }
+    case "SOpaque": {
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SAbandon": {
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SRec": {
+      const t = x4.a[0];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SImplicit": {
+      const x = x4.a[0];
+      const e = x4.a[1];
+      return r.el(g)(c)(e)(vs);
+    }
+    case "SPrim": {
+      const x = x4.a[0];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SMetaApp": {
+      const m = x4.a[0];
+      const idxs = x4.a[1];
+      const ty = x4.a[2];
+      return { $: "Nom", a: [(() => {
+        const sp = foldlFrom((sp) => (i) => ({ $: "SpApp", a: [sp, localsAt(vs, i)] }), 0n, { $: "SpId", a: [] }, idxs);
+        const ty1 = (() => {
+          const x1 = r.ty(g)({ $: "N", a: [] })(ty)(vs);
+          switch (x1.$) {
+            case "Nom": {
+              const x = x1.a[0];
+              return x;
+            }
+            case "Describe": {
+              const x11 = x1.a[0];
+              return $abandon();
+            }
+            case "Become": {
+              const x = x1.a[0];
+              return x;
+            }
+          }
+          return $nomatch(x1);
+        })();
+        return reflect({ $: "HMeta", a: [m] }, (u) => sp, (u) => ty1, { $: "Nothing", a: [] });
+      })()] };
+    }
+    case "SLitInt": {
+      const n = x4.a[0];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SLitFloat": {
+      const n = x4.a[0];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+    case "SLitString": {
+      const s = x4.a[0];
+      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
+    }
+  }
+  return $nomatch(x4);
+};
+
+const evalTyF = (r, g, c, x4, vs) => {
+  switch (x4.$) {
+    case "SU": {
+      const u = x4.a[0];
+      return { $: "Nom", a: [{ $: "VU", a: [u] }] };
+    }
+    case "SDecode": {
+      const t = x4.a[0];
+      const x1 = r.el(g)(c)(t)(vs);
+      switch (x1.$) {
+        case "Nom": {
+          const x = x1.a[0];
+          return { $: "Nom", a: [decodeN(x)] };
+        }
+        case "Describe": {
+          const x = x1.a[0];
+          switch (x.$) {
+            case "VNeu": {
+              const x2 = x.a[0];
+              const x3 = x.a[1];
+              const x5 = x.a[2];
+              const x6 = x.a[3];
+              const x7 = x.a[4];
+              return $abandon();
+            }
+            case "VCode": {
+              const a = x.a[0];
+              return { $: "Describe", a: [a] };
+            }
+            case "VLam": {
+              const x2 = x.a[0];
+              const x3 = x.a[1];
+              return $abandon();
+            }
+            case "VCons": {
+              const x2 = x.a[0];
+              return $abandon();
+            }
+            case "VOpaque": {
+              return $abandon();
+            }
+          }
+          return $nomatch(x);
+        }
+        case "Become": {
+          const x = x1.a[0];
+          return { $: "Become", a: [decodeN(x)] };
+        }
+      }
+      return $nomatch(x1);
+    }
+    case "SFunction": {
+      const level = x4.a[0];
+      const dom = x4.a[1];
+      const cod = x4.a[2];
+      const implicit = x4.a[3];
+      return { $: "Nom", a: [{ $: "VFunction", a: [level, (() => {
+        const x1 = r.ty(g)({ $: "N", a: [] })(dom)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x = x1.a[0];
+            return x;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x = x1.a[0];
+            return x;
+          }
+        }
+        return $nomatch(x1);
+      })(), (() => {
+        switch (cod.$) {
+          case "MkAbs": {
+            const x = cod.a[0];
+            const t = cod.a[1];
+            return { $: "MkClo", a: [x, vs, (vs2) => r.ty(g)({ $: "N", a: [] })(t)(vs2)] };
+          }
+          case "AbsConst": {
+            const t = cod.a[0];
+            return { $: "CloConst", a: [r.ty(g)({ $: "N", a: [] })(t)(vs)] };
+          }
+        }
+        return $nomatch(cod);
+      })(), implicit] }] };
+    }
+    case "SRecord": {
+      const level = x4.a[0];
+      const fieldTypes = x4.a[1];
+      return { $: "Describe", a: [{ $: "VRecord", a: [level, vs, { keys: fieldTypes.keys, byName: fieldTypes.byName, values: (() => {
+        const xs = fieldTypes.values;
+        return $arrayGenerate($arrayLength(xs), (i) => {
+          const t = $arrayIndex(xs, i);
+          return (vs2) => ({ $: "MkField", a: [(() => {
+            const x1 = r.ty(g)({ $: "N", a: [] })(t)(vs2);
+            switch (x1.$) {
+              case "Nom": {
+                const x = x1.a[0];
+                return x;
+              }
+              case "Describe": {
+                const x11 = x1.a[0];
+                return $abandon();
+              }
+              case "Become": {
+                const x = x1.a[0];
+                return x;
+              }
+            }
+            return $nomatch(x1);
+          })(), { $: "Nothing", a: [] }] });
+        });
+      })() }] }] };
+    }
+    case "SSum": {
+      const st = x4.a[0];
+      return { $: "Describe", a: [{ $: "VSum", a: [variantsMap((t) => (u) => {
+        const x1 = r.ty(g)({ $: "N", a: [] })(t)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x = x1.a[0];
+            return x;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x = x1.a[0];
+            return x;
+          }
+        }
+        return $nomatch(x1);
+      }, st)] }] };
+    }
+    case "SIsTy": {
+      const t = x4.a[0];
+      return { $: "Become", a: [(() => {
+        const x1 = r.ty(g)({ $: "N", a: [] })(t)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x = x1.a[0];
+            return x;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x = x1.a[0];
+            return x;
+          }
+        }
+        return $nomatch(x1);
+      })()] };
+    }
+    case "SPrimInt": {
+      return { $: "Nom", a: [{ $: "VPrimInt", a: [] }] };
+    }
+    case "SPrimFloat": {
+      return { $: "Nom", a: [{ $: "VPrimFloat", a: [] }] };
+    }
+    case "SPrimString": {
+      return { $: "Nom", a: [{ $: "VPrimString", a: [] }] };
+    }
+    case "SPrimArray": {
+      const a = x4.a[0];
+      return { $: "Nom", a: [{ $: "VPrimArray", a: [(() => {
+        const x1 = r.ty(g)({ $: "N", a: [] })(a)(vs);
+        switch (x1.$) {
+          case "Nom": {
+            const x = x1.a[0];
+            return x;
+          }
+          case "Describe": {
+            const x11 = x1.a[0];
+            return $abandon();
+          }
+          case "Become": {
+            const x = x1.a[0];
+            return x;
+          }
+        }
+        return $nomatch(x1);
+      })()] }] };
+    }
+  }
+  return $nomatch(x4);
+};
+
+const evaluator = $lazy(() => ({ el: (g) => (c) => (s) => (vs) => evalElF(evaluator(), g, c, s, vs), ty: (g) => (c) => (s) => (vs) => evalTyF(evaluator(), g, c, s, vs) }));
+
+const emptyScope = { len: 0n, names: { $: "Nil", a: [] }, locals: { $: "LNil", a: [] }, ctx: { $: "CEmpty", a: [] } };
+
+const bindAt = (bm, x, a, c) => {
+  const v = reflect({ $: "HLocal", a: [c.len] }, (u) => ({ $: "SpId", a: [] }), (u) => a, { $: "Nothing", a: [] });
+  return { len: c.len + 1n, names: { $: "Cons", a: [x, c.names] }, locals: { $: "LSnoc", a: [c.locals, (u) => v] }, ctx: { $: "CBind", a: [c.ctx, bm, a] } };
+};
+
+const multiBind = (x1$, x2$, s$) => {
+  for (;;) {
+    const x1 = x1$, x2 = x2$, s = s$;
+    switch (x1.$) {
+      case "Nil": {
+        return s;
+      }
+      case "Cons": {
+        const x = x1.a[0];
+        const xs = x1.a[1];
+        switch (x2.$) {
+          case "Nil": {
+            return s;
+          }
+          case "Cons": {
+            const a = x2.a[0];
+            const as = x2.a[1];
+            x1$ = xs; x2$ = as; s$ = bindAt({ $: "BDelayedBy", a: [0n] }, x, a, s); continue;
+          }
+        }
+        return $nomatch(x2);
+      }
+    }
+    return $nomatch(x1);
+  }
+};
+
+const withBound = (x, a, c, action) => action(reflect({ $: "HLocal", a: [c.len] }, (u) => ({ $: "SpId", a: [] }), (u) => a, { $: "Nothing", a: [] }))((() => {
+  const v = reflect({ $: "HLocal", a: [c.len] }, (u) => ({ $: "SpId", a: [] }), (u) => a, { $: "Nothing", a: [] });
+  return { len: c.len + 1n, names: { $: "Cons", a: [x, c.names] }, locals: { $: "LSnoc", a: [c.locals, (u) => v] }, ctx: { $: "CBind", a: [c.ctx, { $: "BDelayedBy", a: [0n] }, a] } };
+})());
+
+const leanInfo = (i) => ({ span: i.span, name: i.name, key: i.key, member: i.member, ty: (u) => "" });
+
+const emptyCore = { infos: { $: "Nil", a: [] }, recovered: { $: "Nil", a: [] }, poisoned: map_empty, metas: map_empty, nextMeta: 0n, postponed: { $: "Nil", a: [] }, trace: { $: "Nil", a: [] }, selfKey: { $: "Nothing", a: [] } };
+
+const compiler_environment_emptySt = { $: "MkSt", a: [emptyCore, { $: "Nil", a: [] }, { $: "Nil", a: [] }] };
+
+const compiler_environment_bind = (m, f, st) => {
+  const x1 = m(st);
+  switch (x1.$) {
+    case "MkPair": {
+      const x11 = x1.a[0];
+      const st1 = x1.a[1];
+      switch (x11.$) {
+        case "Left": {
+          const e = x11.a[0];
+          return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+        }
+        case "Right": {
+          const x = x11.a[0];
+          return f(x)(st1);
+        }
+      }
+      return $nomatch(x11);
+    }
+  }
+  return $nomatch(x1);
+};
+const compiler_environment_bind$c = (m) => (f) => (st) => compiler_environment_bind(m, f, st);
+
+const compiler_environment_pure = (x, st) => ({ $: "MkPair", a: [{ $: "Right", a: [x] }, st] });
+const compiler_environment_pure$c = (x) => (st) => compiler_environment_pure(x, st);
+
+const runE = (m, st) => m(st);
+
+const traceE = (span, kind, text1, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
+  switch (st.$) {
+    case "MkSt": {
+      const c = st.a[0];
+      const d = st.a[1];
+      const w = st.a[2];
+      return { $: "MkSt", a: [{ infos: c.infos, recovered: c.recovered, poisoned: c.poisoned, metas: c.metas, nextMeta: c.nextMeta, postponed: c.postponed, trace: { $: "Cons", a: [{ span: span, kind: kind, text: text1 }, c.trace] }, selfKey: c.selfKey }, d, w] };
+    }
+  }
+  return $nomatch(st);
+})()] });
+const traceE$c = (span) => (kind) => (text1) => (st) => traceE(span, kind, text1, st);
+
+const record = (i, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
+  switch (st.$) {
+    case "MkSt": {
+      const c = st.a[0];
+      const d = st.a[1];
+      const w = st.a[2];
+      return { $: "MkSt", a: [{ infos: { $: "Cons", a: [i, c.infos] }, recovered: c.recovered, poisoned: c.poisoned, metas: c.metas, nextMeta: c.nextMeta, postponed: c.postponed, trace: c.trace, selfKey: c.selfKey }, d, w] };
+    }
+  }
+  return $nomatch(st);
+})()] });
+const record$c = (i) => (st) => record(i, st);
+
+const failWith = (sp, code1, msg) => {
+  const d = { code: 300n + code1, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
 };
 
 const emptyFixities = { groups: { $: "Nil", a: [] }, above: { $: "Nil", a: [] } };
@@ -14749,600 +15428,6 @@ const printSig = (im, name, shown, t, body) => {
   }
   return $nomatch(s);
 };
-
-const evalElF = (r, g, c, x4, vs) => {
-  switch (x4.$) {
-    case "SLocal": {
-      const i = x4.a[0];
-      return { $: "Nom", a: [localsAt(vs, i)] };
-    }
-    case "SGlobal": {
-      const x = x4.a[0];
-      return { $: "Nom", a: [(() => {
-        const s = map_lookup(compareString$c, x, g.entries);
-        switch (s.$) {
-          case "Nothing": {
-            return $abandon();
-          }
-          case "Just": {
-            const e = s.a[0];
-            return e;
-          }
-        }
-        return $nomatch(s);
-      })().value] };
-    }
-    case "SCode": {
-      const a = x4.a[0];
-      const f = (t) => {
-        switch (t.$) {
-          case "VU": {
-            const x = t.a[0];
-            return { $: "VCode", a: [t] };
-          }
-          case "VDecode": {
-            const h = t.a[0];
-            const sp = t.a[1];
-            const u = t.a[2];
-            const described = t.a[3];
-            const el = t.a[4];
-            return $force(el);
-          }
-          case "VFunction": {
-            const x = t.a[0];
-            const x1 = t.a[1];
-            const x2 = t.a[2];
-            const x3 = t.a[3];
-            return { $: "VCode", a: [t] };
-          }
-          case "VRecord": {
-            const x = t.a[0];
-            const x1 = t.a[1];
-            const x2 = t.a[2];
-            return { $: "VCode", a: [t] };
-          }
-          case "VSum": {
-            const x = t.a[0];
-            return { $: "VCode", a: [t] };
-          }
-          case "VPrimInt": {
-            return { $: "VCode", a: [t] };
-          }
-          case "VPrimFloat": {
-            return { $: "VCode", a: [t] };
-          }
-          case "VPrimString": {
-            return { $: "VCode", a: [t] };
-          }
-          case "VPrimArray": {
-            const x = t.a[0];
-            return { $: "VCode", a: [t] };
-          }
-        }
-        return $nomatch(t);
-      };
-      const x2 = r.ty(g)(c)(a)(vs);
-      switch (x2.$) {
-        case "Nom": {
-          const x = x2.a[0];
-          return { $: "Nom", a: [f(x)] };
-        }
-        case "Describe": {
-          const x = x2.a[0];
-          return { $: "Describe", a: [f(x)] };
-        }
-        case "Become": {
-          const x = x2.a[0];
-          return { $: "Become", a: [f(x)] };
-        }
-      }
-      return $nomatch(x2);
-    }
-    case "SApp": {
-      const t0 = x4.a[0];
-      const t1 = x4.a[1];
-      const f = (f) => compiler_value_app(f, (u) => {
-        const x1 = r.el(g)({ $: "N", a: [] })(t1)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x = x1.a[0];
-            return x;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x = x1.a[0];
-            return x;
-          }
-        }
-        return $nomatch(x1);
-      });
-      const x2 = r.el(g)({ $: "N", a: [] })(t0)(vs);
-      switch (x2.$) {
-        case "Nom": {
-          const x = x2.a[0];
-          return f(x);
-        }
-        case "Describe": {
-          const x = x2.a[0];
-          return f(x);
-        }
-        case "Become": {
-          const x = x2.a[0];
-          return { $: "Become", a: [(() => {
-            const x1 = f(x);
-            switch (x1.$) {
-              case "Nom": {
-                const x3 = x1.a[0];
-                return x3;
-              }
-              case "Describe": {
-                const x11 = x1.a[0];
-                return $abandon();
-              }
-              case "Become": {
-                const x3 = x1.a[0];
-                return x3;
-              }
-            }
-            return $nomatch(x1);
-          })()] };
-        }
-      }
-      return $nomatch(x2);
-    }
-    case "SLam": {
-      const dom = x4.a[0];
-      const x42 = x4.a[1];
-      switch (x42.$) {
-        case "MkAbs": {
-          const x = x42.a[0];
-          const t = x42.a[1];
-          const x1 = { $: "VLam", a: [(u) => {
-            const x1 = r.ty(g)({ $: "N", a: [] })(dom)(vs);
-            switch (x1.$) {
-              case "Nom": {
-                const x2 = x1.a[0];
-                return x2;
-              }
-              case "Describe": {
-                const x11 = x1.a[0];
-                return $abandon();
-              }
-              case "Become": {
-                const x2 = x1.a[0];
-                return x2;
-              }
-            }
-            return $nomatch(x1);
-          }, { $: "MkClo", a: [x, vs, (vs2) => r.el(g)(c)(t)(vs2)] }] };
-          switch (c.$) {
-            case "N": {
-              return { $: "Nom", a: [x1] };
-            }
-            case "De": {
-              return { $: "Describe", a: [x1] };
-            }
-          }
-          return $nomatch(c);
-        }
-        case "AbsConst": {
-          const t = x42.a[0];
-          const x = { $: "VLam", a: [(u) => {
-            const x1 = r.ty(g)({ $: "N", a: [] })(dom)(vs);
-            switch (x1.$) {
-              case "Nom": {
-                const x = x1.a[0];
-                return x;
-              }
-              case "Describe": {
-                const x11 = x1.a[0];
-                return $abandon();
-              }
-              case "Become": {
-                const x = x1.a[0];
-                return x;
-              }
-            }
-            return $nomatch(x1);
-          }, { $: "CloConst", a: [r.el(g)(c)(t)(vs)] }] };
-          switch (c.$) {
-            case "N": {
-              return { $: "Nom", a: [x] };
-            }
-            case "De": {
-              return { $: "Describe", a: [x] };
-            }
-          }
-          return $nomatch(c);
-        }
-      }
-      return $nomatch(x42);
-    }
-    case "SCons": {
-      const fields = x4.a[0];
-      const x = { $: "VCons", a: [{ keys: fields.keys, byName: fields.byName, values: (() => {
-        const xs = fields.values;
-        return $arrayGenerate($arrayLength(xs), (i) => {
-          const t = $arrayIndex(xs, i);
-          return r.el(g)(c)(t)(vs);
-        });
-      })() }] };
-      switch (c.$) {
-        case "N": {
-          return { $: "Nom", a: [x] };
-        }
-        case "De": {
-          return { $: "Describe", a: [x] };
-        }
-      }
-      return $nomatch(c);
-    }
-    case "SProj": {
-      const t = x4.a[0];
-      const x = x4.a[1];
-      const x2 = r.el(g)({ $: "N", a: [] })(t)(vs);
-      switch (x2.$) {
-        case "Nom": {
-          const x1 = x2.a[0];
-          return compiler_value_proj(x1, x);
-        }
-        case "Describe": {
-          const x1 = x2.a[0];
-          return compiler_value_proj(x1, x);
-        }
-        case "Become": {
-          const x1 = x2.a[0];
-          return { $: "Become", a: [(() => {
-            const x11 = compiler_value_proj(x1, x);
-            switch (x11.$) {
-              case "Nom": {
-                const x3 = x11.a[0];
-                return x3;
-              }
-              case "Describe": {
-                const x111 = x11.a[0];
-                return $abandon();
-              }
-              case "Become": {
-                const x3 = x11.a[0];
-                return x3;
-              }
-            }
-            return $nomatch(x11);
-          })()] };
-        }
-      }
-      return $nomatch(x2);
-    }
-    case "STag": {
-      const x = x4.a[0];
-      const ts = x4.a[1];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SMatch": {
-      const t = x4.a[0];
-      const arms = x4.a[1];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SSpecialize": {
-      const t = x4.a[0];
-      const x = x4.a[1];
-      const t_ = x4.a[2];
-      return { $: "Nom", a: [specialize((() => {
-        const x1 = r.el(g)({ $: "N", a: [] })(t)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x2 = x1.a[0];
-            return x2;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x2 = x1.a[0];
-            return x2;
-          }
-        }
-        return $nomatch(x1);
-      })(), x, (() => {
-        const x1 = r.el(g)({ $: "N", a: [] })(t_)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x2 = x1.a[0];
-            return x2;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x2 = x1.a[0];
-            return x2;
-          }
-        }
-        return $nomatch(x1);
-      })())] };
-    }
-    case "SIs": {
-      const t = x4.a[0];
-      return { $: "Become", a: [(() => {
-        const x1 = r.el(g)({ $: "N", a: [] })(t)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x = x1.a[0];
-            return x;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x = x1.a[0];
-            return x;
-          }
-        }
-        return $nomatch(x1);
-      })()] };
-    }
-    case "SOpaque": {
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SAbandon": {
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SRec": {
-      const t = x4.a[0];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SImplicit": {
-      const x = x4.a[0];
-      const e = x4.a[1];
-      return r.el(g)(c)(e)(vs);
-    }
-    case "SPrim": {
-      const x = x4.a[0];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SMetaApp": {
-      const m = x4.a[0];
-      const idxs = x4.a[1];
-      const ty = x4.a[2];
-      return { $: "Nom", a: [(() => {
-        const sp = foldlFrom((sp) => (i) => ({ $: "SpApp", a: [sp, localsAt(vs, i)] }), 0n, { $: "SpId", a: [] }, idxs);
-        const ty1 = (() => {
-          const x1 = r.ty(g)({ $: "N", a: [] })(ty)(vs);
-          switch (x1.$) {
-            case "Nom": {
-              const x = x1.a[0];
-              return x;
-            }
-            case "Describe": {
-              const x11 = x1.a[0];
-              return $abandon();
-            }
-            case "Become": {
-              const x = x1.a[0];
-              return x;
-            }
-          }
-          return $nomatch(x1);
-        })();
-        return reflect({ $: "HMeta", a: [m] }, (u) => sp, (u) => ty1, { $: "Nothing", a: [] });
-      })()] };
-    }
-    case "SLitInt": {
-      const n = x4.a[0];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SLitFloat": {
-      const n = x4.a[0];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-    case "SLitString": {
-      const s = x4.a[0];
-      return { $: "Nom", a: [{ $: "VOpaque", a: [] }] };
-    }
-  }
-  return $nomatch(x4);
-};
-
-const evalTyF = (r, g, c, x4, vs) => {
-  switch (x4.$) {
-    case "SU": {
-      const u = x4.a[0];
-      return { $: "Nom", a: [{ $: "VU", a: [u] }] };
-    }
-    case "SDecode": {
-      const t = x4.a[0];
-      const x1 = r.el(g)(c)(t)(vs);
-      switch (x1.$) {
-        case "Nom": {
-          const x = x1.a[0];
-          return { $: "Nom", a: [decodeN(x)] };
-        }
-        case "Describe": {
-          const x = x1.a[0];
-          switch (x.$) {
-            case "VNeu": {
-              const x2 = x.a[0];
-              const x3 = x.a[1];
-              const x5 = x.a[2];
-              const x6 = x.a[3];
-              const x7 = x.a[4];
-              return $abandon();
-            }
-            case "VCode": {
-              const a = x.a[0];
-              return { $: "Describe", a: [a] };
-            }
-            case "VLam": {
-              const x2 = x.a[0];
-              const x3 = x.a[1];
-              return $abandon();
-            }
-            case "VCons": {
-              const x2 = x.a[0];
-              return $abandon();
-            }
-            case "VOpaque": {
-              return $abandon();
-            }
-          }
-          return $nomatch(x);
-        }
-        case "Become": {
-          const x = x1.a[0];
-          return { $: "Become", a: [decodeN(x)] };
-        }
-      }
-      return $nomatch(x1);
-    }
-    case "SFunction": {
-      const level = x4.a[0];
-      const dom = x4.a[1];
-      const cod = x4.a[2];
-      const implicit = x4.a[3];
-      return { $: "Nom", a: [{ $: "VFunction", a: [level, (() => {
-        const x1 = r.ty(g)({ $: "N", a: [] })(dom)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x = x1.a[0];
-            return x;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x = x1.a[0];
-            return x;
-          }
-        }
-        return $nomatch(x1);
-      })(), (() => {
-        switch (cod.$) {
-          case "MkAbs": {
-            const x = cod.a[0];
-            const t = cod.a[1];
-            return { $: "MkClo", a: [x, vs, (vs2) => r.ty(g)({ $: "N", a: [] })(t)(vs2)] };
-          }
-          case "AbsConst": {
-            const t = cod.a[0];
-            return { $: "CloConst", a: [r.ty(g)({ $: "N", a: [] })(t)(vs)] };
-          }
-        }
-        return $nomatch(cod);
-      })(), implicit] }] };
-    }
-    case "SRecord": {
-      const level = x4.a[0];
-      const fieldTypes = x4.a[1];
-      return { $: "Describe", a: [{ $: "VRecord", a: [level, vs, { keys: fieldTypes.keys, byName: fieldTypes.byName, values: (() => {
-        const xs = fieldTypes.values;
-        return $arrayGenerate($arrayLength(xs), (i) => {
-          const t = $arrayIndex(xs, i);
-          return (vs2) => ({ $: "MkField", a: [(() => {
-            const x1 = r.ty(g)({ $: "N", a: [] })(t)(vs2);
-            switch (x1.$) {
-              case "Nom": {
-                const x = x1.a[0];
-                return x;
-              }
-              case "Describe": {
-                const x11 = x1.a[0];
-                return $abandon();
-              }
-              case "Become": {
-                const x = x1.a[0];
-                return x;
-              }
-            }
-            return $nomatch(x1);
-          })(), { $: "Nothing", a: [] }] });
-        });
-      })() }] }] };
-    }
-    case "SSum": {
-      const st = x4.a[0];
-      return { $: "Describe", a: [{ $: "VSum", a: [variantsMap((t) => (u) => {
-        const x1 = r.ty(g)({ $: "N", a: [] })(t)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x = x1.a[0];
-            return x;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x = x1.a[0];
-            return x;
-          }
-        }
-        return $nomatch(x1);
-      }, st)] }] };
-    }
-    case "SIsTy": {
-      const t = x4.a[0];
-      return { $: "Become", a: [(() => {
-        const x1 = r.ty(g)({ $: "N", a: [] })(t)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x = x1.a[0];
-            return x;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x = x1.a[0];
-            return x;
-          }
-        }
-        return $nomatch(x1);
-      })()] };
-    }
-    case "SPrimInt": {
-      return { $: "Nom", a: [{ $: "VPrimInt", a: [] }] };
-    }
-    case "SPrimFloat": {
-      return { $: "Nom", a: [{ $: "VPrimFloat", a: [] }] };
-    }
-    case "SPrimString": {
-      return { $: "Nom", a: [{ $: "VPrimString", a: [] }] };
-    }
-    case "SPrimArray": {
-      const a = x4.a[0];
-      return { $: "Nom", a: [{ $: "VPrimArray", a: [(() => {
-        const x1 = r.ty(g)({ $: "N", a: [] })(a)(vs);
-        switch (x1.$) {
-          case "Nom": {
-            const x = x1.a[0];
-            return x;
-          }
-          case "Describe": {
-            const x11 = x1.a[0];
-            return $abandon();
-          }
-          case "Become": {
-            const x = x1.a[0];
-            return x;
-          }
-        }
-        return $nomatch(x1);
-      })()] }] };
-    }
-  }
-  return $nomatch(x4);
-};
-
-const evaluator = $lazy(() => ({ el: (g) => (c) => (s) => (vs) => evalElF(evaluator(), g, c, s, vs), ty: (g) => (c) => (s) => (vs) => evalTyF(evaluator(), g, c, s, vs) }));
 
 const arrayEmpty = $lazy(() => array_empty());
 
@@ -36467,108 +36552,6 @@ const canon = (v) => {
     }
   }
   return $nomatch(v);
-};
-
-const emptyScope = { len: 0n, names: { $: "Nil", a: [] }, locals: { $: "LNil", a: [] }, ctx: { $: "CEmpty", a: [] } };
-
-const bindAt = (bm, x, a, c) => {
-  const v = reflect({ $: "HLocal", a: [c.len] }, (u) => ({ $: "SpId", a: [] }), (u) => a, { $: "Nothing", a: [] });
-  return { len: c.len + 1n, names: { $: "Cons", a: [x, c.names] }, locals: { $: "LSnoc", a: [c.locals, (u) => v] }, ctx: { $: "CBind", a: [c.ctx, bm, a] } };
-};
-
-const multiBind = (x1$, x2$, s$) => {
-  for (;;) {
-    const x1 = x1$, x2 = x2$, s = s$;
-    switch (x1.$) {
-      case "Nil": {
-        return s;
-      }
-      case "Cons": {
-        const x = x1.a[0];
-        const xs = x1.a[1];
-        switch (x2.$) {
-          case "Nil": {
-            return s;
-          }
-          case "Cons": {
-            const a = x2.a[0];
-            const as = x2.a[1];
-            x1$ = xs; x2$ = as; s$ = bindAt({ $: "BDelayedBy", a: [0n] }, x, a, s); continue;
-          }
-        }
-        return $nomatch(x2);
-      }
-    }
-    return $nomatch(x1);
-  }
-};
-
-const withBound = (x, a, c, action) => action(reflect({ $: "HLocal", a: [c.len] }, (u) => ({ $: "SpId", a: [] }), (u) => a, { $: "Nothing", a: [] }))((() => {
-  const v = reflect({ $: "HLocal", a: [c.len] }, (u) => ({ $: "SpId", a: [] }), (u) => a, { $: "Nothing", a: [] });
-  return { len: c.len + 1n, names: { $: "Cons", a: [x, c.names] }, locals: { $: "LSnoc", a: [c.locals, (u) => v] }, ctx: { $: "CBind", a: [c.ctx, { $: "BDelayedBy", a: [0n] }, a] } };
-})());
-
-const emptyCore = { infos: { $: "Nil", a: [] }, recovered: { $: "Nil", a: [] }, poisoned: map_empty, metas: map_empty, nextMeta: 0n, postponed: { $: "Nil", a: [] }, trace: { $: "Nil", a: [] }, selfKey: { $: "Nothing", a: [] } };
-
-const compiler_environment_emptySt = { $: "MkSt", a: [emptyCore, { $: "Nil", a: [] }, { $: "Nil", a: [] }] };
-
-const compiler_environment_bind = (m, f, st) => {
-  const x1 = m(st);
-  switch (x1.$) {
-    case "MkPair": {
-      const x11 = x1.a[0];
-      const st1 = x1.a[1];
-      switch (x11.$) {
-        case "Left": {
-          const e = x11.a[0];
-          return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
-        }
-        case "Right": {
-          const x = x11.a[0];
-          return f(x)(st1);
-        }
-      }
-      return $nomatch(x11);
-    }
-  }
-  return $nomatch(x1);
-};
-const compiler_environment_bind$c = (m) => (f) => (st) => compiler_environment_bind(m, f, st);
-
-const compiler_environment_pure = (x, st) => ({ $: "MkPair", a: [{ $: "Right", a: [x] }, st] });
-const compiler_environment_pure$c = (x) => (st) => compiler_environment_pure(x, st);
-
-const runE = (m, st) => m(st);
-
-const traceE = (span, kind, text1, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
-  switch (st.$) {
-    case "MkSt": {
-      const c = st.a[0];
-      const d = st.a[1];
-      const w = st.a[2];
-      return { $: "MkSt", a: [{ infos: c.infos, recovered: c.recovered, poisoned: c.poisoned, metas: c.metas, nextMeta: c.nextMeta, postponed: c.postponed, trace: { $: "Cons", a: [{ span: span, kind: kind, text: text1 }, c.trace] }, selfKey: c.selfKey }, d, w] };
-    }
-  }
-  return $nomatch(st);
-})()] });
-const traceE$c = (span) => (kind) => (text1) => (st) => traceE(span, kind, text1, st);
-
-const record = (i, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
-  switch (st.$) {
-    case "MkSt": {
-      const c = st.a[0];
-      const d = st.a[1];
-      const w = st.a[2];
-      return { $: "MkSt", a: [{ infos: { $: "Cons", a: [i, c.infos] }, recovered: c.recovered, poisoned: c.poisoned, metas: c.metas, nextMeta: c.nextMeta, postponed: c.postponed, trace: c.trace, selfKey: c.selfKey }, d, w] };
-    }
-  }
-  return $nomatch(st);
-})()] });
-const record$c = (i) => (st) => record(i, st);
-
-const failWith = (sp, code1, msg) => {
-  const d = { code: 300n + code1, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
-  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
 };
 
 const code = (g) => ({ stx: { $: "SCode", a: [g.stx] }, val: (u) => {
@@ -81710,6 +81693,16 @@ const elabWith = (done, s, imps, thaw) => elabDirect(done, s, imps, thaw, filter
   })();
   return any($strEq$c(c.module), xs);
 }, done));
+
+const lean = (c) => {
+  const top = (() => {
+    const infos = map(leanInfo, c.top.infos);
+    return { globals: c.top.globals, diags: c.top.diags, keys: c.top.keys, broken: c.top.broken, watches: c.top.watches, tests: c.top.tests, spans: c.top.spans, infos: infos, trace: { $: "Nil", a: [] } };
+  })();
+  return { module: c.module, path: c.path, source: c.source, ntns: c.ntns, top: top, diags: c.diags, own: c.own, deps: c.deps, opens: c.opens, aliases: c.aliases, fixities: c.fixities, cached: c.cached };
+};
+
+const traceless = (c) => ({ module: c.module, path: c.path, source: c.source, ntns: c.ntns, top: { globals: c.top.globals, diags: c.top.diags, keys: c.top.keys, broken: c.top.broken, watches: c.top.watches, tests: c.top.tests, spans: c.top.spans, infos: c.top.infos, trace: { $: "Nil", a: [] } }, diags: c.diags, own: c.own, deps: c.deps, opens: c.opens, aliases: c.aliases, fixities: c.fixities, cached: c.cached });
 
 const defKind = (c, k) => {
   const it = lookupKey(c.top.globals, k);
@@ -134524,6 +134517,10 @@ const exit = (e, ev, code1) => {
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
 
+const withProject = (p, s) => ({ docs: s.docs, checked: s.checked, due: s.due, project: p, watch: s.watch, shutdown: s.shutdown, lib: s.lib });
+
+const mkProject = (root, program) => ({ root: root, program: program });
+
 const jtrue = { $: "JBool", a: [{ $: "True", a: [] }] };
 
 const jfalse = { $: "JBool", a: [{ $: "False", a: [] }] };
@@ -135122,6 +135119,36 @@ const readOpen = (e, st, p, sys, disk, wire) => {
   return $nomatch(s);
 };
 
+const keptOf = (program) => {
+  const x1 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, program);
+  const s = (() => {
+    switch (x1.$) {
+      case "Nil": {
+        return { $: "Nothing", a: [] };
+      }
+      case "Cons": {
+        const x = x1.a[0];
+        const x12 = x1.a[1];
+        return { $: "Just", a: [x] };
+      }
+    }
+    return $nomatch(x1);
+  })();
+  switch (s.$) {
+    case "Nothing": {
+      return { $: "Nil", a: [] };
+    }
+    case "Just": {
+      const c = s.a[0];
+      return concatList(map(lean, (() => {
+        const xs = drop(1n, foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, program));
+        return foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, xs);
+      })()), { $: "Cons", a: [traceless(c), { $: "Nil", a: [] }] });
+    }
+  }
+  return $nomatch(s);
+};
+
 const check = (e, st, f, sys, disk, wire) => {
   const s = map_lookup(compareString$c, f, st.docs);
   switch (s.$) {
@@ -135135,15 +135162,21 @@ const check = (e, st, f, sys, disk, wire) => {
         const c1 = cachedProgram(e, disk, x);
         return c1(hd)((x1) => {
           const c2 = (() => {
-            const ds = map((x2) => diagnostic(d.text, x2), diagsOf(d.text, x1, x.errors));
-            return notify(e, "textDocument/publishDiagnostics", { $: "JObject", a: [{ $: "Cons", a: [{ $: "MkPair", a: ["uri", { $: "JString", a: [d.uri] }] }, { $: "Cons", a: [{ $: "MkPair", a: ["diagnostics", { $: "JArray", a: [ds] }] }, { $: "Nil", a: [] }] }] }] }, sys, disk, wire);
+            const x2 = keptOf(x1);
+            return (hd1) => (k1) => k1(x2);
           })();
           return c2(hd)((x2) => {
-            const x3 = (() => {
-              const c3 = insert(compareString$c, f, { text: d.text, program: x1 }, st.checked);
-              return { docs: st.docs, checked: c3, due: st.due, project: st.project, watch: st.watch, shutdown: st.shutdown, lib: st.lib };
+            const c3 = (() => {
+              const ds = map((x3) => diagnostic(d.text, x3), diagsOf(d.text, x2, x.errors));
+              return notify(e, "textDocument/publishDiagnostics", { $: "JObject", a: [{ $: "Cons", a: [{ $: "MkPair", a: ["uri", { $: "JString", a: [d.uri] }] }, { $: "Cons", a: [{ $: "MkPair", a: ["diagnostics", { $: "JArray", a: [ds] }] }, { $: "Nil", a: [] }] }] }] }, sys, disk, wire);
             })();
-            return k(x3);
+            return c3(hd)((x3) => {
+              const x4 = (() => {
+                const c4 = insert(compareString$c, f, { text: d.text, program: x2 }, st.checked);
+                return { docs: st.docs, checked: c4, due: st.due, project: st.project, watch: st.watch, shutdown: st.shutdown, lib: st.lib };
+              })();
+              return k(x4);
+            });
           });
         });
       });
@@ -135315,28 +135348,30 @@ const loadAll = (e, read, lib, x3, sys, disk, wire) => {
   return $nomatch(x3);
 };
 
+const elabFiles = (e, read, lib, files, sys, disk, wire) => {
+  const c = loadAll(e, read, lib, nubPaths(files), sys, disk, wire);
+  return (hd) => (k) => c(hd)((x) => {
+    const x1 = (() => {
+      const sources = nubSources(x);
+      return foldl((done) => (s) => appendD(done, { $: "Cons", a: [lean(elabWith(done, s, importsGo(s.source, 0n, { $: "Nil", a: [] }), { $: "Nothing", a: [] })), { $: "Nil", a: [] }] }), { $: "Nil", a: [] }, sources);
+    })();
+    return k(x1);
+  });
+};
+
 const elabProject = (e, read, lib, root, f, sys, disk, wire) => {
   const c = (() => {
     const p = wire({ $: "ProjectFiles", a: [root, (fs1) => fs1] });
     return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
   })();
-  return (hd) => (k) => c(hd)((x) => {
-    const c1 = loadAll(e, read, lib, nubPaths(concatList(x, { $: "Cons", a: [f, { $: "Nil", a: [] }] })), sys, disk, wire);
-    return c1(hd)((x1) => {
-      const x2 = (() => {
-        const sources = nubSources(x1);
-        return foldl((done) => (s) => appendD(done, { $: "Cons", a: [elabWith(done, s, importsGo(s.source, 0n, { $: "Nil", a: [] }), { $: "Nothing", a: [] }), { $: "Nil", a: [] }] }), { $: "Nil", a: [] }, sources);
-      })();
-      return k(x2);
-    });
-  });
+  return (hd) => (k) => c(hd)((x) => elabFiles(e, read, lib, concatList(x, { $: "Cons", a: [f, { $: "Nil", a: [] }] }), sys, disk, wire)(hd)(k));
 };
 
 const mkWithProgram = (st, program) => ({ st: st, program: program });
 
 const projectAnew = (e, st, root, f, sys, disk, wire) => {
   const c = elabProject(e, (p) => readOpen(e, st, p, sys, disk, wire), st.lib, root, f, sys, disk, wire);
-  return (hd) => (k) => c(hd)((x) => k({ st: { docs: st.docs, checked: st.checked, due: st.due, project: { $: "Just", a: [{ root: root, program: x }] }, watch: st.watch, shutdown: st.shutdown, lib: st.lib }, program: x }));
+  return (hd) => (k) => c(hd)((x) => co_pure(e, mkWithProgram(withProject({ $: "Just", a: [mkProject(root, x)] }, st), x), hd, k));
 };
 
 const project = (e, st, f, sys, disk, wire) => {
@@ -135349,10 +135384,10 @@ const project = (e, st, f, sys, disk, wire) => {
       }
       case "Just": {
         const pr1 = s.a[0];
-        const s1 = pr1.root === x.root ? $T : $F;
+        const s1 = strEq(pr1.root)(x.root);
         switch (s1.$) {
           case "True": {
-            return k({ st: st, program: pr1.program });
+            return co_pure(e, mkWithProgram(st, pr1.program), hd, k);
           }
           case "False": {
             return projectAnew(e, st, x.root, f, sys, disk, wire)(hd)(k);
@@ -135963,44 +135998,104 @@ const renamedTarget = (t, _new) => {
   return $nomatch(s);
 };
 
-const renameChecked = (e, st, t, _new, sys, disk, wire) => {
-  const c = pathsFor(e, disk, st.lib, t.path);
-  return (hd) => (k) => c(hd)((x) => {
-    const c1 = project(e, st, t.path, sys, disk, wire);
-    return c1(hd)((x1) => co_bind(e, elabProject(e, (p) => {
-      const s = textOf(map((b) => ({ $: "MkPair", a: [b.path, renamedText(_new, b.occurrences)] }), byFile(t.occurrences)), p);
-      switch (s.$) {
-        case "Nothing": {
-          return readOpen(e, st, p, sys, disk, wire);
+const renameVerdict = (before, t, _new, errorsBefore, errorsAfter, after) => ({ $: "MkPair", a: [before.st, (() => {
+  const s = errorsBefore < errorsAfter ? $T : $F;
+  switch (s.$) {
+    case "True": {
+      return { $: "Just", a: ["renaming `" + (t.name + ("` to `" + (_new + ("` would make " + ((errorsAfter - errorsBefore).toString() + " more error(s)")))))] };
+    }
+    case "False": {
+      const a = (() => {
+        const xs = occurrences(after, renamedTarget(t, _new), _new);
+        return foldl((n) => (x) => n + 1n, 0n, xs);
+      })();
+      const b = foldl((n) => (x) => n + 1n, 0n, t.occurrences);
+      const x1 = a === b ? $T : $F;
+      const s1 = (() => {
+        switch (x1.$) {
+          case "True": {
+            return { $: "False", a: [] };
+          }
+          case "False": {
+            return { $: "True", a: [] };
+          }
         }
-        case "Just": {
-          const txt = s.a[0];
-          return co_pure$c(e)({ $: "Just", a: [txt] });
-        }
-      }
-      return $nomatch(s);
-    }, st.lib, x.root, t.path, sys, disk, wire), (after) => co_pure$c(e)({ $: "MkPair", a: [x1.st, (() => {
-      const s = op_gt(errorCount(after), errorCount(x1.program));
-      switch (s.$) {
+        return $nomatch(x1);
+      })();
+      switch (s1.$) {
         case "True": {
-          return { $: "Just", a: [op_plus_plus("renaming `")(op_plus_plus(t.name)(op_plus_plus("` to `")(op_plus_plus(_new)(op_plus_plus("` would make ")(op_plus_plus(showInt(op_minus(errorCount(after))(errorCount(x1.program))))(" more error(s)"))))))] };
+          return { $: "Just", a: ["`" + (_new + "` is already a name some of these occurrences would refer to")] };
         }
         case "False": {
-          const s1 = op_slash_eq(length(occurrences(after, renamedTarget(t, _new), _new)), length(t.occurrences));
-          switch (s1.$) {
-            case "True": {
-              return { $: "Just", a: [op_plus_plus("`")(op_plus_plus(_new)("` is already a name some of these occurrences would refer to"))] };
-            }
-            case "False": {
-              return { $: "Nothing", a: [] };
-            }
-          }
-          return $nomatch(s1);
+          return { $: "Nothing", a: [] };
         }
       }
-      return $nomatch(s);
-    })()] }), hd, k));
-  });
+      return $nomatch(s1);
+    }
+  }
+  return $nomatch(s);
+})()] });
+
+const affectedGo = (changed1$, mods$, x3$) => {
+  let $root, $hole = null, $at = 0;
+  for (;;) {
+    const changed1 = changed1$, mods = mods$, x3 = x3$;
+    switch (x3.$) {
+      case "Nil": {
+        const r = { $: "Nil", a: [] };
+        if ($hole) { $hole.a[$at] = r; return $root; }
+        return r;
+      }
+      case "Cons": {
+        const c = x3.a[0];
+        const rest = x3.a[1];
+        const s = (() => {
+          const s = any($strEq$c(c.path), changed1);
+          switch (s.$) {
+            case "True": {
+              return { $: "True", a: [] };
+            }
+            case "False": {
+              return any((d) => any($strEq$c(d), mods), c.deps);
+            }
+          }
+          return $nomatch(s);
+        })();
+        switch (s.$) {
+          case "True": {
+            const cell = { $: "Cons", a: [c.path, undefined] };
+            if ($hole) $hole.a[$at] = cell; else $root = cell;
+            $hole = cell; $at = 1;
+            changed1$ = changed1; mods$ = { $: "Cons", a: [c.module, mods] }; x3$ = rest; continue;
+          }
+          case "False": {
+            changed1$ = changed1; mods$ = mods; x3$ = rest; continue;
+          }
+        }
+        return $nomatch(s);
+      }
+    }
+    return $nomatch(x3);
+  }
+};
+
+const inPaths = (paths, program) => filter((c) => any($strEq$c(c.path), paths), program);
+
+const renameChecked = (e, st, t, _new, sys, disk, wire) => {
+  const c = project(e, st, t.path, sys, disk, wire);
+  return (hd) => (k) => c(hd)((x) => co_bind(e, co_pure$c(e)(affectedGo(map((b) => b.path, byFile(t.occurrences)), { $: "Nil", a: [] }, x.program)), (affected) => co_bind$c(e)(elabFiles(e, (p) => {
+    const s = textOf(map((b) => ({ $: "MkPair", a: [b.path, renamedText(_new, b.occurrences)] }), byFile(t.occurrences)), p);
+    switch (s.$) {
+      case "Nothing": {
+        return readOpen(e, st, p, sys, disk, wire);
+      }
+      case "Just": {
+        const txt = s.a[0];
+        return co_pure$c(e)({ $: "Just", a: [txt] });
+      }
+    }
+    return $nomatch(s);
+  }, st.lib, affected, sys, disk, wire))((after) => co_pure$c(e)(renameVerdict(x, t, _new, errorCount(inPaths(affected, x.program)), errorCount(inPaths(affected, after)), after))), hd, k));
 };
 
 const changesOf = (e, st, _new, x3, sys, disk, wire) => {

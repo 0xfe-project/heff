@@ -14,7 +14,8 @@ const uri = (f) => pathToFileURL(join(root, f)).href;
 const disk = (f) => readFileSync(join(root, f), "utf8");
 
 // (as vscode-languageclient starts it, with `--stdio`)
-const server = spawn("node", [join(root, "bin", "heff.mjs"), "lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"] });
+// (with a bounded heap: what it keeps must fit, on any machine)
+const server = spawn("node", [join(root, "bin", "heff.mjs"), "lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, HEFF_HEAP_MB: "1024" } });
 let buf = Buffer.alloc(0), nextId = 1, failed = 0, checks = 0;
 const waiting = new Map(), notes = [], noteWaiters = [];
 server.stdout.on("data", (chunk) => {
