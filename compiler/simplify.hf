@@ -17,25 +17,59 @@ import prelude
 budget : Int
 budget = 24
 
+-- | what a known definition, given all its arguments and none it can
+-- | compute with, came to: those arguments as its parameters, or not
+-- | inlined
+data Plain = Inlined (List String) I.Expr | NotInlined
+
 type St =
   { supply : Int
   , fuel : Int
   , defs : M.Map String I.Expr
   , safe : M.Map String Unit
   , total : M.Map String Int
+  , plain : M.Map String Plain
   }
 
 withSupply : Int -> St -> St
 withSupply n s =
-  { supply = n, fuel = s.fuel, defs = s.defs, safe = s.safe, total = s.total }
+  { supply = n
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , total = s.total
+  , plain = s.plain
+  }
 
 withFuel : Int -> St -> St
 withFuel f s =
-  { supply = s.supply, fuel = f, defs = s.defs, safe = s.safe, total = s.total }
+  { supply = s.supply
+  , fuel = f
+  , defs = s.defs
+  , safe = s.safe
+  , total = s.total
+  , plain = s.plain
+  }
+
+withPlain : String -> Plain -> St -> St
+withPlain k p s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , total = s.total
+  , plain = M.insert compareString k p s.plain
+  }
 
 withDefs : M.Map String I.Expr -> St -> St
 withDefs d s =
-  { supply = s.supply, fuel = s.fuel, defs = d, safe = s.safe, total = s.total }
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = d
+  , safe = s.safe
+  , total = s.total
+  , plain = s.plain
+  }
 
 type M a = St -> Pair a St
 
@@ -120,6 +154,7 @@ restore saved st =
   , defs = saved.defs
   , safe = saved.safe
   , total = saved.total
+  , plain = st.plain
   }
 
 copyTake : St -> Pair I.Expr Int -> Pair I.Expr St
@@ -349,6 +384,82 @@ simpF r e = case e of
     pure (EPrimCall p as')
   _ -> pure e
 
+-- | an argument that tells a body nothing to compute with
+opaque : I.Expr -> Bool
+opaque e = case e of
+  EVar _ -> True
+  EInt _ -> True
+  EFloat _ -> True
+  EStr _ -> True
+  _ -> False
+
+allOpaque : List I.Expr -> Bool
+allOpaque as = I.allI (map (\a -> opaque a) as)
+
+-- | a known definition, inlined if it may be, and the result simplified
+inlineCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
+inlineCall r f g as = do
+  mb <- known g
+  case mb of
+    Just b -> attempt (EApp f as) (r.applyTo b as)
+    Nothing -> pure (EApp f as)
+
+paramsTo : List String -> List I.Expr -> M.Map String I.Expr
+paramsTo xs as =
+  foldl (\m p -> M.insert compareString (fst p) (snd p) m) M.empty (zipL xs as)
+
+freshParam : String -> Pair (List String) Int -> Pair (List String) Int
+freshParam base (MkPair xs n) = case I.fresh base n of
+  MkPair x n2 -> MkPair (Cons x xs) n2
+
+freshParams : Int -> M (List String)
+freshParams k = \s -> case foldl
+    (\acc i -> freshParam "p" acc)
+    (MkPair Nil s.supply)
+    (range 1 k) of
+  MkPair xs n -> MkPair xs (withSupply n s)
+
+plainKey : String -> List I.Expr -> String
+plainKey g as = g ++ "/" ++ showInt (length as)
+
+-- | (taken from what was found, so long as the fuel lasted it out)
+remember : String -> Plain -> M Unit
+remember k p = \s -> MkPair MkUnit (if s.fuel > 0 then withPlain k p s else s)
+
+-- | a known definition given all its arguments, none of which it can
+-- | compute with: what the call comes to is the same whatever they are,
+-- | so it is found once -- for parameters of its own -- and kept, the
+-- | arguments put in for them where it is used again.  (Each such call
+-- | copied and simplified the body again, and most were thrown away.)
+plainCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
+plainCall r f g as = do
+  s <- get
+  case M.lookup compareString (plainKey g as) s.plain of
+    Just NotInlined -> pure (EApp f as)
+    Just (Inlined ps e) ->
+      if s.fuel > 0
+        then do
+          u <- put (withFuel (s.fuel - 1) s)
+          e2 <- copy e
+          pure (I.subst (paramsTo ps as) e2)
+      else pure (EApp f as)
+    Nothing -> do
+      ps <- freshParams (length as)
+      mb <- known g
+      case mb of
+        Just b -> do
+          e <- r.applyTo b (map (\x -> EVar x) ps)
+          if I.size e <= I.size (EApp f as) + budget
+              then do
+                u <- remember (plainKey g as) (Inlined ps e)
+                pure (I.subst (paramsTo ps as) e)
+            else do
+              st <- get
+              u <- put (restore s st)
+              u2 <- remember (plainKey g as) NotInlined
+              pure (EApp f as)
+        Nothing -> pure (EApp f as)
+
 -- | an application of simplified parts
 applyToF : SK -> I.Expr -> List I.Expr -> M I.Expr
 applyToF r f as =
@@ -379,10 +490,12 @@ applyToF r f as =
           pure (EMatch s arms')
       else pure (EApp (EMatch s arms) as)
     EGlobal g -> do
-      mb <- known g
-      case mb of
-        Just b -> attempt (EApp f as) (r.applyTo b as)
-        Nothing -> pure (EApp f as)
+      s <- get
+      case M.lookup compareString g s.defs of
+        Just (ELam xs _) ->
+          if allOpaque as && length xs == length as then plainCall r f g as
+          else inlineCall r f g as
+        _ -> inlineCall r f g as
     -- (a field of a known record, applied: judged by what the
     -- application comes to, not by the size of the field)
     EProj (EGlobal g) l -> do
@@ -478,7 +591,13 @@ simplifyDone (MkPair out st) = { defs = out, supply = st.supply }
 
 initSt : Int -> SG -> St
 initSt n0 sg =
-  { supply = n0, fuel = 0, defs = M.empty, safe = sg.safe, total = sg.total }
+  { supply = n0
+  , fuel = 0
+  , defs = M.empty
+  , safe = sg.safe
+  , total = sg.total
+  , plain = M.empty
+  }
 
 -- | each definition, in order, simplified; what is inlined is taken
 -- | simplified already
