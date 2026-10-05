@@ -80,8 +80,8 @@ try {
 
   // a type error, in the editor's text (not the file's)
   const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = not (not "x")\n';
-  open("test/modules/b.hf", bad);
-  ds = await diagnosticsOf(uri("test/modules/b.hf"));
+  open("test/modules/src/b.hf", bad);
+  ds = await diagnosticsOf(uri("test/modules/src/b.hf"));
   const at = pos(bad, '"x"');
   expect("a type error's diagnostic", ds.length === 1 && ds[0].code === "E0311" && ds[0].severity === 1 &&
     ds[0].range.start.line === at.line && ds[0].range.start.character === at.character && ds[0].range.end.character === at.character + 3 &&
@@ -89,21 +89,21 @@ try {
 
   // fixed, with a change (full sync, debounced), and non-ASCII before a name
   const good = "import a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} not (not b)\n";
-  notify("textDocument/didChange", { textDocument: { uri: uri("test/modules/b.hf"), version: 2 }, contentChanges: [{ text: good }] });
-  ds = await diagnosticsOf(uri("test/modules/b.hf"));
+  notify("textDocument/didChange", { textDocument: { uri: uri("test/modules/src/b.hf"), version: 2 }, contentChanges: [{ text: good }] });
+  ds = await diagnosticsOf(uri("test/modules/src/b.hf"));
   expect("no diagnostics once fixed", ds.length === 0, ds);
 
-  const hover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/b.hf") }, position: pos(good, "not", 1) });
+  const hover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "not", 1) });
   expect("hover past non-ASCII text", hover.result && hover.result.contents.value.includes("not : Bool -> Bool") && hover.result.contents.value.includes("(global)"), hover.result);
-  const local = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/b.hf") }, position: pos(good, "b)") });
+  const local = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "b)") });
   expect("hover on a local", local.result && local.result.contents.value.includes("b : Bool") && local.result.contents.value.includes("(local)"), local.result);
-  const nothing = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/b.hf") }, position: { line: 1, character: 0 } });
+  const nothing = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: { line: 1, character: 0 } });
   expect("hover on nothing", nothing.result === null, nothing.result);
 
   // a global of an imported module, not open: its file on disk
-  const def = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/b.hf") }, position: pos(good, "not", 1) });
-  const notAt = pos(disk("test/modules/a.hf"), "not");
-  expect("definition in another module", def.result && def.result.uri === uri("test/modules/a.hf") &&
+  const def = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "not", 1) });
+  const notAt = pos(disk("test/modules/src/a.hf"), "not");
+  expect("definition in another module", def.result && def.result.uri === uri("test/modules/src/a.hf") &&
     def.result.range.start.line === notAt.line && def.result.range.start.character === notAt.character && def.result.range.end.character === notAt.character + 3, def.result);
 
   // a global of a module imported as `A`: `A.not`
@@ -111,7 +111,7 @@ try {
   open("test/modules/qualified.hf", qualified);
   await diagnosticsOf(uri("test/modules/qualified.hf"));
   const qDef = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
-  expect("definition of a qualified name", qDef.result && qDef.result.uri === uri("test/modules/a.hf") && qDef.result.range.start.line === notAt.line, qDef.result);
+  expect("definition of a qualified name", qDef.result && qDef.result.uri === uri("test/modules/src/a.hf") && qDef.result.range.start.line === notAt.line, qDef.result);
   const qHover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
   expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.not : A.Bool -> A.Bool"), qHover.result);
 
@@ -150,11 +150,11 @@ try {
     libDef.result.range.start.line === boolAt.line && libDef.result.range.start.character === boolAt.character + 5, libDef.result);
 
   // an import's unsaved text is what the importer sees
-  open("test/modules/a.hf", "data Bool = True | False\n");
-  ds = await diagnosticsOf(uri("test/modules/a.hf"));
-  const dependent = await diagnosticsOf(uri("test/modules/b.hf"));
+  open("test/modules/src/a.hf", "data Bool = True | False\n");
+  ds = await diagnosticsOf(uri("test/modules/src/a.hf"));
+  const dependent = await diagnosticsOf(uri("test/modules/src/b.hf"));
   expect("an import's unsaved text", dependent.some((d) => d.message.includes("no such variable not")), dependent);
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hf") } });
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
 
   // in a `do` block, the name hovered, not the `bind` it is read into
   const counter = disk("examples/counter/counter.hf");
@@ -228,10 +228,10 @@ try {
   expect("references in a file", notLines && [pos(basics, "not :"), pos(basics, "not True"), pos(basics, "not False"), pos(basics, "not (not"), pos(basics, ">>> not")].every((p) => notLines.includes(p.line)) && notLines.length === 6, refs.result);
   const usesOnly = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)"), context: { includeDeclaration: false } });
   expect("references without the definition", usesOnly.result && usesOnly.result.length === 3, usesOnly.result);
-  const a = disk("test/modules/a.hf");
-  open("test/modules/a.hf", a);
-  await diagnosticsOf(uri("test/modules/a.hf"));
-  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: true } });
+  const a = disk("test/modules/src/a.hf");
+  open("test/modules/src/a.hf", a);
+  await diagnosticsOf(uri("test/modules/src/a.hf"));
+  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: true } });
   const acrossAt = across.result ? across.result.map(where) : [];
   const qNot = pos(qualified, "A.not");
   expect("references across modules", acrossAt.includes(`b.hf:${pos(good, "not", 1).line}:${pos(good, "not", 1).character}-${pos(good, "not", 1).character + 3}`) &&
@@ -239,22 +239,22 @@ try {
 
   // renaming: every occurrence, in every file; refused for a local, a
   // primitive, a name of another kind, and a name already there
-  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not True") });
+  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not True") });
   expect("prepare a rename", prep.result && prep.result.placeholder === "not" && prep.result.range.start.line === pos(a, "not True").line, prep);
   const prepLocal = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
   expect("prepare a rename of a local", prepLocal.result && prepLocal.result.placeholder === "ys", prepLocal);
   const prepPrim = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "intAdd") });
   expect("no rename of a primitive", prepPrim.error && prepPrim.error.message.includes("primitive"), prepPrim);
-  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "neg" });
+  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "neg" });
   const edits = ren.result && ren.result.changes;
-  expect("a rename", edits && edits[uri("test/modules/a.hf")].length === 3 && edits[uri("test/modules/b.hf")].length === 2 &&
+  expect("a rename", edits && edits[uri("test/modules/src/a.hf")].length === 3 && edits[uri("test/modules/src/b.hf")].length === 2 &&
     edits[uri("test/modules/qualified.hf")].length === 2 && Object.values(edits).flat().every((e) => e.newText === "neg" && e.range.end.character - e.range.start.character === 3), edits);
-  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "Not" });
+  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "Not" });
   expect("no rename to another kind of name", wrongKind.error, wrongKind);
   // (`b` defines `twice`, which would hide the imported `not` renamed to it)
-  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), newName: "twice" });
+  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "twice" });
   expect("no rename to a name already there", captured.error && captured.error.message.includes("twice"), captured);
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hf") } });
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
 
   // a local: its binder and its uses, in its equation only (`f` is bound by
   // each equation of `map`); renamed there, unless the new name would be
@@ -282,9 +282,9 @@ try {
 
   // a file changed on disk, not in the editor: told of, the project is
   // elaborated again
-  open("test/modules/a.hf", a);
-  await diagnosticsOf(uri("test/modules/a.hf"));
-  const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: false } })).result || [];
+  open("test/modules/src/a.hf", a);
+  await diagnosticsOf(uri("test/modules/src/a.hf"));
+  const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: false } })).result || [];
   const watched = "test/modules/lsp-watched.hf";
   expect("before a file is made", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
   writeFileSync(join(root, watched), "import a\n\ny : Bool\ny = not True\n");
@@ -293,7 +293,7 @@ try {
   unlinkSync(join(root, watched));
   notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 3 }] });
   expect("a file deleted on disk", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/a.hf") } });
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
 
   // a theory's field, used by the fields after it and projected
   const tRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "t -> t -> t"), context: { includeDeclaration: true } });
@@ -313,7 +313,7 @@ try {
   const shown = await note((m) => m.method === "window/showMessage", "window/showMessage");
   expect("formatting refused", Array.isArray(refused.result) && refused.result.length === 0 && shown.params.type === 2 && shown.params.message.includes("does not parse"), { refused, shown });
 
-  const unknown = await request("textDocument/codeLens", { textDocument: { uri: uri("test/modules/b.hf") } });
+  const unknown = await request("textDocument/codeLens", { textDocument: { uri: uri("test/modules/src/b.hf") } });
   expect("an unknown request", unknown.error && unknown.error.code === -32601, unknown);
 
   const down = await request("shutdown", null);

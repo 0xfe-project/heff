@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Each example is a project (examples/NAME: package.json with a "heff"
-// field, NAME.hf, index.html); this writes its app, NAME.js, with
+// Each example is a project (examples/NAME: package.hf, NAME.hf,
+// index.html); this writes its app, NAME.js, with
 // `heff compile --backend=page`, after which index.html opens as it is.  (The apps are built,
 // not kept: test/app-run.mjs runs them.)
 import { spawnSync } from "node:child_process";
@@ -13,7 +13,7 @@ const root = join(here, "..");
 let failed = 0;
 for (const name of readdirSync(here).sort()) {
   const dir = join(here, name), src = join(dir, `${name}.hf`), app = join(dir, `${name}.js`);
-  if (!existsSync(join(dir, "package.json")) || !existsSync(src)) continue;
+  if (!existsSync(join(dir, "package.hf")) || !existsSync(src)) continue;
   const r = spawnSync("node", [join(root, "output", "heff.mjs"), "compile", src, app, "--name", name, "--backend=page"], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL examples/${name}: ${r.stdout}${r.stderr}`); continue; }
   console.log(`examples/${name}/${name}.js`);

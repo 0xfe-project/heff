@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Projects (compiler/project.hf, compiler/load.hf): `heff init` makes one
+// Projects (src/heff/project.hf, src/heff/load.hf): `heff init` makes one
 // whose watches hold; a project's modules are under src/, a file outside
 // it (a test) may import the project's modules and helpers beside it,
 // what is in src/ may not import those; a module found twice, a
@@ -25,6 +25,8 @@ const made = heff("init", "hello");
 const pkg = readFileSync(join(work, "hello", "package.hf"), "utf8");
 expect("init", made.status === 0 && pkg.includes(`heff = "${version}"`) && pkg.includes(`module = "hello"`) &&
   readFileSync(join(work, "hello", ".gitignore"), "utf8").includes(".heff/"), made);
+const laid = heff("fmt", "--check", "hello/package.hf", "hello/src/hello/main.hf");
+expect("init's files are laid out", laid.status === 0, laid);
 const tested = heff("test", "hello/src/hello/main.hf");
 expect("init's main.hf", tested.status === 0 && tested.stdout.includes("1/1 expectations hold"), tested);
 const checked = heff("check", "hello/package.hf");

@@ -1,0 +1,200 @@
+-- The metavariable layer in the elaboration monad: forcing, fresh
+-- metavariables, unification entered from `Elab`, postponed problems and delayed checks
+-- settled together, unsolved metavariables reported.  `do` here is
+-- src/heff/environment.hf's `bind`.
+
+import array as A
+import heff.conversion as C
+import heff.environment
+import heff.notation
+import heff.eval as EV
+import heff.globals as G
+import heff.params as P
+import heff.readback as R
+import heff.syntax as Sx
+import heff.unify as U
+import heff.value as V
+import map as M
+import prelude
+
+force : V.V -> Elab V.V
+force v = gets (\st -> V.forceEl (core st).metas v)
+
+forceT : V.Ty -> Elab V.Ty
+forceT t = gets (\st -> V.forceTy (core st).metas t)
+
+liftStep : {a : Type}
+         -> Pair (Either C.EqErr a) ElabSt
+         -> Pair (Either Diag (Either C.EqErr a)) ElabSt
+liftStep (MkPair r st) = MkPair (Right r) st
+
+-- | a unification, from the elaboration monad: its failure is a value
+liftU : {a : Type} -> U.Unify a -> Elab (Either C.EqErr a)
+liftU u = \st -> liftStep (u st)
+
+unifyTy : G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Elab (Either C.EqErr Unit)
+unifyTy g cs a b = liftU (U.uTy g cs a b)
+
+unifyEl : G.Globals -> P.CtxShape -> V.V -> V.V -> Elab (Either C.EqErr Unit)
+unifyEl g cs a b = liftU (U.uEl g cs a b)
+
+blockedFlex : M.Map Int Unit -> V.Ty -> Bool
+blockedFlex ps a = case U.flexTy a of
+  Just (MkPair m _) -> M.member compareInt m ps
+  Nothing -> False
+
+-- | is a type one nothing can be asked of, for an error elsewhere: an
+-- | error hole's, or a metavariable an error hole kept from being solved?
+blockedTy : V.Ty -> Elab Bool
+blockedTy a0 = do
+  a <- forceT a0
+  gets (\st -> V.isErrorTy a || blockedFlex (core st).poisoned a)
+
+type Unsolved = { name : String, span : P.Span }
+
+keepUnsolved : List Unsolved -> V.MetaEntry -> List Unsolved
+keepUnsolved acc e = case e.sol of
+  Nothing -> Cons { name = e.name, span = e.span } acc
+  Just _ -> acc
+
+-- | the metavariables that were created and never solved
+unsolvedMetas : Elab (List Unsolved)
+unsolvedMetas =
+  gets (\st -> reverse (foldl keepUnsolved Nil (M.values (core st).metas)))
+
+-- Postponed problems and delayed checks
+--------------------------------------------------------------------------------
+
+keepFailed : Postponed -> Either C.EqErr Unit -> Elab Unit
+keepFailed p (Left _) =
+  modify
+    (withCore
+       (\c ->
+          setPostponed
+            (Cons
+               { shape = p.shape
+               , left = p.left
+               , right = p.right
+               , failed = True
+               }
+               c.postponed)
+            c))
+keepFailed p (Right _) = pure MkUnit
+
+retryEach : G.Globals -> List Postponed -> Elab Unit
+retryEach g Nil = pure MkUnit
+retryEach g (Cons p rest) = do
+  r <- liftU (U.uEl g p.shape p.left p.right)
+  keepFailed p r
+  retryEach g rest
+
+retryGo : G.Globals -> Int -> Elab (List Postponed)
+retryGo g fuel = do
+  ps <- gets (\st -> reverse (core st).postponed)
+  modify (withCore (setPostponed Nil))
+  retryEach g ps
+  left <- gets (\st -> (core st).postponed)
+  if length left == 0 || length left == length ps || fuel > 50
+      then pure (reverse left)
+    else retryGo g (fuel + 1)
+
+-- | Retry the postponed problems until no more are solved; a problem
+-- | that fails outright is kept, to be reported as stuck: it holds the
+-- | contradiction.
+retryPostponed : G.Globals -> Elab (List Postponed)
+retryPostponed g = retryGo g 0
+
+delayedReady : V.MetaCtx -> Bool -> Delayed ElabSt -> Bool
+delayedReady mc all (MkDelayed ty chk) =
+  all || not (U.isFlexTy (V.forceTy mc ty))
+
+runCheckOf : Delayed ElabSt -> Elab Unit
+runCheckOf (MkDelayed ty chk) = \st -> chk st
+
+runEach : List (Delayed ElabSt) -> Elab Unit
+runEach Nil = pure MkUnit
+runEach (Cons d rest) = do
+  runCheckOf d
+  runEach rest
+
+-- | Run the delayed checks whose types are now known (and those they
+-- | delay in turn); with `all`, every one, known or not.
+runDelayed : Bool -> Elab Unit
+runDelayed all = do
+  ds <- gets delayedOf
+  mc <- gets (\st -> (core st).metas)
+  if length (filter (delayedReady mc all) ds) == 0 then pure MkUnit
+    else do
+      modify
+          (withDelayed (\old -> filter (\d -> not (delayedReady mc all d)) ds))
+      -- (the state holds them newest first; they run oldest first, in
+      -- the order they were delayed)
+      runEach (reverse (filter (delayedReady mc all) ds))
+      runDelayed all
+
+anyDelayed : V.MetaCtx -> List (Delayed ElabSt) -> Bool
+anyDelayed mc Nil = False
+anyDelayed mc (Cons d rest) = delayedReady mc False d || anyDelayed mc rest
+
+resolveKept : List (Pair Bool (Wanted ElabSt)) -> List (Wanted ElabSt)
+resolveKept Nil = Nil
+resolveKept (Cons (MkPair True _) rest) = resolveKept rest
+resolveKept (Cons (MkPair False w) rest) = Cons w (resolveKept rest)
+
+resolveAny : List (Pair Bool (Wanted ElabSt)) -> Bool
+resolveAny rs = any (\(p : Pair Bool (Wanted ElabSt)) -> fst p) rs
+
+resolveTake : P.Span
+            -> (Bool -> ElabSt -> Pair (Either Diag Bool) ElabSt)
+            -> Pair (Either Diag Bool) ElabSt
+            -> Pair (Either Diag (Pair Bool (Wanted ElabSt))) ElabSt
+resolveTake sp f (MkPair (Right done) st) =
+  MkPair (Right (MkPair done (MkWanted sp f))) st
+resolveTake sp f (MkPair (Left d) st) = MkPair (Left d) st
+
+resolveOne : Bool -> Wanted ElabSt -> Elab (Pair Bool (Wanted ElabSt))
+resolveOne final (MkWanted sp f) = \st -> resolveTake sp f (f final st)
+
+resolveList : Bool
+            -> List (Wanted ElabSt)
+            -> Elab (List (Pair Bool (Wanted ElabSt)))
+resolveList final Nil = pure Nil
+resolveList final (Cons w rest) = do
+  r <- resolveOne final w
+  rs <- resolveList final rest
+  pure (Cons r rs)
+
+-- | try each waiting instance argument; `final` refuses the
+-- | ones whose goals never became determined.  Answers whether any was
+-- | found (the loop then goes again).
+resolveWanteds : Bool -> Elab Bool
+resolveWanteds final = do
+  ws <- gets wantedOf
+  if null ws then pure False
+    else do
+      modify (withWanted (\w -> Nil))
+      rs <- resolveList final ws
+      modify (withWanted (\w -> concatList w (resolveKept rs)))
+      pure (resolveAny rs)
+
+settleGo : G.Globals -> Int -> Elab (List Postponed)
+settleGo g fuel = do
+  runDelayed False
+  retryPostponed g
+  -- find the instance arguments whose goals are determined now
+  moved <- resolveWanteds False
+  ds <- gets delayedOf
+  mc <- gets (\st -> (core st).metas)
+  if (anyDelayed mc ds || moved) && fuel <= 50 then settleGo g (fuel + 1)
+    else do
+      runDelayed True
+      moved2 <- resolveWanteds True
+      retryPostponed g
+
+-- | Let the postponed problems and the delayed checks feed one another
+-- | until neither moves; then force what is left, and retry once more.
+settle : G.Globals -> Elab (List Postponed)
+settle g = settleGo g 0
+
+-- >>> length (M.values (M.insert compareInt 1 "a" M.empty))
+-- 1

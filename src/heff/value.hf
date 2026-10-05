@@ -1,0 +1,490 @@
+-- Values.  The mutual recursion of elements and types is broken as in
+-- src/heff/syntax.hf: every auxiliary former is parametric, `El` is
+-- parametric in the type it mentions, and `Ty` closes the knot
+-- (`V = El Ty`).  Fields are positional constructor arguments; lazy
+-- ones are thunks (`P.Th`, no memoization); `abandon` fires on
+-- ill-typed input only, which the elaborator never hands over.
+
+import array as A
+import heff.dict as D
+import heff.params as P
+import heff.syntax as Sx
+import map as M
+import prelude
+
+-- | a local is a de Bruijn level; a meta is an implicit argument being
+-- | inferred; an error is what did not elaborate
+data Head = HLocal Int | HGlobal String | HMeta Int | HError
+
+headIsError : Head -> Bool
+headIsError HError = True
+headIsError _ = False
+
+data Spine v
+  = SpId
+  | SpApp (Spine v) v
+  | SpProj (Spine v) String
+  | SpSpec (Spine v) String v
+
+data Locals v
+  = LNil
+  | LSnoc (Locals v) (P.Th v)
+  | LChunkSnoc (Locals v) (Array v)
+
+localsAt : {v : Type} -> Locals v -> Int -> v
+localsAt LNil i = abandon
+localsAt (LSnoc e v) i = if i == 0 then P.forceTh v else localsAt e (i - 1)
+localsAt (LChunkSnoc e vs) i =
+  if i < A.length vs then A.index vs (A.length vs - i - 1)
+  else localsAt e (i - A.length vs)
+
+snocL : {v : Type} -> Locals v -> v -> Locals v
+snocL vs v = LSnoc vs (\u -> v)
+
+-- | `Ev a`: at case N just `Nom`; at case D a description, or a
+-- | definition that turned out to be an ordinary element (`Become`)
+data Ev a = Nom a | Describe a | Become a
+
+nom : {a : Type} -> Ev a -> a
+nom (Nom x) = x
+nom (Become x) = x
+nom (Describe _) = abandon
+
+epure : {a : Type} -> P.Case -> a -> Ev a
+epure N x = Nom x
+epure De x = Describe x
+
+emap : {a b : Type} -> (a -> b) -> Ev a -> Ev b
+emap f (Nom x) = Nom (f x)
+emap f (Describe x) = Describe (f x)
+emap f (Become x) = Become (f x)
+
+-- | `f` is used at case N for `Become` (whose payload is nominative)
+ebind : {a b : Type} -> (a -> Ev b) -> Ev a -> Ev b
+ebind f (Nom x) = f x
+ebind f (Describe x) = f x
+ebind f (Become x) = Become (nom (f x))
+
+data Clo v a = MkClo String (Locals v) (Locals v -> Ev a) | CloConst (Ev a)
+
+-- | the argument is a thunk: a closure that ignores it never evaluates it
+appClo : {v a : Type} -> Clo v a -> P.Th v -> Ev a
+appClo (MkClo x vs body) v = body (LSnoc vs v)
+appClo (CloConst body) v = body
+
+cloName : {v a : Type} -> Clo v a -> Maybe String
+cloName (MkClo n _ _) = Just n
+cloName (CloConst _) = Nothing
+
+data Expansion v = IntoCons (D.Dict v) | NotApplicable
+
+-- | a record field: its type, and its value where specialized
+data FieldOf t v = MkField t (Maybe v)
+
+fieldTy : {t v : Type} -> FieldOf t v -> t
+fieldTy (MkField ty _) = ty
+
+fieldValue : {t v : Type} -> FieldOf t v -> Maybe v
+fieldValue (MkField _ v) = v
+
+-- | an element: `VNeu head spine ty expansion description`
+data El t
+  = VNeu Head (Spine (El t)) (P.Th t) (P.Th (Expansion (El t))) (P.Th
+                                                                   (Maybe
+                                                                      (El t)))
+  | VCode t
+  | VLam (P.Th t) (Clo (El t) (El t))
+  | VCons (D.Dict (Ev (El t)))
+  | VOpaque
+
+-- | a type: `VDecode head spine universe described el` (`described`:
+-- | the type the description decodes to, if any), `VFunction level dom cod implicit`,
+-- | `VRecord level capture fieldTypes`
+data Ty
+  = VU P.Universe
+  | VDecode Head (Spine (El Ty)) P.Universe (P.Th (Maybe Ty)) (P.Th (El Ty))
+  | VFunction P.Level Ty (Clo (El Ty) Ty) P.Plicity
+  | VRecord P.Level (Locals (El Ty)) (D.Dict
+                                        (Locals (El Ty) -> FieldOf Ty (El Ty)))
+  | VSum (P.Variants (P.Th Ty))
+  | VPrimInt
+  | VPrimFloat
+  | VPrimString
+  | VPrimArray Ty
+
+type V = El Ty
+
+type Field = FieldOf Ty V
+
+-- | how a type behaves under the rules
+data TB
+  = LikeU P.Universe
+  | LikeFunction P.Level Ty (Clo V Ty) P.Plicity
+  | LikeRecord P.Level (Locals V) (D.Dict (Locals V -> Field))
+  | LikeSum (P.Variants (P.Th Ty))
+  | LikeInt
+  | LikeFloat
+  | LikeString
+  | LikeArray Ty
+  | NoRules
+
+behavior : Ty -> TB
+behavior (VU u) = LikeU u
+behavior (VDecode h sp u described el) = case described MkUnit of
+  Just t -> behavior t
+  Nothing -> NoRules
+behavior (VFunction level dom cod implicit) =
+  LikeFunction level dom cod implicit
+behavior (VRecord level capture fieldTypes) =
+  LikeRecord level capture fieldTypes
+behavior (VSum st) = LikeSum st
+behavior VPrimInt = LikeInt
+behavior VPrimFloat = LikeFloat
+behavior VPrimString = LikeString
+behavior (VPrimArray a) = LikeArray a
+
+levelOf : Ty -> P.Level
+levelOf (VU u) = P.codesInto u
+levelOf (VDecode h sp u described el) = P.decodesInto u
+levelOf (VFunction level dom cod implicit) = level
+levelOf (VRecord level capture fieldTypes) = level
+levelOf (VSum st) = Small
+levelOf VPrimInt = Small
+levelOf VPrimFloat = Small
+levelOf VPrimString = Small
+levelOf (VPrimArray a) = levelOf a
+
+levelOfEv : Ev Ty -> P.Level
+levelOfEv (Nom t) = levelOf t
+levelOfEv (Describe t) = levelOf t
+levelOfEv (Become t) = levelOf t
+
+-- | the domain of a lambda's function type annotation; a metavariable
+-- | solution's lambdas are annotated with a placeholder universe instead,
+-- | which is taken as the domain itself
+lamDom : Ty -> Ty
+lamDom t = case behavior t of
+  LikeFunction level dom cod implicit -> dom
+  _ -> t
+
+coerceToFieldsMaybe : V -> Maybe (D.Dict (Ev V))
+coerceToFieldsMaybe v = case v of
+  VCons fields -> Just fields
+  VNeu h sp ty expansion desc -> case expansion MkUnit of
+    IntoCons fields -> Just (D.mapD (\f -> Nom f) fields)
+    NotApplicable -> Nothing
+  _ -> Nothing
+
+coerceToFields : V -> D.Dict (Ev V)
+coerceToFields v = case coerceToFieldsMaybe v of
+  Just fields -> fields
+  Nothing -> abandon
+
+proj : V -> String -> Ev V
+proj v x = case v of
+  VOpaque -> Nom VOpaque
+  _ -> D.elemAt (coerceToFields v) x
+
+-- | `expandRecord` makes a neutral for each field not specialized, so it
+-- | takes `reflect` (they are mutually recursive, and definitions are
+-- | sequential)
+type Reflect = Head -> P.Th (Spine V) -> P.Th Ty -> Maybe (Ev V) -> V
+
+mapMaybe : {a b : Type} -> (a -> b) -> Maybe a -> Maybe b
+mapMaybe f Nothing = Nothing
+mapMaybe f (Just x) = Just (f x)
+
+fieldVal : Reflect -> Head -> Spine V -> Maybe V -> String -> Field -> V
+fieldVal refl h sp desc x (MkField fty (Just v)) = v
+fieldVal refl h sp desc x (MkField fty Nothing) =
+  refl h (\u -> SpProj sp x) (\u -> fty) (mapMaybe (\d -> proj d x) desc)
+
+withV : {a : Type} -> V -> (V -> a) -> a
+withV v k = k v
+
+goER : Reflect
+     -> Locals V
+     -> Head
+     -> Spine V
+     -> Maybe V
+     -> List (Pair String (Locals V -> Field))
+     -> List V
+     -> List V
+goER refl vs h sp desc Nil acc = acc
+goER refl vs h sp desc (Cons (MkPair x f) rest) acc =
+  withV
+    (fieldVal refl h sp desc x (f vs))
+    (\v -> goER refl (snocL vs v) h sp desc rest (Cons v acc))
+
+expandRecordWith : Reflect
+                 -> P.Level
+                 -> Locals V
+                 -> D.Dict (Locals V -> Field)
+                 -> Head
+                 -> Spine V
+                 -> Maybe V
+                 -> D.Dict V
+expandRecordWith refl level capture fieldTypes h sp desc =
+  { keys = fieldTypes.keys
+  , byName = fieldTypes.byName
+  , values =
+      A.fromList
+        (reverse (goER refl capture h sp desc (D.toList fieldTypes) Nil))
+  }
+
+mkNeu : Reflect -> Head -> Spine V -> P.Th Ty -> Maybe V -> V
+mkNeu refl h spine ty desc =
+  VNeu
+    h
+    spine
+    ty
+    (\u -> case behavior (P.forceTh ty) of
+     LikeRecord level capture fieldTypes ->
+       IntoCons (expandRecordWith refl level capture fieldTypes h spine desc)
+     _ -> NotApplicable)
+    (\u -> desc)
+
+-- | Make a neutral, or, when the description says the name is really just
+-- | an element (`Become`), that element.  The spine is only built in the
+-- | first case, so a `Become` never forces the arguments that led to it.
+reflect : Head -> P.Th (Spine V) -> P.Th Ty -> Maybe (Ev V) -> V
+reflect h spineTh ty edesc = case edesc of
+  Just (Describe desc) ->
+    mkNeu
+      (\h2 sp2 ty2 d2 -> reflect h2 sp2 ty2 d2)
+      h
+      (P.forceTh spineTh)
+      ty
+      (Just desc)
+  Just (Become v) -> v
+  Just (Nom v) -> v
+  Nothing ->
+    mkNeu
+      (\h2 sp2 ty2 d2 -> reflect h2 sp2 ty2 d2)
+      h
+      (P.forceTh spineTh)
+      ty
+      Nothing
+
+local : Int -> Ty -> V
+local i a = reflect (HLocal i) (\u -> SpId) (\u -> a) Nothing
+
+localTh : Int -> P.Th Ty -> V
+localTh i a = reflect (HLocal i) (\u -> SpId) a Nothing
+
+-- | an error hole, of a type
+errorHole : Ty -> V
+errorHole a = reflect HError (\u -> SpId) (\u -> a) Nothing
+
+-- | is it an error hole (applied, projected), or the type it decodes?
+isError : V -> Bool
+isError v = case v of
+  VNeu h sp ty expansion desc -> headIsError h
+  VCode (VDecode h sp u described el) -> headIsError h
+  _ -> False
+
+isErrorTy : Ty -> Bool
+isErrorTy t = case t of
+  VDecode h sp u described el -> headIsError h
+  _ -> False
+
+-- | decoding a description
+decodeD : V -> Ev Ty
+decodeD (VCode a) = Describe a
+decodeD _ = abandon
+
+-- | Encoding a type as an element of its universe.  A decoded neutral
+-- | encodes back to the neutral itself, so values stay normal.
+code : Ty -> V
+code (VDecode h sp u described el) = P.forceTh el
+code t = VCode t
+
+universeOfTy : Ty -> P.Universe
+universeOfTy (VU u) = u
+universeOfTy _ = abandon
+
+decodeNeu : Head
+          -> Spine V
+          -> P.Th Ty
+          -> P.Th (Expansion V)
+          -> P.Th (Maybe V)
+          -> P.Universe
+          -> Maybe (Ev Ty)
+          -> Ty
+decodeNeu h sp ty expansion desc u decoded = case decoded of
+  Just (Describe dty) ->
+    VDecode h sp u (\x -> Just dty) (\x -> VNeu h sp ty expansion desc)
+  Just (Become dty) -> dty
+  Just (Nom dty) -> dty
+  Nothing -> VDecode h sp u (\x -> Nothing) (\x -> VNeu h sp ty expansion desc)
+
+-- | decoding an element of case N
+decodeN : V -> Ty
+decodeN (VCode a) = a
+decodeN (VNeu h sp ty expansion desc) =
+  decodeNeu
+    h
+    sp
+    ty
+    expansion
+    desc
+    (universeOfTy (P.forceTh ty))
+    (mapMaybe decodeD (desc MkUnit))
+decodeN _ = abandon
+
+-- | the type an error hole of a universe decodes to
+errorTy : P.Universe -> Ty
+errorTy u = decodeN (errorHole (VU u))
+
+decodeEv : Ev V -> Ev Ty
+decodeEv (Nom x) = Nom (decodeN x)
+decodeEv (Describe x) = decodeD x
+decodeEv (Become x) = Become (decodeN x)
+
+appTy : Ty -> P.Th V -> Ty
+appTy t arg = case behavior t of
+  LikeFunction level dom cod implicit -> nom (appClo cod arg)
+  _ -> abandon
+
+-- | the type of a neutral applied; a metavariable's stays what it is
+-- | past its arity
+neuAppTy : Head -> Ty -> P.Th V -> Ty
+neuAppTy h t arg = case h of
+  HMeta m -> case behavior t of
+    LikeFunction level dom cod implicit -> appTy t arg
+    _ -> t
+  _ -> appTy t arg
+
+app : V -> P.Th V -> Ev V
+app f arg = case f of
+  VLam fty clo -> appClo clo arg
+  VNeu h sp ty expansion desc ->
+    Nom
+      (reflect
+         h
+         (\u -> SpApp sp (P.forceTh arg))
+         (\u -> neuAppTy h (P.forceTh ty) arg)
+         (mapMaybe (\d -> app d arg) (desc MkUnit)))
+  VOpaque -> Nom VOpaque
+  _ -> abandon
+
+setFieldValue : V -> (Locals V -> Field) -> Locals V -> Field
+setFieldValue v field vs = case field vs of
+  MkField ty _ -> MkField ty (Just v)
+
+addSpecialization : P.Level
+                  -> Locals V
+                  -> D.Dict (Locals V -> Field)
+                  -> String
+                  -> V
+                  -> Ty
+addSpecialization level capture fieldTypes x v =
+  VRecord
+    level
+    capture
+    (D.update fieldTypes x (\field -> setFieldValue v field))
+
+specialize : V -> String -> V -> V
+specialize v x f = case v of
+  VNeu h sp ty expansion desc -> case desc MkUnit of
+    Just (VCode (VRecord level capture fieldTypes)) ->
+      VNeu
+        h
+        (SpSpec sp x f)
+        ty
+        expansion
+        (\u -> Just (VCode (addSpecialization level capture fieldTypes x f)))
+    _ -> abandon
+  _ -> abandon
+
+-- Metavariables
+--------------------------------------------------------------------------------
+
+-- | `solStx` is the solution as syntax, closed, under one binder per
+-- | local the metavariable was applied to
+type MetaEntry =
+  { ty : Ty
+  , sol : Maybe V
+  , solStx : Maybe Sx.Tm
+  , arity : Int
+  , name : String
+  , span : P.Span
+  }
+
+type MetaCtx = M.Map Int MetaEntry
+
+-- | a metavariable applied to the locals in scope where it was created
+metaEl : Int -> Spine V -> Ty -> V
+metaEl m sp ty = reflect (HMeta m) (\u -> sp) (\u -> ty) Nothing
+
+replay : V -> Spine V -> V
+replay v SpId = v
+replay v (SpApp sp a) = nom (app (replay v sp) (\u -> a))
+replay v (SpProj sp l) = nom (proj (replay v sp) l)
+replay v (SpSpec sp l f) = specialize (replay v sp) l f
+
+solutionOf : MetaCtx -> Int -> Maybe V
+solutionOf mc m = case M.lookup compareInt m mc of
+  Just e -> e.sol
+  Nothing -> Nothing
+
+-- | a solved metavariable at the head replaced by its solution
+forceEl : MetaCtx -> V -> V
+forceEl mc v = case v of
+  VNeu (HMeta m) sp ty expansion desc -> case solutionOf mc m of
+    Just sol -> forceEl mc (replay sol sp)
+    Nothing -> v
+  _ -> v
+
+forceTy : MetaCtx -> Ty -> Ty
+forceTy mc t = case t of
+  VDecode (HMeta m) sp u described el -> case solutionOf mc m of
+    Just sol -> forceTy mc (decodeN (forceEl mc (replay sol sp)))
+    Nothing -> t
+  _ -> t
+
+-- Projection types
+--------------------------------------------------------------------------------
+
+typeForProjection : Locals V
+                  -> D.Dict (Locals V -> Field)
+                  -> String
+                  -> D.Dict V
+                  -> Field
+typeForProjection capture fieldTypes x fields =
+  (D.at fieldTypes (D.keyIndex fieldTypes x))
+    (LChunkSnoc
+       capture
+       (A.generate (D.keyIndex fieldTypes x) (\j -> A.index fields.values j)))
+
+projTy : Ty -> V -> String -> Ty
+projTy t v x = case behavior t of
+  LikeRecord level capture fieldTypes ->
+    fieldTy
+      (typeForProjection
+         capture
+         fieldTypes
+         x
+         (D.mapD (\e -> nom e) (coerceToFields v)))
+  _ -> abandon
+
+projTyMaybe : Ty -> V -> String -> Maybe Ty
+projTyMaybe t v x = case behavior t of
+  LikeRecord level capture fieldTypes -> case coerceToFieldsMaybe v of
+    Just fields ->
+      Just
+        (fieldTy
+           (typeForProjection
+              capture
+              fieldTypes
+              x
+              (D.mapD (\e -> nom e) fields)))
+    Nothing -> Nothing
+  _ -> Nothing
+
+-- >>> localsAt (LSnoc (LSnoc LNil (\u -> 10)) (\u -> 20)) 0
+-- 20
+-- >>> localsAt (LChunkSnoc (LSnoc LNil (\u -> 10)) (arrayFromList [1, 2, 3])) 0
+-- 3
+-- >>> levelOf (VFunction Small VPrimInt (CloConst (Nom VPrimInt)) Expl)
+-- Small

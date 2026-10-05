@@ -1,0 +1,1536 @@
+-- Top-level elaboration: notation becomes
+-- judgments (the dispatcher's functions are one knot record, `tk`),
+-- declarations become globals, each elaborated in a fresh state; a
+-- definition whose body fails is an error hole of its type.  A watch
+-- (`-- >>> e`) elaborates to an entry of its own, kept aside.
+
+import array as A
+import heff.clauses as Cl
+import heff.conversion as C
+import heff.dict as D
+import heff.environment
+import heff.globals as G
+import heff.memoed as M
+import heff.meta as Mt
+import heff.notation
+import heff.params as Pm
+import heff.prims as Pi
+import heff.print as Pr
+import heff.psurface as Ps
+import heff.readback as Rb
+import heff.rename as Rnm
+import heff.rules as R
+import heff.surface as Su
+import heff.syntax as Sx
+import heff.top as T
+import heff.unify as U
+import heff.value as V
+import map as Mp
+import prelude
+
+-- Diagnostics (parser codes are numbered from 200)
+--------------------------------------------------------------------------------
+
+failP : {a : Type} -> Pm.Span -> Int -> String -> Elab a
+failP sp code msg =
+  throwE
+    { code = 200 + code
+    , severity = SError
+    , msg = msg
+    , span = sp
+    , note = Nothing
+    }
+
+unexpectedNotation : {a : Type} -> Ntn -> String -> Elab a
+unexpectedNotation n c = failP (ntnSpan n) 3 ("unexpected notation for " ++ c)
+
+tryStep : {a : Type}
+        -> Pair (Either Diag a) ElabSt
+        -> Pair (Either Diag (Either Diag a)) ElabSt
+tryStep (MkPair r st) = MkPair (Right r) st
+
+-- | a computation, its failure as a value (the state kept either way)
+tryE : {a : Type} -> Elab a -> Elab (Either Diag a)
+tryE m = \st -> tryStep (m st)
+
+-- The self, as local 0
+--------------------------------------------------------------------------------
+
+type SL = { el : Int -> Sx.Tm -> Sx.Tm, ty : Int -> Sx.Ty -> Sx.Ty }
+
+selfTermF : SL -> String -> Int -> Sx.Tm -> Sx.Tm
+selfTermF r k d t = case t of
+  SGlobal x -> if strEq x k then SLocal d else SGlobal x
+  SCode a -> SCode (r.ty d a)
+  SApp f a -> SApp (r.el d f) (r.el d a)
+  SLam dom (MkAbs x b) -> SLam (r.ty d dom) (MkAbs x (r.el (d + 1) b))
+  SLam dom (AbsConst b) -> SLam (r.ty d dom) (AbsConst (r.el d b))
+  SCons c -> SCons (D.mapD (r.el d) c)
+  SProj e l -> SProj (r.el d e) l
+  STag tg as -> STag tg (A.map (r.el d) as)
+  SMatch e cs ->
+    SMatch
+      (r.el d e)
+      (D.mapD
+         (\p -> case p of
+          MkPair xs b -> MkPair xs (r.el (d + A.length xs) b))
+         cs)
+  SSpecialize e l v -> SSpecialize (r.el d e) l (r.el d v)
+  SIs e -> SIs (r.el d e)
+  SRec e -> SRec (r.el d e)
+  SImplicit x e -> SImplicit x (r.el d e)
+  SMetaApp m ix ty2 -> SMetaApp m ix (r.ty d ty2)
+  _ -> t
+
+selfTypeF : SL -> String -> Int -> Sx.Ty -> Sx.Ty
+selfTypeF r k d t = case t of
+  SDecode e -> SDecode (r.el d e)
+  SFunction level dom (MkAbs x b) implicit ->
+    SFunction level (r.ty d dom) (MkAbs x (r.ty (d + 1) b)) implicit
+  SFunction level dom (AbsConst b) implicit ->
+    SFunction level (r.ty d dom) (AbsConst (r.ty d b)) implicit
+  SRecord level ft -> SRecord level (D.mapD (r.ty d) ft)
+  SSum vs -> SSum (D.mapD (A.map (r.ty d)) vs)
+  SIsTy a -> SIsTy (r.ty d a)
+  SPrimArray a -> SPrimArray (r.ty d a)
+  _ -> t
+
+selfWalk : String -> SL
+selfWalk k =
+  { el = \d t -> selfTermF (selfWalk k) k d t
+  , ty = \d t -> selfTypeF (selfWalk k) k d t
+  }
+
+-- | the global it was mentioned as, while it was not yet one: the
+-- | definition itself, local 0
+selfAsLocal : String -> Sx.Tm -> Sx.Tm
+selfAsLocal k t = (selfWalk k).el 0 t
+
+-- Judgments from notation
+--------------------------------------------------------------------------------
+
+data Judgment = ChkJ R.Chk | SynJ R.Syn | TypJ R.Typ
+
+fromSynN : Pm.Case -> R.Syn -> Judgment
+fromSynN N j = SynJ j
+fromSynN De j =
+  SynJ
+    (MkSyn (\e -> do
+     pr <- R.runSyn j (R.withFor e ForNominative)
+     case pr of
+       MkPair res a -> pure (MkPair (M.isM res) a)))
+
+fromChkN : Pm.Case -> R.Chk -> Judgment
+fromChkN N j = ChkJ j
+fromChkN De j =
+  ChkJ
+    (MkChk (\e a -> do
+     res <- R.runChk j (R.withFor e ForNominative) a
+     pure (M.isM res)))
+
+fromTypN : Pm.Case -> R.Typ -> Judgment
+fromTypN N j = TypJ j
+fromTypN De j =
+  TypJ
+    (MkTyp (\e -> do
+     res <- R.runTyp j (R.withFor e ForNominative)
+     pure (M.isTy res)))
+
+fromTypD : Pm.Case -> Pm.Span -> R.Typ -> Elab Judgment
+fromTypD N sp j = failP sp 4 "cannot use descriptive syntax in nominal position"
+fromTypD De sp j = pure (TypJ j)
+
+-- | notation that can only be checked, never synthesised
+checksOnly : Ntn -> Bool
+checksOnly n = case (getGroup n).head of
+  At (NTag _) _ -> True
+  At (NBlock "struct" _ _) _ -> True
+  At (NBlock "match" _ _) _ -> True
+  At (NTuple _) _ -> True
+  At (Keyword "abandon") _ -> True
+  At (Infix _ (At (Keyword "=>") _) _) _ -> True
+  _ -> False
+
+implicitLambda : Ntn -> Bool
+implicitLambda (At (Infix (At (NBrace _) _) (At (Keyword "=>") _) _) _) = True
+implicitLambda _ = False
+
+intoSyn : Pm.Span -> Judgment -> Elab R.Syn
+intoSyn sp (ChkJ _) =
+  failP sp 0 "this notation must be put in a checking position"
+intoSyn sp (SynJ j) = pure j
+intoSyn sp (TypJ _) =
+  failP sp 0 "a type used as an element must be in checking position"
+
+-- | the dispatcher's functions, knotted
+type TK =
+  { parseJ : Pm.Case -> Ntn -> Elab Judgment
+  , chkJ : Pm.Case -> Ntn -> Elab R.Chk
+  , synJ : Pm.Case -> Ntn -> Elab R.Syn
+  , typJ : Pm.Case -> Ntn -> Elab R.Typ
+  }
+
+-- | a check, recovered from where it fails -- where its notation is not
+-- | read, too
+recoveringChk : Elab R.Chk -> Elab R.Chk
+recoveringChk m = do
+  r <- tryE m
+  case r of
+    Right c -> pure (R.recovering c)
+    Left d -> pure (R.recovering (MkChk (\e a -> throwE d)))
+
+-- | an argument: where it does not check, an error hole
+argumentF : TK -> Ntn -> Elab R.Chk
+argumentF tk n = recoveringChk (tk.chkJ N n)
+
+-- | an application to `n`, from `start` (where the function is) to it
+elimF : TK -> Int -> R.Syn -> Ntn -> Elab R.Syn
+elimF tk start s (At (NField x) sp) = pure (R.recordElim sp s x)
+elimF tk start s (At (NBrace (At (Infix (At (Ident x) _) (At (Keyword ":=") _) n) _)) sp) = do
+  a <- argumentF tk n
+  pure (R.functionElimNamed { start = start, end = sp.end } x s a)
+elimF tk start s (At (NBrace n) sp) = do
+  a <- argumentF tk n
+  pure (R.functionElimImplicit { start = start, end = sp.end } s a)
+elimF tk start s n = do
+  a <- argumentF tk n
+  pure
+      (R.functionElimC
+         (checksOnly n)
+         { start = start, end = (ntnSpan n).end }
+         s
+         a)
+
+elimAll : TK -> Int -> R.Syn -> List Ntn -> Elab R.Syn
+elimAll tk start s Nil = pure s
+elimAll tk start s (Cons n rest) = do
+  s' <- elimF tk start s n
+  elimAll tk start s' rest
+
+binderF : TK -> Ntn -> Elab R.Binder
+binderF tk (At (Infix (At (Ident x) _) (At (Keyword ":") _) n) _) = do
+  t <- tk.typJ N n
+  pure (Named x t)
+binderF tk (At (NBracket (At (Infix (At (Ident x) _) (At (Keyword ":") _) n) _)) sp) = do
+  t <- tk.typJ N n
+  pure (NamedInstance sp x t)
+binderF tk (At (NBrace (At (Infix (At (Ident x) _) (At (Keyword ":") _) n) _)) sp) = do
+  t <- tk.typJ N n
+  pure (NamedImplicit sp x t)
+binderF tk n = do
+  t <- tk.typJ N n
+  pure (Anonymous t)
+
+fieldDeclF : TK -> Ntn -> Elab R.FieldDeclaration
+fieldDeclF tk (At (Infix (At (Ident x) _) (At (Keyword ":") _) n) _) = do
+  a <- tk.typJ N n
+  pure { name = x, typ = a }
+fieldDeclF tk n =
+  failP (ntnSpan n) 1 "expected a field declaration of the form `x : A`"
+
+fieldSetF : TK -> Pm.Case -> Ntn -> Elab R.FieldSetting
+fieldSetF tk c (At (Infix (At (Ident x) xsp) (At (Keyword ":=") _) n) _) = do
+  v <- recoveringChk (tk.chkJ c n)
+  pure { name = x, chk = v, span = ntnSpan n, nameSpan = xsp }
+fieldSetF tk c n =
+  failP (ntnSpan n) 2 "expected a field setting of the form `x = v`"
+
+traverseEL : {a b : Type} -> (a -> Elab b) -> List a -> Elab (List b)
+traverseEL f Nil = pure Nil
+traverseEL f (Cons x xs) = do
+  y <- f x
+  ys <- traverseEL f xs
+  pure (Cons y ys)
+
+smallF : TK -> Ntn -> Elab R.SmallTyp
+smallF tk n = do
+  t <- tk.typJ N n
+  pure (R.asSmall (ntnSpan n) t)
+
+variantF : TK -> Ntn -> Elab (Pair String (Array R.SmallTyp))
+variantF tk n = case (getGroup n).head of
+  At (NTag x) _ -> do
+    typs <- traverseEL (\m -> smallF tk m) (getGroup n).args
+    pure (MkPair x (A.fromList typs))
+  _ -> unexpectedNotation n "variant in a sum type"
+
+foldlR : {a b : Type} -> (a -> b -> b) -> b -> List a -> b
+foldlR f z Nil = z
+foldlR f z (Cons x xs) = f x (foldlR f z xs)
+
+doBind : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
+doBind sp e x rest =
+  juxt (juxt (At (Ident "bind") sp) e) (infixOp x (At (Keyword "=>") sp) rest)
+
+doStep : Pm.Span -> Ntn -> Ntn -> Ntn
+doStep sp (At (Infix x (At (Keyword "<-") _) e) _) rest = doBind sp e x rest
+doStep sp e rest = doBind sp e (At (Ident "_") sp) rest
+
+doLast : Pm.Span -> List Ntn -> Ntn -> Maybe Ntn
+doLast sp init (At (Infix _ (At (Keyword "<-") _) _) _) = Nothing
+doLast sp init last = Just (foldlR (\s rest -> doStep sp s rest) last init)
+
+-- | `do` ... with whichever `bind` is in scope
+doBlock : Pm.Span -> List Ntn -> Maybe Ntn
+doBlock sp stmts = case reverse stmts of
+  Nil -> Nothing
+  Cons last init -> doLast sp (reverse init) last
+
+-- | a whole value needs no new name: it is in hand already
+bareAltRefused : {a : Type} -> String -> Pm.Span -> Elab a
+bareAltRefused x sp =
+  failP
+    sp
+    3
+    ("`"
+     ++ x
+     ++ "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already")
+
+patName : Ntn -> Elab String
+patName (At (Ident x) _) = pure x
+patName p =
+  failP (ntnSpan p) 3 "an argument of a `case` pattern is a pattern or a name"
+
+doPat : Ntn -> Elab (Pair String (List String))
+doPat n = case (getGroup n).head of
+  At (NTag x) _ -> do
+    xs <- traverseEL (\p -> patName p) (getGroup n).args
+    pure (MkPair x xs)
+  -- extension: `_ => e` handles every tag not listed
+  At (Ident x) sp ->
+    if strEq x "_" && length (getGroup n).args == 0 then pure (MkPair "_" Nil)
+    else bareAltRefused x sp
+  _ ->
+    failP
+      (ntnSpan n)
+      3
+      "a `case` pattern is a pattern: a tag applied to patterns, a literal, or `_`"
+
+doCase : TK -> Ntn -> Elab (Pair String (Pair (Array String) R.Chk))
+doCase tk (At (Infix p (At (Keyword "=>") _) bodyN) _) = do
+  px <- doPat p
+  case px of
+    MkPair x xs -> do
+      body <- recoveringChk (tk.chkJ N bodyN)
+      pure (MkPair x (MkPair (A.fromList xs) body))
+doCase tk n = unexpectedNotation n "case in a match statement"
+
+specializationF : TK -> Ntn -> Elab (Pair String R.Chk)
+specializationF tk (At (NTuple (Cons (At (Infix (At (NField x) _) (At (Keyword ":=") _) n) _) Nil)) _) = do
+  c <- tk.chkJ N n
+  pure (MkPair x c)
+specializationF tk n = unexpectedNotation n "specialization"
+
+allL : {a : Type} -> (a -> Bool) -> List a -> Bool
+allL p Nil = True
+allL p (Cons x xs) = p x && allL p xs
+
+isIdentA : Ntn -> Bool
+isIdentA (At (Ident _) _) = True
+isIdentA _ = False
+
+flatPat : Group -> Bool
+flatPat gr = case gr.head of
+  At (NTag _) _ -> allL isIdentA gr.args
+  At (Ident _) _ -> length gr.args == 0
+  _ -> False
+
+-- | flat: a tag applied to names, or `_`; anything else goes through the
+-- | match-tree compiler
+flatCaseAlt : Ntn -> Bool
+flatCaseAlt (At (Infix p (At (Keyword "=>") _) _) _) = flatPat (getGroup p)
+flatCaseAlt _ = True
+
+tagSpanOf : Ntn -> List (Pair String Pm.Span) -> List (Pair String Pm.Span)
+tagSpanOf p acc = case (getGroup p).head of
+  At (NTag x) tsp -> Cons (MkPair x tsp) acc
+  _ -> acc
+
+tagSpans : List Ntn -> List (Pair String Pm.Span)
+tagSpans Nil = Nil
+tagSpans (Cons (At (Infix p (At (Keyword "=>") _) _) _) rest) =
+  tagSpanOf p (tagSpans rest)
+tagSpans (Cons _ rest) = tagSpans rest
+
+checkBareOne : Group -> Elab Unit
+checkBareOne gr = case gr.head of
+  At (Ident x) xsp ->
+    if length gr.args == 0 && not (strEq x "_") then bareAltRefused x xsp
+    else pure MkUnit
+  _ -> pure MkUnit
+
+checkBareAlts : List Ntn -> Elab Unit
+checkBareAlts Nil = pure MkUnit
+checkBareAlts (Cons (At (Infix p (At (Keyword "=>") _) _) _) rest) = do
+  checkBareOne (getGroup p)
+  checkBareAlts rest
+checkBareAlts (Cons _ rest) = checkBareAlts rest
+
+-- Operators in patterns
+--------------------------------------------------------------------------------
+
+-- | the lambdas a body opens with, and what is under them (and under
+-- | its mark of case D)
+lamsOf : Int -> Sx.Tm -> Pair Int Sx.Tm
+lamsOf n (SLam _ (MkAbs _ b)) = lamsOf (n + 1) b
+lamsOf n (SLam _ (AbsConst b)) = lamsOf (n + 1) b
+lamsOf n (SIs b) = lamsOf n b
+lamsOf n b = MkPair n b
+
+absBody : Sx.Abs Sx.Ty -> Sx.Ty
+absBody (MkAbs _ t) = t
+absBody (AbsConst t) = t
+
+-- | a function type's implicit parameters, then its explicit ones: how
+-- | many of each (`Nothing` if they are mixed otherwise)
+paramsOf : Int -> Int -> Sx.Ty -> Maybe (Pair Int Int)
+paramsOf i e (SFunction _ _ cod Impl) =
+  if e > 0 then Nothing else paramsOf (i + 1) e (absBody cod)
+paramsOf i e (SFunction _ _ cod Expl) = paramsOf i (e + 1) (absBody cod)
+paramsOf i e (SFunction _ _ _ Inst) = Nothing
+paramsOf i e _ = Just (MkPair i e)
+
+-- | the arguments are the variables of the last `k` lambdas, in order
+paramsInOrder : Int -> Int -> List Sx.Tm -> Bool
+paramsInOrder k i Nil = i == k
+paramsInOrder k i (Cons (SLocal j) rest) =
+  j == k - 1 - i && paramsInOrder k (i + 1) rest
+paramsInOrder k i _ = False
+
+-- | `(op) x y = C x y`: the tag an operator is another name for, and how
+-- | many arguments it takes
+tagSynonym : G.Entry -> Maybe (Pair String Int)
+tagSynonym ge = case paramsOf 0 0 ge.tySyntax of
+  Just (MkPair i k) -> case lamsOf 0 ge.syntax of
+    MkPair n (STag t args) ->
+      if n == i + k && paramsInOrder k 0 (A.toList args) then Just (MkPair t k)
+      else Nothing
+    _ -> Nothing
+  Nothing -> Nothing
+
+notTagSynonym : {a : Type} -> String -> Pm.Span -> Elab a
+notTagSynonym x sp =
+  failP
+    sp
+    3
+    ("`"
+     ++ x
+     ++ "` is not another name for a tag, so no pattern can use it: an operator in a pattern is defined as one, `("
+     ++ x
+     ++ ") x y = C x y`")
+
+-- | an operator applied, `x :: xs`, in a pattern
+hasOpPat : Ntn -> Bool
+hasOpPat n = case (getGroup n).head of
+  At (Ident _) _ -> length (getGroup n).args > 0
+  At (NTuple (Cons p Nil)) _ -> hasOpPat p
+  _ -> not (allL (\m -> not (hasOpPat m)) (getGroup n).args)
+
+-- | a pattern, its operators as the tags they are other names for
+opPat : G.Globals -> Ntn -> Elab Ntn
+opPat g n = case (getGroup n).head of
+  At (Ident x) xsp ->
+    if length (getGroup n).args == 0 then pure n
+    else case G.lookupKey g x of
+      Just (MkPair _ ge) -> case tagSynonym ge of
+        Just (MkPair t k) ->
+          if k == length (getGroup n).args
+            then do
+              args <- traverseEL (\m -> opPat g m) (getGroup n).args
+              pure (group (At (NTag t) xsp) args)
+          else notTagSynonym x xsp
+        Nothing -> notTagSynonym x xsp
+      Nothing -> failP xsp 3 ("no such operator " ++ x ++ " in scope")
+  At (NTuple (Cons p Nil)) sp -> do
+    p' <- opPat g p
+    pure (group (At (NTuple (Cons p' Nil)) sp) (getGroup n).args)
+  _ -> do
+    args <- traverseEL (\m -> opPat g m) (getGroup n).args
+    pure (group (getGroup n).head args)
+
+altHasOp : Ntn -> Bool
+altHasOp (At (Infix p (At (Keyword "=>") _) _) _) = hasOpPat p
+altHasOp _ = False
+
+opAlt : G.Globals -> Ntn -> Elab Ntn
+opAlt g (At (Infix p (At (Keyword "=>") ksp) body) sp) = do
+  p' <- opPat g p
+  pure (At (Infix p' (At (Keyword "=>") ksp) body) sp)
+opAlt g n = pure n
+
+eqnHasOp : Ntn -> Bool
+eqnHasOp (At (Infix lhs (At (Keyword ":=") _) _) _) =
+  not (allL (\m -> not (hasOpPat m)) (getGroup lhs).args)
+eqnHasOp _ = False
+
+opEquation : G.Globals -> Ntn -> Elab Ntn
+opEquation g (At (Infix lhs (At (Keyword ":=") ksp) rhs) sp) = do
+  args <- traverseEL (\m -> opPat g m) (getGroup lhs).args
+  pure
+      (At
+         (Infix (group (getGroup lhs).head args) (At (Keyword ":=") ksp) rhs)
+         sp)
+opEquation g n = pure n
+
+-- | the head of a group, parsed
+parseHeadF : TK -> Pm.Case -> Ntn -> Elab Judgment
+parseHeadF tk c n = case n of
+  -- Variable rule
+  At (Ident x) sp -> pure (fromSynN c (R.find sp x))
+  -- Type formers
+  At (Infix domN (At (Keyword "->") _) codN) _ -> do
+    dom <- binderF tk domN
+    cod <- tk.typJ N codN
+    pure (fromTypN c (R.functionFormation dom cod))
+  At (NBlock "sig" Nothing fields) sp -> do
+    fieldDecls <- traverseEL (\m -> fieldDeclF tk m) fields
+    fromTypD c sp (R.recordFormation fieldDecls)
+  At (NBlock "sum" Nothing variantNs) sp -> do
+    variants <- traverseEL (\m -> variantF tk m) variantNs
+    fromTypD c sp (R.sumFormation (D.fromList variants))
+  At (Keyword "Type") _ -> pure (fromTypN c (R.universeFormation SmallU))
+  -- Introduction rules (except for tag)
+  At (Infix (At (Ident x) _) (At (Keyword "=>") _) bodyN) _ -> do
+    body <- recoveringChk (tk.chkJ c bodyN)
+    pure (ChkJ (R.functionIntro (ntnSpan n) x body))
+  -- extension: `\(x : T) -> e` annotates the binder
+  At (Infix (At (Infix (At (Ident x) _) (At (Keyword ":") _) tyN) _) (At (Keyword "=>") _) bodyN) _ -> do
+    dom <- tk.typJ N tyN
+    bj <- tk.parseJ N bodyN
+    case bj of
+      SynJ body -> pure (fromSynN c (R.functionIntroSyn x dom body))
+      ChkJ j ->
+        pure
+          (fromChkN
+             c
+             (R.functionIntroAnn
+                (ntnSpan n)
+                x
+                dom
+                (if implicitLambda bodyN then j else R.implicitLams j)))
+      TypJ j ->
+        pure
+          (fromChkN
+             c
+             (R.functionIntroAnn
+                (ntnSpan n)
+                x
+                dom
+                (R.universeIntro (ntnSpan bodyN) j)))
+  -- extension: `{x} => e` names an implicit argument
+  At (Infix (At (NBrace (At (Ident x) _)) _) (At (Keyword "=>") _) bodyN) _ -> do
+    body <- recoveringChk (tk.chkJ c bodyN)
+    pure (ChkJ (R.functionIntroImplicit (ntnSpan n) x body))
+  At (NBlock "struct" Nothing fields) sp -> do
+    fieldSettings <- traverseEL (\m -> fieldSetF tk c m) fields
+    pure (ChkJ (R.recordIntro sp fieldSettings))
+  -- extension: `do` ... with whichever `bind` is in scope
+  At (NBlock "do" Nothing stmts) sp -> case doBlock sp stmts of
+    Just n' -> tk.parseJ c n'
+    Nothing -> failP sp 12 "a `do` block ends with an expression"
+  At (NBlock "match" (Just scrutN) casesN) sp ->
+    -- (an operator in a pattern is found where the globals are in hand)
+    if not (allL (\m -> not (altHasOp m)) casesN)
+      then pure
+          (fromChkN
+             c
+             (MkChk (\e a -> do
+              casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
+              j <- tk.chkJ N (At (NBlock "match" (Just scrutN) casesN') sp)
+              R.runChk j e a)))
+    else if allL flatCaseAlt casesN
+      then do
+        scrut <- tk.synJ N scrutN
+        cases <- traverseEL (\m -> doCase tk m) casesN
+        pure
+            (fromChkN
+               c
+               (R.sumElim sp scrut (tagSpans casesN) (D.fromList cases)))
+    -- extension: nested patterns and literals, compiled into the flat
+    -- matches above, on a name for the scrutinee, bound once
+    else do
+      checkBareAlts casesN
+      case Cl.caseTree sp casesN of
+        Left err -> failP err.span 3 err.msg
+        Right r -> do
+          scrut <- tk.synJ N scrutN
+          body <- tk.chkJ N r.tree
+          pure (fromChkN c (R.caseLet r.scrutinee scrut body))
+  -- Misc.
+  At (Keyword "abandon") sp -> pure (fromChkN c (R.abandonChk sp))
+  At (Infix n0 (At (Keyword "~") _) n1) _ -> do
+    px <- specializationF tk n1
+    case px of
+      MkPair x cc -> do
+        s <- tk.synJ N n0
+        pure (fromSynN c (R.recordSpec (ntnSpan n) s x cc))
+  At (Infix n0 (At (Keyword ":") _) n1) _ -> do
+    cc <- tk.chkJ c n0
+    t <- tk.typJ N n1
+    pure (SynJ (R.annot t cc))
+  At (Keyword "Int") _ -> pure (fromTypN c R.primInt)
+  At (NInt i) _ -> pure (fromSynN c (R.litInt i))
+  At (Keyword "Float") _ -> pure (fromTypN c R.primFloat)
+  At (NFloat x) _ -> pure (fromSynN c (R.litFloat x))
+  At (Keyword "String") _ -> pure (fromTypN c R.primString)
+  At (NString s) _ -> pure (fromSynN c (R.litString s))
+  _ -> failP (ntnSpan n) 3 "unexpected notation"
+
+parseArray : TK -> Pm.Case -> Ntn -> Pm.Span -> List Ntn -> Elab Judgment
+parseArray tk c n ksp (Cons n0 Nil) = do
+  a <- tk.typJ N n0
+  pure (fromTypN c (R.primArray a))
+parseArray tk c n ksp args = failP (ntnSpan n) 3 "`Array` takes one type"
+
+parseF : TK -> Pm.Case -> Ntn -> Elab Judgment
+parseF tk c n = case (getGroup n).head of
+  At (NTag x) tsp -> do
+    args <- traverseEL (\m -> argumentF tk m) (getGroup n).args
+    pure (fromChkN c (R.sumIntro (ntnSpan n) tsp x args))
+  At (Keyword "Array") ksp -> parseArray tk c n ksp (getGroup n).args
+  _ ->
+    if length (getGroup n).args == 0 then parseHeadF tk c (getGroup n).head
+    else do
+      h <- parseHeadF tk N (getGroup n).head
+      s0 <- intoSyn (ntnSpan (getGroup n).head) h
+      s <- elimAll tk (ntnSpan (getGroup n).head).start s0 (getGroup n).args
+      pure (fromSynN c s)
+
+chkHeadOf : Ntn -> R.Syn -> R.Chk
+chkHeadOf n j = case (getGroup n).head of
+  At (Ident x) _ -> R.autoRec (ntnSpan n) x (R.apply (ntnSpan n) j)
+  _ -> R.apply (ntnSpan n) j
+
+chkF : TK -> Pm.Case -> Ntn -> Elab R.Chk
+chkF tk c n = do
+  j <- tk.parseJ c n
+  case j of
+    -- (`{x} => e` binds the implicit argument itself)
+    ChkJ j2 -> pure (if implicitLambda n then j2 else R.implicitLams j2)
+    SynJ j2 -> pure (R.implicitLams (chkHeadOf n j2))
+    TypJ j2 -> pure (R.universeIntro (ntnSpan n) j2)
+
+synF : TK -> Pm.Case -> Ntn -> Elab R.Syn
+synF tk c n = do
+  j <- tk.parseJ c n
+  intoSyn (ntnSpan n) j
+
+typF : TK -> Pm.Case -> Ntn -> Elab R.Typ
+typF tk c n = do
+  j <- tk.parseJ c n
+  case j of
+    ChkJ j2 -> pure (R.universeElim LargeU j2)
+    SynJ j2 -> pure (R.universeElimSyn (ntnSpan n) j2)
+    TypJ j2 -> pure j2
+
+tk : TK
+tk =
+  { parseJ = \c n -> parseF tk c n
+  , chkJ = \c n -> chkF tk c n
+  , synJ = \c n -> synF tk c n
+  , typJ = \c n -> typF tk c n
+  }
+
+-- Declarations
+--------------------------------------------------------------------------------
+
+definition : Ntn -> Elab (Pair Ntn Ntn)
+definition (At (Infix n0 (At (Keyword ":=") _) n1) _) = pure (MkPair n0 n1)
+definition n = unexpectedNotation n "notation of the form `<head> := <body>`"
+
+annotN : Ntn -> Elab (Pair Ntn Ntn)
+annotN (At (Infix n0 (At (Keyword ":") _) n1) _) = pure (MkPair n0 n1)
+annotN n = unexpectedNotation n "type-annotated expression"
+
+identE : Ntn -> Elab String
+identE (At (Ident x) _) = pure x
+identE n = unexpectedNotation n "identifier"
+
+type ArgBinding =
+  { span : Pm.Span, name : String, typ : R.Typ, implicit : Pm.Plicity }
+
+mkArgBinding : Pm.Span -> String -> R.Typ -> Pm.Plicity -> ArgBinding
+mkArgBinding span name typ implicit =
+  { span = span, name = name, typ = typ, implicit = implicit }
+
+argBinding : Ntn -> Elab ArgBinding
+argBinding (At (Infix n0 (At (Keyword ":") _) n1) _) = do
+  x <- identE n0
+  a <- tk.typJ N n1
+  pure
+      (mkArgBinding
+         (ntnSpan (infixOp n0 (At (Keyword ":") Pm.noSpan) n1))
+         x
+         a
+         Expl)
+argBinding (At (NBrace (At (Infix n0 (At (Keyword ":") _) n1) _)) sp) = do
+  x <- identE n0
+  a <- tk.typJ N n1
+  pure (mkArgBinding sp x a Impl)
+-- an instance binder in a head, `{{x : T}}`
+argBinding (At (NBracket (At (Infix n0 (At (Keyword ":") _) n1) _)) sp) = do
+  x <- identE n0
+  a <- tk.typJ N n1
+  pure (mkArgBinding sp x a Inst)
+argBinding n =
+  unexpectedNotation n "argument binding of the form `<name> : <type>`"
+
+unpackArgs : Ntn -> Elab (Pair String (List ArgBinding))
+unpackArgs n = do
+  x <- identE (getGroup n).head
+  args <- traverseEL (\m -> argBinding m) (getGroup n).args
+  pure (MkPair x args)
+
+withOne : ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
+withOne ab (MkPair t c) = case ab.implicit of
+  Impl ->
+    MkPair
+      (R.functionFormation (NamedImplicit ab.span ab.name ab.typ) t)
+      (R.functionIntroImplicit ab.span ab.name c)
+  Inst ->
+    MkPair
+      (R.functionFormation (NamedInstance ab.span ab.name ab.typ) t)
+      (R.functionIntroImplicit ab.span ab.name c)
+  Expl ->
+    MkPair
+      (R.functionFormation (Named ab.name ab.typ) t)
+      (R.functionIntro ab.span ab.name c)
+
+withArgs : List ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
+withArgs Nil base = base
+withArgs (Cons ab rest) base = withOne ab (withArgs rest base)
+
+type DeclJ = { name : String, ty : R.Typ, tm : R.Chk, prim : Bool }
+
+mkDeclJ : String -> R.Typ -> R.Chk -> Bool -> DeclJ
+mkDeclJ name ty tm prim = { name = name, ty = ty, tm = tm, prim = prim }
+
+declOfParts : String -> Pair R.Typ R.Chk -> Bool -> Elab DeclJ
+declOfParts name (MkPair ty tm) prim = pure (mkDeclJ name ty tm prim)
+
+theoryD : Ntn -> Elab DeclJ
+theoryD n = do
+  pn <- definition n
+  case pn of
+    MkPair patN bodyN -> do
+      pa <- unpackArgs patN
+      case pa of
+        MkPair name args -> do
+          body <- tk.chkJ De bodyN
+          declOfParts
+              name
+              (withArgs args (MkPair (MkTyp (\e -> pure (M.univ LargeU))) body))
+              False
+
+explicitNames : List ArgBinding -> List String
+explicitNames Nil = Nil
+explicitNames (Cons ab rest) =
+  if not (Pm.eqPlicity ab.implicit Expl) then explicitNames rest
+  else Cons ab.name (explicitNames rest)
+
+defPlain : Ntn -> Elab DeclJ
+defPlain n = do
+  pn <- definition n
+  case pn of
+    MkPair headN bodyN -> do
+      pt <- annotN headN
+      case pt of
+        MkPair patN tyN -> do
+          pa <- unpackArgs patN
+          case pa of
+            MkPair name args -> do
+              returnTyp <- tk.typJ N tyN
+              body <- tk.chkJ De bodyN
+              declOfParts name (withArgs args (MkPair returnTyp body)) False
+
+equationsBody : String -> List ArgBinding -> List Ntn -> Pm.Span -> Elab R.Chk
+equationsBody name args eqs sp = do
+  bodyN <- case Cl.desugar name (explicitNames args) eqs sp of
+    Left err -> failP err.span 10 err.msg
+    Right b -> pure b
+  tk.chkJ De bodyN
+
+-- extension: a definition by equations, `def f : T where <equations> end`
+defD : Ntn -> Elab DeclJ
+defD (At (Infix headN (At (Keyword ":") ksp) tyW) _) = case Cl.stripWhere tyW of
+  Just (MkPair tyN eqs) -> do
+    pa <- unpackArgs headN
+    case pa of
+      MkPair name args -> do
+        body <-
+          if not (allL (\m -> not (eqnHasOp m)) eqs)
+            then pure
+                (MkChk (\e a -> do
+                 eqs' <- traverseEL (\m -> opEquation e.globals m) eqs
+                 j <- equationsBody name args eqs' (ntnSpan tyW)
+                 R.runChk j e a))
+          else equationsBody name args eqs (ntnSpan tyW)
+        returnTyp <- tk.typJ N tyN
+        declOfParts name (withArgs args (MkPair returnTyp body)) False
+  Nothing -> defPlain (infixOp headN (At (Keyword ":") ksp) tyW)
+defD n = defPlain n
+
+declJ : Ntn -> Elab DeclJ
+declJ (At (MDecl Nil "theory" n) _) = theoryD n
+-- (`instance` marks a definition; it elaborates as any other)
+declJ (At (MDecl _ "def" n) _) = defD n
+-- extension: `primitive name : T`, implemented by the runtime
+declJ (At (MDecl Nil "primitive" (At (Infix (At (Ident x) _) (At (Keyword ":") _) tyN) _)) _) = do
+  ty <- tk.typJ N tyN
+  pure
+      (mkDeclJ
+         x
+         ty
+         (MkChk (\e a -> pure { stx = SPrim x, val = \u -> Nom VOpaque }))
+         True)
+declJ n = unexpectedNotation n "top-level declaration"
+
+-- Elaborating one declaration
+--------------------------------------------------------------------------------
+
+-- | fail, if errors were recovered from (they are reported, this is not)
+recoveredCheck : Elab Unit
+recoveredCheck = do
+  ds <- gets (\st -> (core st).recovered)
+  if length ds == 0 then pure MkUnit
+    else failElsewhere Pm.noSpan "errors recovered from"
+
+anyL : {a : Type} -> (a -> Bool) -> List a -> Bool
+anyL p Nil = False
+anyL p (Cons x xs) = p x || anyL p xs
+
+unsolvedPoisoned : V.MetaCtx -> Int -> Bool
+unsolvedPoisoned mc m = case Mp.lookup compareInt m mc of
+  Just me -> case me.sol of
+    Just _ -> False
+    Nothing -> True
+  Nothing -> False
+
+-- | fail, unreported, if an implicit argument is left that an error hole
+-- | kept from being inferred
+poisonedLeft : Elab Unit
+poisonedLeft = do
+  ps <- gets (\st -> (core st).poisoned)
+  mc <- gets (\st -> (core st).metas)
+  if anyL (\m -> unsolvedPoisoned mc m) (Mp.keys ps)
+      then failElsewhere
+          Pm.noSpan
+          "an implicit argument an error kept from being inferred"
+    else pure MkUnit
+
+appendM : {a : Type} -> List a -> List a -> List a
+appendM Nil ys = ys
+appendM (Cons x xs) ys = Cons x (appendM xs ys)
+
+concatMapM : {a b : Type} -> (a -> List b) -> List a -> List b
+concatMapM f Nil = Nil
+concatMapM f (Cons x xs) = appendM (f x) (concatMapM f xs)
+
+spineVals : V.Spine V.V -> List V.V
+spineVals SpId = Nil
+spineVals (SpApp sp e) = appendM (spineVals sp) (Cons e Nil)
+spineVals (SpProj sp _) = spineVals sp
+spineVals (SpSpec sp _ e) = appendM (spineVals sp) (Cons e Nil)
+
+headMeta : V.Head -> List Int
+headMeta (HMeta m) = Cons m Nil
+headMeta _ = Nil
+
+-- | the metavariables not yet solved in a value: at its head, or in
+-- | its spine's arguments
+metasInV : V.MetaCtx -> V.V -> List Int
+metasInV mc v = case V.forceEl mc v of
+  VNeu h sp ty expansion desc ->
+    appendM (headMeta h) (concatMapM (\v2 -> metasInV mc v2) (spineVals sp))
+  _ -> Nil
+
+nubInt : List Int -> List Int
+nubInt Nil = Nil
+nubInt (Cons x xs) = Cons x (nubInt (filter (\y -> not (y == x)) xs))
+
+shownV : G.Globals -> V.MetaCtx -> Pm.CtxShape -> V.V -> String
+shownV g mc cs v =
+  Ps.printEl
+    Ps.plainImplicits
+    0
+    cs.names
+    (Rnm.renameEl (Rnm.displayName g) (Rb.readbEl cs.len (V.forceEl mc v)))
+
+aboutMeta : V.MetaCtx -> Postponed -> Maybe V.MetaEntry
+aboutMeta mc p = case head
+    (nubInt (appendM (metasInV mc p.left) (metasInV mc p.right))) of
+  Just m -> Mp.lookup compareInt m mc
+  Nothing -> Nothing
+
+-- a problem that was retried and found contradictory: not missing
+-- information, a mismatch -- say so, where the implicit was asked for
+stuckWith : Pm.Span
+          -> Postponed
+          -> Maybe V.MetaEntry
+          -> String
+          -> String
+          -> Diag
+stuckWith fallback p about left right =
+  if p.failed
+    then { code = 311
+         , severity = SError
+         , msg =
+             "the implicit arguments found do not fit together: "
+             ++ left
+             ++ " and "
+             ++ right
+             ++ " are not equal"
+         , span =
+             (case about of
+              Just me -> me.span
+              Nothing -> fallback)
+         , note =
+             (case about of
+              Just me ->
+                Just
+                  ("found for `"
+                   ++ me.name
+                   ++ "`, it would need "
+                   ++ left
+                   ++ " = "
+                   ++ right)
+              Nothing -> Nothing)
+         }
+  else case about of
+    Just me ->
+      { code = 327
+      , severity = SError
+      , msg =
+          "cannot infer the implicit argument `"
+          ++ me.name
+          ++ "`: give it, `("
+          ++ me.name
+          ++ " := ...)`"
+      , span = me.span
+      , note =
+          Just
+            ("what is known of it, "
+             ++ left
+             ++ " = "
+             ++ right
+             ++ ", does not say what it is")
+      }
+    Nothing ->
+      { code = 327
+      , severity = SError
+      , msg =
+          "cannot infer an implicit argument: "
+          ++ left
+          ++ " = "
+          ++ right
+          ++ " does not say what it is"
+      , span = fallback
+      , note = Nothing
+      }
+
+stuckAt : G.Globals -> Pm.Span -> Postponed -> V.MetaCtx -> Diag
+stuckAt g fallback p mc =
+  stuckWith
+    fallback
+    p
+    (aboutMeta mc p)
+    (shownV g mc p.shape p.left)
+    (shownV g mc p.shape p.right)
+
+stuckDiag : G.Globals -> Pm.Span -> Postponed -> Elab Diag
+stuckDiag g fallback p = do
+  mc <- gets (\st -> (core st).metas)
+  pure (stuckAt g fallback p mc)
+
+type Elaborated =
+  { name : String
+  , key : String
+  , prim : Bool
+  , entry : G.Entry
+  , failed : Maybe Diag
+  }
+
+mkElaborated : String -> String -> Bool -> G.Entry -> Maybe Diag -> Elaborated
+mkElaborated name key prim entry failed =
+  { name = name, key = key, prim = prim, entry = entry, failed = failed }
+
+-- | the entry a definition is stored as, from its core syntax alone
+entryFor : G.Globals -> String -> Bool -> Sx.Ty -> Sx.Tm -> G.Entry
+entryFor g k prim tyStx bodyStx =
+  { syntax = bodyStx
+  , tySyntax = tyStx
+  , value =
+      if prim then T.primValueOf g k tyStx else T.valueOf g k tyStx bodyStx
+  , type_ = T.typeOf g tyStx
+  }
+
+errEntry : G.Globals -> String -> Sx.Ty -> G.Entry
+errEntry g k tyStx =
+  { syntax = SAbandon
+  , tySyntax = tyStx
+  , value = V.errorHole (T.typeOf g tyStx)
+  , type_ = T.typeOf g tyStx
+  }
+
+checkStuck : G.Globals -> Pm.Span -> List Postponed -> Elab Unit
+checkStuck g sp Nil = pure MkUnit
+checkStuck g sp (Cons p rest) = do
+  d <- stuckDiag g sp p
+  throwE (a := Unit) d
+
+checkUnsolved : List Mt.Unsolved -> Elab Unit
+checkUnsolved Nil = pure MkUnit
+checkUnsolved (Cons u rest) =
+  throwE
+    { code = 328
+    , severity = SError
+    , msg =
+        "cannot infer the implicit argument `"
+        ++ u.name
+        ++ "`; give it as `{...}`"
+    , span = u.span
+    , note = Nothing
+    }
+
+withSelf : ElabEnv -> String -> Scope -> ElabEnv
+withSelf e k sc =
+  { scope = sc
+  , globals = e.globals
+  , elabFor = e.elabFor
+  , lams = e.lams
+  , self = Just k
+  , insts = e.insts
+  }
+
+-- | the definition mentions itself as the global it will be; pattern
+-- | unification knows it by its key
+bodyEnv : G.Globals -> String -> String -> V.Ty -> ElabEnv
+bodyEnv gSelf k name aval =
+  withSelf
+    (emptyElabEnvFor gSelf k)
+    k
+    (letAt
+       (BDelayedBy 1)
+       name
+       (V.reflect (HGlobal k) (\u -> SpId) (\u -> aval) Nothing)
+       aval
+       (emptyElabEnvFor gSelf k).scope)
+
+-- | the whole body phase: checked, settled, zonk-ready
+bodyPhase : Pm.Span -> DeclJ -> G.Globals -> String -> V.Ty -> Elab M.El
+bodyPhase dsp d gSelf k aval = do
+  t <- R.runChk d.tm (bodyEnv gSelf k d.name aval) aval
+  -- the implicit arguments: every one inferred, and substituted in
+  stuck <- Mt.settle gSelf
+  recoveredCheck
+  poisonedLeft
+  checkStuck gSelf dsp stuck
+  unsolved <- Mt.unsolvedMetas
+  checkUnsolved unsolved
+  pure t
+
+keyOf : (String -> String) -> DeclJ -> String
+keyOf key d = if d.prim then d.name else key d.name
+
+elabOut : (String -> String)
+        -> G.Globals
+        -> DeclJ
+        -> Sx.Ty
+        -> V.MetaCtx
+        -> Either Diag M.El
+        -> Elab Elaborated
+elabOut key g d tyStx mc (Left failed) =
+  pure
+    (mkElaborated
+       d.name
+       (keyOf key d)
+       d.prim
+       (errEntry g (keyOf key d) tyStx)
+       (Just failed))
+elabOut key g d tyStx mc (Right t) =
+  pure
+    (mkElaborated
+       d.name
+       (keyOf key d)
+       d.prim
+       (entryFor
+          g
+          (keyOf key d)
+          d.prim
+          tyStx
+          (selfAsLocal (keyOf key d) (U.zonkEl mc t.stx)))
+       Nothing)
+
+primNames : List String
+primNames = map (\(p : Pair String Pi.PrimImpl) -> fst p) Pi.prims
+
+-- | a primitive is one the runtime has
+primKnown : Ntn -> DeclJ -> Elab Unit
+primKnown n d =
+  if d.prim && not (elemBy strEq d.name primNames)
+    then failWith
+        (a := Unit)
+        (ntnSpan n)
+        29
+        ("there is no primitive called `"
+         ++ d.name
+         ++ "` (the runtime has: "
+         ++ joinWith ", " primNames
+         ++ ")")
+  else pure MkUnit
+
+elabBody : (String -> String)
+         -> G.Globals
+         -> Ntn
+         -> DeclJ
+         -> M.Ty
+         -> Elab Elaborated
+elabBody key g n d a = do
+  modify (withCore (setSelfKey (Just (keyOf key d))))
+  body <-
+    tryE
+      (bodyPhase
+         (ntnSpan n)
+         d
+         (G.addEntry
+            (keyOf key d)
+            { syntax = SOpaque
+            , tySyntax = a.stx
+            , value =
+                V.reflect
+                  (HGlobal (keyOf key d))
+                  (\u -> SpId)
+                  (\u -> M.tyN a)
+                  Nothing
+            , type_ = M.tyN a
+            }
+            g)
+         (keyOf key d)
+         (M.tyN a))
+  modify (withCore (setSelfKey Nothing))
+  primKnown n d
+  mc <- gets (\st -> (core st).metas)
+  elabOut key g d (U.zonkTy mc a.stx) mc body
+
+-- | Elaborate one declaration.  A definition whose type elaborates and
+-- | whose body does not is a definition still, `failed`: an error hole
+-- | of its type.
+elabDecl : (String -> String) -> G.Globals -> Ntn -> Elab Elaborated
+elabDecl key g n = do
+  modify (withCore (setSelfKey Nothing))
+  d <- declJ n
+  a <- R.runTyp d.ty (emptyElabEnv g)
+  -- (a type with an error hole is no type to give the definition)
+  recoveredCheck
+  elabBody key g n d a
+
+watchSyn : Pm.Span -> Judgment -> Elab R.Syn
+watchSyn sp (SynJ j) = pure j
+watchSyn sp _ =
+  failP sp 0 "a watch must say what type it has: write `-- >>> (e : T)`"
+
+watchEntry : G.Globals -> V.MetaCtx -> M.El -> V.Ty -> G.Entry
+watchEntry g mc t ty =
+  entryFor
+    g
+    "> watch"
+    False
+    (U.zonkTy mc (Rb.readbTy 0 (V.forceTy mc ty)))
+    (U.zonkEl mc t.stx)
+
+watchPhase : G.Globals -> Pm.Span -> Pair M.El V.Ty -> Elab G.Entry
+watchPhase g sp (MkPair t ty) = do
+  stuck <- Mt.settle g
+  -- (what settling met that was recovered from, too)
+  recoveredCheck
+  poisonedLeft
+  checkStuck g sp stuck
+  unsolved <- Mt.unsolvedMetas
+  checkUnsolved unsolved
+  mc <- gets (\st -> (core st).metas)
+  pure (watchEntry g mc t ty)
+
+-- | a watch `-- >>> e`: elaborated as an anonymous definition, its
+-- | entry kept aside (never among the globals)
+elabWatch : G.Globals -> Ntn -> Elab G.Entry
+elabWatch g n = do
+  j <- tk.parseJ N n
+  s <- watchSyn (ntnSpan n) j
+  pr <- R.runSyn s (emptyElabEnv g)
+  watchPhase g (ntnSpan n) pr
+
+-- The module
+--------------------------------------------------------------------------------
+
+type Watch = { span : Pm.Span, entry : G.Entry }
+
+mkWatch : Pm.Span -> G.Entry -> Watch
+mkWatch span entry = { span = span, entry = entry }
+
+type TestDecl = { name : String, span : Pm.Span }
+
+-- | a module elaborated: its globals, what went wrong, what each
+-- | definition is stored under and where it is; `broken`: the
+-- | declarations that did not elaborate, not even their types (where
+-- | each is); `infos` and `trace`: what elaboration found for the IDE,
+-- | and its steps (for `heff explain`)
+type TopResult =
+  { globals : G.Globals
+  , diags : List Diag
+  , keys : List String
+  , broken : List (Pair String Pm.Span)
+  , watches : List Watch
+  , tests : List TestDecl
+  , spans : List (Pair String Pm.Span)
+  , infos : List Info
+  , trace : List TraceEvent
+  }
+
+mkTop : G.Globals
+      -> List Diag
+      -> List String
+      -> List (Pair String Pm.Span)
+      -> List Watch
+      -> List TestDecl
+      -> List (Pair String Pm.Span)
+      -> List Info
+      -> List TraceEvent
+      -> TopResult
+mkTop globals diags keys broken watches tests spans infos trace =
+  { globals = globals
+  , diags = diags
+  , keys = keys
+  , broken = broken
+  , watches = watches
+  , tests = tests
+  , spans = spans
+  , infos = infos
+  , trace = trace
+  }
+
+appendT : {a : Type} -> List a -> List a -> List a
+appendT Nil ys = ys
+appendT (Cons x xs) ys = Cons x (appendT xs ys)
+
+-- (a `failElsewhere` marker is reported where it comes from, not here)
+reportedD : Diag -> List Diag
+reportedD d = if reportedElsewhere d then Nil else Cons d Nil
+
+concatMapT : {a b : Type} -> (a -> List b) -> List a -> List b
+concatMapT f Nil = Nil
+concatMapT f (Cons x xs) = appendT (f x) (concatMapT f xs)
+
+-- what a declaration's elaboration recovered from, kept: chronological
+-- (the state holds them newest first)
+recChron : ElabSt -> List Diag
+recChron st = concatMapT reportedD (reverse (core st).recovered)
+
+-- (the accumulator holds diagnostics newest first)
+consAll : List Diag -> List Diag -> List Diag
+consAll ds xs = foldl (\a x -> Cons x a) ds xs
+
+failedList : Elaborated -> List Diag
+failedList r = case r.failed of
+  Just d -> reportedD d
+  Nothing -> Nil
+
+headNameN : Ntn -> Maybe String
+headNameN (At (Infix h (At (Keyword ":") _) _) _) = headNameN h
+headNameN h = case (getGroup h).head of
+  At (Ident x) _ -> Just x
+  _ -> Nothing
+
+-- | the name a declaration defines, from its notation: it may not be
+-- | read further
+declNameN : Ntn -> Maybe String
+declNameN (At (MDecl _ _ (At (Infix h (At (Keyword ":=") _) _) _)) _) =
+  headNameN h
+declNameN (At (MDecl _ _ h) _) = headNameN h
+declNameN _ = Nothing
+
+-- (not even its type: what uses it is not checked, and not refused)
+topBroken : (String -> String) -> TopResult -> Ntn -> List Diag -> TopResult
+topBroken kf acc n diags = case declNameN n of
+  Just x ->
+    mkTop
+      (G.addBroken
+         (kf x)
+         (if strEq (kf x) x then acc.globals
+          else G.addAlias x (kf x) acc.globals))
+      diags
+      acc.keys
+      (Cons (MkPair x (ntnSpan n)) acc.broken)
+      acc.watches
+      acc.tests
+      acc.spans
+      acc.infos
+      acc.trace
+  Nothing ->
+    mkTop
+      acc.globals
+      diags
+      acc.keys
+      acc.broken
+      acc.watches
+      acc.tests
+      acc.spans
+      acc.infos
+      acc.trace
+
+-- (what a declaration's elaboration found for the IDE, and its steps,
+-- kept: the state and the accumulator both hold them newest first)
+keepSt : ElabSt -> TopResult -> TopResult
+keepSt st acc =
+  mkTop
+    acc.globals
+    acc.diags
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
+
+topTake : (String -> String)
+        -> TopResult
+        -> Ntn
+        -> Pair (Either Diag Elaborated) ElabSt
+        -> TopResult
+topTake kf acc n (MkPair (Left d) st) =
+  topBroken
+    kf
+    (keepSt st acc)
+    n
+    (consAll acc.diags (appendT (recChron st) (reportedD d)))
+topTake kf acc n (MkPair (Right r) st) =
+  mkTop
+    (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals))
+    (consAll acc.diags (appendT (recChron st) (failedList r)))
+    (Cons r.key acc.keys)
+    acc.broken
+    acc.watches
+    acc.tests
+    (Cons (MkPair r.name (ntnSpan n)) acc.spans)
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
+
+watchTake : TopResult
+          -> Pm.Span
+          -> Pair (Either Diag G.Entry) ElabSt
+          -> TopResult
+watchTake acc sp (MkPair (Left d) st) =
+  mkTop
+    acc.globals
+    (consAll acc.diags (appendT (recChron st) (reportedD d)))
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
+watchTake acc sp (MkPair (Right entry) st) =
+  mkTop
+    acc.globals
+    (consAll acc.diags (recChron st))
+    acc.keys
+    acc.broken
+    (Cons (mkWatch sp entry) acc.watches)
+    acc.tests
+    acc.spans
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
+
+testDiag : Ntn -> Diag
+testDiag n =
+  { code = 211
+  , severity = SError
+  , msg = "a test is named: `test <name>`"
+  , span = ntnSpan n
+  , note = Nothing
+  }
+
+topOne : (String -> String) -> TopResult -> Ntn -> TopResult
+topOne kf acc (At (MDecl Nil ">" n) sp) =
+  watchTake acc sp (runE (elabWatch acc.globals n) emptySt)
+-- extension: `test name`, the watches after it (with expectations) are
+-- a test, named
+topOne kf acc (At (MDecl Nil "test" (At (Ident x) xsp)) sp) =
+  mkTop
+    acc.globals
+    acc.diags
+    acc.keys
+    acc.broken
+    acc.watches
+    (Cons { name = x, span = sp } acc.tests)
+    acc.spans
+    acc.infos
+    acc.trace
+topOne kf acc (At (MDecl Nil "test" n) sp) =
+  mkTop
+    acc.globals
+    (Cons (testDiag n) acc.diags)
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+    acc.infos
+    acc.trace
+topOne kf acc n = topTake kf acc n (runE (elabDecl kf acc.globals n) emptySt)
+
+topGo : (String -> String) -> TopResult -> List Ntn -> TopResult
+topGo kf acc Nil =
+  mkTop
+    acc.globals
+    (reverse acc.diags)
+    (reverse acc.keys)
+    (reverse acc.broken)
+    (reverse acc.watches)
+    (reverse acc.tests)
+    (reverse acc.spans)
+    (reverse acc.infos)
+    (reverse acc.trace)
+topGo kf acc (Cons n rest) = topGo kf (topOne kf acc n) rest
+
+emptyTop : G.Globals -> TopResult
+emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil Nil Nil
+
+-- | every declaration of a module, each elaborated in a fresh state
+topModule : String -> G.Globals -> List Ntn -> TopResult
+topModule modName g0 ntns = topGo (\x -> modName ++ "." ++ x) (emptyTop g0) ntns
+
+-- | the same, on top of some existing globals, each definition under
+-- | its own name (what an expectation is read with)
+topWith : G.Globals -> List Ntn -> TopResult
+topWith g0 ntns = topGo (\x -> x) (emptyTop g0) ntns
+
+-- | a definition as a cache keeps it: its key, where it is, and its
+-- | core syntax (type and body)
+type ThawedDef =
+  { name : String, key : String, span : Pm.Span, ty : Sx.Ty, body : Sx.Tm }
+
+mkThawedDef : String -> String -> Pm.Span -> Sx.Ty -> Sx.Tm -> ThawedDef
+mkThawedDef name key span ty body =
+  { name = name, key = key, span = span, ty = ty, body = body }
+
+isForeignB : Sx.Tm -> Bool
+isForeignB (SPrim _) = True
+isForeignB (SIs e) = isForeignB e
+isForeignB _ = False
+
+knownEntry : G.Globals -> String -> Bool
+knownEntry g k = case G.lookupEntry g k of
+  Just _ -> True
+  Nothing -> False
+
+thawKeep : TopResult -> ThawedDef -> G.Globals -> TopResult
+thawKeep acc d g =
+  mkTop
+    g
+    acc.diags
+    (Cons d.key acc.keys)
+    acc.broken
+    acc.watches
+    acc.tests
+    (Cons (MkPair d.name d.span) acc.spans)
+    acc.infos
+    acc.trace
+
+thawGlobals : TopResult -> ThawedDef -> G.Globals
+thawGlobals acc d =
+  if strEq d.key d.name
+    then G.addEntry
+        d.key
+        (entryFor acc.globals d.key (isForeignB d.body) d.ty d.body)
+        acc.globals
+  else G.addAlias
+      d.name
+      d.key
+      (G.addEntry
+         d.key
+         (entryFor acc.globals d.key (isForeignB d.body) d.ty d.body)
+         acc.globals)
+
+thawOne : TopResult -> ThawedDef -> TopResult
+thawOne acc d =
+  -- (a primitive declared again, by another module, is the same one)
+  if isForeignB d.body && knownEntry acc.globals d.key
+    then thawKeep acc d acc.globals
+  else thawKeep acc d (thawGlobals acc d)
+
+thawDone : TopResult -> TopResult
+thawDone acc =
+  mkTop
+    acc.globals
+    acc.diags
+    (reverse acc.keys)
+    acc.broken
+    acc.watches
+    acc.tests
+    (reverse acc.spans)
+    acc.infos
+    acc.trace
+
+-- | a module thawed from a cache: its definitions' syntax evaluated
+-- | back into globals -- `topModule` with the elaboration already done
+topThawed : G.Globals -> List ThawedDef -> TopResult
+topThawed g0 defs =
+  thawDone (foldl (\acc d -> thawOne acc d) (emptyTop g0) defs)
+
+-- Checking source text, whole
+--------------------------------------------------------------------------------
+
+withParse : TopResult -> List Diag -> TopResult
+withParse t ds =
+  mkTop
+    t.globals
+    (appendT ds t.diags)
+    t.keys
+    t.broken
+    t.watches
+    t.tests
+    t.spans
+    t.infos
+    t.trace
+
+noImports : String -> Bool
+noImports x = False
+
+checkRead : String -> Su.Read -> TopResult
+checkRead modName r =
+  withParse (topModule modName G.emptyGlobals r.ntns) r.diags
+
+-- | a module's source, read and elaborated (no imports)
+checkSource : String -> String -> TopResult
+checkSource modName src = checkRead modName (Su.readProgram noImports src)
+
+-- | a definition's stored core, printed
+bodyDump : TopResult -> String -> String
+bodyDump t k = case G.lookupEntry t.globals k of
+  Just e -> Pr.showEl e.syntax
+  Nothing -> "<no such definition>"
+
+tyDump : TopResult -> String -> String
+tyDump t k = case G.lookupEntry t.globals k of
+  Just e -> Pr.showTy e.tySyntax
+  Nothing -> "<no such definition>"
+
+-- >>> length (topModule "m" G.emptyGlobals Nil).keys
+-- 0
+
+-- >>> (checkSource "m" "two : Int\ntwo = 2\n").keys
+-- ["m.two"]
+
+-- >>> tyDump (checkSource "m" "two : Int\ntwo = 2\n") "m.two"
+-- "SPrimInt"
+
+-- >>> bodyDump (checkSource "m" "two : Int\ntwo = 2\n") "m.two"
+-- "(SIs (SLitInt 2))"
+
+-- >>> bodyDump (checkSource "m" "idInt : Int -> Int\nidInt x = x\n") "m.idInt"
+-- "(SLam (SFunction Small SPrimInt (AbsConst SPrimInt) Expl) (MkAbs \"x\" (SIs (SLocal 0))))"
+
+-- >>> length (checkSource "m" "bad : Int\nbad = \"no\"\n").diags
+-- 1

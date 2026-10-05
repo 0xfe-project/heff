@@ -23,7 +23,7 @@ npm install       # also builds heff
 npm link          # puts `heff` on the PATH
 ```
 
-heff is written in heff (`compiler/`).  `boot/heff.mjs` is a compiled
+heff is written in heff (`src/heff/`).  `boot/heff.mjs` is a compiled
 copy of the compiler; the build (`npm run build`) uses it to compile the
 compiler into `output/heff.mjs`, which is `heff` (minified; the
 compiler's own output is `output/heff.raw.mjs`).
@@ -42,17 +42,32 @@ heff compile FILE OUT --backend=MODE [--name NAME]
                                # esm: an ES module
                                # page: a script running the app NAME in a web page
                                # node: a Node.js program running NAME
+heff init [DIR]                # a new project
 heff lsp                       # the language server, on stdio
 heff completions SHELL         # fish, bash or zsh completions
 ```
 
 ## Modules
 
-A module is a file, named by its path from the project root:
-`parse/surface.hf` is `parse.surface`.  The project root is the nearest
-directory with a `package.json` that has a `"heff"` field.  Other modules
-are looked up in `lib/`, then in `node_modules/`.  Compiled modules are
-cached in `.heff/`.
+A project is a directory with a `package.hf`: a heff file defining
+`package`, of type `Package` (`lib/manifest.hf`), read without being
+run.  A module is a file under its `src/`, named by its path there:
+`src/parse/surface.hf` is `parse.surface`.  Modules are looked up there
+and in `lib/`; a file outside `src/` (a test) may also import files
+beside it, by their paths from the root.  Compiled modules are cached in
+`.heff/`.
+
+```haskell
+import manifest
+
+package : Package
+package =
+  { module = "github.com/someone/hello"
+  , heff = "0.1.0"
+  , require = []
+  , replace = []
+  }
+```
 
 ## Effects
 

@@ -16,7 +16,7 @@ const again = join(root, "output", "heff-again.mjs");
 const run = (args) => spawnSync(process.execPath, args, { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
 
 if (run([join(root, "scripts", "build.mjs")]).status !== 0) process.exit(1);
-if (run([out, "compile", "compiler/main.hf", again, "--name", "main", "--backend=node"]).status !== 0) process.exit(1);
+if (run([out, "compile", "src/heff/main.hf", again, "--name", "main", "--backend=node"]).status !== 0) process.exit(1);
 if (readFileSync(raw, "utf8") !== readFileSync(again, "utf8")) {
   console.error("heff boot: the compiler does not compile itself to itself; the seed is left as it was");
   process.exit(1);

@@ -1,0 +1,633 @@
+-- Laying a file out anew.
+-- The concrete syntax from `heff.fmt.cst` is turned into a `doc` document and
+-- rendered at width 80; blank lines between declarations are kept, at most
+-- one, and each comment goes where it was attached.  What lays an
+-- expression out calls itself through the record `lay`, as the grammar
+-- does through `gram`.
+
+import prelude
+import array as A
+import map as M
+import doc
+import heff.fmt.lex as L
+import heff.fmt.imports as I
+import heff.fmt.toks as Tk
+import heff.fmt.cst as C
+
+type T = Tk.T
+
+-- (a line to keep blank, and a line break inside a comment: what is left
+-- blank otherwise, from a line break forced by a comment, is dropped)
+blankMark : String
+blankMark = fromCharCode 1
+
+newlineMark : String
+newlineMark = fromCharCode 2
+
+replaceAll : String -> String -> String -> String
+replaceAll pat rep s = joinWith rep (split pat s)
+
+rtrimEnd : String -> Int -> Int
+rtrimEnd s e =
+  if e > 0
+  && (charCode s (e - 1) == 32
+      || charCode s (e - 1) == 9
+      || charCode s (e - 1) == 13)
+    then rtrimEnd s (e - 1)
+  else e
+
+rtrim : String -> String
+rtrim s = strSlice s 0 (rtrimEnd s (strLength s))
+
+comment : String -> Doc
+comment s = text (replaceAll "\n" newlineMark s)
+
+blankLine : Doc
+blankLine = text blankMark <> hardline
+
+foldDocs : List Doc -> Doc
+foldDocs ds = foldl (\a b -> a <> b) emptyDoc ds
+
+-- Tokens with their comments
+
+leadOf : Tk.Env -> T -> List Tk.Cmt
+leadOf env t = fromMaybe Nil (M.lookup compareInt t.ix env.lead)
+
+trailOf : Tk.Env -> T -> Doc
+trailOf env t = case M.lookup compareInt t.ix env.trail of
+  Nothing -> emptyDoc
+  Just c -> text " " <> comment c <> hardline
+
+cmtLead : Tk.Cmt -> Doc
+cmtLead c = hardline <> comment c.text
+
+inlineDoc : String -> Doc
+inlineDoc c = comment c <> text " "
+
+tokLead : Tk.Env -> T -> List Tk.Cmt
+tokLead env t = if t.ix == env.noLead then Nil else leadOf env t
+
+-- | A token, with its comments: those before it on lines of their own, and
+-- | the one after it on its line (after which the line ends).
+tok : Tk.Env -> T -> Doc
+tok env t =
+  (if null (tokLead env t) then emptyDoc
+   else foldDocs (map cmtLead (tokLead env t)) <> hardline)
+  <> foldDocs
+    (map inlineDoc (fromMaybe Nil (M.lookup compareInt t.ix env.inline)))
+  <> text t.raw
+  <> (if t.ix == env.noTrail then emptyDoc else trailOf env t)
+
+cmtBlank : Tk.Cmt -> Bool
+cmtBlank c = c.blank
+
+tokBlank : T -> Bool
+tokBlank t = t.blank
+
+tokIx2 : T -> Int
+tokIx2 t = t.ix
+
+tokEnd : T -> Int
+tokEnd t = t.end
+
+-- | a blank line was before the item (before its comments, if any)
+blankBefore : Tk.Env -> T -> Bool
+blankBefore env t = case head (leadOf env t) of
+  Just c -> cmtBlank c
+  Nothing -> tokBlank t
+
+noComments : Tk.Env -> Int -> Int -> Tk.Env
+noComments env noLead noTrail =
+  { src = env.src
+  , lead = env.lead
+  , inline = env.inline
+  , trail = env.trail
+  , noLead = noLead
+  , noTrail = noTrail
+  }
+
+leadDocs : List Tk.Cmt -> Int -> Doc
+leadDocs Nil i = emptyDoc
+leadDocs (Cons c cs) i =
+  (if i > 0 && cmtBlank c then blankLine else emptyDoc)
+  <> comment c.text
+  <> hardline
+  <> leadDocs cs (i + 1)
+
+-- | an item (a declaration, or an item of a block) from the token `first`
+-- | to `last`, at the current column: its leading comments there, the rest
+-- | of it indented further, so that no line of it could start another, and
+-- | the comment after it (outside what it groups, which it would break)
+item : Tk.Env -> T -> T -> (Tk.Env -> Doc) -> Doc
+item env first last2 body =
+  leadDocs (leadOf env first) 0
+  <> (if not (null (leadOf env first)) && tokBlank first then blankLine
+      else emptyDoc)
+  <> nest
+    2
+    (body (noComments env (tokIx2 first) (tokIx2 last2)) <> trailOf env last2)
+
+itemsGo : {a : Type}
+        -> Tk.Env
+        -> (a -> T)
+        -> (a -> T)
+        -> (Tk.Env -> a -> Doc)
+        -> Int
+        -> List a
+        -> Doc
+itemsGo env first last2 doc2 i Nil = emptyDoc
+itemsGo env first last2 doc2 i (Cons x xs) =
+  hardline
+  <> (if i > 0 && blankBefore env (first x) then blankLine else emptyDoc)
+  <> item env (first x) (last2 x) (\e -> doc2 e x)
+  <> itemsGo env first last2 doc2 (i + 1) xs
+
+-- | items, each on a line of its own, blank lines between kept
+items : {a : Type}
+      -> Tk.Env
+      -> (a -> T)
+      -> (a -> T)
+      -> (Tk.Env -> a -> Doc)
+      -> List a
+      -> Doc
+items env first last2 doc2 xs = itemsGo env first last2 doc2 0 xs
+
+-- The expressions
+
+-- | what is right of `=` (or `->`, `<-`): a lambda, `case` or `do` right
+-- | there, anything else on the next line if it does not fit
+opensBlock : C.E -> Bool
+opensBlock (Lam bs binders arrow body) = True
+opensBlock (Case kw scrut of2 alts) = True
+opensBlock (Do kw stmts) = True
+opensBlock e = False
+
+-- | a `do` or `case`, or a lambda to one: its items are lines of their own
+hangs : C.E -> Bool
+hangs (Lam bs binders arrow body) = hangs body
+hangs (Case kw scrut of2 alts) = True
+hangs (Do kw stmts) = True
+hangs e = False
+
+isFSet : C.E -> Bool
+isFSet (EFSet x eq e) = True
+isFSet e = False
+
+-- | `a -> b -> c` (or `~`, `*`) as its operands
+data Chain = MkChain C.E (List C.E)
+
+sameOp : T -> List C.E -> Bool
+sameOp op Nil = True
+sameOp op (Cons (OpRhs op2 e) rest) = strEq op2.text op.text
+sameOp op other = False
+
+chainOp : C.E -> T -> C.E -> Chain -> Chain
+chainOp a op b (MkChain bf rest) =
+  if sameOp op rest then MkChain a (Cons (OpRhs op bf) rest)
+  else MkChain a (Cons (OpRhs op b) Nil)
+
+chain : C.E -> Chain
+chain (Op a op b) = chainOp a op b (chain b)
+chain e = MkChain e Nil
+
+anyArrow : List C.E -> Bool
+anyArrow Nil = False
+anyArrow (Cons (OpRhs op e) rest) =
+  if strEq op.text "->" then True else anyArrow rest
+anyArrow (Cons e rest) = anyArrow rest
+
+unsnocRev : List C.E -> Maybe (Pair (List C.E) C.E)
+unsnocRev Nil = Nothing
+unsnocRev (Cons x rev) = Just (MkPair (reverse rev) x)
+
+unsnocE : List C.E -> Maybe (Pair (List C.E) C.E)
+unsnocE es = unsnocRev (reverse es)
+
+-- (`pOne` is `pP env`: the two call one another, so one is passed in)
+pListGo : Tk.Env -> (C.Pat -> Doc) -> List C.Pat -> List T -> Bool -> Doc
+pListGo env pOne Nil commas isFirst = emptyDoc
+pListGo env pOne (Cons p ps) commas isFirst =
+  (if isFirst then emptyDoc
+   else (case head commas of
+         Just comma -> tok env comma <> text " "
+         Nothing -> emptyDoc))
+  <> pOne p
+  <> pListGo env pOne ps (if isFirst then commas else drop 1 commas) False
+
+pP : Tk.Env -> C.Pat -> Doc
+pP env (POp l op r) = pP env l <+> tok env op <+> pP env r
+pP env (PCon c args) =
+  tok env c <> foldDocs (map (\p -> text " " <> pP env p) args)
+pP env (PAtom t) = tok env t
+pP env (PParen o p c) = tok env o <> pP env p <> tok env c
+pP env (PList o ps commas c) =
+  tok env o <> pListGo env (\p2 -> pP env p2) ps commas True <> tok env c
+
+-- | how tightly the standard library's operators bind, for layout alone
+-- | (how they bind is the parser's business): a chain of several
+-- | tightnesses breaks at its loosest operators, each tighter run kept
+-- | whole while it fits.  An operator not here lays the chain out flat.
+layoutPrec : String -> Maybe Int
+layoutPrec s =
+  if strEq s "$" then Just 0
+  else if strEq s "||" then Just 10
+  else if strEq s "<>" then Just 10
+  else if strEq s "&&" then Just 20
+  else if strEq s "<+>" then Just 20
+  else if strEq s "::" then Just 35
+  else if elemBy
+    strEq
+    s
+    ["==", "/=", "<", "<=", ">", ">=", "==.", "<.", "<=.", ">.", ">=."]
+    then Just 30
+  else if elemBy strEq s ["+", "-", "++", "+.", "-."] then Just 40
+  else if elemBy strEq s ["*", "/", "%", "*.", "/."] then Just 50
+  else Nothing
+
+consPrec : Maybe Int -> Maybe (List Int) -> Maybe (List Int)
+consPrec Nothing _ = Nothing
+consPrec (Just p) Nothing = Nothing
+consPrec (Just p) (Just ps) = Just (p :: ps)
+
+-- | each operator's tightness, if every one is known
+opPrecs : List C.E -> Maybe (List Int)
+opPrecs Nil = Just Nil
+opPrecs (r :: rs) = case r of
+  OpRhs op e -> consPrec (layoutPrec op.text) (opPrecs rs)
+  _ -> Nothing
+
+minList : Int -> List Int -> Int
+minList m Nil = m
+minList m (p :: ps) = minList (if p < m then p else m) ps
+
+allEq : Int -> List Int -> Bool
+allEq m Nil = True
+allEq m (p :: ps) = p == m && allEq m ps
+
+precEq : Int -> String -> Bool
+precEq m s = case layoutPrec s of
+  Just p -> p == m
+  Nothing -> False
+
+theory Lay where
+  pE : Tk.Env -> C.E -> Doc
+  rhsOf : Tk.Env -> C.E -> Doc
+  ifLink : Tk.Env -> T -> C.E -> T -> C.E -> Doc
+  elseOf : Tk.Env -> T -> C.E -> Doc
+  appDoc : Tk.Env -> C.E -> List C.E -> Doc
+  chainOperand : Tk.Env -> List C.E -> C.E -> Doc
+  binderDoc : Tk.Env -> C.E -> Doc
+  opRhsDoc : Tk.Env -> List C.E -> C.E -> Doc
+  opsRhsDoc : Tk.Env -> C.E -> Doc
+  opsChainDoc : Tk.Env -> C.E -> List C.E -> Doc
+  opsCut : Tk.Env -> Int -> C.E -> List C.E -> List C.E -> Doc
+  altDoc : Tk.Env -> C.E -> Doc
+  stmtDoc : Tk.Env -> C.E -> Doc
+  rhsField : Tk.Env -> C.E -> Doc
+
+lay : Lay
+lay =
+  { pE = \env e0 -> case e0 of
+      Atom t -> tok env t
+      BVar t -> tok env t
+      BImp o x c -> tok env o <> tok env x <> tok env c
+      BAnn o x cc ty c ->
+        tok env o <> tok env x <+> tok env cc <+> lay.pE env ty <> tok env c
+      EParen o e c -> tok env o <> align (lay.pE env e) <> tok env c
+      Named o x k e c ->
+        tok env o <> tok env x <+> tok env k <+> lay.pE env e <> tok env c
+      Tup o es commas c ->
+        (case es of
+         Nil -> tok env o <> tok env c
+         Cons e1 more ->
+           group
+             (align
+                (tok env o
+                 <> flatAlt (text " ") emptyDoc
+                 <> lay.pE env e1
+                 <> foldDocs
+                   (zipWith
+                      (\comma e -> linebreak <> tok env comma <+> lay.pE env e)
+                      commas
+                      more)
+                 <> linebreak
+                 <> tok env c)))
+      InstB o o2 d c1 c ->
+        tok env o <> tok env o2 <> lay.pE env d <> tok env c1 <> tok env c
+      Braces o fs commas c ->
+        (case fs of
+         Nil -> tok env o <> tok env c
+         Cons f1 more ->
+           group
+             (align
+                (tok env o <+> nest 4 (lay.rhsField env f1)
+                 <> foldDocs
+                   (zipWith
+                      (\comma f ->
+                         linebreak
+                         <> tok env comma <+> nest 4 (lay.rhsField env f))
+                      commas
+                      more)
+                 <> line
+                 <> tok env c)))
+      EFSet x eq e -> tok env x <+> tok env eq <> lay.rhsOf env e
+      Sum kw o alts bars c ->
+        (case alts of
+         Nil -> tok env kw <+> tok env o <+> tok env c
+         Cons a1 more ->
+           tok env kw
+           <+> group
+             (align
+                (tok env o <+> lay.pE env a1
+                 <> foldDocs
+                   (zipWith
+                      (\bar a -> line <> tok env bar <+> lay.pE env a)
+                      bars
+                      more)
+                 <+> tok env c)))
+      ECon c args ->
+        tok env c <> foldDocs (map (\a -> text " " <> lay.pE env a) args)
+      EField e f -> lay.pE env e <> tok env f
+      App h args -> lay.appDoc env h args
+      Op a op b ->
+        (case chain (Op a op b) of
+         MkChain first rest ->
+           group
+             (lay.chainOperand env rest first
+              <> foldDocs (map (\r -> line <> lay.opRhsDoc env rest r) rest)))
+      Ops a rest -> lay.opsChainDoc env a rest
+      OpRhs op e -> tok env op <+> lay.pE env e
+      Ann e cc ty ->
+        group (lay.pE env e <+> tok env cc <> nest 2 (line <> lay.pE env ty))
+      Lam bs binders arrow body ->
+        tok env bs
+        <> concatWith (\a b -> a <+> b) (map (lay.binderDoc env) binders)
+        <+> tok env arrow
+        <> (if opensBlock body then text " " <> lay.pE env body
+            else group (nest 2 (line <> lay.pE env body)))
+      Case kw scrut of2 alts ->
+        tok env kw <+> lay.pE env scrut <+> tok env of2
+        <> items env C.firstE C.lastE (\e a -> lay.altDoc e a) alts
+      EAlt p arrow body -> pP env p <+> tok env arrow <> lay.rhsOf env body
+      If kw c th a el b ->
+        group (lay.ifLink env kw c th a <> lay.elseOf env el b)
+      Do kw stmts ->
+        tok env kw <> items env C.firstE C.lastE (\e s -> lay.stmtDoc e s) stmts
+      ESBind x arrow e -> tok env x <+> tok env arrow <> lay.rhsOf env e
+  , rhsOf = \env e ->
+        if opensBlock e then text " " <> lay.pE env e
+        else group (line <> lay.pE env e)
+  -- (`else if` goes on at the same depth: a chain, not a staircase, and
+  -- each link holds `if ... then ...` on one line while it fits)
+  , ifLink = \env kw c th a ->
+        group
+          (tok env kw <+> lay.pE env c
+           <> nest 2 (line <> tok env th <+> nest 2 (lay.pE env a)))
+  , elseOf = \env el b -> case b of
+      If kw c th a el2 b2 ->
+        line <> tok env el <+> lay.ifLink env kw c th a <> lay.elseOf env el2 b2
+      _ -> line <> tok env el <+> nest 2 (lay.pE env b)
+  -- (a block last, `f x (\y -> do`, stays on the line, and its items are
+  -- indented from the line, not from the parenthesis)
+  , appDoc = \env h args -> case unsnocE args of
+      Nothing -> lay.pE env h
+      Just pr ->
+        (case pr of
+         MkPair init2 lastA ->
+           (case lastA of
+            EParen o e c ->
+              if hangs e
+                then group
+                    (lay.pE env h
+                     <> nest
+                       2
+                       (foldDocs (map (\a -> line <> lay.pE env a) init2)))
+                  <+> tok env o
+                  <> lay.pE env e
+                  <> tok env c
+              else group
+                  (lay.pE env h
+                   <> nest 2 (foldDocs (map (\a -> line <> lay.pE env a) args)))
+            _ ->
+              if hangs lastA
+                then group
+                    (lay.pE env h
+                     <> nest
+                       2
+                       (foldDocs (map (\a -> line <> lay.pE env a) init2)))
+                  <+> lay.pE env lastA
+              else group
+                  (lay.pE env h
+                   <> nest
+                     2
+                     (foldDocs (map (\a -> line <> lay.pE env a) args)))))
+  -- (`{x :: A} -> B`: an implicit binder, written close)
+  , chainOperand = \env rest e -> case e of
+      Braces o fs commas c ->
+        (case fs of
+         Cons d rest2 ->
+           if null rest2 && anyArrow rest && not (isFSet d) && null commas
+             then tok env o <> lay.pE env d <> tok env c
+           else lay.pE env (Braces o fs commas c)
+         Nil -> lay.pE env (Braces o fs commas c))
+      _ -> lay.pE env e
+  , binderDoc = \env b -> case b of
+      BVar t -> tok env t
+      BImp o x c -> tok env o <> tok env x <> tok env c
+      BAnn o x cc ty c ->
+        tok env o <> tok env x <+> tok env cc <+> lay.pE env ty <> tok env c
+      _ -> lay.pE env b
+  , opRhsDoc = \env rest r -> case r of
+      OpRhs op e -> tok env op <+> lay.chainOperand env rest e
+      _ -> lay.pE env r
+  , opsRhsDoc = \env r -> case r of
+      OpRhs op e -> tok env op <+> lay.pE env e
+      _ -> lay.pE env r
+  -- (a chain of declared operators: flat when one tightness, or one not
+  -- known; else cut at the loosest, each piece a chain again)
+  , opsChainDoc = \env first rest -> case opPrecs rest of
+      Nothing ->
+        group
+          (lay.pE env first
+           <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
+      Just ps ->
+        (case ps of
+         Nil -> group (lay.pE env first)
+         p :: more ->
+           if allEq p more
+             then group
+                 (lay.pE env first
+                  <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
+           else group (lay.opsCut env (minList p more) first Nil rest))
+  , opsCut = \env m f acc rs -> case rs of
+      Nil -> lay.opsChainDoc env f (reverse acc)
+      r :: rest2 ->
+        (case r of
+         OpRhs op e ->
+           if precEq m op.text
+             then lay.opsChainDoc env f (reverse acc)
+               <> line
+               <> tok env op <+> lay.opsCut env m e Nil rest2
+           else lay.opsCut env m f (r :: acc) rest2
+         _ -> lay.opsCut env m f (r :: acc) rest2)
+  , altDoc = \env a -> case a of
+      EAlt p arrow body -> pP env p <+> tok env arrow <> lay.rhsOf env body
+      _ -> lay.pE env a
+  , stmtDoc = \env s -> case s of
+      ESBind x arrow e -> tok env x <+> tok env arrow <> lay.rhsOf env e
+      _ -> lay.pE env s
+  -- (a block in a field is indented past the commas: the `nest 4` is at
+  -- the use)
+  , rhsField = \env f -> case f of
+      EFSet x eq e -> tok env x <+> tok env eq <> lay.rhsOf env e
+      _ -> lay.pE env f
+  }
+
+-- The declarations
+
+-- | `:: A -> B`, the arrows under `::` if it does not fit
+sig : Tk.Env -> T -> C.E -> Doc
+sig env cc ty = align (tok env cc <+> lay.pE env ty)
+
+nmDoc : Tk.Env -> List T -> Doc
+nmDoc env n = foldDocs (map (tok env) n)
+
+-- (a declaration's parameters are not broken: on one line, however long)
+paramsDoc : Tk.Env -> List C.E -> Doc
+paramsDoc env params =
+  foldDocs (map (\p -> text " " <> flatten (lay.pE env p)) params)
+
+dataAltsDoc : Tk.Env -> Maybe C.DAlts -> Doc
+dataAltsDoc env Nothing = emptyDoc
+dataAltsDoc env (Just (MkDAlts eq alts bars)) = case alts of
+  Nil -> emptyDoc
+  Cons a1 more ->
+    group
+      (line
+       <> tok env eq <+> lay.pE env a1
+       <> foldDocs
+         (zipWith (\bar a -> line <> tok env bar <+> lay.pE env a) bars more))
+
+universeDoc : Tk.Env -> Maybe (Pair T C.E) -> Doc
+universeDoc env Nothing = emptyDoc
+universeDoc env (Just (MkPair cc u)) = text " " <> tok env cc <+> lay.pE env u
+
+tfFirst : C.TF -> T
+tfFirst (MkTF x cc ty) = x
+
+tfLast2 : C.TF -> T
+tfLast2 (MkTF x cc ty) = C.lastE ty
+
+tfDoc : Tk.Env -> C.TF -> Doc
+tfDoc env (MkTF x cc ty) = tok env x <+> sig env cc ty
+
+srcSlice : Tk.Env -> Int -> Int -> String
+srcSlice env a b = strSlice env.src a b
+
+pD : Tk.Env -> C.D -> Doc
+pD env (DImport t) = tok env t
+pD env (DFixity kw ts) =
+  tok env kw <> foldDocs (map (\t -> text " " <> tok env t) ts)
+pD env (DSig n cc ty) = nmDoc env n <+> sig env cc ty
+pD env (DEqn n pats eq rhs) =
+  nmDoc env n
+  <> foldDocs (map (\p -> text " " <> pP env p) pats) <+> tok env eq
+  <> lay.rhsOf env rhs
+pD env (DData kw name params universe alts) =
+  tok env kw <+> tok env name
+  <> paramsDoc env params
+  <> universeDoc env universe
+  <> dataAltsDoc env alts
+pD env (DType kw name params eq body) =
+  tok env kw <+> tok env name
+  <> paramsDoc env params <+> tok env eq
+  <> lay.rhsOf env body
+pD env (DTheory kw name params w fields) =
+  tok env kw <+> tok env name
+  <> paramsDoc env params <+> tok env w
+  <> items env tfFirst tfLast2 tfDoc fields
+pD env (DForeign kw imp x cc ty) =
+  tok env kw <+> tok env imp <+> tok env x <+> sig env cc ty
+pD env (DTest kw x) = tok env kw <+> tok env x
+-- (as written: its expectation is the lines under it)
+pD env (DWatch w e) =
+  tok env w <> comment (srcSlice env (tokEnd w) (tokEnd (C.lastE e)))
+
+eofLeadDocs : Tk.Env -> List Tk.Cmt -> Doc
+eofLeadDocs env Nil = emptyDoc
+eofLeadDocs env (Cons c cs) =
+  hardline
+  <> (if cmtBlank c then blankLine else emptyDoc)
+  <> comment c.text
+  <> eofLeadDocs env cs
+
+topLevelGo : Tk.Env -> Int -> List C.D -> Doc
+topLevelGo env i Nil = emptyDoc
+topLevelGo env i (Cons d ds) =
+  (if i > 0
+     then hardline
+       <> (if blankBefore env (C.firstD d) then blankLine else emptyDoc)
+   else emptyDoc)
+  <> item env (C.firstD d) (C.lastD d) (\e -> pD e d)
+  <> topLevelGo env (i + 1) ds
+
+topLevel : Tk.Env -> List C.D -> T -> Doc
+topLevel env ds eof = topLevelGo env 0 ds <> eofLeadDocs env (leadOf env eof)
+
+-- Rendering
+
+keptLines : List String -> List String
+keptLines Nil = Nil
+keptLines (Cons l ls) =
+  if strEq (trim l) blankMark then Cons "" (keptLines ls)
+  else if strEq (trim l) "" then keptLines ls
+  else Cons l (keptLines ls)
+
+render2 : Doc -> String
+render2 d =
+  replaceAll
+    newlineMark
+    "\n"
+    (joinWith "\n" (keptLines (map rtrim (split "\n" (renderWidth 80 d)))))
+  ++ "\n"
+
+eofOf : Array T -> T
+eofOf ts =
+  if A.length ts > 0 then A.index ts (A.length ts - 1) else Tk.dummy (-1)
+
+fmtParsed : Tk.Attached -> Either String (List C.D) -> Either String String
+fmtParsed at (Left e) = Left e
+fmtParsed at (Right ds) = Right (render2 (topLevel at.env ds (eofOf at.toks)))
+
+fmtAttached : Tk.Attached -> Either String String
+fmtAttached at = fmtParsed at (C.parseToks at.toks)
+
+fmtLexed : String -> I.Header -> L.Lexed -> Either String String
+fmtLexed src hdr l =
+  if not (null l.errors) then Left "the file does not lex"
+  else fmtAttached
+      (Tk.attach src (I.withImports hdr.imports l.tokens) l.comments)
+
+fmtHeader : String -> I.Header -> Either String String
+fmtHeader src hdr = fmtLexed src hdr (L.lex hdr.text)
+
+-- | A file laid out anew, what it means not checked (the caller checks).
+formatUnchecked : String -> Either String String
+formatUnchecked src = fmtHeader src (I.readImports src)
+
+test laying
+
+-- >>> formatUnchecked "f=1"
+-- Right "f = 1\n"
+
+-- >>> formatUnchecked "f :  Int -> Int\nf x   =  x + 1"
+-- Right "f : Int -> Int\nf x = x + 1\n"
+
+-- >>> formatUnchecked "-- lead\nf = 1 -- trail"
+-- Right "-- lead\nf = 1 -- trail\n"
+
+-- >>> formatUnchecked "f = case x of\n  A -> 1\n  B -> 2"
+-- Right "f = case x of\n  A -> 1\n  B -> 2\n"
+
+-- >>> formatUnchecked "import a\n\ng = do\n  y <- f 1\n  pure y"
+-- Right "import a\n\ng = do\n  y <- f 1\n  pure y\n"

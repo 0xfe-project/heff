@@ -1,0 +1,336 @@
+-- A file and every module it imports, directly or not, each after what
+-- it imports, over the fs effect.  The project's root is the nearest
+-- directory above the file with a package.hf (src/heff/project.hf); its
+-- modules are under `src/`: `foo.bar` is `src/foo/bar.hf`.  A module is
+-- looked for there and in the library; for a file outside both (a test,
+-- an example), under the root too, so such files share helpers --
+-- what is in `src/` never imports them.  A module found in two of these
+-- places is an error.  Without a package.hf above it, a file's
+-- directory is its root, and holds its modules.
+
+import co
+import heff.diagnostic as Dg
+import heff.driver as Dr
+import heff.import as I
+import heff.project as Pr
+import fs
+import prelude
+
+dotsGo : String -> Int -> String -> String
+dotsGo p i acc =
+  if i >= strLength p then acc
+  else if charCode p i == 47 then dotsGo p (i + 1) (acc ++ ".")
+  else dotsGo p (i + 1) (acc ++ strSlice p i (i + 1))
+
+dotsOf : String -> String
+dotsOf p = dotsGo p 0 ""
+
+dropHf : String -> String
+dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
+
+-- | where the project is, where its modules are, and where the standard
+-- | library
+type Paths = { root : String, src : String, lib : String }
+
+-- | the working directory's project, the library at `lib/`
+here : Paths
+here = { root = ".", src = "src", lib = "lib" }
+
+-- (a path under a directory: under `.`, the path itself)
+dirPrefix : String -> String
+dirPrefix d = if strEq d "." then "" else d ++ "/"
+
+under : String -> String -> String
+under d p = dirPrefix d ++ p
+
+dropPrefix : String -> String -> Maybe String
+dropPrefix pre s =
+  if startsWith pre s then Just (strSlice s (strLength pre) (strLength s))
+  else Nothing
+
+-- | the module a file of the project is; one of the standard library is
+-- | the library's (`lib/co.hf` is `co`), wherever the project's root is;
+-- | `src/heff/dict.hf` is `heff.dict`; a file outside `src/` is named
+-- | from the root: `test/helpers.hf` is `test.helpers`
+moduleOf : Paths -> String -> String
+moduleOf ps path =
+  dotsOf
+    (dropHf (case dropPrefix (dirPrefix ps.lib) path of
+     Just rel -> rel
+     Nothing -> case dropPrefix (dirPrefix ps.src) path of
+       Just rel -> rel
+       Nothing -> case dropPrefix (dirPrefix ps.root) path of
+         Just rel -> rel
+         Nothing -> path))
+
+-- | the path is under the directory
+inside : String -> String -> Bool
+inside d path = strEq d "." || startsWith (dirPrefix d) path
+
+-- (where the last `/` is, from `i` down)
+lastSlash : String -> Int -> Maybe Int
+lastSlash p i =
+  if i < 0 then Nothing
+  else if charCode p i == 47 then Just i
+  else lastSlash p (i - 1)
+
+dirname : String -> String
+dirname p = case lastSlash p (strLength p - 1) of
+  Just 0 -> "/"
+  Just i -> strSlice p 0 i
+  Nothing -> "."
+
+-- | a directory is a project's root
+isRoot : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
+isRoot d = do
+  hf <- readFile (under d "package.hf")
+  val (case hf of
+    Just _ -> True
+    Nothing -> False)
+
+rootFrom : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> String
+         -> String
+         -> String
+         -> Co e Paths
+rootFrom lib start d = do
+  found <- isRoot d
+  if found then val { root = d, src = under d "src", lib = lib }
+    else if strEq d "/" || strEq d "." || strEq d ""
+      then val { root = start, src = start, lib = lib }
+    else rootFrom lib start (dirname d)
+
+-- | the paths of the project `file` is in, with the library at `lib`
+-- | (without a root, the file's directory is one)
+pathsFor : {e : HFunctor} -> {{ev : fs <: e}} -> String -> String -> Co e Paths
+pathsFor lib file = rootFrom lib (dirname file) (dirname file)
+
+slashGo : String -> Int -> String -> String
+slashGo m i acc =
+  if i >= strLength m then acc
+  else if charCode m i == 46 then slashGo m (i + 1) (acc ++ "/")
+  else slashGo m (i + 1) (acc ++ strSlice m i (i + 1))
+
+-- | where a module's file is: `foo.bar` is `foo/bar.hf`
+importPath : String -> String
+importPath m = slashGo m 0 "" ++ ".hf"
+
+elemL : String -> List String -> Bool
+elemL x xs = elemBy strEq x xs
+
+type LoadSt =
+  { done : List Dr.Source, doneMods : List String, errors : List String }
+
+emptySt : LoadSt
+emptySt = { done = Nil, doneMods = Nil, errors = Nil }
+
+addErr : LoadSt -> String -> LoadSt
+addErr st e =
+  { done = st.done
+  , doneMods = st.doneMods
+  , errors = concatList st.errors (Cons e Nil)
+  }
+
+pushDone : LoadSt -> String -> String -> String -> LoadSt
+pushDone st m path src =
+  { done =
+      concatList st.done (Cons { module = m, path = path, source = src } Nil)
+  , doneMods = Cons m st.doneMods
+  , errors = st.errors
+  }
+
+-- (a module's file, read)
+type Found = { path : String, source : String }
+
+nubPathsGo : List String -> List String -> List String
+nubPathsGo seen Nil = reverse seen
+nubPathsGo seen (Cons p rest) =
+  if elemL p seen then nubPathsGo seen rest else nubPathsGo (Cons p seen) rest
+
+-- | where module `m`, imported by the file at `from`, may be: among the
+-- | project's modules and in the library; for a file outside both,
+-- | under the root too
+placesOf : Paths -> String -> String -> List String
+placesOf ps from m =
+  nubPathsGo
+    Nil
+    (concatList
+       [under ps.src (importPath m), under ps.lib (importPath m)]
+       (if inside ps.src from || inside ps.lib from then Nil
+        else [under ps.root (importPath m)]))
+
+-- (the first of the paths that reads, by `read`)
+readFirst : {e : HFunctor}
+          -> (String -> Co e (Maybe String))
+          -> List String
+          -> Co e (Maybe Found)
+readFirst read Nil = val Nothing
+readFirst read (Cons path rest) = do
+  a <- read path
+  case a of
+    Just s -> val (Just { path = path, source = s })
+    Nothing -> readFirst read rest
+
+readFound : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> List String
+          -> Co e (Maybe Found)
+readFound paths = readFirst (\p -> readFile p) paths
+
+cycleMsg : String -> String -> List String -> String
+cycleMsg from m stack =
+  from
+  ++ ": importing "
+  ++ m
+  ++ " is a cycle: "
+  ++ joinWith " -> " (concatList (reverse stack) (Cons m Nil))
+
+missingMsg : List String -> String -> String -> String
+missingMsg places from m =
+  from ++ ": no module " ++ m ++ " (looked for " ++ joinWith ", " places ++ ")"
+
+clashMsg : List Found -> String -> String -> String
+clashMsg found from m =
+  from
+  ++ ": module "
+  ++ m
+  ++ " is more than one file: "
+  ++ joinWith " and " (map (\(f : Found) -> f.path) found)
+
+-- (every one of the paths that reads, by `read`)
+readEvery : {e : HFunctor}
+          -> (String -> Co e (Maybe String))
+          -> List String
+          -> Co e (List Found)
+readEvery read Nil = val Nil
+readEvery read (Cons path rest) = do
+  a <- read path
+  more <- readEvery read rest
+  val (case a of
+    Just s -> Cons { path = path, source = s } more
+    Nothing -> more)
+
+-- | the modules `ms`, imported by `from`, each visited after what it
+-- | imports (`stack`: the modules being visited, newest first), each
+-- | file read by `read`
+loadMany : {e : HFunctor}
+         -> (String -> Co e (Maybe String))
+         -> Paths
+         -> List String
+         -> String
+         -> List String
+         -> LoadSt
+         -> Co e LoadSt
+loadMany read ps stack from Nil st = val st
+loadMany read ps stack from (Cons m rest) st =
+  if elemL m st.doneMods then loadMany read ps stack from rest st
+  else if elemL m stack
+    then loadMany read ps stack from rest (addErr st (cycleMsg from m stack))
+  else do
+    found <- readEvery read (placesOf ps from m)
+    case found of
+      Nil ->
+        loadMany
+          read
+          ps
+          stack
+          from
+          rest
+          (addErr st (missingMsg (placesOf ps from m) from m))
+      Cons found2 others -> do
+        inner <-
+          loadMany
+            read
+            ps
+            (Cons m stack)
+            found2.path
+            (Dr.importNames (I.importsOf m found2.source).imports)
+            (if null others then st else addErr st (clashMsg found from m))
+        loadMany
+            read
+            ps
+            stack
+            from
+            rest
+            (pushDone inner m found2.path found2.source)
+
+-- | a program: its sources, what could not be loaded, where its project
+-- | is, and what its package.hf says (if it has one, and it reads)
+type Loaded =
+  { sources : List Dr.Source
+  , errors : List String
+  , paths : Paths
+  , package : Maybe Pr.Package
+  }
+
+-- | what is wrong with a package.hf, where it is
+problemMsg : String -> String -> Pr.Problem -> String
+problemMsg path src p =
+  path
+  ++ ":"
+  ++ showInt ((Dg.lineCol src p.at).line + 1)
+  ++ ":"
+  ++ showInt ((Dg.lineCol src p.at).col + 1)
+  ++ ": "
+  ++ p.msg
+
+-- | the project's package.hf, read (Nothing: there is none)
+readPackageAt : {e : HFunctor}
+              -> {{ev : fs <: e}}
+              -> Paths
+              -> Co e (Maybe (Either String Pr.Package))
+readPackageAt ps = do
+  text <- readFile (under ps.root "package.hf")
+  val (case text of
+    Nothing -> Nothing
+    Just src -> case Pr.readPackage src of
+      Left p -> Just (Left (problemMsg (under ps.root "package.hf") src p))
+      Right pk -> Just (Right pk))
+
+loadDone : Paths -> Maybe (Either String Pr.Package) -> LoadSt -> Loaded
+loadDone ps pk st = case pk of
+  Just (Left why) ->
+    { sources = st.done
+    , errors = Cons why st.errors
+    , paths = ps
+    , package = Nothing
+    }
+  Just (Right p) ->
+    { sources = st.done, errors = st.errors, paths = ps, package = Just p }
+  Nothing ->
+    { sources = st.done, errors = st.errors, paths = ps, package = Nothing }
+
+-- | the program rooted at `file`, the library at `lib`, each file read
+-- | by `read` (an editor's unsaved text, say): its sources in dependency
+-- | order, what could not be found, and where it looked
+loadProgramWith : {e : HFunctor}
+                -> {{ev : fs <: e}}
+                -> (String -> Co e (Maybe String))
+                -> String
+                -> String
+                -> Co e Loaded
+loadProgramWith read lib file = do
+  ps <- pathsFor lib file
+  pk <- readPackageAt ps
+  mSrc <- read file
+  case mSrc of
+    Nothing -> val (loadDone ps pk (addErr emptySt ("cannot read " ++ file)))
+    Just src -> do
+      st <-
+        loadMany
+          read
+          ps
+          (Cons (moduleOf ps file) Nil)
+          file
+          (Dr.importNames (I.importsOf (moduleOf ps file) src).imports)
+          emptySt
+      val (loadDone ps pk (pushDone st (moduleOf ps file) file src))
+
+-- | ... each file read from the disk
+loadProgram : {e : HFunctor}
+            -> {{ev : fs <: e}}
+            -> String
+            -> String
+            -> Co e Loaded
+loadProgram lib file = loadProgramWith (\p -> readFile p) lib file

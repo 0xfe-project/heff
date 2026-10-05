@@ -1,0 +1,135 @@
+-- Rendering diagnostics the way `diagnostician` does, under a
+-- `path:line:col` header.
+
+import heff.notation
+import heff.params as Pm
+import prelude
+
+type LineCol = { line : Int, col : Int }
+
+-- (the position after the line's start: the newline at `nl` still
+-- belongs to the line before it)
+lineColGo : String -> Int -> Int -> Int -> LineCol
+lineColGo src i l start = case indexFrom "\n" src start of
+  Just nl ->
+    if i <= nl then { line = l, col = i - start }
+    else lineColGo src i (l + 1) (nl + 1)
+  Nothing -> { line = l, col = i - start }
+
+-- | 0-based line and column
+lineCol : String -> Int -> LineCol
+lineCol src i = lineColGo src i 0 0
+
+numDigits : Int -> Int
+numDigits x = if x < 10 then 1 else 1 + numDigits (x / 10)
+
+repeated : Int -> String -> String
+repeated k c = if k <= 0 then "" else c ++ repeated (k - 1) c
+
+lineStartFrom : String -> Int -> Int -> Int
+lineStartFrom src l start = case indexFrom "\n" src start of
+  Just nl -> if l == 1 then nl + 1 else lineStartFrom src (l - 1) (nl + 1)
+  Nothing -> strLength src
+
+-- (where line `l` starts, 0-based)
+lineStartAt : String -> Int -> Int
+lineStartAt src 0 = 0
+lineStartAt src l = lineStartFrom src l 0
+
+lineEndAt : String -> Int -> Int
+lineEndAt src start = case indexFrom "\n" src start of
+  Just nl -> nl
+  Nothing -> strLength src
+
+prettyWith : String -> String -> Int -> Int -> String
+prettyWith gutter t ns nc =
+  gutter
+  ++ " "
+  ++ t
+  ++ "\n"
+  ++ gutter
+  ++ " "
+  ++ repeated ns " "
+  ++ repeated nc "^"
+
+prettyAt : String -> Pm.Span -> Int -> Int -> Int -> Int -> String
+prettyAt src sp w l lstart lend =
+  prettyWith
+    (showInt (l + 1) ++ repeated (w - numDigits (l + 1)) " " ++ " |")
+    (strSlice src lstart lend)
+    (max lstart sp.start - lstart)
+    (max 1 (min lend sp.end - max lstart sp.start))
+
+prettyLine : String -> Pm.Span -> Int -> Int -> String
+prettyLine src sp w l =
+  prettyAt src sp w l (lineStartAt src l) (lineEndAt src (lineStartAt src l))
+
+lineRange : String -> Pm.Span -> Int -> Int -> Int -> List String
+lineRange src sp w l le =
+  if l > le then Nil
+  else Cons (prettyLine src sp w l) (lineRange src sp w (l + 1) le)
+
+-- | the span's lines, each under its number, the span's characters
+-- | pointed at (the gutter width is taken from the 0-based line
+-- | numbers, as diagnostician does)
+linesPretty : String -> Pm.Span -> String
+linesPretty src sp =
+  joinWith
+    "\n"
+    (lineRange
+       src
+       sp
+       (max
+          (numDigits (lineCol src sp.start).line)
+          (numDigits (lineCol src sp.end).line))
+       (lineCol src sp.start).line
+       (lineCol src sp.end).line)
+
+severityWord : Severity -> String
+severityWord SDebug = "debug"
+severityWord SWarning = "warning"
+severityWord SError = "error"
+
+severityLetter : Severity -> String
+severityLetter SDebug = "D"
+severityLetter SWarning = "W"
+severityLetter SError = "E"
+
+prtCode : Diag -> String
+prtCode d =
+  severityWord d.severity
+  ++ "["
+  ++ severityLetter d.severity
+  ++ repeated (4 - numDigits d.code) "0"
+  ++ showInt d.code
+  ++ "]"
+
+renderDiag : String -> Diag -> String
+renderDiag src d =
+  prtCode d
+  ++ ": "
+  ++ d.msg
+  ++ "\n"
+  ++ linesPretty src d.span
+  ++ (case d.note of
+      Just n -> "\n" ++ n
+      Nothing -> "")
+
+fileDiag : String -> String -> Diag -> String
+fileDiag path src d =
+  path
+  ++ ":"
+  ++ showInt ((lineCol src d.span.start).line + 1)
+  ++ ":"
+  ++ showInt ((lineCol src d.span.start).col + 1)
+  ++ "\n"
+  ++ renderDiag src d
+  ++ "\n\n"
+
+-- | each diagnostic under `path:line:col`
+renderFileDiags : String -> String -> List Diag -> String
+renderFileDiags path src ds =
+  joinWith "" (map (\(d : Diag) -> fileDiag path src d) ds)
+
+-- >>> linesPretty "one : Int\none = 2\n" { start = 10, end = 13 }
+-- "2 | one = 2\n2 | ^^^"

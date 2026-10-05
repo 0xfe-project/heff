@@ -1,0 +1,139 @@
+-- Readback: values go back to core
+-- syntax; elements and types read back through one another, so the two
+-- are the fields of one record, `rb`.
+
+import array as A
+import heff.dict as D
+import heff.eval as E
+import heff.globals as G
+import heff.params as P
+import heff.syntax as Sx
+import heff.value as V
+import map as M
+import prelude
+
+type Rb = { el : Int -> V.V -> Sx.Tm, ty : Int -> V.Ty -> Sx.Ty }
+
+arrayEmpty : Array Int
+arrayEmpty = A.empty
+
+readbHead : Int -> V.Head -> Sx.Tm
+readbHead n (HLocal i) = SLocal (n - i - 1)
+readbHead n (HGlobal x) = SGlobal x
+readbHead n (HMeta m) = SMetaApp m arrayEmpty (SU SmallU)
+-- (computed, an error hole abandons: it is never, as the definitions
+-- that have one are not)
+readbHead n HError = SAbandon
+
+consMaybe : Int -> Maybe (List Int) -> Maybe (List Int)
+consMaybe l (Just xs) = Just (Cons l xs)
+consMaybe l Nothing = Nothing
+
+-- | the spine's arguments, if they are exactly locals (then a
+-- | metavariable reads back as `SMetaApp`); innermost first here,
+-- | reversed by the caller
+localArgs : V.Spine V.V -> Maybe (List Int)
+localArgs SpId = Just Nil
+localArgs (SpApp sp (VNeu (HLocal l) SpId _ _ _)) = consMaybe l (localArgs sp)
+localArgs _ = Nothing
+
+readbSpine : Rb -> Int -> V.Spine V.V -> Sx.Tm -> Sx.Tm
+readbSpine r n SpId t = t
+readbSpine r n (SpApp sp v) t = SApp (readbSpine r n sp t) (r.el n v)
+readbSpine r n (SpProj sp x) t = SProj (readbSpine r n sp t) x
+readbSpine r n (SpSpec sp x v) t =
+  SSpecialize (readbSpine r n sp t) x (r.el n v)
+
+readbBare : Rb -> Int -> V.Head -> V.Spine V.V -> Sx.Tm
+readbBare r n (HMeta m) sp = case localArgs sp of
+  Just idxs ->
+    SMetaApp m (A.fromList (map (\l -> n - l - 1) (reverse idxs))) (SU SmallU)
+  Nothing -> readbSpine r n sp (readbHead n (HMeta m))
+readbBare r n h sp = readbSpine r n sp (readbHead n h)
+
+-- | an evaluation read back as syntax of the same case
+readbEvF : Rb -> Int -> V.Ev V.V -> Sx.Tm
+readbEvF r n (Nom v) = r.el n v
+readbEvF r n (Describe v) = r.el n v
+readbEvF r n (Become v) = SIs (r.el n v)
+
+readbEvTypeF : Rb -> Int -> V.Ev V.Ty -> Sx.Ty
+readbEvTypeF r n (Nom a) = r.ty n a
+readbEvTypeF r n (Describe a) = r.ty n a
+readbEvTypeF r n (Become a) = SIsTy (r.ty n a)
+
+readbCloEl : Rb -> Int -> V.Ty -> V.Clo V.V V.V -> Sx.Abs Sx.Tm
+readbCloEl r n dom (MkClo x l f) =
+  MkAbs x (readbEvF r (n + 1) (f (V.snocL l (V.local n dom))))
+readbCloEl r n dom (CloConst t) = AbsConst (readbEvF r n t)
+
+readbCloTy : Rb -> Int -> V.Ty -> V.Clo V.V V.Ty -> Sx.Abs Sx.Ty
+readbCloTy r n dom (MkClo x l f) =
+  MkAbs x (readbEvTypeF r (n + 1) (f (V.snocL l (V.local n dom))))
+readbCloTy r n dom (CloConst t) = AbsConst (readbEvTypeF r n t)
+
+readbTermF : Rb -> Int -> V.V -> Sx.Tm
+readbTermF r n (VNeu h sp ty expansion desc) = readbBare r n h sp
+readbTermF r n (VCode a) = SCode (r.ty n a)
+readbTermF r n (VLam fty body) =
+  SLam (r.ty n (P.forceTh fty)) (readbCloEl r n (V.lamDom (P.forceTh fty)) body)
+readbTermF r n (VCons d) = SCons (D.mapD (readbEvF r n) d)
+readbTermF r n VOpaque = SOpaque
+
+-- | a record type's fields, each under the ones before it
+goRT : Rb -> Int -> V.Locals V.V -> List (V.Locals V.V -> V.Field) -> List Sx.Ty
+goRT r i ls Nil = Nil
+goRT r i ls (Cons f rest) = case f ls of
+  MkField ty value ->
+    Cons (r.ty i ty) (goRT r (i + 1) (V.snocL ls (V.local i ty)) rest)
+
+sumVariant : Rb -> Int -> P.Th V.Ty -> Sx.Ty
+sumVariant r n t = r.ty n (P.forceTh t)
+
+readbTypeF : Rb -> Int -> V.Ty -> Sx.Ty
+readbTypeF r n (VU u) = SU u
+readbTypeF r n (VDecode h sp u described el) =
+  SDecode (readbSpine r n sp (readbHead n h))
+readbTypeF r n (VFunction level dom cod implicit) =
+  SFunction level (r.ty n dom) (readbCloTy r n dom cod) implicit
+readbTypeF r n (VRecord level capture fieldTypes) =
+  SRecord
+    level
+    { keys = fieldTypes.keys
+    , byName = fieldTypes.byName
+    , values = A.fromList (goRT r n capture (A.toList fieldTypes.values))
+    }
+readbTypeF r n (VSum st) = SSum (P.variantsMap (sumVariant r n) st)
+readbTypeF r n VPrimInt = SPrimInt
+readbTypeF r n VPrimFloat = SPrimFloat
+readbTypeF r n VPrimString = SPrimString
+readbTypeF r n (VPrimArray a) = SPrimArray (r.ty n a)
+
+rb : Rb
+rb = { el = \n v -> readbTermF rb n v, ty = \n t -> readbTypeF rb n t }
+
+readbEl : Int -> V.V -> Sx.Tm
+readbEl n v = rb.el n v
+
+readbBareN : Int -> V.Head -> V.Spine V.V -> Sx.Tm
+readbBareN n h sp = readbBare rb n h sp
+
+readbTy : Int -> V.Ty -> Sx.Ty
+readbTy n t = rb.ty n t
+
+readbEv : Int -> V.Ev V.V -> Sx.Tm
+readbEv n e = readbEvF rb n e
+
+-- the identity on Int, as core syntax, and the NbE round trip
+idTm : Sx.Tm
+idTm =
+  SLam
+    (SFunction Small SPrimInt (AbsConst SPrimInt) Expl)
+    (MkAbs "x" (SLocal 0))
+
+-- >>> readbEl 0 (V.nom (E.eval G.emptyGlobals N idTm LNil))
+-- SLam (SFunction Small SPrimInt (AbsConst SPrimInt) Expl) (MkAbs "x" (SLocal 0))
+
+-- a beta step against a free local
+-- >>> readbEl 1 (V.nom (E.eval G.emptyGlobals N (SApp idTm (SLocal 0)) (V.snocL LNil (V.local 0 VPrimInt))))
+-- SLocal 0

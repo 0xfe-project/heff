@@ -1,0 +1,687 @@
+-- Core syntax printed in the surface syntax (`heff.surface` reads
+-- it back).  Blocks (`case`) are laid out: their alternatives go
+-- on lines of their own, indented past the line they start on; a
+-- stored definition with the shape of equations is printed back as
+-- them.
+
+import array as A
+import heff.dict as D
+import heff.params as Pm
+import heff.syntax as Sx
+import prelude
+
+-- | which arguments of an application are implicit (by the name of
+-- | their binder), from its head; and whether to leave them out or
+-- | write them as `(x := a)`
+type Implicits =
+  { names : List String -> Sx.Tm -> Array (Maybe String), hide : Bool }
+
+-- | nothing is implicit, and what is marked so is hidden: the tools'
+-- | default
+arrayNone : Array (Maybe String)
+arrayNone = A.fromList Nil
+
+plainImplicits : Implicits
+plainImplicits = { names = \xs e -> arrayNone, hide = True }
+
+type Ctx = { im : Implicits, indent : Int }
+
+deepen : Ctx -> Ctx
+deepen c = { im = c.im, indent = c.indent + 2 }
+
+-- | precedences: 0 anything, 1 an operand of `->`, `~` or an operator,
+-- | 2 an argument
+paren : Bool -> String -> String
+paren b s = if b then "(" ++ s ++ ")" else s
+
+spaces : Int -> String
+spaces n = joinWith "" (replicate n " ")
+
+escAt : String -> Int -> String
+escAt s i =
+  if charCode s i == 34 then "\\\""
+  else if charCode s i == 92 then "\\\\"
+  else if charCode s i == 10 then "\\n"
+  else if charCode s i == 13 then "\\r"
+  else if charCode s i == 9 then "\\t"
+  else strSlice s i (i + 1)
+
+quoteGo : String -> Int -> String -> String
+quoteGo s i acc =
+  if i >= strLength s then acc else quoteGo s (i + 1) (acc ++ escAt s i)
+
+quoteString : String -> String
+quoteString s = "\"" ++ quoteGo s 0 "" ++ "\""
+
+wordOf : Int -> Maybe String
+wordOf c =
+  if c == 43 then Just "plus"
+  else if c == 45 then Just "minus"
+  else if c == 42 then Just "times"
+  else if c == 47 then Just "slash"
+  else if c == 37 then Just "percent"
+  else if c == 61 then Just "eq"
+  else if c == 60 then Just "lt"
+  else if c == 62 then Just "gt"
+  else if c == 38 then Just "amp"
+  else if c == 124 then Just "bar"
+  else if c == 33 then Just "bang"
+  else if c == 94 then Just "caret"
+  else if c == 63 then Just "q"
+  else if c == 64 then Just "at"
+  else if c == 35 then Just "hash"
+  else if c == 36 then Just "dollar"
+  else if c == 126 then Just "tilde"
+  else if c == 58 then Just "colon"
+  else if c == 46 then Just "dot"
+  else if c == 92 then Just "backslash"
+  else Nothing
+
+operatorGo : String -> Int -> List String -> Maybe (List String)
+operatorGo x i acc =
+  if i >= strLength x then Just (reverse acc)
+  else case wordOf (charCode x i) of
+    Just w -> operatorGo x (i + 1) (Cons w acc)
+    Nothing -> Nothing
+
+operatorDone : Maybe (List String) -> Maybe String
+operatorDone (Just ws) = Just ("op_" ++ joinWith "_" ws)
+operatorDone Nothing = Nothing
+
+operatorName : String -> Maybe String
+operatorName x =
+  if strEq x "" then Nothing else operatorDone (operatorGo x 0 Nil)
+
+isOperator : String -> Bool
+isOperator x = maybe False (\w -> True) (operatorName x)
+
+-- | a name as written alone: an operator in parentheses, `(+)`
+named : String -> String
+named x = if isOperator x then "(" ++ x ++ ")" else x
+
+upper : String -> Bool
+upper x = 65 <= charCode x 0 && charCode x 0 <= 90
+
+-- | a tag: a capitalised one is written as a constructor
+tagText : String -> String
+tagText t = if upper t then t else "'" ++ t
+
+nth : {a : Type} -> List a -> Int -> Maybe a
+nth Nil i = Nothing
+nth (Cons x xs) i =
+  if i == 0 then Just x else if i < 0 then Nothing else nth xs (i - 1)
+
+-- | a local by its index; one shadowed by an inner one of the same name
+-- | is primed
+localName : List String -> Int -> String
+localName xs i = case nth xs i of
+  Just x ->
+    x
+    ++ joinWith
+      ""
+      (replicate (length (filter (\y -> strEq y x) (take i xs))) "'")
+  Nothing -> "?" ++ showInt i
+
+-- | the printers, knotted
+type PK =
+  { el : Ctx -> Int -> List String -> Sx.Tm -> String
+  , ty : Ctx -> Int -> List String -> Sx.Ty -> String
+  }
+
+type Spine = { head : Sx.Tm, args : List Sx.Tm }
+
+spineGo : Sx.Tm -> List Sx.Tm -> Spine
+spineGo (SApp f a) acc = spineGo f (Cons a acc)
+spineGo h acc = { head = h, args = acc }
+
+spineOf : Sx.Tm -> Spine
+spineOf t = spineGo t Nil
+
+isImplicitArg : Sx.Tm -> Bool
+isImplicitArg (SImplicit _ _) = True
+isImplicitArg _ = False
+
+joinM : {a : Type} -> Maybe (Maybe a) -> Maybe a
+joinM (Just m) = m
+joinM Nothing = Nothing
+
+type Imp = { n : String, inner : Sx.Tm }
+
+-- (an implicit argument: marked so by the elaborator, or (in what was
+-- stored before it did) known from the head's type)
+implicitName : Array (Maybe String) -> Int -> Sx.Tm -> Maybe Imp
+implicitName names i (SImplicit n inner) = Just { n = n, inner = inner }
+implicitName names i a = case joinM (nth (A.toList names) i) of
+  Just n -> Just { n = n, inner = a }
+  Nothing -> Nothing
+
+type Lams = { names : List String, binders : List String, body : Sx.Tm }
+
+lambdas : List String -> List String -> Sx.Tm -> Lams
+lambdas ys bs e = case e of
+  SLam (SFunction _ _ _ Impl) (MkAbs x b) ->
+    lambdas (Cons x ys) (Cons ("{" ++ x ++ "}") bs) b
+  SLam (SFunction _ _ _ Inst) (MkAbs x b) ->
+    lambdas (Cons x ys) (Cons ("{" ++ x ++ "}") bs) b
+  SLam _ (MkAbs x b) -> lambdas (Cons x ys) (Cons x bs) b
+  SLam _ (AbsConst b) -> lambdas ys (Cons "_" bs) b
+  _ -> { names = ys, binders = reverse bs, body = e }
+
+argStrs : PK
+        -> Ctx
+        -> List String
+        -> Array (Maybe String)
+        -> Int
+        -> List Sx.Tm
+        -> List String
+argStrs k c xs names i Nil = Nil
+argStrs k c xs names i (Cons a rest) = case implicitName names i a of
+  Just imp ->
+    if c.im.hide then argStrs k c xs names (i + 1) rest
+    else Cons
+        ("(" ++ imp.n ++ " := " ++ k.el c 0 xs imp.inner ++ ")")
+        (argStrs k c xs names (i + 1) rest)
+  Nothing -> Cons (k.el c 2 xs a) (argStrs k c xs names (i + 1) rest)
+
+altLine : PK
+        -> Ctx
+        -> List String
+        -> Pair String (Pair (Array String) Sx.Tm)
+        -> String
+altLine k inner xs (MkPair t (MkPair ys body)) =
+  "\n"
+  ++ spaces inner.indent
+  ++ joinWith " " (Cons (tagText t) (A.toList ys))
+  ++ " -> "
+  ++ k.el inner 0 (foldl (\acc y -> Cons y acc) xs (A.toList ys)) body
+
+opHead : Sx.Tm -> String
+opHead (SGlobal x) = x
+opHead _ = ""
+
+opApp : Ctx -> List String -> Spine -> Maybe (Pair Sx.Tm Sx.Tm)
+opApp c xs sp = case sp.head of
+  SGlobal x -> case sp.args of
+    Cons l (Cons r2 Nil) ->
+      if isOperator x && not (isImplicitArg l || isImplicitArg r2)
+        then Just (MkPair l r2)
+      else Nothing
+    _ -> Nothing
+  _ -> Nothing
+
+appDone : Int -> String -> List String -> String -> String
+appDone p headArg args headAlone =
+  if null args then headAlone
+  else paren (p >= 2) (joinWith " " (Cons headArg args))
+
+appPlain : PK -> Ctx -> Int -> List String -> Spine -> String
+appPlain k c p xs sp =
+  appDone
+    p
+    (k.el c 2 xs sp.head)
+    (argStrs k c xs (c.im.names xs sp.head) 0 sp.args)
+    (k.el c p xs sp.head)
+
+appStr : PK -> Ctx -> Int -> List String -> Sx.Tm -> String
+appStr k c p xs t = case opApp c xs (spineOf t) of
+  -- `a + b`: an operator applied to two (its fixity unknown here, an
+  -- operand that is an operator's is parenthesised)
+  Just (MkPair l r2) ->
+    paren
+      (p >= 1)
+      (k.el c 1 xs l ++ " " ++ opHead (spineOf t).head ++ " " ++ k.el c 1 xs r2)
+  Nothing -> appPlain k c p xs (spineOf t)
+
+lamStr : PK -> Ctx -> Int -> List String -> Lams -> String
+lamStr k c p xs l =
+  paren
+    (p >= 1)
+    ("\\" ++ joinWith " " l.binders ++ " -> " ++ k.el c 0 l.names l.body)
+
+consField : PK -> Ctx -> List String -> Pair String Sx.Tm -> String
+consField k c xs (MkPair l e) = l ++ " = " ++ k.el c 0 xs e
+
+elF : PK -> Ctx -> Int -> List String -> Sx.Tm -> String
+elF k c p xs e = case e of
+  SLocal i -> localName xs i
+  -- (an operator, alone: `(+)`)
+  SGlobal x -> if isOperator x then "(" ++ x ++ ")" else x
+  SCode t -> k.ty c p xs t
+  SApp f a -> appStr k c p xs (SApp f a)
+  SLam t b -> lamStr k c p xs (lambdas xs Nil (SLam t b))
+  SCons d ->
+    "{ " ++ joinWith ", " (map (\f -> consField k c xs f) (D.toList d)) ++ " }"
+  SProj e2 l -> k.el c 2 xs e2 ++ "." ++ l
+  STag x ts ->
+    if length (A.toList ts) == 0 then tagText x
+    else paren
+        (p >= 2)
+        (joinWith
+           " "
+           (Cons (tagText x) (map (\a -> k.el c 2 xs a) (A.toList ts))))
+  SMatch s cases ->
+    paren
+      (p >= 1)
+      ("case "
+       ++ k.el c 0 xs s
+       ++ " of"
+       ++ joinWith
+         ""
+         (map (\alt -> altLine k (deepen c) xs alt) (D.toList cases)))
+  SSpecialize e2 x v ->
+    paren
+      (p >= 1)
+      (k.el c 2 xs e2 ++ " ~ { " ++ x ++ " = " ++ k.el c 0 xs v ++ " }")
+  SIs e2 -> k.el c p xs e2
+  SRec e2 -> k.el c p xs e2
+  SOpaque -> "<opaque>"
+  SAbandon -> "abandon"
+  SMetaApp m _ _ -> "?" ++ showInt m
+  SLitInt i -> showInt i
+  SLitFloat x -> showFloat x
+  SLitString s -> quoteString s
+  SImplicit _ e2 -> k.el c p xs e2
+  SPrim x -> "<primitive " ++ x ++ ">"
+
+type FieldsAcc = { names : List String, out : List String }
+
+recordField : PK -> Ctx -> FieldsAcc -> Pair String Sx.Ty -> FieldsAcc
+recordField k c acc (MkPair l t) =
+  { names = Cons l acc.names
+  , out = concatList acc.out (Cons (l ++ " : " ++ k.ty c 0 acc.names t) Nil)
+  }
+
+recordDone : FieldsAcc -> List String
+recordDone acc = acc.out
+
+recordFields : PK
+             -> Ctx
+             -> List String
+             -> List (Pair String Sx.Ty)
+             -> List String
+recordFields k c xs fs =
+  recordDone
+    (foldl
+       (\acc (f : Pair String Sx.Ty) -> recordField k c acc f)
+       { names = xs, out = Nil }
+       fs)
+
+variantStr : PK -> Ctx -> List String -> Pair String (Array Sx.Ty) -> String
+variantStr k c xs (MkPair t ts) =
+  joinWith " " (Cons (tagText t) (map (\t2 -> k.ty c 2 xs t2) (A.toList ts)))
+
+type Grouped = { names : List String, rest : Sx.Ty, ctx : List String }
+
+-- (only binders of a universe: their types cannot mention one another)
+implicitGroup : List String -> Pm.Universe -> Sx.Ty -> List String -> Grouped
+implicitGroup names u rest ctx = case rest of
+  SFunction _ (SU u') (MkAbs y b) Impl ->
+    if Pm.eqUniverse u u'
+      then implicitGroup (concatList names (Cons y Nil)) u b (Cons y ctx)
+    else { names = names, rest = rest, ctx = ctx }
+  _ -> { names = names, rest = rest, ctx = ctx }
+
+arrowGrouped : PK -> Ctx -> List String -> Sx.Ty -> Grouped -> String
+arrowGrouped k c xs dom r =
+  "{"
+  ++ joinWith " " r.names
+  ++ " : "
+  ++ k.ty c 0 xs dom
+  ++ "} -> "
+  ++ k.ty c 0 r.ctx r.rest
+
+arrowStr : PK
+         -> Ctx
+         -> List String
+         -> Pm.Level
+         -> Sx.Ty
+         -> Sx.Abs Sx.Ty
+         -> Pm.Plicity
+         -> String
+arrowStr k c xs level dom cod implicit = case cod of
+  MkAbs x b -> case implicit of
+    Impl ->
+      -- `{a b : T}`: implicit binders of the same type, together
+      arrowGrouped
+        k
+        c
+        xs
+        dom (case dom of
+      SU u -> implicitGroup (Cons x Nil) u b (Cons x xs)
+      _ -> { names = Cons x Nil, rest = b, ctx = Cons x xs })
+    -- `{{x : T}} ->`, an instance binder
+    Inst ->
+      "{{"
+      ++ x
+      ++ " : "
+      ++ k.ty c 0 xs dom
+      ++ "}} -> "
+      ++ k.ty c 0 (Cons x xs) b
+    Expl ->
+      "(" ++ x ++ " : " ++ k.ty c 0 xs dom ++ ") -> " ++ k.ty c 0 (Cons x xs) b
+  AbsConst b -> case implicit of
+    Inst -> "{{_ : " ++ k.ty c 0 xs dom ++ "}} -> " ++ k.ty c 0 xs b
+    _ -> k.ty c 1 xs dom ++ " -> " ++ k.ty c 0 xs b
+
+tyF : PK -> Ctx -> Int -> List String -> Sx.Ty -> String
+tyF k c p xs t = case t of
+  SU SmallU -> "Type"
+  SU LargeU -> "Theory"
+  SDecode e -> k.el c p xs e
+  SFunction level dom cod implicit ->
+    paren (p >= 1) (arrowStr k c xs level dom cod implicit)
+  SRecord _ fs ->
+    "{ " ++ joinWith ", " (recordFields k c xs (D.toList fs)) ++ " }"
+  SSum vs ->
+    "data { "
+    ++ joinWith " | " (map (\v -> variantStr k c xs v) (D.toList vs))
+    ++ " }"
+  SIsTy t2 -> k.ty c p xs t2
+  SPrimInt -> "Int"
+  SPrimFloat -> "Float"
+  SPrimString -> "String"
+  SPrimArray a -> paren (p >= 2) ("Array " ++ k.ty c 2 xs a)
+
+pk : PK
+pk = { el = \c p xs e -> elF pk c p xs e, ty = \c p xs t -> tyF pk c p xs t }
+
+printEl : Implicits -> Int -> List String -> Sx.Tm -> String
+printEl im p xs e = pk.el { im = im, indent = 0 } p xs e
+
+printTy : Implicits -> Int -> List String -> Sx.Ty -> String
+printTy im p xs t = pk.ty { im = im, indent = 0 } p xs t
+
+-- Equations
+--------------------------------------------------------------------------------
+
+-- | a pattern: a variable (by de Bruijn level) or a tag of patterns
+data Pat = PVar Int | PTag String (List Pat)
+
+-- | how equations are written: a tag in a pattern, what separates the
+-- | sides, how many equations it takes to write a definition so (one:
+-- | any function is `f x = ...`), and a body
+type Style =
+  { tag : String -> String
+  , sep : String
+  , minRows : Int
+  , body : List String -> Sx.Tm -> String
+  }
+
+type Clause = { pats : List Pat, names : List String, body : Sx.Tm }
+
+mkClause : List Pat -> List String -> Sx.Tm -> Clause
+mkClause pats names body = { pats = pats, names = names, body = body }
+
+isLamE : Sx.Tm -> Bool
+isLamE (SLam _ _) = True
+isLamE _ = False
+
+isMatchE : Sx.Tm -> Bool
+isMatchE (SMatch _ _) = True
+isMatchE _ = False
+
+hasVar : Int -> Pat -> Bool
+hasVar l (PVar l2) = l == l2
+hasVar l (PTag _ qs) = any (\q -> hasVar l q) qs
+
+refine : Int -> Pat -> Pat -> Pat
+refine l p (PVar l2) = if l == l2 then p else PVar l2
+refine l p (PTag t qs) = PTag t (map (\q -> refine l p q) qs)
+
+-- | a pattern in argument position
+patAtom : Style -> List String -> Pat -> String
+patAtom style ns (PVar l) = fromMaybe "_" (nth ns (length ns - 1 - l))
+patAtom style ns (PTag t Nil) = style.tag t
+patAtom style ns (PTag t qs) =
+  "("
+  ++ style.tag t
+  ++ " "
+  ++ joinWith " " (map (\q -> patAtom style ns q) qs)
+  ++ ")"
+
+absBody : Sx.Abs Sx.Ty -> Sx.Ty
+absBody (MkAbs _ t) = t
+absBody (AbsConst t) = t
+
+subPats : Int -> Int -> List String -> List Pat
+subPats base k Nil = Nil
+subPats base k (Cons _ rest) =
+  Cons (PVar (base + k)) (subPats base (k + 1) rest)
+
+-- the lambdas of the explicit arguments (the type says which are); an
+-- implicit one ends the equations' shape
+eqLams : List String -> List Pat -> Sx.Ty -> Sx.Tm -> Clause
+eqLams ns ps ty b = case ty of
+  SFunction _ _ cod Impl -> case b of
+    SLam _ (MkAbs x body) ->
+      -- an implicit argument is not written in the equations: it is in
+      -- scope
+      eqLams
+        (Cons x ns)
+        ps
+        (absBody cod)
+        body
+    SIs e -> if isLamE e then eqLams ns ps ty e else mkClause ps ns b
+    _ -> mkClause ps ns b
+  SFunction _ _ cod Expl -> case b of
+    SLam _ (MkAbs x body) ->
+      eqLams
+        (Cons x ns)
+        (concatList ps (Cons (PVar (length ns)) Nil))
+        (absBody cod)
+        body
+    -- `_ => e`: not by cases
+    SLam _ (AbsConst _) -> mkClause Nil ns b
+    SIs e -> if isLamE e then eqLams ns ps ty e else mkClause ps ns b
+    _ -> mkClause ps ns b
+  -- (an instance argument is not written in the equations either: it
+  -- is in scope, by its name)
+  SFunction _ _ cod Inst -> case b of
+    SLam _ (MkAbs x body) -> eqLams (Cons x ns) ps (absBody cod) body
+    SIs e -> if isLamE e then eqLams ns ps ty e else mkClause ps ns b
+    _ -> mkClause ps ns b
+  SIsTy _ -> mkClause ps ns b
+  _ -> case b of
+    SIs e -> if isLamE e then eqLams ns ps ty e else mkClause ps ns b
+    _ -> mkClause ps ns b
+
+-- refine the patterns by every `match` on one of their variables
+eqGo : List String -> List Pat -> Sx.Tm -> List Clause
+eqGo ns ps body = case body of
+  -- `is` marks where a description is made; equations do not show it
+  SIs e ->
+    if length ps > 0 && isMatchE e then eqGo ns ps e
+    else Cons (mkClause ps ns body) Nil
+  SMatch (SLocal i) arms ->
+    if any (\p2 -> hasVar (length ns - 1 - i) p2) ps
+      then concatMap
+          (\arm -> case arm of
+           MkPair t (MkPair xs b) ->
+             eqGo
+               (foldl (\acc x -> Cons x acc) ns (A.toList xs))
+               (map
+                  (\p2 ->
+                     refine
+                       (length ns - 1 - i)
+                       (PTag t (subPats (length ns) 0 (A.toList xs)))
+                       p2)
+                  ps)
+               b)
+          (D.toList arms)
+    else Cons (mkClause ps ns body) Nil
+  _ -> Cons (mkClause ps ns body) Nil
+
+eqRow : Style -> String -> Clause -> String
+eqRow style f r =
+  joinWith " " (Cons f (map (\p2 -> patAtom style r.names p2) r.pats))
+  ++ " "
+  ++ style.sep
+  ++ " "
+  ++ style.body r.names r.body
+
+eqRows : Style -> String -> List Pat -> List Clause -> Maybe (List String)
+eqRows style f pats rows =
+  if null pats || length rows < style.minRows then Nothing
+  else Just (map (\r -> eqRow style f r) rows)
+
+eqTake : Style -> String -> Clause -> Maybe (List String)
+eqTake style f lam = eqRows style f lam.pats (eqGo lam.names lam.pats lam.body)
+
+equationsWith : Style
+              -> String
+              -> List String
+              -> Sx.Ty
+              -> Sx.Tm
+              -> Maybe (List String)
+equationsWith style f names0 ty0 el0 =
+  eqTake style f (eqLams names0 Nil ty0 el0)
+
+-- Definitions and signatures
+--------------------------------------------------------------------------------
+
+primitiveOf : Sx.Tm -> Maybe String
+primitiveOf (SPrim x) = Just x
+primitiveOf (SIs e) = primitiveOf e
+primitiveOf _ = Nothing
+
+stripIs : Sx.Tm -> Sx.Tm
+stripIs (SIs e) = stripIs e
+stripIs e = e
+
+unIsTy : Sx.Ty -> Sx.Ty
+unIsTy (SIsTy d) = unIsTy d
+unIsTy d = d
+
+type Former =
+  { params : List String, names : List String, def : Sx.Ty, large : Bool }
+
+-- | `(p : A) -> ... -> Type` defined by lambdas and then a type: a
+-- | `data`, a `type` or a `theory` (`large`: into `Theory`)
+formerAt : List String -> List String -> Sx.Tm -> Bool -> Former
+formerAt params ns b large = case b of
+  SCode d -> { params = params, names = ns, def = unIsTy d, large = large }
+  -- (`type T = Tk.T`: a type-valued term, an alias among them)
+  _ -> { params = params, names = ns, def = SDecode b, large = large }
+
+-- (a parameter of type `Type` is bare if it is lower case: `data List a`)
+formerParam : List String -> String -> Sx.Ty -> String
+formerParam ns x dom = case dom of
+  SU SmallU -> if upper x then "(" ++ x ++ " : Type)" else x
+  _ ->
+    "("
+    ++ x
+    ++ " : "
+    ++ printTy { names = \xs2 e2 -> arrayNone, hide = False } 0 ns dom
+    ++ ")"
+
+typeFormer : Sx.Ty -> Sx.Tm -> List String -> List String -> Maybe Former
+typeFormer t body ns params = case t of
+  SU u -> Just (formerAt params ns (stripIs body) (Pm.eqUniverse u LargeU))
+  SFunction _ dom (MkAbs _ cod) Expl -> case body of
+    SLam _ (MkAbs x b) ->
+      typeFormer
+        cod
+        b
+        (Cons x ns)
+        (concatList params (Cons (formerParam ns x dom) Nil))
+    SIs b -> typeFormer t b ns params
+    _ -> Nothing
+  _ -> case body of
+    SIs b -> typeFormer t b ns params
+    _ -> Nothing
+
+formerHead : String -> List String -> String
+formerHead name params = joinWith " " (Cons name params)
+
+formerOf : Ctx -> String -> Former -> Maybe String
+formerOf c name tf = case tf.def of
+  SSum vs ->
+    if tf.large then Nothing
+    else Just
+        ("data "
+         ++ formerHead name tf.params
+         ++ (if null (D.toList vs) then ""
+             else " = "
+               ++ joinWith
+                 " | "
+                 (map (\v -> variantStr pk c tf.names v) (D.toList vs)))
+         ++ "\n")
+  SRecord _ fs ->
+    if tf.large
+      then Just
+          ("theory "
+           ++ formerHead name tf.params
+           ++ " where\n"
+           ++ joinWith
+             "\n"
+             (map (\l -> "  " ++ l) (recordFields pk c tf.names (D.toList fs)))
+           ++ "\n")
+    else Just
+        ("type "
+         ++ formerHead name tf.params
+         ++ " = "
+         ++ pk.ty c 0 tf.names tf.def
+         ++ "\n")
+  _ ->
+    if tf.large then Nothing
+    else Just
+        ("type "
+         ++ formerHead name tf.params
+         ++ " = "
+         ++ pk.ty c 0 tf.names tf.def
+         ++ "\n")
+
+-- | a definition written back as `data`, `type` or `theory`, where it
+-- | has their shape
+former : Implicits -> String -> Sx.Ty -> Sx.Tm -> Maybe String
+former im name t body = case typeFormer t body (Cons name Nil) Nil of
+  Just tf -> formerOf { im = im, indent = 0 } name tf
+  Nothing -> Nothing
+
+printGeneral : Implicits -> String -> Sx.Ty -> Sx.Tm -> String
+printGeneral im name t body =
+  name
+  ++ " : "
+  ++ printTy im 0 Nil t
+  ++ "\n"
+  ++ (case equationsWith
+        { tag = tagText
+        , sep = "="
+        , minRows = 1
+        , body = \ns e -> pk.el { im = im, indent = 0 } 0 ns e
+        }
+        name
+        (Cons name Nil)
+        t
+        body of
+      Just eqs -> joinWith "" (map (\l -> l ++ "\n") eqs)
+      Nothing ->
+        name
+        ++ " = "
+        ++ pk.el { im = im, indent = 0 } 0 (Cons name Nil) body
+        ++ "\n")
+
+-- | a stored definition: as `data`, `type`, `theory` or `foreign
+-- | import` where it has their shape, else a signature and equations
+printDef : Implicits -> String -> Sx.Ty -> Sx.Tm -> String
+printDef im name t body = case primitiveOf body of
+  Just _ -> "foreign import " ++ name ++ " : " ++ printTy im 0 Nil t ++ "\n"
+  Nothing -> fromMaybe (printGeneral im name t body) (former im name t body)
+
+-- | a definition as an interface has it: `data`, `type` and `theory` in
+-- | full -- an importer sees through them -- and any other as its
+-- | signature.  `shown` is the name as a signature writes it (an
+-- | operator in parentheses)
+printSig : Implicits -> String -> String -> Sx.Ty -> Sx.Tm -> String
+printSig im name shown t body = case primitiveOf body of
+  Just _ -> shown ++ " : " ++ printTy im 0 Nil t ++ "\n"
+  Nothing ->
+    fromMaybe
+      (shown ++ " : " ++ printTy im 0 Nil t ++ "\n")
+      (former im name t body)
+
+-- >>> printTy plainImplicits 0 Nil (SFunction Small SPrimInt (AbsConst SPrimInt) Expl)
+-- "Int -> Int"
+
+-- >>> printEl plainImplicits 0 Nil (SApp (SApp (SGlobal "+") (SLitInt 1)) (SLitInt 2))
+-- "1 + 2"

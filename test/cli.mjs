@@ -49,7 +49,7 @@ expect("fmt of what does not parse", refused.status === 1 && refused.stderr.incl
 
 // the usage: asked for, on stdout; for what is no command (or a command
 // without its files), on stderr, failing
-const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "lsp", "completions"];
+const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "lsp", "completions"];
 for (const args of [[], ["help"]]) {
   const r = heff(...args);
   expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND FILE ...") &&
