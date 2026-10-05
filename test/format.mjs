@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The formatter (src/Heff/Format.purs): every .hf file of the repository
+// The formatter (compiler/format.hf): every .hf file of the repository
 // (that parses) is formatted (the formatter checks itself that the result means the same and
 // keeps the comments) and formatting it again changes nothing; then cases
 // of comments, blank lines, blocks and watches, some with the exact result.
@@ -7,19 +7,19 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { format } from "../output/Heff.Format/index.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-// `format` lays out through the formatter written in heff: have the CLI
-// compile it if it is stale, then load it, as `bin/heff.mjs` does
-execFileSync("node", [ join(root, "bin", "heff.mjs"), "fmt", "--check", join(root, "lib", "doc.hf") ]);
-globalThis.$heffFormatUnchecked = (await import(pathToFileURL(join(root, "output", "heff-fmt.mjs")))).default.formatUnchecked;
+// the formatter, compiled to a module of its own, its `format` called
+// directly: `Right` the text laid out, `Left` why not
+const module = join(root, "output", "heff-format.mjs");
+execFileSync("node", [join(root, "bin", "heff.mjs"), "compile-js", "compiler/format.hf", module], { cwd: root });
+const { format } = (await import(pathToFileURL(module))).default;
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}:\n${got}`); } };
 const run = (src) => {
   const r = format(src);
-  return r.constructor.name === "Right" ? { ok: true, out: r.value0 } : { ok: false, why: r.value0 };
+  return r.$ === "Right" ? { ok: true, out: r.a[0] } : { ok: false, why: r.a[0] };
 };
 // formatted, and formatting it again changes nothing
 const formats = (what, src, want) => {

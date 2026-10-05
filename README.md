@@ -30,15 +30,15 @@ foreign import intAdd : Int -> Int -> Int              -- a primitive
 
 ```sh
 npm install
-npm run build     # the reference (PureScript), then the compiler compiling itself
+npm run build     # the compiler, compiled by itself from its seed
 npm link          # puts `heff` on the PATH
 ```
 
-`heff` is the self-hosted compiler (`compiler/`), bootstrapped by the
-reference: the reference compiles it once, and what that makes compiles
-it again, to `output/heff.mjs`.  Only `dump-nbe` -- the reference's
-own side of the differential tests -- is still the reference's
-(`bin/reference.mjs`).
+heff is written in heff (`compiler/`, and the formatter in `fmt/`).  Its
+seed, `boot/heff.mjs`, is the compiler compiled by itself; `npm run
+build` has the seed compile the source, and what that makes compile it
+again, to `output/heff.mjs` -- the source's compiler, by the source's
+backend.  (Before a build, `heff` runs the seed.)
 
 For VS Code, `editors/vscode` is an extension: highlighting, and the
 language server (diagnostics, hover, go to definition, completion,
@@ -203,10 +203,18 @@ stages of a pipeline, each shown or not by the handler
 
 ## Developing
 
-`npm test` runs the tests.
+`npm test` runs the tests: the expectations under the watches, the
+language server, compiled programs against the interpreter, the texts
+heff says of the library's and the tests' files (`test/golden/`, kept
+with `node test/golden.mjs --update`), and the fixpoint -- the compiler
+compiles itself to itself, byte for byte.
 
-The formatter is written in heff itself (`fmt/`): `heff fmt` and the
-language server compile it -- with heff -- when it is missing or stale
-(`output/heff-fmt.mjs`), and lay files out through it.  The layout in
-`Heff.Format` stays as the reference: `test/fmt-port.mjs` holds the two
-byte for byte the same over every `.hf` file of the repository.
+The seed is renewed with `npm run boot`, when the language changes so
+that the old seed cannot compile the new source: the compiler built,
+once it compiles itself to itself, becomes `boot/heff.mjs`.
+
+heff began as a PureScript implementation (the reference); the compiler
+was ported to heff against it -- every definition elaborated, every
+message, every compiled module byte for byte the same -- and the
+reference was retired once nothing but it was left.  `test/golden/`
+holds what it said.

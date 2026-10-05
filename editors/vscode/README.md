@@ -7,7 +7,7 @@ definition (of globals, across modules and `lib/`), and formatting.
 The server is the repository's `bin/heff.mjs`, so build heff first:
 
 ```sh
-npm install && npx spago build     # at the repository's root
+npm install && npm run build     # at the repository's root
 ```
 
 ## Running it from the repository

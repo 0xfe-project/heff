@@ -28,7 +28,7 @@ for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genPro
 
 // (a generated program needs no depth: one that goes deep diverges, and is
 // said to sooner; and heff that does not finish is a failure, not a wait)
-const heff = (args, depth) => spawnSync("node", [join(root, "bin", "reference.mjs"), ...args], { encoding: "utf8", timeout: 120000, env: depth ? { ...process.env, HEFF_DEPTH: String(depth) } : process.env });
+const heff = (args, depth) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8", timeout: 120000, env: depth ? { ...process.env, HEFF_DEPTH: String(depth) } : process.env });
 
 let agree = 0, differ = 0, compileErrors = 0, compared = 0, timeouts = 0;
 for (const c of cases) {
