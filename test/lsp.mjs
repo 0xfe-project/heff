@@ -145,8 +145,8 @@ try {
   ds = await diagnosticsOf(uri("test/surface/lsp-lib.hf"));
   expect("an unsaved file importing the library", ds.length === 0, ds);
   const libDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-lib.hf") }, position: pos(withLib, "Bool") });
-  const boolAt = pos(disk("lib/prelude.hf"), "data Bool");
-  expect("definition in lib/", libDef.result && libDef.result.uri === uri("lib/prelude.hf") &&
+  const boolAt = pos(disk("lib/builtin.hf"), "data Bool");
+  expect("definition in lib/", libDef.result && libDef.result.uri === uri("lib/builtin.hf") &&
     libDef.result.range.start.line === boolAt.line && libDef.result.range.start.character === boolAt.character + 5, libDef.result);
 
   // an import's unsaved text is what the importer sees
