@@ -8,24 +8,25 @@
 -- `test/self-check.mjs`.
 
 import co
-import compiler.cache as Ca
 import compiler.diagnostic as Dg
 import compiler.driver as Dr
 import compiler.effect as Ef
 import compiler.emit as Em
 import compiler.format as Fm
 import compiler.load as L
+import compiler.lsp as Lsp
 import compiler.query as Q
 import compiler.report as Rp
+import compiler.rpc as Rpc
+import compiler.session as Se
 import compiler.toplevel as T
 import fs
-import map as Mp
 import prelude
 import process
 import stdio
 
 world : HFunctor
-world = stdio <+> process <+> fs <+> Rp.report
+world = stdio <+> process <+> fs <+> Rp.report <+> Rpc.rpc
 
 -- the program asks for its worlds' evidence: every computation of it is
 -- a `Heff`, whose operations find the evidence in scope -- given once,
@@ -35,6 +36,7 @@ type Heff a =
   -> {{sys : process <: world}}
   -> {{disk : fs <: world}}
   -> {{rep : Rp.report <: world}}
+  -> {{wire : Rpc.rpc <: world}}
   -> Co world a
 
 -- | where the standard library is: `HEFF_LIB` (the host sets it, beside
@@ -167,70 +169,6 @@ emitErrs (Cons e rest) = do
   printErr ("heff: not compiled: " ++ e)
   emitErrs rest
 
--- The cache: a module whose making is unchanged is thawed from
--- `.heff/<module>.hc` instead of elaborated again; a fresh module that
--- elaborated clean is frozen back (`compiler.cache`).  The file asked
--- for -- the last source -- is always elaborated: its watches and
--- spans are wanted.
-type CacheAcc = { done : List Dr.Checked, hashes : Mp.Map String String }
-
-cacheDir : String -> String
-cacheDir root = L.under root ".heff"
-
-cachePath : String -> String -> String
-cachePath root m = cacheDir root ++ "/" ++ m ++ ".hc"
-
-thawTry : String -> Dr.Source -> CacheAcc -> Heff (Maybe Dr.Thawed)
-thawTry root s acc = do
-  mtxt <- readFile (cachePath root s.module)
-  pure (case mtxt of
-    Just txt -> Ca.melt acc.hashes acc.done s txt
-    Nothing -> Nothing)
-
-cacheKeep : CacheAcc -> Dr.Checked -> CacheAcc
-cacheKeep acc c =
-  { done = concatList acc.done (Cons c Nil)
-  , hashes = Ca.defHashesInto acc.hashes c
-  }
-
-cacheStep : CacheAcc -> Dr.Source -> Maybe Dr.Thawed -> CacheAcc
-cacheStep acc s th = cacheKeep acc (Dr.elabNext acc.done s th)
-
-cachedGo : String -> List Dr.Source -> CacheAcc -> Heff CacheAcc
-cachedGo root Nil acc = pure acc
-cachedGo root (Cons s Nil) acc = pure (cacheStep acc s Nothing)
-cachedGo root (Cons s rest) acc = do
-  th <- thawTry root s acc
-  cachedGo root rest (cacheStep acc s th)
-
-freezeOne : String -> CacheAcc -> Pair Dr.Source Dr.Checked -> Heff Unit
-freezeOne root acc (MkPair s c) =
-  if c.cached || not (null c.diags) then pure MkUnit
-  else case Ca.freeze acc.hashes acc.done s c of
-    Just out -> do
-      ok <- writeFile (cachePath root c.module) out
-      pure MkUnit
-    Nothing -> pure MkUnit
-
-freezeAll : String -> CacheAcc -> List (Pair Dr.Source Dr.Checked) -> Heff Unit
-freezeAll root acc Nil = pure MkUnit
-freezeAll root acc (Cons p rest) = do
-  freezeOne root acc p
-  freezeAll root acc rest
-
-zipSC : List Dr.Source -> List Dr.Checked -> List (Pair Dr.Source Dr.Checked)
-zipSC (Cons s ss) (Cons c cs) = Cons (MkPair s c) (zipSC ss cs)
-zipSC _ _ = Nil
-
--- | the program, each module elaborated or thawed, the fresh clean
--- | ones frozen back
-cachedProgram : L.Loaded -> Heff (List Dr.Checked)
-cachedProgram l = do
-  acc <- cachedGo l.paths.root l.sources { done = Nil, hashes = Mp.empty }
-  ok <- mkDir (cacheDir l.paths.root)
-  freezeAll l.paths.root acc (zipSC l.sources acc.done)
-  pure acc.done
-
 putFileDiags : List Dr.Checked -> Heff Unit
 putFileDiags Nil = pure MkUnit
 putFileDiags (Cons c rest) = do
@@ -313,7 +251,7 @@ compileCmd : String -> Maybe String -> String -> String -> String -> Heff Unit
 compileCmd host name outPath how file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   compileDiags l.paths host file name outPath how (badL > 0) cs
 
 nodeCmd : Maybe String -> String -> String -> Heff Unit
@@ -359,7 +297,7 @@ compileJsCmd : String -> String -> Heff Unit
 compileJsCmd file outPath = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   compileJsDiags file outPath (badL > 0) cs
 
 printEvals : List Dr.Evaluated -> Heff Unit
@@ -382,7 +320,7 @@ evalCmd : String -> Heff Unit
 evalCmd file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   evalDiags (badL > 0) cs
 
 promoteDiags : String -> Bool -> List Dr.Checked -> Heff Unit
@@ -401,7 +339,7 @@ promoteCmd : String -> Heff Unit
 promoteCmd file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   promoteDiags file (badL > 0) cs
 
 printWatchVals : List Dr.WatchInfo -> Heff Unit
@@ -426,7 +364,7 @@ runCmd : String -> Heff Unit
 runCmd file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   runChecked badL cs
 
 type TestRes = { total : Int, failed : Int, ok : Bool }
@@ -485,7 +423,7 @@ testOneF : String -> Heff TestRes
 testOneF f = do
   l <- load f
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   testOneC f badL cs
 
 -- | check the watches' expectations of every file given
@@ -512,7 +450,7 @@ checkCmd : String -> Heff Unit
 checkCmd file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   checkLast (badL > 0) cs
 
 -- | what the name at OFFSET of FILE resolved to, and its type
@@ -520,7 +458,7 @@ typeAtCmd : String -> String -> Heff Unit
 typeAtCmd file off = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   putFileDiags cs
   case Dr.lastChecked cs of
     Nothing -> exit 1
@@ -535,7 +473,7 @@ explainCmd : String -> Heff Unit
 explainCmd file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l
+  cs <- Se.cachedProgram l
   putFileDiags cs
   case Dr.lastChecked cs of
     Nothing -> exit 1
@@ -743,6 +681,15 @@ program = do
     Cons "fmt" (Cons f files) -> fmtCmd (Cons f files)
     Cons "completions" (Cons "fish" Nil) -> write fishCompletions
     Cons "dump-core" files -> selfcheck files
+    -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
+    Cons "lsp" flags ->
+      if all (\x -> startsWith "--" x) flags
+        then do
+          lib <- libDir
+          Lsp.serve lib
+      else do
+        printErr usage
+        exit 1
     Nil -> print usage
     Cons "help" Nil -> print usage
     -- (on stderr: what reads the output, a shell's completion, say, does
@@ -755,7 +702,8 @@ program = do
 main : Co world Unit
 main =
   program
-    (io := \p -> InL (InL (InL p)))
-    (sys := \p -> InL (InL (InR p)))
-    (disk := \p -> InL (InR p))
-    (rep := \p -> InR p)
+    (io := \p -> InL (InL (InL (InL p))))
+    (sys := \p -> InL (InL (InL (InR p))))
+    (disk := \p -> InL (InL (InR p)))
+    (rep := \p -> InL (InR p))
+    (wire := \p -> InR p)

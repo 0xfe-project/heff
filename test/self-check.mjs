@@ -32,7 +32,8 @@ const files = [
   "compiler/interp.hf", "compiler/diagnostic.hf",
   "compiler/driver.hf", "compiler/serial.hf", "compiler/cache.hf",
   "compiler/load.hf", "compiler/format.hf", "compiler/report.hf",
-  "compiler/locals.hf", "compiler/query.hf",
+  "compiler/locals.hf", "compiler/query.hf", "compiler/session.hf",
+  "compiler/json.hf", "compiler/rpc.hf", "compiler/lsp.hf",
   "compiler/main.hf",
 ];
 

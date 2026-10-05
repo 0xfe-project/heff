@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // heff: the self-hosted compiler (compiler/, built to output/heff.mjs by
-// `npm run build`) runs every command it has; the few it does not have
-// yet go to the reference (bin/reference.mjs).  Either runs in a thread
+// `npm run build`) runs every command but `dump-nbe`, the reference's
+// own side of the differential tests (bin/reference.mjs).  Either runs
+// in a thread
 // whose stack is deep enough for the elaborator and the interpreter to
 // go as deep as a file or a program does.
 //
@@ -14,7 +15,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..");
 const selfHosted = join(root, "output", "heff.mjs");
-const referenceOnly = ["lsp", "dump-nbe"];
+const referenceOnly = ["dump-nbe"];
 
 const args = process.argv.slice(2);
 if (referenceOnly.includes(args[0]) || !existsSync(selfHosted)) {
@@ -23,7 +24,11 @@ if (referenceOnly.includes(args[0]) || !existsSync(selfHosted)) {
   process.env.HEFF_LIB ??= join(root, "lib");
   // (a worker's stdout is never a terminal: whether ours is, said)
   if (process.stdout.isTTY) process.env.HEFF_TTY = "1";
-  const worker = new Worker(selfHosted, { argv: args, resourceLimits: { stackSizeMb: 512 } });
+  // (the language server speaks on stdin, given to its thread; when it
+  // ends, heff does)
+  const lsp = args[0] === "lsp";
+  const worker = new Worker(selfHosted, { argv: args, resourceLimits: { stackSizeMb: 512 }, stdin: lsp });
+  if (lsp) process.stdin.pipe(worker.stdin);
   worker.on("error", (e) => { console.error(e); process.exitCode = 1; });
-  worker.on("exit", (code) => { if (code !== 0) process.exitCode = code; });
+  worker.on("exit", (code) => { if (lsp) process.exit(code); else if (code !== 0) process.exitCode = code; });
 }

@@ -136,23 +136,23 @@ inLib ps m = under ps.lib (importPath m)
 inPkg : Paths -> String -> String
 inPkg ps m = under ps.root ("node_modules/" ++ importPath m)
 
+-- (the first of the paths that reads, by `read`)
+readFirst : {e : HFunctor}
+          -> (String -> Co e (Maybe String))
+          -> List String
+          -> Co e (Maybe Found)
+readFirst read Nil = val Nothing
+readFirst read (Cons path rest) = do
+  a <- read path
+  case a of
+    Just s -> val (Just { path = path, source = s })
+    Nothing -> readFirst read rest
+
 readFound : {e : HFunctor}
           -> {{ev : fs <: e}}
           -> List String
           -> Co e (Maybe Found)
-readFound Nil = val Nothing
-readFound (Cons path rest) = do
-  a <- readFile path
-  case a of
-    Just s -> val (Just { path = path, source = s })
-    Nothing -> readFound rest
-
-resolveRead : {e : HFunctor}
-            -> {{ev : fs <: e}}
-            -> Paths
-            -> String
-            -> Co e (Maybe Found)
-resolveRead ps m = readFound [inRoot ps m, inLib ps m, inPkg ps m]
+readFound paths = readFirst (\p -> readFile p) paths
 
 cycleMsg : String -> String -> List String -> String
 cycleMsg from m stack =
@@ -176,57 +176,77 @@ missingMsg ps from m =
   ++ ")"
 
 -- | the modules `ms`, imported by `from`, each visited after what it
--- | imports (`stack`: the modules being visited, newest first)
+-- | imports (`stack`: the modules being visited, newest first), each
+-- | file read by `read`
 loadMany : {e : HFunctor}
-         -> {{ev : fs <: e}}
+         -> (String -> Co e (Maybe String))
          -> Paths
          -> List String
          -> String
          -> List String
          -> LoadSt
          -> Co e LoadSt
-loadMany ps stack from Nil st = val st
-loadMany ps stack from (Cons m rest) st =
-  if elemL m st.doneMods then loadMany ps stack from rest st
+loadMany read ps stack from Nil st = val st
+loadMany read ps stack from (Cons m rest) st =
+  if elemL m st.doneMods then loadMany read ps stack from rest st
   else if elemL m stack
-    then loadMany ps stack from rest (addErr st (cycleMsg from m stack))
+    then loadMany read ps stack from rest (addErr st (cycleMsg from m stack))
   else do
-    found <- resolveRead ps m
+    found <- readFirst read [inRoot ps m, inLib ps m, inPkg ps m]
     case found of
-      Nothing -> loadMany ps stack from rest (addErr st (missingMsg ps from m))
+      Nothing ->
+        loadMany read ps stack from rest (addErr st (missingMsg ps from m))
       Just found2 -> do
         inner <-
           loadMany
+            read
             ps
             (Cons m stack)
             found2.path
             (Dr.importNames (I.readImports found2.source).imports)
             st
-        loadMany ps stack from rest (pushDone inner m found2.path found2.source)
+        loadMany
+            read
+            ps
+            stack
+            from
+            rest
+            (pushDone inner m found2.path found2.source)
 
 type Loaded = { sources : List Dr.Source, errors : List String, paths : Paths }
 
 loadDone : Paths -> LoadSt -> Loaded
 loadDone ps st = { sources = st.done, errors = st.errors, paths = ps }
 
--- | the program rooted at `file`, the library at `lib`: its sources in
--- | dependency order, what could not be found, and where it looked
-loadProgram : {e : HFunctor}
-            -> {{ev : fs <: e}}
-            -> String
-            -> String
-            -> Co e Loaded
-loadProgram lib file = do
+-- | the program rooted at `file`, the library at `lib`, each file read
+-- | by `read` (an editor's unsaved text, say): its sources in dependency
+-- | order, what could not be found, and where it looked
+loadProgramWith : {e : HFunctor}
+                -> {{ev : fs <: e}}
+                -> (String -> Co e (Maybe String))
+                -> String
+                -> String
+                -> Co e Loaded
+loadProgramWith read lib file = do
   ps <- pathsFor lib file
-  mSrc <- readFile file
+  mSrc <- read file
   case mSrc of
     Nothing -> val (loadDone ps (addErr emptySt ("cannot read " ++ file)))
     Just src -> do
       st <-
         loadMany
+          read
           ps
           (Cons (moduleOf ps file) Nil)
           file
           (Dr.importNames (I.readImports src).imports)
           emptySt
       val (loadDone ps (pushDone st (moduleOf ps file) file src))
+
+-- | ... each file read from the disk
+loadProgram : {e : HFunctor}
+            -> {{ev : fs <: e}}
+            -> String
+            -> String
+            -> Co e Loaded
+loadProgram lib file = loadProgramWith (\p -> readFile p) lib file

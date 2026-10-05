@@ -442,7 +442,12 @@ primCall p as = case p, as of
   "strLength", [ a ] -> { code: "BigInt(" <> atLeast 3 a <> ".length)", prec: 3 }
   _, _ -> { code: "$" <> p <> "(" <> S.joinWith ", " (map _.code as) <> ")", prec: 3 }
   where
-  bin op a b = { code: atLeast 1 a <> " " <> op <> " " <> atLeast 2 b, prec: 1 }
+  -- (an additive operator binds at 1, a multiplicative one at 2: both
+  -- left-associative, so the right operand is one tighter -- `(a - b) * c`
+  -- and `a / (b * c)` keep their parentheses)
+  bin op a b
+    | op == "*" || op == "/" = { code: atLeast 2 a <> " " <> op <> " " <> atLeast 3 b, prec: 2 }
+    | otherwise = { code: atLeast 1 a <> " " <> op <> " " <> atLeast 2 b, prec: 1 }
   test op a b = { code: atLeast 2 a <> " " <> op <> " " <> atLeast 2 b <> " ? $T : $F", prec: 0 }
 
 -- Runtime

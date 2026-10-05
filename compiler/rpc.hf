@@ -1,0 +1,90 @@
+-- JSON-RPC over the standard streams, as the Language Server Protocol
+-- frames it, and the host's side of what a language server asks of it:
+-- an effect, whose side is JavaScript (compiler/rpc.provider.js).  A
+-- server pulls: it awaits the next message, or the time it waits for
+-- passing first, and answers -- its state goes along the loop.
+
+import co
+import compiler.json as J
+import prelude
+
+-- | what an await finds: a message, the time waited for, or the client
+-- | gone (its stream ended)
+data Event = Message J.Json | Timeout | Closed
+
+data RpcF (m : Type -> Type) x
+  = Await Int (Event -> x)
+  | Send String x
+  | Log String x
+  | Now (Int -> x)
+  | ProjectFiles String (List String -> x)
+  | UriPath String (Maybe String -> x)
+  | PathUri String (String -> x)
+  | AbsPath String (String -> x)
+  | Quit Int
+
+-- | A language server's world, as an effect.
+rpc : HFunctor
+rpc =
+  { f = RpcF
+  , hfmap = \fm g p -> case p of
+      Await t k -> Await t (\e -> g (k e))
+      Send s x -> Send s (g x)
+      Log s x -> Log s (g x)
+      Now k -> Now (\n -> g (k n))
+      ProjectFiles r k -> ProjectFiles r (\fs -> g (k fs))
+      UriPath u k -> UriPath u (\p -> g (k p))
+      PathUri p k -> PathUri p (\u -> g (k u))
+      AbsPath p k -> AbsPath p (\a -> g (k a))
+      Quit c -> Quit c
+  , hmap = \nt p -> case p of
+      Await t k -> Await t k
+      Send s x -> Send s x
+      Log s x -> Log s x
+      Now k -> Now k
+      ProjectFiles r k -> ProjectFiles r k
+      UriPath u k -> UriPath u k
+      PathUri p k -> PathUri p k
+      AbsPath p k -> AbsPath p k
+      Quit c -> Quit c
+  }
+
+-- | the next message, or `Timeout` after `ms` milliseconds (none: wait
+-- | for as long as it takes)
+await : {e : HFunctor} -> {{ev : rpc <: e}} -> Maybe Int -> Co e Event
+await ms = op (ev (Await (fromMaybe (0 - 1) ms) (\x -> x))) val
+
+-- | a message sent, framed
+send : {e : HFunctor} -> {{ev : rpc <: e}} -> J.Json -> Co e Unit
+send m = op (ev (Send (J.stringify m) MkUnit)) val
+
+-- | a line on the error stream, `heff lsp: ...`
+log : {e : HFunctor} -> {{ev : rpc <: e}} -> String -> Co e Unit
+log s = op (ev (Log s MkUnit)) val
+
+-- | the time, in milliseconds
+now : {e : HFunctor} -> {{ev : rpc <: e}} -> Co e Int
+now = op (ev (Now (\n -> n))) val
+
+-- | the `.hf` files of the project at a root: the source directories
+-- | package.json's "heff" names, and the root's own files
+projectFiles : {e : HFunctor}
+             -> {{ev : rpc <: e}}
+             -> String
+             -> Co e (List String)
+projectFiles root = op (ev (ProjectFiles root (\fs -> fs))) val
+
+-- | a `file:` URI's path, if it is one
+uriPath : {e : HFunctor} -> {{ev : rpc <: e}} -> String -> Co e (Maybe String)
+uriPath u = op (ev (UriPath u (\p -> p))) val
+
+pathUri : {e : HFunctor} -> {{ev : rpc <: e}} -> String -> Co e String
+pathUri p = op (ev (PathUri p (\u -> u))) val
+
+absPath : {e : HFunctor} -> {{ev : rpc <: e}} -> String -> Co e String
+absPath p = op (ev (AbsPath p (\a -> a))) val
+
+-- | the server ended, with a status, once what it said is written (the
+-- | client's stream, still open, would keep it waiting)
+quit : {e : HFunctor} -> {a : Type} -> {{ev : rpc <: e}} -> Int -> Co e a
+quit code = op (ev (Quit code)) val

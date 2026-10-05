@@ -36,8 +36,9 @@ npm link          # puts `heff` on the PATH
 
 `heff` is the self-hosted compiler (`compiler/`), bootstrapped by the
 reference: the reference compiles it once, and what that makes compiles
-it again, to `output/heff.mjs`.  The language server and `dump-nbe`
-are still the reference's (`bin/reference.mjs`).
+it again, to `output/heff.mjs`.  Only `dump-nbe` -- the reference's
+own side of the differential tests -- is still the reference's
+(`bin/reference.mjs`).
 
 For VS Code, `editors/vscode` is an extension: highlighting, and the
 language server (diagnostics, hover, go to definition, completion,

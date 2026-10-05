@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // The reference compiler (PureScript, output/Main): what `bin/heff.mjs`
-// hands the commands the self-hosted compiler does not have yet (lsp,
-// dump-nbe), what builds the self-hosted one's first
-// generation, and what the differential tests hold it to.
+// hands the one command the self-hosted compiler does not have
+// (dump-nbe), what builds the self-hosted one's first generation, and
+// what the differential tests hold it to.
 //
 // It runs in a thread of its own, whose stack is deep enough for the
 // interpreter to go as deep as a program does (a list of a million, say),
