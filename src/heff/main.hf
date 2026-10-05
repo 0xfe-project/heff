@@ -704,6 +704,11 @@ commands =
         ]
     }
   , cmd "init" "[DIR]" "a new project in DIR (here, without it)" ""
+  , cmd
+    "publish"
+    "VERSION"
+    "check the project, then tag it vVERSION and push the tag"
+    ""
   , cmd "lsp" "" "a language server, on stdin/stdout" ""
   , { name = "completions"
     , args = "SHELL"
@@ -937,6 +942,130 @@ fmtCmd as = do
     _ -> fmtAll False as 0
   if bad > 0 then exit 1 else pure MkUnit
 
+-- (the `.hf` files under the paths, the directories walked; a name
+-- starting with `.` passed over)
+hfFilesGo : List String -> List String -> Heff (List String)
+hfFilesGo Nil acc = pure (reverse acc)
+hfFilesGo (Cons p rest) acc = do
+  names <- readDir p
+  case names of
+    Just ns ->
+      hfFilesGo
+        (concatList
+           (map
+              (\n -> p ++ "/" ++ n)
+              (filter (\n -> not (startsWith "." n)) ns))
+           rest)
+        acc
+    Nothing ->
+      if endsWith ".hf" p then hfFilesGo rest (Cons p acc)
+      else hfFilesGo rest acc
+
+-- (the watches of the files, checked: how many hold, of how many, and
+-- whether every file checked)
+addRes : TestRes -> TestRes -> TestRes
+addRes a b =
+  { total = a.total + b.total, failed = a.failed + b.failed, ok = a.ok && b.ok }
+
+testAll : List String -> TestRes -> Heff TestRes
+testAll Nil acc = pure acc
+testAll (Cons f rest) acc = do
+  r <- testOneF f
+  testAll rest (addRes acc r)
+
+publishFails : String -> Heff Unit
+publishFails why = do
+  printErr ("heff publish: " ++ why)
+  exit 1
+
+ranStatus : Ran -> Int
+ranStatus r = r.status
+
+ranOut : Ran -> String
+ranOut r = r.out
+
+ranErr : Ran -> String
+ranErr r = r.err
+
+-- (git, run: what is wrong if it fails)
+gitOk : String -> List String -> Heff (Maybe String)
+gitOk what as = do
+  r <- run "git" as
+  pure
+      (if ranStatus r == 0 then Nothing
+       else Just
+           (what ++ ": git " ++ joinWith " " as ++ ": " ++ trim (ranErr r)))
+
+publishTag : String -> Pr.Package -> Heff Unit
+publishTag v pk = do
+  tagged <- gitOk "not tagged" ["tag", "-a", "v" ++ v, "-m", "v" ++ v]
+  case tagged of
+    Just why -> publishFails why
+    Nothing -> do
+      pushed <- gitOk "tagged, not pushed" ["push", "origin", "v" ++ v]
+      case pushed of
+        Just why -> publishFails why
+        Nothing ->
+          print ("heff publish: " ++ pk.module ++ " " ++ v ++ ", tag v" ++ v)
+
+publishTested : String -> Pr.Package -> TestRes -> Heff Unit
+publishTested v pk r =
+  if r.failed > 0 || not r.ok
+    then publishFails
+        (showInt r.failed
+         ++ " of "
+         ++ showInt r.total
+         ++ " expectations do not hold, or a file does not check")
+  else publishTag v pk
+
+publishGit : String -> Pr.Package -> String -> Heff Unit
+publishGit v pk src = do
+  status <- run "git" ["status", "--porcelain"]
+  tag <- run "git" ["rev-parse", "-q", "--verify", "refs/tags/v" ++ v]
+  if not (ranStatus status == 0)
+      then publishFails ("not in a git repository: " ++ trim (ranErr status))
+    else if not (strEq (trim (ranOut status)) "")
+      then publishFails "what is published is what is committed: commit first"
+    else if ranStatus tag == 0
+      then publishFails ("v" ++ v ++ " is tagged already")
+    else do
+      files <- hfFilesGo [src] Nil
+      r <- testAll files { total = 0, failed = 0, ok = True }
+      publishTested v pk r
+
+publishChecked : String -> L.Loaded -> Pr.Package -> Heff Unit
+publishChecked v l pk = case Pr.majorMismatch pk.module v of
+  Just why -> publishFails (pk.module ++ ": " ++ why)
+  Nothing -> do
+    own <- L.ownDir (L.under l.paths.root "src")
+    case own of
+      Left why -> publishFails why
+      Right _ -> publishGit v pk (L.under l.paths.root "src")
+
+-- | publish the project, at the working directory, as version V: its
+-- | package.hf a Package (lib/manifest.hf), its path's `/vN` its major,
+-- | its src/ one directory, every file of it checked and its watches
+-- | holding, all of it committed -- then tagged `vV`, the tag pushed
+publishCmd : String -> Heff Unit
+publishCmd v = case Pr.version v of
+  Nothing -> publishFails ("`" ++ v ++ "` is no version: a.b.c")
+  Just _ -> do
+    here <- readFile "package.hf"
+    case here of
+      Nothing ->
+        publishFails "no package.hf here: publish at the project's root"
+      Just _ -> do
+        l <- load "package.hf"
+        badL <- printErrs "heff" l.errors 0
+        cs <- Se.cachedProgram l
+        putFileDiags cs
+        case l.package of
+          Nothing -> publishFails "package.hf does not read"
+          Just pk ->
+            if badL > 0 || anyErrors cs
+              then publishFails "package.hf is no Package (lib/manifest.hf)"
+            else publishChecked v l pk
+
 -- | the last part of a path, its trailing slashes dropped
 basename : String -> String
 basename p =
@@ -1091,6 +1220,7 @@ program = do
     "completions" :: "zsh" :: Nil -> write zshCompletions
     "dump-core" :: files -> selfcheck files
     "init" :: Nil -> initCmd "."
+    "publish" :: v :: Nil -> publishCmd v
     "init" :: dir :: Nil -> initCmd dir
     -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
     "lsp" :: flags ->

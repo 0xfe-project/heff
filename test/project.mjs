@@ -143,5 +143,38 @@ const useold = heff("check", "useold/src/useold/main.hf");
 expect("a package for another heff", useold.status === 1 &&
   useold.stderr.includes(`the package x.org/olddep is for heff 0.99.0 (the same 0.x), and this heff is ${version}`), useold);
 
+// publish: checked, tagged vVERSION, the tag pushed; refused for a
+// version that is no a.b.c, a path whose /vN is not the major, what is
+// not committed, a watch that does not hold, a tag already there
+const git = (dir, ...args) => spawnSync("git", args, { cwd: join(work, dir), encoding: "utf8" });
+for (const [k, v] of Object.entries({ GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" })) process.env[k] = v;
+spawnSync("git", ["init", "-q", "--bare", join(work, "origin.git")]);
+write("pub/package.hf", "import manifest\n\npackage : Package\n" + manifestOf("x.org/pub"));
+write("pub/src/pub/m.hf", "import prelude\n\nx : Int\nx = 1\n\n-- >>> x + 1\n-- 2\n");
+write("pub/.gitignore", ".heff/\n");
+git("pub", "init", "-q"); git("pub", "add", "-A"); git("pub", "commit", "-q", "-m", "one");
+git("pub", "remote", "add", "origin", join(work, "origin.git"));
+const publish = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), "publish", ...args], { cwd: join(work, "pub"), encoding: "utf8" });
+write("untyped/package.hf", manifestOf("x.org/untyped"));
+write("untyped/src/untyped/m.hf", "x : Int\nx = 1\n");
+const untyped = spawnSync("node", [join(root, "output", "heff.mjs"), "publish", "1.0.0"], { cwd: join(work, "untyped"), encoding: "utf8" });
+expect("publish, a package.hf of no type", untyped.status === 1 && untyped.stderr.includes("package.hf is no Package (lib/manifest.hf)"), untyped);
+const noVersion = publish("1.0");
+expect("publish, no a.b.c", noVersion.status === 1 && noVersion.stderr.includes("`1.0` is no version: a.b.c"), noVersion);
+const major = publish("2.0.0");
+expect("publish, a major without its /vN", major.status === 1 && major.stderr.includes("version 2.0.0 is fetched from a path ending in /v2"), major);
+const published = publish("1.0.0");
+expect("publish", published.status === 0 && published.stdout.includes("heff publish: x.org/pub 1.0.0, tag v1.0.0") &&
+  git("pub", "ls-remote", "--tags", "origin").stdout.includes("refs/tags/v1.0.0"), published);
+const twice = publish("1.0.0");
+expect("publish, a version already tagged", twice.status === 1 && twice.stderr.includes("v1.0.0 is tagged already"), twice);
+write("pub/src/pub/m.hf", "import prelude\n\nx : Int\nx = 1\n\n-- >>> x + 1\n-- 3\n");
+const dirty = publish("1.0.1");
+expect("publish, not committed", dirty.status === 1 && dirty.stderr.includes("commit first"), dirty);
+git("pub", "commit", "-q", "-am", "wrong");
+const failing = publish("1.0.1");
+expect("publish, a watch that does not hold", failing.status === 1 && failing.stderr.includes("1 of 1 expectations do not hold") &&
+  !git("pub", "tag").stdout.includes("v1.0.1"), failing);
+
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
