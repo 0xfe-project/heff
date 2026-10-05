@@ -13,8 +13,6 @@ const $force = (f) => { if (f.$m !== undefined) return f.$m; const v = f({ $: "M
 const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error("heff: defined by itself"); state = 1; try { v = f(); state = 2; return v; } finally { if (state === 1) state = 0; } }; };
 const $intAdd = (a, b) => a + b;
 const $intAdd$c = (a) => (b) => $intAdd(a, b);
-const $intSub = (a, b) => a - b;
-const $intSub$c = (a) => (b) => $intSub(a, b);
 const $intDiv = (a, b) => { if (b === 0n) return $abandon(); const q = a / b, r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? q - 1n : q; };
 const $intMod = (a, b) => { if (b === 0n) return $abandon(); const r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? r + b : r; };
 const $intEq = (a, b) => a === b ? $T : $F;
@@ -40,7 +38,6 @@ const $strCharCode = (a, i) => i >= 0n && i < BigInt(a.length) ? BigInt(a.charCo
 const $strFromCharCode = (c) => c >= 0n && c <= 65535n ? String.fromCharCode(Number(c)) : "";
 
 const co_bind = (h, c, f, hd, k) => c(hd)((x) => f(x)(hd)(k));
-const co_bind$c = (h) => (c) => (f) => (hd) => (k) => co_bind(h, c, f, hd, k);
 
 const co_pure = (h, x, hd, k) => k(x);
 const co_pure$c = (h) => (x) => (hd) => (k) => co_pure(h, x, hd, k);
@@ -87,13 +84,9 @@ const not = (x1) => {
 
 const intAdd = $intAdd$c;
 
-const intSub = $intSub$c;
-
 const intEq = $intEq$c;
 
 const op_plus = intAdd;
-
-const op_minus = intSub;
 
 const op_eq_eq = intEq;
 
@@ -129,41 +122,6 @@ const strEq = $strEq$c;
 const strLt = $strLt$c;
 
 const op_plus_plus = strAppend;
-
-const fst = (x1) => {
-  switch (x1.$) {
-    case "MkPair": {
-      const x = x1.a[0];
-      const y = x1.a[1];
-      return x;
-    }
-  }
-  return $nomatch(x1);
-};
-
-const snd = (x1) => {
-  switch (x1.$) {
-    case "MkPair": {
-      const x = x1.a[0];
-      const y = x1.a[1];
-      return y;
-    }
-  }
-  return $nomatch(x1);
-};
-
-const fromMaybe = (d, x2) => {
-  switch (x2.$) {
-    case "Nothing": {
-      return d;
-    }
-    case "Just": {
-      const x = x2.a[0];
-      return x;
-    }
-  }
-  return $nomatch(x2);
-};
 
 const map = (f$, x2$) => {
   let $root, $hole = null, $at = 0;
@@ -3411,9 +3369,9 @@ const addSpecialization = (level, capture, fieldTypes, x, v) => ({ $: "VRecord",
     case "Just": {
       const i = s.a[0];
       return { keys: fieldTypes.keys, byName: fieldTypes.byName, values: $arraySet(fieldTypes.values, i, (() => {
-        const field1 = $arrayIndex(fieldTypes.values, i);
+        const field = $arrayIndex(fieldTypes.values, i);
         return (vs) => {
-          const s1 = field1(vs);
+          const s1 = field(vs);
           switch (s1.$) {
             case "MkField": {
               const ty = s1.a[0];
@@ -5668,20 +5626,18 @@ const compiler_environment_bind$c = (m) => (f) => (st) => compiler_environment_b
 const compiler_environment_pure = (x, st) => ({ $: "MkPair", a: [{ $: "Right", a: [x] }, st] });
 const compiler_environment_pure$c = (x) => (st) => compiler_environment_pure(x, st);
 
-const runE = (m, st) => m(st);
-
-const traceE = (span, kind, text1, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
+const traceE = (span, kind, text, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
   switch (st.$) {
     case "MkSt": {
       const c = st.a[0];
       const d = st.a[1];
       const w = st.a[2];
-      return { $: "MkSt", a: [{ infos: c.infos, recovered: c.recovered, poisoned: c.poisoned, metas: c.metas, nextMeta: c.nextMeta, postponed: c.postponed, trace: { $: "Cons", a: [{ span: span, kind: kind, text: text1 }, c.trace] }, selfKey: c.selfKey }, d, w] };
+      return { $: "MkSt", a: [{ infos: c.infos, recovered: c.recovered, poisoned: c.poisoned, metas: c.metas, nextMeta: c.nextMeta, postponed: c.postponed, trace: { $: "Cons", a: [{ span: span, kind: kind, text: text }, c.trace] }, selfKey: c.selfKey }, d, w] };
     }
   }
   return $nomatch(st);
 })()] });
-const traceE$c = (span) => (kind) => (text1) => (st) => traceE(span, kind, text1, st);
+const traceE$c = (span) => (kind) => (text) => (st) => traceE(span, kind, text, st);
 
 const record = (i, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
   switch (st.$) {
@@ -5695,11 +5651,6 @@ const record = (i, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a
   return $nomatch(st);
 })()] });
 const record$c = (i) => (st) => record(i, st);
-
-const failWith = (sp, code1, msg) => {
-  const d = { code: 300n + code1, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
-  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
-};
 
 const emptyFixities = { groups: { $: "Nil", a: [] }, above: { $: "Nil", a: [] } };
 
@@ -17149,9 +17100,9 @@ const operandBefore = (x1, start) => {
 const nameStep = (src, i, line1, lineStart, first, j) => {
   const t = (() => {
     const kind = (() => {
-      const text1 = $strSlice(src, i, j);
+      const text = $strSlice(src, i, j);
       const c = $strCharCode(src, i);
-      const s = any($strEq$c(text1), keywords);
+      const s = any($strEq$c(text), keywords);
       switch (s.$) {
         case "True": {
           return "kw";
@@ -17182,27 +17133,27 @@ const nameStep = (src, i, line1, lineStart, first, j) => {
       }
       return $nomatch(s);
     })();
-    const text1 = $strSlice(src, i, j);
+    const text = $strSlice(src, i, j);
     const col = i - lineStart;
-    return { kind: kind, text: text1, start: i, end: j, line: line1, col: col, first: first };
+    return { kind: kind, text: text, start: i, end: j, line: line1, col: col, first: first };
   })();
   return { i: j, line: line1, lineStart: lineStart, first: { $: "False", a: [] }, tok: { $: "Just", a: [t] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } };
 };
 
 const tagStep = (src, i, line1, lineStart, first, j) => {
   const t = (() => {
-    const text1 = $strSlice(src, i + 1n, j);
+    const text = $strSlice(src, i + 1n, j);
     const col = i - lineStart;
-    return { kind: "tag", text: text1, start: i, end: j, line: line1, col: col, first: first };
+    return { kind: "tag", text: text, start: i, end: j, line: line1, col: col, first: first };
   })();
   return { i: j, line: line1, lineStart: lineStart, first: { $: "False", a: [] }, tok: { $: "Just", a: [t] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } };
 };
 
 const fieldStep = (src, i, line1, lineStart, first, j) => {
   const t = (() => {
-    const text1 = $strSlice(src, i + 1n, j);
+    const text = $strSlice(src, i + 1n, j);
     const col = i - lineStart;
-    return { kind: "field", text: text1, start: i, end: j, line: line1, col: col, first: first };
+    return { kind: "field", text: text, start: i, end: j, line: line1, col: col, first: first };
   })();
   return { i: j, line: line1, lineStart: lineStart, first: { $: "False", a: [] }, tok: { $: "Just", a: [t] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } };
 };
@@ -17221,9 +17172,9 @@ const numStep = (src, i, line1, lineStart, first, r) => {
       }
       return $nomatch(s);
     })();
-    const text1 = $strSlice(src, i, r.end);
+    const text = $strSlice(src, i, r.end);
     const col = i - lineStart;
-    return { kind: kind, text: text1, start: i, end: r.end, line: line1, col: col, first: first };
+    return { kind: kind, text: text, start: i, end: r.end, line: line1, col: col, first: first };
   })();
   return { i: r.end, line: line1, lineStart: lineStart, first: { $: "False", a: [] }, tok: { $: "Just", a: [t] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } };
 };
@@ -17562,10 +17513,10 @@ const stepAt = (src, i, line1, lineStart, first, toks, c) => {
                                             case "True": {
                                               const j = i + 1n;
                                               const t = (() => {
-                                                const text1 = $strSlice(src, i, i + 1n);
+                                                const text = $strSlice(src, i, i + 1n);
                                                 const end = i + 1n;
                                                 const col = i - lineStart;
-                                                return { kind: "punct", text: text1, start: i, end: end, line: line1, col: col, first: first };
+                                                return { kind: "punct", text: text, start: i, end: end, line: line1, col: col, first: first };
                                               })();
                                               return { i: j, line: line1, lineStart: lineStart, first: { $: "False", a: [] }, tok: { $: "Just", a: [t] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } };
                                             }
@@ -17597,9 +17548,9 @@ const stepAt = (src, i, line1, lineStart, first, toks, c) => {
                                                 case "True": {
                                                   const j = symEnd(src, i + 1n);
                                                   const t = (() => {
-                                                    const text1 = $strSlice(src, i, j);
+                                                    const text = $strSlice(src, i, j);
                                                     const col = i - lineStart;
-                                                    return { kind: "sym", text: text1, start: i, end: j, line: line1, col: col, first: first };
+                                                    return { kind: "sym", text: text, start: i, end: j, line: line1, col: col, first: first };
                                                   })();
                                                   return { i: j, line: line1, lineStart: lineStart, first: { $: "False", a: [] }, tok: { $: "Just", a: [t] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } };
                                                 }
@@ -31991,7 +31942,7 @@ const eqnEnd = (f$, x2$, e$) => {
   }
 };
 
-const assembleOne = (broken, items1, x3) => {
+const assembleOne = (broken, items, x3) => {
   switch (x3.$) {
     case "Sig": {
       const f = x3.a[0];
@@ -32005,7 +31956,7 @@ const assembleOne = (broken, items1, x3) => {
         }
         case "False": {
           const s1 = (() => {
-            const xs = eqnsOf(f, items1);
+            const xs = eqnsOf(f, items);
             return foldl((n) => (x) => n + 1n, 0n, xs);
           })() === 0n ? $T : $F;
           switch (s1.$) {
@@ -32015,10 +31966,10 @@ const assembleOne = (broken, items1, x3) => {
             case "False": {
               return { $: "Just", a: [(() => {
                 const sp1 = (() => {
-                  const b = eqnEnd(f, items1, sp.end);
+                  const b = eqnEnd(f, items, sp.end);
                   return { start: sp.start, end: b };
                 })();
-                const eqs = eqnsOf(f, items1);
+                const eqs = eqnsOf(f, items);
                 return { $: "MDecl", a: [{ $: "Nil", a: [] }, "def", { $: "Infix", a: [{ $: "Ident", a: [f, fsp] }, { $: "Keyword", a: [":", sp1] }, { $: "Juxt", a: [ty, { $: "NBlock", a: ["where", { $: "Nothing", a: [] }, eqs, sp1] }] }] }, sp1] };
               })()] };
             }
@@ -32414,17 +32365,17 @@ const appendRev = (x1$, acc$) => {
   }
 };
 
-const progGo = (s0$, items1$, diags$, broken$) => {
+const progGo = (s0$, items$, diags$, broken$) => {
   for (;;) {
-    const s0 = s0$, items1 = items1$, diags = diags$, broken = broken$;
+    const s0 = s0$, items = items$, diags = diags$, broken = broken$;
     const st = progReset(s0);
     const s = tokAt(st, st.i).kind === "eof" ? $T : $F;
     switch (s.$) {
       case "True": {
-        const items2 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, items1);
+        const items1 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, items);
         const diags1 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, diags);
         const broken1 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, broken);
-        return { items: items2, diags: diags1, broken: broken1 };
+        return { items: items1, diags: diags1, broken: broken1 };
       }
       case "False": {
         const it = decl()(st);
@@ -32435,7 +32386,7 @@ const progGo = (s0$, items1$, diags$, broken$) => {
             switch (it1.$) {
               case "Left": {
                 const d = it1.a[0];
-                s0$ = skipDecl(s2); items1$ = items1; diags$ = { $: "Cons", a: [d, diags] }; broken$ = (() => {
+                s0$ = skipDecl(s2); items$ = items; diags$ = { $: "Cons", a: [d, diags] }; broken$ = (() => {
                   const x1 = declaredAt(s2);
                   switch (x1.$) {
                     case "Nothing": {
@@ -32454,10 +32405,10 @@ const progGo = (s0$, items1$, diags$, broken$) => {
                 const s1 = tokAt(s2, s2.i).kind === "eof" ? $T : $F;
                 switch (s1.$) {
                   case "True": {
-                    s0$ = s2; items1$ = appendRev(ds, items1); diags$ = diags; broken$ = broken; continue;
+                    s0$ = s2; items$ = appendRev(ds, items); diags$ = diags; broken$ = broken; continue;
                   }
                   case "False": {
-                    s0$ = skipDecl(s2); items1$ = appendRev(ds, items1); diags$ = { $: "Cons", a: [(() => {
+                    s0$ = skipDecl(s2); items$ = appendRev(ds, items); diags$ = { $: "Cons", a: [(() => {
                       const span = (() => {
                         const t = tokAt(s2, s2.i);
                         return { start: t.start, end: t.end };
@@ -32499,11 +32450,11 @@ const initialSt = (o, toks, declared, own) => ({ toks: toks, i: 0n, top: 0n, sta
 })(), lenient: o.lenient });
 
 const readOut = (lexDiags, own, r) => ({ ntns: (() => {
-  const items1 = r.items;
-  return catMaybesS(map((it) => assembleOne(r.broken, items1, it), items1));
+  const items = r.items;
+  return catMaybesS(map((it) => assembleOne(r.broken, items, it), items));
 })(), diags: appendS(lexDiags, appendS(own.diags, appendS(r.diags, (() => {
-  const items1 = r.items;
-  return catMaybesS(map(assembleDiagOne$c(r.broken)(sigNames(items1))(eqnNames(items1)), items1));
+  const items = r.items;
+  return catMaybesS(map(assembleDiagOne$c(r.broken)(sigNames(items))(eqnNames(items)), items));
 })()))), fixities: own.fixities, broken: r.broken });
 
 const readToks = (o, toks, lexDiags) => {
@@ -34752,10 +34703,10 @@ const nubTagRows = (x1$) => {
   }
 };
 
-const armSubName = (used, vars, v, i, x5) => {
+const armSubName = (used, bound, v, i, x5) => {
   switch (x5.$) {
     case "Nothing": {
-      return fresh(appendC(used, vars), v + (i + 1n).toString());
+      return fresh(appendC(used, bound), v + (i + 1n).toString());
     }
     case "Just": {
       const x = x5.a[0];
@@ -34774,7 +34725,7 @@ const armSubName = (used, vars, v, i, x5) => {
         })();
         switch (s.$) {
           case "True": {
-            const x11 = any($strEq$c(x), vars);
+            const x11 = any($strEq$c(x), bound);
             switch (x11.$) {
               case "True": {
                 return { $: "False", a: [] };
@@ -34796,7 +34747,7 @@ const armSubName = (used, vars, v, i, x5) => {
           return x;
         }
         case "False": {
-          return fresh(appendC(used, vars), v + (i + 1n).toString());
+          return fresh(appendC(used, bound), v + (i + 1n).toString());
         }
       }
       return $nomatch(s);
@@ -34805,15 +34756,15 @@ const armSubName = (used, vars, v, i, x5) => {
   return $nomatch(x5);
 };
 
-const armSub = (used, vars, t, v, i) => {
+const armSub = (used, bound, t, v, i) => {
   const s = nthC(t.pats, i);
   switch (s.$) {
     case "Nothing": {
-      return fresh(appendC(used, vars), v + (i + 1n).toString());
+      return fresh(appendC(used, bound), v + (i + 1n).toString());
     }
     case "Just": {
       const p = s.a[0];
-      return armSubName(used, vars, v, i, (() => {
+      return armSubName(used, bound, v, i, (() => {
         switch (p.$) {
           case "PVar": {
             const x = p.a[0];
@@ -34994,7 +34945,7 @@ const armSpecializeV = (c, t, ys, v, r) => {
   return $nomatch(s);
 };
 
-const compiler_clauses_armOf = (r, used, sp, vars, rows, c, v, t) => {
+const compiler_clauses_armOf = (r, used, bound, sp, vars, rows, c, v, t) => {
   const x1 = (() => {
     const s = anyC((row) => badArity(c, t, row), rows);
     switch (s.$) {
@@ -35017,10 +34968,10 @@ const compiler_clauses_armOf = (r, used, sp, vars, rows, c, v, t) => {
     }
     case "Right": {
       const x = x1.a[0];
-      const x11 = r.compile(used)(sp)((() => {
-        const ys = map((i) => armSub(used, vars, t, v, i), upToGo(0n, t.arity));
+      const x11 = r.compile(used)(appendC(map((i) => armSub(used, bound, t, v, i), upToGo(0n, t.arity)), bound))(sp)((() => {
+        const ys = map((i) => armSub(used, bound, t, v, i), upToGo(0n, t.arity));
         return appendC(takeC(c, vars), appendC(ys, dropC(c + 1n, vars)));
-      })())(catMaybesC(map((row) => armSpecializeV(c, t, map((i) => armSub(used, vars, t, v, i), upToGo(0n, t.arity)), v, row), rows)));
+      })())(catMaybesC(map((row) => armSpecializeV(c, t, map((i) => armSub(used, bound, t, v, i), upToGo(0n, t.arity)), v, row), rows)));
       switch (x11.$) {
         case "Left": {
           const e = x11.a[0];
@@ -35029,7 +34980,7 @@ const compiler_clauses_armOf = (r, used, sp, vars, rows, c, v, t) => {
         case "Right": {
           const x2 = x11.a[0];
           const x3 = { $: "Infix", a: [(() => {
-            const args = map((y) => ({ $: "Ident", a: [y, sp] }), map((i) => armSub(used, vars, t, v, i), upToGo(0n, t.arity)));
+            const args = map((y) => ({ $: "Ident", a: [y, sp] }), map((i) => armSub(used, bound, t, v, i), upToGo(0n, t.arity)));
             return foldl((f) => (x3) => ({ $: "Juxt", a: [f, x3] }), { $: "NTag", a: [t.tag, t.span] }, args);
           })(), { $: "Keyword", a: ["=>", sp] }, x2] };
           return { $: "Right", a: [x3] };
@@ -35303,7 +35254,7 @@ const litChecks = (sp, vars, rows, c, l) => {
   return $nomatch(x1);
 };
 
-const literalOf = (r, used, sp, vars, rows, c, l) => {
+const literalOf = (r, used, bound, sp, vars, rows, c, l) => {
   const x1 = litChecks(sp, vars, rows, c, l);
   switch (x1.$) {
     case "Left": {
@@ -35312,7 +35263,7 @@ const literalOf = (r, used, sp, vars, rows, c, l) => {
     }
     case "Right": {
       const x = x1.a[0];
-      const x11 = r.compile(used)(sp)(dropAt(c, vars))(litYes(c, l, (() => {
+      const x11 = r.compile(used)(bound)(sp)(dropAt(c, vars))(litYes(c, l, (() => {
         const s = nthC(vars, c);
         switch (s.$) {
           case "Nothing": {
@@ -35332,7 +35283,7 @@ const literalOf = (r, used, sp, vars, rows, c, l) => {
         }
         case "Right": {
           const x2 = x11.a[0];
-          const x12 = r.compile(used)(sp)(vars)(litNo(c, l, rows));
+          const x12 = r.compile(used)(bound)(sp)(vars)(litNo(c, l, rows));
           switch (x12.$) {
             case "Left": {
               const e = x12.a[0];
@@ -35488,7 +35439,7 @@ const noLitHere = (sp, c, rows) => forC(rows, (row) => {
   return $nomatch(s);
 });
 
-const defaultOf = (r, used, sp, vars, rows, c, rest) => {
+const defaultOf = (r, used, bound, sp, vars, rows, c, rest) => {
   switch (rest.$) {
     case "Nil": {
       return { $: "Right", a: [{ $: "Nil", a: [] }] };
@@ -35496,7 +35447,7 @@ const defaultOf = (r, used, sp, vars, rows, c, rest) => {
     case "Cons": {
       const x = rest.a[0];
       const x1 = rest.a[1];
-      const x11 = r.compile(used)(sp)(dropAt(c, vars))(map((row) => {
+      const x11 = r.compile(used)(bound)(sp)(dropAt(c, vars))(map((row) => {
         const pats = dropAt(c, row.pats);
         const rhs = bindVar((() => {
           const s = nthC(vars, c);
@@ -35541,7 +35492,7 @@ const defaultOf = (r, used, sp, vars, rows, c, rest) => {
   return $nomatch(rest);
 };
 
-const compileAt = (r, used, sp, vars, rows, c, p) => {
+const compileAt = (r, used, bound, sp, vars, rows, c, p) => {
   switch (p.$) {
     case "PVar": {
       const x = p.a[0];
@@ -35553,7 +35504,7 @@ const compileAt = (r, used, sp, vars, rows, c, p) => {
         }
         case "Right": {
           const x2 = x1.a[0];
-          const x11 = traverseC((t) => compiler_clauses_armOf(r, used, sp, vars, rows, c, (() => {
+          const x11 = traverseC((t) => compiler_clauses_armOf(r, used, bound, sp, vars, rows, c, (() => {
             const s = nthC(vars, c);
             switch (s.$) {
               case "Nothing": {
@@ -35604,7 +35555,7 @@ const compileAt = (r, used, sp, vars, rows, c, p) => {
             }
             case "Right": {
               const x3 = x11.a[0];
-              const x12 = defaultOf(r, used, sp, vars, rows, c, filter((row) => {
+              const x12 = defaultOf(r, used, bound, sp, vars, rows, c, filter((row) => {
                 const x12 = (() => {
                   const x12 = (() => {
                     const s = nthC(row.pats, c);
@@ -35690,7 +35641,7 @@ const compileAt = (r, used, sp, vars, rows, c, p) => {
         }
         case "Right": {
           const x3 = x11.a[0];
-          const x12 = traverseC((t) => compiler_clauses_armOf(r, used, sp, vars, rows, c, (() => {
+          const x12 = traverseC((t) => compiler_clauses_armOf(r, used, bound, sp, vars, rows, c, (() => {
             const s = nthC(vars, c);
             switch (s.$) {
               case "Nothing": {
@@ -35741,7 +35692,7 @@ const compileAt = (r, used, sp, vars, rows, c, p) => {
             }
             case "Right": {
               const x4 = x12.a[0];
-              const x13 = defaultOf(r, used, sp, vars, rows, c, filter((row) => {
+              const x13 = defaultOf(r, used, bound, sp, vars, rows, c, filter((row) => {
                 const x13 = (() => {
                   const x13 = (() => {
                     const s = nthC(row.pats, c);
@@ -35817,13 +35768,13 @@ const compileAt = (r, used, sp, vars, rows, c, p) => {
     }
     case "PLit": {
       const l = p.a[0];
-      return literalOf(r, used, sp, vars, rows, c, l);
+      return literalOf(r, used, bound, sp, vars, rows, c, l);
     }
   }
   return $nomatch(p);
 };
 
-const compileF = (r, used, sp, vars, rows) => {
+const compileF = (r, used, bound, sp, vars, rows) => {
   switch (rows.$) {
     case "Nil": {
       return { $: "Right", a: [{ $: "Keyword", a: ["abandon", sp] }] };
@@ -35847,7 +35798,7 @@ const compileF = (r, used, sp, vars, rows) => {
         }
         case "Just": {
           const c = s.a[0];
-          return compileAt(r, used, sp, vars, rows, c, (() => {
+          return compileAt(r, used, bound, sp, vars, rows, c, (() => {
             const s1 = nthC(row.pats, c);
             switch (s1.$) {
               case "Nothing": {
@@ -35868,7 +35819,7 @@ const compileF = (r, used, sp, vars, rows) => {
   return $nomatch(rows);
 };
 
-const ck = $lazy(() => ({ compile: (used) => (sp) => (vars) => (rows) => compileF(ck(), used, sp, vars, rows) }));
+const ck = $lazy(() => ({ compile: (used) => (bound) => (sp) => (vars) => (rows) => compileF(ck(), used, bound, sp, vars, rows) }));
 
 const colPick = (used, i, xs) => {
   switch (xs.$) {
@@ -35960,7 +35911,7 @@ const foldr2 = (f, z, x3) => {
 };
 
 const desugarBody = (f, params, sp, rows, arity, used) => {
-  const x1 = ck().compile(used)(sp)(map((i) => colName(used, params, rows, i), upToGo(0n, arity)))(rows);
+  const x1 = ck().compile(used)(map((i) => colName(used, params, rows, i), upToGo(0n, arity)))(sp)(map((i) => colName(used, params, rows, i), upToGo(0n, arity)))(rows);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -36364,7 +36315,7 @@ const caseTree = (sp, altNs) => {
     case "Right": {
       const x = x1.a[0];
       const x2 = fresh(concatMapC((r) => appendC(concatMapC((p) => patVars(p), r.pats), identsOf(r.rhs)), x), "it");
-      const x11 = ck().compile({ $: "Cons", a: [x2, { $: "Nil", a: [] }] })(sp)({ $: "Cons", a: [x2, { $: "Nil", a: [] }] })(x);
+      const x11 = ck().compile({ $: "Cons", a: [x2, { $: "Nil", a: [] }] })({ $: "Cons", a: [x2, { $: "Nil", a: [] }] })(sp)({ $: "Cons", a: [x2, { $: "Nil", a: [] }] })(x);
       switch (x11.$) {
         case "Left": {
           const e = x11.a[0];
@@ -37112,83 +37063,6 @@ const compiler_memoed_primInt = { stx: { $: "SPrimInt", a: [] }, val: (u) => ({ 
 const compiler_memoed_primFloat = { stx: { $: "SPrimFloat", a: [] }, val: (u) => ({ $: "Nom", a: [{ $: "VPrimFloat", a: [] }] }) };
 
 const compiler_memoed_primString = { stx: { $: "SPrimString", a: [] }, val: (u) => ({ $: "Nom", a: [{ $: "VPrimString", a: [] }] }) };
-
-const isFlexTy = (t) => {
-  const s = (() => {
-    switch (t.$) {
-      case "VU": {
-        const x = t.a[0];
-        return { $: "Nothing", a: [] };
-      }
-      case "VDecode": {
-        const it1 = t.a[0];
-        const sp = t.a[1];
-        const u = t.a[2];
-        const described = t.a[3];
-        const el = t.a[4];
-        switch (it1.$) {
-          case "HLocal": {
-            const x = it1.a[0];
-            return { $: "Nothing", a: [] };
-          }
-          case "HGlobal": {
-            const x = it1.a[0];
-            return { $: "Nothing", a: [] };
-          }
-          case "HMeta": {
-            const m = it1.a[0];
-            return { $: "Just", a: [{ $: "MkPair", a: [m, sp] }] };
-          }
-          case "HError": {
-            return { $: "Nothing", a: [] };
-          }
-        }
-        return $nomatch(it1);
-      }
-      case "VFunction": {
-        const x = t.a[0];
-        const x1 = t.a[1];
-        const x2 = t.a[2];
-        const x3 = t.a[3];
-        return { $: "Nothing", a: [] };
-      }
-      case "VRecord": {
-        const x = t.a[0];
-        const x1 = t.a[1];
-        const x2 = t.a[2];
-        return { $: "Nothing", a: [] };
-      }
-      case "VSum": {
-        const x = t.a[0];
-        return { $: "Nothing", a: [] };
-      }
-      case "VPrimInt": {
-        return { $: "Nothing", a: [] };
-      }
-      case "VPrimFloat": {
-        return { $: "Nothing", a: [] };
-      }
-      case "VPrimString": {
-        return { $: "Nothing", a: [] };
-      }
-      case "VPrimArray": {
-        const x = t.a[0];
-        return { $: "Nothing", a: [] };
-      }
-    }
-    return $nomatch(t);
-  })();
-  switch (s.$) {
-    case "Nothing": {
-      return { $: "False", a: [] };
-    }
-    case "Just": {
-      const x = s.a[0];
-      return { $: "True", a: [] };
-    }
-  }
-  return $nomatch(s);
-};
 
 const eqPatArgs = (x1$, x2$) => {
   for (;;) {
@@ -39448,11 +39322,11 @@ const solveF = (r, g, cs, m, sp, rhs, self, st) => {
                         return { $: "Nothing", a: [] };
                       }
                       case "Just": {
-                        const items1 = s.a[0];
-                        const s1 = distinct(compiler_unify_patVarsOf(items1));
+                        const items = s.a[0];
+                        const s1 = distinct(compiler_unify_patVarsOf(items));
                         switch (s1.$) {
                           case "True": {
-                            return { $: "Just", a: [foldl((acc) => (x3) => ({ $: "Cons", a: [x3, acc] }), { $: "Nil", a: [] }, items1)] };
+                            return { $: "Just", a: [foldl((acc) => (x3) => ({ $: "Cons", a: [x3, acc] }), { $: "Nil", a: [] }, items)] };
                           }
                           case "False": {
                             return { $: "Nothing", a: [] };
@@ -39535,11 +39409,11 @@ const solveF = (r, g, cs, m, sp, rhs, self, st) => {
                                         return { $: "Nothing", a: [] };
                                       }
                                       case "Just": {
-                                        const items1 = s2.a[0];
-                                        const s3 = distinct(compiler_unify_patVarsOf(items1));
+                                        const items = s2.a[0];
+                                        const s3 = distinct(compiler_unify_patVarsOf(items));
                                         switch (s3.$) {
                                           case "True": {
-                                            return { $: "Just", a: [foldl((acc) => (x3) => ({ $: "Cons", a: [x3, acc] }), { $: "Nil", a: [] }, items1)] };
+                                            return { $: "Just", a: [foldl((acc) => (x3) => ({ $: "Cons", a: [x3, acc] }), { $: "Nil", a: [] }, items)] };
                                           }
                                           case "False": {
                                             return { $: "Nothing", a: [] };
@@ -46538,11 +46412,11 @@ const renameFlexF = (r, g, m, pr1, m_, sp, st) => {
                         return { $: "Nothing", a: [] };
                       }
                       case "Just": {
-                        const items1 = s.a[0];
-                        const s1 = distinct(compiler_unify_patVarsOf(items1));
+                        const items = s.a[0];
+                        const s1 = distinct(compiler_unify_patVarsOf(items));
                         switch (s1.$) {
                           case "True": {
-                            return { $: "Just", a: [foldl((acc) => (x3) => ({ $: "Cons", a: [x3, acc] }), { $: "Nil", a: [] }, items1)] };
+                            return { $: "Just", a: [foldl((acc) => (x3) => ({ $: "Cons", a: [x3, acc] }), { $: "Nil", a: [] }, items)] };
                           }
                           case "False": {
                             return { $: "Nothing", a: [] };
@@ -48492,8 +48366,6 @@ const intoSilent = (e, implicit, y, dom, sc, v, counted) => ({ scope: sc, global
   }
   return $nomatch(s);
 })() });
-
-const errorHole = (a) => ({ stx: { $: "SAbandon", a: [] }, val: (u) => ({ $: "Nom", a: [reflect({ $: "HError", a: [] }, (u1) => ({ $: "SpId", a: [] }), (u1) => a, { $: "Nothing", a: [] })] }) });
 
 const errorOf = $lazy(() => {
   const x = { $: "MkPair", a: [(() => {
@@ -59117,7 +58989,9 @@ const sumElim = (sp, scrutSyn, tags, casesChk) => ({ $: "MkChk", a: [(e) => (b) 
                                                 return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b)(st3);
                                               }
                                               case "False": {
-                                                return failWith(sp, 18n, op_plus_plus("cannot match against non-sum type ")(tyStr(e, x2)))(st3);
+                                                const msg = "cannot match against non-sum type " + tyStr(e, x2);
+                                                const d = { code: 300n + 18n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+                                                return { $: "MkPair", a: [{ $: "Left", a: [d] }, st3] };
                                               }
                                             }
                                             return $nomatch(s2);
@@ -59136,115 +59010,585 @@ const sumElim = (sp, scrutSyn, tags, casesChk) => ({ $: "MkChk", a: [(e) => (b) 
                                 return casesAt(sp, e, b, scrut, x2, vs, tags, casesChk)(st2);
                               }
                               case "LikeInt": {
-                                return compiler_environment_bind(blockedTy$c(x2), (blocked) => {
-                                  switch (blocked.$) {
-                                    case "True": {
-                                      return compiler_environment_pure$c(errorHole(b));
-                                    }
-                                    case "False": {
-                                      const s2 = isFlexTy(x2);
-                                      switch (s2.$) {
-                                        case "True": {
-                                          return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b);
-                                        }
-                                        case "False": {
-                                          return failWith(sp, 18n, op_plus_plus("cannot match against non-sum type ")(tyStr(e, x2)));
-                                        }
+                                const m1 = blockedTy$c(x2);
+                                const x13 = m1(st2);
+                                switch (x13.$) {
+                                  case "MkPair": {
+                                    const x113 = x13.a[0];
+                                    const st3 = x13.a[1];
+                                    switch (x113.$) {
+                                      case "Left": {
+                                        const e1 = x113.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e1] }, st3] };
                                       }
-                                      return $nomatch(s2);
+                                      case "Right": {
+                                        const x3 = x113.a[0];
+                                        switch (x3.$) {
+                                          case "True": {
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ stx: { $: "SAbandon", a: [] }, val: (u) => ({ $: "Nom", a: [reflect({ $: "HError", a: [] }, (u1) => ({ $: "SpId", a: [] }), (u1) => b, { $: "Nothing", a: [] })] }) }] }, st3] };
+                                          }
+                                          case "False": {
+                                            const s2 = (() => {
+                                              const s2 = (() => {
+                                                switch (x2.$) {
+                                                  case "VU": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VDecode": {
+                                                    const it1 = x2.a[0];
+                                                    const sp1 = x2.a[1];
+                                                    const u = x2.a[2];
+                                                    const described = x2.a[3];
+                                                    const el = x2.a[4];
+                                                    switch (it1.$) {
+                                                      case "HLocal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HGlobal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HMeta": {
+                                                        const m2 = it1.a[0];
+                                                        return { $: "Just", a: [{ $: "MkPair", a: [m2, sp1] }] };
+                                                      }
+                                                      case "HError": {
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                    }
+                                                    return $nomatch(it1);
+                                                  }
+                                                  case "VFunction": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    const x7 = x2.a[3];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VRecord": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VSum": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimInt": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimFloat": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimString": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimArray": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                }
+                                                return $nomatch(x2);
+                                              })();
+                                              switch (s2.$) {
+                                                case "Nothing": {
+                                                  return { $: "False", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const x4 = s2.a[0];
+                                                  return { $: "True", a: [] };
+                                                }
+                                              }
+                                              return $nomatch(s2);
+                                            })();
+                                            switch (s2.$) {
+                                              case "True": {
+                                                return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b)(st3);
+                                              }
+                                              case "False": {
+                                                const msg = "cannot match against non-sum type " + tyStr(e, x2);
+                                                const d = { code: 300n + 18n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+                                                return { $: "MkPair", a: [{ $: "Left", a: [d] }, st3] };
+                                              }
+                                            }
+                                            return $nomatch(s2);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
                                     }
+                                    return $nomatch(x113);
                                   }
-                                  return $nomatch(blocked);
-                                }, st2);
+                                }
+                                return $nomatch(x13);
                               }
                               case "LikeFloat": {
-                                return compiler_environment_bind(blockedTy$c(x2), (blocked) => {
-                                  switch (blocked.$) {
-                                    case "True": {
-                                      return compiler_environment_pure$c(errorHole(b));
-                                    }
-                                    case "False": {
-                                      const s2 = isFlexTy(x2);
-                                      switch (s2.$) {
-                                        case "True": {
-                                          return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b);
-                                        }
-                                        case "False": {
-                                          return failWith(sp, 18n, op_plus_plus("cannot match against non-sum type ")(tyStr(e, x2)));
-                                        }
+                                const m1 = blockedTy$c(x2);
+                                const x13 = m1(st2);
+                                switch (x13.$) {
+                                  case "MkPair": {
+                                    const x113 = x13.a[0];
+                                    const st3 = x13.a[1];
+                                    switch (x113.$) {
+                                      case "Left": {
+                                        const e1 = x113.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e1] }, st3] };
                                       }
-                                      return $nomatch(s2);
+                                      case "Right": {
+                                        const x3 = x113.a[0];
+                                        switch (x3.$) {
+                                          case "True": {
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ stx: { $: "SAbandon", a: [] }, val: (u) => ({ $: "Nom", a: [reflect({ $: "HError", a: [] }, (u1) => ({ $: "SpId", a: [] }), (u1) => b, { $: "Nothing", a: [] })] }) }] }, st3] };
+                                          }
+                                          case "False": {
+                                            const s2 = (() => {
+                                              const s2 = (() => {
+                                                switch (x2.$) {
+                                                  case "VU": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VDecode": {
+                                                    const it1 = x2.a[0];
+                                                    const sp1 = x2.a[1];
+                                                    const u = x2.a[2];
+                                                    const described = x2.a[3];
+                                                    const el = x2.a[4];
+                                                    switch (it1.$) {
+                                                      case "HLocal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HGlobal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HMeta": {
+                                                        const m2 = it1.a[0];
+                                                        return { $: "Just", a: [{ $: "MkPair", a: [m2, sp1] }] };
+                                                      }
+                                                      case "HError": {
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                    }
+                                                    return $nomatch(it1);
+                                                  }
+                                                  case "VFunction": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    const x7 = x2.a[3];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VRecord": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VSum": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimInt": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimFloat": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimString": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimArray": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                }
+                                                return $nomatch(x2);
+                                              })();
+                                              switch (s2.$) {
+                                                case "Nothing": {
+                                                  return { $: "False", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const x4 = s2.a[0];
+                                                  return { $: "True", a: [] };
+                                                }
+                                              }
+                                              return $nomatch(s2);
+                                            })();
+                                            switch (s2.$) {
+                                              case "True": {
+                                                return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b)(st3);
+                                              }
+                                              case "False": {
+                                                const msg = "cannot match against non-sum type " + tyStr(e, x2);
+                                                const d = { code: 300n + 18n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+                                                return { $: "MkPair", a: [{ $: "Left", a: [d] }, st3] };
+                                              }
+                                            }
+                                            return $nomatch(s2);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
                                     }
+                                    return $nomatch(x113);
                                   }
-                                  return $nomatch(blocked);
-                                }, st2);
+                                }
+                                return $nomatch(x13);
                               }
                               case "LikeString": {
-                                return compiler_environment_bind(blockedTy$c(x2), (blocked) => {
-                                  switch (blocked.$) {
-                                    case "True": {
-                                      return compiler_environment_pure$c(errorHole(b));
-                                    }
-                                    case "False": {
-                                      const s2 = isFlexTy(x2);
-                                      switch (s2.$) {
-                                        case "True": {
-                                          return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b);
-                                        }
-                                        case "False": {
-                                          return failWith(sp, 18n, op_plus_plus("cannot match against non-sum type ")(tyStr(e, x2)));
-                                        }
+                                const m1 = blockedTy$c(x2);
+                                const x13 = m1(st2);
+                                switch (x13.$) {
+                                  case "MkPair": {
+                                    const x113 = x13.a[0];
+                                    const st3 = x13.a[1];
+                                    switch (x113.$) {
+                                      case "Left": {
+                                        const e1 = x113.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e1] }, st3] };
                                       }
-                                      return $nomatch(s2);
+                                      case "Right": {
+                                        const x3 = x113.a[0];
+                                        switch (x3.$) {
+                                          case "True": {
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ stx: { $: "SAbandon", a: [] }, val: (u) => ({ $: "Nom", a: [reflect({ $: "HError", a: [] }, (u1) => ({ $: "SpId", a: [] }), (u1) => b, { $: "Nothing", a: [] })] }) }] }, st3] };
+                                          }
+                                          case "False": {
+                                            const s2 = (() => {
+                                              const s2 = (() => {
+                                                switch (x2.$) {
+                                                  case "VU": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VDecode": {
+                                                    const it1 = x2.a[0];
+                                                    const sp1 = x2.a[1];
+                                                    const u = x2.a[2];
+                                                    const described = x2.a[3];
+                                                    const el = x2.a[4];
+                                                    switch (it1.$) {
+                                                      case "HLocal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HGlobal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HMeta": {
+                                                        const m2 = it1.a[0];
+                                                        return { $: "Just", a: [{ $: "MkPair", a: [m2, sp1] }] };
+                                                      }
+                                                      case "HError": {
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                    }
+                                                    return $nomatch(it1);
+                                                  }
+                                                  case "VFunction": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    const x7 = x2.a[3];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VRecord": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VSum": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimInt": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimFloat": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimString": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimArray": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                }
+                                                return $nomatch(x2);
+                                              })();
+                                              switch (s2.$) {
+                                                case "Nothing": {
+                                                  return { $: "False", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const x4 = s2.a[0];
+                                                  return { $: "True", a: [] };
+                                                }
+                                              }
+                                              return $nomatch(s2);
+                                            })();
+                                            switch (s2.$) {
+                                              case "True": {
+                                                return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b)(st3);
+                                              }
+                                              case "False": {
+                                                const msg = "cannot match against non-sum type " + tyStr(e, x2);
+                                                const d = { code: 300n + 18n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+                                                return { $: "MkPair", a: [{ $: "Left", a: [d] }, st3] };
+                                              }
+                                            }
+                                            return $nomatch(s2);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
                                     }
+                                    return $nomatch(x113);
                                   }
-                                  return $nomatch(blocked);
-                                }, st2);
+                                }
+                                return $nomatch(x13);
                               }
                               case "LikeArray": {
                                 const x3 = s1.a[0];
-                                return compiler_environment_bind(blockedTy$c(x2), (blocked) => {
-                                  switch (blocked.$) {
-                                    case "True": {
-                                      return compiler_environment_pure$c(errorHole(b));
-                                    }
-                                    case "False": {
-                                      const s2 = isFlexTy(x2);
-                                      switch (s2.$) {
-                                        case "True": {
-                                          return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b);
-                                        }
-                                        case "False": {
-                                          return failWith(sp, 18n, op_plus_plus("cannot match against non-sum type ")(tyStr(e, x2)));
-                                        }
+                                const m1 = blockedTy$c(x2);
+                                const x13 = m1(st2);
+                                switch (x13.$) {
+                                  case "MkPair": {
+                                    const x113 = x13.a[0];
+                                    const st3 = x13.a[1];
+                                    switch (x113.$) {
+                                      case "Left": {
+                                        const e1 = x113.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e1] }, st3] };
                                       }
-                                      return $nomatch(s2);
+                                      case "Right": {
+                                        const x4 = x113.a[0];
+                                        switch (x4.$) {
+                                          case "True": {
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ stx: { $: "SAbandon", a: [] }, val: (u) => ({ $: "Nom", a: [reflect({ $: "HError", a: [] }, (u1) => ({ $: "SpId", a: [] }), (u1) => b, { $: "Nothing", a: [] })] }) }] }, st3] };
+                                          }
+                                          case "False": {
+                                            const s2 = (() => {
+                                              const s2 = (() => {
+                                                switch (x2.$) {
+                                                  case "VU": {
+                                                    const x5 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VDecode": {
+                                                    const it1 = x2.a[0];
+                                                    const sp1 = x2.a[1];
+                                                    const u = x2.a[2];
+                                                    const described = x2.a[3];
+                                                    const el = x2.a[4];
+                                                    switch (it1.$) {
+                                                      case "HLocal": {
+                                                        const x5 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HGlobal": {
+                                                        const x5 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HMeta": {
+                                                        const m2 = it1.a[0];
+                                                        return { $: "Just", a: [{ $: "MkPair", a: [m2, sp1] }] };
+                                                      }
+                                                      case "HError": {
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                    }
+                                                    return $nomatch(it1);
+                                                  }
+                                                  case "VFunction": {
+                                                    const x5 = x2.a[0];
+                                                    const x6 = x2.a[1];
+                                                    const x7 = x2.a[2];
+                                                    const x8 = x2.a[3];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VRecord": {
+                                                    const x5 = x2.a[0];
+                                                    const x6 = x2.a[1];
+                                                    const x7 = x2.a[2];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VSum": {
+                                                    const x5 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimInt": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimFloat": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimString": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimArray": {
+                                                    const x5 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                }
+                                                return $nomatch(x2);
+                                              })();
+                                              switch (s2.$) {
+                                                case "Nothing": {
+                                                  return { $: "False", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const x5 = s2.a[0];
+                                                  return { $: "True", a: [] };
+                                                }
+                                              }
+                                              return $nomatch(s2);
+                                            })();
+                                            switch (s2.$) {
+                                              case "True": {
+                                                return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b)(st3);
+                                              }
+                                              case "False": {
+                                                const msg = "cannot match against non-sum type " + tyStr(e, x2);
+                                                const d = { code: 300n + 18n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+                                                return { $: "MkPair", a: [{ $: "Left", a: [d] }, st3] };
+                                              }
+                                            }
+                                            return $nomatch(s2);
+                                          }
+                                        }
+                                        return $nomatch(x4);
+                                      }
                                     }
+                                    return $nomatch(x113);
                                   }
-                                  return $nomatch(blocked);
-                                }, st2);
+                                }
+                                return $nomatch(x13);
                               }
                               case "NoRules": {
-                                return compiler_environment_bind(blockedTy$c(x2), (blocked) => {
-                                  switch (blocked.$) {
-                                    case "True": {
-                                      return compiler_environment_pure$c(errorHole(b));
-                                    }
-                                    case "False": {
-                                      const s2 = isFlexTy(x2);
-                                      switch (s2.$) {
-                                        case "True": {
-                                          return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b);
-                                        }
-                                        case "False": {
-                                          return failWith(sp, 18n, op_plus_plus("cannot match against non-sum type ")(tyStr(e, x2)));
-                                        }
+                                const m1 = blockedTy$c(x2);
+                                const x13 = m1(st2);
+                                switch (x13.$) {
+                                  case "MkPair": {
+                                    const x113 = x13.a[0];
+                                    const st3 = x13.a[1];
+                                    switch (x113.$) {
+                                      case "Left": {
+                                        const e1 = x113.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e1] }, st3] };
                                       }
-                                      return $nomatch(s2);
+                                      case "Right": {
+                                        const x3 = x113.a[0];
+                                        switch (x3.$) {
+                                          case "True": {
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ stx: { $: "SAbandon", a: [] }, val: (u) => ({ $: "Nom", a: [reflect({ $: "HError", a: [] }, (u1) => ({ $: "SpId", a: [] }), (u1) => b, { $: "Nothing", a: [] })] }) }] }, st3] };
+                                          }
+                                          case "False": {
+                                            const s2 = (() => {
+                                              const s2 = (() => {
+                                                switch (x2.$) {
+                                                  case "VU": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VDecode": {
+                                                    const it1 = x2.a[0];
+                                                    const sp1 = x2.a[1];
+                                                    const u = x2.a[2];
+                                                    const described = x2.a[3];
+                                                    const el = x2.a[4];
+                                                    switch (it1.$) {
+                                                      case "HLocal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HGlobal": {
+                                                        const x4 = it1.a[0];
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                      case "HMeta": {
+                                                        const m2 = it1.a[0];
+                                                        return { $: "Just", a: [{ $: "MkPair", a: [m2, sp1] }] };
+                                                      }
+                                                      case "HError": {
+                                                        return { $: "Nothing", a: [] };
+                                                      }
+                                                    }
+                                                    return $nomatch(it1);
+                                                  }
+                                                  case "VFunction": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    const x7 = x2.a[3];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VRecord": {
+                                                    const x4 = x2.a[0];
+                                                    const x5 = x2.a[1];
+                                                    const x6 = x2.a[2];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VSum": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimInt": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimFloat": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimString": {
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                  case "VPrimArray": {
+                                                    const x4 = x2.a[0];
+                                                    return { $: "Nothing", a: [] };
+                                                  }
+                                                }
+                                                return $nomatch(x2);
+                                              })();
+                                              switch (s2.$) {
+                                                case "Nothing": {
+                                                  return { $: "False", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const x4 = s2.a[0];
+                                                  return { $: "True", a: [] };
+                                                }
+                                              }
+                                              return $nomatch(s2);
+                                            })();
+                                            switch (s2.$) {
+                                              case "True": {
+                                                return delayChkOn(e, sp, "match", matchLater(sp, scrut, x2, tags, casesChk), x2, b)(st3);
+                                              }
+                                              case "False": {
+                                                const msg = "cannot match against non-sum type " + tyStr(e, x2);
+                                                const d = { code: 300n + 18n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+                                                return { $: "MkPair", a: [{ $: "Left", a: [d] }, st3] };
+                                              }
+                                            }
+                                            return $nomatch(s2);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
                                     }
+                                    return $nomatch(x113);
                                   }
-                                  return $nomatch(blocked);
-                                }, st2);
+                                }
+                                return $nomatch(x13);
                               }
                             }
                             return $nomatch(s1);
@@ -61044,52 +61388,220 @@ const elimF = (tk1, start, s, n) => {
         case "Juxt": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "Infix": {
           const n11 = n1.a[0];
           const n12 = n1.a[1];
-          const n2 = n1.a[2];
+          const n13 = n1.a[2];
           switch (n11.$) {
             case "Juxt": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "Infix": {
               const x = n11.a[0];
               const x1 = n11.a[1];
               const x2 = n11.a[2];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x3 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NBlock": {
               const x = n11.a[0];
               const x1 = n11.a[1];
               const x2 = n11.a[2];
               const x3 = n11.a[3];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x4 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x4)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "MDecl": {
               const x = n11.a[0];
               const x1 = n11.a[1];
               const x2 = n11.a[2];
               const x3 = n11.a[3];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x4 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x4)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NTuple": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NBrace": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NBracket": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "Ident": {
               const x = n11.a[0];
@@ -61098,58 +61610,268 @@ const elimF = (tk1, start, s, n) => {
                 case "Juxt": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "Infix": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x4 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x4)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NBlock": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
                   const x4 = n12.a[3];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x5 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x5)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "MDecl": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
                   const x4 = n12.a[3];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x5 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x5)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NTuple": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NBrace": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NBracket": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "Ident": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "Keyword": {
                   const n121 = n12.a[0];
                   const n122 = n12.a[1];
-                  const s1 = strEq(n121)(":=");
+                  const s1 = n121 === ":=" ? $T : $F;
                   switch (s1.$) {
                     case "True": {
-                      return compiler_environment_bind$c(argumentF(tk1, n2))((a) => compiler_environment_pure$c(functionElimNamed({ start: start, end: sp.end }, x, s, a)));
+                      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n13));
+                      return (st) => {
+                        const x1 = m(st);
+                        switch (x1.$) {
+                          case "MkPair": {
+                            const x11 = x1.a[0];
+                            const st1 = x1.a[1];
+                            switch (x11.$) {
+                              case "Left": {
+                                const e = x11.a[0];
+                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                              }
+                              case "Right": {
+                                const x2 = x11.a[0];
+                                return { $: "MkPair", a: [{ $: "Right", a: [functionElimNamed({ start: start, end: sp.end }, x, s, x2)] }, st1] };
+                              }
+                            }
+                            return $nomatch(x11);
+                          }
+                        }
+                        return $nomatch(x1);
+                      };
                     }
                     case "False": {
-                      return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                      return (st) => {
+                        const x1 = m(st);
+                        switch (x1.$) {
+                          case "MkPair": {
+                            const x11 = x1.a[0];
+                            const st1 = x1.a[1];
+                            switch (x11.$) {
+                              case "Left": {
+                                const e = x11.a[0];
+                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                              }
+                              case "Right": {
+                                const x2 = x11.a[0];
+                                return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                              }
+                            }
+                            return $nomatch(x11);
+                          }
+                        }
+                        return $nomatch(x1);
+                      };
                     }
                   }
                   return $nomatch(s1);
@@ -61157,31 +61879,157 @@ const elimF = (tk1, start, s, n) => {
                 case "NField": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NTag": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NInt": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NFloat": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NString": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x3 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x3)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
                 case "NError": {
                   const x1 = n12.a[0];
-                  return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+                  const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+                  return (st) => {
+                    const x11 = m(st);
+                    switch (x11.$) {
+                      case "MkPair": {
+                        const x111 = x11.a[0];
+                        const st1 = x11.a[1];
+                        switch (x111.$) {
+                          case "Left": {
+                            const e = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                          }
+                          case "Right": {
+                            const x2 = x111.a[0];
+                            return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                          }
+                        }
+                        return $nomatch(x111);
+                      }
+                    }
+                    return $nomatch(x11);
+                  };
                 }
               }
               return $nomatch(n12);
@@ -61189,36 +62037,183 @@ const elimF = (tk1, start, s, n) => {
             case "Keyword": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NField": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NTag": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NInt": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NFloat": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NString": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x11 = m(st);
+                switch (x11.$) {
+                  case "MkPair": {
+                    const x111 = x11.a[0];
+                    const st1 = x11.a[1];
+                    switch (x111.$) {
+                      case "Left": {
+                        const e = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x111.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x111);
+                  }
+                }
+                return $nomatch(x11);
+              };
             }
             case "NError": {
               const x = n11.a[0];
-              return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+              const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+              return (st) => {
+                const x1 = m(st);
+                switch (x1.$) {
+                  case "MkPair": {
+                    const x11 = x1.a[0];
+                    const st1 = x1.a[1];
+                    switch (x11.$) {
+                      case "Left": {
+                        const e = x11.a[0];
+                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                      }
+                      case "Right": {
+                        const x2 = x11.a[0];
+                        return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                      }
+                    }
+                    return $nomatch(x11);
+                  }
+                }
+                return $nomatch(x1);
+              };
             }
           }
           return $nomatch(n11);
@@ -61228,68 +62223,341 @@ const elimF = (tk1, start, s, n) => {
           const x1 = n1.a[1];
           const x2 = n1.a[2];
           const x3 = n1.a[3];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x4 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x4)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "MDecl": {
           const x = n1.a[0];
           const x1 = n1.a[1];
           const x2 = n1.a[2];
           const x3 = n1.a[3];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x4 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x4)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NTuple": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NBrace": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NBracket": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "Ident": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "Keyword": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NField": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NTag": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NInt": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NFloat": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NString": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x11 = m(st);
+            switch (x11.$) {
+              case "MkPair": {
+                const x111 = x11.a[0];
+                const st1 = x11.a[1];
+                switch (x111.$) {
+                  case "Left": {
+                    const e = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x111.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x111);
+              }
+            }
+            return $nomatch(x11);
+          };
         }
         case "NError": {
           const x = n1.a[0];
-          return compiler_environment_bind$c(argumentF(tk1, n1))((a) => compiler_environment_pure$c(functionElimImplicit({ start: start, end: sp.end }, s, a)));
+          const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n1));
+          return (st) => {
+            const x1 = m(st);
+            switch (x1.$) {
+              case "MkPair": {
+                const x11 = x1.a[0];
+                const st1 = x1.a[1];
+                switch (x11.$) {
+                  case "Left": {
+                    const e = x11.a[0];
+                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                  }
+                  case "Right": {
+                    const x2 = x11.a[0];
+                    return { $: "MkPair", a: [{ $: "Right", a: [functionElimImplicit({ start: start, end: sp.end }, s, x2)] }, st1] };
+                  }
+                }
+                return $nomatch(x11);
+              }
+            }
+            return $nomatch(x1);
+          };
         }
       }
       return $nomatch(n1);
@@ -61297,32 +62565,142 @@ const elimF = (tk1, start, s, n) => {
     case "NBracket": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return compiler_environment_bind$c(argumentF(tk1, n))((a) => compiler_environment_pure$c(functionElimC(checksOnly(n), { start: start, end: ntnSpan(n).end }, s, a)));
+      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n));
+      return (st) => {
+        const x11 = m(st);
+        switch (x11.$) {
+          case "MkPair": {
+            const x111 = x11.a[0];
+            const st1 = x11.a[1];
+            switch (x111.$) {
+              case "Left": {
+                const e = x111.a[0];
+                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+              }
+              case "Right": {
+                const x2 = x111.a[0];
+                const x3 = functionElimC(checksOnly(n), { start: start, end: { start: startPos(n), end: endPos(n) }.end }, s, x2);
+                return { $: "MkPair", a: [{ $: "Right", a: [x3] }, st1] };
+              }
+            }
+            return $nomatch(x111);
+          }
+        }
+        return $nomatch(x11);
+      };
     }
     case "Ident": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return compiler_environment_bind$c(argumentF(tk1, n))((a) => compiler_environment_pure$c(functionElimC(checksOnly(n), { start: start, end: ntnSpan(n).end }, s, a)));
+      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n));
+      return (st) => {
+        const x11 = m(st);
+        switch (x11.$) {
+          case "MkPair": {
+            const x111 = x11.a[0];
+            const st1 = x11.a[1];
+            switch (x111.$) {
+              case "Left": {
+                const e = x111.a[0];
+                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+              }
+              case "Right": {
+                const x2 = x111.a[0];
+                const x3 = functionElimC(checksOnly(n), { start: start, end: { start: startPos(n), end: endPos(n) }.end }, s, x2);
+                return { $: "MkPair", a: [{ $: "Right", a: [x3] }, st1] };
+              }
+            }
+            return $nomatch(x111);
+          }
+        }
+        return $nomatch(x11);
+      };
     }
     case "Keyword": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return compiler_environment_bind$c(argumentF(tk1, n))((a) => compiler_environment_pure$c(functionElimC(checksOnly(n), { start: start, end: ntnSpan(n).end }, s, a)));
+      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n));
+      return (st) => {
+        const x11 = m(st);
+        switch (x11.$) {
+          case "MkPair": {
+            const x111 = x11.a[0];
+            const st1 = x11.a[1];
+            switch (x111.$) {
+              case "Left": {
+                const e = x111.a[0];
+                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+              }
+              case "Right": {
+                const x2 = x111.a[0];
+                const x3 = functionElimC(checksOnly(n), { start: start, end: { start: startPos(n), end: endPos(n) }.end }, s, x2);
+                return { $: "MkPair", a: [{ $: "Right", a: [x3] }, st1] };
+              }
+            }
+            return $nomatch(x111);
+          }
+        }
+        return $nomatch(x11);
+      };
     }
     case "NField": {
       const x = n.a[0];
       const sp = n.a[1];
-      return compiler_environment_pure$c(recordElim(sp, s, x));
+      return (st) => ({ $: "MkPair", a: [{ $: "Right", a: [recordElim(sp, s, x)] }, st] });
     }
     case "NTag": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return compiler_environment_bind$c(argumentF(tk1, n))((a) => compiler_environment_pure$c(functionElimC(checksOnly(n), { start: start, end: ntnSpan(n).end }, s, a)));
+      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n));
+      return (st) => {
+        const x11 = m(st);
+        switch (x11.$) {
+          case "MkPair": {
+            const x111 = x11.a[0];
+            const st1 = x11.a[1];
+            switch (x111.$) {
+              case "Left": {
+                const e = x111.a[0];
+                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+              }
+              case "Right": {
+                const x2 = x111.a[0];
+                const x3 = functionElimC(checksOnly(n), { start: start, end: { start: startPos(n), end: endPos(n) }.end }, s, x2);
+                return { $: "MkPair", a: [{ $: "Right", a: [x3] }, st1] };
+              }
+            }
+            return $nomatch(x111);
+          }
+        }
+        return $nomatch(x11);
+      };
     }
     case "NInt": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return compiler_environment_bind$c(argumentF(tk1, n))((a) => compiler_environment_pure$c(functionElimC(checksOnly(n), { start: start, end: ntnSpan(n).end }, s, a)));
+      const m = recoveringChk$c(tk1.chkJ({ $: "N", a: [] })(n));
+      return (st) => {
+        const x11 = m(st);
+        switch (x11.$) {
+          case "MkPair": {
+            const x111 = x11.a[0];
+            const st1 = x11.a[1];
+            switch (x111.$) {
+              case "Left": {
+                const e = x111.a[0];
+                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+              }
+              case "Right": {
+                const x2 = x111.a[0];
+                const x3 = functionElimC(checksOnly(n), { start: start, end: { start: startPos(n), end: endPos(n) }.end }, s, x2);
+                return { $: "MkPair", a: [{ $: "Right", a: [x3] }, st1] };
+              }
+            }
+            return $nomatch(x111);
+          }
+        }
+        return $nomatch(x11);
+      };
     }
     case "NFloat": {
       const x = n.a[0];
@@ -62306,12 +63684,12 @@ const compiler_toplevel_binderF = (tk1, n) => {
         case "Infix": {
           const n11 = n1.a[0];
           const n12 = n1.a[1];
-          const n2 = n1.a[2];
+          const n13 = n1.a[2];
           switch (n11.$) {
             case "Juxt": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62338,7 +63716,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
               const x = n11.a[0];
               const x1 = n11.a[1];
               const x2 = n11.a[2];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62366,7 +63744,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
               const x1 = n11.a[1];
               const x2 = n11.a[2];
               const x3 = n11.a[3];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62394,7 +63772,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
               const x1 = n11.a[1];
               const x2 = n11.a[2];
               const x3 = n11.a[3];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62420,7 +63798,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NTuple": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62446,7 +63824,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NBrace": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62472,7 +63850,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NBracket": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62502,7 +63880,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "Juxt": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62529,7 +63907,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62557,7 +63935,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
                   const x4 = n12.a[3];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62585,7 +63963,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
                   const x4 = n12.a[3];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62611,7 +63989,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NTuple": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62637,7 +64015,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NBrace": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62663,7 +64041,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NBracket": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62689,7 +64067,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "Ident": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62718,7 +64096,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const s = n121 === ":" ? $T : $F;
                   switch (s.$) {
                     case "True": {
-                      const m = tk1.typJ({ $: "N", a: [] })(n2);
+                      const m = tk1.typJ({ $: "N", a: [] })(n13);
                       return (st) => {
                         const x1 = m(st);
                         switch (x1.$) {
@@ -62742,7 +64120,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                       };
                     }
                     case "False": {
-                      const m = tk1.typJ({ $: "N", a: [] })(n2);
+                      const m = tk1.typJ({ $: "N", a: [] })(n);
                       return (st) => {
                         const x1 = m(st);
                         switch (x1.$) {
@@ -62771,7 +64149,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NField": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62797,7 +64175,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NTag": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62823,7 +64201,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NInt": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62849,7 +64227,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NFloat": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62875,7 +64253,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NString": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62900,7 +64278,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 }
                 case "NError": {
                   const x1 = n12.a[0];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -62929,7 +64307,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "Keyword": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62955,7 +64333,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NField": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -62981,7 +64359,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NTag": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63007,7 +64385,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NInt": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63033,7 +64411,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NFloat": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63059,7 +64437,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NString": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63084,7 +64462,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             }
             case "NError": {
               const x = n11.a[0];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x1 = m(st);
                 switch (x1.$) {
@@ -63487,12 +64865,12 @@ const compiler_toplevel_binderF = (tk1, n) => {
         case "Infix": {
           const n11 = n1.a[0];
           const n12 = n1.a[1];
-          const n2 = n1.a[2];
+          const n13 = n1.a[2];
           switch (n11.$) {
             case "Juxt": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63519,7 +64897,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
               const x = n11.a[0];
               const x1 = n11.a[1];
               const x2 = n11.a[2];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63547,7 +64925,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
               const x1 = n11.a[1];
               const x2 = n11.a[2];
               const x3 = n11.a[3];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63575,7 +64953,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
               const x1 = n11.a[1];
               const x2 = n11.a[2];
               const x3 = n11.a[3];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63601,7 +64979,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NTuple": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63627,7 +65005,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NBrace": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63653,7 +65031,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NBracket": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -63683,7 +65061,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "Juxt": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63710,7 +65088,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63738,7 +65116,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
                   const x4 = n12.a[3];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63766,7 +65144,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const x2 = n12.a[1];
                   const x3 = n12.a[2];
                   const x4 = n12.a[3];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63792,7 +65170,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NTuple": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63818,7 +65196,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NBrace": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63844,7 +65222,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NBracket": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63870,7 +65248,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "Ident": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63899,7 +65277,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                   const s = n121 === ":" ? $T : $F;
                   switch (s.$) {
                     case "True": {
-                      const m = tk1.typJ({ $: "N", a: [] })(n2);
+                      const m = tk1.typJ({ $: "N", a: [] })(n13);
                       return (st) => {
                         const x1 = m(st);
                         switch (x1.$) {
@@ -63923,7 +65301,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                       };
                     }
                     case "False": {
-                      const m = tk1.typJ({ $: "N", a: [] })(n2);
+                      const m = tk1.typJ({ $: "N", a: [] })(n);
                       return (st) => {
                         const x1 = m(st);
                         switch (x1.$) {
@@ -63952,7 +65330,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NField": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -63978,7 +65356,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NTag": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -64004,7 +65382,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NInt": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -64030,7 +65408,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NFloat": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -64056,7 +65434,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 case "NString": {
                   const x1 = n12.a[0];
                   const x2 = n12.a[1];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -64081,7 +65459,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
                 }
                 case "NError": {
                   const x1 = n12.a[0];
-                  const m = tk1.typJ({ $: "N", a: [] })(n2);
+                  const m = tk1.typJ({ $: "N", a: [] })(n);
                   return (st) => {
                     const x11 = m(st);
                     switch (x11.$) {
@@ -64110,7 +65488,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "Keyword": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -64136,7 +65514,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NField": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -64162,7 +65540,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NTag": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -64188,7 +65566,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NInt": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -64214,7 +65592,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NFloat": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -64240,7 +65618,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             case "NString": {
               const x = n11.a[0];
               const x1 = n11.a[1];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x11 = m(st);
                 switch (x11.$) {
@@ -64265,7 +65643,7 @@ const compiler_toplevel_binderF = (tk1, n) => {
             }
             case "NError": {
               const x = n11.a[0];
-              const m = tk1.typJ({ $: "N", a: [] })(n2);
+              const m = tk1.typJ({ $: "N", a: [] })(n);
               return (st) => {
                 const x1 = m(st);
                 switch (x1.$) {
@@ -66827,12 +68205,12 @@ const specializationF = (tk1, n) => {
             case "Infix": {
               const n111 = n11.a[0];
               const n112 = n11.a[1];
-              const n3 = n11.a[2];
+              const n113 = n11.a[2];
               switch (n111.$) {
                 case "Juxt": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66841,7 +68219,7 @@ const specializationF = (tk1, n) => {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
                   const x2 = n111.a[2];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66851,7 +68229,7 @@ const specializationF = (tk1, n) => {
                   const x1 = n111.a[1];
                   const x2 = n111.a[2];
                   const x3 = n111.a[3];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66861,7 +68239,7 @@ const specializationF = (tk1, n) => {
                   const x1 = n111.a[1];
                   const x2 = n111.a[2];
                   const x3 = n111.a[3];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66869,7 +68247,7 @@ const specializationF = (tk1, n) => {
                 case "NTuple": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66877,7 +68255,7 @@ const specializationF = (tk1, n) => {
                 case "NBrace": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66885,7 +68263,7 @@ const specializationF = (tk1, n) => {
                 case "NBracket": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66893,7 +68271,7 @@ const specializationF = (tk1, n) => {
                 case "Ident": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66901,7 +68279,7 @@ const specializationF = (tk1, n) => {
                 case "Keyword": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66913,7 +68291,7 @@ const specializationF = (tk1, n) => {
                     case "Juxt": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66922,7 +68300,7 @@ const specializationF = (tk1, n) => {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
                       const x3 = n112.a[2];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66932,7 +68310,7 @@ const specializationF = (tk1, n) => {
                       const x2 = n112.a[1];
                       const x3 = n112.a[2];
                       const x4 = n112.a[3];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66942,7 +68320,7 @@ const specializationF = (tk1, n) => {
                       const x2 = n112.a[1];
                       const x3 = n112.a[2];
                       const x4 = n112.a[3];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66950,7 +68328,7 @@ const specializationF = (tk1, n) => {
                     case "NTuple": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66958,7 +68336,7 @@ const specializationF = (tk1, n) => {
                     case "NBrace": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66966,7 +68344,7 @@ const specializationF = (tk1, n) => {
                     case "NBracket": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66974,7 +68352,7 @@ const specializationF = (tk1, n) => {
                     case "Ident": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -66987,7 +68365,7 @@ const specializationF = (tk1, n) => {
                         case "True": {
                           switch (n12.$) {
                             case "Nil": {
-                              const m = tk1.chkJ({ $: "N", a: [] })(n3);
+                              const m = tk1.chkJ({ $: "N", a: [] })(n113);
                               return (st) => {
                                 const x1 = m(st);
                                 switch (x1.$) {
@@ -67013,7 +68391,7 @@ const specializationF = (tk1, n) => {
                             case "Cons": {
                               const x1 = n12.a[0];
                               const x2 = n12.a[1];
-                              const sp = { start: startPos(n3), end: endPos(n3) };
+                              const sp = { start: startPos(n), end: endPos(n) };
                               const msg = "unexpected notation for " + "specialization";
                               const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                               return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67022,7 +68400,7 @@ const specializationF = (tk1, n) => {
                           return $nomatch(n12);
                         }
                         case "False": {
-                          const sp = { start: startPos(n3), end: endPos(n3) };
+                          const sp = { start: startPos(n), end: endPos(n) };
                           const msg = "unexpected notation for " + "specialization";
                           const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                           return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67033,7 +68411,7 @@ const specializationF = (tk1, n) => {
                     case "NField": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67041,7 +68419,7 @@ const specializationF = (tk1, n) => {
                     case "NTag": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67049,7 +68427,7 @@ const specializationF = (tk1, n) => {
                     case "NInt": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67057,7 +68435,7 @@ const specializationF = (tk1, n) => {
                     case "NFloat": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67065,14 +68443,14 @@ const specializationF = (tk1, n) => {
                     case "NString": {
                       const x1 = n112.a[0];
                       const x2 = n112.a[1];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                     }
                     case "NError": {
                       const x1 = n112.a[0];
-                      const sp = { start: startPos(n3), end: endPos(n3) };
+                      const sp = { start: startPos(n), end: endPos(n) };
                       const msg = "unexpected notation for " + "specialization";
                       const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                       return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67083,7 +68461,7 @@ const specializationF = (tk1, n) => {
                 case "NTag": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67091,7 +68469,7 @@ const specializationF = (tk1, n) => {
                 case "NInt": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67099,7 +68477,7 @@ const specializationF = (tk1, n) => {
                 case "NFloat": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -67107,14 +68485,14 @@ const specializationF = (tk1, n) => {
                 case "NString": {
                   const x = n111.a[0];
                   const x1 = n111.a[1];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                 }
                 case "NError": {
                   const x = n111.a[0];
-                  const sp = { start: startPos(n3), end: endPos(n3) };
+                  const sp = { start: startPos(n), end: endPos(n) };
                   const msg = "unexpected notation for " + "specialization";
                   const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
                   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
@@ -70354,7 +71732,8 @@ const parseHeadF = (tk1, c, n) => {
                                                           }
                                                           case "Right": {
                                                             const x4 = x111.a[0];
-                                                            return compiler_environment_pure(fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc)), st2);
+                                                            const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                            return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
                                                           }
                                                         }
                                                         return $nomatch(x111);
@@ -70373,13 +71752,55 @@ const parseHeadF = (tk1, c, n) => {
                                       };
                                     }
                                     case "False": {
-                                      const s4 = strEq(it21)(":");
+                                      const s4 = it21 === ":" ? $T : $F;
                                       switch (s4.$) {
                                         case "True": {
-                                          return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                          const m = tk1.chkJ(c)(domN);
+                                          return (st) => {
+                                            const x1 = m(st);
+                                            switch (x1.$) {
+                                              case "MkPair": {
+                                                const x11 = x1.a[0];
+                                                const st1 = x1.a[1];
+                                                switch (x11.$) {
+                                                  case "Left": {
+                                                    const e = x11.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                                  }
+                                                  case "Right": {
+                                                    const x2 = x11.a[0];
+                                                    const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                                    const x12 = m1(st1);
+                                                    switch (x12.$) {
+                                                      case "MkPair": {
+                                                        const x111 = x12.a[0];
+                                                        const st2 = x12.a[1];
+                                                        switch (x111.$) {
+                                                          case "Left": {
+                                                            const e = x111.a[0];
+                                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                          }
+                                                          case "Right": {
+                                                            const x3 = x111.a[0];
+                                                            return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                                          }
+                                                        }
+                                                        return $nomatch(x111);
+                                                      }
+                                                    }
+                                                    return $nomatch(x12);
+                                                  }
+                                                }
+                                                return $nomatch(x11);
+                                              }
+                                            }
+                                            return $nomatch(x1);
+                                          };
                                         }
                                         case "False": {
-                                          return failP(ntnSpan(n), 3n, "unexpected notation");
+                                          const sp = { start: startPos(n), end: endPos(n) };
+                                          const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                          return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                         }
                                       }
                                       return $nomatch(s4);
@@ -70391,28 +71812,109 @@ const parseHeadF = (tk1, c, n) => {
                               return $nomatch(s2);
                             }
                             case "False": {
-                              const s2 = strEq(it21)("~");
+                              const s2 = it21 === "~" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                    switch (px.$) {
+                                  const m = specializationF(tk1, codN);
+                                  return (st) => {
+                                    const x1 = m(st);
+                                    switch (x1.$) {
                                       case "MkPair": {
-                                        const x1 = px.a[0];
-                                        const cc = px.a[1];
-                                        return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s3) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s3, x1, cc))));
+                                        const x11 = x1.a[0];
+                                        const st1 = x1.a[1];
+                                        switch (x11.$) {
+                                          case "Left": {
+                                            const e = x11.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x2 = x11.a[0];
+                                            switch (x2.$) {
+                                              case "MkPair": {
+                                                const x3 = x2.a[0];
+                                                const cc = x2.a[1];
+                                                const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                                const x12 = m1(st1);
+                                                switch (x12.$) {
+                                                  case "MkPair": {
+                                                    const x111 = x12.a[0];
+                                                    const st2 = x12.a[1];
+                                                    switch (x111.$) {
+                                                      case "Left": {
+                                                        const e = x111.a[0];
+                                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                      }
+                                                      case "Right": {
+                                                        const x4 = x111.a[0];
+                                                        const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                        return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                                      }
+                                                    }
+                                                    return $nomatch(x111);
+                                                  }
+                                                }
+                                                return $nomatch(x12);
+                                              }
+                                            }
+                                            return $nomatch(x2);
+                                          }
+                                        }
+                                        return $nomatch(x11);
                                       }
                                     }
-                                    return $nomatch(px);
-                                  });
+                                    return $nomatch(x1);
+                                  };
                                 }
                                 case "False": {
-                                  const s3 = strEq(it21)(":");
+                                  const s3 = it21 === ":" ? $T : $F;
                                   switch (s3.$) {
                                     case "True": {
-                                      return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                      const m = tk1.chkJ(c)(domN);
+                                      return (st) => {
+                                        const x1 = m(st);
+                                        switch (x1.$) {
+                                          case "MkPair": {
+                                            const x11 = x1.a[0];
+                                            const st1 = x1.a[1];
+                                            switch (x11.$) {
+                                              case "Left": {
+                                                const e = x11.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                              }
+                                              case "Right": {
+                                                const x2 = x11.a[0];
+                                                const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                                const x12 = m1(st1);
+                                                switch (x12.$) {
+                                                  case "MkPair": {
+                                                    const x111 = x12.a[0];
+                                                    const st2 = x12.a[1];
+                                                    switch (x111.$) {
+                                                      case "Left": {
+                                                        const e = x111.a[0];
+                                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                      }
+                                                      case "Right": {
+                                                        const x3 = x111.a[0];
+                                                        return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                                      }
+                                                    }
+                                                    return $nomatch(x111);
+                                                  }
+                                                }
+                                                return $nomatch(x12);
+                                              }
+                                            }
+                                            return $nomatch(x11);
+                                          }
+                                        }
+                                        return $nomatch(x1);
+                                      };
                                     }
                                     case "False": {
-                                      return failP(ntnSpan(n), 3n, "unexpected notation");
+                                      const sp = { start: startPos(n), end: endPos(n) };
+                                      const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                      return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                     }
                                   }
                                   return $nomatch(s3);
@@ -70426,28 +71928,109 @@ const parseHeadF = (tk1, c, n) => {
                         case "NField": {
                           const x1 = domN2.a[0];
                           const x2 = domN2.a[1];
-                          const s1 = strEq(it21)("~");
+                          const s1 = it21 === "~" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                switch (px.$) {
+                              const m = specializationF(tk1, codN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
                                   case "MkPair": {
-                                    const x3 = px.a[0];
-                                    const cc = px.a[1];
-                                    return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x3, cc))));
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x3 = x111.a[0];
+                                        switch (x3.$) {
+                                          case "MkPair": {
+                                            const x4 = x3.a[0];
+                                            const cc = x3.a[1];
+                                            const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x5 = x112.a[0];
+                                                    const x6 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x5, x4, cc));
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [x6] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
+                                    }
+                                    return $nomatch(x111);
                                   }
                                 }
-                                return $nomatch(px);
-                              });
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              const s2 = strEq(it21)(":");
+                              const s2 = it21 === ":" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                  const m = tk1.chkJ(c)(domN);
+                                  return (st) => {
+                                    const x11 = m(st);
+                                    switch (x11.$) {
+                                      case "MkPair": {
+                                        const x111 = x11.a[0];
+                                        const st1 = x11.a[1];
+                                        switch (x111.$) {
+                                          case "Left": {
+                                            const e = x111.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x3 = x111.a[0];
+                                            const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x4 = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x4, x3)] }] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x111);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  };
                                 }
                                 case "False": {
-                                  return failP(ntnSpan(n), 3n, "unexpected notation");
+                                  const sp = { start: startPos(n), end: endPos(n) };
+                                  const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                 }
                               }
                               return $nomatch(s2);
@@ -70458,28 +72041,109 @@ const parseHeadF = (tk1, c, n) => {
                         case "NTag": {
                           const x1 = domN2.a[0];
                           const x2 = domN2.a[1];
-                          const s1 = strEq(it21)("~");
+                          const s1 = it21 === "~" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                switch (px.$) {
+                              const m = specializationF(tk1, codN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
                                   case "MkPair": {
-                                    const x3 = px.a[0];
-                                    const cc = px.a[1];
-                                    return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x3, cc))));
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x3 = x111.a[0];
+                                        switch (x3.$) {
+                                          case "MkPair": {
+                                            const x4 = x3.a[0];
+                                            const cc = x3.a[1];
+                                            const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x5 = x112.a[0];
+                                                    const x6 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x5, x4, cc));
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [x6] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
+                                    }
+                                    return $nomatch(x111);
                                   }
                                 }
-                                return $nomatch(px);
-                              });
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              const s2 = strEq(it21)(":");
+                              const s2 = it21 === ":" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                  const m = tk1.chkJ(c)(domN);
+                                  return (st) => {
+                                    const x11 = m(st);
+                                    switch (x11.$) {
+                                      case "MkPair": {
+                                        const x111 = x11.a[0];
+                                        const st1 = x11.a[1];
+                                        switch (x111.$) {
+                                          case "Left": {
+                                            const e = x111.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x3 = x111.a[0];
+                                            const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x4 = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x4, x3)] }] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x111);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  };
                                 }
                                 case "False": {
-                                  return failP(ntnSpan(n), 3n, "unexpected notation");
+                                  const sp = { start: startPos(n), end: endPos(n) };
+                                  const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                 }
                               }
                               return $nomatch(s2);
@@ -70490,28 +72154,109 @@ const parseHeadF = (tk1, c, n) => {
                         case "NInt": {
                           const x1 = domN2.a[0];
                           const x2 = domN2.a[1];
-                          const s1 = strEq(it21)("~");
+                          const s1 = it21 === "~" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                switch (px.$) {
+                              const m = specializationF(tk1, codN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
                                   case "MkPair": {
-                                    const x3 = px.a[0];
-                                    const cc = px.a[1];
-                                    return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x3, cc))));
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x3 = x111.a[0];
+                                        switch (x3.$) {
+                                          case "MkPair": {
+                                            const x4 = x3.a[0];
+                                            const cc = x3.a[1];
+                                            const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x5 = x112.a[0];
+                                                    const x6 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x5, x4, cc));
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [x6] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
+                                    }
+                                    return $nomatch(x111);
                                   }
                                 }
-                                return $nomatch(px);
-                              });
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              const s2 = strEq(it21)(":");
+                              const s2 = it21 === ":" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                  const m = tk1.chkJ(c)(domN);
+                                  return (st) => {
+                                    const x11 = m(st);
+                                    switch (x11.$) {
+                                      case "MkPair": {
+                                        const x111 = x11.a[0];
+                                        const st1 = x11.a[1];
+                                        switch (x111.$) {
+                                          case "Left": {
+                                            const e = x111.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x3 = x111.a[0];
+                                            const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x4 = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x4, x3)] }] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x111);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  };
                                 }
                                 case "False": {
-                                  return failP(ntnSpan(n), 3n, "unexpected notation");
+                                  const sp = { start: startPos(n), end: endPos(n) };
+                                  const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                 }
                               }
                               return $nomatch(s2);
@@ -70522,28 +72267,109 @@ const parseHeadF = (tk1, c, n) => {
                         case "NFloat": {
                           const x1 = domN2.a[0];
                           const x2 = domN2.a[1];
-                          const s1 = strEq(it21)("~");
+                          const s1 = it21 === "~" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                switch (px.$) {
+                              const m = specializationF(tk1, codN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
                                   case "MkPair": {
-                                    const x3 = px.a[0];
-                                    const cc = px.a[1];
-                                    return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x3, cc))));
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x3 = x111.a[0];
+                                        switch (x3.$) {
+                                          case "MkPair": {
+                                            const x4 = x3.a[0];
+                                            const cc = x3.a[1];
+                                            const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x5 = x112.a[0];
+                                                    const x6 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x5, x4, cc));
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [x6] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
+                                    }
+                                    return $nomatch(x111);
                                   }
                                 }
-                                return $nomatch(px);
-                              });
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              const s2 = strEq(it21)(":");
+                              const s2 = it21 === ":" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                  const m = tk1.chkJ(c)(domN);
+                                  return (st) => {
+                                    const x11 = m(st);
+                                    switch (x11.$) {
+                                      case "MkPair": {
+                                        const x111 = x11.a[0];
+                                        const st1 = x11.a[1];
+                                        switch (x111.$) {
+                                          case "Left": {
+                                            const e = x111.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x3 = x111.a[0];
+                                            const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x4 = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x4, x3)] }] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x111);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  };
                                 }
                                 case "False": {
-                                  return failP(ntnSpan(n), 3n, "unexpected notation");
+                                  const sp = { start: startPos(n), end: endPos(n) };
+                                  const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                 }
                               }
                               return $nomatch(s2);
@@ -70554,28 +72380,109 @@ const parseHeadF = (tk1, c, n) => {
                         case "NString": {
                           const x1 = domN2.a[0];
                           const x2 = domN2.a[1];
-                          const s1 = strEq(it21)("~");
+                          const s1 = it21 === "~" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                switch (px.$) {
+                              const m = specializationF(tk1, codN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
                                   case "MkPair": {
-                                    const x3 = px.a[0];
-                                    const cc = px.a[1];
-                                    return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x3, cc))));
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x3 = x111.a[0];
+                                        switch (x3.$) {
+                                          case "MkPair": {
+                                            const x4 = x3.a[0];
+                                            const cc = x3.a[1];
+                                            const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x5 = x112.a[0];
+                                                    const x6 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x5, x4, cc));
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [x6] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x3);
+                                      }
+                                    }
+                                    return $nomatch(x111);
                                   }
                                 }
-                                return $nomatch(px);
-                              });
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              const s2 = strEq(it21)(":");
+                              const s2 = it21 === ":" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                  const m = tk1.chkJ(c)(domN);
+                                  return (st) => {
+                                    const x11 = m(st);
+                                    switch (x11.$) {
+                                      case "MkPair": {
+                                        const x111 = x11.a[0];
+                                        const st1 = x11.a[1];
+                                        switch (x111.$) {
+                                          case "Left": {
+                                            const e = x111.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x3 = x111.a[0];
+                                            const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x4 = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x4, x3)] }] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x111);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  };
                                 }
                                 case "False": {
-                                  return failP(ntnSpan(n), 3n, "unexpected notation");
+                                  const sp = { start: startPos(n), end: endPos(n) };
+                                  const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                 }
                               }
                               return $nomatch(s2);
@@ -70585,28 +72492,109 @@ const parseHeadF = (tk1, c, n) => {
                         }
                         case "NError": {
                           const x1 = domN2.a[0];
-                          const s1 = strEq(it21)("~");
+                          const s1 = it21 === "~" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                                switch (px.$) {
+                              const m = specializationF(tk1, codN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
                                   case "MkPair": {
-                                    const x2 = px.a[0];
-                                    const cc = px.a[1];
-                                    return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        switch (x2.$) {
+                                          case "MkPair": {
+                                            const x3 = x2.a[0];
+                                            const cc = x2.a[1];
+                                            const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x4 = x112.a[0];
+                                                    const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x2);
+                                      }
+                                    }
+                                    return $nomatch(x111);
                                   }
                                 }
-                                return $nomatch(px);
-                              });
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              const s2 = strEq(it21)(":");
+                              const s2 = it21 === ":" ? $T : $F;
                               switch (s2.$) {
                                 case "True": {
-                                  return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                                  const m = tk1.chkJ(c)(domN);
+                                  return (st) => {
+                                    const x11 = m(st);
+                                    switch (x11.$) {
+                                      case "MkPair": {
+                                        const x111 = x11.a[0];
+                                        const st1 = x11.a[1];
+                                        switch (x111.$) {
+                                          case "Left": {
+                                            const e = x111.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                          }
+                                          case "Right": {
+                                            const x2 = x111.a[0];
+                                            const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                            const x12 = m1(st1);
+                                            switch (x12.$) {
+                                              case "MkPair": {
+                                                const x112 = x12.a[0];
+                                                const st2 = x12.a[1];
+                                                switch (x112.$) {
+                                                  case "Left": {
+                                                    const e = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                                  }
+                                                  case "Right": {
+                                                    const x3 = x112.a[0];
+                                                    return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                                  }
+                                                }
+                                                return $nomatch(x112);
+                                              }
+                                            }
+                                            return $nomatch(x12);
+                                          }
+                                        }
+                                        return $nomatch(x111);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  };
                                 }
                                 case "False": {
-                                  return failP(ntnSpan(n), 3n, "unexpected notation");
+                                  const sp = { start: startPos(n), end: endPos(n) };
+                                  const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                                  return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                                 }
                               }
                               return $nomatch(s2);
@@ -70620,28 +72608,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "Keyword": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70652,28 +72721,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "NField": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70684,28 +72834,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "NTag": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70716,28 +72947,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "NInt": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70748,28 +73060,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "NFloat": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70780,28 +73173,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "NString": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70811,28 +73285,109 @@ const parseHeadF = (tk1, c, n) => {
                     }
                     case "NError": {
                       const x = domN1.a[0];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x1 = m(st);
+                            switch (x1.$) {
                               case "MkPair": {
-                                const x1 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x1, cc))));
+                                const x11 = x1.a[0];
+                                const st1 = x1.a[1];
+                                switch (x11.$) {
+                                  case "Left": {
+                                    const e = x11.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x11.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x111 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x111.$) {
+                                              case "Left": {
+                                                const e = x111.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x111.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x111);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x11);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x1);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x1 = m(st);
+                                switch (x1.$) {
+                                  case "MkPair": {
+                                    const x11 = x1.a[0];
+                                    const st1 = x1.a[1];
+                                    switch (x11.$) {
+                                      case "Left": {
+                                        const e = x11.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x11.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x111 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x111.$) {
+                                              case "Left": {
+                                                const e = x111.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x111.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x111);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x11);
+                                  }
+                                }
+                                return $nomatch(x1);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70848,28 +73403,109 @@ const parseHeadF = (tk1, c, n) => {
                   const x1 = domN.a[1];
                   const x2 = domN.a[2];
                   const x3 = domN.a[3];
-                  const s1 = strEq(it21)("~");
+                  const s1 = it21 === "~" ? $T : $F;
                   switch (s1.$) {
                     case "True": {
-                      return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                        switch (px.$) {
+                      const m = specializationF(tk1, codN);
+                      return (st) => {
+                        const x11 = m(st);
+                        switch (x11.$) {
                           case "MkPair": {
-                            const x4 = px.a[0];
-                            const cc = px.a[1];
-                            return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x4, cc))));
+                            const x111 = x11.a[0];
+                            const st1 = x11.a[1];
+                            switch (x111.$) {
+                              case "Left": {
+                                const e = x111.a[0];
+                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                              }
+                              case "Right": {
+                                const x4 = x111.a[0];
+                                switch (x4.$) {
+                                  case "MkPair": {
+                                    const x5 = x4.a[0];
+                                    const cc = x4.a[1];
+                                    const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                    const x12 = m1(st1);
+                                    switch (x12.$) {
+                                      case "MkPair": {
+                                        const x112 = x12.a[0];
+                                        const st2 = x12.a[1];
+                                        switch (x112.$) {
+                                          case "Left": {
+                                            const e = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                          }
+                                          case "Right": {
+                                            const x6 = x112.a[0];
+                                            const x7 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x6, x5, cc));
+                                            return { $: "MkPair", a: [{ $: "Right", a: [x7] }, st2] };
+                                          }
+                                        }
+                                        return $nomatch(x112);
+                                      }
+                                    }
+                                    return $nomatch(x12);
+                                  }
+                                }
+                                return $nomatch(x4);
+                              }
+                            }
+                            return $nomatch(x111);
                           }
                         }
-                        return $nomatch(px);
-                      });
+                        return $nomatch(x11);
+                      };
                     }
                     case "False": {
-                      const s2 = strEq(it21)(":");
+                      const s2 = it21 === ":" ? $T : $F;
                       switch (s2.$) {
                         case "True": {
-                          return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                          const m = tk1.chkJ(c)(domN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
+                              case "MkPair": {
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x4 = x111.a[0];
+                                    const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                    const x12 = m1(st1);
+                                    switch (x12.$) {
+                                      case "MkPair": {
+                                        const x112 = x12.a[0];
+                                        const st2 = x12.a[1];
+                                        switch (x112.$) {
+                                          case "Left": {
+                                            const e = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                          }
+                                          case "Right": {
+                                            const x5 = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x5, x4)] }] }, st2] };
+                                          }
+                                        }
+                                        return $nomatch(x112);
+                                      }
+                                    }
+                                    return $nomatch(x12);
+                                  }
+                                }
+                                return $nomatch(x111);
+                              }
+                            }
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          return failP(ntnSpan(n), 3n, "unexpected notation");
+                          const sp = { start: startPos(n), end: endPos(n) };
+                          const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                          return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                         }
                       }
                       return $nomatch(s2);
@@ -70882,28 +73518,109 @@ const parseHeadF = (tk1, c, n) => {
                   const x1 = domN.a[1];
                   const x2 = domN.a[2];
                   const x3 = domN.a[3];
-                  const s1 = strEq(it21)("~");
+                  const s1 = it21 === "~" ? $T : $F;
                   switch (s1.$) {
                     case "True": {
-                      return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                        switch (px.$) {
+                      const m = specializationF(tk1, codN);
+                      return (st) => {
+                        const x11 = m(st);
+                        switch (x11.$) {
                           case "MkPair": {
-                            const x4 = px.a[0];
-                            const cc = px.a[1];
-                            return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x4, cc))));
+                            const x111 = x11.a[0];
+                            const st1 = x11.a[1];
+                            switch (x111.$) {
+                              case "Left": {
+                                const e = x111.a[0];
+                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                              }
+                              case "Right": {
+                                const x4 = x111.a[0];
+                                switch (x4.$) {
+                                  case "MkPair": {
+                                    const x5 = x4.a[0];
+                                    const cc = x4.a[1];
+                                    const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                    const x12 = m1(st1);
+                                    switch (x12.$) {
+                                      case "MkPair": {
+                                        const x112 = x12.a[0];
+                                        const st2 = x12.a[1];
+                                        switch (x112.$) {
+                                          case "Left": {
+                                            const e = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                          }
+                                          case "Right": {
+                                            const x6 = x112.a[0];
+                                            const x7 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x6, x5, cc));
+                                            return { $: "MkPair", a: [{ $: "Right", a: [x7] }, st2] };
+                                          }
+                                        }
+                                        return $nomatch(x112);
+                                      }
+                                    }
+                                    return $nomatch(x12);
+                                  }
+                                }
+                                return $nomatch(x4);
+                              }
+                            }
+                            return $nomatch(x111);
                           }
                         }
-                        return $nomatch(px);
-                      });
+                        return $nomatch(x11);
+                      };
                     }
                     case "False": {
-                      const s2 = strEq(it21)(":");
+                      const s2 = it21 === ":" ? $T : $F;
                       switch (s2.$) {
                         case "True": {
-                          return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                          const m = tk1.chkJ(c)(domN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
+                              case "MkPair": {
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x4 = x111.a[0];
+                                    const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                    const x12 = m1(st1);
+                                    switch (x12.$) {
+                                      case "MkPair": {
+                                        const x112 = x12.a[0];
+                                        const st2 = x12.a[1];
+                                        switch (x112.$) {
+                                          case "Left": {
+                                            const e = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                          }
+                                          case "Right": {
+                                            const x5 = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x5, x4)] }] }, st2] };
+                                          }
+                                        }
+                                        return $nomatch(x112);
+                                      }
+                                    }
+                                    return $nomatch(x12);
+                                  }
+                                }
+                                return $nomatch(x111);
+                              }
+                            }
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          return failP(ntnSpan(n), 3n, "unexpected notation");
+                          const sp = { start: startPos(n), end: endPos(n) };
+                          const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                          return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                         }
                       }
                       return $nomatch(s2);
@@ -70914,28 +73631,109 @@ const parseHeadF = (tk1, c, n) => {
                 case "NTuple": {
                   const x = domN.a[0];
                   const x1 = domN.a[1];
-                  const s1 = strEq(it21)("~");
+                  const s1 = it21 === "~" ? $T : $F;
                   switch (s1.$) {
                     case "True": {
-                      return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                        switch (px.$) {
+                      const m = specializationF(tk1, codN);
+                      return (st) => {
+                        const x11 = m(st);
+                        switch (x11.$) {
                           case "MkPair": {
-                            const x2 = px.a[0];
-                            const cc = px.a[1];
-                            return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                            const x111 = x11.a[0];
+                            const st1 = x11.a[1];
+                            switch (x111.$) {
+                              case "Left": {
+                                const e = x111.a[0];
+                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                              }
+                              case "Right": {
+                                const x2 = x111.a[0];
+                                switch (x2.$) {
+                                  case "MkPair": {
+                                    const x3 = x2.a[0];
+                                    const cc = x2.a[1];
+                                    const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                    const x12 = m1(st1);
+                                    switch (x12.$) {
+                                      case "MkPair": {
+                                        const x112 = x12.a[0];
+                                        const st2 = x12.a[1];
+                                        switch (x112.$) {
+                                          case "Left": {
+                                            const e = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                          }
+                                          case "Right": {
+                                            const x4 = x112.a[0];
+                                            const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                            return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                          }
+                                        }
+                                        return $nomatch(x112);
+                                      }
+                                    }
+                                    return $nomatch(x12);
+                                  }
+                                }
+                                return $nomatch(x2);
+                              }
+                            }
+                            return $nomatch(x111);
                           }
                         }
-                        return $nomatch(px);
-                      });
+                        return $nomatch(x11);
+                      };
                     }
                     case "False": {
-                      const s2 = strEq(it21)(":");
+                      const s2 = it21 === ":" ? $T : $F;
                       switch (s2.$) {
                         case "True": {
-                          return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                          const m = tk1.chkJ(c)(domN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
+                              case "MkPair": {
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                    const x12 = m1(st1);
+                                    switch (x12.$) {
+                                      case "MkPair": {
+                                        const x112 = x12.a[0];
+                                        const st2 = x12.a[1];
+                                        switch (x112.$) {
+                                          case "Left": {
+                                            const e = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                          }
+                                          case "Right": {
+                                            const x3 = x112.a[0];
+                                            return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                          }
+                                        }
+                                        return $nomatch(x112);
+                                      }
+                                    }
+                                    return $nomatch(x12);
+                                  }
+                                }
+                                return $nomatch(x111);
+                              }
+                            }
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          return failP(ntnSpan(n), 3n, "unexpected notation");
+                          const sp = { start: startPos(n), end: endPos(n) };
+                          const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                          return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                         }
                       }
                       return $nomatch(s2);
@@ -70950,28 +73748,109 @@ const parseHeadF = (tk1, c, n) => {
                     case "Juxt": {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x2 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x2, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x2 = x111.a[0];
+                                    switch (x2.$) {
+                                      case "MkPair": {
+                                        const x3 = x2.a[0];
+                                        const cc = x2.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                const x5 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x4, x3, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x5] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x2);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x2 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x3 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x3, x2)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -70983,28 +73862,109 @@ const parseHeadF = (tk1, c, n) => {
                       const x = domN1.a[0];
                       const x1 = domN1.a[1];
                       const x2 = domN1.a[2];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x3 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x3, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x3 = x111.a[0];
+                                    switch (x3.$) {
+                                      case "MkPair": {
+                                        const x4 = x3.a[0];
+                                        const cc = x3.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x5 = x112.a[0];
+                                                const x6 = fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x5, x4, cc));
+                                                return { $: "MkPair", a: [{ $: "Right", a: [x6] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x3);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
-                          const s2 = strEq(it21)(":");
+                          const s2 = it21 === ":" ? $T : $F;
                           switch (s2.$) {
                             case "True": {
-                              return compiler_environment_bind$c(tk1.chkJ(c)(domN))((cc) => compiler_environment_bind$c(tk1.typJ({ $: "N", a: [] })(codN))((t) => compiler_environment_pure$c({ $: "SynJ", a: [annot(t, cc)] })));
+                              const m = tk1.chkJ(c)(domN);
+                              return (st) => {
+                                const x11 = m(st);
+                                switch (x11.$) {
+                                  case "MkPair": {
+                                    const x111 = x11.a[0];
+                                    const st1 = x11.a[1];
+                                    switch (x111.$) {
+                                      case "Left": {
+                                        const e = x111.a[0];
+                                        return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                      }
+                                      case "Right": {
+                                        const x3 = x111.a[0];
+                                        const m1 = tk1.typJ({ $: "N", a: [] })(codN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x4 = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Right", a: [{ $: "SynJ", a: [annot(x4, x3)] }] }, st2] };
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x111);
+                                  }
+                                }
+                                return $nomatch(x11);
+                              };
                             }
                             case "False": {
-                              return failP(ntnSpan(n), 3n, "unexpected notation");
+                              const sp = { start: startPos(n), end: endPos(n) };
+                              const d = { code: 200n + 3n, severity: { $: "SError", a: [] }, msg: "unexpected notation", span: sp, note: { $: "Nothing", a: [] } };
+                              return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
                             }
                           }
                           return $nomatch(s2);
@@ -71017,19 +73977,57 @@ const parseHeadF = (tk1, c, n) => {
                       const x1 = domN1.a[1];
                       const x2 = domN1.a[2];
                       const x3 = domN1.a[3];
-                      const s1 = strEq(it21)("~");
+                      const s1 = it21 === "~" ? $T : $F;
                       switch (s1.$) {
                         case "True": {
-                          return compiler_environment_bind$c(specializationF(tk1, codN))((px) => {
-                            switch (px.$) {
+                          const m = specializationF(tk1, codN);
+                          return (st) => {
+                            const x11 = m(st);
+                            switch (x11.$) {
                               case "MkPair": {
-                                const x4 = px.a[0];
-                                const cc = px.a[1];
-                                return compiler_environment_bind$c(tk1.synJ({ $: "N", a: [] })(domN))((s2) => compiler_environment_pure$c(fromSynN(c, recordSpec(ntnSpan(n), s2, x4, cc))));
+                                const x111 = x11.a[0];
+                                const st1 = x11.a[1];
+                                switch (x111.$) {
+                                  case "Left": {
+                                    const e = x111.a[0];
+                                    return { $: "MkPair", a: [{ $: "Left", a: [e] }, st1] };
+                                  }
+                                  case "Right": {
+                                    const x4 = x111.a[0];
+                                    switch (x4.$) {
+                                      case "MkPair": {
+                                        const x5 = x4.a[0];
+                                        const cc = x4.a[1];
+                                        const m1 = tk1.synJ({ $: "N", a: [] })(domN);
+                                        const x12 = m1(st1);
+                                        switch (x12.$) {
+                                          case "MkPair": {
+                                            const x112 = x12.a[0];
+                                            const st2 = x12.a[1];
+                                            switch (x112.$) {
+                                              case "Left": {
+                                                const e = x112.a[0];
+                                                return { $: "MkPair", a: [{ $: "Left", a: [e] }, st2] };
+                                              }
+                                              case "Right": {
+                                                const x6 = x112.a[0];
+                                                return compiler_environment_pure(fromSynN(c, recordSpec({ start: startPos(n), end: endPos(n) }, x6, x5, cc)), st2);
+                                              }
+                                            }
+                                            return $nomatch(x112);
+                                          }
+                                        }
+                                        return $nomatch(x12);
+                                      }
+                                    }
+                                    return $nomatch(x4);
+                                  }
+                                }
+                                return $nomatch(x111);
                               }
                             }
-                            return $nomatch(px);
-                          });
+                            return $nomatch(x11);
+                          };
                         }
                         case "False": {
                           const s2 = strEq(it21)(":");
@@ -76789,8 +79787,6 @@ const elabWatch = (g, n) => {
   };
 };
 
-const mkTop = (globals, diags, keys, broken, watches, tests, spans, infos, trace) => ({ globals: globals, diags: diags, keys: keys, broken: broken, watches: watches, tests: tests, spans: spans, infos: infos, trace: trace });
-
 const appendT = (x1$, ys$) => {
   let $root, $hole = null, $at = 0;
   for (;;) {
@@ -79935,8 +82931,6 @@ const watchTake = (acc, sp, x3) => {
   return $nomatch(x3);
 };
 
-const testDiag = (n) => ({ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n), end: endPos(n) }, note: { $: "Nothing", a: [] } });
-
 const topOne = (kf, acc, n) => {
   switch (n.$) {
     case "Juxt": {
@@ -79951,14 +82945,20 @@ const topOne = (kf, acc, n) => {
       const x = n.a[0];
       const x1 = n.a[1];
       const x2 = n.a[2];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NBlock": {
       const x = n.a[0];
       const x1 = n.a[1];
       const x2 = n.a[2];
       const x3 = n.a[3];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "MDecl": {
       const n1 = n.a[0];
@@ -79967,100 +82967,120 @@ const topOne = (kf, acc, n) => {
       const sp = n.a[3];
       switch (n1.$) {
         case "Nil": {
-          const s = strEq(n2)(">");
+          const s = n2 === ">" ? $T : $F;
           switch (s.$) {
             case "True": {
-              return watchTake(acc, sp, runE(elabWatch(acc.globals, n3), compiler_environment_emptySt));
+              return watchTake(acc, sp, (() => {
+                const m = elabWatch(acc.globals, n3);
+                return m(compiler_environment_emptySt);
+              })());
             }
             case "False": {
-              const s1 = strEq(n2)("test");
+              const s1 = n2 === "test" ? $T : $F;
               switch (s1.$) {
                 case "True": {
                   switch (n3.$) {
                     case "Juxt": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "Infix": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
                       const x2 = n3.a[2];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NBlock": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
                       const x2 = n3.a[2];
                       const x3 = n3.a[3];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "MDecl": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
                       const x2 = n3.a[2];
                       const x3 = n3.a[3];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NTuple": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NBrace": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NBracket": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "Ident": {
                       const x = n3.a[0];
                       const xsp = n3.a[1];
-                      return mkTop(acc.globals, acc.diags, acc.keys, acc.broken, acc.watches, { $: "Cons", a: [{ name: x, span: sp }, acc.tests] }, acc.spans, acc.infos, acc.trace);
+                      return { globals: acc.globals, diags: acc.diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: { $: "Cons", a: [{ name: x, span: sp }, acc.tests] }, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "Keyword": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NField": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NTag": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NInt": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NFloat": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NString": {
                       const x = n3.a[0];
                       const x1 = n3.a[1];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                     case "NError": {
                       const x = n3.a[0];
-                      return mkTop(acc.globals, { $: "Cons", a: [testDiag(n3), acc.diags] }, acc.keys, acc.broken, acc.watches, acc.tests, acc.spans, acc.infos, acc.trace);
+                      const diags = { $: "Cons", a: [{ code: 211n, severity: { $: "SError", a: [] }, msg: "a test is named: `test <name>`", span: { start: startPos(n3), end: endPos(n3) }, note: { $: "Nothing", a: [] } }, acc.diags] };
+                      return { globals: acc.globals, diags: diags, keys: acc.keys, broken: acc.broken, watches: acc.watches, tests: acc.tests, spans: acc.spans, infos: acc.infos, trace: acc.trace };
                     }
                   }
                   return $nomatch(n3);
                 }
                 case "False": {
-                  return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+                  return topTake(kf, acc, n, (() => {
+                    const m = elabDecl$c(kf)(acc.globals)(n);
+                    return m(compiler_environment_emptySt);
+                  })());
                 }
               }
               return $nomatch(s1);
@@ -80071,7 +83091,10 @@ const topOne = (kf, acc, n) => {
         case "Cons": {
           const x = n1.a[0];
           const x1 = n1.a[1];
-          return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+          return topTake(kf, acc, n, (() => {
+            const m = elabDecl$c(kf)(acc.globals)(n);
+            return m(compiler_environment_emptySt);
+          })());
         }
       }
       return $nomatch(n1);
@@ -80079,56 +83102,89 @@ const topOne = (kf, acc, n) => {
     case "NTuple": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NBrace": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NBracket": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "Ident": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "Keyword": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NField": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NTag": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NInt": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NFloat": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NString": {
       const x = n.a[0];
       const x1 = n.a[1];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
     case "NError": {
       const x = n.a[0];
-      return topTake(kf, acc, n, runE(elabDecl$c(kf)(acc.globals)(n), compiler_environment_emptySt));
+      return topTake(kf, acc, n, (() => {
+        const m = elabDecl$c(kf)(acc.globals)(n);
+        return m(compiler_environment_emptySt);
+      })());
     }
   }
   return $nomatch(n);
@@ -87829,7 +90885,7 @@ const known = (g, s) => {
           const m = (() => {
             const s_ = (() => {
               const f = s.fuel - 1n;
-              return { supply: s.supply, fuel: f, defs: s.defs, safe: s.safe, total: s.total };
+              return { supply: s.supply, fuel: f, defs: s.defs, safe: s.safe, total: s.total, plain: s.plain };
             })();
             return (s3) => ({ $: "MkPair", a: [{ $: "MkUnit", a: [] }, s_] });
           })();
@@ -87844,7 +90900,7 @@ const known = (g, s) => {
                   case "MkPair": {
                     const e_ = x21.a[0];
                     const n = x21.a[1];
-                    return { $: "MkPair", a: [e_, { supply: n, fuel: s3.fuel, defs: s3.defs, safe: s3.safe, total: s3.total }] };
+                    return { $: "MkPair", a: [e_, { supply: n, fuel: s3.fuel, defs: s3.defs, safe: s3.safe, total: s3.total, plain: s3.plain }] };
                   }
                 }
                 return $nomatch(x21);
@@ -87884,7 +90940,7 @@ const attempt = (orig, m, s) => {
           return { $: "MkPair", a: [x, s1] };
         }
         case "False": {
-          return { $: "MkPair", a: [orig, { supply: s1.supply, fuel: s1.fuel, defs: s.defs, safe: s.safe, total: s.total }] };
+          return { $: "MkPair", a: [orig, { supply: s1.supply, fuel: s1.fuel, defs: s.defs, safe: s.safe, total: s.total, plain: s1.plain }] };
         }
       }
       return $nomatch(s2);
@@ -88283,7 +91339,7 @@ const substCopies = (x, a, e) => {
               case "MkPair": {
                 const e_ = x2.a[0];
                 const n = x2.a[1];
-                return { $: "MkPair", a: [e_, { supply: n, fuel: s1.fuel, defs: s1.defs, safe: s1.safe, total: s1.total }] };
+                return { $: "MkPair", a: [e_, { supply: n, fuel: s1.fuel, defs: s1.defs, safe: s1.safe, total: s1.total, plain: s1.plain }] };
               }
             }
             return $nomatch(x2);
@@ -89041,6 +92097,235 @@ const simpF = (r, e) => {
   return $nomatch(e);
 };
 
+const freshParams = (k, s) => {
+  const s1 = foldl((acc) => (i) => {
+    switch (acc.$) {
+      case "MkPair": {
+        const xs = acc.a[0];
+        const n = acc.a[1];
+        const x = "p" + ("$" + n.toString());
+        const n2 = n + 1n;
+        return { $: "MkPair", a: [{ $: "Cons", a: [x, xs] }, n2] };
+      }
+    }
+    return $nomatch(acc);
+  }, { $: "MkPair", a: [{ $: "Nil", a: [] }, s.supply] }, prelude_range(1n, k));
+  switch (s1.$) {
+    case "MkPair": {
+      const xs = s1.a[0];
+      const n = s1.a[1];
+      return { $: "MkPair", a: [xs, { supply: n, fuel: s.fuel, defs: s.defs, safe: s.safe, total: s.total, plain: s.plain }] };
+    }
+  }
+  return $nomatch(s1);
+};
+const freshParams$c = (k) => (s) => freshParams(k, s);
+
+const remember = (k, p, s) => ({ $: "MkPair", a: [{ $: "MkUnit", a: [] }, (() => {
+  const s1 = 0n < s.fuel ? $T : $F;
+  switch (s1.$) {
+    case "True": {
+      return { supply: s.supply, fuel: s.fuel, defs: s.defs, safe: s.safe, total: s.total, plain: insert(compareString$c, k, p, s.plain) };
+    }
+    case "False": {
+      return s;
+    }
+  }
+  return $nomatch(s1);
+})()] });
+const remember$c = (k) => (p) => (s) => remember(k, p, s);
+
+const plainCall = (r, f, g, as, s) => {
+  const it = map_lookup(compareString$c, g + ("/" + foldl((n) => (x) => n + 1n, 0n, as).toString()), s.plain);
+  switch (it.$) {
+    case "Nothing": {
+      const m = freshParams$c(foldl((n) => (x) => n + 1n, 0n, as));
+      const x2 = m(s);
+      switch (x2.$) {
+        case "MkPair": {
+          const x = x2.a[0];
+          const s1 = x2.a[1];
+          const m1 = known$c(g);
+          const x21 = m1(s1);
+          switch (x21.$) {
+            case "MkPair": {
+              const x1 = x21.a[0];
+              const s2 = x21.a[1];
+              switch (x1.$) {
+                case "Nothing": {
+                  return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                }
+                case "Just": {
+                  const b = x1.a[0];
+                  const m2 = r.applyTo(b)(map((x3) => ({ $: "EVar", a: [x3] }), x));
+                  const x22 = m2(s2);
+                  switch (x22.$) {
+                    case "MkPair": {
+                      const x3 = x22.a[0];
+                      const s3 = x22.a[1];
+                      const s4 = compiler_ir_size(x3) <= (compiler_ir_size({ $: "EApp", a: [f, as] }) + budget) ? $T : $F;
+                      switch (s4.$) {
+                        case "True": {
+                          const m3 = remember$c(g + ("/" + foldl((n) => (x4) => n + 1n, 0n, as).toString()))({ $: "Inlined", a: [x, x3] });
+                          const x23 = m3(s3);
+                          switch (x23.$) {
+                            case "MkPair": {
+                              const x4 = x23.a[0];
+                              const s5 = x23.a[1];
+                              const x5 = (() => {
+                                const m4 = foldl((m4) => (p) => insert(compareString$c, (() => {
+                                  switch (p.$) {
+                                    case "MkPair": {
+                                      const x5 = p.a[0];
+                                      const y = p.a[1];
+                                      return x5;
+                                    }
+                                  }
+                                  return $nomatch(p);
+                                })(), (() => {
+                                  switch (p.$) {
+                                    case "MkPair": {
+                                      const x5 = p.a[0];
+                                      const y = p.a[1];
+                                      return y;
+                                    }
+                                  }
+                                  return $nomatch(p);
+                                })(), m4), map_empty, compiler_simplify_zipL(x, as));
+                                const s6 = map_size(m4) === 0n ? $T : $F;
+                                switch (s6.$) {
+                                  case "True": {
+                                    return x3;
+                                  }
+                                  case "False": {
+                                    return substGo(m4, x3);
+                                  }
+                                }
+                                return $nomatch(s6);
+                              })();
+                              return { $: "MkPair", a: [x5, s5] };
+                            }
+                          }
+                          return $nomatch(x23);
+                        }
+                        case "False": {
+                          const m3 = remember$c(g + ("/" + foldl((n) => (x4) => n + 1n, 0n, as).toString()))({ $: "NotInlined", a: [] });
+                          const x23 = m3({ supply: s3.supply, fuel: s3.fuel, defs: s.defs, safe: s.safe, total: s.total, plain: s3.plain });
+                          switch (x23.$) {
+                            case "MkPair": {
+                              const x4 = x23.a[0];
+                              const s5 = x23.a[1];
+                              return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s5] };
+                            }
+                          }
+                          return $nomatch(x23);
+                        }
+                      }
+                      return $nomatch(s4);
+                    }
+                  }
+                  return $nomatch(x22);
+                }
+              }
+              return $nomatch(x1);
+            }
+          }
+          return $nomatch(x21);
+        }
+      }
+      return $nomatch(x2);
+    }
+    case "Just": {
+      const it1 = it.a[0];
+      switch (it1.$) {
+        case "Inlined": {
+          const ps = it1.a[0];
+          const e = it1.a[1];
+          const s1 = 0n < s.fuel ? $T : $F;
+          switch (s1.$) {
+            case "True": {
+              const m = (() => {
+                const s_ = (() => {
+                  const f1 = s.fuel - 1n;
+                  return { supply: s.supply, fuel: f1, defs: s.defs, safe: s.safe, total: s.total, plain: s.plain };
+                })();
+                return (s2) => ({ $: "MkPair", a: [{ $: "MkUnit", a: [] }, s_] });
+              })();
+              const x2 = m(s);
+              switch (x2.$) {
+                case "MkPair": {
+                  const x = x2.a[0];
+                  const s2 = x2.a[1];
+                  const x21 = (() => {
+                    const x21 = fk().go(map_empty)(s2.supply)(e);
+                    switch (x21.$) {
+                      case "MkPair": {
+                        const e_ = x21.a[0];
+                        const n = x21.a[1];
+                        return { $: "MkPair", a: [e_, { supply: n, fuel: s2.fuel, defs: s2.defs, safe: s2.safe, total: s2.total, plain: s2.plain }] };
+                      }
+                    }
+                    return $nomatch(x21);
+                  })();
+                  switch (x21.$) {
+                    case "MkPair": {
+                      const x1 = x21.a[0];
+                      const s3 = x21.a[1];
+                      const x3 = (() => {
+                        const m1 = foldl((m1) => (p) => insert(compareString$c, (() => {
+                          switch (p.$) {
+                            case "MkPair": {
+                              const x3 = p.a[0];
+                              const y = p.a[1];
+                              return x3;
+                            }
+                          }
+                          return $nomatch(p);
+                        })(), (() => {
+                          switch (p.$) {
+                            case "MkPair": {
+                              const x3 = p.a[0];
+                              const y = p.a[1];
+                              return y;
+                            }
+                          }
+                          return $nomatch(p);
+                        })(), m1), map_empty, compiler_simplify_zipL(ps, as));
+                        const s4 = map_size(m1) === 0n ? $T : $F;
+                        switch (s4.$) {
+                          case "True": {
+                            return x1;
+                          }
+                          case "False": {
+                            return substGo(m1, x1);
+                          }
+                        }
+                        return $nomatch(s4);
+                      })();
+                      return { $: "MkPair", a: [x3, s3] };
+                    }
+                  }
+                  return $nomatch(x21);
+                }
+              }
+              return $nomatch(x2);
+            }
+            case "False": {
+              return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s] };
+            }
+          }
+          return $nomatch(s1);
+        }
+        case "NotInlined": {
+          return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s] };
+        }
+      }
+      return $nomatch(it1);
+    }
+  }
+  return $nomatch(it);
+};
+
 const applyToF = (r, f, as) => {
   const s = foldl((n) => (x) => n + 1n, 0n, as) === 0n ? $T : $F;
   switch (s.$) {
@@ -89055,26 +92340,494 @@ const applyToF = (r, f, as) => {
         }
         case "EGlobal": {
           const g = f.a[0];
-          const m = known$c(g);
           return (s1) => {
-            const x2 = m(s1);
-            switch (x2.$) {
-              case "MkPair": {
-                const x = x2.a[0];
-                const s2 = x2.a[1];
-                switch (x.$) {
-                  case "Nothing": {
-                    return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
-                  }
-                  case "Just": {
-                    const b = x.a[0];
-                    return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+            const it = map_lookup(compareString$c, g, s1.defs);
+            switch (it.$) {
+              case "Nothing": {
+                const m = known$c(g);
+                const x2 = m(s1);
+                switch (x2.$) {
+                  case "MkPair": {
+                    const x = x2.a[0];
+                    const s2 = x2.a[1];
+                    switch (x.$) {
+                      case "Nothing": {
+                        return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                      }
+                      case "Just": {
+                        const b = x.a[0];
+                        return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                      }
+                    }
+                    return $nomatch(x);
                   }
                 }
-                return $nomatch(x);
+                return $nomatch(x2);
+              }
+              case "Just": {
+                const it1 = it.a[0];
+                switch (it1.$) {
+                  case "EVar": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EGlobal": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "ELam": {
+                    const xs = it1.a[0];
+                    const it12 = it1.a[1];
+                    const s2 = (() => {
+                      const s2 = allI(map((a) => {
+                        switch (a.$) {
+                          case "EVar": {
+                            const x = a.a[0];
+                            return { $: "True", a: [] };
+                          }
+                          case "EGlobal": {
+                            const x = a.a[0];
+                            return { $: "False", a: [] };
+                          }
+                          case "ELam": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "EApp": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "ELet": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            const x2 = a.a[2];
+                            return { $: "False", a: [] };
+                          }
+                          case "ERecord": {
+                            const x = a.a[0];
+                            return { $: "False", a: [] };
+                          }
+                          case "EProj": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "ETag": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "EMatch": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "EPrim": {
+                            const x = a.a[0];
+                            return { $: "False", a: [] };
+                          }
+                          case "EPrimCall": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "ECall": {
+                            const x = a.a[0];
+                            const x1 = a.a[1];
+                            return { $: "False", a: [] };
+                          }
+                          case "EInt": {
+                            const x = a.a[0];
+                            return { $: "True", a: [] };
+                          }
+                          case "EFloat": {
+                            const x = a.a[0];
+                            return { $: "True", a: [] };
+                          }
+                          case "EStr": {
+                            const x = a.a[0];
+                            return { $: "True", a: [] };
+                          }
+                          case "EAbandon": {
+                            return { $: "False", a: [] };
+                          }
+                        }
+                        return $nomatch(a);
+                      }, as));
+                      switch (s2.$) {
+                        case "True": {
+                          return foldl((n) => (x) => n + 1n, 0n, xs) === foldl((n) => (x) => n + 1n, 0n, as) ? $T : $F;
+                        }
+                        case "False": {
+                          return { $: "False", a: [] };
+                        }
+                      }
+                      return $nomatch(s2);
+                    })();
+                    switch (s2.$) {
+                      case "True": {
+                        return plainCall(r, f, g, as, s1);
+                      }
+                      case "False": {
+                        const m = known$c(g);
+                        const x2 = m(s1);
+                        switch (x2.$) {
+                          case "MkPair": {
+                            const x = x2.a[0];
+                            const s3 = x2.a[1];
+                            switch (x.$) {
+                              case "Nothing": {
+                                return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s3] };
+                              }
+                              case "Just": {
+                                const b = x.a[0];
+                                return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s3);
+                              }
+                            }
+                            return $nomatch(x);
+                          }
+                        }
+                        return $nomatch(x2);
+                      }
+                    }
+                    return $nomatch(s2);
+                  }
+                  case "EApp": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x3 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "ELet": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const x2 = it1.a[2];
+                    const m = known$c(g);
+                    const x21 = m(s1);
+                    switch (x21.$) {
+                      case "MkPair": {
+                        const x3 = x21.a[0];
+                        const s2 = x21.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x21);
+                  }
+                  case "ERecord": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EProj": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x3 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "ETag": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x3 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EMatch": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x3 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EPrim": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EPrimCall": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x3 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "ECall": {
+                    const x = it1.a[0];
+                    const x1 = it1.a[1];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x3 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x3.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EInt": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EFloat": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EStr": {
+                    const x = it1.a[0];
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x1 = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x1.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x1.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x1);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                  case "EAbandon": {
+                    const m = known$c(g);
+                    const x2 = m(s1);
+                    switch (x2.$) {
+                      case "MkPair": {
+                        const x = x2.a[0];
+                        const s2 = x2.a[1];
+                        switch (x.$) {
+                          case "Nothing": {
+                            return { $: "MkPair", a: [{ $: "EApp", a: [f, as] }, s2] };
+                          }
+                          case "Just": {
+                            const b = x.a[0];
+                            return attempt({ $: "EApp", a: [f, as] }, r.applyTo(b)(as), s2);
+                          }
+                        }
+                        return $nomatch(x);
+                      }
+                    }
+                    return $nomatch(x2);
+                  }
+                }
+                return $nomatch(it1);
               }
             }
-            return $nomatch(x2);
+            return $nomatch(it);
           };
         }
         case "ELam": {
@@ -89942,7 +93695,7 @@ const recordDef = (key, b, s) => ({ $: "MkPair", a: [{ $: "MkUnit", a: [] }, (()
     }
     case "False": {
       const d = insert(compareString$c, key, b, s.defs);
-      return { supply: s.supply, fuel: s.fuel, defs: d, safe: s.safe, total: s.total };
+      return { supply: s.supply, fuel: s.fuel, defs: d, safe: s.safe, total: s.total, plain: s.plain };
     }
   }
   return $nomatch(s1);
@@ -89951,7 +93704,7 @@ const recordDef$c = (key) => (b) => (s) => recordDef(key, b, s);
 
 const oneDef = (d, s) => {
   const m = sk().simp(d.body);
-  const x2 = m({ supply: s.supply, fuel: 4000n, defs: s.defs, safe: s.safe, total: s.total });
+  const x2 = m({ supply: s.supply, fuel: 4000n, defs: s.defs, safe: s.safe, total: s.total, plain: s.plain });
   switch (x2.$) {
     case "MkPair": {
       const x = x2.a[0];
@@ -89984,7 +93737,7 @@ const oneDef$c = (d) => (s) => oneDef(d, s);
 const simplifyProgram = (n0, defs) => {
   const x1 = traverseS((d) => oneDef$c(d), defs)((() => {
     const sg = foldl((acc) => (d) => sgFlat(acc, d.key, flat(d.body)), { safe: map_empty, total: map_empty }, defs);
-    return { supply: n0, fuel: 0n, defs: map_empty, safe: sg.safe, total: sg.total };
+    return { supply: n0, fuel: 0n, defs: map_empty, safe: sg.safe, total: sg.total, plain: map_empty };
   })());
   switch (x1.$) {
     case "MkPair": {
@@ -91603,6 +95356,7 @@ const primBin = (op, a, b) => {
   }
   return $nomatch(s);
 };
+const primBin$c = (op) => (a) => (b) => primBin(op, a, b);
 
 const primTest = (op, a, b) => ({ code: (() => {
   const s = a.prec < 2n ? $T : $F;
@@ -91627,6 +95381,7 @@ const primTest = (op, a, b) => ({ code: (() => {
   }
   return $nomatch(s);
 })() + " ? $T : $F")))), prec: 0n });
+const primTest$c = (op) => (a) => (b) => primTest(op, a, b);
 
 const primDefault = (p, as) => {
   const code1 = "$" + (p + ("(" + ((() => {
@@ -91646,6 +95401,204 @@ const primDefault = (p, as) => {
   return { code: code1, prec: 3n };
 };
 
+const primOp = (x1) => {
+  const s = x1 === "intAdd" ? $T : $F;
+  switch (s.$) {
+    case "True": {
+      return { $: "Just", a: [primBin$c("+")] };
+    }
+    case "False": {
+      const s1 = x1 === "intSub" ? $T : $F;
+      switch (s1.$) {
+        case "True": {
+          return { $: "Just", a: [primBin$c("-")] };
+        }
+        case "False": {
+          const s2 = x1 === "intMul" ? $T : $F;
+          switch (s2.$) {
+            case "True": {
+              return { $: "Just", a: [primBin$c("*")] };
+            }
+            case "False": {
+              const s3 = x1 === "strAppend" ? $T : $F;
+              switch (s3.$) {
+                case "True": {
+                  return { $: "Just", a: [primBin$c("+")] };
+                }
+                case "False": {
+                  const s4 = x1 === "intEq" ? $T : $F;
+                  switch (s4.$) {
+                    case "True": {
+                      return { $: "Just", a: [primTest$c("===")] };
+                    }
+                    case "False": {
+                      const s5 = x1 === "strEq" ? $T : $F;
+                      switch (s5.$) {
+                        case "True": {
+                          return { $: "Just", a: [primTest$c("===")] };
+                        }
+                        case "False": {
+                          const s6 = x1 === "intLt" ? $T : $F;
+                          switch (s6.$) {
+                            case "True": {
+                              return { $: "Just", a: [primTest$c("<")] };
+                            }
+                            case "False": {
+                              const s7 = x1 === "strLt" ? $T : $F;
+                              switch (s7.$) {
+                                case "True": {
+                                  return { $: "Just", a: [primTest$c("<")] };
+                                }
+                                case "False": {
+                                  const s8 = x1 === "intLe" ? $T : $F;
+                                  switch (s8.$) {
+                                    case "True": {
+                                      return { $: "Just", a: [primTest$c("<=")] };
+                                    }
+                                    case "False": {
+                                      const s9 = x1 === "floatAdd" ? $T : $F;
+                                      switch (s9.$) {
+                                        case "True": {
+                                          return { $: "Just", a: [primBin$c("+")] };
+                                        }
+                                        case "False": {
+                                          const s10 = x1 === "floatSub" ? $T : $F;
+                                          switch (s10.$) {
+                                            case "True": {
+                                              return { $: "Just", a: [primBin$c("-")] };
+                                            }
+                                            case "False": {
+                                              const s11 = x1 === "floatMul" ? $T : $F;
+                                              switch (s11.$) {
+                                                case "True": {
+                                                  return { $: "Just", a: [primBin$c("*")] };
+                                                }
+                                                case "False": {
+                                                  const s12 = x1 === "floatDiv" ? $T : $F;
+                                                  switch (s12.$) {
+                                                    case "True": {
+                                                      return { $: "Just", a: [primBin$c("/")] };
+                                                    }
+                                                    case "False": {
+                                                      const s13 = x1 === "floatEq" ? $T : $F;
+                                                      switch (s13.$) {
+                                                        case "True": {
+                                                          return { $: "Just", a: [primTest$c("===")] };
+                                                        }
+                                                        case "False": {
+                                                          const s14 = x1 === "floatLt" ? $T : $F;
+                                                          switch (s14.$) {
+                                                            case "True": {
+                                                              return { $: "Just", a: [primTest$c("<")] };
+                                                            }
+                                                            case "False": {
+                                                              const s15 = x1 === "floatLe" ? $T : $F;
+                                                              switch (s15.$) {
+                                                                case "True": {
+                                                                  return { $: "Just", a: [primTest$c("<=")] };
+                                                                }
+                                                                case "False": {
+                                                                  return { $: "Nothing", a: [] };
+                                                                }
+                                                              }
+                                                              return $nomatch(s15);
+                                                            }
+                                                          }
+                                                          return $nomatch(s14);
+                                                        }
+                                                      }
+                                                      return $nomatch(s13);
+                                                    }
+                                                  }
+                                                  return $nomatch(s12);
+                                                }
+                                              }
+                                              return $nomatch(s11);
+                                            }
+                                          }
+                                          return $nomatch(s10);
+                                        }
+                                      }
+                                      return $nomatch(s9);
+                                    }
+                                  }
+                                  return $nomatch(s8);
+                                }
+                              }
+                              return $nomatch(s7);
+                            }
+                          }
+                          return $nomatch(s6);
+                        }
+                      }
+                      return $nomatch(s5);
+                    }
+                  }
+                  return $nomatch(s4);
+                }
+              }
+              return $nomatch(s3);
+            }
+          }
+          return $nomatch(s2);
+        }
+      }
+      return $nomatch(s1);
+    }
+  }
+  return $nomatch(s);
+};
+
+const primUnary = (x1) => {
+  const s = x1 === "intShow" ? $T : $F;
+  switch (s.$) {
+    case "True": {
+      return { $: "Just", a: [(a) => {
+        const code1 = (() => {
+          const s1 = a.prec < 3n ? $T : $F;
+          switch (s1.$) {
+            case "True": {
+              return "(" + (a.code + ")");
+            }
+            case "False": {
+              return a.code;
+            }
+          }
+          return $nomatch(s1);
+        })() + ".toString()";
+        return { code: code1, prec: 3n };
+      }] };
+    }
+    case "False": {
+      const s1 = x1 === "strLength" ? $T : $F;
+      switch (s1.$) {
+        case "True": {
+          return { $: "Just", a: [(a) => {
+            const code1 = "BigInt(" + ((() => {
+              const s2 = a.prec < 3n ? $T : $F;
+              switch (s2.$) {
+                case "True": {
+                  return "(" + (a.code + ")");
+                }
+                case "False": {
+                  return a.code;
+                }
+              }
+              return $nomatch(s2);
+            })() + ".length)");
+            return { code: code1, prec: 3n };
+          }] };
+        }
+        case "False": {
+          return { $: "Nothing", a: [] };
+        }
+      }
+      return $nomatch(s1);
+    }
+  }
+  return $nomatch(s);
+};
+
 const primCall = (p, as) => {
   switch (as.$) {
     case "Nil": {
@@ -91656,46 +95609,14 @@ const primCall = (p, as) => {
       const it2 = as.a[1];
       switch (it2.$) {
         case "Nil": {
-          const s = p === "intShow" ? $T : $F;
+          const s = primUnary(p);
           switch (s.$) {
-            case "True": {
-              const code1 = (() => {
-                const s1 = a.prec < 3n ? $T : $F;
-                switch (s1.$) {
-                  case "True": {
-                    return "(" + (a.code + ")");
-                  }
-                  case "False": {
-                    return a.code;
-                  }
-                }
-                return $nomatch(s1);
-              })() + ".toString()";
-              return { code: code1, prec: 3n };
+            case "Nothing": {
+              return primDefault(p, as);
             }
-            case "False": {
-              const s1 = p === "strLength" ? $T : $F;
-              switch (s1.$) {
-                case "True": {
-                  const code1 = "BigInt(" + ((() => {
-                    const s2 = a.prec < 3n ? $T : $F;
-                    switch (s2.$) {
-                      case "True": {
-                        return "(" + (a.code + ")");
-                      }
-                      case "False": {
-                        return a.code;
-                      }
-                    }
-                    return $nomatch(s2);
-                  })() + ".length)");
-                  return { code: code1, prec: 3n };
-                }
-                case "False": {
-                  return primDefault(p, as);
-                }
-              }
-              return $nomatch(s1);
+            case "Just": {
+              const f = s.a[0];
+              return f(a);
             }
           }
           return $nomatch(s);
@@ -91705,148 +95626,14 @@ const primCall = (p, as) => {
           const it22 = it2.a[1];
           switch (it22.$) {
             case "Nil": {
-              const s = p === "intAdd" ? $T : $F;
+              const s = primOp(p);
               switch (s.$) {
-                case "True": {
-                  return primBin("+", a, b);
+                case "Nothing": {
+                  return primDefault(p, as);
                 }
-                case "False": {
-                  const s1 = p === "intSub" ? $T : $F;
-                  switch (s1.$) {
-                    case "True": {
-                      return primBin("-", a, b);
-                    }
-                    case "False": {
-                      const s2 = p === "intMul" ? $T : $F;
-                      switch (s2.$) {
-                        case "True": {
-                          return primBin("*", a, b);
-                        }
-                        case "False": {
-                          const s3 = p === "strAppend" ? $T : $F;
-                          switch (s3.$) {
-                            case "True": {
-                              return primBin("+", a, b);
-                            }
-                            case "False": {
-                              const s4 = p === "intEq" ? $T : $F;
-                              switch (s4.$) {
-                                case "True": {
-                                  return primTest("===", a, b);
-                                }
-                                case "False": {
-                                  const s5 = p === "strEq" ? $T : $F;
-                                  switch (s5.$) {
-                                    case "True": {
-                                      return primTest("===", a, b);
-                                    }
-                                    case "False": {
-                                      const s6 = p === "intLt" ? $T : $F;
-                                      switch (s6.$) {
-                                        case "True": {
-                                          return primTest("<", a, b);
-                                        }
-                                        case "False": {
-                                          const s7 = p === "strLt" ? $T : $F;
-                                          switch (s7.$) {
-                                            case "True": {
-                                              return primTest("<", a, b);
-                                            }
-                                            case "False": {
-                                              const s8 = p === "intLe" ? $T : $F;
-                                              switch (s8.$) {
-                                                case "True": {
-                                                  return primTest("<=", a, b);
-                                                }
-                                                case "False": {
-                                                  const s9 = p === "floatAdd" ? $T : $F;
-                                                  switch (s9.$) {
-                                                    case "True": {
-                                                      return primBin("+", a, b);
-                                                    }
-                                                    case "False": {
-                                                      const s10 = p === "floatSub" ? $T : $F;
-                                                      switch (s10.$) {
-                                                        case "True": {
-                                                          return primBin("-", a, b);
-                                                        }
-                                                        case "False": {
-                                                          const s11 = p === "floatMul" ? $T : $F;
-                                                          switch (s11.$) {
-                                                            case "True": {
-                                                              return primBin("*", a, b);
-                                                            }
-                                                            case "False": {
-                                                              const s12 = p === "floatDiv" ? $T : $F;
-                                                              switch (s12.$) {
-                                                                case "True": {
-                                                                  return primBin("/", a, b);
-                                                                }
-                                                                case "False": {
-                                                                  const s13 = p === "floatEq" ? $T : $F;
-                                                                  switch (s13.$) {
-                                                                    case "True": {
-                                                                      return primTest("===", a, b);
-                                                                    }
-                                                                    case "False": {
-                                                                      const s14 = p === "floatLt" ? $T : $F;
-                                                                      switch (s14.$) {
-                                                                        case "True": {
-                                                                          return primTest("<", a, b);
-                                                                        }
-                                                                        case "False": {
-                                                                          const s15 = p === "floatLe" ? $T : $F;
-                                                                          switch (s15.$) {
-                                                                            case "True": {
-                                                                              return primTest("<=", a, b);
-                                                                            }
-                                                                            case "False": {
-                                                                              return primDefault(p, as);
-                                                                            }
-                                                                          }
-                                                                          return $nomatch(s15);
-                                                                        }
-                                                                      }
-                                                                      return $nomatch(s14);
-                                                                    }
-                                                                  }
-                                                                  return $nomatch(s13);
-                                                                }
-                                                              }
-                                                              return $nomatch(s12);
-                                                            }
-                                                          }
-                                                          return $nomatch(s11);
-                                                        }
-                                                      }
-                                                      return $nomatch(s10);
-                                                    }
-                                                  }
-                                                  return $nomatch(s9);
-                                                }
-                                              }
-                                              return $nomatch(s8);
-                                            }
-                                          }
-                                          return $nomatch(s7);
-                                        }
-                                      }
-                                      return $nomatch(s6);
-                                    }
-                                  }
-                                  return $nomatch(s5);
-                                }
-                              }
-                              return $nomatch(s4);
-                            }
-                          }
-                          return $nomatch(s3);
-                        }
-                      }
-                      return $nomatch(s2);
-                    }
-                  }
-                  return $nomatch(s1);
+                case "Just": {
+                  const f = s.a[0];
+                  return f(a)(b);
                 }
               }
               return $nomatch(s);
@@ -93928,9 +97715,173 @@ const uncurryGo = (ps$, s$) => {
   }
 };
 
-const primHelperU = (code1, p, u) => concatList((() => {
-  const needle = "$" + (p + "(");
-  const x3 = indexFrom(needle, code1, 0n);
+const primUses = (m$, e$) => {
+  for (;;) {
+    const m = m$, e = e$;
+    switch (e.$) {
+      case "EVar": {
+        const x = e.a[0];
+        return m;
+      }
+      case "EGlobal": {
+        const x = e.a[0];
+        return m;
+      }
+      case "ELam": {
+        const x = e.a[0];
+        const b = e.a[1];
+        m$ = m; e$ = b; continue;
+      }
+      case "EApp": {
+        const f = e.a[0];
+        const as = e.a[1];
+        return foldl(primUses$c, primUses(m, f), as);
+      }
+      case "ELet": {
+        const x = e.a[0];
+        const e1 = e.a[1];
+        const b = e.a[2];
+        m$ = primUses(m, e1); e$ = b; continue;
+      }
+      case "ERecord": {
+        const fs1 = e.a[0];
+        return foldl((m2) => (f) => primUses(m2, (() => {
+          switch (f.$) {
+            case "MkPair": {
+              const x = f.a[0];
+              const y = f.a[1];
+              return y;
+            }
+          }
+          return $nomatch(f);
+        })()), m, fs1);
+      }
+      case "EProj": {
+        const e2 = e.a[0];
+        const x = e.a[1];
+        m$ = m; e$ = e2; continue;
+      }
+      case "ETag": {
+        const x = e.a[0];
+        const as = e.a[1];
+        return foldl(primUses$c, m, as);
+      }
+      case "EMatch": {
+        const s = e.a[0];
+        const arms = e.a[1];
+        return foldl((m2) => (a) => primUses(m2, (() => {
+          switch (a.$) {
+            case "MkArm": {
+              const x11 = a.a[0];
+              const x12 = a.a[1];
+              const b = a.a[2];
+              return b;
+            }
+          }
+          return $nomatch(a);
+        })()), primUses(m, s), arms);
+      }
+      case "EPrim": {
+        const p = e.a[0];
+        return insert(compareString$c, "$" + (p + "$c"), { $: "MkUnit", a: [] }, m);
+      }
+      case "EPrimCall": {
+        const p = e.a[0];
+        const as = e.a[1];
+        return foldl(primUses$c, (() => {
+          const s = (() => {
+            switch (as.$) {
+              case "Nil": {
+                return { $: "True", a: [] };
+              }
+              case "Cons": {
+                const it1 = as.a[0];
+                const it2 = as.a[1];
+                switch (it2.$) {
+                  case "Nil": {
+                    const x3 = primUnary(p);
+                    switch (x3.$) {
+                      case "Nothing": {
+                        return { $: "True", a: [] };
+                      }
+                      case "Just": {
+                        const x = x3.a[0];
+                        return { $: "False", a: [] };
+                      }
+                    }
+                    return $nomatch(x3);
+                  }
+                  case "Cons": {
+                    const it21 = it2.a[0];
+                    const it22 = it2.a[1];
+                    switch (it22.$) {
+                      case "Nil": {
+                        const x3 = primOp(p);
+                        switch (x3.$) {
+                          case "Nothing": {
+                            return { $: "True", a: [] };
+                          }
+                          case "Just": {
+                            const x = x3.a[0];
+                            return { $: "False", a: [] };
+                          }
+                        }
+                        return $nomatch(x3);
+                      }
+                      case "Cons": {
+                        const x = it22.a[0];
+                        const x1 = it22.a[1];
+                        return { $: "True", a: [] };
+                      }
+                    }
+                    return $nomatch(it22);
+                  }
+                }
+                return $nomatch(it2);
+              }
+            }
+            return $nomatch(as);
+          })();
+          switch (s.$) {
+            case "True": {
+              return insert(compareString$c, "$" + (p + "("), { $: "MkUnit", a: [] }, m);
+            }
+            case "False": {
+              return m;
+            }
+          }
+          return $nomatch(s);
+        })(), as);
+      }
+      case "ECall": {
+        const x = e.a[0];
+        const as = e.a[1];
+        return foldl(primUses$c, m, as);
+      }
+      case "EInt": {
+        const x = e.a[0];
+        return m;
+      }
+      case "EFloat": {
+        const x = e.a[0];
+        return m;
+      }
+      case "EStr": {
+        const x = e.a[0];
+        return m;
+      }
+      case "EAbandon": {
+        return m;
+      }
+    }
+    return $nomatch(e);
+  }
+};
+const primUses$c = (m) => (e) => primUses(m, e);
+
+const primHelperU = (uses, p, u) => concatList((() => {
+  const k = "$" + (p + "(");
+  const x3 = map_lookup(compareString$c, k, uses);
   const s = (() => {
     const s = (() => {
       switch (x3.$) {
@@ -93949,8 +97900,8 @@ const primHelperU = (code1, p, u) => concatList((() => {
         return { $: "True", a: [] };
       }
       case "False": {
-        const needle1 = "$" + (p + "$c");
-        const x31 = indexFrom(needle1, code1, 0n);
+        const k1 = "$" + (p + "$c");
+        const x31 = map_lookup(compareString$c, k1, uses);
         switch (x31.$) {
           case "Nothing": {
             return { $: "False", a: [] };
@@ -93988,8 +97939,8 @@ const primHelperU = (code1, p, u) => concatList((() => {
   }
   return $nomatch(s);
 })(), (() => {
-  const needle = "$" + (p + "$c");
-  const x3 = indexFrom(needle, code1, 0n);
+  const k = "$" + (p + "$c");
+  const x3 = map_lookup(compareString$c, k, uses);
   const s = (() => {
     switch (x3.$) {
       case "Nothing": {
@@ -94039,14 +97990,15 @@ const primHelperU = (code1, p, u) => concatList((() => {
   return $nomatch(s);
 })());
 
-const primHelpers = (code1) => {
+const primHelpers = (defs) => {
   const xs = prims;
   return foldl((acc) => (x) => concatList((() => {
+    const uses = foldl((m) => (d) => primUses(m, d.body), map_empty, defs);
     switch (x.$) {
       case "MkPair": {
         const p = x.a[0];
         const i = x.a[1];
-        return primHelperU(code1, p, uncurryGo({ $: "Nil", a: [] }, i.js));
+        return primHelperU(uses, p, uncurryGo({ $: "Nil", a: [] }, i.js));
       }
     }
     return $nomatch(x);
@@ -94344,19 +98296,7 @@ const emitCode = (defs, info, curried, globalNames) => {
     }
     return $nomatch(s);
   })(), acc), { $: "Nil", a: [] }, foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, defs));
-  return emitLines(info, code1, primHelpers((() => {
-    switch (code1.$) {
-      case "Nil": {
-        return "";
-      }
-      case "Cons": {
-        const x = code1.a[0];
-        const xs = code1.a[1];
-        return foldl((acc) => (y) => acc + ("\n" + y), x, xs);
-      }
-    }
-    return $nomatch(code1);
-  })()));
+  return emitLines(info, code1, primHelpers(defs));
 };
 
 const emitWithShorts = (defs, roots, shorts) => emitCode(defs, foldl((acc) => (d) => infoOne(shorts, acc, d), map_empty, defs), (() => {
@@ -94398,7 +98338,7 @@ const exportNameOf = (l) => {
   return $nomatch(s);
 };
 
-const exportedNames = (text1) => filter((n) => {
+const exportedNames = (text) => filter((n) => {
   const x1 = $strSlice(n, 0n, BigInt("$".length)) === "$" ? $T : $F;
   switch (x1.$) {
     case "True": {
@@ -94413,10 +98353,10 @@ const exportedNames = (text1) => filter((n) => {
   const s = BigInt("\n".length) === 0n ? $T : $F;
   switch (s.$) {
     case "True": {
-      return { $: "Cons", a: [text1, { $: "Nil", a: [] }] };
+      return { $: "Cons", a: [text, { $: "Nil", a: [] }] };
     }
     case "False": {
-      return splitFrom("\n", text1, 0n, { $: "Nil", a: [] });
+      return splitFrom("\n", text, 0n, { $: "Nil", a: [] });
     }
   }
   return $nomatch(s);
@@ -94446,15 +98386,15 @@ const hostLineOf = (l) => {
   return $nomatch(s);
 };
 
-const hostOf = (text1) => {
+const hostOf = (text) => {
   const x1 = compiler_emit_catMaybesL(map((l) => hostLineOf(l), (() => {
     const s = BigInt("\n".length) === 0n ? $T : $F;
     switch (s.$) {
       case "True": {
-        return { $: "Cons", a: [text1, { $: "Nil", a: [] }] };
+        return { $: "Cons", a: [text, { $: "Nil", a: [] }] };
       }
       case "False": {
-        return splitFrom("\n", text1, 0n, { $: "Nil", a: [] });
+        return splitFrom("\n", text, 0n, { $: "Nil", a: [] });
       }
     }
     return $nomatch(s);
@@ -94965,19 +98905,6 @@ const compileJs = (g, exports0) => compileJsWith(g, (() => {
 
 const emptyDoc = { $: "None", a: [] };
 
-const text = (s) => {
-  const s1 = s === "" ? $T : $F;
-  switch (s1.$) {
-    case "True": {
-      return { $: "None", a: [] };
-    }
-    case "False": {
-      return { $: "Text", a: [s] };
-    }
-  }
-  return $nomatch(s1);
-};
-
 const hardline = { $: "Line", a: [] };
 
 const line = { $: "FlatAlt", a: [{ $: "Line", a: [] }, { $: "Text", a: [" "] }] };
@@ -95433,8 +99360,6 @@ const nest = (i, d) => {
   return $nomatch(s);
 };
 
-const flatAlt = (a, b) => ({ $: "FlatAlt", a: [a, b] });
-
 const flatten = (other$) => {
   let $root, $hole = null, $at = 0;
   for (;;) {
@@ -95765,20 +99690,6 @@ const group = (d) => {
   }
   return $nomatch(d);
 };
-
-const align = (d) => ({ $: "Column", a: [(k) => ({ $: "Nesting", a: [(i) => {
-  const i1 = k - i;
-  const s = i1 === 0n ? $T : $F;
-  switch (s.$) {
-    case "True": {
-      return d;
-    }
-    case "False": {
-      return { $: "Nest", a: [i1, d] };
-    }
-  }
-  return $nomatch(s);
-}] })] });
 
 const spacesInto = (n$, acc$) => {
   for (;;) {
@@ -96534,15 +100445,15 @@ const stepTok = (src, st, e, blank, t) => ({ prevEnd: e.endLine, n: st.n + 1n, t
 const stepTrail = (st, e, lt) => ({ prevEnd: e.endLine, n: st.n, toks: st.toks, pending: st.pending, inl: st.inl, lead: st.lead, inline: st.inline, trail: (() => {
   const m = st.trail;
   const ix = lt.ix;
-  const text1 = e.text;
+  const text = e.text;
   const s = map_lookup(compareInt$c, ix, m);
   switch (s.$) {
     case "Nothing": {
-      return insert(compareInt$c, ix, text1, m);
+      return insert(compareInt$c, ix, text, m);
     }
     case "Just": {
       const old = s.a[0];
-      return insert(compareInt$c, ix, old + (" " + text1), m);
+      return insert(compareInt$c, ix, old + (" " + text), m);
     }
   }
   return $nomatch(s);
@@ -97302,7 +101213,7 @@ const many1 = (p, st) => {
 };
 const many1$c = (p) => (st) => many1(p, st);
 
-const compiler_fmt_cst_sepGo = (sep, p, items1, seps) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
+const compiler_fmt_cst_sepGo = (sep, p, items, seps) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.text === sep ? $T : $F;
   switch (s.$) {
     case "True": {
@@ -97331,7 +101242,7 @@ const compiler_fmt_cst_sepGo = (sep, p, items1, seps) => compiler_fmt_cst_bind$c
                       case "MkRes": {
                         const st2 = x111.a[0];
                         const x2 = x111.a[1];
-                        return compiler_fmt_cst_sepGo(sep, p, { $: "Cons", a: [x2, items1] }, { $: "Cons", a: [x, seps] })(st2);
+                        return compiler_fmt_cst_sepGo(sep, p, { $: "Cons", a: [x2, items] }, { $: "Cons", a: [x, seps] })(st2);
                       }
                     }
                     return $nomatch(x111);
@@ -97347,7 +101258,7 @@ const compiler_fmt_cst_sepGo = (sep, p, items1, seps) => compiler_fmt_cst_bind$c
       };
     }
     case "False": {
-      const x = { $: "MkSep", a: [foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, items1), foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, seps)] };
+      const x = { $: "MkSep", a: [foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, items), foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, seps)] };
       return (st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, x] }] });
     }
   }
@@ -99694,9 +103605,9 @@ const compiler_fmt_cst_atomF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_p
                                                           const x6 = (() => {
                                                             switch (x4.$) {
                                                               case "MkSep": {
-                                                                const items1 = x4.a[0];
+                                                                const items = x4.a[0];
                                                                 const seps = x4.a[1];
-                                                                return { $: "Sum", a: [x2, x3, items1, seps, x5] };
+                                                                return { $: "Sum", a: [x2, x3, items, seps, x5] };
                                                               }
                                                             }
                                                             return $nomatch(x4);
@@ -100595,9 +104506,9 @@ const compiler_fmt_cst_bracesF = (g, st) => {
                                               const x5 = (() => {
                                                 switch (x3.$) {
                                                   case "MkSep": {
-                                                    const items1 = x3.a[0];
+                                                    const items = x3.a[0];
                                                     const seps = x3.a[1];
-                                                    return { $: "Braces", a: [x, items1, seps, x4] };
+                                                    return { $: "Braces", a: [x, items, seps, x4] };
                                                   }
                                                 }
                                                 return $nomatch(x3);
@@ -102040,9 +105951,9 @@ const dataDeclP = (st) => {
                                                                 const x7 = { $: "Just", a: [(() => {
                                                                   switch (x6.$) {
                                                                     case "MkSep": {
-                                                                      const items1 = x6.a[0];
+                                                                      const items = x6.a[0];
                                                                       const seps = x6.a[1];
-                                                                      return { $: "MkDAlts", a: [x5, items1, seps] };
+                                                                      return { $: "MkDAlts", a: [x5, items, seps] };
                                                                     }
                                                                   }
                                                                   return $nomatch(x6);
@@ -103145,20 +107056,6 @@ const rtrimEnd = (s$, e$) => {
 
 const rtrim = (s) => $strSlice(s, 0n, rtrimEnd(s, BigInt(s.length)));
 
-const comment = (s) => {
-  const s1 = replaceAll("\n", newlineMark(), s);
-  const s2 = s1 === "" ? $T : $F;
-  switch (s2.$) {
-    case "True": {
-      return { $: "None", a: [] };
-    }
-    case "False": {
-      return { $: "Text", a: [s1] };
-    }
-  }
-  return $nomatch(s2);
-};
-
 const blankLine = $lazy(() => op_lt_gt((() => {
   const s = blankMark();
   const s1 = s === "" ? $T : $F;
@@ -103360,8 +107257,6 @@ const tok = (env, t) => op_lt_gt((() => {
   return $nomatch(s);
 })())));
 const tok$c = (env) => (t) => tok(env, t);
-
-const tokEnd = (t) => t.end;
 
 const leadDocs = (x1, i) => {
   switch (x1.$) {
@@ -103565,163 +107460,6 @@ const itemsGo = (env, first, last2, doc2, i, x6) => {
     }
   }
   return $nomatch(x6);
-};
-
-const items = (env, first, last2, doc2, xs) => itemsGo(env, first, last2, doc2, 0n, xs);
-
-const opensBlock = (e) => {
-  switch (e.$) {
-    case "Atom": {
-      const x = e.a[0];
-      return { $: "False", a: [] };
-    }
-    case "EParen": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-    case "Named": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      const x4 = e.a[4];
-      return { $: "False", a: [] };
-    }
-    case "Tup": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      return { $: "False", a: [] };
-    }
-    case "Braces": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      return { $: "False", a: [] };
-    }
-    case "InstB": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      const x4 = e.a[4];
-      return { $: "False", a: [] };
-    }
-    case "EFSet": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-    case "Sum": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      const x4 = e.a[4];
-      return { $: "False", a: [] };
-    }
-    case "ECon": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      return { $: "False", a: [] };
-    }
-    case "EField": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      return { $: "False", a: [] };
-    }
-    case "App": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      return { $: "False", a: [] };
-    }
-    case "Op": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-    case "Ops": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      return { $: "False", a: [] };
-    }
-    case "OpRhs": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      return { $: "False", a: [] };
-    }
-    case "Ann": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-    case "BVar": {
-      const x = e.a[0];
-      return { $: "False", a: [] };
-    }
-    case "BImp": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-    case "BAnn": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      const x4 = e.a[4];
-      return { $: "False", a: [] };
-    }
-    case "Lam": {
-      const bs = e.a[0];
-      const binders = e.a[1];
-      const arrow = e.a[2];
-      const body = e.a[3];
-      return { $: "True", a: [] };
-    }
-    case "Case": {
-      const kw = e.a[0];
-      const scrut = e.a[1];
-      const of2 = e.a[2];
-      const alts = e.a[3];
-      return { $: "True", a: [] };
-    }
-    case "EAlt": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-    case "If": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      const x3 = e.a[3];
-      const x4 = e.a[4];
-      const x5 = e.a[5];
-      return { $: "False", a: [] };
-    }
-    case "Do": {
-      const kw = e.a[0];
-      const stmts = e.a[1];
-      return { $: "True", a: [] };
-    }
-    case "ESBind": {
-      const x = e.a[0];
-      const x1 = e.a[1];
-      const x2 = e.a[2];
-      return { $: "False", a: [] };
-    }
-  }
-  return $nomatch(e);
 };
 
 const hangs = (e$) => {
@@ -104551,21 +108289,6 @@ const anyArrow = (x1$) => {
   }
 };
 
-const unsnocE = (es) => {
-  const x1 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, es);
-  switch (x1.$) {
-    case "Nil": {
-      return { $: "Nothing", a: [] };
-    }
-    case "Cons": {
-      const x = x1.a[0];
-      const rev = x1.a[1];
-      return { $: "Just", a: [{ $: "MkPair", a: [foldl((acc) => (x2) => ({ $: "Cons", a: [x2, acc] }), { $: "Nil", a: [] }, rev), x] }] };
-    }
-  }
-  return $nomatch(x1);
-};
-
 const pListGo = (env, pOne, x3, commas, isFirst) => {
   switch (x3.$) {
     case "Nil": {
@@ -104675,7 +108398,13 @@ const pP = (env, x2) => {
       const l = x2.a[0];
       const op = x2.a[1];
       const r = x2.a[2];
-      return op_lt_plus_gt(pP(env, l), op_lt_plus_gt(tok(env, op), pP(env, r)));
+      const a = pP(env, l);
+      const b = (() => {
+        const a1 = tok(env, op);
+        const b = pP(env, r);
+        return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })();
+      return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
     }
   }
   return $nomatch(x2);
@@ -105054,7 +108783,11 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const c = e0.a[4];
       return op_lt_gt(tok(env, o), op_lt_gt((() => {
         const a = tok(env, x);
-        const b = op_lt_plus_gt(tok(env, k), lay().pE(env)(e));
+        const b = (() => {
+          const a1 = tok(env, k);
+          const b = lay().pE(env)(e);
+          return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+        })();
         return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
       })(), tok(env, c)));
     }
@@ -105070,7 +108803,43 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
         case "Cons": {
           const e1 = es.a[0];
           const more = es.a[1];
-          return group(align(op_lt_gt(tok(env, o), op_lt_gt(flatAlt(text(" "), emptyDoc), op_lt_gt(lay().pE(env)(e1), op_lt_gt(foldDocs(zipWith((comma) => (e) => op_lt_gt(linebreak, op_lt_plus_gt(tok(env, comma), lay().pE(env)(e))), commas, more)), op_lt_gt(linebreak, tok(env, c))))))));
+          return group((() => {
+            const d = op_lt_gt(tok(env, o), op_lt_gt((() => {
+              const a = (() => {
+                const s = " " === "" ? $T : $F;
+                switch (s.$) {
+                  case "True": {
+                    return { $: "None", a: [] };
+                  }
+                  case "False": {
+                    return { $: "Text", a: [" "] };
+                  }
+                }
+                return $nomatch(s);
+              })();
+              return { $: "FlatAlt", a: [a, emptyDoc] };
+            })(), op_lt_gt(lay().pE(env)(e1), op_lt_gt((() => {
+              const ds = zipWith((comma) => (e) => op_lt_gt(linebreak, (() => {
+                const a = tok(env, comma);
+                const b = lay().pE(env)(e);
+                return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+              })()), commas, more);
+              return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+            })(), op_lt_gt(linebreak, tok(env, c))))));
+            return { $: "Column", a: [(k) => ({ $: "Nesting", a: [(i) => {
+              const i1 = k - i;
+              const s = i1 === 0n ? $T : $F;
+              switch (s.$) {
+                case "True": {
+                  return d;
+                }
+                case "False": {
+                  return { $: "Nest", a: [i1, d] };
+                }
+              }
+              return $nomatch(s);
+            }] })] };
+          })());
         }
       }
       return $nomatch(es);
@@ -105087,7 +108856,57 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
         case "Cons": {
           const f1 = fs1.a[0];
           const more = fs1.a[1];
-          return group(align(op_lt_gt(op_lt_plus_gt(tok(env, o), nest(4n, lay().rhsField(env)(f1))), op_lt_gt(foldDocs(zipWith((comma) => (f) => op_lt_gt(linebreak, op_lt_plus_gt(tok(env, comma), nest(4n, lay().rhsField(env)(f)))), commas, more)), op_lt_gt(line, tok(env, c))))));
+          return group((() => {
+            const d = op_lt_gt((() => {
+              const a = tok(env, o);
+              const b = (() => {
+                const d = lay().rhsField(env)(f1);
+                const s = 4n === 0n ? $T : $F;
+                switch (s.$) {
+                  case "True": {
+                    return d;
+                  }
+                  case "False": {
+                    return { $: "Nest", a: [4n, d] };
+                  }
+                }
+                return $nomatch(s);
+              })();
+              return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+            })(), op_lt_gt((() => {
+              const ds = zipWith((comma) => (f) => op_lt_gt(linebreak, (() => {
+                const a = tok(env, comma);
+                const b = (() => {
+                  const d = lay().rhsField(env)(f);
+                  const s = 4n === 0n ? $T : $F;
+                  switch (s.$) {
+                    case "True": {
+                      return d;
+                    }
+                    case "False": {
+                      return { $: "Nest", a: [4n, d] };
+                    }
+                  }
+                  return $nomatch(s);
+                })();
+                return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+              })()), commas, more);
+              return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+            })(), op_lt_gt(line, tok(env, c))));
+            return { $: "Column", a: [(k) => ({ $: "Nesting", a: [(i) => {
+              const i1 = k - i;
+              const s = i1 === 0n ? $T : $F;
+              switch (s.$) {
+                case "True": {
+                  return d;
+                }
+                case "False": {
+                  return { $: "Nest", a: [i1, d] };
+                }
+              }
+              return $nomatch(s);
+            }] })] };
+          })());
         }
       }
       return $nomatch(fs1);
@@ -105104,7 +108923,11 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const x = e0.a[0];
       const eq = e0.a[1];
       const e = e0.a[2];
-      return op_lt_gt(op_lt_plus_gt(tok(env, x), tok(env, eq)), lay().rhsOf(env)(e));
+      return op_lt_gt((() => {
+        const a = tok(env, x);
+        const b = tok(env, eq);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), lay().rhsOf(env)(e));
     }
     case "Sum": {
       const kw = e0.a[0];
@@ -105114,12 +108937,50 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const c = e0.a[4];
       switch (alts.$) {
         case "Nil": {
-          return op_lt_plus_gt(tok(env, kw), op_lt_plus_gt(tok(env, o), tok(env, c)));
+          const a = tok(env, kw);
+          const b = (() => {
+            const a1 = tok(env, o);
+            const b = tok(env, c);
+            return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+          })();
+          return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
         }
         case "Cons": {
           const a1 = alts.a[0];
           const more = alts.a[1];
-          return op_lt_plus_gt(tok(env, kw), group(align(op_lt_gt(op_lt_plus_gt(tok(env, o), lay().pE(env)(a1)), op_lt_plus_gt(foldDocs(zipWith((bar) => (a) => op_lt_gt(line, op_lt_plus_gt(tok(env, bar), lay().pE(env)(a))), bars, more)), tok(env, c))))));
+          const a = tok(env, kw);
+          const b = group((() => {
+            const d = op_lt_gt((() => {
+              const a2 = tok(env, o);
+              const b = lay().pE(env)(a1);
+              return op_lt_gt(a2, op_lt_gt({ $: "Text", a: [" "] }, b));
+            })(), (() => {
+              const a2 = (() => {
+                const ds = zipWith((bar) => (a2) => op_lt_gt(line, (() => {
+                  const a3 = tok(env, bar);
+                  const b = lay().pE(env)(a2);
+                  return op_lt_gt(a3, op_lt_gt({ $: "Text", a: [" "] }, b));
+                })()), bars, more);
+                return foldl((a2) => (b) => op_lt_gt(a2, b), emptyDoc, ds);
+              })();
+              const b = tok(env, c);
+              return op_lt_gt(a2, op_lt_gt({ $: "Text", a: [" "] }, b));
+            })());
+            return { $: "Column", a: [(k) => ({ $: "Nesting", a: [(i) => {
+              const i1 = k - i;
+              const s = i1 === 0n ? $T : $F;
+              switch (s.$) {
+                case "True": {
+                  return d;
+                }
+                case "False": {
+                  return { $: "Nest", a: [i1, d] };
+                }
+              }
+              return $nomatch(s);
+            }] })] };
+          })());
+          return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
         }
       }
       return $nomatch(alts);
@@ -105127,7 +108988,21 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
     case "ECon": {
       const c = e0.a[0];
       const args = e0.a[1];
-      return op_lt_gt(tok(env, c), foldDocs(map((a) => op_lt_gt(text(" "), lay().pE(env)(a)), args)));
+      return op_lt_gt(tok(env, c), (() => {
+        const ds = map((a) => op_lt_gt((() => {
+          const s = " " === "" ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return { $: "None", a: [] };
+            }
+            case "False": {
+              return { $: "Text", a: [" "] };
+            }
+          }
+          return $nomatch(s);
+        })(), lay().pE(env)(a)), args);
+        return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+      })());
     }
     case "EField": {
       const e = e0.a[0];
@@ -105148,7 +109023,10 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
         case "MkChain": {
           const first = s.a[0];
           const rest = s.a[1];
-          return group(op_lt_gt(lay().chainOperand(env)(rest)(first), foldDocs(map((r) => op_lt_gt(line, lay().opRhsDoc(env)(rest)(r)), rest))));
+          return group(op_lt_gt(lay().chainOperand(env)(rest)(first), (() => {
+            const ds = map((r) => op_lt_gt(line, lay().opRhsDoc(env)(rest)(r)), rest);
+            return foldl((a1) => (b1) => op_lt_gt(a1, b1), emptyDoc, ds);
+          })()));
         }
       }
       return $nomatch(s);
@@ -105161,13 +109039,31 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
     case "OpRhs": {
       const op = e0.a[0];
       const e = e0.a[1];
-      return op_lt_plus_gt(tok(env, op), lay().pE(env)(e));
+      const a = tok(env, op);
+      const b = lay().pE(env)(e);
+      return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
     }
     case "Ann": {
       const e = e0.a[0];
       const cc = e0.a[1];
       const ty = e0.a[2];
-      return group(op_lt_gt(op_lt_plus_gt(lay().pE(env)(e), tok(env, cc)), nest(2n, op_lt_gt(line, lay().pE(env)(ty)))));
+      return group(op_lt_gt((() => {
+        const a = lay().pE(env)(e);
+        const b = tok(env, cc);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), (() => {
+        const d = op_lt_gt(line, lay().pE(env)(ty));
+        const s = 2n === 0n ? $T : $F;
+        switch (s.$) {
+          case "True": {
+            return d;
+          }
+          case "False": {
+            return { $: "Nest", a: [2n, d] };
+          }
+        }
+        return $nomatch(s);
+      })()));
     }
     case "BVar": {
       const t = e0.a[0];
@@ -105185,21 +109081,209 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const cc = e0.a[2];
       const ty = e0.a[3];
       const c = e0.a[4];
-      return op_lt_gt(tok(env, o), op_lt_gt(op_lt_plus_gt(tok(env, x), op_lt_plus_gt(tok(env, cc), lay().pE(env)(ty))), tok(env, c)));
+      return op_lt_gt(tok(env, o), op_lt_gt((() => {
+        const a = tok(env, x);
+        const b = (() => {
+          const a1 = tok(env, cc);
+          const b = lay().pE(env)(ty);
+          return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), tok(env, c)));
     }
     case "Lam": {
       const bs = e0.a[0];
       const binders = e0.a[1];
       const arrow = e0.a[2];
       const body = e0.a[3];
-      return op_lt_gt(tok(env, bs), op_lt_gt(op_lt_plus_gt(concatWith((a) => (b) => op_lt_plus_gt(a, b), map(lay().binderDoc(env), binders)), tok(env, arrow)), (() => {
-        const s = opensBlock(body);
+      return op_lt_gt(tok(env, bs), op_lt_gt((() => {
+        const a = concatWith((a) => (b) => op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b)), map(lay().binderDoc(env), binders));
+        const b = tok(env, arrow);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), (() => {
+        const s = (() => {
+          switch (body.$) {
+            case "Atom": {
+              const x = body.a[0];
+              return { $: "False", a: [] };
+            }
+            case "EParen": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+            case "Named": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              const x4 = body.a[4];
+              return { $: "False", a: [] };
+            }
+            case "Tup": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              return { $: "False", a: [] };
+            }
+            case "Braces": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              return { $: "False", a: [] };
+            }
+            case "InstB": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              const x4 = body.a[4];
+              return { $: "False", a: [] };
+            }
+            case "EFSet": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+            case "Sum": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              const x4 = body.a[4];
+              return { $: "False", a: [] };
+            }
+            case "ECon": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              return { $: "False", a: [] };
+            }
+            case "EField": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              return { $: "False", a: [] };
+            }
+            case "App": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              return { $: "False", a: [] };
+            }
+            case "Op": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+            case "Ops": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              return { $: "False", a: [] };
+            }
+            case "OpRhs": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              return { $: "False", a: [] };
+            }
+            case "Ann": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+            case "BVar": {
+              const x = body.a[0];
+              return { $: "False", a: [] };
+            }
+            case "BImp": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+            case "BAnn": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              const x4 = body.a[4];
+              return { $: "False", a: [] };
+            }
+            case "Lam": {
+              const bs1 = body.a[0];
+              const binders1 = body.a[1];
+              const arrow1 = body.a[2];
+              const body1 = body.a[3];
+              return { $: "True", a: [] };
+            }
+            case "Case": {
+              const kw = body.a[0];
+              const scrut = body.a[1];
+              const of2 = body.a[2];
+              const alts = body.a[3];
+              return { $: "True", a: [] };
+            }
+            case "EAlt": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+            case "If": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              const x3 = body.a[3];
+              const x4 = body.a[4];
+              const x5 = body.a[5];
+              return { $: "False", a: [] };
+            }
+            case "Do": {
+              const kw = body.a[0];
+              const stmts = body.a[1];
+              return { $: "True", a: [] };
+            }
+            case "ESBind": {
+              const x = body.a[0];
+              const x1 = body.a[1];
+              const x2 = body.a[2];
+              return { $: "False", a: [] };
+            }
+          }
+          return $nomatch(body);
+        })();
         switch (s.$) {
           case "True": {
-            return op_lt_gt(text(" "), lay().pE(env)(body));
+            return op_lt_gt((() => {
+              const s1 = " " === "" ? $T : $F;
+              switch (s1.$) {
+                case "True": {
+                  return { $: "None", a: [] };
+                }
+                case "False": {
+                  return { $: "Text", a: [" "] };
+                }
+              }
+              return $nomatch(s1);
+            })(), lay().pE(env)(body));
           }
           case "False": {
-            return group(nest(2n, op_lt_gt(line, lay().pE(env)(body))));
+            return group((() => {
+              const d = op_lt_gt(line, lay().pE(env)(body));
+              const s1 = 2n === 0n ? $T : $F;
+              switch (s1.$) {
+                case "True": {
+                  return d;
+                }
+                case "False": {
+                  return { $: "Nest", a: [2n, d] };
+                }
+              }
+              return $nomatch(s1);
+            })());
           }
         }
         return $nomatch(s);
@@ -105210,13 +109294,25 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const scrut = e0.a[1];
       const of2 = e0.a[2];
       const alts = e0.a[3];
-      return op_lt_gt(op_lt_plus_gt(tok(env, kw), op_lt_plus_gt(lay().pE(env)(scrut), tok(env, of2))), items(env, firstE, lastE, (e) => (a) => lay().altDoc(e)(a), alts));
+      return op_lt_gt((() => {
+        const a = tok(env, kw);
+        const b = (() => {
+          const a1 = lay().pE(env)(scrut);
+          const b = tok(env, of2);
+          return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), itemsGo(env, firstE, lastE, (e) => (a) => lay().altDoc(e)(a), 0n, alts));
     }
     case "EAlt": {
       const p = e0.a[0];
       const arrow = e0.a[1];
       const body = e0.a[2];
-      return op_lt_gt(op_lt_plus_gt(pP(env, p), tok(env, arrow)), lay().rhsOf(env)(body));
+      return op_lt_gt((() => {
+        const a = pP(env, p);
+        const b = tok(env, arrow);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), lay().rhsOf(env)(body));
     }
     case "If": {
       const kw = e0.a[0];
@@ -105230,38 +109326,270 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
     case "Do": {
       const kw = e0.a[0];
       const stmts = e0.a[1];
-      return op_lt_gt(tok(env, kw), items(env, firstE, lastE, (e) => (s) => lay().stmtDoc(e)(s), stmts));
+      return op_lt_gt(tok(env, kw), itemsGo(env, firstE, lastE, (e) => (s) => lay().stmtDoc(e)(s), 0n, stmts));
     }
     case "ESBind": {
       const x = e0.a[0];
       const arrow = e0.a[1];
       const e = e0.a[2];
-      return op_lt_gt(op_lt_plus_gt(tok(env, x), tok(env, arrow)), lay().rhsOf(env)(e));
+      return op_lt_gt((() => {
+        const a = tok(env, x);
+        const b = tok(env, arrow);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), lay().rhsOf(env)(e));
     }
   }
   return $nomatch(e0);
 }, rhsOf: (env) => (e) => {
-  const s = opensBlock(e);
+  const s = (() => {
+    switch (e.$) {
+      case "Atom": {
+        const x = e.a[0];
+        return { $: "False", a: [] };
+      }
+      case "EParen": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+      case "Named": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        const x4 = e.a[4];
+        return { $: "False", a: [] };
+      }
+      case "Tup": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        return { $: "False", a: [] };
+      }
+      case "Braces": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        return { $: "False", a: [] };
+      }
+      case "InstB": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        const x4 = e.a[4];
+        return { $: "False", a: [] };
+      }
+      case "EFSet": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+      case "Sum": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        const x4 = e.a[4];
+        return { $: "False", a: [] };
+      }
+      case "ECon": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        return { $: "False", a: [] };
+      }
+      case "EField": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        return { $: "False", a: [] };
+      }
+      case "App": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        return { $: "False", a: [] };
+      }
+      case "Op": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+      case "Ops": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        return { $: "False", a: [] };
+      }
+      case "OpRhs": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        return { $: "False", a: [] };
+      }
+      case "Ann": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+      case "BVar": {
+        const x = e.a[0];
+        return { $: "False", a: [] };
+      }
+      case "BImp": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+      case "BAnn": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        const x4 = e.a[4];
+        return { $: "False", a: [] };
+      }
+      case "Lam": {
+        const bs = e.a[0];
+        const binders = e.a[1];
+        const arrow = e.a[2];
+        const body = e.a[3];
+        return { $: "True", a: [] };
+      }
+      case "Case": {
+        const kw = e.a[0];
+        const scrut = e.a[1];
+        const of2 = e.a[2];
+        const alts = e.a[3];
+        return { $: "True", a: [] };
+      }
+      case "EAlt": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+      case "If": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        const x3 = e.a[3];
+        const x4 = e.a[4];
+        const x5 = e.a[5];
+        return { $: "False", a: [] };
+      }
+      case "Do": {
+        const kw = e.a[0];
+        const stmts = e.a[1];
+        return { $: "True", a: [] };
+      }
+      case "ESBind": {
+        const x = e.a[0];
+        const x1 = e.a[1];
+        const x2 = e.a[2];
+        return { $: "False", a: [] };
+      }
+    }
+    return $nomatch(e);
+  })();
   switch (s.$) {
     case "True": {
-      return op_lt_gt(text(" "), lay().pE(env)(e));
+      return op_lt_gt((() => {
+        const s1 = " " === "" ? $T : $F;
+        switch (s1.$) {
+          case "True": {
+            return { $: "None", a: [] };
+          }
+          case "False": {
+            return { $: "Text", a: [" "] };
+          }
+        }
+        return $nomatch(s1);
+      })(), lay().pE(env)(e));
     }
     case "False": {
       return group(op_lt_gt(line, lay().pE(env)(e)));
     }
   }
   return $nomatch(s);
-}, ifLink: (env) => (kw) => (c) => (th) => (a) => group(op_lt_gt(op_lt_plus_gt(tok(env, kw), lay().pE(env)(c)), nest(2n, op_lt_gt(line, op_lt_plus_gt(tok(env, th), nest(2n, lay().pE(env)(a))))))), elseOf: (env) => (el) => (b) => {
+}, ifLink: (env) => (kw) => (c) => (th) => (a) => group(op_lt_gt((() => {
+  const a1 = tok(env, kw);
+  const b = lay().pE(env)(c);
+  return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+})(), (() => {
+  const d = op_lt_gt(line, (() => {
+    const a1 = tok(env, th);
+    const b = (() => {
+      const d = lay().pE(env)(a);
+      const s = 2n === 0n ? $T : $F;
+      switch (s.$) {
+        case "True": {
+          return d;
+        }
+        case "False": {
+          return { $: "Nest", a: [2n, d] };
+        }
+      }
+      return $nomatch(s);
+    })();
+    return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+  })());
+  const s = 2n === 0n ? $T : $F;
+  switch (s.$) {
+    case "True": {
+      return d;
+    }
+    case "False": {
+      return { $: "Nest", a: [2n, d] };
+    }
+  }
+  return $nomatch(s);
+})())), elseOf: (env) => (el) => (b) => {
   switch (b.$) {
     case "Atom": {
       const x = b.a[0];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "EParen": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Named": {
       const x = b.a[0];
@@ -105269,21 +109597,69 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const x2 = b.a[2];
       const x3 = b.a[3];
       const x4 = b.a[4];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Tup": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
       const x3 = b.a[3];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Braces": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
       const x3 = b.a[3];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "InstB": {
       const x = b.a[0];
@@ -105291,13 +109667,45 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const x2 = b.a[2];
       const x3 = b.a[3];
       const x4 = b.a[4];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "EFSet": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Sum": {
       const x = b.a[0];
@@ -105305,54 +109713,214 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const x2 = b.a[2];
       const x3 = b.a[3];
       const x4 = b.a[4];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "ECon": {
       const x = b.a[0];
       const x1 = b.a[1];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "EField": {
       const x = b.a[0];
       const x1 = b.a[1];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "App": {
       const x = b.a[0];
       const x1 = b.a[1];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Op": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Ops": {
       const x = b.a[0];
       const x1 = b.a[1];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "OpRhs": {
       const x = b.a[0];
       const x1 = b.a[1];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Ann": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "BVar": {
       const x = b.a[0];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "BImp": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "BAnn": {
       const x = b.a[0];
@@ -105360,27 +109928,91 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const x2 = b.a[2];
       const x3 = b.a[3];
       const x4 = b.a[4];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Lam": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
       const x3 = b.a[3];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "Case": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
       const x3 = b.a[3];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "EAlt": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "If": {
       const kw = b.a[0];
@@ -105389,23 +110021,72 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
       const a = b.a[3];
       const el2 = b.a[4];
       const b2 = b.a[5];
-      return op_lt_gt(line, op_lt_gt(op_lt_plus_gt(tok(env, el), lay().ifLink(env)(kw)(c)(th)(a)), lay().elseOf(env)(el2)(b2)));
+      return op_lt_gt(line, op_lt_gt((() => {
+        const a1 = tok(env, el);
+        const b1 = lay().ifLink(env)(kw)(c)(th)(a);
+        return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })(), lay().elseOf(env)(el2)(b2)));
     }
     case "Do": {
       const x = b.a[0];
       const x1 = b.a[1];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
     case "ESBind": {
       const x = b.a[0];
       const x1 = b.a[1];
       const x2 = b.a[2];
-      return op_lt_gt(line, op_lt_plus_gt(tok(env, el), nest(2n, lay().pE(env)(b))));
+      return op_lt_gt(line, (() => {
+        const a = tok(env, el);
+        const b1 = (() => {
+          const d = lay().pE(env)(b);
+          const s = 2n === 0n ? $T : $F;
+          switch (s.$) {
+            case "True": {
+              return d;
+            }
+            case "False": {
+              return { $: "Nest", a: [2n, d] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b1));
+      })());
     }
   }
   return $nomatch(b);
 }, appDoc: (env) => (h) => (args) => {
-  const s = unsnocE(args);
+  const x1 = foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, args);
+  const s = (() => {
+    switch (x1.$) {
+      case "Nil": {
+        return { $: "Nothing", a: [] };
+      }
+      case "Cons": {
+        const x = x1.a[0];
+        const rev = x1.a[1];
+        return { $: "Just", a: [{ $: "MkPair", a: [foldl((acc) => (x2) => ({ $: "Cons", a: [x2, acc] }), { $: "Nil", a: [] }, rev), x] }] };
+      }
+    }
+    return $nomatch(x1);
+  })();
   switch (s.$) {
     case "Nothing": {
       return lay().pE(env)(h);
@@ -105422,10 +110103,42 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
-                  return op_lt_plus_gt(group(op_lt_gt(lay().pE(env)(h), nest(2n, foldDocs(map((a) => op_lt_gt(line, lay().pE(env)(a)), init2))))), lay().pE(env)(lastA));
+                  const a = group(op_lt_gt(lay().pE(env)(h), (() => {
+                    const d = (() => {
+                      const ds = map((a) => op_lt_gt(line, lay().pE(env)(a)), init2);
+                      return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+                    })();
+                    const s2 = 2n === 0n ? $T : $F;
+                    switch (s2.$) {
+                      case "True": {
+                        return d;
+                      }
+                      case "False": {
+                        return { $: "Nest", a: [2n, d] };
+                      }
+                    }
+                    return $nomatch(s2);
+                  })()));
+                  const b = lay().pE(env)(lastA);
+                  return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
                 }
                 case "False": {
-                  return group(op_lt_gt(lay().pE(env)(h), nest(2n, foldDocs(map((a) => op_lt_gt(line, lay().pE(env)(a)), args)))));
+                  return group(op_lt_gt(lay().pE(env)(h), (() => {
+                    const d = (() => {
+                      const ds = map((a) => op_lt_gt(line, lay().pE(env)(a)), args);
+                      return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+                    })();
+                    const s2 = 2n === 0n ? $T : $F;
+                    switch (s2.$) {
+                      case "True": {
+                        return d;
+                      }
+                      case "False": {
+                        return { $: "Nest", a: [2n, d] };
+                      }
+                    }
+                    return $nomatch(s2);
+                  })()));
                 }
               }
               return $nomatch(s1);
@@ -105437,7 +110150,26 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
               const s1 = hangs(e);
               switch (s1.$) {
                 case "True": {
-                  return op_lt_gt(op_lt_plus_gt(group(op_lt_gt(lay().pE(env)(h), nest(2n, foldDocs(map((a) => op_lt_gt(line, lay().pE(env)(a)), init2))))), tok(env, o)), op_lt_gt(lay().pE(env)(e), tok(env, c)));
+                  return op_lt_gt((() => {
+                    const a = group(op_lt_gt(lay().pE(env)(h), (() => {
+                      const d = (() => {
+                        const ds = map((a) => op_lt_gt(line, lay().pE(env)(a)), init2);
+                        return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+                      })();
+                      const s2 = 2n === 0n ? $T : $F;
+                      switch (s2.$) {
+                        case "True": {
+                          return d;
+                        }
+                        case "False": {
+                          return { $: "Nest", a: [2n, d] };
+                        }
+                      }
+                      return $nomatch(s2);
+                    })()));
+                    const b = tok(env, o);
+                    return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+                  })(), op_lt_gt(lay().pE(env)(e), tok(env, c)));
                 }
                 case "False": {
                   return group(op_lt_gt(lay().pE(env)(h), nest(2n, foldDocs(map((a) => op_lt_gt(line, lay().pE(env)(a)), args)))));
@@ -105447,10 +110179,10 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Named": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
-              const x4 = lastA.a[4];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
+              const x5 = lastA.a[4];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105464,9 +110196,9 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Tup": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105480,9 +110212,9 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Braces": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105496,10 +110228,10 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "InstB": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
-              const x4 = lastA.a[4];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
+              const x5 = lastA.a[4];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105513,8 +110245,8 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "EFSet": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105528,10 +110260,10 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Sum": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
-              const x4 = lastA.a[4];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
+              const x5 = lastA.a[4];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105545,7 +110277,7 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "ECon": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
+              const x2 = lastA.a[1];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105559,7 +110291,7 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "EField": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
+              const x2 = lastA.a[1];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105573,7 +110305,7 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "App": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
+              const x2 = lastA.a[1];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105587,8 +110319,8 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Op": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105602,7 +110334,7 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Ops": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
+              const x2 = lastA.a[1];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105616,7 +110348,7 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "OpRhs": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
+              const x2 = lastA.a[1];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105630,8 +110362,8 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Ann": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105658,8 +110390,8 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "BImp": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105673,10 +110405,10 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "BAnn": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
-              const x4 = lastA.a[4];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
+              const x5 = lastA.a[4];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105690,9 +110422,9 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Lam": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105706,9 +110438,9 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Case": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105722,8 +110454,8 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "EAlt": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105737,11 +110469,11 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "If": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
-              const x3 = lastA.a[3];
-              const x4 = lastA.a[4];
-              const x5 = lastA.a[5];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
+              const x4 = lastA.a[3];
+              const x5 = lastA.a[4];
+              const x6 = lastA.a[5];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105755,7 +110487,7 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "Do": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
+              const x2 = lastA.a[1];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -105769,8 +110501,8 @@ const lay = $lazy(() => ({ pE: (env) => (e0) => {
             }
             case "ESBind": {
               const x = lastA.a[0];
-              const x1 = lastA.a[1];
-              const x2 = lastA.a[2];
+              const x2 = lastA.a[1];
+              const x3 = lastA.a[2];
               const s1 = hangs(lastA);
               switch (s1.$) {
                 case "True": {
@@ -107135,11 +111867,6 @@ const sig = (env, cc, ty) => {
   }] })] };
 };
 
-const nmDoc = (env, n) => {
-  const ds = map(tok$c(env), n);
-  return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
-};
-
 const paramsDoc = (env, params) => {
   const ds = map((p) => op_lt_gt((() => {
     const s = " " === "" ? $T : $F;
@@ -107272,8 +111999,6 @@ const tfDoc = (env, x2) => {
 };
 const tfDoc$c = (env) => (x2) => tfDoc(env, x2);
 
-const srcSlice = (env, a, b) => $strSlice(env.src, a, b);
-
 const pD = (env, x2) => {
   switch (x2.$) {
     case "DImport": {
@@ -107315,7 +112040,28 @@ const pD = (env, x2) => {
       const pats = x2.a[1];
       const eq = x2.a[2];
       const rhs = x2.a[3];
-      return op_lt_gt(nmDoc(env, n), op_lt_gt(op_lt_plus_gt(foldDocs(map((p) => op_lt_gt(text(" "), pP(env, p)), pats)), tok(env, eq)), lay().rhsOf(env)(rhs)));
+      return op_lt_gt((() => {
+        const ds = map(tok$c(env), n);
+        return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+      })(), op_lt_gt((() => {
+        const a = (() => {
+          const ds = map((p) => op_lt_gt((() => {
+            const s = " " === "" ? $T : $F;
+            switch (s.$) {
+              case "True": {
+                return { $: "None", a: [] };
+              }
+              case "False": {
+                return { $: "Text", a: [" "] };
+              }
+            }
+            return $nomatch(s);
+          })(), pP(env, p)), pats);
+          return foldl((a) => (b) => op_lt_gt(a, b), emptyDoc, ds);
+        })();
+        const b = tok(env, eq);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), lay().rhsOf(env)(rhs)));
     }
     case "DData": {
       const kw = x2.a[0];
@@ -107323,7 +112069,11 @@ const pD = (env, x2) => {
       const params = x2.a[2];
       const universe = x2.a[3];
       const alts = x2.a[4];
-      return op_lt_gt(op_lt_plus_gt(tok(env, kw), tok(env, name)), op_lt_gt(paramsDoc(env, params), op_lt_gt(universeDoc(env, universe), dataAltsDoc(env, alts))));
+      return op_lt_gt((() => {
+        const a = tok(env, kw);
+        const b = tok(env, name);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), op_lt_gt(paramsDoc(env, params), op_lt_gt(universeDoc(env, universe), dataAltsDoc(env, alts))));
     }
     case "DType": {
       const kw = x2.a[0];
@@ -107331,7 +112081,15 @@ const pD = (env, x2) => {
       const params = x2.a[2];
       const eq = x2.a[3];
       const body = x2.a[4];
-      return op_lt_gt(op_lt_plus_gt(tok(env, kw), tok(env, name)), op_lt_gt(op_lt_plus_gt(paramsDoc(env, params), tok(env, eq)), lay().rhsOf(env)(body)));
+      return op_lt_gt((() => {
+        const a = tok(env, kw);
+        const b = tok(env, name);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), op_lt_gt((() => {
+        const a = paramsDoc(env, params);
+        const b = tok(env, eq);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), lay().rhsOf(env)(body)));
     }
     case "DTheory": {
       const kw = x2.a[0];
@@ -107339,7 +112097,15 @@ const pD = (env, x2) => {
       const params = x2.a[2];
       const w = x2.a[3];
       const fields = x2.a[4];
-      return op_lt_gt(op_lt_plus_gt(tok(env, kw), tok(env, name)), op_lt_gt(op_lt_plus_gt(paramsDoc(env, params), tok(env, w)), items(env, tfFirst, tfLast2, tfDoc$c, fields)));
+      return op_lt_gt((() => {
+        const a = tok(env, kw);
+        const b = tok(env, name);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), op_lt_gt((() => {
+        const a = paramsDoc(env, params);
+        const b = tok(env, w);
+        return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })(), itemsGo(env, tfFirst, tfLast2, tfDoc$c, 0n, fields)));
     }
     case "DForeign": {
       const kw = x2.a[0];
@@ -107347,17 +112113,48 @@ const pD = (env, x2) => {
       const x = x2.a[2];
       const cc = x2.a[3];
       const ty = x2.a[4];
-      return op_lt_plus_gt(tok(env, kw), op_lt_plus_gt(tok(env, imp), op_lt_plus_gt(tok(env, x), sig(env, cc, ty))));
+      const a = tok(env, kw);
+      const b = (() => {
+        const a1 = tok(env, imp);
+        const b = (() => {
+          const a2 = tok(env, x);
+          const b = sig(env, cc, ty);
+          return op_lt_gt(a2, op_lt_gt({ $: "Text", a: [" "] }, b));
+        })();
+        return op_lt_gt(a1, op_lt_gt({ $: "Text", a: [" "] }, b));
+      })();
+      return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
     }
     case "DTest": {
       const kw = x2.a[0];
       const x = x2.a[1];
-      return op_lt_plus_gt(tok(env, kw), tok(env, x));
+      const a = tok(env, kw);
+      const b = tok(env, x);
+      return op_lt_gt(a, op_lt_gt({ $: "Text", a: [" "] }, b));
     }
     case "DWatch": {
       const w = x2.a[0];
       const e = x2.a[1];
-      return op_lt_gt(tok(env, w), comment(srcSlice(env, tokEnd(w), tokEnd(lastE(e)))));
+      return op_lt_gt(tok(env, w), (() => {
+        const s = (() => {
+          const b = (() => {
+            const t = lastE(e);
+            return t.end;
+          })();
+          return $strSlice(env.src, w.end, b);
+        })();
+        const s1 = replaceAll("\n", newlineMark(), s);
+        const s2 = s1 === "" ? $T : $F;
+        switch (s2.$) {
+          case "True": {
+            return { $: "None", a: [] };
+          }
+          case "False": {
+            return { $: "Text", a: [s1] };
+          }
+        }
+        return $nomatch(s2);
+      })());
     }
   }
   return $nomatch(x2);
@@ -107468,7 +112265,7 @@ const topLevelGo = (env, i, x3) => {
           }
         }
         return $nomatch(s);
-      })(), op_lt_gt(item(env, firstD(d), compiler_fmt_cst_lastD(d), (e) => pD(e, d)), topLevelGo(env, op_plus(i)(1n), ds)));
+      })(), op_lt_gt(item(env, firstD(d), compiler_fmt_cst_lastD(d), (e) => pD(e, d)), topLevelGo(env, i + 1n, ds)));
     }
   }
   return $nomatch(x3);
@@ -107793,8 +112590,8 @@ const ntnKey = (x1) => {
   return $nomatch(x1);
 };
 
-const readNoFixities = (text1) => {
-  const l = lexGo(text1, { i: 0n, line: 0n, lineStart: 0n, first: { $: "True", a: [] }, tok: { $: "Nothing", a: [] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } }, { $: "Nil", a: [] }, { $: "Nil", a: [] }, { $: "Nil", a: [] });
+const readNoFixities = (text) => {
+  const l = lexGo(text, { i: 0n, line: 0n, lineStart: 0n, first: { $: "True", a: [] }, tok: { $: "Nothing", a: [] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } }, { $: "Nil", a: [] }, { $: "Nil", a: [] }, { $: "Nil", a: [] });
   return readToks({ known: noKnown, fixities: emptyFixities, lenient: { $: "True", a: [] } }, $arrayFromList(l.tokens), map(lexDiagOf, l.errors));
 };
 
@@ -107942,9 +112739,9 @@ const fs = { hfmap: (fm) => (g) => (p) => {
     }
     case "WriteFile": {
       const path = p.a[0];
-      const str1 = p.a[1];
+      const str = p.a[1];
       const k = p.a[2];
-      return { $: "WriteFile", a: [path, str1, (ok) => g(k(ok))] };
+      return { $: "WriteFile", a: [path, str, (ok) => g(k(ok))] };
     }
     case "MkDir": {
       const path = p.a[0];
@@ -107962,9 +112759,9 @@ const fs = { hfmap: (fm) => (g) => (p) => {
     }
     case "WriteFile": {
       const path = p.a[0];
-      const str1 = p.a[1];
+      const str = p.a[1];
       const k = p.a[2];
-      return { $: "WriteFile", a: [path, str1, k] };
+      return { $: "WriteFile", a: [path, str, k] };
     }
     case "MkDir": {
       const path = p.a[0];
@@ -107980,8 +112777,8 @@ const readFile = (e, ev, path) => {
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
 
-const writeFile = (e, ev, path, str1) => {
-  const p = ev({ $: "WriteFile", a: [path, str1, (ok) => ok] });
+const writeFile = (e, ev, path, str) => {
+  const p = ev({ $: "WriteFile", a: [path, str, (ok) => ok] });
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
 
@@ -108761,67 +113558,6 @@ const stringify = (j) => {
   return $nomatch(j);
 };
 
-const field = (k, x2) => {
-  switch (x2.$) {
-    case "JNull": {
-      return { $: "Nothing", a: [] };
-    }
-    case "JBool": {
-      const x = x2.a[0];
-      return { $: "Nothing", a: [] };
-    }
-    case "JInt": {
-      const x = x2.a[0];
-      return { $: "Nothing", a: [] };
-    }
-    case "JFloat": {
-      const x = x2.a[0];
-      return { $: "Nothing", a: [] };
-    }
-    case "JString": {
-      const x = x2.a[0];
-      return { $: "Nothing", a: [] };
-    }
-    case "JArray": {
-      const x = x2.a[0];
-      return { $: "Nothing", a: [] };
-    }
-    case "JObject": {
-      const fs1 = x2.a[0];
-      const s = prelude_find((p) => (() => {
-        switch (p.$) {
-          case "MkPair": {
-            const x = p.a[0];
-            const y = p.a[1];
-            return x;
-          }
-        }
-        return $nomatch(p);
-      })() === k ? $T : $F, fs1);
-      switch (s.$) {
-        case "Nothing": {
-          return { $: "Nothing", a: [] };
-        }
-        case "Just": {
-          const p = s.a[0];
-          return { $: "Just", a: [(() => {
-            switch (p.$) {
-              case "MkPair": {
-                const x = p.a[0];
-                const y = p.a[1];
-                return y;
-              }
-            }
-            return $nomatch(p);
-          })()] };
-        }
-      }
-      return $nomatch(s);
-    }
-  }
-  return $nomatch(x2);
-};
-
 const at = (x1$, j$) => {
   for (;;) {
     const x1 = x1$, j = j$;
@@ -108907,96 +113643,6 @@ const at = (x1$, j$) => {
     return $nomatch(x1);
   }
 };
-
-const str = (ks, j) => {
-  const it = at(ks, j);
-  switch (it.$) {
-    case "Nothing": {
-      return { $: "Nothing", a: [] };
-    }
-    case "Just": {
-      const it1 = it.a[0];
-      switch (it1.$) {
-        case "JNull": {
-          return { $: "Nothing", a: [] };
-        }
-        case "JBool": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JInt": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JFloat": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JString": {
-          const s = it1.a[0];
-          return { $: "Just", a: [s] };
-        }
-        case "JArray": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JObject": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-      }
-      return $nomatch(it1);
-    }
-  }
-  return $nomatch(it);
-};
-
-const bool = (ks, j) => {
-  const it = at(ks, j);
-  switch (it.$) {
-    case "Nothing": {
-      return { $: "Nothing", a: [] };
-    }
-    case "Just": {
-      const it1 = it.a[0];
-      switch (it1.$) {
-        case "JNull": {
-          return { $: "Nothing", a: [] };
-        }
-        case "JBool": {
-          const b = it1.a[0];
-          return { $: "Just", a: [b] };
-        }
-        case "JInt": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JFloat": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JString": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JArray": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-        case "JObject": {
-          const x = it1.a[0];
-          return { $: "Nothing", a: [] };
-        }
-      }
-      return $nomatch(it1);
-    }
-  }
-  return $nomatch(it);
-};
-
-const obj = (fs1) => ({ $: "JObject", a: [fs1] });
-
-const kv = (k, v) => ({ $: "MkPair", a: [k, v] });
 
 const none = { binders: { $: "Nil", a: [] }, uses: { $: "Nil", a: [] } };
 
@@ -130568,14 +135214,14 @@ const renameRefused = (t, old, _new) => {
   return $nomatch(s);
 };
 
-const kindOf = (x, text1) => {
-  const s = $strSlice(text1, 0n, 5n) === "data " ? $T : $F;
+const kindOf = (x, text) => {
+  const s = $strSlice(text, 0n, 5n) === "data " ? $T : $F;
   switch (s.$) {
     case "True": {
       return 10n;
     }
     case "False": {
-      const s1 = $strSlice(text1, 0n, 7n) === "theory " ? $T : $F;
+      const s1 = $strSlice(text, 0n, 7n) === "theory " ? $T : $F;
       switch (s1.$) {
         case "True": {
           return 11n;
@@ -130853,16 +135499,6 @@ const _await = (e, ev, ms) => {
 
 const send = (e, ev, m) => {
   const p = ev({ $: "Send", a: [stringify(m), { $: "MkUnit", a: [] }] });
-  return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
-};
-
-const now = (e, ev) => {
-  const p = ev({ $: "Now", a: [(n) => n] });
-  return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
-};
-
-const quit = (e, ev, code1) => {
-  const p = ev({ $: "Quit", a: [code1] });
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
 
@@ -133852,9 +138488,9 @@ const pairsHold = (p$, x2$) => {
   }
 };
 
-const melt = (hashes, done, s, text1) => {
+const melt = (hashes, done, s, text) => {
   const x1 = (() => {
-    const x1 = takeStr(text1, 0n);
+    const x1 = takeStr(text, 0n);
     switch (x1.$) {
       case "Nothing": {
         return { $: "Nothing", a: [] };
@@ -133882,7 +138518,7 @@ const melt = (hashes, done, s, text1) => {
                 return { $: "Nothing", a: [] };
               }
               case "False": {
-                const x13 = takeStr(text1, i);
+                const x13 = takeStr(text, i);
                 switch (x13.$) {
                   case "Nothing": {
                     return { $: "Nothing", a: [] };
@@ -133910,7 +138546,7 @@ const melt = (hashes, done, s, text1) => {
                             return { $: "Nothing", a: [] };
                           }
                           case "False": {
-                            const x15 = meltFix(text1, i1);
+                            const x15 = meltFix(text, i1);
                             switch (x15.$) {
                               case "Nothing": {
                                 return { $: "Nothing", a: [] };
@@ -133923,7 +138559,7 @@ const melt = (hashes, done, s, text1) => {
                                     const i2 = x112.a[1];
                                     const x16 = (() => {
                                       const x16 = (() => {
-                                        const x16 = takeWord(text1, i2);
+                                        const x16 = takeWord(text, i2);
                                         switch (x16.$) {
                                           case "Nothing": {
                                             return { $: "Nothing", a: [] };
@@ -133954,7 +138590,7 @@ const melt = (hashes, done, s, text1) => {
                                               const x4 = x113.a[0];
                                               const i3 = x113.a[1];
                                               return takeManyG((j) => {
-                                                const x17 = takeStr(text1, j);
+                                                const x17 = takeStr(text, j);
                                                 switch (x17.$) {
                                                   case "Nothing": {
                                                     return { $: "Nothing", a: [] };
@@ -133965,7 +138601,7 @@ const melt = (hashes, done, s, text1) => {
                                                       case "MkPair": {
                                                         const x5 = x114.a[0];
                                                         const i4 = x114.a[1];
-                                                        const x18 = takeStr(text1, i4);
+                                                        const x18 = takeStr(text, i4);
                                                         switch (x18.$) {
                                                           case "Nothing": {
                                                             return { $: "Nothing", a: [] };
@@ -134064,7 +138700,7 @@ const melt = (hashes, done, s, text1) => {
                                               case "False": {
                                                 const x18 = (() => {
                                                   const x18 = (() => {
-                                                    const x18 = takeWord(text1, i3);
+                                                    const x18 = takeWord(text, i3);
                                                     switch (x18.$) {
                                                       case "Nothing": {
                                                         return { $: "Nothing", a: [] };
@@ -134095,7 +138731,7 @@ const melt = (hashes, done, s, text1) => {
                                                           const x5 = x114.a[0];
                                                           const i4 = x114.a[1];
                                                           return takeManyG((j) => {
-                                                            const x19 = takeStr(text1, j);
+                                                            const x19 = takeStr(text, j);
                                                             switch (x19.$) {
                                                               case "Nothing": {
                                                                 return { $: "Nothing", a: [] };
@@ -134106,7 +138742,7 @@ const melt = (hashes, done, s, text1) => {
                                                                   case "MkPair": {
                                                                     const x6 = x115.a[0];
                                                                     const i5 = x115.a[1];
-                                                                    const x110 = takeStr(text1, i5);
+                                                                    const x110 = takeStr(text, i5);
                                                                     switch (x110.$) {
                                                                       case "Nothing": {
                                                                         return { $: "Nothing", a: [] };
@@ -134188,7 +138824,7 @@ const melt = (hashes, done, s, text1) => {
                                                           case "False": {
                                                             const x110 = (() => {
                                                               const x110 = (() => {
-                                                                const x110 = takeWord(text1, i4);
+                                                                const x110 = takeWord(text, i4);
                                                                 switch (x110.$) {
                                                                   case "Nothing": {
                                                                     return { $: "Nothing", a: [] };
@@ -134218,7 +138854,7 @@ const melt = (hashes, done, s, text1) => {
                                                                     case "MkPair": {
                                                                       const x6 = x115.a[0];
                                                                       const i5 = x115.a[1];
-                                                                      return takeManyG((j) => meltDef(text1, j), x6, i5);
+                                                                      return takeManyG((j) => meltDef(text, j), x6, i5);
                                                                     }
                                                                   }
                                                                   return $nomatch(x115);
@@ -134566,10 +139202,6 @@ const exit = (e, ev, code1) => {
   const p = ev({ $: "Exit", a: [code1, { $: "MkUnit", a: [] }] });
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
-
-const withProject = (p, s) => ({ docs: s.docs, checked: s.checked, due: s.due, project: p, watch: s.watch, shutdown: s.shutdown, lib: s.lib });
-
-const mkProject = (root, program) => ({ root: root, program: program });
 
 const jtrue = { $: "JBool", a: [{ $: "True", a: [] }] };
 
@@ -135417,11 +140049,9 @@ const elabProject = (e, read, lib, root, f, sys, disk, wire) => {
   return (hd) => (k) => c(hd)((x) => elabFiles(e, read, lib, concatList(x, { $: "Cons", a: [f, { $: "Nil", a: [] }] }), sys, disk, wire)(hd)(k));
 };
 
-const mkWithProgram = (st, program) => ({ st: st, program: program });
-
 const projectAnew = (e, st, root, f, sys, disk, wire) => {
   const c = elabProject(e, (p) => readOpen(e, st, p, sys, disk, wire), st.lib, root, f, sys, disk, wire);
-  return (hd) => (k) => c(hd)((x) => co_pure(e, mkWithProgram(withProject({ $: "Just", a: [mkProject(root, x)] }, st), x), hd, k));
+  return (hd) => (k) => c(hd)((x) => k({ st: { docs: st.docs, checked: st.checked, due: st.due, project: { $: "Just", a: [{ root: root, program: x }] }, watch: st.watch, shutdown: st.shutdown, lib: st.lib }, program: x }));
 };
 
 const project = (e, st, f, sys, disk, wire) => {
@@ -135434,10 +140064,10 @@ const project = (e, st, f, sys, disk, wire) => {
       }
       case "Just": {
         const pr1 = s.a[0];
-        const s1 = strEq(pr1.root)(x.root);
+        const s1 = pr1.root === x.root ? $T : $F;
         switch (s1.$) {
           case "True": {
-            return co_pure(e, mkWithProgram(st, pr1.program), hd, k);
+            return k({ st: st, program: pr1.program });
           }
           case "False": {
             return projectAnew(e, st, x.root, f, sys, disk, wire)(hd)(k);
@@ -135545,21 +140175,21 @@ const withProgram = (e, st, p, sys, disk, wire) => {
                 const c1 = check(e, st, f, sys, disk, wire);
                 return c1(hd)((x1) => {
                   const x2 = (() => {
-                    const text1 = d.text;
+                    const text = d.text;
                     const s2 = map_lookup(compareString$c, f, x1.checked);
                     switch (s2.$) {
                       case "Nothing": {
-                        return { st: x1, text: text1, program: { $: "Nil", a: [] } };
+                        return { st: x1, text: text, program: { $: "Nil", a: [] } };
                       }
                       case "Just": {
                         const c2 = s2.a[0];
-                        const s3 = c2.text === text1 ? $T : $F;
+                        const s3 = c2.text === text ? $T : $F;
                         switch (s3.$) {
                           case "True": {
-                            return { st: x1, text: text1, program: c2.program };
+                            return { st: x1, text: text, program: c2.program };
                           }
                           case "False": {
-                            return { st: x1, text: text1, program: { $: "Nil", a: [] } };
+                            return { st: x1, text: text, program: { $: "Nil", a: [] } };
                           }
                         }
                         return $nomatch(s3);
@@ -135576,21 +140206,21 @@ const withProgram = (e, st, p, sys, disk, wire) => {
                 switch (s2.$) {
                   case "True": {
                     const x1 = (() => {
-                      const text1 = d.text;
+                      const text = d.text;
                       const s3 = map_lookup(compareString$c, f, st.checked);
                       switch (s3.$) {
                         case "Nothing": {
-                          return { st: st, text: text1, program: { $: "Nil", a: [] } };
+                          return { st: st, text: text, program: { $: "Nil", a: [] } };
                         }
                         case "Just": {
                           const c2 = s3.a[0];
-                          const s4 = c2.text === text1 ? $T : $F;
+                          const s4 = c2.text === text ? $T : $F;
                           switch (s4.$) {
                             case "True": {
-                              return { st: st, text: text1, program: c2.program };
+                              return { st: st, text: text, program: c2.program };
                             }
                             case "False": {
-                              return { st: st, text: text1, program: { $: "Nil", a: [] } };
+                              return { st: st, text: text, program: { $: "Nil", a: [] } };
                             }
                           }
                           return $nomatch(s4);
@@ -135604,21 +140234,21 @@ const withProgram = (e, st, p, sys, disk, wire) => {
                     const c2 = check(e, st, f, sys, disk, wire);
                     return c2(hd)((x1) => {
                       const x2 = (() => {
-                        const text1 = d.text;
+                        const text = d.text;
                         const s3 = map_lookup(compareString$c, f, x1.checked);
                         switch (s3.$) {
                           case "Nothing": {
-                            return { st: x1, text: text1, program: { $: "Nil", a: [] } };
+                            return { st: x1, text: text, program: { $: "Nil", a: [] } };
                           }
                           case "Just": {
                             const c3 = s3.a[0];
-                            const s4 = c3.text === text1 ? $T : $F;
+                            const s4 = c3.text === text ? $T : $F;
                             switch (s4.$) {
                               case "True": {
-                                return { st: x1, text: text1, program: c3.program };
+                                return { st: x1, text: text, program: c3.program };
                               }
                               case "False": {
-                                return { st: x1, text: text1, program: { $: "Nil", a: [] } };
+                                return { st: x1, text: text, program: { $: "Nil", a: [] } };
                               }
                             }
                             return $nomatch(s4);
@@ -135841,7 +140471,10 @@ const withTarget = (e, st, p, sys, disk, wire) => {
           case "Just": {
             const d = s.a[0];
             const c1 = project(e, st, f, sys, disk, wire);
-            return c1(hd)((x1) => co_pure(e, compiler_lsp_targetIn(x1.st, f, d, p, x1.program), hd, k));
+            return c1(hd)((x1) => {
+              const x2 = compiler_lsp_targetIn(x1.st, f, d, p, x1.program);
+              return k(x2);
+            });
           }
         }
         return $nomatch(s);
@@ -135882,11 +140515,6 @@ const locations = (e, st, x2, sys, disk, wire) => {
   }
   return $nomatch(x2);
 };
-
-const byFile = (os) => map((p) => {
-  const os1 = filter((o) => o.path === p ? $T : $F, os);
-  return { path: p, occurrences: os1 };
-}, nubPaths(map((o) => o.path, os)));
 
 const renamedText = (_new, os) => {
   const z = (() => {
@@ -135969,38 +140597,6 @@ const errorCount = (program) => foldl((n) => (c) => n + (() => {
   }, c.diags);
   return foldl((n1) => (x) => n1 + 1n, 0n, xs);
 })(), 0n, nubCheckedPaths(program));
-
-const textOf = (texts, p) => {
-  const s = prelude_find((q) => (() => {
-    switch (q.$) {
-      case "MkPair": {
-        const x = q.a[0];
-        const y = q.a[1];
-        return x;
-      }
-    }
-    return $nomatch(q);
-  })() === p ? $T : $F, texts);
-  switch (s.$) {
-    case "Nothing": {
-      return { $: "Nothing", a: [] };
-    }
-    case "Just": {
-      const q = s.a[0];
-      return { $: "Just", a: [(() => {
-        switch (q.$) {
-          case "MkPair": {
-            const x = q.a[0];
-            const y = q.a[1];
-            return y;
-          }
-        }
-        return $nomatch(q);
-      })()] };
-    }
-  }
-  return $nomatch(s);
-};
 
 const shiftOf = (t, _new, b) => (BigInt(_new.length) - BigInt(t.name.length)) * (() => {
   const xs = filter((o) => {
@@ -136129,23 +140725,76 @@ const affectedGo = (changed1$, mods$, x3$) => {
   }
 };
 
-const inPaths = (paths, program) => filter((c) => any($strEq$c(c.path), paths), program);
-
 const renameChecked = (e, st, t, _new, sys, disk, wire) => {
   const c = project(e, st, t.path, sys, disk, wire);
-  return (hd) => (k) => c(hd)((x) => co_bind(e, co_pure$c(e)(affectedGo(map((b) => b.path, byFile(t.occurrences)), { $: "Nil", a: [] }, x.program)), (affected) => co_bind$c(e)(elabFiles(e, (p) => {
-    const s = textOf(map((b) => ({ $: "MkPair", a: [b.path, renamedText(_new, b.occurrences)] }), byFile(t.occurrences)), p);
-    switch (s.$) {
-      case "Nothing": {
-        return readOpen(e, st, p, sys, disk, wire);
-      }
-      case "Just": {
-        const txt = s.a[0];
-        return co_pure$c(e)({ $: "Just", a: [txt] });
-      }
-    }
-    return $nomatch(s);
-  }, st.lib, affected, sys, disk, wire))((after) => co_pure$c(e)(renameVerdict(x, t, _new, errorCount(inPaths(affected, x.program)), errorCount(inPaths(affected, after)), after))), hd, k));
+  return (hd) => (k) => c(hd)((x) => {
+    const c1 = (() => {
+      const x1 = affectedGo(map((b) => b.path, (() => {
+        const os = t.occurrences;
+        return map((p) => {
+          const os1 = filter((o) => o.path === p ? $T : $F, os);
+          return { path: p, occurrences: os1 };
+        }, nubPaths(map((o) => o.path, os)));
+      })()), { $: "Nil", a: [] }, x.program);
+      return (hd1) => (k1) => k1(x1);
+    })();
+    return c1(hd)((x1) => {
+      const c2 = elabFiles(e, (p) => {
+        const texts = map((b) => ({ $: "MkPair", a: [b.path, renamedText(_new, b.occurrences)] }), (() => {
+          const os = t.occurrences;
+          return map((p1) => {
+            const os1 = filter((o) => o.path === p1 ? $T : $F, os);
+            return { path: p1, occurrences: os1 };
+          }, nubPaths(map((o) => o.path, os)));
+        })());
+        const s = (() => {
+          const s = prelude_find((q) => (() => {
+            switch (q.$) {
+              case "MkPair": {
+                const x2 = q.a[0];
+                const y = q.a[1];
+                return x2;
+              }
+            }
+            return $nomatch(q);
+          })() === p ? $T : $F, texts);
+          switch (s.$) {
+            case "Nothing": {
+              return { $: "Nothing", a: [] };
+            }
+            case "Just": {
+              const q = s.a[0];
+              return { $: "Just", a: [(() => {
+                switch (q.$) {
+                  case "MkPair": {
+                    const x2 = q.a[0];
+                    const y = q.a[1];
+                    return y;
+                  }
+                }
+                return $nomatch(q);
+              })()] };
+            }
+          }
+          return $nomatch(s);
+        })();
+        switch (s.$) {
+          case "Nothing": {
+            return readOpen(e, st, p, sys, disk, wire);
+          }
+          case "Just": {
+            const txt = s.a[0];
+            return (hd1) => (k1) => k1({ $: "Just", a: [txt] });
+          }
+        }
+        return $nomatch(s);
+      }, st.lib, x1, sys, disk, wire);
+      return c2(hd)((x2) => {
+        const x3 = renameVerdict(x, t, _new, errorCount(filter((c3) => any($strEq$c(c3.path), x1), x.program)), errorCount(filter((c3) => any($strEq$c(c3.path), x1), x2)), x2);
+        return k(x3);
+      });
+    });
+  });
 };
 
 const changesOf = (e, st, _new, x3, sys, disk, wire) => {
@@ -136258,7 +140907,16 @@ const projects = (e, st, x2, sys, disk, wire) => {
           const x211 = x21.a[0];
           const f = x21.a[1];
           const c = project(e, st, f, sys, disk, wire);
-          return (hd) => (k) => c(hd)((x) => co_bind(e, projects(e, x.st, rest, sys, disk, wire), (more) => co_pure$c(e)(mkWithProgram(more.st, concatList(x.program, more.program))), hd, k));
+          return (hd) => (k) => c(hd)((x) => {
+            const c1 = projects(e, x.st, rest, sys, disk, wire);
+            return c1(hd)((x1) => {
+              const x3 = (() => {
+                const program = concatList(x.program, x1.program);
+                return { st: x1.st, program: program };
+              })();
+              return k(x3);
+            });
+          });
         }
       }
       return $nomatch(x21);
@@ -136419,14 +141077,67 @@ const renamed = (e, id, _new, tg, sys, disk, wire) => {
         case "Nothing": {
           const c = renameChecked(e, tg.st, t, _new, sys, disk, wire);
           return (hd) => (k) => c(hd)((x) => {
-            const s2 = snd(x);
+            const s2 = (() => {
+              switch (x.$) {
+                case "MkPair": {
+                  const x1 = x.a[0];
+                  const y = x.a[1];
+                  return y;
+                }
+              }
+              return $nomatch(x);
+            })();
             switch (s2.$) {
               case "Nothing": {
-                return co_bind(e, changesOf(e, fst(x), _new, byFile(t.occurrences), sys, disk, wire), (cs) => co_bind$c(e)(reply(e, id, obj({ $: "Cons", a: [kv("changes", { $: "JObject", a: [cs] }), { $: "Nil", a: [] }] }), sys, disk, wire))((x1) => co_pure$c(e)(fst(x))), hd, k);
+                const c1 = changesOf(e, (() => {
+                  switch (x.$) {
+                    case "MkPair": {
+                      const x1 = x.a[0];
+                      const y = x.a[1];
+                      return x1;
+                    }
+                  }
+                  return $nomatch(x);
+                })(), _new, (() => {
+                  const os = t.occurrences;
+                  return map((p) => {
+                    const os1 = filter((o) => o.path === p ? $T : $F, os);
+                    return { path: p, occurrences: os1 };
+                  }, nubPaths(map((o) => o.path, os)));
+                })(), sys, disk, wire);
+                return c1(hd)((x1) => {
+                  const c2 = reply(e, id, { $: "JObject", a: [{ $: "Cons", a: [{ $: "MkPair", a: ["changes", { $: "JObject", a: [x1] }] }, { $: "Nil", a: [] }] }] }, sys, disk, wire);
+                  return c2(hd)((x2) => {
+                    const x3 = (() => {
+                      switch (x.$) {
+                        case "MkPair": {
+                          const x3 = x.a[0];
+                          const y = x.a[1];
+                          return x3;
+                        }
+                      }
+                      return $nomatch(x);
+                    })();
+                    return k(x3);
+                  });
+                });
               }
               case "Just": {
                 const why = s2.a[0];
-                return co_bind(e, replyError(e, id, op_minus(0n)(32803n), why, sys, disk, wire), (x1) => co_pure$c(e)(fst(x)), hd, k);
+                const c1 = replyError(e, id, 0n - 32803n, why, sys, disk, wire);
+                return c1(hd)((x1) => {
+                  const x2 = (() => {
+                    switch (x.$) {
+                      case "MkPair": {
+                        const x2 = x.a[0];
+                        const y = x.a[1];
+                        return x2;
+                      }
+                    }
+                    return $nomatch(x);
+                  })();
+                  return k(x2);
+                });
               }
             }
             return $nomatch(s2);
@@ -136434,7 +141145,8 @@ const renamed = (e, id, _new, tg, sys, disk, wire) => {
         }
         case "Just": {
           const why = s1.a[0];
-          return co_bind$c(e)(replyError(e, id, op_minus(0n)(32803n), why, sys, disk, wire))((x) => co_pure$c(e)(tg.st));
+          const c = replyError(e, id, 0n - 32803n, why, sys, disk, wire);
+          return (hd) => (k) => c(hd)((x) => k(tg.st));
         }
       }
       return $nomatch(s1);
@@ -136798,51 +141510,173 @@ const request = (e, st, m, id, p, sys, disk, wire) => {
                               switch (s7.$) {
                                 case "True": {
                                   const c = withTarget(e, st, p, sys, disk, wire);
-                                  return (hd) => (k) => c(hd)((x) => co_bind(e, (() => {
-                                    const s8 = x.target;
-                                    switch (s8.$) {
-                                      case "Nothing": {
-                                        return reply(e, id, { $: "JNull", a: [] }, sys, disk, wire);
-                                      }
-                                      case "Just": {
-                                        const t = s8.a[0];
-                                        return co_bind$c(e)(locations(e, x.st, filter((o) => {
-                                          const s9 = fromMaybe({ $: "True", a: [] }, bool({ $: "Cons", a: ["context", { $: "Cons", a: ["includeDeclaration", { $: "Nil", a: [] }] }] }, p));
-                                          switch (s9.$) {
-                                            case "True": {
-                                              return { $: "True", a: [] };
+                                  return (hd) => (k) => c(hd)((x) => {
+                                    const c1 = (() => {
+                                      const s8 = x.target;
+                                      switch (s8.$) {
+                                        case "Nothing": {
+                                          return reply(e, id, { $: "JNull", a: [] }, sys, disk, wire);
+                                        }
+                                        case "Just": {
+                                          const t = s8.a[0];
+                                          const c1 = locations(e, x.st, filter((o) => {
+                                            const x2 = (() => {
+                                              const it = at({ $: "Cons", a: ["context", { $: "Cons", a: ["includeDeclaration", { $: "Nil", a: [] }] }] }, p);
+                                              switch (it.$) {
+                                                case "Nothing": {
+                                                  return { $: "Nothing", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const it1 = it.a[0];
+                                                  switch (it1.$) {
+                                                    case "JNull": {
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JBool": {
+                                                      const b = it1.a[0];
+                                                      return { $: "Just", a: [b] };
+                                                    }
+                                                    case "JInt": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JFloat": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JString": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JArray": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JObject": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                  }
+                                                  return $nomatch(it1);
+                                                }
+                                              }
+                                              return $nomatch(it);
+                                            })();
+                                            const s9 = (() => {
+                                              switch (x2.$) {
+                                                case "Nothing": {
+                                                  return { $: "True", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const x1 = x2.a[0];
+                                                  return x1;
+                                                }
+                                              }
+                                              return $nomatch(x2);
+                                            })();
+                                            switch (s9.$) {
+                                              case "True": {
+                                                return { $: "True", a: [] };
+                                              }
+                                              case "False": {
+                                                const s10 = o.defines;
+                                                switch (s10.$) {
+                                                  case "True": {
+                                                    return { $: "False", a: [] };
+                                                  }
+                                                  case "False": {
+                                                    return { $: "True", a: [] };
+                                                  }
+                                                }
+                                                return $nomatch(s10);
+                                              }
                                             }
-                                            case "False": {
-                                              return not(o.defines);
-                                            }
-                                          }
-                                          return $nomatch(s9);
-                                        }, t.occurrences), sys, disk, wire))((js) => reply(e, id, { $: "JArray", a: [js] }, sys, disk, wire));
+                                            return $nomatch(s9);
+                                          }, t.occurrences), sys, disk, wire);
+                                          return (hd1) => (k1) => c1(hd1)((x1) => reply(e, id, { $: "JArray", a: [x1] }, sys, disk, wire)(hd1)(k1));
+                                        }
                                       }
-                                    }
-                                    return $nomatch(s8);
-                                  })(), (x1) => co_pure$c(e)(x.st), hd, k));
+                                      return $nomatch(s8);
+                                    })();
+                                    return c1(hd)((x1) => k(x.st));
+                                  });
                                 }
                                 case "False": {
-                                  const s8 = strEq(m)("textDocument/prepareRename");
+                                  const s8 = m === "textDocument/prepareRename" ? $T : $F;
                                   switch (s8.$) {
                                     case "True": {
-                                      return co_bind$c(e)(withTarget(e, st, p, sys, disk, wire))((tg) => prepared(e, id, tg, sys, disk, wire));
+                                      const c = withTarget(e, st, p, sys, disk, wire);
+                                      return (hd) => (k) => c(hd)((x) => prepared(e, id, x, sys, disk, wire)(hd)(k));
                                     }
                                     case "False": {
-                                      const s9 = strEq(m)("textDocument/rename");
+                                      const s9 = m === "textDocument/rename" ? $T : $F;
                                       switch (s9.$) {
                                         case "True": {
-                                          return co_bind$c(e)(withTarget(e, st, p, sys, disk, wire))((tg) => renamed(e, id, fromMaybe("", str({ $: "Cons", a: ["newName", { $: "Nil", a: [] }] }, p)), tg, sys, disk, wire));
+                                          const c = withTarget(e, st, p, sys, disk, wire);
+                                          return (hd) => (k) => c(hd)((x) => renamed(e, id, (() => {
+                                            const x2 = (() => {
+                                              const it = at({ $: "Cons", a: ["newName", { $: "Nil", a: [] }] }, p);
+                                              switch (it.$) {
+                                                case "Nothing": {
+                                                  return { $: "Nothing", a: [] };
+                                                }
+                                                case "Just": {
+                                                  const it1 = it.a[0];
+                                                  switch (it1.$) {
+                                                    case "JNull": {
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JBool": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JInt": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JFloat": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JString": {
+                                                      const s10 = it1.a[0];
+                                                      return { $: "Just", a: [s10] };
+                                                    }
+                                                    case "JArray": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                    case "JObject": {
+                                                      const x1 = it1.a[0];
+                                                      return { $: "Nothing", a: [] };
+                                                    }
+                                                  }
+                                                  return $nomatch(it1);
+                                                }
+                                              }
+                                              return $nomatch(it);
+                                            })();
+                                            switch (x2.$) {
+                                              case "Nothing": {
+                                                return "";
+                                              }
+                                              case "Just": {
+                                                const x1 = x2.a[0];
+                                                return x1;
+                                              }
+                                            }
+                                            return $nomatch(x2);
+                                          })(), x, sys, disk, wire)(hd)(k));
                                         }
                                         case "False": {
-                                          const s10 = strEq(m)("textDocument/formatting");
+                                          const s10 = m === "textDocument/formatting" ? $T : $F;
                                           switch (s10.$) {
                                             case "True": {
                                               return formatted(e, st, id, p, sys, disk, wire);
                                             }
                                             case "False": {
-                                              return co_bind$c(e)(replyError(e, id, op_minus(0n)(32601n), op_plus_plus("no method ")(m), sys, disk, wire))((x) => co_pure$c(e)(st));
+                                              const c = replyError(e, id, 0n - 32601n, "no method " + m, sys, disk, wire);
+                                              return (hd) => (k) => c(hd)((x) => k(st));
                                             }
                                           }
                                           return $nomatch(s10);
@@ -136997,7 +141831,7 @@ const lastChange = (p) => {
   return $nomatch(s);
 };
 
-const changed = (st, f, text1) => {
+const changed = (st, f, text) => {
   const s = map_lookup(compareString$c, f, st.docs);
   switch (s.$) {
     case "Nothing": {
@@ -137005,7 +141839,7 @@ const changed = (st, f, text1) => {
     }
     case "Just": {
       const d = s.a[0];
-      const d1 = insert(compareString$c, f, { uri: d.uri, text: text1 }, st.docs);
+      const d1 = insert(compareString$c, f, { uri: d.uri, text: text }, st.docs);
       return { docs: d1, checked: st.checked, due: st.due, project: st.project, watch: st.watch, shutdown: st.shutdown, lib: st.lib };
     }
   }
@@ -137143,7 +141977,7 @@ const notified = (e, st, m, p, sys, disk, wire) => {
                               }
                               return $nomatch(x2);
                             })();
-                            const text1 = (() => {
+                            const text = (() => {
                               const x2 = (() => {
                                 const it = at({ $: "Cons", a: ["textDocument", { $: "Cons", a: ["text", { $: "Nil", a: [] }] }] }, p);
                                 switch (it.$) {
@@ -137197,7 +142031,7 @@ const notified = (e, st, m, p, sys, disk, wire) => {
                               }
                               return $nomatch(x2);
                             })();
-                            return { uri: uri, text: text1 };
+                            return { uri: uri, text: text };
                           })(), st.docs);
                           return { docs: d, checked: st.checked, due: st.due, project: st.project, watch: st.watch, shutdown: st.shutdown, lib: st.lib };
                         })(), f, sys, disk, wire)(hd)(k);
@@ -137212,7 +142046,7 @@ const notified = (e, st, m, p, sys, disk, wire) => {
                                 return k(st);
                               }
                               case "Just": {
-                                const text1 = s5.a[0];
+                                const text = s5.a[0];
                                 const c1 = (() => {
                                   const p1 = wire({ $: "Now", a: [(n) => n] });
                                   return (hd1) => (k2) => hd1.bind(hd1.malg(e.hmap((c1) => c1(hd1)(hd1.ret))(p1)))((x1) => k2(x1));
@@ -137220,7 +142054,7 @@ const notified = (e, st, m, p, sys, disk, wire) => {
                                 return c1(hd)((x1) => {
                                   const x2 = (() => {
                                     const t = insert(compareString$c, f, x1 + 200n, st.due);
-                                    const s6 = changed(st, f, text1);
+                                    const s6 = changed(st, f, text);
                                     return { docs: s6.docs, checked: s6.checked, due: t, project: s6.project, watch: s6.watch, shutdown: s6.shutdown, lib: s6.lib };
                                   })();
                                   return k(x2);
@@ -137523,7 +142357,78 @@ const handle = (e, st, msg, sys, disk, wire) => {
               return (hd) => (k) => c(hd)((x) => k(st));
             }
             case "False": {
-              return request(e, st, m, id, fromMaybe({ $: "JNull", a: [] }, field("params", msg)), sys, disk, wire);
+              return request(e, st, m, id, (() => {
+                const x2 = (() => {
+                  switch (msg.$) {
+                    case "JNull": {
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "JBool": {
+                      const x = msg.a[0];
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "JInt": {
+                      const x = msg.a[0];
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "JFloat": {
+                      const x = msg.a[0];
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "JString": {
+                      const x = msg.a[0];
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "JArray": {
+                      const x = msg.a[0];
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "JObject": {
+                      const fs1 = msg.a[0];
+                      const s3 = prelude_find((p) => (() => {
+                        switch (p.$) {
+                          case "MkPair": {
+                            const x = p.a[0];
+                            const y = p.a[1];
+                            return x;
+                          }
+                        }
+                        return $nomatch(p);
+                      })() === "params" ? $T : $F, fs1);
+                      switch (s3.$) {
+                        case "Nothing": {
+                          return { $: "Nothing", a: [] };
+                        }
+                        case "Just": {
+                          const p = s3.a[0];
+                          return { $: "Just", a: [(() => {
+                            switch (p.$) {
+                              case "MkPair": {
+                                const x = p.a[0];
+                                const y = p.a[1];
+                                return y;
+                              }
+                            }
+                            return $nomatch(p);
+                          })()] };
+                        }
+                      }
+                      return $nomatch(s3);
+                    }
+                  }
+                  return $nomatch(msg);
+                })();
+                switch (x2.$) {
+                  case "Nothing": {
+                    return { $: "JNull", a: [] };
+                  }
+                  case "Just": {
+                    const x = x2.a[0];
+                    return x;
+                  }
+                }
+                return $nomatch(x2);
+              })(), sys, disk, wire);
             }
           }
           return $nomatch(s2);
@@ -137534,26 +142439,6 @@ const handle = (e, st, msg, sys, disk, wire) => {
   }
   return $nomatch(s);
 };
-
-const dueBy = (st, t) => map((q) => {
-  switch (q.$) {
-    case "MkPair": {
-      const x = q.a[0];
-      const y = q.a[1];
-      return x;
-    }
-  }
-  return $nomatch(q);
-}, filter((q) => (() => {
-  switch (q.$) {
-    case "MkPair": {
-      const x = q.a[0];
-      const y = q.a[1];
-      return y;
-    }
-  }
-  return $nomatch(q);
-})() <= t ? $T : $F, toListOnto(st.due, { $: "Nil", a: [] })));
 
 const nextDue = (st, t) => {
   const s = map((p) => {
@@ -137632,10 +142517,36 @@ const serveFrom = (e, st, sys, disk, wire) => {
           return c2(hd)((x2) => serveFrom(e, x2, sys, disk, wire)(hd)(k));
         }
         case "Timeout": {
-          return co_bind(e, now(e, wire), (t2) => co_bind$c(e)(checkDue(e, st, dueBy(st, t2), sys, disk, wire))((st2) => serveFrom(e, st2, sys, disk, wire)), hd, k);
+          const c2 = (() => {
+            const p = wire({ $: "Now", a: [(n) => n] });
+            return (hd1) => (k2) => hd1.bind(hd1.malg(e.hmap((c2) => c2(hd1)(hd1.ret))(p)))((x2) => k2(x2));
+          })();
+          return c2(hd)((x2) => {
+            const c3 = checkDue(e, st, map((q) => {
+              switch (q.$) {
+                case "MkPair": {
+                  const x3 = q.a[0];
+                  const y = q.a[1];
+                  return x3;
+                }
+              }
+              return $nomatch(q);
+            }, filter((q) => (() => {
+              switch (q.$) {
+                case "MkPair": {
+                  const x3 = q.a[0];
+                  const y = q.a[1];
+                  return y;
+                }
+              }
+              return $nomatch(q);
+            })() <= x2 ? $T : $F, toListOnto(st.due, { $: "Nil", a: [] }))), sys, disk, wire);
+            return c3(hd)((x3) => serveFrom(e, x3, sys, disk, wire)(hd)(k));
+          });
         }
         case "Closed": {
-          return quit(e, wire, 1n)(hd)(k);
+          const p = wire({ $: "Quit", a: [1n] });
+          return hd.bind(hd.malg(e.hmap((c2) => c2(hd)(hd.ret))(p)))((x2) => k(x2));
         }
       }
       return $nomatch(x1);
@@ -137691,14 +142602,14 @@ const mismatch = (e, ev, color, expected, got) => {
 const stdio = { hfmap: (fm) => (g) => (p) => {
   switch (p.$) {
     case "Write": {
-      const str1 = p.a[0];
+      const str = p.a[0];
       const x = p.a[1];
-      return { $: "Write", a: [str1, g(x)] };
+      return { $: "Write", a: [str, g(x)] };
     }
     case "WriteErr": {
-      const str1 = p.a[0];
+      const str = p.a[0];
       const x = p.a[1];
-      return { $: "WriteErr", a: [str1, g(x)] };
+      return { $: "WriteErr", a: [str, g(x)] };
     }
     case "ReadStdin": {
       const k = p.a[0];
@@ -137709,14 +142620,14 @@ const stdio = { hfmap: (fm) => (g) => (p) => {
 }, hmap: (nt) => (p) => {
   switch (p.$) {
     case "Write": {
-      const str1 = p.a[0];
+      const str = p.a[0];
       const x = p.a[1];
-      return { $: "Write", a: [str1, x] };
+      return { $: "Write", a: [str, x] };
     }
     case "WriteErr": {
-      const str1 = p.a[0];
+      const str = p.a[0];
       const x = p.a[1];
-      return { $: "WriteErr", a: [str1, x] };
+      return { $: "WriteErr", a: [str, x] };
     }
     case "ReadStdin": {
       const k = p.a[0];
@@ -137726,19 +142637,19 @@ const stdio = { hfmap: (fm) => (g) => (p) => {
   return $nomatch(p);
 } };
 
-const write = (e, ev, str1) => {
+const write = (e, ev, str) => {
+  const p = ev({ $: "Write", a: [str, { $: "MkUnit", a: [] }] });
+  return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
+};
+
+const print = (e, ev, str) => {
+  const str1 = str + "\n";
   const p = ev({ $: "Write", a: [str1, { $: "MkUnit", a: [] }] });
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
 
-const print = (e, ev, str1) => {
-  const str3 = str1 + "\n";
-  const p = ev({ $: "Write", a: [str3, { $: "MkUnit", a: [] }] });
-  return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
-};
-
-const printErr = (e, ev, str1) => {
-  const p = ev({ $: "WriteErr", a: [str1 + "\n", { $: "MkUnit", a: [] }] });
+const printErr = (e, ev, str) => {
+  const p = ev({ $: "WriteErr", a: [str + "\n", { $: "MkUnit", a: [] }] });
   return (hd) => (k2) => hd.bind(hd.malg(e.hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
 };
 
@@ -138219,7 +143130,7 @@ const putFileDiags = (x1, io, sys, disk, rep, wire) => {
             return (hd) => (k) => $force(k);
           }
           case "False": {
-            const str1 = (() => {
+            const str = (() => {
               const x2 = map((d) => fileDiag(c.path, c.source, d), c.diags);
               switch (x2.$) {
                 case "Nil": {
@@ -138233,7 +143144,7 @@ const putFileDiags = (x1, io, sys, disk, rep, wire) => {
               }
               return $nomatch(x2);
             })();
-            const p = io({ $: "WriteErr", a: [str1, { $: "MkUnit", a: [] }] });
+            const p = io({ $: "WriteErr", a: [str, { $: "MkUnit", a: [] }] });
             return (hd) => (k2) => hd.bind(hd.malg(plus(plus(plus(plus(stdio, _process), fs), report), rpc).hmap((c1) => c1(hd)(hd.ret))(p)))((x) => k2(x));
           }
         }
@@ -138499,7 +143410,7 @@ const compileJsCmd = (file, outPath, io, sys, disk, rep, wire) => {
     const c1 = printErrs("heff", x.errors, 0n, io, sys, disk, rep, wire);
     return c1(hd)((x1) => {
       const c2 = cachedProgram(plus(plus(plus(plus(stdio, _process), fs), report), rpc), disk, x);
-      return c2(hd)((x2) => compileJsDiags(file, outPath, op_gt(x1, 0n), x2, io, sys, disk, rep, wire)(hd)(k));
+      return c2(hd)((x2) => compileJsDiags(file, outPath, 0n < x1 ? $T : $F, x2, io, sys, disk, rep, wire)(hd)(k));
     });
   });
 };
@@ -138753,18 +143664,16 @@ const runLast = (bad, x2, io, sys, disk, rep, wire) => {
   return $nomatch(x2);
 };
 
-const runChecked = (badL, cs, io, sys, disk, rep, wire) => {
-  const c = diagCount(cs, io, sys, disk, rep, wire);
-  return (hd) => (k) => c(hd)((x) => runLast(badL + x, lastChecked(cs), io, sys, disk, rep, wire)(hd)(k));
-};
-
 const runCmd = (file, io, sys, disk, rep, wire) => {
   const c = load(file, io, sys, disk, rep, wire);
   return (hd) => (k) => c(hd)((x) => {
     const c1 = printErrs("heff", x.errors, 0n, io, sys, disk, rep, wire);
     return c1(hd)((x1) => {
       const c2 = cachedProgram(plus(plus(plus(plus(stdio, _process), fs), report), rpc), disk, x);
-      return c2(hd)((x2) => runChecked(x1, x2, io, sys, disk, rep, wire)(hd)(k));
+      return c2(hd)((x2) => {
+        const c3 = diagCount(x2, io, sys, disk, rep, wire);
+        return c3(hd)((x3) => runLast(x1 + x3, lastChecked(x2), io, sys, disk, rep, wire)(hd)(k));
+      });
     });
   });
 };
@@ -139017,8 +143926,8 @@ const checkLast = (badLoad, cs, io, sys, disk, rep, wire) => {
       case "Just": {
         const c1 = s.a[0];
         const c2 = (() => {
-          const str1 = _interface(c1);
-          const p = io({ $: "Write", a: [str1, { $: "MkUnit", a: [] }] });
+          const str = _interface(c1);
+          const p = io({ $: "Write", a: [str, { $: "MkUnit", a: [] }] });
           return (hd1) => (k2) => hd1.bind(hd1.malg(plus(plus(plus(plus(stdio, _process), fs), report), rpc).hmap((c2) => c2(hd1)(hd1.ret))(p)))((x1) => k2(x1));
         })();
         return c2(hd)((x1) => {
@@ -139099,7 +144008,7 @@ const checkCmd = (file, io, sys, disk, rep, wire) => {
   });
 };
 
-const typeAtCmd = (file, off, io, sys, disk, rep, wire) => {
+const typeAtCmd = (file, offs, io, sys, disk, rep, wire) => {
   const c = load(file, io, sys, disk, rep, wire);
   return (hd) => (k) => c(hd)((x) => {
     const c1 = printErrs("heff", x.errors, 0n, io, sys, disk, rep, wire);
@@ -139116,19 +144025,31 @@ const typeAtCmd = (file, off, io, sys, disk, rep, wire) => {
             }
             case "Just": {
               const c4 = s.a[0];
-              return print(plus(plus(plus(plus(stdio, _process), fs), report), rpc), io, fromMaybe("nothing there", (() => {
-                const s1 = parseInt(off);
-                switch (s1.$) {
+              return printLines(map((off) => {
+                const x21 = (() => {
+                  const s1 = parseInt(off);
+                  switch (s1.$) {
+                    case "Nothing": {
+                      return { $: "Nothing", a: [] };
+                    }
+                    case "Just": {
+                      const o = s1.a[0];
+                      return typeAt(c4, o);
+                    }
+                  }
+                  return $nomatch(s1);
+                })();
+                switch (x21.$) {
                   case "Nothing": {
-                    return { $: "Nothing", a: [] };
+                    return "nothing there";
                   }
                   case "Just": {
-                    const o = s1.a[0];
-                    return typeAt(c4, o);
+                    const x4 = x21.a[0];
+                    return x4;
                   }
                 }
-                return $nomatch(s1);
-              })()))(hd)(k);
+                return $nomatch(x21);
+              }, offs), io, sys, disk, rep, wire)(hd)(k);
             }
           }
           return $nomatch(s);
@@ -139165,7 +144086,7 @@ const explainCmd = (file, io, sys, disk, rep, wire) => {
   });
 };
 
-const commands = { $: "Cons", a: [{ name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its interface", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "eval", args: "FILE", doc: "print what each definition of FILE evaluates to", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME, its worlds' providers bundled in", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "type-at", args: "FILE OFFSET", doc: "what the name at OFFSET resolved to, and its type", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hf", flags: { $: "Cons", a: [{ flag: "check", doc: "only say which are not formatted" }, { $: "Nil", a: [] }] } }, { $: "Cons", a: [{ name: "lsp", args: "", doc: "a language server, on stdin/stdout", files: "", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "completions", args: "fish", doc: "a completion script for the shell", files: "", flags: { $: "Nil", a: [] } }, { $: "Nil", a: [] }] }] }] }] }] }] }] }] }] }] }] }] }] };
+const commands = { $: "Cons", a: [{ name: "check", args: "FILE", doc: "elaborate FILE and what it imports; print its interface", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "eval", args: "FILE", doc: "print what each definition of FILE evaluates to", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "run", args: "FILE", doc: "print what each watch (`-- >>> e`) of FILE evaluates to", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "test", args: "FILE...", doc: "check the watches' expectations (the `-- ...` lines under them)", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "promote", args: "FILE", doc: "write each watch's value under it as its expectation", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "compile-js", args: "FILE OUT.js", doc: "an ES module of FILE and what it imports", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "app", args: "FILE [NAME] OUT.js", doc: "a script running the app NAME (lib/dom.hf) in a page", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "node", args: "FILE [NAME] OUT.mjs", doc: "a Node.js program running NAME, its worlds' providers bundled in", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "explain", args: "FILE", doc: "the elaboration trace", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "type-at", args: "FILE OFFSET...", doc: "what the name at each OFFSET resolved to, and its type, a line each", files: ".hf", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "fmt", args: "[--check] FILE...", doc: "format FILEs in place (--check: only say which are not formatted)", files: ".hf", flags: { $: "Cons", a: [{ flag: "check", doc: "only say which are not formatted" }, { $: "Nil", a: [] }] } }, { $: "Cons", a: [{ name: "lsp", args: "", doc: "a language server, on stdin/stdout", files: "", flags: { $: "Nil", a: [] } }, { $: "Cons", a: [{ name: "completions", args: "fish", doc: "a completion script for the shell", files: "", flags: { $: "Nil", a: [] } }, { $: "Nil", a: [] }] }] }] }] }] }] }] }] }] }] }] }] }] };
 
 const usageLine = (c) => "  " + (c.name + (() => {
   const s = c.args === "" ? $T : $F;
@@ -139682,18 +144603,8 @@ const compiler_main_program = (io, sys, disk, rep, wire) => {
                                               }
                                               case "Cons": {
                                                 const off = it22.a[0];
-                                                const it222 = it22.a[1];
-                                                switch (it222.$) {
-                                                  case "Nil": {
-                                                    return typeAtCmd(file, off, io, sys, disk, rep, wire)(hd)(k);
-                                                  }
-                                                  case "Cons": {
-                                                    const x1 = it222.a[0];
-                                                    const x2 = it222.a[1];
-                                                    return co_bind(plus(plus(plus(plus(stdio, _process), fs), report), rpc), printErr(plus(plus(plus(plus(stdio, _process), fs), report), rpc), io, usage()), (x3) => exit(plus(plus(plus(plus(stdio, _process), fs), report), rpc), sys, 1n), hd, k);
-                                                  }
-                                                }
-                                                return $nomatch(it222);
+                                                const offs = it22.a[1];
+                                                return typeAtCmd(file, { $: "Cons", a: [off, offs] }, io, sys, disk, rep, wire)(hd)(k);
                                               }
                                             }
                                             return $nomatch(it22);

@@ -261,7 +261,12 @@ patAt c r = case nthC r.pats c of
 -- | the match compiler, knotted with its arms
 type CK =
   { compile :
-        List String -> Pm.Span -> List String -> List Clause -> Either Err Ntn
+        List String
+        -> List String
+        -> Pm.Span
+        -> List String
+        -> List Clause
+        -> Either Err Ntn
   }
 
 findTagLit : List Pat -> Int -> Maybe Int
@@ -274,23 +279,29 @@ nubTagRows Nil = Nil
 nubTagRows (Cons t rest) =
   Cons t (nubTagRows (filter (\(u : TagRow) -> not (strEq t.tag u.tag)) rest))
 
+-- | (`bound`: every variable the match has bound so far, those taken
+-- | apart too -- an equation further down may still mean one of them,
+-- | so no field takes its name)
 armSubName : List String
            -> List String
            -> String
            -> Int
            -> Maybe String
            -> String
-armSubName used vars v i (Just x) =
-  if not (strEq x "_") && not (elemBy strEq x vars) then x
-  else fresh (appendC used vars) (v ++ showInt (i + 1))
-armSubName used vars v i Nothing =
-  fresh (appendC used vars) (v ++ showInt (i + 1))
+armSubName used bound v i (Just x) =
+  if not (strEq x "_") && not (elemBy strEq x bound) then x
+  else fresh (appendC used bound) (v ++ showInt (i + 1))
+armSubName used bound v i Nothing =
+  fresh (appendC used bound) (v ++ showInt (i + 1))
 
 -- | the fields' names: those the first equation of the tag uses
 armSub : List String -> List String -> TagRow -> String -> Int -> String
-armSub used vars t v i = case nthC t.pats i of
-  Just p -> armSubName used vars v i (varOf p)
-  Nothing -> fresh (appendC used vars) (v ++ showInt (i + 1))
+armSub used bound t v i = case nthC t.pats i of
+  Just p -> armSubName used bound v i (varOf p)
+  Nothing -> fresh (appendC used bound) (v ++ showInt (i + 1))
+
+armFields : List String -> List String -> TagRow -> String -> List String
+armFields used bound t v = map (\i -> armSub used bound t v i) (upTo t.arity)
 
 badArity : Int -> TagRow -> Clause -> Bool
 badArity c t row = case patAt c row of
@@ -327,6 +338,7 @@ armSpecializeV c t ys v r = case patAt c r of
 
 armOf : CK
       -> List String
+      -> List String
       -> Pm.Span
       -> List String
       -> List Clause
@@ -334,30 +346,23 @@ armOf : CK
       -> String
       -> TagRow
       -> Either Err Ntn
-armOf r used sp vars rows c v t = do
+armOf r used bound sp vars rows c v t = do
   arityCheck sp rows c t
   body <-
     r.compile
       used
+      (appendC (armFields used bound t v) bound)
       sp
-      (spliceAt c (map (\i -> armSub used vars t v i) (upTo t.arity)) vars)
+      (spliceAt c (armFields used bound t v) vars)
       (catMaybesC
          (map
-            (\row ->
-               armSpecializeV
-                 c
-                 t
-                 (map (\i -> armSub used vars t v i) (upTo t.arity))
-                 v
-                 row)
+            (\row -> armSpecializeV c t (armFields used bound t v) v row)
             rows))
   pure
       (Infix
          (group
             (NTag t.tag t.span)
-            (map
-               (\y -> Ident y sp)
-               (map (\i -> armSub used vars t v i) (upTo t.arity))))
+            (map (\y -> Ident y sp) (armFields used bound t v)))
          (Keyword "=>" sp)
          body)
 
@@ -410,16 +415,18 @@ varAt vars c = case nthC vars c of
 -- | a column of literals: equal to the first equation's, or not
 literalOf : CK
           -> List String
+          -> List String
           -> Pm.Span
           -> List String
           -> List Clause
           -> Int
           -> Ntn
           -> Either Err Ntn
-literalOf r used sp vars rows c l = do
+literalOf r used bound sp vars rows c l = do
   litChecks sp vars rows c l
-  yesB <- r.compile used sp (dropAt c vars) (litYes c l (varAt vars c) rows)
-  noB <- r.compile used sp vars (litNo c l rows)
+  yesB <-
+    r.compile used bound sp (dropAt c vars) (litYes c l (varAt vars c) rows)
+  noB <- r.compile used bound sp vars (litNo c l rows)
   pure
       (NBlock
          "match"
@@ -452,17 +459,19 @@ bindPair e (MkPair v p) = bindVar v p e
 
 defaultOf : CK
           -> List String
+          -> List String
           -> Pm.Span
           -> List String
           -> List Clause
           -> Int
           -> List Clause
           -> Either Err (List Ntn)
-defaultOf r used sp vars rows c Nil = Right Nil
-defaultOf r used sp vars rows c rest = do
+defaultOf r used bound sp vars rows c Nil = Right Nil
+defaultOf r used bound sp vars rows c rest = do
   b <-
     r.compile
       used
+      bound
       sp
       (dropAt c vars)
       (map
@@ -476,15 +485,17 @@ defaultOf r used sp vars rows c rest = do
 -- | rows whose column `c` is a variable go on in every other case
 defaultArm : CK
            -> List String
+           -> List String
            -> Pm.Span
            -> List String
            -> List Clause
            -> Int
            -> Either Err (List Ntn)
-defaultArm r used sp vars rows c =
+defaultArm r used bound sp vars rows c =
   defaultOf
     r
     used
+    bound
     sp
     vars
     rows
@@ -493,30 +504,33 @@ defaultArm r used sp vars rows c =
 
 compileAt : CK
           -> List String
+          -> List String
           -> Pm.Span
           -> List String
           -> List Clause
           -> Int
           -> Pat
           -> Either Err Ntn
-compileAt r used sp vars rows c (PLit l) = literalOf r used sp vars rows c l
-compileAt r used sp vars rows c p = do
+compileAt r used bound sp vars rows c (PLit l) =
+  literalOf r used bound sp vars rows c l
+compileAt r used bound sp vars rows c p = do
   noLitHere sp c rows
   arms <-
     traverseC
-      (\t -> armOf r used sp vars rows c (varAt vars c) t)
+      (\t -> armOf r used bound sp vars rows c (varAt vars c) t)
       (nubTagRows (catMaybesC (map (\row -> tagOf (patAt c row)) rows)))
-  dflt <- defaultArm r used sp vars rows c
+  dflt <- defaultArm r used bound sp vars rows c
   pure (NBlock "match" (Just (Ident (varAt vars c) sp)) (appendC arms dflt) sp)
 
 -- | the match tree for `rows` over the variables `vars`, column by column
 compileF : CK
          -> List String
+         -> List String
          -> Pm.Span
          -> List String
          -> List Clause
          -> Either Err Ntn
-compileF r used sp vars rows = case rows of
+compileF r used bound sp vars rows = case rows of
   -- unreachable: a missing tag is the match's error
   Nil -> Right (Keyword "abandon" sp)
   Cons row rest -> case findTagLit (clausePats row) 0 of
@@ -527,10 +541,11 @@ compileF r used sp vars rows = case rows of
            (\e vp -> bindPair e vp)
            (clauseRhs row)
            (zipC vars (clausePats row)))
-    Just c -> compileAt r used sp vars rows c (patAt c row)
+    Just c -> compileAt r used bound sp vars rows c (patAt c row)
 
 ck : CK
-ck = { compile = \used sp vars rows -> compileF ck used sp vars rows }
+ck =
+  { compile = \used bound sp vars rows -> compileF ck used bound sp vars rows }
 
 rowVar : Clause -> Int -> Maybe String
 rowVar r i = case nthC r.pats i of
@@ -568,6 +583,7 @@ desugarBody f params sp rows arity used = do
   body <-
     ck.compile
       used
+      (map (\i -> colName used params rows i) (upTo arity))
       sp
       (map (\i -> colName used params rows i) (upTo arity))
       rows
@@ -639,7 +655,7 @@ caseAlt n =
 
 caseTreeOf : Pm.Span -> List Clause -> String -> Either Err CaseTree
 caseTreeOf sp rows x = do
-  tree <- ck.compile (Cons x Nil) sp (Cons x Nil) rows
+  tree <- ck.compile [x] [x] sp [x] rows
   pure { scrutinee = x, tree = tree }
 
 caseTree : Pm.Span -> List Ntn -> Either Err CaseTree
