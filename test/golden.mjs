@@ -24,13 +24,22 @@ const filesIn = (dirs) => dirs.flatMap((d) =>
 
 const said = (r) => `${r.stdout}--stderr--\n${r.stderr}--exit ${r.status}\n`;
 
+// (the lexer's keywords, `Int` and `Type` among them: no names)
+const keywords = new Set(
+  readFileSync(join(root, "compiler", "fmt", "lex.hf"), "utf8")
+    .match(/^keywords =\n((?:  .*\n)+)/m)[1].match(/"[^"]+"/g).map((k) => k.slice(1, -1)));
+
 // type-at: the starts of some names of the file (every one of a stride,
-// eight at most), the file's start, and an offset that is no number
+// eight at most; not in a comment, a string or an import), the file's
+// start, and an offset that is no number
 const offsetsIn = (f) => {
-  const src = readFileSync(join(root, f), "utf8");
+  // (a string's words are no names: blanked, its length kept)
+  const src = readFileSync(join(root, f), "utf8").replace(/"(?:[^"\\\n]|\\.)*"/g, (s) => " ".repeat(s.length));
   const starts = [];
-  for (const m of src.matchAll(/(?<![A-Za-z0-9_'])[A-Za-z_][A-Za-z0-9_']*/g))
-    if (!/^--/.test(src.slice(src.lastIndexOf("\n", m.index) + 1, m.index).trimStart())) starts.push(m.index);
+  for (const m of src.matchAll(/(?<![A-Za-z0-9_'])[A-Za-z_][A-Za-z0-9_']*/g)) {
+    const before = src.slice(src.lastIndexOf("\n", m.index) + 1, m.index).trimStart();
+    if (!keywords.has(m[0]) && !/^--/.test(before) && !/^import\b/.test(before)) starts.push(m.index);
+  }
   const stride = Math.max(1, Math.floor(starts.length / 8));
   return [...starts.filter((_, i) => i % stride === 0).slice(0, 8).map((o) => String(o + 1)), "0", "nope"];
 };
