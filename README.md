@@ -25,7 +25,8 @@ npm link          # puts `heff` on the PATH
 
 heff is written in heff (`compiler/`).  `boot/heff.mjs` is a compiled
 copy of the compiler; the build (`npm run build`) uses it to compile the
-compiler into `output/heff.mjs`, which is `heff`.
+compiler into `output/heff.mjs`, which is `heff` (minified; the
+compiler's own output is `output/heff.raw.mjs`).
 
 `editors/vscode` is a VS Code extension for the language server.
 
