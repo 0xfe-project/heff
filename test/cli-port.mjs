@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const bin = join(root, "output", "heff-selfcheck.mjs");
-const heff = (...args) => spawnSync("node", ["--stack-size=60000", join(root, "bin", "heff.mjs"), ...args], { cwd: root, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
+const heff = (...args) => spawnSync("node", ["--stack-size=60000", join(root, "bin", "reference.mjs"), ...args], { cwd: root, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
 const portIn = (cwd, ...args) => spawnSync("node", [join(root, "test", "run-worker.mjs"), bin, ...args], { cwd, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
 
 if (!existsSync(bin)) { console.log("FAIL cli-port: no output/heff-selfcheck.mjs (run test/self-check.mjs first)"); process.exit(1); }
@@ -48,7 +48,7 @@ for (const [mode, f] of [["node", "test/node/echo.hf"], ["node", "compiler/main.
   compared++;
   const rout = join(tmp, "r.mjs"), pout = join(tmp, "p.mjs");
   const r = heff(mode, resolve(root, f), rout);
-  const p = portIn(root, mode, pout, f);
+  const p = portIn(root, mode, f, pout);
   if (p.status !== r.status) { fail(`${mode} ${f} exit (reference ${r.status}, port ${p.status})`, p.stderr.split("\n").slice(0, 3).join("\n")); continue; }
   if (r.status !== 0) continue;
   const a = readFileSync(rout, "utf8"), b = readFileSync(pout, "utf8");
@@ -115,7 +115,7 @@ for (const [mode, f] of [["node", "test/node/echo.hf"], ["node", "compiler/main.
     compared++;
     const rdir = mk(`fmt-ref-${check}`), pdir = mk(`fmt-port-${check}`);
     const args = [...(check ? ["--check"] : []), ...Object.keys(cases)];
-    const r = spawnSync("node", ["--stack-size=60000", join(root, "bin", "heff.mjs"), "fmt", ...args], { cwd: rdir, encoding: "utf8" });
+    const r = spawnSync("node", ["--stack-size=60000", join(root, "bin", "reference.mjs"), "fmt", ...args], { cwd: rdir, encoding: "utf8" });
     const p = portIn(pdir, "fmt", ...args);
     const what = `fmt${check ? " --check" : ""}`;
     if (p.status !== r.status) { fail(`${what} exit (reference ${r.status}, port ${p.status})`, p.stderr.split("\n").slice(0, 3).join("\n")); continue; }

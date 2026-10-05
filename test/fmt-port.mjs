@@ -9,10 +9,10 @@ import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-// the CLI compiles output/heff-fmt.mjs when it is stale (bin/heff.mjs);
+// the CLI compiles output/heff-fmt.mjs when it is stale (bin/reference.mjs);
 // have it do so, and hold that artifact -- the one `heff fmt` runs -- to
 // the reference
-const c = spawnSync("node", [join(root, "bin", "heff.mjs"), "fmt", "--check", join(root, "lib", "doc.hf")], { cwd: root, encoding: "utf8" });
+const c = spawnSync("node", [join(root, "bin", "reference.mjs"), "fmt", "--check", join(root, "lib", "doc.hf")], { cwd: root, encoding: "utf8" });
 if (c.status !== 0) { console.log("fmt port: heff fmt could not run\n" + c.stdout + c.stderr); process.exit(1); }
 
 const lay = (await import(pathToFileURL(join(root, "output", "heff-fmt.mjs")))).default;

@@ -1,11 +1,11 @@
 -- The compiler, run: a Node.js program (`heff node compiler/main.hf
--- main OUT.mjs`).  Given file paths in dependency order, it reads them,
--- elaborates them with its own reader and elaborator, and prints every
--- definition's stored core exactly as the reference's `dump-nbe` does
--- -- so the two compilers can be held to the same text, file by file,
--- by `test/self-check.mjs`.  As `node NAME OUT.mjs FILE`, it loads
--- FILE's import closure itself and compiles the computation NAME to a
--- Node.js program, with its own backend.
+-- main OUT.mjs`), the one `bin/heff.mjs` runs for the commands of
+-- `usage` it has (the rest are the reference's still).  `dump-core
+-- FILE...` reads the files given in dependency order, elaborates them
+-- with its own reader and elaborator, and prints every definition's
+-- stored core exactly as the reference's `dump-nbe` does -- so the two
+-- compilers can be held to the same text, file by file, by
+-- `test/self-check.mjs`.
 
 import co
 import compiler.cache as Ca
@@ -15,6 +15,7 @@ import compiler.effect as Ef
 import compiler.emit as Em
 import compiler.format as Fm
 import compiler.load as L
+import compiler.report as Rp
 import compiler.toplevel as T
 import fs
 import map as Mp
@@ -23,7 +24,7 @@ import process
 import stdio
 
 world : HFunctor
-world = stdio <+> process <+> fs
+world = stdio <+> process <+> fs <+> Rp.report
 
 -- the program asks for its worlds' evidence: every computation of it is
 -- a `Heff`, whose operations find the evidence in scope -- given once,
@@ -32,7 +33,21 @@ type Heff a =
   {{io : stdio <: world}}
   -> {{sys : process <: world}}
   -> {{disk : fs <: world}}
+  -> {{rep : Rp.report <: world}}
   -> Co world a
+
+-- | where the standard library is: `HEFF_LIB` (the host sets it, beside
+-- | itself), else the working directory's `lib/`
+libDir : Heff String
+libDir = do
+  v <- getEnv "HEFF_LIB"
+  pure (fromMaybe "lib" v)
+
+-- | FILE and its import closure, loaded from FILE's project
+load : String -> Heff L.Loaded
+load file = do
+  lib <- libDir
+  L.loadProgram lib file
 
 readAll : List String -> Heff (List Dr.Source)
 readAll Nil = pure Nil
@@ -45,7 +60,10 @@ readAll (Cons path rest) = do
       pure Nil
     Just src -> do
       more <- readAll rest
-      pure (Cons { module = L.moduleOf path, path = path, source = src } more)
+      pure
+          (Cons
+             { module = L.moduleOf L.here path, path = path, source = src }
+             more)
 
 printLines : List String -> Heff Unit
 printLines Nil = pure MkUnit
@@ -102,31 +120,28 @@ nubStrM : List String -> List String
 nubStrM xs = nubStrGo Nil xs
 
 -- the provider of a module, M.provider.js beside M.hf: read as the
--- module itself is found (under the root, else lib/, else
--- node_modules/)
+-- module itself is found (under the root, else the library, else the
+-- root's node_modules/)
 providerPathOf : String -> String
 providerPathOf m = L.dropHf (L.importPath m) ++ ".provider.js"
 
-readProviderAt : String -> Heff (Maybe Em.Provider)
-readProviderAt m = do
-  a <- readFile (providerPathOf m)
-  case a of
-    Just t -> pure (Just { module = m, text = t })
-    Nothing -> do
-      b <- readFile ("lib/" ++ providerPathOf m)
-      case b of
-        Just t -> pure (Just { module = m, text = t })
-        Nothing -> do
-          mc <- readFile ("node_modules/" ++ providerPathOf m)
-          case mc of
-            Just t -> pure (Just { module = m, text = t })
-            Nothing -> pure Nothing
+readProviderAt : L.Paths -> String -> Heff (Maybe Em.Provider)
+readProviderAt ps m = do
+  found <-
+    L.readFound
+      [ L.under ps.root (providerPathOf m)
+      , L.under ps.lib (providerPathOf m)
+      , L.under ps.root ("node_modules/" ++ providerPathOf m)
+      ]
+  pure (case found of
+    Just f -> Just { module = m, text = f.source }
+    Nothing -> Nothing)
 
-readProviders : List String -> Heff (List Em.Provider)
-readProviders Nil = pure Nil
-readProviders (Cons m rest) = do
-  p <- readProviderAt m
-  ps <- readProviders rest
+readProviders : L.Paths -> List String -> Heff (List Em.Provider)
+readProviders paths Nil = pure Nil
+readProviders paths (Cons m rest) = do
+  p <- readProviderAt paths m
+  ps <- readProviders paths rest
   pure (case p of
     Just pr -> Cons pr ps
     Nothing -> ps)
@@ -158,12 +173,15 @@ emitErrs (Cons e rest) = do
 -- spans are wanted.
 type CacheAcc = { done : List Dr.Checked, hashes : Mp.Map String String }
 
-cachePath : String -> String
-cachePath m = ".heff/" ++ m ++ ".hc"
+cacheDir : String -> String
+cacheDir root = L.under root ".heff"
 
-thawTry : Dr.Source -> CacheAcc -> Heff (Maybe Dr.Thawed)
-thawTry s acc = do
-  mtxt <- readFile (cachePath s.module)
+cachePath : String -> String -> String
+cachePath root m = cacheDir root ++ "/" ++ m ++ ".hc"
+
+thawTry : String -> Dr.Source -> CacheAcc -> Heff (Maybe Dr.Thawed)
+thawTry root s acc = do
+  mtxt <- readFile (cachePath root s.module)
   pure (case mtxt of
     Just txt -> Ca.melt acc.hashes acc.done s txt
     Nothing -> Nothing)
@@ -177,27 +195,27 @@ cacheKeep acc c =
 cacheStep : CacheAcc -> Dr.Source -> Maybe Dr.Thawed -> CacheAcc
 cacheStep acc s th = cacheKeep acc (Dr.elabNext acc.done s th)
 
-cachedGo : List Dr.Source -> CacheAcc -> Heff CacheAcc
-cachedGo Nil acc = pure acc
-cachedGo (Cons s Nil) acc = pure (cacheStep acc s Nothing)
-cachedGo (Cons s rest) acc = do
-  th <- thawTry s acc
-  cachedGo rest (cacheStep acc s th)
+cachedGo : String -> List Dr.Source -> CacheAcc -> Heff CacheAcc
+cachedGo root Nil acc = pure acc
+cachedGo root (Cons s Nil) acc = pure (cacheStep acc s Nothing)
+cachedGo root (Cons s rest) acc = do
+  th <- thawTry root s acc
+  cachedGo root rest (cacheStep acc s th)
 
-freezeOne : CacheAcc -> Pair Dr.Source Dr.Checked -> Heff Unit
-freezeOne acc (MkPair s c) =
+freezeOne : String -> CacheAcc -> Pair Dr.Source Dr.Checked -> Heff Unit
+freezeOne root acc (MkPair s c) =
   if c.cached || not (null c.diags) then pure MkUnit
   else case Ca.freeze acc.hashes acc.done s c of
     Just out -> do
-      ok <- writeFile (cachePath c.module) out
+      ok <- writeFile (cachePath root c.module) out
       pure MkUnit
     Nothing -> pure MkUnit
 
-freezeAll : CacheAcc -> List (Pair Dr.Source Dr.Checked) -> Heff Unit
-freezeAll acc Nil = pure MkUnit
-freezeAll acc (Cons p rest) = do
-  freezeOne acc p
-  freezeAll acc rest
+freezeAll : String -> CacheAcc -> List (Pair Dr.Source Dr.Checked) -> Heff Unit
+freezeAll root acc Nil = pure MkUnit
+freezeAll root acc (Cons p rest) = do
+  freezeOne root acc p
+  freezeAll root acc rest
 
 zipSC : List Dr.Source -> List Dr.Checked -> List (Pair Dr.Source Dr.Checked)
 zipSC (Cons s ss) (Cons c cs) = Cons (MkPair s c) (zipSC ss cs)
@@ -205,11 +223,11 @@ zipSC _ _ = Nil
 
 -- | the program, each module elaborated or thawed, the fresh clean
 -- | ones frozen back
-cachedProgram : List Dr.Source -> Heff (List Dr.Checked)
-cachedProgram sources = do
-  acc <- cachedGo sources { done = Nil, hashes = Mp.empty }
-  ok <- mkDir ".heff"
-  freezeAll acc (zipSC sources acc.done)
+cachedProgram : L.Loaded -> Heff (List Dr.Checked)
+cachedProgram l = do
+  acc <- cachedGo l.paths.root l.sources { done = Nil, hashes = Mp.empty }
+  ok <- mkDir (cacheDir l.paths.root)
+  freezeAll l.paths.root acc (zipSC l.sources acc.done)
   pure acc.done
 
 putFileDiags : List Dr.Checked -> Heff Unit
@@ -256,24 +274,27 @@ compileFound file name outPath how c available = case Dr.findRunnable
 
 -- (a computation whose effects all have providers for this host: each
 -- world's algebra is bundled in from its module's M.provider.js)
-compileLast : String
+compileLast : L.Paths
+            -> String
             -> String
             -> Maybe String
             -> String
             -> String
             -> List Dr.Checked
             -> Heff Unit
-compileLast host file name outPath how cs = case Dr.lastChecked cs of
+compileLast paths host file name outPath how cs = case Dr.lastChecked cs of
   Nothing -> do
     printErr "no files given"
     exit 1
   Just c -> do
     found <-
       readProviders
+        paths
         (nubStrM (map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
     compileFound file name outPath how c (filter (\p -> forHost host p) found)
 
-compileDiags : String
+compileDiags : L.Paths
+             -> String
              -> String
              -> Maybe String
              -> String
@@ -281,18 +302,18 @@ compileDiags : String
              -> Bool
              -> List Dr.Checked
              -> Heff Unit
-compileDiags host file name outPath how badL cs = do
+compileDiags paths host file name outPath how badL cs = do
   putFileDiags cs
-  if badL then exit 1 else compileLast host file name outPath how cs
+  if badL then exit 1 else compileLast paths host file name outPath how cs
 
 -- | compile the computation `name` of FILE to a program of `host`:
 -- | FILE's import closure loaded with the compiler's own loader
 compileCmd : String -> Maybe String -> String -> String -> String -> Heff Unit
 compileCmd host name outPath how file = do
-  l <- L.loadProgram file
+  l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
-  compileDiags host file name outPath how (badL > 0) cs
+  cs <- cachedProgram l
+  compileDiags l.paths host file name outPath how (badL > 0) cs
 
 nodeCmd : Maybe String -> String -> String -> Heff Unit
 nodeCmd name outPath file =
@@ -335,9 +356,9 @@ compileJsDiags file outPath badL cs = do
 -- | an ES module of FILE and what it imports
 compileJsCmd : String -> String -> Heff Unit
 compileJsCmd file outPath = do
-  l <- L.loadProgram file
+  l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
+  cs <- cachedProgram l
   compileJsDiags file outPath (badL > 0) cs
 
 printEvals : List Dr.Evaluated -> Heff Unit
@@ -358,9 +379,9 @@ evalDiags badL cs = do
 -- | print what each definition of FILE evaluates to
 evalCmd : String -> Heff Unit
 evalCmd file = do
-  l <- L.loadProgram file
+  l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
+  cs <- cachedProgram l
   evalDiags (badL > 0) cs
 
 promoteDiags : String -> Bool -> List Dr.Checked -> Heff Unit
@@ -377,9 +398,9 @@ promoteDiags file badL cs = do
 -- | write each watch's value under it as its expectation
 promoteCmd : String -> Heff Unit
 promoteCmd file = do
-  l <- L.loadProgram file
+  l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
+  cs <- cachedProgram l
   promoteDiags file (badL > 0) cs
 
 printWatchVals : List Dr.WatchInfo -> Heff Unit
@@ -402,15 +423,15 @@ runChecked badL cs = do
 -- | print what each watch (`-- >>> e`) of FILE evaluates to
 runCmd : String -> Heff Unit
 runCmd file = do
-  l <- L.loadProgram file
+  l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
+  cs <- cachedProgram l
   runChecked badL cs
 
 type TestRes = { total : Int, failed : Int, ok : Bool }
 
-failLine : String -> Dr.TestReport -> String
-failLine f r =
+failLine : String -> Dr.TestReport -> Rp.Mismatch -> String
+failLine f r m =
   "FAIL "
   ++ f
   ++ (case r.owner of
@@ -419,22 +440,28 @@ failLine f r =
   ++ ": "
   ++ r.watch.expr
   ++ "\n  expected "
-  ++ fromMaybe "" r.watch.expected
+  ++ m.expected
   ++ "\n  but got  "
-  ++ r.watch.value
+  ++ m.got
+  ++ "\n  diff     "
+  ++ m.diff
 
-printFails : String -> List Dr.TestReport -> Heff Unit
-printFails f Nil = pure MkUnit
-printFails f (Cons r rest) = do
-  print (failLine f r)
-  printFails f rest
+-- (each expectation that does not hold, and what differs, in colour on
+-- a terminal)
+printFails : String -> Bool -> List Dr.TestReport -> Heff Unit
+printFails f color Nil = pure MkUnit
+printFails f color (Cons r rest) = do
+  m <- Rp.mismatch color (fromMaybe "" r.watch.expected) r.watch.value
+  print (failLine f r m)
+  printFails f color rest
 
 badReports : List Dr.TestReport -> List Dr.TestReport
 badReports rs = filter (\(r : Dr.TestReport) -> not r.watch.holds) rs
 
 testReport : String -> Int -> List Dr.TestReport -> Heff TestRes
 testReport f bad ts = do
-  printFails f (badReports ts)
+  color <- Rp.useColor
+  printFails f color (badReports ts)
   print
       ((if null (badReports ts) && bad == 0 then "ok    " else "FAIL  ")
        ++ f
@@ -455,9 +482,9 @@ testOneC f bad0 cs = do
 
 testOneF : String -> Heff TestRes
 testOneF f = do
-  l <- L.loadProgram f
+  l <- load f
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
+  cs <- cachedProgram l
   testOneC f badL cs
 
 -- | check the watches' expectations of every file given
@@ -482,9 +509,9 @@ checkLast badLoad cs = do
 -- | elaborate FILE and what it imports; print its interface
 checkCmd : String -> Heff Unit
 checkCmd file = do
-  l <- L.loadProgram file
+  l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- cachedProgram l.sources
+  cs <- cachedProgram l
   checkLast (badL > 0) cs
 
 -- | a flag of a command, and what it does
@@ -671,12 +698,12 @@ program : Heff Unit
 program = do
   as <- args
   case as of
-    Cons "node" (Cons name (Cons outPath (Cons file Nil))) ->
+    Cons "node" (Cons file (Cons name (Cons outPath Nil))) ->
       nodeCmd (Just name) outPath file
-    Cons "node" (Cons outPath (Cons file Nil)) -> nodeCmd Nothing outPath file
-    Cons "app" (Cons name (Cons outPath (Cons file Nil))) ->
+    Cons "node" (Cons file (Cons outPath Nil)) -> nodeCmd Nothing outPath file
+    Cons "app" (Cons file (Cons name (Cons outPath Nil))) ->
       appCmd (Just name) outPath file
-    Cons "app" (Cons outPath (Cons file Nil)) -> appCmd Nothing outPath file
+    Cons "app" (Cons file (Cons outPath Nil)) -> appCmd Nothing outPath file
     Cons "compile-js" (Cons file (Cons outPath Nil)) ->
       compileJsCmd file outPath
     Cons "check" (Cons file Nil) -> checkCmd file
@@ -699,6 +726,7 @@ program = do
 main : Co world Unit
 main =
   program
-    (io := \p -> InL (InL p))
-    (sys := \p -> InL (InR p))
-    (disk := \p -> InR p)
+    (io := \p -> InL (InL (InL p)))
+    (sys := \p -> InL (InL (InR p)))
+    (disk := \p -> InL (InR p))
+    (rep := \p -> InR p)

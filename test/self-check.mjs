@@ -11,7 +11,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const heff = (...args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
+const heff = (...args) => spawnSync("node", [join(root, "bin", "reference.mjs"), ...args], { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
 
 const files = [
   "lib/prelude.hf", "lib/array.hf", "lib/map.hf", "lib/co.hf",
@@ -31,7 +31,8 @@ const files = [
   "compiler/effect.hf", "compiler/lower.hf", "compiler/emit.hf",
   "compiler/interp.hf", "compiler/diagnostic.hf",
   "compiler/driver.hf", "compiler/serial.hf", "compiler/cache.hf",
-  "compiler/load.hf", "compiler/format.hf", "compiler/main.hf",
+  "compiler/load.hf", "compiler/format.hf", "compiler/report.hf",
+  "compiler/main.hf",
 ];
 
 let failed = 0;

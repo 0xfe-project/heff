@@ -12,7 +12,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const heff = (...args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { cwd: root, encoding: "utf8" });
+const heff = (...args) => spawnSync("node", [join(root, "bin", "reference.mjs"), ...args], { cwd: root, encoding: "utf8" });
 
 let failed = 0, defs = 0;
 const corpus = readdirSync(join(root, "test", "nbe")).filter((f) => f.endsWith(".hf"));

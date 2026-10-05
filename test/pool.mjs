@@ -26,7 +26,7 @@ export const run = (cmd, args, { cwd = root, timeout = 600000 } = {}) =>
 
 // | the reference compiler, and the self-hosted one (on a worker's big
 // | stack: its interpreter has no stack chunking)
-export const heff = (args, opts) => run("node", ["--stack-size=60000", join(root, "bin", "heff.mjs"), ...args], opts);
+export const heff = (args, opts) => run("node", ["--stack-size=60000", join(root, "bin", "reference.mjs"), ...args], opts);
 export const port = (args, opts) => run("node", [join(root, "test", "run-worker.mjs"), bin, ...args], opts);
 
 // | `fn` over `items`, `n` at once; the answers in the items' order
