@@ -24,7 +24,7 @@ npm run build
 npm link          # puts `heff` on the PATH
 ```
 
-heff is written in heff (`compiler/`, `fmt/`).  `boot/heff.mjs` is a
+heff is written in heff (`compiler/`).  `boot/heff.mjs` is a
 compiled copy of the compiler; `npm run build` uses it to compile the
 compiler into `output/heff.mjs`.
 

@@ -96066,7 +96066,7 @@ const allNameC = (s$, i$) => {
   }
 };
 
-const fmt_imports_isAlias = (x) => {
+const compiler_fmt_imports_isAlias = (x) => {
   const a = BigInt(x.length);
   const s = 0n < a ? $T : $F;
   switch (s.$) {
@@ -96159,8 +96159,8 @@ const spacesOf = (n$) => {
   }
 };
 
-const fmt_imports_blankOne = (s, imp) => $strSlice(s, 0n, imp.span.start) + (spacesOf(imp.span.end - imp.span.start) + $strSlice(s, imp.span.end, BigInt(s.length)));
-const fmt_imports_blankOne$c = (s) => (imp) => fmt_imports_blankOne(s, imp);
+const compiler_fmt_imports_blankOne = (s, imp) => $strSlice(s, 0n, imp.span.start) + (spacesOf(imp.span.end - imp.span.start) + $strSlice(s, imp.span.end, BigInt(s.length)));
+const compiler_fmt_imports_blankOne$c = (s) => (imp) => compiler_fmt_imports_blankOne(s, imp);
 
 const importWords = (rest) => filter((w) => {
   const a = BigInt(w.length);
@@ -96243,7 +96243,7 @@ const oneImport = (i, e, ws) => {
                         })();
                         switch (s1.$) {
                           case "True": {
-                            return fmt_imports_isAlias(a);
+                            return compiler_fmt_imports_isAlias(a);
                           }
                           case "False": {
                             return { $: "False", a: [] };
@@ -96653,7 +96653,7 @@ const attach = (src, toks, comments1) => {
   return { toks: $arrayFromList(foldl((acc) => (x) => ({ $: "Cons", a: [x, acc] }), { $: "Nil", a: [] }, r.toks)), env: { src: src, lead: r.lead, inline: r.inline, trail: r.trail, noLead: -1n, noTrail: -1n } };
 };
 
-const fmt_cst_bind = (p, f, st) => {
+const compiler_fmt_cst_bind = (p, f, st) => {
   const x1 = p(st);
   switch (x1.$) {
     case "Left": {
@@ -96674,11 +96674,11 @@ const fmt_cst_bind = (p, f, st) => {
   }
   return $nomatch(x1);
 };
-const fmt_cst_bind$c = (p) => (f) => (st) => fmt_cst_bind(p, f, st);
+const compiler_fmt_cst_bind$c = (p) => (f) => (st) => compiler_fmt_cst_bind(p, f, st);
 
 const eofT = { kind: "eof", text: "", raw: "", start: 0n, end: 0n, col: 0n, first: { $: "True", a: [] }, ix: -1n, blank: { $: "False", a: [] } };
 
-const fmt_cst_peek = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, (() => {
+const compiler_fmt_cst_peek = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, (() => {
   const ts = st.toks;
   const i = st.i;
   const s = (() => {
@@ -96731,7 +96731,7 @@ const peekAt = (k, st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, (() => {
 })()] }] });
 const peekAt$c = (k) => (st) => peekAt(k, st);
 
-const fmt_cst_next = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [(() => {
+const compiler_fmt_cst_next = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [(() => {
   const i = st.i + 1n;
   return { toks: st.toks, i: i, stack: st.stack, start: st.start };
 })(), (() => {
@@ -96887,7 +96887,7 @@ const boundaryT = (st, t) => {
   return $nomatch(s);
 };
 
-const fmt_cst_atBoundary = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, boundaryT(st, (() => {
+const compiler_fmt_cst_atBoundary = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, boundaryT(st, (() => {
   const ts = st.toks;
   const i = st.i;
   const s = (() => {
@@ -96913,7 +96913,7 @@ const fmt_cst_atBoundary = (st) => ({ $: "Right", a: [{ $: "MkRes", a: [st, boun
   return $nomatch(s);
 })())] }] });
 
-const fmt_cst_blockGo = (one, col, acc, st) => {
+const compiler_fmt_cst_blockGo = (one, col, acc, st) => {
   const x1 = one({ toks: st.toks, i: st.i, stack: st.stack, start: st.i });
   switch (x1.$) {
     case "Left": {
@@ -96926,7 +96926,7 @@ const fmt_cst_blockGo = (one, col, acc, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          return fmt_cst_bind(fmt_cst_peek, (t) => {
+          return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t) => {
             const x12 = t.kind === "eof" ? $T : $F;
             const s = (() => {
               const s = (() => {
@@ -96961,7 +96961,7 @@ const fmt_cst_blockGo = (one, col, acc, st) => {
             })();
             switch (s.$) {
               case "True": {
-                return fmt_cst_blockGo$c(one)(col)({ $: "Cons", a: [x, acc] });
+                return compiler_fmt_cst_blockGo$c(one)(col)({ $: "Cons", a: [x, acc] });
               }
               case "False": {
                 const x2 = foldl((acc1) => (x2) => ({ $: "Cons", a: [x2, acc1] }), { $: "Nil", a: [] }, { $: "Cons", a: [x, acc] });
@@ -96977,9 +96977,9 @@ const fmt_cst_blockGo = (one, col, acc, st) => {
   }
   return $nomatch(x1);
 };
-const fmt_cst_blockGo$c = (one) => (col) => (acc) => (st) => fmt_cst_blockGo(one, col, acc, st);
+const compiler_fmt_cst_blockGo$c = (one) => (col) => (acc) => (st) => compiler_fmt_cst_blockGo(one, col, acc, st);
 
-const fmt_cst_block = (one) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
+const compiler_fmt_cst_block = (one) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => (st) => {
   const s = (() => {
     const s = t.kind === "eof" ? $T : $F;
     switch (s.$) {
@@ -97032,7 +97032,7 @@ const fmt_cst_block = (one) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
       return { $: "Left", a: [msg] };
     }
     case "False": {
-      const p = fmt_cst_blockGo$c(one)(t.col)({ $: "Nil", a: [] });
+      const p = compiler_fmt_cst_blockGo$c(one)(t.col)({ $: "Nil", a: [] });
       const x1 = p({ toks: st.toks, i: st.i, stack: { $: "Cons", a: [t.col, st.stack] }, start: st.start });
       switch (x1.$) {
         case "Left": {
@@ -97078,7 +97078,7 @@ const fmt_cst_block = (one) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
   return $nomatch(s);
 });
 
-const fmt_cst_inBrackets = (p, st) => {
+const compiler_fmt_cst_inBrackets = (p, st) => {
   const x1 = p({ toks: st.toks, i: st.i, stack: { $: "Cons", a: [-1n, st.stack] }, start: st.start });
   switch (x1.$) {
     case "Left": {
@@ -97120,10 +97120,10 @@ const fmt_cst_inBrackets = (p, st) => {
   }
   return $nomatch(x1);
 };
-const fmt_cst_inBrackets$c = (p) => (st) => fmt_cst_inBrackets(p, st);
+const compiler_fmt_cst_inBrackets$c = (p) => (st) => compiler_fmt_cst_inBrackets(p, st);
 
-const fmt_cst_manyGo = (p, acc, st) => {
-  const x1 = fmt_cst_atBoundary(st);
+const compiler_fmt_cst_manyGo = (p, acc, st) => {
+  const x1 = compiler_fmt_cst_atBoundary(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -97135,7 +97135,7 @@ const fmt_cst_manyGo = (p, acc, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          return fmt_cst_bind(fmt_cst_peek, (t) => {
+          return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t) => {
             const s = (() => {
               switch (x.$) {
                 case "True": {
@@ -97204,7 +97204,7 @@ const fmt_cst_manyGo = (p, acc, st) => {
                         case "MkRes": {
                           const st3 = x111.a[0];
                           const x2 = x111.a[1];
-                          return fmt_cst_manyGo(p, { $: "Cons", a: [x2, acc] }, st3);
+                          return compiler_fmt_cst_manyGo(p, { $: "Cons", a: [x2, acc] }, st3);
                         }
                       }
                       return $nomatch(x111);
@@ -97223,7 +97223,7 @@ const fmt_cst_manyGo = (p, acc, st) => {
   }
   return $nomatch(x1);
 };
-const fmt_cst_manyGo$c = (p) => (acc) => (st) => fmt_cst_manyGo(p, acc, st);
+const compiler_fmt_cst_manyGo$c = (p) => (acc) => (st) => compiler_fmt_cst_manyGo(p, acc, st);
 
 const many1 = (p, st) => {
   const x1 = p(st);
@@ -97238,7 +97238,7 @@ const many1 = (p, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p1 = fmt_cst_manyGo$c(p)({ $: "Nil", a: [] });
+          const p1 = compiler_fmt_cst_manyGo$c(p)({ $: "Nil", a: [] });
           const x12 = p1(st1);
           switch (x12.$) {
             case "Left": {
@@ -97267,12 +97267,12 @@ const many1 = (p, st) => {
 };
 const many1$c = (p) => (st) => many1(p, st);
 
-const fmt_cst_sepGo = (sep, p, items1, seps) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_sepGo = (sep, p, items1, seps) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.text === sep ? $T : $F;
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -97296,7 +97296,7 @@ const fmt_cst_sepGo = (sep, p, items1, seps) => fmt_cst_bind$c(fmt_cst_peek)((t)
                       case "MkRes": {
                         const st2 = x111.a[0];
                         const x2 = x111.a[1];
-                        return fmt_cst_sepGo(sep, p, { $: "Cons", a: [x2, items1] }, { $: "Cons", a: [x, seps] })(st2);
+                        return compiler_fmt_cst_sepGo(sep, p, { $: "Cons", a: [x2, items1] }, { $: "Cons", a: [x, seps] })(st2);
                       }
                     }
                     return $nomatch(x111);
@@ -97319,7 +97319,7 @@ const fmt_cst_sepGo = (sep, p, items1, seps) => fmt_cst_bind$c(fmt_cst_peek)((t)
   return $nomatch(s);
 });
 
-const fmt_cst_expectAnn = $lazy(() => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_expectAnn = $lazy(() => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.kind === "sym" ? $T : $F;
     switch (s.$) {
@@ -97334,7 +97334,7 @@ const fmt_cst_expectAnn = $lazy(() => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   })();
   switch (s.$) {
     case "True": {
-      return fmt_cst_next;
+      return compiler_fmt_cst_next;
     }
     case "False": {
       const msg = "the file does not parse (at `" + (t.raw + ("`, offset " + (t.start.toString() + ")")));
@@ -97344,7 +97344,7 @@ const fmt_cst_expectAnn = $lazy(() => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 }));
 
-const fmt_cst_expectSym = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_expectSym = (x) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.kind === "sym" ? $T : $F;
     switch (s.$) {
@@ -97359,7 +97359,7 @@ const fmt_cst_expectSym = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   })();
   switch (s.$) {
     case "True": {
-      return fmt_cst_next;
+      return compiler_fmt_cst_next;
     }
     case "False": {
       const msg = "the file does not parse (at `" + (t.raw + ("`, offset " + (t.start.toString() + ")")));
@@ -97369,7 +97369,7 @@ const fmt_cst_expectSym = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_expectPunct = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_expectPunct = (x) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.kind === "punct" ? $T : $F;
     switch (s.$) {
@@ -97384,7 +97384,7 @@ const fmt_cst_expectPunct = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   })();
   switch (s.$) {
     case "True": {
-      return fmt_cst_next;
+      return compiler_fmt_cst_next;
     }
     case "False": {
       const msg = "the file does not parse (at `" + (t.raw + ("`, offset " + (t.start.toString() + ")")));
@@ -97394,7 +97394,7 @@ const fmt_cst_expectPunct = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_expectKw = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_expectKw = (x) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.kind === "kw" ? $T : $F;
     switch (s.$) {
@@ -97409,7 +97409,7 @@ const fmt_cst_expectKw = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   })();
   switch (s.$) {
     case "True": {
-      return fmt_cst_next;
+      return compiler_fmt_cst_next;
     }
     case "False": {
       const msg = "the file does not parse (at `" + (t.raw + ("`, offset " + (t.start.toString() + ")")));
@@ -97419,11 +97419,11 @@ const fmt_cst_expectKw = (x) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_expectKind = (k) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_expectKind = (k) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.kind === k ? $T : $F;
   switch (s.$) {
     case "True": {
-      return fmt_cst_next;
+      return compiler_fmt_cst_next;
     }
     case "False": {
       const msg = "the file does not parse (at `" + (t.raw + ("`, offset " + (t.start.toString() + ")")));
@@ -97441,7 +97441,7 @@ const nextN = (n) => {
     }
     case "False": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -98236,7 +98236,7 @@ const dataLast = (name, params, universe, x4) => {
   return $nomatch(x4);
 };
 
-const fmt_cst_lastD = (x1) => {
+const compiler_fmt_cst_lastD = (x1) => {
   switch (x1.$) {
     case "DImport": {
       const t = x1.a[0];
@@ -98360,7 +98360,7 @@ const fmt_cst_lastD = (x1) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_binderF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.kind === "var" ? $T : $F;
     switch (s.$) {
@@ -98376,7 +98376,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -98413,7 +98413,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
       switch (s1.$) {
         case "True": {
           return (st) => {
-            const x1 = fmt_cst_next(st);
+            const x1 = compiler_fmt_cst_next(st);
             switch (x1.$) {
               case "Left": {
                 const e = x1.a[0];
@@ -98425,7 +98425,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                   case "MkRes": {
                     const st1 = x11.a[0];
                     const x = x11.a[1];
-                    return fmt_cst_bind(fmt_cst_peek, (x2) => {
+                    return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (x2) => {
                       const x12 = (() => {
                         const s2 = x2.kind === "var" ? $T : $F;
                         switch (s2.$) {
@@ -98456,7 +98456,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                         }
                         case "False": {
                           return (st2) => {
-                            const x13 = fmt_cst_next(st2);
+                            const x13 = compiler_fmt_cst_next(st2);
                             switch (x13.$) {
                               case "Left": {
                                 const e = x13.a[0];
@@ -98468,7 +98468,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                                   case "MkRes": {
                                     const st3 = x111.a[0];
                                     const x3 = x111.a[1];
-                                    const p = fmt_cst_expectPunct("}");
+                                    const p = compiler_fmt_cst_expectPunct("}");
                                     const x14 = p(st3);
                                     switch (x14.$) {
                                       case "Left": {
@@ -98523,7 +98523,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
           switch (s2.$) {
             case "True": {
               return (st) => {
-                const x1 = fmt_cst_next(st);
+                const x1 = compiler_fmt_cst_next(st);
                 switch (x1.$) {
                   case "Left": {
                     const e = x1.a[0];
@@ -98535,7 +98535,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                       case "MkRes": {
                         const st1 = x11.a[0];
                         const x = x11.a[1];
-                        return fmt_cst_inBrackets(fmt_cst_bind$c(fmt_cst_peek)((x2) => {
+                        return compiler_fmt_cst_inBrackets(compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((x2) => {
                           const x12 = (() => {
                             const s3 = x2.kind === "var" ? $T : $F;
                             switch (s3.$) {
@@ -98566,7 +98566,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                             }
                             case "False": {
                               return (st2) => {
-                                const x13 = fmt_cst_next(st2);
+                                const x13 = compiler_fmt_cst_next(st2);
                                 switch (x13.$) {
                                   case "Left": {
                                     const e = x13.a[0];
@@ -98578,7 +98578,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                                       case "MkRes": {
                                         const st3 = x111.a[0];
                                         const x3 = x111.a[1];
-                                        const p = fmt_cst_expectAnn();
+                                        const p = compiler_fmt_cst_expectAnn();
                                         const x14 = p(st3);
                                         switch (x14.$) {
                                           case "Left": {
@@ -98603,7 +98603,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                                                       case "MkRes": {
                                                         const st5 = x113.a[0];
                                                         const x5 = x113.a[1];
-                                                        const p1 = fmt_cst_expectPunct(")");
+                                                        const p1 = compiler_fmt_cst_expectPunct(")");
                                                         const x16 = p1(st5);
                                                         switch (x16.$) {
                                                           case "Left": {
@@ -98668,7 +98668,7 @@ const fmt_cst_binderF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_exprF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_exprF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const p = (() => {
     const s = (() => {
       const s = t.text === "\\" ? $T : $F;
@@ -98765,8 +98765,8 @@ const fmt_cst_exprF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
           case "MkRes": {
             const st1 = x11.a[0];
             const x = x11.a[1];
-            return fmt_cst_bind(fmt_cst_peek, (t2) => (st2) => {
-              const x12 = fmt_cst_atBoundary(st2);
+            return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t2) => (st2) => {
+              const x12 = compiler_fmt_cst_atBoundary(st2);
               switch (x12.$) {
                 case "Left": {
                   const e = x12.a[0];
@@ -98809,7 +98809,7 @@ const fmt_cst_exprF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                       })();
                       switch (s.$) {
                         case "True": {
-                          const x13 = fmt_cst_next(st3);
+                          const x13 = compiler_fmt_cst_next(st3);
                           switch (x13.$) {
                             case "Left": {
                               const e = x13.a[0];
@@ -98868,8 +98868,8 @@ const fmt_cst_exprF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   };
 });
 
-const fmt_cst_opLoopF = (g, minPrec, lhs) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
-  const x1 = fmt_cst_atBoundary(st);
+const compiler_fmt_cst_opLoopF = (g, minPrec, lhs) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => (st) => {
+  const x1 = compiler_fmt_cst_atBoundary(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -98983,7 +98983,7 @@ const fmt_cst_opLoopF = (g, minPrec, lhs) => fmt_cst_bind$c(fmt_cst_peek)((t) =>
           })();
           switch (s.$) {
             case "True": {
-              const x12 = fmt_cst_next(st1);
+              const x12 = compiler_fmt_cst_next(st1);
               switch (x12.$) {
                 case "Left": {
                   const e = x12.a[0];
@@ -99106,7 +99106,7 @@ const fmt_cst_opLoopF = (g, minPrec, lhs) => fmt_cst_bind$c(fmt_cst_peek)((t) =>
   return $nomatch(x1);
 });
 
-const fmt_cst_arrowRhsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_arrowRhsF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.text === "\\" ? $T : $F;
     switch (s.$) {
@@ -99179,7 +99179,7 @@ const fmt_cst_arrowRhsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_userOpsF = (g, st) => {
+const compiler_fmt_cst_userOpsF = (g, st) => {
   const x1 = g.app(st);
   switch (x1.$) {
     case "Left": {
@@ -99243,8 +99243,8 @@ const fmt_cst_userOpsF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_operandsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
-  const x1 = fmt_cst_atBoundary(st);
+const compiler_fmt_cst_operandsF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => (st) => {
+  const x1 = compiler_fmt_cst_atBoundary(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -99298,7 +99298,7 @@ const fmt_cst_operandsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
           })();
           switch (s.$) {
             case "True": {
-              const x12 = fmt_cst_next(st1);
+              const x12 = compiler_fmt_cst_next(st1);
               switch (x12.$) {
                 case "Left": {
                   const e = x12.a[0];
@@ -99310,7 +99310,7 @@ const fmt_cst_operandsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                     case "MkRes": {
                       const st2 = x111.a[0];
                       const x2 = x111.a[1];
-                      return fmt_cst_bind(fmt_cst_peek, (u) => {
+                      return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (u) => {
                         const s1 = (() => {
                           const s1 = u.text === "\\" ? $T : $F;
                           switch (s1.$) {
@@ -99460,7 +99460,7 @@ const fmt_cst_operandsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
   return $nomatch(x1);
 });
 
-const fmt_cst_appF = (g, st) => {
+const compiler_fmt_cst_appF = (g, st) => {
   const x1 = g.atom(st);
   switch (x1.$) {
     case "Left": {
@@ -99473,7 +99473,7 @@ const fmt_cst_appF = (g, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p = fmt_cst_manyGo$c(g.atom)({ $: "Nil", a: [] });
+          const p = compiler_fmt_cst_manyGo$c(g.atom)({ $: "Nil", a: [] });
           const x12 = p(st1);
           switch (x12.$) {
             case "Left": {
@@ -99525,8 +99525,8 @@ const fmt_cst_appF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
-  const x1 = fmt_cst_atBoundary(st);
+const compiler_fmt_cst_atomF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => (st) => {
+  const x1 = compiler_fmt_cst_atBoundary(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -99580,7 +99580,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                 switch (s1.$) {
                   case "True": {
                     return (st2) => {
-                      const x12 = fmt_cst_next(st2);
+                      const x12 = compiler_fmt_cst_next(st2);
                       switch (x12.$) {
                         case "Left": {
                           const e = x12.a[0];
@@ -99592,7 +99592,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                             case "MkRes": {
                               const st3 = x111.a[0];
                               const x2 = x111.a[1];
-                              const p = fmt_cst_expectPunct("{");
+                              const p = compiler_fmt_cst_expectPunct("{");
                               const x13 = p(st3);
                               switch (x13.$) {
                                 case "Left": {
@@ -99605,7 +99605,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                     case "MkRes": {
                                       const st4 = x112.a[0];
                                       const x3 = x112.a[1];
-                                      return fmt_cst_inBrackets((() => {
+                                      return compiler_fmt_cst_inBrackets((() => {
                                         const p1 = (() => {
                                           const p1 = g.con;
                                           return (st5) => {
@@ -99621,7 +99621,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                                   case "MkRes": {
                                                     const st6 = x113.a[0];
                                                     const x4 = x113.a[1];
-                                                    return fmt_cst_sepGo("|", p1, { $: "Cons", a: [x4, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st6);
+                                                    return compiler_fmt_cst_sepGo("|", p1, { $: "Cons", a: [x4, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st6);
                                                   }
                                                 }
                                                 return $nomatch(x113);
@@ -99643,7 +99643,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                                 case "MkRes": {
                                                   const st6 = x113.a[0];
                                                   const x4 = x113.a[1];
-                                                  const p2 = fmt_cst_expectPunct("}");
+                                                  const p2 = compiler_fmt_cst_expectPunct("}");
                                                   const x15 = p2(st6);
                                                   switch (x15.$) {
                                                     case "Left": {
@@ -99745,7 +99745,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                             switch (s4.$) {
                               case "True": {
                                 return (st2) => {
-                                  const x12 = fmt_cst_next(st2);
+                                  const x12 = compiler_fmt_cst_next(st2);
                                   switch (x12.$) {
                                     case "Left": {
                                       const e = x12.a[0];
@@ -99757,12 +99757,12 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                         case "MkRes": {
                                           const st3 = x111.a[0];
                                           const x2 = x111.a[1];
-                                          return fmt_cst_inBrackets(fmt_cst_bind$c(fmt_cst_peek)((t2) => {
+                                          return compiler_fmt_cst_inBrackets(compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t2) => {
                                             const s5 = t2.text === "]" ? $T : $F;
                                             switch (s5.$) {
                                               case "True": {
                                                 return (st4) => {
-                                                  const x13 = fmt_cst_next(st4);
+                                                  const x13 = compiler_fmt_cst_next(st4);
                                                   switch (x13.$) {
                                                     case "Left": {
                                                       const e = x13.a[0];
@@ -99809,7 +99809,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                                                 case "MkRes": {
                                                                   const st6 = x113.a[0];
                                                                   const x4 = x113.a[1];
-                                                                  const p = fmt_cst_expectPunct("]");
+                                                                  const p = compiler_fmt_cst_expectPunct("]");
                                                                   const x15 = p(st6);
                                                                   switch (x15.$) {
                                                                     case "Left": {
@@ -99857,7 +99857,7 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                               }
                               case "False": {
                                 return (st2) => {
-                                  const x12 = fmt_cst_next(st2);
+                                  const x12 = compiler_fmt_cst_next(st2);
                                   switch (x12.$) {
                                     case "Left": {
                                       const e = x12.a[0];
@@ -99920,12 +99920,12 @@ const fmt_cst_atomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
   return $nomatch(x1);
 });
 
-const fieldsOfF = (g, e) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const fieldsOfF = (g, e) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.kind === "field" ? $T : $F;
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e1 = x1.a[0];
@@ -99953,8 +99953,8 @@ const fieldsOfF = (g, e) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_parensF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+const compiler_fmt_cst_parensF = (g, st) => {
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -99966,7 +99966,7 @@ const fmt_cst_parensF = (g, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          return fmt_cst_inBrackets(fmt_cst_bind$c(fmt_cst_peek)((t) => {
+          return compiler_fmt_cst_inBrackets(compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
             const p = peekAt$c(1n);
             return (st2) => {
               const x12 = p(st2);
@@ -100015,7 +100015,7 @@ const fmt_cst_parensF = (g, st) => {
                       })();
                       switch (s.$) {
                         case "True": {
-                          const x13 = fmt_cst_next(st3);
+                          const x13 = compiler_fmt_cst_next(st3);
                           switch (x13.$) {
                             case "Left": {
                               const e = x13.a[0];
@@ -100027,7 +100027,7 @@ const fmt_cst_parensF = (g, st) => {
                                 case "MkRes": {
                                   const st4 = x112.a[0];
                                   const x3 = x112.a[1];
-                                  const x14 = fmt_cst_next(st4);
+                                  const x14 = compiler_fmt_cst_next(st4);
                                   switch (x14.$) {
                                     case "Left": {
                                       const e = x14.a[0];
@@ -100088,7 +100088,7 @@ const fmt_cst_parensF = (g, st) => {
                           })();
                           switch (s1.$) {
                             case "True": {
-                              const x13 = fmt_cst_next(st3);
+                              const x13 = compiler_fmt_cst_next(st3);
                               switch (x13.$) {
                                 case "Left": {
                                   const e = x13.a[0];
@@ -100100,7 +100100,7 @@ const fmt_cst_parensF = (g, st) => {
                                     case "MkRes": {
                                       const st4 = x112.a[0];
                                       const x3 = x112.a[1];
-                                      const x14 = fmt_cst_next(st4);
+                                      const x14 = compiler_fmt_cst_next(st4);
                                       switch (x14.$) {
                                         case "Left": {
                                           const e = x14.a[0];
@@ -100124,7 +100124,7 @@ const fmt_cst_parensF = (g, st) => {
                                                     case "MkRes": {
                                                       const st6 = x114.a[0];
                                                       const x5 = x114.a[1];
-                                                      const p1 = fmt_cst_expectPunct(")");
+                                                      const p1 = compiler_fmt_cst_expectPunct(")");
                                                       const x16 = p1(st6);
                                                       switch (x16.$) {
                                                         case "Left": {
@@ -100176,7 +100176,7 @@ const fmt_cst_parensF = (g, st) => {
                                     case "MkRes": {
                                       const st4 = x112.a[0];
                                       const x3 = x112.a[1];
-                                      return fmt_cst_bind(fmt_cst_peek, (t3) => {
+                                      return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t3) => {
                                         const s2 = t3.text === "," ? $T : $F;
                                         switch (s2.$) {
                                           case "True": {
@@ -100193,7 +100193,7 @@ const fmt_cst_parensF = (g, st) => {
                                                     case "MkRes": {
                                                       const st6 = x113.a[0];
                                                       const x4 = x113.a[1];
-                                                      const p1 = fmt_cst_expectPunct(")");
+                                                      const p1 = compiler_fmt_cst_expectPunct(")");
                                                       const x15 = p1(st6);
                                                       switch (x15.$) {
                                                         case "Left": {
@@ -100223,7 +100223,7 @@ const fmt_cst_parensF = (g, st) => {
                                             };
                                           }
                                           case "False": {
-                                            const p1 = fmt_cst_expectPunct(")");
+                                            const p1 = compiler_fmt_cst_expectPunct(")");
                                             return (st5) => {
                                               const x14 = p1(st5);
                                               switch (x14.$) {
@@ -100277,8 +100277,8 @@ const fmt_cst_parensF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_bracesF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+const compiler_fmt_cst_bracesF = (g, st) => {
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -100290,7 +100290,7 @@ const fmt_cst_bracesF = (g, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          return fmt_cst_inBrackets(fmt_cst_bind$c(fmt_cst_peek)((t) => {
+          return compiler_fmt_cst_inBrackets(compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
             const p = peekAt$c(1n);
             return (st2) => {
               const x12 = p(st2);
@@ -100319,7 +100319,7 @@ const fmt_cst_bracesF = (g, st) => {
                       })();
                       switch (s.$) {
                         case "True": {
-                          const x13 = fmt_cst_next(st3);
+                          const x13 = compiler_fmt_cst_next(st3);
                           switch (x13.$) {
                             case "Left": {
                               const e = x13.a[0];
@@ -100331,7 +100331,7 @@ const fmt_cst_bracesF = (g, st) => {
                                 case "MkRes": {
                                   const st4 = x112.a[0];
                                   const x3 = x112.a[1];
-                                  const p1 = fmt_cst_inBrackets$c(g.expr);
+                                  const p1 = compiler_fmt_cst_inBrackets$c(g.expr);
                                   const x14 = p1(st4);
                                   switch (x14.$) {
                                     case "Left": {
@@ -100344,7 +100344,7 @@ const fmt_cst_bracesF = (g, st) => {
                                         case "MkRes": {
                                           const st5 = x113.a[0];
                                           const x4 = x113.a[1];
-                                          const p2 = fmt_cst_expectPunct("}");
+                                          const p2 = compiler_fmt_cst_expectPunct("}");
                                           const x15 = p2(st5);
                                           switch (x15.$) {
                                             case "Left": {
@@ -100357,7 +100357,7 @@ const fmt_cst_bracesF = (g, st) => {
                                                 case "MkRes": {
                                                   const st6 = x114.a[0];
                                                   const x5 = x114.a[1];
-                                                  const p3 = fmt_cst_expectPunct("}");
+                                                  const p3 = compiler_fmt_cst_expectPunct("}");
                                                   const x16 = p3(st6);
                                                   switch (x16.$) {
                                                     case "Left": {
@@ -100400,7 +100400,7 @@ const fmt_cst_bracesF = (g, st) => {
                           const s1 = t.text === "}" ? $T : $F;
                           switch (s1.$) {
                             case "True": {
-                              const x13 = fmt_cst_next(st3);
+                              const x13 = compiler_fmt_cst_next(st3);
                               switch (x13.$) {
                                 case "Left": {
                                   const e = x13.a[0];
@@ -100426,7 +100426,7 @@ const fmt_cst_bracesF = (g, st) => {
                                 switch (s2.$) {
                                   case "True": {
                                     const p1 = (st4) => {
-                                      const x13 = fmt_cst_next(st4);
+                                      const x13 = compiler_fmt_cst_next(st4);
                                       switch (x13.$) {
                                         case "Left": {
                                           const e = x13.a[0];
@@ -100438,7 +100438,7 @@ const fmt_cst_bracesF = (g, st) => {
                                             case "MkRes": {
                                               const st5 = x112.a[0];
                                               const x3 = x112.a[1];
-                                              const p1 = fmt_cst_expectSym("=");
+                                              const p1 = compiler_fmt_cst_expectSym("=");
                                               const x14 = p1(st5);
                                               switch (x14.$) {
                                                 case "Left": {
@@ -100496,7 +100496,7 @@ const fmt_cst_bracesF = (g, st) => {
                                             case "MkRes": {
                                               const st5 = x112.a[0];
                                               const x3 = x112.a[1];
-                                              return fmt_cst_sepGo(",", p1, { $: "Cons", a: [x3, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st5);
+                                              return compiler_fmt_cst_sepGo(",", p1, { $: "Cons", a: [x3, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st5);
                                             }
                                           }
                                           return $nomatch(x112);
@@ -100520,7 +100520,7 @@ const fmt_cst_bracesF = (g, st) => {
                                             case "MkRes": {
                                               const st5 = x112.a[0];
                                               const x3 = x112.a[1];
-                                              return fmt_cst_sepGo(",", p1, { $: "Cons", a: [x3, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st5);
+                                              return compiler_fmt_cst_sepGo(",", p1, { $: "Cons", a: [x3, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st5);
                                             }
                                           }
                                           return $nomatch(x112);
@@ -100544,7 +100544,7 @@ const fmt_cst_bracesF = (g, st) => {
                                     case "MkRes": {
                                       const st4 = x112.a[0];
                                       const x3 = x112.a[1];
-                                      const p2 = fmt_cst_expectPunct("}");
+                                      const p2 = compiler_fmt_cst_expectPunct("}");
                                       const x14 = p2(st4);
                                       switch (x14.$) {
                                         case "Left": {
@@ -100602,8 +100602,8 @@ const fmt_cst_bracesF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_lambdaF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+const compiler_fmt_cst_lambdaF = (g, st) => {
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -100628,7 +100628,7 @@ const fmt_cst_lambdaF = (g, st) => {
                 case "MkRes": {
                   const st2 = x111.a[0];
                   const x2 = x111.a[1];
-                  const p1 = fmt_cst_expectSym("->");
+                  const p1 = compiler_fmt_cst_expectSym("->");
                   const x13 = p1(st2);
                   switch (x13.$) {
                     case "Left": {
@@ -100680,8 +100680,8 @@ const fmt_cst_lambdaF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_caseExprF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+const compiler_fmt_cst_caseExprF = (g, st) => {
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -100705,7 +100705,7 @@ const fmt_cst_caseExprF = (g, st) => {
                 case "MkRes": {
                   const st2 = x111.a[0];
                   const x2 = x111.a[1];
-                  const p = fmt_cst_expectKw("of");
+                  const p = compiler_fmt_cst_expectKw("of");
                   const x13 = p(st2);
                   switch (x13.$) {
                     case "Left": {
@@ -100718,7 +100718,7 @@ const fmt_cst_caseExprF = (g, st) => {
                         case "MkRes": {
                           const st3 = x112.a[0];
                           const x3 = x112.a[1];
-                          const p1 = fmt_cst_block(g.alt);
+                          const p1 = compiler_fmt_cst_block(g.alt);
                           const x14 = p1(st3);
                           switch (x14.$) {
                             case "Left": {
@@ -100758,8 +100758,8 @@ const fmt_cst_caseExprF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_ifExprF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+const compiler_fmt_cst_ifExprF = (g, st) => {
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -100783,7 +100783,7 @@ const fmt_cst_ifExprF = (g, st) => {
                 case "MkRes": {
                   const st2 = x111.a[0];
                   const x2 = x111.a[1];
-                  const p = fmt_cst_expectKw("then");
+                  const p = compiler_fmt_cst_expectKw("then");
                   const x13 = p(st2);
                   switch (x13.$) {
                     case "Left": {
@@ -100808,7 +100808,7 @@ const fmt_cst_ifExprF = (g, st) => {
                                 case "MkRes": {
                                   const st4 = x113.a[0];
                                   const x4 = x113.a[1];
-                                  const p1 = fmt_cst_expectKw("else");
+                                  const p1 = compiler_fmt_cst_expectKw("else");
                                   const x15 = p1(st4);
                                   switch (x15.$) {
                                     case "Left": {
@@ -100872,8 +100872,8 @@ const fmt_cst_ifExprF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_doExprF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+const compiler_fmt_cst_doExprF = (g, st) => {
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -100885,7 +100885,7 @@ const fmt_cst_doExprF = (g, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p = fmt_cst_block(g.stmt);
+          const p = compiler_fmt_cst_block(g.stmt);
           const x12 = p(st1);
           switch (x12.$) {
             case "Left": {
@@ -100913,7 +100913,7 @@ const fmt_cst_doExprF = (g, st) => {
   return $nomatch(x1);
 };
 
-const stmtF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const stmtF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const p = peekAt$c(1n);
   return (st) => {
     const x1 = p(st);
@@ -100942,7 +100942,7 @@ const stmtF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
             })();
             switch (s.$) {
               case "True": {
-                const x12 = fmt_cst_next(st1);
+                const x12 = compiler_fmt_cst_next(st1);
                 switch (x12.$) {
                   case "Left": {
                     const e = x12.a[0];
@@ -100954,7 +100954,7 @@ const stmtF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
                       case "MkRes": {
                         const st2 = x111.a[0];
                         const x2 = x111.a[1];
-                        const x13 = fmt_cst_next(st2);
+                        const x13 = compiler_fmt_cst_next(st2);
                         switch (x13.$) {
                           case "Left": {
                             const e = x13.a[0];
@@ -101025,7 +101025,7 @@ const altF = (g, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p = fmt_cst_expectSym("->");
+          const p = compiler_fmt_cst_expectSym("->");
           const x12 = p(st1);
           switch (x12.$) {
             case "Left": {
@@ -101071,12 +101071,12 @@ const altF = (g, st) => {
   return $nomatch(x1);
 };
 
-const commaSepEF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const commaSepEF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.text === "," ? $T : $F;
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -101140,7 +101140,7 @@ const commaSepEF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_patHeadF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const compiler_fmt_cst_patHeadF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = (() => {
     const s = t.kind === "con" ? $T : $F;
     switch (s.$) {
@@ -101156,7 +101156,7 @@ const fmt_cst_patHeadF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -101168,7 +101168,7 @@ const fmt_cst_patHeadF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
               case "MkRes": {
                 const st1 = x11.a[0];
                 const x = x11.a[1];
-                const p = fmt_cst_manyGo$c(g.patAtom)({ $: "Nil", a: [] });
+                const p = compiler_fmt_cst_manyGo$c(g.patAtom)({ $: "Nil", a: [] });
                 const x12 = p(st1);
                 switch (x12.$) {
                   case "Left": {
@@ -101203,8 +101203,8 @@ const fmt_cst_patHeadF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_consTailF = (g, l) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
-  const x1 = fmt_cst_atBoundary(st);
+const compiler_fmt_cst_consTailF = (g, l) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => (st) => {
+  const x1 = compiler_fmt_cst_atBoundary(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -101247,7 +101247,7 @@ const fmt_cst_consTailF = (g, l) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => 
           })();
           switch (s.$) {
             case "True": {
-              const x12 = fmt_cst_next(st1);
+              const x12 = compiler_fmt_cst_next(st1);
               switch (x12.$) {
                 case "Left": {
                   const e = x12.a[0];
@@ -101298,12 +101298,12 @@ const fmt_cst_consTailF = (g, l) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => 
   return $nomatch(x1);
 });
 
-const morePatsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const morePatsF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.text === "," ? $T : $F;
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -101367,8 +101367,8 @@ const morePatsF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
-  const x1 = fmt_cst_atBoundary(st);
+const compiler_fmt_cst_patAtomF = (g) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => (st) => {
+  const x1 = compiler_fmt_cst_atBoundary(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -101400,7 +101400,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
               })();
               switch (s.$) {
                 case "True": {
-                  const x12 = fmt_cst_next(st1);
+                  const x12 = compiler_fmt_cst_next(st1);
                   switch (x12.$) {
                     case "Left": {
                       const e = x12.a[0];
@@ -101412,7 +101412,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                         case "MkRes": {
                           const st2 = x111.a[0];
                           const x2 = x111.a[1];
-                          return fmt_cst_inBrackets((st3) => {
+                          return compiler_fmt_cst_inBrackets((st3) => {
                             const x13 = g.pattern(st3);
                             switch (x13.$) {
                               case "Left": {
@@ -101425,7 +101425,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                   case "MkRes": {
                                     const st4 = x112.a[0];
                                     const x3 = x112.a[1];
-                                    const p = fmt_cst_expectPunct(")");
+                                    const p = compiler_fmt_cst_expectPunct(")");
                                     const x14 = p(st4);
                                     switch (x14.$) {
                                       case "Left": {
@@ -101474,7 +101474,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                   })();
                   switch (s1.$) {
                     case "True": {
-                      const x12 = fmt_cst_next(st1);
+                      const x12 = compiler_fmt_cst_next(st1);
                       switch (x12.$) {
                         case "Left": {
                           const e = x12.a[0];
@@ -101486,12 +101486,12 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                             case "MkRes": {
                               const st2 = x111.a[0];
                               const x2 = x111.a[1];
-                              return fmt_cst_inBrackets(fmt_cst_bind$c(fmt_cst_peek)((t2) => {
+                              return compiler_fmt_cst_inBrackets(compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t2) => {
                                 const s2 = t2.text === "]" ? $T : $F;
                                 switch (s2.$) {
                                   case "True": {
                                     return (st3) => {
-                                      const x13 = fmt_cst_next(st3);
+                                      const x13 = compiler_fmt_cst_next(st3);
                                       switch (x13.$) {
                                         case "Left": {
                                           const e = x13.a[0];
@@ -101538,7 +101538,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                                                     case "MkRes": {
                                                       const st5 = x113.a[0];
                                                       const x4 = x113.a[1];
-                                                      const p = fmt_cst_expectPunct("]");
+                                                      const p = compiler_fmt_cst_expectPunct("]");
                                                       const x15 = p(st5);
                                                       switch (x15.$) {
                                                         case "Left": {
@@ -101587,7 +101587,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
                       const s2 = any($strEq$c(t.kind), { $: "Cons", a: ["var", { $: "Cons", a: ["con", { $: "Cons", a: ["tag", { $: "Cons", a: ["int", { $: "Cons", a: ["float", { $: "Cons", a: ["str", { $: "Nil", a: [] }] }] }] }] }] }] });
                       switch (s2.$) {
                         case "True": {
-                          const x12 = fmt_cst_next(st1);
+                          const x12 = compiler_fmt_cst_next(st1);
                           switch (x12.$) {
                             case "Left": {
                               const e = x12.a[0];
@@ -101631,7 +101631,7 @@ const fmt_cst_patAtomF = (g) => fmt_cst_bind$c(fmt_cst_peek)((t) => (st) => {
 });
 
 const conF = (g, st) => {
-  const x1 = fmt_cst_next(st);
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -101643,7 +101643,7 @@ const conF = (g, st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p = fmt_cst_manyGo$c(g.atom)({ $: "Nil", a: [] });
+          const p = compiler_fmt_cst_manyGo$c(g.atom)({ $: "Nil", a: [] });
           const x12 = p(st1);
           switch (x12.$) {
             case "Left": {
@@ -101671,8 +101671,8 @@ const conF = (g, st) => {
   return $nomatch(x1);
 };
 
-const fmt_cst_gram = $lazy(() => ({ expr: (st) => fmt_cst_exprF(fmt_cst_gram())(st), opExpr: (minPrec) => (st) => {
-  const g = fmt_cst_gram();
+const compiler_fmt_cst_gram = $lazy(() => ({ expr: (st) => compiler_fmt_cst_exprF(compiler_fmt_cst_gram())(st), opExpr: (minPrec) => (st) => {
+  const g = compiler_fmt_cst_gram();
   const x1 = g.userOps(st);
   switch (x1.$) {
     case "Left": {
@@ -101692,9 +101692,9 @@ const fmt_cst_gram = $lazy(() => ({ expr: (st) => fmt_cst_exprF(fmt_cst_gram())(
     }
   }
   return $nomatch(x1);
-}, opLoop: (minPrec) => (lhs) => (st) => fmt_cst_opLoopF(fmt_cst_gram(), minPrec, lhs)(st), arrowRhs: (st) => fmt_cst_arrowRhsF(fmt_cst_gram())(st), userOps: (st) => fmt_cst_userOpsF(fmt_cst_gram(), st), operands: (st) => fmt_cst_operandsF(fmt_cst_gram())(st), app: (st) => fmt_cst_appF(fmt_cst_gram(), st), atom: (st) => fmt_cst_atomF(fmt_cst_gram())(st), fieldsOf: (e) => (st) => fieldsOfF(fmt_cst_gram(), e)(st), parens: (st) => fmt_cst_parensF(fmt_cst_gram(), st), braces: (st) => fmt_cst_bracesF(fmt_cst_gram(), st), lambda: (st) => fmt_cst_lambdaF(fmt_cst_gram(), st), caseExpr: (st) => fmt_cst_caseExprF(fmt_cst_gram(), st), ifExpr: (st) => fmt_cst_ifExprF(fmt_cst_gram(), st), doExpr: (st) => fmt_cst_doExprF(fmt_cst_gram(), st), stmt: (st) => stmtF(fmt_cst_gram())(st), alt: (st) => altF(fmt_cst_gram(), st), commaSepE: (st) => commaSepEF(fmt_cst_gram())(st), pattern: (st) => {
-  const g = fmt_cst_gram();
-  const p = fmt_cst_patHeadF(g);
+}, opLoop: (minPrec) => (lhs) => (st) => compiler_fmt_cst_opLoopF(compiler_fmt_cst_gram(), minPrec, lhs)(st), arrowRhs: (st) => compiler_fmt_cst_arrowRhsF(compiler_fmt_cst_gram())(st), userOps: (st) => compiler_fmt_cst_userOpsF(compiler_fmt_cst_gram(), st), operands: (st) => compiler_fmt_cst_operandsF(compiler_fmt_cst_gram())(st), app: (st) => compiler_fmt_cst_appF(compiler_fmt_cst_gram(), st), atom: (st) => compiler_fmt_cst_atomF(compiler_fmt_cst_gram())(st), fieldsOf: (e) => (st) => fieldsOfF(compiler_fmt_cst_gram(), e)(st), parens: (st) => compiler_fmt_cst_parensF(compiler_fmt_cst_gram(), st), braces: (st) => compiler_fmt_cst_bracesF(compiler_fmt_cst_gram(), st), lambda: (st) => compiler_fmt_cst_lambdaF(compiler_fmt_cst_gram(), st), caseExpr: (st) => compiler_fmt_cst_caseExprF(compiler_fmt_cst_gram(), st), ifExpr: (st) => compiler_fmt_cst_ifExprF(compiler_fmt_cst_gram(), st), doExpr: (st) => compiler_fmt_cst_doExprF(compiler_fmt_cst_gram(), st), stmt: (st) => stmtF(compiler_fmt_cst_gram())(st), alt: (st) => altF(compiler_fmt_cst_gram(), st), commaSepE: (st) => commaSepEF(compiler_fmt_cst_gram())(st), pattern: (st) => {
+  const g = compiler_fmt_cst_gram();
+  const p = compiler_fmt_cst_patHeadF(g);
   const x1 = p(st);
   switch (x1.$) {
     case "Left": {
@@ -101707,17 +101707,17 @@ const fmt_cst_gram = $lazy(() => ({ expr: (st) => fmt_cst_exprF(fmt_cst_gram())(
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          return fmt_cst_consTailF(g, x)(st1);
+          return compiler_fmt_cst_consTailF(g, x)(st1);
         }
       }
       return $nomatch(x11);
     }
   }
   return $nomatch(x1);
-}, morePats: (st) => morePatsF(fmt_cst_gram())(st), patAtom: (st) => fmt_cst_patAtomF(fmt_cst_gram())(st), con: (st) => conF(fmt_cst_gram(), st), binder: (st) => fmt_cst_binderF(fmt_cst_gram())(st) }));
+}, morePats: (st) => morePatsF(compiler_fmt_cst_gram())(st), patAtom: (st) => compiler_fmt_cst_patAtomF(compiler_fmt_cst_gram())(st), con: (st) => conF(compiler_fmt_cst_gram(), st), binder: (st) => compiler_fmt_cst_binderF(compiler_fmt_cst_gram())(st) }));
 
 const theoryFieldP = (st) => {
-  const x1 = fmt_cst_next(st);
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -101729,7 +101729,7 @@ const theoryFieldP = (st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p = fmt_cst_expectAnn();
+          const p = compiler_fmt_cst_expectAnn();
           const x12 = p(st1);
           switch (x12.$) {
             case "Left": {
@@ -101742,7 +101742,7 @@ const theoryFieldP = (st) => {
                 case "MkRes": {
                   const st2 = x111.a[0];
                   const x2 = x111.a[1];
-                  const p1 = fmt_cst_gram().expr;
+                  const p1 = compiler_fmt_cst_gram().expr;
                   const x13 = p1(st2);
                   switch (x13.$) {
                     case "Left": {
@@ -101776,7 +101776,7 @@ const theoryFieldP = (st) => {
   return $nomatch(x1);
 };
 
-const fixityRest = (acc) => fmt_cst_bind$c(fmt_cst_peek)((u) => {
+const fixityRest = (acc) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((u) => {
   const s = (() => {
     const s = u.kind === "eof" ? $T : $F;
     switch (s.$) {
@@ -101805,7 +101805,7 @@ const fixityRest = (acc) => fmt_cst_bind$c(fmt_cst_peek)((u) => {
     }
     case "False": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -101831,7 +101831,7 @@ const fixityRest = (acc) => fmt_cst_bind$c(fmt_cst_peek)((u) => {
 });
 
 const dataDeclP = (st) => {
-  const x1 = fmt_cst_next(st);
+  const x1 = compiler_fmt_cst_next(st);
   switch (x1.$) {
     case "Left": {
       const e = x1.a[0];
@@ -101843,7 +101843,7 @@ const dataDeclP = (st) => {
         case "MkRes": {
           const st1 = x11.a[0];
           const x = x11.a[1];
-          const p = fmt_cst_expectKind("con");
+          const p = compiler_fmt_cst_expectKind("con");
           const x12 = p(st1);
           switch (x12.$) {
             case "Left": {
@@ -101857,8 +101857,8 @@ const dataDeclP = (st) => {
                   const st2 = x111.a[0];
                   const x2 = x111.a[1];
                   const p1 = (() => {
-                    const p1 = fmt_cst_gram().atom;
-                    return fmt_cst_manyGo$c(p1)({ $: "Nil", a: [] });
+                    const p1 = compiler_fmt_cst_gram().atom;
+                    return compiler_fmt_cst_manyGo$c(p1)({ $: "Nil", a: [] });
                   })();
                   const x13 = p1(st2);
                   switch (x13.$) {
@@ -101872,7 +101872,7 @@ const dataDeclP = (st) => {
                         case "MkRes": {
                           const st3 = x112.a[0];
                           const x3 = x112.a[1];
-                          return fmt_cst_bind(fmt_cst_peek, (t0) => {
+                          return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t0) => {
                             const p2 = (() => {
                               const s = (() => {
                                 const s = t0.text === ":" ? $T : $F;
@@ -101889,7 +101889,7 @@ const dataDeclP = (st) => {
                               switch (s.$) {
                                 case "True": {
                                   return (st4) => {
-                                    const x14 = fmt_cst_next(st4);
+                                    const x14 = compiler_fmt_cst_next(st4);
                                     switch (x14.$) {
                                       case "Left": {
                                         const e = x14.a[0];
@@ -101901,7 +101901,7 @@ const dataDeclP = (st) => {
                                           case "MkRes": {
                                             const st5 = x113.a[0];
                                             const x4 = x113.a[1];
-                                            const p2 = fmt_cst_gram().app;
+                                            const p2 = compiler_fmt_cst_gram().app;
                                             const x15 = p2(st5);
                                             switch (x15.$) {
                                               case "Left": {
@@ -101948,13 +101948,13 @@ const dataDeclP = (st) => {
                                     case "MkRes": {
                                       const st5 = x113.a[0];
                                       const x4 = x113.a[1];
-                                      return fmt_cst_bind(fmt_cst_peek, (t) => {
+                                      return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t) => {
                                         const p3 = (() => {
                                           const s = t.text === "=" ? $T : $F;
                                           switch (s.$) {
                                             case "True": {
                                               return (st6) => {
-                                                const x15 = fmt_cst_next(st6);
+                                                const x15 = compiler_fmt_cst_next(st6);
                                                 switch (x15.$) {
                                                   case "Left": {
                                                     const e = x15.a[0];
@@ -101967,7 +101967,7 @@ const dataDeclP = (st) => {
                                                         const st7 = x114.a[0];
                                                         const x5 = x114.a[1];
                                                         const p3 = (() => {
-                                                          const p3 = fmt_cst_gram().con;
+                                                          const p3 = compiler_fmt_cst_gram().con;
                                                           return (st8) => {
                                                             const x16 = p3(st8);
                                                             switch (x16.$) {
@@ -101981,7 +101981,7 @@ const dataDeclP = (st) => {
                                                                   case "MkRes": {
                                                                     const st9 = x115.a[0];
                                                                     const x6 = x115.a[1];
-                                                                    return fmt_cst_sepGo("|", p3, { $: "Cons", a: [x6, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st9);
+                                                                    return compiler_fmt_cst_sepGo("|", p3, { $: "Cons", a: [x6, { $: "Nil", a: [] }] }, { $: "Nil", a: [] })(st9);
                                                                   }
                                                                 }
                                                                 return $nomatch(x115);
@@ -102209,12 +102209,12 @@ const declNameP = (t) => {
                                   case "MkRes": {
                                     const st4 = x113.a[0];
                                     const x4 = x113.a[1];
-                                    return fmt_cst_bind(fmt_cst_peek, (u) => {
+                                    return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (u) => {
                                       const s = u.text === ":" ? $T : $F;
                                       switch (s.$) {
                                         case "True": {
                                           return (st5) => {
-                                            const x15 = fmt_cst_next(st5);
+                                            const x15 = compiler_fmt_cst_next(st5);
                                             switch (x15.$) {
                                               case "Left": {
                                                 const e = x15.a[0];
@@ -102226,7 +102226,7 @@ const declNameP = (t) => {
                                                   case "MkRes": {
                                                     const st6 = x114.a[0];
                                                     const x5 = x114.a[1];
-                                                    const p4 = fmt_cst_gram().expr;
+                                                    const p4 = compiler_fmt_cst_gram().expr;
                                                     const x16 = p4(st6);
                                                     switch (x16.$) {
                                                       case "Left": {
@@ -102256,8 +102256,8 @@ const declNameP = (t) => {
                                         }
                                         case "False": {
                                           const p4 = (() => {
-                                            const p4 = fmt_cst_gram().patAtom;
-                                            return fmt_cst_manyGo$c(p4)({ $: "Nil", a: [] });
+                                            const p4 = compiler_fmt_cst_gram().patAtom;
+                                            return compiler_fmt_cst_manyGo$c(p4)({ $: "Nil", a: [] });
                                           })();
                                           return (st5) => {
                                             const x15 = p4(st5);
@@ -102272,7 +102272,7 @@ const declNameP = (t) => {
                                                   case "MkRes": {
                                                     const st6 = x114.a[0];
                                                     const x5 = x114.a[1];
-                                                    const p5 = fmt_cst_expectSym("=");
+                                                    const p5 = compiler_fmt_cst_expectSym("=");
                                                     const x16 = p5(st6);
                                                     switch (x16.$) {
                                                       case "Left": {
@@ -102285,7 +102285,7 @@ const declNameP = (t) => {
                                                           case "MkRes": {
                                                             const st7 = x115.a[0];
                                                             const x6 = x115.a[1];
-                                                            const p6 = fmt_cst_gram().expr;
+                                                            const p6 = compiler_fmt_cst_gram().expr;
                                                             const x17 = p6(st7);
                                                             switch (x17.$) {
                                                               case "Left": {
@@ -102354,7 +102354,7 @@ const declAt = (t) => {
   switch (s.$) {
     case "True": {
       return (st) => {
-        const x1 = fmt_cst_next(st);
+        const x1 = compiler_fmt_cst_next(st);
         switch (x1.$) {
           case "Left": {
             const e = x1.a[0];
@@ -102408,7 +102408,7 @@ const declAt = (t) => {
           switch (s2.$) {
             case "True": {
               return (st) => {
-                const x1 = fmt_cst_next(st);
+                const x1 = compiler_fmt_cst_next(st);
                 switch (x1.$) {
                   case "Left": {
                     const e = x1.a[0];
@@ -102420,7 +102420,7 @@ const declAt = (t) => {
                       case "MkRes": {
                         const st1 = x11.a[0];
                         const x = x11.a[1];
-                        const p = fmt_cst_expectKind("con");
+                        const p = compiler_fmt_cst_expectKind("con");
                         const x12 = p(st1);
                         switch (x12.$) {
                           case "Left": {
@@ -102434,8 +102434,8 @@ const declAt = (t) => {
                                 const st2 = x111.a[0];
                                 const x2 = x111.a[1];
                                 const p1 = (() => {
-                                  const p1 = fmt_cst_gram().atom;
-                                  return fmt_cst_manyGo$c(p1)({ $: "Nil", a: [] });
+                                  const p1 = compiler_fmt_cst_gram().atom;
+                                  return compiler_fmt_cst_manyGo$c(p1)({ $: "Nil", a: [] });
                                 })();
                                 const x13 = p1(st2);
                                 switch (x13.$) {
@@ -102449,7 +102449,7 @@ const declAt = (t) => {
                                       case "MkRes": {
                                         const st3 = x112.a[0];
                                         const x3 = x112.a[1];
-                                        const p2 = fmt_cst_expectSym("=");
+                                        const p2 = compiler_fmt_cst_expectSym("=");
                                         const x14 = p2(st3);
                                         switch (x14.$) {
                                           case "Left": {
@@ -102462,7 +102462,7 @@ const declAt = (t) => {
                                               case "MkRes": {
                                                 const st4 = x113.a[0];
                                                 const x4 = x113.a[1];
-                                                const p3 = fmt_cst_gram().expr;
+                                                const p3 = compiler_fmt_cst_gram().expr;
                                                 const x15 = p3(st4);
                                                 switch (x15.$) {
                                                   case "Left": {
@@ -102524,7 +102524,7 @@ const declAt = (t) => {
               switch (s3.$) {
                 case "True": {
                   return (st) => {
-                    const x1 = fmt_cst_next(st);
+                    const x1 = compiler_fmt_cst_next(st);
                     switch (x1.$) {
                       case "Left": {
                         const e = x1.a[0];
@@ -102536,7 +102536,7 @@ const declAt = (t) => {
                           case "MkRes": {
                             const st1 = x11.a[0];
                             const x = x11.a[1];
-                            const p = fmt_cst_expectKind("con");
+                            const p = compiler_fmt_cst_expectKind("con");
                             const x12 = p(st1);
                             switch (x12.$) {
                               case "Left": {
@@ -102550,8 +102550,8 @@ const declAt = (t) => {
                                     const st2 = x111.a[0];
                                     const x2 = x111.a[1];
                                     const p1 = (() => {
-                                      const p1 = fmt_cst_gram().atom;
-                                      return fmt_cst_manyGo$c(p1)({ $: "Nil", a: [] });
+                                      const p1 = compiler_fmt_cst_gram().atom;
+                                      return compiler_fmt_cst_manyGo$c(p1)({ $: "Nil", a: [] });
                                     })();
                                     const x13 = p1(st2);
                                     switch (x13.$) {
@@ -102565,7 +102565,7 @@ const declAt = (t) => {
                                           case "MkRes": {
                                             const st3 = x112.a[0];
                                             const x3 = x112.a[1];
-                                            const p2 = fmt_cst_expectKw("where");
+                                            const p2 = compiler_fmt_cst_expectKw("where");
                                             const x14 = p2(st3);
                                             switch (x14.$) {
                                               case "Left": {
@@ -102578,7 +102578,7 @@ const declAt = (t) => {
                                                   case "MkRes": {
                                                     const st4 = x113.a[0];
                                                     const x4 = x113.a[1];
-                                                    const p3 = fmt_cst_block(theoryFieldP);
+                                                    const p3 = compiler_fmt_cst_block(theoryFieldP);
                                                     const x15 = p3(st4);
                                                     switch (x15.$) {
                                                       case "Left": {
@@ -102640,7 +102640,7 @@ const declAt = (t) => {
                   switch (s4.$) {
                     case "True": {
                       return (st) => {
-                        const x1 = fmt_cst_next(st);
+                        const x1 = compiler_fmt_cst_next(st);
                         switch (x1.$) {
                           case "Left": {
                             const e = x1.a[0];
@@ -102652,7 +102652,7 @@ const declAt = (t) => {
                               case "MkRes": {
                                 const st1 = x11.a[0];
                                 const x = x11.a[1];
-                                const p = fmt_cst_expectKw("import");
+                                const p = compiler_fmt_cst_expectKw("import");
                                 const x12 = p(st1);
                                 switch (x12.$) {
                                   case "Left": {
@@ -102665,7 +102665,7 @@ const declAt = (t) => {
                                       case "MkRes": {
                                         const st2 = x111.a[0];
                                         const x2 = x111.a[1];
-                                        const p1 = fmt_cst_expectKind("var");
+                                        const p1 = compiler_fmt_cst_expectKind("var");
                                         const x13 = p1(st2);
                                         switch (x13.$) {
                                           case "Left": {
@@ -102678,7 +102678,7 @@ const declAt = (t) => {
                                               case "MkRes": {
                                                 const st3 = x112.a[0];
                                                 const x3 = x112.a[1];
-                                                const p2 = fmt_cst_expectAnn();
+                                                const p2 = compiler_fmt_cst_expectAnn();
                                                 const x14 = p2(st3);
                                                 switch (x14.$) {
                                                   case "Left": {
@@ -102691,7 +102691,7 @@ const declAt = (t) => {
                                                       case "MkRes": {
                                                         const st4 = x113.a[0];
                                                         const x4 = x113.a[1];
-                                                        const p3 = fmt_cst_gram().expr;
+                                                        const p3 = compiler_fmt_cst_gram().expr;
                                                         const x15 = p3(st4);
                                                         switch (x15.$) {
                                                           case "Left": {
@@ -102753,7 +102753,7 @@ const declAt = (t) => {
                       switch (s5.$) {
                         case "True": {
                           return (st) => {
-                            const x1 = fmt_cst_next(st);
+                            const x1 = compiler_fmt_cst_next(st);
                             switch (x1.$) {
                               case "Left": {
                                 const e = x1.a[0];
@@ -102765,7 +102765,7 @@ const declAt = (t) => {
                                   case "MkRes": {
                                     const st1 = x11.a[0];
                                     const x = x11.a[1];
-                                    const p = fmt_cst_expectKind("var");
+                                    const p = compiler_fmt_cst_expectKind("var");
                                     const x12 = p(st1);
                                     switch (x12.$) {
                                       case "Left": {
@@ -102798,7 +102798,7 @@ const declAt = (t) => {
                           switch (s6.$) {
                             case "True": {
                               return (st) => {
-                                const x1 = fmt_cst_next(st);
+                                const x1 = compiler_fmt_cst_next(st);
                                 switch (x1.$) {
                                   case "Left": {
                                     const e = x1.a[0];
@@ -102810,7 +102810,7 @@ const declAt = (t) => {
                                       case "MkRes": {
                                         const st1 = x11.a[0];
                                         const x = x11.a[1];
-                                        const p = fmt_cst_gram().expr;
+                                        const p = compiler_fmt_cst_gram().expr;
                                         const x12 = p(st1);
                                         switch (x12.$) {
                                           case "Left": {
@@ -102894,7 +102894,7 @@ const declAt = (t) => {
                               switch (s7.$) {
                                 case "True": {
                                   return (st) => {
-                                    const x1 = fmt_cst_next(st);
+                                    const x1 = compiler_fmt_cst_next(st);
                                     switch (x1.$) {
                                       case "Left": {
                                         const e = x1.a[0];
@@ -102962,9 +102962,9 @@ const declAt = (t) => {
   return $nomatch(s);
 };
 
-const declP = $lazy(() => fmt_cst_bind$c(fmt_cst_peek)((t) => declAt(t)));
+const declP = $lazy(() => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => declAt(t)));
 
-const declLoop = (acc) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
+const declLoop = (acc) => compiler_fmt_cst_bind$c(compiler_fmt_cst_peek)((t) => {
   const s = t.kind === "eof" ? $T : $F;
   switch (s.$) {
     case "True": {
@@ -102986,7 +102986,7 @@ const declLoop = (acc) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
               case "MkRes": {
                 const st1 = x11.a[0];
                 const x = x11.a[1];
-                return fmt_cst_bind(fmt_cst_peek, (t2) => {
+                return compiler_fmt_cst_bind(compiler_fmt_cst_peek, (t2) => {
                   const s1 = (() => {
                     const s1 = t2.kind === "eof" ? $T : $F;
                     switch (s1.$) {
@@ -103031,7 +103031,7 @@ const declLoop = (acc) => fmt_cst_bind$c(fmt_cst_peek)((t) => {
   return $nomatch(s);
 });
 
-const fmt_cst_program = $lazy(() => declLoop({ $: "Nil", a: [] }));
+const compiler_fmt_cst_program = $lazy(() => declLoop({ $: "Nil", a: [] }));
 
 const blankMark = $lazy(() => $strFromCharCode(1n));
 
@@ -107433,7 +107433,7 @@ const topLevelGo = (env, i, x3) => {
           }
         }
         return $nomatch(s);
-      })(), op_lt_gt(item(env, firstD(d), fmt_cst_lastD(d), (e) => pD(e, d)), topLevelGo(env, op_plus(i)(1n), ds)));
+      })(), op_lt_gt(item(env, firstD(d), compiler_fmt_cst_lastD(d), (e) => pD(e, d)), topLevelGo(env, op_plus(i)(1n), ds)));
     }
   }
   return $nomatch(x3);
@@ -107590,7 +107590,7 @@ const fmtLexed = (src, hdr, l) => {
     case "False": {
       const at1 = attach(src, sortBy(tokLe$c, concatList(map(importTok, hdr.imports), l.tokens)), l.comments);
       return fmtParsed(at1, (() => {
-        const p = fmt_cst_program();
+        const p = compiler_fmt_cst_program();
         const x11 = p({ toks: at1.toks, i: 0n, stack: { $: "Cons", a: [0n, { $: "Nil", a: [] }] }, start: 0n });
         switch (x11.$) {
           case "Left": {
@@ -107619,7 +107619,7 @@ const fmtLexed = (src, hdr, l) => {
 const formatUnchecked = (src) => {
   const hdr = (() => {
     const imps = readGo(src, 0n, { $: "Nil", a: [] });
-    return { imports: imps, text: foldl(fmt_imports_blankOne$c, src, imps) };
+    return { imports: imps, text: foldl(compiler_fmt_imports_blankOne$c, src, imps) };
   })();
   return fmtLexed(src, hdr, lexGo(hdr.text, { i: 0n, line: 0n, lineStart: 0n, first: { $: "True", a: [] }, tok: { $: "Nothing", a: [] }, err: { $: "Nothing", a: [] }, cmt: { $: "Nothing", a: [] } }, { $: "Nil", a: [] }, { $: "Nil", a: [] }, { $: "Nil", a: [] }));
 };
