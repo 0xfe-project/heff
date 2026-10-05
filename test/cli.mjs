@@ -49,7 +49,7 @@ expect("fmt of what does not parse", refused.status === 1 && refused.stderr.incl
 
 // the usage: asked for, on stdout; for what is no command (or a command
 // without its files), on stderr, failing
-const commands = ["check", "eval", "run", "test", "promote", "compile-js", "app", "node", "explain", "type-at", "fmt", "lsp", "completions"];
+const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "lsp", "completions"];
 for (const args of [[], ["help"]]) {
   const r = heff(...args);
   expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND FILE ...") &&
@@ -64,7 +64,32 @@ for (const args of [["no-such-command"], ["test"], ["check"]]) {
 const fish = heff("completions", "fish");
 expect("completions fish", fish.status === 0 && fish.stdout.startsWith("# heff: written by `heff completions fish`\n") &&
   commands.every((c) => fish.stdout.includes(`-a ${c} -d `)) &&
-  fish.stdout.includes("complete -c heff -n '__fish_seen_subcommand_from check' -a '(__fish_complete_suffix .hf)'"), fish.stdout);
+  fish.stdout.includes("complete -c heff -n '__fish_seen_subcommand_from check' -a '(__fish_complete_suffix .hf)'") &&
+  fish.stdout.includes("complete -c heff -n '__fish_seen_subcommand_from compile' -l backend -xa 'esm page node' -d "), fish.stdout);
+// bash and zsh: every command, the backend's values, and each script
+// read by its shell without a complaint
+const bash = heff("completions", "bash");
+expect("completions bash", bash.status === 0 && bash.stdout.startsWith("# heff: written by `heff completions bash`\n") &&
+  bash.stdout.includes(commands.join(" ")) && bash.stdout.includes("'compile --backend') COMPREPLY=($(compgen -W 'esm page node'") &&
+  spawnSync("bash", ["-n"], { input: bash.stdout }).status === 0, bash.stdout);
+// (where there is no zsh, its reading is not checked)
+const zsh = heff("completions", "zsh");
+const zshRead = spawnSync("zsh", ["-n"], { input: zsh.stdout });
+expect("completions zsh", zsh.status === 0 && zsh.stdout.startsWith("#compdef heff\n") &&
+  commands.every((c) => zsh.stdout.includes(`\n    '${c}:`)) && zsh.stdout.includes("'--backend=[esm, page or node]:value:(esm page node)'") &&
+  (zshRead.error !== undefined || zshRead.status === 0), zsh.stdout);
+
+// compile: a backend wanted, one of three; no NAME for a module
+for (const [args, says] of [
+  [["compile", "a.hf", "a.mjs"], "which backend?"],
+  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "no backend wasm"],
+  [["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"], "no --name with --backend=esm"],
+  [["compile", "a.hf", "--backend=node"], "FILE OUT"],
+  [["compile", "a.hf", "a.mjs", "--back=node"], "no such flag: --back=node"],
+]) {
+  const r = heff(...args);
+  expect(`refused: ${args.join(" ")}`, r.status === 1 && r.stderr.startsWith("heff compile: ") && r.stderr.includes(says), r);
+}
 
 // type-at: nothing there, at an offset that is no name or no number
 for (const o of ["0", "nope"]) {

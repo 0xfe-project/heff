@@ -2,7 +2,7 @@
 // What heff says of the repository's files, held to what it said: for
 // each file of the library and the tests, `check` (its interface and its
 // diagnostics), `explain` (the elaboration's trace), `eval` (each
-// definition's value) and `type-at` (at some names), against the text
+// definition's value, `dump-eval`) and `type-at` (at some names), against the text
 // kept under test/golden/, byte for byte.  A change of them is a change
 // of heff, to be looked at -- and kept with
 // `node test/golden.mjs --update`.
@@ -50,7 +50,7 @@ const kinds = [
   { kind: "explain", files: filesIn(["lib", "test/nbe", "test/surface", "test/errors"]),
     say: async (f) => said(await heff(["explain", f])) },
   { kind: "eval", files: filesIn(["lib", "test/nbe"]),
-    say: async (f) => said(await heff(["eval", f])) },
+    say: async (f) => said(await heff(["dump-eval", f])) },
   { kind: "type-at", files: filesIn(["lib", "test/surface", "test/nbe"]),
     say: async (f) => {
       // (one run for all of them, a line each)

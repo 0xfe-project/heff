@@ -29,7 +29,7 @@ if (mtime(out) >= 0 && sources.every((s) => mtime(s) <= mtime(out))) {
 }
 
 const step = (what, compiler, to) => {
-  const r = spawnSync(process.execPath, [compiler, "node", "compiler/main.hf", "main", to],
+  const r = spawnSync(process.execPath, [compiler, "compile", "compiler/main.hf", to, "--name", "main", "--backend=node"],
     { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
   if (r.status !== 0) { console.error(`heff build: ${what} failed`); process.exit(r.status ?? 1); }
 };

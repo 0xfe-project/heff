@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Programs compiled for Node.js (`heff node`: stdio, process, fs, time,
+// Programs compiled for Node.js (`heff compile --backend=node`: stdio, process, fs, time,
 // net) and run: what they write, their exit status, loops a million
 // rounds deep, and a long loop of operations done at once.
 import { spawnSync } from "node:child_process";
@@ -16,14 +16,15 @@ const check = (what, got, want) => {
   if (got !== want) { failed++; console.log(`FAIL ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
 const build = (file, name, out) => {
-  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "node", file, name, out], { encoding: "utf8" });
-  if (r.status !== 0) { failed++; console.log(`FAIL heff node ${file}\n${r.stdout}${r.stderr}`); return false; }
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "compile", file, out, "--name", name, "--backend=node"], { encoding: "utf8" });
+  if (r.status !== 0) { failed++; console.log(`FAIL heff compile --backend=node ${file}\n${r.stdout}${r.stderr}`); return false; }
   return true;
 };
 
-const echo = join(work, "echo.mjs"), copied = join(work, "copied.txt");
-if (build("test/node/echo.hf", "echo", echo)) {
-  const r = spawnSync("node", [echo, copied, "two words"], { input: "from stdin", encoding: "utf8", env: { ...process.env, GREETING: "hi" } });
+// (`heff run`: compiled, then run in heff's place, on its streams)
+const copied = join(work, "copied.txt");
+{
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "run", "test/node/echo.hf", copied, "two words"], { cwd: root, input: "from stdin", encoding: "utf8", env: { ...process.env, GREETING: "hi" } });
   check("echo: stdout", r.stdout, `${copied}\ntwo words\nhi\ncopied: from stdin\nmissing: not read\n`);
   check("echo: stderr", r.stderr, "to stderr\n");
   check("echo: status", r.status, 3);
@@ -39,7 +40,7 @@ if (build("test/node/timed.hf", "timed", timed)) {
 
 // a computation of an effect Node has no handler for is refused, and why
 {
-  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "node", "examples/counter/counter.hf", join(work, "counter.mjs")], { cwd: root, encoding: "utf8" });
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "compile", "examples/counter/counter.hf", join(work, "counter.mjs"), "--backend=node"], { cwd: root, encoding: "utf8" });
   check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom.dom, which is not provided here"), true);
 }
 

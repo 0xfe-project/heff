@@ -5,7 +5,7 @@
 //
 // Compiles the programs of test/programs and N generated ones to JavaScript,
 // loads each module (in a child process, with a timeout) and compares every
-// definition's value with the interpreter's (`heff eval`).  Both are
+// definition's value with the interpreter's (`heff dump-eval`).  Both are
 // call-by-value, so they agree exactly: the same value, or both abandon.
 // (What the interpreter finds to diverge is not read.)
 import { spawnSync } from "node:child_process";
@@ -33,8 +33,8 @@ let agree = 0, differ = 0, compileErrors = 0, compared = 0, timeouts = 0;
 for (const c of cases) {
   const file = join(work, `${c.name}.hf`), out = join(work, `${c.name}.mjs`);
   writeFileSync(file, c.src);
-  const r = heff(["compile-js", file, out]);
-  const ev = heff(["eval", file]);
+  const r = heff(["compile", file, out, "--backend=esm"]);
+  const ev = heff(["dump-eval", file]);
   if (r.status !== 0 || ev.status !== 0) { compileErrors++; console.log(`NOT COMPILED ${c.name}:\n${r.stderr}${ev.stderr}${r.error || ""}${ev.error || ""}`); continue; }
   // `name = value`, a value going on over the lines that do not start so;
   // an operator's name without its parentheses, as the module exports it

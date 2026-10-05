@@ -1,5 +1,5 @@
 // Load one compiled JavaScript module and print the named values as
-// `heff eval` shows them, as JSON: { name: { value } | { threw } }.
+// `heff dump-eval` shows them, as JSON: { name: { value } | { threw } }.
 import { pathToFileURL } from "node:url";
 const [file, ...names] = process.argv.slice(2);
 const g = (await import(pathToFileURL(file))).default;

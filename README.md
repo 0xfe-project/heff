@@ -34,16 +34,16 @@ compiler's own output is `output/heff.raw.mjs`).
 
 ```sh
 heff check FILE                # the file's interface, and its errors
-heff eval FILE                 # the value of each definition
-heff run FILE                  # the value of each watch (`-- >>> e`)
-heff test FILE...              # check the watches' expectations
+heff run FILE [ARGS...]        # run the file's `main` (on Node.js)
+heff test FILE...              # check the watches' expectations (`-- >>> e`)
 heff promote FILE              # write each watch's value as its expectation
 heff fmt [--check] FILE...     # format in place
-heff compile-js FILE OUT.js    # an ES module
-heff app FILE [NAME] OUT.js    # a script running an app in a web page
-heff node FILE [NAME] OUT.mjs  # a Node.js program
+heff compile FILE OUT --backend=MODE [--name NAME]
+                               # esm: an ES module
+                               # page: a script running the app NAME in a web page
+                               # node: a Node.js program running NAME
 heff lsp                       # the language server, on stdio
-heff completions fish          # fish completions
+heff completions SHELL         # fish, bash or zsh completions
 ```
 
 ## Modules

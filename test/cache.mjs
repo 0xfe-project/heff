@@ -65,8 +65,8 @@ want(mtime("b") > tB1, "a new name in a dependency re-elaborates the importer");
 
 // a changed definition the importer uses: the answer changes with it
 writeFileSync(join(dir, "a.hf"), "import prelude\n\nnine : Int\nnine = 90\n\nunused : Int\nunused = 1\n");
-const c3 = heff("run", "c.hf");
-want(c3.status === 0 && /91/.test(c3.stdout), `a changed definition reaches the importer\n${c3.stdout.slice(0, 120)}`);
+const c3 = heff("test", "c.hf");
+want(c3.status === 1 && /91/.test(c3.stdout), `a changed definition reaches the importer\n${c3.stdout.slice(0, 120)}`);
 
 console.log(`cache: ${failed ? "NOT " : ""}thawed, healed and invalidated at the definitions used`);
 process.exit(failed ? 1 : 0);

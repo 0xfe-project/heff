@@ -1245,14 +1245,18 @@ importLinesOf (Cons p rest) =
 
 -- (a Node.js program runs itself again in a thread of its own, whose
 -- stack is deep enough for what a heff program does; the first thread
--- passes on its arguments and its standard input, says whether its
--- output is a terminal, and ends with the program's status.
+-- passes on its arguments and -- once the program reads it -- its
+-- standard input, says whether its output is a terminal, and ends with
+-- the program's status -- or, where the program asked to
+-- (lib/process.hf's `exec`), runs a command in its place, on the same
+-- standard streams, and ends with the command's status.
 -- HEFF_HEAP_MB, if set, bounds the thread's heap)
 nodeHead : List String
 nodeHead =
   [ "#!/usr/bin/env node"
   , "// Generated from Hippogriff; do not edit."
-  , "import { Worker as $Worker, isMainThread as $isMainThread } from \"node:worker_threads\";"
+  , "import { Worker as $Worker, isMainThread as $isMainThread, parentPort as $parentPort } from \"node:worker_threads\";"
+  , "import { spawn as $spawn } from \"node:child_process\";"
   ]
 
 nodeRun : String -> String
@@ -1263,10 +1267,21 @@ nodeRun run =
     , "  if (process.stdout.isTTY) process.env.HEFF_TTY = \"1\";"
     , "  const limits = { stackSizeMb: 512, maxOldGenerationSizeMb: Number(process.env.HEFF_HEAP_MB) || undefined };"
     , "  const worker = new $Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: limits, stdin: true });"
-    , "  process.stdin.pipe(worker.stdin);"
+    , "  let piped = false, exec = null;"
+    , "  worker.on(\"message\", (m) => {"
+    , "    if (m && m.stdin && !piped) { piped = true; process.stdin.pipe(worker.stdin); }"
+    , "    if (m && m.exec) exec = m.exec;"
+    , "  });"
     , "  worker.on(\"error\", (e) => { console.error(e); process.exitCode = 1; });"
-    , "  worker.on(\"exit\", (code) => { process.exitCode = code; process.stdin.unpipe(worker.stdin); process.stdin.destroy(); });"
+    , "  worker.on(\"exit\", (code) => {"
+    , "    if (piped) { process.stdin.unpipe(worker.stdin); process.stdin.destroy(); }"
+    , "    if (!exec) { process.exitCode = code; return; }"
+    , "    const child = $spawn(exec[0], exec[1], { stdio: \"inherit\" });"
+    , "    child.on(\"error\", (e) => { console.error(e.message); process.exitCode = 1; });"
+    , "    child.on(\"exit\", (status) => { process.exitCode = status ?? 1; });"
+    , "  });"
     , "} else {"
+    , "  process.stdin.once(\"resume\", () => $parentPort.postMessage({ stdin: true }));"
     , "  " ++ run
     , "}"
     ]

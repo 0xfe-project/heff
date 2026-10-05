@@ -1,8 +1,10 @@
--- The compiler, run: a Node.js program (`heff node compiler/main.hf
--- main OUT.mjs`), `heff` itself -- compiled by itself, from the seed
+-- The compiler, run: a Node.js program (`heff compile compiler/main.hf
+-- OUT.mjs --name main --backend=node`), `heff` itself -- compiled by itself, from the seed
 -- boot/heff.mjs (scripts/build.mjs).  Besides the commands of
 -- `usage`, `dump-core FILE...` reads the files given in dependency
--- order, elaborates them, and prints every definition's stored core.
+-- order, elaborates them, and prints every definition's stored core, and
+-- `dump-eval FILE` prints what each definition of FILE evaluates to (the
+-- interpreter's values, which the tests hold the backend to).
 
 import co
 import compiler.diagnostic as Dg
@@ -151,7 +153,7 @@ readProviders paths (Cons m rest) = do
     Just pr -> Cons pr ps
     Nothing -> ps)
 
--- (a provider without `$host` lives anywhere; `heff node`'s is "node")
+-- (a provider without `$host` lives anywhere; `--backend=node`'s is "node")
 forHost : String -> Em.Provider -> Bool
 forHost host p = case Em.hostOf p.text of
   Nothing -> True
@@ -181,13 +183,14 @@ putFileDiags (Cons c rest) = do
 anyErrors : List Dr.Checked -> Bool
 anyErrors cs = any (\(c : Dr.Checked) -> not (null (Dr.errorsIn c))) cs
 
-writeOut : String -> String -> Em.Output -> Heff Unit
-writeOut outPath how o = do
+-- (`done`: what follows the written program)
+writeOut : String -> Co world Unit -> Em.Output -> Heff Unit
+writeOut outPath done o = do
   emitErrs o.errors
   if null o.errors
       then do
         ok <- writeFile outPath o.source
-        if ok then print ("wrote " ++ outPath ++ ": " ++ how)
+        if ok then done
           else do
             printErr ("cannot write " ++ outPath)
             exit 1
@@ -197,11 +200,11 @@ compileFound : String
              -> String
              -> Maybe String
              -> String
-             -> String
+             -> Co world Unit
              -> Dr.Checked
              -> List Em.Provider
              -> Heff Unit
-compileFound host file name outPath how c available = case Dr.findRunnable
+compileFound host file name outPath done c available = case Dr.findRunnable
     (filter (\k -> providesLeaf available k) (Dr.candidateLeaves c))
     c
     name of
@@ -211,7 +214,7 @@ compileFound host file name outPath how c available = case Dr.findRunnable
   Right r ->
     writeOut
       outPath
-      how
+      done
       (Em.compileProgram host available c.top.globals r.key r.effect)
 
 -- (a computation whose effects all have providers for this host: each
@@ -221,10 +224,10 @@ compileLast : L.Paths
             -> String
             -> Maybe String
             -> String
-            -> String
+            -> Co world Unit
             -> List Dr.Checked
             -> Heff Unit
-compileLast paths host file name outPath how cs = case Dr.lastChecked cs of
+compileLast paths host file name outPath done cs = case Dr.lastChecked cs of
   Nothing -> do
     printErr "no files given"
     exit 1
@@ -238,7 +241,7 @@ compileLast paths host file name outPath how cs = case Dr.lastChecked cs of
         file
         name
         outPath
-        how
+        done
         c
         (filter (\p -> forHost host p) found)
 
@@ -247,13 +250,14 @@ compileDiags : L.Paths
              -> String
              -> Maybe String
              -> String
-             -> String
+             -> Co world Unit
              -> Bool
              -> List Dr.Checked
              -> Heff Unit
-compileDiags paths host file name outPath how badL cs = do
+compileDiags paths host file name outPath done badL cs = do
   putFileDiags cs
-  if badL then exit 1 else compileLast paths host file name outPath how cs
+  if badL || anyErrors cs then exit 1
+    else compileLast paths host file name outPath done cs
 
 -- | compile the computation `name` of FILE to a program of `host`:
 -- | FILE's import closure loaded with the compiler's own loader
@@ -262,7 +266,15 @@ compileCmd host name outPath how file = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
   cs <- Se.cachedProgram l
-  compileDiags l.paths host file name outPath how (badL > 0) cs
+  compileDiags
+      l.paths
+      host
+      file
+      name
+      outPath
+      (print ("wrote " ++ outPath ++ ": " ++ how))
+      (badL > 0)
+      cs
 
 nodeCmd : Maybe String -> String -> String -> Heff Unit
 nodeCmd name outPath file =
@@ -281,6 +293,32 @@ appCmd name outPath file =
     outPath
     "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
     file
+
+runDir : L.Paths -> String
+runDir paths = L.under paths.root ".heff/run"
+
+-- (FILE's path, its slashes underscores)
+runPath : L.Paths -> String -> String
+runPath paths file =
+  runDir paths ++ "/" ++ joinWith "_" (split "/" file) ++ ".mjs"
+
+-- | run FILE's `main` with ARGS: compiled for Node.js to `.heff/run/`,
+-- | which runs in heff's place
+runCmd : String -> List String -> Heff Unit
+runCmd file progArgs = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  cs <- Se.cachedProgram l
+  ok <- mkDir (runDir l.paths)
+  compileDiags
+      l.paths
+      "node"
+      file
+      (Just "main")
+      (runPath l.paths file)
+      (exec "node" (runPath l.paths file :: progArgs))
+      (badL > 0)
+      cs
 
 ownExport : Dr.Own -> Em.Export
 ownExport o = Em.mkExport o.name o.key
@@ -309,6 +347,51 @@ compileJsCmd file outPath = do
   badL <- printErrs "heff" l.errors 0
   cs <- Se.cachedProgram l
   compileJsDiags file outPath (badL > 0) cs
+
+-- | how `heff compile` was called: FILE, OUT, `--name`, `--backend`
+type CompileOpts =
+  { file : String, outPath : String, name : Maybe String, backend : String }
+
+-- (the words given, the files read backwards; a flag's value after `=`
+-- or as the next word)
+compileOpts : List String
+            -> Maybe String
+            -> Maybe String
+            -> List String
+            -> Either String CompileOpts
+compileOpts files name backend Nil = case backend of
+  Nothing -> Left "which backend? --backend=esm, page or node"
+  Just b -> case reverse files of
+    file :: outPath :: Nil ->
+      Right { file = file, outPath = outPath, name = name, backend = b }
+    _ -> Left "FILE OUT [--name NAME] --backend=MODE"
+compileOpts files name backend ("--name" :: n :: rest) =
+  compileOpts files (Just n) backend rest
+compileOpts files name backend ("--backend" :: b :: rest) =
+  compileOpts files name (Just b) rest
+compileOpts files name backend (w :: rest) =
+  if startsWith "--name=" w
+    then compileOpts files (Just (strSlice w 7 (strLength w))) backend rest
+  else if startsWith "--backend=" w
+    then compileOpts files name (Just (strSlice w 10 (strLength w))) rest
+  else if startsWith "--" w then Left ("no such flag: " ++ w)
+  else compileOpts (w :: files) name backend rest
+
+-- | `heff compile`, by its backend
+compileTo : CompileOpts -> Heff Unit
+compileTo o =
+  if strEq o.backend "node" then nodeCmd o.name o.outPath o.file
+  else if strEq o.backend "page" then appCmd o.name o.outPath o.file
+  else if strEq o.backend "esm"
+    then case o.name of
+      Nothing -> compileJsCmd o.file o.outPath
+      Just n -> do
+        printErr
+            "heff compile: an ES module runs nothing: no --name with --backend=esm"
+        exit 1
+  else do
+    printErr ("heff compile: no backend " ++ o.backend ++ ": esm, page or node")
+    exit 1
 
 printEvals : List Dr.Evaluated -> Heff Unit
 printEvals Nil = pure MkUnit
@@ -351,31 +434,6 @@ promoteCmd file = do
   badL <- printErrs "heff" l.errors 0
   cs <- Se.cachedProgram l
   promoteDiags file (badL > 0) cs
-
-printWatchVals : List Dr.WatchInfo -> Heff Unit
-printWatchVals Nil = pure MkUnit
-printWatchVals (Cons w rest) = do
-  print (">>> " ++ w.expr ++ "\n" ++ w.value)
-  printWatchVals rest
-
-runLast : Int -> Maybe Dr.Checked -> Heff Unit
-runLast bad Nothing = exit 1
-runLast bad (Just c) = do
-  printWatchVals (Dr.watches c)
-  if bad == 0 then pure MkUnit else exit 1
-
-runChecked : Int -> List Dr.Checked -> Heff Unit
-runChecked badL cs = do
-  bad <- diagCount cs
-  runLast (badL + bad) (Dr.lastChecked cs)
-
--- | print what each watch (`-- >>> e`) of FILE evaluates to
-runCmd : String -> Heff Unit
-runCmd file = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  runChecked badL cs
 
 type TestRes = { total : Int, failed : Int, ok : Bool }
 
@@ -493,22 +551,28 @@ explainCmd file = do
     Nothing -> exit 1
     Just c -> printLines (Q.explain c)
 
--- | a flag of a command, and what it does
-type Flag = { flag : String, doc : String }
+-- | a flag of a command, what it does, and its value (`Nothing`: it
+-- | takes none; `Just Nil`: any word; else one of those)
+type Flag = { flag : String, doc : String, value : Maybe (List String) }
 
 -- | a command: how it is called, what it does, and what its words
--- | complete to (`files`: the files' suffix; `flags`)
+-- | complete to (`files`: the files' suffix; `words`: the words it takes;
+-- | `flags`)
 type Command =
   { name : String
   , args : String
   , doc : String
   , files : String
+  , words : List String
   , flags : List Flag
   }
 
 cmd : String -> String -> String -> String -> Command
 cmd name a doc files =
-  { name = name, args = a, doc = doc, files = files, flags = Nil }
+  { name = name, args = a, doc = doc, files = files, words = Nil, flags = Nil }
+
+shells : List String
+shells = ["fish", "bash", "zsh"]
 
 commands : List Command
 commands =
@@ -517,11 +581,10 @@ commands =
     "FILE"
     "elaborate FILE and what it imports; print its interface"
     ".hf"
-  , cmd "eval" "FILE" "print what each definition of FILE evaluates to" ".hf"
   , cmd
     "run"
-    "FILE"
-    "print what each watch (`-- >>> e`) of FILE evaluates to"
+    "FILE [ARGS...]"
+    "run FILE's main with ARGS, compiled for Node.js"
     ".hf"
   , cmd
     "test"
@@ -533,21 +596,23 @@ commands =
     "FILE"
     "write each watch's value under it as its expectation"
     ".hf"
-  , cmd
-    "compile-js"
-    "FILE OUT.js"
-    "an ES module of FILE and what it imports"
-    ".hf"
-  , cmd
-    "app"
-    "FILE [NAME] OUT.js"
-    "a script running the app NAME (lib/dom.hf) in a page"
-    ".hf"
-  , cmd
-    "node"
-    "FILE [NAME] OUT.mjs"
-    "a Node.js program running NAME, its worlds' providers bundled in"
-    ".hf"
+  , { name = "compile"
+    , args = "FILE OUT --backend=MODE [--name NAME]"
+    , doc =
+        "FILE as JavaScript, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME)"
+    , files = ".hf"
+    , words = Nil
+    , flags =
+        [ { flag = "backend"
+          , doc = "esm, page or node"
+          , value = Just ["esm", "page", "node"]
+          }
+        , { flag = "name"
+          , doc = "the computation run (page, node)"
+          , value = Just Nil
+          }
+        ]
+    }
   , cmd "explain" "FILE" "the elaboration trace" ".hf"
   , cmd
     "type-at"
@@ -558,10 +623,22 @@ commands =
     , args = "[--check] FILE..."
     , doc = "format FILEs in place (--check: only say which are not formatted)"
     , files = ".hf"
-    , flags = [{ flag = "check", doc = "only say which are not formatted" }]
+    , words = Nil
+    , flags =
+        [ { flag = "check"
+          , doc = "only say which are not formatted"
+          , value = Nothing
+          }
+        ]
     }
   , cmd "lsp" "" "a language server, on stdin/stdout" ""
-  , cmd "completions" "fish" "a completion script for the shell" ""
+  , { name = "completions"
+    , args = "SHELL"
+    , doc = "a completion script for SHELL: fish, bash or zsh"
+    , files = ""
+    , words = shells
+    , flags = Nil
+    }
   ]
 
 spaces : Int -> String
@@ -592,6 +669,18 @@ seenFrom : String -> String
 seenFrom name =
   "complete -c heff -n '__fish_seen_subcommand_from " ++ name ++ "'"
 
+fishFlag : Command -> Flag -> String
+fishFlag c f =
+  seenFrom c.name
+  ++ " -l "
+  ++ f.flag
+  ++ (case f.value of
+      Nothing -> ""
+      Just Nil -> " -x"
+      Just vs -> " -xa " ++ fishQuote (unwords vs))
+  ++ " -d "
+  ++ fishQuote f.doc
+
 fishLines : Command -> List String
 fishLines c =
   concatList
@@ -607,15 +696,10 @@ fishLines c =
              ++ ")'"
              ]))
     (concatList
-       (map
-          (\(f : Flag) ->
-             seenFrom c.name ++ " -l " ++ f.flag ++ " -d " ++ fishQuote f.doc)
-          c.flags)
-       (if strEq c.name "completions"
-          then [seenFrom "completions" ++ " -a fish"]
-        else Nil))
+       (if null c.words then Nil
+        else [seenFrom c.name ++ " -a " ++ fishQuote (unwords c.words)])
+       (map (\(f : Flag) -> fishFlag c f) c.flags))
 
--- | fish's completions of heff: `heff completions fish > ~/.config/fish/completions/heff.fish`
 fishCompletions : String
 fishCompletions =
   joinWith
@@ -626,6 +710,122 @@ fishCompletions =
        , "complete -c heff -f"
        ]
        (concatMap fishLines commands))
+  ++ "\n"
+
+-- (a POSIX shell's string: single-quoted, each quote closed, escaped and
+-- opened again)
+shQuote : String -> String
+shQuote x = "'" ++ joinWith "'\\''" (split "'" x) ++ "'"
+
+flagWords : Command -> List String
+flagWords c = map (\(f : Flag) -> "--" ++ f.flag) c.flags
+
+-- (after a flag that takes a value: its values, or nothing)
+bashValueArm : Command -> Flag -> List String
+bashValueArm c f = case f.value of
+  Nothing -> Nil
+  Just vs ->
+    [ "    "
+    ++ shQuote (c.name ++ " --" ++ f.flag)
+    ++ ") COMPREPLY=($(compgen -W "
+    ++ shQuote (unwords vs)
+    ++ " -- \"$cur\")); return;;"
+    ]
+
+bashArm : Command -> String
+bashArm c =
+  "    "
+  ++ c.name
+  ++ ") COMPREPLY=($(compgen -W "
+  ++ shQuote (unwords (concatList c.words (flagWords c)))
+  ++ " -- \"$cur\"))"
+  ++ (if strEq c.files "" then ""
+      else "; COMPREPLY+=($(compgen -d -- \"$cur\") $(compgen -f -X "
+        ++ shQuote ("!*" ++ c.files)
+        ++ " -- \"$cur\"))")
+  ++ ";;"
+
+bashCompletions : String
+bashCompletions =
+  joinWith
+    "\n"
+    (concatList
+       [ "# heff: written by `heff completions bash`"
+       , "_heff() {"
+       , "  local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}"
+       , "  if [ \"$COMP_CWORD\" -eq 1 ]; then"
+       , "    COMPREPLY=($(compgen -W "
+       ++ shQuote (unwords (map (\(c : Command) -> c.name) commands))
+       ++ " -- \"$cur\"))"
+       , "    return"
+       , "  fi"
+       , "  case \"${COMP_WORDS[1]} $prev\" in"
+       ]
+       (concatList
+          (concatMap
+             (\(c : Command) ->
+                concatMap (\(f : Flag) -> bashValueArm c f) c.flags)
+             commands)
+          (concatList
+             (Cons "  esac" (Cons "  case \"${COMP_WORDS[1]}\" in" Nil))
+             (concatList
+                (map bashArm commands)
+                ["  esac", "}", "complete -o filenames -F _heff heff"]))))
+  ++ "\n"
+
+zshFlag : Flag -> String
+zshFlag f =
+  shQuote
+    ("--"
+     ++ f.flag
+     ++ (case f.value of
+         Nothing -> "[" ++ f.doc ++ "]"
+         Just Nil -> "=[" ++ f.doc ++ "]:value: "
+         Just vs -> "=[" ++ f.doc ++ "]:value:(" ++ unwords vs ++ ")"))
+
+zshArm : Command -> String
+zshArm c =
+  "    "
+  ++ c.name
+  ++ ") _arguments"
+  ++ joinWith "" (map (\(f : Flag) -> " " ++ zshFlag f) c.flags)
+  ++ (if null c.words then ""
+      else " " ++ shQuote ("1:value:(" ++ unwords c.words ++ ")"))
+  ++ (if strEq c.files "" then ""
+      else " " ++ shQuote ("*:file:_files -g \"*" ++ c.files ++ "\""))
+  ++ " ;;"
+
+zshCompletions : String
+zshCompletions =
+  joinWith
+    "\n"
+    (concatList
+       [ "#compdef heff"
+       , "# heff: written by `heff completions zsh`"
+       , "_heff() {"
+       , "  local -a commands"
+       , "  commands=("
+       ]
+       (concatList
+          (map
+             (\(c : Command) -> "    " ++ shQuote (c.name ++ ":" ++ c.doc))
+             commands)
+          (concatList
+             [ "  )"
+             , "  if (( CURRENT == 2 )); then"
+             , "    _describe command commands"
+             , "    return"
+             , "  fi"
+             , "  shift words"
+             , "  (( CURRENT-- ))"
+             , "  case $words[1] in"
+             ]
+             (concatList
+                (map zshArm commands)
+                [ "  esac"
+                , "}"
+                , "if [ \"$funcstack[1]\" = _heff ]; then _heff \"$@\"; else compdef _heff heff; fi"
+                ]))))
   ++ "\n"
 
 -- | 1 if the file is not formatted (with `--check`) or cannot be
@@ -660,37 +860,36 @@ fmtAll checkOnly (Cons f rest) bad = do
 fmtCmd : List String -> Heff Unit
 fmtCmd as = do
   bad <- case as of
-    Cons "--check" files -> fmtAll True files 0
+    "--check" :: files -> fmtAll True files 0
     _ -> fmtAll False as 0
   if bad > 0 then exit 1 else pure MkUnit
 
 -- | the compiler's door: the commands of `usage`, and `dump-core
 -- | FILE...`, which checks the files given (in dependency order) and
--- | prints their stored core
+-- | prints their stored core, and `dump-eval FILE`
 program : Heff Unit
 program = do
   as <- args
   case as of
-    Cons "node" (Cons file (Cons name (Cons outPath Nil))) ->
-      nodeCmd (Just name) outPath file
-    Cons "node" (Cons file (Cons outPath Nil)) -> nodeCmd Nothing outPath file
-    Cons "app" (Cons file (Cons name (Cons outPath Nil))) ->
-      appCmd (Just name) outPath file
-    Cons "app" (Cons file (Cons outPath Nil)) -> appCmd Nothing outPath file
-    Cons "compile-js" (Cons file (Cons outPath Nil)) ->
-      compileJsCmd file outPath
-    Cons "check" (Cons file Nil) -> checkCmd file
-    Cons "run" (Cons file Nil) -> runCmd file
-    Cons "eval" (Cons file Nil) -> evalCmd file
-    Cons "promote" (Cons file Nil) -> promoteCmd file
-    Cons "type-at" (Cons file (Cons off offs)) -> typeAtCmd file (Cons off offs)
-    Cons "explain" (Cons file Nil) -> explainCmd file
-    Cons "test" (Cons f files) -> testCmd (Cons f files) 0 0 False
-    Cons "fmt" (Cons f files) -> fmtCmd (Cons f files)
-    Cons "completions" (Cons "fish" Nil) -> write fishCompletions
-    Cons "dump-core" files -> selfcheck files
+    "compile" :: flags -> case compileOpts Nil Nothing Nothing flags of
+      Left why -> do
+        printErr ("heff compile: " ++ why)
+        exit 1
+      Right o -> compileTo o
+    "check" :: file :: Nil -> checkCmd file
+    "run" :: file :: progArgs -> runCmd file progArgs
+    "dump-eval" :: file :: Nil -> evalCmd file
+    "promote" :: file :: Nil -> promoteCmd file
+    "type-at" :: file :: off :: offs -> typeAtCmd file (off :: offs)
+    "explain" :: file :: Nil -> explainCmd file
+    "test" :: f :: files -> testCmd (f :: files) 0 0 False
+    "fmt" :: f :: files -> fmtCmd (f :: files)
+    "completions" :: "fish" :: Nil -> write fishCompletions
+    "completions" :: "bash" :: Nil -> write bashCompletions
+    "completions" :: "zsh" :: Nil -> write zshCompletions
+    "dump-core" :: files -> selfcheck files
     -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
-    Cons "lsp" flags ->
+    "lsp" :: flags ->
       if all (\x -> startsWith "--" x) flags
         then do
           lib <- libDir
@@ -699,7 +898,7 @@ program = do
         printErr usage
         exit 1
     Nil -> print usage
-    Cons "help" Nil -> print usage
+    "help" :: Nil -> print usage
     -- (on stderr: what reads the output, a shell's completion, say, does
     -- not take it for an answer)
     _ -> do
