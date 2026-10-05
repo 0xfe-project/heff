@@ -21,9 +21,9 @@ const files = [
   "compiler/dict.hf", "compiler/params.hf", "compiler/syntax.hf",
   "compiler/value.hf", "compiler/globals.hf", "compiler/eval.hf",
   "compiler/readback.hf", "compiler/conversion.hf", "compiler/notation.hf",
-  "compiler/environment.hf", "compiler/unify.hf", "compiler/meta.hf",
+  "compiler/environment.hf", "compiler/psurface.hf", "compiler/unify.hf", "compiler/meta.hf",
   "compiler/memoed.hf", "compiler/print.hf", "compiler/top.hf",
-  "compiler/rename.hf", "compiler/psurface.hf",
+  "compiler/rename.hf",
   "compiler/rules.hf", "compiler/fixity.hf", "compiler/import.hf",
   "compiler/surface.hf", "compiler/clauses.hf", "compiler/toplevel.hf",
   "compiler/prims.hf", "compiler/ir.hf", "compiler/shake.hf",
@@ -32,6 +32,7 @@ const files = [
   "compiler/interp.hf", "compiler/diagnostic.hf",
   "compiler/driver.hf", "compiler/serial.hf", "compiler/cache.hf",
   "compiler/load.hf", "compiler/format.hf", "compiler/report.hf",
+  "compiler/locals.hf", "compiler/query.hf",
   "compiler/main.hf",
 ];
 

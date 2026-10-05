@@ -1,0 +1,755 @@
+-- What a tool asks of a file elaborated: the elaboration's trace, the
+-- name at an offset (its type, where it is defined, what may be written
+-- there), every occurrence of what a name refers to, and an outline.
+-- A port of `Heff.Driver`'s semantic queries.
+
+import compiler.diagnostic as Dg
+import compiler.driver as Dr
+import compiler.environment as Env
+import compiler.globals as G
+import compiler.locals as Lc
+import compiler.notation
+import compiler.params as Pm
+import compiler.psurface as Ps
+import compiler.readback as R
+import compiler.toplevel as T
+import map as Mp
+import prelude
+
+-- Small things
+--------------------------------------------------------------------------------
+
+catMaybesQ : {a : Type} -> List (Maybe a) -> List a
+catMaybesQ Nil = Nil
+catMaybesQ (Cons (Just x) rest) = Cons x (catMaybesQ rest)
+catMaybesQ (Cons Nothing rest) = catMaybesQ rest
+
+sameSpan : Pm.Span -> Pm.Span -> Bool
+sameSpan a b = a.start == b.start && a.end == b.end
+
+mkSpan : Int -> Int -> Pm.Span
+mkSpan s e = { start = s, end = e }
+
+-- | a character of a name (a module path's `/` too)
+isNameChar : Int -> Bool
+isNameChar c =
+  c == 95
+  || c == 39
+  || c == 47
+  || 97 <= c && c <= 122
+  || 65 <= c && c <= 90
+  || 48 <= c && c <= 57
+
+-- | is `x`, at `p` in `src`, a word: not part of a longer name?
+wordAt : String -> Int -> String -> Bool
+wordAt src p x =
+  (p == 0 || not (isNameChar (charCode src (p - 1))))
+  && not (isNameChar (charCode src (p + strLength x)))
+
+-- | the first occurrence of a name, as a word, in a span (else the span)
+nameInGo : String -> String -> Pm.Span -> Int -> Pm.Span
+nameInGo src x sp from = case indexFrom x src from of
+  Just p ->
+    if p + strLength x <= sp.end
+      then if wordAt src p x then mkSpan p (p + strLength x)
+        else nameInGo src x sp (p + 1)
+    else sp
+  Nothing -> sp
+
+nameIn : String -> String -> Pm.Span -> Pm.Span
+nameIn src x sp = nameInGo src x sp sp.start
+
+stripPrefixS : String -> String -> Maybe String
+stripPrefixS pre s =
+  if startsWith pre s then Just (strSlice s (strLength pre) (strLength s))
+  else Nothing
+
+nubByStart : List Pm.Span -> List Pm.Span
+nubByStart Nil = Nil
+nubByStart (Cons x xs) =
+  Cons x (nubByStart (filter (\(y : Pm.Span) -> y.start /= x.start) xs))
+
+sortSpans : List Pm.Span -> List Pm.Span
+sortSpans xs = sortBy (\(a : Pm.Span) (b : Pm.Span) -> a.start <= b.start) xs
+
+-- The trace
+--------------------------------------------------------------------------------
+
+atLine : String -> Pm.Span -> String
+atLine src sp =
+  showInt ((Dg.lineCol src sp.start).line + 1)
+  ++ ":"
+  ++ showInt ((Dg.lineCol src sp.start).col + 1)
+
+-- | the elaboration trace of a file, one line per event: where, what
+explain : Dr.Checked -> List String
+explain c =
+  concatList
+    (map
+       (\(ev : Env.TraceEvent) ->
+          atLine c.source ev.span ++ "  " ++ ev.kind ++ "  " ++ ev.text MkUnit)
+       c.top.trace)
+    (map
+       (\(d : Diag) -> atLine c.source d.span ++ "  error  " ++ d.msg)
+       c.diags)
+
+-- The name at an offset
+--------------------------------------------------------------------------------
+
+infoLen : Env.Info -> Int
+infoLen i = i.span.end - i.span.start
+
+-- | the name at an offset: one written there, the innermost.  (What `do`
+-- | is read into, `bind`, is no name written: its span is the block's,
+-- | wider than the name, and it must not hide what is in the block.)
+infoAt : Dr.Checked -> Int -> Maybe Env.Info
+infoAt c off =
+  head
+    (sortBy
+       (\(a : Env.Info) (b : Env.Info) -> infoLen a <= infoLen b)
+       (filter
+          (\(i : Env.Info) ->
+             -- (a tag may be written with its `'`)
+             infoLen
+               i
+             <= strLength i.name + 1
+             && i.span.start <= off
+             && off <= i.span.end)
+          c.top.infos))
+
+-- | what the name at an offset resolved to, and its type
+typeAt : Dr.Checked -> Int -> Maybe String
+typeAt c off = case infoAt c off of
+  Just i ->
+    Just
+      (Ps.named i.name
+       ++ " : "
+       ++ i.ty MkUnit
+       ++ (case i.key of
+           Just _ -> "   (global)"
+           Nothing -> "   (local)"))
+  Nothing -> Nothing
+
+isTypedChar : Int -> Bool
+isTypedChar c =
+  c == 95
+  || c == 39
+  || c == 46
+  || 97 <= c && c <= 122
+  || 65 <= c && c <= 90
+  || 48 <= c && c <= 57
+
+typedFrom : String -> Int -> Int
+typedFrom src i =
+  if i > 0 && isTypedChar (charCode src (i - 1)) then typedFrom src (i - 1)
+  else i
+
+lastDot : String -> Int -> Maybe Int
+lastDot s i =
+  if i < 0 then Nothing
+  else if charCode s i == 46 then Just i
+  else lastDot s (i - 1)
+
+type Completion = { label : String, detail : String }
+
+completionDetail : Dr.Checked -> String -> String
+completionDetail c x = case G.lookupEntry c.top.globals x of
+  Just e -> Dr.showTySx c.top.globals (R.readbTy 0 e.type_)
+  Nothing -> case G.lookupEntry c.top.globals (c.module ++ "." ++ x) of
+    Just e -> Dr.showTySx c.top.globals (R.readbTy 0 e.type_)
+    Nothing -> ""
+
+completionOf : Dr.Checked -> String -> String -> String -> Maybe Completion
+completionOf c typed qualifier x =
+  if startsWith typed x && (not (strEq qualifier "") || not (contains "." x))
+    then Just
+        { label = fromMaybe x (stripPrefixS qualifier x)
+        , detail = completionDetail c x
+        }
+  else Nothing
+
+qualifierOf : String -> String
+qualifierOf typed = case lastDot typed (strLength typed - 1) of
+  Just i -> strSlice typed 0 (i + 1)
+  Nothing -> ""
+
+typedAt : Dr.Checked -> Int -> String
+typedAt c offset = strSlice c.source (typedFrom c.source offset) offset
+
+-- | What may be written where the name being typed ends, at `offset`:
+-- | the names in scope that start as it does, each with its type.  After
+-- | `M.`, the definitions of the module imported as `M`, without the `M.`.
+completionsAt : Dr.Checked -> Int -> List Completion
+completionsAt c offset =
+  sortBy
+    (\(a : Completion) (b : Completion) -> not (strLt b.label a.label))
+    (catMaybesQ
+       (map
+          (\x ->
+             completionOf
+               c
+               (typedAt c offset)
+               (qualifierOf (typedAt c offset))
+               x)
+          (Dr.nubStrD
+             (concatList
+                (map (\(o : Dr.Own) -> o.name) c.own)
+                (Mp.keys c.top.globals.aliases)))))
+
+-- References
+--------------------------------------------------------------------------------
+
+-- | What a name refers to: a global, by its key; a tag or a field
+-- | (`member`) of the type `key` names; or a local (`local`: where its
+-- | binder is) of the file `key` is the path of.
+type Target = { key : String, member : Maybe String, local : Maybe Pm.Span }
+
+globalT : String -> Target
+globalT k = { key = k, member = Nothing, local = Nothing }
+
+memberT : String -> String -> Target
+memberT k m = { key = k, member = Just m, local = Nothing }
+
+localT : String -> Pm.Span -> Target
+localT path b = { key = path, member = Nothing, local = Just b }
+
+eqMaybeStr : Maybe String -> Maybe String -> Bool
+eqMaybeStr Nothing Nothing = True
+eqMaybeStr (Just a) (Just b) = strEq a b
+eqMaybeStr _ _ = False
+
+eqMaybeSpan : Maybe Pm.Span -> Maybe Pm.Span -> Bool
+eqMaybeSpan Nothing Nothing = True
+eqMaybeSpan (Just a) (Just b) = sameSpan a b
+eqMaybeSpan _ _ = False
+
+eqTarget : Target -> Target -> Bool
+eqTarget a b =
+  strEq a.key b.key
+  && eqMaybeStr a.member b.member
+  && eqMaybeSpan a.local b.local
+
+-- | a name written in a file; the span is the name's alone; `defines`:
+-- | where it is defined
+type Occurrence =
+  { path : String, source : String, span : Pm.Span, defines : Bool }
+
+type Site = { target : Target, name : String, span : Pm.Span }
+
+type Named = { name : String, span : Pm.Span }
+
+keyOf : Dr.Checked -> String -> Maybe String
+keyOf c x = case find (\(o : Dr.Own) -> strEq o.name x) c.own of
+  Just o -> Just o.key
+  Nothing -> Nothing
+
+-- (the name alone: a tag's `'` is not part of it)
+site : Target -> String -> Pm.Span -> Site
+site t x sp =
+  { target = t
+  , name = x
+  , span = mkSpan (max sp.start (sp.end - strLength x)) sp.end
+  }
+
+globalSites : Dr.Checked -> String -> List Pm.Span -> List Site
+globalSites c x sps = case keyOf c x of
+  Just k -> map (\sp -> site (globalT k) x sp) sps
+  Nothing -> Nil
+
+memberSites : Dr.Checked -> String -> List Named -> List Site
+memberSites c x ms = case keyOf c x of
+  Just k -> map (\(m : Named) -> site (memberT k m.name) m.name m.span) ms
+  Nothing -> Nil
+
+headOf : Ntn -> Maybe Named
+headOf h = case (getGroup h).head of
+  Ident x sp -> Just { name = x, span = sp }
+  _ -> Nothing
+
+equationHead : Ntn -> Maybe Pm.Span
+equationHead (Infix l (Keyword ":=" _) _) = case headOf l of
+  Just x -> Just x.span
+  Nothing -> Nothing
+equationHead _ = Nothing
+
+tagOf : Ntn -> Maybe Named
+tagOf alt = case (getGroup alt).head of
+  NTag t sp -> Just { name = t, span = sp }
+  _ -> Nothing
+
+fieldOf : Ntn -> Maybe Named
+fieldOf (Infix (Ident x sp) (Keyword ":" _) _) = Just { name = x, span = sp }
+fieldOf _ = Nothing
+
+sumTags : Ntn -> List Named
+sumTags (NBlock "sum" _ alts _) = catMaybesQ (map tagOf alts)
+sumTags _ = Nil
+
+-- (a definition with named arguments, `data Pair a b = ...`: its name
+-- and its tags)
+defSites : Dr.Checked -> Ntn -> Ntn -> List Site
+defSites c h body = case headOf h of
+  Just x ->
+    concatList
+      (globalSites c x.name [x.span])
+      (memberSites c x.name (sumTags body))
+  Nothing -> Nil
+
+theorySites : Dr.Checked -> Ntn -> List Ntn -> List Site
+theorySites c h fs = case headOf h of
+  Just x ->
+    concatList
+      (globalSites c x.name [x.span])
+      (memberSites c x.name (catMaybesQ (map fieldOf fs)))
+  Nothing -> Nil
+
+declSites : Dr.Checked -> Ntn -> List Site
+declSites c n = case n of
+  MDecl _ "def" (Infix (Ident f fsp) (Keyword ":" _) (Juxt _ (NBlock "where" Nothing eqs _))) _ ->
+    globalSites c f (Cons fsp (catMaybesQ (map equationHead eqs)))
+  MDecl _ "def" (Infix (Infix h (Keyword ":" _) _) (Keyword ":=" _) body) _ ->
+    defSites c h body
+  MDecl _ "theory" (Infix h (Keyword ":=" _) (NBlock "sig" _ fs _)) _ ->
+    theorySites c h fs
+  MDecl _ "primitive" (Infix (Ident x sp) (Keyword ":" _) _) _ ->
+    globalSites c x [sp]
+  _ -> Nil
+
+-- | Where a file defines its names, as its notation says: each
+-- | declaration's name, in its signature and at the head of each
+-- | equation; a `data`'s tags; a `theory`'s fields.  (A declaration that
+-- | did not elaborate defines nothing to refer to.)
+sites : Dr.Checked -> List Site
+sites c = concatMap (\n -> declSites c n) c.ntns
+
+-- | where the global the name at an offset resolved to is defined, in a
+-- | program (the file last): its file, and the span of its name there.
+-- | (A local's binder is not kept by the elaborator: nothing, for one.)
+type Definition = { path : String, source : String, span : Pm.Span }
+
+type Defines = { c : Dr.Checked, name : String, span : Pm.Span }
+
+definesGo : String
+          -> Dr.Checked
+          -> List Dr.Own
+          -> List (Pair String Pm.Span)
+          -> Maybe Defines
+definesGo k c (Cons o os) (Cons (MkPair _ sp) sps) =
+  if strEq o.key k then Just { c = c, name = o.name, span = sp }
+  else definesGo k c os sps
+definesGo k c _ _ = Nothing
+
+definitionIn : Env.Info -> String -> Defines -> Definition
+definitionIn i k d =
+  { path = d.c.path
+  , source = d.c.source
+  , span =
+      -- (the name looked for is the one at the offset: a tag's is in its
+      -- type's declaration)
+      case find
+        (\(s : Site) ->
+           eqTarget s.target (if i.member then memberT k i.name else globalT k))
+        (sites d.c) of
+      Just s -> s.span
+      Nothing -> nameIn d.c.source i.name d.span
+  }
+
+definitionAt : List Dr.Checked -> Int -> Maybe Definition
+definitionAt program off = case last program of
+  Nothing -> Nothing
+  Just c -> case infoAt c off of
+    Nothing -> Nothing
+    Just i -> case i.key of
+      Nothing -> Nothing
+      Just k ->
+        -- (a primitive may be declared by more than one file: this
+        -- one's first)
+        case head
+          (catMaybesQ
+             (map
+                (\(c2 : Dr.Checked) -> definesGo k c2 c2.own c2.top.spans)
+                (reverse program))) of
+        Just d -> Just (definitionIn i k d)
+        Nothing -> Nothing
+
+-- | a target found, and the name it is defined as
+type Found = { target : Target, name : String }
+
+ownNameOf : List Dr.Checked -> String -> Maybe String
+ownNameOf Nil k = Nothing
+ownNameOf (Cons c rest) k = case find (\(o : Dr.Own) -> strEq o.key k) c.own of
+  Just o -> Just o.name
+  Nothing -> ownNameOf rest k
+
+withName : List Dr.Checked -> Target -> Maybe Found
+withName program t = case t.member of
+  Just m -> Just { target = t, name = m }
+  Nothing -> case ownNameOf program t.key of
+    Just x -> Just { target = t, name = x }
+    Nothing -> Nothing
+
+atOff : Int -> Pm.Span -> Bool
+atOff off sp = sp.start <= off && off <= sp.end
+
+orElse : {a : Type} -> Maybe a -> Maybe a -> Maybe a
+orElse (Just x) _ = Just x
+orElse Nothing y = y
+
+siteFound : List Dr.Checked -> Dr.Checked -> Int -> Maybe Found
+siteFound program c off = case find
+    (\(s : Site) -> atOff off s.span)
+    (sites c) of
+  Just s -> withName program s.target
+  Nothing -> Nothing
+
+-- (a field used by the fields after it: the field's)
+fieldFound : List Dr.Checked -> Dr.Checked -> Lc.Locals -> Int -> Maybe Found
+fieldFound program c ls off = case find
+    (\(f : Lc.FieldUse) -> atOff off f.use)
+    ls.fields of
+  Just f -> case find (\(s : Site) -> sameSpan s.span f.field) (sites c) of
+    Just s -> withName program s.target
+    Nothing -> Nothing
+  Nothing -> Nothing
+
+atLocal : Int -> Lc.Local -> Bool
+atLocal off l = atOff off l.binder || any (\sp -> atOff off sp) l.uses
+
+foundLocal : String -> Lc.Local -> Found
+foundLocal path l = { target = localT path l.binder, name = l.name }
+
+localFound : Dr.Checked -> Lc.Locals -> Int -> Maybe Found
+localFound c ls off = case find (\l -> atLocal off l) ls.locals of
+  Just l -> Just (foundLocal c.path l)
+  Nothing -> Nothing
+
+targetIn : List Dr.Checked -> Dr.Checked -> Lc.Locals -> Int -> Maybe Found
+targetIn program c ls off = case infoAt c off of
+  Just i -> case i.key of
+    Just k ->
+      withName program (if i.member then memberT k i.name else globalT k)
+    Nothing ->
+      orElse
+        (siteFound program c off)
+        (orElse (fieldFound program c ls off) (localFound c ls off))
+  Nothing ->
+    orElse
+      (siteFound program c off)
+      (orElse (fieldFound program c ls off) (localFound c ls off))
+
+-- | the name at an offset, in a program (the file last), as what it
+-- | refers to: a global or a member used there, or one the file defines
+-- | there; a local, at its binder or a use; and the name it is defined as
+targetAt : List Dr.Checked -> Int -> Maybe Found
+targetAt program off = case last program of
+  Just c -> targetIn program c (Lc.locals c.ntns) off
+  Nothing -> Nothing
+
+-- (a name's use, as the elaborator recorded it: the name alone)
+useOf : Target -> String -> Env.Info -> Maybe Pm.Span
+useOf t name i =
+  if eqMaybeStr i.key (Just t.key)
+  && (if i.member then eqMaybeStr t.member (Just i.name)
+      else eqMaybeStr t.member Nothing)
+    then Just
+        (mkSpan (max i.span.start (i.span.end - strLength name)) i.span.end)
+  else Nothing
+
+type Word = { text : String, span : Pm.Span }
+
+-- (a line's words, split at spaces, where they are)
+wordsOf : Int -> String -> Int -> List Word -> List Word
+wordsOf base line i acc =
+  if i >= strLength line then reverse acc
+  else if charCode line i == 32 then wordsOf base line (i + 1) acc
+  else wordsOf
+      base
+      line
+      (fromMaybe (strLength line) (indexFrom " " line i))
+      (Cons
+         { text =
+             strSlice line i (fromMaybe (strLength line) (indexFrom " " line i))
+         , span =
+             mkSpan
+               (base + i)
+               (base + fromMaybe (strLength line) (indexFrom " " line i))
+         }
+         acc)
+
+fixityWords : String -> List Word -> List Pm.Span
+fixityWords name ws = case ws of
+  Cons w _ ->
+    if strEq w.text "infixl" || strEq w.text "infixr" || strEq w.text "infix"
+      then map
+          (\(x : Word) -> x.span)
+          (filter (\(x : Word) -> strEq x.text name) ws)
+    else Nil
+  Nil -> Nil
+
+-- (`infixl + - above ==`: its words that are the name)
+fixityLine : String -> String -> Int -> List Pm.Span
+fixityLine name src p =
+  fixityWords
+    name
+    (wordsOf
+       p
+       (strSlice src p (fromMaybe (strLength src) (indexFrom "\n" src p)))
+       0
+       Nil)
+
+lineStarts : String -> List Int
+lineStarts src =
+  filter
+    (\p -> p == 0 || charCode src (p - 1) == 10)
+    (range 0 (strLength src - 1))
+
+wordsIn : String -> String -> Int -> Int -> List Pm.Span -> List Pm.Span
+wordsIn name src i to acc = case indexFrom name src i of
+  Just p ->
+    if p + strLength name <= to
+      then wordsIn
+          name
+          src
+          (p + 1)
+          to
+          (if wordAt src p name then Cons (mkSpan p (p + strLength name)) acc
+           else acc)
+    else reverse acc
+  Nothing -> reverse acc
+
+-- (in a watch's expectation, as text)
+expectedIn : String -> Dr.Checked -> List Pm.Span
+expectedIn name c =
+  concatMap
+    (\(w : T.Watch) ->
+       wordsIn
+         name
+         c.source
+         (Dr.expectation c.source w.span.end).from
+         (Dr.expectation c.source w.span.end).to
+         Nil)
+    c.top.watches
+
+isOperatorName : String -> Bool
+isOperatorName name = not (isNameChar (charCode name 0))
+
+fieldUsesOf : List Site -> Lc.Locals -> List Pm.Span
+fieldUsesOf ss ls =
+  map
+    (\(f : Lc.FieldUse) -> f.use)
+    (filter
+       (\(f : Lc.FieldUse) -> any (\(s : Site) -> sameSpan s.span f.field) ss)
+       ls.fields)
+
+moreIn : Target -> String -> Dr.Checked -> List Pm.Span
+moreIn t name c =
+  concatList
+    (if isOperatorName name && eqMaybeStr t.member Nothing
+       then concatMap (\p -> fixityLine name c.source p) (lineStarts c.source)
+     else Nil)
+    (if isOperatorName name then Nil else expectedIn name c)
+
+mkOccurrence : Dr.Checked -> Pm.Span -> Bool -> Occurrence
+mkOccurrence c sp defines =
+  { path = c.path, source = c.source, span = sp, defines = defines }
+
+occurrencesOf : Dr.Checked -> List Pm.Span -> List Pm.Span -> List Occurrence
+occurrencesOf c defs spans =
+  map
+    (\sp ->
+       mkOccurrence c sp (any (\(d : Pm.Span) -> d.start == sp.start) defs))
+    (nubByStart (sortSpans spans))
+
+inFileFound : Target
+            -> String
+            -> Dr.Checked
+            -> List Site
+            -> List Pm.Span
+            -> List Occurrence
+inFileFound t name c ss found =
+  occurrencesOf
+    c
+    (map (\(s : Site) -> s.span) ss)
+    (concatList found (if null found then Nil else moreIn t name c))
+
+inFileSites : Target -> String -> Dr.Checked -> List Site -> List Occurrence
+inFileSites t name c ss =
+  inFileFound
+    t
+    name
+    c
+    ss
+    (concatList
+       (catMaybesQ (map (\i -> useOf t name i) c.top.infos))
+       (concatList
+          (map (\(s : Site) -> s.span) ss)
+          (fieldUsesOf ss (Lc.locals c.ntns))))
+
+inFile : Target -> String -> Dr.Checked -> List Occurrence
+inFile t name c =
+  inFileSites t name c (filter (\(s : Site) -> eqTarget s.target t) (sites c))
+
+nubByPath : List Dr.Checked -> List Dr.Checked
+nubByPath Nil = Nil
+nubByPath (Cons c cs) =
+  Cons
+    c
+    (nubByPath (filter (\(d : Dr.Checked) -> not (strEq d.path c.path)) cs))
+
+sameBinder : Pm.Span -> Lc.Local -> Bool
+sameBinder b l = sameSpan l.binder b
+
+spansOfLocal : Lc.Local -> List Pm.Span
+spansOfLocal l = Cons l.binder l.uses
+
+localOccurrences : Dr.Checked -> Pm.Span -> List Occurrence
+localOccurrences c b = case find
+    (\l -> sameBinder b l)
+    (Lc.locals c.ntns).locals of
+  Just l ->
+    map (\sp -> mkOccurrence c sp (sameSpan sp b)) (sortSpans (spansOfLocal l))
+  Nothing -> Nil
+
+-- | every occurrence in a program of what a name refers to (`name`, as
+-- | it is defined), by file, in order: its definition, its uses -- the
+-- | elaborator's record of each -- and, as text, in the files that use
+-- | it, in a fixity declaration (an operator) and in a watch's
+-- | expectation (a local: its binder and its uses, in its file)
+occurrences : List Dr.Checked -> Target -> String -> List Occurrence
+occurrences program t name = case t.local of
+  Just b -> case find (\(c : Dr.Checked) -> strEq c.path t.key) program of
+    Just c -> localOccurrences c b
+    Nothing -> Nil
+  Nothing -> concatMap (\c -> inFile t name c) (nubByPath program)
+
+-- | a capitalised name (1), a variable (2), an operator (3), or none (0)
+isNameChar2 : Int -> Bool
+isNameChar2 d = d /= 47 && isNameChar d
+
+allChars : (Int -> Bool) -> String -> Int -> Bool
+allChars p s i =
+  if i >= strLength s then True else p (charCode s i) && allChars p s (i + 1)
+
+punctuation : Int -> Bool
+punctuation d =
+  d == 32
+  || d == 10
+  || d == 40
+  || d == 41
+  || d == 91
+  || d == 93
+  || d == 123
+  || d == 125
+  || d == 44
+  || d == 34
+  || d == 96
+
+nameClass : String -> Int
+nameClass x =
+  if strLength x == 0 then 0
+  else if 65 <= charCode x 0 && charCode x 0 <= 90
+    then if allChars isNameChar2 x 0 then 1 else 0
+  else if charCode x 0 == 95 || 97 <= charCode x 0 && charCode x 0 <= 122
+    then if allChars isNameChar2 x 0 then 2 else 0
+  else if allChars (\d -> not (isNameChar2 d) && not (punctuation d)) x 0 then 3
+  else 0
+
+-- | why a name cannot be renamed to another, if it cannot: a primitive is
+-- | the runtime's; a name stays the kind it is (a variable, a capitalised
+-- | name, an operator), and is not qualified
+renameRefused : Target -> String -> String -> Maybe String
+renameRefused t old new =
+  if eqMaybeStr t.member Nothing
+  && eqMaybeSpan t.local Nothing
+  && not (contains "." t.key)
+    then Just ("`" ++ old ++ "` is a primitive: its name is the runtime's")
+  else if nameClass old /= nameClass new
+    then Just ("`" ++ new ++ "` is not a name of the kind `" ++ old ++ "` is")
+  else Nothing
+
+-- Symbols
+--------------------------------------------------------------------------------
+
+type Child = { name : String, kind : Int, span : Pm.Span }
+
+-- | a file's definitions, for an outline: each with where it is, where
+-- | its name is, and its tags or fields (the kinds are the Language
+-- | Server Protocol's: enum, interface, function, operator; enum member,
+-- | field)
+type DocSymbol =
+  { name : String
+  , kind : Int
+  , span : Pm.Span
+  , selection : Pm.Span
+  , children : List Child
+  }
+
+kindOf : String -> String -> Int
+kindOf x text =
+  if strEq (strSlice text 0 5) "data " then 10
+  else if strEq (strSlice text 0 7) "theory " then 11
+  else if not (isNameChar (charCode x 0)) then 25
+  else 12
+
+-- (one that did not elaborate, not even its type: still where it is)
+brokenSymbol : Dr.Checked -> Pair String Pm.Span -> DocSymbol
+brokenSymbol c (MkPair x sp) =
+  { name = x
+  , kind = kindOf x (strSlice c.source sp.start sp.end)
+  , span = sp
+  , selection = nameIn c.source x sp
+  , children = Nil
+  }
+
+isMember : Site -> Bool
+isMember s = case s.target.member of
+  Just _ -> True
+  Nothing -> False
+
+childOf : Bool -> Site -> Child
+childOf isData m =
+  { name = m.name, kind = if isData then 22 else 8, span = m.span }
+
+symbolWith : Dr.Checked -> Dr.Own -> Pm.Span -> List Site -> DocSymbol
+symbolWith c o sp own =
+  { name = o.name
+  , kind = kindOf o.name (strSlice c.source sp.start sp.end)
+  , span = sp
+  , selection = case find (\(s : Site) -> not (isMember s)) own of
+      Just s -> s.span
+      Nothing -> nameIn c.source o.name sp
+  , children =
+      map
+        (\m ->
+           childOf
+             (strEq (strSlice c.source sp.start (sp.start + 5)) "data ")
+             m)
+        (filter isMember own)
+  }
+
+symbolOf : Dr.Checked -> List Site -> Dr.Own -> Pm.Span -> DocSymbol
+symbolOf c ss o sp =
+  symbolWith
+    c
+    o
+    sp
+    (filter
+       (\(s : Site) -> s.span.start >= sp.start && s.span.end <= sp.end)
+       ss)
+
+symbolsGo : Dr.Checked
+          -> List Site
+          -> List Dr.Own
+          -> List (Pair String Pm.Span)
+          -> List DocSymbol
+symbolsGo c ss (Cons o os) (Cons (MkPair _ sp) sps) =
+  Cons (symbolOf c ss o sp) (symbolsGo c ss os sps)
+symbolsGo c ss _ _ = Nil
+
+symbols : Dr.Checked -> List DocSymbol
+symbols c =
+  sortBy
+    (\(a : DocSymbol) (b : DocSymbol) -> a.span.start <= b.span.start)
+    (concatList
+       (symbolsGo c (sites c) c.own c.top.spans)
+       (map (\p -> brokenSymbol c p) c.top.broken))

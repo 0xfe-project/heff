@@ -1,0 +1,237 @@
+-- The locals of a file, as written: each binder, and the names that
+-- refer to it.  A port of `Heff.Locals`.  Read from the notation --
+-- before the equations are compiled to matches, which merges the
+-- variables of different equations into one -- by the scoping the
+-- elaborator follows: a name refers to the nearest binder of it around
+-- it, else to a global.
+--
+-- What binds: a lambda's parameters and a `case` alternative's, an
+-- equation's patterns, `x <- e` in a `do` block (for the statements
+-- after it), a named argument of a function type (for what follows it),
+-- a definition's or a theory's parameters (for what follows them); and
+-- a signature's implicit arguments, which its equations are under.  A
+-- record type's field is in scope for the fields after it: a use of one
+-- is the field's (`fields`), not a local's.
+
+import compiler.notation
+import compiler.params as Pm
+import prelude
+
+-- | a local: its name, where its binder is, where it is used
+type Local = { name : String, binder : Pm.Span, uses : List Pm.Span }
+
+-- | a use of a record type's field among the fields after it (`t` of
+-- | `m : t -> t`), and where the field is declared
+type FieldUse = { name : String, field : Pm.Span, use : Pm.Span }
+
+type Binder = { name : String, span : Pm.Span, field : Bool }
+
+type Use = { binder : Binder, use : Pm.Span }
+
+type Found = { binders : List Binder, uses : List Use }
+
+type Locals = { locals : List Local, fields : List FieldUse }
+
+none : Found
+none = { binders = Nil, uses = Nil }
+
+both : Found -> Found -> Found
+both a b =
+  { binders = concatList a.binders b.binders, uses = concatList a.uses b.uses }
+
+bound : List Binder -> Found
+bound bs = { binders = bs, uses = Nil }
+
+binder : String -> Pm.Span -> Binder
+binder name span = { name = name, span = span, field = False }
+
+sameSpan : Pm.Span -> Pm.Span -> Bool
+sameSpan a b = a.start == b.start && a.end == b.end
+
+-- | binders in scope, the innermost first
+scope : List Binder -> List Binder -> List Binder
+scope bs env = foldl (\e b -> Cons b e) env bs
+
+findBinder : String -> List Binder -> Maybe Binder
+findBinder x Nil = Nothing
+findBinder x (Cons b rest) =
+  if strEq b.name x then Just b else findBinder x rest
+
+-- | the variables a pattern binds (`_` binds nothing; a tag is no
+-- | variable)
+patternBinders : Ntn -> List Binder
+patternBinders (Ident x sp) = if strEq x "_" then Nil else [binder x sp]
+patternBinders (NBrace p _) = patternBinders p
+patternBinders (NTuple ps _) = concatMap patternBinders ps
+patternBinders (Juxt a b) = concatList (patternBinders a) (patternBinders b)
+patternBinders _ = Nil
+
+isIdent : Ntn -> Bool
+isIdent (Ident _ _) = True
+isIdent _ = False
+
+-- | the walk: a name's use, or what binds around what
+type Walk =
+  { walk : List Binder -> Ntn -> Found
+  , doBlock : List Binder -> List Ntn -> Found
+  , sigBlock : List Binder -> List Ntn -> Found
+  }
+
+walkAll : Walk -> List Binder -> List Ntn -> Found
+walkAll w env ns = foldl (\acc x -> both acc (w.walk env x)) none ns
+
+walkMaybe : Walk -> List Binder -> Maybe Ntn -> Found
+walkMaybe w env (Just h) = w.walk env h
+walkMaybe w env Nothing = none
+
+under : Walk -> List Binder -> List Binder -> Ntn -> Found
+under w env bs r = both (bound bs) (w.walk (scope bs env) r)
+
+-- (a field's name, set or declared, is no use of anything)
+fieldSetting : Walk -> List Binder -> Ntn -> Found
+fieldSetting w env (Infix (Ident _ _) (Keyword ":=" _) e) = w.walk env e
+fieldSetting w env f = w.walk env f
+
+walkF : Walk -> List Binder -> Ntn -> Found
+walkF w env n = case n of
+  Ident x sp -> case findBinder x env of
+    Just b -> { binders = Nil, uses = [{ binder = b, use = sp }] }
+    Nothing -> none
+  -- a lambda with its binder annotated, `\(x : T) -> e`: `T` is outside
+  Infix (Infix (Ident x sp) (Keyword ":" _) a) (Keyword "=>" _) r ->
+    both (w.walk env a) (under w env [binder x sp] r)
+  -- a lambda, a `case` alternative
+  Infix l (Keyword "=>" _) r -> under w env (patternBinders l) r
+  -- an equation: its head is the definition's name, its arguments
+  -- patterns; a named argument of a function type
+  Infix l (Keyword ":=" _) r ->
+    if isIdent (getGroup l).head
+      then under w env (concatMap patternBinders (getGroup l).args) r
+    else both (w.walk env l) (w.walk env r)
+  Infix (Infix (Ident x sp) (Keyword ":" _) a) (Keyword "->" _) r ->
+    both (w.walk env a) (under w env [binder x sp] r)
+  Infix (NBrace (Infix (Ident x sp) (Keyword ":" _) a) _) (Keyword "->" _) r ->
+    both (w.walk env a) (under w env [binder x sp] r)
+  NBlock "do" h stmts _ -> both (walkMaybe w env h) (w.doBlock env stmts)
+  NBlock "struct" h fs _ ->
+    both
+      (walkMaybe w env h)
+      (foldl (\acc f -> both acc (fieldSetting w env f)) none fs)
+  NBlock "sig" h fs _ -> both (walkMaybe w env h) (w.sigBlock env fs)
+  Infix l op r -> both (w.walk env l) (both (w.walk env op) (w.walk env r))
+  Juxt a b -> both (w.walk env a) (w.walk env b)
+  NBlock _ h ns _ -> both (walkMaybe w env h) (walkAll w env ns)
+  MDecl _ _ x _ -> w.walk env x
+  NTuple ns _ -> walkAll w env ns
+  NBrace x _ -> w.walk env x
+  _ -> none
+
+-- | `x <- e`: `x` is bound for the statements after it
+doBlockF : Walk -> List Binder -> List Ntn -> Found
+doBlockF w env Nil = none
+doBlockF w env (Cons (Infix (Ident x sp) (Keyword "<-" _) e) rest) =
+  both
+    (w.walk env e)
+    (both (bound [binder x sp]) (w.doBlock (Cons (binder x sp) env) rest))
+doBlockF w env (Cons s rest) = both (w.walk env s) (w.doBlock env rest)
+
+-- | a record type's fields: each in scope for those after it
+sigBlockF : Walk -> List Binder -> List Ntn -> Found
+sigBlockF w env Nil = none
+sigBlockF w env (Cons (Infix (Ident x sp) (Keyword ":" _) a) rest) =
+  both
+    (w.walk env a)
+    (both
+       (bound [{ name = x, span = sp, field = True }])
+       (w.sigBlock (Cons { name = x, span = sp, field = True } env) rest))
+sigBlockF w env (Cons f rest) = both (w.walk env f) (w.sigBlock env rest)
+
+walker : Walk
+walker =
+  { walk = \env n -> walkF walker env n
+  , doBlock = \env ns -> doBlockF walker env ns
+  , sigBlock = \env ns -> sigBlockF walker env ns
+  }
+
+-- | a signature's implicit arguments, which its equations are under
+implicitsOf : Ntn -> List Binder
+implicitsOf (Infix (NBrace (Infix (Ident x sp) (Keyword ":" _) _) _) (Keyword "->" _) r) =
+  Cons (binder x sp) (implicitsOf r)
+implicitsOf _ = Nil
+
+-- | a definition's or theory's argument, as written: a name, perhaps
+-- | annotated
+type Argument = { binder : Binder, ty : Maybe Ntn }
+
+namedArg : Ntn -> Maybe Argument
+namedArg (Ident x sp) = Just { binder = binder x sp, ty = Nothing }
+namedArg (Infix (Ident x sp) (Keyword ":" _) a) =
+  Just { binder = binder x sp, ty = Just a }
+namedArg (NBrace (Infix (Ident x sp) (Keyword ":" _) a) _) =
+  Just { binder = binder x sp, ty = Just a }
+namedArg _ = Nothing
+
+-- | each argument in scope for those after it, then what follows them
+arguments : List Binder -> List Ntn -> List Ntn -> Found
+arguments env Nil rest = walkAll walker env rest
+arguments env (Cons a tl) rest = case namedArg a of
+  -- (an argument's type is in the scope of those before it)
+  Just arg ->
+    both
+      (walkMaybe walker env arg.ty)
+      (both (bound [arg.binder]) (arguments (Cons arg.binder env) tl rest))
+  Nothing -> both (walker.walk env a) (arguments env tl rest)
+
+-- | a declaration: its signature, then its equations under the
+-- | signature's implicit arguments
+declaration : Ntn -> Found
+declaration n = case n of
+  MDecl _ "def" (Infix (Ident _ _) (Keyword ":" _) (Juxt ty (NBlock "where" Nothing eqs _))) _ ->
+    -- (the implicit arguments are bound in the signature, which walks
+    -- them)
+    both
+      (walker.walk Nil ty)
+      (foldl
+         (\acc eq -> both acc (walker.walk (scope (implicitsOf ty) Nil) eq))
+         none
+         eqs)
+  -- a definition with named arguments (`data Pair a b = ...`): each in
+  -- scope for those after it, the type, and the body
+  MDecl _ "def" (Infix (Infix h (Keyword ":" _) ty) (Keyword ":=" _) body) _ ->
+    if isIdent (getGroup h).head then arguments Nil (getGroup h).args [ty, body]
+    else walker.walk Nil n
+  -- a theory's parameters (`theory SET a`)
+  MDecl _ "theory" (Infix h (Keyword ":=" _) body) _ ->
+    if isIdent (getGroup h).head then arguments Nil (getGroup h).args [body]
+    else walker.walk Nil n
+  MDecl _ _ x _ -> walker.walk Nil x
+  _ -> walker.walk Nil n
+
+usesOf : List Use -> Binder -> List Pm.Span
+usesOf us b =
+  map
+    (\(u : Use) -> u.use)
+    (filter (\(u : Use) -> sameSpan u.binder.span b.span) us)
+
+mkLocal : List Use -> Binder -> Local
+mkLocal us b = { name = b.name, binder = b.span, uses = usesOf us b }
+
+mkFieldUse : Use -> FieldUse
+mkFieldUse u = { name = u.binder.name, field = u.binder.span, use = u.use }
+
+localsOf : Found -> Locals
+localsOf found =
+  { locals =
+      map
+        (\b -> mkLocal found.uses b)
+        (filter (\(b : Binder) -> not b.field) found.binders)
+  , fields =
+      map
+        (\u -> mkFieldUse u)
+        (filter (\(u : Use) -> u.binder.field) found.uses)
+  }
+
+-- | the locals of a file, and the uses of record fields among the
+-- | fields after them
+locals : List Ntn -> Locals
+locals ntns = localsOf (foldl (\acc n -> both acc (declaration n)) none ntns)

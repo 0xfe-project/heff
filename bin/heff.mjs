@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..");
 const selfHosted = join(root, "output", "heff.mjs");
-const referenceOnly = ["lsp", "type-at", "explain", "dump-nbe"];
+const referenceOnly = ["lsp", "dump-nbe"];
 
 const args = process.argv.slice(2);
 if (referenceOnly.includes(args[0]) || !existsSync(selfHosted)) {

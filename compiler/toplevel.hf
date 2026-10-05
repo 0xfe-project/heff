@@ -1020,25 +1020,34 @@ mkWatch span entry = { span = span, entry = entry }
 
 type TestDecl = { name : String, span : Pm.Span }
 
+-- | a module elaborated: its globals, what went wrong, what each
+-- | definition is stored under and where it is; `broken`: the
+-- | declarations that did not elaborate, not even their types (where
+-- | each is); `infos` and `trace`: what elaboration found for the IDE,
+-- | and its steps (for `heff explain`)
 type TopResult =
   { globals : G.Globals
   , diags : List Diag
   , keys : List String
-  , broken : List String
+  , broken : List (Pair String Pm.Span)
   , watches : List Watch
   , tests : List TestDecl
   , spans : List (Pair String Pm.Span)
+  , infos : List Info
+  , trace : List TraceEvent
   }
 
 mkTop : G.Globals
       -> List Diag
       -> List String
-      -> List String
+      -> List (Pair String Pm.Span)
       -> List Watch
       -> List TestDecl
       -> List (Pair String Pm.Span)
+      -> List Info
+      -> List TraceEvent
       -> TopResult
-mkTop globals diags keys broken watches tests spans =
+mkTop globals diags keys broken watches tests spans infos trace =
   { globals = globals
   , diags = diags
   , keys = keys
@@ -1046,6 +1055,8 @@ mkTop globals diags keys broken watches tests spans =
   , watches = watches
   , tests = tests
   , spans = spans
+  , infos = infos
+  , trace = trace
   }
 
 appendT : {a : Type} -> List a -> List a -> List a
@@ -1098,12 +1109,38 @@ topBroken kf acc n diags = case declNameN n of
           else G.addAlias x (kf x) acc.globals))
       diags
       acc.keys
-      (Cons x acc.broken)
+      (Cons (MkPair x (ntnSpan n)) acc.broken)
       acc.watches
       acc.tests
       acc.spans
+      acc.infos
+      acc.trace
   Nothing ->
-    mkTop acc.globals diags acc.keys acc.broken acc.watches acc.tests acc.spans
+    mkTop
+      acc.globals
+      diags
+      acc.keys
+      acc.broken
+      acc.watches
+      acc.tests
+      acc.spans
+      acc.infos
+      acc.trace
+
+-- (what a declaration's elaboration found for the IDE, and its steps,
+-- kept: the state and the accumulator both hold them newest first)
+keepSt : ElabSt -> TopResult -> TopResult
+keepSt st acc =
+  mkTop
+    acc.globals
+    acc.diags
+    acc.keys
+    acc.broken
+    acc.watches
+    acc.tests
+    acc.spans
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
 
 topTake : (String -> String)
         -> TopResult
@@ -1111,7 +1148,11 @@ topTake : (String -> String)
         -> Pair (Either Diag Elaborated) ElabSt
         -> TopResult
 topTake kf acc n (MkPair (Left d) st) =
-  topBroken kf acc n (consAll acc.diags (appendT (recChron st) (reportedD d)))
+  topBroken
+    kf
+    (keepSt st acc)
+    n
+    (consAll acc.diags (appendT (recChron st) (reportedD d)))
 topTake kf acc n (MkPair (Right r) st) =
   mkTop
     (G.addAlias r.name r.key (G.addEntry r.key r.entry acc.globals))
@@ -1121,6 +1162,8 @@ topTake kf acc n (MkPair (Right r) st) =
     acc.watches
     acc.tests
     (Cons (MkPair r.name (ntnSpan n)) acc.spans)
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
 
 watchTake : TopResult
           -> Pm.Span
@@ -1135,6 +1178,8 @@ watchTake acc sp (MkPair (Left d) st) =
     acc.watches
     acc.tests
     acc.spans
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
 watchTake acc sp (MkPair (Right entry) st) =
   mkTop
     acc.globals
@@ -1144,6 +1189,8 @@ watchTake acc sp (MkPair (Right entry) st) =
     (Cons (mkWatch sp entry) acc.watches)
     acc.tests
     acc.spans
+    (appendT (core st).infos acc.infos)
+    (appendT (core st).trace acc.trace)
 
 testDiag : Ntn -> Diag
 testDiag n =
@@ -1168,6 +1215,8 @@ topOne kf acc (MDecl Nil "test" (Ident x xsp) sp) =
     acc.watches
     (Cons { name = x, span = sp } acc.tests)
     acc.spans
+    acc.infos
+    acc.trace
 topOne kf acc (MDecl Nil "test" n sp) =
   mkTop
     acc.globals
@@ -1177,6 +1226,8 @@ topOne kf acc (MDecl Nil "test" n sp) =
     acc.watches
     acc.tests
     acc.spans
+    acc.infos
+    acc.trace
 topOne kf acc n = topTake kf acc n (runE (elabDecl kf acc.globals n) emptySt)
 
 topGo : (String -> String) -> TopResult -> List Ntn -> TopResult
@@ -1189,10 +1240,12 @@ topGo kf acc Nil =
     (reverse acc.watches)
     (reverse acc.tests)
     (reverse acc.spans)
+    (reverse acc.infos)
+    (reverse acc.trace)
 topGo kf acc (Cons n rest) = topGo kf (topOne kf acc n) rest
 
 emptyTop : G.Globals -> TopResult
-emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil
+emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil Nil Nil
 
 -- | every declaration of a module, each elaborated in a fresh state
 topModule : String -> G.Globals -> List Ntn -> TopResult
@@ -1232,6 +1285,8 @@ thawKeep acc d g =
     acc.watches
     acc.tests
     (Cons (MkPair d.name d.span) acc.spans)
+    acc.infos
+    acc.trace
 
 thawGlobals : TopResult -> ThawedDef -> G.Globals
 thawGlobals acc d =
@@ -1265,6 +1320,8 @@ thawDone acc =
     acc.watches
     acc.tests
     (reverse acc.spans)
+    acc.infos
+    acc.trace
 
 -- | a module thawed from a cache: its definitions' syntax evaluated
 -- | back into globals -- `topModule` with the elaboration already done
@@ -1277,7 +1334,16 @@ topThawed g0 defs =
 
 withParse : TopResult -> List Diag -> TopResult
 withParse t ds =
-  mkTop t.globals (appendT ds t.diags) t.keys t.broken t.watches t.tests t.spans
+  mkTop
+    t.globals
+    (appendT ds t.diags)
+    t.keys
+    t.broken
+    t.watches
+    t.tests
+    t.spans
+    t.infos
+    t.trace
 
 noImports : String -> Bool
 noImports x = False

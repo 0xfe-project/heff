@@ -131,6 +131,16 @@ type Hole = { stx : Sx.Tm, val : V.V }
 downFrom : Int -> List Int
 downFrom n = if n < 0 then Nil else Cons n (downFrom (n - 1))
 
+-- (a context of `n` locals, named for a trace: `x0` the outermost)
+namesFor : Int -> List String
+namesFor n =
+  if n <= 0 then Nil else Cons ("x" ++ showInt (n - 1)) (namesFor (n - 1))
+
+-- | a metavariable's type, for the trace, as the metacontext has it
+metaTyShown : V.MetaCtx -> Int -> V.Ty -> String
+metaTyShown mc len ty =
+  Ps.printTy Ps.plainImplicits 0 (namesFor len) (U.zonkTy mc (R.readbTy len ty))
+
 -- | A metavariable of type `ty`, applied to every local in scope (so its
 -- | solution may mention them).
 freshMeta : Int -> V.Locals V.V -> V.Ty -> String -> P.Span -> Elab Hole
@@ -153,7 +163,12 @@ freshMeta len locals ty name sp = do
                  c.metas)
               (m + 1)
               c))
-  traceE sp "meta"
+  mc <- gets (\st -> (core st).metas)
+  traceE
+      sp
+      "meta"
+      (\u ->
+         "?" ++ showInt m ++ " (" ++ name ++ ") : " ++ metaTyShown mc len ty)
   pure
       { stx = SMetaApp m (A.fromList (downFrom (len - 1))) (R.readbTy len ty)
       , val =
@@ -202,6 +217,21 @@ solveHole g cs m holeVal argStx argVal = do
     Just e -> case e.sol of
       Nothing -> do
         fillHole g m e argStx
+        mc2 <- gets (\st -> (core st).metas)
+        traceE
+            e.span
+            "solve"
+            (\u ->
+               "?"
+               ++ showInt m
+               ++ " ("
+               ++ e.name
+               ++ ") := "
+               ++ Ps.printEl
+                 Ps.plainImplicits
+                 0
+                 Nil
+                 (U.zonkEl mc2 (U.lamsU e.arity argStx)))
         pure (Right MkUnit)
       Just _ -> Mt.unifyEl g cs holeVal argVal
     Nothing -> Mt.unifyEl g cs holeVal argVal
@@ -407,7 +437,12 @@ resolveWanted e sp hm holeVal goal final = do
         Cons one Nil -> do
           r <- solveHole e.globals (shape e.scope) hm holeVal one.stx one.val
           case r of
-            Right _ -> pure True
+            Right _ -> do
+              traceE
+                  sp
+                  "instance"
+                  (\u -> "found " ++ one.name ++ " : " ++ instShown e mc goal)
+              pure True
             Left err ->
               failWithNote
                 (a := Bool)
@@ -442,6 +477,16 @@ metaOf _ = 0 - 1
 insertInstance : ElabEnv -> P.Span -> V.Ty -> String -> Elab M.El
 insertInstance e sp goal name = do
   hole <- freshMeta e.scope.len e.scope.locals goal name sp
+  mc0 <- gets (\st -> (core st).metas)
+  -- (measured: a goal already determined here would need no deferral)
+  traceE
+      sp
+      "instance"
+      (\u ->
+         "wanted "
+         ++ instShown e mc0 goal
+         ++ (if null (metasLeft e mc0 goal) then "  [ready at the call]"
+             else "  [waits for implicits]"))
   modify
       (withWanted
          (\ws ->
@@ -850,7 +895,10 @@ delayChkOn e sp what c keyTy ty = do
                  keyTy
                  (delayedCheck e sp what c ty (metaOfStx (hole.stx)) hole))
               ds))
-  traceE sp "delay"
+  traceE
+      sp
+      "delay"
+      (\u -> what ++ " waits for its type ?" ++ showInt (metaOfStx hole.stx))
   pure (mEl hole.stx hole.val)
 
 delayChk : ElabEnv -> P.Span -> String -> Chk -> V.Ty -> Elab M.El
@@ -961,7 +1009,17 @@ applyGo sp e a (MkPair m a') = do
   r <- case r0 of
     Left err -> specialized e (M.valN m) a a' (Left err)
     Right x -> pure (Right x)
-  traceE sp "unify"
+  mc <- gets (\st -> (core st).metas)
+  traceE
+      sp
+      "unify"
+      (\u ->
+         instShown e mc a
+         ++ "  =?=  "
+         ++ instShown e mc a'
+         ++ (case r of
+             Right _ -> "   ok"
+             Left _ -> "   FAILS"))
   case r of
     Right _ -> do
       Mt.runDelayed False
@@ -1129,7 +1187,13 @@ recordName : ElabEnv -> V.Ty -> String -> P.Span -> V.Ty -> Elab Unit
 recordName e a x sp ty = case a of
   VDecode (HGlobal k) sp2 u described el ->
     if sp.end - sp.start == strLength x || sp.end - sp.start == strLength x + 1
-      then record { span = sp, name = x, key = Just k, member = True }
+      then record
+          { span = sp
+          , name = x
+          , key = Just k
+          , member = True
+          , ty = \u -> tyStr e ty
+          }
     else pure MkUnit
   _ -> pure MkUnit
 
@@ -1799,7 +1863,13 @@ find sp x =
   MkSyn (\e -> case findLocal e x of
   Right (MkPair m ty) -> do
     -- (the definition's own name, local 0: the global it is)
-    record { span = sp, name = x, key = selfKeyOf e x, member = False }
+    record
+        { span = sp
+        , name = x
+        , key = selfKeyOf e x
+        , member = False
+        , ty = \u -> tyStr e ty
+        }
     pure (MkPair m ty)
   Left Delayed2 ->
     failWith
@@ -1810,7 +1880,13 @@ find sp x =
        ++ " is the definition being elaborated: it is in hand only under a lambda, where a type is expected of it (an argument, a branch, the result -- not a case scrutinee)")
   Left NotInScope -> case G.lookupKey e.globals x of
     Just (MkPair key ge) -> do
-      record { span = sp, name = x, key = Just key, member = False }
+      record
+          { span = sp
+          , name = x
+          , key = Just key
+          , member = False
+          , ty = \u -> tyStr e ge.type_
+          }
       pure (MkPair (M.global key ge.value) ge.type_)
     Nothing ->
       -- (not an error of its own: that of the definition is reported)
