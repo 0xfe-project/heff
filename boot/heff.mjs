@@ -1,4 +1,6 @@
+#!/usr/bin/env node
 // Generated from Hippogriff; do not edit.
+import { Worker as $Worker, isMainThread as $isMainThread } from "node:worker_threads";
 import { readFile as $readFile, writeFile as $writeFile, mkdir as $mkdir } from "node:fs";
 import { diffWordsWithSpace as $diffWordsWithSpace } from "diff";
 import { fileURLToPath as $fileURLToPath, pathToFileURL as $pathToFileURL } from "node:url";
@@ -5001,7 +5003,7 @@ const computationEffect = (g, t) => {
   return $nomatch(t);
 };
 
-const evalElF = (r, g, c, x4, vs) => {
+const evalTermF = (r, g, c, x4, vs) => {
   switch (x4.$) {
     case "SLocal": {
       const i = x4.a[0];
@@ -5401,7 +5403,7 @@ const evalElF = (r, g, c, x4, vs) => {
   return $nomatch(x4);
 };
 
-const evalTyF = (r, g, c, x4, vs) => {
+const evalTypeF = (r, g, c, x4, vs) => {
   switch (x4.$) {
     case "SU": {
       const u = x4.a[0];
@@ -5593,7 +5595,7 @@ const evalTyF = (r, g, c, x4, vs) => {
   return $nomatch(x4);
 };
 
-const evaluator = $lazy(() => ({ el: (g) => (c) => (s) => (vs) => evalElF(evaluator(), g, c, s, vs), ty: (g) => (c) => (s) => (vs) => evalTyF(evaluator(), g, c, s, vs) }));
+const evaluator = $lazy(() => ({ el: (g) => (c) => (s) => (vs) => evalTermF(evaluator(), g, c, s, vs), ty: (g) => (c) => (s) => (vs) => evalTypeF(evaluator(), g, c, s, vs) }));
 
 const emptyScope = { len: 0n, names: { $: "Nil", a: [] }, locals: { $: "LNil", a: [] }, ctx: { $: "CEmpty", a: [] } };
 
@@ -15749,7 +15751,7 @@ const readbCloTy = (r, n, dom, x4) => {
   return $nomatch(x4);
 };
 
-const readbElF = (r, n, x3) => {
+const readbTermF = (r, n, x3) => {
   switch (x3.$) {
     case "VNeu": {
       const h = x3.a[0];
@@ -15876,7 +15878,7 @@ const goRT = (r$, i$, ls$, x4$) => {
   }
 };
 
-const readbTyF = (r, n, x3) => {
+const readbTypeF = (r, n, x3) => {
   switch (x3.$) {
     case "VU": {
       const u = x3.a[0];
@@ -15943,9 +15945,9 @@ const readbTyF = (r, n, x3) => {
   return $nomatch(x3);
 };
 
-const rb = $lazy(() => ({ el: (n) => (v) => readbElF(rb(), n, v), ty: (n) => (t) => readbTyF(rb(), n, t) }));
+const rb = $lazy(() => ({ el: (n) => (v) => readbTermF(rb(), n, v), ty: (n) => (t) => readbTypeF(rb(), n, t) }));
 
-const renameElF = (k, r, e) => {
+const renameTermF = (k, r, e) => {
   switch (e.$) {
     case "SLocal": {
       const x = e.a[0];
@@ -16071,7 +16073,7 @@ const renameElF = (k, r, e) => {
   return $nomatch(e);
 };
 
-const compiler_rename_renameTyF = (k, r, t) => {
+const compiler_rename_renameTypeF = (k, r, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -16137,7 +16139,7 @@ const compiler_rename_renameTyF = (k, r, t) => {
   return $nomatch(t);
 };
 
-const rkOf = (r) => ({ el: (e) => renameElF(rkOf(r), r, e), ty: (t) => compiler_rename_renameTyF(rkOf(r), r, t) });
+const rkOf = (r) => ({ el: (e) => renameTermF(rkOf(r), r, e), ty: (t) => compiler_rename_renameTypeF(rkOf(r), r, t) });
 
 const describeKey = (x) => {
   const s = $strSlice(x, BigInt(x.length) - BigInt("#T".length), BigInt(x.length)) === "#T" ? $T : $F;
@@ -16195,7 +16197,7 @@ const nubFirst = (x1$) => {
   }
 };
 
-const globalsElF = (k, e) => {
+const globalsTermF = (k, e) => {
   switch (e.$) {
     case "SLocal": {
       const x = e.a[0];
@@ -16332,7 +16334,7 @@ const globalsElF = (k, e) => {
   return $nomatch(e);
 };
 
-const globalsTyF = (k, t) => {
+const globalsTypeF = (k, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -16413,7 +16415,7 @@ const globalsTyF = (k, t) => {
   return $nomatch(t);
 };
 
-const gk = $lazy(() => ({ el: (e) => globalsElF(gk(), e), ty: (t) => globalsTyF(gk(), t) }));
+const gk = $lazy(() => ({ el: (e) => globalsTermF(gk(), e), ty: (t) => globalsTypeF(gk(), t) }));
 
 const firstAliasOf = (x1$, x$) => {
   for (;;) {
@@ -37764,7 +37766,7 @@ const postponeU = (cs, l, r, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "
   return $nomatch(st);
 })()] });
 
-const metasElF = (r, mc, depth, len, v0) => {
+const metasTermF = (r, mc, depth, len, v0) => {
   const s = depth <= 0n ? $T : $F;
   switch (s.$) {
     case "True": {
@@ -37914,7 +37916,7 @@ const metasElF = (r, mc, depth, len, v0) => {
   return $nomatch(s);
 };
 
-const metasTyF = (r, mc, depth, len, t0) => {
+const metasTypeF = (r, mc, depth, len, t0) => {
   const s = depth <= 0n ? $T : $F;
   switch (s.$) {
     case "True": {
@@ -38028,7 +38030,7 @@ const metasSpF = (r, mc, depth, len, x5) => {
   return $nomatch(x5);
 };
 
-const metasK = (mc) => ({ mel: (depth) => (len) => (v) => metasElF(metasK(mc), mc, depth, len, v), mty: (depth) => (len) => (t) => metasTyF(metasK(mc), mc, depth, len, t), msp: (depth) => (len) => (sp) => metasSpF(metasK(mc), mc, depth, len, sp) });
+const metasK = (mc) => ({ mel: (depth) => (len) => (v) => metasTermF(metasK(mc), mc, depth, len, v), mty: (depth) => (len) => (t) => metasTypeF(metasK(mc), mc, depth, len, t), msp: (depth) => (len) => (sp) => metasSpF(metasK(mc), mc, depth, len, sp) });
 
 const poisonMany = (ms, st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, (() => {
   switch (st.$) {
@@ -38140,7 +38142,7 @@ const substVar = (idxs, d, i) => {
   return $nomatch(s);
 };
 
-const substElF = (r, idxs, d, t) => {
+const substTermF = (r, idxs, d, t) => {
   switch (t.$) {
     case "SLocal": {
       const i = t.a[0];
@@ -38384,7 +38386,7 @@ const substTyFields = (r$, d$, i$, x4$) => {
   }
 };
 
-const substTyF = (r, idxs, d, t) => {
+const substTypeF = (r, idxs, d, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -38451,7 +38453,7 @@ const substTyF = (r, idxs, d, t) => {
   return $nomatch(t);
 };
 
-const substOf = (idxs) => ({ el: (d) => (t) => substElF(substOf(idxs), idxs, d, t), ty: (d) => (t) => substTyF(substOf(idxs), idxs, d, t) });
+const substOf = (idxs) => ({ el: (d) => (t) => substTermF(substOf(idxs), idxs, d, t), ty: (d) => (t) => substTypeF(substOf(idxs), idxs, d, t) });
 
 const stripLams = (n$, t$) => {
   for (;;) {
@@ -38570,7 +38572,7 @@ const stripLams = (n$, t$) => {
   }
 };
 
-const zonkElF = (r, mc, t) => {
+const zonkTermF = (r, mc, t) => {
   switch (t.$) {
     case "SLocal": {
       const x = t.a[0];
@@ -38719,7 +38721,7 @@ const zonkElF = (r, mc, t) => {
   return $nomatch(t);
 };
 
-const zonkTyF = (r, mc, t) => {
+const zonkTypeF = (r, mc, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -38789,7 +38791,7 @@ const zonkTyF = (r, mc, t) => {
   return $nomatch(t);
 };
 
-const zonker = (mc) => ({ el: (t) => zonkElF(zonker(mc), mc, t), ty: (t) => zonkTyF(zonker(mc), mc, t) });
+const zonker = (mc) => ({ el: (t) => zonkTermF(zonker(mc), mc, t), ty: (t) => zonkTypeF(zonker(mc), mc, t) });
 
 const scopeError = (st) => ({ $: "MkPair", a: [{ $: "Left", a: [{ $: "UnequalEls", a: [emptyShape, { $: "VOpaque", a: [] }, { $: "VOpaque", a: [] }] }] }, st] });
 
@@ -40291,7 +40293,7 @@ const uTyRigid = (r, g, cs, a, b) => {
   return $nomatch(a);
 };
 
-const uTyF = (r, g, cs, a0, b0, st) => {
+const uTypeF = (r, g, cs, a0, b0, st) => {
   const x1 = { $: "MkPair", a: [{ $: "Right", a: [(() => {
     const c = (() => {
       switch (st.$) {
@@ -40894,7 +40896,7 @@ const uTyF = (r, g, cs, a0, b0, st) => {
   }
   return $nomatch(x1);
 };
-const uTyF$c = (r) => (g) => (cs) => (a0) => (b0) => (st) => uTyF(r, g, cs, a0, b0, st);
+const uTypeF$c = (r) => (g) => (cs) => (a0) => (b0) => (st) => uTypeF(r, g, cs, a0, b0, st);
 
 const uBareF = (r, g, cs, h, sp, h_, sp_) => {
   const s = (() => {
@@ -41485,7 +41487,7 @@ const uElRigid = (r, g, cs, ca, cb, a, b) => {
   return $nomatch(ca);
 };
 
-const uElF = (r, g, cs, a0, b0, st) => {
+const uTermF = (r, g, cs, a0, b0, st) => {
   const x1 = { $: "MkPair", a: [{ $: "Right", a: [(() => {
     const c = (() => {
       switch (st.$) {
@@ -45384,7 +45386,7 @@ const uElF = (r, g, cs, a0, b0, st) => {
   }
   return $nomatch(x1);
 };
-const uElF$c = (r) => (g) => (cs) => (a0) => (b0) => (st) => uElF(r, g, cs, a0, b0, st);
+const uTermF$c = (r) => (g) => (cs) => (a0) => (b0) => (st) => uTermF(r, g, cs, a0, b0, st);
 
 const renameSpine = (r, g, m, pr1, x5, h) => {
   switch (x5.$) {
@@ -45673,7 +45675,7 @@ const renameEvF = (r, g, m, pr1, x5) => {
   return $nomatch(x5);
 };
 
-const renameEvTyF = (r, g, m, pr1, x5) => {
+const renameEvTypeF = (r, g, m, pr1, x5) => {
   switch (x5.$) {
     case "Nom": {
       const a = x5.a[0];
@@ -46093,7 +46095,7 @@ const renameRecordFields = (r, g, m, pr1, i, ls, x7) => {
   return $nomatch(x7);
 };
 
-const compiler_unify_renameTyF = (r, g, m, pr1, t0, st) => {
+const compiler_unify_renameTypeF = (r, g, m, pr1, t0, st) => {
   const x1 = { $: "MkPair", a: [{ $: "Right", a: [(() => {
     const c = (() => {
       switch (st.$) {
@@ -46476,7 +46478,7 @@ const compiler_unify_renameTyF = (r, g, m, pr1, t0, st) => {
   }
   return $nomatch(x1);
 };
-const compiler_unify_renameTyF$c = (r) => (g) => (m) => (pr1) => (t0) => (st) => compiler_unify_renameTyF(r, g, m, pr1, t0, st);
+const compiler_unify_renameTypeF$c = (r) => (g) => (m) => (pr1) => (t0) => (st) => compiler_unify_renameTypeF(r, g, m, pr1, t0, st);
 
 const renameFlexF = (r, g, m, pr1, m_, sp, st) => {
   const x1 = { $: "MkPair", a: [{ $: "Right", a: [(() => {
@@ -46767,7 +46769,7 @@ const renameFlexF = (r, g, m, pr1, m_, sp, st) => {
 };
 const renameFlexF$c = (r) => (g) => (m) => (pr1) => (m_) => (sp) => (st) => renameFlexF(r, g, m, pr1, m_, sp, st);
 
-const uk = $lazy(() => ({ uty: (g) => (cs) => (a) => (b) => uTyF$c(uk())(g)(cs)(a)(b), uel: (g) => (cs) => (a) => (b) => uElF$c(uk())(g)(cs)(a)(b), ubare: (g) => (cs) => (h) => (sp) => (h_) => (sp_) => uBareF(uk(), g, cs, h, sp, h_, sp_), solve: (g) => (cs) => (m) => (sp) => (rhs) => (self) => solveF$c(uk())(g)(cs)(m)(sp)(rhs)(self), ren: (g) => (m) => (pr1) => (v) => renameF$c(uk())(g)(m)(pr1)(v), renEv: (g) => (m) => (pr1) => (v) => renameEvF(uk(), g, m, pr1, v), renTy: (g) => (m) => (pr1) => (t) => compiler_unify_renameTyF$c(uk())(g)(m)(pr1)(t), renEvTy: (g) => (m) => (pr1) => (t) => renameEvTyF(uk(), g, m, pr1, t), renFlex: (g) => (m) => (pr1) => (m_) => (sp) => renameFlexF$c(uk())(g)(m)(pr1)(m_)(sp) }));
+const uk = $lazy(() => ({ uty: (g) => (cs) => (a) => (b) => uTypeF$c(uk())(g)(cs)(a)(b), uel: (g) => (cs) => (a) => (b) => uTermF$c(uk())(g)(cs)(a)(b), ubare: (g) => (cs) => (h) => (sp) => (h_) => (sp_) => uBareF(uk(), g, cs, h, sp, h_, sp_), solve: (g) => (cs) => (m) => (sp) => (rhs) => (self) => solveF$c(uk())(g)(cs)(m)(sp)(rhs)(self), ren: (g) => (m) => (pr1) => (v) => renameF$c(uk())(g)(m)(pr1)(v), renEv: (g) => (m) => (pr1) => (v) => renameEvF(uk(), g, m, pr1, v), renTy: (g) => (m) => (pr1) => (t) => compiler_unify_renameTypeF$c(uk())(g)(m)(pr1)(t), renEvTy: (g) => (m) => (pr1) => (t) => renameEvTypeF(uk(), g, m, pr1, t), renFlex: (g) => (m) => (pr1) => (m_) => (sp) => renameFlexF$c(uk())(g)(m)(pr1)(m_)(sp) }));
 
 const blockedFlex = (ps, a) => {
   const it = (() => {
@@ -48208,7 +48210,7 @@ const compiler_print_armOf = (r, x2) => {
 };
 const compiler_print_armOf$c = (r) => (x2) => compiler_print_armOf(r, x2);
 
-const showElF = (r, x2) => {
+const showTermF = (r, x2) => {
   switch (x2.$) {
     case "SLocal": {
       const i = x2.a[0];
@@ -48341,7 +48343,7 @@ const showElF = (r, x2) => {
   return $nomatch(x2);
 };
 
-const showTyF = (r, x2) => {
+const showTypeF = (r, x2) => {
   switch (x2.$) {
     case "SU": {
       const u = x2.a[0];
@@ -48440,7 +48442,7 @@ const showTyF = (r, x2) => {
   return $nomatch(x2);
 };
 
-const pr = $lazy(() => ({ el: (t) => showElF(pr(), t), ty: (t) => showTyF(pr(), t) }));
+const pr = $lazy(() => ({ el: (t) => showTermF(pr(), t), ty: (t) => showTypeF(pr(), t) }));
 
 const intoSilent = (e, implicit, y, dom, sc, v, counted) => ({ scope: sc, globals: e.globals, elabFor: (() => {
   const s = e.elabFor;
@@ -55786,7 +55788,7 @@ const anyIdxGo = (i$, f$, x3$) => {
   }
 };
 
-const mentionsElF = (r, d, t) => {
+const mentionsTermF = (r, d, t) => {
   switch (t.$) {
     case "SLocal": {
       const i = t.a[0];
@@ -55961,7 +55963,7 @@ const mentionsElF = (r, d, t) => {
   return $nomatch(t);
 };
 
-const mentionsTyF = (r, d, t) => {
+const mentionsTypeF = (r, d, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -56047,7 +56049,7 @@ const mentionsTyF = (r, d, t) => {
   return $nomatch(t);
 };
 
-const mentions = $lazy(() => ({ el: (d) => (t) => mentionsElF(mentions(), d, t), ty: (d) => (t) => mentionsTyF(mentions(), d, t) }));
+const mentions = $lazy(() => ({ el: (d) => (t) => mentionsTermF(mentions(), d, t), ty: (d) => (t) => mentionsTypeF(mentions(), d, t) }));
 
 const fieldTyAt = (len$, capture$, fieldTypes$, i$, before$, j$) => {
   for (;;) {
@@ -59930,7 +59932,7 @@ const failP = (sp, code1, msg) => {
   return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d] }, st] });
 };
 
-const selfElF = (r, k, d, t) => {
+const selfTermF = (r, k, d, t) => {
   switch (t.$) {
     case "SLocal": {
       const x = t.a[0];
@@ -60066,7 +60068,7 @@ const selfElF = (r, k, d, t) => {
   return $nomatch(t);
 };
 
-const selfTyF = (r, k, d, t) => {
+const selfTypeF = (r, k, d, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -60139,7 +60141,7 @@ const selfTyF = (r, k, d, t) => {
   return $nomatch(t);
 };
 
-const selfWalk = (k) => ({ el: (d) => (t) => selfElF(selfWalk(k), k, d, t), ty: (d) => (t) => selfTyF(selfWalk(k), k, d, t) });
+const selfWalk = (k) => ({ el: (d) => (t) => selfTermF(selfWalk(k), k, d, t), ty: (d) => (t) => selfTypeF(selfWalk(k), k, d, t) });
 
 const fromSynN = (x1, j) => {
   switch (x1.$) {
@@ -80952,7 +80954,7 @@ const closeFieldsGo = (r$, i$, depth$, j$, x5$) => {
   }
 };
 
-const closeTyF = (r, idx, i, depth, t) => {
+const closeTypeF = (r, idx, i, depth, t) => {
   switch (t.$) {
     case "SU": {
       const x = t.a[0];
@@ -81036,7 +81038,7 @@ const closeTyF = (r, idx, i, depth, t) => {
   return $nomatch(t);
 };
 
-const closeElF = (r, idx, i, depth, e) => {
+const closeTermF = (r, idx, i, depth, e) => {
   switch (e.$) {
     case "SLocal": {
       const x = e.a[0];
@@ -81187,7 +81189,7 @@ const closeElF = (r, idx, i, depth, e) => {
   return $nomatch(e);
 };
 
-const ckOf = (idx) => ({ ty: (i) => (depth) => (t) => closeTyF(ckOf(idx), idx, i, depth, t), el: (i) => (depth) => (e) => closeElF(ckOf(idx), idx, i, depth, e) });
+const ckOf = (idx) => ({ ty: (i) => (depth) => (t) => closeTypeF(ckOf(idx), idx, i, depth, t), el: (i) => (depth) => (e) => closeTermF(ckOf(idx), idx, i, depth, e) });
 
 const structFieldsGo = (idx$, i$, x3$) => {
   let $root, $hole = null, $at = 0;
@@ -94731,41 +94733,10 @@ const importLinesOf = (x1) => {
   return $nomatch(x1);
 };
 
-const runSource = (provs, eff, key, m) => {
-  const x2 = concatList({ $: "Cons", a: ["// Generated from Hippogriff; do not edit.", { $: "Nil", a: [] }] }, concatList((() => {
-    const xs = importLinesOf(provs);
-    return nubGo({ $: "Nil", a: [] }, xs);
-  })(), concatList(m.lines, { $: "Cons", a: ["", { $: "Cons", a: [runtimeFor(provs, eff), { $: "Cons", a: ["", { $: "Cons", a: ["$run(" + ((() => {
-    const s = map_lookup(compareString$c, key, m.globals);
-    switch (s.$) {
-      case "Nothing": {
-        return "undefined";
-      }
-      case "Just": {
-        const i = s.a[0];
-        const s1 = 2n <= i.arity ? $T : $F;
-        switch (s1.$) {
-          case "True": {
-            return i.js + "$c";
-          }
-          case "False": {
-            const s2 = i.lazy;
-            switch (s2.$) {
-              case "True": {
-                return i.js + "()";
-              }
-              case "False": {
-                return i.js;
-              }
-            }
-            return $nomatch(s2);
-          }
-        }
-        return $nomatch(s1);
-      }
-    }
-    return $nomatch(s);
-  })() + (", " + (handlerOf(provs, eff) + ");"))), { $: "Cons", a: ["", { $: "Nil", a: [] }] }] }] }] }] })));
+const nodeHead = { $: "Cons", a: ["#!/usr/bin/env node", { $: "Cons", a: ["// Generated from Hippogriff; do not edit.", { $: "Cons", a: ["import { Worker as $Worker, isMainThread as $isMainThread } from \"node:worker_threads\";", { $: "Nil", a: [] }] }] }] };
+
+const nodeRun = (run) => {
+  const x2 = { $: "Cons", a: ["if ($isMainThread) {", { $: "Cons", a: ["  if (process.stdout.isTTY) process.env.HEFF_TTY = \"1\";", { $: "Cons", a: ["  const limits = { stackSizeMb: 512, maxOldGenerationSizeMb: Number(process.env.HEFF_HEAP_MB) || undefined };", { $: "Cons", a: ["  const worker = new $Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: limits, stdin: true });", { $: "Cons", a: ["  process.stdin.pipe(worker.stdin);", { $: "Cons", a: ["  worker.on(\"error\", (e) => { console.error(e); process.exitCode = 1; });", { $: "Cons", a: ["  worker.on(\"exit\", (code) => { process.exitCode = code; process.stdin.unpipe(worker.stdin); process.stdin.destroy(); });", { $: "Cons", a: ["} else {", { $: "Cons", a: ["  " + run, { $: "Cons", a: ["}", { $: "Nil", a: [] }] }] }] }] }] }] }] }] }] }] };
   switch (x2.$) {
     case "Nil": {
       return "";
@@ -94779,12 +94750,83 @@ const runSource = (provs, eff, key, m) => {
   return $nomatch(x2);
 };
 
-const compileLowered = (provs, eff, key, l) => ({ source: runSource(provs, eff, key, (() => {
+const runSource = (host, provs, eff, key, m) => {
+  const x2 = concatList((() => {
+    const s = host === "node" ? $T : $F;
+    switch (s.$) {
+      case "True": {
+        return nodeHead;
+      }
+      case "False": {
+        return { $: "Cons", a: ["// Generated from Hippogriff; do not edit.", { $: "Nil", a: [] }] };
+      }
+    }
+    return $nomatch(s);
+  })(), concatList((() => {
+    const xs = importLinesOf(provs);
+    return nubGo({ $: "Nil", a: [] }, xs);
+  })(), concatList(m.lines, { $: "Cons", a: ["", { $: "Cons", a: [runtimeFor(provs, eff), { $: "Cons", a: ["", { $: "Cons", a: [(() => {
+    const run = "$run(" + ((() => {
+      const s = map_lookup(compareString$c, key, m.globals);
+      switch (s.$) {
+        case "Nothing": {
+          return "undefined";
+        }
+        case "Just": {
+          const i = s.a[0];
+          const s1 = 2n <= i.arity ? $T : $F;
+          switch (s1.$) {
+            case "True": {
+              return i.js + "$c";
+            }
+            case "False": {
+              const s2 = i.lazy;
+              switch (s2.$) {
+                case "True": {
+                  return i.js + "()";
+                }
+                case "False": {
+                  return i.js;
+                }
+              }
+              return $nomatch(s2);
+            }
+          }
+          return $nomatch(s1);
+        }
+      }
+      return $nomatch(s);
+    })() + (", " + (handlerOf(provs, eff) + ");")));
+    const s = host === "node" ? $T : $F;
+    switch (s.$) {
+      case "True": {
+        return nodeRun(run);
+      }
+      case "False": {
+        return run;
+      }
+    }
+    return $nomatch(s);
+  })(), { $: "Cons", a: ["", { $: "Nil", a: [] }] }] }] }] }] })));
+  switch (x2.$) {
+    case "Nil": {
+      return "";
+    }
+    case "Cons": {
+      const x = x2.a[0];
+      const xs = x2.a[1];
+      return foldl((acc) => (y) => acc + ("\n" + y), x, xs);
+    }
+  }
+  return $nomatch(x2);
+};
+
+const compileLowered = (host, provs, eff, key, l) => ({ source: runSource(host, provs, eff, key, (() => {
   const defs = l.defs;
   return emitWithShorts(defs, { $: "Cons", a: [key, { $: "Nil", a: [] }] }, map((d) => safe(shortName(d.key)), defs));
 })()), errors: l.errors });
 
-const compileProgram = (available, g, key, eff) => compileLowered(provsForGo(available, (() => {
+const compileProgram = (host, available, g, key, eff) => compileLowered(host, provsForGo(available, (() => {
   const xs = map((k) => moduleOfKey(k), leaves(eff));
   return nubGo({ $: "Nil", a: [] }, xs);
 })()), eff, key, (() => {
@@ -130871,7 +130913,7 @@ const encodeAlt = (k, x2, rest) => {
   return $nomatch(x2);
 };
 
-const encodeElF = (k, e, rest) => {
+const encodeTermF = (k, e, rest) => {
   switch (e.$) {
     case "SLocal": {
       const i = e.a[0];
@@ -130990,7 +131032,7 @@ const encodeElF = (k, e, rest) => {
   return $nomatch(e);
 };
 
-const encodeTyF = (k, t, rest) => {
+const encodeTypeF = (k, t, rest) => {
   switch (t.$) {
     case "SU": {
       const it1 = t.a[0];
@@ -131104,7 +131146,7 @@ const encodeTyF = (k, t, rest) => {
   return $nomatch(t);
 };
 
-const compiler_serial_ek = $lazy(() => ({ el: (e) => (rest) => encodeElF(compiler_serial_ek(), e, rest), ty: (t) => (rest) => encodeTyF(compiler_serial_ek(), t, rest) }));
+const compiler_serial_ek = $lazy(() => ({ el: (e) => (rest) => encodeTermF(compiler_serial_ek(), e, rest), ty: (t) => (rest) => encodeTypeF(compiler_serial_ek(), t, rest) }));
 
 const wordEnd = (s$, i$) => {
   for (;;) {
@@ -131693,7 +131735,7 @@ const takeAlt = (s, k, i) => {
   return $nomatch(x1);
 };
 
-const decodeElF = (k, s, i) => {
+const decodeTermF = (k, s, i) => {
   const x1 = takeWord(s, i);
   switch (x1.$) {
     case "Nothing": {
@@ -132372,7 +132414,7 @@ const decodeElF = (k, s, i) => {
   return $nomatch(x1);
 };
 
-const decodeTyF = (k, s, i) => {
+const decodeTypeF = (k, s, i) => {
   const x1 = takeWord(s, i);
   switch (x1.$) {
     case "Nothing": {
@@ -132747,7 +132789,7 @@ const decodeTyF = (k, s, i) => {
   return $nomatch(x1);
 };
 
-const dkOf = (s) => ({ el: (i) => decodeElF(dkOf(s), s, i), ty: (i) => decodeTyF(dkOf(s), s, i) });
+const dkOf = (s) => ({ el: (i) => decodeTermF(dkOf(s), s, i), ty: (i) => decodeTypeF(dkOf(s), s, i) });
 
 const version = "heff-cache-port/2";
 
@@ -134485,6 +134527,10 @@ const _process = { hfmap: (fm) => (g) => (p) => {
       const k = p.a[1];
       return { $: "GetEnv", a: [name, (v) => g(k(v))] };
     }
+    case "ProgramPath": {
+      const k = p.a[0];
+      return { $: "ProgramPath", a: [(s) => g(k(s))] };
+    }
     case "Exit": {
       const code1 = p.a[0];
       const x = p.a[1];
@@ -134502,6 +134548,10 @@ const _process = { hfmap: (fm) => (g) => (p) => {
       const name = p.a[0];
       const k = p.a[1];
       return { $: "GetEnv", a: [name, k] };
+    }
+    case "ProgramPath": {
+      const k = p.a[0];
+      return { $: "ProgramPath", a: [k] };
     }
     case "Exit": {
       const code1 = p.a[0];
@@ -137698,19 +137748,66 @@ const libDir = (io, sys, disk, rep, wire) => {
     return (hd) => (k2) => hd.bind(hd.malg(plus(plus(plus(plus(stdio, _process), fs), report), rpc).hmap((c) => c(hd)(hd.ret))(p)))((x) => k2(x));
   })();
   return (hd) => (k) => c(hd)((x) => {
-    const x1 = (() => {
-      switch (x.$) {
-        case "Nothing": {
-          return "lib";
-        }
-        case "Just": {
-          const x1 = x.a[0];
-          return x1;
-        }
+    switch (x.$) {
+      case "Nothing": {
+        const c1 = (() => {
+          const p = sys({ $: "ProgramPath", a: [(s) => s] });
+          return (hd1) => (k2) => hd1.bind(hd1.malg(plus(plus(plus(plus(stdio, _process), fs), report), rpc).hmap((c1) => c1(hd1)(hd1.ret))(p)))((x1) => k2(x1));
+        })();
+        return c1(hd)((x1) => {
+          const x2 = (() => {
+            const p = (() => {
+              const it = lastSlash(x1, BigInt(x1.length) - 1n);
+              switch (it.$) {
+                case "Nothing": {
+                  return ".";
+                }
+                case "Just": {
+                  const it1 = it.a[0];
+                  const s = it1 === 0n ? $T : $F;
+                  switch (s.$) {
+                    case "True": {
+                      return "/";
+                    }
+                    case "False": {
+                      return $strSlice(x1, 0n, it1);
+                    }
+                  }
+                  return $nomatch(s);
+                }
+              }
+              return $nomatch(it);
+            })();
+            const it = lastSlash(p, BigInt(p.length) - 1n);
+            switch (it.$) {
+              case "Nothing": {
+                return ".";
+              }
+              case "Just": {
+                const it1 = it.a[0];
+                const s = it1 === 0n ? $T : $F;
+                switch (s.$) {
+                  case "True": {
+                    return "/";
+                  }
+                  case "False": {
+                    return $strSlice(p, 0n, it1);
+                  }
+                }
+                return $nomatch(s);
+              }
+            }
+            return $nomatch(it);
+          })() + "/lib";
+          return k(x2);
+        });
       }
-      return $nomatch(x);
-    })();
-    return k(x1);
+      case "Just": {
+        const lib = x.a[0];
+        return k(lib);
+      }
+    }
+    return $nomatch(x);
   });
 };
 
@@ -138195,7 +138292,7 @@ const writeOut = (outPath, how, o, io, sys, disk, rep, wire) => {
   });
 };
 
-const compileFound = (file, name, outPath, how, c, available, io, sys, disk, rep, wire) => {
+const compileFound = (host, file, name, outPath, how, c, available, io, sys, disk, rep, wire) => {
   const s = findRunnable(filter((k) => providesLeaf(available, k), nubStrD(candLeaves(catMaybesD(map((o) => candOf(c, o), c.own))))), c, name);
   switch (s.$) {
     case "Left": {
@@ -138208,7 +138305,7 @@ const compileFound = (file, name, outPath, how, c, available, io, sys, disk, rep
     }
     case "Right": {
       const r = s.a[0];
-      return writeOut(outPath, how, compileProgram(available, c.top.globals, r.key, r.effect), io, sys, disk, rep, wire);
+      return writeOut(outPath, how, compileProgram(host, available, c.top.globals, r.key, r.effect), io, sys, disk, rep, wire);
     }
   }
   return $nomatch(s);
@@ -138230,7 +138327,7 @@ const compileLast = (paths, host, file, name, outPath, how, cs, io, sys, disk, r
         const xs = map((k) => moduleOfKey(k), nubStrD(candLeaves(catMaybesD(map((o) => candOf(c, o), c.own)))));
         return nubStrGo({ $: "Nil", a: [] }, xs);
       })(), io, sys, disk, rep, wire);
-      return (hd) => (k) => c1(hd)((x) => compileFound(file, name, outPath, how, c, filter((p) => forHost(host, p), x), io, sys, disk, rep, wire)(hd)(k));
+      return (hd) => (k) => c1(hd)((x) => compileFound(host, file, name, outPath, how, c, filter((p) => forHost(host, p), x), io, sys, disk, rep, wire)(hd)(k));
     }
   }
   return $nomatch(s);
@@ -138656,16 +138753,18 @@ const runLast = (bad, x2, io, sys, disk, rep, wire) => {
   return $nomatch(x2);
 };
 
+const runChecked = (badL, cs, io, sys, disk, rep, wire) => {
+  const c = diagCount(cs, io, sys, disk, rep, wire);
+  return (hd) => (k) => c(hd)((x) => runLast(badL + x, lastChecked(cs), io, sys, disk, rep, wire)(hd)(k));
+};
+
 const runCmd = (file, io, sys, disk, rep, wire) => {
   const c = load(file, io, sys, disk, rep, wire);
   return (hd) => (k) => c(hd)((x) => {
     const c1 = printErrs("heff", x.errors, 0n, io, sys, disk, rep, wire);
     return c1(hd)((x1) => {
       const c2 = cachedProgram(plus(plus(plus(plus(stdio, _process), fs), report), rpc), disk, x);
-      return c2(hd)((x2) => {
-        const c3 = diagCount(x2, io, sys, disk, rep, wire);
-        return c3(hd)((x3) => runLast(x1 + x3, lastChecked(x2), io, sys, disk, rep, wire)(hd)(k));
-      });
+      return c2(hd)((x2) => runChecked(x1, x2, io, sys, disk, rep, wire)(hd)(k));
     });
   });
 };
@@ -139017,31 +139116,19 @@ const typeAtCmd = (file, off, io, sys, disk, rep, wire) => {
             }
             case "Just": {
               const c4 = s.a[0];
-              return print(plus(plus(plus(plus(stdio, _process), fs), report), rpc), io, (() => {
-                const x21 = (() => {
-                  const s1 = parseInt(off);
-                  switch (s1.$) {
-                    case "Nothing": {
-                      return { $: "Nothing", a: [] };
-                    }
-                    case "Just": {
-                      const o = s1.a[0];
-                      return typeAt(c4, o);
-                    }
-                  }
-                  return $nomatch(s1);
-                })();
-                switch (x21.$) {
+              return print(plus(plus(plus(plus(stdio, _process), fs), report), rpc), io, fromMaybe("nothing there", (() => {
+                const s1 = parseInt(off);
+                switch (s1.$) {
                   case "Nothing": {
-                    return "nothing there";
+                    return { $: "Nothing", a: [] };
                   }
                   case "Just": {
-                    const x4 = x21.a[0];
-                    return x4;
+                    const o = s1.a[0];
+                    return typeAt(c4, o);
                   }
                 }
-                return $nomatch(x21);
-              })())(hd)(k);
+                return $nomatch(s1);
+              })()))(hd)(k);
             }
           }
           return $nomatch(s);
@@ -139846,6 +139933,7 @@ const process = () => {
     switch (p.$) {
       case "Args": return k(a[0](list(globalThis.process.argv.slice(2))));
       case "GetEnv": { const v = globalThis.process.env[a[0]]; return k(a[1](v === undefined ? nothing : just(v))); }
+      case "ProgramPath": return k(a[0](decodeURIComponent(new URL(import.meta.url).pathname)));
       case "Exit": globalThis.process.exitCode = Number(a[0]); return;
       default: throw new Error("heff: not an operation of process: " + (p && p.$));
     }
@@ -139909,7 +139997,7 @@ const report = () => {
     const a = p.a;
     switch (p.$) {
       case "Differ": { const m = mismatch(a[0].$ === "True", a[1], a[2]); return k(a[3](m.e)(m.g)(m.d)); }
-      // (in the worker bin/heff.mjs runs it in, stdout is not the
+      // (in the thread a Node.js program runs in, stdout is not the
       // terminal: the main thread says whether it is, HEFF_TTY)
       case "UseColor": return k(a[0]({ $: (Boolean(process.stdout.isTTY) || process.env.HEFF_TTY === "1") && !process.env.NO_COLOR ? "True" : "False", a: [] }));
       default: throw new Error("heff: not an operation of report: " + (p && p.$));
@@ -140051,4 +140139,13 @@ const rpc = () => {
 return { rpc };
 })();
 
-$run(main(), $sum($sum($sum($sum($p0.stdio(), $p1.process()), $p2.fs()), $p3.report()), $p4.rpc()));
+if ($isMainThread) {
+  if (process.stdout.isTTY) process.env.HEFF_TTY = "1";
+  const limits = { stackSizeMb: 512, maxOldGenerationSizeMb: Number(process.env.HEFF_HEAP_MB) || undefined };
+  const worker = new $Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: limits, stdin: true });
+  process.stdin.pipe(worker.stdin);
+  worker.on("error", (e) => { console.error(e); process.exitCode = 1; });
+  worker.on("exit", (code) => { process.exitCode = code; process.stdin.unpipe(worker.stdin); process.stdin.destroy(); });
+} else {
+  $run(main(), $sum($sum($sum($sum($p0.stdio(), $p1.process()), $p2.fs()), $p3.report()), $p4.rpc()));
+}

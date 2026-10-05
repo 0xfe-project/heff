@@ -27,7 +27,7 @@ for (const f of readdirSync(join(root, "test", "programs")).filter((f) => f.ends
 for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genProgram() });
 
 // (heff that does not finish is a failure, not a wait)
-const heff = (args) => spawnSync("node", [join(root, "bin", "heff.mjs"), ...args], { encoding: "utf8", timeout: 120000 });
+const heff = (args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { encoding: "utf8", timeout: 120000 });
 
 let agree = 0, differ = 0, compileErrors = 0, compared = 0, timeouts = 0;
 for (const c of cases) {

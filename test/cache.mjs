@@ -23,7 +23,7 @@ writeFileSync(join(dir, "a.hf"), "import prelude\n\nnine : Int\nnine = 9\n\nunus
 writeFileSync(join(dir, "b.hf"), "import a\nimport prelude\n\nten : Int\nten = nine + 1\n");
 writeFileSync(join(dir, "c.hf"), "import b\nimport prelude\n\n-- >>> ten\n-- 10\n");
 
-const heff = (...args) => spawnSync("node", [join(root, "test", "run-worker.mjs"), bin, ...args], { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
+const heff = (...args) => spawnSync("node", [bin, ...args], { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
 const hc = (m) => join(dir, ".heff", m + ".hc");
 const mtime = (m) => statSync(hc(m)).mtimeMs;
 

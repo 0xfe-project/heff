@@ -38,7 +38,7 @@ const check = (what, got, want) => {
 };
 async function run(file, name, fill = () => {}) {
   const out = join(work, `${name}.mjs`);
-  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "app", file, name, out], { encoding: "utf8" });
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "app", file, name, out], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL heff app ${file}\n${r.stdout}${r.stderr}`); return null; }
   const page = new Node("body");
   fill(page);

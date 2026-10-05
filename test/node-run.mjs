@@ -16,7 +16,7 @@ const check = (what, got, want) => {
   if (got !== want) { failed++; console.log(`FAIL ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
 const build = (file, name, out) => {
-  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "node", file, name, out], { encoding: "utf8" });
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "node", file, name, out], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL heff node ${file}\n${r.stdout}${r.stderr}`); return false; }
   return true;
 };
@@ -39,7 +39,7 @@ if (build("test/node/timed.hf", "timed", timed)) {
 
 // a computation of an effect Node has no handler for is refused, and why
 {
-  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "node", "examples/counter/counter.hf", join(work, "counter.mjs")], { cwd: root, encoding: "utf8" });
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "node", "examples/counter/counter.hf", join(work, "counter.mjs")], { cwd: root, encoding: "utf8" });
   check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom.dom, which is not provided here"), true);
 }
 

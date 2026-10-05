@@ -19,14 +19,13 @@ map f (Cons y ys) = Cons (f y) (map f ys)
 ## Installing
 
 ```sh
-npm install
-npm run build
+npm install       # also builds heff
 npm link          # puts `heff` on the PATH
 ```
 
-heff is written in heff (`compiler/`).  `boot/heff.mjs` is a
-compiled copy of the compiler; `npm run build` uses it to compile the
-compiler into `output/heff.mjs`.
+heff is written in heff (`compiler/`).  `boot/heff.mjs` is a compiled
+copy of the compiler; the build (`npm run build`) uses it to compile the
+compiler into `output/heff.mjs`, which is `heff`.
 
 `editors/vscode` is a VS Code extension for the language server.
 

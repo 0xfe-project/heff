@@ -11,7 +11,7 @@ try { languageclient = require("vscode-languageclient/node"); } catch (_) { lang
 let client;
 
 // the `heff` on the PATH, through its links (`npm link`, `npm install -g`), when
-// it is heff's bin/heff.mjs
+// it is heff's output/heff.mjs
 function heffOnPath() {
   for (const dir of (process.env.PATH || "").split(path.delimiter)) {
     if (!dir) continue;
@@ -27,7 +27,7 @@ function heffOnPath() {
 function serverPath(context) {
   const configured = vscode.workspace.getConfiguration("heff").get("serverPath");
   if (configured) return configured;
-  const repository = path.join(context.extensionPath, "..", "..", "bin", "heff.mjs");
+  const repository = path.join(context.extensionPath, "..", "..", "output", "heff.mjs");
   if (fs.existsSync(repository)) return repository;
   return heffOnPath() || repository;
 }
@@ -41,7 +41,7 @@ async function start(context) {
   const config = vscode.workspace.getConfiguration("heff");
   const script = serverPath(context);
   if (!fs.existsSync(script)) {
-    vscode.window.showErrorMessage(`heff: no language server at ${script}; put \`heff\` on the PATH (\`npm link\`), or set heff.serverPath to its bin/heff.mjs`);
+    vscode.window.showErrorMessage(`heff: no language server at ${script}; put \`heff\` on the PATH (\`npm link\`), or set heff.serverPath to its output/heff.mjs`);
     return;
   }
   // (no `transport`: with one, the client adds `--stdio` to the arguments)

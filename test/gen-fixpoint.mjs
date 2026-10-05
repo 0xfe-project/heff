@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The compiler is its own fixed point: output/heff.mjs (built by
-// bin/build.mjs) compiles its own source -- loading its import closure
+// scripts/build.mjs) compiles its own source -- loading its import closure
 // itself -- to output/heff-gen.mjs, which must be output/heff.mjs, byte
 // for byte.
 import { spawnSync } from "node:child_process";
@@ -14,8 +14,8 @@ const out = join(root, "output", "heff-gen.mjs");
 
 if (!existsSync(bin)) { console.log("FAIL gen-fixpoint: no output/heff.mjs (run npm run build first)"); process.exit(1); }
 
-const r = spawnSync("node", [join(root, "test", "run-worker.mjs"), bin, "node", "compiler/main.hf", "main", out],
-  { cwd: root, encoding: "utf8", maxBuffer: 1e9, env: { ...process.env, HEFF_LIB: join(root, "lib") } });
+const r = spawnSync("node", [bin, "node", "compiler/main.hf", "main", out],
+  { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
 if (r.status !== 0) { console.log(`FAIL gen-fixpoint: the compiler refused its own source\n${r.stdout}${r.stderr}`.split("\n").slice(0, 12).join("\n")); process.exit(1); }
 
 const g0 = readFileSync(bin, "utf8");

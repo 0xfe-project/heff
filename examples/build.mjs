@@ -14,7 +14,7 @@ let failed = 0;
 for (const name of readdirSync(here).sort()) {
   const dir = join(here, name), src = join(dir, `${name}.hf`), app = join(dir, `${name}.js`);
   if (!existsSync(join(dir, "package.json")) || !existsSync(src)) continue;
-  const r = spawnSync("node", [join(root, "bin", "heff.mjs"), "app", src, name, app], { encoding: "utf8" });
+  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "app", src, name, app], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL examples/${name}: ${r.stdout}${r.stderr}`); continue; }
   console.log(`examples/${name}/${name}.js`);
 }

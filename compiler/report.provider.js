@@ -30,7 +30,7 @@ export const report = () => {
     const a = p.a;
     switch (p.$) {
       case "Differ": { const m = mismatch(a[0].$ === "True", a[1], a[2]); return k(a[3](m.e)(m.g)(m.d)); }
-      // (in the worker bin/heff.mjs runs it in, stdout is not the
+      // (in the thread a Node.js program runs in, stdout is not the
       // terminal: the main thread says whether it is, HEFF_TTY)
       case "UseColor": return k(a[0]({ $: (Boolean(process.stdout.isTTY) || process.env.HEFF_TTY === "1") && !process.env.NO_COLOR ? "True" : "False", a: [] }));
       default: throw new Error("heff: not an operation of report: " + (p && p.$));

@@ -1193,12 +1193,45 @@ importLinesOf Nil = Nil
 importLinesOf (Cons p rest) =
   concatList (filter (\l -> isImportLine l) (lines p.text)) (importLinesOf rest)
 
-runSource : List Provider -> Ef.Effect -> String -> Emitted -> String
-runSource provs eff key m =
+-- (a Node.js program runs itself again in a thread of its own, whose
+-- stack is deep enough for what a heff program does; the first thread
+-- passes on its arguments and its standard input, says whether its
+-- output is a terminal, and ends with the program's status.
+-- HEFF_HEAP_MB, if set, bounds the thread's heap)
+nodeHead : List String
+nodeHead =
+  [ "#!/usr/bin/env node"
+  , "// Generated from Hippogriff; do not edit."
+  , "import { Worker as $Worker, isMainThread as $isMainThread } from \"node:worker_threads\";"
+  ]
+
+nodeRun : String -> String
+nodeRun run =
+  joinWith
+    "\n"
+    [ "if ($isMainThread) {"
+    , "  if (process.stdout.isTTY) process.env.HEFF_TTY = \"1\";"
+    , "  const limits = { stackSizeMb: 512, maxOldGenerationSizeMb: Number(process.env.HEFF_HEAP_MB) || undefined };"
+    , "  const worker = new $Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: limits, stdin: true });"
+    , "  process.stdin.pipe(worker.stdin);"
+    , "  worker.on(\"error\", (e) => { console.error(e); process.exitCode = 1; });"
+    , "  worker.on(\"exit\", (code) => { process.exitCode = code; process.stdin.unpipe(worker.stdin); process.stdin.destroy(); });"
+    , "} else {"
+    , "  " ++ run
+    , "}"
+    ]
+
+-- (the line that runs the program, as the host runs it)
+runFor : String -> String -> String
+runFor host run = if strEq host "node" then nodeRun run else run
+
+runSource : String -> List Provider -> Ef.Effect -> String -> Emitted -> String
+runSource host provs eff key m =
   joinWith
     "\n"
     (concatList
-       (Cons "// Generated from Hippogriff; do not edit." Nil)
+       (if strEq host "node" then nodeHead
+        else Cons "// Generated from Hippogriff; do not edit." Nil)
        (concatList
           (nubStr (importLinesOf provs))
           (concatList
@@ -1206,27 +1239,45 @@ runSource provs eff key m =
              [ ""
              , runtimeFor provs eff
              , ""
-             , "$run("
-             ++ ref m.globals key
-             ++ ", "
-             ++ handlerOf provs eff
-             ++ ");"
+             , runFor
+               host
+               ("$run("
+                ++ ref m.globals key
+                ++ ", "
+                ++ handlerOf provs eff
+                ++ ");")
              , ""
              ])))
 
-compileLowered : List Provider -> Ef.Effect -> String -> L.Lowered -> Output
-compileLowered provs eff key l =
-  { source = runSource provs eff key (emitDefs l.defs (Cons key Nil))
+compileLowered : String
+               -> List Provider
+               -> Ef.Effect
+               -> String
+               -> L.Lowered
+               -> Output
+compileLowered host provs eff key l =
+  { source = runSource host provs eff key (emitDefs l.defs (Cons key Nil))
   , errors = l.errors
   }
 
--- | one file that runs a computation (`key`) of the effect `eff`: the
+-- | one file that runs a computation (`key`) of the effect `eff` on a
+-- | host (`node`, `page`): the
 -- | program, the runtime, and each world's algebra from its provider --
 -- | it imports nothing but what the providers do (`node:` builtins,
 -- | hoisted), so a page loads it from file:// too
-compileProgram : List Provider -> G.Globals -> String -> Ef.Effect -> Output
-compileProgram available g key eff =
-  compileLowered (provsFor available eff) eff key (L.lower g (Cons key Nil))
+compileProgram : String
+               -> List Provider
+               -> G.Globals
+               -> String
+               -> Ef.Effect
+               -> Output
+compileProgram host available g key eff =
+  compileLowered
+    host
+    (provsFor available eff)
+    eff
+    key
+    (L.lower g (Cons key Nil))
 
 getterOf : M.Map String GInfo -> Export -> String
 getterOf gs o =
