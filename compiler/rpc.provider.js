@@ -56,11 +56,13 @@ export const rpc = () => {
     });
     process.stdin.on("end", () => { closed = true; deliver(); });
   };
-  // the `.hf` files of the project at `root`: package.json's `"heff":
-  // { "sources": [...] }` names its module directories, walked, with
-  // the root's own files; without it, every directory but another
-  // project's, a hidden one, or one the root's .gitignore names
+  // the `.hf` files of the project at `root` (a directory with a
+  // package.hf, or a package.json with a "heff" field): with that
+  // package.json's `"heff": { "sources": [...] }`, the directories it
+  // names, walked, and the root's own files; else every directory but
+  // another project's, a hidden one, or one the root's .gitignore names
   const isRoot = (d) => {
+    try { $readFileSync($join(d, "package.hf"), "utf8"); return true; } catch (_) {}
     try { return JSON.parse($readFileSync($join(d, "package.json"), "utf8")).heff !== undefined; } catch (_) { return false; }
   };
   const projectFiles = (root) => {

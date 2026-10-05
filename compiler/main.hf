@@ -13,6 +13,7 @@ import compiler.effect as Ef
 import compiler.emit as Em
 import compiler.format as Fm
 import compiler.load as L
+import compiler.project as Pr
 import compiler.lsp as Lsp
 import compiler.query as Q
 import compiler.report as Rp
@@ -50,11 +51,63 @@ libDir = do
       self <- programPath
       pure (L.dirname (L.dirname self) ++ "/lib")
 
--- | FILE and its import closure, loaded from FILE's project
+-- | the version of heff running: its package.json's, beside `output/`
+-- | (npm writes `"version": "a.b.c"`)
+ownVersion : Heff (Maybe String)
+ownVersion = do
+  self <- programPath
+  json <- readFile (L.dirname (L.dirname self) ++ "/package.json")
+  pure (case json of
+    Just text -> case split "\"version\"" text of
+      Cons _ (Cons rest _) -> case split "\"" rest of
+        Cons colon (Cons v _) ->
+          if strEq (trim colon) ":" then Just v else Nothing
+        _ -> Nothing
+      _ -> Nothing
+    Nothing -> Nothing)
+
+-- | what is wrong with the heff a project is for, if anything: this heff
+-- | is `running`
+heffVersions : String
+             -> String
+             -> Maybe (List Int)
+             -> Maybe (List Int)
+             -> Maybe String
+heffVersions wanted running (Just w) (Just r) =
+  if Pr.compatible w r then Nothing
+  else Just
+      ("package.hf: the project is for heff "
+       ++ wanted
+       ++ (if strEq (strSlice wanted 0 2) "0." then " (the same 0.x)" else "")
+       ++ ", and this heff is "
+       ++ running)
+heffVersions wanted running _ _ = Nothing
+
+heffFor : Maybe String -> Pr.Package -> Maybe String
+heffFor (Just running) pk =
+  heffVersions pk.heff running (Pr.version pk.heff) (Pr.version running)
+heffFor Nothing pk = Nothing
+
+withError : L.Loaded -> String -> L.Loaded
+withError l e =
+  { sources = l.sources
+  , errors = Cons e l.errors
+  , paths = l.paths
+  , package = l.package
+  }
+
+-- | FILE and its import closure, loaded from FILE's project, which must
+-- | be for this heff
 load : String -> Heff L.Loaded
 load file = do
   lib <- libDir
-  L.loadProgram lib file
+  l <- L.loadProgram lib file
+  running <- ownVersion
+  pure (case l.package of
+    Just pk -> case heffFor running pk of
+      Just why -> withError l why
+      Nothing -> l
+    Nothing -> l)
 
 readAll : List String -> Heff (List Dr.Source)
 readAll Nil = pure Nil
@@ -126,29 +179,27 @@ nubStrGo seen (Cons x rest) =
 nubStrM : List String -> List String
 nubStrM xs = nubStrGo Nil xs
 
--- the provider of a module, M.provider.js beside M.hf: read as the
--- module itself is found (under the root, else the library, else the
--- root's node_modules/)
-providerPathOf : String -> String
-providerPathOf m = L.dropHf (L.importPath m) ++ ".provider.js"
+-- the provider of a module, M.provider.js beside the M.hf it was loaded
+-- from
+pathOfModule : List Dr.Source -> String -> Maybe String
+pathOfModule Nil m = Nothing
+pathOfModule (Cons s rest) m =
+  if strEq s.module m then Just s.path else pathOfModule rest m
 
-readProviderAt : L.Paths -> String -> Heff (Maybe Em.Provider)
-readProviderAt ps m = do
-  found <-
-    L.readFound
-      [ L.under ps.root (providerPathOf m)
-      , L.under ps.lib (providerPathOf m)
-      , L.under ps.root ("node_modules/" ++ providerPathOf m)
-      ]
-  pure (case found of
-    Just f -> Just { module = m, text = f.source }
-    Nothing -> Nothing)
+readProviderAt : List Dr.Source -> String -> Heff (Maybe Em.Provider)
+readProviderAt sources m = case pathOfModule sources m of
+  Nothing -> pure Nothing
+  Just path -> do
+    text <- readFile (L.dropHf path ++ ".provider.js")
+    pure (case text of
+      Just t -> Just { module = m, text = t }
+      Nothing -> Nothing)
 
-readProviders : L.Paths -> List String -> Heff (List Em.Provider)
-readProviders paths Nil = pure Nil
-readProviders paths (Cons m rest) = do
-  p <- readProviderAt paths m
-  ps <- readProviders paths rest
+readProviders : List Dr.Source -> List String -> Heff (List Em.Provider)
+readProviders sources Nil = pure Nil
+readProviders sources (Cons m rest) = do
+  p <- readProviderAt sources m
+  ps <- readProviders sources rest
   pure (case p of
     Just pr -> Cons pr ps
     Nothing -> ps)
@@ -219,7 +270,7 @@ compileFound host file name outPath done c available = case Dr.findRunnable
 
 -- (a computation whose effects all have providers for this host: each
 -- world's algebra is bundled in from its module's M.provider.js)
-compileLast : L.Paths
+compileLast : List Dr.Source
             -> String
             -> String
             -> Maybe String
@@ -227,14 +278,14 @@ compileLast : L.Paths
             -> Co world Unit
             -> List Dr.Checked
             -> Heff Unit
-compileLast paths host file name outPath done cs = case Dr.lastChecked cs of
+compileLast sources host file name outPath done cs = case Dr.lastChecked cs of
   Nothing -> do
     printErr "no files given"
     exit 1
   Just c -> do
     found <-
       readProviders
-        paths
+        sources
         (nubStrM (map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
     compileFound
         host
@@ -245,7 +296,7 @@ compileLast paths host file name outPath done cs = case Dr.lastChecked cs of
         c
         (filter (\p -> forHost host p) found)
 
-compileDiags : L.Paths
+compileDiags : List Dr.Source
              -> String
              -> String
              -> Maybe String
@@ -254,10 +305,10 @@ compileDiags : L.Paths
              -> Bool
              -> List Dr.Checked
              -> Heff Unit
-compileDiags paths host file name outPath done badL cs = do
+compileDiags sources host file name outPath done badL cs = do
   putFileDiags cs
   if badL || anyErrors cs then exit 1
-    else compileLast paths host file name outPath done cs
+    else compileLast sources host file name outPath done cs
 
 -- | compile the computation `name` of FILE to a program of `host`:
 -- | FILE's import closure loaded with the compiler's own loader
@@ -267,7 +318,7 @@ compileCmd host name outPath how file = do
   badL <- printErrs "heff" l.errors 0
   cs <- Se.cachedProgram l
   compileDiags
-      l.paths
+      l.sources
       host
       file
       name
@@ -311,7 +362,7 @@ runCmd file progArgs = do
   cs <- Se.cachedProgram l
   ok <- mkDir (runDir l.paths)
   compileDiags
-      l.paths
+      l.sources
       "node"
       file
       (Just "main")
@@ -631,6 +682,7 @@ commands =
           }
         ]
     }
+  , cmd "init" "[DIR]" "a new project in DIR (here, without it)" ""
   , cmd "lsp" "" "a language server, on stdin/stdout" ""
   , { name = "completions"
     , args = "SHELL"
@@ -864,6 +916,126 @@ fmtCmd as = do
     _ -> fmtAll False as 0
   if bad > 0 then exit 1 else pure MkUnit
 
+-- | the last part of a path, its trailing slashes dropped
+basename : String -> String
+basename p =
+  if strLength p > 1 && charCode p (strLength p - 1) == 47
+    then basename (strSlice p 0 (strLength p - 1))
+  else case L.lastSlash p (strLength p - 1) of
+    Just i -> strSlice p (i + 1) (strLength p)
+    Nothing -> p
+
+-- | the project's name: DIR's, or (DIR being `.`) the working directory's
+projectName : String -> Maybe String -> String
+projectName "." (Just pwd) = basename pwd
+projectName dir _ = basename dir
+
+-- | the files of a new project NAME, for heff VERSION: what each is, and
+-- | its text
+projectFiles : String -> String -> List (Pair String String)
+projectFiles name v =
+  [ MkPair
+    "package.hf"
+    (joinWith
+       "\n"
+       [ "import manifest"
+       , ""
+       , "package : Package"
+       , "package ="
+       , "  { module = \"" ++ name ++ "\""
+       , "  , heff = \"" ++ v ++ "\""
+       , "  , require = []"
+       , "  , replace = []"
+       , "  }"
+       , ""
+       ])
+  , MkPair ".gitignore" (joinWith "\n" [".heff/", ""])
+  , MkPair
+    ("src/" ++ name ++ "/main.hf")
+    (joinWith
+       "\n"
+       [ "-- `heff test src/"
+       ++ name
+       ++ "/main.hf` checks the watches; `heff run src/"
+       ++ name
+       ++ "/main.hf` runs `main`."
+       , ""
+       , "import co"
+       , "import prelude"
+       , "import stdio"
+       , ""
+       , "greeting : String -> String"
+       , "greeting name = \"Hello, \" ++ name ++ \"!\""
+       , ""
+       , "-- >>> greeting \"heff\""
+       , "-- \"Hello, heff!\""
+       , ""
+       , "program : {{io : stdio <: stdio}} -> Co stdio Unit"
+       , "program = print (greeting \"world\")"
+       , ""
+       , "main : Co stdio Unit"
+       , "main = program (io := here stdio)"
+       , ""
+       ])
+  ]
+
+-- | the files of `projectFiles` that are there already in DIR
+existing : String -> List (Pair String String) -> Heff (List String)
+existing dir Nil = pure Nil
+existing dir (Cons (MkPair f text) rest) = do
+  there <- readFile (dir ++ "/" ++ f)
+  others <- existing dir rest
+  case there of
+    Just _ -> pure (Cons f others)
+    Nothing -> pure others
+
+writeAll : String -> List (Pair String String) -> Heff Bool
+writeAll dir Nil = pure True
+writeAll dir (Cons (MkPair f text) rest) = do
+  made <- mkDir (L.dirname (dir ++ "/" ++ f))
+  ok <- writeFile (dir ++ "/" ++ f) text
+  if made && ok then writeAll dir rest
+    else do
+      printErr ("heff: cannot write " ++ dir ++ "/" ++ f)
+      pure False
+
+-- | a new project in DIR: its package.hf, a .gitignore, and a module of
+-- | its package, `src/NAME/main.hf`, NAME being DIR's; nothing is
+-- | written over
+initCmd : String -> Heff Unit
+initCmd dir = do
+  pwd <- getEnv "PWD"
+  v <- ownVersion
+  name <- pure (projectName dir pwd)
+  files <- pure (projectFiles name (fromMaybe "0.1.0" v))
+  there <- existing dir files
+  if not (Pr.isName name)
+      then do
+        printErr
+            ("heff: `"
+             ++ name
+             ++ "` cannot name a package: a lowercase letter, then letters, digits and `_`")
+        exit 1
+    else case there of
+      Cons _ _ -> do
+        printErr
+            ("heff: "
+             ++ dir
+             ++ " has "
+             ++ joinWith ", " there
+             ++ " already; nothing written")
+        exit 1
+      Nil -> do
+        ok <- writeAll dir files
+        if ok
+            then print
+                ("heff: a new project in "
+                 ++ dir
+                 ++ "; `heff test src/"
+                 ++ name
+                 ++ "/main.hf` checks it")
+          else exit 1
+
 -- | the compiler's door: the commands of `usage`, and `dump-core
 -- | FILE...`, which checks the files given (in dependency order) and
 -- | prints their stored core, and `dump-eval FILE`
@@ -888,6 +1060,8 @@ program = do
     "completions" :: "bash" :: Nil -> write bashCompletions
     "completions" :: "zsh" :: Nil -> write zshCompletions
     "dump-core" :: files -> selfcheck files
+    "init" :: Nil -> initCmd "."
+    "init" :: dir :: Nil -> initCmd dir
     -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
     "lsp" :: flags ->
       if all (\x -> startsWith "--" x) flags
