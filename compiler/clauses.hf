@@ -26,13 +26,13 @@ stripRight : Ntn
            -> Maybe (Pair Ntn (List Ntn))
            -> Maybe (Pair Ntn (List Ntn))
 stripRight l op Nothing = Nothing
-stripRight l op (Just (MkPair r' eqs)) = Just (MkPair (Infix l op r') eqs)
+stripRight l op (Just (MkPair r' eqs)) = Just (MkPair (infixOp l op r') eqs)
 
 -- | `T where ... end`, the type of a definition by equations
 stripWhere : Ntn -> Maybe (Pair Ntn (List Ntn))
 stripWhere n = case n of
-  Juxt f (NBlock "where" Nothing eqs _) -> Just (MkPair f eqs)
-  Infix l op r -> stripRight l op (stripWhere r)
+  At (Juxt f (At (NBlock "where" Nothing eqs) _)) _ -> Just (MkPair f eqs)
+  At (Infix l op r) _ -> stripRight l op (stripWhere r)
   _ -> Nothing
 
 -- | a literal pattern is matched by the equality in scope for its kind
@@ -129,38 +129,39 @@ badPat n =
 
 pat : Ntn -> Either Err Pat
 pat n = case (getGroup n).head of
-  NTuple (Cons p Nil) _ ->
+  At (NTuple (Cons p Nil)) _ ->
     if length (getGroup n).args == 0 then pat p else badPat n
-  Ident x _ ->
+  At (Ident x) _ ->
     if length (getGroup n).args == 0 then Right (PVar x) else badPat n
-  NTag t sp -> do
+  At (NTag t) sp -> do
     ps <- traverseC (\m -> pat m) (getGroup n).args
     pure (PTag t ps sp)
-  NInt v sp ->
-    if length (getGroup n).args == 0 then Right (PLit (NInt v sp)) else badPat n
-  NString v sp ->
-    if length (getGroup n).args == 0 then Right (PLit (NString v sp))
+  At (NInt v) sp ->
+    if length (getGroup n).args == 0 then Right (PLit (At (NInt v) sp))
     else badPat n
-  NFloat v sp ->
-    if length (getGroup n).args == 0 then Right (PLit (NFloat v sp))
+  At (NString v) sp ->
+    if length (getGroup n).args == 0 then Right (PLit (At (NString v) sp))
+    else badPat n
+  At (NFloat v) sp ->
+    if length (getGroup n).args == 0 then Right (PLit (At (NFloat v) sp))
     else badPat n
   _ -> badPat n
 
 -- | the equality a literal is matched by
 equalityOf : Ntn -> String
-equalityOf (NString _ _) = "strEq"
-equalityOf (NFloat _ _) = "floatEq"
+equalityOf (At (NString _) _) = "strEq"
+equalityOf (At (NFloat _) _) = "floatEq"
 equalityOf _ = "intEq"
 
 sameLit : Ntn -> Ntn -> Bool
-sameLit (NInt x _) (NInt y _) = x == y
-sameLit (NString x _) (NString y _) = strEq x y
-sameLit (NFloat x _) (NFloat y _) = floatEq x y
+sameLit (At (NInt x) _) (At (NInt y) _) = x == y
+sameLit (At (NString x) _) (At (NString y) _) = strEq x y
+sameLit (At (NFloat x) _) (At (NFloat y) _) = floatEq x y
 sameLit _ _ = False
 
 equationLhs : String -> Ntn -> Ntn -> Either Err Clause
 equationLhs f lhs rhs = case (getGroup lhs).head of
-  Ident g _ ->
+  At (Ident g) _ ->
     if strEq g f
       then do
         pats <- traverseC (\m -> pat m) (getGroup lhs).args
@@ -177,7 +178,7 @@ equationLhs f lhs rhs = case (getGroup lhs).head of
 
 -- | `f p ... := e`
 equation : String -> Ntn -> Either Err Clause
-equation f (Infix lhs (Keyword ":=" _) rhs) = equationLhs f lhs rhs
+equation f (At (Infix lhs (At (Keyword ":=") _) rhs) _) = equationLhs f lhs rhs
 equation f n =
   Left
     (mkErr
@@ -195,18 +196,18 @@ patVars (PLit _) = Nil
 
 identsOf : Ntn -> List String
 identsOf n = case n of
-  Ident x _ -> Cons x Nil
-  Juxt a b -> appendC (identsOf a) (identsOf b)
-  Infix a _ b -> appendC (identsOf a) (identsOf b)
-  NBlock _ h ns _ ->
+  At (Ident x) _ -> Cons x Nil
+  At (Juxt a b) _ -> appendC (identsOf a) (identsOf b)
+  At (Infix a _ b) _ -> appendC (identsOf a) (identsOf b)
+  At (NBlock _ h ns) _ ->
     appendC
       (case h of
        Nothing -> Nil
        Just m -> identsOf m)
       (concatMapC (\m -> identsOf m) ns)
-  MDecl _ _ m _ -> identsOf m
-  NTuple ns _ -> concatMapC (\m -> identsOf m) ns
-  NBrace m _ -> identsOf m
+  At (MDecl _ _ m) _ -> identsOf m
+  At (NTuple ns) _ -> concatMapC (\m -> identsOf m) ns
+  At (NBrace m) _ -> identsOf m
   _ -> Nil
 
 fresh : List String -> String -> String
@@ -215,22 +216,23 @@ fresh used x = if elemBy strEq x used then fresh used (x ++ "'") else x
 -- | `x` becomes `v`, except where something binds `x` again
 rename : String -> String -> Ntn -> Ntn
 rename x v n = case n of
-  Ident y sp -> if strEq y x then Ident v sp else Ident y sp
-  Infix l (Keyword "=>" ksp) r ->
-    if elemBy strEq x (identsOf l) then Infix l (Keyword "=>" ksp) r
-    else Infix l (Keyword "=>" ksp) (rename x v r)
-  Infix l k r -> Infix (rename x v l) k (rename x v r)
-  Juxt a b -> Juxt (rename x v a) (rename x v b)
-  NBlock b h ns sp ->
-    NBlock
-      b
-      (case h of
-       Nothing -> Nothing
-       Just m -> Just (rename x v m))
-      (map (\m -> rename x v m) ns)
+  At (Ident y) sp -> if strEq y x then At (Ident v) sp else At (Ident y) sp
+  At (Infix l (At (Keyword "=>") ksp) r) _ ->
+    if elemBy strEq x (identsOf l) then infixOp l (At (Keyword "=>") ksp) r
+    else infixOp l (At (Keyword "=>") ksp) (rename x v r)
+  At (Infix l k r) _ -> infixOp (rename x v l) k (rename x v r)
+  At (Juxt a b) _ -> juxt (rename x v a) (rename x v b)
+  At (NBlock b h ns) sp ->
+    At
+      (NBlock
+         b
+         (case h of
+          Nothing -> Nothing
+          Just m -> Just (rename x v m))
+         (map (\m -> rename x v m) ns))
       sp
-  NTuple ns sp -> NTuple (map (\m -> rename x v m) ns) sp
-  NBrace a sp -> NBrace (rename x v a) sp
+  At (NTuple ns) sp -> At (NTuple (map (\m -> rename x v m) ns)) sp
+  At (NBrace a) sp -> At (NBrace (rename x v a)) sp
   _ -> n
 
 -- | a variable pattern `p` matched against the variable `v`: `p` means `v`
@@ -359,11 +361,11 @@ armOf r used bound sp vars rows c v t = do
             (\row -> armSpecializeV c t (armFields used bound t v) v row)
             rows))
   pure
-      (Infix
+      (infixOp
          (group
-            (NTag t.tag t.span)
-            (map (\y -> Ident y sp) (armFields used bound t v)))
-         (Keyword "=>" sp)
+            (At (NTag t.tag) t.span)
+            (map (\y -> At (Ident y) sp) (armFields used bound t v)))
+         (At (Keyword "=>") sp)
          body)
 
 litYesOne : Int -> Ntn -> String -> Clause -> List Clause -> List Clause
@@ -428,17 +430,24 @@ literalOf r used bound sp vars rows c l = do
     r.compile used bound sp (dropAt c vars) (litYes c l (varAt vars c) rows)
   noB <- r.compile used bound sp vars (litNo c l rows)
   pure
-      (NBlock
-         "match"
-         (Just
-            (group
-               (Ident (equalityOf l) (ntnSpan l))
-               (Cons (Ident (varAt vars c) sp) (Cons l Nil))))
-         (Cons
-            (Infix (NTag "True" (ntnSpan l)) (Keyword "=>" (ntnSpan l)) yesB)
+      (At
+         (NBlock
+            "match"
+            (Just
+               (group
+                  (At (Ident (equalityOf l)) (ntnSpan l))
+                  (Cons (At (Ident (varAt vars c)) sp) (Cons l Nil))))
             (Cons
-               (Infix (NTag "False" (ntnSpan l)) (Keyword "=>" (ntnSpan l)) noB)
-               Nil))
+               (infixOp
+                  (At (NTag "True") (ntnSpan l))
+                  (At (Keyword "=>") (ntnSpan l))
+                  yesB)
+               (Cons
+                  (infixOp
+                     (At (NTag "False") (ntnSpan l))
+                     (At (Keyword "=>") (ntnSpan l))
+                     noB)
+                  Nil)))
          (ntnSpan l))
 
 noLitHere : Pm.Span -> Int -> List Clause -> Either Err Unit
@@ -480,7 +489,7 @@ defaultOf r used bound sp vars rows c rest = do
               (dropAt c row.pats)
               (bindVar (varAt vars c) (patAt c row) row.rhs))
          rest)
-  pure (Cons (Infix (Ident "_" sp) (Keyword "=>" sp) b) Nil)
+  pure (Cons (infixOp (At (Ident "_") sp) (At (Keyword "=>") sp) b) Nil)
 
 -- | rows whose column `c` is a variable go on in every other case
 defaultArm : CK
@@ -520,7 +529,13 @@ compileAt r used bound sp vars rows c p = do
       (\t -> armOf r used bound sp vars rows c (varAt vars c) t)
       (nubTagRows (catMaybesC (map (\row -> tagOf (patAt c row)) rows)))
   dflt <- defaultArm r used bound sp vars rows c
-  pure (NBlock "match" (Just (Ident (varAt vars c) sp)) (appendC arms dflt) sp)
+  pure
+      (At
+         (NBlock
+            "match"
+            (Just (At (Ident (varAt vars c)) sp))
+            (appendC arms dflt))
+         sp)
 
 -- | the match tree for `rows` over the variables `vars`, column by column
 compileF : CK
@@ -532,7 +547,7 @@ compileF : CK
          -> Either Err Ntn
 compileF r used bound sp vars rows = case rows of
   -- unreachable: a missing tag is the match's error
-  Nil -> Right (Keyword "abandon" sp)
+  Nil -> Right (At (Keyword "abandon") sp)
   Cons row rest -> case findTagLit (clausePats row) 0 of
     -- the first equation matches whatever is left: it is the answer
     Nothing ->
@@ -589,7 +604,7 @@ desugarBody f params sp rows arity used = do
       rows
   pure
       (foldr2
-         (\x b -> Infix (Ident x sp) (Keyword "=>" sp) b)
+         (\x b -> infixOp (At (Ident x) sp) (At (Keyword "=>") sp) b)
          body
          (dropC
             (length params)
@@ -644,7 +659,7 @@ desugar f params eqNs sp = do
 type CaseTree = { scrutinee : String, tree : Ntn }
 
 caseAlt : Ntn -> Either Err Clause
-caseAlt (Infix p (Keyword "=>" _) rhs) = do
+caseAlt (At (Infix p (At (Keyword "=>") _) rhs) _) = do
   p' <- pat p
   pure (mkClause (Cons p' Nil) rhs)
 caseAlt n =
@@ -671,5 +686,5 @@ caseTree sp altNs = do
             rows)
          "it")
 
--- >>> (\(e : Either Err Pat) -> 1) (pat (Ident "x" Pm.noSpan))
+-- >>> (\(e : Either Err Pat) -> 1) (pat (At (Ident "x") Pm.noSpan))
 -- 1
