@@ -26,4 +26,6 @@ export const mismatchImpl = (color) => (expected) => (got) => {
   return { expected: e, got: g, diff: d };
 };
 
-export const useColorImpl = () => Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+// (in the worker bin/ runs heff in, stdout is not the terminal: the main
+// thread says whether it is, HEFF_TTY)
+export const useColorImpl = () => (Boolean(process.stdout.isTTY) || process.env.HEFF_TTY === "1") && !process.env.NO_COLOR;

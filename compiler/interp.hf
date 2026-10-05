@@ -7,7 +7,9 @@
 -- first used.  Where the reference lets `abandon` escape as a host
 -- exception and catches it, here it is a value, `Abn`, threaded through
 -- every step -- so a watch that abandons reports `<abandoned>` instead
--- of ending the run.
+-- of ending the run.  Evaluation that goes deeper than `deepest` is said
+-- to diverge, `Div`, as the reference's `deeper` says it: every
+-- function and every thunk is given the depth it is forced at.
 
 import array as A
 import compiler.dict as D
@@ -16,12 +18,13 @@ import compiler.syntax as Sx
 import map as M
 import prelude
 
-type Th a = Unit -> a
+-- | a computation forced at a depth
+type Th a = Int -> a
 
-data Res a = Ok a | Abn
+data Res a = Ok a | Abn | Div
 
 data Val
-  = VFun (Th (Res Val) -> Res Val)
+  = VFun (Int -> Th (Res Val) -> Res Val)
   | VCons (D.Dict Val)
   | VTag String (List Val)
   | VInt Int
@@ -35,14 +38,21 @@ type RVal = Res Val
 rbind : RVal -> (Val -> RVal) -> RVal
 rbind (Ok v) f = f v
 rbind Abn f = Abn
+rbind Div f = Div
 
 okTh : Val -> Th RVal
-okTh v = \u -> Ok v
+okTh v = \d -> Ok v
 
-app : Val -> Th RVal -> RVal
-app (VFun f) v = f v
-app VErased _ = Ok VErased
-app _ _ = abandon
+-- | how deep evaluation goes before it is said to diverge: deeper than a
+-- | program that ends needs (the reference's `deepest`)
+deepest : Int
+deepest = 1000000
+
+-- | a function applied, by evaluation at depth `d`
+app : Int -> Val -> Th RVal -> RVal
+app d (VFun f) v = f d v
+app d VErased _ = Ok VErased
+app d _ _ = abandon
 
 projV : Val -> String -> RVal
 projV (VCons fs) x = Ok (D.elemAt fs x)
@@ -63,20 +73,18 @@ intTake2 f _ _ = abandon
 int2 : (Int -> Int -> RVal) -> Val
 int2 f =
   VFun
-    (\a ->
+    (\d a ->
        Ok
          (VFun
-            (\b ->
-               rbind
-                 (a MkUnit)
-                 (\av -> rbind (b MkUnit) (\bv -> intTake2 f av bv)))))
+            (\d b ->
+               rbind (a d) (\av -> rbind (b d) (\bv -> intTake2 f av bv)))))
 
 floatTake1 : (Float -> RVal) -> Val -> RVal
 floatTake1 f (VFloat a) = f a
 floatTake1 f _ = abandon
 
 float1 : (Float -> RVal) -> Val
-float1 f = VFun (\a -> rbind (a MkUnit) (\av -> floatTake1 f av))
+float1 f = VFun (\d a -> rbind (a d) (\av -> floatTake1 f av))
 
 floatTake2 : (Float -> Float -> RVal) -> Val -> Val -> RVal
 floatTake2 f (VFloat a) (VFloat b) = f a b
@@ -85,20 +93,18 @@ floatTake2 f _ _ = abandon
 float2 : (Float -> Float -> RVal) -> Val
 float2 f =
   VFun
-    (\a ->
+    (\d a ->
        Ok
          (VFun
-            (\b ->
-               rbind
-                 (a MkUnit)
-                 (\av -> rbind (b MkUnit) (\bv -> floatTake2 f av bv)))))
+            (\d b ->
+               rbind (a d) (\av -> rbind (b d) (\bv -> floatTake2 f av bv)))))
 
 strTake1 : (String -> RVal) -> Val -> RVal
 strTake1 f (VStr a) = f a
 strTake1 f _ = abandon
 
 str1 : (String -> RVal) -> Val
-str1 f = VFun (\a -> rbind (a MkUnit) (\av -> strTake1 f av))
+str1 f = VFun (\d a -> rbind (a d) (\av -> strTake1 f av))
 
 strTake2 : (String -> String -> RVal) -> Val -> Val -> RVal
 strTake2 f (VStr a) (VStr b) = f a b
@@ -107,31 +113,29 @@ strTake2 f _ _ = abandon
 str2 : (String -> String -> RVal) -> Val
 str2 f =
   VFun
-    (\a ->
+    (\d a ->
        Ok
          (VFun
-            (\b ->
-               rbind
-                 (a MkUnit)
-                 (\av -> rbind (b MkUnit) (\bv -> strTake2 f av bv)))))
+            (\d b ->
+               rbind (a d) (\av -> rbind (b d) (\bv -> strTake2 f av bv)))))
 
 intTake1 : (Int -> RVal) -> Val -> RVal
 intTake1 f (VInt a) = f a
 intTake1 f _ = abandon
 
 int1 : (Int -> RVal) -> Val
-int1 f = VFun (\a -> rbind (a MkUnit) (\av -> intTake1 f av))
+int1 f = VFun (\d a -> rbind (a d) (\av -> intTake1 f av))
 
 -- (an array's element type is given first, erased)
 tyThen : Val -> Val
-tyThen k = VFun (\u -> Ok k)
+tyThen k = VFun (\d u -> Ok k)
 
 arrTake1 : (Array Val -> RVal) -> Val -> RVal
 arrTake1 f (VArr xs) = f xs
 arrTake1 f _ = abandon
 
 arr1 : (Array Val -> RVal) -> Val
-arr1 f = VFun (\a -> rbind (a MkUnit) (\av -> arrTake1 f av))
+arr1 f = VFun (\d a -> rbind (a d) (\av -> arrTake1 f av))
 
 isFiniteF : Float -> Bool
 isFiniteF x = (x -. x) ==. 0.0
@@ -141,12 +145,12 @@ setAt Nil i x = Nil
 setAt (Cons y ys) i x =
   if i == 0 then Cons x ys else Cons y (setAt ys (i - 1) x)
 
-genGo : Int -> Int -> Val -> (List Val -> RVal) -> RVal
-genGo j n f k =
+genGo : Int -> Int -> Int -> Val -> (List Val -> RVal) -> RVal
+genGo d j n f k =
   if j >= n then k Nil
   else rbind
-      (app f (okTh (VInt j)))
-      (\v -> genGo (j + 1) n f (\vs -> k (Cons v vs)))
+      (app d f (okTh (VInt j)))
+      (\v -> genGo d (j + 1) n f (\vs -> k (Cons v vs)))
 
 -- (a list's cells, `Cons`/`Nil`, as the prelude has them)
 fromListV : Val -> List Val -> List Val
@@ -212,9 +216,9 @@ prim p =
                    (\i ->
                       Ok
                         (VFun
-                           (\x ->
+                           (\d x ->
                               rbind
-                                (x MkUnit)
+                                (x d)
                                 (\xv ->
                                    if 0 <= i && i < length (A.toList xs)
                                      then Ok
@@ -228,18 +232,21 @@ prim p =
            (\n ->
               Ok
                 (VFun
-                   (\f ->
+                   (\d f ->
                       rbind
-                        (f MkUnit)
+                        (f d)
                         (\fv ->
-                           genGo 0 n fv (\vs -> Ok (VArr (A.fromList vs))))))))
+                           genGo
+                             d
+                             0
+                             n
+                             fv
+                             (\vs -> Ok (VArr (A.fromList vs))))))))
   else if strEq p "arrayFromList"
     then tyThen
         (VFun
-           (\l ->
-              rbind
-                (l MkUnit)
-                (\lv -> Ok (VArr (A.fromList (fromListV lv Nil))))))
+           (\d l ->
+              rbind (l d) (\lv -> Ok (VArr (A.fromList (fromListV lv Nil))))))
   else if strEq p "arrayToList"
     then tyThen (arr1 (\xs -> Ok (toListV (A.toList xs))))
   else if strEq p "strAppend" then str2 (\a b -> Ok (VStr (a ++ b)))
@@ -281,50 +288,58 @@ evalFields ev Nil k = k Nil
 evalFields ev (Cons (MkPair l t) rest) k =
   rbind (ev t) (\v -> evalFields ev rest (\vs -> k (Cons (MkPair l v) vs)))
 
-evalIn : Env -> Sx.Tm -> RVal
-evalIn e t = case t of
-  SLocal i -> case nthTh e.local i of
-    Just v -> v MkUnit
-    Nothing -> abandon
-  SGlobal x -> case M.lookup compareString x e.global of
-    Just v -> v MkUnit
-    Nothing -> abandon
-  SLam _ (MkAbs _ body) -> Ok (VFun (\v -> evalIn (bindLocal e v) body))
-  SLam _ (AbsConst body) -> Ok (VFun (\u -> evalIn e body))
-  SApp t1 t2 ->
-    rbind (evalIn e t1) (\f -> rbind (evalIn e t2) (\a -> app f (okTh a)))
-  SCons fs ->
-    evalFields
-      (\t2 -> evalIn e t2)
-      (D.toList fs)
-      (\vs -> Ok (VCons (D.fromList vs)))
-  SProj t2 x -> rbind (evalIn e t2) (\v -> projV v x)
-  STag x ts ->
-    evalEach (\t2 -> evalIn e t2) (A.toList ts) (\vs -> Ok (VTag x vs))
-  SMatch scrut cases ->
-    rbind (evalIn e scrut) (\v -> case v of
-    VTag x vs ->
-      (case D.lookup cases x of
-       Just (MkPair _ body) -> evalIn (bindVals e vs) body
-       Nothing -> abandon)
-    VErased -> Ok VErased
-    _ -> abandon)
-  SCode _ -> Ok VErased
-  SIs t2 -> evalIn e t2
-  SAbandon -> Abn
-  SRec t2 -> evalIn e t2
-  SPrim x -> Ok (prim x)
-  SLitInt i -> Ok (VInt i)
-  SLitFloat x -> Ok (VFloat x)
-  SLitString s -> Ok (VStr s)
-  SImplicit _ t2 -> evalIn e t2
-  SSpecialize _ _ _ -> Ok VErased
-  _ -> abandon
+evalIn : Int -> Env -> Sx.Tm -> RVal
+evalIn d e t =
+  if d > deepest then Div
+  else case t of
+    SLocal i -> case nthTh e.local i of
+      Just v -> v d
+      Nothing -> abandon
+    SGlobal x -> case M.lookup compareString x e.global of
+      Just v -> v d
+      Nothing -> abandon
+    SLam _ (MkAbs _ body) ->
+      Ok (VFun (\dc v -> evalIn (dc + 1) (bindLocal e v) body))
+    SLam _ (AbsConst body) -> Ok (VFun (\dc u -> evalIn (dc + 1) e body))
+    SApp t1 t2 ->
+      rbind
+        (evalIn (d + 1) e t1)
+        (\f -> rbind (evalIn (d + 1) e t2) (\a -> app d f (okTh a)))
+    SCons fs ->
+      evalFields
+        (\t2 -> evalIn (d + 1) e t2)
+        (D.toList fs)
+        (\vs -> Ok (VCons (D.fromList vs)))
+    SProj t2 x -> rbind (evalIn (d + 1) e t2) (\v -> projV v x)
+    STag x ts ->
+      evalEach
+        (\t2 -> evalIn (d + 1) e t2)
+        (A.toList ts)
+        (\vs -> Ok (VTag x vs))
+    SMatch scrut cases ->
+      rbind (evalIn (d + 1) e scrut) (\v -> case v of
+      VTag x vs ->
+        (case D.lookup cases x of
+         Just (MkPair _ body) -> evalIn (d + 1) (bindVals e vs) body
+         Nothing -> abandon)
+      VErased -> Ok VErased
+      _ -> abandon)
+    SCode _ -> Ok VErased
+    SIs t2 -> evalIn (d + 1) e t2
+    SAbandon -> Abn
+    SRec t2 -> evalIn (d + 1) e t2
+    SPrim x -> Ok (prim x)
+    SLitInt i -> Ok (VInt i)
+    SLitFloat x -> Ok (VFloat x)
+    SLitString s -> Ok (VStr s)
+    SImplicit _ t2 -> evalIn (d + 1) e t2
+    SSpecialize _ _ _ -> Ok VErased
+    _ -> abandon
 
 -- Results, as the tools show them
 --------------------------------------------------------------------------------
 
-data EvalResult = RSucceeded Val | RAbandoned
+data EvalResult = RSucceeded Val | RAbandoned | RDiverged
 
 escAt : String -> Int -> String
 escAt s i =
@@ -389,6 +404,7 @@ showVal v = showValGo False v
 showResult : EvalResult -> String
 showResult (RSucceeded v) = showVal v
 showResult RAbandoned = "<abandoned>"
+showResult RDiverged = "<diverged>"
 
 -- Globals
 --------------------------------------------------------------------------------
@@ -397,11 +413,13 @@ type GlobalEnv = M.Map String (Th RVal)
 
 -- (the definition itself is local 0: forcing it ties the knot)
 fixThunk : GlobalEnv -> Sx.Tm -> Th RVal
-fixThunk g t = \u -> evalIn { local = Cons (fixThunk g t) Nil, global = g } t
+fixThunk g t = \d ->
+    evalIn (d + 1) { local = Cons (fixThunk g t) Nil, global = g } t
 
 resultOf : RVal -> EvalResult
 resultOf (Ok v) = RSucceeded v
 resultOf Abn = RAbandoned
+resultOf Div = RDiverged
 
 withR : {a : Type} -> RVal -> (RVal -> a) -> a
 withR r f = f r
@@ -414,11 +432,11 @@ evalGlobalsGo : (String -> Bool)
 evalGlobalsGo wanted ge Nil acc = reverse acc
 evalGlobalsGo wanted ge (Cons (MkPair x entry) rest) acc =
   withR
-    (fixThunk ge entry.syntax MkUnit)
+    (fixThunk ge entry.syntax 0)
     (\r ->
        evalGlobalsGo
          wanted
-         (M.insert compareString x (\u -> r) ge)
+         (M.insert compareString x (\d -> r) ge)
          rest
          (if wanted x then Cons (MkPair x (resultOf r)) acc else acc))
 
@@ -432,8 +450,8 @@ evalGlobalsWhere : (String -> Bool)
                  -> List (Pair String EvalResult)
 evalGlobalsWhere wanted gs = evalGlobalsGo wanted M.empty (G.globalsList gs) Nil
 
--- >>> showResult (resultOf (evalIn { local = Nil, global = M.empty } (SApp (SApp (SPrim "intAdd") (SLitInt 2)) (SLitInt 3))))
+-- >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intAdd") (SLitInt 2)) (SLitInt 3))))
 -- "5"
 
--- >>> showResult (resultOf (evalIn { local = Nil, global = M.empty } (SApp (SApp (SPrim "intDiv") (SLitInt 2)) (SLitInt 0))))
+-- >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intDiv") (SLitInt 2)) (SLitInt 0))))
 -- "<abandoned>"

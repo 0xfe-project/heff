@@ -21,6 +21,8 @@ if (referenceOnly.includes(args[0]) || !existsSync(selfHosted)) {
   await import(pathToFileURL(join(root, "bin", "reference.mjs")));
 } else {
   process.env.HEFF_LIB ??= join(root, "lib");
+  // (a worker's stdout is never a terminal: whether ours is, said)
+  if (process.stdout.isTTY) process.env.HEFF_TTY = "1";
   const worker = new Worker(selfHosted, { argv: args, resourceLimits: { stackSizeMb: 512 } });
   worker.on("error", (e) => { console.error(e); process.exitCode = 1; });
   worker.on("exit", (code) => { if (code !== 0) process.exitCode = code; });

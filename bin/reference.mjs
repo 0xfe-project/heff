@@ -46,6 +46,8 @@ if (!isMainThread) {
   main();
 } else {
   const lsp = cmd === "lsp";
+  // (a worker's stdout is never a terminal: whether ours is, said)
+  if (process.stdout.isTTY) process.env.HEFF_TTY = "1";
   const worker = new Worker(new URL(import.meta.url), { argv: process.argv.slice(2), resourceLimits: { stackSizeMb: 512 }, stdin: lsp });
   // (the client's messages, to the server's thread; when it ends, heff does)
   if (lsp) process.stdin.pipe(worker.stdin);
