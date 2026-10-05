@@ -70,5 +70,78 @@ const old = heff("check", "old/src/old/m.hf");
 expect("a project for another heff", old.status === 1 &&
   old.stderr.includes(`package.hf: the project is for heff 0.99.0 (the same 0.x), and this heff is ${version}`), old);
 
+// packages: a required package given by a directory (`replace`), its
+// modules imported by the name the project requires it by, its own
+// imports by its own package.hf
+const manifestOf = (path, requires = [], heff = version) => {
+  const req = requires.map(([name, p]) => `{ name = "${name}", path = "${p}", version = "1.0.0" }`);
+  const rep = requires.filter(([, , dir]) => dir).map(([name, , dir]) => `{ name = "${name}", dir = "${dir}" }`);
+  return `package = { module = "${path}", heff = "${heff}", require = [${req.join(", ")}], replace = [${rep.join(", ")}] }\n`;
+};
+write("json/package.hf", manifestOf("x.org/json"));
+write("json/src/json/util.hf", "import prelude\n\nquoted : String -> String\nquoted s = \"<\" ++ s ++ \">\"\n");
+write("json/src/json/encode.hf", "import json.util\nimport prelude\n\nencode : String -> String\nencode s = quoted s\n");
+write("jsony/package.hf", manifestOf("y.org/json"));
+write("jsony/src/json/encode.hf", "import prelude\n\nencode : String -> Int\nencode s = 1\n");
+
+write("app/package.hf", manifestOf("x.org/app", [["json", "x.org/json", "../json"]]));
+write("app/src/app/main.hf", "import json.encode\nimport prelude\n\nout : String\nout = encode \"hi\"\n\n-- >>> out\n-- \"<hi>\"\n");
+const app = heff("test", "app/src/app/main.hf");
+expect("a package from a directory", app.status === 0 && app.stdout.includes("1/1 expectations hold"), app);
+
+write("renamed/package.hf", manifestOf("x.org/renamed", [["js", "x.org/json", "../json"]]));
+write("renamed/src/renamed/main.hf", "import js.encode\nimport prelude\n\nout : String\nout = encode \"hi\"\n");
+const renamed = heff("check", "renamed/src/renamed/main.hf");
+expect("a package imported by another name", renamed.status === 0 && renamed.stdout.includes("out : String"), renamed);
+
+write("both/package.hf", manifestOf("x.org/both", [["json", "x.org/json", "../json"], ["json2", "y.org/json", "../jsony"]]));
+write("both/src/both/main.hf", "import json.encode as X\nimport json2.encode as Y\nimport prelude\n\nout : String\nout = X.encode \"hi\"\n\nn : Int\nn = Y.encode \"hi\"\n");
+const both = heff("check", "both/src/both/main.hf");
+expect("two packages of one name, required by two", both.status === 0 && both.stdout.includes("out : String") && both.stdout.includes("n : Int"), both);
+
+write("clash/package.hf", manifestOf("x.org/clash", [["json", "x.org/json", "../json"]]));
+write("clash/src/json/encode.hf", "x : Int\nx = 1\n");
+write("clash/src/clash/main.hf", "import json.encode\n\ny : Int\ny = 1\n");
+const pclash = heff("check", "clash/src/clash/main.hf");
+expect("a package and the project's module of one name", pclash.status === 1 &&
+  pclash.stderr.includes("module json.encode is more than one file: clash/src/json/encode.hf and clash/../json/src/json/encode.hf"), pclash);
+
+write("unfetched/package.hf", manifestOf("x.org/unfetched", [["json", "x.org/json"]]));
+write("unfetched/src/unfetched/main.hf", "x : Int\nx = 1\n");
+const unfetched = heff("check", "unfetched/src/unfetched/main.hf");
+expect("a package with no directory", unfetched.status === 1 &&
+  unfetched.stderr.includes("x.org/unfetched requires x.org/json, which heff does not fetch yet: give it a directory, by `replace` in unfetched/package.hf"), unfetched);
+
+write("wrong/package.hf", manifestOf("x.org/wrong", [["json", "x.org/json", "../jsony"]]));
+write("wrong/src/wrong/main.hf", "x : Int\nx = 1\n");
+const wrong = heff("check", "wrong/src/wrong/main.hf");
+expect("a directory of another package", wrong.status === 1 &&
+  wrong.stderr.includes("wrong/../jsony/package.hf is the package y.org/json, not x.org/json"), wrong);
+
+write("two/package.hf", manifestOf("x.org/two"));
+write("two/src/a/a.hf", "x : Int\nx = 1\n");
+write("two/src/b/b.hf", "x : Int\nx = 1\n");
+write("usetwo/package.hf", manifestOf("x.org/usetwo", [["two", "x.org/two", "../two"]]));
+write("usetwo/src/usetwo/main.hf", "x : Int\nx = 1\n");
+const usetwo = heff("check", "usetwo/src/usetwo/main.hf");
+expect("a package whose src/ holds two directories", usetwo.status === 1 &&
+  usetwo.stderr.includes("usetwo/../two/src holds a, b: a package's src/ holds one directory, named as the package"), usetwo);
+
+write("loop/package.hf", manifestOf("x.org/loop", [["back", "x.org/back", "../back"]]));
+write("loop/src/loop/main.hf", "x : Int\nx = 1\n");
+write("back/package.hf", manifestOf("x.org/back", [["loop", "x.org/loop"]]));
+write("back/src/back/b.hf", "x : Int\nx = 1\n");
+const loop = heff("check", "loop/src/loop/main.hf");
+expect("packages that require one another", loop.status === 1 &&
+  loop.stderr.includes("packages require one another: x.org/loop -> x.org/back -> x.org/loop"), loop);
+
+write("olddep/package.hf", manifestOf("x.org/olddep", [], "0.99.0"));
+write("olddep/src/olddep/m.hf", "x : Int\nx = 1\n");
+write("useold/package.hf", manifestOf("x.org/useold", [["olddep", "x.org/olddep", "../olddep"]]));
+write("useold/src/useold/main.hf", "x : Int\nx = 1\n");
+const useold = heff("check", "useold/src/useold/main.hf");
+expect("a package for another heff", useold.status === 1 &&
+  useold.stderr.includes(`the package x.org/olddep is for heff 0.99.0 (the same 0.x), and this heff is ${version}`), useold);
+
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
