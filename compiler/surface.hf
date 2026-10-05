@@ -551,7 +551,8 @@ patVarsOf : Ntn -> List String
 patVarsOf n = case (getGroup n).head of
   At (Ident x) _ ->
     if length (getGroup n).args == 0 && not (strEq x "_") then Cons x Nil
-    else Nil
+    -- (`p :: q`, an operator applied)
+    else concatMapS (\m -> patVarsOf m) (getGroup n).args
   At (NTag _) _ -> concatMapS (\m -> patVarsOf m) (getGroup n).args
   _ -> Nil
 
@@ -712,11 +713,16 @@ applyOp op l r =
   else if strEq op.text "||" then shortcut op l (At (NTag "True") (spanOf op)) r
   else juxt (juxt (At (Ident op.text) (spanOf op)) l) r
 
+-- | in a pattern, an operator is applied as a tag is: its operands are
+-- | its arguments
+applyPatOp : L.Tok -> Ntn -> Ntn -> Ntn
+applyPatOp op l r = group (At (Ident op.text) (spanOf op)) (Cons l (Cons r Nil))
+
 -- (stacks newest first: push is `Cons`)
-reduceS : Shunt -> Shunt
-reduceS st = case st.ops of
+reduceS : (L.Tok -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
+reduceS apply st = case st.ops of
   Cons o os -> case st.out of
-    Cons r (Cons l rest) -> { ops = os, out = Cons (applyOp o l r) rest }
+    Cons r (Cons l rest) -> { ops = os, out = Cons (apply o l r) rest }
     _ -> st
   Nil -> st
 
@@ -759,19 +765,29 @@ firstS fix lenient before op = case F.relate fix before.text op.text of
             ++ x
             ++ "`), or import the module that does"))
 
-pushS : F.Fixities -> Bool -> Shunt -> Operand -> P Shunt
-pushS fix lenient st r = case st.ops of
+pushS : (L.Tok -> Ntn -> Ntn -> Ntn)
+      -> F.Fixities
+      -> Bool
+      -> Shunt
+      -> Operand
+      -> P Shunt
+pushS apply fix lenient st r = case st.ops of
   Nil -> pure { ops = Cons r.op st.ops, out = Cons r.e st.out }
   Cons before os -> do
     done <- firstS fix lenient before r.op
-    if done then pushS fix lenient (reduceS st) r
+    if done then pushS apply fix lenient (reduceS apply st) r
       else pure { ops = Cons r.op st.ops, out = Cons r.e st.out }
 
-pushAll : F.Fixities -> Bool -> Shunt -> List Operand -> P Shunt
-pushAll fix lenient st Nil = pure st
-pushAll fix lenient st (Cons r rest) = do
-  st' <- pushS fix lenient st r
-  pushAll fix lenient st' rest
+pushAll : (L.Tok -> Ntn -> Ntn -> Ntn)
+        -> F.Fixities
+        -> Bool
+        -> Shunt
+        -> List Operand
+        -> P Shunt
+pushAll apply fix lenient st Nil = pure st
+pushAll apply fix lenient st (Cons r rest) = do
+  st' <- pushS apply fix lenient st r
+  pushAll apply fix lenient st' rest
 
 checkFixOf : F.Fixities -> Bool -> List Operand -> P Unit
 checkFixOf fix lenient Nil = pure MkUnit
@@ -788,10 +804,10 @@ checkFixOf fix lenient (Cons r rest) = case F.groupOf fix r.op.text of
             ++ r.op.text
             ++ "`), or import the module that does"))
 
-reduceAll : Shunt -> Shunt
-reduceAll st = case st.ops of
+reduceAll : (L.Tok -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
+reduceAll apply st = case st.ops of
   Nil -> st
-  Cons o os -> reduceAll (reduceS st)
+  Cons o os -> reduceAll apply (reduceS apply st)
 
 headOr : {a : Type} -> a -> List a -> a
 headOr z Nil = z
@@ -799,13 +815,13 @@ headOr z (Cons x xs) = x
 
 -- | operators and operands into a tree, refusing operators that do not
 -- | go together
-resolve : Ntn -> List Operand -> P Ntn
-resolve e0 rest = do
+resolve : (L.Tok -> Ntn -> Ntn -> Ntn) -> Ntn -> List Operand -> P Ntn
+resolve apply e0 rest = do
   fix <- pGets (\s -> s.fix)
   lenient <- pGets (\s -> s.lenient)
   checkFixOf fix lenient rest
-  st <- pushAll fix lenient { ops = Nil, out = Cons e0 Nil } rest
-  pure (headOr e0 (reduceAll st).out)
+  st <- pushAll apply fix lenient { ops = Nil, out = Cons e0 Nil } rest
+  pure (headOr e0 (reduceAll apply st).out)
 
 -- The grammar's functions, knotted through `gram`
 --------------------------------------------------------------------------------
@@ -895,7 +911,7 @@ userOpsF : Gram -> P Ntn
 userOpsF g = do
   e0 <- g.app
   rest <- operandsF g Nil
-  if length rest == 0 then pure e0 else resolve e0 rest
+  if length rest == 0 then pure e0 else resolve applyOp e0 rest
 
 -- | application: a head and its arguments
 appF : Gram -> P Ntn
@@ -1266,23 +1282,25 @@ patHeadF g = do
         pure (group (At (NTag t.text) (spanOf t)) args)
     else g.patAtom
 
-consTailF : Gram -> Ntn -> P Ntn
-consTailF g l = do
+patOperandsF : Gram -> List Operand -> P (List Operand)
+patOperandsF g acc = do
   t <- peek
   b <- atBoundary
-  if strEq t.kind "sym" && strEq t.text "::" && not b
+  if isOperator t && not b
       then do
         n <- next
-        r <- g.pattern_
-        pure (group (At (NTag "Cons") (spanOf t)) (Cons l (Cons r Nil)))
-    else pure l
+        p <- patHeadF g
+        patOperandsF g (Cons (mkOperand t p) acc)
+    else pure (reverse acc)
 
--- | a pattern: `C p ...`, or an atomic one; `x :: xs` is the `Cons` in
--- | scope, and binds right
+-- | a pattern: `C p ...`, or an atomic one; or such patterns between
+-- | operators, `x :: xs`, as the fixities say (an operator is another
+-- | name for a tag: elaboration finds which)
 patternF : Gram -> P Ntn
 patternF g = do
   p <- patHeadF g
-  consTailF g p
+  rest <- patOperandsF g Nil
+  if length rest == 0 then pure p else resolve applyPatOp p rest
 
 -- | `x`, `_`, `C` (with no arguments), a literal, `[...]`, `(p)`
 patAtomF : Gram -> P Ntn

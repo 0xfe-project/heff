@@ -366,6 +366,112 @@ checkBareAlts (Cons (At (Infix p (At (Keyword "=>") _) _) _) rest) = do
   checkBareAlts rest
 checkBareAlts (Cons _ rest) = checkBareAlts rest
 
+-- Operators in patterns
+--------------------------------------------------------------------------------
+
+-- | the lambdas a body opens with, and what is under them (and under
+-- | its mark of case D)
+lamsOf : Int -> Sx.Tm -> Pair Int Sx.Tm
+lamsOf n (SLam _ (MkAbs _ b)) = lamsOf (n + 1) b
+lamsOf n (SLam _ (AbsConst b)) = lamsOf (n + 1) b
+lamsOf n (SIs b) = lamsOf n b
+lamsOf n b = MkPair n b
+
+absBody : Sx.Abs Sx.Ty -> Sx.Ty
+absBody (MkAbs _ t) = t
+absBody (AbsConst t) = t
+
+-- | a function type's implicit parameters, then its explicit ones: how
+-- | many of each (`Nothing` if they are mixed otherwise)
+paramsOf : Int -> Int -> Sx.Ty -> Maybe (Pair Int Int)
+paramsOf i e (SFunction _ _ cod Impl) =
+  if e > 0 then Nothing else paramsOf (i + 1) e (absBody cod)
+paramsOf i e (SFunction _ _ cod Expl) = paramsOf i (e + 1) (absBody cod)
+paramsOf i e (SFunction _ _ _ Inst) = Nothing
+paramsOf i e _ = Just (MkPair i e)
+
+-- | the arguments are the variables of the last `k` lambdas, in order
+paramsInOrder : Int -> Int -> List Sx.Tm -> Bool
+paramsInOrder k i Nil = i == k
+paramsInOrder k i (Cons (SLocal j) rest) =
+  j == k - 1 - i && paramsInOrder k (i + 1) rest
+paramsInOrder k i _ = False
+
+-- | `(op) x y = C x y`: the tag an operator is another name for, and how
+-- | many arguments it takes
+tagSynonym : G.Entry -> Maybe (Pair String Int)
+tagSynonym ge = case paramsOf 0 0 ge.tySyntax of
+  Just (MkPair i k) -> case lamsOf 0 ge.syntax of
+    MkPair n (STag t args) ->
+      if n == i + k && paramsInOrder k 0 (A.toList args) then Just (MkPair t k)
+      else Nothing
+    _ -> Nothing
+  Nothing -> Nothing
+
+notTagSynonym : {a : Type} -> String -> Pm.Span -> Elab a
+notTagSynonym x sp =
+  failP
+    sp
+    3
+    ("`"
+     ++ x
+     ++ "` is not another name for a tag, so no pattern can use it: an operator in a pattern is defined as one, `("
+     ++ x
+     ++ ") x y = C x y`")
+
+-- | an operator applied, `x :: xs`, in a pattern
+hasOpPat : Ntn -> Bool
+hasOpPat n = case (getGroup n).head of
+  At (Ident _) _ -> length (getGroup n).args > 0
+  At (NTuple (Cons p Nil)) _ -> hasOpPat p
+  _ -> not (allL (\m -> not (hasOpPat m)) (getGroup n).args)
+
+-- | a pattern, its operators as the tags they are other names for
+opPat : G.Globals -> Ntn -> Elab Ntn
+opPat g n = case (getGroup n).head of
+  At (Ident x) xsp ->
+    if length (getGroup n).args == 0 then pure n
+    else case G.lookupKey g x of
+      Just (MkPair _ ge) -> case tagSynonym ge of
+        Just (MkPair t k) ->
+          if k == length (getGroup n).args
+            then do
+              args <- traverseEL (\m -> opPat g m) (getGroup n).args
+              pure (group (At (NTag t) xsp) args)
+          else notTagSynonym x xsp
+        Nothing -> notTagSynonym x xsp
+      Nothing -> failP xsp 3 ("no such operator " ++ x ++ " in scope")
+  At (NTuple (Cons p Nil)) sp -> do
+    p' <- opPat g p
+    pure (group (At (NTuple (Cons p' Nil)) sp) (getGroup n).args)
+  _ -> do
+    args <- traverseEL (\m -> opPat g m) (getGroup n).args
+    pure (group (getGroup n).head args)
+
+altHasOp : Ntn -> Bool
+altHasOp (At (Infix p (At (Keyword "=>") _) _) _) = hasOpPat p
+altHasOp _ = False
+
+opAlt : G.Globals -> Ntn -> Elab Ntn
+opAlt g (At (Infix p (At (Keyword "=>") ksp) body) sp) = do
+  p' <- opPat g p
+  pure (At (Infix p' (At (Keyword "=>") ksp) body) sp)
+opAlt g n = pure n
+
+eqnHasOp : Ntn -> Bool
+eqnHasOp (At (Infix lhs (At (Keyword ":=") _) _) _) =
+  not (allL (\m -> not (hasOpPat m)) (getGroup lhs).args)
+eqnHasOp _ = False
+
+opEquation : G.Globals -> Ntn -> Elab Ntn
+opEquation g (At (Infix lhs (At (Keyword ":=") ksp) rhs) sp) = do
+  args <- traverseEL (\m -> opPat g m) (getGroup lhs).args
+  pure
+      (At
+         (Infix (group (getGroup lhs).head args) (At (Keyword ":=") ksp) rhs)
+         sp)
+opEquation g n = pure n
+
 -- | the head of a group, parsed
 parseHeadF : TK -> Pm.Case -> Ntn -> Elab Judgment
 parseHeadF tk c n = case n of
@@ -423,7 +529,16 @@ parseHeadF tk c n = case n of
     Just n' -> tk.parseJ c n'
     Nothing -> failP sp 12 "a `do` block ends with an expression"
   At (NBlock "match" (Just scrutN) casesN) sp ->
-    if allL flatCaseAlt casesN
+    -- (an operator in a pattern is found where the globals are in hand)
+    if not (allL (\m -> not (altHasOp m)) casesN)
+      then pure
+          (fromChkN
+             c
+             (MkChk (\e a -> do
+              casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
+              j <- tk.chkJ N (At (NBlock "match" (Just scrutN) casesN') sp)
+              R.runChk j e a)))
+    else if allL flatCaseAlt casesN
       then do
         scrut <- tk.synJ N scrutN
         cases <- traverseEL (\m -> doCase tk m) casesN
@@ -628,6 +743,13 @@ defPlain n = do
               body <- tk.chkJ De bodyN
               declOfParts name (withArgs args (MkPair returnTyp body)) False
 
+equationsBody : String -> List ArgBinding -> List Ntn -> Pm.Span -> Elab R.Chk
+equationsBody name args eqs sp = do
+  bodyN <- case Cl.desugar name (explicitNames args) eqs sp of
+    Left err -> failP err.span 10 err.msg
+    Right b -> pure b
+  tk.chkJ De bodyN
+
 -- extension: a definition by equations, `def f : T where <equations> end`
 defD : Ntn -> Elab DeclJ
 defD (At (Infix headN (At (Keyword ":") ksp) tyW) _) = case Cl.stripWhere tyW of
@@ -635,11 +757,15 @@ defD (At (Infix headN (At (Keyword ":") ksp) tyW) _) = case Cl.stripWhere tyW of
     pa <- unpackArgs headN
     case pa of
       MkPair name args -> do
-        bodyN <- case Cl.desugar name (explicitNames args) eqs (ntnSpan tyW) of
-          Left err -> failP err.span 10 err.msg
-          Right b -> pure b
+        body <-
+          if not (allL (\m -> not (eqnHasOp m)) eqs)
+            then pure
+                (MkChk (\e a -> do
+                 eqs' <- traverseEL (\m -> opEquation e.globals m) eqs
+                 j <- equationsBody name args eqs' (ntnSpan tyW)
+                 R.runChk j e a))
+          else equationsBody name args eqs (ntnSpan tyW)
         returnTyp <- tk.typJ N tyN
-        body <- tk.chkJ De bodyN
         declOfParts name (withArgs args (MkPair returnTyp body)) False
   Nothing -> defPlain (infixOp headN (At (Keyword ":") ksp) tyW)
 defD n = defPlain n
