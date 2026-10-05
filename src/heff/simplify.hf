@@ -354,11 +354,28 @@ letIn r x a b = do
         pure (ELet x a b')
     else letPure r x a b (occCountOf x b)
 
+-- | `g` is a function known to take more than `n` arguments: given
+-- | `n`, it only builds a closure
+takesMore : St -> String -> Int -> Bool
+takesMore s g n = case M.lookup compareString g s.defs of
+  Just (ELam xs _) -> length xs > n
+  _ -> False
+
 simpF : SK -> I.Expr -> M I.Expr
 simpF r e = case e of
   ELam xs b -> do
     b' <- r.simp b
     pure (lam xs b')
+  -- (a call given its arguments a few at a time, `(g a) b`, is `g a b`
+  -- where `g a` only builds a closure: the same computed in the same
+  -- order, and the call seen whole)
+  EApp (EApp (EGlobal g) bs) as -> do
+    s <- get
+    if takesMore s g (length bs) then r.simp (EApp (EGlobal g) (appendL bs as))
+      else do
+        f' <- r.simp (EApp (EGlobal g) bs)
+        as' <- traverseS (\a -> r.simp a) as
+        r.applyTo f' as'
   EApp f as -> do
     f' <- r.simp f
     as' <- traverseS (\a -> r.simp a) as
@@ -460,25 +477,47 @@ plainCall r f g as = do
               pure (EApp f as)
         Nothing -> pure (EApp f as)
 
+-- | a lambda applied: its parameters bound to the arguments (not
+-- | simplified yet: `simp` does it once all are bound), and what is left
+-- | applied to the rest
+applyLam : SK -> List String -> I.Expr -> List I.Expr -> M I.Expr
+applyLam r xs b as = do
+  red <-
+    r.simp
+      (letsOf
+         (zipL
+            (takeL (minI (length xs) (length as)) xs)
+            (takeL (minI (length xs) (length as)) as))
+         (if length xs > minI (length xs) (length as)
+            then ELam (dropL (minI (length xs) (length as)) xs) b
+          else b))
+  r.applyTo red (dropL (minI (length xs) (length as)) as)
+
+-- (the expressions are the variables, in order)
+varsAre : List String -> List I.Expr -> Bool
+varsAre Nil Nil = True
+varsAre (Cons x xs) (Cons (EVar y) es) = strEq x y && varsAre xs es
+varsAre _ _ = False
+
+-- | a function that is another name for a tag, `\x y -> C x y`: the tag
+tagOfLam : List String -> I.Expr -> Maybe String
+tagOfLam xs (ETag t es) = if varsAre xs es then Just t else Nothing
+tagOfLam xs _ = Nothing
+
 -- | an application of simplified parts
 applyToF : SK -> I.Expr -> List I.Expr -> M I.Expr
 applyToF r f as =
   if length as == 0 then pure f
   else case f of
     EApp g bs -> r.applyTo g (appendL bs as)
-    ELam xs b -> do
-      -- (the bindings are not simplified yet: `simp` does it once all
-      -- are bound)
-      red <-
-        r.simp
-          (letsOf
-             (zipL
-                (takeL (minI (length xs) (length as)) xs)
-                (takeL (minI (length xs) (length as)) as))
-             (if length xs > minI (length xs) (length as)
-                then ELam (dropL (minI (length xs) (length as)) xs) b
-              else b))
-      r.applyTo red (dropL (minI (length xs) (length as)) as)
+    -- (another name for a tag, given all its arguments: the tag given
+    -- them, with no bindings between -- the tag computes its fields in
+    -- order, as the bindings would, and a call in a field stays where
+    -- a loop can build the value)
+    ELam xs (ETag t es) ->
+      if length xs == length as && varsAre xs es then pure (ETag t as)
+      else applyLam r xs (ETag t es) as
+    ELam xs b -> applyLam r xs b as
     ELet x a b -> do
       b' <- r.applyTo b as
       pure (ELet x a b')
@@ -606,7 +645,12 @@ simplifyProgram n0 defs =
   simplifyDone (traverseS (\d -> oneDef d) defs (initSt n0 (safeGlobals defs)))
 
 -- >>> map (\(d : I.Def) -> d.body) (simplifyProgram 0 [I.mkDef "f" "f" (EApp (ELam ["x"] (EVar "x")) [EInt 1])]).defs
--- [EInt 1]
+-- Cons (EInt 1) Nil
 
 -- >>> map (\(d : I.Def) -> d.body) (simplifyProgram 0 [I.mkDef "g" "g" (EMatch (ETag "Just" [EInt 5]) [MkArm "Just" ["x"] (EVar "x"), MkArm "Nothing" [] (EInt 0)])]).defs
--- [EInt 5]
+-- Cons (EInt 5) Nil
+
+-- another name for a tag, given a call: the tag given it, no binding
+-- between, so a loop can build the value
+-- >>> map (\(d : I.Def) -> d.body) (simplifyProgram 0 [I.mkDef "c" "c" (ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"])), I.mkDef "f" "f" (ELam ["z"] (EApp (EApp (EGlobal "c") [EPrimCall "add" [EVar "z"]]) [EApp (EGlobal "f") [EVar "z"]]))]).defs
+-- Cons (ELam (Cons "x" (Cons "y" Nil)) (ETag "Cons" (Cons (EVar "x") (Cons (EVar "y") Nil)))) (Cons (ELam (Cons "z" Nil) (ETag "Cons" (Cons (EPrimCall "add" (Cons (EVar "z") Nil)) (Cons (EApp (EGlobal "f") (Cons (EVar "z") Nil)) Nil)))) Nil)
