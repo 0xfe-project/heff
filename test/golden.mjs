@@ -44,8 +44,12 @@ const kinds = [
     say: async (f) => said(await heff(["eval", f])) },
   { kind: "type-at", files: filesIn(["lib", "test/surface", "test/nbe"]),
     say: async (f) => {
-      const answers = await Promise.all(offsetsIn(f).map(async (o) => `@${o}\n${said(await heff(["type-at", f, o]))}`));
-      return answers.join("");
+      // (one run for all of them, a line each)
+      const offsets = offsetsIn(f);
+      const r = await heff(["type-at", f, ...offsets]);
+      const lines = r.stdout.split("\n");
+      const answers = offsets.map((o, i) => `@${o}\n${lines[i] ?? ""}\n`).join("");
+      return said({ ...r, stdout: answers + lines.slice(offsets.length).join("\n") });
     } },
 ];
 
