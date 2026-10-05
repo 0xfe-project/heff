@@ -10,7 +10,7 @@ import prelude
 
 map : {a b : Type} -> (a -> b) -> List a -> List b
 map f Nil = Nil
-map f (Cons y ys) = Cons (f y) (map f ys)
+map f (y :: ys) = f y :: map f ys
 
 -- >>> map not [True, False]
 -- Cons False (Cons True Nil)
