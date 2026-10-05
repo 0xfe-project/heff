@@ -1,10 +1,12 @@
 # heff for VS Code
 
 Highlighting for `.hf` files, and a client for heff's language server
-(`heff lsp`): diagnostics as you type, the type of a name on hover, go to
-definition (of globals, across modules and `lib/`), and formatting.
+(`heff lsp`): diagnostics as you type, hover, go to definition,
+completion, formatting, an outline, and references, renaming and symbols
+across the project.
 
-The server is the repository's `bin/heff.mjs`, so build heff first:
+The server is the repository's `bin/heff.mjs`.  It runs without a build
+(from `boot/heff.mjs`); after changing the compiler, rebuild it:
 
 ```sh
 npm install && npm run build     # at the repository's root

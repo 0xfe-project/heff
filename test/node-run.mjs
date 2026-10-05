@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Programs compiled for Node.js (`heff node`: stdio, process, fs, time, net) and run: what they
-// write, their exit status, loops a million rounds deep, and a long loop
-// of operations done at once.
+// Programs compiled for Node.js (`heff node`: stdio, process, fs, time,
+// net) and run: what they write, their exit status, loops a million
+// rounds deep, and a long loop of operations done at once.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -44,7 +44,7 @@ if (build("test/node/timed.hf", "timed", timed)) {
 }
 
 // one world handled at home (a counter: state, peeled off in the
-// language), the rest handed to Node: the program left over is stdio's
+// language), the rest handed to Node: the program left over is stdio's;
 // the evidence as instance implicits: `main` asks for it, its body finds
 // it, `run` gives it
 const evidence = join(work, "evidence.mjs");

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // The formatter (compiler/format.hf): every .hf file of the repository
-// (that parses) is formatted (the formatter checks itself that the result means the same and
-// keeps the comments) and formatting it again changes nothing; then cases
-// of comments, blank lines, blocks and watches, some with the exact result.
+// (that parses) is formatted (the formatter checks itself that the result
+// means the same and keeps the comments) and formatting it again changes
+// nothing; then cases of comments, blank lines, blocks and watches, some
+// with the exact result.
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";

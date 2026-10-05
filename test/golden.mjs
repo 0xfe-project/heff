@@ -3,9 +3,9 @@
 // each file of the library and the tests, `check` (its interface and its
 // diagnostics), `explain` (the elaboration's trace), `eval` (each
 // definition's value) and `type-at` (at some names), against the text
-// kept under test/golden/.  These were the reference compiler's words,
-// byte for byte, when it was retired; a change of them is a change of
-// heff, to be looked at -- and kept with `node test/golden.mjs --update`.
+// kept under test/golden/, byte for byte.  A change of them is a change
+// of heff, to be looked at -- and kept with
+// `node test/golden.mjs --update`.
 // (The compiler's own files are held by the fixpoint instead: their
 // words change with every change of the compiler.)
 import { spawnSync } from "node:child_process";

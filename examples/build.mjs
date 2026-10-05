@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Each example is a project (examples/NAME: package.json with a "heff"
-// field, NAME.hf, index.html);
-// this writes its app, NAME.js, with `heff app`, after which index.html opens
-// as it is.  (The apps are built, not kept: test/app-run.mjs runs them.)
+// field, NAME.hf, index.html); this writes its app, NAME.js, with
+// `heff app`, after which index.html opens as it is.  (The apps are built,
+// not kept: test/app-run.mjs runs them.)
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";

@@ -5,9 +5,9 @@
 //
 // Compiles the programs of test/programs and N generated ones to JavaScript,
 // loads each module (in a child process, with a timeout) and compares every
-// definition's value with the interpreter's (`heff eval`).  Both are call-by-value, so they agree
-// exactly: the same value, or both abandon.  (What the interpreter finds
-// to diverge is not read.)
+// definition's value with the interpreter's (`heff eval`).  Both are
+// call-by-value, so they agree exactly: the same value, or both abandon.
+// (What the interpreter finds to diverge is not read.)
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";

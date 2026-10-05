@@ -1,7 +1,7 @@
 // The terminal's side of compiler/report.hf: an effect provider (the
 // shape of one is said in lib/dom.provider.js).  What differs is
 // jsdiff's, by words (with the spaces between them), long stretches
-// alike cut to their ends -- src/Heff/Support/Diff.js, the reference's.
+// alike cut to their ends.
 import { diffWordsWithSpace as $diffWordsWithSpace } from "diff";
 export const $host = "node";
 export const report = () => {

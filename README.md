@@ -1,220 +1,95 @@
 # heff
 
-heff is a language and its toolchain: Hippogriff (Lynch & Staton,
-arXiv:2608.19728), a typed language with a phase distinction -- types are
-computed in the static phase, never from a runtime value -- with a
-Haskell-like syntax, modules, doctests, effects and handlers, a formatter,
-a language server, and a compiler to JavaScript -- for web pages and for
-Node.js.
+heff is an implementation of Hippogriff (Lynch & Staton,
+arXiv:2608.19728), a typed language with a phase distinction, with a
+Haskell-like syntax, modules, doctests, algebraic effects, a formatter, a
+language server, and a compiler to JavaScript for web pages and Node.js.
 
 ```haskell
-import co
+import prelude
 
-data List a = Nil | Cons a (List a)
-
-map : {a b : Type} -> (a -> b) -> List a -> List b   -- {…}: implicit
+map : {a b : Type} -> (a -> b) -> List a -> List b
 map f Nil = Nil
 map f (Cons y ys) = Cons (f y) (map f ys)
 
-theory Monoid where
-  t : Type
-  m : t -> t -> t
-
-foreign import intAdd : Int -> Int -> Int              -- a primitive
-
--- >>> map not (Cons False Nil)
--- Cons True Nil
+-- >>> map not [True, False]
+-- Cons False (Cons True Nil)
 ```
 
 ## Installing
 
 ```sh
 npm install
-npm run build     # the compiler, compiled by itself from its seed
+npm run build
 npm link          # puts `heff` on the PATH
 ```
 
-heff is written in heff (`compiler/`, and the formatter in `fmt/`).  Its
-seed, `boot/heff.mjs`, is the compiler compiled by itself; `npm run
-build` has the seed compile the source, and what that makes compile it
-again, to `output/heff.mjs` -- the source's compiler, by the source's
-backend.  (Before a build, `heff` runs the seed.)
+heff is written in heff (`compiler/`, `fmt/`).  `boot/heff.mjs` is a
+compiled copy of the compiler; `npm run build` uses it to compile the
+compiler into `output/heff.mjs`.
 
-For VS Code, `editors/vscode` is an extension: highlighting, and the
-language server (diagnostics, hover, go to definition, completion,
-formatting, an outline; and over the whole project: references, renaming
--- of globals, tags, fields and locals -- and symbols).  A rename is
-refused when it would change what the program means: a name captured by
-one already there, or a new error.
-
-An error is reported once, where it is, and the rest is checked still.
-Inside a definition, what does not elaborate -- an argument, a `case`
-alternative, a field, a lambda's body -- is an error hole of the type it
-was checked at: equal to anything, and never what an implicit argument is
-inferred to be.  A definition with an error keeps its type for what uses
-it (and abandons if computed); one whose type does not elaborate, or that
-does not parse, is not an error again where it is used; a declaration
-that does not parse ends where the next begins.
+`editors/vscode` is a VS Code extension for the language server.
 
 ## Commands
 
 ```sh
-heff check FILE                # FILE's interface: its types in full, its values' signatures
-heff eval FILE                 # what each definition evaluates to
-heff run FILE                  # what each watch evaluates to
-heff test FILE...              # do the watches' expectations hold?
-heff promote FILE              # write each watch's value under it
+heff check FILE                # the file's interface, and its errors
+heff eval FILE                 # the value of each definition
+heff run FILE                  # the value of each watch (`-- >>> e`)
+heff test FILE...              # check the watches' expectations
+heff promote FILE              # write each watch's value as its expectation
 heff fmt [--check] FILE...     # format in place
-heff compile-js FILE OUT.js    # an ES module of FILE's definitions
+heff compile-js FILE OUT.js    # an ES module
 heff app FILE [NAME] OUT.js    # a script running an app in a web page
 heff node FILE [NAME] OUT.mjs  # a Node.js program
 heff lsp                       # the language server, on stdio
-heff completions fish          # > ~/.config/fish/completions/heff.fish
+heff completions fish          # fish completions
 ```
-
-Every command elaborates the file given and what it imports.  An imported
-module is thawed from the cache the compiler keeps at the project root
-(`.heff/`, safe to delete, worth ignoring in git) instead of elaborated
-again, when nothing it is made of has changed: its source, the compiler,
-each definition it mentions from other modules (hashed transitively, so a
-change to a body no one mentions, or to comments, invalidates no one), and
-what its parse takes from each direct import (the names defined, the
-fixities declared).
-
-## The language
-
-`:` annotates, everywhere; `x :: xs` is `Cons x xs` (in patterns too), right, below the arithmetic and `++`; a capitalised name is a constructor unless it
-names a definition or a binder; `f (a := T)` gives an implicit argument by
-name; `case`/`of`, `if`, `do`, `\x -> e`, records `{ x = 1 }` and record
-types `{ x : Int }`, lists `[1, 2, 3]` (`Cons 1 (Cons 2 (Cons 3 Nil))`,
-in patterns too).  `\(x : T) -> e` annotates a lambda's binder: the
-lambda then says its own type, where an argument of `map` would
-otherwise be checked before the type is known (a projection `x.field`
-there needs it -- the error says so).  A function is defined by equations, each a case; a
-call of itself is recursion.  A pattern may be a literal, `fib 0 = 0`,
-compared by the equality in scope (`intEq`, `strEq`, `floatEq`); one of
-the equations must then match every other value.  Functions that call one
-another are fields of one record.
-
-A `-- >>> e` line is a watch, and the `--` lines under it are its
-expectation: a doctest, checked by `heff test`.  `test name` names the
-watches after it.
-
-Operators are declared, and bind relatively -- no numbers, only which
-binds tighter than which:
-
-```haskell
-infixl + - above ==
-infixl * / above + -
-infixr ++ above ==
-
-(+) : Int -> Int -> Int
-(+) = intAdd
-```
-
-Operators of unrelated groups do not go together without parentheses:
-`a + b ++ c` is refused.
-
-`a && b` and `a || b` are `if`: the right side is computed only if it is
-needed (`False && e` is `False`, whatever `e`), and a call of itself
-there is a tail call.  `(&&)` written alone is still the prelude's
-function, for `foldl (&&) True`.
-
-Evaluation is call-by-value: arguments, and the fields of constructors and
-records, are computed before they are passed, used or not; a definition
-that is not a function is computed when first used.  `Int` is an integer
-of any size; division is floor division, and by zero it abandons.  `Float`
-is a 64-bit floating-point number (`1.5`, `6.02e23`), its operators the
-integers' with a `.`: `+.`, `*.`, `<.`.  `Array a` is an array, each
-element reached at once by its index, and never changed (`set` makes
-another): `lib/array.hf`, imported as `import array as A`.
-
-`lib/prelude.hf` has `Bool`, `Maybe`, `Either`, pairs and lists, the
-arithmetic, and the functions on lists (`map`, `foldl`, `foldr`,
-`filter`, `take`, `zip`, `range`, `sortBy`, …) and on text (`split`,
-`lines`, `words`, `trim`, `indexOf`, `parseInt`, …).  There are no type
-classes: what needs an equality or an order is given one (`elemBy`,
-`sortBy`, `compareInt`).  `lib/map.hf` and `lib/set.hf` are maps and sets
-by an order of their keys (balanced trees), to be imported by a name:
-`import map as M`, then `M.insert compareString "k" 1 m`.
 
 ## Modules
 
-A module is a file, named by its path from the project's root:
-`parse/surface.hf` is `parse.surface`.  The root is the nearest directory
-above the file whose `package.json` has a `"heff"` field (a project is
-an npm package; see `"heff"` in this repository's own), else the file's
-own directory.  What is not in the project is looked for in the standard
-library, `lib/`, then among the installed packages (`node_modules/`):
-a package `foo` holds `foo.bar` at `node_modules/foo/bar.hf`.
-
-- Imports come first in a file, one per line: `import dom`.
-- `import dom as D` brings `dom`'s definitions in as `D.sleep`, `D.Node`,
-  … only.  (A constructor is not qualified: `True` is found by its type.)
-- A file sees its own definitions and those of the modules it imports --
-  not what those import.
-- A name defined by two modules imported by name is an error: import one
-  of them `as`.  A file's own definition shadows an imported one.
-- Everything a module defines is exported.
-
-A `theory` is a first-class module (a record type), and an instance of it
-is a record.
+A module is a file, named by its path from the project root:
+`parse/surface.hf` is `parse.surface`.  The project root is the nearest
+directory with a `package.json` that has a `"heff"` field.  Other modules
+are looked up in `lib/`, then in `node_modules/`.  Compiled modules are
+cached in `.heff/`.
 
 ## Effects
 
-`lib/co.hf` has computations with effects, after Yang and Wu, "Handling
-Higher-Order Effectful Operations with Judgemental Monadic Laws" (POPL
-2026): an effect is a higher-order functor, a handler is a monad with an
-algebra (`Handler h`), and a computation `Co h a` runs under any handler of
-its effect.  `do` is `bind`.  `h <+> k` is two effects as one, and
-`h <: e` is the evidence that `h`'s operations are among `e`'s -- which
-world an operation belongs to is nowhere in its type, so the evidence is
-the program saying it; a computation polymorphic in its effect takes the
-evidence it needs (`{e : HFunctor} -> (stdio <: e) -> ...`).  `through`
-handles the left effect of a sum and no more: the rest is a computation
-again, for whoever handles it.
+`lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program
+names the effects it needs as instance arguments and is given them where
+it runs:
 
-- `lib/dom.hf`: a web page (create, text, attr, append, on, select,
-  xpath, sleep, fetch), with `lib/state.hf`: an app is a
-  `Co (dom <+> (state s)) Unit`, and `heff app` writes it as a script for
-  a page.  Where it goes on the page is the app's to find, by `select` or
-  `xpath`.
-- `lib/stdio.hf`, `lib/process.hf`, `lib/fs.hf`, `lib/time.hf`,
-  `lib/net.hf`: a program's worlds, one effect each -- the standard
-  streams, the process (arguments, environment, exit), files, time, the
-  network.  A program sums the ones it lives in, `stdio <+> fs`, and
-  lifts each computation in by its evidence (`lift`, `inl`, `inr`:
-  values of `<:`, lib/co.hf); `heff node` writes it as a Node.js
-  program -- one monad, an algebra per effect.
+```haskell
+import co
+import fs
+import prelude
+import stdio
 
-The page's handler and Node's are written in JavaScript; asynchrony is
-the handler's, and the program is plain `do`.  The same computation runs
-under a handler written in heff (`test/surface/dom-trace.hf`).
+world : HFunctor
+world = stdio <+> fs
 
-`lib/nanopass.hf` is how a compiler of many small passes is written:
-a language is a theory (its sorts, types; its productions, functions), a
-term what any handler of it gives a value for, and a pass a handler --
-of its source, into its target's terms.  It has fresh names, and the
-stages of a pipeline, each shown or not by the handler
-(`test/surface/nanopass.hf`).
+program : {{io : stdio <: world}} -> {{disk : fs <: world}} -> Co world Unit
+program = do
+  ok <- writeFile "hello.txt" "hello"
+  print (if ok then "written" else "not written")
 
-`examples/counter`, `examples/clock` and `examples/greet` are apps:
-`npm run examples` builds them, then open their `index.html`.
+main : Co world Unit
+main = program (io := \p -> InL p) (disk := \p -> InR p)
+```
+
+`lib/` has effects for the standard streams, the process, files, time,
+the network and web pages; each one's JavaScript side is in
+`M.provider.js` beside `M.hf`.  `examples/` has apps for the browser
+(`npm run examples`).
 
 ## Developing
 
-`npm test` runs the tests: the expectations under the watches, the
-language server, compiled programs against the interpreter, the texts
-heff says of the library's and the tests' files (`test/golden/`, kept
-with `node test/golden.mjs --update`), and the fixpoint -- the compiler
-compiles itself to itself, byte for byte.
+`npm test` builds the compiler and runs the tests.  Among them,
+`test/golden/` holds the output of `check`, `explain`, `eval` and
+`type-at` on the library and test files; after an intended change,
+update it with `node test/golden.mjs --update`.
 
-The seed is renewed with `npm run boot`, when the language changes so
-that the old seed cannot compile the new source: the compiler built,
-once it compiles itself to itself, becomes `boot/heff.mjs`.
-
-heff began as a PureScript implementation (the reference); the compiler
-was ported to heff against it -- every definition elaborated, every
-message, every compiled module byte for byte the same -- and the
-reference was retired once nothing but it was left.  `test/golden/`
-holds what it said.
+`npm run boot` replaces `boot/heff.mjs` with the current compiler, once it
+compiles itself to an identical file.  This is needed only when a
+language change means the old copy can no longer compile the source.

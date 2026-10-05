@@ -48034,6 +48034,41 @@ const settleGo = (g, fuel) => {
   };
 };
 
+const prims = { $: "Cons", a: [{ $: "MkPair", a: ["intAdd", { arity: 2n, js: "(a) => (b) => a + b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intSub", { arity: 2n, js: "(a) => (b) => a - b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intMul", { arity: 2n, js: "(a) => (b) => a * b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intDiv", { arity: 2n, js: "(a) => (b) => { if (b === 0n) return $abandon(); const q = a / b, r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? q - 1n : q; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intMod", { arity: 2n, js: "(a) => (b) => { if (b === 0n) return $abandon(); const r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? r + b : r; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intEq", { arity: 2n, js: "(a) => (b) => a === b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intLt", { arity: 2n, js: "(a) => (b) => a < b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intLe", { arity: 2n, js: "(a) => (b) => a <= b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intShow", { arity: 1n, js: "(a) => a.toString()" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatAdd", { arity: 2n, js: "(a) => (b) => a + b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatSub", { arity: 2n, js: "(a) => (b) => a - b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatMul", { arity: 2n, js: "(a) => (b) => a * b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatDiv", { arity: 2n, js: "(a) => (b) => a / b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatEq", { arity: 2n, js: "(a) => (b) => a === b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatLt", { arity: 2n, js: "(a) => (b) => a < b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatLe", { arity: 2n, js: "(a) => (b) => a <= b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatShow", { arity: 1n, js: "(a) => { const s = String(a); return isNaN(s + \".0\") ? s : s + \".0\"; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatFromInt", { arity: 1n, js: "(a) => Number(a)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatSqrt", { arity: 1n, js: "(a) => Math.sqrt(a)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatFloor", { arity: 1n, js: "(a) => Number.isFinite(a) ? BigInt(Math.floor(a)) : $abandon()" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayLength", { arity: 1n, js: "(a) => BigInt(a.length)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayIndex", { arity: 2n, js: "(a) => (i) => i >= 0n && i < BigInt(a.length) ? a[Number(i)] : $abandon()" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arraySet", { arity: 3n, js: "(a) => (i) => (x) => { if (!(i >= 0n && i < BigInt(a.length))) return $abandon(); const b = a.slice(); b[Number(i)] = x; return b; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayGenerate", { arity: 2n, js: "(n) => (f) => Array.from({ length: n > 0n ? Number(n) : 0 }, (_, k) => f(BigInt(k)))" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayFromList", { arity: 1n, js: "(l) => { const r = []; while (l.$ === \"Cons\") { r.push(l.a[0]); l = l.a[1]; } return r; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayToList", { arity: 1n, js: "(a) => a.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] })" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strAppend", { arity: 2n, js: "(a) => (b) => a + b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strLength", { arity: 1n, js: "(a) => BigInt(a.length)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strSlice", { arity: 3n, js: "(a) => (i) => (j) => a.slice(Number(i), Number(j))" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strEq", { arity: 2n, js: "(a) => (b) => a === b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strLt", { arity: 2n, js: "(a) => (b) => a < b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strCharCode", { arity: 2n, js: "(a) => (i) => i >= 0n && i < BigInt(a.length) ? BigInt(a.charCodeAt(Number(i))) : -1n" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strFromCharCode", { arity: 1n, js: "(c) => c >= 0n && c <= 65535n ? String.fromCharCode(Number(c)) : \"\"" }] }, { $: "Nil", a: [] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] };
+
+const primArityGo = (p$, x2$) => {
+  for (;;) {
+    const p = p$, x2 = x2$;
+    switch (x2.$) {
+      case "Nil": {
+        return { $: "Nothing", a: [] };
+      }
+      case "Cons": {
+        const x21 = x2.a[0];
+        const rest = x2.a[1];
+        switch (x21.$) {
+          case "MkPair": {
+            const k = x21.a[0];
+            const i = x21.a[1];
+            const s = k === p ? $T : $F;
+            switch (s.$) {
+              case "True": {
+                return { $: "Just", a: [i.arity] };
+              }
+              case "False": {
+                p$ = p; x2$ = rest; continue;
+              }
+            }
+            return $nomatch(s);
+          }
+        }
+        return $nomatch(x21);
+      }
+    }
+    return $nomatch(x2);
+  }
+};
+
 const escChar = (c) => {
   const s = c === "\"" ? $T : $F;
   switch (s.$) {
@@ -76072,6 +76107,69 @@ const elabOut = (key, g, d, tyStx, mc, x6) => {
   return $nomatch(x6);
 };
 
+const primNames = $lazy(() => map((p) => {
+  switch (p.$) {
+    case "MkPair": {
+      const x = p.a[0];
+      const y = p.a[1];
+      return x;
+    }
+  }
+  return $nomatch(p);
+}, prims));
+
+const primKnown = (n, d) => {
+  const s = (() => {
+    const s = d.prim;
+    switch (s.$) {
+      case "True": {
+        const x1 = (() => {
+          const xs = primNames();
+          return any($strEq$c(d.name), xs);
+        })();
+        switch (x1.$) {
+          case "True": {
+            return { $: "False", a: [] };
+          }
+          case "False": {
+            return { $: "True", a: [] };
+          }
+        }
+        return $nomatch(x1);
+      }
+      case "False": {
+        return { $: "False", a: [] };
+      }
+    }
+    return $nomatch(s);
+  })();
+  switch (s.$) {
+    case "True": {
+      const sp = { start: startPos(n), end: endPos(n) };
+      const msg = "there is no primitive called `" + (d.name + ("` (the runtime has: " + ((() => {
+        const x2 = primNames();
+        switch (x2.$) {
+          case "Nil": {
+            return "";
+          }
+          case "Cons": {
+            const x = x2.a[0];
+            const xs = x2.a[1];
+            return foldl((acc) => (y) => acc + (", " + y), x, xs);
+          }
+        }
+        return $nomatch(x2);
+      })() + ")")));
+      const d1 = { code: 300n + 29n, severity: { $: "SError", a: [] }, msg: msg, span: sp, note: { $: "Nothing", a: [] } };
+      return (st) => ({ $: "MkPair", a: [{ $: "Left", a: [d1] }, st] });
+    }
+    case "False": {
+      return (st) => ({ $: "MkPair", a: [{ $: "Right", a: [{ $: "MkUnit", a: [] }] }, st] });
+    }
+  }
+  return $nomatch(s);
+};
+
 const elabBody = (key, g, n, d, a) => {
   const m = (() => {
     const f = (() => {
@@ -76249,17 +76347,8 @@ const elabBody = (key, g, n, d, a) => {
                           }
                           case "Right": {
                             const x3 = x112.a[0];
-                            const x14 = { $: "MkPair", a: [{ $: "Right", a: [(() => {
-                              switch (st3.$) {
-                                case "MkSt": {
-                                  const c = st3.a[0];
-                                  const x121 = st3.a[1];
-                                  const x131 = st3.a[2];
-                                  return c;
-                                }
-                              }
-                              return $nomatch(st3);
-                            })().metas] }, st3] };
+                            const m2 = primKnown(n, d);
+                            const x14 = m2(st3);
                             switch (x14.$) {
                               case "MkPair": {
                                 const x113 = x14.a[0];
@@ -76271,7 +76360,35 @@ const elabBody = (key, g, n, d, a) => {
                                   }
                                   case "Right": {
                                     const x4 = x113.a[0];
-                                    return elabOut(key, g, d, zonker(x4).ty(a.stx), x4, x2)(st4);
+                                    const x15 = { $: "MkPair", a: [{ $: "Right", a: [(() => {
+                                      switch (st4.$) {
+                                        case "MkSt": {
+                                          const c = st4.a[0];
+                                          const x121 = st4.a[1];
+                                          const x131 = st4.a[2];
+                                          return c;
+                                        }
+                                      }
+                                      return $nomatch(st4);
+                                    })().metas] }, st4] };
+                                    switch (x15.$) {
+                                      case "MkPair": {
+                                        const x114 = x15.a[0];
+                                        const st5 = x15.a[1];
+                                        switch (x114.$) {
+                                          case "Left": {
+                                            const e = x114.a[0];
+                                            return { $: "MkPair", a: [{ $: "Left", a: [e] }, st5] };
+                                          }
+                                          case "Right": {
+                                            const x5 = x114.a[0];
+                                            return elabOut(key, g, d, zonker(x5).ty(a.stx), x5, x2)(st5);
+                                          }
+                                        }
+                                        return $nomatch(x114);
+                                      }
+                                    }
+                                    return $nomatch(x15);
                                   }
                                 }
                                 return $nomatch(x113);
@@ -84413,41 +84530,6 @@ const spine = (e) => {
     }
   }
   return $nomatch(e);
-};
-
-const prims = { $: "Cons", a: [{ $: "MkPair", a: ["intAdd", { arity: 2n, js: "(a) => (b) => a + b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intSub", { arity: 2n, js: "(a) => (b) => a - b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intMul", { arity: 2n, js: "(a) => (b) => a * b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intDiv", { arity: 2n, js: "(a) => (b) => { if (b === 0n) return $abandon(); const q = a / b, r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? q - 1n : q; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intMod", { arity: 2n, js: "(a) => (b) => { if (b === 0n) return $abandon(); const r = a % b; return r !== 0n && (r < 0n) !== (b < 0n) ? r + b : r; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intEq", { arity: 2n, js: "(a) => (b) => a === b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intLt", { arity: 2n, js: "(a) => (b) => a < b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intLe", { arity: 2n, js: "(a) => (b) => a <= b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["intShow", { arity: 1n, js: "(a) => a.toString()" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatAdd", { arity: 2n, js: "(a) => (b) => a + b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatSub", { arity: 2n, js: "(a) => (b) => a - b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatMul", { arity: 2n, js: "(a) => (b) => a * b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatDiv", { arity: 2n, js: "(a) => (b) => a / b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatEq", { arity: 2n, js: "(a) => (b) => a === b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatLt", { arity: 2n, js: "(a) => (b) => a < b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatLe", { arity: 2n, js: "(a) => (b) => a <= b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatShow", { arity: 1n, js: "(a) => { const s = String(a); return isNaN(s + \".0\") ? s : s + \".0\"; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatFromInt", { arity: 1n, js: "(a) => Number(a)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatSqrt", { arity: 1n, js: "(a) => Math.sqrt(a)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["floatFloor", { arity: 1n, js: "(a) => Number.isFinite(a) ? BigInt(Math.floor(a)) : $abandon()" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayLength", { arity: 1n, js: "(a) => BigInt(a.length)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayIndex", { arity: 2n, js: "(a) => (i) => i >= 0n && i < BigInt(a.length) ? a[Number(i)] : $abandon()" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arraySet", { arity: 3n, js: "(a) => (i) => (x) => { if (!(i >= 0n && i < BigInt(a.length))) return $abandon(); const b = a.slice(); b[Number(i)] = x; return b; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayGenerate", { arity: 2n, js: "(n) => (f) => Array.from({ length: n > 0n ? Number(n) : 0 }, (_, k) => f(BigInt(k)))" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayFromList", { arity: 1n, js: "(l) => { const r = []; while (l.$ === \"Cons\") { r.push(l.a[0]); l = l.a[1]; } return r; }" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["arrayToList", { arity: 1n, js: "(a) => a.reduceRight((rest, x) => ({ $: \"Cons\", a: [x, rest] }), { $: \"Nil\", a: [] })" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strAppend", { arity: 2n, js: "(a) => (b) => a + b" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strLength", { arity: 1n, js: "(a) => BigInt(a.length)" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strSlice", { arity: 3n, js: "(a) => (i) => (j) => a.slice(Number(i), Number(j))" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strEq", { arity: 2n, js: "(a) => (b) => a === b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strLt", { arity: 2n, js: "(a) => (b) => a < b ? $T : $F" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strCharCode", { arity: 2n, js: "(a) => (i) => i >= 0n && i < BigInt(a.length) ? BigInt(a.charCodeAt(Number(i))) : -1n" }] }, { $: "Cons", a: [{ $: "MkPair", a: ["strFromCharCode", { arity: 1n, js: "(c) => c >= 0n && c <= 65535n ? String.fromCharCode(Number(c)) : \"\"" }] }, { $: "Nil", a: [] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] }] };
-
-const primArityGo = (p$, x2$) => {
-  for (;;) {
-    const p = p$, x2 = x2$;
-    switch (x2.$) {
-      case "Nil": {
-        return { $: "Nothing", a: [] };
-      }
-      case "Cons": {
-        const x21 = x2.a[0];
-        const rest = x2.a[1];
-        switch (x21.$) {
-          case "MkPair": {
-            const k = x21.a[0];
-            const i = x21.a[1];
-            const s = k === p ? $T : $F;
-            switch (s.$) {
-              case "True": {
-                return { $: "Just", a: [i.arity] };
-              }
-              case "False": {
-                p$ = p; x2$ = rest; continue;
-              }
-            }
-            return $nomatch(s);
-          }
-        }
-        return $nomatch(x21);
-      }
-    }
-    return $nomatch(x2);
-  }
 };
 
 const arityOne = (m, d) => {
@@ -139704,7 +139786,7 @@ const $p3 = (() => {
 // The terminal's side of compiler/report.hf: an effect provider (the
 // shape of one is said in lib/dom.provider.js).  What differs is
 // jsdiff's, by words (with the spaces between them), long stretches
-// alike cut to their ends -- src/Heff/Support/Diff.js, the reference's.
+// alike cut to their ends.
 const $host = "node";
 const report = () => {
   const context = 20;
