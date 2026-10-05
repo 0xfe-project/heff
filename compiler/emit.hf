@@ -425,31 +425,48 @@ primTest op a b =
 primDefault : String -> List Code -> Code
 primDefault p as = p3 ("$" ++ p ++ "(" ++ joinWith ", " (map codeOfC as) ++ ")")
 
+-- | the primitives JavaScript has an operator for, given both arguments
+primOp : String -> Maybe (Code -> Code -> Code)
+primOp "intAdd" = Just (primBin "+")
+primOp "intSub" = Just (primBin "-")
+primOp "intMul" = Just (primBin "*")
+primOp "strAppend" = Just (primBin "+")
+primOp "intEq" = Just (primTest "===")
+primOp "strEq" = Just (primTest "===")
+primOp "intLt" = Just (primTest "<")
+primOp "strLt" = Just (primTest "<")
+primOp "intLe" = Just (primTest "<=")
+primOp "floatAdd" = Just (primBin "+")
+primOp "floatSub" = Just (primBin "-")
+primOp "floatMul" = Just (primBin "*")
+primOp "floatDiv" = Just (primBin "/")
+primOp "floatEq" = Just (primTest "===")
+primOp "floatLt" = Just (primTest "<")
+primOp "floatLe" = Just (primTest "<=")
+primOp _ = Nothing
+
+-- | the ones written another way, given their argument
+primUnary : String -> Maybe (Code -> Code)
+primUnary "intShow" = Just (\a -> p3 (atLeast 3 a ++ ".toString()"))
+primUnary "strLength" = Just (\a -> p3 ("BigInt(" ++ atLeast 3 a ++ ".length)"))
+primUnary _ = Nothing
+
 primCall : String -> List Code -> Code
 primCall p as = case as of
-  Cons a (Cons b Nil) ->
-    if strEq p "intAdd" then primBin "+" a b
-    else if strEq p "intSub" then primBin "-" a b
-    else if strEq p "intMul" then primBin "*" a b
-    else if strEq p "strAppend" then primBin "+" a b
-    else if strEq p "intEq" then primTest "===" a b
-    else if strEq p "strEq" then primTest "===" a b
-    else if strEq p "intLt" then primTest "<" a b
-    else if strEq p "strLt" then primTest "<" a b
-    else if strEq p "intLe" then primTest "<=" a b
-    else if strEq p "floatAdd" then primBin "+" a b
-    else if strEq p "floatSub" then primBin "-" a b
-    else if strEq p "floatMul" then primBin "*" a b
-    else if strEq p "floatDiv" then primBin "/" a b
-    else if strEq p "floatEq" then primTest "===" a b
-    else if strEq p "floatLt" then primTest "<" a b
-    else if strEq p "floatLe" then primTest "<=" a b
-    else primDefault p as
-  Cons a Nil ->
-    if strEq p "intShow" then p3 (atLeast 3 a ++ ".toString()")
-    else if strEq p "strLength" then p3 ("BigInt(" ++ atLeast 3 a ++ ".length)")
-    else primDefault p as
+  Cons a (Cons b Nil) -> case primOp p of
+    Just f -> f a b
+    Nothing -> primDefault p as
+  Cons a Nil -> case primUnary p of
+    Just f -> f a
+    Nothing -> primDefault p as
   _ -> primDefault p as
+
+-- | whether `primCall` calls the primitive's function, `$p(...)`
+callsHelper : String -> List I.Expr -> Bool
+callsHelper p as = case as of
+  Cons _ (Cons _ Nil) -> maybe True (\_ -> False) (primOp p)
+  Cons _ Nil -> maybe True (\_ -> False) (primUnary p)
+  _ -> True
 
 -- Expressions
 --------------------------------------------------------------------------------
@@ -921,10 +938,31 @@ uncurryGo ps s =
 uncurryJs : String -> Uncurried
 uncurryJs js = uncurryGo Nil js
 
-primHelperU : String -> String -> Uncurried -> List String
-primHelperU code p u =
+-- | the primitives the code uses, as it writes them: `$p(` (given all
+-- | its arguments) and `$p$c` (curried)
+primUses : M.Map String Unit -> I.Expr -> M.Map String Unit
+primUses m e = case e of
+  ELam _ b -> primUses m b
+  EApp f as -> foldl primUses (primUses m f) as
+  ELet _ e1 b -> primUses (primUses m e1) b
+  ERecord fs -> foldl (\m2 f -> primUses m2 (snd f)) m fs
+  EProj e2 _ -> primUses m e2
+  ETag _ as -> foldl primUses m as
+  EMatch s arms -> foldl (\m2 a -> primUses m2 (I.armBody a)) (primUses m s) arms
+  EPrim p -> M.insert compareString ("$" ++ p ++ "$c") MkUnit m
+  EPrimCall p as ->
+    foldl
+      primUses
+      (if callsHelper p as then M.insert compareString ("$" ++ p ++ "(") MkUnit m
+       else m)
+      as
+  ECall _ as -> foldl primUses m as
+  _ -> m
+
+primHelperU : M.Map String Unit -> String -> Uncurried -> List String
+primHelperU uses p u =
   concatList
-    (if contains ("$" ++ p ++ "(") code || contains ("$" ++ p ++ "$c") code
+    (if M.member compareString ("$" ++ p ++ "(") uses || M.member compareString ("$" ++ p ++ "$c") uses
        then Cons
            ("const $"
             ++ p
@@ -935,7 +973,7 @@ primHelperU code p u =
             ++ ";")
            Nil
      else Nil)
-    (if contains ("$" ++ p ++ "$c") code
+    (if M.member compareString ("$" ++ p ++ "$c") uses
        then Cons
            ("const $"
             ++ p
@@ -949,12 +987,15 @@ primHelperU code p u =
            Nil
      else Nil)
 
-primHelperOne : String -> Pair String Pr.PrimImpl -> List String
-primHelperOne code (MkPair p i) = primHelperU code p (uncurryJs i.js)
+primHelperOne : M.Map String Unit -> Pair String Pr.PrimImpl -> List String
+primHelperOne uses (MkPair p i) = primHelperU uses p (uncurryJs i.js)
 
--- | the primitives the code uses: `$p(a, b)`, and `$p$c` (curried)
-primHelpers : String -> List String
-primHelpers code = concatMap (\p -> primHelperOne code p) Pr.prims
+-- | the helpers of the primitives the definitions use
+primHelpers : List I.Def -> List String
+primHelpers defs =
+  concatMap
+    (\p -> primHelperOne (foldl (\m (d : I.Def) -> primUses m d.body) M.empty defs) p)
+    Pr.prims
 
 type Emitted = { lines : List String, globals : M.Map String GInfo }
 
@@ -1011,8 +1052,8 @@ emitLines info code helpers =
   }
 
 -- (a primitive's helper may use the runtime too: `$abandon`, `$T`)
-emitDone : M.Map String GInfo -> List String -> Emitted
-emitDone info code = emitLines info code (primHelpers (joinWith "\n" code))
+emitDone : List I.Def -> M.Map String GInfo -> List String -> Emitted
+emitDone defs info code = emitLines info code (primHelpers defs)
 
 emitCode : List I.Def
          -> M.Map String GInfo
@@ -1020,7 +1061,7 @@ emitCode : List I.Def
          -> M.Map String Unit
          -> Emitted
 emitCode defs info curried globalNames =
-  emitDone info (concatMap (\d -> defLines info curried globalNames d) defs)
+  emitDone defs info (concatMap (\d -> defLines info curried globalNames d) defs)
 
 emitWithShorts : List I.Def -> List String -> List String -> Emitted
 emitWithShorts defs roots shorts =
