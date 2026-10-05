@@ -13,7 +13,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { root, run, pool } from "./pool.mjs";
 
+// (`node test/golden.mjs [--update] [KIND...]`: only the kinds named,
+// check, explain, eval, type-at; all by default)
 const update = process.argv.includes("--update");
+const only = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 const heff = (args) => run("node", [join(root, "output", "heff.mjs"), ...args]);
 
 const filesIn = (dirs) => dirs.flatMap((d) =>
@@ -46,7 +49,7 @@ const kinds = [
     } },
 ];
 
-const jobs = kinds.flatMap((k) => k.files.map((f) => ({ kind: k.kind, f, say: k.say })));
+const jobs = kinds.filter((k) => only.length === 0 || only.includes(k.kind)).flatMap((k) => k.files.map((f) => ({ kind: k.kind, f, say: k.say })));
 const results = await pool(jobs, async (j) => {
   const got = await j.say(j.f);
   const at = join(root, "test", "golden", j.kind, j.f + ".txt");
