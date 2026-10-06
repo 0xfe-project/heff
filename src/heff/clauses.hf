@@ -31,7 +31,7 @@ stripRight l op (Just (MkPair r' eqs)) = Just (MkPair (infixOp l op r') eqs)
 -- | `T where ... end`, the type of a definition by equations
 stripWhere : Ntn -> Maybe (Pair Ntn (List Ntn))
 stripWhere n = case n of
-  At (Juxt f (At (NBlock "where" Nothing eqs) _)) _ -> Just (MkPair f eqs)
+  At (Juxt f (At (NBlock BWhere Nothing eqs) _)) _ -> Just (MkPair f eqs)
   At (Infix l op r) _ -> stripRight l op (stripWhere r)
   _ -> Nothing
 
@@ -163,7 +163,7 @@ pat n = case (getGroup n).head of
   At (NFloat v) sp ->
     if length (getGroup n).args == 0 then Right (PLit (At (NFloat v) sp))
     else badPat n
-  At (NBlock "struct" Nothing fs) sp ->
+  At (NBlock BStruct Nothing fs) sp ->
     if length (getGroup n).args == 0
       then do
         fps <- traverseC (\f -> fieldPat (\m -> pat m) f) fs
@@ -202,7 +202,7 @@ equationLhs f lhs rhs = case (getGroup lhs).head of
 
 -- | `f p ... := e`
 equation : String -> Ntn -> Either Err Clause
-equation f (At (Infix lhs (At (Keyword ":=") _) rhs) _) = equationLhs f lhs rhs
+equation f (At (Infix lhs (At (Keyword KSet) _) rhs) _) = equationLhs f lhs rhs
 equation f n =
   Left
     (mkErr
@@ -230,7 +230,7 @@ identsOf n = case n of
        Nothing -> Nil
        Just m -> identsOf m)
       (concatMapC (\m -> identsOf m) ns)
-  At (MDecl _ _ m) _ -> identsOf m
+  At (MDecl _ m) _ -> identsOf m
   At (NTuple ns) _ -> concatMapC (\m -> identsOf m) ns
   At (NBrace m) _ -> identsOf m
   _ -> Nil
@@ -242,9 +242,9 @@ fresh used x = if elemBy strEq x used then fresh used (x ++ "'") else x
 rename : String -> String -> Ntn -> Ntn
 rename x v n = case n of
   At (Ident y) sp -> if strEq y x then At (Ident v) sp else At (Ident y) sp
-  At (Infix l (At (Keyword "=>") ksp) r) _ ->
-    if elemBy strEq x (identsOf l) then infixOp l (At (Keyword "=>") ksp) r
-    else infixOp l (At (Keyword "=>") ksp) (rename x v r)
+  At (Infix l (At (Keyword KMaps) ksp) r) _ ->
+    if elemBy strEq x (identsOf l) then infixOp l (At (Keyword KMaps) ksp) r
+    else infixOp l (At (Keyword KMaps) ksp) (rename x v r)
   At (Infix l k r) _ -> infixOp (rename x v l) k (rename x v r)
   At (Juxt a b) _ -> juxt (rename x v a) (rename x v b)
   At (NBlock b h ns) sp ->
@@ -303,8 +303,7 @@ type CK =
 findTagLit : List Pat -> Int -> Maybe Int
 findTagLit Nil i = Nothing
 findTagLit (Cons p rest) i =
-  if isTagP p || isLitP p || isRecP p then Just i
-  else findTagLit rest (i + 1)
+  if isTagP p || isLitP p || isRecP p then Just i else findTagLit rest (i + 1)
 
 nubTagRows : List TagRow -> List TagRow
 nubTagRows Nil = Nil
@@ -396,7 +395,7 @@ armOf r used bound sp vars rows c v t = do
          (group
             (At (NTag t.tag) t.span)
             (map (\y -> At (Ident y) sp) (armFields used bound t v)))
-         (At (Keyword "=>") sp)
+         (At (Keyword KMaps) sp)
          body)
 
 litYesOne : Int -> Ntn -> String -> Clause -> List Clause -> List Clause
@@ -464,7 +463,7 @@ literalOf r used bound sp vars rows c l = do
   pure
       (At
          (NBlock
-            "match"
+            BMatch
             (Just
                (group
                   (At (Ident (equalityOf l)) (ntnSpan l))
@@ -472,12 +471,12 @@ literalOf r used bound sp vars rows c l = do
             (Cons
                (infixOp
                   (At (NTag "True") (ntnSpan l))
-                  (At (Keyword "=>") (ntnSpan l))
+                  (At (Keyword KMaps) (ntnSpan l))
                   yesB)
                (Cons
                   (infixOp
                      (At (NTag "False") (ntnSpan l))
-                     (At (Keyword "=>") (ntnSpan l))
+                     (At (Keyword KMaps) (ntnSpan l))
                      noB)
                   Nil)))
          (ntnSpan l))
@@ -521,7 +520,7 @@ defaultOf r used bound sp vars rows c rest = do
               (dropAt c row.pats)
               (bindVar (varAt vars c) (patAt c row) row.rhs))
          rest)
-  pure (Cons (infixOp (At (Ident "_") sp) (At (Keyword "=>") sp) b) Nil)
+  pure (Cons (infixOp (At (Ident "_") sp) (At (Keyword KMaps) sp) b) Nil)
 
 -- | rows whose column `c` is a variable go on in every other case
 defaultArm : CK
@@ -560,11 +559,12 @@ noRecMix : List Clause -> Int -> Either Err Unit
 noRecMix rows c =
   if anyC (\row -> isRecP (patAt c row)) rows
     then forC rows (\row -> case patAt c row of
-    PTag _ _ sp ->
-      Left (mkErr sp "a record and a tag match the same argument")
-    PLit l ->
-      Left (mkErr (ntnSpan l) "a record and a literal match the same argument")
-    _ -> Right MkUnit)
+      PTag _ _ sp ->
+        Left (mkErr sp "a record and a tag match the same argument")
+      PLit l ->
+        Left
+          (mkErr (ntnSpan l) "a record and a literal match the same argument")
+      _ -> Right MkUnit)
   else Right MkUnit
 
 -- | every field some equation names in column `c`, in order
@@ -575,10 +575,10 @@ recFieldNames c rows =
 
 -- | the variable the first equation naming field `f` binds it to
 recFieldVar : Int -> List Clause -> String -> Maybe String
-recFieldVar c rows f =
-  case catMaybesC (map (\row -> lookupField f (recFieldsOf (patAt c row))) rows) of
-    Cons p _ -> varOf p
-    Nil -> Nothing
+recFieldVar c rows f = case catMaybesC
+    (map (\row -> lookupField f (recFieldsOf (patAt c row))) rows) of
+  Cons p _ -> varOf p
+  Nil -> Nothing
 
 -- | the name of field `f`'s column: that variable, unless it is `_` or
 -- | bound already, else (a fresh) `f`
@@ -616,12 +616,12 @@ letFields sp v Nil body = body
 letFields sp v (Cons (MkPair f y) rest) body =
   At
     (NBlock
-       "let"
+       BLet
        (Just (juxt (At (Ident v) sp) (At (NField f) sp)))
        (Cons
           (infixOp
              (At (Ident y) sp)
-             (At (Keyword "=>") sp)
+             (At (Keyword KMaps) sp)
              (letFields sp v rest body))
           Nil))
     sp
@@ -679,7 +679,7 @@ compileAt r used bound sp vars rows c p = do
   pure
       (At
          (NBlock
-            "match"
+            BMatch
             (Just (At (Ident (varAt vars c)) sp))
             (appendC arms dflt))
          sp)
@@ -694,7 +694,7 @@ compileF : CK
          -> Either Err Ntn
 compileF r used bound sp vars rows = case rows of
   -- unreachable: a missing tag is the match's error
-  Nil -> Right (At (Keyword "abandon") sp)
+  Nil -> Right (At (Keyword KAbandon) sp)
   Cons row rest -> case findTagLit (clausePats row) 0 of
     -- the first equation matches whatever is left: it is the answer
     Nothing ->
@@ -751,7 +751,7 @@ desugarBody f params sp rows arity used = do
       rows
   pure
       (foldr2
-         (\x b -> infixOp (At (Ident x) sp) (At (Keyword "=>") sp) b)
+         (\x b -> infixOp (At (Ident x) sp) (At (Keyword KMaps) sp) b)
          body
          (dropC
             (length params)
@@ -806,7 +806,7 @@ desugar f params eqNs sp = do
 type CaseTree = { scrutinee : String, tree : Ntn }
 
 caseAlt : Ntn -> Either Err Clause
-caseAlt (At (Infix p (At (Keyword "=>") _) rhs) _) = do
+caseAlt (At (Infix p (At (Keyword KMaps) _) rhs) _) = do
   p' <- pat p
   pure (mkClause (Cons p' Nil) rhs)
 caseAlt n =
