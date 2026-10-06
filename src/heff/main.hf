@@ -1,7 +1,8 @@
 -- The compiler, run: a Node.js program (`heff compile src/heff/main.hf
 -- OUT.mjs --name main --backend=node`), `heff` itself -- compiled by itself, from the seed
--- boot/heff.mjs (scripts/build.mjs).  Besides the commands of
--- `usage`, `dump-core FILE...` reads the files given in dependency
+-- boot/heff.mjs (scripts/build.mjs).  Its command line is read by
+-- lib/cli.hf (`commands`, below).  Besides the commands the usage
+-- shows, `dump-core FILE...` reads the files given in dependency
 -- order, elaborates them, and prints every definition's stored core, and
 -- `dump-eval FILE` prints what each definition of FILE evaluates to (the
 -- interpreter's values, which the tests hold the backend to).
@@ -21,6 +22,7 @@ import heff.report as Rp
 import heff.rpc as Rpc
 import heff.session as Se
 import heff.toplevel as T
+import cli as Cli
 import fs
 import path as P
 import prelude
@@ -565,31 +567,6 @@ compileJsCmd file outPath = do
 type CompileOpts =
   { file : String, outPath : String, name : Maybe String, backend : String }
 
--- (the words given, the files read backwards; a flag's value after `=`
--- or as the next word)
-compileOpts : List String
-            -> Maybe String
-            -> Maybe String
-            -> List String
-            -> Either String CompileOpts
-compileOpts files name backend Nil = case backend of
-  Nothing -> Left "which backend? --backend=esm, page or node"
-  Just b -> case reverse files of
-    file :: outPath :: Nil ->
-      Right { file = file, outPath = outPath, name = name, backend = b }
-    _ -> Left "FILE OUT [--name NAME] --backend=MODE"
-compileOpts files name backend ("--name" :: n :: rest) =
-  compileOpts files (Just n) backend rest
-compileOpts files name backend ("--backend" :: b :: rest) =
-  compileOpts files name (Just b) rest
-compileOpts files name backend (w :: rest) =
-  if startsWith "--name=" w
-    then compileOpts files (Just (strSlice w 7 (strLength w))) backend rest
-  else if startsWith "--backend=" w
-    then compileOpts files name (Just (strSlice w 10 (strLength w))) rest
-  else if startsWith "--" w then Left ("no such flag: " ++ w)
-  else compileOpts (w :: files) name backend rest
-
 -- | `heff compile`, by its backend
 compileTo : {e : HFunctor}
           -> {{io : stdio <: e}}
@@ -848,294 +825,6 @@ explainCmd file = do
     Nothing -> exit 1
     Just c -> printLines (Q.explain c)
 
--- | a flag of a command, what it does, and its value (`Nothing`: it
--- | takes none; `Just Nil`: any word; else one of those)
-type Flag = { flag : String, doc : String, value : Maybe (List String) }
-
--- | a command: how it is called, what it does, and what its words
--- | complete to (`files`: the files' suffix; `words`: the words it takes;
--- | `flags`)
-type Command =
-  { name : String
-  , args : String
-  , doc : String
-  , files : String
-  , words : List String
-  , flags : List Flag
-  }
-
-cmd : String -> String -> String -> String -> Command
-cmd name a doc files =
-  { name = name, args = a, doc = doc, files = files, words = Nil, flags = Nil }
-
-shells : List String
-shells = ["fish", "bash", "zsh"]
-
-commands : List Command
-commands =
-  [ cmd
-    "check"
-    "FILE"
-    "elaborate FILE and what it imports; print its interface"
-    ".hf"
-  , cmd
-    "run"
-    "FILE [ARGS...]"
-    "run FILE's main with ARGS, compiled for Node.js"
-    ".hf"
-  , cmd
-    "test"
-    "FILE..."
-    "check the watches' expectations (the `-- ...` lines under them)"
-    ".hf"
-  , cmd
-    "promote"
-    "FILE"
-    "write each watch's value under it as its expectation"
-    ".hf"
-  , { name = "compile"
-    , args = "FILE OUT --backend=MODE [--name NAME]"
-    , doc =
-        "FILE as JavaScript, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME)"
-    , files = ".hf"
-    , words = Nil
-    , flags =
-        [ { flag = "backend"
-          , doc = "esm, page or node"
-          , value = Just ["esm", "page", "node"]
-          }
-        , { flag = "name"
-          , doc = "the computation run (page, node)"
-          , value = Just Nil
-          }
-        ]
-    }
-  , cmd "explain" "FILE" "the elaboration trace" ".hf"
-  , cmd
-    "type-at"
-    "FILE OFFSET..."
-    "what the name at each OFFSET resolved to, and its type, a line each"
-    ".hf"
-  , { name = "fmt"
-    , args = "[--check] FILE..."
-    , doc = "format FILEs in place (--check: only say which are not formatted)"
-    , files = ".hf"
-    , words = Nil
-    , flags =
-        [ { flag = "check"
-          , doc = "only say which are not formatted"
-          , value = Nothing
-          }
-        ]
-    }
-  , cmd "init" "[DIR]" "a new project in DIR (here, without it)" ""
-  , cmd
-    "publish"
-    "VERSION"
-    "check the project, then tag it vVERSION and push the tag"
-    ""
-  , cmd
-    "get"
-    "[PATH[@VERSION]]"
-    "fetch what the project requires, writing heff.sum; with PATH, require it (at VERSION, else its newest) first"
-    ""
-  , cmd "lsp" "" "a language server, on stdin/stdout" ""
-  , { name = "completions"
-    , args = "SHELL"
-    , doc = "a completion script for SHELL: fish, bash or zsh"
-    , files = ""
-    , words = shells
-    , flags = Nil
-    }
-  ]
-
-spaces : Int -> String
-spaces n = joinWith "" (replicate n " ")
-
-commandHead : Command -> String
-commandHead c = c.name ++ (if strEq c.args "" then "" else " " ++ c.args)
-
--- (the head, padded to 24 columns -- a space at least -- and its doc)
-usageLine : Command -> String
-usageLine c =
-  "  "
-  ++ commandHead c
-  ++ spaces (max 1 (24 - strLength (commandHead c)))
-  ++ c.doc
-
-usage : String
-usage =
-  joinWith
-    "\n"
-    (Cons "usage: heff COMMAND FILE ..." (Cons "" (map usageLine commands)))
-
--- (a fish string: quoted, its quotes escaped)
-fishQuote : String -> String
-fishQuote x = "'" ++ joinWith "\\'" (split "'" x) ++ "'"
-
-seenFrom : String -> String
-seenFrom name =
-  "complete -c heff -n '__fish_seen_subcommand_from " ++ name ++ "'"
-
-fishFlag : Command -> Flag -> String
-fishFlag c f =
-  seenFrom c.name
-  ++ " -l "
-  ++ f.flag
-  ++ (case f.value of
-      Nothing -> ""
-      Just Nil -> " -x"
-      Just vs -> " -xa " ++ fishQuote (unwords vs))
-  ++ " -d "
-  ++ fishQuote f.doc
-
-fishLines : Command -> List String
-fishLines c =
-  concatList
-    (Cons
-       ("complete -c heff -n __fish_use_subcommand -a "
-        ++ c.name
-        ++ " -d "
-        ++ fishQuote c.doc)
-       (if strEq c.files "" then Nil
-        else [ seenFrom c.name
-             ++ " -a '(__fish_complete_suffix "
-             ++ c.files
-             ++ ")'"
-             ]))
-    (concatList
-       (if null c.words then Nil
-        else [seenFrom c.name ++ " -a " ++ fishQuote (unwords c.words)])
-       (map (\(f : Flag) -> fishFlag c f) c.flags))
-
-fishCompletions : String
-fishCompletions =
-  joinWith
-    "\n"
-    (concatList
-       [ "# heff: written by `heff completions fish`"
-       , "complete -c heff -e"
-       , "complete -c heff -f"
-       ]
-       (concatMap fishLines commands))
-  ++ "\n"
-
--- (a POSIX shell's string: single-quoted, each quote closed, escaped and
--- opened again)
-shQuote : String -> String
-shQuote x = "'" ++ joinWith "'\\''" (split "'" x) ++ "'"
-
-flagWords : Command -> List String
-flagWords c = map (\(f : Flag) -> "--" ++ f.flag) c.flags
-
--- (after a flag that takes a value: its values, or nothing)
-bashValueArm : Command -> Flag -> List String
-bashValueArm c f = case f.value of
-  Nothing -> Nil
-  Just vs ->
-    [ "    "
-    ++ shQuote (c.name ++ " --" ++ f.flag)
-    ++ ") COMPREPLY=($(compgen -W "
-    ++ shQuote (unwords vs)
-    ++ " -- \"$cur\")); return;;"
-    ]
-
-bashArm : Command -> String
-bashArm c =
-  "    "
-  ++ c.name
-  ++ ") COMPREPLY=($(compgen -W "
-  ++ shQuote (unwords (concatList c.words (flagWords c)))
-  ++ " -- \"$cur\"))"
-  ++ (if strEq c.files "" then ""
-      else "; COMPREPLY+=($(compgen -d -- \"$cur\") $(compgen -f -X "
-        ++ shQuote ("!*" ++ c.files)
-        ++ " -- \"$cur\"))")
-  ++ ";;"
-
-bashCompletions : String
-bashCompletions =
-  joinWith
-    "\n"
-    (concatList
-       [ "# heff: written by `heff completions bash`"
-       , "_heff() {"
-       , "  local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}"
-       , "  if [ \"$COMP_CWORD\" -eq 1 ]; then"
-       , "    COMPREPLY=($(compgen -W "
-       ++ shQuote (unwords (map (\(c : Command) -> c.name) commands))
-       ++ " -- \"$cur\"))"
-       , "    return"
-       , "  fi"
-       , "  case \"${COMP_WORDS[1]} $prev\" in"
-       ]
-       (concatList
-          (concatMap
-             (\(c : Command) ->
-                concatMap (\(f : Flag) -> bashValueArm c f) c.flags)
-             commands)
-          (concatList
-             (Cons "  esac" (Cons "  case \"${COMP_WORDS[1]}\" in" Nil))
-             (concatList
-                (map bashArm commands)
-                ["  esac", "}", "complete -o filenames -F _heff heff"]))))
-  ++ "\n"
-
-zshFlag : Flag -> String
-zshFlag f =
-  shQuote
-    ("--"
-     ++ f.flag
-     ++ (case f.value of
-         Nothing -> "[" ++ f.doc ++ "]"
-         Just Nil -> "=[" ++ f.doc ++ "]:value: "
-         Just vs -> "=[" ++ f.doc ++ "]:value:(" ++ unwords vs ++ ")"))
-
-zshArm : Command -> String
-zshArm c =
-  "    "
-  ++ c.name
-  ++ ") _arguments"
-  ++ joinWith "" (map (\(f : Flag) -> " " ++ zshFlag f) c.flags)
-  ++ (if null c.words then ""
-      else " " ++ shQuote ("1:value:(" ++ unwords c.words ++ ")"))
-  ++ (if strEq c.files "" then ""
-      else " " ++ shQuote ("*:file:_files -g \"*" ++ c.files ++ "\""))
-  ++ " ;;"
-
-zshCompletions : String
-zshCompletions =
-  joinWith
-    "\n"
-    (concatList
-       [ "#compdef heff"
-       , "# heff: written by `heff completions zsh`"
-       , "_heff() {"
-       , "  local -a commands"
-       , "  commands=("
-       ]
-       (concatList
-          (map
-             (\(c : Command) -> "    " ++ shQuote (c.name ++ ":" ++ c.doc))
-             commands)
-          (concatList
-             [ "  )"
-             , "  if (( CURRENT == 2 )); then"
-             , "    _describe command commands"
-             , "    return"
-             , "  fi"
-             , "  shift words"
-             , "  (( CURRENT-- ))"
-             , "  case $words[1] in"
-             ]
-             (concatList
-                (map zshArm commands)
-                [ "  esac"
-                , "}"
-                , "if [ \"$funcstack[1]\" = _heff ]; then _heff \"$@\"; else compdef _heff heff; fi"
-                ]))))
-  ++ "\n"
-
 fmtSrc : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{disk : fs <: e}}
@@ -1195,12 +884,11 @@ fmtCmd : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{sys : process <: e}}
        -> {{disk : fs <: e}}
+       -> Bool
        -> List String
        -> Co e Unit
-fmtCmd as = do
-  bad <- case as of
-    "--check" :: files -> fmtAll True files 0
-    _ -> fmtAll False as 0
+fmtCmd check files = do
+  bad <- fmtAll check files 0
   if bad > 0 then exit 1 else pure MkUnit
 
 -- (the `.hf` files under the paths, the directories walked; a name
@@ -1839,9 +1527,238 @@ getCmd spec = do
                 ok <- getRequire ps t pk (fst (specOf s)) ver
                 if ok then getAll else pure MkUnit
 
--- | the compiler's door: the commands of `usage`, and `dump-core
--- | FILE...`, which checks the files given (in dependency order) and
--- | prints their stored core, and `dump-eval FILE`
+-- The command line
+--------------------------------------------------------------------------------
+
+-- | `heff compile FILE OUT --backend=MODE [--name NAME]`
+compileWith : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> String
+            -> String
+            -> Maybe String
+            -> String
+            -> Co e Unit
+compileWith file outPath name backend =
+  compileTo { file = file, outPath = outPath, name = name, backend = backend }
+
+-- | the language server, on stdin/stdout (the flags clients add,
+-- | `--stdio` say, are passed over: it is all there is)
+lspCmd : {e : HFunctor}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> {{wire : Rpc.rpc <: e}}
+       -> List String
+       -> Co e Unit
+lspCmd flags = do
+  h <- hostNow
+  Lsp.serve h
+
+-- heff's commands, as types: what each takes, for any result `r` -- the
+-- program is one handler of them, the watches below another.  They are
+-- in groups by what they are given to run: only the tools talk to an
+-- editor.
+
+-- | building and checking files
+type Build (r : Type) =
+  { check : String -> r
+  , run : String -> List String -> r
+  , tests : List String -> r
+  , promote : String -> r
+  , compile : String -> String -> Maybe String -> String -> r
+  , explain : String -> r
+  , typeAt : String -> List String -> r
+  , fmt : Bool -> List String -> r
+  }
+
+-- | the project, and its packages
+type Project (r : Type) =
+  { init : Maybe String -> r, get : Maybe String -> r, publish : String -> r }
+
+-- | the language server, and the compiler's own doors
+type Tool (r : Type) =
+  { lsp : List String -> r
+  , dumpCore : List String -> r
+  , dumpEval : String -> r
+  }
+
+type Commands (r : Type) =
+  { build : Build r, project : Project r, tool : Tool r }
+
+hf : Cli.Complete
+hf = 'files ".hf"
+
+buildCommands : {r : Type} -> Build r -> List (Cli.Command r)
+buildCommands c =
+  [ Cli.command
+    "check"
+    "elaborate FILE and what it imports; print its interface"
+    (\s -> Cli.with1 s c.check (Cli.arg s "FILE" hf))
+  , Cli.command
+    "run"
+    "run FILE's main with ARGS, compiled for Node.js"
+    (\s -> Cli.with2 s c.run (Cli.arg s "FILE" hf) (Cli.rest s "ARGS"))
+  , Cli.command
+    "test"
+    "check the watches' expectations (the `-- ...` lines under them)"
+    (\s -> Cli.with1 s c.tests (Cli.some s "FILE" hf))
+  , Cli.command
+    "promote"
+    "write each watch's value under it as its expectation"
+    (\s -> Cli.with1 s c.promote (Cli.arg s "FILE" hf))
+  , Cli.command
+    "compile"
+    "FILE as JavaScript, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME)"
+    (\s ->
+       Cli.with4
+         s
+         c.compile
+         (Cli.arg s "FILE" hf)
+         (Cli.arg s "OUT" 'none)
+         (Cli.option s "name" "n" "NAME" "the computation run (page, node)")
+         (Cli.choose
+            s
+            "backend"
+            "b"
+            "MODE"
+            "what it is compiled to"
+            ["esm", "page", "node"]))
+  , Cli.command
+    "explain"
+    "the elaboration trace"
+    (\s -> Cli.with1 s c.explain (Cli.arg s "FILE" hf))
+  , Cli.command
+    "type-at"
+    "what the name at each OFFSET resolved to, and its type, a line each"
+    (\s ->
+       Cli.with2 s c.typeAt (Cli.arg s "FILE" hf) (Cli.some s "OFFSET" 'none))
+  , Cli.command
+    "fmt"
+    "format FILEs in place"
+    (\s ->
+       Cli.with2
+         s
+         c.fmt
+         (Cli.switch s "check" "c" "only say which are not formatted")
+         (Cli.some s "FILE" hf))
+  ]
+
+projectCommands : {r : Type} -> Project r -> List (Cli.Command r)
+projectCommands c =
+  [ Cli.command
+    "init"
+    "a new project in DIR (here, without it)"
+    (\s -> Cli.with1 s c.init (Cli.optional s "DIR" 'dirs))
+  , Cli.command
+    "get"
+    "fetch what the project requires, writing heff.sum; with PATH, require it (at VERSION, else its newest) first"
+    (\s -> Cli.with1 s c.get (Cli.optional s "PATH[@VERSION]" 'none))
+  , Cli.command
+    "publish"
+    "check the project, then tag it vVERSION and push the tag"
+    (\s -> Cli.with1 s c.publish (Cli.arg s "VERSION" 'none))
+  ]
+
+toolCommands : {r : Type} -> Tool r -> List (Cli.Command r)
+toolCommands c =
+  [ Cli.command
+    "lsp"
+    "a language server, on stdin/stdout"
+    (\s -> Cli.with1 s c.lsp (Cli.rest s "FLAGS"))
+  , Cli.hidden "dump-core" (\s -> Cli.with1 s c.dumpCore (Cli.many s "FILE" hf))
+  , Cli.hidden "dump-eval" (\s -> Cli.with1 s c.dumpEval (Cli.arg s "FILE" hf))
+  ]
+
+commands : {r : Type} -> Commands r -> List (Cli.Command r)
+commands c =
+  concatList
+    (buildCommands c.build)
+    (concatList (projectCommands c.project) (toolCommands c.tool))
+
+build : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : fs <: e}}
+      -> {{rep : Rp.report <: e}}
+      -> Build (Co e Unit)
+build =
+  { check = checkCmd
+  , run = runCmd
+  , tests = \files -> testCmd files 0 0 False
+  , promote = promoteCmd
+  , compile = compileWith
+  , explain = explainCmd
+  , typeAt = typeAtCmd
+  , fmt = fmtCmd
+  }
+
+project : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{rep : Rp.report <: e}}
+        -> Project (Co e Unit)
+project =
+  { init = \dir -> initCmd (fromMaybe "." dir)
+  , get = getCmd
+  , publish = publishCmd
+  }
+
+tool : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : fs <: e}}
+     -> {{wire : Rpc.rpc <: e}}
+     -> Tool (Co e Unit)
+tool = { lsp = lspCmd, dumpCore = selfcheck, dumpEval = evalCmd }
+
+-- (what a command line is read as, said: for the watches)
+said : Commands String
+said =
+  { build =
+      { check = \f -> "check " ++ f
+      , run = \f as -> "run " ++ f ++ " [" ++ joinWith "," as ++ "]"
+      , tests = \fs -> "test " ++ joinWith "," fs
+      , promote = \f -> "promote " ++ f
+      , compile = \f o n b ->
+            "compile " ++ f ++ " " ++ o ++ " " ++ fromMaybe "-" n ++ " " ++ b
+      , explain = \f -> "explain " ++ f
+      , typeAt = \f os -> "type-at " ++ f ++ " " ++ joinWith "," os
+      , fmt = \c fs ->
+            "fmt " ++ (if c then "--check " else "") ++ joinWith "," fs
+      }
+  , project =
+      { init = \d -> "init " ++ fromMaybe "." d
+      , get = \p -> "get " ++ fromMaybe "-" p
+      , publish = \v -> "publish " ++ v
+      }
+  , tool =
+      { lsp = \fs -> "lsp " ++ joinWith "," fs
+      , dumpCore = \fs -> "dump-core " ++ joinWith "," fs
+      , dumpEval = \f -> "dump-eval " ++ f
+      }
+  }
+
+-- >>> Cli.readLine "heff" (commands said) ["compile", "a.hf", "-bnode", "a.mjs"]
+-- 'run "compile a.hf a.mjs - node"
+
+-- >>> Cli.readLine "heff" (commands said) ["run", "main.hf", "--verbose", "x"]
+-- 'run "run main.hf [--verbose,x]"
+
+-- >>> Cli.readLine "heff" (commands said) ["fmt", "src", "-c", "test"]
+-- 'run "fmt --check src,test"
+
+-- >>> Cli.readLine "heff" (commands said) ["init"]
+-- 'run "init ."
+
+-- >>> Cli.readLine "heff" (commands said) ["lsp", "--stdio"]
+-- 'run "lsp --stdio"
+
+-- >>> Cli.readLine "heff" (commands said) ["type-at", "a.hf", "3", "17"]
+-- 'run "type-at a.hf 3,17"
+
+-- | heff: its commands, given what they are to run with
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
@@ -1851,44 +1768,14 @@ program : {e : HFunctor}
         -> Co e Unit
 program = do
   as <- args
-  case as of
-    "compile" :: flags -> case compileOpts Nil Nothing Nothing flags of
-      Left why -> do
-        printErr ("heff compile: " ++ why)
-        exit 1
-      Right o -> compileTo o
-    "check" :: file :: Nil -> checkCmd file
-    "run" :: file :: progArgs -> runCmd file progArgs
-    "dump-eval" :: file :: Nil -> evalCmd file
-    "promote" :: file :: Nil -> promoteCmd file
-    "type-at" :: file :: off :: offs -> typeAtCmd file (off :: offs)
-    "explain" :: file :: Nil -> explainCmd file
-    "test" :: f :: files -> testCmd (f :: files) 0 0 False
-    "fmt" :: f :: files -> fmtCmd (f :: files)
-    "completions" :: "fish" :: Nil -> write fishCompletions
-    "completions" :: "bash" :: Nil -> write bashCompletions
-    "completions" :: "zsh" :: Nil -> write zshCompletions
-    "dump-core" :: files -> selfcheck files
-    "init" :: Nil -> initCmd "."
-    "publish" :: v :: Nil -> publishCmd v
-    "get" :: Nil -> getCmd Nothing
-    "get" :: spec :: Nil -> getCmd (Just spec)
-    "init" :: dir :: Nil -> initCmd dir
-    -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
-    "lsp" :: flags ->
-      if all (\x -> startsWith "--" x) flags
-        then do
-          h <- hostNow
-          Lsp.serve h
-      else do
-        printErr usage
-        exit 1
-    Nil -> print usage
-    "help" :: Nil -> print usage
-    -- (on stderr: what reads the output, a shell's completion, say, does
-    -- not take it for an answer)
-    _ -> do
-      printErr usage
+  case Cli.readLine
+      "heff"
+      (commands { build = build, project = project, tool = tool })
+      as of
+    'run act -> act
+    'out text -> write text
+    'fail text -> do
+      writeErr text
       exit 1
 
 -- | where the world is: each sub-effect's evidence, given

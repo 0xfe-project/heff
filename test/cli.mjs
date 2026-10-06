@@ -4,7 +4,7 @@
 // usage, the completions and an unknown command say what they should, on
 // the right stream, with the right exit status.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,49 +69,100 @@ expect("fmt by imported fixities", cut.status === 0 && readFileSync(join(work, "
   "  <+ dddddddddddddddd", "",
 ].join("\n"), { cut, text: readFileSync(join(work, "uses.hf"), "utf8") });
 
-// the usage: asked for, on stdout; for what is no command (or a command
-// without its files), on stderr, failing
-const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "publish", "get", "lsp", "completions"];
-for (const args of [[], ["help"]]) {
+// the usage: asked for, on stdout; for what is no command, on stderr,
+// failing; a command's own help, asked for; its words wrong, what is wrong
+// and how it is called, on stderr
+const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "publish", "lsp", "help", "completions"];
+for (const args of [[], ["help"], ["--help"]]) {
   const r = heff(...args);
-  expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND FILE ...") &&
-    commands.every((c) => r.stdout.includes(`\n  ${c}`)), r);
+  expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND ...\n") &&
+    commands.every((c) => r.stdout.includes(`\n  ${c}`)) && !r.stdout.includes("dump-core"), r);
 }
-for (const args of [["no-such-command"], ["test"], ["check"]]) {
-  const r = heff(...args);
-  expect(`refused: ${args.join(" ")}`, r.status === 1 && r.stdout === "" && r.stderr.startsWith("usage: heff COMMAND FILE ..."), r);
-}
-
-// fish completions: every command, and file completion where it takes files
-const fish = heff("completions", "fish");
-expect("completions fish", fish.status === 0 && fish.stdout.startsWith("# heff: written by `heff completions fish`\n") &&
-  commands.every((c) => fish.stdout.includes(`-a ${c} -d `)) &&
-  fish.stdout.includes("complete -c heff -n '__fish_seen_subcommand_from check' -a '(__fish_complete_suffix .hf)'") &&
-  fish.stdout.includes("complete -c heff -n '__fish_seen_subcommand_from compile' -l backend -xa 'esm page node' -d "), fish.stdout);
-// bash and zsh: every command, the backend's values, and each script
-// read by its shell without a complaint
-const bash = heff("completions", "bash");
-expect("completions bash", bash.status === 0 && bash.stdout.startsWith("# heff: written by `heff completions bash`\n") &&
-  bash.stdout.includes(commands.join(" ")) && bash.stdout.includes("'compile --backend') COMPREPLY=($(compgen -W 'esm page node'") &&
-  spawnSync("bash", ["-n"], { input: bash.stdout }).status === 0, bash.stdout);
-// (where there is no zsh, its reading is not checked)
-const zsh = heff("completions", "zsh");
-const zshRead = spawnSync("zsh", ["-n"], { input: zsh.stdout });
-expect("completions zsh", zsh.status === 0 && zsh.stdout.startsWith("#compdef heff\n") &&
-  commands.every((c) => zsh.stdout.includes(`\n    '${c}:`)) && zsh.stdout.includes("'--backend=[esm, page or node]:value:(esm page node)'") &&
-  (zshRead.error !== undefined || zshRead.status === 0), zsh.stdout);
-
-// compile: a backend wanted, one of three; no NAME for a module
+const noSuch = heff("no-such-command");
+expect("refused: no-such-command", noSuch.status === 1 && noSuch.stdout === "" &&
+  noSuch.stderr.startsWith("heff: no command no-such-command\nusage: heff COMMAND ..."), noSuch);
 for (const [args, says] of [
-  [["compile", "a.hf", "a.mjs"], "which backend?"],
-  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "no backend wasm"],
-  [["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"], "no --name with --backend=esm"],
-  [["compile", "a.hf", "--backend=node"], "FILE OUT"],
-  [["compile", "a.hf", "a.mjs", "--back=node"], "no such flag: --back=node"],
+  [["test"], "heff test: expected FILE...\nusage: heff test FILE...\n"],
+  [["check"], "heff check: expected FILE\nusage: heff check FILE\n"],
+  [["fmt", "--chek", "x.hf"], "heff fmt: no flag --chek; --check?\nusage: heff fmt FILE... [--check]\n"],
+  [["compile", "a.hf", "a.mjs"], "heff compile: --backend=MODE is wanted\n"],
+  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "heff compile: --backend is esm, page or node, not wasm\n"],
+  [["compile", "a.hf", "--backend=node"], "heff compile: expected OUT\n"],
+  [["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"], "heff compile: an ES module runs nothing: no --name with --backend=esm"],
+  [["init", "a", "b"], "heff init: too many words: b\n"],
 ]) {
   const r = heff(...args);
-  expect(`refused: ${args.join(" ")}`, r.status === 1 && r.stderr.startsWith("heff compile: ") && r.stderr.includes(says), r);
+  expect(`refused: ${args.join(" ")}`, r.status === 1 && r.stdout === "" && r.stderr.startsWith(says), r);
 }
+for (const args of [["help", "compile"], ["compile", "--help"], ["compile", "a.hf", "-h"]]) {
+  const r = heff(...args);
+  expect(`help: ${args.join(" ")}`, r.status === 0 &&
+    r.stdout.startsWith("usage: heff compile FILE OUT [--name NAME] --backend=MODE\n") &&
+    r.stdout.includes("\n  -b, --backend=MODE") && r.stdout.includes("(esm, page, node)"), r);
+}
+
+// what a word completes to: the commands, a command's flags, a flag's
+// values, its files
+for (const [words, out] of [
+  [["co"], "compile\tFILE as JavaScript, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME)\ncompletions\ta completion script for SHELL\n"],
+  [["compile", "a.hf", "--b"], "--backend\twhat it is compiled to\n"],
+  [["compile", "a.hf", "-b", ""], "esm\npage\nnode\n"],
+  [["compile", "a.hf", "--backend=n"], "--backend=node\n"],
+  [["fmt", "--check", ""], ":files .hf\n"],
+  [["init", ""], ":dirs\n"],
+  [["completions", ""], "fish\nbash\nzsh\n"],
+  [["run", "main.hf", "--"], ""],
+]) {
+  const r = heff("complete", ...words);
+  expect(`complete ${JSON.stringify(words)}`, r.status === 0 && r.stdout === out, r);
+}
+
+// the scripts, run by their shells, with `heff` on the path: a line typed
+// so far, and what the shell offers
+const bin = join(work, "bin");
+mkdirSync(bin);
+writeFileSync(join(bin, "heff"), `#!/bin/sh\nexec node ${JSON.stringify(join(root, "output", "heff.mjs"))} "$@"\n`);
+chmodSync(join(bin, "heff"), 0o755);
+const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
+writeFileSync(join(work, "comp.bash"), heff("completions", "bash").stdout);
+// (bash splits `--backend=n` at `=`: its words as bash makes them)
+const bashOffers = (line, words) => spawnSync("bash", ["-c",
+  `source comp.bash; COMP_LINE=${JSON.stringify(line)}; COMP_POINT=\${#COMP_LINE}; COMP_WORDS=(${words.map((w) => JSON.stringify(w)).join(" ")}); COMP_CWORD=${words.length - 1}; _heff; printf '%s\\n' "\${COMPREPLY[@]}"`],
+  { cwd: work, env, encoding: "utf8" });
+for (const [line, words, want] of [
+  ["heff comp", ["heff", "comp"], ["compile", "completions"]],
+  ["heff compile a.hf --b", ["heff", "compile", "a.hf", "--b"], ["--backend"]],
+  ["heff compile a.hf --backend ", ["heff", "compile", "a.hf", "--backend", ""], ["esm", "page", "node"]],
+  ["heff compile a.hf --backend=n", ["heff", "compile", "a.hf", "--backend", "=", "n"], ["node"]],
+  ["heff compile a.hf --backend=", ["heff", "compile", "a.hf", "--backend", "="], ["=esm", "=page", "=node"]],
+  ["heff check cle", ["heff", "check", "cle"], ["clean.hf"]],
+]) {
+  const r = bashOffers(line, words);
+  expect(`bash completes ${JSON.stringify(line)}`, r.status === 0 && JSON.stringify(r.stdout.trim().split("\n").filter(Boolean)) === JSON.stringify(want), r);
+}
+// (fish and zsh, where they are)
+const fishThere = spawnSync("fish", ["--version"]).error === undefined;
+if (fishThere) {
+  writeFileSync(join(work, "comp.fish"), heff("completions", "fish").stdout);
+  const fishOffers = (line) => spawnSync("fish", ["-c", `source comp.fish; complete -C ${JSON.stringify(line)}`], { cwd: work, env, encoding: "utf8" });
+  for (const [line, want] of [
+    ["heff comp", ["compile", "completions"]],
+    ["heff compile a.hf --backend=", ["--backend=esm", "--backend=page", "--backend=node"]],
+    ["heff compile a.hf -b ", ["esm", "page", "node"]],
+    ["heff check cle", ["clean.hf"]],
+  ]) {
+    const r = fishOffers(line);
+    // (fish sorts what it offers)
+    const got = r.stdout.trim().split("\n").filter(Boolean).map((l) => l.split("\t")[0]).sort();
+    expect(`fish completes ${JSON.stringify(line)}`, r.status === 0 && JSON.stringify(got) === JSON.stringify([...want].sort()), r);
+  }
+}
+const zsh = heff("completions", "zsh");
+const zshRead = spawnSync("zsh", ["-n"], { input: zsh.stdout });
+expect("completions zsh", zsh.status === 0 && zsh.stdout.startsWith("#compdef heff\n") && zsh.stdout.includes("heff complete") &&
+  (zshRead.error !== undefined || zshRead.status === 0), zsh.stdout);
+const noShell = heff("completions", "tcsh");
+expect("completions of no shell", noShell.status === 1 && noShell.stderr.startsWith("heff completions: a shell is fish, bash or zsh, not tcsh"), noShell);
 
 // type-at: nothing there, at an offset that is no name or no number
 for (const o of ["0", "nope"]) {

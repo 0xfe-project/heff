@@ -1,0 +1,1167 @@
+-- A command line, described once: what each command takes is a term of
+-- `Args`, and the words given are read by it, the usage and each
+-- command's help written from it, and what the word being written
+-- completes to said by it (the shells' scripts ask the program).
+--
+-- The words are read as getopt_long reads them: flags anywhere among the
+-- positionals; `--long V`, `--long=V`, `-s V`, `-sV`, switches side by
+-- side (`-abc`); a long name by any start of it that is no other's; an
+-- option's value the next word, whatever it is; given twice, the last;
+-- `--` ends the flags, and so does the start of a rest; `-` alone is a
+-- positional; `--help` and `-h` ask for the command's help.
+--
+-- They are read in two stages -- split by the shape (which flags take a
+-- value), then the values taken -- so the shape is known before a word is
+-- read: `Args` is applicative, not a monad.  A program's commands are
+-- ordinary functions given the values; the library has no effect, and
+-- says what the program is to do (`Outcome`).
+
+import prelude
+
+-- The shape
+--------------------------------------------------------------------------------
+
+-- | what a word completes to
+data Complete = 'none | 'files String | 'dirs | 'among (List String)
+
+-- | a flag: `--long`, `-s` (`short`: "" for none), the value it takes
+-- | (`meta`: "" for a switch), the values it may have (Nil: any), whether
+-- | it may be given more than once, and must be given
+type Flag =
+  { long : String
+  , short : String
+  , meta : String
+  , doc : String
+  , values : List String
+  , repeated : Bool
+  , required : Bool
+  , complete : Complete
+  }
+
+-- | how many words a positional takes: one, one or none, any number, at
+-- | least one, or the rest (verbatim: flags are not read in them)
+data Arity = 'one | 'optional | 'many | 'some | 'rest
+
+type Pos = { meta : String, arity : Arity, complete : Complete }
+
+type Shape = { flags : List Flag, pos : List Pos }
+
+-- | what is wrong with the words given
+data Problem
+  = 'unknown String (Maybe String)
+  | 'noValue String
+  | 'switchValue String
+  | 'ambiguous String (List String)
+  | 'missingFlag String
+  | 'notIn String String (List String)
+  | 'missing String
+  | 'extra String
+  | 'help
+  | 'badShape String
+
+-- The language
+--------------------------------------------------------------------------------
+
+theory Args where
+  A : Type -> Type
+  give : {a : Type} -> a -> A a
+  ap : {a b : Type} -> A (a -> b) -> A a -> A b
+  -- | the values a flag was given, one for each time (a switch: "")
+  flag : Flag -> A (List String)
+  -- | the words a positional took
+  pos : Pos -> A (List String)
+
+-- | a term: what a command takes, read as an `a`
+type Term a = (s : Args) -> s.A a
+
+-- Reading: the shape, and how the values are taken once the words are
+-- split by it
+--------------------------------------------------------------------------------
+
+type Reader a =
+  { shape : Shape
+  , take : List (List String) -> List (Pair String (List String)) -> a
+  }
+
+lastS : List String -> Maybe String
+lastS Nil = Nothing
+lastS (x :: Nil) = Just x
+lastS (_ :: xs) = lastS xs
+
+lookupL : String -> List (Pair String (List String)) -> List String
+lookupL k Nil = Nil
+lookupL k (MkPair x vs :: rest) = if strEq k x then vs else lookupL k rest
+
+headOr : String -> List String -> String
+headOr d (x :: _) = x
+headOr d Nil = d
+
+reading : Args
+reading =
+  { A = Reader
+  , give = \x -> { shape = { flags = Nil, pos = Nil }, take = \_ _ -> x }
+  , ap = \f x ->
+        { shape =
+            { flags = concatList f.shape.flags x.shape.flags
+            , pos = concatList f.shape.pos x.shape.pos
+            }
+        , take = \groups fl ->
+              (f.take groups fl) (x.take (drop (length f.shape.pos) groups) fl)
+        }
+  , flag = \fl ->
+        { shape = { flags = [fl], pos = Nil }
+        , take = \_ given -> lookupL fl.long given
+        }
+  , pos = \p ->
+        { shape = { flags = Nil, pos = [p] }
+        , take = \groups _ -> case groups of
+            g :: _ -> g
+            Nil -> Nil
+        }
+  }
+
+readerOf : {a : Type} -> Term a -> Reader a
+readerOf t = t reading
+
+shapeOf : {a : Type} -> Term a -> Shape
+shapeOf t = (readerOf t).shape
+
+-- What is built on the language
+--------------------------------------------------------------------------------
+
+flagSpec : String -> String -> String -> String -> Flag
+flagSpec long short meta doc =
+  { long = long
+  , short = short
+  , meta = meta
+  , doc = doc
+  , values = Nil
+  , repeated = False
+  , required = False
+  , complete = 'none
+  }
+
+-- | `--long`, `-s`: given or not
+switch : (s : Args) -> String -> String -> String -> s.A Bool
+switch s long short doc =
+  s.ap
+    (s.give (\(vs : List String) -> not (null vs)))
+    (s.flag (flagSpec long short "" doc))
+
+-- | `--long V`, `--long=V`, `-s V`, `-sV`: the last one given
+option : (s : Args)
+       -> String
+       -> String
+       -> String
+       -> String
+       -> s.A (Maybe String)
+option s long short meta doc =
+  s.ap (s.give lastS) (s.flag (flagSpec long short meta doc))
+
+-- | ... given, one of `values`
+choose : (s : Args)
+       -> String
+       -> String
+       -> String
+       -> String
+       -> List String
+       -> s.A String
+choose s long short meta doc values =
+  s.ap
+    (s.give (\(vs : List String) -> fromMaybe "" (lastS vs)))
+    (s.flag
+       { long = long
+       , short = short
+       , meta = meta
+       , doc = doc
+       , values = values
+       , repeated = False
+       , required = True
+       , complete = 'among values
+       })
+
+arg : (s : Args) -> String -> Complete -> s.A String
+arg s meta c =
+  s.ap (s.give (headOr "")) (s.pos { meta = meta, arity = 'one, complete = c })
+
+optional : (s : Args) -> String -> Complete -> s.A (Maybe String)
+optional s meta c =
+  s.ap
+    (s.give (\(ws : List String) -> case ws of
+     w :: _ -> Just w
+     Nil -> Nothing))
+    (s.pos { meta = meta, arity = 'optional, complete = c })
+
+some : (s : Args) -> String -> Complete -> s.A (List String)
+some s meta c = s.pos { meta = meta, arity = 'some, complete = c }
+
+many : (s : Args) -> String -> Complete -> s.A (List String)
+many s meta c = s.pos { meta = meta, arity = 'many, complete = c }
+
+rest : (s : Args) -> String -> s.A (List String)
+rest s meta = s.pos { meta = meta, arity = 'rest, complete = 'none }
+
+-- | `f` given what each of the terms read
+with1 : (s : Args) -> {a r : Type} -> (a -> r) -> s.A a -> s.A r
+with1 s f x = s.ap (s.give f) x
+
+with2 : (s : Args) -> {a b r : Type} -> (a -> b -> r) -> s.A a -> s.A b -> s.A r
+with2 s f x y = s.ap (s.ap (s.give f) x) y
+
+with3 : (s : Args)
+      -> {a b c r : Type}
+      -> (a -> b -> c -> r)
+      -> s.A a
+      -> s.A b
+      -> s.A c
+      -> s.A r
+with3 s f x y z = s.ap (s.ap (s.ap (s.give f) x) y) z
+
+with4 : (s : Args)
+      -> {a b c d r : Type}
+      -> (a -> b -> c -> d -> r)
+      -> s.A a
+      -> s.A b
+      -> s.A c
+      -> s.A d
+      -> s.A r
+with4 s f x y z w = s.ap (s.ap (s.ap (s.ap (s.give f) x) y) z) w
+
+-- The shape, checked
+--------------------------------------------------------------------------------
+
+hasEq : String -> Bool
+hasEq x = case indexOf "=" x of
+  Just _ -> True
+  Nothing -> False
+
+dupOf : List String -> Maybe String
+dupOf Nil = Nothing
+dupOf (x :: rest) = if elemBy strEq x rest then Just x else dupOf rest
+
+lastOnly : List Pos -> Maybe String
+lastOnly Nil = Nothing
+lastOnly (p :: Nil) = Nothing
+lastOnly (p :: rest) = case p.arity of
+  'one -> lastOnly rest
+  _ -> Just p.meta
+
+-- | what is wrong with a shape: a name twice, a short name that is not
+-- | one letter, `help`/`h` taken, a positional of many words before the
+-- | last, a switch with values, flags where every word is the rest
+shapeProblem : Shape -> Maybe String
+shapeProblem sh = case dupOf (map (\(f : Flag) -> f.long) sh.flags) of
+  Just x -> Just ("--" ++ x ++ " twice")
+  Nothing -> case dupOf
+      (filter
+         (\x -> not (strEq x ""))
+         (map (\(f : Flag) -> f.short) sh.flags)) of
+    Just x -> Just ("-" ++ x ++ " twice")
+    Nothing ->
+      if any
+        (\(f : Flag) ->
+           strLength f.short > 1 || strEq f.short "-" || strEq f.short "=")
+        sh.flags
+        then Just "a short name is one letter"
+      else if any
+        (\(f : Flag) ->
+           strEq f.long "help"
+           || strEq f.short "h"
+           || strEq f.long ""
+           || hasEq f.long)
+        sh.flags
+        then Just
+            "--help and -h are the library's; a long name is not empty, has no `=`"
+      else if any
+        (\(f : Flag) -> strEq f.meta "" && not (null f.values))
+        sh.flags
+        then Just "a switch takes no value"
+      else case lastOnly sh.pos of
+        Just m ->
+          Just (m ++ " takes more or less than one word, and is not the last")
+        Nothing -> case sh.pos of
+          p :: _ -> case p.arity of
+            'rest ->
+              if null sh.flags then Nothing
+              else Just (p.meta ++ " is every word, so no flag could be given")
+            _ -> Nothing
+          Nil -> Nothing
+
+-- Splitting the words
+--------------------------------------------------------------------------------
+
+byLong : Shape -> String -> Maybe Flag
+byLong sh x = find (\(f : Flag) -> strEq f.long x) sh.flags
+
+oneOf : List Flag -> Either (List String) Flag
+oneOf (f :: Nil) = Right f
+oneOf fs = Left (map (\(f : Flag) -> f.long) fs)
+
+-- | a long name as written: the flag it names, or the one it is the
+-- | start of (getopt_long's abbreviation); Left: the flags it could be
+-- | (none, or more than one)
+longNamed : Shape -> String -> Either (List String) Flag
+longNamed sh x = case byLong sh x of
+  Just f -> Right f
+  Nothing ->
+    oneOf (filter (\(f : Flag) -> startsWith (prefix := x) f.long) sh.flags)
+
+-- | ... if it names one
+longMaybe : Shape -> String -> Maybe Flag
+longMaybe sh x = case longNamed sh x of
+  Right f -> Just f
+  Left _ -> Nothing
+
+byShort : Shape -> String -> Maybe Flag
+byShort sh x =
+  if strEq x "" then Nothing else find (\(f : Flag) -> strEq f.short x) sh.flags
+
+-- | a word is a flag's: `--x...`, `-x...` -- not `-` alone (getopt's)
+flagLike : Shape -> String -> Bool
+flagLike sh w = strLength w >= 2 && charCode w 0 == 45
+
+-- (the edit distance of two names, for a suggestion: a row of the table
+-- at a time)
+costOf : String -> Int -> Int -> Int
+costOf a i c = if charCode a (i - 1) == c then 0 else 1
+
+cellOf : String -> Int -> Int -> Int -> Int -> Int -> Int
+cellOf a c up diag left i = min (min (up + 1) (left + 1)) (diag + costOf a i c)
+
+nextGo : String -> Int -> List Int -> Int -> Int -> Int -> List Int
+nextGo a c Nil diag left i = Nil
+nextGo a c (up :: ups) diag left i =
+  cellOf a c up diag left i
+  :: nextGo a c ups up (cellOf a c up diag left i) (i + 1)
+
+lastOr : Int -> List Int -> Int
+lastOr d Nil = d
+lastOr d (x :: Nil) = x
+lastOr d (x :: xs) = lastOr d xs
+
+tailOf : List Int -> List Int
+tailOf (_ :: xs) = xs
+tailOf Nil = Nil
+
+headInt : List Int -> Int
+headInt (x :: _) = x
+headInt Nil = 0
+
+rowFor : String -> String -> List Int -> Int -> List Int
+rowFor a b row j =
+  (j + 1) :: nextGo a (charCode b j) (tailOf row) (headInt row) (j + 1) 1
+
+distance : String -> String -> Int
+distance a b =
+  lastOr
+    0
+    (foldl
+       (\(row : List Int) (j : Int) -> rowFor a b row j)
+       (range 0 (strLength a + 1))
+       (range 0 (strLength b)))
+
+nearest : Shape -> String -> Maybe String
+nearest sh x =
+  foldl
+    (\(best : Maybe String) (f : Flag) ->
+       if distance f.long x <= 2 && strLength x <= 16
+         then (case best of
+               Just b ->
+                 if distance f.long x < distance b x then Just f.long else best
+               Nothing -> Just f.long)
+       else best)
+    Nothing
+    sh.flags
+
+-- | the words split: the positionals, and each flag given (its long
+-- | name, its value), in order
+type Split = { pos : List String, flags : List (Pair String String) }
+
+-- (where splitting is: the shape; `ra`, how many positionals come before
+-- the rest (-1: there is none), after which flags are not read; `on`,
+-- flags are read; the positionals and flags so far, newest first)
+type At =
+  { sh : Shape
+  , ra : Int
+  , on : Bool
+  , ps : List String
+  , fs : List (Pair String String)
+  }
+
+withPos : At -> String -> At
+withPos at w =
+  { sh = at.sh, ra = at.ra, on = at.on, ps = w :: at.ps, fs = at.fs }
+
+withFlag : At -> String -> String -> At
+withFlag at long v =
+  { sh = at.sh
+  , ra = at.ra
+  , on = at.on
+  , ps = at.ps
+  , fs = MkPair long v :: at.fs
+  }
+
+flagsOff : At -> At
+flagsOff at = { sh = at.sh, ra = at.ra, on = False, ps = at.ps, fs = at.fs }
+
+-- (a long name that names no flag, or more than one)
+unknownLong : Shape -> String -> List String -> Problem
+unknownLong sh x Nil = 'unknown ("--" ++ x) (nearest sh x)
+unknownLong sh x cands = 'ambiguous ("--" ++ x) cands
+
+-- (the three parts of splitting call one another through this record)
+type Splitter = { words : At -> List String -> Either Problem Split }
+
+-- (`--body`, the words after it `ws`)
+longF : Splitter -> At -> List String -> String -> Either Problem Split
+longF sp at ws body = case indexOf "=" body of
+  Just i -> case longNamed at.sh (strSlice body 0 i) of
+    Left cands -> Left (unknownLong at.sh (strSlice body 0 i) cands)
+    Right f ->
+      if strEq f.meta "" then Left ('switchValue ("--" ++ f.long))
+      else sp.words
+          (withFlag at f.long (strSlice body (i + 1) (strLength body)))
+          ws
+  Nothing -> case longNamed at.sh body of
+    Left cands -> Left (unknownLong at.sh body cands)
+    Right f ->
+      if strEq f.meta "" then sp.words (withFlag at f.long "") ws
+      else (case ws of
+            v :: ws2 -> sp.words (withFlag at f.long v) ws2
+            Nil -> Left ('noValue ("--" ++ f.long)))
+
+-- (`-cluster`: switches, the last of which may take a value -- the rest
+-- of the word, else the next)
+shortF : Splitter -> At -> List String -> String -> Either Problem Split
+shortF sp at ws cl =
+  if strEq cl "" then sp.words at ws
+  else case byShort at.sh (strSlice cl 0 1) of
+    Nothing -> Left ('unknown ("-" ++ strSlice cl 0 1) Nothing)
+    Just f ->
+      if strEq f.meta ""
+        then shortF sp (withFlag at f.long "") ws (strSlice cl 1 (strLength cl))
+      else if strLength cl > 1
+        then sp.words (withFlag at f.long (strSlice cl 1 (strLength cl))) ws
+      else (case ws of
+            v :: ws2 -> sp.words (withFlag at f.long v) ws2
+            Nil -> Left ('noValue ("-" ++ f.short)))
+
+wordsF : Splitter -> At -> List String -> Either Problem Split
+wordsF sp at Nil = Right { pos = reverse at.ps, flags = reverse at.fs }
+wordsF sp at (w :: ws) =
+  if not at.on || (at.ra >= 0 && length at.ps >= at.ra)
+    then wordsF sp (withPos (flagsOff at) w) ws
+  else if strEq w "--" then wordsF sp (flagsOff at) ws
+  else if strEq w "--help" || strEq w "-h" then Left 'help
+  else if startsWith (prefix := "--") w
+    then longF sp at ws (strSlice w 2 (strLength w))
+  else if flagLike at.sh w then shortF sp at ws (strSlice w 1 (strLength w))
+  else wordsF sp (withPos at w) ws
+
+splitter : Splitter
+splitter = { words = \at ws -> wordsF splitter at ws }
+
+restIndex : List Pos -> Int -> Int
+restIndex Nil i = 0 - 1
+restIndex (p :: ps) i = case p.arity of
+  'rest -> i
+  _ -> restIndex ps (i + 1)
+
+-- | the words, split by the shape
+splitWords : Shape -> List String -> Either Problem Split
+splitWords sh ws =
+  splitter.words
+    { sh = sh, ra = restIndex sh.pos 0, on = True, ps = Nil, fs = Nil }
+    ws
+
+-- Checking what was split, and taking it
+--------------------------------------------------------------------------------
+
+valuesOf : List (Pair String String) -> String -> List String
+valuesOf fs long =
+  map snd (filter (\(p : Pair String String) -> strEq (fst p) long) fs)
+
+flagProblem : List (Pair String String) -> Flag -> Maybe Problem
+flagProblem fs f =
+  if null (valuesOf fs f.long) && f.required
+    then Just
+        ('missingFlag
+           ("--" ++ f.long ++ (if strEq f.meta "" then "" else "=" ++ f.meta)))
+  else case find
+      (\v -> not (null f.values) && not (elemBy strEq v f.values))
+      (valuesOf fs f.long) of
+    Just v -> Just ('notIn ("--" ++ f.long) v f.values)
+    Nothing -> Nothing
+
+firstJust : {a b : Type} -> (a -> Maybe b) -> List a -> Maybe b
+firstJust g Nil = Nothing
+firstJust g (x :: xs) = case g x of
+  Just y -> Just y
+  Nothing -> firstJust g xs
+
+consGroup : List String
+          -> Either Problem (List (List String))
+          -> Either Problem (List (List String))
+consGroup g (Left p) = Left p
+consGroup g (Right gs) = Right (g :: gs)
+
+-- | the words each positional takes, in order
+groupsGo : List Pos -> List String -> Either Problem (List (List String))
+groupsGo Nil Nil = Right Nil
+groupsGo Nil (w :: _) = Left ('extra w)
+groupsGo (p :: ps) ws = case p.arity of
+  'one -> case ws of
+    w :: ws2 -> consGroup [w] (groupsGo ps ws2)
+    Nil -> Left ('missing p.meta)
+  'optional -> case ws of
+    w :: ws2 -> consGroup [w] (groupsGo ps ws2)
+    Nil -> consGroup Nil (groupsGo ps Nil)
+  'some ->
+    if null ws then Left ('missing (p.meta ++ "..."))
+    else consGroup ws (groupsGo ps Nil)
+  _ -> consGroup ws (groupsGo ps Nil)
+
+-- | the words read as the term says, or what is wrong with them
+parse : {a : Type} -> Term a -> List String -> Either Problem a
+parse t ws = case shapeProblem (shapeOf t) of
+  Just why -> Left ('badShape why)
+  Nothing -> case splitWords (shapeOf t) ws of
+    Left p -> Left p
+    Right sp -> case firstJust (flagProblem sp.flags) (shapeOf t).flags of
+      Just p -> Left p
+      Nothing -> case groupsGo (shapeOf t).pos sp.pos of
+        Left p -> Left p
+        Right gs ->
+          Right
+            ((readerOf t).take
+               gs
+               (map
+                  (\(f : Flag) -> MkPair f.long (valuesOf sp.flags f.long))
+                  (shapeOf t).flags))
+
+-- Completing
+--------------------------------------------------------------------------------
+
+-- | what the word being written completes to
+data Candidates = 'words (List String) | 'filesBy String | 'dirsOnly | 'nothing
+
+-- | where the words before the one being written leave the reading: flags
+-- | read or not, a flag waiting for its value, how many positionals
+type Where =
+  { on : Bool, waiting : Maybe Flag, count : Int, given : List String }
+
+shortWhere : Shape -> Where -> String -> Where
+shortWhere sh st cl =
+  if strEq cl "" then st
+  else case byShort sh (strSlice cl 0 1) of
+    Nothing -> st
+    Just f ->
+      if strEq f.meta ""
+        then shortWhere
+            sh
+            { on = st.on
+            , waiting = Nothing
+            , count = st.count
+            , given = f.long :: st.given
+            }
+            (strSlice cl 1 (strLength cl))
+      else { on = st.on
+           , waiting = if strLength cl > 1 then Nothing else Just f
+           , count = st.count
+           , given = f.long :: st.given
+           }
+
+whereGo : Shape -> Int -> Where -> List String -> Where
+whereGo sh ra st Nil = st
+whereGo sh ra st (w :: ws) = case st.waiting of
+  Just f ->
+    whereGo
+      sh
+      ra
+      { on = st.on, waiting = Nothing, count = st.count, given = st.given }
+      ws
+  Nothing ->
+    if not st.on || (ra >= 0 && st.count >= ra)
+      then whereGo
+          sh
+          ra
+          { on = False
+          , waiting = Nothing
+          , count = st.count + 1
+          , given = st.given
+          }
+          ws
+    else if strEq w "--"
+      then whereGo
+          sh
+          ra
+          { on = False, waiting = Nothing, count = st.count, given = st.given }
+          ws
+    else if startsWith (prefix := "--") w
+      then (case longMaybe sh (strSlice w 2 (strLength w)) of
+            Just f ->
+              whereGo
+                sh
+                ra
+                { on = True
+                , waiting = if strEq f.meta "" then Nothing else Just f
+                , count = st.count
+                , given = f.long :: st.given
+                }
+                ws
+            Nothing -> case indexOf "=" w of
+              Just i ->
+                whereGo
+                  sh
+                  ra
+                  { on = True
+                  , waiting = Nothing
+                  , count = st.count
+                  , given =
+                      (case longMaybe sh (strSlice w 2 i) of
+                       Just f -> f.long
+                       Nothing -> "")
+                      :: st.given
+                  }
+                  ws
+              Nothing -> whereGo sh ra st ws)
+    else if flagLike sh w
+      then whereGo sh ra (shortWhere sh st (strSlice w 1 (strLength w))) ws
+    else whereGo
+        sh
+        ra
+        { on = True, waiting = Nothing, count = st.count + 1, given = st.given }
+        ws
+
+byComplete : Complete -> String -> Candidates
+byComplete 'none cur = 'nothing
+byComplete ('files sfx) cur = 'filesBy sfx
+byComplete 'dirs cur = 'dirsOnly
+byComplete ('among ws) cur =
+  'words (filter (\w -> startsWith (prefix := cur) w) ws)
+
+posAt : List Pos -> Int -> Maybe Pos
+posAt Nil i = Nothing
+posAt (p :: ps) i = case p.arity of
+  'one -> if i == 0 then Just p else posAt ps (i - 1)
+  'optional -> if i == 0 then Just p else posAt ps (i - 1)
+  _ -> Just p
+
+ra0 : Shape -> Where -> Bool
+ra0 sh st = restIndex sh.pos 0 >= 0 && st.count >= restIndex sh.pos 0
+
+completeAt : Shape -> Where -> String -> Candidates
+completeAt sh st cur = case st.waiting of
+  Just f ->
+    if null f.values then byComplete f.complete cur
+    else 'words (filter (\w -> startsWith (prefix := cur) w) f.values)
+  Nothing ->
+    if st.on && not (ra0 sh st) && startsWith (prefix := "-") cur
+      then (case indexOf "=" cur of
+            Just i -> case longMaybe sh (strSlice cur 2 i) of
+              Just f ->
+                'words
+                  (filter
+                     (\w -> startsWith (prefix := cur) w)
+                     (map (\v -> strSlice cur 0 (i + 1) ++ v) f.values))
+              Nothing -> 'nothing
+            Nothing ->
+              'words
+                (filter
+                   (\w -> startsWith (prefix := cur) w)
+                   ("--help"
+                    :: map
+                      (\(f : Flag) -> "--" ++ f.long)
+                      (filter
+                         (\(f : Flag) ->
+                            f.repeated || not (elemBy strEq f.long st.given))
+                         sh.flags))))
+    else case posAt sh.pos st.count of
+      Just p -> byComplete p.complete cur
+      Nothing -> 'nothing
+
+-- | what `cur` completes to, after the words `before`
+complete : Shape -> List String -> String -> Candidates
+complete sh before cur =
+  completeAt
+    sh
+    (whereGo
+       sh
+       (restIndex sh.pos 0)
+       { on = True, waiting = Nothing, count = 0, given = Nil }
+       before)
+    cur
+
+-- Commands
+--------------------------------------------------------------------------------
+
+-- | a command: its name, what it does, whether the usage shows it, and
+-- | what it takes, read as an `r`
+type Command (r : Type) =
+  { name : String, doc : String, shown : Bool, args : Term r }
+
+command : {r : Type} -> String -> String -> Term r -> Command r
+command name doc t = { name = name, doc = doc, shown = True, args = t }
+
+-- | a command not in the usage, nor completed
+hidden : {r : Type} -> String -> Term r -> Command r
+hidden name t = { name = name, doc = "", shown = False, args = t }
+
+parseCommand : {r : Type} -> Command r -> List String -> Either Problem r
+parseCommand k ws = parse k.args ws
+
+shapeOfCommand : {r : Type} -> Command r -> Shape
+shapeOfCommand k = shapeOf k.args
+
+-- What is written
+--------------------------------------------------------------------------------
+
+posWord : Pos -> String
+posWord p = case p.arity of
+  'one -> p.meta
+  'optional -> "[" ++ p.meta ++ "]"
+  'many -> "[" ++ p.meta ++ "...]"
+  'some -> p.meta ++ "..."
+  'rest -> "[" ++ p.meta ++ "...]"
+
+flagWord : Flag -> String
+flagWord f =
+  if strEq f.meta "" then "[--" ++ f.long ++ "]"
+  else if f.required then "--" ++ f.long ++ "=" ++ f.meta
+  else "[--" ++ f.long ++ " " ++ f.meta ++ "]"
+
+-- | how a command is called: its positionals, then its flags
+synopsis : Shape -> String
+synopsis sh = unwords (concatList (map posWord sh.pos) (map flagWord sh.flags))
+
+-- | a command's name and how it is called
+headOf : {r : Type} -> Command r -> String
+headOf k =
+  if strEq (synopsis (shapeOfCommand k)) "" then k.name
+  else k.name ++ " " ++ synopsis (shapeOfCommand k)
+
+spaces : Int -> String
+spaces n = joinWith "" (replicate n " ")
+
+-- (a head and its doc: the doc at column 30, on a line of its own if
+-- the head reaches it)
+line2 : String -> String -> String
+line2 x doc =
+  if strLength x > 26 then "  " ++ x ++ "\n" ++ spaces 30 ++ doc
+  else "  " ++ x ++ spaces (28 - strLength x) ++ doc
+
+-- | the program's usage: its commands, and the library's
+usage : {r : Type} -> String -> List (Command r) -> String
+usage prog cs =
+  joinWith
+    "\n"
+    (concatList
+       ["usage: " ++ prog ++ " COMMAND ...", ""]
+       (concatList
+          (map
+             (\(k : Command r) -> line2 (headOf k) k.doc)
+             (filter (\(k : Command r) -> k.shown) cs))
+          [ line2 "help [COMMAND]" "this, or a command's flags"
+          , line2
+            "completions SHELL"
+            "a completion script for SHELL: fish, bash or zsh"
+          ]))
+  ++ "\n"
+
+flagLine : Flag -> String
+flagLine f =
+  line2
+    ((if strEq f.short "" then "    " else "-" ++ f.short ++ ", ")
+     ++ "--"
+     ++ f.long
+     ++ (if strEq f.meta "" then "" else "=" ++ f.meta))
+    (f.doc
+     ++ (if null f.values then "" else " (" ++ joinWith ", " f.values ++ ")"))
+
+-- | a command's help: how it is called, what it does, its flags
+helpOf : {r : Type} -> String -> Command r -> String
+helpOf prog k =
+  joinWith
+    "\n"
+    (concatList
+       ["usage: " ++ prog ++ " " ++ headOf k, "", k.doc]
+       (if null (shapeOfCommand k).flags then Nil
+        else "" :: "flags:" :: map flagLine (shapeOfCommand k).flags))
+  ++ "\n"
+
+orList : List String -> String
+orList Nil = ""
+orList (x :: Nil) = x
+orList (x :: y :: Nil) = x ++ " or " ++ y
+orList (x :: xs) = x ++ ", " ++ orList xs
+
+-- | what is wrong, said
+problemSaid : Problem -> String
+problemSaid ('unknown w (Just s)) = "no flag " ++ w ++ "; --" ++ s ++ "?"
+problemSaid ('unknown w Nothing) = "no flag " ++ w
+problemSaid ('ambiguous w cands) =
+  w ++ " is the start of " ++ orList (map (\c -> "--" ++ c) cands)
+problemSaid ('noValue w) = w ++ " takes a value"
+problemSaid ('switchValue w) = w ++ " takes no value"
+problemSaid ('missingFlag w) = w ++ " is wanted"
+problemSaid ('notIn w v vs) = w ++ " is " ++ orList vs ++ ", not " ++ v
+problemSaid ('missing m) = "expected " ++ m
+problemSaid ('extra w) = "too many words: " ++ w
+problemSaid 'help = "help"
+problemSaid ('badShape why) = "the command is described wrongly: " ++ why
+
+findCommand : {r : Type} -> List (Command r) -> String -> Maybe (Command r)
+findCommand cs w = find (\(k : Command r) -> strEq k.name w) cs
+
+shells : List String
+shells = ["fish", "bash", "zsh"]
+
+-- (a text made of each of the list's)
+concatS : {a : Type} -> (a -> String) -> List a -> String
+concatS f xs = joinWith "" (map f xs)
+
+-- Completing a command line
+--------------------------------------------------------------------------------
+-- The shells' scripts ask the program, `PROG complete WORD...` (the words
+-- after its name, the one being written last), and it answers a line a
+-- candidate -- the word, a tab, what it is -- or `:files SUFFIX` or
+-- `:dirs` for the shell to complete itself.
+
+candLine : String -> String -> String
+candLine w doc = if strEq doc "" then w else w ++ "\t" ++ doc
+
+startsW : String -> String -> Bool
+startsW cur w = startsWith (prefix := cur) w
+
+docOfWord : Shape -> String -> String
+docOfWord sh w =
+  if startsWith (prefix := "--") w
+    then (case byLong sh (strSlice w 2 (strLength w)) of
+          Just f -> f.doc
+          Nothing -> "")
+  else ""
+
+candidatesText : Shape -> Candidates -> String
+candidatesText sh ('words ws) =
+  concatS (\w -> candLine w (docOfWord sh w) ++ "\n") ws
+candidatesText sh ('filesBy sfx) = ":files " ++ sfx ++ "\n"
+candidatesText sh 'dirsOnly = ":dirs\n"
+candidatesText sh 'nothing = ""
+
+-- (the commands, and the library's, that start with `cur`)
+commandsText : {r : Type} -> List (Command r) -> String -> String
+commandsText cs cur =
+  concatS
+    (\(k : Command r) -> candLine k.name k.doc ++ "\n")
+    (filter (\(k : Command r) -> k.shown && startsW cur k.name) cs)
+  ++ concatS
+    (\(p : Pair String String) -> candLine (fst p) (snd p) ++ "\n")
+    (filter
+       (\(p : Pair String String) -> startsW cur (fst p))
+       [ MkPair "help" "this, or a command's flags"
+       , MkPair "completions" "a completion script for SHELL"
+       ])
+
+wordsText : List String -> String -> String
+wordsText ws cur = concatS (\w -> w ++ "\n") (filter (startsW cur) ws)
+
+-- (after the words `before`, what `cur` completes to)
+completeWords : {r : Type}
+              -> List (Command r)
+              -> List String
+              -> String
+              -> String
+completeWords cs Nil cur = commandsText cs cur
+completeWords cs ("help" :: Nil) cur =
+  wordsText
+    (map (\(k : Command r) -> k.name) (filter (\(k : Command r) -> k.shown) cs))
+    cur
+completeWords cs ("completions" :: Nil) cur = wordsText shells cur
+completeWords cs (w :: before) cur = case findCommand cs w of
+  Just k ->
+    candidatesText (shapeOfCommand k) (complete (shapeOfCommand k) before cur)
+  Nothing -> ""
+
+initOf : List String -> List String
+initOf Nil = Nil
+initOf (x :: Nil) = Nil
+initOf (x :: xs) = x :: initOf xs
+
+lastOf : List String -> String
+lastOf Nil = ""
+lastOf (x :: Nil) = x
+lastOf (x :: xs) = lastOf xs
+
+-- | the answer to `PROG complete WORD...`
+completeLine : {r : Type} -> List (Command r) -> List String -> String
+completeLine cs ws = completeWords cs (initOf ws) (lastOf ws)
+
+-- | fish's script: it asks `PROG complete` for the words before the
+-- | cursor and the one at it
+fishScript : String -> String
+fishScript prog =
+  unlines
+    [ "# " ++ prog ++ ": written by `" ++ prog ++ " completions fish`"
+    , "function __" ++ prog ++ "_complete"
+    , "    set -l words (commandline -opc) (commandline -ct)"
+    , "    set -e words[1]"
+    , "    set -l out (" ++ prog ++ " complete $words)"
+    , "    switch \"$out[1]\""
+    , "        case ':files *'"
+    , "            __fish_complete_suffix (string replace ':files ' '' -- $out[1])"
+    , "        case ':dirs'"
+    , "            __fish_complete_directories (commandline -ct)"
+    , "        case '*'"
+    , "            printf '%s\\n' $out"
+    , "    end"
+    , "end"
+    , "complete -c " ++ prog ++ " -e"
+    , "complete -c " ++ prog ++ " -f -a '(__" ++ prog ++ "_complete)'"
+    ]
+
+-- | bash's script (bash 3.2 and on): the words are the line up to the
+-- | cursor, split at blanks; bash splits a word at `=` too, so what
+-- | follows a `=` is what replaces the word being written
+bashScript : String -> String
+bashScript prog =
+  unlines
+    [ "# " ++ prog ++ ": written by `" ++ prog ++ " completions bash`"
+    , "_" ++ prog ++ "() {"
+    , "  local line=${COMP_LINE:0:COMP_POINT} cur=${COMP_WORDS[COMP_CWORD]} w last"
+    , "  local -a words out"
+    , "  read -ra words <<< \"$line\""
+    , "  [[ $line == *' ' || ${#words[@]} -eq 1 ]] && words+=('')"
+    , "  last=${words[${#words[@]}-1]}"
+    , "  while IFS= read -r w; do out+=(\"$w\"); done < <("
+    ++ prog
+    ++ " complete \"${words[@]:1}\")"
+    , "  COMPREPLY=()"
+    , "  case \"${out[0]}\" in"
+    , "    ':files '*) COMPREPLY=($(compgen -d -- \"$cur\") $(compgen -f -X \"!*${out[0]#:files }\" -- \"$cur\")) ;;"
+    , "    ':dirs') COMPREPLY=($(compgen -d -- \"$cur\")) ;;"
+    , "    *)"
+    , "      for w in \"${out[@]}\"; do"
+    , "        w=${w%%$'\\t'*}"
+    , "        if [[ $last == *=* ]]; then w=${w#*=}; [[ $cur == = ]] && w=\"=$w\"; fi"
+    , "        COMPREPLY+=(\"$w\")"
+    , "      done ;;"
+    , "  esac"
+    , "}"
+    , "complete -o filenames -F _" ++ prog ++ " " ++ prog
+    ]
+
+-- | zsh's script
+zshScript : String -> String
+zshScript prog =
+  unlines
+    [ "#compdef " ++ prog
+    , "# " ++ prog ++ ": written by `" ++ prog ++ " completions zsh`"
+    , "_" ++ prog ++ "() {"
+    , "  local -a out cands"
+    , "  local l"
+    , "  out=(\"${(@f)$(" ++ prog ++ " complete \"${(@)words[2,CURRENT]}\")}\")"
+    , "  case $out[1] in"
+    , "    ':files '*) _files -g \"*${out[1]#:files }\" ;;"
+    , "    ':dirs') _files -/ ;;"
+    , "    *)"
+    , "      for l in $out; do"
+    , "        [[ -z $l ]] && continue"
+    , "        if [[ $l == *$'\\t'* ]]; then"
+    , "          cands+=(\"${${l%%$'\\t'*}//:/\\\\:}:${l#*$'\\t'}\")"
+    , "        else"
+    , "          cands+=(\"${l//:/\\\\:}\")"
+    , "        fi"
+    , "      done"
+    , "      _describe " ++ prog ++ " cands ;;"
+    , "  esac"
+    , "}"
+    , "if [ \"$funcstack[1]\" = _"
+    ++ prog
+    ++ " ]; then _"
+    ++ prog
+    ++ " \"$@\"; else compdef _"
+    ++ prog
+    ++ " "
+    ++ prog
+    ++ "; fi"
+    ]
+
+-- The command line
+--------------------------------------------------------------------------------
+
+-- | what the program is to do: run what the words were read as, or
+-- | write a text on its output (and end well), or on its error stream
+-- | (and end badly)
+data Outcome (r : Type) = 'run r | 'out String | 'fail String
+
+-- (a command's words read)
+outcomeOf : {r : Type} -> String -> Command r -> List String -> Outcome r
+outcomeOf prog k ws = case parseCommand k ws of
+  Right x -> 'run x
+  Left 'help -> 'out (helpOf prog k)
+  Left p ->
+    'fail
+      (prog
+       ++ " "
+       ++ k.name
+       ++ ": "
+       ++ problemSaid p
+       ++ "\nusage: "
+       ++ prog
+       ++ " "
+       ++ headOf k
+       ++ "\n")
+
+-- | the words given the program `prog` (not its own name), read by its
+-- | commands; `help [COMMAND]`, `completions SHELL` and `complete WORD...`
+-- | (what the scripts ask) are the library's
+readLine : {r : Type} -> String -> List (Command r) -> List String -> Outcome r
+readLine prog cs Nil = 'out (usage prog cs)
+readLine prog cs ("help" :: Nil) = 'out (usage prog cs)
+readLine prog cs ("--help" :: Nil) = 'out (usage prog cs)
+readLine prog cs ("-h" :: Nil) = 'out (usage prog cs)
+readLine prog cs ("help" :: w :: Nil) = case findCommand cs w of
+  Just k -> 'out (helpOf prog k)
+  Nothing -> 'fail (prog ++ ": no command " ++ w ++ "\n" ++ usage prog cs)
+readLine prog cs ("completions" :: sh :: Nil) =
+  if strEq sh "fish" then 'out (fishScript prog)
+  else if strEq sh "bash" then 'out (bashScript prog)
+  else if strEq sh "zsh" then 'out (zshScript prog)
+  else 'fail
+      (prog
+       ++ " completions: a shell is "
+       ++ orList shells
+       ++ ", not "
+       ++ sh
+       ++ "\n")
+readLine prog cs ("complete" :: ws) = 'out (completeLine cs ws)
+readLine prog cs (w :: ws) = case findCommand cs w of
+  Just k -> outcomeOf prog k ws
+  Nothing -> 'fail (prog ++ ": no command " ++ w ++ "\n" ++ usage prog cs)
+
+-- Examples
+--------------------------------------------------------------------------------
+
+-- (what `heff compile` takes, read as one line)
+compileArgs : Term String
+compileArgs = \s ->
+    with4
+      s
+      (\f o n b -> f ++ " " ++ o ++ " " ++ fromMaybe "-" n ++ " " ++ b)
+      (arg s "FILE" ('files ".hf"))
+      (arg s "OUT" 'none)
+      (option s "name" "n" "NAME" "the computation run")
+      (choose s "backend" "b" "MODE" "how it runs" ["esm", "page", "node"])
+
+-- >>> parse compileArgs ["a.hf", "a.mjs", "--backend=node"]
+-- Right "a.hf a.mjs - node"
+
+-- >>> parse compileArgs ["--back", "page", "a.hf", "-nmain", "a.mjs"]
+-- Right "a.hf a.mjs main page"
+
+-- >>> parse compileArgs ["a.hf", "a.mjs", "-b", "esm", "--backend=node"]
+-- Right "a.hf a.mjs - node"
+
+-- >>> parse compileArgs ["--backend=esm", "--", "-a.hf", "a.mjs"]
+-- Right "-a.hf a.mjs - esm"
+
+-- >>> parse compileArgs ["a.hf", "a.mjs"]
+-- Left ('missingFlag "--backend=MODE")
+
+-- >>> parse compileArgs ["a.hf", "a.mjs", "--backend=wasm"]
+-- Left ('notIn "--backend" "wasm" ["esm", "page", "node"])
+
+-- >>> parse compileArgs ["a.hf", "a.mjs", "--bakend=node"]
+-- Left ('unknown "--bakend" (Just "backend"))
+
+-- >>> parse compileArgs ["a.hf", "--name", "--help", "a.mjs", "-b", "esm"]
+-- Right "a.hf a.mjs --help esm"
+
+-- >>> parse compileArgs ["a.hf", "-h"]
+-- Left 'help
+
+-- >>> parse compileArgs ["a.hf", "a.mjs", "b.mjs", "-b", "esm"]
+-- Left ('extra "b.mjs")
+
+-- >>> synopsis (shapeOf compileArgs)
+-- "FILE OUT [--name NAME] --backend=MODE"
+
+-- (switches side by side, and names that start alike)
+listArgs : Term String
+listArgs = \s ->
+    with3
+      s
+      (\a b l ->
+         (if a then "all " else "")
+         ++ (if b then "almost " else "")
+         ++ fromMaybe "-" l)
+      (switch s "all" "a" "")
+      (switch s "almost" "A" "")
+      (option s "level" "l" "N" "")
+
+-- >>> parse listArgs ["-aAl3"]
+-- Right "all almost 3"
+
+-- >>> parse listArgs ["--al"]
+-- Left ('ambiguous "--al" ["all", "almost"])
+
+-- >>> parse listArgs ["--all=1"]
+-- Left ('switchValue "--all")
+
+-- >>> parse listArgs ["-l"]
+-- Left ('noValue "-l")
+
+-- (a rest: its words as written, flags or not)
+runArgs : Term String
+runArgs = \s ->
+    with2
+      s
+      (\f as -> f ++ " " ++ joinWith "," as)
+      (arg s "FILE" 'none)
+      (rest s "ARGS")
+
+-- >>> parse runArgs ["main.hf", "--verbose", "--", "-h"]
+-- Right "main.hf --verbose,--,-h"
+
+-- >>> shapeProblem { flags = (shapeOf listArgs).flags, pos = (shapeOf runArgs).pos }
+-- Nothing
+
+-- >>> shapeProblem { flags = (shapeOf listArgs).flags, pos = [{ meta = "ARGS", arity = 'rest, complete = 'none }] }
+-- Just "ARGS is every word, so no flag could be given"
+
+-- >>> complete (shapeOf compileArgs) ["a.hf", "a.mjs", "--backend"] ""
+-- 'words ["esm", "page", "node"]
+
+-- >>> complete (shapeOf compileArgs) ["a.hf", "-b"] "p"
+-- 'words ["page"]
+
+-- >>> complete (shapeOf compileArgs) ["a.hf", "--name", "x"] "--"
+-- 'words ["--help", "--backend"]
+
+-- >>> complete (shapeOf compileArgs) Nil ""
+-- 'filesBy ".hf"
+
+-- >>> complete (shapeOf compileArgs) ["a.hf"] "--backend=n"
+-- 'words ["--backend=node"]
+
+commandsEx : List (Command String)
+commandsEx =
+  [ command "compile" "FILE as JavaScript" compileArgs
+  , command "run" "run FILE with ARGS" runArgs
+  , hidden "list" listArgs
+  ]
+
+-- >>> readLine "heff" commandsEx ["compile", "a.hf", "a.mjs", "-bnode"]
+-- 'run "a.hf a.mjs - node"
+
+-- >>> readLine "heff" commandsEx ["compile", "a.hf", "-b", "esm"]
+-- 'fail "heff compile: expected OUT\nusage: heff compile FILE OUT [--name NAME] --backend=MODE\n"
+
+-- >>> completeLine commandsEx ["c"]
+-- "compile\tFILE as JavaScript\ncompletions\ta completion script for SHELL\n"
+
+-- >>> completeLine commandsEx ["compile", "a.hf", "--"]
+-- "--help\n--name\tthe computation run\n--backend\thow it runs\n"
+
+-- >>> completeLine commandsEx ["help", ""]
+-- "compile\nrun\n"

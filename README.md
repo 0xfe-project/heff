@@ -46,8 +46,12 @@ heff init [DIR]                # a new project
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
 heff lsp                       # the language server, on stdio
+heff help [COMMAND]            # the commands, or a command's flags
 heff completions SHELL         # fish, bash or zsh completions
 ```
+
+Flags go anywhere among the words, as getopt_long reads them (`-b node`,
+`--back=node`, `--`); `lib/cli.hf` reads them, for any heff program.
 
 ## Modules
 
