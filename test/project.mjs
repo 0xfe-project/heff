@@ -57,6 +57,33 @@ const reach = heff("check", "hello/src/hello/reach.hf");
 expect("src/ does not import what is outside it", reach.status === 1 &&
   reach.stderr.includes("no module test.helper (looked for hello/src/test/helper.hf, "), reach);
 
+// a module whose import is written in another case than its file (or a
+// directory on its path) is named: an error where the file system finds
+// it all the same; two names that differ only in case, where it does not
+write("hello/src/hello/Shout.hf", "import prelude\n\nup : String\nup = \"HI\"\n");
+write("hello/src/hello/useshout.hf", "import hello.shout\nimport prelude\n\nu : String\nu = up\n");
+const caseBlind = existsSync(join(work, "hello/src/hello/shout.hf"));
+const shout = heff("check", "hello/src/hello/useshout.hf");
+expect("a module found by a case-different name", shout.status === 1 && (caseBlind
+  ? shout.stderr.includes("importing hello.shout: hello/src/hello/shout.hf is named Shout.hf on the disk: a file system that tells case apart finds no shout.hf")
+  : shout.stderr.includes("no module hello.shout")), shout);
+write("hello/src/hello/useshout.hf", "import Hello.Shout\nimport prelude\n\nu : String\nu = up\n");
+const shoutDir = heff("check", "hello/src/hello/useshout.hf");
+expect("a directory found by a case-different name", shoutDir.status === 1 && (caseBlind
+  ? shoutDir.stderr.includes("hello/src/Hello is named hello on the disk")
+  : shoutDir.stderr.includes("no module Hello.Shout")), shoutDir);
+write("hello/src/hello/useshout.hf", "import hello.Shout\nimport prelude\n\nu : String\nu = up\n");
+const shoutOk = heff("check", "hello/src/hello/useshout.hf");
+expect("a module named as on the disk", shoutOk.status === 0 && shoutOk.stdout.includes("u : String"), shoutOk);
+if (!caseBlind) {
+  write("hello/src/hello/shout.hf", "x : Int\nx = 1\n");
+  const twoCases = heff("check", "hello/src/hello/useshout.hf");
+  expect("two names that differ only in case", twoCases.status === 1 &&
+    twoCases.stderr.includes("hello/src/hello holds Shout.hf, shout.hf: names that differ only in case"), twoCases);
+  rmSync(join(work, "hello/src/hello/shout.hf"));
+}
+rmSync(join(work, "hello/src/hello/Shout.hf")); rmSync(join(work, "hello/src/hello/useshout.hf"));
+
 // a module of the project with a library module's name
 write("hello/src/prelude.hf", "x : Int\nx = 1\n");
 const clash = heff("check", "hello/src/hello/words.hf");

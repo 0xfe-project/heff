@@ -107,10 +107,12 @@ rootFrom h start d = do
 pathsFor : {e : HFunctor} -> {{ev : fs <: e}} -> Host -> String -> Co e Paths
 pathsFor h file = rootFrom h (P.dirname h.style file) (P.dirname h.style file)
 
--- | where a module's file is, with `/`s (`under` reads them in any
--- | style): `foo.bar` is `foo/bar.hf`
-importPath : String -> String
-importPath m = joinWith "/" (split "." m) ++ ".hf"
+-- | the parts of the path of a module's file, under where it is looked
+-- | for: `foo.bar` is `foo`, `bar.hf`
+importParts : String -> List String
+importParts m = case reverse (split "." m) of
+  Cons last before -> reverse (Cons (last ++ ".hf") before)
+  Nil -> Nil
 
 -- | what is wrong with a package.hf, where it is
 problemMsg : String -> String -> Pr.Problem -> String
@@ -224,7 +226,8 @@ ownDir ps src = do
 -- | of the cache, and beside it `<dir>.hash`, the tree its tag is of
 -- | (written last: without it, the version is not fetched)
 cachedDir : Paths -> String -> String -> String
-cachedDir ps path v = under ps ps.mod (path ++ "@" ++ v)
+cachedDir ps path v =
+  under ps ps.mod (P.fromSlashes ps.style (path ++ "@" ++ v))
 
 -- | the package.hf at `dir`, read, required by `by` as the package at
 -- | `path`
@@ -547,14 +550,17 @@ packagesOf ps (Just root) = do
 -- Modules
 --------------------------------------------------------------------------------
 
--- | where a module may be, and the module it is there
-type Place = { path : String, module : String }
+-- | where a module may be, and the module it is there: `path`, the
+-- | file at `parts` under the directory `base`
+type Place =
+  { path : String, base : String, parts : List String, module : String }
 
-place : String -> String -> Place
-place path m = { path = path, module = m }
+place : Paths -> String -> List String -> String -> Place
+place ps base parts m =
+  { path = foldl (under ps) base parts, base = base, parts = parts, module = m }
 
--- | a module's file, read, and the module it is
-type Found = { path : String, source : String, module : String }
+-- | a module's file, read, where it was looked for, and the module it is
+type Found = { path : String, source : String, place : Place, module : String }
 
 -- (the package a file is in: the dependency whose directory holds it,
 -- else the project's)
@@ -575,8 +581,7 @@ requiredPlace ps pkgs k h rest = case filter
     (\(x : Pair String String) -> strEq (fst x) h)
     k.scope of
   Cons (MkPair n p) _ -> case pkgByPath pkgs p of
-    Just q ->
-      [place (under ps q.src (importPath (q.own ++ rest))) (q.top ++ rest)]
+    Just q -> [place ps q.src (importParts (q.own ++ rest)) (q.top ++ rest)]
     Nothing -> Nil
   Nil -> Nil
 
@@ -588,25 +593,22 @@ requiredPlace ps pkgs k h rest = case filter
 placesOf : Paths -> List Pkg -> String -> String -> List Place
 placesOf ps pkgs from w =
   if inside ps ps.lib from && not (strEq ps.lib ".")
-    then [place (under ps ps.lib (importPath w)) w]
+    then [place ps ps.lib (importParts w) w]
   else case pkgs of
     Nil -> Nil
     Cons project deps ->
       (\(k : Pkg) ->
          concatList
-           (if strEq k.own "" then [place (under ps k.src (importPath w)) w]
+           (if strEq k.own "" then [place ps k.src (importParts w) w]
             else if strEq (fst (headOf w)) k.own
-              then [ place
-                     (under ps k.src (importPath w))
-                     (k.top ++ snd (headOf w))
-                   ]
+              then [place ps k.src (importParts w) (k.top ++ snd (headOf w))]
             else Nil)
            (concatList
               (requiredPlace ps pkgs k (fst (headOf w)) (snd (headOf w)))
               (concatList
-                 [place (under ps ps.lib (importPath w)) w]
+                 [place ps ps.lib (importParts w) w]
                  (if strEq k.own "" && not (inside ps k.src from)
-                    then [place (under ps k.dir (importPath w)) w]
+                    then [place ps k.dir (importParts w) w]
                   else Nil))))
         (pkgOfGo ps deps project from)
 
@@ -620,8 +622,73 @@ readEvery read (Cons pl rest) = do
   a <- read pl.path
   more <- readEvery read rest
   val (case a of
-    Just s -> Cons { path = pl.path, source = s, module = pl.module } more
+    Just s ->
+      Cons { path = pl.path, source = s, place = pl, module = pl.module } more
     Nothing -> more)
+
+-- Names, as written and on the disk
+--------------------------------------------------------------------------------
+-- A file system that does not tell `Foo.hf` from `foo.hf` (macOS's,
+-- Windows') finds a module whose import is written in another case
+-- than its file is named; one that does (Linux's) does not.  Each part
+-- of the path a module is found at, under the directory it is looked
+-- for in, must be named on the disk as it is written -- and no other
+-- name beside it may differ from it only in case.
+
+-- | two names, the same but for the case of their (ASCII) letters
+sameButCase : String -> String -> Bool
+sameButCase a b = strEq (P.lower a) (P.lower b)
+
+-- (what is wrong with the name `x`, in `d`, the names there the same
+-- but for case `ns`)
+casesIn : Paths -> String -> String -> List String -> Maybe String
+casesIn ps d x Nil = Nothing
+casesIn ps d x [n] =
+  if strEq n x then Nothing
+  else Just
+      (under ps d x
+       ++ " is named "
+       ++ n
+       ++ " on the disk: a file system that tells case apart finds no "
+       ++ x)
+casesIn ps d x ns =
+  Just
+    (d
+     ++ " holds "
+     ++ joinWith ", " ns
+     ++ ": names that differ only in case are one file where case is not told apart")
+
+-- | what is wrong with the name `x`, written so, in directory `d`, which
+-- | holds `names`
+nameIn : Paths -> String -> List String -> String -> Maybe String
+nameIn ps d names x = casesIn ps d x (filter (\n -> sameButCase n x) names)
+
+-- | what is wrong with the names of the parts `parts` of a path under
+-- | `d`, if anything
+partsNamed : {e : HFunctor}
+           -> {{ev : fs <: e}}
+           -> Paths
+           -> String
+           -> List String
+           -> Co e (Maybe String)
+partsNamed ps d Nil = val Nothing
+partsNamed ps d (Cons x rest) = do
+  names <- readDir d
+  case names of
+    Nothing -> val Nothing
+    Just ns -> case nameIn ps d ns x of
+      Just why -> val (Just why)
+      Nothing -> partsNamed ps (under ps d x) rest
+
+-- | what is wrong with the names on the disk of the file a module was
+-- | found at, if anything (a file not on the disk, an editor's unsaved
+-- | text, has none)
+namedAsWritten : {e : HFunctor}
+               -> {{ev : fs <: e}}
+               -> Paths
+               -> Found
+               -> Co e (Maybe String)
+namedAsWritten ps f = partsNamed ps f.place.base f.place.parts
 
 type LoadSt =
   { done : List Dr.Source, doneMods : List String, errors : List String }
@@ -688,6 +755,7 @@ renaming w m rs = if strEq w m then rs else Cons (MkPair w m) rs
 -- | each file read by `read`; and the imports of `from` that mean
 -- | another module than they say (`rs`, so far)
 loadMany : {e : HFunctor}
+         -> {{ev : fs <: e}}
          -> (String -> Co e (Maybe String))
          -> Paths
          -> List Pkg
@@ -725,6 +793,7 @@ loadMany read ps pkgs stack from (Cons w rest) st rs = do
             (addErr st (cycleMsg from f.module stack))
             (renaming w f.module rs)
       else do
+        named <- namedAsWritten ps f
         inner <-
           loadMany
             read
@@ -733,7 +802,10 @@ loadMany read ps pkgs stack from (Cons w rest) st rs = do
             (Cons f.module stack)
             f.path
             (Dr.importNames (I.importsOf f.module f.source).imports)
-            (if null others then st else addErr st (clashMsg found from w))
+            (case named of
+             Just why -> addErr st (from ++ ": importing " ++ w ++ ": " ++ why)
+             Nothing ->
+               if null others then st else addErr st (clashMsg found from w))
             Nil
         loadMany
             read
