@@ -9,6 +9,7 @@ import prelude
 import array as A
 import map as M
 import doc
+import heff.fixity as F
 import heff.fmt.lex as L
 import heff.fmt.imports as I
 import heff.fmt.toks as Tk
@@ -104,6 +105,7 @@ noComments env noLead noTrail =
   , trail = env.trail
   , noLead = noLead
   , noTrail = noTrail
+  , fix = env.fix
   }
 
 leadDocs : List Tk.Cmt -> Int -> Doc
@@ -223,51 +225,47 @@ pP env (PParen o p c) = tok env o <> pP env p <> tok env c
 pP env (PList o ps commas c) =
   tok env o <> pListGo env (\p2 -> pP env p2) ps commas True <> tok env c
 
--- | how tightly the standard library's operators bind, for layout alone
--- | (how they bind is the parser's business): a chain of several
--- | tightnesses breaks at its loosest operators, each tighter run kept
--- | whole while it fits.  An operator not here lays the chain out flat.
-layoutPrec : String -> Maybe Int
-layoutPrec s =
-  if strEq s "$" then Just 0
-  else if strEq s "||" then Just 10
-  else if strEq s "<>" then Just 10
-  else if strEq s "&&" then Just 20
-  else if strEq s "<+>" then Just 20
-  else if strEq s "::" then Just 35
-  else if elemBy
-    strEq
-    s
-    ["==", "/=", "<", "<=", ">", ">=", "==.", "<.", "<=.", ">.", ">=."]
-    then Just 30
-  else if elemBy strEq s ["+", "-", "++", "+.", "-."] then Just 40
-  else if elemBy strEq s ["*", "/", "%", "*.", "/."] then Just 50
-  else Nothing
+-- A chain of several tightnesses breaks at its loosest operators, each
+-- tighter run kept whole while it fits -- as the fixities in scope say,
+-- for layout alone (how they bind is the parser's business).  An
+-- operator not declared, or two unrelated, lay the chain out flat.
 
-consPrec : Maybe Int -> Maybe (List Int) -> Maybe (List Int)
-consPrec Nothing _ = Nothing
-consPrec (Just p) Nothing = Nothing
-consPrec (Just p) (Just ps) = Just (p :: ps)
+consOp : String -> Maybe (List String) -> Maybe (List String)
+consOp o (Just ops) = Just (o :: ops)
+consOp o Nothing = Nothing
 
--- | each operator's tightness, if every one is known
-opPrecs : List C.E -> Maybe (List Int)
-opPrecs Nil = Just Nil
-opPrecs (r :: rs) = case r of
-  OpRhs op e -> consPrec (layoutPrec op.text) (opPrecs rs)
+-- | the operators of a chain, if every one is declared
+opsOf : F.Fixities -> List C.E -> Maybe (List String)
+opsOf f Nil = Just Nil
+opsOf f (r :: rs) = case r of
+  OpRhs op e -> case F.groupOf f op.text of
+    Just _ -> consOp op.text (opsOf f rs)
+    Nothing -> Nothing
   _ -> Nothing
 
-minList : Int -> List Int -> Int
-minList m Nil = m
-minList m (p :: ps) = minList (if p < m then p else m) ps
+loosestGo : F.Fixities -> String -> List String -> Maybe String
+loosestGo f m Nil = Just m
+loosestGo f m (o :: os) = case F.relate f m o of
+  Tighter -> loosestGo f o os
+  Looser -> loosestGo f m os
+  Same _ -> loosestGo f m os
+  _ -> Nothing
 
-allEq : Int -> List Int -> Bool
-allEq m Nil = True
-allEq m (p :: ps) = p == m && allEq m ps
+-- | the loosest operator of a chain, if each is declared and all related
+loosest : F.Fixities -> List C.E -> Maybe String
+loosest f rest = case opsOf f rest of
+  Just (o :: os) -> loosestGo f o os
+  _ -> Nothing
 
-precEq : Int -> String -> Bool
-precEq m s = case layoutPrec s of
-  Just p -> p == m
-  Nothing -> False
+sameAs : F.Fixities -> String -> String -> Bool
+sameAs f m s = case F.relate f m s of
+  Same _ -> True
+  _ -> False
+
+isSameIn : F.Fixities -> String -> C.E -> Bool
+isSameIn f m r = case r of
+  OpRhs op e -> sameAs f m op.text
+  _ -> False
 
 theory Lay where
   pE : Tk.Env -> C.E -> Doc
@@ -280,7 +278,7 @@ theory Lay where
   opRhsDoc : Tk.Env -> List C.E -> C.E -> Doc
   opsRhsDoc : Tk.Env -> C.E -> Doc
   opsChainDoc : Tk.Env -> C.E -> List C.E -> Doc
-  opsCut : Tk.Env -> Int -> C.E -> List C.E -> List C.E -> Doc
+  opsCut : Tk.Env -> String -> C.E -> List C.E -> List C.E -> Doc
   altDoc : Tk.Env -> C.E -> Doc
   stmtDoc : Tk.Env -> C.E -> Doc
   rhsField : Tk.Env -> C.E -> Doc
@@ -444,27 +442,24 @@ lay =
       OpRhs op e -> tok env op <+> lay.pE env e
       _ -> lay.pE env r
   -- (a chain of declared operators: flat when one tightness, or one not
-  -- known; else cut at the loosest, each piece a chain again)
-  , opsChainDoc = \env first rest -> case opPrecs rest of
+  -- declared; else cut at the loosest, each piece a chain again)
+  , opsChainDoc = \env first rest -> case loosest env.fix rest of
+      Just m ->
+        if all (isSameIn env.fix m) rest
+          then group
+              (lay.pE env first
+               <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
+        else group (lay.opsCut env m first Nil rest)
       Nothing ->
         group
           (lay.pE env first
            <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
-      Just ps ->
-        (case ps of
-         Nil -> group (lay.pE env first)
-         p :: more ->
-           if allEq p more
-             then group
-                 (lay.pE env first
-                  <> foldDocs (map (\r -> line <> lay.opsRhsDoc env r) rest))
-           else group (lay.opsCut env (minList p more) first Nil rest))
   , opsCut = \env m f acc rs -> case rs of
       Nil -> lay.opsChainDoc env f (reverse acc)
       r :: rest2 ->
         (case r of
          OpRhs op e ->
-           if precEq m op.text
+           if sameAs env.fix m op.text
              then lay.opsChainDoc env f (reverse acc)
                <> line
                <> tok env op <+> lay.opsCut env m e Nil rest2
@@ -599,21 +594,42 @@ fmtParsed : Tk.Attached -> Either String (List C.D) -> Either String String
 fmtParsed at (Left e) = Left e
 fmtParsed at (Right ds) = Right (render2 (topLevel at.env ds (eofOf at.toks)))
 
+withFix : F.Fixities -> Tk.Attached -> Tk.Attached
+withFix f at =
+  { toks = at.toks
+  , env =
+      { src = at.env.src
+      , lead = at.env.lead
+      , inline = at.env.inline
+      , trail = at.env.trail
+      , noLead = at.env.noLead
+      , noTrail = at.env.noTrail
+      , fix = f
+      }
+  }
+
 fmtAttached : Tk.Attached -> Either String String
 fmtAttached at = fmtParsed at (C.parseToks at.toks)
 
-fmtLexed : String -> I.Header -> L.Lexed -> Either String String
-fmtLexed src hdr l =
+fmtLexed : F.Fixities -> String -> I.Header -> L.Lexed -> Either String String
+fmtLexed f src hdr l =
   if not (null l.errors) then Left "the file does not lex"
   else fmtAttached
-      (Tk.attach src (I.withImports hdr.imports l.tokens) l.comments)
+      (withFix
+         f
+         (Tk.attach src (I.withImports hdr.imports l.tokens) l.comments))
 
-fmtHeader : String -> I.Header -> Either String String
-fmtHeader src hdr = fmtLexed src hdr (L.lex hdr.text)
+fmtHeader : F.Fixities -> String -> I.Header -> Either String String
+fmtHeader f src hdr = fmtLexed f src hdr (L.lex hdr.text)
 
--- | A file laid out anew, what it means not checked (the caller checks).
+-- | A file laid out anew, a chain of operators cut as the fixities in
+-- | scope say; what it means not checked (the caller checks).
+formatUncheckedIn : F.Fixities -> String -> Either String String
+formatUncheckedIn f src = fmtHeader f src (I.readImports src)
+
+-- | (with no fixities known: every chain of operators laid out flat)
 formatUnchecked : String -> Either String String
-formatUnchecked src = fmtHeader src (I.readImports src)
+formatUnchecked src = formatUncheckedIn F.emptyFixities src
 
 test laying
 

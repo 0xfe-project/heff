@@ -46,6 +46,28 @@ expect("fmt", laid.status === 0 && readFileSync(join(work, "messy.hf"), "utf8") 
 const refused = heff("fmt", "broken.hf");
 expect("fmt of what does not parse", refused.status === 1 && refused.stderr.includes("broken.hf not formatted: the file does not parse") &&
   readFileSync(join(work, "broken.hf"), "utf8") === "f : Int ->\n", refused);
+// fmt: a chain of operators breaks at its loosest, as the fixities of what
+// the file imports say
+writeFileSync(join(work, "ops.hf"), [
+  "import prelude", "",
+  "infixl <+", "infixl <* above <+", "",
+  "(<+) : Int -> Int -> Int", "(<+) a b = a + b", "",
+  "(<*) : Int -> Int -> Int", "(<*) a b = a * b", "",
+].join("\n"));
+writeFileSync(join(work, "uses.hf"), [
+  "import ops", "",
+  "long : Int",
+  "long = aaaaaaaaaaaaaaaaaaaa <+ bbbbbbbbbbbbbbbbbbbbbbbbb <* cccccccccccccccccccccc <+ dddddddddddddddd", "",
+].join("\n"));
+const cut = heff("fmt", "uses.hf");
+expect("fmt by imported fixities", cut.status === 0 && readFileSync(join(work, "uses.hf"), "utf8") === [
+  "import ops", "",
+  "long : Int",
+  "long =",
+  "  aaaaaaaaaaaaaaaaaaaa",
+  "  <+ bbbbbbbbbbbbbbbbbbbbbbbbb <* cccccccccccccccccccccc",
+  "  <+ dddddddddddddddd", "",
+].join("\n"), { cut, text: readFileSync(join(work, "uses.hf"), "utf8") });
 
 // the usage: asked for, on stdout; for what is no command (or a command
 // without its files), on stderr, failing
