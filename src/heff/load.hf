@@ -6,7 +6,9 @@
 -- an example), under the root too, so such files share helpers --
 -- what is in `src/` never imports them.  A module found in two of these
 -- places is an error.  Without a package.hf above it, a file's
--- directory is its root, and holds its modules.
+-- directory is its root, and holds its modules.  The packages a project
+-- requires are in the cache `heff get` fetches them to (or the
+-- directories it replaces them with), each the version selected.
 
 import co
 import heff.diagnostic as Dg
@@ -20,17 +22,19 @@ import prelude
 dropHf : String -> String
 dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
 
--- | where the standard library is, and the style of the paths of the
--- | platform heff runs on
-type Host = { lib : String, style : P.Style }
+-- | where the standard library is, where packages are fetched to, and
+-- | the style of the paths of the platform heff runs on
+type Host = { lib : String, mod : String, style : P.Style }
 
--- | where the project is, where its modules are, and where the standard
--- | library; the paths in the platform's style
-type Paths = { root : String, src : String, lib : String, style : P.Style }
+-- | where the project is, where its modules are, where the standard
+-- | library, and where packages are fetched to; the paths in the
+-- | platform's style
+type Paths =
+  { root : String, src : String, lib : String, mod : String, style : P.Style }
 
 -- | the working directory's project, the library at `lib/`
 here : P.Style -> Paths
-here st = { root = ".", src = "src", lib = "lib", style = st }
+here st = { root = ".", src = "src", lib = "lib", mod = "", style = st }
 
 -- | a path under a directory
 under : Paths -> String -> String -> String
@@ -85,10 +89,17 @@ rootFrom h start d = do
           { root = d
           , src = P.join h.style d "src"
           , lib = h.lib
+          , mod = h.mod
           , style = h.style
           }
     else if strEq (P.dirname h.style d) d
-      then val { root = start, src = start, lib = h.lib, style = h.style }
+      then val
+          { root = start
+          , src = start
+          , lib = h.lib
+          , mod = h.mod
+          , style = h.style
+          }
     else rootFrom h start (P.dirname h.style d)
 
 -- | the paths of the project `file` is in, with the library and the
@@ -202,113 +213,255 @@ ownDir ps src = do
             ++ joinWith ", " xs
             ++ ": a package's src/ holds one directory, named as the package"))
 
--- (a package found, or what is wrong with it)
-type Reached = { pkg : Maybe Pkg, errors : List String }
+-- Versions: Go's minimal version selection.  Every version of a package
+-- reached from the project -- by what it requires, and what each version
+-- reached requires -- is read; of each package, the newest of those is
+-- the one in the program.  A package the project replaces with a
+-- directory is that directory, whatever version is reached.
+--------------------------------------------------------------------------------
 
--- | the package at `path`, as the project gives it, required by `by`
-reachPkg : {e : HFunctor}
-         -> {{ev : fs <: e}}
-         -> Paths
-         -> Pr.Package
-         -> String
-         -> String
-         -> Co e Reached
-reachPkg ps root by path = case replacedDir root path of
-  Nothing ->
-    val
-      { pkg = Nothing
-      , errors =
-          [ by
-          ++ " requires "
-          ++ path
-          ++ ", which heff does not fetch yet: give it a directory, by `replace` in "
-          ++ under ps ps.root "package.hf"
-          ]
-      }
-  Just d -> do
-    text <- readFile (under ps (under ps ps.root d) "package.hf")
-    case text of
+-- | where version `v` of the package at `path` is fetched to: a directory
+-- | of the cache, and beside it `<dir>.hash`, the tree its tag is of
+-- | (written last: without it, the version is not fetched)
+cachedDir : Paths -> String -> String -> String
+cachedDir ps path v = under ps ps.mod (path ++ "@" ++ v)
+
+-- | the package.hf at `dir`, read, required by `by` as the package at
+-- | `path`
+readPkgAt : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> Paths
+          -> String
+          -> String
+          -> Co e (Either String Pr.Package)
+readPkgAt ps dir path = do
+  text <- readFile (under ps dir "package.hf")
+  val (case text of
+    Nothing -> Left (under ps dir "package.hf" ++ " cannot be read")
+    Just t -> case Pr.readPackage t of
+      Left p -> Left (problemMsg (under ps dir "package.hf") t p)
+      Right pk ->
+        if strEq pk.module path then Right pk
+        else Left
+            (under ps dir "package.hf"
+             ++ " is the package "
+             ++ pk.module
+             ++ ", not "
+             ++ path))
+
+-- | a version reached, and its package.hf (Nothing: it does not read)
+type Visit = { path : String, version : String, pkg : Maybe Pr.Package }
+
+-- | a version required, and by whom
+type Need = { by : String, path : String, version : String }
+
+needOf : String -> Pr.Require -> Need
+needOf by r = { by = by, path = r.path, version = r.version }
+
+needsOf : String -> Pr.Package -> List Need
+needsOf by pk = map (needOf by) pk.require
+
+visited : List Visit -> String -> String -> Bool
+visited seen path v =
+  any (\(x : Visit) -> strEq x.path path && strEq x.version v) seen
+
+-- | the versions reached from `work` (`root`: the project's own path,
+-- | not reached again), each's package.hf read by `rd` (who requires
+-- | it, its path, its version); those so far in `seen`; what is wrong
+versionsGo : {e : HFunctor}
+           -> (String -> String -> String -> Co e (Either String Pr.Package))
+           -> String
+           -> List Need
+           -> List Visit
+           -> List String
+           -> Co e (Pair (List Visit) (List String))
+versionsGo rd root Nil seen errs = val (MkPair seen errs)
+versionsGo rd root (Cons n rest) seen errs =
+  if strEq n.path root || visited seen n.path n.version
+    then versionsGo rd root rest seen errs
+  else do
+    r <- rd n.by n.path n.version
+    case r of
+      Left why ->
+        versionsGo
+          rd
+          root
+          rest
+          (concatList
+             seen
+             [{ path = n.path, version = n.version, pkg = Nothing }])
+          (concatList errs [why])
+      Right pk ->
+        versionsGo
+          rd
+          root
+          (concatList rest (needsOf (n.path ++ " " ++ n.version) pk))
+          (concatList
+             seen
+             [{ path = n.path, version = n.version, pkg = Just pk }])
+          errs
+
+-- | every version reached from the project `root`, each's package.hf
+-- | read by `rd`; and what is wrong
+versionsOf : {e : HFunctor}
+           -> (String -> String -> String -> Co e (Either String Pr.Package))
+           -> Pr.Package
+           -> Co e (Pair (List Visit) (List String))
+versionsOf rd root =
+  versionsGo
+    rd
+    root.module
+    (needsOf (if strEq root.module "" then "the project" else root.module) root)
+    Nil
+    Nil
+
+-- (the newest of the versions of `x`'s package reached)
+newestOf : List Visit -> Visit -> Visit
+newestOf seen x =
+  foldl
+    (\(best : Visit) (y : Visit) ->
+       if strEq y.path best.path && Pr.newer y.version best.version then y
+       else best)
+    x
+    seen
+
+-- | of each package reached, the newest version, in the order the
+-- | packages are first reached
+selected : List Visit -> List Visit
+selected seen =
+  map
+    (newestOf seen)
+    (foldl
+       (\(acc : List Visit) (x : Visit) ->
+          if any (\(y : Visit) -> strEq y.path x.path) acc then acc
+          else concatList acc [x])
+       Nil
+       seen)
+
+-- | the package.hf of version `v` of `path`, required by `by`, as the
+-- | project `root` gives it: the directory it replaces it with, else
+-- | the cache -- fetched by `heff get`, the tree heff.sum says
+cachedPkg : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> Paths
+          -> Pr.Package
+          -> List Pr.Sum
+          -> String
+          -> String
+          -> String
+          -> Co e (Either String Pr.Package)
+cachedPkg ps root sums by path v = case replacedDir root path of
+  Just d -> readPkgAt ps (under ps ps.root d) path
+  Nothing -> do
+    hash <- readFile (cachedDir ps path v ++ ".hash")
+    case hash of
       Nothing ->
         val
-          { pkg = Nothing
-          , errors =
-              [ under ps (under ps ps.root d) "package.hf"
-              ++ " cannot be read ("
+          (Left
+             (by
+              ++ " requires "
               ++ path
-              ++ " is replaced with "
-              ++ d
-              ++ ")"
-              ]
-          }
-      Just t -> case Pr.readPackage t of
-        Left p ->
+              ++ " "
+              ++ v
+              ++ ", which is not fetched: run `heff get`"))
+      Just h -> case Pr.sumOf sums path v of
+        Nothing ->
           val
-            { pkg = Nothing
-            , errors =
-                [problemMsg (under ps (under ps ps.root d) "package.hf") t p]
-            }
-        Right pk ->
-          if not (strEq pk.module path)
-            then val
-                { pkg = Nothing
-                , errors =
-                    [ under ps (under ps ps.root d) "package.hf"
-                    ++ " is the package "
-                    ++ pk.module
-                    ++ ", not "
-                    ++ path
-                    ]
-                }
-          else do
-            own <- ownDir ps (under ps (under ps ps.root d) "src")
-            val (case own of
-              Left why -> { pkg = Nothing, errors = [why] }
-              Right x ->
-                { pkg =
-                    Just
-                      { path = path
-                      , dir = under ps ps.root d
-                      , src = under ps (under ps ps.root d) "src"
-                      , own = x
-                      , top = x
-                      , heff = pk.heff
-                      , scope = scopeOf pk
-                      }
-                , errors = Nil
-                })
+            (Left
+               ("heff.sum says nothing of "
+                ++ path
+                ++ " "
+                ++ v
+                ++ ": run `heff get`"))
+        Just want ->
+          if strEq (trim h) want then readPkgAt ps (cachedDir ps path v) path
+          else val
+              (Left
+                 (path
+                  ++ " "
+                  ++ v
+                  ++ " in "
+                  ++ cachedDir ps path v
+                  ++ " is "
+                  ++ trim h
+                  ++ ", and heff.sum says "
+                  ++ want))
 
--- | the packages reached from `work` (each with who requires it), those
--- | so far in `acc`; what is wrong
+-- | the package a version selected is, as the project `root` gives it
+pkgOf : {e : HFunctor}
+      -> {{ev : fs <: e}}
+      -> Paths
+      -> Pr.Package
+      -> Visit
+      -> Pr.Package
+      -> Co e (Either String Pkg)
+pkgOf ps root x pk = do
+  dir <-
+    val (case replacedDir root x.path of
+    Just d -> under ps ps.root d
+    Nothing -> cachedDir ps x.path x.version)
+  own <- ownDir ps (under ps dir "src")
+  val (case own of
+    Left why -> Left why
+    Right name ->
+      Right
+        { path = x.path
+        , dir = dir
+        , src = under ps dir "src"
+        , own = name
+        , top = name
+        , heff = pk.heff
+        , scope = scopeOf pk
+        })
+
+-- | the packages of the versions selected; what is wrong with them
+pkgsOf : {e : HFunctor}
+       -> {{ev : fs <: e}}
+       -> Paths
+       -> Pr.Package
+       -> List Visit
+       -> List Pkg
+       -> List String
+       -> Co e (Pair (List Pkg) (List String))
+pkgsOf ps root Nil acc errs = val (MkPair acc errs)
+pkgsOf ps root (Cons x rest) acc errs = case x.pkg of
+  Nothing -> pkgsOf ps root rest acc errs
+  Just pk -> do
+    k <- pkgOf ps root x pk
+    case k of
+      Left why -> pkgsOf ps root rest acc (concatList errs [why])
+      Right p -> pkgsOf ps root rest (concatList acc [p]) errs
+
+-- | the project's heff.sum, read (none: empty)
+readSumAt : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> Paths
+          -> Co e (Either String (List Pr.Sum))
+readSumAt ps = do
+  text <- readFile (under ps ps.root "heff.sum")
+  val (case text of
+    Nothing -> Right Nil
+    Just t -> case Pr.readSum t of
+      Left p -> Left (problemMsg (under ps ps.root "heff.sum") t p)
+      Right sums -> Right sums)
+
+-- | the packages the project `root` requires, directly or not, each the
+-- | version selected; what is wrong
 reachAll : {e : HFunctor}
          -> {{ev : fs <: e}}
          -> Paths
          -> Pr.Package
-         -> List (Pair String String)
-         -> List Pkg
-         -> List String
          -> Co e (Pair (List Pkg) (List String))
-reachAll ps root Nil acc errs = val (MkPair acc errs)
-reachAll ps root (Cons (MkPair by path) rest) acc errs = case pkgByPath
-    acc
-    path of
-  Just _ -> reachAll ps root rest acc errs
-  Nothing ->
-    if elemL path (map (\(x : Pair String String) -> snd x) rest)
-    || strEq path root.module
-      then reachAll ps root rest acc errs
-    else do
-      r <- reachPkg ps root by path
-      case r.pkg of
-        Nothing -> reachAll ps root rest acc (concatList errs r.errors)
-        Just k ->
-          reachAll
-            ps
-            root
-            (concatList
-               rest
-               (map (\(x : Pair String String) -> MkPair path (snd x)) k.scope))
-            (concatList acc [k])
-            errs
+reachAll ps root = do
+  sums <- readSumAt ps
+  reached <- versionsOf (cachedPkg ps root (either (\_ -> Nil) id sums)) root
+  pkgs <- pkgsOf ps root (selected (fst reached)) Nil Nil
+  val
+      (MkPair
+         (fst pkgs)
+         (concatList
+            (either (\why -> [why]) (\_ -> Nil) sums)
+            (concatList (snd reached) (snd pkgs))))
 
 -- (the stack down to `path`, newest first)
 takeUntil : String -> List String -> List String
@@ -373,18 +526,7 @@ packagesOf : {e : HFunctor}
            -> Co e (Pair (List Pkg) (List String))
 packagesOf ps Nothing = val (MkPair [projectPkg ps Nothing] Nil)
 packagesOf ps (Just root) = do
-  reached <-
-    reachAll
-      ps
-      root
-      (map
-         (\(r : Pr.Require) ->
-            MkPair
-              (if strEq root.module "" then "the project" else root.module)
-              r.path)
-         root.require)
-      Nil
-      Nil
+  reached <- reachAll ps root
   inSrc <- topNames ps.src
   inRoot <- topNames ps.root
   inLib <- topNames ps.lib

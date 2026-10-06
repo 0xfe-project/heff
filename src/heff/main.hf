@@ -60,12 +60,30 @@ libDir = do
       self <- programPath
       pure (P.join st (P.dirname st (P.dirname st self)) "lib")
 
--- | the library, and the style of the platform's paths
+-- | where packages are fetched to: `HEFF_MODCACHE`, else
+-- | `~/.cache/heff/mod`
+modDir : Heff String
+modDir = do
+  v <- getEnv "HEFF_MODCACHE"
+  home <- getEnv "HOME"
+  profile <- getEnv "USERPROFILE"
+  st <- styleNow
+  pure (case v of
+    Just d -> d
+    Nothing ->
+      P.join
+        st
+        (P.join st (fromMaybe (fromMaybe "." profile) home) ".cache")
+        (P.join st "heff" "mod"))
+
+-- | the library, the packages fetched, and the style of the platform's
+-- | paths
 hostNow : Heff L.Host
 hostNow = do
   lib <- libDir
+  mod <- modDir
   st <- styleNow
-  pure { lib = lib, style = st }
+  pure { lib = lib, mod = mod, style = st }
 
 -- | the version of heff running: its package.json's, beside `output/`
 -- | (npm writes `"version": "a.b.c"`)
@@ -730,6 +748,11 @@ commands =
     "VERSION"
     "check the project, then tag it vVERSION and push the tag"
     ""
+  , cmd
+    "get"
+    "[PATH[@VERSION]]"
+    "fetch what the project requires, writing heff.sum; with PATH, require it (at VERSION, else its newest) first"
+    ""
   , cmd "lsp" "" "a language server, on stdin/stdout" ""
   , { name = "completions"
     , args = "SHELL"
@@ -1218,6 +1241,283 @@ initCmd dir = do
                  ++ "/main.hf` checks it")
           else exit 1
 
+-- Fetching
+--------------------------------------------------------------------------------
+
+getFails : String -> Heff Unit
+getFails why = do
+  printErr ("heff get: " ++ why)
+  exit 1
+
+-- | where the package at `path` is fetched from
+urlOf : String -> String
+urlOf path = "https://" ++ Pr.repoOf path
+
+-- | version `v` of the package at `path`, in the cache: fetched there
+-- | (its tag cloned, its .git removed, made read-only, then the tree
+-- | its tag is of written beside it) unless it is there already; the
+-- | tree, or what is wrong
+fetched : L.Paths -> String -> String -> Heff (Either String String)
+fetched ps path v = do
+  dir <- pure (L.cachedDir ps path v)
+  hash <- readFile (dir ++ ".hash")
+  case hash of
+    Just h -> pure (Right (trim h))
+    Nothing -> do
+      _ <- remove dir
+      _ <- mkDir (P.dirname ps.style dir)
+      cloned <-
+        run
+          "git"
+          [ "-c"
+          , "advice.detachedHead=false"
+          , "clone"
+          , "--quiet"
+          , "--depth"
+          , "1"
+          , "--branch"
+          , "v" ++ v
+          , urlOf path
+          , dir
+          ]
+      if not (ranStatus cloned == 0)
+          then do
+            _ <- remove dir
+            pure
+                (Left
+                   ("cannot fetch "
+                    ++ path
+                    ++ " "
+                    ++ v
+                    ++ " (tag v"
+                    ++ v
+                    ++ " of "
+                    ++ urlOf path
+                    ++ "): "
+                    ++ trim (ranErr cloned)))
+        else do
+          tree <- run "git" ["-C", dir, "rev-parse", "HEAD^{tree}"]
+          _ <- remove (P.join ps.style dir ".git")
+          sealed <- readOnly dir
+          h <- pure ("tree:" ++ trim (ranOut tree))
+          ok <- writeFile (dir ++ ".hash") (h ++ "\n")
+          if ranStatus tree == 0 && sealed && ok
+              then do
+                print ("heff get: fetched " ++ path ++ " " ++ v)
+                pure (Right h)
+            else pure
+                (Left ("cannot keep " ++ path ++ " " ++ v ++ " in " ++ dir))
+
+-- | the package.hf of version `v` of `path`, required by `by`, fetched
+-- | (unless the project replaces it); its tree must be what heff.sum
+-- | said, if it said one
+fetchedPkg : L.Paths
+           -> Pr.Package
+           -> List Pr.Sum
+           -> String
+           -> String
+           -> String
+           -> Heff (Either String Pr.Package)
+fetchedPkg ps root sums by path v = case L.replacedDir root path of
+  Just d -> L.readPkgAt ps (L.under ps ps.root d) path
+  Nothing -> do
+    got <- fetched ps path v
+    case got of
+      Left why ->
+        pure (Left (by ++ " requires " ++ path ++ " " ++ v ++ ": " ++ why))
+      Right h -> case Pr.sumOf sums path v of
+        Just want ->
+          if strEq h want then L.readPkgAt ps (L.cachedDir ps path v) path
+          else pure
+              (Left
+                 (path
+                  ++ " "
+                  ++ v
+                  ++ " is "
+                  ++ h
+                  ++ ", and heff.sum says "
+                  ++ want
+                  ++ ": its tag has been moved"))
+        Nothing -> L.readPkgAt ps (L.cachedDir ps path v) path
+
+-- (the trees of the versions fetched, as heff.sum's lines)
+sumsOf : L.Paths -> Pr.Package -> List L.Visit -> Heff (List Pr.Sum)
+sumsOf ps root Nil = pure Nil
+sumsOf ps root (Cons x rest) = do
+  others <- sumsOf ps root rest
+  h <- readFile (L.cachedDir ps x.path x.version ++ ".hash")
+  pure (case L.replacedDir root x.path of
+    Just _ -> others
+    Nothing -> case h of
+      Just t ->
+        Cons { path = x.path, version = x.version, hash = trim t } others
+      Nothing -> others)
+
+-- | the newest version tagged in the repository of `path` that it is
+-- | the path of (its major), or what is wrong
+newestTag : String -> Heff (Either String String)
+newestTag path = do
+  r <- run "git" ["ls-remote", "--tags", "--refs", urlOf path]
+  pure
+      (if not (ranStatus r == 0)
+         then Left
+             ("cannot list the tags of "
+              ++ urlOf path
+              ++ ": "
+              ++ trim (ranErr r))
+       else case foldl
+           (\(best : Maybe String) (line : String) -> case split
+              "refs/tags/v"
+              line of
+            Cons _ (Cons v Nil) -> case Pr.version (trim v) of
+              Just _ -> case Pr.majorMismatch path (trim v) of
+                Nothing -> case best of
+                  Just b -> if Pr.newer (trim v) b then Just (trim v) else best
+                  Nothing -> Just (trim v)
+                Just _ -> best
+              Nothing -> best
+            _ -> best)
+           Nothing
+           (lines (ranOut r)) of
+         Just v -> Right v
+         Nothing ->
+           Left
+             ("no tag of "
+              ++ urlOf path
+              ++ " is a version of "
+              ++ path
+              ++ " (vA.B.C, its major "
+              ++ (if Pr.isMajorPart (Pr.lastPart path)
+                    then "that of /" ++ Pr.lastPart path
+                  else "0 or 1")
+              ++ ")"))
+
+-- | PATH@VERSION, PATH: the path, and the version (Nothing: the newest)
+specOf : String -> Pair String (Maybe String)
+specOf spec = case split "@" spec of
+  Cons path (Cons v Nil) -> MkPair path (Just v)
+  _ -> MkPair spec Nothing
+
+-- (`r`, of version `v` if it is of `path`)
+retarget : String -> String -> Pr.Require -> Pr.Require
+retarget path v r =
+  if strEq r.path path then { name = r.name, path = path, version = v } else r
+
+-- | the project `pk`, requiring version `v` of `path`: in place of the
+-- | version it required, else by the name the package's src/ gives it
+requiring : Pr.Package -> String -> String -> String -> Pr.Package
+requiring pk name path v =
+  { module = pk.module
+  , heff = pk.heff
+  , require =
+      if any (\(r : Pr.Require) -> strEq r.path path) pk.require
+        then map (retarget path v) pk.require
+      else concatList pk.require [{ name = name, path = path, version = v }]
+  , replace = pk.replace
+  }
+
+-- | write the project's package.hf, requiring version `v` of `path`
+-- | (fetched, to know its name)
+getRequire : L.Paths -> String -> Pr.Package -> String -> String -> Heff Bool
+getRequire ps text pk path v = case Pr.majorMismatch path v of
+  Just why -> do
+    getFails (path ++ ": " ++ why)
+    pure False
+  Nothing -> do
+    got <- fetched ps path v
+    case got of
+      Left why -> do
+        getFails why
+        pure False
+      Right _ -> do
+        own <- L.ownDir ps (P.join ps.style (L.cachedDir ps path v) "src")
+        case own of
+          Left why -> do
+            getFails why
+            pure False
+          Right name ->
+            if not (any (\(r : Pr.Require) -> strEq r.path path) pk.require)
+            && any (\(r : Pr.Require) -> strEq r.name name) pk.require
+              then do
+                getFails
+                    ("`"
+                     ++ name
+                     ++ "` is required already: add "
+                     ++ path
+                     ++ " to package.hf by another name")
+                pure False
+            else do
+              ok <-
+                writeFile
+                  "package.hf"
+                  (laidOut
+                     "package.hf"
+                     (Pr.withPackage text (requiring pk name path v)))
+              if ok
+                  then do
+                    print ("heff get: package.hf requires " ++ path ++ " " ++ v)
+                    pure True
+                else do
+                  getFails "cannot write package.hf"
+                  pure False
+
+-- | fetch every version the project's package.hf reaches, then write
+-- | heff.sum, and load the project's packages, as a program would
+getAll : Heff Unit
+getAll = do
+  h <- hostNow
+  ps <- L.pathsFor h "package.hf"
+  text <- readFile "package.hf"
+  case Pr.readPackage (fromMaybe "" text) of
+    Right root -> do
+      old <- L.readSumAt ps
+      case old of
+        Left why -> getFails why
+        Right sums -> do
+          reached <-
+            L.versionsOf (\by path v -> fetchedPkg ps root sums by path v) root
+          news <- sumsOf ps root (fst reached)
+          wrote <-
+            if strEq (Pr.showSum news) "" then pure True
+            else writeFile "heff.sum" (Pr.showSum news)
+          bad <- printErrs "heff get" (snd reached) 0
+          if bad > 0 then exit 1
+            else if not wrote then getFails "cannot write heff.sum"
+            else do
+              l <- load "package.hf"
+              badL <- printErrs "heff get" l.errors 0
+              if badL > 0 then exit 1
+                else print
+                    ("heff get: "
+                     ++ showInt (length (L.selected (fst reached)))
+                     ++ " packages, heff.sum written")
+    _ -> getFails "package.hf does not read: get at the project's root"
+
+-- | fetch what the project requires, writing heff.sum; with PATH, first
+-- | require it, at VERSION, else its newest
+getCmd : Maybe String -> Heff Unit
+getCmd spec = do
+  text <- readFile "package.hf"
+  case text of
+    Nothing -> getFails "no package.hf here: get at the project's root"
+    Just t -> case Pr.readPackage t of
+      Left _ -> getFails "package.hf does not read"
+      Right pk -> case spec of
+        Nothing -> getAll
+        Just s -> do
+          h <- hostNow
+          ps <- L.pathsFor h "package.hf"
+          v <- case snd (specOf s) of
+            Just v -> pure (Right v)
+            Nothing -> newestTag (fst (specOf s))
+          case v of
+            Left why -> getFails why
+            Right ver -> case Pr.version ver of
+              Nothing -> getFails ("`" ++ ver ++ "` is no version: a.b.c")
+              Just _ -> do
+                ok <- getRequire ps t pk (fst (specOf s)) ver
+                if ok then getAll else pure MkUnit
+
 -- | the compiler's door: the commands of `usage`, and `dump-core
 -- | FILE...`, which checks the files given (in dependency order) and
 -- | prints their stored core, and `dump-eval FILE`
@@ -1244,6 +1544,8 @@ program = do
     "dump-core" :: files -> selfcheck files
     "init" :: Nil -> initCmd "."
     "publish" :: v :: Nil -> publishCmd v
+    "get" :: Nil -> getCmd Nothing
+    "get" :: spec :: Nil -> getCmd (Just spec)
     "init" :: dir :: Nil -> initCmd dir
     -- (clients add flags, `--stdio` say: stdin/stdout is all there is)
     "lsp" :: flags ->

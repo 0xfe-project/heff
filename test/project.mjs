@@ -4,14 +4,18 @@
 // it (a test) may import the project's modules and helpers beside it,
 // what is in src/ may not import those; a module found twice, a
 // package.hf that does not read and one for another heff are errors.
+// Packages: given by directories, fetched by `heff get` (git, MVS,
+// heff.sum), published by `heff publish`.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = mkdtempSync(join(tmpdir(), "heff-project-"));
+// (packages are fetched into the test's own cache)
+process.env.HEFF_MODCACHE = join(work, "mod");
 const heff = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: work, encoding: "utf8" });
 const write = (path, text) => { mkdirSync(dirname(join(work, path)), { recursive: true }); writeFileSync(join(work, path), text); };
 const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
@@ -109,8 +113,8 @@ expect("a package and the project's module of one name", pclash.status === 1 &&
 write("unfetched/package.hf", manifestOf("x.org/unfetched", [["json", "x.org/json"]]));
 write("unfetched/src/unfetched/main.hf", "x : Int\nx = 1\n");
 const unfetched = heff("check", "unfetched/src/unfetched/main.hf");
-expect("a package with no directory", unfetched.status === 1 &&
-  unfetched.stderr.includes("x.org/unfetched requires x.org/json, which heff does not fetch yet: give it a directory, by `replace` in unfetched/package.hf"), unfetched);
+expect("a package not fetched", unfetched.status === 1 &&
+  unfetched.stderr.includes("x.org/unfetched requires x.org/json 1.0.0, which is not fetched: run `heff get`"), unfetched);
 
 write("wrong/package.hf", manifestOf("x.org/wrong", [["json", "x.org/json", "../jsony"]]));
 write("wrong/src/wrong/main.hf", "x : Int\nx = 1\n");
@@ -175,6 +179,73 @@ git("pub", "commit", "-q", "-am", "wrong");
 const failing = publish("1.0.1");
 expect("publish, a watch that does not hold", failing.status === 1 && failing.stderr.includes("1 of 1 expectations do not hold") &&
   !git("pub", "tag").stdout.includes("v1.0.1"), failing);
+
+// get: every version reached fetched from git (`https://PATH`, here a
+// directory by git's `insteadOf`), the newest of each package selected,
+// heff.sum written; a tag moved since is an error, as is a cache that is
+// not what heff.sum says
+process.env.GIT_CONFIG_COUNT = "1";
+process.env.GIT_CONFIG_KEY_0 = `url.file://${join(work, "remotes")}/.insteadOf`;
+process.env.GIT_CONFIG_VALUE_0 = "https://";
+const remote = (path, files, tag) => {
+  const dir = join("remotes", path);
+  for (const [f, text] of Object.entries(files)) write(join(dir, f), text);
+  if (!existsSync(join(work, dir, ".git"))) git(dir, "init", "-q");
+  git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", tag); git(dir, "tag", tag);
+};
+const typed = (path, requires = []) => "import manifest\n\npackage : Package\n" +
+  `package = { module = "${path}", heff = "${version}", require = [${requires.map(([n, p, v]) => `{ name = "${n}", path = "${p}", version = "${v}" }`).join(", ")}], replace = [] }\n`;
+const encodeAs = (l, r) => `import prelude\n\nencode : String -> String\nencode s = "${l}" ++ s ++ "${r}"\n`;
+remote("x.org/lib", { "package.hf": typed("x.org/lib"), "src/lib/encode.hf": encodeAs("<", ">") }, "v1.0.0");
+remote("x.org/lib", { "src/lib/encode.hf": encodeAs("[", "]") }, "v1.1.0");
+remote("x.org/lib", { "package.hf": typed("x.org/lib/v2"), "src/lib/encode.hf": encodeAs("{", "}") }, "v2.0.0");
+remote("x.org/mid", { "package.hf": typed("x.org/mid", [["lib", "x.org/lib", "1.1.0"]]),
+  "src/mid/m.hf": "import lib.encode\nimport prelude\n\ntwice : String -> String\ntwice s = encode (encode s)\n" }, "v1.0.0");
+
+write("user/package.hf", typed("x.org/user", [["lib", "x.org/lib", "1.0.0"], ["mid", "x.org/mid", "1.0.0"]]));
+write("user/src/user/main.hf", "import lib.encode\nimport mid.m\nimport prelude\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n\n-- >>> twice \"hi\"\n-- \"[[hi]]\"\n");
+const inUser = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: join(work, "user"), encoding: "utf8" });
+const notYet = inUser("test", "src/user/main.hf");
+expect("get: not fetched yet", notYet.status === 1 && notYet.stderr.includes("x.org/user requires x.org/lib 1.0.0, which is not fetched: run `heff get`"), notYet);
+const got = inUser("get");
+const sum = existsSync(join(work, "user", "heff.sum")) ? readFileSync(join(work, "user", "heff.sum"), "utf8") : "";
+expect("get", got.status === 0 && got.stdout.includes("heff get: 2 packages, heff.sum written") &&
+  /^x\.org\/lib 1\.0\.0 tree:[0-9a-f]+\nx\.org\/lib 1\.1\.0 tree:[0-9a-f]+\nx\.org\/mid 1\.0\.0 tree:[0-9a-f]+\n$/.test(sum), [got, sum]);
+const cached = join(work, "mod", "x.org", "lib@1.1.0");
+expect("get: the cache, read-only, without .git", existsSync(join(cached, "src/lib/encode.hf")) && !existsSync(join(cached, ".git")) &&
+  (statSync(join(cached, "src/lib/encode.hf")).mode & 0o222) === 0, cached);
+const selectedV = inUser("test", "src/user/main.hf");
+expect("get: the newest version reached is the one in the program", selectedV.status === 0 && selectedV.stdout.includes("2/2 expectations hold"), selectedV);
+const again2 = inUser("get");
+expect("get, again: nothing fetched", again2.status === 0 && !again2.stdout.includes("fetched"), again2);
+
+const clashV2 = inUser("get", "x.org/lib/v2");
+expect("get PATH: a name required already", clashV2.status === 1 && clashV2.stderr.includes("`lib` is required already: add x.org/lib/v2 to package.hf by another name"), clashV2);
+write("fresh/package.hf", "-- mine\n" + typed("x.org/fresh"));
+write("fresh/src/fresh/main.hf", "import lib.encode\nimport prelude\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n");
+const inFresh = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: join(work, "fresh"), encoding: "utf8" });
+const getNewest = inFresh("get", "x.org/lib");
+const freshPkg = readFileSync(join(work, "fresh", "package.hf"), "utf8");
+expect("get PATH: its newest version of the path's major, by its own name", getNewest.status === 0 &&
+  getNewest.stdout.includes("package.hf requires x.org/lib 1.1.0") && freshPkg.startsWith("-- mine\n") &&
+  freshPkg.includes(`{ name = "lib", path = "x.org/lib", version = "1.1.0" }`) && inFresh("test", "src/fresh/main.hf").status === 0, [getNewest, freshPkg]);
+expect("get PATH: package.hf laid out", inFresh("fmt", "--check", "package.hf").status === 0, freshPkg);
+const getOld = inFresh("get", "x.org/lib@1.0.0");
+expect("get PATH@VERSION", getOld.status === 0 && readFileSync(join(work, "fresh", "package.hf"), "utf8").includes(`version = "1.0.0"`), getOld);
+const getNone = inFresh("get", "x.org/lib@1.7.0");
+expect("get PATH@VERSION, no such tag", getNone.status === 1 && getNone.stderr.includes("cannot fetch x.org/lib 1.7.0 (tag v1.7.0 of https://x.org/lib)"), getNone);
+
+write("user/heff.sum", sum.replace(/(x\.org\/mid 1\.0\.0 tree:)[0-9a-f]+/, "$10000"));
+const tampered = inUser("check", "src/user/main.hf");
+expect("a cache that is not what heff.sum says", tampered.status === 1 && tampered.stderr.includes("and heff.sum says tree:0000"), tampered);
+write("user/heff.sum", sum);
+git("remotes/x.org/lib", "checkout", "-q", "v1.0.0");
+remote("x.org/lib", { "src/lib/encode.hf": encodeAs("(", ")") }, "moved");
+git("remotes/x.org/lib", "tag", "-f", "v1.0.0");
+const unlock = (p) => { if (!existsSync(p)) return; chmodSync(p, 0o755); if (statSync(p).isDirectory()) for (const n of readdirSync(p)) unlock(join(p, n)); };
+unlock(join(work, "mod")); rmSync(join(work, "mod"), { recursive: true, force: true });
+const moved = inUser("get");
+expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/lib 1.0.0 is tree:") && moved.stderr.includes("its tag has been moved"), moved);
 
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

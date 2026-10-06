@@ -43,6 +43,8 @@ heff compile FILE OUT --backend=MODE [--name NAME]
                                # page: a script running the app NAME in a web page
                                # node: a Node.js program running NAME
 heff init [DIR]                # a new project
+heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
+heff publish VERSION           # check the project, tag it vVERSION, push the tag
 heff lsp                       # the language server, on stdio
 heff completions SHELL         # fish, bash or zsh completions
 ```
@@ -55,7 +57,9 @@ run.  A module is a file under its `src/`, named by its path there:
 `src/parse/surface.hf` is `parse.surface`.  Modules are looked up there
 and in `lib/`; a file outside `src/` (a test) may also import files
 beside it, by their paths from the root.  Compiled modules are cached in
-`.heff/`.
+`.heff/`.  A package required is fetched by git from its path (`heff
+get`), the version chosen as Go's minimal version selection does, into
+`~/.cache/heff/mod`; `heff.sum` holds the tree of each version.
 
 ```haskell
 import manifest
