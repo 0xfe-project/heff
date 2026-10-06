@@ -36,7 +36,12 @@ stripWhere n = case n of
   _ -> Nothing
 
 -- | a literal pattern is matched by the equality in scope for its kind
-data Pat = PVar String | PTag String (List Pat) Pm.Span | PLit Ntn
+-- | a record pattern names the fields it matches
+data Pat
+  = PVar String
+  | PTag String (List Pat) Pm.Span
+  | PLit Ntn
+  | PRec (List (Pair String Pat)) Pm.Span
 
 type Clause = { pats : List Pat, rhs : Ntn }
 
@@ -125,7 +130,20 @@ badPat n =
   Left
     (mkErr
        (ntnSpan n)
-       "a pattern is a variable, a literal, or a tag applied to patterns")
+       "a pattern is a variable, a literal, a tag applied to patterns, or a record of patterns")
+
+-- | `x = p`, a field of a record pattern
+recFieldOf : Ntn -> Maybe String
+recFieldOf (At (Infix (At (Ident x) _) _ _) _) = Just x
+recFieldOf _ = Nothing
+
+-- | (`pat`, the knot: a record's fields are patterns)
+fieldPat : (Ntn -> Either Err Pat) -> Ntn -> Either Err (Pair String Pat)
+fieldPat pt f = case recFieldOf f of
+  Just x -> do
+    p <- pt (fieldPatOf f)
+    pure (MkPair x p)
+  Nothing -> badPat f
 
 pat : Ntn -> Either Err Pat
 pat n = case (getGroup n).head of
@@ -144,6 +162,12 @@ pat n = case (getGroup n).head of
     else badPat n
   At (NFloat v) sp ->
     if length (getGroup n).args == 0 then Right (PLit (At (NFloat v) sp))
+    else badPat n
+  At (NBlock "struct" Nothing fs) sp ->
+    if length (getGroup n).args == 0
+      then do
+        fps <- traverseC (\f -> fieldPat (\m -> pat m) f) fs
+        pure (PRec fps sp)
     else badPat n
   _ -> badPat n
 
@@ -193,6 +217,7 @@ patVars : Pat -> List String
 patVars (PVar x) = Cons x Nil
 patVars (PTag _ ps _) = concatMapC (\p -> patVars p) ps
 patVars (PLit _) = Nil
+patVars (PRec fps _) = concatMapC (\fp -> patVars (snd fp)) fps
 
 identsOf : Ntn -> List String
 identsOf n = case n of
@@ -249,6 +274,10 @@ isLitP : Pat -> Bool
 isLitP (PLit _) = True
 isLitP _ = False
 
+isRecP : Pat -> Bool
+isRecP (PRec _ _) = True
+isRecP _ = False
+
 type TagRow = { tag : String, arity : Int, pats : List Pat, span : Pm.Span }
 
 tagOf : Pat -> Maybe TagRow
@@ -274,7 +303,8 @@ type CK =
 findTagLit : List Pat -> Int -> Maybe Int
 findTagLit Nil i = Nothing
 findTagLit (Cons p rest) i =
-  if isTagP p || isLitP p then Just i else findTagLit rest (i + 1)
+  if isTagP p || isLitP p || isRecP p then Just i
+  else findTagLit rest (i + 1)
 
 nubTagRows : List TagRow -> List TagRow
 nubTagRows Nil = Nil
@@ -337,6 +367,7 @@ armSpecializeV c t ys v r = case patAt c r of
   PLit l ->
     Just
       (mkClause (spliceAt c (map (\(y : String) -> PVar "_") ys) r.pats) r.rhs)
+  PRec _ _ -> Nothing
 
 armOf : CK
       -> List String
@@ -374,6 +405,7 @@ litYesOne c l v r acc = case patAt c r of
     if sameLit l l' then Cons (mkClause (dropAt c r.pats) r.rhs) acc else acc
   PVar x -> Cons (mkClause (dropAt c r.pats) (bindVar v (PVar x) r.rhs)) acc
   PTag _ _ _ -> acc
+  PRec _ _ -> acc
 
 litYes : Int -> Ntn -> String -> List Clause -> List Clause
 litYes c l v Nil = Nil
@@ -511,6 +543,117 @@ defaultArm r used bound sp vars rows c =
     c
     (filter (\row -> not (isTagP (patAt c row))) rows)
 
+-- Records
+--------------------------------------------------------------------------------
+
+recFieldsOf : Pat -> List (Pair String Pat)
+recFieldsOf (PRec fps _) = fps
+recFieldsOf _ = Nil
+
+lookupField : String -> List (Pair String Pat) -> Maybe Pat
+lookupField f Nil = Nothing
+lookupField f (Cons (MkPair g p) rest) =
+  if strEq f g then Just p else lookupField f rest
+
+-- | a column of records matches no tag and no literal
+noRecMix : List Clause -> Int -> Either Err Unit
+noRecMix rows c =
+  if anyC (\row -> isRecP (patAt c row)) rows
+    then forC rows (\row -> case patAt c row of
+    PTag _ _ sp ->
+      Left (mkErr sp "a record and a tag match the same argument")
+    PLit l ->
+      Left (mkErr (ntnSpan l) "a record and a literal match the same argument")
+    _ -> Right MkUnit)
+  else Right MkUnit
+
+-- | every field some equation names in column `c`, in order
+recFieldNames : Int -> List Clause -> List String
+recFieldNames c rows =
+  nubStr
+    (concatMapC (\row -> map (\fp -> fst fp) (recFieldsOf (patAt c row))) rows)
+
+-- | the variable the first equation naming field `f` binds it to
+recFieldVar : Int -> List Clause -> String -> Maybe String
+recFieldVar c rows f =
+  case catMaybesC (map (\row -> lookupField f (recFieldsOf (patAt c row))) rows) of
+    Cons p _ -> varOf p
+    Nil -> Nothing
+
+-- | the name of field `f`'s column: that variable, unless it is `_` or
+-- | bound already, else (a fresh) `f`
+recSubName : List String -> List String -> Maybe String -> String -> String
+recSubName used bound (Just x) f =
+  if not (strEq x "_") && not (elemBy strEq x bound) then x
+  else fresh (appendC used bound) f
+recSubName used bound Nothing f = fresh (appendC used bound) f
+
+recSubs : List String -> List String -> Int -> List Clause -> List String
+recSubs used bound c rows =
+  map
+    (\f -> recSubName used bound (recFieldVar c rows f) f)
+    (recFieldNames c rows)
+
+orWildcard : Maybe Pat -> Pat
+orWildcard (Just p) = p
+orWildcard Nothing = PVar "_"
+
+-- | a row, its column `c` the fields `fs` (`_` those it does not name)
+recSpecialize : Int -> List String -> String -> Clause -> Clause
+recSpecialize c fs v r = case patAt c r of
+  PRec fps _ ->
+    mkClause
+      (spliceAt c (map (\f -> orWildcard (lookupField f fps)) fs) r.pats)
+      r.rhs
+  _ ->
+    mkClause
+      (spliceAt c (map (\(f : String) -> PVar "_") fs) r.pats)
+      (bindVar v (patAt c r) r.rhs)
+
+-- | `let y = v.f in e`, each field's column bound to its projection
+letFields : Pm.Span -> String -> List (Pair String String) -> Ntn -> Ntn
+letFields sp v Nil body = body
+letFields sp v (Cons (MkPair f y) rest) body =
+  At
+    (NBlock
+       "let"
+       (Just (juxt (At (Ident v) sp) (At (NField f) sp)))
+       (Cons
+          (infixOp
+             (At (Ident y) sp)
+             (At (Keyword "=>") sp)
+             (letFields sp v rest body))
+          Nil))
+    sp
+
+-- | a column of records: a column for each field named, bound to its
+-- | projection
+recordOf : CK
+         -> List String
+         -> List String
+         -> Pm.Span
+         -> List String
+         -> List Clause
+         -> Int
+         -> Either Err Ntn
+recordOf r used bound sp vars rows c = do
+  noRecMix rows c
+  body <-
+    r.compile
+      used
+      (appendC (recSubs used bound c rows) bound)
+      sp
+      (spliceAt c (recSubs used bound c rows) vars)
+      (map
+         (\row -> recSpecialize c (recFieldNames c rows) (varAt vars c) row)
+         rows)
+  pure
+      (letFields
+         sp
+         (varAt vars c)
+         (zipC (recFieldNames c rows) (recSubs used bound c rows))
+         body)
+
 compileAt : CK
           -> List String
           -> List String
@@ -520,9 +663,13 @@ compileAt : CK
           -> Int
           -> Pat
           -> Either Err Ntn
-compileAt r used bound sp vars rows c (PLit l) =
+compileAt r used bound sp vars rows c (PLit l) = do
+  noRecMix rows c
   literalOf r used bound sp vars rows c l
+compileAt r used bound sp vars rows c (PRec _ _) =
+  recordOf r used bound sp vars rows c
 compileAt r used bound sp vars rows c p = do
+  noRecMix rows c
   noLitHere sp c rows
   arms <-
     traverseC
