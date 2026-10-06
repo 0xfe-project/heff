@@ -104,7 +104,7 @@ write("clash/src/json/encode.hf", "x : Int\nx = 1\n");
 write("clash/src/clash/main.hf", "import json.encode\n\ny : Int\ny = 1\n");
 const pclash = heff("check", "clash/src/clash/main.hf");
 expect("a package and the project's module of one name", pclash.status === 1 &&
-  pclash.stderr.includes("module json.encode is more than one file: clash/src/json/encode.hf and clash/../json/src/json/encode.hf"), pclash);
+  pclash.stderr.includes("module json.encode is more than one file: clash/src/json/encode.hf and json/src/json/encode.hf"), pclash);
 
 write("unfetched/package.hf", manifestOf("x.org/unfetched", [["json", "x.org/json"]]));
 write("unfetched/src/unfetched/main.hf", "x : Int\nx = 1\n");
@@ -116,7 +116,7 @@ write("wrong/package.hf", manifestOf("x.org/wrong", [["json", "x.org/json", "../
 write("wrong/src/wrong/main.hf", "x : Int\nx = 1\n");
 const wrong = heff("check", "wrong/src/wrong/main.hf");
 expect("a directory of another package", wrong.status === 1 &&
-  wrong.stderr.includes("wrong/../jsony/package.hf is the package y.org/json, not x.org/json"), wrong);
+  wrong.stderr.includes("jsony/package.hf is the package y.org/json, not x.org/json"), wrong);
 
 write("two/package.hf", manifestOf("x.org/two"));
 write("two/src/a/a.hf", "x : Int\nx = 1\n");
@@ -125,7 +125,7 @@ write("usetwo/package.hf", manifestOf("x.org/usetwo", [["two", "x.org/two", "../
 write("usetwo/src/usetwo/main.hf", "x : Int\nx = 1\n");
 const usetwo = heff("check", "usetwo/src/usetwo/main.hf");
 expect("a package whose src/ holds two directories", usetwo.status === 1 &&
-  usetwo.stderr.includes("usetwo/../two/src holds a, b: a package's src/ holds one directory, named as the package"), usetwo);
+  usetwo.stderr.includes("two/src holds a, b: a package's src/ holds one directory, named as the package"), usetwo);
 
 write("loop/package.hf", manifestOf("x.org/loop", [["back", "x.org/back", "../back"]]));
 write("loop/src/loop/main.hf", "x : Int\nx = 1\n");

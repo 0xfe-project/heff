@@ -14,39 +14,32 @@ import heff.driver as Dr
 import heff.import as I
 import heff.project as Pr
 import fs
+import path as P
 import prelude
-
-dotsGo : String -> Int -> String -> String
-dotsGo p i acc =
-  if i >= strLength p then acc
-  else if charCode p i == 47 then dotsGo p (i + 1) (acc ++ ".")
-  else dotsGo p (i + 1) (acc ++ strSlice p i (i + 1))
-
-dotsOf : String -> String
-dotsOf p = dotsGo p 0 ""
 
 dropHf : String -> String
 dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
 
+-- | where the standard library is, and the style of the paths of the
+-- | platform heff runs on
+type Host = { lib : String, style : P.Style }
+
 -- | where the project is, where its modules are, and where the standard
--- | library
-type Paths = { root : String, src : String, lib : String }
+-- | library; the paths in the platform's style
+type Paths = { root : String, src : String, lib : String, style : P.Style }
 
 -- | the working directory's project, the library at `lib/`
-here : Paths
-here = { root = ".", src = "src", lib = "lib" }
+here : P.Style -> Paths
+here st = { root = ".", src = "src", lib = "lib", style = st }
 
--- (a path under a directory: under `.`, the path itself)
-dirPrefix : String -> String
-dirPrefix d = if strEq d "." then "" else d ++ "/"
+-- | a path under a directory
+under : Paths -> String -> String -> String
+under ps d p = P.join ps.style d p
 
-under : String -> String -> String
-under d p = dirPrefix d ++ p
-
-dropPrefix : String -> String -> Maybe String
-dropPrefix pre s =
-  if startsWith pre s then Just (strSlice s (strLength pre) (strLength s))
-  else Nothing
+-- (the path from the directory, if it is under it)
+relFrom : Paths -> String -> String -> Maybe String
+relFrom ps d path =
+  if P.isUnder ps.style d path then P.relative ps.style d path else Nothing
 
 -- | the module a file of the project is; one of the standard library is
 -- | the library's (`lib/co.hf` is `co`), wherever the project's root is;
@@ -54,67 +47,59 @@ dropPrefix pre s =
 -- | from the root: `test/helpers.hf` is `test.helpers`
 moduleOf : Paths -> String -> String
 moduleOf ps path =
-  dotsOf
-    (dropHf (case dropPrefix (dirPrefix ps.lib) path of
-     Just rel -> rel
-     Nothing -> case dropPrefix (dirPrefix ps.src) path of
-       Just rel -> rel
-       Nothing -> case dropPrefix (dirPrefix ps.root) path of
-         Just rel -> rel
-         Nothing -> path))
+  joinWith
+    "."
+    (P.components
+       ps.style
+       (dropHf (case relFrom ps ps.lib path of
+        Just rel -> rel
+        Nothing -> case relFrom ps ps.src path of
+          Just rel -> rel
+          Nothing -> case relFrom ps ps.root path of
+            Just rel -> rel
+            Nothing -> path)))
 
 -- | the path is under the directory
-inside : String -> String -> Bool
-inside d path = strEq d "." || startsWith (dirPrefix d) path
-
--- (where the last `/` is, from `i` down)
-lastSlash : String -> Int -> Maybe Int
-lastSlash p i =
-  if i < 0 then Nothing
-  else if charCode p i == 47 then Just i
-  else lastSlash p (i - 1)
-
-dirname : String -> String
-dirname p = case lastSlash p (strLength p - 1) of
-  Just 0 -> "/"
-  Just i -> strSlice p 0 i
-  Nothing -> "."
+inside : Paths -> String -> String -> Bool
+inside ps d path = strEq d "." || P.isUnder ps.style d path
 
 -- | a directory is a project's root
-isRoot : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
-isRoot d = do
-  hf <- readFile (under d "package.hf")
+isRoot : {e : HFunctor} -> {{ev : fs <: e}} -> P.Style -> String -> Co e Bool
+isRoot st d = do
+  hf <- readFile (P.join st d "package.hf")
   val (case hf of
     Just _ -> True
     Nothing -> False)
 
+-- (a root -- `/`, `C:\`, `.` -- is its own directory)
 rootFrom : {e : HFunctor}
          -> {{ev : fs <: e}}
-         -> String
+         -> Host
          -> String
          -> String
          -> Co e Paths
-rootFrom lib start d = do
-  found <- isRoot d
-  if found then val { root = d, src = under d "src", lib = lib }
-    else if strEq d "/" || strEq d "." || strEq d ""
-      then val { root = start, src = start, lib = lib }
-    else rootFrom lib start (dirname d)
+rootFrom h start d = do
+  found <- isRoot h.style d
+  if found
+      then val
+          { root = d
+          , src = P.join h.style d "src"
+          , lib = h.lib
+          , style = h.style
+          }
+    else if strEq (P.dirname h.style d) d
+      then val { root = start, src = start, lib = h.lib, style = h.style }
+    else rootFrom h start (P.dirname h.style d)
 
--- | the paths of the project `file` is in, with the library at `lib`
--- | (without a root, the file's directory is one)
-pathsFor : {e : HFunctor} -> {{ev : fs <: e}} -> String -> String -> Co e Paths
-pathsFor lib file = rootFrom lib (dirname file) (dirname file)
+-- | the paths of the project `file` is in, with the library and the
+-- | style of the host (without a root, the file's directory is one)
+pathsFor : {e : HFunctor} -> {{ev : fs <: e}} -> Host -> String -> Co e Paths
+pathsFor h file = rootFrom h (P.dirname h.style file) (P.dirname h.style file)
 
-slashGo : String -> Int -> String -> String
-slashGo m i acc =
-  if i >= strLength m then acc
-  else if charCode m i == 46 then slashGo m (i + 1) (acc ++ "/")
-  else slashGo m (i + 1) (acc ++ strSlice m i (i + 1))
-
--- | where a module's file is: `foo.bar` is `foo/bar.hf`
+-- | where a module's file is, with `/`s (`under` reads them in any
+-- | style): `foo.bar` is `foo/bar.hf`
 importPath : String -> String
-importPath m = slashGo m 0 "" ++ ".hf"
+importPath m = joinWith "/" (split "." m) ++ ".hf"
 
 -- | what is wrong with a package.hf, where it is
 problemMsg : String -> String -> Pr.Problem -> String
@@ -193,19 +178,20 @@ replacedDir pk path = case filter
 -- | the one directory a package's `src/` holds, its name
 ownDir : {e : HFunctor}
        -> {{ev : fs <: e}}
+       -> Paths
        -> String
        -> Co e (Either String String)
-ownDir src = do
+ownDir ps src = do
   names <- readDir src
   case names of
     Nothing -> val (Left (src ++ " is not a directory"))
     Just (Cons x Nil) -> do
-      inner <- readDir (under src x)
+      inner <- readDir (under ps src x)
       val (case inner of
         Just _ ->
           if Pr.isName x then Right x
           else Left
-              (under src x
+              (under ps src x
                ++ " cannot name a package: a lowercase letter, then letters, digits and `_`")
         Nothing -> Left (src ++ " holds " ++ x ++ ", which is not a directory"))
     Just xs ->
@@ -236,17 +222,17 @@ reachPkg ps root by path = case replacedDir root path of
           ++ " requires "
           ++ path
           ++ ", which heff does not fetch yet: give it a directory, by `replace` in "
-          ++ under ps.root "package.hf"
+          ++ under ps ps.root "package.hf"
           ]
       }
   Just d -> do
-    text <- readFile (under (under ps.root d) "package.hf")
+    text <- readFile (under ps (under ps ps.root d) "package.hf")
     case text of
       Nothing ->
         val
           { pkg = Nothing
           , errors =
-              [ under (under ps.root d) "package.hf"
+              [ under ps (under ps ps.root d) "package.hf"
               ++ " cannot be read ("
               ++ path
               ++ " is replaced with "
@@ -258,14 +244,15 @@ reachPkg ps root by path = case replacedDir root path of
         Left p ->
           val
             { pkg = Nothing
-            , errors = [problemMsg (under (under ps.root d) "package.hf") t p]
+            , errors =
+                [problemMsg (under ps (under ps ps.root d) "package.hf") t p]
             }
         Right pk ->
           if not (strEq pk.module path)
             then val
                 { pkg = Nothing
                 , errors =
-                    [ under (under ps.root d) "package.hf"
+                    [ under ps (under ps ps.root d) "package.hf"
                     ++ " is the package "
                     ++ pk.module
                     ++ ", not "
@@ -273,15 +260,15 @@ reachPkg ps root by path = case replacedDir root path of
                     ]
                 }
           else do
-            own <- ownDir (under (under ps.root d) "src")
+            own <- ownDir ps (under ps (under ps ps.root d) "src")
             val (case own of
               Left why -> { pkg = Nothing, errors = [why] }
               Right x ->
                 { pkg =
                     Just
                       { path = path
-                      , dir = under ps.root d
-                      , src = under (under ps.root d) "src"
+                      , dir = under ps ps.root d
+                      , src = under ps (under ps ps.root d) "src"
                       , own = x
                       , top = x
                       , heff = pk.heff
@@ -429,10 +416,10 @@ type Found = { path : String, source : String, module : String }
 
 -- (the package a file is in: the dependency whose directory holds it,
 -- else the project's)
-pkgOfGo : List Pkg -> Pkg -> String -> Pkg
-pkgOfGo Nil project from = project
-pkgOfGo (Cons k rest) project from =
-  if inside k.dir from then k else pkgOfGo rest project from
+pkgOfGo : Paths -> List Pkg -> Pkg -> String -> Pkg
+pkgOfGo ps Nil project from = project
+pkgOfGo ps (Cons k rest) project from =
+  if inside ps k.dir from then k else pkgOfGo ps rest project from
 
 -- (the first part of a module name, and the rest, with its dot)
 headOf : String -> Pair String String
@@ -441,12 +428,13 @@ headOf w = case indexOf "." w of
   Nothing -> MkPair w ""
 
 -- (the package `k` requires by name `h`, where its module `rest` is)
-requiredPlace : List Pkg -> Pkg -> String -> String -> List Place
-requiredPlace pkgs k h rest = case filter
+requiredPlace : Paths -> List Pkg -> Pkg -> String -> String -> List Place
+requiredPlace ps pkgs k h rest = case filter
     (\(x : Pair String String) -> strEq (fst x) h)
     k.scope of
   Cons (MkPair n p) _ -> case pkgByPath pkgs p of
-    Just q -> [place (under q.src (importPath (q.own ++ rest))) (q.top ++ rest)]
+    Just q ->
+      [place (under ps q.src (importPath (q.own ++ rest))) (q.top ++ rest)]
     Nothing -> Nil
   Nil -> Nil
 
@@ -457,28 +445,28 @@ requiredPlace pkgs k h rest = case filter
 -- | under the root
 placesOf : Paths -> List Pkg -> String -> String -> List Place
 placesOf ps pkgs from w =
-  if inside ps.lib from && not (strEq ps.lib ".")
-    then [place (under ps.lib (importPath w)) w]
+  if inside ps ps.lib from && not (strEq ps.lib ".")
+    then [place (under ps ps.lib (importPath w)) w]
   else case pkgs of
     Nil -> Nil
     Cons project deps ->
       (\(k : Pkg) ->
          concatList
-           (if strEq k.own "" then [place (under k.src (importPath w)) w]
+           (if strEq k.own "" then [place (under ps k.src (importPath w)) w]
             else if strEq (fst (headOf w)) k.own
               then [ place
-                     (under k.src (importPath w))
+                     (under ps k.src (importPath w))
                      (k.top ++ snd (headOf w))
                    ]
             else Nil)
            (concatList
-              (requiredPlace pkgs k (fst (headOf w)) (snd (headOf w)))
+              (requiredPlace ps pkgs k (fst (headOf w)) (snd (headOf w)))
               (concatList
-                 [place (under ps.lib (importPath w)) w]
-                 (if strEq k.own "" && not (inside k.src from)
-                    then [place (under k.dir (importPath w)) w]
+                 [place (under ps ps.lib (importPath w)) w]
+                 (if strEq k.own "" && not (inside ps k.src from)
+                    then [place (under ps k.dir (importPath w)) w]
                   else Nil))))
-        (pkgOfGo deps project from)
+        (pkgOfGo ps deps project from)
 
 -- (every one of the places that reads, by `read`)
 readEvery : {e : HFunctor}
@@ -632,11 +620,11 @@ readPackageAt : {e : HFunctor}
               -> Paths
               -> Co e (Maybe (Either String Pr.Package))
 readPackageAt ps = do
-  text <- readFile (under ps.root "package.hf")
+  text <- readFile (under ps ps.root "package.hf")
   val (case text of
     Nothing -> Nothing
     Just src -> case Pr.readPackage src of
-      Left p -> Just (Left (problemMsg (under ps.root "package.hf") src p))
+      Left p -> Just (Left (problemMsg (under ps ps.root "package.hf") src p))
       Right pk -> Just (Right pk))
 
 packageOf : Maybe (Either String Pr.Package) -> Maybe Pr.Package
@@ -660,17 +648,18 @@ loadDone ps pk pkgs st =
   , packages = fst pkgs
   }
 
--- | the program rooted at `file`, the library at `lib`, each file read
--- | by `read` (an editor's unsaved text, say): its sources in dependency
--- | order, what could not be found, and where it looked
+-- | the program rooted at `file`, on the host `h` (the library, the
+-- | style of paths), each file read by `read` (an editor's unsaved text,
+-- | say): its sources in dependency order, what could not be found, and
+-- | where it looked
 loadProgramWith : {e : HFunctor}
                 -> {{ev : fs <: e}}
                 -> (String -> Co e (Maybe String))
-                -> String
+                -> Host
                 -> String
                 -> Co e Loaded
-loadProgramWith read lib file = do
-  ps <- pathsFor lib file
+loadProgramWith read h file = do
+  ps <- pathsFor h file
   pk <- readPackageAt ps
   pkgs <- packagesOf ps (packageOf pk)
   mSrc <- read file
@@ -698,7 +687,7 @@ loadProgramWith read lib file = do
 -- | ... each file read from the disk
 loadProgram : {e : HFunctor}
             -> {{ev : fs <: e}}
-            -> String
+            -> Host
             -> String
             -> Co e Loaded
-loadProgram lib file = loadProgramWith (\p -> readFile p) lib file
+loadProgram h file = loadProgramWith (\p -> readFile p) h file

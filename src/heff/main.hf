@@ -22,6 +22,7 @@ import heff.rpc as Rpc
 import heff.session as Se
 import heff.toplevel as T
 import fs
+import path as P
 import prelude
 import process
 import stdio
@@ -40,6 +41,12 @@ type Heff a =
   -> {{wire : Rpc.rpc <: world}}
   -> Co world a
 
+-- | the style of the paths of the platform heff runs on
+styleNow : Heff P.Style
+styleNow = do
+  p <- platform
+  pure (P.styleOf p)
+
 -- | where the standard library is: `HEFF_LIB`, else the `lib/` of the
 -- | repository the compiler is built in (it is `output/heff.mjs` or
 -- | `boot/heff.mjs` there)
@@ -49,15 +56,24 @@ libDir = do
   case v of
     Just lib -> pure lib
     Nothing -> do
+      st <- styleNow
       self <- programPath
-      pure (L.dirname (L.dirname self) ++ "/lib")
+      pure (P.join st (P.dirname st (P.dirname st self)) "lib")
+
+-- | the library, and the style of the platform's paths
+hostNow : Heff L.Host
+hostNow = do
+  lib <- libDir
+  st <- styleNow
+  pure { lib = lib, style = st }
 
 -- | the version of heff running: its package.json's, beside `output/`
 -- | (npm writes `"version": "a.b.c"`)
 ownVersion : Heff (Maybe String)
 ownVersion = do
+  st <- styleNow
   self <- programPath
-  json <- readFile (L.dirname (L.dirname self) ++ "/package.json")
+  json <- readFile (P.join st (P.dirname st (P.dirname st self)) "package.json")
   pure (case json of
     Just text -> case split "\"version\"" text of
       Cons _ (Cons rest _) -> case split "\"" rest of
@@ -122,8 +138,8 @@ withError l e =
 -- | be for this heff
 load : String -> Heff L.Loaded
 load file = do
-  lib <- libDir
-  l <- L.loadProgram lib file
+  h <- hostNow
+  l <- L.loadProgram h file
   running <- ownVersion
   pure (foldl withError l (heffErrors running l.packages))
 
@@ -137,10 +153,11 @@ readAll (Cons path rest) = do
       exit 1
       pure Nil
     Just src -> do
+      st <- styleNow
       more <- readAll rest
       pure
           (Cons
-             { module = L.moduleOf L.here path
+             { module = L.moduleOf (L.here st) path
              , path = path
              , source = src
              , renames = Nil
@@ -368,12 +385,15 @@ appCmd name outPath file =
     file
 
 runDir : L.Paths -> String
-runDir paths = L.under paths.root ".heff/run"
+runDir paths = L.under paths paths.root ".heff/run"
 
--- (FILE's path, its slashes underscores)
+-- (FILE's path, its separators underscores)
 runPath : L.Paths -> String -> String
 runPath paths file =
-  runDir paths ++ "/" ++ joinWith "_" (split "/" file) ++ ".mjs"
+  L.under
+    paths
+    (runDir paths)
+    (joinWith "_" (P.components paths.style file) ++ ".mjs")
 
 -- | run FILE's `main` with ARGS: compiled for Node.js to `.heff/run/`,
 -- | which runs in heff's place
@@ -956,14 +976,15 @@ hfFilesGo Nil acc = pure (reverse acc)
 hfFilesGo (Cons p rest) acc = do
   names <- readDir p
   case names of
-    Just ns ->
+    Just ns -> do
+      st <- styleNow
       hfFilesGo
-        (concatList
-           (map
-              (\n -> p ++ "/" ++ n)
-              (filter (\n -> not (startsWith "." n)) ns))
-           rest)
-        acc
+          (concatList
+             (map
+                (\n -> P.join st p n)
+                (filter (\n -> not (startsWith "." n)) ns))
+             rest)
+          acc
     Nothing ->
       if endsWith ".hf" p then hfFilesGo rest (Cons p acc)
       else hfFilesGo rest acc
@@ -1045,10 +1066,10 @@ publishChecked : String -> L.Loaded -> Pr.Package -> Heff Unit
 publishChecked v l pk = case Pr.majorMismatch pk.module v of
   Just why -> publishFails (pk.module ++ ": " ++ why)
   Nothing -> do
-    own <- L.ownDir (L.under l.paths.root "src")
+    own <- L.ownDir l.paths (L.under l.paths l.paths.root "src")
     case own of
       Left why -> publishFails why
-      Right _ -> publishGit v pk (L.under l.paths.root "src")
+      Right _ -> publishGit v pk (L.under l.paths l.paths.root "src")
 
 -- | publish the project, at the working directory, as version V: its
 -- | package.hf a Package (lib/manifest.hf), its path's `/vN` its major,
@@ -1074,19 +1095,10 @@ publishCmd v = case Pr.version v of
               then publishFails "package.hf is no Package (lib/manifest.hf)"
             else publishChecked v l pk
 
--- | the last part of a path, its trailing slashes dropped
-basename : String -> String
-basename p =
-  if strLength p > 1 && charCode p (strLength p - 1) == 47
-    then basename (strSlice p 0 (strLength p - 1))
-  else case L.lastSlash p (strLength p - 1) of
-    Just i -> strSlice p (i + 1) (strLength p)
-    Nothing -> p
-
 -- | the project's name: DIR's, or (DIR being `.`) the working directory's
-projectName : String -> Maybe String -> String
-projectName "." (Just pwd) = basename pwd
-projectName dir _ = basename dir
+projectName : P.Style -> String -> Maybe String -> String
+projectName st "." (Just pwd) = P.basename st pwd
+projectName st dir _ = P.basename st dir
 
 -- | the files of a new project NAME, for heff VERSION: what each is, and
 -- | its text
@@ -1141,7 +1153,8 @@ projectFiles name v =
 existing : String -> List (Pair String String) -> Heff (List String)
 existing dir Nil = pure Nil
 existing dir (Cons (MkPair f text) rest) = do
-  there <- readFile (dir ++ "/" ++ f)
+  st <- styleNow
+  there <- readFile (P.join st dir f)
   others <- existing dir rest
   case there of
     Just _ -> pure (Cons f others)
@@ -1159,11 +1172,12 @@ laidOut f text =
 writeAll : String -> List (Pair String String) -> Heff Bool
 writeAll dir Nil = pure True
 writeAll dir (Cons (MkPair f text) rest) = do
-  made <- mkDir (L.dirname (dir ++ "/" ++ f))
-  ok <- writeFile (dir ++ "/" ++ f) (laidOut f text)
+  st <- styleNow
+  made <- mkDir (P.dirname st (P.join st dir f))
+  ok <- writeFile (P.join st dir f) (laidOut f text)
   if made && ok then writeAll dir rest
     else do
-      printErr ("heff: cannot write " ++ dir ++ "/" ++ f)
+      printErr ("heff: cannot write " ++ P.join st dir f)
       pure False
 
 -- | a new project in DIR: its package.hf, a .gitignore, and a module of
@@ -1173,7 +1187,8 @@ initCmd : String -> Heff Unit
 initCmd dir = do
   pwd <- getEnv "PWD"
   v <- ownVersion
-  name <- pure (projectName dir pwd)
+  st <- styleNow
+  name <- pure (projectName st dir pwd)
   files <- pure (projectFiles name (fromMaybe "0.1.0" v))
   there <- existing dir files
   if not (Pr.isName name)
@@ -1234,8 +1249,8 @@ program = do
     "lsp" :: flags ->
       if all (\x -> startsWith "--" x) flags
         then do
-          lib <- libDir
-          Lsp.serve lib
+          h <- hostNow
+          Lsp.serve h
       else do
         printErr usage
         exit 1
