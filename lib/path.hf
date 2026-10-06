@@ -1,0 +1,302 @@
+-- Paths, in a style: `Posix` (`/a/b`) or `Windows` (`C:\a\b`,
+-- `\\server\share\a`, either slash read). The style is passed in, so
+-- each function means the same on every platform (like Node's
+-- `path.posix` and `path.win32`).
+
+import prelude
+
+data Style = Posix | Windows
+
+-- | A path read: its drive (Windows: `C:` or `//server/share`, with
+-- | `/`s; otherwise `""`), whether it starts at the root, and its
+-- | segments (no `""`, no `.`; `..` only by `normal`'s leave).
+type Path = { drive : String, absolute : Bool, segments : List String }
+
+-- | The separator the style writes.
+sep : Style -> String
+sep Posix = "/"
+sep Windows = "\\"
+
+-- (each separator the style reads, as `/`)
+slashes : Style -> String -> String
+slashes Posix s = s
+slashes Windows s = joinWith "/" (split "\\" s)
+
+-- (the code is a letter's)
+isLetter : Int -> Bool
+isLetter c = 65 <= c && c <= 90 || 97 <= c && c <= 122
+
+-- (the ASCII letters of `s`, in lower case)
+lower : String -> String
+lower s = joinWith "" (map low (range 0 (strLength s)))
+  where
+    low : Int -> String
+    low i =
+      if 65 <= charCode s i && charCode s i <= 90
+        then fromCharCode (charCode s i + 32)
+      else strSlice s i (i + 1)
+
+-- (`s`, with `/`s, after its drive: the drive and the rest)
+driveOf : Style -> String -> Pair String String
+driveOf Posix s = MkPair "" s
+driveOf Windows s =
+  if startsWith (prefix := "//") s && not (startsWith (prefix := "///") s)
+    then unc (split "/" (strSlice s 2 (strLength s)))
+  else if strLength s >= 2
+  && isLetter (charCode s 0)
+  && strEq (strSlice s 1 2) ":"
+    then MkPair (strSlice s 0 2) (strSlice s 2 (strLength s))
+  else MkPair "" s
+  where
+    unc : List String -> Pair String String
+    unc (server :: share :: rest) =
+      MkPair ("//" ++ server ++ "/" ++ share) ("/" ++ joinWith "/" rest)
+    unc _ = MkPair "" s
+
+-- | `s` read in the style.
+parse : Style -> String -> Path
+parse st s = case driveOf st (slashes st s) of
+  MkPair d rest ->
+    { drive = d
+    , absolute =
+        startsWith (prefix := "/") rest || startsWith (prefix := "//") d
+    , segments = filter keep (split "/" rest)
+    }
+  where
+    keep : String -> Bool
+    keep "" = False
+    keep "." = False
+    keep _ = True
+-- >>> parse Posix "/a//b/./c"
+-- { drive = "", absolute = True, segments = ["a", "b", "c"] }
+-- >>> parse Posix "a/../b"
+-- { drive = "", absolute = False, segments = ["a", "..", "b"] }
+-- >>> parse Posix ""
+-- { drive = "", absolute = False, segments = [] }
+-- >>> parse Posix "C:\\a"
+-- { drive = "", absolute = False, segments = ["C:\\a"] }
+-- >>> parse Windows "C:\\a/b"
+-- { drive = "C:", absolute = True, segments = ["a", "b"] }
+-- >>> parse Windows "c:a"
+-- { drive = "c:", absolute = False, segments = ["a"] }
+-- >>> parse Windows "\\\\srv\\share\\x"
+-- { drive = "//srv/share", absolute = True, segments = ["x"] }
+
+-- | `p` written in the style: `.` for nothing.
+render : Style -> Path -> String
+render st p =
+  if strEq p.drive "" && not p.absolute && null p.segments then "."
+  else slashesTo
+      (p.drive ++ (if p.absolute then "/" else "") ++ joinWith "/" p.segments)
+  where
+    slashesTo : String -> String
+    slashesTo s = joinWith (sep st) (split "/" s)
+-- >>> render Posix { drive = "", absolute = True, segments = [] }
+-- "/"
+-- >>> render Posix { drive = "", absolute = False, segments = [] }
+-- "."
+-- >>> render Windows { drive = "//srv/share", absolute = True, segments = ["a"] }
+-- "\\\\srv\\share\\a"
+
+-- (the segments, each `..` taking the one before it away: at the root,
+-- `..` is the root; otherwise, those left over stay)
+collapse : Bool -> List String -> List String
+collapse absolute xs = reverse (foldl step Nil xs)
+  where
+    step : List String -> String -> List String
+    step acc ".." = case acc of
+      Nil -> if absolute then Nil else [".."]
+      ".." :: _ -> ".." :: acc
+      _ :: rest -> rest
+    step acc x = x :: acc
+
+-- | `p` without its `..`s, where they can go.
+normal : Path -> Path
+normal p =
+  { drive = p.drive
+  , absolute = p.absolute
+  , segments = collapse p.absolute p.segments
+  }
+
+-- | `s`, without `.`, doubled slashes or the `..`s that can go, in the
+-- | style's separator.
+normalize : Style -> String -> String
+normalize st s = render st (normal (parse st s))
+-- >>> normalize Posix "/a/./b/../../../c/"
+-- "/c"
+-- >>> normalize Posix "a/../../b"
+-- "../b"
+-- >>> normalize Windows "C:/a\\..\\b"
+-- "C:\\b"
+
+isAbsolute : Style -> String -> Bool
+isAbsolute st s = (parse st s).absolute
+-- >>> isAbsolute Posix "/"
+-- True
+-- >>> isAbsolute Windows "C:\\x"
+-- True
+-- >>> isAbsolute Windows "C:x"
+-- False
+
+-- | `b` from `a`: `b` itself if it is absolute (on `a`'s drive if it has
+-- | none), `a` and `b` one after the other otherwise.
+join : Style -> String -> String -> String
+join st a b = render st (normal (onto (parse st a) (parse st b)))
+  where
+    onto : Path -> Path -> Path
+    onto p q =
+      if not (strEq q.drive "") then q
+      else if q.absolute
+        then { drive = p.drive, absolute = True, segments = q.segments }
+      else { drive = p.drive
+           , absolute = p.absolute
+           , segments = concatList p.segments q.segments
+           }
+-- >>> join Posix "src" "heff/load.hf"
+-- "src/heff/load.hf"
+-- >>> join Posix "/a/b" "../c"
+-- "/a/c"
+-- >>> join Posix "/a" "/b"
+-- "/b"
+-- >>> join Windows "C:\\a" "\\b"
+-- "C:\\b"
+-- >>> join Windows "C:\\a" "b/c.hf"
+-- "C:\\a\\b\\c.hf"
+
+-- | The paths, each from the one before.
+joinAll : Style -> List String -> String
+joinAll st Nil = "."
+joinAll st (x :: xs) = foldl (join st) (normalize st x) xs
+-- >>> joinAll Posix ["a", "b", "c"]
+-- "a/b/c"
+
+-- | The directory `s` is in (the root's is the root).
+dirname : Style -> String -> String
+dirname st s = render st (up (parse st s))
+  where
+    up : Path -> Path
+    up p =
+      { drive = p.drive
+      , absolute = p.absolute
+      , segments = reverse (drop 1 (reverse p.segments))
+      }
+-- >>> dirname Posix "/a/b/c.hf"
+-- "/a/b"
+-- >>> dirname Posix "c.hf"
+-- "."
+-- >>> dirname Posix "/"
+-- "/"
+-- >>> dirname Windows "C:\\a"
+-- "C:\\"
+
+-- | The last segment of `s` (`""` for a root).
+basename : Style -> String -> String
+basename st s = fromMaybe "" (last (parse st s).segments)
+-- >>> basename Posix "/a/b/c.hf/"
+-- "c.hf"
+-- >>> basename Windows "C:\\a\\b.hf"
+-- "b.hf"
+
+-- (the last `.` in `s` at or before `i`, not at 0)
+lastDot : String -> Int -> Maybe Int
+lastDot s i =
+  if i <= 0 then Nothing
+  else if strEq (strSlice s i (i + 1)) "." then Just i
+  else lastDot s (i - 1)
+
+-- | The extension of `s`'s last segment, with its `.` (`""` if none: a
+-- | name starting with `.` has none by that `.`).
+extension : Style -> String -> String
+extension st s = case lastDot (basename st s) (strLength (basename st s) - 1) of
+  Nothing -> ""
+  Just i -> strSlice (basename st s) i (strLength (basename st s))
+-- >>> extension Posix "src/main.hf"
+-- ".hf"
+-- >>> extension Posix "a.tar.gz"
+-- ".gz"
+-- >>> extension Posix ".heff"
+-- ""
+-- >>> extension Posix "Makefile"
+-- ""
+
+-- | `s`'s last segment, without its extension.
+stem : Style -> String -> String
+stem st s =
+  strSlice
+    (basename st s)
+    0
+    (strLength (basename st s) - strLength (extension st s))
+-- >>> stem Posix "src/heff/load.hf"
+-- "load"
+
+-- (the drives are the same: on Windows, in any case)
+sameDrive : Style -> String -> String -> Bool
+sameDrive Posix a b = strEq a b
+sameDrive Windows a b = strEq (lower a) (lower b)
+
+-- (the segments are the same: on Windows, in any case)
+sameSegment : Style -> String -> String -> Bool
+sameSegment = sameDrive
+
+-- (`ys` after the segments it shares with `xs`, from the front, with
+-- what is left of `xs`)
+unshared : Style
+         -> List String
+         -> List String
+         -> Pair (List String) (List String)
+unshared st (x :: xs) (y :: ys) =
+  if sameSegment st x y then unshared st xs ys else MkPair (x :: xs) (y :: ys)
+unshared st xs ys = MkPair xs ys
+
+-- | How to get to `to` from `from`, if there is a way: both are absolute
+-- | on one drive, or both relative from one place.
+relative : Style -> String -> String -> Maybe String
+relative st from to = go (normal (parse st from)) (normal (parse st to))
+  where
+    go : Path -> Path -> Maybe String
+    go p q =
+      if not (sameDrive st p.drive q.drive)
+      || (if p.absolute then not q.absolute else q.absolute)
+        then Nothing
+      else case unshared st p.segments q.segments of
+        MkPair up down ->
+          if elemBy strEq ".." up then Nothing
+          else Just
+              (render
+                 st
+                 { drive = ""
+                 , absolute = False
+                 , segments = concatList (map (\_ -> "..") up) down
+                 })
+-- >>> relative Posix "/a/b/c" "/a/d"
+-- Just "../../d"
+-- >>> relative Posix "/a" "/a/b/c.hf"
+-- Just "b/c.hf"
+-- >>> relative Posix "/a" "/a"
+-- Just "."
+-- >>> relative Posix "/a" "b"
+-- Nothing
+-- >>> relative Windows "C:\\Src\\heff" "c:\\src\\lib"
+-- Just "..\\lib"
+-- >>> relative Windows "C:\\a" "D:\\a"
+-- Nothing
+
+-- | `s` is `dir` or under it.
+isUnder : Style -> String -> String -> Bool
+isUnder st dir s = case relative st dir s of
+  Just r -> not (strEq r "..") && not (startsWith (prefix := ".." ++ sep st) r)
+  Nothing -> False
+-- >>> isUnder Posix "/a/b" "/a/b/c"
+-- True
+-- >>> isUnder Posix "/a/b" "/a/bc"
+-- False
+-- >>> isUnder Posix "/a/b" "/a/b"
+-- True
+-- >>> isUnder Posix "src" "src/../lib/x.hf"
+-- False
+
+-- | A `/`-path (as `package.hf` writes them) in the style.
+fromSlashes : Style -> String -> String
+fromSlashes st s = joinWith (sep st) (split "/" s)
+-- >>> fromSlashes Windows "src/heff"
+-- "src\\heff"
