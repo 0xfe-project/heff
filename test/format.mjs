@@ -5,7 +5,7 @@
 // nothing; then cases of comments, blank lines, blocks and watches, some
 // with the exact result.
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -33,7 +33,9 @@ const formats = (what, src, want) => {
 
 // (but those that do not parse on purpose, which are left)
 const unparsed = ["test/errors/recover.hf"];
-const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
+const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
+  // (the index may still list a file the working copy has removed)
+  .filter((f) => existsSync(join(root, f)));
 for (const f of files) {
   const src = readFileSync(join(root, f), "utf8");
   if (!unparsed.includes(f)) formats(f, src);

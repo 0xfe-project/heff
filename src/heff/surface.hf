@@ -1,15 +1,19 @@
--- The reader: text into notation.  The lexer is src/heff/fmt/lex.hf, the one
--- the formatter runs on; the
--- expression grammar's functions call one another, so they are the
--- fields of one record, `gram`, as src/heff/fmt/cst.hf's are.  `P` is the
--- reader's monad -- state threaded, a diagnostic thrown -- and this
--- module's `bind` is its.
+-- The reader: text into notation.  The text is read once, by `heff.cst`
+-- (the concrete syntax the formatter lays out too); here what it reads
+-- is lowered into the notation the elaborator takes -- which names are
+-- in scope (a capitalised one is a tag unless it is), how operators bind
+-- (the fixities), the sugar taken apart, and signatures met with their
+-- equations.  `P` is the lowering's monad -- state threaded, a diagnostic
+-- thrown -- and this module's `bind` is its; the lowering's functions
+-- call one another, so they are the fields of one record, `lw`.
 
 import array as A
+import heff.cst as C
 import heff.fixity as F
+import heff.fmt.lex as L
+import heff.fmt.toks as Tk
 import heff.notation
 import heff.params as Pm
-import heff.fmt.lex as L
 import prelude
 
 type Binders = { f : String, names : List String, implicits : List String }
@@ -17,18 +21,15 @@ type Binders = { f : String, names : List String, implicits : List String }
 mkBinders : String -> List String -> List String -> Binders
 mkBinders f names implicits = { f = f, names = names, implicits = implicits }
 
--- | `start`: the token that starts the current item; `binders`: the
--- | names each signature binds; `patVars`: those of the equation being
--- | read; `fix`: the fixities in scope; `lenient`: unrelated operators
--- | bind as one left-associative group (the formatter's reading)
+-- | `toks`: the tokens read (the lowering looks one past a parenthesis);
+-- | `scope`: the names bound where the lowering is; `binders`: the names
+-- | each signature binds; `patVars`: those of the equation being lowered;
+-- | `fix`: the fixities in scope; `lenient`: unrelated operators bind as
+-- | one left-associative group (the formatter's reading)
 type St =
-  { toks : Array L.Tok
-  , i : Int
-  , top : Int
-  , stack : List Int
+  { toks : Array C.T
   , scope : List String
   , known : String -> Bool
-  , start : Int
   , binders : List Binders
   , patVars : List String
   , fix : F.Fixities
@@ -47,8 +48,8 @@ bindStep (MkPair (Right x) st) f = f x st
 bind : {a b : Type} -> P a -> (a -> P b) -> P b
 bind m f = \st -> bindStep (m st) f
 
-val : {a : Type} -> a -> P a
-val x = \st -> MkPair (Right x) st
+pure : {a : Type} -> a -> P a
+pure x = \st -> MkPair (Right x) st
 
 pGets : {a : Type} -> (St -> a) -> P a
 pGets f = \st -> MkPair (Right (f st)) st
@@ -63,306 +64,55 @@ diag : Pm.Span -> String -> Diag
 diag span msg =
   { code = 150, severity = SError, msg = msg, span = span, note = Nothing }
 
--- state updates, spelled once
-setI : Int -> St -> St
-setI i s =
-  { toks = s.toks
-  , i = i
-  , top = s.top
-  , stack = s.stack
-  , scope = s.scope
-  , known = s.known
-  , start = s.start
-  , binders = s.binders
-  , patVars = s.patVars
-  , fix = s.fix
-  , lenient = s.lenient
-  }
-
-setStack : List Int -> St -> St
-setStack k s =
-  { toks = s.toks
-  , i = s.i
-  , top = s.top
-  , stack = k
-  , scope = s.scope
-  , known = s.known
-  , start = s.start
-  , binders = s.binders
-  , patVars = s.patVars
-  , fix = s.fix
-  , lenient = s.lenient
+mkSt : Array C.T
+     -> List String
+     -> (String -> Bool)
+     -> List Binders
+     -> List String
+     -> F.Fixities
+     -> Bool
+     -> St
+mkSt toks scope known binders patVars fix lenient =
+  { toks = toks
+  , scope = scope
+  , known = known
+  , binders = binders
+  , patVars = patVars
+  , fix = fix
+  , lenient = lenient
   }
 
 setScope : List String -> St -> St
-setScope sc s =
-  { toks = s.toks
-  , i = s.i
-  , top = s.top
-  , stack = s.stack
-  , scope = sc
-  , known = s.known
-  , start = s.start
-  , binders = s.binders
-  , patVars = s.patVars
-  , fix = s.fix
-  , lenient = s.lenient
-  }
-
-setStart : Int -> St -> St
-setStart x s =
-  { toks = s.toks
-  , i = s.i
-  , top = s.top
-  , stack = s.stack
-  , scope = s.scope
-  , known = s.known
-  , start = x
-  , binders = s.binders
-  , patVars = s.patVars
-  , fix = s.fix
-  , lenient = s.lenient
-  }
-
-setTop : Int -> St -> St
-setTop x s =
-  { toks = s.toks
-  , i = s.i
-  , top = x
-  , stack = s.stack
-  , scope = s.scope
-  , known = s.known
-  , start = s.start
-  , binders = s.binders
-  , patVars = s.patVars
-  , fix = s.fix
-  , lenient = s.lenient
-  }
+setScope sc s = mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient
 
 setBinders : List Binders -> St -> St
-setBinders b s =
-  { toks = s.toks
-  , i = s.i
-  , top = s.top
-  , stack = s.stack
-  , scope = s.scope
-  , known = s.known
-  , start = s.start
-  , binders = b
-  , patVars = s.patVars
-  , fix = s.fix
-  , lenient = s.lenient
-  }
+setBinders b s = mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient
 
 setPatVars : List String -> St -> St
-setPatVars pv s =
-  { toks = s.toks
-  , i = s.i
-  , top = s.top
-  , stack = s.stack
-  , scope = s.scope
-  , known = s.known
-  , start = s.start
-  , binders = s.binders
-  , patVars = pv
-  , fix = s.fix
-  , lenient = s.lenient
-  }
+setPatVars pv s = mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient
 
--- Tokens and layout
+-- Tokens and spans
 --------------------------------------------------------------------------------
-
-eofTok : L.Tok
-eofTok =
-  { kind = "eof"
-  , text = ""
-  , start = 0
-  , end = 0
-  , line = 0
-  , col = 0
-  , first = True
-  }
 
 -- | `:` annotates (`::` is an operator: the prelude's cons)
 isAnnText : String -> Bool
 isAnnText x = strEq x ":"
 
+-- (a token as the lexer gives it: the fixities are read from those)
 spanOf : L.Tok -> Pm.Span
 spanOf t = { start = t.start, end = t.end }
 
-spanTT : L.Tok -> L.Tok -> Pm.Span
+spanT : C.T -> Pm.Span
+spanT t = { start = t.start, end = t.end }
+
+spanTT : C.T -> C.T -> Pm.Span
 spanTT a b = { start = a.start, end = b.end }
 
-spanTE : L.Tok -> Int -> Pm.Span
+spanTE : C.T -> Int -> Pm.Span
 spanTE a e = { start = a.start, end = e }
 
 mkSpan : Int -> Int -> Pm.Span
 mkSpan a b = { start = a, end = b }
-
-endBefore : St -> Int -> Int
-endBefore s j = if j <= 0 then 0 else (A.index s.toks (j - 1)).end
-
-atTok : St -> Int -> L.Tok -> L.Tok
-atTok s j t =
-  if j > s.top && t.first && t.col == 0 && not (strEq t.kind "eof")
-    then { kind = "eof"
-         , text = ""
-         , start = endBefore s j
-         , end = endBefore s j
-         , line = 0
-         , col = 0
-         , first = True
-         }
-  else if strEq t.kind "eof"
-    then { kind = "eof"
-         , text = ""
-         , start = endBefore s j
-         , end = endBefore s j
-         , line = 0
-         , col = 0
-         , first = True
-         }
-  else t
-
--- | the token at an index, as the declaration being read sees it: a line
--- | starting at the left margin ends it
-tokAt : St -> Int -> L.Tok
-tokAt s j =
-  if j < 0 || j >= A.length s.toks
-    then { kind = "eof"
-         , text = ""
-         , start = endBefore s j
-         , end = endBefore s j
-         , line = 0
-         , col = 0
-         , first = True
-         }
-  else atTok s j (A.index s.toks j)
-
-cur : St -> L.Tok
-cur s = tokAt s s.i
-
--- | a token, as an error says what it found
-shown : L.Tok -> String
-shown t =
-  if strEq t.kind "eof" then "the end of the declaration"
-  else "`" ++ t.text ++ "`"
-
-peek : P L.Tok
-peek = pGets cur
-
-peekAt : Int -> P L.Tok
-peekAt k = pGets (\s -> tokAt s (s.i + k))
-
--- | where the last token read ends
-prevEnd : P Int
-prevEnd = pGets (\s -> (tokAt s (s.i - 1)).end)
-
-pure : {a : Type} -> a -> P a
-pure x = val x
-
-next : P L.Tok
-next = do
-  t <- peek
-  pModify (\s -> setI (s.i + 1) s)
-  pure t
-
-lastD : List Int -> Int
-lastD Nil = 0
-lastD (Cons x Nil) = x
-lastD (Cons x rest) = lastD rest
-
-initL : {a : Type} -> List a -> List a
-initL Nil = Nil
-initL (Cons x Nil) = Nil
-initL (Cons x rest) = Cons x (initL rest)
-
-snocL : {a : Type} -> List a -> a -> List a
-snocL Nil y = Cons y Nil
-snocL (Cons x rest) y = Cons x (snocL rest y)
-
--- | the token ends what is being read: it is the end, or starts a line
--- | not indented past the current block
-atBoundary : P Bool
-atBoundary =
-  pGets
-    (\s ->
-       strEq (cur s).kind "eof"
-       || ((cur s).first
-           && (cur s).col <= lastD s.stack
-           && not (s.i == s.start)))
-
-expectAnn : P L.Tok
-expectAnn = do
-  t <- peek
-  if strEq t.kind "sym" && isAnnText t.text then next
-    else throwP (diag (spanOf t) "expected `:`")
-
-expectSym : String -> P L.Tok
-expectSym x = do
-  t <- peek
-  if strEq t.kind "sym" && strEq t.text x then next
-    else throwP (diag (spanOf t) ("expected `" ++ x ++ "`, not " ++ shown t))
-
-expectPunct : String -> P L.Tok
-expectPunct x = do
-  t <- peek
-  if strEq t.kind "punct" && strEq t.text x then next
-    else throwP (diag (spanOf t) ("expected `" ++ x ++ "`, not " ++ shown t))
-
-expectKw : String -> P L.Tok
-expectKw x = do
-  t <- peek
-  if strEq t.kind "kw" && strEq t.text x then next
-    else throwP (diag (spanOf t) ("expected `" ++ x ++ "`, not " ++ shown t))
-
-expectKind : String -> String -> P L.Tok
-expectKind k what = do
-  t <- peek
-  if strEq t.kind k then next
-    else throwP (diag (spanOf t) ("expected " ++ what ++ ", not " ++ shown t))
-
--- | the items of a block: the first sets the column
--- | the token starts the block's next item (a line starting `where` ends
--- | the block: the `where` of an equation)
-continuesBlock : L.Tok -> Int -> Bool
-continuesBlock t col =
-  not (strEq t.kind "eof")
-  && t.first
-  && t.col == col
-  && not (strEq t.kind "kw" && strEq t.text "where")
-
-blockGo : {a : Type} -> P a -> Int -> List a -> P (List a)
-blockGo item col acc = do
-  pModify (\s -> setStart s.i s)
-  x <- item
-  t' <- peek
-  if continuesBlock t' col then blockGo item col (Cons x acc)
-    else pure (reverse (Cons x acc))
-
-block : {a : Type} -> P a -> P (List a)
-block item = do
-  t <- peek
-  if strEq t.kind "eof" then throwP (diag (spanOf t) "a block is empty")
-    else do
-      outer <- pGets (\s -> lastD s.stack)
-      if t.first && t.col <= outer
-          then throwP
-              (diag (spanOf t) "a block must be indented past what it is in")
-        else do
-          pModify (\s -> setStack (snocL s.stack t.col) s)
-          saved <- pGets (\s -> s.scope)
-          xs <- blockGo item t.col Nil
-          pModify (\s -> setScope saved (setStack (initL s.stack) s))
-          pure xs
-
--- | inside brackets, lines do not end anything
-inBrackets : {a : Type} -> P a -> P a
-inBrackets p = do
-  pModify (\s -> setStack (snocL s.stack (0 - 1)) s)
-  x <- p
-  pModify (\s -> setStack (initL s.stack) s)
-  pure x
 
 appendS : {a : Type} -> List a -> List a -> List a
 appendS Nil ys = ys
@@ -376,61 +126,21 @@ withScope xs p = do
   pModify (\s -> setScope saved s)
   pure x
 
-startsAtom : L.Tok -> Bool
-startsAtom t =
-  elemBy strEq t.kind ["var", "con", "tag", "int", "float", "str"]
-  || (strEq t.kind "kw"
-      && elemBy
-        strEq
-        t.text
-        ["Type", "Int", "Float", "String", "Array", "data", "abandon"])
-  || (strEq t.kind "punct"
-      && (strEq t.text "(" || strEq t.text "{" || strEq t.text "["))
+traverseS : {a b : Type} -> (a -> P b) -> List a -> P (List b)
+traverseS f Nil = pure Nil
+traverseS f (Cons x xs) = do
+  y <- f x
+  ys <- traverseS f xs
+  pure (Cons y ys)
 
-startsItem : L.Tok -> Bool
-startsItem t =
-  startsAtom t
-  || strEq t.kind "var"
-  || (strEq t.kind "punct" && strEq t.text "(")
-
--- | as many as there are (a failure that reads nothing ends them);
--- | gathered newest first, reversed at the end
-manyGo : P Ntn -> List Ntn -> P (List Ntn)
-manyGo p acc = do
-  b <- atBoundary
-  t <- peek
-  if b || not (startsItem t) then pure (reverse acc)
-    else do
-      x <- p
-      manyGo p (Cons x acc)
-
-many : P Ntn -> P (List Ntn)
-many p = manyGo p Nil
-
-many1 : P Ntn -> P (List Ntn)
-many1 p = do
-  x <- p
-  xs <- many p
-  pure (Cons x xs)
-
-sepGo : {a : Type} -> String -> P a -> List a -> P (List a)
-sepGo sep p acc = do
-  t <- peek
-  if strEq t.text sep
-      then do
-        n <- next
-        y <- p
-        sepGo sep p (Cons y acc)
-    else pure (reverse acc)
-
-sepBy1 : {a : Type} -> String -> P a -> P (List a)
-sepBy1 sep p = do
-  x <- p
-  sepGo sep p (Cons x Nil)
-
--- | a symbol that is an operator (not syntax)
-isOperator : L.Tok -> Bool
-isOperator t = strEq t.kind "sym" && not (elemBy strEq t.text F.reserved)
+-- | the items of a block, lowered: what one binds is in scope in those
+-- | after it, not after the block
+block : {a b : Type} -> (a -> P b) -> List a -> P (List b)
+block f xs = do
+  saved <- pGets (\s -> s.scope)
+  ys <- traverseS f xs
+  pModify (\s -> setScope saved s)
+  pure ys
 
 -- Number literals
 --------------------------------------------------------------------------------
@@ -508,27 +218,9 @@ floatOfText s =
         (splitExp (strSlice s 1 (strLength s)) 0)
   else floatSplit s (splitExp s 0)
 
--- The expression grammar
---------------------------------------------------------------------------------
+type Operand = { op : C.T, e : Ntn }
 
-type Gram =
-  { expr : P Ntn
-  , opExprN : Int -> P Ntn
-  , userOps : P Ntn
-  , app : P Ntn
-  , atom : P Ntn
-  , pattern_ : P Ntn
-  , patAtom : P Ntn
-  , lambda_ : P Ntn
-  , caseE : P Ntn
-  , ifE : P Ntn
-  , doE : P Ntn
-  , letE : P Ntn
-  }
-
-type Operand = { op : L.Tok, e : Ntn }
-
-mkOperand : L.Tok -> Ntn -> Operand
+mkOperand : C.T -> Ntn -> Operand
 mkOperand t e = { op = t, e = e }
 
 binderNames : Ntn -> List String
@@ -556,16 +248,20 @@ concatMapS : {a b : Type} -> (a -> List b) -> List a -> List b
 concatMapS f Nil = Nil
 concatMapS f (Cons x xs) = appendS (f x) (concatMapS f xs)
 
-patVarsOf : Ntn -> List String
-patVarsOf n = case (getGroup n).head of
-  At (Ident x) _ ->
-    if length (getGroup n).args == 0 && not (strEq x "_") then Cons x Nil
-    -- (`p :: q`, an operator applied)
-    else concatMapS (\m -> patVarsOf m) (getGroup n).args
-  At (NTag _) _ -> concatMapS (\m -> patVarsOf m) (getGroup n).args
-  At (NBlock "struct" _ fs) _ ->
-    concatMapS (\m -> patVarsOf m) (map (\f -> fieldPatOf f) fs)
-  _ -> Nil
+-- | the names a pattern binds (`_` binds nothing; a tag is no
+-- | variable; nor is a capitalised name, unless `pv`, the parameters the
+-- | signature names, has it)
+boundBy : List String -> C.Pat -> List String
+boundBy pv (PAtom t) =
+  if strEq t.kind "var" && not (strEq t.text "_") then Cons t.text Nil
+  else if strEq t.kind "con" && elemBy strEq t.text pv then Cons t.text Nil
+  else Nil
+boundBy pv (PCon c args) = concatMapS (\q -> boundBy pv q) args
+boundBy pv (PParen o q c) = boundBy pv q
+boundBy pv (PList o ps commas c) = concatMapS (\q -> boundBy pv q) ps
+boundBy pv (POp l op q) = appendS (boundBy pv l) (boundBy pv q)
+boundBy pv (PRec o fs commas c) = concatMapS (\q -> boundBy pv q) fs
+boundBy pv (PField x eq q) = boundBy pv q
 
 isIdentN : Ntn -> Bool
 isIdentN (At (Ident _) _) = True
@@ -652,10 +348,6 @@ arrowNames sp lhs rhs g ksp ty braced orig =
 
 -- `{a : T} -> B`: braces with one declaration, left of an arrow, bind
 -- an implicit argument
-bracedLhs : Ntn -> Ntn
-bracedLhs (At (NBlock "sig" Nothing (Cons f Nil)) bsp) = At (NBrace f) bsp
-bracedLhs n = n
-
 arrowBinop : Pm.Span -> Ntn -> Ntn -> Ntn
 arrowBinop sp lhs rhs = case lhs of
   At (Infix g (At (Keyword ":") ksp) ty) _ ->
@@ -674,20 +366,10 @@ specOne sp acc (At (Infix (At (Ident x) xsp) k v) _) =
        (ntnSpan (infixOp (At (Ident x) xsp) k v)))
 specOne sp acc _ = acc
 
--- | `x -> y`, with `(a b : T) -> B` for `(a : T) -> (b : T) -> B`; and
--- | `T ~ { f = v }`, a specialisation
-binop : String -> Pm.Span -> Ntn -> Ntn -> Ntn
-binop "->" sp lhs0 rhs = arrowBinop sp (bracedLhs lhs0) rhs
-binop "~" sp lhs rhs = case rhs of
-  At (NBlock "struct" Nothing fields) _ ->
-    foldl (\acc f -> specOne sp acc f) lhs fields
-  _ -> infixOp lhs (At (Keyword "~") sp) rhs
-binop o sp lhs rhs = infixOp lhs (At (Keyword o) sp) rhs
-
 -- The shunting yard
 --------------------------------------------------------------------------------
 
-type Shunt = { ops : List L.Tok, out : List Ntn }
+type Shunt = { ops : List C.T, out : List Ntn }
 
 maxI : Int -> Int -> Int
 maxI a b = if a < b then b else a
@@ -696,41 +378,41 @@ boolAnn : Pm.Span -> Ntn -> Ntn
 boolAnn osp n = infixOp n (At (Keyword ":") osp) (At (Ident "Bool") osp)
 
 -- (the sides are annotated with the `Bool` in scope)
-shortcut : L.Tok -> Ntn -> Ntn -> Ntn -> Ntn
+shortcut : C.T -> Ntn -> Ntn -> Ntn -> Ntn
 shortcut op c a b =
   boolAnn
-    (spanOf op)
+    (spanT op)
     (At
        (NBlock
           "match"
-          (Just (boolAnn (spanOf op) c))
+          (Just (boolAnn (spanT op) c))
           (Cons
              (infixOp
-                (At (NTag "True") (spanOf op))
-                (At (Keyword "=>") (spanOf op))
+                (At (NTag "True") (spanT op))
+                (At (Keyword "=>") (spanT op))
                 a)
              (Cons
                 (infixOp
-                   (At (NTag "False") (spanOf op))
-                   (At (Keyword "=>") (spanOf op))
+                   (At (NTag "False") (spanT op))
+                   (At (Keyword "=>") (spanT op))
                    b)
                 Nil)))
        (mkSpan (ntnSpan c).start (maxI (ntnSpan a).end (ntnSpan b).end)))
 
 -- | `&&` and `||` are `if`: the right side is computed only if needed
-applyOp : L.Tok -> Ntn -> Ntn -> Ntn
+applyOp : C.T -> Ntn -> Ntn -> Ntn
 applyOp op l r =
-  if strEq op.text "&&" then shortcut op l r (At (NTag "False") (spanOf op))
-  else if strEq op.text "||" then shortcut op l (At (NTag "True") (spanOf op)) r
-  else juxt (juxt (At (Ident op.text) (spanOf op)) l) r
+  if strEq op.text "&&" then shortcut op l r (At (NTag "False") (spanT op))
+  else if strEq op.text "||" then shortcut op l (At (NTag "True") (spanT op)) r
+  else juxt (juxt (At (Ident op.text) (spanT op)) l) r
 
 -- | in a pattern, an operator is applied as a tag is: its operands are
 -- | its arguments
-applyPatOp : L.Tok -> Ntn -> Ntn -> Ntn
-applyPatOp op l r = group (At (Ident op.text) (spanOf op)) (Cons l (Cons r Nil))
+applyPatOp : C.T -> Ntn -> Ntn -> Ntn
+applyPatOp op l r = group (At (Ident op.text) (spanT op)) (Cons l (Cons r Nil))
 
 -- (stacks newest first: push is `Cons`)
-reduceS : (L.Tok -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
+reduceS : (C.T -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
 reduceS apply st = case st.ops of
   Cons o os -> case st.out of
     Cons r (Cons l rest) -> { ops = os, out = Cons (apply o l r) rest }
@@ -738,7 +420,7 @@ reduceS apply st = case st.ops of
   Nil -> st
 
 -- | `before` is on the stack, `op` comes: does `before` reduce first?
-firstS : F.Fixities -> Bool -> L.Tok -> L.Tok -> P Bool
+firstS : F.Fixities -> Bool -> C.T -> C.T -> P Bool
 firstS fix lenient before op = case F.relate fix before.text op.text of
   Tighter -> pure True
   Looser -> pure False
@@ -747,7 +429,7 @@ firstS fix lenient before op = case F.relate fix before.text op.text of
   Same AssocNone ->
     throwP
       (diag
-         (spanOf op)
+         (spanT op)
          (if strEq before.text op.text
             then "`" ++ op.text ++ "` does not associate: add parentheses"
           else "`"
@@ -759,7 +441,7 @@ firstS fix lenient before op = case F.relate fix before.text op.text of
     if lenient then pure True
     else throwP
         (diag
-           (spanOf op)
+           (spanT op)
            ("`"
             ++ before.text
             ++ "` and `"
@@ -769,14 +451,14 @@ firstS fix lenient before op = case F.relate fix before.text op.text of
     if lenient then pure True
     else throwP
         (diag
-           (spanOf (if strEq x op.text then op else before))
+           (spanT (if strEq x op.text then op else before))
            ("`"
             ++ x
             ++ "` has no fixity: declare it (`infixl "
             ++ x
             ++ "`), or import the module that does"))
 
-pushS : (L.Tok -> Ntn -> Ntn -> Ntn)
+pushS : (C.T -> Ntn -> Ntn -> Ntn)
       -> F.Fixities
       -> Bool
       -> Shunt
@@ -789,7 +471,7 @@ pushS apply fix lenient st r = case st.ops of
     if done then pushS apply fix lenient (reduceS apply st) r
       else pure { ops = Cons r.op st.ops, out = Cons r.e st.out }
 
-pushAll : (L.Tok -> Ntn -> Ntn -> Ntn)
+pushAll : (C.T -> Ntn -> Ntn -> Ntn)
         -> F.Fixities
         -> Bool
         -> Shunt
@@ -808,14 +490,14 @@ checkFixOf fix lenient (Cons r rest) = case F.groupOf fix r.op.text of
     if lenient then checkFixOf fix lenient rest
     else throwP
         (diag
-           (spanOf r.op)
+           (spanT r.op)
            ("`"
             ++ r.op.text
             ++ "` has no fixity: declare it (`infixl "
             ++ r.op.text
             ++ "`), or import the module that does"))
 
-reduceAll : (L.Tok -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
+reduceAll : (C.T -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
 reduceAll apply st = case st.ops of
   Nil -> st
   Cons o os -> reduceAll apply (reduceS apply st)
@@ -826,632 +508,13 @@ headOr z (Cons x xs) = x
 
 -- | operators and operands into a tree, refusing operators that do not
 -- | go together
-resolve : (L.Tok -> Ntn -> Ntn -> Ntn) -> Ntn -> List Operand -> P Ntn
+resolve : (C.T -> Ntn -> Ntn -> Ntn) -> Ntn -> List Operand -> P Ntn
 resolve apply e0 rest = do
   fix <- pGets (\s -> s.fix)
   lenient <- pGets (\s -> s.lenient)
   checkFixOf fix lenient rest
   st <- pushAll apply fix lenient { ops = Nil, out = Cons e0 Nil } rest
   pure (headOr e0 (reduceAll apply st).out)
-
--- The grammar's functions, knotted through `gram`
---------------------------------------------------------------------------------
-
--- | a token that starts a closed expression (one that runs to the end)
-startsClosed : L.Tok -> Bool
-startsClosed t =
-  strEq t.text "\\"
-  || (strEq t.kind "kw" && elemBy strEq t.text ["case", "if", "do", "let"])
-
--- | the syntax's operators, loosest first: `->` (right), `~` (right)
-symPrec : String -> Int
-symPrec "->" = 1
-symPrec "~" = 2
-symPrec s = 0 - 1
-
-exprHead : Gram -> L.Tok -> P Ntn
-exprHead g t =
-  if strEq t.text "\\" && strEq t.kind "sym" then g.lambda_
-  else if strEq t.kind "kw" && strEq t.text "case" then g.caseE
-  else if strEq t.kind "kw" && strEq t.text "if" then g.ifE
-  else if strEq t.kind "kw" && strEq t.text "do" then g.doE
-  else if strEq t.kind "kw" && strEq t.text "let" then g.letE
-  else g.opExprN 0
-
-exprF : Gram -> P Ntn
-exprF g = do
-  t <- peek
-  e <- exprHead g t
-  t' <- peek
-  b <- atBoundary
-  if isAnnText t'.text && strEq t'.kind "sym" && not b
-      then do
-        n <- next
-        ty <- g.expr
-        pure (infixOp e (At (Keyword ":") (spanOf t')) ty)
-    else pure e
-
--- the codomain of `->` may be a lambda, a case, ... as any expression
-arrowRhsF : Gram -> P Ntn
-arrowRhsF g = do
-  t <- peek
-  if startsClosed t then g.expr else g.opExprN 1
-
-opLoopF : Gram -> Int -> Ntn -> P Ntn
-opLoopF g minPrec lhs = do
-  t <- peek
-  b <- atBoundary
-  if strEq t.kind "sym"
-    && symPrec t.text >= 1
-    && symPrec t.text >= minPrec
-    && not b
-      then do
-        n <- next
-        rhs <-
-          if symPrec t.text == 1 then arrowRhsF g
-          else g.opExprN (symPrec t.text)
-        opLoopF g minPrec (binop t.text (spanOf t) lhs rhs)
-    else pure lhs
-
-opExprF : Gram -> Int -> P Ntn
-opExprF g minPrec = do
-  lhs <- g.userOps
-  opLoopF g minPrec lhs
-
-operandsF : Gram -> List Operand -> P (List Operand)
-operandsF g acc = do
-  t <- peek
-  b <- atBoundary
-  if isOperator t && not b
-      then do
-        n <- next
-        u <- peek
-        if startsClosed u
-            then do
-              e <- g.expr
-              pure (reverse (Cons (mkOperand t e) acc))
-          else do
-            e <- g.app
-            operandsF g (Cons (mkOperand t e) acc)
-    else pure (reverse acc)
-
--- | `a + b * c`, as the fixities say.  An operand is an application,
--- | or, last, a lambda, `case`, `if` or `do`
-userOpsF : Gram -> P Ntn
-userOpsF g = do
-  e0 <- g.app
-  rest <- operandsF g Nil
-  if length rest == 0 then pure e0 else resolve applyOp e0 rest
-
--- | application: a head and its arguments
-appF : Gram -> P Ntn
-appF g = do
-  h <- g.atom
-  args <- many g.atom
-  pure (group h args)
-
-fieldsGo : Ntn -> P Ntn
-fieldsGo n = do
-  t <- peek
-  if strEq t.kind "field"
-      then do
-        f <- next
-        fieldsGo (juxt n (At (NField t.text) (spanOf t)))
-    else pure n
-
--- | `[a, b, c]`, `Cons a (Cons b (Cons c Nil))`, and `[]`, `Nil`
-listOfF : Gram -> P Ntn -> P Ntn
-listOfF g item = do
-  o <- next
-  inBrackets (do
-    t <- peek
-    xs <- if strEq t.text "]" then pure Nil else sepBy1 "," item
-    c <- expectPunct "]"
-    pure
-        (foldr
-           (\x rest ->
-              group (At (NTag "Cons") (spanTT o c)) (Cons x (Cons rest Nil)))
-           (At (NTag "Nil") (spanTT o c))
-           xs))
-
--- | `, e, e ...` (after the first of a tuple's components)
-many1SepF : Gram -> P (List Ntn)
-many1SepF g = do
-  t <- peek
-  if strEq t.text ","
-      then do
-        n <- next
-        e <- g.expr
-        rest <- many1SepF g
-        pure (Cons e rest)
-    else pure Nil
-
--- | `x : T` in a binder's parentheses names its variable
-binderOrExprF : Gram -> P Ntn
-binderOrExprF g = do
-  e <- g.expr
-  asBinder e
-
-settingF : Gram -> P Ntn
-settingF g = do
-  x <- next
-  eq <- expectSym "="
-  e <- g.expr
-  pure (infixOp (At (Ident x.text) (spanOf x)) (At (Keyword ":=") (spanOf x)) e)
-
-declarationF : Gram -> P Ntn
-declarationF g = do
-  e <- binderOrExprF g
-  case e of
-    At (Infix _ (At (Keyword ":") _) _) _ -> pure e
-    _ -> throwP (diag (ntnSpan e) "a field is `name : Type`")
-
--- | `{ x : A, ... }` (a record type), `{ x = e, ... }` (a record), `{}`,
--- | and `{x : A}` (an implicit binder)
-bracesF : Gram -> P Ntn
-bracesF g = do
-  o <- next
-  inBrackets (do
-    t <- peek
-    t2 <- peekAt 1
-    -- `{{x : T}}`: an instance argument -- an implicit one, found among
-    -- the instance binders in scope rather than by unification
-    if strEq t.kind "punct" && strEq t.text "{"
-        then do
-          i <- next
-          d <- inBrackets (declarationF g)
-          c1 <- expectPunct "}"
-          c <- expectPunct "}"
-          pure (At (NBracket d) (spanTT o c))
-      else if strEq t.text "}"
-        then do
-          c <- next
-          pure (At (NBlock "struct" Nothing Nil) (spanTT o c))
-      else if strEq t2.text "="
-        then do
-          fs <- sepBy1 "," (settingF g)
-          c <- expectPunct "}"
-          pure (At (NBlock "struct" Nothing fs) (spanTT o c))
-      else do
-        fs <- sepBy1 "," (declarationF g)
-        c <- expectPunct "}"
-        pure (At (NBlock "sig" Nothing fs) (spanTT o c)))
-
-altConF : Gram -> P Ntn
-altConF g = do
-  c <- next
-  args <- many g.atom
-  pure (group (At (NTag c.text) (spanOf c)) args)
-
--- | `data { A x | B }`, a sum type without a name
-anonymousSumF : Gram -> P Ntn
-anonymousSumF g = do
-  kw <- next
-  o <- expectPunct "{"
-  inBrackets (do
-    alts <- sepBy1 "|" (altConF g)
-    c <- expectPunct "}"
-    pure (At (NBlock "sum" Nothing alts) (spanTT kw c)))
-
--- | `( e )`, `( e : T )`, `(x := e)` (a named argument), `(+)`
-parensF : Gram -> P Ntn
-parensF g = do
-  o <- next
-  inBrackets (do
-    t <- peek
-    t2 <- peekAt 1
-    if isOperator t && strEq t2.text ")"
-        then do
-          n1 <- next
-          n2 <- next
-          pure (At (Ident t.text) (spanOf t))
-      else if (strEq t.kind "var" || strEq t.kind "con")
-      && strEq t2.kind "sym"
-      && strEq t2.text ":="
-        then do
-          n1 <- next
-          n2 <- next
-          e <- g.expr
-          c <- expectPunct ")"
-          pure
-              (At
-                 (NBrace
-                    (infixOp
-                       (At (Ident t.text) (spanOf t))
-                       (At (Keyword ":=") (spanOf t2))
-                       e))
-                 (spanTT o c))
-      else do
-        e <- g.expr
-        t' <- peek
-        if strEq t'.text ","
-            then do
-              rest <- many1SepF g
-              c <- expectPunct ")"
-              pure (At (NTuple (Cons e rest)) (spanTT o c))
-          else do
-            c <- expectPunct ")"
-            after <- peek
-            if strEq after.kind "sym" && strEq after.text "->" then asBinder e
-              else pure e)
-
--- (`M.x`, a definition of the module imported as `M`, unless `M` is a
--- variable here)
-conAtom : Gram -> L.Tok -> P Ntn
-conAtom g t = do
-  t2 <- peek
-  local <- pGets (\s -> elemBy strEq t.text s.scope)
-  qualified <-
-    pGets (\s -> strEq t2.kind "field" && s.known (t.text ++ "." ++ t2.text))
-  if qualified && not local
-      then do
-        n <- next
-        pure (At (Ident (t.text ++ "." ++ t2.text)) (spanTT t t2))
-    else do
-      inScope <- pGets (\s -> local || s.known t.text)
-      pure
-          (if inScope then At (Ident t.text) (spanOf t)
-           else At (NTag t.text) (spanOf t))
-
-atomBase : Gram -> L.Tok -> P Ntn
-atomBase g t =
-  if strEq t.kind "var"
-    then do
-      n <- next
-      pure (At (Ident t.text) (spanOf t))
-  else if strEq t.kind "con"
-    then do
-      n <- next
-      conAtom g t
-  else if strEq t.kind "tag"
-    then do
-      n <- next
-      pure (At (NTag t.text) (spanOf t))
-  else if strEq t.kind "int"
-    then do
-      n <- next
-      pure (At (NInt (intOfText t.text)) (spanOf t))
-  else if strEq t.kind "float"
-    then do
-      n <- next
-      pure (At (NFloat (floatOfText t.text)) (spanOf t))
-  else if strEq t.kind "str"
-    then do
-      n <- next
-      pure (At (NString t.text) (spanOf t))
-  else if strEq t.kind "kw"
-  && elemBy strEq t.text ["Type", "Int", "Float", "String", "Array", "abandon"]
-    then do
-      n <- next
-      pure (At (Keyword t.text) (spanOf t))
-  else if strEq t.kind "kw" && strEq t.text "data" then anonymousSumF g
-  else if strEq t.kind "punct" && strEq t.text "(" then parensF g
-  else if strEq t.kind "punct" && strEq t.text "{" then bracesF g
-  else if strEq t.kind "punct" && strEq t.text "[" then listOfF g g.expr
-  else throwP (diag (spanOf t) ("expected an expression, not " ++ shown t))
-
--- | the arguments of an application, with fields: `x`, `C`, `3`, `"s"`,
--- | `(e)`, `{...}`, `p.x`
-atomF : Gram -> P Ntn
-atomF g = do
-  t <- peek
-  b <- atBoundary
-  if b || not (startsAtom t)
-      then throwP (diag (spanOf t) ("expected an expression, not " ++ shown t))
-    else do
-      base <- atomBase g t
-      fieldsGo base
-
-lamBinderF : Gram -> P Ntn
-lamBinderF g = do
-  t <- peek
-  if strEq t.kind "var" || strEq t.kind "con"
-      then do
-        n <- next
-        pure (At (Ident t.text) (spanOf t))
-    else if strEq t.kind "punct" && strEq t.text "{"
-      then do
-        n <- next
-        x <- peek
-        if not (strEq x.kind "var" || strEq x.kind "con")
-            then throwP (diag (spanOf x) "expected an implicit argument's name")
-          else do
-            n2 <- next
-            c <- expectPunct "}"
-            pure (At (NBrace (At (Ident x.text) (spanOf x))) (spanTT t c))
-    else if strEq t.kind "punct" && strEq t.text "("
-      then do
-        n <- next
-        inBrackets (do
-          x <- peek
-          if not (strEq x.kind "var" || strEq x.kind "con")
-              then throwP
-                  (diag (spanOf x) "expected a binder's name: `\\(x : T) -> e`")
-            else do
-              n2 <- next
-              cc <- expectAnn
-              ty <- g.expr
-              c <- expectPunct ")"
-              pure
-                  (infixOp
-                     (At (Ident x.text) (spanOf x))
-                     (At (Keyword ":") (spanOf cc))
-                     ty))
-    else throwP
-        (diag (spanOf t) "a lambda binds names: `\\x y -> e`, `\\(x : T) -> e`")
-
-lamBound : Ntn -> List String
-lamBound (At (Ident x) _) = Cons x Nil
-lamBound (At (NBrace (At (Ident x) _)) _) = Cons x Nil
-lamBound (At (Infix (At (Ident x) _) (At (Keyword ":") _) _) _) = Cons x Nil
-lamBound _ = Nil
-
-lamBinders : Gram -> List Ntn -> P (List Ntn)
-lamBinders g acc = do
-  t <- peek
-  if strEq t.kind "var"
-    || strEq t.kind "con"
-    || (strEq t.kind "punct" && (strEq t.text "{" || strEq t.text "("))
-      then do
-        b <- lamBinderF g
-        lamBinders g (Cons b acc)
-    else pure (reverse acc)
-
--- | `\x {y} _ -> e`
-lambdaF : Gram -> P Ntn
-lambdaF g = do
-  n <- next
-  bs <- do
-    b0 <- lamBinderF g
-    more <- lamBinders g Nil
-    pure (Cons b0 more)
-  arrow <- expectSym "->"
-  withScope (concatMapS lamBound bs) (do
-    body <- g.expr
-    pure (foldr (\b e -> infixOp b (At (Keyword "=>") (ntnSpan b)) e) body bs))
-
-alternativeF : Gram -> P Ntn
-alternativeF g = do
-  p <- g.pattern_
-  arrow <- expectSym "->"
-  withScope (patVarsOf p) (do
-    e <- g.expr
-    pure (infixOp p (At (Keyword "=>") (spanOf arrow)) e))
-
--- | `case e of` and its alternatives, `C x y -> e`
-caseExprF : Gram -> P Ntn
-caseExprF g = do
-  kw <- next
-  scrut <- g.expr
-  o <- expectKw "of"
-  alts <- block (alternativeF g)
-  end <- prevEnd
-  pure (At (NBlock "match" (Just scrut) alts) (spanTE kw end))
-
--- | `if c then a else b`, a `case` on `True` and `False`
-ifExprF : Gram -> P Ntn
-ifExprF g = do
-  kw <- next
-  c <- g.expr
-  o1 <- expectKw "then"
-  a <- g.expr
-  o2 <- expectKw "else"
-  b <- g.expr
-  end <- prevEnd
-  pure
-      (At
-         (NBlock
-            "match"
-            (Just c)
-            (Cons
-               (infixOp
-                  (At (NTag "True") (spanTE kw end))
-                  (At (Keyword "=>") (spanTE kw end))
-                  a)
-               (Cons
-                  (infixOp
-                     (At (NTag "False") (spanTE kw end))
-                     (At (Keyword "=>") (spanTE kw end))
-                     b)
-                  Nil)))
-         (spanTE kw end))
-
--- | `p = e`, or `p : T = e`, after `let`: the pattern, and what it is
--- | bound to (annotated, `(e : T)`)
-letHeadF : Gram -> P (Pair Ntn Ntn)
-letHeadF g = do
-  p <- g.pattern_
-  t <- peek
-  if strEq t.kind "sym" && isAnnText t.text
-      then do
-        cc <- next
-        ty <- g.expr
-        eq <- expectSym "="
-        e <- g.expr
-        pure
-            (MkPair
-               p
-               (At
-                  (Infix e (At (Keyword ":") (spanOf cc)) ty)
-                  (mkSpan (startPos ty) (endPos e))))
-    else do
-      eq <- expectSym "="
-      e <- g.expr
-      pure (MkPair p e)
-
--- | `in e` after `let p = e'`: `p`'s variables are bound in `e`
-letBodyF : Gram -> L.Tok -> Pair Ntn Ntn -> P Ntn
-letBodyF g kw (MkPair p rhs) = do
-  i <- expectKw "in"
-  withScope (patVarsOf p) (do
-    body <- g.expr
-    end <- prevEnd
-    pure
-        (At
-           (NBlock
-              "let"
-              (Just rhs)
-              (Cons (infixOp p (At (Keyword "=>") (spanOf i)) body) Nil))
-           (spanTE kw end)))
-
--- | `let p = e in e'`, a `case` of one alternative: `p` is a name, or a
--- | pattern every value matches
-letExprF : Gram -> P Ntn
-letExprF g = do
-  kw <- next
-  h <- letHeadF g
-  letBodyF g kw h
-
--- | `let p = e` in a `do` block, `p`'s variables bound in the statements
--- | after it (followed by `in`, it is the expression)
-letStmtF : Gram -> P Ntn
-letStmtF g = do
-  kw <- next
-  h <- letHeadF g
-  t <- peek
-  if strEq t.kind "kw" && strEq t.text "in" then letBodyF g kw h
-    else do
-      end <- prevEnd
-      pModify (\s -> setScope (appendS (patVarsOf (fst h)) s.scope) s)
-      pure (At (NBlock "let" (Just (snd h)) (Cons (fst h) Nil)) (spanTE kw end))
-
-statementF : Gram -> P Ntn
-statementF g = do
-  t <- peek
-  t2 <- peekAt 1
-  if strEq t.kind "kw" && strEq t.text "let" then letStmtF g
-    else if strEq t.kind "var" && strEq t2.text "<-"
-      then do
-        n <- next
-        arrow <- next
-        e <- g.expr
-        -- (the rest of the block sees it)
-        pModify (\s -> setScope (Cons t.text s.scope) s)
-        pure
-            (infixOp
-               (At (Ident t.text) (spanOf t))
-               (At (Keyword "<-") (spanOf arrow))
-               e)
-    else g.expr
-
--- | `do` and its statements, `x <- e` or `e`
-doExprF : Gram -> P Ntn
-doExprF g = do
-  kw <- next
-  stmts <- block (statementF g)
-  end <- prevEnd
-  pure (At (NBlock "do" Nothing stmts) (spanTE kw end))
-
--- | `x = p` in a record pattern
-fieldPatF : Gram -> P Ntn
-fieldPatF g = do
-  x <- expectKind "var" "a field name"
-  eq <- expectSym "="
-  p <- g.pattern_
-  pure (infixOp (At (Ident x.text) (spanOf x)) (At (Keyword ":=") (spanOf eq)) p)
-
--- | `{ x = p, ... }`, a record pattern: the fields it names, matched
-recordPatF : Gram -> P Ntn
-recordPatF g = do
-  o <- next
-  inBrackets (do
-    fs <- sepBy1 "," (fieldPatF g)
-    c <- expectPunct "}"
-    pure (At (NBlock "struct" Nothing fs) (spanTT o c)))
-
-patHeadF : Gram -> P Ntn
-patHeadF g = do
-  t <- peek
-  if strEq t.kind "con" || strEq t.kind "tag"
-      then do
-        n <- next
-        args <- many g.patAtom
-        pure (group (At (NTag t.text) (spanOf t)) args)
-    else g.patAtom
-
-patOperandsF : Gram -> List Operand -> P (List Operand)
-patOperandsF g acc = do
-  t <- peek
-  b <- atBoundary
-  if isOperator t && not b
-      then do
-        n <- next
-        p <- patHeadF g
-        patOperandsF g (Cons (mkOperand t p) acc)
-    else pure (reverse acc)
-
--- | a pattern: `C p ...`, or an atomic one; or such patterns between
--- | operators, `x :: xs`, as the fixities say (an operator is another
--- | name for a tag: elaboration finds which)
-patternF : Gram -> P Ntn
-patternF g = do
-  p <- patHeadF g
-  rest <- patOperandsF g Nil
-  if length rest == 0 then pure p else resolve applyPatOp p rest
-
--- | `x`, `_`, `C` (with no arguments), a literal, `[...]`, `(p)`
-patAtomF : Gram -> P Ntn
-patAtomF g = do
-  t <- peek
-  b <- atBoundary
-  if b then throwP (diag (spanOf t) "expected a pattern")
-    else if strEq t.kind "var"
-      then do
-        n <- next
-        pure (At (Ident t.text) (spanOf t))
-    else if strEq t.kind "con"
-      then do
-        n <- next
-        -- (a capitalised parameter of the signature is a variable)
-        isVar <- pGets (\s -> elemBy strEq t.text s.patVars)
-        pure
-            (if isVar then At (Ident t.text) (spanOf t)
-             else At (NTag t.text) (spanOf t))
-    else if strEq t.kind "tag"
-      then do
-        n <- next
-        pure (At (NTag t.text) (spanOf t))
-    else if strEq t.kind "int"
-      then do
-        n <- next
-        pure (At (NInt (intOfText t.text)) (spanOf t))
-    else if strEq t.kind "float"
-      then do
-        n <- next
-        pure (At (NFloat (floatOfText t.text)) (spanOf t))
-    else if strEq t.kind "str"
-      then do
-        n <- next
-        pure (At (NString t.text) (spanOf t))
-    else if strEq t.kind "punct" && strEq t.text "[" then listOfF g g.pattern_
-    else if strEq t.kind "punct" && strEq t.text "{" then recordPatF g
-    else if strEq t.kind "punct" && strEq t.text "("
-      then do
-        n <- next
-        inBrackets (do
-          p <- g.pattern_
-          c <- expectPunct ")"
-          pure p)
-    else throwP (diag (spanOf t) ("expected a pattern, not " ++ shown t))
-
-gram : Gram
-gram =
-  { expr = \st -> exprF gram st
-  , opExprN = \minPrec st -> opExprF gram minPrec st
-  , userOps = \st -> userOpsF gram st
-  , app = \st -> appF gram st
-  , atom = \st -> atomF gram st
-  , pattern_ = \st -> patternF gram st
-  , patAtom = \st -> patAtomF gram st
-  , lambda_ = \st -> lambdaF gram st
-  , caseE = \st -> caseExprF gram st
-  , ifE = \st -> ifExprF gram st
-  , doE = \st -> doExprF gram st
-  , letE = \st -> letExprF gram st
-  }
-
-expr : P Ntn
-expr = \st -> gram.expr st
 
 -- Declarations
 --------------------------------------------------------------------------------
@@ -1548,36 +611,465 @@ assembleDiags broken items =
   catMaybesS
     (map (assembleDiagOne broken (sigNames items) (eqnNames items)) items)
 
--- | what a signature or an equation defines: `f`, `C`, or `(+)`
-type DeclName = { name : String, len : Int, span : Pm.Span }
+-- The lowering, knotted through `lw`
+--------------------------------------------------------------------------------
 
-mkDeclName : String -> Int -> Pm.Span -> DeclName
-mkDeclName name len span = { name = name, len = len, span = span }
+-- (a function over `E` or `Ntn` matches through one of these, its body
+-- written once: a default equation is compiled into every other arm)
 
-declName : P (Maybe DeclName)
-declName = do
-  t <- peek
-  t2 <- peekAt 1
-  t3 <- peekAt 2
+atomOf : C.E -> Maybe C.T
+atomOf (Atom t) = Just t
+atomOf _ = Nothing
+
+symAtom : C.E -> Maybe C.T
+symAtom (Atom t) = if strEq t.kind "sym" then Just t else Nothing
+symAtom _ = Nothing
+
+-- | an operator's right side, as written: the operator, and its operand
+opRhsOf : C.E -> Pair C.T C.E
+opRhsOf (OpRhs op e) = MkPair op e
+opRhsOf e = MkPair (C.firstE e) e
+
+-- | `{x : A}`: braces around one declaration (not a record's field)
+bracedOne : C.E -> Maybe C.E
+bracedOne (Braces o (Cons f Nil) commas c) = case f of
+  EFSet x eq e -> Nothing
+  _ -> Just f
+bracedOne _ = Nothing
+
+-- | `{ x = e, ... }` or `{}`: a record's settings
+settingsOf : C.E -> Maybe (List C.E)
+settingsOf (Braces o fs commas c) = case fs of
+  Nil -> Just Nil
+  Cons (EFSet x eq e) rest -> Just fs
+  _ -> Nothing
+settingsOf _ = Nothing
+
+isColon : Ntn -> Bool
+isColon (At (Keyword k) _) = strEq k ":"
+isColon _ = False
+
+-- | `a : T`
+isAnnN : Ntn -> Bool
+isAnnN (At (Infix l k t) _) = isColon k
+isAnnN _ = False
+
+type Lw =
+  { e : C.E -> P Ntn, pat : C.Pat -> P Ntn, decl : C.D -> P (List Item) }
+
+-- | a literal, a keyword, a name or a tag, as the token says
+atomTok : C.T -> Ntn
+atomTok t =
+  if strEq t.kind "var" then At (Ident t.text) (spanT t)
+  else if strEq t.kind "tag" then At (NTag t.text) (spanT t)
+  else if strEq t.kind "int" then At (NInt (intOfText t.text)) (spanT t)
+  else if strEq t.kind "float" then At (NFloat (floatOfText t.text)) (spanT t)
+  else if strEq t.kind "str" then At (NString t.text) (spanT t)
+  else if strEq t.kind "sym" then At (Ident t.text) (spanT t)
+  else At (Keyword t.text) (spanT t)
+
+withFields : Ntn -> List C.T -> Ntn
+withFields n fs =
+  foldl (\m (f : C.T) -> juxt m (At (NField f.text) (spanT f))) n fs
+
+-- | a capitalised name: a variable or a definition in scope, or a tag;
+-- | `M.x`, a definition of the module imported as `M`, unless `M` is a
+-- | variable here
+conAtom : C.T -> List C.T -> P Ntn
+conAtom t fs = do
+  local <- pGets (\s -> elemBy strEq t.text s.scope)
+  qualified <-
+    pGets (\s -> case fs of
+    Cons f rest -> s.known (t.text ++ "." ++ f.text)
+    Nil -> False)
+  inScope <- pGets (\s -> local || s.known t.text)
   pure
-      (if strEq t.kind "var" || strEq t.kind "con"
-         then Just (mkDeclName t.text 1 (spanOf t))
-       else if strEq t.text "(" && isOperator t2 && strEq t3.text ")"
-         then Just (mkDeclName t2.text 3 (spanOf t2))
-       else Nothing)
+      (if qualified && not local
+         then case fs of
+           Cons f rest ->
+             withFields (At (Ident (t.text ++ "." ++ f.text)) (spanTT t f)) rest
+           Nil -> At (NTag t.text) (spanT t)
+       else if inScope then withFields (At (Ident t.text) (spanT t)) fs
+       else withFields (At (NTag t.text) (spanT t)) fs)
+
+-- | `e.x.y`: what is projected, and the fields
+data Fields = MkFields C.E (List C.T)
+
+fieldsOf : C.E -> List C.T -> Fields
+fieldsOf (EField e f) acc = fieldsOf e (Cons f acc)
+fieldsOf e acc = MkFields e acc
+
+-- | the token after `t` is `->`: what is in the parentheses `t` closes
+-- | binds names
+arrowAfter : St -> C.T -> Bool
+arrowAfter s t =
+  t.ix + 1 < A.length s.toks
+  && strEq (A.index s.toks (t.ix + 1)).kind "sym"
+  && strEq (A.index s.toks (t.ix + 1)).text "->"
+
+-- | `[a, b, c]`, `Cons a (Cons b (Cons c Nil))`, and `[]`, `Nil`
+listN : Pm.Span -> List Ntn -> Ntn
+listN sp xs =
+  foldr
+    (\x rest -> group (At (NTag "Cons") sp) (Cons x (Cons rest Nil)))
+    (At (NTag "Nil") sp)
+    xs
+
+-- | `x : T` in a binder's braces, and nothing else
+declarationL : Lw -> C.E -> P Ntn
+declarationL r e = do
+  e0 <- r.e e
+  d <- asBinder e0
+  if isAnnN d then pure d
+    else throwP (diag (ntnSpan d) "a field is `name : Type`")
+
+settingL : Lw -> C.E -> P Ntn
+settingL r (EFSet x eq e) = do
+  e' <- r.e e
+  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword ":=") (spanT x)) e')
+settingL r e = r.e e
+
+isSetting : C.E -> Bool
+isSetting (EFSet x eq e) = True
+isSetting e = False
+
+bracesL : Lw -> C.T -> List C.E -> C.T -> P Ntn
+bracesL r o fs c = case fs of
+  Nil -> pure (At (NBlock "struct" Nothing Nil) (spanTT o c))
+  Cons f rest ->
+    if isSetting f
+      then do
+        fs' <- traverseS (\m -> settingL r m) fs
+        pure (At (NBlock "struct" Nothing fs') (spanTT o c))
+    else do
+      fs' <- traverseS (\m -> declarationL r m) fs
+      pure (At (NBlock "sig" Nothing fs') (spanTT o c))
+
+conAltL : Lw -> C.E -> P Ntn
+conAltL r (ECon c args) = do
+  args' <- traverseS r.e args
+  pure (group (At (NTag c.text) (spanT c)) args')
+conAltL r e = r.e e
+
+lamBinderL : Lw -> C.E -> P Ntn
+lamBinderL r (BVar x) = pure (At (Ident x.text) (spanT x))
+lamBinderL r (BImp o x c) =
+  pure (At (NBrace (At (Ident x.text) (spanT x))) (spanTT o c))
+lamBinderL r (BAnn o x cc ty c) = do
+  ty' <- r.e ty
+  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword ":") (spanT cc)) ty')
+lamBinderL r e = r.e e
+
+lamBound : Ntn -> List String
+lamBound (At (Ident x) _) = Cons x Nil
+lamBound (At (NBrace (At (Ident x) _)) _) = Cons x Nil
+lamBound (At (Infix (At (Ident x) _) (At (Keyword ":") _) _) _) = Cons x Nil
+lamBound _ = Nil
+
+-- | `\x {y} _ -> e`
+lambdaL : Lw -> List C.E -> C.E -> P Ntn
+lambdaL r binders body = do
+  bs <- traverseS (\b -> lamBinderL r b) binders
+  withScope (concatMapS lamBound bs) (do
+    body' <- r.e body
+    pure (foldr (\b e -> infixOp b (At (Keyword "=>") (ntnSpan b)) e) body' bs))
+
+-- | `C x y -> e`: `x` and `y` are bound in `e`
+altL : Lw -> C.E -> P Ntn
+altL r (EAlt p arrow e) = do
+  p' <- r.pat p
+  withScope (boundBy Nil p) (do
+    e' <- r.e e
+    pure (infixOp p' (At (Keyword "=>") (spanT arrow)) e'))
+altL r e = r.e e
+
+-- | `if c then a else b`, a `case` on `True` and `False`
+ifN : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
+ifN sp c a b =
+  At
+    (NBlock
+       "match"
+       (Just c)
+       (Cons
+          (infixOp (At (NTag "True") sp) (At (Keyword "=>") sp) a)
+          (Cons (infixOp (At (NTag "False") sp) (At (Keyword "=>") sp) b) Nil)))
+    sp
+
+-- | `p = e`, or `p : T = e`, after `let`: the pattern, and what it is
+-- | bound to (annotated, `(e : T)`)
+letHeadL : Lw -> C.Pat -> Maybe (Pair C.T C.E) -> C.E -> P (Pair Ntn Ntn)
+letHeadL r p ann e = do
+  p' <- r.pat p
+  case ann of
+    Just (MkPair cc ty) -> do
+      ty' <- r.e ty
+      e' <- r.e e
+      pure
+          (MkPair
+             p'
+             (At
+                (Infix e' (At (Keyword ":") (spanT cc)) ty')
+                (mkSpan (startPos ty') (endPos e'))))
+    Nothing -> do
+      e' <- r.e e
+      pure (MkPair p' e')
+
+-- | `in e` after `let p = e'`: `p`'s variables are bound in `e`
+letBodyL : Lw -> C.T -> Pair Ntn Ntn -> List String -> C.T -> C.E -> P Ntn
+letBodyL r kw (MkPair p rhs) names i body =
+  withScope names (do
+  body' <- r.e body
+  pure
+      (At
+         (NBlock
+            "let"
+            (Just rhs)
+            (Cons (infixOp p (At (Keyword "=>") (spanT i)) body') Nil))
+         (spanTE kw (C.lastE body).end)))
+
+-- | `let p = e in e'`; in a `do` block, `let p = e`, `p`'s variables
+-- | bound in the statements after it
+letL : Lw -> C.E -> P Ntn
+letL r (ELet kw p ann eq e body) = do
+  h <- letHeadL r p ann e
+  case body of
+    Just (MkPair i b) -> letBodyL r kw h (boundBy Nil p) i b
+    Nothing -> do
+      pModify (\s -> setScope (appendS (boundBy Nil p) s.scope) s)
+      pure
+          (At
+             (NBlock "let" (Just (snd h)) (Cons (fst h) Nil))
+             (spanTE kw (C.lastE e).end))
+letL r e = r.e e
+
+-- | a statement of a `do` block: `x <- e` (`x` bound in the statements
+-- | after it), `let p = e`, or `e`
+stmtL : Lw -> C.E -> P Ntn
+stmtL r (ESBind x arrow e) = do
+  e' <- r.e e
+  pModify (\s -> setScope (Cons x.text s.scope) s)
+  pure
+      (infixOp
+         (At (Ident x.text) (spanT x))
+         (At (Keyword "<-") (spanT arrow))
+         e')
+stmtL r (ELet kw p ann eq e body) = letL r (ELet kw p ann eq e body)
+stmtL r e = r.e e
+
+-- | an operator's operands, as written
+operandL : Lw -> C.E -> P Operand
+operandL r m = case opRhsOf m of
+  MkPair op e -> do
+    e' <- r.e e
+    pure (mkOperand op e')
+
+parenL : Lw -> C.T -> C.E -> C.T -> P Ntn
+parenL r o e c = case symAtom e of
+  Just t -> pure (At (Ident t.text) (spanT t))
+  Nothing -> do
+    e' <- r.e e
+    after <- pGets (\s -> arrowAfter s c)
+    if after then asBinder e' else pure e'
+
+-- | `x -> y`, with `(a b : T) -> B` for `(a : T) -> (b : T) -> B`, and
+-- | `{a : T} -> B` binding an implicit argument; `T ~ { f = v }`, a
+-- | specialisation
+opL : Lw -> C.E -> C.T -> C.E -> P Ntn
+opL r a op b =
+  if strEq op.text "->"
+    then do
+      a' <- case bracedOne a of
+        Just f -> do
+          d <- declarationL r f
+          pure (At (NBrace d) (spanTT (C.firstE a) (C.lastE a)))
+        Nothing -> r.e a
+      b' <- r.e b
+      pure (arrowBinop (spanT op) a' b')
+  else do
+    a' <- r.e a
+    case settingsOf b of
+      Just fs ->
+        if strEq op.text "~"
+          then do
+            fs' <- traverseS (\m -> settingL r m) fs
+            pure (foldl (\acc f -> specOne (spanT op) acc f) a' fs')
+        else do
+          b' <- r.e b
+          pure (infixOp a' (At (Keyword op.text) (spanT op)) b')
+      Nothing -> do
+        b' <- r.e b
+        pure (infixOp a' (At (Keyword op.text) (spanT op)) b')
+
+-- | an expression
+exprL : Lw -> C.E -> P Ntn
+exprL r e0 = case e0 of
+  Atom t -> if strEq t.kind "con" then conAtom t Nil else pure (atomTok t)
+  EField e f -> case fieldsOf (EField e f) Nil of
+    MkFields (Atom t) fs ->
+      if strEq t.kind "con" then conAtom t fs
+      else pure (withFields (atomTok t) fs)
+    MkFields b fs -> do
+      b' <- r.e b
+      pure (withFields b' fs)
+  EParen o e c -> parenL r o e c
+  Named o x k e c -> do
+    e' <- r.e e
+    pure
+        (At
+           (NBrace
+              (infixOp
+                 (At (Ident x.text) (spanT x))
+                 (At (Keyword ":=") (spanT k))
+                 e'))
+           (spanTT o c))
+  Tup o es commas c -> do
+    es' <- traverseS r.e es
+    pure
+        (if strEq o.text "[" then listN (spanTT o c) es'
+         else At (NTuple es') (spanTT o c))
+  Braces o fs commas c -> bracesL r o fs c
+  InstB o o2 d c1 c -> do
+    d' <- declarationL r d
+    pure (At (NBracket d') (spanTT o c))
+  Sum kw o alts bars c -> do
+    alts' <- traverseS (\a -> conAltL r a) alts
+    pure (At (NBlock "sum" Nothing alts') (spanTT kw c))
+  ECon c args -> conAltL r (ECon c args)
+  App h args -> do
+    h' <- r.e h
+    args' <- traverseS r.e args
+    pure (group h' args')
+  Op a op b -> opL r a op b
+  Ops a rest -> do
+    a' <- r.e a
+    rest' <- traverseS (\m -> operandL r m) rest
+    resolve applyOp a' rest'
+  Ann e cc ty -> do
+    e' <- r.e e
+    ty' <- r.e ty
+    pure (infixOp e' (At (Keyword ":") (spanT cc)) ty')
+  Lam bs binders arrow body -> lambdaL r binders body
+  Case kw scrut o alts -> do
+    scrut' <- r.e scrut
+    alts' <- block (\a -> altL r a) alts
+    pure (At (NBlock "match" (Just scrut') alts') (spanTE kw (C.lastE e0).end))
+  If kw c th a el b -> do
+    c' <- r.e c
+    a' <- r.e a
+    b' <- r.e b
+    pure (ifN (spanTE kw (C.lastE b).end) c' a' b')
+  Do kw stmts -> do
+    stmts' <- block (\m -> stmtL r m) stmts
+    pure (At (NBlock "do" Nothing stmts') (spanTE kw (C.lastE e0).end))
+  ELet kw p ann eq e body -> letL r e0
+  _ ->
+    throwP
+      (diag (spanT (C.firstE e0)) ("unexpected `" ++ (C.firstE e0).text ++ "`"))
+
+-- Patterns
+
+-- | `p op q op' r`: the first, and each operator with what follows it
+data PChain = MkPChain C.Pat (List (Pair C.T C.Pat))
+
+pchainCons : C.Pat -> C.T -> PChain -> PChain
+pchainCons l op (MkPChain rh rest) = MkPChain l (Cons (MkPair op rh) rest)
+
+pchainOf : C.Pat -> PChain
+pchainOf (POp l op r) = pchainCons l op (pchainOf r)
+pchainOf p = MkPChain p Nil
+
+patOperandL : Lw -> Pair C.T C.Pat -> P Operand
+patOperandL r (MkPair op p) = do
+  p' <- r.pat p
+  pure (mkOperand op p')
+
+fieldPatL : Lw -> C.Pat -> P Ntn
+fieldPatL r (PField x eq p) = do
+  p' <- r.pat p
+  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword ":=") (spanT eq)) p')
+fieldPatL r p = r.pat p
+
+-- | a pattern: an operator in it is another name for a tag (elaboration
+-- | finds which), its operands as the fixities say
+patL : Lw -> C.Pat -> P Ntn
+patL r p0 = case p0 of
+  PAtom t ->
+    if strEq t.kind "con"
+      then do
+        -- (a capitalised parameter of the signature is a variable)
+        isVar <- pGets (\s -> elemBy strEq t.text s.patVars)
+        pure
+            (if isVar then At (Ident t.text) (spanT t)
+             else At (NTag t.text) (spanT t))
+    else pure (atomTok t)
+  PCon c args -> do
+    args' <- traverseS r.pat args
+    pure (group (At (NTag c.text) (spanT c)) args')
+  PParen o p c -> r.pat p
+  PList o ps commas c -> do
+    ps' <- traverseS r.pat ps
+    pure (listN (spanTT o c) ps')
+  PRec o fs commas c -> do
+    fs' <- traverseS (\f -> fieldPatL r f) fs
+    pure (At (NBlock "struct" Nothing fs') (spanTT o c))
+  POp l op q -> case pchainOf (POp l op q) of
+    MkPChain h rest -> do
+      h' <- r.pat h
+      rest' <- traverseS (\m -> patOperandL r m) rest
+      resolve applyPatOp h' rest'
+  PField x eq p -> fieldPatL r (PField x eq p)
+
+-- Declarations
+
+-- | what a signature or an equation defines: `f`, `C`, or `(+)`
+type DeclName = { name : String, span : Pm.Span }
+
+declNameOf : List C.T -> DeclName
+declNameOf (Cons t (Cons op (Cons c Nil))) = { name = op.text, span = spanT op }
+declNameOf (Cons t rest) = { name = t.text, span = spanT t }
+declNameOf Nil = { name = "", span = mkSpan 0 0 }
+
+firstStart : List C.T -> Int
+firstStart (Cons t _) = t.start
+firstStart Nil = 0
 
 bindersFor : St -> String -> List Binders
 bindersFor s f = filter (\(b : Binders) -> strEq b.f f) s.binders
 
--- | `e where` and the local definitions, signatures and equations (read
--- | by `item`), as at the top level
-whereF : P (List Item) -> Ntn -> P Ntn
-whereF item rhs = do
-  w <- next
+sigL : Lw -> List C.T -> C.E -> P (List Item)
+sigL r names ty = do
+  ty' <- r.e ty
+  pModify
+      (\s ->
+         setBinders
+           (Cons
+              (mkBinders
+                 (declNameOf names).name
+                 (piBinders ty')
+                 (piImplicits ty'))
+              s.binders)
+           s)
+  pure
+      (Cons
+         (Sig
+            (declNameOf names).name
+            (declNameOf names).span
+            ty'
+            (mkSpan (firstStart names) (C.lastE ty).end))
+         Nil)
+
+lastDEnd : List C.D -> Int -> Int
+lastDEnd ds e = case last ds of
+  Just d -> (C.lastD d).end
+  Nothing -> e
+
+-- | `e where` and the local definitions, signatures and equations, as at
+-- | the top level
+whereL : Lw -> C.T -> List C.D -> Ntn -> P Ntn
+whereL r kw ds rhs = do
   saved <- pGets (\s -> s.binders)
-  items <- block item
+  items <- block r.decl ds
   pModify (\s -> setBinders saved s)
-  end <- prevEnd
   case assembleDiags Nil (concatMapS (\x -> x) items) of
     Cons d _ -> throwP d
     Nil ->
@@ -1587,319 +1079,211 @@ whereF item rhs = do
               "local"
               (Just rhs)
               (assemble Nil (concatMapS (\x -> x) items)))
-           (mkSpan (startPos rhs) end))
+           (mkSpan (startPos rhs) (lastDEnd ds kw.end)))
 
--- | `f p ... = e`, perhaps followed by `where` (its declarations read by
--- | `item`)
-equationW : P (List Item) -> DeclName -> P (List Item)
-equationW item f = do
-  start <- pGets (\s -> (cur s).start)
-  pModify (\s -> setI (s.i + f.len) s)
-  sig <- pGets (\s -> bindersFor s f.name)
+-- | `f p ... = e`, perhaps followed by `where`
+eqnL : Lw
+     -> List C.T
+     -> List C.Pat
+     -> C.E
+     -> Maybe (Pair C.T (List C.D))
+     -> P (List Item)
+eqnL r names pats rhs w = do
+  sig <- pGets (\s -> bindersFor s (declNameOf names).name)
   pModify (\s -> setPatVars (concatMapS (\(b : Binders) -> b.names) sig) s)
-  pats <- many gram.patAtom
+  pats' <- traverseS r.pat pats
   pModify (\s -> setPatVars Nil s)
-  eq <- expectSym "="
   -- (an implicit parameter is not written, but bound all the same, by
   -- the name the signature gives it)
   withScope
       (appendS
-         (concatMapS patVarsOf pats)
+         (concatMapS
+            (boundBy (concatMapS (\(b : Binders) -> b.names) sig))
+            pats)
          (concatMapS (\(b : Binders) -> b.implicits) sig)) (do
-    rhs0 <- gram.expr
-    w <- peek
-    rhs <-
-      if strEq w.kind "kw" && strEq w.text "where" then whereF item rhs0
-      else pure rhs0
+    rhs0 <- r.e rhs
+    rhs' <- case w of
+      Just (MkPair kw ds) -> whereL r kw ds rhs0
+      Nothing -> pure rhs0
     pure
         (Cons
            (Eqn
-              f.name
+              (declNameOf names).name
               (infixOp
-                 (group (At (Ident f.name) f.span) pats)
-                 (At (Keyword ":=") (mkSpan start (ntnSpan rhs).end))
-                 rhs)
-              (mkSpan start (ntnSpan rhs).end))
+                 (group
+                    (At (Ident (declNameOf names).name) (declNameOf names).span)
+                    pats')
+                 (At
+                    (Keyword ":=")
+                    (mkSpan (firstStart names) (ntnSpan rhs').end))
+                 rhs')
+              (mkSpan (firstStart names) (ntnSpan rhs').end))
            Nil))
 
+-- | `x : T`, `x` a name
+nameAnn : Ntn -> Maybe Ntn
+nameAnn (At (Infix l k t) _) =
+  if isIdentN l && isColon k then Just (infixOp l k t) else Nothing
+nameAnn _ = Nothing
+
+paramOf : Ntn -> Maybe Ntn -> P Ntn
+paramOf p (Just q) = pure q
+paramOf p Nothing =
+  throwP (diag (ntnSpan p) "a parameter is `a`, `(x : T)` or `{x : T}`")
+
+-- | `(x : T)` or `{x : T}`, a parameter of a type
+dataParamOf : Lw -> C.E -> P Ntn
+dataParamOf r e = case bracedOne e of
+  Just f -> do
+    d <- declarationL r f
+    case nameAnn d of
+      Just q -> pure (At (NBrace q) (spanTT (C.firstE e) (C.lastE e)))
+      Nothing -> paramOf d Nothing
+  Nothing -> do
+    p0 <- r.e e
+    p <- if strEq (C.firstE e).text "(" then asBinder p0 else pure p0
+    paramOf p (nameAnn p)
+
 -- | a parameter of a type: `a` (a type), `(x : T)` or `{x : T}`
-dataParam : P Ntn
-dataParam = do
-  t <- peek
-  b <- atBoundary
-  if b then throwP (diag (spanOf t) "no parameter here")
-    else if strEq t.kind "con"
-      then throwP
-          (diag
-             (spanOf t)
-             ("a type's parameter is lower case, or given its type: `("
-              ++ t.text
-              ++ " :: Type)`"))
-    else if strEq t.kind "var"
-      then do
-        n <- next
-        pure
-            (infixOp
-               (At (Ident t.text) (spanOf t))
-               (At (Keyword ":") (spanOf t))
-               (At (Keyword "Type") (spanOf t)))
-    else if strEq t.text "(" || strEq t.text "{"
-      then do
-        p0 <- gram.atom
-        p <- if strEq t.text "(" then asBinder p0 else pure p0
-        case p of
-          At (Infix (At (Ident px) psp) (At (Keyword ":") ksp) pty) _ ->
-            pure (infixOp (At (Ident px) psp) (At (Keyword ":") ksp) pty)
-          At (NBlock "sig" Nothing (Cons (At (Infix (At (Ident px) psp) (At (Keyword ":") ksp) pty) _) Nil)) sp ->
-            pure
-              (At
-                 (NBrace
-                    (infixOp (At (Ident px) psp) (At (Keyword ":") ksp) pty))
-                 sp)
-          _ ->
-            throwP
-              (diag (ntnSpan p) "a parameter is `a`, `(x : T)` or `{x : T}`")
-    else throwP (diag (spanOf t) "no parameter here")
+dataParamL : Lw -> C.E -> P Ntn
+dataParamL r e = case atomOf e of
+  Just x ->
+    pure
+      (infixOp
+         (At (Ident x.text) (spanT x))
+         (At (Keyword ":") (spanT x))
+         (At (Keyword "Type") (spanT x)))
+  Nothing -> dataParamOf r e
 
-manyParams : List Ntn -> P (List Ntn)
-manyParams acc = do
-  b <- atBoundary
-  t <- peek
-  if b || not (startsItem t) then pure (reverse acc)
-    else do
-      x <- dataParam
-      manyParams (Cons x acc)
+-- | the head of a type's definition: its name applied to its parameters
+headN : C.T -> List Ntn -> Ntn
+headN name params = group (At (Ident name.text) (spanT name)) params
 
-dataAlternative : P Ntn
-dataAlternative = do
-  c <- next
-  if strEq c.kind "con" || strEq c.kind "tag"
-      then do
-        args <- many gram.atom
-        pure (group (At (NTag c.text) (spanOf c)) args)
-    else throwP (diag (spanOf c) "a constructor starts with a capital")
-
-checkAltNames : String -> List Ntn -> P Unit
-checkAltNames name Nil = pure MkUnit
-checkAltNames name (Cons alt rest) = case (getGroup alt).head of
-  At (NTag c) csp ->
-    if strEq c name
-      then throwP
-          (diag
-             csp
-             ("`"
-              ++ c
-              ++ "` names the type; its constructor needs another name, e.g. `Mk"
-              ++ c
-              ++ "`"))
-    else checkAltNames name rest
-  _ -> checkAltNames name rest
+defN : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
+defN sp h ty body =
+  At
+    (MDecl
+       Nil
+       "def"
+       (infixOp
+          (infixOp h (At (Keyword ":") sp) ty)
+          (At (Keyword ":=") sp)
+          body))
+    sp
 
 -- | `data T a = C x y | D`, and `data T : U = ...`
-dataDecl : P Ntn
-dataDecl = do
-  kw <- next
-  name <- expectKind "con" "the name of a type"
-  params <- manyParams Nil
-  withScope (concatMapS binderNames params) (do
-    t0 <- peek
-    universe <-
-      if isAnnText t0.text && strEq t0.kind "sym"
-        then do
-          n <- next
-          gram.app
-      else pure (At (Keyword "Type") (spanOf name))
-    t <- peek
-    alts <-
-      if strEq t.text "="
-        then do
-          n <- next
-          sepBy1 "|" dataAlternative
-      else pure Nil
-    -- (a type is a term: its name cannot also be a constructor's)
-    checkAltNames name.text alts
-    end <- prevEnd
+dataL : Lw
+      -> C.D
+      -> C.T
+      -> C.T
+      -> List C.E
+      -> Maybe (Pair C.T C.E)
+      -> Maybe C.DAlts
+      -> P (List Item)
+dataL r d kw name params universe alts = do
+  params' <- traverseS (\m -> dataParamL r m) params
+  withScope (concatMapS binderNames params') (do
+    universe' <- case universe of
+      Just (MkPair cc u) -> r.e u
+      Nothing -> pure (At (Keyword "Type") (spanT name))
+    alts' <- traverseS (\a -> conAltL r a) (C.altsOf alts)
     pure
-        (At
-           (MDecl
-              Nil
-              "def"
-              (infixOp
-                 (infixOp
-                    (group (At (Ident name.text) (spanOf name)) params)
-                    (At (Keyword ":") (spanTE kw end))
-                    universe)
-                 (At (Keyword ":=") (spanTE kw end))
-                 (At (NBlock "sum" Nothing alts) (spanTE kw end))))
-           (spanTE kw end)))
+        (Cons
+           (Decl
+              (defN
+                 (spanTE kw (C.lastD d).end)
+                 (headN name params')
+                 universe'
+                 (At (NBlock "sum" Nothing alts') (spanTE kw (C.lastD d).end))))
+           Nil))
 
 -- | `type T a = ...`
-typeDecl : P Ntn
-typeDecl = do
-  kw <- next
-  name <- expectKind "con" "the name of a type"
-  params <- manyParams Nil
-  eq <- expectSym "="
-  withScope (concatMapS binderNames params) (do
-    body <- gram.expr
-    end <- prevEnd
+typeL : Lw -> C.T -> C.T -> List C.E -> C.E -> P (List Item)
+typeL r kw name params body = do
+  params' <- traverseS (\m -> dataParamL r m) params
+  withScope (concatMapS binderNames params') (do
+    body' <- r.e body
     pure
-        (At
-           (MDecl
-              Nil
-              "def"
-              (infixOp
-                 (infixOp
-                    (group (At (Ident name.text) (spanOf name)) params)
-                    (At (Keyword ":") (spanTE kw end))
-                    (At (Keyword "Type") (spanTE kw end)))
-                 (At (Keyword ":=") (spanTE kw end))
-                 body))
-           (spanTE kw end)))
+        (Cons
+           (Decl
+              (defN
+                 (spanTE kw (C.lastE body).end)
+                 (headN name params')
+                 (At (Keyword "Type") (spanTE kw (C.lastE body).end))
+                 body'))
+           Nil))
 
-theoryField : P Ntn
-theoryField = do
-  x <- next
-  if not (strEq x.kind "var" || strEq x.kind "con")
-      then throwP (diag (spanOf x) "a field is `name : Type`")
-    else do
-      cc <- expectAnn
-      ty <- gram.expr
-      pModify (\s -> setScope (Cons x.text s.scope) s)
-      pure
-          (infixOp
-             (At (Ident x.text) (spanOf x))
-             (At (Keyword ":") (spanOf x))
-             ty)
+-- | a field of a theory: in scope in the fields after it
+theoryFieldL : Lw -> C.TF -> P Ntn
+theoryFieldL r (MkTF x cc ty) = do
+  ty' <- r.e ty
+  pModify (\s -> setScope (Cons x.text s.scope) s)
+  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword ":") (spanT x)) ty')
 
--- | `theory T a where` and its fields, each in scope in the next
-theoryDecl : P Ntn
-theoryDecl = do
-  kw <- next
-  name <- expectKind "con" "the name of a theory"
-  params <- manyParams Nil
-  w <- expectKw "where"
-  withScope (concatMapS binderNames params) (do
-    fields <- block theoryField
-    end <- prevEnd
+-- | `theory T a where` and its fields
+theoryL : Lw -> C.D -> C.T -> C.T -> List C.E -> List C.TF -> P (List Item)
+theoryL r d kw name params fields = do
+  params' <- traverseS (\m -> dataParamL r m) params
+  withScope (concatMapS binderNames params') (do
+    fields' <- block (\f -> theoryFieldL r f) fields
     pure
-        (At
-           (MDecl
-              Nil
-              "theory"
-              (infixOp
-                 (group (At (Ident name.text) (spanOf name)) params)
-                 (At (Keyword ":=") (spanTE kw end))
-                 (At (NBlock "sig" Nothing fields) (spanTE kw end))))
-           (spanTE kw end)))
+        (Cons
+           (Decl
+              (At
+                 (MDecl
+                    Nil
+                    "theory"
+                    (infixOp
+                       (headN name params')
+                       (At (Keyword ":=") (spanTE kw (C.lastD d).end))
+                       (At
+                          (NBlock "sig" Nothing fields')
+                          (spanTE kw (C.lastD d).end))))
+                 (spanTE kw (C.lastD d).end)))
+           Nil))
 
--- | `foreign import name : T`, a primitive
-foreignDecl : P Ntn
-foreignDecl = do
-  kw <- next
-  im <- expectKw "import"
-  x <- expectKind "var" "the primitive's name"
-  cc <- expectAnn
-  ty <- gram.expr
-  end <- prevEnd
-  pure
-      (At
-         (MDecl
-            Nil
-            "primitive"
-            (infixOp
-               (At (Ident x.text) (spanOf x))
-               (At (Keyword ":") (spanTE kw end))
-               ty))
-         (spanTE kw end))
+-- | a declaration, lowered: what it is before signatures meet equations
+declL : Lw -> C.D -> P (List Item)
+declL r d = case d of
+  DImport t -> pure Nil
+  -- (read before the rest, by `fixityDecls`)
+  DFixity kw ts -> pure Nil
+  DSig names cc ty -> sigL r names ty
+  DEqn names pats eq rhs w -> eqnL r names pats rhs w
+  DData kw name params universe alts -> dataL r d kw name params universe alts
+  DType kw name params eq body -> typeL r kw name params body
+  DTheory kw name params w fields -> theoryL r d kw name params fields
+  DForeign kw im x cc ty -> do
+    ty' <- r.e ty
+    pure
+        (Cons
+           (Decl
+              (At
+                 (MDecl
+                    Nil
+                    "primitive"
+                    (infixOp
+                       (At (Ident x.text) (spanT x))
+                       (At (Keyword ":") (spanTE kw (C.lastE ty).end))
+                       ty'))
+                 (spanTE kw (C.lastE ty).end)))
+           Nil)
+  DTest kw x ->
+    pure
+      (Cons
+         (Decl
+            (At (MDecl Nil "test" (At (Ident x.text) (spanT x))) (spanTT kw x)))
+         Nil)
+  DWatch w e -> do
+    e' <- r.e e
+    pure (Cons (Decl (At (MDecl Nil ">" e') (spanTE w (C.lastE e).end))) Nil)
 
-skipFixity : P Unit
-skipFixity = do
-  u <- peek
-  if strEq u.kind "eof" || (u.first && u.col == 0) then pure MkUnit
-    else do
-      n <- next
-      skipFixity
-
-declOfW : P (List Item) -> L.Tok -> Maybe DeclName -> P (List Item)
-declOfW item t Nothing =
-  throwP
-    (diag (spanOf t) ("a declaration cannot start with `" ++ t.text ++ "`"))
-declOfW item t (Just f) = do
-  t2 <- peekAt f.len
-  if isAnnText t2.text
-      then do
-        pModify (\s -> setI (s.i + f.len + 1) s)
-        ty <- gram.expr
-        end <- prevEnd
-        pModify
-            (\s ->
-               setBinders
-                 (Cons
-                    (mkBinders f.name (piBinders ty) (piImplicits ty))
-                    s.binders)
-                 s)
-        pure (Cons (Sig f.name f.span ty (spanTE t end)) Nil)
-    else equationW item f
-
--- | a local declaration, of a `where`: a signature or an equation
-localItem : P (List Item)
-localItem = \st ->
-    (do
-     t <- peek
-     name <- declName
-     declOfW localItem t name)
-      st
-
-declOf : L.Tok -> Maybe DeclName -> P (List Item)
-declOf t n = declOfW localItem t n
-
-decl : P (List Item)
-decl = do
-  t <- peek
-  if strEq t.kind "kw" && strEq t.text "data"
-      then do
-        d <- dataDecl
-        pure (Cons (Decl d) Nil)
-    else if strEq t.kind "kw" && strEq t.text "type"
-      then do
-        d <- typeDecl
-        pure (Cons (Decl d) Nil)
-    else if strEq t.kind "kw" && strEq t.text "theory"
-      then do
-        d <- theoryDecl
-        pure (Cons (Decl d) Nil)
-    else if strEq t.kind "kw" && strEq t.text "foreign"
-      then do
-        d <- foreignDecl
-        pure (Cons (Decl d) Nil)
-    -- (read before the rest, by `fixityDecls`)
-    else if strEq t.kind "kw"
-    && elemBy strEq t.text ["infixl", "infixr", "infix"]
-      then do
-        n <- next
-        skipFixity
-        pure Nil
-    else if strEq t.kind "kw" && strEq t.text "test"
-      then do
-        n <- next
-        x <- expectKind "var" "a test's name"
-        pure
-            (Cons
-               (Decl
-                  (At
-                     (MDecl Nil "test" (At (Ident x.text) (spanOf x)))
-                     (spanTT t x)))
-               Nil)
-    else if strEq t.kind "watch"
-      then do
-        n <- next
-        e <- gram.expr
-        end <- prevEnd
-        pure (Cons (Decl (At (MDecl Nil ">" e) (spanTE t end))) Nil)
-    else do
-      name <- declName
-      declOf t name
+lw : Lw
+lw =
+  { e = \e st -> exprL lw e st
+  , pat = \p st -> patL lw p st
+  , decl = \d st -> declL lw d st
+  }
 
 -- The program
 --------------------------------------------------------------------------------
@@ -2177,40 +1561,6 @@ fixitiesOfText imported src =
 
 type ProgRes = { items : List Item, diags : List Diag, broken : List String }
 
-skipFrom : St -> St
-skipFrom s = if strEq (cur s).kind "eof" then s else skipFrom (setI (s.i + 1) s)
-
--- | on to the next declaration (the first token of this one, at least)
-skipDecl : St -> St
-skipDecl s =
-  skipFrom
-    (setScope Nil (setStack (Cons 0 Nil) (setI (maxI s.i (s.top + 1)) s)))
-
-declaredOne : L.Tok -> Maybe String
-declaredOne t =
-  if strEq t.kind "var" || strEq t.kind "con" then Just t.text else Nothing
-
-declaredTwo : L.Tok -> L.Tok -> Maybe String
-declaredTwo t u =
-  if strEq t.kind "kw" && elemBy strEq t.text ["data", "type", "theory"]
-    then Just u.text
-  else if strEq t.text "(" && strEq u.kind "sym" then Just u.text
-  else declaredOne t
-
--- | the name the declaration starting at `top` defines, as far as it says
-declaredAt : St -> Maybe String
-declaredAt s =
-  if s.top + 1 < A.length s.toks
-    then declaredTwo (A.index s.toks s.top) (A.index s.toks (s.top + 1))
-  else if s.top < A.length s.toks then declaredOne (A.index s.toks s.top)
-  else Nothing
-
-progReset : St -> St
-progReset s = setScope Nil (setStack (Cons 0 Nil) (setStart s.i (setTop s.i s)))
-
-withSt : {a : Type} -> St -> (St -> a) -> a
-withSt st k = k st
-
 appendRev : {a : Type} -> List a -> List a -> List a
 appendRev Nil acc = acc
 appendRev (Cons x xs) acc = appendRev xs (Cons x acc)
@@ -2222,32 +1572,45 @@ brokenPlus (Just x) broken = Cons x broken
 mkProgRes : List Item -> List Diag -> List String -> ProgRes
 mkProgRes items diags broken = { items = items, diags = diags, broken = broken }
 
-progGo : St -> List Item -> List Diag -> List String -> ProgRes
-progGo s0 items diags broken =
-  withSt
-    (progReset s0)
-    (\s ->
-       if strEq (cur s).kind "eof"
-         then mkProgRes (reverse items) (reverse diags) (reverse broken)
-       else case decl s of
-         MkPair (Right ds) s2 ->
-           if strEq (cur s2).kind "eof"
-             then progGo s2 (appendRev ds items) diags broken
-           else progGo
-               (skipDecl s2)
-               (appendRev ds items)
-               (Cons
-                  (diag
-                     (spanOf (cur s2))
-                     ("unexpected `" ++ (cur s2).text ++ "`"))
-                  diags)
-               broken
-         MkPair (Left d) s2 ->
-           progGo
-             (skipDecl s2)
-             items
-             (Cons d diags)
-             (brokenPlus (declaredAt s2) broken))
+-- | a declaration, lowered where nothing local is in scope
+lowerDecl : C.D -> St -> Pair (Either Diag (List Item)) St
+lowerDecl d s = lw.decl d (setScope Nil s)
+
+-- | each declaration read (`cs`), then lowered (`s`); one that is wrong
+-- | is passed over, the name it would define broken
+progGo : C.St -> St -> List Item -> List Diag -> List String -> ProgRes
+progGo cs s items diags broken =
+  if C.textDone cs
+    then mkProgRes (reverse items) (reverse diags) (reverse broken)
+  else case C.declStep cs of
+    MkPair (Left d) cs2 ->
+      progGo
+        (C.skipDecl cs2)
+        s
+        items
+        (Cons d diags)
+        (brokenPlus (C.declaredAt cs2) broken)
+    MkPair (Right dc) cs2 -> case lowerDecl dc s of
+      MkPair (Left d) s2 ->
+        progGo
+          (C.skipDecl cs2)
+          s2
+          items
+          (Cons d diags)
+          (brokenPlus (C.declaredAt cs2) broken)
+      MkPair (Right ds) s2 ->
+        if strEq (C.cur cs2).kind "eof"
+          then progGo cs2 s2 (appendRev ds items) diags broken
+        else progGo
+            (C.skipDecl cs2)
+            s2
+            (appendRev ds items)
+            (Cons
+               (diag
+                  (spanT (C.cur cs2))
+                  ("unexpected `" ++ (C.cur cs2).text ++ "`"))
+               diags)
+            broken
 
 -- Entry points
 --------------------------------------------------------------------------------
@@ -2270,20 +1633,16 @@ lexDiagOf e =
   , note = Nothing
   }
 
-initialSt : Options -> Array L.Tok -> List String -> F.Fixities -> St
+initialSt : Options -> Array C.T -> List String -> F.Fixities -> St
 initialSt o toks declared own =
-  { toks = toks
-  , i = 0
-  , top = 0
-  , stack = Cons 0 Nil
-  , scope = Nil
-  , known = \x -> o.known x || elemBy strEq x declared
-  , start = 0
-  , binders = Nil
-  , patVars = Nil
-  , fix = F.union o.fixities own
-  , lenient = o.lenient
-  }
+  mkSt
+    toks
+    Nil
+    (\x -> o.known x || elemBy strEq x declared)
+    Nil
+    Nil
+    (F.union o.fixities own)
+    o.lenient
 
 readOut : List Diag -> FixRead -> ProgRes -> Read
 readOut lexDiags own r =
@@ -2296,19 +1655,25 @@ readOut lexDiags own r =
   , broken = r.broken
   }
 
-readRun : Options -> Array L.Tok -> List Diag -> List String -> FixRead -> Read
+readRun : Options -> Array C.T -> List Diag -> List String -> FixRead -> Read
 readRun o toks lexDiags declared own =
   readOut
     lexDiags
     own
-    (progGo (initialSt o toks declared own.fixities) Nil Nil Nil)
+    (progGo
+       (C.initialSt toks)
+       (initialSt o toks declared own.fixities)
+       Nil
+       Nil
+       Nil)
 
-readToks : Options -> Array L.Tok -> List Diag -> Read
-readToks o toks lexDiags =
-  readRun o toks lexDiags (prescan toks) (fixityDecls o.fixities toks)
+readToks : Options -> Array L.Tok -> Array C.T -> List Diag -> Read
+readToks o ltoks toks lexDiags =
+  readRun o toks lexDiags (prescan ltoks) (fixityDecls o.fixities ltoks)
 
 readLexed : Options -> L.Lexed -> Read
-readLexed o l = readToks o (A.fromList l.tokens) (map lexDiagOf l.errors)
+readLexed o l =
+  readToks o (A.fromList l.tokens) (Tk.plain l.tokens) (map lexDiagOf l.errors)
 
 -- | `fixities`: those of what the file imports; the result's, the file's
 -- | own.  `broken`: the declarations that do not parse.
