@@ -480,6 +480,221 @@ type JK =
   , last : Env -> Int -> I.Expr -> List String
   }
 
+-- Conditions
+--------------------------------------------------------------------------------
+
+-- A boolean in the position of a test -- what a match on `True`/`False`
+-- looks at, and its arms where they are booleans again -- is compiled to
+-- a sublanguage of its own (Danvy's boolean position, Chez's `Pred`): a
+-- JavaScript condition, never a `True` or `False` built to be switched on.
+data Pred
+  = PTrue
+  | PFalse
+  | PRel String
+  | PNot Pred
+  | PIf Pred Pred Pred
+  -- | a binding, then the condition: `(x = a, p)`, `x` declared before
+  -- | the statement the condition is in (AB-normal: the binding is an
+  -- | assignment, so it can sit inside a condition)
+  | PSeq String String Pred
+
+isConstant : Pred -> Bool
+isConstant PTrue = True
+isConstant PFalse = True
+isConstant _ = False
+
+-- | `if c then t else e`, what is known of it worked out: a test of a
+-- | test whose arms are constants is the inner test's arms tested
+-- | (case-of-case, copying only constants)
+condIf : Pred -> Pred -> Pred -> Pred
+condIf (PSeq x a c) t e = PSeq x a (condIf c t e)
+condIf PTrue t e = t
+condIf PFalse t e = e
+condIf (PNot c) t e = condIf c e t
+condIf (PIf a b c) t e =
+  if isConstant t && isConstant e then condIf a (condIf b t e) (condIf c t e)
+  else PIf (PIf a b c) t e
+condIf c PTrue PFalse = c
+condIf c PFalse PTrue = PNot c
+condIf c t e = PIf c t e
+
+-- | a condition's code and how tightly it binds: 0 a conditional, 1 `||`,
+-- | 2 `&&`, 3 a comparison, 4 `!` or an atom
+type Cond = { code : String, prec : Int }
+
+condAtLeast : Int -> Cond -> String
+condAtLeast n c = if c.prec < n then "(" ++ c.code ++ ")" else c.code
+
+condCode : Pred -> Cond
+condCode p = case p of
+  PTrue -> { code = "true", prec = 4 }
+  PFalse -> { code = "false", prec = 4 }
+  PRel s -> { code = s, prec = 3 }
+  PSeq x a q ->
+    { code = "(" ++ x ++ " = " ++ a ++ ", " ++ condAtLeast 1 (condCode q) ++ ")"
+    , prec = 4
+    }
+  PNot q -> { code = "!" ++ condAtLeast 4 (condCode q), prec = 4 }
+  PIf c t PFalse ->
+    { code = condAtLeast 2 (condCode c) ++ " && " ++ condAtLeast 2 (condCode t)
+    , prec = 2
+    }
+  PIf c PTrue e ->
+    { code = condAtLeast 1 (condCode c) ++ " || " ++ condAtLeast 1 (condCode e)
+    , prec = 1
+    }
+  PIf c PFalse e ->
+    { code =
+        condAtLeast 2 (condCode (PNot c))
+        ++ " && "
+        ++ condAtLeast 2 (condCode e)
+    , prec = 2
+    }
+  PIf c t PTrue ->
+    { code =
+        condAtLeast 1 (condCode (PNot c))
+        ++ " || "
+        ++ condAtLeast 1 (condCode t)
+    , prec = 1
+    }
+  PIf c t e ->
+    { code =
+        condAtLeast 1 (condCode c)
+        ++ " ? "
+        ++ condAtLeast 0 (condCode t)
+        ++ " : "
+        ++ condAtLeast 0 (condCode e)
+    , prec = 0
+    }
+
+-- | the names a condition binds, to be declared before it (a name two
+-- | arms each bind is one variable: the scopes do not overlap)
+seqsOf : Pred -> List String
+seqsOf p = case p of
+  PSeq x _ q -> Cons x (seqsOf q)
+  PNot q -> seqsOf q
+  PIf c t e -> concatList (seqsOf c) (concatList (seqsOf t) (seqsOf e))
+  _ -> Nil
+
+letDeclarations : Int -> List String -> List String
+letDeclarations ind Nil = Nil
+letDeclarations ind xs =
+  Cons (indent ind ++ "let " ++ joinWith ", " (nubStr xs) ++ ";") Nil
+
+-- | the comparisons JavaScript has an operator for
+primRel : String -> Maybe String
+primRel "intEq" = Just "==="
+primRel "strEq" = Just "==="
+primRel "intLt" = Just "<"
+primRel "strLt" = Just "<"
+primRel "intLe" = Just "<="
+primRel "floatEq" = Just "==="
+primRel "floatLt" = Just "<"
+primRel "floatLe" = Just "<="
+primRel _ = Nothing
+
+armNamed : String -> List I.Arm -> Maybe I.Expr
+armNamed t Nil = Nothing
+armNamed t (Cons (MkArm t2 vs b) rest) =
+  if strEq t2 t && null vs then Just b else armNamed t rest
+
+-- | a match's arms, if it is a test: one for `True`, one for `False`
+boolArms : List I.Arm -> Maybe (Pair I.Expr I.Expr)
+boolArms arms =
+  if length arms == 2
+    then case armNamed "True" arms of
+      Just t -> case armNamed "False" arms of
+        Just f -> Just (MkPair t f)
+        Nothing -> Nothing
+      Nothing -> Nothing
+  else Nothing
+
+-- | whether it is a boolean all the way down, as a condition
+condShaped : I.Expr -> Bool
+condShaped e = case e of
+  ETag t Nil -> strEq t "True" || strEq t "False"
+  EPrimCall p (Cons _ (Cons _ Nil)) -> maybe False (\_ -> True) (primRel p)
+  EMatch s arms -> case boolArms arms of
+    Just (MkPair t f) -> condShaped t && condShaped f
+    Nothing -> False
+  ELet _ _ b -> condShaped b
+  _ -> False
+
+predOfValue : JK -> Env -> Int -> I.Expr -> Pred
+predOfValue r env ind e =
+  PRel (atLeast 3 (r.expr env ind e) ++ ".$ === \"True\"")
+
+predOfPrim : JK -> Env -> Int -> I.Expr -> String -> List I.Expr -> Pred
+predOfPrim r env ind e p as = case primRel p of
+  Just op -> case as of
+    Cons a (Cons b Nil) ->
+      PRel
+        (atLeast 2 (r.expr env ind a)
+         ++ " "
+         ++ op
+         ++ " "
+         ++ atLeast 2 (r.expr env ind b))
+    _ -> predOfValue r env ind e
+  Nothing -> predOfValue r env ind e
+
+predOfLet : (Env -> I.Expr -> Pred) -> String -> I.Expr -> BoundN -> Pred
+predOfLet go a b nb = PSeq nb.js a (go nb.env b)
+
+-- | a boolean, as a condition
+predOf : JK -> Env -> Int -> I.Expr -> Pred
+predOf r env ind e = case e of
+  ETag t Nil ->
+    if strEq t "True" then PTrue
+    else if strEq t "False" then PFalse
+    else predOfValue r env ind e
+  EPrimCall p as -> predOfPrim r env ind e p as
+  EMatch s arms -> case boolArms arms of
+    Just (MkPair t f) ->
+      condIf (predOf r env ind s) (predOf r env ind t) (predOf r env ind f)
+    Nothing -> predOfValue r env ind e
+  ELet x a b ->
+    predOfLet
+      (\env2 q -> predOf r env2 ind q)
+      (r.expr env ind a).code
+      b
+      (bindName env x)
+  _ -> predOfValue r env ind e
+
+-- | a condition in an expression: where it binds, there is no statement
+-- | to declare the names before, so the match is a block of its own
+exprCond : JK -> Env -> Int -> I.Expr -> Pred -> (Cond -> Code) -> Code
+exprCond r env ind e c k =
+  if null (seqsOf c) then k (condCode c)
+  else p3 ("(() => " ++ r.block env ind e ++ ")()")
+
+-- | a test in an expression: a boolean built from the condition, or
+-- | the arms chosen by it
+exprTest : JK -> Env -> Int -> I.Expr -> I.Expr -> I.Expr -> I.Expr -> Code
+exprTest r env ind e s t f =
+  if condShaped t && condShaped f
+    then exprCond
+        r
+        env
+        ind
+        e
+        (predOf r env ind e)
+        (\c -> { code = condAtLeast 1 c ++ " ? $T : $F", prec = 0 })
+  else exprCond
+      r
+      env
+      ind
+      e
+      (predOf r env ind s)
+      (\c ->
+         { code =
+             condAtLeast 1 c
+             ++ " ? "
+             ++ atLeast 1 (r.expr env ind t)
+             ++ " : "
+             ++ atLeast 1 (r.expr env ind f)
+         , prec = 0
+         })
+
 callName : Env -> String -> String
 callName env g = case M.lookup compareString g env.gs of
   Just i -> i.js
@@ -535,6 +750,10 @@ exprGo r env ind e = case e of
   EProj e2 l -> p3 (atLeast 3 (r.expr env ind e2) ++ projSuffix l)
   ERecord fs ->
     p3 ("{ " ++ joinWith ", " (map (\p -> fieldCode r env ind p) fs) ++ " }")
+  ETag t Nil ->
+    if strEq t "True" then p3 "$T"
+    else if strEq t "False" then p3 "$F"
+    else p3 ("{ $: " ++ quoteString t ++ ", a: [] }")
   ETag t as ->
     p3
       ("{ $: "
@@ -549,7 +768,9 @@ exprGo r env ind e = case e of
   EPrim p -> p3 ("$" ++ p ++ "$c")
   EPrimCall p as -> primCall p (map (\a -> r.expr env ind a) as)
   ELet x a b -> p3 ("(() => " ++ r.block env ind (ELet x a b) ++ ")()")
-  EMatch s arms -> p3 ("(() => " ++ r.block env ind (EMatch s arms) ++ ")()")
+  EMatch s arms -> case boolArms arms of
+    Just (MkPair t f) -> exprTest r env ind e s t f
+    Nothing -> p3 ("(() => " ++ r.block env ind (EMatch s arms) ++ ")()")
 
 exprF : JK -> Env -> Int -> I.Expr -> Code
 exprF r env0 ind e = exprGo r (noSelf env0) ind e
@@ -635,10 +856,48 @@ stmtsLet2 r ind b ac nb =
     (indent ind ++ "const " ++ nb.js ++ " = " ++ ac.code ++ ";")
     (r.stmts nb.env ind b)
 
+-- | a test, as a statement: the arm the condition chooses
+stmtsIf : JK -> Env -> Int -> Pred -> I.Expr -> I.Expr -> List String
+stmtsIf r env ind c t f = case c of
+  PTrue -> r.stmts env ind t
+  PFalse -> r.stmts env ind f
+  _ ->
+    concatList
+      (letDeclarations ind (seqsOf c))
+      (concatList
+         (Cons (indent ind ++ "if (" ++ (condCode c).code ++ ") {") Nil)
+         (concatList
+            (r.stmts env (ind + 1) t)
+            (Cons
+               (indent ind ++ "} else {")
+               (concatList
+                  (r.stmts env (ind + 1) f)
+                  (Cons (indent ind ++ "}") Nil)))))
+
+-- | a boolean returned: the condition, as a value
+stmtsReturnCond : Int -> Pred -> List String
+stmtsReturnCond ind c = case c of
+  PTrue -> Cons (indent ind ++ "return $T;") Nil
+  PFalse -> Cons (indent ind ++ "return $F;") Nil
+  _ ->
+    concatList
+      (letDeclarations ind (seqsOf c))
+      (Cons
+         (indent ind
+          ++ "return "
+          ++ condAtLeast 1 (condCode c)
+          ++ " ? $T : $F;")
+         Nil)
+
 stmtsF : JK -> Env -> Int -> I.Expr -> List String
 stmtsF r env ind e = case e of
   ELet x a b -> stmtsLet2 r ind b (r.expr env ind a) (bindName env x)
-  EMatch s arms -> stmtsMatch2 r ind arms (scrutOf r env ind s)
+  EMatch s arms -> case boolArms arms of
+    Just (MkPair t f) ->
+      if maybe True (\_ -> False) env.self && condShaped t && condShaped f
+        then stmtsReturnCond ind (predOf r env ind e)
+      else stmtsIf r env ind (predOf r env ind s) t f
+    Nothing -> stmtsMatch2 r ind arms (scrutOf r env ind s)
   _ -> r.last env ind e
 
 -- (the arguments are of this round's `const`s: assigned one by one)
