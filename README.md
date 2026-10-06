@@ -76,8 +76,8 @@ package =
 ## Effects
 
 `lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program
-names the effects it needs as instance arguments and is given them where
-it runs:
+names the effects it needs as instance arguments, in any world that has
+them -- it can do nothing else -- and is given them where it runs:
 
 ```haskell
 import co
@@ -88,7 +88,7 @@ import stdio
 world : HFunctor
 world = stdio <+> fs
 
-program : {{io : stdio <: world}} -> {{disk : fs <: world}} -> Co world Unit
+program : {e : HFunctor} -> {{io : stdio <: e}} -> {{disk : fs <: e}} -> Co e Unit
 program = do
   ok <- writeFile "hello.txt" "hello"
   print (if ok then "written" else "not written")

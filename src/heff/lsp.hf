@@ -27,7 +27,6 @@ import heff.session as Se
 import fs
 import map as M
 import prelude
-import process
 
 -- State
 --------------------------------------------------------------------------------
@@ -157,18 +156,15 @@ wholeSpan text = Q.mkSpan 0 (strLength text)
 -- The world
 --------------------------------------------------------------------------------
 
--- | a language server's computations, in any world with the process,
--- | the disk and the client in it
-type Lsp (e : HFunctor) a =
-  {{sys : process <: e}}
-  -> {{disk : fs <: e}}
-  -> {{wire : R.rpc <: e}}
-  -> Co e a
-
-reply : {e : HFunctor} -> Json -> Json -> Lsp e Unit
+reply : {e : HFunctor} -> {{wire : R.rpc <: e}} -> Json -> Json -> Co e Unit
 reply id result = R.send (message [kv "id" id, kv "result" result])
 
-replyError : {e : HFunctor} -> Json -> Int -> String -> Lsp e Unit
+replyError : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> Json
+           -> Int
+           -> String
+           -> Co e Unit
 replyError id code msg =
   R.send
     (message
@@ -176,11 +172,15 @@ replyError id code msg =
        , kv "error" (obj [kv "code" (num code), kv "message" (jstr msg)])
        ])
 
-notify : {e : HFunctor} -> String -> Json -> Lsp e Unit
+notify : {e : HFunctor} -> {{wire : R.rpc <: e}} -> String -> Json -> Co e Unit
 notify method params =
   R.send (message [kv "method" (jstr method), kv "params" params])
 
-publish : {e : HFunctor} -> String -> List Json -> Lsp e Unit
+publish : {e : HFunctor}
+        -> {{wire : R.rpc <: e}}
+        -> String
+        -> List Json
+        -> Co e Unit
 publish uri ds =
   notify
     "textDocument/publishDiagnostics"
@@ -292,7 +292,11 @@ diagsOf src program errors =
              (dropLast program))))
 
 -- | a document's text as the editor has it, else the disk's
-readOpen : {e : HFunctor} -> St -> String -> Lsp e (Maybe String)
+readOpen : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> St
+         -> String
+         -> Co e (Maybe String)
 readOpen st p = case M.lookup compareString p st.docs of
   Just d -> pure (Just d.text)
   Nothing -> readFile p
@@ -303,7 +307,12 @@ keptOf program = case last program of
   Nothing -> Nil
 
 -- | elaborate a document open, and publish what is wrong with it
-check : {e : HFunctor} -> St -> String -> Lsp e St
+check : {e : HFunctor}
+      -> {{disk : fs <: e}}
+      -> {{wire : R.rpc <: e}}
+      -> St
+      -> String
+      -> Co e St
 check st f = case M.lookup compareString f st.docs of
   Nothing -> pure st
   Just d -> do
@@ -320,7 +329,12 @@ check st f = case M.lookup compareString f st.docs of
            (M.insert compareString f (mkElaborated d.text program) st.checked)
            st)
 
-checkAll : {e : HFunctor} -> St -> List String -> Lsp e St
+checkAll : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> List String
+         -> Co e St
 checkAll st Nil = pure st
 checkAll st (Cons f rest) = do
   st2 <- check st f
@@ -338,7 +352,12 @@ dependentsOf st f =
        (M.toList st.checked))
 
 -- | a document, and those open that import it (as last elaborated)
-checkNow : {e : HFunctor} -> St -> String -> Lsp e St
+checkNow : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> String
+         -> Co e St
 checkNow st f = do
   st2 <- check (withDue (M.delete compareString f st.due) st) f
   checkAll st2 (dependentsOf st f)
@@ -358,10 +377,11 @@ nubSources (Cons s ss) =
     (nubSources (filter (\(t : Dr.Source) -> not (strEq t.path s.path)) ss))
 
 loadAll : {e : HFunctor}
+        -> {{disk : fs <: e}}
         -> (String -> Co e (Maybe String))
         -> L.Host
         -> List String
-        -> Lsp e (List Dr.Source)
+        -> Co e (List Dr.Source)
 loadAll read lib Nil = pure Nil
 loadAll read lib (Cons f rest) = do
   l <- L.loadProgramWith read lib f
@@ -370,10 +390,11 @@ loadAll read lib (Cons f rest) = do
 
 -- | the files, with what each imports, elaborated as one program
 elabFiles : {e : HFunctor}
+          -> {{disk : fs <: e}}
           -> (String -> Co e (Maybe String))
           -> L.Host
           -> List String
-          -> Lsp e (List Dr.Checked)
+          -> Co e (List Dr.Checked)
 elabFiles read lib files = do
   sources <- loadAll read lib (nubPaths files)
   pure (Dr.checkProgramLean (nubSources sources))
@@ -381,11 +402,13 @@ elabFiles read lib files = do
 -- | every file of a project (and `f`, if it is not one), with what each
 -- | imports, elaborated as one program
 elabProject : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : R.rpc <: e}}
             -> (String -> Co e (Maybe String))
             -> L.Host
             -> String
             -> String
-            -> Lsp e (List Dr.Checked)
+            -> Co e (List Dr.Checked)
 elabProject read lib root f = do
   files <- R.projectFiles root
   elabFiles read lib (concatList files [f])
@@ -395,14 +418,25 @@ type WithProgram = { st : St, program : List Dr.Checked }
 mkWithProgram : St -> List Dr.Checked -> WithProgram
 mkWithProgram st program = { st = st, program = program }
 
-projectAnew : {e : HFunctor} -> St -> String -> String -> Lsp e WithProgram
+projectAnew : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> String
+            -> String
+            -> Co e WithProgram
 projectAnew st root f = do
   program <- elabProject (\p -> readOpen st p) st.lib root f
   pure (mkWithProgram (withProject (Just (mkProject root program)) st) program)
 
 -- | the project a document is in, every file of it elaborated, an open
 -- | one as its text is in the editor
-project : {e : HFunctor} -> St -> String -> Lsp e WithProgram
+project : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> {{wire : R.rpc <: e}}
+        -> St
+        -> String
+        -> Co e WithProgram
 project st f = do
   ps <- L.pathsFor st.lib f
   case st.project of
@@ -442,12 +476,12 @@ capabilities =
     , kv "serverInfo" (obj [kv "name" (jstr "heff")])
     ]
 
-docPath : {e : HFunctor} -> Json -> Lsp e (Maybe String)
+docPath : {e : HFunctor} -> {{wire : R.rpc <: e}} -> Json -> Co e (Maybe String)
 docPath p = case str ["textDocument", "uri"] p of
   Just u -> R.uriPath u
   Nothing -> pure Nothing
 
-uriOf : {e : HFunctor} -> St -> String -> Lsp e String
+uriOf : {e : HFunctor} -> {{wire : R.rpc <: e}} -> St -> String -> Co e String
 uriOf st p = case M.lookup compareString p st.docs of
   Just d -> pure d.uri
   Nothing -> R.pathUri p
@@ -465,7 +499,12 @@ asked st f text = case M.lookup compareString f st.checked of
     if strEq c.text text then mkAsked st text c.program else mkAsked st text Nil
   Nothing -> mkAsked st text Nil
 
-withProgram : {e : HFunctor} -> St -> Json -> Lsp e Asked
+withProgram : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> Json
+            -> Co e Asked
 withProgram st p = do
   mf <- docPath p
   case mf of
@@ -577,7 +616,12 @@ targetIn st f d p program = case find
     else mkTargeted st 0 Nothing
   Nothing -> mkTargeted st 0 Nothing
 
-withTarget : {e : HFunctor} -> St -> Json -> Lsp e Targeted
+withTarget : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Json
+           -> Co e Targeted
 withTarget st p = do
   mf <- docPath p
   case mf of
@@ -588,12 +632,20 @@ withTarget st p = do
         wp <- project st f
         pure (targetIn wp.st f d p wp.program)
 
-locationOf : {e : HFunctor} -> St -> Q.Occurrence -> Lsp e Json
+locationOf : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Q.Occurrence
+           -> Co e Json
 locationOf st o = do
   u <- uriOf st o.path
   pure (obj [kv "uri" (jstr u), kv "range" (range o.source o.span)])
 
-locations : {e : HFunctor} -> St -> List Q.Occurrence -> Lsp e (List Json)
+locations : {e : HFunctor}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> List Q.Occurrence
+          -> Co e (List Json)
 locations st Nil = pure Nil
 locations st (Cons o rest) = do
   j <- locationOf st o
@@ -725,10 +777,12 @@ inPaths paths program =
   filter (\(c : Dr.Checked) -> elemBy strEq c.path paths) program
 
 renameChecked : {e : HFunctor}
+              -> {{disk : fs <: e}}
+              -> {{wire : R.rpc <: e}}
               -> St
               -> Pointed
               -> String
-              -> Lsp e (Pair St (Maybe String))
+              -> Co e (Pair St (Maybe String))
 renameChecked st t new = do
   before <- project st t.path
   affected <-
@@ -761,10 +815,11 @@ editOf : String -> Q.Occurrence -> Json
 editOf new o = obj [kv "range" (range o.source o.span), kv "newText" (jstr new)]
 
 changesOf : {e : HFunctor}
+          -> {{wire : R.rpc <: e}}
           -> St
           -> String
           -> List ByFile
-          -> Lsp e (List (Pair String Json))
+          -> Co e (List (Pair String Json))
 changesOf st new Nil = pure Nil
 changesOf st new (Cons b rest) = do
   u <- uriOf st b.path
@@ -773,9 +828,10 @@ changesOf st new (Cons b rest) = do
 
 -- (the documents' roots, each once)
 rootsOf : {e : HFunctor}
+        -> {{disk : fs <: e}}
         -> St
         -> List String
-        -> Lsp e (List (Pair String String))
+        -> Co e (List (Pair String String))
 rootsOf st Nil = pure Nil
 rootsOf st (Cons f rest) = do
   ps <- L.pathsFor st.lib f
@@ -791,16 +847,23 @@ nubRoots (Cons r rs) =
        (filter (\(q : Pair String String) -> not (strEq (fst q) (fst r))) rs))
 
 projects : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
          -> St
          -> List (Pair String String)
-         -> Lsp e WithProgram
+         -> Co e WithProgram
 projects st Nil = pure (mkWithProgram st Nil)
 projects st (Cons (MkPair _ f) rest) = do
   wp <- project st f
   more <- projects wp.st rest
   pure (mkWithProgram more.st (concatList wp.program more.program))
 
-symbolJson : {e : HFunctor} -> St -> Dr.Checked -> Q.DocSymbol -> Lsp e Json
+symbolJson : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Dr.Checked
+           -> Q.DocSymbol
+           -> Co e Json
 symbolJson st c y = do
   u <- uriOf st c.path
   pure
@@ -814,10 +877,11 @@ symbolJson st c y = do
          ])
 
 eachSymbol : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
            -> St
            -> Dr.Checked
            -> List Q.DocSymbol
-           -> Lsp e (List Json)
+           -> Co e (List Json)
 eachSymbol st c Nil = pure Nil
 eachSymbol st c (Cons y rest) = do
   j <- symbolJson st c y
@@ -825,10 +889,11 @@ eachSymbol st c (Cons y rest) = do
   pure (Cons j js)
 
 symbolsJson : {e : HFunctor}
+            -> {{wire : R.rpc <: e}}
             -> St
             -> String
             -> List Dr.Checked
-            -> Lsp e (List Json)
+            -> Co e (List Json)
 symbolsJson st query Nil = pure Nil
 symbolsJson st query (Cons c rest) = do
   here <-
@@ -848,7 +913,11 @@ occurrenceAt t off =
        strEq o.path t.path && o.span.start <= off && off <= o.span.end)
     t.occurrences
 
-prepared : {e : HFunctor} -> Json -> Targeted -> Lsp e St
+prepared : {e : HFunctor}
+         -> {{wire : R.rpc <: e}}
+         -> Json
+         -> Targeted
+         -> Co e St
 prepared id tg = case tg.target of
   Nothing -> do
     reply id JNull
@@ -870,7 +939,13 @@ prepared id tg = case tg.target of
         replyError id (0 - 32803) ("`" ++ t.name ++ "` is not written here")
         pure tg.st
 
-renamed : {e : HFunctor} -> Json -> String -> Targeted -> Lsp e St
+renamed : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> {{wire : R.rpc <: e}}
+        -> Json
+        -> String
+        -> Targeted
+        -> Co e St
 renamed id new tg = case tg.target of
   Nothing -> do
     reply id JNull
@@ -894,7 +969,13 @@ docAt : St -> Maybe String -> Maybe Doc
 docAt st (Just f) = M.lookup compareString f st.docs
 docAt st Nothing = Nothing
 
-formattedIn : {e : HFunctor} -> St -> Json -> Doc -> F.Fixities -> Lsp e St
+formattedIn : {e : HFunctor}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> Json
+            -> Doc
+            -> F.Fixities
+            -> Co e St
 formattedIn st id d fix = case Fm.formatIn fix d.text of
   Left why -> do
     notify
@@ -923,7 +1004,13 @@ formattedIn st id d fix = case Fm.formatIn fix d.text of
 
 -- | a document laid out anew, its operators cut as the fixities of what
 -- | it imports say
-formatted : {e : HFunctor} -> St -> Json -> Json -> Lsp e St
+formatted : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> Json
+          -> Json
+          -> Co e St
 formatted st id p = do
   mf <- docPath p
   case mf of
@@ -938,7 +1025,14 @@ formatted st id p = do
         l <- L.loadProgramWith (\q -> readOpen st q) st.lib f
         formattedIn st id d (Dr.fixitiesIn l.sources)
 
-request : {e : HFunctor} -> St -> String -> Json -> Json -> Lsp e St
+request : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> {{wire : R.rpc <: e}}
+        -> St
+        -> String
+        -> Json
+        -> Json
+        -> Co e St
 request st m id p =
   if strEq m "initialize"
     then do
@@ -1082,7 +1176,13 @@ closed st f =
        (M.delete compareString f st.checked)
        (withDocs (M.delete compareString f st.docs) st))
 
-notified : {e : HFunctor} -> St -> String -> Json -> Lsp e St
+notified : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> String
+         -> Json
+         -> Co e St
 notified st m p = do
   mf <- docPath p
   if strEq m "exit"
@@ -1134,7 +1234,13 @@ notified st m p = do
         -- (`$/...`, and what we do not know)
         else pure st
 
-notification : {e : HFunctor} -> St -> String -> Json -> Lsp e St
+notification : {e : HFunctor}
+             -> {{disk : fs <: e}}
+             -> {{wire : R.rpc <: e}}
+             -> St
+             -> String
+             -> Json
+             -> Co e St
 notification st m p =
   -- (a document changed: the project is elaborated again when asked
   -- about)
@@ -1149,7 +1255,12 @@ notification st m p =
 -- The loop
 --------------------------------------------------------------------------------
 
-handle : {e : HFunctor} -> St -> Json -> Lsp e St
+handle : {e : HFunctor}
+       -> {{disk : fs <: e}}
+       -> {{wire : R.rpc <: e}}
+       -> St
+       -> Json
+       -> Co e St
 handle st msg = case str ["method"] msg of
   Just m -> case field "id" msg of
     Just id ->
@@ -1175,7 +1286,12 @@ nextDue st t = case M.values st.due of
   Nil -> Nothing
   Cons d ds -> Just (max 0 (foldl (\a b -> min a b) d ds - t))
 
-checkDue : {e : HFunctor} -> St -> List String -> Lsp e St
+checkDue : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> List String
+         -> Co e St
 checkDue st Nil = pure st
 checkDue st (Cons f rest) = do
   st2 <- checkNow st f
@@ -1183,7 +1299,11 @@ checkDue st (Cons f rest) = do
 
 -- | serve, from a state: a message answered, or the documents due checked,
 -- | until the client says `exit` or goes away
-serveFrom : {e : HFunctor} -> St -> Lsp e Unit
+serveFrom : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> Co e Unit
 serveFrom st = do
   t <- R.now
   ev <- R.await (nextDue st t)
@@ -1200,7 +1320,11 @@ serveFrom st = do
 
 -- | serve on stdin/stdout, on the host `h0` (the standard library, the
 -- | style of paths)
-serve : {e : HFunctor} -> L.Host -> Lsp e Unit
+serve : {e : HFunctor}
+      -> {{disk : fs <: e}}
+      -> {{wire : R.rpc <: e}}
+      -> L.Host
+      -> Co e Unit
 serve h0 = do
   lib <- R.absPath h0.lib
   serveFrom
