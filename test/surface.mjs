@@ -40,6 +40,8 @@ const rejected = [
   ["test/errors/specialize.hf", "neutrals m.t and Bool are not equal"],
   ["test/errors/instance.hf", "error[E0341]: no instance for Eqv"],
   ["test/errors/instance.hf", "error[E0342]: more than one instance for Eqv"],
+  ["test/errors/let-refutable.hf", "test/errors/let-refutable.hf:6:7\nerror[E0317]: no case provided for tag Nothing"],
+  ["test/errors/let-last.hf", "error[E0212]: a `do` block ends with an expression"],
   ["test/errors/primitive.hf", "there is no primitive called `intPlusPlus` (the runtime has: intAdd, "],
 ];
 for (const [f, msg] of rejected) {

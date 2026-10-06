@@ -254,6 +254,47 @@ formats("operators and their fixities", [
   "",
 ].join("\n"));
 
+formats("let: on one line while it fits; else `in` under `let`, a chain", [
+  "short : Int",
+  "short = let  a = 1   in a",
+  "long : Int -> Int",
+  "long n = let aaaaaaaaaaaaaaaa = n + 1111111111111 + 22222222222222 in let bbbbbbbbbbbb = aaaaaaaaaaaaaaaa * 3333333333 in aaaaaaaaaaaaaaaa + bbbbbbbbbbbb",
+  "blocky : Maybe Int -> Int",
+  "blocky m =",
+  "  let k : Int = case m of",
+  "        Just x -> x",
+  "        Nothing -> 0",
+  "  in k + 1",
+  "inDo : Maybe Int",
+  "inDo = do",
+  "  x <- Just 1",
+  "  let  y : Int = x + 1",
+  "  let MkPair a b = p",
+  "  Just y",
+  "",
+].join("\n"), [
+  "short : Int",
+  "short = let a = 1 in a",
+  "long : Int -> Int",
+  "long n =",
+  "  let aaaaaaaaaaaaaaaa = n + 1111111111111 + 22222222222222",
+  "  in let bbbbbbbbbbbb = aaaaaaaaaaaaaaaa * 3333333333",
+  "  in aaaaaaaaaaaaaaaa + bbbbbbbbbbbb",
+  "blocky : Maybe Int -> Int",
+  "blocky m =",
+  "  let k : Int = case m of",
+  "    Just x -> x",
+  "    Nothing -> 0",
+  "  in k + 1",
+  "inDo : Maybe Int",
+  "inDo = do",
+  "  x <- Just 1",
+  "  let y : Int = x + 1",
+  "  let MkPair a b = p",
+  "  Just y",
+  "",
+].join("\n"));
+
 const bad = run("x : Bool\nx = (\n");
 expect("what does not parse is left", !bad.ok && bad.why.includes("does not parse"), JSON.stringify(bad));
 

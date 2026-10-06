@@ -146,6 +146,7 @@ checksOnly n = case (getGroup n).head of
   At (NTag _) _ -> True
   At (NBlock "struct" _ _) _ -> True
   At (NBlock "match" _ _) _ -> True
+  At (NBlock "let" _ _) _ -> True
   At (NTuple _) _ -> True
   At (Keyword "abandon") _ -> True
   At (Infix _ (At (Keyword "=>") _) _) _ -> True
@@ -262,13 +263,31 @@ doBind : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
 doBind sp e x rest =
   juxt (juxt (At (Ident "bind") sp) e) (infixOp x (At (Keyword "=>") sp) rest)
 
+-- | `let p = e` as a statement of a `do` block, not `let p = e in e'`
+isLetStmt : Ntn -> Bool
+isLetStmt (At (NBlock "let" _ (Cons (At (Infix _ (At (Keyword "=>") _) _) _) Nil)) _) =
+  False
+isLetStmt (At (NBlock "let" _ _) _) = True
+isLetStmt _ = False
+
+-- | `let p = e`, the statements after it its body
+letOver : Ntn -> Ntn -> Ntn
+letOver (At (NBlock "let" rhs (Cons p Nil)) lsp) rest =
+  At
+    (NBlock "let" rhs (Cons (infixOp p (At (Keyword "=>") lsp) rest) Nil))
+    { start = lsp.start, end = endPos rest }
+letOver n rest = n
+
 doStep : Pm.Span -> Ntn -> Ntn -> Ntn
 doStep sp (At (Infix x (At (Keyword "<-") _) e) _) rest = doBind sp e x rest
-doStep sp e rest = doBind sp e (At (Ident "_") sp) rest
+doStep sp e rest =
+  if isLetStmt e then letOver e rest else doBind sp e (At (Ident "_") sp) rest
 
 doLast : Pm.Span -> List Ntn -> Ntn -> Maybe Ntn
 doLast sp init (At (Infix _ (At (Keyword "<-") _) _) _) = Nothing
-doLast sp init last = Just (foldlR (\s rest -> doStep sp s rest) last init)
+doLast sp init last =
+  if isLetStmt last then Nothing
+  else Just (foldlR (\s rest -> doStep sp s rest) last init)
 
 -- | `do` ... with whichever `bind` is in scope
 doBlock : Pm.Span -> List Ntn -> Maybe Ntn
@@ -324,6 +343,16 @@ specializationF tk n = unexpectedNotation n "specialization"
 allL : {a : Type} -> (a -> Bool) -> List a -> Bool
 allL p Nil = True
 allL p (Cons x xs) = p x && allL p xs
+
+-- | `(e : T)`, `e` a tag, a record or a tuple: in the core it is `e`,
+-- | which does not say its type
+annotatesData : Ntn -> Bool
+annotatesData (At (Infix e (At (Keyword ":") _) _) _) = case (getGroup e).head of
+  At (NTag _) _ -> True
+  At (NBlock "struct" _ _) _ -> True
+  At (NTuple _) _ -> True
+  _ -> False
+annotatesData _ = False
 
 isIdentA : Ntn -> Bool
 isIdentA (At (Ident _) _) = True
@@ -538,7 +567,9 @@ parseHeadF tk c n = case n of
               casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
               j <- tk.chkJ N (At (NBlock "match" (Just scrutN) casesN') sp)
               R.runChk j e a)))
-    else if allL flatCaseAlt casesN
+    -- (a scrutinee `(e : T)`, `e` a tag or a record, is `e` in the core,
+    -- which does not say its type there: it is bound to a name, below)
+    else if allL flatCaseAlt casesN && not (annotatesData scrutN)
       then do
         scrut <- tk.synJ N scrutN
         cases <- traverseEL (\m -> doCase tk m) casesN
@@ -556,6 +587,17 @@ parseHeadF tk c n = case n of
           scrut <- tk.synJ N scrutN
           body <- tk.chkJ N r.tree
           pure (fromChkN c (R.caseLet r.scrutinee scrut body))
+  -- extension: `let x = e in e'`, `e` synthesised (`let x : T = e` if it
+  -- is not), bound once by a beta-redex; `let p = e in e'`, a `case` of
+  -- one alternative, which must match every value
+  At (NBlock "let" (Just rhsN) (Cons alt Nil)) sp -> case alt of
+    At (Infix (At (Ident x) _) (At (Keyword "=>") _) bodyN) _ -> do
+      rhs <- tk.synJ N rhsN
+      body <- recoveringChk (tk.chkJ N bodyN)
+      pure (fromChkN c (R.caseLet x rhs body))
+    At (Infix _ (At (Keyword "=>") _) _) _ ->
+      tk.parseJ c (At (NBlock "match" (Just rhsN) (Cons alt Nil)) sp)
+    _ -> failP sp 12 "a `let` statement is followed by what it is bound in"
   -- Misc.
   At (Keyword "abandon") sp -> pure (fromChkN c (R.abandonChk sp))
   At (Infix n0 (At (Keyword "~") _) n1) _ -> do

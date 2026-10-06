@@ -515,6 +515,7 @@ type Gram =
   , caseE : P Ntn
   , ifE : P Ntn
   , doE : P Ntn
+  , letE : P Ntn
   }
 
 type Operand = { op : L.Tok, e : Ntn }
@@ -830,7 +831,7 @@ resolve apply e0 rest = do
 startsClosed : L.Tok -> Bool
 startsClosed t =
   strEq t.text "\\"
-  || (strEq t.kind "kw" && elemBy strEq t.text ["case", "if", "do"])
+  || (strEq t.kind "kw" && elemBy strEq t.text ["case", "if", "do", "let"])
 
 -- | the syntax's operators, loosest first: `->` (right), `~` (right)
 symPrec : String -> Int
@@ -844,8 +845,7 @@ exprHead g t =
   else if strEq t.kind "kw" && strEq t.text "case" then g.caseE
   else if strEq t.kind "kw" && strEq t.text "if" then g.ifE
   else if strEq t.kind "kw" && strEq t.text "do" then g.doE
-  else if strEq t.kind "kw" && strEq t.text "let"
-    then throwP (diag (spanOf t) "`let` is not supported yet")
+  else if strEq t.kind "kw" && strEq t.text "let" then g.letE
   else g.opExprN 0
 
 exprF : Gram -> P Ntn
@@ -1246,11 +1246,71 @@ ifExprF g = do
                   Nil)))
          (spanTE kw end))
 
+-- | `p = e`, or `p : T = e`, after `let`: the pattern, and what it is
+-- | bound to (annotated, `(e : T)`)
+letHeadF : Gram -> P (Pair Ntn Ntn)
+letHeadF g = do
+  p <- g.pattern_
+  t <- peek
+  if strEq t.kind "sym" && isAnnText t.text
+      then do
+        cc <- next
+        ty <- g.expr
+        eq <- expectSym "="
+        e <- g.expr
+        pure
+            (MkPair
+               p
+               (At
+                  (Infix e (At (Keyword ":") (spanOf cc)) ty)
+                  (mkSpan (startPos ty) (endPos e))))
+    else do
+      eq <- expectSym "="
+      e <- g.expr
+      pure (MkPair p e)
+
+-- | `in e` after `let p = e'`: `p`'s variables are bound in `e`
+letBodyF : Gram -> L.Tok -> Pair Ntn Ntn -> P Ntn
+letBodyF g kw (MkPair p rhs) = do
+  i <- expectKw "in"
+  withScope (patVarsOf p) (do
+    body <- g.expr
+    end <- prevEnd
+    pure
+        (At
+           (NBlock
+              "let"
+              (Just rhs)
+              (Cons (infixOp p (At (Keyword "=>") (spanOf i)) body) Nil))
+           (spanTE kw end)))
+
+-- | `let p = e in e'`, a `case` of one alternative: `p` is a name, or a
+-- | pattern every value matches
+letExprF : Gram -> P Ntn
+letExprF g = do
+  kw <- next
+  h <- letHeadF g
+  letBodyF g kw h
+
+-- | `let p = e` in a `do` block, `p`'s variables bound in the statements
+-- | after it (followed by `in`, it is the expression)
+letStmtF : Gram -> P Ntn
+letStmtF g = do
+  kw <- next
+  h <- letHeadF g
+  t <- peek
+  if strEq t.kind "kw" && strEq t.text "in" then letBodyF g kw h
+    else do
+      end <- prevEnd
+      pModify (\s -> setScope (appendS (patVarsOf (fst h)) s.scope) s)
+      pure (At (NBlock "let" (Just (snd h)) (Cons (fst h) Nil)) (spanTE kw end))
+
 statementF : Gram -> P Ntn
 statementF g = do
   t <- peek
   t2 <- peekAt 1
-  if strEq t.kind "var" && strEq t2.text "<-"
+  if strEq t.kind "kw" && strEq t.text "let" then letStmtF g
+    else if strEq t.kind "var" && strEq t2.text "<-"
       then do
         n <- next
         arrow <- next
@@ -1359,6 +1419,7 @@ gram =
   , caseE = \st -> caseExprF gram st
   , ifE = \st -> ifExprF gram st
   , doE = \st -> doExprF gram st
+  , letE = \st -> letExprF gram st
   }
 
 expr : P Ntn

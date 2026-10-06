@@ -283,6 +283,9 @@ data E
   | If T E T E T E
   | Do T (List E)
   | ESBind T T E
+  -- | `let p : T = e in e'`, the annotation and the body each perhaps
+  -- | not there (a `do` block's `let p = e` has no body)
+  | ELet T Pat (Maybe (Pair T E)) T E (Maybe (Pair T E))
 
 data CE = MkCE T E
 
@@ -350,6 +353,7 @@ firstE (EAlt p arrow body) = firstP p
 firstE (If kw c th a el b) = kw
 firstE (Do kw stmts) = kw
 firstE (ESBind x arrow e) = x
+firstE (ELet kw p ann eq e body) = kw
 
 lastE : E -> T
 lastE (Atom t) = t
@@ -391,6 +395,10 @@ lastE (Do kw stmts) =
    Just e -> lastE e
    Nothing -> kw)
 lastE (ESBind x arrow e) = lastE e
+lastE (ELet kw p ann eq e body) =
+  (case body of
+   Just (MkPair i b) -> lastE b
+   Nothing -> lastE e)
 
 -- (`lastE` of the element, if there is one; the fallback otherwise)
 lastEOr : T -> Maybe E -> T
@@ -466,6 +474,7 @@ type Gram =
   , caseExpr : P E
   , ifExpr : P E
   , doExpr : P E
+  , letExpr : P E
   , stmt : P E
   , alt : P E
   , commaSepE : P (List CE)
@@ -537,6 +546,7 @@ exprF g = do
      else if isKw t "case" then g.caseExpr
      else if isKw t "if" then g.ifExpr
      else if isKw t "do" then g.doExpr
+     else if isKw t "let" then g.letExpr
      else g.opExpr 0)
   t2 <- peek
   b <- atBoundary
@@ -566,7 +576,12 @@ opLoopF g minPrec lhs = do
 arrowRhsF : Gram -> P E
 arrowRhsF g = do
   t <- peek
-  if isText t "\\" || isKw t "case" || isKw t "if" || isKw t "do" then g.expr
+  if isText t "\\"
+    || isKw t "case"
+    || isKw t "if"
+    || isKw t "do"
+    || isKw t "let"
+      then g.expr
     else g.opExpr 1
 
 userOpsF : Gram -> P E
@@ -583,7 +598,11 @@ operandsF g = do
       then do
         op <- next
         u <- peek
-        if isText u "\\" || isKw u "case" || isKw u "if" || isKw u "do"
+        if isText u "\\"
+          || isKw u "case"
+          || isKw u "if"
+          || isKw u "do"
+          || isKw u "let"
             then do
               e <- g.expr
               val (Cons (OpRhs op e) Nil)
@@ -738,11 +757,38 @@ doExprF g = do
   stmts <- block g.stmt
   val (Do kw stmts)
 
+-- | `let p = e in e'`, or `let p : T = e ...`; in a `do` block, `let p =
+-- | e` alone
+letExprF : Gram -> P E
+letExprF g = do
+  kw <- next
+  p <- g.pattern
+  t <- peek
+  ann <-
+    (if isAnnT t && isKind t "sym"
+       then do
+         cc <- next
+         ty <- g.expr
+         val (Just (MkPair cc ty))
+     else val Nothing)
+  eq <- expectSym "="
+  e <- g.expr
+  t2 <- peek
+  body <-
+    (if isKw t2 "in"
+       then do
+         i <- next
+         b <- g.expr
+         val (Just (MkPair i b))
+     else val Nothing)
+  val (ELet kw p ann eq e body)
+
 stmtF : Gram -> P E
 stmtF g = do
   t <- peek
   t2 <- peekAt 1
-  if isKind t "var" && isText t2 "<-"
+  if isKw t "let" then g.letExpr
+    else if isKind t "var" && isText t2 "<-"
       then do
         x <- next
         arrow <- next
@@ -860,6 +906,7 @@ gram =
   , caseExpr = \st -> caseExprF gram st
   , ifExpr = \st -> ifExprF gram st
   , doExpr = \st -> doExprF gram st
+  , letExpr = \st -> letExprF gram st
   , stmt = \st -> stmtF gram st
   , alt = \st -> altF gram st
   , commaSepE = \st -> commaSepEF gram st
@@ -1077,6 +1124,20 @@ tsE (If kw c th a el b) =
   Cons kw (concatList (tsE c) (Cons th (concatList (tsE a) (Cons el (tsE b)))))
 tsE (Do kw stmts) = Cons kw (concatMap tsE stmts)
 tsE (ESBind x arrow e) = Cons x (Cons arrow (tsE e))
+tsE (ELet kw p ann eq e body) =
+  Cons
+    kw
+    (concatList
+       (tsP p)
+       (concatList
+          (case ann of
+           Just (MkPair cc ty) -> Cons cc (tsE ty)
+           Nothing -> Nil)
+          (Cons
+             eq
+             (concatList (tsE e) (case body of
+              Just (MkPair i b) -> Cons i (tsE b)
+              Nothing -> Nil)))))
 
 tsTF : TF -> List T
 tsTF (MkTF x cc ty) = Cons x (Cons cc (tsE ty))
