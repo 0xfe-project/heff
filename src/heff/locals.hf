@@ -7,9 +7,10 @@
 --
 -- What binds: a lambda's parameters and a `case` alternative's, an
 -- equation's patterns, `let p = e in e'`, `x <- e` and `let p = e` in a
--- `do` block (for the statements after it), a named argument of a
--- function type (for what follows it), a definition's or a theory's
--- parameters (for what follows them); and
+-- `do` block (for the statements after it), a local definition of a
+-- `where` (for itself, those after it and the equation's body), a named
+-- argument of a function type (for what follows it), a definition's or a
+-- theory's parameters (for what follows them); and
 -- a signature's implicit arguments, which its equations are under.  A
 -- record type's field is in scope for the fields after it: a use of one
 -- is the field's (`fields`), not a local's.
@@ -76,6 +77,12 @@ isIdent : Ntn -> Bool
 isIdent (At (Ident _) _) = True
 isIdent _ = False
 
+-- | a signature's implicit arguments, which its equations are under
+implicitsOf : Ntn -> List Binder
+implicitsOf (At (Infix (At (NBrace (At (Infix (At (Ident x) sp) (At (Keyword ":") _) _) _)) _) (At (Keyword "->") _) r) _) =
+  Cons (binder x sp) (implicitsOf r)
+implicitsOf _ = Nil
+
 -- | the walk: a name's use, or what binds around what
 type Walk =
   { walk : List Binder -> Ntn -> Found
@@ -99,6 +106,57 @@ fieldSetting w env (At (Infix (At (Ident _) _) (At (Keyword ":=") _) e) _) =
   w.walk env e
 fieldSetting w env f = w.walk env f
 
+-- | the name a local definition (`where`) binds
+localBinders : Ntn -> List Binder
+localBinders n = case defEqnsOf n of
+  Just d -> [binder d.name d.span]
+  Nothing -> Nil
+
+-- (an equation's head, the definition's name: a use of it)
+headUse : List Binder -> Ntn -> Found
+headUse env eq = case Pm.nodeOf eq of
+  Infix l op _ ->
+    if isKeyword ":=" op
+      then (case Pm.nodeOf (getGroup l).head of
+            Ident f -> case findBinder f env of
+              Just b ->
+                { binders = Nil
+                , uses = [{ binder = b, use = Pm.spanOf (getGroup l).head }]
+                }
+              Nothing -> none
+            _ -> none)
+    else none
+  _ -> none
+
+-- | a local definition: its signature, then its equations under the
+-- | signature's implicit arguments
+localDefF : Walk -> List Binder -> Ntn -> Found
+localDefF w env n = case defEqnsOf n of
+  Just d ->
+    both
+      (w.walk env d.ty)
+      (foldl
+         (\acc eq ->
+            both
+              acc
+              (both
+                 (headUse env eq)
+                 (w.walk (scope (implicitsOf d.ty) env) eq)))
+         none
+         d.eqs)
+  Nothing -> w.walk env n
+
+-- | an equation's `where`: each local definition in scope in itself,
+-- | those after it and the equation's body
+localsF : Walk -> List Binder -> List Ntn -> Maybe Ntn -> Found
+localsF w env Nil body = walkMaybe w env body
+localsF w env (d :: ds) body =
+  both
+    (bound (localBinders d))
+    (both
+       (localDefF w (scope (localBinders d) env) d)
+       (localsF w (scope (localBinders d) env) ds body))
+
 walkF : Walk -> List Binder -> Ntn -> Found
 walkF w env n = case n of
   At (Ident x) sp -> case findBinder x env of
@@ -120,6 +178,7 @@ walkF w env n = case n of
   At (Infix (At (NBrace (At (Infix (At (Ident x) sp) (At (Keyword ":") _) a) _)) _) (At (Keyword "->") _) r) _ ->
     both (w.walk env a) (under w env [binder x sp] r)
   At (NBlock "do" h stmts) _ -> both (walkMaybe w env h) (w.doBlock env stmts)
+  At (NBlock "local" body defs) _ -> localsF w env defs body
   At (NBlock "struct" h fs) _ ->
     both
       (walkMaybe w env h)
@@ -171,12 +230,6 @@ walker =
   , doBlock = \env ns -> doBlockF walker env ns
   , sigBlock = \env ns -> sigBlockF walker env ns
   }
-
--- | a signature's implicit arguments, which its equations are under
-implicitsOf : Ntn -> List Binder
-implicitsOf (At (Infix (At (NBrace (At (Infix (At (Ident x) sp) (At (Keyword ":") _) _) _)) _) (At (Keyword "->") _) r) _) =
-  Cons (binder x sp) (implicitsOf r)
-implicitsOf _ = Nil
 
 -- | a definition's or theory's argument, as written: a name, perhaps
 -- | annotated

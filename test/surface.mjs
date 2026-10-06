@@ -42,6 +42,9 @@ const rejected = [
   ["test/errors/instance.hf", "error[E0342]: more than one instance for Eqv"],
   ["test/errors/let-refutable.hf", "test/errors/let-refutable.hf:6:7\nerror[E0317]: no case provided for tag Nothing"],
   ["test/errors/let-last.hf", "error[E0212]: a `do` block ends with an expression"],
+  ["test/errors/where-loop.hf", "test/errors/where-loop.hf:10:12\nerror[E0331]: the definition would need itself while it is being computed"],
+  ["test/errors/where-type.hf", "test/errors/where-type.hf:8:5\nerror[E0150]: `go` needs a type: `go : ...`"],
+  ["test/errors/where-order.hf", "test/errors/where-order.hf:9:9\nerror[E0308]: no such variable b in scope"],
   ["test/errors/primitive.hf", "there is no primitive called `intPlusPlus` (the runtime has: intAdd, "],
 ];
 for (const [f, msg] of rejected) {

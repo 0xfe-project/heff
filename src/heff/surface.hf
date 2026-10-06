@@ -323,13 +323,21 @@ expectKind k what = do
     else throwP (diag (spanOf t) ("expected " ++ what ++ ", not " ++ shown t))
 
 -- | the items of a block: the first sets the column
+-- | the token starts the block's next item (a line starting `where` ends
+-- | the block: the `where` of an equation)
+continuesBlock : L.Tok -> Int -> Bool
+continuesBlock t col =
+  not (strEq t.kind "eof")
+  && t.first
+  && t.col == col
+  && not (strEq t.kind "kw" && strEq t.text "where")
+
 blockGo : {a : Type} -> P a -> Int -> List a -> P (List a)
 blockGo item col acc = do
   pModify (\s -> setStart s.i s)
   x <- item
   t' <- peek
-  if not (strEq t'.kind "eof") && t'.first && t'.col == col
-      then blockGo item col (Cons x acc)
+  if continuesBlock t' col then blockGo item col (Cons x acc)
     else pure (reverse (Cons x acc))
 
 block : {a : Type} -> P a -> P (List a)
@@ -1433,6 +1441,93 @@ expr = \st -> gram.expr st
 -- | signature is), an equation, or a declaration whole
 data Item = Sig String Pm.Span Ntn Pm.Span | Eqn String Ntn Pm.Span | Decl Ntn
 
+-- Signatures meet their equations
+--------------------------------------------------------------------------------
+
+defOf : String -> Pm.Span -> Ntn -> Pm.Span -> List Ntn -> Ntn
+defOf f fsp ty sp eqs =
+  At
+    (MDecl
+       Nil
+       "def"
+       (infixOp
+          (At (Ident f) fsp)
+          (At (Keyword ":") sp)
+          (juxt ty (At (NBlock "where" Nothing eqs) sp))))
+    sp
+
+eqnsOf : String -> List Item -> List Ntn
+eqnsOf f Nil = Nil
+eqnsOf f (Cons (Eqn g e esp) rest) =
+  if strEq g f then Cons e (eqnsOf f rest) else eqnsOf f rest
+eqnsOf f (Cons _ rest) = eqnsOf f rest
+
+eqnEnd : String -> List Item -> Int -> Int
+eqnEnd f Nil e = e
+eqnEnd f (Cons (Eqn g _ esp) rest) e =
+  if strEq g f then eqnEnd f rest (maxI e esp.end) else eqnEnd f rest e
+eqnEnd f (Cons _ rest) e = eqnEnd f rest e
+
+assembleOne : List String -> List Item -> Item -> Maybe Ntn
+assembleOne broken items (Decl n) = Just n
+assembleOne broken items (Sig f fsp ty sp) =
+  if elemBy strEq f broken
+    then Just
+        (defOf
+           f
+           fsp
+           ty
+           sp
+           (Cons
+              (infixOp
+                 (At (Ident f) fsp)
+                 (At (Keyword ":=") sp)
+                 (At (Keyword "abandon") sp))
+              Nil))
+  else if length (eqnsOf f items) == 0 then Nothing
+  else Just
+      (defOf
+         f
+         fsp
+         ty
+         (mkSpan sp.start (eqnEnd f items sp.end))
+         (eqnsOf f items))
+assembleOne broken items (Eqn _ _ _) = Nothing
+
+assemble : List String -> List Item -> List Ntn
+assemble broken items =
+  catMaybesS (map (\it -> assembleOne broken items it) items)
+
+sigNames : List Item -> List String
+sigNames Nil = Nil
+sigNames (Cons (Sig f _ _ _) rest) = Cons f (sigNames rest)
+sigNames (Cons _ rest) = sigNames rest
+
+eqnNames : List Item -> List String
+eqnNames Nil = Nil
+eqnNames (Cons (Eqn f _ _) rest) = Cons f (eqnNames rest)
+eqnNames (Cons _ rest) = eqnNames rest
+
+assembleDiagOne : List String
+                -> List String
+                -> List String
+                -> Item
+                -> Maybe Diag
+assembleDiagOne broken sigs eqns (Sig f _ _ sp) =
+  if not (elemBy strEq f eqns) && not (elemBy strEq f broken)
+    then Just (diag sp ("`" ++ f ++ "` has a type but no definition"))
+  else Nothing
+assembleDiagOne broken sigs eqns (Eqn f _ sp) =
+  if not (elemBy strEq f sigs) && not (elemBy strEq f broken)
+    then Just (diag sp ("`" ++ f ++ "` needs a type: `" ++ f ++ " : ...`"))
+  else Nothing
+assembleDiagOne broken sigs eqns (Decl _) = Nothing
+
+assembleDiags : List String -> List Item -> List Diag
+assembleDiags broken items =
+  catMaybesS
+    (map (assembleDiagOne broken (sigNames items) (eqnNames items)) items)
+
 -- | what a signature or an equation defines: `f`, `C`, or `(+)`
 type DeclName = { name : String, len : Int, span : Pm.Span }
 
@@ -1454,9 +1549,30 @@ declName = do
 bindersFor : St -> String -> List Binders
 bindersFor s f = filter (\(b : Binders) -> strEq b.f f) s.binders
 
--- | `f p ... = e`
-equation : DeclName -> P (List Item)
-equation f = do
+-- | `e where` and the local definitions, signatures and equations (read
+-- | by `item`), as at the top level
+whereF : P (List Item) -> Ntn -> P Ntn
+whereF item rhs = do
+  w <- next
+  saved <- pGets (\s -> s.binders)
+  items <- block item
+  pModify (\s -> setBinders saved s)
+  end <- prevEnd
+  case assembleDiags Nil (concatMapS (\x -> x) items) of
+    Cons d _ -> throwP d
+    Nil ->
+      pure
+        (At
+           (NBlock
+              "local"
+              (Just rhs)
+              (assemble Nil (concatMapS (\x -> x) items)))
+           (mkSpan (startPos rhs) end))
+
+-- | `f p ... = e`, perhaps followed by `where` (its declarations read by
+-- | `item`)
+equationW : P (List Item) -> DeclName -> P (List Item)
+equationW item f = do
   start <- pGets (\s -> (cur s).start)
   pModify (\s -> setI (s.i + f.len) s)
   sig <- pGets (\s -> bindersFor s f.name)
@@ -1470,7 +1586,11 @@ equation f = do
       (appendS
          (concatMapS patVarsOf pats)
          (concatMapS (\(b : Binders) -> b.implicits) sig)) (do
-    rhs <- gram.expr
+    rhs0 <- gram.expr
+    w <- peek
+    rhs <-
+      if strEq w.kind "kw" && strEq w.text "where" then whereF item rhs0
+      else pure rhs0
     pure
         (Cons
            (Eqn
@@ -1681,11 +1801,11 @@ skipFixity = do
       n <- next
       skipFixity
 
-declOf : L.Tok -> Maybe DeclName -> P (List Item)
-declOf t Nothing =
+declOfW : P (List Item) -> L.Tok -> Maybe DeclName -> P (List Item)
+declOfW item t Nothing =
   throwP
     (diag (spanOf t) ("a declaration cannot start with `" ++ t.text ++ "`"))
-declOf t (Just f) = do
+declOfW item t (Just f) = do
   t2 <- peekAt f.len
   if isAnnText t2.text
       then do
@@ -1700,7 +1820,19 @@ declOf t (Just f) = do
                     s.binders)
                  s)
         pure (Cons (Sig f.name f.span ty (spanTE t end)) Nil)
-    else equation f
+    else equationW item f
+
+-- | a local declaration, of a `where`: a signature or an equation
+localItem : P (List Item)
+localItem = \st ->
+    (do
+     t <- peek
+     name <- declName
+     declOfW localItem t name)
+      st
+
+declOf : L.Tok -> Maybe DeclName -> P (List Item)
+declOf t n = declOfW localItem t n
 
 decl : P (List Item)
 decl = do
@@ -2019,93 +2151,6 @@ fixityDecls imported ts = fixityFrom imported (fixDecls ts 0 Nil)
 fixitiesOfText : F.Fixities -> String -> F.Fixities
 fixitiesOfText imported src =
   (fixityDecls imported (A.fromList (L.lex src).tokens)).fixities
-
--- Signatures meet their equations
---------------------------------------------------------------------------------
-
-defOf : String -> Pm.Span -> Ntn -> Pm.Span -> List Ntn -> Ntn
-defOf f fsp ty sp eqs =
-  At
-    (MDecl
-       Nil
-       "def"
-       (infixOp
-          (At (Ident f) fsp)
-          (At (Keyword ":") sp)
-          (juxt ty (At (NBlock "where" Nothing eqs) sp))))
-    sp
-
-eqnsOf : String -> List Item -> List Ntn
-eqnsOf f Nil = Nil
-eqnsOf f (Cons (Eqn g e esp) rest) =
-  if strEq g f then Cons e (eqnsOf f rest) else eqnsOf f rest
-eqnsOf f (Cons _ rest) = eqnsOf f rest
-
-eqnEnd : String -> List Item -> Int -> Int
-eqnEnd f Nil e = e
-eqnEnd f (Cons (Eqn g _ esp) rest) e =
-  if strEq g f then eqnEnd f rest (maxI e esp.end) else eqnEnd f rest e
-eqnEnd f (Cons _ rest) e = eqnEnd f rest e
-
-assembleOne : List String -> List Item -> Item -> Maybe Ntn
-assembleOne broken items (Decl n) = Just n
-assembleOne broken items (Sig f fsp ty sp) =
-  if elemBy strEq f broken
-    then Just
-        (defOf
-           f
-           fsp
-           ty
-           sp
-           (Cons
-              (infixOp
-                 (At (Ident f) fsp)
-                 (At (Keyword ":=") sp)
-                 (At (Keyword "abandon") sp))
-              Nil))
-  else if length (eqnsOf f items) == 0 then Nothing
-  else Just
-      (defOf
-         f
-         fsp
-         ty
-         (mkSpan sp.start (eqnEnd f items sp.end))
-         (eqnsOf f items))
-assembleOne broken items (Eqn _ _ _) = Nothing
-
-assemble : List String -> List Item -> List Ntn
-assemble broken items =
-  catMaybesS (map (\it -> assembleOne broken items it) items)
-
-sigNames : List Item -> List String
-sigNames Nil = Nil
-sigNames (Cons (Sig f _ _ _) rest) = Cons f (sigNames rest)
-sigNames (Cons _ rest) = sigNames rest
-
-eqnNames : List Item -> List String
-eqnNames Nil = Nil
-eqnNames (Cons (Eqn f _ _) rest) = Cons f (eqnNames rest)
-eqnNames (Cons _ rest) = eqnNames rest
-
-assembleDiagOne : List String
-                -> List String
-                -> List String
-                -> Item
-                -> Maybe Diag
-assembleDiagOne broken sigs eqns (Sig f _ _ sp) =
-  if not (elemBy strEq f eqns) && not (elemBy strEq f broken)
-    then Just (diag sp ("`" ++ f ++ "` has a type but no definition"))
-  else Nothing
-assembleDiagOne broken sigs eqns (Eqn f _ sp) =
-  if not (elemBy strEq f sigs) && not (elemBy strEq f broken)
-    then Just (diag sp ("`" ++ f ++ "` needs a type: `" ++ f ++ " : ...`"))
-  else Nothing
-assembleDiagOne broken sigs eqns (Decl _) = Nothing
-
-assembleDiags : List String -> List Item -> List Diag
-assembleDiags broken items =
-  catMaybesS
-    (map (assembleDiagOne broken (sigNames items) (eqnNames items)) items)
 
 -- The program loop
 --------------------------------------------------------------------------------

@@ -271,6 +271,26 @@ try {
   const yCaptures = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "y ys) = Cons"), newName: "map" });
   expect("no rename of a local to a name used under it", yCaptures.error, yCaptures);
 
+  // a local definition of a `where`: under its parent in the outline; its
+  // signature, the head of each of its equations and each use are it,
+  // renamed together
+  const whereSrc = disk("test/surface/where.hf");
+  open("test/surface/where.hf", whereSrc);
+  await diagnosticsOf(uri("test/surface/where.hf"));
+  const wOutline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/where.hf") } });
+  const wSym = (n) => wOutline.result && wOutline.result.find((s) => s.name === n);
+  expect("local definitions in the outline", wSym("scaled") && wSym("scaled").children.map((c) => c.name).join() === "times,go" &&
+    wSym("nested") && wSym("nested").children.map((c) => c.name).join() === "outer,inner", wOutline.result && [wSym("scaled"), wSym("nested")]);
+  const goAt = pos(whereSrc, "go xs");
+  const goRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/where.hf") }, position: goAt, context: { includeDeclaration: true } });
+  const goLines = goRefs.result && goRefs.result.map(lineOf);
+  expect("references of a local definition", goLines && goLines.length === 5 &&
+    [goAt, pos(whereSrc, "go : List Int"), pos(whereSrc, "go Nil = Nil"), pos(whereSrc, "go (y :: ys) = times"), pos(whereSrc, "go ys\n")].every((p) => goLines.includes(p.line)), goRefs.result);
+  const goRen = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/where.hf") }, position: pos(whereSrc, "go : List Int"), newName: "loop" });
+  const goEdits = goRen.result && goRen.result.changes[uri("test/surface/where.hf")];
+  expect("a rename of a local definition", goEdits && goEdits.length === 5 && goEdits.every((e) => e.newText === "loop"), goRen);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/where.hf") } });
+
   // a lambda's annotated binder, `\(r : R) -> ...`: its uses are its
   const ann = disk("test/surface/binder-ann.hf");
   open("test/surface/binder-ann.hf", ann);

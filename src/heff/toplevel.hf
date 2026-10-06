@@ -78,6 +78,8 @@ selfTermF r k d t = case t of
   SSpecialize e l v -> SSpecialize (r.el d e) l (r.el d v)
   SIs e -> SIs (r.el d e)
   SRec e -> SRec (r.el d e)
+  SFix dom (MkAbs x b) -> SFix (r.ty d dom) (MkAbs x (r.el (d + 1) b))
+  SFix dom (AbsConst b) -> SFix (r.ty d dom) (AbsConst (r.el d b))
   SImplicit x e -> SImplicit x (r.el d e)
   SMetaApp m ix ty2 -> SMetaApp m ix (r.ty d ty2)
   _ -> t
@@ -147,6 +149,7 @@ checksOnly n = case (getGroup n).head of
   At (NBlock "struct" _ _) _ -> True
   At (NBlock "match" _ _) _ -> True
   At (NBlock "let" _ _) _ -> True
+  At (NBlock "local" _ _) _ -> True
   At (NTuple _) _ -> True
   At (Keyword "abandon") _ -> True
   At (Infix _ (At (Keyword "=>") _) _) _ -> True
@@ -344,14 +347,17 @@ allL : {a : Type} -> (a -> Bool) -> List a -> Bool
 allL p Nil = True
 allL p (Cons x xs) = p x && allL p xs
 
--- | `(e : T)`, `e` a tag, a record or a tuple: in the core it is `e`,
--- | which does not say its type
-annotatesData : Ntn -> Bool
-annotatesData (At (Infix e (At (Keyword ":") _) _) _) = case (getGroup e).head of
+isData : Ntn -> Bool
+isData n = case n of
   At (NTag _) _ -> True
   At (NBlock "struct" _ _) _ -> True
   At (NTuple _) _ -> True
   _ -> False
+
+-- | `(e : T)`, `e` a tag, a record or a tuple: in the core it is `e`,
+-- | which does not say its type
+annotatesData : Ntn -> Bool
+annotatesData (At (Infix e (At (Keyword ":") _) _) _) = isData (getGroup e).head
 annotatesData _ = False
 
 isIdentA : Ntn -> Bool
@@ -502,6 +508,37 @@ opEquation g (At (Infix lhs (At (Keyword ":=") ksp) rhs) sp) = do
 opEquation g n = pure n
 
 -- | the head of a group, parsed
+-- | a local definition's body: its equations, as a match
+localEqs : TK -> String -> List Ntn -> Pm.Span -> Elab R.Chk
+localEqs tk f eqs sp = case Cl.desugar f Nil eqs sp of
+  Left err -> failP err.span 10 err.msg
+  Right b -> tk.chkJ N b
+
+-- (an operator in a pattern is found where the globals are in hand)
+localBody : TK -> String -> List Ntn -> Pm.Span -> Elab R.Chk
+localBody tk f eqs sp =
+  if not (allL (\m -> not (eqnHasOp m)) eqs)
+    then pure
+        (MkChk (\e a -> do
+         eqs' <- traverseEL (\m -> opEquation e.globals m) eqs
+         j <- localEqs tk f eqs' sp
+         R.runChk j e a))
+  else localEqs tk f eqs sp
+
+-- | extension: an equation's `where`: each local definition, `f : T` by
+-- | its equations, in scope in those after it and in the equation's body
+localsJ : TK -> List Ntn -> Maybe Ntn -> Pm.Span -> Elab R.Chk
+localsJ tk Nil (Just bodyN) sp = tk.chkJ N bodyN
+localsJ tk Nil Nothing sp =
+  unexpectedNotation (At NError sp) "local definitions"
+localsJ tk (n :: ns) bodyN sp = case defEqnsOf n of
+  Just d -> do
+    ty <- tk.typJ N d.ty
+    body <- localBody tk d.name d.eqs (ntnSpan n)
+    rest <- localsJ tk ns bodyN sp
+    pure (R.localDef d.name ty body rest)
+  Nothing -> unexpectedNotation n "local definition"
+
 parseHeadF : TK -> Pm.Case -> Ntn -> Elab Judgment
 parseHeadF tk c n = case n of
   -- Variable rule
@@ -598,6 +635,10 @@ parseHeadF tk c n = case n of
     At (Infix _ (At (Keyword "=>") _) _) _ ->
       tk.parseJ c (At (NBlock "match" (Just rhsN) (Cons alt Nil)) sp)
     _ -> failP sp 12 "a `let` statement is followed by what it is bound in"
+  -- extension: an equation's body and its local definitions (`where`)
+  At (NBlock "local" bodyN defs) sp -> do
+    j <- localsJ tk defs bodyN sp
+    pure (fromChkN c j)
   -- Misc.
   At (Keyword "abandon") sp -> pure (fromChkN c (R.abandonChk sp))
   At (Infix n0 (At (Keyword "~") _) n1) _ -> do
