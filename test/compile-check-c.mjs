@@ -35,9 +35,8 @@ for (let i = 0; i < Number(nArg); i++) cases.push({ name: `gen${i}`, src: genPro
 // (heff that does not finish is a failure, not a wait)
 const heff = (args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { encoding: "utf8", timeout: 120000 });
 
-// (what the C backend does not do yet, its value not compared: integers
-// beyond 62 bits, big integers being the next stage)
-const notYet = new Set(["prims.big"]);
+// (what the C backend does not do yet, its value not compared)
+const notYet = new Set([]);
 
 let agree = 0, differ = 0, compileErrors = 0, compared = 0, timeouts = 0;
 for (const c of cases) {
