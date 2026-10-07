@@ -1,7 +1,10 @@
 name: Release
 
 # A tag `vX.Y.Z` makes a GitHub release of that version: the compiler,
-# ready to run (`heff-X.Y.Z.tar.gz`), and the VS Code extension
+# ready to run on Node.js (`heff-X.Y.Z.tar.gz`), the compiler as a
+# program of its own for each platform (`heff-X.Y.Z-PLATFORM.tar.gz`,
+# `.zip` for Windows; compiled through C, by zig for every platform from
+# one runner, then tried on each), and the VS Code extension
 # (`heff-X.Y.Z.vsix`).  The tag must name the version package.json and
 # the extension's package.json say, which is what `heff` reports itself
 # to be.
@@ -15,7 +18,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -47,17 +50,97 @@ jobs:
           cp output/heff.mjs "$d/output/"
           cp -R package.json README.md lib licenses "$d/"
           tar czf "$d.tar.gz" "$d"
+      - uses: mlugg/setup-zig@v2
+      # The compiler as a program: `heff-X.Y.Z-PLATFORM/bin/heff`, with
+      # its version and library beside `bin/` as beside `output/`.
+      - name: The compiler, native
+        run: |
+          set -- \
+            linux-x64 x86_64-linux-musl \
+            linux-arm64 aarch64-linux-musl \
+            macos-x64 x86_64-macos \
+            macos-arm64 aarch64-macos \
+            windows-x64 x86_64-windows-gnu
+          targets=""
+          for i in $(seq 2 2 $#); do targets="$targets ${!i}"; done
+          node scripts/native.mjs $targets
+          while [ $# -gt 0 ]; do
+            d="heff-$VERSION-$1"
+            mkdir -p "$d/bin"
+            cp output/native/$2/heff* "$d/bin/"
+            cp -R package.json README.md lib licenses "$d/"
+            case "$1" in
+              windows-*) zip -qr "$d.zip" "$d" ;;
+              *) tar czf "$d.tar.gz" "$d" ;;
+            esac
+            shift 2
+          done
       - name: The VS Code extension
         working-directory: editors/vscode
         run: |
           npm ci
           npm run package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: |
+            heff-*.tar.gz
+            heff-*.zip
+            editors/vscode/heff-*.vsix
+
+  # each platform's program tried where it runs: checking, formatting,
+  # compiling, and running a program on Node.js (`heff run` runs node in
+  # its place, its own command)
+  try:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux-x64, exe: heff }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64, exe: heff }
+          - { os: macos-latest, platform: macos-arm64, exe: heff }
+          - { os: windows-latest, platform: windows-x64, exe: heff.exe }
+    runs-on: ${{ matrix.os }}
+    name: try ${{ matrix.platform }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+      - name: Unpack
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          case "${{ matrix.platform }}" in
+            windows-*) unzip -q "heff-$v-${{ matrix.platform }}.zip" ;;
+            *) tar xzf "heff-$v-${{ matrix.platform }}.tar.gz" ;;
+          esac
+          echo "HEFF=$PWD/heff-$v-${{ matrix.platform }}/bin/${{ matrix.exe }}" >> "$GITHUB_ENV"
+      - run: '"$HEFF" check test/programs/bigs.hf'
+      - run: '"$HEFF" fmt --check test/programs/bigs.hf'
+      - run: '"$HEFF" compile test/programs/bigs.hf bigs.mjs --backend=esm && node -e "import(\"./bigs.mjs\")"'
+      - run: test "$("$HEFF" run bench/pure.hf | tr -d '\r')" = 1000000
+
+  release:
+    needs: try
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
       - name: The release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            "heff-$VERSION.tar.gz" \
-            "editors/vscode/heff-$VERSION.vsix" \
-            --title "heff $VERSION" \
+            heff-*.tar.gz heff-*.zip \
+            editors/vscode/heff-*.vsix \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "heff ${GITHUB_REF_NAME#v}" \
             --generate-notes
