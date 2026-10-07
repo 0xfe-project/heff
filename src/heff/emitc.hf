@@ -570,6 +570,26 @@ lamVal r ce live xs b = do
        ++ argsArr (map (varUse ce.borrowed live) (freeOf xs b))
        ++ ")")
 
+-- (the primitive a tag built in a kept cell is, while emitting: see
+-- `reusing`)
+reusePrim : String
+reusePrim = "$reuse"
+
+reuseVal : CK -> CE -> List String -> List I.Expr -> C String
+reuseVal r ce live (Cons ru (Cons (ETag t as) Nil)) = do
+  vs <- operandsF r ce live (Cons ru as)
+  pure
+      ("heff_tag_at("
+       ++ fromMaybe "0" (head vs)
+       ++ ", "
+       ++ tagName t
+       ++ ", "
+       ++ showInt (length as)
+       ++ ", "
+       ++ argsArr (drop 1 vs)
+       ++ ")")
+reuseVal r ce live _ = pure "0"
+
 valF : CK -> CE -> List String -> I.Expr -> C String
 valF r ce live (EVar x) = pure (varUse ce.borrowed live x)
 valF r ce live (EGlobal g) =
@@ -600,9 +620,11 @@ valF r ce live (EProj e l) = do
   v <- r.val ce live e
   pure ("heff_get(" ++ v ++ ", " ++ lblName l ++ ")")
 valF r ce live (EPrim p) = primLit p
-valF r ce live (EPrimCall p as) = do
-  vs <- operandsF r ce live as
-  pure (primName p ++ "(" ++ joinWith ", " vs ++ ")")
+valF r ce live (EPrimCall p as) =
+  if strEq p reusePrim then reuseVal r ce live as
+  else do
+    vs <- operandsF r ce live as
+    pure (primName p ++ "(" ++ joinWith ", " vs ++ ")")
 valF r ce live (ELam xs b) = lamVal r ce live xs b
 valF r ce live EAbandon = pure "heff_abandon()"
 valF r ce live e = r.comp ce live e
@@ -697,42 +719,122 @@ fieldMask used i Nil = 0
 fieldMask used i (Cons v vs) =
   (if elemS v used then pow2 i else 0) + fieldMask used (i + 1) vs
 
+isNothingS : Maybe String -> Bool
+isNothingS Nothing = True
+isNothingS (Just _) = False
+
 takeLines : String -> Maybe String -> List String -> List String -> List String
 takeLines sv Nothing vs used = Nil
 takeLines sv (Just _) vs used =
   Cons ("heff_take(" ++ sv ++ ", " ++ showInt (fieldMask used 0 vs) ++ "ULL);") Nil
 
+-- (operands, the first that builds a tag of `n` fields in the kept cell)
+argDone : List I.Expr -> Pair Bool I.Expr -> Pair Bool (List I.Expr)
+argDone done (MkPair b e) = MkPair b (concatList done (Cons e Nil))
+
+reuseArgs : (I.Expr -> Pair Bool I.Expr) -> List I.Expr -> Pair Bool (List I.Expr)
+reuseArgs go es =
+  foldl
+    (\acc e ->
+       if fst acc then MkPair True (concatList (snd acc) (Cons e Nil))
+       else argDone (snd acc) (go e))
+    (MkPair False Nil)
+    es
+
+withArgs : (List I.Expr -> I.Expr) -> Pair Bool (List I.Expr) -> Pair Bool I.Expr
+withArgs f (MkPair b es) = MkPair b (f es)
+
+onePair : Pair Bool I.Expr -> Pair Bool (List I.Expr)
+onePair (MkPair b e) = MkPair b (Cons e Nil)
+
+-- (`let x = a in b`: the cell kept used in `a`, or else in `b`)
+letReuse : (I.Expr -> Pair Bool I.Expr) -> String -> I.Expr -> I.Expr -> Pair Bool I.Expr -> Pair Bool I.Expr
+letReuse go x a b (MkPair True a2) = MkPair True (ELet x a2 b)
+letReuse go x a b (MkPair False _) =
+  withArgs (\es -> ELet x a (fromMaybe b (head es))) (onePair (go b))
+
+armReuse : I.Arm -> Pair Bool I.Expr -> Pair Bool I.Arm
+armReuse (MkArm t vs _) (MkPair r b) = MkPair r (MkArm t vs b)
+
+matchReuse : I.Expr -> List (Pair Bool I.Arm) -> Pair Bool I.Expr
+matchReuse s ps = MkPair (any fst ps) (EMatch s (map snd ps))
+
+-- (the first tag of `n` fields built on each path, not in a lambda, built
+-- in the cell `ru` kept: whether one is)
+reuseIn : String -> Int -> I.Expr -> Pair Bool I.Expr
+reuseIn ru n (ETag t as) =
+  if length as == n
+    then MkPair True (EPrimCall reusePrim (Cons (EVar ru) (Cons (ETag t as) Nil)))
+  else withArgs (\es -> ETag t es) (reuseArgs (reuseIn ru n) as)
+reuseIn ru n (ECall g as) = withArgs (\es -> ECall g es) (reuseArgs (reuseIn ru n) as)
+reuseIn ru n (ELet x a b) = letReuse (reuseIn ru n) x a b (reuseIn ru n a)
+reuseIn ru n (EMatch s arms) =
+  matchReuse s (map (\a -> armReuse a (reuseIn ru n (I.armBody a))) arms)
+reuseIn ru n e = MkPair False e
+
+-- (an arm whose scrutinee is given up: its cell kept, `ru`, where the
+-- arm builds a tag of its size -- the body, so built)
+reusing : Maybe String -> String -> List String -> I.Expr -> Pair (Maybe String) I.Expr
+reusing Nothing t vs b = MkPair Nothing b
+reusing (Just x) t vs b = case reuseIn ("ru$" ++ x ++ "$" ++ t) (length vs) b of
+  MkPair True b2 -> MkPair (Just ("ru$" ++ x ++ "$" ++ t)) b2
+  MkPair False _ -> MkPair Nothing b
+
+takeKept : String -> Maybe String -> List String -> List String -> List String
+takeKept sv (Just ru) vs used =
+  Cons
+    ("V "
+     ++ cLocal ru
+     ++ " = heff_take_reuse("
+     ++ sv
+     ++ ", "
+     ++ showInt (fieldMask used 0 vs)
+     ++ "ULL);")
+    Nil
+takeKept sv Nothing vs used = Nil
+
 -- (an arm: the fields it wants, a reference to each; what is held and
 -- not wanted on it, dropped.  The scrutinee held and not wanted on it is
 -- given up at once (`heff_take`): its last reference, its shell freed and
 -- the fields not wanted dropped -- no field counted up and then down)
-armLines : CK -> CE -> Dest -> String -> Maybe String -> Bool -> I.Arm -> C (List String)
-armLines r ce dest sv held lent (MkArm t vs b) = do
+armKept : CK
+        -> CE
+        -> Dest
+        -> String
+        -> Maybe String
+        -> Bool
+        -> String
+        -> List String
+        -> I.Expr
+        -> Pair (Maybe String) I.Expr
+        -> C (List String)
+armKept r ce dest sv taken lent t vs b (MkPair ru b2) = do
   body <-
     r.stmts
         (withPath
            (deadKept
-              (concatList ce.owned (fieldsHeld lent vs b))
-              (unionS (fvE b) ce.after))
+              (concatList ce.owned (concatList (fieldsHeld lent vs b) (maybeList ru)))
+              (unionS (fvE b2) ce.after))
            ce.after
            (withBorrowed (if lent then concatList vs ce.borrowed else ce.borrowed) ce))
         dest
-        b
+        b2
   pure
       (concatList
          (Cons ("case " ++ tagName t ++ ": {") Nil)
          (concatList
             (concatMap
-               (fieldLine sv (lent || isJustS (takenOn ce held vs b)) (fvE b))
+               (fieldLine sv (lent || isJustS taken) (fvE b))
                (zipWith (\v i -> MkPair v i) vs (range 0 (length vs - 1))))
             (concatList
                (map
                   (\l -> "  " ++ l)
                   (concatList
-                     (takeLines sv (takenOn ce held vs b) vs (fvE b))
+                     (if isNothingS ru then takeLines sv taken vs (fvE b)
+                      else takeKept sv ru vs (fvE b))
                      (dropLines
                         (filter
-                           (\v -> not (elemS v (maybeList (takenOn ce held vs b))))
+                           (\v -> not (elemS v (maybeList taken)))
                            (deadIn
                               (concatList ce.owned (fieldsHeld lent vs b))
                               (unionS (fvE b) ce.after))))))
@@ -743,6 +845,10 @@ armLines r ce dest sv held lent (MkArm t vs b) = do
                       Ret -> Nil
                       Asg _ -> Cons "  break;" Nil)
                      (Cons "}" Nil))))))
+
+armLines : CK -> CE -> Dest -> String -> Maybe String -> Bool -> I.Arm -> C (List String)
+armLines r ce dest sv held lent (MkArm t vs b) =
+  armKept r ce dest sv (takenOn ce held vs b) lent t vs b (reusing (takenOn ce held vs b) t vs b)
 
 nomatchLine : Dest -> String -> String
 nomatchLine Ret sv = "default: return heff_nomatch(" ++ sv ++ ");"
