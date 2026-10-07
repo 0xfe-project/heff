@@ -289,7 +289,19 @@ try {
   const goRen = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/where.hf") }, position: pos(whereSrc, "go : List Int"), newName: "loop" });
   const goEdits = goRen.result && goRen.result.changes[uri("test/surface/where.hf")];
   expect("a rename of a local definition", goEdits && goEdits.length === 5 && goEdits.every((e) => e.newText === "loop"), goRen);
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/where.hf") } });
+  // an operator in a pattern is a tag's other name, no local: `::` after
+  // `=` is the prelude's, and so is the one in the pattern
+  const consRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/where.hf") }, position: pos(whereSrc, ":: go ys"), context: { includeDeclaration: true } });
+  expect("an operator in a pattern binds nothing", consRefs.result && consRefs.result.some((r) => r.uri === uri("lib/prelude.hf")), consRefs.result);
+  // an instance argument, `{{ev : pick <: e}}`: bound in the equations
+  const amb = disk("test/surface/amb.hf");
+  open("test/surface/amb.hf", amb);
+  await diagnosticsOf(uri("test/surface/amb.hf"));
+  const evRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/amb.hf") }, position: pos(amb, "ev (Flip"), context: { includeDeclaration: true } });
+  const evLines = evRefs.result && evRefs.result.map(lineOf);
+  expect("references of an instance argument", evLines && evLines.length === 2 &&
+    evLines.includes(pos(amb, "{{ev : pick <: e}} -> Co e Bool").line) && evLines.includes(pos(amb, "ev (Flip").line), evRefs.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/amb.hf") } });
 
   // a lambda's annotated binder, `\(r : R) -> ...`: its uses are its
   const ann = disk("test/surface/binder-ann.hf");
