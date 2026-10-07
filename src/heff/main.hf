@@ -655,7 +655,8 @@ promoteCmd file = do
   cs <- Se.cachedProgram l
   promoteDiags file (badL > 0) cs
 
-type TestRes = { total : Int, failed : Int, ok : Bool }
+type TestRes =
+  { total : Int, failed : Int, ok : Bool, tests : Int, testsFailed : Int }
 
 failLine : String -> Dr.TestReport -> Rp.Mismatch -> String
 failLine f r m =
@@ -693,71 +694,212 @@ printFails f color (Cons r rest) = do
 badReports : List Dr.TestReport -> List Dr.TestReport
 badReports rs = filter (\(r : Dr.TestReport) -> not r.watch.holds) rs
 
+-- (`n` of `total`, as a part of a hundred)
+percent : Int -> Int -> String
+percent n total = showInt (if total == 0 then 0 else n * 100 / total) ++ "%"
+
+-- | a property's statistic: how many runs held, how many were given up
+-- | on, and how many had each label -- so that a property that holds
+-- | only of what is trivial shows
+statistic : Dr.TestOutcome -> String
+statistic o =
+  showInt o.runs
+  ++ " runs"
+  ++ (if o.discarded > 0
+        then ", " ++ showInt o.discarded ++ " given up on"
+      else "")
+  ++ joinWith
+    ""
+    (map
+       (\(p : Pair String Int) -> ", " ++ percent (snd p) o.runs ++ " " ++ fst p)
+       o.labels)
+
+-- (how many shrinks made the counterexample)
+shrunk : Int -> String
+shrunk 0 = "not shrunk"
+shrunk 1 = "shrunk once"
+shrunk n = "shrunk " ++ showInt n ++ " times"
+
+-- | a test's line: whether it held, its name, and for a property its
+-- | statistic -- and if it failed, how far its counterexample was
+-- | shrunk and the seed that runs it again
+outcomeLine : Dr.TestOutcome -> String
+outcomeLine o =
+  (if o.ok then "  ok    " else "  FAIL  ")
+  ++ o.name
+  ++ (if not o.property then ""
+      else if o.ok then "  (" ++ statistic o ++ ")"
+      else "  (failed after "
+        ++ showInt o.runs
+        ++ " runs held"
+        ++ (if o.discarded > 0
+              then ", " ++ showInt o.discarded ++ " given up on"
+            else "")
+        ++ "; "
+        ++ shrunk o.shrinks
+        ++ "; again: --seed "
+        ++ showInt o.seed
+        ++ ")")
+
+mismatchLines : Rp.Mismatch -> List String
+mismatchLines m =
+  [ "        expected " ++ m.expected
+  , "        but got  " ++ m.got
+  , "        diff     " ++ m.diff
+  ]
+
+failLines : Bool -> Dr.TestFailure -> List String
+failLines color (FailBecause why) = ["        " ++ why]
+failLines color (FailDiffer expected got) =
+  mismatchLines (Rp.mismatch color expected got)
+
+failureLines : Bool -> Maybe Dr.TestFailure -> List String
+failureLines color Nothing = Nil
+failureLines color (Just f) = failLines color f
+
+-- | what came of each test: a line each, and under one that failed its
+-- | counterexample (what it drew and noted) and what was wrong
+printOutcomes : {e : HFunctor}
+              -> {{io : stdio <: e}}
+              -> Bool
+              -> List Dr.TestOutcome
+              -> Co e Unit
+printOutcomes color Nil = pure MkUnit
+printOutcomes color (Cons o rest) = do
+  print (outcomeLine o)
+  if o.ok then pure MkUnit
+  else print
+      (joinWith
+         "\n"
+         (concatList
+            (map (\n -> "        " ++ n) o.notes)
+            (failureLines color o.failure)))
+  printOutcomes color rest
+
+badOutcomes : List Dr.TestOutcome -> List Dr.TestOutcome
+badOutcomes os = filter (\(o : Dr.TestOutcome) -> not o.ok) os
+
+-- (how many tests held, of how many: said only of a file that has some)
+testsSaid : List Dr.TestOutcome -> String
+testsSaid Nil = ""
+testsSaid os =
+  ", tests "
+  ++ showInt (length os - length (badOutcomes os))
+  ++ "/"
+  ++ showInt (length os)
+
 testReport : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{rep : Rp.report <: e}}
            -> String
            -> Int
            -> List Dr.TestReport
+           -> List Dr.TestOutcome
            -> Co e TestRes
-testReport f bad ts = do
+testReport f bad ts os = do
   color <- Rp.useColor
   printFails f color (badReports ts)
+  printOutcomes color os
   print
-      ((if null (badReports ts) && bad == 0 then "ok    " else "FAIL  ")
+      ((if null (badReports ts) && null (badOutcomes os) && bad == 0
+          then "ok    "
+        else "FAIL  ")
        ++ f
        ++ "  "
        ++ showInt (length ts - length (badReports ts))
        ++ "/"
-       ++ showInt (length ts))
-  pure { total = length ts, failed = length (badReports ts), ok = bad == 0 }
+       ++ showInt (length ts)
+       ++ testsSaid os)
+  pure
+      { total = length ts
+      , failed = length (badReports ts)
+      , ok = bad == 0
+      , tests = length os
+      , testsFailed = length (badOutcomes os)
+      }
 
 testOneC : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{rep : Rp.report <: e}}
+         -> Int
          -> String
          -> Int
          -> List Dr.Checked
          -> Co e TestRes
-testOneC f bad0 cs = do
+testOneC seed f bad0 cs = do
   bad <- diagCount cs
   case Dr.lastChecked cs of
     Nothing -> do
       print ("FAIL  " ++ f ++ "  0/0")
-      pure { total = 0, failed = 0, ok = False }
-    Just c -> testReport f (bad0 + bad) (Dr.testFile c)
+      pure { total = 0, failed = 0, ok = False, tests = 0, testsFailed = 0 }
+    Just c ->
+      testReport
+        f
+        (bad0 + bad)
+        (Dr.testFile c)
+        (if bad0 + bad > 0 then Nil else Dr.runTests seed c)
 
 testOneF : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> {{disk : fs <: e}}
          -> {{rep : Rp.report <: e}}
+         -> Int
          -> String
          -> Co e TestRes
-testOneF f = do
+testOneF seed f = do
   l <- load f
   badL <- printErrs "heff" l.errors 0
   cs <- Se.cachedProgram l
-  testOneC f badL cs
+  testOneC seed f badL cs
 
--- | check the watches' expectations of every file given
+-- (the tests' part of the last line: said only if there were some)
+testsHeld : Int -> Int -> String
+testsHeld tests failed =
+  if tests == 0 then ""
+  else ", " ++ showInt (tests - failed) ++ "/" ++ showInt tests ++ " tests hold"
+
+-- | check the watches' expectations of every file given, and run its
+-- | tests (each property from `seed`)
 testCmd : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
         -> {{disk : fs <: e}}
         -> {{rep : Rp.report <: e}}
+        -> Int
         -> List String
-        -> Int
-        -> Int
-        -> Bool
+        -> TestRes
         -> Co e Unit
-testCmd Nil total failed anyBad = do
+testCmd seed Nil acc = do
   print
-      (showInt (total - failed) ++ "/" ++ showInt total ++ " expectations hold")
-  if failed > 0 || anyBad then exit 1 else pure MkUnit
-testCmd (Cons f rest) total failed anyBad = do
-  r <- testOneF f
-  testCmd rest (total + r.total) (failed + r.failed) (anyBad || not r.ok)
+      (showInt (acc.total - acc.failed)
+       ++ "/"
+       ++ showInt acc.total
+       ++ " expectations hold"
+       ++ testsHeld acc.tests acc.testsFailed)
+  if acc.failed > 0 || acc.testsFailed > 0 || not acc.ok then exit 1
+  else pure MkUnit
+testCmd seed (Cons f rest) acc = do
+  r <- testOneF seed f
+  testCmd
+    seed
+    rest
+    { total = acc.total + r.total
+    , failed = acc.failed + r.failed
+    , ok = acc.ok && r.ok
+    , tests = acc.tests + r.tests
+    , testsFailed = acc.testsFailed + r.testsFailed
+    }
+
+-- | the seed the properties are run from, unless `--seed` gives one:
+-- | always the same, so that a run of the tests is a run of the same
+-- | tests
+defaultSeed : Int
+defaultSeed = 2026
+
+seedOf : Maybe String -> Int
+seedOf Nothing = defaultSeed
+seedOf (Just s) = fromMaybe defaultSeed (parseInt s)
 
 checkLast : {e : HFunctor}
           -> {{io : stdio <: e}}
@@ -918,8 +1060,8 @@ hfFilesGo (Cons p rest) acc = do
       if endsWith ".hf" p then hfFilesGo rest (Cons p acc)
       else hfFilesGo rest acc
 
--- (the watches of the files, checked: how many hold, of how many, and
--- whether every file checked)
+-- (the watches of the files, checked, and their tests run: how many
+-- hold, of how many, and whether every file checked)
 testAll : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
@@ -930,12 +1072,14 @@ testAll : {e : HFunctor}
         -> Co e TestRes
 testAll Nil acc = pure acc
 testAll (Cons f rest) acc = do
-  r <- testOneF f
+  r <- testOneF defaultSeed f
   testAll
       rest
       { total = acc.total + r.total
       , failed = acc.failed + r.failed
       , ok = acc.ok && r.ok
+      , tests = acc.tests + r.tests
+      , testsFailed = acc.testsFailed + r.testsFailed
       }
 
 publishFails : {e : HFunctor}
@@ -994,12 +1138,16 @@ publishTested : {e : HFunctor}
               -> TestRes
               -> Co e Unit
 publishTested v pk r =
-  if r.failed > 0 || not r.ok
+  if r.failed > 0 || r.testsFailed > 0 || not r.ok
     then publishFails
         (showInt r.failed
          ++ " of "
          ++ showInt r.total
-         ++ " expectations do not hold, or a file does not check")
+         ++ " expectations do not hold, "
+         ++ showInt r.testsFailed
+         ++ " of "
+         ++ showInt r.tests
+         ++ " tests fail, or a file does not check")
   else publishTag v pk
 
 publishGit : {e : HFunctor}
@@ -1022,7 +1170,9 @@ publishGit v pk src = do
       then publishFails ("v" ++ v ++ " is tagged already")
     else do
       files <- hfFilesGo [src] Nil
-      r <- testAll files { total = 0, failed = 0, ok = True }
+      r <- testAll
+          files
+          { total = 0, failed = 0, ok = True, tests = 0, testsFailed = 0 }
       publishTested v pk r
 
 publishChecked : {e : HFunctor}
@@ -1044,8 +1194,9 @@ publishChecked v l pk = case Pr.majorMismatch pk.module v of
 
 -- | publish the project, at the working directory, as version V: its
 -- | package.hf a Package (lib/manifest.hf), its path's `/vN` its major,
--- | its src/ one directory, every file of it checked and its watches
--- | holding, all of it committed -- then tagged `vV`, the tag pushed
+-- | its src/ one directory, every file of it checked, its watches
+-- | holding and its tests too, all of it committed -- then tagged `vV`,
+-- | the tag pushed
 publishCmd : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
@@ -1566,7 +1717,7 @@ lspCmd flags = do
 type Build (r : Type) =
   { check : String -> r
   , run : String -> List String -> r
-  , tests : List String -> r
+  , tests : Maybe String -> List String -> r
   , promote : String -> r
   , compile : String -> String -> Maybe String -> String -> r
   , explain : String -> r
@@ -1603,8 +1754,18 @@ buildCommands c =
     (\s -> Cli.with2 s c.run (Cli.arg s "FILE" hf) (Cli.rest s "ARGS"))
   , Cli.command
     "test"
-    "check the watches' expectations (the `-- ...` lines under them)"
-    (\s -> Cli.with1 s c.tests (Cli.some s "FILE" hf))
+    "check the watches' expectations (the `-- ...` lines under them), and run the tests (the definitions of type `Test`, lib/check.hf)"
+    (\s ->
+       Cli.with2
+         s
+         c.tests
+         (Cli.option
+            s
+            "seed"
+            "s"
+            "N"
+            "the seed the properties draw from (the same seed, the same runs)")
+         (Cli.some s "FILE" hf))
   , Cli.command
     "promote"
     "write each watch's value under it as its expectation"
@@ -1687,7 +1848,11 @@ build : {e : HFunctor}
 build =
   { check = checkCmd
   , run = runCmd
-  , tests = \files -> testCmd files 0 0 False
+  , tests = \seed files ->
+      testCmd
+        (seedOf seed)
+        files
+        { total = 0, failed = 0, ok = True, tests = 0, testsFailed = 0 }
   , promote = promoteCmd
   , compile = compileWith
   , explain = explainCmd
@@ -1721,7 +1886,7 @@ said =
   { build =
       { check = \f -> "check " ++ f
       , run = \f as -> "run " ++ f ++ " [" ++ joinWith "," as ++ "]"
-      , tests = \fs -> "test " ++ joinWith "," fs
+      , tests = \sd fs -> "test " ++ fromMaybe "-" sd ++ " " ++ joinWith "," fs
       , promote = \f -> "promote " ++ f
       , compile = \f o n b ->
             "compile " ++ f ++ " " ++ o ++ " " ++ fromMaybe "-" n ++ " " ++ b
