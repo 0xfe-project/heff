@@ -318,62 +318,72 @@ foldr : {a b : Type} -> (a -> b -> b) -> b -> List a -> b
 foldr f z Nil = z
 foldr f z (Cons x xs) = f x (foldr f z xs)
 
-wrapB : Bool -> Expr -> Pm.Span -> Expr
-wrapB True e sp = At (EBrace e) sp
-wrapB False e sp = e
+-- | `d -> b`, from the binder to the type
+piOf : PiBinder Expr -> Pm.Span -> Expr -> Expr
+piOf d dsp b = At (EPi d b) (spanning dsp (Pm.spanOf b))
 
--- | what is left of `->`: `(x : A)`, `{x : A}`, `{{x : A}}`, or a type
-piBinderOf : Expr -> PiBinder Expr
-piBinderOf (At (EAnn (At (EVar x) xsp) t) _) = PiNamed x xsp t
-piBinderOf (At (EBrace (At (EAnn (At (EVar x) xsp) t) _)) bsp) =
-  PiImplicit x xsp bsp t
-piBinderOf (At (EBracket (At (EAnn (At (EVar x) xsp) t) _)) bsp) =
-  PiInstance x xsp bsp t
-piBinderOf d = PiAnon d
+-- | what is left of `->`: a type, or what is in braces, `{x : A}`, or
+-- | in double braces, `{{x : A}}` (where they are)
+data ArrowLhs = Plain Expr | Braced Expr Pm.Span | Bracketed Expr Pm.Span
 
--- | `d -> b`, from the one to the other
-piOf : Expr -> Expr -> Expr
-piOf d b = At (EPi (piBinderOf d) b) (spanning (Pm.spanOf d) (Pm.spanOf b))
+-- | a type alone, or `(x : A)`
+plainBinder : Expr -> PiBinder Expr
+plainBinder (At (EAnn (At (EVar x) xsp) t) _) = PiNamed x xsp t
+plainBinder d = PiAnon d
 
-arrowNames : Expr -> Expr -> Expr -> Bool -> Expr -> Expr
-arrowNames rhs g ty braced orig =
+-- | `(a b : T) -> B` is `(a : T) -> (b : T) -> B`; `{a b : T} -> B`, the
+-- | same with implicit arguments
+arrowNames : Expr -> Expr -> Expr -> Maybe Pm.Span -> Expr -> Expr
+arrowNames rhs g ty braces orig =
   if allS isVarE (Cons (spineOf g).head (spineOf g).args)
-  && length (spineOf g).args > 0
     then foldr
-        (\x b -> piOf (wrapB braced (ann x ty) (Pm.spanOf orig)) b)
+        (\x b -> case x of
+         At (EVar y) ysp -> case braces of
+           Just bsp -> piOf (PiImplicit y ysp bsp ty) bsp b
+           Nothing -> piOf (PiNamed y ysp ty) (spanning ysp (Pm.spanOf ty)) b
+         _ -> b)
         rhs
         (Cons (spineOf g).head (spineOf g).args)
-  else piOf orig rhs
+  else case braces of
+    Just bsp ->
+      piOf
+        (PiAnon
+           (At
+              (EInvalid "an implicit argument is named: `{x : T} -> ...`")
+              bsp))
+        bsp
+        rhs
+    Nothing -> piOf (plainBinder orig) (Pm.spanOf orig) rhs
 
--- `{a : T} -> B`: braces with one declaration, left of an arrow, bind
--- an implicit argument
-arrowBinop : Expr -> Expr -> Expr
+arrowBinop : ArrowLhs -> Expr -> Expr
 arrowBinop lhs rhs = case lhs of
-  At (EAnn g ty) _ -> arrowNames rhs g ty False lhs
-  At (EBrace (At (EAnn g ty) _)) _ -> arrowNames rhs g ty True lhs
-  _ -> piOf lhs rhs
+  Plain (At (EAnn g ty) sp) -> arrowNames rhs g ty Nothing (At (EAnn g ty) sp)
+  Plain d -> piOf (PiAnon d) (Pm.spanOf d) rhs
+  Braced (At (EAnn g ty) sp) bsp ->
+    arrowNames rhs g ty (Just bsp) (At (EAnn g ty) sp)
+  Braced d bsp ->
+    piOf
+      (PiAnon
+         (At (EInvalid "an implicit argument is named: `{x : T} -> ...`") bsp))
+      bsp
+      rhs
+  Bracketed (At (EAnn (At (EVar x) xsp) t) _) bsp ->
+    piOf (PiInstance x xsp bsp t) bsp rhs
+  Bracketed d bsp ->
+    piOf
+      (PiAnon
+         (At
+            (EInvalid "an instance argument is named: `{{x : T}} -> ...`")
+            bsp))
+      bsp
+      rhs
 
--- | written where a setting would be, `x` and something else (`x : T`,
--- | `\x -> e`, `x -> T`, `x ~ e`): read as a setting of `x`, of no kind
--- | a specialisation takes
-namedOther : Expr -> Bool
-namedOther (At (EAnn (At (EVar _) _) _) _) = True
-namedOther (At (ELam (LamName _ _) _) _) = True
-namedOther (At (EPi (PiAnon (At (EVar _) _)) _) _) = True
-namedOther (At (ESpecOther (At (EVar _) _) _) _) = True
-namedOther (At (ESpec (At (EVar _) _) _ _ _) _) = True
-namedOther _ = False
-
--- (any other setting whose field is no name specialises nothing)
+-- | `e ~ { x = v }`, a setting at a time
 specOne : Expr -> Pm.Spanned (FieldSet Expr) -> Expr
 specOne acc (At (SetField x _ v) fsp) =
   At (ESpec acc x fsp v) (spanning (Pm.spanOf acc) fsp)
 specOne acc (At (BadFieldSet e) fsp) =
-  if namedOther e
-    then At
-        (ESpecOther acc (At (ETuple [e]) fsp))
-        (spanning (Pm.spanOf acc) fsp)
-  else acc
+  At (EInvalid "a specialisation sets a field by its name: `x = v`") fsp
 
 -- The shunting yard
 --------------------------------------------------------------------------------
@@ -916,8 +926,14 @@ opL r a op b =
       a' <- case bracedOne a of
         Just f -> do
           d <- declarationL r f
-          pure (At (EBrace d) (spanTT (C.firstE a) (C.lastE a)))
-        Nothing -> r.e a
+          pure (Braced d (spanTT (C.firstE a) (C.lastE a)))
+        Nothing -> case a of
+          InstB o o2 d c1 c -> do
+            d' <- declarationL r d
+            pure (Bracketed d' (spanTT o c))
+          _ -> do
+            e <- r.e a
+            pure (Plain e)
       b' <- r.e b
       pure (arrowBinop a' b')
   else do
@@ -928,7 +944,17 @@ opL r a op b =
         pure (foldl (\acc f -> specOne acc f) a' fs')
       Nothing -> do
         b' <- r.e b
-        pure (At (ESpecOther a' b') (spanning (Pm.spanOf a') (Pm.spanOf b')))
+        pure
+            (At
+               (EInvalid "a specialisation sets fields: `T ~ { x = v }`")
+               (spanning (Pm.spanOf a') (Pm.spanOf b')))
+
+-- | an argument: `(x := e)` names the parameter it is for
+argL : Lw -> C.E -> P Expr
+argL r (Named o x k e c) = do
+  e' <- r.e e
+  pure (At (ENamed x.text e') (spanTT o c))
+argL r e = r.e e
 
 -- | an expression
 exprL : Lw -> C.E -> P Expr
@@ -944,23 +970,42 @@ exprL r e0 = case e0 of
   EParen o e c -> parenL r o e c
   Named o x k e c -> do
     e' <- r.e e
-    pure (At (ENamed x.text e') (spanTT o c))
-  Tup o es commas c -> do
-    es' <- traverseS r.e es
     pure
-        (if strEq o.text "[" then listE (spanTT o c) es'
-         else At (ETuple es') (spanTT o c))
+        (At
+           (EInvalid
+              ("`("
+               ++ x.text
+               ++ " := ...)` names an argument, after a function: `f ("
+               ++ x.text
+               ++ " := e)`"))
+           (spanTT o c))
+  Tup o es commas c ->
+    if strEq o.text "["
+      then do
+        es' <- traverseS r.e es
+        pure (listE (spanTT o c) es')
+    else do
+      es' <- traverseS r.e es
+      pure
+          (At
+             (EInvalid
+                "heff has no tuples: a record holds values together, `{ x = a, y = b }`")
+             (spanTT o c))
   Braces o fs commas c -> bracesL r o fs c
   InstB o o2 d c1 c -> do
     d' <- declarationL r d
-    pure (At (EBracket d') (spanTT o c))
+    pure
+        (At
+           (EInvalid
+              "an instance argument is bound before `->`: `{{x : T}} -> ...`")
+           (spanTT o c))
   Sum kw o alts bars c -> do
     alts' <- traverseS (\a -> variantL r a) alts
     pure (At (ESum alts') (spanTT kw c))
   ECon c args -> conL r c args
   App h args -> do
     h' <- r.e h
-    args' <- traverseS r.e args
+    args' <- traverseS (\m -> argL r m) args
     pure (app h' args')
   Op a op b -> opL r a op b
   Ops a rest -> do
