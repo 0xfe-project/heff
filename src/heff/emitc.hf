@@ -355,8 +355,18 @@ bound (ECall _ as) = varsIn bound as
 bound _ = Nil
 
 -- (those mentioned not bound: `bs` reckoned once, not for each)
+setOf : List String -> M.Map String Unit
+setOf xs = foldl (\m x -> M.insert compareString x (MkUnit : Unit) m) M.empty xs
+
+-- (those of `ms` not in `bs` nor before, in order)
+freeGo : M.Map String Unit -> M.Map String Unit -> List String -> List String -> List String
+freeGo bs seen Nil acc = reverse acc
+freeGo bs seen (Cons v vs) acc =
+  if M.member compareString v bs || M.member compareString v seen then freeGo bs seen vs acc
+  else freeGo bs (M.insert compareString v (MkUnit : Unit) seen) vs (Cons v acc)
+
 freeAmong : List String -> List String -> List String
-freeAmong bs ms = nubS Nil (filter (\v -> not (elemS v bs)) ms)
+freeAmong bs ms = freeGo (setOf bs) M.empty ms Nil
 
 freeOf : List String -> I.Expr -> List String
 freeOf xs b = freeAmong (concatList xs (bound b)) (mentioned b)
@@ -675,11 +685,11 @@ again ce vs = case ce.self of
   Nothing -> Nil
 
 -- (the scrutinee, a variable held, given up on an arm that does not want
--- it and has fields)
-takenOn : CE -> Maybe String -> List String -> I.Expr -> Maybe String
-takenOn ce Nothing vs b = Nothing
-takenOn ce (Just x) vs b =
-  if not (null vs) && length vs <= 60 && not (elemS x (unionS (fvE b) ce.after))
+-- it and has fields: `fb` what the arm wants)
+takenFv : CE -> Maybe String -> List String -> List String -> Maybe String
+takenFv ce Nothing vs fb = Nothing
+takenFv ce (Just x) vs fb =
+  if not (null vs) && length vs <= 60 && not (elemS x fb) && not (elemS x ce.after)
     then Just x
   else Nothing
 
@@ -707,9 +717,9 @@ isJustS (Just _) = True
 isJustS Nothing = False
 
 -- (the fields an arm holds a reference to: those it wants, unless lent)
-fieldsHeld : Bool -> List String -> I.Expr -> List String
-fieldsHeld True vs b = Nil
-fieldsHeld False vs b = filter (\v -> elemS v (fvE b)) vs
+fieldsHeld : Bool -> List String -> List String -> List String
+fieldsHeld True vs fb = Nil
+fieldsHeld False vs fb = filter (\v -> elemS v fb) vs
 
 pow2 : Int -> Int
 pow2 0 = 1
@@ -807,15 +817,16 @@ armKept : CK
         -> String
         -> List String
         -> I.Expr
+        -> List String
         -> Pair (Maybe String) I.Expr
         -> C (List String)
-armKept r ce dest sv taken lent t vs b (MkPair ru b2) = do
+armKept r ce dest sv taken lent t vs b fb (MkPair ru b2) = do
   body <-
     r.stmts
         (withPath
            (deadKept
-              (concatList ce.owned (concatList (fieldsHeld lent vs b) (maybeList ru)))
-              (unionS (fvE b2) ce.after))
+              (concatList ce.owned (concatList (fieldsHeld lent vs fb) (maybeList ru)))
+              (unionS (concatList fb (maybeList ru)) ce.after))
            ce.after
            (withBorrowed (if lent then concatList vs ce.borrowed else ce.borrowed) ce))
         dest
@@ -825,20 +836,20 @@ armKept r ce dest sv taken lent t vs b (MkPair ru b2) = do
          (Cons ("case " ++ tagName t ++ ": {") Nil)
          (concatList
             (concatMap
-               (fieldLine sv (lent || isJustS taken) (fvE b))
+               (fieldLine sv (lent || isJustS taken) fb)
                (zipWith (\v i -> MkPair v i) vs (range 0 (length vs - 1))))
             (concatList
                (map
                   (\l -> "  " ++ l)
                   (concatList
-                     (if isNothingS ru then takeLines sv taken vs (fvE b)
-                      else takeKept sv ru vs (fvE b))
+                     (if isNothingS ru then takeLines sv taken vs fb
+                      else takeKept sv ru vs fb)
                      (dropLines
                         (filter
                            (\v -> not (elemS v (maybeList taken)))
                            (deadIn
-                              (concatList ce.owned (fieldsHeld lent vs b))
-                              (unionS (fvE b) ce.after))))))
+                              (concatList ce.owned (fieldsHeld lent vs fb))
+                              (unionS fb ce.after))))))
                (concatList
                   (map (\l -> "  " ++ l) body)
                   (concatList
@@ -847,9 +858,37 @@ armKept r ce dest sv taken lent t vs b (MkPair ru b2) = do
                       Asg _ -> Cons "  break;" Nil)
                      (Cons "}" Nil))))))
 
+armTaken : CK
+         -> CE
+         -> Dest
+         -> String
+         -> Bool
+         -> String
+         -> List String
+         -> I.Expr
+         -> List String
+         -> Maybe String
+         -> C (List String)
+armTaken r ce dest sv lent t vs b fb taken =
+  armKept r ce dest sv taken lent t vs b fb (reusing taken t vs b)
+
+armFv : CK
+      -> CE
+      -> Dest
+      -> String
+      -> Maybe String
+      -> Bool
+      -> String
+      -> List String
+      -> I.Expr
+      -> List String
+      -> C (List String)
+armFv r ce dest sv held lent t vs b fb =
+  armTaken r ce dest sv lent t vs b fb (takenFv ce held vs fb)
+
 armLines : CK -> CE -> Dest -> String -> Maybe String -> Bool -> I.Arm -> C (List String)
 armLines r ce dest sv held lent (MkArm t vs b) =
-  armKept r ce dest sv (takenOn ce held vs b) lent t vs b (reusing (takenOn ce held vs b) t vs b)
+  armFv r ce dest sv held lent t vs b (fvE b)
 
 nomatchLine : Dest -> String -> String
 nomatchLine Ret sv = "default: return heff_nomatch(" ++ sv ++ ");"
@@ -890,36 +929,38 @@ bindTo r ce x a = do
 -- (`let x = a in b`: what is held and wanted neither by `a` nor after it
 -- dropped first; then `a`, wanted after it what `b` and what comes after
 -- want; then `x`, dropped if nothing wants it)
-letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
-letLines r ce dest x a b = do
-  la <-
-    bindTo
-        r
-        (withPath
-           (deadKept ce.owned (unionS (fvE a) (unionS (fvE b) ce.after)))
-           (unionS (fvE b) ce.after)
-           ce)
-        x
-        a
+-- (`fa` what `a` wants, `wb` what `b` and what comes after want: each
+-- reckoned once)
+letWith : CK
+        -> CE
+        -> Dest
+        -> String
+        -> I.Expr
+        -> I.Expr
+        -> List String
+        -> List String
+        -> C (List String)
+letWith r ce dest x a b fa wb = do
+  la <- bindTo r (withPath (deadKept ce.owned (unionS fa wb)) wb ce) x a
   rest <-
     r.stmts
         (withPath
-           (concatList
-              (deadKept ce.owned (unionS (fvE b) ce.after))
-              (if elemS x (unionS (fvE b) ce.after) then Cons x Nil else Nil))
+           (concatList (deadKept ce.owned wb) (if elemS x wb then Cons x Nil else Nil))
            ce.after
            ce)
         dest
         b
   pure
       (concatList
-         (dropLines (deadIn ce.owned (unionS (fvE a) (unionS (fvE b) ce.after))))
+         (dropLines (deadIn ce.owned (unionS fa wb)))
          (concatList
             la
             (concatList
-               (if elemS x (unionS (fvE b) ce.after) then Nil
-                else Cons ("heff_drop(" ++ cLocal x ++ ");") Nil)
+               (if elemS x wb then Nil else Cons ("heff_drop(" ++ cLocal x ++ ");") Nil)
                rest)))
+
+letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
+letLines r ce dest x a b = letWith r ce dest x a b (fvE a) (unionS (fvE b) ce.after)
 
 stmtsF : CK -> CE -> Dest -> I.Expr -> C (List String)
 stmtsF r ce dest (ELet x a b) = letLines r ce dest x a b
