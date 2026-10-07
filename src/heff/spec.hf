@@ -1,0 +1,183 @@
+-- Specialisation, the parts that compute nothing (`heff.simplify` does
+-- the rest): a key that tells known arguments apart (the same for two
+-- copies of one value, whatever their binders are named), which
+-- parameters a function hands on to itself unchanged, and its calls of
+-- itself as calls of a copy given only the others.
+
+import heff.ir as I
+import map as M
+import prelude
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+appendS : {a : Type} -> List a -> List a -> List a
+appendS Nil ys = ys
+appendS (Cons x xs) ys = Cons x (appendS xs ys)
+
+allS : {a : Type} -> (a -> Bool) -> List a -> Bool
+allS p Nil = True
+allS p (Cons x xs) = p x && allS p xs
+
+-- | whether every variable it mentions is bound in it or in `env`
+closedIn : List String -> I.Expr -> Bool
+closedIn env e = case e of
+  EVar x -> elemS x env
+  ELam xs b -> closedIn (appendS xs env) b
+  EApp f as -> closedIn env f && allS (\a -> closedIn env a) as
+  ELet x a b -> closedIn env a && closedIn (Cons x env) b
+  ERecord fs -> allS (\p -> closedIn env (snd p)) fs
+  EProj e2 _ -> closedIn env e2
+  ETag _ as -> allS (\a -> closedIn env a) as
+  EMatch s arms ->
+    closedIn env s
+    && allS (\a -> closedIn (appendS (I.armVars a) env) (I.armBody a)) arms
+  EPrimCall _ as -> allS (\a -> closedIn env a) as
+  ECall _ as -> allS (\a -> closedIn env a) as
+  EFix _ _ -> False
+  _ -> True
+
+posGo : String -> List String -> Int -> Int
+posGo x Nil i = 0 - 1
+posGo x (Cons y ys) i = if strEq x y then i else posGo x ys (i + 1)
+
+-- (a variable is where it was bound, counted from the nearest binder)
+keyGo : List String -> I.Expr -> String
+keyGo env e = case e of
+  EVar x -> "v" ++ showInt (posGo x env 0)
+  EGlobal g -> "g" ++ g ++ ";"
+  ELam xs b ->
+    "L" ++ showInt (length xs) ++ "(" ++ keyGo (appendS (reverse xs) env) b ++ ")"
+  EApp f as -> "A(" ++ keyGo env f ++ ":" ++ joinWith "," (map (\a -> keyGo env a) as) ++ ")"
+  ELet x a b -> "T(" ++ keyGo env a ++ ":" ++ keyGo (Cons x env) b ++ ")"
+  ERecord fs ->
+    "R("
+    ++ joinWith
+      ","
+      (map
+         (\p -> case p of
+          MkPair l v -> l ++ "=" ++ keyGo env v)
+         fs)
+    ++ ")"
+  EProj e2 l -> "P(" ++ keyGo env e2 ++ "." ++ l ++ ")"
+  ETag t as -> "C" ++ t ++ "(" ++ joinWith "," (map (\a -> keyGo env a) as) ++ ")"
+  EMatch s arms ->
+    "M("
+    ++ keyGo env s
+    ++ joinWith
+      ""
+      (map
+         (\a ->
+            "|"
+            ++ I.armTag a
+            ++ showInt (length (I.armVars a))
+            ++ ":"
+            ++ keyGo (appendS (reverse (I.armVars a)) env) (I.armBody a))
+         arms)
+    ++ ")"
+  EPrim p -> "p" ++ p ++ ";"
+  EPrimCall p as -> "Q" ++ p ++ "(" ++ joinWith "," (map (\a -> keyGo env a) as) ++ ")"
+  ECall g as -> "K" ++ g ++ "(" ++ joinWith "," (map (\a -> keyGo env a) as) ++ ")"
+  EInt i -> "i" ++ showInt i
+  EFloat x -> "f" ++ showFloat x
+  EStr s -> "s" ++ showInt (strLength s) ++ ":" ++ s
+  EAbandon -> "X"
+  EFix _ _ -> "F"
+
+-- | a closed value's key: alike for two copies of it
+key : I.Expr -> String
+key e = keyGo Nil e
+
+-- Calls of itself
+--------------------------------------------------------------------------------
+
+-- | each use of the global `g`: the arguments of a call of it, or
+-- | `Nothing` where it is not called (a value, handed on)
+usesOf : String -> I.Expr -> List (Maybe (List I.Expr))
+usesOf g e = case e of
+  EGlobal h -> if strEq h g then Cons Nothing Nil else Nil
+  EApp (EGlobal h) as ->
+    if strEq h g
+      then Cons (Just as) (concatMap (\a -> usesOf g a) as)
+    else concatMap (\a -> usesOf g a) as
+  EApp f as -> appendS (usesOf g f) (concatMap (\a -> usesOf g a) as)
+  ELam _ b -> usesOf g b
+  ELet _ a b -> appendS (usesOf g a) (usesOf g b)
+  ERecord fs -> concatMap (\p -> usesOf g (snd p)) fs
+  EProj e2 _ -> usesOf g e2
+  ETag _ as -> concatMap (\a -> usesOf g a) as
+  EMatch s arms ->
+    appendS (usesOf g s) (concatMap (\a -> usesOf g (I.armBody a)) arms)
+  EPrimCall _ as -> concatMap (\a -> usesOf g a) as
+  ECall h as ->
+    if strEq h g then Cons (Just as) (concatMap (\a -> usesOf g a) as)
+    else concatMap (\a -> usesOf g a) as
+  _ -> Nil
+
+nthS : {a : Type} -> Int -> List a -> Maybe a
+nthS i Nil = Nothing
+nthS i (Cons x xs) = if i == 0 then Just x else nthS (i - 1) xs
+
+isVarOf : String -> Maybe I.Expr -> Bool
+isVarOf x (Just (EVar y)) = strEq x y
+isVarOf x _ = False
+
+handsOn : String -> Int -> Maybe (List I.Expr) -> Bool
+handsOn x i (Just as) = isVarOf x (nthS i as)
+handsOn x i Nothing = False
+
+staticGo : List (Maybe (List I.Expr)) -> List String -> Int -> List Bool
+staticGo uses Nil i = Nil
+staticGo uses (Cons x xs) i =
+  Cons (allS (\u -> handsOn x i u) uses) (staticGo uses xs (i + 1))
+
+-- | for each parameter of `g` (`\xs -> b`), whether every call of itself
+-- | hands it on as it is: a copy for a known argument there is a copy
+-- | for every round
+statics : String -> List String -> I.Expr -> List Bool
+statics g xs b = staticGo (usesOf g b) xs 0
+
+-- | the arguments but those at the positions marked
+dropAt : List Bool -> List I.Expr -> List I.Expr
+dropAt Nil as = as
+dropAt (Cons d ds) Nil = Nil
+dropAt (Cons d ds) (Cons a as) =
+  if d then dropAt ds as else Cons a (dropAt ds as)
+
+-- | the calls of `g` as calls of `h`, the marked arguments left out
+selfTo : String -> String -> List Bool -> I.Expr -> I.Expr
+selfTo g h ds e = case e of
+  EApp (EGlobal k) as ->
+    if strEq k g then EApp (EGlobal h) (map (\a -> selfTo g h ds a) (dropAt ds as))
+    else EApp (EGlobal k) (map (\a -> selfTo g h ds a) as)
+  EApp f as -> EApp (selfTo g h ds f) (map (\a -> selfTo g h ds a) as)
+  ELam xs b -> ELam xs (selfTo g h ds b)
+  ELet x a b -> ELet x (selfTo g h ds a) (selfTo g h ds b)
+  ERecord fs ->
+    ERecord
+      (map
+         (\p -> case p of
+          MkPair l v -> MkPair l (selfTo g h ds v))
+         fs)
+  EProj e2 l -> EProj (selfTo g h ds e2) l
+  ETag t as -> ETag t (map (\a -> selfTo g h ds a) as)
+  EMatch s arms ->
+    EMatch
+      (selfTo g h ds s)
+      (map
+         (\a -> case a of
+          MkArm t vs b -> MkArm t vs (selfTo g h ds b))
+         arms)
+  EPrimCall p as -> EPrimCall p (map (\a -> selfTo g h ds a) as)
+  ECall k as -> ECall k (map (\a -> selfTo g h ds a) as)
+  _ -> e
+
+-- >>> statics "f" ["a", "n"] (EApp (EGlobal "f") [EVar "a", EPrimCall "intSub" [EVar "n", EInt 1]])
+-- [True, False]
+
+-- >>> strEq (key (ELam ["x"] (EVar "x"))) (key (ELam ["y"] (EVar "y")))
+-- True
+
+-- >>> closedIn Nil (ELam ["x"] (EVar "y"))
+-- False
