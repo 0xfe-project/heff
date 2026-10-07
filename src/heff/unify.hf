@@ -1,9 +1,13 @@
 -- Unification: conversion-with-solving -- the rules of src/heff/conversion.hf, plus pattern unification with
--- pruning.  `Unify` is the elaboration state with a conversion error for its
--- failure; this module's `bind` is `Unify`'s (the `Elab` layer is
--- src/heff/meta.hf).  The solver's judgments are one knot record, `uk`.
+-- pruning.  A unification is a computation (lib/co.hf) in any world `w`
+-- with two effects in it: the elaboration's core state (the
+-- metavariables, `ms`) and failing with a conversion error (`uf`) --
+-- nothing else of elaboration's.  src/heff/meta.hf runs it in `Elab`.
+-- The solver's judgments are one knot record, `uk`, for a world.
 
 import array as A
+import co
+import exn as X
 import heff.conversion as C
 import heff.dict as D
 import heff.environment as Env
@@ -15,45 +19,52 @@ import heff.syntax as Sx
 import heff.value as V
 import map as M
 import prelude
+import state as S
 
-type Unify a = Env.StCore -> Pair (Either C.EqErr a) Env.StCore
+uGets : {w : HFunctor}
+      -> {{ms : S.state Env.StCore <: w}}
+      -> {{uf : X.exn C.EqErr <: w}}
+      -> {a : Type}
+      -> (Env.StCore -> a)
+      -> Co w a
+uGets f = op (ms (Get f)) val
 
-bindStep : {a b : Type}
-         -> Pair (Either C.EqErr a) Env.StCore
-         -> (a -> Unify b)
-         -> Pair (Either C.EqErr b) Env.StCore
-bindStep (MkPair (Left e) st) f = MkPair (Left e) st
-bindStep (MkPair (Right x) st) f = f x st
+uModify : {w : HFunctor}
+        -> {{ms : S.state Env.StCore <: w}}
+        -> {{uf : X.exn C.EqErr <: w}}
+        -> (Env.StCore -> Env.StCore)
+        -> Co w Unit
+uModify f = bind (uGets f) (\c -> op (ms (Put c (MkUnit : Unit))) val)
 
-bind : {a b : Type} -> Unify a -> (a -> Unify b) -> Unify b
-bind m f = \st -> bindStep (m st) f
+throwU : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> {a : Type}
+       -> C.EqErr
+       -> Co w a
+throwU err = op (uf (Throw err)) val
 
-val : {a : Type} -> a -> Unify a
-val x = \st -> MkPair (Right x) st
+catchU : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> {a : Type}
+       -> Co w a
+       -> (C.EqErr -> Co w a)
+       -> Co w a
+catchU m h = op (uf (Catch m h)) val
 
-uGets : {a : Type} -> (Env.StCore -> a) -> Unify a
-uGets f = \c -> MkPair (Right (f c)) c
-
-uModify : (Env.StCore -> Env.StCore) -> Unify Unit
-uModify f = \c -> MkPair (Right MkUnit) (f c)
-
-throwU : {a : Type} -> C.EqErr -> Unify a
-throwU e = \st -> MkPair (Left e) st
-
-catchStep : {a : Type}
-          -> (C.EqErr -> Unify a)
-          -> Pair (Either C.EqErr a) Env.StCore
-          -> Pair (Either C.EqErr a) Env.StCore
-catchStep h (MkPair (Left e) st) = h e st
-catchStep h (MkPair (Right x) st) = MkPair (Right x) st
-
-catchU : {a : Type} -> Unify a -> (C.EqErr -> Unify a) -> Unify a
-catchU m h = \st -> catchStep h (m st)
-
-forceU : V.V -> Unify V.V
+forceU : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> V.V
+       -> Co w V.V
 forceU v = uGets (\c -> V.forceEl c.metas v)
 
-forceTU : V.Ty -> Unify V.Ty
+forceTU : {w : HFunctor}
+        -> {{ms : S.state Env.StCore <: w}}
+        -> {{uf : X.exn C.EqErr <: w}}
+        -> V.Ty
+        -> Co w V.Ty
 forceTU t = uGets (\c -> V.forceTy c.metas t)
 
 -- Flexible heads
@@ -160,19 +171,37 @@ concatMapL : {a b : Type} -> (a -> List b) -> List a -> List b
 concatMapL f Nil = Nil
 concatMapL f (Cons x xs) = appendL (f x) (concatMapL f xs)
 
-traverseU : {a b : Type} -> (a -> Unify b) -> List a -> Unify (List b)
+traverseU : {w : HFunctor}
+          -> {{ms : S.state Env.StCore <: w}}
+          -> {{uf : X.exn C.EqErr <: w}}
+          -> {a b : Type}
+          -> (a -> Co w b)
+          -> List a
+          -> Co w (List b)
 traverseU f Nil = val Nil
 traverseU f (Cons x xs) =
   bind (f x) (\y -> bind (traverseU f xs) (\ys -> val (Cons y ys)))
 
-forU : {a : Type} -> List a -> (a -> Unify Unit) -> Unify Unit
+forU : {w : HFunctor}
+     -> {{ms : S.state Env.StCore <: w}}
+     -> {{uf : X.exn C.EqErr <: w}}
+     -> {a : Type}
+     -> List a
+     -> (a -> Co w Unit)
+     -> Co w Unit
 forU Nil f = val MkUnit
 forU (Cons x xs) f = bind (f x) (\u -> forU xs f)
 
 -- Postponing, poisoning
 --------------------------------------------------------------------------------
 
-postponeU : P.CtxShape -> V.V -> V.V -> Unify Unit
+postponeU : {w : HFunctor}
+          -> {{ms : S.state Env.StCore <: w}}
+          -> {{uf : X.exn C.EqErr <: w}}
+          -> P.CtxShape
+          -> V.V
+          -> V.V
+          -> Co w Unit
 postponeU cs l r =
   uModify
     (\c ->
@@ -238,7 +267,11 @@ metasK mc =
 metasTy : V.MetaCtx -> Int -> Int -> V.Ty -> List Int
 metasTy mc depth len t = (metasK mc).mty depth len t
 
-poisonMany : List Int -> Unify Unit
+poisonMany : {w : HFunctor}
+           -> {{ms : S.state Env.StCore <: w}}
+           -> {{uf : X.exn C.EqErr <: w}}
+           -> List Int
+           -> Co w Unit
 poisonMany ms =
   uModify
     (\c ->
@@ -246,11 +279,21 @@ poisonMany ms =
          (foldl (\ps m -> M.insert compareInt m MkUnit ps) c.poisoned ms)
          c)
 
-poisonTy : Int -> V.Ty -> Unify Unit
+poisonTy : {w : HFunctor}
+         -> {{ms : S.state Env.StCore <: w}}
+         -> {{uf : X.exn C.EqErr <: w}}
+         -> Int
+         -> V.Ty
+         -> Co w Unit
 poisonTy len t =
   bind (uGets (\c -> c.metas)) (\mc -> poisonMany ((metasK mc).mty 20 len t))
 
-poisonEl : Int -> V.V -> Unify Unit
+poisonEl : {w : HFunctor}
+         -> {{ms : S.state Env.StCore <: w}}
+         -> {{uf : X.exn C.EqErr <: w}}
+         -> Int
+         -> V.V
+         -> Co w Unit
 poisonEl len v =
   bind (uGets (\c -> c.metas)) (\mc -> poisonMany ((metasK mc).mel 20 len v))
 
@@ -408,10 +451,18 @@ canonU v = case v of
   VNeu (HMeta m) sp ty expansion desc -> v
   _ -> C.canon v
 
-scopeError : {a : Type} -> Unify a
+scopeError : {w : HFunctor}
+           -> {{ms : S.state Env.StCore <: w}}
+           -> {{uf : X.exn C.EqErr <: w}}
+           -> {a : Type}
+           -> Co w a
 scopeError = throwU (UnequalEls P.emptyShape VOpaque VOpaque)
 
-occursError : {a : Type} -> Unify a
+occursError : {w : HFunctor}
+            -> {{ms : S.state Env.StCore <: w}}
+            -> {{uf : X.exn C.EqErr <: w}}
+            -> {a : Type}
+            -> Co w a
 occursError = throwU (UnequalEls P.emptyShape VOpaque VOpaque)
 
 -- | a partial renaming: the levels of `dom` that may appear, and what
@@ -428,7 +479,12 @@ lift1 r =
 iterateLift : Int -> PRen -> PRen
 iterateLift i rr = if i <= 0 then rr else iterateLift (i - 1) (lift1 rr)
 
-renameHead : PRen -> V.Head -> Unify Sx.Tm
+renameHead : {w : HFunctor}
+           -> {{ms : S.state Env.StCore <: w}}
+           -> {{uf : X.exn C.EqErr <: w}}
+           -> PRen
+           -> V.Head
+           -> Co w Sx.Tm
 renameHead r (HLocal l) = case M.lookup compareInt l r.ren of
   Just l' -> val (SLocal (r.cod - l' - 1))
   Nothing -> scopeError
@@ -456,7 +512,11 @@ withTm t k = k t
 withVal : {a : Type} -> V.V -> (V.V -> a) -> a
 withVal v k = k v
 
-metaEntry : Int -> Unify V.MetaEntry
+metaEntry : {w : HFunctor}
+          -> {{ms : S.state Env.StCore <: w}}
+          -> {{uf : X.exn C.EqErr <: w}}
+          -> Int
+          -> Co w V.MetaEntry
 metaEntry m =
   bind (uGets (\c -> c.metas)) (\mc -> case M.lookup compareInt m mc of
   Just e -> val e
@@ -473,7 +533,13 @@ solvedEntry sol stx e =
   }
 
 -- | store a solution for `m`
-storeSol : Int -> V.V -> Sx.Tm -> Unify Unit
+storeSol : {w : HFunctor}
+         -> {{ms : S.state Env.StCore <: w}}
+         -> {{uf : X.exn C.EqErr <: w}}
+         -> Int
+         -> V.V
+         -> Sx.Tm
+         -> Co w Unit
 storeSol m sol stx =
   uModify (\c -> case M.lookup compareInt m c.metas of
   Just e ->
@@ -485,7 +551,12 @@ storeSol m sol stx =
 
 -- | a solution in the trace, at the metavariable's span: its body, over
 -- | one binder per local
-traceSolve : Int -> Sx.Tm -> Unify Unit
+traceSolve : {w : HFunctor}
+           -> {{ms : S.state Env.StCore <: w}}
+           -> {{uf : X.exn C.EqErr <: w}}
+           -> Int
+           -> Sx.Tm
+           -> Co w Unit
 traceSolve m stx =
   uModify (\c -> case M.lookup compareInt m c.metas of
   Just e ->
@@ -502,32 +573,36 @@ traceSolve m stx =
       c
   Nothing -> c)
 
-newMetaStep : V.MetaEntry
-            -> Int
-            -> V.Ty
-            -> Env.StCore
-            -> Pair (Either C.EqErr Int) Env.StCore
-newMetaStep entry arity ty c =
-  MkPair
-    (Right c.nextMeta)
-    (Env.setMetas
-       (M.insert
-          compareInt
-          c.nextMeta
-          { ty = ty
-          , sol = Nothing
-          , solStx = Nothing
-          , arity = arity
-          , name = entry.name
-          , span = entry.span
-          }
-          c.metas)
-       (c.nextMeta + 1)
-       c)
+-- | the state with a new metavariable, numbered next
+newMetaIn : V.MetaEntry -> Int -> V.Ty -> Env.StCore -> Env.StCore
+newMetaIn entry arity ty c =
+  Env.setMetas
+    (M.insert
+       compareInt
+       c.nextMeta
+       { ty = ty
+       , sol = Nothing
+       , solStx = Nothing
+       , arity = arity
+       , name = entry.name
+       , span = entry.span
+       }
+       c.metas)
+    (c.nextMeta + 1)
+    c
 
 -- | a fresh metavariable from an old entry's name and span
-newMetaFrom : V.MetaEntry -> Int -> V.Ty -> Unify Int
-newMetaFrom entry arity ty = \st0 -> newMetaStep entry arity ty st0
+newMetaFrom : {w : HFunctor}
+            -> {{ms : S.state Env.StCore <: w}}
+            -> {{uf : X.exn C.EqErr <: w}}
+            -> V.MetaEntry
+            -> Int
+            -> V.Ty
+            -> Co w Int
+newMetaFrom entry arity ty = do
+  n <- uGets (\c -> c.nextMeta)
+  uModify (newMetaIn entry arity ty)
+  val n
 
 -- | the positions where two equal-length patterns agree
 agreeing : List PatArg -> List PatArg -> List Int
@@ -557,9 +632,9 @@ renOf cs args =
 -- The judgments and renamings, knotted
 --------------------------------------------------------------------------------
 
-type UK =
-  { uty : G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Unify Unit
-  , uel : G.Globals -> P.CtxShape -> V.V -> V.V -> Unify Unit
+type UK (w : HFunctor) =
+  { uty : G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Co w Unit
+  , uel : G.Globals -> P.CtxShape -> V.V -> V.V -> Co w Unit
   , ubare :
         G.Globals
         -> P.CtxShape
@@ -567,33 +642,30 @@ type UK =
         -> V.Spine V.V
         -> V.Head
         -> V.Spine V.V
-        -> Unify Unit
+        -> Co w Unit
   , solve :
-        G.Globals
-        -> P.CtxShape
-        -> Int
-        -> V.Spine V.V
-        -> V.V
-        -> V.V
-        -> Unify Unit
-  , ren : G.Globals -> Int -> PRen -> V.V -> Unify Sx.Tm
-  , renEv : G.Globals -> Int -> PRen -> V.Ev V.V -> Unify Sx.Tm
-  , renTy : G.Globals -> Int -> PRen -> V.Ty -> Unify Sx.Ty
-  , renEvTy : G.Globals -> Int -> PRen -> V.Ev V.Ty -> Unify Sx.Ty
-  , renFlex : G.Globals -> Int -> PRen -> Int -> V.Spine V.V -> Unify Sx.Tm
+        G.Globals -> P.CtxShape -> Int -> V.Spine V.V -> V.V -> V.V -> Co w Unit
+  , ren : G.Globals -> Int -> PRen -> V.V -> Co w Sx.Tm
+  , renEv : G.Globals -> Int -> PRen -> V.Ev V.V -> Co w Sx.Tm
+  , renTy : G.Globals -> Int -> PRen -> V.Ty -> Co w Sx.Ty
+  , renEvTy : G.Globals -> Int -> PRen -> V.Ev V.Ty -> Co w Sx.Ty
+  , renFlex : G.Globals -> Int -> PRen -> Int -> V.Spine V.V -> Co w Sx.Tm
   }
 
 -- | `?storeM := λx₁…xₙ. ?new x_kept`, from an old entry's name and
 -- | span; the type must be closed (renamed into the empty context, with
 -- | the occurs check against `occursM`)
-solveWithPruned : UK
+solveWithPruned : {w : HFunctor}
+                -> {{ms : S.state Env.StCore <: w}}
+                -> {{uf : X.exn C.EqErr <: w}}
+                -> (UK w)
                 -> G.Globals
                 -> Int
                 -> Int
                 -> V.MetaEntry
                 -> Int
                 -> List Int
-                -> Unify V.V
+                -> Co w V.V
 solveWithPruned r g occursM storeM entry n kept =
   bind
     (r.renTy g occursM { dom = entry.arity, cod = 0, ren = M.empty } entry.ty)
@@ -616,13 +688,16 @@ solveWithPruned r g occursM storeM entry n kept =
 
 -- | rename the right-hand side; one mentioning an error hole is no
 -- | solution (the metavariable is left as it is)
-solveRhs : UK
+solveRhs : {w : HFunctor}
+         -> {{ms : S.state Env.StCore <: w}}
+         -> {{uf : X.exn C.EqErr <: w}}
+         -> (UK w)
          -> G.Globals
          -> P.CtxShape
          -> Int
          -> List PatArg
          -> V.V
-         -> Unify Unit
+         -> Co w Unit
 solveRhs r g cs m args rhs =
   bind
     (catchU
@@ -650,14 +725,17 @@ solveRhs r g cs m args rhs =
                           (\u2 -> traceSolve m stx))))))
 
 -- | `?m sp := rhs`; `self` is the flexible side, kept for postponing
-solveF : UK
+solveF : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> (UK w)
        -> G.Globals
        -> P.CtxShape
        -> Int
        -> V.Spine V.V
        -> V.V
        -> V.V
-       -> Unify Unit
+       -> Co w Unit
 solveF r g cs m sp rhs self =
   bind
     (uGets (\c -> c.metas))
@@ -692,7 +770,15 @@ solveF r g cs m sp rhs self =
            else solveRhs r g cs m args rhs
          Nothing -> solveRhs r g cs m args rhs))
 
-uTyRigid : UK -> G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Unify Unit
+uTyRigid : {w : HFunctor}
+         -> {{ms : S.state Env.StCore <: w}}
+         -> {{uf : X.exn C.EqErr <: w}}
+         -> (UK w)
+         -> G.Globals
+         -> P.CtxShape
+         -> V.Ty
+         -> V.Ty
+         -> Co w Unit
 uTyRigid r g cs a b = case a of
   VU u -> case b of
     VU u' ->
@@ -731,7 +817,15 @@ uTyRigid r g cs a b = case a of
     _ -> throwU (UnequalTys cs a b)
   _ -> throwU (UnequalTys cs a b)
 
-uTypeF : UK -> G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Unify Unit
+uTypeF : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> (UK w)
+       -> G.Globals
+       -> P.CtxShape
+       -> V.Ty
+       -> V.Ty
+       -> Co w Unit
 uTypeF r g cs a0 b0 =
   bind
     (forceTU a0)
@@ -749,14 +843,17 @@ uTypeF r g cs a0 b0 =
                 Just (MkPair m sp) -> r.solve g cs m sp (V.code a) (V.code b)
                 Nothing -> uTyRigid r g cs a b))
 
-uBareF : UK
+uBareF : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> (UK w)
        -> G.Globals
        -> P.CtxShape
        -> V.Head
        -> V.Spine V.V
        -> V.Head
        -> V.Spine V.V
-       -> Unify Unit
+       -> Co w Unit
 uBareF r g cs h sp h' sp' =
   if V.headIsError h || V.headIsError h' then val MkUnit
   else case sp of
@@ -788,14 +885,17 @@ uBareF r g cs h sp h' sp' =
                (\u2 -> r.uel g cs v v'))
       _ -> throwU (UnequalNeus cs h sp h' sp')
 
-uElRigid : UK
+uElRigid : {w : HFunctor}
+         -> {{ms : S.state Env.StCore <: w}}
+         -> {{uf : X.exn C.EqErr <: w}}
+         -> (UK w)
          -> G.Globals
          -> P.CtxShape
          -> V.V
          -> V.V
          -> V.V
          -> V.V
-         -> Unify Unit
+         -> Co w Unit
 uElRigid r g cs ca cb a b = case ca of
   VNeu h sp ty expansion desc -> case cb of
     VNeu h' sp' ty' expansion' desc' -> r.ubare g cs h sp h' sp'
@@ -821,7 +921,15 @@ uElRigid r g cs ca cb a b = case ca of
     _ -> throwU (UnequalEls cs a b)
   VOpaque -> val MkUnit
 
-uTermF : UK -> G.Globals -> P.CtxShape -> V.V -> V.V -> Unify Unit
+uTermF : {w : HFunctor}
+       -> {{ms : S.state Env.StCore <: w}}
+       -> {{uf : X.exn C.EqErr <: w}}
+       -> (UK w)
+       -> G.Globals
+       -> P.CtxShape
+       -> V.V
+       -> V.V
+       -> Co w Unit
 uTermF r g cs a0 b0 =
   bind
     (forceU a0)
@@ -841,13 +949,16 @@ uTermF r g cs a0 b0 =
                     Just (MkPair m sp) -> r.solve g cs m sp a b
                     Nothing -> uElRigid r g cs (canonU a) (canonU b) a b))
 
-renameSpine : UK
+renameSpine : {w : HFunctor}
+            -> {{ms : S.state Env.StCore <: w}}
+            -> {{uf : X.exn C.EqErr <: w}}
+            -> (UK w)
             -> G.Globals
             -> Int
             -> PRen
             -> V.Spine V.V
             -> Sx.Tm
-            -> Unify Sx.Tm
+            -> Co w Sx.Tm
 renameSpine r g m pr SpId h = val h
 renameSpine r g m pr (SpApp s a) h =
   bind
@@ -860,13 +971,16 @@ renameSpine r g m pr (SpSpec s l a) h =
     (renameSpine r g m pr s h)
     (\f -> bind (r.ren g m pr a) (\x -> val (SSpecialize f l x)))
 
-renameClo : UK
+renameClo : {w : HFunctor}
+          -> {{ms : S.state Env.StCore <: w}}
+          -> {{uf : X.exn C.EqErr <: w}}
+          -> (UK w)
           -> G.Globals
           -> Int
           -> PRen
           -> V.Ty
           -> V.Clo V.V V.V
-          -> Unify (Sx.Abs Sx.Tm)
+          -> Co w (Sx.Abs Sx.Tm)
 renameClo r g m pr dom (MkClo x l f) =
   bind
     (r.renEv g m (lift1 pr) (f (V.snocL l (V.local pr.dom dom))))
@@ -874,13 +988,16 @@ renameClo r g m pr dom (MkClo x l f) =
 renameClo r g m pr dom (CloConst t) =
   bind (r.renEv g m pr t) (\b -> val (AbsConst b))
 
-renameCloTy : UK
+renameCloTy : {w : HFunctor}
+            -> {{ms : S.state Env.StCore <: w}}
+            -> {{uf : X.exn C.EqErr <: w}}
+            -> (UK w)
             -> G.Globals
             -> Int
             -> PRen
             -> V.Ty
             -> V.Clo V.V V.Ty
-            -> Unify (Sx.Abs Sx.Ty)
+            -> Co w (Sx.Abs Sx.Ty)
 renameCloTy r g m pr dom (MkClo x l f) =
   bind
     (r.renEvTy g m (lift1 pr) (f (V.snocL l (V.local pr.dom dom))))
@@ -888,18 +1005,42 @@ renameCloTy r g m pr dom (MkClo x l f) =
 renameCloTy r g m pr dom (CloConst t) =
   bind (r.renEvTy g m pr t) (\b -> val (AbsConst b))
 
-renameEvF : UK -> G.Globals -> Int -> PRen -> V.Ev V.V -> Unify Sx.Tm
+renameEvF : {w : HFunctor}
+          -> {{ms : S.state Env.StCore <: w}}
+          -> {{uf : X.exn C.EqErr <: w}}
+          -> (UK w)
+          -> G.Globals
+          -> Int
+          -> PRen
+          -> V.Ev V.V
+          -> Co w Sx.Tm
 renameEvF r g m pr (Nom v) = r.ren g m pr v
 renameEvF r g m pr (Describe v) = r.ren g m pr v
 renameEvF r g m pr (Become v) = bind (r.ren g m pr v) (\t -> val (SIs t))
 
-renameEvTypeF : UK -> G.Globals -> Int -> PRen -> V.Ev V.Ty -> Unify Sx.Ty
+renameEvTypeF : {w : HFunctor}
+              -> {{ms : S.state Env.StCore <: w}}
+              -> {{uf : X.exn C.EqErr <: w}}
+              -> (UK w)
+              -> G.Globals
+              -> Int
+              -> PRen
+              -> V.Ev V.Ty
+              -> Co w Sx.Ty
 renameEvTypeF r g m pr (Nom a) = r.renTy g m pr a
 renameEvTypeF r g m pr (Describe a) = r.renTy g m pr a
 renameEvTypeF r g m pr (Become a) =
   bind (r.renTy g m pr a) (\t -> val (SIsTy t))
 
-renameF : UK -> G.Globals -> Int -> PRen -> V.V -> Unify Sx.Tm
+renameF : {w : HFunctor}
+        -> {{ms : S.state Env.StCore <: w}}
+        -> {{uf : X.exn C.EqErr <: w}}
+        -> (UK w)
+        -> G.Globals
+        -> Int
+        -> PRen
+        -> V.V
+        -> Co w Sx.Tm
 renameF r g m pr v0 =
   bind (forceU v0) (\v -> case v of
   VNeu (HMeta m') sp ty expansion desc ->
@@ -923,14 +1064,17 @@ renameF r g m pr v0 =
       (\ps -> val (SCons (D.fromList ps)))
   VOpaque -> val SOpaque)
 
-renameRecordFields : UK
+renameRecordFields : {w : HFunctor}
+                   -> {{ms : S.state Env.StCore <: w}}
+                   -> {{uf : X.exn C.EqErr <: w}}
+                   -> (UK w)
                    -> G.Globals
                    -> Int
                    -> PRen
                    -> Int
                    -> V.Locals V.V
                    -> List (V.Locals V.V -> V.Field)
-                   -> Unify (List Sx.Ty)
+                   -> Co w (List Sx.Ty)
 renameRecordFields r g m pr i ls Nil = val Nil
 renameRecordFields r g m pr i ls (Cons fc rest) = case fc ls of
   MkField ty value ->
@@ -948,7 +1092,15 @@ renameRecordFields r g m pr i ls (Cons fc rest) = case fc ls of
               rest)
            (\xs -> val (Cons x xs)))
 
-renameTypeF : UK -> G.Globals -> Int -> PRen -> V.Ty -> Unify Sx.Ty
+renameTypeF : {w : HFunctor}
+            -> {{ms : S.state Env.StCore <: w}}
+            -> {{uf : X.exn C.EqErr <: w}}
+            -> (UK w)
+            -> G.Globals
+            -> Int
+            -> PRen
+            -> V.Ty
+            -> Co w Sx.Ty
 renameTypeF r g m pr t0 =
   bind (forceTU t0) (\t -> case t of
   VU u -> val (SU u)
@@ -994,13 +1146,16 @@ renameTypeF r g m pr t0 =
 
 -- | Another metavariable in the solution.  If some of its arguments are
 -- | out of scope, it is pruned: replaced by a fresh one without them.
-renameFlexF : UK
+renameFlexF : {w : HFunctor}
+            -> {{ms : S.state Env.StCore <: w}}
+            -> {{uf : X.exn C.EqErr <: w}}
+            -> (UK w)
             -> G.Globals
             -> Int
             -> PRen
             -> Int
             -> V.Spine V.V
-            -> Unify Sx.Tm
+            -> Co w Sx.Tm
 renameFlexF r g m pr m' sp =
   bind
     (uGets (\c -> c.metas))
@@ -1042,7 +1197,10 @@ renameFlexF r g m pr m' sp =
                           args)
                        (\idxs -> val (SMetaApp m' (A.fromList idxs) ty))))))
 
-uk : UK
+uk : {w : HFunctor}
+   -> {{ms : S.state Env.StCore <: w}}
+   -> {{uf : X.exn C.EqErr <: w}}
+   -> (UK w)
 uk =
   { uty = \g cs a b -> uTypeF uk g cs a b
   , uel = \g cs a b -> uTermF uk g cs a b
@@ -1055,17 +1213,89 @@ uk =
   , renFlex = \g m pr m' sp -> renameFlexF uk g m pr m' sp
   }
 
-uTy : G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Unify Unit
-uTy g cs a b = uk.uty g cs a b
+uTy : {w : HFunctor}
+    -> {{ms : S.state Env.StCore <: w}}
+    -> {{uf : X.exn C.EqErr <: w}}
+    -> G.Globals
+    -> P.CtxShape
+    -> V.Ty
+    -> V.Ty
+    -> Co w Unit
+uTy g cs a b = (uk : UK w).uty g cs a b
 
-uEl : G.Globals -> P.CtxShape -> V.V -> V.V -> Unify Unit
-uEl g cs a b = uk.uel g cs a b
+uEl : {w : HFunctor}
+    -> {{ms : S.state Env.StCore <: w}}
+    -> {{uf : X.exn C.EqErr <: w}}
+    -> G.Globals
+    -> P.CtxShape
+    -> V.V
+    -> V.V
+    -> Co w Unit
+uEl g cs a b = (uk : UK w).uel g cs a b
+
+-- A unification by itself
+--------------------------------------------------------------------------------
+
+-- | the world a unification is run in by itself: the core state, and
+-- | failing with a conversion error
+uW : HFunctor
+uW = S.state Env.StCore <+> X.exn C.EqErr
+
+msEv : S.state Env.StCore <: uW
+msEv p = InL p
+
+ufEv : X.exn C.EqErr <: uW
+ufEv p = InR p
+
+-- | its handler's monad: from a state, an answer or a conversion error,
+-- | and the state after
+type UStep a = Env.StCore -> Pair (Either C.EqErr a) Env.StCore
+
+bindStep : {a b : Type}
+         -> Pair (Either C.EqErr a) Env.StCore
+         -> (a -> UStep b)
+         -> Pair (Either C.EqErr b) Env.StCore
+bindStep (MkPair (Left e) st) f = MkPair (Left e) st
+bindStep (MkPair (Right x) st) f = f x st
+
+catchStep : {a : Type}
+          -> (C.EqErr -> UStep a)
+          -> Pair (Either C.EqErr a) Env.StCore
+          -> Pair (Either C.EqErr a) Env.StCore
+catchStep h (MkPair (Left e) st) = h e st
+catchStep h (MkPair (Right x) st) = MkPair (Right x) st
+
+uStateAlg : {a : Type} -> S.StateF Env.StCore UStep a -> UStep a
+uStateAlg (Get k) = \c -> MkPair (Right (k c)) c
+uStateAlg (Put c2 x) = \c -> MkPair (Right x) c2
+
+uExnAlg : {a : Type} -> X.ExnF C.EqErr UStep a -> UStep a
+uExnAlg (Throw err) = \c -> MkPair (Left err) c
+uExnAlg (Catch m h) = \c -> catchStep h (m c)
+
+uAlg : {a : Type}
+     -> SumF (S.StateF Env.StCore) (X.ExnF C.EqErr) UStep a
+     -> UStep a
+uAlg (InL t) = uStateAlg t
+uAlg (InR q) = uExnAlg q
+
+uH : Handler uW
+uH =
+  { M = UStep
+  , ret = \x c -> MkPair (Right x) c
+  , bind = \m k c -> bindStep (m c) k
+  , malg = \p -> uAlg p
+  }
+
+-- | a unification, from a state
+runU : {a : Type} -> Co uW a -> UStep a
+runU u = handle uH u
 
 resOf : Pair (Either C.EqErr Unit) Env.StCore -> Either C.EqErr Unit
 resOf (MkPair e st) = e
 
--- >>> C.holds (resOf (uTy G.emptyGlobals P.emptyShape VPrimInt VPrimInt Env.emptyCore))
+-- >>> C.holds (resOf (runU (uTy (ms := msEv) (uf := ufEv) G.emptyGlobals P.emptyShape VPrimInt VPrimInt) Env.emptyCore))
 -- True
 
--- >>> C.holds (resOf (uTy G.emptyGlobals P.emptyShape VPrimInt VPrimString Env.emptyCore))
+-- >>> C.holds (resOf (runU (uTy (ms := msEv) (uf := ufEv) G.emptyGlobals P.emptyShape VPrimInt VPrimString) Env.emptyCore))
 -- False
