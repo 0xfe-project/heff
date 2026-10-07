@@ -45,8 +45,9 @@ release has it built (`heff-X.Y.Z.vsix`).
 ```sh
 heff check FILE                # the file's interface, and its errors
 heff run FILE [ARGS...]        # run the file's `main` (on Node.js)
-heff test [--seed N] FILE...   # check the watches' expectations (`-- >>> e`),
-                               # and run the tests (lib/check.hf)
+heff test [--seed N] [FILE...] # check the watches' expectations (`-- >>> e`),
+                               # and run the tests (lib/check.hf); no FILE:
+                               # every .hf file of the project here
 heff promote FILE              # write each watch's value as its expectation
 heff fmt [--check] FILE...     # format in place
 heff compile FILE OUT --backend=MODE [--name NAME]
