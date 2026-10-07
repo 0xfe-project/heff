@@ -35,6 +35,8 @@ data MatchPat
   | PTag String (List MatchPat) Pm.Span
   | PLit Notation.Pat
   | PRec (List (Pair String MatchPat)) Pm.Span
+  -- | `x@p`
+  | PAs String MatchPat
 
 type Clause = { pats : List MatchPat, rhs : Notation.Checkable }
 
@@ -138,6 +140,9 @@ pat p = case Pm.nodeOf p of
   PatRecord fs -> do
     fps <- traverseC (\f -> fieldPat (\m -> pat m) f) fs
     pure (PRec fps (Pm.spanOf p))
+  PatAs x _ q -> do
+    q' <- pat q
+    pure (PAs x q')
   _ -> badPat p
 
 -- | the equality a literal is matched by
@@ -168,6 +173,7 @@ equation (At (MkEquation _ _ ps rhs) _) = do
 
 varOf : MatchPat -> Maybe String
 varOf (PVar x) = Just x
+varOf (PAs x _) = Just x
 varOf _ = Nothing
 
 patVars : MatchPat -> List String
@@ -175,6 +181,7 @@ patVars (PVar x) = Cons x Nil
 patVars (PTag _ ps _) = concatMapC (\p -> patVars p) ps
 patVars (PLit _) = Nil
 patVars (PRec fps _) = concatMapC (\fp -> patVars (snd fp)) fps
+patVars (PAs x p) = Cons x (patVars p)
 
 -- Names written
 --------------------------------------------------------------------------------
@@ -186,6 +193,7 @@ patIdents p = case Pm.nodeOf p of
   PatVar x -> Cons x Nil
   PatTag _ _ ps -> concatMapC (\m -> patIdents m) ps
   PatOp x _ ps -> Cons x (concatMapC (\m -> patIdents m) ps)
+  PatAs x _ q -> Cons x (patIdents q)
   PatRecord fs ->
     concatMapC
       (\f -> case f of
@@ -323,6 +331,7 @@ patBinds p = case Pm.nodeOf p of
   PatVar x -> Cons x Nil
   PatTag _ _ ps -> concatMapC (\m -> patBinds m) ps
   PatOp _ _ ps -> concatMapC (\m -> patBinds m) ps
+  PatAs x _ q -> Cons x (patBinds q)
   PatRecord fs ->
     concatMapC
       (\f -> case f of
@@ -635,6 +644,8 @@ armSpecializeV c t ys v r = case patAt c r of
     Just
       (mkClause (spliceAt c (map (\(y : String) -> PVar "_") ys) r.pats) r.rhs)
   PRec _ _ -> Nothing
+  -- (none: `compile` takes each `x@p` apart first)
+  PAs _ _ -> Nothing
 
 armOf : CK
       -> List String
@@ -678,6 +689,7 @@ litYesOne c l v r acc = case patAt c r of
   PVar x -> Cons (mkClause (dropAt c r.pats) (bindVar v (PVar x) r.rhs)) acc
   PTag _ _ _ -> acc
   PRec _ _ -> acc
+  PAs _ _ -> acc
 
 litYes : Int -> Notation.Pat -> String -> List Clause -> List Clause
 litYes c l v Nil = Nil
@@ -943,15 +955,34 @@ compileAt r used bound sp vars rows c p = do
   dflt <- defaultArm r used bound sp vars rows c
   pure (At (CMatch (At (IVar (varAt vars c)) sp) (appendC arms dflt)) sp)
 
--- | the match tree for `rows` over the variables `vars`, column by column
-compileF : CK
-         -> List String
-         -> List String
-         -> Pm.Span
-         -> List String
-         -> List Clause
-         -> Either Err Notation.Checkable
-compileF r used bound sp vars rows = case rows of
+-- | `x@p` matched against the variable `v`: `p`, and `x` means `v`
+peelAs : String
+       -> MatchPat
+       -> Notation.Checkable
+       -> Pair MatchPat Notation.Checkable
+peelAs v (PAs x p) e = peelAs v p (bindVar v (PVar x) e)
+peelAs v p e = MkPair p e
+
+consPat : MatchPat -> Clause -> Clause
+consPat p r = mkClause (Cons p r.pats) r.rhs
+
+-- | a row, no column of it `x@p`
+peelCols : List String -> List MatchPat -> Notation.Checkable -> Clause
+peelCols (Cons v vs) (Cons p ps) e = case peelAs v p e of
+  MkPair p' e' -> consPat p' (peelCols vs ps e')
+peelCols _ ps e = mkClause ps e
+
+peelRow : List String -> Clause -> Clause
+peelRow vars r = peelCols vars r.pats r.rhs
+
+compilePeeled : CK
+              -> List String
+              -> List String
+              -> Pm.Span
+              -> List String
+              -> List Clause
+              -> Either Err Notation.Checkable
+compilePeeled r used bound sp vars rows = case rows of
   -- unreachable: a missing tag is the match's error
   Nil -> Right (At CAbandon sp)
   Cons row rest -> case findTagLit (clausePats row) 0 of
@@ -963,6 +994,17 @@ compileF r used bound sp vars rows = case rows of
            (clauseRhs row)
            (zipC vars (clausePats row)))
     Just c -> compileAt r used bound sp vars rows c (patAt c row)
+
+-- | the match tree for `rows` over the variables `vars`, column by column
+compileF : CK
+         -> List String
+         -> List String
+         -> Pm.Span
+         -> List String
+         -> List Clause
+         -> Either Err Notation.Checkable
+compileF r used bound sp vars rows =
+  compilePeeled r used bound sp vars (map (\row -> peelRow vars row) rows)
 
 ck : CK
 ck =
