@@ -21,6 +21,9 @@ setSeed(seedArg);
 const work = join(root, "ref", `compile-check-c-${seedArg}`);
 // (the C compiler: zig's, else the system's)
 const cc = spawnSync("zig", ["version"]).status === 0 ? ["zig", "cc"] : ["cc"];
+// (HEFF_SANITIZE=1: built with AddressSanitizer and UBSan, so that a
+// reference count wrong shows, a use after free, where it is)
+const flags = process.env.HEFF_SANITIZE ? ["-O0", "-g", "-fsanitize=address,undefined"] : ["-O1"];
 rmSync(work, { recursive: true, force: true });
 mkdirSync(work, { recursive: true });
 
@@ -41,7 +44,7 @@ for (const c of cases) {
   const file = join(work, `${c.name}.hf`), out = join(work, `${c.name}.c`), bin = join(work, c.name);
   writeFileSync(file, c.src);
   const r0 = heff(["compile", file, out, "--backend=c"]);
-  const b = r0.status === 0 ? spawnSync(cc[0], [...cc.slice(1), "-O1", "-w", out, "-o", bin, "-lm", "-lpthread"], { encoding: "utf8" }) : r0;
+  const b = r0.status === 0 ? spawnSync(cc[0], [...cc.slice(1), ...flags, "-w", out, "-o", bin, "-lm", "-lpthread"], { encoding: "utf8" }) : r0;
   const r = { status: b.status, stderr: (r0.stderr || "") + (b.stderr || ""), error: b.error };
   const ev = heff(["dump-eval", file]);
   if (r.status !== 0 || ev.status !== 0) { compileErrors++; console.log(`NOT COMPILED ${c.name}:\n${r.stderr}${ev.stderr}${r.error || ""}${ev.error || ""}`); continue; }
