@@ -73,10 +73,10 @@ const coldly = (f) => {
   }
 };
 
-const check = ["node", heff, "check", "src/heff/main.hf"];
+const check = ["node", heff, "check", "cmd/heff/main.hf"];
 if (wanted("check")) coldly((clear) => best("check (cold)", () => { clear(); return timed(check); }));
 
 // the compiler compiling itself: with the cache as it is, then with none
-const self = ["node", heff, "compile", "src/heff/main.hf", join(work, "self.mjs"), "--name", "main", "--backend=node"];
+const self = ["node", heff, "compile", "cmd/heff/main.hf", join(work, "self.mjs"), "--name", "main", "--backend=node"];
 if (wanted("self")) best("self (warm)", () => timed(self));
 if (wanted("self-cold")) coldly((clear) => best("self (cold)", () => { clear(); return timed(self); }));

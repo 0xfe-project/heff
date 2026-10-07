@@ -30,10 +30,13 @@ npm install       # also builds heff
 npm link          # puts `heff` on the PATH
 ```
 
-heff is written in heff (`src/heff/`).  `boot/heff.mjs` is a compiled
-copy of the compiler; the build (`npm run build`) uses it to compile the
-compiler into `output/heff.mjs`, which is `heff` (minified; the
-compiler's own output is `output/heff.raw.mjs`).
+heff is written in heff.  The package's modules (`src/heff/`) are the
+compiler as a library, each command's work among them
+(`heff.commands`); the program `heff` is `cmd/heff/main.hf`, which reads
+the command line and gives the commands the world they run in.
+`boot/heff.mjs` is a compiled copy of the compiler; the build (`npm run
+build`) uses it to compile the program into `output/heff.mjs`, which is
+`heff` (minified; the compiler's own output is `output/heff.raw.mjs`).
 
 `editors/vscode` is a VS Code extension for the language server; a
 release has it built (`heff-X.Y.Z.vsix`).

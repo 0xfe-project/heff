@@ -13,7 +13,7 @@ const hfIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hf
 let failed = 0;
 
 const examples = readdirSync(join(root, "examples"), { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => hfIn(join("examples", d.name)));
-const files = [...hfIn("lib"), ...hfIn("lib/std"), ...hfIn("src/heff"), ...hfIn("src/heff/fmt"), ...examples, ...hfIn("test/surface"), ...hfIn("test/check"), "test/modules/app/main.hf", "test/modules/qualified.hf", "test/modules/struct-use.hf", "test/modules/value-use.hf"];
+const files = [...hfIn("lib"), ...hfIn("lib/std"), ...hfIn("src/heff"), ...hfIn("src/heff/fmt"), "cmd/heff/main.hf", ...examples, ...hfIn("test/surface"), ...hfIn("test/check"), "test/modules/app/main.hf", "test/modules/qualified.hf", "test/modules/struct-use.hf", "test/modules/value-use.hf"];
 const t = heff("test", ...files);
 console.log(t.stdout.trim().split("\n").pop());
 if (t.status !== 0) { failed++; console.log(t.stdout + t.stderr); }
