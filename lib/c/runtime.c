@@ -218,7 +218,7 @@ static size_t heff_size(V v) {
   }
 }
 
-static void heff_free(V v) {
+__attribute__((noinline)) static void heff_free(V v) {
   Obj *o = OBJ(v);
   switch (o->kind) {
   case K_TAG: { Tag *t = (Tag *)v; for (int64_t i = 0; i < t->n; i++) heff_drop(t->f[i]); break; }
