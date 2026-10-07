@@ -1,0 +1,318 @@
+-- Generators of random values, for properties (lib/check.hf), after
+-- Hedgehog: a generator makes a value together with every smaller value
+-- to try instead of it, a rose tree, so that each generator shrinks, and
+-- a generator made of others shrinks by theirs -- there is no `shrink`
+-- to write apart, and none to get out of step with the generator.  A
+-- generator is a pure function of a seed and a size; a property draws
+-- from it by an effect (`check.forAll`), which the runner gives.
+-- Generators are values passed by hand: there is no search for "the"
+-- generator of a type.  Import it by a name, `import gen as G`, as it
+-- has a `map`, a `list` and an `int`.
+
+import prelude
+import prelude as P
+
+-- Seeds
+--------------------------------------------------------------------------------
+
+-- | Where a random value comes from: a state of a congruential generator
+-- | modulo the prime 2^31 - 1, split in two by two different steps, a
+-- | value drawn from it by a third step and a fifth power (which mixes
+-- | what the steps, being linear, do not, and loses nothing: modulo this
+-- | prime, no two numbers have the same fifth power).  It is no
+-- | cryptographic generator: enough to spread the values a test tries,
+-- | the same seed always making the same value.
+data Seed = MkSeed Int
+
+modulus : Int
+modulus = 2147483647
+
+-- (a step: a multiplier and an increment)
+step : Int -> Int -> Int -> Int
+step a c s = (s * a + c) % modulus
+
+-- (the fifth power)
+mix : Int -> Int
+mix x = (x * x % modulus) * (x * x % modulus) % modulus * x % modulus
+
+-- | A seed from any number (as `heff test --seed N` gives it).
+seed : Int -> Seed
+seed n = MkSeed (mix (step 48271 11 (n % modulus)))
+
+-- | Two seeds from one: what a generator draws from the first does not
+-- | change what is drawn from the second.
+split : Seed -> Pair Seed Seed
+split (MkSeed s) = MkPair (MkSeed (step 48271 11 s)) (MkSeed (step 69621 7 s))
+
+-- | A number from 0 to `n - 1` (`n` at least 1), from the seed.
+bounded : Int -> Seed -> Int
+bounded n (MkSeed s) =
+  if n <= modulus then mix (step 16807 3 s) % n
+  else (mix (step 16807 3 s) * modulus + mix (step 39373 5 s)) % n
+
+-- Rose trees
+--------------------------------------------------------------------------------
+
+-- | A value and the smaller ones to try instead, each with its own:
+-- | each is made only when it is asked for, as a shrink is tried only
+-- | while the ones before it did not fail.
+data Tree a = Node a (List (Unit -> Tree a))
+
+root : {a : Type} -> Tree a -> a
+root (Node x _) = x
+
+children : {a : Type} -> Tree a -> List (Unit -> Tree a)
+children (Node _ cs) = cs
+
+mapTree : {a b : Type} -> (a -> b) -> Tree a -> Tree b
+mapTree f (Node x cs) =
+  Node
+    (f x)
+    (P.map
+       (\(c : Unit -> Tree a) -> \(u : Unit) -> (mapTree f (c u) : Tree b))
+       cs)
+
+-- (a tree whose smaller values are tried before the root's own)
+graft : {a : Type} -> List (Unit -> Tree a) -> Tree a -> Tree a
+graft cs (Node y ds) = Node y (concatList cs ds)
+
+-- | A tree of trees, as one: the outer value's shrinks first, each with
+-- | the inner value made again from it, then the inner value's.
+bindTree : {a b : Type} -> Tree a -> (a -> Tree b) -> Tree b
+bindTree (Node x cs) k =
+  graft
+    (P.map
+       (\(c : Unit -> Tree a) -> \(u : Unit) -> (bindTree (c u) k : Tree b))
+       cs)
+    (k x)
+
+-- Generators
+--------------------------------------------------------------------------------
+
+-- | A generator: from a seed and a size (0 to 100, growing over a
+-- | property's runs, so that the first values tried are small), a value
+-- | and its shrinks.
+data Gen a = MkGen (Seed -> Int -> Tree a)
+
+-- | The tree a generator makes from a seed, at a size.
+run : {a : Type} -> Gen a -> Seed -> Int -> Tree a
+run (MkGen g) s n = g s n
+
+-- | Values made from 10 seeds, at sizes growing to 100: what a generator
+-- | makes, for a look at it.
+sample : {a : Type} -> Gen a -> List a
+sample g = P.map (\i -> root (run g (seed (i * 7919)) (i * 10))) (range 1 10)
+
+-- | Always `x`, which does not shrink.
+constant : {a : Type} -> a -> Gen a
+constant x = MkGen (\s n -> Node x Nil)
+
+-- | `f` of what `g` makes; it shrinks as `g` does.
+map : {a b : Type} -> (a -> b) -> Gen a -> Gen b
+map f g = MkGen (\s n -> mapTree f (run g s n))
+
+-- | A value of `g`, and a generator made from it: shrinking tries the
+-- | first value's shrinks first, the second made again from each.
+bind : {a b : Type} -> Gen a -> (a -> Gen b) -> Gen b
+bind g k =
+  MkGen (\s n -> case split s of
+  MkPair s1 s2 -> bindTree (run g s1 n) (\x -> run (k x) s2 n))
+
+pure : {a : Type} -> a -> Gen a
+pure x = constant x
+
+-- | `f` of what both make.
+map2 : {a b c : Type} -> (a -> b -> c) -> Gen a -> Gen b -> Gen c
+map2 f ga gb = bind ga (\x -> map (\y -> f x y) gb)
+
+-- | Both, as a pair.
+pair : {a b : Type} -> Gen a -> Gen b -> Gen (Pair a b)
+pair ga gb = map2 (\x y -> MkPair x y) ga gb
+
+-- | The generator at the size given, whatever the size is.
+resize : {a : Type} -> Int -> Gen a -> Gen a
+resize m g = MkGen (\s n -> run g s m)
+
+-- | A generator chosen by the size.
+sized : {a : Type} -> (Int -> Gen a) -> Gen a
+sized f = MkGen (\s n -> run (f n) s n)
+
+-- Numbers
+--------------------------------------------------------------------------------
+
+-- (the quotient, rounded toward zero, as `/` rounds down)
+quot : Int -> Int -> Int
+quot a b = if a < 0 then 0 - (0 - a) / b else a / b
+
+halves : Int -> List Int
+halves d = if d == 0 then Nil else Cons d (halves (quot d 2))
+
+-- | The values to try instead of `x`, nearer `o`: `o` itself first, then
+-- | ever nearer `x`, so that the search for the smallest that fails is
+-- | a binary one.
+towards : Int -> Int -> List Int
+towards o x =
+  if x == o then Nil else Cons o (P.map (\d -> x - d) (halves (quot (x - o) 2)))
+
+-- >>> towards 0 100
+-- Cons 0 (Cons 50 (Cons 75 (Cons 88 (Cons 94 (Cons 97 (Cons 99 Nil))))))
+
+-- (`x`, shrinking toward `o`)
+intTree : Int -> Int -> Tree Int
+intTree o x =
+  Node x (P.map (\y -> \(u : Unit) -> (intTree o y : Tree Int)) (towards o x))
+
+-- (`o`, within `lo` to `hi`)
+clamp : Int -> Int -> Int -> Int
+clamp lo hi o = if o < lo then lo else if o > hi then hi else o
+
+-- (a number from `o - below` to `o + above`, shrinking toward `o`)
+around : Int -> Int -> Int -> Seed -> Tree Int
+around o below above s = intTree o (o - below + bounded (below + above + 1) s)
+
+-- | A number from `lo` to `hi`, shrinking toward the one nearest 0.  The
+-- | range grows with the size, from that number at size 0 to all of it
+-- | at 100.
+int : Int -> Int -> Gen Int
+int lo hi =
+  MkGen
+    (\s n ->
+       around
+         (clamp lo hi 0)
+         ((clamp lo hi 0 - lo) * n / 100)
+         ((hi - clamp lo hi 0) * n / 100)
+         s)
+
+-- >>> sample (int 0 9)
+-- Cons 0 (Cons 1 (Cons 2 (Cons 1 (Cons 2 (Cons 0 (Cons 6 (Cons 7 (Cons 4 (Cons 7 Nil)))))))))
+
+-- | A number from `lo` to `hi`, any of them as likely at any size,
+-- | shrinking toward `lo`.
+uniform : Int -> Int -> Gen Int
+uniform lo hi = MkGen (\s n -> intTree lo (lo + bounded (hi - lo + 1) s))
+
+-- | `False` or `True`, shrinking to `False`.
+bool : Gen Bool
+bool = map (\i -> i == 1) (uniform 0 1)
+
+-- (the `i`th, counting from 0)
+nth : {a : Type} -> Int -> List a -> a
+nth i Nil = abandon
+nth i (Cons x xs) = if i <= 0 then x else nth (i - 1) xs
+
+-- | One of these, shrinking toward the first.  (Of none, `abandon`.)
+element : {a : Type} -> List a -> Gen a
+element xs = map (\i -> nth i xs) (uniform 0 (length xs - 1))
+
+-- | What one of these makes, shrinking toward the first.
+oneOf : {a : Type} -> List (Gen a) -> Gen a
+oneOf gs = bind (uniform 0 (length gs - 1)) (\i -> nth i gs)
+
+-- (the generator whose weights, added from the first, pass `i`)
+pick : {a : Type} -> Int -> List (Pair Int (Gen a)) -> Gen a
+pick i Nil = abandon
+pick i (Cons p rest) = if i < fst p then snd p else pick (i - fst p) rest
+
+-- | What one of these makes, each as often as its weight says, shrinking
+-- | toward the first.
+frequency : {a : Type} -> List (Pair Int (Gen a)) -> Gen a
+frequency ws =
+  bind
+    (uniform 0 (sum (P.map (\(p : Pair Int (Gen a)) -> fst p) ws) - 1))
+    (\i -> pick i ws)
+
+-- | `Nothing` now and then, else `Just` of what `g` makes; it shrinks to
+-- | `Nothing`.
+maybe : {a : Type} -> Gen a -> Gen (Maybe a)
+maybe g =
+  frequency
+    [MkPair 1 (constant Nothing), MkPair 4 (map (\x -> (Just x : Maybe a)) g)]
+
+-- Lists
+--------------------------------------------------------------------------------
+
+-- (`n` trees of `g`, each from a seed of its own)
+trees : {a : Type} -> Gen a -> Int -> Seed -> Int -> List (Tree a)
+trees g size s n =
+  if n <= 0 then Nil
+  else case split s of
+    MkPair s1 s2 -> Cons (run g s1 size) (trees g size s2 (n - 1))
+
+-- (the list without its `k` elements from `i`)
+removeAt : {a : Type} -> Int -> Int -> List a -> List a
+removeAt i k xs = concatList (take i xs) (drop (i + k) xs)
+
+-- (the list without `k` elements in a row, each way: from 0, `k`, `2k`)
+removals : {a : Type} -> Int -> Int -> Int -> List a -> List (List a)
+removals k i n xs =
+  if i + k > n then Nil else Cons (removeAt i k xs) (removals k (i + k) n xs)
+
+-- (shorter lists, by halves, then quarters, ... then one element, kept
+-- at `lo` elements at least)
+shorter : {a : Type} -> Int -> List a -> List (List a)
+shorter lo xs =
+  concatMap
+    (\k -> if length xs - k < lo then Nil else removals k 0 (length xs) xs)
+    (halves (length xs))
+
+-- (each element's shrinks, the others as they are; `before` backwards)
+shrinkEach : {a : Type}
+           -> (List (Tree a) -> Tree (List a))
+           -> List (Tree a)
+           -> List (Tree a)
+           -> List (Unit -> Tree (List a))
+shrinkEach f before Nil = Nil
+shrinkEach f before (Cons t rest) =
+  concatList
+    (P.map
+       (\(c : Unit -> Tree a) -> \(u : Unit) ->
+          f (concatList (reverse before) (Cons (c u) rest)))
+       (children t))
+    (shrinkEach f (Cons t before) rest)
+
+-- | The list of these trees' values, shrinking by fewer elements (`lo` at
+-- | least), then by smaller ones.
+interleave : {a : Type} -> Int -> List (Tree a) -> Tree (List a)
+interleave lo ts =
+  Node
+    (P.map (\(t : Tree a) -> root t) ts)
+    (concatList
+       (P.map
+          (\(us : List (Tree a)) -> \(u : Unit) ->
+             (interleave lo us : Tree (List a)))
+          (shorter lo ts))
+       (shrinkEach (\us -> interleave lo us) Nil ts))
+
+-- | A list of `lo` to `hi` elements of `g`, longer with the size,
+-- | shrinking to fewer and smaller elements.
+list : {a : Type} -> Int -> Int -> Gen a -> Gen (List a)
+list lo hi g =
+  MkGen (\s n -> case split s of
+  MkPair s1 s2 ->
+    interleave lo (trees g n s2 (lo + bounded ((hi - lo) * n / 100 + 1) s1)))
+
+-- | A string of `lo` to `hi` of the characters of `alphabet`.
+string : Int -> Int -> String -> Gen String
+string lo hi alphabet =
+  map
+    (\cs -> joinWith "" cs)
+    (list
+       lo
+       hi
+       (element
+          (P.map
+             (\i -> strSlice alphabet i (i + 1))
+             (range 0 (strLength alphabet - 1)))))
+
+-- | The shrinks of a tree, a level deep: what a generator tries first
+-- | instead of what it made.
+shrinks : {a : Type} -> Tree a -> List a
+shrinks t = P.map (\(c : Unit -> Tree a) -> root (c MkUnit)) (children t)
+
+-- >>> root (run (list 0 3 (int 0 9)) (seed 1) 100)
+-- Cons 8 (Cons 1 Nil)
+
+-- (both elements taken out, then each one, then the 8 made smaller, then
+-- the 1)
+-- >>> shrinks (run (list 0 3 (int 0 9)) (seed 1) 100)
+-- Cons Nil (Cons (Cons 1 Nil) (Cons (Cons 8 Nil) (Cons (Cons 0 (Cons 1 Nil)) (Cons (Cons 4 (Cons 1 Nil)) (Cons (Cons 6 (Cons 1 Nil)) (Cons (Cons 7 (Cons 1 Nil)) (Cons (Cons 8 (Cons 0 Nil)) Nil)))))))
