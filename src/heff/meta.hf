@@ -79,10 +79,38 @@ keepFailed p (Left _) =
          c)
 keepFailed p (Right _) = pure MkUnit
 
+-- | the state as it was, but for what a failed unification keeps: the
+-- | metavariables and the problems postponed go back; the trace (and
+-- | what else is written down) stays, so `heff explain` shows the try
+undoTo : StCore -> StCore -> StCore
+undoTo before c = setPostponed before.postponed (setMetas before.metas before.nextMeta c)
+
+undoIfFailed : {a : Type}
+             -> StCore
+             -> Saved
+             -> Either C.EqErr a
+             -> Elab (Either C.EqErr a)
+undoIfFailed before waiting (Right x) = pure (Right x)
+undoIfFailed before waiting (Left err) = do
+  modify (undoTo before)
+  restoreWaiting waiting
+  pure (Left err)
+
+-- | a unification tried: if it fails, what it did is undone -- the
+-- | metavariables it solved or made, the problems it postponed, the
+-- | checks it left waiting -- for what is tried next to start from what
+-- | was there before (#19)
+attempt : {a : Type} -> Elab (Either C.EqErr a) -> Elab (Either C.EqErr a)
+attempt m = do
+  before <- gets (\c -> c)
+  waiting <- saveDelayed
+  r <- m
+  undoIfFailed before waiting r
+
 retryEach : G.Globals -> List Postponed -> Elab Unit
 retryEach g Nil = pure MkUnit
 retryEach g (Cons p rest) = do
-  r <- liftU (U.uEl (ms := U.msEv) (uf := U.ufEv) g p.shape p.left p.right)
+  r <- attempt (liftU (U.uEl (ms := U.msEv) (uf := U.ufEv) g p.shape p.left p.right))
   keepFailed p r
   retryEach g rest
 
@@ -213,8 +241,10 @@ deferAlg (Resolve final k) = \st ->
     bindStep (resolveS final st) (\b st2 -> MkPair (Right (k b)) st2)
 deferAlg (Pending k) = \st ->
     MkPair (Right (k (anyDelayed (core st).metas (delayedOf st)))) st
-deferAlg (SaveDelayed k) = \st -> MkPair (Right (k (MkSaved (delayedOf st)))) st
+deferAlg (SaveDelayed k) = \st ->
+    MkPair (Right (k (MkSaved (delayedOf st) (wantedOf st)))) st
 deferAlg (RestoreDelayed sv x) = \st -> MkPair (Right x) (restoreTo sv st)
+deferAlg (RestoreWaiting sv x) = \st -> MkPair (Right x) (restoreAllTo sv st)
 
 notesAlg : {a : Type} -> NotesF Step a -> Step a
 notesAlg (Trace ev x) = \st -> MkPair (Right x) (withCore (pushTrace ev) st)
@@ -288,3 +318,32 @@ resultOf (MkPair (Left _) _) = 0 - 1
 
 -- >>> resultOf (runE (bind (failWith (a := Int) P.noSpan 8 "no") (\x -> val 1)) emptySt)
 -- -1
+
+-- (a unification that makes a metavariable, then fails)
+madeThenFailed : Elab (Either C.EqErr Int)
+madeThenFailed =
+  bind
+    (liftU
+       (U.newMetaFrom
+          (ms := U.msEv)
+          (uf := U.ufEv)
+          { ty = VPrimInt
+          , sol = Nothing
+          , solStx = Nothing
+          , arity = 0
+          , name = "m"
+          , span = P.noSpan
+          }
+          0
+          VPrimInt))
+    (\r -> pure (Left MentionsError))
+
+metaCount : {a : Type} -> Pair (Either Diag a) ElabSt -> Int
+metaCount (MkPair _ st) = M.size (core st).metas
+
+-- tried, what the failed unification made is gone; not tried, it stays
+-- >>> metaCount (runE (attempt madeThenFailed) emptySt)
+-- 0
+
+-- >>> metaCount (runE madeThenFailed emptySt)
+-- 1
