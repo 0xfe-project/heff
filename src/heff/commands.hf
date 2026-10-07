@@ -410,6 +410,24 @@ compileDiags sources host file name outPath done badL cs = do
   if badL || anyErrors cs then exit 1
     else compileLast sources host file name outPath done cs
 
+-- | compile the computation `name` of FILE to a program of `host`, then
+-- | go on with `done`
+compileThen : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> String
+            -> Maybe String
+            -> String
+            -> String
+            -> Co e Unit
+            -> Co e Unit
+compileThen host name outPath file done = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  cs <- Se.cachedProgram l
+  compileDiags l.sources host file name outPath done (badL > 0) cs
+
 -- | compile the computation `name` of FILE to a program of `host`:
 -- | FILE's import closure loaded with the compiler's own loader
 compileCmd : {e : HFunctor}
@@ -422,19 +440,13 @@ compileCmd : {e : HFunctor}
            -> String
            -> String
            -> Co e Unit
-compileCmd host name outPath how file = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  compileDiags
-      l.sources
-      host
-      file
-      name
-      outPath
-      (print ("wrote " ++ outPath ++ ": " ++ how))
-      (badL > 0)
-      cs
+compileCmd host name outPath how file =
+  compileThen
+    host
+    name
+    outPath
+    file
+    (print ("wrote " ++ outPath ++ ": " ++ how))
 
 nodeCmd : {e : HFunctor}
         -> {{io : stdio <: e}}
@@ -467,6 +479,75 @@ appCmd name outPath file =
     outPath
     "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
     file
+
+-- | the project's programs: `app/X/main.hf` is the program X
+programsIn : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> P.Style
+           -> List String
+           -> Co e (List String)
+programsIn st Nil = pure Nil
+programsIn st (Cons x rest) = do
+  m <- readFile (P.join st (P.join st "app" x) "main.hf")
+  more <- programsIn st rest
+  pure (case m of
+    Just _ -> Cons x more
+    Nothing -> more)
+
+-- (each program compiled for Node.js to `bin/`, its file runnable)
+buildEach : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> P.Style
+          -> List String
+          -> Co e Unit
+buildEach st Nil = pure MkUnit
+buildEach st (Cons x rest) =
+  compileThen
+    "node"
+    (Just "main")
+    (P.join st "bin" x)
+    (P.join st (P.join st "app" x) "main.hf") (do
+  r <- run "chmod" ["+x", P.join st "bin" x]
+  print ("wrote " ++ P.join st "bin" x)
+  buildEach st rest)
+
+-- (the names given, else all of them)
+orAll : List String -> List String -> List String
+orAll Nil progs = progs
+orAll names progs = names
+
+-- | build the project's programs (the ones NAMEd, else all): `app/X/main.hf`
+-- | is the program X, compiled for Node.js to `bin/X`
+buildCmd : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> List String
+         -> Co e Unit
+buildCmd names = do
+  text <- readFile "package.hf"
+  st <- styleNow
+  case text of
+    Nothing -> do
+      printErr "heff build: no package.hf here: build at the project's root"
+      exit 1
+    Just _ -> do
+      found <- readDir "app"
+      progs <- programsIn st (fromMaybe Nil found)
+      case filter (\n -> not (any (\p -> strEq p n) progs)) names of
+        Cons n _ -> do
+          printErr
+              ("heff build: no program " ++ n ++ ": no app/" ++ n ++ "/main.hf")
+          exit 1
+        Nil -> case orAll names progs of
+          Nil -> do
+            printErr "heff build: no programs: a program X is app/X/main.hf"
+            exit 1
+          _ -> do
+            ok <- mkDir "bin"
+            buildEach st (orAll names progs)
 
 runDir : L.Paths -> String
 runDir paths = L.under paths paths.root ".heff/run"
