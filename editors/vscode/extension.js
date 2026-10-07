@@ -1,4 +1,4 @@
-// The client: runs `node <heff.serverPath> lsp` for `.hf` files.
+// The client: runs `<heff.serverPath> lsp` for `.hf` files.
 const fs = require("fs");
 const path = require("path");
 const vscode = require("vscode");
@@ -10,26 +10,13 @@ try { languageclient = require("vscode-languageclient/node"); } catch (_) { lang
 
 let client;
 
-// the `heff` on the PATH, through its links (`npm link`, `npm install -g`), when
-// it is heff's output/heff.mjs
-function heffOnPath() {
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
-    if (!dir) continue;
-    let real;
-    try { real = fs.realpathSync(path.join(dir, "heff")); } catch (_) { continue; }
-    if (path.basename(real) === "heff.mjs") return real;
-  }
-  return null;
-}
-
-// the server's script: the setting, else the repository's (in development,
-// this extension is its editors/vscode), else the `heff` on the PATH
+// the server: the setting, else the repository's (in development, this
+// extension is its editors/vscode), else `heff` on the PATH
 function serverPath(context) {
   const configured = vscode.workspace.getConfiguration("heff").get("serverPath");
   if (configured) return configured;
-  const repository = path.join(context.extensionPath, "..", "..", "output", "heff.mjs");
-  if (fs.existsSync(repository)) return repository;
-  return heffOnPath() || repository;
+  const repository = path.join(context.extensionPath, "..", "..", "output", process.platform === "win32" ? "heff.exe" : "heff");
+  return fs.existsSync(repository) ? repository : "heff";
 }
 
 async function start(context) {
@@ -38,14 +25,8 @@ async function start(context) {
     return;
   }
   const { LanguageClient } = languageclient;
-  const config = vscode.workspace.getConfiguration("heff");
-  const script = serverPath(context);
-  if (!fs.existsSync(script)) {
-    vscode.window.showErrorMessage(`heff: no language server at ${script}; put \`heff\` on the PATH (\`npm link\`), or set heff.serverPath to its output/heff.mjs`);
-    return;
-  }
   // (no `transport`: with one, the client adds `--stdio` to the arguments)
-  const run = { command: config.get("nodePath") || "node", args: [script, "lsp"] };
+  const run = { command: serverPath(context), args: ["lsp"] };
   client = new LanguageClient("heff", "heff language server", { run, debug: run }, {
     documentSelector: [{ scheme: "file", language: "heff" }],
   });

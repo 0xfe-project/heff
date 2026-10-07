@@ -9,10 +9,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = mkdtempSync(join(tmpdir(), "heff-cli-"));
-const heff = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: work, encoding: "utf8" });
+const heff = (...args) => spawnSync(heffBin, [...args], { cwd: work, encoding: "utf8" });
 
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}: got ${JSON.stringify(got)}`); } };
@@ -155,7 +156,7 @@ for (const [words, out] of [
 // so far, and what the shell offers
 const bin = join(work, "bin");
 mkdirSync(bin);
-writeFileSync(join(bin, "heff"), `#!/bin/sh\nexec node ${JSON.stringify(join(root, "output", "heff.mjs"))} "$@"\n`);
+writeFileSync(join(bin, "heff"), `#!/bin/sh\nexec ${JSON.stringify(heffBin)} "$@"\n`);
 chmodSync(join(bin, "heff"), 0o755);
 const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
 writeFileSync(join(work, "comp.bash"), heff("completions", "bash").stdout);

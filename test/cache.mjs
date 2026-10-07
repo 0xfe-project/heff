@@ -9,10 +9,10 @@ import { existsSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, copyFi
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
+import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bin = join(root, "output", "heff.mjs");
-if (!existsSync(bin)) { console.log("FAIL cache: no output/heff.mjs (run npm run build first)"); process.exit(1); }
+if (!existsSync(heffBin)) { console.log(`FAIL cache: no ${heffBin} (run node scripts/build.mjs first)`); process.exit(1); }
 
 const dir = mkdtempSync(join(tmpdir(), "heff-cache-"));
 mkdirSync(join(dir, "lib"), { recursive: true });
@@ -23,7 +23,7 @@ writeFileSync(join(dir, "a.hf"), "import prelude\n\nnine : Int\nnine = 9\n\nunus
 writeFileSync(join(dir, "b.hf"), "import a\nimport prelude\n\nten : Int\nten = nine + 1\n");
 writeFileSync(join(dir, "c.hf"), "import b\nimport prelude\n\n-- >>> ten\n-- 10\n");
 
-const heff = (...args) => spawnSync("node", [bin, ...args], { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
+const heff = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
 const hc = (m) => join(dir, ".heff", m + ".hc");
 const mtime = (m) => statSync(hc(m)).mtimeMs;
 

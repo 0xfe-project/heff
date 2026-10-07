@@ -8,13 +8,14 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 // the formatter, compiled to a module of its own, its `format` called
 // directly: `Right` the text laid out, `Left` why not
 const module = join(root, "output", "heff-format.mjs");
-execFileSync("node", [join(root, "output", "heff.mjs"), "compile", "src/heff/format.hf", module, "--backend=esm"], { cwd: root });
+execFileSync(heffBin, ["compile", "src/heff/format.hf", module, "--backend=esm"], { cwd: root });
 const { format } = (await import(pathToFileURL(module))).default;
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}:\n${got}`); } };

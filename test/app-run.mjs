@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = join(root, "ref", "app-run");
@@ -38,7 +39,7 @@ const check = (what, got, want) => {
 };
 async function run(file, name, fill = () => {}) {
   const out = join(work, `${name}.mjs`);
-  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "compile", file, out, "--name", name, "--backend=page"], { encoding: "utf8" });
+  const r = spawnSync(heffBin, ["compile", file, out, "--name", name, "--backend=page"], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL heff compile --backend=page ${file}\n${r.stdout}${r.stderr}`); return null; }
   const page = new Node("body");
   fill(page);
