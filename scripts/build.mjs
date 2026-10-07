@@ -46,5 +46,7 @@ step("the first stage (the seed compiling app/heff/main.hf)", process.execPath,
   [unpacked, "compile", "app/heff/main.hf", stage1, "--name", "main", "--backend=node"]);
 step("the compiler in C (the first stage compiling itself)", process.execPath,
   [stage1, "compile", "app/heff/main.hf", c, "--name", "main", "--backend=c"]);
-step("zig cc", "zig", ["cc", "-O2", "-w", c, "-o", out, "-lm"]);
+// (for any machine of this kind, not only this one: zig's default is
+// this machine's processor, whose instructions another may not have)
+step("zig cc", "zig", ["cc", "-mcpu=baseline", "-O2", "-w", c, "-o", out, "-lm"]);
 console.log(`heff build: ${out}, the compiler compiled by itself`);
