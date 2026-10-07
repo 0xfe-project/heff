@@ -190,6 +190,33 @@ static inline void heff_take(V v, uint64_t keep) {
   }
 }
 
+// (as `heff_take`, the cell kept for a tag of its size to be built in
+// (`heff_tag_at`): its last reference, the cell itself, its fields
+// taken or dropped and blanked; otherwise none, 0)
+static inline V heff_take_reuse(V v, uint64_t keep) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) {
+    for (int64_t i = 0; i < t->n; i++) {
+      if (!((keep >> i) & 1)) heff_drop(t->f[i]);
+      t->f[i] = MK_INT(0);
+    }
+    return v;
+  }
+  for (int64_t i = 0; i < t->n; i++)
+    if ((keep >> i) & 1) heff_dup(t->f[i]);
+  if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  return MK_INT(0);
+}
+
+// (a tag built in the cell `r` kept for it, or a new one)
+static inline V heff_tag_at(V r, int id, int64_t n, V *f) {
+  if (!IS_OBJ(r)) return heff_tag(id, n, f);
+  Tag *t = (Tag *)r;
+  t->h.tag = (uint16_t)id;
+  memcpy(t->f, f, n * sizeof(V));
+  return r;
+}
+
 static V heff_clo(Fn fn, int arity, int nenv, V *env) {
   Clo *c = heff_obj_alloc(sizeof(Clo) + nenv * sizeof(V));
   c->h.rc = 1; c->h.kind = K_CLO; c->h.tag = 0;
@@ -218,18 +245,40 @@ static size_t heff_size(V v) {
   }
 }
 
-__attribute__((noinline)) static void heff_free(V v) {
-  Obj *o = OBJ(v);
-  switch (o->kind) {
-  case K_TAG: { Tag *t = (Tag *)v; for (int64_t i = 0; i < t->n; i++) heff_drop(t->f[i]); break; }
-  case K_REC: { Rec *r = (Rec *)v; for (int64_t i = 0; i < r->n; i++) heff_drop(r->f[i]); break; }
-  case K_CLO: { Clo *c = (Clo *)v; for (int i = 0; i < c->nenv; i++) heff_drop(c->env[i]); break; }
-  case K_PAP: { Pap *p = (Pap *)v; heff_drop(p->fun); for (int i = 0; i < p->n; i++) heff_drop(p->a[i]); break; }
-  case K_ARR: { Arr *r = (Arr *)v; for (int64_t i = 0; i < r->n; i++) heff_drop(r->a[i]); break; }
-  case K_BNC: { Bnc *b = (Bnc *)v; heff_drop(b->fun); for (int i = 0; i < b->n; i++) heff_drop(b->a[i]); break; }
-  default: break;
+// (what is given back, a stack of it, not a recursion: a long list's
+// cells given back one after another, the stack as deep as the list
+// never)
+static V *heff_dead;
+static size_t heff_ndead, heff_cdead;
+
+static inline void heff_dead_push(V v) {
+  if (!IS_OBJ(v) || (OBJ(v)->rc & IMMORTAL) || --OBJ(v)->rc != 0) return;
+  if (heff_ndead == heff_cdead) {
+    heff_cdead = heff_cdead ? heff_cdead * 2 : 1024;
+    heff_dead = realloc(heff_dead, heff_cdead * sizeof(V));
+    if (!heff_dead) heff_fail("out of memory");
   }
-  heff_obj_free(o, heff_size(v));
+  heff_dead[heff_ndead++] = v;
+}
+
+__attribute__((noinline)) static void heff_free(V v) {
+  size_t base = heff_ndead;
+  OBJ(v)->rc = 1;
+  heff_dead_push(v);
+  while (heff_ndead > base) {
+    V w = heff_dead[--heff_ndead];
+    Obj *o = OBJ(w);
+    switch (o->kind) {
+    case K_TAG: { Tag *t = (Tag *)w; for (int64_t i = 0; i < t->n; i++) heff_dead_push(t->f[i]); break; }
+    case K_REC: { Rec *r = (Rec *)w; for (int64_t i = 0; i < r->n; i++) heff_dead_push(r->f[i]); break; }
+    case K_CLO: { Clo *c = (Clo *)w; for (int i = 0; i < c->nenv; i++) heff_dead_push(c->env[i]); break; }
+    case K_PAP: { Pap *p = (Pap *)w; heff_dead_push(p->fun); for (int i = 0; i < p->n; i++) heff_dead_push(p->a[i]); break; }
+    case K_ARR: { Arr *r = (Arr *)w; for (int64_t i = 0; i < r->n; i++) heff_dead_push(r->a[i]); break; }
+    case K_BNC: { Bnc *b = (Bnc *)w; heff_dead_push(b->fun); for (int i = 0; i < b->n; i++) heff_dead_push(b->a[i]); break; }
+    default: break;
+    }
+    heff_obj_free(o, heff_size(w));
+  }
 }
 
 // Calls of what is not known
