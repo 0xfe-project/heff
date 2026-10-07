@@ -31,15 +31,16 @@ liftTake : {a : Type}
          -> Elab (Either C.EqErr a)
 liftTake (MkPair r c2) = bind (putSt c2) (\u -> val r)
 
--- | a unification, in elaboration: its failure is a value
-liftU : {a : Type} -> U.Unify a -> Elab (Either C.EqErr a)
-liftU u = bind (gets (\c -> u c)) liftTake
+-- | a unification, in elaboration: run on the core state, by itself
+-- | (it has no other effect), its failure a value
+liftU : {a : Type} -> Co U.uW a -> Elab (Either C.EqErr a)
+liftU u = bind (gets (\c -> U.runU u c)) liftTake
 
 unifyTy : G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Elab (Either C.EqErr Unit)
-unifyTy g cs a b = liftU (U.uTy g cs a b)
+unifyTy g cs a b = liftU (U.uTy (ms := U.msEv) (uf := U.ufEv) g cs a b)
 
 unifyEl : G.Globals -> P.CtxShape -> V.V -> V.V -> Elab (Either C.EqErr Unit)
-unifyEl g cs a b = liftU (U.uEl g cs a b)
+unifyEl g cs a b = liftU (U.uEl (ms := U.msEv) (uf := U.ufEv) g cs a b)
 
 blockedFlex : M.Map Int Unit -> V.Ty -> Bool
 blockedFlex ps a = case U.flexTy a of
@@ -62,8 +63,7 @@ keepUnsolved acc e = case e.sol of
 
 -- | the metavariables that were created and never solved
 unsolvedMetas : Elab (List Unsolved)
-unsolvedMetas =
-  gets (\c -> reverse (foldl keepUnsolved Nil (M.values c.metas)))
+unsolvedMetas = gets (\c -> reverse (foldl keepUnsolved Nil (M.values c.metas)))
 
 -- Postponed problems and delayed checks
 --------------------------------------------------------------------------------
@@ -72,21 +72,17 @@ keepFailed : Postponed -> Either C.EqErr Unit -> Elab Unit
 keepFailed p (Left _) =
   modify
     (\c ->
-          setPostponed
-            (Cons
-               { shape = p.shape
-               , left = p.left
-               , right = p.right
-               , failed = True
-               }
-               c.postponed)
-            c)
+       setPostponed
+         (Cons
+            { shape = p.shape, left = p.left, right = p.right, failed = True }
+            c.postponed)
+         c)
 keepFailed p (Right _) = pure MkUnit
 
 retryEach : G.Globals -> List Postponed -> Elab Unit
 retryEach g Nil = pure MkUnit
 retryEach g (Cons p rest) = do
-  r <- liftU (U.uEl g p.shape p.left p.right)
+  r <- liftU (U.uEl (ms := U.msEv) (uf := U.ufEv) g p.shape p.left p.right)
   keepFailed p r
   retryEach g rest
 
@@ -150,7 +146,8 @@ catchStep h (MkPair (Right x) st) = MkPair (Right x) st
 -- (the delayed checks, oldest first)
 runEachS : List (Delayed ElabSt) -> Step Unit
 runEachS Nil = \st -> MkPair (Right MkUnit) st
-runEachS (Cons (MkDelayed ty chk) rest) = \st -> bindStep (chk st) (\u -> runEachS rest)
+runEachS (Cons (MkDelayed ty chk) rest) = \st ->
+    bindStep (chk st) (\u -> runEachS rest)
 
 readyIn : Bool -> ElabSt -> List (Delayed ElabSt)
 readyIn all st = filter (delayedReady (core st).metas all) (delayedOf st)
@@ -166,7 +163,8 @@ wakeS all = \st ->
            -- the order they were delayed)
            (reverse (readyIn all st))
            (withDelayed
-              (\ds -> filter (\d -> not (delayedReady (core st).metas all d)) ds)
+              (\ds ->
+                 filter (\d -> not (delayedReady (core st).metas all d)) ds)
               st))
         (\u -> wakeS all)
 
@@ -180,7 +178,8 @@ resolveListS final (Cons (MkWanted sp f) rest) = \st ->
       (\done st2 ->
          bindStep
            (resolveListS final rest st2)
-           (\rs st3 -> MkPair (Right (Cons (MkPair done (MkWanted sp f)) rs)) st3))
+           (\rs st3 ->
+              MkPair (Right (Cons (MkPair done (MkWanted sp f)) rs)) st3))
 
 -- | each wanted instance tried; those found dropped
 resolveS : Bool -> Step Bool
@@ -208,7 +207,8 @@ deferAlg (Want sp f x) = \st ->
     MkPair
       (Right x)
       (withWanted (\ws -> concatList ws (Cons (MkWanted sp f) Nil)) st)
-deferAlg (Wake all x) = \st -> bindStep (wakeS all st) (\u st2 -> MkPair (Right x) st2)
+deferAlg (Wake all x) = \st ->
+    bindStep (wakeS all st) (\u st2 -> MkPair (Right x) st2)
 deferAlg (Resolve final k) = \st ->
     bindStep (resolveS final st) (\b st2 -> MkPair (Right (k b)) st2)
 deferAlg (Pending k) = \st ->
