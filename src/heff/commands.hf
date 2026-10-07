@@ -9,6 +9,7 @@ import co
 import heff.driver as Dr
 import heff.effect as Ef
 import heff.emit as Em
+import heff.emitc as Ec
 import heff.fixity as F
 import heff.format as Fm
 import heff.load as L
@@ -551,6 +552,136 @@ compileJsCmd file outPath = do
   cs <- Se.cachedProgram l
   compileJsDiags file outPath (badL > 0) cs
 
+-- The C backend
+--------------------------------------------------------------------------------
+
+-- (a world's provider for the C backend: `M.provider.c` beside `M.hf`)
+readProviderC : {e : HFunctor}
+              -> {{disk : fs <: e}}
+              -> List Dr.Source
+              -> String
+              -> Co e (Maybe Em.Provider)
+readProviderC sources m = case pathOfModule sources m of
+  Nothing -> pure Nothing
+  Just path -> do
+    text <- readFile (L.dropHf path ++ ".provider.c")
+    pure (case text of
+      Just t -> Just { module = m, text = t }
+      Nothing -> Nothing)
+
+readProvidersC : {e : HFunctor}
+               -> {{disk : fs <: e}}
+               -> List Dr.Source
+               -> List String
+               -> Co e (List Em.Provider)
+readProvidersC sources Nil = pure Nil
+readProvidersC sources (Cons m rest) = do
+  p <- readProviderC sources m
+  ps <- readProvidersC sources rest
+  pure (case p of
+    Just pr -> Cons pr ps
+    Nothing -> ps)
+
+providesLeafC : List Em.Provider -> String -> Bool
+providesLeafC Nil k = False
+providesLeafC (Cons p rest) k =
+  if strEq p.module (Ef.moduleOfKey k)
+  && elemStrM (Ef.nameOfKey k) (Ec.providedNames p.text)
+    then True
+  else providesLeafC rest k
+
+compileFoundC : {e : HFunctor}
+              -> {{io : stdio <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : fs <: e}}
+              -> String
+              -> Maybe String
+              -> String
+              -> String
+              -> Dr.Checked
+              -> List Em.Provider
+              -> Co e Unit
+compileFoundC file name outPath runtime c available = case Dr.findRunnable
+    (filter (\k -> providesLeafC available k) (Dr.candidateLeaves c))
+    c
+    name of
+  Left why -> do
+    printErr ("heff: " ++ file ++ ": " ++ why)
+    exit 1
+  Right r ->
+    writeOut
+      outPath
+      (print ("wrote " ++ outPath ++ ": build it with `zig cc -O2 " ++ outPath ++ " -o PROGRAM`"))
+      (Ec.compileProgramC runtime available c.top.globals r.key r.effect)
+
+-- (lib/c/runtime.c, what a C program is bundled with)
+readRuntimeC : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> Co e String
+readRuntimeC = do
+  lib <- libDir
+  st <- styleNow
+  runtime <- readFile (P.join st (P.join st lib "c") "runtime.c")
+  case runtime of
+    Nothing -> do
+      printErr ("heff: no C runtime at " ++ P.join st (P.join st lib "c") "runtime.c")
+      exit 1
+      pure ""
+    Just text -> pure text
+
+compileLastC : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> List Dr.Source
+             -> String
+             -> Maybe String
+             -> String
+             -> List Dr.Checked
+             -> Co e Unit
+compileLastC sources file name outPath cs = case Dr.lastChecked cs of
+  Nothing -> do
+    printErr "no files given"
+    exit 1
+  Just c -> do
+    found <-
+      readProvidersC
+        sources
+        (nubStrM (map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
+    runtime <- readRuntimeC
+    case name of
+      -- (no computation named: each of the file's definitions, shown)
+      Nothing ->
+        compileJsOut
+          outPath
+          False
+          (Ec.compileCheckC
+             runtime
+             c.top.globals
+             (map (\(o : Dr.Own) -> MkPair o.name o.key) c.own))
+      Just _ -> compileFoundC file name outPath runtime c found
+
+-- | compile the computation `name` of FILE to one C file (with no
+-- | `name`, one that shows each of FILE's definitions asked for, as the
+-- | tests ask: test/compile-check-c.mjs)
+cCmd : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : fs <: e}}
+     -> Maybe String
+     -> String
+     -> String
+     -> Co e Unit
+cCmd name outPath file = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  cs <- Se.cachedProgram l
+  putFileDiags cs
+  if badL > 0 || anyErrors cs then exit 1
+    else compileLastC l.sources file name outPath cs
+
 -- | how `heff compile` was called: FILE, OUT, `--name`, `--backend`
 type CompileOpts =
   { file : String, outPath : String, name : Maybe String, backend : String }
@@ -572,8 +703,9 @@ compileTo o =
         printErr
             "heff compile: an ES module runs nothing: no --name with --backend=esm"
         exit 1
+  else if strEq o.backend "c" then cCmd o.name o.outPath o.file
   else do
-    printErr ("heff compile: no backend " ++ o.backend ++ ": esm, page or node")
+    printErr ("heff compile: no backend " ++ o.backend ++ ": esm, page, node or c")
     exit 1
 
 printEvals : {e : HFunctor}
