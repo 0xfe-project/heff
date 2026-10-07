@@ -15,6 +15,16 @@ map f (y :: ys) = f y :: map f ys
 
 ## Installing
 
+A [release](https://github.com/dannypsnl/heff/releases) has the
+compiler ready to run, needing nothing but Node.js:
+
+```sh
+tar xzf heff-0.1.0.tar.gz
+node heff-0.1.0/output/heff.mjs help
+```
+
+From the repository:
+
 ```sh
 npm install       # also builds heff
 npm link          # puts `heff` on the PATH
@@ -25,7 +35,8 @@ copy of the compiler; the build (`npm run build`) uses it to compile the
 compiler into `output/heff.mjs`, which is `heff` (minified; the
 compiler's own output is `output/heff.raw.mjs`).
 
-`editors/vscode` is a VS Code extension for the language server.
+`editors/vscode` is a VS Code extension for the language server; a
+release has it built (`heff-X.Y.Z.vsix`).
 
 ## Commands
 
