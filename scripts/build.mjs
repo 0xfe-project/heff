@@ -22,7 +22,7 @@ const out = join(root, "output", "heff.mjs");
 // than the seed)
 const mtime = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
 const sources = [seed, join(root, "scripts", "build.mjs"),
-  ...["src/heff", "src/heff/fmt", "lib"].flatMap((d) => readdirSync(join(root, d)).filter((f) => f.endsWith(".hf") || f.endsWith(".js")).map((f) => join(root, d, f)))];
+  ...["src/heff", "src/heff/fmt", "lib", "lib/std"].flatMap((d) => readdirSync(join(root, d)).filter((f) => f.endsWith(".hf") || f.endsWith(".js")).map((f) => join(root, d, f)))];
 if (mtime(out) >= 0 && sources.every((s) => mtime(s) <= mtime(out))) {
   console.log(`heff build: ${out} is up to date`);
   process.exit(0);

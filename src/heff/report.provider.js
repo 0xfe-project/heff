@@ -1,5 +1,5 @@
 // The terminal's side of src/heff/report.hf: an effect provider (the
-// shape of one is said in lib/dom.provider.js).
+// shape of one is said in lib/std/dom.provider.js).
 export const $host = "node";
 export const report = () => (p, k) => {
   const a = p.a;

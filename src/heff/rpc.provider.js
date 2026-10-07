@@ -2,7 +2,7 @@
 // Language Server Protocol frames it -- each message a `Content-Length:
 // n` header, a blank line, then n bytes of JSON; stdout carries only the
 // messages, logs go to stderr -- and what of the host a language server
-// asks for (the shape of a provider is said in lib/dom.provider.js).
+// asks for (the shape of a provider is said in lib/std/dom.provider.js).
 import { fileURLToPath as $fileURLToPath, pathToFileURL as $pathToFileURL } from "node:url";
 import { join as $join, resolve as $resolve } from "node:path";
 import { readFileSync as $readFileSync, readdirSync as $readdirSync } from "node:fs";
