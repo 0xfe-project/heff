@@ -480,75 +480,6 @@ appCmd name outPath file =
     "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
     file
 
--- | the project's programs: `app/X/main.hf` is the program X
-programsIn : {e : HFunctor}
-           -> {{disk : fs <: e}}
-           -> P.Style
-           -> List String
-           -> Co e (List String)
-programsIn st Nil = pure Nil
-programsIn st (Cons x rest) = do
-  m <- readFile (P.join st (P.join st "app" x) "main.hf")
-  more <- programsIn st rest
-  pure (case m of
-    Just _ -> Cons x more
-    Nothing -> more)
-
--- (each program compiled for Node.js to `bin/`, its file runnable)
-buildEach : {e : HFunctor}
-          -> {{io : stdio <: e}}
-          -> {{sys : process <: e}}
-          -> {{disk : fs <: e}}
-          -> P.Style
-          -> List String
-          -> Co e Unit
-buildEach st Nil = pure MkUnit
-buildEach st (Cons x rest) =
-  compileThen
-    "node"
-    (Just "main")
-    (P.join st "bin" x)
-    (P.join st (P.join st "app" x) "main.hf") (do
-  r <- run "chmod" ["+x", P.join st "bin" x]
-  print ("wrote " ++ P.join st "bin" x)
-  buildEach st rest)
-
--- (the names given, else all of them)
-orAll : List String -> List String -> List String
-orAll Nil progs = progs
-orAll names progs = names
-
--- | build the project's programs (the ones NAMEd, else all): `app/X/main.hf`
--- | is the program X, compiled for Node.js to `bin/X`
-buildCmd : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> {{disk : fs <: e}}
-         -> List String
-         -> Co e Unit
-buildCmd names = do
-  text <- readFile "package.hf"
-  st <- styleNow
-  case text of
-    Nothing -> do
-      printErr "heff build: no package.hf here: build at the project's root"
-      exit 1
-    Just _ -> do
-      found <- readDir "app"
-      progs <- programsIn st (fromMaybe Nil found)
-      case filter (\n -> not (any (\p -> strEq p n) progs)) names of
-        Cons n _ -> do
-          printErr
-              ("heff build: no program " ++ n ++ ": no app/" ++ n ++ "/main.hf")
-          exit 1
-        Nil -> case orAll names progs of
-          Nil -> do
-            printErr "heff build: no programs: a program X is app/X/main.hf"
-            exit 1
-          _ -> do
-            ok <- mkDir "bin"
-            buildEach st (orAll names progs)
-
 runDir : L.Paths -> String
 runDir paths = L.under paths paths.root ".heff/run"
 
@@ -679,10 +610,11 @@ compileFoundC : {e : HFunctor}
               -> Maybe String
               -> String
               -> String
+              -> Co e Unit
               -> Dr.Checked
               -> List Em.Provider
               -> Co e Unit
-compileFoundC file name outPath runtime c available = case Dr.findRunnable
+compileFoundC file name outPath runtime done c available = case Dr.findRunnable
     (filter (\k -> providesLeafC available k) (Dr.candidateLeaves c))
     c
     name of
@@ -692,12 +624,7 @@ compileFoundC file name outPath runtime c available = case Dr.findRunnable
   Right r ->
     writeOut
       outPath
-      (print
-         ("wrote "
-          ++ outPath
-          ++ ": build it with `zig cc -O2 "
-          ++ outPath
-          ++ " -o PROGRAM`"))
+      done
       (Ec.compileProgramC runtime available c.top.globals r.key r.effect)
 
 -- (lib/c/runtime.c, what a C program is bundled with)
@@ -727,9 +654,10 @@ compileLastC : {e : HFunctor}
              -> String
              -> Maybe String
              -> String
+             -> Co e Unit
              -> List Dr.Checked
              -> Co e Unit
-compileLastC sources file name outPath cs = case Dr.lastChecked cs of
+compileLastC sources file name outPath done cs = case Dr.lastChecked cs of
   Nothing -> do
     printErr "no files given"
     exit 1
@@ -749,11 +677,30 @@ compileLastC sources file name outPath cs = case Dr.lastChecked cs of
              runtime
              c.top.globals
              (map (\(o : Dr.Own) -> MkPair o.name o.key) c.own))
-      Just _ -> compileFoundC file name outPath runtime c found
+      Just _ -> compileFoundC file name outPath runtime done c found
 
 -- | compile the computation `name` of FILE to one C file (with no
 -- | `name`, one that shows each of FILE's definitions asked for, as the
 -- | tests ask: test/compile-check-c.mjs)
+-- | compile the computation `name` of FILE to one C file, then go on
+-- | with `done`
+cThen : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : fs <: e}}
+      -> Maybe String
+      -> String
+      -> String
+      -> Co e Unit
+      -> Co e Unit
+cThen name outPath file done = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  cs <- Se.cachedProgram l
+  putFileDiags cs
+  if badL > 0 || anyErrors cs then exit 1
+    else compileLastC l.sources file name outPath done cs
+
 cCmd : {e : HFunctor}
      -> {{io : stdio <: e}}
      -> {{sys : process <: e}}
@@ -762,13 +709,109 @@ cCmd : {e : HFunctor}
      -> String
      -> String
      -> Co e Unit
-cCmd name outPath file = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  putFileDiags cs
-  if badL > 0 || anyErrors cs then exit 1
-    else compileLastC l.sources file name outPath cs
+cCmd name outPath file =
+  cThen
+    name
+    outPath
+    file
+    (print
+       ("wrote "
+        ++ outPath
+        ++ ": build it with `zig cc -O2 "
+        ++ outPath
+        ++ " -o PROGRAM`"))
+
+ranStatus : Ran -> Int
+ranStatus r = r.status
+
+ranOut : Ran -> String
+ranOut r = r.out
+
+ranErr : Ran -> String
+ranErr r = r.err
+
+-- | the project's programs: `app/X/main.hf` is the program X
+programsIn : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> P.Style
+           -> List String
+           -> Co e (List String)
+programsIn st Nil = pure Nil
+programsIn st (Cons x rest) = do
+  m <- readFile (P.join st (P.join st "app" x) "main.hf")
+  more <- programsIn st rest
+  pure (case m of
+    Just _ -> Cons x more
+    Nothing -> more)
+
+-- (each program compiled to C in `.heff/build/`, and by `zig cc` to `bin/`)
+buildEach : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> P.Style
+          -> List String
+          -> Co e Unit
+buildEach st Nil = pure MkUnit
+buildEach st (Cons x rest) =
+  cThen
+    (Just "main")
+    (P.join st (P.join st ".heff" "build") (x ++ ".c"))
+    (P.join st (P.join st "app" x) "main.hf") (do
+  r <-
+    run
+      "zig"
+      [ "cc"
+      , "-O2"
+      , P.join st (P.join st ".heff" "build") (x ++ ".c")
+      , "-o"
+      , P.join st "bin" x
+      ]
+  if ranStatus r == 0
+      then do
+        print ("wrote " ++ P.join st "bin" x)
+        buildEach st rest
+    else do
+      writeErr (ranErr r)
+      printErr ("heff build: `zig cc` could not build " ++ P.join st "bin" x)
+      exit 1)
+
+-- (the names given, else all of them)
+orAll : List String -> List String -> List String
+orAll Nil progs = progs
+orAll names progs = names
+
+-- | build the project's programs (the ones NAMEd, else all): `app/X/main.hf`
+-- | is the program X, compiled to C and by `zig cc` to `bin/X`
+buildCmd : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> List String
+         -> Co e Unit
+buildCmd names = do
+  text <- readFile "package.hf"
+  st <- styleNow
+  case text of
+    Nothing -> do
+      printErr "heff build: no package.hf here: build at the project's root"
+      exit 1
+    Just _ -> do
+      found <- readDir "app"
+      progs <- programsIn st (fromMaybe Nil found)
+      case filter (\n -> not (any (\p -> strEq p n) progs)) names of
+        Cons n _ -> do
+          printErr
+              ("heff build: no program " ++ n ++ ": no app/" ++ n ++ "/main.hf")
+          exit 1
+        Nil -> case orAll names progs of
+          Nil -> do
+            printErr "heff build: no programs: a program X is app/X/main.hf"
+            exit 1
+          _ -> do
+            ok <- mkDir "bin"
+            okC <- mkDir (P.join st ".heff" "build")
+            buildEach st (orAll names progs)
 
 -- | how `heff compile` was called: FILE, OUT, `--name`, `--backend`
 type CompileOpts =
@@ -1300,15 +1343,6 @@ publishFails why = do
   printErr ("heff publish: " ++ why)
   exit 1
 
-ranStatus : Ran -> Int
-ranStatus r = r.status
-
-ranOut : Ran -> String
-ranOut r = r.out
-
-ranErr : Ran -> String
-ranErr r = r.err
-
 -- (git, run: what is wrong if it fails)
 gitOk : {e : HFunctor}
       -> {{sys : process <: e}}
@@ -1457,7 +1491,7 @@ projectFiles name v =
        , "  }"
        , ""
        ])
-  , MkPair ".gitignore" (joinWith "\n" [".heff/", ""])
+  , MkPair ".gitignore" (joinWith "\n" [".heff/", "bin/", ""])
   , MkPair
     ("src/" ++ name ++ "/main.hf")
     (joinWith
