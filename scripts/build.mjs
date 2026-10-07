@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The compiler, bootstrapped from its seed: boot/heff.mjs (the compiler,
-// compiled by itself, kept) compiles src/heff/main.hf to a first stage,
+// compiled by itself, kept) compiles cmd/heff/main.hf to a first stage,
 // and the first stage compiles the same source to output/heff.raw.mjs --
 // made by the backend of the source, whatever the seed's was -- which,
 // minified (esbuild: white space and syntax, every name kept), is
@@ -22,14 +22,14 @@ const out = join(root, "output", "heff.mjs");
 // than the seed)
 const mtime = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
 const sources = [seed, join(root, "scripts", "build.mjs"),
-  ...["src/heff", "src/heff/fmt", "lib", "lib/std"].flatMap((d) => readdirSync(join(root, d)).filter((f) => f.endsWith(".hf") || f.endsWith(".js")).map((f) => join(root, d, f)))];
+  ...["cmd/heff", "src/heff", "src/heff/fmt", "lib", "lib/std"].flatMap((d) => readdirSync(join(root, d)).filter((f) => f.endsWith(".hf") || f.endsWith(".js")).map((f) => join(root, d, f)))];
 if (mtime(out) >= 0 && sources.every((s) => mtime(s) <= mtime(out))) {
   console.log(`heff build: ${out} is up to date`);
   process.exit(0);
 }
 
 const step = (what, compiler, to) => {
-  const r = spawnSync(process.execPath, [compiler, "compile", "src/heff/main.hf", to, "--name", "main", "--backend=node"],
+  const r = spawnSync(process.execPath, [compiler, "compile", "cmd/heff/main.hf", to, "--name", "main", "--backend=node"],
     { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
   if (r.status !== 0) { console.error(`heff build: ${what} failed`); process.exit(r.status ?? 1); }
 };
@@ -38,7 +38,7 @@ const minify = (code) => transformSync(code,
   { loader: "js", format: "esm", target: "esnext", minifyWhitespace: true, minifySyntax: true, legalComments: "none" }).code;
 
 mkdirSync(join(root, "output"), { recursive: true });
-step("the first stage (the seed compiling src/heff/main.hf)", seed, stage1);
+step("the first stage (the seed compiling cmd/heff/main.hf)", seed, stage1);
 step("the compiler (the first stage compiling itself)", stage1, raw);
 writeFileSync(out, minify(readFileSync(raw, "utf8")));
 chmodSync(out, 0o755);
