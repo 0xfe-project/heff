@@ -67,7 +67,10 @@ typedef V (*Fn)(V self, V *args);
 
 typedef struct { Obj h; int64_t n; V f[]; } Tag;
 typedef struct { Obj h; int64_t n; uint32_t *lbl; V f[]; } Rec;
-typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V env[]; } Clo;
+// (a closure: its code, how many arguments it takes, and what it holds;
+// `memo`, once a thunk -- a function of one argument -- is forced, its
+// value, or 0)
+typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V memo; V env[]; } Clo;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
 typedef struct { Obj h; int64_t len; int64_t cap; uint16_t s[]; } Str;
 typedef struct { Obj h; double d; } Flt;
@@ -238,7 +241,7 @@ static inline V heff_tag_at(V r, int id, int64_t n, V *f) {
 static V heff_clo(Fn fn, int arity, int nenv, V *env) {
   Clo *c = heff_obj_alloc(sizeof(Clo) + nenv * sizeof(V));
   c->h.rc = 1; c->h.kind = K_CLO; c->h.tag = 0;
-  c->fn = fn; c->arity = arity; c->nenv = nenv;
+  c->fn = fn; c->arity = arity; c->nenv = nenv; c->memo = 0;
   if (nenv) memcpy(c->env, env, nenv * sizeof(V));
   return (V)c;
 }
@@ -289,7 +292,7 @@ __attribute__((noinline)) static void heff_free(V v) {
     switch (o->kind) {
     case K_TAG: { Tag *t = (Tag *)w; for (int64_t i = 0; i < t->n; i++) heff_dead_push(t->f[i]); break; }
     case K_REC: { Rec *r = (Rec *)w; for (int64_t i = 0; i < r->n; i++) heff_dead_push(r->f[i]); break; }
-    case K_CLO: { Clo *c = (Clo *)w; for (int i = 0; i < c->nenv; i++) heff_dead_push(c->env[i]); break; }
+    case K_CLO: { Clo *c = (Clo *)w; for (int i = 0; i < c->nenv; i++) heff_dead_push(c->env[i]); if (c->memo) heff_dead_push(c->memo); break; }
     case K_PAP: { Pap *p = (Pap *)w; heff_dead_push(p->fun); for (int i = 0; i < p->n; i++) heff_dead_push(p->a[i]); break; }
     case K_ARR: { Arr *r = (Arr *)w; for (int64_t i = 0; i < r->n; i++) heff_dead_push(r->a[i]); break; }
     case K_BNC: { Bnc *b = (Bnc *)w; heff_dead_push(b->fun); for (int i = 0; i < b->n; i++) heff_dead_push(b->a[i]); break; }
@@ -362,6 +365,22 @@ static V heff_apply(V f, int n, V *a) {
     }
     if (o->kind != K_CLO) heff_fail("applying what is not a function");
     Clo *c = (Clo *)f;
+    // (a thunk forced: its value kept on it, so that forcing it again does
+    // not compute it again -- the language is pure, `f MkUnit` is the same
+    // value every time -- as the JavaScript backend's `$force` keeps it)
+    if (n == 1 && c->arity == 1 && a[0] == NTAG(TAG_MkUnit)) {
+      if (c->memo) {
+        V r = heff_dup(c->memo);
+        heff_drop(f);
+        return r;
+      }
+      if (heff_unique(f)) return c->fn(f, a);
+      heff_dup(f);
+      V r = heff_tr(c->fn(f, a));
+      c->memo = heff_dup(r);
+      heff_drop(f);
+      return r;
+    }
     if (n == c->arity) return c->fn(f, a);
     if (n < c->arity) {
       Pap *p = heff_obj_alloc(sizeof(Pap) + n * sizeof(V));
