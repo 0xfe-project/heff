@@ -125,7 +125,11 @@ static void *heff_alloc(size_t n) {
 // computation's continuations, its operations): those of up to
 // `SMALL_MAX` bytes come from free lists, one for each multiple of 8
 // bytes, an object given back kept for the next of its size.
+// (`-DSMALL_MAX=0`: none kept, every object given back to the system, so
+// that AddressSanitizer sees a use after its last reference)
+#ifndef SMALL_MAX
 #define SMALL_MAX 128
+#endif
 static void *heff_free_list[SMALL_MAX / 8 + 1];
 
 static inline void *heff_obj_alloc(size_t n) {
