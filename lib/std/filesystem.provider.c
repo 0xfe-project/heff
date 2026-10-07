@@ -5,6 +5,16 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+// (no links on Windows as stat sees them, and mkdir takes no mode)
+#define lstat stat
+#define S_ISLNK(m) 0
+#define heff_mkdir(p) mkdir(p)
+#define heff_is_sep(c) ((c) == '/' || (c) == '\\')
+#else
+#define heff_mkdir(p) mkdir(p, 0777)
+#define heff_is_sep(c) ((c) == '/')
+#endif
 
 // (a file's text, if it can be read)
 static V heff_read_file(const char *path) {
@@ -31,13 +41,16 @@ static int heff_write_file(const char *path, V s) {
 // (a directory and those it is in)
 static int heff_mkdir_p(char *path) {
   for (char *c = path + 1; *c; c++)
-    if (*c == '/') {
+    if (heff_is_sep(*c)) {
+      char sep = *c;
       *c = 0;
-      int ok = mkdir(path, 0777) == 0 || errno == EEXIST;
-      *c = '/';
+      // (a drive, `C:`, is there already)
+      int drive = c[-1] == ':';
+      int ok = drive || heff_mkdir(path) == 0 || errno == EEXIST;
+      *c = sep;
       if (!ok) return 0;
     }
-  return mkdir(path, 0777) == 0 || errno == EEXIST;
+  return heff_mkdir(path) == 0 || errno == EEXIST;
 }
 
 // (the names in a directory, sorted)

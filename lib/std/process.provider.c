@@ -3,20 +3,28 @@
 // `Exit` ends the program there; `Exec` runs the command in its place
 // (Node.js's first thread does that once the program has ended).
 
+#ifndef _WIN32
 #include <poll.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 // (where the program is: its executable, as the system says)
 static V heff_program_path(void) {
   char buf[4096];
-#ifdef __APPLE__
+#if defined(_WIN32)
+  DWORD n = GetModuleFileNameA(NULL, buf, sizeof buf);
+  if (n == 0 || n >= sizeof buf) return heff_str_c(heff_argv[0]);
+  return heff_str_c(buf);
+#elif defined(__APPLE__)
   uint32_t n = sizeof buf;
   if (_NSGetExecutablePath(buf, &n) != 0) return heff_str_c(heff_argv[0]);
 #else
@@ -24,8 +32,10 @@ static V heff_program_path(void) {
   if (n < 0) return heff_str_c(heff_argv[0]);
   buf[n] = 0;
 #endif
+#ifndef _WIN32
   char real[4096];
   return heff_str_c(realpath(buf, real) ? real : buf);
+#endif
 }
 
 // (a list of strings as a NULL-ended array of C strings, `first` first)
@@ -40,6 +50,72 @@ static char **heff_argv_of(const char *first, V l) {
   return as;
 }
 
+#ifdef _WIN32
+// (a command line of `as`, each quoted as the C runtime's parser reads it
+// back: malloc'd)
+static char *heff_command_line(char **as) {
+  Buf b = {0};
+  for (char **a = as; *a; a++) {
+    if (a != as) buf_put(&b, " ", 1);
+    const char *s = *a;
+    if (*s && !strpbrk(s, " \t\n\v\"")) { buf_str(&b, s); continue; }
+    buf_put(&b, "\"", 1);
+    for (;;) {
+      size_t slashes = 0;
+      while (*s == '\\') { s++; slashes++; }
+      if (!*s) {
+        for (size_t i = 0; i < slashes * 2; i++) buf_put(&b, "\\", 1);
+        break;
+      }
+      size_t k = *s == '"' ? slashes * 2 + 1 : slashes;
+      for (size_t i = 0; i < k; i++) buf_put(&b, "\\", 1);
+      buf_put(&b, s++, 1);
+    }
+    buf_put(&b, "\"", 1);
+  }
+  buf_put(&b, "", 1);
+  return b.s;
+}
+
+typedef struct { HANDLE h; Buf *b; } HeffDrain;
+
+// (all a pipe gives, until it is closed)
+static DWORD WINAPI heff_drain(LPVOID u) {
+  HeffDrain *d = u;
+  char chunk[65536];
+  DWORD got;
+  while (ReadFile(d->h, chunk, sizeof chunk, &got, NULL) && got > 0) buf_put(d->b, chunk, got);
+  return 0;
+}
+
+// (a command started, its stdin this program's, its stdout and stderr
+// `out` and `err`, or 0 if it cannot be)
+static HANDLE heff_spawn(char **as, HANDLE out, HANDLE err) {
+  char *line = heff_command_line(as);
+  STARTUPINFOA si;
+  memset(&si, 0, sizeof si);
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  si.hStdOutput = out;
+  si.hStdError = err;
+  PROCESS_INFORMATION pi;
+  int ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+  free(line);
+  if (!ok) return 0;
+  CloseHandle(pi.hThread);
+  return pi.hProcess;
+}
+
+// (a command's exit code once it has ended)
+static int64_t heff_wait(HANDLE h) {
+  DWORD code = (DWORD)-1;
+  WaitForSingleObject(h, INFINITE);
+  GetExitCodeProcess(h, &code);
+  CloseHandle(h);
+  return (int64_t)code;
+}
+#else
 // (what a command writes, both streams read together, so that neither
 // fills its pipe while the other is waited for)
 static void heff_read_both(int out, int err, Buf *bo, Buf *be) {
@@ -57,14 +133,35 @@ static void heff_read_both(int out, int err, Buf *bo, Buf *be) {
   }
 }
 
+#endif
+
 static uint32_t heff_run_shape[3] = { LBL_status, LBL_out, LBL_err };
 
 static V heff_run(V cmd, V args) {
   char *c = heff_cstr(cmd);
   char **as = heff_argv_of(c, args);
-  int po[2], pe[2];
   int64_t status = -1;
   Buf bo = {0}, be = {0};
+#ifdef _WIN32
+  SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+  HANDLE or_, ow, er, ew;
+  if (CreatePipe(&or_, &ow, &sa, 0) && CreatePipe(&er, &ew, &sa, 0)) {
+    SetHandleInformation(or_, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(er, HANDLE_FLAG_INHERIT, 0);
+    HANDLE h = heff_spawn(as, ow, ew);
+    CloseHandle(ow);
+    CloseHandle(ew);
+    HeffDrain de = { er, &be }, dout = { or_, &bo };
+    HANDLE t = CreateThread(NULL, 0, heff_drain, &de, 0, NULL);
+    heff_drain(&dout);
+    if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+    else heff_drain(&de);
+    CloseHandle(or_);
+    CloseHandle(er);
+    if (h) status = heff_wait(h);
+  }
+#else
+  int po[2], pe[2];
   if (pipe(po) == 0 && pipe(pe) == 0) {
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
@@ -83,6 +180,7 @@ static V heff_run(V cmd, V args) {
       if (waitpid(pid, &st, 0) >= 0 && WIFEXITED(st)) status = WEXITSTATUS(st);
     }
   }
+#endif
   V f[3] = {
     MK_INT(status),
     heff_str_utf8((const unsigned char *)(bo.s ? bo.s : ""), (int64_t)bo.n),
@@ -150,7 +248,14 @@ static V heff_provider_process(V p, V k) {
     char **as = heff_argv_of(c, heff_field(p, 1));
     fflush(stdout);
     fflush(stderr);
+#ifdef _WIN32
+    // (no exec on Windows: the command is run, and its exit code this
+    // program's)
+    HANDLE h = heff_spawn(as, GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
+    if (h) exit((int)heff_wait(h));
+#else
     execvp(c, as);
+#endif
     fprintf(stderr, "%s: cannot run it\n", c);
     exit(1);
   }
