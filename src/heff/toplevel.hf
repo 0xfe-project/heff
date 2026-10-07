@@ -104,33 +104,27 @@ selfAsLocal k t = (selfWalk k).el 0 t
 -- Judgments from presyntax
 --------------------------------------------------------------------------------
 
--- (in descriptive position, a term is elaborated as in nominative, its
--- result marked so)
-synN : Pm.Case -> R.Syn -> R.Syn
-synN N j = j
-synN De j =
+-- (in descriptive position, a term not passing it on is elaborated as in
+-- nominative, its result marked so: `Notation.INominal` and the others,
+-- where the presyntax says it is)
+nominalSyn : R.Syn -> R.Syn
+nominalSyn j =
   MkSyn (\e -> do
   pr <- R.runSyn j (R.withFor e ForNominative)
   case pr of
     MkPair res a -> pure (MkPair (M.isM res) a))
 
-chkN : Pm.Case -> R.Chk -> R.Chk
-chkN N j = j
-chkN De j =
+nominalChk : R.Chk -> R.Chk
+nominalChk j =
   MkChk (\e a -> do
   res <- R.runChk j (R.withFor e ForNominative) a
   pure (M.isM res))
 
-typN : Pm.Case -> R.Typ -> R.Typ
-typN N j = j
-typN De j =
+nominalTyp : R.Typ -> R.Typ
+nominalTyp j =
   MkTyp (\e -> do
   res <- R.runTyp j (R.withFor e ForNominative)
   pure (M.isTy res))
-
-typD : Pm.Case -> Pm.Span -> R.Typ -> Elab R.Typ
-typD N sp j = failP sp 4 "cannot use descriptive syntax in nominal position"
-typD De sp j = pure j
 
 -- | a term that can only be checked, never inferred (whose argument
 -- | waits, where its type is not known yet)
@@ -149,10 +143,10 @@ implicitLambda _ = False
 -- | the elaborator's functions, knotted: a term inferring, checked (the
 -- | implicit lambdas around it inserted), checked as written, a type
 type TK =
-  { infJ : Pm.Case -> Notation.Inferable -> Elab R.Syn
-  , chkJ : Pm.Case -> Notation.Checkable -> Elab R.Chk
-  , rawJ : Pm.Case -> Notation.Checkable -> Elab R.Chk
-  , typJ : Pm.Case -> Notation.TypeForm -> Elab R.Typ
+  { infJ : Notation.Inferable -> Elab R.Syn
+  , chkJ : Notation.Checkable -> Elab R.Chk
+  , rawJ : Notation.Checkable -> Elab R.Chk
+  , typJ : Notation.TypeForm -> Elab R.Typ
   }
 
 -- | a check, recovered from where it fails -- where its presyntax is not
@@ -166,7 +160,7 @@ recoveringChk m = do
 
 -- | an argument: where it does not check, an error hole
 argumentF : TK -> Notation.Checkable -> Elab R.Chk
-argumentF tk c = recoveringChk (tk.chkJ N c)
+argumentF tk c = recoveringChk (tk.chkJ c)
 
 -- | an application to `a`, from `start` (where the function is) to it
 elimF : TK
@@ -194,35 +188,34 @@ elimAll tk start s (Cons a rest) = do
 
 binderF : TK -> Notation.PiBinder Notation.TypeForm -> Elab R.Binder
 binderF tk (PiNamed x _ t) = do
-  a <- tk.typJ N t
+  a <- tk.typJ t
   pure (Named x a)
 binderF tk (PiInstance x _ sp t) = do
-  a <- tk.typJ N t
+  a <- tk.typJ t
   pure (NamedInstance sp x a)
 binderF tk (PiImplicit x _ sp t) = do
-  a <- tk.typJ N t
+  a <- tk.typJ t
   pure (NamedImplicit sp x a)
 binderF tk (PiAnon d) = do
-  a <- tk.typJ N d
+  a <- tk.typJ d
   pure (Anonymous a)
 
 fieldDeclF : TK
            -> Pm.Spanned (Notation.FieldDecl Notation.TypeForm)
            -> Elab R.FieldDeclaration
 fieldDeclF tk (At (DeclareField x _ t) _) = do
-  a <- tk.typJ N t
+  a <- tk.typJ t
   pure { name = x, typ = a }
 fieldDeclF tk (At (BadFieldDecl _) sp) =
   failP sp 1 "expected a field declaration of the form `x : A`"
 
 fieldSetF : TK
-          -> Pm.Case
           -> Pm.Spanned (Notation.FieldSet Notation.Checkable)
           -> Elab R.FieldSetting
-fieldSetF tk c (At (SetField x xsp e) _) = do
-  v <- recoveringChk (tk.chkJ c e)
+fieldSetF tk (At (SetField x xsp e) _) = do
+  v <- recoveringChk (tk.chkJ e)
   pure { name = x, chk = v, span = Pm.spanOf e, nameSpan = xsp }
-fieldSetF tk c (At (BadFieldSet _) sp) =
+fieldSetF tk (At (BadFieldSet _) sp) =
   failP sp 2 "expected a field setting of the form `x = v`"
 
 traverseEL : {a b : Type} -> (a -> Elab b) -> List a -> Elab (List b)
@@ -234,7 +227,7 @@ traverseEL f (Cons x xs) = do
 
 smallF : TK -> Notation.TypeForm -> Elab R.SmallTyp
 smallF tk t = do
-  a <- tk.typJ N t
+  a <- tk.typJ t
   pure (R.asSmall (Pm.spanOf t) a)
 
 variantF : TK
@@ -284,7 +277,7 @@ doCase tk (At (MkAlt p body) _) = do
   px <- doPat p
   case px of
     MkPair x xs -> do
-      b <- recoveringChk (tk.chkJ N body)
+      b <- recoveringChk (tk.chkJ body)
       pure (MkPair x (MkPair (A.fromList xs) b))
 
 allL : {a : Type} -> (a -> Bool) -> List a -> Bool
@@ -465,7 +458,7 @@ localEqs : TK
          -> Elab R.Chk
 localEqs tk f eqs sp = case Cl.desugar f Nil eqs sp of
   Left err -> failP err.span 10 err.msg
-  Right b -> tk.chkJ N b
+  Right b -> tk.chkJ b
 
 -- (an operator in a pattern is found where the globals are in hand)
 localBody : TK
@@ -485,82 +478,83 @@ localBody tk f eqs sp =
 -- | extension: an equation's `where`: each local definition, `f : T` by
 -- | its equations, in scope in those after it and in the equation's body
 localsJ : TK -> List Notation.Declaration -> Notation.Checkable -> Elab R.Chk
-localsJ tk Nil body = tk.chkJ N body
+localsJ tk Nil body = tk.chkJ body
 localsJ tk (d :: ds) body = case Pm.nodeOf d of
   DeclEquations name _ tyN eqs -> do
-    ty <- tk.typJ N tyN
+    ty <- tk.typJ tyN
     b <- localBody tk name eqs (Pm.spanOf d)
     rest <- localsJ tk ds body
     pure (R.localDef name ty b rest)
   _ -> unexpectedNotation (Pm.spanOf d) "local definition"
 
 -- | a term that infers its type
-infF : TK -> Pm.Case -> Notation.Inferable -> Elab R.Syn
-infF tk c n = case n of
+infF : TK -> Notation.Inferable -> Elab R.Syn
+infF tk n = case n of
   -- Variable rule
-  At (IVar x) sp -> pure (synN c (R.find sp x))
-  At (IInt i) _ -> pure (synN c (R.litInt i))
-  At (IFloat x) _ -> pure (synN c (R.litFloat x))
-  At (IString s) _ -> pure (synN c (R.litString s))
+  At (IVar x) sp -> pure (R.find sp x)
+  At (IInt i) _ -> pure (R.litInt i)
+  At (IFloat x) _ -> pure (R.litFloat x)
+  At (IString s) _ -> pure (R.litString s)
   At (IApp h args) _ -> do
-    s0 <- tk.infJ N h
+    s0 <- tk.infJ h
     s <- elimAll tk (Pm.spanOf h).start s0 args
-    pure (synN c s)
+    pure (s)
   At (IAnn n0 n1) _ -> do
-    cc <- tk.chkJ c n0
-    t <- tk.typJ N n1
+    cc <- tk.chkJ n0
+    t <- tk.typJ n1
     pure (R.annot t cc)
   At (ISpec n0 x _ v) _ -> do
-    cc <- tk.chkJ N v
-    s <- tk.infJ N n0
-    pure (synN c (R.recordSpec (Pm.spanOf n) s x cc))
+    cc <- tk.chkJ v
+    s <- tk.infJ n0
+    pure (R.recordSpec (Pm.spanOf n) s x cc)
   -- extension: `\(x : T) -> e` annotates the binder
   At (IAnnLam x _ tyN body) _ -> do
-    dom <- tk.typJ N tyN
-    b <- tk.infJ N body
-    pure (synN c (R.functionIntroSyn x dom b))
+    dom <- tk.typJ tyN
+    b <- tk.infJ body
+    pure (R.functionIntroSyn x dom b)
   At (IInvalid code why) sp -> failP sp code why
+  At (INominal i) _ -> do
+    s <- tk.infJ i
+    pure (nominalSyn s)
 
 -- | a term checked against a type, as written (no implicit lambdas
 -- | around it)
-rawF : TK -> Pm.Case -> Notation.Checkable -> Elab R.Chk
-rawF tk c n = case n of
+rawF : TK -> Notation.Checkable -> Elab R.Chk
+rawF tk n = case n of
   -- Introduction rules
   At (CLam x _ body) _ -> do
-    b <- recoveringChk (tk.chkJ c body)
+    b <- recoveringChk (tk.chkJ body)
     pure (R.functionIntro (Pm.spanOf n) x b)
   -- extension: `\(x : T) -> e` annotates the binder
   At (CAnnLam x _ tyN body) _ -> do
-    dom <- tk.typJ N tyN
-    b <- tk.chkJ N body
-    pure (chkN c (R.functionIntroAnn (Pm.spanOf n) x dom b))
+    dom <- tk.typJ tyN
+    b <- tk.chkJ body
+    pure (R.functionIntroAnn (Pm.spanOf n) x dom b)
   -- extension: `{x} => e` names an implicit argument
   At (CImplicitLam x _ body) _ -> do
-    b <- recoveringChk (tk.chkJ c body)
+    b <- recoveringChk (tk.chkJ body)
     pure (R.functionIntroImplicit (Pm.spanOf n) x b)
   At (CTag x tsp args) _ -> do
     as <- traverseEL (\m -> argumentF tk m) args
-    pure (chkN c (R.sumIntro (Pm.spanOf n) tsp x as))
+    pure (R.sumIntro (Pm.spanOf n) tsp x as)
   At (CStruct fields) sp -> do
-    fieldSettings <- traverseEL (\m -> fieldSetF tk c m) fields
+    fieldSettings <- traverseEL (\m -> fieldSetF tk m) fields
     pure (R.recordIntro sp fieldSettings)
   At (CMatch scrutN casesN) sp ->
     -- (an operator in a pattern is found where the globals are in hand)
     if not (allL (\m -> not (altHasOp m)) casesN)
       then pure
-          (chkN
-             c
-             (MkChk (\e a -> do
-              casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
-              j <- tk.chkJ N (At (CMatch scrutN casesN') sp)
-              R.runChk j e a)))
+          (MkChk (\e a -> do
+           casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
+           j <- tk.chkJ (At (CMatch scrutN casesN') sp)
+           R.runChk j e a))
     -- (a scrutinee `(e : T)`, `e` a tag or a record, is `e` in the core,
     -- which does not say its type there: it is bound to a name, below)
     else if allL flatCaseAlt casesN && not (annotatesData scrutN)
       then do
-        scrut <- tk.infJ N scrutN
+        scrut <- tk.infJ scrutN
         cases <- traverseEL (\m -> doCase tk m) casesN
-        pure (chkN c (R.sumElim sp scrut (tagSpans casesN) (D.fromList cases)))
+        pure (R.sumElim sp scrut (tagSpans casesN) (D.fromList cases))
     -- extension: nested patterns and literals, compiled into the flat
     -- matches above, on a name for the scrutinee, bound once
     else do
@@ -568,76 +562,81 @@ rawF tk c n = case n of
       case Cl.caseTree sp casesN of
         Left err -> failP err.span 3 err.msg
         Right r -> do
-          scrut <- tk.infJ N scrutN
-          body <- tk.chkJ N r.tree
-          pure (chkN c (R.caseLet r.scrutinee scrut body))
+          scrut <- tk.infJ scrutN
+          body <- tk.chkJ r.tree
+          pure (R.caseLet r.scrutinee scrut body)
   -- extension: `let x = e in e'`, `e` inferring (`let x : T = e` if it
   -- does not), bound once by a beta-redex; `let p = e in e'`, a `case` of
   -- one alternative, which must match every value
   At (CLetIn rhsN alt0) sp -> case alt0 of
     At (MkAlt (At (PatVar x) _) bodyN) _ -> do
-      rhs <- tk.infJ N rhsN
-      body <- recoveringChk (tk.chkJ N bodyN)
-      pure (chkN c (R.caseLet x rhs body))
-    _ -> tk.rawJ c (At (CMatch rhsN (Cons alt0 Nil)) sp)
+      rhs <- tk.infJ rhsN
+      body <- recoveringChk (tk.chkJ bodyN)
+      pure (R.caseLet x rhs body)
+    _ -> tk.rawJ (At (CMatch rhsN (Cons alt0 Nil)) sp)
   -- extension: an equation's body and its local definitions (`where`)
   At (CLocal bodyN defs) sp -> do
-    j <- localsJ tk defs bodyN
-    pure (chkN c j)
-  At CAbandon sp -> pure (chkN c (R.abandonChk sp))
-  _ -> tk.chkJ c n
+    localsJ tk defs bodyN
+  At CAbandon sp -> pure (R.abandonChk sp)
+  At (CNominal c) _ -> do
+    j <- tk.rawJ c
+    pure (nominalChk j)
+  _ -> tk.chkJ n
 
 chkHeadOf : Notation.Inferable -> R.Syn -> R.Chk
-chkHeadOf n j = case (Notation.infSpineOf n).head of
+chkHeadOf n j = case (Notation.infSpineOf (Notation.unNominal n)).head of
   At (IVar x) _ -> R.autoRec (Pm.spanOf n) x (R.apply (Pm.spanOf n) j)
   _ -> R.apply (Pm.spanOf n) j
 
 -- | a term checked against a type, the implicit lambdas around it
 -- | inserted (`{x} => e` binds the implicit argument itself)
-chkF : TK -> Pm.Case -> Notation.Checkable -> Elab R.Chk
-chkF tk c n = case n of
+chkF : TK -> Notation.Checkable -> Elab R.Chk
+chkF tk n = case n of
   At (CInf i) _ -> do
-    s <- tk.infJ c i
+    s <- tk.infJ i
     pure (R.implicitLams (chkHeadOf i s))
   At (CType t) sp -> do
-    a <- tk.typJ c t
+    a <- tk.typJ t
     pure (R.universeIntro sp a)
   _ -> do
-    j <- tk.rawJ c n
+    j <- tk.rawJ n
     pure (if implicitLambda n then j else R.implicitLams j)
 
-typF : TK -> Pm.Case -> Notation.TypeForm -> Elab R.Typ
-typF tk c n = case n of
+typF : TK -> Notation.TypeForm -> Elab R.Typ
+typF tk n = case n of
   At (TPi b codN) _ -> do
     dom <- binderF tk b
-    cod <- tk.typJ N codN
-    pure (typN c (R.functionFormation dom cod))
+    cod <- tk.typJ codN
+    pure (R.functionFormation dom cod)
   At (TSig fields) sp -> do
     fieldDecls <- traverseEL (\m -> fieldDeclF tk m) fields
-    typD c sp (R.recordFormation fieldDecls)
+    pure (R.recordFormation fieldDecls)
   At (TSum variantNs) sp -> do
     variants <- traverseEL (\m -> variantF tk m) variantNs
-    typD c sp (R.sumFormation (D.fromList variants))
-  At TType _ -> pure (typN c (R.universeFormation SmallU))
-  At TInt _ -> pure (typN c R.primInt)
-  At TFloat _ -> pure (typN c R.primFloat)
-  At TString _ -> pure (typN c R.primString)
+    pure (R.sumFormation (D.fromList variants))
+  At TType _ -> pure (R.universeFormation SmallU)
+  At TInt _ -> pure (R.primInt)
+  At TFloat _ -> pure (R.primFloat)
+  At TString _ -> pure (R.primString)
   At (TArray a0) _ -> do
-    a <- tk.typJ N a0
-    pure (typN c (R.primArray a))
+    a <- tk.typJ a0
+    pure (R.primArray a)
   At (TInf i) sp -> do
-    s <- tk.infJ c i
+    s <- tk.infJ i
     pure (R.universeElimSyn sp s)
   At (TChk ch) _ -> do
-    j <- tk.rawJ c ch
+    j <- tk.rawJ ch
     pure (R.universeElim LargeU j)
+  At (TNominal t) _ -> do
+    a <- tk.typJ t
+    pure (nominalTyp a)
 
 tk : TK
 tk =
-  { infJ = \c n -> infF tk c n
-  , chkJ = \c n -> chkF tk c n
-  , rawJ = \c n -> rawF tk c n
-  , typJ = \c n -> typF tk c n
+  { infJ = \n -> infF tk n
+  , chkJ = \n -> chkF tk n
+  , rawJ = \n -> rawF tk n
+  , typJ = \n -> typF tk n
   }
 
 -- Declarations
@@ -652,10 +651,10 @@ mkArgBinding span name typ implicit =
 
 argBinding : Pm.Spanned (Notation.Param Notation.TypeForm) -> Elab ArgBinding
 argBinding (At (ExplicitParam x _ t) sp) = do
-  a <- tk.typJ N t
+  a <- tk.typJ (Notation.markType N t)
   pure (mkArgBinding sp x a Expl)
 argBinding (At (ImplicitParam x _ t) sp) = do
-  a <- tk.typJ N t
+  a <- tk.typJ (Notation.markType N t)
   pure (mkArgBinding sp x a Impl)
 
 withOne : ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
@@ -692,7 +691,7 @@ theoryD : String
         -> Elab DeclJ
 theoryD name params bodyN = do
   args <- traverseEL (\m -> argBinding m) params
-  body <- tk.chkJ De bodyN
+  body <- tk.chkJ (Notation.markTerm De bodyN)
   declOfParts
       name
       (withArgs args (MkPair (MkTyp (\e -> pure (M.univ LargeU))) body))
@@ -713,8 +712,8 @@ defineD : String
         -> Elab DeclJ
 defineD name params tyN bodyN = do
   args <- traverseEL (\m -> argBinding m) params
-  returnTyp <- tk.typJ N tyN
-  body <- tk.chkJ De bodyN
+  returnTyp <- tk.typJ (Notation.markType N tyN)
+  body <- tk.chkJ (Notation.markTerm De bodyN)
   declOfParts name (withArgs args (MkPair returnTyp body)) False
 
 equationsBody : String
@@ -726,7 +725,8 @@ equationsBody name args eqs sp = do
   bodyN <- case Cl.desugar name (explicitNames args) eqs sp of
     Left err -> failP err.span 10 err.msg
     Right b -> pure b
-  tk.chkJ De bodyN
+  -- (in descriptive position as the clause compiler made it)
+  tk.chkJ (Notation.markTerm De bodyN)
 
 -- | a definition by equations, `f : T` and `f p ... = e`; `sp`, from the
 -- | type to the last equation
@@ -744,7 +744,7 @@ equationsD name tyN eqs sp = do
            j <- equationsBody name Nil eqs' sp
            R.runChk j e a))
     else equationsBody name Nil eqs sp
-  returnTyp <- tk.typJ N tyN
+  returnTyp <- tk.typJ (Notation.markType N tyN)
   declOfParts name (withArgs Nil (MkPair returnTyp body)) False
 
 declJ : Notation.Declaration -> Elab DeclJ
@@ -759,7 +759,7 @@ declJ d = case Pm.nodeOf d of
       { start = (Pm.spanOf tyN).start, end = (Pm.spanOf d).end }
   -- extension: `primitive name : T`, implemented by the runtime
   DeclPrimitive x _ tyN -> do
-    ty <- tk.typJ N tyN
+    ty <- tk.typJ (Notation.markType N tyN)
     pure
         (mkDeclJ
            x
@@ -1111,7 +1111,7 @@ elabDecl key g n = do
   elabBody key g n d a
 
 watchSyn : Notation.Checkable -> Elab R.Syn
-watchSyn (At (CInf i) _) = tk.infJ N i
+watchSyn (At (CInf i) _) = tk.infJ i
 watchSyn w =
   failP
     (Pm.spanOf w)
@@ -1143,7 +1143,7 @@ watchPhase g sp (MkPair t ty) = do
 -- | entry kept aside (never among the globals)
 elabWatch : G.Globals -> Notation.Checkable -> Elab G.Entry
 elabWatch g n = do
-  s <- watchSyn n
+  s <- watchSyn (Notation.markTerm N n)
   pr <- R.runSyn s (emptyElabEnv g)
   watchPhase g (Pm.spanOf n) pr
 
