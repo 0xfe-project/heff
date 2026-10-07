@@ -1,0 +1,248 @@
+-- What differs between two sequences: Myers' algorithm, the fewest
+-- removals and additions that make the one the other (where two are as
+-- few, a removal comes before an addition); and between two texts, word
+-- by word or line by line, each run of what is alike, removed or added
+-- one piece.
+
+import array as A
+import map as M
+import prelude
+
+-- | a piece of the first sequence kept, removed, or one of the second
+-- | added
+data Edit a = Same a | Removed a | Added a
+
+-- | how far a path has gone along the first sequence, and its edits, the
+-- | last first
+type Path a = { x : Int, edits : List (Edit a) }
+
+mkPath : {a : Type} -> Int -> List (Edit a) -> Path a
+mkPath x edits = { x = x, edits = edits }
+
+editsOf : {a : Type} -> Path a -> List (Edit a)
+editsOf p = p.edits
+
+-- | from `x` in `xs` and `y` in `ys`, as far as they are alike
+snake : {a : Type}
+      -> (a -> a -> Bool)
+      -> Array a
+      -> Array a
+      -> Int
+      -> Int
+      -> List (Edit a)
+      -> Path a
+snake eq xs ys x y acc =
+  if x < A.length xs && y < A.length ys && eq (A.index xs x) (A.index ys y)
+    then snake eq xs ys (x + 1) (y + 1) (Cons (Same (A.index xs x)) acc)
+  else mkPath x acc
+
+-- | the furthest path on diagonal `k` (`x - y = k`), if there is one
+type Paths a = M.Map Int (Path a)
+
+pathX : {a : Type} -> Maybe (Path a) -> Int
+pathX (Just p) = p.x
+pathX Nothing = -1
+
+-- | a path one edit longer, onto diagonal `k`: an addition from the
+-- | diagonal above, or a removal from the one below
+stepOnto : {a : Type}
+         -> (a -> a -> Bool)
+         -> Array a
+         -> Array a
+         -> Int
+         -> Paths a
+         -> Maybe (Path a)
+stepOnto eq xs ys k v =
+  let above = M.lookup compareInt (k + 1) v
+  in let below = M.lookup compareInt (k - 1) v
+  in let canAdd : Bool = case above of
+    Just p -> p.x - (k + 1) < A.length ys
+    Nothing -> False
+  in let canRemove : Bool = case below of
+    Just p -> p.x < A.length xs
+    Nothing -> False
+  in if not canAdd && not canRemove then Nothing
+  else if not canRemove || (canAdd && pathX below < pathX above)
+    then case above of
+      Just p ->
+        Just
+          (snake
+             eq
+             xs
+             ys
+             p.x
+             (p.x - k)
+             (Cons (Added (A.index ys (p.x - (k + 1)))) (editsOf p)))
+      Nothing -> Nothing
+  else case below of
+    Just p ->
+      Just
+        (snake
+           eq
+           xs
+           ys
+           (p.x + 1)
+           (p.x + 1 - k)
+           (Cons (Removed (A.index xs p.x)) (editsOf p)))
+    Nothing -> Nothing
+
+-- | a path that has gone through both sequences
+finished : {a : Type} -> Array a -> Array a -> Int -> Path a -> Bool
+finished xs ys k p = p.x >= A.length xs && p.x - k >= A.length ys
+
+-- | the diagonals `k`, `k + 2`, ..., `d` of edit length `d`: the edits,
+-- | once a path is through, else the paths of this length
+diagonals : {a : Type}
+          -> (a -> a -> Bool)
+          -> Array a
+          -> Array a
+          -> Int
+          -> Int
+          -> Paths a
+          -> Paths a
+          -> Either (List (Edit a)) (Paths a)
+diagonals eq xs ys d k v acc =
+  if k > d then Right acc
+  else case stepOnto eq xs ys k v of
+    Just p ->
+      if finished xs ys k p then Left (editsOf p)
+      else diagonals eq xs ys d (k + 2) v (M.insert compareInt k p acc)
+    Nothing -> diagonals eq xs ys d (k + 2) v acc
+
+-- | edit lengths `d`, `d + 1`, ...
+rounds : {a : Type}
+       -> (a -> a -> Bool)
+       -> Array a
+       -> Array a
+       -> Int
+       -> Paths a
+       -> List (Edit a)
+rounds eq xs ys d v = case diagonals eq xs ys d (0 - d) v M.empty of
+  Left edits -> reverse edits
+  Right v' -> rounds eq xs ys (d + 1) v'
+
+-- | what differs between `as` and `bs`, the things compared by `eq`
+diffBy : {a : Type} -> (a -> a -> Bool) -> List a -> List a -> List (Edit a)
+diffBy eq as bs =
+  let xs = A.fromList as
+  in let ys = A.fromList bs
+  in let start = snake eq xs ys 0 0 Nil
+  in if finished xs ys 0 start then reverse (editsOf start)
+  else rounds eq xs ys 1 (M.singleton 0 start)
+
+-- >>> diffBy intEq [1, 2, 3] [1, 3, 4]
+-- [Same 1, Removed 2, Same 3, Added 4]
+
+-- >>> diffBy intEq [] [1]
+-- [Added 1]
+
+-- Texts
+--------------------------------------------------------------------------------
+
+-- | a letter, a digit, `_`, or a letter with a mark (as jsdiff has them)
+isWordCode : Int -> Bool
+isWordCode c =
+  (97 <= c && c <= 122)
+  || (65 <= c && c <= 90)
+  || (48 <= c && c <= 57)
+  || c == 95
+  || c == 173
+  || (192 <= c && c <= 214)
+  || (216 <= c && c <= 246)
+  || (248 <= c && c <= 710)
+  || (712 <= c && c <= 727)
+  || (734 <= c && c <= 767)
+  || (7680 <= c && c <= 7935)
+
+-- | white space, not a line's end
+isBlankCode : Int -> Bool
+isBlankCode c =
+  c == 32
+  || c == 9
+  || c == 11
+  || c == 12
+  || c == 160
+  || c == 5760
+  || (8192 <= c && c <= 8202)
+  || c == 8232
+  || c == 8233
+  || c == 8239
+  || c == 8287
+  || c == 12288
+  || c == 65279
+
+-- | where a run of the codes `p` holds for ends, from `i`
+runEnd : (Int -> Bool) -> String -> Int -> Int
+runEnd p s i =
+  if i < strLength s && p (charCode s i) then runEnd p s (i + 1) else i
+
+-- | where the token at `i` ends: a line's end, a word, a run of white
+-- | space, or any other character alone
+tokenEnd : String -> Int -> Int
+tokenEnd s i =
+  if charCode s i == 10 then i + 1
+  else if charCode s i == 13 && i + 1 < strLength s && charCode s (i + 1) == 10
+    then i + 2
+  else if isWordCode (charCode s i) then runEnd isWordCode s i
+  else if isBlankCode (charCode s i) then runEnd isBlankCode s i
+  else i + 1
+
+wordsFrom : String -> Int -> List String -> List String
+wordsFrom s i acc =
+  if i >= strLength s then reverse acc
+  else wordsFrom s (tokenEnd s i) (Cons (strSlice s i (tokenEnd s i)) acc)
+
+-- | a text as words, the white space between them, line ends and other
+-- | characters, each a token
+words : String -> List String
+words s = wordsFrom s 0 Nil
+
+-- >>> words "a  bc,d\n"
+-- ["a", "  ", "bc", ",", "d", "\n"]
+
+lineEnd : String -> Int -> Int
+lineEnd s i =
+  if i >= strLength s then i
+  else if charCode s i == 10 then i + 1
+  else lineEnd s (i + 1)
+
+linesFrom : String -> Int -> List String -> List String
+linesFrom s i acc =
+  if i >= strLength s then reverse acc
+  else linesFrom s (lineEnd s i) (Cons (strSlice s i (lineEnd s i)) acc)
+
+-- | a text as lines, each with its line end
+lines : String -> List String
+lines s = linesFrom s 0 Nil
+
+-- >>> lines "a\nb"
+-- ["a\n", "b"]
+
+-- | one edit of what two are of the same kind, their texts joined
+joinEdit : Edit String -> Edit String -> Maybe (Edit String)
+joinEdit (Same a) (Same b) = Just (Same (a ++ b))
+joinEdit (Removed a) (Removed b) = Just (Removed (a ++ b))
+joinEdit (Added a) (Added b) = Just (Added (a ++ b))
+joinEdit _ _ = Nothing
+
+joinRunsGo : Edit String -> List (Edit String) -> List (Edit String)
+joinRunsGo e Nil = Cons e Nil
+joinRunsGo e (Cons f rest) = case joinEdit e f of
+  Just g -> joinRunsGo g rest
+  Nothing -> Cons e (joinRunsGo f rest)
+
+-- | each run of edits of a kind, one edit
+joinRuns : List (Edit String) -> List (Edit String)
+joinRuns Nil = Nil
+joinRuns (Cons e rest) = joinRunsGo e rest
+
+-- | what differs between two texts, word by word
+diffWords : String -> String -> List (Edit String)
+diffWords a b = joinRuns (diffBy strEq (words a) (words b))
+
+-- >>> diffWords "on click" "onn click"
+-- [Removed "on", Added "onn", Same " click"]
+
+-- | what differs between two texts, line by line
+diffLines : String -> String -> List (Edit String)
+diffLines a b = joinRuns (diffBy strEq (lines a) (lines b))
