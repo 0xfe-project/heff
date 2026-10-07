@@ -1,0 +1,560 @@
+-- Tests: unit tests, properties and models, run by `heff test`.
+--
+-- A test is a top-level definition of type `Test`: `heff test FILE`
+-- runs each one of the file's own, after its watches.  It is found by
+-- its type, not by its name; a watch stays an example in a definition's
+-- documentation, a test is what is checked of it, and both are counted
+-- by the same runner.
+--
+--   import check
+--   import co
+--   import gen as G
+--   import prelude
+--
+--   arithmetic : Test
+--   arithmetic = group "arithmetic"
+--     [ unit "one and one" (equal showInt (1 + 1) 2)
+--     , property "reversed twice" (do
+--         xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))
+--         label (if null xs then "empty" else "not empty")
+--         equal (showList showInt) (reverse (reverse xs)) xs)
+--     ]
+--
+-- A test is a computation with effects (lib/co.hf), and its type says
+-- which: a unit test only checks (`check`), a property also draws random
+-- values (`random`).  Neither can do anything else.  The runner handles
+-- both, and gives the randomness from a seed, so that a run is replayed
+-- by its seed.  It handles them in a generator's monad (lib/gen.hf), so
+-- a property is itself a generator, of runs: a run that fails shrinks
+-- as all of its draws do, each made again from the shrinks of those
+-- before it, with no shrinking written for it.
+--
+-- There are no type classes: what a value is shown as, for a
+-- counterexample or for what differs, is said by a function given, as
+-- lib/map.hf is given the keys' order, and a generator is given by
+-- hand.  Two values are equal for `equal` when they are shown the same,
+-- as a watch holds when its value is shown as its expectation is.
+--
+-- A model-based test (`agree`) runs a program of commands on a system
+-- and on a model of it, and holds when they observe the same after each
+-- command; a property draws the programs, which shrink to a short one
+-- that tells the two apart (test/check/map.hf, lib/map.hf against a
+-- list).
+
+import co
+import gen as G
+import map as M
+import prelude
+
+-- Effects
+--------------------------------------------------------------------------------
+
+-- | Randomness: a value drawn from a generator.
+data RandomF (m : Type -> Type) x = Draw (G.Gen x)
+
+-- | Randomness as an effect: what a property is given, and a unit test
+-- | is not.
+random : HFunctor
+random =
+  { f = RandomF
+  , hfmap = \fm g p -> case p of
+      Draw d -> Draw (G.map g d)
+  , hmap = \nt p -> case p of
+      Draw d -> Draw d
+  }
+
+-- | Why a test failed: said in words, or two values (shown) that are not
+-- | the same, what was expected first.
+data Failure = Because String | Differ String String
+
+-- | Checking: a failure, a run given up on (its assumptions do not hold),
+-- | a label of the run (counted over the runs), and a note (shown if the
+-- | run fails; made only then).
+data CheckF (m : Type -> Type) x
+  = Fail Failure
+  | Discard
+  | Label String x
+  | Note (Unit -> String) x
+
+-- | Checking as an effect.
+check : HFunctor
+check =
+  { f = CheckF
+  , hfmap = \fm g p -> case p of
+      Fail f -> Fail f
+      Discard -> Discard
+      Label l x -> Label l (g x)
+      Note s x -> Note s (g x)
+  , hmap = \nt p -> case p of
+      Fail f -> Fail f
+      Discard -> Discard
+      Label l x -> Label l x
+      Note s x -> Note s x
+  }
+
+-- | The effects a test is run in.
+world : HFunctor
+world = random <+> check
+
+-- Checking
+--------------------------------------------------------------------------------
+
+-- | A value of `g`, shown by `shw` if the run fails.
+forAll : {a : Type}
+       -> {e : HFunctor}
+       -> {{rnd : random <: e}}
+       -> {{chk : check <: e}}
+       -> (a -> String)
+       -> G.Gen a
+       -> Co e a
+forAll shw g = do
+  x <- op (rnd (Draw g)) val
+  op (chk (Note (\u -> shw x) (MkUnit : Unit))) val
+  pure x
+
+-- | The test fails, for this reason.
+failure : {a : Type}
+        -> {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> String
+        -> Co e a
+failure why = op (chk (Fail (Because why))) val
+
+-- | The test fails unless `b` holds; `what` says what should have.
+assert : {e : HFunctor} -> {{chk : check <: e}} -> String -> Bool -> Co e Unit
+assert what b = if b then pure MkUnit else failure what
+
+-- | The test fails unless what was got (first) and what was expected are
+-- | the same when shown (`shw`); then it says what differs.
+equal : {a : Type}
+      -> {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> (a -> String)
+      -> a
+      -> a
+      -> Co e Unit
+equal shw got expected =
+  if strEq (shw got) (shw expected) then pure MkUnit
+  else op (chk (Fail (Differ (shw expected) (shw got)))) val
+
+-- | The run is given up on unless `b` holds: a property's assumption.
+-- | Runs given up on are not counted as runs, and too many fail it.
+assume : {e : HFunctor} -> {{chk : check <: e}} -> Bool -> Co e Unit
+assume b = if b then pure MkUnit else op (chk Discard) val
+
+-- | The run is counted under `l`: the runner says what part of the runs
+-- | each label had, so that a property that held only of trivial values
+-- | shows.
+label : {e : HFunctor} -> {{chk : check <: e}} -> String -> Co e Unit
+label l = op (chk (Label l MkUnit)) val
+
+-- | Shown with the counterexample, if the run fails.
+note : {e : HFunctor} -> {{chk : check <: e}} -> String -> Co e Unit
+note s = op (chk (Note (\u -> s) MkUnit)) val
+
+-- Showing values
+--------------------------------------------------------------------------------
+
+showBool : Bool -> String
+showBool True = "True"
+showBool False = "False"
+
+-- (a string, quoted as a string literal is written)
+escapeAt : String -> Int -> String
+escapeAt s i =
+  if charCode s i == 34 then "\\\""
+  else if charCode s i == 92 then "\\\\"
+  else if charCode s i == 10 then "\\n"
+  else strSlice s i (i + 1)
+
+showString : String -> String
+showString s =
+  "\""
+  ++ joinWith "" (map (\i -> escapeAt s i) (range 0 (strLength s - 1)))
+  ++ "\""
+
+showList : {a : Type} -> (a -> String) -> List a -> String
+showList shw xs = "[" ++ joinWith ", " (map shw xs) ++ "]"
+
+showMaybe : {a : Type} -> (a -> String) -> Maybe a -> String
+showMaybe shw Nothing = "Nothing"
+showMaybe shw (Just x) = "Just (" ++ shw x ++ ")"
+
+showPair : {a b : Type} -> (a -> String) -> (b -> String) -> Pair a b -> String
+showPair sa sb (MkPair x y) = "MkPair (" ++ sa x ++ ") (" ++ sb y ++ ")"
+
+-- Running
+--------------------------------------------------------------------------------
+
+-- | What a run has said so far, backwards: its notes and labels.
+type Trace = { notes : List (Unit -> String), labels : List String }
+
+noTrace : Trace
+noTrace = { notes = Nil, labels = Nil }
+
+-- (one trace, then another)
+andThen : Trace -> Trace -> Trace
+andThen a b =
+  { notes = concatList b.notes a.notes, labels = concatList b.labels a.labels }
+
+-- | A run of a test, so far: going on, failed, or given up on.
+data Run a = Going Trace a | Failed Trace Failure | Discarded
+
+-- (the rest of a run, after a run of `t`)
+after : {a : Type} -> Trace -> Run a -> Run a
+after t (Going t2 x) = Going (andThen t t2) x
+after t (Failed t2 f) = Failed (andThen t t2) f
+after t Discarded = Discarded
+
+-- (a run, then what comes of its value)
+continue : {a b : Type} -> (a -> G.Gen (Run b)) -> Run a -> G.Gen (Run b)
+continue k (Going t x) = G.map (\r -> after t r) (k x)
+continue k (Failed t f) = G.constant (Failed t f)
+continue k Discarded = G.constant Discarded
+
+drawAlg : {m : Type -> Type} -> {a : Type} -> RandomF m a -> G.Gen (Run a)
+drawAlg (Draw g) = G.map (\x -> Going noTrace x) g
+
+checkAlg : {m : Type -> Type} -> {a : Type} -> CheckF m a -> G.Gen (Run a)
+checkAlg (Fail f) = G.constant (Failed noTrace f)
+checkAlg Discard = G.constant Discarded
+checkAlg (Label l x) = G.constant (Going { notes = Nil, labels = [l] } x)
+checkAlg (Note s x) = G.constant (Going { notes = [s], labels = Nil } x)
+
+-- | The runner's handler: a test is a generator of runs, so a draw is a
+-- | generator's value, and a run's draws shrink together (lib/gen.hf).
+runner : Handler world
+runner =
+  { M = \a -> G.Gen (Run a)
+  , ret = \x -> G.constant (Going noTrace x)
+  , bind = \m k -> G.bind m (\r -> continue k r)
+  , malg = \p -> case p of
+      InL d -> drawAlg d
+      InR c -> checkAlg c
+  }
+
+-- Tests
+--------------------------------------------------------------------------------
+
+-- | How a property is run: how many runs, how many may be given up on,
+-- | and how many shrinks are tried at most.
+type Config = { runs : Int, discards : Int, shrinks : Int }
+
+defaults : Config
+defaults = { runs = 100, discards = 1000, shrinks = 1000 }
+
+-- | A test: a unit test, a property, or tests under a name.  (Each is
+-- | kept in the runner's world, its effects given.)
+data Test
+  = UnitTest String (Co world Unit)
+  | PropTest String Config (Co world Unit)
+  | Group String (List Test)
+
+-- | A unit test: it only checks.
+unit : String -> ({e : HFunctor} -> {{chk : check <: e}} -> Co e Unit) -> Test
+unit name body = UnitTest name (body (chk := inr random check))
+
+-- | A property: it draws random values and checks them, run 100 times
+-- | (`runs` says otherwise).
+property : String
+         -> ({e : HFunctor}
+             -> {{rnd : random <: e}}
+             -> {{chk : check <: e}}
+             -> Co e Unit)
+         -> Test
+property name body =
+  PropTest
+    name
+    defaults
+    (body (rnd := inl random check) (chk := inr random check))
+
+-- | Tests under a name.
+group : String -> List Test -> Test
+group name ts = Group name ts
+
+-- | The property run `n` times (each property of the group).
+runs : Int -> Test -> Test
+runs n (UnitTest name c) = UnitTest name c
+runs n (PropTest name cfg c) =
+  PropTest name { runs = n, discards = cfg.discards, shrinks = cfg.shrinks } c
+runs n (Group name ts) = Group name (map (\t -> runs n t) ts)
+
+-- Models
+--------------------------------------------------------------------------------
+
+-- | A system and a model of it, each run a command at a time, each
+-- | saying what it observes of the command: they agree when they observe
+-- | the same.  `valid` is what the system must always be.
+type Machine c s m o =
+  { system : s
+  , model : m
+  , step : c -> s -> Pair s o
+  , stepModel : c -> m -> Pair m o
+  , valid : s -> Bool
+  }
+
+-- (the commands from the `i`th, run on both)
+agreeFrom : {c s m o : Type}
+          -> {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> (c -> String)
+          -> (o -> String)
+          -> Machine c s m o
+          -> Int
+          -> s
+          -> m
+          -> List c
+          -> Co e Unit
+agreeFrom showC showO mc i s md Nil = pure MkUnit
+agreeFrom showC showO mc i s md (Cons cmd rest) = case mc.step cmd s of
+  MkPair s2 o -> case mc.stepModel cmd md of
+    MkPair md2 mo ->
+      if strEq (showO o) (showO mo) && mc.valid s2
+        then agreeFrom showC showO mc (i + 1) s2 md2 rest
+      else do
+        note ("at command " ++ showInt i ++ ", " ++ showC cmd)
+        assert "the system is valid" (mc.valid s2)
+        equal showO o mo
+
+-- | The commands run on the system and on the model, in order: after
+-- | each, both observe the same, and the system is valid.  (Drawn by a
+-- | property, the commands shrink to a short program that tells them
+-- | apart.)
+agree : {c s m o : Type}
+      -> {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> (c -> String)
+      -> (o -> String)
+      -> Machine c s m o
+      -> List c
+      -> Co e Unit
+agree showC showO mc cmds = agreeFrom showC showO mc 0 mc.system mc.model cmds
+
+-- Outcomes
+--------------------------------------------------------------------------------
+
+-- | What came of a test: its name (under its groups'), whether it held,
+-- | how many runs held and how many were given up on, how many shrinks
+-- | made the counterexample, how many runs had each label, the
+-- | counterexample's notes (what was drawn, in order), why it failed,
+-- | and the seed it was run from.
+type Outcome =
+  { name : String
+  , ok : Bool
+  , property : Bool
+  , runs : Int
+  , discarded : Int
+  , shrinks : Int
+  , labels : List (Pair String Int)
+  , notes : List String
+  , failure : Maybe Failure
+  , seed : Int
+  }
+
+-- (a number from a name, so that each test has a seed of its own, which
+-- adding another test does not change)
+hashName : String -> Int
+hashName s =
+  foldl
+    (\h i -> (h * 31 + charCode s i) % G.modulus)
+    7
+    (range 0 (strLength s - 1))
+
+-- (each label of a run once)
+nubLabels : List String -> List String
+nubLabels Nil = Nil
+nubLabels (Cons l rest) =
+  Cons l (nubLabels (filter (\x -> not (strEq x l)) rest))
+
+countLabels : M.Map String Int -> List String -> M.Map String Int
+countLabels m ls =
+  foldl
+    (\acc l ->
+       M.insert
+         compareString
+         l
+         (1 + fromMaybe 0 (M.lookup compareString l acc))
+         acc)
+    m
+    (nubLabels ls)
+
+type Tally = { runs : Int, discarded : Int, labels : M.Map String Int }
+
+passed : String -> Bool -> Int -> Tally -> Outcome
+passed name prop seed t =
+  { name = name
+  , ok = True
+  , property = prop
+  , runs = t.runs
+  , discarded = t.discarded
+  , shrinks = 0
+  , labels = M.toList t.labels
+  , notes = Nil
+  , failure = Nothing
+  , seed = seed
+  }
+
+failedWith : String
+           -> Bool
+           -> Int
+           -> Tally
+           -> Int
+           -> Trace
+           -> Failure
+           -> Outcome
+failedWith name prop seed t n tr f =
+  { name = name
+  , ok = False
+  , property = prop
+  , runs = t.runs
+  , discarded = t.discarded
+  , shrinks = n
+  , labels = M.toList t.labels
+  , notes = reverse (map (\(s : Unit -> String) -> s MkUnit) tr.notes)
+  , failure = Just f
+  , seed = seed
+  }
+
+isFailed : {a : Type} -> Run a -> Bool
+isFailed (Failed _ _) = True
+isFailed _ = False
+
+-- (the first of these shrinks that fails too)
+firstFailing : List (Unit -> G.Tree (Run Unit)) -> Maybe (G.Tree (Run Unit))
+firstFailing Nil = Nothing
+firstFailing (Cons c rest) = keepIfFailed (c MkUnit) (firstFailing rest)
+  where
+    keepIfFailed : G.Tree (Run Unit)
+                 -> Maybe (G.Tree (Run Unit))
+                 -> Maybe (G.Tree (Run Unit))
+    keepIfFailed t later = if isFailed (G.root t) then Just t else later
+
+type Shrunk = { tree : G.Tree (Run Unit), shrinks : Int }
+
+-- | A failing run made smaller: its first shrink that fails too, then
+-- | that one's, as long as there is one (and `limit` is not reached).
+shrink : Int -> Int -> G.Tree (Run Unit) -> Shrunk
+shrink limit n t =
+  if n >= limit then { tree = t, shrinks = n }
+  else case firstFailing (G.children t) of
+    Just t2 -> shrink limit (n + 1) t2
+    Nothing -> { tree = t, shrinks = n }
+
+-- (a failing run, shrunk, as an outcome)
+failedRun : String -> Bool -> Int -> Tally -> Shrunk -> Outcome
+failedRun name prop seed t sh = case G.root sh.tree of
+  Failed tr f -> failedWith name prop seed t sh.shrinks tr f
+  _ ->
+    failedWith name prop seed t sh.shrinks noTrace (Because "lost the failure")
+
+-- | After a run: the tally with it, or the outcome it made.
+data Next = Again Tally | Done Outcome
+
+judge : String -> Config -> Int -> Tally -> G.Tree (Run Unit) -> Next
+judge name cfg seed t tree = case G.root tree of
+  Going tr _ ->
+    Again
+      { runs = t.runs + 1
+      , discarded = t.discarded
+      , labels = countLabels t.labels tr.labels
+      }
+  Discarded ->
+    Again { runs = t.runs, discarded = t.discarded + 1, labels = t.labels }
+  Failed _ _ -> Done (failedRun name True seed t (shrink cfg.shrinks 0 tree))
+
+-- | The property's runs: each from a seed of its own, at a size growing
+-- | to 100.
+loop : String -> Config -> Int -> G.Gen (Run Unit) -> G.Seed -> Tally -> Outcome
+loop name cfg seed g s t =
+  if t.runs >= cfg.runs then passed name True seed t
+  else if t.discarded > cfg.discards
+    then failedWith
+        name
+        True
+        seed
+        t
+        0
+        noTrace
+        (Because
+           ("gave up after " ++ showInt t.discarded ++ " runs given up on"))
+  else case G.split s of
+    MkPair s1 s2 -> case judge
+        name
+        cfg
+        seed
+        t
+        (G.run g s1 (t.runs * 100 / cfg.runs)) of
+      Again t2 -> loop name cfg seed g s2 t2
+      Done o -> o
+
+noTally : Tally
+noTally = { runs = 0, discarded = 0, labels = M.empty }
+
+-- (a unit test: one run)
+runUnit : String -> Int -> Co world Unit -> Outcome
+runUnit name seed c = case G.root (G.run (handle runner c) (G.seed seed) 0) of
+  Going _ _ ->
+    passed name False seed { runs = 1, discarded = 0, labels = M.empty }
+  Failed tr f -> failedWith name False seed noTally 0 tr f
+  Discarded ->
+    failedWith
+      name
+      False
+      seed
+      noTally
+      0
+      noTrace
+      (Because "a unit test gave itself up")
+
+-- (a name under its group's)
+under : String -> String -> String
+under prefix name = if strEq prefix "" then name else prefix ++ " / " ++ name
+
+runUnder : Int -> String -> Test -> List Outcome
+runUnder seed prefix (UnitTest name c) = [runUnit (under prefix name) seed c]
+runUnder seed prefix (PropTest name cfg c) =
+  [ loop
+    (under prefix name)
+    cfg
+    seed
+    (handle runner c)
+    (G.seed (seed + hashName (under prefix name)))
+    noTally
+  ]
+runUnder seed prefix (Group name ts) =
+  concatMap (\t -> runUnder seed (under prefix name) t) ts
+
+-- | Each test, run from the seed: what `heff test` runs of each test
+-- | it finds (`--seed N` gives the seed; the same seed runs the same).
+runTest : Int -> Test -> List Outcome
+runTest seed t = runUnder seed "" t
+
+showFailure : Failure -> String
+showFailure (Because why) = "Because " ++ showString why
+showFailure (Differ expected got) =
+  "Differ " ++ showString expected ++ " " ++ showString got
+
+-- | An outcome, as the record it is (for a test of tests).
+showOutcome : Outcome -> String
+showOutcome o =
+  "{ name = "
+  ++ showString o.name
+  ++ ", ok = "
+  ++ showBool o.ok
+  ++ ", property = "
+  ++ showBool o.property
+  ++ ", runs = "
+  ++ showInt o.runs
+  ++ ", discarded = "
+  ++ showInt o.discarded
+  ++ ", shrinks = "
+  ++ showInt o.shrinks
+  ++ ", labels = "
+  ++ showList (\p -> showPair showString showInt p) o.labels
+  ++ ", notes = "
+  ++ showList showString o.notes
+  ++ ", failure = "
+  ++ showMaybe showFailure o.failure
+  ++ ", seed = "
+  ++ showInt o.seed
+  ++ " }"
