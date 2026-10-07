@@ -698,19 +698,25 @@ static V heff_str_utf8(const unsigned char *c, int64_t n) {
 }
 
 // (UTF-16 out, as UTF-8)
+// (a string written out as UTF-8: encoded into a buffer, written a
+// buffer at a time, not a byte -- each fputc takes the stream's lock)
 static void heff_put(FILE *f, V v) {
   Str *s = (Str *)v;
+  unsigned char buf[8192];
+  size_t n = 0;
   for (int64_t i = 0; i < s->len; i++) {
     uint32_t u = s->s[i];
     if (u >= 0xD800 && u < 0xDC00 && i + 1 < s->len) {
       uint32_t w = s->s[i + 1];
       if (w >= 0xDC00 && w < 0xE000) { u = 0x10000 + ((u - 0xD800) << 10) + (w - 0xDC00); i++; }
     }
-    if (u < 0x80) fputc((int)u, f);
-    else if (u < 0x800) { fputc(0xC0 | (u >> 6), f); fputc(0x80 | (u & 0x3F), f); }
-    else if (u < 0x10000) { fputc(0xE0 | (u >> 12), f); fputc(0x80 | ((u >> 6) & 0x3F), f); fputc(0x80 | (u & 0x3F), f); }
-    else { fputc(0xF0 | (u >> 18), f); fputc(0x80 | ((u >> 12) & 0x3F), f); fputc(0x80 | ((u >> 6) & 0x3F), f); fputc(0x80 | (u & 0x3F), f); }
+    if (n > sizeof buf - 4) { fwrite(buf, 1, n, f); n = 0; }
+    if (u < 0x80) buf[n++] = (unsigned char)u;
+    else if (u < 0x800) { buf[n++] = (unsigned char)(0xC0 | (u >> 6)); buf[n++] = (unsigned char)(0x80 | (u & 0x3F)); }
+    else if (u < 0x10000) { buf[n++] = (unsigned char)(0xE0 | (u >> 12)); buf[n++] = (unsigned char)(0x80 | ((u >> 6) & 0x3F)); buf[n++] = (unsigned char)(0x80 | (u & 0x3F)); }
+    else { buf[n++] = (unsigned char)(0xF0 | (u >> 18)); buf[n++] = (unsigned char)(0x80 | ((u >> 12) & 0x3F)); buf[n++] = (unsigned char)(0x80 | ((u >> 6) & 0x3F)); buf[n++] = (unsigned char)(0x80 | (u & 0x3F)); }
   }
+  if (n) fwrite(buf, 1, n, f);
 }
 
 // (the first string, its last reference, grown in place, room made for
