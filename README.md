@@ -43,7 +43,8 @@ release has it built (`heff-X.Y.Z.vsix`).
 ```sh
 heff check FILE                # the file's interface, and its errors
 heff run FILE [ARGS...]        # run the file's `main` (on Node.js)
-heff test FILE...              # check the watches' expectations (`-- >>> e`)
+heff test [--seed N] FILE...   # check the watches' expectations (`-- >>> e`),
+                               # and run the tests (lib/check.hf)
 heff promote FILE              # write each watch's value as its expectation
 heff fmt [--check] FILE...     # format in place
 heff compile FILE OUT --backend=MODE [--name NAME]
@@ -124,6 +125,51 @@ under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `M.provider.js` beside `M.hf`.
 
 `examples/` has apps for the browser (`npm run examples`).
+
+## Tests
+
+A watch, `-- >>> e` with its expected value under it, is an example in a
+definition's documentation.  A test is a top-level definition of type
+`Test` (`lib/check.hf`); `heff test` runs a file's tests after its
+watches.  A unit test checks; a property draws values from generators
+(`lib/gen.hf`, imported `as G`) and checks them, a hundred runs:
+
+```haskell
+import check
+import co
+import gen as G
+import prelude
+
+lists : Test
+lists = group "lists"
+  [ unit "append" (equal (showList showInt) (concatList [1] [2]) [1, 2])
+  , property "reversed twice" (do
+      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))
+      label (if null xs then "empty" else "not empty")
+      equal (showList showInt) (reverse (reverse xs)) xs)
+  ]
+```
+
+```
+  ok    lists / append
+  ok    lists / reversed twice  (100 runs, 17% empty, 83% not empty)
+ok    lists.hf  0/0, tests 2/2
+```
+
+Randomness and checking are effects: a unit test's type grants it only
+`check`, a property also `random`, and the runner gives both.  A
+generator makes each value with the smaller ones to try instead
+(Hedgehog's rose trees), so a property that fails is shrunk, every draw
+of it, with nothing written for it; the runner then says the
+counterexample and the seed to run it again (`--seed N`; the default
+seed is always the same, so a run of the tests is always the same run).
+A label counts the runs it is given, so that a property that holds only
+of trivial values shows.  There are no type classes, so a value is
+shown, and compared by `equal`, by a function given, and a generator is
+given by hand.  `agree` runs a program of commands on a system and on a
+model of it and compares what they observe; drawn by a property, the
+program shrinks to a short one that tells them apart
+(`test/check/map.hf` holds `lib/map.hf` to a list of pairs).
 
 ## Developing
 

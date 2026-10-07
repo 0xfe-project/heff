@@ -1029,6 +1029,164 @@ promoteOne w s =
 promote : Checked -> String
 promote c = foldr (\w s -> promoteOne w s) c.source (watches c)
 
+-- Tests (lib/check.hf)
+--------------------------------------------------------------------------------
+
+-- | what came of a test, as lib/check.hf's `Outcome` says it (read back
+-- | from the interpreter's value)
+data TestFailure = FailBecause String | FailDiffer String String
+
+type TestOutcome =
+  { name : String
+  , ok : Bool
+  , property : Bool
+  , runs : Int
+  , discarded : Int
+  , shrinks : Int
+  , labels : List (Pair String Int)
+  , notes : List String
+  , failure : Maybe TestFailure
+  , seed : Int
+  }
+
+-- (a type that is lib/check.hf's `Test`: a test is found by its type)
+isTestEl : Sx.Tm -> Bool
+isTestEl (SGlobal k) = strEq k "check.Test"
+isTestEl _ = False
+
+isTestTy : Sx.Ty -> Bool
+isTestTy (SDecode t) = isTestEl t
+isTestTy _ = False
+
+isTestOwn : Checked -> Own -> Bool
+isTestOwn c o = case G.lookupEntry c.top.globals o.key of
+  Just e -> isTestTy e.tySyntax
+  Nothing -> False
+
+-- | a file's tests: its own definitions of type `Test`, in order
+testsOf : Checked -> List Own
+testsOf c = filter (\o -> isTestOwn c o) c.own
+
+fieldV : In.Val -> String -> In.Val
+fieldV (VCons fs) x = case D.lookup fs x of
+  Just v -> v
+  Nothing -> VErased
+fieldV _ x = VErased
+
+strOfV : In.Val -> String
+strOfV (VStr s) = s
+strOfV _ = ""
+
+intOfV : In.Val -> Int
+intOfV (VInt i) = i
+intOfV _ = 0
+
+tagOfV : In.Val -> String
+tagOfV (VTag x _) = x
+tagOfV _ = ""
+
+argsOfV : In.Val -> List In.Val
+argsOfV (VTag _ vs) = vs
+argsOfV _ = Nil
+
+argV : In.Val -> Int -> In.Val
+argV v i = fromMaybe VErased (head (drop i (argsOfV v)))
+
+-- (a list, `Cons`es and its `Nil`)
+listOfV : In.Val -> List In.Val
+listOfV v =
+  if strEq (tagOfV v) "Cons" then Cons (argV v 0) (listOfV (argV v 1)) else Nil
+
+labelOfV : In.Val -> Pair String Int
+labelOfV v = MkPair (strOfV (argV v 0)) (intOfV (argV v 1))
+
+failureOfV : In.Val -> Maybe TestFailure
+failureOfV v =
+  if strEq (tagOfV v) "Just"
+    then (if strEq (tagOfV (argV v 0)) "Differ"
+          then Just
+              (FailDiffer
+                 (strOfV (argV (argV v 0) 0))
+                 (strOfV (argV (argV v 0) 1)))
+        else Just (FailBecause (strOfV (argV (argV v 0) 0))))
+  else Nothing
+
+outcomeOfV : In.Val -> TestOutcome
+outcomeOfV v =
+  { name = strOfV (fieldV v "name")
+  , ok = strEq (tagOfV (fieldV v "ok")) "True"
+  , property = strEq (tagOfV (fieldV v "property")) "True"
+  , runs = intOfV (fieldV v "runs")
+  , discarded = intOfV (fieldV v "discarded")
+  , shrinks = intOfV (fieldV v "shrinks")
+  , labels = map labelOfV (listOfV (fieldV v "labels"))
+  , notes = map strOfV (listOfV (fieldV v "notes"))
+  , failure = failureOfV (fieldV v "failure")
+  , seed = intOfV (fieldV v "seed")
+  }
+
+-- (a test that came to no outcome: it abandoned, or went too deep)
+brokenOutcome : String -> Int -> String -> TestOutcome
+brokenOutcome name seed why =
+  { name = name
+  , ok = False
+  , property = False
+  , runs = 0
+  , discarded = 0
+  , shrinks = 0
+  , labels = Nil
+  , notes = Nil
+  , failure = Just (FailBecause why)
+  , seed = seed
+  }
+
+outcomesOf : Own -> Int -> In.EvalResult -> List TestOutcome
+outcomesOf o seed (RSucceeded v) = map outcomeOfV (listOfV v)
+outcomesOf o seed r = [brokenOutcome (Ps.named o.name) seed (In.showResult r)]
+
+-- (`check.runTest seed t`, as a global of its own)
+testEntry : Int -> Own -> G.Entry
+testEntry seed o =
+  { syntax = SApp (SApp (SGlobal "check.runTest") (SLitInt seed)) (SGlobal o.key)
+  , tySyntax = SPrimInt
+  , value = VOpaque
+  , type_ = VPrimInt
+  }
+
+testName : Int -> String
+testName i = "> test " ++ showInt i
+
+addTests : Int -> Int -> List Own -> G.Globals -> G.Globals
+addTests seed i Nil g = g
+addTests seed i (Cons o rest) g =
+  addTests seed (i + 1) rest (G.addEntry (testName i) (testEntry seed o) g)
+
+pickOutcomes : Int
+             -> List (Pair String In.EvalResult)
+             -> Int
+             -> List Own
+             -> List TestOutcome
+pickOutcomes seed rs i Nil = Nil
+pickOutcomes seed rs i (Cons o rest) =
+  concatList
+    (case lookupBy strEq (testName i) rs of
+     Just r -> outcomesOf o seed r
+     Nothing -> Nil)
+    (pickOutcomes seed rs (i + 1) rest)
+
+-- | each test of the file run from the seed (by the interpreter, as a
+-- | watch is evaluated), what came of it
+runTests : Int -> Checked -> List TestOutcome
+runTests seed c =
+  if null (testsOf c) then Nil
+  else pickOutcomes
+      seed
+      (In.evalGlobalsWhere
+         (\k -> startsWith "> test " k)
+         (addTests seed 0 (testsOf c) c.top.globals))
+      0
+      (testsOf c)
+
 -- The interface, and the diagnostics as files report them
 --------------------------------------------------------------------------------
 

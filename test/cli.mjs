@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// The command line: `promote` writes each watch's value under it, `fmt`
+// The command line: `promote` writes each watch's value under it, `test`
+// runs the tests (lib/check.hf) and shrinks what fails, `fmt`
 // lays files out in place (with `--check`, only names them), and the
 // usage, the completions and an unknown command say what they should, on
 // the right stream, with the right exit status.
@@ -31,6 +32,39 @@ expect("promote", promoted.status === 0 &&
   text.includes("-- >>> not True\n-- False\n") && !text.includes("wrong"), { promoted, text });
 const tested = heff("test", "p.hf");
 expect("test after promote", tested.status === 0 && tested.stdout.includes("3/3 expectations hold"), tested);
+
+// test: the definitions of type `Test` run too.  A property that fails on
+// purpose is shrunk to its smallest counterexample, says the seed that
+// runs it again, and fails the run; the same seed runs the same runs,
+// another seed others, to the same counterexample
+writeFileSync(join(work, "props.hf"), [
+  "import check", "import co", "import gen as G", "import prelude", "",
+  "small : Test",
+  "small = group \"small\"",
+  "  [ unit \"two\" (equal showInt (1 + 1) 2)",
+  "  , unit \"three\" (equal showInt (1 + 1) 3)",
+  "  , property \"all below 50\" (do",
+  "      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))",
+  "      assert \"all below 50\" (all (\\x -> x < 50) xs))",
+  "  , property \"reversed twice\" (do",
+  "      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))",
+  "      label (if null xs then \"empty\" else \"not empty\")",
+  "      equal (showList showInt) (reverse (reverse xs)) xs)",
+  "  ]", "",
+].join("\n"));
+const props = heff("test", "props.hf");
+const runsOf = (r) => (r.stdout.match(/all below 50  \(failed after (\d+) runs held/) ?? [])[1];
+expect("test runs the tests", props.status === 1 &&
+  props.stdout.includes("  ok    small / two\n") &&
+  props.stdout.includes("  FAIL  small / three\n        expected 3\n        but got  2\n") &&
+  /  FAIL  small \/ all below 50  \(failed after \d+ runs held; shrunk (once|\d+ times); again: --seed 2026\)\n        \[50\]\n        all below 50\n/.test(props.stdout) &&
+  /  ok    small \/ reversed twice  \(100 runs, \d+% empty, \d+% not empty\)\n/.test(props.stdout) &&
+  props.stdout.includes("FAIL  props.hf  0/0, tests 2/4\n") &&
+  props.stdout.endsWith("0/0 expectations hold, 2/4 tests hold\n"), props);
+const seeded = heff("test", "--seed", "99", "props.hf");
+expect("test --seed", seeded.status === 1 && seeded.stdout.includes("again: --seed 99)\n        [50]\n") &&
+  runsOf(seeded) !== undefined && runsOf(seeded) !== runsOf(props), { seeded, props });
+expect("test --seed, again", heff("test", "props.hf", "-s", "99").stdout === seeded.stdout, seeded);
 
 // fmt: --check names what is not laid out (and fails), leaves it; without
 // it, lays it out; a file that does not parse is refused, untouched
@@ -82,7 +116,7 @@ const noSuch = heff("no-such-command");
 expect("refused: no-such-command", noSuch.status === 1 && noSuch.stdout === "" &&
   noSuch.stderr.startsWith("heff: no command no-such-command\nusage: heff COMMAND ..."), noSuch);
 for (const [args, says] of [
-  [["test"], "heff test: expected FILE...\nusage: heff test FILE...\n"],
+  [["test"], "heff test: expected FILE...\nusage: heff test FILE... [--seed N]\n"],
   [["check"], "heff check: expected FILE\nusage: heff check FILE\n"],
   [["fmt", "--chek", "x.hf"], "heff fmt: no flag --chek; --check?\nusage: heff fmt FILE... [--check]\n"],
   [["compile", "a.hf", "a.mjs"], "heff compile: --backend=MODE is wanted\n"],

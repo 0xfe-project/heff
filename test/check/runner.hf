@@ -1,0 +1,174 @@
+-- The runner of lib/check.hf, tested by itself: properties that fail on
+-- purpose, run by `runTest` as `heff test` runs them, and what came of
+-- them looked at -- the counterexample shrunk to the smallest, the same
+-- seed running the same runs, the labels counted, the runs given up on.
+-- (Those that fail on purpose are made by functions, not definitions of
+-- type `Test`, which `heff test` would run itself.)
+
+import check
+import co
+import gen as G
+import prelude
+
+-- | Fails on purpose: some list of numbers below 100 has one of 50 or
+-- | more.  The smallest counterexample is `[50]`.
+allSmall : Unit -> Test
+allSmall u =
+  property "all below 50" (do
+  xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))
+  assert "all below 50" (all (\x -> x < 50) xs))
+
+-- | Fails on purpose, by two draws: shrunk, the two sum to 10 (each draw
+-- | shrinks with the other as it is, so it is a smallest pair, not the
+-- | smallest).
+sumSmall : Unit -> Test
+sumSmall u =
+  property "sums below 10" (do
+  a <- forAll showInt (G.int 0 20)
+  b <- forAll showInt (G.int 0 20)
+  equal showBool (a + b < 10) True)
+
+-- | Holds, but only of the runs it does not give up on.
+evens : Unit -> Test
+evens u =
+  property "an even number halved and doubled" (do
+  n <- forAll showInt (G.int 0 1000)
+  assume (n % 2 == 0)
+  label (if n == 0 then "zero" else "not zero")
+  equal showInt (n / 2 * 2) n)
+
+-- | Gives up on every run.
+nothingFits : Unit -> Test
+nothingFits u = property "nothing fits" (assume False)
+
+outcome : Int -> Test -> Outcome
+outcome seed t = case runTest seed t of
+  Cons o _ -> o
+  Nil -> abandon
+
+-- | A broken map: its size is wrong once it has three keys or more.
+data Command = Put Int | Count
+
+showCommand : Command -> String
+showCommand (Put k) = "Put " ++ showInt k
+showCommand Count = "Count"
+
+putIn : Int -> List Int -> List Int
+putIn k ks = if any (\x -> x == k) ks then ks else Cons k ks
+
+stepBroken : Command -> List Int -> Pair (List Int) Int
+stepBroken (Put k) ks = MkPair (putIn k ks) 0
+stepBroken Count ks = MkPair ks (if length ks >= 3 then 0 else length ks)
+
+stepRight : Command -> List Int -> Pair (List Int) Int
+stepRight (Put k) ks = MkPair (putIn k ks) 0
+stepRight Count ks = MkPair ks (length ks)
+
+broken : Machine Command (List Int) (List Int) Int
+broken =
+  { system = Nil
+  , model = Nil
+  , step = stepBroken
+  , stepModel = stepRight
+  , valid = \ks -> True
+  }
+
+brokenModel : Unit -> Test
+brokenModel u =
+  property "the broken map agrees with its model" (do
+  cmds <-
+    forAll
+      (showList showCommand)
+      (G.list
+         0
+         30
+         (G.oneOf [G.map (\k -> Put k) (G.int 0 9), G.constant Count]))
+  agree showCommand showInt broken cmds)
+
+runner : Test
+runner =
+  group
+    "runner"
+    [ unit "a failing property shrinks to the smallest counterexample" (do
+    assert "fails" (not (outcome 1 (allSmall MkUnit)).ok)
+    equal (showList showString) (outcome 1 (allSmall MkUnit)).notes ["[50]"]
+    equal
+        (showMaybe showFailure)
+        (outcome 1 (allSmall MkUnit)).failure
+        (Just (Because "all below 50")))
+    , unit
+      "two draws shrink together, to a sum of 10"
+      (equal
+         showInt
+         (sum
+            (map
+               (\s -> fromMaybe 0 (parseInt s))
+               (outcome 3 (sumSmall MkUnit)).notes))
+         10)
+    , unit
+      "what differs is said: expected, then got"
+      (equal
+         (showMaybe showFailure)
+         (outcome 3 (sumSmall MkUnit)).failure
+         (Just (Differ "True" "False")))
+    , unit
+      "the same seed runs the same runs"
+      (equal
+         (showList showOutcome)
+         (runTest 7 (allSmall MkUnit))
+         (runTest 7 (allSmall MkUnit)))
+    , unit "another seed runs others, to the same counterexample" (do
+    assert
+        "the runs differ"
+        (not
+           ((outcome 7 (allSmall MkUnit)).runs
+            == (outcome 8 (allSmall MkUnit)).runs))
+    equal (showList showString) (outcome 8 (allSmall MkUnit)).notes ["[50]"])
+    , unit "runs given up on are counted apart, and labels counted" (do
+    assert "holds" (outcome 1 (evens MkUnit)).ok
+    equal showInt (outcome 1 (evens MkUnit)).runs 100
+    assert "gives some up" ((outcome 1 (evens MkUnit)).discarded > 0)
+    equal
+        (showList showString)
+        (map
+           (\(p : Pair String Int) -> fst p)
+           (outcome 1 (evens MkUnit)).labels)
+        ["not zero", "zero"])
+    , unit "a property that gives up on every run fails" (do
+    assert "fails" (not (outcome 1 (nothingFits MkUnit)).ok)
+    equal showInt (outcome 1 (nothingFits MkUnit)).runs 0)
+    , unit "a model-based test shrinks to a short program" (do
+    equal
+        showInt
+        (length
+           (split
+              ", "
+              (fromMaybe "" (head (outcome 1 (brokenModel MkUnit)).notes))))
+        4
+    equal
+        (showList showString)
+        (drop 1 (outcome 1 (brokenModel MkUnit)).notes)
+        ["at command 3, Count"])
+    , runs
+      10
+      (property "from any seed, the same smallest counterexample" (do
+       s <- forAll showInt (G.uniform 0 1000000)
+       equal
+           (showList showString)
+           (outcome s (allSmall MkUnit)).notes
+           ["[50]"]))
+    , unit
+      "a group names its tests"
+      (equal
+         (showList showString)
+         (map
+            (\(o : Outcome) -> o.name)
+            (runTest
+               1
+               (group
+                  "g"
+                  [ unit "a" (pure MkUnit)
+                  , group "h" [unit "b" (pure MkUnit)]
+                  ])))
+         ["g / a", "g / h / b"])
+    ]

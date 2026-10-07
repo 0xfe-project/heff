@@ -1,0 +1,122 @@
+-- lib/map.hf against a model of it: a list of pairs, the newest first,
+-- which is too slow to use and too simple to be wrong.  A property draws
+-- a program of commands, runs it on both, and after each command holds
+-- the map to say what the list says, and to be balanced and in order
+-- (`M.valid`).  If they ever differ, the program shrinks to a short one
+-- that shows how.
+
+import check
+import co
+import gen as G
+import map as M
+import prelude
+
+data Command = Insert Int Int | Delete Int | Lookup Int | Size | Keys
+
+showCommand : Command -> String
+showCommand (Insert k v) = "Insert " ++ showInt k ++ " " ++ showInt v
+showCommand (Delete k) = "Delete " ++ showInt k
+showCommand (Lookup k) = "Lookup " ++ showInt k
+showCommand Size = "Size"
+showCommand Keys = "Keys"
+
+-- | A command: its keys from a small range, so that a program inserts a
+-- | key it has, and deletes and looks up keys it has.
+command : G.Gen Command
+command =
+  G.frequency
+    [ MkPair 4 (G.map2 (\k v -> Insert k v) (G.int 0 15) (G.int 0 9))
+    , MkPair 2 (G.map (\k -> Delete k) (G.int 0 15))
+    , MkPair 2 (G.map (\k -> Lookup k) (G.int 0 15))
+    , MkPair 1 (G.constant Size)
+    , MkPair 1 (G.constant Keys)
+    ]
+
+-- | What a command is seen to do: nothing, a value, or a number of keys,
+-- | or the keys.
+data Seen = Nothing' | Found (Maybe Int) | Count Int | KeysAre (List Int)
+
+showSeen : Seen -> String
+showSeen Nothing' = "nothing"
+showSeen (Found m) = showMaybe showInt m
+showSeen (Count n) = showInt n
+showSeen (KeysAre ks) = showList showInt ks
+
+stepMap : Command -> M.Map Int Int -> Pair (M.Map Int Int) Seen
+stepMap (Insert k v) m = MkPair (M.insert compareInt k v m) Nothing'
+stepMap (Delete k) m = MkPair (M.delete compareInt k m) Nothing'
+stepMap (Lookup k) m = MkPair m (Found (M.lookup compareInt k m))
+stepMap Size m = MkPair m (Count (M.size m))
+stepMap Keys m = MkPair m (KeysAre (M.keys m))
+
+without : Int -> List (Pair Int Int) -> List (Pair Int Int)
+without k ps = filter (\(p : Pair Int Int) -> not (fst p == k)) ps
+
+stepList : Command -> List (Pair Int Int) -> Pair (List (Pair Int Int)) Seen
+stepList (Insert k v) ps = MkPair (Cons (MkPair k v) (without k ps)) Nothing'
+stepList (Delete k) ps = MkPair (without k ps) Nothing'
+stepList (Lookup k) ps = MkPair ps (Found (lookupBy (\a b -> a == b) k ps))
+stepList Size ps = MkPair ps (Count (length ps))
+stepList Keys ps =
+  MkPair
+    ps
+    (KeysAre (sortBy (\a b -> a <= b) (map (\(p : Pair Int Int) -> fst p) ps)))
+
+machine : Machine Command (M.Map Int Int) (List (Pair Int Int)) Seen
+machine =
+  { system = M.empty
+  , model = Nil
+  , step = stepMap
+  , stepModel = stepList
+  , valid = \m -> M.valid compareInt m
+  }
+
+-- (how many keys a program leaves: to see the programs are not trivial)
+sizeLabel : List Command -> String
+sizeLabel cmds = sized (M.size (foldl (\m c -> fst (stepMap c m)) M.empty cmds))
+  where
+    sized : Int -> String
+    sized n =
+      if n == 0 then "ends empty"
+      else if n < 5 then "ends with 1 to 4 keys"
+      else "ends with 5 keys or more"
+
+mapModel : Test
+mapModel =
+  group
+    "map"
+    [ property "agrees with a list of pairs" (do
+    cmds <- forAll (showList showCommand) (G.list 0 50 command)
+    label (sizeLabel cmds)
+    agree showCommand showSeen machine cmds)
+    , property
+      "fromList, then toList, is the pairs sorted, the last of each key kept" (do
+    ps <-
+      forAll
+        (showList (\p -> showPair showInt showInt p))
+        (G.list 0 30 (G.pair (G.int 0 20) (G.int 0 9)))
+    equal
+        (showList (\p -> showPair showInt showInt p))
+        (M.toList (M.fromList compareInt ps))
+        (sortBy
+           (\(a : Pair Int Int) (b : Pair Int Int) -> fst a <= fst b)
+           (foldl
+              (\acc (p : Pair Int Int) -> Cons p (without (fst p) acc))
+              Nil
+              ps)))
+    , unit
+      "a key inserted is found"
+      (equal
+         (showMaybe showString)
+         (M.lookup compareInt 1 (M.insert compareInt 1 "one" M.empty))
+         (Just "one"))
+    , unit
+      "a key deleted is not"
+      (equal
+         (showMaybe showString)
+         (M.lookup
+            compareInt
+            1
+            (M.delete compareInt 1 (M.insert compareInt 1 "one" M.empty)))
+         Nothing)
+    ]
