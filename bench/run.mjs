@@ -34,7 +34,8 @@ const timed = (args, opts = {}) => {
   const r = spawnSync("/usr/bin/time", ["-l", ...args], { cwd: root, encoding: "utf8", maxBuffer: 1 << 26, ...opts });
   const real = Number((r.stderr.match(/([\d.]+) real/) || [])[1]);
   const rss = Number((r.stderr.match(/(\d+)\s+maximum resident set size/) || [])[1]) / (1 << 20);
-  return { ok: r.status === 0, real, rss, out: r.stdout, err: r.stderr };
+  const ins = Number((r.stderr.match(/(\d+)\s+instructions retired/) || [])[1]) / 1e9;
+  return { ok: r.status === 0, real, rss, ins, out: r.stdout, err: r.stderr };
 };
 
 const best = (name, once) => {
@@ -44,7 +45,8 @@ const best = (name, once) => {
     if (!r.ok) { console.log(`${name.padEnd(16)} FAILED\n${r.err}`); return; }
     if (b === null || r.real < b.real) b = r;
   }
-  console.log(`${name.padEnd(16)} ${b.real.toFixed(2).padStart(7)} s ${b.rss.toFixed(0).padStart(7)} MB`);
+  // (instructions, the steadiest: wall-clock time wanders by a tenth)
+  console.log(`${name.padEnd(16)} ${b.real.toFixed(2).padStart(7)} s ${b.rss.toFixed(0).padStart(7)} MB ${b.ins.toFixed(2).padStart(8)} G instr`);
 };
 
 for (const f of readdirSync(join(root, "bench")).filter((f) => f.endsWith(".hf")).sort()) {
