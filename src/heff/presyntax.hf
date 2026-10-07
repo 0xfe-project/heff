@@ -1,14 +1,18 @@
--- The presyntax: what the elaborator reads, as the lowering
--- (`heff.surface`) gives it -- which names are variables and which are
--- tags, operators bound as the fixities say, the sugar taken apart,
--- signatures met with their equations.  Each node is `P.Spanned`: where
--- it is written.
+-- The presyntax: what the lowering (`heff.surface`) gives, and what the
+-- elaborator reads.  It comes in two layers.  `Expr` is the text as
+-- written -- which names are variables and which are tags, operators
+-- bound as the fixities say, signatures met with their equations; what
+-- the tools read (the language server, the formatter).  `Checkable`,
+-- `Inferable` and `TypeForm` are the same, each term in the judgment it
+-- is elaborated by (`classify`): checked against a type, inferring one,
+-- or a type -- what the elaborator reads.  A term in the wrong one is
+-- `IInvalid`, there.  Each node is `P.Spanned`: where it is written.
 --
--- Types are defined one after another, so what an expression holds is
--- parametric in the expression (`e`), and `ExprF` closes the knot.
--- Notation that has no reading where it is written is `EInvalid`, what
--- to write instead (and a field, a setting or a variant that is not one
--- is `Bad...`): elaboration says so, there.
+-- Types are defined one after another, so what a term holds is
+-- parametric in the terms it holds, and the last type of each layer
+-- closes the knot.  Notation that has no reading where it is written is
+-- `EInvalid`, what to write instead (and a field, a setting or a variant
+-- that is not one is `Bad...`): elaboration says so, there.
 
 import heff.params as P
 import prelude
@@ -83,27 +87,30 @@ data Param e = ExplicitParam String P.Span e | ImplicitParam String P.Span e
 -- | `f p ... = e`: the name, where it is, the patterns, the body
 data Equation e = MkEquation String P.Span (List Pat) e
 
--- | a declaration: a definition by equations (its name, where it is, its
--- | type, its equations); a `data` or `type` (its parameters, its
--- | universe, its body); a `theory` (its parameters, its fields, a
--- | `ESig`); a primitive; a test; a watch
-data DeclF e
-  = DeclEquations String P.Span e (List (P.Spanned (Equation e)))
-  | DeclDefine String P.Span (List (P.Spanned (Param e))) e e
-  | DeclTheory String P.Span (List (P.Spanned (Param e))) e
-  | DeclPrimitive String P.Span e
+-- | a declaration, over terms `c` and types `t`: a definition by
+-- | equations (its name, where it is, its type, its equations); a `data`
+-- | or `type` (its parameters, its universe, its body); a `theory` (its
+-- | parameters, its fields, a record type); a primitive; a test; a watch
+data DeclF c t
+  = DeclEquations String P.Span t (List (P.Spanned (Equation c)))
+  | DeclDefine String P.Span (List (P.Spanned (Param t))) t c
+  | DeclTheory String P.Span (List (P.Spanned (Param t))) c
+  | DeclPrimitive String P.Span t
   | DeclTest String P.Span
-  | DeclWatch e
+  | DeclWatch c
 
 -- Expressions
 --------------------------------------------------------------------------------
 
--- | `EApp`'s arguments are its spine, `e.x` (`EProject`) and `(x := e)`
--- | (`ENamed`) among them; `ESpec`, `e ~ { x = v }` (the field, where its
--- | setting is, the value); `ELetIn`, `let p = e in e'`; `ELocal`, an
--- | equation's body and its local definitions
+-- | `EImplicitVar`, a name the lowering writes, which the text does not
+-- | (the `Bool` of `&&`); `EApp`'s arguments are its spine, `e.x`
+-- | (`EProject`) and `(x := e)` (`ENamed`) among them; `ESpec`, `e ~ {
+-- | x = v }` (the field, where its setting is, the value); `ELetIn`,
+-- | `let p = e in e'`; `ELocal`, an equation's body and its local
+-- | definitions
 data ExprF
   = EVar String
+  | EImplicitVar String
   | ETag String
   | EInt Int
   | EFloat Float
@@ -122,12 +129,14 @@ data ExprF
   | EMatch (P.Spanned ExprF) (List (P.Spanned (Alt (P.Spanned ExprF))))
   | ELetIn (P.Spanned ExprF) (P.Spanned (Alt (P.Spanned ExprF)))
   | EDo (List (P.Spanned (Stmt (P.Spanned ExprF))))
-  | ELocal (P.Spanned ExprF) (List (P.Spanned (DeclF (P.Spanned ExprF))))
+  | ELocal (P.Spanned ExprF) (List
+                                (P.Spanned
+                                   (DeclF (P.Spanned ExprF) (P.Spanned ExprF))))
   | EInvalid String
 
 type Expr = P.Spanned ExprF
 
-type Decl = P.Spanned (DeclF Expr)
+type Decl = P.Spanned (DeclF Expr Expr)
 
 -- Building
 --------------------------------------------------------------------------------
@@ -180,7 +189,7 @@ patOp x xsp ps =
   At (PatOp x xsp ps) (spanning xsp (P.spanOf (lastOr (At (PatVar x) xsp) ps)))
 
 -- | `p -> e`, from the pattern to the body
-alt : Pat -> Expr -> P.Spanned (Alt Expr)
+alt : {a : Type} -> Pat -> P.Spanned a -> P.Spanned (Alt (P.Spanned a))
 alt p e = At (MkAlt p e) (spanning (P.spanOf p) (P.spanOf e))
 
 -- | `\x -> e`, from the binder to the body
@@ -192,7 +201,7 @@ ann : Expr -> Expr -> Expr
 ann e t = At (EAnn e t) (spanning (P.spanOf e) (P.spanOf t))
 
 -- | the name a declaration defines (a watch defines none)
-declName : Decl -> Maybe String
+declName : {c t : Type} -> P.Spanned (DeclF c t) -> Maybe String
 declName d = case P.nodeOf d of
   DeclEquations f _ _ _ -> Just f
   DeclDefine x _ _ _ _ -> Just x
@@ -200,6 +209,330 @@ declName d = case P.nodeOf d of
   DeclPrimitive x _ _ -> Just x
   DeclTest x _ -> Just x
   DeclWatch _ -> Nothing
+
+-- Terms in their judgments
+--------------------------------------------------------------------------------
+
+-- | an argument in an application's spine: a term, `.x`, `(x := e)`
+data Arg c = ArgExplicit c | ArgProject String | ArgNamed String c
+
+-- | a term that infers its type, over checkable terms `c` and types `t`:
+-- | `IAnnLam`, `\(x : T) -> e` with `e` inferring; `IInvalid`, what is
+-- | wrong here (its code, what to write)
+data InferableF c t
+  = IVar String
+  | IInt Int
+  | IFloat Float
+  | IString String
+  | IApp (P.Spanned (InferableF c t)) (List (P.Spanned (Arg c)))
+  | IAnn c t
+  | ISpec (P.Spanned (InferableF c t)) String P.Span c
+  | IAnnLam String P.Span t (P.Spanned (InferableF c t))
+  | IInvalid Int String
+
+-- | a term checked against a type, over types `t`: `CInf`, a term that
+-- | infers its type, checked against it; `CType`, a type, as an element
+-- | of a universe; `CTag`, a tag applied
+data CheckableF t
+  = CInf (P.Spanned (InferableF (P.Spanned (CheckableF t)) t))
+  | CType t
+  | CLam String P.Span (P.Spanned (CheckableF t))
+  | CImplicitLam String P.Span (P.Spanned (CheckableF t))
+  | CAnnLam String P.Span t (P.Spanned (CheckableF t))
+  | CTag String P.Span (List (P.Spanned (CheckableF t)))
+  | CStruct (List (P.Spanned (FieldSet (P.Spanned (CheckableF t)))))
+  | CMatch (P.Spanned (InferableF (P.Spanned (CheckableF t)) t)) (List
+                                                                    (P.Spanned
+                                                                       (Alt
+                                                                          (P.Spanned
+                                                                             (CheckableF
+                                                                                t)))))
+  | CLetIn (P.Spanned (InferableF (P.Spanned (CheckableF t)) t)) (P.Spanned
+                                                                    (Alt
+                                                                       (P.Spanned
+                                                                          (CheckableF
+                                                                             t))))
+  | CLocal (P.Spanned (CheckableF t)) (List
+                                         (P.Spanned
+                                            (DeclF
+                                               (P.Spanned (CheckableF t))
+                                               t)))
+  | CAbandon
+
+-- | a type: `TInf`, a term that infers a universe; `TChk`, one checked
+-- | against one
+data TypeFormF
+  = TPi (PiBinder (P.Spanned TypeFormF)) (P.Spanned TypeFormF)
+  | TSig (List (P.Spanned (FieldDecl (P.Spanned TypeFormF))))
+  | TSum (List (P.Spanned (Variant (P.Spanned TypeFormF))))
+  | TType
+  | TInt
+  | TFloat
+  | TString
+  | TArray (P.Spanned TypeFormF)
+  | TInf (P.Spanned
+            (InferableF
+               (P.Spanned (CheckableF (P.Spanned TypeFormF)))
+               (P.Spanned TypeFormF)))
+  | TChk (P.Spanned (CheckableF (P.Spanned TypeFormF)))
+
+type TypeForm = P.Spanned TypeFormF
+
+type Checkable = P.Spanned (CheckableF TypeForm)
+
+type Inferable = P.Spanned (InferableF Checkable TypeForm)
+
+-- | a declaration, its terms in their judgments
+type Declaration = P.Spanned (DeclF Checkable TypeForm)
+
+-- | an inferring term as a head applied to its spine
+type InfSpine = { head : Inferable, args : List (P.Spanned (Arg Checkable)) }
+
+infSpineOf : Inferable -> InfSpine
+infSpineOf (At (IApp h xs) _) = { head = h, args = xs }
+infSpineOf i = { head = i, args = Nil }
+
+-- | `f args`, from the function to the last argument
+infApp : Inferable -> List (P.Spanned (Arg Checkable)) -> Inferable
+infApp f args =
+  At
+    (IApp f args)
+    (spanning
+       (P.spanOf f)
+       (P.spanOf (lastOr (At (ArgProject "") (P.spanOf f)) args)))
+
+-- | `\x -> e`, from the binder to the body
+chkLam : String -> P.Span -> Checkable -> Checkable
+chkLam x xsp e = At (CLam x xsp e) (spanning xsp (P.spanOf e))
+
+-- | an inferring term, checked
+chkOf : Inferable -> Checkable
+chkOf i = At (CInf i) (P.spanOf i)
+
+-- Classifying
+--------------------------------------------------------------------------------
+
+-- | a `do` block, taken apart: `x <- e` and `e` are `bind e (\x -> ...)`
+-- | (whichever `bind` is in scope), `let p = e` a `let` over the
+-- | statements after it; it ends with an expression
+doBind : P.Span -> Expr -> String -> P.Span -> Expr -> Expr
+doBind sp e x xsp rest = app (At (EVar "bind") sp) [e, lamName x xsp rest]
+
+doStep : P.Span -> P.Spanned (Stmt Expr) -> Expr -> Expr
+doStep sp (At (StmtBind x xsp e) _) rest = doBind sp e x xsp rest
+doStep sp (At (StmtLet p rhs) lsp) rest =
+  At (ELetIn rhs (alt p rest)) { start = lsp.start, end = (P.spanOf rest).end }
+doStep sp (At (StmtExpr e) _) rest = doBind sp e "_" sp rest
+
+doFrom : P.Span -> List (P.Spanned (Stmt Expr)) -> Expr -> Expr
+doFrom sp Nil e = e
+doFrom sp (Cons s rest) e = doStep sp s (doFrom sp rest e)
+
+doLast : P.Span
+       -> List (P.Spanned (Stmt Expr))
+       -> P.Spanned (Stmt Expr)
+       -> Maybe Expr
+doLast sp init (At (StmtExpr e) _) = Just (doFrom sp init e)
+doLast sp init _ = Nothing
+
+doBlock : P.Span -> List (P.Spanned (Stmt Expr)) -> Maybe Expr
+doBlock sp stmts = case reverse stmts of
+  Nil -> Nothing
+  Cons last init -> doLast sp (reverse init) last
+
+-- | a term in the judgment it is elaborated by
+data Classified
+  = IsInferable Inferable
+  | IsCheckable Checkable
+  | IsType TypeForm
+
+classifiedSpan : Classified -> P.Span
+classifiedSpan (IsInferable i) = P.spanOf i
+classifiedSpan (IsCheckable c) = P.spanOf c
+classifiedSpan (IsType t) = P.spanOf t
+
+invalid : Int -> String -> P.Span -> Inferable
+invalid code why sp = At (IInvalid code why) sp
+
+-- | where a term infers its type (a function applied, a scrutinee, what
+-- | `let x` is bound to, what is specialised)
+toInferable : Classified -> Inferable
+toInferable (IsInferable i) = i
+toInferable (IsCheckable c) =
+  invalid 0 "this notation must be put in a checking position" (P.spanOf c)
+toInferable (IsType (At (TSig fs) sp)) =
+  invalid 4 "cannot use descriptive syntax in nominal position" sp
+toInferable (IsType (At (TSum vs) sp)) =
+  invalid 4 "cannot use descriptive syntax in nominal position" sp
+toInferable (IsType t) =
+  invalid
+    0
+    "a type used as an element must be in checking position"
+    (P.spanOf t)
+
+toCheckable : Classified -> Checkable
+toCheckable (IsInferable i) = At (CInf i) (P.spanOf i)
+toCheckable (IsCheckable c) = c
+toCheckable (IsType t) = At (CType t) (P.spanOf t)
+
+toTypeForm : Classified -> TypeForm
+toTypeForm (IsInferable i) = At (TInf i) (P.spanOf i)
+toTypeForm (IsCheckable c) = At (TChk c) (P.spanOf c)
+toTypeForm (IsType t) = t
+
+-- | the classifier, knotted: an expression, a declaration
+type Classifier = { e : Expr -> Classified, decl : Decl -> Declaration }
+
+inferable : Classifier -> Expr -> Inferable
+inferable r e = toInferable (r.e e)
+
+checkable : Classifier -> Expr -> Checkable
+checkable r e = toCheckable (r.e e)
+
+typeForm : Classifier -> Expr -> TypeForm
+typeForm r e = toTypeForm (r.e e)
+
+wordOf : SyntaxWord -> P.Span -> Classified
+wordOf TypeWord sp = IsType (At TType sp)
+wordOf IntWord sp = IsType (At TInt sp)
+wordOf FloatWord sp = IsType (At TFloat sp)
+wordOf StringWord sp = IsType (At TString sp)
+wordOf ArrayWord sp =
+  IsType (At (TInf (invalid 3 "`Array` takes one type" sp)) sp)
+wordOf AbandonWord sp = IsCheckable (At CAbandon sp)
+
+-- | an argument in a spine
+argOf : Classifier -> Expr -> P.Spanned (Arg Checkable)
+argOf r (At (EProject x) sp) = At (ArgProject x) sp
+argOf r (At (ENamed x e) sp) = At (ArgNamed x (checkable r e)) sp
+argOf r e = At (ArgExplicit (checkable r e)) (P.spanOf e)
+
+-- | `h args`: a tag applied, `Array T`, or a function applied
+appOf : Classifier -> Expr -> List Expr -> P.Span -> Classified
+appOf r h args sp = case h of
+  At (ETag t) tsp -> IsCheckable (At (CTag t tsp (map (checkable r) args)) sp)
+  At (EWord ArrayWord) _ -> case args of
+    Cons a Nil -> IsType (At (TArray (typeForm r a)) sp)
+    _ -> IsType (At (TInf (invalid 3 "`Array` takes one type" sp)) sp)
+  _ -> IsInferable (At (IApp (inferable r h) (map (argOf r) args)) sp)
+
+piBinderOf : Classifier -> PiBinder Expr -> PiBinder TypeForm
+piBinderOf r (PiNamed x xsp t) = PiNamed x xsp (typeForm r t)
+piBinderOf r (PiImplicit x xsp bsp t) = PiImplicit x xsp bsp (typeForm r t)
+piBinderOf r (PiInstance x xsp bsp t) = PiInstance x xsp bsp (typeForm r t)
+piBinderOf r (PiAnon t) = PiAnon (typeForm r t)
+
+altOf : Classifier -> P.Spanned (Alt Expr) -> P.Spanned (Alt Checkable)
+altOf r (At (MkAlt p b) sp) = At (MkAlt p (checkable r b)) sp
+
+fieldDeclOf : Classifier
+            -> P.Spanned (FieldDecl Expr)
+            -> P.Spanned (FieldDecl TypeForm)
+fieldDeclOf r (At (DeclareField x xsp t) sp) =
+  At (DeclareField x xsp (typeForm r t)) sp
+fieldDeclOf r (At (BadFieldDecl e) sp) = At (BadFieldDecl (typeForm r e)) sp
+
+fieldSetOf : Classifier
+           -> P.Spanned (FieldSet Expr)
+           -> P.Spanned (FieldSet Checkable)
+fieldSetOf r (At (SetField x xsp e) sp) = At (SetField x xsp (checkable r e)) sp
+fieldSetOf r (At (BadFieldSet e) sp) = At (BadFieldSet (checkable r e)) sp
+
+variantOf : Classifier
+          -> P.Spanned (Variant Expr)
+          -> P.Spanned (Variant TypeForm)
+variantOf r (At (TagVariant t tsp args) sp) =
+  At (TagVariant t tsp (map (typeForm r) args)) sp
+variantOf r (At (BadVariant e) sp) = At (BadVariant (typeForm r e)) sp
+
+-- | `\(x : T) -> e`: inferring, if `e` does
+annLamOf : String -> P.Span -> TypeForm -> Classified -> P.Span -> Classified
+annLamOf x xsp t (IsInferable b) sp = IsInferable (At (IAnnLam x xsp t b) sp)
+annLamOf x xsp t b sp = IsCheckable (At (CAnnLam x xsp t (toCheckable b)) sp)
+
+classifyTermF : Classifier -> Expr -> Classified
+classifyTermF r e = case e of
+  At (EVar x) sp -> IsInferable (At (IVar x) sp)
+  At (EImplicitVar x) sp -> IsInferable (At (IVar x) sp)
+  At (ETag t) sp -> IsCheckable (At (CTag t sp Nil) sp)
+  At (EInt i) sp -> IsInferable (At (IInt i) sp)
+  At (EFloat x) sp -> IsInferable (At (IFloat x) sp)
+  At (EString x) sp -> IsInferable (At (IString x) sp)
+  At (EWord w) sp -> wordOf w sp
+  At (EApp h args) sp -> appOf r h args sp
+  At (EPi b cod) sp -> IsType (At (TPi (piBinderOf r b) (typeForm r cod)) sp)
+  At (ELam (LamName x xsp) body) sp ->
+    IsCheckable (At (CLam x xsp (checkable r body)) sp)
+  At (ELam (LamImplicit x xsp) body) sp ->
+    IsCheckable (At (CImplicitLam x xsp (checkable r body)) sp)
+  At (ELam (LamAnn x xsp t) body) sp ->
+    annLamOf x xsp (typeForm r t) (r.e body) sp
+  At (EAnn a t) sp -> IsInferable (At (IAnn (checkable r a) (typeForm r t)) sp)
+  At (ESpec a x fsp v) sp ->
+    IsInferable (At (ISpec (inferable r a) x fsp (checkable r v)) sp)
+  At (ESig fs) sp -> IsType (At (TSig (map (fieldDeclOf r) fs)) sp)
+  At (ESum vs) sp -> IsType (At (TSum (map (variantOf r) vs)) sp)
+  At (EStruct fs) sp -> IsCheckable (At (CStruct (map (fieldSetOf r) fs)) sp)
+  At (EMatch s alts) sp ->
+    IsCheckable (At (CMatch (inferable r s) (map (altOf r) alts)) sp)
+  At (ELetIn rhs a) sp ->
+    IsCheckable (At (CLetIn (inferable r rhs) (altOf r a)) sp)
+  At (EDo stmts) sp -> case doBlock sp stmts of
+    Just e' -> r.e e'
+    Nothing ->
+      IsInferable (invalid 12 "a `do` block ends with an expression" sp)
+  At (ELocal body ds) sp ->
+    IsCheckable (At (CLocal (checkable r body) (map r.decl ds)) sp)
+  At (EInvalid why) sp -> IsInferable (invalid 3 why sp)
+  At _ sp -> IsInferable (invalid 3 "unexpected notation" sp)
+
+paramOf : Classifier -> P.Spanned (Param Expr) -> P.Spanned (Param TypeForm)
+paramOf r (At (ExplicitParam x xsp t) sp) =
+  At (ExplicitParam x xsp (typeForm r t)) sp
+paramOf r (At (ImplicitParam x xsp t) sp) =
+  At (ImplicitParam x xsp (typeForm r t)) sp
+
+equationOf : Classifier
+           -> P.Spanned (Equation Expr)
+           -> P.Spanned (Equation Checkable)
+equationOf r (At (MkEquation f fsp ps rhs) sp) =
+  At (MkEquation f fsp ps (checkable r rhs)) sp
+
+-- | a watch infers what it is: it says its type
+watchOf : Classified -> Checkable
+watchOf (IsInferable i) = At (CInf i) (P.spanOf i)
+watchOf c =
+  At
+    (CInf
+       (invalid
+          0
+          "a watch must say what type it has: write `-- >>> (e : T)`"
+          (classifiedSpan c)))
+    (classifiedSpan c)
+
+classifyDeclF : Classifier -> Decl -> Declaration
+classifyDeclF r d = case d of
+  At (DeclEquations f fsp ty eqs) sp ->
+    At (DeclEquations f fsp (typeForm r ty) (map (equationOf r) eqs)) sp
+  At (DeclDefine x xsp ps u body) sp ->
+    At
+      (DeclDefine x xsp (map (paramOf r) ps) (typeForm r u) (checkable r body))
+      sp
+  At (DeclTheory x xsp ps body) sp ->
+    At (DeclTheory x xsp (map (paramOf r) ps) (checkable r body)) sp
+  At (DeclPrimitive x xsp t) sp -> At (DeclPrimitive x xsp (typeForm r t)) sp
+  At (DeclTest x xsp) sp -> At (DeclTest x xsp) sp
+  At (DeclWatch e) sp -> At (DeclWatch (watchOf (r.e e))) sp
+
+classifier : Classifier
+classifier =
+  { e = \e -> classifyTermF classifier e
+  , decl = \d -> classifyDeclF classifier d
+  }
+
+-- | a declaration, each term in the judgment it is elaborated by
+classify : Decl -> Declaration
+classify d = classifier.decl d
 
 -- >>> (spineOf (app (app (At (EVar "f") P.noSpan) [At (EVar "x") P.noSpan]) [At (EVar "y") P.noSpan])).args
 -- [At (EVar "x") { start = 0, end = 0 }, At (EVar "y") { start = 0, end = 0 }]

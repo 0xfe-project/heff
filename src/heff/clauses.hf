@@ -5,7 +5,7 @@
 -- of one record, `ck`.
 
 import heff.params as Pm
-import heff.presyntax
+import heff.presyntax as Notation
 import prelude
 
 type Err = { span : Pm.Span, msg : String }
@@ -21,7 +21,7 @@ bind (Right x) f = f x
 bindU : Either Err Unit -> Either Err Unit
 bindU e = e
 
-badPat : {a : Type} -> Pat -> Either Err a
+badPat : {a : Type} -> Notation.Pat -> Either Err a
 badPat p =
   Left
     (mkErr
@@ -33,12 +33,12 @@ badPat p =
 data MatchPat
   = PVar String
   | PTag String (List MatchPat) Pm.Span
-  | PLit Pat
+  | PLit Notation.Pat
   | PRec (List (Pair String MatchPat)) Pm.Span
 
-type Clause = { pats : List MatchPat, rhs : Expr }
+type Clause = { pats : List MatchPat, rhs : Notation.Checkable }
 
-mkClause : List MatchPat -> Expr -> Clause
+mkClause : List MatchPat -> Notation.Checkable -> Clause
 mkClause pats rhs = { pats = pats, rhs = rhs }
 
 appendC : {a : Type} -> List a -> List a -> List a
@@ -119,14 +119,14 @@ spliceAt : {a : Type} -> Int -> List a -> List a -> List a
 spliceAt i ys xs = appendC (takeC i xs) (appendC ys (dropC (i + 1) xs))
 
 -- | (`pat`, the knot: a record's fields are patterns)
-fieldPat : (Pat -> Either Err MatchPat)
-         -> FieldPat Pat
+fieldPat : (Notation.Pat -> Either Err MatchPat)
+         -> Notation.FieldPat Notation.Pat
          -> Either Err (Pair String MatchPat)
 fieldPat pt (MkFieldPat x p) = do
   q <- pt p
   pure (MkPair x q)
 
-pat : Pat -> Either Err MatchPat
+pat : Notation.Pat -> Either Err MatchPat
 pat p = case Pm.nodeOf p of
   PatVar x -> Right (PVar x)
   PatTag t tsp ps -> do
@@ -141,26 +141,27 @@ pat p = case Pm.nodeOf p of
   _ -> badPat p
 
 -- | the equality a literal is matched by
-equalityOf : Pat -> String
+equalityOf : Notation.Pat -> String
 equalityOf (At (PatString _) _) = "strEq"
 equalityOf (At (PatFloat _) _) = "floatEq"
 equalityOf _ = "intEq"
 
-sameLit : Pat -> Pat -> Bool
+sameLit : Notation.Pat -> Notation.Pat -> Bool
 sameLit (At (PatInt x) _) (At (PatInt y) _) = x == y
 sameLit (At (PatString x) _) (At (PatString y) _) = strEq x y
 sameLit (At (PatFloat x) _) (At (PatFloat y) _) = floatEq x y
 sameLit _ _ = False
 
 -- | a literal pattern, as the expression it is compared to
-litExpr : Pat -> Expr
-litExpr (At (PatInt x) sp) = At (EInt x) sp
-litExpr (At (PatString x) sp) = At (EString x) sp
-litExpr (At (PatFloat x) sp) = At (EFloat x) sp
-litExpr (At _ sp) = At (EWord AbandonWord) sp
+litExpr : Notation.Pat -> Notation.Checkable
+litExpr (At (PatInt x) sp) = Notation.chkOf (At (IInt x) sp)
+litExpr (At (PatString x) sp) = Notation.chkOf (At (IString x) sp)
+litExpr (At (PatFloat x) sp) = Notation.chkOf (At (IFloat x) sp)
+litExpr (At _ sp) = At CAbandon sp
 
 -- | `f p ... = e`
-equation : Pm.Spanned (Equation Expr) -> Either Err Clause
+equation : Pm.Spanned (Notation.Equation Notation.Checkable)
+         -> Either Err Clause
 equation (At (MkEquation _ _ ps rhs) _) = do
   pats <- traverseC (\m -> pat m) ps
   pure (mkClause pats rhs)
@@ -180,7 +181,7 @@ patVars (PRec fps _) = concatMapC (\fp -> patVars (snd fp)) fps
 
 -- | the names a pattern has, as written (an operator's, a record's
 -- | fields' too)
-patIdents : Pat -> List String
+patIdents : Notation.Pat -> List String
 patIdents p = case Pm.nodeOf p of
   PatVar x -> Cons x Nil
   PatTag _ _ ps -> concatMapC (\m -> patIdents m) ps
@@ -192,91 +193,119 @@ patIdents p = case Pm.nodeOf p of
       fs
   _ -> Nil
 
--- | the names an expression has, as written: every name it uses or
--- | binds (a field's, set or declared, too)
-type Idents = { e : Expr -> List String, decl : Decl -> List String }
+-- | the names a term has: every name it uses or binds (a field's, set
+-- | or declared, and a named argument's too)
+type Idents =
+  { inf : Notation.Inferable -> List String
+  , chk : Notation.Checkable -> List String
+  , typ : Notation.TypeForm -> List String
+  , decl : Notation.Declaration -> List String
+  }
 
-lamIdents : Idents -> LamBinder Expr -> List String
-lamIdents r (LamName x _) = Cons x Nil
-lamIdents r (LamImplicit x _) = Cons x Nil
-lamIdents r (LamAnn x _ t) = Cons x (r.e t)
+argIdents : Idents
+          -> Pm.Spanned (Notation.Arg Notation.Checkable)
+          -> List String
+argIdents r (At (ArgExplicit c) _) = r.chk c
+argIdents r (At (ArgProject _) _) = Nil
+argIdents r (At (ArgNamed x c) _) = Cons x (r.chk c)
 
-piIdents : Idents -> PiBinder Expr -> List String
-piIdents r (PiNamed x _ t) = Cons x (r.e t)
-piIdents r (PiImplicit x _ _ t) = Cons x (r.e t)
-piIdents r (PiInstance x _ _ t) = Cons x (r.e t)
-piIdents r (PiAnon d) = r.e d
+piIdents : Idents -> Notation.PiBinder Notation.TypeForm -> List String
+piIdents r (PiNamed x _ t) = Cons x (r.typ t)
+piIdents r (PiImplicit x _ _ t) = Cons x (r.typ t)
+piIdents r (PiInstance x _ _ t) = Cons x (r.typ t)
+piIdents r (PiAnon d) = r.typ d
 
-altIdents : Idents -> Pm.Spanned (Alt Expr) -> List String
-altIdents r (At (MkAlt p b) _) = appendC (patIdents p) (r.e b)
+altIdents : Idents
+          -> Pm.Spanned (Notation.Alt Notation.Checkable)
+          -> List String
+altIdents r (At (MkAlt p b) _) = appendC (patIdents p) (r.chk b)
 
-stmtIdents : Idents -> Pm.Spanned (Stmt Expr) -> List String
-stmtIdents r (At (StmtBind x _ e) _) = Cons x (r.e e)
-stmtIdents r (At (StmtLet p e) _) = appendC (r.e e) (patIdents p)
-stmtIdents r (At (StmtExpr e) _) = r.e e
+paramIdents : Idents
+            -> Pm.Spanned (Notation.Param Notation.TypeForm)
+            -> List String
+paramIdents r (At (ExplicitParam x _ t) _) = Cons x (r.typ t)
+paramIdents r (At (ImplicitParam x _ t) _) = Cons x (r.typ t)
 
-paramIdents : Idents -> Pm.Spanned (Param Expr) -> List String
-paramIdents r (At (ExplicitParam x _ t) _) = Cons x (r.e t)
-paramIdents r (At (ImplicitParam x _ t) _) = Cons x (r.e t)
-
-equationIdents : Idents -> Pm.Spanned (Equation Expr) -> List String
+equationIdents : Idents
+               -> Pm.Spanned (Notation.Equation Notation.Checkable)
+               -> List String
 equationIdents r (At (MkEquation f _ ps rhs) _) =
-  Cons f (appendC (concatMapC (\m -> patIdents m) ps) (r.e rhs))
+  Cons f (appendC (concatMapC (\m -> patIdents m) ps) (r.chk rhs))
 
-identsTermF : Idents -> Expr -> List String
-identsTermF r n = case Pm.nodeOf n of
-  EVar x -> Cons x Nil
-  EApp h args -> appendC (r.e h) (concatMapC r.e args)
-  ENamed x e -> Cons x (r.e e)
-  EPi b cod -> appendC (piIdents r b) (r.e cod)
-  ELam b body -> appendC (lamIdents r b) (r.e body)
-  EAnn e t -> appendC (r.e e) (r.e t)
-  ESpec acc _ _ v -> appendC (r.e acc) (r.e v)
-  ESig fs ->
-    concatMapC
-      (\f -> case Pm.nodeOf f of
-       DeclareField x _ t -> Cons x (r.e t)
-       BadFieldDecl e -> r.e e)
-      fs
-  ESum vs ->
-    concatMapC
-      (\v -> case Pm.nodeOf v of
-       TagVariant _ _ args -> concatMapC r.e args
-       BadVariant e -> r.e e)
-      vs
-  EStruct fs ->
-    concatMapC
-      (\f -> case Pm.nodeOf f of
-       SetField x _ e -> Cons x (r.e e)
-       BadFieldSet e -> r.e e)
-      fs
-  EMatch s alts -> appendC (r.e s) (concatMapC (\a -> altIdents r a) alts)
-  ELetIn rhs a -> appendC (r.e rhs) (altIdents r a)
-  EDo stmts -> concatMapC (\m -> stmtIdents r m) stmts
-  ELocal body ds -> appendC (r.e body) (concatMapC r.decl ds)
+identsInfF : Idents -> Notation.Inferable -> List String
+identsInfF r n = case Pm.nodeOf n of
+  IVar x -> Cons x Nil
+  IApp h args -> appendC (r.inf h) (concatMapC (argIdents r) args)
+  IAnn c t -> appendC (r.chk c) (r.typ t)
+  ISpec a _ _ v -> appendC (r.inf a) (r.chk v)
+  IAnnLam x _ t b -> Cons x (appendC (r.typ t) (r.inf b))
   _ -> Nil
 
-identsDeclF : Idents -> Decl -> List String
+identsChkF : Idents -> Notation.Checkable -> List String
+identsChkF r n = case Pm.nodeOf n of
+  CInf i -> r.inf i
+  CType t -> r.typ t
+  CLam x _ b -> Cons x (r.chk b)
+  CImplicitLam x _ b -> Cons x (r.chk b)
+  CAnnLam x _ t b -> Cons x (appendC (r.typ t) (r.chk b))
+  CTag _ _ args -> concatMapC r.chk args
+  CStruct fs ->
+    concatMapC
+      (\f -> case Pm.nodeOf f of
+       SetField x _ e -> Cons x (r.chk e)
+       BadFieldSet e -> r.chk e)
+      fs
+  CMatch s alts -> appendC (r.inf s) (concatMapC (\a -> altIdents r a) alts)
+  CLetIn rhs a -> appendC (r.inf rhs) (altIdents r a)
+  CLocal body ds -> appendC (r.chk body) (concatMapC r.decl ds)
+  CAbandon -> Nil
+
+identsTypF : Idents -> Notation.TypeForm -> List String
+identsTypF r n = case Pm.nodeOf n of
+  TPi b cod -> appendC (piIdents r b) (r.typ cod)
+  TSig fs ->
+    concatMapC
+      (\f -> case Pm.nodeOf f of
+       DeclareField x _ t -> Cons x (r.typ t)
+       BadFieldDecl e -> r.typ e)
+      fs
+  TSum vs ->
+    concatMapC
+      (\v -> case Pm.nodeOf v of
+       TagVariant _ _ args -> concatMapC r.typ args
+       BadVariant e -> r.typ e)
+      vs
+  TArray a -> r.typ a
+  TInf i -> r.inf i
+  TChk c -> r.chk c
+  _ -> Nil
+
+identsDeclF : Idents -> Notation.Declaration -> List String
 identsDeclF r d = case Pm.nodeOf d of
   DeclEquations f _ ty eqs ->
-    Cons f (appendC (r.e ty) (concatMapC (\m -> equationIdents r m) eqs))
+    Cons f (appendC (r.typ ty) (concatMapC (\m -> equationIdents r m) eqs))
   DeclDefine x _ ps u body ->
     Cons
       x
       (appendC
          (concatMapC (\m -> paramIdents r m) ps)
-         (appendC (r.e u) (r.e body)))
+         (appendC (r.typ u) (r.chk body)))
   DeclTheory x _ ps body ->
-    Cons x (appendC (concatMapC (\m -> paramIdents r m) ps) (r.e body))
-  DeclPrimitive x _ t -> Cons x (r.e t)
+    Cons x (appendC (concatMapC (\m -> paramIdents r m) ps) (r.chk body))
+  DeclPrimitive x _ t -> Cons x (r.typ t)
   DeclTest x _ -> Cons x Nil
-  DeclWatch e -> r.e e
+  DeclWatch e -> r.chk e
 
 idents : Idents
-idents = { e = \n -> identsTermF idents n, decl = \d -> identsDeclF idents d }
+idents =
+  { inf = \n -> identsInfF idents n
+  , chk = \n -> identsChkF idents n
+  , typ = \n -> identsTypF idents n
+  , decl = \d -> identsDeclF idents d
+  }
 
-identsOf : Expr -> List String
-identsOf n = idents.e n
+identsOf : Notation.Checkable -> List String
+identsOf n = idents.chk n
 
 fresh : List String -> String -> String
 fresh used x = if elemBy strEq x used then fresh used (x ++ "'") else x
@@ -286,7 +315,7 @@ fresh used x = if elemBy strEq x used then fresh used (x ++ "'") else x
 
 -- | the variables a pattern binds (an operator is a tag, a field's name
 -- | a label: neither is bound)
-patBinds : Pat -> List String
+patBinds : Notation.Pat -> List String
 patBinds p = case Pm.nodeOf p of
   PatVar x -> Cons x Nil
   PatTag _ _ ps -> concatMapC (\m -> patBinds m) ps
@@ -298,7 +327,7 @@ patBinds p = case Pm.nodeOf p of
       fs
   _ -> Nil
 
-binds : String -> Pat -> Bool
+binds : String -> Notation.Pat -> Bool
 binds x p = elemBy strEq x (patBinds p)
 
 -- | `x` becomes `v` in each item, until one binds `x` again: `f` renames
@@ -308,178 +337,192 @@ renameSeq f b Nil = Nil
 renameSeq f b (Cons m rest) =
   Cons (f m) (if b m then rest else renameSeq f b rest)
 
--- | (`rename x v`, the knot) `p -> e`: `x` is `v` in `e`, unless `p`
--- | binds `x`
-renameAlt : (Expr -> Expr)
-          -> String
-          -> Pm.Spanned (Alt Expr)
-          -> Pm.Spanned (Alt Expr)
-renameAlt rn x (At (MkAlt p b) sp) =
-  if binds x p then At (MkAlt p b) sp else At (MkAlt p (rn b)) sp
+-- | the variable `x` as `v`, in each kind of term (the knot)
+type Renamer =
+  { x : String
+  , v : String
+  , inf : Notation.Inferable -> Notation.Inferable
+  , chk : Notation.Checkable -> Notation.Checkable
+  , typ : Notation.TypeForm -> Notation.TypeForm
+  }
 
-renameStmt : (Expr -> Expr) -> Pm.Spanned (Stmt Expr) -> Pm.Spanned (Stmt Expr)
-renameStmt rn (At (StmtBind y ysp e) sp) = At (StmtBind y ysp (rn e)) sp
-renameStmt rn (At (StmtLet p e) sp) = At (StmtLet p (rn e)) sp
-renameStmt rn (At (StmtExpr e) sp) = At (StmtExpr (rn e)) sp
+-- | `p -> e`: `x` is `v` in `e`, unless `p` binds `x`
+renameAlt : Renamer
+          -> Pm.Spanned (Notation.Alt Notation.Checkable)
+          -> Pm.Spanned (Notation.Alt Notation.Checkable)
+renameAlt r (At (MkAlt p b) sp) =
+  if binds r.x p then At (MkAlt p b) sp else At (MkAlt p (r.chk b)) sp
 
-stmtBinds : String -> Pm.Spanned (Stmt Expr) -> Bool
-stmtBinds x (At (StmtBind y _ _) _) = strEq x y
-stmtBinds x (At (StmtLet p _) _) = binds x p
-stmtBinds x (At (StmtExpr _) _) = False
+renameArg : Renamer
+          -> Pm.Spanned (Notation.Arg Notation.Checkable)
+          -> Pm.Spanned (Notation.Arg Notation.Checkable)
+renameArg r (At (ArgExplicit c) sp) = At (ArgExplicit (r.chk c)) sp
+renameArg r (At (ArgNamed y c) sp) = At (ArgNamed y (r.chk c)) sp
+renameArg r a = a
 
-renameField : (Expr -> Expr)
-            -> Pm.Spanned (FieldDecl Expr)
-            -> Pm.Spanned (FieldDecl Expr)
-renameField rn (At (DeclareField y ysp t) sp) =
-  At (DeclareField y ysp (rn t)) sp
-renameField rn (At (BadFieldDecl e) sp) = At (BadFieldDecl (rn e)) sp
+renameField : Renamer
+            -> Pm.Spanned (Notation.FieldDecl Notation.TypeForm)
+            -> Pm.Spanned (Notation.FieldDecl Notation.TypeForm)
+renameField r (At (DeclareField y ysp t) sp) =
+  At (DeclareField y ysp (r.typ t)) sp
+renameField r (At (BadFieldDecl e) sp) = At (BadFieldDecl (r.typ e)) sp
 
-fieldBinds : String -> Pm.Spanned (FieldDecl Expr) -> Bool
+fieldBinds : String -> Pm.Spanned (Notation.FieldDecl Notation.TypeForm) -> Bool
 fieldBinds x (At (DeclareField y _ _) _) = strEq x y
 fieldBinds x (At (BadFieldDecl _) _) = False
 
-renameEquation : (Expr -> Expr)
-               -> String
-               -> Pm.Spanned (Equation Expr)
-               -> Pm.Spanned (Equation Expr)
-renameEquation rn x (At (MkEquation f fsp ps rhs) sp) =
-  if anyC (binds x) ps then At (MkEquation f fsp ps rhs) sp
-  else At (MkEquation f fsp ps (rn rhs)) sp
+renameEquation : Renamer
+               -> Pm.Spanned (Notation.Equation Notation.Checkable)
+               -> Pm.Spanned (Notation.Equation Notation.Checkable)
+renameEquation r (At (MkEquation f fsp ps rhs) sp) =
+  if anyC (binds r.x) ps then At (MkEquation f fsp ps rhs) sp
+  else At (MkEquation f fsp ps (r.chk rhs)) sp
 
-renameParam : (Expr -> Expr)
-            -> Pm.Spanned (Param Expr)
-            -> Pm.Spanned (Param Expr)
-renameParam rn (At (ExplicitParam y ysp t) sp) =
-  At (ExplicitParam y ysp (rn t)) sp
-renameParam rn (At (ImplicitParam y ysp t) sp) =
-  At (ImplicitParam y ysp (rn t)) sp
+renameParam : Renamer
+            -> Pm.Spanned (Notation.Param Notation.TypeForm)
+            -> Pm.Spanned (Notation.Param Notation.TypeForm)
+renameParam r (At (ExplicitParam y ysp t) sp) =
+  At (ExplicitParam y ysp (r.typ t)) sp
+renameParam r (At (ImplicitParam y ysp t) sp) =
+  At (ImplicitParam y ysp (r.typ t)) sp
 
-paramBinds : String -> Pm.Spanned (Param Expr) -> Bool
+paramBinds : String -> Pm.Spanned (Notation.Param Notation.TypeForm) -> Bool
 paramBinds x (At (ExplicitParam y _ _) _) = strEq x y
 paramBinds x (At (ImplicitParam y _ _) _) = strEq x y
 
 -- | a local definition: its type is outside it, its name binds in its
 -- | equations (and in what follows, which the caller sees to)
-renameDecl : (Expr -> Expr) -> String -> Decl -> Decl
-renameDecl rn x d = case d of
+renameDecl : Renamer -> Notation.Declaration -> Notation.Declaration
+renameDecl r d = case d of
   At (DeclEquations f fsp ty eqs) sp ->
     At
       (DeclEquations
          f
          fsp
-         (rn ty)
-         (if strEq x f then eqs else map (renameEquation rn x) eqs))
+         (r.typ ty)
+         (if strEq r.x f then eqs else map (renameEquation r) eqs))
       sp
   At (DeclDefine y ysp ps u body) sp ->
-    if strEq x y then d
+    if strEq r.x y then d
     else At
         (DeclDefine
            y
            ysp
-           (renameSeq (renameParam rn) (paramBinds x) ps)
-           (if anyC (paramBinds x) ps then u else rn u)
-           (if anyC (paramBinds x) ps then body else rn body))
+           (renameSeq (renameParam r) (paramBinds r.x) ps)
+           (if anyC (paramBinds r.x) ps then u else r.typ u)
+           (if anyC (paramBinds r.x) ps then body else r.chk body))
         sp
   At (DeclTheory y ysp ps body) sp ->
-    if strEq x y then d
+    if strEq r.x y then d
     else At
         (DeclTheory
            y
            ysp
-           (renameSeq (renameParam rn) (paramBinds x) ps)
-           (if anyC (paramBinds x) ps then body else rn body))
+           (renameSeq (renameParam r) (paramBinds r.x) ps)
+           (if anyC (paramBinds r.x) ps then body else r.chk body))
         sp
-  At (DeclPrimitive y ysp t) sp -> At (DeclPrimitive y ysp (rn t)) sp
-  At (DeclWatch e) sp -> At (DeclWatch (rn e)) sp
+  At (DeclPrimitive y ysp t) sp -> At (DeclPrimitive y ysp (r.typ t)) sp
+  At (DeclWatch e) sp -> At (DeclWatch (r.chk e)) sp
   _ -> d
 
-declBinds : String -> Decl -> Bool
-declBinds x d = case declName d of
+declBinds : String -> Notation.Declaration -> Bool
+declBinds x d = case Notation.declName d of
   Just y -> strEq x y
   Nothing -> False
 
-renamePi : (Expr -> Expr) -> PiBinder Expr -> PiBinder Expr
-renamePi rn (PiNamed y ysp t) = PiNamed y ysp (rn t)
-renamePi rn (PiImplicit y ysp bsp t) = PiImplicit y ysp bsp (rn t)
-renamePi rn (PiInstance y ysp bsp t) = PiInstance y ysp bsp (rn t)
-renamePi rn (PiAnon d) = PiAnon (rn d)
+renamePi : Renamer
+         -> Notation.PiBinder Notation.TypeForm
+         -> Notation.PiBinder Notation.TypeForm
+renamePi r (PiNamed y ysp t) = PiNamed y ysp (r.typ t)
+renamePi r (PiImplicit y ysp bsp t) = PiImplicit y ysp bsp (r.typ t)
+renamePi r (PiInstance y ysp bsp t) = PiInstance y ysp bsp (r.typ t)
+renamePi r (PiAnon d) = PiAnon (r.typ d)
 
-piBinds : String -> PiBinder Expr -> Bool
+piBinds : String -> Notation.PiBinder Notation.TypeForm -> Bool
 piBinds x (PiNamed y _ _) = strEq x y
 piBinds x (PiImplicit y _ _ _) = strEq x y
 piBinds x (PiInstance y _ _ _) = strEq x y
 piBinds x (PiAnon _) = False
 
-lamBinds : String -> LamBinder Expr -> Bool
-lamBinds x (LamName y _) = strEq x y
-lamBinds x (LamImplicit y _) = strEq x y
-lamBinds x (LamAnn y _ _) = strEq x y
+renameInfF : Renamer -> Notation.Inferable -> Notation.Inferable
+renameInfF r n = case n of
+  At (IVar y) sp -> if strEq y r.x then At (IVar r.v) sp else n
+  At (IApp h args) sp -> At (IApp (r.inf h) (map (renameArg r) args)) sp
+  At (IAnn c t) sp -> At (IAnn (r.chk c) (r.typ t)) sp
+  At (ISpec a f fsp val) sp -> At (ISpec (r.inf a) f fsp (r.chk val)) sp
+  -- (the type of an annotated lambda's binder is outside it)
+  At (IAnnLam y ysp t b) sp ->
+    At (IAnnLam y ysp (r.typ t) (if strEq y r.x then b else r.inf b)) sp
+  _ -> n
 
--- | the type of an annotated lambda's binder is outside it
-renameLam : (Expr -> Expr) -> LamBinder Expr -> LamBinder Expr
-renameLam rn (LamAnn y ysp t) = LamAnn y ysp (rn t)
-renameLam rn b = b
+renameChkF : Renamer -> Notation.Checkable -> Notation.Checkable
+renameChkF r n = case n of
+  At (CInf i) sp -> At (CInf (r.inf i)) sp
+  At (CType t) sp -> At (CType (r.typ t)) sp
+  At (CLam y ysp b) sp ->
+    if strEq y r.x then n else At (CLam y ysp (r.chk b)) sp
+  At (CImplicitLam y ysp b) sp ->
+    if strEq y r.x then n else At (CImplicitLam y ysp (r.chk b)) sp
+  At (CAnnLam y ysp t b) sp ->
+    At (CAnnLam y ysp (r.typ t) (if strEq y r.x then b else r.chk b)) sp
+  At (CTag t tsp args) sp -> At (CTag t tsp (map r.chk args)) sp
+  At (CStruct fs) sp ->
+    At
+      (CStruct
+         (map
+            (\f -> case f of
+             At (SetField y ysp e) fsp -> At (SetField y ysp (r.chk e)) fsp
+             At (BadFieldSet e) fsp -> At (BadFieldSet (r.chk e)) fsp)
+            fs))
+      sp
+  At (CMatch s alts) sp -> At (CMatch (r.inf s) (map (renameAlt r) alts)) sp
+  At (CLetIn rhs a) sp -> At (CLetIn (r.inf rhs) (renameAlt r a)) sp
+  At (CLocal body ds) sp ->
+    At
+      (CLocal
+         (if anyC (declBinds r.x) ds then body else r.chk body)
+         (renameSeq (renameDecl r) (declBinds r.x) ds))
+      sp
+  _ -> n
+
+renameTypF : Renamer -> Notation.TypeForm -> Notation.TypeForm
+renameTypF r n = case n of
+  At (TPi b cod) sp ->
+    At (TPi (renamePi r b) (if piBinds r.x b then cod else r.typ cod)) sp
+  At (TSig fs) sp ->
+    At (TSig (renameSeq (renameField r) (fieldBinds r.x) fs)) sp
+  At (TSum vs) sp ->
+    At
+      (TSum
+         (map
+            (\m -> case m of
+             At (TagVariant t tsp args) vsp ->
+               At (TagVariant t tsp (map r.typ args)) vsp
+             At (BadVariant e) vsp -> At (BadVariant (r.typ e)) vsp)
+            vs))
+      sp
+  At (TArray a) sp -> At (TArray (r.typ a)) sp
+  At (TInf i) sp -> At (TInf (r.inf i)) sp
+  At (TChk c) sp -> At (TChk (r.chk c)) sp
+  _ -> n
+
+renamer : String -> String -> Renamer
+renamer x v =
+  { x = x
+  , v = v
+  , inf = \n -> renameInfF (renamer x v) n
+  , chk = \n -> renameChkF (renamer x v) n
+  , typ = \n -> renameTypF (renamer x v) n
+  }
 
 -- | the variable `x` becomes `v` wherever it is not bound again (`v` is
 -- | fresh: nothing binds it); a field's name, set or declared, and a
 -- | named argument's are labels, not variables
-rename : String -> String -> Expr -> Expr
-rename x v n = case n of
-  At (EVar y) sp -> if strEq y x then At (EVar v) sp else n
-  At (ELam b body) sp ->
-    At
-      (ELam
-         (renameLam (rename x v) b)
-         (if lamBinds x b then body else rename x v body))
-      sp
-  At (EPi b cod) sp ->
-    At
-      (EPi
-         (renamePi (rename x v) b)
-         (if piBinds x b then cod else rename x v cod))
-      sp
-  At (EAnn e t) sp -> At (EAnn (rename x v e) (rename x v t)) sp
-  At (ESpec acc f fsp val) sp ->
-    At (ESpec (rename x v acc) f fsp (rename x v val)) sp
-  At (EApp h args) sp -> At (EApp (rename x v h) (map (rename x v) args)) sp
-  At (ENamed y e) sp -> At (ENamed y (rename x v e)) sp
-  At (EMatch s alts) sp ->
-    At (EMatch (rename x v s) (map (renameAlt (rename x v) x) alts)) sp
-  At (ELetIn rhs a) sp ->
-    At (ELetIn (rename x v rhs) (renameAlt (rename x v) x a)) sp
-  At (EDo stmts) sp ->
-    At (EDo (renameSeq (renameStmt (rename x v)) (stmtBinds x) stmts)) sp
-  At (ELocal body ds) sp ->
-    At
-      (ELocal
-         (if anyC (declBinds x) ds then body else rename x v body)
-         (renameSeq (renameDecl (rename x v) x) (declBinds x) ds))
-      sp
-  At (EStruct fs) sp ->
-    At
-      (EStruct
-         (map
-            (\f -> case f of
-             At (SetField y ysp e) fsp -> At (SetField y ysp (rename x v e)) fsp
-             At (BadFieldSet e) fsp -> At (BadFieldSet (rename x v e)) fsp)
-            fs))
-      sp
-  At (ESig fs) sp ->
-    At (ESig (renameSeq (renameField (rename x v)) (fieldBinds x) fs)) sp
-  At (ESum vs) sp ->
-    At
-      (ESum
-         (map
-            (\m -> case m of
-             At (TagVariant t tsp args) vsp ->
-               At (TagVariant t tsp (map (rename x v) args)) vsp
-             At (BadVariant e) vsp -> At (BadVariant (rename x v e)) vsp)
-            vs))
-      sp
-  _ -> n
+rename : String -> String -> Notation.Checkable -> Notation.Checkable
+rename x v n = (renamer x v).chk n
 
 -- | a variable pattern `p` matched against the variable `v`: `p` means `v`
-bindVar : String -> MatchPat -> Expr -> Expr
+bindVar : String -> MatchPat -> Notation.Checkable -> Notation.Checkable
 bindVar v (PVar x) e =
   if not (strEq x "_") && not (strEq x v) then rename x v e else e
 bindVar v _ e = e
@@ -516,7 +559,7 @@ type CK =
         -> Pm.Span
         -> List String
         -> List Clause
-        -> Either Err Expr
+        -> Either Err Notation.Checkable
   }
 
 findTagLit : List MatchPat -> Int -> Maybe Int
@@ -596,7 +639,7 @@ armOf : CK
       -> Int
       -> String
       -> TagRow
-      -> Either Err (Pm.Spanned (Alt Expr))
+      -> Either Err (Pm.Spanned (Notation.Alt Notation.Checkable))
 armOf r used bound sp vars rows c v t = do
   arityCheck sp rows c t
   body <-
@@ -610,14 +653,19 @@ armOf r used bound sp vars rows c v t = do
             (\row -> armSpecializeV c t (armFields used bound t v) v row)
             rows))
   pure
-      (alt
-         (patTag
+      (Notation.alt
+         (Notation.patTag
             t.tag
             t.span
             (map (\y -> At (PatVar y) sp) (armFields used bound t v)))
          body)
 
-litYesOne : Int -> Pat -> String -> Clause -> List Clause -> List Clause
+litYesOne : Int
+          -> Notation.Pat
+          -> String
+          -> Clause
+          -> List Clause
+          -> List Clause
 litYesOne c l v r acc = case patAt c r of
   PLit l' ->
     if sameLit l l' then Cons (mkClause (dropAt c r.pats) r.rhs) acc else acc
@@ -625,16 +673,16 @@ litYesOne c l v r acc = case patAt c r of
   PTag _ _ _ -> acc
   PRec _ _ -> acc
 
-litYes : Int -> Pat -> String -> List Clause -> List Clause
+litYes : Int -> Notation.Pat -> String -> List Clause -> List Clause
 litYes c l v Nil = Nil
 litYes c l v (Cons r rest) = litYesOne c l v r (litYes c l v rest)
 
-litNoOne : Int -> Pat -> Clause -> List Clause -> List Clause
+litNoOne : Int -> Notation.Pat -> Clause -> List Clause -> List Clause
 litNoOne c l r acc = case patAt c r of
   PLit l' -> if sameLit l l' then acc else Cons r acc
   _ -> Cons r acc
 
-litNo : Int -> Pat -> List Clause -> List Clause
+litNo : Int -> Notation.Pat -> List Clause -> List Clause
 litNo c l Nil = Nil
 litNo c l (Cons r rest) = litNoOne c l r (litNo c l rest)
 
@@ -642,7 +690,7 @@ litChecks : Pm.Span
           -> List String
           -> List Clause
           -> Int
-          -> Pat
+          -> Notation.Pat
           -> Either Err Unit
 litChecks sp vars rows c l =
   bind
@@ -672,8 +720,8 @@ literalOf : CK
           -> List String
           -> List Clause
           -> Int
-          -> Pat
-          -> Either Err Expr
+          -> Notation.Pat
+          -> Either Err Notation.Checkable
 literalOf r used bound sp vars rows c l = do
   litChecks sp vars rows c l
   yesB <-
@@ -681,12 +729,16 @@ literalOf r used bound sp vars rows c l = do
   noB <- r.compile used bound sp vars (litNo c l rows)
   pure
       (At
-         (EMatch
-            (app
-               (At (EVar (equalityOf l)) (Pm.spanOf l))
-               [At (EVar (varAt vars c)) sp, litExpr l])
-            [ alt (patTag "True" (Pm.spanOf l) Nil) yesB
-            , alt (patTag "False" (Pm.spanOf l) Nil) noB
+         (CMatch
+            (Notation.infApp
+               (At (IVar (equalityOf l)) (Pm.spanOf l))
+               [ At
+                 (ArgExplicit (Notation.chkOf (At (IVar (varAt vars c)) sp)))
+                 sp
+               , At (ArgExplicit (litExpr l)) (Pm.spanOf l)
+               ])
+            [ Notation.alt (Notation.patTag "True" (Pm.spanOf l) Nil) yesB
+            , Notation.alt (Notation.patTag "False" (Pm.spanOf l) Nil) noB
             ])
          (Pm.spanOf l))
 
@@ -700,10 +752,10 @@ noLitHere sp c rows =
 clausePats : Clause -> List MatchPat
 clausePats r = r.pats
 
-clauseRhs : Clause -> Expr
+clauseRhs : Clause -> Notation.Checkable
 clauseRhs r = r.rhs
 
-bindPair : Expr -> Pair String MatchPat -> Expr
+bindPair : Notation.Checkable -> Pair String MatchPat -> Notation.Checkable
 bindPair e (MkPair v p) = bindVar v p e
 
 defaultOf : CK
@@ -714,7 +766,7 @@ defaultOf : CK
           -> List Clause
           -> Int
           -> List Clause
-          -> Either Err (List (Pm.Spanned (Alt Expr)))
+          -> Either Err (List (Pm.Spanned (Notation.Alt Notation.Checkable)))
 defaultOf r used bound sp vars rows c Nil = Right Nil
 defaultOf r used bound sp vars rows c rest = do
   b <-
@@ -729,7 +781,7 @@ defaultOf r used bound sp vars rows c rest = do
               (dropAt c row.pats)
               (bindVar (varAt vars c) (patAt c row) row.rhs))
          rest)
-  pure (Cons (alt (At (PatVar "_") sp) b) Nil)
+  pure (Cons (Notation.alt (At (PatVar "_") sp) b) Nil)
 
 -- | rows whose column `c` is a variable go on in every other case
 defaultArm : CK
@@ -739,7 +791,7 @@ defaultArm : CK
            -> List String
            -> List Clause
            -> Int
-           -> Either Err (List (Pm.Spanned (Alt Expr)))
+           -> Either Err (List (Pm.Spanned (Notation.Alt Notation.Checkable)))
 defaultArm r used bound sp vars rows c =
   defaultOf
     r
@@ -820,13 +872,17 @@ recSpecialize c fs v r = case patAt c r of
       (bindVar v (patAt c r) r.rhs)
 
 -- | `let y = v.f in e`, each field's column bound to its projection
-letFields : Pm.Span -> String -> List (Pair String String) -> Expr -> Expr
+letFields : Pm.Span
+          -> String
+          -> List (Pair String String)
+          -> Notation.Checkable
+          -> Notation.Checkable
 letFields sp v Nil body = body
 letFields sp v (Cons (MkPair f y) rest) body =
   At
-    (ELetIn
-       (app (At (EVar v) sp) [At (EProject f) sp])
-       (alt (At (PatVar y) sp) (letFields sp v rest body)))
+    (CLetIn
+       (Notation.infApp (At (IVar v) sp) [At (ArgProject f) sp])
+       (Notation.alt (At (PatVar y) sp) (letFields sp v rest body)))
     sp
 
 -- | a column of records: a column for each field named, bound to its
@@ -838,7 +894,7 @@ recordOf : CK
          -> List String
          -> List Clause
          -> Int
-         -> Either Err Expr
+         -> Either Err Notation.Checkable
 recordOf r used bound sp vars rows c = do
   noRecMix rows c
   body <-
@@ -865,7 +921,7 @@ compileAt : CK
           -> List Clause
           -> Int
           -> MatchPat
-          -> Either Err Expr
+          -> Either Err Notation.Checkable
 compileAt r used bound sp vars rows c (PLit l) = do
   noRecMix rows c
   literalOf r used bound sp vars rows c l
@@ -879,7 +935,7 @@ compileAt r used bound sp vars rows c p = do
       (\t -> armOf r used bound sp vars rows c (varAt vars c) t)
       (nubTagRows (catMaybesC (map (\row -> tagOf (patAt c row)) rows)))
   dflt <- defaultArm r used bound sp vars rows c
-  pure (At (EMatch (At (EVar (varAt vars c)) sp) (appendC arms dflt)) sp)
+  pure (At (CMatch (At (IVar (varAt vars c)) sp) (appendC arms dflt)) sp)
 
 -- | the match tree for `rows` over the variables `vars`, column by column
 compileF : CK
@@ -888,10 +944,10 @@ compileF : CK
          -> Pm.Span
          -> List String
          -> List Clause
-         -> Either Err Expr
+         -> Either Err Notation.Checkable
 compileF r used bound sp vars rows = case rows of
   -- unreachable: a missing tag is the match's error
-  Nil -> Right (At (EWord AbandonWord) sp)
+  Nil -> Right (At CAbandon sp)
   Cons row rest -> case findTagLit (clausePats row) 0 of
     -- the first equation matches whatever is left: it is the answer
     Nothing ->
@@ -937,7 +993,7 @@ desugarBody : String
             -> List Clause
             -> Int
             -> List String
-            -> Either Err Expr
+            -> Either Err Notation.Checkable
 desugarBody f params sp rows arity used = do
   body <-
     ck.compile
@@ -948,7 +1004,7 @@ desugarBody f params sp rows arity used = do
       rows
   pure
       (foldr2
-         (\x b -> lamName x sp b)
+         (\x b -> Notation.chkLam x sp b)
          body
          (dropC
             (length params)
@@ -958,9 +1014,9 @@ desugarBody f params sp rows arity used = do
 -- | named in the head of the definition
 desugar : String
         -> List String
-        -> List (Pm.Spanned (Equation Expr))
+        -> List (Pm.Spanned (Notation.Equation Notation.Checkable))
         -> Pm.Span
-        -> Either Err Expr
+        -> Either Err Notation.Checkable
 desugar f params eqNs sp = do
   rows <- traverseC (\n -> equation n) eqNs
   arity <- case rows of
@@ -1004,9 +1060,9 @@ desugar f params eqNs sp = do
 
 -- | a `case` whose alternatives match nested patterns: compiled like the
 -- | equations, over one column -- a fresh name for the scrutinee
-type CaseTree = { scrutinee : String, tree : Expr }
+type CaseTree = { scrutinee : String, tree : Notation.Checkable }
 
-caseAlt : Pm.Spanned (Alt Expr) -> Either Err Clause
+caseAlt : Pm.Spanned (Notation.Alt Notation.Checkable) -> Either Err Clause
 caseAlt (At (MkAlt p rhs) _) = do
   p' <- pat p
   pure (mkClause (Cons p' Nil) rhs)
@@ -1029,7 +1085,9 @@ caseNames rows =
        appendC (concatMapC (\p -> patVars p) r.pats) (identsOf r.rhs))
     rows
 
-caseTree : Pm.Span -> List (Pm.Spanned (Alt Expr)) -> Either Err CaseTree
+caseTree : Pm.Span
+         -> List (Pm.Spanned (Notation.Alt Notation.Checkable))
+         -> Either Err CaseTree
 caseTree sp altNs = do
   rows <- traverseC (\n -> caseAlt n) altNs
   caseTreeOf sp rows (caseNames rows) (fresh (caseNames rows) "it")
