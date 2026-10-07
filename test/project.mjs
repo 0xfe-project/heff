@@ -34,6 +34,16 @@ const laid = heff("fmt", "--check", "hello/package.hf", "hello/src/hello/main.hf
 expect("init's files are laid out", laid.status === 0, laid);
 const tested = heff("test", "hello/src/hello/main.hf");
 expect("init's main.hf", tested.status === 0 && tested.stdout.includes("1/1 expectations hold"), tested);
+// (with no file: the project's every .hf file, run where it is; one in
+// a directory starting with `.` or in a project of its own passed over)
+write("hello/.hidden/no.hf", "x : Int\nx = \n");
+write("hello/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
+write("hello/vendor/other/no.hf", "x : Int\nx = \n");
+const inHello = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
+expect("test with no file: the project's", inHello.status === 0 && inHello.stdout.includes("src/hello/main.hf") &&
+  inHello.stdout.includes("package.hf") && !inHello.stdout.includes("no.hf") && inHello.stdout.includes("1/1 expectations hold"), inHello);
+rmSync(join(work, "hello", ".hidden"), { recursive: true });
+rmSync(join(work, "hello", "vendor"), { recursive: true });
 const checked = heff("check", "hello/package.hf");
 expect("package.hf is heff, of type Package", checked.status === 0 && checked.stdout.includes("package : Package"), checked);
 const again = heff("init", "hello");

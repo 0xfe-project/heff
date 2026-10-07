@@ -117,7 +117,7 @@ const noSuch = heff("no-such-command");
 expect("refused: no-such-command", noSuch.status === 1 && noSuch.stdout === "" &&
   noSuch.stderr.startsWith("heff: no command no-such-command\nusage: heff COMMAND ..."), noSuch);
 for (const [args, says] of [
-  [["test"], "heff test: expected FILE...\nusage: heff test FILE... [--seed N]\n"],
+  [["fmt"], "heff fmt: expected FILE...\nusage: heff fmt FILE... [--check]\n"],
   [["check"], "heff check: expected FILE\nusage: heff check FILE\n"],
   [["fmt", "--chek", "x.hf"], "heff fmt: no flag --chek; --check?\nusage: heff fmt FILE... [--check]\n"],
   [["compile", "a.hf", "a.mjs"], "heff compile: --backend=MODE is wanted\n"],
