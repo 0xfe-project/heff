@@ -32,6 +32,7 @@ const rejected = [
   ["test/errors/knot.hf", "the definition would need itself while it is being computed"],
   ["test/errors/knot-record.hf", "the definition would need itself while it is being computed"],
   ["test/errors/case-binds.hf", "which a `case` alternative cannot bind"],
+  ["test/errors/descriptive.hf", "cannot use descriptive syntax in nominal position"],
   ["test/errors/op-pattern.hf", "`++` is not another name for a tag, so no pattern can use it"],
   ["test/errors/case-nested.hf", "literals are matched here: one of them must match every other value"],
   ["test/errors/project-inferred.hf", "the record's shape is not in hand here for `.a`"],

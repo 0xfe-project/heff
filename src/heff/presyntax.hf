@@ -229,6 +229,9 @@ data InferableF c t
   | ISpec (P.Spanned (InferableF c t)) String P.Span c
   | IAnnLam String P.Span t (P.Spanned (InferableF c t))
   | IInvalid Int String
+  -- | in descriptive position: elaborated as nominal, its result marked
+  -- | so (see "Descriptive positions")
+  | INominal (P.Spanned (InferableF c t))
 
 -- | a term checked against a type, over types `t`: `CInf`, a term that
 -- | infers its type, checked against it; `CType`, a type, as an element
@@ -258,6 +261,7 @@ data CheckableF t
                                                (P.Spanned (CheckableF t))
                                                t)))
   | CAbandon
+  | CNominal (P.Spanned (CheckableF t))
 
 -- | a type: `TInf`, a term that infers a universe; `TChk`, one checked
 -- | against one
@@ -275,6 +279,7 @@ data TypeFormF
                (P.Spanned (CheckableF (P.Spanned TypeFormF)))
                (P.Spanned TypeFormF)))
   | TChk (P.Spanned (CheckableF (P.Spanned TypeFormF)))
+  | TNominal (P.Spanned TypeFormF)
 
 type TypeForm = P.Spanned TypeFormF
 
@@ -536,3 +541,177 @@ classify d = classifier.decl d
 
 -- >>> (spineOf (app (app (At (EVar "f") P.noSpan) [At (EVar "x") P.noSpan]) [At (EVar "y") P.noSpan])).args
 -- [At (EVar "x") { start = 0, end = 0 }, At (EVar "y") { start = 0, end = 0 }]
+
+-- Descriptive positions
+--------------------------------------------------------------------------------
+
+-- Where a term is written decides whether it is in descriptive
+-- position (the body of a `theory`, of a `data`/`type` definition, of a
+-- definition by equations, and what passes it on) or nominal
+-- (everywhere else).  So it is marked here, once, before elaboration
+-- (`mark`, at each declaration's terms), and the elaborator takes no
+-- position along:
+--
+-- - in descriptive position, a term that does not pass it on is
+--   elaborated as a nominal one, its result marked so (`INominal`,
+--   `CNominal`, `TNominal`);
+-- - a record or sum type in nominal position is E0204, an `IInvalid`
+--   (as `toInferable` makes one).
+--
+-- What passes descriptive position on: a lambda's body (`\x -> e`,
+-- `{x} => e`), a record's fields, an annotation's term (`(e : T)`), and
+-- a term that is a type, or a type that is a term (`CInf`, `CType`,
+-- `TInf`, `TChk`).  Everything else is nominal: a function and its
+-- arguments, an annotation's type, a binder's type, a record or sum
+-- type's field and variant types, a match's scrutinee and arms, a
+-- `let`'s bound term and body, a local definition.  A definition by
+-- equations is in descriptive position as the clause compiler makes it
+-- (its lambdas, its match), so it is marked after (`heff.toplevel`).
+
+mapAt : {a b : Type} -> (a -> b) -> P.Spanned a -> P.Spanned b
+mapAt f (At x sp) = At (f x) sp
+
+-- | the marking judgments, knotted
+type MK =
+  { i : P.Case -> Inferable -> Inferable
+  , c : P.Case -> Checkable -> Checkable
+  , t : P.Case -> TypeForm -> TypeForm
+  }
+
+argN : MK -> Arg Checkable -> Arg Checkable
+argN r (ArgExplicit c) = ArgExplicit (r.c N c)
+argN r (ArgProject x) = ArgProject x
+argN r (ArgNamed x c) = ArgNamed x (r.c N c)
+
+altN : MK -> Alt Checkable -> Alt Checkable
+altN r (MkAlt p b) = MkAlt p (r.c N b)
+
+fieldSetM : MK -> P.Case -> FieldSet Checkable -> FieldSet Checkable
+fieldSetM r cs (SetField x sp e) = SetField x sp (r.c cs e)
+fieldSetM r cs (BadFieldSet e) = BadFieldSet (r.c cs e)
+
+fieldDeclN : MK -> FieldDecl TypeForm -> FieldDecl TypeForm
+fieldDeclN r (DeclareField x sp t) = DeclareField x sp (r.t N t)
+fieldDeclN r (BadFieldDecl e) = BadFieldDecl (r.t N e)
+
+variantN : MK -> Variant TypeForm -> Variant TypeForm
+variantN r (TagVariant x sp ts) = TagVariant x sp (map (r.t N) ts)
+variantN r (BadVariant e) = BadVariant (r.t N e)
+
+piN : MK -> PiBinder TypeForm -> PiBinder TypeForm
+piN r (PiNamed x sp t) = PiNamed x sp (r.t N t)
+piN r (PiImplicit x sp sp2 t) = PiImplicit x sp sp2 (r.t N t)
+piN r (PiInstance x sp sp2 t) = PiInstance x sp sp2 (r.t N t)
+piN r (PiAnon t) = PiAnon (r.t N t)
+
+paramN : MK -> Param TypeForm -> Param TypeForm
+paramN r (ExplicitParam x sp t) = ExplicitParam x sp (r.t N t)
+paramN r (ImplicitParam x sp t) = ImplicitParam x sp (r.t N t)
+
+eqN : MK -> Equation Checkable -> Equation Checkable
+eqN r (MkEquation f sp ps rhs) = MkEquation f sp ps (r.c N rhs)
+
+-- (a local definition: nominal throughout)
+declN : MK -> DeclF Checkable TypeForm -> DeclF Checkable TypeForm
+declN r (DeclEquations f sp ty eqs) =
+  DeclEquations f sp (r.t N ty) (map (mapAt (eqN r)) eqs)
+declN r (DeclDefine x sp ps u body) =
+  DeclDefine x sp (map (mapAt (paramN r)) ps) (r.t N u) (r.c N body)
+declN r (DeclTheory x sp ps body) =
+  DeclTheory x sp (map (mapAt (paramN r)) ps) (r.c N body)
+declN r (DeclPrimitive x sp t) = DeclPrimitive x sp (r.t N t)
+declN r (DeclTest x sp) = DeclTest x sp
+declN r (DeclWatch c) = DeclWatch (r.c N c)
+
+-- (nominal: each part as its place says)
+infNode : MK -> InferableF Checkable TypeForm -> InferableF Checkable TypeForm
+infNode r (IApp h args) = IApp (r.i N h) (map (mapAt (argN r)) args)
+infNode r (IAnn c t) = IAnn (r.c N c) (r.t N t)
+infNode r (ISpec a x sp v) = ISpec (r.i N a) x sp (r.c N v)
+infNode r (IAnnLam x sp t b) = IAnnLam x sp (r.t N t) (r.i N b)
+infNode r n = n
+
+chkNode : MK -> CheckableF TypeForm -> CheckableF TypeForm
+chkNode r (CInf i) = CInf (r.i N i)
+chkNode r (CType t) = CType (r.t N t)
+chkNode r (CLam x sp b) = CLam x sp (r.c N b)
+chkNode r (CImplicitLam x sp b) = CImplicitLam x sp (r.c N b)
+chkNode r (CAnnLam x sp t b) = CAnnLam x sp (r.t N t) (r.c N b)
+chkNode r (CTag x sp args) = CTag x sp (map (r.c N) args)
+chkNode r (CStruct fs) = CStruct (map (mapAt (fieldSetM r N)) fs)
+chkNode r (CMatch sc alts) = CMatch (r.i N sc) (map (mapAt (altN r)) alts)
+chkNode r (CLetIn rhs alt) = CLetIn (r.i N rhs) (mapAt (altN r) alt)
+chkNode r (CLocal body ds) = CLocal (r.c N body) (map (mapAt (declN r)) ds)
+chkNode r n = n
+
+typNode : MK -> TypeFormF -> TypeFormF
+typNode r (TPi b cod) = TPi (piN r b) (r.t N cod)
+typNode r (TSig fs) = TSig (map (mapAt (fieldDeclN r)) fs)
+typNode r (TSum vs) = TSum (map (mapAt (variantN r)) vs)
+typNode r (TArray a) = TArray (r.t N a)
+typNode r (TInf i) = TInf (r.i N i)
+typNode r (TChk c) = TChk (r.c N c)
+typNode r n = n
+
+-- (descriptive: passed on, or elaborated as nominal and marked)
+infDe : MK -> P.Span -> InferableF Checkable TypeForm -> Inferable
+infDe r sp (IAnn c t) = At (IAnn (r.c De c) (r.t N t)) sp
+infDe r sp (IInvalid code why) = At (IInvalid code why) sp
+infDe r sp n = At (INominal (At (infNode r n) sp)) sp
+
+chkDe : MK -> P.Span -> CheckableF TypeForm -> Checkable
+chkDe r sp (CInf i) = At (CInf (r.i De i)) sp
+chkDe r sp (CType t) = At (CType (r.t De t)) sp
+chkDe r sp (CLam x xsp b) = At (CLam x xsp (r.c De b)) sp
+chkDe r sp (CImplicitLam x xsp b) = At (CImplicitLam x xsp (r.c De b)) sp
+chkDe r sp (CStruct fs) = At (CStruct (map (mapAt (fieldSetM r De)) fs)) sp
+chkDe r sp n = At (CNominal (At (chkNode r n) sp)) sp
+
+typDe : MK -> P.Span -> TypeFormF -> TypeForm
+typDe r sp (TSig fs) = At (typNode r (TSig fs)) sp
+typDe r sp (TSum vs) = At (typNode r (TSum vs)) sp
+typDe r sp (TInf i) = At (TInf (r.i De i)) sp
+typDe r sp (TChk c) = At (TChk (r.c De c)) sp
+typDe r sp n = At (TNominal (At (typNode r n) sp)) sp
+
+-- (nominal: a record or sum type is E0204)
+descriptiveHere : P.Span -> TypeForm
+descriptiveHere sp =
+  At (TInf (invalid 4 "cannot use descriptive syntax in nominal position" sp)) sp
+
+typNom : MK -> P.Span -> TypeFormF -> TypeForm
+typNom r sp (TSig _) = descriptiveHere sp
+typNom r sp (TSum _) = descriptiveHere sp
+typNom r sp n = At (typNode r n) sp
+
+markI : MK -> P.Case -> Inferable -> Inferable
+markI r N (At n sp) = At (infNode r n) sp
+markI r De (At n sp) = infDe r sp n
+
+markC : MK -> P.Case -> Checkable -> Checkable
+markC r N (At n sp) = At (chkNode r n) sp
+markC r De (At n sp) = chkDe r sp n
+
+markT : MK -> P.Case -> TypeForm -> TypeForm
+markT r N (At n sp) = typNom r sp n
+markT r De (At n sp) = typDe r sp n
+
+mk : MK
+mk =
+  { i = \cs n -> markI mk cs n
+  , c = \cs n -> markC mk cs n
+  , t = \cs n -> markT mk cs n
+  }
+
+-- | a term, its descriptive positions marked (`De`: it is in one)
+markTerm : P.Case -> Checkable -> Checkable
+markTerm cs n = mk.c cs n
+
+-- | a type, its descriptive positions marked
+markType : P.Case -> TypeForm -> TypeForm
+markType cs n = mk.t cs n
+
+-- | what a term in descriptive position, elaborated as nominal, is
+unNominal : Inferable -> Inferable
+unNominal (At (INominal i) _) = i
+unNominal i = i
