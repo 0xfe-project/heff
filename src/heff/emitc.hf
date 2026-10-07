@@ -44,13 +44,17 @@ mangleChar c =
   if isAlnum c then strFromCharCode c
   else "_" ++ hexDigit (intDiv (intMod c 256) 16) ++ hexDigit (intMod c 16)
 
-mangleGo : String -> Int -> String -> String
-mangleGo s i acc =
-  if i >= strLength s then acc else mangleGo s (i + 1) (acc ++ mangleChar (charCode s i))
+-- (from `i`, a run of letters and digits scanned to `j`: each run taken
+-- whole, not a letter at a time)
+mangleW : String -> Int -> Int -> String -> String
+mangleW s i j acc =
+  if j < strLength s && isAlnum (charCode s j) then mangleW s i (j + 1) acc
+  else if j >= strLength s then acc ++ strSlice s i j
+  else mangleW s (j + 1) (j + 1) (acc ++ strSlice s i j ++ mangleChar (charCode s j))
 
 -- | a name as C spells it: letters and digits kept, the rest `_xx`
 mangle : String -> String
-mangle s = mangleGo s 0 ""
+mangle s = mangleW s 0 0 ""
 
 cGlobal : String -> String
 cGlobal k = "g_" ++ mangle k
@@ -323,36 +327,23 @@ addLam proto def = \s ->
 -- Free variables
 --------------------------------------------------------------------------------
 
-varsIn : (I.Expr -> List String) -> List I.Expr -> List String
-varsIn go es = concatMap go es
-
--- (the variables it mentions, and those it binds: names being unique,
--- what it mentions and does not bind is free)
-mentioned : I.Expr -> List String
-mentioned (EVar x) = Cons x Nil
-mentioned (ELam _ b) = mentioned b
-mentioned (EApp f as) = varsIn mentioned (Cons f as)
-mentioned (ELet _ a b) = varsIn mentioned [a, b]
-mentioned (ERecord fs) = varsIn mentioned (map snd fs)
-mentioned (EProj e _) = mentioned e
-mentioned (ETag _ as) = varsIn mentioned as
-mentioned (EMatch s arms) = varsIn mentioned (Cons s (map I.armBody arms))
-mentioned (EPrimCall _ as) = varsIn mentioned as
-mentioned (ECall _ as) = varsIn mentioned as
-mentioned _ = Nil
-
-bound : I.Expr -> List String
-bound (ELam xs b) = concatList xs (bound b)
-bound (EApp f as) = varsIn bound (Cons f as)
-bound (ELet x a b) = Cons x (varsIn bound [a, b])
-bound (ERecord fs) = varsIn bound (map snd fs)
-bound (EProj e _) = bound e
-bound (ETag _ as) = varsIn bound as
-bound (EMatch s arms) =
-  concatList (concatMap I.armVars arms) (varsIn bound (Cons s (map I.armBody arms)))
-bound (EPrimCall _ as) = varsIn bound as
-bound (ECall _ as) = varsIn bound as
-bound _ = Nil
+-- (the variables a worklist binds, `bs`, and mentions, `ms`, last first:
+-- names being unique, what it mentions and does not bind is free --
+-- both gathered in one walk)
+fvW : List String -> List String -> List I.Expr -> Pair (List String) (List String)
+fvW bs ms Nil = MkPair bs ms
+fvW bs ms (Cons (EVar x) rest) = fvW bs (Cons x ms) rest
+fvW bs ms (Cons (ELam xs b) rest) = fvW (concatList xs bs) ms (Cons b rest)
+fvW bs ms (Cons (EApp f as) rest) = fvW bs ms (Cons f (concatList as rest))
+fvW bs ms (Cons (ELet x a b) rest) = fvW (Cons x bs) ms (Cons a (Cons b rest))
+fvW bs ms (Cons (ERecord fs) rest) = fvW bs ms (I.pushFields fs rest)
+fvW bs ms (Cons (EProj e _) rest) = fvW bs ms (Cons e rest)
+fvW bs ms (Cons (ETag _ as) rest) = fvW bs ms (concatList as rest)
+fvW bs ms (Cons (EMatch s arms) rest) =
+  fvW (concatList (concatMap I.armVars arms) bs) ms (Cons s (I.pushArms arms rest))
+fvW bs ms (Cons (EPrimCall _ as) rest) = fvW bs ms (concatList as rest)
+fvW bs ms (Cons (ECall _ as) rest) = fvW bs ms (concatList as rest)
+fvW bs ms (Cons _ rest) = fvW bs ms rest
 
 -- (those mentioned not bound: `bs` reckoned once, not for each)
 setOf : List String -> M.Map String Unit
@@ -368,8 +359,11 @@ freeGo bs seen (Cons v vs) acc =
 freeAmong : List String -> List String -> List String
 freeAmong bs ms = freeGo (setOf bs) M.empty ms Nil
 
+freeFrom : List String -> Pair (List String) (List String) -> List String
+freeFrom xs (MkPair bs ms) = freeAmong (concatList xs bs) (reverse ms)
+
 freeOf : List String -> I.Expr -> List String
-freeOf xs b = freeAmong (concatList xs (bound b)) (mentioned b)
+freeOf xs b = freeFrom xs (fvW Nil Nil (Cons b Nil))
 
 -- Reference counts
 --------------------------------------------------------------------------------
