@@ -330,14 +330,18 @@ safeGlobals defs =
 
 -- | a known function given fewer arguments than it takes (each pure):
 -- | it only builds a closure
+partialOf : St -> List I.Expr -> Maybe I.Expr -> Bool
+partialOf s as (Just (ELam xs _)) =
+  length as < length xs && I.allI (map (pureIn s.safe s.total) as)
+partialOf s as _ = False
+
+partialHead : St -> List I.Expr -> I.Expr -> Bool
+partialHead s as (EGlobal g) = partialOf s as (M.lookup compareString g s.sp.all)
+partialHead s as _ = False
+
 partialIn : St -> I.Expr -> Bool
-partialIn s e = case e of
-  EApp (EGlobal g) as -> case M.lookup compareString g s.sp.all of
-    Just (ELam xs _) ->
-      length as < length xs
-      && I.allI (map (\a -> pureIn s.safe s.total a) as)
-    _ -> False
-  _ -> False
+partialIn s (EApp f as) = partialHead s as f
+partialIn s _ = False
 
 isPure : I.Expr -> M Bool
 isPure e = \s -> MkPair (pureIn s.safe s.total e || partialIn s e) s
@@ -636,11 +640,12 @@ specDepth = 16
 
 -- | an argument a copy may be made for
 knownArg : M.Map String Unit -> I.Expr -> Bool
-knownArg kinds e = case e of
-  EGlobal g -> M.member compareString g kinds
-  ELam _ _ -> I.size e <= specArgSize && Sp.closedIn Nil e
-  ERecord _ -> I.size e <= specArgSize && Sp.closedIn Nil e
-  _ -> False
+knownArg kinds (EGlobal g) = M.member compareString g kinds
+knownArg kinds (ELam xs b) =
+  I.size (ELam xs b) <= specArgSize && Sp.closedIn Nil (ELam xs b)
+knownArg kinds (ERecord fs) =
+  I.size (ERecord fs) <= specArgSize && Sp.closedIn Nil (ERecord fs)
+knownArg kinds _ = False
 
 nthE : Int -> List I.Expr -> Maybe I.Expr
 nthE i Nil = Nothing
@@ -721,12 +726,11 @@ popSpec h b = \s ->
 
 -- | the copy's body: the parameters left, the calls of itself of it
 specBody : String -> String -> List Bool -> List I.Expr -> I.Expr -> M I.Expr
-specBody g h marks as lam1 = case lam1 of
-  ELam xs1 b1 -> do
-    b2 <- substMarked marks xs1 as (Sp.selfTo g h marks b1)
-    pure (if null (keepParams marks xs1) then b2
-      else ELam (keepParams marks xs1) b2)
-  _ -> pure lam1
+specBody g h marks as (ELam xs1 b1) = do
+  b2 <- substMarked marks xs1 as (Sp.selfTo g h marks b1)
+  pure (if null (keepParams marks xs1) then b2
+    else ELam (keepParams marks xs1) b2)
+specBody g h marks as lam1 = pure lam1
 
 -- Arity
 --------------------------------------------------------------------------------
@@ -742,20 +746,19 @@ specBody g h marks as lam1 = case lam1 of
 
 -- | computing it is little, and cannot fail
 cheap : M.Map String Unit -> I.Expr -> Bool
-cheap safe e = case e of
-  EVar _ -> True
-  EGlobal g -> M.member compareString g safe
-  ELam _ _ -> True
-  EPrim _ -> True
-  EInt _ -> True
-  EFloat _ -> True
-  EStr _ -> True
-  ETag _ as -> I.allI (map (\a -> cheap safe a) as)
-  ERecord fs -> I.allI (map (\p -> cheap safe (snd p)) fs)
-  EProj e2 _ -> cheap safe e2
-  EPrimCall p as ->
-    not (elemStr p failing) && I.allI (map (\a -> cheap safe a) as)
-  _ -> False
+cheap safe (EVar _) = True
+cheap safe (EGlobal g) = M.member compareString g safe
+cheap safe (ELam _ _) = True
+cheap safe (EPrim _) = True
+cheap safe (EInt _) = True
+cheap safe (EFloat _) = True
+cheap safe (EStr _) = True
+cheap safe (ETag _ as) = I.allI (map (cheap safe) as)
+cheap safe (ERecord fs) = I.allI (map (cheap safe) (map snd fs))
+cheap safe (EProj e _) = cheap safe e
+cheap safe (EPrimCall p as) =
+  not (elemStr p failing) && I.allI (map (cheap safe) as)
+cheap safe _ = False
 
 minL : List Int -> Int
 minL Nil = 0
@@ -763,45 +766,39 @@ minL (Cons x xs) = foldl (\m y -> minI m y) x xs
 
 -- | how many parameters every way out of it takes
 lamsOut : M.Map String Unit -> I.Expr -> Int
-lamsOut safe e = case e of
-  ELam ys _ -> length ys
-  ELet _ a b -> if cheap safe a then lamsOut safe b else 0
-  EMatch sc arms ->
-    if cheap safe sc && not (null arms)
-      then minL (map (\a -> lamsOut safe (I.armBody a)) arms)
-    else 0
-  _ -> 0
+lamsOut safe (ELam ys _) = length ys
+lamsOut safe (ELet _ a b) = if cheap safe a then lamsOut safe b else 0
+lamsOut safe (EMatch sc arms) =
+  if cheap safe sc && not (null arms)
+    then minL (map (lamsOut safe) (map I.armBody arms))
+  else 0
+lamsOut safe _ = 0
 
 -- | each way out without its first lambdas, their parameters `zs`
+stripArm : (I.Expr -> I.Expr) -> I.Arm -> I.Arm
+stripArm go (MkArm t vs b) = MkArm t vs (go b)
+
 stripLams : List String -> I.Expr -> I.Expr
-stripLams zs e = case e of
-  ELam ys b ->
-    I.subst
-      (paramsTo ys (map (\z -> EVar z) zs))
-      (if length ys > length zs then ELam (dropL (length zs) ys) b else b)
-  ELet x a b -> ELet x a (stripLams zs b)
-  EMatch sc arms ->
-    EMatch
-      sc
-      (map
-         (\a -> case a of
-          MkArm t vs b -> MkArm t vs (stripLams zs b))
-         arms)
-  _ -> e
+stripLams zs (ELam ys b) =
+  I.subst
+    (paramsTo ys (map (\z -> EVar z) zs))
+    (if length ys > length zs then ELam (dropL (length zs) ys) b else b)
+stripLams zs (ELet x a b) = ELet x a (stripLams zs b)
+stripLams zs (EMatch sc arms) = EMatch sc (map (stripArm (stripLams zs)) arms)
+stripLams zs e = e
 
 raiseWith : List String -> I.Expr -> List String -> I.Expr
 raiseWith xs b zs = ELam (appendL xs zs) (stripLams zs b)
 
 -- | a function, taking the parameters every way out of it does
 raise : I.Expr -> M I.Expr
-raise e = case e of
-  ELam xs b -> do
-    s <- get
-    if lamsOut s.safe b == 0 then pure e
-      else do
-        zs <- freshParams (lamsOut s.safe b)
-        pure (raiseWith xs b zs)
-  _ -> pure e
+raise (ELam xs b) = do
+  s <- get
+  if lamsOut s.safe b == 0 then pure (ELam xs b)
+    else do
+      zs <- freshParams (lamsOut s.safe b)
+      pure (raiseWith xs b zs)
+raise e = pure e
 
 -- | a copy made: simplified with fuel of its own
 makeSpec : SK -> String -> List String -> I.Expr -> List I.Expr -> List Bool -> String -> M I.Expr
@@ -882,14 +879,15 @@ knownField g l = do
 -- | there (what the other judgments know a primitive's computation by;
 -- | `heff.arity` does the same for the definitions, whose parameters are
 -- | not known until the simplifier is done)
+primAppN : String -> List I.Expr -> Maybe Int -> I.Expr
+primAppN p as (Just n) =
+  if length as == n then EPrimCall p as
+  else if length as > n then EApp (EPrimCall p (takeL n as)) (dropL n as)
+  else EApp (EPrim p) as
+primAppN p as Nothing = EApp (EPrim p) as
+
 primApp : String -> List I.Expr -> I.Expr
-primApp p as = case Pr.primArity p of
-  Just n ->
-    if length as >= n
-      then (if length as == n then EPrimCall p as
-        else EApp (EPrimCall p (takeL n as)) (dropL n as))
-    else EApp (EPrim p) as
-  Nothing -> EApp (EPrim p) as
+primApp p as = primAppN p as (Pr.primArity p)
 
 -- | an application of simplified parts
 applyToF : SK -> I.Expr -> List I.Expr -> M I.Expr
