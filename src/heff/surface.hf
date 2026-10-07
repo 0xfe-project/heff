@@ -1,6 +1,6 @@
--- The reader: text into notation.  The text is read once, by `heff.cst`
+-- The reader: text into presyntax.  The text is read once, by `heff.cst`
 -- (the concrete syntax the formatter lays out too); here what it reads
--- is lowered into the notation the elaborator takes -- which names are
+-- is lowered into the presyntax the elaborator takes -- which names are
 -- in scope (a capitalised one is a tag unless it is), how operators bind
 -- (the fixities), the sugar taken apart, and signatures met with their
 -- equations.  `P` is the lowering's monad -- state threaded, a diagnostic
@@ -9,11 +9,12 @@
 
 import array as A
 import heff.cst as C
+import heff.diagnostic
 import heff.fixity as F
 import heff.fmt.lex as L
 import heff.fmt.toks as Tk
-import heff.notation
 import heff.params as Pm
+import heff.presyntax
 import prelude
 
 type Binders = { f : String, names : List String, implicits : List String }
@@ -218,31 +219,32 @@ floatOfText s =
         (splitExp (strSlice s 1 (strLength s)) 0)
   else floatSplit s (splitExp s 0)
 
-type Operand = { op : C.T, e : Ntn }
+type Operand a = { op : C.T, e : a }
 
-mkOperand : C.T -> Ntn -> Operand
+mkOperand : {a : Type} -> C.T -> a -> Operand a
 mkOperand t e = { op = t, e = e }
 
-binderNames : Ntn -> List String
-binderNames (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) _) _) = Cons x Nil
-binderNames (At (NBrace n) _) = binderNames n
-binderNames (At (NBracket n) _) = binderNames n
-binderNames _ = Nil
+piBinderNames : PiBinder Expr -> List String
+piBinderNames (PiNamed x _ _) = Cons x Nil
+piBinderNames (PiImplicit x _ _ _) = Cons x Nil
+piBinderNames (PiInstance x _ _ _) = Cons x Nil
+piBinderNames (PiAnon _) = Nil
 
 -- | the names a (function) type binds: `(x : A) -> ...`, `{x : A} -> ...`
-piBinders : Ntn -> List String
-piBinders (At (Infix b (At (Keyword KArrow) _) rest) _) =
-  appendS (binderNames b) (piBinders rest)
+piBinders : Expr -> List String
+piBinders (At (EPi b rest) _) = appendS (piBinderNames b) (piBinders rest)
 piBinders _ = Nil
 
 -- | the names of the implicit parameters, `{x : A} -> ...`
-piImplicits : Ntn -> List String
-piImplicits (At (Infix (At (NBrace b) bsp) (At (Keyword KArrow) _) rest) _) =
-  appendS (binderNames (At (NBrace b) bsp)) (piImplicits rest)
-piImplicits (At (Infix (At (NBracket b) bsp) (At (Keyword KArrow) _) rest) _) =
-  appendS (binderNames (At (NBracket b) bsp)) (piImplicits rest)
-piImplicits (At (Infix _ (At (Keyword KArrow) _) rest) _) = piImplicits rest
+piImplicits : Expr -> List String
+piImplicits (At (EPi (PiImplicit x _ _ _) rest) _) = Cons x (piImplicits rest)
+piImplicits (At (EPi (PiInstance x _ _ _) rest) _) = Cons x (piImplicits rest)
+piImplicits (At (EPi _ rest) _) = piImplicits rest
 piImplicits _ = Nil
+
+paramName : Pm.Spanned (Param Expr) -> String
+paramName (At (ExplicitParam x _ _) _) = x
+paramName (At (ImplicitParam x _ _) _) = x
 
 concatMapS : {a b : Type} -> (a -> List b) -> List a -> List b
 concatMapS f Nil = Nil
@@ -263,37 +265,36 @@ boundBy pv (POp l op q) = appendS (boundBy pv l) (boundBy pv q)
 boundBy pv (PRec o fs commas c) = concatMapS (\q -> boundBy pv q) fs
 boundBy pv (PField x eq q) = boundBy pv q
 
-isIdentN : Ntn -> Bool
-isIdentN (At (Ident _) _) = True
-isIdentN _ = False
+isVarE : Expr -> Bool
+isVarE (At (EVar _) _) = True
+isVarE _ = False
 
 -- (a capitalised name, not a tag: `'x` is written one longer than `x`)
-isNameN : Ntn -> Bool
-isNameN (At (Ident _) _) = True
-isNameN (At (NTag x) sp) = sp.end - sp.start == strLength x
-isNameN _ = False
+isNameE : Expr -> Bool
+isNameE (At (EVar _) _) = True
+isNameE (At (ETag x) sp) = sp.end - sp.start == strLength x
+isNameE _ = False
 
-asNameN : Ntn -> Ntn
-asNameN (At (NTag x) sp) = At (Ident x) sp
-asNameN n = n
+asNameE : Expr -> Expr
+asNameE (At (ETag x) sp) = At (EVar x) sp
+asNameE e = e
 
 catMaybesS : {a : Type} -> List (Maybe a) -> List a
 catMaybesS Nil = Nil
 catMaybesS (Cons (Just x) xs) = Cons x (catMaybesS xs)
 catMaybesS (Cons Nothing xs) = catMaybesS xs
 
-identOf : Ntn -> Maybe String
-identOf (At (Ident x) _) = Just x
-identOf (At (NTag x) _) = Just x
+identOf : Expr -> Maybe String
+identOf (At (EVar x) _) = Just x
+identOf (At (ETag x) _) = Just x
 identOf _ = Nothing
 
-identsOfG : Ntn -> List String
-identsOfG g =
-  catMaybesS (map identOf (Cons (getGroup g).head (getGroup g).args))
+identsOfG : Expr -> List String
+identsOfG g = catMaybesS (map identOf (Cons (spineOf g).head (spineOf g).args))
 
-asBinderOn : Ntn -> P Ntn
+asBinderOn : Expr -> P Expr
 asBinderOn e = case e of
-  At (Infix g (At (Keyword KAnn) _) _) _ -> do
+  At (EAnn g _) _ -> do
     pModify (\s -> setScope (appendS (identsOfG g) s.scope) s)
     pure e
   _ -> pure e
@@ -302,120 +303,116 @@ allS : {a : Type} -> (a -> Bool) -> List a -> Bool
 allS p Nil = True
 allS p (Cons x xs) = p x && allS p xs
 
-nameBinder : Ntn -> Ntn
-nameBinder (At (Infix g (At (Keyword KAnn) ksp) t) _) =
-  if allS isNameN (Cons (getGroup g).head (getGroup g).args)
-    then infixOp
-        (group (asNameN (getGroup g).head) (map asNameN (getGroup g).args))
-        (At (Keyword KAnn) ksp)
-        t
-  else infixOp g (At (Keyword KAnn) ksp) t
+nameBinder : Expr -> Expr
+nameBinder (At (EAnn g t) _) =
+  if allS isNameE (Cons (spineOf g).head (spineOf g).args)
+    then ann (app (asNameE (spineOf g).head) (map asNameE (spineOf g).args)) t
+  else ann g t
 nameBinder e0 = e0
 
 -- | `A : T` as a binder: what is left of `:` is names (in scope after)
-asBinder : Ntn -> P Ntn
+asBinder : Expr -> P Expr
 asBinder e0 = asBinderOn (nameBinder e0)
 
 foldr : {a b : Type} -> (a -> b -> b) -> b -> List a -> b
 foldr f z Nil = z
 foldr f z (Cons x xs) = f x (foldr f z xs)
 
-wrapB : Bool -> Ntn -> Pm.Span -> Ntn
-wrapB True n sp = At (NBrace n) sp
-wrapB False n sp = n
+wrapB : Bool -> Expr -> Pm.Span -> Expr
+wrapB True e sp = At (EBrace e) sp
+wrapB False e sp = e
 
-arrowNames : Pm.Span
-           -> Ntn
-           -> Ntn
-           -> Ntn
-           -> Pm.Span
-           -> Ntn
-           -> Bool
-           -> Ntn
-           -> Ntn
-arrowNames sp lhs rhs g ksp ty braced orig =
-  if allS isIdentN (Cons (getGroup g).head (getGroup g).args)
-  && length (getGroup g).args > 0
+-- | what is left of `->`: `(x : A)`, `{x : A}`, `{{x : A}}`, or a type
+piBinderOf : Expr -> PiBinder Expr
+piBinderOf (At (EAnn (At (EVar x) xsp) t) _) = PiNamed x xsp t
+piBinderOf (At (EBrace (At (EAnn (At (EVar x) xsp) t) _)) bsp) =
+  PiImplicit x xsp bsp t
+piBinderOf (At (EBracket (At (EAnn (At (EVar x) xsp) t) _)) bsp) =
+  PiInstance x xsp bsp t
+piBinderOf d = PiAnon d
+
+-- | `d -> b`, from the one to the other
+piOf : Expr -> Expr -> Expr
+piOf d b = At (EPi (piBinderOf d) b) (spanning (Pm.spanOf d) (Pm.spanOf b))
+
+arrowNames : Expr -> Expr -> Expr -> Bool -> Expr -> Expr
+arrowNames rhs g ty braced orig =
+  if allS isVarE (Cons (spineOf g).head (spineOf g).args)
+  && length (spineOf g).args > 0
     then foldr
-        (\x b ->
-           infixOp
-             (wrapB
-                braced
-                (infixOp x (At (Keyword KAnn) ksp) ty)
-                (ntnSpan orig))
-             (At (Keyword KArrow) sp)
-             b)
+        (\x b -> piOf (wrapB braced (ann x ty) (Pm.spanOf orig)) b)
         rhs
-        (Cons (getGroup g).head (getGroup g).args)
-  else infixOp orig (At (Keyword KArrow) sp) rhs
+        (Cons (spineOf g).head (spineOf g).args)
+  else piOf orig rhs
 
 -- `{a : T} -> B`: braces with one declaration, left of an arrow, bind
 -- an implicit argument
-arrowBinop : Pm.Span -> Ntn -> Ntn -> Ntn
-arrowBinop sp lhs rhs = case lhs of
-  At (Infix g (At (Keyword KAnn) ksp) ty) _ ->
-    arrowNames sp lhs rhs g ksp ty False lhs
-  At (NBrace (At (Infix g (At (Keyword KAnn) ksp) ty) _)) bsp ->
-    arrowNames sp lhs rhs g ksp ty True lhs
-  _ -> infixOp lhs (At (Keyword KArrow) sp) rhs
+arrowBinop : Expr -> Expr -> Expr
+arrowBinop lhs rhs = case lhs of
+  At (EAnn g ty) _ -> arrowNames rhs g ty False lhs
+  At (EBrace (At (EAnn g ty) _)) _ -> arrowNames rhs g ty True lhs
+  _ -> piOf lhs rhs
 
-specOne : Pm.Span -> Ntn -> Ntn -> Ntn
-specOne sp acc (At (Infix (At (Ident x) xsp) k v) _) =
-  infixOp
-    acc
-    (At (Keyword KSpec) sp)
-    (At
-       (NTuple (Cons (infixOp (At (NField x) xsp) k v) Nil))
-       (ntnSpan (infixOp (At (Ident x) xsp) k v)))
-specOne sp acc _ = acc
+-- | written where a setting would be, `x` and something else (`x : T`,
+-- | `\x -> e`, `x -> T`, `x ~ e`): read as a setting of `x`, of no kind
+-- | a specialisation takes
+namedOther : Expr -> Bool
+namedOther (At (EAnn (At (EVar _) _) _) _) = True
+namedOther (At (ELam (LamName _ _) _) _) = True
+namedOther (At (EPi (PiAnon (At (EVar _) _)) _) _) = True
+namedOther (At (ESpecOther (At (EVar _) _) _) _) = True
+namedOther (At (ESpec (At (EVar _) _) _ _ _) _) = True
+namedOther _ = False
+
+-- (any other setting whose field is no name specialises nothing)
+specOne : Expr -> Pm.Spanned (FieldSet Expr) -> Expr
+specOne acc (At (SetField x _ v) fsp) =
+  At (ESpec acc x fsp v) (spanning (Pm.spanOf acc) fsp)
+specOne acc (At (BadFieldSet e) fsp) =
+  if namedOther e
+    then At
+        (ESpecOther acc (At (ETuple [e]) fsp))
+        (spanning (Pm.spanOf acc) fsp)
+  else acc
 
 -- The shunting yard
 --------------------------------------------------------------------------------
 
-type Shunt = { ops : List C.T, out : List Ntn }
+type Shunt a = { ops : List C.T, out : List a }
 
 maxI : Int -> Int -> Int
 maxI a b = if a < b then b else a
 
-boolAnn : Pm.Span -> Ntn -> Ntn
-boolAnn osp n = infixOp n (At (Keyword KAnn) osp) (At (Ident "Bool") osp)
+boolAnn : Pm.Span -> Expr -> Expr
+boolAnn osp e = ann e (At (EVar "Bool") osp)
 
 -- (the sides are annotated with the `Bool` in scope)
-shortcut : C.T -> Ntn -> Ntn -> Ntn -> Ntn
+shortcut : C.T -> Expr -> Expr -> Expr -> Expr
 shortcut op c a b =
   boolAnn
     (spanT op)
     (At
-       (NBlock
-          BMatch
-          (Just (boolAnn (spanT op) c))
-          (Cons
-             (infixOp
-                (At (NTag "True") (spanT op))
-                (At (Keyword KMaps) (spanT op))
-                a)
-             (Cons
-                (infixOp
-                   (At (NTag "False") (spanT op))
-                   (At (Keyword KMaps) (spanT op))
-                   b)
-                Nil)))
-       (mkSpan (ntnSpan c).start (maxI (ntnSpan a).end (ntnSpan b).end)))
+       (EMatch
+          (boolAnn (spanT op) c)
+          [ alt (patTag "True" (spanT op) Nil) a
+          , alt (patTag "False" (spanT op) Nil) b
+          ])
+       (mkSpan (Pm.spanOf c).start (maxI (Pm.spanOf a).end (Pm.spanOf b).end)))
 
 -- | `&&` and `||` are `if`: the right side is computed only if needed
-applyOp : C.T -> Ntn -> Ntn -> Ntn
+applyOp : C.T -> Expr -> Expr -> Expr
 applyOp op l r =
-  if strEq op.text "&&" then shortcut op l r (At (NTag "False") (spanT op))
-  else if strEq op.text "||" then shortcut op l (At (NTag "True") (spanT op)) r
-  else juxt (juxt (At (Ident op.text) (spanT op)) l) r
+  if strEq op.text "&&" then shortcut op l r (At (ETag "False") (spanT op))
+  else if strEq op.text "||" then shortcut op l (At (ETag "True") (spanT op)) r
+  else app (At (EVar op.text) (spanT op)) [l, r]
 
 -- | in a pattern, an operator is applied as a tag is: its operands are
 -- | its arguments
-applyPatOp : C.T -> Ntn -> Ntn -> Ntn
-applyPatOp op l r = group (At (Ident op.text) (spanT op)) (Cons l (Cons r Nil))
+applyPatOp : C.T -> Pat -> Pat -> Pat
+applyPatOp op l r = patOp op.text (spanT op) [l, r]
 
 -- (stacks newest first: push is `Cons`)
-reduceS : (C.T -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
+reduceS : {a : Type} -> (C.T -> a -> a -> a) -> Shunt a -> Shunt a
 reduceS apply st = case st.ops of
   Cons o os -> case st.out of
     Cons r (Cons l rest) -> { ops = os, out = Cons (apply o l r) rest }
@@ -461,12 +458,13 @@ firstS fix lenient before op = case F.relate fix before.text op.text of
             ++ x
             ++ "`), or import the module that does"))
 
-pushS : (C.T -> Ntn -> Ntn -> Ntn)
+pushS : {a : Type}
+      -> (C.T -> a -> a -> a)
       -> F.Fixities
       -> Bool
-      -> Shunt
-      -> Operand
-      -> P Shunt
+      -> Shunt a
+      -> Operand a
+      -> P (Shunt a)
 pushS apply fix lenient st r = case st.ops of
   Nil -> pure { ops = Cons r.op st.ops, out = Cons r.e st.out }
   Cons before os -> do
@@ -474,18 +472,19 @@ pushS apply fix lenient st r = case st.ops of
     if done then pushS apply fix lenient (reduceS apply st) r
       else pure { ops = Cons r.op st.ops, out = Cons r.e st.out }
 
-pushAll : (C.T -> Ntn -> Ntn -> Ntn)
+pushAll : {a : Type}
+        -> (C.T -> a -> a -> a)
         -> F.Fixities
         -> Bool
-        -> Shunt
-        -> List Operand
-        -> P Shunt
+        -> Shunt a
+        -> List (Operand a)
+        -> P (Shunt a)
 pushAll apply fix lenient st Nil = pure st
 pushAll apply fix lenient st (Cons r rest) = do
   st' <- pushS apply fix lenient st r
   pushAll apply fix lenient st' rest
 
-checkFixOf : F.Fixities -> Bool -> List Operand -> P Unit
+checkFixOf : {a : Type} -> F.Fixities -> Bool -> List (Operand a) -> P Unit
 checkFixOf fix lenient Nil = pure MkUnit
 checkFixOf fix lenient (Cons r rest) = case F.groupOf fix r.op.text of
   Just _ -> checkFixOf fix lenient rest
@@ -500,10 +499,13 @@ checkFixOf fix lenient (Cons r rest) = case F.groupOf fix r.op.text of
             ++ r.op.text
             ++ "`), or import the module that does"))
 
-reduceAll : (C.T -> Ntn -> Ntn -> Ntn) -> Shunt -> Shunt
+reduceAll : {a : Type} -> (C.T -> a -> a -> a) -> Shunt a -> Shunt a
 reduceAll apply st = case st.ops of
   Nil -> st
   Cons o os -> reduceAll apply (reduceS apply st)
+
+shuntOut : {a : Type} -> Shunt a -> List a
+shuntOut st = st.out
 
 headOr : {a : Type} -> a -> List a -> a
 headOr z Nil = z
@@ -511,37 +513,37 @@ headOr z (Cons x xs) = x
 
 -- | operators and operands into a tree, refusing operators that do not
 -- | go together
-resolve : (C.T -> Ntn -> Ntn -> Ntn) -> Ntn -> List Operand -> P Ntn
+resolve : {a : Type} -> (C.T -> a -> a -> a) -> a -> List (Operand a) -> P a
 resolve apply e0 rest = do
   fix <- pGets (\s -> s.fix)
   lenient <- pGets (\s -> s.lenient)
   checkFixOf fix lenient rest
   st <- pushAll apply fix lenient { ops = Nil, out = Cons e0 Nil } rest
-  pure (headOr e0 (reduceAll apply st).out)
+  pure (headOr e0 (shuntOut (reduceAll apply st)))
 
 -- Declarations
 --------------------------------------------------------------------------------
 
 -- | what a top-level declaration is, before signatures meet equations:
 -- | a signature (the name, where it is written, the type, where the
--- | signature is), an equation, or a declaration whole
-data Item = Sig String Pm.Span Ntn Pm.Span | Eqn String Ntn Pm.Span | Decl Ntn
+-- | signature is), an equation (where it is), or a declaration whole
+data Item
+  = Sig String Pm.Span Expr Pm.Span
+  | Eqn String (Pm.Spanned (Equation Expr)) Pm.Span
+  | Whole Decl
 
 -- Signatures meet their equations
 --------------------------------------------------------------------------------
 
-defOf : String -> Pm.Span -> Ntn -> Pm.Span -> List Ntn -> Ntn
-defOf f fsp ty sp eqs =
-  At
-    (MDecl
-       DefK
-       (infixOp
-          (At (Ident f) fsp)
-          (At (Keyword KAnn) sp)
-          (juxt ty (At (NBlock BWhere Nothing eqs) sp))))
-    sp
+defOf : String
+      -> Pm.Span
+      -> Expr
+      -> Pm.Span
+      -> List (Pm.Spanned (Equation Expr))
+      -> Decl
+defOf f fsp ty sp eqs = At (DeclEquations f fsp ty eqs) sp
 
-eqnsOf : String -> List Item -> List Ntn
+eqnsOf : String -> List Item -> List (Pm.Spanned (Equation Expr))
 eqnsOf f Nil = Nil
 eqnsOf f (Cons (Eqn g e esp) rest) =
   if strEq g f then Cons e (eqnsOf f rest) else eqnsOf f rest
@@ -553,8 +555,8 @@ eqnEnd f (Cons (Eqn g _ esp) rest) e =
   if strEq g f then eqnEnd f rest (maxI e esp.end) else eqnEnd f rest e
 eqnEnd f (Cons _ rest) e = eqnEnd f rest e
 
-assembleOne : List String -> List Item -> Item -> Maybe Ntn
-assembleOne broken items (Decl n) = Just n
+assembleOne : List String -> List Item -> Item -> Maybe Decl
+assembleOne broken items (Whole d) = Just d
 assembleOne broken items (Sig f fsp ty sp) =
   if elemBy strEq f broken
     then Just
@@ -563,12 +565,10 @@ assembleOne broken items (Sig f fsp ty sp) =
            fsp
            ty
            sp
-           (Cons
-              (infixOp
-                 (At (Ident f) fsp)
-                 (At (Keyword KSet) sp)
-                 (At (Keyword KAbandon) sp))
-              Nil))
+           [ At
+             (MkEquation f fsp Nil (At (EWord AbandonWord) sp))
+             (spanning fsp sp)
+           ])
   else if length (eqnsOf f items) == 0 then Nothing
   else Just
       (defOf
@@ -579,7 +579,7 @@ assembleOne broken items (Sig f fsp ty sp) =
          (eqnsOf f items))
 assembleOne broken items (Eqn _ _ _) = Nothing
 
-assemble : List String -> List Item -> List Ntn
+assemble : List String -> List Item -> List Decl
 assemble broken items =
   catMaybesS (map (\it -> assembleOne broken items it) items)
 
@@ -606,7 +606,7 @@ assembleDiagOne broken sigs eqns (Eqn f _ sp) =
   if not (elemBy strEq f sigs) && not (elemBy strEq f broken)
     then Just (diag sp ("`" ++ f ++ "` needs a type: `" ++ f ++ " : ...`"))
   else Nothing
-assembleDiagOne broken sigs eqns (Decl _) = Nothing
+assembleDiagOne broken sigs eqns (Whole _) = Nothing
 
 assembleDiags : List String -> List Item -> List Diag
 assembleDiags broken items =
@@ -615,9 +615,6 @@ assembleDiags broken items =
 
 -- The lowering, knotted through `lw`
 --------------------------------------------------------------------------------
-
--- (a function over `E` or `Ntn` matches through one of these, its body
--- written once: a default equation is compiled into every other arm)
 
 atomOf : C.E -> Maybe C.T
 atomOf (Atom t) = Just t
@@ -647,47 +644,53 @@ settingsOf (Braces o fs commas c) = case fs of
   _ -> Nothing
 settingsOf _ = Nothing
 
-isColon : Ntn -> Bool
-isColon (At (Keyword KAnn) _) = True
-isColon _ = False
-
 -- | `a : T`
-isAnnN : Ntn -> Bool
-isAnnN (At (Infix l k t) _) = isColon k
-isAnnN _ = False
+isAnnE : Expr -> Bool
+isAnnE (At (EAnn _ _) _) = True
+isAnnE _ = False
 
 type Lw =
-  { e : C.E -> P Ntn, pat : C.Pat -> P Ntn, decl : C.D -> P (List Item) }
+  { e : C.E -> P Expr, pat : C.Pat -> P Pat, decl : C.D -> P (List Item) }
 
 -- | a keyword written as a word: a built-in type, or `abandon` (where
--- | the text becomes the keyword it is, once)
-wordKw : String -> Kw
-wordKw "Int" = KInt
-wordKw "Float" = KFloat
-wordKw "String" = KString
-wordKw "Array" = KArray
-wordKw "abandon" = KAbandon
-wordKw _ = KType
+-- | the text becomes the word it is, once)
+wordKw : String -> SyntaxWord
+wordKw "Int" = IntWord
+wordKw "Float" = FloatWord
+wordKw "String" = StringWord
+wordKw "Array" = ArrayWord
+wordKw "abandon" = AbandonWord
+wordKw _ = TypeWord
 
 -- | a literal, a keyword, a name or a tag, as the token says
-atomTok : C.T -> Ntn
+atomTok : C.T -> Expr
 atomTok t =
-  if strEq t.kind "var" then At (Ident t.text) (spanT t)
-  else if strEq t.kind "tag" then At (NTag t.text) (spanT t)
-  else if strEq t.kind "int" then At (NInt (intOfText t.text)) (spanT t)
-  else if strEq t.kind "float" then At (NFloat (floatOfText t.text)) (spanT t)
-  else if strEq t.kind "str" then At (NString t.text) (spanT t)
-  else if strEq t.kind "sym" then At (Ident t.text) (spanT t)
-  else At (Keyword (wordKw t.text)) (spanT t)
+  if strEq t.kind "var" then At (EVar t.text) (spanT t)
+  else if strEq t.kind "tag" then At (ETag t.text) (spanT t)
+  else if strEq t.kind "int" then At (EInt (intOfText t.text)) (spanT t)
+  else if strEq t.kind "float" then At (EFloat (floatOfText t.text)) (spanT t)
+  else if strEq t.kind "str" then At (EString t.text) (spanT t)
+  else if strEq t.kind "sym" then At (EVar t.text) (spanT t)
+  else At (EWord (wordKw t.text)) (spanT t)
 
-withFields : Ntn -> List C.T -> Ntn
-withFields n fs =
-  foldl (\m (f : C.T) -> juxt m (At (NField f.text) (spanT f))) n fs
+-- | the same, in a pattern
+patTok : C.T -> Pat
+patTok t =
+  if strEq t.kind "var" then At (PatVar t.text) (spanT t)
+  else if strEq t.kind "tag" then patTag t.text (spanT t) Nil
+  else if strEq t.kind "int" then At (PatInt (intOfText t.text)) (spanT t)
+  else if strEq t.kind "float" then At (PatFloat (floatOfText t.text)) (spanT t)
+  else if strEq t.kind "str" then At (PatString t.text) (spanT t)
+  else if strEq t.kind "sym" then At (PatVar t.text) (spanT t)
+  else At (PatWord (wordKw t.text)) (spanT t)
+
+withFields : Expr -> List C.T -> Expr
+withFields e fs = app e (map (\(f : C.T) -> At (EProject f.text) (spanT f)) fs)
 
 -- | a capitalised name: a variable or a definition in scope, or a tag;
 -- | `M.x`, a definition of the module imported as `M`, unless `M` is a
 -- | variable here
-conAtom : C.T -> List C.T -> P Ntn
+conAtom : C.T -> List C.T -> P Expr
 conAtom t fs = do
   local <- pGets (\s -> elemBy strEq t.text s.scope)
   qualified <-
@@ -699,10 +702,10 @@ conAtom t fs = do
       (if qualified && not local
          then case fs of
            Cons f rest ->
-             withFields (At (Ident (t.text ++ "." ++ f.text)) (spanTT t f)) rest
-           Nil -> At (NTag t.text) (spanT t)
-       else if inScope then withFields (At (Ident t.text) (spanT t)) fs
-       else withFields (At (NTag t.text) (spanT t)) fs)
+             withFields (At (EVar (t.text ++ "." ++ f.text)) (spanTT t f)) rest
+           Nil -> At (ETag t.text) (spanT t)
+       else if inScope then withFields (At (EVar t.text) (spanT t)) fs
+       else withFields (At (ETag t.text) (spanT t)) fs)
 
 -- | `e.x.y`: what is projected, and the fields
 data Fields = MkFields C.E (List C.T)
@@ -720,103 +723,130 @@ arrowAfter s t =
   && strEq (A.index s.toks (t.ix + 1)).text "->"
 
 -- | `[a, b, c]`, `Cons a (Cons b (Cons c Nil))`, and `[]`, `Nil`
-listN : Pm.Span -> List Ntn -> Ntn
-listN sp xs =
-  foldr
-    (\x rest -> group (At (NTag "Cons") sp) (Cons x (Cons rest Nil)))
-    (At (NTag "Nil") sp)
-    xs
+listE : Pm.Span -> List Expr -> Expr
+listE sp xs =
+  foldr (\x rest -> app (At (ETag "Cons") sp) [x, rest]) (At (ETag "Nil") sp) xs
+
+listP : Pm.Span -> List Pat -> Pat
+listP sp xs =
+  foldr (\x rest -> patTag "Cons" sp [x, rest]) (patTag "Nil" sp Nil) xs
 
 -- | `x : T` in a binder's braces, and nothing else
-declarationL : Lw -> C.E -> P Ntn
+declarationL : Lw -> C.E -> P Expr
 declarationL r e = do
   e0 <- r.e e
   d <- asBinder e0
-  if isAnnN d then pure d
-    else throwP (diag (ntnSpan d) "a field is `name : Type`")
+  if isAnnE d then pure d
+    else throwP (diag (Pm.spanOf d) "a field is `name : Type`")
 
-settingL : Lw -> C.E -> P Ntn
+-- | `x : T`, a field of a record type
+fieldDeclOf : Expr -> Pm.Spanned (FieldDecl Expr)
+fieldDeclOf (At (EAnn (At (EVar x) xsp) t) sp) = At (DeclareField x xsp t) sp
+fieldDeclOf d = At (BadFieldDecl d) (Pm.spanOf d)
+
+settingL : Lw -> C.E -> P (Pm.Spanned (FieldSet Expr))
 settingL r (EFSet x eq e) = do
   e' <- r.e e
-  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword KSet) (spanT x)) e')
-settingL r e = r.e e
+  pure (At (SetField x.text (spanT x) e') (spanning (spanT x) (Pm.spanOf e')))
+settingL r e = do
+  e' <- r.e e
+  pure (At (BadFieldSet e') (Pm.spanOf e'))
 
 isSetting : C.E -> Bool
 isSetting (EFSet x eq e) = True
 isSetting e = False
 
-bracesL : Lw -> C.T -> List C.E -> C.T -> P Ntn
+bracesL : Lw -> C.T -> List C.E -> C.T -> P Expr
 bracesL r o fs c = case fs of
-  Nil -> pure (At (NBlock BStruct Nothing Nil) (spanTT o c))
+  Nil -> pure (At (EStruct Nil) (spanTT o c))
   Cons f rest ->
     if isSetting f
       then do
         fs' <- traverseS (\m -> settingL r m) fs
-        pure (At (NBlock BStruct Nothing fs') (spanTT o c))
+        pure (At (EStruct fs') (spanTT o c))
     else do
       fs' <- traverseS (\m -> declarationL r m) fs
-      pure (At (NBlock BSig Nothing fs') (spanTT o c))
+      pure (At (ESig (map fieldDeclOf fs')) (spanTT o c))
 
-conAltL : Lw -> C.E -> P Ntn
-conAltL r (ECon c args) = do
+-- | `C x y`, a tag applied
+conL : Lw -> C.T -> List C.E -> P Expr
+conL r c args = do
   args' <- traverseS r.e args
-  pure (group (At (NTag c.text) (spanT c)) args')
-conAltL r e = r.e e
+  pure (app (At (ETag c.text) (spanT c)) args')
 
-lamBinderL : Lw -> C.E -> P Ntn
-lamBinderL r (BVar x) = pure (At (Ident x.text) (spanT x))
+-- | a tag applied to types, an alternative of a sum type
+variantOf : Expr -> Pm.Spanned (Variant Expr)
+variantOf e = case (spineOf e).head of
+  At (ETag t) tsp -> At (TagVariant t tsp (spineOf e).args) (Pm.spanOf e)
+  _ -> At (BadVariant e) (Pm.spanOf e)
+
+variantL : Lw -> C.E -> P (Pm.Spanned (Variant Expr))
+variantL r (ECon c args) = do
+  e <- conL r c args
+  pure (variantOf e)
+variantL r e = do
+  e' <- r.e e
+  pure (variantOf e')
+
+-- | a lambda's binder, and where it starts
+type LamB = { binder : LamBinder Expr, span : Pm.Span }
+
+lamBinderL : Lw -> C.E -> P LamB
+lamBinderL r (BVar x) =
+  pure { binder = LamName x.text (spanT x), span = spanT x }
 lamBinderL r (BImp o x c) =
-  pure (At (NBrace (At (Ident x.text) (spanT x))) (spanTT o c))
+  pure { binder = LamImplicit x.text (spanT x), span = spanTT o c }
 lamBinderL r (BAnn o x cc ty c) = do
   ty' <- r.e ty
   pure
-      (infixOp (At (Ident x.text) (spanT x)) (At (Keyword KAnn) (spanT cc)) ty')
-lamBinderL r e = r.e e
+      { binder = LamAnn x.text (spanT x) ty'
+      , span = spanning (spanT x) (Pm.spanOf ty')
+      }
+lamBinderL r e =
+  throwP
+    (diag (spanT (C.firstE e)) ("unexpected `" ++ (C.firstE e).text ++ "`"))
 
-lamBound : Ntn -> List String
-lamBound (At (Ident x) _) = Cons x Nil
-lamBound (At (NBrace (At (Ident x) _)) _) = Cons x Nil
-lamBound (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) _) _) = Cons x Nil
-lamBound _ = Nil
+lamBound : LamB -> List String
+lamBound b = case b.binder of
+  LamName x _ -> Cons x Nil
+  LamImplicit x _ -> Cons x Nil
+  LamAnn x _ _ -> Cons x Nil
 
 -- | `\x {y} _ -> e`
-lambdaL : Lw -> List C.E -> C.E -> P Ntn
+lambdaL : Lw -> List C.E -> C.E -> P Expr
 lambdaL r binders body = do
   bs <- traverseS (\b -> lamBinderL r b) binders
   withScope (concatMapS lamBound bs) (do
     body' <- r.e body
     pure
-        (foldr (\b e -> infixOp b (At (Keyword KMaps) (ntnSpan b)) e) body' bs))
+        (foldr
+           (\(b : LamB) e ->
+              At (ELam b.binder e) (spanning b.span (Pm.spanOf e)))
+           body'
+           bs))
 
 -- | `C x y -> e`: `x` and `y` are bound in `e`
-altL : Lw -> C.E -> P Ntn
+altL : Lw -> C.E -> P (Pm.Spanned (Alt Expr))
 altL r (EAlt p arrow e) = do
   p' <- r.pat p
   withScope (boundBy Nil p) (do
     e' <- r.e e
-    pure (infixOp p' (At (Keyword KMaps) (spanT arrow)) e'))
-altL r e = r.e e
+    pure (alt p' e'))
+altL r e =
+  throwP
+    (diag (spanT (C.firstE e)) ("unexpected `" ++ (C.firstE e).text ++ "`"))
 
 -- | `if c then a else b`, a `case` on `True` and `False`
-ifN : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
-ifN sp c a b =
-  At
-    (NBlock
-       BMatch
-       (Just c)
-       (Cons
-          (infixOp (At (NTag "True") sp) (At (Keyword KMaps) sp) a)
-          (Cons
-             (infixOp (At (NTag "False") sp) (At (Keyword KMaps) sp) b)
-             Nil)))
-    sp
+ifE : Pm.Span -> Expr -> Expr -> Expr -> Expr
+ifE sp c a b =
+  At (EMatch c [alt (patTag "True" sp Nil) a, alt (patTag "False" sp Nil) b]) sp
 
 -- | `p = e`, or `p : T = e`, after `let`: the pattern, and what it is
 -- | bound to (annotated, `(e : T)`)
-letHeadL : Lw -> C.Pat -> Maybe (Pair C.T C.E) -> C.E -> P (Pair Ntn Ntn)
-letHeadL r p ann e = do
+letHeadL : Lw -> C.Pat -> Maybe (Pair C.T C.E) -> C.E -> P (Pair Pat Expr)
+letHeadL r p ann0 e = do
   p' <- r.pat p
-  case ann of
+  case ann0 of
     Just (MkPair cc ty) -> do
       ty' <- r.e ty
       e' <- r.e e
@@ -824,64 +854,53 @@ letHeadL r p ann e = do
           (MkPair
              p'
              (At
-                (Infix e' (At (Keyword KAnn) (spanT cc)) ty')
-                (mkSpan (startPos ty') (endPos e'))))
+                (EAnn e' ty')
+                (mkSpan (Pm.spanOf ty').start (Pm.spanOf e').end)))
     Nothing -> do
       e' <- r.e e
       pure (MkPair p' e')
 
 -- | `in e` after `let p = e'`: `p`'s variables are bound in `e`
-letBodyL : Lw -> C.T -> Pair Ntn Ntn -> List String -> C.T -> C.E -> P Ntn
-letBodyL r kw (MkPair p rhs) names i body =
+letBodyL : Lw -> C.T -> Pair Pat Expr -> List String -> C.E -> P Expr
+letBodyL r kw (MkPair p rhs) names body =
   withScope names (do
   body' <- r.e body
-  pure
-      (At
-         (NBlock
-            BLet
-            (Just rhs)
-            (Cons (infixOp p (At (Keyword KMaps) (spanT i)) body') Nil))
-         (spanTE kw (C.lastE body).end)))
+  pure (At (ELetIn rhs (alt p body')) (spanTE kw (C.lastE body).end)))
 
--- | `let p = e in e'`; in a `do` block, `let p = e`, `p`'s variables
--- | bound in the statements after it
-letL : Lw -> C.E -> P Ntn
-letL r (ELet kw p ann eq e body) = do
-  h <- letHeadL r p ann e
-  case body of
-    Just (MkPair i b) -> letBodyL r kw h (boundBy Nil p) i b
-    Nothing -> do
-      pModify (\s -> setScope (appendS (boundBy Nil p) s.scope) s)
-      pure
-          (At
-             (NBlock BLet (Just (snd h)) (Cons (fst h) Nil))
-             (spanTE kw (C.lastE e).end))
-letL r e = r.e e
+-- | `let p = e in e'`
+letL : Lw -> C.E -> P Expr
+letL r (ELet kw p ann0 eq e (Just (MkPair i body))) = do
+  h <- letHeadL r p ann0 e
+  letBodyL r kw h (boundBy Nil p) body
+letL r e =
+  throwP
+    (diag (spanT (C.firstE e)) ("unexpected `" ++ (C.firstE e).text ++ "`"))
 
 -- | a statement of a `do` block: `x <- e` (`x` bound in the statements
--- | after it), `let p = e`, or `e`
-stmtL : Lw -> C.E -> P Ntn
+-- | after it), `let p = e` (`p`'s variables bound in them), or `e`
+stmtL : Lw -> C.E -> P (Pm.Spanned (Stmt Expr))
 stmtL r (ESBind x arrow e) = do
   e' <- r.e e
   pModify (\s -> setScope (Cons x.text s.scope) s)
-  pure
-      (infixOp
-         (At (Ident x.text) (spanT x))
-         (At (Keyword KBind) (spanT arrow))
-         e')
-stmtL r (ELet kw p ann eq e body) = letL r (ELet kw p ann eq e body)
-stmtL r e = r.e e
+  pure (At (StmtBind x.text (spanT x) e') (spanning (spanT x) (Pm.spanOf e')))
+stmtL r (ELet kw p ann0 eq e Nothing) = do
+  h <- letHeadL r p ann0 e
+  pModify (\s -> setScope (appendS (boundBy Nil p) s.scope) s)
+  pure (At (StmtLet (fst h) (snd h)) (spanTE kw (C.lastE e).end))
+stmtL r e = do
+  e' <- r.e e
+  pure (At (StmtExpr e') (Pm.spanOf e'))
 
 -- | an operator's operands, as written
-operandL : Lw -> C.E -> P Operand
+operandL : Lw -> C.E -> P (Operand Expr)
 operandL r m = case opRhsOf m of
   MkPair op e -> do
     e' <- r.e e
     pure (mkOperand op e')
 
-parenL : Lw -> C.T -> C.E -> C.T -> P Ntn
+parenL : Lw -> C.T -> C.E -> C.T -> P Expr
 parenL r o e c = case symAtom e of
-  Just t -> pure (At (Ident t.text) (spanT t))
+  Just t -> pure (At (EVar t.text) (spanT t))
   Nothing -> do
     e' <- r.e e
     after <- pGets (\s -> arrowAfter s c)
@@ -890,29 +909,29 @@ parenL r o e c = case symAtom e of
 -- | `x -> y`, with `(a b : T) -> B` for `(a : T) -> (b : T) -> B`, and
 -- | `{a : T} -> B` binding an implicit argument; `T ~ { f = v }`, a
 -- | specialisation (the syntax's operators are these two)
-opL : Lw -> C.E -> C.T -> C.E -> P Ntn
+opL : Lw -> C.E -> C.T -> C.E -> P Expr
 opL r a op b =
   if strEq op.text "->"
     then do
       a' <- case bracedOne a of
         Just f -> do
           d <- declarationL r f
-          pure (At (NBrace d) (spanTT (C.firstE a) (C.lastE a)))
+          pure (At (EBrace d) (spanTT (C.firstE a) (C.lastE a)))
         Nothing -> r.e a
       b' <- r.e b
-      pure (arrowBinop (spanT op) a' b')
+      pure (arrowBinop a' b')
   else do
     a' <- r.e a
     case settingsOf b of
       Just fs -> do
         fs' <- traverseS (\m -> settingL r m) fs
-        pure (foldl (\acc f -> specOne (spanT op) acc f) a' fs')
+        pure (foldl (\acc f -> specOne acc f) a' fs')
       Nothing -> do
         b' <- r.e b
-        pure (infixOp a' (At (Keyword KSpec) (spanT op)) b')
+        pure (At (ESpecOther a' b') (spanning (Pm.spanOf a') (Pm.spanOf b')))
 
 -- | an expression
-exprL : Lw -> C.E -> P Ntn
+exprL : Lw -> C.E -> P Expr
 exprL r e0 = case e0 of
   Atom t -> if strEq t.kind "con" then conAtom t Nil else pure (atomTok t)
   EField e f -> case fieldsOf (EField e f) Nil of
@@ -925,31 +944,24 @@ exprL r e0 = case e0 of
   EParen o e c -> parenL r o e c
   Named o x k e c -> do
     e' <- r.e e
-    pure
-        (At
-           (NBrace
-              (infixOp
-                 (At (Ident x.text) (spanT x))
-                 (At (Keyword KSet) (spanT k))
-                 e'))
-           (spanTT o c))
+    pure (At (ENamed x.text e') (spanTT o c))
   Tup o es commas c -> do
     es' <- traverseS r.e es
     pure
-        (if strEq o.text "[" then listN (spanTT o c) es'
-         else At (NTuple es') (spanTT o c))
+        (if strEq o.text "[" then listE (spanTT o c) es'
+         else At (ETuple es') (spanTT o c))
   Braces o fs commas c -> bracesL r o fs c
   InstB o o2 d c1 c -> do
     d' <- declarationL r d
-    pure (At (NBracket d') (spanTT o c))
+    pure (At (EBracket d') (spanTT o c))
   Sum kw o alts bars c -> do
-    alts' <- traverseS (\a -> conAltL r a) alts
-    pure (At (NBlock BSum Nothing alts') (spanTT kw c))
-  ECon c args -> conAltL r (ECon c args)
+    alts' <- traverseS (\a -> variantL r a) alts
+    pure (At (ESum alts') (spanTT kw c))
+  ECon c args -> conL r c args
   App h args -> do
     h' <- r.e h
     args' <- traverseS r.e args
-    pure (group h' args')
+    pure (app h' args')
   Op a op b -> opL r a op b
   Ops a rest -> do
     a' <- r.e a
@@ -958,21 +970,21 @@ exprL r e0 = case e0 of
   Ann e cc ty -> do
     e' <- r.e e
     ty' <- r.e ty
-    pure (infixOp e' (At (Keyword KAnn) (spanT cc)) ty')
+    pure (ann e' ty')
   Lam bs binders arrow body -> lambdaL r binders body
   Case kw scrut o alts -> do
     scrut' <- r.e scrut
     alts' <- block (\a -> altL r a) alts
-    pure (At (NBlock BMatch (Just scrut') alts') (spanTE kw (C.lastE e0).end))
+    pure (At (EMatch scrut' alts') (spanTE kw (C.lastE e0).end))
   If kw c th a el b -> do
     c' <- r.e c
     a' <- r.e a
     b' <- r.e b
-    pure (ifN (spanTE kw (C.lastE b).end) c' a' b')
+    pure (ifE (spanTE kw (C.lastE b).end) c' a' b')
   Do kw stmts -> do
     stmts' <- block (\m -> stmtL r m) stmts
-    pure (At (NBlock BDo Nothing stmts') (spanTE kw (C.lastE e0).end))
-  ELet kw p ann eq e body -> letL r e0
+    pure (At (EDo stmts') (spanTE kw (C.lastE e0).end))
+  ELet kw p ann0 eq e body -> letL r e0
   _ ->
     throwP
       (diag (spanT (C.firstE e0)) ("unexpected `" ++ (C.firstE e0).text ++ "`"))
@@ -989,20 +1001,22 @@ pchainOf : C.Pat -> PChain
 pchainOf (POp l op r) = pchainCons l op (pchainOf r)
 pchainOf p = MkPChain p Nil
 
-patOperandL : Lw -> Pair C.T C.Pat -> P Operand
+patOperandL : Lw -> Pair C.T C.Pat -> P (Operand Pat)
 patOperandL r (MkPair op p) = do
   p' <- r.pat p
   pure (mkOperand op p')
 
-fieldPatL : Lw -> C.Pat -> P Ntn
+fieldPatL : Lw -> C.Pat -> P (FieldPat Pat)
 fieldPatL r (PField x eq p) = do
   p' <- r.pat p
-  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword KSet) (spanT eq)) p')
-fieldPatL r p = r.pat p
+  pure (MkFieldPat x.text p')
+fieldPatL r p =
+  throwP
+    (diag (spanT (C.firstP p)) ("unexpected `" ++ (C.firstP p).text ++ "`"))
 
 -- | a pattern: an operator in it is another name for a tag (elaboration
 -- | finds which), its operands as the fixities say
-patL : Lw -> C.Pat -> P Ntn
+patL : Lw -> C.Pat -> P Pat
 patL r p0 = case p0 of
   PAtom t ->
     if strEq t.kind "con"
@@ -1010,25 +1024,25 @@ patL r p0 = case p0 of
         -- (a capitalised parameter of the signature is a variable)
         isVar <- pGets (\s -> elemBy strEq t.text s.patVars)
         pure
-            (if isVar then At (Ident t.text) (spanT t)
-             else At (NTag t.text) (spanT t))
-    else pure (atomTok t)
+            (if isVar then At (PatVar t.text) (spanT t)
+             else patTag t.text (spanT t) Nil)
+    else pure (patTok t)
   PCon c args -> do
     args' <- traverseS r.pat args
-    pure (group (At (NTag c.text) (spanT c)) args')
+    pure (patTag c.text (spanT c) args')
   PParen o p c -> r.pat p
   PList o ps commas c -> do
     ps' <- traverseS r.pat ps
-    pure (listN (spanTT o c) ps')
+    pure (listP (spanTT o c) ps')
   PRec o fs commas c -> do
     fs' <- traverseS (\f -> fieldPatL r f) fs
-    pure (At (NBlock BStruct Nothing fs') (spanTT o c))
+    pure (At (PatRecord fs') (spanTT o c))
   POp l op q -> case pchainOf (POp l op q) of
     MkPChain h rest -> do
       h' <- r.pat h
       rest' <- traverseS (\m -> patOperandL r m) rest
       resolve applyPatOp h' rest'
-  PField x eq p -> fieldPatL r (PField x eq p)
+  PField x eq p -> r.pat p
 
 -- Declarations
 
@@ -1076,7 +1090,7 @@ lastDEnd ds e = case last ds of
 
 -- | `e where` and the local definitions, signatures and equations, as at
 -- | the top level
-whereL : Lw -> C.T -> List C.D -> Ntn -> P Ntn
+whereL : Lw -> C.T -> List C.D -> Expr -> P Expr
 whereL r kw ds rhs = do
   saved <- pGets (\s -> s.binders)
   items <- block r.decl ds
@@ -1086,11 +1100,8 @@ whereL r kw ds rhs = do
     Nil ->
       pure
         (At
-           (NBlock
-              BLocal
-              (Just rhs)
-              (assemble Nil (concatMapS (\x -> x) items)))
-           (mkSpan (startPos rhs) (lastDEnd ds kw.end)))
+           (ELocal rhs (assemble Nil (concatMapS (\x -> x) items)))
+           (mkSpan (Pm.spanOf rhs).start (lastDEnd ds kw.end)))
 
 -- | `f p ... = e`, perhaps followed by `where`
 eqnL : Lw
@@ -1120,66 +1131,59 @@ eqnL r names pats rhs w = do
         (Cons
            (Eqn
               (declNameOf names).name
-              (infixOp
-                 (group
-                    (At (Ident (declNameOf names).name) (declNameOf names).span)
-                    pats')
-                 (At
-                    (Keyword KSet)
-                    (mkSpan (firstStart names) (ntnSpan rhs').end))
-                 rhs')
-              (mkSpan (firstStart names) (ntnSpan rhs').end))
+              (At
+                 (MkEquation
+                    (declNameOf names).name
+                    (declNameOf names).span
+                    pats'
+                    rhs')
+                 (mkSpan (firstStart names) (Pm.spanOf rhs').end))
+              (mkSpan (firstStart names) (Pm.spanOf rhs').end))
            Nil))
 
--- | `x : T`, `x` a name
-nameAnn : Ntn -> Maybe Ntn
-nameAnn (At (Infix l k t) _) =
-  if isIdentN l && isColon k then Just (infixOp l k t) else Nothing
+-- | `x : T`, `x` a name: the name, where it is, the type
+type NameAnn = { name : String, span : Pm.Span, ty : Expr }
+
+nameAnn : Expr -> Maybe NameAnn
+nameAnn (At (EAnn (At (EVar x) xsp) t) _) =
+  Just { name = x, span = xsp, ty = t }
 nameAnn _ = Nothing
 
-paramOf : Ntn -> Maybe Ntn -> P Ntn
-paramOf p (Just q) = pure q
-paramOf p Nothing =
-  throwP (diag (ntnSpan p) "a parameter is `a`, `(x : T)` or `{x : T}`")
+paramOf : Expr -> P (Pm.Spanned (Param Expr))
+paramOf p = case nameAnn p of
+  Just q ->
+    pure
+      (At (ExplicitParam q.name q.span q.ty) (spanning q.span (Pm.spanOf q.ty)))
+  Nothing ->
+    throwP (diag (Pm.spanOf p) "a parameter is `a`, `(x : T)` or `{x : T}`")
 
 -- | `(x : T)` or `{x : T}`, a parameter of a type
-dataParamOf : Lw -> C.E -> P Ntn
+dataParamOf : Lw -> C.E -> P (Pm.Spanned (Param Expr))
 dataParamOf r e = case bracedOne e of
   Just f -> do
     d <- declarationL r f
     case nameAnn d of
-      Just q -> pure (At (NBrace q) (spanTT (C.firstE e) (C.lastE e)))
-      Nothing -> paramOf d Nothing
+      Just q ->
+        pure
+          (At
+             (ImplicitParam q.name q.span q.ty)
+             (spanTT (C.firstE e) (C.lastE e)))
+      Nothing ->
+        throwP (diag (Pm.spanOf d) "a parameter is `a`, `(x : T)` or `{x : T}`")
   Nothing -> do
     p0 <- r.e e
     p <- if strEq (C.firstE e).text "(" then asBinder p0 else pure p0
-    paramOf p (nameAnn p)
+    paramOf p
 
 -- | a parameter of a type: `a` (a type), `(x : T)` or `{x : T}`
-dataParamL : Lw -> C.E -> P Ntn
+dataParamL : Lw -> C.E -> P (Pm.Spanned (Param Expr))
 dataParamL r e = case atomOf e of
   Just x ->
     pure
-      (infixOp
-         (At (Ident x.text) (spanT x))
-         (At (Keyword KAnn) (spanT x))
-         (At (Keyword KType) (spanT x)))
+      (At
+         (ExplicitParam x.text (spanT x) (At (EWord TypeWord) (spanT x)))
+         (spanT x))
   Nothing -> dataParamOf r e
-
--- | the head of a type's definition: its name applied to its parameters
-headN : C.T -> List Ntn -> Ntn
-headN name params = group (At (Ident name.text) (spanT name)) params
-
-defN : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
-defN sp h ty body =
-  At
-    (MDecl
-       DefK
-       (infixOp
-          (infixOp h (At (Keyword KAnn) sp) ty)
-          (At (Keyword KSet) sp)
-          body))
-    sp
 
 -- | `data T a = C x y | D`, and `data T : U = ...`
 dataL : Lw
@@ -1192,62 +1196,68 @@ dataL : Lw
       -> P (List Item)
 dataL r d kw name params universe alts = do
   params' <- traverseS (\m -> dataParamL r m) params
-  withScope (concatMapS binderNames params') (do
+  withScope (map paramName params') (do
     universe' <- case universe of
       Just (MkPair cc u) -> r.e u
-      Nothing -> pure (At (Keyword KType) (spanT name))
-    alts' <- traverseS (\a -> conAltL r a) (C.altsOf alts)
+      Nothing -> pure (At (EWord TypeWord) (spanT name))
+    alts' <- traverseS (\a -> variantL r a) (C.altsOf alts)
     pure
         (Cons
-           (Decl
-              (defN
-                 (spanTE kw (C.lastD d).end)
-                 (headN name params')
-                 universe'
-                 (At (NBlock BSum Nothing alts') (spanTE kw (C.lastD d).end))))
+           (Whole
+              (At
+                 (DeclDefine
+                    name.text
+                    (spanT name)
+                    params'
+                    universe'
+                    (At (ESum alts') (spanTE kw (C.lastD d).end)))
+                 (spanTE kw (C.lastD d).end)))
            Nil))
 
 -- | `type T a = ...`
 typeL : Lw -> C.T -> C.T -> List C.E -> C.E -> P (List Item)
 typeL r kw name params body = do
   params' <- traverseS (\m -> dataParamL r m) params
-  withScope (concatMapS binderNames params') (do
+  withScope (map paramName params') (do
     body' <- r.e body
     pure
         (Cons
-           (Decl
-              (defN
-                 (spanTE kw (C.lastE body).end)
-                 (headN name params')
-                 (At (Keyword KType) (spanTE kw (C.lastE body).end))
-                 body'))
+           (Whole
+              (At
+                 (DeclDefine
+                    name.text
+                    (spanT name)
+                    params'
+                    (At (EWord TypeWord) (spanTE kw (C.lastE body).end))
+                    body')
+                 (spanTE kw (C.lastE body).end)))
            Nil))
 
 -- | a field of a theory: in scope in the fields after it
-theoryFieldL : Lw -> C.TF -> P Ntn
+theoryFieldL : Lw -> C.TF -> P (Pm.Spanned (FieldDecl Expr))
 theoryFieldL r (MkTF x cc ty) = do
   ty' <- r.e ty
   pModify (\s -> setScope (Cons x.text s.scope) s)
-  pure (infixOp (At (Ident x.text) (spanT x)) (At (Keyword KAnn) (spanT x)) ty')
+  pure
+      (At
+         (DeclareField x.text (spanT x) ty')
+         (spanning (spanT x) (Pm.spanOf ty')))
 
 -- | `theory T a where` and its fields
 theoryL : Lw -> C.D -> C.T -> C.T -> List C.E -> List C.TF -> P (List Item)
 theoryL r d kw name params fields = do
   params' <- traverseS (\m -> dataParamL r m) params
-  withScope (concatMapS binderNames params') (do
+  withScope (map paramName params') (do
     fields' <- block (\f -> theoryFieldL r f) fields
     pure
         (Cons
-           (Decl
+           (Whole
               (At
-                 (MDecl
-                    TheoryK
-                    (infixOp
-                       (headN name params')
-                       (At (Keyword KSet) (spanTE kw (C.lastD d).end))
-                       (At
-                          (NBlock BSig Nothing fields')
-                          (spanTE kw (C.lastD d).end))))
+                 (DeclTheory
+                    name.text
+                    (spanT name)
+                    params'
+                    (At (ESig fields') (spanTE kw (C.lastD d).end)))
                  (spanTE kw (C.lastD d).end)))
            Nil))
 
@@ -1266,24 +1276,16 @@ declL r d = case d of
     ty' <- r.e ty
     pure
         (Cons
-           (Decl
+           (Whole
               (At
-                 (MDecl
-                    PrimK
-                    (infixOp
-                       (At (Ident x.text) (spanT x))
-                       (At (Keyword KAnn) (spanTE kw (C.lastE ty).end))
-                       ty'))
+                 (DeclPrimitive x.text (spanT x) ty')
                  (spanTE kw (C.lastE ty).end)))
            Nil)
   DTest kw x ->
-    pure
-      (Cons
-         (Decl (At (MDecl TestK (At (Ident x.text) (spanT x))) (spanTT kw x)))
-         Nil)
+    pure (Cons (Whole (At (DeclTest x.text (spanT x)) (spanTT kw x))) Nil)
   DWatch w e -> do
     e' <- r.e e
-    pure (Cons (Decl (At (MDecl WatchK e') (spanTE w (C.lastE e).end))) Nil)
+    pure (Cons (Whole (At (DeclWatch e') (spanTE w (C.lastE e).end))) Nil)
 
 lw : Lw
 lw =
@@ -1625,7 +1627,7 @@ progGo cs s items diags broken =
 type Options = { known : String -> Bool, fixities : F.Fixities, lenient : Bool }
 
 type Read =
-  { ntns : List Ntn
+  { decls : List Decl
   , diags : List Diag
   , fixities : F.Fixities
   , broken : List String
@@ -1653,7 +1655,7 @@ initialSt o toks declared own =
 
 readOut : List Diag -> FixRead -> ProgRes -> Read
 readOut lexDiags own r =
-  { ntns = assemble r.broken r.items
+  { decls = assemble r.broken r.items
   , diags =
       appendS
         lexDiags
@@ -1697,10 +1699,10 @@ readProgram known src =
 noKnown : String -> Bool
 noKnown x = False
 
--- >>> length (readProgram noKnown "idInt : Int -> Int\nidInt x = x\n").ntns
+-- >>> length (readProgram noKnown "idInt : Int -> Int\nidInt x = x\n").decls
 -- 1
 
--- >>> length (readProgram noKnown "data Color = Red | Green\n\nnext : Color -> Color\nnext c = case c of\n  Red -> Green\n  Green -> Red\n").ntns
+-- >>> length (readProgram noKnown "data Color = Red | Green\n\nnext : Color -> Color\nnext c = case c of\n  Red -> Green\n  Green -> Red\n").decls
 -- 2
 
 -- >>> length (readProgram noKnown "x : Int\nx = ) oops\n").diags

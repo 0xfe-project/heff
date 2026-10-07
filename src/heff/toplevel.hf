@@ -1,4 +1,4 @@
--- Top-level elaboration: notation becomes
+-- Top-level elaboration: presyntax becomes
 -- judgments (the dispatcher's functions are one knot record, `tk`),
 -- declarations become globals, each elaborated in a fresh state; a
 -- definition whose body fails is an error hole of its type.  A watch
@@ -7,13 +7,14 @@
 import array as A
 import heff.clauses as Cl
 import heff.conversion as C
+import heff.diagnostic
 import heff.dict as D
 import heff.environment
 import heff.globals as G
 import heff.memoed as M
 import heff.meta as Mt
-import heff.notation
 import heff.params as Pm
+import heff.presyntax
 import heff.prims as Pi
 import heff.print as Pr
 import heff.psurface as Ps
@@ -41,8 +42,8 @@ failP sp code msg =
     , note = Nothing
     }
 
-unexpectedNotation : {a : Type} -> Ntn -> String -> Elab a
-unexpectedNotation n c = failP (ntnSpan n) 3 ("unexpected notation for " ++ c)
+unexpectedNotation : {a : Type} -> Pm.Span -> String -> Elab a
+unexpectedNotation sp c = failP sp 3 ("unexpected notation for " ++ c)
 
 tryStep : {a : Type}
         -> Pair (Either Diag a) ElabSt
@@ -108,7 +109,7 @@ selfWalk k =
 selfAsLocal : String -> Sx.Tm -> Sx.Tm
 selfAsLocal k t = (selfWalk k).el 0 t
 
--- Judgments from notation
+-- Judgments from presyntax
 --------------------------------------------------------------------------------
 
 data Judgment = ChkJ R.Chk | SynJ R.Syn | TypJ R.Typ
@@ -142,21 +143,21 @@ fromTypD : Pm.Case -> Pm.Span -> R.Typ -> Elab Judgment
 fromTypD N sp j = failP sp 4 "cannot use descriptive syntax in nominal position"
 fromTypD De sp j = pure (TypJ j)
 
--- | notation that can only be checked, never synthesised
-checksOnly : Ntn -> Bool
-checksOnly n = case (getGroup n).head of
-  At (NTag _) _ -> True
-  At (NBlock BStruct _ _) _ -> True
-  At (NBlock BMatch _ _) _ -> True
-  At (NBlock BLet _ _) _ -> True
-  At (NBlock BLocal _ _) _ -> True
-  At (NTuple _) _ -> True
-  At (Keyword KAbandon) _ -> True
-  At (Infix _ (At (Keyword KMaps) _) _) _ -> True
+-- | presyntax that can only be checked, never synthesised
+checksOnly : Expr -> Bool
+checksOnly e = case Pm.nodeOf (spineOf e).head of
+  ETag _ -> True
+  EStruct _ -> True
+  EMatch _ _ -> True
+  ELetIn _ _ -> True
+  ELocal _ _ -> True
+  ETuple _ -> True
+  EWord AbandonWord -> True
+  ELam _ _ -> True
   _ -> False
 
-implicitLambda : Ntn -> Bool
-implicitLambda (At (Infix (At (NBrace _) _) (At (Keyword KMaps) _) _) _) = True
+implicitLambda : Expr -> Bool
+implicitLambda (At (ELam (LamImplicit _ _) _) _) = True
 implicitLambda _ = False
 
 intoSyn : Pm.Span -> Judgment -> Elab R.Syn
@@ -168,13 +169,13 @@ intoSyn sp (TypJ _) =
 
 -- | the dispatcher's functions, knotted
 type TK =
-  { parseJ : Pm.Case -> Ntn -> Elab Judgment
-  , chkJ : Pm.Case -> Ntn -> Elab R.Chk
-  , synJ : Pm.Case -> Ntn -> Elab R.Syn
-  , typJ : Pm.Case -> Ntn -> Elab R.Typ
+  { parseJ : Pm.Case -> Expr -> Elab Judgment
+  , chkJ : Pm.Case -> Expr -> Elab R.Chk
+  , synJ : Pm.Case -> Expr -> Elab R.Syn
+  , typJ : Pm.Case -> Expr -> Elab R.Typ
   }
 
--- | a check, recovered from where it fails -- where its notation is not
+-- | a check, recovered from where it fails -- where its presyntax is not
 -- | read, too
 recoveringChk : Elab R.Chk -> Elab R.Chk
 recoveringChk m = do
@@ -184,60 +185,57 @@ recoveringChk m = do
     Left d -> pure (R.recovering (MkChk (\e a -> throwE d)))
 
 -- | an argument: where it does not check, an error hole
-argumentF : TK -> Ntn -> Elab R.Chk
-argumentF tk n = recoveringChk (tk.chkJ N n)
+argumentF : TK -> Expr -> Elab R.Chk
+argumentF tk e = recoveringChk (tk.chkJ N e)
 
--- | an application to `n`, from `start` (where the function is) to it
-elimF : TK -> Int -> R.Syn -> Ntn -> Elab R.Syn
-elimF tk start s (At (NField x) sp) = pure (R.recordElim sp s x)
-elimF tk start s (At (NBrace (At (Infix (At (Ident x) _) (At (Keyword KSet) _) n) _)) sp) = do
-  a <- argumentF tk n
+-- | an application to `e`, from `start` (where the function is) to it
+elimF : TK -> Int -> R.Syn -> Expr -> Elab R.Syn
+elimF tk start s (At (EProject x) sp) = pure (R.recordElim sp s x)
+elimF tk start s (At (ENamed x e) sp) = do
+  a <- argumentF tk e
   pure (R.functionElimNamed { start = start, end = sp.end } x s a)
-elimF tk start s (At (NBrace n) sp) = do
-  a <- argumentF tk n
-  pure (R.functionElimImplicit { start = start, end = sp.end } s a)
-elimF tk start s n = do
-  a <- argumentF tk n
+elimF tk start s e = do
+  a <- argumentF tk e
   pure
       (R.functionElimC
-         (checksOnly n)
-         { start = start, end = (ntnSpan n).end }
+         (checksOnly e)
+         { start = start, end = (Pm.spanOf e).end }
          s
          a)
 
-elimAll : TK -> Int -> R.Syn -> List Ntn -> Elab R.Syn
+elimAll : TK -> Int -> R.Syn -> List Expr -> Elab R.Syn
 elimAll tk start s Nil = pure s
-elimAll tk start s (Cons n rest) = do
-  s' <- elimF tk start s n
+elimAll tk start s (Cons e rest) = do
+  s' <- elimF tk start s e
   elimAll tk start s' rest
 
-binderF : TK -> Ntn -> Elab R.Binder
-binderF tk (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) n) _) = do
-  t <- tk.typJ N n
-  pure (Named x t)
-binderF tk (At (NBracket (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) n) _)) sp) = do
-  t <- tk.typJ N n
-  pure (NamedInstance sp x t)
-binderF tk (At (NBrace (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) n) _)) sp) = do
-  t <- tk.typJ N n
-  pure (NamedImplicit sp x t)
-binderF tk n = do
-  t <- tk.typJ N n
-  pure (Anonymous t)
+binderF : TK -> PiBinder Expr -> Elab R.Binder
+binderF tk (PiNamed x _ t) = do
+  a <- tk.typJ N t
+  pure (Named x a)
+binderF tk (PiInstance x _ sp t) = do
+  a <- tk.typJ N t
+  pure (NamedInstance sp x a)
+binderF tk (PiImplicit x _ sp t) = do
+  a <- tk.typJ N t
+  pure (NamedImplicit sp x a)
+binderF tk (PiAnon d) = do
+  a <- tk.typJ N d
+  pure (Anonymous a)
 
-fieldDeclF : TK -> Ntn -> Elab R.FieldDeclaration
-fieldDeclF tk (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) n) _) = do
-  a <- tk.typJ N n
+fieldDeclF : TK -> Pm.Spanned (FieldDecl Expr) -> Elab R.FieldDeclaration
+fieldDeclF tk (At (DeclareField x _ t) _) = do
+  a <- tk.typJ N t
   pure { name = x, typ = a }
-fieldDeclF tk n =
-  failP (ntnSpan n) 1 "expected a field declaration of the form `x : A`"
+fieldDeclF tk (At (BadFieldDecl _) sp) =
+  failP sp 1 "expected a field declaration of the form `x : A`"
 
-fieldSetF : TK -> Pm.Case -> Ntn -> Elab R.FieldSetting
-fieldSetF tk c (At (Infix (At (Ident x) xsp) (At (Keyword KSet) _) n) _) = do
-  v <- recoveringChk (tk.chkJ c n)
-  pure { name = x, chk = v, span = ntnSpan n, nameSpan = xsp }
-fieldSetF tk c n =
-  failP (ntnSpan n) 2 "expected a field setting of the form `x = v`"
+fieldSetF : TK -> Pm.Case -> Pm.Spanned (FieldSet Expr) -> Elab R.FieldSetting
+fieldSetF tk c (At (SetField x xsp e) _) = do
+  v <- recoveringChk (tk.chkJ c e)
+  pure { name = x, chk = v, span = Pm.spanOf e, nameSpan = xsp }
+fieldSetF tk c (At (BadFieldSet _) sp) =
+  failP sp 2 "expected a field setting of the form `x = v`"
 
 traverseEL : {a b : Type} -> (a -> Elab b) -> List a -> Elab (List b)
 traverseEL f Nil = pure Nil
@@ -246,54 +244,48 @@ traverseEL f (Cons x xs) = do
   ys <- traverseEL f xs
   pure (Cons y ys)
 
-smallF : TK -> Ntn -> Elab R.SmallTyp
-smallF tk n = do
-  t <- tk.typJ N n
-  pure (R.asSmall (ntnSpan n) t)
+smallF : TK -> Expr -> Elab R.SmallTyp
+smallF tk e = do
+  t <- tk.typJ N e
+  pure (R.asSmall (Pm.spanOf e) t)
 
-variantF : TK -> Ntn -> Elab (Pair String (Array R.SmallTyp))
-variantF tk n = case (getGroup n).head of
-  At (NTag x) _ -> do
-    typs <- traverseEL (\m -> smallF tk m) (getGroup n).args
-    pure (MkPair x (A.fromList typs))
-  _ -> unexpectedNotation n "variant in a sum type"
+variantF : TK
+         -> Pm.Spanned (Variant Expr)
+         -> Elab (Pair String (Array R.SmallTyp))
+variantF tk (At (TagVariant x _ args) _) = do
+  typs <- traverseEL (\m -> smallF tk m) args
+  pure (MkPair x (A.fromList typs))
+variantF tk (At (BadVariant _) sp) =
+  unexpectedNotation sp "variant in a sum type"
 
 foldlR : {a b : Type} -> (a -> b -> b) -> b -> List a -> b
 foldlR f z Nil = z
 foldlR f z (Cons x xs) = f x (foldlR f z xs)
 
-doBind : Pm.Span -> Ntn -> Ntn -> Ntn -> Ntn
-doBind sp e x rest =
-  juxt (juxt (At (Ident "bind") sp) e) (infixOp x (At (Keyword KMaps) sp) rest)
-
--- | `let p = e` as a statement of a `do` block, not `let p = e in e'`
-isLetStmt : Ntn -> Bool
-isLetStmt (At (NBlock BLet _ (Cons (At (Infix _ (At (Keyword KMaps) _) _) _) Nil)) _) =
-  False
-isLetStmt (At (NBlock BLet _ _) _) = True
-isLetStmt _ = False
+-- | `bind e (\x -> rest)`
+doBind : Pm.Span -> Expr -> String -> Pm.Span -> Expr -> Expr
+doBind sp e x xsp rest = app (At (EVar "bind") sp) [e, lamName x xsp rest]
 
 -- | `let p = e`, the statements after it its body
-letOver : Ntn -> Ntn -> Ntn
-letOver (At (NBlock BLet rhs (Cons p Nil)) lsp) rest =
-  At
-    (NBlock BLet rhs (Cons (infixOp p (At (Keyword KMaps) lsp) rest) Nil))
-    { start = lsp.start, end = endPos rest }
-letOver n rest = n
+letOver : Pm.Span -> Pat -> Expr -> Expr -> Expr
+letOver lsp p rhs rest =
+  At (ELetIn rhs (alt p rest)) { start = lsp.start, end = (Pm.spanOf rest).end }
 
-doStep : Pm.Span -> Ntn -> Ntn -> Ntn
-doStep sp (At (Infix x (At (Keyword KBind) _) e) _) rest = doBind sp e x rest
-doStep sp e rest =
-  if isLetStmt e then letOver e rest else doBind sp e (At (Ident "_") sp) rest
+doStep : Pm.Span -> Pm.Spanned (Stmt Expr) -> Expr -> Expr
+doStep sp (At (StmtBind x xsp e) _) rest = doBind sp e x xsp rest
+doStep sp (At (StmtLet p rhs) lsp) rest = letOver lsp p rhs rest
+doStep sp (At (StmtExpr e) _) rest = doBind sp e "_" sp rest
 
-doLast : Pm.Span -> List Ntn -> Ntn -> Maybe Ntn
-doLast sp init (At (Infix _ (At (Keyword KBind) _) _) _) = Nothing
-doLast sp init last =
-  if isLetStmt last then Nothing
-  else Just (foldlR (\s rest -> doStep sp s rest) last init)
+doLast : Pm.Span
+       -> List (Pm.Spanned (Stmt Expr))
+       -> Pm.Spanned (Stmt Expr)
+       -> Maybe Expr
+doLast sp init (At (StmtExpr e) _) =
+  Just (foldlR (\s rest -> doStep sp s rest) e init)
+doLast sp init _ = Nothing
 
 -- | `do` ... with whichever `bind` is in scope
-doBlock : Pm.Span -> List Ntn -> Maybe Ntn
+doBlock : Pm.Span -> List (Pm.Spanned (Stmt Expr)) -> Maybe Expr
 doBlock sp stmts = case reverse stmts of
   Nil -> Nothing
   Cons last init -> doLast sp (reverse init) last
@@ -308,100 +300,89 @@ bareAltRefused x sp =
      ++ x
      ++ "` would be a new name for the whole value, which a `case` alternative cannot bind: `_` matches every other value, and the value is in hand already")
 
-patName : Ntn -> Elab String
-patName (At (Ident x) _) = pure x
+patName : Pat -> Elab String
+patName (At (PatVar x) _) = pure x
 patName p =
-  failP (ntnSpan p) 3 "an argument of a `case` pattern is a pattern or a name"
+  failP (Pm.spanOf p) 3 "an argument of a `case` pattern is a pattern or a name"
 
-doPat : Ntn -> Elab (Pair String (List String))
-doPat n = case (getGroup n).head of
-  At (NTag x) _ -> do
-    xs <- traverseEL (\p -> patName p) (getGroup n).args
+doPat : Pat -> Elab (Pair String (List String))
+doPat p = case (patSpineOf p).head of
+  At (PatTag x _ _) _ -> do
+    xs <- traverseEL (\q -> patName q) (patSpineOf p).args
     pure (MkPair x xs)
   -- extension: `_ => e` handles every tag not listed
-  At (Ident x) sp ->
-    if strEq x "_" && length (getGroup n).args == 0 then pure (MkPair "_" Nil)
+  At (PatVar x) sp ->
+    if strEq x "_" && length (patSpineOf p).args == 0 then pure (MkPair "_" Nil)
     else bareAltRefused x sp
   _ ->
     failP
-      (ntnSpan n)
+      (Pm.spanOf p)
       3
       "a `case` pattern is a pattern: a tag applied to patterns, a literal, or `_`"
 
-doCase : TK -> Ntn -> Elab (Pair String (Pair (Array String) R.Chk))
-doCase tk (At (Infix p (At (Keyword KMaps) _) bodyN) _) = do
+doCase : TK
+       -> Pm.Spanned (Alt Expr)
+       -> Elab (Pair String (Pair (Array String) R.Chk))
+doCase tk (At (MkAlt p bodyN) _) = do
   px <- doPat p
   case px of
     MkPair x xs -> do
       body <- recoveringChk (tk.chkJ N bodyN)
       pure (MkPair x (MkPair (A.fromList xs) body))
-doCase tk n = unexpectedNotation n "case in a match statement"
-
-specializationF : TK -> Ntn -> Elab (Pair String R.Chk)
-specializationF tk (At (NTuple (Cons (At (Infix (At (NField x) _) (At (Keyword KSet) _) n) _) Nil)) _) = do
-  c <- tk.chkJ N n
-  pure (MkPair x c)
-specializationF tk n = unexpectedNotation n "specialization"
 
 allL : {a : Type} -> (a -> Bool) -> List a -> Bool
 allL p Nil = True
 allL p (Cons x xs) = p x && allL p xs
 
-isData : Ntn -> Bool
-isData n = case n of
-  At (NTag _) _ -> True
-  At (NBlock BStruct _ _) _ -> True
-  At (NTuple _) _ -> True
+isData : Expr -> Bool
+isData e = case Pm.nodeOf e of
+  ETag _ -> True
+  EStruct _ -> True
+  ETuple _ -> True
   _ -> False
 
 -- | `(e : T)`, `e` a tag, a record or a tuple: in the core it is `e`,
 -- | which does not say its type
-annotatesData : Ntn -> Bool
-annotatesData (At (Infix e (At (Keyword KAnn) _) _) _) =
-  isData (getGroup e).head
+annotatesData : Expr -> Bool
+annotatesData (At (EAnn e _) _) = isData (spineOf e).head
 annotatesData _ = False
 
-isIdentA : Ntn -> Bool
-isIdentA (At (Ident _) _) = True
-isIdentA _ = False
+isVarP : Pat -> Bool
+isVarP (At (PatVar _) _) = True
+isVarP _ = False
 
-flatPat : Group -> Bool
-flatPat gr = case gr.head of
-  At (NTag _) _ -> allL isIdentA gr.args
-  At (Ident _) _ -> length gr.args == 0
+flatPat : PatSpine -> Bool
+flatPat gr = case Pm.nodeOf gr.head of
+  PatTag _ _ _ -> allL isVarP gr.args
+  PatVar _ -> length gr.args == 0
   _ -> False
 
 -- | flat: a tag applied to names, or `_`; anything else goes through the
 -- | match-tree compiler
-flatCaseAlt : Ntn -> Bool
-flatCaseAlt (At (Infix p (At (Keyword KMaps) _) _) _) = flatPat (getGroup p)
-flatCaseAlt _ = True
+flatCaseAlt : Pm.Spanned (Alt Expr) -> Bool
+flatCaseAlt (At (MkAlt p _) _) = flatPat (patSpineOf p)
 
-tagSpanOf : Ntn -> List (Pair String Pm.Span) -> List (Pair String Pm.Span)
-tagSpanOf p acc = case (getGroup p).head of
-  At (NTag x) tsp -> Cons (MkPair x tsp) acc
+tagSpanOf : Pat -> List (Pair String Pm.Span) -> List (Pair String Pm.Span)
+tagSpanOf p acc = case (patSpineOf p).head of
+  At (PatTag x _ _) tsp -> Cons (MkPair x tsp) acc
   _ -> acc
 
-tagSpans : List Ntn -> List (Pair String Pm.Span)
+tagSpans : List (Pm.Spanned (Alt Expr)) -> List (Pair String Pm.Span)
 tagSpans Nil = Nil
-tagSpans (Cons (At (Infix p (At (Keyword KMaps) _) _) _) rest) =
-  tagSpanOf p (tagSpans rest)
-tagSpans (Cons _ rest) = tagSpans rest
+tagSpans (Cons (At (MkAlt p _) _) rest) = tagSpanOf p (tagSpans rest)
 
-checkBareOne : Group -> Elab Unit
+checkBareOne : PatSpine -> Elab Unit
 checkBareOne gr = case gr.head of
-  At (Ident x) xsp ->
+  At (PatVar x) xsp ->
     if length gr.args == 0 && not (strEq x "_") then bareAltRefused x xsp
     else pure MkUnit
   _ -> pure MkUnit
 
-checkBareAlts : List Ntn -> Elab Unit
+checkBareAlts : List (Pm.Spanned (Alt Expr)) -> Elab Unit
 checkBareAlts Nil = pure MkUnit
-checkBareAlts (Cons (At (Infix p (At (Keyword KMaps) _) _) _) rest) = do
-  checkBareOne (getGroup p)
+checkBareAlts (Cons (At (MkAlt p _) _) rest) = do
+  checkBareOne (patSpineOf p)
   checkBareAlts rest
-checkBareAlts (Cons _ rest) = checkBareAlts rest
-
 -- Operators in patterns
 --------------------------------------------------------------------------------
 
@@ -456,79 +437,79 @@ notTagSynonym x sp =
      ++ ") x y = C x y`")
 
 -- | an operator applied, `x :: xs`, in a pattern
-hasOpPat : Ntn -> Bool
-hasOpPat n = case (getGroup n).head of
-  At (Ident _) _ -> length (getGroup n).args > 0
-  At (NTuple (Cons p Nil)) _ -> hasOpPat p
-  At (NBlock BStruct _ fs) _ ->
-    not (allL (\m -> not (hasOpPat (fieldPatOf m))) fs)
-  _ -> not (allL (\m -> not (hasOpPat m)) (getGroup n).args)
+hasOpPat : Pat -> Bool
+hasOpPat p = case Pm.nodeOf p of
+  PatOp _ _ _ -> True
+  PatRecord fs ->
+    not
+      (allL
+         (\f -> case f of
+          MkFieldPat _ q -> not (hasOpPat q))
+         fs)
+  PatTag _ _ ps -> not (allL (\m -> not (hasOpPat m)) ps)
+  _ -> False
 
 -- | (`opPat`, the knot) `x = p`, a field of a record pattern
-opField : (Ntn -> Elab Ntn) -> Ntn -> Elab Ntn
-opField op (At (Infix x k p) sp) = do
+opField : (Pat -> Elab Pat) -> FieldPat Pat -> Elab (FieldPat Pat)
+opField op (MkFieldPat x p) = do
   p' <- op p
-  pure (At (Infix x k p') sp)
-opField op n = pure n
+  pure (MkFieldPat x p')
 
 -- | a pattern, its operators as the tags they are other names for
-opPat : G.Globals -> Ntn -> Elab Ntn
-opPat g n = case (getGroup n).head of
-  At (Ident x) xsp ->
-    if length (getGroup n).args == 0 then pure n
-    else case G.lookupKey g x of
-      Just (MkPair _ ge) -> case tagSynonym ge of
-        Just (MkPair t k) ->
-          if k == length (getGroup n).args
-            then do
-              args <- traverseEL (\m -> opPat g m) (getGroup n).args
-              pure (group (At (NTag t) xsp) args)
-          else notTagSynonym x xsp
-        Nothing -> notTagSynonym x xsp
-      Nothing -> failP xsp 3 ("no such operator " ++ x ++ " in scope")
-  At (NTuple (Cons p Nil)) sp -> do
-    p' <- opPat g p
-    pure (group (At (NTuple (Cons p' Nil)) sp) (getGroup n).args)
-  At (NBlock BStruct h fs) sp -> do
+opPat : G.Globals -> Pat -> Elab Pat
+opPat g p = case p of
+  At (PatOp x xsp args) _ -> case G.lookupKey g x of
+    Just (MkPair _ ge) -> case tagSynonym ge of
+      Just (MkPair t k) ->
+        if k == length args
+          then do
+            args' <- traverseEL (\m -> opPat g m) args
+            pure (patTag t xsp args')
+        else notTagSynonym x xsp
+      Nothing -> notTagSynonym x xsp
+    Nothing -> failP xsp 3 ("no such operator " ++ x ++ " in scope")
+  At (PatRecord fs) sp -> do
     fs' <- traverseEL (\m -> opField (\q -> opPat g q) m) fs
-    pure (group (At (NBlock BStruct h fs') sp) (getGroup n).args)
-  _ -> do
-    args <- traverseEL (\m -> opPat g m) (getGroup n).args
-    pure (group (getGroup n).head args)
+    pure (At (PatRecord fs') sp)
+  At (PatTag t tsp args) _ -> do
+    args' <- traverseEL (\m -> opPat g m) args
+    pure (patTag t tsp args')
+  _ -> pure p
 
-altHasOp : Ntn -> Bool
-altHasOp (At (Infix p (At (Keyword KMaps) _) _) _) = hasOpPat p
-altHasOp _ = False
+altHasOp : Pm.Spanned (Alt Expr) -> Bool
+altHasOp (At (MkAlt p _) _) = hasOpPat p
 
-opAlt : G.Globals -> Ntn -> Elab Ntn
-opAlt g (At (Infix p (At (Keyword KMaps) ksp) body) sp) = do
+opAlt : G.Globals -> Pm.Spanned (Alt Expr) -> Elab (Pm.Spanned (Alt Expr))
+opAlt g (At (MkAlt p body) sp) = do
   p' <- opPat g p
-  pure (At (Infix p' (At (Keyword KMaps) ksp) body) sp)
-opAlt g n = pure n
+  pure (At (MkAlt p' body) sp)
 
-eqnHasOp : Ntn -> Bool
-eqnHasOp (At (Infix lhs (At (Keyword KSet) _) _) _) =
-  not (allL (\m -> not (hasOpPat m)) (getGroup lhs).args)
-eqnHasOp _ = False
+eqnHasOp : Pm.Spanned (Equation Expr) -> Bool
+eqnHasOp (At (MkEquation _ _ ps _) _) = not (allL (\m -> not (hasOpPat m)) ps)
 
-opEquation : G.Globals -> Ntn -> Elab Ntn
-opEquation g (At (Infix lhs (At (Keyword KSet) ksp) rhs) sp) = do
-  args <- traverseEL (\m -> opPat g m) (getGroup lhs).args
-  pure
-      (At
-         (Infix (group (getGroup lhs).head args) (At (Keyword KSet) ksp) rhs)
-         sp)
-opEquation g n = pure n
+opEquation : G.Globals
+           -> Pm.Spanned (Equation Expr)
+           -> Elab (Pm.Spanned (Equation Expr))
+opEquation g (At (MkEquation f fsp ps rhs) sp) = do
+  ps' <- traverseEL (\m -> opPat g m) ps
+  pure (At (MkEquation f fsp ps' rhs) sp)
 
--- | the head of a group, parsed
 -- | a local definition's body: its equations, as a match
-localEqs : TK -> String -> List Ntn -> Pm.Span -> Elab R.Chk
+localEqs : TK
+         -> String
+         -> List (Pm.Spanned (Equation Expr))
+         -> Pm.Span
+         -> Elab R.Chk
 localEqs tk f eqs sp = case Cl.desugar f Nil eqs sp of
   Left err -> failP err.span 10 err.msg
   Right b -> tk.chkJ N b
 
 -- (an operator in a pattern is found where the globals are in hand)
-localBody : TK -> String -> List Ntn -> Pm.Span -> Elab R.Chk
+localBody : TK
+          -> String
+          -> List (Pm.Spanned (Equation Expr))
+          -> Pm.Span
+          -> Elab R.Chk
 localBody tk f eqs sp =
   if not (allL (\m -> not (eqnHasOp m)) eqs)
     then pure
@@ -540,40 +521,39 @@ localBody tk f eqs sp =
 
 -- | extension: an equation's `where`: each local definition, `f : T` by
 -- | its equations, in scope in those after it and in the equation's body
-localsJ : TK -> List Ntn -> Maybe Ntn -> Pm.Span -> Elab R.Chk
-localsJ tk Nil (Just bodyN) sp = tk.chkJ N bodyN
-localsJ tk Nil Nothing sp =
-  unexpectedNotation (At NError sp) "local definitions"
-localsJ tk (n :: ns) bodyN sp = case defEqnsOf n of
-  Just d -> do
-    ty <- tk.typJ N d.ty
-    body <- localBody tk d.name d.eqs (ntnSpan n)
-    rest <- localsJ tk ns bodyN sp
-    pure (R.localDef d.name ty body rest)
-  Nothing -> unexpectedNotation n "local definition"
+localsJ : TK -> List Decl -> Expr -> Elab R.Chk
+localsJ tk Nil bodyN = tk.chkJ N bodyN
+localsJ tk (d :: ds) bodyN = case Pm.nodeOf d of
+  DeclEquations name _ tyN eqs -> do
+    ty <- tk.typJ N tyN
+    body <- localBody tk name eqs (Pm.spanOf d)
+    rest <- localsJ tk ds bodyN
+    pure (R.localDef name ty body rest)
+  _ -> unexpectedNotation (Pm.spanOf d) "local definition"
 
-parseHeadF : TK -> Pm.Case -> Ntn -> Elab Judgment
+-- | the head of a spine, parsed
+parseHeadF : TK -> Pm.Case -> Expr -> Elab Judgment
 parseHeadF tk c n = case n of
   -- Variable rule
-  At (Ident x) sp -> pure (fromSynN c (R.find sp x))
+  At (EVar x) sp -> pure (fromSynN c (R.find sp x))
   -- Type formers
-  At (Infix domN (At (Keyword KArrow) _) codN) _ -> do
-    dom <- binderF tk domN
+  At (EPi b codN) _ -> do
+    dom <- binderF tk b
     cod <- tk.typJ N codN
     pure (fromTypN c (R.functionFormation dom cod))
-  At (NBlock BSig Nothing fields) sp -> do
+  At (ESig fields) sp -> do
     fieldDecls <- traverseEL (\m -> fieldDeclF tk m) fields
     fromTypD c sp (R.recordFormation fieldDecls)
-  At (NBlock BSum Nothing variantNs) sp -> do
+  At (ESum variantNs) sp -> do
     variants <- traverseEL (\m -> variantF tk m) variantNs
     fromTypD c sp (R.sumFormation (D.fromList variants))
-  At (Keyword KType) _ -> pure (fromTypN c (R.universeFormation SmallU))
+  At (EWord TypeWord) _ -> pure (fromTypN c (R.universeFormation SmallU))
   -- Introduction rules (except for tag)
-  At (Infix (At (Ident x) _) (At (Keyword KMaps) _) bodyN) _ -> do
+  At (ELam (LamName x _) bodyN) _ -> do
     body <- recoveringChk (tk.chkJ c bodyN)
-    pure (ChkJ (R.functionIntro (ntnSpan n) x body))
+    pure (ChkJ (R.functionIntro (Pm.spanOf n) x body))
   -- extension: `\(x : T) -> e` annotates the binder
-  At (Infix (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) tyN) _) (At (Keyword KMaps) _) bodyN) _ -> do
+  At (ELam (LamAnn x _ tyN) bodyN) _ -> do
     dom <- tk.typJ N tyN
     bj <- tk.parseJ N bodyN
     case bj of
@@ -583,7 +563,7 @@ parseHeadF tk c n = case n of
           (fromChkN
              c
              (R.functionIntroAnn
-                (ntnSpan n)
+                (Pm.spanOf n)
                 x
                 dom
                 (if implicitLambda bodyN then j else R.implicitLams j)))
@@ -592,22 +572,22 @@ parseHeadF tk c n = case n of
           (fromChkN
              c
              (R.functionIntroAnn
-                (ntnSpan n)
+                (Pm.spanOf n)
                 x
                 dom
-                (R.universeIntro (ntnSpan bodyN) j)))
+                (R.universeIntro (Pm.spanOf bodyN) j)))
   -- extension: `{x} => e` names an implicit argument
-  At (Infix (At (NBrace (At (Ident x) _)) _) (At (Keyword KMaps) _) bodyN) _ -> do
+  At (ELam (LamImplicit x _) bodyN) _ -> do
     body <- recoveringChk (tk.chkJ c bodyN)
-    pure (ChkJ (R.functionIntroImplicit (ntnSpan n) x body))
-  At (NBlock BStruct Nothing fields) sp -> do
+    pure (ChkJ (R.functionIntroImplicit (Pm.spanOf n) x body))
+  At (EStruct fields) sp -> do
     fieldSettings <- traverseEL (\m -> fieldSetF tk c m) fields
     pure (ChkJ (R.recordIntro sp fieldSettings))
   -- extension: `do` ... with whichever `bind` is in scope
-  At (NBlock BDo Nothing stmts) sp -> case doBlock sp stmts of
+  At (EDo stmts) sp -> case doBlock sp stmts of
     Just n' -> tk.parseJ c n'
     Nothing -> failP sp 12 "a `do` block ends with an expression"
-  At (NBlock BMatch (Just scrutN) casesN) sp ->
+  At (EMatch scrutN casesN) sp ->
     -- (an operator in a pattern is found where the globals are in hand)
     if not (allL (\m -> not (altHasOp m)) casesN)
       then pure
@@ -615,7 +595,7 @@ parseHeadF tk c n = case n of
              c
              (MkChk (\e a -> do
               casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
-              j <- tk.chkJ N (At (NBlock BMatch (Just scrutN) casesN') sp)
+              j <- tk.chkJ N (At (EMatch scrutN casesN') sp)
               R.runChk j e a)))
     -- (a scrutinee `(e : T)`, `e` a tag or a record, is `e` in the core,
     -- which does not say its type there: it is bound to a name, below)
@@ -640,83 +620,80 @@ parseHeadF tk c n = case n of
   -- extension: `let x = e in e'`, `e` synthesised (`let x : T = e` if it
   -- is not), bound once by a beta-redex; `let p = e in e'`, a `case` of
   -- one alternative, which must match every value
-  At (NBlock BLet (Just rhsN) (Cons alt Nil)) sp -> case alt of
-    At (Infix (At (Ident x) _) (At (Keyword KMaps) _) bodyN) _ -> do
+  At (ELetIn rhsN alt0) sp -> case alt0 of
+    At (MkAlt (At (PatVar x) _) bodyN) _ -> do
       rhs <- tk.synJ N rhsN
       body <- recoveringChk (tk.chkJ N bodyN)
       pure (fromChkN c (R.caseLet x rhs body))
-    At (Infix _ (At (Keyword KMaps) _) _) _ ->
-      tk.parseJ c (At (NBlock BMatch (Just rhsN) (Cons alt Nil)) sp)
-    _ -> failP sp 12 "a `let` statement is followed by what it is bound in"
+    _ -> tk.parseJ c (At (EMatch rhsN (Cons alt0 Nil)) sp)
   -- extension: an equation's body and its local definitions (`where`)
-  At (NBlock BLocal bodyN defs) sp -> do
-    j <- localsJ tk defs bodyN sp
+  At (ELocal bodyN defs) sp -> do
+    j <- localsJ tk defs bodyN
     pure (fromChkN c j)
   -- Misc.
-  At (Keyword KAbandon) sp -> pure (fromChkN c (R.abandonChk sp))
-  At (Infix n0 (At (Keyword KSpec) _) n1) _ -> do
-    px <- specializationF tk n1
-    case px of
-      MkPair x cc -> do
-        s <- tk.synJ N n0
-        pure (fromSynN c (R.recordSpec (ntnSpan n) s x cc))
-  At (Infix n0 (At (Keyword KAnn) _) n1) _ -> do
+  At (EWord AbandonWord) sp -> pure (fromChkN c (R.abandonChk sp))
+  At (ESpec n0 x _ v) _ -> do
+    cc <- tk.chkJ N v
+    s <- tk.synJ N n0
+    pure (fromSynN c (R.recordSpec (Pm.spanOf n) s x cc))
+  At (ESpecOther n0 n1) _ -> unexpectedNotation (Pm.spanOf n1) "specialization"
+  At (EAnn n0 n1) _ -> do
     cc <- tk.chkJ c n0
     t <- tk.typJ N n1
     pure (SynJ (R.annot t cc))
-  At (Keyword KInt) _ -> pure (fromTypN c R.primInt)
-  At (NInt i) _ -> pure (fromSynN c (R.litInt i))
-  At (Keyword KFloat) _ -> pure (fromTypN c R.primFloat)
-  At (NFloat x) _ -> pure (fromSynN c (R.litFloat x))
-  At (Keyword KString) _ -> pure (fromTypN c R.primString)
-  At (NString s) _ -> pure (fromSynN c (R.litString s))
-  _ -> failP (ntnSpan n) 3 "unexpected notation"
+  At (EWord IntWord) _ -> pure (fromTypN c R.primInt)
+  At (EInt i) _ -> pure (fromSynN c (R.litInt i))
+  At (EWord FloatWord) _ -> pure (fromTypN c R.primFloat)
+  At (EFloat x) _ -> pure (fromSynN c (R.litFloat x))
+  At (EWord StringWord) _ -> pure (fromTypN c R.primString)
+  At (EString s) _ -> pure (fromSynN c (R.litString s))
+  _ -> failP (Pm.spanOf n) 3 "unexpected notation"
 
-parseArray : TK -> Pm.Case -> Ntn -> Pm.Span -> List Ntn -> Elab Judgment
-parseArray tk c n ksp (Cons n0 Nil) = do
+parseArray : TK -> Pm.Case -> Expr -> List Expr -> Elab Judgment
+parseArray tk c n (Cons n0 Nil) = do
   a <- tk.typJ N n0
   pure (fromTypN c (R.primArray a))
-parseArray tk c n ksp args = failP (ntnSpan n) 3 "`Array` takes one type"
+parseArray tk c n args = failP (Pm.spanOf n) 3 "`Array` takes one type"
 
-parseF : TK -> Pm.Case -> Ntn -> Elab Judgment
-parseF tk c n = case (getGroup n).head of
-  At (NTag x) tsp -> do
-    args <- traverseEL (\m -> argumentF tk m) (getGroup n).args
-    pure (fromChkN c (R.sumIntro (ntnSpan n) tsp x args))
-  At (Keyword KArray) ksp -> parseArray tk c n ksp (getGroup n).args
+parseF : TK -> Pm.Case -> Expr -> Elab Judgment
+parseF tk c n = case (spineOf n).head of
+  At (ETag x) tsp -> do
+    args <- traverseEL (\m -> argumentF tk m) (spineOf n).args
+    pure (fromChkN c (R.sumIntro (Pm.spanOf n) tsp x args))
+  At (EWord ArrayWord) _ -> parseArray tk c n (spineOf n).args
   _ ->
-    if length (getGroup n).args == 0 then parseHeadF tk c (getGroup n).head
+    if length (spineOf n).args == 0 then parseHeadF tk c (spineOf n).head
     else do
-      h <- parseHeadF tk N (getGroup n).head
-      s0 <- intoSyn (ntnSpan (getGroup n).head) h
-      s <- elimAll tk (ntnSpan (getGroup n).head).start s0 (getGroup n).args
+      h <- parseHeadF tk N (spineOf n).head
+      s0 <- intoSyn (Pm.spanOf (spineOf n).head) h
+      s <- elimAll tk (Pm.spanOf (spineOf n).head).start s0 (spineOf n).args
       pure (fromSynN c s)
 
-chkHeadOf : Ntn -> R.Syn -> R.Chk
-chkHeadOf n j = case (getGroup n).head of
-  At (Ident x) _ -> R.autoRec (ntnSpan n) x (R.apply (ntnSpan n) j)
-  _ -> R.apply (ntnSpan n) j
+chkHeadOf : Expr -> R.Syn -> R.Chk
+chkHeadOf n j = case (spineOf n).head of
+  At (EVar x) _ -> R.autoRec (Pm.spanOf n) x (R.apply (Pm.spanOf n) j)
+  _ -> R.apply (Pm.spanOf n) j
 
-chkF : TK -> Pm.Case -> Ntn -> Elab R.Chk
+chkF : TK -> Pm.Case -> Expr -> Elab R.Chk
 chkF tk c n = do
   j <- tk.parseJ c n
   case j of
     -- (`{x} => e` binds the implicit argument itself)
     ChkJ j2 -> pure (if implicitLambda n then j2 else R.implicitLams j2)
     SynJ j2 -> pure (R.implicitLams (chkHeadOf n j2))
-    TypJ j2 -> pure (R.universeIntro (ntnSpan n) j2)
+    TypJ j2 -> pure (R.universeIntro (Pm.spanOf n) j2)
 
-synF : TK -> Pm.Case -> Ntn -> Elab R.Syn
+synF : TK -> Pm.Case -> Expr -> Elab R.Syn
 synF tk c n = do
   j <- tk.parseJ c n
-  intoSyn (ntnSpan n) j
+  intoSyn (Pm.spanOf n) j
 
-typF : TK -> Pm.Case -> Ntn -> Elab R.Typ
+typF : TK -> Pm.Case -> Expr -> Elab R.Typ
 typF tk c n = do
   j <- tk.parseJ c n
   case j of
     ChkJ j2 -> pure (R.universeElim LargeU j2)
-    SynJ j2 -> pure (R.universeElimSyn (ntnSpan n) j2)
+    SynJ j2 -> pure (R.universeElimSyn (Pm.spanOf n) j2)
     TypJ j2 -> pure j2
 
 tk : TK
@@ -730,18 +707,6 @@ tk =
 -- Declarations
 --------------------------------------------------------------------------------
 
-definition : Ntn -> Elab (Pair Ntn Ntn)
-definition (At (Infix n0 (At (Keyword KSet) _) n1) _) = pure (MkPair n0 n1)
-definition n = unexpectedNotation n "notation of the form `<head> := <body>`"
-
-annotN : Ntn -> Elab (Pair Ntn Ntn)
-annotN (At (Infix n0 (At (Keyword KAnn) _) n1) _) = pure (MkPair n0 n1)
-annotN n = unexpectedNotation n "type-annotated expression"
-
-identE : Ntn -> Elab String
-identE (At (Ident x) _) = pure x
-identE n = unexpectedNotation n "identifier"
-
 type ArgBinding =
   { span : Pm.Span, name : String, typ : R.Typ, implicit : Pm.Plicity }
 
@@ -749,33 +714,13 @@ mkArgBinding : Pm.Span -> String -> R.Typ -> Pm.Plicity -> ArgBinding
 mkArgBinding span name typ implicit =
   { span = span, name = name, typ = typ, implicit = implicit }
 
-argBinding : Ntn -> Elab ArgBinding
-argBinding (At (Infix n0 (At (Keyword KAnn) _) n1) _) = do
-  x <- identE n0
-  a <- tk.typJ N n1
-  pure
-      (mkArgBinding
-         (ntnSpan (infixOp n0 (At (Keyword KAnn) Pm.noSpan) n1))
-         x
-         a
-         Expl)
-argBinding (At (NBrace (At (Infix n0 (At (Keyword KAnn) _) n1) _)) sp) = do
-  x <- identE n0
-  a <- tk.typJ N n1
+argBinding : Pm.Spanned (Param Expr) -> Elab ArgBinding
+argBinding (At (ExplicitParam x _ t) sp) = do
+  a <- tk.typJ N t
+  pure (mkArgBinding sp x a Expl)
+argBinding (At (ImplicitParam x _ t) sp) = do
+  a <- tk.typJ N t
   pure (mkArgBinding sp x a Impl)
--- an instance binder in a head, `{{x : T}}`
-argBinding (At (NBracket (At (Infix n0 (At (Keyword KAnn) _) n1) _)) sp) = do
-  x <- identE n0
-  a <- tk.typJ N n1
-  pure (mkArgBinding sp x a Inst)
-argBinding n =
-  unexpectedNotation n "argument binding of the form `<name> : <type>`"
-
-unpackArgs : Ntn -> Elab (Pair String (List ArgBinding))
-unpackArgs n = do
-  x <- identE (getGroup n).head
-  args <- traverseEL (\m -> argBinding m) (getGroup n).args
-  pure (MkPair x args)
 
 withOne : ArgBinding -> Pair R.Typ R.Chk -> Pair R.Typ R.Chk
 withOne ab (MkPair t c) = case ab.implicit of
@@ -804,19 +749,15 @@ mkDeclJ name ty tm prim = { name = name, ty = ty, tm = tm, prim = prim }
 declOfParts : String -> Pair R.Typ R.Chk -> Bool -> Elab DeclJ
 declOfParts name (MkPair ty tm) prim = pure (mkDeclJ name ty tm prim)
 
-theoryD : Ntn -> Elab DeclJ
-theoryD n = do
-  pn <- definition n
-  case pn of
-    MkPair patN bodyN -> do
-      pa <- unpackArgs patN
-      case pa of
-        MkPair name args -> do
-          body <- tk.chkJ De bodyN
-          declOfParts
-              name
-              (withArgs args (MkPair (MkTyp (\e -> pure (M.univ LargeU))) body))
-              False
+-- | `theory T a where` and its fields
+theoryD : String -> List (Pm.Spanned (Param Expr)) -> Expr -> Elab DeclJ
+theoryD name params bodyN = do
+  args <- traverseEL (\m -> argBinding m) params
+  body <- tk.chkJ De bodyN
+  declOfParts
+      name
+      (withArgs args (MkPair (MkTyp (\e -> pure (M.univ LargeU))) body))
+      False
 
 explicitNames : List ArgBinding -> List String
 explicitNames Nil = Nil
@@ -824,63 +765,65 @@ explicitNames (Cons ab rest) =
   if not (Pm.eqPlicity ab.implicit Expl) then explicitNames rest
   else Cons ab.name (explicitNames rest)
 
-defPlain : Ntn -> Elab DeclJ
-defPlain n = do
-  pn <- definition n
-  case pn of
-    MkPair headN bodyN -> do
-      pt <- annotN headN
-      case pt of
-        MkPair patN tyN -> do
-          pa <- unpackArgs patN
-          case pa of
-            MkPair name args -> do
-              returnTyp <- tk.typJ N tyN
-              body <- tk.chkJ De bodyN
-              declOfParts name (withArgs args (MkPair returnTyp body)) False
+-- | `data T a = ...`, `type T a = ...`: a definition with named
+-- | arguments, its type and its body
+defineD : String -> List (Pm.Spanned (Param Expr)) -> Expr -> Expr -> Elab DeclJ
+defineD name params tyN bodyN = do
+  args <- traverseEL (\m -> argBinding m) params
+  returnTyp <- tk.typJ N tyN
+  body <- tk.chkJ De bodyN
+  declOfParts name (withArgs args (MkPair returnTyp body)) False
 
-equationsBody : String -> List ArgBinding -> List Ntn -> Pm.Span -> Elab R.Chk
+equationsBody : String
+              -> List ArgBinding
+              -> List (Pm.Spanned (Equation Expr))
+              -> Pm.Span
+              -> Elab R.Chk
 equationsBody name args eqs sp = do
   bodyN <- case Cl.desugar name (explicitNames args) eqs sp of
     Left err -> failP err.span 10 err.msg
     Right b -> pure b
   tk.chkJ De bodyN
 
--- extension: a definition by equations, `def f : T where <equations> end`
-defD : Ntn -> Elab DeclJ
-defD (At (Infix headN (At (Keyword KAnn) ksp) tyW) _) = case Cl.stripWhere
-    tyW of
-  Just (MkPair tyN eqs) -> do
-    pa <- unpackArgs headN
-    case pa of
-      MkPair name args -> do
-        body <-
-          if not (allL (\m -> not (eqnHasOp m)) eqs)
-            then pure
-                (MkChk (\e a -> do
-                 eqs' <- traverseEL (\m -> opEquation e.globals m) eqs
-                 j <- equationsBody name args eqs' (ntnSpan tyW)
-                 R.runChk j e a))
-          else equationsBody name args eqs (ntnSpan tyW)
-        returnTyp <- tk.typJ N tyN
-        declOfParts name (withArgs args (MkPair returnTyp body)) False
-  Nothing -> defPlain (infixOp headN (At (Keyword KAnn) ksp) tyW)
-defD n = defPlain n
+-- | a definition by equations, `f : T` and `f p ... = e`; `sp`, from the
+-- | type to the last equation
+equationsD : String
+           -> Expr
+           -> List (Pm.Spanned (Equation Expr))
+           -> Pm.Span
+           -> Elab DeclJ
+equationsD name tyN eqs sp = do
+  body <-
+    if not (allL (\m -> not (eqnHasOp m)) eqs)
+      then pure
+          (MkChk (\e a -> do
+           eqs' <- traverseEL (\m -> opEquation e.globals m) eqs
+           j <- equationsBody name Nil eqs' sp
+           R.runChk j e a))
+    else equationsBody name Nil eqs sp
+  returnTyp <- tk.typJ N tyN
+  declOfParts name (withArgs Nil (MkPair returnTyp body)) False
 
-declJ : Ntn -> Elab DeclJ
-declJ (At (MDecl TheoryK n) _) = theoryD n
--- (`instance` marks a definition; it elaborates as any other)
-declJ (At (MDecl DefK n) _) = defD n
--- extension: `primitive name : T`, implemented by the runtime
-declJ (At (MDecl PrimK (At (Infix (At (Ident x) _) (At (Keyword KAnn) _) tyN) _)) _) = do
-  ty <- tk.typJ N tyN
-  pure
-      (mkDeclJ
-         x
-         ty
-         (MkChk (\e a -> pure { stx = SPrim x, val = \u -> Nom VOpaque }))
-         True)
-declJ n = unexpectedNotation n "top-level declaration"
+declJ : Decl -> Elab DeclJ
+declJ d = case Pm.nodeOf d of
+  DeclTheory name _ params bodyN -> theoryD name params bodyN
+  DeclDefine name _ params tyN bodyN -> defineD name params tyN bodyN
+  DeclEquations name _ tyN eqs ->
+    equationsD
+      name
+      tyN
+      eqs
+      { start = (Pm.spanOf tyN).start, end = (Pm.spanOf d).end }
+  -- extension: `primitive name : T`, implemented by the runtime
+  DeclPrimitive x _ tyN -> do
+    ty <- tk.typJ N tyN
+    pure
+        (mkDeclJ
+           x
+           ty
+           (MkChk (\e a -> pure { stx = SPrim x, val = \u -> Nom VOpaque }))
+           True)
+  _ -> unexpectedNotation (Pm.spanOf d) "top-level declaration"
 
 -- Elaborating one declaration
 --------------------------------------------------------------------------------
@@ -1162,12 +1105,12 @@ primNames : List String
 primNames = map (\(p : Pair String Pi.PrimImpl) -> fst p) Pi.prims
 
 -- | a primitive is one the runtime has
-primKnown : Ntn -> DeclJ -> Elab Unit
-primKnown n d =
+primKnown : Pm.Span -> DeclJ -> Elab Unit
+primKnown sp d =
   if d.prim && not (elemBy strEq d.name primNames)
     then failWith
         (a := Unit)
-        (ntnSpan n)
+        sp
         29
         ("there is no primitive called `"
          ++ d.name
@@ -1178,7 +1121,7 @@ primKnown n d =
 
 elabBody : (String -> String)
          -> G.Globals
-         -> Ntn
+         -> Decl
          -> DeclJ
          -> M.Ty
          -> Elab Elaborated
@@ -1187,7 +1130,7 @@ elabBody key g n d a = do
   body <-
     tryE
       (bodyPhase
-         (ntnSpan n)
+         (Pm.spanOf n)
          d
          (G.addEntry
             (keyOf key d)
@@ -1205,14 +1148,14 @@ elabBody key g n d a = do
          (keyOf key d)
          (M.tyN a))
   modify (withCore (setSelfKey Nothing))
-  primKnown n d
+  primKnown (Pm.spanOf n) d
   mc <- gets (\st -> (core st).metas)
   elabOut key g d (U.zonkTy mc a.stx) mc body
 
 -- | Elaborate one declaration.  A definition whose type elaborates and
 -- | whose body does not is a definition still, `failed`: an error hole
 -- | of its type.
-elabDecl : (String -> String) -> G.Globals -> Ntn -> Elab Elaborated
+elabDecl : (String -> String) -> G.Globals -> Decl -> Elab Elaborated
 elabDecl key g n = do
   modify (withCore (setSelfKey Nothing))
   d <- declJ n
@@ -1249,12 +1192,12 @@ watchPhase g sp (MkPair t ty) = do
 
 -- | a watch `-- >>> e`: elaborated as an anonymous definition, its
 -- | entry kept aside (never among the globals)
-elabWatch : G.Globals -> Ntn -> Elab G.Entry
+elabWatch : G.Globals -> Expr -> Elab G.Entry
 elabWatch g n = do
   j <- tk.parseJ N n
-  s <- watchSyn (ntnSpan n) j
+  s <- watchSyn (Pm.spanOf n) j
   pr <- R.runSyn s (emptyElabEnv g)
-  watchPhase g (ntnSpan n) pr
+  watchPhase g (Pm.spanOf n) pr
 
 -- The module
 --------------------------------------------------------------------------------
@@ -1331,23 +1274,9 @@ failedList r = case r.failed of
   Just d -> reportedD d
   Nothing -> Nil
 
-headNameN : Ntn -> Maybe String
-headNameN (At (Infix h (At (Keyword KAnn) _) _) _) = headNameN h
-headNameN h = case (getGroup h).head of
-  At (Ident x) _ -> Just x
-  _ -> Nothing
-
--- | the name a declaration defines, from its notation: it may not be
--- | read further
-declNameN : Ntn -> Maybe String
-declNameN (At (MDecl _ (At (Infix h (At (Keyword KSet) _) _) _)) _) =
-  headNameN h
-declNameN (At (MDecl _ h) _) = headNameN h
-declNameN _ = Nothing
-
 -- (not even its type: what uses it is not checked, and not refused)
-topBroken : (String -> String) -> TopResult -> Ntn -> List Diag -> TopResult
-topBroken kf acc n diags = case declNameN n of
+topBroken : (String -> String) -> TopResult -> Decl -> List Diag -> TopResult
+topBroken kf acc n diags = case declName n of
   Just x ->
     mkTop
       (G.addBroken
@@ -1356,7 +1285,7 @@ topBroken kf acc n diags = case declNameN n of
           else G.addAlias x (kf x) acc.globals))
       diags
       acc.keys
-      (Cons (MkPair x (ntnSpan n)) acc.broken)
+      (Cons (MkPair x (Pm.spanOf n)) acc.broken)
       acc.watches
       acc.tests
       acc.spans
@@ -1391,7 +1320,7 @@ keepSt st acc =
 
 topTake : (String -> String)
         -> TopResult
-        -> Ntn
+        -> Decl
         -> Pair (Either Diag Elaborated) ElabSt
         -> TopResult
 topTake kf acc n (MkPair (Left d) st) =
@@ -1408,7 +1337,7 @@ topTake kf acc n (MkPair (Right r) st) =
     acc.broken
     acc.watches
     acc.tests
-    (Cons (MkPair r.name (ntnSpan n)) acc.spans)
+    (Cons (MkPair r.name (Pm.spanOf n)) acc.spans)
     (appendT (core st).infos acc.infos)
     (appendT (core st).trace acc.trace)
 
@@ -1439,21 +1368,12 @@ watchTake acc sp (MkPair (Right entry) st) =
     (appendT (core st).infos acc.infos)
     (appendT (core st).trace acc.trace)
 
-testDiag : Ntn -> Diag
-testDiag n =
-  { code = 211
-  , severity = SError
-  , msg = "a test is named: `test <name>`"
-  , span = ntnSpan n
-  , note = Nothing
-  }
-
-topOne : (String -> String) -> TopResult -> Ntn -> TopResult
-topOne kf acc (At (MDecl WatchK n) sp) =
-  watchTake acc sp (runE (elabWatch acc.globals n) emptySt)
+topOne : (String -> String) -> TopResult -> Decl -> TopResult
+topOne kf acc (At (DeclWatch e) sp) =
+  watchTake acc sp (runE (elabWatch acc.globals e) emptySt)
 -- extension: `test name`, the watches after it (with expectations) are
 -- a test, named
-topOne kf acc (At (MDecl TestK (At (Ident x) xsp)) sp) =
+topOne kf acc (At (DeclTest x _) sp) =
   mkTop
     acc.globals
     acc.diags
@@ -1464,20 +1384,9 @@ topOne kf acc (At (MDecl TestK (At (Ident x) xsp)) sp) =
     acc.spans
     acc.infos
     acc.trace
-topOne kf acc (At (MDecl TestK n) sp) =
-  mkTop
-    acc.globals
-    (Cons (testDiag n) acc.diags)
-    acc.keys
-    acc.broken
-    acc.watches
-    acc.tests
-    acc.spans
-    acc.infos
-    acc.trace
 topOne kf acc n = topTake kf acc n (runE (elabDecl kf acc.globals n) emptySt)
 
-topGo : (String -> String) -> TopResult -> List Ntn -> TopResult
+topGo : (String -> String) -> TopResult -> List Decl -> TopResult
 topGo kf acc Nil =
   mkTop
     acc.globals
@@ -1495,13 +1404,14 @@ emptyTop : G.Globals -> TopResult
 emptyTop g0 = mkTop g0 Nil Nil Nil Nil Nil Nil Nil Nil
 
 -- | every declaration of a module, each elaborated in a fresh state
-topModule : String -> G.Globals -> List Ntn -> TopResult
-topModule modName g0 ntns = topGo (\x -> modName ++ "." ++ x) (emptyTop g0) ntns
+topModule : String -> G.Globals -> List Decl -> TopResult
+topModule modName g0 decls =
+  topGo (\x -> modName ++ "." ++ x) (emptyTop g0) decls
 
 -- | the same, on top of some existing globals, each definition under
 -- | its own name (what an expectation is read with)
-topWith : G.Globals -> List Ntn -> TopResult
-topWith g0 ntns = topGo (\x -> x) (emptyTop g0) ntns
+topWith : G.Globals -> List Decl -> TopResult
+topWith g0 decls = topGo (\x -> x) (emptyTop g0) decls
 
 -- | a definition as a cache keeps it: its key, where it is, and its
 -- | core syntax (type and body)
@@ -1597,7 +1507,7 @@ noImports x = False
 
 checkRead : String -> Su.Read -> TopResult
 checkRead modName r =
-  withParse (topModule modName G.emptyGlobals r.ntns) r.diags
+  withParse (topModule modName G.emptyGlobals r.decls) r.diags
 
 -- | a module's source, read and elaborated (no imports)
 checkSource : String -> String -> TopResult

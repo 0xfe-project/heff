@@ -1,46 +1,169 @@
 -- The formatter, checked: src/heff/fmt/layout.hf lays a file out anew, and here
 -- the result is held to mean what the text did -- the same imports, the
--- same notation read back, the same comments in the same order.
+-- same presyntax read back, the same comments in the same order.
 
+import heff.diagnostic
 import heff.fixity as F
 import heff.import as Im
-import heff.notation
+import heff.params as Pm
+import heff.presyntax
 import heff.surface as Su
 import heff.fmt.layout as Ly
 import heff.fmt.lex as L
 import prelude
 
--- | a notation as a string, its spans forgotten: two readings mean the
+-- | presyntax as a string, its spans forgotten: two readings mean the
 -- | same where their keys are equal
-ntnKey : Ntn -> String
-ntnKey (At (Juxt a b) _) = "(" ++ ntnKey a ++ " " ++ ntnKey b ++ ")"
-ntnKey (At (Infix a b c) _) =
-  "{" ++ ntnKey a ++ " " ++ ntnKey b ++ " " ++ ntnKey c ++ "}"
-ntnKey (At (NBlock b m xs) _) =
-  "["
-  ++ blockText b
-  ++ " "
-  ++ (case m of
-      Nothing -> ""
-      Just n -> ntnKey n)
-  ++ " | "
-  ++ joinWith "; " (map ntnKey xs)
-  ++ "]"
-ntnKey (At (MDecl k n) _) = "<" ++ declText k ++ " " ++ ntnKey n ++ ">"
-ntnKey (At (NTuple xs) _) = "(," ++ joinWith ", " (map ntnKey xs) ++ ")"
-ntnKey (At (NBrace n) _) = "{b " ++ ntnKey n ++ "}"
-ntnKey (At (NBracket n) _) = "[b " ++ ntnKey n ++ "]"
-ntnKey (At (Ident x) _) = "i:" ++ x
-ntnKey (At (Keyword x) _) = "k:" ++ kwText x
-ntnKey (At (NField x) _) = "f:" ++ x
-ntnKey (At (NTag x) _) = "t:" ++ x
-ntnKey (At (NInt i) _) = "n:" ++ showInt i
-ntnKey (At (NFloat x) _) = "f:" ++ showFloat x
-ntnKey (At (NString s) _) = "s:" ++ s
-ntnKey (At NError _) = "error"
+wordKey : SyntaxWord -> String
+wordKey TypeWord = "Type"
+wordKey IntWord = "Int"
+wordKey FloatWord = "Float"
+wordKey StringWord = "String"
+wordKey ArrayWord = "Array"
+wordKey AbandonWord = "abandon"
+
+-- (each piece in brackets, so that no two readings are one key)
+keyOf : String -> List String -> String
+keyOf c parts = "(" ++ c ++ joinWith "" (map (\x -> " " ++ x) parts) ++ ")"
+
+listKey : {a : Type} -> (a -> String) -> List a -> String
+listKey f xs = "[" ++ joinWith ", " (map f xs) ++ "]"
+
+patKey : Pat -> String
+patKey p = case Pm.nodeOf p of
+  PatVar x -> keyOf "var" [x]
+  PatTag t _ ps -> keyOf "tag" [t, listKey patKey ps]
+  PatOp x _ ps -> keyOf "op" [x, listKey patKey ps]
+  PatInt i -> keyOf "int" [showInt i]
+  PatFloat x -> keyOf "float" [showFloat x]
+  PatString x -> keyOf "string" [x]
+  PatRecord fs ->
+    keyOf
+      "record"
+      [ listKey
+        (\f -> case f of
+         MkFieldPat x q -> keyOf "field" [x, patKey q])
+        fs
+      ]
+  PatWord w -> keyOf "word" [wordKey w]
+
+type Keys = { e : Expr -> String, decl : Decl -> String }
+
+paramKey : Keys -> Pm.Spanned (Param Expr) -> String
+paramKey r (At (ExplicitParam x _ t) _) = keyOf "explicit" [x, r.e t]
+paramKey r (At (ImplicitParam x _ t) _) = keyOf "implicit" [x, r.e t]
+
+keyTermF : Keys -> Expr -> String
+keyTermF r n = case Pm.nodeOf n of
+  EVar x -> keyOf "var" [x]
+  ETag x -> keyOf "tag" [x]
+  EInt i -> keyOf "int" [showInt i]
+  EFloat x -> keyOf "float" [showFloat x]
+  EString x -> keyOf "string" [x]
+  EWord w -> keyOf "word" [wordKey w]
+  EApp h args -> keyOf "app" [r.e h, listKey r.e args]
+  EProject x -> keyOf "project" [x]
+  ENamed x e -> keyOf "named" [x, r.e e]
+  EPi b cod ->
+    keyOf
+      "pi"
+      [ (case b of
+         PiNamed x _ t -> keyOf "named" [x, r.e t]
+         PiImplicit x _ _ t -> keyOf "implicit" [x, r.e t]
+         PiInstance x _ _ t -> keyOf "instance" [x, r.e t]
+         PiAnon t -> keyOf "anon" [r.e t])
+      , r.e cod
+      ]
+  ELam b body ->
+    keyOf
+      "lam"
+      [ (case b of
+         LamName x _ -> keyOf "name" [x]
+         LamImplicit x _ -> keyOf "implicit" [x]
+         LamAnn x _ t -> keyOf "ann" [x, r.e t])
+      , r.e body
+      ]
+  EAnn e t -> keyOf "ann" [r.e e, r.e t]
+  ESpec acc x _ v -> keyOf "spec" [r.e acc, x, r.e v]
+  ESpecOther a b -> keyOf "specOther" [r.e a, r.e b]
+  ESig fs ->
+    keyOf
+      "sig"
+      [ listKey
+        (\f -> case f of
+         At (DeclareField x _ t) _ -> keyOf "field" [x, r.e t]
+         At (BadFieldDecl e) _ -> keyOf "bad" [r.e e])
+        fs
+      ]
+  ESum vs ->
+    keyOf
+      "sum"
+      [ listKey
+        (\v -> case v of
+         At (TagVariant t _ args) _ -> keyOf "variant" [t, listKey r.e args]
+         At (BadVariant e) _ -> keyOf "bad" [r.e e])
+        vs
+      ]
+  EStruct fs ->
+    keyOf
+      "struct"
+      [ listKey
+        (\f -> case f of
+         At (SetField x _ e) _ -> keyOf "set" [x, r.e e]
+         At (BadFieldSet e) _ -> keyOf "bad" [r.e e])
+        fs
+      ]
+  EMatch s alts ->
+    keyOf
+      "match"
+      [ r.e s
+      , listKey
+        (\a -> case a of
+         At (MkAlt p e) _ -> keyOf "alt" [patKey p, r.e e])
+        alts
+      ]
+  ELetIn rhs (At (MkAlt p e) _) -> keyOf "let" [r.e rhs, patKey p, r.e e]
+  EDo stmts ->
+    keyOf
+      "do"
+      [ listKey
+        (\m -> case m of
+         At (StmtBind x _ e) _ -> keyOf "bind" [x, r.e e]
+         At (StmtLet p e) _ -> keyOf "let" [patKey p, r.e e]
+         At (StmtExpr e) _ -> keyOf "expr" [r.e e])
+        stmts
+      ]
+  ELocal body ds -> keyOf "local" [r.e body, listKey r.decl ds]
+  ETuple es -> keyOf "tuple" [listKey r.e es]
+  EBrace e -> keyOf "brace" [r.e e]
+  EBracket e -> keyOf "bracket" [r.e e]
+
+keyDeclF : Keys -> Decl -> String
+keyDeclF r d = case Pm.nodeOf d of
+  DeclEquations f _ ty eqs ->
+    keyOf
+      "equations"
+      [ f
+      , r.e ty
+      , listKey
+        (\eq -> case eq of
+         At (MkEquation g _ ps rhs) _ ->
+           keyOf "equation" [g, listKey patKey ps, r.e rhs])
+        eqs
+      ]
+  DeclDefine x _ ps u body ->
+    keyOf "define" [x, listKey (paramKey r) ps, r.e u, r.e body]
+  DeclTheory x _ ps body ->
+    keyOf "theory" [x, listKey (paramKey r) ps, r.e body]
+  DeclPrimitive x _ t -> keyOf "primitive" [x, r.e t]
+  DeclTest x _ -> keyOf "test" [x]
+  DeclWatch e -> keyOf "watch" [r.e e]
+
+keys : Keys
+keys = { e = \n -> keyTermF keys n, decl = \d -> keyDeclF keys d }
 
 type Meaning =
-  { imports : List String, ntns : List String, diags : List String }
+  { imports : List String, decls : List String, diags : List String }
 
 readNoFixities : String -> Su.Read
 readNoFixities text =
@@ -51,7 +174,7 @@ readNoFixities text =
 meaningOf : Im.Imports -> Su.Read -> Meaning
 meaningOf h r =
   { imports = map (\(i : Im.Import) -> i.name) h.imports
-  , ntns = map ntnKey r.ntns
+  , decls = map keys.decl r.decls
   , diags = map (\(d : Diag) -> d.msg) r.diags
   }
 
@@ -76,7 +199,7 @@ sameMeaning : String -> String -> Meaning -> Meaning -> Either String String
 sameMeaning src out a b =
   if not (strsEq a.imports b.imports)
     then Left "formatting would change the imports"
-  else if not (strsEq a.ntns b.ntns && strsEq a.diags b.diags)
+  else if not (strsEq a.decls b.decls && strsEq a.diags b.diags)
     then Left
         "formatting would change what the file means (a bug of the formatter)"
   else if not (strsEq (comments src) (comments out))

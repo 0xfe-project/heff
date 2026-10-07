@@ -2,15 +2,16 @@
 -- name at an offset (its type, where it is defined, what may be written
 -- there), every occurrence of what a name refers to, and an outline.
 
-import heff.diagnostic as Dg
+import heff.diagnostic
 import heff.driver as Dr
 import heff.environment as Env
 import heff.globals as G
 import heff.locals as Lc
-import heff.notation
 import heff.params as Pm
+import heff.presyntax
 import heff.psurface as Ps
 import heff.readback as R
+import heff.render as Dg
 import heff.toplevel as T
 import map as Mp
 import prelude
@@ -260,59 +261,33 @@ memberSites c x ms = case keyOf c x of
   Just k -> map (\(m : Named) -> site (memberT k m.name) m.name m.span) ms
   Nothing -> Nil
 
-headOf : Ntn -> Maybe Named
-headOf h = case (getGroup h).head of
-  At (Ident x) sp -> Just { name = x, span = sp }
-  _ -> Nothing
+tagOf : Pm.Spanned (Variant Expr) -> Maybe Named
+tagOf (At (TagVariant t tsp _) _) = Just { name = t, span = tsp }
+tagOf _ = Nothing
 
-equationHead : Ntn -> Maybe Pm.Span
-equationHead (At (Infix l (At (Keyword KSet) _) _) _) = case headOf l of
-  Just x -> Just x.span
-  Nothing -> Nothing
-equationHead _ = Nothing
-
-tagOf : Ntn -> Maybe Named
-tagOf alt = case (getGroup alt).head of
-  At (NTag t) sp -> Just { name = t, span = sp }
-  _ -> Nothing
-
-fieldOf : Ntn -> Maybe Named
-fieldOf (At (Infix (At (Ident x) sp) (At (Keyword KAnn) _) _) _) =
-  Just { name = x, span = sp }
+fieldOf : Pm.Spanned (FieldDecl Expr) -> Maybe Named
+fieldOf (At (DeclareField x sp _) _) = Just { name = x, span = sp }
 fieldOf _ = Nothing
 
-sumTags : Ntn -> List Named
-sumTags (At (NBlock BSum _ alts) _) = catMaybesQ (map tagOf alts)
+sumTags : Expr -> List Named
+sumTags (At (ESum alts) _) = catMaybesQ (map tagOf alts)
 sumTags _ = Nil
 
--- (a definition with named arguments, `data Pair a b = ...`: its name
--- and its tags)
-defSites : Dr.Checked -> Ntn -> Ntn -> List Site
-defSites c h body = case headOf h of
-  Just x ->
-    concatList
-      (globalSites c x.name [x.span])
-      (memberSites c x.name (sumTags body))
-  Nothing -> Nil
+equationHead : Pm.Spanned (Equation Expr) -> Pm.Span
+equationHead (At (MkEquation _ fsp _ _) _) = fsp
 
-theorySites : Dr.Checked -> Ntn -> List Ntn -> List Site
-theorySites c h fs = case headOf h of
-  Just x ->
+declSites : Dr.Checked -> Decl -> List Site
+declSites c d = case Pm.nodeOf d of
+  DeclEquations f fsp _ eqs -> globalSites c f (Cons fsp (map equationHead eqs))
+  -- (a definition with named arguments, `data Pair a b = ...`: its name
+  -- and its tags)
+  DeclDefine x xsp _ _ body ->
+    concatList (globalSites c x [xsp]) (memberSites c x (sumTags body))
+  DeclTheory x xsp _ (At (ESig fs) _) ->
     concatList
-      (globalSites c x.name [x.span])
-      (memberSites c x.name (catMaybesQ (map fieldOf fs)))
-  Nothing -> Nil
-
-declSites : Dr.Checked -> Ntn -> List Site
-declSites c n = case n of
-  At (MDecl DefK (At (Infix (At (Ident f) fsp) (At (Keyword KAnn) _) (At (Juxt _ (At (NBlock BWhere Nothing eqs) _)) _)) _)) _ ->
-    globalSites c f (Cons fsp (catMaybesQ (map equationHead eqs)))
-  At (MDecl DefK (At (Infix (At (Infix h (At (Keyword KAnn) _) _) _) (At (Keyword KSet) _) body) _)) _ ->
-    defSites c h body
-  At (MDecl TheoryK (At (Infix h (At (Keyword KSet) _) (At (NBlock BSig _ fs) _)) _)) _ ->
-    theorySites c h fs
-  At (MDecl PrimK (At (Infix (At (Ident x) sp) (At (Keyword KAnn) _) _) _)) _ ->
-    globalSites c x [sp]
+      (globalSites c x [xsp])
+      (memberSites c x (catMaybesQ (map fieldOf fs)))
+  DeclPrimitive x sp _ -> globalSites c x [sp]
   _ -> Nil
 
 -- | Where a file defines its names, as its notation says: each
@@ -320,7 +295,7 @@ declSites c n = case n of
 -- | equation; a `data`'s tags; a `theory`'s fields.  (A declaration that
 -- | did not elaborate defines nothing to refer to.)
 sites : Dr.Checked -> List Site
-sites c = concatMap (\n -> declSites c n) c.ntns
+sites c = concatMap (\d -> declSites c d) c.decls
 
 -- | where the global the name at an offset resolved to is defined, in a
 -- | program (the file last): its file, and the span of its name there.
@@ -442,7 +417,7 @@ targetIn program c ls off = case infoAt c off of
 -- | there; a local, at its binder or a use; and the name it is defined as
 targetAt : List Dr.Checked -> Int -> Maybe Found
 targetAt program off = case last program of
-  Just c -> targetIn program c (Lc.locals c.ntns) off
+  Just c -> targetIn program c (Lc.locals c.decls) off
   Nothing -> Nothing
 
 -- (a name's use, as the elaborator recorded it: the name alone)
@@ -583,7 +558,7 @@ inFileSites t name c ss =
        (catMaybesQ (map (\i -> useOf t name i) c.top.infos))
        (concatList
           (map (\(s : Site) -> s.span) ss)
-          (fieldUsesOf ss (Lc.locals c.ntns))))
+          (fieldUsesOf ss (Lc.locals c.decls))))
 
 inFile : Target -> String -> Dr.Checked -> List Occurrence
 inFile t name c =
@@ -605,7 +580,7 @@ spansOfLocal l = Cons l.binder l.uses
 localOccurrences : Dr.Checked -> Pm.Span -> List Occurrence
 localOccurrences c b = case find
     (\l -> sameBinder b l)
-    (Lc.locals c.ntns).locals of
+    (Lc.locals c.decls).locals of
   Just l ->
     map (\sp -> mkOccurrence c sp (sameSpan sp b)) (sortSpans (spansOfLocal l))
   Nothing -> Nil
@@ -711,28 +686,105 @@ childOf isData m =
   { name = m.name, kind = if isData then 22 else 8, span = m.span }
 
 -- | a local definition (`where`), as a child of what it is in
-localChild : Ntn -> List Child
-localChild n = case defEqnsOf n of
-  Just d -> [{ name = d.name, kind = 12, span = d.span }]
-  Nothing -> Nil
+localChild : Decl -> List Child
+localChild d = case Pm.nodeOf d of
+  DeclEquations f fsp _ _ -> [{ name = f, kind = 12, span = fsp }]
+  _ -> Nil
+
+-- | what a walk for local definitions looks in: the expressions in an
+-- | expression, in a declaration, in the order they are written
+type Children = { e : Expr -> List Child, decl : Decl -> List Child }
+
+paramChildren : Children -> Pm.Spanned (Param Expr) -> List Child
+paramChildren r (At (ExplicitParam _ _ t) _) = r.e t
+paramChildren r (At (ImplicitParam _ _ t) _) = r.e t
+
+localDeclF : Children -> Decl -> List Child
+localDeclF r d = case Pm.nodeOf d of
+  DeclEquations _ _ ty eqs ->
+    concatList
+      (r.e ty)
+      (concatMap
+         (\eq -> case eq of
+          At (MkEquation _ _ _ rhs) _ -> r.e rhs)
+         eqs)
+  DeclDefine _ _ ps u body ->
+    concatList
+      (concatMap (\m -> paramChildren r m) ps)
+      (concatList (r.e u) (r.e body))
+  DeclTheory _ _ ps body ->
+    concatList (concatMap (\m -> paramChildren r m) ps) (r.e body)
+  DeclPrimitive _ _ t -> r.e t
+  DeclTest _ _ -> Nil
+  DeclWatch e -> r.e e
 
 -- | the local definitions in a declaration, those in them too
-localChildren : Ntn -> List Child
-localChildren n = case n of
-  At (NBlock BLocal (Just b) defs) _ ->
+localTermF : Children -> Expr -> List Child
+localTermF r n = case Pm.nodeOf n of
+  ELocal b defs ->
     concatList
       (concatMap (\m -> localChild m) defs)
-      (concatList (localChildren b) (concatMap (\m -> localChildren m) defs))
-  At (Juxt a b) _ -> concatList (localChildren a) (localChildren b)
-  At (Infix a o b) _ -> concatList (localChildren a) (localChildren b)
-  At (NBlock _ (Just h) xs) _ ->
-    concatList (localChildren h) (concatMap (\m -> localChildren m) xs)
-  At (NBlock _ Nothing xs) _ -> concatMap (\m -> localChildren m) xs
-  At (MDecl _ x) _ -> localChildren x
-  At (NTuple xs) _ -> concatMap (\m -> localChildren m) xs
-  At (NBrace x) _ -> localChildren x
-  At (NBracket x) _ -> localChildren x
+      (concatList (r.e b) (concatMap r.decl defs))
+  EApp h args -> concatList (r.e h) (concatMap r.e args)
+  ENamed _ e -> r.e e
+  EPi b cod ->
+    concatList
+      (case b of
+       PiNamed _ _ t -> r.e t
+       PiImplicit _ _ _ t -> r.e t
+       PiInstance _ _ _ t -> r.e t
+       PiAnon t -> r.e t)
+      (r.e cod)
+  ELam b body ->
+    concatList
+      (case b of
+       LamAnn _ _ t -> r.e t
+       _ -> Nil)
+      (r.e body)
+  EAnn e t -> concatList (r.e e) (r.e t)
+  ESpec acc _ _ v -> concatList (r.e acc) (r.e v)
+  ESpecOther a b -> concatList (r.e a) (r.e b)
+  ESig fs ->
+    concatMap
+      (\f -> case f of
+       At (DeclareField _ _ t) _ -> r.e t
+       At (BadFieldDecl e) _ -> r.e e)
+      fs
+  ESum vs ->
+    concatMap
+      (\v -> case v of
+       At (TagVariant _ _ args) _ -> concatMap r.e args
+       At (BadVariant e) _ -> r.e e)
+      vs
+  EStruct fs ->
+    concatMap
+      (\f -> case f of
+       At (SetField _ _ e) _ -> r.e e
+       At (BadFieldSet e) _ -> r.e e)
+      fs
+  EMatch s alts ->
+    concatList
+      (r.e s)
+      (concatMap
+         (\a -> case a of
+          At (MkAlt _ e) _ -> r.e e)
+         alts)
+  ELetIn rhs (At (MkAlt _ e) _) -> concatList (r.e rhs) (r.e e)
+  EDo stmts ->
+    concatMap
+      (\m -> case m of
+       At (StmtBind _ _ e) _ -> r.e e
+       At (StmtLet _ e) _ -> r.e e
+       At (StmtExpr e) _ -> r.e e)
+      stmts
+  ETuple es -> concatMap r.e es
+  EBrace e -> r.e e
+  EBracket e -> r.e e
   _ -> Nil
+
+localWalk : Children
+localWalk =
+  { e = \n -> localTermF localWalk n, decl = \d -> localDeclF localWalk d }
 
 symbolWith : Dr.Checked -> Dr.Own -> Pm.Span -> List Site -> DocSymbol
 symbolWith c o sp own =
@@ -752,7 +804,7 @@ symbolWith c o sp own =
            (filter isMember own))
         (filter
            (\(m : Child) -> m.span.start >= sp.start && m.span.end <= sp.end)
-           (concatMap (\n -> localChildren n) c.ntns))
+           (concatMap localWalk.decl c.decls))
   }
 
 symbolOf : Dr.Checked -> List Site -> Dr.Own -> Pm.Span -> DocSymbol

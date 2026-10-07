@@ -1,11 +1,11 @@
 -- Definitions by equations, and a `case` of nested patterns.  Each
--- equation is one case of an induction; they are compiled, as notation,
--- into the lambdas and matches Hippogriff has.  This module's `do`
+-- equation is one case of an induction; they are compiled, as
+-- presyntax, into the lambdas and matches Hippogriff has.  This module's `do`
 -- sequences `Either Err`; the match compiler and its arms are the fields
 -- of one record, `ck`.
 
-import heff.notation
 import heff.params as Pm
+import heff.presyntax
 import prelude
 
 type Err = { span : Pm.Span, msg : String }
@@ -21,31 +21,24 @@ bind (Right x) f = f x
 bindU : Either Err Unit -> Either Err Unit
 bindU e = e
 
-stripRight : Ntn
-           -> Ntn
-           -> Maybe (Pair Ntn (List Ntn))
-           -> Maybe (Pair Ntn (List Ntn))
-stripRight l op Nothing = Nothing
-stripRight l op (Just (MkPair r' eqs)) = Just (MkPair (infixOp l op r') eqs)
-
--- | `T where ... end`, the type of a definition by equations
-stripWhere : Ntn -> Maybe (Pair Ntn (List Ntn))
-stripWhere n = case n of
-  At (Juxt f (At (NBlock BWhere Nothing eqs) _)) _ -> Just (MkPair f eqs)
-  At (Infix l op r) _ -> stripRight l op (stripWhere r)
-  _ -> Nothing
+badPat : {a : Type} -> Pat -> Either Err a
+badPat p =
+  Left
+    (mkErr
+       (Pm.spanOf p)
+       "a pattern is a variable, a literal, a tag applied to patterns, or a record of patterns")
 
 -- | a literal pattern is matched by the equality in scope for its kind
 -- | a record pattern names the fields it matches
-data Pat
+data MatchPat
   = PVar String
-  | PTag String (List Pat) Pm.Span
-  | PLit Ntn
-  | PRec (List (Pair String Pat)) Pm.Span
+  | PTag String (List MatchPat) Pm.Span
+  | PLit Pat
+  | PRec (List (Pair String MatchPat)) Pm.Span
 
-type Clause = { pats : List Pat, rhs : Ntn }
+type Clause = { pats : List MatchPat, rhs : Expr }
 
-mkClause : List Pat -> Ntn -> Clause
+mkClause : List MatchPat -> Expr -> Clause
 mkClause pats rhs = { pats = pats, rhs = rhs }
 
 appendC : {a : Type} -> List a -> List a -> List a
@@ -125,166 +118,307 @@ dropC n (Cons x xs) = if n <= 0 then Cons x xs else dropC (n - 1) xs
 spliceAt : {a : Type} -> Int -> List a -> List a -> List a
 spliceAt i ys xs = appendC (takeC i xs) (appendC ys (dropC (i + 1) xs))
 
-badPat : {a : Type} -> Ntn -> Either Err a
-badPat n =
-  Left
-    (mkErr
-       (ntnSpan n)
-       "a pattern is a variable, a literal, a tag applied to patterns, or a record of patterns")
-
--- | `x = p`, a field of a record pattern
-recFieldOf : Ntn -> Maybe String
-recFieldOf (At (Infix (At (Ident x) _) _ _) _) = Just x
-recFieldOf _ = Nothing
-
 -- | (`pat`, the knot: a record's fields are patterns)
-fieldPat : (Ntn -> Either Err Pat) -> Ntn -> Either Err (Pair String Pat)
-fieldPat pt f = case recFieldOf f of
-  Just x -> do
-    p <- pt (fieldPatOf f)
-    pure (MkPair x p)
-  Nothing -> badPat f
+fieldPat : (Pat -> Either Err MatchPat)
+         -> FieldPat Pat
+         -> Either Err (Pair String MatchPat)
+fieldPat pt (MkFieldPat x p) = do
+  q <- pt p
+  pure (MkPair x q)
 
-pat : Ntn -> Either Err Pat
-pat n = case (getGroup n).head of
-  At (NTuple (Cons p Nil)) _ ->
-    if length (getGroup n).args == 0 then pat p else badPat n
-  At (Ident x) _ ->
-    if length (getGroup n).args == 0 then Right (PVar x) else badPat n
-  At (NTag t) sp -> do
-    ps <- traverseC (\m -> pat m) (getGroup n).args
-    pure (PTag t ps sp)
-  At (NInt v) sp ->
-    if length (getGroup n).args == 0 then Right (PLit (At (NInt v) sp))
-    else badPat n
-  At (NString v) sp ->
-    if length (getGroup n).args == 0 then Right (PLit (At (NString v) sp))
-    else badPat n
-  At (NFloat v) sp ->
-    if length (getGroup n).args == 0 then Right (PLit (At (NFloat v) sp))
-    else badPat n
-  At (NBlock BStruct Nothing fs) sp ->
-    if length (getGroup n).args == 0
-      then do
-        fps <- traverseC (\f -> fieldPat (\m -> pat m) f) fs
-        pure (PRec fps sp)
-    else badPat n
-  _ -> badPat n
+pat : Pat -> Either Err MatchPat
+pat p = case Pm.nodeOf p of
+  PatVar x -> Right (PVar x)
+  PatTag t tsp ps -> do
+    qs <- traverseC (\m -> pat m) ps
+    pure (PTag t qs tsp)
+  PatInt _ -> Right (PLit p)
+  PatString _ -> Right (PLit p)
+  PatFloat _ -> Right (PLit p)
+  PatRecord fs -> do
+    fps <- traverseC (\f -> fieldPat (\m -> pat m) f) fs
+    pure (PRec fps (Pm.spanOf p))
+  _ -> badPat p
 
 -- | the equality a literal is matched by
-equalityOf : Ntn -> String
-equalityOf (At (NString _) _) = "strEq"
-equalityOf (At (NFloat _) _) = "floatEq"
+equalityOf : Pat -> String
+equalityOf (At (PatString _) _) = "strEq"
+equalityOf (At (PatFloat _) _) = "floatEq"
 equalityOf _ = "intEq"
 
-sameLit : Ntn -> Ntn -> Bool
-sameLit (At (NInt x) _) (At (NInt y) _) = x == y
-sameLit (At (NString x) _) (At (NString y) _) = strEq x y
-sameLit (At (NFloat x) _) (At (NFloat y) _) = floatEq x y
+sameLit : Pat -> Pat -> Bool
+sameLit (At (PatInt x) _) (At (PatInt y) _) = x == y
+sameLit (At (PatString x) _) (At (PatString y) _) = strEq x y
+sameLit (At (PatFloat x) _) (At (PatFloat y) _) = floatEq x y
 sameLit _ _ = False
 
-equationLhs : String -> Ntn -> Ntn -> Either Err Clause
-equationLhs f lhs rhs = case (getGroup lhs).head of
-  At (Ident g) _ ->
-    if strEq g f
-      then do
-        pats <- traverseC (\m -> pat m) (getGroup lhs).args
-        pure (mkClause pats rhs)
-    else Left
-        (mkErr
-           (ntnSpan lhs)
-           ("an equation of `" ++ f ++ "` starts with `" ++ f ++ "`"))
-  _ ->
-    Left
-      (mkErr
-         (ntnSpan lhs)
-         ("an equation of `" ++ f ++ "` starts with `" ++ f ++ "`"))
+-- | a literal pattern, as the expression it is compared to
+litExpr : Pat -> Expr
+litExpr (At (PatInt x) sp) = At (EInt x) sp
+litExpr (At (PatString x) sp) = At (EString x) sp
+litExpr (At (PatFloat x) sp) = At (EFloat x) sp
+litExpr (At _ sp) = At (EWord AbandonWord) sp
 
--- | `f p ... := e`
-equation : String -> Ntn -> Either Err Clause
-equation f (At (Infix lhs (At (Keyword KSet) _) rhs) _) = equationLhs f lhs rhs
-equation f n =
-  Left
-    (mkErr
-       (ntnSpan n)
-       ("an equation has the form `" ++ f ++ " <patterns> = <body>`"))
+-- | `f p ... = e`
+equation : Pm.Spanned (Equation Expr) -> Either Err Clause
+equation (At (MkEquation _ _ ps rhs) _) = do
+  pats <- traverseC (\m -> pat m) ps
+  pure (mkClause pats rhs)
 
-varOf : Pat -> Maybe String
+varOf : MatchPat -> Maybe String
 varOf (PVar x) = Just x
 varOf _ = Nothing
 
-patVars : Pat -> List String
+patVars : MatchPat -> List String
 patVars (PVar x) = Cons x Nil
 patVars (PTag _ ps _) = concatMapC (\p -> patVars p) ps
 patVars (PLit _) = Nil
 patVars (PRec fps _) = concatMapC (\fp -> patVars (snd fp)) fps
 
-identsOf : Ntn -> List String
-identsOf n = case n of
-  At (Ident x) _ -> Cons x Nil
-  At (Juxt a b) _ -> appendC (identsOf a) (identsOf b)
-  At (Infix a _ b) _ -> appendC (identsOf a) (identsOf b)
-  At (NBlock _ h ns) _ ->
-    appendC
-      (case h of
-       Nothing -> Nil
-       Just m -> identsOf m)
-      (concatMapC (\m -> identsOf m) ns)
-  At (MDecl _ m) _ -> identsOf m
-  At (NTuple ns) _ -> concatMapC (\m -> identsOf m) ns
-  At (NBrace m) _ -> identsOf m
+-- Names written
+--------------------------------------------------------------------------------
+
+-- | the names a pattern has, as written (an operator's, a record's
+-- | fields' too)
+patIdents : Pat -> List String
+patIdents p = case Pm.nodeOf p of
+  PatVar x -> Cons x Nil
+  PatTag _ _ ps -> concatMapC (\m -> patIdents m) ps
+  PatOp x _ ps -> Cons x (concatMapC (\m -> patIdents m) ps)
+  PatRecord fs ->
+    concatMapC
+      (\f -> case f of
+       MkFieldPat x q -> Cons x (patIdents q))
+      fs
   _ -> Nil
+
+-- | the names an expression has, as written: every name it uses or
+-- | binds (a field's, set or declared, too; not under `{{x : T}}`)
+type Idents = { e : Expr -> List String, decl : Decl -> List String }
+
+lamIdents : Idents -> LamBinder Expr -> List String
+lamIdents r (LamName x _) = Cons x Nil
+lamIdents r (LamImplicit x _) = Cons x Nil
+lamIdents r (LamAnn x _ t) = Cons x (r.e t)
+
+piIdents : Idents -> PiBinder Expr -> List String
+piIdents r (PiNamed x _ t) = Cons x (r.e t)
+piIdents r (PiImplicit x _ _ t) = Cons x (r.e t)
+piIdents r (PiInstance _ _ _ _) = Nil
+piIdents r (PiAnon d) = r.e d
+
+altIdents : Idents -> Pm.Spanned (Alt Expr) -> List String
+altIdents r (At (MkAlt p b) _) = appendC (patIdents p) (r.e b)
+
+stmtIdents : Idents -> Pm.Spanned (Stmt Expr) -> List String
+stmtIdents r (At (StmtBind x _ e) _) = Cons x (r.e e)
+stmtIdents r (At (StmtLet p e) _) = appendC (r.e e) (patIdents p)
+stmtIdents r (At (StmtExpr e) _) = r.e e
+
+paramIdents : Idents -> Pm.Spanned (Param Expr) -> List String
+paramIdents r (At (ExplicitParam x _ t) _) = Cons x (r.e t)
+paramIdents r (At (ImplicitParam x _ t) _) = Cons x (r.e t)
+
+equationIdents : Idents -> Pm.Spanned (Equation Expr) -> List String
+equationIdents r (At (MkEquation f _ ps rhs) _) =
+  Cons f (appendC (concatMapC (\m -> patIdents m) ps) (r.e rhs))
+
+identsTermF : Idents -> Expr -> List String
+identsTermF r n = case Pm.nodeOf n of
+  EVar x -> Cons x Nil
+  EApp h args -> appendC (r.e h) (concatMapC r.e args)
+  ENamed x e -> Cons x (r.e e)
+  EPi b cod -> appendC (piIdents r b) (r.e cod)
+  ELam b body -> appendC (lamIdents r b) (r.e body)
+  EAnn e t -> appendC (r.e e) (r.e t)
+  ESpec acc _ _ v -> appendC (r.e acc) (r.e v)
+  ESpecOther a b -> appendC (r.e a) (r.e b)
+  ESig fs ->
+    concatMapC
+      (\f -> case Pm.nodeOf f of
+       DeclareField x _ t -> Cons x (r.e t)
+       BadFieldDecl e -> r.e e)
+      fs
+  ESum vs ->
+    concatMapC
+      (\v -> case Pm.nodeOf v of
+       TagVariant _ _ args -> concatMapC r.e args
+       BadVariant e -> r.e e)
+      vs
+  EStruct fs ->
+    concatMapC
+      (\f -> case Pm.nodeOf f of
+       SetField x _ e -> Cons x (r.e e)
+       BadFieldSet e -> r.e e)
+      fs
+  EMatch s alts -> appendC (r.e s) (concatMapC (\a -> altIdents r a) alts)
+  ELetIn rhs a -> appendC (r.e rhs) (altIdents r a)
+  EDo stmts -> concatMapC (\m -> stmtIdents r m) stmts
+  ELocal body ds -> appendC (r.e body) (concatMapC r.decl ds)
+  ETuple es -> concatMapC r.e es
+  EBrace e -> r.e e
+  _ -> Nil
+
+identsDeclF : Idents -> Decl -> List String
+identsDeclF r d = case Pm.nodeOf d of
+  DeclEquations f _ ty eqs ->
+    Cons f (appendC (r.e ty) (concatMapC (\m -> equationIdents r m) eqs))
+  DeclDefine x _ ps u body ->
+    Cons
+      x
+      (appendC
+         (concatMapC (\m -> paramIdents r m) ps)
+         (appendC (r.e u) (r.e body)))
+  DeclTheory x _ ps body ->
+    Cons x (appendC (concatMapC (\m -> paramIdents r m) ps) (r.e body))
+  DeclPrimitive x _ t -> Cons x (r.e t)
+  DeclTest x _ -> Cons x Nil
+  DeclWatch e -> r.e e
+
+idents : Idents
+idents = { e = \n -> identsTermF idents n, decl = \d -> identsDeclF idents d }
+
+identsOf : Expr -> List String
+identsOf n = idents.e n
 
 fresh : List String -> String -> String
 fresh used x = if elemBy strEq x used then fresh used (x ++ "'") else x
 
--- | `x` becomes `v`, except where something binds `x` again
-rename : String -> String -> Ntn -> Ntn
-rename x v n = case n of
-  At (Ident y) sp -> if strEq y x then At (Ident v) sp else At (Ident y) sp
-  At (Infix l (At (Keyword KMaps) ksp) r) _ ->
-    if elemBy strEq x (identsOf l) then infixOp l (At (Keyword KMaps) ksp) r
-    else infixOp l (At (Keyword KMaps) ksp) (rename x v r)
-  At (Infix l k r) _ -> infixOp (rename x v l) k (rename x v r)
-  At (Juxt a b) _ -> juxt (rename x v a) (rename x v b)
-  At (NBlock b h ns) sp ->
+-- Renaming
+--------------------------------------------------------------------------------
+
+renameName : String -> String -> String -> String
+renameName x v y = if strEq y x then v else y
+
+-- | a pattern, `x` in it `v` (an operator's name, a field's, too)
+renamePat : String -> String -> Pat -> Pat
+renamePat x v p = case p of
+  At (PatVar y) sp -> At (PatVar (renameName x v y)) sp
+  At (PatTag t tsp ps) sp ->
+    At (PatTag t tsp (map (\m -> renamePat x v m) ps)) sp
+  At (PatOp y ysp ps) sp ->
+    At (PatOp (renameName x v y) ysp (map (\m -> renamePat x v m) ps)) sp
+  At (PatRecord fs) sp ->
     At
-      (NBlock
-         b
-         (case h of
-          Nothing -> Nothing
-          Just m -> Just (rename x v m))
-         (map (\m -> rename x v m) ns))
+      (PatRecord
+         (map
+            (\f -> case f of
+             MkFieldPat y q -> MkFieldPat (renameName x v y) (renamePat x v q))
+            fs))
       sp
-  At (NTuple ns) sp -> At (NTuple (map (\m -> rename x v m) ns)) sp
-  At (NBrace a) sp -> At (NBrace (rename x v a)) sp
+  _ -> p
+
+-- | (`rename x v`, the knot) `p -> e`: `x` is `v` in `e`, unless `p` has
+-- | the name `x`
+renameAlt : (Expr -> Expr)
+          -> String
+          -> Pm.Spanned (Alt Expr)
+          -> Pm.Spanned (Alt Expr)
+renameAlt rn x (At (MkAlt p b) sp) =
+  if elemBy strEq x (patIdents p) then At (MkAlt p b) sp else alt p (rn b)
+
+renamePi : (Expr -> Expr) -> String -> String -> PiBinder Expr -> PiBinder Expr
+renamePi rn x v (PiNamed y ysp t) = PiNamed (renameName x v y) ysp (rn t)
+renamePi rn x v (PiImplicit y ysp bsp t) =
+  PiImplicit (renameName x v y) ysp bsp (rn t)
+renamePi rn x v b = case b of
+  PiAnon d -> PiAnon (rn d)
+  _ -> b
+
+renameStmt : (Expr -> Expr)
+           -> String
+           -> String
+           -> Pm.Spanned (Stmt Expr)
+           -> Pm.Spanned (Stmt Expr)
+renameStmt rn x v (At (StmtBind y ysp e) _) =
+  At (StmtBind (renameName x v y) ysp (rn e)) (spanning ysp (Pm.spanOf (rn e)))
+renameStmt rn x v (At (StmtLet p e) sp) =
+  At (StmtLet (renamePat x v p) (rn e)) sp
+renameStmt rn x v (At (StmtExpr e) sp) = At (StmtExpr (rn e)) sp
+
+-- | `x` becomes `v`, except where something binds `x` again (a lambda
+-- | or an alternative; the type of an annotated lambda's binder is left
+-- | as it is, and so are local definitions and `{{x : T}}`)
+rename : String -> String -> Expr -> Expr
+rename x v n = case n of
+  At (EVar y) sp -> At (EVar (renameName x v y)) sp
+  At (ELam b body) sp ->
+    if elemBy strEq x (lamIdents idents b) then n
+    else At (ELam b (rename x v body)) sp
+  At (EAnn e t) _ -> ann (rename x v e) (rename x v t)
+  At (EPi b cod) sp ->
+    At (EPi (renamePi (rename x v) x v b) (rename x v cod)) sp
+  At (ESpec acc f fsp val) sp ->
+    At (ESpec (rename x v acc) f fsp (rename x v val)) sp
+  At (ESpecOther a b) sp -> At (ESpecOther (rename x v a) (rename x v b)) sp
+  At (EApp h args) sp -> At (EApp (rename x v h) (map (rename x v) args)) sp
+  At (ENamed y e) sp -> At (ENamed (renameName x v y) (rename x v e)) sp
+  At (EMatch s alts) sp ->
+    At (EMatch (rename x v s) (map (renameAlt (rename x v) x) alts)) sp
+  At (ELetIn rhs a) sp ->
+    At (ELetIn (rename x v rhs) (renameAlt (rename x v) x a)) sp
+  At (EDo stmts) sp -> At (EDo (map (renameStmt (rename x v) x v) stmts)) sp
+  At (ELocal body ds) sp -> At (ELocal (rename x v body) ds) sp
+  At (EStruct fs) sp ->
+    At
+      (EStruct
+         (map
+            (\f -> case f of
+             At (SetField y ysp e) fsp ->
+               At (SetField (renameName x v y) ysp (rename x v e)) fsp
+             At (BadFieldSet e) fsp -> At (BadFieldSet (rename x v e)) fsp)
+            fs))
+      sp
+  At (ESig fs) sp ->
+    At
+      (ESig
+         (map
+            (\f -> case f of
+             At (DeclareField y ysp t) fsp ->
+               At (DeclareField (renameName x v y) ysp (rename x v t)) fsp
+             At (BadFieldDecl e) fsp -> At (BadFieldDecl (rename x v e)) fsp)
+            fs))
+      sp
+  At (ESum vs) sp ->
+    At
+      (ESum
+         (map
+            (\m -> case m of
+             At (TagVariant t tsp args) vsp ->
+               At (TagVariant t tsp (map (rename x v) args)) vsp
+             At (BadVariant e) vsp -> At (BadVariant (rename x v e)) vsp)
+            vs))
+      sp
+  At (ETuple es) sp -> At (ETuple (map (rename x v) es)) sp
+  At (EBrace e) sp -> At (EBrace (rename x v e)) sp
   _ -> n
 
 -- | a variable pattern `p` matched against the variable `v`: `p` means `v`
-bindVar : String -> Pat -> Ntn -> Ntn
+bindVar : String -> MatchPat -> Expr -> Expr
 bindVar v (PVar x) e =
   if not (strEq x "_") && not (strEq x v) then rename x v e else e
 bindVar v _ e = e
 
-isTagP : Pat -> Bool
+isTagP : MatchPat -> Bool
 isTagP (PTag _ _ _) = True
 isTagP _ = False
 
-isLitP : Pat -> Bool
+isLitP : MatchPat -> Bool
 isLitP (PLit _) = True
 isLitP _ = False
 
-isRecP : Pat -> Bool
+isRecP : MatchPat -> Bool
 isRecP (PRec _ _) = True
 isRecP _ = False
 
-type TagRow = { tag : String, arity : Int, pats : List Pat, span : Pm.Span }
+type TagRow =
+  { tag : String, arity : Int, pats : List MatchPat, span : Pm.Span }
 
-tagOf : Pat -> Maybe TagRow
+tagOf : MatchPat -> Maybe TagRow
 tagOf (PTag t ps s) = Just { tag = t, arity = length ps, pats = ps, span = s }
 tagOf _ = Nothing
 
-patAt : Int -> Clause -> Pat
+patAt : Int -> Clause -> MatchPat
 patAt c r = case nthC r.pats c of
   Just p -> p
   Nothing -> PVar "_"
@@ -297,10 +431,10 @@ type CK =
         -> Pm.Span
         -> List String
         -> List Clause
-        -> Either Err Ntn
+        -> Either Err Expr
   }
 
-findTagLit : List Pat -> Int -> Maybe Int
+findTagLit : List MatchPat -> Int -> Maybe Int
 findTagLit Nil i = Nothing
 findTagLit (Cons p rest) i =
   if isTagP p || isLitP p || isRecP p then Just i else findTagLit rest (i + 1)
@@ -377,7 +511,7 @@ armOf : CK
       -> Int
       -> String
       -> TagRow
-      -> Either Err Ntn
+      -> Either Err (Pm.Spanned (Alt Expr))
 armOf r used bound sp vars rows c v t = do
   arityCheck sp rows c t
   body <-
@@ -391,14 +525,14 @@ armOf r used bound sp vars rows c v t = do
             (\row -> armSpecializeV c t (armFields used bound t v) v row)
             rows))
   pure
-      (infixOp
-         (group
-            (At (NTag t.tag) t.span)
-            (map (\y -> At (Ident y) sp) (armFields used bound t v)))
-         (At (Keyword KMaps) sp)
+      (alt
+         (patTag
+            t.tag
+            t.span
+            (map (\y -> At (PatVar y) sp) (armFields used bound t v)))
          body)
 
-litYesOne : Int -> Ntn -> String -> Clause -> List Clause -> List Clause
+litYesOne : Int -> Pat -> String -> Clause -> List Clause -> List Clause
 litYesOne c l v r acc = case patAt c r of
   PLit l' ->
     if sameLit l l' then Cons (mkClause (dropAt c r.pats) r.rhs) acc else acc
@@ -406,16 +540,16 @@ litYesOne c l v r acc = case patAt c r of
   PTag _ _ _ -> acc
   PRec _ _ -> acc
 
-litYes : Int -> Ntn -> String -> List Clause -> List Clause
+litYes : Int -> Pat -> String -> List Clause -> List Clause
 litYes c l v Nil = Nil
 litYes c l v (Cons r rest) = litYesOne c l v r (litYes c l v rest)
 
-litNoOne : Int -> Ntn -> Clause -> List Clause -> List Clause
+litNoOne : Int -> Pat -> Clause -> List Clause -> List Clause
 litNoOne c l r acc = case patAt c r of
   PLit l' -> if sameLit l l' then acc else Cons r acc
   _ -> Cons r acc
 
-litNo : Int -> Ntn -> List Clause -> List Clause
+litNo : Int -> Pat -> List Clause -> List Clause
 litNo c l Nil = Nil
 litNo c l (Cons r rest) = litNoOne c l r (litNo c l rest)
 
@@ -423,20 +557,20 @@ litChecks : Pm.Span
           -> List String
           -> List Clause
           -> Int
-          -> Ntn
+          -> Pat
           -> Either Err Unit
 litChecks sp vars rows c l =
   bind
     (a := Unit)
     (if anyC (\row -> isTagP (patAt c row)) rows
        then Left
-           (mkErr (ntnSpan l) "a literal and a tag match the same argument")
+           (mkErr (Pm.spanOf l) "a literal and a tag match the same argument")
      else Right MkUnit)
     (\u1 ->
        if allC (\row -> isLitP (patAt c row)) rows
          then Left
              (mkErr
-                (ntnSpan l)
+                (Pm.spanOf l)
                 "literals are matched here: one of them must match every other value (a variable, or `_`)")
        else Right MkUnit)
 
@@ -453,8 +587,8 @@ literalOf : CK
           -> List String
           -> List Clause
           -> Int
-          -> Ntn
-          -> Either Err Ntn
+          -> Pat
+          -> Either Err Expr
 literalOf r used bound sp vars rows c l = do
   litChecks sp vars rows c l
   yesB <-
@@ -462,39 +596,29 @@ literalOf r used bound sp vars rows c l = do
   noB <- r.compile used bound sp vars (litNo c l rows)
   pure
       (At
-         (NBlock
-            BMatch
-            (Just
-               (group
-                  (At (Ident (equalityOf l)) (ntnSpan l))
-                  (Cons (At (Ident (varAt vars c)) sp) (Cons l Nil))))
-            (Cons
-               (infixOp
-                  (At (NTag "True") (ntnSpan l))
-                  (At (Keyword KMaps) (ntnSpan l))
-                  yesB)
-               (Cons
-                  (infixOp
-                     (At (NTag "False") (ntnSpan l))
-                     (At (Keyword KMaps) (ntnSpan l))
-                     noB)
-                  Nil)))
-         (ntnSpan l))
+         (EMatch
+            (app
+               (At (EVar (equalityOf l)) (Pm.spanOf l))
+               [At (EVar (varAt vars c)) sp, litExpr l])
+            [ alt (patTag "True" (Pm.spanOf l) Nil) yesB
+            , alt (patTag "False" (Pm.spanOf l) Nil) noB
+            ])
+         (Pm.spanOf l))
 
 noLitHere : Pm.Span -> Int -> List Clause -> Either Err Unit
 noLitHere sp c rows =
   forC rows (\row -> case patAt c row of
   PLit l ->
-    Left (mkErr (ntnSpan l) "a literal and a tag match the same argument")
+    Left (mkErr (Pm.spanOf l) "a literal and a tag match the same argument")
   _ -> Right MkUnit)
 
-clausePats : Clause -> List Pat
+clausePats : Clause -> List MatchPat
 clausePats r = r.pats
 
-clauseRhs : Clause -> Ntn
+clauseRhs : Clause -> Expr
 clauseRhs r = r.rhs
 
-bindPair : Ntn -> Pair String Pat -> Ntn
+bindPair : Expr -> Pair String MatchPat -> Expr
 bindPair e (MkPair v p) = bindVar v p e
 
 defaultOf : CK
@@ -505,7 +629,7 @@ defaultOf : CK
           -> List Clause
           -> Int
           -> List Clause
-          -> Either Err (List Ntn)
+          -> Either Err (List (Pm.Spanned (Alt Expr)))
 defaultOf r used bound sp vars rows c Nil = Right Nil
 defaultOf r used bound sp vars rows c rest = do
   b <-
@@ -520,7 +644,7 @@ defaultOf r used bound sp vars rows c rest = do
               (dropAt c row.pats)
               (bindVar (varAt vars c) (patAt c row) row.rhs))
          rest)
-  pure (Cons (infixOp (At (Ident "_") sp) (At (Keyword KMaps) sp) b) Nil)
+  pure (Cons (alt (At (PatVar "_") sp) b) Nil)
 
 -- | rows whose column `c` is a variable go on in every other case
 defaultArm : CK
@@ -530,7 +654,7 @@ defaultArm : CK
            -> List String
            -> List Clause
            -> Int
-           -> Either Err (List Ntn)
+           -> Either Err (List (Pm.Spanned (Alt Expr)))
 defaultArm r used bound sp vars rows c =
   defaultOf
     r
@@ -545,11 +669,11 @@ defaultArm r used bound sp vars rows c =
 -- Records
 --------------------------------------------------------------------------------
 
-recFieldsOf : Pat -> List (Pair String Pat)
+recFieldsOf : MatchPat -> List (Pair String MatchPat)
 recFieldsOf (PRec fps _) = fps
 recFieldsOf _ = Nil
 
-lookupField : String -> List (Pair String Pat) -> Maybe Pat
+lookupField : String -> List (Pair String MatchPat) -> Maybe MatchPat
 lookupField f Nil = Nothing
 lookupField f (Cons (MkPair g p) rest) =
   if strEq f g then Just p else lookupField f rest
@@ -563,7 +687,7 @@ noRecMix rows c =
         Left (mkErr sp "a record and a tag match the same argument")
       PLit l ->
         Left
-          (mkErr (ntnSpan l) "a record and a literal match the same argument")
+          (mkErr (Pm.spanOf l) "a record and a literal match the same argument")
       _ -> Right MkUnit)
   else Right MkUnit
 
@@ -594,7 +718,7 @@ recSubs used bound c rows =
     (\f -> recSubName used bound (recFieldVar c rows f) f)
     (recFieldNames c rows)
 
-orWildcard : Maybe Pat -> Pat
+orWildcard : Maybe MatchPat -> MatchPat
 orWildcard (Just p) = p
 orWildcard Nothing = PVar "_"
 
@@ -611,19 +735,13 @@ recSpecialize c fs v r = case patAt c r of
       (bindVar v (patAt c r) r.rhs)
 
 -- | `let y = v.f in e`, each field's column bound to its projection
-letFields : Pm.Span -> String -> List (Pair String String) -> Ntn -> Ntn
+letFields : Pm.Span -> String -> List (Pair String String) -> Expr -> Expr
 letFields sp v Nil body = body
 letFields sp v (Cons (MkPair f y) rest) body =
   At
-    (NBlock
-       BLet
-       (Just (juxt (At (Ident v) sp) (At (NField f) sp)))
-       (Cons
-          (infixOp
-             (At (Ident y) sp)
-             (At (Keyword KMaps) sp)
-             (letFields sp v rest body))
-          Nil))
+    (ELetIn
+       (app (At (EVar v) sp) [At (EProject f) sp])
+       (alt (At (PatVar y) sp) (letFields sp v rest body)))
     sp
 
 -- | a column of records: a column for each field named, bound to its
@@ -635,7 +753,7 @@ recordOf : CK
          -> List String
          -> List Clause
          -> Int
-         -> Either Err Ntn
+         -> Either Err Expr
 recordOf r used bound sp vars rows c = do
   noRecMix rows c
   body <-
@@ -661,8 +779,8 @@ compileAt : CK
           -> List String
           -> List Clause
           -> Int
-          -> Pat
-          -> Either Err Ntn
+          -> MatchPat
+          -> Either Err Expr
 compileAt r used bound sp vars rows c (PLit l) = do
   noRecMix rows c
   literalOf r used bound sp vars rows c l
@@ -676,13 +794,7 @@ compileAt r used bound sp vars rows c p = do
       (\t -> armOf r used bound sp vars rows c (varAt vars c) t)
       (nubTagRows (catMaybesC (map (\row -> tagOf (patAt c row)) rows)))
   dflt <- defaultArm r used bound sp vars rows c
-  pure
-      (At
-         (NBlock
-            BMatch
-            (Just (At (Ident (varAt vars c)) sp))
-            (appendC arms dflt))
-         sp)
+  pure (At (EMatch (At (EVar (varAt vars c)) sp) (appendC arms dflt)) sp)
 
 -- | the match tree for `rows` over the variables `vars`, column by column
 compileF : CK
@@ -691,10 +803,10 @@ compileF : CK
          -> Pm.Span
          -> List String
          -> List Clause
-         -> Either Err Ntn
+         -> Either Err Expr
 compileF r used bound sp vars rows = case rows of
   -- unreachable: a missing tag is the match's error
-  Nil -> Right (At (Keyword KAbandon) sp)
+  Nil -> Right (At (EWord AbandonWord) sp)
   Cons row rest -> case findTagLit (clausePats row) 0 of
     -- the first equation matches whatever is left: it is the answer
     Nothing ->
@@ -740,7 +852,7 @@ desugarBody : String
             -> List Clause
             -> Int
             -> List String
-            -> Either Err Ntn
+            -> Either Err Expr
 desugarBody f params sp rows arity used = do
   body <-
     ck.compile
@@ -751,7 +863,7 @@ desugarBody f params sp rows arity used = do
       rows
   pure
       (foldr2
-         (\x b -> infixOp (At (Ident x) sp) (At (Keyword KMaps) sp) b)
+         (\x b -> lamName x sp b)
          body
          (dropC
             (length params)
@@ -759,9 +871,13 @@ desugarBody f params sp rows arity used = do
 
 -- | the body of `f` from its equations: `params` are the parameters
 -- | named in the head of the definition
-desugar : String -> List String -> List Ntn -> Pm.Span -> Either Err Ntn
+desugar : String
+        -> List String
+        -> List (Pm.Spanned (Equation Expr))
+        -> Pm.Span
+        -> Either Err Expr
 desugar f params eqNs sp = do
-  rows <- traverseC (\n -> equation f n) eqNs
+  rows <- traverseC (\n -> equation n) eqNs
   arity <- case rows of
     Nil -> Left (mkErr sp "a definition by equations needs an equation")
     Cons r rest -> Right (length r.pats)
@@ -771,7 +887,7 @@ desugar f params eqNs sp = do
          if not (length r.pats == arity)
            then Left
                (mkErr
-                  (ntnSpan r.rhs)
+                  (Pm.spanOf r.rhs)
                   ("every equation of `"
                    ++ f
                    ++ "` has "
@@ -803,24 +919,19 @@ desugar f params eqNs sp = do
 
 -- | a `case` whose alternatives match nested patterns: compiled like the
 -- | equations, over one column -- a fresh name for the scrutinee
-type CaseTree = { scrutinee : String, tree : Ntn }
+type CaseTree = { scrutinee : String, tree : Expr }
 
-caseAlt : Ntn -> Either Err Clause
-caseAlt (At (Infix p (At (Keyword KMaps) _) rhs) _) = do
+caseAlt : Pm.Spanned (Alt Expr) -> Either Err Clause
+caseAlt (At (MkAlt p rhs) _) = do
   p' <- pat p
   pure (mkClause (Cons p' Nil) rhs)
-caseAlt n =
-  Left
-    (mkErr
-       (ntnSpan n)
-       "a `case` alternative has the form `<pattern> => <body>`")
 
 caseTreeOf : Pm.Span -> List Clause -> String -> Either Err CaseTree
 caseTreeOf sp rows x = do
   tree <- ck.compile [x] [x] sp [x] rows
   pure { scrutinee = x, tree = tree }
 
-caseTree : Pm.Span -> List Ntn -> Either Err CaseTree
+caseTree : Pm.Span -> List (Pm.Spanned (Alt Expr)) -> Either Err CaseTree
 caseTree sp altNs = do
   rows <- traverseC (\n -> caseAlt n) altNs
   caseTreeOf
@@ -833,5 +944,5 @@ caseTree sp altNs = do
             rows)
          "it")
 
--- >>> (\(e : Either Err Pat) -> 1) (pat (At (Ident "x") Pm.noSpan))
+-- >>> (\(e : Either Err MatchPat) -> 1) (pat (At (PatVar "x") Pm.noSpan))
 -- 1
