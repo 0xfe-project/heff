@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { heffBin } from "../test/heff.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -14,7 +15,7 @@ let failed = 0;
 for (const name of readdirSync(here).sort()) {
   const dir = join(here, name), src = join(dir, `${name}.hf`), app = join(dir, `${name}.js`);
   if (!existsSync(join(dir, "package.hf")) || !existsSync(src)) continue;
-  const r = spawnSync("node", [join(root, "output", "heff.mjs"), "compile", src, app, "--name", name, "--backend=page"], { encoding: "utf8" });
+  const r = spawnSync(heffBin, ["compile", src, app, "--name", name, "--backend=page"], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL examples/${name}: ${r.stdout}${r.stderr}`); continue; }
   console.log(`examples/${name}/${name}.js`);
 }

@@ -1,25 +1,21 @@
 #!/usr/bin/env node
-// The compiler is its own fixed point: output/heff.mjs (built by
-// scripts/build.mjs) compiles its own source -- loading its import closure
-// itself -- to output/heff-gen.mjs, which must be output/heff.raw.mjs,
-// what heff.mjs was minified from, byte for byte.
-import { spawnSync } from "node:child_process";
+// The compiler is its own fixed point: heff (built by scripts/build.mjs
+// from output/heff.c) compiles its own source -- loading its import
+// closure itself -- to output/heff-gen.c, which must be output/heff.c,
+// byte for byte.
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { heff, heffBin, root } from "./heff.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const bin = join(root, "output", "heff.mjs");
-const raw = join(root, "output", "heff.raw.mjs");
-const out = join(root, "output", "heff-gen.mjs");
+const c = join(root, "output", "heff.c");
+const out = join(root, "output", "heff-gen.c");
 
-if (!existsSync(bin) || !existsSync(raw)) { console.log("FAIL gen-fixpoint: no output/heff.mjs and output/heff.raw.mjs (run npm run build first)"); process.exit(1); }
+if (!existsSync(heffBin) || !existsSync(c)) { console.log("FAIL gen-fixpoint: no output/heff and output/heff.c (run node scripts/build.mjs first)"); process.exit(1); }
 
-const r = spawnSync("node", [bin, "compile", "app/heff/main.hf", out, "--name", "main", "--backend=node"],
-  { cwd: root, encoding: "utf8", maxBuffer: 1e9 });
+const r = heff(["compile", "app/heff/main.hf", out, "--name", "main", "--backend=c"], { cwd: root });
 if (r.status !== 0) { console.log(`FAIL gen-fixpoint: the compiler refused its own source\n${r.stdout}${r.stderr}`.split("\n").slice(0, 12).join("\n")); process.exit(1); }
 
-const g0 = readFileSync(raw, "utf8");
+const g0 = readFileSync(c, "utf8");
 const g1 = readFileSync(out, "utf8");
 if (g0 !== g1) {
   const a = g0.split("\n"), b = g1.split("\n");
@@ -29,4 +25,4 @@ if (g0 !== g1) {
   process.exit(1);
 }
 
-console.log(`gen-fixpoint: the compiler compiles itself to itself, ${g1.length} bytes, byte-identical`);
+console.log(`gen-fixpoint: the compiler compiles itself to itself, ${g1.length} bytes of C, byte-identical`);

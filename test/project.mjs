@@ -11,14 +11,15 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = mkdtempSync(join(tmpdir(), "heff-project-"));
 // (packages are fetched into the test's own cache)
 process.env.HEFF_MODCACHE = join(work, "mod");
-const heff = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: work, encoding: "utf8" });
+const heff = (...args) => spawnSync(heffBin, [...args], { cwd: work, encoding: "utf8" });
 const write = (path, text) => { mkdirSync(dirname(join(work, path)), { recursive: true }); writeFileSync(join(work, path), text); };
-const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+const version = /heff = "([^"]*)"/.exec(readFileSync(join(root, "package.hf"), "utf8"))[1];
 
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}: ${JSON.stringify(got)}`); } };
@@ -185,10 +186,10 @@ write("pub/src/pub/m.hf", "import prelude\n\nx : Int\nx = 1\n\n-- >>> x + 1\n-- 
 write("pub/.gitignore", ".heff/\n");
 git("pub", "init", "-q"); git("pub", "add", "-A"); git("pub", "commit", "-q", "-m", "one");
 git("pub", "remote", "add", "origin", join(work, "origin.git"));
-const publish = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), "publish", ...args], { cwd: join(work, "pub"), encoding: "utf8" });
+const publish = (...args) => spawnSync(heffBin, ["publish", ...args], { cwd: join(work, "pub"), encoding: "utf8" });
 write("untyped/package.hf", manifestOf("x.org/untyped"));
 write("untyped/src/untyped/m.hf", "x : Int\nx = 1\n");
-const untyped = spawnSync("node", [join(root, "output", "heff.mjs"), "publish", "1.0.0"], { cwd: join(work, "untyped"), encoding: "utf8" });
+const untyped = spawnSync(heffBin, ["publish", "1.0.0"], { cwd: join(work, "untyped"), encoding: "utf8" });
 expect("publish, a package.hf of no type", untyped.status === 1 && untyped.stderr.includes("package.hf is no Package (lib/manifest.hf)"), untyped);
 const noVersion = publish("1.0");
 expect("publish, no a.b.c", noVersion.status === 1 && noVersion.stderr.includes("`1.0` is no version: a.b.c"), noVersion);
@@ -231,7 +232,7 @@ remote("x.org/mid", { "package.hf": typed("x.org/mid", [["lib", "x.org/lib", "1.
 
 write("user/package.hf", typed("x.org/user", [["lib", "x.org/lib", "1.0.0"], ["mid", "x.org/mid", "1.0.0"]]));
 write("user/src/user/main.hf", "import lib.encode\nimport mid.m\nimport prelude\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n\n-- >>> twice \"hi\"\n-- \"[[hi]]\"\n");
-const inUser = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: join(work, "user"), encoding: "utf8" });
+const inUser = (...args) => spawnSync(heffBin, [...args], { cwd: join(work, "user"), encoding: "utf8" });
 const notYet = inUser("test", "src/user/main.hf");
 expect("get: not fetched yet", notYet.status === 1 && notYet.stderr.includes("x.org/user requires x.org/lib 1.0.0, which is not fetched: run `heff get`"), notYet);
 const got = inUser("get");
@@ -250,7 +251,7 @@ const clashV2 = inUser("get", "x.org/lib/v2");
 expect("get PATH: a name required already", clashV2.status === 1 && clashV2.stderr.includes("`lib` is required already: add x.org/lib/v2 to package.hf by another name"), clashV2);
 write("fresh/package.hf", "-- mine\n" + typed("x.org/fresh"));
 write("fresh/src/fresh/main.hf", "import lib.encode\nimport prelude\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n");
-const inFresh = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: join(work, "fresh"), encoding: "utf8" });
+const inFresh = (...args) => spawnSync(heffBin, [...args], { cwd: join(work, "fresh"), encoding: "utf8" });
 const getNewest = inFresh("get", "x.org/lib");
 const freshPkg = readFileSync(join(work, "fresh", "package.hf"), "utf8");
 expect("get PATH: its newest version of the path's major, by its own name", getNewest.status === 0 &&

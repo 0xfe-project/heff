@@ -6,9 +6,10 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const heff = (...args) => spawnSync("node", [join(root, "output", "heff.mjs"), ...args], { cwd: root, encoding: "utf8" });
+const heff = (...args) => spawnSync(heffBin, [...args], { cwd: root, encoding: "utf8" });
 const hfIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hf")).map((f) => join(dir, f));
 let failed = 0;
 

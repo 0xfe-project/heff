@@ -12,12 +12,13 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { root, run, pool } from "./pool.mjs";
+import { heffBin } from "./heff.mjs";
 
 // (`node test/golden.mjs [--update] [KIND...]`: only the kinds named,
 // check, explain, eval, type-at; all by default)
 const update = process.argv.includes("--update");
 const only = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-const heff = (args) => run("node", [join(root, "output", "heff.mjs"), ...args]);
+const heff = (args) => run(heffBin, args);
 
 const filesIn = (dirs) => dirs.flatMap((d) =>
   spawnSync("bash", ["-c", `ls ${d}/*.hf`], { cwd: root, encoding: "utf8" }).stdout.split("\n").filter(Boolean));

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// heff compiled through C, checked by AddressSanitizer: app/heff/main.hf
-// compiled to C by output/heff.mjs, built by the system's clang with
+// heff compiled through C, checked by AddressSanitizer: output/heff.c
+// (scripts/build.mjs) built by the system's clang with
 // `-fsanitize=address` (zig's has no ASan runtime) and no free lists
 // (`-DSMALL_MAX=0`, so that a use after the last reference is a use after
 // free), then made to check each program of test/programs in ref/native-asan,
@@ -20,7 +20,6 @@ const work = join(root, "ref", "native-asan");
 rmSync(work, { recursive: true, force: true });
 mkdirSync(join(work, "bin"), { recursive: true });
 cpSync(join(root, "lib"), join(work, "lib"), { recursive: true });
-cpSync(join(root, "package.json"), join(work, "package.json"));
 cpSync(join(root, "package.hf"), join(work, "package.hf"));
 // (the programs checked there, apart from the repository and its cache)
 cpSync(join(root, "test", "programs"), join(work, "test", "programs"), { recursive: true });
@@ -34,8 +33,7 @@ const step = (what, cmd, args, opts = {}) => {
   return r;
 };
 
-const c = join(work, "heff.c"), heff = join(work, "bin", "heff");
-step("compiling heff to C", "node", [join(root, "output", "heff.mjs"), "compile", "app/heff/main.hf", c, "--name", "main", "--backend=c"]);
+const c = join(root, "output", "heff.c"), heff = join(work, "bin", "heff");
 step("building it", "clang", ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0", c, "-o", heff, "-lm", "-lpthread"]);
 
 // (what it leaves at its end is no fault: a program's last objects are

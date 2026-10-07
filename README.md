@@ -15,28 +15,27 @@ map f (y :: ys) = f y :: map f ys
 
 ## Installing
 
-A [release](https://github.com/dannypsnl/heff/releases) has the
-compiler ready to run, needing nothing but Node.js:
+A [release](https://github.com/dannypsnl/heff/releases) has heff for
+Linux, macOS and Windows, a program needing nothing installed:
 
 ```sh
-tar xzf heff-0.1.0.tar.gz
-node heff-0.1.0/output/heff.mjs help
+tar xzf heff-0.2.0-linux-x64.tar.gz
+heff-0.2.0-linux-x64/bin/heff help
 ```
 
-From the repository:
+From the repository, with Node.js and [zig](https://ziglang.org/download/):
 
 ```sh
-npm install       # also builds heff
-npm link          # puts `heff` on the PATH
+node scripts/build.mjs     # output/heff
 ```
 
 heff is written in heff.  The package's modules (`src/heff/`) are the
 compiler as a library, each command's work among them
 (`heff.commands`); the program `heff` is `app/heff/main.hf`, which reads
 the command line and gives the commands the world they run in.
-`boot/heff.mjs` is a compiled copy of the compiler; the build (`npm run
-build`) uses it to compile the program into `output/heff.mjs`, which is
-`heff` (minified; the compiler's own output is `output/heff.raw.mjs`).
+`boot/heff.mjs.gz` is the compiler compiled to JavaScript, the seed: the
+build (`node scripts/build.mjs`) runs it on Node.js to compile the
+program to C, which `zig cc` builds into `output/heff`.
 
 `editors/vscode` is a VS Code extension for the language server; a
 release has it built (`heff-X.Y.Z.vsix`).
@@ -125,9 +124,9 @@ under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.path`, `std.cli` (command lines) and
 `std.doc` (documents laid out).  An effect's JavaScript side is in
-`M.provider.js` beside `M.hf`.
+`M.provider.js` beside `M.hf`, its C side in `M.provider.c`.
 
-`examples/` has apps for the browser (`npm run examples`).
+`examples/` has apps for the browser (`node examples/build.mjs`).
 
 ## Tests
 
@@ -176,11 +175,14 @@ program shrinks to a short one that tells them apart
 
 ## Developing
 
-`npm test` builds the compiler and runs the tests.  Among them,
+`node test/run.mjs [GROUP...]` runs the tests on `output/heff` (or on
+`HEFF`), by group: `compiler`, `lsp`, `backends` (each backend held to
+the interpreter), `fixpoint` (heff compiles itself to the same C) and
+`asan` (heff under AddressSanitizer).  Among them,
 `test/golden/` holds the output of `check`, `explain`, `eval` and
 `type-at` on the library and test files; after an intended change,
 update it with `node test/golden.mjs --update`.
 
-`npm run boot` replaces `boot/heff.mjs` with the current compiler, once it
-compiles itself to an identical file.  This is needed only when a
+`node scripts/boot.mjs` replaces the seed with the current compiler,
+compiled to JavaScript, once that compiles itself to an identical file.  This is needed only when a
 language change means the old copy can no longer compile the source.

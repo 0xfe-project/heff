@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// The benchmarks: each program here compiled for Node.js and run, the
-// compiler checking itself (elaboration only: the code the compiler
-// emits, measured apart from what its simplifier does), and compiling
-// itself (its cache warm, then cold), each timed; the best of `--runs N`
-// (3) is said, with its peak memory.  `--heff FILE` measures another
-// compiler (boot/heff.mjs, say: the one before).
+// The benchmarks: each program here compiled by each backend (Node.js,
+// and C by `zig cc -O2`) and run, the compiler checking itself
+// (elaboration only: the code the compiler emits, measured apart from
+// what its simplifier does), and compiling itself to C (its cache warm,
+// then cold), each timed; the best of `--runs N` (3) is said, with its
+// peak memory.  `--heff FILE` measures another compiler (one built
+// before, say).
 //
 //   node bench/run.mjs [--runs N] [--heff FILE] [NAME...]
 import { spawnSync } from "node:child_process";
@@ -14,7 +15,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-let heff = join(root, "output", "heff.mjs");
+let heff = join(root, "output", process.platform === "win32" ? "heff.exe" : "heff");
 const work = join(root, "ref", "bench");
 mkdirSync(work, { recursive: true });
 
@@ -53,9 +54,14 @@ for (const f of readdirSync(join(root, "bench")).filter((f) => f.endsWith(".hf")
   const name = basename(f, ".hf");
   if (!wanted(name)) continue;
   const out = join(work, name + ".mjs");
-  const c = spawnSync("node", [heff, "compile", join("bench", f), out, "--name", "main", "--backend=node"], { cwd: root, encoding: "utf8" });
+  const c = spawnSync(heff, ["compile", join("bench", f), out, "--name", "main", "--backend=node"], { cwd: root, encoding: "utf8" });
   if (c.status !== 0) { console.log(`${name.padEnd(16)} did not compile\n${c.stdout}${c.stderr}`); continue; }
-  best(name, () => timed(["node", out]));
+  best(`${name} (node)`, () => timed(["node", out]));
+  const cOut = join(work, name + ".c"), bin = join(work, name);
+  const cc = spawnSync(heff, ["compile", join("bench", f), cOut, "--name", "main", "--backend=c"], { cwd: root, encoding: "utf8" });
+  const z = cc.status === 0 ? spawnSync("zig", ["cc", "-O2", "-w", cOut, "-o", bin, "-lm"], { encoding: "utf8" }) : cc;
+  if (z.status !== 0) { console.log(`${name.padEnd(16)} did not compile to C\n${z.stdout}${z.stderr}`); continue; }
+  best(`${name} (c)`, () => timed([bin]));
 }
 
 // (with no cache: the one there is put aside, and back after)
@@ -73,10 +79,10 @@ const coldly = (f) => {
   }
 };
 
-const check = ["node", heff, "check", "app/heff/main.hf"];
+const check = [heff, "check", "app/heff/main.hf"];
 if (wanted("check")) coldly((clear) => best("check (cold)", () => { clear(); return timed(check); }));
 
 // the compiler compiling itself: with the cache as it is, then with none
-const self = ["node", heff, "compile", "app/heff/main.hf", join(work, "self.mjs"), "--name", "main", "--backend=node"];
+const self = [heff, "compile", "app/heff/main.hf", join(work, "self.c"), "--name", "main", "--backend=c"];
 if (wanted("self")) best("self (warm)", () => timed(self));
 if (wanted("self-cold")) coldly((clear) => best("self (cold)", () => { clear(); return timed(self); }));
