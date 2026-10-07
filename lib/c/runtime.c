@@ -24,7 +24,16 @@
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
 // backend does (src/heff/emit.hf, "Tail calls").
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <malloc.h>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <alloca.h>
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -1018,7 +1027,11 @@ static char *heff_join(const char *dir, const char *name) {
   size_t a = strlen(dir), b = strlen(name);
   char *p = heff_alloc(a + b + 2);
   memcpy(p, dir, a);
+#ifdef _WIN32
+  p[a] = '\\';
+#else
   p[a] = '/';
+#endif
   memcpy(p + a + 1, name, b + 1);
   return p;
 }
@@ -1211,6 +1224,27 @@ static void *heff_thread(void *u) {
 }
 #endif
 
+#ifdef _WIN32
+// (the program's thread on Windows: its large stack reserved, not
+// committed, and its bytes in and out as they are, not as text)
+static DWORD WINAPI heff_win_thread(LPVOID u) {
+  heff_thread(u);
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  heff_argc = argc; heff_argv = argv;
+  _setmode(_fileno(stdin), _O_BINARY);
+  _setmode(_fileno(stdout), _O_BINARY);
+  _setmode(_fileno(stderr), _O_BINARY);
+  SetConsoleOutputCP(CP_UTF8);
+  HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, heff_win_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+  if (!t) heff_fail("cannot start");
+  WaitForSingleObject(t, INFINITE);
+  fflush(stdout);
+  return heff_status;
+}
+#else
 int main(int argc, char **argv) {
   heff_argc = argc; heff_argv = argv;
   pthread_attr_t attr;
@@ -1222,3 +1256,4 @@ int main(int argc, char **argv) {
   fflush(stdout);
   return heff_status;
 }
+#endif

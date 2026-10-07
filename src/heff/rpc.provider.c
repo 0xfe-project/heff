@@ -6,11 +6,16 @@
 // lib/std/io.provider.c).
 
 #include <dirent.h>
+#ifndef _WIN32
 #include <poll.h>
+#endif
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#define lstat stat
+#endif
 
 // A message's JSON, as src/heff/json.hf's `Json`
 // ---------------------------------------------------------------------
@@ -222,6 +227,26 @@ static int64_t rpc_now(void) {
   return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+// (whether stdin has something to read within `wait` ms (none, below
+// 0): 1 if so, 0 if not, below 0 if waiting failed)
+static int rpc_ready(int wait) {
+#ifdef _WIN32
+  // (a pipe, as an editor gives it, is looked into until it has bytes;
+  // what is not a pipe is read, waiting there)
+  HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+  int64_t until = rpc_now() + wait;
+  for (;;) {
+    DWORD avail = 0;
+    if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) || avail > 0) return 1;
+    if (wait >= 0 && rpc_now() >= until) return 0;
+    Sleep(5);
+  }
+#else
+  struct pollfd fd = { 0, POLLIN, 0 };
+  return poll(&fd, 1, wait);
+#endif
+}
+
 // (the next event: a message, the time waited for, `ms`, passing first
 // (none, below 0), or the client gone)
 static V rpc_await(int64_t ms) {
@@ -243,8 +268,7 @@ static V rpc_await(int64_t ms) {
       if (left <= 0) return NTAG(TAG_Timeout);
       wait = left > 0x7fffffff ? 0x7fffffff : (int)left;
     }
-    struct pollfd fd = { 0, POLLIN, 0 };
-    int r = poll(&fd, 1, wait);
+    int r = rpc_ready(wait);
     if (r == 0) return NTAG(TAG_Timeout);
     if (r < 0) continue;
     char chunk[65536];
@@ -258,36 +282,68 @@ static V rpc_await(int64_t ms) {
 // ---------------------------------------------------------------------
 
 // (a path made absolute against the working directory, its `.`, `..`
-// and repeated slashes resolved, as Node.js's path.resolve: malloc'd)
+// and repeated separators resolved, as Node.js's path.resolve: malloc'd;
+// on Windows a path starts with its drive, `C:`, and its separator is
+// `\\`, though `/` is read as one too)
+#ifdef _WIN32
+#define RPC_SEP '\\'
+#define rpc_is_sep(c) ((c) == '/' || (c) == '\\')
+#else
+#define RPC_SEP '/'
+#define rpc_is_sep(c) ((c) == '/')
+#endif
+
 static char *rpc_resolve(const char *p) {
   Buf b = {0};
+  char cwd[4096];
+  if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+#ifdef _WIN32
+  int drive = p[0] && p[1] == ':';
+  if (drive && rpc_is_sep(p[2])) buf_str(&b, p);
+  else if (rpc_is_sep(p[0])) {
+    if (cwd[0] && cwd[1] == ':') buf_put(&b, cwd, 2);
+    buf_str(&b, p);
+  } else {
+    buf_str(&b, cwd);
+    buf_put(&b, "\\", 1);
+    buf_str(&b, drive ? p + 2 : p);
+  }
+#else
   if (p[0] != '/') {
-    char cwd[4096];
-    if (getcwd(cwd, sizeof cwd)) buf_str(&b, cwd);
+    buf_str(&b, cwd);
     buf_put(&b, "/", 1);
   }
   buf_str(&b, p);
+#endif
   buf_put(&b, "", 1);
-  char *out = heff_alloc(b.n + 1);
-  size_t o = 0;
+  char *out = heff_alloc(b.n + 2);
+  size_t o = 0, top = 0;
   const char *s = b.s;
+#ifdef _WIN32
+  if (s[0] && s[1] == ':') {
+    out[o++] = s[0];
+    out[o++] = ':';
+    s += 2;
+    top = 2;
+  }
+#endif
   while (*s) {
-    while (*s == '/') s++;
+    while (rpc_is_sep(*s)) s++;
     const char *e = s;
-    while (*e && *e != '/') e++;
+    while (*e && !rpc_is_sep(*e)) e++;
     size_t n = (size_t)(e - s);
     if (n == 0 || (n == 1 && s[0] == '.')) {}
     else if (n == 2 && s[0] == '.' && s[1] == '.') {
-      while (o > 0 && out[o - 1] != '/') o--;
-      if (o > 0) o--;
+      while (o > top && out[o - 1] != RPC_SEP) o--;
+      if (o > top) o--;
     } else {
-      out[o++] = '/';
+      out[o++] = RPC_SEP;
       memcpy(out + o, s, n);
       o += n;
     }
     s = e;
   }
-  if (o == 0) out[o++] = '/';
+  if (o == top) out[o++] = RPC_SEP;
   out[o] = 0;
   free(b.s);
   return out;
@@ -313,12 +369,22 @@ static V rpc_uri_path(const char *u) {
     int a, c;
     if (*u == '%' && (a = rpc_hex(u[1])) >= 0 && (c = rpc_hex(u[2])) >= 0) {
       char x = (char)(a * 16 + c);
-      if (x == '/') { free(b.s); return heff_nothing; }
+      if (x == '/' || (RPC_SEP == '\\' && x == '\\')) { free(b.s); return heff_nothing; }
       buf_put(&b, &x, 1);
       u += 2;
     } else buf_put(&b, u, 1);
   }
   if (b.n == 0) buf_put(&b, "/", 1);
+#ifdef _WIN32
+  // (`/C:/a/b` is `C:\\a\\b`; a path without its drive is no path here)
+  buf_put(&b, "", 1);
+  if (!(b.n >= 4 && b.s[0] == '/' && b.s[2] == ':' && (b.s[3] == '/' || b.s[3] == 0))) { free(b.s); return heff_nothing; }
+  b.n -= 2;
+  memmove(b.s, b.s + 1, b.n);
+  for (size_t i = 0; i < b.n; i++)
+    if (b.s[i] == '/') b.s[i] = '\\';
+  if (b.n == 2) buf_put(&b, "\\", 1);
+#endif
   V s = heff_str_utf8((const unsigned char *)b.s, (int64_t)b.n);
   free(b.s);
   return heff_just(s);
@@ -328,7 +394,14 @@ static V rpc_uri_path(const char *u) {
 static V rpc_path_uri(const char *p) {
   char *abs = rpc_resolve(p);
   Buf b = {0};
+#ifdef _WIN32
+  // (`C:\\a\\b` is `file:///C:/a/b`)
+  for (char *c = abs; *c; c++)
+    if (*c == '\\') *c = '/';
+  buf_str(&b, "file:///");
+#else
   buf_str(&b, "file://");
+#endif
   for (const unsigned char *c = (const unsigned char *)abs; *c; c++) {
     if (*c <= 0x20 || *c >= 0x7F || strchr("\"#<>?`{}%\\", *c)) {
       char e[4];
