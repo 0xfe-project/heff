@@ -139,17 +139,40 @@ numbered n (Cons x xs) m =
 -- | parameters (the loop's)
 type Self = { key : String, params : List String }
 
+-- (`owned`: the variables this code holds a reference to, to consume or
+-- drop; `after`: those wanted after what is being emitted, by what
+-- comes after it -- see "Reference counts")
 type CE =
   { tags : M.Map String Int
   , lbls : M.Map String Int
   , funs : M.Map String Int
   , bounce : M.Map String Unit
   , self : Maybe Self
+  , owned : List String
+  , after : List String
   }
 
 withSelf : Maybe Self -> CE -> CE
 withSelf s ce =
-  { tags = ce.tags, lbls = ce.lbls, funs = ce.funs, bounce = ce.bounce, self = s }
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = s
+  , owned = ce.owned
+  , after = ce.after
+  }
+
+withPath : List String -> List String -> CE -> CE
+withPath owned after ce =
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , owned = owned
+  , after = after
+  }
 
 lblOf : CE -> String -> Int
 lblOf ce l = fromMaybe 0 (M.lookup compareString l ce.lbls)
@@ -309,16 +332,65 @@ freeOf : List String -> I.Expr -> List String
 freeOf xs b =
   nubS Nil (filter (\v -> not (elemS v xs) && not (elemS v (bound b))) (mentioned b))
 
+-- Reference counts
+--------------------------------------------------------------------------------
+
+-- Perceus: a variable holds a reference to its value, which the code
+-- holding the variable consumes or drops, exactly once on each path.
+--
+-- - Each use of a variable consumes a reference: the last use on its
+--   path gives its own away; a use before that takes one more
+--   (`heff_dup`).  A use is last where the variable is not wanted after
+--   it: by the operands after it, or by what comes after the expression
+--   (`live`).  What uses its operands consumes them: a call, a tag or a
+--   record built, a closure made, a primitive, a field taken.
+-- - Where a path starts -- a function's or a lambda's body, a match's
+--   arm, what follows a binding -- a variable held and not wanted on
+--   it is dropped (`heff_drop`).
+-- - A match only looks at what it matches: an arm takes a reference to
+--   each field it wants, and the matched value is dropped there if the
+--   arm does not want it.
+-- - A definition's value is the definition's, never dropped: a use of
+--   it takes a reference.  A lambda's closure holds what it mentions:
+--   its body takes a reference to each, and drops the closure.
+
+unionS : List String -> List String -> List String
+unionS xs ys = concatList xs ys
+
+-- | the variables it mentions and does not bind
+fvE : I.Expr -> List String
+fvE e = freeOf Nil e
+
+fvList : List I.Expr -> List String
+fvList es = concatMap fvE es
+
+-- (a use of `x`: its reference, or one more if it is wanted after)
+varUse : List String -> String -> String
+varUse live x = if elemS x live then "heff_dup(" ++ cLocal x ++ ")" else cLocal x
+
+dropLines : List String -> List String
+dropLines xs = map (\x -> "heff_drop(" ++ cLocal x ++ ");") xs
+
+-- | what is held and not wanted: given back where a path starts
+deadIn : List String -> List String -> List String
+deadIn owned wanted = filter (\v -> not (elemS v wanted)) owned
+
+-- | what is held and wanted, of what is held
+deadKept : List String -> List String -> List String
+deadKept owned wanted = filter (\v -> elemS v wanted) owned
+
 -- Expressions
 --------------------------------------------------------------------------------
 
 data Dest = Ret | Asg String
 
--- | the emitter's judgments, knotted: a value (an operand: computes
--- | nothing that can fail), a computation not last, statements
+-- | the emitter's judgments, knotted: a value (an operand, consumed,
+-- | `live` what is wanted after it), a computation not last (the same),
+-- | statements (where its value goes, `CE.owned` and `CE.after` saying
+-- | what is held and wanted after)
 type CK =
-  { val : CE -> I.Expr -> C String
-  , comp : CE -> I.Expr -> C String
+  { val : CE -> List String -> I.Expr -> C String
+  , comp : CE -> List String -> I.Expr -> C String
   , stmts : CE -> Dest -> I.Expr -> C (List String)
   }
 
@@ -342,59 +414,78 @@ floatLit x =
 primName : String -> String
 primName p = "heff_" ++ p
 
-lamVal : CK -> CE -> List String -> I.Expr -> C String
-lamVal r ce xs b = do
+-- | operands, left to right: each consumed, wanted after it what the
+-- | ones after it want, and `live`
+operandsF : CK -> CE -> List String -> List I.Expr -> C (List String)
+operandsF r ce live Nil = pure Nil
+operandsF r ce live (Cons e es) = do
+  v <- r.val ce (unionS (fvList es) live) e
+  vs <- operandsF r ce live es
+  pure (Cons v vs)
+
+lamBody : CK -> CE -> List String -> I.Expr -> List String -> C (List String)
+lamBody r ce xs b fv =
+  r.stmts
+    (withPath
+       (deadKept (concatList xs fv) (fvE b))
+       Nil
+       (withSelf Nothing ce))
+    Ret
+    b
+
+lamLines : Int -> List String -> List String -> List String -> List String -> List String
+lamLines k xs fv dead body =
+  concatList
+    (Cons ("static V lam_" ++ showInt k ++ "(V self, V *args) {") Nil)
+    (concatList
+       (zipWith
+          (\x i -> "  V " ++ cLocal x ++ " = args[" ++ showInt i ++ "];")
+          xs
+          (range 0 (length xs - 1)))
+       (concatList
+          (zipWith
+             (\x i ->
+                "  V " ++ cLocal x ++ " = heff_dup(heff_env(self)[" ++ showInt i ++ "]);")
+             fv
+             (range 0 (length fv - 1)))
+          (concatList
+             (Cons "  heff_drop(self);" Nil)
+             (concatList
+                (map (\l -> "  " ++ l) (dropLines dead))
+                (concatList (map (\l -> "  " ++ l) body) (Cons "}" Nil))))))
+
+lamVal : CK -> CE -> List String -> List String -> I.Expr -> C String
+lamVal r ce live xs b = do
   k <- newLam
-  body <- r.stmts (withSelf Nothing ce) Ret b
+  body <- lamBody r ce xs b (freeOf xs b)
   u <-
     addLam
         ("static V lam_" ++ showInt k ++ "(V self, V *args);")
-        (joinWith
-           "\n"
-           (concatList
-              (Cons ("static V lam_" ++ showInt k ++ "(V self, V *args) {") Nil)
-              (concatList
-                 (zipWith
-                    (\x i -> "  V " ++ cLocal x ++ " = args[" ++ showInt i ++ "];")
-                    xs
-                    (range 0 (length xs - 1)))
-                 (concatList
-                    (zipWith
-                       (\x i ->
-                          "  V " ++ cLocal x ++ " = heff_env(self)[" ++ showInt i ++ "];")
-                       (freeOf xs b)
-                       (range 0 (length (freeOf xs b) - 1)))
-                    (concatList (map (\l -> "  " ++ l) body) (Cons "}" Nil))))))
+        (joinWith "\n" (lamLines k xs (freeOf xs b) (deadIn xs (fvE b)) body))
   pure
-      (if null (freeOf xs b)
-         then "heff_clo(lam_"
-         ++ showInt k
-         ++ ", "
-         ++ showInt (length xs)
-         ++ ", 0, NULL)"
-       else "heff_clo(lam_"
+      ("heff_clo(lam_"
        ++ showInt k
        ++ ", "
        ++ showInt (length xs)
        ++ ", "
        ++ showInt (length (freeOf xs b))
        ++ ", "
-       ++ argsArr (map cLocal (freeOf xs b))
+       ++ argsArr (map (varUse live) (freeOf xs b))
        ++ ")")
 
-valF : CK -> CE -> I.Expr -> C String
-valF r ce (EVar x) = pure (cLocal x)
-valF r ce (EGlobal g) =
+valF : CK -> CE -> List String -> I.Expr -> C String
+valF r ce live (EVar x) = pure (varUse live x)
+valF r ce live (EGlobal g) =
   pure
     (if M.member compareString g ce.funs then "((V)&" ++ cGlobal g ++ "_clo)"
-     else cGlobal g ++ "_get()")
-valF r ce (EInt n) = pure (intLit n)
-valF r ce (EFloat x) = pure (floatLit x)
-valF r ce (EStr s) = strLit s
-valF r ce (ETag t as) =
+     else "heff_dup(" ++ cGlobal g ++ "_get())")
+valF r ce live (EInt n) = pure (intLit n)
+valF r ce live (EFloat x) = pure (floatLit x)
+valF r ce live (EStr s) = strLit s
+valF r ce live (ETag t as) =
   if null as then pure ("NTAG(" ++ tagName t ++ ")")
   else do
-    vs <- traverseC (r.val ce) as
+    vs <- operandsF r ce live as
     pure
         ("heff_tag("
          ++ tagName t
@@ -403,42 +494,41 @@ valF r ce (ETag t as) =
          ++ ", "
          ++ argsArr vs
          ++ ")")
-valF r ce (ERecord fs) = do
-  vs <- traverseC (r.val ce) (map snd fs)
+valF r ce live (ERecord fs) = do
+  vs <- operandsF r ce live (map snd fs)
   shape <- shapeLit (map (\p -> lblOf ce (fst p)) fs)
   pure
       ("heff_rec(" ++ showInt (length fs) ++ ", " ++ shape ++ ", " ++ argsArr vs ++ ")")
-valF r ce (EProj e l) = do
-  v <- r.val ce e
+valF r ce live (EProj e l) = do
+  v <- r.val ce live e
   pure ("heff_get(" ++ v ++ ", " ++ lblName l ++ ")")
-valF r ce (EPrim p) = primLit p
-valF r ce (EPrimCall p as) = do
-  vs <- traverseC (r.val ce) as
+valF r ce live (EPrim p) = primLit p
+valF r ce live (EPrimCall p as) = do
+  vs <- operandsF r ce live as
   pure (primName p ++ "(" ++ joinWith ", " vs ++ ")")
-valF r ce (ELam xs b) = lamVal r ce xs b
-valF r ce EAbandon = pure "heff_abandon()"
-valF r ce e = r.comp ce e
+valF r ce live (ELam xs b) = lamVal r ce live xs b
+valF r ce live EAbandon = pure "heff_abandon()"
+valF r ce live e = r.comp ce live e
 
 -- | a computation not last: its value, through any bounces
-compF : CK -> CE -> I.Expr -> C String
-compF r ce (EApp f as) = do
-  fv <- r.val ce f
-  vs <- traverseC (r.val ce) as
+compF : CK -> CE -> List String -> I.Expr -> C String
+compF r ce live (EApp f as) = do
+  vs <- operandsF r ce live (Cons f as)
   pure
       ("heff_tr(heff_apply("
-       ++ fv
+       ++ fromMaybe "0" (head vs)
        ++ ", "
        ++ showInt (length as)
        ++ ", "
-       ++ argsArr vs
+       ++ argsArr (drop 1 vs)
        ++ "))")
-compF r ce (ECall g as) = do
-  vs <- traverseC (r.val ce) as
+compF r ce live (ECall g as) = do
+  vs <- operandsF r ce live as
   pure
       (if M.member compareString g ce.bounce
          then "heff_tr(" ++ cGlobal g ++ "(" ++ joinWith ", " vs ++ "))"
        else cGlobal g ++ "(" ++ joinWith ", " vs ++ ")")
-compF r ce e = r.val ce e
+compF r ce live e = r.val ce live e
 
 -- (a value to where it goes)
 toDest : Dest -> String -> List String
@@ -467,39 +557,69 @@ again ce vs = case ce.self of
          (Cons "goto top;" Nil))
   Nothing -> Nil
 
+-- (an arm: the fields it wants, a reference to each; what is held and
+-- not wanted on it, dropped)
 armLines : CK -> CE -> Dest -> String -> I.Arm -> C (List String)
 armLines r ce dest sv (MkArm t vs b) = do
-  body <- r.stmts ce dest b
+  body <-
+    r.stmts
+        (withPath
+           (deadKept
+              (concatList ce.owned (filter (\v -> elemS v (fvE b)) vs))
+              (unionS (fvE b) ce.after))
+           ce.after
+           ce)
+        dest
+        b
   pure
       (concatList
          (Cons ("case " ++ tagName t ++ ": {") Nil)
          (concatList
-            (zipWith
-               (\v i ->
-                  "  V "
-                  ++ cLocal v
-                  ++ " = heff_field("
-                  ++ sv
-                  ++ ", "
-                  ++ showInt i
-                  ++ "); (void)"
-                  ++ cLocal v
-                  ++ ";")
-               vs
-               (range 0 (length vs - 1)))
+            (concatMap
+               (\(p : Pair String Int) -> case p of
+                MkPair v i ->
+                  if elemS v (fvE b)
+                    then Cons
+                        ("  V "
+                         ++ cLocal v
+                         ++ " = heff_dup(heff_field("
+                         ++ sv
+                         ++ ", "
+                         ++ showInt i
+                         ++ "));")
+                        Nil
+                  else Nil)
+               (zipWith (\v i -> MkPair v i) vs (range 0 (length vs - 1))))
             (concatList
-               (map (\l -> "  " ++ l) body)
+               (map
+                  (\l -> "  " ++ l)
+                  (dropLines
+                     (deadIn
+                        (concatList ce.owned (filter (\v -> elemS v (fvE b)) vs))
+                        (unionS (fvE b) ce.after))))
                (concatList
-                  (case dest of
-                   Ret -> Nil
-                   Asg _ -> Cons "  break;" Nil)
-                  (Cons "}" Nil)))))
+                  (map (\l -> "  " ++ l) body)
+                  (concatList
+                     (case dest of
+                      Ret -> Nil
+                      Asg _ -> Cons "  break;" Nil)
+                     (Cons "}" Nil))))))
 
 nomatchLine : Dest -> String -> String
 nomatchLine Ret sv = "default: return heff_nomatch(" ++ sv ++ ");"
 nomatchLine (Asg _) sv = "default: heff_nomatch(" ++ sv ++ ");"
 
--- (what is bound to `x`: a match or a binding, as statements)
+-- (what a match looks at: looked at, not consumed)
+scrutF : CK -> CE -> I.Expr -> C String
+scrutF r ce (EVar x) = pure (cLocal x)
+scrutF r ce (EGlobal g) =
+  pure
+    (if M.member compareString g ce.funs then "((V)&" ++ cGlobal g ++ "_clo)"
+     else cGlobal g ++ "_get()")
+scrutF r ce e = r.val ce Nil e
+
+-- (what is bound to `x`: a match or a binding, as statements, held what
+-- is held, wanted after it what is `after`)
 bindTo : CK -> CE -> String -> I.Expr -> C (List String)
 bindTo r ce x (EMatch s arms) = do
   ls <- r.stmts ce (Asg (cLocal x)) (EMatch s arms)
@@ -508,16 +628,47 @@ bindTo r ce x (ELet y a b) = do
   ls <- r.stmts ce (Asg (cLocal x)) (ELet y a b)
   pure (Cons ("V " ++ cLocal x ++ ";") ls)
 bindTo r ce x a = do
-  v <- r.comp ce a
+  v <- r.comp ce ce.after a
   pure (Cons ("V " ++ cLocal x ++ " = " ++ v ++ ";") Nil)
 
+-- (`let x = a in b`: what is held and wanted neither by `a` nor after it
+-- dropped first; then `a`, wanted after it what `b` and what comes after
+-- want; then `x`, dropped if nothing wants it)
+letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
+letLines r ce dest x a b = do
+  la <-
+    bindTo
+        r
+        (withPath
+           (deadKept ce.owned (unionS (fvE a) (unionS (fvE b) ce.after)))
+           (unionS (fvE b) ce.after)
+           ce)
+        x
+        a
+  rest <-
+    r.stmts
+        (withPath
+           (concatList
+              (deadKept ce.owned (unionS (fvE b) ce.after))
+              (if elemS x (unionS (fvE b) ce.after) then Cons x Nil else Nil))
+           ce.after
+           ce)
+        dest
+        b
+  pure
+      (concatList
+         (dropLines (deadIn ce.owned (unionS (fvE a) (unionS (fvE b) ce.after))))
+         (concatList
+            la
+            (concatList
+               (if elemS x (unionS (fvE b) ce.after) then Nil
+                else Cons ("heff_drop(" ++ cLocal x ++ ");") Nil)
+               rest)))
+
 stmtsF : CK -> CE -> Dest -> I.Expr -> C (List String)
-stmtsF r ce dest (ELet x a b) = do
-  ls <- bindTo r ce x a
-  rest <- r.stmts ce dest b
-  pure (concatList ls rest)
+stmtsF r ce dest (ELet x a b) = letLines r ce dest x a b
 stmtsF r ce dest (EMatch s arms) = do
-  sv <- r.val ce s
+  sv <- scrutF r ce s
   as <- traverseC (armLines r ce dest sv) arms
   pure
       (concatList
@@ -526,31 +677,33 @@ stmtsF r ce dest (EMatch s arms) = do
             (concatMap (\x -> x) as)
             (Cons (nomatchLine dest sv) (Cons "}" Nil))))
 stmtsF r ce Ret (EApp f as) = do
-  fv <- r.val ce f
-  vs <- traverseC (r.val ce) as
+  vs <- operandsF r ce Nil (Cons f as)
   pure
       (Cons
          ("return heff_tail("
-          ++ fv
+          ++ fromMaybe "0" (head vs)
           ++ ", "
           ++ showInt (length as)
           ++ ", "
-          ++ argsArr vs
+          ++ argsArr (drop 1 vs)
           ++ ");")
          Nil)
 stmtsF r ce Ret (ECall g as) = do
-  vs <- traverseC (r.val ce) as
+  vs <- operandsF r ce Nil as
   pure
       (if isSelfCall ce g as then again ce vs
        else Cons ("return " ++ cGlobal g ++ "(" ++ joinWith ", " vs ++ ");") Nil)
-stmtsF r ce dest e = do
-  v <- r.comp ce e
-  pure (toDest dest v)
+stmtsF r ce Ret e = do
+  v <- r.comp ce Nil e
+  pure (toDest Ret v)
+stmtsF r ce (Asg x) e = do
+  v <- r.comp ce ce.after e
+  pure (toDest (Asg x) v)
 
 ck : CK
 ck =
-  { val = \ce e -> valF ck ce e
-  , comp = \ce e -> compF ck ce e
+  { val = \ce live e -> valF ck ce live e
+  , comp = \ce live e -> compF ck ce live e
   , stmts = \ce dest e -> stmtsF ck ce dest e
   }
 
@@ -565,7 +718,14 @@ type Emitted1 = { protos : List String, code : List String }
 
 funDef : CE -> I.Def -> List String -> I.Expr -> C Emitted1
 funDef ce d xs b = do
-  body <- ck.stmts (withSelf (Just { key = d.key, params = xs }) ce) Ret b
+  body <-
+    ck.stmts
+        (withPath
+           (deadKept xs (fvE b))
+           Nil
+           (withSelf (Just { key = d.key, params = xs }) ce))
+        Ret
+        b
   pure
       { protos =
           [ "static V " ++ cGlobal d.key ++ "(" ++ paramList xs ++ ");"
@@ -585,24 +745,26 @@ funDef ce d xs b = do
             , "top: ;"
             ]
             (concatList
-               (map (\l -> "  " ++ l) body)
-               [ "}"
-               , "static V " ++ cGlobal d.key ++ "_entry(V self, V *a) {"
-               , "  (void)self;"
-               , "  return "
-               ++ cGlobal d.key
-               ++ "("
-               ++ joinWith
-                 ", "
-                 (map (\i -> "a[" ++ showInt i ++ "]") (range 0 (length xs - 1)))
-               ++ ");"
-               , "}"
-               ])
+               (map (\l -> "  " ++ l) (dropLines (deadIn xs (fvE b))))
+               (concatList
+                  (map (\l -> "  " ++ l) body)
+                  [ "}"
+                  , "static V " ++ cGlobal d.key ++ "_entry(V self, V *a) {"
+                  , "  (void)self;"
+                  , "  return "
+                  ++ cGlobal d.key
+                  ++ "("
+                  ++ joinWith
+                    ", "
+                    (map (\i -> "a[" ++ showInt i ++ "]") (range 0 (length xs - 1)))
+                  ++ ");"
+                  , "}"
+                  ]))
       }
 
 valDef : CE -> I.Def -> C Emitted1
 valDef ce d = do
-  body <- ck.stmts (withSelf Nothing ce) Ret d.body
+  body <- ck.stmts (withPath Nil Nil (withSelf Nothing ce)) Ret d.body
   pure
       { protos = Cons ("static V " ++ cGlobal d.key ++ "_get(void);") Nil
       , code =
@@ -648,11 +810,11 @@ plusDone n la na (MkPair lb nb) =
           lb
           [ "static V heff_perform_"
             ++ showInt n
-            ++ "(V p, V k) { return heff_tag_of(p) == TAG_InL ? heff_perform_"
+            ++ "(V p, V k) { int l = heff_tag_of(p) == TAG_InL; V q = heff_dup(heff_field(p, 0)); heff_drop(p); return l ? heff_perform_"
             ++ showInt (n + 1)
-            ++ "(heff_field(p, 0), k) : heff_perform_"
+            ++ "(q, k) : heff_perform_"
             ++ showInt na
-            ++ "(heff_field(p, 0), k); }"
+            ++ "(q, k); }"
           ]))
     nb
 
@@ -862,6 +1024,8 @@ programWith runtime provs ending defs names =
     , funs = foldl arityOne M.empty defs
     , bounce = Em.bouncing defs
     , self = Nothing
+    , owned = Nil
+    , after = Nil
     }
 
 -- | the program, its runtime and its providers before it
