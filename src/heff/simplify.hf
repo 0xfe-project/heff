@@ -9,6 +9,8 @@
 -- where it is used; what could fail stays where it was.
 
 import heff.ir as I
+import heff.prims as Pr
+import heff.spec as Sp
 import map as M
 import prelude
 
@@ -22,6 +24,22 @@ budget = 24
 -- | inlined
 data Plain = Inlined (List String) I.Expr | NotInlined
 
+-- | specialisation: every definition so far small enough to be copied
+-- | (those calling themselves too), those that are functions or records
+-- | (whatever their size), the copies made (by what they were made
+-- | for), those made for the definition at hand (the last first), how
+-- | many there are, and the definitions whose copies are being made,
+-- | one inside the other
+type Specs =
+  { all : M.Map String I.Expr
+  , kinds : M.Map String Unit
+  , specs : M.Map String String
+  , made : List I.Def
+  , count : Int
+  , within : List String
+  , trying : Int
+  }
+
 type St =
   { supply : Int
   , fuel : Int
@@ -29,6 +47,18 @@ type St =
   , safe : M.Map String Unit
   , total : M.Map String Int
   , plain : M.Map String Plain
+  , sp : Specs
+  }
+
+withSp : Specs -> St -> St
+withSp p s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , total = s.total
+  , plain = s.plain
+  , sp = p
   }
 
 withSupply : Int -> St -> St
@@ -39,6 +69,7 @@ withSupply n s =
   , safe = s.safe
   , total = s.total
   , plain = s.plain
+  , sp = s.sp
   }
 
 withFuel : Int -> St -> St
@@ -49,6 +80,7 @@ withFuel f s =
   , safe = s.safe
   , total = s.total
   , plain = s.plain
+  , sp = s.sp
   }
 
 withPlain : String -> Plain -> St -> St
@@ -59,6 +91,7 @@ withPlain k p s =
   , safe = s.safe
   , total = s.total
   , plain = M.insert compareString k p s.plain
+  , sp = s.sp
   }
 
 withDefs : M.Map String I.Expr -> St -> St
@@ -69,6 +102,7 @@ withDefs d s =
   , safe = s.safe
   , total = s.total
   , plain = s.plain
+  , sp = s.sp
   }
 
 type M a = St -> Pair a St
@@ -155,6 +189,7 @@ restore saved st =
   , safe = saved.safe
   , total = saved.total
   , plain = st.plain
+  , sp = st.sp
   }
 
 copyTake : St -> Pair I.Expr Int -> Pair I.Expr St
@@ -178,10 +213,30 @@ known g = do
     Nothing -> pure Nothing
 
 -- | try an inlining: keep it if it is small enough
+-- (inside an attempt, copies are not made, only those made taken: an
+-- attempt is often undone, and the copies made for it with it.  The
+-- second pass over a definition makes them where the first inlined)
+trying : Int -> M Unit
+trying d = \s ->
+    MkPair
+      MkUnit
+      (withSp
+         { all = s.sp.all
+         , kinds = s.sp.kinds
+         , specs = s.sp.specs
+         , made = s.sp.made
+         , count = s.sp.count
+         , within = s.sp.within
+         , trying = s.sp.trying + d
+         }
+         s)
+
 attempt : I.Expr -> M I.Expr -> M I.Expr
 attempt orig m = do
   saved <- get
+  u0 <- trying 1
   e <- m
+  u1 <- trying (0 - 1)
   if I.size e <= I.size orig + budget then pure e
     else do
       -- (the names drawn stay drawn: no name is ever given out twice.
@@ -198,6 +253,18 @@ type SG = { safe : M.Map String Unit, total : M.Map String Int }
 -- | what cannot fail: evaluating it gives a value, at once.  A
 -- | projection is of a record, always there; an application of a
 -- | `total` function up to its arity builds a closure or its pure body
+-- | the primitives that may fail (abandon), or call what may
+failing : List String
+failing =
+  [ "intDiv"
+  , "intMod"
+  , "floatFloor"
+  , "arrayIndex"
+  , "arraySet"
+  , "arrayGenerate"
+  , "perform"
+  ]
+
 pureIn : M.Map String Unit -> M.Map String Int -> I.Expr -> Bool
 pureIn safe total e = case e of
   EVar _ -> True
@@ -217,6 +284,8 @@ pureIn safe total e = case e of
   ECall g as -> case M.lookup compareString g total of
     Just ar -> length as <= ar && I.allI (map (\a -> pureIn safe total a) as)
     Nothing -> False
+  EPrimCall p as ->
+    not (elemStr p failing) && I.allI (map (\a -> pureIn safe total a) as)
   EPrim _ -> True
   EInt _ -> True
   EFloat _ -> True
@@ -259,8 +328,19 @@ safeGlobals defs =
     { safe = M.empty, total = M.empty }
     defs
 
+-- | a known function given fewer arguments than it takes (each pure):
+-- | it only builds a closure
+partialIn : St -> I.Expr -> Bool
+partialIn s e = case e of
+  EApp (EGlobal g) as -> case M.lookup compareString g s.sp.all of
+    Just (ELam xs _) ->
+      length as < length xs
+      && I.allI (map (\a -> pureIn s.safe s.total a) as)
+    _ -> False
+  _ -> False
+
 isPure : I.Expr -> M Bool
-isPure e = \s -> MkPair (pureIn s.safe s.total e) s
+isPure e = \s -> MkPair (pureIn s.safe s.total e || partialIn s e) s
 
 atomic : I.Expr -> Bool
 atomic e = case e of
@@ -414,12 +494,26 @@ allOpaque : List I.Expr -> Bool
 allOpaque as = I.allI (map (\a -> opaque a) as)
 
 -- | a known definition, inlined if it may be, and the result simplified
+-- | the most a definition's body may be for an inlining to be tried:
+-- | copying and simplifying a bigger one, to find it too big, was most of
+-- | what the simplifier did
+inlineMax : Int
+inlineMax = 300
+
+tooBig : String -> St -> Bool
+tooBig g s = case M.lookup compareString g s.defs of
+  Just b -> I.size b > inlineMax
+  Nothing -> False
+
 inlineCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
 inlineCall r f g as = do
-  mb <- known g
-  case mb of
-    Just b -> attempt (EApp f as) (r.applyTo b as)
-    Nothing -> pure (EApp f as)
+  s <- get
+  if tooBig g s then pure (EApp f as)
+    else do
+      mb <- known g
+      case mb of
+        Just b -> attempt (EApp f as) (r.applyTo b as)
+        Nothing -> pure (EApp f as)
 
 paramsTo : List String -> List I.Expr -> M.Map String I.Expr
 paramsTo xs as =
@@ -477,6 +571,13 @@ plainCall r f g as = do
               pure (EApp f as)
         Nothing -> pure (EApp f as)
 
+-- | a known definition called: inlined if it may be
+callOf : SK -> I.Expr -> String -> List I.Expr -> Maybe I.Expr -> M I.Expr
+callOf r f g as (Just (ELam xs _)) =
+  if allOpaque as && length xs == length as then plainCall r f g as
+  else inlineCall r f g as
+callOf r f g as _ = inlineCall r f g as
+
 -- | a lambda applied: its parameters bound to the arguments (not
 -- | simplified yet: `simp` does it once all are bound), and what is left
 -- | applied to the rest
@@ -504,11 +605,298 @@ tagOfLam : List String -> I.Expr -> Maybe String
 tagOfLam xs (ETag t es) = if varsAre xs es then Just t else Nothing
 tagOfLam xs _ = Nothing
 
+-- Specialisation
+--------------------------------------------------------------------------------
+
+-- A known definition that is not inlined -- it calls itself, or is too
+-- big -- given arguments known where it is called (a definition that is
+-- a function or a record, a closed lambda or record) is called as a copy
+-- of it made for them: their parameters gone, the arguments in their
+-- place, the copy simplified with them (`e.hmap`, `hd.bind`, `r.simp`
+-- known now: inlined, or calls of known definitions in turn).  A copy
+-- is made once for each definition and arguments (alike up to the names
+-- they bind, `Sp.key`), and comes just before the definition it was
+-- first made for.  For a definition that calls itself, only the
+-- parameters every call of itself hands on unchanged (`Sp.statics`):
+-- its calls are of the copy then.
+
+-- | the most that is made: the size of a known argument, of a definition
+-- | copied, copies for one program, copies being made one inside another
+specArgSize : Int
+specArgSize = 60
+
+specBodySize : Int
+specBodySize = 400
+
+specLimit : Int
+specLimit = 2000
+
+specDepth : Int
+specDepth = 16
+
+-- | an argument a copy may be made for
+knownArg : M.Map String Unit -> I.Expr -> Bool
+knownArg kinds e = case e of
+  EGlobal g -> M.member compareString g kinds
+  ELam _ _ -> I.size e <= specArgSize && Sp.closedIn Nil e
+  ERecord _ -> I.size e <= specArgSize && Sp.closedIn Nil e
+  _ -> False
+
+nthE : Int -> List I.Expr -> Maybe I.Expr
+nthE i Nil = Nothing
+nthE i (Cons x xs) = if i == 0 then Just x else nthE (i - 1) xs
+
+markGo : M.Map String Unit -> List I.Expr -> List Bool -> Int -> List Bool
+markGo all as Nil i = Nil
+markGo all as (Cons st rest) i =
+  Cons
+    (st && maybe False (\a -> knownArg all a) (nthE i as))
+    (markGo all as rest (i + 1))
+
+-- | the parameters a copy is made for: known there, and handed on as
+-- | they are if `g` calls itself
+marksOf : M.Map String Unit -> String -> List String -> I.Expr -> List I.Expr -> List Bool
+marksOf all g xs b as =
+  markGo
+    all
+    as
+    (if elemStr g (I.globalsIn b) then Sp.statics g xs b
+     else map (\x -> True) xs)
+    0
+
+specKey : String -> List Bool -> List I.Expr -> String
+specKey g marks as =
+  g
+  ++ "("
+  ++ joinWith
+    ","
+    (zipWith (\m a -> if m then Sp.key a else "_") marks (takeL (length marks) as))
+  ++ ")"
+
+keepParams : List Bool -> List String -> List String
+keepParams Nil xs = xs
+keepParams (Cons m ms) Nil = Nil
+keepParams (Cons m ms) (Cons x xs) =
+  if m then keepParams ms xs else Cons x (keepParams ms xs)
+
+-- | each marked parameter replaced by its argument, a copy each time
+substMarked : List Bool -> List String -> List I.Expr -> I.Expr -> M I.Expr
+substMarked (Cons m ms) (Cons x xs) (Cons a as) e =
+  if m
+    then do
+      e2 <- substCopies x a e
+      substMarked ms xs as e2
+  else substMarked ms xs as e
+substMarked _ _ _ e = pure e
+
+pushSpec : String -> String -> M Unit
+pushSpec k h = \s ->
+    MkPair
+      MkUnit
+      (withSp
+         { all = s.sp.all
+         , kinds = s.sp.kinds
+         , specs = M.insert compareString k h s.sp.specs
+         , made = s.sp.made
+         , count = s.sp.count + 1
+         , within = Cons k s.sp.within
+         , trying = s.sp.trying
+         }
+         s)
+
+popSpec : String -> I.Expr -> M Unit
+popSpec h b = \s ->
+    MkPair
+      MkUnit
+      (withSp
+         { all = M.insert compareString h b s.sp.all
+         , kinds = M.insert compareString h MkUnit s.sp.kinds
+         , specs = s.sp.specs
+         , made = Cons (I.mkDef h h b) s.sp.made
+         , count = s.sp.count
+         , within = drop 1 s.sp.within
+         , trying = s.sp.trying
+         }
+         s)
+
+-- | the copy's body: the parameters left, the calls of itself of it
+specBody : String -> String -> List Bool -> List I.Expr -> I.Expr -> M I.Expr
+specBody g h marks as lam1 = case lam1 of
+  ELam xs1 b1 -> do
+    b2 <- substMarked marks xs1 as (Sp.selfTo g h marks b1)
+    pure (if null (keepParams marks xs1) then b2
+      else ELam (keepParams marks xs1) b2)
+  _ -> pure lam1
+
+-- Arity
+--------------------------------------------------------------------------------
+
+-- A function whose every way out is a lambda, `\n -> if n <= 0 then (\hd
+-- k -> a) else (\hd k -> b)` -- a computation (`Co`), made of a few
+-- arguments -- takes those lambdas' parameters as its own: `\n hd k ->
+-- if n <= 0 then a else b`.  A call given them all is one call, and a
+-- copy may be made for them (the handler: `hd.bind`, known).  Only what
+-- is cheap is crossed -- a value bound, a test of what is at hand: it is
+-- computed again each time the function is given its first arguments
+-- and applied -- and nothing that may fail.
+
+-- | computing it is little, and cannot fail
+cheap : M.Map String Unit -> I.Expr -> Bool
+cheap safe e = case e of
+  EVar _ -> True
+  EGlobal g -> M.member compareString g safe
+  ELam _ _ -> True
+  EPrim _ -> True
+  EInt _ -> True
+  EFloat _ -> True
+  EStr _ -> True
+  ETag _ as -> I.allI (map (\a -> cheap safe a) as)
+  ERecord fs -> I.allI (map (\p -> cheap safe (snd p)) fs)
+  EProj e2 _ -> cheap safe e2
+  EPrimCall p as ->
+    not (elemStr p failing) && I.allI (map (\a -> cheap safe a) as)
+  _ -> False
+
+minL : List Int -> Int
+minL Nil = 0
+minL (Cons x xs) = foldl (\m y -> minI m y) x xs
+
+-- | how many parameters every way out of it takes
+lamsOut : M.Map String Unit -> I.Expr -> Int
+lamsOut safe e = case e of
+  ELam ys _ -> length ys
+  ELet _ a b -> if cheap safe a then lamsOut safe b else 0
+  EMatch sc arms ->
+    if cheap safe sc && not (null arms)
+      then minL (map (\a -> lamsOut safe (I.armBody a)) arms)
+    else 0
+  _ -> 0
+
+-- | each way out without its first lambdas, their parameters `zs`
+stripLams : List String -> I.Expr -> I.Expr
+stripLams zs e = case e of
+  ELam ys b ->
+    I.subst
+      (paramsTo ys (map (\z -> EVar z) zs))
+      (if length ys > length zs then ELam (dropL (length zs) ys) b else b)
+  ELet x a b -> ELet x a (stripLams zs b)
+  EMatch sc arms ->
+    EMatch
+      sc
+      (map
+         (\a -> case a of
+          MkArm t vs b -> MkArm t vs (stripLams zs b))
+         arms)
+  _ -> e
+
+raiseWith : List String -> I.Expr -> List String -> I.Expr
+raiseWith xs b zs = ELam (appendL xs zs) (stripLams zs b)
+
+-- | a function, taking the parameters every way out of it does
+raise : I.Expr -> M I.Expr
+raise e = case e of
+  ELam xs b -> do
+    s <- get
+    if lamsOut s.safe b == 0 then pure e
+      else do
+        zs <- freshParams (lamsOut s.safe b)
+        pure (raiseWith xs b zs)
+  _ -> pure e
+
+-- | a copy made: simplified with fuel of its own
+makeSpec : SK -> String -> List String -> I.Expr -> List I.Expr -> List Bool -> String -> M I.Expr
+makeSpec r g xs b as marks k = do
+  s <- get
+  u <- pushSpec k (g ++ "$s" ++ showInt s.sp.count)
+  lam1 <- copy (ELam xs b)
+  body0 <- specBody g (g ++ "$s" ++ showInt s.sp.count) marks as lam1
+  u2 <- setFuel 4000
+  body1 <- r.simp body0
+  body2 <- r.simp body1
+  body3 <- raise body2
+  u3 <- setFuel s.fuel
+  u4 <- popSpec (g ++ "$s" ++ showInt s.sp.count) body3
+  -- (the copy called, and a copy of it made if it may be, for what it
+  -- takes now)
+  r.applyTo (EGlobal (g ++ "$s" ++ showInt s.sp.count)) (Sp.dropAt marks as)
+
+specMarked : SK -> String -> List String -> I.Expr -> List I.Expr -> List Bool -> St -> M I.Expr
+specMarked r g xs b as marks s =
+  if not (any (\m -> m) marks)
+    || (null (keepParams marks xs) && elemStr g (I.globalsIn b))
+    then pure (EApp (EGlobal g) as)
+  else case M.lookup compareString (specKey g marks as) s.sp.specs of
+    Just h -> r.applyTo (EGlobal h) (Sp.dropAt marks as)
+    Nothing ->
+      if s.sp.trying > 0 then pure (EApp (EGlobal g) as)
+      else makeSpec r g xs b as marks (specKey g marks as)
+
+specLam : SK -> String -> List String -> I.Expr -> List I.Expr -> M I.Expr
+specLam r g xs b as = do
+  s <- get
+  if s.sp.count >= specLimit
+    || length s.sp.within >= specDepth
+    || not (any (\a -> knownArg s.sp.kinds a) as)
+    then pure (EApp (EGlobal g) as)
+    else specMarked r g xs b as (marksOf s.sp.kinds g xs b as) s
+
+-- | a call of a definition not inlined: of a copy of it, if one may be
+-- | made
+trySpec : SK -> String -> List I.Expr -> M I.Expr
+trySpec r g as = do
+  s <- get
+  case M.lookup compareString g s.sp.all of
+    Just (ELam xs b) -> specLam r g xs b as
+    _ -> pure (EApp (EGlobal g) as)
+
+-- | whether it is still the call of `g` it was
+stillCall : String -> I.Expr -> Bool
+stillCall g (EApp (EGlobal h) _) = strEq g h
+stillCall g _ = False
+
+specAfter : SK -> String -> List I.Expr -> I.Expr -> M I.Expr
+specAfter r g as e = if stillCall g e then trySpec r g as else pure e
+
+fieldIn : String -> List (Pair String I.Expr) -> Maybe I.Expr
+fieldIn l Nil = Nothing
+fieldIn l (Cons (MkPair k v) rest) = if strEq k l then Just v else fieldIn l rest
+
+-- | a field of a record that is a definition calling itself (one of
+-- | knotted judgments, `sk.simp`): a copy of it, if it is a value
+knownField : String -> String -> M (Maybe I.Expr)
+knownField g l = do
+  s <- get
+  case M.lookup compareString g s.sp.all of
+    Just (ERecord fs) -> case fieldIn l fs of
+      Just v ->
+        if I.isValue v && s.fuel > 0
+          then do
+            u <- put (withFuel (s.fuel - 1) s)
+            e <- copy v
+            pure (Just e)
+        else pure Nothing
+      Nothing -> pure Nothing
+    _ -> pure Nothing
+
+-- | a primitive given its arguments: a call of it, once they are all
+-- | there (what the other judgments know a primitive's computation by;
+-- | `heff.arity` does the same for the definitions, whose parameters are
+-- | not known until the simplifier is done)
+primApp : String -> List I.Expr -> I.Expr
+primApp p as = case Pr.primArity p of
+  Just n ->
+    if length as >= n
+      then (if length as == n then EPrimCall p as
+        else EApp (EPrimCall p (takeL n as)) (dropL n as))
+    else EApp (EPrim p) as
+  Nothing -> EApp (EPrim p) as
+
 -- | an application of simplified parts
 applyToF : SK -> I.Expr -> List I.Expr -> M I.Expr
 applyToF r f as =
   if length as == 0 then pure f
   else case f of
+    EPrim p -> pure (primApp p as)
     EApp g bs -> r.applyTo g (appendL bs as)
     -- (another name for a tag, given all its arguments: the tag given
     -- them, with no bindings between -- the tag computes its fields in
@@ -530,11 +918,8 @@ applyToF r f as =
       else pure (EApp (EMatch s arms) as)
     EGlobal g -> do
       s <- get
-      case M.lookup compareString g s.defs of
-        Just (ELam xs _) ->
-          if allOpaque as && length xs == length as then plainCall r f g as
-          else inlineCall r f g as
-        _ -> inlineCall r f g as
+      e1 <- callOf r f g as (M.lookup compareString g s.defs)
+      specAfter r g as e1
     -- (a field of a known record, applied: judged by what the
     -- application comes to, not by the size of the field)
     EProj (EGlobal g) l -> do
@@ -544,7 +929,11 @@ applyToF r f as =
           attempt (EApp f as) (do
           h <- r.project l b
           r.applyTo h as)
-        Nothing -> pure (EApp f as)
+        Nothing -> do
+          mv <- knownField g l
+          case mv of
+            Just v -> attempt (EApp f as) (r.applyTo v as)
+            Nothing -> pure (EApp f as)
     _ -> pure (EApp f as)
 
 findField : String -> List (Pair String I.Expr) -> Maybe I.Expr
@@ -606,27 +995,76 @@ sk =
   , match = \s arms -> matchF sk s arms
   }
 
+isKind : I.Expr -> Bool
+isKind (ELam _ _) = True
+isKind (ERecord _) = True
+isKind _ = False
+
+recordAll : String -> I.Expr -> St -> St
+recordAll key b s =
+  withSp
+    { all =
+        if I.size b <= specBodySize then M.insert compareString key b s.sp.all
+        else s.sp.all
+    , kinds =
+        if isKind b then M.insert compareString key MkUnit s.sp.kinds
+        else s.sp.kinds
+    , specs = s.sp.specs
+    , made = s.sp.made
+    , count = s.sp.count
+    , within = s.sp.within
+    , trying = s.sp.trying
+    }
+    s
+
 recordDef : String -> I.Expr -> M Unit
 recordDef key b = \s ->
     -- a definition calling itself is never inlined
     MkPair
       MkUnit
-      (if elemStr key (I.globalsIn b) then s
-       else withDefs (M.insert compareString key b s.defs) s)
+      (recordAll
+         key
+         b
+         (if elemStr key (I.globalsIn b) then s
+          else withDefs (M.insert compareString key b s.defs) s))
 
-oneDef : I.Def -> M I.Def
+-- | the copies made for the definition at hand, in the order they were
+-- | made, taken
+takeMade : M (List I.Def)
+takeMade = \s ->
+    MkPair
+      (reverse s.sp.made)
+      (withSp
+         { all = s.sp.all
+         , kinds = s.sp.kinds
+         , specs = s.sp.specs
+         , made = Nil
+         , count = s.sp.count
+         , within = s.sp.within
+         , trying = s.sp.trying
+         }
+         s)
+
+-- | a definition simplified, after the copies made for it
+oneDef : I.Def -> M (List I.Def)
 oneDef d = do
   u <- setFuel 4000
   -- (twice: what the first pass exposes, the second reduces)
   b1 <- sk.simp d.body
-  b <- sk.simp b1
+  b2 <- sk.simp b1
+  b <- raise b2
   u2 <- recordDef d.key b
-  pure (I.mkDef d.key d.name b)
+  made <- takeMade
+  pure (appendL made (Cons (I.mkDef d.key d.name b) Nil))
 
 type Simplified = { defs : List I.Def, supply : Int }
 
-simplifyDone : Pair (List I.Def) St -> Simplified
-simplifyDone (MkPair out st) = { defs = out, supply = st.supply }
+concatDefs : List (List I.Def) -> List I.Def
+concatDefs Nil = Nil
+concatDefs (Cons ds rest) = appendL ds (concatDefs rest)
+
+simplifyDone : Pair (List (List I.Def)) St -> Simplified
+simplifyDone (MkPair out st) = { defs = concatDefs out, supply = st.supply }
 
 initSt : Int -> SG -> St
 initSt n0 sg =
@@ -636,6 +1074,15 @@ initSt n0 sg =
   , safe = sg.safe
   , total = sg.total
   , plain = M.empty
+  , sp =
+      { all = M.empty
+      , kinds = M.empty
+      , specs = M.empty
+      , made = Nil
+      , count = 0
+      , within = Nil
+      , trying = 0
+      }
   }
 
 -- | each definition, in order, simplified; what is inlined is taken

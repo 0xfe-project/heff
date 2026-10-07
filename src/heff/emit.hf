@@ -805,6 +805,15 @@ mayBounce env e = tailApp e || any (\g -> bouncesG env g) (tailGlobals e)
 trWhen : Bool -> String -> String
 trWhen b c = if b then trCode c else c
 
+-- | a known definition called, as it is (what it gives back may be a
+-- | bounce)
+callCode : JK -> Env -> Int -> String -> List I.Expr -> String
+callCode r env ind g as =
+  callName env g
+  ++ "("
+  ++ joinWith ", " (map (\a -> (r.expr env ind a).code) as)
+  ++ ")"
+
 exprGo : JK -> Env -> Int -> I.Expr -> Code
 exprGo r env ind e = case e of
   EVar x -> p3 (fromMaybe (safe x) (M.lookup compareString x env.names))
@@ -823,13 +832,7 @@ exprGo r env ind e = case e of
         as
   ECall g as ->
     if isUnitArgs as then p3 ("$force(" ++ callName env g ++ ")")
-    else p3
-        (trWhen
-           (bouncesG env g)
-           (callName env g
-            ++ "("
-            ++ joinWith ", " (map (\a -> (r.expr env ind a).code) as)
-            ++ ")"))
+    else p3 (trWhen (bouncesG env g) (callCode r env ind g as))
   EProj e2 l -> p3 (atLeast 3 (r.expr env ind e2) ++ projSuffix l)
   ERecord fs ->
     p3 ("{ " ++ joinWith ", " (map (\p -> fieldCode r env ind p) fs) ++ " }")
@@ -878,6 +881,11 @@ bodyF r env ind e = case e of
   ELet x a b -> r.block env ind (ELet x a b)
   EMatch s arms -> r.block env ind (EMatch s arms)
   EApp f as -> r.block env ind (EApp f as)
+  -- (a call last that may give back a bounce gives it back: asked for
+  -- here, through `$tr`, each round's stack would stay)
+  ECall g as ->
+    if bouncesG env g then r.block env ind (ECall g as)
+    else bodyCode ((r.expr env ind e).code)
   _ -> bodyCode ((r.expr env ind e).code)
 
 blockF : JK -> Env -> Int -> I.Expr -> String
@@ -1127,6 +1135,11 @@ returnLines r env ind e = case e of
           (if null ini then r.expr env ind f else r.expr env ind (EApp f ini))
           (r.expr env ind a)
       Nothing -> Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
+  -- (a known definition called last: not counted, its bounce handed on)
+  ECall g as ->
+    if isUnitArgs as
+      then Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
+    else Cons (indent ind ++ "return " ++ callCode r env ind g as ++ ";") Nil
   _ -> Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
 
 lastTrmc : JK -> Env -> Int -> I.Expr -> BoundN -> List String
@@ -1489,7 +1502,7 @@ primHelpers defs =
        primHelperOne
          (foldl (\m (d : I.Def) -> primUses m d.body) M.empty defs)
          p)
-    Pr.prims
+    Pr.allPrims
 
 type Emitted = { lines : List String, globals : M.Map String GInfo }
 
@@ -1587,7 +1600,9 @@ emitDefs defs roots = emitWithShorts defs roots (shortsOf defs)
 --------------------------------------------------------------------------------
 
 -- The runtime: a computation run by a handler whose (raw) monad is the
--- continuation monad, `(a -> ()) -> ()`.  An operation may finish later
+-- continuation monad, `(a -> ()) -> ()` -- the handler is the program's
+-- (`heff.lower`'s `lowerProgram`), its algebra `perform` handing each
+-- operation here, to `$performer`.  An operation may finish later
 -- (`Sleep`, `Fetch`, reading a file), and the rest of the computation
 -- -- its continuation -- runs then: JavaScript's asynchrony, as a
 -- handler, and the computation is the same whatever handles it.  There
@@ -1604,18 +1619,13 @@ runStr : String
 runStr =
   joinWith
     "\n"
-    [ "const $run = (main, perform) => {"
-    , "  const done = () => {};"
+    [ "let $performer;"
+    , "const $run = (entry, perform) => {"
     , "  const later = typeof setImmediate === \"function\" ? setImmediate : (f) => setTimeout(f, 0);"
     , "  let depth = 0;"
     , "  const now = (k) => (x) => { if (depth > 1000) { depth = 0; later(() => $tr(k(x))); return; } depth++; $tr(k(x)); };"
-    , "  // the handler: its monad's return and bind, and its algebra"
-    , "  const hd = {"
-    , "    ret: (x) => (k) => k(x),"
-    , "    bind: (m) => (f) => (k) => m((x) => $tr(f(x))(k)),"
-    , "    malg: (p) => (k) => perform(p, now(k)),"
-    , "  };"
-    , "  return $tr($tr($tr(main(hd))(hd.ret))(done));"
+    , "  $performer = (p, k) => perform(p, now(k));"
+    , "  return $tr(entry());"
     , "};"
     ]
 
@@ -1817,8 +1827,8 @@ runSource host provs eff key m =
              , ""
              , runFor
                host
-               ("$run("
-                ++ ref m.globals key
+               ("$run(() => "
+                ++ ref m.globals L.entryKey
                 ++ ", "
                 ++ handlerOf provs eff
                 ++ ");")
@@ -1832,7 +1842,8 @@ compileLowered : String
                -> L.Lowered
                -> Output
 compileLowered host provs eff key l =
-  { source = runSource host provs eff key (emitDefs l.defs (Cons key Nil))
+  { source =
+      runSource host provs eff key (emitDefs l.defs (Cons L.entryKey Nil))
   , errors = l.errors
   }
 
@@ -1853,7 +1864,7 @@ compileProgram host available g key eff =
     (provsFor available eff)
     eff
     key
-    (L.lower g (Cons key Nil))
+    (L.lowerProgram g key)
 
 getterOf : M.Map String GInfo -> Export -> String
 getterOf gs o =

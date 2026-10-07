@@ -1,9 +1,12 @@
 #!/usr/bin/env node
-// The benchmarks: each program here compiled for Node.js and run, and the
-// compiler compiling itself (its cache warm, then cold), each timed; the
-// best of `--runs N` (3) is said, with its peak memory.
+// The benchmarks: each program here compiled for Node.js and run, the
+// compiler checking itself (elaboration only: the code the compiler
+// emits, measured apart from what its simplifier does), and compiling
+// itself (its cache warm, then cold), each timed; the best of `--runs N`
+// (3) is said, with its peak memory.  `--heff FILE` measures another
+// compiler (boot/heff.mjs, say: the one before).
 //
-//   node bench/run.mjs [--runs N] [NAME...]
+//   node bench/run.mjs [--runs N] [--heff FILE] [NAME...]
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,7 +14,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const heff = join(root, "output", "heff.mjs");
+let heff = join(root, "output", "heff.mjs");
 const work = join(root, "ref", "bench");
 mkdirSync(work, { recursive: true });
 
@@ -20,6 +23,7 @@ let runs = 3;
 const only = [];
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === "--runs") runs = Number(argv[++i]);
+  else if (argv[i] === "--heff") heff = join(process.cwd(), argv[++i]);
   else only.push(argv[i]);
 }
 const wanted = (name) => only.length === 0 || only.includes(name);
@@ -52,19 +56,25 @@ for (const f of readdirSync(join(root, "bench")).filter((f) => f.endsWith(".hf")
   best(name, () => timed(["node", out]));
 }
 
-// the compiler compiling itself: with the cache as it is, then with none
-const self = ["node", heff, "compile", "src/heff/main.hf", join(work, "self.mjs"), "--name", "main", "--backend=node"];
-if (wanted("self")) best("self (warm)", () => timed(self));
-if (wanted("self-cold")) {
+// (with no cache: the one there is put aside, and back after)
+const coldly = (f) => {
   const cache = join(root, ".heff");
   const saved = mkdtempSync(join(tmpdir(), "heff-cache-"));
   const had = existsSync(cache);
   if (had) renameSync(cache, join(saved, ".heff"));
   try {
-    best("self (cold)", () => { rmSync(cache, { recursive: true, force: true }); return timed(self); });
+    f(() => rmSync(cache, { recursive: true, force: true }));
   } finally {
     rmSync(cache, { recursive: true, force: true });
     if (had) renameSync(join(saved, ".heff"), cache);
     rmSync(saved, { recursive: true, force: true });
   }
-}
+};
+
+const check = ["node", heff, "check", "src/heff/main.hf"];
+if (wanted("check")) coldly((clear) => best("check (cold)", () => { clear(); return timed(check); }));
+
+// the compiler compiling itself: with the cache as it is, then with none
+const self = ["node", heff, "compile", "src/heff/main.hf", join(work, "self.mjs"), "--name", "main", "--backend=node"];
+if (wanted("self")) best("self (warm)", () => timed(self));
+if (wanted("self-cold")) coldly((clear) => best("self (cold)", () => { clear(); return timed(self); }));
