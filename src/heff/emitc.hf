@@ -117,13 +117,16 @@ identAt : String -> Int -> Int -> String
 identAt text start i =
   if i < strLength text && (isAlnum (charCode text i) || charCode text i == 95)
     then identAt text start (i + 1)
-  else strSlice text start i-- (`TAG_x` in a provider's text: the tags it makes or reads)
-tagsInGo : String -> Int -> List String -> List String
-tagsInGo text i acc = case indexOf "TAG_" (strSlice text i (strLength text)) of
+  else strSlice text start i
+
+-- (`TAG_x` or `LBL_x` in a provider's text: the tags or labels it makes
+-- or reads)
+namesInGo : String -> String -> Int -> List String -> List String
+namesInGo pre text i acc = case indexOf pre (strSlice text i (strLength text)) of
   Nothing -> acc
-  Just j -> tagsInGo text (i + j + 4) (Cons (identAt text (i + j + 4) (i + j + 4)) acc)
-
-
+  Just j ->
+    namesInGo pre text (i + j + strLength pre)
+      (Cons (identAt text (i + j + strLength pre) (i + j + strLength pre)) acc)
 
 numbered : Int -> List String -> M.Map String Int -> M.Map String Int
 numbered n Nil m = m
@@ -214,11 +217,13 @@ unitsOf str = map (\i -> showInt (charCode str i)) (range 0 (strLength str - 1))
 
 strDef : Int -> String -> String
 strDef n str =
-  "static struct { Obj h; int64_t len; uint16_t s["
+  "static struct { Obj h; int64_t len; int64_t cap; uint16_t s["
   ++ showInt (if strLength str == 0 then 1 else strLength str)
   ++ "]; } str_"
   ++ showInt n
   ++ " = {{0x80000000u, K_STR, 0}, "
+  ++ showInt (strLength str)
+  ++ ", "
   ++ showInt (strLength str)
   ++ ", {"
   ++ (if strLength str == 0 then "0" else joinWith ", " (unitsOf str))
@@ -328,9 +333,12 @@ bound (EPrimCall _ as) = varsIn bound as
 bound (ECall _ as) = varsIn bound as
 bound _ = Nil
 
+-- (those mentioned not bound: `bs` reckoned once, not for each)
+freeAmong : List String -> List String -> List String
+freeAmong bs ms = nubS Nil (filter (\v -> not (elemS v bs)) ms)
+
 freeOf : List String -> I.Expr -> List String
-freeOf xs b =
-  nubS Nil (filter (\v -> not (elemS v xs) && not (elemS v (bound b))) (mentioned b))
+freeOf xs b = freeAmong (concatList xs (bound b)) (mentioned b)
 
 -- Reference counts
 --------------------------------------------------------------------------------
@@ -402,7 +410,7 @@ intLit : Int -> String
 intLit n =
   if n < 2305843009213693952 && n > (0 - 2305843009213693952)
     then "MK_INT(" ++ showInt n ++ "LL)"
-  else "heff_overflow()"
+  else "HEFF_BIG(\"" ++ showInt n ++ "\")"
 
 floatLit : Float -> String
 floatLit x =
@@ -557,10 +565,55 @@ again ce vs = case ce.self of
          (Cons "goto top;" Nil))
   Nothing -> Nil
 
+-- (the scrutinee, a variable held, given up on an arm that does not want
+-- it and has fields)
+takenOn : CE -> Maybe String -> List String -> I.Expr -> Maybe String
+takenOn ce Nothing vs b = Nothing
+takenOn ce (Just x) vs b =
+  if not (null vs) && length vs <= 60 && not (elemS x (unionS (fvE b) ce.after))
+    then Just x
+  else Nothing
+
+maybeList : Maybe String -> List String
+maybeList Nothing = Nil
+maybeList (Just x) = Cons x Nil
+
+-- (a field the arm wants: its own reference, or, the scrutinee given
+-- up, the scrutinee's, taken over)
+fieldLine : String -> Maybe String -> List String -> Pair String Int -> List String
+fieldLine sv taken used (MkPair v i) =
+  if elemS v used
+    then Cons
+        ("  V "
+         ++ cLocal v
+         ++ " = "
+         ++ (case taken of
+             Just _ -> "heff_field(" ++ sv ++ ", " ++ showInt i ++ ")"
+             Nothing -> "heff_dup(heff_field(" ++ sv ++ ", " ++ showInt i ++ "))")
+         ++ ";")
+        Nil
+  else Nil
+
+pow2 : Int -> Int
+pow2 0 = 1
+pow2 n = 2 * pow2 (n - 1)
+
+fieldMask : List String -> Int -> List String -> Int
+fieldMask used i Nil = 0
+fieldMask used i (Cons v vs) =
+  (if elemS v used then pow2 i else 0) + fieldMask used (i + 1) vs
+
+takeLines : String -> Maybe String -> List String -> List String -> List String
+takeLines sv Nothing vs used = Nil
+takeLines sv (Just _) vs used =
+  Cons ("heff_take(" ++ sv ++ ", " ++ showInt (fieldMask used 0 vs) ++ "ULL);") Nil
+
 -- (an arm: the fields it wants, a reference to each; what is held and
--- not wanted on it, dropped)
-armLines : CK -> CE -> Dest -> String -> I.Arm -> C (List String)
-armLines r ce dest sv (MkArm t vs b) = do
+-- not wanted on it, dropped.  The scrutinee held and not wanted on it is
+-- given up at once (`heff_take`): its last reference, its shell freed and
+-- the fields not wanted dropped -- no field counted up and then down)
+armLines : CK -> CE -> Dest -> String -> Maybe String -> I.Arm -> C (List String)
+armLines r ce dest sv held (MkArm t vs b) = do
   body <-
     r.stmts
         (withPath
@@ -576,27 +629,19 @@ armLines r ce dest sv (MkArm t vs b) = do
          (Cons ("case " ++ tagName t ++ ": {") Nil)
          (concatList
             (concatMap
-               (\(p : Pair String Int) -> case p of
-                MkPair v i ->
-                  if elemS v (fvE b)
-                    then Cons
-                        ("  V "
-                         ++ cLocal v
-                         ++ " = heff_dup(heff_field("
-                         ++ sv
-                         ++ ", "
-                         ++ showInt i
-                         ++ "));")
-                        Nil
-                  else Nil)
+               (fieldLine sv (takenOn ce held vs b) (fvE b))
                (zipWith (\v i -> MkPair v i) vs (range 0 (length vs - 1))))
             (concatList
                (map
                   (\l -> "  " ++ l)
-                  (dropLines
-                     (deadIn
-                        (concatList ce.owned (filter (\v -> elemS v (fvE b)) vs))
-                        (unionS (fvE b) ce.after))))
+                  (concatList
+                     (takeLines sv (takenOn ce held vs b) vs (fvE b))
+                     (dropLines
+                        (filter
+                           (\v -> not (elemS v (maybeList (takenOn ce held vs b))))
+                           (deadIn
+                              (concatList ce.owned (filter (\v -> elemS v (fvE b)) vs))
+                              (unionS (fvE b) ce.after))))))
                (concatList
                   (map (\l -> "  " ++ l) body)
                   (concatList
@@ -608,6 +653,11 @@ armLines r ce dest sv (MkArm t vs b) = do
 nomatchLine : Dest -> String -> String
 nomatchLine Ret sv = "default: return heff_nomatch(" ++ sv ++ ");"
 nomatchLine (Asg _) sv = "default: heff_nomatch(" ++ sv ++ ");"
+
+-- (the variable a match looks at, if it holds a reference to it)
+heldVar : CE -> I.Expr -> Maybe String
+heldVar ce (EVar x) = if elemS x ce.owned then Just x else Nothing
+heldVar ce _ = Nothing
 
 -- (what a match looks at: looked at, not consumed)
 scrutF : CK -> CE -> I.Expr -> C String
@@ -669,7 +719,7 @@ stmtsF : CK -> CE -> Dest -> I.Expr -> C (List String)
 stmtsF r ce dest (ELet x a b) = letLines r ce dest x a b
 stmtsF r ce dest (EMatch s arms) = do
   sv <- scrutF r ce s
-  as <- traverseC (armLines r ce dest sv) arms
+  as <- traverseC (armLines r ce dest sv (heldVar ce s)) arms
   pure
       (concatList
          (Cons ("switch (heff_tag_of(" ++ sv ++ ")) {") Nil)
@@ -1018,9 +1068,19 @@ programWith runtime provs ending defs names =
              knownTags
              (concatList
                 (fst names)
-                (concatMap (\(p : Em.Provider) -> tagsInGo p.text 0 Nil) provs)))
+                (concatMap (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil) provs)))
           M.empty
-    , lbls = numbered 0 (sortBy (\a b -> not (strLt b a)) (nubS Nil (snd names))) M.empty
+    , lbls =
+        numbered
+          0
+          (sortBy
+             (\a b -> not (strLt b a))
+             (nubS
+                Nil
+                (concatList
+                   (snd names)
+                   (concatMap (\(p : Em.Provider) -> namesInGo "LBL_" p.text 0 Nil) provs))))
+          M.empty
     , funs = foldl arityOne M.empty defs
     , bounce = Em.bouncing defs
     , self = Nothing
