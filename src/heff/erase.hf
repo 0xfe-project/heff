@@ -77,11 +77,12 @@ isType lvl t = case V.behavior t of
     isType (lvl + 1) (V.nom (V.appClo cod (\u -> V.local lvl dom)))
   _ -> False
 
--- | The type of field `l`: through the value's fields where they are in
--- | hand; else each field before it a local of its own, if the type
--- | depends on none of them
-projTyIn : Int -> V.Ty -> V.V -> String -> M V.Ty
-projTyIn len t v l = case V.projTyMaybe t v l of
+-- | The type of field `l`: through the value's fields `fs` where they are
+-- | in hand (expanded once for a record's fields, not once each); else
+-- | each field before it a local of its own, if the type depends on none
+-- | of them
+projTyInWith : Int -> V.Ty -> Maybe (D.Dict (V.Ev V.V)) -> String -> M V.Ty
+projTyInWith len t fs l = case V.projTyWith t fs l of
   Just ty -> pure ty
   Nothing -> case V.behavior t of
     LikeRecord level capture fieldTypes -> case RL.fieldTyApart
@@ -95,6 +96,15 @@ projTyIn len t v l = case V.projTyMaybe t v l of
         failWith
           ("the type of `." ++ l ++ "` depends on fields not in hand here")
     _ -> failWith "projecting from something that is not of a record type"
+
+-- | as `projTyInWith`, the value given
+projTyIn : Int -> V.Ty -> V.V -> String -> M V.Ty
+projTyIn len t v l = projTyInWith len t (V.coerceToFieldsMaybe v) l
+
+-- (a field of the value, its fields given if they are in hand)
+projWith : Maybe (D.Dict (V.Ev V.V)) -> V.V -> String -> V.Ev V.V
+projWith (Just fs) v l = D.elemAt fs l
+projWith Nothing v l = V.proj v l
 
 matchVariants : V.Ty -> M (Pm.Variants (Pm.Th V.Ty))
 matchVariants sty = case V.behavior sty of
@@ -354,14 +364,27 @@ chkDField : EK
           -> Ctx
           -> V.Ty
           -> V.V
+          -> Maybe (D.Dict (V.Ev V.V))
           -> Pair String Sx.Tm
           -> M (Maybe (Pair String I.Expr))
-chkDField r c ty v (MkPair l fe) = do
-  fty <- projTyIn c.len ty v l
+chkDField r c ty v fs (MkPair l fe) = do
+  fty <- projTyInWith c.len ty fs l
   if isType c.len fty then pure Nothing
     else do
-      e <- r.chkD c fe fty (V.nom (V.proj v l))
+      e <- r.chkD c fe fty (V.nom (projWith fs v l))
       pure (Just (MkPair l e))
+
+-- (a record's fields, its value's fields expanded once for them all)
+chkDFields : EK
+           -> Ctx
+           -> V.Ty
+           -> V.V
+           -> List (Pair String Sx.Tm)
+           -> Maybe (D.Dict (V.Ev V.V))
+           -> M I.Expr
+chkDFields r c ty v ps fs = do
+  fields <- traverseM (\p -> chkDField r c ty v fs p) ps
+  pure (ERecord (catMaybesE fields))
 
 -- | a definition's own syntax, whose value `v` is known: under its
 -- | lambdas and through its record's fields the value is followed along
@@ -387,9 +410,8 @@ chkDF r c t ty v = case t of
           pure (ELam (Cons n Nil) b)
     _ -> r.chk c t ty
   SCons d -> case V.behavior ty of
-    LikeRecord level capture fieldTypes -> do
-      fields <- traverseM (\p -> chkDField r c ty v p) (D.toList d)
-      pure (ERecord (catMaybesE fields))
+    LikeRecord level capture fieldTypes ->
+      chkDFields r c ty v (D.toList d) (V.coerceToFieldsMaybe v)
     _ -> r.chk c t ty
   _ -> r.chk c t ty
 

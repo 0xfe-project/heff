@@ -120,7 +120,7 @@ for (const [args, says] of [
   [["check"], "heff check: expected FILE\nusage: heff check FILE\n"],
   [["fmt", "--chek", "x.hf"], "heff fmt: no flag --chek; --check?\nusage: heff fmt FILE... [--check]\n"],
   [["compile", "a.hf", "a.mjs"], "heff compile: --backend=MODE is wanted\n"],
-  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "heff compile: --backend is esm, page or node, not wasm\n"],
+  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "heff compile: --backend is esm, page, node or c, not wasm\n"],
   [["compile", "a.hf", "--backend=node"], "heff compile: expected OUT\n"],
   [["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"], "heff compile: an ES module runs nothing: no --name with --backend=esm"],
   [["init", "a", "b"], "heff init: too many words: b\n"],
@@ -132,15 +132,15 @@ for (const args of [["help", "compile"], ["compile", "--help"], ["compile", "a.h
   const r = heff(...args);
   expect(`help: ${args.join(" ")}`, r.status === 0 &&
     r.stdout.startsWith("usage: heff compile FILE OUT [--name NAME] --backend=MODE\n") &&
-    r.stdout.includes("\n  -b, --backend=MODE") && r.stdout.includes("(esm, page, node)"), r);
+    r.stdout.includes("\n  -b, --backend=MODE") && r.stdout.includes("(esm, page, node, c)"), r);
 }
 
 // what a word completes to: the commands, a command's flags, a flag's
 // values, its files
 for (const [words, out] of [
-  [["co"], "compile\tFILE as JavaScript, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME)\ncompletions\ta completion script for SHELL\n"],
+  [["co"], "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME), c (a C program running NAME, for `zig cc`)\ncompletions\ta completion script for SHELL\n"],
   [["compile", "a.hf", "--b"], "--backend\twhat it is compiled to\n"],
-  [["compile", "a.hf", "-b", ""], "esm\npage\nnode\n"],
+  [["compile", "a.hf", "-b", ""], "esm\npage\nnode\nc\n"],
   [["compile", "a.hf", "--backend=n"], "--backend=node\n"],
   [["fmt", "--check", ""], ":files .hf\n"],
   [["init", ""], ":dirs\n"],
@@ -166,9 +166,9 @@ const bashOffers = (line, words) => spawnSync("bash", ["-c",
 for (const [line, words, want] of [
   ["heff comp", ["heff", "comp"], ["compile", "completions"]],
   ["heff compile a.hf --b", ["heff", "compile", "a.hf", "--b"], ["--backend"]],
-  ["heff compile a.hf --backend ", ["heff", "compile", "a.hf", "--backend", ""], ["esm", "page", "node"]],
+  ["heff compile a.hf --backend ", ["heff", "compile", "a.hf", "--backend", ""], ["esm", "page", "node", "c"]],
   ["heff compile a.hf --backend=n", ["heff", "compile", "a.hf", "--backend", "=", "n"], ["node"]],
-  ["heff compile a.hf --backend=", ["heff", "compile", "a.hf", "--backend", "="], ["=esm", "=page", "=node"]],
+  ["heff compile a.hf --backend=", ["heff", "compile", "a.hf", "--backend", "="], ["=esm", "=page", "=node", "=c"]],
   ["heff check cle", ["heff", "check", "cle"], ["clean.hf"]],
 ]) {
   const r = bashOffers(line, words);
@@ -181,8 +181,8 @@ if (fishThere) {
   const fishOffers = (line) => spawnSync("fish", ["-c", `source comp.fish; complete -C ${JSON.stringify(line)}`], { cwd: work, env, encoding: "utf8" });
   for (const [line, want] of [
     ["heff comp", ["compile", "completions"]],
-    ["heff compile a.hf --backend=", ["--backend=esm", "--backend=page", "--backend=node"]],
-    ["heff compile a.hf -b ", ["esm", "page", "node"]],
+    ["heff compile a.hf --backend=", ["--backend=esm", "--backend=page", "--backend=node", "--backend=c"]],
+    ["heff compile a.hf -b ", ["c", "esm", "node", "page"]],
     ["heff check cle", ["clean.hf"]],
   ]) {
     const r = fishOffers(line);

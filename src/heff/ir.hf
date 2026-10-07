@@ -212,54 +212,67 @@ pairSndI (MkPair _ e2) = e2
 
 type Occ = { count : Int, underLam : Bool }
 
-occNone : Occ
-occNone = { count = 0, underLam = False }
+-- (worklists: an expression's parts before the rest -- a walk that
+-- needs no list of its own for each node)
+pushArms : List Arm -> List Expr -> List Expr
+pushArms Nil rest = rest
+pushArms (Cons a as) rest = Cons (armBody a) (pushArms as rest)
 
-occBoth : Occ -> Occ -> Occ
-occBoth a b = { count = a.count + b.count, underLam = a.underLam || b.underLam }
+pushFields : List (Pair String Expr) -> List Expr -> List Expr
+pushFields Nil rest = rest
+pushFields (Cons p fs) rest = Cons (pairSndI p) (pushFields fs rest)
 
-occGo : String -> Bool -> Expr -> Occ
-occGo x lam e = case e of
-  EVar y -> if strEq y x then { count = 1, underLam = lam } else occNone
-  ELam _ b -> occGo x True b
-  EApp f as ->
-    foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone (Cons f as)
-  ELet _ a b -> occBoth (occGo x lam a) (occGo x lam b)
-  ERecord fs ->
-    foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone (map pairSndI fs)
-  EProj e2 _ -> occGo x lam e2
-  ETag _ as -> foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone as
-  EMatch s arms ->
-    occBoth
-      (occGo x lam s)
-      (foldl (\acc a -> occBoth acc (occGo x lam (armBody a))) occNone arms)
-  EPrimCall _ as -> foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone as
-  ECall _ as -> foldl (\acc e2 -> occBoth acc (occGo x lam e2)) occNone as
-  _ -> occNone
+-- (how often `x` occurs in the worklist, `n` counted so far)
+countW : String -> Int -> List Expr -> Int
+countW x n Nil = n
+countW x n (Cons (EVar y) rest) = countW x (if strEq y x then n + 1 else n) rest
+countW x n (Cons (ELam _ b) rest) = countW x n (Cons b rest)
+countW x n (Cons (EApp f as) rest) = countW x n (Cons f (appendI as rest))
+countW x n (Cons (ELet _ a b) rest) = countW x n (Cons a (Cons b rest))
+countW x n (Cons (ERecord fs) rest) = countW x n (pushFields fs rest)
+countW x n (Cons (EProj e _) rest) = countW x n (Cons e rest)
+countW x n (Cons (ETag _ as) rest) = countW x n (appendI as rest)
+countW x n (Cons (EMatch s arms) rest) = countW x n (Cons s (pushArms arms rest))
+countW x n (Cons (EPrimCall _ as) rest) = countW x n (appendI as rest)
+countW x n (Cons (ECall _ as) rest) = countW x n (appendI as rest)
+countW x n (Cons _ rest) = countW x n rest
+
+-- (whether `x` occurs under a lambda in the worklist: a lambda's body
+-- counted, not walked again)
+lamW : String -> List Expr -> Bool
+lamW x Nil = False
+lamW x (Cons (ELam _ b) rest) = countW x 0 (Cons b Nil) > 0 || lamW x rest
+lamW x (Cons (EApp f as) rest) = lamW x (Cons f (appendI as rest))
+lamW x (Cons (ELet _ a b) rest) = lamW x (Cons a (Cons b rest))
+lamW x (Cons (ERecord fs) rest) = lamW x (pushFields fs rest)
+lamW x (Cons (EProj e _) rest) = lamW x (Cons e rest)
+lamW x (Cons (ETag _ as) rest) = lamW x (appendI as rest)
+lamW x (Cons (EMatch s arms) rest) = lamW x (Cons s (pushArms arms rest))
+lamW x (Cons (EPrimCall _ as) rest) = lamW x (appendI as rest)
+lamW x (Cons (ECall _ as) rest) = lamW x (appendI as rest)
+lamW x (Cons _ rest) = lamW x rest
 
 -- | how often a variable occurs, and whether any occurrence is under a
 -- | lambda (where it may be evaluated any number of times)
 occurrences : String -> Expr -> Occ
-occurrences x e = occGo x False e
+occurrences x e = { count = countW x 0 (Cons e Nil), underLam = lamW x (Cons e Nil) }
+
+-- (the nodes in the worklist, `n` counted so far)
+sizeW : Int -> List Expr -> Int
+sizeW n Nil = n
+sizeW n (Cons (ELam _ b) rest) = sizeW (n + 1) (Cons b rest)
+sizeW n (Cons (EApp f as) rest) = sizeW (n + 1) (Cons f (appendI as rest))
+sizeW n (Cons (ELet _ a b) rest) = sizeW (n + 1) (Cons a (Cons b rest))
+sizeW n (Cons (ERecord fs) rest) = sizeW (n + 1) (pushFields fs rest)
+sizeW n (Cons (EProj e _) rest) = sizeW (n + 1) (Cons e rest)
+sizeW n (Cons (ETag _ as) rest) = sizeW (n + 1) (appendI as rest)
+sizeW n (Cons (EMatch s arms) rest) = sizeW (n + 1) (Cons s (pushArms arms rest))
+sizeW n (Cons (EPrimCall _ as) rest) = sizeW (n + 1) (appendI as rest)
+sizeW n (Cons (ECall _ as) rest) = sizeW (n + 1) (appendI as rest)
+sizeW n (Cons _ rest) = sizeW (n + 1) rest
 
 size : Expr -> Int
-size e = case e of
-  ELam _ b -> 1 + size b
-  EApp f as -> 1 + size f + sumI (map (\a -> size a) as)
-  ELet _ a b -> 1 + size a + size b
-  ERecord fs ->
-    1
-    + sumI
-      (map
-         (\p -> case p of
-          MkPair _ e2 -> size e2)
-         fs)
-  EProj e2 _ -> 1 + size e2
-  ETag _ as -> 1 + sumI (map (\a -> size a) as)
-  EMatch s arms -> 1 + size s + sumI (map (\a -> size (armBody a)) arms)
-  EPrimCall _ as -> 1 + sumI (map (\a -> size a) as)
-  ECall _ as -> 1 + sumI (map (\a -> size a) as)
-  _ -> 1
+size e = sizeW 0 (Cons e Nil)
 
 globalsGo : Expr -> List String
 globalsGo e = case e of

@@ -1,0 +1,1585 @@
+-- The lowered program (heff.lower's `lowerProgramAnf`: in A-normal
+-- form) as C, for lib/c/runtime.c, compiled by `zig cc` (#20).
+--
+--   a definition of n parameters  ~>  a C function of n parameters
+--            (`g_K`), and a closure of it (`g_K_clo`) where it is a value;
+--            a call of itself last, a loop (`goto top`)
+--   a definition that is not a function  ~>  computed when first used
+--            (`g_K_get`)
+--   a lambda  ~>  a C function of its own (`lam_N`), what it mentions
+--            and does not bind kept in its closure
+--   a tag, a record  ~>  `heff_tag`, `heff_rec`: tags and labels
+--            numbered (`TAG_x`, `LBL_x`), a record's fields in the order
+--            it is written in
+--   a string  ~>  a static object, its UTF-16 code units
+--   a call last of an unknown function  ~>  `heff_tail` (counted, a
+--            bounce every so often); a call not last, its value through
+--            `heff_tr` -- as src/heff/emit.hf does (`Em.bouncing`)
+--
+-- A program is one file: the runtime, the providers of its worlds
+-- (`M.provider.c`), and its code; its entry is heff.lower's `entryKey`,
+-- its algebra (`perform`) handing each operation to its world's
+-- provider by the sum the effect is.
+
+import heff.effect as Ef
+import heff.emit as Em
+import heff.globals as G
+import heff.ir as I
+import heff.lower as L
+import heff.prims as Pr
+import map as M
+import prelude
+
+-- Names
+--------------------------------------------------------------------------------
+
+hexDigit : Int -> String
+hexDigit d = strSlice "0123456789abcdef" d (d + 1)
+
+isAlnum : Int -> Bool
+isAlnum c = (97 <= c && c <= 122) || (65 <= c && c <= 90) || (48 <= c && c <= 57)
+
+mangleChar : Int -> String
+mangleChar c =
+  if isAlnum c then strFromCharCode c
+  else "_" ++ hexDigit (intDiv (intMod c 256) 16) ++ hexDigit (intMod c 16)
+
+-- (from `i`, a run of letters and digits scanned to `j`: each run taken
+-- whole, not a letter at a time)
+mangleW : String -> Int -> Int -> String -> String
+mangleW s i j acc =
+  if j < strLength s && isAlnum (charCode s j) then mangleW s i (j + 1) acc
+  else if j >= strLength s then acc ++ strSlice s i j
+  else mangleW s (j + 1) (j + 1) (acc ++ strSlice s i j ++ mangleChar (charCode s j))
+
+-- | a name as C spells it: letters and digits kept, the rest `_xx`
+mangle : String -> String
+mangle s = mangleW s 0 0 ""
+
+cGlobal : String -> String
+cGlobal k = "g_" ++ mangle k
+
+cLocal : String -> String
+cLocal x = "v_" ++ mangle x
+
+tagName : String -> String
+tagName t = "TAG_" ++ mangle t
+
+lblName : String -> String
+lblName l = "LBL_" ++ mangle l
+
+-- Tags and labels
+--------------------------------------------------------------------------------
+
+-- | the tags lib/c/runtime.c knows, numbered as it numbers them
+knownTags : List String
+knownTags =
+  ["True", "False", "Nil", "Cons", "MkUnit", "Just", "Nothing", "MkPair", "InL", "InR"]
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+nubS : List String -> List String -> List String
+nubS acc Nil = reverse acc
+nubS acc (Cons x xs) = if elemS x acc then nubS acc xs else nubS (Cons x acc) xs
+
+armTags : List I.Arm -> List String
+armTags arms = map I.armTag arms
+
+-- (each the one's before the other's: only the first copied)
+pairCat : Pair (List String) (List String)
+        -> Pair (List String) (List String)
+        -> Pair (List String) (List String)
+pairCat (MkPair ts ls) (MkPair ts2 ls2) = MkPair (concatList ts ts2) (concatList ls ls2)
+
+-- (the tags and labels an expression mentions)
+namesIn : (I.Expr -> Pair (List String) (List String))
+        -> List I.Expr
+        -> Pair (List String) (List String)
+namesIn go es = foldr (\e acc -> pairCat (go e) acc) (MkPair Nil Nil) es
+
+withLbls : List String -> Pair (List String) (List String) -> Pair (List String) (List String)
+withLbls ls (MkPair ts ls2) = MkPair ts (concatList ls ls2)
+
+withTags : List String -> Pair (List String) (List String) -> Pair (List String) (List String)
+withTags ts (MkPair ts2 ls) = MkPair (concatList ts ts2) ls
+
+tagsLbls : I.Expr -> Pair (List String) (List String)
+tagsLbls (ELam _ b) = tagsLbls b
+tagsLbls (EApp f as) = namesIn tagsLbls (Cons f as)
+tagsLbls (ELet _ a b) = namesIn tagsLbls [a, b]
+tagsLbls (ERecord fs) = withLbls (map fst fs) (namesIn tagsLbls (map snd fs))
+tagsLbls (EProj e l) = withLbls (Cons l Nil) (tagsLbls e)
+tagsLbls (ETag t as) = withTags (Cons t Nil) (namesIn tagsLbls as)
+tagsLbls (EMatch s arms) =
+  withTags (armTags arms) (namesIn tagsLbls (Cons s (map I.armBody arms)))
+tagsLbls (EPrimCall _ as) = namesIn tagsLbls as
+tagsLbls (ECall _ as) = namesIn tagsLbls as
+tagsLbls _ = MkPair Nil Nil
+
+identAt : String -> Int -> Int -> String
+identAt text start i =
+  if i < strLength text && (isAlnum (charCode text i) || charCode text i == 95)
+    then identAt text start (i + 1)
+  else strSlice text start i
+
+-- (`TAG_x` or `LBL_x` in a provider's text: the tags or labels it makes
+-- or reads)
+namesInGo : String -> String -> Int -> List String -> List String
+namesInGo pre text i acc = case indexOf pre (strSlice text i (strLength text)) of
+  Nothing -> acc
+  Just j ->
+    namesInGo pre text (i + j + strLength pre)
+      (Cons (identAt text (i + j + strLength pre) (i + j + strLength pre)) acc)
+
+numbered : Int -> List String -> M.Map String Int -> M.Map String Int
+numbered n Nil m = m
+numbered n (Cons x xs) m =
+  if M.member compareString x m then numbered n xs m
+  else numbered (n + 1) xs (M.insert compareString x n m)
+
+-- What emitting reads: the numbers, the definitions that are functions
+-- (by their arity) and those whose calls may give back a bounce
+--------------------------------------------------------------------------------
+
+-- | a definition being emitted that calls itself last: its key and
+-- | parameters (the loop's)
+type Self = { key : String, params : List String }
+
+-- (`owned`: the variables this code holds a reference to, to consume or
+-- drop; `after`: those wanted after what is being emitted, by what
+-- comes after it -- see "Reference counts")
+type CE =
+  { tags : M.Map String Int
+  , lbls : M.Map String Int
+  , funs : M.Map String Int
+  , bounce : M.Map String Unit
+  , self : Maybe Self
+  , owned : List String
+  , after : List String
+  , borrowed : List String
+  , bor : M.Map String (List Int)
+  }
+
+withSelf : Maybe Self -> CE -> CE
+withSelf s ce =
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = s
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  }
+
+withPath : List String -> List String -> CE -> CE
+withPath owned after ce =
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , owned = owned
+  , after = after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  }
+
+-- (the variables lent to this code: it holds no reference to them)
+withBorrowed : List String -> CE -> CE
+withBorrowed bs ce =
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = bs
+  , bor = ce.bor
+  }
+
+lblOf : CE -> String -> Int
+lblOf ce l = fromMaybe 0 (M.lookup compareString l ce.lbls)
+
+-- What emitting makes on the way: the lambdas, the strings and the
+-- labels of records, each a C definition of its own
+--------------------------------------------------------------------------------
+
+type CS =
+  { nlam : Int
+  , lams : List String
+  , protos : List String
+  , nstr : Int
+  , strs : List String
+  , shapes : List String
+  , prims : List String
+  }
+
+type C a = CS -> Pair a CS
+
+bindTake : {a b : Type} -> (a -> C b) -> Pair a CS -> Pair b CS
+bindTake f (MkPair x s) = f x s
+
+bind : {a b : Type} -> C a -> (a -> C b) -> C b
+bind m f = \s -> bindTake f (m s)
+
+pure : {a : Type} -> a -> C a
+pure x = \s -> MkPair x s
+
+traverseC : {a b : Type} -> (a -> C b) -> List a -> C (List b)
+traverseC f Nil = pure Nil
+traverseC f (Cons x xs) = do
+  y <- f x
+  ys <- traverseC f xs
+  pure (Cons y ys)
+
+unitsOf : String -> List String
+unitsOf str = map (\i -> showInt (charCode str i)) (range 0 (strLength str - 1))
+
+strDef : Int -> String -> String
+strDef n str =
+  "static struct { Obj h; int64_t len; int64_t cap; uint16_t s["
+  ++ showInt (if strLength str == 0 then 1 else strLength str)
+  ++ "]; } str_"
+  ++ showInt n
+  ++ " = {{0x80000000u, K_STR, 0}, "
+  ++ showInt (strLength str)
+  ++ ", "
+  ++ showInt (strLength str)
+  ++ ", {"
+  ++ (if strLength str == 0 then "0" else joinWith ", " (unitsOf str))
+  ++ "}};"
+
+-- | a static string, its UTF-16 code units
+strLit : String -> C String
+strLit str = \s ->
+    MkPair
+      ("((V)&str_" ++ showInt s.nstr ++ ")")
+      { nlam = s.nlam
+      , lams = s.lams
+      , protos = s.protos
+      , nstr = s.nstr + 1
+      , strs = Cons (strDef s.nstr str) s.strs
+      , shapes = s.shapes
+      , prims = s.prims
+      }
+
+-- | a record's labels, in the order it is written in, as a static array
+shapeLit : List Int -> C String
+shapeLit ids = \s ->
+    MkPair
+      ("shape_" ++ joinWith "_" (map showInt ids))
+      { nlam = s.nlam
+      , lams = s.lams
+      , protos = s.protos
+      , nstr = s.nstr
+      , strs = s.strs
+      , shapes =
+          if elemS (joinWith "_" (map showInt ids)) s.shapes then s.shapes
+          else Cons (joinWith "_" (map showInt ids)) s.shapes
+      , prims = s.prims
+      }
+
+-- | a primitive, as a value: a closure of it
+primLit : String -> C String
+primLit p = \s ->
+    MkPair
+      ("((V)&prim_" ++ p ++ "_clo)")
+      { nlam = s.nlam
+      , lams = s.lams
+      , protos = s.protos
+      , nstr = s.nstr
+      , strs = s.strs
+      , shapes = s.shapes
+      , prims = if elemS p s.prims then s.prims else Cons p s.prims
+      }
+
+newLam : C Int
+newLam = \s ->
+    MkPair
+      s.nlam
+      { nlam = s.nlam + 1
+      , lams = s.lams
+      , protos = s.protos
+      , nstr = s.nstr
+      , strs = s.strs
+      , shapes = s.shapes
+      , prims = s.prims
+      }
+
+addLam : String -> String -> C Unit
+addLam proto def = \s ->
+    MkPair
+      MkUnit
+      { nlam = s.nlam
+      , lams = Cons def s.lams
+      , protos = Cons proto s.protos
+      , nstr = s.nstr
+      , strs = s.strs
+      , shapes = s.shapes
+      , prims = s.prims
+      }
+
+-- Free variables
+--------------------------------------------------------------------------------
+
+-- (the variables a worklist binds, `bs`, and mentions, `ms`, last first:
+-- names being unique, what it mentions and does not bind is free --
+-- both gathered in one walk)
+fvW : List String -> List String -> List I.Expr -> Pair (List String) (List String)
+fvW bs ms Nil = MkPair bs ms
+fvW bs ms (Cons (EVar x) rest) = fvW bs (Cons x ms) rest
+fvW bs ms (Cons (ELam xs b) rest) = fvW (concatList xs bs) ms (Cons b rest)
+fvW bs ms (Cons (EApp f as) rest) = fvW bs ms (Cons f (concatList as rest))
+fvW bs ms (Cons (ELet x a b) rest) = fvW (Cons x bs) ms (Cons a (Cons b rest))
+fvW bs ms (Cons (ERecord fs) rest) = fvW bs ms (I.pushFields fs rest)
+fvW bs ms (Cons (EProj e _) rest) = fvW bs ms (Cons e rest)
+fvW bs ms (Cons (ETag _ as) rest) = fvW bs ms (concatList as rest)
+fvW bs ms (Cons (EMatch s arms) rest) =
+  fvW (concatList (concatMap I.armVars arms) bs) ms (Cons s (I.pushArms arms rest))
+fvW bs ms (Cons (EPrimCall _ as) rest) = fvW bs ms (concatList as rest)
+fvW bs ms (Cons (ECall _ as) rest) = fvW bs ms (concatList as rest)
+fvW bs ms (Cons _ rest) = fvW bs ms rest
+
+-- (those mentioned not bound: `bs` reckoned once, not for each)
+setOf : List String -> M.Map String Unit
+setOf xs = foldl (\m x -> M.insert compareString x (MkUnit : Unit) m) M.empty xs
+
+-- (those of `ms` not in `bs` nor before, in order)
+freeGo : M.Map String Unit -> M.Map String Unit -> List String -> List String -> List String
+freeGo bs seen Nil acc = reverse acc
+freeGo bs seen (Cons v vs) acc =
+  if M.member compareString v bs || M.member compareString v seen then freeGo bs seen vs acc
+  else freeGo bs (M.insert compareString v (MkUnit : Unit) seen) vs (Cons v acc)
+
+freeAmong : List String -> List String -> List String
+freeAmong bs ms = freeGo (setOf bs) M.empty ms Nil
+
+freeFrom : List String -> Pair (List String) (List String) -> List String
+freeFrom xs (MkPair bs ms) = freeAmong (concatList xs bs) (reverse ms)
+
+freeOf : List String -> I.Expr -> List String
+freeOf xs b = freeFrom xs (fvW Nil Nil (Cons b Nil))
+
+-- Reference counts
+--------------------------------------------------------------------------------
+
+-- Perceus: a variable holds a reference to its value, which the code
+-- holding the variable consumes or drops, exactly once on each path.
+--
+-- - Each use of a variable consumes a reference: the last use on its
+--   path gives its own away; a use before that takes one more
+--   (`heff_dup`).  A use is last where the variable is not wanted after
+--   it: by the operands after it, or by what comes after the expression
+--   (`live`).  What uses its operands consumes them: a call, a tag or a
+--   record built, a closure made, a primitive, a field taken.
+-- - Where a path starts -- a function's or a lambda's body, a match's
+--   arm, what follows a binding -- a variable held and not wanted on
+--   it is dropped (`heff_drop`).
+-- - A match only looks at what it matches: an arm takes a reference to
+--   each field it wants, and the matched value is dropped there if the
+--   arm does not want it.
+-- - A definition's value is the definition's, never dropped: a use of
+--   it takes a reference.  A lambda's closure holds what it mentions:
+--   its body takes a reference to each, and drops the closure.
+
+unionS : List String -> List String -> List String
+unionS xs ys = concatList xs ys
+
+-- | the variables it mentions and does not bind
+fvE : I.Expr -> List String
+fvE e = freeOf Nil e
+
+fvList : List I.Expr -> List String
+fvList es = concatMap fvE es
+
+-- (a use of `x`: its reference, or one more if it is wanted after or
+-- lent)
+varUse : List String -> List String -> String -> String
+varUse lent live x =
+  if elemS x live || elemS x lent then "heff_dup(" ++ cLocal x ++ ")" else cLocal x
+
+dropLines : List String -> List String
+dropLines xs = map (\x -> "heff_drop(" ++ cLocal x ++ ");") xs
+
+-- | what is held and not wanted: given back where a path starts
+deadIn : List String -> List String -> List String
+deadIn owned wanted = filter (\v -> not (elemS v wanted)) owned
+
+-- | what is held and wanted, of what is held
+deadKept : List String -> List String -> List String
+deadKept owned wanted = filter (\v -> elemS v wanted) owned
+
+-- Expressions
+--------------------------------------------------------------------------------
+
+data Dest = Ret | Asg String
+
+-- | the emitter's judgments, knotted: a value (an operand, consumed,
+-- | `live` what is wanted after it), a computation not last (the same),
+-- | statements (where its value goes, `CE.owned` and `CE.after` saying
+-- | what is held and wanted after)
+type CK =
+  { val : CE -> List String -> I.Expr -> C String
+  , comp : CE -> List String -> I.Expr -> C String
+  , stmts : CE -> Dest -> I.Expr -> C (List String)
+  }
+
+argsArr : List String -> String
+argsArr vs = if null vs then "NULL" else "(V[]){" ++ joinWith ", " vs ++ "}"
+
+-- (an integer the runtime keeps in a word, or one it cannot)
+intLit : Int -> String
+intLit n =
+  if n < 2305843009213693952 && n > (0 - 2305843009213693952)
+    then "MK_INT(" ++ showInt n ++ "LL)"
+  else "HEFF_BIG(\"" ++ showInt n ++ "\")"
+
+floatLit : Float -> String
+floatLit x =
+  if strEq (showFloat x) "NaN" then "heff_flt(NAN)"
+  else if strEq (showFloat x) "Infinity" then "heff_flt(INFINITY)"
+  else if strEq (showFloat x) "-Infinity" then "heff_flt(-INFINITY)"
+  else "heff_flt(" ++ showFloat x ++ ")"
+
+primName : String -> String
+primName p = "heff_" ++ p
+
+-- | operands, left to right: each consumed, wanted after it what the
+-- | ones after it want, and `live`
+operandsF : CK -> CE -> List String -> List I.Expr -> C (List String)
+operandsF r ce live Nil = pure Nil
+operandsF r ce live (Cons e es) = do
+  v <- r.val ce (unionS (fvList es) live) e
+  vs <- operandsF r ce live es
+  pure (Cons v vs)
+
+-- (a call's operand: at a borrowed parameter lent, not given -- a
+-- variable held and wanted after by none dropped after the call, any
+-- other value computed before it and dropped after it)
+type Lent = { arg : String, pre : List String, post : List String }
+
+elemI : Int -> List Int -> Bool
+elemI i Nil = False
+elemI i (Cons j js) = i == j || elemI i js
+
+borOf : M.Map String (List Int) -> String -> List Int
+borOf bor g = fromMaybe Nil (M.lookup compareString g bor)
+
+given : String -> Lent
+given v = { arg = v, pre = Nil, post = Nil }
+
+lentVar : CE -> List String -> String -> Lent
+lentVar ce live x =
+  if elemS x live || elemS x ce.borrowed then given (cLocal x)
+  else { arg = cLocal x, pre = Nil, post = Cons ("heff_drop(" ++ cLocal x ++ ");") Nil }
+
+lentValue : Int -> String -> Lent
+lentValue i v =
+  { arg = "b_" ++ showInt i
+  , pre = Cons ("V b_" ++ showInt i ++ " = " ++ v ++ ";") Nil
+  , post = Cons ("heff_drop(b_" ++ showInt i ++ ");") Nil
+  }
+
+lentOne : CK -> CE -> List String -> List Int -> Int -> I.Expr -> C Lent
+lentOne r ce live bi i (EVar x) =
+  if elemI i bi then pure (lentVar ce live x)
+  else do
+    v <- r.val ce live (EVar x)
+    pure (given v)
+lentOne r ce live bi i e = do
+  v <- r.val ce live e
+  pure (if elemI i bi then lentValue i v else given v)
+
+lentOperands : CK -> CE -> List String -> List Int -> Int -> List I.Expr -> C (List Lent)
+lentOperands r ce live bi i Nil = pure Nil
+lentOperands r ce live bi i (Cons e es) = do
+  l <- lentOne r ce (unionS (fvList es) live) bi i e
+  ls <- lentOperands r ce live bi (i + 1) es
+  pure (Cons l ls)
+
+lentPlain : List Lent -> Bool
+lentPlain ls = all (\(l : Lent) -> null l.pre && null l.post) ls
+
+-- (a call of `g`, through any bounces if `tr`: the lent dropped after)
+callText : String -> Bool -> List Lent -> String
+callText g tr ls =
+  if lentPlain ls
+    then (if tr then "heff_tr(" else "(")
+    ++ cGlobal g
+    ++ "("
+    ++ joinWith ", " (map (\(l : Lent) -> l.arg) ls)
+    ++ "))"
+  else "({ "
+  ++ joinWith " " (concatMap (\(l : Lent) -> l.pre) ls)
+  ++ " V r_ = "
+  ++ (if tr then "heff_tr(" else "(")
+  ++ cGlobal g
+  ++ "("
+  ++ joinWith ", " (map (\(l : Lent) -> l.arg) ls)
+  ++ ")); "
+  ++ joinWith " " (concatMap (\(l : Lent) -> l.post) ls)
+  ++ " r_; })"
+
+lamBody : CK -> CE -> List String -> I.Expr -> List String -> C (List String)
+lamBody r ce xs b fv =
+  r.stmts
+    (withPath
+       (deadKept (concatList xs fv) (fvE b))
+       Nil
+       (withBorrowed Nil (withSelf Nothing ce)))
+    Ret
+    b
+
+lamLines : Int -> List String -> List String -> List String -> List String -> List String
+lamLines k xs fv dead body =
+  concatList
+    (Cons ("static V lam_" ++ showInt k ++ "(V self, V *args) {") Nil)
+    (concatList
+       (zipWith
+          (\x i -> "  V " ++ cLocal x ++ " = args[" ++ showInt i ++ "];")
+          xs
+          (range 0 (length xs - 1)))
+       (concatList
+          (zipWith
+             (\x i ->
+                "  V " ++ cLocal x ++ " = heff_dup(heff_env(self)[" ++ showInt i ++ "]);")
+             fv
+             (range 0 (length fv - 1)))
+          (concatList
+             (Cons "  heff_drop(self);" Nil)
+             (concatList
+                (map (\l -> "  " ++ l) (dropLines dead))
+                (concatList (map (\l -> "  " ++ l) body) (Cons "}" Nil))))))
+
+-- (a lambda's closure: made with what it holds, or, holding nothing, one
+-- of its own, static and immortal -- made once, not at each use)
+lamProto : Int -> Int -> List String -> String
+lamProto k n fv =
+  if null fv
+    then "static V lam_"
+    ++ showInt k
+    ++ "(V self, V *args); static Clo lam_"
+    ++ showInt k
+    ++ "_clo = {{0x80000000u, K_CLO, 0}, lam_"
+    ++ showInt k
+    ++ ", "
+    ++ showInt n
+    ++ ", 0};"
+  else "static V lam_" ++ showInt k ++ "(V self, V *args);"
+
+lamWith : CK -> CE -> List String -> List String -> I.Expr -> List String -> C String
+lamWith r ce live xs b fv = do
+  k <- newLam
+  body <- lamBody r ce xs b fv
+  u <-
+    addLam
+        (lamProto k (length xs) fv)
+        (joinWith "\n" (lamLines k xs fv (deadIn xs (fvE b)) body))
+  pure
+      (if null fv then "((V)&lam_" ++ showInt k ++ "_clo)"
+       else "heff_clo(lam_"
+       ++ showInt k
+       ++ ", "
+       ++ showInt (length xs)
+       ++ ", "
+       ++ showInt (length fv)
+       ++ ", "
+       ++ argsArr (map (varUse ce.borrowed live) fv)
+       ++ ")")
+
+lamVal : CK -> CE -> List String -> List String -> I.Expr -> C String
+lamVal r ce live xs b = lamWith r ce live xs b (freeOf xs b)
+
+-- (the primitive a tag built in a kept cell is, while emitting: see
+-- `reusing`)
+reusePrim : String
+reusePrim = "$reuse"
+
+reuseVal : CK -> CE -> List String -> List I.Expr -> C String
+reuseVal r ce live (Cons ru (Cons (ETag t as) Nil)) = do
+  vs <- operandsF r ce live (Cons ru as)
+  pure
+      ("heff_tag_at("
+       ++ fromMaybe "0" (head vs)
+       ++ ", "
+       ++ tagName t
+       ++ ", "
+       ++ showInt (length as)
+       ++ ", "
+       ++ argsArr (drop 1 vs)
+       ++ ")")
+reuseVal r ce live _ = pure "0"
+
+valF : CK -> CE -> List String -> I.Expr -> C String
+valF r ce live (EVar x) = pure (varUse ce.borrowed live x)
+valF r ce live (EGlobal g) =
+  pure
+    (if M.member compareString g ce.funs then "((V)&" ++ cGlobal g ++ "_clo)"
+     else "heff_dup(" ++ cGlobal g ++ "_get())")
+valF r ce live (EInt n) = pure (intLit n)
+valF r ce live (EFloat x) = pure (floatLit x)
+valF r ce live (EStr s) = strLit s
+valF r ce live (ETag t as) =
+  if null as then pure ("NTAG(" ++ tagName t ++ ")")
+  else do
+    vs <- operandsF r ce live as
+    pure
+        ("heff_tag("
+         ++ tagName t
+         ++ ", "
+         ++ showInt (length as)
+         ++ ", "
+         ++ argsArr vs
+         ++ ")")
+valF r ce live (ERecord fs) = do
+  vs <- operandsF r ce live (map snd fs)
+  shape <- shapeLit (map (\p -> lblOf ce (fst p)) fs)
+  pure
+      ("heff_rec(" ++ showInt (length fs) ++ ", " ++ shape ++ ", " ++ argsArr vs ++ ")")
+valF r ce live (EProj e l) = do
+  v <- r.val ce live e
+  pure ("heff_get(" ++ v ++ ", " ++ lblName l ++ ")")
+valF r ce live (EPrim p) = primLit p
+valF r ce live (EPrimCall p as) =
+  if strEq p reusePrim then reuseVal r ce live as
+  else do
+    vs <- operandsF r ce live as
+    pure (primName p ++ "(" ++ joinWith ", " vs ++ ")")
+valF r ce live (ELam xs b) = lamVal r ce live xs b
+valF r ce live EAbandon = pure "heff_abandon()"
+valF r ce live e = r.comp ce live e
+
+-- | a computation not last: its value, through any bounces
+compF : CK -> CE -> List String -> I.Expr -> C String
+compF r ce live (EApp f as) = do
+  vs <- operandsF r ce live (Cons f as)
+  pure
+      ("heff_tr(heff_apply("
+       ++ fromMaybe "0" (head vs)
+       ++ ", "
+       ++ showInt (length as)
+       ++ ", "
+       ++ argsArr (drop 1 vs)
+       ++ "))")
+compF r ce live (ECall g as) = do
+  ls <- lentOperands r ce live (borOf ce.bor g) 0 as
+  pure (callText g (M.member compareString g ce.bounce) ls)
+compF r ce live e = r.val ce live e
+
+-- (a value to where it goes)
+toDest : Dest -> String -> List String
+toDest Ret v = Cons ("return " ++ v ++ ";") Nil
+toDest (Asg x) v = Cons (x ++ " = " ++ v ++ ";") Nil
+
+isSelfCall : CE -> String -> List I.Expr -> Bool
+isSelfCall ce g as = case ce.self of
+  Just s -> strEq s.key g && length s.params == length as
+  Nothing -> False
+
+-- (the loop again: the arguments, then the parameters)
+again : CE -> List String -> List String
+again ce vs = case ce.self of
+  Just s ->
+    concatList
+      (zipWith
+         (\v i -> "V t_" ++ showInt i ++ " = " ++ v ++ ";")
+         vs
+         (range 0 (length vs - 1)))
+      (concatList
+         (zipWith
+            (\p i -> cLocal p ++ " = t_" ++ showInt i ++ ";")
+            s.params
+            (range 0 (length vs - 1)))
+         (Cons "goto top;" Nil))
+  Nothing -> Nil
+
+-- (the scrutinee, a variable held, given up on an arm that does not want
+-- it and has fields: `fb` what the arm wants)
+takenFv : CE -> Maybe String -> List String -> List String -> Maybe String
+takenFv ce Nothing vs fb = Nothing
+takenFv ce (Just x) vs fb =
+  if not (null vs) && length vs <= 60 && not (elemS x fb) && not (elemS x ce.after)
+    then Just x
+  else Nothing
+
+maybeList : Maybe String -> List String
+maybeList Nothing = Nil
+maybeList (Just x) = Cons x Nil
+
+-- (a field the arm wants: its own reference, or, the scrutinee given
+-- up or lent, the scrutinee's, taken over or lent)
+fieldLine : String -> Bool -> List String -> Pair String Int -> List String
+fieldLine sv plain used (MkPair v i) =
+  if elemS v used
+    then Cons
+        ("  V "
+         ++ cLocal v
+         ++ " = "
+         ++ (if plain then "heff_field(" ++ sv ++ ", " ++ showInt i ++ ")"
+             else "heff_dup(heff_field(" ++ sv ++ ", " ++ showInt i ++ "))")
+         ++ ";")
+        Nil
+  else Nil
+
+isJustS : Maybe String -> Bool
+isJustS (Just _) = True
+isJustS Nothing = False
+
+-- (the fields an arm holds a reference to: those it wants, unless lent)
+fieldsHeld : Bool -> List String -> List String -> List String
+fieldsHeld True vs fb = Nil
+fieldsHeld False vs fb = filter (\v -> elemS v fb) vs
+
+pow2 : Int -> Int
+pow2 0 = 1
+pow2 n = 2 * pow2 (n - 1)
+
+fieldMask : List String -> Int -> List String -> Int
+fieldMask used i Nil = 0
+fieldMask used i (Cons v vs) =
+  (if elemS v used then pow2 i else 0) + fieldMask used (i + 1) vs
+
+isNothingS : Maybe String -> Bool
+isNothingS Nothing = True
+isNothingS (Just _) = False
+
+takeLines : String -> Maybe String -> List String -> List String -> List String
+takeLines sv Nothing vs used = Nil
+takeLines sv (Just _) vs used =
+  Cons ("heff_take(" ++ sv ++ ", " ++ showInt (fieldMask used 0 vs) ++ "ULL);") Nil
+
+-- (operands, the first that builds a tag of `n` fields in the kept cell)
+argDone : List I.Expr -> Pair Bool I.Expr -> Pair Bool (List I.Expr)
+argDone done (MkPair b e) = MkPair b (concatList done (Cons e Nil))
+
+reuseArgs : (I.Expr -> Pair Bool I.Expr) -> List I.Expr -> Pair Bool (List I.Expr)
+reuseArgs go es =
+  foldl
+    (\acc e ->
+       if fst acc then MkPair True (concatList (snd acc) (Cons e Nil))
+       else argDone (snd acc) (go e))
+    (MkPair False Nil)
+    es
+
+withArgs : (List I.Expr -> I.Expr) -> Pair Bool (List I.Expr) -> Pair Bool I.Expr
+withArgs f (MkPair b es) = MkPair b (f es)
+
+onePair : Pair Bool I.Expr -> Pair Bool (List I.Expr)
+onePair (MkPair b e) = MkPair b (Cons e Nil)
+
+-- (`let x = a in b`: the cell kept used in `a`, or else in `b`)
+letReuse : (I.Expr -> Pair Bool I.Expr) -> String -> I.Expr -> I.Expr -> Pair Bool I.Expr -> Pair Bool I.Expr
+letReuse go x a b (MkPair True a2) = MkPair True (ELet x a2 b)
+letReuse go x a b (MkPair False _) =
+  withArgs (\es -> ELet x a (fromMaybe b (head es))) (onePair (go b))
+
+armReuse : I.Arm -> Pair Bool I.Expr -> Pair Bool I.Arm
+armReuse (MkArm t vs _) (MkPair r b) = MkPair r (MkArm t vs b)
+
+matchReuse : I.Expr -> List (Pair Bool I.Arm) -> Pair Bool I.Expr
+matchReuse s ps = MkPair (any fst ps) (EMatch s (map snd ps))
+
+-- (the first tag of `n` fields built on each path, not in a lambda, built
+-- in the cell `ru` kept: whether one is)
+reuseIn : String -> Int -> I.Expr -> Pair Bool I.Expr
+reuseIn ru n (ETag t as) =
+  if length as == n
+    then MkPair True (EPrimCall reusePrim (Cons (EVar ru) (Cons (ETag t as) Nil)))
+  else withArgs (\es -> ETag t es) (reuseArgs (reuseIn ru n) as)
+reuseIn ru n (ECall g as) = withArgs (\es -> ECall g es) (reuseArgs (reuseIn ru n) as)
+reuseIn ru n (ELet x a b) = letReuse (reuseIn ru n) x a b (reuseIn ru n a)
+reuseIn ru n (EMatch s arms) =
+  matchReuse s (map (\a -> armReuse a (reuseIn ru n (I.armBody a))) arms)
+reuseIn ru n e = MkPair False e
+
+-- (an arm whose scrutinee is given up: its cell kept, `ru`, where the
+-- arm builds a tag of its size -- the body, so built)
+reusing : Maybe String -> String -> List String -> I.Expr -> Pair (Maybe String) I.Expr
+reusing Nothing t vs b = MkPair Nothing b
+reusing (Just x) t vs b = case reuseIn ("ru$" ++ x ++ "$" ++ t) (length vs) b of
+  MkPair True b2 -> MkPair (Just ("ru$" ++ x ++ "$" ++ t)) b2
+  MkPair False _ -> MkPair Nothing b
+
+takeKept : String -> Maybe String -> List String -> List String -> List String
+takeKept sv (Just ru) vs used =
+  Cons
+    ("V "
+     ++ cLocal ru
+     ++ " = heff_take_reuse("
+     ++ sv
+     ++ ", "
+     ++ showInt (fieldMask used 0 vs)
+     ++ "ULL);")
+    Nil
+takeKept sv Nothing vs used = Nil
+
+-- (an arm: the fields it wants, a reference to each; what is held and
+-- not wanted on it, dropped.  The scrutinee held and not wanted on it is
+-- given up at once (`heff_take`): its last reference, its shell freed and
+-- the fields not wanted dropped -- no field counted up and then down)
+armKept : CK
+        -> CE
+        -> Dest
+        -> String
+        -> Maybe String
+        -> Bool
+        -> String
+        -> List String
+        -> I.Expr
+        -> List String
+        -> Pair (Maybe String) I.Expr
+        -> C (List String)
+armKept r ce dest sv taken lent t vs b fb (MkPair ru b2) = do
+  body <-
+    r.stmts
+        (withPath
+           (deadKept
+              (concatList ce.owned (concatList (fieldsHeld lent vs fb) (maybeList ru)))
+              (unionS (concatList fb (maybeList ru)) ce.after))
+           ce.after
+           (withBorrowed (if lent then concatList vs ce.borrowed else ce.borrowed) ce))
+        dest
+        b2
+  pure
+      (concatList
+         (Cons ("case " ++ tagName t ++ ": {") Nil)
+         (concatList
+            (concatMap
+               (fieldLine sv (lent || isJustS taken) fb)
+               (zipWith (\v i -> MkPair v i) vs (range 0 (length vs - 1))))
+            (concatList
+               (map
+                  (\l -> "  " ++ l)
+                  (concatList
+                     (if isNothingS ru then takeLines sv taken vs fb
+                      else takeKept sv ru vs fb)
+                     (dropLines
+                        (filter
+                           (\v -> not (elemS v (maybeList taken)))
+                           (deadIn
+                              (concatList ce.owned (fieldsHeld lent vs fb))
+                              (unionS fb ce.after))))))
+               (concatList
+                  (map (\l -> "  " ++ l) body)
+                  (concatList
+                     (case dest of
+                      Ret -> Nil
+                      Asg _ -> Cons "  break;" Nil)
+                     (Cons "}" Nil))))))
+
+armTaken : CK
+         -> CE
+         -> Dest
+         -> String
+         -> Bool
+         -> String
+         -> List String
+         -> I.Expr
+         -> List String
+         -> Maybe String
+         -> C (List String)
+armTaken r ce dest sv lent t vs b fb taken =
+  armKept r ce dest sv taken lent t vs b fb (reusing taken t vs b)
+
+armFv : CK
+      -> CE
+      -> Dest
+      -> String
+      -> Maybe String
+      -> Bool
+      -> String
+      -> List String
+      -> I.Expr
+      -> List String
+      -> C (List String)
+armFv r ce dest sv held lent t vs b fb =
+  armTaken r ce dest sv lent t vs b fb (takenFv ce held vs fb)
+
+armLines : CK -> CE -> Dest -> String -> Maybe String -> Bool -> I.Arm -> C (List String)
+armLines r ce dest sv held lent (MkArm t vs b) =
+  armFv r ce dest sv held lent t vs b (fvE b)
+
+nomatchLine : Dest -> String -> String
+nomatchLine Ret sv = "default: return heff_nomatch(" ++ sv ++ ");"
+nomatchLine (Asg _) sv = "default: heff_nomatch(" ++ sv ++ ");"
+
+-- (the variable a match looks at, if it holds a reference to it)
+heldVar : CE -> I.Expr -> Maybe String
+heldVar ce (EVar x) = if elemS x ce.owned then Just x else Nothing
+heldVar ce _ = Nothing
+
+-- (whether a match looks at a variable lent)
+lentScrut : CE -> I.Expr -> Bool
+lentScrut ce (EVar x) = elemS x ce.borrowed
+lentScrut ce _ = False
+
+-- (what a match looks at: looked at, not consumed)
+scrutF : CK -> CE -> I.Expr -> C String
+scrutF r ce (EVar x) = pure (cLocal x)
+scrutF r ce (EGlobal g) =
+  pure
+    (if M.member compareString g ce.funs then "((V)&" ++ cGlobal g ++ "_clo)"
+     else cGlobal g ++ "_get()")
+scrutF r ce e = r.val ce Nil e
+
+-- (what is bound to `x`: a match or a binding, as statements, held what
+-- is held, wanted after it what is `after`)
+bindTo : CK -> CE -> String -> I.Expr -> C (List String)
+bindTo r ce x (EMatch s arms) = do
+  ls <- r.stmts ce (Asg (cLocal x)) (EMatch s arms)
+  pure (Cons ("V " ++ cLocal x ++ ";") ls)
+bindTo r ce x (ELet y a b) = do
+  ls <- r.stmts ce (Asg (cLocal x)) (ELet y a b)
+  pure (Cons ("V " ++ cLocal x ++ ";") ls)
+bindTo r ce x a = do
+  v <- r.comp ce ce.after a
+  pure (Cons ("V " ++ cLocal x ++ " = " ++ v ++ ";") Nil)
+
+-- (`let x = a in b`: what is held and wanted neither by `a` nor after it
+-- dropped first; then `a`, wanted after it what `b` and what comes after
+-- want; then `x`, dropped if nothing wants it)
+-- (`fa` what `a` wants, `wb` what `b` and what comes after want: each
+-- reckoned once)
+letWith : CK
+        -> CE
+        -> Dest
+        -> String
+        -> I.Expr
+        -> I.Expr
+        -> List String
+        -> List String
+        -> C (List String)
+letWith r ce dest x a b fa wb = do
+  la <- bindTo r (withPath (deadKept ce.owned (unionS fa wb)) wb ce) x a
+  rest <-
+    r.stmts
+        (withPath
+           (concatList (deadKept ce.owned wb) (if elemS x wb then Cons x Nil else Nil))
+           ce.after
+           ce)
+        dest
+        b
+  pure
+      (concatList
+         (dropLines (deadIn ce.owned (unionS fa wb)))
+         (concatList
+            la
+            (concatList
+               (if elemS x wb then Nil else Cons ("heff_drop(" ++ cLocal x ++ ");") Nil)
+               rest)))
+
+letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
+letLines r ce dest x a b = letWith r ce dest x a b (fvE a) (unionS (fvE b) ce.after)
+
+stmtsF : CK -> CE -> Dest -> I.Expr -> C (List String)
+stmtsF r ce dest (ELet x a b) = letLines r ce dest x a b
+stmtsF r ce dest (EMatch s arms) = do
+  sv <- scrutF r ce s
+  as <- traverseC (armLines r ce dest sv (heldVar ce s) (lentScrut ce s)) arms
+  pure
+      (concatList
+         (Cons ("switch (heff_tag_of(" ++ sv ++ ")) {") Nil)
+         (concatList
+            (concatMap (\x -> x) as)
+            (Cons (nomatchLine dest sv) (Cons "}" Nil))))
+stmtsF r ce Ret (EApp f as) = do
+  vs <- operandsF r ce Nil (Cons f as)
+  pure
+      (Cons
+         ("return heff_tail("
+          ++ fromMaybe "0" (head vs)
+          ++ ", "
+          ++ showInt (length as)
+          ++ ", "
+          ++ argsArr (drop 1 vs)
+          ++ ");")
+         Nil)
+stmtsF r ce Ret (ECall g as) = do
+  ls <- lentOperands r ce Nil (borOf ce.bor g) 0 as
+  pure
+      (if isSelfCall ce g as && lentPlain ls
+         then again ce (map (\(l : Lent) -> l.arg) ls)
+       else Cons ("return " ++ callText g False ls ++ ";") Nil)
+stmtsF r ce Ret e = do
+  v <- r.comp ce Nil e
+  pure (toDest Ret v)
+stmtsF r ce (Asg x) e = do
+  v <- r.comp ce ce.after e
+  pure (toDest (Asg x) v)
+
+ck : CK
+ck =
+  { val = \ce live e -> valF ck ce live e
+  , comp = \ce live e -> compF ck ce live e
+  , stmts = \ce dest e -> stmtsF ck ce dest e
+  }
+
+-- Definitions
+--------------------------------------------------------------------------------
+
+paramList : List String -> String
+paramList xs = if null xs then "void" else joinWith ", " (map (\x -> "V " ++ cLocal x) xs)
+
+-- | a definition's prototypes, and its code
+type Emitted1 = { protos : List String, code : List String }
+
+-- (the parameters at the indices `bi`, or those not)
+paramsAt : Bool -> List Int -> List String -> List String
+paramsAt want bi xs =
+  map
+    fst
+    (filter
+       (\p -> if want then elemI (snd p) bi else not (elemI (snd p) bi))
+       (zipWith (\x i -> MkPair x i) xs (range 0 (length xs - 1))))
+
+-- (a closure's entry: the arguments given, those lent dropped after)
+entryCall : String -> List Int -> Int -> String
+entryCall key bi n =
+  if null bi
+    then "  return "
+    ++ cGlobal key
+    ++ "("
+    ++ joinWith ", " (map (\i -> "a[" ++ showInt i ++ "]") (range 0 (n - 1)))
+    ++ ");"
+  else "  V r = "
+  ++ cGlobal key
+  ++ "("
+  ++ joinWith ", " (map (\i -> "a[" ++ showInt i ++ "]") (range 0 (n - 1)))
+  ++ "); "
+  ++ joinWith " " (map (\i -> "heff_drop(a[" ++ showInt i ++ "]);") bi)
+  ++ " return r;"
+
+funDef : CE -> I.Def -> List String -> I.Expr -> C Emitted1
+funDef ce d xs b = do
+  body <-
+    ck.stmts
+        (withPath
+           (deadKept (paramsAt False (borOf ce.bor d.key) xs) (fvE b))
+           Nil
+           (withBorrowed
+              (paramsAt True (borOf ce.bor d.key) xs)
+              (withSelf (Just { key = d.key, params = xs }) ce)))
+        Ret
+        b
+  pure
+      { protos =
+          [ "static V " ++ cGlobal d.key ++ "(" ++ paramList xs ++ ");"
+          , "static V " ++ cGlobal d.key ++ "_entry(V self, V *a);"
+          , "static Clo "
+          ++ cGlobal d.key
+          ++ "_clo = {{0x80000000u, K_CLO, 0}, "
+          ++ cGlobal d.key
+          ++ "_entry, "
+          ++ showInt (length xs)
+          ++ ", 0};"
+          ]
+      , code =
+          concatList
+            [ ""
+            , "static V " ++ cGlobal d.key ++ "(" ++ paramList xs ++ ") {"
+            , "top: ;"
+            ]
+            (concatList
+               (map
+                  (\l -> "  " ++ l)
+                  (dropLines (deadIn (paramsAt False (borOf ce.bor d.key) xs) (fvE b))))
+               (concatList
+                  (map (\l -> "  " ++ l) body)
+                  [ "}"
+                  , "static V " ++ cGlobal d.key ++ "_entry(V self, V *a) {"
+                  , "  (void)self;"
+                  , entryCall d.key (borOf ce.bor d.key) (length xs)
+                  , "}"
+                  ]))
+      }
+
+valDef : CE -> I.Def -> C Emitted1
+valDef ce d = do
+  body <- ck.stmts (withPath Nil Nil (withSelf Nothing ce)) Ret d.body
+  pure
+      { protos = Cons ("static V " ++ cGlobal d.key ++ "_get(void);") Nil
+      , code =
+          concatList
+            [ ""
+            , "static V " ++ cGlobal d.key ++ "_val;"
+            , "static int " ++ cGlobal d.key ++ "_st;"
+            , "static V " ++ cGlobal d.key ++ "_init(void) {"
+            ]
+            (concatList
+               (map (\l -> "  " ++ l) body)
+               [ "}"
+               , "static V " ++ cGlobal d.key ++ "_get(void) {"
+               , "  if (" ++ cGlobal d.key ++ "_st == 2) return " ++ cGlobal d.key ++ "_val;"
+               , "  if ("
+               ++ cGlobal d.key
+               ++ "_st == 1) heff_fail(\"defined by itself\");"
+               , "  " ++ cGlobal d.key ++ "_st = 1;"
+               , "  " ++ cGlobal d.key ++ "_val = heff_tr(" ++ cGlobal d.key ++ "_init());"
+               , "  " ++ cGlobal d.key ++ "_st = 2;"
+               , "  return " ++ cGlobal d.key ++ "_val;"
+               , "}"
+               ])
+      }
+
+defC : CE -> I.Def -> C Emitted1
+defC ce d = case d.body of
+  ELam xs b -> funDef ce d xs b
+  _ -> valDef ce d
+
+-- The world's algebra
+--------------------------------------------------------------------------------
+
+-- (each node of the effect's sum, a function handing an operation on:
+-- `InL` to the left, `InR` to the right, a leaf to its provider)
+-- (a sum: its left's nodes `la`, from `n + 1` to `na`, then its right's)
+plusDone : Int -> List String -> Int -> Pair (List String) Int -> Pair (List String) Int
+plusDone n la na (MkPair lb nb) =
+  MkPair
+    (concatList
+       la
+       (concatList
+          lb
+          [ "static V heff_perform_"
+            ++ showInt n
+            ++ "(V p, V k) { int l = heff_tag_of(p) == TAG_InL; V q = heff_dup(heff_field(p, 0)); heff_drop(p); return l ? heff_perform_"
+            ++ showInt (n + 1)
+            ++ "(q, k) : heff_perform_"
+            ++ showInt na
+            ++ "(q, k); }"
+          ]))
+    nb
+
+plusNodes : (Ef.Effect -> Int -> Pair (List String) Int)
+          -> Int
+          -> Ef.Effect
+          -> Pair (List String) Int
+          -> Pair (List String) Int
+plusNodes go n b (MkPair la na) = plusDone n la na (go b na)
+
+performNodes : Ef.Effect -> Int -> Pair (List String) Int
+performNodes (Leaf k) n =
+  MkPair
+    [ "static V heff_perform_"
+      ++ showInt n
+      ++ "(V p, V k) { return heff_provider_"
+      ++ Ef.nameOfKey k
+      ++ "(p, k); }"
+    ]
+    (n + 1)
+performNodes (Plus a b) n = plusNodes performNodes n b (performNodes a (n + 1))
+
+performCode : Ef.Effect -> List String
+performCode eff =
+  concatList
+    (fst (performNodes eff 0))
+    [ "static V heff_perform(V p, V k) { return heff_perform_0(p, k); }" ]
+
+-- The program
+--------------------------------------------------------------------------------
+
+primCloDef : String -> List String
+primCloDef p = case Pr.primArity p of
+  Just n ->
+    [ "static V prim_"
+      ++ p
+      ++ "_entry(V self, V *a) { (void)self; return "
+      ++ primName p
+      ++ "("
+      ++ joinWith ", " (map (\i -> "a[" ++ showInt i ++ "]") (range 0 (n - 1)))
+      ++ "); }"
+    , "static Clo prim_"
+      ++ p
+      ++ "_clo = {{0x80000000u, K_CLO, 0}, prim_"
+      ++ p
+      ++ "_entry, "
+      ++ showInt n
+      ++ ", 0};"
+    ]
+  Nothing -> Nil
+
+shapeDef : String -> String
+shapeDef key =
+  "static uint32_t shape_" ++ key ++ "[] = {" ++ joinWith ", " (split "_" key) ++ "};"
+
+defsC : CE -> List I.Def -> C (List Emitted1)
+defsC ce defs = traverseC (defC ce) defs
+
+emptyCS : CS
+emptyCS =
+  { nlam = 0
+  , lams = Nil
+  , protos = Nil
+  , nstr = 0
+  , strs = Nil
+  , shapes = Nil
+  , prims = Nil
+  }
+
+arityOne : M.Map String Int -> I.Def -> M.Map String Int
+arityOne m d = case d.body of
+  ELam xs _ -> M.insert compareString d.key (length xs) m
+  _ -> m
+
+-- | the names of what is numbered, in order (`heff_show`'s)
+namesTable : String -> M.Map String Int -> List String
+namesTable name m =
+  [ "static const char *"
+    ++ name
+    ++ "[] = {"
+    ++ joinWith
+      ", "
+      (map
+         (\p -> "\"" ++ fst p ++ "\"")
+         (sortBy (\a b -> snd a <= snd b) (M.toList m)))
+    ++ "};"
+  ]
+
+-- | how the program ends: its entry, run; or (`checkEnd`) each of the
+-- | file's definitions, by its name, shown
+type Ending = { prefix : List String, end : CE -> List String }
+
+runEnd : Ef.Effect -> CE -> List String
+runEnd eff ce =
+  concatList
+    (performCode eff)
+    [ ""
+    , "static V heff_entry(void) { return " ++ cGlobal L.entryKey ++ "_get(); }"
+    , ""
+    ]
+
+-- (a definition's value, as a getter: a function's is its closure)
+globalGet : CE -> Pair String String -> List String
+globalGet ce (MkPair name key) =
+  if M.member compareString key ce.funs
+    then [ "static V gget_" ++ mangle key ++ "(void) { return (V)&" ++ cGlobal key ++ "_clo; }" ]
+  else Nil
+
+getterOf : CE -> String -> String
+getterOf ce key =
+  if M.member compareString key ce.funs then "gget_" ++ mangle key
+  else cGlobal key ++ "_get"
+
+definedIn : List I.Def -> String -> Bool
+definedIn defs key = any (\(d : I.Def) -> strEq d.key key) defs
+
+checkEnd : List (Pair String String) -> List I.Def -> CE -> List String
+checkEnd exports defs ce =
+  concatList
+    [ "static V heff_perform(V p, V k) { (void)p; (void)k; return heff_abandon(); }" ]
+    (concatList
+       (concatMap (globalGet ce) (filter (\p -> definedIn defs (snd p)) exports))
+       (concatList
+          (namesTable "heff_tag_names_arr" ce.tags)
+          (concatList
+             (namesTable "heff_lbl_names_arr" ce.lbls)
+             [ "static const Global heff_globals_arr[] = {"
+               ++ joinWith
+                 ", "
+                 (map
+                    (\p -> "{\"" ++ fst p ++ "\", " ++ getterOf ce (snd p) ++ "}")
+                    (filter (\p -> definedIn defs (snd p)) exports))
+               ++ (if null (filter (\p -> definedIn defs (snd p)) exports) then "{NULL, NULL}" else "")
+               ++ "};"
+             , "static void heff_check_init(void) {"
+             , "  heff_globals = heff_globals_arr;"
+             , "  heff_nglobals = "
+               ++ showInt (length (filter (\p -> definedIn defs (snd p)) exports))
+               ++ ";"
+             , "  heff_tag_names = heff_tag_names_arr;"
+             , "  heff_lbl_names = heff_lbl_names_arr;"
+             , "}"
+             , ""
+             ])))
+
+-- Borrowing
+--------------------------------------------------------------------------------
+
+-- A function's parameter is lent, not given (borrowed), where the
+-- function only looks at it: matches on it, or lends it on to a call's
+-- borrowed parameter -- the fields a match on it binds are then lent
+-- too.  The caller keeps its reference; the callee counts none.  A
+-- parameter one of whose matches builds a tag of the matched one's size
+-- stays given (its cell is reused there), and so does one a loop (a call
+-- of itself) would be given a value held.  Every parameter is lent at
+-- first; what is not is taken away until nothing changes.
+
+isVar : String -> I.Expr -> Bool
+isVar p (EVar x) = strEq p x
+isVar p _ = False
+
+indexedE : List I.Expr -> List (Pair I.Expr Int)
+indexedE es = zipWith (\e i -> MkPair e i) es (range 0 (length es - 1))
+
+-- (each use of `p` in it only looked at or lent)
+onlyLent : M.Map String (List Int) -> String -> I.Expr -> Bool
+onlyLent bor p (EVar x) = not (strEq p x)
+onlyLent bor p (EMatch s arms) =
+  (isVar p s || onlyLent bor p s) && all (\a -> onlyLent bor p (I.armBody a)) arms
+onlyLent bor p (ECall g as) =
+  all
+    (\pr -> (isVar p (fst pr) && elemI (snd pr) (borOf bor g)) || onlyLent bor p (fst pr))
+    (indexedE as)
+onlyLent bor p (ELam _ b) = onlyLent bor p b
+onlyLent bor p (EApp f as) = all (onlyLent bor p) (Cons f as)
+onlyLent bor p (ELet _ a b) = onlyLent bor p a && onlyLent bor p b
+onlyLent bor p (ERecord fs) = all (\f -> onlyLent bor p (snd f)) fs
+onlyLent bor p (EProj e _) = onlyLent bor p e
+onlyLent bor p (ETag _ as) = all (onlyLent bor p) as
+onlyLent bor p (EPrimCall _ as) = all (onlyLent bor p) as
+onlyLent bor p _ = True
+
+-- (whether it builds a tag of `n` fields)
+buildsSize : Int -> I.Expr -> Bool
+buildsSize n (ETag _ as) = length as == n || any (buildsSize n) as
+buildsSize n (ELam _ b) = buildsSize n b
+buildsSize n (EApp f as) = any (buildsSize n) (Cons f as)
+buildsSize n (ELet _ a b) = buildsSize n a || buildsSize n b
+buildsSize n (ERecord fs) = any (\f -> buildsSize n (snd f)) fs
+buildsSize n (EProj e _) = buildsSize n e
+buildsSize n (EMatch s arms) = buildsSize n s || any (\a -> buildsSize n (I.armBody a)) arms
+buildsSize n (ECall _ as) = any (buildsSize n) as
+buildsSize n (EPrimCall _ as) = any (buildsSize n) as
+buildsSize n _ = False
+
+armReuses : I.Arm -> Bool
+armReuses (MkArm _ vs b) = not (null vs) && buildsSize (length vs) b
+
+-- (whether a match on `p` may reuse its cell)
+reuses : String -> I.Expr -> Bool
+reuses p (EMatch s arms) =
+  (isVar p s && any armReuses arms) || reuses p s || any (\a -> reuses p (I.armBody a)) arms
+reuses p (ELam _ b) = reuses p b
+reuses p (EApp f as) = any (reuses p) (Cons f as)
+reuses p (ELet _ a b) = reuses p a || reuses p b
+reuses p (ERecord fs) = any (\f -> reuses p (snd f)) fs
+reuses p (EProj e _) = reuses p e
+reuses p (ETag _ as) = any (reuses p) as
+reuses p (ECall _ as) = any (reuses p) as
+reuses p (EPrimCall _ as) = any (reuses p) as
+reuses p _ = False
+
+scrutLent : List String -> I.Expr -> Bool
+scrutLent ds (EVar x) = elemS x ds
+scrutLent ds _ = False
+
+-- (the variables lent with `ds`: the fields of matches on them)
+lentVars : List String -> I.Expr -> List String
+lentVars ds (EMatch s arms) =
+  concatMap
+    (\a ->
+       if scrutLent ds s
+         then concatList (I.armVars a) (lentVars (concatList (I.armVars a) ds) (I.armBody a))
+       else lentVars ds (I.armBody a))
+    arms
+lentVars ds (ELet _ a b) = concatList (lentVars ds a) (lentVars ds b)
+lentVars ds _ = Nil
+
+-- (each call of `key` given at `i` one of `ds`)
+loopLent : String -> Int -> List String -> I.Expr -> Bool
+loopLent key i ds (ECall g as) =
+  (not (strEq g key)
+   || all (\pr -> not (snd pr == i) || any (\d -> isVar d (fst pr)) ds) (indexedE as))
+  && all (loopLent key i ds) as
+loopLent key i ds (EMatch s arms) =
+  loopLent key i ds s && all (\a -> loopLent key i ds (I.armBody a)) arms
+loopLent key i ds (ELet _ a b) = loopLent key i ds a && loopLent key i ds b
+loopLent key i ds (ETag _ as) = all (loopLent key i ds) as
+loopLent key i ds (EApp f as) = all (loopLent key i ds) (Cons f as)
+loopLent key i ds _ = True
+
+lentAt : M.Map String (List Int) -> String -> List String -> I.Expr -> List String -> Int -> Bool
+lentAt bor key xs b ds i = case drop i xs of
+  Cons p _ -> onlyLent bor p b && not (reuses p b) && loopLent key i ds b
+  Nil -> False
+
+borDef : M.Map String (List Int) -> I.Def -> M.Map String (List Int)
+borDef bor d = case d.body of
+  ELam xs b ->
+    M.insert
+      compareString
+      d.key
+      (filter
+         (lentAt
+            bor
+            d.key
+            xs
+            b
+            (concatList
+               (paramsAt True (borOf bor d.key) xs)
+               (lentVars (paramsAt True (borOf bor d.key) xs) b)))
+         (borOf bor d.key))
+      bor
+  _ -> bor
+
+borSize : M.Map String (List Int) -> Int
+borSize bor = sum (map (\p -> length (snd p)) (M.toList bor))
+
+-- (again until no parameter is taken away: `size` how many were lent)
+borFix : List I.Def -> Int -> M.Map String (List Int) -> M.Map String (List Int)
+borFix defs size bor =
+  if borSize bor == size then bor else borFix defs (borSize bor) (foldl borDef bor defs)
+
+borAll : M.Map String (List Int) -> I.Def -> M.Map String (List Int)
+borAll m d = case d.body of
+  ELam xs _ -> M.insert compareString d.key (range 0 (length xs - 1)) m
+  _ -> m
+
+-- | each function's borrowed parameters, by index
+borrowing : List I.Def -> M.Map String (List Int)
+borrowing defs = borFix defs (0 - 1) (foldl borAll M.empty defs)
+
+programCE : String -> List Em.Provider -> Ending -> List I.Def -> CE -> String
+programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
+  MkPair ems s ->
+    joinWith
+      "\n"
+      (concatList
+         (Cons "// Generated from Hippogriff; do not edit." ending.prefix)
+         (concatList
+            (map
+               (\p -> "#define " ++ tagName (fst p) ++ " " ++ showInt (snd p))
+               (filter
+                  (\p -> not (elemS (fst p) knownTags))
+                  (M.toList ce.tags)))
+            (concatList
+               (map
+                  (\p -> "#define " ++ lblName (fst p) ++ " " ++ showInt (snd p))
+                  (M.toList ce.lbls))
+               (concatList
+                  (Cons runtime Nil)
+                  (concatList
+                     (map (\(p : Em.Provider) -> p.text) provs)
+                     (concatList
+                        (Cons "static V heff_perform(V p, V k);" Nil)
+                        (concatList
+                           (reverse s.strs)
+                           (concatList
+                              (map shapeDef (reverse s.shapes))
+                              (concatList
+                                 (concatMap (\(e : Emitted1) -> e.protos) ems)
+                                 (concatList
+                                    (reverse s.protos)
+                                    (concatList
+                                       (concatMap primCloDef (reverse s.prims))
+                                       (concatList
+                                          (concatMap (\(e : Emitted1) -> e.code) ems)
+                                          (concatList
+                                             (reverse s.lams)
+                                             (ending.end ce))))))))))))))
+
+-- (each once, in order: through a map, not a list searched)
+sortedOnce : List String -> List String
+sortedOnce xs =
+  map fst (M.toList (foldl (\m x -> M.insert compareString x (MkUnit : Unit) m) M.empty xs))
+
+programWith : String
+            -> List Em.Provider
+            -> Ending
+            -> List I.Def
+            -> Pair (List String) (List String)
+            -> String
+programWith runtime provs ending defs names =
+  programCE
+    runtime
+    provs
+    ending
+    defs
+    { tags =
+        numbered
+          0
+          (concatList
+             knownTags
+             (concatList
+                (fst names)
+                (concatMap (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil) provs)))
+          M.empty
+    , lbls =
+        numbered
+          0
+          (sortedOnce
+             (concatList
+                (snd names)
+                (concatMap (\(p : Em.Provider) -> namesInGo "LBL_" p.text 0 Nil) provs)))
+          M.empty
+    , funs = foldl arityOne M.empty defs
+    , bounce = Em.bouncing defs
+    , self = Nothing
+    , owned = Nil
+    , after = Nil
+    , borrowed = Nil
+    , bor = borrowing defs
+    }
+
+-- | the program, its runtime and its providers before it
+programC : String -> List Em.Provider -> Ending -> List I.Def -> String
+programC runtime provs ending defs =
+  programWith
+    runtime
+    provs
+    ending
+    defs
+    (namesIn tagsLbls (map (\(d : I.Def) -> d.body) defs))
+
+outputOf : String -> List Em.Provider -> Ending -> L.Lowered -> Em.Output
+outputOf runtime provs ending l =
+  { source = programC runtime provs ending l.defs, errors = l.errors }
+
+checkOut : String -> List (Pair String String) -> L.Lowered -> Em.Output
+checkOut runtime exports l =
+  { source =
+      programC
+        runtime
+        Nil
+        { prefix = Cons "#define HEFF_CHECK" Nil, end = checkEnd exports l.defs }
+        l.defs
+  , errors = l.errors
+  }
+
+-- | one C file that runs the computation `key` of the effect `eff`: the
+-- | runtime (lib/c/runtime.c), each world's provider, and the program
+compileProgramC : String
+                -> List Em.Provider
+                -> G.Globals
+                -> String
+                -> Ef.Effect
+                -> Em.Output
+compileProgramC runtime provs g key eff =
+  outputOf
+    runtime
+    provs
+    { prefix = Nil, end = runEnd eff }
+    (L.lowerProgramAnf g key)
+
+-- | one C file that shows the definitions it is asked for, of those
+-- | given (each by its name and key), as test/load-js.mjs shows
+-- | JavaScript's: what the tests hold the backend to
+compileCheckC : String -> G.Globals -> List (Pair String String) -> Em.Output
+compileCheckC runtime g exports =
+  checkOut runtime exports (L.lowerAnf g (map snd exports))
+
+catMaybesC : {a : Type} -> List (Maybe a) -> List a
+catMaybesC Nil = Nil
+catMaybesC (Cons (Just x) rest) = Cons x (catMaybesC rest)
+catMaybesC (Cons Nothing rest) = catMaybesC rest
+
+-- | the effects a C provider provides: its `heff_provider_X` definitions
+providedNames : String -> List String
+providedNames text =
+  catMaybesC
+    (map
+       (\l ->
+          if startsWith "static V heff_provider_" l
+            then Just (identAt l 23 23)
+          else Nothing)
+       (lines text))
+
+-- >>> mangle "co.<+>"
+-- "co_2e_3c_2b_3e"
+
+-- >>> providedNames "static V heff_provider_stdio(V p, V k) {"
+-- ["stdio"]
