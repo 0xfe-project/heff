@@ -193,7 +193,7 @@ patIdents p = case Pm.nodeOf p of
   _ -> Nil
 
 -- | the names an expression has, as written: every name it uses or
--- | binds (a field's, set or declared, too; not under `{{x : T}}`)
+-- | binds (a field's, set or declared, too)
 type Idents = { e : Expr -> List String, decl : Decl -> List String }
 
 lamIdents : Idents -> LamBinder Expr -> List String
@@ -204,7 +204,7 @@ lamIdents r (LamAnn x _ t) = Cons x (r.e t)
 piIdents : Idents -> PiBinder Expr -> List String
 piIdents r (PiNamed x _ t) = Cons x (r.e t)
 piIdents r (PiImplicit x _ _ t) = Cons x (r.e t)
-piIdents r (PiInstance _ _ _ _) = Nil
+piIdents r (PiInstance x _ _ t) = Cons x (r.e t)
 piIdents r (PiAnon d) = r.e d
 
 altIdents : Idents -> Pm.Spanned (Alt Expr) -> List String
@@ -257,6 +257,7 @@ identsTermF r n = case Pm.nodeOf n of
   ELocal body ds -> appendC (r.e body) (concatMapC r.decl ds)
   ETuple es -> concatMapC r.e es
   EBrace e -> r.e e
+  EBracket e -> r.e e
   _ -> Nil
 
 identsDeclF : Idents -> Decl -> List String
@@ -287,98 +288,189 @@ fresh used x = if elemBy strEq x used then fresh used (x ++ "'") else x
 -- Renaming
 --------------------------------------------------------------------------------
 
-renameName : String -> String -> String -> String
-renameName x v y = if strEq y x then v else y
+-- | the variables a pattern binds (an operator is a tag, a field's name
+-- | a label: neither is bound)
+patBinds : Pat -> List String
+patBinds p = case Pm.nodeOf p of
+  PatVar x -> Cons x Nil
+  PatTag _ _ ps -> concatMapC (\m -> patBinds m) ps
+  PatOp _ _ ps -> concatMapC (\m -> patBinds m) ps
+  PatRecord fs ->
+    concatMapC
+      (\f -> case f of
+       MkFieldPat _ q -> patBinds q)
+      fs
+  _ -> Nil
 
--- | a pattern, `x` in it `v` (an operator's name, a field's, too)
-renamePat : String -> String -> Pat -> Pat
-renamePat x v p = case p of
-  At (PatVar y) sp -> At (PatVar (renameName x v y)) sp
-  At (PatTag t tsp ps) sp ->
-    At (PatTag t tsp (map (\m -> renamePat x v m) ps)) sp
-  At (PatOp y ysp ps) sp ->
-    At (PatOp (renameName x v y) ysp (map (\m -> renamePat x v m) ps)) sp
-  At (PatRecord fs) sp ->
-    At
-      (PatRecord
-         (map
-            (\f -> case f of
-             MkFieldPat y q -> MkFieldPat (renameName x v y) (renamePat x v q))
-            fs))
-      sp
-  _ -> p
+binds : String -> Pat -> Bool
+binds x p = elemBy strEq x (patBinds p)
 
--- | (`rename x v`, the knot) `p -> e`: `x` is `v` in `e`, unless `p` has
--- | the name `x`
+-- | `x` becomes `v` in each item, until one binds `x` again: `f` renames
+-- | an item, `b` says whether it binds `x` for those after it
+renameSeq : {a : Type} -> (a -> a) -> (a -> Bool) -> List a -> List a
+renameSeq f b Nil = Nil
+renameSeq f b (Cons m rest) =
+  Cons (f m) (if b m then rest else renameSeq f b rest)
+
+-- | (`rename x v`, the knot) `p -> e`: `x` is `v` in `e`, unless `p`
+-- | binds `x`
 renameAlt : (Expr -> Expr)
           -> String
           -> Pm.Spanned (Alt Expr)
           -> Pm.Spanned (Alt Expr)
 renameAlt rn x (At (MkAlt p b) sp) =
-  if elemBy strEq x (patIdents p) then At (MkAlt p b) sp else alt p (rn b)
+  if binds x p then At (MkAlt p b) sp else At (MkAlt p (rn b)) sp
 
-renamePi : (Expr -> Expr) -> String -> String -> PiBinder Expr -> PiBinder Expr
-renamePi rn x v (PiNamed y ysp t) = PiNamed (renameName x v y) ysp (rn t)
-renamePi rn x v (PiImplicit y ysp bsp t) =
-  PiImplicit (renameName x v y) ysp bsp (rn t)
-renamePi rn x v b = case b of
-  PiAnon d -> PiAnon (rn d)
-  _ -> b
+renameStmt : (Expr -> Expr) -> Pm.Spanned (Stmt Expr) -> Pm.Spanned (Stmt Expr)
+renameStmt rn (At (StmtBind y ysp e) sp) = At (StmtBind y ysp (rn e)) sp
+renameStmt rn (At (StmtLet p e) sp) = At (StmtLet p (rn e)) sp
+renameStmt rn (At (StmtExpr e) sp) = At (StmtExpr (rn e)) sp
 
-renameStmt : (Expr -> Expr)
-           -> String
-           -> String
-           -> Pm.Spanned (Stmt Expr)
-           -> Pm.Spanned (Stmt Expr)
-renameStmt rn x v (At (StmtBind y ysp e) _) =
-  At (StmtBind (renameName x v y) ysp (rn e)) (spanning ysp (Pm.spanOf (rn e)))
-renameStmt rn x v (At (StmtLet p e) sp) =
-  At (StmtLet (renamePat x v p) (rn e)) sp
-renameStmt rn x v (At (StmtExpr e) sp) = At (StmtExpr (rn e)) sp
+stmtBinds : String -> Pm.Spanned (Stmt Expr) -> Bool
+stmtBinds x (At (StmtBind y _ _) _) = strEq x y
+stmtBinds x (At (StmtLet p _) _) = binds x p
+stmtBinds x (At (StmtExpr _) _) = False
 
--- | `x` becomes `v`, except where something binds `x` again (a lambda
--- | or an alternative; the type of an annotated lambda's binder is left
--- | as it is, and so are local definitions and `{{x : T}}`)
+renameField : (Expr -> Expr)
+            -> Pm.Spanned (FieldDecl Expr)
+            -> Pm.Spanned (FieldDecl Expr)
+renameField rn (At (DeclareField y ysp t) sp) =
+  At (DeclareField y ysp (rn t)) sp
+renameField rn (At (BadFieldDecl e) sp) = At (BadFieldDecl (rn e)) sp
+
+fieldBinds : String -> Pm.Spanned (FieldDecl Expr) -> Bool
+fieldBinds x (At (DeclareField y _ _) _) = strEq x y
+fieldBinds x (At (BadFieldDecl _) _) = False
+
+renameEquation : (Expr -> Expr)
+               -> String
+               -> Pm.Spanned (Equation Expr)
+               -> Pm.Spanned (Equation Expr)
+renameEquation rn x (At (MkEquation f fsp ps rhs) sp) =
+  if anyC (binds x) ps then At (MkEquation f fsp ps rhs) sp
+  else At (MkEquation f fsp ps (rn rhs)) sp
+
+renameParam : (Expr -> Expr)
+            -> Pm.Spanned (Param Expr)
+            -> Pm.Spanned (Param Expr)
+renameParam rn (At (ExplicitParam y ysp t) sp) =
+  At (ExplicitParam y ysp (rn t)) sp
+renameParam rn (At (ImplicitParam y ysp t) sp) =
+  At (ImplicitParam y ysp (rn t)) sp
+
+paramBinds : String -> Pm.Spanned (Param Expr) -> Bool
+paramBinds x (At (ExplicitParam y _ _) _) = strEq x y
+paramBinds x (At (ImplicitParam y _ _) _) = strEq x y
+
+-- | a local definition: its type is outside it, its name binds in its
+-- | equations (and in what follows, which the caller sees to)
+renameDecl : (Expr -> Expr) -> String -> Decl -> Decl
+renameDecl rn x d = case d of
+  At (DeclEquations f fsp ty eqs) sp ->
+    At
+      (DeclEquations
+         f
+         fsp
+         (rn ty)
+         (if strEq x f then eqs else map (renameEquation rn x) eqs))
+      sp
+  At (DeclDefine y ysp ps u body) sp ->
+    if strEq x y then d
+    else At
+        (DeclDefine
+           y
+           ysp
+           (renameSeq (renameParam rn) (paramBinds x) ps)
+           (if anyC (paramBinds x) ps then u else rn u)
+           (if anyC (paramBinds x) ps then body else rn body))
+        sp
+  At (DeclTheory y ysp ps body) sp ->
+    if strEq x y then d
+    else At
+        (DeclTheory
+           y
+           ysp
+           (renameSeq (renameParam rn) (paramBinds x) ps)
+           (if anyC (paramBinds x) ps then body else rn body))
+        sp
+  At (DeclPrimitive y ysp t) sp -> At (DeclPrimitive y ysp (rn t)) sp
+  At (DeclWatch e) sp -> At (DeclWatch (rn e)) sp
+  _ -> d
+
+declBinds : String -> Decl -> Bool
+declBinds x d = case declName d of
+  Just y -> strEq x y
+  Nothing -> False
+
+renamePi : (Expr -> Expr) -> PiBinder Expr -> PiBinder Expr
+renamePi rn (PiNamed y ysp t) = PiNamed y ysp (rn t)
+renamePi rn (PiImplicit y ysp bsp t) = PiImplicit y ysp bsp (rn t)
+renamePi rn (PiInstance y ysp bsp t) = PiInstance y ysp bsp (rn t)
+renamePi rn (PiAnon d) = PiAnon (rn d)
+
+piBinds : String -> PiBinder Expr -> Bool
+piBinds x (PiNamed y _ _) = strEq x y
+piBinds x (PiImplicit y _ _ _) = strEq x y
+piBinds x (PiInstance y _ _ _) = strEq x y
+piBinds x (PiAnon _) = False
+
+lamBinds : String -> LamBinder Expr -> Bool
+lamBinds x (LamName y _) = strEq x y
+lamBinds x (LamImplicit y _) = strEq x y
+lamBinds x (LamAnn y _ _) = strEq x y
+
+-- | the type of an annotated lambda's binder is outside it
+renameLam : (Expr -> Expr) -> LamBinder Expr -> LamBinder Expr
+renameLam rn (LamAnn y ysp t) = LamAnn y ysp (rn t)
+renameLam rn b = b
+
+-- | the variable `x` becomes `v` wherever it is not bound again (`v` is
+-- | fresh: nothing binds it); a field's name, set or declared, and a
+-- | named argument's are labels, not variables
 rename : String -> String -> Expr -> Expr
 rename x v n = case n of
-  At (EVar y) sp -> At (EVar (renameName x v y)) sp
+  At (EVar y) sp -> if strEq y x then At (EVar v) sp else n
   At (ELam b body) sp ->
-    if elemBy strEq x (lamIdents idents b) then n
-    else At (ELam b (rename x v body)) sp
-  At (EAnn e t) _ -> ann (rename x v e) (rename x v t)
+    At
+      (ELam
+         (renameLam (rename x v) b)
+         (if lamBinds x b then body else rename x v body))
+      sp
   At (EPi b cod) sp ->
-    At (EPi (renamePi (rename x v) x v b) (rename x v cod)) sp
+    At
+      (EPi
+         (renamePi (rename x v) b)
+         (if piBinds x b then cod else rename x v cod))
+      sp
+  At (EAnn e t) sp -> At (EAnn (rename x v e) (rename x v t)) sp
   At (ESpec acc f fsp val) sp ->
     At (ESpec (rename x v acc) f fsp (rename x v val)) sp
   At (ESpecOther a b) sp -> At (ESpecOther (rename x v a) (rename x v b)) sp
   At (EApp h args) sp -> At (EApp (rename x v h) (map (rename x v) args)) sp
-  At (ENamed y e) sp -> At (ENamed (renameName x v y) (rename x v e)) sp
+  At (ENamed y e) sp -> At (ENamed y (rename x v e)) sp
   At (EMatch s alts) sp ->
     At (EMatch (rename x v s) (map (renameAlt (rename x v) x) alts)) sp
   At (ELetIn rhs a) sp ->
     At (ELetIn (rename x v rhs) (renameAlt (rename x v) x a)) sp
-  At (EDo stmts) sp -> At (EDo (map (renameStmt (rename x v) x v) stmts)) sp
-  At (ELocal body ds) sp -> At (ELocal (rename x v body) ds) sp
+  At (EDo stmts) sp ->
+    At (EDo (renameSeq (renameStmt (rename x v)) (stmtBinds x) stmts)) sp
+  At (ELocal body ds) sp ->
+    At
+      (ELocal
+         (if anyC (declBinds x) ds then body else rename x v body)
+         (renameSeq (renameDecl (rename x v) x) (declBinds x) ds))
+      sp
   At (EStruct fs) sp ->
     At
       (EStruct
          (map
             (\f -> case f of
-             At (SetField y ysp e) fsp ->
-               At (SetField (renameName x v y) ysp (rename x v e)) fsp
+             At (SetField y ysp e) fsp -> At (SetField y ysp (rename x v e)) fsp
              At (BadFieldSet e) fsp -> At (BadFieldSet (rename x v e)) fsp)
             fs))
       sp
   At (ESig fs) sp ->
-    At
-      (ESig
-         (map
-            (\f -> case f of
-             At (DeclareField y ysp t) fsp ->
-               At (DeclareField (renameName x v y) ysp (rename x v t)) fsp
-             At (BadFieldDecl e) fsp -> At (BadFieldDecl (rename x v e)) fsp)
-            fs))
-      sp
+    At (ESig (renameSeq (renameField (rename x v)) (fieldBinds x) fs)) sp
   At (ESum vs) sp ->
     At
       (ESum
@@ -391,6 +483,7 @@ rename x v n = case n of
       sp
   At (ETuple es) sp -> At (ETuple (map (rename x v) es)) sp
   At (EBrace e) sp -> At (EBrace (rename x v e)) sp
+  At (EBracket e) sp -> At (EBracket (rename x v e)) sp
   _ -> n
 
 -- | a variable pattern `p` matched against the variable `v`: `p` means `v`
