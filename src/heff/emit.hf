@@ -258,8 +258,9 @@ shortName k = fromMaybe k (last (split "." k))
 --------------------------------------------------------------------------------
 
 -- | how a definition is reached: its name, how many parameters it takes
--- | at once, whether it is computed when first used
-type GInfo = { js : String, arity : Int, lazy : Bool }
+-- | at once, whether it is computed when first used, and whether a call
+-- | of it may give back a bounce (see Tail calls)
+type GInfo = { js : String, arity : Int, lazy : Bool, bounce : Bool }
 
 -- | a global as a value
 ref : M.Map String GInfo -> String -> String
@@ -287,6 +288,67 @@ valueRefs e = case e of
   EPrimCall _ as -> concatMap (\a -> valueRefs a) as
   ECall _ as -> concatMap (\a -> valueRefs a) as
   _ -> Nil
+
+-- Tail calls
+--------------------------------------------------------------------------------
+
+-- JavaScript has no tail calls, and a computation (`Co`) is all of them:
+-- each step calls the rest last, so a loop of operations a handler of
+-- the language handles is a stack as deep as the loop is long.  So a
+-- call of an unknown function last (an application) counts itself, in
+-- `$dep`, and every so often, instead of calling, gives back a bounce
+-- (`$Bnc`: the function and its argument): the stack is let go of, to
+-- where the call's value was asked for, which -- a call not last,
+-- `$tr(f(x))` -- makes the call then, and again while it is given a
+-- bounce.  A known definition called last is not counted: definitions
+-- are sequential, so a chain of them always ends -- unless in a call of
+-- an unknown function, which counts.  A definition that may give back
+-- a bounce (`bounce`) is one that calls an unknown function last, or
+-- such a definition.  (Where JavaScript calls a function of the
+-- program -- the runtime, a provider, a module's user -- `$tr` and
+-- `$ext` stand between.)
+
+-- | whether it applies an unknown function last
+tailApp : I.Expr -> Bool
+tailApp e = case e of
+  ELet _ _ b -> tailApp b
+  EMatch _ arms -> any (\a -> tailApp (I.armBody a)) arms
+  EApp _ _ -> True
+  _ -> False
+
+-- | the definitions it calls last
+tailGlobals : I.Expr -> List String
+tailGlobals e = case e of
+  ELet _ _ b -> tailGlobals b
+  EMatch _ arms -> concatMap (\a -> tailGlobals (I.armBody a)) arms
+  ECall g _ -> Cons g Nil
+  _ -> Nil
+
+bodyBounces : M.Map String Unit -> I.Def -> Bool
+bodyBounces set d = case d.body of
+  ELam _ b ->
+    tailApp b
+    || any
+      (\g -> not (strEq g d.key) && M.member compareString g set)
+      (tailGlobals b)
+  _ -> False
+
+bounceStep : List I.Def -> M.Map String Unit -> M.Map String Unit
+bounceStep defs set =
+  foldl
+    (\m (d : I.Def) ->
+       if bodyBounces set d then M.insert compareString d.key MkUnit m else m)
+    set
+    defs
+
+bounceGo : List I.Def -> M.Map String Unit -> M.Map String Unit
+bounceGo defs set =
+  if M.size (bounceStep defs set) == M.size set then set
+  else bounceGo defs (bounceStep defs set)
+
+-- | the definitions that may give back a bounce
+bouncing : List I.Def -> M.Map String Unit
+bouncing defs = bounceGo defs M.empty
 
 -- Loops
 --------------------------------------------------------------------------------
@@ -727,6 +789,22 @@ isUnitArgs : List I.Expr -> Bool
 isUnitArgs (Cons (ETag t Nil) Nil) = strEq t "MkUnit"
 isUnitArgs _ = False
 
+bouncesG : Env -> String -> Bool
+bouncesG env g = case M.lookup compareString g env.gs of
+  Just i -> i.bounce
+  Nothing -> False
+
+-- | a call's value, through its bounces
+trCode : String -> String
+trCode c = "$tr(" ++ c ++ ")"
+
+-- | whether what it returns last may be a bounce
+mayBounce : Env -> I.Expr -> Bool
+mayBounce env e = tailApp e || any (\g -> bouncesG env g) (tailGlobals e)
+
+trWhen : Bool -> String -> String
+trWhen b c = if b then trCode c else c
+
 exprGo : JK -> Env -> Int -> I.Expr -> Code
 exprGo r env ind e = case e of
   EVar x -> p3 (fromMaybe (safe x) (M.lookup compareString x env.names))
@@ -735,18 +813,23 @@ exprGo r env ind e = case e of
   -- (a thunk forced: its value kept on it, so that forcing it again
   -- does not compute it again -- the language is pure, `f MkUnit` is
   -- the same value every time, and what abandons is not kept)
+  -- (a call not last: its value asked for, through any bounces)
   EApp f as ->
     if isUnitArgs as then p3 ("$force(" ++ (r.expr env ind f).code ++ ")")
-    else p3
-        (atLeast 3 (r.expr env ind f)
-         ++ joinWith "" (map (\a -> "(" ++ (r.expr env ind a).code ++ ")") as))
+    else foldl
+        (\c a ->
+           p3 (trCode (atLeast 3 c ++ "(" ++ (r.expr env ind a).code ++ ")")))
+        (r.expr env ind f)
+        as
   ECall g as ->
     if isUnitArgs as then p3 ("$force(" ++ callName env g ++ ")")
     else p3
-        (callName env g
-         ++ "("
-         ++ joinWith ", " (map (\a -> (r.expr env ind a).code) as)
-         ++ ")")
+        (trWhen
+           (bouncesG env g)
+           (callName env g
+            ++ "("
+            ++ joinWith ", " (map (\a -> (r.expr env ind a).code) as)
+            ++ ")"))
   EProj e2 l -> p3 (atLeast 3 (r.expr env ind e2) ++ projSuffix l)
   ERecord fs ->
     p3 ("{ " ++ joinWith ", " (map (\p -> fieldCode r env ind p) fs) ++ " }")
@@ -769,10 +852,19 @@ exprGo r env ind e = case e of
   EFix _ _ -> p3 "$abandon()"
   EPrim p -> p3 ("$" ++ p ++ "$c")
   EPrimCall p as -> primCall p (map (\a -> r.expr env ind a) as)
-  ELet x a b -> p3 ("(() => " ++ r.block env ind (ELet x a b) ++ ")()")
+  -- (a block, called at once: what it returns last may be a bounce)
+  ELet x a b ->
+    p3
+      (trWhen
+         (mayBounce env e)
+         ("(() => " ++ r.block env ind (ELet x a b) ++ ")()"))
   EMatch s arms -> case boolArms arms of
     Just (MkPair t f) -> exprTest r env ind e s t f
-    Nothing -> p3 ("(() => " ++ r.block env ind (EMatch s arms) ++ ")()")
+    Nothing ->
+      p3
+        (trWhen
+           (mayBounce env e)
+           ("(() => " ++ r.block env ind (EMatch s arms) ++ ")()"))
 
 exprF : JK -> Env -> Int -> I.Expr -> Code
 exprF r env0 ind e = exprGo r (noSelf env0) ind e
@@ -785,6 +877,7 @@ bodyF : JK -> Env -> Int -> I.Expr -> String
 bodyF r env ind e = case e of
   ELet x a b -> r.block env ind (ELet x a b)
   EMatch s arms -> r.block env ind (EMatch s arms)
+  EApp f as -> r.block env ind (EApp f as)
   _ -> bodyCode ((r.expr env ind e).code)
 
 blockF : JK -> Env -> Int -> I.Expr -> String
@@ -963,6 +1056,79 @@ again r env s ind as =
      ++ " continue;")
     Nil
 
+-- | the most calls of unknown functions made last, one inside the
+-- | other, before the stack is let go of
+bounceDepth : Int
+bounceDepth = 500
+
+atomGo : String -> Int -> Bool
+atomGo c i =
+  if i >= strLength c then True
+  else (isWordCode (charCode c i) || charCode c i == 36) && atomGo c (i + 1)
+
+-- | code that is a name or a literal: computing it again is nothing
+isAtom : String -> Bool
+isAtom c = not (strEq c "") && atomGo c 0
+
+-- | a value as a name: itself if it is one, else a `const`'s
+type Named = { js : String, pre : List String, env : Env }
+
+namedAs : Int -> Code -> BoundN -> Named
+namedAs ind c nb =
+  { js = nb.js
+  , pre = Cons (indent ind ++ "const " ++ nb.js ++ " = " ++ c.code ++ ";") Nil
+  , env = nb.env
+  }
+
+named : Env -> Int -> String -> Code -> Named
+named env ind base c =
+  if isAtom c.code then { js = c.code, pre = Nil, env = env }
+  else namedAs ind c (bindName env base)
+
+bounceGive : Int -> Named -> Named -> List String
+bounceGive ind f a =
+  concatList
+    f.pre
+    (concatList
+       a.pre
+       (Cons
+          (indent ind
+           ++ "return ++$dep > "
+           ++ showInt bounceDepth
+           ++ " ? new $Bnc("
+           ++ f.js
+           ++ ", "
+           ++ a.js
+           ++ ") : "
+           ++ f.js
+           ++ "("
+           ++ a.js
+           ++ ");")
+          Nil))
+
+bounceNamed : Int -> Code -> Named -> List String
+bounceNamed ind ac f = bounceGive ind f (named f.env ind "a" ac)
+
+bounceLines : Env -> Int -> Code -> Code -> List String
+bounceLines env ind fc ac = bounceNamed ind ac (named env ind "f" fc)
+
+-- | a value returned: an unknown function's, called last, counted (and,
+-- | every so often, a bounce instead)
+returnLines : JK -> Env -> Int -> I.Expr -> List String
+returnLines r env ind e = case e of
+  EApp f as ->
+    if isUnitArgs as
+      then bounceLines env ind (p3 "$force") (r.expr env ind f)
+    else case unsnocE as of
+      Just (MkPair ini a) ->
+        bounceLines
+          env
+          ind
+          (if null ini then r.expr env ind f else r.expr env ind (EApp f ini))
+          (r.expr env ind a)
+      Nothing -> Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
+  _ -> Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
+
 lastTrmc : JK -> Env -> Int -> I.Expr -> BoundN -> List String
 lastTrmc r env ind e rr =
   [ indent ind ++ "const " ++ rr.js ++ " = " ++ (r.expr env ind e).code ++ ";"
@@ -977,7 +1143,7 @@ lastOther r env s ind e =
     then Cons
         (indent ind ++ "return $s + " ++ atLeast 2 (r.expr env ind e) ++ ";")
         Nil
-  else Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
+  else returnLines r env ind e
 
 lastCell : JK
          -> Env
@@ -1053,8 +1219,7 @@ lastSelf r env s ind e = case e of
 lastF : JK -> Env -> Int -> I.Expr -> List String
 lastF r env ind e = case env.self of
   Just s -> lastSelf r env s ind e
-  Nothing ->
-    Cons (indent ind ++ "return " ++ (r.expr env ind e).code ++ ";") Nil
+  Nothing -> returnLines r env ind e
 
 jk : JK
 jk =
@@ -1198,11 +1363,26 @@ defLines gs curried globalNames d = case M.lookup compareString d.key gs of
 whenHas : String -> String -> String -> Maybe String
 whenHas code k line = if contains k code then Just line else Nothing
 
+-- | bounces (see Tail calls): how many calls last were made since the
+-- | last one, a bounce, and a value asked for through them
+trampolineStr : String
+trampolineStr =
+  "let $dep = 0; function $Bnc(f, a) { this.f = f; this.a = a; } const $trs = (r) => { do { $dep = 0; r = r.f(r.a); } while (r instanceof $Bnc); return r; }; const $tr = (r) => r instanceof $Bnc ? $trs(r) : r;"
+
+-- | a value of the program given to JavaScript: a function's value is
+-- | asked for through its bounces, and so are a record's functions'
+extStr : String
+extStr =
+  "const $ext = (v) => typeof v === \"function\" ? (x) => $ext($tr(v(x))) : v !== null && typeof v === \"object\" && !Array.isArray(v) && !(\"$\" in v) ? Object.fromEntries(Object.entries(v).map(([l, x]) => [l, $ext(x)])) : v;"
+
 -- | what the code uses of the runtime
 runtime : String -> List String
 runtime code =
   catMaybesL
-    [ whenHas
+    [ if any (\k -> contains k code) ["$tr(", "$Bnc", "$force", "$lazy"]
+        then Just trampolineStr
+      else Nothing
+    , whenHas
       code
       "$T"
       "const $T = { $: \"True\", a: [] }, $F = { $: \"False\", a: [] };"
@@ -1217,11 +1397,11 @@ runtime code =
     , whenHas
       code
       "$force"
-      "const $force = (f) => { if (f.$m !== undefined) return f.$m; const v = f({ $: \"MkUnit\", a: [] }); f.$m = v; return v; };"
+      "const $force = (f) => { if (f.$m !== undefined) return f.$m; const v = $tr(f({ $: \"MkUnit\", a: [] })); f.$m = v; return v; };"
     , whenHas
       code
       "$lazy"
-      "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"heff: defined by itself\"); state = 1; try { v = f(); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
+      "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"heff: defined by itself\"); state = 1; try { v = $tr(f()); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
     ]
 
 type Uncurried = { params : List String, body : String }
@@ -1342,14 +1522,19 @@ lazyOf acc key b ar =
     (I.isValue b
      && all (\k -> not (strEq k key) && depEager acc k) (I.globalsIn b))
 
-infoOne : List String -> M.Map String GInfo -> I.Def -> M.Map String GInfo
-infoOne shorts acc d =
+infoOne : List String
+        -> M.Map String Unit
+        -> M.Map String GInfo
+        -> I.Def
+        -> M.Map String GInfo
+infoOne shorts bnc acc d =
   M.insert
     compareString
     d.key
     { js = jsNameOf shorts d.key
     , arity = arityOfBody d.body
     , lazy = lazyOf acc d.key d.body (arityOfBody d.body)
+    , bounce = M.member compareString d.key bnc
     }
     acc
 
@@ -1380,11 +1565,17 @@ emitCode defs info curried globalNames =
     info
     (concatMap (\d -> defLines info curried globalNames d) defs)
 
+infoAll : List String
+        -> M.Map String Unit
+        -> List I.Def
+        -> M.Map String GInfo
+infoAll shorts bnc defs = foldl (\acc d -> infoOne shorts bnc acc d) M.empty defs
+
 emitWithShorts : List I.Def -> List String -> List String -> Emitted
 emitWithShorts defs roots shorts =
   emitCode
     defs
-    (foldl (\acc d -> infoOne shorts acc d) M.empty defs)
+    (infoAll shorts (bouncing defs) defs)
     (setFrom
        (concatList (concatMap (\(d : I.Def) -> valueRefs d.body) defs) roots))
     (setFrom (map (\(d : I.Def) -> jsNameOf shorts d.key) defs))
@@ -1417,16 +1608,22 @@ runStr =
     , "  const done = () => {};"
     , "  const later = typeof setImmediate === \"function\" ? setImmediate : (f) => setTimeout(f, 0);"
     , "  let depth = 0;"
-    , "  const now = (k) => (x) => { if (depth > 1000) { depth = 0; later(() => k(x)); return; } depth++; k(x); };"
+    , "  const now = (k) => (x) => { if (depth > 1000) { depth = 0; later(() => $tr(k(x))); return; } depth++; $tr(k(x)); };"
     , "  // the handler: its monad's return and bind, and its algebra"
     , "  const hd = {"
     , "    ret: (x) => (k) => k(x),"
-    , "    bind: (m) => (f) => (k) => m((x) => f(x)(k)),"
+    , "    bind: (m) => (f) => (k) => m((x) => $tr(f(x))(k)),"
     , "    malg: (p) => (k) => perform(p, now(k)),"
     , "  };"
-    , "  return main(hd)(hd.ret)(done);"
+    , "  return $tr($tr($tr(main(hd))(hd.ret))(done));"
     , "};"
     ]
+
+-- (a provider's operation, its functions -- the program's -- asked for
+-- through their bounces)
+leafStr : String
+leafStr =
+  "const $leaf = (h) => (p, k) => h({ $: p.$, a: p.a.map($ext) }, k);"
 
 sumStr : String
 sumStr =
@@ -1500,12 +1697,14 @@ bundleAll : Int -> List Provider -> List String
 bundleAll i Nil = Nil
 bundleAll i (Cons p rest) = Cons (bundleProvider i p) (bundleAll (i + 1) rest)
 
-runtimeFor : List Provider -> Ef.Effect -> String
-runtimeFor provs eff =
+runtimeFor : Bool -> List Provider -> Ef.Effect -> String
+runtimeFor hasTr provs eff =
   joinWith
     "\n"
     (concatList
-       (Cons runStr Nil)
+       (concatList
+          (if hasTr then Nil else Cons trampolineStr Nil)
+          [extStr, leafStr, runStr])
        (concatList
           (if hasSum eff then Cons sumStr Nil else Nil)
           (bundleAll 0 provs)))
@@ -1519,11 +1718,11 @@ provIndexGo i md (Cons p rest) =
 -- leaf's is its provider's factory, called for a fresh algebra)
 handlerOf : List Provider -> Ef.Effect -> String
 handlerOf provs (Leaf k) =
-  "$p"
+  "$leaf($p"
   ++ showInt (provIndexGo 0 (Ef.moduleOfKey k) provs)
   ++ "."
   ++ Ef.nameOfKey k
-  ++ "()"
+  ++ "())"
 handlerOf provs (Plus a b) =
   "$sum(" ++ handlerOf provs a ++ ", " ++ handlerOf provs b ++ ")"
 
@@ -1598,6 +1797,10 @@ nodeRun run =
 runFor : String -> String -> String
 runFor host run = if strEq host "node" then nodeRun run else run
 
+-- | whether the program's code has the bounces' runtime already
+definesTr : Emitted -> Bool
+definesTr m = any (\l -> strEq l trampolineStr) m.lines
+
 runSource : String -> List Provider -> Ef.Effect -> String -> Emitted -> String
 runSource host provs eff key m =
   joinWith
@@ -1610,7 +1813,7 @@ runSource host provs eff key m =
           (concatList
              m.lines
              [ ""
-             , runtimeFor provs eff
+             , runtimeFor (definesTr m) provs eff
              , ""
              , runFor
                host
@@ -1654,7 +1857,7 @@ compileProgram host available g key eff =
 
 getterOf : M.Map String GInfo -> Export -> String
 getterOf gs o =
-  "  get " ++ propName o.name ++ "() { return " ++ ref gs o.key ++ "; },"
+  "  get " ++ propName o.name ++ "() { return $ext(" ++ ref gs o.key ++ "); },"
 
 jsSource : List Export -> Emitted -> String
 jsSource exports m =
@@ -1665,7 +1868,9 @@ jsSource exports m =
        (concatList
           m.lines
           (concatList
-             ["", "export default {"]
+             (concatList
+                (if definesTr m then Nil else Cons trampolineStr Nil)
+                ["", extStr, "", "export default {"])
              (concatList
                 (map
                    (\o -> getterOf m.globals o)

@@ -84,5 +84,13 @@ if (build(loop, "main", loopJs)) {
   const r = spawnSync("node", [loopJs], { encoding: "utf8" });
   check("a long loop", r.stdout + r.stderr, "100000\n");
 }
+// a loop of operations a handler of the language handles: each step's
+// rest called last, a million times, in a small heap -- the stack let go
+// of every so often (a bounce), not as deep as the loop is long
+const handled = join(work, "handled.mjs");
+if (build("bench/state.hf", "main", handled)) {
+  const r = spawnSync("node", [handled], { encoding: "utf8", env: { ...process.env, HEFF_HEAP_MB: "256" } });
+  check("a long loop, handled in the language", r.stdout + r.stderr, "1000000\n");
+}
 console.log(`node: ${failed ? "FAILED" : "programs run"}`);
 process.exit(failed ? 1 : 0);
