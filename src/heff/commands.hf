@@ -730,7 +730,7 @@ ranOut r = r.out
 ranErr : Ran -> String
 ranErr r = r.err
 
--- | the project's programs: `app/X/main.hf` is the program X
+-- | the project's programs: `app/X/` with a build.hf is the program X
 programsIn : {e : HFunctor}
            -> {{disk : fs <: e}}
            -> P.Style
@@ -738,26 +738,21 @@ programsIn : {e : HFunctor}
            -> Co e (List String)
 programsIn st Nil = pure Nil
 programsIn st (Cons x rest) = do
-  m <- readFile (P.join st (P.join st "app" x) "main.hf")
+  m <- readFile (P.join st (P.join st "app" x) "build.hf")
   more <- programsIn st rest
   pure (case m of
     Just _ -> Cons x more
     Nothing -> more)
 
--- (each program compiled to C in `.heff/build/`, and by `zig cc` to `bin/`)
-buildEach : {e : HFunctor}
-          -> {{io : stdio <: e}}
-          -> {{sys : process <: e}}
-          -> {{disk : fs <: e}}
-          -> P.Style
-          -> List String
-          -> Co e Unit
-buildEach st Nil = pure MkUnit
-buildEach st (Cons x rest) =
-  cThen
-    (Just "main")
-    (P.join st (P.join st ".heff" "build") (x ++ ".c"))
-    (P.join st (P.join st "app" x) "main.hf") (do
+-- (`.heff/build/X.c`, by `zig cc`, is `bin/X`)
+zigCc : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{sys : process <: e}}
+      -> P.Style
+      -> String
+      -> Co e Unit
+      -> Co e Unit
+zigCc st x next = do
   r <-
     run
       "zig"
@@ -770,19 +765,94 @@ buildEach st (Cons x rest) =
   if ranStatus r == 0
       then do
         print ("wrote " ++ P.join st "bin" x)
-        buildEach st rest
+        next
     else do
       writeErr (ranErr r)
       printErr ("heff build: `zig cc` could not build " ++ P.join st "bin" x)
-      exit 1)
+      exit 1
+
+-- (said: `path` is written; then `next`)
+wrote : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> String
+      -> Co e Unit
+      -> Co e Unit
+wrote path next = do
+  print ("wrote " ++ path)
+  next
+
+-- (`bin/X`, a Node.js program, made runnable)
+nodeDone : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> P.Style
+         -> String
+         -> Co e Unit
+         -> Co e Unit
+nodeDone st x next = do
+  r <- run "chmod" ["+x", P.join st "bin" x]
+  wrote (P.join st "bin" x) next
+
+-- (the program X, compiled as its build.hf says, then `next`)
+buildApp : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> P.Style
+         -> String
+         -> Pr.Build
+         -> Co e Unit
+         -> Co e Unit
+buildApp st x a next =
+  if strEq a.backend "c"
+    then cThen
+        (Just a.run)
+        (P.join st (P.join st ".heff" "build") (x ++ ".c"))
+        (P.join st (P.join st "app" x) "main.hf")
+        (zigCc st x next)
+  else if strEq a.backend "node"
+    then compileThen
+        "node"
+        (Just a.run)
+        (P.join st "bin" x)
+        (P.join st (P.join st "app" x) "main.hf")
+        (nodeDone st x next)
+  else compileThen
+      "page"
+      (Just a.run)
+      (P.join st "bin" (x ++ ".js"))
+      (P.join st (P.join st "app" x) "main.hf")
+      (wrote (P.join st "bin" (x ++ ".js")) next)
+
+-- (each program, by its build.hf)
+buildEach : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> P.Style
+          -> List String
+          -> Co e Unit
+buildEach st Nil = pure MkUnit
+buildEach st (Cons x rest) = do
+  text <- readFile (P.join st (P.join st "app" x) "build.hf")
+  case Pr.readBuild (fromMaybe "" text) of
+    Left p -> do
+      printErr
+          (L.problemMsg
+             (P.join st (P.join st "app" x) "build.hf")
+             (fromMaybe "" text)
+             p)
+      exit 1
+    Right a -> buildApp st x a (buildEach st rest)
 
 -- (the names given, else all of them)
 orAll : List String -> List String -> List String
 orAll Nil progs = progs
 orAll names progs = names
 
--- | build the project's programs (the ones NAMEd, else all): `app/X/main.hf`
--- | is the program X, compiled to C and by `zig cc` to `bin/X`
+-- | build the project's programs (the ones NAMEd, else all): `app/X/` with
+-- | a build.hf is the program X, app/X/main.hf compiled as its build.hf
+-- | says, to `bin/`
 buildCmd : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
@@ -802,11 +872,16 @@ buildCmd names = do
       case filter (\n -> not (any (\p -> strEq p n) progs)) names of
         Cons n _ -> do
           printErr
-              ("heff build: no program " ++ n ++ ": no app/" ++ n ++ "/main.hf")
+              ("heff build: no program "
+               ++ n
+               ++ ": no app/"
+               ++ n
+               ++ "/build.hf")
           exit 1
         Nil -> case orAll names progs of
           Nil -> do
-            printErr "heff build: no programs: a program X is app/X/main.hf"
+            printErr
+                "heff build: no programs: app/X/ with a build.hf is the program X"
             exit 1
           _ -> do
             ok <- mkDir "bin"

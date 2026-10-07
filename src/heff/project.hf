@@ -23,14 +23,16 @@ import array as A
 import heff.fmt.lex as L
 import prelude
 
--- | a literal of package.hf, and the token it starts at
+-- | a literal of package.hf (or a build.hf), and the token it starts at
 data Lit
   = LStr String L.Tok
+  | LTag String L.Tok
   | LList (List Lit) L.Tok
   | LRec (List (Pair String Lit)) L.Tok
 
 litTok : Lit -> L.Tok
 litTok (LStr _ t) = t
+litTok (LTag _ t) = t
 litTok (LList _ t) = t
 litTok (LRec _ t) = t
 
@@ -101,6 +103,8 @@ litF : LitReader -> Array L.Tok -> Int -> Got Lit
 litF r ts i =
   if strEq (A.index ts i).kind "str"
     then Right (MkPair (LStr (A.index ts i).text (A.index ts i)) (i + 1))
+  else if strEq (A.index ts i).kind "tag"
+    then Right (MkPair (LTag (A.index ts i).text (A.index ts i)) (i + 1))
   else if isPunct "[" (A.index ts i)
     then (if isPunct "]" (A.index ts (i + 1))
             then Right (MkPair (LList Nil (A.index ts i)) (i + 2))
@@ -110,7 +114,7 @@ litF r ts i =
   else Left
       (problemAt
          (A.index ts i)
-         "package.hf holds strings, lists `[...]` and records `{...}`, nothing else")
+         "a manifest holds strings, tags `'x`, lists `[...]` and records `{...}`, nothing else")
 
 litReader : LitReader
 litReader = { lit = \ts i -> litF litReader ts i }
@@ -128,40 +132,54 @@ nextDecl ts i = if startsDecl (A.index ts i) then i else nextDecl ts (i + 1)
 isSym : String -> L.Tok -> Bool
 isSym x t = strEq t.kind "sym" && strEq t.text x
 
--- | the literal `package` is defined as, the declarations from `i` on
--- | read (`found`: it, if it has been met)
-declsGo : Array L.Tok -> Int -> Maybe Lit -> Either Problem Lit
-declsGo ts i found =
+-- | the literal `name` is defined as in `file` (package.hf, `package`;
+-- | a build.hf, `build`), the declarations from `i` on read (`found`: it,
+-- | if it has been met)
+declsGo : String
+        -> String
+        -> Array L.Tok
+        -> Int
+        -> Maybe Lit
+        -> Either Problem Lit
+declsGo file name ts i found =
   if strEq (A.index ts i).kind "eof"
     then (case found of
           Just x -> Right x
           Nothing ->
-            Left (problemAt (A.index ts i) "package.hf defines no `package`"))
+            Left
+              (problemAt
+                 (A.index ts i)
+                 (file ++ " defines no `" ++ name ++ "`")))
   else if strEq (A.index ts i).kind "kw" && strEq (A.index ts i).text "import"
-    then declsGo ts (nextDecl ts (i + 1)) found
+    then declsGo file name ts (nextDecl ts (i + 1)) found
   else if strEq (A.index ts i).kind "var"
-  && strEq (A.index ts i).text "package"
+  && strEq (A.index ts i).text name
   && isSym ":" (A.index ts (i + 1))
-    then declsGo ts (nextDecl ts (i + 1)) found
+    then declsGo file name ts (nextDecl ts (i + 1)) found
   else if strEq (A.index ts i).kind "var"
-  && strEq (A.index ts i).text "package"
+  && strEq (A.index ts i).text name
   && isSym "=" (A.index ts (i + 1))
     then (case found of
           Just _ ->
             Left
-              (problemAt (A.index ts i) "`package` is defined more than once")
+              (problemAt
+                 (A.index ts i)
+                 ("`" ++ name ++ "` is defined more than once"))
           Nothing -> case litReader.lit ts (i + 2) of
             Left p -> Left p
             Right (MkPair x j) ->
-              if startsDecl (A.index ts j) then declsGo ts j (Just x)
+              if startsDecl (A.index ts j) then declsGo file name ts j (Just x)
               else Left
                   (problemAt
                      (A.index ts j)
-                     "`package` is a literal, and nothing follows it"))
+                     ("`" ++ name ++ "` is a literal, and nothing follows it")))
   else Left
       (problemAt
          (A.index ts i)
-         "package.hf holds imports, and `package` (its signature and its definition), nothing else")
+         (file
+          ++ " holds imports, and `"
+          ++ name
+          ++ "` (its signature and its definition), nothing else"))
 
 -- What it says
 --------------------------------------------------------------------------------
@@ -418,9 +436,68 @@ lexedErrors l = l.errors
 readPackage : String -> Check Package
 readPackage src = case lexedErrors (L.lex src) of
   Cons e _ -> Left { at = e.start, msg = e.msg }
-  Nil -> case declsGo (A.fromList (lexedTokens (L.lex src))) 0 Nothing of
+  Nil -> case declsGo
+      "package.hf"
+      "package"
+      (A.fromList (lexedTokens (L.lex src)))
+      0
+      Nothing of
     Left p -> Left p
     Right x -> packageOf x
+
+-- A program's build.hf
+--------------------------------------------------------------------------------
+
+-- | what a build.hf says: app/X/main.hf is the program X, its computation
+-- | `run` compiled by `backend` (`c`, `node`, `page`)
+type Build = { backend : String, run : String }
+
+backendOf : Lit -> Check String
+backendOf (LTag b t) =
+  if strEq b "c" || strEq b "node" || strEq b "page" then Right b
+  else Left (problemAt t ("no backend '" ++ b ++ ": 'c, 'node or 'page"))
+backendOf x =
+  Left (problemAt (litTok x) "expected a backend: 'c, 'node or 'page")
+
+buildOf : Lit -> Check Build
+buildOf x = case fieldsAre ["backend", "run"] x of
+  Left p -> Left p
+  Right (Cons b (Cons r Nil)) -> case backendOf b of
+    Left p -> Left p
+    Right backend -> case str r of
+      Left p -> Left p
+      Right run -> Right { backend = backend, run = run }
+  Right _ -> Left (problemAt (litTok x) "expected a record `{...}`")
+
+-- | a build.hf's text, read
+readBuild : String -> Check Build
+readBuild src = case lexedErrors (L.lex src) of
+  Cons e _ -> Left { at = e.start, msg = e.msg }
+  Nil -> case declsGo
+      "build.hf"
+      "build"
+      (A.fromList (lexedTokens (L.lex src)))
+      0
+      Nothing of
+    Left p -> Left p
+    Right x -> buildOf x
+
+-- (what is wrong, said; or the backend and the computation run)
+saidBuild : Check Build -> String
+saidBuild (Left p) = showInt p.at ++ ": " ++ p.msg
+saidBuild (Right a) = a.backend ++ " " ++ a.run
+
+-- >>> saidBuild (readBuild "import manifest\n\nbuild : Build\nbuild = { backend = 'c, run = \"main\" }\n")
+-- "c main"
+
+-- >>> saidBuild (readBuild "build = { backend = 'wasm, run = \"main\" }")
+-- "20: no backend 'wasm: 'c, 'node or 'page"
+
+-- >>> saidBuild (readBuild "build = { backend = \"c\", run = \"main\" }")
+-- "20: expected a backend: 'c, 'node or 'page"
+
+-- >>> saidBuild (readBuild "build = { run = \"main\", backend = 'c }")
+-- "8: the fields are backend, run, in this order"
 
 -- (what is wrong, said; or the module path)
 said : Check Package -> String
