@@ -1,6 +1,6 @@
 # heff
 
-heff is an implementation of Hippogriff (Lynch & Staton,
+heff is a language based on Hippogriff (Lynch & Staton,
 arXiv:2608.19728), a typed language with a phase distinction, with a
 Haskell-like syntax, modules, doctests, algebraic effects, a formatter, a
 language server, and a compiler to JavaScript for web pages and Node.js.
