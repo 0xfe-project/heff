@@ -359,6 +359,35 @@ atomic e = case e of
 allAtomic : List I.Expr -> Bool
 allAtomic as = I.allI (map (\a -> atomic a) as)
 
+-- | a primitive given its arguments: a call of it, once they are all
+-- | there (what the other judgments know a primitive's computation by;
+-- | `heff.arity` does the same for the definitions, whose parameters are
+-- | not known until the simplifier is done)
+primAppN : String -> List I.Expr -> Maybe Int -> I.Expr
+primAppN p as (Just n) =
+  if length as == n then EPrimCall p as
+  else if length as > n then EApp (EPrimCall p (takeL n as)) (dropL n as)
+  else EApp (EPrim p) as
+primAppN p as Nothing = EApp (EPrim p) as
+
+primApp : String -> List I.Expr -> I.Expr
+primApp p as = primAppN p as (Pr.primArity p)
+
+-- | an application, in the form the simplifier keeps every one in:
+-- | its head not an application (`(f a) b` is `f a b`), and a primitive
+-- | given all its arguments a call of it.  Every application the
+-- | simplifier makes is made by this, so no judgment need look for
+-- | another form (a primitive applied, not called: `cheap` would not
+-- | know it)
+mkApp : I.Expr -> List I.Expr -> I.Expr
+mkApp f Nil = f
+mkApp (EApp g bs) as = mkApp g (appendL bs as)
+mkApp (EPrim p) as = primApp p as
+mkApp f as = EApp f as
+
+-- >>> mkApp (EApp (EPrim "intLe") [EVar "n"]) [EInt 0]
+-- EPrimCall "intLe" [EVar "n", EInt 0]
+
 -- | `x` replaced by `a`, a copy of it for each occurrence
 substCopies : String -> I.Expr -> I.Expr -> M I.Expr
 substCopies x a e = case e of
@@ -369,7 +398,7 @@ substCopies x a e = case e of
   EApp f as -> do
     f' <- substCopies x a f
     as' <- traverseS (\q -> substCopies x a q) as
-    pure (EApp f' as')
+    pure (mkApp f' as')
   ELet y e2 b -> do
     e2' <- substCopies x a e2
     b' <- substCopies x a b
@@ -512,12 +541,12 @@ tooBig g s = case M.lookup compareString g s.defs of
 inlineCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
 inlineCall r f g as = do
   s <- get
-  if tooBig g s then pure (EApp f as)
+  if tooBig g s then pure (mkApp f as)
     else do
       mb <- known g
       case mb of
-        Just b -> attempt (EApp f as) (r.applyTo b as)
-        Nothing -> pure (EApp f as)
+        Just b -> attempt (mkApp f as) (r.applyTo b as)
+        Nothing -> pure (mkApp f as)
 
 paramsTo : List String -> List I.Expr -> M.Map String I.Expr
 paramsTo xs as =
@@ -550,21 +579,21 @@ plainCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
 plainCall r f g as = do
   s <- get
   case M.lookup compareString (plainKey g as) s.plain of
-    Just NotInlined -> pure (EApp f as)
+    Just NotInlined -> pure (mkApp f as)
     Just (Inlined ps e) ->
       if s.fuel > 0
         then do
           u <- put (withFuel (s.fuel - 1) s)
           e2 <- copy e
           pure (I.subst (paramsTo ps as) e2)
-      else pure (EApp f as)
+      else pure (mkApp f as)
     Nothing -> do
       ps <- freshParams (length as)
       mb <- known g
       case mb of
         Just b -> do
           e <- r.applyTo b (map (\x -> EVar x) ps)
-          if I.size e <= I.size (EApp f as) + budget
+          if I.size e <= I.size (mkApp f as) + budget
               then do
                 u <- remember (plainKey g as) (Inlined ps e)
                 pure (I.subst (paramsTo ps as) e)
@@ -572,8 +601,8 @@ plainCall r f g as = do
               st <- get
               u <- put (restore s st)
               u2 <- remember (plainKey g as) NotInlined
-              pure (EApp f as)
-        Nothing -> pure (EApp f as)
+              pure (mkApp f as)
+        Nothing -> pure (mkApp f as)
 
 -- | a known definition called: inlined if it may be
 callOf : SK -> I.Expr -> String -> List I.Expr -> Maybe I.Expr -> M I.Expr
@@ -821,11 +850,11 @@ specMarked : SK -> String -> List String -> I.Expr -> List I.Expr -> List Bool -
 specMarked r g xs b as marks s =
   if not (any (\m -> m) marks)
     || (null (keepParams marks xs) && elemStr g (I.globalsIn b))
-    then pure (EApp (EGlobal g) as)
+    then pure (mkApp (EGlobal g) as)
   else case M.lookup compareString (specKey g marks as) s.sp.specs of
     Just h -> r.applyTo (EGlobal h) (Sp.dropAt marks as)
     Nothing ->
-      if s.sp.trying > 0 then pure (EApp (EGlobal g) as)
+      if s.sp.trying > 0 then pure (mkApp (EGlobal g) as)
       else makeSpec r g xs b as marks (specKey g marks as)
 
 specLam : SK -> String -> List String -> I.Expr -> List I.Expr -> M I.Expr
@@ -834,7 +863,7 @@ specLam r g xs b as = do
   if s.sp.count >= specLimit
     || length s.sp.within >= specDepth
     || not (any (\a -> knownArg s.sp.kinds a) as)
-    then pure (EApp (EGlobal g) as)
+    then pure (mkApp (EGlobal g) as)
     else specMarked r g xs b as (marksOf s.sp.kinds g xs b as) s
 
 -- | a call of a definition not inlined: of a copy of it, if one may be
@@ -844,7 +873,7 @@ trySpec r g as = do
   s <- get
   case M.lookup compareString g s.sp.all of
     Just (ELam xs b) -> specLam r g xs b as
-    _ -> pure (EApp (EGlobal g) as)
+    _ -> pure (mkApp (EGlobal g) as)
 
 -- | whether it is still the call of `g` it was
 stillCall : String -> I.Expr -> Bool
@@ -875,26 +904,12 @@ knownField g l = do
       Nothing -> pure Nothing
     _ -> pure Nothing
 
--- | a primitive given its arguments: a call of it, once they are all
--- | there (what the other judgments know a primitive's computation by;
--- | `heff.arity` does the same for the definitions, whose parameters are
--- | not known until the simplifier is done)
-primAppN : String -> List I.Expr -> Maybe Int -> I.Expr
-primAppN p as (Just n) =
-  if length as == n then EPrimCall p as
-  else if length as > n then EApp (EPrimCall p (takeL n as)) (dropL n as)
-  else EApp (EPrim p) as
-primAppN p as Nothing = EApp (EPrim p) as
-
-primApp : String -> List I.Expr -> I.Expr
-primApp p as = primAppN p as (Pr.primArity p)
-
 -- | an application of simplified parts
 applyToF : SK -> I.Expr -> List I.Expr -> M I.Expr
 applyToF r f as =
   if length as == 0 then pure f
   else case f of
-    EPrim p -> pure (primApp p as)
+    EPrim p -> pure (mkApp f as)
     EApp g bs -> r.applyTo g (appendL bs as)
     -- (another name for a tag, given all its arguments: the tag given
     -- them, with no bindings between -- the tag computes its fields in
@@ -913,7 +928,7 @@ applyToF r f as =
         then do
           arms' <- armsS (\b -> r.applyTo b as) arms
           pure (EMatch s arms')
-      else pure (EApp (EMatch s arms) as)
+      else pure (mkApp (EMatch s arms) as)
     EGlobal g -> do
       s <- get
       e1 <- callOf r f g as (M.lookup compareString g s.defs)
@@ -924,15 +939,15 @@ applyToF r f as =
       mb <- known g
       case mb of
         Just b ->
-          attempt (EApp f as) (do
+          attempt (mkApp f as) (do
           h <- r.project l b
           r.applyTo h as)
         Nothing -> do
           mv <- knownField g l
           case mv of
-            Just v -> attempt (EApp f as) (r.applyTo v as)
-            Nothing -> pure (EApp f as)
-    _ -> pure (EApp f as)
+            Just v -> attempt (mkApp f as) (r.applyTo v as)
+            Nothing -> pure (mkApp f as)
+    _ -> pure (mkApp f as)
 
 findField : String -> List (Pair String I.Expr) -> Maybe I.Expr
 findField l Nil = Nothing
