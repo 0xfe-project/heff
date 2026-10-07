@@ -1,10 +1,11 @@
--- The elaboration environment and state.  `Elab` is the elaborator's
--- monad -- the state threaded, a diagnostic thrown -- written out as a
--- function, as src/heff/cst.hf writes its parser's; this module's `bind` is
--- what `do` takes in the modules that import it unqualified.  `ElabSt`
--- holds delayed checks, which are themselves computations in `Elab`:
--- the state is a `data` (`MkSt core delayed`) so the knot may be tied.
+-- The elaboration environment and state.  `Elab` is a computation
+-- (lib/co.hf) whose effects are the elaboration state and failing with
+-- a diagnostic; `do` is `co`'s.  `ElabSt` holds delayed
+-- checks and wanted instances as its handler's steps (`Step`), so it is
+-- a `data` (`MkSt core delayed wanted`), the knot tied.
 
+import co
+import exn as X
 import heff.diagnostic
 import heff.dict as D
 import heff.eval as E
@@ -14,6 +15,7 @@ import heff.syntax as Sx
 import heff.value as V
 import map as M
 import prelude
+import state as S
 
 -- Scope
 --------------------------------------------------------------------------------
@@ -162,8 +164,8 @@ type StCore =
   }
 
 -- | an argument whose check waits until the type it is checked at is
--- | known.  It is a computation over the whole state, so the state is a
--- | `data`, and the field parametric, to tie the knot.
+-- | known.  It is a step of the handler (`Step`), over the whole state,
+-- | so the state is a `data`, and the field parametric, to tie the knot.
 data Delayed st = MkDelayed V.Ty (st -> Pair (Either Diag Unit) st)
 
 -- | an instance argument to find.  `resolve final` searches
@@ -171,6 +173,9 @@ data Delayed st = MkDelayed V.Ty (st -> Pair (Either Diag Unit) st)
 -- | is done (solved), and on `final` it fails rather than wait longer.
 data Wanted st = MkWanted P.Span (Bool -> st -> Pair (Either Diag Bool) st)
 
+-- | The handler's state: the elaboration state, and the checks waiting
+-- | in it.  No rule sees it: they see `StCore`, and say what is to wait
+-- | by the operations of `defer`.
 data ElabSt = MkSt StCore (List (Delayed ElabSt)) (List (Wanted ElabSt))
 
 emptyCore : StCore
@@ -208,50 +213,142 @@ withDelayed f (MkSt c d w) = MkSt c (f d) w
 withWanted : (List (Wanted ElabSt) -> List (Wanted ElabSt)) -> ElabSt -> ElabSt
 withWanted f (MkSt c d w) = MkSt c d (f w)
 
--- The monad
+-- | the checks waiting, as they were at a moment: what a check that
+-- | failed is put back to (recovery drops what it left waiting)
+data Saved = MkSaved (List (Delayed ElabSt))
+
+restoreTo : Saved -> ElabSt -> ElabSt
+restoreTo (MkSaved ds) st = withDelayed (\old -> ds) st
+
+-- Effects
 --------------------------------------------------------------------------------
 
--- | elaboration gives up with the one diagnostic that made it stop, and
--- | keeps its state either way
-type Elab a = ElabSt -> Pair (Either Diag a) ElabSt
+-- | Checks that wait: one delayed until a type is known, an instance
+-- | argument wanted; waking the delayed ones whose types are known (all
+-- | of them, with `True`), trying the wanted ones (and refusing those
+-- | still undetermined, on `True`: whether any was found); whether one
+-- | is ready; the waiting checks saved, and put back.
+data DeferF (m : Type -> Type) x
+  = Delay V.Ty (m Unit) x
+  | Want P.Span (Bool -> m Bool) x
+  | Wake Bool x
+  | Resolve Bool (Bool -> x)
+  | Pending (Bool -> x)
+  | SaveDelayed (Saved -> x)
+  | RestoreDelayed Saved x
 
-val : {a : Type} -> a -> Elab a
-val x = \st -> MkPair (Right x) st
+defer : HFunctor
+defer =
+  { f = DeferF
+  , hfmap = \fm g p -> case p of
+      Delay ty c x -> Delay ty c (g x)
+      Want sp f x -> Want sp f (g x)
+      Wake all x -> Wake all (g x)
+      Resolve final k -> Resolve final (\b -> g (k b))
+      Pending k -> Pending (\b -> g (k b))
+      SaveDelayed k -> SaveDelayed (\sv -> g (k sv))
+      RestoreDelayed sv x -> RestoreDelayed sv (g x)
+  , hmap = \nt p -> case p of
+      Delay ty c x -> Delay ty (nt c) x
+      Want sp f x -> Want sp (\b -> nt (f b)) x
+      Wake all x -> Wake all x
+      Resolve final k -> Resolve final k
+      Pending k -> Pending k
+      SaveDelayed k -> SaveDelayed k
+      RestoreDelayed sv x -> RestoreDelayed sv x
+  }
 
-bindStep : {a b : Type}
-         -> Pair (Either Diag a) ElabSt
-         -> (a -> Elab b)
-         -> Pair (Either Diag b) ElabSt
-bindStep (MkPair (Left e) st) f = MkPair (Left e) st
-bindStep (MkPair (Right x) st) f = f x st
+-- | What elaboration writes down for others: a step of the trace (for
+-- | `heff explain`), and what a name resolved to (for the IDE).
+data NotesF (m : Type -> Type) x = Trace TraceEvent x | Record Info x
 
-bind : {a b : Type} -> Elab a -> (a -> Elab b) -> Elab b
-bind m f = \st -> bindStep (m st) f
+notes : HFunctor
+notes =
+  { f = NotesF
+  , hfmap = \fm g p -> case p of
+      Trace ev x -> Trace ev (g x)
+      Record i x -> Record i (g x)
+  , hmap = \nt p -> case p of
+      Trace ev x -> Trace ev x
+      Record i x -> Record i x
+  }
 
-pure : {a : Type} -> a -> Elab a
-pure x = val x
+-- | What elaboration does to the world: it has a state, it may give up
+-- | with the one diagnostic that made it stop, checks wait in it, and it
+-- | writes notes.  (Its handler is `heff.meta`'s `elabH`: whether a
+-- | delayed check is ready is the unifier's to say.)
+elabE : HFunctor
+elabE = S.state StCore <+> X.exn Diag <+> defer <+> notes
 
-gets : {a : Type} -> (ElabSt -> a) -> Elab a
-gets f = \st -> MkPair (Right (f st)) st
+type Elab a = Co elabE a
 
-modify : (ElabSt -> ElabSt) -> Elab Unit
-modify f = \st -> MkPair (Right MkUnit) (f st)
+-- the evidence of each, given once
+stEv : S.state StCore <: elabE
+stEv p = InL (InL (InL p))
+
+exEv : X.exn Diag <: elabE
+exEv p = InL (InL (InR p))
+
+dfEv : defer <: elabE
+dfEv p = InL (InR p)
+
+ntEv : notes <: elabE
+ntEv p = InR p
+
+gets : {a : Type} -> (StCore -> a) -> Elab a
+gets f = op (stEv (Get f)) val
+
+putSt : StCore -> Elab Unit
+putSt c = op (stEv (Put c (MkUnit : Unit))) val
+
+modify : (StCore -> StCore) -> Elab Unit
+modify f = bind (gets f) putSt
 
 throwE : {a : Type} -> Diag -> Elab a
-throwE d = \st -> MkPair (Left d) st
+throwE d = op (exEv (Throw d)) val
 
-catchStep : {a : Type}
-          -> (Diag -> Elab a)
-          -> Pair (Either Diag a) ElabSt
-          -> Pair (Either Diag a) ElabSt
-catchStep h (MkPair (Left e) st) = h e st
-catchStep h (MkPair (Right x) st) = MkPair (Right x) st
-
+-- | `m`; if it gives up, `h` of why, from the state it gave up in
 catchE : {a : Type} -> Elab a -> (Diag -> Elab a) -> Elab a
-catchE m h = \st -> catchStep h (m st)
+catchE m h = op (exEv (Catch m h)) val
 
-runE : {a : Type} -> Elab a -> ElabSt -> Pair (Either Diag a) ElabSt
-runE m st = m st
+-- | `chk`, once `ty` is known
+delay : V.Ty -> Elab Unit -> Elab Unit
+delay ty chk = op (dfEv (Delay ty chk (MkUnit : Unit))) val
+
+-- | an instance argument to find later (see `Wanted`)
+want : P.Span -> (Bool -> Elab Bool) -> Elab Unit
+want sp f = op (dfEv (Want sp f (MkUnit : Unit))) val
+
+-- | run the delayed checks whose types are now known (and those they
+-- | delay in turn); with `all`, every one, known or not
+wake : Bool -> Elab Unit
+wake all = op (dfEv (Wake all (MkUnit : Unit))) val
+
+-- | try each waiting instance argument; `final` refuses the ones whose
+-- | goals never became determined.  Whether any was found.
+resolve : Bool -> Elab Bool
+resolve final = op (dfEv (Resolve final (\b -> b))) val
+
+-- | whether a delayed check is ready to run
+pending : Elab Bool
+pending = op (dfEv (Pending (\b -> b))) val
+
+saveDelayed : Elab Saved
+saveDelayed = op (dfEv (SaveDelayed (\sv -> sv))) val
+
+restoreDelayed : Saved -> Elab Unit
+restoreDelayed sv = op (dfEv (RestoreDelayed sv (MkUnit : Unit))) val
+
+traceE : P.Span -> String -> (Unit -> String) -> Elab Unit
+traceE span kind text =
+  op (ntEv (Trace { span = span, kind = kind, text = text } (MkUnit : Unit))) val
+
+record : Info -> Elab Unit
+record i = op (ntEv (Record i (MkUnit : Unit))) val
+
+-- | a computation, its failure as a value (the state kept either way)
+tryE : {a : Type} -> Elab a -> Elab (Either Diag a)
+tryE m = catchE (bind m (\x -> val (Right x))) (\d -> val (Left d))
 
 -- | a trace event, kept in the state
 pushTrace : TraceEvent -> StCore -> StCore
@@ -271,24 +368,18 @@ pushTraceAt : P.Span -> String -> (Unit -> String) -> StCore -> StCore
 pushTraceAt span kind text c =
   pushTrace { span = span, kind = kind, text = text } c
 
-traceE : P.Span -> String -> (Unit -> String) -> Elab Unit
-traceE span kind text =
-  modify (withCore (pushTrace { span = span, kind = kind, text = text }))
-
-record : Info -> Elab Unit
-record i =
-  modify
-    (withCore
-       (\c ->
-          { infos = Cons i c.infos
-          , recovered = c.recovered
-          , poisoned = c.poisoned
-          , metas = c.metas
-          , nextMeta = c.nextMeta
-          , postponed = c.postponed
-          , trace = c.trace
-          , selfKey = c.selfKey
-          }))
+-- | an info, kept in the state
+pushInfo : Info -> StCore -> StCore
+pushInfo i c =
+  { infos = Cons i c.infos
+  , recovered = c.recovered
+  , poisoned = c.poisoned
+  , metas = c.metas
+  , nextMeta = c.nextMeta
+  , postponed = c.postponed
+  , trace = c.trace
+  , selfKey = c.selfKey
+  }
 
 -- | elaborator codes are numbered from 300
 failWith : {a : Type} -> P.Span -> Int -> String -> Elab a
@@ -381,13 +472,3 @@ setSelfKey k c =
   , trace = c.trace
   , selfKey = k
   }
-
-resultOf : Pair (Either Diag Int) ElabSt -> Int
-resultOf (MkPair (Right n) _) = n
-resultOf (MkPair (Left _) _) = 0 - 1
-
--- >>> resultOf (runE (bind (val 20) (\x -> val (x + 22))) emptySt)
--- 42
-
--- >>> resultOf (runE (bind (failWith (a := Int) P.noSpan 8 "no") (\x -> val 1)) emptySt)
--- -1

@@ -3,6 +3,7 @@
 -- recovers from errors with holes.
 
 import array as A
+import co
 import heff.conversion as C
 import heff.diagnostic
 import heff.dict as D
@@ -143,10 +144,9 @@ metaTyShown mc len ty =
 -- | solution may mention them).
 freshMeta : Int -> V.Locals V.V -> V.Ty -> String -> P.Span -> Elab Hole
 freshMeta len locals ty name sp = do
-  m <- gets (\st -> (core st).nextMeta)
+  m <- gets (\c -> c.nextMeta)
   modify
-      (withCore
-         (\c ->
+      (\c ->
             setMetas
               (Mp.insert
                  compareInt
@@ -160,8 +160,8 @@ freshMeta len locals ty name sp = do
                  }
                  c.metas)
               (m + 1)
-              c))
-  mc <- gets (\st -> (core st).metas)
+              c)
+  mc <- gets (\c -> c.metas)
   traceE
       sp
       "meta"
@@ -182,8 +182,7 @@ freshMeta len locals ty name sp = do
 fillHole : G.Globals -> Int -> V.MetaEntry -> Sx.Tm -> Elab Unit
 fillHole g m e argStx =
   modify
-    (withCore
-       (\c ->
+    (\c ->
           setMetas
             (Mp.insert
                compareInt
@@ -197,7 +196,7 @@ fillHole g m e argStx =
                }
                c.metas)
             c.nextMeta
-            c))
+            c)
 
 -- | The hole standing for a delayed argument, filled with the argument
 -- | once it is checked.  If unification got there first, the two must
@@ -210,12 +209,12 @@ solveHole : G.Globals
           -> V.V
           -> Elab (Either C.EqErr Unit)
 solveHole g cs m holeVal argStx argVal = do
-  mc <- gets (\st -> (core st).metas)
+  mc <- gets (\c -> c.metas)
   case Mp.lookup compareInt m mc of
     Just e -> case e.sol of
       Nothing -> do
         fillHole g m e argStx
-        mc2 <- gets (\st -> (core st).metas)
+        mc2 <- gets (\c -> c.metas)
         traceE
             e.span
             "solve"
@@ -298,7 +297,7 @@ prettyEqErr g MentionsError = "a solution would mention what did not elaborate"
 
 tyStrZ : ElabEnv -> V.Ty -> Elab String
 tyStrZ e t = do
-  mc <- gets (\st -> (core st).metas)
+  mc <- gets (\c -> c.metas)
   pure
       (Ps.printTy
          Ps.plainImplicits
@@ -310,11 +309,11 @@ tyStrZ e t = do
 
 -- | (checked at a type that did not elaborate, nothing is an error of
 -- | its own: kept, for the definition to fail, but reported elsewhere)
-keepRecovered : Diag -> ElabSt -> Elab Unit
-keepRecovered kept saved = do
-  modify (withCore (\c -> setRecovered (Cons kept c.recovered) c))
-  modify (withCore (setPostponed (core saved).postponed))
-  modify (withDelayed (\old -> delayedOf saved))
+keepRecovered : Diag -> StCore -> Saved -> Elab Unit
+keepRecovered kept saved waiting = do
+  modify (\c -> setRecovered (Cons kept c.recovered) c)
+  modify (setPostponed saved.postponed)
+  restoreDelayed waiting
 
 -- Function
 --------------------------------------------------------------------------------
@@ -328,38 +327,31 @@ data Binder
 -- | Where a check fails, the error is kept and an error hole of the type
 -- | checked at takes its place, so that what is around it is checked
 -- | still.  What the failed check left waiting is dropped with it.
-recoverWith : ElabEnv
-            -> V.Ty
-            -> Diag
-            -> ElabSt
-            -> ElabSt
-            -> Pair (Either Diag M.El) ElabSt
-recoverWith e a d st0 st =
-  (do
-   blocked <- Mt.blockedTy a
-   keepRecovered
-       (if blocked
-          then { code = 0 - 1
-               , severity = d.severity
-               , msg = d.msg
-               , span = d.span
-               , note = d.note
-               }
-        else d)
-       st0
-   pure (errorHole a))
-    st
+recoverWith : ElabEnv -> V.Ty -> Diag -> StCore -> Saved -> Elab M.El
+recoverWith e a d saved waiting = do
+  blocked <- Mt.blockedTy a
+  keepRecovered
+      (if blocked
+         then { code = 0 - 1
+              , severity = d.severity
+              , msg = d.msg
+              , span = d.span
+              , note = d.note
+              }
+       else d)
+      saved
+      waiting
+  pure (errorHole a)
 
-recoverStep : ElabEnv
-            -> V.Ty
-            -> Pair (Either Diag M.El) ElabSt
-            -> ElabSt
-            -> Pair (Either Diag M.El) ElabSt
-recoverStep e a (MkPair (Right m) st) st0 = MkPair (Right m) st
-recoverStep e a (MkPair (Left d) st) st0 = recoverWith e a d st0 st
-
+-- (the state and the checks waiting before the check, for what fails to
+-- go back to)
 recovering : Chk -> Chk
-recovering c = MkChk (\e a -> \st0 -> recoverStep e a (runChk c e a st0) st0)
+recovering c =
+  MkChk
+    (\e a -> do
+     saved <- gets (\c0 -> c0)
+     waiting <- saveDelayed
+     catchE (runChk c e a) (\d -> recoverWith e a d saved waiting))
 
 isImplicitPi : V.Ty -> Bool
 isImplicitPi t = case V.behavior t of
@@ -417,7 +409,7 @@ witnessMatches e goal (Cons w rest) = do
 -- | them apart); none is refused too.
 resolveWanted : ElabEnv -> P.Span -> Int -> V.V -> V.Ty -> Bool -> Elab Bool
 resolveWanted e sp hm holeVal goal final = do
-  mc <- gets (\st -> (core st).metas)
+  mc <- gets (\c -> c.metas)
   if not (null (metasLeft e mc goal))
       then if final
           then failWithNote
@@ -474,7 +466,7 @@ metaOf _ = 0 - 1
 insertInstance : ElabEnv -> P.Span -> V.Ty -> String -> Elab M.El
 insertInstance e sp goal name = do
   hole <- freshMeta e.scope.len e.scope.locals goal name sp
-  mc0 <- gets (\st -> (core st).metas)
+  mc0 <- gets (\c -> c.metas)
   -- (the trace says whether the goal is determined already: then it
   -- would need no deferral)
   traceE
@@ -485,23 +477,7 @@ insertInstance e sp goal name = do
          ++ instShown e mc0 goal
          ++ (if null (metasLeft e mc0 goal) then "  [ready at the call]"
              else "  [waits for implicits]"))
-  modify
-      (withWanted
-         (\ws ->
-            concatList
-              ws
-              (Cons
-                 (MkWanted
-                    sp
-                    (\final ->
-                       resolveWanted
-                         e
-                         sp
-                         (metaOf hole.stx)
-                         hole.val
-                         goal
-                         final))
-                 Nil)))
+  want sp (\final -> resolveWanted e sp (metaOf hole.stx) hole.val goal final)
   pure (mEl hole.stx hole.val)
 
 -- | Apply `m : ty` to a fresh metavariable for each implicit argument it
@@ -878,14 +854,7 @@ metaOfStx _ = 0 - 1
 delayChkOn : ElabEnv -> P.Span -> String -> Chk -> V.Ty -> V.Ty -> Elab M.El
 delayChkOn e sp what c keyTy ty = do
   hole <- freshMeta e.scope.len e.scope.locals ty what sp
-  modify
-      (withDelayed
-         (\ds ->
-            Cons
-              (MkDelayed
-                 keyTy
-                 (delayedCheck e sp what c ty (metaOfStx (hole.stx)) hole))
-              ds))
+  delay keyTy (delayedCheck e sp what c ty (metaOfStx (hole.stx)) hole)
   traceE
       sp
       "delay"
@@ -1000,7 +969,7 @@ applyGo sp e a (MkPair m a') = do
   r <- case r0 of
     Left err -> specialized e (M.valN m) a a' (Left err)
     Right x -> pure (Right x)
-  mc <- gets (\st -> (core st).metas)
+  mc <- gets (\c -> c.metas)
   traceE
       sp
       "unify"
@@ -1244,7 +1213,7 @@ advanceSelf gk a fieldTypes done =
 selfAdvance : ElabEnv -> V.Ty -> List (Pair String V.V) -> Elab ElabEnv
 selfAdvance e a done = case e.elabFor of
   ForDescriptive (HGlobal gk) SpId -> do
-    sk <- gets (\st -> (core st).selfKey)
+    sk <- gets (\c -> c.selfKey)
     case V.behavior a of
       LikeRecord level capture fieldTypes ->
         if nameIs sk gk
