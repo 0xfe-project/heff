@@ -729,7 +729,10 @@ static V heff_strAppend(V a, V b) {
     if (n > x->cap) {
       int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
       size_t was = (sizeof(Str) + x->cap * sizeof(uint16_t) + 7) / 8 * 8;
-      Str *g = heff_alloc(sizeof(Str) + cap * sizeof(uint16_t));
+      // (from the allocator objects are given back to, rounded as it
+      // rounds: a block it frees to a free list must be the whole of
+      // that list's size)
+      Str *g = heff_obj_alloc(sizeof(Str) + cap * sizeof(uint16_t));
       memcpy(g, x, sizeof(Str) + x->len * sizeof(uint16_t));
       heff_obj_free(x, was);
       g->cap = cap;
