@@ -17,6 +17,8 @@
 -- language defines types one after another.
 
 import array as A
+import co
+import exn
 import heff.diagnostic
 import heff.fixity as F
 import heff.fmt.imports as I
@@ -24,6 +26,7 @@ import heff.fmt.lex as L
 import heff.fmt.toks as Tk
 import heff.params as Pm
 import prelude
+import state
 
 type T = Tk.T
 
@@ -98,29 +101,69 @@ data D
 -- | `start`: the token the item being read starts with
 type St = { toks : Array T, i : Int, top : Int, stack : List Int, start : Int }
 
-type P a = St -> Pair (Either Diag a) St
+-- | What reading does to the world: it has a state, and it may fail
+-- | with a diagnostic.  Reading is a computation of these (lib/co.hf),
+-- | and its `do` is `co`'s; the reader's handler is below.
+reader : HFunctor
+reader = state St <+> exn Diag
+
+type P a = Co reader a
+
+pGets : {a : Type} -> (St -> a) -> P a
+pGets f = op (inl (state St) (exn Diag) (Get f)) val
+
+pPut : St -> P Unit
+pPut s = op (inl (state St) (exn Diag) (Put s MkUnit)) val
+
+pModify : (St -> St) -> P Unit
+pModify f = bind (pGets f) pPut
+
+throwP : {a : Type} -> Diag -> P a
+throwP d = op (inr (state St) (exn Diag) (Throw d)) val
+
+-- | The reader's handler: a state threaded through, and a failure that
+-- | ends reading where it is, with the state there.  (Specialised for
+-- | it, a reading is the state passing it would be by hand.)
+type Read a = St -> Pair (Either Diag a) St
 
 bindStep : {a b : Type}
          -> Pair (Either Diag a) St
-         -> (a -> P b)
+         -> (a -> Read b)
          -> Pair (Either Diag b) St
 bindStep (MkPair (Left e) st) f = MkPair (Left e) st
 bindStep (MkPair (Right x) st) f = f x st
 
-bind : {a b : Type} -> P a -> (a -> P b) -> P b
-bind m f = \st -> bindStep (m st) f
+-- (a `Catch`: what is caught is heard where it was thrown, the state kept)
+catchStep : {a : Type}
+          -> (Diag -> Read a)
+          -> Pair (Either Diag a) St
+          -> Pair (Either Diag a) St
+catchStep h (MkPair (Left d) st) = h d st
+catchStep h r = r
 
-pure : {a : Type} -> a -> P a
-pure x = \st -> MkPair (Right x) st
+readStateAlg : {a : Type} -> StateF St Read a -> Read a
+readStateAlg (Get k) = \st -> MkPair (Right (k st)) st
+readStateAlg (Put s2 x) = \st -> MkPair (Right x) s2
 
-pGets : {a : Type} -> (St -> a) -> P a
-pGets f = \st -> MkPair (Right (f st)) st
+readExnAlg : {a : Type} -> ExnF Diag Read a -> Read a
+readExnAlg (Throw d) = \st -> MkPair (Left d) st
+readExnAlg (Catch c h) = \st -> catchStep h (c st)
 
-pModify : (St -> St) -> P Unit
-pModify f = \st -> MkPair (Right MkUnit) (f st)
+readSumAlg : {a : Type} -> SumF (StateF St) (ExnF Diag) Read a -> Read a
+readSumAlg (InL t) = readStateAlg t
+readSumAlg (InR q) = readExnAlg q
 
-throwP : {a : Type} -> Diag -> P a
-throwP d = \st -> MkPair (Left d) st
+readH : Handler reader
+readH =
+  { M = Read
+  , ret = \x st -> MkPair (Right x) st
+  , bind = \m k st -> bindStep (m st) k
+  , malg = \p -> readSumAlg p
+  }
+
+-- | a reading, from a state
+runP : {a : Type} -> P a -> St -> Pair (Either Diag a) St
+runP m st = handle readH m st
 
 diag : Pm.Span -> String -> Diag
 diag span msg =
@@ -1085,7 +1128,7 @@ skipDecl s =
 
 -- | one declaration read where `s` is (reset), and the state after it
 declStep : St -> Pair (Either Diag D) St
-declStep s = decl (declReset s)
+declStep s = runP decl (declReset s)
 
 -- | is the state at the end of the text (not of a declaration)?
 textDone : St -> Bool
