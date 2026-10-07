@@ -83,6 +83,17 @@ withFuel f s =
   , sp = s.sp
   }
 
+withSafe : String -> St -> St
+withSafe k s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = M.insert compareString k MkUnit s.safe
+  , total = s.total
+  , plain = s.plain
+  , sp = s.sp
+  }
+
 withPlain : String -> Plain -> St -> St
 withPlain k p s =
   { supply = s.supply
@@ -726,7 +737,7 @@ specArgSize : Int
 specArgSize = 60
 
 specBodySize : Int
-specBodySize = 400
+specBodySize = 1200
 
 specLimit : Int
 specLimit = 2000
@@ -805,6 +816,15 @@ pushSpec k h = \s ->
          }
          s)
 
+-- | a copy that is a function, or a value computing nothing, is safe
+-- | to use anywhere, as the definitions it was made from were
+-- | (`safeGlobals`)
+markSafe : String -> I.Expr -> M Unit
+markSafe h b = \s ->
+    MkPair
+      MkUnit
+      (if I.isValue b || pureIn s.safe s.total b then withSafe h s else s)
+
 popSpec : String -> I.Expr -> M Unit
 popSpec h b = \s ->
     MkPair
@@ -852,6 +872,7 @@ cheap safe (EStr _) = True
 cheap safe (ETag _ as) = I.allI (map (cheap safe) as)
 cheap safe (ERecord fs) = I.allI (map (cheap safe) (map snd fs))
 cheap safe (EProj e _) = cheap safe e
+cheap safe (ELet _ a b) = cheap safe a && cheap safe b
 cheap safe (EPrimCall p as) =
   not (elemStr p failing) && I.allI (map (cheap safe) as)
 cheap safe _ = False
@@ -886,7 +907,12 @@ stripLams zs e = e
 raiseWith : List String -> I.Expr -> List String -> I.Expr
 raiseWith xs b zs = ELam (appendL xs zs) (stripLams zs b)
 
--- | a function, taking the parameters every way out of it does
+-- | a function, taking the parameters every way out of it does.  A
+-- | definition that is not a function but whose every way out is a
+-- | lambda past what is cheap -- a computation, `peek = let c = ... in
+-- | \hd k -> ...` -- becomes one: what it computed once it computes at
+-- | each call, which is little and cannot fail, and its handler is a
+-- | parameter a copy can be made for
 raise : I.Expr -> M I.Expr
 raise (ELam xs b) = do
   s <- get
@@ -894,7 +920,12 @@ raise (ELam xs b) = do
     else do
       zs <- freshParams (lamsOut s.safe b)
       pure (raiseWith xs b zs)
-raise e = pure e
+raise e = do
+  s <- get
+  if lamsOut s.safe e == 0 then pure e
+    else do
+      zs <- freshParams (lamsOut s.safe e)
+      pure (ELam zs (stripLams zs e))
 
 -- | a copy made: simplified with fuel of its own
 makeSpec : SK -> String -> List String -> I.Expr -> List I.Expr -> List Bool -> String -> M I.Expr
@@ -909,6 +940,7 @@ makeSpec r g xs b as marks k = do
   body3 <- raise body2
   u3 <- setFuel s.fuel
   u4 <- popSpec (g ++ "$s" ++ showInt s.sp.count) body3
+  u5 <- markSafe (g ++ "$s" ++ showInt s.sp.count) body3
   -- (the copy called, and a copy of it made if it may be, for what it
   -- takes now)
   r.applyTo (EGlobal (g ++ "$s" ++ showInt s.sp.count)) (Sp.dropAt marks as)
@@ -1171,6 +1203,7 @@ oneDef d = do
   b2 <- sk.simp b1
   b <- raise b2
   u2 <- recordDef d.key b
+  u3 <- markSafe d.key b
   made <- takeMade
   pure (appendL made (Cons (I.mkDef d.key d.name b) Nil))
 
