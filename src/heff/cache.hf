@@ -25,7 +25,7 @@ import map as Mp
 import prelude
 
 version : String
-version = "heff-cache-port/10"
+version = "heff-cache-port/11"
 
 -- Hashing (private to this cache): two polynomial hashes, each modulo a
 -- prime below 2^31, so that every step stays a machine word (no big
@@ -105,6 +105,23 @@ wholeHash m c =
              ","
              (map (\(o : Dr.Own) -> o.key ++ ":" ++ hashOf m o.key) c.own)))
        m)
+
+-- | a thawed module's hashes: each definition's as it was frozen -- what
+-- | it is made of being unchanged, so is its hash -- not computed again
+thawedHashesInto : Mp.Map String String
+                 -> Dr.Thawed
+                 -> Dr.Checked
+                 -> Mp.Map String String
+thawedHashesInto hs th c =
+  wholeHash
+    (foldl
+       (\m p -> case p of
+        MkPair k h ->
+          if Mp.member compareString k m then m
+          else Mp.insert compareString k h m)
+       hs
+       th.hashes)
+    c
 
 -- | each definition's hash: its core syntax, and the hashes of the
 -- | definitions it mentions -- so a hash covers a definition's making,
@@ -190,10 +207,13 @@ needsOf c =
               Nothing -> Nil)
              c.own)))
 
-freezeDef : Dr.Checked
+freezeDef : Mp.Map String String
+          -> Dr.Checked
           -> Pair Dr.Own (Pair String Pm.Span)
           -> Maybe (List String)
-freezeDef c (MkPair o (MkPair _ sp)) = case G.lookupEntry c.top.globals o.key of
+freezeDef hashes c (MkPair o (MkPair _ sp)) = case G.lookupEntry
+    c.top.globals
+    o.key of
   Just e ->
     Just
       (Cons
@@ -201,12 +221,14 @@ freezeDef c (MkPair o (MkPair _ sp)) = case G.lookupEntry c.top.globals o.key of
          (Cons
             (Se.tokStr o.key)
             (Cons
-               (showInt sp.start)
+               (Se.tokStr (hashOf hashes o.key))
                (Cons
-                  (showInt sp.end)
+                  (showInt sp.start)
                   (Cons
-                     (Se.encodeTy e.tySyntax)
-                     (Cons (Se.encodeEl e.syntax) Nil))))))
+                     (showInt sp.end)
+                     (Cons
+                        (Se.encodeTy e.tySyntax)
+                        (Cons (Se.encodeEl e.syntax) Nil)))))))
   Nothing -> Nothing
 
 zipCa : {a b : Type} -> List a -> List b -> List (Pair a b)
@@ -233,7 +255,7 @@ freeze : Mp.Map String String
        -> Dr.Checked
        -> Maybe String
 freeze hashes done s c = case allJust
-    (map (\p -> freezeDef c p) (zipCa c.own c.top.spans)) of
+    (map (\p -> freezeDef hashes c p) (zipCa c.own c.top.spans)) of
   Nothing -> Nothing
   Just defs ->
     Just
@@ -309,34 +331,39 @@ meltPair s i =
     (Se.takeStr s i)
     (\a j -> Se.bindG (Se.takeStr s j) (\b j2 -> Se.gotG (MkPair a b) j2))
 
-meltDef : String -> Int -> Maybe (Pair T.ThawedDef Int)
+meltDef : String -> Int -> Maybe (Pair (Pair T.ThawedDef String) Int)
 meltDef s i =
   Se.bindG
     (Se.takeStr s i)
     (\name j ->
        Se.bindG
          (Se.takeStr s j)
-         (\key j2 ->
+         (\key j1 ->
             Se.bindG
-              (Se.takeInt s j2)
-              (\start j3 ->
+              (Se.takeStr s j1)
+              (\hash j2 ->
                  Se.bindG
-                   (Se.takeInt s j3)
-                   (\end j4 ->
+                   (Se.takeInt s j2)
+                   (\start j3 ->
                       Se.bindG
-                        (Se.decodeTyAt s j4)
-                        (\ty j5 ->
+                        (Se.takeInt s j3)
+                        (\end j4 ->
                            Se.bindG
-                             (Se.decodeElAt s j5)
-                             (\body j6 ->
-                                Se.gotG
-                                  (T.mkThawedDef
-                                     name
-                                     key
-                                     { start = start, end = end }
-                                     ty
-                                     body)
-                                  j6))))))
+                             (Se.decodeTyAt s j4)
+                             (\ty j5 ->
+                                Se.bindG
+                                  (Se.decodeElAt s j5)
+                                  (\body j6 ->
+                                     Se.gotG
+                                       (MkPair
+                                          (T.mkThawedDef
+                                             name
+                                             key
+                                             { start = start, end = end }
+                                             ty
+                                             body)
+                                          (key ++ "\n" ++ hash))
+                                       j6)))))))
 
 pairsHold : (Pair String String -> Bool) -> List (Pair String String) -> Bool
 pairsHold p Nil = True
@@ -350,8 +377,18 @@ meltDone : Maybe (Pair Dr.Thawed Int) -> Maybe Dr.Thawed
 meltDone (Just (MkPair th _)) = Just th
 meltDone Nothing = Nothing
 
-mkThawed : F.Fixities -> List T.ThawedDef -> Dr.Thawed
-mkThawed fixities defs = { fixities = fixities, defs = defs }
+-- (a definition melted, with its key and hash: `key\nhash`)
+keyHash : String -> Pair String String
+keyHash kh = case split "\n" kh of
+  Cons k (Cons h _) -> MkPair k h
+  _ -> MkPair kh "?"
+
+mkThawed : F.Fixities -> List (Pair T.ThawedDef String) -> Dr.Thawed
+mkThawed fixities defs =
+  { fixities = fixities
+  , defs = map fst defs
+  , hashes = map (\d -> keyHash (snd d)) defs
+  }
 
 melt : Mp.Map String String
      -> List Dr.Checked

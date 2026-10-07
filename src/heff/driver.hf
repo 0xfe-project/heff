@@ -183,17 +183,31 @@ nubByName (Cons o rest) =
     o
     (nubByName (filter (\(p : Imported) -> not (strEq p.name o.name)) rest))
 
+-- (each name imported: the key it first came with, and whether another
+-- key came with it too)
+clashMap : Mp.Map String (Pair String Bool)
+         -> List Imported
+         -> Mp.Map String (Pair String Bool)
+clashMap m Nil = m
+clashMap m (Cons o rest) =
+  clashMap
+    (case Mp.lookup compareString o.name m of
+     Nothing -> Mp.insert compareString o.name (MkPair o.key False) m
+     Just (MkPair k c) ->
+       if c || strEq k o.key then m
+       else Mp.insert compareString o.name (MkPair k True) m)
+    rest
+
+clashedIn : Mp.Map String (Pair String Bool) -> Imported -> Bool
+clashedIn m o = case Mp.lookup compareString o.name m of
+  Just (MkPair _ c) -> c
+  Nothing -> False
+
 -- | a name two modules imported define, each its own way, is in scope
 -- | as neither
 clashesOf : List Imported -> List Imported
 clashesOf imported =
-  nubByName
-    (filter
-       (\(o : Imported) ->
-          anyD
-            (\(p : Imported) -> strEq p.name o.name && not (strEq p.key o.key))
-            imported)
-       imported)
+  nubByName (filter (clashedIn (clashMap Mp.empty imported)) imported)
 
 joinComma : List String -> String
 joinComma Nil = ""
@@ -538,30 +552,36 @@ hint d = case d.note of
            }
     else d
 
--- | a module thawed from a cache: its fixities, and its definitions'
--- | core syntax (`heff.cache` reads one)
-type Thawed = { fixities : F.Fixities, defs : List T.ThawedDef }
+-- | a module thawed from a cache: its fixities, its definitions' core
+-- | syntax, and each definition's hash as it was frozen (key, hash) --
+-- | `heff.cache` reads one
+type Thawed =
+  { fixities : F.Fixities
+  , defs : List T.ThawedDef
+  , hashes : List (Pair String String)
+  }
 
 -- (a module the cache has was elaborated clean, and nothing it is made
 -- of has changed: its text is not even parsed)
-elabThawed : Source -> I.Imports -> Thawed -> G.Globals -> Checked
-elabThawed s imps th g0 =
+-- (the definitions thawed once, for all that is made of them)
+thawedChecked : Source -> I.Imports -> Thawed -> T.TopResult -> Checked
+thawedChecked s imps th t =
   mkChecked
     s.module
     s.path
     s.source
     Nil
-    (withStruct
-       s.module
-       (ownOf s.module (T.topThawed g0 th.defs).keys)
-       (T.topThawed g0 th.defs))
+    (withStruct s.module (ownOf s.module t.keys) t)
     Nil
-    (ownOf s.module (T.topThawed g0 th.defs).keys)
+    (ownOf s.module t.keys)
     (importNames imps.imports)
     (openNames imps.imports)
     (aliasPairs imps.imports)
     th.fixities
     True
+
+elabThawed : Source -> I.Imports -> Thawed -> G.Globals -> Checked
+elabThawed s imps th g0 = thawedChecked s imps th (T.topThawed g0 th.defs)
 
 elabTop : Source
         -> I.Imports
@@ -634,14 +654,16 @@ elabFrom : List Checked
 elabFrom done s imps (Just th) direct g0 = elabThawed s imps th g0
 elabFrom done s imps Nothing direct g0 = elabEnv done s imps direct g0
 
-elabDirect : List Checked
-           -> Source
-           -> I.Imports
-           -> Maybe Thawed
-           -> List Checked
-           -> List Checked
-           -> Checked
-elabDirect done s imps thaw direct needed =
+elabClashed : List Checked
+            -> Source
+            -> I.Imports
+            -> Maybe Thawed
+            -> List Checked
+            -> List Checked
+            -> List Imported
+            -> List Imported
+            -> Checked
+elabClashed done s imps thaw direct needed imported clashes =
   elabFrom
     done
     s
@@ -651,26 +673,52 @@ elabDirect done s imps thaw direct needed =
     (aliasQualified
        done
        (aliasOpen
-          (clashesOf (importedOf direct))
-          (aliasOpen
-             (clashesOf (importedOf direct))
-             (envOf done needed)
-             (importedOf direct))
+          clashes
+          (aliasOpen clashes (envOf done needed) imported)
           (concatMapD (\(c : Checked) -> brokenIn c) direct))
        (aliasPairs imps.imports))
 
-elabWith : List Checked -> Source -> I.Imports -> Maybe Thawed -> Checked
-elabWith done s imps thaw =
+-- (what is imported, and which of it clashes, reckoned once)
+elabAliased : List Checked
+            -> Source
+            -> I.Imports
+            -> Maybe Thawed
+            -> List Checked
+            -> List Checked
+            -> List Imported
+            -> Checked
+elabAliased done s imps thaw direct needed imported =
+  elabClashed done s imps thaw direct needed imported (clashesOf imported)
+
+elabDirect : List Checked
+           -> Source
+           -> I.Imports
+           -> Maybe Thawed
+           -> List Checked
+           -> List Checked
+           -> Checked
+elabDirect done s imps thaw direct needed =
+  elabAliased done s imps thaw direct needed (importedOf direct)
+
+-- (the modules reached from the imports, reckoned once)
+elabNeeding : List Checked
+            -> Source
+            -> I.Imports
+            -> Maybe Thawed
+            -> List String
+            -> Checked
+elabNeeding done s imps thaw reached =
   elabDirect
     done
     s
     imps
     thaw
     (filter (\(c : Checked) -> elemStr c.module (openNames imps.imports)) done)
-    (filter
-       (\(c : Checked) ->
-          elemStr c.module (closure done (importNames imps.imports)))
-       done)
+    (filter (\(c : Checked) -> elemStr c.module reached) done)
+
+elabWith : List Checked -> Source -> I.Imports -> Maybe Thawed -> Checked
+elabWith done s imps thaw =
+  elabNeeding done s imps thaw (closure done (importNames imps.imports))
 
 -- | one more module, elaborated after what it imports; a module `thaw`
 -- | has is not read or elaborated -- its definitions come back through
