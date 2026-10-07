@@ -190,6 +190,33 @@ static inline void heff_take(V v, uint64_t keep) {
   }
 }
 
+// (as `heff_take`, the cell kept for a tag of its size to be built in
+// (`heff_tag_at`): its last reference, the cell itself, its fields
+// taken or dropped and blanked; otherwise none, 0)
+static inline V heff_take_reuse(V v, uint64_t keep) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) {
+    for (int64_t i = 0; i < t->n; i++) {
+      if (!((keep >> i) & 1)) heff_drop(t->f[i]);
+      t->f[i] = MK_INT(0);
+    }
+    return v;
+  }
+  for (int64_t i = 0; i < t->n; i++)
+    if ((keep >> i) & 1) heff_dup(t->f[i]);
+  if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  return MK_INT(0);
+}
+
+// (a tag built in the cell `r` kept for it, or a new one)
+static inline V heff_tag_at(V r, int id, int64_t n, V *f) {
+  if (!IS_OBJ(r)) return heff_tag(id, n, f);
+  Tag *t = (Tag *)r;
+  t->h.tag = (uint16_t)id;
+  memcpy(t->f, f, n * sizeof(V));
+  return r;
+}
+
 static V heff_clo(Fn fn, int arity, int nenv, V *env) {
   Clo *c = heff_obj_alloc(sizeof(Clo) + nenv * sizeof(V));
   c->h.rc = 1; c->h.kind = K_CLO; c->h.tag = 0;
