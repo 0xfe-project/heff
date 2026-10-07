@@ -59,7 +59,7 @@ heff completions SHELL         # fish, bash or zsh completions
 ```
 
 Flags go anywhere among the words, as getopt_long reads them (`-b node`,
-`--back=node`, `--`); `lib/cli.hf` reads them, for any heff program.
+`--back=node`, `--`); `std.cli` reads them, for any heff program.
 
 ## Modules
 
@@ -67,11 +67,12 @@ A project is a directory with a `package.hf`: a heff file defining
 `package`, of type `Package` (`lib/manifest.hf`), read without being
 run.  A module is a file under its `src/`, named by its path there:
 `src/parse/surface.hf` is `parse.surface`.  Modules are looked up there
-and in `lib/`; a file outside `src/` (a test) may also import files
-beside it, by their paths from the root.  Compiled modules are cached in
-`.heff/`.  A package required is fetched by git from its path (`heff
-get`), the version chosen as Go's minimal version selection does, into
-`~/.cache/heff/mod`; `heff.sum` holds the tree of each version.
+and in `lib/` (`std.io` is `lib/std/io.hf`); a file outside `src/` (a
+test) may also import files beside it, by their paths from the root.
+Compiled modules are cached in `.heff/`.  A package required is fetched
+by git from its path (`heff get`), the version chosen as Go's minimal
+version selection does, into `~/.cache/heff/mod`; `heff.sum` holds the
+tree of each version.
 
 ```haskell
 import manifest
@@ -93,9 +94,9 @@ them -- it can do nothing else -- and is given them where it runs:
 
 ```haskell
 import co
-import fs
 import prelude
-import stdio
+import std.filesystem
+import std.io
 
 world : HFunctor
 world = stdio <+> fs
@@ -109,10 +110,20 @@ main : Co world Unit
 main = program (io := \p -> InL p) (disk := \p -> InR p)
 ```
 
-`lib/` has effects for the standard streams, the process, files, time,
-the network and web pages; each one's JavaScript side is in
-`M.provider.js` beside `M.hf`.  `examples/` has apps for the browser
-(`npm run examples`).
+## The library
+
+`lib/` goes with the compiler, its version the compiler's; `HEFF_LIB`
+says where it is, else it is the `lib/` beside the compiler.  Its
+modules are imported by their names: `builtin` (implicit in every
+module), `prelude`, `co`, `state`, `exn`, `par`, `array`, `map`, `set`,
+and `manifest` (the type of `package.hf`).  The batteries ship with it,
+under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
+`std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
+`std.dom` (web pages), `std.path`, `std.cli` (command lines) and
+`std.doc` (documents laid out).  An effect's JavaScript side is in
+`M.provider.js` beside `M.hf`.
+
+`examples/` has apps for the browser (`npm run examples`).
 
 ## Developing
 

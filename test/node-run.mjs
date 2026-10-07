@@ -41,7 +41,7 @@ if (build("test/node/timed.hf", "timed", timed)) {
 // a computation of an effect Node has no handler for is refused, and why
 {
   const r = spawnSync("node", [join(root, "output", "heff.mjs"), "compile", "examples/counter/counter.hf", join(work, "counter.mjs"), "--backend=node"], { cwd: root, encoding: "utf8" });
-  check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect dom.dom, which is not provided here"), true);
+  check("an app is not a program", r.status !== 0 && r.stderr.includes("counter has the effect std.dom.dom, which is not provided here"), true);
 }
 
 // one world handled at home (a counter: state, peeled off in the
@@ -70,7 +70,7 @@ if (build("test/node/deep.hf", "deep", deep)) {
 // (each operation goes on at once: the stack must not overflow)
 const loop = join(work, "loop.hf"), loopJs = join(work, "loop.mjs");
 writeFileSync(loop, [
-  "import co", "import prelude", "import process", "import stdio", "",
+  "import co", "import prelude", "import std.process", "import std.io", "",
   "eff : HFunctor",
   "eff = stdio <+> process", "",
   "loop : {{io : stdio <: eff}} -> {{sys : process <: eff}} -> Int -> Int -> Co eff Unit",

@@ -45,13 +45,13 @@ const offsetsIn = (f) => {
 };
 
 const kinds = [
-  { kind: "check", files: filesIn(["lib", "test/nbe", "test/surface", "test/errors", "test/modules", "test/modules/src"]),
+  { kind: "check", files: filesIn(["lib", "lib/std", "test/nbe", "test/surface", "test/errors", "test/modules", "test/modules/src"]),
     say: async (f) => said(await heff(["check", f])) },
-  { kind: "explain", files: filesIn(["lib", "test/nbe", "test/surface", "test/errors"]),
+  { kind: "explain", files: filesIn(["lib", "lib/std", "test/nbe", "test/surface", "test/errors"]),
     say: async (f) => said(await heff(["explain", f])) },
-  { kind: "eval", files: filesIn(["lib", "test/nbe"]),
+  { kind: "eval", files: filesIn(["lib", "lib/std", "test/nbe"]),
     say: async (f) => said(await heff(["dump-eval", f])) },
-  { kind: "type-at", files: filesIn(["lib", "test/surface", "test/nbe"]),
+  { kind: "type-at", files: filesIn(["lib", "lib/std", "test/surface", "test/nbe"]),
     say: async (f) => {
       // (one run for all of them, a line each)
       const offsets = offsetsIn(f);
