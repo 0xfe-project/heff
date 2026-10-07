@@ -1,26 +1,27 @@
 -- A test's report, where it meets the terminal: what differs between an
--- expectation and a value (jsdiff's word difference), and whether
--- colour may be used.  An
--- effect, so that its side is JavaScript: src/heff/report.provider.js.
+-- expectation and a value (`heff.diff`, word by word), and whether
+-- colour may be used -- an effect, so that its side is JavaScript:
+-- src/heff/report.provider.js.
 
 import co
+import heff.diff as D
 import prelude
 
-data ReportF (m : Type -> Type) x
-  = Differ Bool String String (String -> String -> String -> x)
-  | UseColor (Bool -> x)
+data ReportF (m : Type -> Type) x = UseColor (Bool -> x)
 
 -- | A test's report, at the terminal, as an effect.
 report : HFunctor
 report =
   { f = ReportF
   , hfmap = \fm g p -> case p of
-      Differ c e v k -> Differ c e v (\a b d -> g (k a b d))
       UseColor k -> UseColor (\b -> g (k b))
   , hmap = \nt p -> case p of
-      Differ c e v k -> Differ c e v k
       UseColor k -> UseColor k
   }
+
+-- | the standard output is a terminal, and `NO_COLOR` is not set
+useColor : {e : HFunctor} -> {{ev : report <: e}} -> Co e Bool
+useColor = op (ev (UseColor (\b -> b))) val
 
 -- | the expectation and the value, cut to where they differ, and the
 -- | difference, `[-expected-]` and `{+got+}`
@@ -29,16 +30,57 @@ type Mismatch = { expected : String, got : String, diff : String }
 mkMismatch : String -> String -> String -> Mismatch
 mkMismatch e g d = { expected = e, got = g, diff = d }
 
--- | what differs between `expected` and `got` (in colour, if `color`)
-mismatch : {e : HFunctor}
-         -> {{ev : report <: e}}
-         -> Bool
-         -> String
-         -> String
-         -> Co e Mismatch
-mismatch color expected got =
-  op (ev (Differ color expected got (\a b d -> mkMismatch a b d))) val
+-- | how much of a stretch alike is kept at each end of it
+context : Int
+context = 20
 
--- | the standard output is a terminal, and `NO_COLOR` is not set
-useColor : {e : HFunctor} -> {{ev : report <: e}} -> Co e Bool
-useColor = op (ev (UseColor (\b -> b))) val
+-- | a stretch alike: kept whole if short, else its ends (only the end
+-- | after the start, only the start before the end)
+cut : String -> Bool -> Bool -> String
+cut s first last =
+  if strLength s <= 2 * context + 1 then s
+  else if first then "…" ++ strSlice s (strLength s - context) (strLength s)
+  else if last then strSlice s 0 context ++ "…"
+  else strSlice s 0 context
+    ++ "…"
+    ++ strSlice s (strLength s - context) (strLength s)
+
+escape : String -> String
+escape code = fromCharCode 27 ++ "[" ++ code ++ "m"
+
+-- | `s` in a colour (`31`, red; `32`, green), if `color`
+paint : Bool -> String -> String -> String
+paint color code s = if color then escape code ++ s ++ escape "0" else s
+
+mismatchGo : Bool -> Int -> Int -> List (D.Edit String) -> Mismatch -> Mismatch
+mismatchGo color i n Nil m = m
+mismatchGo color i n (Cons p rest) m =
+  mismatchGo color (i + 1) n rest (case p of
+  Added v ->
+    mkMismatch
+      m.expected
+      (m.got ++ paint color "32" v)
+      (m.diff ++ paint color "32" ("{+" ++ v ++ "+}"))
+  Removed v ->
+    mkMismatch
+      (m.expected ++ paint color "31" v)
+      m.got
+      (m.diff ++ paint color "31" ("[-" ++ v ++ "-]"))
+  Same v ->
+    mkMismatch
+      (m.expected ++ cut v (i == 0) (i == n - 1))
+      (m.got ++ cut v (i == 0) (i == n - 1))
+      (m.diff ++ cut v (i == 0) (i == n - 1)))
+
+-- | what differs between `expected` and `got` (in colour, if `color`)
+mismatch : Bool -> String -> String -> Mismatch
+mismatch color expected got =
+  mismatchGo
+    color
+    0
+    (length (D.diffWords expected got))
+    (D.diffWords expected got)
+    (mkMismatch "" "" "")
+
+-- >>> (mismatch False "a onn b" "a on b").diff
+-- "a [-onn-]{+on+} b"
