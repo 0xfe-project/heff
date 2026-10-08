@@ -387,6 +387,42 @@ write("lib-only/src/libonly/m.hf", "x : Int\nx = 1\n");
 const nothing = spawnSync(heffBin, ["install", "lib-only"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home } });
 expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("no programs"), nothing);
 
+// install again, the program run over and over meanwhile by another
+// process: each run is of the program as it was or as it is, never of one
+// half written (it is put in place by a rename, at once); an install that
+// fails leaves it as it was, and nothing beside it in bin/
+heff("init", "busy");
+const busyHome = join(work, "busy-home"), busyBin = join(busyHome, "bin", "busy");
+const installBusy = () => spawnSync(heffBin, ["install", "busy"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: busyHome } });
+const busyFirst = installBusy();
+const busyMain = readFileSync(join(work, "busy", "app", "busy", "main.hf"), "utf8");
+write("busy/app/busy/main.hf", busyMain.replace("greeting \"world\"", "greeting \"again\""));
+const busyStop = join(work, "busy-stop"), busyReady = join(work, "busy-ready");
+const runsBusy = run(process.execPath, ["-e", [
+  "const { spawnSync } = require('node:child_process'), { existsSync, writeFileSync } = require('node:fs');",
+  "const [bin, stop, ready] = process.argv.slice(1); let runs = 0; const bad = [];",
+  "while (!existsSync(stop)) {",
+  "  const r = spawnSync(bin, [], { encoding: 'utf8' }); runs++;",
+  "  if (r.error || r.status !== 0 || !/^Hello, (world|again)!\\n$/.test(r.stdout)) bad.push(r.error ? r.error.code : `${r.status} ${r.signal} ${JSON.stringify(r.stdout)}`);",
+  "  if (runs === 1) writeFileSync(ready, '');",
+  "}",
+  "console.log(JSON.stringify({ runs, failed: bad.length, bad: bad.slice(0, 5) }));",
+].join("\n"), busyBin, busyStop, busyReady]);
+for (let i = 0; i < 2000 && !existsSync(busyReady); i++) await new Promise((r) => setTimeout(r, 5));
+const busyAgain = installBusy();
+writeFileSync(busyStop, "");
+const busyRuns = await runsBusy;
+const busyRan = (() => { try { return JSON.parse(busyRuns.stdout); } catch { return null; } })();
+expect("install again, the program running meanwhile: never run half written", busyFirst.status === 0 && busyAgain.status === 0 &&
+  busyRan !== null && busyRan.runs > 0 && busyRan.failed === 0 &&
+  spawnSync(busyBin, [], { encoding: "utf8" }).stdout === "Hello, again!\n" && readdirSync(join(busyHome, "bin")).join(",") === "busy",
+  [busyFirst, busyAgain, busyRuns, readdirSync(join(busyHome, "bin"))]);
+write("busy/app/busy/main.hf", busyMain.replace("greeting \"world\"", "greeting 1"));
+const busyBroken = installBusy();
+expect("install that fails: the program installed before kept", busyBroken.status === 1 &&
+  spawnSync(busyBin, [], { encoding: "utf8" }).stdout === "Hello, again!\n" && readdirSync(join(busyHome, "bin")).join(",") === "busy",
+  [busyBroken, readdirSync(join(busyHome, "bin"))]);
+
 // heff itself, installed: it ships its lib/ and its package.hf, so the
 // heff in the heff home finds its library and its version beside bin/,
 // as a release's does (no HEFF_LIB to find it by)

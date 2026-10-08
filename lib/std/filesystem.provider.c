@@ -236,6 +236,21 @@ static V heff_provider_fs(V p, V k) {
     x = heff_answer(f, heff_bool(ok));
     break;
   }
+  case TAG_Replace: {
+    char *to = heff_cstr(heff_field(p, 1));
+    V f = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    // (rename(2) puts a file in place of another at once; Windows' does
+    // not over one there, MoveFileEx does)
+#ifdef _WIN32
+    int ok = MoveFileExA(path, to, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    int ok = rename(path, to) == 0;
+#endif
+    free(to);
+    x = heff_answer(f, heff_bool(ok));
+    break;
+  }
   default:
     heff_fail("not an operation of fs");
     return 0;

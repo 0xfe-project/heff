@@ -924,9 +924,14 @@ inProject st t p = P.join st t.root p
 appFile : P.Style -> Target -> String -> String -> String
 appFile st t x f = inProject st t (P.join st (P.join st "app" x) f)
 
--- (where the C of the program X is: `.heff/build/X/`)
+-- (where the program X is built: `.heff/build/X/`, its C and what is
+-- made of it)
 partsDir : P.Style -> Target -> String -> String
 partsDir st t x = inProject st t (P.join st (P.join st ".heff" "build") x)
+
+-- (`n`, made of the program X, in the project: `.heff/build/X/n`)
+builtAt : P.Style -> Target -> String -> String -> String
+builtAt st t x n = P.join st (partsDir st t x) n
 
 -- | a program of the project: `app/X/` with a build.hf is the program X,
 -- | built as its build.hf says
@@ -1043,9 +1048,9 @@ wrote t path next = do
   next
 
 -- (`.heff/build/X/`, a C file a module, by `zig cc` -- which builds
--- them at once, and again only those that changed -- is the program X:
--- a task under the program's, `p`, of as many items as files and the
--- link, what zig says of them under it)
+-- them at once, and again only those that changed -- is the program X,
+-- `.heff/build/X/X`: a task under the program's, `p`, of as many items
+-- as files and the link, what zig says of them under it)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
@@ -1071,12 +1076,12 @@ zigCc st t p x next = do
       "zig"
       (List.append
          ["cc", t.opt, "-w"]
-         (List.append files ["-o", P.join st t.bin x, "-lm"]))
+         (List.append files ["-o", builtAt st t x x, "-lm"]))
   Pg.end z
-  if ranStatus r == 0 then wrote t (P.join st t.bin x) next
+  if ranStatus r == 0 then next
     else do
       writeErr (ranErr r)
-      printErr ("heff build: `zig cc` could not build " ^ P.join st t.bin x)
+      printErr ("heff build: `zig cc` could not build " ^ builtAt st t x x)
       exit 1
 
 -- (the program X, a Node.js program, made runnable)
@@ -1089,12 +1094,13 @@ nodeDone : {e : HFunctor}
          -> Co e Unit
          -> Co e Unit
 nodeDone st t x next = do
-  r <- run "chmod" ["+x", P.join st t.bin x]
-  wrote t (P.join st t.bin x) next
+  r <- run "chmod" ["+x", builtAt st t x x]
+  next
 
--- (the program X, compiled as its build.hf says, then `next`: a task
--- under `bp`, the programs', of its steps -- through C, compiled, then
--- built by zig; else compiled -- each a task under it as it is done)
+-- (the program X, compiled as its build.hf says, in `.heff/build/X/`,
+-- then `next`: a task under `bp`, the programs', of its steps -- through
+-- C, compiled, then built by zig; else compiled -- each a task under it
+-- as it is done)
 buildApp : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
@@ -1122,22 +1128,24 @@ buildApp st t bp x a next =
     then do
       p <- Pg.start bp x 1
       c <- Pg.start p "compiling for Node.js" 0
+      made <- mkDir (partsDir st t x)
       compileThen
           "node"
           (Just a.run)
-          (P.join st t.bin x)
+          (builtAt st t x x)
           (appFile st t x "main.hf")
           (ended c (nodeDone st t x (ended p next)))
   else if t.pages
     then do
       p <- Pg.start bp x 1
       c <- Pg.start p "compiling for a page" 0
+      made <- mkDir (partsDir st t x)
       compileThen
           "page"
           (Just a.run)
-          (P.join st t.bin (x ^ ".js"))
+          (builtAt st t x (x ^ ".js"))
           (appFile st t x "main.hf")
-          (ended c (wrote t (P.join st t.bin (x ^ ".js")) (ended p next)))
+          (ended c (ended p next))
   else do
     print ("passed over " ^ x ^ ": a page's script, not a program")
     Pg.complete bp
@@ -1263,8 +1271,86 @@ shipIn st t done progs (Just home) = do
     Pg.start Pg.root ("installing in " ^ home) (List.length (shippedBy progs))
   shipAll st t home sh (ended sh done) (shippedBy progs)
 
--- (the programs, built to `t.bin`, and what they ship put where `t`
--- says; then `done`)
+-- (what the program puts in `t.bin`, by its build.hf: itself, or, if
+-- `t.pages`, a page's script)
+madeAs : Target -> App -> Maybe String
+madeAs t a =
+  if strEq a.build.backend "c" || strEq a.build.backend "node" then Just a.name
+  else if t.pages then Just (a.name ^ ".js")
+  else Nothing
+
+-- (`n`, made of the program X, put in `t.bin` in place of what was
+-- there: copied beside it first, as `.n.new`, then renamed to `n`, which
+-- is done at once, so that what runs it meanwhile runs the one or the
+-- other, never a part of either; or, the copy gone and what was there
+-- kept, nothing more done (as on Windows, where nothing is put in place
+-- of a program running); then `next` (a task under `pl`, the programs',
+-- meanwhile)
+placeMade : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> {{prog : Pg.progress <: e}}
+          -> P.Style
+          -> Target
+          -> Pg.Task
+          -> Co e Unit
+          -> String
+          -> Maybe String
+          -> Co e Unit
+placeMade st t pl next x Nothing = do
+  Pg.complete pl
+  next
+placeMade st t pl next x (Just n) = do
+  it <- Pg.start pl n 0
+  fresh <- pure (P.join st t.bin ("." ^ n ^ ".new"))
+  _ <- remove fresh
+  copied <- copy (builtAt st t x n) fresh
+  placed <- if copied then replace fresh (P.join st t.bin n) else pure False
+  if placed then wrote t (P.join st t.bin n) (ended it next)
+    else do
+      _ <- remove fresh
+      shipFails
+          ("cannot put "
+           ^ builtAt st t x n
+           ^ " in place of "
+           ^ P.join st t.bin n)
+
+placeAll : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{prog : Pg.progress <: e}}
+         -> P.Style
+         -> Target
+         -> Pg.Task
+         -> Co e Unit
+         -> List App
+         -> Co e Unit
+placeAll st t pl next Nil = next
+placeAll st t pl next (Cons a rest) =
+  placeMade st t pl (placeAll st t pl next rest) a.name (madeAs t a)
+
+-- (the programs, built, put in `t.bin`, a task meanwhile; then `next`)
+placeIn : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{prog : Pg.progress <: e}}
+        -> P.Style
+        -> Target
+        -> Co e Unit
+        -> List App
+        -> Co e Unit
+placeIn st t next progs = do
+  ok <- mkDir t.bin
+  pl <-
+    Pg.start Pg.root ("putting the programs in " ^ t.bin) (List.length progs)
+  placeAll st t pl (ended pl next) progs
+
+-- (the programs, built in the project, then put in `t.bin`, and what
+-- they ship put where `t` says: none put anywhere unless all are built;
+-- then `done`)
 buildPrograms : {e : HFunctor}
               -> {{io : stdio <: e}}
               -> {{sys : process <: e}}
@@ -1277,10 +1363,14 @@ buildPrograms : {e : HFunctor}
               -> List App
               -> Co e Unit
 buildPrograms st t done progs = do
-  ok <- mkDir t.bin
   okC <- mkDir (inProject st t (P.join st ".heff" "build"))
   bp <- Pg.start Pg.root "building programs" (List.length progs)
-  buildEach st t bp (ended bp (shipIn st t done progs t.shipTo)) progs
+  buildEach
+      st
+      t
+      bp
+      (ended bp (placeIn st t (shipIn st t done progs t.shipTo) progs))
+      progs
 
 -- (the `.hf` files under the paths, the directories walked; a name
 -- starting with `.` passed over)
