@@ -276,7 +276,8 @@ there).  Every module imports `builtin` and `prelude` without writing
 them, and `list` as `List`, the operations of lists (`List.map`,
 `List.length`) -- but those they are made of.  A name is the module's
 own definition's, else an import's it writes, else one of those it has
-without writing them; two imports written that have it are an error
+without writing them, a primitive (the prelude's `intAdd`) as any other
+name; two imports written that have it are an error
 only where it is used unqualified.  An import a module has already is
 an error -- `import prelude`, or one written twice -- but
 `import prelude as P` is another.  Its other modules are imported by
