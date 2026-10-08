@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { heffBin } from "./heff.mjs";
+import { run } from "./pool.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = mkdtempSync(join(tmpdir(), "heff-project-"));
@@ -24,6 +25,12 @@ const version = /heff = "([^"]*)"/.exec(readFileSync(join(root, "package.hf"), "
 
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}: ${JSON.stringify(got)}`); } };
+
+// (heff itself installed -- looked at last -- begun now, the rest done
+// meanwhile: it builds heff, which takes longest)
+const { HEFF_LIB: _heffLib, ...installEnv } = process.env;
+const heffHome = join(work, "heff-home");
+const selfInstalling = run(heffBin, ["install"], { cwd: root, env: { ...installEnv, HEFF_HOME: heffHome } });
 
 // init: package.hf (for this heff), .gitignore, a module
 // (src/hello/greeting.hf) whose watch holds, the program hello using it
@@ -386,8 +393,7 @@ expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("
 // heff in the heff home finds its library and its version beside bin/,
 // as a release's does (no HEFF_LIB to find it by)
 const { HEFF_LIB: _lib, ...ownEnv } = process.env;
-const heffHome = join(work, "heff-home");
-const selfInstalled = spawnSync(heffBin, ["install"], { cwd: root, encoding: "utf8", env: { ...ownEnv, HEFF_HOME: heffHome } });
+const selfInstalled = await selfInstalling;
 const installedHeff = (...args) => spawnSync(join(heffHome, "bin", "heff"), args, { cwd: work, encoding: "utf8", env: ownEnv });
 write("uses-prelude.hf", "import prelude\n\nxs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n");
 const selfChecked = installedHeff("check", "uses-prelude.hf");
