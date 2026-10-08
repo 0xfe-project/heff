@@ -125,6 +125,7 @@ for (const [args, says] of [
   [["compile", "a.hf", "--backend=node"], "heff compile: expected OUT\n"],
   [["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"], "heff compile: an ES module runs nothing: no --name with --backend=esm"],
   [["init", "a", "b"], "heff init: too many words: b\n"],
+  [["build", "x"], "heff build: too many words: x\nusage: heff build\n"],
 ]) {
   const r = heff(...args);
   expect(`refused: ${args.join(" ")}`, r.status === 1 && r.stdout === "" && r.stderr.startsWith(says), r);

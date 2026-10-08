@@ -56,8 +56,9 @@ heff compile FILE OUT --backend=MODE [--name NAME]
                                # esm: an ES module
                                # page: a script running the app NAME in a web page
                                # node: a Node.js program running NAME
-heff build [NAME...]           # the project: every module of src/ checked, then
-                               # its programs (app/NAME/) built to .heff/bin/
+heff build                     # the whole project: every module of src/
+                               # checked, then every program (app/NAME/)
+                               # built to .heff/bin/
 heff install [DIR]             # the project at DIR built, its programs put in
                                # ~/.heff/bin/ (HEFF_HOME/bin/)
 heff init [DIR]                # a new project

@@ -290,34 +290,44 @@ unlock(join(work, "mod")); rmSync(join(work, "mod"), { recursive: true, force: t
 const moved = inUser("get");
 expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/lib 1.0.0 is tree:") && moved.stderr.includes("its tag has been moved"), moved);
 
-// build: every module of src/ checked, then every program of app/ built
-// to .heff/bin/ (the NAMEd ones only, given NAMEs); install: the
-// programs built into the heff home's bin/ (HEFF_HOME), and said if it
-// is not on the PATH
+// build: the whole project, every module of src/ checked and every
+// program's build.hf read, then, if nothing is wrong, every program of
+// app/ built to .heff/bin/; install: the programs built into the heff
+// home's bin/ (HEFF_HOME), and said if it is not on the PATH
 write("tool/package.hf", manifestOf("tool"));
 write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
-write("tool/app/tool/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = Node, run = \"main\" }\n");
-write("tool/app/tool/main.hf", "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print greeting\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
+const program = (says) => "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print " + says + "\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n";
+for (const [x, says] of [["tool", "greeting"], ["again", "(greeting ++ \", again\")"]]) {
+  write(`tool/app/${x}/build.hf`, "import manifest\n\nbuild : Build\nbuild = { backend = Node, run = \"main\" }\n");
+  write(`tool/app/${x}/main.hf`, program(says));
+}
 const inTool = (...args) => spawnSync(heffBin, args, { cwd: join(work, "tool"), encoding: "utf8" });
 const built = inTool("build");
-const toolBin = join(work, "tool", ".heff", "bin", "tool");
-expect("build: the modules checked, the programs built", built.status === 0 && built.stdout.includes("heff build: 1 module checked") &&
-  built.stdout.includes("wrote .heff/bin/tool") && existsSync(toolBin) &&
-  spawnSync(toolBin, [], { encoding: "utf8" }).stdout === "hi from tool\n", built);
+const toolBin = join(work, "tool", ".heff", "bin", "tool"), againBin = join(work, "tool", ".heff", "bin", "again");
+expect("build: the modules checked, every program built", built.status === 0 && built.stdout.includes("heff build: 1 module checked") &&
+  built.stdout.includes("wrote .heff/bin/tool") && built.stdout.includes("wrote .heff/bin/again") &&
+  spawnSync(toolBin, [], { encoding: "utf8" }).stdout === "hi from tool\n" &&
+  spawnSync(againBin, [], { encoding: "utf8" }).stdout === "hi from tool, again\n", built);
 write("tool/src/tool/broken.hf", "import prelude\n\nx : Int\nx = True\n");
 rmSync(join(work, "tool", ".heff", "bin"), { recursive: true });
 const broken = inTool("build");
-expect("build: a module that does not check", broken.status === 1 && broken.stderr.includes("src/tool/broken.hf") &&
-  !existsSync(toolBin), broken);
-const named = inTool("build", "tool");
-expect("build NAME: the program only", named.status === 0 && !named.stdout.includes("checked") && existsSync(toolBin), named);
+expect("build: a module that does not check, nothing built", broken.status === 1 && broken.stderr.includes("src/tool/broken.hf") &&
+  !existsSync(toolBin) && !existsSync(againBin), broken);
 rmSync(join(work, "tool", "src", "tool", "broken.hf"));
-const noProgram = inTool("build", "nope");
-expect("build NAME: no such program", noProgram.status === 1 && noProgram.stderr.includes("no program nope"), noProgram);
+write("tool/app/unread/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = Rust, run = \"main\" }\n");
+write("tool/app/unread/main.hf", program("greeting"));
+const unread = inTool("build");
+expect("build: a build.hf that cannot be read, nothing built", unread.status === 1 && unread.stderr.includes("app/unread/build.hf") &&
+  unread.stderr.includes("no backend Rust") && unread.stderr.includes("nothing built") && !existsSync(toolBin) && !existsSync(againBin), unread);
 const home = join(work, "home"), homeBin = join(home, "bin");
 const install = (path) => spawnSync(heffBin, ["install", "tool"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home, PATH: path } });
+const unreadInstall = install(process.env.PATH);
+expect("install: a build.hf that cannot be read, nothing installed", unreadInstall.status === 1 && unreadInstall.stderr.includes("app/unread/build.hf") &&
+  !existsSync(join(homeBin, "tool")) && !existsSync(join(homeBin, "again")), unreadInstall);
+rmSync(join(work, "tool", "app", "unread"), { recursive: true });
 const installed = install(process.env.PATH);
 expect("install: the programs, in the heff home's bin/", installed.status === 0 && installed.stdout.includes(`installed ${join(homeBin, "tool")}`) &&
+  installed.stdout.includes(`installed ${join(homeBin, "again")}`) &&
   installed.stdout.includes(`${homeBin} is not on the PATH`) &&
   spawnSync(join(homeBin, "tool"), [], { encoding: "utf8" }).stdout === "hi from tool\n", installed);
 const onPath = install(`${homeBin}:${process.env.PATH}`);
