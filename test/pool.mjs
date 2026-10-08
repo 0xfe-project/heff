@@ -5,10 +5,7 @@
 // file does not decode, so it is elaborated over.
 import { spawn } from "node:child_process";
 import { availableParallelism } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-export const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+import { root } from "./heff.mjs";
 
 // | a process run to its end: `{ status, signal, stdout, stderr }`, as
 // | spawnSync answers (a timeout kills it, `signal` then set; one that

@@ -11,8 +11,8 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { root, run, pool } from "./pool.mjs";
-import { heffBin } from "./heff.mjs";
+import { run, pool } from "./pool.mjs";
+import { heffBin, root } from "./heff.mjs";
 
 // (`node test/golden.mjs [--update] [KIND...]`: only the kinds named,
 // check, explain, eval, type-at; all by default)

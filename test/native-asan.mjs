@@ -10,11 +10,10 @@
 //   node test/native-asan.mjs
 import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, join } from "node:path";
+import { root } from "./heff.mjs";
 import { pool, run } from "./pool.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // (the program beside its library and version, as a release lays it out,
 // in a project as the repository is, its modules named as they are there)
 const work = join(root, ".heff", "ref", "native-asan");

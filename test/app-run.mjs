@@ -4,12 +4,10 @@
 // as `<script src>` loads it, a classic script (not a module) in the page's window.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import vm from "node:vm";
-import { heffBin } from "./heff.mjs";
+import { heffBin, root } from "./heff.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = join(root, ".heff", "ref", "app-run");
 mkdirSync(work, { recursive: true });
 

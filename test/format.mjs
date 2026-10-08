@@ -6,11 +6,9 @@
 // definitions kept as written (`-- fmt: skip`), some with the exact result.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { heffBin } from "./heff.mjs";
-
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { heffBin, root } from "./heff.mjs";
 
 // the formatter, compiled to a module of its own, its `format` called
 // directly: `Right` the text laid out, `Left` why not

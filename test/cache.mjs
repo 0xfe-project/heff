@@ -7,11 +7,9 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, basename } from "node:path";
-import { fileURLToPath } from "node:url";
-import { heffBin } from "./heff.mjs";
+import { join, basename } from "node:path";
+import { heffBin, root } from "./heff.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 if (!existsSync(heffBin)) { console.log(`FAIL cache: no ${heffBin} (run node scripts/build.mjs first)`); process.exit(1); }
 
 const dir = mkdtempSync(join(tmpdir(), "heff-cache-"));

@@ -8,11 +8,9 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { heffBin } from "./heff.mjs";
+import { basename, join } from "node:path";
+import { heffBin, root } from "./heff.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = mkdtempSync(join(tmpdir(), "heff-cli-"));
 const heff = (...args) => spawnSync(heffBin, [...args], { cwd: work, encoding: "utf8" });
 

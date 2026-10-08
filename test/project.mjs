@@ -11,11 +11,9 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { heffBin } from "./heff.mjs";
+import { heffBin, root } from "./heff.mjs";
 import { run } from "./pool.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const work = mkdtempSync(join(tmpdir(), "heff-project-"));
 // (packages are fetched into the test's own cache)
 process.env.HEFF_MODCACHE = join(work, "mod");

@@ -6,11 +6,10 @@
 // references and renaming across the project, formatting, shutdown.
 import { spawn } from "node:child_process";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { heffBin } from "./heff.mjs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { heffBin, root } from "./heff.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const uri = (f) => pathToFileURL(join(root, f)).href;
 const disk = (f) => readFileSync(join(root, f), "utf8");
 

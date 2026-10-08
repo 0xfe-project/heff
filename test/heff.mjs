@@ -1,5 +1,5 @@
-// The compiler the tests run: `HEFF`, else the one built
-// (scripts/build.mjs), .heff/out/heff.
+// The repository the tests are of, and the compiler they run: `HEFF`,
+// else the one built (scripts/build.mjs), .heff/out/heff.
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
