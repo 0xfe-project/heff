@@ -234,6 +234,16 @@ checks.push(ran("a long loop, handled in the language", "bench/state.hf", "main"
 
 for (const msgs of await values) said(msgs);
 console.log(`backends: ${cases.length} programs, ${compared} values compared`);
+
+// `f $ x` inlined, a call of `f`: the prelude's `$` is not in the code
+// either backend made of test/programs/dollar.hf (`op_dollar` in
+// JavaScript, `prelude_2e_24` in C)
+{
+  const code = (f) => { try { return readFileSync(join(work, f), "utf8"); } catch { return null; } };
+  const js = code("dollar-js.mjs"), c = code("dollar-c.c");
+  if (js !== null && js.includes("op_dollar")) said(["FAIL dollar (js): `$` is not inlined"]);
+  if (c !== null && /prelude_2e_24\b/.test(c)) said(["FAIL dollar (c): `$` is not inlined"]);
+}
 for (const msgs of await Promise.all(checks)) said(msgs);
 console.log(`backends: ${failed ? `${failed} FAILED` : "all agree"}`);
 process.exit(failed ? 1 : 0);

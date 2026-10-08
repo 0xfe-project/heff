@@ -17,7 +17,7 @@ const hfIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hf
 let failed = 0;
 
 const examples = readdirSync(join(root, "examples"), { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => hfIn(join("examples", d.name)));
-const files = [...hfIn("lib"), ...hfIn("lib/std"), ...hfIn("src/heff"), ...hfIn("src/heff/fmt"), "app/heff/main.hf", ...examples, ...hfIn("test/surface"), ...hfIn("test/check"), "test/modules/app/main.hf", "test/modules/qualified.hf", "test/modules/struct-use.hf", "test/modules/value-use.hf", "test/modules/own-primitive.hf", "test/programs/own-primitives.hf"];
+const files = [...hfIn("lib"), ...hfIn("lib/std"), ...hfIn("src/heff"), ...hfIn("src/heff/fmt"), "app/heff/main.hf", ...examples, ...hfIn("test/surface"), ...hfIn("test/check"), "test/modules/app/main.hf", "test/modules/qualified.hf", "test/modules/struct-use.hf", "test/modules/value-use.hf", "test/modules/own-primitive.hf", "test/programs/own-primitives.hf", "test/programs/dollar.hf"];
 // (the files dealt out to as many `heff test` runs as there are cores, all
 // at once; what they say added up)
 const n = Math.min(availableParallelism(), files.length);

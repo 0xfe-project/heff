@@ -182,6 +182,29 @@ calm : String
 calm = greet "hi"                 -- "hi"; greet (loud := True) "hi" is "hi!"
 ```
 
+## Operators
+
+An operator is a name of symbols, defined as `(op) a b = ...`, and how
+it binds is declared relatively: `infixl`, `infixr` or `infix`, the
+operators of a group, then `above` the groups it binds tighter than and
+`below` those it binds looser than, each named by any of its operators.
+Binding tighter goes along a chain of them; two operators no chain
+relates are refused side by side, parentheses saying which is first
+(the prelude's `^` and `+`, `a + b ^ c`).  `below` alone is below all,
+any module's operators too.  The prelude's `$` is: `f $ x` is `f x`, to
+the right, so `f $ g $ h x` is `f (g (h x))` and `showInt $ a + b * c`
+shows the sum; it is inlined, a call of `f` itself.
+
+```haskell
+infixl .+. below +
+
+(.+.) : Int -> Int -> Int
+(.+.) a b = a * 10 + b
+
+-- >>> showInt $ 1 .+. 2 + 3
+-- "15"
+```
+
 ## Numbers
 
 `Int` is an integer of any size, `Float` IEEE 754's double (`Float64`
