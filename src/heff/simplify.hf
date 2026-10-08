@@ -1287,8 +1287,23 @@ concatDefs : List (List I.Def) -> List I.Def
 concatDefs Nil = Nil
 concatDefs (Cons ds rest) = appendL ds (concatDefs rest)
 
+-- (a copy made for two modules: the first's kept)
+onceOne : (M.Map String Unit -> List I.Def -> List I.Def)
+        -> M.Map String Unit
+        -> I.Def
+        -> List I.Def
+        -> List I.Def
+onceOne go seen d rest =
+  if M.member compareString d.key seen then go seen rest
+  else Cons d (go (M.insert compareString d.key MkUnit seen) rest)
+
+onceGo : M.Map String Unit -> List I.Def -> List I.Def
+onceGo seen Nil = Nil
+onceGo seen (Cons d rest) = onceOne onceGo seen d rest
+
 simplifyDone : Pair (List (List I.Def)) St -> Simplified
-simplifyDone (MkPair out st) = { defs = concatDefs out, supply = st.supply }
+simplifyDone (MkPair out st) =
+  { defs = onceGo M.empty (concatDefs out), supply = st.supply }
 
 initSt : Int -> SG -> St
 initSt n0 sg =
@@ -1309,11 +1324,78 @@ initSt n0 sg =
       }
   }
 
+-- What a module is simplified with is its own: the copies made for
+-- it, and the calls found plain, are made anew at each module, not
+-- taken from those made for the modules before it -- so that what a
+-- module comes to depends on what it uses, not on what came before it.
+
+-- (each module's own: no copy made, nor call found plain, for another)
+ownSt : M Unit
+ownSt = \s ->
+    MkPair
+      MkUnit
+      { supply = s.supply
+      , fuel = s.fuel
+      , defs = s.defs
+      , safe = s.safe
+      , total = s.total
+      , plain = M.empty
+      , sp =
+          { all = s.sp.all
+          , kinds = s.sp.kinds
+          , specs = M.empty
+          , made = s.sp.made
+          , count = 0
+          , within = s.sp.within
+          , trying = s.sp.trying
+          }
+      }
+
+-- (the last `c` in `k` from `i` on, `at` if none)
+lastAt : String -> Int -> Int -> Int -> Int
+lastAt k c i at =
+  if i >= strLength k then at
+  else lastAt k c (i + 1) (if charCode k i == c then i else at)
+
+digitsFrom : String -> Int -> Bool
+digitsFrom s i =
+  i >= strLength s
+  || (charCode s i >= 48 && charCode s i <= 57 && digitsFrom s (i + 1))
+
+-- (a lifted local definition's last part: `go$3`)
+liftedAt : String -> Int -> Bool
+liftedAt seg d = d > 0 && d + 1 < strLength seg && digitsFrom seg (d + 1)
+
+liftedSeg : String -> Bool
+liftedSeg seg = liftedAt seg (lastAt seg 36 0 (0 - 1))
+
+-- (the module of `k`, its last dot at `at`)
+moduleAt : (String -> String) -> String -> Int -> String
+moduleAt go k at =
+  if at < 0 then k
+  else if liftedSeg (strSlice k (at + 1) (strLength k))
+    then go (strSlice k 0 at)
+  else strSlice k 0 at
+
+-- | the module a definition is of: its key up to its last dot -- a
+-- | lifted local definition's, the definition's it was lifted from
+moduleOfDef : String -> String
+moduleOfDef k = moduleAt moduleOfDef k (lastAt k 46 0 (0 - 1))
+
+-- (each definition in order, anew at each module: `prev` the last's)
+simpDefs : String -> List I.Def -> M (List (List I.Def))
+simpDefs prev Nil = pure Nil
+simpDefs prev (Cons d rest) = do
+  u <- if strEq (moduleOfDef d.key) prev then pure MkUnit else ownSt
+  x <- oneDef d
+  xs <- simpDefs (moduleOfDef d.key) rest
+  pure (Cons x xs)
+
 -- | each definition, in order, simplified; what is inlined is taken
 -- | simplified already
 simplifyProgram : Int -> List I.Def -> Simplified
 simplifyProgram n0 defs =
-  simplifyDone (traverseS (\d -> oneDef d) defs (initSt n0 (safeGlobals defs)))
+  simplifyDone (simpDefs "" defs (initSt n0 (safeGlobals defs)))
 
 -- >>> map (\(d : I.Def) -> d.body) (simplifyProgram 0 [I.mkDef "f" "f" (EApp (ELam ["x"] (EVar "x")) [EInt 1])]).defs
 -- Cons (EInt 1) Nil
