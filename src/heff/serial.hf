@@ -6,6 +6,7 @@
 -- absent.
 
 import array as A
+import heff.decoder
 import heff.dict as D
 import heff.fixed
 import heff.params as Pm
@@ -179,331 +180,225 @@ encodeEl e = joinWith " " (ek.el e Nil)
 encodeTy : Sx.Ty -> String
 encodeTy t = joinWith " " (ek.ty t Nil)
 
--- Reading: a cursor over the stream
+-- Reading: decoders (`heff.decoder`), in sequence
 --------------------------------------------------------------------------------
 
--- (a decoder: from a position, what it read and where it ended)
-type Got a = Pair a Int
-
-bindG : {a b : Type}
-      -> Maybe (Got a)
-      -> (a -> Int -> Maybe (Got b))
-      -> Maybe (Got b)
-bindG Nothing f = Nothing
-bindG (Just (MkPair x i)) f = f x i
-
-gotG : {a : Type} -> a -> Int -> Maybe (Got a)
-gotG x i = Just (MkPair x i)
-
--- (after a token, one space is skipped, or the stream ends)
-pastSep : String -> Int -> Int
-pastSep s i = if i < strLength s && charCode s i == 32 then i + 1 else i
-
-wordEnd : String -> Int -> Int
-wordEnd s i =
-  if i >= strLength s || charCode s i == 32 then i else wordEnd s (i + 1)
-
-takeWord : String -> Int -> Maybe (Got String)
-takeWord s i =
-  if i >= strLength s then Nothing
-  else gotG (strSlice s i (wordEnd s i)) (pastSep s (wordEnd s i))
-
-colonAt : String -> Int -> Int
-colonAt s i =
-  if i >= strLength s || charCode s i == 58 then i else colonAt s (i + 1)
-
-takeStrAt : String -> Int -> Int -> Maybe (Got String)
-takeStrAt s j n =
-  if j + n > strLength s then Nothing
-  else gotG (strSlice s j (j + n)) (pastSep s (j + n))
-
--- (a length-prefixed string: nothing in it is looked at)
-takeStr : String -> Int -> Maybe (Got String)
-takeStr s i =
-  if colonAt s i >= strLength s || colonAt s i == i then Nothing
-  else takeStrAt s (colonAt s i + 1) (Su.intOfText (strSlice s i (colonAt s i)))
-
-takeInt : String -> Int -> Maybe (Got Int)
-takeInt s i = bindG (takeWord s i) (\w j -> gotG (Su.intOfText w) j)
-
 -- (a fixed-width type, by its name)
-takeFixed : String -> Int -> Maybe (Got Fixed)
-takeFixed s i =
-  bindG (takeWord s i) (\w j -> case fixedOfName w of
-  Just f -> gotG f j
-  Nothing -> Nothing)
+takeFixed : Dec Fixed
+takeFixed = do
+  w <- word
+  found (fixedOfName w)
 
-takeBool : String -> Int -> Maybe (Got Bool)
-takeBool s i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "t" then gotG True j
-       else if strEq w "f" then gotG False j
-       else Nothing)
+plicityOf : String -> Dec Pm.Plicity
+plicityOf "0" = pure Expl
+plicityOf "1" = pure Impl
+plicityOf "2" = pure Inst
+plicityOf _ = fail
 
-takePlicity : String -> Int -> Maybe (Got Pm.Plicity)
-takePlicity s i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "0" then gotG Expl j
-       else if strEq w "1" then gotG Impl j
-       else if strEq w "2" then gotG Inst j
-       else Nothing)
+takePlicity : Dec Pm.Plicity
+takePlicity = bind word plicityOf
 
-takeLevel : String -> Int -> Maybe (Got Pm.Level)
-takeLevel s i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "0" then gotG Small j
-       else if strEq w "1" then gotG Large j
-       else if strEq w "2" then gotG TopL j
-       else Nothing)
+levelOf : String -> Dec Pm.Level
+levelOf "0" = pure Small
+levelOf "1" = pure Large
+levelOf "2" = pure TopL
+levelOf _ = fail
 
--- | the decoders, knotted over the stream
-type DK = { el : Int -> Maybe (Got Sx.Tm), ty : Int -> Maybe (Got Sx.Ty) }
+takeLevel : Dec Pm.Level
+takeLevel = bind word levelOf
 
-takeAbs : {a : Type}
-        -> String
-        -> (Int -> Maybe (Got a))
-        -> Int
-        -> Maybe (Got (Sx.Abs a))
-takeAbs s f i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "v"
-         then bindG
-             (takeStr s j)
-             (\x j2 -> bindG (f j2) (\e j3 -> gotG (MkAbs x e) j3))
-       else if strEq w "_" then bindG (f j) (\e j2 -> gotG (AbsConst e) j2)
-       else Nothing)
+-- | the decoders, knotted
+type DK = { el : Dec Sx.Tm, ty : Dec Sx.Ty }
 
-takeManyG : {a : Type}
-          -> (Int -> Maybe (Got a))
-          -> Int
-          -> Int
-          -> Maybe (Got (List a))
-takeManyG f n i =
-  if n <= 0 then gotG Nil i
-  else bindG
-      (f i)
-      (\x j -> bindG (takeManyG f (n - 1) j) (\xs j2 -> gotG (Cons x xs) j2))
+absOf : {a : Type} -> Dec a -> String -> Dec (Sx.Abs a)
+absOf d "v" = do
+  x <- str
+  e <- d
+  pure (MkAbs x e)
+absOf d "_" = do
+  e <- d
+  pure (AbsConst e)
+absOf d _ = fail
 
-takeMany : {a : Type}
-         -> String
-         -> (Int -> Maybe (Got a))
-         -> Int
-         -> Maybe (Got (List a))
-takeMany s f i = bindG (takeInt s i) (\n j -> takeManyG f n j)
+takeAbs : {a : Type} -> Dec a -> Dec (Sx.Abs a)
+takeAbs d = bind word (absOf d)
 
-takePair : {a : Type}
-         -> String
-         -> (Int -> Maybe (Got a))
-         -> Int
-         -> Maybe (Got (Pair String a))
-takePair s f i =
-  bindG (takeStr s i) (\x j -> bindG (f j) (\v j2 -> gotG (MkPair x v) j2))
+takePair : {a : Type} -> Dec a -> Dec (Pair String a)
+takePair d = do
+  x <- str
+  v <- d
+  pure (MkPair x v)
 
-takeDict : {a : Type}
-         -> String
-         -> (Int -> Maybe (Got a))
-         -> Int
-         -> Maybe (Got (D.Dict a))
-takeDict s f i =
-  bindG (takeMany s (\j -> takePair s f j) i) (\ps j -> gotG (D.fromList ps) j)
+takeDict : {a : Type} -> Dec a -> Dec (D.Dict a)
+takeDict d = do
+  ps <- many (takePair d)
+  pure (D.fromList ps)
 
-takeAlt : String -> DK -> Int -> Maybe (Got (Pair (Array String) Sx.Tm))
-takeAlt s k i =
-  bindG
-    (takeMany s (\j -> takeStr s j) i)
-    (\xs j -> bindG (k.el j) (\b j2 -> gotG (MkPair (A.fromList xs) b) j2))
+takeAlt : DK -> Dec (Pair (Array String) Sx.Tm)
+takeAlt k = do
+  xs <- many str
+  b <- k.el
+  pure (MkPair (A.fromList xs) b)
 
-decodeTermF : DK -> String -> Int -> Maybe (Got Sx.Tm)
-decodeTermF k s i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "loc" then bindG (takeInt s j) (\n j2 -> gotG (SLocal n) j2)
-       else if strEq w "glo"
-         then bindG (takeStr s j) (\x j2 -> gotG (SGlobal x) j2)
-       else if strEq w "cod" then bindG (k.ty j) (\t j2 -> gotG (SCode t) j2)
-       else if strEq w "app"
-         then bindG
-             (k.el j)
-             (\f j2 -> bindG (k.el j2) (\a j3 -> gotG (SApp f a) j3))
-       else if strEq w "lam"
-         then bindG
-             (k.ty j)
-             (\t j2 ->
-                bindG
-                  (takeAbs s (\j3 -> k.el j3) j2)
-                  (\b j3 -> gotG (SLam t b) j3))
-       else if strEq w "con"
-         then bindG (takeDict s (\j2 -> k.el j2) j) (\d j2 -> gotG (SCons d) j2)
-       else if strEq w "prj"
-         then bindG
-             (k.el j)
-             (\e j2 -> bindG (takeStr s j2) (\l j3 -> gotG (SProj e l) j3))
-       else if strEq w "tag"
-         then bindG
-             (takeStr s j)
-             (\t j2 ->
-                bindG
-                  (takeMany s (\j3 -> k.el j3) j2)
-                  (\as j3 -> gotG (STag t (A.fromList as)) j3))
-       else if strEq w "mat"
-         then bindG
-             (k.el j)
-             (\e j2 ->
-                bindG
-                  (takeDict s (\j3 -> takeAlt s k j3) j2)
-                  (\cs j3 -> gotG (SMatch e cs) j3))
-       else if strEq w "spe"
-         then bindG
-             (k.el j)
-             (\e j2 ->
-                bindG
-                  (takeStr s j2)
-                  (\l j3 ->
-                     bindG (k.el j3) (\v j4 -> gotG (SSpecialize e l v) j4)))
-       else if strEq w "is" then bindG (k.el j) (\e j2 -> gotG (SIs e) j2)
-       else if strEq w "opq" then gotG SOpaque j
-       else if strEq w "abn" then gotG SAbandon j
-       else if strEq w "rec" then bindG (k.el j) (\e j2 -> gotG (SRec e) j2)
-       else if strEq w "fix"
-         then bindG
-             (k.ty j)
-             (\t j2 ->
-                bindG
-                  (takeAbs s (\j3 -> k.el j3) j2)
-                  (\b j3 -> gotG (SFix t b) j3))
-       else if strEq w "imp"
-         then bindG
-             (takeStr s j)
-             (\x j2 -> bindG (k.el j2) (\e j3 -> gotG (SImplicit x e) j3))
-       else if strEq w "prm"
-         then bindG (takeStr s j) (\x j2 -> gotG (SPrim x) j2)
-       else if strEq w "int"
-         then bindG (takeStr s j) (\x j2 -> gotG (SLitInt (Su.intOfText x)) j2)
-       else if strEq w "flt"
-         then bindG
-             (takeStr s j)
-             (\x j2 -> gotG (SLitFloat (Su.floatOfText x)) j2)
-       else if strEq w "str"
-         then bindG (takeStr s j) (\x j2 -> gotG (SLitString x) j2)
-       else if strEq w "rn"
-         then bindG (takeStr s j) (\x j2 -> gotG (SLitRune (Su.intOfText x)) j2)
-       else if strEq w "fxl"
-         then bindG
-             (takeFixed s j)
-             (\f j2 ->
-                bindG
-                  (takeStr s j2)
-                  (\x j3 -> gotG (SLitFixed f (Su.intOfText x)) j3))
-       else if strEq w "f32"
-         then bindG
-             (takeStr s j)
-             (\x j2 -> gotG (SLitFloat32 (Su.floatOfText x)) j2)
-       else Nothing)
+-- (a term, after the word saying which)
+termOf : DK -> String -> Dec Sx.Tm
+termOf k "loc" = do
+  n <- int
+  pure (SLocal n)
+termOf k "glo" = do
+  x <- str
+  pure (SGlobal x)
+termOf k "cod" = do
+  t <- k.ty
+  pure (SCode t)
+termOf k "app" = do
+  f <- k.el
+  a <- k.el
+  pure (SApp f a)
+termOf k "lam" = do
+  t <- k.ty
+  b <- takeAbs k.el
+  pure (SLam t b)
+termOf k "con" = do
+  d <- takeDict k.el
+  pure (SCons d)
+termOf k "prj" = do
+  e <- k.el
+  l <- str
+  pure (SProj e l)
+termOf k "tag" = do
+  t <- str
+  as <- many k.el
+  pure (STag t (A.fromList as))
+termOf k "mat" = do
+  e <- k.el
+  cs <- takeDict (takeAlt k)
+  pure (SMatch e cs)
+termOf k "spe" = do
+  e <- k.el
+  l <- str
+  v <- k.el
+  pure (SSpecialize e l v)
+termOf k "is" = do
+  e <- k.el
+  pure (SIs e)
+termOf k "opq" = pure SOpaque
+termOf k "abn" = pure SAbandon
+termOf k "rec" = do
+  e <- k.el
+  pure (SRec e)
+termOf k "fix" = do
+  t <- k.ty
+  b <- takeAbs k.el
+  pure (SFix t b)
+termOf k "imp" = do
+  x <- str
+  e <- k.el
+  pure (SImplicit x e)
+termOf k "prm" = do
+  x <- str
+  pure (SPrim x)
+termOf k "int" = do
+  x <- str
+  pure (SLitInt (Su.intOfText x))
+termOf k "flt" = do
+  x <- str
+  pure (SLitFloat (Su.floatOfText x))
+termOf k "str" = do
+  x <- str
+  pure (SLitString x)
+termOf k "rn" = do
+  x <- str
+  pure (SLitRune (Su.intOfText x))
+termOf k "fxl" = do
+  w <- takeFixed
+  x <- str
+  pure (SLitFixed w (Su.intOfText x))
+termOf k "f32" = do
+  x <- str
+  pure (SLitFloat32 (Su.floatOfText x))
+termOf k _ = fail
+
+decodeTermF : DK -> Dec Sx.Tm
+decodeTermF k = bind word (termOf k)
 
 -- (an implicit argument's default, if there is one)
-takeDefault : String -> DK -> Int -> Maybe (Got (Maybe Sx.Tm))
-takeDefault s k i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "j" then bindG (k.el j) (\d j2 -> gotG (Just d) j2)
-       else if strEq w "n" then gotG Nothing j
-       else Nothing)
+defaultOf : DK -> String -> Dec (Maybe Sx.Tm)
+defaultOf k "j" = do
+  d <- k.el
+  pure (Just d)
+defaultOf k "n" = pure Nothing
+defaultOf k _ = fail
 
-decodeTypeF : DK -> String -> Int -> Maybe (Got Sx.Ty)
-decodeTypeF k s i =
-  bindG
-    (takeWord s i)
-    (\w j ->
-       if strEq w "u"
-         then bindG
-             (takeWord s j)
-             (\u j2 ->
-                if strEq u "0" then gotG (SU SmallU) j2
-                else if strEq u "1" then gotG (SU LargeU) j2
-                else Nothing)
-       else if strEq w "de" then bindG (k.el j) (\e j2 -> gotG (SDecode e) j2)
-       else if strEq w "fn"
-         then bindG
-             (takeLevel s j)
-             (\level j2 ->
-                bindG
-                  (k.ty j2)
-                  (\dom j3 ->
-                     bindG
-                       (takeAbs s (\j4 -> k.ty j4) j3)
-                       (\cod j4 ->
-                          bindG
-                            (takePlicity s j4)
-                            (\implicit j5 ->
-                               bindG
-                                 (takeDefault s k j5)
-                                 (\dflt j6 ->
-                                    gotG
-                                      (SFunction level dom cod implicit dflt)
-                                      j6)))))
-       else if strEq w "rc"
-         then bindG
-             (takeLevel s j)
-             (\level j2 ->
-                bindG
-                  (takeDict s (\j3 -> k.ty j3) j2)
-                  (\fs j3 ->
-                     bindG
-                       (takeDict s (\j4 -> k.el j4) j3)
-                       (\ds j4 -> gotG (SRecord level fs ds) j4)))
-       else if strEq w "sm"
-         then bindG
-             (takeDict
-                s
-                (\j2 ->
-                   bindG
-                     (takeMany s (\j3 -> k.ty j3) j2)
-                     (\ts j3 -> gotG (A.fromList ts) j3))
-                j)
-             (\vs j2 -> gotG (SSum vs) j2)
-       else if strEq w "ist" then bindG (k.ty j) (\t j2 -> gotG (SIsTy t) j2)
-       else if strEq w "pi" then gotG SPrimInt j
-       else if strEq w "pf" then gotG SPrimFloat j
-       else if strEq w "ps" then gotG SPrimString j
-       else if strEq w "pr" then gotG SPrimRune j
-       else if strEq w "pa"
-         then bindG (k.ty j) (\t j2 -> gotG (SPrimArray t) j2)
-       else if strEq w "px"
-         then bindG (takeFixed s j) (\f j2 -> gotG (SFixed f) j2)
-       else Nothing)
+takeDefault : DK -> Dec (Maybe Sx.Tm)
+takeDefault k = bind word (defaultOf k)
 
-dkOf : String -> DK
-dkOf s =
-  { el = \i -> decodeTermF (dkOf s) s i, ty = \i -> decodeTypeF (dkOf s) s i }
+universeOf : String -> Dec Sx.Ty
+universeOf "0" = pure (SU SmallU)
+universeOf "1" = pure (SU LargeU)
+universeOf _ = fail
+
+-- (a variant's fields)
+takeFields : DK -> Dec (Array Sx.Ty)
+takeFields k = do
+  ts <- many k.ty
+  pure (A.fromList ts)
+
+-- (a type, after the word saying which)
+typeOf : DK -> String -> Dec Sx.Ty
+typeOf k "u" = bind word universeOf
+typeOf k "de" = do
+  e <- k.el
+  pure (SDecode e)
+typeOf k "fn" = do
+  level <- takeLevel
+  dom <- k.ty
+  cod <- takeAbs k.ty
+  implicit <- takePlicity
+  dflt <- takeDefault k
+  pure (SFunction level dom cod implicit dflt)
+typeOf k "rc" = do
+  level <- takeLevel
+  fs <- takeDict k.ty
+  ds <- takeDict k.el
+  pure (SRecord level fs ds)
+typeOf k "sm" = do
+  vs <- takeDict (takeFields k)
+  pure (SSum vs)
+typeOf k "ist" = do
+  t <- k.ty
+  pure (SIsTy t)
+typeOf k "pi" = pure SPrimInt
+typeOf k "pf" = pure SPrimFloat
+typeOf k "ps" = pure SPrimString
+typeOf k "pr" = pure SPrimRune
+typeOf k "pa" = do
+  t <- k.ty
+  pure (SPrimArray t)
+typeOf k "px" = do
+  w <- takeFixed
+  pure (SFixed w)
+typeOf k _ = fail
+
+decodeTypeF : DK -> Dec Sx.Ty
+decodeTypeF k = bind word (typeOf k)
+
+dk : DK
+dk = { el = \s i -> decodeTermF dk s i, ty = \s i -> decodeTypeF dk s i }
+
+-- | a term, inside a larger stream (the cache's own fields around it)
+takeEl : Dec Sx.Tm
+takeEl = dk.el
+
+takeTy : Dec Sx.Ty
+takeTy = dk.ty
 
 -- | a term, read whole (the stream must end with it)
 decodeEl : String -> Maybe Sx.Tm
-decodeEl s = case (dkOf s).el 0 of
-  Just (MkPair e i) -> if i >= strLength s then Just e else Nothing
-  Nothing -> Nothing
+decodeEl s = run (whole takeEl) s
 
 decodeTy : String -> Maybe Sx.Ty
-decodeTy s = case (dkOf s).ty 0 of
-  Just (MkPair t i) -> if i >= strLength s then Just t else Nothing
-  Nothing -> Nothing
-
--- | decoders at a position inside a larger stream, for the cache's own
--- | fields
-decodeElAt : String -> Int -> Maybe (Got Sx.Tm)
-decodeElAt s i = (dkOf s).el i
-
-decodeTyAt : String -> Int -> Maybe (Got Sx.Ty)
-decodeTyAt s i = (dkOf s).ty i
+decodeTy s = run (whole takeTy) s
 
 -- >>> decodeEl (encodeEl (SApp (SLam SPrimInt (MkAbs "x y" (SLocal 0))) (SLitString "a 3:b")))
 -- Just (SApp (SLam SPrimInt (MkAbs "x y" (SLocal 0))) (SLitString "a 3:b"))

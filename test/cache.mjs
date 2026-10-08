@@ -48,6 +48,45 @@ const healed = heff("check", "c.hf");
 want(healed.status === 0 && healed.stdout === cold.stdout, "a corrupt cache file is elaborated over");
 want(readFileSync(hc("a"), "utf8") !== "garbage", "and frozen again");
 
+// each field a cache file is believed by, changed, is elaborated over:
+// the file is frozen again as it was.  (Its tokens: a length-prefixed
+// string `3:abc` whole, or a word.  `b` declares no fixities: version,
+// module, source hash, no groups, no edges, how many imports -- those it
+// has without writing them too -- each and its namespace's hash, how
+// many outside definitions it needs, each and its hash, ...)
+const tokens = (t) => {
+  const out = [];
+  for (let i = 0; i < t.length; ) {
+    const m = /^(\d+):/.exec(t.slice(i, i + 12));
+    let end = m ? i + m[0].length + Number(m[1]) : t.indexOf(" ", i);
+    if (end < 0) end = t.length;
+    out.push(t.slice(i, end));
+    i = end + 1;
+  }
+  return out;
+};
+const altered = (tok) => tok.slice(0, -1) + (tok.endsWith("x") ? "y" : "x");
+const alteredAt = (k) => (ts) => ts.map((t, i) => (i === k ? altered(t) : t));
+const frozenB = readFileSync(hc("b"), "utf8");
+const toksB = tokens(frozenB);
+const imports = Number(toksB[5]), needs = 6 + 2 * imports;
+want(toksB.join(" ") === frozenB && toksB[3] === "0" && toksB[4] === "0" && toksB.slice(6, needs).includes("1:a") && Number(toksB[needs]) > 0,
+  `b's cache file reads as expected\n${frozenB.slice(0, 160)}`);
+const mismatches = [
+  ["its version", alteredAt(0)],
+  ["its module", alteredAt(1)],
+  ["its source's hash", alteredAt(2)],
+  ["an import's namespace hash", alteredAt(7)],
+  ["an import left out", (ts) => [...ts.slice(0, 5), String(imports - 1), ...ts.slice(8)]],
+  ["a needed definition's hash", alteredAt(needs + 2)],
+];
+for (const [what, change] of mismatches) {
+  writeFileSync(hc("b"), change(toksB).join(" "));
+  const r = heff("check", "c.hf");
+  want(r.status === 0 && r.stdout === cold.stdout, `a cache file with ${what} changed: checked as before`);
+  want(readFileSync(hc("b"), "utf8") === frozenB, `a cache file with ${what} changed is elaborated over`);
+}
+
 // a comment-only change deep down: the importer between still thaws
 // (the entry file is always fresh; `b` is the one to watch)
 const tB1 = mtime("b");
