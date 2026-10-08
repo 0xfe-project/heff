@@ -4,9 +4,11 @@
 // (The apps are run by test/app-run.mjs.)
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { heffBin } from "./heff.mjs";
+import { pool, run } from "./pool.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const heff = (...args) => spawnSync(heffBin, [...args], { cwd: root, encoding: "utf8" });
@@ -15,9 +17,17 @@ let failed = 0;
 
 const examples = readdirSync(join(root, "examples"), { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => hfIn(join("examples", d.name)));
 const files = [...hfIn("lib"), ...hfIn("lib/std"), ...hfIn("src/heff"), ...hfIn("src/heff/fmt"), "app/heff/main.hf", ...examples, ...hfIn("test/surface"), ...hfIn("test/check"), "test/modules/app/main.hf", "test/modules/qualified.hf", "test/modules/struct-use.hf", "test/modules/value-use.hf"];
-const t = heff("test", ...files);
-console.log(t.stdout.trim().split("\n").pop());
-if (t.status !== 0) { failed++; console.log(t.stdout + t.stderr); }
+// (the files dealt out to as many `heff test` runs as there are cores, all
+// at once; what they say added up)
+const n = Math.min(availableParallelism(), files.length);
+const runs = await pool(Array.from({ length: n }, (_, i) => files.filter((_, k) => k % n === i)), (some) => run(heffBin, ["test", ...some]));
+const held = [0, 0, 0, 0];
+for (const t of runs) {
+  const m = /(\d+)\/(\d+) expectations hold(?:, (\d+)\/(\d+) tests hold)?\n$/.exec(t.stdout) ?? [];
+  for (let i = 0; i < 4; i++) held[i] += Number(m[i + 1] ?? 0);
+  if (t.status !== 0 || !m.length) { failed++; console.log(t.stdout + t.stderr); }
+}
+console.log(`${held[0]}/${held[1]} expectations hold, ${held[2]}/${held[3]} tests hold`);
 
 // what must not elaborate, and the error it must give
 const rejected = [
