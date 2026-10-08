@@ -11,6 +11,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { basename, join } from "node:path";
 import { root } from "./heff.mjs";
 import { pool, run } from "./pool.mjs";
@@ -41,6 +42,10 @@ const c = readdirSync(parts).filter((f) => f.endsWith(".c")).map((f) => join(par
 // object kept from a run before, in .heff/ref/native-asan.o/, named by
 // what it is made of -- the clang, the flags, heff.h and the part -- is
 // not made again, and one no part is made of now is let go)
+// (under CI, four at once at most: a part takes clang up to some 750MB,
+// and a container's memory may be less than its cores' share;
+// HEFF_ASAN_JOBS=N, N at once)
+const jobs = Number(process.env.HEFF_ASAN_JOBS) || (process.env.CI ? Math.min(availableParallelism(), 4) : availableParallelism());
 const flags = ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0"];
 const kept = join(root, ".heff", "ref", "native-asan.o");
 mkdirSync(kept, { recursive: true });
@@ -53,7 +58,7 @@ const objects = await pool(c, async (f) => {
   if (r.status !== 0) { console.log(`building it failed, at ${basename(f)}:\n${r.stdout}${r.stderr}${r.error || ""}`); process.exit(1); }
   renameSync(o + ".part", o);
   return o;
-});
+}, jobs);
 for (const n of readdirSync(kept)) if (!objects.includes(join(kept, n))) rmSync(join(kept, n));
 step("building it", "clang", [...flags, ...objects, "-o", heff, "-lm", "-lpthread"]);
 
