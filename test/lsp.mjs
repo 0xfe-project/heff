@@ -299,6 +299,14 @@ try {
   expect("references in a file", notLines && [pos(basics, "not :"), pos(basics, "not True"), pos(basics, "not False"), pos(basics, "not (not"), pos(basics, ">>> not")].every((p) => notLines.includes(p.line)) && notLines.length === 6, refs.result);
   const usesOnly = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)"), context: { includeDeclaration: false } });
   expect("references without the definition", usesOnly.result && usesOnly.result.length === 3, usesOnly.result);
+  // a watch's expectation: a name written there is a reference, but not a
+  // string's text, nor a record's label
+  const expecting = 'name : String\nname = "name"\n\ntype R = { name : String, n : Int }\n\ny : R\ny = { name = name, n = 1 }\n\n-- >>> y\n-- { name = "name", n = 1 }\n\n-- >>> y.name\n-- name\n';
+  open("test/surface/lsp-expect.hf", expecting);
+  await diagnosticsOf(uri("test/surface/lsp-expect.hf"));
+  const eRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/lsp-expect.hf") }, position: { line: 0, character: 0 }, context: { includeDeclaration: true } });
+  expect("references in a watch's expectation", eRefs.result && eRefs.result.map((r) => r.range.start.line).join() === [0, 1, 6, 12].join(), eRefs.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-expect.hf") } });
 
   // a local: its binder and its uses, in its equation only (`f` is bound by
   // each equation of `map`); renamed there, unless the new name would be
