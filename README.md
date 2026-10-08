@@ -292,6 +292,16 @@ main : Co world Unit
 main = program (io := \p -> InL p) (disk := \p -> InR p)
 ```
 
+A handler says what its effect's operations do, in a monad of its
+own; `through` handles one effect into `Co` of the others.  Pure work
+runs where it is reached, by value: an argument where the computation
+is built (`pure (fib n)` computes `fib n` there), a step after a `bind`
+as the computation is handled.  Only what comes after an operation is
+left to the handler's monad, so a handler into `Co e` that puts a part
+elsewhere -- `lib/parallel.hf`'s `Par`, a side in a process of its own
+-- finds its pure work done already, unless it comes after `later`:
+`parIn (later (\u -> fib n)) (later (\u -> fib m))`.
+
 ## The library
 
 `lib/` goes with the compiler, its version the compiler's; `HEFF_LIB`
