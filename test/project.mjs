@@ -29,7 +29,7 @@ const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`
 const made = heff("init", "hello");
 const pkg = readFileSync(join(work, "hello", "package.hf"), "utf8");
 expect("init", made.status === 0 && pkg.includes(`heff = "${version}"`) && pkg.includes(`module = "hello"`) &&
-  readFileSync(join(work, "hello", ".gitignore"), "utf8").includes(".heff/"), made);
+  readFileSync(join(work, "hello", ".gitignore"), "utf8") === ".heff/\n", made);
 const laid = heff("fmt", "--check", "hello/package.hf", "hello/src/hello/main.hf");
 expect("init's files are laid out", laid.status === 0, laid);
 const tested = heff("test", "hello/src/hello/main.hf");

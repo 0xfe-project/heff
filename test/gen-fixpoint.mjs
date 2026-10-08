@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // The compiler is its own fixed point: heff (built by scripts/build.mjs
-// from output/heff.d/: heff.h, and a C file a module) compiles its own
-// source -- loading its import closure itself -- to output/heff-gen.d/,
-// which must be output/heff.d/, file for file, byte for byte.
+// from .heff/out/heff.d/: heff.h, and a C file a module) compiles its own
+// source -- loading its import closure itself -- to .heff/out/heff-gen.d/,
+// which must be .heff/out/heff.d/, file for file, byte for byte.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { heff, heffBin, root } from "./heff.mjs";
 
-const built = join(root, "output", "heff.d");
-const gen = join(root, "output", "heff-gen.d");
+const built = join(root, ".heff", "out", "heff.d");
+const gen = join(root, ".heff", "out", "heff-gen.d");
 
-if (!existsSync(heffBin) || !existsSync(built)) { console.log("FAIL gen-fixpoint: no output/heff and output/heff.d (run node scripts/build.mjs first)"); process.exit(1); }
+if (!existsSync(heffBin) || !existsSync(built)) { console.log("FAIL gen-fixpoint: no .heff/out/heff and .heff/out/heff.d (run node scripts/build.mjs first)"); process.exit(1); }
 
 const r = heff(["compile", "app/heff/main.hf", gen + "/", "--name", "main", "--backend=c"], { cwd: root });
 if (r.status !== 0) { console.log(`FAIL gen-fixpoint: the compiler refused its own source (status ${r.status}, signal ${r.signal}${r.error ? `, ${r.error}` : ""})\n${r.stdout}${r.stderr}`.split("\n").slice(0, 12).join("\n")); process.exit(1); }

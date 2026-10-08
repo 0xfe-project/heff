@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The tests, by group: each GROUP given (all without one) run in turn,
 // each of its tests a script of test/, on heff as test/heff.mjs says
-// (`HEFF`, else output/heff, built by scripts/build.mjs).  CI runs the
+// (`HEFF`, else .heff/out/heff, built by scripts/build.mjs).  CI runs the
 // groups apart, one job each.
 //
 //   node test/run.mjs [GROUP...]

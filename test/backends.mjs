@@ -22,7 +22,7 @@ import { heff, root } from "./heff.mjs";
 
 const [nArg = "100", seedArg = "7"] = process.argv.slice(2);
 setSeed(seedArg);
-const work = join(root, "ref", `backends-${seedArg}`);
+const work = join(root, ".heff", "ref", `backends-${seedArg}`);
 rmSync(work, { recursive: true, force: true });
 mkdirSync(work, { recursive: true });
 

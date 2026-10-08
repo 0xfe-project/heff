@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // The compiler, bootstrapped: a compiler there is (stage 0) compiles
 // app/heff/main.hf to a first stage, and the first stage compiles the
-// same source to C, output/heff.d/ (a file a module) -- made by the
+// same source to C, .heff/out/heff.d/ (a file a module) -- made by the
 // backend of the source, whatever stage 0's was -- which `zig cc` builds
-// (each file apart, and again only those changed) into output/heff,
-// `heff`.  Stage 0 is the heff built before (output/heff), as Go builds
+// (each file apart, and again only those changed) into .heff/out/heff,
+// `heff`.  Stage 0 is the heff built before (.heff/out/heff), as Go builds
 // with a Go there is; where there is none, or it cannot compile the
 // source, the seed: boot/heff.tar.xz, heff compiled by itself to C,
-// unpacked to output/heff-seed.d/ and built by zig for this machine.
+// unpacked to .heff/out/heff-seed.d/ and built by zig for this machine.
 // (test/gen-fixpoint.mjs holds that heff compiles itself to the same C;
 // `node scripts/boot.mjs` renews the seed.)
 //
@@ -20,8 +20,8 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const exe = process.platform === "win32" ? ".exe" : "";
 const seed = join(root, "boot", "heff.tar.xz");
-const out = join(root, "output", "heff" + exe);
-const parts = join(root, "output", "heff.d");
+const out = join(root, ".heff", "out", "heff" + exe);
+const parts = join(root, ".heff", "out", "heff.d");
 const fromSeed = process.argv.includes("--seed");
 
 // (nothing to do where the compiler is newer than every source of it and
@@ -35,8 +35,11 @@ if (!fromSeed && mtime(out) >= 0 && sources.every((s) => mtime(s) <= mtime(out))
   process.exit(0);
 }
 
+// (the library each stage compiles with: the repository's, wherever the
+// stage is -- a heff from before .heff/out/ looks for it beside itself)
+const env = { ...process.env, HEFF_LIB: process.env.HEFF_LIB ?? join(root, "lib") };
 const run = (cmd, args) => {
-  const r = spawnSync(cmd, args, { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
+  const r = spawnSync(cmd, args, { cwd: root, env, stdio: ["ignore", "ignore", "inherit"] });
   if (r.error?.code === "ENOENT" && cmd === "zig") {
     console.error("heff build: zig is not on the PATH (https://ziglang.org/download/)");
     process.exit(1);
@@ -58,10 +61,10 @@ const cc = (dir, to) => {
   step("zig cc", "zig", ["cc", "-mcpu=baseline", "-O2", "-w", ...files, "-o", to, "-lm"]);
 };
 
-mkdirSync(join(root, "output"), { recursive: true });
-const stage0 = join(root, "output", "heff-stage0" + exe);
-const stage1 = join(root, "output", "heff-stage1" + exe);
-const stage1C = join(root, "output", "heff-stage1.d");
+mkdirSync(join(root, ".heff", "out"), { recursive: true });
+const stage0 = join(root, ".heff", "out", "heff-stage0" + exe);
+const stage1 = join(root, ".heff", "out", "heff-stage1" + exe);
+const stage1C = join(root, ".heff", "out", "heff-stage1.d");
 let first = false;
 if (!fromSeed && mtime(out) >= 0) {
   // (the heff there is, set apart: the build writes over it)
@@ -72,8 +75,8 @@ if (!fromSeed && mtime(out) >= 0) {
 if (!first) {
   // (the seed, built for this machine; `tar` with xz: libarchive's, on
   // macOS and Windows, GNU's with xz, on Linux)
-  const seedC = join(root, "output", "heff-seed.d");
-  const seedExe = join(root, "output", "heff-seed" + exe);
+  const seedC = join(root, ".heff", "out", "heff-seed.d");
+  const seedExe = join(root, ".heff", "out", "heff-seed" + exe);
   rmSync(seedC, { recursive: true, force: true });
   mkdirSync(seedC, { recursive: true });
   step("unpacking the seed", "tar", ["-xJf", seed, "-C", seedC]);

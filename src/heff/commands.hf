@@ -30,9 +30,23 @@ styleNow = do
   p <- platform
   pure (P.styleOf p)
 
--- | where the standard library is: `HEFF_LIB`, else the `lib/` of the
--- | repository the compiler is built in (it is `output/heff` there), or
--- | of a release (`bin/heff`)
+-- | the directory the compiler at `self` came with: the repository it is
+-- | built in (it is `.heff/out/heff` there), or a release (`bin/heff`)
+ownRoot : P.Style -> String -> String
+ownRoot st self =
+  if strEq (P.basename st (P.dirname st self)) "out"
+  && strEq (P.basename st (P.dirname st (P.dirname st self))) ".heff"
+    then P.dirname st (P.dirname st (P.dirname st self))
+  else P.dirname st (P.dirname st self)
+
+-- >>> ownRoot (P.styleOf "linux") "/r/.heff/out/heff"
+-- "/r"
+
+-- >>> ownRoot (P.styleOf "linux") "/opt/heff-0.2.0/bin/heff"
+-- "/opt/heff-0.2.0"
+
+-- | where the standard library is: `HEFF_LIB`, else the `lib/` the
+-- | compiler came with
 libDir : {e : HFunctor} -> {{sys : process <: e}} -> Co e String
 libDir = do
   v <- getEnv "HEFF_LIB"
@@ -41,7 +55,7 @@ libDir = do
     Nothing -> do
       st <- styleNow
       self <- programPath
-      pure (P.join st (P.dirname st (P.dirname st self)) "lib")
+      pure (P.join st (ownRoot st self) "lib")
 
 -- | where packages are fetched to: `HEFF_MODCACHE`, else
 -- | `~/.cache/heff/mod`
@@ -69,7 +83,7 @@ hostNow = do
   pure { lib = lib, mod = mod, style = st }
 
 -- | the version of heff running: the heff its own package.hf is for,
--- | beside its `output/` or `bin/`
+-- | in the directory it came with
 ownVersion : {e : HFunctor}
            -> {{sys : process <: e}}
            -> {{disk : fs <: e}}
@@ -77,7 +91,7 @@ ownVersion : {e : HFunctor}
 ownVersion = do
   st <- styleNow
   self <- programPath
-  text <- readFile (P.join st (P.dirname st (P.dirname st self)) "package.hf")
+  text <- readFile (P.join st (ownRoot st self) "package.hf")
   pure (case text of
     Just src -> case Pr.readPackage src of
       Right p -> Just p.heff
@@ -789,8 +803,12 @@ programsIn st (Cons x rest) = do
     Just _ -> Cons x more
     Nothing -> more)
 
+-- | where `heff build` writes the project's programs: `.heff/bin/`
+binDir : P.Style -> String
+binDir st = P.join st ".heff" "bin"
+
 -- (`.heff/build/X/`, a C file a module, by `zig cc` -- which builds
--- them at once, and again only those that changed -- is `bin/X`)
+-- them at once, and again only those that changed -- is `.heff/bin/X`)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
@@ -810,14 +828,15 @@ zigCc st x next = do
             (map
                (\n -> P.join st (P.join st (P.join st ".heff" "build") x) n)
                (filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
-            ["-o", P.join st "bin" x, "-lm"]))
+            ["-o", P.join st (binDir st) x, "-lm"]))
   if ranStatus r == 0
       then do
-        print ("wrote " ++ P.join st "bin" x)
+        print ("wrote " ++ P.join st (binDir st) x)
         next
     else do
       writeErr (ranErr r)
-      printErr ("heff build: `zig cc` could not build " ++ P.join st "bin" x)
+      printErr
+          ("heff build: `zig cc` could not build " ++ P.join st (binDir st) x)
       exit 1
 
 -- (said: `path` is written; then `next`)
@@ -830,7 +849,7 @@ wrote path next = do
   print ("wrote " ++ path)
   next
 
--- (`bin/X`, a Node.js program, made runnable)
+-- (`.heff/bin/X`, a Node.js program, made runnable)
 nodeDone : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
@@ -839,8 +858,8 @@ nodeDone : {e : HFunctor}
          -> Co e Unit
          -> Co e Unit
 nodeDone st x next = do
-  r <- run "chmod" ["+x", P.join st "bin" x]
-  wrote (P.join st "bin" x) next
+  r <- run "chmod" ["+x", P.join st (binDir st) x]
+  wrote (P.join st (binDir st) x) next
 
 -- (the program X, compiled as its build.hf says, then `next`)
 buildApp : {e : HFunctor}
@@ -863,15 +882,15 @@ buildApp st x a next =
     then compileThen
         "node"
         (Just a.run)
-        (P.join st "bin" x)
+        (P.join st (binDir st) x)
         (P.join st (P.join st "app" x) "main.hf")
         (nodeDone st x next)
   else compileThen
       "page"
       (Just a.run)
-      (P.join st "bin" (x ++ ".js"))
+      (P.join st (binDir st) (x ++ ".js"))
       (P.join st (P.join st "app" x) "main.hf")
-      (wrote (P.join st "bin" (x ++ ".js")) next)
+      (wrote (P.join st (binDir st) (x ++ ".js")) next)
 
 -- (each program, by its build.hf)
 buildEach : {e : HFunctor}
@@ -901,7 +920,7 @@ orAll names progs = names
 
 -- | build the project's programs (the ones NAMEd, else all): `app/X/` with
 -- | a build.hf is the program X, app/X/main.hf compiled as its build.hf
--- | says, to `bin/`
+-- | says, to `.heff/bin/`
 buildCmd : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
@@ -933,7 +952,7 @@ buildCmd names = do
                 "heff build: no programs: app/X/ with a build.hf is the program X"
             exit 1
           _ -> do
-            ok <- mkDir "bin"
+            ok <- mkDir (binDir st)
             okC <- mkDir (P.join st ".heff" "build")
             buildEach st (orAll names progs)
 
@@ -1654,7 +1673,7 @@ projectFiles name v =
        , "  }"
        , ""
        ])
-  , MkPair ".gitignore" (joinWith "\n" [".heff/", "bin/", ""])
+  , MkPair ".gitignore" (joinWith "\n" [".heff/", ""])
   , MkPair
     ("src/" ++ name ++ "/main.hf")
     (joinWith
