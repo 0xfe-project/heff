@@ -191,9 +191,19 @@ numbers: `Int8`, `Int16`, `Int32` and `Int64` (two's complement),
 `UInt8` to `UInt64`, and `Float32` (IEEE 754's single).  An integer of
 one wraps around, as the machine's does, divides rounding toward zero,
 and shifts by the amount modulo its bits; each operation of a `Float32`
-is rounded to one.  A literal checked at one of them is of it, and must
-be one of its values (`300` at `UInt8` is an error, as `1.5` at `Int32`
-is); a literal whose type is not given is an `Int` or a `Float`:
+is rounded to one.
+
+A number literal is of the type it is used at: an integer literal of any
+number type, a fractional one (`2.5`) of a float type.  Where the type is
+not known yet, the literal waits for it, and unification finds it from
+how the literal is used (`id 5` wanted as an `Int32` is one).  It must be
+one of the type's values, however late the type is found: `300` as a
+`UInt8` is an error, as `1.5` as an `Int32` or `5` as a `String` is.
+What nothing decides is an `Int`, or a `Float`, when the definition is
+settled, before its instance arguments are last looked for (an integer
+literal is a `Float` where it shares its type with a fractional one,
+`[1, 2.5]`).  A `let` does not generalise: what it binds has one type,
+for every use.
 
 ```haskell
 import prelude
