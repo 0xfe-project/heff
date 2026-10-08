@@ -33,9 +33,14 @@ beside it what heff finds there, its library and its version, `lib/`
 and `package.hf`, which `app/heff/build.hf` ships.
 
 heff is written in heff.  The package's modules (`src/heff/`) are the
-compiler as a library, each command's work among them
-(`heff.build.commands`); the program `heff` is `app/heff/main.hf`, which reads
-the command line and gives the commands the world they run in.
+compiler as a library, in a directory each by what they are for:
+`syntax/` reads a file and lays it out again (`fmt/`, the formatter's),
+`elab/` elaborates it, `compile/` erases, lowers and emits JavaScript and
+C, `build/` loads a project, keeps the cache and does each command's
+work (`heff.build.commands`), `lsp/` is the language server and how
+diagnostics and test reports are shown, and `util/` holds what is of no
+one of them.  The program `heff` is `app/heff/main.hf`, which reads the
+command line and gives the commands the world they run in.
 The build (`node scripts/build.mjs`) compiles the program to C with the
 heff built before (`.heff/out/heff`), and `zig cc` builds it into
 `.heff/out/heff`.  Where there is no heff yet, or only one of another
