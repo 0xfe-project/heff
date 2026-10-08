@@ -267,7 +267,8 @@ withKnown x k ce =
 
 -- (`owner`: the C name of the definition being emitted, which names its
 -- lambdas and strings; `nlam`, `nstr` count them within it -- so that a
--- definition's C is the same whatever is emitted before it)
+-- definition's C is the same whatever is emitted before it.  What each
+-- makes, and the shapes and primitives each uses, by its owner)
 type CS =
   { owner : String
   , nlam : Int
@@ -275,8 +276,8 @@ type CS =
   , protos : List (Pair String String)
   , nstr : Int
   , strs : List (Pair String String)
-  , shapes : List String
-  , prims : List String
+  , shapes : List (Pair String String)
+  , prims : List (Pair String String)
   }
 
 type C a = CS -> Pair a CS
@@ -338,6 +339,20 @@ strLit str = \s ->
 shapeKey : List String -> String
 shapeKey ls = joinWith "__" (map mangle ls)
 
+-- (whether the owner `o` has `k` among its: theirs are those first, the
+-- definition being emitted's)
+ownHas : String -> String -> List (Pair String String) -> Bool
+ownHas o k (Cons (MkPair o2 k2) rest) =
+  strEq o o2 && (strEq k k2 || ownHas o k rest)
+ownHas o k Nil = False
+
+-- (`k`, the owner's, once)
+ownAdd : String
+       -> String
+       -> List (Pair String String)
+       -> List (Pair String String)
+ownAdd o k ps = if ownHas o k ps then ps else Cons (MkPair o k) ps
+
 -- | a record's labels, in the order it is written in, as a static array
 shapeLit : List String -> C String
 shapeLit ls = \s ->
@@ -349,9 +364,7 @@ shapeLit ls = \s ->
       , protos = s.protos
       , nstr = s.nstr
       , strs = s.strs
-      , shapes =
-          if elemS (shapeKey ls) s.shapes then s.shapes
-          else Cons (shapeKey ls) s.shapes
+      , shapes = ownAdd s.owner (shapeKey ls) s.shapes
       , prims = s.prims
       }
 
@@ -367,7 +380,7 @@ primLit p = \s ->
       , nstr = s.nstr
       , strs = s.strs
       , shapes = s.shapes
-      , prims = if elemS p s.prims then s.prims else Cons p s.prims
+      , prims = ownAdd s.owner p s.prims
       }
 
 newLam : C String
@@ -1538,6 +1551,17 @@ arityOne m d = case d.body of
   ELam xs _ -> M.insert compareString d.key (length xs) m
   _ -> m
 
+-- (each once, the first kept, in order)
+onceInOrder : M.Map String Unit -> List String -> List String
+onceInOrder seen Nil = Nil
+onceInOrder seen (Cons x xs) =
+  if M.member compareString x seen then onceInOrder seen xs
+  else Cons x (onceInOrder (M.insert compareString x MkUnit seen) xs)
+
+-- (what the owners use, each once, in the order first used)
+usedOnce : List (Pair String String) -> List String
+usedOnce ps = onceInOrder M.empty (map snd (reverse ps))
+
 -- | the names of what is numbered, in order (`heff_show`'s)
 namesTable : String -> M.Map String Int -> List String
 namesTable name m =
@@ -1800,13 +1824,13 @@ programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
                         (concatList
                            (map snd (reverse s.strs))
                            (concatList
-                              (map shapeDef (reverse s.shapes))
+                              (map shapeDef (usedOnce s.shapes))
                               (concatList
                                  (concatMap (\(e : Emitted1) -> e.protos) ems)
                                  (concatList
                                     (map snd (reverse s.protos))
                                     (concatList
-                                       (concatMap primCloDef (reverse s.prims))
+                                       (concatMap primCloDef (usedOnce s.prims))
                                        (concatList
                                           (concatMap
                                              (\(e : Emitted1) -> e.code)
@@ -1904,10 +1928,12 @@ cloDecl l = case indexOf " =" l of
   Just at -> "extern Clo " ++ strSlice l 11 at ++ ";"
   Nothing -> l
 
--- (heff.h, which every part includes: the program's names, the
--- runtime, and every definition's prototype)
-partHead : String -> Ending -> CE -> CS -> List Emitted1 -> List String
-partHead runtime ending ce s ems =
+-- (heff.h, which every part includes: the program's names (its tags and
+-- labels) and the runtime -- what each part declares and defines for
+-- itself is in it, so that heff.h is the same after most changes, and
+-- a part changed does not make every part be built again)
+partHead : String -> Ending -> CE -> List String
+partHead runtime ending ce =
   concatList
     (Cons "// Generated from Hippogriff; do not edit." Nil)
     (concatList
@@ -1922,17 +1948,23 @@ partHead runtime ending ce s ems =
                 (M.toList ce.lbls))
              (concatList
                 (Cons runtime Nil)
-                (concatList
-                   (Cons "V heff_perform(V p, V k);" Nil)
-                   (concatList
-                      (map shapeDef (reverse s.shapes))
-                      (concatList
-                         (concatMap primCloDef (reverse s.prims))
-                         (map
-                            (\l -> if isCloDef l then cloDecl l else pubLine l)
-                            (concatMap
-                               (\(e : Emitted1) -> e.protos)
-                               ems)))))))))
+                (Cons "V heff_perform(V p, V k);" Nil)))))
+
+-- (a definition, declared to a part that uses it: a function's code,
+-- entry and closure, a value's getter -- by its arity, not by its
+-- parameters' names, so that a part changes only when what it uses does)
+declOf : CE -> String -> List String
+declOf ce k = case M.lookup compareString k ce.funs of
+  Just n ->
+    [ "V "
+    ++ cGlobal k
+    ++ "("
+    ++ (if n == 0 then "void" else joinWith ", " (replicate n "V"))
+    ++ ");"
+    , "V " ++ cGlobal k ++ "_entry(V self, V *a);"
+    , "extern Clo " ++ cGlobal k ++ "_clo;"
+    ]
+  Nothing -> ["V " ++ cGlobal k ++ "_get(void);"]
 
 -- (what was made for each definition -- its strings, its lambdas --
 -- by the definition it was made for)
@@ -1994,20 +2026,41 @@ zipDE : List I.Def -> List Emitted1 -> List (Pair I.Def Emitted1)
 zipDE (Cons d ds) (Cons e es) = Cons (MkPair d e) (zipDE ds es)
 zipDE _ _ = Nil
 
--- (a module's part)
+-- (what a definition uses: the definitions it calls or mentions, and
+-- itself)
+usesOf : Pair I.Def Emitted1 -> List String
+usesOf (MkPair d _) = Cons d.key (I.globalsIn d.body)
+
+-- (what the owners of a part use, each once: shapes, primitives)
+usedBy : M.Map String (List String) -> List (Pair I.Def Emitted1) -> List String
+usedBy m ps = sortedOnce (concatMap (\p -> linesOf m (cGlobal (pairKey p))) ps)
+
+-- (a module's part: heff.h, then what it uses declared -- the shapes and
+-- primitives its definitions use, and the definitions -- then its own)
 modulePart : List String
+           -> CE
            -> CS
+           -> M.Map String (List String)
+           -> M.Map String (List String)
            -> M.Map String (List String)
            -> M.Map String (List String)
            -> M.Map String (List String)
            -> Pair String (List (Pair I.Def Emitted1))
            -> Pair String String
-modulePart head s strs protos lams (MkPair m ps) =
+modulePart head ce s shapes prims strs protos lams (MkPair m ps) =
   MkPair
     (m ++ ".c")
     (joinWith
        "\n"
-       (concatList head (concatMap (ownLines s strs protos lams) ps)))
+       (concatList
+          head
+          (concatList
+             (map shapeDef (usedBy shapes ps))
+             (concatList
+                (concatMap primCloDef (usedBy prims ps))
+                (concatList
+                   (concatMap (declOf ce) (sortedOnce (concatMap usesOf ps)))
+                   (concatMap (ownLines s strs protos lams) ps))))))
 
 -- | the part with the program's `main`, its worlds' providers and its
 -- | algebra: named, as `run$entry.c` is, as no module's part is -- a
@@ -2024,7 +2077,7 @@ partsWith : String
           -> List (Pair String String)
 partsWith runtime provs ending defs ce (MkPair ems s) =
   Cons
-    (MkPair "heff.h" (joinWith "\n" (partHead runtime ending ce s ems)))
+    (MkPair "heff.h" (joinWith "\n" (partHead runtime ending ce)))
     (Cons
        (MkPair
           entryPart
@@ -2033,15 +2086,20 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
              (Cons
                 "#include \"heff.h\""
                 (concatList
-                   (map (\(p : Em.Provider) -> p.text) provs)
-                   (map pubLine (ending.end ce))))))
+                   (declOf ce L.entryKey)
+                   (concatList
+                      (map (\(p : Em.Provider) -> p.text) provs)
+                      (map pubLine (ending.end ce)))))))
        (map
           (modulePart
              [ "// Generated from Hippogriff; do not edit."
              , "#define HEFF_PART"
              , "#include \"heff.h\""
              ]
+             ce
              s
+             (byOwner s.shapes)
+             (byOwner s.prims)
              (byOwner s.strs)
              (byOwner s.protos)
              (byOwner s.lams))
