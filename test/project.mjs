@@ -34,16 +34,21 @@ const laid = heff("fmt", "--check", "hello/package.hf", "hello/src/hello/main.hf
 expect("init's files are laid out", laid.status === 0, laid);
 const tested = heff("test", "hello/src/hello/main.hf");
 expect("init's main.hf", tested.status === 0 && tested.stdout.includes("1/1 expectations hold"), tested);
-// (with no file: the project's every .hf file, run where it is; one in
-// a directory starting with `.` or in a project of its own passed over)
-write("hello/.hidden/no.hf", "x : Int\nx = \n");
-write("hello/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
-write("hello/vendor/other/no.hf", "x : Int\nx = \n");
+// (with no file: the project's test/, run where it is; a file in a
+// directory starting with `.` or in a project of its own passed over;
+// nothing outside test/, and no test/, nothing to test)
+write("hello/test/greeting.hf", "import hello.main\nimport prelude\n\n-- >>> greeting \"test\"\n-- \"Hello, test!\"\n");
+write("hello/test/.hidden/no.hf", "x : Int\nx = \n");
+write("hello/test/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
+write("hello/test/vendor/other/no.hf", "x : Int\nx = \n");
+write("hello/elsewhere/no.hf", "x : Int\nx = \n");
 const inHello = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
-expect("test with no file: the project's", inHello.status === 0 && inHello.stdout.includes("src/hello/main.hf") &&
-  inHello.stdout.includes("package.hf") && !inHello.stdout.includes("no.hf") && inHello.stdout.includes("1/1 expectations hold"), inHello);
-rmSync(join(work, "hello", ".hidden"), { recursive: true });
-rmSync(join(work, "hello", "vendor"), { recursive: true });
+expect("test with no file: the project's test/", inHello.status === 0 && inHello.stdout.includes("test/greeting.hf") &&
+  !inHello.stdout.includes("src/hello/main.hf") && !inHello.stdout.includes("no.hf") && inHello.stdout.includes("1/1 expectations hold"), inHello);
+rmSync(join(work, "hello", "test"), { recursive: true });
+rmSync(join(work, "hello", "elsewhere"), { recursive: true });
+const noTests = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
+expect("test with no file and no test/", noTests.status === 1 && noTests.stderr.includes("no test/ here"), noTests);
 const checked = heff("check", "hello/package.hf");
 expect("package.hf is heff, of type Package", checked.status === 0 && checked.stdout.includes("package : Package"), checked);
 const again = heff("init", "hello");
