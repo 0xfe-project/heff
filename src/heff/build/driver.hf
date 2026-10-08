@@ -1090,7 +1090,7 @@ moduleName c = c.module
 
 -- | a diagnostic, on one line
 diagLine : Diag -> String
-diagLine d = "error[" ^ showInt d.code ^ "]: " ^ d.msg
+diagLine d = Dg.severityWord d.severity ^ "[" ^ showInt d.code ^ "]: " ^ d.msg
 
 diagLines : Checked -> List String
 diagLines c = List.map (\(d : Diag) -> diagLine d) c.diags
@@ -1156,8 +1156,9 @@ showTySx g t =
     (Rn.renameTy (localNameIn (localNames g)) t)
 
 -- | a watch `-- >>> e`, with the `-- ...` lines under it, its
--- | expectation (a doctest): `expectFrom`..`expectTo` is where those
--- | lines are, or where they would go
+-- | expectation, or a doc test `-- | >>> e`, with the `-- | ...` lines
+-- | under it: `expectFrom`..`expectTo` is where those lines are, or
+-- | where they would go; `doc`, whether it is a doc test
 type WatchInfo =
   { from : Int
   , to : Int
@@ -1168,6 +1169,7 @@ type WatchInfo =
   , holds : Bool
   , expectFrom : Int
   , expectTo : Int
+  , doc : Bool
   }
 
 type Expectation = { expected : Maybe String, from : Int, to : Int }
@@ -1179,23 +1181,46 @@ lineEndFrom src i = case indexFrom "\n" src i of
 
 type ExpGo = { lines : List String, stop : Int }
 
-expectLineAt : String -> Int -> String -> Maybe String
-expectLineAt src i line =
-  if i < strLength src
-  && strEq (strSlice line 0 2) "--"
+-- | is the watch at `start` a doc test, `-- | >>> e`?
+isDocTest : String -> Int -> Bool
+isDocTest src start = strEq (strSlice src start (start + 8)) "-- | >>>"
+
+-- (a line of a watch's expectation, `-- v`: `v`; not another watch's
+-- line, a doc comment's or a blank one)
+watchExpect : String -> Maybe String
+watchExpect line =
+  if strEq (strSlice line 0 2) "--"
   && not (strEq (strSlice line 0 6) "-- >>>")
+  && not (strEq (strSlice line 0 4) "-- |")
   && not (strEq (trim (strSlice line 2 (strLength line))) "")
     then Just (trim (strSlice line 2 (strLength line)))
   else Nothing
 
-expectLine : String -> Int -> Maybe String
-expectLine src i =
-  expectLineAt src i (trim (strSlice src i (lineEndFrom src i)))
+-- (a line of a doc test's expectation, `-- | v`: `v`; not another doc
+-- test's line or a blank one of the doc comment)
+docExpect : String -> Maybe String
+docExpect line =
+  if strEq (strSlice line 0 4) "-- |"
+  && not (strEq (strSlice line 0 8) "-- | >>>")
+  && not (strEq (trim (strSlice line 4 (strLength line))) "")
+    then Just (trim (strSlice line 4 (strLength line)))
+  else Nothing
 
-expectGo : String -> Int -> List String -> ExpGo
-expectGo src i acc = case expectLine src i of
+expectLineAt : Bool -> String -> Int -> String -> Maybe String
+expectLineAt doc src i line =
+  if i >= strLength src then Nothing
+  else if doc then docExpect line
+  else watchExpect line
+
+expectLine : Bool -> String -> Int -> Maybe String
+expectLine doc src i =
+  expectLineAt doc src i (trim (strSlice src i (lineEndFrom src i)))
+
+expectGo : Bool -> String -> Int -> List String -> ExpGo
+expectGo doc src i acc = case expectLine doc src i of
   Just l ->
     expectGo
+      doc
       src
       (min (strLength src) (lineEndFrom src i + 1))
       (List.append acc (Cons l Nil))
@@ -1209,13 +1234,17 @@ expectDone start r =
   , to = r.stop
   }
 
--- | the `-- ...` lines after the line that `end` is on, up to a blank
--- | one
-expectation : String -> Int -> Expectation
-expectation src end =
+expectAfter : Bool -> String -> Int -> Expectation
+expectAfter doc src end =
   expectDone
     (min (strLength src) (lineEndFrom src end + 1))
-    (expectGo src (min (strLength src) (lineEndFrom src end + 1)) Nil)
+    (expectGo doc src (min (strLength src) (lineEndFrom src end + 1)) Nil)
+
+-- | the expectation of the watch at `sp`: the `-- ...` lines after the
+-- | line its expression ends on, up to a blank one (a doc test's, the
+-- | `-- | ...` lines, up to a blank one of its doc comment)
+expectation : String -> Pm.Span -> Expectation
+expectation src sp = expectAfter (isDocTest src sp.start) src sp.end
 
 evalWatch : String -> G.Globals -> String
 evalWatch name g = case In.evalGlobalsWhere (\k -> strEq k name) g of
@@ -1240,12 +1269,15 @@ readExpRead g r =
   if not (List.null r.diags) then Nothing
   else readExpTop g (T.topWith g r.decls)
 
--- | the value of an expectation, read as `(e : T)`
+-- | the value of an expectation, read as `(e : T)` (one of more than
+-- | one line, its lines after the first indented: one expression)
 readExpectation : G.Globals -> String -> String -> Maybe String
 readExpectation g ty e =
   readExpRead
     g
-    (Su.readProgram (\x -> knownG g x) ("-- >>> (" ^ e ^ " : " ^ ty ^ ")\n"))
+    (Su.readProgram
+       (\x -> knownG g x)
+       ("-- >>> (" ^ joinWith "\n  " (split "\n" e) ^ " : " ^ ty ^ ")\n"))
 
 -- an expectation is Hippogriff: it holds when it evaluates to the same,
 -- however it is written; what cannot be read (`#fun`) is compared as
@@ -1260,7 +1292,9 @@ holdsOf g ty value (Just e) =
 
 dropWatchMark : String -> String
 dropWatchMark s =
-  if startsWith "-- >>>" s then strSlice s 6 (strLength s) else ""
+  if startsWith "-- >>>" s then strSlice s 6 (strLength s)
+  else if startsWith "-- | >>>" s then strSlice s 8 (strLength s)
+  else ""
 
 mkWatchInfo : Checked -> T.Watch -> String -> Expectation -> String -> WatchInfo
 mkWatchInfo c w value ex ty =
@@ -1274,6 +1308,7 @@ mkWatchInfo c w value ex ty =
   , holds = holdsOf c.top.globals ty value ex.expected
   , expectFrom = ex.from
   , expectTo = ex.to
+  , doc = isDocTest c.source w.span.start
   }
 
 watchInfo : Checked -> Int -> T.Watch -> WatchInfo
@@ -1284,7 +1319,7 @@ watchInfo c i w =
     (evalWatch
        ("> " ^ showInt i)
        (G.addEntry ("> " ^ showInt i) w.entry c.top.globals))
-    (expectation c.source w.span.end)
+    (expectation c.source w.span)
     (showTySx c.top.globals (R.readbTy 0 w.entry.type_))
 
 watchesGo : Checked -> Int -> List T.Watch -> List WatchInfo
@@ -1295,15 +1330,16 @@ watches : Checked -> List WatchInfo
 watches c = watchesGo c 0 c.top.watches
 
 -- | a file's tests: the watches with an expectation, each under the
--- | name of the `test` before it (if any)
-type TestReport = { owner : Maybe String, watch : WatchInfo }
+-- | name of the `test` before it (if any), a doc test under the name of
+-- | its definition; `line`, where it is (from 1)
+type TestReport = { owner : Maybe String, line : Int, watch : WatchInfo }
 
 declStarts : Checked -> List Int
 declStarts c =
   List.map (\(p : Pair String Pm.Span) -> (snd p).start) c.top.spans
 
-ownerOf : Checked -> Int -> Maybe String
-ownerOf c from = case List.last
+testOwner : Checked -> Int -> Maybe String
+testOwner c from = case List.last
     (List.filter
        (\(m : T.TestDecl) ->
           m.span.start < from
@@ -1312,9 +1348,32 @@ ownerOf c from = case List.last
   Just m -> Just m.name
   Nothing -> Nothing
 
+-- (the definition under a doc test: the first after it)
+defUnder : Int
+         -> Maybe (Pair String Pm.Span)
+         -> Pair String Pm.Span
+         -> Maybe (Pair String Pm.Span)
+defUnder to (Just a) b =
+  if (snd b).start >= to && (snd b).start < (snd a).start then Just b
+  else Just a
+defUnder to Nothing b = if (snd b).start >= to then Just b else Nothing
+
+docOwner : Checked -> WatchInfo -> Maybe String
+docOwner c w = case List.foldl (defUnder w.to) Nothing c.top.spans of
+  Just p -> Just (Ps.named (fst p))
+  Nothing -> Nothing
+
+ownerOf : Checked -> WatchInfo -> Maybe String
+ownerOf c w = if w.doc then docOwner c w else testOwner c w.from
+
 testReportOf : Checked -> WatchInfo -> Maybe TestReport
 testReportOf c w = case w.expected of
-  Just _ -> Just { owner = ownerOf c w.from, watch = w }
+  Just _ ->
+    Just
+      { owner = ownerOf c w
+      , line = (Dg.lineCol c.source w.from).line + 1
+      , watch = w
+      }
   Nothing -> Nothing
 
 testFile : Checked -> List TestReport
@@ -1352,17 +1411,29 @@ promoteAt s from to lines =
   ^ joinWith "" (List.map (\l -> l ^ "\n") lines)
   ^ strSlice s to (strLength s)
 
+-- (a line of an expectation, as a watch's or a doc test's)
+expectMark : WatchInfo -> String
+expectMark w = if w.doc then "-- | " else "-- "
+
 promoteOne : WatchInfo -> String -> String
 promoteOne w s =
   promoteAt
     s
     w.expectFrom
     w.expectTo
-    (List.map (\l -> "-- " ^ l) (split "\n" w.value))
+    (List.map (\l -> expectMark w ^ l) (split "\n" w.value))
 
 -- | the source, each watch's value written under it as its expectation
+-- | (a doc test's in its doc comment), last first: each where the text
+-- | before it is as it was
 promote : Checked -> String
-promote c = List.foldr (\w s -> promoteOne w s) c.source (watches c)
+promote c =
+  List.foldl
+    (\s w -> promoteOne w s)
+    c.source
+    (List.sortBy
+       (\(a : WatchInfo) (b : WatchInfo) -> a.from >= b.from)
+       (watches c))
 
 -- Tests (lib/check.hf)
 --------------------------------------------------------------------------------

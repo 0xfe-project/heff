@@ -2,8 +2,9 @@
 // The formatter (src/heff/syntax/format.hf): every .hf file of the repository
 // (that parses) is formatted (the formatter checks itself that the result
 // means the same and keeps the comments) and formatting it again changes
-// nothing; then cases of comments, blank lines, blocks, watches and
-// definitions kept as written (`-- fmt: skip`), some with the exact result.
+// nothing; then cases of comments, blank lines, blocks, watches, doc
+// tests and definitions kept as written (`-- fmt: skip`), some with the
+// exact result.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -108,6 +109,56 @@ formats("a watch and its expectation, as written", [
   "",
   "-- >>> not False",
   "-- True",
+  "",
+].join("\n"));
+
+formats("doc tests, in their doc comment: as written, after the `>>>` and a space", [
+  "-- | the doc of f",
+  "-- | >>>   f   True",
+  "-- | False",
+  "-- |",
+  "-- | more of it",
+  "-- | >>> f False",
+  "f : Bool -> Bool",
+  "f   b = b",
+  "",
+  "-- >>>f True",
+  "-- True",
+  "",
+].join("\n"), [
+  "-- | the doc of f",
+  "-- | >>> f   True",
+  "-- | False",
+  "-- |",
+  "-- | more of it",
+  "-- | >>> f False",
+  "f : Bool -> Bool",
+  "f b = b",
+  "",
+  "-- >>> f True",
+  "-- True",
+  "",
+].join("\n"));
+
+formats("`-- fmt: skip` above a definition's doc tests", [
+  "-- | the doc of m",
+  "-- fmt: skip",
+  "-- | >>> m",
+  "-- | [1, 0]",
+  "m : List Int",
+  "m  =  [ 1,",
+  "        0 ]",
+  "n  =  1",
+  "",
+].join("\n"), [
+  "-- | the doc of m",
+  "-- fmt: skip",
+  "-- | >>> m",
+  "-- | [1, 0]",
+  "m : List Int",
+  "m  =  [ 1,",
+  "        0 ]",
+  "n = 1",
   "",
 ].join("\n"));
 

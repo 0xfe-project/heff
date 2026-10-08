@@ -594,11 +594,13 @@ resolve apply e0 rest = do
 
 -- | what a top-level declaration is, before signatures meet equations:
 -- | a signature (the name, where it is written, the type, where the
--- | signature is), an equation (where it is), or a declaration whole
+-- | signature is), an equation (where it is), a declaration whole, or a
+-- | doc test (a watch, before it meets the definition it is of)
 data Item
   = Sig String Pm.Span Notation.Expr Pm.Span
   | Eqn String (Pm.Spanned (Notation.Equation Notation.Expr)) Pm.Span
   | Whole Notation.Decl
+  | Doc Notation.Decl
 
 -- Signatures meet their equations
 --------------------------------------------------------------------------------
@@ -627,6 +629,7 @@ eqnEnd f (Cons _ rest) e = eqnEnd f rest e
 
 assembleOne : List String -> List Item -> Item -> Maybe Notation.Decl
 assembleOne broken items (Whole d) = Just d
+assembleOne broken items (Doc d) = Just d
 assembleOne broken items (Sig f fsp ty sp) =
   if List.elemBy strEq f broken
     then Just
@@ -677,11 +680,122 @@ assembleDiagOne broken sigs eqns (Eqn f _ sp) =
     then Just (diag sp ("`" ^ f ^ "` needs a type: `" ^ f ^ " : ...`"))
   else Nothing
 assembleDiagOne broken sigs eqns (Whole _) = Nothing
+assembleDiagOne broken sigs eqns (Doc _) = Nothing
 
 assembleDiags : List String -> List Item -> List Diag
 assembleDiags broken items =
   catMaybesS
     (List.map (assembleDiagOne broken (sigNames items) (eqnNames items)) items)
+
+-- Doc tests meet their definitions
+--------------------------------------------------------------------------------
+
+-- A doc test, `-- | >>> e`, is a line of the doc comment right above a
+-- definition: it is checked after the definition, as a watch written
+-- under it would be, with it and what is above it in scope.  Between
+-- the doc test and the definition there are only comment lines (the
+-- rest of the doc comment): a blank line, a declaration or the end of
+-- the file there, and the doc test is of nothing -- it stays where it
+-- is, checked there as a watch, and is warned of.
+
+lineEndS : String -> Int -> Int
+lineEndS src i = fromMaybe (strLength src) (indexFrom "\n" src i)
+
+-- (each line from the one at `i` up to `to` a `--` comment)
+commentLinesFrom : String -> Int -> Int -> Bool
+commentLinesFrom src i to =
+  if i >= to then True
+  else if startsWith "--" (trim (strSlice src i (lineEndS src i)))
+    then commentLinesFrom src (lineEndS src i + 1) to
+  else False
+
+-- | only comment lines after the line `from` is on, up to `to`
+commentsOnly : String -> Int -> Int -> Bool
+commentsOnly src from to = commentLinesFrom src (lineEndS src from + 1) to
+
+itemStart : Item -> Int
+itemStart (Sig _ _ _ sp) = sp.start
+itemStart (Eqn _ _ sp) = sp.start
+itemStart (Whole d) = (Pm.spanOf d).start
+itemStart (Doc d) = (Pm.spanOf d).start
+
+-- (a declaration that defines a name: what a doc test may be of)
+definesDecl : Notation.Decl -> Bool
+definesDecl (At (DeclTest _ _) _) = False
+definesDecl (At (DeclWatch _) _) = False
+definesDecl _ = True
+
+-- (a signature starts a definition, so does `data`, `type`, `theory` or
+-- `primitive`; an equation, a test or a watch does not)
+definesItem : Item -> Bool
+definesItem (Sig _ _ _ _) = True
+definesItem (Whole d) = definesDecl d
+definesItem _ = False
+
+-- | the items so far, the doc tests waiting for their definition (each
+-- | list last first), and what is wrong
+type Placed =
+  { items : List Item, waiting : List Notation.Decl, diags : List Diag }
+
+mkPlaced : List Item -> List Notation.Decl -> List Diag -> Placed
+mkPlaced items waiting diags =
+  { items = items, waiting = waiting, diags = diags }
+
+strayDiag : Notation.Decl -> Diag
+strayDiag d =
+  { code = 151
+  , severity = SWarning
+  , msg =
+      "a doc test is of the definition right under its doc comment, no blank line between: there is none here, so it is checked here, as a watch"
+  , span = Pm.spanOf d
+  , note =
+      Just
+        "write it as a watch, `-- >>> e`, or move it into the doc comment right above the definition it is of"
+  }
+
+-- (the doc tests waiting, of no definition: left where they are, each
+-- warned of)
+strand : Placed -> Placed
+strand p =
+  mkPlaced
+    (appendS (List.map (\d -> Whole d) p.waiting) p.items)
+    Nil
+    (appendS (List.map strayDiag p.waiting) p.diags)
+
+-- (whether what is at `at` is right under the doc test waiting last)
+nextTo : String -> List Notation.Decl -> Int -> Bool
+nextTo src (Cons d _) at = commentsOnly src (Pm.spanOf d).end at
+nextTo src Nil at = False
+
+-- (another doc test, of the same definition as those waiting if it is
+-- right under them)
+docNext : String -> Placed -> Notation.Decl -> Placed
+docNext src p d =
+  if List.null p.waiting || nextTo src p.waiting (Pm.spanOf d).start
+    then mkPlaced p.items (Cons d p.waiting) p.diags
+  else mkPlaced (strand p).items (Cons d Nil) (strand p).diags
+
+-- (a definition: the doc tests right above it after it)
+defNext : String -> Placed -> Item -> Placed
+defNext src p it =
+  if nextTo src p.waiting (itemStart it)
+    then mkPlaced
+        (appendS (List.map (\d -> Whole d) p.waiting) (Cons it p.items))
+        Nil
+        p.diags
+  else mkPlaced (Cons it (strand p).items) Nil (strand p).diags
+
+placeStep : String -> Placed -> Item -> Placed
+placeStep src p (Doc d) = docNext src p d
+placeStep src p it =
+  if definesItem it then defNext src p it
+  else mkPlaced (Cons it (strand p).items) Nil (strand p).diags
+
+-- | the items, each doc test after the definition it is of; a doc test
+-- | of none where it is, warned of
+placeDocs : String -> List Item -> Placed
+placeDocs src items =
+  strand (List.foldl (\p it -> placeStep src p it) (mkPlaced Nil Nil Nil) items)
 
 -- The lowering, knotted through `lw`
 --------------------------------------------------------------------------------
@@ -1463,6 +1577,10 @@ primitiveL r kw x ty = do
                (spanTE kw (C.lastE ty).end)))
          Nil)
 
+-- (a watch is a declaration whole; a doc test waits for its definition)
+watchItem : C.T -> Notation.Decl -> Item
+watchItem w d = if strEq w.kind "doctest" then Doc d else Whole d
+
 -- | a declaration, lowered: what it is before signatures meet equations
 declL : Lw -> C.D -> P (List Item)
 declL r d = case d of
@@ -1479,7 +1597,7 @@ declL r d = case d of
     pure (Cons (Whole (At (DeclTest x.text (spanT x)) (spanTT kw x))) Nil)
   DWatch w e -> do
     e' <- r.e e
-    pure (Cons (Whole (At (DeclWatch e') (spanTE w (C.lastE e).end))) Nil)
+    pure (Cons (watchItem w (At (DeclWatch e') (spanTE w (C.lastE e).end))) Nil)
 
 lw : Lw
 lw =
@@ -1938,20 +2056,36 @@ initialSt o toks declared own =
     (F.union o.fixities own)
     o.lenient
 
-readOut : List Diag -> FixRead -> ProgRes -> Read
-readOut lexDiags own r =
-  { decls = assemble r.broken r.items
+readPlaced : List Diag -> FixRead -> ProgRes -> Placed -> Read
+readPlaced lexDiags own r placed =
+  { decls = assemble r.broken (List.reverse placed.items)
   , diags =
       appendS
         lexDiags
-        (appendS own.diags (appendS r.diags (assembleDiags r.broken r.items)))
+        (appendS
+           own.diags
+           (appendS
+              r.diags
+              (appendS
+                 (List.reverse placed.diags)
+                 (assembleDiags r.broken r.items))))
   , fixities = own.fixities
   , broken = r.broken
   }
 
-readRun : Options -> Array C.T -> List Diag -> List String -> FixRead -> Read
-readRun o toks lexDiags declared own =
+readOut : String -> List Diag -> FixRead -> ProgRes -> Read
+readOut src lexDiags own r = readPlaced lexDiags own r (placeDocs src r.items)
+
+readRun : String
+        -> Options
+        -> Array C.T
+        -> List Diag
+        -> List String
+        -> FixRead
+        -> Read
+readRun src o toks lexDiags declared own =
   readOut
+    src
     lexDiags
     own
     (progGo
@@ -1961,13 +2095,20 @@ readRun o toks lexDiags declared own =
        Nil
        Nil)
 
-readToks : Options -> Array L.Tok -> Array C.T -> List Diag -> Read
-readToks o ltoks toks lexDiags =
-  readRun o toks lexDiags (prescan ltoks) (fixityDecls o.place o.fixities ltoks)
+readToks : String -> Options -> Array L.Tok -> Array C.T -> List Diag -> Read
+readToks src o ltoks toks lexDiags =
+  readRun
+    src
+    o
+    toks
+    lexDiags
+    (prescan ltoks)
+    (fixityDecls o.place o.fixities ltoks)
 
-readLexed : Options -> L.Lexed -> Read
-readLexed o l =
+readLexed : String -> Options -> L.Lexed -> Read
+readLexed src o l =
   readToks
+    src
     o
     (A.fromList l.tokens)
     (Tk.plain l.tokens)
@@ -1976,7 +2117,7 @@ readLexed o l =
 -- | `fixities`: those of what the file imports; the result's, the file's
 -- | own.  `broken`: the declarations that do not parse.
 readProgramWith : Options -> String -> Read
-readProgramWith o src = readLexed o (L.lex src)
+readProgramWith o src = readLexed src o (L.lex src)
 
 -- | the program, as declarations the elaborator takes
 readProgram : (String -> Bool) -> String -> Read

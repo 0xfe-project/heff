@@ -3,7 +3,8 @@
 // (of the editor's text, and of an import's unsaved text, of a file as deep
 // as the command line goes), files changed on disk, hover and go to
 // definition (across modules, past non-ASCII text), completion, an outline,
-// references and renaming across the project, formatting, shutdown.
+// references and renaming across the project, doc tests (their errors,
+// shown in a hover), formatting, shutdown.
 import { spawn } from "node:child_process";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -307,6 +308,34 @@ try {
   const eRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/lsp-expect.hf") }, position: { line: 0, character: 0 }, context: { includeDeclaration: true } });
   expect("references in a watch's expectation", eRefs.result && eRefs.result.map((r) => r.range.start.line).join() === [0, 1, 6, 12].join(), eRefs.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-expect.hf") } });
+
+  // doc tests: checked after their definition, an error on the doc test's
+  // line (a name defined below), a warning on one of no definition's;
+  // shown in the definition's hover; a name in an expectation a reference
+  // as in a watch's
+  const documented = [
+    'name : String', 'name = "name"', '', 'type R = { name : String, n : Int }', '',
+    '-- | a record of a name', '-- | >>> y', '-- | { name = "name", n = 1 }', '-- | >>> y.name', '-- | name',
+    'y : R', 'y = { name = name, n = 1 }', '',
+    '-- | >>> twice y.name', '-- | "namename"', '-- | >>> twice x',
+    'twice : String -> String', 'twice s = s ^ s', '',
+    '-- | >>> twice "stray"', '',
+    'x : String', 'x = "x"', '',
+  ].join("\n");
+  const docU = uri("test/surface/lsp-doctest.hf");
+  open("test/surface/lsp-doctest.hf", documented);
+  ds = await diagnosticsOf(docU);
+  const byLine = [...ds].sort((a, b) => a.range.start.line - b.range.start.line);
+  expect("diagnostics on doc tests' lines", byLine.length === 2 && byLine[0].range.start.line === 15 && byLine[0].message.includes("x") &&
+    byLine[0].severity === 1 && byLine[1].range.start.line === 19 && byLine[1].message.includes("doc test") &&
+    byLine[1].severity === 2 && byLine[1].code === "W0151", ds);
+  const docHover = await request("textDocument/hover", { textDocument: { uri: docU }, position: pos(documented, "y\n") });
+  expect("hover: the doc comment, its doc tests as heff", docHover.result &&
+    docHover.result.contents.value.includes("y : R") &&
+    docHover.result.contents.value.includes('a record of a name\n```heff\n>>> y\n{ name = "name", n = 1 }\n>>> y.name\nname\n```'), docHover.result);
+  const dRefs = await request("textDocument/references", { textDocument: { uri: docU }, position: { line: 0, character: 0 }, context: { includeDeclaration: true } });
+  expect("references in a doc test's expectation", dRefs.result && dRefs.result.filter((r) => r.uri === docU).map((r) => r.range.start.line).join() === [0, 1, 9, 11].join(), dRefs.result);
+  notify("textDocument/didClose", { textDocument: { uri: docU } });
 
   // a local: its binder and its uses, in its equation only (`f` is bound by
   // each equation of `map`); renamed there, unless the new name would be

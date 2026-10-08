@@ -3,12 +3,12 @@
 heff is a language based on Hippogriff (Lynch & Staton, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728)), a typed language with a phase distinction, with a Haskell-like syntax, modules, doctests, algebraic effects, a formatter, a language server, and a compiler to JavaScript for web pages and Node.js.
 
 ```haskell
+-- | `f` applied to each element
+-- | >>> map not [True, False]
+-- | [False, True]
 map : {a b : Type} -> (a -> b) -> List a -> List b
 map f Nil = Nil
 map f (y :: ys) = f y :: map f ys
-
--- >>> map not [True, False]
--- Cons False (Cons True Nil)
 ```
 
 ## Installing
@@ -56,10 +56,11 @@ for bat.
 ```sh
 heff check FILE                # the file's interface, and its errors
 heff run FILE [ARGS...]        # run the file's `main` (on Node.js)
-heff test [--seed N] [FILE...] # check the watches' expectations (`-- >>> e`),
-                               # and run the tests (lib/check.hf); no FILE:
-                               # the project's test/
-heff promote FILE              # write each watch's value as its expectation
+heff test [--seed N] [FILE...] # check the doc tests' and watches' expectations
+                               # (`-- | >>> e`, `-- >>> e`), and run the tests
+                               # (lib/check.hf); no FILE: the project's test/
+heff promote FILE              # write each doc test's and watch's value as
+                               # its expectation
 heff fmt [--check] FILE...     # format in place
 heff compile FILE OUT --backend=MODE [--name NAME]
                                # esm: an ES module
@@ -85,12 +86,14 @@ Flags go anywhere among the words, as getopt_long reads them (`-b node`,
 `--back=node`, `--`); `std.cli` reads them, for any heff program.
 
 `heff fmt` lays a file out anew, keeping its comments, and at most one
-blank line between two declarations.  A line `-- fmt: skip` among the
-comments right above a top-level declaration (no blank line between)
-keeps the definition as it is written, byte for byte, to the end of
-its last line: a signature with the equations of its name after it, or
-any other declaration.  What is around it is laid out.
-Anywhere else, the line is a comment like any other.
+blank line between two declarations; a doc test or a watch is kept as
+written, after its `>>>` and a space.  A line `-- fmt: skip` among the
+comments right above a top-level declaration (no blank line between),
+or above the doc tests of its doc comment, keeps the definition as it
+is written, byte for byte, to the end of its last line: a signature
+with the equations of its name after it, or any other declaration.
+What is around it is laid out.  Anywhere else, the line is a comment
+like any other.
 
 ```haskell
 -- | the corners: x, y, then r, g, b
@@ -205,11 +208,10 @@ alone, and two such, side by side, take parentheses.
 ```haskell
 infixl .+. below +
 
+-- | >>> showInt $ 1 .+. 2 + 3
+-- | "15"
 (.+.) : Int -> Int -> Int
 (.+.) a b = a * 10 + b
-
--- >>> showInt $ 1 .+. 2 + 3
--- "15"
 ```
 
 ## Numbers
@@ -247,11 +249,10 @@ a fixed-width type's builtin's, `int32Eq` and the others).
 ```haskell
 import uint8 as U8
 
+-- | >>> U8.show (U8.add mask 255)
+-- | "239"
 mask : UInt8
 mask = 240
-
--- >>> U8.show (U8.add mask 255)
--- "239"
 ```
 
 Each has a module, imported by a name (`import int32 as I32`), whose
@@ -294,11 +295,10 @@ surrogate pair in it, and a surrogate not in a pair is read as U+FFFD.
 ```haskell
 import rune as R
 
+-- | >>> initials "héllo"
+-- | "Hé"
 initials : String -> String
 initials s = ofRunes (List.map R.toUpper (List.take 2 (runes s)))
-
--- >>> initials "héllo"
--- "Hé"
 ```
 
 The module `rune` (`import rune as R`) has their comparisons (`eq`,
@@ -385,10 +385,47 @@ veth pair by rtnetlink, its socket's calls a provider of its own.
 
 ## Tests
 
-A watch, `-- >>> e` with its expected value under it, is an example in a
-definition's documentation.  A test is a top-level definition of type
-`Test` (`lib/check.hf`); `heff test` runs a file's tests after its
-watches.  A unit test checks; a property draws values from generators
+A doc test is an example in a definition's documentation: a line
+`-- | >>> e` of the doc comment right above the definition, with the
+value expected on the `-- | ...` lines under it.  It belongs to the
+definition, and is checked after it, as a watch written under it
+would be: the definition and what is above it are in scope.  The
+language server shows it in the definition's hover, and `heff test`
+names the definition when it does not hold.
+
+```haskell
+-- | the list, its elements the other way round
+-- | >>> reverse [1, 2, 3]
+-- | [3, 2, 1]
+-- | >>> reverse (Cons "a" Nil)
+-- | ["a"]
+-- |
+-- | It takes as many steps as there are elements.
+reverse : {a : Type} -> List a -> List a
+```
+
+The expectation is the `-- | ...` lines up to the next doc test, a
+blank line of the doc comment (`-- |`), or its end: it may go on over
+more than one line (read as one expression), and the comment goes on
+after a blank one.  It is compared by value, so `Cons 3 (Cons 2 Nil)`
+holds of `[3, 2]`.  A doc test with no expectation is checked only to
+elaborate; `heff promote` writes the value of each doc test and watch
+under it as its expectation (replacing what was there).  A doc test is
+in the comment right above a definition -- its signature, or a `data`,
+`type`, `theory` or `primitive` -- with nothing but comments between,
+no blank line.  One that is not (a blank line under it, a `test`, a
+watch or an import, the end of the file) is checked where it is, as a
+watch, and warned of: write it as a watch, or move it into the doc
+comment right above its definition.
+
+A watch, `-- >>> e` with the value expected on the `-- ...` lines under
+it, is such a check of no one definition, written where it is: of what
+the file defines above it, or what it imports.  A `test NAME` names the
+watches after it (up to the next definition) in `heff test`'s report.
+
+A test is a top-level definition of type `Test` (`lib/check.hf`);
+`heff test` runs a file's tests after its doc tests and watches.  A
+unit test checks; a property draws values from generators
 (`lib/gen.hf`, imported `as G`) and checks them, a hundred runs:
 
 ```haskell

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// The command line: `promote` writes each watch's value under it, `test`
-// runs the tests (lib/check.hf) and shrinks what fails, `fmt`
-// lays files out in place (with `--check`, only names them), `version`
-// says which heff runs, and the usage, the completions and an unknown
-// command say what they should, on the right stream, with the right exit
-// status.
+// The command line: `promote` writes each watch's and doc test's value
+// under it, `test` runs the tests (lib/check.hf) and shrinks what fails,
+// `fmt` lays files out in place (with `--check`, only names them),
+// `version` says which heff runs, and the usage, the completions and an
+// unknown command say what they should, on the right stream, with the
+// right exit status.
 import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +31,39 @@ expect("promote", promoted.status === 0 &&
   text.includes("-- >>> not True\n-- False\n") && !text.includes("wrong"), { promoted, text });
 const tested = heff("test", "p.hf");
 expect("test after promote", tested.status === 0 && tested.stdout.includes("3/3 expectations hold"), tested);
+
+// doc tests: one that does not hold named by its line and its definition;
+// promoted, each expectation in the doc comment, the rest of it kept
+writeFileSync(join(work, "d.hf"), [
+  "-- | a number, twice",
+  "-- | >>> twice 2",
+  "-- | >>> twice 3",
+  "-- | 5",
+  "-- |",
+  "-- | the doc goes on",
+  "twice : Int -> Int",
+  "twice x = x + x",
+  "",
+].join("\n"));
+const dFailed = heff("test", "d.hf");
+expect("a doc test that does not hold", dFailed.status === 1 &&
+  dFailed.stdout.includes("FAIL d.hf:3 (twice): twice 3\n") && dFailed.stdout.includes("0/1 expectations hold"), dFailed);
+const dPromoted = heff("promote", "d.hf");
+const dText = readFileSync(join(work, "d.hf"), "utf8");
+expect("promote, doc tests", dPromoted.status === 0 && dText === [
+  "-- | a number, twice",
+  "-- | >>> twice 2",
+  "-- | 4",
+  "-- | >>> twice 3",
+  "-- | 6",
+  "-- |",
+  "-- | the doc goes on",
+  "twice : Int -> Int",
+  "twice x = x + x",
+  "",
+].join("\n"), { dPromoted, dText });
+const dTested = heff("test", "d.hf");
+expect("test after promote, doc tests", dTested.status === 0 && dTested.stdout.includes("2/2 expectations hold"), dTested);
 
 // test: the definitions of type `Test` run too.  A property that fails on
 // purpose is shrunk to its smallest counterexample, says the seed that
