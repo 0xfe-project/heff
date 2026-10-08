@@ -10,8 +10,9 @@
 //   node test/native-asan.mjs
 import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pool, run } from "./pool.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // (the program beside its library and version, as a release lays it out,
@@ -35,7 +36,17 @@ const step = (what, cmd, args, opts = {}) => {
 
 const parts = join(root, ".heff", "out", "heff.d"), heff = join(work, "bin", "heff");
 const c = readdirSync(parts).filter((f) => f.endsWith(".c")).map((f) => join(parts, f));
-step("building it", "clang", ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0", ...c, "-o", heff, "-lm", "-lpthread"]);
+// (a part an object, as many at once as there are cores -- clang given
+// them all builds them one after another -- then the objects linked)
+const flags = ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0"];
+mkdirSync(join(work, "obj"));
+const objects = await pool(c, async (f) => {
+  const o = join(work, "obj", basename(f, ".c") + ".o");
+  const r = await run("clang", [...flags, "-c", f, "-o", o]);
+  if (r.status !== 0) { console.log(`building it failed, at ${basename(f)}:\n${r.stdout}${r.stderr}${r.error || ""}`); process.exit(1); }
+  return o;
+});
+step("building it", "clang", [...flags, ...objects, "-o", heff, "-lm", "-lpthread"]);
 
 // (what it leaves at its end is no fault: a program's last objects are
 // the system's to take back)
