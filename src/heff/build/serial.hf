@@ -1,0 +1,422 @@
+-- Core syntax as text, for the cache (`heff.build.cache`): a stream of
+-- tokens, every node a tag of fixed shape, counts before lists, and
+-- strings length-prefixed (`3:abc`) so nothing is escaped.  `decode` is
+-- the inverse of `encode`; what does not decode -- another compiler's
+-- cache, a torn write -- is `Nothing`, and the cache treats it as
+-- absent.
+
+import array as A
+import heff.build.decoder
+import heff.util.dict as D
+import heff.elab.fixed
+import heff.elab.params as Pm
+import heff.syntax.surface as Su
+import heff.elab.syntax as Sx
+
+-- Writing: a list of tokens, joined with one space
+--------------------------------------------------------------------------------
+
+tokStr : String -> String
+tokStr s = showInt (strLength s) ^ ":" ^ s
+
+tokInt : Int -> String
+tokInt i = showInt i
+
+tokBool : Bool -> String
+tokBool True = "t"
+tokBool False = "f"
+
+tokLevel : Pm.Level -> String
+tokLevel Small = "0"
+tokLevel Large = "1"
+tokLevel TopL = "2"
+
+tokPlicity : Pm.Plicity -> String
+tokPlicity Expl = "0"
+tokPlicity Impl = "1"
+tokPlicity Inst = "2"
+
+-- (every encoder takes the tokens that follow, and conses its own in
+-- front: linear, however deep the term)
+encodeAbs : {a : Type}
+          -> (a -> List String -> List String)
+          -> Sx.Abs a
+          -> List String
+          -> List String
+encodeAbs f (MkAbs x e) rest = Cons "v" (Cons (tokStr x) (f e rest))
+encodeAbs f (AbsConst e) rest = Cons "_" (f e rest)
+
+encodeListGo : {a : Type}
+             -> (a -> List String -> List String)
+             -> List a
+             -> List String
+             -> List String
+encodeListGo f Nil rest = rest
+encodeListGo f (Cons x xs) rest = f x (encodeListGo f xs rest)
+
+encodeMany : {a : Type}
+           -> (a -> List String -> List String)
+           -> List a
+           -> List String
+           -> List String
+encodeMany f xs rest = Cons (tokInt (List.length xs)) (encodeListGo f xs rest)
+
+encodeDict : {a : Type}
+           -> (a -> List String -> List String)
+           -> D.Dict a
+           -> List String
+           -> List String
+encodeDict f d rest =
+  encodeMany
+    (\p rest2 -> case p of
+     MkPair x v -> Cons (tokStr x) (f v rest2))
+    (D.toList d)
+    rest
+
+-- | the encoders, knotted
+type EK =
+  { el : Sx.Tm -> List String -> List String
+  , ty : Sx.Ty -> List String -> List String
+  }
+
+encodeAlt : EK -> Pair (Array String) Sx.Tm -> List String -> List String
+encodeAlt k (MkPair xs b) rest =
+  encodeMany (\x rest2 -> Cons (tokStr x) rest2) (A.toList xs) (k.el b rest)
+
+encodeTermF : EK -> Sx.Tm -> List String -> List String
+encodeTermF k e rest = case e of
+  SLocal i -> Cons "loc" (Cons (tokInt i) rest)
+  SGlobal x -> Cons "glo" (Cons (tokStr x) rest)
+  SCode t -> Cons "cod" (k.ty t rest)
+  SApp f a -> Cons "app" (k.el f (k.el a rest))
+  SLam t b ->
+    Cons "lam" (k.ty t (encodeAbs (\e2 rest2 -> k.el e2 rest2) b rest))
+  SCons d -> Cons "con" (encodeDict (\e2 rest2 -> k.el e2 rest2) d rest)
+  SProj e2 l -> Cons "prj" (k.el e2 (Cons (tokStr l) rest))
+  STag t as ->
+    Cons
+      "tag"
+      (Cons
+         (tokStr t)
+         (encodeMany (\a rest2 -> k.el a rest2) (A.toList as) rest))
+  SMatch e2 cs ->
+    Cons
+      "mat"
+      (k.el e2 (encodeDict (\alt rest2 -> encodeAlt k alt rest2) cs rest))
+  SSpecialize e2 l v -> Cons "spe" (k.el e2 (Cons (tokStr l) (k.el v rest)))
+  SIs e2 -> Cons "is" (k.el e2 rest)
+  SOpaque -> Cons "opq" rest
+  SAbandon -> Cons "abn" rest
+  SRec e2 -> Cons "rec" (k.el e2 rest)
+  SFix t b ->
+    Cons "fix" (k.ty t (encodeAbs (\e2 rest2 -> k.el e2 rest2) b rest))
+  SImplicit x e2 -> Cons "imp" (Cons (tokStr x) (k.el e2 rest))
+  SPrim x -> Cons "prm" (Cons (tokStr x) rest)
+  -- (zonked away before a definition is stored; decoding refuses it)
+  SMetaApp _ _ _ -> Cons "meta" rest
+  SLitInt i -> Cons "int" (Cons (tokStr (showInt i)) rest)
+  SLitFloat x -> Cons "flt" (Cons (tokStr (showFloat x)) rest)
+  SLitString s -> Cons "str" (Cons (tokStr s) rest)
+  SLitRune c -> Cons "rn" (Cons (tokStr (showInt c)) rest)
+  SLitFixed w n ->
+    Cons "fxl" (Cons (fixedName w) (Cons (tokStr (showInt n)) rest))
+  SLitFloat32 x -> Cons "f32" (Cons (tokStr (showFloat x)) rest)
+
+-- (an implicit argument's default: `j` and it, or `n`, none)
+encodeDefault : EK -> Maybe Sx.Tm -> List String -> List String
+encodeDefault k (Just d) rest = Cons "j" (k.el d rest)
+encodeDefault k Nothing rest = Cons "n" rest
+
+encodeTypeF : EK -> Sx.Ty -> List String -> List String
+encodeTypeF k t rest = case t of
+  SU SmallU -> Cons "u" (Cons "0" rest)
+  SU LargeU -> Cons "u" (Cons "1" rest)
+  SDecode e -> Cons "de" (k.el e rest)
+  SFunction level dom cod implicit dflt ->
+    Cons
+      "fn"
+      (Cons
+         (tokLevel level)
+         (k.ty
+            dom
+            (encodeAbs
+               (\t2 rest2 -> k.ty t2 rest2)
+               cod
+               (Cons (tokPlicity implicit) (encodeDefault k dflt rest)))))
+  SRecord level fs ds ->
+    Cons
+      "rc"
+      (Cons
+         (tokLevel level)
+         (encodeDict
+            (\t2 rest2 -> k.ty t2 rest2)
+            fs
+            (encodeDict (\e2 rest2 -> k.el e2 rest2) ds rest)))
+  SSum vs ->
+    Cons
+      "sm"
+      (encodeDict
+         (\ts rest2 ->
+            encodeMany (\t2 rest3 -> k.ty t2 rest3) (A.toList ts) rest2)
+         vs
+         rest)
+  SIsTy t2 -> Cons "ist" (k.ty t2 rest)
+  SPrimInt -> Cons "pi" rest
+  SPrimFloat -> Cons "pf" rest
+  SPrimString -> Cons "ps" rest
+  SPrimRune -> Cons "pr" rest
+  SPrimArray t2 -> Cons "pa" (k.ty t2 rest)
+  SFixed w -> Cons "px" (Cons (fixedName w) rest)
+
+ek : EK
+ek =
+  { el = \e rest -> encodeTermF ek e rest
+  , ty = \t rest -> encodeTypeF ek t rest
+  }
+
+encodeEl : Sx.Tm -> String
+encodeEl e = joinWith " " (ek.el e Nil)
+
+encodeTy : Sx.Ty -> String
+encodeTy t = joinWith " " (ek.ty t Nil)
+
+-- Reading: decoders (`heff.build.decoder`), in sequence
+--------------------------------------------------------------------------------
+
+-- (a fixed-width type, by its name)
+takeFixed : Dec Fixed
+takeFixed = do
+  w <- word
+  found (fixedOfName w)
+
+plicityOf : String -> Dec Pm.Plicity
+plicityOf "0" = pure Expl
+plicityOf "1" = pure Impl
+plicityOf "2" = pure Inst
+plicityOf _ = fail
+
+takePlicity : Dec Pm.Plicity
+takePlicity = bind word plicityOf
+
+levelOf : String -> Dec Pm.Level
+levelOf "0" = pure Small
+levelOf "1" = pure Large
+levelOf "2" = pure TopL
+levelOf _ = fail
+
+takeLevel : Dec Pm.Level
+takeLevel = bind word levelOf
+
+-- | the decoders, knotted
+type DK = { el : Dec Sx.Tm, ty : Dec Sx.Ty }
+
+absOf : {a : Type} -> Dec a -> String -> Dec (Sx.Abs a)
+absOf d "v" = do
+  x <- str
+  e <- d
+  pure (MkAbs x e)
+absOf d "_" = do
+  e <- d
+  pure (AbsConst e)
+absOf d _ = fail
+
+takeAbs : {a : Type} -> Dec a -> Dec (Sx.Abs a)
+takeAbs d = bind word (absOf d)
+
+takePair : {a : Type} -> Dec a -> Dec (Pair String a)
+takePair d = do
+  x <- str
+  v <- d
+  pure (MkPair x v)
+
+takeDict : {a : Type} -> Dec a -> Dec (D.Dict a)
+takeDict d = do
+  ps <- many (takePair d)
+  pure (D.fromList ps)
+
+takeAlt : DK -> Dec (Pair (Array String) Sx.Tm)
+takeAlt k = do
+  xs <- many str
+  b <- k.el
+  pure (MkPair (A.fromList xs) b)
+
+-- (a term, after the word saying which)
+termOf : DK -> String -> Dec Sx.Tm
+termOf k "loc" = do
+  n <- int
+  pure (SLocal n)
+termOf k "glo" = do
+  x <- str
+  pure (SGlobal x)
+termOf k "cod" = do
+  t <- k.ty
+  pure (SCode t)
+termOf k "app" = do
+  f <- k.el
+  a <- k.el
+  pure (SApp f a)
+termOf k "lam" = do
+  t <- k.ty
+  b <- takeAbs k.el
+  pure (SLam t b)
+termOf k "con" = do
+  d <- takeDict k.el
+  pure (SCons d)
+termOf k "prj" = do
+  e <- k.el
+  l <- str
+  pure (SProj e l)
+termOf k "tag" = do
+  t <- str
+  as <- many k.el
+  pure (STag t (A.fromList as))
+termOf k "mat" = do
+  e <- k.el
+  cs <- takeDict (takeAlt k)
+  pure (SMatch e cs)
+termOf k "spe" = do
+  e <- k.el
+  l <- str
+  v <- k.el
+  pure (SSpecialize e l v)
+termOf k "is" = do
+  e <- k.el
+  pure (SIs e)
+termOf k "opq" = pure SOpaque
+termOf k "abn" = pure SAbandon
+termOf k "rec" = do
+  e <- k.el
+  pure (SRec e)
+termOf k "fix" = do
+  t <- k.ty
+  b <- takeAbs k.el
+  pure (SFix t b)
+termOf k "imp" = do
+  x <- str
+  e <- k.el
+  pure (SImplicit x e)
+termOf k "prm" = do
+  x <- str
+  pure (SPrim x)
+termOf k "int" = do
+  x <- str
+  pure (SLitInt (Su.intOfText x))
+termOf k "flt" = do
+  x <- str
+  pure (SLitFloat (Su.floatOfText x))
+termOf k "str" = do
+  x <- str
+  pure (SLitString x)
+termOf k "rn" = do
+  x <- str
+  pure (SLitRune (Su.intOfText x))
+termOf k "fxl" = do
+  w <- takeFixed
+  x <- str
+  pure (SLitFixed w (Su.intOfText x))
+termOf k "f32" = do
+  x <- str
+  pure (SLitFloat32 (Su.floatOfText x))
+termOf k _ = fail
+
+decodeTermF : DK -> Dec Sx.Tm
+decodeTermF k = bind word (termOf k)
+
+-- (an implicit argument's default, if there is one)
+defaultOf : DK -> String -> Dec (Maybe Sx.Tm)
+defaultOf k "j" = do
+  d <- k.el
+  pure (Just d)
+defaultOf k "n" = pure Nothing
+defaultOf k _ = fail
+
+takeDefault : DK -> Dec (Maybe Sx.Tm)
+takeDefault k = bind word (defaultOf k)
+
+universeOf : String -> Dec Sx.Ty
+universeOf "0" = pure (SU SmallU)
+universeOf "1" = pure (SU LargeU)
+universeOf _ = fail
+
+-- (a variant's fields)
+takeFields : DK -> Dec (Array Sx.Ty)
+takeFields k = do
+  ts <- many k.ty
+  pure (A.fromList ts)
+
+-- (a type, after the word saying which)
+typeOf : DK -> String -> Dec Sx.Ty
+typeOf k "u" = bind word universeOf
+typeOf k "de" = do
+  e <- k.el
+  pure (SDecode e)
+typeOf k "fn" = do
+  level <- takeLevel
+  dom <- k.ty
+  cod <- takeAbs k.ty
+  implicit <- takePlicity
+  dflt <- takeDefault k
+  pure (SFunction level dom cod implicit dflt)
+typeOf k "rc" = do
+  level <- takeLevel
+  fs <- takeDict k.ty
+  ds <- takeDict k.el
+  pure (SRecord level fs ds)
+typeOf k "sm" = do
+  vs <- takeDict (takeFields k)
+  pure (SSum vs)
+typeOf k "ist" = do
+  t <- k.ty
+  pure (SIsTy t)
+typeOf k "pi" = pure SPrimInt
+typeOf k "pf" = pure SPrimFloat
+typeOf k "ps" = pure SPrimString
+typeOf k "pr" = pure SPrimRune
+typeOf k "pa" = do
+  t <- k.ty
+  pure (SPrimArray t)
+typeOf k "px" = do
+  w <- takeFixed
+  pure (SFixed w)
+typeOf k _ = fail
+
+decodeTypeF : DK -> Dec Sx.Ty
+decodeTypeF k = bind word (typeOf k)
+
+dk : DK
+dk = { el = \s i -> decodeTermF dk s i, ty = \s i -> decodeTypeF dk s i }
+
+-- | a term, inside a larger stream (the cache's own fields around it)
+takeEl : Dec Sx.Tm
+takeEl = dk.el
+
+takeTy : Dec Sx.Ty
+takeTy = dk.ty
+
+-- | a term, read whole (the stream must end with it)
+decodeEl : String -> Maybe Sx.Tm
+decodeEl s = run (whole takeEl) s
+
+decodeTy : String -> Maybe Sx.Ty
+decodeTy s = run (whole takeTy) s
+
+-- >>> decodeEl (encodeEl (SApp (SLam SPrimInt (MkAbs "x y" (SLocal 0))) (SLitString "a 3:b")))
+-- Just (SApp (SLam SPrimInt (MkAbs "x y" (SLocal 0))) (SLitString "a 3:b"))
+
+-- >>> decodeTy (encodeTy (SFunction Small SPrimInt (AbsConst (SDecode (SGlobal "m.T"))) Expl Nothing))
+-- Just (SFunction Small SPrimInt (AbsConst (SDecode (SGlobal "m.T"))) Expl Nothing)
+
+-- >>> decodeTy (encodeTy (SFunction Small SPrimString (AbsConst SPrimInt) Impl (Just (SGlobal "m.d"))))
+-- Just (SFunction Small SPrimString (AbsConst SPrimInt) Impl (Just (SGlobal "m.d")))
+
+-- >>> decodeEl (encodeEl (SLitInt (0 - 42)))
+-- Just (SLitInt (-42))
+
+-- >>> decodeEl (encodeEl (SApp (SLam (SFixed U64) (MkAbs "x" (SLocal 0))) (SLitFixed U64 18446744073709551615)))
+-- Just (SApp (SLam (SFixed U64) (MkAbs "x" (SLocal 0))) (SLitFixed U64 18446744073709551615))
+
+-- >>> decodeEl (encodeEl (SApp (SLitFixed I8 (0 - 128)) (SLitFloat32 0.1)))
+-- Just (SApp (SLitFixed I8 (-128)) (SLitFloat32 0.1))
+
+-- >>> decodeEl (encodeEl (SApp (SLam SPrimRune (MkAbs "c" (SLocal 0))) (SLitRune 128512)))
+-- Just (SApp (SLam SPrimRune (MkAbs "c" (SLocal 0))) (SLitRune 128512))

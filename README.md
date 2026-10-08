@@ -34,7 +34,7 @@ and `package.hf`, which `app/heff/build.hf` ships.
 
 heff is written in heff.  The package's modules (`src/heff/`) are the
 compiler as a library, each command's work among them
-(`heff.commands`); the program `heff` is `app/heff/main.hf`, which reads
+(`heff.build.commands`); the program `heff` is `app/heff/main.hf`, which reads
 the command line and gives the commands the world they run in.
 The build (`node scripts/build.mjs`) compiles the program to C with the
 heff built before (`.heff/out/heff`), and `zig cc` builds it into

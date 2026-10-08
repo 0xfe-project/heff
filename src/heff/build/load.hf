@@ -1,0 +1,1042 @@
+-- A file and every module it imports, directly or not, each after what
+-- it imports, over the fs effect.  The project's root is the nearest
+-- directory above the file with a package.hf (src/heff/build/project.hf); its
+-- modules are under `src/`: `foo.bar` is `src/foo/bar.hf`.  A module is
+-- looked for there and in the library; for a file outside both (a test,
+-- an example), under the root too, so such files share helpers --
+-- what is in `src/` never imports them.  A module found in two of these
+-- places is an error.  Without a package.hf above it, a file's
+-- directory is its root, and holds its modules.  The packages a project
+-- requires are in the cache `heff get` fetches them to (or the
+-- directories it replaces them with), each the version selected.
+
+import co
+import heff.build.driver as Dr
+import heff.syntax.import as I
+import heff.build.project as Pr
+import heff.lsp.render as Dg
+import std.filesystem
+import std.path as P
+
+dropHf : String -> String
+dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
+
+-- | where the standard library is, where packages are fetched to, the
+-- | directory heff runs in, and the style of the paths of the platform
+-- | heff runs on
+type Host = { lib : String, mod : String, cwd : String, style : P.Style }
+
+-- | where the project is, where its modules are, where the standard
+-- | library, where packages are fetched to, and the directory a relative
+-- | path is from; the paths in the platform's style
+type Paths =
+  { root : String
+  , src : String
+  , lib : String
+  , mod : String
+  , cwd : String
+  , style : P.Style
+  }
+
+-- | the working directory's project, the library at `lib/`
+here : P.Style -> Paths
+here st =
+  { root = ".", src = "src", lib = "lib", mod = "", cwd = ".", style = st }
+
+-- | the working directory's project, the library where the host has it
+hostPaths : Host -> Paths
+hostPaths h =
+  { root = "."
+  , src = "src"
+  , lib = h.lib
+  , mod = h.mod
+  , cwd = h.cwd
+  , style = h.style
+  }
+
+-- | a path under a directory
+under : Paths -> String -> String -> String
+under ps d p = P.join ps.style d p
+
+-- (a path as from the working directory: two paths are compared so,
+-- however each is written, relative or not)
+fromCwd : Paths -> String -> String
+fromCwd ps p = P.join ps.style ps.cwd p
+
+-- (the path from the directory, if it is under it)
+relFrom : Paths -> String -> String -> Maybe String
+relFrom ps d path =
+  if P.isUnder ps.style (fromCwd ps d) (fromCwd ps path)
+    then P.relative ps.style (fromCwd ps d) (fromCwd ps path)
+  else Nothing
+
+-- | the module a file of the project is; one of the standard library is
+-- | the library's (`lib/co.hf` is `co`), wherever the project's root is;
+-- | `src/heff/util/dict.hf` is `heff.util.dict`; a file outside `src/` is named
+-- | from the root: `test/helpers.hf` is `test.helpers`
+moduleOf : Paths -> String -> String
+moduleOf ps path =
+  joinWith
+    "."
+    (P.components
+       ps.style
+       (dropHf (case relFrom ps ps.lib path of
+        Just rel -> rel
+        Nothing -> case relFrom ps ps.src path of
+          Just rel -> rel
+          Nothing -> case relFrom ps ps.root path of
+            Just rel -> rel
+            Nothing -> path)))
+
+-- | the path is under the directory
+inside : Paths -> String -> String -> Bool
+inside ps d path =
+  strEq d "." || P.isUnder ps.style (fromCwd ps d) (fromCwd ps path)
+
+-- | a directory is a project's root
+isRoot : {e : HFunctor} -> {{ev : fs <: e}} -> P.Style -> String -> Co e Bool
+isRoot st d = do
+  hf <- readFile (P.join st d "package.hf")
+  val (case hf of
+    Just _ -> True
+    Nothing -> False)
+
+-- (a root -- `/`, `C:\`, `.` -- is its own directory)
+rootFrom : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> Host
+         -> String
+         -> String
+         -> Co e Paths
+rootFrom h start d = do
+  found <- isRoot h.style d
+  if found
+      then val
+          { root = d
+          , src = P.join h.style d "src"
+          , lib = h.lib
+          , mod = h.mod
+          , cwd = h.cwd
+          , style = h.style
+          }
+    else if strEq (P.dirname h.style d) d
+      then val
+          { root = start
+          , src = start
+          , lib = h.lib
+          , mod = h.mod
+          , cwd = h.cwd
+          , style = h.style
+          }
+    else rootFrom h start (P.dirname h.style d)
+
+-- | the paths of the project `file` is in, with the library and the
+-- | style of the host (without a root, the file's directory is one)
+pathsFor : {e : HFunctor} -> {{ev : fs <: e}} -> Host -> String -> Co e Paths
+pathsFor h file = rootFrom h (P.dirname h.style file) (P.dirname h.style file)
+
+-- | the parts of the path of a module's file, under where it is looked
+-- | for: `foo.bar` is `foo`, `bar.hf`
+importParts : String -> List String
+importParts m = case List.reverse (split "." m) of
+  Cons last before -> List.reverse (Cons (last ^ ".hf") before)
+  Nil -> Nil
+
+-- | what is wrong with a package.hf, where it is
+problemMsg : String -> String -> Pr.Problem -> String
+problemMsg path src p =
+  path
+  ^ ":"
+  ^ showInt ((Dg.lineCol src p.at).line + 1)
+  ^ ":"
+  ^ showInt ((Dg.lineCol src p.at).col + 1)
+  ^ ": "
+  ^ p.msg
+
+elemL : String -> List String -> Bool
+elemL x xs = List.elemBy strEq x xs
+
+-- Packages
+--------------------------------------------------------------------------------
+
+-- | a package of the program: the project's own, or one it requires,
+-- | directly or not.  `own`: the name its modules start with, its
+-- | `src/` holding that one directory (the project's own: "", any
+-- | name); `top`: the name they are known by in the program, `own`
+-- | unless another package or the library has it; `scope`: the
+-- | packages it requires, by the name it imports each by, and path
+type Pkg =
+  { path : String
+  , dir : String
+  , src : String
+  , own : String
+  , top : String
+  , heff : String
+  , scope : List (Pair String String)
+  }
+
+scopeOf : Pr.Package -> List (Pair String String)
+scopeOf pk = List.map (\(r : Pr.Require) -> MkPair r.name r.path) pk.require
+
+-- | the project's own package
+projectPkg : Paths -> Maybe Pr.Package -> Pkg
+projectPkg ps (Just pk) =
+  { path = pk.module
+  , dir = ps.root
+  , src = ps.src
+  , own = ""
+  , top = ""
+  , heff = pk.heff
+  , scope = scopeOf pk
+  }
+projectPkg ps Nothing =
+  { path = ""
+  , dir = ps.root
+  , src = ps.src
+  , own = ""
+  , top = ""
+  , heff = ""
+  , scope = Nil
+  }
+
+pkgByPath : List Pkg -> String -> Maybe Pkg
+pkgByPath Nil p = Nothing
+pkgByPath (Cons k rest) p = if strEq k.path p then Just k else pkgByPath rest p
+
+-- (the directory the project gives a package: what it replaces the name
+-- it requires that path by with)
+replacedDir : Pr.Package -> String -> Maybe String
+replacedDir pk path = case List.filter
+    (\(r : Pr.Require) -> strEq r.path path)
+    pk.require of
+  Cons r _ -> case List.filter
+      (\(p : Pr.Replace) -> strEq p.name r.name)
+      pk.replace of
+    Cons p _ -> Just p.dir
+    Nil -> Nothing
+  Nil -> Nothing
+
+-- | the one directory a package's `src/` holds, its name
+ownDir : {e : HFunctor}
+       -> {{ev : fs <: e}}
+       -> Paths
+       -> String
+       -> Co e (Either String String)
+ownDir ps src = do
+  names <- readDir src
+  case names of
+    Nothing -> val (Left (src ^ " is not a directory"))
+    Just (Cons x Nil) -> do
+      inner <- readDir (under ps src x)
+      val (case inner of
+        Just _ ->
+          if Pr.isName x then Right x
+          else Left
+              (under ps src x
+               ^ " cannot name a package: a lowercase letter, then letters, digits and `_`")
+        Nothing -> Left (src ^ " holds " ^ x ^ ", which is not a directory"))
+    Just xs ->
+      val
+        (Left
+           (src
+            ^ " holds "
+            ^ joinWith ", " xs
+            ^ ": a package's src/ holds one directory, named as the package"))
+
+-- Versions: Go's minimal version selection.  Every version of a package
+-- reached from the project -- by what it requires, and what each version
+-- reached requires -- is read; of each package, the newest of those is
+-- the one in the program.  A package the project replaces with a
+-- directory is that directory, whatever version is reached.
+--------------------------------------------------------------------------------
+
+-- | where version `v` of the package at `path` is fetched to: a directory
+-- | of the cache, and beside it `<dir>.hash`, the tree its tag is of
+-- | (written last: without it, the version is not fetched)
+cachedDir : Paths -> String -> String -> String
+cachedDir ps path v = under ps ps.mod (P.fromSlashes ps.style (path ^ "@" ^ v))
+
+-- | the package.hf at `dir`, read, required by `by` as the package at
+-- | `path`
+readPkgAt : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> Paths
+          -> String
+          -> String
+          -> Co e (Either String Pr.Package)
+readPkgAt ps dir path = do
+  text <- readFile (under ps dir "package.hf")
+  val (case text of
+    Nothing -> Left (under ps dir "package.hf" ^ " cannot be read")
+    Just t -> case Pr.readPackage t of
+      Left p -> Left (problemMsg (under ps dir "package.hf") t p)
+      Right pk ->
+        if strEq pk.module path then Right pk
+        else Left
+            (under ps dir "package.hf"
+             ^ " is the package "
+             ^ pk.module
+             ^ ", not "
+             ^ path))
+
+-- | a version reached, and its package.hf (Nothing: it does not read)
+type Visit = { path : String, version : String, pkg : Maybe Pr.Package }
+
+-- | a version required, and by whom
+type Need = { by : String, path : String, version : String }
+
+needOf : String -> Pr.Require -> Need
+needOf by r = { by = by, path = r.path, version = r.version }
+
+needsOf : String -> Pr.Package -> List Need
+needsOf by pk = List.map (needOf by) pk.require
+
+visited : List Visit -> String -> String -> Bool
+visited seen path v =
+  List.any (\(x : Visit) -> strEq x.path path && strEq x.version v) seen
+
+-- | the versions reached from `work` (`root`: the project's own path,
+-- | not reached again), each's package.hf read by `rd` (who requires
+-- | it, its path, its version); those so far in `seen`; what is wrong
+versionsGo : {e : HFunctor}
+           -> (String -> String -> String -> Co e (Either String Pr.Package))
+           -> String
+           -> List Need
+           -> List Visit
+           -> List String
+           -> Co e (Pair (List Visit) (List String))
+versionsGo rd root Nil seen errs = val (MkPair seen errs)
+versionsGo rd root (Cons n rest) seen errs =
+  if strEq n.path root || visited seen n.path n.version
+    then versionsGo rd root rest seen errs
+  else do
+    r <- rd n.by n.path n.version
+    case r of
+      Left why ->
+        versionsGo
+          rd
+          root
+          rest
+          (List.append
+             seen
+             [{ path = n.path, version = n.version, pkg = Nothing }])
+          (List.append errs [why])
+      Right pk ->
+        versionsGo
+          rd
+          root
+          (List.append rest (needsOf (n.path ^ " " ^ n.version) pk))
+          (List.append
+             seen
+             [{ path = n.path, version = n.version, pkg = Just pk }])
+          errs
+
+-- | every version reached from the project `root`, each's package.hf
+-- | read by `rd`; and what is wrong
+versionsOf : {e : HFunctor}
+           -> (String -> String -> String -> Co e (Either String Pr.Package))
+           -> Pr.Package
+           -> Co e (Pair (List Visit) (List String))
+versionsOf rd root =
+  versionsGo
+    rd
+    root.module
+    (needsOf (if strEq root.module "" then "the project" else root.module) root)
+    Nil
+    Nil
+
+-- (the newest of the versions of `x`'s package reached)
+newestOf : List Visit -> Visit -> Visit
+newestOf seen x =
+  List.foldl
+    (\(best : Visit) (y : Visit) ->
+       if strEq y.path best.path && Pr.newer y.version best.version then y
+       else best)
+    x
+    seen
+
+-- | of each package reached, the newest version, in the order the
+-- | packages are first reached
+selected : List Visit -> List Visit
+selected seen =
+  List.map
+    (newestOf seen)
+    (List.foldl
+       (\(acc : List Visit) (x : Visit) ->
+          if List.any (\(y : Visit) -> strEq y.path x.path) acc then acc
+          else List.append acc [x])
+       Nil
+       seen)
+
+-- | the package.hf of version `v` of `path`, required by `by`, as the
+-- | project `root` gives it: the directory it replaces it with, else
+-- | the cache -- fetched by `heff get`, the tree heff.sum says
+cachedPkg : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> Paths
+          -> Pr.Package
+          -> List Pr.Sum
+          -> String
+          -> String
+          -> String
+          -> Co e (Either String Pr.Package)
+cachedPkg ps root sums by path v = case replacedDir root path of
+  Just d -> readPkgAt ps (under ps ps.root d) path
+  Nothing -> do
+    hash <- readFile (cachedDir ps path v ^ ".hash")
+    case hash of
+      Nothing ->
+        val
+          (Left
+             (by
+              ^ " requires "
+              ^ path
+              ^ " "
+              ^ v
+              ^ ", which is not fetched: run `heff get`"))
+      Just h -> case Pr.sumOf sums path v of
+        Nothing ->
+          val
+            (Left
+               ("heff.sum says nothing of "
+                ^ path
+                ^ " "
+                ^ v
+                ^ ": run `heff get`"))
+        Just want ->
+          if strEq (trim h) want then readPkgAt ps (cachedDir ps path v) path
+          else val
+              (Left
+                 (path
+                  ^ " "
+                  ^ v
+                  ^ " in "
+                  ^ cachedDir ps path v
+                  ^ " is "
+                  ^ trim h
+                  ^ ", and heff.sum says "
+                  ^ want))
+
+-- | the package a version selected is, as the project `root` gives it
+pkgOf : {e : HFunctor}
+      -> {{ev : fs <: e}}
+      -> Paths
+      -> Pr.Package
+      -> Visit
+      -> Pr.Package
+      -> Co e (Either String Pkg)
+pkgOf ps root x pk = do
+  dir <-
+    val (case replacedDir root x.path of
+    Just d -> under ps ps.root d
+    Nothing -> cachedDir ps x.path x.version)
+  own <- ownDir ps (under ps dir "src")
+  val (case own of
+    Left why -> Left why
+    Right name ->
+      Right
+        { path = x.path
+        , dir = dir
+        , src = under ps dir "src"
+        , own = name
+        , top = name
+        , heff = pk.heff
+        , scope = scopeOf pk
+        })
+
+-- | the packages of the versions selected; what is wrong with them
+pkgsOf : {e : HFunctor}
+       -> {{ev : fs <: e}}
+       -> Paths
+       -> Pr.Package
+       -> List Visit
+       -> List Pkg
+       -> List String
+       -> Co e (Pair (List Pkg) (List String))
+pkgsOf ps root Nil acc errs = val (MkPair acc errs)
+pkgsOf ps root (Cons x rest) acc errs = case x.pkg of
+  Nothing -> pkgsOf ps root rest acc errs
+  Just pk -> do
+    k <- pkgOf ps root x pk
+    case k of
+      Left why -> pkgsOf ps root rest acc (List.append errs [why])
+      Right p -> pkgsOf ps root rest (List.append acc [p]) errs
+
+-- | the project's heff.sum, read (none: empty)
+readSumAt : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> Paths
+          -> Co e (Either String (List Pr.Sum))
+readSumAt ps = do
+  text <- readFile (under ps ps.root "heff.sum")
+  val (case text of
+    Nothing -> Right Nil
+    Just t -> case Pr.readSum t of
+      Left p -> Left (problemMsg (under ps ps.root "heff.sum") t p)
+      Right sums -> Right sums)
+
+-- | the packages the project `root` requires, directly or not, each the
+-- | version selected; what is wrong
+reachAll : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> Paths
+         -> Pr.Package
+         -> Co e (Pair (List Pkg) (List String))
+reachAll ps root = do
+  sums <- readSumAt ps
+  reached <- versionsOf (cachedPkg ps root (either (\_ -> Nil) id sums)) root
+  pkgs <- pkgsOf ps root (selected (fst reached)) Nil Nil
+  val
+      (MkPair
+         (fst pkgs)
+         (List.append
+            (either (\why -> [why]) (\_ -> Nil) sums)
+            (List.append (snd reached) (snd pkgs))))
+
+-- (the stack down to `path`, newest first)
+takeUntil : String -> List String -> List String
+takeUntil x Nil = Nil
+takeUntil x (Cons y rest) = if strEq x y then [y] else Cons y (takeUntil x rest)
+
+orElse : Maybe (List String) -> Maybe (List String) -> Maybe (List String)
+orElse (Just x) _ = Just x
+orElse Nothing y = y
+
+requiredPaths : List Pkg -> String -> List String
+requiredPaths pkgs path = case pkgByPath pkgs path of
+  Just k -> List.map snd k.scope
+  Nothing -> Nil
+
+-- | a cycle through one of `paths`, the packages being visited in
+-- | `stack`, newest first
+cycleAmong : List Pkg -> List String -> List String -> Maybe (List String)
+cycleAmong pkgs stack Nil = Nothing
+cycleAmong pkgs stack (Cons path rest) =
+  if elemL path stack
+    then Just (List.reverse (Cons path (takeUntil path stack)))
+  else orElse
+      (cycleAmong pkgs (Cons path stack) (requiredPaths pkgs path))
+      (cycleAmong pkgs stack rest)
+
+-- | the names a directory's modules start with: its files', its
+-- | directories'
+topNames : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e (List String)
+topNames d = do
+  names <- readDir d
+  val (List.map dropHf (fromMaybe Nil names))
+
+-- (a name not taken: `x`, else `x_2`, `x_3`, ...)
+freeName : List String -> String -> Int -> String
+freeName taken x n =
+  if not (elemL (if n < 2 then x else x ^ "_" ^ showInt n) taken)
+    then (if n < 2 then x else x ^ "_" ^ showInt n)
+  else freeName taken x (n + 1)
+
+-- | each package's `top`: its own name, unless the project, the library
+-- | or a package before it has that name
+namedGo : List String -> List Pkg -> List Pkg
+namedGo taken Nil = Nil
+namedGo taken (Cons k rest) =
+  Cons
+    { path = k.path
+    , dir = k.dir
+    , src = k.src
+    , own = k.own
+    , top = freeName taken k.own 1
+    , heff = k.heff
+    , scope = k.scope
+    }
+    (namedGo (Cons (freeName taken k.own 1) taken) rest)
+
+-- | the project's package, then those it requires, directly or not; and
+-- | what is wrong with them
+packagesOf : {e : HFunctor}
+           -> {{ev : fs <: e}}
+           -> Paths
+           -> Maybe Pr.Package
+           -> Co e (Pair (List Pkg) (List String))
+packagesOf ps Nothing = val (MkPair [projectPkg ps Nothing] Nil)
+packagesOf ps (Just root) = do
+  reached <- reachAll ps root
+  inSrc <- topNames ps.src
+  inRoot <- topNames ps.root
+  inLib <- topNames ps.lib
+  val
+      (MkPair
+         (Cons
+            (projectPkg ps (Just root))
+            (namedGo
+               (List.append inSrc (List.append inRoot inLib))
+               (fst reached)))
+         (List.append (snd reached) (case cycleAmong
+            (Cons (projectPkg ps (Just root)) (fst reached))
+            Nil
+            [root.module] of
+          Just c -> ["packages require one another: " ^ joinWith " -> " c]
+          Nothing -> Nil)))
+
+-- Modules
+--------------------------------------------------------------------------------
+
+-- | where a module may be, and the module it is there: `path`, the
+-- | file at `parts` under the directory `base`
+type Place =
+  { path : String, base : String, parts : List String, module : String }
+
+place : Paths -> String -> List String -> String -> Place
+place ps base parts m =
+  { path = List.foldl (under ps) base parts
+  , base = base
+  , parts = parts
+  , module = m
+  }
+
+-- | a module's file, read, where it was looked for, and the module it is
+type Found = { path : String, source : String, place : Place, module : String }
+
+-- (the package a file is in: the dependency whose directory holds it,
+-- else the project's)
+pkgOfGo : Paths -> List Pkg -> Pkg -> String -> Pkg
+pkgOfGo ps Nil project from = project
+pkgOfGo ps (Cons k rest) project from =
+  if inside ps k.dir from then k else pkgOfGo ps rest project from
+
+-- (the first part of a module name, and the rest, with its dot)
+headOf : String -> Pair String String
+headOf w = case indexOf "." w of
+  Just i -> MkPair (strSlice w 0 i) (strSlice w i (strLength w))
+  Nothing -> MkPair w ""
+
+-- (the package `k` requires by name `h`, where its module `rest` is)
+requiredPlace : Paths -> List Pkg -> Pkg -> String -> String -> List Place
+requiredPlace ps pkgs k h rest = case List.filter
+    (\(x : Pair String String) -> strEq (fst x) h)
+    k.scope of
+  Cons (MkPair n p) _ -> case pkgByPath pkgs p of
+    Just q -> [place ps q.src (importParts (q.own ^ rest)) (q.top ^ rest)]
+    Nothing -> Nil
+  Nil -> Nil
+
+-- | where module `w`, written in the file at `from`, may be: in the
+-- | library, a file of it, only there; in a package, its own modules,
+-- | those of the packages it requires (by the names it requires them
+-- | by), the library; in the project, a file outside `src/` also
+-- | under the root
+placesOf : Paths -> List Pkg -> String -> String -> List Place
+placesOf ps pkgs from w =
+  if inside ps ps.lib from && not (strEq ps.lib ".")
+    then [place ps ps.lib (importParts w) w]
+  else case pkgs of
+    Nil -> Nil
+    Cons project deps ->
+      (\(k : Pkg) ->
+         List.append
+           (if strEq k.own "" then [place ps k.src (importParts w) w]
+            else if strEq (fst (headOf w)) k.own
+              then [place ps k.src (importParts w) (k.top ^ snd (headOf w))]
+            else Nil)
+           (List.append
+              (requiredPlace ps pkgs k (fst (headOf w)) (snd (headOf w)))
+              (List.append
+                 [place ps ps.lib (importParts w) w]
+                 (if strEq k.own "" && not (inside ps k.src from)
+                    then [place ps k.dir (importParts w) w]
+                  else Nil))))
+        (pkgOfGo ps deps project from)
+
+-- (every one of the places that reads, by `read`)
+readEvery : {e : HFunctor}
+          -> (String -> Co e (Maybe String))
+          -> List Place
+          -> Co e (List Found)
+readEvery read Nil = val Nil
+readEvery read (Cons pl rest) = do
+  a <- read pl.path
+  more <- readEvery read rest
+  val (case a of
+    Just s ->
+      Cons { path = pl.path, source = s, place = pl, module = pl.module } more
+    Nothing -> more)
+
+-- Names, as written and on the disk
+--------------------------------------------------------------------------------
+-- A file system that does not tell `Foo.hf` from `foo.hf` (macOS's,
+-- Windows') finds a module whose import is written in another case
+-- than its file is named; one that does (Linux's) does not.  Each part
+-- of the path a module is found at, under the directory it is looked
+-- for in, must be named on the disk as it is written -- and no other
+-- name beside it may differ from it only in case.
+
+-- | two names, the same but for the case of their (ASCII) letters
+sameButCase : String -> String -> Bool
+sameButCase a b = strEq (P.lower a) (P.lower b)
+
+-- (what is wrong with the name `x`, in `d`, the names there the same
+-- but for case `ns`)
+casesIn : Paths -> String -> String -> List String -> Maybe String
+casesIn ps d x Nil = Nothing
+casesIn ps d x [n] =
+  if strEq n x then Nothing
+  else Just
+      (under ps d x
+       ^ " is named "
+       ^ n
+       ^ " on the disk: a file system that tells case apart finds no "
+       ^ x)
+casesIn ps d x ns =
+  Just
+    (d
+     ^ " holds "
+     ^ joinWith ", " ns
+     ^ ": names that differ only in case are one file where case is not told apart")
+
+-- | what is wrong with the name `x`, written so, in directory `d`, which
+-- | holds `names`
+nameIn : Paths -> String -> List String -> String -> Maybe String
+nameIn ps d names x = casesIn ps d x (List.filter (\n -> sameButCase n x) names)
+
+-- | what is wrong with the names of the parts `parts` of a path under
+-- | `d`, if anything
+partsNamed : {e : HFunctor}
+           -> {{ev : fs <: e}}
+           -> Paths
+           -> String
+           -> List String
+           -> Co e (Maybe String)
+partsNamed ps d Nil = val Nothing
+partsNamed ps d (Cons x rest) = do
+  names <- readDir d
+  case names of
+    Nothing -> val Nothing
+    Just ns -> case nameIn ps d ns x of
+      Just why -> val (Just why)
+      Nothing -> partsNamed ps (under ps d x) rest
+
+-- | what is wrong with the names on the disk of the file a module was
+-- | found at, if anything (a file not on the disk, an editor's unsaved
+-- | text, has none)
+namedAsWritten : {e : HFunctor}
+               -> {{ev : fs <: e}}
+               -> Paths
+               -> Found
+               -> Co e (Maybe String)
+namedAsWritten ps f = partsNamed ps f.place.base f.place.parts
+
+type LoadSt =
+  { done : List Dr.Source, doneMods : List String, errors : List String }
+
+emptySt : LoadSt
+emptySt = { done = Nil, doneMods = Nil, errors = Nil }
+
+addErr : LoadSt -> String -> LoadSt
+addErr st e =
+  { done = st.done
+  , doneMods = st.doneMods
+  , errors = List.append st.errors (Cons e Nil)
+  }
+
+-- | a file's path as a diagnostic names it: one of the library's as
+-- | `lib/...`, wherever the library is
+shownOf : Paths -> String -> String
+shownOf ps path = case relFrom ps ps.lib path of
+  Just rel -> P.join ps.style "lib" rel
+  Nothing -> path
+
+-- | the file is one of the library's: a module that may declare
+-- | primitives
+ofLibrary : Paths -> String -> Bool
+ofLibrary ps path = case relFrom ps ps.lib path of
+  Just _ -> True
+  Nothing -> False
+
+pushDone : LoadSt
+         -> Paths
+         -> String
+         -> String
+         -> String
+         -> List String
+         -> List (Pair String String)
+         -> LoadSt
+pushDone st ps m path src implicit renames =
+  { done =
+      List.append
+        st.done
+        (Cons
+           { module = m
+           , path = path
+           , shown = shownOf ps path
+           , source = src
+           , renames = renames
+           , implicit = implicit
+           , library = ofLibrary ps path
+           }
+           Nil)
+  , doneMods = Cons m st.doneMods
+  , errors = st.errors
+  }
+
+cycleMsg : String -> String -> List String -> String
+cycleMsg from m stack =
+  from
+  ^ ": importing "
+  ^ m
+  ^ " is a cycle: "
+  ^ joinWith " -> " (List.append (List.reverse stack) (Cons m Nil))
+
+missingMsg : List Place -> String -> String -> String
+missingMsg places from m =
+  from
+  ^ ": no module "
+  ^ m
+  ^ " (looked for "
+  ^ joinWith ", " (List.map (\(p : Place) -> p.path) places)
+  ^ ")"
+
+clashMsg : List Found -> String -> String -> String
+clashMsg found from m =
+  from
+  ^ ": module "
+  ^ m
+  ^ " is more than one file: "
+  ^ joinWith " and " (List.map (\(f : Found) -> f.path) found)
+
+-- (the import written `w` means module `m`)
+renaming : String
+         -> String
+         -> List (Pair String String)
+         -> List (Pair String String)
+renaming w m rs = if strEq w m then rs else Cons (MkPair w m) rs
+
+-- | the modules written `ws` in the file at `from`, each visited after
+-- | what it imports (`stack`: the modules being visited, newest first),
+-- | each file read by `read`, each importing without writing them the
+-- | modules `imp` says; and the imports of `from` that mean another
+-- | module than they say (`rs`, so far)
+loadMany : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> (String -> Co e (Maybe String))
+         -> Paths
+         -> List Pkg
+         -> List String
+         -> String
+         -> (String -> List String)
+         -> List String
+         -> LoadSt
+         -> List (Pair String String)
+         -> Co e (Pair LoadSt (List (Pair String String)))
+loadMany read ps pkgs stack from imp Nil st rs = val (MkPair st rs)
+loadMany read ps pkgs stack from imp (Cons w rest) st rs = do
+  found <- readEvery read (placesOf ps pkgs from w)
+  case found of
+    Nil ->
+      loadMany
+        read
+        ps
+        pkgs
+        stack
+        from
+        imp
+        rest
+        (addErr st (missingMsg (placesOf ps pkgs from w) from w))
+        rs
+    Cons f others ->
+      if elemL f.module st.doneMods
+        then loadMany
+            read
+            ps
+            pkgs
+            stack
+            from
+            imp
+            rest
+            st
+            (renaming w f.module rs)
+      else if elemL f.module stack
+        then loadMany
+            read
+            ps
+            pkgs
+            stack
+            from
+            imp
+            rest
+            (addErr st (cycleMsg from f.module stack))
+            (renaming w f.module rs)
+      else do
+        named <- namedAsWritten ps f
+        inner <-
+          loadMany
+            read
+            ps
+            pkgs
+            (Cons f.module stack)
+            f.path
+            imp
+            (Dr.importNames (I.importsOf (imp f.module) f.source).imports)
+            (case named of
+             Just why -> addErr st (from ^ ": importing " ^ w ^ ": " ^ why)
+             Nothing ->
+               if List.null others then st
+               else addErr st (clashMsg found from w))
+            Nil
+        loadMany
+            read
+            ps
+            pkgs
+            stack
+            from
+            imp
+            rest
+            (pushDone
+               (fst inner)
+               ps
+               f.module
+               f.path
+               f.source
+               (imp f.module)
+               (snd inner))
+            (renaming w f.module rs)
+
+-- | a program: its sources, what could not be loaded, where its project
+-- | is, what its package.hf says (if it has one, and it reads), and its
+-- | packages, the project's first
+type Loaded =
+  { sources : List Dr.Source
+  , errors : List String
+  , paths : Paths
+  , package : Maybe Pr.Package
+  , packages : List Pkg
+  }
+
+-- | the project's package.hf, read (Nothing: there is none)
+readPackageAt : {e : HFunctor}
+              -> {{ev : fs <: e}}
+              -> Paths
+              -> Co e (Maybe (Either String Pr.Package))
+readPackageAt ps = do
+  text <- readFile (under ps ps.root "package.hf")
+  val (case text of
+    Nothing -> Nothing
+    Just src -> case Pr.readPackage src of
+      Left p -> Just (Left (problemMsg (under ps ps.root "package.hf") src p))
+      Right pk -> Just (Right pk))
+
+packageOf : Maybe (Either String Pr.Package) -> Maybe Pr.Package
+packageOf (Just (Right p)) = Just p
+packageOf _ = Nothing
+
+packageErrors : Maybe (Either String Pr.Package) -> List String
+packageErrors (Just (Left why)) = [why]
+packageErrors _ = Nil
+
+loadDone : Paths
+         -> Maybe (Either String Pr.Package)
+         -> Pair (List Pkg) (List String)
+         -> LoadSt
+         -> Loaded
+loadDone ps pk pkgs st =
+  { sources = st.done
+  , errors = List.append (packageErrors pk) (List.append (snd pkgs) st.errors)
+  , paths = ps
+  , package = packageOf pk
+  , packages = fst pkgs
+  }
+
+-- What a module imports without writing it.  Every module imports each
+-- of the implicit modules (`I.implicitModules`), but those it is made
+-- of: a module the first of them needs imports none of them, one the
+-- second needs (and the first does not) imports the first, and so on.
+-- Which modules those are is found first, by loading each implicit
+-- module in turn, its files importing the implicit modules before it.
+
+-- (the implicit modules `ms` loaded in turn, after `before`)
+madeOfGo : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> (String -> Co e (Maybe String))
+         -> Paths
+         -> List Pkg
+         -> String
+         -> List String
+         -> List String
+         -> LoadSt
+         -> Co e LoadSt
+madeOfGo read ps pkgs from before Nil st = val st
+madeOfGo read ps pkgs from before (Cons m ms) st = do
+  r <- loadMany read ps pkgs Nil from (\_ -> before) [m] st Nil
+  madeOfGo read ps pkgs from (List.append before [m]) ms (fst r)
+
+-- | the modules the implicit modules are made of, imported from `from`,
+-- | each with the implicit modules it imports
+madeOf : {e : HFunctor}
+       -> {{ev : fs <: e}}
+       -> (String -> Co e (Maybe String))
+       -> Paths
+       -> List Pkg
+       -> String
+       -> Co e (List Dr.Source)
+madeOf read ps pkgs from = do
+  st <- madeOfGo read ps pkgs from Nil I.implicitModules emptySt
+  val st.done
+
+-- | what module `m` imports without writing it, the implicit modules
+-- | being made of `made`
+implicitOf : List Dr.Source -> String -> List String
+implicitOf made m = case List.find
+    (\(s : Dr.Source) -> strEq s.module m)
+    made of
+  Just s -> s.implicit
+  Nothing -> I.implicitModules
+
+-- | the program rooted at `file`, on the host `h` (the library, the
+-- | style of paths), each file read by `read` (an editor's unsaved text,
+-- | say): its sources in dependency order, what could not be found, and
+-- | where it looked
+loadProgramWith : {e : HFunctor}
+                -> {{ev : fs <: e}}
+                -> (String -> Co e (Maybe String))
+                -> Host
+                -> String
+                -> Co e Loaded
+loadProgramWith read h file = do
+  ps <- pathsFor h file
+  pk <- readPackageAt ps
+  pkgs <- packagesOf ps (packageOf pk)
+  mSrc <- read file
+  case mSrc of
+    Nothing ->
+      val (loadDone ps pk pkgs (addErr emptySt ("cannot read " ^ file)))
+    Just src -> do
+      made <- madeOf read ps (fst pkgs) file
+      r <-
+        loadMany
+          read
+          ps
+          (fst pkgs)
+          (Cons (moduleOf ps file) Nil)
+          file
+          (implicitOf made)
+          (Dr.importNames
+             (I.importsOf (implicitOf made (moduleOf ps file)) src).imports)
+          emptySt
+          Nil
+      val
+          (loadDone
+             ps
+             pk
+             pkgs
+             (pushDone
+                (fst r)
+                ps
+                (moduleOf ps file)
+                file
+                src
+                (implicitOf made (moduleOf ps file))
+                (snd r)))
+
+-- | ... each file read from the disk
+loadProgram : {e : HFunctor}
+            -> {{ev : fs <: e}}
+            -> Host
+            -> String
+            -> Co e Loaded
+loadProgram h file = loadProgramWith (\p -> readFile p) h file

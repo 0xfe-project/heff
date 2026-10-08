@@ -1,0 +1,410 @@
+-- Separate compilation, as a cache the compiler manages; this is the
+-- pure side: what a cache file says, and whether it may be believed.
+-- A module whose making is unchanged since it last elaborated clean is
+-- thawed from `.heff/<versionDir>/<module>.hc` instead of elaborated
+-- again (`heff.build.commands` does the reading and writing).
+--
+-- What a module is made of is tracked at the definitions it uses, not
+-- at whole imports: a definition's hash covers its core syntax and,
+-- transitively, the definitions it mentions; a module records the hash
+-- of each outside definition its own mention, and one hash per direct
+-- import for what its parse takes (the names defined, the fixities).
+-- `version` (and `versionDir` with it) must be bumped when elaboration
+-- changes, there being no build stamp to read from inside.
+
+import array as A
+import heff.build.decoder
+import heff.build.driver as Dr
+import heff.syntax.fixity as F
+import heff.elab.globals as G
+import heff.syntax.import as I
+import heff.elab.params as Pm
+import heff.elab.rename as Rn
+import heff.build.serial as Se
+import heff.elab.toplevel as T
+import map as Mp
+
+version : String
+version = "heff-cache-port/28"
+
+-- | the directory under `.heff/` this version's cache files are in: a
+-- | compiler of another version (the seed, the first stage) keeps its
+-- | own beside it, and neither throws the other's away
+versionDir : String
+versionDir = "v28"
+
+-- Hashing (private to this cache): two polynomial hashes, each modulo a
+-- prime below 2^31, so that every step stays a machine word (no big
+-- integer, on either backend)
+--------------------------------------------------------------------------------
+
+hashStepA : Int -> Int -> Int
+hashStepA h c = (h * 1000003 + c + 1) % 2147483647
+
+hashStepB : Int -> Int -> Int
+hashStepB h c = (h * 999983 + c + 1) % 2147483629
+
+hashGo : String -> Int -> Int -> Int -> String
+hashGo s i a b =
+  if i >= strLength s then showInt a ^ "-" ^ showInt b
+  else hashGo
+      s
+      (i + 1)
+      (hashStepA a (charCode s i))
+      (hashStepB b (charCode s i))
+
+strHash : String -> String
+strHash s = hashGo s 0 5381 7919
+
+-- Hashes of the definitions, and of what a parse takes
+--------------------------------------------------------------------------------
+
+hashOf : Mp.Map String String -> String -> String
+hashOf m k = fromMaybe "?" (Mp.lookup compareString k m)
+
+nubCa : List String -> List String
+nubCa Nil = Nil
+nubCa (Cons x xs) = Cons x (nubCa (List.filter (\y -> not (strEq y x)) xs))
+
+refsOf : G.Entry -> List String
+refsOf e =
+  List.sortBy
+    strLt
+    (nubCa (List.append (Rn.globalsInTy e.tySyntax) (Rn.globalsInEl e.syntax)))
+
+defHashOne : Mp.Map String String
+           -> Dr.Checked
+           -> Dr.Own
+           -> Mp.Map String String
+defHashOne m c o =
+  if Mp.member compareString o.key m then m
+  else case G.lookupEntry c.top.globals o.key of
+    Just e ->
+      Mp.insert
+        compareString
+        o.key
+        (strHash
+           (Se.encodeTy e.tySyntax
+            ^ "\n"
+            ^ Se.encodeEl e.syntax
+            ^ "\n"
+            ^ joinWith "," (List.map (\k -> k ^ ":" ^ hashOf m k) (refsOf e))))
+        m
+    Nothing -> m
+
+-- the module itself, a struct of its definitions, and its theory:
+-- mentioned bare (`M`), they hash as all of it
+wholeHash : Mp.Map String String -> Dr.Checked -> Mp.Map String String
+wholeHash m c =
+  Mp.insert
+    compareString
+    (c.module ^ "#")
+    (strHash
+       (joinWith
+          ","
+          (List.map (\(o : Dr.Own) -> o.key ^ ":" ^ hashOf m o.key) c.own)))
+    (Mp.insert
+       compareString
+       (c.module ^ "#T")
+       (strHash
+          (joinWith
+             ","
+             (List.map (\(o : Dr.Own) -> o.key ^ ":" ^ hashOf m o.key) c.own)))
+       m)
+
+-- | a thawed module's hashes: each definition's as it was frozen -- what
+-- | it is made of being unchanged, so is its hash -- not computed again
+thawedHashesInto : Mp.Map String String
+                 -> Dr.Thawed
+                 -> Dr.Checked
+                 -> Mp.Map String String
+thawedHashesInto hs th c =
+  wholeHash
+    (List.foldl
+       (\m p -> case p of
+        MkPair k h ->
+          if Mp.member compareString k m then m
+          else Mp.insert compareString k h m)
+       hs
+       th.hashes)
+    c
+
+-- | each definition's hash: its core syntax, and the hashes of the
+-- | definitions it mentions -- so a hash covers a definition's making,
+-- | transitively.  (A primitive declared again is the same one: the
+-- | first hash stands.)
+defHashesInto : Mp.Map String String -> Dr.Checked -> Mp.Map String String
+defHashesInto hs c =
+  wholeHash (List.foldl (\m o -> defHashOne m c o) hs c.own) c
+
+assocInt : F.Assoc -> Int
+assocInt AssocLeft = 0
+assocInt AssocRight = 1
+assocInt AssocNone = 2
+
+fixSig : F.Fixities -> String
+fixSig f =
+  joinWith
+    ";"
+    (List.map
+       (\(g : F.Group) ->
+          g.id
+          ^ ":"
+          ^ showInt (assocInt g.assoc)
+          ^ Se.tokBool g.loosest
+          ^ ":"
+          ^ joinWith " " g.ops)
+       f.groups)
+  ^ "|"
+  ^ joinWith
+    ";"
+    (List.map (\(e : F.Edge) -> e.tighter ^ ">" ^ e.looser) f.above)
+
+-- | what a module's parse takes from a direct import: the names it
+-- | defines, and the fixities it declares
+nsHashOf : Dr.Checked -> String
+nsHashOf c =
+  strHash
+    (joinWith "," (List.map (\(o : Dr.Own) -> o.name) c.own)
+     ^ "|"
+     ^ fixSig c.fixities)
+
+-- | the modules a file imports directly, in scope by name or by alias
+directOf : Dr.Source -> List String
+directOf s = Dr.importNames (Dr.importsOfSource s).imports
+
+-- Freezing: a clean module as the cache file keeps it
+--------------------------------------------------------------------------------
+
+tokPair : Pair String String -> List String
+tokPair (MkPair a b) = Cons (Se.tokStr a) (Cons (Se.tokStr b) Nil)
+
+tokCount : {a : Type} -> (a -> List String) -> List a -> List String
+tokCount f xs = Cons (showInt (List.length xs)) (List.concatMap f xs)
+
+freezeFix : F.Fixities -> List String
+freezeFix f =
+  List.append
+    (tokCount
+       (\(g : F.Group) ->
+          Cons
+            (Se.tokStr g.id)
+            (Cons
+               (showInt (assocInt g.assoc))
+               (Cons
+                  (Se.tokBool g.loosest)
+                  (Cons
+                     (Se.tokStr g.at)
+                     (tokCount (\o -> Cons (Se.tokStr o) Nil) g.ops)))))
+       f.groups)
+    (tokCount
+       (\(e : F.Edge) ->
+          Cons (Se.tokStr e.tighter) (Cons (Se.tokStr e.looser) Nil))
+       f.above)
+
+nsOf : List Dr.Checked -> String -> String
+nsOf done m = case List.find (\(d : Dr.Checked) -> strEq d.module m) done of
+  Just d -> nsHashOf d
+  Nothing -> "?"
+
+needsOf : Dr.Checked -> List String
+needsOf c =
+  List.sortBy
+    strLt
+    (List.filter
+       (\k ->
+          not (List.elemBy strEq k (List.map (\(o : Dr.Own) -> o.key) c.own)))
+       (nubCa
+          (List.concatMap
+             (\(o : Dr.Own) -> case G.lookupEntry c.top.globals o.key of
+              Just e ->
+                List.append
+                  (Rn.globalsInTy e.tySyntax)
+                  (Rn.globalsInEl e.syntax)
+              Nothing -> Nil)
+             c.own)))
+
+freezeDef : Mp.Map String String
+          -> Dr.Checked
+          -> Pair Dr.Own (Pair String Pm.Span)
+          -> Maybe (List String)
+freezeDef hashes c (MkPair o (MkPair _ sp)) = case G.lookupEntry
+    c.top.globals
+    o.key of
+  Just e ->
+    Just
+      (Cons
+         (Se.tokStr o.name)
+         (Cons
+            (Se.tokStr o.key)
+            (Cons
+               (Se.tokStr (hashOf hashes o.key))
+               (Cons
+                  (showInt sp.start)
+                  (Cons
+                     (showInt sp.end)
+                     (Cons
+                        (Se.encodeTy e.tySyntax)
+                        (Cons (Se.encodeEl e.syntax) Nil)))))))
+  Nothing -> Nothing
+
+zipCa : {a b : Type} -> List a -> List b -> List (Pair a b)
+zipCa (Cons x xs) (Cons y ys) = Cons (MkPair x y) (zipCa xs ys)
+zipCa _ _ = Nil
+
+consJust : {a : Type} -> a -> Maybe (List a) -> Maybe (List a)
+consJust x (Just ys) = Just (Cons x ys)
+consJust x Nothing = Nothing
+
+allJust : {a : Type} -> List (Maybe a) -> Maybe (List a)
+allJust Nil = Just Nil
+allJust (Cons Nothing _) = Nothing
+allJust (Cons (Just x) xs) = consJust x (allJust xs)
+
+-- | a clean module as the cache file keeps it: under which version, as
+-- | which module (a file system that does not tell case apart has one
+-- | file for `a.B` and `a.b`) and from which source it elaborated, what its parse took from each direct import,
+-- | which outside definitions it mentions (at which hashes), and its
+-- | own definitions' syntax
+freeze : Mp.Map String String
+       -> List Dr.Checked
+       -> Dr.Source
+       -> Dr.Checked
+       -> Maybe String
+freeze hashes done s c = case allJust
+    (List.map (\p -> freezeDef hashes c p) (zipCa c.own c.top.spans)) of
+  Nothing -> Nothing
+  Just defs ->
+    Just
+      (joinWith
+         " "
+         (List.append
+            (Cons
+               (Se.tokStr version)
+               (Cons
+                  (Se.tokStr s.module)
+                  (Cons (Se.tokStr (strHash c.source)) (freezeFix c.fixities))))
+            (List.append
+               (tokCount (\m -> tokPair (MkPair m (nsOf done m))) (directOf s))
+               (List.append
+                  (tokCount
+                     (\k -> tokPair (MkPair k (hashOf hashes k)))
+                     (needsOf c))
+                  (tokCount (\d -> d) defs)))))
+
+-- Melting: believing a cache file, or not
+--------------------------------------------------------------------------------
+
+mkGroup : String -> F.Assoc -> Bool -> String -> List String -> F.Group
+mkGroup gid assoc loosest at ops =
+  { id = gid, assoc = assoc, ops = ops, loosest = loosest, at = at }
+
+mkEdge : String -> String -> F.Edge
+mkEdge tighter looser = { tighter = tighter, looser = looser }
+
+mkFixities : List F.Group -> List F.Edge -> F.Fixities
+mkFixities groups above = { groups = groups, above = above }
+
+assocOf : Int -> Dec F.Assoc
+assocOf 0 = pure AssocLeft
+assocOf 1 = pure AssocRight
+assocOf 2 = pure AssocNone
+assocOf _ = fail
+
+meltFixGroup : Dec F.Group
+meltFixGroup = do
+  gid <- str
+  a <- int
+  loosest <- bool
+  at <- str
+  ops <- many str
+  assoc <- assocOf a
+  pure (mkGroup gid assoc loosest at ops)
+
+meltFixEdge : Dec F.Edge
+meltFixEdge = do
+  tighter <- str
+  looser <- str
+  pure (mkEdge tighter looser)
+
+meltFix : Dec F.Fixities
+meltFix = do
+  groups <- many meltFixGroup
+  above <- many meltFixEdge
+  pure (mkFixities groups above)
+
+meltPair : Dec (Pair String String)
+meltPair = do
+  a <- str
+  b <- str
+  pure (MkPair a b)
+
+meltDef : Dec (Pair T.ThawedDef String)
+meltDef = do
+  name <- str
+  key <- str
+  hash <- str
+  start <- int
+  end <- int
+  ty <- Se.takeTy
+  body <- Se.takeEl
+  pure
+      (MkPair
+         (T.mkThawedDef name key { start = start, end = end } ty body)
+         (key ^ "\n" ^ hash))
+
+-- (a definition melted, with its key and hash: `key\nhash`)
+keyHash : String -> Pair String String
+keyHash kh = case split "\n" kh of
+  Cons k (Cons h _) -> MkPair k h
+  _ -> MkPair kh "?"
+
+mkThawed : F.Fixities -> List (Pair T.ThawedDef String) -> Dr.Thawed
+mkThawed fixities defs =
+  { fixities = fixities
+  , defs = List.map fst defs
+  , hashes = List.map (\d -> keyHash (snd d)) defs
+  }
+
+-- (a direct import, its namespace as it was)
+importHolds : List Dr.Checked -> Pair String String -> Bool
+importHolds done (MkPair m h) = strEq (nsOf done m) h
+
+-- (a needed definition, at the hash it had)
+needHolds : Mp.Map String String -> Pair String String -> Bool
+needHolds hashes (MkPair k h) = strEq (hashOf hashes k) h
+
+-- | every direct import's namespace as it was, and no other import
+importsHold : List Dr.Checked -> Dr.Source -> List (Pair String String) -> Bool
+importsHold done s ns =
+  List.all (importHolds done) ns && List.length ns == List.length (directOf s)
+
+needsHold : Mp.Map String String -> List (Pair String String) -> Bool
+needsHold hashes needs = List.all (needHolds hashes) needs
+
+-- | a module believed back from its cache file: same version, same
+-- | module, same source, every direct import's namespace as it was (the
+-- | source is the same, so the import list is too), every needed
+-- | definition at the hash it had
+meltFrom : Mp.Map String String -> List Dr.Checked -> Dr.Source -> Dec Dr.Thawed
+meltFrom hashes done s = do
+  expect version
+  expect s.module
+  expect (strHash s.source)
+  fixities <- meltFix
+  ns <- many meltPair
+  guard (importsHold done s ns)
+  needs <- many meltPair
+  guard (needsHold hashes needs)
+  defs <- many meltDef
+  pure (mkThawed fixities defs)
+
+melt : Mp.Map String String
+     -> List Dr.Checked
+     -> Dr.Source
+     -> String
+     -> Maybe Dr.Thawed
+melt hashes done s text = run (meltFrom hashes done s) text
+
+-- >>> strEq (strHash "abc") (strHash "abc") && not (strEq (strHash "abc") (strHash "abd"))
+-- True

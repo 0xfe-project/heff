@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The formatter (src/heff/format.hf): every .hf file of the repository
+// The formatter (src/heff/syntax/format.hf): every .hf file of the repository
 // (that parses) is formatted (the formatter checks itself that the result
 // means the same and keeps the comments) and formatting it again changes
 // nothing; then cases of comments, blank lines, blocks, watches and
@@ -13,7 +13,7 @@ import { heffBin, root } from "./heff.mjs";
 // the formatter, compiled to a module of its own, its `format` called
 // directly: `Right` the text laid out, `Left` why not
 const module = join(root, ".heff", "out", "heff-format.mjs");
-execFileSync(heffBin, ["compile", "src/heff/format.hf", module, "--backend=esm"], { cwd: root });
+execFileSync(heffBin, ["compile", "src/heff/syntax/format.hf", module, "--backend=esm"], { cwd: root });
 const { format } = (await import(pathToFileURL(module))).default;
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}:\n${got}`); } };

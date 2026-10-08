@@ -27,7 +27,7 @@ const said = (r) => `${r.stdout}--stderr--\n${r.stderr}--exit ${r.status}\n`;
 
 // (the lexer's keywords, `Int` and `Type` among them: no names)
 const keywords = new Set(
-  readFileSync(join(root, "src", "heff", "fmt", "lex.hf"), "utf8")
+  readFileSync(join(root, "src", "heff", "syntax", "fmt", "lex.hf"), "utf8")
     .match(/^keywords =\n((?:  .*\n)+)/m)[1].match(/"[^"]+"/g).map((k) => k.slice(1, -1)));
 
 // type-at: the starts of some names of the file (every one of a stride,

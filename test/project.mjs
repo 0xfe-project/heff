@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Projects (src/heff/project.hf, src/heff/load.hf): `heff init` makes one
+// Projects (src/heff/build/project.hf, src/heff/build/load.hf): `heff init` makes one
 // that builds, its watches and tests holding; a project's modules are
 // under src/, a file outside it (a test) may import the project's
 // modules and helpers beside it, what is in src/ may not import those; a

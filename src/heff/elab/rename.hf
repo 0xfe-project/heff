@@ -1,0 +1,168 @@
+-- Renaming the globals inside syntax: how the keys of other modules' definitions are shown by the names
+-- they have in a file.
+
+import array as A
+import heff.util.dict as D
+import heff.elab.globals as G
+import heff.elab.params as Pm
+import heff.elab.syntax as Sx
+import map as M
+
+renameAbs : {a : Type} -> (a -> a) -> Sx.Abs a -> Sx.Abs a
+renameAbs f (MkAbs x t) = MkAbs x (f t)
+renameAbs f (AbsConst t) = AbsConst (f t)
+
+-- | the two renamers, knotted
+type RK = { el : Sx.Tm -> Sx.Tm, ty : Sx.Ty -> Sx.Ty }
+
+renameCase : RK -> Pair (Array String) Sx.Tm -> Pair (Array String) Sx.Tm
+renameCase k (MkPair xs b) = MkPair xs (k.el b)
+
+renameTermF : RK -> (String -> String) -> Sx.Tm -> Sx.Tm
+renameTermF k r e = case e of
+  SGlobal x -> SGlobal (r x)
+  SCode t -> SCode (k.ty t)
+  SApp f a -> SApp (k.el f) (k.el a)
+  SLam d b -> SLam (k.ty d) (renameAbs (\e2 -> k.el e2) b)
+  SCons d -> SCons (D.mapD (\e2 -> k.el e2) d)
+  SProj e2 l -> SProj (k.el e2) l
+  STag t as -> STag t (A.fromList (List.map (\e2 -> k.el e2) (A.toList as)))
+  SMatch e2 cs -> SMatch (k.el e2) (D.mapD (\p -> renameCase k p) cs)
+  SSpecialize e2 l v -> SSpecialize (k.el e2) l (k.el v)
+  SIs e2 -> SIs (k.el e2)
+  SRec e2 -> SRec (k.el e2)
+  SFix d b -> SFix (k.ty d) (renameAbs (\e2 -> k.el e2) b)
+  SImplicit x e2 -> SImplicit x (k.el e2)
+  SMetaApp m xs t -> SMetaApp m xs (k.ty t)
+  _ -> e
+
+renameDefault : RK -> Maybe Sx.Tm -> Maybe Sx.Tm
+renameDefault k (Just d) = Just (k.el d)
+renameDefault k Nothing = Nothing
+
+renameTypeF : RK -> (String -> String) -> Sx.Ty -> Sx.Ty
+renameTypeF k r t = case t of
+  SDecode e -> SDecode (k.el e)
+  SFunction level dom cod implicit dflt ->
+    SFunction
+      level
+      (k.ty dom)
+      (renameAbs (\t2 -> k.ty t2) cod)
+      implicit
+      (renameDefault k dflt)
+  SRecord level fs ds ->
+    SRecord level (D.mapD (\t2 -> k.ty t2) fs) (D.mapD (\e2 -> k.el e2) ds)
+  SSum vs -> SSum (Pm.variantsMap (\t2 -> k.ty t2) vs)
+  SIsTy t2 -> SIsTy (k.ty t2)
+  SPrimArray t2 -> SPrimArray (k.ty t2)
+  _ -> t
+
+rkOf : (String -> String) -> RK
+rkOf r =
+  { el = \e -> renameTermF (rkOf r) r e, ty = \t -> renameTypeF (rkOf r) r t }
+
+renameEl : (String -> String) -> Sx.Tm -> Sx.Tm
+renameEl r e = (rkOf r).el e
+
+renameTy : (String -> String) -> Sx.Ty -> Sx.Ty
+renameTy r t = (rkOf r).ty t
+
+-- | a synthesized key (no surface spelling: `m#` is the module as a
+-- | value, `m#T` its theory) said in words
+describeKey : String -> String
+describeKey x =
+  if endsWith "#T" x then "the theory of " ^ strSlice x 0 (strLength x - 2)
+  else if endsWith "#" x then "the module " ^ strSlice x 0 (strLength x - 1)
+  else x
+
+nubFirst : List String -> List String
+nubFirst Nil = Nil
+nubFirst (Cons x xs) =
+  Cons x (nubFirst (List.filter (\y -> not (strEq y x)) xs))
+
+globalsAbs : {a : Type} -> (a -> List String) -> Sx.Abs a -> List String
+globalsAbs f (MkAbs _ t) = f t
+globalsAbs f (AbsConst t) = f t
+
+-- | the globals a term mentions, in order of first mention, each once
+-- | (the two walkers are one knot)
+type GK = { el : Sx.Tm -> List String, ty : Sx.Ty -> List String }
+
+globalsTermF : GK -> Sx.Tm -> List String
+globalsTermF k e = case e of
+  SGlobal x -> Cons x Nil
+  SCode t -> k.ty t
+  SApp f a -> List.append (k.el f) (k.el a)
+  SLam d b -> List.append (k.ty d) (globalsAbs (\e2 -> k.el e2) b)
+  SCons d ->
+    List.concatMap
+      (\p -> case p of
+       MkPair _ e2 -> k.el e2)
+      (D.toList d)
+  SProj e2 _ -> k.el e2
+  STag _ as -> List.concatMap (\a -> k.el a) (A.toList as)
+  SMatch e2 cs ->
+    List.append
+      (k.el e2)
+      (List.concatMap
+         (\p -> case p of
+          MkPair _ (MkPair _ b) -> k.el b)
+         (D.toList cs))
+  SSpecialize e2 _ v -> List.append (k.el e2) (k.el v)
+  SIs e2 -> k.el e2
+  SRec e2 -> k.el e2
+  SFix d b -> List.append (k.ty d) (globalsAbs (\e2 -> k.el e2) b)
+  SImplicit _ e2 -> k.el e2
+  SMetaApp _ _ t -> k.ty t
+  _ -> Nil
+
+globalsTypeF : GK -> Sx.Ty -> List String
+globalsTypeF k t = case t of
+  SDecode e -> k.el e
+  SFunction _ dom cod _ dflt ->
+    List.append
+      (k.ty dom)
+      (List.append (globalsAbs (\t2 -> k.ty t2) cod) (case dflt of
+       Just d -> k.el d
+       Nothing -> Nil))
+  SRecord _ fs ds ->
+    List.append
+      (List.concatMap
+         (\p -> case p of
+          MkPair _ t2 -> k.ty t2)
+         (D.toList fs))
+      (List.concatMap
+         (\p -> case p of
+          MkPair _ e2 -> k.el e2)
+         (D.toList ds))
+  SSum vs ->
+    List.concatMap
+      (\p -> case p of
+       MkPair _ ts -> List.concatMap (\t2 -> k.ty t2) (A.toList ts))
+      (D.toList vs)
+  SIsTy t2 -> k.ty t2
+  SPrimArray t2 -> k.ty t2
+  _ -> Nil
+
+gk : GK
+gk = { el = \e -> globalsTermF gk e, ty = \t -> globalsTypeF gk t }
+
+globalsInEl : Sx.Tm -> List String
+globalsInEl e = nubFirst (gk.el e)
+
+globalsInTy : Sx.Ty -> List String
+globalsInTy t = nubFirst (gk.ty t)
+
+firstAliasOf : List (Pair String String) -> String -> Maybe String
+firstAliasOf Nil x = Nothing
+firstAliasOf (Cons (MkPair n k) rest) x =
+  if strEq k x then Just n else firstAliasOf rest x
+
+-- | a global key as the name it is known by where it is shown: a
+-- | module's definition (`module.name`) by its alias, if it has one
+displayName : G.Globals -> String -> String
+displayName g x =
+  fromMaybe (describeKey x) (firstAliasOf (M.toList g.aliases) x)
+
+-- >>> renameEl (\k -> if strEq k "prelude.id" then "id" else k) (SApp (SGlobal "prelude.id") (SLitInt 3))
+-- SApp (SGlobal "id") (SLitInt 3)

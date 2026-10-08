@@ -41,7 +41,7 @@ const heffSeed = (() => { try { return readFileSync(seedOf, "utf8").trim(); } ca
 // newer than every source of it and than the seed)
 const mtime = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
 const sources = [seed, join(root, "scripts", "build.mjs"),
-  ...["app/heff", "src/heff", "src/heff/fmt", "lib", "lib/std", "lib/c"].flatMap((d) =>
+  ...["app/heff", "src/heff/syntax", "src/heff/syntax/fmt", "src/heff/elab", "src/heff/compile", "src/heff/build", "src/heff/lsp", "src/heff/util", "lib", "lib/std", "lib/c"].flatMap((d) =>
     readdirSync(join(root, d)).filter((f) => /\.(hf|js|c)$/.test(f)).map((f) => join(root, d, f)))];
 if (!fromSeed && mtime(out) >= 0 && heffSeed === seedHash && sources.every((s) => mtime(s) <= mtime(out))) {
   console.log(`heff build: ${out} is up to date`);

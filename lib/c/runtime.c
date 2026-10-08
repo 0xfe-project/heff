@@ -1,4 +1,4 @@
-// heff's runtime for the C backend (src/heff/emitc.hf), bundled whole
+// heff's runtime for the C backend (src/heff/compile/emitc.hf), bundled whole
 // into each program it compiles, before the program's own code and its
 // worlds' providers (`M.provider.c` beside `M.hf`).
 //
@@ -16,14 +16,14 @@
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
 // freeing it.  What a function is given it owns: it consumes it (gives
 // it to what it calls, keeps it in what it builds) or drops it -- the
-// emitter says where (src/heff/emitc.hf, "Reference counts"); every
+// emitter says where (src/heff/compile/emitc.hf, "Reference counts"); every
 // primitive and the runtime's calls consume their arguments too.  What
 // is static (a string written in the program, a definition's closure) is
 // immortal, its count never changed.  A program runs in a thread of its
 // own with a large stack, as the Node.js backend's does.  A call last of an unknown
 // function counts itself and every so often gives back a bounce (`K_BNC`),
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
-// backend does (src/heff/emit.hf, "Tail calls") -- unless it is a jump
+// backend does (src/heff/compile/emit.hf, "Tail calls") -- unless it is a jump
 // (`HEFF_LAST`), from a lambda to a closure of as many parameters.
 
 #ifdef _WIN32
@@ -399,7 +399,7 @@ HEFF_KNOWN V heff_clo_n(Fn fn, int arity, int64_t n, V *env) {
 
 // Fields at their known place (#34): a record's fields are those of its
 // type that are not types, in the order the type has them (its shape),
-// so where the emitter knows the type -- src/heff/erase.hf gives each
+// so where the emitter knows the type -- src/heff/compile/erase.hf gives each
 // projection its record's shape -- it reads a field at its place, not
 // looking for its label (`heff_get`).
 
@@ -439,7 +439,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
 }
 
 // (field `i` of a record wanted after, which after it is only read other
-// fields of, then updated or dropped (src/heff/emitc.hf, `takesFor`):
+// fields of, then updated or dropped (src/heff/compile/emitc.hf, `takesFor`):
 // its last reference, the field taken out of it -- moved, not counted, a
 // hole left that drops as nothing; otherwise the field counted)
 HEFF_KNOWN V heff_take_field(V v, int64_t i) {
@@ -718,7 +718,7 @@ static inline V heff_app1(V f, V x) { return heff_apply(f, 1, &x); }
 // (whether `f`, given the `n` arguments at `a`, is a closure taking
 // exactly them and not a thunk forced -- what `heff_apply` would call at
 // once, as it is -- and a call last of it a jump: a lambda's call last
-// of it is then not counted (src/heff/emitc.hf, `inPlace`))
+// of it is then not counted (src/heff/compile/emitc.hf, `inPlace`))
 static inline int heff_exact(V f, int n, V *a) {
   return HEFF_JUMPS && IS_OBJ(f) && OBJ(f)->kind == K_CLO
       && ((Clo *)f)->arity == n && !(n == 1 && a[0] == NTAG(TAG_MkUnit));
@@ -1472,7 +1472,7 @@ static inline float heff_f32_of(V v) {
 
 // Fixed-width numbers
 // ---------------------------------------------------------------------
-// (heff.fixed's.)  An integer of up to 32 bits is a word of its value,
+// (heff.elab.fixed's.)  An integer of up to 32 bits is a word of its value,
 // in its type's range; one of 64 bits is kept as an `Int` is (a word, big
 // beyond 62 bits), so `toInt` is nothing.  An integer's operation is
 // done on its 64 bits, unsigned (where no overflow is undefined), and the
@@ -1808,7 +1808,7 @@ static V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 // The world: the things the providers hand out, held in one table for
 // them all, so that one effect's provider takes what another's handed
 // out (lib/std/handle.hf: a `Handle` is `MkHandle i`, made and taken
-// apart by the provider), as src/heff/emit.hf's `$world` holds them.
+// apart by the provider), as src/heff/compile/emit.hf's `$world` holds them.
 // `heff_hold(x, free)` is the number of `x`, the same while it is held;
 // `heff_held(i)` the thing numbered `i`; `heff_release(i)` lets it go
 // -- `free(x)`, if its holder gave a `free` -- and its number is no
@@ -1899,7 +1899,7 @@ static V heff_nomatch(V s) {
 // ---------------------------------------------------------------------
 
 // (the names of the tags and labels, each by its number: a tag's and a
-// label's number is a hash of its name, src/heff/emitc.hf)
+// label's number is a hash of its name, src/heff/compile/emitc.hf)
 typedef struct { uint32_t id; const char *name; } HeffName;
 HEFF_VAR(const HeffName *heff_tag_names);
 HEFF_VAR(int heff_ntag_names);

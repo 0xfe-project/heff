@@ -1,0 +1,188 @@
+-- Globals: an insertion-ordered map of names to elaborated
+-- definitions.  `syntax` is the definition at case D with itself as
+-- local 0, `tySyntax` its type, closed; `value` and `type_` their
+-- evaluations (`src/heff/elab/top.hf` ties the knot).
+
+import heff.elab.syntax as Sx
+import heff.elab.value as V
+import map as M
+
+type Entry = { syntax : Sx.Tm, tySyntax : Sx.Ty, value : V.V, type_ : V.Ty }
+
+-- | `aliases` maps a name to the key it stands for; `broken` the keys of
+-- | definitions that did not elaborate (a use of one is not an error of
+-- | its own); `ambiguous` a name that stands for more than one key, the
+-- | keys (a use of it unqualified is an error), and `places` where a key
+-- | is defined, said (`prelude, at lib/prelude.hf:23`)
+type Globals =
+  { order : List String
+  , entries : M.Map String Entry
+  , aliases : M.Map String String
+  , broken : M.Map String Unit
+  , ambiguous : M.Map String (List String)
+  , places : M.Map String String
+  }
+
+emptyGlobals : Globals
+emptyGlobals =
+  { order = Nil
+  , entries = M.empty
+  , aliases = M.empty
+  , broken = M.empty
+  , ambiguous = M.empty
+  , places = M.empty
+  }
+
+addBroken : String -> Globals -> Globals
+addBroken k g =
+  { order = g.order
+  , entries = g.entries
+  , aliases = g.aliases
+  , broken = M.insert compareString k MkUnit g.broken
+  , ambiguous = g.ambiguous
+  , places = g.places
+  }
+
+-- | whether the name `x` stands for a definition that did not elaborate:
+-- | what it is an alias for, else (a key being itself) `x`
+isBroken : Globals -> String -> Bool
+isBroken g x = case M.lookup compareString x g.aliases of
+  Just k -> M.member compareString k g.broken
+  Nothing -> M.member compareString x g.broken
+
+-- | (a redefinition moves the name to the end; `order` is kept backwards
+-- | here, newest first, and reversed where it is read.  Only then is it
+-- | copied: an old `Globals` is kept by what was elaborated under it,
+-- | and a copy each time held them all, quadratic in the definitions)
+addEntry : String -> Entry -> Globals -> Globals
+addEntry x e g =
+  { order =
+      if M.member compareString x g.entries
+        then Cons x (List.filter (\y -> not (strEq y x)) g.order)
+      else Cons x g.order
+  , entries = M.insert compareString x e g.entries
+  , aliases = g.aliases
+  , broken = g.broken
+  , ambiguous = g.ambiguous
+  , places = g.places
+  }
+
+addAlias : String -> String -> Globals -> Globals
+addAlias name key g =
+  { order = g.order
+  , entries = g.entries
+  , aliases = M.insert compareString name key g.aliases
+  , broken = g.broken
+  , ambiguous = g.ambiguous
+  , places = g.places
+  }
+
+-- | where the key `k` is defined, said
+addPlace : String -> String -> Globals -> Globals
+addPlace k place g =
+  { order = g.order
+  , entries = g.entries
+  , aliases = g.aliases
+  , broken = g.broken
+  , ambiguous = g.ambiguous
+  , places = M.insert compareString k place g.places
+  }
+
+placeOf : Globals -> String -> String
+placeOf g k = case M.lookup compareString k g.places of
+  Just place -> place
+  Nothing -> k
+
+-- | the keys the name `x` stands for, if more than one
+ambiguousIn : Globals -> String -> Maybe (List String)
+ambiguousIn g x = M.lookup compareString x g.ambiguous
+
+-- | the name `x` stands for the keys `ks` too: no longer for one alone
+addAmbiguous : String -> List String -> Globals -> Globals
+addAmbiguous x ks g =
+  { order = g.order
+  , entries = g.entries
+  , aliases = M.delete compareString x g.aliases
+  , broken = g.broken
+  , ambiguous =
+      M.insert
+        compareString
+        x
+        (List.append
+           (case ambiguousIn g x of
+            Just old -> List.filter (\k -> not (List.elemBy strEq k ks)) old
+            Nothing -> Nil)
+           ks)
+        g.ambiguous
+  , places = g.places
+  }
+
+-- | the definition under the key `k`, and the key
+keyedEntry : Globals -> String -> Maybe (Pair String Entry)
+keyedEntry g k = case M.lookup compareString k g.entries of
+  Just e -> Just (MkPair k e)
+  Nothing -> Nothing
+
+-- | resolve a name to its key and entry: what the name is an alias for
+-- | -- the module's own definition, else an import's -- else, a key
+-- | being itself, the definition under it.  A primitive's key is its
+-- | bare name: the module's own definition of that name, or an import's,
+-- | comes before it, as before any other.  (A name that stands for more
+-- | than one key is ambiguous, `ambiguousIn`, not resolved)
+lookupKey : Globals -> String -> Maybe (Pair String Entry)
+lookupKey g x = case M.lookup compareString x g.aliases of
+  Just k -> keyedEntry g k
+  Nothing -> keyedEntry g x
+
+-- | the definition a name stands for (`lookupKey`)
+lookupName : Globals -> String -> Maybe Entry
+lookupName g x = case lookupKey g x of
+  Just (MkPair _ e) -> Just e
+  Nothing -> Nothing
+
+-- | the definition under the key `k` -- else under what `k` is an alias
+-- | for.  The key comes first: `intAdd` is the primitive here, where the
+-- | name `intAdd` may be the module's own (`lookupName` for a name)
+lookupEntry : Globals -> String -> Maybe Entry
+lookupEntry g k = case M.lookup compareString k g.entries of
+  Just e -> Just e
+  Nothing -> case M.lookup compareString k g.aliases of
+    Just k2 -> M.lookup compareString k2 g.entries
+    Nothing -> Nothing
+
+-- (the name `x` stands for one key again)
+notAmbiguous : String -> Globals -> Globals
+notAmbiguous x g =
+  { order = g.order
+  , entries = g.entries
+  , aliases = g.aliases
+  , broken = g.broken
+  , ambiguous = M.delete compareString x g.ambiguous
+  , places = g.places
+  }
+
+-- | the module's own definition of `x`, by the key `k`: the name stands
+-- | for it, whatever it stood for before -- an import's, or two imports'
+-- | -- as a module's own definition comes first
+addOwn : String -> String -> Globals -> Globals
+addOwn x k g = addAlias x k (notAmbiguous x g)
+
+-- | every definition, in the order declared (`order` is kept newest
+-- | first)
+globalsList : Globals -> List (Pair String Entry)
+globalsList g =
+  List.foldl
+    (\acc k -> case M.lookup compareString k g.entries of
+     Just e -> Cons (MkPair k e) acc
+     Nothing -> acc)
+    Nil
+    g.order
+
+-- | (evaluation only reaches globals that are there)
+elemAt : Globals -> String -> Entry
+elemAt g x = case M.lookup compareString x g.entries of
+  Just e -> e
+  Nothing -> abandon
+
+-- >>> (elemAt (addEntry "k" { syntax = SOpaque, tySyntax = SPrimInt, value = VOpaque, type_ = VPrimInt } emptyGlobals) "k").tySyntax
+-- SPrimInt

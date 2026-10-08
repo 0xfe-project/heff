@@ -1,0 +1,415 @@
+-- Specialisation, the parts that compute nothing (`heff.compile.simplify` does
+-- the rest): a key that tells known arguments apart (the same for two
+-- copies of one value, whatever their binders are named), which
+-- parameters a function hands on to itself unchanged, and its calls of
+-- itself as calls of a copy given only the others.
+
+import heff.elab.fixed as Fx
+import heff.compile.ir as I
+import map as M
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+appendS : {a : Type} -> List a -> List a -> List a
+appendS Nil ys = ys
+appendS (Cons x xs) ys = Cons x (appendS xs ys)
+
+allS : {a : Type} -> (a -> Bool) -> List a -> Bool
+allS p Nil = True
+allS p (Cons x xs) = p x && allS p xs
+
+-- (an arm's body, its variables bound)
+armClosed : (List String -> I.Expr -> Bool) -> List String -> I.Arm -> Bool
+armClosed go env (MkArm _ vs b) = go (appendS vs env) b
+
+-- | whether every variable it mentions is bound in it or in `env`
+closedIn : List String -> I.Expr -> Bool
+closedIn env (EVar x) = elemS x env
+closedIn env (ELam xs b) = closedIn (appendS xs env) b
+closedIn env (EApp f as) = closedIn env f && allS (closedIn env) as
+closedIn env (ELet x a b) = closedIn env a && closedIn (Cons x env) b
+closedIn env (ERecord fs) = allS (closedIn env) (List.map snd fs)
+closedIn env (EProj e _ _) = closedIn env e
+closedIn env (ETag _ as) = allS (closedIn env) as
+closedIn env (EMatch s arms) =
+  closedIn env s && allS (armClosed closedIn env) arms
+closedIn env (EPrimCall _ as) = allS (closedIn env) as
+closedIn env (ECall _ as) = allS (closedIn env) as
+closedIn env (EFix _ _) = False
+closedIn env _ = True
+
+posGo : String -> List String -> Int -> Int
+posGo x Nil i = 0 - 1
+posGo x (Cons y ys) i = if strEq x y then i else posGo x ys (i + 1)
+
+keysBy : (I.Expr -> String) -> List I.Expr -> String
+keysBy go es = joinWith "," (List.map go es)
+
+fieldKey : (I.Expr -> String) -> Pair String I.Expr -> String
+fieldKey go (MkPair l v) = l ^ "=" ^ go v
+
+armKey : (List String -> I.Expr -> String) -> List String -> I.Arm -> String
+armKey go env (MkArm t vs b) =
+  "|"
+  ^ t
+  ^ showInt (List.length vs)
+  ^ ":"
+  ^ go (appendS (List.reverse vs) env) b
+
+-- (a variable is where it was bound, counted from the nearest binder)
+keyGo : List String -> I.Expr -> String
+keyGo env (EVar x) = "v" ^ showInt (posGo x env 0)
+keyGo env (EGlobal g) = "g" ^ g ^ ";"
+keyGo env (ELam xs b) =
+  "L"
+  ^ showInt (List.length xs)
+  ^ "("
+  ^ keyGo (appendS (List.reverse xs) env) b
+  ^ ")"
+keyGo env (EApp f as) = "A(" ^ keyGo env f ^ ":" ^ keysBy (keyGo env) as ^ ")"
+keyGo env (ELet x a b) = "T(" ^ keyGo env a ^ ":" ^ keyGo (Cons x env) b ^ ")"
+keyGo env (ERecord fs) =
+  "R(" ^ joinWith "," (List.map (fieldKey (keyGo env)) fs) ^ ")"
+keyGo env (EProj e l sh) =
+  "P(" ^ keyGo env e ^ "." ^ l ^ "/" ^ joinWith "," sh ^ ")"
+keyGo env (ETag t as) = "C" ^ t ^ "(" ^ keysBy (keyGo env) as ^ ")"
+keyGo env (EMatch s arms) =
+  "M(" ^ keyGo env s ^ joinWith "" (List.map (armKey keyGo env) arms) ^ ")"
+keyGo env (EPrim p) = "p" ^ p ^ ";"
+keyGo env (EPrimCall p as) = "Q" ^ p ^ "(" ^ keysBy (keyGo env) as ^ ")"
+keyGo env (ECall g as) = "K" ^ g ^ "(" ^ keysBy (keyGo env) as ^ ")"
+keyGo env (EInt i) = "i" ^ showInt i
+keyGo env (EFloat x) = "f" ^ showFloat x
+keyGo env (EStr s) = "s" ^ showInt (strLength s) ^ ":" ^ s
+keyGo env (EFixed w n) = "x" ^ Fx.showFixed w ^ ":" ^ showInt n
+keyGo env (EFloat32 x) = "y" ^ showFloat x
+keyGo env EAbandon = "X"
+keyGo env (EFix _ _) = "F"
+
+-- | a closed value's key: alike for two copies of it
+key : I.Expr -> String
+key e = keyGo Nil e
+
+-- (two polynomial hashes, each modulo a prime below 2^31)
+hashGo : String -> Int -> Int -> Int -> String
+hashGo s i a b =
+  if i >= strLength s then showInt a ^ "x" ^ showInt b
+  else hashGo
+      s
+      (i + 1)
+      ((a * 1000003 + charCode s i + 1) % 2147483647)
+      ((b * 999983 + charCode s i + 1) % 2147483629)
+
+-- | a short name for a text: a hash of it
+hashText : String -> String
+hashText s = hashGo s 0 5381 7919
+
+-- (the definition a copy is of: its name up to the first copy's mark)
+rootAt : String -> Maybe Int -> String
+rootAt g (Just i) = strSlice g 0 i
+rootAt g Nothing = g
+
+rootOf : String -> String
+rootOf g = rootAt g (indexOf "$s" g)
+
+-- | a copy's name: by what it is made for -- the definition and its
+-- | key -- not by how many were made before it, nor by who made it
+-- | first, so that a copy is named alike in every program, and a name
+-- | is one copy
+copyName : String -> String -> String
+copyName g k = rootOf g ^ "$s" ^ hashText k
+
+-- Shapes: what a copy is made for
+--------------------------------------------------------------------------------
+
+-- A copy is made for what its known arguments are, not for the numbers
+-- and texts written in them, nor for what their binders are called: a
+-- literal in a known argument is a parameter of the copy, given it
+-- where the copy is called, and every binder is named alike (`a`).  So
+-- arguments alike but for those are given one copy, the same whoever
+-- asks for it first; and a copy for a number that grows each time one
+-- is asked for (`{ indent = c.indent + 2 }`) is the same copy, not one
+-- more for each number.
+
+-- | shaping, so far: the binders renamed, the literals taken out (the
+-- | last first, each a variable of `vars`), the names drawn
+type ShapeSt =
+  { ren : M.Map String String
+  , vars : List String
+  , holes : List I.Expr
+  , n : Int
+  }
+
+-- | a known argument as the copy has it (`e`), its literals variables
+-- | (`vars`) given `holes` where it is called; names drawn up to `n`
+type Shaped = { e : I.Expr, vars : List String, holes : List I.Expr, n : Int }
+
+type ShapeGo = I.Expr -> ShapeSt -> Pair I.Expr ShapeSt
+
+-- (a literal taken out, a variable in its place)
+holeOf : I.Expr -> ShapeSt -> Pair I.Expr ShapeSt
+holeOf lit st =
+  MkPair
+    (EVar ("lit$" ^ showInt st.n))
+    { ren = st.ren
+    , vars = Cons ("lit$" ^ showInt st.n) st.vars
+    , holes = Cons lit st.holes
+    , n = st.n + 1
+    }
+
+-- (a binder named `a`, afresh)
+bindOne : Pair (List String) ShapeSt -> String -> Pair (List String) ShapeSt
+bindOne (MkPair xs st) x =
+  MkPair
+    (Cons ("a$" ^ showInt st.n) xs)
+    { ren = M.insert compareString x ("a$" ^ showInt st.n) st.ren
+    , vars = st.vars
+    , holes = st.holes
+    , n = st.n + 1
+    }
+
+bindAll : List String -> ShapeSt -> Pair (List String) ShapeSt
+bindAll xs st = case List.foldl bindOne (MkPair Nil st) xs of
+  MkPair ys st2 -> MkPair (List.reverse ys) st2
+
+renamed : ShapeSt -> String -> String
+renamed st x = fromMaybe x (M.lookup compareString x st.ren)
+
+withFst : (I.Expr -> I.Expr) -> Pair I.Expr ShapeSt -> Pair I.Expr ShapeSt
+withFst f (MkPair e st) = MkPair (f e) st
+
+manyTo : (List I.Expr -> I.Expr)
+       -> Pair (List I.Expr) ShapeSt
+       -> Pair I.Expr ShapeSt
+manyTo f (MkPair es st) = MkPair (f es) st
+
+consShaped : I.Expr -> Pair (List I.Expr) ShapeSt -> Pair (List I.Expr) ShapeSt
+consShaped e (MkPair es st) = MkPair (Cons e es) st
+
+-- (`e` shaped, then the rest after it)
+manyThen : (ShapeSt -> Pair (List I.Expr) ShapeSt)
+         -> Pair I.Expr ShapeSt
+         -> Pair (List I.Expr) ShapeSt
+manyThen more (MkPair e st) = consShaped e (more st)
+
+shapeMany : ShapeGo -> List I.Expr -> ShapeSt -> Pair (List I.Expr) ShapeSt
+shapeMany go Nil st = MkPair Nil st
+shapeMany go (Cons e rest) st = manyThen (shapeMany go rest) (go e st)
+
+-- (a binding's body, its binders renamed)
+boundThen : ShapeGo
+          -> I.Expr
+          -> (List String -> I.Expr -> I.Expr)
+          -> Pair (List String) ShapeSt
+          -> Pair I.Expr ShapeSt
+boundThen go b f (MkPair ys st) = withFst (f ys) (go b st)
+
+-- (an application's head, then its arguments)
+appThen : ShapeGo -> List I.Expr -> Pair I.Expr ShapeSt -> Pair I.Expr ShapeSt
+appThen go as (MkPair f st) = manyTo (\es -> EApp f es) (shapeMany go as st)
+
+-- (the name a binder was given)
+oneName : String -> List String -> String
+oneName x (Cons y _) = y
+oneName x Nil = x
+
+-- (a binding's value, then its body)
+letThen : ShapeGo
+        -> String
+        -> I.Expr
+        -> Pair I.Expr ShapeSt
+        -> Pair I.Expr ShapeSt
+letThen go x b (MkPair a st) =
+  boundThen go b (\ys b2 -> ELet (oneName x ys) a b2) (bindAll [x] st)
+
+labelsTo : List (Pair String I.Expr) -> List I.Expr -> List (Pair String I.Expr)
+labelsTo (Cons (MkPair l _) fs) (Cons e es) = Cons (MkPair l e) (labelsTo fs es)
+labelsTo _ _ = Nil
+
+consArm : I.Arm -> Pair (List I.Arm) ShapeSt -> Pair (List I.Arm) ShapeSt
+consArm a (MkPair as st) = MkPair (Cons a as) st
+
+-- (an arm, its binders renamed, then the arms after it)
+armThen : (ShapeSt -> Pair (List I.Arm) ShapeSt)
+        -> String
+        -> Pair (List String) (Pair I.Expr ShapeSt)
+        -> Pair (List I.Arm) ShapeSt
+armThen more t (MkPair vs (MkPair b st)) = consArm (MkArm t vs b) (more st)
+
+armBound : ShapeGo
+         -> I.Expr
+         -> Pair (List String) ShapeSt
+         -> Pair (List String) (Pair I.Expr ShapeSt)
+armBound go b (MkPair vs st) = MkPair vs (go b st)
+
+shapeArms : ShapeGo -> List I.Arm -> ShapeSt -> Pair (List I.Arm) ShapeSt
+shapeArms go Nil st = MkPair Nil st
+shapeArms go (Cons (MkArm t vs b) rest) st =
+  armThen (shapeArms go rest) t (armBound go b (bindAll vs st))
+
+matchThen : ShapeGo -> List I.Arm -> Pair I.Expr ShapeSt -> Pair I.Expr ShapeSt
+matchThen go arms (MkPair sc st) = case shapeArms go arms st of
+  MkPair arms2 st2 -> MkPair (EMatch sc arms2) st2
+
+shapeGo : I.Expr -> ShapeSt -> Pair I.Expr ShapeSt
+shapeGo (EVar x) st = MkPair (EVar (renamed st x)) st
+shapeGo (EInt i) st = holeOf (EInt i) st
+shapeGo (EFloat x) st = holeOf (EFloat x) st
+shapeGo (EStr t) st = holeOf (EStr t) st
+shapeGo (ELam xs b) st =
+  boundThen shapeGo b (\ys b2 -> ELam ys b2) (bindAll xs st)
+shapeGo (EApp f as) st = appThen shapeGo as (shapeGo f st)
+shapeGo (ELet x a b) st = letThen shapeGo x b (shapeGo a st)
+shapeGo (ERecord fs) st =
+  manyTo
+    (\es -> ERecord (labelsTo fs es))
+    (shapeMany shapeGo (List.map snd fs) st)
+shapeGo (EProj e l sh) st = withFst (\e2 -> EProj e2 l sh) (shapeGo e st)
+shapeGo (ETag t as) st = manyTo (\es -> ETag t es) (shapeMany shapeGo as st)
+shapeGo (EMatch sc arms) st = matchThen shapeGo arms (shapeGo sc st)
+shapeGo (EPrimCall p as) st =
+  manyTo (\es -> EPrimCall p es) (shapeMany shapeGo as st)
+shapeGo (ECall g as) st = manyTo (\es -> ECall g es) (shapeMany shapeGo as st)
+shapeGo e st = MkPair e st
+
+shapedOf : Pair I.Expr ShapeSt -> Shaped
+shapedOf (MkPair e st) =
+  { e = e
+  , vars = List.reverse st.vars
+  , holes = List.reverse st.holes
+  , n = st.n
+  }
+
+-- | a known argument shaped, the names it is given drawn from `n` on
+shapeOf : Int -> I.Expr -> Shaped
+shapeOf n e =
+  shapedOf (shapeGo e { ren = M.empty, vars = Nil, holes = Nil, n = n })
+
+-- Calls of itself
+--------------------------------------------------------------------------------
+
+type Use = Maybe (List I.Expr)
+
+-- (an application's head: a call of `g`, given `as`)
+callUse : String -> I.Expr -> List I.Expr -> List Use
+callUse g (EGlobal h) as = if strEq h g then Cons (Just as) Nil else Nil
+callUse g _ as = Nil
+
+-- (... and the uses in it, unless it is a global, called)
+headUses : (I.Expr -> List Use) -> I.Expr -> List Use
+headUses go (EGlobal _) = Nil
+headUses go f = go f
+
+-- | each use of the global `g`: the arguments of a call of it, or
+-- | `Nothing` where it is not called (a value, handed on)
+usesOf : String -> I.Expr -> List Use
+usesOf g (EGlobal h) = if strEq h g then Cons Nothing Nil else Nil
+usesOf g (EApp f as) =
+  appendS
+    (callUse g f as)
+    (appendS (headUses (usesOf g) f) (List.concatMap (usesOf g) as))
+usesOf g (ELam _ b) = usesOf g b
+usesOf g (ELet _ a b) = appendS (usesOf g a) (usesOf g b)
+usesOf g (ERecord fs) = List.concatMap (usesOf g) (List.map snd fs)
+usesOf g (EProj e _ _) = usesOf g e
+usesOf g (ETag _ as) = List.concatMap (usesOf g) as
+usesOf g (EMatch s arms) =
+  appendS (usesOf g s) (List.concatMap (usesOf g) (List.map I.armBody arms))
+usesOf g (EPrimCall _ as) = List.concatMap (usesOf g) as
+usesOf g (ECall h as) =
+  appendS (callUse g (EGlobal h) as) (List.concatMap (usesOf g) as)
+usesOf g _ = Nil
+
+nthS : {a : Type} -> Int -> List a -> Maybe a
+nthS i Nil = Nothing
+nthS i (Cons x xs) = if i == 0 then Just x else nthS (i - 1) xs
+
+isVarOf : String -> Maybe I.Expr -> Bool
+isVarOf x (Just (EVar y)) = strEq x y
+isVarOf x _ = False
+
+handsOn : String -> Int -> Use -> Bool
+handsOn x i (Just as) = isVarOf x (nthS i as)
+handsOn x i Nothing = False
+
+staticGo : List Use -> List String -> Int -> List Bool
+staticGo uses Nil i = Nil
+staticGo uses (Cons x xs) i =
+  Cons (allS (handsOn x i) uses) (staticGo uses xs (i + 1))
+
+-- | for each parameter of `g` (`\xs -> b`), whether every call of itself
+-- | hands it on as it is: a copy for a known argument there is a copy
+-- | for every round
+statics : String -> List String -> I.Expr -> List Bool
+statics g xs b = staticGo (usesOf g b) xs 0
+
+-- | the arguments but those at the positions marked
+dropAt : List Bool -> List I.Expr -> List I.Expr
+dropAt Nil as = as
+dropAt (Cons d ds) Nil = Nil
+dropAt (Cons d ds) (Cons a as) =
+  if d then dropAt ds as else Cons a (dropAt ds as)
+
+-- (an application's head, `g` made `h`; any other, gone through)
+selfHead : (I.Expr -> I.Expr) -> String -> String -> I.Expr -> I.Expr
+selfHead go g h (EGlobal k) = EGlobal (if strEq k g then h else k)
+selfHead go g h f = go f
+
+-- (... and its arguments, the marked ones left out of a call of `g`,
+-- `pre` before the others)
+selfArgs : String
+         -> List I.Expr
+         -> List Bool
+         -> I.Expr
+         -> List I.Expr
+         -> List I.Expr
+selfArgs g pre ds (EGlobal k) as =
+  if strEq k g then appendS pre (dropAt ds as) else as
+selfArgs g pre ds f as = as
+
+selfField : (I.Expr -> I.Expr) -> Pair String I.Expr -> Pair String I.Expr
+selfField go (MkPair l v) = MkPair l (go v)
+
+selfArm : (I.Expr -> I.Expr) -> I.Arm -> I.Arm
+selfArm go (MkArm t vs b) = MkArm t vs (go b)
+
+-- | the calls of `g` as calls of `h`, the marked arguments left out
+-- | and `pre` given first (the literals of a copy's known arguments)
+selfTo : String -> String -> List I.Expr -> List Bool -> I.Expr -> I.Expr
+selfTo g h pre ds (EApp f as) =
+  EApp
+    (selfHead (selfTo g h pre ds) g h f)
+    (List.map (selfTo g h pre ds) (selfArgs g pre ds f as))
+selfTo g h pre ds (ELam xs b) = ELam xs (selfTo g h pre ds b)
+selfTo g h pre ds (ELet x a b) =
+  ELet x (selfTo g h pre ds a) (selfTo g h pre ds b)
+selfTo g h pre ds (ERecord fs) =
+  ERecord (List.map (selfField (selfTo g h pre ds)) fs)
+selfTo g h pre ds (EProj e l sh) = EProj (selfTo g h pre ds e) l sh
+selfTo g h pre ds (ETag t as) = ETag t (List.map (selfTo g h pre ds) as)
+selfTo g h pre ds (EMatch s arms) =
+  EMatch (selfTo g h pre ds s) (List.map (selfArm (selfTo g h pre ds)) arms)
+selfTo g h pre ds (EPrimCall p as) =
+  EPrimCall p (List.map (selfTo g h pre ds) as)
+selfTo g h pre ds (ECall k as) = ECall k (List.map (selfTo g h pre ds) as)
+selfTo g h pre ds e = e
+
+-- >>> statics "f" ["a", "n"] (EApp (EGlobal "f") [EVar "a", EPrimCall "intSub" [EVar "n", EInt 1]])
+-- [True, False]
+
+-- >>> strEq (key (ELam ["x"] (EVar "x"))) (key (ELam ["y"] (EVar "y")))
+-- True
+
+-- >>> closedIn Nil (ELam ["x"] (EVar "y"))
+-- False
+
+-- >>> selfTo "f" "f$s0" Nil [True, False] (EApp (EGlobal "f") [EVar "a", EApp (EGlobal "f") [EVar "a", EVar "n"]])
+-- EApp (EGlobal "f$s0") [EApp (EGlobal "f$s0") [EVar "n"]]
+
+-- >>> (shapeOf 0 (ELam ["x"] (EPrimCall "intAdd" [EVar "x", EInt 1]))).e
+-- ELam (Cons "a$0" Nil) (EPrimCall "intAdd" (Cons (EVar "a$0") (Cons (EVar "lit$1") Nil)))
+
+-- >>> strEq (key (shapeOf 0 (ELam ["x"] (EInt 1))).e) (key (shapeOf 7 (ELam ["y"] (EInt 2))).e)
+-- True

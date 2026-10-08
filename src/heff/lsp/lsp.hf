@@ -1,0 +1,1348 @@
+-- A language server (the Language Server Protocol, over stdio) for `.hf`
+-- files: diagnostics, hover, go to definition, completion, formatting,
+-- an outline; and, over the whole project, references and renaming, and
+-- the symbols of every file.
+--
+-- A document is elaborated with what it imports, from its text in the
+-- editor; an import open in the editor is read from there too, else from
+-- disk.  The project -- every file under its root, with what each
+-- imports -- is elaborated when it is asked about, and kept until a
+-- document changes.  The server pulls (src/heff/lsp/rpc.hf): it awaits a
+-- message, or the time a document's check waits for, and its state goes
+-- along the loop.
+
+import co
+import heff.syntax.diagnostic
+import heff.build.driver as Dr
+import heff.syntax.fixity as F
+import heff.syntax.format as Fm
+import heff.syntax.import as Im
+import heff.util.json
+import heff.build.load as L
+import heff.elab.params as Pm
+import heff.build.query as Q
+import heff.lsp.render as Dg
+import heff.lsp.rpc as R
+import heff.build.session as Se
+import map as M
+import std.filesystem
+
+-- State
+--------------------------------------------------------------------------------
+
+type Doc = { uri : String, text : String }
+
+-- | a document's last elaboration, of what text
+type Elaborated = { text : String, program : List Dr.Checked }
+
+type Project = { root : String, program : List Dr.Checked }
+
+-- | the documents open, by path; the last elaboration of each; when a
+-- | document changed in the editor is to be checked (the typing paused);
+-- | the project last elaborated, by its root (forgotten when a document
+-- | changes); whether the client tells of files changed on disk when
+-- | asked to (`watch`); the standard library
+type St =
+  { docs : M.Map String Doc
+  , checked : M.Map String Elaborated
+  , due : M.Map String Int
+  , project : Maybe Project
+  , watch : Bool
+  , shutdown : Bool
+  , lib : L.Host
+  }
+
+mkSt : M.Map String Doc
+     -> M.Map String Elaborated
+     -> M.Map String Int
+     -> Maybe Project
+     -> Bool
+     -> Bool
+     -> L.Host
+     -> St
+mkSt docs checked due project watch shutdown lib =
+  { docs = docs
+  , checked = checked
+  , due = due
+  , project = project
+  , watch = watch
+  , shutdown = shutdown
+  , lib = lib
+  }
+
+withDocs : M.Map String Doc -> St -> St
+withDocs d s = mkSt d s.checked s.due s.project s.watch s.shutdown s.lib
+
+withChecked : M.Map String Elaborated -> St -> St
+withChecked c s = mkSt s.docs c s.due s.project s.watch s.shutdown s.lib
+
+withDue : M.Map String Int -> St -> St
+withDue t s = mkSt s.docs s.checked t s.project s.watch s.shutdown s.lib
+
+withProject : Maybe Project -> St -> St
+withProject p s = mkSt s.docs s.checked s.due p s.watch s.shutdown s.lib
+
+withWatch : Bool -> St -> St
+withWatch w s = mkSt s.docs s.checked s.due s.project w s.shutdown s.lib
+
+mkDoc : String -> String -> Doc
+mkDoc uri text = { uri = uri, text = text }
+
+mkElaborated : String -> List Dr.Checked -> Elaborated
+mkElaborated text program = { text = text, program = program }
+
+mkProject : String -> List Dr.Checked -> Project
+mkProject root program = { root = root, program = program }
+
+shutDown : St -> St
+shutDown s = mkSt s.docs s.checked s.due s.project s.watch True s.lib
+
+-- JSON
+--------------------------------------------------------------------------------
+
+jtrue : Json
+jtrue = JBool True
+
+jfalse : Json
+jfalse = JBool False
+
+message : List (Pair String Json) -> Json
+message fs = obj (Cons (kv "jsonrpc" (jstr "2.0")) fs)
+
+-- Positions
+--------------------------------------------------------------------------------
+
+lineEnd : String -> Int -> Int
+lineEnd src i = fromMaybe (strLength src) (indexFrom "\n" src i)
+
+-- | an LSP position (a line, and UTF-16 code units into it) as an
+-- | offset: a heff string is JavaScript's, indexed by code units too
+offsetGo : String -> Int -> Int -> Int -> Int -> Int
+offsetGo src line ch i l =
+  if l >= line then min (i + max 0 ch) (lineEnd src i)
+  else case indexFrom "\n" src i of
+    Just e -> offsetGo src line ch (e + 1) (l + 1)
+    Nothing -> strLength src
+
+offsetOf : String -> Int -> Int -> Int
+offsetOf src line ch = offsetGo src line ch 0 0
+
+position : String -> Int -> Json
+position src i =
+  obj
+    [ kv "line" (num (Dg.lineCol src (max 0 (min (strLength src) i))).line)
+    , kv "character" (num (Dg.lineCol src (max 0 (min (strLength src) i))).col)
+    ]
+
+range : String -> Pm.Span -> Json
+range src sp =
+  obj
+    [ kv "start" (position src sp.start)
+    , kv "end" (position src (max sp.start sp.end))
+    ]
+
+-- | the offset a `textDocument/...` request is at
+offsetIn : String -> Json -> Int
+offsetIn src params =
+  offsetOf
+    src
+    (fromMaybe 0 (int ["position", "line"] params))
+    (fromMaybe 0 (int ["position", "character"] params))
+
+wholeSpan : String -> Pm.Span
+wholeSpan text = Q.mkSpan 0 (strLength text)
+
+-- The world
+--------------------------------------------------------------------------------
+
+reply : {e : HFunctor} -> {{wire : R.rpc <: e}} -> Json -> Json -> Co e Unit
+reply id result = R.send (message [kv "id" id, kv "result" result])
+
+replyError : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> Json
+           -> Int
+           -> String
+           -> Co e Unit
+replyError id code msg =
+  R.send
+    (message
+       [ kv "id" id
+       , kv "error" (obj [kv "code" (num code), kv "message" (jstr msg)])
+       ])
+
+notify : {e : HFunctor} -> {{wire : R.rpc <: e}} -> String -> Json -> Co e Unit
+notify method params =
+  R.send (message [kv "method" (jstr method), kv "params" params])
+
+publish : {e : HFunctor}
+        -> {{wire : R.rpc <: e}}
+        -> String
+        -> List Json
+        -> Co e Unit
+publish uri ds =
+  notify
+    "textDocument/publishDiagnostics"
+    (obj [kv "uri" (jstr uri), kv "diagnostics" (JArray ds)])
+
+-- Diagnostics
+--------------------------------------------------------------------------------
+
+severityNum : Severity -> Int
+severityNum SError = 1
+severityNum SWarning = 2
+severityNum SDebug = 4
+
+severityLetter : Severity -> String
+severityLetter SError = "E"
+severityLetter SWarning = "W"
+severityLetter SDebug = "D"
+
+-- | the message and note of a diagnostic, without the source snippet (an
+-- | editor shows the span itself)
+diagMessage : Diag -> String
+diagMessage d = case d.note of
+  Just n -> d.msg ^ "\n" ^ n
+  Nothing -> d.msg
+
+diagCode : Diag -> String
+diagCode d =
+  severityLetter d.severity
+  ^ strSlice
+    ("0000" ^ showInt d.code)
+    (strLength ("0000" ^ showInt d.code) - 4)
+    (strLength ("0000" ^ showInt d.code))
+
+diagnostic : String -> Diag -> Json
+diagnostic src d =
+  obj
+    (List.append
+       [ kv "range" (range src d.span)
+       , kv "severity" (num (severityNum d.severity))
+       , kv "source" (jstr "heff")
+       , kv "message" (jstr (diagMessage d))
+       ]
+       (if d.code == 0 then Nil else [kv "code" (jstr (diagCode d))]))
+
+zeroSpan : Pm.Span
+zeroSpan = Q.mkSpan 0 0
+
+mkDiag : Severity -> Pm.Span -> String -> Diag
+mkDiag sev sp msg =
+  { code = 0, severity = sev, msg = msg, span = sp, note = Nothing }
+
+importSpan : List Im.Import -> String -> Pm.Span
+importSpan imports m = case List.find
+    (\(i : Im.Import) -> strEq i.name m)
+    imports of
+  Just i -> i.span
+  Nothing -> zeroSpan
+
+-- (what did not load, at the `import` line that names it)
+loadError : List Im.Import -> String -> Diag
+loadError imports e =
+  mkDiag
+    SError
+    (case List.find
+       (\(i : Im.Import) -> contains (" " ^ i.name ^ " ") e)
+       imports of
+     Just i -> i.span
+     Nothing -> zeroSpan)
+    e
+
+-- (a module imported that does not elaborate, at its `import` line)
+brokenImport : List Im.Import -> Dr.Checked -> Maybe Diag
+brokenImport imports c =
+  if not (List.null (Dr.errorsIn c))
+  && List.any (\(i : Im.Import) -> strEq i.name c.module) imports
+    then Just
+        (mkDiag
+           SWarning
+           (importSpan imports c.module)
+           ("module "
+            ^ c.module
+            ^ " ("
+            ^ c.path
+            ^ ") does not elaborate: "
+            ^ showInt (List.length (Dr.errorsIn c))
+            ^ " error"
+            ^ (if List.length (Dr.errorsIn c) == 1 then "" else "s")))
+  else Nothing
+
+dropLast : {a : Type} -> List a -> List a
+dropLast xs = List.reverse (List.drop 1 (List.reverse xs))
+
+catMaybesL : {a : Type} -> List (Maybe a) -> List a
+catMaybesL Nil = Nil
+catMaybesL (Cons (Just x) rest) = Cons x (catMaybesL rest)
+catMaybesL (Cons Nothing rest) = catMaybesL rest
+
+-- | a document's own diagnostics; what did not load; the modules it
+-- | imports that do not elaborate, at their `import` lines
+diagsOf : String -> List Dr.Checked -> List String -> List Diag
+diagsOf src program errors =
+  List.append
+    (case List.last program of
+     Just c -> c.diags
+     Nothing -> Nil)
+    (List.append
+       (List.map (\e -> loadError (Im.readImports src).imports e) errors)
+       (catMaybesL
+          (List.map
+             (\c -> brokenImport (Im.readImports src).imports c)
+             (dropLast program))))
+
+-- | a document's text as the editor has it, else the disk's
+readOpen : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> St
+         -> String
+         -> Co e (Maybe String)
+readOpen st p = case M.lookup compareString p st.docs of
+  Just d -> pure (Just d.text)
+  Nothing -> readFile p
+
+keptOf : List Dr.Checked -> List Dr.Checked
+keptOf program = case List.last program of
+  Just c -> List.append (List.map Dr.lean (dropLast program)) [Dr.traceless c]
+  Nothing -> Nil
+
+-- | elaborate a document open, and publish what is wrong with it
+check : {e : HFunctor}
+      -> {{disk : fs <: e}}
+      -> {{wire : R.rpc <: e}}
+      -> St
+      -> String
+      -> Co e St
+check st f = case M.lookup compareString f st.docs of
+  Nothing -> pure st
+  Just d -> do
+    l <- L.loadProgramWith (\p -> readOpen st p) st.lib f
+    full <- Se.cachedProgram l
+    -- (what is kept of it: the document's names with their types, for
+    -- hover; of what it imports, what a query over it needs)
+    program <- pure (keptOf full)
+    publish
+        d.uri
+        (List.map (\x -> diagnostic d.text x) (diagsOf d.text program l.errors))
+    pure
+        (withChecked
+           (M.insert compareString f (mkElaborated d.text program) st.checked)
+           st)
+
+checkAll : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> List String
+         -> Co e St
+checkAll st Nil = pure st
+checkAll st (Cons f rest) = do
+  st2 <- check st f
+  checkAll st2 rest
+
+-- (the documents whose last elaboration had `f` in it)
+dependentsOf : St -> String -> List String
+dependentsOf st f =
+  List.map
+    (\(p : Pair String Elaborated) -> fst p)
+    (List.filter
+       (\(p : Pair String Elaborated) ->
+          not (strEq (fst p) f)
+          && List.any (\(c : Dr.Checked) -> strEq c.path f) (snd p).program)
+       (M.toList st.checked))
+
+-- | a document, and those open that import it (as last elaborated)
+checkNow : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> String
+         -> Co e St
+checkNow st f = do
+  st2 <- check (withDue (M.delete compareString f st.due) st) f
+  checkAll st2 (dependentsOf st f)
+
+-- The project
+--------------------------------------------------------------------------------
+
+nubPaths : List String -> List String
+nubPaths Nil = Nil
+nubPaths (Cons x xs) =
+  Cons x (nubPaths (List.filter (\y -> not (strEq y x)) xs))
+
+nubSources : List Dr.Source -> List Dr.Source
+nubSources Nil = Nil
+nubSources (Cons s ss) =
+  Cons
+    s
+    (nubSources
+       (List.filter (\(t : Dr.Source) -> not (strEq t.path s.path)) ss))
+
+loadAll : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> (String -> Co e (Maybe String))
+        -> L.Host
+        -> List String
+        -> Co e (List Dr.Source)
+loadAll read lib Nil = pure Nil
+loadAll read lib (Cons f rest) = do
+  l <- L.loadProgramWith read lib f
+  more <- loadAll read lib rest
+  pure (List.append l.sources more)
+
+-- | the files, with what each imports, elaborated as one program
+elabFiles : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> (String -> Co e (Maybe String))
+          -> L.Host
+          -> List String
+          -> Co e (List Dr.Checked)
+elabFiles read lib files = do
+  sources <- loadAll read lib (nubPaths files)
+  pure (Dr.checkProgramLean (nubSources sources))
+
+-- | every file of a project (and `f`, if it is not one), with what each
+-- | imports, elaborated as one program
+elabProject : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : R.rpc <: e}}
+            -> (String -> Co e (Maybe String))
+            -> L.Host
+            -> String
+            -> String
+            -> Co e (List Dr.Checked)
+elabProject read lib root f = do
+  files <- R.projectFiles root
+  elabFiles read lib (List.append files [f])
+
+type WithProgram = { st : St, program : List Dr.Checked }
+
+mkWithProgram : St -> List Dr.Checked -> WithProgram
+mkWithProgram st program = { st = st, program = program }
+
+projectAnew : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> String
+            -> String
+            -> Co e WithProgram
+projectAnew st root f = do
+  program <- elabProject (\p -> readOpen st p) st.lib root f
+  pure (mkWithProgram (withProject (Just (mkProject root program)) st) program)
+
+-- | the project a document is in, every file of it elaborated, an open
+-- | one as its text is in the editor
+project : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> {{wire : R.rpc <: e}}
+        -> St
+        -> String
+        -> Co e WithProgram
+project st f = do
+  ps <- L.pathsFor st.lib f
+  case st.project of
+    Just pr ->
+      if strEq pr.root ps.root then pure (mkWithProgram st pr.program)
+      else projectAnew st ps.root f
+    Nothing -> projectAnew st ps.root f
+
+-- Requests
+--------------------------------------------------------------------------------
+
+capabilities : Json
+capabilities =
+  obj
+    [ kv
+      "capabilities"
+      (obj
+         [ kv
+           "textDocumentSync"
+           (obj
+              [ kv "openClose" jtrue
+              , kv "change" (num 1)
+              , kv "save" (obj [kv "includeText" jfalse])
+              ])
+         , kv "hoverProvider" jtrue
+         , kv "definitionProvider" jtrue
+         , kv "documentFormattingProvider" jtrue
+         -- (after `M.`, the module's definitions)
+         , kv
+           "completionProvider"
+           (obj [kv "triggerCharacters" (JArray [jstr "."])])
+         , kv "referencesProvider" jtrue
+         , kv "renameProvider" (obj [kv "prepareProvider" jtrue])
+         , kv "documentSymbolProvider" jtrue
+         , kv "workspaceSymbolProvider" jtrue
+         ])
+    , kv "serverInfo" (obj [kv "name" (jstr "heff")])
+    ]
+
+docPath : {e : HFunctor} -> {{wire : R.rpc <: e}} -> Json -> Co e (Maybe String)
+docPath p = case str ["textDocument", "uri"] p of
+  Just u -> R.uriPath u
+  Nothing -> pure Nothing
+
+uriOf : {e : HFunctor} -> {{wire : R.rpc <: e}} -> St -> String -> Co e String
+uriOf st p = case M.lookup compareString p st.docs of
+  Just d -> pure d.uri
+  Nothing -> R.pathUri p
+
+-- | the document a request is about, elaborated as its text is now: its
+-- | text, and the program (the document last), or nothing
+type Asked = { st : St, text : String, program : List Dr.Checked }
+
+mkAsked : St -> String -> List Dr.Checked -> Asked
+mkAsked st text program = { st = st, text = text, program = program }
+
+asked : St -> String -> String -> Asked
+asked st f text = case M.lookup compareString f st.checked of
+  Just c ->
+    if strEq c.text text then mkAsked st text c.program else mkAsked st text Nil
+  Nothing -> mkAsked st text Nil
+
+withProgram : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> Json
+            -> Co e Asked
+withProgram st p = do
+  mf <- docPath p
+  case mf of
+    Nothing -> pure (mkAsked st "" Nil)
+    Just f -> case M.lookup compareString f st.docs of
+      Nothing -> pure (mkAsked st "" Nil)
+      Just d -> case M.lookup compareString f st.checked of
+        Just c ->
+          if strEq c.text d.text then pure (asked st f d.text)
+          else do
+            st2 <- check st f
+            pure (asked st2 f d.text)
+        Nothing -> do
+          st2 <- check st f
+          pure (asked st2 f d.text)
+
+hoverOf : Asked -> Json -> Json
+hoverOf a p = case List.last a.program of
+  Just c -> case Q.typeAt c (offsetIn a.text p) of
+    Just t ->
+      obj
+        [ kv
+          "contents"
+          (obj
+             [ kv "kind" (jstr "markdown")
+             , kv "value" (jstr ("```heff\n" ^ t ^ "\n```"))
+             ])
+        ]
+    Nothing -> JNull
+  Nothing -> JNull
+
+completionItem : Q.Completion -> Json
+completionItem i =
+  obj
+    [kv "label" (jstr i.label), kv "kind" (num 3), kv "detail" (jstr i.detail)]
+
+childJson : String -> Q.Child -> Json
+childJson src m =
+  obj
+    [ kv "name" (jstr m.name)
+    , kv "kind" (num m.kind)
+    , kv "range" (range src m.span)
+    , kv "selectionRange" (range src m.span)
+    ]
+
+docSymbol : String -> Q.DocSymbol -> Json
+docSymbol src y =
+  obj
+    [ kv "name" (jstr y.name)
+    , kv "kind" (num y.kind)
+    , kv
+      "range"
+      (range src (Q.mkSpan y.span.start (max y.span.end y.selection.end)))
+    , kv "selectionRange" (range src y.selection)
+    , kv "children" (JArray (List.map (\m -> childJson src m) y.children))
+    ]
+
+-- (ASCII letters to lower case: what a symbol query is matched by)
+lowerGo : String -> Int -> String -> String
+lowerGo s i acc =
+  if i >= strLength s then acc
+  else lowerGo
+      s
+      (i + 1)
+      (acc
+       ^ (if 65 <= charCode s i && charCode s i <= 90
+            then fromCharCode (charCode s i + 32)
+          else strSlice s i (i + 1)))
+
+lower : String -> String
+lower s = lowerGo s 0 ""
+
+-- | what the name at a request's position refers to, in the project of
+-- | its document: the name, and every occurrence of it
+type Pointed =
+  { path : String
+  , target : Q.Target
+  , name : String
+  , occurrences : List Q.Occurrence
+  }
+
+type Targeted = { st : St, off : Int, target : Maybe Pointed }
+
+mkPointed : String -> Q.Target -> String -> List Q.Occurrence -> Pointed
+mkPointed path target name occurrences =
+  { path = path, target = target, name = name, occurrences = occurrences }
+
+mkTargeted : St -> Int -> Maybe Pointed -> Targeted
+mkTargeted st off target = { st = st, off = off, target = target }
+
+pointedAt : List Dr.Checked -> String -> Q.Found -> Pointed
+pointedAt program f t =
+  mkPointed f t.target t.name (Q.occurrences program t.target t.name)
+
+targetIn : St -> String -> Doc -> Json -> List Dr.Checked -> Targeted
+targetIn st f d p program = case List.find
+    (\(c : Dr.Checked) -> strEq c.path f)
+    program of
+  Just c ->
+    if strEq c.source d.text
+      then case Q.targetAt
+          (List.append
+             (List.filter (\(c2 : Dr.Checked) -> not (strEq c2.path f)) program)
+             [c])
+          (offsetIn d.text p) of
+        Just t ->
+          mkTargeted st (offsetIn d.text p) (Just (pointedAt program f t))
+        Nothing -> mkTargeted st 0 Nothing
+    else mkTargeted st 0 Nothing
+  Nothing -> mkTargeted st 0 Nothing
+
+withTarget : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Json
+           -> Co e Targeted
+withTarget st p = do
+  mf <- docPath p
+  case mf of
+    Nothing -> pure (mkTargeted st 0 Nothing)
+    Just f -> case M.lookup compareString f st.docs of
+      Nothing -> pure (mkTargeted st 0 Nothing)
+      Just d -> do
+        wp <- project st f
+        pure (targetIn wp.st f d p wp.program)
+
+locationOf : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Q.Occurrence
+           -> Co e Json
+locationOf st o = do
+  u <- uriOf st o.path
+  pure (obj [kv "uri" (jstr u), kv "range" (range o.source o.span)])
+
+locations : {e : HFunctor}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> List Q.Occurrence
+          -> Co e (List Json)
+locations st Nil = pure Nil
+locations st (Cons o rest) = do
+  j <- locationOf st o
+  js <- locations st rest
+  pure (Cons j js)
+
+-- | occurrences, by file
+type ByFile = { path : String, occurrences : List Q.Occurrence }
+
+mkByFile : String -> List Q.Occurrence -> ByFile
+mkByFile path os = { path = path, occurrences = os }
+
+inFile : String -> List Q.Occurrence -> List Q.Occurrence
+inFile p os = List.filter (\(o : Q.Occurrence) -> strEq o.path p) os
+
+byFile : List Q.Occurrence -> List ByFile
+byFile os =
+  List.map
+    (\p -> mkByFile p (inFile p os))
+    (nubPaths (List.map (\(o : Q.Occurrence) -> o.path) os))
+
+-- (each file's text with every occurrence in it renamed)
+renamedText : String -> List Q.Occurrence -> String
+renamedText new os =
+  List.foldr
+    (\(o : Q.Occurrence) src ->
+       strSlice src 0 o.span.start
+       ^ new
+       ^ strSlice src o.span.end (strLength src))
+    (case List.head os of
+     Just o -> o.source
+     Nothing -> "")
+    os
+
+nubCheckedPaths : List Dr.Checked -> List Dr.Checked
+nubCheckedPaths Nil = Nil
+nubCheckedPaths (Cons c cs) =
+  Cons
+    c
+    (nubCheckedPaths
+       (List.filter (\(d : Dr.Checked) -> not (strEq d.path c.path)) cs))
+
+errorCount : List Dr.Checked -> Int
+errorCount program =
+  List.foldl
+    (\n (c : Dr.Checked) -> n + List.length (Dr.errorsIn c))
+    0
+    (nubCheckedPaths program)
+
+textOf : List (Pair String String) -> String -> Maybe String
+textOf texts p = case List.find
+    (\(q : Pair String String) -> strEq (fst q) p)
+    texts of
+  Just q -> Just (snd q)
+  Nothing -> Nothing
+
+-- (where the target is after the renaming: a local's binder moved by
+-- the occurrences renamed before it)
+-- (how far a local's binder moves: the occurrences renamed before it,
+-- each longer or shorter by the difference)
+shiftOf : Pointed -> String -> Pm.Span -> Int
+shiftOf t new b =
+  (strLength new - strLength t.name)
+  * List.length
+    (List.filter
+       (\(o : Q.Occurrence) -> strEq o.path t.path && o.span.start < b.start)
+       t.occurrences)
+
+renamedTarget : Pointed -> String -> Q.Target
+renamedTarget t new = case t.target.local of
+  Just b ->
+    Q.localT
+      t.target.key
+      (Q.mkSpan
+         (b.start + shiftOf t new b)
+         (b.start + shiftOf t new b + strLength new))
+  Nothing -> case t.target.member of
+    Just _ -> Q.memberT t.target.key new
+    Nothing ->
+      Q.globalT
+        (strSlice t.target.key 0 (strLength t.target.key - strLength t.name)
+         ^ new)
+
+renameVerdict : WithProgram
+              -> Pointed
+              -> String
+              -> Int
+              -> Int
+              -> List Dr.Checked
+              -> Pair St (Maybe String)
+renameVerdict before t new errorsBefore errorsAfter after =
+  (MkPair
+     before.st
+     (if errorsAfter > errorsBefore
+        then Just
+            ("renaming `"
+             ^ t.name
+             ^ "` to `"
+             ^ new
+             ^ "` would make "
+             ^ showInt (errorsAfter - errorsBefore)
+             ^ " more error(s)")
+      else if List.length (Q.occurrences after (renamedTarget t new) new)
+      /= List.length t.occurrences
+        then Just
+            ("`"
+             ^ new
+             ^ "` is already a name some of these occurrences would refer to")
+      else Nothing))
+
+-- | Why renaming would change what the program means, if it would: with
+-- | every occurrence renamed, the project is elaborated again, and the
+-- | new name must be written as often as the old one was, each time
+-- | referring to what was renamed -- not captured by a name already
+-- | there -- and no file may have more errors than it had.
+-- (the files of a program a renaming changes, and every file that
+-- imports one of them, directly or not: nothing else can have more
+-- errors, or another occurrence.  The program is in the order of its
+-- imports, so one pass finds them)
+affectedGo : List String -> List String -> List Dr.Checked -> List String
+affectedGo changed mods Nil = Nil
+affectedGo changed mods (Cons c rest) =
+  if List.elemBy strEq c.path changed
+  || List.any (\d -> List.elemBy strEq d mods) c.deps
+    then Cons c.path (affectedGo changed (Cons c.module mods) rest)
+  else affectedGo changed mods rest
+
+inPaths : List String -> List Dr.Checked -> List Dr.Checked
+inPaths paths program =
+  List.filter (\(c : Dr.Checked) -> List.elemBy strEq c.path paths) program
+
+renameChecked : {e : HFunctor}
+              -> {{disk : fs <: e}}
+              -> {{wire : R.rpc <: e}}
+              -> St
+              -> Pointed
+              -> String
+              -> Co e (Pair St (Maybe String))
+renameChecked st t new = do
+  before <- project st t.path
+  affected <-
+    pure
+      (affectedGo
+         (List.map (\(b : ByFile) -> b.path) (byFile t.occurrences))
+         Nil
+         before.program)
+  after <-
+    elabFiles
+      (\p -> case textOf
+         (List.map
+            (\(b : ByFile) -> MkPair b.path (renamedText new b.occurrences))
+            (byFile t.occurrences))
+         p of
+       Just txt -> pure (Just txt)
+       Nothing -> readOpen st p)
+      st.lib
+      affected
+  pure
+      (renameVerdict
+         before
+         t
+         new
+         (errorCount (inPaths affected before.program))
+         (errorCount (inPaths affected after))
+         after)
+
+editOf : String -> Q.Occurrence -> Json
+editOf new o = obj [kv "range" (range o.source o.span), kv "newText" (jstr new)]
+
+changesOf : {e : HFunctor}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> String
+          -> List ByFile
+          -> Co e (List (Pair String Json))
+changesOf st new Nil = pure Nil
+changesOf st new (Cons b rest) = do
+  u <- uriOf st b.path
+  more <- changesOf st new rest
+  pure
+      (Cons
+         (MkPair u (JArray (List.map (\o -> editOf new o) b.occurrences)))
+         more)
+
+-- (the documents' roots, each once)
+rootsOf : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> St
+        -> List String
+        -> Co e (List (Pair String String))
+rootsOf st Nil = pure Nil
+rootsOf st (Cons f rest) = do
+  ps <- L.pathsFor st.lib f
+  more <- rootsOf st rest
+  pure (Cons (MkPair ps.root f) more)
+
+nubRoots : List (Pair String String) -> List (Pair String String)
+nubRoots Nil = Nil
+nubRoots (Cons r rs) =
+  Cons
+    r
+    (nubRoots
+       (List.filter
+          (\(q : Pair String String) -> not (strEq (fst q) (fst r)))
+          rs))
+
+projects : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> List (Pair String String)
+         -> Co e WithProgram
+projects st Nil = pure (mkWithProgram st Nil)
+projects st (Cons (MkPair _ f) rest) = do
+  wp <- project st f
+  more <- projects wp.st rest
+  pure (mkWithProgram more.st (List.append wp.program more.program))
+
+symbolJson : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Dr.Checked
+           -> Q.DocSymbol
+           -> Co e Json
+symbolJson st c y = do
+  u <- uriOf st c.path
+  pure
+      (obj
+         [ kv "name" (jstr y.name)
+         , kv "kind" (num y.kind)
+         , kv "containerName" (jstr c.module)
+         , kv
+           "location"
+           (obj [kv "uri" (jstr u), kv "range" (range c.source y.selection)])
+         ])
+
+eachSymbol : {e : HFunctor}
+           -> {{wire : R.rpc <: e}}
+           -> St
+           -> Dr.Checked
+           -> List Q.DocSymbol
+           -> Co e (List Json)
+eachSymbol st c Nil = pure Nil
+eachSymbol st c (Cons y rest) = do
+  j <- symbolJson st c y
+  js <- eachSymbol st c rest
+  pure (Cons j js)
+
+symbolsJson : {e : HFunctor}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> String
+            -> List Dr.Checked
+            -> Co e (List Json)
+symbolsJson st query Nil = pure Nil
+symbolsJson st query (Cons c rest) = do
+  here <-
+    eachSymbol
+      st
+      c
+      (List.filter
+         (\(y : Q.DocSymbol) -> contains query (lower y.name))
+         (Q.symbols c))
+  more <- symbolsJson st query rest
+  pure (List.append here more)
+
+occurrenceAt : Pointed -> Int -> Maybe Q.Occurrence
+occurrenceAt t off =
+  List.find
+    (\(o : Q.Occurrence) ->
+       strEq o.path t.path && o.span.start <= off && off <= o.span.end)
+    t.occurrences
+
+prepared : {e : HFunctor}
+         -> {{wire : R.rpc <: e}}
+         -> Json
+         -> Targeted
+         -> Co e St
+prepared id tg = case tg.target of
+  Nothing -> do
+    reply id JNull
+    pure tg.st
+  Just t -> case Q.renameRefused t.target t.name t.name of
+    Just why -> do
+      replyError id (0 - 32803) why
+      pure tg.st
+    Nothing -> case occurrenceAt t tg.off of
+      Just o -> do
+        reply
+            id
+            (obj
+               [ kv "range" (range o.source o.span)
+               , kv "placeholder" (jstr t.name)
+               ])
+        pure tg.st
+      Nothing -> do
+        replyError id (0 - 32803) ("`" ^ t.name ^ "` is not written here")
+        pure tg.st
+
+renamed : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> {{wire : R.rpc <: e}}
+        -> Json
+        -> String
+        -> Targeted
+        -> Co e St
+renamed id new tg = case tg.target of
+  Nothing -> do
+    reply id JNull
+    pure tg.st
+  Just t -> case Q.renameRefused t.target t.name new of
+    Just why -> do
+      replyError id (0 - 32803) why
+      pure tg.st
+    Nothing -> do
+      r <- renameChecked tg.st t new
+      case snd r of
+        Just why -> do
+          replyError id (0 - 32803) why
+          pure (fst r)
+        Nothing -> do
+          cs <- changesOf (fst r) new (byFile t.occurrences)
+          reply id (obj [kv "changes" (JObject cs)])
+          pure (fst r)
+
+docAt : St -> Maybe String -> Maybe Doc
+docAt st (Just f) = M.lookup compareString f st.docs
+docAt st Nothing = Nothing
+
+formattedIn : {e : HFunctor}
+            -> {{wire : R.rpc <: e}}
+            -> St
+            -> Json
+            -> Doc
+            -> F.Fixities
+            -> Co e St
+formattedIn st id d fix = case Fm.formatIn fix d.text of
+  Left why -> do
+    notify
+        "window/showMessage"
+        (obj
+           [ kv "type" (num 2)
+           , kv "message" (jstr ("heff: not formatted: " ^ why))
+           ])
+    reply id (JArray Nil)
+    pure st
+  Right t ->
+    if strEq t d.text
+      then do
+        reply id (JArray Nil)
+        pure st
+    else do
+      reply
+          id
+          (JArray
+             [ obj
+               [ kv "range" (range d.text (wholeSpan d.text))
+               , kv "newText" (jstr t)
+               ]
+             ])
+      pure st
+
+-- | a document laid out anew, its operators cut as the fixities of what
+-- | it imports say
+formatted : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> Json
+          -> Json
+          -> Co e St
+formatted st id p = do
+  mf <- docPath p
+  case mf of
+    Nothing -> do
+      reply id (JArray Nil)
+      pure st
+    Just f -> case docAt st (Just f) of
+      Nothing -> do
+        reply id (JArray Nil)
+        pure st
+      Just d -> do
+        l <- L.loadProgramWith (\q -> readOpen st q) st.lib f
+        formattedIn st id d (Dr.fixitiesIn l.sources)
+
+request : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> {{wire : R.rpc <: e}}
+        -> St
+        -> String
+        -> Json
+        -> Json
+        -> Co e St
+request st m id p =
+  if strEq m "initialize"
+    then do
+      reply id capabilities
+      pure
+          (withWatch
+             (fromMaybe
+                False
+                (bool
+                   [ "capabilities"
+                   , "workspace"
+                   , "didChangeWatchedFiles"
+                   , "dynamicRegistration"
+                   ]
+                   p))
+             st)
+  else if strEq m "shutdown"
+    then do
+      reply id JNull
+      pure (shutDown st)
+  else if strEq m "textDocument/hover"
+    then do
+      a <- withProgram st p
+      reply id (hoverOf a p)
+      pure a.st
+  else if strEq m "textDocument/definition"
+    then do
+      a <- withProgram st p
+      case Q.definitionAt a.program (offsetIn a.text p) of
+        Just d -> do
+          u <- uriOf a.st d.path
+          reply id (obj [kv "uri" (jstr u), kv "range" (range d.source d.span)])
+        Nothing -> reply id JNull
+      pure a.st
+  else if strEq m "textDocument/completion"
+    then do
+      a <- withProgram st p
+      reply
+          id
+          (JArray (case List.last a.program of
+           Just c ->
+             List.map completionItem (Q.completionsAt c (offsetIn a.text p))
+           Nothing -> Nil))
+      pure a.st
+  else if strEq m "textDocument/documentSymbol"
+    then do
+      a <- withProgram st p
+      reply
+          id
+          (JArray (case List.last a.program of
+           Just c -> List.map (\y -> docSymbol a.text y) (Q.symbols c)
+           Nothing -> Nil))
+      pure a.st
+  -- (in the projects of the documents open)
+  else if strEq m "workspace/symbol"
+    then do
+      roots <- rootsOf st (M.keys st.docs)
+      wp <- projects st (nubRoots roots)
+      js <-
+        symbolsJson
+          wp.st
+          (lower (fromMaybe "" (str ["query"] p)))
+          (nubCheckedPaths wp.program)
+      reply id (JArray js)
+      pure wp.st
+  else if strEq m "textDocument/references"
+    then do
+      tg <- withTarget st p
+      case tg.target of
+        Just t -> do
+          js <-
+            locations
+              tg.st
+              (List.filter
+                 (\(o : Q.Occurrence) ->
+                    fromMaybe True (bool ["context", "includeDeclaration"] p)
+                    || not o.defines)
+                 t.occurrences)
+          reply id (JArray js)
+        Nothing -> reply id JNull
+      pure tg.st
+  else if strEq m "textDocument/prepareRename"
+    then do
+      tg <- withTarget st p
+      prepared id tg
+  else if strEq m "textDocument/rename"
+    then do
+      tg <- withTarget st p
+      renamed id (fromMaybe "" (str ["newName"] p)) tg
+  else if strEq m "textDocument/formatting" then formatted st id p
+  else do
+    replyError id (0 - 32601) ("no method " ^ m)
+    pure st
+
+-- Notifications
+--------------------------------------------------------------------------------
+
+registration : Json
+registration =
+  message
+    [ kv "id" (jstr "heff-watch")
+    , kv "method" (jstr "client/registerCapability")
+    , kv
+      "params"
+      (obj
+         [ kv
+           "registrations"
+           (JArray
+              [ obj
+                [ kv "id" (jstr "heff-watch")
+                , kv "method" (jstr "workspace/didChangeWatchedFiles")
+                , kv
+                  "registerOptions"
+                  (obj
+                     [ kv
+                       "watchers"
+                       (JArray [obj [kv "globPattern" (jstr "**/*.hf")]])
+                     ])
+                ]
+              ])
+         ])
+    ]
+
+-- (full sync: the last change is the whole text)
+lastChange : Json -> Maybe String
+lastChange p = case arr ["contentChanges"] p of
+  Just cs -> case List.last cs of
+    Just c -> str ["text"] c
+    Nothing -> Nothing
+  Nothing -> Nothing
+
+changed : St -> String -> String -> St
+changed st f text = case M.lookup compareString f st.docs of
+  Just d -> withDocs (M.insert compareString f (mkDoc d.uri text) st.docs) st
+  Nothing -> st
+
+closed : St -> String -> St
+closed st f =
+  withDue
+    (M.delete compareString f st.due)
+    (withChecked
+       (M.delete compareString f st.checked)
+       (withDocs (M.delete compareString f st.docs) st))
+
+notified : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> String
+         -> Json
+         -> Co e St
+notified st m p = do
+  mf <- docPath p
+  if strEq m "exit"
+      then do
+        R.quit (if st.shutdown then 0 else 1)
+    -- (the files of a project, changed on disk -- by `jj`, `git`,
+    -- another editor -- are told of: the client is asked to)
+    else if strEq m "initialized"
+      then if st.watch
+          then do
+            R.send registration
+            pure st
+        else pure st
+    -- (what the documents open import may be what changed)
+    else if strEq m "workspace/didChangeWatchedFiles"
+      then checkAll st (M.keys st.docs)
+    else case mf of
+      Nothing -> pure st
+      Just f ->
+        if strEq m "textDocument/didOpen"
+          then checkNow
+              (withDocs
+                 (M.insert
+                    compareString
+                    f
+                    (mkDoc
+                       (fromMaybe "" (str ["textDocument", "uri"] p))
+                       (fromMaybe "" (str ["textDocument", "text"] p)))
+                    st.docs)
+                 st)
+              f
+        else if strEq m "textDocument/didChange"
+          then case lastChange p of
+            Just text -> do
+              t <- R.now
+              -- (checked once the typing pauses)
+              pure
+                  (withDue
+                     (M.insert compareString f (t + 200) st.due)
+                     (changed st f text))
+            Nothing -> pure st
+        else if strEq m "textDocument/didSave" then checkNow st f
+        else if strEq m "textDocument/didClose"
+          then do
+            case M.lookup compareString f st.docs of
+              Just d -> publish d.uri Nil
+              Nothing -> pure MkUnit
+            pure (closed st f)
+        -- (`$/...`, and what we do not know)
+        else pure st
+
+notification : {e : HFunctor}
+             -> {{disk : fs <: e}}
+             -> {{wire : R.rpc <: e}}
+             -> St
+             -> String
+             -> Json
+             -> Co e St
+notification st m p =
+  -- (a document changed: the project is elaborated again when asked
+  -- about)
+  notified
+    (if startsWith "textDocument/" m
+     || strEq m "workspace/didChangeWatchedFiles"
+       then withProject Nothing st
+     else st)
+    m
+    p
+
+-- The loop
+--------------------------------------------------------------------------------
+
+handle : {e : HFunctor}
+       -> {{disk : fs <: e}}
+       -> {{wire : R.rpc <: e}}
+       -> St
+       -> Json
+       -> Co e St
+handle st msg = case str ["method"] msg of
+  Just m -> case field "id" msg of
+    Just id ->
+      if st.shutdown && not (strEq m "shutdown")
+        then do
+          replyError id (0 - 32600) "shut down"
+          pure st
+      else request st m id (fromMaybe JNull (field "params" msg))
+    Nothing -> notification st m (fromMaybe JNull (field "params" msg))
+  -- (a response: we ask nothing)
+  Nothing -> pure st
+
+-- (the documents whose typing has paused by `t`)
+dueBy : St -> Int -> List String
+dueBy st t =
+  List.map
+    (\(q : Pair String Int) -> fst q)
+    (List.filter (\(q : Pair String Int) -> snd q <= t) (M.toList st.due))
+
+-- (how long until the next document is due, if one is)
+nextDue : St -> Int -> Maybe Int
+nextDue st t = case M.values st.due of
+  Nil -> Nothing
+  Cons d ds -> Just (max 0 (List.foldl (\a b -> min a b) d ds - t))
+
+checkDue : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> {{wire : R.rpc <: e}}
+         -> St
+         -> List String
+         -> Co e St
+checkDue st Nil = pure st
+checkDue st (Cons f rest) = do
+  st2 <- checkNow st f
+  checkDue st2 rest
+
+-- | serve, from a state: a message answered, or the documents due checked,
+-- | until the client says `exit` or goes away
+serveFrom : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> {{wire : R.rpc <: e}}
+          -> St
+          -> Co e Unit
+serveFrom st = do
+  t <- R.now
+  ev <- R.await (nextDue st t)
+  case ev of
+    Message msg -> do
+      st2 <- handle st msg
+      serveFrom st2
+    Timeout -> do
+      t2 <- R.now
+      st2 <- checkDue st (dueBy st t2)
+      serveFrom st2
+    -- (the client went away without `exit`)
+    Closed -> R.quit 1
+
+-- | serve on stdin/stdout, on the host `h0` (the standard library, the
+-- | style of paths)
+serve : {e : HFunctor}
+      -> {{disk : fs <: e}}
+      -> {{wire : R.rpc <: e}}
+      -> L.Host
+      -> Co e Unit
+serve h0 = do
+  lib <- R.absPath h0.lib
+  serveFrom
+      (mkSt
+         M.empty
+         M.empty
+         M.empty
+         Nothing
+         False
+         False
+         { lib = lib, mod = h0.mod, cwd = h0.cwd, style = h0.style })
