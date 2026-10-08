@@ -118,6 +118,22 @@ build : Build
 build = { backend = C, run = "main", ships = [] }
 ```
 
+## Records
+
+A record type names its fields, and a record gives each, in the type's
+order.  A field may have a default, `x : A = d`: a record checked
+against the type may leave the field out, and is given `d`.  A default
+names definitions only, not the type's parameters nor its other fields,
+so that it means the same wherever a record leaves it out; a theory's
+fields may have defaults too.
+
+```haskell
+type Opts = { name : String, verbose : Bool = False, tags : List String = [] }
+
+quiet : Opts
+quiet = { name = "quiet" }   -- { name = "quiet", verbose = False, tags = [] }
+```
+
 ## Effects
 
 `lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program

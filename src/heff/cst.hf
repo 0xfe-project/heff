@@ -13,8 +13,8 @@
 --
 -- The sums are flat: a `case` alternative, a `do` statement, a brace
 -- field, a constructor's arguments and an operator's right side are
--- constructors of `E` (`EAlt`, `ESBind`, `EFSet`, `ECon`, `OpRhs`), as the
--- language defines types one after another.
+-- constructors of `E` (`EAlt`, `ESBind`, `EFSet`, `EFDefault`,
+-- `ECon`, `OpRhs`), as the language defines types one after another.
 
 import array as A
 import co
@@ -56,6 +56,8 @@ data E
   -- | `{{x : T}}`, an instance binder
   | InstB T T E T T
   | EFSet T T E
+  -- | `x : A = d`, a record type's field and its default
+  | EFDefault E T E
   | Sum T T (List E) (List T) T
   | ECon T (List E)
   | EField E T
@@ -77,7 +79,8 @@ data E
   -- | not there (a `do` block's `let p = e` has no body)
   | ELet T Pat (Maybe (Pair T E)) T E (Maybe (Pair T E))
 
-data TF = MkTF T T E
+-- | a theory's field, `x : A`, and its default, `= d`, if it has one
+data TF = MkTF T T E (Maybe (Pair T E))
 
 data DAlts = MkDAlts T (List E) (List T)
 
@@ -542,8 +545,23 @@ settingF g = do
   e <- g.expr
   pure (EFSet x eq e)
 
--- | `{ x : A, ... }` (a record type), `{ x = e, ... }` (a record), `{}`,
--- | `{x : A}` (an implicit binder), and `{{x : A}}` (an instance one)
+-- | what is in braces, and `= d` after it: a record type's field and its
+-- | default
+defaultedF : Gram -> P E
+defaultedF g = do
+  e <- g.expr
+  t <- peek
+  b <- atBoundary
+  if isKind t "sym" && isText t "=" && not b
+      then do
+        eq <- next
+        d <- g.expr
+        pure (EFDefault e eq d)
+    else pure e
+
+-- | `{ x : A, ... }` (a record type, its fields perhaps with defaults,
+-- | `x : A = d`), `{ x = e, ... }` (a record), `{}`, `{x : A}` (an
+-- | implicit binder), and `{{x : A}}` (an instance one)
 bracesF : Gram -> P E
 bracesF g = do
   o <- next
@@ -567,7 +585,7 @@ bracesF g = do
           c <- expectPunct "}"
           pure (mkBraces o fs c)
       else do
-        fs <- sepBy1 "," g.expr
+        fs <- sepBy1 "," (defaultedF g)
         c <- expectPunct "}"
         pure (mkBraces o fs c))
 
@@ -993,6 +1011,18 @@ typeDecl = do
   body <- gram.expr
   pure (DType kw name params eq body)
 
+-- (`= d`, a theory's field's default, if there is one)
+fieldDefault : P (Maybe (Pair T E))
+fieldDefault = do
+  t <- peek
+  b <- atBoundary
+  if isKind t "sym" && isText t "=" && not b
+      then do
+        eq <- next
+        d <- gram.expr
+        pure (Just (MkPair eq d))
+    else pure Nothing
+
 theoryField : P TF
 theoryField = do
   x <- next
@@ -1001,7 +1031,8 @@ theoryField = do
     else do
       cc <- expectAnn
       ty <- gram.expr
-      pure (MkTF x cc ty)
+      d <- fieldDefault
+      pure (MkTF x cc ty d)
 
 -- | `theory T a where` and its fields
 theoryDecl : P D
@@ -1238,6 +1269,7 @@ firstE (Tup o es commas c) = o
 firstE (Braces o fs commas c) = o
 firstE (InstB o o2 d c1 c) = o
 firstE (EFSet x eq e) = x
+firstE (EFDefault e eq d) = firstE e
 firstE (Sum kw o alts bars c) = kw
 firstE (ECon c args) = c
 firstE (EField e f) = firstE e
@@ -1265,6 +1297,7 @@ lastE (Tup o es commas c) = c
 lastE (Braces o fs commas c) = c
 lastE (InstB o o2 d c1 c) = c
 lastE (EFSet x eq e) = lastE e
+lastE (EFDefault e eq d) = lastE d
 lastE (Sum kw o alts bars c) = c
 lastE (ECon c args) =
   (case last args of
@@ -1323,7 +1356,8 @@ firstD (DTest kw x) = kw
 firstD (DWatch w e) = w
 
 tfLast : TF -> T
-tfLast (MkTF x cc ty) = lastE ty
+tfLast (MkTF x cc ty Nothing) = lastE ty
+tfLast (MkTF x cc ty (Just (MkPair eq d))) = lastE d
 
 dataLastPlain : T -> List E -> Maybe (Pair T E) -> T
 dataLastPlain name params (Just (MkPair cc u)) = lastE u
@@ -1387,6 +1421,7 @@ tsE (Braces o fs commas c) =
 tsE (InstB o o2 d c1 c) =
   Cons o (Cons o2 (concatList (tsE d) (Cons c1 (Cons c Nil))))
 tsE (EFSet x eq e) = Cons x (Cons eq (tsE e))
+tsE (EFDefault e eq d) = concatList (tsE e) (Cons eq (tsE d))
 tsE (Sum kw o alts bars c) =
   Cons kw (Cons o (concatList (interleaveT (map tsE alts) bars) (Cons c Nil)))
 tsE (ECon c args) = Cons c (concatMap tsE args)
@@ -1425,7 +1460,9 @@ tsE (ELet kw p ann eq e body) =
               Nothing -> Nil)))))
 
 tsTF : TF -> List T
-tsTF (MkTF x cc ty) = Cons x (Cons cc (tsE ty))
+tsTF (MkTF x cc ty Nothing) = Cons x (Cons cc (tsE ty))
+tsTF (MkTF x cc ty (Just (MkPair eq d))) =
+  Cons x (Cons cc (concatList (tsE ty) (Cons eq (tsE d))))
 
 tsUniverse : Maybe (Pair T E) -> List T
 tsUniverse Nothing = Nil

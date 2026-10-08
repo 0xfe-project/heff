@@ -354,6 +354,27 @@ formats("where: under its equation, its declarations under it, with their commen
   "",
 ].join("\n"));
 
+formats("a record type's defaults: `= d` after the field, a long one on the next line", [
+  "type Opts = {   name : String,   verbose:Bool=False , tags : List String = [] }",
+  "type Long = { aVeryLongFieldName : String = \"a long default value\", another : List String = [\"one\", \"two\"], third : Int }",
+  "theory Sig where",
+  "  T : Type   =   Int",
+  "  long : List String = [\"one\", \"two\", \"three\", \"four\", \"five\", \"six\", \"seven\", \"eight\"]",
+  "",
+].join("\n"), [
+  "type Opts = { name : String, verbose : Bool = False, tags : List String = [] }",
+  "type Long =",
+  "  { aVeryLongFieldName : String = \"a long default value\"",
+  "  , another : List String = [\"one\", \"two\"]",
+  "  , third : Int",
+  "  }",
+  "theory Sig where",
+  "  T : Type = Int",
+  "  long : List String =",
+  "    [\"one\", \"two\", \"three\", \"four\", \"five\", \"six\", \"seven\", \"eight\"]",
+  "",
+].join("\n"));
+
 const bad = run("x : Bool\nx = (\n");
 expect("what does not parse is left", !bad.ok && bad.why.includes("does not parse"), JSON.stringify(bad));
 

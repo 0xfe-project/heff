@@ -1109,34 +1109,60 @@ litString s = MkSyn (\e -> pure (MkPair (M.litString s) VPrimString))
 -- Record
 --------------------------------------------------------------------------------
 
-type FieldDeclaration = { name : String, typ : Typ }
+-- | a field of a record type: its name, its type, and its default (a
+-- | term of that type), if it has one
+type FieldDeclaration = { name : String, typ : Typ, dflt : Maybe Chk }
 
-formGo : ElabEnv
-       -> List FieldDeclaration
-       -> Elab (Pair P.Level (List (Pair String Sx.Ty)))
-formGo e' Nil = pure (MkPair Small Nil)
+-- | a record type's fields formed: its level, the fields' types, the
+-- | defaults of those that have one
+type Formed =
+  { level : P.Level
+  , fields : List (Pair String Sx.Ty)
+  , defaults : List (Pair String Sx.Tm)
+  }
+
+-- (a field's default, checked at the field's type, where the type is)
+defaultAt : ElabEnv -> M.Ty -> Maybe Chk -> Elab (Maybe Sx.Tm)
+defaultAt e ty Nothing = pure Nothing
+defaultAt e ty (Just c) = do
+  m <- runChk c e (M.tyN ty)
+  pure (Just m.stx)
+
+consDefault : String
+            -> Maybe Sx.Tm
+            -> List (Pair String Sx.Tm)
+            -> List (Pair String Sx.Tm)
+consDefault x (Just d) ds = Cons (MkPair x d) ds
+consDefault x Nothing ds = ds
+
+formGo : ElabEnv -> List FieldDeclaration -> Elab Formed
+formGo e' Nil = pure { level = Small, fields = Nil, defaults = Nil }
 formGo e' (Cons fd rest) = do
   ty <- runTyp fd.typ e'
-  pl <- formGo (withScope e' (bindName fd.name (M.tyN ty) e'.scope)) rest
-  case pl of
-    MkPair l fieldTys ->
-      pure
-        (MkPair
-           (P.maxLevel l (M.levelOf ty))
-           (Cons (MkPair fd.name ty.stx) fieldTys))
+  d <- defaultAt e' ty fd.dflt
+  f <- formGo (withScope e' (bindName fd.name (M.tyN ty) e'.scope)) rest
+  pure
+      { level = P.maxLevel f.level (M.levelOf ty)
+      , fields = Cons (MkPair fd.name ty.stx) f.fields
+      , defaults = consDefault fd.name d f.defaults
+      }
 
 recordFormation : List FieldDeclaration -> Typ
 recordFormation fieldTyps =
   MkTyp (\e -> do
   -- (the fields may name the definition being elaborated: the record
   -- type is nominative, so the recursion is guarded by its name)
-  pl <-
+  f <-
     formGo
       (withScope (withFor e ForNominative) (undelayScope e.scope))
       fieldTyps
-  case pl of
-    MkPair l fields ->
-      pure (M.recordM e.globals e.scope.locals l (D.fromList fields)))
+  pure
+      (M.recordM
+         e.globals
+         e.scope.locals
+         f.level
+         (D.fromList f.fields)
+         (D.fromList f.defaults)))
 
 -- | (`nameSpan`: the field's name, where it is written)
 type FieldSetting =
@@ -1224,15 +1250,15 @@ selfAdvance e a done = case e.elabFor of
       _ -> pure e
   _ -> pure e
 
-checkFixed : ElabEnv -> FieldSetting -> V.V -> Maybe V.V -> Elab Unit
-checkFixed e fs v Nothing = pure MkUnit
-checkFixed e fs v (Just expected) = do
+checkFixed : ElabEnv -> P.Span -> V.V -> Maybe V.V -> Elab Unit
+checkFixed e sp v Nothing = pure MkUnit
+checkFixed e sp v (Just expected) = do
   r <- Mt.unifyEl e.globals (shape e.scope) v expected
   case r of
     Right _ -> pure MkUnit
     Left err ->
       failWithNote
-        fs.span
+        sp
         11
         ("expected value "
          ++ eqElStr e.globals (shape e.scope) expected
@@ -1240,84 +1266,165 @@ checkFixed e fs v (Just expected) = do
          ++ eqElStr e.globals (shape e.scope) v)
         (prettyEqErr e.globals err)
 
-introGo : ElabEnv
+-- | what checking a record's fields has in hand: the record's span, the
+-- | type, its fields' names in order, their defaults, and the names of
+-- | the fields written
+type Intro =
+  { span : P.Span
+  , ty : V.Ty
+  , keys : List String
+  , defaults : D.Dict Sx.Tm
+  , written : List String
+  }
+
+-- (`a`, `a and b`, `a, b and c`)
+andList : List String -> String
+andList Nil = ""
+andList (Cons x Nil) = x
+andList (Cons x (Cons y Nil)) = x ++ " and " ++ y
+andList (Cons x rest) = x ++ ", " ++ andList rest
+
+-- | the fields a record of the type is given, in order, and which of
+-- | them it may leave out
+fieldsNote : Intro -> String
+fieldsNote it =
+  "the fields are "
+  ++ joinWith ", " it.keys
+  ++ ", in this order"
+  ++ (if D.size it.defaults == 0 then ""
+      else " (" ++ andList (A.toList it.defaults.keys) ++ " may be left out)")
+
+-- | a field's default: a nominal term, marked so in descriptive position
+-- | (as one written there is, `CNominal`)
+defaultFor : ElabFor -> G.Globals -> Sx.Tm -> M.El
+defaultFor ForNominative g d = { stx = d, val = \u -> EV.eval g N d LNil }
+defaultFor (ForDescriptive _ _) g d =
+  M.isM { stx = d, val = \u -> EV.eval g N d LNil }
+
+-- | a field given: its term, where it is (the setting, or the record for
+-- | a default), the settings after it
+type Given = { el : M.El, span : P.Span, rest : List FieldSetting }
+
+-- (field `x` not written, nor defaulted: the setting there instead, or
+-- the record's end)
+notGiven : Intro -> String -> List FieldSetting -> Elab Given
+notGiven it x (Cons fs _) =
+  failWithNote
+    fs.span
+    3
+    ("expected record field " ++ x ++ " got: " ++ fs.name)
+    (fieldsNote it)
+notGiven it x Nil =
+  failWithNote it.span 4 ("missing record field " ++ x) (fieldsNote it)
+
+-- (field `x` not written: its default, if it has one)
+defaulted : ElabEnv -> Intro -> String -> List FieldSetting -> Elab Given
+defaulted e it x settings = case D.lookup it.defaults x of
+  Just d ->
+    pure
+      { el = defaultFor (projElabFor e.elabFor x) e.globals d
+      , span = it.span
+      , rest = settings
+      }
+  Nothing -> notGiven it x settings
+
+written : ElabEnv
+        -> Intro
+        -> String
         -> V.Ty
+        -> FieldSetting
+        -> List FieldSetting
+        -> Elab Given
+written e it x fty fs rest = do
+  recordName e it.ty fs.name fs.nameSpan fty
+  m <- runChk fs.chk (withFor e (projElabFor e.elabFor x)) fty
+  pure { el = m, span = fs.span, rest = rest }
+
+-- | field `x`, of type `fty`: the next setting, if it is `x`'s, else
+-- | `x`'s default
+givenField : ElabEnv
+           -> Intro
+           -> String
+           -> V.Ty
+           -> List FieldSetting
+           -> Elab Given
+givenField e it x fty (Cons fs rest) =
+  if strEq fs.name x then written e it x fty fs rest
+  else defaulted e it x (Cons fs rest)
+givenField e it x fty Nil = defaulted e it x Nil
+
+-- | a setting after the type's fields: of none of them, or of one met
+-- | before (written twice, or out of order)
+leftOver : ElabEnv
+         -> Intro
+         -> List FieldSetting
+         -> Elab (List (Pair String M.El))
+leftOver e it Nil = pure Nil
+leftOver e it (Cons fs _) =
+  if length (filter (\x -> strEq x fs.name) it.written) > 1
+    then failWithNote
+        fs.span
+        4
+        ("record field " ++ fs.name ++ " is given twice")
+        (fieldsNote it)
+  else if elemBy strEq fs.name it.keys
+    then failWithNote
+        fs.span
+        4
+        ("record field " ++ fs.name ++ " is out of order")
+        (fieldsNote it)
+  else failWithNote
+      fs.span
+      7
+      ("no such field " ++ fs.name ++ " in type " ++ tyStr e it.ty)
+      (fieldsNote it)
+
+-- | the record's fields, one by one as the type has them: each the next
+-- | setting written, or its default
+introGo : ElabEnv
+        -> Intro
         -> List (Pair String V.V)
         -> V.Locals V.V
-        -> List (Pair FieldSetting (Pair String (V.Locals V.V -> V.Field)))
+        -> List FieldSetting
+        -> List (Pair String (V.Locals V.V -> V.Field))
         -> Elab (List (Pair String M.El))
-introGo e a done vs Nil = pure Nil
-introGo e a done vs (Cons (MkPair fs (MkPair x fieldC)) rest) =
-  if strEq fs.name x
-    then case fieldC vs of
-      MkField fty fvalue -> do
-        recordName e a fs.name fs.nameSpan fty
-        m <- runChk fs.chk (withFor e (projElabFor e.elabFor x)) fty
-        checkFixed
-            e
-            fs
-            (createNominative (projElabFor e.elabFor x) (P.forceTh m.val) fty)
-            fvalue
-        e' <-
-          selfAdvance
-            e
-            a
-            (appendP
-               done
-               (Cons
-                  (MkPair
-                     x
-                     (createNominative
-                        (projElabFor e.elabFor x)
-                        (P.forceTh m.val)
-                        fty))
-                  Nil))
-        fields <-
-          introGo
-            e'
-            a
-            (appendP
-               done
-               (Cons
-                  (MkPair
-                     x
-                     (createNominative
-                        (projElabFor e.elabFor x)
-                        (P.forceTh m.val)
-                        fty))
-                  Nil))
-            (V.snocL
-               vs
-               (createNominative
-                  (projElabFor e.elabFor x)
-                  (P.forceTh m.val)
-                  fty))
-            rest
-        pure (Cons (MkPair x m) fields)
-  else failWith fs.span 3 ("expected record field " ++ x ++ " got: " ++ fs.name)
-
-zipP : {a b : Type} -> List a -> List b -> List (Pair a b)
-zipP (Cons x xs) (Cons y ys) = Cons (MkPair x y) (zipP xs ys)
-zipP _ _ = Nil
+introGo e it done vs settings Nil = leftOver e it settings
+introGo e it done vs settings (Cons (MkPair x fieldC) rest) = case fieldC vs of
+  MkField fty fvalue -> do
+    g <- givenField e it x fty settings
+    let v = createNominative (projElabFor e.elabFor x) (P.forceTh g.el.val) fty
+    checkFixed e g.span v fvalue
+    e' <- selfAdvance e it.ty (appendP done (Cons (MkPair x v) Nil))
+    fields <-
+      introGo
+        e'
+        it
+        (appendP done (Cons (MkPair x v) Nil))
+        (V.snocL vs v)
+        g.rest
+        rest
+    pure (Cons (MkPair x g.el) fields)
 
 recordIntro : P.Span -> List FieldSetting -> Chk
 recordIntro sp fieldSettings =
   MkChk (\e0 a0 -> do
   a <- Mt.forceT a0
   case V.behavior a of
-    LikeRecord level capture fieldTypes ->
-      if not (D.size fieldTypes == length fieldSettings)
-        then failWith
-            sp
-            4
-            ("expected "
-             ++ showInt (D.size fieldTypes)
-             ++ " fields, got: "
-             ++ showInt (length fieldSettings))
-      else do
-        fields <-
-          introGo e0 a Nil capture (zipP fieldSettings (D.toList fieldTypes))
-        pure (M.cons (caseOf e0.elabFor) (D.fromList fields))
+    LikeRecord level capture fieldTypes -> do
+      fields <-
+        introGo
+          e0
+          { span = sp
+          , ty = a
+          , keys = A.toList fieldTypes.keys
+          , defaults = V.defaultsOf a
+          , written = map (\(fs : FieldSetting) -> fs.name) fieldSettings
+          }
+          Nil
+          capture
+          fieldSettings
+          (D.toList fieldTypes)
+      pure (M.cons (caseOf e0.elabFor) (D.fromList fields))
     _ ->
       failWith
         (a := M.El)
@@ -1372,7 +1479,8 @@ mentionsTypeF r d t = case t of
   SDecode e -> r.el d e
   SFunction level dom (MkAbs x b) implicit -> r.ty d dom || r.ty (d + 1) b
   SFunction level dom (AbsConst b) implicit -> r.ty d dom || r.ty d b
-  SRecord level ft ->
+  -- (a default is closed)
+  SRecord level ft ds ->
     anyWithIndex (\i ty -> r.ty (d + i) ty) (A.toList ft.values)
   SSum vs -> anyP (variantMentions r d) (D.toList vs)
   SIsTy a -> r.ty d a
@@ -1388,6 +1496,26 @@ mentions =
 -- | does a type's syntax mention local 0 (the innermost binder)?
 mentionsInner : Sx.Ty -> Bool
 mentionsInner t = mentions.ty 0 t
+
+closedEl : P.Span -> M.El -> Sx.Tm -> Elab M.El
+closedEl sp m stx =
+  if mentions.el 0 stx
+    then failWith
+        sp
+        43
+        "a field's default can name definitions only, not the type's parameters nor its fields"
+  else pure { stx = stx, val = m.val }
+
+-- | a field's default: closed, naming definitions only -- a record that
+-- | leaves the field out is given it, wherever that record is.  (An
+-- | implicit argument it leaves unsolved is the definition's error, as
+-- | anywhere.)
+closedDefault : P.Span -> Chk -> Chk
+closedDefault sp c =
+  MkChk (\e a -> do
+  m <- runChk c e a
+  mc <- gets (\c0 -> c0.metas)
+  closedEl sp m (U.zonkEl mc m.stx))
 
 fieldOrLocal : Int -> V.Ty -> Maybe V.V -> V.V
 fieldOrLocal l fty (Just v) = v
@@ -1490,7 +1618,7 @@ recordSpec sp s x c =
   case pg of
     MkPair g a -> case M.valN g of
       VNeu h sp2 nty expansion desc -> case desc MkUnit of
-        Just (VCode (VRecord level capture fieldTypes)) ->
+        Just (VCode (VRecord level capture fieldTypes defaults)) ->
           if D.contains fieldTypes x
             then case V.typeForProjection
                 capture

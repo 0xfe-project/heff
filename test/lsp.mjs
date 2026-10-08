@@ -199,6 +199,21 @@ try {
     expect("definition of a field " + what, d.result && d.result.range.start.line === hmapAt.line && d.result.range.start.character === hmapAt.character, d.result);
   }
 
+  // a record type's defaults: a name in a default, a field set where the
+  // others are left out, and a theory's field that has a default
+  const defaults = disk("test/surface/record-defaults.hf");
+  const du = uri("test/surface/record-defaults.hf");
+  open("test/surface/record-defaults.hf", defaults);
+  ds = await diagnosticsOf(du);
+  expect("a record type's defaults: no diagnostics", ds.length === 0, ds);
+  const inDefault = await request("textDocument/hover", { textDocument: { uri: du }, position: pos(defaults, "greeting\n") });
+  expect("hover in a default", inDefault.result && inDefault.result.contents.value.includes("greeting : String"), inDefault.result);
+  const setField = await request("textDocument/hover", { textDocument: { uri: du }, position: pos(defaults, "name = \"bare\"") });
+  expect("hover on a field set, the others left out", setField.result && setField.result.contents.value.includes("name : String"), setField.result);
+  const nameDef = await request("textDocument/definition", { textDocument: { uri: du }, position: pos(defaults, "name = \"strings\"") });
+  const nameAt = pos(defaults, "name : String = ");
+  expect("definition of a theory's field that has a default", nameDef.result && nameDef.result.range.start.line === nameAt.line && nameDef.result.range.start.character === nameAt.character, nameDef.result);
+
   // an outline: each definition, a data's tags and a theory's fields under it
   const outline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/basics.hf") } });
   const sym = (n) => outline.result && outline.result.find((s) => s.name === n);

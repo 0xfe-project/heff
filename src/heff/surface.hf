@@ -667,10 +667,12 @@ opRhsOf : C.E -> Pair C.T C.E
 opRhsOf (OpRhs op e) = MkPair op e
 opRhsOf e = MkPair (C.firstE e) e
 
--- | `{x : A}`: braces around one declaration (not a record's field)
+-- | `{x : A}`: braces around one declaration (not a record's field, set
+-- | or with its default)
 bracedOne : C.E -> Maybe C.E
 bracedOne (Braces o (Cons f Nil) commas c) = case f of
   EFSet x eq e -> Nothing
+  EFDefault d eq e -> Nothing
   _ -> Just f
 bracedOne _ = Nothing
 
@@ -785,10 +787,30 @@ declarationL r e = do
   if isAnnE d then pure d
     else throwP (diag (Pm.spanOf d) "a field is `name : Type`")
 
--- | `x : T`, a field of a record type
-fieldDeclOf : Notation.Expr -> Pm.Spanned (Notation.FieldDecl Notation.Expr)
-fieldDeclOf (At (EAnn (At (EVar x) xsp) t) sp) = At (DeclareField x xsp t) sp
-fieldDeclOf d = At (BadFieldDecl d) (Pm.spanOf d)
+-- (from the field's start to its default's end, if it has one)
+spanWith : Pm.Span -> Maybe Notation.Expr -> Pm.Span
+spanWith sp Nothing = sp
+spanWith sp (Just d) = Notation.spanning sp (Pm.spanOf d)
+
+-- | `x : T`, a field of a record type, and its default `d`, if it has one
+fieldDeclOf : Notation.Expr
+            -> Maybe Notation.Expr
+            -> Pm.Spanned (Notation.FieldDecl Notation.Expr Notation.Expr)
+fieldDeclOf (At (EAnn (At (EVar x) xsp) t) sp) d =
+  At (DeclareField x xsp t d) (spanWith sp d)
+fieldDeclOf e d = At (BadFieldDecl e) (Pm.spanOf e)
+
+-- | `x : T`, or `x : T = d`, a field of a record type
+fieldL : Lw
+       -> C.E
+       -> P (Pm.Spanned (Notation.FieldDecl Notation.Expr Notation.Expr))
+fieldL r (EFDefault e eq d) = do
+  e' <- declarationL r e
+  d' <- r.e d
+  pure (fieldDeclOf e' (Just d'))
+fieldL r e = do
+  e' <- declarationL r e
+  pure (fieldDeclOf e' Nothing)
 
 settingL : Lw -> C.E -> P (Pm.Spanned (Notation.FieldSet Notation.Expr))
 settingL r (EFSet x eq e) = do
@@ -814,8 +836,8 @@ bracesL r o fs c = case fs of
         fs' <- traverseS (\m -> settingL r m) fs
         pure (At (EStruct fs') (spanTT o c))
     else do
-      fs' <- traverseS (\m -> declarationL r m) fs
-      pure (At (ESig (map fieldDeclOf fs')) (spanTT o c))
+      fs' <- traverseS (\m -> fieldL r m) fs
+      pure (At (ESig fs') (spanTT o c))
 
 -- | `C x y`, a tag applied
 conL : Lw -> C.T -> List C.E -> P Notation.Expr
@@ -1345,15 +1367,26 @@ typeL r kw name params body = do
                  (spanTE kw (C.lastE body).end)))
            Nil))
 
--- | a field of a theory: in scope in the fields after it
-theoryFieldL : Lw -> C.TF -> P (Pm.Spanned (Notation.FieldDecl Notation.Expr))
-theoryFieldL r (MkTF x cc ty) = do
+-- (a theory's field's default, if it has one)
+defaultL : Lw -> Maybe (Pair C.T C.E) -> P (Maybe Notation.Expr)
+defaultL r Nothing = pure Nothing
+defaultL r (Just (MkPair eq d)) = do
+  d' <- r.e d
+  pure (Just d')
+
+-- | a field of a theory, and its default: in scope in the fields after
+-- | it (not in its default)
+theoryFieldL : Lw
+             -> C.TF
+             -> P (Pm.Spanned (Notation.FieldDecl Notation.Expr Notation.Expr))
+theoryFieldL r (MkTF x cc ty d) = do
   ty' <- r.e ty
+  d' <- defaultL r d
   pModify (\s -> setScope (Cons x.text s.scope) s)
   pure
       (At
-         (DeclareField x.text (spanT x) ty')
-         (Notation.spanning (spanT x) (Pm.spanOf ty')))
+         (DeclareField x.text (spanT x) ty' d')
+         (Notation.spanning (spanT x) (Pm.spanOf (fromMaybe ty' d'))))
 
 -- | `theory T a where` and its fields
 theoryL : Lw -> C.D -> C.T -> C.T -> List C.E -> List C.TF -> P (List Item)

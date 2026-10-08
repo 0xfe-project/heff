@@ -70,5 +70,18 @@ writeFileSync(join(dir, "a.hf"), "import prelude\n\nnine : Int\nnine = 90\n\nunu
 const c3 = heff("test", "c.hf");
 want(c3.status === 1 && /91/.test(c3.stdout), `a changed definition reaches the importer\n${c3.stdout.slice(0, 120)}`);
 
+// a record type's default changed: a record that leaves the field out,
+// in an importer that names only a function of the type, is given the
+// new one (the importer holds the default it was given)
+const opts = (size) => `import prelude\n\ntype Opts = { name : String, size : Int = ${size} }\n\nsizeOf : Opts -> Int\nsizeOf o = o.size\n`;
+writeFileSync(join(dir, "d.hf"), opts(1));
+writeFileSync(join(dir, "e.hf"), "import d\nimport prelude\n\nsized : Int\nsized = sizeOf { name = \"e\" }\n");
+writeFileSync(join(dir, "f.hf"), "import e\nimport prelude\n\n-- >>> sized\n-- 1\n");
+const d1 = heff("test", "f.hf");
+want(d1.status === 0 && /1\/1 expectations hold/.test(d1.stdout), `a default given\n${d1.stdout.slice(0, 120)}`);
+writeFileSync(join(dir, "d.hf"), opts(2));
+const d2 = heff("test", "f.hf");
+want(d2.status === 1 && /\b2\b/.test(d2.stdout), `a changed default reaches the importer\n${d2.stdout.slice(0, 120)}`);
+
 console.log(`cache: ${failed ? "NOT " : ""}thawed, healed and invalidated at the definitions used`);
 process.exit(failed ? 1 : 0);

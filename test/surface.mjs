@@ -47,6 +47,19 @@ const rejected = [
   ["test/errors/where-type.hf", "test/errors/where-type.hf:8:5\nerror[E0150]: `go` needs a type: `go : ...`"],
   ["test/errors/where-order.hf", "test/errors/where-order.hf:9:9\nerror[E0308]: no such variable b in scope"],
   ["test/errors/primitive.hf", "there is no primitive called `intPlusPlus` (the runtime has: intAdd, "],
+  // (a record type's defaults: what a record may leave out, and what a
+  // default may name)
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:11:24\nerror[E0303]: expected record field name got: verbose"],
+  ["test/errors/record-defaults.hf", "the fields are name, verbose, tags, in this order (verbose and tags may be left out)"],
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:14:9\nerror[E0304]: missing record field name"],
+  ["test/errors/record-defaults.hf", "error[E0304]: record field verbose is out of order"],
+  ["test/errors/record-defaults.hf", "error[E0304]: record field name is given twice"],
+  ["test/errors/record-defaults.hf", "error[E0307]: no such field tag in type Opts"],
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:28:45\nerror[E0343]: a field's default can name definitions only, not the type's parameters nor its fields"],
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:30:39\nerror[E0343]"],
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:33:30\nerror[E0311]: expected type Bool, but got type Int"],
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:37:33\nerror[E0328]: cannot infer the implicit argument `a`"],
+  ["test/errors/record-defaults.hf", "test/errors/record-defaults.hf:41:20\nerror[E0200]: this notation must be put in a checking position"],
 ];
 for (const [f, msg] of rejected) {
   const r = heff("check", f);
