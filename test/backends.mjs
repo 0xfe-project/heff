@@ -15,7 +15,8 @@
 // write, their exit status, loops a million rounds deep, a long loop of
 // operations done at once, time and the network.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setSeed, genProgram } from "./gen.mjs";
 import { heff, root } from "./heff.mjs";
@@ -159,6 +160,22 @@ const ran = (what, file, name, args, want, opts = {}) => {
 
 // time and the network: done later, the rest going on then
 ran("sleep and fetch", "test/node/timed.hf", "timed", [], { out: "fetched\n", status: 0 });
+
+// a module named `main` (main.hf, in no project), compiled to C as
+// parts: its part, main.c, is not the program's entry, which is a part of
+// its own
+{
+  const alone = mkdtempSync(join(tmpdir(), "heff-main-"));
+  copyFileSync(join(root, "test", "node", "main.hf"), join(alone, "main.hf"));
+  const dir = join(alone, "parts"), bin = join(work, "main-parts-c");
+  const r = heff(["compile", "main.hf", "parts/", "--name", "main", "--backend=c"], { cwd: alone });
+  const parts = r.status === 0 ? readdirSync(dir).filter((f) => f.endsWith(".c")) : [];
+  const b = r.status === 0 ? spawnSync(cc[0], [...cc.slice(1), ...ccFlags, "-w", ...parts.map((f) => join(dir, f)), "-o", bin, "-lm", "-lpthread"], { encoding: "utf8" }) : r;
+  const out = b.status === 0 ? spawnSync(bin, [], { encoding: "utf8", timeout: 60000 }) : b;
+  if (!(parts.includes("main.c") && out.status === 0 && out.stdout === "main, a module of its own: 3 2 1\n"))
+    fail(`FAIL a module named main, as parts: ${parts.join(" ")}\n${out.stdout ?? ""}${out.stderr ?? ""}`);
+  rmSync(alone, { recursive: true, force: true });
+}
 
 // a computation of an effect the backend has no provider for is refused,
 // and why
