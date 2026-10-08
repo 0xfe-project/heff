@@ -612,6 +612,20 @@ HEFF_VAR(long heff_dep);
 
 static V heff_apply(V f, int n, V *a);
 
+// (a call's `n` arguments copied, `n` known only where it is run and
+// most often a few: stored one by one, not given to `memcpy`, a call that
+// costs more than such a copy)
+static inline void heff_copy(V *to, const V *from, int64_t n) {
+  switch (n) {
+  case 4: to[3] = from[3]; /* fall through */
+  case 3: to[2] = from[2]; /* fall through */
+  case 2: to[1] = from[1]; /* fall through */
+  case 1: to[0] = from[0]; /* fall through */
+  case 0: return;
+  default: memcpy(to, from, n * sizeof(V));
+  }
+}
+
 static V heff_trs(V r) {
   do {
     Bnc *b = (Bnc *)r;
@@ -619,7 +633,7 @@ static V heff_trs(V r) {
     V fun = b->fun;
     int n = b->n;
     V *a = alloca(n * sizeof(V));
-    memcpy(a, b->a, n * sizeof(V));
+    heff_copy(a, b->a, n);
     heff_obj_free(b, sizeof(Bnc) + n * sizeof(V));
     r = heff_apply(fun, n, a);
   } while (!IS_INT(r) && !IS_NTAG(r) && OBJ(r)->kind == K_BNC);
@@ -633,7 +647,7 @@ static inline V heff_tr(V r) {
 static V heff_bounce(V f, int n, V *a) {
   Bnc *b = heff_obj_alloc(sizeof(Bnc) + n * sizeof(V));
   b->h.rc = 1; b->h.kind = K_BNC; b->h.tag = 0; b->fun = f; b->n = n;
-  memcpy(b->a, a, n * sizeof(V));
+  heff_copy(b->a, a, n);
   return (V)b;
 }
 
@@ -654,7 +668,7 @@ static V heff_apply(V f, int n, V *a) {
       V *all = alloca(m * sizeof(V));
       V fun;
       if (heff_unique(f)) {
-        memcpy(all, p->a, pn * sizeof(V));
+        heff_copy(all, p->a, pn);
         fun = p->fun;
         heff_obj_free(p, sizeof(Pap) + pn * sizeof(V));
       } else {
@@ -662,7 +676,7 @@ static V heff_apply(V f, int n, V *a) {
         fun = heff_dup(p->fun);
         heff_drop(f);
       }
-      memcpy(all + pn, a, n * sizeof(V));
+      heff_copy(all + pn, a, n);
       f = fun; a = all; n = m;
       continue;
     }
@@ -688,7 +702,7 @@ static V heff_apply(V f, int n, V *a) {
     if (n < c->arity) {
       Pap *p = heff_obj_alloc(sizeof(Pap) + n * sizeof(V));
       p->h.rc = 1; p->h.kind = K_PAP; p->h.tag = 0; p->fun = f; p->n = n;
-      memcpy(p->a, a, n * sizeof(V));
+      heff_copy(p->a, a, n);
       return (V)p;
     }
     // (more arguments than it takes: the rest given to what it gives --
