@@ -195,7 +195,10 @@ and shifts by the amount modulo its bits; each operation of a `Float32`
 is rounded to one.
 
 A number literal is of the type it is used at: an integer literal of any
-number type, a fractional one (`2.5`) of a float type.  Where the type is
+number type, a fractional one (`2.5`) of a float type.  An integer
+literal may be written in hexadecimal, `0x605`, or in binary,
+`0b1010`, and any number's digits may be set apart by `_`
+(`1_000_000`); the formatter keeps it as it is written.  Where the type is
 not known yet, the literal waits for it, and unification finds it from
 how the literal is used (`id 5` wanted as an `Int32` is one).  It must be
 one of the type's values, however late the type is found: `300` as a
