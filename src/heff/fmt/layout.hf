@@ -1,9 +1,9 @@
 -- Laying a file out anew.
 -- The concrete syntax from `heff.cst` is turned into a `doc` document and
 -- rendered at width 80; blank lines between declarations are kept, at most
--- one, and each comment goes where it was attached.  What lays an
--- expression out calls itself through the record `lay`, as the grammar
--- does through `gram`.
+-- one, and each comment goes where it was attached; a definition under
+-- `-- fmt: skip` is kept as written.  What lays an expression out calls
+-- itself through the record `lay`, as the grammar does through `gram`.
 
 import array as A
 import heff.cst as C
@@ -566,14 +566,20 @@ tfDoc env (MkTF x cc ty d) = tok env x <+> sig env cc ty <> tfDefault env d
 srcSlice : Tk.Env -> Int -> Int -> String
 srcSlice env a b = strSlice env.src a b
 
+-- (the line break before a declaration but the first, and a blank line
+-- if one was before it)
+declSep : Tk.Env -> Int -> C.D -> Doc
+declSep env i d =
+  if i > 0
+    then hardline
+      <> (if blankBefore env (C.firstD d) then blankLine else emptyDoc)
+  else emptyDoc
+
 -- | declarations, one after another, a blank line between two kept
 declsGo : Tk.Env -> (Tk.Env -> C.D -> Doc) -> Int -> List C.D -> Doc
 declsGo env one i Nil = emptyDoc
 declsGo env one i (Cons d ds) =
-  (if i > 0
-     then hardline
-       <> (if blankBefore env (C.firstD d) then blankLine else emptyDoc)
-   else emptyDoc)
+  declSep env i d
   <> item env (C.firstD d) (C.lastD d) (\e -> one e d)
   <> declsGo env one (i + 1) ds
 
@@ -635,8 +641,103 @@ eofLeadDocs env (Cons c cs) =
   <> comment c.text
   <> eofLeadDocs env cs
 
+-- Definitions kept as written: a line `-- fmt: skip` among the comments
+-- right above a top-level declaration (no blank line between) keeps it
+-- as it is written, a signature with the equations of its name after
+-- it.  Elsewhere the line is a comment like any other.
+
+isSkip : Tk.Cmt -> Bool
+isSkip c = strEq (rtrim c.text) "-- fmt: skip"
+
+-- (of the comments before a token, last first, those after the last
+-- blank line)
+nearGo : List Tk.Cmt -> List Tk.Cmt -> List Tk.Cmt
+nearGo Nil acc = acc
+nearGo (Cons c cs) acc =
+  if cmtBlank c then Cons c acc else nearGo cs (Cons c acc)
+
+-- | a `-- fmt: skip` right above the token, no blank line between
+skipsAt : Tk.Env -> T -> Bool
+skipsAt env t =
+  not (tokBlank t) && any isSkip (nearGo (reverse (leadOf env t)) Nil)
+
+tokText : T -> String
+tokText t = t.text
+
+nameText : List T -> String
+nameText n = joinWith "" (map tokText n)
+
+-- (the name a signature or an equation defines; "" of another
+-- declaration)
+defName : C.D -> String
+defName (DSig n cc ty) = nameText n
+defName (DEqn n pats eq rhs w) = nameText n
+defName d = ""
+
+isEqnOf : String -> C.D -> Bool
+isEqnOf x (DEqn n pats eq rhs w) = strEq (nameText n) x
+isEqnOf x d = False
+
+-- (the last declaration of the definition from `d`: the last of the
+-- equations of its name right after it, or `d`)
+defLast : String -> C.D -> List C.D -> C.D
+defLast x d Nil = d
+defLast x d (Cons e es) = if isEqnOf x e then defLast x e es else d
+
+-- (what is after the definition: the equations of its name dropped)
+afterDef : String -> List C.D -> List C.D
+afterDef x Nil = Nil
+afterDef x (Cons e es) = if isEqnOf x e then afterDef x es else Cons e es
+
+gapEnd : String -> Int -> Int
+gapEnd s i =
+  if charCode s i == 32 || charCode s i == 9 then gapEnd s (i + 1) else i
+
+-- (a `--` comment at `j`, as the lexer reads one)
+lineCmtAt : String -> Int -> Bool
+lineCmtAt s j =
+  charCode s j == 45
+  && L.dashesEnd s j - j >= 2
+  && not (L.isSymC (charCode s (L.dashesEnd s j)))
+
+blockCmtAt : String -> Int -> Bool
+blockCmtAt s j = charCode s j == 123 && charCode s (j + 1) == 45
+
+blockEnd : L.BlockEnd -> Int
+blockEnd r = r.i
+
+-- | where the comments after a token on its line end; `i`, where the
+-- | token ends, if there are none
+trailEnd : String -> Int -> Int
+trailEnd s i =
+  if lineCmtAt s (gapEnd s i) then L.eolEnd s (gapEnd s i)
+  else if blockCmtAt s (gapEnd s i)
+    then trailEnd s (blockEnd (L.blockScan s (gapEnd s i) 0 0 0 False))
+  else i
+
+inlineOf : Tk.Env -> T -> List String
+inlineOf env t = fromMaybe Nil (M.lookup compareInt t.ix env.inline)
+
+-- | a definition kept as written: its leading comments laid out as an
+-- | item's, then its text copied, from its first token to the comments
+-- | after its last on its line
+asWritten : Tk.Env -> T -> T -> Doc
+asWritten env first last2 =
+  leadDocs (leadOf env first) 0
+  <> foldDocs (map inlineDoc (inlineOf env first))
+  <> comment (srcSlice env first.start (trailEnd env.src last2.end))
+
+-- | the declarations, each laid out, or kept as written under
+-- | `-- fmt: skip` with the equations of its name after it
 topLevelGo : Tk.Env -> Int -> List C.D -> Doc
-topLevelGo env i ds = declsGo env (\e d -> pD e d) i ds
+topLevelGo env i Nil = emptyDoc
+topLevelGo env i (Cons d ds) =
+  declSep env i d
+  <> (if skipsAt env (C.firstD d)
+        then asWritten env (C.firstD d) (C.lastD (defLast (defName d) d ds))
+          <> topLevelGo env (i + 1) (afterDef (defName d) ds)
+      else item env (C.firstD d) (C.lastD d) (\e -> pD e d)
+        <> topLevelGo env (i + 1) ds)
 
 topLevel : Tk.Env -> List C.D -> T -> Doc
 topLevel env ds eof = topLevelGo env 0 ds <> eofLeadDocs env (leadOf env eof)
@@ -719,3 +820,6 @@ test laying
 
 -- >>> formatUnchecked "import a\n\ng = do\n  y <- f 1\n  pure y"
 -- Right "import a\n\ng = do\n  y <- f 1\n  pure y\n"
+
+-- >>> formatUnchecked "-- fmt: skip\nm  =  [ 1, 0,\n        0, 1 ]\nn  =  1"
+-- Right "-- fmt: skip\nm  =  [ 1, 0,\n        0, 1 ]\nn = 1\n"

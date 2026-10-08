@@ -79,6 +79,25 @@ heff completions SHELL         # fish, bash or zsh completions
 Flags go anywhere among the words, as getopt_long reads them (`-b node`,
 `--back=node`, `--`); `std.cli` reads them, for any heff program.
 
+`heff fmt` lays a file out anew, keeping its comments, and at most one
+blank line between two declarations.  A line `-- fmt: skip` among the
+comments right above a top-level declaration (no blank line between)
+keeps the definition as it is written, byte for byte, to the end of
+its last line: a signature with the equations of its name after it, or
+any other declaration.  What is around it is laid out.
+Anywhere else, the line is a comment like any other.
+
+```haskell
+-- | the corners: x, y, then r, g, b
+-- fmt: skip
+corners : List Float
+corners =
+  [  0.0,  0.8,   1.0, 0.0, 0.0
+  , -0.8, -0.8,   0.0, 1.0, 0.0
+  ,  0.8, -0.8,   0.0, 0.0, 1.0
+  ]
+```
+
 ## Modules
 
 A project is a directory with a `package.hf`: a heff file defining

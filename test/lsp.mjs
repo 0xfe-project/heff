@@ -349,13 +349,15 @@ try {
   const tLines = tRefs.result ? tRefs.result.map(lineOf) : [];
   expect("references of a field", tLines.includes(pos(basics, "t : Type").line) && tLines.filter((l) => l === pos(basics, "m : t").line).length === 3 && tLines.includes(pos(basics, "r.t").line), tRefs.result);
 
-  // formatting: one edit, the whole text; what does not parse is left, with a warning
-  const messy = "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n";
+  // formatting: one edit, the whole text, a definition under `-- fmt: skip`
+  // as written; what does not parse is left, with a warning
+  const kept = "-- fmt: skip\nsame  :  Bool -> Bool\nsame   b  =  b\n";
+  const messy = "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n\n" + kept;
   open("test/surface/lsp-fmt.hf", messy);
   await diagnosticsOf(uri("test/surface/lsp-fmt.hf"));
   const fmt = await request("textDocument/formatting", { textDocument: { uri: uri("test/surface/lsp-fmt.hf") }, options: { tabSize: 2, insertSpaces: true } });
   expect("formatting", Array.isArray(fmt.result) && fmt.result.length === 1 &&
-    fmt.result[0].newText === "data Bool = True | False\n\nnot : Bool -> Bool\nnot True = False -- c\nnot False = True\n", fmt.result);
+    fmt.result[0].newText === "data Bool = True | False\n\nnot : Bool -> Bool\nnot True = False -- c\nnot False = True\n\n" + kept, fmt.result);
   open("test/surface/lsp-bad.hf", "x : Bool\nx = (\n");
   await diagnosticsOf(uri("test/surface/lsp-bad.hf"));
   const refused = await request("textDocument/formatting", { textDocument: { uri: uri("test/surface/lsp-bad.hf") }, options: { tabSize: 2, insertSpaces: true } });

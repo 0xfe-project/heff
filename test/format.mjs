@@ -2,8 +2,8 @@
 // The formatter (src/heff/format.hf): every .hf file of the repository
 // (that parses) is formatted (the formatter checks itself that the result
 // means the same and keeps the comments) and formatting it again changes
-// nothing; then cases of comments, blank lines, blocks and watches, some
-// with the exact result.
+// nothing; then cases of comments, blank lines, blocks, watches and
+// definitions kept as written (`-- fmt: skip`), some with the exact result.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -374,6 +374,100 @@ formats("a record type's defaults: `= d` after the field, a long one on the next
   "    [\"one\", \"two\", \"three\", \"four\", \"five\", \"six\", \"seven\", \"eight\"]",
   "",
 ].join("\n"));
+
+// `-- fmt: skip` right above a top-level declaration: the definition (its
+// signature and the equations of its name after it) kept byte for byte,
+// its comments too, up to the comment after its last token; what is
+// around it laid out, the blank lines at its edges at most one
+const kept = [
+  "-- | the corners: x, y, then r, g, b",
+  "-- fmt: skip",
+  "corners : List Float",
+  "corners =",
+  "  [  0.0,  0.8,   1.0, 0.0, 0.0",
+  "  , -0.8, -0.8,   0.0, 1.0, 0.0   -- left  ",
+  "",
+  "  ,  0.8, -0.8,   0.0, 0.0, 1.0",
+  "  ]   {- after -}  -- and",
+];
+const pick = [
+  "-- fmt: skip",
+  "pick  :  Int -> Int",
+  "pick 0  =  10",
+  "pick n  =    n",
+];
+formats("a definition under `-- fmt: skip`, as written", [
+  "import prelude",
+  "", "", "",
+  ...kept,
+  "", "",
+  "size  :  Int",
+  "size =   512",
+  ...pick,
+  "next  :  Int",
+  "next =   pick 1",
+  "",
+].join("\n"), [
+  "import prelude",
+  "",
+  ...kept,
+  "",
+  "size : Int",
+  "size = 512",
+  ...pick,
+  "next : Int",
+  "next = pick 1",
+  "",
+].join("\n"));
+
+// (formatted, it is as it was: what `fmt --check` holds)
+const keptSrc = ["import prelude", "", ...kept, "", ...pick, ""].join("\n");
+const again = run(keptSrc);
+expect("a definition as written is formatted", again.ok && again.out === keptSrc, JSON.stringify(again));
+
+// (one definition: the next, of another name, laid out)
+formats("`-- fmt: skip` keeps one definition, not those after it", [
+  "-- fmt: skip",
+  "red   = 1",
+  "green  = 2",
+  "-- fmt: skip",
+  "blue  = 3",
+  "",
+].join("\n"), [
+  "-- fmt: skip",
+  "red   = 1",
+  "green = 2",
+  "-- fmt: skip",
+  "blue  = 3",
+  "",
+].join("\n"));
+
+// (a blank line under it, in a `where`, after code on its line, or at the
+// end: a comment like another, what is under it laid out)
+formats("`-- fmt: skip` elsewhere, a comment like another", [
+  "-- fmt: skip",
+  "",
+  "f  =  1",
+  "g = h  -- fmt: skip",
+  "  where",
+  "    -- fmt: skip",
+  "    h  =  2",
+  "-- fmt: skip",
+  "",
+].join("\n"), [
+  "-- fmt: skip",
+  "",
+  "f = 1",
+  "g = h -- fmt: skip",
+  "  where",
+  "    -- fmt: skip",
+  "    h = 2",
+  "-- fmt: skip",
+  "",
+].join("\n"));
+
+const badKept = run("-- fmt: skip\nx : Bool\nx = (\n");
+expect("a definition kept that does not parse is refused", !badKept.ok && badKept.why.includes("does not parse"), JSON.stringify(badKept));
 
 const bad = run("x : Bool\nx = (\n");
 expect("what does not parse is left", !bad.ok && bad.why.includes("does not parse"), JSON.stringify(bad));

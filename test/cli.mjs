@@ -82,6 +82,16 @@ expect("fmt", laid.status === 0 && readFileSync(join(work, "messy.hf"), "utf8") 
 const refused = heff("fmt", "broken.hf");
 expect("fmt of what does not parse", refused.status === 1 && refused.stderr.includes("broken.hf not formatted: the file does not parse") &&
   readFileSync(join(work, "broken.hf"), "utf8") === "f : Int ->\n", refused);
+// fmt: a definition under `-- fmt: skip` is as it is written, for
+// `--check` too, and left so; what is around it is laid out
+const keptText = "-- fmt: skip\nm : List Int\nm = [ 1, 0,\n      0, 1 ]\n";
+writeFileSync(join(work, "kept.hf"), keptText);
+writeFileSync(join(work, "around.hf"), keptText + "n  =  1\n");
+const keptCheck = heff("fmt", "--check", "kept.hf", "around.hf");
+expect("fmt --check of a definition kept", keptCheck.status === 1 && keptCheck.stdout === "around.hf\n", keptCheck);
+const keptLaid = heff("fmt", "kept.hf", "around.hf");
+expect("fmt of a definition kept", keptLaid.status === 0 && readFileSync(join(work, "kept.hf"), "utf8") === keptText &&
+  readFileSync(join(work, "around.hf"), "utf8") === keptText + "n = 1\n", keptLaid);
 // fmt: a chain of operators breaks at its loosest, as the fixities of what
 // the file imports say
 writeFileSync(join(work, "ops.hf"), [
