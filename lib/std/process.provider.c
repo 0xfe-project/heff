@@ -3,7 +3,9 @@
 // `Exit` ends the program there; `Exec` runs the command in its place
 // (Node.js's first thread does that once the program has ended).
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <direct.h>
+#else
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
@@ -87,6 +89,18 @@ static V heff_provider_process(V p, V k) {
     V f = heff_dup(heff_field(p, 0));
     heff_drop(p);
     V x = heff_answer(f, heff_program_path());
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_WorkingDir: {
+    V f = heff_dup(heff_field(p, 0));
+    heff_drop(p);
+    char buf[4096];
+#ifdef _WIN32
+    const char *d = _getcwd(buf, sizeof buf);
+#else
+    const char *d = getcwd(buf, sizeof buf);
+#endif
+    V x = heff_answer(f, heff_str_c(d ? d : "."));
     return heff_tail(k, 1, &x);
   }
   case TAG_Platform: {
