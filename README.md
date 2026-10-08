@@ -27,7 +27,12 @@ From the repository, with Node.js and [zig](https://ziglang.org/download/):
 
 ```sh
 node scripts/build.mjs     # .heff/out/heff
+.heff/out/heff install     # ~/.heff/bin/heff (HEFF_HOME/bin/heff)
 ```
+
+`heff install` lays the heff home out as a release is: `bin/heff`, and
+beside it what heff finds there, its library and its version, `lib/`
+and `package.hf`, which `app/heff/build.hf` ships.
 
 heff is written in heff.  The package's modules (`src/heff/`) are the
 compiler as a library, each command's work among them
@@ -60,7 +65,8 @@ heff build                     # the whole project: every module of src/
                                # checked, then every program (app/NAME/)
                                # built to .heff/bin/
 heff install [DIR]             # the project at DIR built, its programs put in
-                               # ~/.heff/bin/ (HEFF_HOME/bin/)
+                               # ~/.heff/bin/ (HEFF_HOME/bin/), what they
+                               # ship beside it
 heff init [DIR]                # a new project: a module, a program, a test
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
@@ -97,6 +103,20 @@ package =
   }
 ```
 
+A program is `app/NAME/main.hf`, with an `app/NAME/build.hf` beside it
+defining `build`, of type `Build`: the computation run, what it is
+compiled to (`C`, `Node`, `Page`), and the files and directories of the
+project's root it ships.  `heff build` builds every program to
+`.heff/bin/`; `heff install` builds them into the heff home's `bin/`,
+and puts what they ship beside it, in place of what was there.
+
+```haskell
+import manifest
+
+build : Build
+build = { backend = C, run = "main", ships = [] }
+```
+
 ## Effects
 
 `lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program
@@ -124,10 +144,12 @@ main = program (io := \p -> InL p) (disk := \p -> InR p)
 ## The library
 
 `lib/` goes with the compiler, its version the compiler's; `HEFF_LIB`
-says where it is, else it is the `lib/` beside the compiler.  Its
-modules are imported by their names: `builtin` (implicit in every
-module), `prelude`, `co`, `state`, `exn`, `par`, `array`, `map`, `set`,
-and `manifest` (the type of `package.hf`).  The batteries ship with it,
+says where it is, else it is the `lib/` the compiler came with: the
+repository's, a release's, or the heff home's (`heff install` puts it
+there).  Its modules are imported by their names: `builtin` (implicit
+in every module), `prelude`, `co`, `state`, `exn`, `par`, `array`,
+`map`, `set`, and `manifest` (the types of `package.hf` and
+`build.hf`).  The batteries ship with it,
 under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.path`, `std.cli` (command lines) and

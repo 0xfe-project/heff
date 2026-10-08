@@ -31,7 +31,8 @@ styleNow = do
   pure (P.styleOf p)
 
 -- | the directory the compiler at `self` came with: the repository it is
--- | built in (it is `.heff/out/heff` there), or a release (`bin/heff`)
+-- | built in (it is `.heff/out/heff` there), or a release or the heff
+-- | home (`bin/heff`, what it ships beside `bin/`)
 ownRoot : P.Style -> String -> String
 ownRoot st self =
   if strEq (P.basename st (P.dirname st self)) "out"
@@ -74,7 +75,8 @@ modDir = do
         (P.join st "heff" "mod"))
 
 -- | where heff keeps what is the user's (`bin/`, the programs `heff
--- | install` installs): `HEFF_HOME`, else `~/.heff`
+-- | install` installs, and beside it what they ship): `HEFF_HOME`, else
+-- | `~/.heff`
 heffHome : {e : HFunctor} -> {{sys : process <: e}} -> Co e String
 heffHome = do
   v <- getEnv "HEFF_HOME"
@@ -819,8 +821,15 @@ binDir st = P.join st ".heff" "bin"
 
 -- | what a build makes, and where: the project at `root`, its programs
 -- | written to `bin`, each said as it is made (`wrote`, `installed`); a
--- | page's script made too, if `pages`
-type Target = { root : String, bin : String, said : String, pages : Bool }
+-- | page's script made too, if `pages`; what the programs ship put in
+-- | `shipTo`, if it is given
+type Target =
+  { root : String
+  , bin : String
+  , said : String
+  , pages : Bool
+  , shipTo : Maybe String
+  }
 
 -- | `heff build`'s: the project at `root`, its programs in `.heff/bin/`
 buildTarget : P.Style -> String -> Target
@@ -829,6 +838,7 @@ buildTarget st root =
   , bin = P.join st root (binDir st)
   , said = "wrote"
   , pages = True
+  , shipTo = Nothing
   }
 
 -- (a path of the project)
@@ -851,10 +861,57 @@ type App = { name : String, build : Pr.Build }
 -- | could not be read
 type Apps = { apps : List App, bad : Int }
 
+-- (a file or a directory is at `path`)
+isThere : {e : HFunctor} -> {{disk : fs <: e}} -> String -> Co e Bool
+isThere path = do
+  dir <- readDir path
+  case dir of
+    Just _ -> pure True
+    Nothing -> do
+      file <- readFile path
+      pure (case file of
+        Just _ -> True
+        Nothing -> False)
+
+-- (the names among `ns` that are not of the project's root)
+notInProject : {e : HFunctor}
+             -> {{disk : fs <: e}}
+             -> P.Style
+             -> Target
+             -> List String
+             -> Co e (List String)
+notInProject st t Nil = pure Nil
+notInProject st t (Cons n rest) = do
+  ok <- isThere (inProject st t n)
+  others <- notInProject st t rest
+  pure (if ok then others else Cons n others)
+
+-- (the program X, read from its build.hf, unless what it ships is not
+-- all in the project: `missing`)
+appShips : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> P.Style
+         -> Target
+         -> Apps
+         -> String
+         -> Pr.Build
+         -> List String
+         -> Co e Apps
+appShips st t acc x a Nil =
+  pure { apps = Cons { name = x, build = a } acc.apps, bad = acc.bad }
+appShips st t acc x a missing = do
+  printErr
+      (appFile st t x "build.hf"
+       ++ ": it ships "
+       ++ joinWith ", " (map (\n -> "`" ++ n ++ "`") missing)
+       ++ ", which the project does not have")
+  pure { apps = acc.apps, bad = acc.bad + 1 }
+
 -- (the directory app/X, with its build.hf's text, if it has one: the
 -- program X read, or what is wrong with its build.hf said)
 appRead : {e : HFunctor}
         -> {{io : stdio <: e}}
+        -> {{disk : fs <: e}}
         -> P.Style
         -> Target
         -> Apps
@@ -866,8 +923,9 @@ appRead st t acc x (Just text) = case Pr.readBuild text of
   Left p -> do
     printErr (L.problemMsg (appFile st t x "build.hf") text p)
     pure { apps = acc.apps, bad = acc.bad + 1 }
-  Right a ->
-    pure { apps = Cons { name = x, build = a } acc.apps, bad = acc.bad }
+  Right a -> do
+    missing <- notInProject st t a.ships
+    appShips st t acc x a missing
 
 -- | the project's programs, among the directories of its app/: each one's
 -- | build.hf read, before any is built
@@ -990,7 +1048,101 @@ buildEach st t done Nil = done
 buildEach st t done (Cons a rest) =
   buildApp st t a.name a.build (buildEach st t done rest)
 
--- (the programs, built to `t.bin`, then `done`)
+-- (what cannot be put in `home` said: nothing more is done)
+shipFails : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> String
+          -> Co e Unit
+shipFails why = do
+  printErr ("heff: " ++ why)
+  exit 1
+
+-- (`fresh` moved to `to`, what was there moved aside to `old` first:
+-- `old` then removed; or, `fresh` not moved, what was there put back)
+shipMoved : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> Target
+          -> String
+          -> String
+          -> String
+          -> Co e Unit
+          -> Bool
+          -> Co e Unit
+shipMoved t fresh old to next True = do
+  _ <- remove old
+  wrote t to next
+shipMoved t fresh old to next False = do
+  _ <- move old to
+  _ <- remove fresh
+  shipFails ("cannot put " ++ fresh ++ " in place of " ++ to)
+
+-- (the file or directory `n` of the project put in `home`, in place of
+-- what was there: copied into `home` first, as `.n.new`, then moved to
+-- `n`, so that a failure leaves the whole of what was there, not a part
+-- of either; then `next`)
+shipOne : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> P.Style
+        -> Target
+        -> String
+        -> Co e Unit
+        -> String
+        -> Co e Unit
+shipOne st t home next n = do
+  fresh <- pure (P.join st home ("." ++ n ++ ".new"))
+  old <- pure (P.join st home ("." ++ n ++ ".old"))
+  _ <- remove fresh
+  _ <- remove old
+  copied <- copy (inProject st t n) fresh
+  if copied
+      then do
+        -- (nothing there, nothing moved aside)
+        _ <- move (P.join st home n) old
+        moved <- move fresh (P.join st home n)
+        shipMoved t fresh old (P.join st home n) next moved
+    else do
+      _ <- remove fresh
+      shipFails ("cannot copy " ++ inProject st t n ++ " to " ++ fresh)
+
+shipAll : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> P.Style
+        -> Target
+        -> String
+        -> Co e Unit
+        -> List String
+        -> Co e Unit
+shipAll st t home next Nil = next
+shipAll st t home next (Cons n rest) =
+  shipOne st t home (shipAll st t home next rest) n
+
+-- | what the programs ship, each named once
+shippedBy : List App -> List String
+shippedBy progs = nubStrM (concatMap (\(a : App) -> a.build.ships) progs)
+
+-- (what the programs ship, put in `t.shipTo` if it is given; then `done`)
+shipIn : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> P.Style
+       -> Target
+       -> Co e Unit
+       -> List App
+       -> Maybe String
+       -> Co e Unit
+shipIn st t done progs Nothing = done
+shipIn st t done progs (Just home) = shipAll st t home done (shippedBy progs)
+
+-- (the programs, built to `t.bin`, and what they ship put where `t`
+-- says; then `done`)
 buildPrograms : {e : HFunctor}
               -> {{io : stdio <: e}}
               -> {{sys : process <: e}}
@@ -1004,7 +1156,7 @@ buildPrograms : {e : HFunctor}
 buildPrograms st t done progs = do
   ok <- mkDir t.bin
   okC <- mkDir (inProject st t (P.join st ".heff" "build"))
-  buildEach st t done progs
+  buildEach st t (shipIn st t done progs t.shipTo) progs
 
 -- (the `.hf` files under the paths, the directories walked; a name
 -- starting with `.` passed over)
@@ -1187,7 +1339,9 @@ onPathHint st bin = do
          ++ " is not on the PATH: add it there to run them by their names")
 
 -- | install the project at DIR: built as `heff build` builds it, its
--- | programs into the heff home's `bin/` (`HEFF_HOME/bin`, `~/.heff/bin`)
+-- | programs into the heff home's `bin/` (`HEFF_HOME/bin`, `~/.heff/bin`),
+-- | and what they ship (their build.hf's `ships`) into the heff home,
+-- | beside `bin/`
 installCmd : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
@@ -1205,6 +1359,7 @@ installCmd dir = do
       , bin = P.join st home "bin"
       , said = "installed"
       , pages = False
+      , shipTo = Just home
       }
   case text of
     Nothing -> do
@@ -1979,12 +2134,13 @@ buildText =
   joinWith
     "\n"
     [ "-- main.hf's `main`, compiled through C (by `zig cc`); `Node` makes a"
-    , "-- Node.js program of it."
+    , "-- Node.js program of it.  `ships` names the files and directories of"
+    , "-- the project's root `heff install` puts in the heff home with it."
     , ""
     , "import manifest"
     , ""
     , "build : Build"
-    , "build = { backend = C, run = \"main\" }"
+    , "build = { backend = C, run = \"main\", ships = [] }"
     , ""
     ]
 

@@ -449,8 +449,10 @@ readPackage src = case lexedErrors (L.lex src) of
 --------------------------------------------------------------------------------
 
 -- | what a build.hf says: app/X/main.hf is the program X, its computation
--- | `run` compiled by `backend` (`C`, `Node`, `Page`: "c", "node", "page")
-type Build = { backend : String, run : String }
+-- | `run` compiled by `backend` (`C`, `Node`, `Page`: "c", "node",
+-- | "page"); `ships`, the files and directories of the project's root
+-- | that `heff install` puts in the heff home with it, beside bin/
+type Build = { backend : String, run : String, ships : List String }
 
 backendOf : Lit -> Check String
 backendOf (LTag "C" t) = Right "c"
@@ -460,14 +462,50 @@ backendOf (LTag b t) =
   Left (problemAt t ("no backend " ++ b ++ ": C, Node or Page"))
 backendOf x = Left (problemAt (litTok x) "expected a backend: C, Node or Page")
 
-buildOf : Lit -> Check Build
-buildOf x = case fieldsAre ["backend", "run"] x of
+-- | what is wrong with a program shipping `n`, if anything: it is the
+-- | name of a file or a directory of the project's root (and, so, of the
+-- | heff home, where bin/ is the programs')
+shipWrong : String -> Maybe String
+shipWrong "bin" =
+  Just
+    "a program ships no `bin`: the heff home's bin/ is where the programs are"
+shipWrong n =
+  if strEq n ""
+  || strEq n "."
+  || strEq n ".."
+  || contains "/" n
+  || contains "\\" n
+    then Just
+        ("`"
+         ++ n
+         ++ "` is not a name: a program ships files and directories of the project's root, by their names")
+  else Nothing
+
+shippedOf : Lit -> Check String
+shippedOf x = case str x of
   Left p -> Left p
-  Right (Cons b (Cons r Nil)) -> case backendOf b of
+  Right n -> case shipWrong n of
+    Just why -> Left (problemAt (litTok x) why)
+    Nothing -> Right n
+
+shipsOf : Lit -> Check (List String)
+shipsOf x = case items x of
+  Left p -> Left p
+  Right xs -> allOf shippedOf xs
+
+buildOf3 : Lit -> Lit -> Lit -> Check Build
+buildOf3 b r s = case backendOf b of
+  Left p -> Left p
+  Right backend -> case str r of
     Left p -> Left p
-    Right backend -> case str r of
+    Right run -> case shipsOf s of
       Left p -> Left p
-      Right run -> Right { backend = backend, run = run }
+      Right ships -> Right { backend = backend, run = run, ships = ships }
+
+buildOf : Lit -> Check Build
+buildOf x = case fieldsAre ["backend", "run", "ships"] x of
+  Left p -> Left p
+  Right (Cons b (Cons r (Cons s Nil))) -> buildOf3 b r s
   Right _ -> Left (problemAt (litTok x) "expected a record `{...}`")
 
 -- | a build.hf's text, read
@@ -483,25 +521,39 @@ readBuild src = case lexedErrors (L.lex src) of
     Left p -> Left p
     Right x -> buildOf x
 
--- (what is wrong, said; or the backend and the computation run)
+-- (what is wrong, said; or the backend, the computation run and what is
+-- shipped)
 saidBuild : Check Build -> String
 saidBuild (Left p) = showInt p.at ++ ": " ++ p.msg
-saidBuild (Right a) = a.backend ++ " " ++ a.run
+saidBuild (Right a) =
+  a.backend ++ " " ++ a.run ++ joinWith "" (map (\n -> " " ++ n) a.ships)
 
--- >>> saidBuild (readBuild "import manifest\n\nbuild : Build\nbuild = { backend = C, run = \"main\" }\n")
+-- >>> saidBuild (readBuild "import manifest\n\nbuild : Build\nbuild = { backend = C, run = \"main\", ships = [] }\n")
 -- "c main"
 
--- >>> saidBuild (readBuild "build = { backend = Page, run = \"main\" }")
+-- >>> saidBuild (readBuild "build = { backend = C, run = \"main\", ships = [\"lib\", \"package.hf\"] }")
+-- "c main lib package.hf"
+
+-- >>> saidBuild (readBuild "build = { backend = Page, run = \"main\", ships = [] }")
 -- "page main"
 
--- >>> saidBuild (readBuild "build = { backend = Wasm, run = \"main\" }")
+-- >>> saidBuild (readBuild "build = { backend = Wasm, run = \"main\", ships = [] }")
 -- "20: no backend Wasm: C, Node or Page"
 
--- >>> saidBuild (readBuild "build = { backend = \"c\", run = \"main\" }")
+-- >>> saidBuild (readBuild "build = { backend = \"c\", run = \"main\", ships = [] }")
 -- "20: expected a backend: C, Node or Page"
 
--- >>> saidBuild (readBuild "build = { run = \"main\", backend = C }")
--- "8: the fields are backend, run, in this order"
+-- >>> saidBuild (readBuild "build = { run = \"main\", backend = C, ships = [] }")
+-- "8: the fields are backend, run, ships, in this order"
+
+-- >>> saidBuild (readBuild "build = { backend = C, run = \"main\" }")
+-- "8: the fields are backend, run, ships, in this order"
+
+-- >>> saidBuild (readBuild "build = { backend = C, run = \"main\", ships = [\"lib/std\"] }")
+-- "46: `lib/std` is not a name: a program ships files and directories of the project's root, by their names"
+
+-- >>> saidBuild (readBuild "build = { backend = C, run = \"main\", ships = [\"bin\"] }")
+-- "46: a program ships no `bin`: the heff home's bin/ is where the programs are"
 
 -- (what is wrong, said; or the module path)
 said : Check Package -> String

@@ -8,10 +8,12 @@ across the project.
 The server is a heff executable, run as `heff lsp --stdio`: the one
 `heff.serverPath` names, else the `heff` on the `PATH`, else the heff home's
 (`HEFF_HOME/bin/heff`, else `~/.heff/bin/heff`).  A release's `bin/heff` is
-one; so is the repository's `.heff/out/heff`, made by the build:
+one; so is the repository's `.heff/out/heff`, made by the build, and the
+heff home's, which it installs:
 
 ```sh
 node scripts/build.mjs     # at the repository's root
+.heff/out/heff install     # then: ~/.heff/bin/heff, with its lib/
 ```
 
 ## Running it from the repository

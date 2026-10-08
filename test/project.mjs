@@ -307,8 +307,10 @@ expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/li
 write("tool/package.hf", manifestOf("tool"));
 write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
 const program = (says) => "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print " + says + "\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n";
+const buildOf = (backend, ships = []) =>
+  `import manifest\n\nbuild : Build\nbuild = { backend = ${backend}, run = "main", ships = [${ships.map((n) => `"${n}"`).join(", ")}] }\n`;
 for (const [x, says] of [["tool", "greeting"], ["again", "(greeting ++ \", again\")"]]) {
-  write(`tool/app/${x}/build.hf`, "import manifest\n\nbuild : Build\nbuild = { backend = Node, run = \"main\" }\n");
+  write(`tool/app/${x}/build.hf`, buildOf("Node"));
   write(`tool/app/${x}/main.hf`, program(says));
 }
 const inTool = (...args) => spawnSync(heffBin, args, { cwd: join(work, "tool"), encoding: "utf8" });
@@ -324,7 +326,7 @@ const broken = inTool("build");
 expect("build: a module that does not check, nothing built", broken.status === 1 && broken.stderr.includes("src/tool/broken.hf") &&
   !existsSync(toolBin) && !existsSync(againBin), broken);
 rmSync(join(work, "tool", "src", "tool", "broken.hf"));
-write("tool/app/unread/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = Rust, run = \"main\" }\n");
+write("tool/app/unread/build.hf", buildOf("Rust"));
 write("tool/app/unread/main.hf", program("greeting"));
 const unread = inTool("build");
 expect("build: a build.hf that cannot be read, nothing built", unread.status === 1 && unread.stderr.includes("app/unread/build.hf") &&
@@ -342,10 +344,56 @@ expect("install: the programs, in the heff home's bin/", installed.status === 0 
   spawnSync(join(homeBin, "tool"), [], { encoding: "utf8" }).stdout === "hi from tool\n", installed);
 const onPath = install(`${homeBin}:${process.env.PATH}`);
 expect("install: its bin/ on the PATH", onPath.status === 0 && !onPath.stdout.includes("not on the PATH"), onPath);
+
+// install: what a program ships (its build.hf's `ships`), files and
+// directories of the project's root, put in the heff home beside bin/
+// (modes kept), in place of what was there: nothing of that left, nor of
+// the copy made beside it; one the project does not have, nothing built
+write("tool/share/greeting.txt", "hello\n");
+write("tool/share/old.txt", "old\n");
+write("tool/share/run.sh", "#!/bin/sh\necho run\n");
+chmodSync(join(work, "tool", "share", "run.sh"), 0o755);
+write("tool/NOTICE", "notice 1\n");
+write("tool/app/tool/build.hf", buildOf("Node", ["share", "NOTICE"]));
+write("tool/app/again/build.hf", buildOf("Node", ["share"]));
+const shipped = install(process.env.PATH);
+expect("install: what a program ships, beside bin/", shipped.status === 0 &&
+  shipped.stdout.includes(`installed ${join(home, "share")}\n`) && shipped.stdout.includes(`installed ${join(home, "NOTICE")}\n`) &&
+  shipped.stdout.split(`installed ${join(home, "share")}\n`).length === 2 &&
+  readFileSync(join(home, "share", "greeting.txt"), "utf8") === "hello\n" && readFileSync(join(home, "NOTICE"), "utf8") === "notice 1\n" &&
+  (statSync(join(home, "share", "run.sh")).mode & 0o111) !== 0, shipped);
+rmSync(join(work, "tool", "share", "old.txt"));
+write("tool/share/greeting.txt", "hello again\n");
+write("tool/NOTICE", "notice 2\n");
+const reshipped = install(process.env.PATH);
+expect("install again: what is shipped, in place of what was there", reshipped.status === 0 &&
+  readFileSync(join(home, "share", "greeting.txt"), "utf8") === "hello again\n" && !existsSync(join(home, "share", "old.txt")) &&
+  readFileSync(join(home, "NOTICE"), "utf8") === "notice 2\n" && readdirSync(home).sort().join(",") === "NOTICE,bin,share", [reshipped, readdirSync(home)]);
+write("tool/app/tool/build.hf", buildOf("Node", ["share", "nowhere"]));
+rmSync(homeBin, { recursive: true });
+const unshipped = install(process.env.PATH);
+expect("install: a program shipping what the project does not have, nothing installed", unshipped.status === 1 &&
+  unshipped.stderr.includes(`${join("tool", "app", "tool", "build.hf")}: it ships \`nowhere\`, which the project does not have`) &&
+  unshipped.stderr.includes("nothing built") && !existsSync(homeBin), unshipped);
 write("lib-only/package.hf", manifestOf("libonly"));
 write("lib-only/src/libonly/m.hf", "import prelude\n\nx : Int\nx = 1\n");
 const nothing = spawnSync(heffBin, ["install", "lib-only"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home } });
 expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("no programs"), nothing);
+
+// heff itself, installed: it ships its lib/ and its package.hf, so the
+// heff in the heff home finds its library and its version beside bin/,
+// as a release's does (no HEFF_LIB to find it by)
+const { HEFF_LIB: _lib, ...ownEnv } = process.env;
+const heffHome = join(work, "heff-home");
+const selfInstalled = spawnSync(heffBin, ["install"], { cwd: root, encoding: "utf8", env: { ...ownEnv, HEFF_HOME: heffHome } });
+const installedHeff = (...args) => spawnSync(join(heffHome, "bin", "heff"), args, { cwd: work, encoding: "utf8", env: ownEnv });
+write("uses-prelude.hf", "import prelude\n\nxs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n");
+const selfChecked = installedHeff("check", "uses-prelude.hf");
+const selfInit = installedHeff("init", "fromhome");
+expect("install heff: the heff in the heff home, with its library and its version", selfInstalled.status === 0 &&
+  selfInstalled.stdout.includes(`installed ${join(heffHome, "lib")}\n`) && selfInstalled.stdout.includes(`installed ${join(heffHome, "package.hf")}\n`) &&
+  selfChecked.status === 0 && selfChecked.stdout.includes("xs : List Int") &&
+  selfInit.status === 0 && readFileSync(join(work, "fromhome", "package.hf"), "utf8").includes(`heff = "${version}"`), [selfInstalled, selfChecked, selfInit]);
 
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

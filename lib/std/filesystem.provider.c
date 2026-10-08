@@ -126,6 +126,56 @@ static int heff_remove_all(const char *p) {
   return ok && rmdir(p) == 0;
 }
 
+// (a file's bytes copied to `q`, which is given `mode`)
+static int heff_copy_file(const char *p, const char *q, mode_t mode) {
+  FILE *f = fopen(p, "rb");
+  if (!f) return 0;
+  FILE *g = fopen(q, "wb");
+  if (!g) {
+    fclose(f);
+    return 0;
+  }
+  char *chunk = heff_alloc(65536);
+  size_t got;
+  int ok = 1;
+  while (ok && (got = fread(chunk, 1, 65536, f)) > 0) ok = fwrite(chunk, 1, got, g) == got;
+  ok = ok && !ferror(f);
+  free(chunk);
+  fclose(f);
+  ok = fclose(g) == 0 && ok;
+  return ok && chmod(q, mode) == 0;
+}
+
+// (a file, or a directory and all it holds, copied to `q`: links
+// followed, modes kept -- a directory's once what it holds is in it)
+static int heff_copy_all(const char *p, const char *q) {
+  struct stat st;
+  if (stat(p, &st) != 0) return 0;
+  mode_t mode = st.st_mode & 07777;
+  if (!S_ISDIR(st.st_mode)) return heff_copy_file(p, q, mode);
+  if (heff_mkdir(q) != 0) return 0;
+  DIR *d = opendir(p);
+  if (!d) return 0;
+  struct dirent *e;
+  int ok = 1;
+  while (ok && (e = readdir(d))) {
+    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+    char *a = heff_join(p, e->d_name);
+    char *b = heff_join(q, e->d_name);
+    ok = heff_copy_all(a, b);
+    free(a);
+    free(b);
+  }
+  closedir(d);
+  return ok && chmod(q, mode) == 0;
+}
+
+// (nothing is at `p`: no file, directory or link)
+static int heff_nothing_at(const char *p) {
+  struct stat st;
+  return lstat(p, &st) != 0 && errno == ENOENT;
+}
+
 static V heff_provider_fs(V p, V k) {
   char *path = heff_cstr(heff_field(p, 0));
   V x;
@@ -166,6 +216,24 @@ static V heff_provider_fs(V p, V k) {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
     x = heff_answer(f, heff_bool(heff_chmod_all(path, 0) == 1));
+    break;
+  }
+  case TAG_Copy: {
+    char *to = heff_cstr(heff_field(p, 1));
+    V f = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    int ok = heff_nothing_at(to) && heff_copy_all(path, to);
+    free(to);
+    x = heff_answer(f, heff_bool(ok));
+    break;
+  }
+  case TAG_Move: {
+    char *to = heff_cstr(heff_field(p, 1));
+    V f = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    int ok = heff_nothing_at(to) && rename(path, to) == 0;
+    free(to);
+    x = heff_answer(f, heff_bool(ok));
     break;
   }
   default:
