@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const run = (cmd, args) => spawnSync(cmd, args, { cwd: root, stdio: "inherit" }).status === 0;
+const run = (cmd, args, env = process.env) => spawnSync(cmd, args, { cwd: root, stdio: "inherit", env }).status === 0;
 
 if (!run(process.execPath, [join(root, "scripts", "build.mjs")])) process.exit(1);
 if (!run(process.execPath, [join(root, "test", "gen-fixpoint.mjs")])) {
@@ -19,6 +19,7 @@ if (!run(process.execPath, [join(root, "test", "gen-fixpoint.mjs")])) {
   process.exit(1);
 }
 // (`tar` with xz: libarchive's, on macOS and Windows; GNU's with xz, on
-// Linux)
-if (!run("tar", ["-cJf", join("boot", "heff.tar.xz"), "-C", join("output", "heff.d"), "."])) process.exit(1);
+// Linux.  macOS's would add a `._NAME` of each file's attributes)
+if (!run("tar", ["-cJf", join("boot", "heff.tar.xz"), "-C", join("output", "heff.d"), "."],
+  { ...process.env, COPYFILE_DISABLE: "1" })) process.exit(1);
 console.log("heff boot: boot/heff.tar.xz is the compiler, compiled by itself to C");

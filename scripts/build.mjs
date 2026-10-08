@@ -54,7 +54,7 @@ const toC = (compiler, dir) =>
 // kind, not only this one -- zig's default is this machine's processor,
 // whose instructions another may not have)
 const cc = (dir, to) => {
-  const files = readdirSync(dir).filter((f) => f.endsWith(".c")).map((f) => join(dir, f));
+  const files = readdirSync(dir).filter((f) => f.endsWith(".c") && !f.startsWith(".")).map((f) => join(dir, f));
   step("zig cc", "zig", ["cc", "-mcpu=baseline", "-O2", "-w", ...files, "-o", to, "-lm"]);
 };
 
