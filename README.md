@@ -234,8 +234,8 @@ becomes another's (`I8.fromInt (I32.toInt x)`); `float32`'s has
 `I.shiftL`, `I.shiftR`), as two's complement has them with the sign
 extended for ever; a shift right rounds down, and one by a negative
 count abandons.  A fixed-width type's operators, `+` to `>=`, are its
-module's too, for a module that imports it as it is and the prelude by a
-name.  A provider is given them as the backend keeps them: in
+module's too, for a module that imports it as it is: the prelude's,
+which it has without writing it, give way to them.  A provider is given them as the backend keeps them: in
 JavaScript an `Int`, an `Int64` and a `UInt64` are BigInts, any other
 number a number; in C an integer of up to 32 bits is a word of its value
 (`INT_OF`), one of 64 bits is kept as an `Int` is, a `Float32` is a word
@@ -274,7 +274,10 @@ says where it is, else it is the `lib/` the compiler came with: the
 repository's, a release's, or the heff home's (`heff install` puts it
 there).  Every module imports `builtin` and `prelude` without writing
 them, and `list` as `List`, the operations of lists (`List.map`,
-`List.length`) -- but those they are made of.  Its other modules are
+`List.length`) -- but those they are made of.  A name is the module's
+own definition's, else an import's it writes, else one of those it has
+without writing them; two imports written that have it are an error
+only where it is used unqualified.  Its other modules are
 imported by their names: `co`, `state`, `exn`, `parallel`, `array`,
 `map`, `set`, and `manifest` (the types of `package.hf` and
 `build.hf`); the fixed-width numbers' are `int8` to `int64`, `uint8` to
