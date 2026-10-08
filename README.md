@@ -61,7 +61,7 @@ heff build                     # the whole project: every module of src/
                                # built to .heff/bin/
 heff install [DIR]             # the project at DIR built, its programs put in
                                # ~/.heff/bin/ (HEFF_HOME/bin/)
-heff init [DIR]                # a new project
+heff init [DIR]                # a new project: a module, a program, a test
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
 heff lsp                       # the language server, on stdio

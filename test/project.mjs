@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Projects (src/heff/project.hf, src/heff/load.hf): `heff init` makes one
-// whose watches hold; a project's modules are under src/, a file outside
-// it (a test) may import the project's modules and helpers beside it,
-// what is in src/ may not import those; a module found twice, a
-// package.hf that does not read and one for another heff are errors.
+// that builds, its watches and tests holding; a project's modules are
+// under src/, a file outside it (a test) may import the project's
+// modules and helpers beside it, what is in src/ may not import those; a
+// module found twice, a package.hf that does not read and one for
+// another heff are errors.
 // Packages: given by directories, fetched by `heff get` (git, MVS,
 // heff.sum), published by `heff publish`.
 import { spawnSync } from "node:child_process";
@@ -24,27 +25,36 @@ const version = /heff = "([^"]*)"/.exec(readFileSync(join(root, "package.hf"), "
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}: ${JSON.stringify(got)}`); } };
 
-// init: package.hf (for this heff), .gitignore, src/hello/main.hf, whose
-// watch holds; again, nothing is written
+// init: package.hf (for this heff), .gitignore, a module
+// (src/hello/greeting.hf) whose watch holds, the program hello using it
+// (app/hello/), built, and a test of it (test/greeting.hf) that holds;
+// again, nothing is written
 const made = heff("init", "hello");
 const pkg = readFileSync(join(work, "hello", "package.hf"), "utf8");
+const inited = ["package.hf", "src/hello/greeting.hf", "app/hello/main.hf", "app/hello/build.hf", "test/greeting.hf"];
 expect("init", made.status === 0 && pkg.includes(`heff = "${version}"`) && pkg.includes(`module = "hello"`) &&
-  readFileSync(join(work, "hello", ".gitignore"), "utf8") === ".heff/\n", made);
-const laid = heff("fmt", "--check", "hello/package.hf", "hello/src/hello/main.hf");
+  readFileSync(join(work, "hello", ".gitignore"), "utf8") === ".heff/\n" && inited.every((f) => existsSync(join(work, "hello", f))), made);
+const laid = heff("fmt", "--check", ...inited.map((f) => `hello/${f}`));
 expect("init's files are laid out", laid.status === 0, laid);
-const tested = heff("test", "hello/src/hello/main.hf");
-expect("init's main.hf", tested.status === 0 && tested.stdout.includes("1/1 expectations hold"), tested);
+const tested = heff("test", "hello/src/hello/greeting.hf");
+expect("init's module", tested.status === 0 && tested.stdout.includes("1/1 expectations hold"), tested);
+const initTests = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
+expect("init's test", initTests.status === 0 && initTests.stdout.includes("1/1 tests hold"), initTests);
+const initBuilt = spawnSync(heffBin, ["build"], { cwd: join(work, "hello"), encoding: "utf8" });
+expect("init's program, built", initBuilt.status === 0 && initBuilt.stdout.includes("wrote .heff/bin/hello") &&
+  spawnSync(join(work, "hello", ".heff", "bin", "hello"), [], { encoding: "utf8" }).stdout === "Hello, world!\n", initBuilt);
 // (with no file: the project's test/, run where it is; a file in a
 // directory starting with `.` or in a project of its own passed over;
 // nothing outside test/, and no test/, nothing to test)
-write("hello/test/greeting.hf", "import hello.main\nimport prelude\n\n-- >>> greeting \"test\"\n-- \"Hello, test!\"\n");
+write("hello/test/watch.hf", "import hello.greeting\nimport prelude\n\n-- >>> greeting \"watch\"\n-- \"Hello, watch!\"\n");
 write("hello/test/.hidden/no.hf", "x : Int\nx = \n");
 write("hello/test/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
 write("hello/test/vendor/other/no.hf", "x : Int\nx = \n");
 write("hello/elsewhere/no.hf", "x : Int\nx = \n");
 const inHello = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
 expect("test with no file: the project's test/", inHello.status === 0 && inHello.stdout.includes("test/greeting.hf") &&
-  !inHello.stdout.includes("src/hello/main.hf") && !inHello.stdout.includes("no.hf") && inHello.stdout.includes("1/1 expectations hold"), inHello);
+  inHello.stdout.includes("test/watch.hf") && !inHello.stdout.includes("src/hello/greeting.hf") && !inHello.stdout.includes("no.hf") &&
+  inHello.stdout.includes("1/1 expectations hold, 1/1 tests hold"), inHello);
 rmSync(join(work, "hello", "test"), { recursive: true });
 rmSync(join(work, "hello", "elsewhere"), { recursive: true });
 const noTests = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
