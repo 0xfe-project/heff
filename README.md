@@ -277,13 +277,14 @@ main = program (io := \p -> InL p) (disk := \p -> InR p)
 says where it is, else it is the `lib/` the compiler came with: the
 repository's, a release's, or the heff home's (`heff install` puts it
 there).  Every module imports `builtin` and `prelude` without writing
-them (but those the two are made of); its other modules are imported by
-their names: `co`, `state`, `exn`, `parallel`, `array`, `map`, `set`,
-and `manifest` (the types of `package.hf` and `build.hf`); the
-fixed-width numbers' are `int8` to `int64`, `uint8` to `uint64` and
-`float32`, and `int` has an `Int`'s bits.  The batteries ship with it,
-under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
-`std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
+them, and `list` as `List`, the operations of lists (`List.map`,
+`List.length`) -- but those they are made of.  Its other modules are
+imported by their names: `co`, `state`, `exn`, `parallel`, `array`,
+`map`, `set`, and `manifest` (the types of `package.hf` and
+`build.hf`); the fixed-width numbers' are `int8` to `int64`, `uint8` to
+`uint64` and `float32`, and `int` has an `Int`'s bits.  The batteries
+ship with it, under `lib/std/`: `std.io` (the standard streams),
+`std.filesystem`, `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one
 effect hands out and another takes), `std.path`, `std.cli` (command
 lines), `std.doc` (documents laid out), `std.progress` (what a

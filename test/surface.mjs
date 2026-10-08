@@ -53,7 +53,8 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   writeFileSync(join(lib, "core.hf"), "yes : Bool\nyes = True\n");
   writeFileSync(join(lib, "prelude.hf"), "import core\n\nno : Bool\nno = False\n\nboth : List Bool\nboth = [yes, no]\n");
   writeFileSync(join(lib, "other.hf"), "noes : List Bool\nnoes = [no, no]\n");
-  writeFileSync(join(dir, "use.hf"), "import other\n\n-- >>> both\n-- Cons True (Cons False Nil)\n\n-- >>> noes\n-- Cons False (Cons False Nil)\n");
+  writeFileSync(join(lib, "list.hf"), "none : List Bool\nnone = []\n");
+  writeFileSync(join(dir, "use.hf"), "import other\n\n-- >>> both\n-- Cons True (Cons False Nil)\n\n-- >>> noes\n-- Cons False (Cons False Nil)\n\n-- >>> List.none\n-- Nil\n");
   const inLib = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", env: { ...process.env, HEFF_LIB: lib } });
   const used = inLib("test", "use.hf");
   const core = inLib("check", join(lib, "core.hf"));

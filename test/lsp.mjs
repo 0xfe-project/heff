@@ -136,6 +136,18 @@ try {
   const uDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "map") });
   expect("definition of a prelude name, not imported", uDef.result && uDef.result.uri === uri("lib/prelude.hf") && uDef.result.range.start.line === pos(disk("lib/prelude.hf"), "map :").line, uDef.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") } });
+  // the operations of lists, by the name `List`, written by no import:
+  // completed after `List.`, hovered, gone to
+  const listed = "xs : List Int\nxs = List.map (\\x -> x + 1) [1]\n\nn : Int\nn = List.len";
+  open("test/surface/lsp-list.hf", listed);
+  await diagnosticsOf(uri("test/surface/lsp-list.hf"));
+  const lComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-list.hf") }, position: { line: 4, character: 12 } });
+  expect("completion after `List.`", lComp.result && lComp.result.some((i) => i.label === "length" && i.detail.includes("List a -> Int")) && lComp.result.every((i) => !i.label.includes(".")), lComp.result && lComp.result.map((i) => i.label));
+  const lHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-list.hf") }, position: pos(listed, "map") });
+  expect("hover on `List.map`", lHover.result && lHover.result.contents.value.includes("map : {a b : Type} -> (a -> b) -> List a -> List b"), lHover.result);
+  const lDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-list.hf") }, position: pos(listed, "map") });
+  expect("definition of `List.map`", lDef.result && lDef.result.uri === uri("lib/list.hf") && lDef.result.range.start.line === pos(disk("lib/list.hf"), "map :").line, lDef.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-list.hf") } });
   const dotted = "import a as A\n\nx : A.Bool\nx = A.";
   open("test/modules/lsp-dot.hf", dotted);
   await diagnosticsOf(uri("test/modules/lsp-dot.hf"));
