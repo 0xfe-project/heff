@@ -1223,9 +1223,12 @@ armLines : CK
 armLines r ce dest sv held lent (MkArm t vs b) =
   armFv r (knowing held (List.length vs) ce) dest sv held lent t vs b (fvE b)
 
+nomatchStmt : Dest -> String -> String
+nomatchStmt Ret sv = "return heff_nomatch(" ^ sv ^ ");"
+nomatchStmt (Asg _) sv = "heff_nomatch(" ^ sv ^ ");"
+
 nomatchLine : Dest -> String -> String
-nomatchLine Ret sv = "default: return heff_nomatch(" ^ sv ^ ");"
-nomatchLine (Asg _) sv = "default: heff_nomatch(" ^ sv ^ ");"
+nomatchLine dest sv = "default: " ^ nomatchStmt dest sv
 
 -- (the variable a match looks at, if it holds a reference to it)
 heldVar : CE -> I.Expr -> Maybe String
@@ -1273,6 +1276,155 @@ knownLet : String -> Maybe Known -> CE -> CE
 knownLet x Nothing ce = ce
 knownLet x (Just k) ce = withKnown x k ce
 
+-- Conditions
+--------------------------------------------------------------------------------
+
+-- A comparison whose Bool is only looked at -- `let t = a < b in case t
+-- of True -> ..; False -> ..`, as `if`, `&&`, `||` and an equation
+-- matching a Bool are lowered -- is C's condition: the runtime's of it,
+-- an `int` (`heff_intLt_c`, lib/c/runtime.c), tested by `if`: no Bool
+-- made, nor taken apart again (`heff_tag_of`).
+
+-- (the comparisons the runtime has a condition of: `Int`'s, `Float`'s,
+-- `String`'s, and the fixed-width types')
+condPrims : List String
+condPrims =
+  ["intEq", "intLt", "intLe", "floatEq", "floatLt", "floatLe", "strEq", "strLt"]
+
+relOp : Fx.FixedOp -> Bool
+relOp OpEq = True
+relOp OpLt = True
+relOp OpLe = True
+relOp _ = False
+
+relFixed : Maybe Fx.FixedPrim -> Bool
+relFixed (Just p) = relOp p.op
+relFixed Nothing = False
+
+isCondPrim : String -> Bool
+isCondPrim p = elemS p condPrims || relFixed (Fx.fixedPrimOf p)
+
+-- (an arm of a match on a Bool)
+boolArm : I.Arm -> Bool
+boolArm (MkArm t vs _) = List.null vs && (strEq t "True" || strEq t "False")
+
+isVarOf : String -> I.Expr -> Bool
+isVarOf x (EVar y) = strEq x y
+isVarOf x _ = False
+
+-- | a comparison, and the arms of the match on its Bool
+type Cond = { prim : String, args : List I.Expr, arms : List I.Arm }
+
+-- (`x` bound to the comparison `p`, looked at by the match and wanted by
+-- none of its arms)
+condOn : String -> String -> List I.Expr -> I.Expr -> List I.Arm -> Maybe Cond
+condOn x p as s arms =
+  if isCondPrim p
+  && isVarOf x s
+  && List.all boolArm arms
+  && not (elemS x (fvList (List.map I.armBody arms)))
+    then Just { prim = p, args = as, arms = arms }
+  else Nothing
+
+condMatch : String -> String -> List I.Expr -> I.Expr -> Maybe Cond
+condMatch x p as (EMatch s arms) = condOn x p as s arms
+condMatch x p as b = Nothing
+
+-- | `let x = a in b`, where it is a condition
+condLet : String -> I.Expr -> I.Expr -> Maybe Cond
+condLet x (EPrimCall p as) b = condMatch x p as b
+condLet x a b = Nothing
+
+isCondCall : I.Expr -> Bool
+isCondCall (EPrimCall p _) = isCondPrim p
+isCondCall _ = False
+
+isMatchOn : String -> I.Expr -> Bool
+isMatchOn x (EMatch s _) = isVarOf x s
+isMatchOn x _ = False
+
+-- (`let x = a in let y = case x of .. in e`, `a` a comparison and `x`
+-- not wanted in `e`, as `let y = (let x = a in case x of ..) in e`: the
+-- match, bound, a condition where it is bound)
+sunkGo : String -> I.Expr -> I.Expr -> Maybe I.Expr
+sunkGo x a (ELet y m e) =
+  if isMatchOn x m && not (elemS x (fvE e)) then Just (ELet y (ELet x a m) e)
+  else Nothing
+sunkGo x a b = Nothing
+
+sunk : String -> I.Expr -> I.Expr -> Maybe I.Expr
+sunk x a b = if isCondCall a then sunkGo x a b else Nothing
+
+armFor : String -> List I.Arm -> Maybe I.Expr
+armFor t Nil = Nothing
+armFor t (Cons (MkArm u _ b) rest) = if strEq t u then Just b else armFor t rest
+
+indented : List String -> List String
+indented ls = List.map (\l -> "  " ^ l) ls
+
+-- (an arm of a condition: what is held and wanted neither by it nor
+-- after it dropped first, as a match's arm drops it; where there is no
+-- arm, as where no arm matches)
+condArm : CK -> CE -> Dest -> String -> Maybe I.Expr -> C (List String)
+condArm r ce dest t (Just b) = do
+  body <-
+    r.stmts
+      (withPath (deadKept ce.owned (unionS (fvE b) ce.after)) ce.after ce)
+      dest
+      b
+  pure
+      (List.append
+         (dropsIn ce (deadIn ce.owned (unionS (fvE b) ce.after)))
+         body)
+condArm r ce dest t Nothing =
+  pure (Cons (nomatchStmt dest ("NTAG(" ^ tagName t ^ ")")) Nil)
+
+-- (`fa` what the comparison wants, `wb` what its arms and what comes
+-- after want, as `letWith` reckons them: the comparison's operands, then
+-- the test, then each arm)
+condWith : CK
+         -> CE
+         -> Dest
+         -> Cond
+         -> List String
+         -> List String
+         -> C (List String)
+condWith r ce dest c fa wb = do
+  vs <-
+    operandsF r (withPath (deadKept ce.owned (unionS fa wb)) wb ce) wb c.args
+  yes <-
+    condArm
+      r
+      (withPath (deadKept ce.owned wb) ce.after ce)
+      dest
+      "True"
+      (armFor "True" c.arms)
+  no <-
+    condArm
+      r
+      (withPath (deadKept ce.owned wb) ce.after ce)
+      dest
+      "False"
+      (armFor "False" c.arms)
+  pure
+      (List.append
+         (dropsIn ce (deadIn ce.owned (unionS fa wb)))
+         (Cons
+            ("if (" ^ primName c.prim ^ "_c(" ^ joinWith ", " vs ^ ")) {")
+            (List.append
+               (indented yes)
+               (Cons "} else {" (List.append (indented no) (Cons "}" Nil))))))
+
+condLines : CK -> CE -> Dest -> Cond -> C (List String)
+condLines r ce dest c =
+  condWith
+    r
+    ce
+    dest
+    c
+    (fvList c.args)
+    (unionS (fvList (List.map I.armBody c.arms)) ce.after)
+
 -- (`let x = a in b`: what is held and wanted neither by `a` nor after it
 -- dropped first; then `a`, wanted after it what `b` and what comes after
 -- want; then `x`, dropped if nothing wants it)
@@ -1309,9 +1461,31 @@ letWith r ce dest x a b fa wb = do
                 else dropsIn (knownLet x (builtOf a) ce) (Cons x Nil))
                rest)))
 
-letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
-letLines r ce dest x a b =
+letOrSunk : CK
+          -> CE
+          -> Dest
+          -> String
+          -> I.Expr
+          -> I.Expr
+          -> Maybe I.Expr
+          -> C (List String)
+letOrSunk r ce dest x a b (Just e) = r.stmts ce dest e
+letOrSunk r ce dest x a b Nothing =
   letWith r ce dest x a b (fvE a) (unionS (fvE b) ce.after)
+
+letOrCond : CK
+          -> CE
+          -> Dest
+          -> String
+          -> I.Expr
+          -> I.Expr
+          -> Maybe Cond
+          -> C (List String)
+letOrCond r ce dest x a b (Just c) = condLines r ce dest c
+letOrCond r ce dest x a b Nothing = letOrSunk r ce dest x a b (sunk x a b)
+
+letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
+letLines r ce dest x a b = letOrCond r ce dest x a b (condLet x a b)
 
 stmtsF : CK -> CE -> Dest -> I.Expr -> C (List String)
 stmtsF r ce dest (ELet x a b) = letLines r ce dest x a b

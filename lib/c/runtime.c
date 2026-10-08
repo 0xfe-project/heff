@@ -772,9 +772,10 @@ HEFF_FAST V heff_intMod(V a, V b) {
   return heff_intMod_big(a, b);
 }
 
-// A comparison, as C's condition (`heff_intLt_c`) and as its Bool.
-// Words are in the order of their integers, and equal as they are; a
-// word and a big one are never equal.
+// A comparison, as C's condition (`heff_intLt_c`, what the emitter
+// tests where its Bool is only looked at) and as its Bool.  Words are
+// in the order of their integers, and equal as they are; a word and a
+// big one are never equal.
 #define INT_CMP(name, op, cmp)                                          \
   INT_BIG(int, name##_c, num_cmp(&x, &y) cmp)                           \
   HEFF_FAST int name##_c(V a, V b) {                                    \
@@ -1103,19 +1104,23 @@ static int heff_str_cmp(V a, V b) {
   return x->len == y->len ? 0 : x->len < y->len ? -1 : 1;
 }
 
-static V heff_strEq(V a, V b) {
-  int c = heff_str_cmp(a, b);
+// (as C's condition, and as a Bool: see `INT_CMP`)
+static int heff_strEq_c(V a, V b) {
+  Str *x = (Str *)a, *y = (Str *)b;
+  int c = x == y || (x->len == y->len && memcmp(x->s, y->s, x->len * sizeof(uint16_t)) == 0);
   heff_drop(a);
   heff_drop(b);
-  return heff_bool(c == 0);
+  return c;
 }
+static inline V heff_strEq(V a, V b) { return heff_bool(heff_strEq_c(a, b)); }
 
-static V heff_strLt(V a, V b) {
+static int heff_strLt_c(V a, V b) {
   int c = heff_str_cmp(a, b);
   heff_drop(a);
   heff_drop(b);
-  return heff_bool(c < 0);
+  return c < 0;
 }
+static inline V heff_strLt(V a, V b) { return heff_bool(heff_strLt_c(a, b)); }
 
 static V heff_strCharCode(V a, V i) {
   Str *x = (Str *)a;
@@ -1159,9 +1164,14 @@ FLT2(heff_floatAdd, heff_flt(x + y))
 FLT2(heff_floatSub, heff_flt(x - y))
 FLT2(heff_floatMul, heff_flt(x * y))
 FLT2(heff_floatDiv, heff_flt(x / y))
-FLT2(heff_floatEq, heff_bool(x == y))
-FLT2(heff_floatLt, heff_bool(x < y))
-FLT2(heff_floatLe, heff_bool(x <= y))
+// (as C's condition, and as a Bool: see `INT_CMP`)
+#define FLT_CMP(name, op)                                                   \
+  static inline int name##_c(V a, V b) {                                    \
+    double x = FLT_OF(a), y = FLT_OF(b); heff_drop(a); heff_drop(b); return x op y; } \
+  static inline V name(V a, V b) { return heff_bool(name##_c(a, b)); }
+FLT_CMP(heff_floatEq, ==)
+FLT_CMP(heff_floatLt, <)
+FLT_CMP(heff_floatLe, <=)
 static V heff_floatFromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_flt(d); }
 static V heff_floatSqrt(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(sqrt(x)); }
 
@@ -1317,12 +1327,15 @@ static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
     if (y == 0) return heff_abandon();                                               \
     if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T(0);                            \
     return fx_mk_##T((uint64_t)(x % y)); }                                           \
-  static V heff_##name##Eq(V a, V b) {                                               \
-    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return heff_bool(x == y); }       \
-  static V heff_##name##Lt(V a, V b) {                                               \
-    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return heff_bool(x < y); }        \
-  static V heff_##name##Le(V a, V b) {                                               \
-    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return heff_bool(x <= y); }       \
+  static inline int heff_##name##Eq_c(V a, V b) {                                   \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return x == y; }                  \
+  static inline int heff_##name##Lt_c(V a, V b) {                                   \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return x < y; }                   \
+  static inline int heff_##name##Le_c(V a, V b) {                                   \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return x <= y; }                  \
+  static inline V heff_##name##Eq(V a, V b) { return heff_bool(heff_##name##Eq_c(a, b)); } \
+  static inline V heff_##name##Lt(V a, V b) { return heff_bool(heff_##name##Lt_c(a, b)); } \
+  static inline V heff_##name##Le(V a, V b) { return heff_bool(heff_##name##Le_c(a, b)); } \
   static V heff_##name##And(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x & y); }       \
   static V heff_##name##Or(V a, V b) {                                               \
@@ -1354,9 +1367,12 @@ F32_2(Add, heff_f32(x + y))
 F32_2(Sub, heff_f32(x - y))
 F32_2(Mul, heff_f32(x * y))
 F32_2(Div, heff_f32(x / y))
-F32_2(Eq, heff_bool(x == y))
-F32_2(Lt, heff_bool(x < y))
-F32_2(Le, heff_bool(x <= y))
+#define F32_CMP(name, op)                                                                  \
+  static inline int heff_float32##name##_c(V a, V b) { return heff_f32_of(a) op heff_f32_of(b); } \
+  static inline V heff_float32##name(V a, V b) { return heff_bool(heff_float32##name##_c(a, b)); }
+F32_CMP(Eq, ==)
+F32_CMP(Lt, <)
+F32_CMP(Le, <=)
 static V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
 
 // (the fewest digits that read back as the same `Float32`, read as a float
