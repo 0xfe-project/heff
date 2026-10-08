@@ -334,7 +334,8 @@ try {
   open("test/modules/src/a.hf", a);
   await diagnosticsOf(uri("test/modules/src/a.hf"));
   const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: false } })).result || [];
-  const watched = "test/modules/lsp-watched.hf";
+  // (in app/, where test/golden.mjs, run at the same time, looks for no file)
+  const watched = "test/modules/app/lsp-watched.hf";
   expect("before a file is made", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
   writeFileSync(join(root, watched), "import a\n\ny : Bool\ny = not True\n");
   notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 1 }] });
