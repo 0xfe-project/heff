@@ -9,8 +9,11 @@ import { root } from "./heff.mjs";
 
 // | a process run to its end: `{ status, signal, stdout, stderr }`, as
 // | spawnSync answers (a timeout kills it, `signal` then set; one that
-// | cannot be run, `error` set); its standard input `input`, then closed
-export const run = (cmd, args, { cwd = root, timeout = 600000, env = process.env, input } = {}) =>
+// | cannot be run, `error` set); its standard input `input`, then closed;
+// | of each of its outputs what comes before `keep` characters, the rest
+// | let go (a process that says the same thing over and over, endlessly,
+// | is not held whole)
+export const run = (cmd, args, { cwd = root, timeout = 600000, env = process.env, input, keep = Infinity } = {}) =>
   new Promise((resolve) => {
     const p = spawn(cmd, args, { cwd, env });
     p.stdin.on("error", () => {});
@@ -18,8 +21,8 @@ export const run = (cmd, args, { cwd = root, timeout = 600000, env = process.env
     let stdout = "", stderr = "";
     p.stdout.setEncoding("utf8");
     p.stderr.setEncoding("utf8");
-    p.stdout.on("data", (d) => { stdout += d; });
-    p.stderr.on("data", (d) => { stderr += d; });
+    p.stdout.on("data", (d) => { if (stdout.length < keep) stdout += d; });
+    p.stderr.on("data", (d) => { if (stderr.length < keep) stderr += d; });
     const timer = setTimeout(() => p.kill("SIGKILL"), timeout);
     p.on("error", (error) => { clearTimeout(timer); resolve({ status: null, signal: null, stdout, stderr, error }); });
     p.on("close", (status, signal) => { clearTimeout(timer); resolve({ status, signal, stdout, stderr }); });
