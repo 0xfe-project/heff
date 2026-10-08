@@ -3,7 +3,8 @@
 --
 --   a definition of n parameters  ~>  a C function of n parameters
 --            (`g_K`), and a closure of it (`g_K_clo`) where it is a value;
---            a call of itself last, a loop (`goto top`)
+--            a call of itself last, a loop (`goto top`); of another
+--            of n parameters, a jump (`HEFF_LAST`: clang's `musttail`)
 --   a definition that is not a function  ~>  computed when first used
 --            (`g_K_get`)
 --   a lambda  ~>  a C function of its own (`lam_N`), what it mentions
@@ -14,7 +15,9 @@
 --   a string  ~>  a static object, its UTF-16 code units
 --   a call last of an unknown function  ~>  `heff_tail` (counted, a
 --            bounce every so often); a call not last, its value through
---            `heff_tr` -- as src/heff/emit.hf does (`Em.bouncing`)
+--            `heff_tr` -- as src/heff/emit.hf does (`Em.bouncing`).  From
+--            a lambda, a jump where the function is a closure taking
+--            the arguments given, and the lambda took as many (`inPlace`)
 --
 -- A program is one file: the runtime, the providers of its worlds
 -- (`M.provider.c`), and its code; its entry is heff.lower's `entryKey`,
@@ -180,13 +183,15 @@ data Known = KnownTag Int | KnownCell Int
 -- (`owned`: the variables this code holds a reference to, to consume or
 -- drop; `after`: those wanted after what is being emitted, by what
 -- comes after it -- see "Reference counts"; `known`: what some of them
--- are known to be)
+-- are known to be; `lam`: in a lambda's body, how many parameters it
+-- takes, else 0 -- see `inPlace`)
 type CE =
   { tags : M.Map String Int
   , lbls : M.Map String Int
   , funs : M.Map String Int
   , bounce : M.Map String Unit
   , self : Maybe Self
+  , lam : Int
   , owned : List String
   , after : List String
   , borrowed : List String
@@ -194,13 +199,15 @@ type CE =
   , known : M.Map String Known
   }
 
-withSelf : Maybe Self -> CE -> CE
-withSelf s ce =
+-- (the code of a definition (`s`) or of a lambda of `n` parameters)
+withFrame : Maybe Self -> Int -> CE -> CE
+withFrame s n ce =
   { tags = ce.tags
   , lbls = ce.lbls
   , funs = ce.funs
   , bounce = ce.bounce
   , self = s
+  , lam = n
   , owned = ce.owned
   , after = ce.after
   , borrowed = ce.borrowed
@@ -215,6 +222,7 @@ withPath owned after ce =
   , funs = ce.funs
   , bounce = ce.bounce
   , self = ce.self
+  , lam = ce.lam
   , owned = owned
   , after = after
   , borrowed = ce.borrowed
@@ -230,6 +238,7 @@ withBorrowed bs ce =
   , funs = ce.funs
   , bounce = ce.bounce
   , self = ce.self
+  , lam = ce.lam
   , owned = ce.owned
   , after = ce.after
   , borrowed = bs
@@ -244,6 +253,7 @@ withKnown x k ce =
   , funs = ce.funs
   , bounce = ce.bounce
   , self = ce.self
+  , lam = ce.lam
   , owned = ce.owned
   , after = ce.after
   , borrowed = ce.borrowed
@@ -648,7 +658,7 @@ lamBody r ce xs b fv =
     (withPath
        (deadKept (concatList xs fv) (fvE b))
        Nil
-       (withBorrowed Nil (withSelf Nothing ce)))
+       (withBorrowed Nil (withFrame Nothing (length xs) ce)))
     Ret
     b
 
@@ -838,6 +848,43 @@ again ce vs = case ce.self of
             (range 0 (length vs - 1)))
          (Cons "goto top;" Nil))
   Nothing -> Nil
+
+arityIs : Int -> Maybe Int -> Bool
+arityIs n (Just m) = n == m
+arityIs n Nothing = False
+
+agreesWith : Maybe Self -> Maybe Int -> Int -> Bool
+agreesWith (Just s) m n = length s.params == n && arityIs n m
+agreesWith Nothing m n = False
+
+-- (a call last of `g`, from a definition taking as many parameters as
+-- `g` does: their C functions' types the same, the call a jump
+-- (`HEFF_LAST`, lib/c/runtime.c))
+agrees : CE -> String -> List I.Expr -> Bool
+agrees ce g as =
+  agreesWith ce.self (M.lookup compareString g ce.funs) (length as)
+
+-- (a call last of an unknown function, from a lambda taking at least as
+-- many arguments: the function, then its arguments, put where the
+-- lambda's were -- read already, and its caller's, neither its own frame
+-- nor its closure, which `heff_clo_take` may have freed -- and a
+-- closure taking exactly those called by a jump (`heff_exact`,
+-- `HEFF_LAST`), its C function's type the lambda's (`Fn`).  Anything
+-- else, as any call last of an unknown function: `heff_tail`, counted)
+inPlace : List String -> List String
+inPlace vs =
+  concatList
+    (Cons ("V f_ = " ++ fromMaybe "0" (head vs) ++ ";") Nil)
+    (concatList
+       (zipWith
+          (\v i -> "args[" ++ showInt i ++ "] = " ++ v ++ ";")
+          (drop 1 vs)
+          (range 0 (length vs - 2)))
+       [ "if (heff_exact(f_, "
+       ++ showInt (length vs - 1)
+       ++ ", args)) HEFF_LAST return ((Clo *)f_)->fn(f_, args);"
+       , "return heff_tail(f_, " ++ showInt (length vs - 1) ++ ", args);"
+       ])
 
 -- (the scrutinee, a variable held, given up on an arm that does not want
 -- it and has fields: `fb` what the arm wants)
@@ -1200,20 +1247,29 @@ stmtsF r ce dest (EMatch s arms) = do
 stmtsF r ce Ret (EApp f as) = do
   vs <- operandsF r ce Nil (Cons f as)
   pure
-      (Cons
-         ("return heff_tail("
-          ++ fromMaybe "0" (head vs)
-          ++ ", "
-          ++ showInt (length as)
-          ++ ", "
-          ++ argsArr (drop 1 vs)
-          ++ ");")
-         Nil)
+      (if 0 < length as && length as <= ce.lam then inPlace vs
+       else Cons
+           ("return heff_tail("
+            ++ fromMaybe "0" (head vs)
+            ++ ", "
+            ++ showInt (length as)
+            ++ ", "
+            ++ argsArr (drop 1 vs)
+            ++ ");")
+           Nil)
 stmtsF r ce Ret (ECall g as) = do
   ls <- lentOperands r ce Nil (borOf ce.bor g) 0 as
   pure
       (if isSelfCall ce g as && lentPlain ls
          then again ce (map (\(l : Lent) -> l.arg) ls)
+       else if agrees ce g as && lentPlain ls
+         then Cons
+             ("HEFF_LAST return "
+              ++ cGlobal g
+              ++ "("
+              ++ joinWith ", " (map (\(l : Lent) -> l.arg) ls)
+              ++ ");")
+             Nil
        else Cons ("return " ++ callText g False ls ++ ";") Nil)
 stmtsF r ce Ret e = do
   v <- r.comp ce Nil e
@@ -1274,7 +1330,7 @@ funDef ce d xs b = do
          Nil
          (withBorrowed
             (paramsAt True (borOf ce.bor d.key) xs)
-            (withSelf (Just { key = d.key, params = xs }) ce)))
+            (withFrame (Just { key = d.key, params = xs }) 0 ce)))
       Ret
       b
   pure
@@ -1312,7 +1368,7 @@ funDef ce d xs b = do
 
 valDef : CE -> I.Def -> C Emitted1
 valDef ce d = do
-  body <- ck.stmts (withPath Nil Nil (withSelf Nothing ce)) Ret d.body
+  body <- ck.stmts (withPath Nil Nil (withFrame Nothing 0 ce)) Ret d.body
   pure
       { protos = Cons ("static V " ++ cGlobal d.key ++ "_get(void);") Nil
       , code =
@@ -1789,6 +1845,7 @@ ceOf provs defs names =
   , funs = foldl arityOne M.empty defs
   , bounce = Em.bouncing defs
   , self = Nothing
+  , lam = 0
   , owned = Nil
   , after = Nil
   , borrowed = Nil

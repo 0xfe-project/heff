@@ -22,7 +22,8 @@
 // own with a large stack, as the Node.js backend's does.  A call last of an unknown
 // function counts itself and every so often gives back a bounce (`K_BNC`),
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
-// backend does (src/heff/emit.hf, "Tail calls").
+// backend does (src/heff/emit.hf, "Tail calls") -- unless it is a jump
+// (`HEFF_LAST`), from a lambda to a closure of as many parameters.
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -57,6 +58,20 @@ extern char **environ;
 #endif
 
 typedef uintptr_t V;
+
+// (a call last whose callee takes what its caller takes -- the same
+// parameters, the same result -- made a jump, the caller's frame let go
+// of: clang's `musttail`, on the processors it always does it for
+// (`HEFF_JUMPS`).  Elsewhere, or with `-DHEFF_NO_JUMPS`, a call, which
+// a C compiler may still make a jump: a call of what is not known then
+// counted, as any other (`heff_exact`))
+#if defined(__clang__) && (defined(__x86_64__) || defined(__aarch64__)) && !defined(HEFF_NO_JUMPS)
+#define HEFF_LAST __attribute__((musttail))
+#define HEFF_JUMPS 1
+#else
+#define HEFF_LAST
+#define HEFF_JUMPS 0
+#endif
 
 // the tags the runtime knows; a program's own are numbered after them
 enum {
@@ -477,6 +492,15 @@ static V heff_apply(V f, int n, V *a) {
 }
 
 static inline V heff_app1(V f, V x) { return heff_apply(f, 1, &x); }
+
+// (whether `f`, given the `n` arguments at `a`, is a closure taking
+// exactly them and not a thunk forced -- what `heff_apply` would call at
+// once, as it is -- and a call last of it a jump: a lambda's call last
+// of it is then not counted (src/heff/emitc.hf, `inPlace`))
+static inline int heff_exact(V f, int n, V *a) {
+  return HEFF_JUMPS && IS_OBJ(f) && OBJ(f)->kind == K_CLO
+      && ((Clo *)f)->arity == n && !(n == 1 && a[0] == NTAG(TAG_MkUnit));
+}
 
 // Integers
 // ---------------------------------------------------------------------
