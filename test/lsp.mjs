@@ -15,8 +15,9 @@ const uri = (f) => pathToFileURL(join(root, f)).href;
 const disk = (f) => readFileSync(join(root, f), "utf8");
 
 // (as vscode-languageclient starts it, with `--stdio`)
-// (with a bounded heap: what it keeps must fit, on any machine)
-const server = spawn(heffBin, ["lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, HEFF_HEAP_MB: "1024" } });
+// (with a bounded heap: what it keeps must fit, on any machine; told it
+// is on a terminal, which it says nothing to in colour all the same)
+const server = spawn(heffBin, ["lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, HEFF_HEAP_MB: "1024", HEFF_TTY: "1" } });
 let buf = Buffer.alloc(0), nextId = 1, failed = 0, checks = 0;
 const waiting = new Map(), notes = [], noteWaiters = [];
 server.stdout.on("data", (chunk) => {
@@ -86,7 +87,7 @@ try {
   const at = pos(bad, '"x"');
   expect("a type error's diagnostic", ds.length === 1 && ds[0].code === "E0311" && ds[0].severity === 1 &&
     ds[0].range.start.line === at.line && ds[0].range.start.character === at.character && ds[0].range.end.character === at.character + 3 &&
-    ds[0].message.includes("expected type Bool, but got type String"), ds);
+    ds[0].message.includes("expected type Bool, but got type String") && !ds[0].message.includes("\u001b"), ds);
 
   // fixed, with a change (full sync, debounced), and non-ASCII before a name
   const good = "import a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} not (not b)\n";

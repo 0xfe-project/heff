@@ -205,5 +205,36 @@ for (const o of ["0", "nope"]) {
   expect(`type-at ${o}`, r.status === 0 && r.stdout === "nothing there\n", r);
 }
 
+// a diagnostic: in colour where heff is told the standard error is a
+// terminal (`HEFF_TTY=1`), not where `NO_COLOR` is set or it is not one;
+// a span over lines marked once, in a margin
+writeFileSync(join(work, "diag.hf"), [
+  "import prelude", "", "data C = R | G | B", "",
+  "name : C -> String", "name c = case c of", "  R -> \"red\"", "  G -> \"green\"", "",
+].join("\n"));
+const withEnv = (extra) => {
+  const env = { ...process.env, ...extra };
+  for (const k of ["HEFF_TTY", "NO_COLOR"]) if (!(k in extra)) delete env[k];
+  return spawnSync(heffBin, ["check", "diag.hf"], { cwd: work, encoding: "utf8", env });
+};
+const esc = "\u001b";
+const plain = withEnv({});
+expect("a diagnostic, not on a terminal", plain.status === 1 && !plain.stderr.includes(esc) &&
+  plain.stderr.includes([
+    "error[E0317]: no case provided for tag B",
+    "6 |   name c = case c of",
+    "  |  __________^",
+    "7 | |   R -> \"red\"",
+    "8 | |   G -> \"green\"",
+    "  | |______________^",
+  ].join("\n")), plain);
+const tty = withEnv({ HEFF_TTY: "1" });
+expect("a diagnostic, on a terminal", tty.status === 1 &&
+  tty.stderr.includes(`${esc}[1;31merror[E0317]${esc}[0m: no case provided`) &&
+  tty.stderr.includes(`${esc}[2m6 |${esc}[0m`) && tty.stderr.includes(`${esc}[1;31m|______________^${esc}[0m`) &&
+  tty.stderr.replace(/\u001b\[[0-9;]*m/g, "") === plain.stderr, tty);
+const noColor = withEnv({ HEFF_TTY: "1", NO_COLOR: "1" });
+expect("a diagnostic, NO_COLOR", noColor.status === 1 && noColor.stderr === plain.stderr, noColor);
+
 console.log(`cli: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
