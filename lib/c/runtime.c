@@ -983,6 +983,20 @@ FLT2(heff_floatLe, heff_bool(x <= y))
 static V heff_floatFromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_flt(d); }
 static V heff_floatSqrt(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(sqrt(x)); }
 
+// (std.math's: libm's, as JavaScript's `Math` has them)
+#define FLT1(name, f) \
+  static V name(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(f(x)); }
+FLT1(heff_floatSin, sin)
+FLT1(heff_floatCos, cos)
+FLT1(heff_floatTan, tan)
+FLT1(heff_floatAsin, asin)
+FLT1(heff_floatAcos, acos)
+FLT1(heff_floatAtan, atan)
+FLT1(heff_floatExp, exp)
+FLT1(heff_floatLog, log)
+FLT2(heff_floatAtan2, heff_flt(atan2(x, y)))
+FLT2(heff_floatPow, heff_flt(pow(x, y)))
+
 static V heff_floatFloor(V a) {
   double d = FLT_OF(a);
   heff_drop(a);
