@@ -56,6 +56,8 @@ heff compile FILE OUT --backend=MODE [--name NAME]
                                # esm: an ES module
                                # page: a script running the app NAME in a web page
                                # node: a Node.js program running NAME
+heff build [NAME...]           # the project: every module of src/ checked, then
+                               # its programs (app/NAME/) built to .heff/bin/
 heff init [DIR]                # a new project
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag

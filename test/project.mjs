@@ -290,5 +290,28 @@ unlock(join(work, "mod")); rmSync(join(work, "mod"), { recursive: true, force: t
 const moved = inUser("get");
 expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/lib 1.0.0 is tree:") && moved.stderr.includes("its tag has been moved"), moved);
 
+// build: every module of src/ checked, then every program of app/ built
+// to .heff/bin/ (the NAMEd ones only, given NAMEs)
+write("tool/package.hf", manifestOf("tool"));
+write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
+write("tool/app/tool/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = 'node, run = \"main\" }\n");
+write("tool/app/tool/main.hf", "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print greeting\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
+const inTool = (...args) => spawnSync(heffBin, args, { cwd: join(work, "tool"), encoding: "utf8" });
+const built = inTool("build");
+const toolBin = join(work, "tool", ".heff", "bin", "tool");
+expect("build: the modules checked, the programs built", built.status === 0 && built.stdout.includes("heff build: 1 module checked") &&
+  built.stdout.includes("wrote .heff/bin/tool") && existsSync(toolBin) &&
+  spawnSync(toolBin, [], { encoding: "utf8" }).stdout === "hi from tool\n", built);
+write("tool/src/tool/broken.hf", "import prelude\n\nx : Int\nx = True\n");
+rmSync(join(work, "tool", ".heff", "bin"), { recursive: true });
+const broken = inTool("build");
+expect("build: a module that does not check", broken.status === 1 && broken.stderr.includes("src/tool/broken.hf") &&
+  !existsSync(toolBin), broken);
+const named = inTool("build", "tool");
+expect("build NAME: the program only", named.status === 0 && !named.stdout.includes("checked") && existsSync(toolBin), named);
+rmSync(join(work, "tool", "src", "tool", "broken.hf"));
+const noProgram = inTool("build", "nope");
+expect("build NAME: no such program", noProgram.status === 1 && noProgram.stderr.includes("no program nope"), noProgram);
+
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
