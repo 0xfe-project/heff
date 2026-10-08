@@ -276,11 +276,12 @@ main = program (io := \p -> InL p) (disk := \p -> InR p)
 `lib/` goes with the compiler, its version the compiler's; `HEFF_LIB`
 says where it is, else it is the `lib/` the compiler came with: the
 repository's, a release's, or the heff home's (`heff install` puts it
-there).  Its modules are imported by their names: `builtin` (implicit
-in every module), `prelude`, `co`, `state`, `exn`, `parallel`, `array`,
-`map`, `set`, and `manifest` (the types of `package.hf` and
-`build.hf`); the fixed-width numbers' are `int8` to `int64`, `uint8` to
-`uint64` and `float32`, and `int` has an `Int`'s bits.  The batteries ship with it,
+there).  Every module imports `builtin` and `prelude` without writing
+them (but those the two are made of); its other modules are imported by
+their names: `co`, `state`, `exn`, `parallel`, `array`, `map`, `set`,
+and `manifest` (the types of `package.hf` and `build.hf`); the
+fixed-width numbers' are `int8` to `int64`, `uint8` to `uint64` and
+`float32`, and `int` has an `Int`'s bits.  The batteries ship with it,
 under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one

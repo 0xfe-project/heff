@@ -80,7 +80,7 @@ try {
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-deep.hf") } });
 
   // a type error, in the editor's text (not the file's)
-  const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = not (not "x")\n';
+  const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = inv (inv "x")\n';
   open("test/modules/src/b.hf", bad);
   ds = await diagnosticsOf(uri("test/modules/src/b.hf"));
   const at = pos(bad, '"x"');
@@ -89,32 +89,32 @@ try {
     ds[0].message.includes("expected type Bool, but got type String") && !ds[0].message.includes("\u001b"), ds);
 
   // fixed, with a change (full sync, debounced), and non-ASCII before a name
-  const good = "import a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} not (not b)\n";
+  const good = "import a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} inv (inv b)\n";
   notify("textDocument/didChange", { textDocument: { uri: uri("test/modules/src/b.hf"), version: 2 }, contentChanges: [{ text: good }] });
   ds = await diagnosticsOf(uri("test/modules/src/b.hf"));
   expect("no diagnostics once fixed", ds.length === 0, ds);
 
-  const hover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "not", 1) });
-  expect("hover past non-ASCII text", hover.result && hover.result.contents.value.includes("not : Bool -> Bool") && hover.result.contents.value.includes("(global)"), hover.result);
+  const hover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "inv", 1) });
+  expect("hover past non-ASCII text", hover.result && hover.result.contents.value.includes("inv : Bool -> Bool") && hover.result.contents.value.includes("(global)"), hover.result);
   const local = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "b)") });
   expect("hover on a local", local.result && local.result.contents.value.includes("b : Bool") && local.result.contents.value.includes("(local)"), local.result);
   const nothing = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: { line: 1, character: 0 } });
   expect("hover on nothing", nothing.result === null, nothing.result);
 
   // a global of an imported module, not open: its file on disk
-  const def = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "not", 1) });
-  const notAt = pos(disk("test/modules/src/a.hf"), "not");
+  const def = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/src/b.hf") }, position: pos(good, "inv", 1) });
+  const notAt = pos(disk("test/modules/src/a.hf"), "inv");
   expect("definition in another module", def.result && def.result.uri === uri("test/modules/src/a.hf") &&
     def.result.range.start.line === notAt.line && def.result.range.start.character === notAt.character && def.result.range.end.character === notAt.character + 3, def.result);
 
-  // a global of a module imported as `A`: `A.not`
+  // a global of a module imported as `A`: `A.inv`
   const qualified = disk("test/modules/qualified.hf");
   open("test/modules/qualified.hf", qualified);
   await diagnosticsOf(uri("test/modules/qualified.hf"));
-  const qDef = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
+  const qDef = await request("textDocument/definition", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "inv") });
   expect("definition of a qualified name", qDef.result && qDef.result.uri === uri("test/modules/src/a.hf") && qDef.result.range.start.line === notAt.line, qDef.result);
-  const qHover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "not") });
-  expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.not : A.Bool -> A.Bool"), qHover.result);
+  const qHover = await request("textDocument/hover", { textDocument: { uri: uri("test/modules/qualified.hf") }, position: pos(qualified, "inv") });
+  expect("hover on a qualified name", qHover.result && qHover.result.contents.value.includes("A.inv : A.Bool -> A.Bool"), qHover.result);
 
   // completion: the names in scope that start as the one being typed; after
   // `A.`, the definitions of the module imported as `A`
@@ -124,11 +124,23 @@ try {
   const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 3, character: 7 } });
   const lengthItem = comp.result && comp.result.find((i) => i.label === "length");
   expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("List a -> Int") && !comp.result.some((i) => i.label === "map"), comp.result && comp.result.map((i) => i.label));
+  // the prelude, which no file writes an import of: its names in scope,
+  // completed and hovered
+  const unwritten = "xs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n\nn : Int\nn = len";
+  open("test/surface/lsp-unwritten.hf", unwritten);
+  await diagnosticsOf(uri("test/surface/lsp-unwritten.hf"));
+  const uHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "map") });
+  expect("hover on a prelude name, not imported", uHover.result && uHover.result.contents.value.includes("map : {a b : Type} -> (a -> b) -> List a -> List b") && uHover.result.contents.value.includes("(global)"), uHover.result);
+  const uComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: { line: 4, character: 7 } });
+  expect("completion of a prelude name, not imported", uComp.result && uComp.result.some((i) => i.label === "length" && i.detail.includes("List a -> Int")), uComp.result && uComp.result.map((i) => i.label));
+  const uDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "map") });
+  expect("definition of a prelude name, not imported", uDef.result && uDef.result.uri === uri("lib/prelude.hf") && uDef.result.range.start.line === pos(disk("lib/prelude.hf"), "map :").line, uDef.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") } });
   const dotted = "import a as A\n\nx : A.Bool\nx = A.";
   open("test/modules/lsp-dot.hf", dotted);
   await diagnosticsOf(uri("test/modules/lsp-dot.hf"));
   const dot = await request("textDocument/completion", { textDocument: { uri: uri("test/modules/lsp-dot.hf") }, position: { line: 3, character: 6 } });
-  expect("completion after `A.`", dot.result && dot.result.some((i) => i.label === "not") && dot.result.every((i) => !i.label.includes(".")), dot.result && dot.result.map((i) => i.label));
+  expect("completion after `A.`", dot.result && dot.result.some((i) => i.label === "inv") && dot.result.every((i) => !i.label.includes(".")), dot.result && dot.result.map((i) => i.label));
 
   // a global of the file itself, and the standard library's
   const basics = disk("test/surface/basics.hf");
@@ -154,7 +166,7 @@ try {
   open("test/modules/src/a.hf", "data Bool = True | False\n");
   ds = await diagnosticsOf(uri("test/modules/src/a.hf"));
   const dependent = await diagnosticsOf(uri("test/modules/src/b.hf"));
-  expect("an import's unsaved text", dependent.some((d) => d.message.includes("no such variable not")), dependent);
+  expect("an import's unsaved text", dependent.some((d) => d.message.includes("no such variable inv")), dependent);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
 
   // in a `do` block, the name hovered, not the `bind` it is read into
@@ -330,33 +342,33 @@ try {
   const a = disk("test/modules/src/a.hf");
   open("test/modules/src/a.hf", a);
   await diagnosticsOf(uri("test/modules/src/a.hf"));
-  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: true } });
+  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv :"), context: { includeDeclaration: true } });
   const acrossAt = across.result ? across.result.map(where) : [];
-  const qNot = pos(qualified, "A.not");
-  expect("references across modules", acrossAt.includes(`b.hf:${pos(good, "not", 1).line}:${pos(good, "not", 1).character}-${pos(good, "not", 1).character + 3}`) &&
+  const qNot = pos(qualified, "A.inv");
+  expect("references across modules", acrossAt.includes(`b.hf:${pos(good, "inv", 1).line}:${pos(good, "inv", 1).character}-${pos(good, "inv", 1).character + 3}`) &&
     acrossAt.includes(`qualified.hf:${qNot.line}:${qNot.character + 2}-${qNot.character + 5}`) && acrossAt.filter((x) => x.startsWith("a.hf")).length === 3, acrossAt);
 
   // renaming: every occurrence, in every file; refused for a name of
   // another kind, and a name already there
-  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not True") });
-  expect("prepare a rename", prep.result && prep.result.placeholder === "not" && prep.result.range.start.line === pos(a, "not True").line, prep);
-  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "neg" });
+  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv True") });
+  expect("prepare a rename", prep.result && prep.result.placeholder === "inv" && prep.result.range.start.line === pos(a, "inv True").line, prep);
+  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv :"), newName: "neg" });
   const edits = ren.result && ren.result.changes;
   expect("a rename", edits && edits[uri("test/modules/src/a.hf")].length === 3 && edits[uri("test/modules/src/b.hf")].length === 2 &&
     edits[uri("test/modules/qualified.hf")].length === 2 && Object.values(edits).flat().every((e) => e.newText === "neg" && e.range.end.character - e.range.start.character === 3), edits);
-  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "Not" });
+  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv :"), newName: "Not" });
   expect("no rename to another kind of name", wrongKind.error, wrongKind);
-  // (`b` defines `twice`, which would hide the imported `not` renamed to it)
-  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "twice" });
+  // (`b` defines `twice`, which would hide the imported `inv` renamed to it)
+  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv :"), newName: "twice" });
   expect("no rename to a name already there", captured.error && captured.error.message.includes("twice"), captured);
 
   // a file changed on disk, not in the editor: told of, the project is
   // elaborated again
-  const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: false } })).result || [];
+  const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv :"), context: { includeDeclaration: false } })).result || [];
   // (in app/, where test/golden.mjs, run at the same time, looks for no file)
   const watched = "test/modules/app/lsp-watched.hf";
   expect("before a file is made", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
-  writeFileSync(join(root, watched), "import a\n\ny : Bool\ny = not True\n");
+  writeFileSync(join(root, watched), "import a\n\ny : Bool\ny = inv True\n");
   notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 1 }] });
   expect("a file made on disk", (await refsOfNot()).some((r) => r.uri === uri(watched)), "");
   unlinkSync(join(root, watched));

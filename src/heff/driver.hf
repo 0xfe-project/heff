@@ -26,19 +26,22 @@ import heff.value as V
 import map as Mp
 import prelude
 
--- | a file of a program: the module it is, where it is, its text, and
--- | the imports it writes that mean another module (one of another
--- | package, imported by the name its importer requires it by)
+-- | a file of a program: the module it is, where it is, its text, the
+-- | imports it writes that mean another module (one of another package,
+-- | imported by the name its importer requires it by), and the modules
+-- | it imports without writing them (`I.implicitModules`, but those it
+-- | is made of)
 type Source =
   { module : String
   , path : String
   , source : String
   , renames : List (Pair String String)
+  , implicit : List String
   }
 
 -- | a file's imports, each naming the module it means
 importsOfSource : Source -> I.Imports
-importsOfSource s = I.renamed s.renames (I.importsOf s.module s.source)
+importsOfSource s = I.renamed s.renames (I.importsOf s.implicit s.source)
 
 type Own = { name : String, key : String }
 
@@ -47,6 +50,7 @@ mkOwn name key = { name = name, key = key }
 
 type AliasQ = { module : String, alias : String }
 
+-- | a module elaborated (`opens`: the modules the imports it writes open)
 type Checked =
   { module : String
   , path : String
@@ -76,6 +80,18 @@ nubStrD (Cons x xs) = Cons x (nubStrD (filter (\y -> not (strEq y x)) xs))
 
 elemStr : String -> List String -> Bool
 elemStr x xs = elemBy strEq x xs
+
+-- | a file given among others in dependency order, after the modules
+-- | `before`: it imports without writing them the implicit modules given
+-- | before it
+givenAfter : List String -> String -> String -> String -> Source
+givenAfter before m path src =
+  { module = m
+  , path = path
+  , source = src
+  , renames = Nil
+  , implicit = filter (\i -> elemStr i before) I.implicitModules
+  }
 
 findChecked : List Checked -> String -> Maybe Checked
 findChecked Nil m = Nothing
@@ -138,24 +154,23 @@ anyD : {a : Type} -> (a -> Bool) -> List a -> Bool
 anyD p Nil = False
 anyD p (Cons x xs) = p x || anyD p xs
 
-fromBuiltin : Imported -> Bool
-fromBuiltin o = strEq o.module I.builtinModule
-
--- | (a name of `builtin`, which is not written, gives way to the same
--- | name of a module that is: they do not clash)
-givesWay : List Imported -> Imported -> Bool
-givesWay imported o =
-  fromBuiltin o
+-- | (a name of a module imported without being written (`unwritten`)
+-- | gives way to the same name of a module that is: they do not clash)
+givesWay : List String -> List Imported -> Imported -> Bool
+givesWay unwritten imported o =
+  elemStr o.module unwritten
   && anyD
-    (\(p : Imported) -> strEq p.name o.name && not (fromBuiltin p))
+    (\(p : Imported) -> strEq p.name o.name && not (elemStr p.module unwritten))
     imported
 
-withoutGiven : List Imported -> List Imported
-withoutGiven all = filter (\(o : Imported) -> not (givesWay all o)) all
+withoutGiven : List String -> List Imported -> List Imported
+withoutGiven unwritten all =
+  filter (\(o : Imported) -> not (givesWay unwritten all o)) all
 
-importedOf : List Checked -> List Imported
-importedOf direct =
+importedOf : List String -> List Checked -> List Imported
+importedOf unwritten direct =
   withoutGiven
+    unwritten
     (concatMapD
        (\(c : Checked) ->
           map (\(o : Own) -> mkImported o.name o.key c.module) c.own)
@@ -320,6 +335,11 @@ openNames Nil = Nil
 openNames (Cons i rest) = case i.alias of
   Nothing -> Cons i.name (openNames rest)
   Just a -> openNames rest
+
+-- (the modules the file opens by the imports it writes)
+writtenOpens : I.Imports -> List String
+writtenOpens imps =
+  filter (\m -> not (elemStr m imps.implicit)) (openNames imps.imports)
 
 aliasPairs : List I.Import -> List AliasQ
 aliasPairs Nil = Nil
@@ -583,7 +603,7 @@ thawedChecked s imps th t =
     Nil
     (ownOf s.module t.keys)
     (importNames imps.imports)
-    (openNames imps.imports)
+    (writtenOpens imps)
     (aliasPairs imps.imports)
     th.fixities
     True
@@ -605,11 +625,13 @@ elabTop s imps direct r t =
     r.decls
     (withStruct s.module (ownOf s.module t.keys) t)
     (appendD
-       (map (clashDiag (importedOf direct)) (clashesOf (importedOf direct)))
+       (map
+          (clashDiag (importedOf imps.implicit direct))
+          (clashesOf (importedOf imps.implicit direct)))
        (map hint (appendD r.diags t.diags)))
     (ownOf s.module t.keys)
     (importNames imps.imports)
-    (openNames imps.imports)
+    (writtenOpens imps)
     (aliasPairs imps.imports)
     r.fixities
     False
@@ -706,7 +728,7 @@ elabDirect : List Checked
            -> List Checked
            -> Checked
 elabDirect done s imps thaw direct needed =
-  elabAliased done s imps thaw direct needed (importedOf direct)
+  elabAliased done s imps thaw direct needed (importedOf imps.implicit direct)
 
 -- (the modules reached from the imports, reckoned once)
 elabNeeding : List Checked
@@ -1336,12 +1358,7 @@ sigEntry c ln o = case G.lookupEntry c.top.globals o.key of
 
 importLines : Checked -> String
 importLines c =
-  joinWith
-    ""
-    (map
-       (\m -> "import " ++ m ++ "\n")
-       -- (`builtin` is imported without being written)
-       (filter (\m -> not (strEq m I.builtinModule)) c.opens))
+  joinWith "" (map (\m -> "import " ++ m ++ "\n") c.opens)
   ++ joinWith
     ""
     (map
@@ -1446,8 +1463,8 @@ findRunnable handled c (Just x) = case find
   Just o -> findNamed handled c x o
 findRunnable handled c Nothing = findFirst handled (candidatesOf c)
 
--- >>> length (checkProgram [{ module = "a", path = "a.hf", source = "one : Int\none = 1\n", renames = Nil }, { module = "b", path = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil }])
+-- >>> length (checkProgram [{ module = "a", path = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil }, { module = "b", path = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil }])
 -- 2
 
--- >>> programBody (checkProgram [{ module = "a", path = "a.hf", source = "one : Int\none = 1\n", renames = Nil }, { module = "b", path = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil }]) "b" "b.two"
+-- >>> programBody (checkProgram [{ module = "a", path = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil }, { module = "b", path = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil }]) "b" "b.two"
 -- "(SIs (SGlobal \"a.one\"))"

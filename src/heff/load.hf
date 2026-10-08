@@ -725,13 +725,21 @@ pushDone : LoadSt
          -> String
          -> String
          -> String
+         -> List String
          -> List (Pair String String)
          -> LoadSt
-pushDone st m path src renames =
+pushDone st m path src implicit renames =
   { done =
       concatList
         st.done
-        (Cons { module = m, path = path, source = src, renames = renames } Nil)
+        (Cons
+           { module = m
+           , path = path
+           , source = src
+           , renames = renames
+           , implicit = implicit
+           }
+           Nil)
   , doneMods = Cons m st.doneMods
   , errors = st.errors
   }
@@ -770,8 +778,9 @@ renaming w m rs = if strEq w m then rs else Cons (MkPair w m) rs
 
 -- | the modules written `ws` in the file at `from`, each visited after
 -- | what it imports (`stack`: the modules being visited, newest first),
--- | each file read by `read`; and the imports of `from` that mean
--- | another module than they say (`rs`, so far)
+-- | each file read by `read`, each importing without writing them the
+-- | modules `imp` says; and the imports of `from` that mean another
+-- | module than they say (`rs`, so far)
 loadMany : {e : HFunctor}
          -> {{ev : fs <: e}}
          -> (String -> Co e (Maybe String))
@@ -779,12 +788,13 @@ loadMany : {e : HFunctor}
          -> List Pkg
          -> List String
          -> String
+         -> (String -> List String)
          -> List String
          -> LoadSt
          -> List (Pair String String)
          -> Co e (Pair LoadSt (List (Pair String String)))
-loadMany read ps pkgs stack from Nil st rs = val (MkPair st rs)
-loadMany read ps pkgs stack from (Cons w rest) st rs = do
+loadMany read ps pkgs stack from imp Nil st rs = val (MkPair st rs)
+loadMany read ps pkgs stack from imp (Cons w rest) st rs = do
   found <- readEvery read (placesOf ps pkgs from w)
   case found of
     Nil ->
@@ -794,12 +804,22 @@ loadMany read ps pkgs stack from (Cons w rest) st rs = do
         pkgs
         stack
         from
+        imp
         rest
         (addErr st (missingMsg (placesOf ps pkgs from w) from w))
         rs
     Cons f others ->
       if elemL f.module st.doneMods
-        then loadMany read ps pkgs stack from rest st (renaming w f.module rs)
+        then loadMany
+            read
+            ps
+            pkgs
+            stack
+            from
+            imp
+            rest
+            st
+            (renaming w f.module rs)
       else if elemL f.module stack
         then loadMany
             read
@@ -807,6 +827,7 @@ loadMany read ps pkgs stack from (Cons w rest) st rs = do
             pkgs
             stack
             from
+            imp
             rest
             (addErr st (cycleMsg from f.module stack))
             (renaming w f.module rs)
@@ -819,7 +840,8 @@ loadMany read ps pkgs stack from (Cons w rest) st rs = do
             pkgs
             (Cons f.module stack)
             f.path
-            (Dr.importNames (I.importsOf f.module f.source).imports)
+            imp
+            (Dr.importNames (I.importsOf (imp f.module) f.source).imports)
             (case named of
              Just why -> addErr st (from ++ ": importing " ++ w ++ ": " ++ why)
              Nothing ->
@@ -831,8 +853,15 @@ loadMany read ps pkgs stack from (Cons w rest) st rs = do
             pkgs
             stack
             from
+            imp
             rest
-            (pushDone (fst inner) f.module f.path f.source (snd inner))
+            (pushDone
+               (fst inner)
+               f.module
+               f.path
+               f.source
+               (imp f.module)
+               (snd inner))
             (renaming w f.module rs)
 
 -- | a program: its sources, what could not be loaded, where its project
@@ -880,6 +909,49 @@ loadDone ps pk pkgs st =
   , packages = fst pkgs
   }
 
+-- What a module imports without writing it.  Every module imports each
+-- of the implicit modules (`I.implicitModules`), but those it is made
+-- of: a module the first of them needs imports none of them, one the
+-- second needs (and the first does not) imports the first, and so on.
+-- Which modules those are is found first, by loading each implicit
+-- module in turn, its files importing the implicit modules before it.
+
+-- (the implicit modules `ms` loaded in turn, after `before`)
+madeOfGo : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> (String -> Co e (Maybe String))
+         -> Paths
+         -> List Pkg
+         -> String
+         -> List String
+         -> List String
+         -> LoadSt
+         -> Co e LoadSt
+madeOfGo read ps pkgs from before Nil st = val st
+madeOfGo read ps pkgs from before (Cons m ms) st = do
+  r <- loadMany read ps pkgs Nil from (\_ -> before) [m] st Nil
+  madeOfGo read ps pkgs from (concatList before [m]) ms (fst r)
+
+-- | the modules the implicit modules are made of, imported from `from`,
+-- | each with the implicit modules it imports
+madeOf : {e : HFunctor}
+       -> {{ev : fs <: e}}
+       -> (String -> Co e (Maybe String))
+       -> Paths
+       -> List Pkg
+       -> String
+       -> Co e (List Dr.Source)
+madeOf read ps pkgs from = do
+  st <- madeOfGo read ps pkgs from Nil I.implicitModules emptySt
+  val st.done
+
+-- | what module `m` imports without writing it, the implicit modules
+-- | being made of `made`
+implicitOf : List Dr.Source -> String -> List String
+implicitOf made m = case find (\(s : Dr.Source) -> strEq s.module m) made of
+  Just s -> s.implicit
+  Nothing -> I.implicitModules
+
 -- | the program rooted at `file`, on the host `h` (the library, the
 -- | style of paths), each file read by `read` (an editor's unsaved text,
 -- | say): its sources in dependency order, what could not be found, and
@@ -899,6 +971,7 @@ loadProgramWith read h file = do
     Nothing ->
       val (loadDone ps pk pkgs (addErr emptySt ("cannot read " ++ file)))
     Just src -> do
+      made <- madeOf read ps (fst pkgs) file
       r <-
         loadMany
           read
@@ -906,7 +979,9 @@ loadProgramWith read h file = do
           (fst pkgs)
           (Cons (moduleOf ps file) Nil)
           file
-          (Dr.importNames (I.importsOf (moduleOf ps file) src).imports)
+          (implicitOf made)
+          (Dr.importNames
+             (I.importsOf (implicitOf made (moduleOf ps file)) src).imports)
           emptySt
           Nil
       val
@@ -914,7 +989,13 @@ loadProgramWith read h file = do
              ps
              pk
              pkgs
-             (pushDone (fst r) (moduleOf ps file) file src (snd r)))
+             (pushDone
+                (fst r)
+                (moduleOf ps file)
+                file
+                src
+                (implicitOf made (moduleOf ps file))
+                (snd r)))
 
 -- | ... each file read from the disk
 loadProgram : {e : HFunctor}
