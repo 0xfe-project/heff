@@ -203,7 +203,9 @@ What nothing decides is an `Int`, or a `Float`, when the definition is
 settled, before its instance arguments are last looked for (an integer
 literal is a `Float` where it shares its type with a fractional one,
 `[1, 2.5]`).  A `let` does not generalise: what it binds has one type,
-for every use.
+for every use.  A literal pattern is of the type of what it matches, and
+compared by that type's equality (an `Int`'s is the prelude's `intEq`,
+a fixed-width type's builtin's, `int32Eq` and the others).
 
 ```haskell
 import prelude
