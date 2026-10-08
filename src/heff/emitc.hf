@@ -98,6 +98,17 @@ elemS : String -> List String -> Bool
 elemS x Nil = False
 elemS x (Cons y ys) = strEq x y || elemS x ys
 
+-- (the variable an expression is, if it is one; the definition: so that
+-- an equation looking for one does not copy its fallback into an arm for
+-- each other kind of expression)
+varOf : I.Expr -> Maybe String
+varOf (EVar x) = Just x
+varOf _ = Nothing
+
+globalOf : I.Expr -> Maybe String
+globalOf (EGlobal g) = Just g
+globalOf _ = Nothing
+
 nubS : List String -> List String -> List String
 nubS acc Nil = List.reverse acc
 nubS acc (Cons x xs) = if elemS x acc then nubS acc xs else nubS (Cons x acc) xs
@@ -537,13 +548,19 @@ freeOf : List String -> I.Expr -> List String
 freeOf xs b = freeFrom xs (fvW Nil Nil (Cons b Nil))
 
 -- (a variable read a field of at a known shape: a record of its size)
+shapedVar : Maybe String
+          -> List String
+          -> List (Pair String Known)
+          -> List (Pair String Known)
+shapedVar (Just x) sh acc =
+  if List.null sh then acc else Cons (MkPair x (KnownRec (List.length sh))) acc
+shapedVar Nothing sh acc = acc
+
 shapedOf : I.Expr
          -> List String
          -> List (Pair String Known)
          -> List (Pair String Known)
-shapedOf (EVar x) sh acc =
-  if List.null sh then acc else Cons (MkPair x (KnownRec (List.length sh))) acc
-shapedOf e sh acc = acc
+shapedOf e sh acc = shapedVar (varOf e) sh acc
 
 shapedGo : List (Pair String Known) -> List I.Expr -> List (Pair String Known)
 shapedGo acc Nil = acc
@@ -740,12 +757,34 @@ fieldLent ce after x (Just i) =
   else Nothing
 fieldLent ce after x Nothing = Nothing
 
+fieldLentOf : CE -> List String -> Maybe String -> Maybe Int -> Maybe String
+fieldLentOf ce after (Just x) i = fieldLent ce after x i
+fieldLentOf ce after Nothing i = Nothing
+
 -- (at a borrowed parameter, a field of a record that outlives the call
 -- -- wanted after it (`after`), or lent to this code -- lent on where it
 -- is: not counted, up or down)
 lentField : CE -> List String -> I.Expr -> Maybe String
-lentField ce after (EProj (EVar x) l sh) = fieldLent ce after x (indexIn l 0 sh)
+lentField ce after (EProj e l sh) =
+  fieldLentOf ce after (varOf e) (indexIn l 0 sh)
 lentField ce after _ = Nothing
+
+lentVarOr : CK
+          -> CE
+          -> List String
+          -> List Int
+          -> Int
+          -> I.Expr
+          -> Maybe String
+          -> C Lent
+lentVarOr r ce live bi i e (Just x) =
+  if elemI i bi then pure (lentVar ce live x)
+  else do
+    v <- r.val ce live e
+    pure (given v)
+lentVarOr r ce live bi i e Nothing = do
+  v <- r.val ce live e
+  pure (if elemI i bi then lentValue i v else given v)
 
 lentOr : CK
        -> CE
@@ -756,14 +795,7 @@ lentOr : CK
        -> Maybe String
        -> C Lent
 lentOr r ce live bi i e (Just a) = pure (given a)
-lentOr r ce live bi i (EVar x) Nothing =
-  if elemI i bi then pure (lentVar ce live x)
-  else do
-    v <- r.val ce live (EVar x)
-    pure (given v)
-lentOr r ce live bi i e Nothing = do
-  v <- r.val ce live e
-  pure (if elemI i bi then lentValue i v else given v)
+lentOr r ce live bi i e Nothing = lentVarOr r ce live bi i e (varOf e)
 
 lentOne : CK
         -> CE
@@ -940,31 +972,50 @@ reuseVal r ce live _ = pure "0"
 -- wanted after or lent, or of a definition's value, the field counted and
 -- the record not touched; otherwise the record consumed, the field taken
 -- over where it was the last reference (`heff_get_n`))
-fieldAt : CK -> CE -> List String -> I.Expr -> Int -> Int -> C String
-fieldAt r ce live (EVar x) i n =
+fieldIn : CK
+        -> CE
+        -> List String
+        -> I.Expr
+        -> Int
+        -> Int
+        -> Maybe String
+        -> Maybe String
+        -> C String
+fieldIn r ce live e i n (Just x) g =
   pure
     (if elemS x live || elemS x ce.borrowed
        then "heff_dup(heff_rfield(" ^ cLocal x ^ ", " ^ showInt i ^ "))"
      else "heff_get_n(" ^ cLocal x ^ ", " ^ showInt i ^ ", " ^ showInt n ^ ")")
-fieldAt r ce live (EGlobal g) i n =
+fieldIn r ce live e i n Nothing (Just g) =
   pure ("heff_dup(heff_rfield(" ^ cGlobal g ^ "_get(), " ^ showInt i ^ "))")
-fieldAt r ce live e i n = do
+fieldIn r ce live e i n Nothing Nothing = do
   v <- r.val ce live e
   pure ("heff_get_n(" ^ v ^ ", " ^ showInt i ^ ", " ^ showInt n ^ ")")
 
+fieldAt : CK -> CE -> List String -> I.Expr -> Int -> Int -> C String
+fieldAt r ce live e i n = fieldIn r ce live e i n (varOf e) (globalOf e)
+
 -- (the field taken out of its record, if this operand takes it and the
 -- record is wanted after it: see `takesFor`)
+takeVarIn : List (Pair String String)
+          -> List String
+          -> Maybe String
+          -> String
+          -> Int
+          -> Maybe String
+takeVarIn ts live (Just x) l i =
+  if elemS x live && List.any (\p -> strEq (fst p) x && strEq (snd p) l) ts
+    then Just ("heff_take_field(" ^ cLocal x ^ ", " ^ showInt i ^ ")")
+  else Nothing
+takeVarIn ts live Nothing l i = Nothing
+
 takeIn : List (Pair String String)
        -> List String
        -> I.Expr
        -> String
        -> Int
        -> Maybe String
-takeIn ts live (EVar x) l i =
-  if elemS x live && List.any (\p -> strEq (fst p) x && strEq (snd p) l) ts
-    then Just ("heff_take_field(" ^ cLocal x ^ ", " ^ showInt i ^ ")")
-  else Nothing
-takeIn ts live e l i = Nothing
+takeIn ts live e l i = takeVarIn ts live (varOf e) l i
 
 fieldOr : CK
         -> CE
@@ -1008,8 +1059,8 @@ sameS _ _ = False
 -- (a field read from a record's at its own place, that record's shape
 -- `ls`, the one being built: the record read)
 keptFrom : List String -> Pair String I.Expr -> Maybe String
-keptFrom ls (MkPair l (EProj (EVar x) l2 sh)) =
-  if strEq l l2 && sameS ls sh then Just x else Nothing
+keptFrom ls (MkPair l (EProj e l2 sh)) =
+  if strEq l l2 && sameS ls sh then varOf e else Nothing
 keptFrom ls _ = Nothing
 
 isJustOf : String -> Maybe String -> Bool
@@ -1782,8 +1833,13 @@ operandsOf _ = Nil
 
 -- (an operand that takes its field, `rest` all that may look at its
 -- record after it)
-takeOne : CE -> List I.Expr -> I.Expr -> List (Pair String String)
-takeOne ce rest (EProj (EVar x) l sh) =
+takeVar : CE
+        -> List I.Expr
+        -> Maybe String
+        -> String
+        -> List String
+        -> List (Pair String String)
+takeVar ce rest (Just x) l sh =
   if not (List.null sh)
   && elemS x ce.owned
   && not (elemS x ce.borrowed)
@@ -1791,6 +1847,10 @@ takeOne ce rest (EProj (EVar x) l sh) =
   && othersW x l rest
     then Cons (MkPair x l) Nil
   else Nil
+takeVar ce rest Nothing l sh = Nil
+
+takeOne : CE -> List I.Expr -> I.Expr -> List (Pair String String)
+takeOne ce rest (EProj e l sh) = takeVar ce rest (varOf e) l sh
 takeOne ce rest e = Nil
 
 takesAt : CE
