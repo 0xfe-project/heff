@@ -19,8 +19,8 @@ A [release](https://github.com/dannypsnl/heff/releases) has heff for
 Linux, macOS and Windows, a program needing nothing installed:
 
 ```sh
-tar xzf heff-0.2.0-linux-x64.tar.gz
-heff-0.2.0-linux-x64/bin/heff help
+tar xzf heff-0.3.0-linux-x64.tar.gz
+heff-0.3.0-linux-x64/bin/heff help
 ```
 
 From the repository, with Node.js and [zig](https://ziglang.org/download/):
