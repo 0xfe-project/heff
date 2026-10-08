@@ -14,12 +14,14 @@
 // (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
 // write, their exit status, loops a million rounds deep, a long loop of
 // operations done at once, time and the network.
+// (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { setSeed, genProgram } from "./gen.mjs";
-import { heff, root } from "./heff.mjs";
+import { heffBin, root } from "./heff.mjs";
+import { pool, run } from "./pool.mjs";
 
 const [nArg = "100", seedArg = "7"] = process.argv.slice(2);
 setSeed(seedArg);
@@ -32,29 +34,32 @@ mkdirSync(work, { recursive: true });
 // after free, where it is)
 const cc = spawnSync("zig", ["version"]).status === 0 ? ["zig", "cc"] : ["cc"];
 const ccFlags = process.env.HEFF_SANITIZE ? ["-O0", "-g", "-fsanitize=address,undefined"] : ["-O1"];
-const buildC = (c, bin) =>
-  spawnSync(cc[0], [...cc.slice(1), ...ccFlags, "-w", c, "-o", bin, "-lm", "-lpthread"], { encoding: "utf8" });
+const buildC = (c, bin) => run(cc[0], [...cc.slice(1), ...ccFlags, "-w", c, "-o", bin, "-lm", "-lpthread"]);
+// (heff run with `args`, a run that does not end in two minutes a
+// failure, not a wait)
+const heff = (args, opts = {}) => run(heffBin, args, { timeout: 120000, ...opts });
 
 // Each backend: compiled, its definitions `wanted` shown as JSON,
 // { name: { value } | { threw } }; a failure is { error }
 const backends = {
-  js: (file, base, wanted) => {
+  js: async (file, base, wanted) => {
     const out = `${base}.mjs`;
-    const r = heff(["compile", file, out, "--backend=esm"]);
+    const r = await heff(["compile", file, out, "--backend=esm"]);
     if (r.status !== 0) return { compile: r.stderr || String(r.error) };
-    return { load: spawnSync(process.execPath, [join(root, "test", "load-js.mjs"), out, ...wanted], { encoding: "utf8", timeout: 30000 }) };
+    return { load: await run(process.execPath, [join(root, "test", "load-js.mjs"), out, ...wanted], { timeout: 30000 }) };
   },
-  c: (file, base, wanted) => {
-    const r = heff(["compile", file, `${base}.c`, "--backend=c"]);
+  c: async (file, base, wanted) => {
+    const r = await heff(["compile", file, `${base}.c`, "--backend=c"]);
     if (r.status !== 0) return { compile: r.stderr || String(r.error) };
-    const b = buildC(`${base}.c`, base);
+    const b = await buildC(`${base}.c`, base);
     if (b.status !== 0) return { compile: b.stderr || String(b.error) };
-    return { load: spawnSync(base, wanted, { encoding: "utf8", timeout: 30000 }) };
+    return { load: await run(base, wanted, { timeout: 30000 }) };
   },
 };
 
+// (what fails is said in the order of the checks, whichever ends first)
 let failed = 0;
-const fail = (msg) => { failed++; console.log(msg); };
+const said = (msgs) => { for (const m of msgs) { failed++; console.log(m); } };
 
 // Values
 // ---------------------------------------------------------------------
@@ -68,11 +73,12 @@ const funsOut = (v) => v.replace(/\w+ = #fun(, )?/g, "").replace(/, \}/g, " }");
 const erasedOut = (v) => v.replace(/\w+ = #erased(, )?/g, "").replace(/, \}/g, " }").replace(/ #erased/g, "");
 
 let compared = 0;
-for (const c of cases) {
+const values = pool(cases, async (c) => {
+  const msgs = [], fail = (msg) => msgs.push(msg);
   const file = join(work, `${c.name}.hf`);
   writeFileSync(file, c.src);
-  const ev = heff(["dump-eval", file]);
-  if (ev.status !== 0) { fail(`NOT EVALUATED ${c.name}:\n${ev.stderr}${ev.error || ""}`); continue; }
+  const ev = await heff(["dump-eval", file]);
+  if (ev.status !== 0) { fail(`NOT EVALUATED ${c.name}:\n${ev.stderr}${ev.error || ""}`); return msgs; }
   // `name = value`, a value going on over the lines that do not start so;
   // an operator's name without its parentheses, as the module exports it
   const interp = new Map();
@@ -84,9 +90,9 @@ for (const c of cases) {
   // loops as loops, it may run for ever)
   const wanted = [...interp.keys()].filter((n) => interp.get(n) !== "<diverged>");
   for (const [be, compile] of Object.entries(backends)) {
-    const r = compile(file, join(work, `${c.name}-${be}`), wanted);
+    const r = await compile(file, join(work, `${c.name}-${be}`), wanted);
     if (r.compile !== undefined) { fail(`NOT COMPILED ${c.name} (${be}):\n${r.compile}`); continue; }
-    if (r.load.status !== 0 || r.load.error) { fail(`LOAD FAILED ${c.name} (${be}): ${(r.load.stderr || String(r.load.error)).split("\n").slice(0, 6).join("\n")}`); continue; }
+    if (r.load.status !== 0 || r.load.error) { fail(`LOAD FAILED ${c.name} (${be}): ${(r.load.stderr || String(r.load.error ?? r.load.signal)).split("\n").slice(0, 6).join("\n")}`); continue; }
     const got = JSON.parse(r.load.stdout);
     for (let [name, want] of interp) {
       if (want === "#erased" || want === "<diverged>") continue;
@@ -108,97 +114,102 @@ for (const c of cases) {
       if (!g || funsOut(g.value) !== want) fail(`DIFF ${at}: compiled ${g && g.value}, interpreted ${want}`);
     }
   }
-}
-console.log(`backends: ${cases.length} programs, ${compared} values compared`);
+  return msgs;
+});
 
 // Programs
 // ---------------------------------------------------------------------
 
-// (a program, compiled by each backend: how each is run)
+// (a program, compiled by each backend: how each is run; its files named
+// by its file and its name)
 const programs = {
-  js: (file, name) => {
-    const out = join(work, `${name}.mjs`);
-    const r = heff(["compile", file, out, "--name", name, "--backend=node"], { cwd: root });
+  js: async (file, name) => {
+    const out = join(work, `${basename(file, ".hf")}-${name}.mjs`);
+    const r = await heff(["compile", file, out, "--name", name, "--backend=node"], { cwd: root });
     return r.status !== 0 ? { error: r.stderr } : { cmd: process.execPath, pre: [out] };
   },
-  c: (file, name) => {
-    const c = join(work, `${name}.c`), bin = join(work, `${name}-c`);
-    const r = heff(["compile", file, c, "--name", name, "--backend=c"], { cwd: root });
+  c: async (file, name) => {
+    const c = join(work, `${basename(file, ".hf")}-${name}.c`), bin = join(work, `${basename(file, ".hf")}-${name}-c`);
+    const r = await heff(["compile", file, c, "--name", name, "--backend=c"], { cwd: root });
     if (r.status !== 0) return { error: r.stderr };
-    const b = buildC(c, bin);
+    const b = await buildC(c, bin);
     return b.status !== 0 ? { error: b.stderr } : { cmd: bin, pre: [] };
   },
 };
 
-// (the program `name` of `file` run by each backend with `args`, what it
-// wrote and its status held to `want`)
-const ran = (what, file, name, args, want, opts = {}) => {
+// (the program `name` of `file` run by each backend in turn with `args`,
+// what it wrote and its status held to `want`; what fails, said)
+const ran = async (what, file, name, args, want, opts = {}) => {
+  const msgs = [];
   for (const [be, build] of Object.entries(programs)) {
-    const p = build(file, name);
-    if (p.error !== undefined) { fail(`FAIL ${what} (${be}): not compiled\n${p.error}`); continue; }
-    const r = spawnSync(p.cmd, [...p.pre, ...args], { encoding: "utf8", timeout: 60000, ...opts });
+    const p = await build(file, name);
+    if (p.error !== undefined) { msgs.push(`FAIL ${what} (${be}): not compiled\n${p.error}`); continue; }
+    const r = await run(p.cmd, [...p.pre, ...args], { timeout: 60000, ...opts });
     const got = { out: r.stdout, err: r.stderr, status: r.status };
     for (const k of Object.keys(want))
-      if (got[k] !== want[k]) fail(`FAIL ${what} (${be}): ${k} ${JSON.stringify(got[k])}, wanted ${JSON.stringify(want[k])}`);
+      if (got[k] !== want[k]) msgs.push(`FAIL ${what} (${be}): ${k} ${JSON.stringify(got[k])}, wanted ${JSON.stringify(want[k])}`);
   }
+  return msgs;
 };
+const checks = [];
 
 // (each backend's world: stdin, the environment, arguments, a file)
-{
+checks.push((async () => {
   const copied = join(work, "copied.txt");
-  ran("echo", "test/node/echo.hf", "main", [copied, "two words"],
+  const msgs = await ran("echo", "test/node/echo.hf", "main", [copied, "two words"],
     { out: `${copied}\ntwo words\nhi\ncopied: from stdin\nmissing: not read\n`, err: "to stderr\n", status: 3 },
     { cwd: root, input: "from stdin", env: { ...process.env, GREETING: "hi" } });
-  if (readFileSync(copied, "utf8") !== "from stdin") fail("FAIL echo: the file");
-}
+  if (readFileSync(copied, "utf8") !== "from stdin") msgs.push("FAIL echo: the file");
+  return msgs;
+})());
 
 // (`heff run`: compiled for Node.js, then run in heff's place, on its streams)
-{
-  const r = heff(["run", "test/node/echo.hf", join(work, "run.txt"), "x"], { cwd: root, input: "in", env: { ...process.env, GREETING: "hi" } });
-  if (r.status !== 3 || r.stderr !== "to stderr\n") fail(`FAIL heff run: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`);
-}
+checks.push((async () => {
+  const r = await heff(["run", "test/node/echo.hf", join(work, "run.txt"), "x"], { cwd: root, input: "in", env: { ...process.env, GREETING: "hi" } });
+  return r.status !== 3 || r.stderr !== "to stderr\n" ? [`FAIL heff run: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`] : [];
+})());
 
 // time and the network: done later, the rest going on then
-ran("sleep and fetch", "test/node/timed.hf", "timed", [], { out: "fetched\n", status: 0 });
+checks.push(ran("sleep and fetch", "test/node/timed.hf", "timed", [], { out: "fetched\n", status: 0 }));
 
 // a module named `main` (main.hf, in no project), compiled to C as
 // parts: its part, main.c, is not the program's entry, which is a part of
 // its own
-{
+checks.push((async () => {
   const alone = mkdtempSync(join(tmpdir(), "heff-main-"));
   copyFileSync(join(root, "test", "node", "main.hf"), join(alone, "main.hf"));
   const dir = join(alone, "parts"), bin = join(work, "main-parts-c");
-  const r = heff(["compile", "main.hf", "parts/", "--name", "main", "--backend=c"], { cwd: alone });
+  const r = await heff(["compile", "main.hf", "parts/", "--name", "main", "--backend=c"], { cwd: alone });
   const parts = r.status === 0 ? readdirSync(dir).filter((f) => f.endsWith(".c")) : [];
-  const b = r.status === 0 ? spawnSync(cc[0], [...cc.slice(1), ...ccFlags, "-w", ...parts.map((f) => join(dir, f)), "-o", bin, "-lm", "-lpthread"], { encoding: "utf8" }) : r;
-  const out = b.status === 0 ? spawnSync(bin, [], { encoding: "utf8", timeout: 60000 }) : b;
-  if (!(parts.includes("main.c") && out.status === 0 && out.stdout === "main, a module of its own: 3 2 1\n"))
-    fail(`FAIL a module named main, as parts: ${parts.join(" ")}\n${out.stdout ?? ""}${out.stderr ?? ""}`);
+  const b = r.status === 0 ? await run(cc[0], [...cc.slice(1), ...ccFlags, "-w", ...parts.map((f) => join(dir, f)), "-o", bin, "-lm", "-lpthread"]) : r;
+  const out = b.status === 0 ? await run(bin, [], { timeout: 60000 }) : b;
   rmSync(alone, { recursive: true, force: true });
-}
+  return parts.includes("main.c") && out.status === 0 && out.stdout === "main, a module of its own: 3 2 1\n" ? []
+    : [`FAIL a module named main, as parts: ${parts.join(" ")}\n${out.stdout ?? ""}${out.stderr ?? ""}`];
+})());
 
 // a computation of an effect the backend has no provider for is refused,
 // and why
-for (const be of ["node", "c"]) {
-  const r = heff(["compile", "examples/counter/counter.hf", join(work, `counter.${be}`), "--name", "counter", `--backend=${be}`], { cwd: root });
-  if (!(r.status !== 0 && r.stderr.includes("counter has the effect std.dom.dom, which is not provided here")))
-    fail(`FAIL an app is not a program (${be}): ${r.status} ${r.stderr}`);
-}
+for (const be of ["node", "c"]) checks.push((async () => {
+  const r = await heff(["compile", "examples/counter/counter.hf", join(work, `counter.${be}`), "--name", "counter", `--backend=${be}`], { cwd: root });
+  return r.status !== 0 && r.stderr.includes("counter has the effect std.dom.dom, which is not provided here") ? []
+    : [`FAIL an app is not a program (${be}): ${r.status} ${r.stderr}`];
+})());
 
 // one world handled at home (a counter: state, peeled off in the
 // language), the rest handed to the backend's providers: the evidence as
 // instance implicits, `main` asks for it, its body finds it, `run` gives it
-ran("evidence found in scope", "test/node/evidence.hf", "run", ["one", "two"], { out: "args: one two\nbye\n", status: 0 });
-ran("state peeled in-language", "test/node/counted.hf", "main", [], { out: "0: one\n1: two\n2: three\ncounted 3\n", status: 0 });
+checks.push(ran("evidence found in scope", "test/node/evidence.hf", "run", ["one", "two"], { out: "args: one two\nbye\n", status: 0 }));
+checks.push(ran("state peeled in-language", "test/node/counted.hf", "main", [], { out: "0: one\n1: two\n2: three\ncounted 3\n", status: 0 }));
 
 // two worlds of the test's own, one's provider acting on the boxes the
 // other's hands out, the world holding them for both (std.handle): held
 // again, the same number; let go of, freed by their maker's provider
-ran("handles shared", "test/node/tally.hf", "main", [],
-  { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 });
+checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
+  { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 }));
 
 // loops, compiled as loops: a million rounds, and the stack does not overflow
-ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 });
+checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 }));
 
 // (each operation goes on at once: the stack must not overflow)
 const loop = join(work, "loop.hf");
@@ -213,13 +224,16 @@ writeFileSync(loop, [
   "main : Co eff Unit",
   "main = loop (io := inl stdio process) (sys := inr stdio process) 100000 0", "",
 ].join("\n"));
-ran("a long loop", loop, "main", [], { out: "100000\n", status: 0 });
+checks.push(ran("a long loop", loop, "main", [], { out: "100000\n", status: 0 }));
 
 // a loop of operations a handler of the language handles: each step's
 // rest called last, a million times, in a small heap -- the stack let go
 // of every so often (a bounce), not as deep as the loop is long
-ran("a long loop, handled in the language", "bench/state.hf", "main", [], { out: "1000000\n", status: 0 },
-  { env: { ...process.env, HEFF_HEAP_MB: "256" } });
+checks.push(ran("a long loop, handled in the language", "bench/state.hf", "main", [], { out: "1000000\n", status: 0 },
+  { env: { ...process.env, HEFF_HEAP_MB: "256" } }));
 
+for (const msgs of await values) said(msgs);
+console.log(`backends: ${cases.length} programs, ${compared} values compared`);
+for (const msgs of await Promise.all(checks)) said(msgs);
 console.log(`backends: ${failed ? `${failed} FAILED` : "all agree"}`);
 process.exit(failed ? 1 : 0);

@@ -1,6 +1,6 @@
 // Child processes, as many at once as there are cores: the goldens' heff
-// runs, the parts of heff built under ASan.  The cache (.heff/vN/*.hc) is
-// shared among heff runs --
+// runs, the backends' programs, the parts of heff built under ASan.  The
+// cache (.heff/vN/*.hc) is shared among heff runs --
 // concurrent writers of one module write the same bytes, and a torn
 // file does not decode, so it is elaborated over.
 import { spawn } from "node:child_process";
@@ -12,10 +12,12 @@ export const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 // | a process run to its end: `{ status, signal, stdout, stderr }`, as
 // | spawnSync answers (a timeout kills it, `signal` then set; one that
-// | cannot be run, `error` set)
-export const run = (cmd, args, { cwd = root, timeout = 600000 } = {}) =>
+// | cannot be run, `error` set); its standard input `input`, then closed
+export const run = (cmd, args, { cwd = root, timeout = 600000, env = process.env, input } = {}) =>
   new Promise((resolve) => {
-    const p = spawn(cmd, args, { cwd });
+    const p = spawn(cmd, args, { cwd, env });
+    p.stdin.on("error", () => {});
+    p.stdin.end(input);
     let stdout = "", stderr = "";
     p.stdout.setEncoding("utf8");
     p.stderr.setEncoding("utf8");
