@@ -15,7 +15,7 @@ export const show = (v, arg = false) => {
   if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {
-      const tag = /^[A-Z]/.test(v.$) ? v.$ : "'" + v.$;
+      const tag = v.$;
       if (!v.a.length) return tag;
       const s = tag + v.a.map((x) => " " + show(x, true)).join("");
       return arg ? `(${s})` : s;
