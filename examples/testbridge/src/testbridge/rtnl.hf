@@ -1,0 +1,321 @@
+-- Talking to the kernel over rtnetlink, as the Go program's libraries
+-- do: each request on a socket of its own (libcontainer's
+-- getNetlinkSocket, then `defer s.Close()`), sent, and the kernel's
+-- answer heard -- its acknowledgement, its error, or the link asked for.
+-- On top, the calls main.go makes of libcontainer's netlink, of tenus
+-- and of net: a bridge and a veth pair made and found, an address put on
+-- a link, a link up, a link enslaved, a default route added.
+--
+-- A call here may fail, as a Go function returning an `error` may: it is
+-- a `Try e a`, a computation whose answer is a failure or its value.
+-- This module's `do` is Go's `if err != nil { return err }`, written
+-- once: its `bind` is the module's own (below), not co's, and stops at
+-- the first failure.  (co's is `C.bind` here.  A module importing this
+-- one and co both has two `bind`s: main.hf imports this one `as R`.)
+
+import co
+import co as C
+import prelude
+import testbridge.bytes
+import testbridge.errno
+import testbridge.ip
+import testbridge.netlink
+import testbridge.requests as Rq
+import testbridge.sys
+
+-- | why a call failed: a system call, and its errno; the kernel's
+-- | answer to a request, an errno; or what was not as it should be
+data Failure = Sys String Int | Kernel Int | Wrong String
+
+-- | a failure, said
+describe : Failure -> String
+describe (Sys call n) = call ++ ": " ++ errnoText n
+describe (Kernel n) = errnoText n
+describe (Wrong why) = why
+
+-- | a link: its name, and its index
+type Link = { name : String, index : Int }
+
+-- | a computation in `e` that may fail
+type Try (e : HFunctor) a = Co e (Either Failure a)
+
+-- (what `k` makes of a value; a failure, as it is)
+orFail : {e : HFunctor}
+       -> {a b : Type}
+       -> (a -> Try e b)
+       -> Either Failure a
+       -> Try e b
+orFail k (Left f) = pure (Left f)
+orFail k (Right x) = k x
+
+-- | `do`'s, here: `c`, then `k` of what it gave; the first failure is
+-- | the whole's
+bind : {e : HFunctor} -> {a b : Type} -> Try e a -> (a -> Try e b) -> Try e b
+bind c k = C.bind c (orFail k)
+
+-- | a value, as a call that did not fail
+ok : {e : HFunctor} -> {a : Type} -> a -> Try e a
+ok x = pure (Right x)
+
+-- | a failure or a value, as a call's answer
+answer : {e : HFunctor} -> {a : Type} -> Either Failure a -> Try e a
+answer r = pure r
+
+-- (a call's errno, as its failure)
+failedCall : {a : Type} -> String -> Either Int a -> Either Failure a
+failedCall call (Left n) = Left (Sys call n)
+failedCall call (Right x) = Right x
+
+-- | a system call, named: its errno, if it fails, a failure of it
+called : {e : HFunctor}
+       -> {a : Type}
+       -> String
+       -> Co e (Either Int a)
+       -> Try e a
+called call c = C.bind c (\r -> pure (failedCall call r))
+
+-- Hearing the kernel
+--------------------------------------------------------------------------------
+
+-- | what a message says of how a request went: nothing (`Nothing`: the
+-- | next message, then), or how
+type Hear a = Msg -> Maybe (Either Failure a)
+
+-- (the next message, unless this one said)
+orNext : {a : Type}
+       -> Maybe (Either Failure a)
+       -> Maybe (Either Failure a)
+       -> Maybe (Either Failure a)
+orNext Nothing next = next
+orNext (Just r) next = Just r
+
+-- | what the messages say of the request `seq`, the first that says;
+-- | a message of another sequence number is wrong (libcontainer's
+-- | CheckMessage; its port is not checked: that needs getsockname, not
+-- | one of the calls testbridge.sys has)
+heard : {a : Type} -> Int -> Hear a -> List Msg -> Maybe (Either Failure a)
+heard seq hear Nil = Nothing
+heard seq hear (Cons m ms) =
+  if m.seq /= seq
+    then Just
+        (Left
+           (Wrong
+              ("netlink: invalid seq "
+               ++ showInt m.seq
+               ++ ", expected "
+               ++ showInt seq)))
+  else orNext (hear m) (heard seq hear ms)
+
+-- | an acknowledgement: an NLMSG_ERROR of errno 0, or NLMSG_DONE; an
+-- | NLMSG_ERROR of another errno is the kernel's failure
+ack : Hear Unit
+ack m =
+  if m.kind == nlmsgError
+    then Just
+        (if errnoOf m == 0 then Right MkUnit else Left (Kernel (errnoOf m)))
+  else if m.kind == nlmsgDone then Just (Right MkUnit)
+  else Nothing
+
+-- (the link a reply is, if it is the one named)
+linkNamed : String -> Msg -> Either Failure Link
+linkNamed name m =
+  if strEq (maybe "" text (attrOf iflaIfname (linkAttrs m))) name
+    then Right { name = name, index = ifIndexOf m }
+  else Left
+      (Wrong
+         ("netlink: asked for "
+          ++ name
+          ++ ", the kernel answered another link"))
+
+-- (no link in the answer)
+noLink : String -> Failure
+noLink name = Wrong ("netlink: no link " ++ name ++ " in the answer")
+
+-- | the link named `name`: an RTM_NEWLINK, its index from the ifinfomsg
+-- | and its name from IFLA_IFNAME; or the kernel's error (ENODEV: no
+-- | link is named that)
+link : String -> Hear Link
+link name m =
+  if m.kind == rtmNewlink then Just (linkNamed name m)
+  else if m.kind == nlmsgError
+    then Just
+        (Left (if errnoOf m == 0 then noLink name else Kernel (errnoOf m)))
+  else if m.kind == nlmsgDone then Just (Left (noLink name))
+  else Nothing
+
+-- (a datagram's messages, or why they are not)
+parsed : Either String (List Msg) -> Either Failure (List Msg)
+parsed (Left why) = Left (Wrong why)
+parsed (Right ms) = Right ms
+
+-- (heard; or not yet, and `more`)
+heardOr : {e : HFunctor}
+        -> {a : Type}
+        -> Try e a
+        -> Maybe (Either Failure a)
+        -> Try e a
+heardOr more Nothing = more
+heardOr more (Just r) = answer r
+
+-- | the kernel's answer to the request `seq`, datagram after datagram on
+-- | `fd` until a message says (a multipart answer, to its NLMSG_DONE:
+-- | libcontainer's HandleAck)
+listen : {e : HFunctor}
+       -> {a : Type}
+       -> {{os : sys <: e}}
+       -> Int
+       -> Int
+       -> Hear a
+       -> Try e a
+listen fd seq hear = do
+  bs <- called "recv" (recv fd 65536)
+  ms <- answer (parsed (messages bs))
+  heardOr (listen fd seq hear) (heard seq hear ms)
+
+-- (`c`, then the socket closed, whatever `c` gave: a failure to close is
+-- not looked at, as Go's `defer s.Close()` does not look)
+closing : {e : HFunctor}
+        -> {a : Type}
+        -> {{os : sys <: e}}
+        -> Int
+        -> Try e a
+        -> Try e a
+closing fd c = C.bind c (\r -> C.bind (close fd) (\_ -> pure r))
+
+-- | a request with the sequence number `seq`, sent on a netlink socket
+-- | of its own, and what `hear` hears in the kernel's answer.  The
+-- | socket is not bound: its first send binds it to a port of the
+-- | kernel's choosing, as Go's bind to port 0 does.
+exchange : {e : HFunctor}
+         -> {a : Type}
+         -> {{os : sys <: e}}
+         -> Int
+         -> Bytes
+         -> Hear a
+         -> Try e a
+exchange seq req hear = do
+  fd <- called "socket" (socket afNetlink (sockRaw + sockCloexec) netlinkRoute)
+  closing fd (do
+    _ <- called "send" (send fd req)
+    listen fd seq hear)
+
+-- libcontainer's netlink, and net.InterfaceByName
+--------------------------------------------------------------------------------
+
+-- | the link named `name` (net.InterfaceByName), by RTM_GETLINK; its
+-- | sequence number is 1, as each of Go's RIB requests' is
+linkByName : {e : HFunctor} -> {{os : sys <: e}} -> String -> Try e Link
+linkByName name = exchange 1 (Rq.getLink 1 name) (link name)
+
+-- | NetworkLinkAdd
+linkAdd : {e : HFunctor}
+        -> {{os : sys <: e}}
+        -> Int
+        -> String
+        -> String
+        -> Try e Unit
+linkAdd seq name kind = exchange seq (Rq.newLink seq name kind) ack
+
+-- | NetworkLinkAddIp (tenus's SetLinkIp)
+linkAddIp : {e : HFunctor}
+          -> {{os : sys <: e}}
+          -> Int
+          -> Link
+          -> Cidr
+          -> Try e Unit
+linkAddIp seq l c = exchange seq (Rq.newAddr seq l.index c) ack
+
+-- | NetworkLinkUp (tenus's SetLinkUp)
+linkUp : {e : HFunctor} -> {{os : sys <: e}} -> Int -> Link -> Try e Unit
+linkUp seq l = exchange seq (Rq.linkUp seq l.index) ack
+
+-- | NetworkCreateVethPair
+createVethPair : {e : HFunctor}
+               -> {{os : sys <: e}}
+               -> Int
+               -> String
+               -> String
+               -> Int
+               -> Try e Unit
+createVethPair seq name peer txqlen =
+  exchange seq (Rq.vethPair seq name peer txqlen) ack
+
+-- | NetworkSetMaster (tenus's AddSlaveIfc): the link `l`'s master the
+-- | link `master`
+setMaster : {e : HFunctor}
+          -> {{os : sys <: e}}
+          -> Int
+          -> Link
+          -> Link
+          -> Try e Unit
+setMaster seq l master =
+  exchange seq (Rq.setMaster seq l.index master.index) ack
+
+-- (the gateway's address, as net.ParseIP reads it)
+gateway : String -> Either Failure Bytes
+gateway ip =
+  maybe
+    (Left (Wrong ("gateway IP " ++ ip ++ " couldn't be parsed")))
+    (\a -> Right a)
+    (parseIp ip)
+
+-- | AddDefaultGw: the default route via the gateway `ip` (written out),
+-- | out of the link named `device`, found by its name as AddRoute finds
+-- | it
+addDefaultGw : {e : HFunctor}
+             -> {{os : sys <: e}}
+             -> Int
+             -> String
+             -> String
+             -> Try e Unit
+addDefaultGw seq ip device = do
+  gw <- answer (gateway ip)
+  l <- linkByName device
+  exchange seq (Rq.defaultRoute seq gw l.index) ack
+
+-- tenus
+--------------------------------------------------------------------------------
+
+-- (the kernel has no such device)
+noDevice : Failure -> Bool
+noDevice (Kernel n) = n == 19
+noDevice _ = False
+
+-- (no link named `name`: the kernel says ENODEV)
+unheardOf : String -> Either Failure Link -> Either Failure Unit
+unheardOf name (Right _) =
+  Left (Wrong ("Interface name " ++ name ++ " already assigned on the host"))
+unheardOf name (Left f) = if noDevice f then Right MkUnit else Left f
+
+-- | no link is named `name` yet (tenus's check, before it makes one)
+unassigned : {e : HFunctor} -> {{os : sys <: e}} -> String -> Try e Unit
+unassigned name = C.bind (linkByName name) (\r -> answer (unheardOf name r))
+
+-- | tenus.NewBridgeWithName: the name not taken, a bridge of it made,
+-- | and found
+newBridgeWithName : {e : HFunctor}
+                  -> {{os : sys <: e}}
+                  -> Int
+                  -> String
+                  -> Try e Link
+newBridgeWithName seq name = do
+  unassigned name
+  linkAdd seq name "bridge"
+  linkByName name
+
+-- | tenus.NewVethPairWithOptions, with a peer's name, the queue's length
+-- | left 0: neither name taken, the pair made, and both found (the
+-- | pair's first link, then its peer)
+newVethPair : {e : HFunctor}
+            -> {{os : sys <: e}}
+            -> Int
+            -> String
+            -> String
+            -> Try e (Pair Link Link)
+newVethPair seq name peer = do
+  unassigned name
+  unassigned peer
+  createVethPair seq name peer 0
+  l <- linkByName name
+  p <- linkByName peer
+  ok (MkPair l p)

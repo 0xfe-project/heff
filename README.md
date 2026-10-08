@@ -208,6 +208,9 @@ world holds for them all.
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.
+`examples/testbridge/` is a project of another kind, built by `heff
+build` there: a Linux program, through C, that makes a bridge and a
+veth pair by rtnetlink, its socket's calls a provider of its own.
 
 ## Tests
 

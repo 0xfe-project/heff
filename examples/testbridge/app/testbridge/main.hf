@@ -1,0 +1,94 @@
+-- testbridge: kubenet's cmd/testbridge/main.go (Go), in heff.  It makes
+-- a bridge with an address, up, and a veth pair, puts an address on the
+-- pair's first link, enslaves it to the bridge, and adds a default route
+-- through the bridge's address -- each step a request to the kernel over
+-- rtnetlink (testbridge.rtnl), on a socket's plain calls
+-- (testbridge.sys).  As the Go program panics, it stops at the first
+-- failure: which step failed, and why, on the standard error, and the
+-- status 1.  It needs Linux, and CAP_NET_ADMIN: run it in a network
+-- namespace of its own (a container's), never on a host whose network
+-- matters.  examples/testbridge/cleanup.sh undoes it.
+--
+-- As in the Go, testveth and kni0 are never set up -- though step 7
+-- brings testveth up, by libcontainer's quirk (testbridge.requests) --
+-- and the parse of each address is not a step: Go drops its error.
+
+import co
+import prelude
+import std.io
+import std.process
+import testbridge.ip
+import testbridge.rtnl as R
+import testbridge.sys
+
+world : HFunctor
+world = stdio <+> process <+> sys
+
+-- | a failure ends the program, as Go's panic does: what failed and
+-- | why, on the standard error, and the status 1
+orDie : {e : HFunctor}
+      -> {a : Type}
+      -> {{io : stdio <: e}}
+      -> {{proc : process <: e}}
+      -> String
+      -> Either R.Failure a
+      -> Co e a
+orDie what (Left f) = do
+  printErr ("FAIL " ++ what ++ ": " ++ R.describe f)
+  exit 1
+  -- (`exit` does not come back, but its type says it comes back with a
+  -- `Unit`: nothing is here, of the type wanted)
+  abandon
+orDie what (Right x) = pure x
+
+-- | a step: done and said, or failed and the end
+step : {e : HFunctor}
+     -> {a : Type}
+     -> {{io : stdio <: e}}
+     -> {{proc : process <: e}}
+     -> String
+     -> R.Try e a
+     -> Co e a
+step what c = do
+  r <- c
+  x <- orDie what r
+  print ("ok   " ++ what)
+  pure x
+
+-- | an address and its prefix, which the program writes
+cidr : String -> Either R.Failure Cidr
+cidr s = either (\why -> Left (Wrong why)) (\c -> Right c) (parseCidr s)
+
+-- | main.go's steps, in its order; each request's sequence number is
+-- | libcontainer's, counted from 1
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{proc : process <: e}}
+        -> {{os : sys <: e}}
+        -> Co e Unit
+program = do
+  ip <- orDie "parse 10.240.0.1/24" (cidr "10.240.0.1/24")
+  bridge <-
+    step "1. create bridge kube-bridge" (R.newBridgeWithName 1 "kube-bridge")
+  print ("       kube-bridge is link " ++ showInt bridge.index)
+  step "2. set 10.240.0.1/24 on kube-bridge" (R.linkAddIp 2 bridge ip)
+  step "3. set kube-bridge up" (R.linkUp 3 bridge)
+  veth <-
+    step
+      "4. create veth pair testveth, peer kni0"
+      (R.newVethPair 4 "testveth" "kni0")
+  vethIp <- orDie "parse 10.240.0.2/24" (cidr "10.240.0.2/24")
+  step "5. set 10.240.0.2/24 on testveth" (R.linkAddIp 5 (fst veth) vethIp)
+  nic <- step "6. look up testveth" (R.linkByName "testveth")
+  print ("       testveth is link " ++ showInt nic.index)
+  step "7. enslave testveth to kube-bridge" (R.setMaster 6 nic bridge)
+  step
+      "8. add default route via 10.240.0.1 dev testveth"
+      (R.addDefaultGw 7 (showIp ip.ip) nic.name)
+
+main : Co world Unit
+main =
+  program
+    (io := \p -> InL (InL p))
+    (proc := \p -> InL (InR p))
+    (os := \p -> InR p)

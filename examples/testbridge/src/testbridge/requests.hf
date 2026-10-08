@@ -1,0 +1,144 @@
+-- The rtnetlink requests testbridge sends, byte for byte as the Go
+-- program's libraries build them (github.com/docker/libcontainer
+-- v2.2.1's netlink package, under github.com/milosgajdos/tenus v0.0.3),
+-- each with the sequence number it is sent with.  Their quirks are kept:
+-- the bridge's kind is not NUL-terminated and the veth's is; a veth pair
+-- is asked for a queue of length 0; and setting a link's master sends an
+-- ifinfomsg whose type is RTM_SETLINK, whose flags are NLM_F_REQUEST --
+-- the bit IFF_UP is -- and which changes every flag (ifi_change ~0): it
+-- brings the link up.
+
+import prelude
+import testbridge.bytes
+import testbridge.ip
+import testbridge.netlink
+
+-- (the flags of a request that makes something, and only if it is not
+-- there, acknowledged)
+creating : Int
+creating = nlmFRequest + nlmFCreate + nlmFExcl + nlmFAck
+
+-- | RTM_NEWLINK: a new link `name` of the kind `kind`, an empty
+-- | ifinfomsg, IFLA_LINKINFO holding IFLA_INFO_KIND (the kind's bytes
+-- | without a NUL), then IFLA_IFNAME (NetworkLinkAdd: `ip link add NAME
+-- | type KIND`)
+newLink : Int -> String -> String -> Bytes
+newLink seq name kind =
+  message
+    rtmNewlink
+    creating
+    seq
+    (cat
+       [ ifinfomsg { family = afUnspec }
+       , attr iflaLinkinfo (attr iflaInfoKind (ascii kind))
+       , attr iflaIfname (cstring name)
+       ])
+
+-- | RTM_NEWADDR: the address `c` on the link `index`, as IFA_LOCAL and
+-- | IFA_ADDRESS both (NetworkLinkAddIp: `ip address add C dev LINK`)
+newAddr : Int -> Int -> Cidr -> Bytes
+newAddr seq index c =
+  message
+    rtmNewaddr
+    creating
+    seq
+    (cat
+       [ ifaddrmsg { family = afInet, prefixlen = c.prefix, index = index }
+       , attr ifaLocal c.ip
+       , attr ifaAddress c.ip
+       ])
+
+-- | RTM_NEWLINK: the link `index` up -- IFF_UP set, the one flag changed
+-- | (NetworkLinkUp: `ip link set LINK up`)
+linkUp : Int -> Int -> Bytes
+linkUp seq index =
+  message
+    rtmNewlink
+    (nlmFRequest + nlmFAck)
+    seq
+    (ifinfomsg
+       { family = afUnspec, index = index, flags = iffUp, change = iffUp })
+
+-- | RTM_NEWLINK: a veth pair, `name` and its peer `peer`, each with a
+-- | queue of `txqlen` (IFLA_TXQLEN), the peer an ifinfomsg and its
+-- | attributes in IFLA_LINKINFO / IFLA_INFO_DATA / VETH_INFO_PEER
+-- | (NetworkCreateVethPair: `ip link add NAME type veth peer name PEER`)
+vethPair : Int -> String -> String -> Int -> Bytes
+vethPair seq name peer txqlen =
+  message
+    rtmNewlink
+    creating
+    seq
+    (cat
+       [ ifinfomsg { family = afUnspec }
+       , attr iflaIfname (cstring name)
+       , u32Attr iflaTxqlen txqlen
+       , attr
+         iflaLinkinfo
+         (cat
+            [ attr iflaInfoKind (cstring "veth")
+            , attr
+              iflaInfoData
+              (attr
+                 vethInfoPeer
+                 (cat
+                    [ ifinfomsg { family = afUnspec }
+                    , attr iflaIfname (cstring peer)
+                    , u32Attr iflaTxqlen txqlen
+                    ]))
+            ])
+       ])
+
+-- | RTM_SETLINK: the link `index`'s master the link `master`, as
+-- | libcontainer's networkMasterAction asks it (`ip link set LINK master
+-- | MASTER`, and up)
+setMaster : Int -> Int -> Int -> Bytes
+setMaster seq index master =
+  message
+    rtmSetlink
+    (nlmFRequest + nlmFAck)
+    seq
+    (cat
+       [ ifinfomsg
+         { family = afUnspec
+         , ifiType = rtmSetlink
+         , index = index
+         , flags = nlmFRequest
+         , change = 4294967295
+         }
+       , u32Attr iflaMaster master
+       ])
+
+-- | RTM_NEWROUTE: the default route via the gateway `gw`, out of the
+-- | link `oif` -- the main table, the boot protocol, the universe's
+-- | scope, unicast; RTA_GATEWAY, then RTA_OIF (AddRoute, as AddDefaultGw
+-- | calls it: `ip route add default via GW dev LINK proto boot`)
+defaultRoute : Int -> Bytes -> Int -> Bytes
+defaultRoute seq gw oif =
+  message
+    rtmNewroute
+    creating
+    seq
+    (cat
+       [ rtmsg
+         { family = afInet
+         , table = rtTableMain
+         , protocol = rtprotBoot
+         , scope = rtScopeUniverse
+         , rtmType = rtnUnicast
+         }
+       , attr rtaGateway gw
+       , u32Attr rtaOif oif
+       ])
+
+-- | RTM_GETLINK: the link named `name` (IFLA_IFNAME), no dump -- the
+-- | kernel answers with one RTM_NEWLINK, or an error.  (Go's
+-- | net.InterfaceByName dumps every link and looks for the name; this
+-- | asks the kernel for the one.)
+getLink : Int -> String -> Bytes
+getLink seq name =
+  message
+    rtmGetlink
+    nlmFRequest
+    seq
+    (cat [ifinfomsg { family = afUnspec }, attr iflaIfname (cstring name)])

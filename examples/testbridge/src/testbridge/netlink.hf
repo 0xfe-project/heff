@@ -1,0 +1,286 @@
+-- Netlink's framing, as <linux/netlink.h> and <linux/rtnetlink.h> lay
+-- it out: a message is a header (struct nlmsghdr, 16 bytes) and a body;
+-- an rtnetlink body is a fixed struct (ifinfomsg, ifaddrmsg, rtmsg) and
+-- attributes after it (struct rtattr: a length, a type, a payload,
+-- padded to 4 bytes), an attribute's payload maybe attributes again.
+-- Every number is in the host's order (testbridge.bytes: little-endian),
+-- every length a count of bytes.  The constants are the kernel's
+-- numbers, which no header gives this program: they are written here.
+-- Flags are distinct bits, so one set of them is their sum.
+
+import prelude
+import testbridge.bytes
+
+-- Constants
+--------------------------------------------------------------------------------
+
+-- | address families (and a socket's domain)
+afUnspec : Int
+afUnspec = 0
+
+afInet : Int
+afInet = 2
+
+afNetlink : Int
+afNetlink = 16
+
+-- | a socket's type: raw, and closed when the program execs another
+sockRaw : Int
+sockRaw = 3
+
+sockCloexec : Int
+sockCloexec = 524288
+
+-- | the protocol of a netlink socket that speaks rtnetlink
+netlinkRoute : Int
+netlinkRoute = 0
+
+-- | nlmsghdr's flags
+nlmFRequest : Int
+nlmFRequest = 1
+
+nlmFMulti : Int
+nlmFMulti = 2
+
+nlmFAck : Int
+nlmFAck = 4
+
+nlmFExcl : Int
+nlmFExcl = 512
+
+nlmFCreate : Int
+nlmFCreate = 1024
+
+-- | nlmsghdr's types: netlink's own ...
+nlmsgError : Int
+nlmsgError = 2
+
+nlmsgDone : Int
+nlmsgDone = 3
+
+-- | ... and rtnetlink's
+rtmNewlink : Int
+rtmNewlink = 16
+
+rtmGetlink : Int
+rtmGetlink = 18
+
+rtmSetlink : Int
+rtmSetlink = 19
+
+rtmNewaddr : Int
+rtmNewaddr = 20
+
+rtmNewroute : Int
+rtmNewroute = 24
+
+-- | a link's attributes (IFLA_*)
+iflaIfname : Int
+iflaIfname = 3
+
+iflaMaster : Int
+iflaMaster = 10
+
+iflaTxqlen : Int
+iflaTxqlen = 13
+
+iflaLinkinfo : Int
+iflaLinkinfo = 18
+
+-- | IFLA_LINKINFO's
+iflaInfoKind : Int
+iflaInfoKind = 1
+
+iflaInfoData : Int
+iflaInfoData = 2
+
+-- | a veth's IFLA_INFO_DATA's: the peer, an ifinfomsg and its attributes
+vethInfoPeer : Int
+vethInfoPeer = 1
+
+-- | an address's attributes (IFA_*)
+ifaAddress : Int
+ifaAddress = 1
+
+ifaLocal : Int
+ifaLocal = 2
+
+-- | a route's attributes (RTA_*)
+rtaOif : Int
+rtaOif = 4
+
+rtaGateway : Int
+rtaGateway = 5
+
+-- | rtmsg's: the main table, a route of the boot protocol, the
+-- | universe's scope, a unicast route
+rtTableMain : Int
+rtTableMain = 254
+
+rtprotBoot : Int
+rtprotBoot = 3
+
+rtScopeUniverse : Int
+rtScopeUniverse = 0
+
+rtnUnicast : Int
+rtnUnicast = 1
+
+-- | a link's flag: up
+iffUp : Int
+iffUp = 1
+
+-- Writing
+--------------------------------------------------------------------------------
+
+-- | a message: its header -- its whole length, its type, its flags, its
+-- | sequence number, and the port it is from, 0, which the kernel fills
+-- | in -- then its body
+message : Int -> Int -> Int -> Bytes -> Bytes
+message kind flags seq body =
+  cat [u32 (16 + length body), u16 kind, u16 flags, u32 seq, u32 0, body]
+
+-- | an attribute: its length (the header's 4 bytes and the payload's,
+-- | not the padding), its type, the payload, padded to 4 bytes.  Nested
+-- | attributes are a payload of attributes, each padded already.
+attr : Int -> Bytes -> Bytes
+attr kind payload =
+  cat [u16 (4 + length payload), u16 kind, payload, padding (length payload)]
+
+-- | an attribute of a 32-bit number
+u32Attr : Int -> Int -> Bytes
+u32Attr kind n = attr kind (u32 n)
+
+-- | struct ifinfomsg's fields (16 bytes): a family, a pad byte, the
+-- | link's type (ARPHRD_*; `ifiType`), its index, its flags, and which
+-- | of the flags are to change
+type IfInfo =
+  { family : Int = 0
+  , ifiType : Int = 0
+  , index : Int = 0
+  , flags : Int = 0
+  , change : Int = 0
+  }
+
+ifinfomsg : IfInfo -> Bytes
+ifinfomsg m =
+  cat [u8 m.family, u8 0, u16 m.ifiType, u32 m.index, u32 m.flags, u32 m.change]
+
+-- | struct ifaddrmsg's (8 bytes): a family, the prefix's length, flags,
+-- | a scope, the link's index
+type IfAddr =
+  { family : Int
+  , prefixlen : Int
+  , flags : Int = 0
+  , scope : Int = 0
+  , index : Int
+  }
+
+ifaddrmsg : IfAddr -> Bytes
+ifaddrmsg m =
+  cat [u8 m.family, u8 m.prefixlen, u8 m.flags, u8 m.scope, u32 m.index]
+
+-- | struct rtmsg's (12 bytes): a family, the lengths of the destination's
+-- | and the source's prefixes, a TOS, the table, the protocol, a scope, a
+-- | type (RTN_*; `rtmType`) and flags
+type Rt =
+  { family : Int
+  , dstLen : Int = 0
+  , srcLen : Int = 0
+  , tos : Int = 0
+  , table : Int
+  , protocol : Int
+  , scope : Int
+  , rtmType : Int
+  , flags : Int = 0
+  }
+
+rtmsg : Rt -> Bytes
+rtmsg m =
+  cat
+    [ u8 m.family
+    , u8 m.dstLen
+    , u8 m.srcLen
+    , u8 m.tos
+    , u8 m.table
+    , u8 m.protocol
+    , u8 m.scope
+    , u8 m.rtmType
+    , u32 m.flags
+    ]
+
+-- Reading
+--------------------------------------------------------------------------------
+
+-- | a message as it came: its header's type, flags, sequence number and
+-- | port, and its body
+type Msg = { kind : Int, flags : Int, seq : Int, port : Int, body : Bytes }
+
+-- (the message of `n` bytes at the front)
+msgOf : Int -> Bytes -> Msg
+msgOf n bs =
+  { kind = at 2 4 bs
+  , flags = at 2 6 bs
+  , seq = at 4 8 bs
+  , port = at 4 12 bs
+  , body = take (n - 16) (drop 16 bs)
+  }
+
+-- (a message, then the others, or why they are not)
+consMsg : Msg -> Either String (List Msg) -> Either String (List Msg)
+consMsg m (Left why) = Left why
+consMsg m (Right ms) = Right (Cons m ms)
+
+-- | the messages of a datagram, one after another, each from a multiple
+-- | of 4 bytes (NLMSG_OK, NLMSG_NEXT); or why they are not messages
+messages : Bytes -> Either String (List Msg)
+messages Nil = Right Nil
+messages bs =
+  if length bs < 16
+    then Left
+        ("netlink: " ++ showInt (length bs) ++ " bytes, short of a header")
+  else (let n = at 4 0 bs
+        in if n < 16 || n > length bs
+          then Left
+              ("netlink: a message of "
+               ++ showInt n
+               ++ " bytes, in "
+               ++ showInt (length bs))
+        else consMsg (msgOf n bs) (messages (drop (align n) bs)))
+
+-- | an attribute as it came: its type, and its payload
+type Attr = { kind : Int, payload : Bytes }
+
+-- | the attributes, one after another (RTA_OK, RTA_NEXT), to the first
+-- | that does not fit.  A type's two high bits (NLA_F_NESTED,
+-- | NLA_F_NET_BYTEORDER) are not of the type.
+attrs : Bytes -> List Attr
+attrs bs =
+  if length bs < 4 then Nil
+  else (let n = at 2 0 bs
+        in if n < 4 || n > length bs then Nil
+        else Cons
+            { kind = at 2 2 bs % 16384, payload = take (n - 4) (drop 4 bs) }
+            (attrs (drop (align n) bs)))
+
+-- | the payload of the first attribute of the type, if there is one
+attrOf : Int -> List Attr -> Maybe Bytes
+attrOf kind as =
+  maybe
+    Nothing
+    (\(a : Attr) -> Just a.payload)
+    (find (\(a : Attr) -> a.kind == kind) as)
+
+-- | what an NLMSG_ERROR says (struct nlmsgerr): its error, the negative
+-- | of an errno, 0 for an acknowledgement; this is the errno
+errnoOf : Msg -> Int
+errnoOf m = 0 - signed32 (at 4 0 m.body)
+
+-- | an ifinfomsg's link index (a reply's body: the ifinfomsg, then
+-- | the attributes)
+ifIndexOf : Msg -> Int
+ifIndexOf m = signed32 (at 4 4 m.body)
+
+-- | the attributes after an ifinfomsg
+linkAttrs : Msg -> List Attr
+linkAttrs m = attrs (drop 16 m.body)

@@ -1,0 +1,212 @@
+-- The kernel's answers, canned, as rtnetlink writes them, and what
+-- testbridge hears in them: an acknowledgement, an error's errno, the
+-- link asked for (its index from the ifinfomsg, its name from its
+-- attributes), a multipart answer to its NLMSG_DONE, and answers that
+-- are wrong -- another request's, or cut short.
+
+import check
+import prelude
+import testbridge.bytes
+import testbridge.netlink
+import testbridge.rtnl as R
+
+-- (a hexadecimal digit's value)
+digit : String -> Int
+digit d = fromMaybe 0 (indexOf d "0123456789abcdef")
+
+-- (two hexadecimal digits, a byte)
+byte : String -> Int
+byte s = 16 * digit (strSlice s 0 1) + digit (strSlice s 1 2)
+
+-- | the bytes written in hexadecimal, a space between each two
+unhex : String -> Bytes
+unhex s = map byte (words s)
+
+-- | what a reply says, said
+showHeard : {a : Type} -> (a -> String) -> Maybe (Either R.Failure a) -> String
+showHeard sh Nothing = "not yet"
+showHeard sh (Just (Left f)) = "failed: " ++ R.describe f
+showHeard sh (Just (Right x)) = "ok: " ++ sh x
+
+-- (the messages of a datagram, none if it is not one)
+msgs : String -> List Msg
+msgs s = either (\_ -> Nil) (\ms -> ms) (messages (unhex s))
+
+-- (what the datagram says, heard as the request `seq` hears)
+heardBy : {a : Type} -> Int -> R.Hear a -> String -> Maybe (Either R.Failure a)
+heardBy seq hear s = R.heard seq hear (msgs s)
+
+showUnit : Unit -> String
+showUnit u = "()"
+
+showLink : R.Link -> String
+showLink l = l.name ++ " " ++ showInt l.index
+
+-- (why a datagram is not messages, or how many there are)
+showParsed : Either String (List Msg) -> String
+showParsed (Left why) = why
+showParsed (Right ms) = showInt (length ms) ++ " messages"
+
+-- fmt: skip
+acked : String
+acked = joinWith " "
+  [ "24 00 00 00  02 00  00 01  06 00 00 00  9a 02 00 00"   -- 36 bytes, NLMSG_ERROR, NLM_F_CAPPED, seq 6, port 666
+  , "00 00 00 00"                                         -- error 0: an acknowledgement
+  , "28 00 00 00  13 00  05 00  06 00 00 00  00 00 00 00"   -- the request's header
+  ]
+
+-- fmt: skip
+exists : String
+exists = joinWith " "
+  [ "24 00 00 00  02 00  00 00  01 00 00 00  9a 02 00 00"   -- NLMSG_ERROR, seq 1
+  , "ef ff ff ff"                                         -- error -17: EEXIST
+  , "40 00 00 00  10 00  05 06  01 00 00 00  00 00 00 00"
+  ]
+
+-- fmt: skip
+unreachable : String
+unreachable = joinWith " "
+  [ "24 00 00 00  02 00  00 00  07 00 00 00  9a 02 00 00"   -- NLMSG_ERROR, seq 7
+  , "9b ff ff ff"                                         -- error -101: ENETUNREACH
+  , "2c 00 00 00  18 00  05 06  07 00 00 00  00 00 00 00"
+  ]
+
+-- fmt: skip
+noSuchDevice : String
+noSuchDevice = joinWith " "
+  [ "24 00 00 00  02 00  00 00  01 00 00 00  9a 02 00 00"   -- NLMSG_ERROR, seq 1
+  , "ed ff ff ff"                                         -- error -19: ENODEV
+  , "30 00 00 00  12 00  01 00  01 00 00 00  00 00 00 00"
+  ]
+
+-- fmt: skip
+testveth : String
+testveth = joinWith " "
+  [ "50 00 00 00  10 00  00 00  01 00 00 00  9a 02 00 00"   -- 80 bytes, RTM_NEWLINK, seq 1
+  , "00 00 01 00  04 00 00 00  03 10 00 00  00 00 00 00"   -- ifinfomsg: ARPHRD_ETHER, link 4, UP|BROADCAST|MULTICAST
+  , "0d 00 03 00  74 65 73 74 76 65 74 68 00  00 00 00"    -- IFLA_IFNAME "testveth\0"
+  , "08 00 04 00  dc 05 00 00"                            -- IFLA_MTU 1500
+  , "08 00 0a 00  03 00 00 00"                            -- IFLA_MASTER 3
+  , "10 00 12 80"                                         -- IFLA_LINKINFO, NLA_F_NESTED
+  , "09 00 01 00  76 65 74 68 00  00 00 00"               --   IFLA_INFO_KIND "veth\0"
+  ]
+
+-- fmt: skip
+kni0 : String
+kni0 = joinWith " "
+  [ "30 00 00 00  10 00  00 00  01 00 00 00  9a 02 00 00"   -- RTM_NEWLINK, 48 bytes, seq 1
+  , "00 00 01 00  05 00 00 00  00 00 00 00  00 00 00 00"   -- link 5
+  , "09 00 03 00  6b 6e 69 30 00  00 00 00"               -- IFLA_IFNAME "kni0\0" (4 bytes short of 48)
+  ]
+
+-- fmt: skip
+multipart : String
+multipart = joinWith " "
+  [ "20 00 00 00  10 00  02 00  03 00 00 00  9a 02 00 00"   -- RTM_NEWLINK, NLM_F_MULTI, seq 3
+  , "00 00 00 00  03 00 00 00  00 00 00 00  00 00 00 00"
+  , "14 00 00 00  03 00  02 00  03 00 00 00  9a 02 00 00"   -- NLMSG_DONE, NLM_F_MULTI, seq 3
+  , "00 00 00 00"
+  ]
+
+-- (the first message of a multipart answer only)
+firstPart : String
+firstPart = joinWith " " (take 32 (words multipart))
+
+-- (the name and index of a reply's link, its master, and its kind)
+linkInfoOf : List Msg -> String
+linkInfoOf Nil = "no message"
+linkInfoOf (Cons m _) =
+  showInt (ifIndexOf m)
+  ++ " "
+  ++ maybe "" text (attrOf iflaIfname (linkAttrs m))
+  ++ ", master "
+  ++ maybe "none" (\b -> showInt (le b)) (attrOf iflaMaster (linkAttrs m))
+  ++ ", kind "
+  ++ maybe
+    "none"
+    (\b -> maybe "none" text (attrOf iflaInfoKind (attrs b)))
+    (attrOf iflaLinkinfo (linkAttrs m))
+
+linkInfo : String -> String
+linkInfo s = linkInfoOf (msgs s)
+
+replies : Test
+replies =
+  group
+    "replies"
+    [ unit
+      "an acknowledgement"
+      (equal showString (showHeard showUnit (heardBy 6 R.ack acked)) "ok: ()")
+    , unit
+      "EEXIST"
+      (equal
+         showString
+         (showHeard showUnit (heardBy 1 R.ack exists))
+         "failed: file exists (EEXIST)")
+    , unit
+      "ENETUNREACH"
+      (equal
+         showString
+         (showHeard showUnit (heardBy 7 R.ack unreachable))
+         "failed: network is unreachable (ENETUNREACH)")
+    , unit
+      "the link asked for"
+      (equal
+         showString
+         (showHeard showLink (heardBy 1 (R.link "testveth") testveth))
+         "ok: testveth 4")
+    , unit
+      "its attributes"
+      (equal showString (linkInfo testveth) "4 testveth, master 3, kind veth")
+    , unit
+      "another link than the one asked for"
+      (equal
+         showString
+         (showHeard showLink (heardBy 1 (R.link "kni0") testveth))
+         "failed: netlink: asked for kni0, the kernel answered another link")
+    , unit
+      "no such link"
+      (equal
+         showString
+         (showHeard showLink (heardBy 1 (R.link "testveth") noSuchDevice))
+         "failed: no such device (ENODEV)")
+    , unit
+      "a multipart answer, to its end"
+      (equal
+         showString
+         (showHeard showUnit (heardBy 3 R.ack multipart))
+         "ok: ()")
+    , unit
+      "a multipart answer, not ended yet"
+      (equal
+         showString
+         (showHeard showUnit (heardBy 3 R.ack firstPart))
+         "not yet")
+    , unit
+      "another request's answer"
+      (equal
+         showString
+         (showHeard showUnit (heardBy 1 R.ack acked))
+         "failed: netlink: invalid seq 6, expected 1")
+    , unit
+      "a message cut short"
+      (equal
+         showString
+         (showParsed (messages (unhex kni0)))
+         "netlink: a message of 48 bytes, in 44")
+    , unit
+      "less than a header"
+      (equal
+         showString
+         (showParsed (messages (unhex "24 00 00 00 02 00 00 00")))
+         "netlink: 8 bytes, short of a header")
+    , unit
+      "two messages"
+      (equal showString (showParsed (messages (unhex multipart))) "2 messages")
+    , unit
+      "a system call's errno"
+      (equal
+         showString
+         (R.describe (Sys "socket" 97))
+         "socket: address family not supported by protocol (EAFNOSUPPORT)")
+    ]
