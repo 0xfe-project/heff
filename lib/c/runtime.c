@@ -313,6 +313,20 @@ static V heff_clo(Fn fn, int arity, int nenv, V *env) {
 
 static inline V *heff_env(V self) { return ((Clo *)self)->env; }
 
+// (a lambda's closure, holding `n`, given up where its body starts,
+// which takes what it holds (#26): its last reference, its shell freed;
+// otherwise each counted.  `n` is a constant where it is called)
+static inline __attribute__((always_inline)) void heff_clo_take(V self, int64_t n) {
+  Clo *c = (Clo *)self;
+  if (c->h.rc == 1) {
+    if (c->memo) heff_drop(c->memo);
+    heff_obj_free(c, sizeof(Clo) + n * sizeof(V));
+  } else {
+    for (int64_t i = 0; i < n; i++) heff_dup(c->env[i]);
+    if (!(c->h.rc & IMMORTAL)) c->h.rc--;
+  }
+}
+
 // (the last reference gone: what it holds given back, then itself)
 // (an object's size, from what it is)
 static size_t heff_size(V v) {
