@@ -240,10 +240,10 @@ lblOf ce l = fromMaybe 0 (M.lookup compareString l ce.lbls)
 type CS =
   { owner : String
   , nlam : Int
-  , lams : List String
-  , protos : List String
+  , lams : List (Pair String String)
+  , protos : List (Pair String String)
   , nstr : Int
-  , strs : List String
+  , strs : List (Pair String String)
   , shapes : List String
   , prims : List String
   }
@@ -293,7 +293,10 @@ strLit str = \s ->
       , lams = s.lams
       , protos = s.protos
       , nstr = s.nstr + 1
-      , strs = Cons (strDef (s.owner ++ "_str" ++ showInt s.nstr) str) s.strs
+      , strs =
+          Cons
+            (MkPair s.owner (strDef (s.owner ++ "_str" ++ showInt s.nstr) str))
+            s.strs
       , shapes = s.shapes
       , prims = s.prims
       }
@@ -350,8 +353,8 @@ addLam proto def = \s ->
       MkUnit
       { owner = s.owner
       , nlam = s.nlam
-      , lams = Cons def s.lams
-      , protos = Cons proto s.protos
+      , lams = Cons (MkPair s.owner def) s.lams
+      , protos = Cons (MkPair s.owner proto) s.protos
       , nstr = s.nstr
       , strs = s.strs
       , shapes = s.shapes
@@ -1653,13 +1656,13 @@ programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
                      (concatList
                         (Cons "static V heff_perform(V p, V k);" Nil)
                         (concatList
-                           (reverse s.strs)
+                           (map snd (reverse s.strs))
                            (concatList
                               (map shapeDef (reverse s.shapes))
                               (concatList
                                  (concatMap (\(e : Emitted1) -> e.protos) ems)
                                  (concatList
-                                    (reverse s.protos)
+                                    (map snd (reverse s.protos))
                                     (concatList
                                        (concatMap primCloDef (reverse s.prims))
                                        (concatList
@@ -1667,7 +1670,7 @@ programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
                                              (\(e : Emitted1) -> e.code)
                                              ems)
                                           (concatList
-                                             (reverse s.lams)
+                                             (map snd (reverse s.lams))
                                              (ending.end ce))))))))))))))
 
 -- (each once, in order: through a map, not a list searched)
@@ -1678,6 +1681,39 @@ sortedOnce xs =
     (M.toList
        (foldl (\m x -> M.insert compareString x (MkUnit : Unit) m) M.empty xs))
 
+-- (what the emitter knows of the whole program)
+ceOf : List Em.Provider -> List I.Def -> Pair (List String) (List String) -> CE
+ceOf provs defs names =
+  { tags =
+      numbered
+        0
+        (concatList
+           knownTags
+           (concatList
+              (fst names)
+              (concatMap
+                 (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil)
+                 provs)))
+        M.empty
+  , lbls =
+      numbered
+        0
+        (sortedOnce
+           (concatList
+              (snd names)
+              (concatMap
+                 (\(p : Em.Provider) -> namesInGo "LBL_" p.text 0 Nil)
+                 provs)))
+        M.empty
+  , funs = foldl arityOne M.empty defs
+  , bounce = Em.bouncing defs
+  , self = Nothing
+  , owned = Nil
+  , after = Nil
+  , borrowed = Nil
+  , bor = borrowing defs
+  }
+
 programWith : String
             -> List Em.Provider
             -> Ending
@@ -1685,40 +1721,205 @@ programWith : String
             -> Pair (List String) (List String)
             -> String
 programWith runtime provs ending defs names =
-  programCE
+  programCE runtime provs ending defs (ceOf provs defs names)
+
+-- Parts: the program in a file for each module (`--split`), which a C
+-- compiler builds apart -- and builds again only what changed
+--------------------------------------------------------------------------------
+
+-- (a definition's module: its key up to its last dot)
+lastDotGo : String -> Int -> Int -> Int
+lastDotGo k i at =
+  if i >= strLength k then at
+  else lastDotGo k (i + 1) (if charCode k i == 46 then i else at)
+
+moduleAt : String -> Int -> String
+moduleAt k at = if at < 0 then k else strSlice k 0 at
+
+moduleOfKey : String -> String
+moduleOfKey k = moduleAt k (lastDotGo k 0 (0 - 1))
+
+-- (a line of the program as a part has it: a definition's functions
+-- seen from every part, not only its own -- what a definition keeps to
+-- itself (`_val`, `_st`, `_init`) stays its own)
+pubLine : String -> String
+pubLine l =
+  if startsWith "static V g_" l
+  && not (endsWith "_val;" l)
+  && not (contains "_init(void)" l)
+    then strSlice l 7 (strLength l)
+  else if startsWith "static V heff_perform(" l then strSlice l 7 (strLength l)
+  else l
+
+-- (a definition's closure: defined in its own part, declared in others)
+isCloDef : String -> Bool
+isCloDef l = startsWith "static Clo g_" l
+
+cloDecl : String -> String
+cloDecl l = case indexOf " =" l of
+  Just at -> "extern Clo " ++ strSlice l 11 at ++ ";"
+  Nothing -> l
+
+-- (what every part begins with: the program's names, the runtime, and
+-- every definition's prototype)
+partHead : Bool -> String -> Ending -> CE -> CS -> List Emitted1 -> List String
+partHead part runtime ending ce s ems =
+  concatList
+    (Cons "// Generated from Hippogriff; do not edit." Nil)
+    (concatList
+       (if part then Cons "#define HEFF_PART" Nil else Nil)
+       (concatList
+          ending.prefix
+          (concatList
+             (map
+                (\p -> "#define " ++ tagName (fst p) ++ " " ++ showInt (snd p))
+                (filter
+                   (\p -> not (elemS (fst p) knownTags))
+                   (M.toList ce.tags)))
+             (concatList
+                (map
+                   (\p ->
+                      "#define " ++ lblName (fst p) ++ " " ++ showInt (snd p))
+                   (M.toList ce.lbls))
+                (concatList
+                   (Cons runtime Nil)
+                   (concatList
+                      (Cons "V heff_perform(V p, V k);" Nil)
+                      (concatList
+                         (map shapeDef (reverse s.shapes))
+                         (concatList
+                            (concatMap primCloDef (reverse s.prims))
+                            (map
+                               (\l ->
+                                  if isCloDef l then cloDecl l else pubLine l)
+                               (concatMap
+                                  (\(e : Emitted1) -> e.protos)
+                                  ems))))))))))
+
+-- (what was made for each definition -- its strings, its lambdas --
+-- by the definition it was made for)
+byOwner : List (Pair String String) -> M.Map String (List String)
+byOwner ps =
+  foldl
+    (\m p ->
+       M.insert
+         compareString
+         (fst p)
+         (Cons (snd p) (fromMaybe Nil (M.lookup compareString (fst p) m)))
+         m)
+    M.empty
+    ps
+
+linesOf : M.Map String (List String) -> String -> List String
+linesOf m o = fromMaybe Nil (M.lookup compareString o m)
+
+-- (a definition, as its part has it)
+ownLines : CS
+         -> M.Map String (List String)
+         -> M.Map String (List String)
+         -> M.Map String (List String)
+         -> Pair I.Def Emitted1
+         -> List String
+ownLines s strs protos lams (MkPair d e) =
+  concatList
+    (linesOf strs (cGlobal d.key))
+    (concatList
+       (map pubLine (linesOf protos (cGlobal d.key)))
+       (concatList
+          (map (\l -> strSlice l 7 (strLength l)) (filter isCloDef e.protos))
+          (concatList
+             (map pubLine e.code)
+             (map pubLine (linesOf lams (cGlobal d.key))))))
+
+pairKey : Pair I.Def Emitted1 -> String
+pairKey (MkPair d _) = d.key
+
+-- (the definitions, by module, each module's in order)
+byModule : List (Pair I.Def Emitted1)
+         -> M.Map String (List (Pair I.Def Emitted1))
+byModule ps =
+  foldl
+    (\m p ->
+       M.insert
+         compareString
+         (moduleOfKey (pairKey p))
+         (Cons
+            p
+            (fromMaybe
+               Nil
+               (M.lookup compareString (moduleOfKey (pairKey p)) m)))
+         m)
+    M.empty
+    (reverse ps)
+
+zipDE : List I.Def -> List Emitted1 -> List (Pair I.Def Emitted1)
+zipDE (Cons d ds) (Cons e es) = Cons (MkPair d e) (zipDE ds es)
+zipDE _ _ = Nil
+
+-- (a module's part)
+modulePart : List String
+           -> CS
+           -> M.Map String (List String)
+           -> M.Map String (List String)
+           -> M.Map String (List String)
+           -> Pair String (List (Pair I.Def Emitted1))
+           -> Pair String String
+modulePart head s strs protos lams (MkPair m ps) =
+  MkPair
+    m
+    (joinWith
+       "\n"
+       (concatList head (concatMap (ownLines s strs protos lams) ps)))
+
+partsWith : String
+          -> List Em.Provider
+          -> Ending
+          -> List I.Def
+          -> CE
+          -> Pair (List Emitted1) CS
+          -> List (Pair String String)
+partsWith runtime provs ending defs ce (MkPair ems s) =
+  Cons
+    (MkPair
+       "main"
+       (joinWith
+          "\n"
+          (concatList
+             (partHead False runtime ending ce s ems)
+             (concatList
+                (map (\(p : Em.Provider) -> p.text) provs)
+                (map pubLine (ending.end ce))))))
+    (map
+       (modulePart
+          (partHead True runtime ending ce s ems)
+          s
+          (byOwner s.strs)
+          (byOwner s.protos)
+          (byOwner s.lams))
+       (M.toList (byModule (zipDE defs ems))))
+
+partsCE : String
+        -> List Em.Provider
+        -> Ending
+        -> List I.Def
+        -> CE
+        -> List (Pair String String)
+partsCE runtime provs ending defs ce =
+  partsWith runtime provs ending defs ce (defsC ce defs emptyCS)
+
+-- | the program as parts: `main`, then a part for each module
+programParts : String
+             -> List Em.Provider
+             -> Ending
+             -> List I.Def
+             -> List (Pair String String)
+programParts runtime provs ending defs =
+  partsCE
     runtime
     provs
     ending
     defs
-    { tags =
-        numbered
-          0
-          (concatList
-             knownTags
-             (concatList
-                (fst names)
-                (concatMap
-                   (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil)
-                   provs)))
-          M.empty
-    , lbls =
-        numbered
-          0
-          (sortedOnce
-             (concatList
-                (snd names)
-                (concatMap
-                   (\(p : Em.Provider) -> namesInGo "LBL_" p.text 0 Nil)
-                   provs)))
-          M.empty
-    , funs = foldl arityOne M.empty defs
-    , bounce = Em.bouncing defs
-    , self = Nothing
-    , owned = Nil
-    , after = Nil
-    , borrowed = Nil
-    , bor = borrowing defs
-    }
+    (ceOf provs defs (namesIn tagsLbls (map (\(d : I.Def) -> d.body) defs)))
 
 -- | the program, its runtime and its providers before it
 programC : String -> List Em.Provider -> Ending -> List I.Def -> String
@@ -1761,6 +1962,27 @@ compileProgramC runtime provs g key eff =
     provs
     { prefix = Nil, end = runEnd eff }
     (L.lowerProgramAnf g key)
+
+partsOf : String
+        -> List Em.Provider
+        -> Ef.Effect
+        -> L.Lowered
+        -> Pair (List (Pair String String)) (List String)
+partsOf runtime provs eff l =
+  MkPair
+    (programParts runtime provs { prefix = Nil, end = runEnd eff } l.defs)
+    l.errors
+
+-- | the program `compileProgramC` makes, as parts (`programParts`), and
+-- | what is wrong with it
+compileProgramParts : String
+                    -> List Em.Provider
+                    -> G.Globals
+                    -> String
+                    -> Ef.Effect
+                    -> Pair (List (Pair String String)) (List String)
+compileProgramParts runtime provs g key eff =
+  partsOf runtime provs eff (L.lowerProgramAnf g key)
 
 -- | one C file that shows the definitions it is asked for, of those
 -- | given (each by its name and key), as test/load-js.mjs shows

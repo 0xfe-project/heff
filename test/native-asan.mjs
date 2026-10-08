@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// heff compiled through C, checked by AddressSanitizer: output/heff.c
+// heff compiled through C, checked by AddressSanitizer: output/heff.d/
 // (scripts/build.mjs) built by the system's clang with
 // `-fsanitize=address` (zig's has no ASan runtime) and no free lists
 // (`-DSMALL_MAX=0`, so that a use after the last reference is a use after
@@ -33,8 +33,9 @@ const step = (what, cmd, args, opts = {}) => {
   return r;
 };
 
-const c = join(root, "output", "heff.c"), heff = join(work, "bin", "heff");
-step("building it", "clang", ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0", c, "-o", heff, "-lm", "-lpthread"]);
+const parts = join(root, "output", "heff.d"), heff = join(work, "bin", "heff");
+const c = readdirSync(parts).filter((f) => f.endsWith(".c")).map((f) => join(parts, f));
+step("building it", "clang", ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0", ...c, "-o", heff, "-lm", "-lpthread"]);
 
 // (what it leaves at its end is no fault: a program's last objects are
 // the system's to take back)

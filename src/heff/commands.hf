@@ -332,6 +332,43 @@ writeOut outPath done o = do
             exit 1
     else exit 1
 
+-- (the parts of a C program, each `DIR/NAME.c`, written)
+writePartsGo : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> String
+             -> List (Pair String String)
+             -> Co e Bool
+writePartsGo dir Nil = pure True
+writePartsGo dir (Cons (MkPair name text) rest) = do
+  st <- styleNow
+  ok <- writeFile (P.join st dir (name ++ ".c")) text
+  if ok then writePartsGo dir rest else pure False
+
+-- | a C program as parts, in the directory `dir` (what was in it before
+-- | gone, so that a module no longer in the program is not built)
+writeParts : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : fs <: e}}
+           -> String
+           -> Co e Unit
+           -> Pair (List (Pair String String)) (List String)
+           -> Co e Unit
+writeParts dir done (MkPair parts errors) = do
+  emitErrs errors
+  if null errors
+      then do
+        gone <- remove dir
+        made <- mkDir dir
+        ok <- writePartsGo dir parts
+        if ok then done
+          else do
+            printErr ("cannot write " ++ dir)
+            exit 1
+    else exit 1
+
 compileFound : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
@@ -619,10 +656,21 @@ compileFoundC file name outPath runtime done c available = case Dr.findRunnable
     printErr ("heff: " ++ file ++ ": " ++ why)
     exit 1
   Right r ->
-    writeOut
-      outPath
-      done
-      (Ec.compileProgramC runtime available c.top.globals r.key r.effect)
+    -- (a directory, `OUT/`: the program as parts, a file for each module)
+    if endsWith "/" outPath
+      then writeParts
+          (strSlice outPath 0 (strLength outPath - 1))
+          done
+          (Ec.compileProgramParts
+             runtime
+             available
+             c.top.globals
+             r.key
+             r.effect)
+    else writeOut
+        outPath
+        done
+        (Ec.compileProgramC runtime available c.top.globals r.key r.effect)
 
 -- (lib/c/runtime.c, what a C program is bundled with)
 readRuntimeC : {e : HFunctor}
@@ -715,7 +763,7 @@ cCmd name outPath file =
        ("wrote "
         ++ outPath
         ++ ": build it with `zig cc -O2 "
-        ++ outPath
+        ++ (if endsWith "/" outPath then outPath ++ "*.c" else outPath)
         ++ " -o PROGRAM`"))
 
 ranStatus : Ran -> Int
@@ -741,24 +789,28 @@ programsIn st (Cons x rest) = do
     Just _ -> Cons x more
     Nothing -> more)
 
--- (`.heff/build/X.c`, by `zig cc`, is `bin/X`)
+-- (`.heff/build/X/`, a C file a module, by `zig cc` -- which builds
+-- them at once, and again only those that changed -- is `bin/X`)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
+      -> {{disk : fs <: e}}
       -> P.Style
       -> String
       -> Co e Unit
       -> Co e Unit
 zigCc st x next = do
+  names <- readDir (P.join st (P.join st ".heff" "build") x)
   r <-
     run
       "zig"
-      [ "cc"
-      , "-O2"
-      , P.join st (P.join st ".heff" "build") (x ++ ".c")
-      , "-o"
-      , P.join st "bin" x
-      ]
+      (concatList
+         ["cc", "-O2", "-w"]
+         (concatList
+            (map
+               (\n -> P.join st (P.join st (P.join st ".heff" "build") x) n)
+               (filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+            ["-o", P.join st "bin" x, "-lm"]))
   if ranStatus r == 0
       then do
         print ("wrote " ++ P.join st "bin" x)
@@ -804,7 +856,7 @@ buildApp st x a next =
   if strEq a.backend "c"
     then cThen
         (Just a.run)
-        (P.join st (P.join st ".heff" "build") (x ++ ".c"))
+        (P.join st (P.join st ".heff" "build") x ++ "/")
         (P.join st (P.join st "app" x) "main.hf")
         (zigCc st x next)
   else if strEq a.backend "node"
