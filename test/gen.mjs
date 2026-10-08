@@ -21,8 +21,8 @@ export function genProgram() {
   const out = [];
   const sums = [];
   const fns = []; // { name, params: [ty], ret: ty }
-  const bool = { k: "sum", name: "Bool", ctors: [["true", []], ["false", []]] };
-  out.push("data Bool = 'true | 'false\n");
+  const bool = { k: "sum", name: "Bool", ctors: [["True", []], ["False", []]] };
+  out.push("data Bool = True | False\n");
   sums.push(bool);
   const nSums = range(1, 3);
   for (let i = 0; i < nSums; i++) {
@@ -35,12 +35,12 @@ export function genProgram() {
       for (let a = 0; a < nArgs; a++) {
         args.push(pick([bool, ...sums, self, { k: "int" }]));
       }
-      self.ctors.push([`c${i}${j}`, args]);
+      self.ctors.push([`C${i}${j}`, args]);
     }
     // a recursive type needs a base case
-    if (!self.ctors.some(([, as]) => as.every((t) => t !== self))) self.ctors.push([`z${i}`, []]);
+    if (!self.ctors.some(([, as]) => as.every((t) => t !== self))) self.ctors.push([`Z${i}`, []]);
     sums.push(self);
-    out.push(`data ${name} = ` + self.ctors.map(([t, as]) => `'${t}` + as.map((a) => " " + tyStr(a)).join("")).join(" | ") + "\n");
+    out.push(`data ${name} = ` + self.ctors.map(([t, as]) => t + as.map((a) => " " + tyStr(a)).join("")).join(" | ") + "\n");
   }
   // a theory, and a record of it
   if (chance(0.7)) {
@@ -100,8 +100,8 @@ function genExpr(ty, env, fns, depth, self, ind) {
     const cs = ctors.length ? ctors : ty.ctors;
     opts.push(() => {
       const [t, as] = pick(cs);
-      if (as.length === 0) return `'${t}`;
-      return `'${t} ` + as.map((a) => paren(genExpr(a, env, fns, depth - 1, self, ind))).join(" ");
+      if (as.length === 0) return t;
+      return `${t} ` + as.map((a) => paren(genExpr(a, env, fns, depth - 1, self, ind))).join(" ");
     });
     if (depth > 0) {
       const scrutinees = env.filter((v) => v.ty.k === "sum");
@@ -112,7 +112,7 @@ function genExpr(ty, env, fns, depth, self, ind) {
           const names = as.map((_, j) => `${s.name}_${i}_${j}`);
           const env2 = env.concat(as.map((a, j) => ({ name: names[j], ty: a })));
           const body = genExpr(ty, env2, fns, depth - 1, self, col);
-          return " ".repeat(col) + `'${t}${names.map((n) => " " + n).join("")} -> ${body}`;
+          return " ".repeat(col) + `${t}${names.map((n) => " " + n).join("")} -> ${body}`;
         });
         return `(case ${s.name} of\n${arms.join("\n")})`;
       });

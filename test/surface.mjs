@@ -24,7 +24,7 @@ const rejected = [
   ["test/modules/transitive.hf", "no such variable not in scope"],
   ["test/modules/clash.hf", "`Bool` is defined by more than one module imported: a, c"],
   ["test/errors/large-elim.hf", "cannot eliminate from sum type into large type"],
-  ["test/errors/odd-and-even.hf", "no such tag zero in type OddAndEven.odd"],
+  ["test/errors/odd-and-even.hf", "no such tag Zero in type OddAndEven.odd"],
   ["test/errors/rec.hf", "variable a is the definition being elaborated"],
   ["test/errors/contra.hf", "the implicit arguments found do not fit together"],
   ["test/errors/specialize.hf", "neutrals Bool and Unit are not equal"],

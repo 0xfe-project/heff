@@ -296,7 +296,7 @@ expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/li
 // is not on the PATH
 write("tool/package.hf", manifestOf("tool"));
 write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
-write("tool/app/tool/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = 'node, run = \"main\" }\n");
+write("tool/app/tool/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = Node, run = \"main\" }\n");
 write("tool/app/tool/main.hf", "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print greeting\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
 const inTool = (...args) => spawnSync(heffBin, args, { cwd: join(work, "tool"), encoding: "utf8" });
 const built = inTool("build");

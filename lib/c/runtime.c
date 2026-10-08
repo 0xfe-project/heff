@@ -1325,9 +1325,7 @@ static void heff_show(Buf *b, V v, int arg) {
     }
   }
   const char *name = heff_tag_names[tag];
-  int upper = name[0] >= 'A' && name[0] <= 'Z';
   if (n && arg) buf_str(b, "(");
-  if (!upper) buf_str(b, "'");
   buf_str(b, name);
   for (int i = 0; i < n; i++) { buf_str(b, " "); heff_show(b, fs[i], 1); }
   if (n && arg) buf_str(b, ")");
