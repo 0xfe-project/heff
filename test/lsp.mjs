@@ -231,6 +231,18 @@ try {
   const rOutline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/errors/recover.hf") } });
   expect("an outline of what does not elaborate", rOutline.result && ["Bool", "f", "g", "h", "k", "bad", "m", "not", "n"].join() === rOutline.result.map((y) => y.name).join(), rOutline.result && rOutline.result.map((y) => y.name));
   notify("textDocument/didClose", { textDocument: { uri: uri("test/errors/recover.hf") } });
+
+  // (a document opened or closed has its project elaborated anew when it
+  // is next asked of -- the repository's takes seconds -- so the documents
+  // asked of are opened first, and what is asked of each project is asked
+  // together: the repository's, then test/modules')
+  const whereSrc = disk("test/surface/where.hf");
+  const amb = disk("test/surface/amb.hf");
+  const ann = disk("test/surface/binder-ann.hf");
+  for (const [f, text] of [["test/surface/where.hf", whereSrc], ["test/surface/amb.hf", amb], ["test/surface/binder-ann.hf", ann]]) {
+    open(f, text);
+    await diagnosticsOf(uri(f));
+  }
   const wsym = await request("workspace/symbol", { query: "twic" });
   expect("the project's symbols", wsym.result && wsym.result.some((s) => s.name === "twice" && s.location.uri === uri("test/surface/basics.hf")), wsym.result);
 
@@ -238,48 +250,24 @@ try {
   const recDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "map f ys") });
   expect("definition of a recursive call", recDef.result && recDef.result.range.start.line === pos(basics, "map :").line, recDef.result);
 
-  // references: the signature, each equation, each use, a watch; across modules
-  const where = (r) => `${r.uri.slice(r.uri.lastIndexOf("/") + 1)}:${r.range.start.line}:${r.range.start.character}-${r.range.end.character}`;
+  // references: the signature, each equation, each use, a watch
   const refs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)"), context: { includeDeclaration: true } });
   const notLines = refs.result && refs.result.filter((r) => r.uri === uri("test/surface/basics.hf")).map((r) => r.range.start.line);
   expect("references in a file", notLines && [pos(basics, "not :"), pos(basics, "not True"), pos(basics, "not False"), pos(basics, "not (not"), pos(basics, ">>> not")].every((p) => notLines.includes(p.line)) && notLines.length === 6, refs.result);
   const usesOnly = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "not (not b)"), context: { includeDeclaration: false } });
   expect("references without the definition", usesOnly.result && usesOnly.result.length === 3, usesOnly.result);
-  const a = disk("test/modules/src/a.hf");
-  open("test/modules/src/a.hf", a);
-  await diagnosticsOf(uri("test/modules/src/a.hf"));
-  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: true } });
-  const acrossAt = across.result ? across.result.map(where) : [];
-  const qNot = pos(qualified, "A.not");
-  expect("references across modules", acrossAt.includes(`b.hf:${pos(good, "not", 1).line}:${pos(good, "not", 1).character}-${pos(good, "not", 1).character + 3}`) &&
-    acrossAt.includes(`qualified.hf:${qNot.line}:${qNot.character + 2}-${qNot.character + 5}`) && acrossAt.filter((x) => x.startsWith("a.hf")).length === 3, acrossAt);
-
-  // renaming: every occurrence, in every file; refused for a local, a
-  // primitive, a name of another kind, and a name already there
-  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not True") });
-  expect("prepare a rename", prep.result && prep.result.placeholder === "not" && prep.result.range.start.line === pos(a, "not True").line, prep);
-  const prepLocal = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
-  expect("prepare a rename of a local", prepLocal.result && prepLocal.result.placeholder === "ys", prepLocal);
-  const prepPrim = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "intAdd") });
-  expect("no rename of a primitive", prepPrim.error && prepPrim.error.message.includes("primitive"), prepPrim);
-  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "neg" });
-  const edits = ren.result && ren.result.changes;
-  expect("a rename", edits && edits[uri("test/modules/src/a.hf")].length === 3 && edits[uri("test/modules/src/b.hf")].length === 2 &&
-    edits[uri("test/modules/qualified.hf")].length === 2 && Object.values(edits).flat().every((e) => e.newText === "neg" && e.range.end.character - e.range.start.character === 3), edits);
-  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "Not" });
-  expect("no rename to another kind of name", wrongKind.error, wrongKind);
-  // (`b` defines `twice`, which would hide the imported `not` renamed to it)
-  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "twice" });
-  expect("no rename to a name already there", captured.error && captured.error.message.includes("twice"), captured);
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
 
   // a local: its binder and its uses, in its equation only (`f` is bound by
   // each equation of `map`); renamed there, unless the new name would be
-  // captured, or capture a name used there
+  // captured, or capture a name used there; a primitive is not renamed
   const lineOf = (r) => r.range.start.line;
   const eq2 = pos(basics, "map f (Cons").line;
   const fRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "f y"), context: { includeDeclaration: true } });
   expect("references of a local", fRefs.result && fRefs.result.length === 3 && fRefs.result.every((r) => lineOf(r) === eq2), fRefs.result);
+  const prepLocal = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
+  expect("prepare a rename of a local", prepLocal.result && prepLocal.result.placeholder === "ys", prepLocal);
+  const prepPrim = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "intAdd") });
+  expect("no rename of a primitive", prepPrim.error && prepPrim.error.message.includes("primitive"), prepPrim);
   const yRen = await request("textDocument/rename", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "y ys) = Cons"), newName: "z" });
   const yEdits = yRen.result && yRen.result.changes[uri("test/surface/basics.hf")];
   expect("a rename of a local", yEdits && yEdits.length === 2 && yEdits.every((e) => lineOf(e) === eq2 && e.newText === "z"), yRen);
@@ -291,9 +279,6 @@ try {
   // a local definition of a `where`: under its parent in the outline; its
   // signature, the head of each of its equations and each use are it,
   // renamed together
-  const whereSrc = disk("test/surface/where.hf");
-  open("test/surface/where.hf", whereSrc);
-  await diagnosticsOf(uri("test/surface/where.hf"));
   const wOutline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/where.hf") } });
   const wSym = (n) => wOutline.result && wOutline.result.find((s) => s.name === n);
   expect("local definitions in the outline", wSym("scaled") && wSym("scaled").children.map((c) => c.name).join() === "times,go" &&
@@ -311,28 +296,50 @@ try {
   const consRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/where.hf") }, position: pos(whereSrc, ":: go ys"), context: { includeDeclaration: true } });
   expect("an operator in a pattern binds nothing", consRefs.result && consRefs.result.some((r) => r.uri === uri("lib/prelude.hf")), consRefs.result);
   // an instance argument, `{{ev : pick <: e}}`: bound in the equations
-  const amb = disk("test/surface/amb.hf");
-  open("test/surface/amb.hf", amb);
-  await diagnosticsOf(uri("test/surface/amb.hf"));
   const evRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/amb.hf") }, position: pos(amb, "ev (Flip"), context: { includeDeclaration: true } });
   const evLines = evRefs.result && evRefs.result.map(lineOf);
   expect("references of an instance argument", evLines && evLines.length === 2 &&
     evLines.includes(pos(amb, "{{ev : pick <: e}} -> Co e Bool").line) && evLines.includes(pos(amb, "ev (Flip").line), evRefs.result);
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/amb.hf") } });
 
   // a lambda's annotated binder, `\(r : R) -> ...`: its uses are its
-  const ann = disk("test/surface/binder-ann.hf");
-  open("test/surface/binder-ann.hf", ann);
-  await diagnosticsOf(uri("test/surface/binder-ann.hf"));
   const rRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/binder-ann.hf") }, position: pos(ann, "r.a + r.b"), context: { includeDeclaration: true } });
   const annLine = pos(ann, "r.a + r.b").line;
   expect("references of an annotated binder", rRefs.result && rRefs.result.length === 3 && rRefs.result.every((r) => lineOf(r) === annLine), rRefs.result);
-  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/binder-ann.hf") } });
+
+  // a theory's field, used by the fields after it and projected
+  const tRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "t -> t -> t"), context: { includeDeclaration: true } });
+  const tLines = tRefs.result ? tRefs.result.map(lineOf) : [];
+  expect("references of a field", tLines.includes(pos(basics, "t : Type").line) && tLines.filter((l) => l === pos(basics, "m : t").line).length === 3 && tLines.includes(pos(basics, "r.t").line), tRefs.result);
+  for (const f of ["test/surface/where.hf", "test/surface/amb.hf", "test/surface/binder-ann.hf"])
+    notify("textDocument/didClose", { textDocument: { uri: uri(f) } });
+
+  // references across modules
+  const where = (r) => `${r.uri.slice(r.uri.lastIndexOf("/") + 1)}:${r.range.start.line}:${r.range.start.character}-${r.range.end.character}`;
+  const a = disk("test/modules/src/a.hf");
+  open("test/modules/src/a.hf", a);
+  await diagnosticsOf(uri("test/modules/src/a.hf"));
+  const across = await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: true } });
+  const acrossAt = across.result ? across.result.map(where) : [];
+  const qNot = pos(qualified, "A.not");
+  expect("references across modules", acrossAt.includes(`b.hf:${pos(good, "not", 1).line}:${pos(good, "not", 1).character}-${pos(good, "not", 1).character + 3}`) &&
+    acrossAt.includes(`qualified.hf:${qNot.line}:${qNot.character + 2}-${qNot.character + 5}`) && acrossAt.filter((x) => x.startsWith("a.hf")).length === 3, acrossAt);
+
+  // renaming: every occurrence, in every file; refused for a name of
+  // another kind, and a name already there
+  const prep = await request("textDocument/prepareRename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not True") });
+  expect("prepare a rename", prep.result && prep.result.placeholder === "not" && prep.result.range.start.line === pos(a, "not True").line, prep);
+  const ren = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "neg" });
+  const edits = ren.result && ren.result.changes;
+  expect("a rename", edits && edits[uri("test/modules/src/a.hf")].length === 3 && edits[uri("test/modules/src/b.hf")].length === 2 &&
+    edits[uri("test/modules/qualified.hf")].length === 2 && Object.values(edits).flat().every((e) => e.newText === "neg" && e.range.end.character - e.range.start.character === 3), edits);
+  const wrongKind = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "Not" });
+  expect("no rename to another kind of name", wrongKind.error, wrongKind);
+  // (`b` defines `twice`, which would hide the imported `not` renamed to it)
+  const captured = await request("textDocument/rename", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), newName: "twice" });
+  expect("no rename to a name already there", captured.error && captured.error.message.includes("twice"), captured);
 
   // a file changed on disk, not in the editor: told of, the project is
   // elaborated again
-  open("test/modules/src/a.hf", a);
-  await diagnosticsOf(uri("test/modules/src/a.hf"));
   const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "not :"), context: { includeDeclaration: false } })).result || [];
   // (in app/, where test/golden.mjs, run at the same time, looks for no file)
   const watched = "test/modules/app/lsp-watched.hf";
@@ -344,11 +351,6 @@ try {
   notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 3 }] });
   expect("a file deleted on disk", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
-
-  // a theory's field, used by the fields after it and projected
-  const tRefs = await request("textDocument/references", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "t -> t -> t"), context: { includeDeclaration: true } });
-  const tLines = tRefs.result ? tRefs.result.map(lineOf) : [];
-  expect("references of a field", tLines.includes(pos(basics, "t : Type").line) && tLines.filter((l) => l === pos(basics, "m : t").line).length === 3 && tLines.includes(pos(basics, "r.t").line), tRefs.result);
 
   // formatting: one edit, the whole text, a definition under `-- fmt: skip`
   // as written; what does not parse is left, with a warning
