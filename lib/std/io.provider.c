@@ -7,7 +7,11 @@
 // function of the operation's (`ReadStdin`'s) is asked for its value
 // through `heff_tr`.  It owns `p` and `k` (reference counts, as
 // lib/c/runtime.c says): it takes what it keeps of `p` (`heff_dup`),
-// drops `p`, and gives `k` away.  It is bundled after lib/c/runtime.c,
+// drops `p`, and gives `k` away.  A number is as the runtime keeps it: an
+// Int a word (`INT_OF`, `MK_INT`) or big, an Int64 and a UInt64 as an Int
+// is, an integer of a fixed-width type of up to 32 bits a word of its
+// value, a Float32 a word of its bits (`heff_f32_of`, `heff_f32`), a Float
+// boxed (`FLT_OF`, `heff_flt`).  It is bundled after lib/c/runtime.c,
 // whose functions it uses -- among them the world's, which hold what
 // every provider hands out (`heff_hold`, `heff_held`, `heff_release`:
 // lib/std/handle.hf says how).

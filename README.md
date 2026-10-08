@@ -183,6 +183,43 @@ calm : String
 calm = greet "hi"                 -- "hi"; greet (loud := True) "hi" is "hi!"
 ```
 
+## Numbers
+
+`Int` is an integer of any size, `Float` IEEE 754's double (`Float64`
+is another name for it).  Built in beside them are the fixed-width
+numbers: `Int8`, `Int16`, `Int32` and `Int64` (two's complement),
+`UInt8` to `UInt64`, and `Float32` (IEEE 754's single).  An integer of
+one wraps around, as the machine's does, divides rounding toward zero,
+and shifts by the amount modulo its bits; each operation of a `Float32`
+is rounded to one.  A literal checked at one of them is of it, and must
+be one of its values (`300` at `UInt8` is an error, as `1.5` at `Int32`
+is); a literal whose type is not given is an `Int` or a `Float`:
+
+```haskell
+import prelude
+import uint8 as U8
+
+mask : UInt8
+mask = 240
+
+-- >>> U8.show (U8.add mask 255)
+-- "239"
+```
+
+Each has a module, imported by a name (`import int32 as I32`), whose
+operations are named as the prelude's: `add`, `div`, `rem`, `compare`,
+`show`, the bits' (`and`, `or`, `xor`, `complement`, `shiftL`,
+`shiftR`), and `fromInt` and `toInt`, by way of which one type's value
+becomes another's (`I8.fromInt (I32.toInt x)`); `float32`'s has
+`fromFloat`, `toFloat` and `sqrt`.  Its operators, `+` to `>=`, are the
+module's too, for a module that imports it as it is and the prelude by a
+name.  A provider is given them as the backend keeps them: in
+JavaScript an `Int`, an `Int64` and a `UInt64` are BigInts, any other
+number a number; in C an integer of up to 32 bits is a word of its value
+(`INT_OF`), one of 64 bits is kept as an `Int` is, a `Float32` is a word
+of its bits (`heff_f32_of`, `heff_f32`), and a `Float` is boxed
+(`FLT_OF`, `heff_flt`).
+
 ## Effects
 
 `lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program
@@ -215,7 +252,8 @@ repository's, a release's, or the heff home's (`heff install` puts it
 there).  Its modules are imported by their names: `builtin` (implicit
 in every module), `prelude`, `co`, `state`, `exn`, `parallel`, `array`,
 `map`, `set`, and `manifest` (the types of `package.hf` and
-`build.hf`).  The batteries ship with it,
+`build.hf`); the fixed-width numbers' are `int8` to `int64`, `uint8` to
+`uint64` and `float32`.  The batteries ship with it,
 under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one
