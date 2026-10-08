@@ -46,6 +46,95 @@ runSyn (MkSyn f) e = f e
 runChk : Chk -> ElabEnv -> V.Ty -> Elab M.El
 runChk (MkChk f) e a = f e a
 
+-- Mentions
+--------------------------------------------------------------------------------
+
+anyP : {a : Type} -> (a -> Bool) -> List a -> Bool
+anyP p Nil = False
+anyP p (Cons x xs) = p x || anyP p xs
+
+anyIdxGo : {a : Type} -> Int -> (Int -> a -> Bool) -> List a -> Bool
+anyIdxGo i f Nil = False
+anyIdxGo i f (Cons x xs) = f i x || anyIdxGo (i + 1) f xs
+
+anyWithIndex : {a : Type} -> (Int -> a -> Bool) -> List a -> Bool
+anyWithIndex f xs = anyIdxGo 0 f xs
+
+-- | whether syntax mentions a local, of those `var d i` says (`i` under
+-- | `d` binders of the term)
+type Mentions =
+  { el : Int -> Sx.Tm -> Bool
+  , ty : Int -> Sx.Ty -> Bool
+  , var : Int -> Int -> Bool
+  }
+
+armMentions : Mentions -> Int -> Pair String (Pair (Array String) Sx.Tm) -> Bool
+armMentions r d (MkPair tag (MkPair xs b)) = r.el (d + A.length xs) b
+
+fieldMentions : Mentions -> Int -> Pair String Sx.Tm -> Bool
+fieldMentions r d (MkPair k v) = r.el d v
+
+variantMentions : Mentions -> Int -> Pair String (Array Sx.Ty) -> Bool
+variantMentions r d (MkPair k args) = anyP (r.ty d) (A.toList args)
+
+mentionsTermF : Mentions -> Int -> Sx.Tm -> Bool
+mentionsTermF r d t = case t of
+  SLocal i -> r.var d i
+  SCode a -> r.ty d a
+  SApp f a -> r.el d f || r.el d a
+  SLam dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
+  SLam dd (AbsConst b) -> r.ty d dd || r.el d b
+  SCons dct -> anyP (fieldMentions r d) (D.toList dct)
+  SProj e l -> r.el d e
+  STag x as -> anyP (r.el d) (A.toList as)
+  SMatch e cs -> r.el d e || anyP (armMentions r d) (D.toList cs)
+  SSpecialize e l v -> r.el d e || r.el d v
+  SIs e -> r.el d e
+  SRec e -> r.el d e
+  SFix dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
+  SFix dd (AbsConst b) -> r.ty d dd || r.el d b
+  SImplicit x e -> r.el d e
+  SMetaApp m ix ty -> r.ty d ty
+  _ -> False
+
+mentionsTypeF : Mentions -> Int -> Sx.Ty -> Bool
+mentionsTypeF r d t = case t of
+  SDecode e -> r.el d e
+  -- (an implicit argument's default is closed)
+  SFunction level dom (MkAbs x b) implicit dflt -> r.ty d dom || r.ty (d + 1) b
+  SFunction level dom (AbsConst b) implicit dflt -> r.ty d dom || r.ty d b
+  -- (a default names the fields before it only)
+  SRecord level ft ds ->
+    anyWithIndex (\i ty -> r.ty (d + i) ty) (A.toList ft.values)
+  SSum vs -> anyP (variantMentions r d) (D.toList vs)
+  SIsTy a -> r.ty d a
+  SPrimArray a -> r.ty d a
+  _ -> False
+
+-- | any local, from `d` binders out
+mentions : Mentions
+mentions =
+  { el = \d t -> mentionsTermF mentions d t
+  , ty = \d t -> mentionsTypeF mentions d t
+  , var = \d i -> i >= d
+  }
+
+-- | the local `k`, of those around the term
+mentionsLocal : Int -> Mentions
+mentionsLocal k =
+  { el = \d t -> mentionsTermF (mentionsLocal k) d t
+  , ty = \d t -> mentionsTypeF (mentionsLocal k) d t
+  , var = \d i -> i == d + k
+  }
+
+-- | does a type's syntax mention local 0 (the innermost binder)?
+mentionsInner : Sx.Ty -> Bool
+mentionsInner t = mentions.ty 0 t
+
+-- | a default -- of a record type's field, of an implicit argument --
+-- | the term, and where it is written
+type Default = { chk : Chk, span : P.Span }
+
 -- environment updates, spelled once
 withScope : ElabEnv -> Scope -> ElabEnv
 withScope e sc =
@@ -321,7 +410,8 @@ keepRecovered kept saved waiting = do
 data Binder
   = Anonymous Typ
   | Named String Typ
-  | NamedImplicit P.Span String Typ
+  -- | `{x : A} -> B`, and `{x : A := d} -> B`, its default
+  | NamedImplicit P.Span String Typ (Maybe Default)
   | NamedInstance P.Span String Typ
 
 -- | Where a check fails, the error is kept and an error hole of the type
@@ -479,19 +569,29 @@ insertInstance e sp goal name = do
   want sp (\final -> resolveWanted e sp (metaOf hole.stx) hole.val goal final)
   pure (mEl hole.stx hole.val)
 
--- | Apply `m : ty` to a fresh metavariable for each implicit argument it
--- | takes first.
+-- | an implicit argument not given, `x : dom`, of the function type `ty`
+-- | that takes it first: its default, where the type has one -- given as
+-- | it is, not inferred -- else a fresh metavariable, inferred
+implicitArg : ElabEnv -> P.Span -> V.Ty -> V.Ty -> String -> Elab M.El
+implicitArg e sp ty dom x = case V.implicitDefault ty of
+  Just d -> pure { stx = d, val = \u -> EV.eval e.globals N d LNil }
+  Nothing -> do
+    meta <- freshMeta e.scope.len e.scope.locals dom x sp
+    pure (mEl meta.stx meta.val)
+
+-- | Apply `m : ty` to each implicit argument it takes first: its default,
+-- | or a fresh metavariable.
 insertImplicits : ElabEnv -> P.Span -> M.El -> V.Ty -> Elab (Pair M.El V.Ty)
 insertImplicits e sp m ty0 = do
   ty <- Mt.forceT ty0
   case V.behavior ty of
     LikeFunction level dom cod Impl -> do
-      meta <- freshMeta e.scope.len e.scope.locals dom (cloNameOr cod) sp
+      arg <- implicitArg e sp ty dom (cloNameOr cod)
       insertImplicits
           e
           sp
-          (M.iapp (cloNameOr cod) m (mEl meta.stx meta.val))
-          (V.nom (V.appClo cod (\u -> meta.val)))
+          (M.iapp (cloNameOr cod) m arg)
+          (V.nom (V.appClo cod (\u -> M.valN arg)))
     -- an instance argument gets a hole, to be found (`settle`)
     -- among the witnesses in scope once its goal type has no metas left
     LikeFunction level dom cod Inst -> do
@@ -502,6 +602,43 @@ insertImplicits e sp m ty0 = do
           (M.app m arg)
           (V.nom (V.appClo cod (\u -> M.valN arg)))
     _ -> pure (MkPair m ty)
+
+isJustD : Maybe Default -> Bool
+isJustD (Just _) = True
+isJustD Nothing = False
+
+-- (an implicit argument's default, zonked: it names no local)
+closedImplicit : P.Span -> M.El -> Sx.Tm -> Elab M.El
+closedImplicit sp m stx =
+  if mentions.el 0 stx
+    then failWith
+        sp
+        45
+        "an implicit argument's default names definitions only, not the parameters before it"
+  else pure { stx = stx, val = m.val }
+
+-- | an implicit argument's default: closed, naming definitions only -- an
+-- | application that leaves the argument out is given it, wherever that
+-- | is.  (An implicit argument it leaves unsolved is the definition's
+-- | error, as anywhere.)
+implicitDefaultChk : P.Span -> Chk -> Chk
+implicitDefaultChk sp c =
+  MkChk (\e a -> do
+  m <- runChk c e a
+  mc <- gets (\c0 -> c0.metas)
+  closedImplicit sp m (U.zonkEl mc m.stx))
+
+-- (an implicit argument's default, checked at its type where the type
+-- is; where it does not do, an error hole)
+implicitDefaultAt : ElabEnv -> M.Ty -> Maybe Default -> Elab (Maybe Sx.Tm)
+implicitDefaultAt e ty Nothing = pure Nothing
+implicitDefaultAt e ty (Just d) = do
+  m <-
+    runChk
+      (recovering (implicitDefaultChk d.span d.chk))
+      (withFor e ForNominative)
+      (M.tyN ty)
+  pure (Just m.stx)
 
 functionFormation : Binder -> Typ -> Typ
 functionFormation (Anonymous dom) cod =
@@ -516,19 +653,21 @@ functionFormation (Named x dom) cod =
   pure (M.function e.globals e.scope.locals edom (MkAbs x ecod)))
 -- extension: an implicit argument, inferred at each use.  Its type must
 -- be large: a value of a small type is statically irrelevant, so nothing
--- could ever determine it.
-functionFormation (NamedImplicit sp x dom) cod =
+-- could ever determine it.  One with a default, `{x : A := d}`, is not
+-- inferred: where it is not given, it is `d` -- of any type.
+functionFormation (NamedImplicit sp x dom dflt) cod =
   MkTyp (\e -> do
   edom <- runTyp dom e
-  if P.leq (M.levelOf edom) Small
+  if P.leq (M.levelOf edom) Small && not (isJustD dflt)
       then failWith
           (a := M.Ty)
           sp
           24
-          "an implicit argument must have a large type (a small one could never be inferred: its values are statically irrelevant)"
+          "an implicit argument without a default must have a large type (a small one could never be inferred: its values are statically irrelevant)"
     else do
+      d <- implicitDefaultAt e edom dflt
       ecod <- runTyp cod (withScope e (bindName x (M.tyN edom) e.scope))
-      pure (M.functionI Impl e.globals e.scope.locals edom (MkAbs x ecod)))
+      pure (M.functionD Impl d e.globals e.scope.locals edom (MkAbs x ecod)))
 -- `{{x : A}} -> B`, an instance argument, found among the
 -- witnesses in scope at each use.  Its type may be small (the finding
 -- is by the goal TYPE, which is static; the small value found is the
@@ -783,14 +922,14 @@ namedGo sp x arg e m ty0 = do
                  (V.nom (V.appClo cod (\u -> M.valN earg))))
       else if P.eqPlicity implicit Impl
         then do
-          meta <- freshMeta e.scope.len e.scope.locals dom (cloNameOr cod) sp
+          iarg <- implicitArg e sp ty dom (cloNameOr cod)
           namedGo
               sp
               x
               arg
               e
-              (M.iapp (cloNameOr cod) m (mEl meta.stx meta.val))
-              (V.nom (V.appClo cod (\u -> meta.val)))
+              (M.iapp (cloNameOr cod) m iarg)
+              (V.nom (V.appClo cod (\u -> M.valN iarg)))
       else if P.eqPlicity implicit Inst
         -- an instance argument before the named one is searched for
         then do
@@ -1106,95 +1245,8 @@ primString = MkTyp (\e -> pure M.primString)
 litString : String -> Syn
 litString s = MkSyn (\e -> pure (MkPair (M.litString s) VPrimString))
 
--- Mentions
---------------------------------------------------------------------------------
-
-anyP : {a : Type} -> (a -> Bool) -> List a -> Bool
-anyP p Nil = False
-anyP p (Cons x xs) = p x || anyP p xs
-
-anyIdxGo : {a : Type} -> Int -> (Int -> a -> Bool) -> List a -> Bool
-anyIdxGo i f Nil = False
-anyIdxGo i f (Cons x xs) = f i x || anyIdxGo (i + 1) f xs
-
-anyWithIndex : {a : Type} -> (Int -> a -> Bool) -> List a -> Bool
-anyWithIndex f xs = anyIdxGo 0 f xs
-
--- | whether syntax mentions a local, of those `var d i` says (`i` under
--- | `d` binders of the term)
-type Mentions =
-  { el : Int -> Sx.Tm -> Bool
-  , ty : Int -> Sx.Ty -> Bool
-  , var : Int -> Int -> Bool
-  }
-
-armMentions : Mentions -> Int -> Pair String (Pair (Array String) Sx.Tm) -> Bool
-armMentions r d (MkPair tag (MkPair xs b)) = r.el (d + A.length xs) b
-
-fieldMentions : Mentions -> Int -> Pair String Sx.Tm -> Bool
-fieldMentions r d (MkPair k v) = r.el d v
-
-variantMentions : Mentions -> Int -> Pair String (Array Sx.Ty) -> Bool
-variantMentions r d (MkPair k args) = anyP (r.ty d) (A.toList args)
-
-mentionsTermF : Mentions -> Int -> Sx.Tm -> Bool
-mentionsTermF r d t = case t of
-  SLocal i -> r.var d i
-  SCode a -> r.ty d a
-  SApp f a -> r.el d f || r.el d a
-  SLam dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
-  SLam dd (AbsConst b) -> r.ty d dd || r.el d b
-  SCons dct -> anyP (fieldMentions r d) (D.toList dct)
-  SProj e l -> r.el d e
-  STag x as -> anyP (r.el d) (A.toList as)
-  SMatch e cs -> r.el d e || anyP (armMentions r d) (D.toList cs)
-  SSpecialize e l v -> r.el d e || r.el d v
-  SIs e -> r.el d e
-  SRec e -> r.el d e
-  SFix dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
-  SFix dd (AbsConst b) -> r.ty d dd || r.el d b
-  SImplicit x e -> r.el d e
-  SMetaApp m ix ty -> r.ty d ty
-  _ -> False
-
-mentionsTypeF : Mentions -> Int -> Sx.Ty -> Bool
-mentionsTypeF r d t = case t of
-  SDecode e -> r.el d e
-  SFunction level dom (MkAbs x b) implicit -> r.ty d dom || r.ty (d + 1) b
-  SFunction level dom (AbsConst b) implicit -> r.ty d dom || r.ty d b
-  -- (a default names the fields before it only)
-  SRecord level ft ds ->
-    anyWithIndex (\i ty -> r.ty (d + i) ty) (A.toList ft.values)
-  SSum vs -> anyP (variantMentions r d) (D.toList vs)
-  SIsTy a -> r.ty d a
-  SPrimArray a -> r.ty d a
-  _ -> False
-
--- | any local, from `d` binders out
-mentions : Mentions
-mentions =
-  { el = \d t -> mentionsTermF mentions d t
-  , ty = \d t -> mentionsTypeF mentions d t
-  , var = \d i -> i >= d
-  }
-
--- | the local `k`, of those around the term
-mentionsLocal : Int -> Mentions
-mentionsLocal k =
-  { el = \d t -> mentionsTermF (mentionsLocal k) d t
-  , ty = \d t -> mentionsTypeF (mentionsLocal k) d t
-  , var = \d i -> i == d + k
-  }
-
--- | does a type's syntax mention local 0 (the innermost binder)?
-mentionsInner : Sx.Ty -> Bool
-mentionsInner t = mentions.ty 0 t
-
 -- Record
 --------------------------------------------------------------------------------
-
--- | a field's default: the term, and where it is written
-type Default = { chk : Chk, span : P.Span }
 
 -- | a field of a record type: its name, its type, and its default (a
 -- | term of that type), if it has one
@@ -1622,7 +1674,8 @@ letsAround n a (Cons (MkPair m v) rest) p body =
           (V.levelOf a)
           (R.readbTy (n + p) m.ty)
           (AbsConst (R.readbTy (n + p) a))
-          Expl)
+          Expl
+          Nothing)
        (MkAbs m.name (letsAround n a rest (p + 1) body)))
     v
 

@@ -224,9 +224,9 @@ type Operand a = { op : C.T, e : a }
 mkOperand : {a : Type} -> C.T -> a -> Operand a
 mkOperand t e = { op = t, e = e }
 
-piBinderNames : Notation.PiBinder Notation.Expr -> List String
+piBinderNames : Notation.PiBinder Notation.Expr Notation.Expr -> List String
 piBinderNames (PiNamed x _ _) = Cons x Nil
-piBinderNames (PiImplicit x _ _ _) = Cons x Nil
+piBinderNames (PiImplicit x _ _ _ _) = Cons x Nil
 piBinderNames (PiInstance x _ _ _) = Cons x Nil
 piBinderNames (PiAnon _) = Nil
 
@@ -237,7 +237,7 @@ piBinders _ = Nil
 
 -- | the names of the implicit parameters, `{x : A} -> ...`
 piImplicits : Notation.Expr -> List String
-piImplicits (At (EPi (PiImplicit x _ _ _) rest) _) = Cons x (piImplicits rest)
+piImplicits (At (EPi (PiImplicit x _ _ _ _) rest) _) = Cons x (piImplicits rest)
 piImplicits (At (EPi (PiInstance x _ _ _) rest) _) = Cons x (piImplicits rest)
 piImplicits (At (EPi _ rest) _) = piImplicits rest
 piImplicits _ = Nil
@@ -327,38 +327,40 @@ foldr f z Nil = z
 foldr f z (Cons x xs) = f x (foldr f z xs)
 
 -- | `d -> b`, from the binder to the type
-piOf : Notation.PiBinder Notation.Expr
+piOf : Notation.PiBinder Notation.Expr Notation.Expr
      -> Pm.Span
      -> Notation.Expr
      -> Notation.Expr
 piOf d dsp b = At (EPi d b) (Notation.spanning dsp (Pm.spanOf b))
 
--- | what is left of `->`: a type, or what is in braces, `{x : A}`, or
--- | in double braces, `{{x : A}}` (where they are)
+-- | what is left of `->`: a type, or what is in braces, `{x : A}` (and
+-- | `{x : A := d}`, its default), or in double braces, `{{x : A}}` (where
+-- | they are)
 data ArrowLhs
   = Plain Notation.Expr
-  | Braced Notation.Expr Pm.Span
+  | Braced Notation.Expr (Maybe Notation.Expr) Pm.Span
   | Bracketed Notation.Expr Pm.Span
 
 -- | a type alone, or `(x : A)`
-plainBinder : Notation.Expr -> Notation.PiBinder Notation.Expr
+plainBinder : Notation.Expr -> Notation.PiBinder Notation.Expr Notation.Expr
 plainBinder (At (EAnn (At (EVar x) xsp) t) _) = PiNamed x xsp t
 plainBinder d = PiAnon d
 
 -- | `(a b : T) -> B` is `(a : T) -> (b : T) -> B`; `{a b : T} -> B`, the
--- | same with implicit arguments
+-- | same with implicit arguments (`{a b : T := d}`, each its default)
 arrowNames : Notation.Expr
            -> Notation.Expr
            -> Notation.Expr
            -> Maybe Pm.Span
+           -> Maybe Notation.Expr
            -> Notation.Expr
            -> Notation.Expr
-arrowNames rhs g ty braces orig =
+arrowNames rhs g ty braces dflt orig =
   if allS isVarE (Cons (Notation.spineOf g).head (Notation.spineOf g).args)
     then foldr
         (\x b -> case x of
          At (EVar y) ysp -> case braces of
-           Just bsp -> piOf (PiImplicit y ysp bsp ty) bsp b
+           Just bsp -> piOf (PiImplicit y ysp bsp ty dflt) bsp b
            Nothing ->
              piOf (PiNamed y ysp ty) (Notation.spanning ysp (Pm.spanOf ty)) b
          _ -> b)
@@ -377,11 +379,12 @@ arrowNames rhs g ty braces orig =
 
 arrowBinop : ArrowLhs -> Notation.Expr -> Notation.Expr
 arrowBinop lhs rhs = case lhs of
-  Plain (At (EAnn g ty) sp) -> arrowNames rhs g ty Nothing (At (EAnn g ty) sp)
+  Plain (At (EAnn g ty) sp) ->
+    arrowNames rhs g ty Nothing Nothing (At (EAnn g ty) sp)
   Plain d -> piOf (PiAnon d) (Pm.spanOf d) rhs
-  Braced (At (EAnn g ty) sp) bsp ->
-    arrowNames rhs g ty (Just bsp) (At (EAnn g ty) sp)
-  Braced d bsp ->
+  Braced (At (EAnn g ty) sp) dflt bsp ->
+    arrowNames rhs g ty (Just bsp) dflt (At (EAnn g ty) sp)
+  Braced d dflt bsp ->
     piOf
       (PiAnon
          (At (EInvalid "an implicit argument is named: `{x : T} -> ...`") bsp))
@@ -667,12 +670,12 @@ opRhsOf : C.E -> Pair C.T C.E
 opRhsOf (OpRhs op e) = MkPair op e
 opRhsOf e = MkPair (C.firstE e) e
 
--- | `{x : A}`: braces around one declaration (not a record's field, set
--- | or with its default)
+-- | `{x : A}`, and `{x : A := d}`: braces around one declaration (not a
+-- | record's field, set or with its default)
 bracedOne : C.E -> Maybe C.E
 bracedOne (Braces o (Cons f Nil) commas c) = case f of
   EFSet x eq e -> Nothing
-  EFDefault d eq e -> Nothing
+  EFDefault d eq e -> if strEq eq.text ":=" then Just f else Nothing
   _ -> Just f
 bracedOne _ = Nothing
 
@@ -800,14 +803,17 @@ fieldDeclOf (At (EAnn (At (EVar x) xsp) t) sp) d =
   At (DeclareField x xsp t d) (spanWith sp d)
 fieldDeclOf e d = At (BadFieldDecl e) (Pm.spanOf e)
 
--- | `x : T`, or `x : T = d`, a field of a record type
+-- | `x : T`, or `x : T = d`, a field of a record type (`x : T := d` is
+-- | none: an implicit argument's)
 fieldL : Lw
        -> C.E
        -> P (Pm.Spanned (Notation.FieldDecl Notation.Expr Notation.Expr))
 fieldL r (EFDefault e eq d) = do
   e' <- declarationL r e
   d' <- r.e d
-  pure (fieldDeclOf e' (Just d'))
+  pure
+      (if strEq eq.text "=" then fieldDeclOf e' (Just d')
+       else At (BadFieldDecl e') (Pm.spanOf e'))
 fieldL r e = do
   e' <- declarationL r e
   pure (fieldDeclOf e' Nothing)
@@ -826,6 +832,17 @@ settingL r e = do
 isSetting : C.E -> Bool
 isSetting (EFSet x eq e) = True
 isSetting e = False
+
+-- | what is in the braces of `{x : A} -> B`, and of `{x : A := d} -> B`
+-- | its default (in scope there: the binders before it, not `x`)
+bracedL : Lw -> C.E -> Pm.Span -> P ArrowLhs
+bracedL r (EFDefault e eq d) sp = do
+  d' <- r.e d
+  e' <- declarationL r e
+  pure (Braced e' (Just d') sp)
+bracedL r f sp = do
+  e' <- declarationL r f
+  pure (Braced e' Nothing sp)
 
 bracesL : Lw -> C.T -> List C.E -> C.T -> P Notation.Expr
 bracesL r o fs c = case fs of
@@ -1008,9 +1025,7 @@ opL r a op b =
   if strEq op.text "->"
     then do
       a' <- case bracedOne a of
-        Just f -> do
-          d <- declarationL r f
-          pure (Braced d (spanTT (C.firstE a) (C.lastE a)))
+        Just f -> bracedL r f (spanTT (C.firstE a) (C.lastE a))
         Nothing -> case a of
           InstB o o2 d c1 c -> do
             d' <- declarationL r d

@@ -165,6 +165,24 @@ quiet : Opts
 quiet = { name = "quiet" }   -- { name = "quiet", verbose = False, label = "quiet" }
 ```
 
+## Implicit arguments
+
+An implicit argument, `{x : A} -> B`, is inferred where the function is
+applied, unless it is given, `f (x := e)`; an instance argument,
+`{{x : A}} -> B`, is found among the instance binders in scope.  An
+implicit argument may have a default, `{x : A := d} -> B`: where it is
+not given, it is `d`, as it is -- not inferred, so that its type may be
+small.  The default names definitions only, so that it means the same
+wherever the function is applied.
+
+```haskell
+greet : {loud : Bool := False} -> String -> String
+greet name = if loud then name ++ "!" else name
+
+calm : String
+calm = greet "hi"                 -- "hi"; greet (loud := True) "hi" is "hi!"
+```
+
 ## Effects
 
 `lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program

@@ -467,5 +467,13 @@ formats("`-- fmt: skip` elsewhere, a comment like another", [
 const badKept = run("-- fmt: skip\nx : Bool\nx = (\n");
 expect("a definition kept that does not parse is refused", !badKept.ok && badKept.why.includes("does not parse"), JSON.stringify(badKept));
 
+formats("an implicit argument's default: `:=`, the binder written close", [
+  "f : {   x : Bool:=False } -> {a b : Type := Int} -> a -> b -> Bool",
+  "",
+].join("\n"), [
+  "f : {x : Bool := False} -> {a b : Type := Int} -> a -> b -> Bool",
+  "",
+].join("\n"));
+
 console.log(`format: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

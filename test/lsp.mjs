@@ -212,6 +212,16 @@ try {
   const nameDef = await request("textDocument/definition", { textDocument: { uri: du }, position: pos(defaults, "name = \"strings\"") });
   const nameAt = pos(defaults, "name : String = ");
   expect("definition of a theory's field that has a default", nameDef.result && nameDef.result.range.start.line === nameAt.line && nameDef.result.range.start.character === nameAt.character, nameDef.result);
+  // (an implicit argument's default: the definition it names)
+  const implicits = disk("test/surface/implicit-defaults.hf");
+  const iu = uri("test/surface/implicit-defaults.hf");
+  open("test/surface/implicit-defaults.hf", implicits);
+  ds = await diagnosticsOf(iu);
+  expect("an implicit argument's default: no diagnostics", ds.length === 0, ds);
+  const inImplicit = await request("textDocument/hover", { textDocument: { uri: iu }, position: pos(implicits, "quietly}") });
+  expect("hover in an implicit argument's default", inImplicit.result && inImplicit.result.contents.value.includes("quietly : Opts"), inImplicit.result);
+  const runHover = await request("textDocument/hover", { textDocument: { uri: iu }, position: pos(implicits, "run 1") });
+  expect("hover on a function with an implicit argument's default", runHover.result && runHover.result.contents.value.includes("{opts : Opts := quietly} -> Int -> Bool"), runHover.result);
   // (a default naming a field before it: that field, a local there)
   const inLo = await request("textDocument/hover", { textDocument: { uri: du }, position: pos(defaults, "lo\n  , width") });
   expect("hover on a field a default names", inLo.result && inLo.result.contents.value.includes("lo : Int") && inLo.result.contents.value.includes("(local)"), inLo.result);
