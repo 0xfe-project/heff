@@ -438,6 +438,18 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
   return x;
 }
 
+// (field `i` of a record wanted after, which after it is only read other
+// fields of, then updated or dropped (src/heff/emitc.hf, `takesFor`):
+// its last reference, the field taken out of it -- moved, not counted, a
+// hole left that drops as nothing; otherwise the field counted)
+HEFF_KNOWN V heff_take_field(V v, int64_t i) {
+  Rec *r = (Rec *)v;
+  V x = r->f[i];
+  if (r->h.rc == 1) r->f[i] = MK_INT(0);
+  else heff_dup(x);
+  return x;
+}
+
 // A record updated (#34): one built of the same shape as the record `v`
 // it is built from, some of its fields read from `v`'s at their own
 // places (`keep`, a bit each) and `v` given up there, is built in `v`'s

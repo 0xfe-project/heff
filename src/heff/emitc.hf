@@ -232,7 +232,9 @@ data Known = KnownTag Int | KnownCell Int | KnownRec Int | KnownClo Int
 -- drop; `after`: those wanted after what is being emitted, by what
 -- comes after it -- see "Reference counts"; `known`: what some of them
 -- are known to be; `lam`: in a lambda's body, how many parameters it
--- takes, else 0 -- see `inPlace`)
+-- takes, else 0 -- see `inPlace`; `takes`: the fields, by their records
+-- and labels, that the operands being emitted take out of their records
+-- -- see `takesFor`)
 type CE =
   { tags : M.Map String Int
   , lbls : M.Map String Int
@@ -245,6 +247,7 @@ type CE =
   , borrowed : List String
   , bor : M.Map String (List Int)
   , known : M.Map String Known
+  , takes : List (Pair String String)
   }
 
 -- (the code of a definition (`s`) or of a lambda of `n` parameters)
@@ -261,6 +264,7 @@ withFrame s n ce =
   , borrowed = ce.borrowed
   , bor = ce.bor
   , known = ce.known
+  , takes = Nil
   }
 
 withPath : List String -> List String -> CE -> CE
@@ -276,6 +280,7 @@ withPath owned after ce =
   , borrowed = ce.borrowed
   , bor = ce.bor
   , known = ce.known
+  , takes = ce.takes
   }
 
 -- (the variables lent to this code: it holds no reference to them)
@@ -292,6 +297,7 @@ withBorrowed bs ce =
   , borrowed = bs
   , bor = ce.bor
   , known = ce.known
+  , takes = ce.takes
   }
 
 withKnown : String -> Known -> CE -> CE
@@ -307,6 +313,23 @@ withKnown x k ce =
   , borrowed = ce.borrowed
   , bor = ce.bor
   , known = M.insert compareString x k ce.known
+  , takes = ce.takes
+  }
+
+withTakes : List (Pair String String) -> CE -> CE
+withTakes ts ce =
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , lam = ce.lam
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  , known = ce.known
+  , takes = ts
   }
 
 -- What emitting makes on the way: the lambdas, the strings and the
@@ -929,6 +952,31 @@ fieldAt r ce live e i n = do
   v <- r.val ce live e
   pure ("heff_get_n(" ^ v ^ ", " ^ showInt i ^ ", " ^ showInt n ^ ")")
 
+-- (the field taken out of its record, if this operand takes it and the
+-- record is wanted after it: see `takesFor`)
+takeIn : List (Pair String String)
+       -> List String
+       -> I.Expr
+       -> String
+       -> Int
+       -> Maybe String
+takeIn ts live (EVar x) l i =
+  if elemS x live && List.any (\p -> strEq (fst p) x && strEq (snd p) l) ts
+    then Just ("heff_take_field(" ^ cLocal x ^ ", " ^ showInt i ^ ")")
+  else Nothing
+takeIn ts live e l i = Nothing
+
+fieldOr : CK
+        -> CE
+        -> List String
+        -> I.Expr
+        -> Int
+        -> Int
+        -> Maybe String
+        -> C String
+fieldOr r ce live e i n (Just t) = pure t
+fieldOr r ce live e i n Nothing = fieldAt r ce live e i n
+
 -- | a field: at its place, where the record's shape is known; else
 -- | looked for by its label (`heff_get`)
 projAt : CK
@@ -939,7 +987,8 @@ projAt : CK
        -> Int
        -> Maybe Int
        -> C String
-projAt r ce live e l n (Just i) = fieldAt r ce live e i n
+projAt r ce live e l n (Just i) =
+  fieldOr r ce live e i n (takeIn ce.takes live e l i)
 projAt r ce live e l n Nothing = do
   v <- r.val ce live e
   pure ("heff_get(" ^ v ^ ", " ^ lblName l ^ ")")
@@ -1686,6 +1735,80 @@ condLines r ce dest c =
     (fvList c.args)
     (unionS (fvList (List.map I.armBody c.arms)) ce.after)
 
+-- Fields taken: `let y = f r.a .. in b`, `r` held and wanted by nothing
+-- after the binding, and -- in what the binding computes besides, and in
+-- `b` -- only read other fields of, outside any lambda: `r.a` is taken
+-- out of `r` (`heff_take_field`, lib/c/runtime.c) where that is `r`'s
+-- last reference -- moved, not counted, a hole left in `r` that drops as
+-- nothing.  `r` is not looked at whole again, nor its `a` read: it is
+-- read other fields of, then updated with another `a` or dropped.  So
+-- the field's value is held once, not by `y` and by `r` both, and may be
+-- built in in turn: a scheduler's queue taken out of its state, put to,
+-- and the state updated with it, each in its own cell.
+
+varIs : String -> I.Expr -> Bool
+varIs x (EVar y) = strEq x y
+varIs x _ = False
+
+-- (whether `x`, in the worklist, is only read fields of, none of them
+-- `l`, and outside any lambda)
+othersW : String -> String -> List I.Expr -> Bool
+othersW x l Nil = True
+othersW x l (Cons (EVar y) rest) = not (strEq x y) && othersW x l rest
+othersW x l (Cons (EProj e l2 _) rest) =
+  if varIs x e then not (strEq l l2) && othersW x l rest
+  else othersW x l (Cons e rest)
+othersW x l (Cons (ELam _ b) rest) =
+  I.countW x 0 (Cons b Nil) == 0 && othersW x l rest
+othersW x l (Cons (EApp f as) rest) = othersW x l (Cons f (List.append as rest))
+othersW x l (Cons (ELet _ a b) rest) = othersW x l (Cons a (Cons b rest))
+othersW x l (Cons (ERecord fs) rest) = othersW x l (I.pushFields fs rest)
+othersW x l (Cons (ETag _ as) rest) = othersW x l (List.append as rest)
+othersW x l (Cons (EMatch s arms) rest) =
+  othersW x l (Cons s (I.pushArms arms rest))
+othersW x l (Cons (EPrimCall _ as) rest) = othersW x l (List.append as rest)
+othersW x l (Cons (ECall _ as) rest) = othersW x l (List.append as rest)
+othersW x l (Cons _ rest) = othersW x l rest
+
+-- (the operands of what a binding computes, as they are emitted)
+operandsOf : I.Expr -> List I.Expr
+operandsOf (EApp f as) = Cons f as
+operandsOf (ECall _ as) = as
+operandsOf (ETag _ as) = as
+operandsOf (ERecord fs) = List.map snd fs
+operandsOf (EPrimCall _ as) = as
+operandsOf (EProj e l sh) = Cons (EProj e l sh) Nil
+operandsOf _ = Nil
+
+-- (an operand that takes its field, `rest` all that may look at its
+-- record after it)
+takeOne : CE -> List I.Expr -> I.Expr -> List (Pair String String)
+takeOne ce rest (EProj (EVar x) l sh) =
+  if not (List.null sh)
+  && elemS x ce.owned
+  && not (elemS x ce.borrowed)
+  && not (elemS x ce.after)
+  && othersW x l rest
+    then Cons (MkPair x l) Nil
+  else Nil
+takeOne ce rest e = Nil
+
+takesAt : CE
+        -> List I.Expr
+        -> I.Expr
+        -> List I.Expr
+        -> List (Pair String String)
+takesAt ce before b Nil = Nil
+takesAt ce before b (Cons e es) =
+  List.append
+    (takeOne ce (List.append before (List.append es (Cons b Nil))) e)
+    (takesAt ce (List.append before (Cons e Nil)) b es)
+
+-- | the fields the operands of `a`, bound in `b`, take out of their
+-- | records
+takesFor : CE -> I.Expr -> I.Expr -> List (Pair String String)
+takesFor ce a b = takesAt ce Nil b (operandsOf a)
+
 -- (`let x = a in b`: what is held and wanted neither by `a` nor after it
 -- dropped first; then `a`, wanted after it what `b` and what comes after
 -- want; then `x`, dropped if nothing wants it)
@@ -1701,7 +1824,14 @@ letWith : CK
         -> List String
         -> C (List String)
 letWith r ce dest x a b fa wb = do
-  la <- bindTo r (withPath (deadKept ce.owned (unionS fa wb)) wb ce) x a
+  la <-
+    bindTo
+      r
+      (withTakes
+         (takesFor ce a b)
+         (withPath (deadKept ce.owned (unionS fa wb)) wb ce))
+      x
+      a
   rest <-
     r.stmts
       (withPath
@@ -1709,7 +1839,7 @@ letWith r ce dest x a b fa wb = do
             (deadKept ce.owned wb)
             (if elemS x wb then Cons x Nil else Nil))
          ce.after
-         (knownLet x (builtOf a) ce))
+         (withTakes Nil (knownLet x (builtOf a) ce)))
       dest
       b
   pure
@@ -2419,6 +2549,7 @@ ceOf provs defs names =
   , borrowed = Nil
   , bor = borrowing defs
   , known = M.empty
+  , takes = Nil
   }
 
 programWith : String
