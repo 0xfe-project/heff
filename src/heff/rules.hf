@@ -1106,12 +1106,99 @@ primString = MkTyp (\e -> pure M.primString)
 litString : String -> Syn
 litString s = MkSyn (\e -> pure (MkPair (M.litString s) VPrimString))
 
+-- Mentions
+--------------------------------------------------------------------------------
+
+anyP : {a : Type} -> (a -> Bool) -> List a -> Bool
+anyP p Nil = False
+anyP p (Cons x xs) = p x || anyP p xs
+
+anyIdxGo : {a : Type} -> Int -> (Int -> a -> Bool) -> List a -> Bool
+anyIdxGo i f Nil = False
+anyIdxGo i f (Cons x xs) = f i x || anyIdxGo (i + 1) f xs
+
+anyWithIndex : {a : Type} -> (Int -> a -> Bool) -> List a -> Bool
+anyWithIndex f xs = anyIdxGo 0 f xs
+
+-- | whether syntax mentions a local, of those `var d i` says (`i` under
+-- | `d` binders of the term)
+type Mentions =
+  { el : Int -> Sx.Tm -> Bool
+  , ty : Int -> Sx.Ty -> Bool
+  , var : Int -> Int -> Bool
+  }
+
+armMentions : Mentions -> Int -> Pair String (Pair (Array String) Sx.Tm) -> Bool
+armMentions r d (MkPair tag (MkPair xs b)) = r.el (d + A.length xs) b
+
+fieldMentions : Mentions -> Int -> Pair String Sx.Tm -> Bool
+fieldMentions r d (MkPair k v) = r.el d v
+
+variantMentions : Mentions -> Int -> Pair String (Array Sx.Ty) -> Bool
+variantMentions r d (MkPair k args) = anyP (r.ty d) (A.toList args)
+
+mentionsTermF : Mentions -> Int -> Sx.Tm -> Bool
+mentionsTermF r d t = case t of
+  SLocal i -> r.var d i
+  SCode a -> r.ty d a
+  SApp f a -> r.el d f || r.el d a
+  SLam dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
+  SLam dd (AbsConst b) -> r.ty d dd || r.el d b
+  SCons dct -> anyP (fieldMentions r d) (D.toList dct)
+  SProj e l -> r.el d e
+  STag x as -> anyP (r.el d) (A.toList as)
+  SMatch e cs -> r.el d e || anyP (armMentions r d) (D.toList cs)
+  SSpecialize e l v -> r.el d e || r.el d v
+  SIs e -> r.el d e
+  SRec e -> r.el d e
+  SFix dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
+  SFix dd (AbsConst b) -> r.ty d dd || r.el d b
+  SImplicit x e -> r.el d e
+  SMetaApp m ix ty -> r.ty d ty
+  _ -> False
+
+mentionsTypeF : Mentions -> Int -> Sx.Ty -> Bool
+mentionsTypeF r d t = case t of
+  SDecode e -> r.el d e
+  SFunction level dom (MkAbs x b) implicit -> r.ty d dom || r.ty (d + 1) b
+  SFunction level dom (AbsConst b) implicit -> r.ty d dom || r.ty d b
+  -- (a default names the fields before it only)
+  SRecord level ft ds ->
+    anyWithIndex (\i ty -> r.ty (d + i) ty) (A.toList ft.values)
+  SSum vs -> anyP (variantMentions r d) (D.toList vs)
+  SIsTy a -> r.ty d a
+  SPrimArray a -> r.ty d a
+  _ -> False
+
+-- | any local, from `d` binders out
+mentions : Mentions
+mentions =
+  { el = \d t -> mentionsTermF mentions d t
+  , ty = \d t -> mentionsTypeF mentions d t
+  , var = \d i -> i >= d
+  }
+
+-- | the local `k`, of those around the term
+mentionsLocal : Int -> Mentions
+mentionsLocal k =
+  { el = \d t -> mentionsTermF (mentionsLocal k) d t
+  , ty = \d t -> mentionsTypeF (mentionsLocal k) d t
+  , var = \d i -> i == d + k
+  }
+
+-- | does a type's syntax mention local 0 (the innermost binder)?
+mentionsInner : Sx.Ty -> Bool
+mentionsInner t = mentions.ty 0 t
+
 -- Record
 --------------------------------------------------------------------------------
 
+-- | a field's default: the term, and where it is written
+type Default = { chk : Chk, span : P.Span }
+
 -- | a field of a record type: its name, its type, and its default (a
 -- | term of that type), if it has one
-type FieldDeclaration = { name : String, typ : Typ, dflt : Maybe Chk }
+type FieldDeclaration = { name : String, typ : Typ, dflt : Maybe Default }
 
 -- | a record type's fields formed: its level, the fields' types, the
 -- | defaults of those that have one
@@ -1121,11 +1208,34 @@ type Formed =
   , defaults : List (Pair String Sx.Tm)
   }
 
--- (a field's default, checked at the field's type, where the type is)
-defaultAt : ElabEnv -> M.Ty -> Maybe Chk -> Elab (Maybe Sx.Tm)
-defaultAt e ty Nothing = pure Nothing
-defaultAt e ty (Just c) = do
-  m <- runChk c e (M.tyN ty)
+-- (a default, zonked: it names no local but the `i` fields before it)
+namesBefore : P.Span -> Int -> M.El -> Sx.Tm -> Elab M.El
+namesBefore sp i m stx =
+  if mentions.el i stx
+    then failWith
+        sp
+        43
+        "a field's default names the fields before it and definitions, not the type's parameters"
+  else pure { stx = stx, val = m.val }
+
+-- | the default of a type's field, the one after `i` others: it names
+-- | those fields and definitions, nothing else of where the type is (its
+-- | parameters), so that it means the same wherever a record leaves the
+-- | field out.  (An implicit argument it leaves unsolved is the
+-- | definition's error, as anywhere.)
+defaultChk : P.Span -> Int -> Chk -> Chk
+defaultChk sp i c =
+  MkChk (\e a -> do
+  m <- runChk c e a
+  mc <- gets (\c0 -> c0.metas)
+  namesBefore sp i m (U.zonkEl mc m.stx))
+
+-- (a field's default, checked at the field's type where the type is, the
+-- `i` fields before it in scope; where it does not do, an error hole)
+defaultAt : ElabEnv -> Int -> M.Ty -> Maybe Default -> Elab (Maybe Sx.Tm)
+defaultAt e i ty Nothing = pure Nothing
+defaultAt e i ty (Just d) = do
+  m <- runChk (recovering (defaultChk d.span i d.chk)) e (M.tyN ty)
   pure (Just m.stx)
 
 consDefault : String
@@ -1135,12 +1245,13 @@ consDefault : String
 consDefault x (Just d) ds = Cons (MkPair x d) ds
 consDefault x Nothing ds = ds
 
-formGo : ElabEnv -> List FieldDeclaration -> Elab Formed
-formGo e' Nil = pure { level = Small, fields = Nil, defaults = Nil }
-formGo e' (Cons fd rest) = do
+-- (the fields from the `i`th on)
+formGo : ElabEnv -> Int -> List FieldDeclaration -> Elab Formed
+formGo e' i Nil = pure { level = Small, fields = Nil, defaults = Nil }
+formGo e' i (Cons fd rest) = do
   ty <- runTyp fd.typ e'
-  d <- defaultAt e' ty fd.dflt
-  f <- formGo (withScope e' (bindName fd.name (M.tyN ty) e'.scope)) rest
+  d <- defaultAt e' i ty fd.dflt
+  f <- formGo (withScope e' (bindName fd.name (M.tyN ty) e'.scope)) (i + 1) rest
   pure
       { level = P.maxLevel f.level (M.levelOf ty)
       , fields = Cons (MkPair fd.name ty.stx) f.fields
@@ -1155,6 +1266,7 @@ recordFormation fieldTyps =
   f <-
     formGo
       (withScope (withFor e ForNominative) (undelayScope e.scope))
+      0
       fieldTyps
   pure
       (M.recordM
@@ -1294,16 +1406,17 @@ fieldsNote it =
   ++ (if D.size it.defaults == 0 then ""
       else " (" ++ andList (A.toList it.defaults.keys) ++ " may be left out)")
 
--- | a field's default: a nominal term, marked so in descriptive position
--- | (as one written there is, `CNominal`)
-defaultFor : ElabFor -> G.Globals -> Sx.Tm -> M.El
-defaultFor ForNominative g d = { stx = d, val = \u -> EV.eval g N d LNil }
-defaultFor (ForDescriptive _ _) g d =
-  M.isM { stx = d, val = \u -> EV.eval g N d LNil }
+-- | the default `d` of a field, `vs` the fields before it: a nominal
+-- | term, marked so in descriptive position (as one written there is,
+-- | `CNominal`); its syntax names those fields, as the type has it
+defaultFor : ElabFor -> G.Globals -> V.Locals V.V -> Sx.Tm -> M.El
+defaultFor ForNominative g vs d = { stx = d, val = \u -> EV.eval g N d vs }
+defaultFor (ForDescriptive _ _) g vs d =
+  M.isM { stx = d, val = \u -> EV.eval g N d vs }
 
 -- | a field given: its term, where it is (the setting, or the record for
--- | a default), the settings after it
-type Given = { el : M.El, span : P.Span, rest : List FieldSetting }
+-- | a default), whether it is a default, the settings after it
+type Given = { el : M.El, span : P.Span, dflt : Bool, rest : List FieldSetting }
 
 -- (field `x` not written, nor defaulted: the setting there instead, or
 -- the record's end)
@@ -1317,13 +1430,20 @@ notGiven it x (Cons fs _) =
 notGiven it x Nil =
   failWithNote it.span 4 ("missing record field " ++ x) (fieldsNote it)
 
--- (field `x` not written: its default, if it has one)
-defaulted : ElabEnv -> Intro -> String -> List FieldSetting -> Elab Given
-defaulted e it x settings = case D.lookup it.defaults x of
+-- (field `x` not written: its default, if it has one; `vs` the fields
+-- before it)
+defaulted : ElabEnv
+          -> Intro
+          -> String
+          -> V.Locals V.V
+          -> List FieldSetting
+          -> Elab Given
+defaulted e it x vs settings = case D.lookup it.defaults x of
   Just d ->
     pure
-      { el = defaultFor (projElabFor e.elabFor x) e.globals d
+      { el = defaultFor (projElabFor e.elabFor x) e.globals vs d
       , span = it.span
+      , dflt = True
       , rest = settings
       }
   Nothing -> notGiven it x settings
@@ -1338,7 +1458,7 @@ written : ElabEnv
 written e it x fty fs rest = do
   recordName e it.ty fs.name fs.nameSpan fty
   m <- runChk fs.chk (withFor e (projElabFor e.elabFor x)) fty
-  pure { el = m, span = fs.span, rest = rest }
+  pure { el = m, span = fs.span, dflt = False, rest = rest }
 
 -- | field `x`, of type `fty`: the next setting, if it is `x`'s, else
 -- | `x`'s default
@@ -1346,19 +1466,22 @@ givenField : ElabEnv
            -> Intro
            -> String
            -> V.Ty
+           -> V.Locals V.V
            -> List FieldSetting
            -> Elab Given
-givenField e it x fty (Cons fs rest) =
+givenField e it x fty vs (Cons fs rest) =
   if strEq fs.name x then written e it x fty fs rest
-  else defaulted e it x (Cons fs rest)
-givenField e it x fty Nil = defaulted e it x Nil
+  else defaulted e it x vs (Cons fs rest)
+givenField e it x fty vs Nil = defaulted e it x vs Nil
+
+-- | a field of the record, made: its name, its type, its term (a
+-- | default's names the fields before it, as the type has it), whether it
+-- | is a default, and where it is
+type Made = { name : String, ty : V.Ty, el : M.El, dflt : Bool, span : P.Span }
 
 -- | a setting after the type's fields: of none of them, or of one met
 -- | before (written twice, or out of order)
-leftOver : ElabEnv
-         -> Intro
-         -> List FieldSetting
-         -> Elab (List (Pair String M.El))
+leftOver : ElabEnv -> Intro -> List FieldSetting -> Elab (List Made)
 leftOver e it Nil = pure Nil
 leftOver e it (Cons fs _) =
   if length (filter (\x -> strEq x fs.name) it.written) > 1
@@ -1387,11 +1510,11 @@ introGo : ElabEnv
         -> V.Locals V.V
         -> List FieldSetting
         -> List (Pair String (V.Locals V.V -> V.Field))
-        -> Elab (List (Pair String M.El))
+        -> Elab (List Made)
 introGo e it done vs settings Nil = leftOver e it settings
 introGo e it done vs settings (Cons (MkPair x fieldC) rest) = case fieldC vs of
   MkField fty fvalue -> do
-    g <- givenField e it x fty settings
+    g <- givenField e it x fty vs settings
     let v = createNominative (projElabFor e.elabFor x) (P.forceTh g.el.val) fty
     checkFixed e g.span v fvalue
     e' <- selfAdvance e it.ty (appendP done (Cons (MkPair x v) Nil))
@@ -1403,7 +1526,175 @@ introGo e it done vs settings (Cons (MkPair x fieldC) rest) = case fieldC vs of
         (V.snocL vs v)
         g.rest
         rest
-    pure (Cons (MkPair x g.el) fields)
+    pure
+        (Cons
+           { name = x, ty = fty, el = g.el, dflt = g.dflt, span = g.span }
+           fields)
+
+-- Sharing the fields a default names
+--------------------------------------------------------------------------------
+
+-- A default that names fields before it is given, where a record leaves
+-- its field out, the record's own: those fields are bound once, by
+-- `let`s around the record (beta-redexes, as `let x = e in e'` is), the
+-- record and the defaults naming them by the `let`s' locals --
+--
+--   { lo = e }  at  { lo : Int, hi : Int = lo }  is  let lo = e in { lo = lo, hi = lo }
+
+-- (does a default given, of the `i`th field on, name field `j`?)
+namedFrom : List Made -> Int -> Int -> Bool
+namedFrom Nil i j = False
+namedFrom (Cons m rest) i j =
+  (m.dflt && (mentionsLocal (i - 1 - j)).el 0 m.el.stx)
+  || namedFrom rest (i + 1) j
+
+-- | for each field, whether a default given names it: then it is bound
+boundGo : List Made -> List Made -> Int -> List Bool
+boundGo all Nil j = Nil
+boundGo all (Cons m rest) j =
+  Cons (namedFrom (drop (j + 1) all) (j + 1) j) (boundGo all rest (j + 1))
+
+-- | each field's `let`, by its place among those bound, if it is bound
+placesGo : List Bool -> Int -> List (Maybe Int)
+placesGo Nil k = Nil
+placesGo (Cons b rest) k =
+  if b then Cons (Just k) (placesGo rest (k + 1))
+  else Cons Nothing (placesGo rest k)
+
+-- (under `at` of the `let`s: field `f`'s local, for each field before
+-- the one a default is of; a field it does not name, any)
+fieldIdxs : Int -> List (Maybe Int) -> List Int
+fieldIdxs at Nil = Nil
+fieldIdxs at (Cons (Just p) rest) = Cons (at - 1 - p) (fieldIdxs at rest)
+fieldIdxs at (Cons Nothing rest) = Cons 0 (fieldIdxs at rest)
+
+-- | a term of a context of `n` locals, under `k` binders more
+weaken : Int -> Int -> Sx.Tm -> Sx.Tm
+weaken n k t =
+  if k == 0 then t
+  else (U.substOf (map (\m -> n - 1 - m + k) (range 0 (n - 1)))).el 0 t
+
+-- | the `i`th field's term, of the record's context (`n` locals) under
+-- | `at` of the `let`s
+codeAt : Int -> Int -> List (Maybe Int) -> Made -> Int -> Sx.Tm
+codeAt n at places m i =
+  if m.dflt then (U.substOf (fieldIdxs at (take i places))).el 0 m.el.stx
+  else weaken n at m.el.stx
+
+-- (the `i`th field in the record, under all `k` of the `let`s)
+entryAt : Int -> Int -> List (Maybe Int) -> Made -> Int -> Maybe Int -> Sx.Tm
+entryAt n k places m i (Just p) = SLocal (k - 1 - p)
+entryAt n k places m i Nothing = codeAt n k places m i
+
+entriesGo : Int
+          -> Int
+          -> List (Maybe Int)
+          -> List Made
+          -> List (Maybe Int)
+          -> Int
+          -> List (Pair String Sx.Tm)
+entriesGo n k places (Cons m rest) (Cons pl pls) i =
+  Cons
+    (MkPair m.name (entryAt n k places m i pl))
+    (entriesGo n k places rest pls (i + 1))
+entriesGo n k places _ _ i = Nil
+
+-- (the bound fields' values, each under the `let`s before it)
+valuesGo : Int
+         -> List (Maybe Int)
+         -> List Made
+         -> List (Maybe Int)
+         -> Int
+         -> List (Pair Made Sx.Tm)
+valuesGo n places (Cons m rest) (Cons (Just p) pls) i =
+  Cons (MkPair m (codeAt n p places m i)) (valuesGo n places rest pls (i + 1))
+valuesGo n places (Cons m rest) (Cons Nothing pls) i =
+  valuesGo n places rest pls (i + 1)
+valuesGo n places _ _ i = Nil
+
+-- | the `let`s around the record, the `p`th on (`a` the record's type)
+letsAround : Int -> V.Ty -> List (Pair Made Sx.Tm) -> Int -> Sx.Tm -> Sx.Tm
+letsAround n a Nil p body = body
+letsAround n a (Cons (MkPair m v) rest) p body =
+  SApp
+    (SLam
+       (SFunction
+          (V.levelOf a)
+          (R.readbTy (n + p) m.ty)
+          (AbsConst (R.readbTy (n + p) a))
+          Expl)
+       (MkAbs m.name (letsAround n a rest (p + 1) body)))
+    v
+
+-- (a type written in place, `data { ... }`: no `let` binds it, the
+-- `let`'s value being nominal)
+describes : Sx.Tm -> Bool
+describes (SCode (SSum _)) = True
+describes (SCode (SRecord _ _ _)) = True
+describes _ = False
+
+-- | a bound field that is a type written in place: none may be
+describedBound : List Made -> List Bool -> Elab Unit
+describedBound (Cons m rest) (Cons b bs) =
+  if b && describes m.el.stx
+    then failWith
+        m.span
+        44
+        ("`"
+         ++ m.name
+         ++ "` is a type written in place, and a default this record is given names it: define the type apart, and set `"
+         ++ m.name
+         ++ "` to its name")
+  else describedBound rest bs
+describedBound _ _ = pure MkUnit
+
+-- (the `let`s, each field bound at its place, around the record)
+lettedAt : ElabEnv
+         -> V.Ty
+         -> List Made
+         -> M.El
+         -> List Bool
+         -> List (Maybe Int)
+         -> Elab M.El
+lettedAt e a made record bound places = do
+  describedBound made bound
+  pure
+      { stx =
+          letsAround
+            e.scope.len
+            a
+            (valuesGo e.scope.len places made places 0)
+            0
+            (SCons
+               (D.fromList
+                  (entriesGo
+                     e.scope.len
+                     (length (filter (\b -> b) bound))
+                     places
+                     made
+                     places
+                     0)))
+      , val = record.val
+      }
+
+-- (the record, and which fields a default given names)
+lettedWith : ElabEnv -> V.Ty -> List Made -> M.El -> List Bool -> Elab M.El
+lettedWith e a made record bound =
+  if any (\b -> b) bound then lettedAt e a made record bound (placesGo bound 0)
+  else pure record
+
+-- | the record of the fields made, the fields a default given names bound
+-- | once around it
+letted : ElabEnv -> V.Ty -> List Made -> Elab M.El
+letted e a made =
+  lettedWith
+    e
+    a
+    made
+    (M.cons
+       (caseOf e.elabFor)
+       (D.fromList (map (\(m : Made) -> MkPair m.name m.el) made)))
+    (boundGo made made 0)
 
 recordIntro : P.Span -> List FieldSetting -> Chk
 recordIntro sp fieldSettings =
@@ -1411,7 +1702,7 @@ recordIntro sp fieldSettings =
   a <- Mt.forceT a0
   case V.behavior a of
     LikeRecord level capture fieldTypes -> do
-      fields <-
+      made <-
         introGo
           e0
           { span = sp
@@ -1424,98 +1715,13 @@ recordIntro sp fieldSettings =
           capture
           fieldSettings
           (D.toList fieldTypes)
-      pure (M.cons (caseOf e0.elabFor) (D.fromList fields))
+      letted e0 a made
     _ ->
       failWith
         (a := M.El)
         sp
         5
         "tried to check a record expression at a non-record type")
-
-anyP : {a : Type} -> (a -> Bool) -> List a -> Bool
-anyP p Nil = False
-anyP p (Cons x xs) = p x || anyP p xs
-
-anyIdxGo : {a : Type} -> Int -> (Int -> a -> Bool) -> List a -> Bool
-anyIdxGo i f Nil = False
-anyIdxGo i f (Cons x xs) = f i x || anyIdxGo (i + 1) f xs
-
-anyWithIndex : {a : Type} -> (Int -> a -> Bool) -> List a -> Bool
-anyWithIndex f xs = anyIdxGo 0 f xs
-
-type Mentions = { el : Int -> Sx.Tm -> Bool, ty : Int -> Sx.Ty -> Bool }
-
-armMentions : Mentions -> Int -> Pair String (Pair (Array String) Sx.Tm) -> Bool
-armMentions r d (MkPair tag (MkPair xs b)) = r.el (d + A.length xs) b
-
-fieldMentions : Mentions -> Int -> Pair String Sx.Tm -> Bool
-fieldMentions r d (MkPair k v) = r.el d v
-
-variantMentions : Mentions -> Int -> Pair String (Array Sx.Ty) -> Bool
-variantMentions r d (MkPair k args) = anyP (r.ty d) (A.toList args)
-
-mentionsTermF : Mentions -> Int -> Sx.Tm -> Bool
-mentionsTermF r d t = case t of
-  SLocal i -> i >= d
-  SCode a -> r.ty d a
-  SApp f a -> r.el d f || r.el d a
-  SLam dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
-  SLam dd (AbsConst b) -> r.ty d dd || r.el d b
-  SCons dct -> anyP (fieldMentions r d) (D.toList dct)
-  SProj e l -> r.el d e
-  STag x as -> anyP (r.el d) (A.toList as)
-  SMatch e cs -> r.el d e || anyP (armMentions r d) (D.toList cs)
-  SSpecialize e l v -> r.el d e || r.el d v
-  SIs e -> r.el d e
-  SRec e -> r.el d e
-  SFix dd (MkAbs x b) -> r.ty d dd || r.el (d + 1) b
-  SFix dd (AbsConst b) -> r.ty d dd || r.el d b
-  SImplicit x e -> r.el d e
-  SMetaApp m ix ty -> r.ty d ty
-  _ -> False
-
-mentionsTypeF : Mentions -> Int -> Sx.Ty -> Bool
-mentionsTypeF r d t = case t of
-  SDecode e -> r.el d e
-  SFunction level dom (MkAbs x b) implicit -> r.ty d dom || r.ty (d + 1) b
-  SFunction level dom (AbsConst b) implicit -> r.ty d dom || r.ty d b
-  -- (a default is closed)
-  SRecord level ft ds ->
-    anyWithIndex (\i ty -> r.ty (d + i) ty) (A.toList ft.values)
-  SSum vs -> anyP (variantMentions r d) (D.toList vs)
-  SIsTy a -> r.ty d a
-  SPrimArray a -> r.ty d a
-  _ -> False
-
-mentions : Mentions
-mentions =
-  { el = \d t -> mentionsTermF mentions d t
-  , ty = \d t -> mentionsTypeF mentions d t
-  }
-
--- | does a type's syntax mention local 0 (the innermost binder)?
-mentionsInner : Sx.Ty -> Bool
-mentionsInner t = mentions.ty 0 t
-
-closedEl : P.Span -> M.El -> Sx.Tm -> Elab M.El
-closedEl sp m stx =
-  if mentions.el 0 stx
-    then failWith
-        sp
-        43
-        "a field's default can name definitions only, not the type's parameters nor its fields"
-  else pure { stx = stx, val = m.val }
-
--- | a field's default: closed, naming definitions only -- a record that
--- | leaves the field out is given it, wherever that record is.  (An
--- | implicit argument it leaves unsolved is the definition's error, as
--- | anywhere.)
-closedDefault : P.Span -> Chk -> Chk
-closedDefault sp c =
-  MkChk (\e a -> do
-  m <- runChk c e a
-  mc <- gets (\c0 -> c0.metas)
-  closedEl sp m (U.zonkEl mc m.stx))
 
 fieldOrLocal : Int -> V.Ty -> Maybe V.V -> V.V
 fieldOrLocal l fty (Just v) = v

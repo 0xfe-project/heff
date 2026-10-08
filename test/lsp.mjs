@@ -212,6 +212,9 @@ try {
   const nameDef = await request("textDocument/definition", { textDocument: { uri: du }, position: pos(defaults, "name = \"strings\"") });
   const nameAt = pos(defaults, "name : String = ");
   expect("definition of a theory's field that has a default", nameDef.result && nameDef.result.range.start.line === nameAt.line && nameDef.result.range.start.character === nameAt.character, nameDef.result);
+  // (a default naming a field before it: that field, a local there)
+  const inLo = await request("textDocument/hover", { textDocument: { uri: du }, position: pos(defaults, "lo\n  , width") });
+  expect("hover on a field a default names", inLo.result && inLo.result.contents.value.includes("lo : Int") && inLo.result.contents.value.includes("(local)"), inLo.result);
 
   // an outline: each definition, a data's tags and a theory's fields under it
   const outline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/basics.hf") } });

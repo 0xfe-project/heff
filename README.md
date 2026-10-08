@@ -152,15 +152,17 @@ build = { backend = C, run = "main" }
 A record type names its fields, and a record gives each, in the type's
 order.  A field may have a default, `x : A = d`: a record checked
 against the type may leave the field out, and is given `d`.  A default
-names definitions only, not the type's parameters nor its other fields,
-so that it means the same wherever a record leaves it out; a theory's
+names definitions and the fields before it -- a record that leaves it
+out is given it of its own fields, each computed once (`let`s around the
+record) -- and nothing else where the type is, not its parameters, so
+that it means the same wherever a record leaves it out; a theory's
 fields may have defaults too.
 
 ```haskell
-type Opts = { name : String, verbose : Bool = False, tags : List String = [] }
+type Opts = { name : String, verbose : Bool = False, label : String = name }
 
 quiet : Opts
-quiet = { name = "quiet" }   -- { name = "quiet", verbose = False, tags = [] }
+quiet = { name = "quiet" }   -- { name = "quiet", verbose = False, label = "quiet" }
 ```
 
 ## Effects
