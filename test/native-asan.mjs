@@ -9,7 +9,8 @@
 //
 //   node test/native-asan.mjs
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { root } from "./heff.mjs";
 import { pool, run } from "./pool.mjs";
@@ -36,15 +37,24 @@ const step = (what, cmd, args, opts = {}) => {
 const parts = join(root, ".heff", "out", "heff.d"), heff = join(work, "bin", "heff");
 const c = readdirSync(parts).filter((f) => f.endsWith(".c")).map((f) => join(parts, f));
 // (a part an object, as many at once as there are cores -- clang given
-// them all builds them one after another -- then the objects linked)
+// them all builds them one after another -- then the objects linked; an
+// object kept from a run before, in .heff/ref/native-asan.o/, named by
+// what it is made of -- the clang, the flags, heff.h and the part -- is
+// not made again, and one no part is made of now is let go)
 const flags = ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0"];
-mkdirSync(join(work, "obj"));
+const kept = join(root, ".heff", "ref", "native-asan.o");
+mkdirSync(kept, { recursive: true });
+const madeOf = createHash("sha256").update(spawnSync("clang", ["--version"], { encoding: "utf8" }).stdout ?? "")
+  .update(flags.join(" ")).update(readFileSync(join(parts, "heff.h")));
 const objects = await pool(c, async (f) => {
-  const o = join(work, "obj", basename(f, ".c") + ".o");
-  const r = await run("clang", [...flags, "-c", f, "-o", o]);
+  const o = join(kept, `${basename(f, ".c")}-${madeOf.copy().update(readFileSync(f)).digest("hex").slice(0, 16)}.o`);
+  if (existsSync(o)) return o;
+  const r = await run("clang", [...flags, "-c", f, "-o", o + ".part"]);
   if (r.status !== 0) { console.log(`building it failed, at ${basename(f)}:\n${r.stdout}${r.stderr}${r.error || ""}`); process.exit(1); }
+  renameSync(o + ".part", o);
   return o;
 });
+for (const n of readdirSync(kept)) if (!objects.includes(join(kept, n))) rmSync(join(kept, n));
 step("building it", "clang", [...flags, ...objects, "-o", heff, "-lm", "-lpthread"]);
 
 // (what it leaves at its end is no fault: a program's last objects are
