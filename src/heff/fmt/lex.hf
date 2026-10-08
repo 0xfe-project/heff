@@ -1,11 +1,13 @@
 -- The lexer of the `.hf` syntax.  Every token knows its column and
 -- whether it is the first on its line: all the layout rule needs.
 -- Comments are not tokens; they are returned apart, for the formatter.
--- The kinds are var, con, field, int, float, str, sym, punct, kw, watch,
--- and one eof at the end.
+-- The kinds are var, con, field, int, float, str, rune, sym, punct, kw,
+-- watch, and one eof at the end.
 --
 -- The loop is one self-recursion: `step` reads one thing and says where to
 -- go on (a `Step`), and `lexGo` applies each step to what has been read.
+
+import heff.rune as R
 
 type Tok =
   { kind : String
@@ -40,6 +42,8 @@ type NumEnd = { end : Int, isFloat : Bool }
 
 type StrEnd = { i : Int, text : String, closed : Bool }
 
+type RuneEnd = { ok : Bool, end : Int, code : Int }
+
 type BlockEnd =
   { i : Int, line : Int, lineStart : Int, first : Bool, closed : Bool }
 
@@ -64,6 +68,7 @@ keywords =
   , "Int"
   , "Float"
   , "String"
+  , "Rune"
   , "Array"
   , "Int8"
   , "Int16"
@@ -206,6 +211,72 @@ strScan s j acc =
     then strScan s (j + 2) (acc ^ escChar (strSlice s (j + 1) (j + 2)))
   else strScan s (j + 1) (acc ^ strSlice s j (j + 1))
 
+-- A rune literal: a `'` where a token starts (in a name it is a prime:
+-- the name is read on over it), one character or an escape, and a `'`.
+-- The escapes are a string's, `\n` `\t` `\r` and `\` before any other
+-- character that character (`\'`, `\\`), and `\u{1F600}`, a code point
+-- in hexadecimal.  Where no `'` closes it, the first is an unexpected
+-- character, as it was.
+
+noRune : RuneEnd
+noRune = { ok = False, end = 0, code = 0 }
+
+-- (closed by a `'` at `j`: the literal, of the code point `c`)
+closedAt : String -> Int -> Int -> RuneEnd
+closedAt s j c =
+  if charCode s j == 39 then { ok = True, end = j + 1, code = c } else noRune
+
+-- (the code point an escape `\c` stands for)
+escCode : Int -> Int
+escCode 110 = 10
+escCode 116 = 9
+escCode 114 = 13
+escCode c = c
+
+hexDigitValue : Int -> Int
+hexDigitValue c =
+  if isDigitC c then c - 48 else if c >= 97 then c - 87 else c - 55
+
+-- (the value of the hexadecimal digits from `j` to `e`)
+hexValue : String -> Int -> Int -> Int -> Int
+hexValue s j e acc =
+  if j >= e then acc
+  else hexValue s (j + 1) e (acc * 16 + hexDigitValue (charCode s j))
+
+hexRunEnd : String -> Int -> Int
+hexRunEnd s j = if isHexC (charCode s j) then hexRunEnd s (j + 1) else j
+
+-- (`\u{...}`: its digits from `j` to `e`, a `}` at `e`)
+uniEscTo : String -> Int -> Int -> RuneEnd
+uniEscTo s j e =
+  if e > j && charCode s e == 125 then closedAt s (e + 1) (hexValue s j e 0)
+  else noRune
+
+-- (an escape, from the character after its `\`, at `j`)
+escRune : String -> Int -> RuneEnd
+escRune s j =
+  if charCode s j == 117 && charCode s (j + 1) == 123
+    then uniEscTo s (j + 2) (hexRunEnd s (j + 2))
+  else if j >= strLength s || charCode s j == 10 then noRune
+  else closedAt s (j + R.widthAt s j) (escCode (R.codeAt s j))
+
+-- (from the opening `'`, at `i`)
+runeScan : String -> Int -> RuneEnd
+runeScan s i =
+  if charCode s (i + 1) == 92 then escRune s (i + 2)
+  else if i + 1 >= strLength s
+  || charCode s (i + 1) == 39
+  || charCode s (i + 1) == 10
+    then noRune
+  else closedAt s (i + 1 + R.widthAt s (i + 1)) (R.codeAt s (i + 1))
+
+-- (what is wrong with a literal's code point, if it is no rune)
+runeErr : Int -> String
+runeErr c =
+  "a rune literal is a Unicode scalar value: "
+  ^ R.codeName c
+  ^ (if c > 1114111 then " is beyond U+10FFFF" else " is a surrogate")
+
 -- (a `{- -}` comment, nested; from its `{-`, with the line bookkeeping)
 blockScan : String -> Int -> Int -> Int -> Int -> Bool -> BlockEnd
 blockScan s j depth line lineStart first =
@@ -239,7 +310,10 @@ operandBefore : List Tok -> Int -> Bool
 operandBefore Nil start = False
 operandBefore (Cons t _) start =
   t.end == start
-  && (List.elemBy strEq t.kind ["var", "con", "int", "float", "str", "field"]
+  && (List.elemBy
+        strEq
+        t.kind
+        ["var", "con", "int", "float", "str", "rune", "field"]
       || strEq t.kind "punct" && List.elemBy strEq t.text [")", "]", "}"])
 
 mkTok : String -> String -> Int -> Int -> Int -> Int -> Bool -> Tok
@@ -339,6 +413,44 @@ strStep src i line lineStart first r =
   , cmt = Nothing
   }
 
+-- (a character no token starts with)
+unexpectedStep : String -> Int -> Int -> Int -> Bool -> Step
+unexpectedStep src i line lineStart first =
+  { i = i + 1
+  , line = line
+  , lineStart = lineStart
+  , first = first
+  , tok = Nothing
+  , err =
+      Just
+        { start = i
+        , end = i + 1
+        , msg = "unexpected character " ^ strSlice src i (i + 1)
+        }
+  , cmt = Nothing
+  }
+
+-- (a rune's token: its text the rune, as a string)
+runeStep : String -> Int -> Int -> Int -> Bool -> RuneEnd -> Step
+runeStep src i line lineStart first r =
+  { i = r.end
+  , line = line
+  , lineStart = lineStart
+  , first = False
+  , tok =
+      Just (mkTok "rune" (R.encode r.code) i r.end line (i - lineStart) first)
+  , err =
+      if R.isScalar r.code then Nothing
+      else Just { start = i, end = r.end, msg = runeErr r.code }
+  , cmt = Nothing
+  }
+
+-- (a `'` where a token starts: a rune literal, if one is there)
+quoteStep : String -> Int -> Int -> Int -> Bool -> RuneEnd -> Step
+quoteStep src i line lineStart first r =
+  if r.ok then runeStep src i line lineStart first r
+  else unexpectedStep src i line lineStart first
+
 lineCmtStep : String -> Int -> Int -> Int -> Bool -> Int -> Step
 lineCmtStep src i line lineStart first e =
   { i = e
@@ -420,19 +532,8 @@ stepAt src i line lineStart first toks c =
            (i - lineStart)
            first)
   else if isSymC c then symStep src i line lineStart first (symEnd src (i + 1))
-  else { i = i + 1
-       , line = line
-       , lineStart = lineStart
-       , first = first
-       , tok = Nothing
-       , err =
-           Just
-             { start = i
-             , end = i + 1
-             , msg = "unexpected character " ^ strSlice src i (i + 1)
-             }
-       , cmt = Nothing
-       }
+  else if c == 39 then quoteStep src i line lineStart first (runeScan src i)
+  else unexpectedStep src i line lineStart first
 
 step : String -> Int -> Int -> Int -> Bool -> List Tok -> Step
 step src i line lineStart first toks =
@@ -516,6 +617,12 @@ tokCols l = List.map tokCol l.tokens
 tokFirsts : Lexed -> List Bool
 tokFirsts l = List.map tokFirst l.tokens
 
+errMsg : Err -> String
+errMsg e = e.msg
+
+errMsgs : Lexed -> List String
+errMsgs l = List.map errMsg l.errors
+
 test lexing
 
 -- >>> showToks "f x = x + 1"
@@ -538,6 +645,15 @@ test lexing
 
 -- >>> showToks "x' Bwd/elemAt \"a\\nb\""
 -- "var:x' con:Bwd/elemAt str:a\nb eof:"
+
+-- >>> showToks "f x' x'' + 'a' g'a' 1'b' '\\n' '\\'' '\\\\' '\\u{1F600}' '😀' 'é' '\\t'"
+-- "var:f var:x' var:x'' sym:+ rune:a var:g'a' int:1 rune:b rune:\n rune:' rune:\\ rune:😀 rune:😀 rune:é rune:\t eof:"
+
+-- >>> showToks "'ab' x'y"
+-- "var:ab' var:x'y eof:"
+
+-- >>> errMsgs (lex "'\\u{d800}' '\\u{110000}' 'ab'")
+-- Cons "a rune literal is a Unicode scalar value: U+D800 is a surrogate" (Cons "a rune literal is a Unicode scalar value: U+110000 is beyond U+10FFFF" (Cons "unexpected character '" Nil))
 
 -- >>> showToks "a --> b --- c"
 -- "var:a sym:--> var:b eof:"

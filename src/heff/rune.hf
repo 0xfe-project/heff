@@ -1,0 +1,114 @@
+-- Runes, as the compiler has them: a rune is a code point of Unicode,
+-- a 32-bit value, as Go's `rune` is (lib/rune.hf has its operations);
+-- here an `Int`.  One that is no Unicode scalar value -- a surrogate,
+-- U+D800 to U+DFFF, one beyond U+10FFFF, or one below 0 -- no literal
+-- is, and a string has U+FFFD for it, as Go's does.  A string is UTF-16
+-- code units on every backend (lib/c/runtime.c): a rune beyond U+FFFF is
+-- two of them, a surrogate pair, and a surrogate not in a pair is read
+-- as U+FFFD.
+
+-- | whether it is a Unicode scalar value: what a literal may be, and what
+-- | a string holds of it
+isScalar : Int -> Bool
+isScalar c = 0 <= c && c <= 1114111 && not (55296 <= c && c <= 57343)
+
+-- | U+FFFD: a string's rune where it is given one that is no scalar
+-- | value, and where it has a surrogate not in a pair
+replacement : Int
+replacement = 65533
+
+-- | the first of a surrogate pair
+isHigh : Int -> Bool
+isHigh c = 55296 <= c && c <= 56319
+
+-- | the second
+isLow : Int -> Bool
+isLow c = 56320 <= c && c <= 57343
+
+hexWith : String -> Int -> String
+hexWith digits n =
+  if n < 16 then strSlice digits n (n + 1)
+  else hexWith digits (n / 16) ^ strSlice digits (n % 16) (n % 16 + 1)
+
+-- | in hexadecimal, lower case: as an escape writes it, `\u{1f600}`
+hex : Int -> String
+hex n = hexWith "0123456789abcdef" n
+
+padTo4 : String -> String
+padTo4 s = if strLength s >= 4 then s else padTo4 ("0" ^ s)
+
+-- | as Unicode names a code point: `U+00E9`
+codeName : Int -> String
+codeName c = "U+" ^ padTo4 (hexWith "0123456789ABCDEF" c)
+
+-- | the string of one rune: a code unit, or a surrogate pair
+encode : Int -> String
+encode c =
+  if not (isScalar c) then fromCharCode replacement
+  else if c < 65536 then fromCharCode c
+  else fromCharCode (55296 + (c - 65536) / 1024)
+    ^ fromCharCode (56320 + (c - 65536) % 1024)
+
+-- | the string of runes
+encodeAll : List Int -> String
+encodeAll cs = joinWith "" (List.map encode cs)
+
+-- | whether a surrogate pair starts at `i`
+pairAt : String -> Int -> Bool
+pairAt s i = isHigh (charCode s i) && isLow (charCode s (i + 1))
+
+-- | the rune at `i` (a surrogate pair's, where one starts there; a
+-- | surrogate of none, U+FFFD)
+codeAt : String -> Int -> Int
+codeAt s i =
+  if pairAt s i
+    then 65536 + (charCode s i - 55296) * 1024 + (charCode s (i + 1) - 56320)
+  else if isHigh (charCode s i) || isLow (charCode s i) then replacement
+  else charCode s i
+
+-- | how many code units it takes
+widthAt : String -> Int -> Int
+widthAt s i = if pairAt s i then 2 else 1
+
+-- (the runes from `i` on, into `acc`, last first)
+decodeFrom : String -> Int -> List Int -> List Int
+decodeFrom s i acc =
+  if i >= strLength s then List.reverse acc
+  else decodeFrom s (i + widthAt s i) (Cons (codeAt s i) acc)
+
+-- | a string's runes
+decode : String -> List Int
+decode s = decodeFrom s 0 Nil
+
+-- (a control character: C0's, DEL and C1's, written as an escape)
+isControl : Int -> Bool
+isControl c = c < 32 || 127 <= c && c < 160
+
+-- (between the quotes)
+quoted : Int -> String
+quoted 39 = "\\'"
+quoted 92 = "\\\\"
+quoted 10 = "\\n"
+quoted 9 = "\\t"
+quoted 13 = "\\r"
+quoted c =
+  if not (isScalar c) then encode replacement
+  else if isControl c then "\\u{" ^ hex c ^ "}"
+  else encode c
+
+-- | as a literal writes it: `'a'`, `'\n'`, `'\u{1b}'`; one that is no
+-- | scalar value as U+FFFD, as Go's `%q` shows it
+quote : Int -> String
+quote c = "'" ^ quoted c ^ "'"
+
+-- >>> List.map quote [97, 39, 92, 10, 27, 233, 128512, 55296, 0 - 1]
+-- Cons "'a'" (Cons "'\\''" (Cons "'\\\\'" (Cons "'\\n'" (Cons "'\\u{1b}'" (Cons "'é'" (Cons "'😀'" (Cons "'�'" (Cons "'�'" Nil))))))))
+
+-- >>> decode (encodeAll [97, 233, 128512, 55296, 1114112])
+-- Cons 97 (Cons 233 (Cons 128512 (Cons 65533 (Cons 65533 Nil))))
+
+-- >>> decode ("a" ^ fromCharCode 55357 ^ "b" ^ fromCharCode 56832)
+-- Cons 97 (Cons 65533 (Cons 98 (Cons 65533 Nil)))
+
+-- >>> List.map codeName [233, 128512]
+-- Cons "U+00E9" (Cons "U+1F600" Nil)

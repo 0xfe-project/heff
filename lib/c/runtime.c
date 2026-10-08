@@ -1404,6 +1404,67 @@ static V heff_float32Floor(V a) {
   return heff_int_of_double(floor(d));
 }
 
+// Runes
+// ---------------------------------------------------------------------
+// A `Rune` is a word of its code point, a 32-bit value, as Go's `rune` is:
+// `fromInt` wraps an integer around to 32 bits, as `int32FromInt` does,
+// so `toInt` is nothing.  One that is no Unicode scalar value (a
+// surrogate, below 0, beyond U+10FFFF) is U+FFFD in a string made of it;
+// a string's surrogate not in a pair is read as U+FFFD.
+
+static inline int heff_runeEq_c(V a, V b) { return a == b; }
+static inline int heff_runeLt_c(V a, V b) { return INT_OF(a) < INT_OF(b); }
+static inline int heff_runeLe_c(V a, V b) { return INT_OF(a) <= INT_OF(b); }
+static inline V heff_runeEq(V a, V b) { return heff_bool(heff_runeEq_c(a, b)); }
+static inline V heff_runeLt(V a, V b) { return heff_bool(heff_runeLt_c(a, b)); }
+static inline V heff_runeLe(V a, V b) { return heff_bool(heff_runeLe_c(a, b)); }
+static V heff_runeToInt(V a) { return a; }
+static V heff_runeFromInt(V a) { return heff_int32FromInt(a); }
+
+// (a string's runes: the last read first, a low surrogate after a high
+// one the pair's)
+static V heff_strRunes(V a) {
+  Str *x = (Str *)a;
+  V l = NTAG(TAG_Nil);
+  for (int64_t i = x->len; i > 0;) {
+    uint32_t u = x->s[--i];
+    if (u >= 0xDC00 && u < 0xE000 && i > 0 && x->s[i - 1] >= 0xD800 && x->s[i - 1] < 0xDC00) {
+      u = 0x10000 + ((uint32_t)(x->s[i - 1] - 0xD800) << 10) + (u - 0xDC00);
+      i--;
+    } else if (u >= 0xD800 && u < 0xE000) u = 0xFFFD;
+    V f[2] = { MK_INT((int64_t)u), l };
+    l = heff_tag(TAG_Cons, 2, f);
+  }
+  heff_drop(a);
+  return l;
+}
+
+static inline int heff_rune_scalar(int64_t r) {
+  return r >= 0 && r <= 0x10FFFF && !(r >= 0xD800 && r < 0xE000);
+}
+
+// (the runes' string: each one code unit, or two, a surrogate pair)
+static V heff_strOfRunes(V l) {
+  int64_t n = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
+    int64_t r = INT_OF(heff_field(c, 0));
+    n += heff_rune_scalar(r) && r >= 0x10000 ? 2 : 1;
+  }
+  Str *s = heff_str_new(n);
+  int64_t k = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
+    int64_t r = INT_OF(heff_field(c, 0));
+    if (!heff_rune_scalar(r)) s->s[k++] = 0xFFFD;
+    else if (r < 0x10000) s->s[k++] = (uint16_t)r;
+    else {
+      s->s[k++] = (uint16_t)(0xD800 + ((r - 0x10000) >> 10));
+      s->s[k++] = (uint16_t)(0xDC00 + ((r - 0x10000) & 0x3FF));
+    }
+  }
+  heff_drop(l);
+  return (V)s;
+}
+
 // Arrays
 // ---------------------------------------------------------------------
 
