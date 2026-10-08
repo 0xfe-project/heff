@@ -662,15 +662,53 @@ lentValue i v =
   , post = Cons ("heff_drop(b_" ^ showInt i ^ ");") Nil
   }
 
-lentOne : CK -> CE -> List String -> List Int -> Int -> I.Expr -> C Lent
-lentOne r ce live bi i (EVar x) =
+-- (a label's place among a shape's labels)
+indexIn : String -> Int -> List String -> Maybe Int
+indexIn l i Nil = Nothing
+indexIn l i (Cons k ks) = if strEq l k then Just i else indexIn l (i + 1) ks
+
+fieldLent : CE -> List String -> String -> Maybe Int -> Maybe String
+fieldLent ce after x (Just i) =
+  if elemS x after || elemS x ce.borrowed
+    then Just ("heff_rfield(" ^ cLocal x ^ ", " ^ showInt i ^ ")")
+  else Nothing
+fieldLent ce after x Nothing = Nothing
+
+-- (at a borrowed parameter, a field of a record that outlives the call
+-- -- wanted after it (`after`), or lent to this code -- lent on where it
+-- is: not counted, up or down)
+lentField : CE -> List String -> I.Expr -> Maybe String
+lentField ce after (EProj (EVar x) l sh) = fieldLent ce after x (indexIn l 0 sh)
+lentField ce after _ = Nothing
+
+lentOr : CK
+       -> CE
+       -> List String
+       -> List Int
+       -> Int
+       -> I.Expr
+       -> Maybe String
+       -> C Lent
+lentOr r ce live bi i e (Just a) = pure (given a)
+lentOr r ce live bi i (EVar x) Nothing =
   if elemI i bi then pure (lentVar ce live x)
   else do
     v <- r.val ce live (EVar x)
     pure (given v)
-lentOne r ce live bi i e = do
+lentOr r ce live bi i e Nothing = do
   v <- r.val ce live e
   pure (if elemI i bi then lentValue i v else given v)
+
+lentOne : CK
+        -> CE
+        -> List String
+        -> List String
+        -> List Int
+        -> Int
+        -> I.Expr
+        -> C Lent
+lentOne r ce after live bi i e =
+  lentOr r ce live bi i e (if elemI i bi then lentField ce after e else Nothing)
 
 lentOperands : CK
              -> CE
@@ -681,7 +719,7 @@ lentOperands : CK
              -> C (List Lent)
 lentOperands r ce live bi i Nil = pure Nil
 lentOperands r ce live bi i (Cons e es) = do
-  l <- lentOne r ce (unionS (fvList es) live) bi i e
+  l <- lentOne r ce live (unionS (fvList es) live) bi i e
   ls <- lentOperands r ce live bi (i + 1) es
   pure (Cons l ls)
 
@@ -832,11 +870,6 @@ reuseVal r ce live (Cons ru (Cons (ETag t as) Nil)) = do
        ^ ")")
 reuseVal r ce live _ = pure "0"
 
--- (a label's place among a shape's labels)
-indexIn : String -> Int -> List String -> Maybe Int
-indexIn l i Nil = Nothing
-indexIn l i (Cons k ks) = if strEq l k then Just i else indexIn l (i + 1) ks
-
 -- (field `i` of a record of `n` fields, read where it is: of a variable
 -- wanted after or lent, or of a definition's value, the field counted and
 -- the record not touched; otherwise the record consumed, the field taken
@@ -868,6 +901,152 @@ projAt r ce live e l n Nothing = do
   v <- r.val ce live e
   pure ("heff_get(" ^ v ^ ", " ^ lblName l ^ ")")
 
+-- Records updated: a record built of the same shape as one it reads
+-- fields of at their own places, `{ a = x, b = r.b, c = r.c }`, the one
+-- read (`r`) held and given up there, is built in `r`'s cell where that
+-- is `r`'s last reference (`heff_rec_reuse_n`, lib/c/runtime.c): the
+-- fields kept where they are, the others computed first -- `r` wanted
+-- by them still -- and stored in it.
+
+sameS : List String -> List String -> Bool
+sameS Nil Nil = True
+sameS (Cons x xs) (Cons y ys) = strEq x y && sameS xs ys
+sameS _ _ = False
+
+-- (a field read from a record's at its own place, that record's shape
+-- `ls`, the one being built: the record read)
+keptFrom : List String -> Pair String I.Expr -> Maybe String
+keptFrom ls (MkPair l (EProj (EVar x) l2 sh)) =
+  if strEq l l2 && sameS ls sh then Just x else Nothing
+keptFrom ls _ = Nothing
+
+isJustOf : String -> Maybe String -> Bool
+isJustOf x (Just y) = strEq x y
+isJustOf x Nothing = False
+
+isKeptFrom : List String -> String -> Pair String I.Expr -> Bool
+isKeptFrom ls x f = isJustOf x (keptFrom ls f)
+
+justsOf : List (Maybe String) -> List String
+justsOf Nil = Nil
+justsOf (Cons (Just x) rest) = Cons x (justsOf rest)
+justsOf (Cons Nothing rest) = justsOf rest
+
+-- (the first record a field is kept from that this code holds and gives
+-- up here: wanted by nothing after, nor lent)
+updatedIn : CE
+          -> List String
+          -> List String
+          -> List (Pair String I.Expr)
+          -> Maybe String
+updatedIn ce live ls fs =
+  if List.length fs > 62 then Nothing
+  else List.head
+      (List.filter
+         (\x ->
+            elemS x ce.owned && not (elemS x live) && not (elemS x ce.borrowed))
+         (justsOf (List.map (keptFrom ls) fs)))
+
+-- (a bit for each field kept, the first the lowest)
+keepBits : List Bool -> Int
+keepBits Nil = 0
+keepBits (Cons b bs) = (if b then 1 else 0) + 2 * keepBits bs
+
+-- (the fields not kept from `x`, each with its place)
+changedOf : List String
+          -> String
+          -> List (Pair String I.Expr)
+          -> List (Pair Int I.Expr)
+changedOf ls x fs =
+  List.map
+    (\p -> MkPair (snd p) (snd (fst p)))
+    (List.filter
+       (\p -> not (isKeptFrom ls x (fst p)))
+       (List.zipWith
+          (\f i -> MkPair f i)
+          fs
+          (List.range 0 (List.length fs - 1))))
+
+updateText : String
+           -> String
+           -> Int
+           -> Int
+           -> List String
+           -> List (Pair Int I.Expr)
+           -> String
+updateText x shape keep n vs changed =
+  "({ "
+  ^ joinWith
+    ""
+    (List.zipWith
+       (\v p -> "V rv_" ^ showInt (fst p) ^ " = " ^ v ^ "; ")
+       vs
+       changed)
+  ^ "V rr_ = heff_rec_reuse_n("
+  ^ cLocal x
+  ^ ", "
+  ^ showInt keep
+  ^ "ULL, "
+  ^ showInt n
+  ^ ", "
+  ^ shape
+  ^ "); "
+  ^ joinWith
+    ""
+    (List.map
+       (\p ->
+          "heff_rfield(rr_, "
+          ^ showInt (fst p)
+          ^ ") = rv_"
+          ^ showInt (fst p)
+          ^ "; ")
+       changed)
+  ^ "rr_; })"
+
+-- | a record built from `x`'s
+updateVal : CK
+          -> CE
+          -> List String
+          -> List (Pair String I.Expr)
+          -> String
+          -> C String
+updateVal r ce live fs x = do
+  vs <-
+    operandsF
+      r
+      ce
+      (Cons x live)
+      (List.map snd (changedOf (List.map fst fs) x fs))
+  shape <- shapeLit (List.map fst fs)
+  pure
+      (updateText
+         x
+         shape
+         (keepBits (List.map (isKeptFrom (List.map fst fs) x) fs))
+         (List.length fs)
+         vs
+         (changedOf (List.map fst fs) x fs))
+
+-- | a record built: in the cell of the one it is updated from, if any
+recordVal : CK
+          -> CE
+          -> List String
+          -> List (Pair String I.Expr)
+          -> Maybe String
+          -> C String
+recordVal r ce live fs (Just x) = updateVal r ce live fs x
+recordVal r ce live fs Nothing = do
+  vs <- operandsF r ce live (List.map snd fs)
+  shape <- shapeLit (List.map fst fs)
+  pure
+      ("heff_rec_n("
+       ^ showInt (List.length fs)
+       ^ ", "
+       ^ shape
+       ^ ", "
+       ^ argsArr vs
+       ^ ")")
+
 valF : CK -> CE -> List String -> I.Expr -> C String
 valF r ce live (EVar x) = pure (varUse ce.borrowed live x)
 valF r ce live (EGlobal g) =
@@ -891,17 +1070,8 @@ valF r ce live (ETag t as) =
          ^ ", "
          ^ argsArr vs
          ^ ")")
-valF r ce live (ERecord fs) = do
-  vs <- operandsF r ce live (List.map snd fs)
-  shape <- shapeLit (List.map fst fs)
-  pure
-      ("heff_rec_n("
-       ^ showInt (List.length fs)
-       ^ ", "
-       ^ shape
-       ^ ", "
-       ^ argsArr vs
-       ^ ")")
+valF r ce live (ERecord fs) =
+  recordVal r ce live fs (updatedIn ce live (List.map fst fs) fs)
 valF r ce live (EProj e l sh) =
   projAt r ce live e l (List.length sh) (indexIn l 0 sh)
 valF r ce live (EPrim p) = primLit p

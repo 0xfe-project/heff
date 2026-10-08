@@ -438,6 +438,42 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
   return x;
 }
 
+// A record updated (#34): one built of the same shape as the record `v`
+// it is built from, some of its fields read from `v`'s at their own
+// places (`keep`, a bit each) and `v` given up there, is built in `v`'s
+// cell where that was `v`'s last reference -- the fields kept left where
+// they are, counted neither up nor down, the others dropped -- as a tag
+// is in a cell kept for it (Perceus's reuse).  Shared, `v` is copied:
+// the fields kept counted, `v` counted down.  Either way the fields not
+// kept are stored by the caller, at once.
+static __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *lbl) {
+  Rec *r = (Rec *)v;
+  int64_t n = r->n;
+  Rec *c = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
+  c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = n; c->lbl = lbl;
+  for (int64_t i = 0; i < n; i++)
+    c->f[i] = ((keep >> i) & 1) ? heff_dup(r->f[i]) : MK_INT(0);
+  if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+  return (V)c;
+}
+
+HEFF_KNOWN V heff_rec_reuse_n(V v, uint64_t keep, int64_t n, uint32_t *lbl) {
+  Rec *r = (Rec *)v;
+  if (r->h.rc != 1) {
+    if (n > HEFF_FEW_FIELDS) return heff_rec_copy(v, keep, lbl);
+    Rec *c = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
+    c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = n; c->lbl = lbl;
+    for (int64_t i = 0; i < n; i++)
+      if ((keep >> i) & 1) c->f[i] = heff_dup(r->f[i]);
+    if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+    return (V)c;
+  }
+  for (int64_t i = 0; i < n; i++)
+    if (!((keep >> i) & 1)) heff_drop(r->f[i]);
+  r->lbl = lbl;
+  return v;
+}
+
 // (a lambda's closure, holding `n`, given up where its body starts,
 // which takes what it holds (#26): its last reference, its shell freed;
 // otherwise each counted.  `n` is a constant where it is called)
