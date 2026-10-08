@@ -130,10 +130,12 @@ expect("a project for another heff", old.status === 1 &&
 // packages: a required package given by a directory (`replace`), its
 // modules imported by the name the project requires it by, its own
 // imports by its own package.hf
+// (a list field of a manifest: left out where it is empty, its default)
+const listField = (x, items) => items.length ? `, ${x} = [${items.join(", ")}]` : "";
 const manifestOf = (path, requires = [], heff = version) => {
   const req = requires.map(([name, p]) => `{ name = "${name}", path = "${p}", version = "1.0.0" }`);
   const rep = requires.filter(([, , dir]) => dir).map(([name, , dir]) => `{ name = "${name}", dir = "${dir}" }`);
-  return `package = { module = "${path}", heff = "${heff}", require = [${req.join(", ")}], replace = [${rep.join(", ")}] }\n`;
+  return `package = { module = "${path}", heff = "${heff}"${listField("require", req)}${listField("replace", rep)} }\n`;
 };
 write("json/package.hf", manifestOf("x.org/json"));
 write("json/src/json/util.hf", "import prelude\n\nquoted : String -> String\nquoted s = \"<\" ++ s ++ \">\"\n");
@@ -247,7 +249,7 @@ const remote = (path, files, tag) => {
   git(dir, "add", "-A"); git(dir, "commit", "-q", "-m", tag); git(dir, "tag", tag);
 };
 const typed = (path, requires = []) => "import manifest\n\npackage : Package\n" +
-  `package = { module = "${path}", heff = "${version}", require = [${requires.map(([n, p, v]) => `{ name = "${n}", path = "${p}", version = "${v}" }`).join(", ")}], replace = [] }\n`;
+  `package = { module = "${path}", heff = "${version}"${listField("require", requires.map(([n, p, v]) => `{ name = "${n}", path = "${p}", version = "${v}" }`))} }\n`;
 const encodeAs = (l, r) => `import prelude\n\nencode : String -> String\nencode s = "${l}" ++ s ++ "${r}"\n`;
 remote("x.org/lib", { "package.hf": typed("x.org/lib"), "src/lib/encode.hf": encodeAs("<", ">") }, "v1.0.0");
 remote("x.org/lib", { "src/lib/encode.hf": encodeAs("[", "]") }, "v1.1.0");
@@ -308,7 +310,7 @@ write("tool/package.hf", manifestOf("tool"));
 write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
 const program = (says) => "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print " + says + "\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n";
 const buildOf = (backend, ships = []) =>
-  `import manifest\n\nbuild : Build\nbuild = { backend = ${backend}, run = "main", ships = [${ships.map((n) => `"${n}"`).join(", ")}] }\n`;
+  `import manifest\n\nbuild : Build\nbuild = { backend = ${backend}, run = "main"${listField("ships", ships.map((n) => `"${n}"`))} }\n`;
 for (const [x, says] of [["tool", "greeting"], ["again", "(greeting ++ \", again\")"]]) {
   write(`tool/app/${x}/build.hf`, buildOf("Node"));
   write(`tool/app/${x}/main.hf`, program(says));
@@ -396,6 +398,38 @@ expect("install heff: the heff in the heff home, with its library and its versio
   selfChecked.status === 0 && selfChecked.stdout.includes("xs : List Int") &&
   selfInit.status === 0 && readFileSync(join(work, "fromhome", "package.hf"), "utf8").includes(`heff = "${version}"`) &&
   selfVersion.status === 0 && selfVersion.stdout === `heff ${version}\n`, [selfInstalled, selfChecked, selfInit, selfVersion]);
+
+// a manifest's fields with a default in lib/manifest.hf (`require`,
+// `replace`, a build.hf's `ships`: empty lists) left out, or written: heff
+// reading package.hf and build.hf (without elaborating them, `heff
+// build`) and elaborating them (`heff check`, against lib/manifest.hf)
+// agree on each, and on a field without one left out, or the fields out
+// of order -- saying the same fields, and which may be left out
+const packageFields = "the fields are module, heff, require, replace, in this order (require and replace may be left out)";
+const buildFields = "the fields are backend, run, ships, in this order (ships may be left out)";
+const agreeing = [
+  ["package.hf", "package : Package\npackage", `{ module = "agree", heff = "${version}" }`, null],
+  ["package.hf", "package : Package\npackage", `{ module = "agree", heff = "${version}", require = [], replace = [] }`, null],
+  ["package.hf", "package : Package\npackage", `{ module = "agree", heff = "${version}", replace = [] }`, null],
+  ["package.hf", "package : Package\npackage", `{ module = "agree" }`, packageFields],
+  ["package.hf", "package : Package\npackage", `{ module = "agree", heff = "${version}", replace = [], require = [] }`, packageFields],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node, run = "main" }`, null],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node, run = "main", ships = [] }`, null],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node }`, buildFields],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node, ships = [], run = "main" }`, buildFields],
+];
+const inAgree = (...args) => spawnSync(heffBin, args, { cwd: join(work, "agree"), encoding: "utf8" });
+write("agree/src/agree/m.hf", "x : Int\nx = 1\n");
+write("agree/app/agree/main.hf", "import co\nimport prelude\nimport std.io\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print \"agree\"\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
+for (const [file, head, literal, fields] of agreeing) {
+  write("agree/package.hf", manifestOf("agree"));
+  write("agree/app/agree/build.hf", buildOf("Node"));
+  write(`agree/${file}`, `import manifest\n\n${head} = ${literal}\n`);
+  const read = inAgree("build"), checked = inAgree("check", file);
+  expect(`${file}, ${literal}: read and elaborated alike`, fields === null
+    ? read.status === 0 && checked.status === 0
+    : read.status === 1 && checked.status === 1 && read.stderr.includes(fields) && checked.stderr.includes(fields), [read, checked]);
+}
 
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

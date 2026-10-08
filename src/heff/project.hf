@@ -14,7 +14,9 @@
 --     }
 --
 -- Nothing else is read: no definition but `package`, no expression but
--- a literal.  What is read is checked: a version is `a.b.c`, a required
+-- a literal.  A field that has a default in lib/manifest.hf may be left
+-- out, as there (`require` and `replace` are empty lists, a build.hf's
+-- `ships` too).  What is read is checked: a version is `a.b.c`, a required
 -- package's path ends in `/vN` when its version's major N is 2 or more
 -- (and only then), names are not required twice, a replaced name is
 -- required.
@@ -266,23 +268,77 @@ isName x =
 
 type Check a = Either Problem a
 
-fieldNames : List (Pair String Lit) -> List String
-fieldNames fs = map fst fs
+-- | a field of a manifest's record, and what it is where it is left out,
+-- | if it may be: lib/manifest.hf's default, there at the record
+type Field = { name : String, left : Maybe (L.Tok -> Lit) }
 
-sameNames : List String -> List String -> Bool
-sameNames Nil Nil = True
-sameNames (Cons x xs) (Cons y ys) = strEq x y && sameNames xs ys
-sameNames _ _ = False
+required : String -> Field
+required x = { name = x, left = Nothing }
 
--- (a record with exactly these fields, in this order, as the type has them)
-fieldsAre : List String -> Lit -> Check (List Lit)
-fieldsAre names (LRec fs t) =
-  if sameNames (fieldNames fs) names then Right (map snd fs)
-  else Left
-      (problemAt
-         t
-         ("the fields are " ++ joinWith ", " names ++ ", in this order"))
-fieldsAre names x = Left (problemAt (litTok x) "expected a record `{...}`")
+-- (a field that is an empty list where it is left out)
+orNone : String -> Field
+orNone x = { name = x, left = Just (\t -> LList Nil t) }
+
+-- (`a`, `a and b`, `a, b and c`)
+andList : List String -> String
+andList Nil = ""
+andList (Cons x Nil) = x
+andList (Cons x (Cons y Nil)) = x ++ " and " ++ y
+andList (Cons x rest) = x ++ ", " ++ andList rest
+
+leftOutNames : List Field -> List String
+leftOutNames Nil = Nil
+leftOutNames (Cons f rest) = case f.left of
+  Just _ -> Cons f.name (leftOutNames rest)
+  Nothing -> leftOutNames rest
+
+-- | the fields a record of the type has, in order, and which of them it
+-- | may leave out (as the elaborator says it, `heff check`)
+fieldsSaid : List Field -> String
+fieldsSaid fields =
+  "the fields are "
+  ++ joinWith ", " (map (\(f : Field) -> f.name) fields)
+  ++ ", in this order"
+  ++ (if null (leftOutNames fields) then ""
+      else " (" ++ andList (leftOutNames fields) ++ " may be left out)")
+
+-- (the next field written, if it is `x`: its literal, and the fields
+-- written after it)
+taken : String
+      -> List (Pair String Lit)
+      -> Maybe (Pair Lit (List (Pair String Lit)))
+taken x (Cons (MkPair y v) more) =
+  if strEq x y then Just (MkPair v more) else Nothing
+taken x Nil = Nothing
+
+-- (what field `f` is where it is left out, if it may be; at `t`)
+leftOut : L.Tok -> Field -> Maybe Lit
+leftOut t f = case f.left of
+  Just mk -> Just (mk t)
+  Nothing -> Nothing
+
+consLit : Lit -> Maybe (List Lit) -> Maybe (List Lit)
+consLit v (Just vs) = Just (Cons v vs)
+consLit v Nothing = Nothing
+
+-- (each field: the next written, if it is that one, else what it is left
+-- out; at the record's token `t`)
+fieldsIn : L.Tok -> List Field -> List (Pair String Lit) -> Maybe (List Lit)
+fieldsIn t Nil Nil = Just Nil
+fieldsIn t Nil (Cons _ _) = Nothing
+fieldsIn t (Cons f rest) written = case taken f.name written of
+  Just (MkPair v more) -> consLit v (fieldsIn t rest more)
+  Nothing -> case leftOut t f of
+    Just v -> consLit v (fieldsIn t rest written)
+    Nothing -> Nothing
+
+-- (a record with these fields, in this order, as the type has them, those
+-- with a default perhaps left out)
+fieldsAre : List Field -> Lit -> Check (List Lit)
+fieldsAre fields (LRec fs t) = case fieldsIn t fields fs of
+  Just xs -> Right xs
+  Nothing -> Left (problemAt t (fieldsSaid fields))
+fieldsAre fields x = Left (problemAt (litTok x) "expected a record `{...}`")
 
 str : Lit -> Check String
 str (LStr s _) = Right s
@@ -339,7 +395,9 @@ pathFor x v = case str x of
     Nothing -> Right path
 
 requireOf : Lit -> Check Require
-requireOf x = case fieldsAre ["name", "path", "version"] x of
+requireOf x = case fieldsAre
+    [required "name", required "path", required "version"]
+    x of
   Left p -> Left p
   Right (Cons n (Cons p (Cons v Nil))) -> case nameOf n of
     Left e -> Left e
@@ -351,7 +409,7 @@ requireOf x = case fieldsAre ["name", "path", "version"] x of
   Right _ -> Left (problemAt (litTok x) "expected a record `{...}`")
 
 replaceOf : Lit -> Check Replace
-replaceOf x = case fieldsAre ["name", "dir"] x of
+replaceOf x = case fieldsAre [required "name", required "dir"] x of
   Left p -> Left p
   Right (Cons n (Cons d Nil)) -> case nameOf n of
     Left e -> Left e
@@ -421,7 +479,9 @@ packageOf4 m h rq rp = case str m of
                 Right { module = mpath, heff = hv, require = rs, replace = ps }
 
 packageOf : Lit -> Check Package
-packageOf x = case fieldsAre ["module", "heff", "require", "replace"] x of
+packageOf x = case fieldsAre
+    [required "module", required "heff", orNone "require", orNone "replace"]
+    x of
   Left p -> Left p
   Right (Cons m (Cons h (Cons rq (Cons rp Nil)))) -> packageOf4 m h rq rp
   Right _ -> Left (problemAt (litTok x) "expected a record `{...}`")
@@ -503,7 +563,9 @@ buildOf3 b r s = case backendOf b of
       Right ships -> Right { backend = backend, run = run, ships = ships }
 
 buildOf : Lit -> Check Build
-buildOf x = case fieldsAre ["backend", "run", "ships"] x of
+buildOf x = case fieldsAre
+    [required "backend", required "run", orNone "ships"]
+    x of
   Left p -> Left p
   Right (Cons b (Cons r (Cons s Nil))) -> buildOf3 b r s
   Right _ -> Left (problemAt (litTok x) "expected a record `{...}`")
@@ -544,10 +606,16 @@ saidBuild (Right a) =
 -- "20: expected a backend: C, Node or Page"
 
 -- >>> saidBuild (readBuild "build = { run = \"main\", backend = C, ships = [] }")
--- "8: the fields are backend, run, ships, in this order"
+-- "8: the fields are backend, run, ships, in this order (ships may be left out)"
 
 -- >>> saidBuild (readBuild "build = { backend = C, run = \"main\" }")
--- "8: the fields are backend, run, ships, in this order"
+-- "c main"
+
+-- >>> saidBuild (readBuild "build = { backend = C }")
+-- "8: the fields are backend, run, ships, in this order (ships may be left out)"
+
+-- >>> saidBuild (readBuild "build = { backend = C, ships = [\"lib\"], run = \"main\" }")
+-- "8: the fields are backend, run, ships, in this order (ships may be left out)"
 
 -- >>> saidBuild (readBuild "build = { backend = C, run = \"main\", ships = [\"lib/std\"] }")
 -- "46: `lib/std` is not a name: a program ships files and directories of the project's root, by their names"
@@ -574,7 +642,19 @@ said (Right pk) =
 -- "33: `0.1` is no version: write `a.b.c`, three numbers"
 
 -- >>> said (readPackage "package = { heff = \"0.1.0\", module = \"m\", require = [], replace = [] }")
--- "10: the fields are module, heff, require, replace, in this order"
+-- "10: the fields are module, heff, require, replace, in this order (require and replace may be left out)"
+
+-- >>> said (readPackage "package = { module = \"m\", heff = \"0.1.0\" }")
+-- "m 0.1.0 "
+
+-- >>> said (readPackage "package = { module = \"m\", heff = \"0.1.0\", replace = [] }")
+-- "m 0.1.0 "
+
+-- >>> said (readPackage "package = { module = \"m\", heff = \"0.1.0\", replace = [], require = [] }")
+-- "10: the fields are module, heff, require, replace, in this order (require and replace may be left out)"
+
+-- >>> said (readPackage "package = { module = \"m\", require = [] }")
+-- "10: the fields are module, heff, require, replace, in this order (require and replace may be left out)"
 
 -- >>> said (readPackage "package = { module = \"m\", heff = \"0.1.0\", require = [{ name = \"j\", path = \"x.org/j\", version = \"2.0.0\" }], replace = [] }")
 -- "74: version 2.0.0 is fetched from a path ending in /v2"
@@ -706,34 +786,36 @@ quoted : String -> String
 quoted s =
   "\"" ++ joinWith "\\\"" (split "\"" (joinWith "\\\\" (split "\\" s))) ++ "\""
 
--- | a Package as package.hf's literal (laid out by the formatter after)
+-- (`, x = [a, b]`, a list field; nothing, where it is empty, its default)
+listField : String -> List String -> String
+listField x Nil = ""
+listField x items = ", " ++ x ++ " = [" ++ joinWith ", " items ++ "]"
+
+showRequire : Require -> String
+showRequire r =
+  "{ name = "
+  ++ quoted r.name
+  ++ ", path = "
+  ++ quoted r.path
+  ++ ", version = "
+  ++ quoted r.version
+  ++ " }"
+
+showReplace : Replace -> String
+showReplace r =
+  "{ name = " ++ quoted r.name ++ ", dir = " ++ quoted r.dir ++ " }"
+
+-- | a Package as package.hf's literal (laid out by the formatter after),
+-- | an empty list left out
 showPackage : Package -> String
 showPackage pk =
   "{ module = "
   ++ quoted pk.module
   ++ ", heff = "
   ++ quoted pk.heff
-  ++ ", require = ["
-  ++ joinWith
-    ", "
-    (map
-       (\(r : Require) ->
-          "{ name = "
-          ++ quoted r.name
-          ++ ", path = "
-          ++ quoted r.path
-          ++ ", version = "
-          ++ quoted r.version
-          ++ " }")
-       pk.require)
-  ++ "], replace = ["
-  ++ joinWith
-    ", "
-    (map
-       (\(r : Replace) ->
-          "{ name = " ++ quoted r.name ++ ", dir = " ++ quoted r.dir ++ " }")
-       pk.replace)
-  ++ "] }"
+  ++ listField "require" (map showRequire pk.require)
+  ++ listField "replace" (map showReplace pk.replace)
+  ++ " }"
 
 -- (where `package`'s literal is, from the declaration at `i` on)
 spanGo : Array L.Tok -> Int -> Maybe (Pair Int Int)
@@ -756,5 +838,5 @@ withPackage src pk = case spanGo (A.fromList (lexedTokens (L.lex src))) 0 of
     strSlice src 0 from ++ showPackage pk ++ strSlice src to (strLength src)
   Nothing -> src
 
--- >>> withPackage "-- mine\npackage =\n  { module = \"m\", heff = \"0.1.0\", require = [], replace = [] } -- end\n" { module = "m", heff = "0.1.0", require = [{ name = "j", path = "x.org/j", version = "1.0.0" }], replace = Nil }
--- "-- mine\npackage =\n  { module = \"m\", heff = \"0.1.0\", require = [{ name = \"j\", path = \"x.org/j\", version = \"1.0.0\" }], replace = [] } -- end\n"
+-- >>> withPackage "-- mine\npackage =\n  { module = \"m\", heff = \"0.1.0\" } -- end\n" { module = "m", heff = "0.1.0", require = [{ name = "j", path = "x.org/j", version = "1.0.0" }], replace = Nil }
+-- "-- mine\npackage =\n  { module = \"m\", heff = \"0.1.0\", require = [{ name = \"j\", path = \"x.org/j\", version = \"1.0.0\" }] } -- end\n"

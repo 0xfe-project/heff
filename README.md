@@ -90,7 +90,9 @@ test) may also import files beside it, by their paths from the root.
 Compiled modules are cached in `.heff/`, where all heff makes is kept.  A package required is fetched
 by git from its path (`heff get`), the version chosen as Go's minimal
 version selection does, into `~/.cache/heff/mod`; `heff.sum` holds the
-tree of each version.
+tree of each version.  What a project requires (`require`) and the
+packages it takes from directories instead (`replace`) are none where
+left out, as their defaults in `lib/manifest.hf` say.
 
 ```haskell
 import manifest
@@ -99,23 +101,23 @@ package : Package
 package =
   { module = "github.com/someone/hello"
   , heff = "0.1.0"
-  , require = []
-  , replace = []
+  , require = [{ name = "json", path = "github.com/someone/json", version = "1.2.0" }]
   }
 ```
 
 A program is `app/NAME/main.hf`, with an `app/NAME/build.hf` beside it
 defining `build`, of type `Build`: the computation run, what it is
 compiled to (`C`, `Node`, `Page`), and the files and directories of the
-project's root it ships.  `heff build` builds every program to
-`.heff/bin/`; `heff install` builds them into the heff home's `bin/`,
-and puts what they ship beside it, in place of what was there.
+project's root it ships (`ships`, none where left out).  `heff build`
+builds every program to `.heff/bin/`; `heff install` builds them into
+the heff home's `bin/`, and puts what they ship beside it, in place of
+what was there.
 
 ```haskell
 import manifest
 
 build : Build
-build = { backend = C, run = "main", ships = [] }
+build = { backend = C, run = "main" }
 ```
 
 ## Records
