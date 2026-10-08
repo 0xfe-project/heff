@@ -45,7 +45,8 @@ seed, it starts from the seed, `boot/heff.tar.xz`: heff compiled by
 itself to C, which zig builds for whatever machine it is on.
 
 `editors/vscode` is a VS Code extension for the language server; a
-release has it built (`heff-X.Y.Z.vsix`).
+release has it built (`heff-X.Y.Z.vsix`).  `editors/bat` is its grammar
+for bat.
 
 ## Commands
 
