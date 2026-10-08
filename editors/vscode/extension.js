@@ -1,5 +1,6 @@
-// The client: runs `<heff.serverPath> lsp` for `.hf` files.
+// The client: runs `<heff> lsp --stdio` for `.hf` files.
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const vscode = require("vscode");
 
@@ -10,13 +11,52 @@ try { languageclient = require("vscode-languageclient/node"); } catch (_) { lang
 
 let client;
 
-// the server: the setting, else the repository's (in development, this
-// extension is its editors/vscode), else `heff` on the PATH
-function serverPath(context) {
+const exe = process.platform === "win32" ? "heff.exe" : "heff";
+
+function runnable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return fs.statSync(file).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+// the heff home's bin/, where `heff install` puts programs: HEFF_HOME/bin,
+// else ~/.heff/bin
+function homeBin() {
+  return path.join(process.env.HEFF_HOME || path.join(os.homedir(), ".heff"), "bin");
+}
+
+// the setting's path: `~` is the home directory, and a relative path is from
+// the workspace's first folder (none without one)
+function configuredPath(configured) {
+  if (/^~($|[\\/])/.test(configured)) return path.join(os.homedir(), configured.slice(1));
+  if (path.isAbsolute(configured)) return configured;
+  const folder = (vscode.workspace.workspaceFolders || [])[0];
+  return folder ? path.join(folder.uri.fsPath, configured) : null;
+}
+
+// the heff to run, else where it was looked for: the setting, else (run from
+// the repository, F5) the repository's, else `heff` on the PATH, else the one
+// in the heff home's bin/
+function findHeff(context) {
   const configured = vscode.workspace.getConfiguration("heff").get("serverPath");
-  if (configured) return configured;
-  const repository = path.join(context.extensionPath, "..", "..", ".heff", "out", process.platform === "win32" ? "heff.exe" : "heff");
-  return fs.existsSync(repository) ? repository : "heff";
+  if (configured) {
+    const file = configuredPath(configured);
+    if (!file) return { missing: `heff.serverPath is ${configured}, a relative path, and no folder is open to find it from` };
+    return runnable(file) ? { heff: file } : { missing: `no heff at ${file} (heff.serverPath)` };
+  }
+  if (context.extensionMode === vscode.ExtensionMode.Development) {
+    const repository = path.join(context.extensionPath, "..", "..", ".heff", "out", exe);
+    if (runnable(repository)) return { heff: repository };
+  }
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (dir && runnable(path.join(dir, exe))) return { heff: path.join(dir, exe) };
+  }
+  const bin = homeBin();
+  if (runnable(path.join(bin, exe))) return { heff: path.join(bin, exe) };
+  return { missing: `no heff on the PATH or in ${bin}; put a release's bin/heff (or the build's .heff/out/heff) on the PATH, or set heff.serverPath to it` };
 }
 
 async function start(context) {
@@ -24,12 +64,18 @@ async function start(context) {
     vscode.window.showErrorMessage(`heff: vscode-languageclient is not installed; run \`npm install\` in ${context.extensionPath}`);
     return;
   }
-  const { LanguageClient } = languageclient;
-  // (no `transport`: with one, the client adds `--stdio` to the arguments)
-  const run = { command: serverPath(context), args: ["lsp"] };
+  const { LanguageClient, TransportKind } = languageclient;
+  const { heff, missing } = findHeff(context);
+  if (!heff) {
+    vscode.window.showErrorMessage(`heff: ${missing}`);
+    return;
+  }
+  // (the stdio transport: the client adds `--stdio` to the arguments)
+  const run = { command: heff, args: ["lsp"], transport: TransportKind.stdio };
   client = new LanguageClient("heff", "heff language server", { run, debug: run }, {
     documentSelector: [{ scheme: "file", language: "heff" }],
   });
+  client.info(`${heff} lsp --stdio`, undefined, false);
   await client.start();
 }
 
