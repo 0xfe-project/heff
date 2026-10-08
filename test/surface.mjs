@@ -116,8 +116,8 @@ console.log("interfaces: as `heff check` prints them");
 }
 
 // an expectation that does not hold: what differs is shown, cut to it
-mkdirSync(join(root, "ref"), { recursive: true });
-const wrong = join(root, "ref", "wrong-expectation.hf");
+mkdirSync(join(root, ".heff", "ref"), { recursive: true });
+const wrong = join(root, ".heff", "ref", "wrong-expectation.hf");
 writeFileSync(wrong, `import prelude\n\n-- >>> "${"x".repeat(60)} on click"\n-- "${"x".repeat(60)} onn click"\n`);
 const w = heff("test", wrong);
 const report = w.stdout.slice(w.stdout.indexOf("  expected"));

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const work = join(root, "ref", "app-run");
+const work = join(root, ".heff", "ref", "app-run");
 mkdirSync(work, { recursive: true });
 
 class Node {

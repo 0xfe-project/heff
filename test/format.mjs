@@ -14,7 +14,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 // the formatter, compiled to a module of its own, its `format` called
 // directly: `Right` the text laid out, `Left` why not
-const module = join(root, "output", "heff-format.mjs");
+const module = join(root, ".heff", "out", "heff-format.mjs");
 execFileSync(heffBin, ["compile", "src/heff/format.hf", module, "--backend=esm"], { cwd: root });
 const { format } = (await import(pathToFileURL(module))).default;
 let checks = 0, failed = 0;

@@ -26,7 +26,7 @@ heff-0.2.0-linux-x64/bin/heff help
 From the repository, with Node.js and [zig](https://ziglang.org/download/):
 
 ```sh
-node scripts/build.mjs     # output/heff
+node scripts/build.mjs     # .heff/out/heff
 ```
 
 heff is written in heff.  The package's modules (`src/heff/`) are the
@@ -34,8 +34,8 @@ compiler as a library, each command's work among them
 (`heff.commands`); the program `heff` is `app/heff/main.hf`, which reads
 the command line and gives the commands the world they run in.
 The build (`node scripts/build.mjs`) compiles the program to C with the
-heff built before (`output/heff`), and `zig cc` builds it into
-`output/heff`.  Where there is no heff yet, it starts from the seed,
+heff built before (`.heff/out/heff`), and `zig cc` builds it into
+`.heff/out/heff`.  Where there is no heff yet, it starts from the seed,
 `boot/heff.tar.xz`: heff compiled by itself to C, which zig builds for
 whatever machine it is on.
 
@@ -49,13 +49,17 @@ heff check FILE                # the file's interface, and its errors
 heff run FILE [ARGS...]        # run the file's `main` (on Node.js)
 heff test [--seed N] [FILE...] # check the watches' expectations (`-- >>> e`),
                                # and run the tests (lib/check.hf); no FILE:
-                               # every .hf file of the project here
+                               # the project's test/
 heff promote FILE              # write each watch's value as its expectation
 heff fmt [--check] FILE...     # format in place
 heff compile FILE OUT --backend=MODE [--name NAME]
                                # esm: an ES module
                                # page: a script running the app NAME in a web page
                                # node: a Node.js program running NAME
+heff build [NAME...]           # the project: every module of src/ checked, then
+                               # its programs (app/NAME/) built to .heff/bin/
+heff install [DIR]             # the project at DIR built, its programs put in
+                               # ~/.heff/bin/ (HEFF_HOME/bin/)
 heff init [DIR]                # a new project
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
@@ -75,7 +79,7 @@ run.  A module is a file under its `src/`, named by its path there:
 `src/parse/surface.hf` is `parse.surface`.  Modules are looked up there
 and in `lib/` (`std.io` is `lib/std/io.hf`); a file outside `src/` (a
 test) may also import files beside it, by their paths from the root.
-Compiled modules are cached in `.heff/`.  A package required is fetched
+Compiled modules are cached in `.heff/`, where all heff makes is kept.  A package required is fetched
 by git from its path (`heff get`), the version chosen as Go's minimal
 version selection does, into `~/.cache/heff/mod`; `heff.sum` holds the
 tree of each version.
@@ -178,13 +182,18 @@ program shrinks to a short one that tells them apart
 
 ## Developing
 
-`node test/run.mjs [GROUP...]` runs the tests on `output/heff` (or on
+`node test/run.mjs [GROUP...]` runs the tests on `.heff/out/heff` (or on
 `HEFF`), by group: `compiler`, `lsp`, `backends` (each backend held to
 the interpreter), `fixpoint` (heff compiles itself to the same C) and
 `asan` (heff under AddressSanitizer).  Among them,
 `test/golden/` holds the output of `check`, `explain`, `eval` and
 `type-at` on the library and test files; after an intended change,
 update it with `node test/golden.mjs --update`.
+
+All that is made is under `.heff/`: the compiler built (`out/`), the
+cache of compiled modules (`vN/`), the programs `heff build` makes
+(`bin/`, their C in `build/`), what `heff run` runs (`run/`), and the
+tests' work directories (`ref/`).
 
 `node scripts/boot.mjs` replaces the seed with the current compiler's
 C, once it compiles itself to the same C.  This is needed only when a

@@ -29,21 +29,26 @@ const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`
 const made = heff("init", "hello");
 const pkg = readFileSync(join(work, "hello", "package.hf"), "utf8");
 expect("init", made.status === 0 && pkg.includes(`heff = "${version}"`) && pkg.includes(`module = "hello"`) &&
-  readFileSync(join(work, "hello", ".gitignore"), "utf8").includes(".heff/"), made);
+  readFileSync(join(work, "hello", ".gitignore"), "utf8") === ".heff/\n", made);
 const laid = heff("fmt", "--check", "hello/package.hf", "hello/src/hello/main.hf");
 expect("init's files are laid out", laid.status === 0, laid);
 const tested = heff("test", "hello/src/hello/main.hf");
 expect("init's main.hf", tested.status === 0 && tested.stdout.includes("1/1 expectations hold"), tested);
-// (with no file: the project's every .hf file, run where it is; one in
-// a directory starting with `.` or in a project of its own passed over)
-write("hello/.hidden/no.hf", "x : Int\nx = \n");
-write("hello/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
-write("hello/vendor/other/no.hf", "x : Int\nx = \n");
+// (with no file: the project's test/, run where it is; a file in a
+// directory starting with `.` or in a project of its own passed over;
+// nothing outside test/, and no test/, nothing to test)
+write("hello/test/greeting.hf", "import hello.main\nimport prelude\n\n-- >>> greeting \"test\"\n-- \"Hello, test!\"\n");
+write("hello/test/.hidden/no.hf", "x : Int\nx = \n");
+write("hello/test/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
+write("hello/test/vendor/other/no.hf", "x : Int\nx = \n");
+write("hello/elsewhere/no.hf", "x : Int\nx = \n");
 const inHello = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
-expect("test with no file: the project's", inHello.status === 0 && inHello.stdout.includes("src/hello/main.hf") &&
-  inHello.stdout.includes("package.hf") && !inHello.stdout.includes("no.hf") && inHello.stdout.includes("1/1 expectations hold"), inHello);
-rmSync(join(work, "hello", ".hidden"), { recursive: true });
-rmSync(join(work, "hello", "vendor"), { recursive: true });
+expect("test with no file: the project's test/", inHello.status === 0 && inHello.stdout.includes("test/greeting.hf") &&
+  !inHello.stdout.includes("src/hello/main.hf") && !inHello.stdout.includes("no.hf") && inHello.stdout.includes("1/1 expectations hold"), inHello);
+rmSync(join(work, "hello", "test"), { recursive: true });
+rmSync(join(work, "hello", "elsewhere"), { recursive: true });
+const noTests = spawnSync(heffBin, ["test"], { cwd: join(work, "hello"), encoding: "utf8" });
+expect("test with no file and no test/", noTests.status === 1 && noTests.stderr.includes("no test/ here"), noTests);
 const checked = heff("check", "hello/package.hf");
 expect("package.hf is heff, of type Package", checked.status === 0 && checked.stdout.includes("package : Package"), checked);
 const again = heff("init", "hello");
@@ -284,6 +289,43 @@ const unlock = (p) => { if (!existsSync(p)) return; chmodSync(p, 0o755); if (sta
 unlock(join(work, "mod")); rmSync(join(work, "mod"), { recursive: true, force: true });
 const moved = inUser("get");
 expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/lib 1.0.0 is tree:") && moved.stderr.includes("its tag has been moved"), moved);
+
+// build: every module of src/ checked, then every program of app/ built
+// to .heff/bin/ (the NAMEd ones only, given NAMEs); install: the
+// programs built into the heff home's bin/ (HEFF_HOME), and said if it
+// is not on the PATH
+write("tool/package.hf", manifestOf("tool"));
+write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
+write("tool/app/tool/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = 'node, run = \"main\" }\n");
+write("tool/app/tool/main.hf", "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print greeting\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
+const inTool = (...args) => spawnSync(heffBin, args, { cwd: join(work, "tool"), encoding: "utf8" });
+const built = inTool("build");
+const toolBin = join(work, "tool", ".heff", "bin", "tool");
+expect("build: the modules checked, the programs built", built.status === 0 && built.stdout.includes("heff build: 1 module checked") &&
+  built.stdout.includes("wrote .heff/bin/tool") && existsSync(toolBin) &&
+  spawnSync(toolBin, [], { encoding: "utf8" }).stdout === "hi from tool\n", built);
+write("tool/src/tool/broken.hf", "import prelude\n\nx : Int\nx = True\n");
+rmSync(join(work, "tool", ".heff", "bin"), { recursive: true });
+const broken = inTool("build");
+expect("build: a module that does not check", broken.status === 1 && broken.stderr.includes("src/tool/broken.hf") &&
+  !existsSync(toolBin), broken);
+const named = inTool("build", "tool");
+expect("build NAME: the program only", named.status === 0 && !named.stdout.includes("checked") && existsSync(toolBin), named);
+rmSync(join(work, "tool", "src", "tool", "broken.hf"));
+const noProgram = inTool("build", "nope");
+expect("build NAME: no such program", noProgram.status === 1 && noProgram.stderr.includes("no program nope"), noProgram);
+const home = join(work, "home"), homeBin = join(home, "bin");
+const install = (path) => spawnSync(heffBin, ["install", "tool"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home, PATH: path } });
+const installed = install(process.env.PATH);
+expect("install: the programs, in the heff home's bin/", installed.status === 0 && installed.stdout.includes(`installed ${join(homeBin, "tool")}`) &&
+  installed.stdout.includes(`${homeBin} is not on the PATH`) &&
+  spawnSync(join(homeBin, "tool"), [], { encoding: "utf8" }).stdout === "hi from tool\n", installed);
+const onPath = install(`${homeBin}:${process.env.PATH}`);
+expect("install: its bin/ on the PATH", onPath.status === 0 && !onPath.stdout.includes("not on the PATH"), onPath);
+write("lib-only/package.hf", manifestOf("libonly"));
+write("lib-only/src/libonly/m.hf", "import prelude\n\nx : Int\nx = 1\n");
+const nothing = spawnSync(heffBin, ["install", "lib-only"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home } });
+expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("no programs"), nothing);
 
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
