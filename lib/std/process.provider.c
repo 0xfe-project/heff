@@ -44,6 +44,11 @@ static char **heff_argv_of(const char *first, V l) {
 }
 
 
+// (the lines std.progress draws on the terminal, once there are any,
+// cleared for good where a command runs in the program's place: an
+// `Exit` clears them as the program ends -- lib/std/progress.provider.c)
+static void (*heff_lines)(int);
+
 static uint32_t heff_run_shape[3] = { LBL_status, LBL_out, LBL_err };
 
 static V heff_run(V cmd, V args) {
@@ -116,6 +121,9 @@ static V heff_provider_process(V p, V k) {
   case TAG_Exec: {
     char *c = heff_cstr(heff_field(p, 0));
     char **as = heff_argv_of(c, heff_field(p, 1));
+    // (std.progress's lines, if any are drawn, cleared for good: the
+    // command has the terminal now)
+    if (heff_lines) heff_lines(2);
     fflush(stdout);
     fflush(stderr);
 #ifdef _WIN32

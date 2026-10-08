@@ -12,17 +12,26 @@
 // every provider hands out (`heff_hold`, `heff_held`, `heff_release`:
 // lib/std/handle.hf says how).
 
+// (the lines std.progress draws on the terminal, once there are any:
+// what is written clears them first, and they come back below it --
+// lib/std/progress.provider.c says how)
+static void (*heff_lines)(int);
+
 static V heff_provider_stdio(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Write: {
+    if (heff_lines) heff_lines(1);
     heff_put(stdout, heff_field(p, 0));
+    if (heff_lines) heff_lines(0);
     V x = heff_dup(heff_field(p, 1));
     heff_drop(p);
     return heff_tail(k, 1, &x);
   }
   case TAG_WriteErr: {
+    if (heff_lines) heff_lines(1);
     fflush(stdout);
     heff_put(stderr, heff_field(p, 0));
+    if (heff_lines) heff_lines(0);
     V x = heff_dup(heff_field(p, 1));
     heff_drop(p);
     return heff_tail(k, 1, &x);

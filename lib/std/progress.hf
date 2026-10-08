@@ -1,0 +1,394 @@
+-- What a program is doing, as an effect (lib/co.hf): its tasks, a tree
+-- of them, each with how many of its items are done, of how many -- as
+-- zig's std.Progress has them.  A program says what it starts, does and
+-- ends; where that goes is its handler's to say: `drawn`, on the
+-- terminal, below what the program writes, redrawn as it goes and gone
+-- at its end, as zig draws its own; or `silently`, nowhere.  `shown`
+-- takes the one the standard error is for: drawn where it is a
+-- terminal (and `TERM` is not `dumb`), else silently -- so that what a
+-- program writes to a file or a pipe is what it would write without
+-- them.
+--
+-- Drawn, the tasks go to the world's `terminal`, whose side is
+-- progress.provider.c (progress.provider.js): it puts their lines on the
+-- standard error, the newest of them every 80 ms at most -- none in the
+-- first 200 ms, so that a quick command shows nothing -- clears them
+-- before the program writes, and draws them again below what it wrote.
+-- A command run under a task (`runUnder`) that reports its own progress
+-- as zig does (`ZIG_PROGRESS`, zig's protocol) has its tasks drawn under
+-- that task.
+
+import co
+import prelude
+import std.process
+
+-- The tasks
+--------------------------------------------------------------------------------
+
+-- | A task: the root, which every task is under, or one started.
+data Task = MkTask Int
+
+-- | The task every other is under: drawn as nothing, its own the tasks
+-- | at the top.
+root : Task
+root = MkTask 0
+
+data ProgressF (m : Type -> Type) x
+  = Start Task String Int (Task -> x)
+  | Complete Task x
+  | End Task x
+  | RunUnder Task String (List String) (Ran -> x)
+
+-- | What a program is doing, as an effect.
+progress : HFunctor
+progress =
+  { f = ProgressF
+  , hfmap = \fm g p -> case p of
+      Start parent name total k -> Start parent name total (\t -> g (k t))
+      Complete t x -> Complete t (g x)
+      End t x -> End t (g x)
+      RunUnder t cmd as k -> RunUnder t cmd as (\r -> g (k r))
+  , hmap = \nt p -> case p of
+      Start parent name total k -> Start parent name total k
+      Complete t x -> Complete t x
+      End t x -> End t x
+      RunUnder t cmd as k -> RunUnder t cmd as k
+  }
+
+-- | A task started under `parent`, named, with `total` items to do (0:
+-- | not known): in any effect the progress is in, by the evidence.
+start : {e : HFunctor}
+      -> {{ev : progress <: e}}
+      -> Task
+      -> String
+      -> Int
+      -> Co e Task
+start parent name total = op (ev (Start parent name total (\t -> t))) val
+
+-- | One more of the task's items done.
+complete : {e : HFunctor} -> {{ev : progress <: e}} -> Task -> Co e Unit
+complete t = op (ev (Complete t MkUnit)) val
+
+-- | The task done with: gone, and one more of its parent's items done.
+end : {e : HFunctor} -> {{ev : progress <: e}} -> Task -> Co e Unit
+end t = op (ev (End t MkUnit)) val
+
+-- | The command run with the arguments, to its end, as std.process's
+-- | `run` runs it -- part of the task: drawn, what the command says of
+-- | its own progress, as zig does, is drawn under the task.
+runUnder : {e : HFunctor}
+         -> {{ev : progress <: e}}
+         -> Task
+         -> String
+         -> List String
+         -> Co e Ran
+runUnder t cmd as = op (ev (RunUnder t cmd as (\r -> r))) val
+
+-- Drawing
+--------------------------------------------------------------------------------
+
+-- | A task as it is drawn: which it is, which it is under, its name,
+-- | and how many of its items are done, of how many (0: not known).
+type Shown =
+  { task : Int, parent : Int, name : String, done : Int, total : Int }
+
+-- (how many are done, of how many, as zig says it before a name)
+countOf : Int -> Int -> String
+countOf 0 0 = ""
+countOf done 0 = "[" ++ showInt done ++ "] "
+countOf done total = "[" ++ showInt done ++ "/" ++ showInt total ++ "] "
+
+-- (a task's line, without what it is under)
+counted : Shown -> String
+counted t = countOf t.done t.total ++ t.name
+
+-- (the tasks under the task `p`, in the order they were started)
+under : Int -> List Shown -> List Shown
+under p ts = filter (\(t : Shown) -> t.parent == p) ts
+
+-- (before a task: the last of its parent's, or not)
+branch : Bool -> String
+branch True = "└─ "
+branch False = "├─ "
+
+-- (before what is under a task: below the last of its parent's, or
+-- not)
+stem : Bool -> String
+stem True = "   "
+stem False = "│  "
+
+-- (the lines of the tasks under one, each with what is under it below;
+-- `prefix` what is before each)
+drawUnder : List Shown -> String -> List Shown -> List String
+drawUnder every prefix Nil = Nil
+drawUnder every prefix (t :: rest) =
+  (prefix ++ branch (null rest) ++ counted t)
+  :: concatList
+    (drawUnder every (prefix ++ stem (null rest)) (under t.task every))
+    (drawUnder every prefix rest)
+
+-- (the tasks at the top, each a line with what is under it below)
+drawTop : List Shown -> List Shown -> List String
+drawTop every Nil = Nil
+drawTop every (t :: rest) =
+  counted t
+  :: concatList (drawUnder every "" (under t.task every)) (drawTop every rest)
+
+-- | The lines the tasks are drawn as, as zig draws its own: those under
+-- | the root at the top, each task's own under it, in the order they
+-- | were started.
+draw : List Shown -> List String
+draw ts = drawTop ts (under 0 ts)
+
+-- >>> draw [{ task = 1, parent = 0, name = "checking modules", done = 3, total = 9 }, { task = 2, parent = 1, name = "heff.cst", done = 0, total = 0 }]
+-- Cons "[3/9] checking modules" (Cons "└─ heff.cst" Nil)
+
+-- >>> draw [{ task = 1, parent = 0, name = "building", done = 0, total = 2 }, { task = 2, parent = 1, name = "a", done = 1, total = 0 }, { task = 3, parent = 2, name = "zig cc", done = 0, total = 0 }, { task = 4, parent = 1, name = "b", done = 0, total = 0 }]
+-- Cons "[0/2] building" (Cons "├─ [1] a" (Cons "│  └─ zig cc" (Cons "└─ b" Nil)))
+
+-- | A task of a command run under a task of the program, as it reports
+-- | it (zig's std.Progress, through `ZIG_PROGRESS`): its name, how many
+-- | of its items are done, of how many, and the index, among those it
+-- | reports, of the one it is under (255: none, the first, its root).
+data Kid = MkKid String Int Int Int
+
+-- (the `i`th task the command reports, as a task drawn: its root is the
+-- task `t`, the others numbered below the program's)
+kidTask : Int -> Int -> Int
+kidTask t 0 = t
+kidTask t 255 = t
+kidTask t i = 0 - 1 - i
+
+-- (the command's tasks after its root, from the `i`th, as tasks drawn
+-- under `t`)
+kidsUnder : Int -> Int -> List Kid -> List Shown
+kidsUnder t i Nil = Nil
+kidsUnder t i (MkKid name done total parent :: rest) =
+  { task = kidTask t i
+  , parent = kidTask t parent
+  , name = name
+  , done = done
+  , total = total
+  }
+  :: kidsUnder t (i + 1) rest
+
+-- (the task `t` with its count the command's root's, and its name, if
+-- the root has one, as zig grafts a child's tree in its own -- of the
+-- total the task was started with, if the root says none: zig's root
+-- counts what it has done, and `zig cc` has as many to do as it is
+-- given files, and one more, the link)
+rooted : Int -> Kid -> Shown -> Shown
+rooted t (MkKid name done total parent) s =
+  if s.task == t
+    then { task = s.task
+         , parent = s.parent
+         , name = if strEq name "" then s.name else name
+         , done = if total == 0 && s.total > 0 then min done s.total else done
+         , total = if total == 0 then s.total else total
+         }
+  else s
+
+-- | The tasks with those a command run under the task `t` reports
+-- | (its root first) put under it.
+graft : Int -> List Kid -> List Shown -> List Shown
+graft t Nil ts = ts
+graft t (r :: kids) ts =
+  concatList (map (\s -> rooted t r s) ts) (kidsUnder t 1 kids)
+
+-- >>> draw (graft 2 [MkKid "" 5 0 255, MkKid "Linking" 7 9 0, MkKid "a.c" 0 0 0] [{ task = 1, parent = 0, name = "x", done = 0, total = 1 }, { task = 2, parent = 1, name = "zig cc", done = 0, total = 0 }])
+-- Cons "[0/1] x" (Cons "└─ [5] zig cc" (Cons "   ├─ [7/9] Linking" (Cons "   └─ a.c" Nil)))
+
+-- | The tasks going on, in the order they were started, and the number
+-- | the next one is given.
+type Tasks = { next : Int, going : List Shown }
+
+-- (the task, one more of its items done if it is `i`)
+bumpOne : Int -> Shown -> Shown
+bumpOne i t =
+  if t.task == i
+    then { task = t.task
+         , parent = t.parent
+         , name = t.name
+         , done = t.done + 1
+         , total = t.total
+         }
+  else t
+
+-- (the task `i`, one more of its items done)
+bump : Int -> List Shown -> List Shown
+bump i ts = map (\t -> bumpOne i t) ts
+
+-- (the parent of the task `i`, if it is going on)
+parentOf : Int -> List Shown -> Int
+parentOf i Nil = 0 - 1
+parentOf i (t :: rest) = if t.task == i then t.parent else parentOf i rest
+
+-- (a task started)
+started : Int -> String -> Int -> Tasks -> Tasks
+started parent name total ts =
+  { next = ts.next + 1
+  , going =
+      concatList
+        ts.going
+        [ { task = ts.next
+          , parent = parent
+          , name = name
+          , done = 0
+          , total = total
+          }
+        ]
+  }
+
+-- (the task `i` ended: gone, and its parent one item further)
+ended : Int -> Tasks -> Tasks
+ended i ts =
+  { next = ts.next
+  , going =
+      bump
+        (parentOf i ts.going)
+        (filter (\(t : Shown) -> not (t.task == i)) ts.going)
+  }
+
+-- >>> draw (ended 2 (started 1 "b" 0 (started 1 "a" 0 (started 0 "x" 2 { next = 1, going = Nil })))).going
+-- Cons "[1/2] x" (Cons "└─ b" Nil)
+
+-- The terminal
+--------------------------------------------------------------------------------
+
+data TerminalF (m : Type -> Type) x
+  = IsTerminal (Bool -> x)
+  | ShowLines (List String) x
+  | ShowRun String (List String) (List Kid -> List String) (Ran -> x)
+
+-- | The terminal the standard error is, where lines are drawn below what
+-- | a program writes, as an effect.
+terminal : HFunctor
+terminal =
+  { f = TerminalF
+  , hfmap = \fm g p -> case p of
+      IsTerminal k -> IsTerminal (\b -> g (k b))
+      ShowLines ls x -> ShowLines ls (g x)
+      ShowRun cmd as lines k -> ShowRun cmd as lines (\r -> g (k r))
+  , hmap = \nt p -> case p of
+      IsTerminal k -> IsTerminal k
+      ShowLines ls x -> ShowLines ls x
+      ShowRun cmd as lines k -> ShowRun cmd as lines k
+  }
+
+-- | The standard error is a terminal lines may be drawn on: `TERM` is
+-- | not `dumb`.
+isTerminal : {e : HFunctor} -> {{ev : terminal <: e}} -> Co e Bool
+isTerminal = op (ev (IsTerminal (\b -> b))) val
+
+-- | The lines drawn, in place of those before (none: nothing drawn, at
+-- | once).
+showLines : {e : HFunctor} -> {{ev : terminal <: e}} -> List String -> Co e Unit
+showLines ls = op (ev (ShowLines ls MkUnit)) val
+
+-- | The command run, as std.process's `run` runs it, and the lines drawn
+-- | meanwhile those `lines` makes of what it says of its own progress
+-- | (if it says any: zig's protocol, through `ZIG_PROGRESS`).
+showRun : {e : HFunctor}
+        -> {{ev : terminal <: e}}
+        -> String
+        -> List String
+        -> (List Kid -> List String)
+        -> Co e Ran
+showRun cmd as lines = op (ev (ShowRun cmd as lines (\r -> r))) val
+
+-- The handlers
+--------------------------------------------------------------------------------
+
+-- (each operation done, nothing shown: a command just run)
+quietly : {m : Type -> Type}
+        -> {e : HFunctor}
+        -> {a : Type}
+        -> {{sys : process <: e}}
+        -> ProgressF m a
+        -> Co e a
+quietly (Start parent name total k) = val (k root)
+quietly (Complete t x) = val x
+quietly (End t x) = val x
+quietly (RunUnder t cmd as k) = bind (run cmd as) (\r -> val (k r))
+
+-- | Progress shown nowhere: what the program does, done as if it said
+-- | nothing of it.
+silently : {e : HFunctor}
+         -> {a : Type}
+         -> {{sys : process <: e}}
+         -> Co (progress <+> e) a
+         -> Co e a
+silently = \{e} {a} c -> handle (through progress e (\p -> quietly p)) c
+
+-- (the tasks after an operation, drawn, and its answer)
+redrawn : {e : HFunctor}
+        -> {a : Type}
+        -> {{term : terminal <: e}}
+        -> Tasks
+        -> a
+        -> Co e (Pair Tasks a)
+redrawn ts x = bind (showLines (draw ts.going)) (\u -> val (MkPair ts x))
+
+-- (an operation on the tasks `ts`, done, the tasks drawn after it)
+drawnOp : {m : Type -> Type}
+        -> {e : HFunctor}
+        -> {a : Type}
+        -> {{term : terminal <: e}}
+        -> Tasks
+        -> ProgressF m a
+        -> Co e (Pair Tasks a)
+drawnOp ts (Start (MkTask p) name total k) =
+  redrawn (started p name total ts) (k (MkTask ts.next))
+drawnOp ts (Complete (MkTask i) x) =
+  redrawn { next = ts.next, going = bump i ts.going } x
+drawnOp ts (End (MkTask i) x) = redrawn (ended i ts) x
+drawnOp ts (RunUnder (MkTask i) cmd as k) =
+  bind
+    (showRun cmd as (\kids -> draw (graft i kids ts.going)))
+    (\r -> redrawn ts (k r))
+
+-- | The handler drawing the tasks: a computation of it is one of the
+-- | rest, given the tasks going on, giving back those going on after
+-- | it (an operation of the rest is one again, its computations run
+-- | with the tasks as they are).
+drawing : (e : HFunctor)
+        -> {{term : terminal <: e}}
+        -> Handler (plus progress e)
+drawing e =
+  { M = \a -> Tasks -> Co e (Pair Tasks a)
+  , ret = \x ts -> val (MkPair ts x)
+  , bind = \m k ts -> bind (m ts) (\r -> k (snd r) (fst r))
+  , malg = \p ts -> case p of
+      InL o -> drawnOp ts o
+      InR q ->
+        op
+          (e.hmap
+             (\{x} (c : Tasks -> Co e (Pair Tasks x)) ->
+                bind (c ts) (\r -> val (snd r)))
+             q)
+          (\x -> val (MkPair ts x))
+  }
+
+-- | Progress drawn on the terminal: each task as it goes, and nothing
+-- | at the end.
+drawn : {e : HFunctor}
+      -> {a : Type}
+      -> {{term : terminal <: e}}
+      -> Co (progress <+> e) a
+      -> Co e a
+drawn = \{e} {a} c ->
+    bind
+      (handle (drawing e) c { next = 1, going = Nil })
+      (\r -> bind (showLines Nil) (\u -> val (snd r)))
+
+-- | Progress drawn where the standard error is a terminal, else shown
+-- | nowhere.
+shown : {e : HFunctor}
+      -> {a : Type}
+      -> {{sys : process <: e}}
+      -> {{term : terminal <: e}}
+      -> Co (progress <+> e) a
+      -> Co e a
+shown c = do
+  t <- isTerminal
+  if t then drawn c else silently c
