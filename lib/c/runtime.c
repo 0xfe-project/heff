@@ -238,6 +238,62 @@ static inline V heff_take_reuse(V v, uint64_t keep) {
   return MK_INT(0);
 }
 
+// Drops specialised (#26): where the emitter knows what a value is -- a
+// tag of `n` fields, the arm it is in matching it -- it gives it back
+// as that, not through `heff_drop`, nor `heff_take`'s loops over what
+// the cell says.  `n` and `keep` are constants where these are called,
+// so each is compiled to the few steps that tag needs: its loops
+// unrolled, its size class known.  (`heff_take` and `heff_take_reuse`
+// stay for a compiler from before, building this runtime's compiler.)
+#define HEFF_KNOWN static inline __attribute__((always_inline))
+
+// (`heff_take`, of a tag of `n` fields)
+HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) {
+    for (int64_t i = 0; i < n; i++)
+      if (!((keep >> i) & 1)) heff_drop(t->f[i]);
+    heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
+  } else {
+    for (int64_t i = 0; i < n; i++)
+      if ((keep >> i) & 1) heff_dup(t->f[i]);
+    if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  }
+}
+
+// (`heff_take_reuse`, of a tag of `n` fields: its fields not blanked, the
+// cell kept being either built in (`heff_tag_at`, each field written) or
+// freed as the cell it is (`heff_drop_cell`), never looked into)
+HEFF_KNOWN V heff_take_reuse_n(V v, uint64_t keep, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) {
+    for (int64_t i = 0; i < n; i++)
+      if (!((keep >> i) & 1)) heff_drop(t->f[i]);
+    return v;
+  }
+  for (int64_t i = 0; i < n; i++)
+    if ((keep >> i) & 1) heff_dup(t->f[i]);
+  if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  return MK_INT(0);
+}
+
+// (a tag of `n` fields dropped: its last reference, its fields dropped
+// and its cell freed at once; otherwise counted down)
+HEFF_KNOWN void heff_drop_tag(V v, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) {
+    for (int64_t i = 0; i < n; i++) heff_drop(t->f[i]);
+    heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
+  } else if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+}
+
+// (a cell kept for a tag of `n` fields (`heff_take_reuse_n`) and not
+// built in: freed, what was in it given back already; none kept,
+// nothing)
+HEFF_KNOWN void heff_drop_cell(V r, int64_t n) {
+  if (IS_OBJ(r)) heff_obj_free((void *)r, sizeof(Tag) + n * sizeof(V));
+}
+
 // (a tag built in the cell `r` kept for it, or a new one)
 static inline V heff_tag_at(V r, int id, int64_t n, V *f) {
   if (!IS_OBJ(r)) return heff_tag(id, n, f);

@@ -172,9 +172,15 @@ numbered n (Cons x xs) m =
 -- | parameters (the loop's)
 type Self = { key : String, params : List String }
 
+-- | what a variable is known to be where it is dropped (#26): a tag of
+-- | `n` fields -- the arm it is in matching it, or built where it is
+-- | bound -- or the cell kept for a tag of `n` fields (`reusing`)
+data Known = KnownTag Int | KnownCell Int
+
 -- (`owned`: the variables this code holds a reference to, to consume or
 -- drop; `after`: those wanted after what is being emitted, by what
--- comes after it -- see "Reference counts")
+-- comes after it -- see "Reference counts"; `known`: what some of them
+-- are known to be)
 type CE =
   { tags : M.Map String Int
   , lbls : M.Map String Int
@@ -185,6 +191,7 @@ type CE =
   , after : List String
   , borrowed : List String
   , bor : M.Map String (List Int)
+  , known : M.Map String Known
   }
 
 withSelf : Maybe Self -> CE -> CE
@@ -198,6 +205,7 @@ withSelf s ce =
   , after = ce.after
   , borrowed = ce.borrowed
   , bor = ce.bor
+  , known = ce.known
   }
 
 withPath : List String -> List String -> CE -> CE
@@ -211,6 +219,7 @@ withPath owned after ce =
   , after = after
   , borrowed = ce.borrowed
   , bor = ce.bor
+  , known = ce.known
   }
 
 -- (the variables lent to this code: it holds no reference to them)
@@ -225,6 +234,21 @@ withBorrowed bs ce =
   , after = ce.after
   , borrowed = bs
   , bor = ce.bor
+  , known = ce.known
+  }
+
+withKnown : String -> Known -> CE -> CE
+withKnown x k ce =
+  { tags = ce.tags
+  , lbls = ce.lbls
+  , funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  , known = M.insert compareString x k ce.known
   }
 
 lblOf : CE -> String -> Int
@@ -434,6 +458,11 @@ freeOf xs b = freeFrom xs (fvW Nil Nil (Cons b Nil))
 -- - A definition's value is the definition's, never dropped: a use of
 --   it takes a reference.  A lambda's closure holds what it mentions:
 --   its body takes a reference to each, and drops the closure.
+-- - A drop is specialised where what is dropped is known (`Known`): a
+--   tag of no fields is a word, nothing to give back; a tag of `n`
+--   fields -- in an arm matching it, or bound to one built -- is given
+--   back as one (`heff_drop_tag`), not looked at by `heff_drop`; a cell
+--   kept and not built in is freed (`heff_drop_cell`).
 
 unionS : List String -> List String -> List String
 unionS xs ys = concatList xs ys
@@ -454,6 +483,23 @@ varUse lent live x =
 
 dropLines : List String -> List String
 dropLines xs = map (\x -> "heff_drop(" ++ cLocal x ++ ");") xs
+
+-- (a drop of `x`, as what it is known to be)
+dropAs : String -> Known -> List String
+dropAs x (KnownTag n) =
+  if n == 0 then Nil
+  else Cons ("heff_drop_tag(" ++ cLocal x ++ ", " ++ showInt n ++ ");") Nil
+dropAs x (KnownCell n) =
+  Cons ("heff_drop_cell(" ++ cLocal x ++ ", " ++ showInt n ++ ");") Nil
+
+dropKnown : String -> Maybe Known -> List String
+dropKnown x Nothing = Cons ("heff_drop(" ++ cLocal x ++ ");") Nil
+dropKnown x (Just k) = dropAs x k
+
+-- | the drops of `xs`, each specialised where what it is is known
+dropsIn : CE -> List String -> List String
+dropsIn ce xs =
+  concatMap (\x -> dropKnown x (M.lookup compareString x ce.known)) xs
 
 -- | what is held and not wanted: given back where a path starts
 deadIn : List String -> List String -> List String
@@ -525,10 +571,7 @@ given v = { arg = v, pre = Nil, post = Nil }
 lentVar : CE -> List String -> String -> Lent
 lentVar ce live x =
   if elemS x live || elemS x ce.borrowed then given (cLocal x)
-  else { arg = cLocal x
-       , pre = Nil
-       , post = Cons ("heff_drop(" ++ cLocal x ++ ");") Nil
-       }
+  else { arg = cLocal x, pre = Nil, post = dropsIn ce (Cons x Nil) }
 
 lentValue : Int -> String -> Lent
 lentValue i v =
@@ -848,7 +891,13 @@ takeLines : String -> Maybe String -> List String -> List String -> List String
 takeLines sv Nothing vs used = Nil
 takeLines sv (Just _) vs used =
   Cons
-    ("heff_take(" ++ sv ++ ", " ++ showInt (fieldMask used 0 vs) ++ "ULL);")
+    ("heff_take_n("
+     ++ sv
+     ++ ", "
+     ++ showInt (fieldMask used 0 vs)
+     ++ "ULL, "
+     ++ showInt (length vs)
+     ++ ");")
     Nil
 
 -- (operands, the first that builds a tag of `n` fields in the kept cell)
@@ -924,13 +973,25 @@ takeKept sv (Just ru) vs used =
   Cons
     ("V "
      ++ cLocal ru
-     ++ " = heff_take_reuse("
+     ++ " = heff_take_reuse_n("
      ++ sv
      ++ ", "
      ++ showInt (fieldMask used 0 vs)
-     ++ "ULL);")
+     ++ "ULL, "
+     ++ showInt (length vs)
+     ++ ");")
     Nil
 takeKept sv Nothing vs used = Nil
+
+-- (in an arm, the scrutinee held: known to be a tag of the arm's size)
+knowing : Maybe String -> Int -> CE -> CE
+knowing Nothing n ce = ce
+knowing (Just x) n ce = withKnown x (KnownTag n) ce
+
+-- (in an arm, the cell kept: known to be one for a tag of its size)
+knowCell : Maybe String -> Int -> CE -> CE
+knowCell Nothing n ce = ce
+knowCell (Just ru) n ce = withKnown ru (KnownCell n) ce
 
 -- (an arm: the fields it wants, a reference to each; what is held and
 -- not wanted on it, dropped.  The scrutinee held and not wanted on it is
@@ -960,7 +1021,7 @@ armKept r ce dest sv taken lent t vs b fb (MkPair ru b2) = do
          ce.after
          (withBorrowed
             (if lent then concatList vs ce.borrowed else ce.borrowed)
-            ce))
+            (knowCell ru (length vs) ce)))
       dest
       b2
   pure
@@ -976,7 +1037,8 @@ armKept r ce dest sv taken lent t vs b fb (MkPair ru b2) = do
                   (concatList
                      (if isNothingS ru then takeLines sv taken vs fb
                       else takeKept sv ru vs fb)
-                     (dropLines
+                     (dropsIn
+                        ce
                         (filter
                            (\v -> not (elemS v (maybeList taken)))
                            (deadIn
@@ -1027,7 +1089,7 @@ armLines : CK
          -> I.Arm
          -> C (List String)
 armLines r ce dest sv held lent (MkArm t vs b) =
-  armFv r ce dest sv held lent t vs b (fvE b)
+  armFv r (knowing held (length vs) ce) dest sv held lent t vs b (fvE b)
 
 nomatchLine : Dest -> String -> String
 nomatchLine Ret sv = "default: return heff_nomatch(" ++ sv ++ ");"
@@ -1065,6 +1127,20 @@ bindTo r ce x a = do
   v <- r.comp ce ce.after a
   pure (Cons ("V " ++ cLocal x ++ " = " ++ v ++ ";") Nil)
 
+-- (what a binding builds: a tag, known by its size)
+reusedOf : List I.Expr -> Maybe Known
+reusedOf (Cons _ (Cons (ETag _ as) Nil)) = Just (KnownTag (length as))
+reusedOf _ = Nothing
+
+builtOf : I.Expr -> Maybe Known
+builtOf (ETag _ as) = Just (KnownTag (length as))
+builtOf (EPrimCall p as) = if strEq p reusePrim then reusedOf as else Nothing
+builtOf _ = Nothing
+
+knownLet : String -> Maybe Known -> CE -> CE
+knownLet x Nothing ce = ce
+knownLet x (Just k) ce = withKnown x k ce
+
 -- (`let x = a in b`: what is held and wanted neither by `a` nor after it
 -- dropped first; then `a`, wanted after it what `b` and what comes after
 -- want; then `x`, dropped if nothing wants it)
@@ -1088,17 +1164,17 @@ letWith r ce dest x a b fa wb = do
             (deadKept ce.owned wb)
             (if elemS x wb then Cons x Nil else Nil))
          ce.after
-         ce)
+         (knownLet x (builtOf a) ce))
       dest
       b
   pure
       (concatList
-         (dropLines (deadIn ce.owned (unionS fa wb)))
+         (dropsIn ce (deadIn ce.owned (unionS fa wb)))
          (concatList
             la
             (concatList
                (if elemS x wb then Nil
-                else Cons ("heff_drop(" ++ cLocal x ++ ");") Nil)
+                else dropsIn (knownLet x (builtOf a) ce) (Cons x Nil))
                rest)))
 
 letLines : CK -> CE -> Dest -> String -> I.Expr -> I.Expr -> C (List String)
@@ -1712,6 +1788,7 @@ ceOf provs defs names =
   , after = Nil
   , borrowed = Nil
   , bor = borrowing defs
+  , known = M.empty
   }
 
 programWith : String
