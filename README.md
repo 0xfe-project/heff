@@ -224,7 +224,11 @@ operations are named as the prelude's: `add`, `div`, `rem`, `compare`,
 `show`, the bits' (`and`, `or`, `xor`, `complement`, `shiftL`,
 `shiftR`), and `fromInt` and `toInt`, by way of which one type's value
 becomes another's (`I8.fromInt (I32.toInt x)`); `float32`'s has
-`fromFloat`, `toFloat` and `sqrt`.  Its operators, `+` to `>=`, are the
+`fromFloat`, `toFloat` and `sqrt`.  An `Int`'s bits are `int`'s
+(`import int as I`: `I.and`, `I.or`, `I.xor`, `I.complement`,
+`I.shiftL`, `I.shiftR`), as two's complement has them with the sign
+extended for ever; a shift right rounds down, and one by a negative
+count abandons.  A fixed-width type's operators, `+` to `>=`, are its
 module's too, for a module that imports it as it is and the prelude by a
 name.  A provider is given them as the backend keeps them: in
 JavaScript an `Int`, an `Int64` and a `UInt64` are BigInts, any other
@@ -268,7 +272,7 @@ there).  Its modules are imported by their names: `builtin` (implicit
 in every module), `prelude`, `co`, `state`, `exn`, `parallel`, `array`,
 `map`, `set`, and `manifest` (the types of `package.hf` and
 `build.hf`); the fixed-width numbers' are `int8` to `int64`, `uint8` to
-`uint64` and `float32`.  The batteries ship with it,
+`uint64` and `float32`, and `int` has an `Int`'s bits.  The batteries ship with it,
 under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one

@@ -726,6 +726,127 @@ INT2(heff_intEq, heff_bool(num_cmp(&x, &y) == 0), return heff_bool(x == y);)
 INT2(heff_intLt, heff_bool(num_cmp(&x, &y) < 0), return heff_bool(x < y);)
 INT2(heff_intLe, heff_bool(num_cmp(&x, &y) <= 0), return heff_bool(x <= y);)
 
+// An integer's bits are as two's complement has them, its sign extended
+// for ever (Python's): two words' operation is the words', a big one's
+// done on as many 32-bit words as the longer has, and one more for the
+// sign.
+
+// (`x` as `n` words of two's complement, the least first)
+static void num_twos(const Num *x, uint32_t *t, int n) {
+  uint64_t carry = 1;
+  for (int i = 0; i < n; i++) {
+    uint32_t w = i < x->n ? x->d[i] : 0;
+    if (x->neg) {
+      uint64_t s = (uint64_t)(uint32_t)~w + carry;
+      t[i] = (uint32_t)s;
+      carry = s >> 32;
+    } else t[i] = w;
+  }
+}
+
+// (`n` words of two's complement as an integer; `t` is overwritten)
+static V twos_make(uint32_t *t, int n) {
+  int neg = (int)(t[n - 1] >> 31);
+  if (neg) {
+    uint64_t carry = 1;
+    for (int i = 0; i < n; i++) {
+      uint64_t s = (uint64_t)(uint32_t)~t[i] + carry;
+      t[i] = (uint32_t)s;
+      carry = s >> 32;
+    }
+  }
+  return big_make(neg, t, n);
+}
+
+#define INT_BITS(name, op)                                                  \
+  static V name(V a, V b) {                                                 \
+    if (IS_INT(a) && IS_INT(b)) return MK_INT(INT_OF(a) op INT_OF(b));      \
+    Num x, y;                                                               \
+    num_of(a, &x);                                                          \
+    num_of(b, &y);                                                          \
+    int n = (x.n > y.n ? x.n : y.n) + 1;                                    \
+    uint32_t *s = alloca(n * sizeof(uint32_t));                             \
+    uint32_t *t = alloca(n * sizeof(uint32_t));                             \
+    num_twos(&x, s, n);                                                     \
+    num_twos(&y, t, n);                                                     \
+    for (int i = 0; i < n; i++) s[i] = s[i] op t[i];                        \
+    V r = twos_make(s, n);                                                  \
+    heff_drop(a);                                                           \
+    heff_drop(b);                                                           \
+    return r;                                                               \
+  }
+INT_BITS(heff_intAnd, &)
+INT_BITS(heff_intOr, |)
+INT_BITS(heff_intXor, ^)
+
+static int heff_int_neg(V v) { return IS_INT(v) ? INT_OF(v) < 0 : ((Big *)v)->neg; }
+
+// (`a` times 2^`b`; a negative count abandons, one beyond memory fails)
+static V heff_intShl(V a, V b) {
+  int bneg = heff_int_neg(b), bbig = !IS_INT(b);
+  heff_drop(b);
+  if (bneg) { heff_drop(a); return heff_abandon(); }
+  if (IS_INT(a) && INT_OF(a) == 0) return a;
+  if (bbig) heff_fail("a shift beyond memory");
+  int64_t k = INT_OF(b);
+  if (IS_INT(a) && k < 62) {
+    __int128 r = (__int128)INT_OF(a) * ((__int128)1 << k);
+    if (r < INT_MAX62 && r > -INT_MAX62) return MK_INT((int64_t)r);
+  }
+  Num x;
+  num_of(a, &x);
+  int64_t w = k / 32, s = k % 32, n = x.n + w + 1;
+  uint32_t *o = heff_alloc(n * sizeof(uint32_t));
+  memset(o, 0, n * sizeof(uint32_t));
+  for (int i = 0; i < x.n; i++) {
+    uint64_t v = (uint64_t)x.d[i] << s;
+    o[i + w] |= (uint32_t)v;
+    o[i + w + 1] |= (uint32_t)(v >> 32);
+  }
+  V r = big_make(x.neg, o, (int)n);
+  free(o);
+  heff_drop(a);
+  return r;
+}
+
+// (`a` divided by 2^`b`, rounding down: its bits shifted out, the sign
+// shifted in; a negative count abandons)
+static V heff_intShr(V a, V b) {
+  int bneg = heff_int_neg(b), bbig = !IS_INT(b);
+  heff_drop(b);
+  if (bneg) { heff_drop(a); return heff_abandon(); }
+  int aneg = heff_int_neg(a);
+  if (bbig) { heff_drop(a); return MK_INT(aneg ? -1 : 0); }
+  int64_t k = INT_OF(b);
+  if (IS_INT(a)) return MK_INT(k >= 63 ? (aneg ? -1 : 0) : INT_OF(a) >> k);
+  Num x;
+  num_of(a, &x);
+  int64_t w = k / 32, s = k % 32;
+  if (w >= x.n) { heff_drop(a); return MK_INT(aneg ? -1 : 0); }
+  int n = x.n - (int)w;
+  uint32_t *o = alloca((n + 1) * sizeof(uint32_t));
+  for (int i = 0; i < n; i++) {
+    uint64_t v = x.d[i + w] | ((uint64_t)(i + w + 1 < x.n ? x.d[i + w + 1] : 0) << 32);
+    o[i] = (uint32_t)(v >> s);
+  }
+  o[n] = 0;
+  // (a negative one rounds down: its magnitude up, where a bit set was
+  // shifted out)
+  int lost = s && (x.d[w] & (((uint32_t)1 << s) - 1));
+  for (int64_t i = 0; i < w && !lost; i++) lost = x.d[i] != 0;
+  if (x.neg && lost) {
+    uint64_t carry = 1;
+    for (int i = 0; i <= n && carry; i++) {
+      uint64_t v = (uint64_t)o[i] + carry;
+      o[i] = (uint32_t)v;
+      carry = v >> 32;
+    }
+  }
+  V r = big_make(x.neg, o, n + 1);
+  heff_drop(a);
+  return r;
+}
+
 // (an integer's decimal digits, a '-' before a negative one: malloc'd)
 static char *heff_int_cstr(V v) {
   Num x;
