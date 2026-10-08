@@ -81,6 +81,15 @@ if (finder) {
 const withOut = (page) => { const p = new Node("p"); p.setAttribute("id", "out"); page.appendChild(p); };
 const aliased = await run("test/apps/aliased.hf", "aliased", withOut);
 if (aliased) check("an effect by its definition", aliased.children[0].text, "42");
+// a world of the test's own beside the page's, each acting on what the
+// other's provider handed out: the world holds them for both (std.handle)
+const painted = await run("test/apps/paint.hf", "painted", withOut);
+if (painted) {
+  const [out] = painted.children;
+  check("painted by another world", out.attrs.class, "red");
+  check("its stamp, put on the page", out.children.map((c) => `${c.tag}: ${c.text}`).join(), "mark: stamped");
+  check("found again, the same handle", out.attrs["data-same"], "yes");
+}
 // the page's own input and paragraph (examples/greet/index.html)
 const greetPage = (page) => {
   const input = new Node("input"); input.setAttribute("id", "name"); input.value = "";
@@ -94,5 +103,5 @@ if (greet) {
   input.value = "Ada"; input.fire("input");
   check("greet after typing", p.text, "Hello, Ada!");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased and greet run"}`);
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, painted and greet run"}`);
 process.exit(failed ? 1 : 0);
