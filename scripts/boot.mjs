@@ -2,11 +2,13 @@
 // The seed renewed: heff (built by scripts/build.mjs), once it compiles
 // itself to the same C (test/gen-fixpoint.mjs), is kept as that C --
 // .heff/out/heff.d/, a file a module -- in boot/heff.tar.xz, the seed a
-// build starts from where there is no heff: zig builds it for whatever
-// machine the build is on.  Wanted when the language changes so that
-// the old seed cannot compile the new source; otherwise the old seed
-// does.
+// build starts from where there is no heff of it: zig builds it for
+// whatever machine the build is on.  Wanted when the language changes so
+// that the old seed cannot compile the new source; otherwise the old
+// seed does.
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,4 +24,9 @@ if (!run(process.execPath, [join(root, "test", "gen-fixpoint.mjs")])) {
 // Linux.  macOS's would add a `._NAME` of each file's attributes)
 if (!run("tar", ["-cJf", join("boot", "heff.tar.xz"), "-C", join(".heff", "out", "heff.d"), "."],
   { ...process.env, COPYFILE_DISABLE: "1" })) process.exit(1);
+// (the heff built comes of the seed -- the seed is its C -- and is kept
+// so, by the seed's hash beside it, as scripts/build.mjs keeps it: a
+// build goes on with it, not from the seed)
+writeFileSync(join(root, ".heff", "out", "heff.seed"),
+  createHash("sha256").update(readFileSync(join(root, "boot", "heff.tar.xz"))).digest("hex") + "\n");
 console.log("heff boot: boot/heff.tar.xz is the compiler, compiled by itself to C");

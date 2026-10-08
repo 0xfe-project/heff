@@ -40,9 +40,9 @@ compiler as a library, each command's work among them
 the command line and gives the commands the world they run in.
 The build (`node scripts/build.mjs`) compiles the program to C with the
 heff built before (`.heff/out/heff`), and `zig cc` builds it into
-`.heff/out/heff`.  Where there is no heff yet, it starts from the seed,
-`boot/heff.tar.xz`: heff compiled by itself to C, which zig builds for
-whatever machine it is on.
+`.heff/out/heff`.  Where there is no heff yet, or only one of another
+seed, it starts from the seed, `boot/heff.tar.xz`: heff compiled by
+itself to C, which zig builds for whatever machine it is on.
 
 `editors/vscode` is a VS Code extension for the language server; a
 release has it built (`heff-X.Y.Z.vsix`).
