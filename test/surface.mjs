@@ -74,4 +74,55 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   rmSync(dir, { recursive: true, force: true });
 }
 
+// a primitive is the library's to declare, and once: one a module of the
+// library declares again -- that a module it is made of declares, or
+// that it declared above -- is an error there; one two of its modules
+// declare, neither made of the other, where they meet, at the import that
+// brings in the second -- and in no module made of that one; each place
+// said.  One the runtime has not is refused.  (A module of a program
+// declares none: test/errors/primitive.hf.)
+{
+  const dir = mkdtempSync(join(tmpdir(), "heff-primitives-"));
+  const lib = join(dir, "lib");
+  mkdirSync(lib, { recursive: true });
+  writeFileSync(join(lib, "builtin.hf"), readFileSync(join(root, "lib", "builtin.hf"), "utf8"));
+  writeFileSync(join(lib, "prelude.hf"), "primitive intAdd : Int -> Int -> Int\n");
+  writeFileSync(join(lib, "list.hf"), "none : List Bool\nnone = []\n");
+  writeFileSync(join(lib, "again.hf"), "-- the prelude's\nprimitive intAdd : Int -> Int -> Int\n");
+  writeFileSync(join(lib, "twice.hf"), "primitive floatCos : Float -> Float\nprimitive floatCos : Float -> Float\n");
+  writeFileSync(join(lib, "sines.hf"), "primitive floatSin : Float -> Float\n");
+  writeFileSync(join(lib, "sinus.hf"), "\nprimitive floatSin : Float -> Float\n");
+  writeFileSync(join(lib, "unknown.hf"), "primitive intPlusPlus : Int -> Int -> Int\n");
+  writeFileSync(join(dir, "both.hf"), "import sines\nimport sinus\n");
+  writeFileSync(join(dir, "both2.hf"), "import both\n");
+  writeFileSync(join(dir, "again2.hf"), "import again\n");
+  const inLib = (f) => spawnSync(heffBin, ["check", f], { cwd: dir, encoding: "utf8", env: { ...process.env, HEFF_LIB: lib } });
+  const said = (r) => r.stdout + r.stderr;
+  const twice = (k, a, b) => `error[E0336]: the primitive \`${k}\` is declared by ${a}, and by ${b}\n`;
+  const errors = (r) => (r.stderr.match(/error\[/g) ?? []).length;
+  const checks = [
+    ["one the prelude declares", inLib(join(lib, "again.hf")),
+      (r) => r.stderr.includes(`again.hf:2:1\n${twice("intAdd", "prelude, at lib/prelude.hf:1", "again, at lib/again.hf:2")}`) && errors(r) === 1],
+    ["one declared above", inLib(join(lib, "twice.hf")),
+      (r) => r.stderr.includes(`twice.hf:2:1\n${twice("floatCos", "twice, at lib/twice.hf:1", "twice, at lib/twice.hf:2")}`) && errors(r) === 1],
+    ["two modules' where they meet", inLib("both.hf"),
+      (r) => r.stderr.includes(`both.hf:2:1\n${twice("floatSin", "sines, at lib/sines.hf:1", "sinus, at lib/sinus.hf:2")}2 | import sinus\n`) && errors(r) === 1],
+    ["two modules', not again in what is made of where they meet", inLib("both2.hf"),
+      (r) => r.status === 1 && errors(r) === 1 && !r.stderr.includes("both2.hf:")],
+    ["one declared again, not again in what is made of it", inLib("again2.hf"),
+      (r) => r.status === 1 && errors(r) === 1 && !r.stderr.includes("again2.hf:")],
+    ["one the runtime has not", inLib(join(lib, "unknown.hf")),
+      (r) => r.status === 1 && r.stderr.includes("error[E0329]: there is no primitive called `intPlusPlus`")],
+    ["one declared once", inLib(join(lib, "sines.hf")),
+      (r) => r.status === 0 && r.stdout === "floatSin : Float -> Float\n"],
+  ];
+  for (const [what, r, ok] of checks) {
+    if (!ok(r)) {
+      failed++;
+      console.log(`FAIL a primitive the library declares: ${what}:\n${said(r)}`);
+    }
+  }
+  rmSync(dir, { recursive: true, force: true });
+}
+
 process.exit(failed ? 1 : 0);

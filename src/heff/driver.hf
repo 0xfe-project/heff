@@ -30,7 +30,8 @@ import map as Mp
 -- | imported by the name its importer requires it by), and the modules
 -- | it imports without writing them (`I.implicitModules`, but those it
 -- | is made of); `shown` its path as a diagnostic names it (one of the
--- | library's as `lib/...`)
+-- | library's as `lib/...`); `library`, whether it is one of the
+-- | library's, the modules that declare primitives
 type Source =
   { module : String
   , path : String
@@ -38,6 +39,7 @@ type Source =
   , source : String
   , renames : List (Pair String String)
   , implicit : List String
+  , library : Bool
   }
 
 -- | a file's imports, each naming the module it means
@@ -87,14 +89,15 @@ elemStr x xs = List.elemBy strEq x xs
 -- | a file given among others in dependency order, after the modules
 -- | `before`: it imports without writing them the implicit modules given
 -- | before it
-givenAfter : List String -> String -> String -> String -> Source
-givenAfter before m path src =
+givenAfter : List String -> String -> String -> String -> Bool -> Source
+givenAfter before m path src library =
   { module = m
   , path = path
   , shown = path
   , source = src
   , renames = Nil
   , implicit = List.filter (\i -> elemStr i before) I.implicitModules
+  , library = library
   }
 
 findChecked : List Checked -> String -> Maybe Checked
@@ -120,9 +123,8 @@ closure done ms = closureGo done Nil ms
 mergeBroken : Mp.Map String Unit -> G.Globals -> G.Globals
 mergeBroken b g = List.foldl (\g2 k -> G.addBroken k g2) g (Mp.keys b)
 
--- (a key there already is the same definition, a primitive another
--- module declared too: it stays where it was, before what was made of
--- it)
+-- (a key there already is a primitive another module declared too --
+-- an error, `withTwice` says where -- and the first stays)
 withEntry : String -> Checked -> G.Globals -> G.Globals
 withEntry k c g = case G.keyedEntry g k of
   Just _ -> g
@@ -243,14 +245,21 @@ spanOfName (Cons (MkPair y sp) rest) x =
 lineAt : String -> Int -> Int
 lineAt src at = (Dg.lineCol src at).line + 1
 
--- (where the module `c` defines `x`, said)
-placeIn : Checked -> String -> String
-placeIn c x =
+-- (the module `c`, at `sp`, said)
+placeAt : Checked -> Pm.Span -> String
+placeAt c sp =
   "by "
   ^ c.module
-  ^ (case spanOfName (appendD c.top.spans c.top.broken) x of
-     Just sp -> ", at " ^ c.shown ^ ":" ^ showInt (lineAt c.source sp.start)
-     Nothing -> "")
+  ^ ", at "
+  ^ c.shown
+  ^ ":"
+  ^ showInt (lineAt c.source sp.start)
+
+-- (where the module `c` defines `x`, said)
+placeIn : Checked -> String -> String
+placeIn c x = case spanOfName (appendD c.top.spans c.top.broken) x of
+  Just sp -> placeAt c sp
+  Nothing -> "by " ^ c.module
 
 -- (where an imported name is defined: said, by its key)
 withPlace : List Checked -> Imported -> G.Globals -> G.Globals
@@ -694,14 +703,16 @@ elabTop s imps direct r t =
     r.fixities
     False
 
-elabRead : List Checked
-         -> Source
-         -> I.Imports
-         -> List Checked
-         -> G.Globals
-         -> Su.Read
-         -> Checked
-elabRead done s imps direct g0 r =
+-- (the declarations elaborated, of those read)
+elabDecls : List Checked
+          -> Source
+          -> I.Imports
+          -> List Checked
+          -> G.Globals
+          -> Su.Read
+          -> List Notation.Decl
+          -> Checked
+elabDecls done s imps direct g0 r decls =
   elabTop
     s
     imps
@@ -710,7 +721,58 @@ elabRead done s imps direct g0 r =
     (T.topModule
        s.module
        (withParseBroken (\x -> s.module ^ "." ^ x) g0 r.broken)
-       r.decls)
+       decls)
+
+-- A primitive is the library's to declare: a module that is not one of
+-- the library's has its `primitive` declarations refused, each name
+-- broken -- a use of it no error of its own -- as a declaration's that
+-- does not parse is.
+
+primOf : Notation.Decl -> Maybe (Pair String Pm.Span)
+primOf (At (DeclPrimitive x _ _) sp) = Just (MkPair x sp)
+primOf _ = Nothing
+
+notPrim : Notation.Decl -> Bool
+notPrim d = case primOf d of
+  Just _ -> False
+  Nothing -> True
+
+primRefused : Pair String Pm.Span -> Diag
+primRefused (MkPair _ sp) =
+  { code = 335
+  , severity = SError
+  , msg = "only the library that goes with heff declares primitives"
+  , span = sp
+  , note = Nothing
+  }
+
+-- | what is read of a module that is not one of the library's, its
+-- | primitives refused
+refusePrims : Su.Read -> List (Pair String Pm.Span) -> Su.Read
+refusePrims r refused =
+  { decls = r.decls
+  , diags = appendD r.diags (List.map primRefused refused)
+  , fixities = r.fixities
+  , broken = appendD r.broken (List.map fst refused)
+  }
+
+elabRead : List Checked
+         -> Source
+         -> I.Imports
+         -> List Checked
+         -> G.Globals
+         -> Su.Read
+         -> Checked
+elabRead done s imps direct g0 r =
+  if s.library then elabDecls done s imps direct g0 r r.decls
+  else elabDecls
+      done
+      s
+      imps
+      direct
+      g0
+      (refusePrims r (catMaybesD (List.map primOf r.decls)))
+      (List.filter notPrim r.decls)
 
 elabEnv : List Checked
         -> Source
@@ -796,6 +858,132 @@ elabDirect done s imps thaw direct needed =
     needed
     (importedOf (implicitNames imps) direct)
 
+-- A primitive is declared once.  One declared again -- by a module made
+-- of one that declares it, or twice by one -- is an error where it is
+-- declared again; one that two modules declare, neither made of the
+-- other, is an error where they meet: at the import that brings in the
+-- second, in a module none of whose imports is made of both.  Each
+-- place is said.
+
+-- | a primitive declared: its key (its name), by which module, where
+type PrimDecl = { key : String, by : Checked, span : Pm.Span }
+
+-- (a primitive's key is its name, unprefixed: of the module's own
+-- definitions, those whose name is their key)
+primDeclsGo : Checked -> List Own -> List (Pair String Pm.Span) -> List PrimDecl
+primDeclsGo c (Cons o os) (Cons (MkPair _ sp) sps) =
+  if strEq o.name o.key
+    then Cons { key = o.key, by = c, span = sp } (primDeclsGo c os sps)
+  else primDeclsGo c os sps
+primDeclsGo c _ _ = Nil
+
+-- | the primitives a module declares, in order
+primDecls : Checked -> List PrimDecl
+primDecls c = primDeclsGo c c.own c.top.spans
+
+-- | a primitive declared again, and where it was first
+type Twice = { first : PrimDecl, again : PrimDecl }
+
+-- (`firsts`: each primitive declared before, where it was first)
+twicesGo : Mp.Map String PrimDecl -> List PrimDecl -> List Twice
+twicesGo firsts Nil = Nil
+twicesGo firsts (Cons d rest) = case Mp.lookup compareString d.key firsts of
+  Just f -> Cons { first = f, again = d } (twicesGo firsts rest)
+  Nothing -> twicesGo (Mp.insert compareString d.key d firsts) rest
+
+-- (the import `i` is of the module `m`, or of one made of it)
+reaches : List Checked -> String -> I.Import -> Bool
+reaches done m i = elemStr m (closure done [i.name])
+
+-- (the two declarations meet in the module `c`: it declares the second,
+-- or none of its imports is made of both)
+metIn : List Checked -> I.Imports -> Checked -> Twice -> Bool
+metIn done imps c t =
+  strEq t.again.by.module c.module
+  || not
+    (List.any
+       (\i ->
+          reaches done t.first.by.module i && reaches done t.again.by.module i)
+       imps.imports)
+
+-- (the first import that brings in the module `m`; none, the file's
+-- start)
+importOfGo : List Checked -> String -> List I.Import -> Pm.Span
+importOfGo done m Nil = { start = 0, end = 0 }
+importOfGo done m (Cons i rest) =
+  if reaches done m i then i.span else importOfGo done m rest
+
+twiceDiag : List Checked -> I.Imports -> Checked -> Twice -> Diag
+twiceDiag done imps c t =
+  { code = 336
+  , severity = SError
+  , msg =
+      "the primitive `"
+      ^ t.again.key
+      ^ "` is declared "
+      ^ placeAt t.first.by t.first.span
+      ^ ", and "
+      ^ placeAt t.again.by t.again.span
+  , span =
+      (if strEq t.again.by.module c.module then t.again.span
+       else importOfGo done t.again.by.module imps.imports)
+  , note = Nothing
+  }
+
+withDiags : Checked -> List Diag -> Checked
+withDiags c Nil = c
+withDiags c ds =
+  mkChecked
+    c.module
+    c.path
+    c.shown
+    c.source
+    c.decls
+    c.top
+    (appendD c.diags ds)
+    c.own
+    c.deps
+    c.opens
+    c.aliases
+    c.fixities
+    c.cached
+
+-- | a module checked, the primitives declared twice that meet in it
+-- | said: among those it is made of (`needed`) and its own
+withTwice : List Checked -> I.Imports -> List Checked -> Checked -> Checked
+withTwice done imps needed c =
+  withDiags
+    c
+    (List.map
+       (twiceDiag done imps c)
+       (List.filter
+          (metIn done imps c)
+          (twicesGo
+             Mp.empty
+             (appendD (concatMapD primDecls needed) (primDecls c)))))
+
+-- (the modules the file is made of, reckoned once)
+elabMadeOf : List Checked
+           -> Source
+           -> I.Imports
+           -> Maybe Thawed
+           -> List Checked
+           -> Checked
+elabMadeOf done s imps thaw needed =
+  withTwice
+    done
+    imps
+    needed
+    (elabDirect
+       done
+       s
+       imps
+       thaw
+       (List.filter
+          (\(c : Checked) -> elemStr c.module (openNames imps.imports))
+          done)
+       needed)
+
 -- (the modules reached from the imports, reckoned once)
 elabNeeding : List Checked
             -> Source
@@ -804,14 +992,11 @@ elabNeeding : List Checked
             -> List String
             -> Checked
 elabNeeding done s imps thaw reached =
-  elabDirect
+  elabMadeOf
     done
     s
     imps
     thaw
-    (List.filter
-       (\(c : Checked) -> elemStr c.module (openNames imps.imports))
-       done)
     (List.filter (\(c : Checked) -> elemStr c.module reached) done)
 
 elabWith : List Checked -> Source -> I.Imports -> Maybe Thawed -> Checked
@@ -1533,8 +1718,8 @@ findRunnable handled c (Just x) = case List.find
   Just o -> findNamed handled c x o
 findRunnable handled c Nothing = findFirst handled (candidatesOf c)
 
--- >>> List.length (checkProgram [{ module = "a", path = "a.hf", shown = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil }, { module = "b", path = "b.hf", shown = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil }])
+-- >>> List.length (checkProgram [{ module = "a", path = "a.hf", shown = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil, library = False }, { module = "b", path = "b.hf", shown = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil, library = False }])
 -- 2
 
--- >>> programBody (checkProgram [{ module = "a", path = "a.hf", shown = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil }, { module = "b", path = "b.hf", shown = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil }]) "b" "b.two"
+-- >>> programBody (checkProgram [{ module = "a", path = "a.hf", shown = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil, library = False }, { module = "b", path = "b.hf", shown = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil, library = False }]) "b" "b.two"
 -- "(SIs (SGlobal \"a.one\"))"

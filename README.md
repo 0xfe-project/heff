@@ -272,7 +272,10 @@ main = program (io := \p -> InL p) (disk := \p -> InR p)
 `lib/` goes with the compiler, its version the compiler's; `HEFF_LIB`
 says where it is, else it is the `lib/` the compiler came with: the
 repository's, a release's, or the heff home's (`heff install` puts it
-there).  Every module imports `builtin` and `prelude` without writing
+there).  Its modules alone declare primitives --
+`primitive intAdd : Int -> Int -> Int`, a function the runtime has --
+and each primitive once: one a module of a program declares, or one
+declared again, is an error.  Every module imports `builtin` and `prelude` without writing
 them, and `list` as `List`, the operations of lists (`List.map`,
 `List.length`) -- but those they are made of.  A name is the module's
 own definition's, else an import's it writes, else one of those it has
