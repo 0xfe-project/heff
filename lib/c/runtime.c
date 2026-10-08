@@ -273,7 +273,14 @@ static inline V heff_take_reuse(V v, uint64_t keep) {
 // so each is compiled to the few steps that tag needs: its loops
 // unrolled, its size class known.  (`heff_take` and `heff_take_reuse`
 // stay for a compiler from before, building this runtime's compiler.)
+// (Not optimised, `-O0`, each is a call: inlined there, its every step a
+// slot of its caller's frame, a recursion a million deep -- a list built
+// by a call that is not last -- would overflow the stack.)
+#ifdef __OPTIMIZE__
 #define HEFF_KNOWN static inline __attribute__((always_inline))
+#else
+#define HEFF_KNOWN static inline
+#endif
 
 // (`heff_take`, of a tag of `n` fields)
 HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
@@ -340,6 +347,55 @@ static V heff_clo(Fn fn, int arity, int nenv, V *env) {
 }
 
 static inline V *heff_env(V self) { return ((Clo *)self)->env; }
+
+// Constructions at their known size (#34): where the emitter builds a
+// tag, a record or a closure, it knows how many fields it has, a
+// constant where these are called -- so each is compiled to its size
+// class's free list taken from and its fields stored, not given to a
+// function that copies them with `memcpy`.  (`heff_tag`, `heff_rec`,
+// `heff_clo` stay for what does not know, and for a compiler from
+// before.)
+
+// (the fields at `f`, `n` of them, stored at `to`: `n` a constant, the
+// loop unrolled, `f` a compound literal's, each stored where it is
+// computed)
+HEFF_KNOWN void heff_fields_n(V *to, V *f, int64_t n) {
+  for (int64_t i = 0; i < n; i++) to[i] = f[i];
+}
+
+// (a tag of `n` fields, `n` more than none)
+HEFF_KNOWN V heff_tag_n(int id, int64_t n, V *f) {
+  Tag *t = heff_obj_alloc(sizeof(Tag) + n * sizeof(V));
+  t->h.rc = 1; t->h.kind = K_TAG; t->h.tag = (uint16_t)id; t->n = n;
+  heff_fields_n(t->f, f, n);
+  return (V)t;
+}
+
+// (a tag of `n` fields built in the cell `r` kept for it, or a new one)
+HEFF_KNOWN V heff_tag_at_n(V r, int id, int64_t n, V *f) {
+  if (!IS_OBJ(r)) return heff_tag_n(id, n, f);
+  Tag *t = (Tag *)r;
+  t->h.tag = (uint16_t)id;
+  heff_fields_n(t->f, f, n);
+  return r;
+}
+
+// (a record of `n` fields, its labels `lbl`)
+HEFF_KNOWN V heff_rec_n(int64_t n, uint32_t *lbl, V *f) {
+  Rec *r = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
+  r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = n; r->lbl = lbl;
+  heff_fields_n(r->f, f, n);
+  return (V)r;
+}
+
+// (a closure holding `n`, more than none)
+HEFF_KNOWN V heff_clo_n(Fn fn, int arity, int64_t n, V *env) {
+  Clo *c = heff_obj_alloc(sizeof(Clo) + n * sizeof(V));
+  c->h.rc = 1; c->h.kind = K_CLO; c->h.tag = 0;
+  c->fn = fn; c->arity = arity; c->nenv = (int32_t)n; c->memo = 0;
+  heff_fields_n(c->env, env, n);
+  return (V)c;
+}
 
 // (a lambda's closure, holding `n`, given up where its body starts,
 // which takes what it holds (#26): its last reference, its shell freed;
@@ -1528,7 +1584,7 @@ static V heff_arrayToList(V a) {
   V l = NTAG(TAG_Nil);
   for (int64_t k = r->n - 1; k >= 0; k--) {
     V f[2] = { heff_dup(r->a[k]), l };
-    l = heff_tag(TAG_Cons, 2, f);
+    l = heff_tag_n(TAG_Cons, 2, f);
   }
   heff_drop(a);
   return l;
@@ -1559,12 +1615,12 @@ static char *heff_cstr(V v) {
 // (a C string, UTF-8, as a string)
 static V heff_str_c(const char *c) { return heff_str_utf8((const unsigned char *)c, (int64_t)strlen(c)); }
 
-static V heff_just(V x) { return heff_tag(TAG_Just, 1, &x); }
+static V heff_just(V x) { return heff_tag_n(TAG_Just, 1, &x); }
 #define heff_nothing NTAG(TAG_Nothing)
 
 static V heff_cons(V x, V rest) {
   V f[2] = { x, rest };
-  return heff_tag(TAG_Cons, 2, f);
+  return heff_tag_n(TAG_Cons, 2, f);
 }
 
 // (C strings, as a list of strings)
