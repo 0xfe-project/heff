@@ -23,6 +23,7 @@ import std.filesystem
 import std.io
 import std.path as P
 import std.process
+import std.progress as Pg
 
 -- | the style of the paths of the platform heff runs on
 styleNow : {e : HFunctor} -> {{sys : process <: e}} -> Co e P.Style
@@ -973,20 +974,33 @@ appRead st t acc x (Just text) = case Pr.readBuild text of
     appShips st t acc x a missing
 
 -- | the project's programs, among the directories of its app/: each one's
--- | build.hf read, before any is built
+-- | build.hf read, before any is built (each one more of the task `rd`'s)
 appsIn : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{disk : fs <: e}}
+       -> {{prog : Pg.progress <: e}}
        -> P.Style
        -> Target
+       -> Pg.Task
        -> Apps
        -> List String
        -> Co e Apps
-appsIn st t acc Nil = pure { apps = reverse acc.apps, bad = acc.bad }
-appsIn st t acc (Cons x rest) = do
+appsIn st t rd acc Nil = pure { apps = reverse acc.apps, bad = acc.bad }
+appsIn st t rd acc (Cons x rest) = do
   m <- readFile (appFile st t x "build.hf")
   next <- appRead st t acc x m
-  appsIn st t next rest
+  Pg.complete rd
+  appsIn st t rd next rest
+
+-- (the task done with, then `next`)
+ended : {e : HFunctor}
+      -> {{prog : Pg.progress <: e}}
+      -> Pg.Task
+      -> Co e Unit
+      -> Co e Unit
+ended task next = do
+  Pg.end task
+  next
 
 -- (said: `path` is made; then `next`)
 wrote : {e : HFunctor}
@@ -1000,28 +1014,36 @@ wrote t path next = do
   next
 
 -- (`.heff/build/X/`, a C file a module, by `zig cc` -- which builds
--- them at once, and again only those that changed -- is the program X)
+-- them at once, and again only those that changed -- is the program X:
+-- a task under the program's, `p`, of as many items as files and the
+-- link, what zig says of them under it)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
       -> {{disk : fs <: e}}
+      -> {{prog : Pg.progress <: e}}
       -> P.Style
       -> Target
+      -> Pg.Task
       -> String
       -> Co e Unit
       -> Co e Unit
-zigCc st t x next = do
+zigCc st t p x next = do
   names <- readDir (partsDir st t x)
+  files <-
+    pure
+      (map
+         (\n -> P.join st (partsDir st t x) n)
+         (filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+  z <- Pg.start p "zig cc" (length files + 1)
   r <-
-    run
+    Pg.runUnder
+      z
       "zig"
       (concatList
          ["cc", "-O2", "-w"]
-         (concatList
-            (map
-               (\n -> P.join st (partsDir st t x) n)
-               (filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
-            ["-o", P.join st t.bin x, "-lm"]))
+         (concatList files ["-o", P.join st t.bin x, "-lm"]))
+  Pg.end z
   if ranStatus r == 0 then wrote t (P.join st t.bin x) next
     else do
       writeErr (ranErr r)
@@ -1041,41 +1063,55 @@ nodeDone st t x next = do
   r <- run "chmod" ["+x", P.join st t.bin x]
   wrote t (P.join st t.bin x) next
 
--- (the program X, compiled as its build.hf says, then `next`)
+-- (the program X, compiled as its build.hf says, then `next`: a task
+-- under `bp`, the programs', of its steps -- through C, compiled, then
+-- built by zig; else compiled -- each a task under it as it is done)
 buildApp : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> {{disk : fs <: e}}
          -> {{rep : Rp.report <: e}}
+         -> {{prog : Pg.progress <: e}}
          -> P.Style
          -> Target
+         -> Pg.Task
          -> String
          -> Pr.Build
          -> Co e Unit
          -> Co e Unit
-buildApp st t x a next =
+buildApp st t bp x a next =
   if strEq a.backend "c"
-    then cThen
-        (Just a.run)
-        (partsDir st t x ++ "/")
-        (appFile st t x "main.hf")
-        (zigCc st t x next)
+    then do
+      p <- Pg.start bp x 2
+      c <- Pg.start p "compiling to C" 0
+      cThen
+          (Just a.run)
+          (partsDir st t x ++ "/")
+          (appFile st t x "main.hf")
+          (ended c (zigCc st t p x (ended p next)))
   else if strEq a.backend "node"
-    then compileThen
-        "node"
-        (Just a.run)
-        (P.join st t.bin x)
-        (appFile st t x "main.hf")
-        (nodeDone st t x next)
+    then do
+      p <- Pg.start bp x 1
+      c <- Pg.start p "compiling for Node.js" 0
+      compileThen
+          "node"
+          (Just a.run)
+          (P.join st t.bin x)
+          (appFile st t x "main.hf")
+          (ended c (nodeDone st t x (ended p next)))
   else if t.pages
-    then compileThen
-        "page"
-        (Just a.run)
-        (P.join st t.bin (x ++ ".js"))
-        (appFile st t x "main.hf")
-        (wrote t (P.join st t.bin (x ++ ".js")) next)
+    then do
+      p <- Pg.start bp x 1
+      c <- Pg.start p "compiling for a page" 0
+      compileThen
+          "page"
+          (Just a.run)
+          (P.join st t.bin (x ++ ".js"))
+          (appFile st t x "main.hf")
+          (ended c (wrote t (P.join st t.bin (x ++ ".js")) (ended p next)))
   else do
     print ("passed over " ++ x ++ ": a page's script, not a program")
+    Pg.complete bp
     next
 
 -- (each program, by its build.hf, then `done`)
@@ -1084,14 +1120,16 @@ buildEach : {e : HFunctor}
           -> {{sys : process <: e}}
           -> {{disk : fs <: e}}
           -> {{rep : Rp.report <: e}}
+          -> {{prog : Pg.progress <: e}}
           -> P.Style
           -> Target
+          -> Pg.Task
           -> Co e Unit
           -> List App
           -> Co e Unit
-buildEach st t done Nil = done
-buildEach st t done (Cons a rest) =
-  buildApp st t a.name a.build (buildEach st t done rest)
+buildEach st t bp done Nil = done
+buildEach st t bp done (Cons a rest) =
+  buildApp st t bp a.name a.build (buildEach st t bp done rest)
 
 -- (what cannot be put in `home` said: nothing more is done)
 shipFails : {e : HFunctor}
@@ -1127,18 +1165,21 @@ shipMoved t fresh old to next False = do
 -- (the file or directory `n` of the project put in `home`, in place of
 -- what was there: copied into `home` first, as `.n.new`, then moved to
 -- `n`, so that a failure leaves the whole of what was there, not a part
--- of either; then `next`)
+-- of either; then `next` (a task under `sh`, the shipping's, meanwhile)
 shipOne : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
         -> {{disk : fs <: e}}
+        -> {{prog : Pg.progress <: e}}
         -> P.Style
         -> Target
         -> String
+        -> Pg.Task
         -> Co e Unit
         -> String
         -> Co e Unit
-shipOne st t home next n = do
+shipOne st t home sh next n = do
+  it <- Pg.start sh n 0
   fresh <- pure (P.join st home ("." ++ n ++ ".new"))
   old <- pure (P.join st home ("." ++ n ++ ".old"))
   _ <- remove fresh
@@ -1149,7 +1190,7 @@ shipOne st t home next n = do
         -- (nothing there, nothing moved aside)
         _ <- move (P.join st home n) old
         moved <- move fresh (P.join st home n)
-        shipMoved t fresh old (P.join st home n) next moved
+        shipMoved t fresh old (P.join st home n) (ended it next) moved
     else do
       _ <- remove fresh
       shipFails ("cannot copy " ++ inProject st t n ++ " to " ++ fresh)
@@ -1158,25 +1199,29 @@ shipAll : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
         -> {{disk : fs <: e}}
+        -> {{prog : Pg.progress <: e}}
         -> P.Style
         -> Target
         -> String
+        -> Pg.Task
         -> Co e Unit
         -> List String
         -> Co e Unit
-shipAll st t home next Nil = next
-shipAll st t home next (Cons n rest) =
-  shipOne st t home (shipAll st t home next rest) n
+shipAll st t home sh next Nil = next
+shipAll st t home sh next (Cons n rest) =
+  shipOne st t home sh (shipAll st t home sh next rest) n
 
 -- | what the programs ship, each named once
 shippedBy : List App -> List String
 shippedBy progs = nubStrM (concatMap (\(a : App) -> a.build.ships) progs)
 
--- (what the programs ship, put in `t.shipTo` if it is given; then `done`)
+-- (what the programs ship, put in `t.shipTo` if it is given, a task
+-- meanwhile; then `done`)
 shipIn : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{sys : process <: e}}
        -> {{disk : fs <: e}}
+       -> {{prog : Pg.progress <: e}}
        -> P.Style
        -> Target
        -> Co e Unit
@@ -1184,7 +1229,9 @@ shipIn : {e : HFunctor}
        -> Maybe String
        -> Co e Unit
 shipIn st t done progs Nothing = done
-shipIn st t done progs (Just home) = shipAll st t home done (shippedBy progs)
+shipIn st t done progs (Just home) = do
+  sh <- Pg.start Pg.root ("installing in " ++ home) (length (shippedBy progs))
+  shipAll st t home sh (ended sh done) (shippedBy progs)
 
 -- (the programs, built to `t.bin`, and what they ship put where `t`
 -- says; then `done`)
@@ -1193,6 +1240,7 @@ buildPrograms : {e : HFunctor}
               -> {{sys : process <: e}}
               -> {{disk : fs <: e}}
               -> {{rep : Rp.report <: e}}
+              -> {{prog : Pg.progress <: e}}
               -> P.Style
               -> Target
               -> Co e Unit
@@ -1201,7 +1249,8 @@ buildPrograms : {e : HFunctor}
 buildPrograms st t done progs = do
   ok <- mkDir t.bin
   okC <- mkDir (inProject st t (P.join st ".heff" "build"))
-  buildEach st t (shipIn st t done progs t.shipTo) progs
+  bp <- Pg.start Pg.root "building programs" (length progs)
+  buildEach st t bp (ended bp (shipIn st t done progs t.shipTo)) progs
 
 -- (the `.hf` files under the paths, the directories walked; a name
 -- starting with `.` passed over)
@@ -1236,20 +1285,27 @@ errorCount cs = foldl (\n (c : Dr.Checked) -> n + length (Dr.errorsIn c)) 0 cs
 
 -- | FILE, a module of the project, checked with what it imports, unless
 -- | it was among what a module checked before imports; the diagnostics
--- | of each module of the project's src/ said once
+-- | of each module of the project's src/ said once (one more of the
+-- | task `chk`'s: checked, a task under it meanwhile)
 checkModule : {e : HFunctor}
             -> {{io : stdio <: e}}
             -> {{sys : process <: e}}
             -> {{disk : fs <: e}}
             -> {{rep : Rp.report <: e}}
+            -> {{prog : Pg.progress <: e}}
+            -> Pg.Task
             -> Checks
             -> String
             -> Co e Checks
-checkModule acc f = do
+checkModule chk acc f = do
   h <- hostNow
   ps <- L.pathsFor h f
-  if elemStrM (L.moduleOf ps f) acc.seen then pure acc
+  if elemStrM (L.moduleOf ps f) acc.seen
+      then do
+        Pg.complete chk
+        pure acc
     else do
+      m <- Pg.start chk (L.moduleOf ps f) 0
       l <- load f
       badL <- printErrs "heff" l.errors 0
       cs <- Se.cachedProgram l
@@ -1262,6 +1318,7 @@ checkModule acc f = do
                 && not (elemStrM c.module acc.seen))
              cs)
       putFileDiags own
+      Pg.end m
       pure
           { seen = concatList (map (\(c : Dr.Checked) -> c.module) own) acc.seen
           , errors = acc.errors + badL + errorCount own
@@ -1272,13 +1329,15 @@ checkModules : {e : HFunctor}
              -> {{sys : process <: e}}
              -> {{disk : fs <: e}}
              -> {{rep : Rp.report <: e}}
+             -> {{prog : Pg.progress <: e}}
+             -> Pg.Task
              -> Checks
              -> List String
              -> Co e Checks
-checkModules acc Nil = pure acc
-checkModules acc (Cons f rest) = do
-  next <- checkModule acc f
-  checkModules next rest
+checkModules chk acc Nil = pure acc
+checkModules chk acc (Cons f rest) = do
+  next <- checkModule chk acc f
+  checkModules chk next rest
 
 -- (`n` modules)
 modulesSaid : Int -> String
@@ -1304,12 +1363,13 @@ nothingBuilt cmd what = do
 -- | the whole project at `t.root` built: every module of its src/
 -- | checked, and every program's build.hf read, then, if none has an
 -- | error, every program of its app/ built (with none, `none`), then
--- | `done`
+-- | `done`; each a task as it is done
 buildProject : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
              -> {{disk : fs <: e}}
              -> {{rep : Rp.report <: e}}
+             -> {{prog : Pg.progress <: e}}
              -> P.Style
              -> String
              -> Target
@@ -1318,7 +1378,9 @@ buildProject : {e : HFunctor}
              -> Co e Unit
 buildProject st cmd t none done = do
   files <- hfFilesGo [inProject st t "src"] Nil
-  checked <- checkModules { seen = Nil, errors = 0 } files
+  chk <- Pg.start Pg.root "checking modules" (length files)
+  checked <- checkModules chk { seen = Nil, errors = 0 } files
+  Pg.end chk
   if checked.errors > 0
       then nothingBuilt
           cmd
@@ -1331,7 +1393,13 @@ buildProject st cmd t none done = do
            ++ modulesSaid (length checked.seen)
            ++ " checked")
       found <- readDir (inProject st t "app")
-      progs <- appsIn st t { apps = Nil, bad = 0 } (fromMaybe Nil found)
+      rd <-
+        Pg.start
+          Pg.root
+          "reading the programs' build.hf"
+          (length (fromMaybe Nil found))
+      progs <- appsIn st t rd { apps = Nil, bad = 0 } (fromMaybe Nil found)
+      Pg.end rd
       if progs.bad > 0
           then nothingBuilt
               cmd
@@ -1349,6 +1417,7 @@ buildCmd : {e : HFunctor}
          -> {{sys : process <: e}}
          -> {{disk : fs <: e}}
          -> {{rep : Rp.report <: e}}
+         -> {{prog : Pg.progress <: e}}
          -> Co e Unit
 buildCmd = do
   text <- readFile "package.hf"
@@ -1392,6 +1461,7 @@ installCmd : {e : HFunctor}
            -> {{sys : process <: e}}
            -> {{disk : fs <: e}}
            -> {{rep : Rp.report <: e}}
+           -> {{prog : Pg.progress <: e}}
            -> String
            -> Co e Unit
 installCmd dir = do
@@ -1775,17 +1845,21 @@ testFiles Nil = do
 testFiles given = testFilesGo (map (\f -> MkPair True f) given) Nil
 
 -- | check the watches' expectations of every file given, and run its
--- | tests (each property from `seed`)
+-- | tests (each property from `seed`), each file a task under `tk` as
+-- | it is tested
 testCmd : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
         -> {{disk : fs <: e}}
         -> {{rep : Rp.report <: e}}
+        -> {{prog : Pg.progress <: e}}
+        -> Pg.Task
         -> Int
         -> List String
         -> TestRes
         -> Co e Unit
-testCmd seed Nil acc = do
+testCmd tk seed Nil acc = do
+  Pg.end tk
   print
       (showInt (acc.total - acc.failed)
        ++ "/"
@@ -1794,9 +1868,12 @@ testCmd seed Nil acc = do
        ++ testsHeld acc.tests acc.testsFailed)
   if acc.failed > 0 || acc.testsFailed > 0 || not acc.ok then exit 1
     else pure MkUnit
-testCmd seed (Cons f rest) acc = do
+testCmd tk seed (Cons f rest) acc = do
+  ft <- Pg.start tk f 0
   r <- testOneF seed f
+  Pg.end ft
   testCmd
+      tk
       seed
       rest
       { total = acc.total + r.total
@@ -1805,6 +1882,26 @@ testCmd seed (Cons f rest) acc = do
       , tests = acc.tests + r.tests
       , testsFailed = acc.testsFailed + r.testsFailed
       }
+
+-- | `heff test`: the watches' expectations of the files checked, and
+-- | their tests run (each property from `seed`), a task meanwhile, each
+-- | file one more of its
+testsCmd : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{rep : Rp.report <: e}}
+         -> {{prog : Pg.progress <: e}}
+         -> Int
+         -> List String
+         -> Co e Unit
+testsCmd seed files = do
+  tk <- Pg.start Pg.root "testing" (length files)
+  testCmd
+      tk
+      seed
+      files
+      { total = 0, failed = 0, ok = True, tests = 0, testsFailed = 0 }
 
 -- | the seed the properties are run from, unless `--seed` gives one:
 -- | always the same, so that a run of the tests is a run of the same
