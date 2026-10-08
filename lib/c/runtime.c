@@ -2096,8 +2096,38 @@ static void buf_json_string(Buf *b, V v) {
   buf_str(b, "\"");
 }
 
+// (a tag of that name and that many arguments, its arguments `*fs`)
+static int heff_tag_named(V v, const char *name, int n, V **fs) {
+  int tag, m = 0;
+  V *f = NULL;
+  if (IS_NTAG(v)) tag = (int)(v >> 2);
+  else if (IS_OBJ(v) && OBJ(v)->kind == K_TAG) { tag = OBJ(v)->tag; m = (int)((Tag *)v)->n; f = ((Tag *)v)->f; }
+  else return 0;
+  if (m != n || strcmp(heff_name_of(heff_tag_names, heff_ntag_names, (uint32_t)tag), name)) return 0;
+  *fs = f;
+  return 1;
+}
+
+// (a list, `Cons a (Cons b Nil)`: whether it is one, a chain that ends
+// in `Nil`)
+static int heff_is_list(V v) {
+  V *f;
+  while (heff_tag_named(v, "Cons", 2, &f)) v = f[1];
+  return heff_tag_named(v, "Nil", 0, &f);
+}
+
 static void heff_show(Buf *b, V v, int arg) {
   char tmp[64];
+  if (heff_is_list(v)) {
+    V *f;
+    buf_str(b, "[");
+    for (int i = 0; heff_tag_named(v, "Cons", 2, &f); i++, v = f[1]) {
+      if (i) buf_str(b, ", ");
+      heff_show(b, f[0], 0);
+    }
+    buf_str(b, "]");
+    return;
+  }
   if (IS_INT(v) || (IS_OBJ(v) && OBJ(v)->kind == K_BIG)) {
     char *c = heff_int_cstr(v);
     if (arg && c[0] == '-') { buf_str(b, "("); buf_str(b, c); buf_str(b, ")"); }

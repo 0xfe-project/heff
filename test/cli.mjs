@@ -27,7 +27,7 @@ writeFileSync(join(work, "p.hf"), [
 const promoted = heff("promote", "p.hf");
 const text = readFileSync(join(work, "p.hf"), "utf8");
 expect("promote", promoted.status === 0 &&
-  text.includes("-- >>> 1 + 2\n-- 3\n") && text.includes("-- >>> (Cons 1 Nil : List Int)\n-- Cons 1 Nil\n") &&
+  text.includes("-- >>> 1 + 2\n-- 3\n") && text.includes("-- >>> (Cons 1 Nil : List Int)\n-- [1]\n") &&
   text.includes("-- >>> not True\n-- False\n") && !text.includes("wrong"), { promoted, text });
 const tested = heff("test", "p.hf");
 expect("test after promote", tested.status === 0 && tested.stdout.includes("3/3 expectations hold"), tested);

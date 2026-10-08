@@ -3,7 +3,16 @@
 import { pathToFileURL } from "node:url";
 const [file, ...names] = process.argv.slice(2);
 const g = (await import(pathToFileURL(file))).default;
-// (a tag with arguments is parenthesized where it is an argument)
+// (a list, `Cons a (Cons b Nil)`: its items, as `[a, b]` writes them;
+// not one, null)
+const isTag = (v, t, n) => v && typeof v === "object" && v.$ === t && Array.isArray(v.a) && v.a.length === n;
+const items = (v) => {
+  const xs = [];
+  for (; isTag(v, "Cons", 2); v = v.a[1]) xs.push(v.a[0]);
+  return isTag(v, "Nil", 0) ? xs : null;
+};
+// (a list as `[a, b]` writes it; a tag with arguments is parenthesized
+// where it is an argument)
 export const show = (v, arg = false) => {
   if (typeof v === "function") return v.$erased ? "#erased" : "#fun";
   // (a negative number, an argument: `Just (-7)`)
@@ -15,6 +24,8 @@ export const show = (v, arg = false) => {
   if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {
+      const xs = items(v);
+      if (xs) return "[" + xs.map((x) => show(x)).join(", ") + "]";
       const tag = v.$;
       if (!v.a.length) return tag;
       const s = tag + v.a.map((x) => " " + show(x, true)).join("");
