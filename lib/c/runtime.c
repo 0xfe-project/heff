@@ -488,7 +488,6 @@ static inline __attribute__((always_inline)) void heff_clo_take(V self, int64_t 
   }
 }
 
-// (the last reference gone: what it holds given back, then itself)
 // (an object's size, from what it is)
 static size_t heff_size(V v) {
   Obj *o = OBJ(v);
@@ -513,8 +512,8 @@ HEFF_VAR(V *heff_dead);
 HEFF_VAR(size_t heff_ndead);
 HEFF_VAR(size_t heff_cdead);
 
-static inline void heff_dead_push(V v) {
-  if (!IS_OBJ(v) || (OBJ(v)->rc & IMMORTAL) || --OBJ(v)->rc != 0) return;
+// (a value whose last reference this was, put on the stack)
+static inline void heff_dead_put(V v) {
   if (heff_ndead == heff_cdead) {
     heff_cdead = heff_cdead ? heff_cdead * 2 : 1024;
     heff_dead = realloc(heff_dead, heff_cdead * sizeof(V));
@@ -523,24 +522,75 @@ static inline void heff_dead_push(V v) {
   heff_dead[heff_ndead++] = v;
 }
 
+// (a value counted down: put on the stack if that was its last reference)
+static inline void heff_dead_push(V v) {
+  if (!IS_OBJ(v) || (OBJ(v)->rc & IMMORTAL) || --OBJ(v)->rc != 0) return;
+  heff_dead_put(v);
+}
+
+// (an object whose last reference is gone: what it holds counted down,
+// its size reckoned as it is looked at, and it freed; of what it holds,
+// each whose last reference that was is given back after it -- the last
+// of them next, at once, the others from the stack: a list's cells one
+// after another, its spine never on the stack)
 __attribute__((noinline)) static void heff_free(V v) {
   size_t base = heff_ndead;
-  OBJ(v)->rc = 1;
-  heff_dead_push(v);
-  while (heff_ndead > base) {
-    V w = heff_dead[--heff_ndead];
-    Obj *o = OBJ(w);
+  for (;;) {
+    Obj *o = OBJ(v);
+    V *f = NULL, next = 0;
+    int64_t n = 0;
+    size_t size;
     switch (o->kind) {
-    case K_TAG: { Tag *t = (Tag *)w; for (int64_t i = 0; i < t->n; i++) heff_dead_push(t->f[i]); break; }
-    case K_REC: { Rec *r = (Rec *)w; for (int64_t i = 0; i < r->n; i++) heff_dead_push(r->f[i]); break; }
-    case K_CLO: { Clo *c = (Clo *)w; for (int i = 0; i < c->nenv; i++) heff_dead_push(c->env[i]); if (c->memo) heff_dead_push(c->memo); break; }
-    case K_PAP: { Pap *p = (Pap *)w; heff_dead_push(p->fun); for (int i = 0; i < p->n; i++) heff_dead_push(p->a[i]); break; }
-    case K_ARR: { Arr *r = (Arr *)w; for (int64_t i = 0; i < r->n; i++) heff_dead_push(r->a[i]); break; }
-    case K_BNC: { Bnc *b = (Bnc *)w; heff_dead_push(b->fun); for (int i = 0; i < b->n; i++) heff_dead_push(b->a[i]); break; }
-    default: break;
+    case K_TAG: { Tag *t = (Tag *)v; n = t->n; f = t->f; size = sizeof(Tag) + n * sizeof(V); break; }
+    case K_REC: { Rec *r = (Rec *)v; n = r->n; f = r->f; size = sizeof(Rec) + n * sizeof(V); break; }
+    case K_CLO: {
+      Clo *c = (Clo *)v; n = c->nenv; f = c->env; size = sizeof(Clo) + n * sizeof(V);
+      if (c->memo) heff_dead_push(c->memo);
+      break;
     }
-    heff_obj_free(o, heff_size(w));
+    case K_PAP: { Pap *p = (Pap *)v; heff_dead_push(p->fun); n = p->n; f = p->a; size = sizeof(Pap) + n * sizeof(V); break; }
+    case K_ARR: { Arr *r = (Arr *)v; n = r->n; f = r->a; size = sizeof(Arr) + n * sizeof(V); break; }
+    case K_BNC: { Bnc *b = (Bnc *)v; heff_dead_push(b->fun); n = b->n; f = b->a; size = sizeof(Bnc) + n * sizeof(V); break; }
+    default: size = heff_size(v); break;
+    }
+    for (int64_t i = 0; i < n; i++) {
+      V x = f[i];
+      if (!IS_OBJ(x) || (OBJ(x)->rc & IMMORTAL) || --OBJ(x)->rc != 0) continue;
+      if (next) heff_dead_put(next);
+      next = x;
+    }
+    heff_obj_free(o, size);
+    if (next) v = next;
+    else if (heff_ndead > base) v = heff_dead[--heff_ndead];
+    else return;
   }
+}
+
+// (a record of `n` fields dropped, its shape known (#34): its last
+// reference, its fields dropped and its cell freed at once -- of many
+// fields, by the walk; otherwise counted down)
+HEFF_KNOWN void heff_drop_rec(V v, int64_t n) {
+  Rec *r = (Rec *)v;
+  if (r->h.rc == 1) {
+    if (n > HEFF_FEW_FIELDS) heff_free(v);
+    else {
+      for (int64_t i = 0; i < n; i++) heff_drop(r->f[i]);
+      heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
+    }
+  } else if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+}
+
+// (a closure holding `n` dropped, as `heff_drop_rec` a record)
+HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
+  Clo *c = (Clo *)v;
+  if (c->h.rc == 1) {
+    if (n > HEFF_FEW_FIELDS) heff_free(v);
+    else {
+      if (c->memo) heff_drop(c->memo);
+      for (int64_t i = 0; i < n; i++) heff_drop(c->env[i]);
+      heff_obj_free(c, sizeof(Clo) + n * sizeof(V));
+    }
+  } else if (!(c->h.rc & IMMORTAL)) c->h.rc--;
 }
 
 // Calls of what is not known

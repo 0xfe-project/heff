@@ -222,8 +222,11 @@ type Self = { key : String, params : List String }
 
 -- | what a variable is known to be where it is dropped (#26): a tag of
 -- | `n` fields -- the arm it is in matching it, or built where it is
--- | bound -- or the cell kept for a tag of `n` fields (`reusing`)
-data Known = KnownTag Int | KnownCell Int
+-- | bound -- or the cell kept for a tag of `n` fields (`reusing`); a
+-- | record of `n` fields -- built where it is bound, or read a field of
+-- | at its shape -- or a closure holding `n`, built where it is bound
+-- | (#34)
+data Known = KnownTag Int | KnownCell Int | KnownRec Int | KnownClo Int
 
 -- (`owned`: the variables this code holds a reference to, to consume or
 -- drop; `after`: those wanted after what is being emitted, by what
@@ -510,6 +513,40 @@ freeFrom xs (MkPair bs ms) = freeAmong (List.append xs bs) (List.reverse ms)
 freeOf : List String -> I.Expr -> List String
 freeOf xs b = freeFrom xs (fvW Nil Nil (Cons b Nil))
 
+-- (a variable read a field of at a known shape: a record of its size)
+shapedOf : I.Expr
+         -> List String
+         -> List (Pair String Known)
+         -> List (Pair String Known)
+shapedOf (EVar x) sh acc =
+  if List.null sh then acc else Cons (MkPair x (KnownRec (List.length sh))) acc
+shapedOf e sh acc = acc
+
+shapedGo : List (Pair String Known) -> List I.Expr -> List (Pair String Known)
+shapedGo acc Nil = acc
+shapedGo acc (Cons (EProj e _ sh) rest) =
+  shapedGo (shapedOf e sh acc) (Cons e rest)
+shapedGo acc (Cons (ELam _ b) rest) = shapedGo acc (Cons b rest)
+shapedGo acc (Cons (EApp f as) rest) =
+  shapedGo acc (Cons f (List.append as rest))
+shapedGo acc (Cons (ELet _ a b) rest) = shapedGo acc (Cons a (Cons b rest))
+shapedGo acc (Cons (ERecord fs) rest) = shapedGo acc (I.pushFields fs rest)
+shapedGo acc (Cons (ETag _ as) rest) = shapedGo acc (List.append as rest)
+shapedGo acc (Cons (EMatch s arms) rest) =
+  shapedGo acc (Cons s (I.pushArms arms rest))
+shapedGo acc (Cons (EPrimCall _ as) rest) = shapedGo acc (List.append as rest)
+shapedGo acc (Cons (ECall _ as) rest) = shapedGo acc (List.append as rest)
+shapedGo acc (Cons _ rest) = shapedGo acc rest
+
+-- | a definition's code, knowing the records it reads fields of at their
+-- | shapes -- in its lambdas too, its variables named once in it all
+knowingShapes : I.Expr -> CE -> CE
+knowingShapes b ce =
+  List.foldl
+    (\c p -> withKnown (fst p) (snd p) c)
+    ce
+    (shapedGo Nil (Cons b Nil))
+
 -- Reference counts
 --------------------------------------------------------------------------------
 
@@ -537,7 +574,8 @@ freeOf xs b = freeFrom xs (fvW Nil Nil (Cons b Nil))
 --   tag of no fields is a word, nothing to give back; a tag of `n`
 --   fields -- in an arm matching it, or bound to one built -- is given
 --   back as one (`heff_drop_tag`), not looked at by `heff_drop`; a cell
---   kept and not built in is freed (`heff_drop_cell`).
+--   kept and not built in is freed (`heff_drop_cell`); so are a record
+--   (`heff_drop_rec`) and a closure (`heff_drop_clo`) of known size.
 
 unionS : List String -> List String -> List String
 unionS xs ys = List.append xs ys
@@ -566,6 +604,11 @@ dropAs x (KnownTag n) =
   else Cons ("heff_drop_tag(" ^ cLocal x ^ ", " ^ showInt n ^ ");") Nil
 dropAs x (KnownCell n) =
   Cons ("heff_drop_cell(" ^ cLocal x ^ ", " ^ showInt n ^ ");") Nil
+dropAs x (KnownRec n) =
+  Cons ("heff_drop_rec(" ^ cLocal x ^ ", " ^ showInt n ^ ");") Nil
+dropAs x (KnownClo n) =
+  if n == 0 then Nil
+  else Cons ("heff_drop_clo(" ^ cLocal x ^ ", " ^ showInt n ^ ");") Nil
 
 dropKnown : String -> Maybe Known -> List String
 dropKnown x Nothing = Cons ("heff_drop(" ^ cLocal x ^ ");") Nil
@@ -1474,6 +1517,8 @@ reusedOf _ = Nothing
 
 builtOf : I.Expr -> Maybe Known
 builtOf (ETag _ as) = Just (KnownTag (List.length as))
+builtOf (ERecord fs) = Just (KnownRec (List.length fs))
+builtOf (ELam xs b) = Just (KnownClo (List.length (freeOf xs b)))
 builtOf (EPrimCall p as) = if strEq p reusePrim then reusedOf as else Nothing
 builtOf _ = Nothing
 
@@ -1808,7 +1853,10 @@ funDef ce d xs b = do
          Nil
          (withBorrowed
             (paramsAt True (borOf ce.bor d.key) xs)
-            (withFrame (Just { key = d.key, params = xs }) 0 ce)))
+            (withFrame
+               (Just { key = d.key, params = xs })
+               0
+               (knowingShapes b ce))))
       Ret
       b
   pure
@@ -1846,7 +1894,11 @@ funDef ce d xs b = do
 
 valDef : CE -> I.Def -> C Emitted1
 valDef ce d = do
-  body <- ck.stmts (withPath Nil Nil (withFrame Nothing 0 ce)) Ret d.body
+  body <-
+    ck.stmts
+      (withPath Nil Nil (withFrame Nothing 0 (knowingShapes d.body ce)))
+      Ret
+      d.body
   pure
       { protos = Cons ("static V " ^ cGlobal d.key ^ "_get(void);") Nil
       , code =
