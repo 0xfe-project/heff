@@ -193,7 +193,9 @@ relates are refused side by side, parentheses saying which is first
 (the prelude's `^` and `+`, `a + b ^ c`).  `below` alone is below all,
 any module's operators too.  The prelude's `$` is: `f $ x` is `f x`, to
 the right, so `f $ g $ h x` is `f (g (h x))` and `showInt $ a + b * c`
-shows the sum; it is inlined, a call of `f` itself.
+shows the sum; it is inlined, a call of `f` itself.  `$` is the bottom:
+nothing is declared below it, or below any operator declared `below`
+alone, and two such, side by side, take parentheses.
 
 ```haskell
 infixl .+. below +

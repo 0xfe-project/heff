@@ -482,6 +482,17 @@ reduceS apply st = case st.ops of
     _ -> st
   Nil -> st
 
+-- (two operators neither binds tighter than)
+unrelatedMsg : F.Fixities -> String -> String -> String
+unrelatedMsg fix a b =
+  if F.bothLoosest fix a b
+    then "`" ^ a ^ "` and `" ^ b ^ "` are both the loosest: add parentheses"
+  else "`"
+    ^ a
+    ^ "` and `"
+    ^ b
+    ^ "` are not related: add parentheses, or declare which binds tighter (`above`, `below`)"
+
 -- | `before` is on the stack, `op` comes: does `before` reduce first?
 firstS : F.Fixities -> Bool -> C.T -> C.T -> P Bool
 firstS fix lenient before op = case F.relate fix before.text op.text of
@@ -502,14 +513,7 @@ firstS fix lenient before op = case F.relate fix before.text op.text of
             ^ "` do not associate: add parentheses"))
   Unrelated ->
     if lenient then pure True
-    else throwP
-        (diag
-           (spanT op)
-           ("`"
-            ^ before.text
-            ^ "` and `"
-            ^ op.text
-            ^ "` are not related: add parentheses, or declare which binds tighter (`above`, `below`)"))
+    else throwP (diag (spanT op) (unrelatedMsg fix before.text op.text))
   Undeclared x ->
     if lenient then pure True
     else throwP
@@ -1516,6 +1520,7 @@ type FixDecl =
   , loosest : Bool
   , errors : List Diag
   , span : Pm.Span
+  , line : Int
   }
 
 restOfDecl : Array L.Tok -> Int -> List L.Tok -> List L.Tok
@@ -1612,6 +1617,7 @@ fixDeclDone t rest ops r =
   , loosest = r.loosest
   , errors = List.reverse r.errors
   , span = mkSpan t.start (lastEnd t rest)
+  , line = t.line
   }
 
 fixDeclParts : L.Tok -> List L.Tok -> FixDecl
@@ -1643,8 +1649,14 @@ fixDecls ts k acc =
     Just d -> fixDecls ts (k + 1) (Cons d acc)
     Nothing -> fixDecls ts (k + 1) acc
 
-groupOfDecl : FixDecl -> Maybe F.Group
-groupOfDecl d = case d.ops of
+-- (where a declaration is, said: the file's place and its line; not
+-- known, nothing)
+placeOfLine : String -> Int -> String
+placeOfLine "" line = ""
+placeOfLine place line = place ^ ":" ^ showInt (line + 1)
+
+groupOfDecl : String -> FixDecl -> Maybe F.Group
+groupOfDecl place d = case d.ops of
   Nil -> Nothing
   Cons op rest ->
     Just
@@ -1652,6 +1664,7 @@ groupOfDecl d = case d.ops of
       , assoc = d.assoc
       , ops = List.map (\(u : L.Tok) -> u.text) d.ops
       , loosest = d.loosest
+      , at = placeOfLine place d.line
       }
 
 mapMaybeG : {a : Type} -> (F.Group -> a) -> Maybe F.Group -> Maybe a
@@ -1671,11 +1684,14 @@ edgesOf scope d = case d.ops of
             (\(r : L.Tok) ->
                mapMaybeG (\g -> mkEdge op.text g.id) (F.groupOf scope r.text))
             d.above))
+      -- (nothing is below the loosest: that is an error, not an edge)
       (catMaybesS
          (List.map
             (\(r : L.Tok) ->
                mapMaybeG (\g -> mkEdge g.id op.text) (F.groupOf scope r.text))
-            d.below))
+            (List.filter
+               (\(r : L.Tok) -> not (F.loosestOf (F.groupOf scope r.text)))
+               d.below)))
 
 anyS : {a : Type} -> (a -> Bool) -> List a -> Bool
 anyS p Nil = False
@@ -1709,6 +1725,37 @@ cycleDiag all d = case d.ops of
              Nil
        else Nil)
 
+-- (where a group is declared, said, in parentheses; not known, nothing)
+declaredAt : String -> String
+declaredAt "" = ""
+declaredAt at = " (" ^ at ^ ")"
+
+-- (`below` the loosest, `u`: what is declared below it, if it names it)
+belowWhat : List L.Tok -> L.Tok -> String
+belowWhat (Cons op _) u =
+  "`"
+  ^ op.text
+  ^ "` cannot be declared below `"
+  ^ u.text
+  ^ "`: `"
+  ^ u.text
+  ^ "`"
+belowWhat Nil u = "nothing can be declared below `" ^ u.text ^ "`: it"
+
+belowLoosestDiag : FixDecl -> L.Tok -> F.Group -> Diag
+belowLoosestDiag d u g =
+  diag
+    (spanOf u)
+    (belowWhat d.ops u
+     ^ " is the loosest operator, below every other, declared `below` with nothing after it"
+     ^ declaredAt g.at)
+
+-- | an operator declared below one of a group below all: the bottom has
+-- | nothing below it
+belowLoosest : F.Fixities -> FixDecl -> L.Tok -> Maybe Diag
+belowLoosest scope d u =
+  mapMaybeG (\g -> belowLoosestDiag d u g) (F.loosestGroup scope u.text)
+
 noGroup : F.Fixities -> L.Tok -> Bool
 noGroup scope u = case F.groupOf scope u.text of
   Just _ -> False
@@ -1735,14 +1782,16 @@ fixDiagsOf scope all d =
              (\(u : L.Tok) -> noGroup scope u)
              (appendS d.above d.below)))
        (appendS
-          (if List.length d.ops == 0
-             then Cons
-                 (diag
-                    d.span
-                    "a fixity declaration names its operators: `infixl + -`")
-                 Nil
-           else Nil)
-          (appendS d.errors (cycleDiag all d))))
+          (catMaybesS (List.map (\u -> belowLoosest scope d u) d.below))
+          (appendS
+             (if List.length d.ops == 0
+                then Cons
+                    (diag
+                       d.span
+                       "a fixity declaration names its operators: `infixl + -`")
+                    Nil
+              else Nil)
+             (appendS d.errors (cycleDiag all d)))))
 
 type FixRead = { fixities : F.Fixities, diags : List Diag }
 
@@ -1767,24 +1816,25 @@ fixityDone imported decls groups =
        (edgesOf (F.union imported { groups = groups, above = Nil }))
        decls)
 
-fixityFrom : F.Fixities -> List FixDecl -> FixRead
-fixityFrom imported decls =
+fixityFrom : String -> F.Fixities -> List FixDecl -> FixRead
+fixityFrom place imported decls =
   fixityDone
     imported
     decls
     (catMaybesS
        (List.map
-          groupOfDecl
+          (\d -> groupOfDecl place d)
           (List.filter (\(d : FixDecl) -> not (List.length d.ops == 0)) decls)))
 
--- | the fixity declarations of a file, read before the rest
-fixityDecls : F.Fixities -> Array L.Tok -> FixRead
-fixityDecls imported ts = fixityFrom imported (fixDecls ts 0 Nil)
+-- | the fixity declarations of a file, read before the rest (`place`: the
+-- | file, said, `by prelude, at lib/prelude.hf`; else nothing)
+fixityDecls : String -> F.Fixities -> Array L.Tok -> FixRead
+fixityDecls place imported ts = fixityFrom place imported (fixDecls ts 0 Nil)
 
 -- | a text's own fixities, read without the rest of it
 fixitiesOfText : F.Fixities -> String -> F.Fixities
 fixitiesOfText imported src =
-  (fixityDecls imported (A.fromList (L.lex src).tokens)).fixities
+  (fixityDecls "" imported (A.fromList (L.lex src).tokens)).fixities
 
 -- The program loop
 --------------------------------------------------------------------------------
@@ -1848,7 +1898,14 @@ progGo cs s items diags broken =
 -- Entry points
 --------------------------------------------------------------------------------
 
-type Options = { known : String -> Bool, fixities : F.Fixities, lenient : Bool }
+-- | `place`: the file, said, `by prelude, at lib/prelude.hf` (where its
+-- | fixities are declared, said with the line)
+type Options =
+  { known : String -> Bool
+  , fixities : F.Fixities
+  , lenient : Bool
+  , place : String = ""
+  }
 
 type Read =
   { decls : List Notation.Decl
@@ -1902,7 +1959,7 @@ readRun o toks lexDiags declared own =
 
 readToks : Options -> Array L.Tok -> Array C.T -> List Diag -> Read
 readToks o ltoks toks lexDiags =
-  readRun o toks lexDiags (prescan ltoks) (fixityDecls o.fixities ltoks)
+  readRun o toks lexDiags (prescan ltoks) (fixityDecls o.place o.fixities ltoks)
 
 readLexed : Options -> L.Lexed -> Read
 readLexed o l =
