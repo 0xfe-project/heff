@@ -390,10 +390,12 @@ const installedHeff = (...args) => spawnSync(join(heffHome, "bin", "heff"), args
 write("uses-prelude.hf", "import prelude\n\nxs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n");
 const selfChecked = installedHeff("check", "uses-prelude.hf");
 const selfInit = installedHeff("init", "fromhome");
+const selfVersion = installedHeff("version");
 expect("install heff: the heff in the heff home, with its library and its version", selfInstalled.status === 0 &&
   selfInstalled.stdout.includes(`installed ${join(heffHome, "lib")}\n`) && selfInstalled.stdout.includes(`installed ${join(heffHome, "package.hf")}\n`) &&
   selfChecked.status === 0 && selfChecked.stdout.includes("xs : List Int") &&
-  selfInit.status === 0 && readFileSync(join(work, "fromhome", "package.hf"), "utf8").includes(`heff = "${version}"`), [selfInstalled, selfChecked, selfInit]);
+  selfInit.status === 0 && readFileSync(join(work, "fromhome", "package.hf"), "utf8").includes(`heff = "${version}"`) &&
+  selfVersion.status === 0 && selfVersion.stdout === `heff ${version}\n`, [selfInstalled, selfChecked, selfInit, selfVersion]);
 
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

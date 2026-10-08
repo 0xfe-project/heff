@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // The command line: `promote` writes each watch's value under it, `test`
 // runs the tests (lib/check.hf) and shrinks what fails, `fmt`
-// lays files out in place (with `--check`, only names them), and the
-// usage, the completions and an unknown command say what they should, on
-// the right stream, with the right exit status.
+// lays files out in place (with `--check`, only names them), `version`
+// says which heff runs, and the usage, the completions and an unknown
+// command say what they should, on the right stream, with the right exit
+// status.
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { basename, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { heffBin } from "./heff.mjs";
 
@@ -107,7 +108,7 @@ expect("fmt by imported fixities", cut.status === 0 && readFileSync(join(work, "
 // the usage: asked for, on stdout; for what is no command, on stderr,
 // failing; a command's own help, asked for; its words wrong, what is wrong
 // and how it is called, on stderr
-const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "build", "install", "publish", "lsp", "help", "completions"];
+const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "build", "install", "publish", "lsp", "version", "help", "completions"];
 for (const args of [[], ["help"], ["--help"]]) {
   const r = heff(...args);
   expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND ...\n") &&
@@ -136,6 +137,25 @@ for (const args of [["help", "compile"], ["compile", "--help"], ["compile", "a.h
     r.stdout.startsWith("usage: heff compile FILE OUT [--name NAME] --backend=MODE\n") &&
     r.stdout.includes("\n  -b, --backend=MODE") && r.stdout.includes("(esm, page, node, c)"), r);
 }
+
+// version: the heff running, as the package.hf it came with says (the
+// repository's, or one beside its bin/); with none there, or one that
+// does not read, not known, and where it looked said
+const version = /heff = "([^"]*)"/.exec(readFileSync(join(root, "package.hf"), "utf8"))[1];
+const versionSaid = heff("version");
+expect("version", versionSaid.status === 0 && versionSaid.stdout === `heff ${version}\n`, versionSaid);
+mkdirSync(join(work, "lone", "bin"), { recursive: true });
+const lone = join(work, "lone", "bin", basename(heffBin));
+copyFileSync(heffBin, lone);
+chmodSync(lone, 0o755);
+const lonePkg = join(realpathSync(join(work, "lone")), "package.hf");
+const noPkg = spawnSync(lone, ["version"], { cwd: work, encoding: "utf8" });
+expect("version, no package.hf", noPkg.status === 1 && noPkg.stdout === "" &&
+  noPkg.stderr === `heff version: not known: there is no ${lonePkg}\n`, noPkg);
+writeFileSync(join(work, "lone", "package.hf"), "package = 1\n");
+const badPkg = spawnSync(lone, ["version"], { cwd: work, encoding: "utf8" });
+expect("version, a package.hf that does not read", badPkg.status === 1 && badPkg.stdout === "" &&
+  badPkg.stderr.startsWith(`heff version: not known: ${lonePkg}:1:11: `), badPkg);
 
 // what a word completes to: the commands, a command's flags, a flag's
 // values, its files

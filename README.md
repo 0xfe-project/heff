@@ -71,6 +71,7 @@ heff init [DIR]                # a new project: a module, a program, a test
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
 heff lsp                       # the language server, on stdio
+heff version                   # which heff this is
 heff help [COMMAND]            # the commands, or a command's flags
 heff completions SHELL         # fish, bash or zsh completions
 ```
