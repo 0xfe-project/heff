@@ -11,10 +11,10 @@
 // Int a word (`INT_OF`, `MK_INT`) or big, an Int64 and a UInt64 as an Int
 // is, an integer of a fixed-width type of up to 32 bits a word of its
 // value, a Float32 a word of its bits (`heff_f32_of`, `heff_f32`), a Float
-// boxed (`FLT_OF`, `heff_flt`).  It is bundled after lib/c/runtime.c,
-// whose functions it uses -- among them the world's, which hold what
-// every provider hands out (`heff_hold`, `heff_held`, `heff_release`:
-// lib/std/handle.hf says how).
+// boxed (`FLT_OF`, `heff_flt`); a Rune is a word of its code point.  It
+// is bundled after lib/c/runtime.c, whose functions it uses -- among
+// them the world's, which hold what every provider hands out
+// (`heff_hold`, `heff_held`, `heff_release`: lib/std/handle.hf says how).
 
 // (the lines std.progress draws on the terminal, once there are any:
 // what is written clears them first, and they come back below it --

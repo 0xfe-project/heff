@@ -269,6 +269,42 @@ of its bits (`heff_f32_of`, `heff_f32`), and a `Float` is boxed
 beyond 62 bits (as an `Int` is), costs an allocation each value, where
 an integer of up to 32 bits and a `Float32` cost none.
 
+## Runes
+
+A `Rune` is a code point of Unicode, a 32-bit value, as Go's `rune` is.
+A rune literal is a `'` where a token starts (in a name, as `x'`, a `'`
+is a prime), one character, and a `'`: `'a'`, `'é'`, `'😀'`; or an
+escape, a string's (`'\n'`, `'\t'`, `'\r'`, and `\` before any other
+character that character, `'\''`, `'\\'`) or a code point in
+hexadecimal, `'\u{1F600}'`.  It is a Unicode scalar value, from U+0000
+to U+10FFFF but the surrogates (`'\u{D800}'` is an error), and a
+`Rune` whatever it is checked at: an integer literal is no rune, nor a
+rune literal an integer.  A rune literal is a pattern too, compared by
+code point.  The prelude takes a string apart into its runes,
+`runes : String -> List Rune`, and puts them together again, `ofRunes`;
+a string is UTF-16 on every backend, so a rune beyond U+FFFF is a
+surrogate pair in it, and a surrogate not in a pair is read as U+FFFD.
+
+```haskell
+import rune as R
+
+initials : String -> String
+initials s = ofRunes (List.map R.toUpper (List.take 2 (runes s)))
+
+-- >>> initials "héllo"
+-- "Hé"
+```
+
+The module `rune` (`import rune as R`) has their comparisons (`eq`,
+`compare`, and `==` to `>=` for a module that imports it as it is),
+`toInt` and `fromInt` (which wraps an integer around to 32 bits, as Go's
+`rune(n)` does: a rune may be no scalar value, `isValid` says, and is
+U+FFFD, `replacement`, in a string made of it), `toString`, `show`
+(`"'a'"`), and ASCII's classes and cases: `isDigit`, `isAlpha`,
+`isSpace`, `isUpper`, `toUpper` and the like (`isAlpha 'é'` is
+`False`).  A provider is given a rune as a number in JavaScript, and in
+C as a word of its code point (`INT_OF`, `MK_INT`).
+
 ## Effects
 
 `lib/co.hf` implements effects after Yang and Wu (POPL 2026).  A program
@@ -322,7 +358,8 @@ an error -- `import prelude`, or one written twice -- but
 their names: `co`, `state`, `exn`, `parallel`, `array`,
 `map`, `set`, and `manifest` (the types of `package.hf` and
 `build.hf`); the fixed-width numbers' are `int8` to `int64`, `uint8` to
-`uint64` and `float32`, and `int` has an `Int`'s bits.  The batteries
+`uint64` and `float32`, `int` has an `Int`'s bits, and `rune` a
+`Rune`'s operations.  The batteries
 ship with it, under `lib/std/`: `std.io` (the standard streams),
 `std.filesystem`, `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one

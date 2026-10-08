@@ -34,8 +34,11 @@ const keywords = new Set(
 // eight at most; not in a comment, a string or an import), the file's
 // start, and an offset that is no number
 const offsetsIn = (f) => {
-  // (a string's words are no names: blanked, its length kept)
-  const src = readFileSync(join(root, f), "utf8").replace(/"(?:[^"\\\n]|\\.)*"/g, (s) => " ".repeat(s.length));
+  // (a string's words are no names, nor a rune literal's: blanked, its
+  // length kept)
+  const src = readFileSync(join(root, f), "utf8")
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, (s) => " ".repeat(s.length))
+    .replace(/(?<![A-Za-z0-9_'])'(?:[^'\\\n]|\\u\{[0-9A-Fa-f]+\}|\\.)'/gu, (s) => " ".repeat(s.length));
   const starts = [];
   for (const m of src.matchAll(/(?<![A-Za-z0-9_'])[A-Za-z_][A-Za-z0-9_']*/g)) {
     const before = src.slice(src.lastIndexOf("\n", m.index) + 1, m.index).trimStart();

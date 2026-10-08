@@ -30,19 +30,22 @@ const formats = (what, src, want) => {
   if (want !== undefined) expect(what, r.out === want, r.out);
 };
 
-// (but those that do not parse on purpose, which are left)
-const unparsed = ["test/errors/recover.hf"];
+// (but those that do not parse, or lex, on purpose, which are left)
+const unparsed = ["test/errors/recover.hf", "test/errors/rune-literals.hf"];
 const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
   // (the index may still list a file the working copy has removed)
   .filter((f) => existsSync(join(root, f)));
 for (const f of files) {
   const src = readFileSync(join(root, f), "utf8");
   if (!unparsed.includes(f)) formats(f, src);
-  else { const r = run(src); expect(f + " is left", !r.ok && r.why.includes("does not parse"), JSON.stringify(r)); }
+  else { const r = run(src); expect(f + " is left", !r.ok && /does not (parse|lex)/.test(r.why), JSON.stringify(r)); }
 }
 
 formats("spacing", "data Bool = True | False\nnot : Bool -> Bool\nnot   True =    False\nnot False = True\n",
   "data Bool = True | False\nnot : Bool -> Bool\nnot True = False\nnot False = True\n");
+
+formats("rune literals, as written", "x : List Rune\nx = ['\\u{41}',   '😀', '\\'',x' ]\n",
+  "x : List Rune\nx = ['\\u{41}', '😀', '\\'', x']\n");
 
 formats("blank lines, at most one", "data Bool = True | False\n\n\n\nx : Bool\n\nx = True\n",
   "data Bool = True | False\n\nx : Bool\n\nx = True\n");
