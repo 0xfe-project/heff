@@ -204,11 +204,15 @@ for (const [line, words, want] of [
   const r = bashOffers(line, words);
   expect(`bash completes ${JSON.stringify(line)}`, r.status === 0 && JSON.stringify(r.stdout.trim().split("\n").filter(Boolean)) === JSON.stringify(want), r);
 }
-// (fish and zsh, where they are)
+// (fish and zsh, where they are.  fish reads no one's configuration
+// (`--no-config`): a config.fish, or its universal variables
+// (`fish_user_paths`), put another heff on the PATH before this one --
+// ~/.heff/bin's, which is not what is tested, and which `heff install`
+// writing it leaves nothing that runs for a while)
 const fishThere = spawnSync("fish", ["--version"]).error === undefined;
 if (fishThere) {
   writeFileSync(join(work, "comp.fish"), heff("completions", "fish").stdout);
-  const fishOffers = (line) => spawnSync("fish", ["-c", `source comp.fish; complete -C ${JSON.stringify(line)}`], { cwd: work, env, encoding: "utf8" });
+  const fishOffers = (line) => spawnSync("fish", ["--no-config", "-c", `source comp.fish; complete -C ${JSON.stringify(line)}`], { cwd: work, env, encoding: "utf8" });
   for (const [line, want] of [
     ["heff comp", ["compile", "completions"]],
     ["heff compile a.hf --backend=", ["--backend=esm", "--backend=page", "--backend=node", "--backend=c"]],
