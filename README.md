@@ -199,10 +199,12 @@ under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one
 effect hands out and another takes), `std.path`, `std.cli` (command
-lines), `std.doc` (documents laid out) and `std.progress` (what a
-program is doing, drawn on a terminal).  An effect's JavaScript side
-is in `M.provider.js` beside `M.hf`, its C side in `M.provider.c`; the
-things they hand out the world holds for them all.
+lines), `std.doc` (documents laid out), `std.progress` (what a
+program is doing, drawn on a terminal) and `std.math` (a float's
+functions: `sin`, `atan2`, `exp`, `log`, `pow`, `round`, `pi`, `e` and
+the like).  An effect's JavaScript side is in `M.provider.js` beside
+`M.hf`, its C side in `M.provider.c`; the things they hand out the
+world holds for them all.
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.
