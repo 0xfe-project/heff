@@ -6,10 +6,11 @@
 // 62 bits and a sign); its low bits `10`, a tag with no fields (`id << 2
 // | 2`); otherwise it points to an object, whose header says what it
 // is.  Tags are numbered (`TAG_x`), the ones the runtime knows first
-// (below), the program's after them; record labels too (`LBL_x`), a
-// record's fields in the order it was written with them.  Strings are
-// UTF-16 code units, as JavaScript's are, so that what a program
-// computes with them is what the other backends compute.
+// (below), the program's after them, each by a hash of its name; record
+// labels too (`LBL_x`), a record's fields in the order it was written
+// with them.  Strings are UTF-16 code units, as JavaScript's are, so
+// that what a program computes with them is what the other backends
+// compute.
 //
 // An object is counted (Perceus): each owner of it holds a reference,
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
@@ -1278,8 +1279,18 @@ static V heff_nomatch(V s) {
 // the file printed as the tests print JavaScript's, test/load-js.mjs)
 // ---------------------------------------------------------------------
 
-HEFF_VAR(const char **heff_tag_names);
-HEFF_VAR(const char **heff_lbl_names);
+// (the names of the tags and labels, each by its number: a tag's and a
+// label's number is a hash of its name, src/heff/emitc.hf)
+typedef struct { uint32_t id; const char *name; } HeffName;
+HEFF_VAR(const HeffName *heff_tag_names);
+HEFF_VAR(int heff_ntag_names);
+HEFF_VAR(const HeffName *heff_lbl_names);
+HEFF_VAR(int heff_nlbl_names);
+
+static const char *heff_name_of(const HeffName *t, int n, uint32_t id) {
+  for (int i = 0; i < n; i++) if (t[i].id == id) return t[i].name;
+  return "?";
+}
 
 typedef struct { char *s; size_t n, cap; } Buf;
 
@@ -1502,7 +1513,7 @@ static void heff_show(Buf *b, V v, int arg) {
       buf_str(b, "{ ");
       for (int64_t i = 0; i < r->n; i++) {
         if (i) buf_str(b, ", ");
-        buf_str(b, heff_lbl_names[r->lbl[i]]);
+        buf_str(b, heff_name_of(heff_lbl_names, heff_nlbl_names, r->lbl[i]));
         buf_str(b, " = ");
         heff_show(b, r->f[i], 0);
       }
@@ -1512,7 +1523,7 @@ static void heff_show(Buf *b, V v, int arg) {
     default: buf_str(b, "#fun"); return;
     }
   }
-  const char *name = heff_tag_names[tag];
+  const char *name = heff_name_of(heff_tag_names, heff_ntag_names, (uint32_t)tag);
   if (n && arg) buf_str(b, "(");
   buf_str(b, name);
   for (int i = 0; i < n; i++) { buf_str(b, " "); heff_show(b, fs[i], 1); }

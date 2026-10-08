@@ -167,6 +167,50 @@ numbered n (Cons x xs) m =
   if M.member compareString x m then numbered n xs m
   else numbered (n + 1) xs (M.insert compareString x n m)
 
+-- A tag's number, and a label's, is by its name, not by what other
+-- tags and labels the program has: a hash of the name (the next number
+-- free, if another took it), so that a tag added does not number the
+-- others again.  Tags are numbered past those the runtime knows, below
+-- 2^16 (an object keeps its tag in 16 bits); labels below 2^31.
+
+-- (a text's hash, below `m`)
+hashBelow : String -> Int -> Int -> Int -> Int
+hashBelow t m i a =
+  if i >= strLength t then a
+  else hashBelow t m (i + 1) ((a * 31 + charCode t i + 1) % m)
+
+-- (the number `h` or, if taken, the next free after it)
+slotFrom : Int -> Int -> Int -> M.Map Int Unit -> Int
+slotFrom base m h taken =
+  if M.member compareInt (base + h) taken
+    then slotFrom base m ((h + 1) % m) taken
+  else base + h
+
+-- (each name, in order, numbered at its hash past `base`, below `base + m`)
+hashedGo : Int
+         -> Int
+         -> List String
+         -> M.Map String Int
+         -> M.Map Int Unit
+         -> M.Map String Int
+hashedGo base m Nil names taken = names
+hashedGo base m (Cons x xs) names taken =
+  if M.member compareString x names then hashedGo base m xs names taken
+  else hashedGo
+      base
+      m
+      xs
+      (M.insert
+         compareString
+         x
+         (slotFrom base m (hashBelow x m 0 7) taken)
+         names)
+      (M.insert
+         compareInt
+         (slotFrom base m (hashBelow x m 0 7) taken)
+         MkUnit
+         taken)
+
 -- What emitting reads: the numbers, the definitions that are functions
 -- (by their arity) and those whose calls may give back a bounce
 --------------------------------------------------------------------------------
@@ -1562,17 +1606,18 @@ onceInOrder seen (Cons x xs) =
 usedOnce : List (Pair String String) -> List String
 usedOnce ps = onceInOrder M.empty (map snd (reverse ps))
 
--- | the names of what is numbered, in order (`heff_show`'s)
+-- | the names of what is numbered, each with its number (`heff_show`'s)
 namesTable : String -> M.Map String Int -> List String
 namesTable name m =
-  [ "static const char *"
+  [ "static const HeffName "
   ++ name
   ++ "[] = {"
   ++ joinWith
     ", "
     (map
-       (\p -> "\"" ++ fst p ++ "\"")
-       (sortBy (\a b -> snd a <= snd b) (M.toList m)))
+       (\p -> "{" ++ showInt (snd p) ++ ", \"" ++ fst p ++ "\"}")
+       (M.toList m))
+  ++ (if M.size m == 0 then "{0, NULL}" else "")
   ++ "};"
   ]
 
@@ -1638,7 +1683,9 @@ checkEnd exports defs ce =
              ++ showInt (length (filter (\p -> definedIn defs (snd p)) exports))
              ++ ";"
              , "  heff_tag_names = heff_tag_names_arr;"
+             , "  heff_ntag_names = " ++ showInt (M.size ce.tags) ++ ";"
              , "  heff_lbl_names = heff_lbl_names_arr;"
+             , "  heff_nlbl_names = " ++ showInt (M.size ce.lbls) ++ ";"
              , "}"
              , ""
              ])))
@@ -1851,25 +1898,30 @@ sortedOnce xs =
 ceOf : List Em.Provider -> List I.Def -> Pair (List String) (List String) -> CE
 ceOf provs defs names =
   { tags =
-      numbered
-        0
-        (concatList
-           knownTags
-           (concatList
-              (fst names)
-              (concatMap
-                 (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil)
-                 provs)))
+      hashedGo
+        10
+        65526
+        (sortedOnce
+           (filter
+              (\t -> not (elemS t knownTags))
+              (concatList
+                 (fst names)
+                 (concatMap
+                    (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil)
+                    provs))))
+        (numbered 0 knownTags M.empty)
         M.empty
   , lbls =
-      numbered
+      hashedGo
         0
+        2147483647
         (sortedOnce
            (concatList
               (snd names)
               (concatMap
                  (\(p : Em.Provider) -> namesInGo "LBL_" p.text 0 Nil)
                  provs)))
+        M.empty
         M.empty
   , funs = foldl arityOne M.empty defs
   , bounce = Em.bouncing defs
@@ -1928,27 +1980,34 @@ cloDecl l = case indexOf " =" l of
   Just at -> "extern Clo " ++ strSlice l 11 at ++ ";"
   Nothing -> l
 
--- (heff.h, which every part includes: the program's names (its tags and
--- labels) and the runtime -- what each part declares and defines for
--- itself is in it, so that heff.h is the same after most changes, and
--- a part changed does not make every part be built again)
-partHead : String -> Ending -> CE -> List String
-partHead runtime ending ce =
+-- (heff.h, which every part includes: the runtime -- what each part
+-- declares and defines for itself, the numbers of the tags and labels
+-- it uses too, is in it, so that heff.h is the same whatever the
+-- program, and a part changed does not make every part be built again)
+partHead : String -> Ending -> List String
+partHead runtime ending =
   concatList
     (Cons "// Generated from Hippogriff; do not edit." Nil)
-    (concatList
-       ending.prefix
-       (concatList
-          (map
-             (\p -> "#define " ++ tagName (fst p) ++ " " ++ showInt (snd p))
-             (filter (\p -> not (elemS (fst p) knownTags)) (M.toList ce.tags)))
-          (concatList
-             (map
-                (\p -> "#define " ++ lblName (fst p) ++ " " ++ showInt (snd p))
-                (M.toList ce.lbls))
-             (concatList
-                (Cons runtime Nil)
-                (Cons "V heff_perform(V p, V k);" Nil)))))
+    (concatList ending.prefix [runtime, "V heff_perform(V p, V k);"])
+
+-- (the numbers of the tags and labels a part uses)
+numbersOf : CE -> Pair (List String) (List String) -> List String
+numbersOf ce (MkPair ts ls) =
+  concatList
+    (map
+       (\t ->
+          "#define "
+          ++ tagName t
+          ++ " "
+          ++ showInt (fromMaybe 0 (M.lookup compareString t ce.tags)))
+       (filter (\t -> not (elemS t knownTags)) (sortedOnce ts)))
+    (map
+       (\l ->
+          "#define "
+          ++ lblName l
+          ++ " "
+          ++ showInt (fromMaybe 0 (M.lookup compareString l ce.lbls)))
+       (sortedOnce ls))
 
 -- (a definition, declared to a part that uses it: a function's code,
 -- entry and closure, a value's getter -- by its arity, not by its
@@ -2055,12 +2114,18 @@ modulePart head ce s shapes prims strs protos lams (MkPair m ps) =
        (concatList
           head
           (concatList
-             (map shapeDef (usedBy shapes ps))
+             (numbersOf
+                ce
+                (namesIn
+                   tagsLbls
+                   (map (\(p : Pair I.Def Emitted1) -> (fst p).body) ps)))
              (concatList
-                (concatMap primCloDef (usedBy prims ps))
+                (map shapeDef (usedBy shapes ps))
                 (concatList
-                   (concatMap (declOf ce) (sortedOnce (concatMap usesOf ps)))
-                   (concatMap (ownLines s strs protos lams) ps))))))
+                   (concatMap primCloDef (usedBy prims ps))
+                   (concatList
+                      (concatMap (declOf ce) (sortedOnce (concatMap usesOf ps)))
+                      (concatMap (ownLines s strs protos lams) ps)))))))
 
 -- | the part with the program's `main`, its worlds' providers and its
 -- | algebra: named, as `run$entry.c` is, as no module's part is -- a
@@ -2077,7 +2142,7 @@ partsWith : String
           -> List (Pair String String)
 partsWith runtime provs ending defs ce (MkPair ems s) =
   Cons
-    (MkPair "heff.h" (joinWith "\n" (partHead runtime ending ce)))
+    (MkPair "heff.h" (joinWith "\n" (partHead runtime ending)))
     (Cons
        (MkPair
           entryPart
@@ -2086,10 +2151,22 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
              (Cons
                 "#include \"heff.h\""
                 (concatList
-                   (declOf ce L.entryKey)
+                   (numbersOf
+                      ce
+                      (MkPair
+                         (concatMap
+                            (\(p : Em.Provider) ->
+                               namesInGo "TAG_" p.text 0 Nil)
+                            provs)
+                         (concatMap
+                            (\(p : Em.Provider) ->
+                               namesInGo "LBL_" p.text 0 Nil)
+                            provs)))
                    (concatList
-                      (map (\(p : Em.Provider) -> p.text) provs)
-                      (map pubLine (ending.end ce)))))))
+                      (declOf ce L.entryKey)
+                      (concatList
+                         (map (\(p : Em.Provider) -> p.text) provs)
+                         (map pubLine (ending.end ce))))))))
        (map
           (modulePart
              [ "// Generated from Hippogriff; do not edit."
