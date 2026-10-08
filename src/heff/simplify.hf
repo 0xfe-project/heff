@@ -26,18 +26,17 @@ data Plain = Inlined (List String) I.Expr | NotInlined
 
 -- | specialisation: every definition so far small enough to be copied
 -- | (those calling themselves too), those that are functions or records
--- | (whatever their size), the copies made (by what they were made
--- | for), those made for the definition at hand (the last first), how
--- | many there are, and the definitions whose copies are being made,
--- | one inside the other
+-- | (whatever their size); the copies asked for, each as it is known
+-- | (by its name), how deep in copies of copies each is, those made,
+-- | and how many were asked for; and whether no copy is asked for now
 type Specs =
   { all : M.Map String I.Expr
   , kinds : M.Map String Unit
-  , specs : M.Map String String
-  , made : List I.Def
+  , recipes : M.Map String I.Expr
+  , depths : M.Map String Int
+  , made : M.Map String Unit
   , count : Int
-  , within : List String
-  , trying : Int
+  , off : Bool
   }
 
 type St =
@@ -133,9 +132,6 @@ get = \s -> MkPair s s
 put : St -> M Unit
 put s' = \s -> MkPair MkUnit s'
 
-setFuel : Int -> M Unit
-setFuel f = \s -> MkPair MkUnit (withFuel f s)
-
 traverseS : {a b : Type} -> (a -> M b) -> List a -> M (List b)
 traverseS f Nil = pure Nil
 traverseS f (Cons x xs) = do
@@ -191,13 +187,14 @@ letsOf : List (Pair String I.Expr) -> I.Expr -> I.Expr
 letsOf Nil body = body
 letsOf (Cons (MkPair x a) rest) body = ELet x a (letsOf rest body)
 
--- (an attempt undone: the names drawn and the fuel burnt kept)
+-- (an attempt undone: the names drawn and the fuel burnt kept, and
+-- what was learnt of the copies asked for in it)
 restore : St -> St -> St
 restore saved st =
   { supply = st.supply
   , fuel = st.fuel
   , defs = saved.defs
-  , safe = saved.safe
+  , safe = st.safe
   , total = saved.total
   , plain = st.plain
   , sp = st.sp
@@ -223,31 +220,13 @@ known g = do
       else pure Nothing
     Nothing -> pure Nothing
 
--- | try an inlining: keep it if it is small enough
--- (inside an attempt, copies are not made, only those made taken: an
--- attempt is often undone, and the copies made for it with it.  The
--- second pass over a definition makes them where the first inlined)
-trying : Int -> M Unit
-trying d = \s ->
-    MkPair
-      MkUnit
-      (withSp
-         { all = s.sp.all
-         , kinds = s.sp.kinds
-         , specs = s.sp.specs
-         , made = s.sp.made
-         , count = s.sp.count
-         , within = s.sp.within
-         , trying = s.sp.trying + d
-         }
-         s)
-
+-- | try an inlining: keep it if it is small enough (a copy asked for
+-- | in it is only named: it is made after the definition, if what it
+-- | comes to calls it)
 attempt : I.Expr -> M I.Expr -> M I.Expr
 attempt orig m = do
   saved <- get
-  u0 <- trying 1
   e <- m
-  u1 <- trying (0 - 1)
   if not (I.sizeAbove (I.size orig + budget) e) then pure e
     else do
       -- (the names drawn stay drawn: no name is ever given out twice.
@@ -725,15 +704,24 @@ tagOfLam xs _ = Nothing
 -- a function or a record, a closed lambda or record) is called as a copy
 -- of it made for them: their parameters gone, the arguments in their
 -- place, the copy simplified with them (`e.hmap`, `hd.bind`, `r.simp`
--- known now: inlined, or calls of known definitions in turn).  A copy
--- is made once for each definition and arguments (alike up to the names
--- they bind, `Sp.key`), and comes just before the definition it was
--- first made for.  For a definition that calls itself, only the
--- parameters every call of itself hands on unchanged (`Sp.statics`):
--- its calls are of the copy then.
+-- known now: inlined, or calls of known definitions in turn).  For a
+-- definition that calls itself, only the parameters every call of
+-- itself hands on unchanged (`Sp.statics`): its calls are of the copy
+-- then.
+--
+-- A copy is the same whoever asks for it, and wherever: it is named by
+-- what it is made for (`Sp.copyName`, of its key, the known arguments
+-- shaped: `Sp.shapeOf`), and asked for by that name, which is all a
+-- call of it needs.  What is known of it (`knowing`) is what it is as
+-- asked for, simplified with no copy asked for in it: the same whoever
+-- asks.  (What making it comes to would be known, or not, by who asked
+-- first -- and not at all by a copy asked for while it is made.)  Each
+-- is made once in the program, after the definition that first calls
+-- it, as a definition is: with fuel of its own, the copies it calls for
+-- made in turn, each before what calls it.
 
 -- | the most that is made: the size of a known argument, of a definition
--- | copied, copies for one program, copies being made one inside another
+-- | copied, copies for one program, copies of copies one inside another
 specArgSize : Int
 specArgSize = 60
 
@@ -741,7 +729,7 @@ specBodySize : Int
 specBodySize = 1200
 
 specLimit : Int
-specLimit = 2000
+specLimit = 50000
 
 specDepth : Int
 specDepth = 16
@@ -810,49 +798,37 @@ substMarked (Cons m ms) (Cons x xs) (Cons a as) e =
   else substMarked ms xs as e
 substMarked _ _ _ e = pure e
 
-pushSpec : String -> String -> M Unit
-pushSpec k h = \s ->
-    MkPair
-      MkUnit
-      (withSp
-         { all = s.sp.all
-         , kinds = s.sp.kinds
-         , specs = M.insert compareString k h s.sp.specs
-         , made = s.sp.made
-         , count = s.sp.count + 1
-         , within = Cons k s.sp.within
-         , trying = s.sp.trying
-         }
-         s)
+-- | the arguments a copy is asked for with: the marked ones shaped, the
+-- | literals taken out of them (`vars`, given `holes` where it is
+-- | called), each in order
+type Shapes = { args : List I.Expr, vars : List String, holes : List I.Expr }
+
+shapeCons : I.Expr -> List String -> List I.Expr -> Shapes -> Shapes
+shapeCons a vs hs rest =
+  { args = Cons a rest.args
+  , vars = appendL vs rest.vars
+  , holes = appendL hs rest.holes
+  }
+
+shapedTo : Sp.Shaped -> St -> Pair Sp.Shaped St
+shapedTo x s = MkPair x (withSupply x.n s)
+
+shapeOne : Bool -> I.Expr -> M Sp.Shaped
+shapeOne m a = \s ->
+    if m then shapedTo (Sp.shapeOf s.supply a) s
+    else MkPair { e = a, vars = Nil, holes = Nil, n = s.supply } s
+
+shapesOf : List Bool -> List I.Expr -> M Shapes
+shapesOf (Cons m ms) (Cons a as) = do
+  x <- shapeOne m a
+  rest <- shapesOf ms as
+  pure (shapeCons x.e x.vars x.holes rest)
+shapesOf _ as = pure { args = as, vars = Nil, holes = Nil }
 
 isKind : I.Expr -> Bool
 isKind (ELam _ _) = True
 isKind (ERecord _) = True
 isKind _ = False
-
--- | a copy known before it is simplified: what it is, as made (its
--- | parameters put in), so that in its own body -- a knot of judgments,
--- | each a call of another with the knot -- the knot is known, a record
--- | whose fields may be inlined and copies made for it
-preKnown : String -> I.Expr -> M Unit
-preKnown h b = \s ->
-    MkPair
-      MkUnit
-      (withSp
-         { all =
-             if not (I.sizeAbove specBodySize b)
-               then M.insert compareString h b s.sp.all
-             else s.sp.all
-         , kinds =
-             if isKind b then M.insert compareString h MkUnit s.sp.kinds
-             else s.sp.kinds
-         , specs = s.sp.specs
-         , made = s.sp.made
-         , count = s.sp.count
-         , within = s.sp.within
-         , trying = s.sp.trying
-         }
-         s)
 
 -- | a copy that is a function, or a value computing nothing, is safe
 -- | to use anywhere, as the definitions it was made from were
@@ -863,29 +839,42 @@ markSafe h b = \s ->
       MkUnit
       (if I.isValue b || pureIn s.safe s.total b then withSafe h s else s)
 
-popSpec : String -> I.Expr -> M Unit
-popSpec h b = \s ->
+-- | a copy asked for, as it is (`b0`, its parameters put in): what is
+-- | known of it, and how deep in copies of copies it is
+askedFor : String -> I.Expr -> Int -> M Unit
+askedFor h b0 d = \s ->
     MkPair
       MkUnit
       (withSp
-         { all = M.insert compareString h b s.sp.all
-         , kinds = M.insert compareString h MkUnit s.sp.kinds
-         , specs = s.sp.specs
-         , made = Cons (I.mkDef h h b) s.sp.made
-         , count = s.sp.count
-         , within = drop 1 s.sp.within
-         , trying = s.sp.trying
+         { all =
+             if not (I.sizeAbove specBodySize b0)
+               then M.insert compareString h b0 s.sp.all
+             else s.sp.all
+         , kinds =
+             if isKind b0 then M.insert compareString h MkUnit s.sp.kinds
+             else s.sp.kinds
+         , recipes = M.insert compareString h b0 s.sp.recipes
+         , depths = M.insert compareString h d s.sp.depths
+         , made = s.sp.made
+         , count = s.sp.count + 1
+         , off = s.sp.off
          }
          s)
 
--- | the copy's body: the parameters left, the calls of itself of it
-specBody : String -> String -> List Bool -> List I.Expr -> I.Expr -> M I.Expr
-specBody g h marks as (ELam xs1 b1) = do
-  b2 <- substMarked marks xs1 as (Sp.selfTo g h marks b1)
+-- | the copy's body: its literals and the parameters left, the calls of
+-- | itself of it
+specBody : String -> String -> List Bool -> Shapes -> I.Expr -> M I.Expr
+specBody g h marks sh (ELam xs1 b1) = do
+  b2 <-
+    substMarked
+      marks
+      xs1
+      sh.args
+      (Sp.selfTo g h (map (\v -> EVar v) sh.vars) marks b1)
   pure
-      (if null (keepParams marks xs1) then b2
-       else ELam (keepParams marks xs1) b2)
-specBody g h marks as lam1 = pure lam1
+      (if null (appendL sh.vars (keepParams marks xs1)) then b2
+       else ELam (appendL sh.vars (keepParams marks xs1)) b2)
+specBody g h marks sh lam1 = pure lam1
 
 -- Arity
 --------------------------------------------------------------------------------
@@ -972,32 +961,158 @@ markedOf (Cons m ms) (Cons a as) =
   if m then Cons a (markedOf ms as) else markedOf ms as
 markedOf _ _ = Nil
 
--- | a copy made, named `h`: simplified with fuel of its own
-makeSpec : SK
-         -> String
-         -> List String
-         -> I.Expr
-         -> List I.Expr
-         -> List Bool
-         -> String
-         -> String
-         -> M I.Expr
-makeSpec r g xs b as marks k h = do
+maxI : Int -> Int -> Int
+maxI a b = if a >= b then a else b
+
+-- | how deep in copies of copies a copy of `g` for `args` is: one more
+-- | than the deepest copy among them
+depthOf : M.Map String Int -> String -> List I.Expr -> Int
+depthOf ds g args =
+  1
+  + foldl
+    (\d n -> maxI d (fromMaybe 0 (M.lookup compareString n ds)))
+    0
+    (Cons g (concatMap I.globalsIn args))
+
+-- What a definition is simplified with is its own: its fuel, and the
+-- calls found plain (`plain`), are made anew for each definition and
+-- each copy -- so that what it comes to depends on what it uses, not on
+-- what was simplified before it.
+
+-- (a definition's own: fuel, and no call found plain for another)
+ownSt : M Unit
+ownSt = \s ->
+    MkPair
+      MkUnit
+      { supply = s.supply
+      , fuel = 4000
+      , defs = s.defs
+      , safe = s.safe
+      , total = s.total
+      , plain = M.empty
+      , sp = s.sp
+      }
+
+-- (asking for copies off, or on again)
+setOff : Bool -> M Unit
+setOff o = \s ->
+    MkPair
+      MkUnit
+      (withSp
+         { all = s.sp.all
+         , kinds = s.sp.kinds
+         , recipes = s.sp.recipes
+         , depths = s.sp.depths
+         , made = s.sp.made
+         , count = s.sp.count
+         , off = o
+         }
+         s)
+
+-- (back to what `saved` was simplifying: its fuel, the calls it found
+-- plain, whether it asks for copies -- the rest learnt kept)
+backTo : St -> M Unit
+backTo saved = \s ->
+    MkPair
+      MkUnit
+      { supply = s.supply
+      , fuel = saved.fuel
+      , defs = s.defs
+      , safe = s.safe
+      , total = s.total
+      , plain = saved.plain
+      , sp =
+          { all = s.sp.all
+          , kinds = s.sp.kinds
+          , recipes = s.sp.recipes
+          , depths = s.sp.depths
+          , made = s.sp.made
+          , count = s.sp.count
+          , off = saved.sp.off
+          }
+      }
+
+-- | what a copy asked for is known by: what it is as asked for (`b0`),
+-- | simplified as a definition is but with no copy asked for in it --
+-- | its calls of itself, the definitions it is made with inlined, seen
+-- | -- so that it is the same whoever asks for it, and whatever was
+-- | made before
+knowing : SK -> I.Expr -> M I.Expr
+knowing r b0 = do
+  saved <- get
+  u <- ownSt
+  u1 <- setOff True
+  b1 <- r.simp b0
+  b2 <- r.simp b1
+  b3 <- raise b2
+  u2 <- backTo saved
+  pure b3
+
+-- | the copy named `h` asked for: if it was not before, what it is
+-- | known by kept (to make it from, too)
+ask : SK
+    -> String
+    -> List String
+    -> I.Expr
+    -> List Bool
+    -> Shapes
+    -> String
+    -> Int
+    -> M Unit
+ask r g xs b marks sh h d = do
   s <- get
-  u <- pushSpec k h
-  lam1 <- copy (ELam xs b)
-  body0 <- specBody g h marks as lam1
-  u1 <- preKnown h body0
-  u2 <- setFuel 4000
-  body1 <- r.simp body0
-  body2 <- r.simp body1
-  body3 <- raise body2
-  u3 <- setFuel s.fuel
-  u4 <- popSpec h body3
-  u5 <- markSafe h body3
-  -- (the copy called, and a copy of it made if it may be, for what it
-  -- takes now)
-  r.applyTo (EGlobal h) (Sp.dropAt marks as)
+  if M.member compareString h s.sp.recipes then pure MkUnit
+    else do
+      lam1 <- copy (ELam xs b)
+      b0 <- specBody g h marks sh lam1
+      b1 <- knowing r b0
+      u <- askedFor h b1 d
+      markSafe h b1
+
+-- (... named `h`, `d` deep in copies of copies)
+specNamed : SK
+          -> String
+          -> List String
+          -> I.Expr
+          -> List I.Expr
+          -> List Bool
+          -> Shapes
+          -> String
+          -> Int
+          -> M I.Expr
+specNamed r g xs b as marks sh h d =
+  if d > specDepth then pure (mkApp (EGlobal g) as)
+  else do
+    u <- ask r g xs b marks sh h d
+    -- (the copy called, and a copy of it asked for if it may be, for
+    -- what it takes now)
+    r.applyTo (EGlobal h) (appendL sh.holes (Sp.dropAt marks as))
+
+-- (a copy that would take nothing but the literals of what it is made
+-- for is not made: what it computes, once, would be computed at each
+-- call)
+specShaped : SK
+           -> String
+           -> List String
+           -> I.Expr
+           -> List I.Expr
+           -> List Bool
+           -> Shapes
+           -> M I.Expr
+specShaped r g xs b as marks sh = \s ->
+    if null (keepParams marks xs) && not (null sh.vars)
+      then MkPair (mkApp (EGlobal g) as) s
+    else specNamed
+        r
+        g
+        xs
+        b
+        as
+        marks
+        sh
+        (Sp.copyName g (specKey g marks sh.args))
+        (depthOf s.sp.depths g (markedOf marks sh.args))
+        s
 
 specMarked : SK
            -> String
@@ -1005,9 +1120,8 @@ specMarked : SK
            -> I.Expr
            -> List I.Expr
            -> List Bool
-           -> St
            -> M I.Expr
-specMarked r g xs b as marks s =
+specMarked r g xs b as marks =
   if not (any (\m -> m) marks)
   -- (a copy taking nothing is a value: calling itself, only where that
   -- is under a lambda -- a knot of judgments, `uk w ms uf` -- not one
@@ -1016,31 +1130,18 @@ specMarked r g xs b as marks s =
       && elemStr g (I.globalsIn b)
       && not (I.isValue b))
     then pure (mkApp (EGlobal g) as)
-  else case M.lookup compareString (specKey g marks as) s.sp.specs of
-    Just h -> r.applyTo (EGlobal h) (Sp.dropAt marks as)
-    Nothing ->
-      if s.sp.trying > 0 then pure (mkApp (EGlobal g) as)
-      else makeSpec
-          r
-          g
-          xs
-          b
-          as
-          marks
-          (specKey g marks as)
-          (Sp.copyName
-             g
-             (specKey g marks as)
-             (concatMap Sp.binders (markedOf marks as)))
+  else do
+    sh <- shapesOf marks as
+    specShaped r g xs b as marks sh
 
 specLam : SK -> String -> List String -> I.Expr -> List I.Expr -> M I.Expr
 specLam r g xs b as = do
   s <- get
-  if s.sp.count >= specLimit
-    || length s.sp.within >= specDepth
+  if s.sp.off
+    || s.sp.count >= specLimit
     || not (any (\a -> knownArg s.sp.kinds a) as)
       then pure (mkApp (EGlobal g) as)
-    else specMarked r g xs b as (marksOf s.sp.kinds g xs b as) s
+    else specMarked r g xs b as (marksOf s.sp.kinds g xs b as)
 
 -- | a call of a definition not inlined: of a copy of it, if one may be
 -- | made
@@ -1232,11 +1333,11 @@ recordAll key b s =
     , kinds =
         if isKind b then M.insert compareString key MkUnit s.sp.kinds
         else s.sp.kinds
-    , specs = s.sp.specs
+    , recipes = s.sp.recipes
+    , depths = s.sp.depths
     , made = s.sp.made
     , count = s.sp.count
-    , within = s.sp.within
-    , trying = s.sp.trying
+    , off = s.sp.off
     }
     s
 
@@ -1251,34 +1352,68 @@ recordDef key b = \s ->
          (if elemStr key (I.globalsIn b) then s
           else withDefs (M.insert compareString key b s.defs) s))
 
--- | the copies made for the definition at hand, in the order they were
--- | made, taken
-takeMade : M (List I.Def)
-takeMade = \s ->
+-- | the copy named `h` taken as made
+madeOne : String -> M Unit
+madeOne h = \s ->
     MkPair
-      (reverse s.sp.made)
+      MkUnit
       (withSp
          { all = s.sp.all
          , kinds = s.sp.kinds
-         , specs = s.sp.specs
-         , made = Nil
+         , recipes = s.sp.recipes
+         , depths = s.sp.depths
+         , made = M.insert compareString h MkUnit s.sp.made
          , count = s.sp.count
-         , within = s.sp.within
-         , trying = s.sp.trying
+         , off = s.sp.off
          }
          s)
 
--- | a definition simplified, after the copies made for it
+-- (the copy named `h`, as asked for, if it is not made yet)
+pendingOf : St -> String -> Maybe I.Expr
+pendingOf s h =
+  if M.member compareString h s.sp.made then Nothing
+  else M.lookup compareString h s.sp.recipes
+
+-- | a copy made: simplified as a definition is (from `b0`, what it is
+-- | known by), then the copies it calls for (`more`), before it
+makeOne : (List String -> M (List I.Def)) -> String -> I.Expr -> M (List I.Def)
+makeOne more h b0 = do
+  u <- madeOne h
+  u2 <- ownSt
+  b1 <- sk.simp b0
+  b2 <- sk.simp b1
+  b3 <- raise b2
+  deps <- more (I.globalsIn b3)
+  pure (appendL deps (Cons (I.mkDef h h b3) Nil))
+
+makeIf : (List String -> M (List I.Def))
+       -> String
+       -> Maybe I.Expr
+       -> M (List I.Def)
+makeIf more h (Just b0) = makeOne more h b0
+makeIf more h Nothing = pure Nil
+
+-- | the copies among `names` not made yet, made, each once in the
+-- | program, and each after those it calls for
+makeEach : List String -> M (List I.Def)
+makeEach Nil = pure Nil
+makeEach (Cons h rest) = do
+  s <- get
+  here <- makeIf makeEach h (pendingOf s h)
+  others <- makeEach rest
+  pure (appendL here others)
+
+-- | a definition simplified, after the copies it calls for
 oneDef : I.Def -> M (List I.Def)
 oneDef d = do
-  u <- setFuel 4000
+  u <- ownSt
   -- (twice: what the first pass exposes, the second reduces)
   b1 <- sk.simp d.body
   b2 <- sk.simp b1
   b <- raise b2
   u2 <- recordDef d.key b
   u3 <- markSafe d.key b
-  made <- takeMade
+  made <- makeEach (I.globalsIn b)
   pure (appendL made (Cons (I.mkDef d.key d.name b) Nil))
 
 type Simplified = { defs : List I.Def, supply : Int }
@@ -1287,23 +1422,8 @@ concatDefs : List (List I.Def) -> List I.Def
 concatDefs Nil = Nil
 concatDefs (Cons ds rest) = appendL ds (concatDefs rest)
 
--- (a copy made for two modules: the first's kept)
-onceOne : (M.Map String Unit -> List I.Def -> List I.Def)
-        -> M.Map String Unit
-        -> I.Def
-        -> List I.Def
-        -> List I.Def
-onceOne go seen d rest =
-  if M.member compareString d.key seen then go seen rest
-  else Cons d (go (M.insert compareString d.key MkUnit seen) rest)
-
-onceGo : M.Map String Unit -> List I.Def -> List I.Def
-onceGo seen Nil = Nil
-onceGo seen (Cons d rest) = onceOne onceGo seen d rest
-
 simplifyDone : Pair (List (List I.Def)) St -> Simplified
-simplifyDone (MkPair out st) =
-  { defs = onceGo M.empty (concatDefs out), supply = st.supply }
+simplifyDone (MkPair out st) = { defs = concatDefs out, supply = st.supply }
 
 initSt : Int -> SG -> St
 initSt n0 sg =
@@ -1316,86 +1436,19 @@ initSt n0 sg =
   , sp =
       { all = M.empty
       , kinds = M.empty
-      , specs = M.empty
-      , made = Nil
+      , recipes = M.empty
+      , depths = M.empty
+      , made = M.empty
       , count = 0
-      , within = Nil
-      , trying = 0
+      , off = False
       }
   }
-
--- What a module is simplified with is its own: the copies made for
--- it, and the calls found plain, are made anew at each module, not
--- taken from those made for the modules before it -- so that what a
--- module comes to depends on what it uses, not on what came before it.
-
--- (each module's own: no copy made, nor call found plain, for another)
-ownSt : M Unit
-ownSt = \s ->
-    MkPair
-      MkUnit
-      { supply = s.supply
-      , fuel = s.fuel
-      , defs = s.defs
-      , safe = s.safe
-      , total = s.total
-      , plain = M.empty
-      , sp =
-          { all = s.sp.all
-          , kinds = s.sp.kinds
-          , specs = M.empty
-          , made = s.sp.made
-          , count = 0
-          , within = s.sp.within
-          , trying = s.sp.trying
-          }
-      }
-
--- (the last `c` in `k` from `i` on, `at` if none)
-lastAt : String -> Int -> Int -> Int -> Int
-lastAt k c i at =
-  if i >= strLength k then at
-  else lastAt k c (i + 1) (if charCode k i == c then i else at)
-
-digitsFrom : String -> Int -> Bool
-digitsFrom s i =
-  i >= strLength s
-  || (charCode s i >= 48 && charCode s i <= 57 && digitsFrom s (i + 1))
-
--- (a lifted local definition's last part: `go$3`)
-liftedAt : String -> Int -> Bool
-liftedAt seg d = d > 0 && d + 1 < strLength seg && digitsFrom seg (d + 1)
-
-liftedSeg : String -> Bool
-liftedSeg seg = liftedAt seg (lastAt seg 36 0 (0 - 1))
-
--- (the module of `k`, its last dot at `at`)
-moduleAt : (String -> String) -> String -> Int -> String
-moduleAt go k at =
-  if at < 0 then k
-  else if liftedSeg (strSlice k (at + 1) (strLength k))
-    then go (strSlice k 0 at)
-  else strSlice k 0 at
-
--- | the module a definition is of: its key up to its last dot -- a
--- | lifted local definition's, the definition's it was lifted from
-moduleOfDef : String -> String
-moduleOfDef k = moduleAt moduleOfDef k (lastAt k 46 0 (0 - 1))
-
--- (each definition in order, anew at each module: `prev` the last's)
-simpDefs : String -> List I.Def -> M (List (List I.Def))
-simpDefs prev Nil = pure Nil
-simpDefs prev (Cons d rest) = do
-  u <- if strEq (moduleOfDef d.key) prev then pure MkUnit else ownSt
-  x <- oneDef d
-  xs <- simpDefs (moduleOfDef d.key) rest
-  pure (Cons x xs)
 
 -- | each definition, in order, simplified; what is inlined is taken
 -- | simplified already
 simplifyProgram : Int -> List I.Def -> Simplified
 simplifyProgram n0 defs =
-  simplifyDone (simpDefs "" defs (initSt n0 (safeGlobals defs)))
+  simplifyDone (traverseS (\d -> oneDef d) defs (initSt n0 (safeGlobals defs)))
 
 -- >>> map (\(d : I.Def) -> d.body) (simplifyProgram 0 [I.mkDef "f" "f" (EApp (ELam ["x"] (EVar "x")) [EInt 1])]).defs
 -- Cons (EInt 1) Nil
@@ -1407,3 +1460,8 @@ simplifyProgram n0 defs =
 -- between, so a loop can build the value
 -- >>> map (\(d : I.Def) -> d.body) (simplifyProgram 0 [I.mkDef "c" "c" (ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"])), I.mkDef "f" "f" (ELam ["z"] (EApp (EApp (EGlobal "c") [EPrimCall "add" [EVar "z"]]) [EApp (EGlobal "f") [EVar "z"]]))]).defs
 -- Cons (ELam (Cons "x" (Cons "y" Nil)) (ETag "Cons" (Cons (EVar "x") (Cons (EVar "y") Nil)))) (Cons (ELam (Cons "z" Nil) (ETag "Cons" (Cons (EPrimCall "add" (Cons (EVar "z") Nil)) (Cons (EApp (EGlobal "f") (Cons (EVar "z") Nil)) Nil)))) Nil)
+
+-- two arguments alike but for a number in them: one copy, the number
+-- given it where it is called
+-- >>> length (filter (\(d : I.Def) -> strEq (Sp.rootOf d.key) "m" && not (strEq d.key "m")) (simplifyProgram 0 [I.mkDef "m" "m" (ELam ["f", "xs"] (EMatch (EVar "xs") [MkArm "Nil" [] (ETag "Nil" []), MkArm "Cons" ["x", "r"] (ETag "Cons" [EApp (EVar "f") [EVar "x"], EApp (EGlobal "m") [EVar "f", EVar "r"]])])), I.mkDef "a" "a" (ELam ["us"] (EApp (EGlobal "m") [ELam ["u"] (EPrimCall "intAdd" [EVar "u", EInt 1]), EVar "us"])), I.mkDef "b" "b" (ELam ["vs"] (EApp (EGlobal "m") [ELam ["v"] (EPrimCall "intAdd" [EVar "v", EInt 2]), EVar "vs"]))]).defs)
+-- 1
