@@ -134,7 +134,7 @@ tagsLbls (EApp f as) = namesIn tagsLbls (Cons f as)
 tagsLbls (ELet _ a b) = namesIn tagsLbls [a, b]
 tagsLbls (ERecord fs) =
   withLbls (List.map fst fs) (namesIn tagsLbls (List.map snd fs))
-tagsLbls (EProj e l) = withLbls (Cons l Nil) (tagsLbls e)
+tagsLbls (EProj e l _) = withLbls (Cons l Nil) (tagsLbls e)
 tagsLbls (ETag t as) = withTags (Cons t Nil) (namesIn tagsLbls as)
 tagsLbls (EMatch s arms) =
   withTags (armTags arms) (namesIn tagsLbls (Cons s (List.map I.armBody arms)))
@@ -473,7 +473,7 @@ fvW bs ms (Cons (ELam xs b) rest) = fvW (List.append xs bs) ms (Cons b rest)
 fvW bs ms (Cons (EApp f as) rest) = fvW bs ms (Cons f (List.append as rest))
 fvW bs ms (Cons (ELet x a b) rest) = fvW (Cons x bs) ms (Cons a (Cons b rest))
 fvW bs ms (Cons (ERecord fs) rest) = fvW bs ms (I.pushFields fs rest)
-fvW bs ms (Cons (EProj e _) rest) = fvW bs ms (Cons e rest)
+fvW bs ms (Cons (EProj e _ _) rest) = fvW bs ms (Cons e rest)
 fvW bs ms (Cons (ETag _ as) rest) = fvW bs ms (List.append as rest)
 fvW bs ms (Cons (EMatch s arms) rest) =
   fvW
@@ -832,6 +832,42 @@ reuseVal r ce live (Cons ru (Cons (ETag t as) Nil)) = do
        ^ ")")
 reuseVal r ce live _ = pure "0"
 
+-- (a label's place among a shape's labels)
+indexIn : String -> Int -> List String -> Maybe Int
+indexIn l i Nil = Nothing
+indexIn l i (Cons k ks) = if strEq l k then Just i else indexIn l (i + 1) ks
+
+-- (field `i` of a record of `n` fields, read where it is: of a variable
+-- wanted after or lent, or of a definition's value, the field counted and
+-- the record not touched; otherwise the record consumed, the field taken
+-- over where it was the last reference (`heff_get_n`))
+fieldAt : CK -> CE -> List String -> I.Expr -> Int -> Int -> C String
+fieldAt r ce live (EVar x) i n =
+  pure
+    (if elemS x live || elemS x ce.borrowed
+       then "heff_dup(heff_rfield(" ^ cLocal x ^ ", " ^ showInt i ^ "))"
+     else "heff_get_n(" ^ cLocal x ^ ", " ^ showInt i ^ ", " ^ showInt n ^ ")")
+fieldAt r ce live (EGlobal g) i n =
+  pure ("heff_dup(heff_rfield(" ^ cGlobal g ^ "_get(), " ^ showInt i ^ "))")
+fieldAt r ce live e i n = do
+  v <- r.val ce live e
+  pure ("heff_get_n(" ^ v ^ ", " ^ showInt i ^ ", " ^ showInt n ^ ")")
+
+-- | a field: at its place, where the record's shape is known; else
+-- | looked for by its label (`heff_get`)
+projAt : CK
+       -> CE
+       -> List String
+       -> I.Expr
+       -> String
+       -> Int
+       -> Maybe Int
+       -> C String
+projAt r ce live e l n (Just i) = fieldAt r ce live e i n
+projAt r ce live e l n Nothing = do
+  v <- r.val ce live e
+  pure ("heff_get(" ^ v ^ ", " ^ lblName l ^ ")")
+
 valF : CK -> CE -> List String -> I.Expr -> C String
 valF r ce live (EVar x) = pure (varUse ce.borrowed live x)
 valF r ce live (EGlobal g) =
@@ -866,9 +902,8 @@ valF r ce live (ERecord fs) = do
        ^ ", "
        ^ argsArr vs
        ^ ")")
-valF r ce live (EProj e l) = do
-  v <- r.val ce live e
-  pure ("heff_get(" ^ v ^ ", " ^ lblName l ^ ")")
+valF r ce live (EProj e l sh) =
+  projAt r ce live e l (List.length sh) (indexIn l 0 sh)
 valF r ce live (EPrim p) = primLit p
 valF r ce live (EPrimCall p as) =
   if strEq p reusePrim then reuseVal r ce live as
@@ -1946,7 +1981,7 @@ onlyLent bor p (ELam _ b) = onlyLent bor p b
 onlyLent bor p (EApp f as) = List.all (onlyLent bor p) (Cons f as)
 onlyLent bor p (ELet _ a b) = onlyLent bor p a && onlyLent bor p b
 onlyLent bor p (ERecord fs) = List.all (\f -> onlyLent bor p (snd f)) fs
-onlyLent bor p (EProj e _) = onlyLent bor p e
+onlyLent bor p (EProj e _ _) = onlyLent bor p e
 onlyLent bor p (ETag _ as) = List.all (onlyLent bor p) as
 onlyLent bor p (EPrimCall _ as) = List.all (onlyLent bor p) as
 onlyLent bor p _ = True
@@ -1958,7 +1993,7 @@ buildsSize n (ELam _ b) = buildsSize n b
 buildsSize n (EApp f as) = List.any (buildsSize n) (Cons f as)
 buildsSize n (ELet _ a b) = buildsSize n a || buildsSize n b
 buildsSize n (ERecord fs) = List.any (\f -> buildsSize n (snd f)) fs
-buildsSize n (EProj e _) = buildsSize n e
+buildsSize n (EProj e _ _) = buildsSize n e
 buildsSize n (EMatch s arms) =
   buildsSize n s || List.any (\a -> buildsSize n (I.armBody a)) arms
 buildsSize n (ECall _ as) = List.any (buildsSize n) as
@@ -1978,7 +2013,7 @@ reuses p (ELam _ b) = reuses p b
 reuses p (EApp f as) = List.any (reuses p) (Cons f as)
 reuses p (ELet _ a b) = reuses p a || reuses p b
 reuses p (ERecord fs) = List.any (\f -> reuses p (snd f)) fs
-reuses p (EProj e _) = reuses p e
+reuses p (EProj e _ _) = reuses p e
 reuses p (ETag _ as) = List.any (reuses p) as
 reuses p (ECall _ as) = List.any (reuses p) as
 reuses p (EPrimCall _ as) = List.any (reuses p) as

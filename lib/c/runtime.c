@@ -397,6 +397,47 @@ HEFF_KNOWN V heff_clo_n(Fn fn, int arity, int64_t n, V *env) {
   return (V)c;
 }
 
+// Fields at their known place (#34): a record's fields are those of its
+// type that are not types, in the order the type has them (its shape),
+// so where the emitter knows the type -- src/heff/erase.hf gives each
+// projection its record's shape -- it reads a field at its place, not
+// looking for its label (`heff_get`).
+
+// (field `i`, the record not consumed)
+#define heff_rfield(v, i) (((Rec *)(v))->f[i])
+
+// (a record's fields but the `i`th dropped and its cell freed: for a
+// record of many fields, a call, not as many drops where it is read)
+#ifndef HEFF_FEW_FIELDS
+#define HEFF_FEW_FIELDS 2
+#endif
+static __attribute__((noinline)) void heff_rec_give(V v, int64_t i) {
+  Rec *r = (Rec *)v;
+  for (int64_t j = 0; j < r->n; j++)
+    if (j != i) heff_drop(r->f[j]);
+  heff_obj_free(r, sizeof(Rec) + r->n * sizeof(V));
+}
+
+// (field `i` of a record of `n` fields, the record consumed: its last
+// reference, the field taken over, the others dropped and its cell freed;
+// otherwise the field counted)
+HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
+  Rec *r = (Rec *)v;
+  V x = r->f[i];
+  if (r->h.rc == 1) {
+    if (n > HEFF_FEW_FIELDS) heff_rec_give(v, i);
+    else {
+      for (int64_t j = 0; j < n; j++)
+        if (j != i) heff_drop(r->f[j]);
+      heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
+    }
+  } else {
+    heff_dup(x);
+    if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+  }
+  return x;
+}
+
 // (a lambda's closure, holding `n`, given up where its body starts,
 // which takes what it holds (#26): its last reference, its shell freed;
 // otherwise each counted.  `n` is a constant where it is called)
