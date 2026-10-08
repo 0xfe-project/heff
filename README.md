@@ -148,7 +148,7 @@ main = program (io := \p -> InL p) (disk := \p -> InR p)
 says where it is, else it is the `lib/` the compiler came with: the
 repository's, a release's, or the heff home's (`heff install` puts it
 there).  Its modules are imported by their names: `builtin` (implicit
-in every module), `prelude`, `co`, `state`, `exn`, `par`, `array`,
+in every module), `prelude`, `co`, `state`, `exn`, `parallel`, `array`,
 `map`, `set`, and `manifest` (the types of `package.hf` and
 `build.hf`).  The batteries ship with it,
 under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
