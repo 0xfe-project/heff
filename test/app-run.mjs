@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // The example apps, compiled (`heff compile --backend=page`) and run on a pretend page: a DOM of
-// plain objects, events fired by hand, and time that passes when told to.
+// plain objects, events fired by hand, and time that passes when told to.  Each app is loaded
+// as `<script src>` loads it, a classic script (not a module) in the page's window.
 import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import { heffBin } from "./heff.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,27 +32,38 @@ const pretendDocument = (page) => ({
   evaluate: (q) => { const m = /^\/\/(\w+)\[@id='([\w-]+)'\]$/.exec(q); return { singleNodeValue: m ? byId(page, m[2], m[1]) : null }; },
 });
 let timers = [];
-globalThis.setTimeout = (f, ms) => { timers.push(f); };
 const tick = () => { const ts = timers; timers = []; for (const f of ts) f(); };
+// The page's window: its global scope, which a classic script's top-level definitions would
+// be part of.  `top` is the window's own and cannot be declared again (as a browser's
+// `window.top`); `name`, `status`, `self` and `parent` are the window's too.
+const pageWindow = (page) => {
+  const win = vm.createContext({ document: pretendDocument(page), setTimeout: (f, ms) => { timers.push(f); } });
+  vm.runInContext(`Object.defineProperty(globalThis, "top", { get: () => globalThis, configurable: false });
+Object.assign(globalThis, { self: globalThis, parent: globalThis, name: "", status: "" });`, win);
+  return win;
+};
 
 let failed = 0;
 const check = (what, got, want) => {
   if (got !== want) { failed++; console.log(`FAIL ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
-async function run(file, name, fill = () => {}) {
-  const out = join(work, `${name}.mjs`);
+// (an app, loaded into a window: whether it loads)
+const load = (win, out) => {
+  try { vm.runInContext(readFileSync(out, "utf8"), win, { filename: out }); return true; }
+  catch (e) { failed++; console.log(`FAIL loading ${out}: ${e}`); return false; }
+};
+function run(file, name, fill = () => {}) {
+  const out = join(work, `${name}.js`);
   const r = spawnSync(heffBin, ["compile", file, out, "--name", name, "--backend=page"], { encoding: "utf8" });
   if (r.status !== 0) { failed++; console.log(`FAIL heff compile --backend=page ${file}\n${r.stdout}${r.stderr}`); return null; }
   const page = new Node("body");
   fill(page);
-  globalThis.document = pretendDocument(page);
-  await import(pathToFileURL(out) + `?${Date.now()}`);
-  return page;
+  return load(pageWindow(page), out) ? page : null;
 }
 
 // (an element with an id, to be found: `#counter`, `#clock`)
 const withBox = (id) => (page) => { const d = new Node("div"); d.setAttribute("id", id); page.appendChild(d); };
-const counter = await run("examples/counter/counter.hf", "counter", withBox("counter"));
+const counter = run("examples/counter/counter.hf", "counter", withBox("counter"));
 if (counter) {
   const [label, plus, minus] = counter.children[0].children;
   check("counter at first", label.text, "count: 0");
@@ -59,7 +72,7 @@ if (counter) {
   minus.fire("click");
   check("counter after -1", label.text, "count: 2");
 }
-const clock = await run("examples/clock/clock.hf", "clock", withBox("clock"));
+const clock = run("examples/clock/clock.hf", "clock", withBox("clock"));
 if (clock) {
   const [label] = clock.children[0].children;
   check("clock at first", label.text, "0 ticks");
@@ -70,7 +83,7 @@ if (clock) {
 const withParagraphs = (page) => {
   for (const id of ["out", "log"]) { const p = new Node("p"); p.setAttribute("id", id); page.appendChild(p); }
 };
-const finder = await run("test/apps/select.hf", "finder", withParagraphs);
+const finder = run("test/apps/select.hf", "finder", withParagraphs);
 if (finder) {
   const [out, log] = finder.children;
   check("found by css", out.text, "found by css");
@@ -79,29 +92,45 @@ if (finder) {
 }
 // an app whose effect is a definition, `page = dom <+> (state Int)`
 const withOut = (page) => { const p = new Node("p"); p.setAttribute("id", "out"); page.appendChild(p); };
-const aliased = await run("test/apps/aliased.hf", "aliased", withOut);
+const aliased = run("test/apps/aliased.hf", "aliased", withOut);
 if (aliased) check("an effect by its definition", aliased.children[0].text, "42");
 // a world of the test's own beside the page's, each acting on what the
 // other's provider handed out: the world holds them for both (std.handle)
-const painted = await run("test/apps/paint.hf", "painted", withOut);
+const painted = run("test/apps/paint.hf", "painted", withOut);
 if (painted) {
   const [out] = painted.children;
   check("painted by another world", out.attrs.class, "red");
   check("its stamp, put on the page", out.children.map((c) => `${c.tag}: ${c.text}`).join(), "mark: stamped");
   check("found again, the same handle", out.attrs["data-same"], "yes");
 }
+// an app whose definitions have the names of the window's own
+const names = run("test/apps/names.hf", "names", withOut);
+if (names) check("the window's names, the app's", names.children[0].text, "top name status self parent");
 // the page's own input and paragraph (examples/greet/index.html)
 const greetPage = (page) => {
   const input = new Node("input"); input.setAttribute("id", "name"); input.value = "";
   const p = new Node("p"); p.setAttribute("id", "greeting");
   page.appendChild(input); page.appendChild(p);
 };
-const greet = await run("examples/greet/greet.hf", "greet", greetPage);
+const greet = run("examples/greet/greet.hf", "greet", greetPage);
 if (greet) {
   const [input, p] = greet.children;
   check("greet at first", p.text, "Hello, whoever you are.");
   input.value = "Ada"; input.fire("input");
   check("greet after typing", p.text, "Hello, Ada!");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, painted and greet run"}`);
+// two apps on one page, each keeping what it defines to itself
+const shared = new Node("body");
+withBox("counter")(shared);
+withBox("clock")(shared);
+const win = pageWindow(shared);
+if (counter && clock && load(win, join(work, "counter.js")) && load(win, join(work, "clock.js"))) {
+  const [label, plus] = shared.children[0].children;
+  const [ticks] = shared.children[1].children;
+  plus.fire("click");
+  tick();
+  check("two apps: the counter", label.text, "count: 1");
+  check("two apps: the clock", ticks.text, "1 ticks");
+}
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, painted, names and greet run, and counter and clock on one page"}`);
 process.exit(failed ? 1 : 0);
