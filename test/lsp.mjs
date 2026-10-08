@@ -124,6 +124,13 @@ try {
   const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 1, character: 9 } });
   const lengthItem = comp.result && comp.result.find((i) => i.label === "showInt");
   expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("Int -> String") && !comp.result.some((i) => i.label === "showFloat"), comp.result && comp.result.map((i) => i.label));
+  // a primitive the library declares (named by no alias: its key is its name)
+  const typingPrim = "x : Int\nx = intAd";
+  open("test/surface/lsp-complete-prim.hf", typingPrim);
+  await diagnosticsOf(uri("test/surface/lsp-complete-prim.hf"));
+  const pComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete-prim.hf") }, position: { line: 1, character: 9 } });
+  expect("completion of a primitive", pComp.result && pComp.result.some((i) => i.label === "intAdd" && i.detail === "Int -> Int -> Int"), pComp.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-complete-prim.hf") } });
   // the prelude, which no file writes an import of: its names in scope,
   // completed and hovered
   const unwritten = "b : Bool\nb = not True\n\nn : String\nn = showI";
