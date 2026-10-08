@@ -274,10 +274,11 @@ an integer of up to 32 bits and a `Float32` cost none.
 A `Rune` is a code point of Unicode, a 32-bit value, as Go's `rune` is.
 A rune literal is a `'` where a token starts (in a name, as `x'`, a `'`
 is a prime), one character, and a `'`: `'a'`, `'é'`, `'😀'`; or an
-escape, a string's (`'\n'`, `'\t'`, `'\r'`, and `\` before any other
-character that character, `'\''`, `'\\'`) or a code point in
-hexadecimal, `'\u{1F600}'`.  It is a Unicode scalar value, from U+0000
-to U+10FFFF but the surrogates (`'\u{D800}'` is an error), and a
+escape, as a string has them: `'\n'`, `'\t'`, `'\r'`, a code point in
+hexadecimal, `'\u{1F600}'`, and `\` before any other character that
+character, `'\''`, `'\\'`.  It is a Unicode scalar value, from U+0000
+to U+10FFFF but the surrogates (`'\u{D800}'` is an error, as it is in
+a string, where `"\u{1F600}"` is 😀 and `"\u{41}"` is `"A"`), and a
 `Rune` whatever it is checked at: an integer literal is no rune, nor a
 rune literal an integer.  A rune literal is a pattern too, compared by
 code point.  The prelude takes a string apart into its runes,

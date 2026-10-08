@@ -31,7 +31,7 @@ const formats = (what, src, want) => {
 };
 
 // (but those that do not parse, or lex, on purpose, which are left)
-const unparsed = ["test/errors/recover.hf", "test/errors/rune-literals.hf"];
+const unparsed = ["test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf"];
 const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
   // (the index may still list a file the working copy has removed)
   .filter((f) => existsSync(join(root, f)));
@@ -46,6 +46,9 @@ formats("spacing", "data Bool = True | False\nnot : Bool -> Bool\nnot   True =  
 
 formats("rune literals, as written", "x : List Rune\nx = ['\\u{41}',   '😀', '\\'',x' ]\n",
   "x : List Rune\nx = ['\\u{41}', '😀', '\\'', x']\n");
+
+formats("string escapes, as written", "x : String\nx =   \"\\u{41}\\u{1F600}\\u\\n\\\"\"\n",
+  "x : String\nx = \"\\u{41}\\u{1F600}\\u\\n\\\"\"\n");
 
 formats("blank lines, at most one", "data Bool = True | False\n\n\n\nx : Bool\n\nx = True\n",
   "data Bool = True | False\n\nx : Bool\n\nx = True\n");
