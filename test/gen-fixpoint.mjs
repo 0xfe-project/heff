@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // The compiler is its own fixed point: heff (built by scripts/build.mjs
-// from output/heff.d/, its C a file a module) compiles its own source --
-// loading its import closure itself -- to output/heff-gen.d/, which must
-// be output/heff.d/, file for file, byte for byte.
+// from output/heff.d/: heff.h, and a C file a module) compiles its own
+// source -- loading its import closure itself -- to output/heff-gen.d/,
+// which must be output/heff.d/, file for file, byte for byte.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { heff, heffBin, root } from "./heff.mjs";
@@ -15,7 +15,7 @@ if (!existsSync(heffBin) || !existsSync(built)) { console.log("FAIL gen-fixpoint
 const r = heff(["compile", "app/heff/main.hf", gen + "/", "--name", "main", "--backend=c"], { cwd: root });
 if (r.status !== 0) { console.log(`FAIL gen-fixpoint: the compiler refused its own source (status ${r.status}, signal ${r.signal}${r.error ? `, ${r.error}` : ""})\n${r.stdout}${r.stderr}`.split("\n").slice(0, 12).join("\n")); process.exit(1); }
 
-const files = (d) => readdirSync(d).filter((f) => f.endsWith(".c")).sort();
+const files = (d) => readdirSync(d).filter((f) => f.endsWith(".c") || f.endsWith(".h")).sort();
 const a = files(built), b = files(gen);
 if (a.join() !== b.join()) { console.log(`FAIL gen-fixpoint: other files: ${a.filter((f) => !b.includes(f)).concat(b.filter((f) => !a.includes(f))).join(", ")}`); process.exit(1); }
 let bytes = 0;
