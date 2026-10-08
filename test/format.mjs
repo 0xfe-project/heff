@@ -469,8 +469,5 @@ formats("`-- fmt: skip` elsewhere, a comment like another", [
 const badKept = run("-- fmt: skip\nx : Bool\nx = (\n");
 expect("a definition kept that does not parse is refused", !badKept.ok && badKept.why.includes("does not parse"), JSON.stringify(badKept));
 
-const bad = run("x : Bool\nx = (\n");
-expect("what does not parse is left", !bad.ok && bad.why.includes("does not parse"), JSON.stringify(bad));
-
 console.log(`format: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

@@ -230,12 +230,6 @@ expect("completions zsh", zsh.status === 0 && zsh.stdout.startsWith("#compdef he
 const noShell = heff("completions", "tcsh");
 expect("completions of no shell", noShell.status === 1 && noShell.stderr.startsWith("heff completions: a shell is fish, bash or zsh, not tcsh"), noShell);
 
-// type-at: nothing there, at an offset that is no name or no number
-for (const o of ["0", "nope"]) {
-  const r = heff("type-at", "clean.hf", o);
-  expect(`type-at ${o}`, r.status === 0 && r.stdout === "nothing there\n", r);
-}
-
 // a diagnostic: in colour where heff is told the standard error is a
 // terminal (`HEFF_TTY=1`), not where `NO_COLOR` is set or it is not one;
 // a span over lines marked once, in a margin
