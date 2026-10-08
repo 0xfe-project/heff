@@ -1,0 +1,445 @@
+-- Green threads whose scheduler is a handler of the language
+-- (heff_parallel's green.hf), with a log beside them, handled in the
+-- language too: threads take turns at `yield`, at a `recv` with nothing
+-- to take, and where they end, round robin, and each says what it does
+-- in the log.  A schedule's order, what it comes to, a deadlock, and
+-- many threads and switches: a heap of continuations, each step's rest
+-- called last.
+--
+--   spawn c        c is a thread of its own; this one goes on
+--   yield          the next thread's turn
+--   newChan        a channel of Ints
+--   send ch x      x put on ch (never waits)
+--   recv ch        the first on ch, waiting for one if there is none
+
+import co
+import map as M
+
+data GreenF (m : Type -> Type) x
+  = Spawn (m Unit) x
+  | Yield x
+  | NewChan (Int -> x)
+  | Send Int Int x
+  | Recv Int (Int -> x)
+
+green : HFunctor
+green =
+  { f = GreenF
+  , hfmap = \fm g p -> case p of
+      Spawn c x -> Spawn c (g x)
+      Yield x -> Yield (g x)
+      NewChan k -> NewChan (\n -> g (k n))
+      Send ch v x -> Send ch v (g x)
+      Recv ch k -> Recv ch (\v -> g (k v))
+  , hmap = \nt p -> case p of
+      Spawn c x -> Spawn (nt c) x
+      Yield x -> Yield x
+      NewChan k -> NewChan k
+      Send ch v x -> Send ch v x
+      Recv ch k -> Recv ch k
+  }
+
+spawn : {e : HFunctor} -> {{ev : green <: e}} -> Co e Unit -> Co e Unit
+spawn c = op (ev (Spawn c MkUnit)) val
+
+yield : {e : HFunctor} -> {{ev : green <: e}} -> Co e Unit
+yield = op (ev (Yield MkUnit)) val
+
+newChan : {e : HFunctor} -> {{ev : green <: e}} -> Co e Int
+newChan = op (ev (NewChan (\n -> n))) val
+
+send : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Co e Unit
+send ch v = op (ev (Send ch v MkUnit)) val
+
+recv : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Int
+recv ch = op (ev (Recv ch (\v -> v))) val
+
+-- the world beside: a log --------------------------------------------------------
+
+data LogF (m : Type -> Type) x = Say String x
+
+logging : HFunctor
+logging =
+  { f = LogF
+  , hfmap = \fm g p -> case p of
+      Say s x -> Say s (g x)
+  , hmap = \nt p -> case p of
+      Say s x -> Say s x
+  }
+
+say : {e : HFunctor} -> {{lg : logging <: e}} -> String -> Co e Unit
+say s = op (lg (Say s MkUnit)) val
+
+-- (what was said before, then what comes after)
+prefixed : {a : Type} -> List String -> Pair a (List String) -> Pair a (List String)
+prefixed out (MkPair y out2) = MkPair y (out ++ out2)
+
+thenLog : {a b : Type} -> Pair a (List String) -> (a -> Pair b (List String)) -> Pair b (List String)
+thenLog (MkPair x out) k = prefixed out (k x)
+
+logAlg : {m : Type -> Type} -> {a : Type} -> LogF m a -> Pair a (List String)
+logAlg (Say s x) = MkPair x [s]
+
+-- | The log, kept: what a computation comes to, and what it said.
+logged : Handler logging
+logged =
+  { M = \a -> Pair a (List String)
+  , ret = \x -> MkPair x []
+  , bind = \m k -> thenLog m k
+  , malg = \p -> logAlg p
+  }
+
+-- the handler: a thread as a resumption ------------------------------------------
+
+-- | A thread, stopped where the scheduler has a say.
+data Res (e : HFunctor) a
+  = RDone a
+  | RYield (Unit -> Res e a)
+  | RSpawn (Res e Unit) (Unit -> Res e a)
+  | RNew (Int -> Res e a)
+  | RSend Int Int (Unit -> Res e a)
+  | RRecv Int (Int -> Res e a)
+  | RAct (Co e (Res e a))
+
+thenRes : {e : HFunctor} -> {a b : Type} -> Res e a -> (a -> Res e b) -> Res e b
+thenRes (RDone x) f = f x
+thenRes (RYield k) f = RYield (\u -> thenRes (k u) f)
+thenRes (RSpawn c k) f = RSpawn c (\u -> thenRes (k u) f)
+thenRes (RNew k) f = RNew (\n -> thenRes (k n) f)
+thenRes (RSend ch v k) f = RSend ch v (\u -> thenRes (k u) f)
+thenRes (RRecv ch k) f = RRecv ch (\v -> thenRes (k v) f)
+thenRes (RAct m) f = RAct (bind m (\r -> pure (thenRes r f)))
+
+-- (a thread run alone to its end: what an operation of `e` holding
+-- computations would need; the log's hold none)
+alone : {e : HFunctor} -> {a : Type} -> Res e a -> Co e a
+alone (RDone x) = pure x
+alone (RYield k) = alone (k MkUnit)
+alone (RSpawn c k) = alone (k MkUnit)
+alone (RNew k) = alone (k 0)
+alone (RSend ch v k) = alone (k MkUnit)
+alone (RRecv ch k) = alone (k 0)
+alone (RAct m) = bind m alone
+
+-- | Each operation, a thread stopped there; one of `e`'s, done in `Co e`.
+greenAlg : (e : HFunctor) -> {a : Type} -> (green <+> e).f (Res e) a -> Res e a
+greenAlg e (InL (Spawn c x)) = RSpawn c (\u -> RDone x)
+greenAlg e (InL (Yield x)) = RYield (\u -> RDone x)
+greenAlg e (InL (NewChan k)) = RNew (\n -> RDone (k n))
+greenAlg e (InL (Send ch v x)) = RSend ch v (\u -> RDone x)
+greenAlg e (InL (Recv ch k)) = RRecv ch (\v -> RDone (k v))
+greenAlg e (InR q) = RAct (op (e.hmap (\r -> alone r) q) (\x -> pure (RDone x)))
+
+greenHandler : (e : HFunctor) -> Handler (green <+> e)
+greenHandler e =
+  { M = Res e
+  , ret = \x -> RDone x
+  , bind = \m f -> thenRes m f
+  , malg = \p -> greenAlg e p
+  }
+
+-- the scheduler -------------------------------------------------------------------
+
+-- | main (whose answer ends it all), or another thread.
+data Thread (e : HFunctor) a = Main (Res e a) | Other (Res e Unit)
+
+-- | A thread's next step, the same for main and the others.
+data Step (e : HFunctor) a
+  = SFinal a
+  | SEnd
+  | SYield (Unit -> Thread e a)
+  | SSpawn (Res e Unit) (Unit -> Thread e a)
+  | SNew (Int -> Thread e a)
+  | SSend Int Int (Unit -> Thread e a)
+  | SRecv Int (Int -> Thread e a)
+  | SAct (Co e (Thread e a))
+
+view : {e : HFunctor} -> {a : Type} -> Thread e a -> Step e a
+view (Main (RDone x)) = SFinal x
+view (Main (RYield k)) = SYield (\u -> Main (k u))
+view (Main (RSpawn c k)) = SSpawn c (\u -> Main (k u))
+view (Main (RNew k)) = SNew (\n -> Main (k n))
+view (Main (RSend ch v k)) = SSend ch v (\u -> Main (k u))
+view (Main (RRecv ch k)) = SRecv ch (\v -> Main (k v))
+view (Main (RAct m)) = SAct (bind m (\r -> pure (Main r)))
+view (Other (RDone _)) = SEnd
+view (Other (RYield k)) = SYield (\u -> Other (k u))
+view (Other (RSpawn c k)) = SSpawn c (\u -> Other (k u))
+view (Other (RNew k)) = SNew (\n -> Other (k n))
+view (Other (RSend ch v k)) = SSend ch v (\u -> Other (k u))
+view (Other (RRecv ch k)) = SRecv ch (\v -> Other (k v))
+view (Other (RAct m)) = SAct (bind m (\r -> pure (Other r)))
+
+-- | A queue: taken from the front, put at the back (two lists; none
+-- | is `{ front = [], back = [] }`).
+type Queue a = { front : List a, back : List a }
+
+putQ : {a : Type} -> a -> Queue a -> Queue a
+putQ x q = { front = q.front, back = x :: q.back }
+
+-- (the back turned round, the front)
+fromBack : {a : Type} -> List a -> Maybe (Pair a (Queue a))
+fromBack (x :: rest) = Just (MkPair x { front = rest, back = [] })
+fromBack Nil = Nothing
+
+takeQ : {a : Type} -> Queue a -> Maybe (Pair a (Queue a))
+takeQ { front = x :: rest, back = b } = Just (MkPair x { front = rest, back = b })
+takeQ { back = b } = fromBack (List.reverse b)
+
+-- | What the scheduler holds: the threads ready, each channel's values
+-- | and the threads waiting on it, and the next channel's number.
+type Sched (e : HFunctor) a =
+  { ready : Queue (Unit -> Thread e a)
+  , chans : M.Map Int (Queue Int)
+  , waiting : M.Map Int (Queue (Int -> Thread e a))
+  , next : Int
+  }
+
+queueOf : {a : Type} -> Int -> M.Map Int (Queue a) -> Queue a
+queueOf ch m = fromMaybe { front = [], back = [] } (M.lookup compareInt ch m)
+
+withReady : {e : HFunctor} -> {a : Type} -> Sched e a -> Queue (Unit -> Thread e a) -> Sched e a
+withReady s q = { ready = q, chans = s.chans, waiting = s.waiting, next = s.next }
+
+-- | A thread's step `t`, then the others', until main is done: its
+-- | answer, or Nothing if every thread waits on a channel (a deadlock).
+go : {e : HFunctor} -> {a : Type} -> Sched e a -> Step e a -> Co e (Maybe a)
+go s (SFinal x) = pure (Just x)
+go s SEnd = case takeQ s.ready of
+  Just (MkPair t q) -> go (withReady s q) (view (t MkUnit))
+  Nothing -> pure Nothing
+go s (SYield k) = case takeQ (putQ k s.ready) of
+  Just (MkPair t q) -> go (withReady s q) (view (t MkUnit))
+  Nothing -> pure Nothing
+go s (SSpawn c k) = go (withReady s (putQ (\u -> Other c) s.ready)) (view (k MkUnit))
+go s (SNew k) = go { ready = s.ready, chans = s.chans, waiting = s.waiting, next = s.next + 1 } (view (k s.next))
+go s (SSend ch v k) = case takeQ (queueOf ch s.waiting) of
+  Just (MkPair w ws) ->
+    go { ready = putQ (\u -> w v) s.ready
+       , chans = s.chans
+       , waiting = M.insert compareInt ch ws s.waiting
+       , next = s.next } (view (k MkUnit))
+  Nothing ->
+    go { ready = s.ready
+       , chans = M.insert compareInt ch (putQ v (queueOf ch s.chans)) s.chans
+       , waiting = s.waiting
+       , next = s.next } (view (k MkUnit))
+go s (SRecv ch k) = case takeQ (queueOf ch s.chans) of
+  Just (MkPair v vs) ->
+    go { ready = s.ready
+       , chans = M.insert compareInt ch vs s.chans
+       , waiting = s.waiting
+       , next = s.next } (view (k v))
+  Nothing -> (case takeQ s.ready of
+    Just (MkPair t q) ->
+      go { ready = q
+         , chans = s.chans
+         , waiting = M.insert compareInt ch (putQ k (queueOf ch s.waiting)) s.waiting
+         , next = s.next } (view (t MkUnit))
+    Nothing -> pure Nothing)
+go s (SAct m) = bind m (\t -> go s (view t))
+
+start : {e : HFunctor} -> {a : Type} -> Sched e a
+start = { ready = { front = [], back = [] }, chans = M.empty, waiting = M.empty, next = 0 }
+
+-- | `c` and the threads it spawns, round robin, in `Co e`: scheduled
+-- | when the `Co e` runs, not when it is made (the scheduler is pure,
+-- | and an argument is computed before the call).
+scheduled : (e : HFunctor) -> {a : Type} -> Co (green <+> e) a -> Co e (Maybe a)
+scheduled e c = bind (val (MkUnit : Unit)) (\u -> go start (view (Main (handle (greenHandler e) c))))
+
+-- | ... scheduled where it is made: up to the first operation of `e`,
+-- | the pure steps of every thread are taken there.
+scheduledNow : (e : HFunctor) -> {a : Type} -> Co (green <+> e) a -> Co e (Maybe a)
+scheduledNow e c = go start (view (Main (handle (greenHandler e) c)))
+
+-- the programs -------------------------------------------------------------------
+
+gw : HFunctor
+gw = green <+> logging
+
+-- | What a schedule came to, and the log.
+type Ran a = Pair (Maybe a) (List String)
+
+-- (each scheduled with a log, the log kept)
+run : {a : Type} -> Co gw a -> Ran a
+run c = handle logged (scheduled logging c)
+
+repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
+repeatG 0 c = pure MkUnit
+repeatG n c = bind c (\u -> repeatG (n - 1) c)
+
+-- (the sum of n values received on ch)
+recvSum : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Co e Int
+recvSum ch 0 = pure 0
+recvSum ch n = do
+  x <- recv ch
+  rest <- recvSum ch (n - 1)
+  pure (x + rest)
+
+-- | Three threads saying three lines each, yielding between: the order
+-- | the scheduler gives them turns in, main first.
+talker : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> String -> Int -> Co e Unit
+talker name 0 = pure MkUnit
+talker name n = do
+  say (name ^ showInt n)
+  yield
+  talker name (n - 1)
+
+turns : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Co e String
+turns = do
+  spawn (talker "a" 3)
+  spawn (talker "b" 3)
+  spawn (talker "c" 3)
+  say "main"
+  yield
+  say "main again"
+  yield
+  yield
+  yield
+  pure "main done"
+
+worker : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Int -> Int -> Int -> Co e Unit
+worker name inbox outbox = do
+  x <- recv inbox
+  say ("worker " ^ showInt name ^ " squares " ^ showInt x)
+  send outbox (x * x)
+  yield
+  worker name inbox outbox
+
+producer : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Int -> Int -> Int -> Co e Unit
+producer jobs i n = if i > n then pure MkUnit else do
+  say ("producer sends " ^ showInt i)
+  send jobs i
+  yield
+  producer jobs (i + 1) n
+
+-- | A producer, two workers squaring, and main adding up the squares of
+-- | 1 to 6 (91): the workers never end, dropped when main is done.
+squares : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Co e Int
+squares = do
+  jobs <- newChan
+  results <- newChan
+  spawn (worker 1 jobs results)
+  spawn (worker 2 jobs results)
+  spawn (producer jobs 1 6)
+  recvSum results 6
+
+-- | n threads, each sending 1: main receives them all.
+spawnMany : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Int
+spawnMany n = do
+  ch <- newChan
+  repeatG n (spawn (send ch 1))
+  recvSum ch n
+
+-- | 10 threads, each yielding n times, then sending 1.
+yields : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Int
+yields n = do
+  ch <- newChan
+  repeatG 10 (spawn (bind (repeatG n yield) (\u -> send ch 1)))
+  recvSum ch 10
+
+ponger : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Co e Unit
+ponger a b = do
+  x <- recv a
+  send b (x + 1)
+  ponger a b
+
+pinger : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Int -> Int -> Co e Int
+pinger 0 a b x = pure x
+pinger n a b x = do
+  send a x
+  y <- recv b
+  pinger (n - 1) a b y
+
+-- | A value sent back and forth n times between two threads, one added
+-- | each time.
+ping : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Int
+ping n = do
+  a <- newChan
+  b <- newChan
+  spawn (ponger a b)
+  pinger n a b 0
+
+-- | main and a thread each waiting on a channel nobody sends on.
+stuck : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Co e Int
+stuck = do
+  a <- newChan
+  b <- newChan
+  spawn (bind (recv a) (\x -> send b x))
+  say "waiting"
+  recv b
+
+-- (each at gw)
+onG : (green <: gw)
+onG p = InL p
+
+onL : (logging <: gw)
+onL p = InR p
+
+turnsRun : Ran String
+turnsRun = run (turns (ev := onG) (lg := onL))
+
+squaresRun : Ran Int
+squaresRun = run (squares (ev := onG) (lg := onL))
+
+spawned : Ran Int
+spawned = run (spawnMany (ev := onG) 1000)
+
+yielded : Ran Int
+yielded = run (yields (ev := onG) 200)
+
+pinged : Ran Int
+pinged = run (ping (ev := onG) 1000)
+
+deadlocked : Ran Int
+deadlocked = run (stuck (ev := onG) (lg := onL))
+
+-- (one watch for them: a watch computes the file's definitions anew)
+-- >>> (MkPair turnsRun [squaresRun, spawned, yielded, pinged, deadlocked] : Pair (Ran String) (List (Ran Int)))
+-- MkPair (MkPair (Just "main done") (Cons "main" (Cons "a3" (Cons "b3" (Cons "c3" (Cons "main again" (Cons "a2" (Cons "b2" (Cons "c2" (Cons "a1" (Cons "b1" (Cons "c1" Nil)))))))))))) (Cons (MkPair (Just 91) (Cons "producer sends 1" (Cons "worker 1 squares 1" (Cons "producer sends 2" (Cons "worker 2 squares 2" (Cons "producer sends 3" (Cons "worker 1 squares 3" (Cons "producer sends 4" (Cons "worker 2 squares 4" (Cons "producer sends 5" (Cons "worker 1 squares 5" (Cons "producer sends 6" (Cons "worker 2 squares 6" Nil))))))))))))) (Cons (MkPair (Just 1000) Nil) (Cons (MkPair (Just 10) Nil) (Cons (MkPair (Just 1000) Nil) (Cons (MkPair Nothing (Cons "waiting" Nil)) Nil)))))
+
+-- when the schedule runs ------------------------------------------------------------
+
+-- (a thread whose pure work abandons after a switch, before anything is
+-- said)
+boom : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Co e Int
+boom = do
+  ch <- newChan
+  spawn (send ch 0)
+  x <- recv ch
+  y <- pure (1 / x)
+  say "never"
+  pure y
+
+-- | `scheduled` makes a computation and runs none of it ...
+madeOnly : String
+madeOnly = const "made" (scheduled logging (boom (ev := onG) (lg := onL)))
+
+-- | ... until it runs.
+madeAndRun : Ran Int
+madeAndRun = run (boom (ev := onG) (lg := onL))
+
+-- >>> madeAndRun
+-- <abandoned>
+
+-- | `scheduledNow` takes every thread's steps up to the first thing said
+-- | where it is made: the work that abandons among them.
+madeNow : String
+madeNow = const "made" (scheduledNow logging (boom (ev := onG) (lg := onL)))
+
+-- >>> madeNow
+-- <abandoned>
+
+-- (... and none after it: what comes after the first thing said waits
+-- for the `Co` to run)
+saidFirst : {e : HFunctor} -> {{ev : green <: e}} -> {{lg : logging <: e}} -> Co e Int
+saidFirst = do
+  say "first"
+  boom
+
+madeNowSaidFirst : String
+madeNowSaidFirst = const "made" (scheduledNow logging (saidFirst (ev := onG) (lg := onL)))
+
+-- >>> ([madeOnly, madeNowSaidFirst] : List String)
+-- Cons "made" (Cons "made" Nil)

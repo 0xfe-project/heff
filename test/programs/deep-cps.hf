@@ -1,0 +1,82 @@
+-- Long chains of calls last, none of which may grow the stack as long
+-- as it is (heff#25): a closure called last a hundred thousand times
+-- over, each continuation calling the one before it; fib in
+-- continuation-passing style; two functions of a record calling each
+-- other last; and twenty thousand operations whose binds nest to the
+-- left, handled in the language (to the right, a million:
+-- test/backends.mjs runs bench/state.hf).  And recursion that is no
+-- tail call, a few thousand deep: JavaScript's stack, Node.js's own, has
+-- room for some 8000.
+
+import co
+import state
+
+-- (n closures, each calling the one before it last)
+countK : Int -> (Int -> Int) -> Int
+countK 0 k = k 0
+countK n k = countK (n - 1) (\x -> k (x + 1))
+
+chained : Int
+chained = countK 100000 (\x -> x)
+
+fibK : Int -> (Int -> Int) -> Int
+fibK n k = if n < 2 then k n else fibK (n - 1) (\a -> fibK (n - 2) (\b -> k (a + b)))
+
+fibK20 : Int
+fibK20 = fibK 20 (\x -> x)
+
+theory Parity where
+  isEven : Int -> Bool
+  isOdd : Int -> Bool
+
+parity : Parity
+parity =
+  { isEven = \n -> if n == 0 then True else parity.isOdd (n - 1)
+  , isOdd = \n -> if n == 0 then False else parity.isEven (n - 1)
+  }
+
+evenOdd : List Bool
+evenOdd = [parity.isEven 40000, parity.isOdd 40001, parity.isEven 39999]
+
+-- a state, handled in the language ------------------------------------------------
+
+countAlg : {m : Type -> Type} -> {a : Type} -> StateF Int m a -> Int -> Pair a Int
+countAlg (Get k) s = MkPair (k s) s
+countAlg (Put s2 x) s = MkPair x s2
+
+-- (the rest, from where a step left the state)
+stepped : {a b : Type} -> (a -> Int -> Pair b Int) -> Pair a Int -> Pair b Int
+stepped k (MkPair x s) = k x s
+
+counting : Handler (state Int)
+counting =
+  { M = \a -> Int -> Pair a Int
+  , ret = \x s -> MkPair x s
+  , bind = \m k s -> stepped k (m s)
+  , malg = \p s -> countAlg p s
+  }
+
+-- | The list added up, each element's bind around those before it.
+leftNested : {e : HFunctor} -> {{ct : state Int <: e}} -> List Int -> Co e Int
+leftNested xs = List.foldl (\c x -> bind c (\acc -> bind get (\s -> bind (put (s + 1)) (\u -> pure (acc + x))))) (pure 0) xs
+
+leftNestedRun : Pair Int Int
+leftNestedRun = handle counting (leftNested (ct := here (state Int)) (List.range 1 20000)) 0
+
+-- no tail call --------------------------------------------------------------------
+
+sumTo : Int -> Int
+sumTo 0 = 0
+sumTo n = n + sumTo (n - 1)
+
+-- (the list's right fold, as deep as the list is long)
+sumR : List Int -> Int
+sumR Nil = 0
+sumR (x :: xs) = x + sumR xs
+
+deepSums : List Int
+deepSums = [sumTo 3000, sumR (List.range 1 3000)]
+
+-- (one watch for them all: a watch computes the file's definitions anew)
+-- >>> (MkPair ([chained, fibK20, fst leftNestedRun, snd leftNestedRun] ++ deepSums) evenOdd : Pair (List Int) (List Bool))
+-- MkPair (Cons 100000 (Cons 6765 (Cons 200010000 (Cons 20000 (Cons 4501500 (Cons 4501500 Nil)))))) (Cons True (Cons True (Cons False Nil)))

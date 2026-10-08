@@ -1,0 +1,360 @@
+-- lib/parallel.hf's `Par`, handled into `Co e` two ways
+-- (heff_parallel's par.hf): one side after the other (`inTurn`), and
+-- each side a process of its own (`forking`), the processes those of
+-- fork.hf -- a spread into n, each given the rest of the program, joined
+-- again by a gather -- here a model of its provider, handled in the
+-- language, the rest of the program called once for each process
+-- (test/node/fork.hf forks real ones, by C).  The two give the same
+-- answers, and say the same.
+--
+-- And when pure work runs (heff#37): a computation's argument is
+-- computed where the computation is built; a step after a `bind` is
+-- taken by a handler into `Co e` (`through`) as it handles, before a
+-- part is placed anywhere; only what comes after an operation of `e`
+-- (`later`, after `suspend`) waits for the `Co e` to run.
+
+import co
+import parallel
+
+-- the world: processes, and a log -----------------------------------------------
+
+data ProcF (m : Type -> Type) x
+  = Spread Int (Int -> x)
+  | Gather Int (List Int -> x)
+  | Suspend x
+  | Say String x
+
+procs : HFunctor
+procs =
+  { f = ProcF
+  , hfmap = \fm g p -> case p of
+      Spread n k -> Spread n (\i -> g (k i))
+      Gather v k -> Gather v (\vs -> g (k vs))
+      Suspend x -> Suspend (g x)
+      Say s x -> Say s (g x)
+  , hmap = \nt p -> case p of
+      Spread n k -> Spread n k
+      Gather v k -> Gather v k
+      Suspend x -> Suspend x
+      Say s x -> Say s x
+  }
+
+-- | `n` processes from here on: this one is 0, the others 1 to n-1.
+spread : {e : HFunctor} -> {{ev : procs <: e}} -> Int -> Co e Int
+spread n = op (ev (Spread n (\i -> i))) val
+
+-- | The processes of the last spread joined: in process 0, every one's
+-- | value, in order; every other one ends here.
+gather : {e : HFunctor} -> {{ev : procs <: e}} -> Int -> Co e (List Int)
+gather v = op (ev (Gather v (\vs -> vs))) val
+
+-- | Nothing: a point where what follows waits to be run.
+suspend : {e : HFunctor} -> {{ev : procs <: e}} -> Co e Unit
+suspend = op (ev (Suspend MkUnit)) val
+
+say : {e : HFunctor} -> {{ev : procs <: e}} -> String -> Co e Unit
+say s = op (ev (Say s MkUnit)) val
+
+-- | `f ()`, computed where the computation runs, not where it is made
+-- | or handled.
+later : {e : HFunctor} -> {{ev : procs <: e}} -> {a : Type} -> (Unit -> a) -> Co e a
+later f = bind suspend (\u -> pure (f u))
+
+-- | `p` parts, part `i` computed by `f i` in a process of its own; their
+-- | values, in order.
+parts : {e : HFunctor} -> {{ev : procs <: e}} -> Int -> (Int -> Int) -> Co e (List Int)
+parts p f = do
+  i <- spread p
+  gather (f i)
+
+-- | ... where a part is a computation of the same world.
+partsCo : {e : HFunctor} -> {{ev : procs <: e}} -> Int -> (Int -> Co e Int) -> Co e (List Int)
+partsCo p f = do
+  i <- spread p
+  x <- f i
+  gather x
+
+-- the processes, modelled ---------------------------------------------------------
+
+-- | A process, stopped at each operation.
+data Proc a
+  = PDone a
+  | PSpread Int (Int -> Proc a)
+  | PGather Int (List Int -> Proc a)
+  | PSay String (Unit -> Proc a)
+
+thenProc : {a b : Type} -> Proc a -> (a -> Proc b) -> Proc b
+thenProc (PDone x) f = f x
+thenProc (PSpread n k) f = PSpread n (\i -> thenProc (k i) f)
+thenProc (PGather v k) f = PGather v (\vs -> thenProc (k vs) f)
+thenProc (PSay s k) f = PSay s (\u -> thenProc (k u) f)
+
+procAlg : {a : Type} -> ProcF Proc a -> Proc a
+procAlg (Spread n k) = PSpread n (\i -> PDone (k i))
+procAlg (Gather v k) = PGather v (\vs -> PDone (k vs))
+procAlg (Suspend x) = PDone x
+procAlg (Say s x) = PSay s (\u -> PDone x)
+
+modelled : Handler procs
+modelled =
+  { M = Proc
+  , ret = \x -> PDone x
+  , bind = \m f -> thenProc m f
+  , malg = \p -> procAlg p
+  }
+
+-- | A process run up to its own gather: what it said, and the value it
+-- | gathered and the rest of it; or what it said and ended with.
+data Part a = Gathered (List String) Int (List Int -> Proc a) | Ended (List String) a
+
+saidBy : {a : Type} -> Part a -> List String
+saidBy (Gathered out _ _) = out
+saidBy (Ended out _) = out
+
+gatheredBy : {a : Type} -> Part a -> Int
+gatheredBy (Gathered _ v _) = v
+gatheredBy (Ended _ _) = 0
+
+-- (what was said, then `p`)
+saying : {a : Type} -> List String -> Proc a -> Proc a
+saying Nil p = p
+saying (s :: ss) p = PSay s (\u -> saying ss p)
+
+-- | A spread's processes, each run up to its gather, process 0 first:
+-- | what they said, in order of process, then process 0 going on with
+-- | every value gathered.
+joined : {a : Type} -> Part a -> List (Part a) -> Proc a
+joined (Gathered out v k) others = saying (out ++ List.concatMap saidBy others) (k (v :: List.map gatheredBy others))
+joined (Ended out x) others = saying (out ++ List.concatMap saidBy others) (PDone x)
+
+-- | ... `out` what it said so far, last first.  A spread in it: each of
+-- | its processes run from the rest of it, called for each.
+upTo : {a : Type} -> List String -> Proc a -> Part a
+upTo out (PDone x) = Ended (List.reverse out) x
+upTo out (PSay s k) = upTo (s :: out) (k MkUnit)
+upTo out (PGather v k) = Gathered (List.reverse out) v k
+upTo out (PSpread n k) = upTo out (joined (upTo [] (k 0)) (List.map (\i -> upTo [] (k i)) (List.range 1 (n - 1))))
+
+-- (what was said before, then what comes after)
+prefixed : {a : Type} -> List String -> Pair a (List String) -> Pair a (List String)
+prefixed out (MkPair x out2) = MkPair x (out ++ out2)
+
+-- | A process run to its end: what it comes to, and what it and its
+-- | processes said.  A gather with no spread open gathers its own value
+-- | alone.
+ran : {a : Type} -> Part a -> Pair a (List String)
+ran (Ended out x) = MkPair x out
+ran (Gathered out v k) = prefixed out (ran (upTo [] (k [v])))
+
+-- | A computation of the world, run.
+world : {a : Type} -> Co procs a -> Pair a (List String)
+world c = ran (upTo [] (handle modelled c))
+
+-- the handlers of Par --------------------------------------------------------------
+
+pairOf : List Int -> Pair Int Int
+pairOf (a :: b :: _) = MkPair a b
+pairOf _ = MkPair 0 0
+
+-- | Two computations, each a process, and both their answers.
+both : {e : HFunctor} -> {{ev : procs <: e}} -> Co e Int -> Co e Int -> Co e (Pair Int Int)
+both l r = do
+  i <- spread 2
+  x <- (if i == 0 then l else r)
+  xs <- gather x
+  pure (pairOf xs)
+
+forked : {e : HFunctor} -> {{ev : procs <: e}} -> {a : Type} -> ParF Int Int (Co e) a -> Co e a
+forked (Par l r k) = bind (both l r) (\ab -> pure (k (fst ab) (snd ab)))
+
+-- | `Par`, its sides processes: each `Par l r k` the two forked.
+forking : (e : HFunctor) -> {{ev : procs <: e}} -> Handler (parOf Int Int <+> e)
+forking e = through (parOf Int Int) e (\p -> forked p)
+
+inOrder : {e : HFunctor} -> {a : Type} -> ParF Int Int (Co e) a -> Co e a
+inOrder (Par l r k) = bind l (\x -> bind r (\y -> pure (k x y)))
+
+-- | ... and one after the other, in the same `Co e`.
+inTurn : (e : HFunctor) -> Handler (parOf Int Int <+> e)
+inTurn e = through (parOf Int Int) e (\p -> inOrder p)
+
+-- the programs ----------------------------------------------------------------------
+
+pw : HFunctor
+pw = parOf Int Int <+> procs
+
+onPar : (parOf Int Int <: pw)
+onPar p = InL p
+
+onProcs : (procs <: pw)
+onProcs p = InR p
+
+fib : Int -> Int
+fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)
+
+-- | fib `n` by `Par`, split `d` deep, each leaf by `leaf`.
+fibPar : (Int -> Co pw Int) -> Int -> Int -> Co pw Int
+fibPar leaf d n =
+  if d == 0 || n < 2 then leaf n
+  else do
+    ab <- parIn (inj := onPar) (fibPar leaf (d - 1) (n - 1)) (fibPar leaf (d - 1) (n - 2))
+    pure (fst ab + snd ab)
+
+-- (each leaf saying which it is)
+loud : Int -> Co pw Int
+loud n = do
+  say (ev := onProcs) ("leaf " ^ showInt n)
+  later (ev := onProcs) (\u -> fib n)
+
+quiet : Int -> Co pw Int
+quiet n = later (ev := onProcs) (\u -> fib n)
+
+-- (fib 15 is 610)
+inTurnLoud : Pair Int (List String)
+inTurnLoud = world (handle (inTurn procs) (fibPar loud 3 15))
+
+-- >>> inTurnLoud
+-- MkPair 610 (Cons "leaf 12" (Cons "leaf 11" (Cons "leaf 11" (Cons "leaf 10" (Cons "leaf 11" (Cons "leaf 10" (Cons "leaf 10" (Cons "leaf 9" Nil))))))))
+
+forkingLoud : Pair Int (List String)
+forkingLoud = world (handle (forking procs (ev := here procs)) (fibPar loud 3 15))
+
+-- >>> forkingLoud
+-- MkPair 610 (Cons "leaf 12" (Cons "leaf 11" (Cons "leaf 11" (Cons "leaf 10" (Cons "leaf 11" (Cons "leaf 10" (Cons "leaf 10" (Cons "leaf 9" Nil))))))))
+
+inTurnQuiet : List Int
+inTurnQuiet = List.map (\d -> fst (world (handle (inTurn procs) (fibPar quiet d 15)))) [0, 1, 2, 5]
+
+-- >>> inTurnQuiet
+-- Cons 610 (Cons 610 (Cons 610 (Cons 610 Nil)))
+
+forkingQuiet : List Int
+forkingQuiet = List.map (\d -> fst (world (handle (forking procs (ev := here procs)) (fibPar quiet d 15)))) [0, 1, 2, 5]
+
+-- >>> forkingQuiet
+-- Cons 610 (Cons 610 (Cons 610 (Cons 610 Nil)))
+
+-- processes, as fork.hf has them
+squaresInParts : Pair (List Int) (List String)
+squaresInParts = world (parts (ev := here procs) 4 (\i -> i * i))
+
+-- >>> squaresInParts
+-- MkPair (Cons 0 (Cons 1 (Cons 4 (Cons 9 Nil)))) Nil
+
+-- (2 parts of 3: the inner gathered and added up in each outer)
+nestedParts : Pair (List Int) (List String)
+nestedParts =
+  world
+    (partsCo (ev := here procs) 2 (\i -> do
+      say (ev := here procs) ("outer " ^ showInt i)
+      inner <- parts (ev := here procs) 3 (\j -> 10 * i + j)
+      pure (List.sum inner)))
+
+-- >>> nestedParts
+-- MkPair (Cons 3 (Cons 33 Nil)) (Cons "outer 0" (Cons "outer 1" Nil))
+
+type Tally = { count : Int, items : List Int }
+
+-- (process i's own: i added to each)
+bumped : Int -> Tally -> Tally
+bumped i t = { count = t.count + i, items = List.map (\x -> x + i) t.items }
+
+totalOf : Tally -> Int
+totalOf t = t.count + List.sum t.items
+
+copiesOf : {e : HFunctor} -> {{ev : procs <: e}} -> Int -> Co e (List Int)
+copiesOf n = do
+  t <- pure { count = n, items = List.range 1 n }
+  i <- spread 3
+  gather (totalOf (bumped i t))
+
+-- (a record and a list made before a spread, each process making its own
+-- of them after: the rest of the program, called once for each, finds
+-- them as they were)
+ownCopies : Pair (List Int) (List String)
+ownCopies = world (copiesOf (ev := here procs) 3)
+
+-- >>> ownCopies
+-- MkPair (Cons 9 (Cons 13 (Cons 17 Nil))) Nil
+
+-- when pure work runs -------------------------------------------------------------
+
+-- (work that abandons: where it is done, the computation abandons)
+boom : Int -> Int
+boom n = n / 0
+
+-- | An argument: computed where the computation is built.
+eagerLeaf : Int -> Co pw Int
+eagerLeaf n = pure (boom n)
+
+-- | A step after a `bind`: taken by a handler into `Co e` as it handles.
+stepLeaf : Int -> Co pw Int
+stepLeaf n = bind (pure n) (\m -> pure (boom m))
+
+-- | After `suspend`: when the `Co e` runs.
+laterLeaf : Int -> Co pw Int
+laterLeaf n = later (ev := onProcs) (\u -> boom n)
+
+builtEager : String
+builtEager = const "built" (fibPar eagerLeaf 2 6)
+
+-- >>> builtEager
+-- <abandoned>
+
+builtStep : String
+builtStep = const "built" (fibPar stepLeaf 2 6)
+
+-- >>> builtStep
+-- "built"
+
+handledStep : String
+handledStep = const "handled" (handle (inTurn procs) (fibPar stepLeaf 2 6))
+
+-- >>> handledStep
+-- <abandoned>
+
+-- (forking: the parent has done every leaf's work before any process is
+-- spread)
+handledStepForking : String
+handledStepForking = const "handled" (handle (forking procs (ev := here procs)) (fibPar stepLeaf 2 6))
+
+-- >>> handledStepForking
+-- <abandoned>
+
+handledLater : String
+handledLater = const "handled" (handle (inTurn procs) (fibPar laterLeaf 2 6))
+
+-- >>> handledLater
+-- "handled"
+
+handledLaterForking : String
+handledLaterForking = const "handled" (handle (forking procs (ev := here procs)) (fibPar laterLeaf 2 6))
+
+-- >>> handledLaterForking
+-- "handled"
+
+-- | ... and done when it runs.
+ranLater : Pair Int (List String)
+ranLater = world (handle (inTurn procs) (fibPar laterLeaf 2 6))
+
+-- >>> ranLater
+-- <abandoned>
+
+ranLaterForking : Pair Int (List String)
+ranLaterForking = world (handle (forking procs (ev := here procs)) (fibPar laterLeaf 2 6))
+
+-- >>> ranLaterForking
+-- <abandoned>
+
+-- (a step after an operation of the world waits too: only the steps up
+-- to the first operation are taken as it is handled)
+saidFirst : Int -> Co pw Int
+saidFirst n = do
+  say (ev := onProcs) "first"
+  stepLeaf n
+
+handledSaidFirst : String
+handledSaidFirst = const "handled" (handle (inTurn procs) (fibPar saidFirst 2 6))
+
+-- >>> handledSaidFirst
+-- "handled"

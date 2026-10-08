@@ -1,0 +1,94 @@
+-- Processes as an effect, for test/backends.mjs, by C alone
+-- (heff_parallel's fork.hf; fork.provider.c): `spread n` forks, and
+-- gives the rest of the program to each of n processes, its index its
+-- answer; `gather s` joins them, each process's string, in order, in
+-- process 0, every other process ending there.  Nothing is shared: a
+-- process computes on its own copy of what was made before the spread.
+-- And lib/parallel.hf's `Par`, each side a process (heff_parallel's
+-- par.hf `forking`).
+
+import co
+import parallel
+import std.io
+
+data ForkF (m : Type -> Type) x
+  = Spread Int (Int -> x)
+  | Gather String (List String -> x)
+  | Suspend x
+
+fork : HFunctor
+fork =
+  { f = ForkF
+  , hfmap = \fm g p -> case p of
+      Spread n k -> Spread n (\i -> g (k i))
+      Gather s k -> Gather s (\ss -> g (k ss))
+      Suspend x -> Suspend (g x)
+  , hmap = \nt p -> case p of
+      Spread n k -> Spread n k
+      Gather s k -> Gather s k
+      Suspend x -> Suspend x
+  }
+
+spread : {e : HFunctor} -> {{fk : fork <: e}} -> Int -> Co e Int
+spread n = op (fk (Spread n (\i -> i))) val
+
+gather : {e : HFunctor} -> {{fk : fork <: e}} -> String -> Co e (List String)
+gather s = op (fk (Gather s (\ss -> ss))) val
+
+-- | `f ()`, computed where the computation runs, not where it is
+-- | handled (test/programs/par-handlers.hf says why).
+later : {e : HFunctor} -> {{fk : fork <: e}} -> {a : Type} -> (Unit -> a) -> Co e a
+later f = bind (op (fk (Suspend MkUnit)) val) (\u -> pure (f u))
+
+-- | `p` parts, part `i` computed by `f i` in a process of its own; their
+-- | answers, in order.
+parts : {e : HFunctor} -> {{fk : fork <: e}} -> Int -> (Int -> Co e String) -> Co e (List String)
+parts p f = do
+  i <- spread p
+  s <- f i
+  gather s
+
+-- Par, forked -----------------------------------------------------------------------
+
+pairOf : List String -> Pair Int Int
+pairOf (a :: b :: _) = MkPair (fromMaybe 0 (parseInt a)) (fromMaybe 0 (parseInt b))
+pairOf _ = MkPair 0 0
+
+forked : {e : HFunctor} -> {{fk : fork <: e}} -> {a : Type} -> ParF Int Int (Co e) a -> Co e a
+forked (Par l r k) = do
+  i <- spread 2
+  x <- (if i == 0 then l else r)
+  ss <- gather (showInt x)
+  pure (k (fst (pairOf ss)) (snd (pairOf ss)))
+
+world : HFunctor
+world = stdio <+> fork
+
+pw : HFunctor
+pw = parOf Int Int <+> world
+
+fib : Int -> Int
+fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)
+
+fibPar : Int -> Int -> Co pw Int
+fibPar d n =
+  if d == 0 || n < 2 then later (fk := \p -> InR (InR p)) (\u -> fib n)
+  else do
+    ab <- parIn (inj := \p -> InL p) (fibPar (d - 1) (n - 1)) (fibPar (d - 1) (n - 2))
+    pure (fst ab + snd ab)
+
+program : {{io : stdio <: world}} -> {{fk : fork <: world}} -> Co world Unit
+program = do
+  print "said before the spread, once"
+  squares <- parts 4 (\i -> pure (showInt (i * i)))
+  print ("squares: " ^ unwords squares)
+  nested <- parts 2 (\i -> bind (parts 3 (\j -> pure (showInt i ^ "." ^ showInt j))) (\ss -> pure (joinWith "," ss)))
+  print ("nested: " ^ unwords nested)
+  xs <- pure (List.range 1 5)
+  own <- parts 3 (\i -> pure (showInt (List.sum (List.map (\x -> x * i) xs))))
+  print ("each its own: " ^ unwords own ^ "; the parent's: " ^ showInt (List.sum xs))
+  r <- handle (through (parOf Int Int) world (\p -> forked p)) (fibPar 3 15)
+  print ("fib 15, each Par forked: " ^ showInt r)
+
+main : Co world Unit
+main = program (io := \p -> InL p) (fk := \p -> InR p)

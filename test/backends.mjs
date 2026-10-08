@@ -13,7 +13,8 @@
 // Programs: those of test/node, compiled to a program by each backend
 // (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
 // write, their exit status, loops a million rounds deep, a long loop of
-// operations done at once, time and the network.
+// operations done at once, time and the network; and, by C alone,
+// processes forked.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -207,6 +208,20 @@ checks.push(ran("state peeled in-language", "test/node/counted.hf", "main", [], 
 // again, the same number; let go of, freed by their maker's provider
 checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
   { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 }));
+
+// processes, by C alone (test/node/fork.provider.c forks; Node.js cannot
+// give a continuation to another process): the rest of the program run
+// by each of them, each on its own copy, their strings gathered in
+// order, and lib/parallel.hf's `Par` each side a process -- what was
+// written before a spread written once
+if (process.platform !== "win32") checks.push((async () => {
+  const p = await programs.c("test/node/fork.hf", "main");
+  if (p.error !== undefined) return [`FAIL processes (c): not compiled\n${p.error}`];
+  const r = await run(p.cmd, [], { timeout: 60000 });
+  const want = "said before the spread, once\nsquares: 0 1 4 9\nnested: 0.0,0.1,0.2 1.0,1.1,1.2\n"
+    + "each its own: 0 15 30; the parent's: 15\nfib 15, each Par forked: 610\n";
+  return r.status === 0 && r.stdout === want ? [] : [`FAIL processes (c): status ${r.status}\n${r.stdout}${r.stderr}`];
+})());
 
 // loops, compiled as loops: a million rounds, and the stack does not overflow
 checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 }));
