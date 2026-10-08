@@ -74,6 +74,14 @@ typedef uintptr_t V;
 #define HEFF_JUMPS 0
 #endif
 
+// (what is done often and is short, an integer's operation on words,
+// inlined where it is used, at any optimisation; what is done seldom
+// and is long, its operation on big ones, a call, out of the way, so
+// that what is inlined stays short)
+#define HEFF_FAST static inline __attribute__((always_inline))
+#define HEFF_SLOW static __attribute__((noinline, cold))
+#define HEFF_LIKELY(c) __builtin_expect(!!(c), 1)
+
 // the tags the runtime knows; a program's own are numbered after them
 enum {
   TAG_True, TAG_False, TAG_Nil, TAG_Cons, TAG_MkUnit, TAG_Just, TAG_Nothing,
@@ -109,7 +117,8 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint32_t d[]; } Big;
 #define IS_NTAG(v) (((v) & 3) == 2)
 #define NTAG(id) ((V)(((uintptr_t)(id) << 2) | 2))
 #define OBJ(v) ((Obj *)(v))
-#define INT_MAX62 ((int64_t)1 << 61)
+// (a word's integers: from -INT_LIM up to, not with, INT_LIM)
+#define INT_LIM ((int64_t)1 << 62)
 #define IS_OBJ(v) (((v) & 3) == 0)
 #define IMMORTAL 0x80000000u
 
@@ -186,6 +195,9 @@ static inline void heff_obj_free(void *p, size_t n) {
 static inline int heff_tag_of(V v) {
   return IS_NTAG(v) ? (int)(v >> 2) : OBJ(v)->tag;
 }
+
+// (C's condition as a Bool)
+#define heff_bool(b) ((b) ? NTAG(TAG_True) : NTAG(TAG_False))
 
 static V heff_tag(int id, int64_t n, V *f) {
   if (n == 0) return NTAG(id);
@@ -505,10 +517,10 @@ static inline int heff_exact(V f, int n, V *a) {
 
 // Integers
 // ---------------------------------------------------------------------
-// An integer is a word while it fits in 62 bits (`MK_INT`); beyond, a
-// big one (`K_BIG`): its sign and its magnitude's 32-bit digits, the
-// least first.  Each result fitting in a word is one, so that two equal
-// integers are both words or both big.
+// An integer is a word while it fits in 62 bits and a sign (`MK_INT`,
+// from -2^62 up to 2^62); beyond, a big one (`K_BIG`): its sign and its
+// magnitude's 32-bit digits, the least first.  Each result fitting in a
+// word is one, so that two equal integers are both words or both big.
 
 // (an integer's sign and digits, to compute with: a word's in `buf`)
 typedef struct { int neg; int n; const uint32_t *d; uint32_t buf[2]; } Num;
@@ -533,7 +545,8 @@ static V big_make(int neg, const uint32_t *d, int n) {
   while (n > 0 && d[n - 1] == 0) n--;
   if (n <= 2) {
     uint64_t m = n == 0 ? 0 : n == 1 ? d[0] : ((uint64_t)d[1] << 32) | d[0];
-    if (m < (uint64_t)INT_MAX62) return MK_INT(neg ? -(int64_t)m : (int64_t)m);
+    if (m < (uint64_t)INT_LIM || (neg && m == (uint64_t)INT_LIM))
+      return MK_INT(neg ? (int64_t)((uint64_t)0 - m) : (int64_t)m);
   }
   Big *b = heff_obj_alloc(sizeof(Big) + n * sizeof(uint32_t));
   b->h.rc = 1; b->h.kind = K_BIG; b->h.tag = 0; b->neg = neg; b->n = n;
@@ -541,11 +554,15 @@ static V big_make(int neg, const uint32_t *d, int n) {
   return (V)b;
 }
 
-static V heff_int(int64_t i) {
-  if (i < INT_MAX62 && i > -INT_MAX62) return MK_INT(i);
+HEFF_SLOW V heff_int_big(int64_t i) {
   uint64_t m = i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i;
   uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
   return big_make(i < 0, d, 2);
+}
+
+HEFF_FAST V heff_int(int64_t i) {
+  if (HEFF_LIKELY(i >= -INT_LIM && i < INT_LIM)) return MK_INT(i);
+  return heff_int_big(i);
 }
 
 static int mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn) {
@@ -665,23 +682,6 @@ static V num_divmod(const Num *a, const Num *b, int want_mod) {
   return big_make(1, o, mag_add(q, qn, &one, 1, o));
 }
 
-// (the two integers' operation, both consumed: `big`'s value, or, both
-// words, what the rest says)
-#define INT2(name, big, ...)                                          \
-  static V name(V a, V b) {                                           \
-    if (IS_INT(a) && IS_INT(b)) {                                     \
-      int64_t x = INT_OF(a), y = INT_OF(b);                           \
-      __VA_ARGS__                                                     \
-    }                                                                 \
-    Num x, y;                                                         \
-    num_of(a, &x);                                                    \
-    num_of(b, &y);                                                    \
-    V r = big;                                                        \
-    heff_drop(a);                                                     \
-    heff_drop(b);                                                     \
-    return r;                                                         \
-  }
-
 static V num_mul(const Num *a, const Num *b) {
   int n = a->n + b->n;
   uint32_t *o = alloca((n + 1) * sizeof(uint32_t));
@@ -704,27 +704,87 @@ static int num_cmp(const Num *a, const Num *b) {
   return a->neg ? -c : c;
 }
 
-INT2(heff_intAdd, num_add(&x, y.neg, &y), return heff_int(x + y);)
-INT2(heff_intSub, num_add(&x, !y.neg && y.n > 0, &y), return heff_int(x - y);)
-INT2(heff_intMul, num_mul(&x, &y),
-     int64_t r;
-     if (!__builtin_mul_overflow(x, y, &r)) return heff_int(r);)
-INT2(heff_intDiv, y.n == 0 ? heff_abandon() : num_divmod(&x, &y, 0),
-     if (y == 0) return heff_abandon();
-     int64_t q = x / y, r = x % y;
-     if (r != 0 && ((r < 0) != (y < 0))) q -= 1;
-     return heff_int(q);)
-INT2(heff_intMod, y.n == 0 ? heff_abandon() : num_divmod(&x, &y, 1),
-     if (y == 0) return heff_abandon();
-     int64_t r = x % y;
-     if (r != 0 && ((r < 0) != (y < 0))) r += y;
-     return heff_int(r);)
+// An integer's operation (`heff_intAdd` and the others) is inlined
+// where it is used, as far as both are words and so is what it makes:
+// there it is done on the words as they are, `2x + 1` each -- their
+// sum less one is `2(x + y) + 1`, and the machine's overflow of it is
+// exactly a sum beyond a word's -- with no call, no frame, nothing to
+// drop.  Anything else, a big one or a result beyond a word, is
+// `NAME_big`'s, a call: the operation on the integers' digits (`Num`),
+// both consumed.
+#define INT_BIG(T, name, big)                                           \
+  HEFF_SLOW T name##_big(V a, V b) {                                    \
+    Num x, y;                                                           \
+    num_of(a, &x);                                                      \
+    num_of(b, &y);                                                      \
+    T r = big;                                                          \
+    heff_drop(a);                                                       \
+    heff_drop(b);                                                       \
+    return r;                                                           \
+  }
 
-#define heff_bool(b) ((b) ? NTAG(TAG_True) : NTAG(TAG_False))
+// (both words: tested at once, their low bits)
+#define BOTH_INT(a, b) HEFF_LIKELY(IS_INT((a) & (b)))
 
-INT2(heff_intEq, heff_bool(num_cmp(&x, &y) == 0), return heff_bool(x == y);)
-INT2(heff_intLt, heff_bool(num_cmp(&x, &y) < 0), return heff_bool(x < y);)
-INT2(heff_intLe, heff_bool(num_cmp(&x, &y) <= 0), return heff_bool(x <= y);)
+INT_BIG(V, heff_intAdd, num_add(&x, y.neg, &y))
+HEFF_FAST V heff_intAdd(V a, V b) {
+  int64_t r;
+  if (BOTH_INT(a, b) && !__builtin_add_overflow((int64_t)a, (int64_t)b - 1, &r)) return (V)r;
+  return heff_intAdd_big(a, b);
+}
+
+// (`2x + 1 - 2y`)
+INT_BIG(V, heff_intSub, num_add(&x, !y.neg && y.n > 0, &y))
+HEFF_FAST V heff_intSub(V a, V b) {
+  int64_t r;
+  if (BOTH_INT(a, b) && !__builtin_sub_overflow((int64_t)a, (int64_t)b - 1, &r)) return (V)r;
+  return heff_intSub_big(a, b);
+}
+
+// (`2x * y`, then its low bit set)
+INT_BIG(V, heff_intMul, num_mul(&x, &y))
+HEFF_FAST V heff_intMul(V a, V b) {
+  int64_t r;
+  if (BOTH_INT(a, b) && !__builtin_mul_overflow((int64_t)a - 1, INT_OF(b), &r)) return (V)r | 1;
+  return heff_intMul_big(a, b);
+}
+
+// (rounded down, as the other backends round; by 0, `abandon`, which
+// the call does.  Of two words only -2^62 / -1 is beyond a word)
+INT_BIG(V, heff_intDiv, y.n == 0 ? heff_abandon() : num_divmod(&x, &y, 0))
+HEFF_FAST V heff_intDiv(V a, V b) {
+  if (BOTH_INT(a, b) && b != MK_INT(0)) {
+    int64_t x = INT_OF(a), y = INT_OF(b), q = x / y, r = x % y;
+    if (r != 0 && ((r < 0) != (y < 0))) q -= 1;
+    if (HEFF_LIKELY(q < INT_LIM)) return MK_INT(q);
+  }
+  return heff_intDiv_big(a, b);
+}
+
+// (of the divisor's sign, and nearer 0 than it: a word)
+INT_BIG(V, heff_intMod, y.n == 0 ? heff_abandon() : num_divmod(&x, &y, 1))
+HEFF_FAST V heff_intMod(V a, V b) {
+  if (BOTH_INT(a, b) && b != MK_INT(0)) {
+    int64_t y = INT_OF(b), r = INT_OF(a) % y;
+    if (r != 0 && ((r < 0) != (y < 0))) r += y;
+    return MK_INT(r);
+  }
+  return heff_intMod_big(a, b);
+}
+
+// A comparison, as C's condition (`heff_intLt_c`) and as its Bool.
+// Words are in the order of their integers, and equal as they are; a
+// word and a big one are never equal.
+#define INT_CMP(name, op, cmp)                                          \
+  INT_BIG(int, name##_c, num_cmp(&x, &y) cmp)                           \
+  HEFF_FAST int name##_c(V a, V b) {                                    \
+    if (BOTH_INT(a, b)) return (int64_t)a op (int64_t)b;                \
+    return name##_c_big(a, b);                                          \
+  }                                                                     \
+  HEFF_FAST V name(V a, V b) { return heff_bool(name##_c(a, b)); }
+INT_CMP(heff_intEq, ==, == 0)
+INT_CMP(heff_intLt, <, < 0)
+INT_CMP(heff_intLe, <=, <= 0)
 
 // An integer's bits are as two's complement has them, its sign extended
 // for ever (Python's): two words' operation is the words', a big one's
@@ -791,7 +851,7 @@ static V heff_intShl(V a, V b) {
   int64_t k = INT_OF(b);
   if (IS_INT(a) && k < 62) {
     __int128 r = (__int128)INT_OF(a) * ((__int128)1 << k);
-    if (r < INT_MAX62 && r > -INT_MAX62) return MK_INT((int64_t)r);
+    if (r < INT_LIM && r >= -INT_LIM) return MK_INT((int64_t)r);
   }
   Num x;
   num_of(a, &x);
@@ -901,7 +961,7 @@ static V heff_big_lit(const char *s) {
 
 // (a float's integer part, beyond a word if it must be)
 static V heff_int_of_double(double f) {
-  if (f < (double)INT_MAX62 && f > -(double)INT_MAX62) return MK_INT((int64_t)f);
+  if (f < (double)INT_LIM && f >= -(double)INT_LIM) return MK_INT((int64_t)f);
   int e;
   double fr = frexp(fabs(f), &e);
   uint64_t mant = (uint64_t)ldexp(fr, 53);
@@ -1212,7 +1272,7 @@ static uint64_t heff_int_low64(V v) {
 }
 
 static V heff_int_u64(uint64_t m) {
-  if (m < (uint64_t)INT_MAX62) return MK_INT((int64_t)m);
+  if (m < (uint64_t)INT_LIM) return MK_INT((int64_t)m);
   uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
   return big_make(0, d, 2);
 }
