@@ -2,6 +2,7 @@
 -- and its JavaScript (a curried function; `$T`/`$F` the answers, builtin's
 -- True and False).
 
+import heff.fixed as Fx
 import prelude
 
 type PrimImpl = { arity : Int, js : String }
@@ -12,8 +13,8 @@ mkPrim arity js = { arity = arity, js = js }
 -- (std.math's, `floatSin` to `floatPow`: JavaScript's `Math`, as C's libm
 -- has them -- `floatPow` as C's `pow`, where 1 to the power NaN is 1, and
 -- so is -1 to an infinite one)
-prims : List (Pair String PrimImpl)
-prims =
+basicPrims : List (Pair String PrimImpl)
+basicPrims =
   [ MkPair "intAdd" (mkPrim 2 "(a) => (b) => a + b")
   , MkPair "intSub" (mkPrim 2 "(a) => (b) => a - b")
   , MkPair "intMul" (mkPrim 2 "(a) => (b) => a * b")
@@ -107,6 +108,132 @@ prims =
        "(c) => c >= 0n && c <= 65535n ? String.fromCharCode(Number(c)) : \"\"")
   ]
 
+-- The fixed-width types' (heff.fixed): an integer of up to 32 bits is a
+-- number, one of 64 a BigInt, each of its type's range; a `Float32` is a
+-- number, rounded to one (`Math.fround`).
+--------------------------------------------------------------------------------
+
+-- (an integer's result, wrapped around to the type's range)
+narrowJs : Fx.Fixed -> String -> String
+narrowJs I8 e = "(" ++ e ++ ") << 24 >> 24"
+narrowJs I16 e = "(" ++ e ++ ") << 16 >> 16"
+narrowJs I32 e = "(" ++ e ++ ") | 0"
+narrowJs I64 e = "BigInt.asIntN(64, " ++ e ++ ")"
+narrowJs U8 e = "(" ++ e ++ ") & 255"
+narrowJs U16 e = "(" ++ e ++ ") & 65535"
+narrowJs U32 e = "(" ++ e ++ ") >>> 0"
+narrowJs U64 e = "BigInt.asUintN(64, " ++ e ++ ")"
+narrowJs F32 e = "Math.fround(" ++ e ++ ")"
+
+isBig : Fx.Fixed -> Bool
+isBig w = Fx.fixedBits w == 64
+
+-- (zero, and the mask of a shift's amount: as many as the bits)
+zeroJs : Fx.Fixed -> String
+zeroJs w = if isBig w then "0n" else "0"
+
+shiftMaskJs : Fx.Fixed -> String
+shiftMaskJs w = showInt (Fx.fixedBits w - 1) ++ (if isBig w then "n" else "")
+
+bin : String -> String
+bin body = "(a) => (b) => " ++ body
+
+-- (by zero, `abandon`)
+byNonZero : Fx.Fixed -> String -> String
+byNonZero w e = bin ("b === " ++ zeroJs w ++ " ? $abandon() : " ++ e)
+
+relJs : String -> String
+relJs op = bin ("a " ++ op ++ " b ? $T : $F")
+
+-- (an integer type's operation)
+intOpJs : Fx.Fixed -> Fx.FixedOp -> String
+intOpJs w OpAdd = bin (narrowJs w "a + b")
+intOpJs w OpSub = bin (narrowJs w "a - b")
+intOpJs w OpMul =
+  bin (narrowJs w (if isBig w then "a * b" else "Math.imul(a, b)"))
+intOpJs w OpDiv =
+  byNonZero w (narrowJs w (if isBig w then "a / b" else "Math.trunc(a / b)"))
+intOpJs w OpRem = byNonZero w (narrowJs w "a % b")
+intOpJs w OpEq = relJs "==="
+intOpJs w OpLt = relJs "<"
+intOpJs w OpLe = relJs "<="
+intOpJs w OpAnd = bin (narrowJs w "a & b")
+intOpJs w OpOr = bin (narrowJs w "a | b")
+intOpJs w OpXor = bin (narrowJs w "a ^ b")
+intOpJs w OpShl = bin (narrowJs w ("a << (b & " ++ shiftMaskJs w ++ ")"))
+intOpJs w OpShr =
+  bin
+    (narrowJs
+       w
+       ("a "
+        ++ (if Fx.fixedSigned w || isBig w then ">>" else ">>>")
+        ++ " (b & "
+        ++ shiftMaskJs w
+        ++ ")"))
+intOpJs w OpShow = "(a) => a.toString()"
+intOpJs w OpFromInt =
+  if isBig w then "(a) => " ++ narrowJs w "a"
+  else "(a) => Number(BigInt.as"
+    ++ (if Fx.fixedSigned w then "IntN(" else "UintN(")
+    ++ showInt (Fx.fixedBits w)
+    ++ ", a))"
+intOpJs w OpToInt = if isBig w then "(a) => a" else "(a) => BigInt(a)"
+intOpJs w _ = "(a) => $abandon()"
+
+-- (a `Float32` shown: the fewest digits that read back as the same one,
+-- as lib/c/runtime.c's `heff_float32Show` says -- for each count of
+-- digits, the number of that many nearest it, of two as near the one whose
+-- last digit is even -- computed exactly, its bits a fraction of BigInts
+-- (`toPrecision` would take the greater of two as near))
+float32ShowJs : String
+float32ShowJs =
+  joinWith
+    " "
+    [ "(a) => { let t = a; if (Number.isFinite(a) && a !== 0) {"
+    , "const v = new DataView(new ArrayBuffer(4)); v.setFloat32(0, Math.abs(a));"
+    , "const b = v.getUint32(0), be = b >>> 23;"
+    , "const m = BigInt(be ? (b & 8388607) | 8388608 : b & 8388607), e = (be || 1) - 150;"
+    , "const n = e >= 0 ? m << BigInt(e) : m, d = e >= 0 ? 1n : 1n << BigInt(-e);"
+    , "const ge = (k) => k >= 0 ? n >= d * 10n ** BigInt(k) : n * 10n ** BigInt(-k) >= d;"
+    , "let k = Math.floor(Math.log10(Math.abs(a))); while (!ge(k)) k--; while (ge(k + 1)) k++;"
+    , "for (let p = 1; p <= 9; p++) { const s = k - p + 1;"
+    , "const num = s >= 0 ? n : n * 10n ** BigInt(-s), den = s >= 0 ? d * 10n ** BigInt(s) : d;"
+    , "let q = num / den; const r2 = 2n * (num % den);"
+    , "if (r2 > den || (r2 === den && (q & 1n))) q++;"
+    , "const c = Number(q + \"e\" + s) * Math.sign(a);"
+    , "if (Math.fround(c) === a) { t = c; break; } } }"
+    , "const s = String(t); return isNaN(s + \".0\") ? s : s + \".0\"; }"
+    ]
+
+-- (`Float32`'s)
+float32OpJs : Fx.FixedOp -> String
+float32OpJs OpAdd = bin "Math.fround(a + b)"
+float32OpJs OpSub = bin "Math.fround(a - b)"
+float32OpJs OpMul = bin "Math.fround(a * b)"
+float32OpJs OpDiv = bin "Math.fround(a / b)"
+float32OpJs OpEq = relJs "==="
+float32OpJs OpLt = relJs "<"
+float32OpJs OpLe = relJs "<="
+float32OpJs OpSqrt = "(a) => Math.fround(Math.sqrt(a))"
+float32OpJs OpShow = float32ShowJs
+float32OpJs OpFromFloat = "(a) => Math.fround(a)"
+float32OpJs OpToFloat = "(a) => a"
+float32OpJs OpFromInt = "(a) => Math.fround(Number(a))"
+float32OpJs OpFloor =
+  "(a) => Number.isFinite(a) ? BigInt(Math.floor(a)) : $abandon()"
+float32OpJs _ = "(a) => $abandon()"
+
+fixedJs : Fx.FixedPrim -> String
+fixedJs p =
+  if Fx.isFloat32 p.fixed then float32OpJs p.op else intOpJs p.fixed p.op
+
+fixedImpl : Fx.FixedPrim -> Pair String PrimImpl
+fixedImpl p = MkPair (Fx.fixedPrimName p) (mkPrim (Fx.opArity p.op) (fixedJs p))
+
+-- | the primitives a program may name (`foreign import`)
+prims : List (Pair String PrimImpl)
+prims = concatList basicPrims (map fixedImpl Fx.fixedPrims)
+
 -- | the primitives the compiler writes, which no program names: an
 -- | operation of a program's world handed to the world (only the
 -- | runtime has it, `$performer`; see `heff.lower`'s `lowerProgram`)
@@ -127,3 +254,9 @@ primArity p = primArityGo p allPrims
 
 -- >>> primArity "strSlice"
 -- Just 3
+
+-- >>> primArity "uint8Shl"
+-- Just 2
+
+-- >>> map (\(p : Pair String PrimImpl) -> (snd p).js) (filter (\(p : Pair String PrimImpl) -> strEq (fst p) "int8Div") prims)
+-- Cons "(a) => (b) => b === 0 ? $abandon() : (Math.trunc(a / b)) << 24 >> 24" Nil

@@ -12,6 +12,7 @@
 
 import array as A
 import heff.dict as D
+import heff.fixed as Fx
 import heff.globals as G
 import heff.syntax as Sx
 import map as M
@@ -166,6 +167,75 @@ nthV : List Val -> Int -> Maybe Val
 nthV Nil i = Nothing
 nthV (Cons x xs) i = if i == 0 then Just x else nthV xs (i - 1)
 
+-- The fixed-width integers (heff.fixed): each an integer of its type's
+-- range, computed with as one and wrapped around to the type
+
+-- (whether two integers' signs differ)
+signsDiffer : Int -> Int -> Bool
+signsDiffer a b = if a < 0 then b >= 0 else b < 0
+
+-- (as C divides: rounding toward zero)
+truncDiv : Int -> Int -> Int
+truncDiv a b = if a % b /= 0 && signsDiffer a b then a / b + 1 else a / b
+
+-- (the bits of two integers from 0 to 2^n - 1, each pair to one by `f`)
+bitwise : (Int -> Int -> Int) -> Int -> Int -> Int -> Int
+bitwise f n a b =
+  if n == 0 then 0
+  else f (a % 2) (b % 2) + 2 * bitwise f (n - 1) (a / 2) (b / 2)
+
+-- (an integer type's operation of two values, as its bits: those of the
+-- values from 0 to 2^bits - 1)
+bitsOf : Fx.Fixed -> (Int -> Int -> Int) -> Int -> Int -> RVal
+bitsOf w f a b =
+  Ok
+    (VInt
+       (Fx.wrapFixed
+          w
+          (bitwise
+             f
+             (Fx.fixedBits w)
+             (a % Fx.twoTo (Fx.fixedBits w))
+             (b % Fx.twoTo (Fx.fixedBits w)))))
+
+wrapV : Fx.Fixed -> Int -> RVal
+wrapV w n = Ok (VInt (Fx.wrapFixed w n))
+
+-- (a shift's amount: modulo the bits)
+shiftOf : Fx.Fixed -> Int -> Int
+shiftOf w b = Fx.twoTo (b % Fx.fixedBits w)
+
+fixedInt2 : Fx.Fixed -> Fx.FixedOp -> Int -> Int -> RVal
+fixedInt2 w OpAdd a b = wrapV w (a + b)
+fixedInt2 w OpSub a b = wrapV w (a - b)
+fixedInt2 w OpMul a b = wrapV w (a * b)
+fixedInt2 w OpDiv a b = if b == 0 then Abn else wrapV w (truncDiv a b)
+fixedInt2 w OpRem a b = if b == 0 then Abn else wrapV w (a - b * truncDiv a b)
+fixedInt2 w OpEq a b = Ok (boolV (a == b))
+fixedInt2 w OpLt a b = Ok (boolV (a < b))
+fixedInt2 w OpLe a b = Ok (boolV (a <= b))
+fixedInt2 w OpAnd a b = bitsOf w (\x y -> x * y) a b
+fixedInt2 w OpOr a b = bitsOf w (\x y -> if x + y > 0 then 1 else 0) a b
+fixedInt2 w OpXor a b = bitsOf w (\x y -> (x + y) % 2) a b
+fixedInt2 w OpShl a b = wrapV w (a * shiftOf w b)
+-- (rounding down: arithmetic, of a negative value)
+fixedInt2 w OpShr a b = Ok (VInt (a / shiftOf w b))
+fixedInt2 w _ a b = Abn
+
+fixedInt1 : Fx.Fixed -> Fx.FixedOp -> Int -> RVal
+fixedInt1 w OpShow a = Ok (VStr (showInt a))
+fixedInt1 w OpFromInt a = wrapV w a
+fixedInt1 w OpToInt a = Ok (VInt a)
+fixedInt1 w _ a = Abn
+
+-- (a `Float32`'s abandon here, the interpreter having no `Float32` of its
+-- own to compute with)
+fixedPrimV : Fx.FixedPrim -> Val
+fixedPrimV p =
+  if Fx.isFloat32 p.fixed then VFun (\d a -> Abn)
+  else if Fx.opArity p.op == 2 then int2 (fixedInt2 p.fixed p.op)
+  else int1 (fixedInt1 p.fixed p.op)
+
 prim : String -> Val
 prim p =
   if strEq p "intAdd" then int2 (\a b -> Ok (VInt (a + b)))
@@ -269,7 +339,9 @@ prim p =
   else if strEq p "strCharCode"
     then str1 (\a -> Ok (int1 (\i -> Ok (VInt (charCode a i)))))
   else if strEq p "strFromCharCode" then int1 (\c -> Ok (VStr (fromCharCode c)))
-  else abandon
+  else case Fx.fixedPrimOf p of
+    Just fp -> fixedPrimV fp
+    Nothing -> abandon
 
 type Env = { local : List (Th RVal), global : M.Map String (Th RVal) }
 

@@ -1070,6 +1070,143 @@ static inline float heff_f32_of(V v) {
   return f;
 }
 
+// Fixed-width numbers
+// ---------------------------------------------------------------------
+// (heff.fixed's.)  An integer of up to 32 bits is a word of its value,
+// in its type's range; one of 64 bits is kept as an `Int` is (a word, big
+// beyond 62 bits), so `toInt` is nothing.  An integer's operation is
+// done on its 64 bits, unsigned (where no overflow is undefined), and the
+// result wrapped around to its type; a division by -1 is a negation
+// (that of the least, itself), as no C division by -1 is safe.  A
+// `Float32` is a word of its bits (`heff_f32`): C's `float` is IEEE's,
+// each operation rounded, as JavaScript's `Math.fround` rounds.
+
+// (an integer's lowest 64 bits, as two's complement has them; borrowed)
+static uint64_t heff_int_low64(V v) {
+  if (IS_INT(v)) return (uint64_t)INT_OF(v);
+  Big *b = (Big *)v;
+  uint64_t m = b->n > 0 ? b->d[0] : 0;
+  if (b->n > 1) m |= (uint64_t)b->d[1] << 32;
+  return b->neg ? (uint64_t)0 - m : m;
+}
+
+static V heff_int_u64(uint64_t m) {
+  if (m < (uint64_t)INT_MAX62) return MK_INT((int64_t)m);
+  uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
+  return big_make(0, d, 2);
+}
+
+// (a value of the type `T`, its 64 bits taken (and consumed), and one
+// made of 64 bits, wrapped around to `T`)
+#define FX_WORD(T)                                                          \
+  static inline uint64_t fx_get_##T(V v) { return (uint64_t)INT_OF(v); }    \
+  static inline V fx_mk_##T(uint64_t u) { return MK_INT((int64_t)(T)u); }
+FX_WORD(int8_t)
+FX_WORD(int16_t)
+FX_WORD(int32_t)
+FX_WORD(uint8_t)
+FX_WORD(uint16_t)
+FX_WORD(uint32_t)
+
+static inline uint64_t fx_get_int64_t(V v) {
+  uint64_t u = heff_int_low64(v);
+  heff_drop(v);
+  return u;
+}
+static inline V fx_mk_int64_t(uint64_t u) { return heff_int((int64_t)u); }
+static inline uint64_t fx_get_uint64_t(V v) { return fx_get_int64_t(v); }
+static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
+
+// (an integer type's primitives: `heff_int32Add` and the rest, `T` its C
+// type, `BITS` its bits)
+#define FX_INT(name, T, BITS)                                                        \
+  static V heff_##name##Add(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x + y); }       \
+  static V heff_##name##Sub(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x - y); }       \
+  static V heff_##name##Mul(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x * y); }       \
+  static V heff_##name##Div(V a, V b) {                                              \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
+    if (y == 0) return heff_abandon();                                               \
+    if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T((uint64_t)0 - (uint64_t)x);    \
+    return fx_mk_##T((uint64_t)(x / y)); }                                           \
+  static V heff_##name##Rem(V a, V b) {                                              \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
+    if (y == 0) return heff_abandon();                                               \
+    if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T(0);                            \
+    return fx_mk_##T((uint64_t)(x % y)); }                                           \
+  static V heff_##name##Eq(V a, V b) {                                               \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return heff_bool(x == y); }       \
+  static V heff_##name##Lt(V a, V b) {                                               \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return heff_bool(x < y); }        \
+  static V heff_##name##Le(V a, V b) {                                               \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return heff_bool(x <= y); }       \
+  static V heff_##name##And(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x & y); }       \
+  static V heff_##name##Or(V a, V b) {                                               \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x | y); }       \
+  static V heff_##name##Xor(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x ^ y); }       \
+  static V heff_##name##Shl(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b);                                  \
+    return fx_mk_##T(x << (y & (BITS - 1))); }                                       \
+  static V heff_##name##Shr(V a, V b) {                                              \
+    uint64_t x = fx_get_##T(a), y = fx_get_##T(b);                                  \
+    return fx_mk_##T((uint64_t)((T)x >> (y & (BITS - 1)))); }                        \
+  static V heff_##name##Show(V a) { return heff_intShow(a); }                        \
+  static V heff_##name##FromInt(V a) {                                               \
+    uint64_t u = heff_int_low64(a); heff_drop(a); return fx_mk_##T(u); }             \
+  static V heff_##name##ToInt(V a) { return a; }
+FX_INT(int8, int8_t, 8)
+FX_INT(int16, int16_t, 16)
+FX_INT(int32, int32_t, 32)
+FX_INT(int64, int64_t, 64)
+FX_INT(uint8, uint8_t, 8)
+FX_INT(uint16, uint16_t, 16)
+FX_INT(uint32, uint32_t, 32)
+FX_INT(uint64, uint64_t, 64)
+
+#define F32_2(name, expr) \
+  static V heff_float32##name(V a, V b) { float x = heff_f32_of(a), y = heff_f32_of(b); return expr; }
+F32_2(Add, heff_f32(x + y))
+F32_2(Sub, heff_f32(x - y))
+F32_2(Mul, heff_f32(x * y))
+F32_2(Div, heff_f32(x / y))
+F32_2(Eq, heff_bool(x == y))
+F32_2(Lt, heff_bool(x < y))
+F32_2(Le, heff_bool(x <= y))
+static V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
+
+// (the fewest digits that read back as the same `Float32`, read as a float
+// reads them (through a double), written as a float is: for each count of
+// digits, the number of that many nearest it (of two as near, the one
+// whose last digit is even, as printf rounds), if it reads back so; nine
+// always do)
+static V heff_float32Show(V a) {
+  float f = heff_f32_of(a);
+  double d = f;
+  char buf[64];
+  if (isfinite(d) && d != 0)
+    for (int p = 1; p <= 9; p++) {
+      snprintf(buf, sizeof buf, "%.*e", p - 1, d);
+      double t = strtod(buf, NULL);
+      if ((float)t == f) { d = t; break; }
+    }
+  heff_js_number(d, buf);
+  if (!strpbrk(buf, ".eNI")) strcat(buf, ".0");
+  return heff_str_ascii(buf);
+}
+
+static V heff_float32FromFloat(V a) { float f = (float)FLT_OF(a); heff_drop(a); return heff_f32(f); }
+static V heff_float32ToFloat(V a) { return heff_flt((double)heff_f32_of(a)); }
+static V heff_float32FromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_f32((float)d); }
+static V heff_float32Floor(V a) {
+  double d = heff_f32_of(a);
+  if (!isfinite(d)) return heff_abandon();
+  return heff_int_of_double(floor(d));
+}
+
 // Arrays
 // ---------------------------------------------------------------------
 
