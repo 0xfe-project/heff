@@ -33,9 +33,11 @@ heff is written in heff.  The package's modules (`src/heff/`) are the
 compiler as a library, each command's work among them
 (`heff.commands`); the program `heff` is `app/heff/main.hf`, which reads
 the command line and gives the commands the world they run in.
-`boot/heff.mjs.gz` is the compiler compiled to JavaScript, the seed: the
-build (`node scripts/build.mjs`) runs it on Node.js to compile the
-program to C, which `zig cc` builds into `output/heff`.
+The build (`node scripts/build.mjs`) compiles the program to C with the
+heff built before (`output/heff`), and `zig cc` builds it into
+`output/heff`.  Where there is no heff yet, it starts from the seed,
+`boot/heff.tar.xz`: heff compiled by itself to C, which zig builds for
+whatever machine it is on.
 
 `editors/vscode` is a VS Code extension for the language server; a
 release has it built (`heff-X.Y.Z.vsix`).
@@ -184,6 +186,6 @@ the interpreter), `fixpoint` (heff compiles itself to the same C) and
 `type-at` on the library and test files; after an intended change,
 update it with `node test/golden.mjs --update`.
 
-`node scripts/boot.mjs` replaces the seed with the current compiler,
-compiled to JavaScript, once that compiles itself to an identical file.  This is needed only when a
-language change means the old copy can no longer compile the source.
+`node scripts/boot.mjs` replaces the seed with the current compiler's
+C, once it compiles itself to the same C.  This is needed only when a
+language change means the old seed can no longer compile the source.

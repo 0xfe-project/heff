@@ -6,21 +6,20 @@
 // (each file apart, and again only those changed) into output/heff,
 // `heff`.  Stage 0 is the heff built before (output/heff), as Go builds
 // with a Go there is; where there is none, or it cannot compile the
-// source, the seed: boot/heff.mjs.gz (the compiler compiled to
-// JavaScript, kept compressed), unpacked to output/heff-seed.mjs and run
-// on Node.js.  (test/gen-fixpoint.mjs holds that heff compiles itself to
-// the same C; `node scripts/boot.mjs` renews the seed.)
+// source, the seed: boot/heff.tar.xz, heff compiled by itself to C,
+// unpacked to output/heff-seed.d/ and built by zig for this machine.
+// (test/gen-fixpoint.mjs holds that heff compiles itself to the same C;
+// `node scripts/boot.mjs` renews the seed.)
 //
 //   node scripts/build.mjs [--seed]     (--seed: from the seed, always)
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const exe = process.platform === "win32" ? ".exe" : "";
-const seed = join(root, "boot", "heff.mjs.gz");
+const seed = join(root, "boot", "heff.tar.xz");
 const out = join(root, "output", "heff" + exe);
 const parts = join(root, "output", "heff.d");
 const fromSeed = process.argv.includes("--seed");
@@ -63,25 +62,26 @@ mkdirSync(join(root, "output"), { recursive: true });
 const stage0 = join(root, "output", "heff-stage0" + exe);
 const stage1 = join(root, "output", "heff-stage1" + exe);
 const stage1C = join(root, "output", "heff-stage1.d");
-let native = false;
+let first = false;
 if (!fromSeed && mtime(out) >= 0) {
   // (the heff there is, set apart: the build writes over it)
   copyFileSync(out, stage0);
-  if (toC(stage0, stage1C)) {
-    cc(stage1C, stage1);
-    native = true;
-  } else console.error("heff build: the heff there is cannot compile the source; from the seed");
+  first = toC(stage0, stage1C);
+  if (!first) console.error("heff build: the heff there is cannot compile the source; from the seed");
 }
-if (native) {
-  if (!toC(stage1, parts)) { console.error("heff build: the first stage could not compile itself"); process.exit(1); }
-} else {
-  const unpacked = join(root, "output", "heff-seed.mjs");
-  const stage1Js = join(root, "output", "heff-stage1.mjs");
-  writeFileSync(unpacked, gunzipSync(readFileSync(seed)));
-  step("the first stage (the seed compiling app/heff/main.hf)", process.execPath,
-    [unpacked, "compile", "app/heff/main.hf", stage1Js, "--name", "main", "--backend=node"]);
-  step("the compiler in C (the first stage compiling itself)", process.execPath,
-    [stage1Js, "compile", "app/heff/main.hf", parts + "/", "--name", "main", "--backend=c"]);
+if (!first) {
+  // (the seed, built for this machine; `tar` with xz: libarchive's, on
+  // macOS and Windows, GNU's with xz, on Linux)
+  const seedC = join(root, "output", "heff-seed.d");
+  const seedExe = join(root, "output", "heff-seed" + exe);
+  rmSync(seedC, { recursive: true, force: true });
+  mkdirSync(seedC, { recursive: true });
+  step("unpacking the seed", "tar", ["-xJf", seed, "-C", seedC]);
+  cc(seedC, seedExe);
+  step("the seed compiling app/heff/main.hf", seedExe,
+    ["compile", "app/heff/main.hf", stage1C + "/", "--name", "main", "--backend=c"]);
 }
+cc(stage1C, stage1);
+if (!toC(stage1, parts)) { console.error("heff build: the first stage could not compile itself"); process.exit(1); }
 cc(parts, out);
-console.log(`heff build: ${out}, the compiler compiled by itself${native ? "" : " (from the seed)"}`);
+console.log(`heff build: ${out}, the compiler compiled by itself${first ? "" : " (from the seed)"}`);
