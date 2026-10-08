@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// The compiler's cache (.heff/<module>.hc): a second run
+// The compiler's cache (.heff/vN/<module>.hc): a second run
 // thaws what the first elaborated (the dependency's cache file is not
 // rewritten), corruption heals over, a new name in a dependency
 // re-elaborates the importer, and a comment-only change does not --
 // the invalidation is at the definitions used, not at whole imports.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +24,8 @@ writeFileSync(join(dir, "b.hf"), "import a\nimport prelude\n\nten : Int\nten = n
 writeFileSync(join(dir, "c.hf"), "import b\nimport prelude\n\n-- >>> ten\n-- 10\n");
 
 const heff = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
-const hc = (m) => join(dir, ".heff", m + ".hc");
+// (the cache files of this heff's version: the one directory under .heff/)
+const hc = (m) => join(dir, ".heff", readdirSync(join(dir, ".heff"))[0], m + ".hc");
 const mtime = (m) => statSync(hc(m)).mtimeMs;
 
 let failed = 0;

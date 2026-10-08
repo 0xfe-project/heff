@@ -1,5 +1,5 @@
 // The goldens' runner: each invocation a child process, as many at once
-// as there are cores.  The cache (.heff/*.hc) is shared among them --
+// as there are cores.  The cache (.heff/vN/*.hc) is shared among them --
 // concurrent writers of one module write the same bytes, and a torn
 // file does not decode, so it is elaborated over.
 import { spawn } from "node:child_process";
