@@ -198,7 +198,12 @@ A number literal is of the type it is used at: an integer literal of any
 number type, a fractional one (`2.5`) of a float type.  An integer
 literal may be written in hexadecimal, `0x605`, or in binary,
 `0b1010`, and any number's digits may be set apart by `_`
-(`1_000_000`); the formatter keeps it as it is written.  Where the type is
+(`1_000_000`); the formatter keeps it as it is written.  A literal may
+be negative: `-` right before a digit is its sign, unless it is right
+after an operand (a name, a literal, a closing bracket, with no space
+between).  So `a - 1` and `a-1` subtract, while `f -1` and `a -1` are
+applied to -1; `-128` as an `Int8` is its least, and a pattern may be
+negative too.  There is no other unary minus: `0 - x` negates.  Where the type is
 not known yet, the literal waits for it, and unification finds it from
 how the literal is used (`id 5` wanted as an `Int32` is one).  It must be
 one of the type's values, however late the type is found: `300` as a
