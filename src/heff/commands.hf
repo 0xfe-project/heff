@@ -789,36 +789,75 @@ ranOut r = r.out
 ranErr : Ran -> String
 ranErr r = r.err
 
--- | the project's programs: `app/X/` with a build.hf is the program X
-programsIn : {e : HFunctor}
-           -> {{disk : fs <: e}}
-           -> P.Style
-           -> List String
-           -> Co e (List String)
-programsIn st Nil = pure Nil
-programsIn st (Cons x rest) = do
-  m <- readFile (P.join st (P.join st "app" x) "build.hf")
-  more <- programsIn st rest
-  pure (case m of
-    Just _ -> Cons x more
-    Nothing -> more)
-
 -- | where `heff build` writes the project's programs: `.heff/bin/`
 binDir : P.Style -> String
 binDir st = P.join st ".heff" "bin"
 
+-- | what a build makes, and where: the project at `root`, its programs
+-- | written to `bin`, each said as it is made (`wrote`, `installed`); a
+-- | page's script made too, if `pages`
+type Target = { root : String, bin : String, said : String, pages : Bool }
+
+-- | `heff build`'s: the project at `root`, its programs in `.heff/bin/`
+buildTarget : P.Style -> String -> Target
+buildTarget st root =
+  { root = root
+  , bin = P.join st root (binDir st)
+  , said = "wrote"
+  , pages = True
+  }
+
+-- (a path of the project)
+inProject : P.Style -> Target -> String -> String
+inProject st t p = P.join st t.root p
+
+-- (`app/X/F`, of the project)
+appFile : P.Style -> Target -> String -> String -> String
+appFile st t x f = inProject st t (P.join st (P.join st "app" x) f)
+
+-- (where the C of the program X is: `.heff/build/X/`)
+partsDir : P.Style -> Target -> String -> String
+partsDir st t x = inProject st t (P.join st (P.join st ".heff" "build") x)
+
+-- | the project's programs: `app/X/` with a build.hf is the program X
+programsIn : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> P.Style
+           -> Target
+           -> List String
+           -> Co e (List String)
+programsIn st t Nil = pure Nil
+programsIn st t (Cons x rest) = do
+  m <- readFile (appFile st t x "build.hf")
+  more <- programsIn st t rest
+  pure (case m of
+    Just _ -> Cons x more
+    Nothing -> more)
+
+-- (said: `path` is made; then `next`)
+wrote : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> Target
+      -> String
+      -> Co e Unit
+      -> Co e Unit
+wrote t path next = do
+  print (t.said ++ " " ++ path)
+  next
+
 -- (`.heff/build/X/`, a C file a module, by `zig cc` -- which builds
--- them at once, and again only those that changed -- is `.heff/bin/X`)
+-- them at once, and again only those that changed -- is the program X)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
       -> {{disk : fs <: e}}
       -> P.Style
+      -> Target
       -> String
       -> Co e Unit
       -> Co e Unit
-zigCc st x next = do
-  names <- readDir (P.join st (P.join st ".heff" "build") x)
+zigCc st t x next = do
+  names <- readDir (partsDir st t x)
   r <-
     run
       "zig"
@@ -826,40 +865,27 @@ zigCc st x next = do
          ["cc", "-O2", "-w"]
          (concatList
             (map
-               (\n -> P.join st (P.join st (P.join st ".heff" "build") x) n)
+               (\n -> P.join st (partsDir st t x) n)
                (filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
-            ["-o", P.join st (binDir st) x, "-lm"]))
-  if ranStatus r == 0
-      then do
-        print ("wrote " ++ P.join st (binDir st) x)
-        next
+            ["-o", P.join st t.bin x, "-lm"]))
+  if ranStatus r == 0 then wrote t (P.join st t.bin x) next
     else do
       writeErr (ranErr r)
-      printErr
-          ("heff build: `zig cc` could not build " ++ P.join st (binDir st) x)
+      printErr ("heff build: `zig cc` could not build " ++ P.join st t.bin x)
       exit 1
 
--- (said: `path` is written; then `next`)
-wrote : {e : HFunctor}
-      -> {{io : stdio <: e}}
-      -> String
-      -> Co e Unit
-      -> Co e Unit
-wrote path next = do
-  print ("wrote " ++ path)
-  next
-
--- (`.heff/bin/X`, a Node.js program, made runnable)
+-- (the program X, a Node.js program, made runnable)
 nodeDone : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> P.Style
+         -> Target
          -> String
          -> Co e Unit
          -> Co e Unit
-nodeDone st x next = do
-  r <- run "chmod" ["+x", P.join st (binDir st) x]
-  wrote (P.join st (binDir st) x) next
+nodeDone st t x next = do
+  r <- run "chmod" ["+x", P.join st t.bin x]
+  wrote t (P.join st t.bin x) next
 
 -- (the program X, compiled as its build.hf says, then `next`)
 buildApp : {e : HFunctor}
@@ -867,60 +893,197 @@ buildApp : {e : HFunctor}
          -> {{sys : process <: e}}
          -> {{disk : fs <: e}}
          -> P.Style
+         -> Target
          -> String
          -> Pr.Build
          -> Co e Unit
          -> Co e Unit
-buildApp st x a next =
+buildApp st t x a next =
   if strEq a.backend "c"
     then cThen
         (Just a.run)
-        (P.join st (P.join st ".heff" "build") x ++ "/")
-        (P.join st (P.join st "app" x) "main.hf")
-        (zigCc st x next)
+        (partsDir st t x ++ "/")
+        (appFile st t x "main.hf")
+        (zigCc st t x next)
   else if strEq a.backend "node"
     then compileThen
         "node"
         (Just a.run)
-        (P.join st (binDir st) x)
-        (P.join st (P.join st "app" x) "main.hf")
-        (nodeDone st x next)
-  else compileThen
-      "page"
-      (Just a.run)
-      (P.join st (binDir st) (x ++ ".js"))
-      (P.join st (P.join st "app" x) "main.hf")
-      (wrote (P.join st (binDir st) (x ++ ".js")) next)
+        (P.join st t.bin x)
+        (appFile st t x "main.hf")
+        (nodeDone st t x next)
+  else if t.pages
+    then compileThen
+        "page"
+        (Just a.run)
+        (P.join st t.bin (x ++ ".js"))
+        (appFile st t x "main.hf")
+        (wrote t (P.join st t.bin (x ++ ".js")) next)
+  else do
+    print ("passed over " ++ x ++ ": a page's script, not a program")
+    next
 
--- (each program, by its build.hf)
+-- (each program, by its build.hf, then `done`)
 buildEach : {e : HFunctor}
           -> {{io : stdio <: e}}
           -> {{sys : process <: e}}
           -> {{disk : fs <: e}}
           -> P.Style
+          -> Target
+          -> Co e Unit
           -> List String
           -> Co e Unit
-buildEach st Nil = pure MkUnit
-buildEach st (Cons x rest) = do
-  text <- readFile (P.join st (P.join st "app" x) "build.hf")
+buildEach st t done Nil = done
+buildEach st t done (Cons x rest) = do
+  text <- readFile (appFile st t x "build.hf")
   case Pr.readBuild (fromMaybe "" text) of
     Left p -> do
-      printErr
-          (L.problemMsg
-             (P.join st (P.join st "app" x) "build.hf")
-             (fromMaybe "" text)
-             p)
+      printErr (L.problemMsg (appFile st t x "build.hf") (fromMaybe "" text) p)
       exit 1
-    Right a -> buildApp st x a (buildEach st rest)
+    Right a -> buildApp st t x a (buildEach st t done rest)
 
--- (the names given, else all of them)
-orAll : List String -> List String -> List String
-orAll Nil progs = progs
-orAll names progs = names
+-- (the programs, built to `t.bin`, then `done`)
+buildPrograms : {e : HFunctor}
+              -> {{io : stdio <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : fs <: e}}
+              -> P.Style
+              -> Target
+              -> Co e Unit
+              -> List String
+              -> Co e Unit
+buildPrograms st t done progs = do
+  ok <- mkDir t.bin
+  okC <- mkDir (inProject st t (P.join st ".heff" "build"))
+  buildEach st t done progs
 
--- | build the project's programs (the ones NAMEd, else all): `app/X/` with
--- | a build.hf is the program X, app/X/main.hf compiled as its build.hf
--- | says, to `.heff/bin/`
+-- (the `.hf` files under the paths, the directories walked; a name
+-- starting with `.` passed over)
+hfFilesGo : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> List String
+          -> List String
+          -> Co e (List String)
+hfFilesGo Nil acc = pure (reverse acc)
+hfFilesGo (Cons p rest) acc = do
+  names <- readDir p
+  case names of
+    Just ns -> do
+      st <- styleNow
+      hfFilesGo
+          (concatList
+             (map
+                (\n -> P.join st p n)
+                (filter (\n -> not (startsWith "." n)) ns))
+             rest)
+          acc
+    Nothing ->
+      if endsWith ".hf" p then hfFilesGo rest (Cons p acc)
+      else hfFilesGo rest acc
+
+-- | the modules of the project checked so far, and the errors found
+type Checks = { seen : List String, errors : Int }
+
+errorCount : List Dr.Checked -> Int
+errorCount cs = foldl (\n (c : Dr.Checked) -> n + length (Dr.errorsIn c)) 0 cs
+
+-- | FILE, a module of the project, checked with what it imports, unless
+-- | it was among what a module checked before imports; the diagnostics
+-- | of each module of the project's src/ said once
+checkModule : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> Checks
+            -> String
+            -> Co e Checks
+checkModule acc f = do
+  h <- hostNow
+  ps <- L.pathsFor h f
+  if elemStrM (L.moduleOf ps f) acc.seen then pure acc
+    else do
+      l <- load f
+      badL <- printErrs "heff" l.errors 0
+      cs <- Se.cachedProgram l
+      own <-
+        pure
+          (filter
+             (\(c : Dr.Checked) ->
+                (L.inside l.paths l.paths.src c.path
+                 || strEq c.module (L.moduleOf ps f))
+                && not (elemStrM c.module acc.seen))
+             cs)
+      putFileDiags own
+      pure
+          { seen = concatList (map (\(c : Dr.Checked) -> c.module) own) acc.seen
+          , errors = acc.errors + badL + errorCount own
+          }
+
+checkModules : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> Checks
+             -> List String
+             -> Co e Checks
+checkModules acc Nil = pure acc
+checkModules acc (Cons f rest) = do
+  next <- checkModule acc f
+  checkModules next rest
+
+-- (`n` modules)
+modulesSaid : Int -> String
+modulesSaid 1 = "1 module"
+modulesSaid n = showInt n ++ " modules"
+
+-- (`n` errors)
+errorsSaid : Int -> String
+errorsSaid 1 = "1 error"
+errorsSaid n = showInt n ++ " errors"
+
+-- | the whole project at `t.root` built: every module of its src/
+-- | checked, then, if none has an error, every program of its app/
+-- | built (with none, `none`), then `done`
+buildProject : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> P.Style
+             -> String
+             -> Target
+             -> Co e Unit
+             -> Co e Unit
+             -> Co e Unit
+buildProject st cmd t none done = do
+  files <- hfFilesGo [inProject st t "src"] Nil
+  checked <- checkModules { seen = Nil, errors = 0 } files
+  if checked.errors > 0
+      then do
+        printErr
+            ("heff "
+             ++ cmd
+             ++ ": "
+             ++ errorsSaid checked.errors
+             ++ " in the project's modules: nothing built")
+        exit 1
+    else do
+      print
+          ("heff "
+           ++ cmd
+           ++ ": "
+           ++ modulesSaid (length checked.seen)
+           ++ " checked")
+      found <- readDir (inProject st t "app")
+      progs <- programsIn st t (fromMaybe Nil found)
+      case progs of
+        Nil -> none
+        _ -> buildPrograms st t done progs
+
+-- | build the project here: every module of its src/ checked, and every
+-- | program of it built (only the ones NAMEd, given NAMEs): `app/X/`
+-- | with a build.hf is the program X, app/X/main.hf compiled as its
+-- | build.hf says, to `.heff/bin/`
 buildCmd : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
@@ -930,31 +1093,26 @@ buildCmd : {e : HFunctor}
 buildCmd names = do
   text <- readFile "package.hf"
   st <- styleNow
+  t <- pure (buildTarget st ".")
   case text of
     Nothing -> do
       printErr "heff build: no package.hf here: build at the project's root"
       exit 1
-    Just _ -> do
-      found <- readDir "app"
-      progs <- programsIn st (fromMaybe Nil found)
-      case filter (\n -> not (any (\p -> strEq p n) progs)) names of
-        Cons n _ -> do
-          printErr
-              ("heff build: no program "
-               ++ n
-               ++ ": no app/"
-               ++ n
-               ++ "/build.hf")
-          exit 1
-        Nil -> case orAll names progs of
-          Nil -> do
+    Just _ -> case names of
+      Nil -> buildProject st "build" t (pure MkUnit) (pure MkUnit)
+      _ -> do
+        found <- readDir "app"
+        progs <- programsIn st t (fromMaybe Nil found)
+        case filter (\n -> not (any (\p -> strEq p n) progs)) names of
+          Cons n _ -> do
             printErr
-                "heff build: no programs: app/X/ with a build.hf is the program X"
+                ("heff build: no program "
+                 ++ n
+                 ++ ": no app/"
+                 ++ n
+                 ++ "/build.hf")
             exit 1
-          _ -> do
-            ok <- mkDir (binDir st)
-            okC <- mkDir (P.join st ".heff" "build")
-            buildEach st (orAll names progs)
+          Nil -> buildPrograms st t (pure MkUnit) names
 
 -- | how `heff compile` was called: FILE, OUT, `--name`, `--backend`
 type CompileOpts =
@@ -1477,31 +1635,6 @@ fmtCmd : {e : HFunctor}
 fmtCmd check files = do
   bad <- fmtAll check files 0
   if bad > 0 then exit 1 else pure MkUnit
-
--- (the `.hf` files under the paths, the directories walked; a name
--- starting with `.` passed over)
-hfFilesGo : {e : HFunctor}
-          -> {{sys : process <: e}}
-          -> {{disk : fs <: e}}
-          -> List String
-          -> List String
-          -> Co e (List String)
-hfFilesGo Nil acc = pure (reverse acc)
-hfFilesGo (Cons p rest) acc = do
-  names <- readDir p
-  case names of
-    Just ns -> do
-      st <- styleNow
-      hfFilesGo
-          (concatList
-             (map
-                (\n -> P.join st p n)
-                (filter (\n -> not (startsWith "." n)) ns))
-             rest)
-          acc
-    Nothing ->
-      if endsWith ".hf" p then hfFilesGo rest (Cons p acc)
-      else hfFilesGo rest acc
 
 -- (the watches of the files, checked, and their tests run: how many
 -- hold, of how many, and whether every file checked)
