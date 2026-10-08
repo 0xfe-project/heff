@@ -1055,6 +1055,21 @@ static V heff_floatShow(V a) {
   return heff_str_ascii(buf);
 }
 
+// A Float32 is kept in a word, its bits as an integer's: nothing is
+// allocated for one, as it is for a float.
+static inline V heff_f32(float f) {
+  uint32_t u;
+  memcpy(&u, &f, sizeof u);
+  return MK_INT((int64_t)u);
+}
+
+static inline float heff_f32_of(V v) {
+  uint32_t u = (uint32_t)INT_OF(v);
+  float f;
+  memcpy(&f, &u, sizeof f);
+  return f;
+}
+
 // Arrays
 // ---------------------------------------------------------------------
 
