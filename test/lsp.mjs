@@ -118,23 +118,23 @@ try {
 
   // completion: the names in scope that start as the one being typed; after
   // `A.`, the definitions of the module imported as `A`
-  const typing = "x : Int\nx = len";
+  const typing = "x : String\nx = showI";
   open("test/surface/lsp-complete.hf", typing);
   await diagnosticsOf(uri("test/surface/lsp-complete.hf"));
-  const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 3, character: 7 } });
-  const lengthItem = comp.result && comp.result.find((i) => i.label === "length");
-  expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("List a -> Int") && !comp.result.some((i) => i.label === "map"), comp.result && comp.result.map((i) => i.label));
+  const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 1, character: 9 } });
+  const lengthItem = comp.result && comp.result.find((i) => i.label === "showInt");
+  expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("Int -> String") && !comp.result.some((i) => i.label === "showFloat"), comp.result && comp.result.map((i) => i.label));
   // the prelude, which no file writes an import of: its names in scope,
   // completed and hovered
-  const unwritten = "xs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n\nn : Int\nn = len";
+  const unwritten = "b : Bool\nb = not True\n\nn : String\nn = showI";
   open("test/surface/lsp-unwritten.hf", unwritten);
   await diagnosticsOf(uri("test/surface/lsp-unwritten.hf"));
-  const uHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "map") });
-  expect("hover on a prelude name, not imported", uHover.result && uHover.result.contents.value.includes("map : {a b : Type} -> (a -> b) -> List a -> List b") && uHover.result.contents.value.includes("(global)"), uHover.result);
-  const uComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: { line: 4, character: 7 } });
-  expect("completion of a prelude name, not imported", uComp.result && uComp.result.some((i) => i.label === "length" && i.detail.includes("List a -> Int")), uComp.result && uComp.result.map((i) => i.label));
-  const uDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "map") });
-  expect("definition of a prelude name, not imported", uDef.result && uDef.result.uri === uri("lib/prelude.hf") && uDef.result.range.start.line === pos(disk("lib/prelude.hf"), "map :").line, uDef.result);
+  const uHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "not") });
+  expect("hover on a prelude name, not imported", uHover.result && uHover.result.contents.value.includes("not : Bool -> Bool") && uHover.result.contents.value.includes("(global)"), uHover.result);
+  const uComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: { line: 4, character: 9 } });
+  expect("completion of a prelude name, not imported", uComp.result && uComp.result.some((i) => i.label === "showInt" && i.detail.includes("Int -> String")), uComp.result && uComp.result.map((i) => i.label));
+  const uDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "not") });
+  expect("definition of a prelude name, not imported", uDef.result && uDef.result.uri === uri("lib/prelude.hf") && uDef.result.range.start.line === pos(disk("lib/prelude.hf"), "not :").line, uDef.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") } });
   // the operations of lists, by the name `List`, written by no import:
   // completed after `List.`, hovered, gone to

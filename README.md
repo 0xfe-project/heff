@@ -311,11 +311,11 @@ import gen as G
 
 lists : Test
 lists = group "lists"
-  [ unit "append" (equal (showList showInt) (concatList [1] [2]) [1, 2])
+  [ unit "append" (equal (showList showInt) ([1] ++ [2]) [1, 2])
   , property "reversed twice" (do
       xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))
-      label (if null xs then "empty" else "not empty")
-      equal (showList showInt) (reverse (reverse xs)) xs)
+      label (if List.null xs then "empty" else "not empty")
+      equal (showList showInt) (List.reverse (List.reverse xs)) xs)
   ]
 ```
 

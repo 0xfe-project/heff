@@ -44,11 +44,11 @@ writeFileSync(join(work, "props.hf"), [
   "  , unit \"three\" (equal showInt (1 + 1) 3)",
   "  , property \"all below 50\" (do",
   "      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))",
-  "      assert \"all below 50\" (all (\\x -> x < 50) xs))",
+  "      assert \"all below 50\" (List.all (\\x -> x < 50) xs))",
   "  , property \"reversed twice\" (do",
   "      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))",
-  "      label (if null xs then \"empty\" else \"not empty\")",
-  "      equal (showList showInt) (reverse (reverse xs)) xs)",
+  "      label (if List.null xs then \"empty\" else \"not empty\")",
+  "      equal (showList showInt) (List.reverse (List.reverse xs)) xs)",
   "  ]", "",
 ].join("\n"));
 const props = heff("test", "props.hf");

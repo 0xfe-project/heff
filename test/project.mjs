@@ -393,7 +393,7 @@ expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("
 const { HEFF_LIB: _lib, ...ownEnv } = process.env;
 const selfInstalled = await selfInstalling;
 const installedHeff = (...args) => spawnSync(join(heffHome, "bin", "heff"), args, { cwd: work, encoding: "utf8", env: ownEnv });
-write("uses-prelude.hf", "xs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n");
+write("uses-prelude.hf", "xs : List Int\nxs = List.map (\\x -> x + 1) [1, 2]\n");
 const selfChecked = installedHeff("check", "uses-prelude.hf");
 const selfInit = installedHeff("init", "fromhome");
 const selfVersion = installedHeff("version");
