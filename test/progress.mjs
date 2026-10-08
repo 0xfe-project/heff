@@ -74,9 +74,9 @@ const n = 600;
 const defs = Array.from({ length: n }, (_, i) =>
   `f${i} : Int -> Int\nf${i} x = if x > ${i} then x * ${i % 7 + 2} + ${i} else f${i} (x + 1)\n`);
 writeFileSync(join(hello, "src", "hello", "big.hf"),
-  `import prelude\n\n${defs.join("\n")}\ntotal : Int\ntotal = ${Array.from({ length: n }, (_, i) => `f${i} 1`).join(" + ")}\n`);
+  `${defs.join("\n")}\ntotal : Int\ntotal = ${Array.from({ length: n }, (_, i) => `f${i} 1`).join(" + ")}\n`);
 writeFileSync(join(hello, "app", "hello", "main.hf"), [
-  "import co", "import hello.big", "import hello.greeting", "import prelude", "import std.io", "",
+  "import co", "import hello.big", "import hello.greeting", "import std.io", "",
   "program : {{io : stdio <: stdio}} -> Co stdio Unit", "program = print (greeting (showInt total))", "",
   "main : Co stdio Unit", "main = program (io := here stdio)", "",
 ].join("\n"));
@@ -114,7 +114,7 @@ delete process.env.HEFF_HOME;
 // what is written while it is drawn is not garbled: a module with an
 // error, said as it is found, the progress cleared before it and after
 // it (`exit 1` ends it), the screen what it says without a terminal
-writeFileSync(join(hello, "src", "hello", "wrong.hf"), "import prelude\n\nwrong : Int\nwrong = \"no\"\n");
+writeFileSync(join(hello, "src", "hello", "wrong.hf"), "wrong : Int\nwrong = \"no\"\n");
 rmSync(join(hello, ".heff"), { recursive: true, force: true });
 const failing = onTerminal(hello, "xterm-256color", "build");
 const failingPlain = plain(hello, "build");

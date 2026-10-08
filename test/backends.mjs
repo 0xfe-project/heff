@@ -214,7 +214,7 @@ checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n
 // (each operation goes on at once: the stack must not overflow)
 const loop = join(work, "loop.hf");
 writeFileSync(loop, [
-  "import co", "import prelude", "import std.process", "import std.io", "",
+  "import co", "import std.process", "import std.io", "",
   "eff : HFunctor",
   "eff = stdio <+> process", "",
   "loop : {{io : stdio <: eff}} -> {{sys : process <: eff}} -> Int -> Int -> Co eff Unit",

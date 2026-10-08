@@ -51,7 +51,7 @@ expect("init's program, built", initBuilt.status === 0 && initBuilt.stdout.inclu
 // (with no file: the project's test/, run where it is; a file in a
 // directory starting with `.` or in a project of its own passed over;
 // nothing outside test/, and no test/, nothing to test)
-write("hello/test/watch.hf", "import hello.greeting\nimport prelude\n\n-- >>> greeting \"watch\"\n-- \"Hello, watch!\"\n");
+write("hello/test/watch.hf", "import hello.greeting\n\n-- >>> greeting \"watch\"\n-- \"Hello, watch!\"\n");
 write("hello/test/.hidden/no.hf", "x : Int\nx = \n");
 write("hello/test/vendor/other/package.hf", "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n");
 write("hello/test/vendor/other/no.hf", "x : Int\nx = \n");
@@ -72,15 +72,15 @@ const badName = heff("init", "hello-world");
 expect("init of a name that is no name", badName.status === 1 && badName.stderr.includes("cannot name a package"), badName);
 
 // a project's module imports another, by its name under src/
-write("hello/src/hello/words.hf", "import prelude\n\nword : String\nword = \"hi\"\n");
-write("hello/src/hello/greet.hf", "import hello.words\nimport prelude\n\ngreet : String\ngreet = word ++ \"!\"\n");
+write("hello/src/hello/words.hf", "word : String\nword = \"hi\"\n");
+write("hello/src/hello/greet.hf", "import hello.words\n\ngreet : String\ngreet = word ^ \"!\"\n");
 const greet = heff("check", "hello/src/hello/greet.hf");
 expect("a module of the project", greet.status === 0 && greet.stdout.includes("greet : String"), greet);
 
 // a test imports the project's modules, and a helper beside it, named
 // from the root; a module of src/ cannot import the helper
-write("hello/test/helper.hf", "import prelude\n\nshout : String -> String\nshout s = s ++ \"!!\"\n");
-write("hello/test/use.hf", "import hello.greet\nimport prelude\nimport test.helper\n\nloud : String\nloud = shout greet\n");
+write("hello/test/helper.hf", "shout : String -> String\nshout s = s ^ \"!!\"\n");
+write("hello/test/use.hf", "import hello.greet\nimport test.helper\n\nloud : String\nloud = shout greet\n");
 const use = heff("check", "hello/test/use.hf");
 expect("a test, with a helper", use.status === 0 && use.stdout.includes("loud : String"), use);
 write("hello/src/hello/reach.hf", "import test.helper\n\nx : String -> String\nx = shout\n");
@@ -91,19 +91,19 @@ expect("src/ does not import what is outside it", reach.status === 1 &&
 // a module whose import is written in another case than its file (or a
 // directory on its path) is named: an error where the file system finds
 // it all the same; two names that differ only in case, where it does not
-write("hello/src/hello/Shout.hf", "import prelude\n\nup : String\nup = \"HI\"\n");
-write("hello/src/hello/useshout.hf", "import hello.shout\nimport prelude\n\nu : String\nu = up\n");
+write("hello/src/hello/Shout.hf", "up : String\nup = \"HI\"\n");
+write("hello/src/hello/useshout.hf", "import hello.shout\n\nu : String\nu = up\n");
 const caseBlind = existsSync(join(work, "hello/src/hello/shout.hf"));
 const shout = heff("check", "hello/src/hello/useshout.hf");
 expect("a module found by a case-different name", shout.status === 1 && (caseBlind
   ? shout.stderr.includes("importing hello.shout: hello/src/hello/shout.hf is named Shout.hf on the disk: a file system that tells case apart finds no shout.hf")
   : shout.stderr.includes("no module hello.shout")), shout);
-write("hello/src/hello/useshout.hf", "import Hello.Shout\nimport prelude\n\nu : String\nu = up\n");
+write("hello/src/hello/useshout.hf", "import Hello.Shout\n\nu : String\nu = up\n");
 const shoutDir = heff("check", "hello/src/hello/useshout.hf");
 expect("a directory found by a case-different name", shoutDir.status === 1 && (caseBlind
   ? shoutDir.stderr.includes("hello/src/Hello is named hello on the disk")
   : shoutDir.stderr.includes("no module Hello.Shout")), shoutDir);
-write("hello/src/hello/useshout.hf", "import hello.Shout\nimport prelude\n\nu : String\nu = up\n");
+write("hello/src/hello/useshout.hf", "import hello.Shout\n\nu : String\nu = up\n");
 const shoutOk = heff("check", "hello/src/hello/useshout.hf");
 expect("a module named as on the disk", shoutOk.status === 0 && shoutOk.stdout.includes("u : String"), shoutOk);
 if (!caseBlind) {
@@ -143,23 +143,23 @@ const manifestOf = (path, requires = [], heff = version) => {
   return `package = { module = "${path}", heff = "${heff}"${listField("require", req)}${listField("replace", rep)} }\n`;
 };
 write("json/package.hf", manifestOf("x.org/json"));
-write("json/src/json/util.hf", "import prelude\n\nquoted : String -> String\nquoted s = \"<\" ++ s ++ \">\"\n");
-write("json/src/json/encode.hf", "import json.util\nimport prelude\n\nencode : String -> String\nencode s = quoted s\n");
+write("json/src/json/util.hf", "quoted : String -> String\nquoted s = \"<\" ^ s ^ \">\"\n");
+write("json/src/json/encode.hf", "import json.util\n\nencode : String -> String\nencode s = quoted s\n");
 write("jsony/package.hf", manifestOf("y.org/json"));
-write("jsony/src/json/encode.hf", "import prelude\n\nencode : String -> Int\nencode s = 1\n");
+write("jsony/src/json/encode.hf", "encode : String -> Int\nencode s = 1\n");
 
 write("app/package.hf", manifestOf("x.org/app", [["json", "x.org/json", "../json"]]));
-write("app/src/app/main.hf", "import json.encode\nimport prelude\n\nout : String\nout = encode \"hi\"\n\n-- >>> out\n-- \"<hi>\"\n");
+write("app/src/app/main.hf", "import json.encode\n\nout : String\nout = encode \"hi\"\n\n-- >>> out\n-- \"<hi>\"\n");
 const app = heff("test", "app/src/app/main.hf");
 expect("a package from a directory", app.status === 0 && app.stdout.includes("1/1 expectations hold"), app);
 
 write("renamed/package.hf", manifestOf("x.org/renamed", [["js", "x.org/json", "../json"]]));
-write("renamed/src/renamed/main.hf", "import js.encode\nimport prelude\n\nout : String\nout = encode \"hi\"\n");
+write("renamed/src/renamed/main.hf", "import js.encode\n\nout : String\nout = encode \"hi\"\n");
 const renamed = heff("check", "renamed/src/renamed/main.hf");
 expect("a package imported by another name", renamed.status === 0 && renamed.stdout.includes("out : String"), renamed);
 
 write("both/package.hf", manifestOf("x.org/both", [["json", "x.org/json", "../json"], ["json2", "y.org/json", "../jsony"]]));
-write("both/src/both/main.hf", "import json.encode as X\nimport json2.encode as Y\nimport prelude\n\nout : String\nout = X.encode \"hi\"\n\nn : Int\nn = Y.encode \"hi\"\n");
+write("both/src/both/main.hf", "import json.encode as X\nimport json2.encode as Y\n\nout : String\nout = X.encode \"hi\"\n\nn : Int\nn = Y.encode \"hi\"\n");
 const both = heff("check", "both/src/both/main.hf");
 expect("two packages of one name, required by two", both.status === 0 && both.stdout.includes("out : String") && both.stdout.includes("n : Int"), both);
 
@@ -214,7 +214,7 @@ const git = (dir, ...args) => spawnSync("git", args, { cwd: join(work, dir), enc
 for (const [k, v] of Object.entries({ GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" })) process.env[k] = v;
 spawnSync("git", ["init", "-q", "--bare", join(work, "origin.git")]);
 write("pub/package.hf", "import manifest\n\npackage : Package\n" + manifestOf("x.org/pub"));
-write("pub/src/pub/m.hf", "import prelude\n\nx : Int\nx = 1\n\n-- >>> x + 1\n-- 2\n");
+write("pub/src/pub/m.hf", "x : Int\nx = 1\n\n-- >>> x + 1\n-- 2\n");
 write("pub/.gitignore", ".heff/\n");
 git("pub", "init", "-q"); git("pub", "add", "-A"); git("pub", "commit", "-q", "-m", "one");
 git("pub", "remote", "add", "origin", join(work, "origin.git"));
@@ -232,7 +232,7 @@ expect("publish", published.status === 0 && published.stdout.includes("heff publ
   git("pub", "ls-remote", "--tags", "origin").stdout.includes("refs/tags/v1.0.0"), published);
 const twice = publish("1.0.0");
 expect("publish, a version already tagged", twice.status === 1 && twice.stderr.includes("v1.0.0 is tagged already"), twice);
-write("pub/src/pub/m.hf", "import prelude\n\nx : Int\nx = 1\n\n-- >>> x + 1\n-- 3\n");
+write("pub/src/pub/m.hf", "x : Int\nx = 1\n\n-- >>> x + 1\n-- 3\n");
 const dirty = publish("1.0.1");
 expect("publish, not committed", dirty.status === 1 && dirty.stderr.includes("commit first"), dirty);
 git("pub", "commit", "-q", "-am", "wrong");
@@ -255,15 +255,15 @@ const remote = (path, files, tag) => {
 };
 const typed = (path, requires = []) => "import manifest\n\npackage : Package\n" +
   `package = { module = "${path}", heff = "${version}"${listField("require", requires.map(([n, p, v]) => `{ name = "${n}", path = "${p}", version = "${v}" }`))} }\n`;
-const encodeAs = (l, r) => `import prelude\n\nencode : String -> String\nencode s = "${l}" ++ s ++ "${r}"\n`;
+const encodeAs = (l, r) => `encode : String -> String\nencode s = "${l}" ^ s ^ "${r}"\n`;
 remote("x.org/lib", { "package.hf": typed("x.org/lib"), "src/lib/encode.hf": encodeAs("<", ">") }, "v1.0.0");
 remote("x.org/lib", { "src/lib/encode.hf": encodeAs("[", "]") }, "v1.1.0");
 remote("x.org/lib", { "package.hf": typed("x.org/lib/v2"), "src/lib/encode.hf": encodeAs("{", "}") }, "v2.0.0");
 remote("x.org/mid", { "package.hf": typed("x.org/mid", [["lib", "x.org/lib", "1.1.0"]]),
-  "src/mid/m.hf": "import lib.encode\nimport prelude\n\ntwice : String -> String\ntwice s = encode (encode s)\n" }, "v1.0.0");
+  "src/mid/m.hf": "import lib.encode\n\ntwice : String -> String\ntwice s = encode (encode s)\n" }, "v1.0.0");
 
 write("user/package.hf", typed("x.org/user", [["lib", "x.org/lib", "1.0.0"], ["mid", "x.org/mid", "1.0.0"]]));
-write("user/src/user/main.hf", "import lib.encode\nimport mid.m\nimport prelude\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n\n-- >>> twice \"hi\"\n-- \"[[hi]]\"\n");
+write("user/src/user/main.hf", "import lib.encode\nimport mid.m\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n\n-- >>> twice \"hi\"\n-- \"[[hi]]\"\n");
 const inUser = (...args) => spawnSync(heffBin, [...args], { cwd: join(work, "user"), encoding: "utf8" });
 const notYet = inUser("test", "src/user/main.hf");
 expect("get: not fetched yet", notYet.status === 1 && notYet.stderr.includes("x.org/user requires x.org/lib 1.0.0, which is not fetched: run `heff get`"), notYet);
@@ -282,7 +282,7 @@ expect("get, again: nothing fetched", again2.status === 0 && !again2.stdout.incl
 const clashV2 = inUser("get", "x.org/lib/v2");
 expect("get PATH: a name required already", clashV2.status === 1 && clashV2.stderr.includes("`lib` is required already: add x.org/lib/v2 to package.hf by another name"), clashV2);
 write("fresh/package.hf", "-- mine\n" + typed("x.org/fresh"));
-write("fresh/src/fresh/main.hf", "import lib.encode\nimport prelude\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n");
+write("fresh/src/fresh/main.hf", "import lib.encode\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n");
 const inFresh = (...args) => spawnSync(heffBin, [...args], { cwd: join(work, "fresh"), encoding: "utf8" });
 const getNewest = inFresh("get", "x.org/lib");
 const freshPkg = readFileSync(join(work, "fresh", "package.hf"), "utf8");
@@ -312,11 +312,11 @@ expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/li
 // app/ built to .heff/bin/; install: the programs built into the heff
 // home's bin/ (HEFF_HOME), and said if it is not on the PATH
 write("tool/package.hf", manifestOf("tool"));
-write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
-const program = (says) => "import co\nimport prelude\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print " + says + "\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n";
+write("tool/src/tool/greet.hf", "greeting : String\ngreeting = \"hi from tool\"\n");
+const program = (says) => "import co\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print " + says + "\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n";
 const buildOf = (backend, ships = []) =>
   `import manifest\n\nbuild : Build\nbuild = { backend = ${backend}, run = "main"${listField("ships", ships.map((n) => `"${n}"`))} }\n`;
-for (const [x, says] of [["tool", "greeting"], ["again", "(greeting ++ \", again\")"]]) {
+for (const [x, says] of [["tool", "greeting"], ["again", "(greeting ^ \", again\")"]]) {
   write(`tool/app/${x}/build.hf`, buildOf("Node"));
   write(`tool/app/${x}/main.hf`, program(says));
 }
@@ -327,7 +327,7 @@ expect("build: the modules checked, every program built", built.status === 0 && 
   built.stdout.includes("wrote .heff/bin/tool") && built.stdout.includes("wrote .heff/bin/again") &&
   spawnSync(toolBin, [], { encoding: "utf8" }).stdout === "hi from tool\n" &&
   spawnSync(againBin, [], { encoding: "utf8" }).stdout === "hi from tool, again\n", built);
-write("tool/src/tool/broken.hf", "import prelude\n\nx : Int\nx = True\n");
+write("tool/src/tool/broken.hf", "x : Int\nx = True\n");
 rmSync(join(work, "tool", ".heff", "bin"), { recursive: true });
 const broken = inTool("build");
 expect("build: a module that does not check, nothing built", broken.status === 1 && broken.stderr.includes("src/tool/broken.hf") &&
@@ -383,7 +383,7 @@ expect("install: a program shipping what the project does not have, nothing inst
   unshipped.stderr.includes(`${join("tool", "app", "tool", "build.hf")}: it ships \`nowhere\`, which the project does not have`) &&
   unshipped.stderr.includes("nothing built") && !existsSync(homeBin), unshipped);
 write("lib-only/package.hf", manifestOf("libonly"));
-write("lib-only/src/libonly/m.hf", "import prelude\n\nx : Int\nx = 1\n");
+write("lib-only/src/libonly/m.hf", "x : Int\nx = 1\n");
 const nothing = spawnSync(heffBin, ["install", "lib-only"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home } });
 expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("no programs"), nothing);
 
@@ -393,7 +393,7 @@ expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("
 const { HEFF_LIB: _lib, ...ownEnv } = process.env;
 const selfInstalled = await selfInstalling;
 const installedHeff = (...args) => spawnSync(join(heffHome, "bin", "heff"), args, { cwd: work, encoding: "utf8", env: ownEnv });
-write("uses-prelude.hf", "import prelude\n\nxs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n");
+write("uses-prelude.hf", "xs : List Int\nxs = map (\\x -> x + 1) [1, 2]\n");
 const selfChecked = installedHeff("check", "uses-prelude.hf");
 const selfInit = installedHeff("init", "fromhome");
 const selfVersion = installedHeff("version");
@@ -424,7 +424,7 @@ const agreeing = [
 ];
 const inAgree = (...args) => spawnSync(heffBin, args, { cwd: join(work, "agree"), encoding: "utf8" });
 write("agree/src/agree/m.hf", "x : Int\nx = 1\n");
-write("agree/app/agree/main.hf", "import co\nimport prelude\nimport std.io\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print \"agree\"\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
+write("agree/app/agree/main.hf", "import co\nimport std.io\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print \"agree\"\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
 for (const [file, head, literal, fields] of agreeing) {
   write("agree/package.hf", manifestOf("agree"));
   write("agree/app/agree/build.hf", buildOf("Node"));

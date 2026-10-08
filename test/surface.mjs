@@ -33,7 +33,7 @@ console.log(`${held[0]}/${held[1]} expectations hold, ${held[2]}/${held[3]} test
 // an expectation that does not hold: what differs is shown, cut to it
 mkdirSync(join(root, ".heff", "ref"), { recursive: true });
 const wrong = join(root, ".heff", "ref", "wrong-expectation.hf");
-writeFileSync(wrong, `import prelude\n\n-- >>> "${"x".repeat(60)} on click"\n-- "${"x".repeat(60)} onn click"\n`);
+writeFileSync(wrong, `-- >>> "${"x".repeat(60)} on click"\n-- "${"x".repeat(60)} onn click"\n`);
 const w = heff("test", wrong);
 const report = w.stdout.slice(w.stdout.indexOf("  expected"));
 if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…") || report.includes("x".repeat(60))) {

@@ -73,7 +73,7 @@ try {
 
   // a file as deep as the elaborator must go deep for: the server's stack is
   // the command line's
-  const deep = "import prelude\n\nxs : List Int\nxs = [" + Array.from({ length: 20000 }, (_, i) => i).join(", ") + "]\n";
+  const deep = "xs : List Int\nxs = [" + Array.from({ length: 20000 }, (_, i) => i).join(", ") + "]\n";
   open("test/surface/lsp-deep.hf", deep);
   ds = await diagnosticsOf(uri("test/surface/lsp-deep.hf"));
   expect("a deep file", ds.length === 0, ds);
@@ -118,7 +118,7 @@ try {
 
   // completion: the names in scope that start as the one being typed; after
   // `A.`, the definitions of the module imported as `A`
-  const typing = "import prelude\n\nx : Int\nx = len";
+  const typing = "x : Int\nx = len";
   open("test/surface/lsp-complete.hf", typing);
   await diagnosticsOf(uri("test/surface/lsp-complete.hf"));
   const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 3, character: 7 } });
@@ -165,7 +165,7 @@ try {
   const loc = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/basics.hf") }, position: pos(basics, "ys)") });
   expect("no definition for a local", loc.result === null, loc.result);
 
-  const withLib = "import prelude\n\nx : Bool\nx = True\n";
+  const withLib = "x : Bool\nx = True\n";
   open("test/surface/lsp-lib.hf", withLib);
   ds = await diagnosticsOf(uri("test/surface/lsp-lib.hf"));
   expect("an unsaved file importing the library", ds.length === 0, ds);
@@ -202,7 +202,7 @@ try {
   }
 
   // an operator: `+` of the prelude
-  const withOps = "import prelude\n\nx : Int\nx = 1 + 2 * 3\n";
+  const withOps = "x : Int\nx = 1 + 2 * 3\n";
   open("test/surface/lsp-ops.hf", withOps);
   ds = await diagnosticsOf(uri("test/surface/lsp-ops.hf"));
   expect("operators of the prelude", ds.length === 0, ds);

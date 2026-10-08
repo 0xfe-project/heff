@@ -3,8 +3,6 @@
 heff is a language based on Hippogriff (Lynch & Staton, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728)), a typed language with a phase distinction, with a Haskell-like syntax, modules, doctests, algebraic effects, a formatter, a language server, and a compiler to JavaScript for web pages and Node.js.
 
 ```haskell
-import prelude
-
 map : {a b : Type} -> (a -> b) -> List a -> List b
 map f Nil = Nil
 map f (y :: ys) = f y :: map f ys
@@ -178,7 +176,7 @@ wherever the function is applied.
 
 ```haskell
 greet : {loud : Bool := False} -> String -> String
-greet name = if loud then name ++ "!" else name
+greet name = if loud then name ^ "!" else name
 
 calm : String
 calm = greet "hi"                 -- "hi"; greet (loud := True) "hi" is "hi!"
@@ -217,7 +215,6 @@ compared by that type's equality (an `Int`'s is the prelude's `intEq`,
 a fixed-width type's builtin's, `int32Eq` and the others).
 
 ```haskell
-import prelude
 import uint8 as U8
 
 mask : UInt8
@@ -255,7 +252,6 @@ them -- it can do nothing else -- and is given them where it runs:
 
 ```haskell
 import co
-import prelude
 import std.filesystem
 import std.io
 
@@ -312,7 +308,6 @@ watches.  A unit test checks; a property draws values from generators
 import check
 import co
 import gen as G
-import prelude
 
 lists : Test
 lists = group "lists"

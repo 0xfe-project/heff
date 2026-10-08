@@ -17,9 +17,9 @@ mkdirSync(join(dir, "lib"), { recursive: true });
 const ls = spawnSync("bash", ["-c", "ls lib/*.hf"], { cwd: root, encoding: "utf8" });
 for (const f of ls.stdout.split("\n").filter(Boolean)) copyFileSync(join(root, f), join(dir, "lib", basename(f)));
 
-writeFileSync(join(dir, "a.hf"), "import prelude\n\nnine : Int\nnine = 9\n\nunused : Int\nunused = 1\n");
-writeFileSync(join(dir, "b.hf"), "import a\nimport prelude\n\nten : Int\nten = nine + 1\n");
-writeFileSync(join(dir, "c.hf"), "import b\nimport prelude\n\n-- >>> ten\n-- 10\n");
+writeFileSync(join(dir, "a.hf"), "nine : Int\nnine = 9\n\nunused : Int\nunused = 1\n");
+writeFileSync(join(dir, "b.hf"), "import a\n\nten : Int\nten = nine + 1\n");
+writeFileSync(join(dir, "c.hf"), "import b\n\n-- >>> ten\n-- 10\n");
 
 const heff = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
 // (the cache files of this heff's version: the directory vN under .heff/,
@@ -51,30 +51,30 @@ want(readFileSync(hc("a"), "utf8") !== "garbage", "and frozen again");
 // a comment-only change deep down: the importer between still thaws
 // (the entry file is always fresh; `b` is the one to watch)
 const tB1 = mtime("b");
-writeFileSync(join(dir, "a.hf"), "-- a comment\nimport prelude\n\nnine : Int\nnine = 9\n\nunused : Int\nunused = 1\n");
+writeFileSync(join(dir, "a.hf"), "-- a comment\n\nnine : Int\nnine = 9\n\nunused : Int\nunused = 1\n");
 const c1 = heff("test", "c.hf");
 want(c1.status === 0 && /1\/1 expectations hold/.test(c1.stdout), "the watch still holds after a comment-only change");
 want(mtime("b") === tB1, "a comment-only change in a dependency invalidates no importer");
 
 // a new name in the dependency re-elaborates the importer (its parse
 // may read differently)
-writeFileSync(join(dir, "a.hf"), "-- a comment\nimport prelude\n\nnine : Int\nnine = 9\n\nunused : Int\nunused = 1\n\nmore : Int\nmore = 2\n");
+writeFileSync(join(dir, "a.hf"), "-- a comment\n\nnine : Int\nnine = 9\n\nunused : Int\nunused = 1\n\nmore : Int\nmore = 2\n");
 const c2 = heff("check", "c.hf");
 want(c2.status === 0, "check after a new name in the dependency");
 want(mtime("b") > tB1, "a new name in a dependency re-elaborates the importer");
 
 // a changed definition the importer uses: the answer changes with it
-writeFileSync(join(dir, "a.hf"), "import prelude\n\nnine : Int\nnine = 90\n\nunused : Int\nunused = 1\n");
+writeFileSync(join(dir, "a.hf"), "nine : Int\nnine = 90\n\nunused : Int\nunused = 1\n");
 const c3 = heff("test", "c.hf");
 want(c3.status === 1 && /91/.test(c3.stdout), `a changed definition reaches the importer\n${c3.stdout.slice(0, 120)}`);
 
 // a record type's default changed: a record that leaves the field out,
 // in an importer that names only a function of the type, is given the
 // new one (the importer holds the default it was given)
-const opts = (size) => `import prelude\n\ntype Opts = { name : String, size : Int = ${size} }\n\nsizeOf : Opts -> Int\nsizeOf o = o.size\n`;
+const opts = (size) => `type Opts = { name : String, size : Int = ${size} }\n\nsizeOf : Opts -> Int\nsizeOf o = o.size\n`;
 writeFileSync(join(dir, "d.hf"), opts(1));
-writeFileSync(join(dir, "e.hf"), "import d\nimport prelude\n\nsized : Int\nsized = sizeOf { name = \"e\" }\n");
-writeFileSync(join(dir, "f.hf"), "import e\nimport prelude\n\n-- >>> sized\n-- 1\n");
+writeFileSync(join(dir, "e.hf"), "import d\n\nsized : Int\nsized = sizeOf { name = \"e\" }\n");
+writeFileSync(join(dir, "f.hf"), "import e\n\n-- >>> sized\n-- 1\n");
 const d1 = heff("test", "f.hf");
 want(d1.status === 0 && /1\/1 expectations hold/.test(d1.stdout), `a default given\n${d1.stdout.slice(0, 120)}`);
 writeFileSync(join(dir, "d.hf"), opts(2));

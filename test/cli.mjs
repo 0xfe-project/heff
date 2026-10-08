@@ -20,7 +20,6 @@ const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`
 // promote: an expectation written where there was none, a wrong one
 // replaced, a right one kept; then `test` holds
 writeFileSync(join(work, "p.hf"), [
-  "import prelude", "",
   "-- >>> 1 + 2", "",
   "-- >>> (Cons 1 Nil : List Int)", "-- wrong", "",
   "-- >>> not True", "-- False", "",
@@ -38,7 +37,7 @@ expect("test after promote", tested.status === 0 && tested.stdout.includes("3/3 
 // runs it again, and fails the run; the same seed runs the same runs,
 // another seed others, to the same counterexample
 writeFileSync(join(work, "props.hf"), [
-  "import check", "import co", "import gen as G", "import prelude", "",
+  "import check", "import co", "import gen as G", "",
   "small : Test",
   "small = group \"small\"",
   "  [ unit \"two\" (equal showInt (1 + 1) 2)",
@@ -93,7 +92,6 @@ expect("fmt of a definition kept", keptLaid.status === 0 && readFileSync(join(wo
 // fmt: a chain of operators breaks at its loosest, as the fixities of what
 // the file imports say
 writeFileSync(join(work, "ops.hf"), [
-  "import prelude", "",
   "infixl <+", "infixl <* above <+", "",
   "(<+) : Int -> Int -> Int", "(<+) a b = a + b", "",
   "(<*) : Int -> Int -> Int", "(<*) a b = a * b", "",
@@ -236,7 +234,7 @@ expect("completions of no shell", noShell.status === 1 && noShell.stderr.startsW
 // terminal (`HEFF_TTY=1`), not where `NO_COLOR` is set or it is not one;
 // a span over lines marked once, in a margin
 writeFileSync(join(work, "diag.hf"), [
-  "import prelude", "", "data C = R | G | B", "",
+  "data C = R | G | B", "",
   "name : C -> String", "name c = case c of", "  R -> \"red\"", "  G -> \"green\"", "",
 ].join("\n"));
 const withEnv = (extra) => {
@@ -249,10 +247,10 @@ const plain = withEnv({});
 expect("a diagnostic, not on a terminal", plain.status === 1 && !plain.stderr.includes(esc) &&
   plain.stderr.includes([
     "error[E0317]: no case provided for tag B",
-    "6 |   name c = case c of",
+    "4 |   name c = case c of",
     "  |  __________^",
-    "7 | |   R -> \"red\"",
-    "8 | |   G -> \"green\"",
+    "5 | |   R -> \"red\"",
+    "6 | |   G -> \"green\"",
     "  | |______________^",
   ].join("\n")), plain);
 const tty = withEnv({ HEFF_TTY: "1" });

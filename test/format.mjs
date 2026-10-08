@@ -50,8 +50,6 @@ formats("blank lines, at most one", "data Bool = True | False\n\n\n\nx : Bool\n\
 formats("comments", [
   "-- a header",
   "",
-  "import prelude",
-  "",
   "-- | the doc of f",
   "f : Bool -> Bool -- after the type",
   "f b = case b of -- after of",
@@ -70,8 +68,6 @@ formats("comments", [
   "",
 ].join("\n"), [
   "-- a header",
-  "",
-  "import prelude",
   "",
   "-- | the doc of f",
   "f : Bool -> Bool -- after the type",
@@ -92,8 +88,6 @@ formats("comments", [
 ].join("\n"));
 
 formats("a watch and its expectation, as written", [
-  "import prelude",
-  "",
   "test not/spec",
   "-- >>> not   True",
   "-- False",
@@ -102,8 +96,6 @@ formats("a watch and its expectation, as written", [
   "-- True",
   "",
 ].join("\n"), [
-  "import prelude",
-  "",
   "test not/spec",
   "-- >>> not   True",
   "-- False",
@@ -395,7 +387,6 @@ const pick = [
   "pick n  =    n",
 ];
 formats("a definition under `-- fmt: skip`, as written", [
-  "import prelude",
   "", "", "",
   ...kept,
   "", "",
@@ -406,8 +397,6 @@ formats("a definition under `-- fmt: skip`, as written", [
   "next =   pick 1",
   "",
 ].join("\n"), [
-  "import prelude",
-  "",
   ...kept,
   "",
   "size : Int",
@@ -419,7 +408,7 @@ formats("a definition under `-- fmt: skip`, as written", [
 ].join("\n"));
 
 // (formatted, it is as it was: what `fmt --check` holds)
-const keptSrc = ["import prelude", "", ...kept, "", ...pick, ""].join("\n");
+const keptSrc = [...kept, "", ...pick, ""].join("\n");
 const again = run(keptSrc);
 expect("a definition as written is formatted", again.ok && again.out === keptSrc, JSON.stringify(again));
 
