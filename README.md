@@ -98,11 +98,12 @@ corners =
   ]
 ```
 
-On a terminal, `heff build`, `install` and `test` draw what they are
-doing below what they say, as zig draws its own -- the modules
-checked, each program compiled, and zig's own tasks as `zig cc` builds
-it -- and clear it at the end; written to a file or a pipe (or with
-`TERM=dumb`), they say what they say and nothing more (`std.progress`).
+On a terminal, `heff build`, `install`, `test` and `get` draw what
+they are doing below what they say, as zig draws its own -- the
+modules checked, each program compiled, zig's own tasks as `zig cc`
+builds it, the packages fetched -- and clear it at the end; written to
+a file or a pipe (or with `TERM=dumb`), they say what they say and
+nothing more (`std.progress`).
 
 ## Modules
 
