@@ -15,8 +15,8 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-let heff = join(root, "output", process.platform === "win32" ? "heff.exe" : "heff");
-const work = join(root, "ref", "bench");
+let heff = join(root, ".heff", "out", process.platform === "win32" ? "heff.exe" : "heff");
+const work = join(root, ".heff", "ref", "bench");
 mkdirSync(work, { recursive: true });
 
 const argv = process.argv.slice(2);
@@ -64,17 +64,20 @@ for (const f of readdirSync(join(root, "bench")).filter((f) => f.endsWith(".hf")
   best(`${name} (c)`, () => timed([bin]));
 }
 
-// (with no cache: the one there is put aside, and back after)
+// (with no cache: the compiler's cache files there are (.heff/vN/, beside
+// the compiler built, which stays) put aside, and back after)
 const coldly = (f) => {
-  const cache = join(root, ".heff");
+  const dot = join(root, ".heff");
+  const versions = () => (existsSync(dot) ? readdirSync(dot).filter((d) => /^v\d+$/.test(d)) : []);
+  const clear = () => { for (const d of versions()) rmSync(join(dot, d), { recursive: true, force: true }); };
   const saved = mkdtempSync(join(tmpdir(), "heff-cache-"));
-  const had = existsSync(cache);
-  if (had) renameSync(cache, join(saved, ".heff"));
+  const had = versions();
+  for (const d of had) renameSync(join(dot, d), join(saved, d));
   try {
-    f(() => rmSync(cache, { recursive: true, force: true }));
+    f(clear);
   } finally {
-    rmSync(cache, { recursive: true, force: true });
-    if (had) renameSync(join(saved, ".heff"), cache);
+    clear();
+    for (const d of had) renameSync(join(saved, d), join(dot, d));
     rmSync(saved, { recursive: true, force: true });
   }
 };

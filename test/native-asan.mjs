@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// heff compiled through C, checked by AddressSanitizer: output/heff.d/
+// heff compiled through C, checked by AddressSanitizer: .heff/out/heff.d/
 // (scripts/build.mjs) built by the system's clang with
 // `-fsanitize=address` (zig's has no ASan runtime) and no free lists
 // (`-DSMALL_MAX=0`, so that a use after the last reference is a use after
-// free), then made to check each program of test/programs in ref/native-asan,
+// free), then made to check each program of test/programs in .heff/ref/native-asan,
 // where there is no cache but its own (one written by the Node.js
 // compiler would spare it the elaborating).
 //
@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // (the program beside its library and version, as a release lays it out,
 // in a project as the repository is, its modules named as they are there)
-const work = join(root, "ref", "native-asan");
+const work = join(root, ".heff", "ref", "native-asan");
 rmSync(work, { recursive: true, force: true });
 mkdirSync(join(work, "bin"), { recursive: true });
 cpSync(join(root, "lib"), join(work, "lib"), { recursive: true });
@@ -33,7 +33,7 @@ const step = (what, cmd, args, opts = {}) => {
   return r;
 };
 
-const parts = join(root, "output", "heff.d"), heff = join(work, "bin", "heff");
+const parts = join(root, ".heff", "out", "heff.d"), heff = join(work, "bin", "heff");
 const c = readdirSync(parts).filter((f) => f.endsWith(".c")).map((f) => join(parts, f));
 step("building it", "clang", ["-O1", "-g", "-w", "-fsanitize=address", "-fno-omit-frame-pointer", "-DSMALL_MAX=0", ...c, "-o", heff, "-lm", "-lpthread"]);
 

@@ -15,7 +15,7 @@ let client;
 function serverPath(context) {
   const configured = vscode.workspace.getConfiguration("heff").get("serverPath");
   if (configured) return configured;
-  const repository = path.join(context.extensionPath, "..", "..", "output", process.platform === "win32" ? "heff.exe" : "heff");
+  const repository = path.join(context.extensionPath, "..", "..", ".heff", "out", process.platform === "win32" ? "heff.exe" : "heff");
   return fs.existsSync(repository) ? repository : "heff";
 }
 

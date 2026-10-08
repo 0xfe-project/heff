@@ -24,8 +24,9 @@ writeFileSync(join(dir, "b.hf"), "import a\nimport prelude\n\nten : Int\nten = n
 writeFileSync(join(dir, "c.hf"), "import b\nimport prelude\n\n-- >>> ten\n-- 10\n");
 
 const heff = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
-// (the cache files of this heff's version: the one directory under .heff/)
-const hc = (m) => join(dir, ".heff", readdirSync(join(dir, ".heff"))[0], m + ".hc");
+// (the cache files of this heff's version: the directory vN under .heff/,
+// among what else is kept there -- `.heff/run/`, `.heff/bin/`, ...)
+const hc = (m) => join(dir, ".heff", readdirSync(join(dir, ".heff")).find((d) => /^v\d+$/.test(d)) ?? "v?", m + ".hc");
 const mtime = (m) => statSync(hc(m)).mtimeMs;
 
 let failed = 0;

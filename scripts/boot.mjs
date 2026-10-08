@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The seed renewed: heff (built by scripts/build.mjs), once it compiles
 // itself to the same C (test/gen-fixpoint.mjs), is kept as that C --
-// output/heff.d/, a file a module -- in boot/heff.tar.xz, the seed a
+// .heff/out/heff.d/, a file a module -- in boot/heff.tar.xz, the seed a
 // build starts from where there is no heff: zig builds it for whatever
 // machine the build is on.  Wanted when the language changes so that
 // the old seed cannot compile the new source; otherwise the old seed
@@ -20,6 +20,6 @@ if (!run(process.execPath, [join(root, "test", "gen-fixpoint.mjs")])) {
 }
 // (`tar` with xz: libarchive's, on macOS and Windows; GNU's with xz, on
 // Linux.  macOS's would add a `._NAME` of each file's attributes)
-if (!run("tar", ["-cJf", join("boot", "heff.tar.xz"), "-C", join("output", "heff.d"), "."],
+if (!run("tar", ["-cJf", join("boot", "heff.tar.xz"), "-C", join(".heff", "out", "heff.d"), "."],
   { ...process.env, COPYFILE_DISABLE: "1" })) process.exit(1);
 console.log("heff boot: boot/heff.tar.xz is the compiler, compiled by itself to C");
