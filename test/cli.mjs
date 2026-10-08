@@ -107,7 +107,7 @@ expect("fmt by imported fixities", cut.status === 0 && readFileSync(join(work, "
 // the usage: asked for, on stdout; for what is no command, on stderr,
 // failing; a command's own help, asked for; its words wrong, what is wrong
 // and how it is called, on stderr
-const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "publish", "lsp", "help", "completions"];
+const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "build", "install", "publish", "lsp", "help", "completions"];
 for (const args of [[], ["help"], ["--help"]]) {
   const r = heff(...args);
   expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND ...\n") &&

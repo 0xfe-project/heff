@@ -291,7 +291,9 @@ const moved = inUser("get");
 expect("get: a tag moved", moved.status === 1 && moved.stderr.includes("x.org/lib 1.0.0 is tree:") && moved.stderr.includes("its tag has been moved"), moved);
 
 // build: every module of src/ checked, then every program of app/ built
-// to .heff/bin/ (the NAMEd ones only, given NAMEs)
+// to .heff/bin/ (the NAMEd ones only, given NAMEs); install: the
+// programs built into the heff home's bin/ (HEFF_HOME), and said if it
+// is not on the PATH
 write("tool/package.hf", manifestOf("tool"));
 write("tool/src/tool/greet.hf", "import prelude\n\ngreeting : String\ngreeting = \"hi from tool\"\n");
 write("tool/app/tool/build.hf", "import manifest\n\nbuild : Build\nbuild = { backend = 'node, run = \"main\" }\n");
@@ -312,6 +314,18 @@ expect("build NAME: the program only", named.status === 0 && !named.stdout.inclu
 rmSync(join(work, "tool", "src", "tool", "broken.hf"));
 const noProgram = inTool("build", "nope");
 expect("build NAME: no such program", noProgram.status === 1 && noProgram.stderr.includes("no program nope"), noProgram);
+const home = join(work, "home"), homeBin = join(home, "bin");
+const install = (path) => spawnSync(heffBin, ["install", "tool"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home, PATH: path } });
+const installed = install(process.env.PATH);
+expect("install: the programs, in the heff home's bin/", installed.status === 0 && installed.stdout.includes(`installed ${join(homeBin, "tool")}`) &&
+  installed.stdout.includes(`${homeBin} is not on the PATH`) &&
+  spawnSync(join(homeBin, "tool"), [], { encoding: "utf8" }).stdout === "hi from tool\n", installed);
+const onPath = install(`${homeBin}:${process.env.PATH}`);
+expect("install: its bin/ on the PATH", onPath.status === 0 && !onPath.stdout.includes("not on the PATH"), onPath);
+write("lib-only/package.hf", manifestOf("libonly"));
+write("lib-only/src/libonly/m.hf", "import prelude\n\nx : Int\nx = 1\n");
+const nothing = spawnSync(heffBin, ["install", "lib-only"], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_HOME: home } });
+expect("install: no programs", nothing.status === 1 && nothing.stderr.includes("no programs"), nothing);
 
 console.log(`project: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
