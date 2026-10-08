@@ -47,6 +47,15 @@ extern char **environ;
 #include <stdlib.h>
 #include <string.h>
 
+// (the runtime's state: defined once, in the program's first file; a
+// program split into parts (`HEFF_PART`, `heff build`) declares it in the
+// others, each of which has its own copy of the runtime's functions)
+#ifdef HEFF_PART
+#define HEFF_VAR(decl) extern decl
+#else
+#define HEFF_VAR(decl) decl
+#endif
+
 typedef uintptr_t V;
 
 // the tags the runtime knows; a program's own are numbered after them
@@ -104,8 +113,8 @@ static inline int heff_unique(V v) { return OBJ(v)->rc == 1; }
 // (where a value is asked for that may fail -- `heff compile` without
 // `--name`, each definition printed -- a failure is caught there, and
 // said; otherwise it ends the program)
-static jmp_buf *heff_catch = NULL;
-static const char *heff_caught = NULL;
+HEFF_VAR(jmp_buf *heff_catch);
+HEFF_VAR(const char *heff_caught);
 
 static void heff_fail(const char *why) {
   if (heff_catch) { heff_caught = why; longjmp(*heff_catch, 1); }
@@ -138,7 +147,7 @@ static void *heff_alloc(size_t n) {
 #ifndef SMALL_MAX
 #define SMALL_MAX 128
 #endif
-static void *heff_free_list[SMALL_MAX / 8 + 1];
+HEFF_VAR(void *heff_free_list[SMALL_MAX / 8 + 1]);
 
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
@@ -269,8 +278,9 @@ static size_t heff_size(V v) {
 // (what is given back, a stack of it, not a recursion: a long list's
 // cells given back one after another, the stack as deep as the list
 // never)
-static V *heff_dead;
-static size_t heff_ndead, heff_cdead;
+HEFF_VAR(V *heff_dead);
+HEFF_VAR(size_t heff_ndead);
+HEFF_VAR(size_t heff_cdead);
 
 static inline void heff_dead_push(V v) {
   if (!IS_OBJ(v) || (OBJ(v)->rc & IMMORTAL) || --OBJ(v)->rc != 0) return;
@@ -305,7 +315,7 @@ __attribute__((noinline)) static void heff_free(V v) {
 // Calls of what is not known
 // ---------------------------------------------------------------------
 
-static long heff_dep = 0;
+HEFF_VAR(long heff_dep);
 
 static V heff_apply(V f, int n, V *a);
 
@@ -1080,8 +1090,8 @@ static V heff_nomatch(V s) {
 // the file printed as the tests print JavaScript's, test/load-js.mjs)
 // ---------------------------------------------------------------------
 
-static const char **heff_tag_names = NULL;
-static const char **heff_lbl_names = NULL;
+HEFF_VAR(const char **heff_tag_names);
+HEFF_VAR(const char **heff_lbl_names);
 
 typedef struct { char *s; size_t n, cap; } Buf;
 
@@ -1349,9 +1359,11 @@ static void heff_check_one(Buf *out, const Global *g) {
   heff_catch = NULL;
 }
 
-static int heff_argc;
-static char **heff_argv;
-static int heff_status = 0;
+HEFF_VAR(int heff_argc);
+HEFF_VAR(char **heff_argv);
+HEFF_VAR(int heff_status);
+
+#ifndef HEFF_PART
 
 #ifdef HEFF_CHECK
 static const Global *heff_globals = NULL;
@@ -1420,4 +1432,5 @@ int main(int argc, char **argv) {
   fflush(stdout);
   return heff_status;
 }
+#endif
 #endif

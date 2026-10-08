@@ -3,8 +3,9 @@
 // compiler, compiled by itself to JavaScript, kept compressed), unpacked
 // to output/heff-seed.mjs, compiles app/heff/main.hf to a first stage,
 // output/heff-stage1.mjs, and the first stage compiles the same source to
-// C, output/heff.c -- made by the backend of the source, whatever the
-// seed's was -- which `zig cc` builds into output/heff, `heff`.
+// C, output/heff.d/ (a file a module) -- made by the backend of the
+// source, whatever the seed's was -- which `zig cc` builds (each file
+// apart, and again only those changed) into output/heff, `heff`.
 // (test/gen-fixpoint.mjs holds that heff compiles itself to the same C;
 // `node scripts/boot.mjs` renews the seed.)
 import { spawnSync } from "node:child_process";
@@ -17,7 +18,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const seed = join(root, "boot", "heff.mjs.gz");
 const unpacked = join(root, "output", "heff-seed.mjs");
 const stage1 = join(root, "output", "heff-stage1.mjs");
-const c = join(root, "output", "heff.c");
+const parts = join(root, "output", "heff.d");
 const out = join(root, "output", process.platform === "win32" ? "heff.exe" : "heff");
 
 // (nothing to do where the compiler is newer than every source of it and
@@ -45,8 +46,11 @@ writeFileSync(unpacked, gunzipSync(readFileSync(seed)));
 step("the first stage (the seed compiling app/heff/main.hf)", process.execPath,
   [unpacked, "compile", "app/heff/main.hf", stage1, "--name", "main", "--backend=node"]);
 step("the compiler in C (the first stage compiling itself)", process.execPath,
-  [stage1, "compile", "app/heff/main.hf", c, "--name", "main", "--backend=c"]);
+  [stage1, "compile", "app/heff/main.hf", parts + "/", "--name", "main", "--backend=c"]);
 // (for any machine of this kind, not only this one: zig's default is
 // this machine's processor, whose instructions another may not have)
-step("zig cc", "zig", ["cc", "-mcpu=baseline", "-O2", "-w", c, "-o", out, "-lm"]);
+// (a file a module: zig builds them at once, and again only those
+// that changed)
+const files = readdirSync(parts).filter((f) => f.endsWith(".c")).map((f) => join(parts, f));
+step("zig cc", "zig", ["cc", "-mcpu=baseline", "-O2", "-w", ...files, "-o", out, "-lm"]);
 console.log(`heff build: ${out}, the compiler compiled by itself`);
