@@ -134,7 +134,8 @@ under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.doc` (documents laid out).  An effect's JavaScript side is in
 `M.provider.js` beside `M.hf`, its C side in `M.provider.c`.
 
-`examples/` has apps for the browser (`node examples/build.mjs`).
+`examples/` has apps for the browser: `node examples/build.mjs` builds
+each to `.heff/examples/NAME/`, where its `index.html` opens.
 
 ## Tests
 
@@ -193,8 +194,8 @@ update it with `node test/golden.mjs --update`.
 
 All that is made is under `.heff/`: the compiler built (`out/`), the
 cache of compiled modules (`vN/`), the programs `heff build` makes
-(`bin/`, their C in `build/`), what `heff run` runs (`run/`), and the
-tests' work directories (`ref/`).
+(`bin/`, their C in `build/`), what `heff run` runs (`run/`), the
+example apps (`examples/`), and the tests' work directories (`ref/`).
 
 `node scripts/boot.mjs` replaces the seed with the current compiler's
 C, once it compiles itself to the same C.  This is needed only when a
