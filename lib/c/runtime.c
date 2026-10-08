@@ -1171,6 +1171,86 @@ static char *heff_join(const char *dir, const char *name) {
 // (an answer, for an operation's function: given it, its value asked for)
 static V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 
+// The world: the things the providers hand out, held in one table for
+// them all, so that one effect's provider takes what another's handed
+// out (lib/std/handle.hf: a `Handle` is `MkHandle i`, made and taken
+// apart by the provider), as src/heff/emit.hf's `$world` holds them.
+// `heff_hold(x, free)` is the number of `x`, the same while it is held;
+// `heff_held(i)` the thing numbered `i`; `heff_release(i)` lets it go
+// -- `free(x)`, if its holder gave a `free` -- and its number is no
+// one's again.  (Numbers by address, `heff_numbers`: open addressing, a
+// slot -1 where it is empty, never emptied but where all are numbered
+// again, the things released left out.)
+typedef struct { void *x; void (*free)(void *); } HeffThing;
+HEFF_VAR(HeffThing *heff_things);
+HEFF_VAR(int64_t heff_nthings);
+HEFF_VAR(int64_t heff_capthings);
+HEFF_VAR(int64_t *heff_numbers);
+HEFF_VAR(int64_t heff_capnumbers);
+HEFF_VAR(int64_t heff_usednumbers);
+
+// (the slot of `x`'s number, or the empty slot it would be in)
+static int64_t heff_number_slot(void *x) {
+  uint64_t h = (uint64_t)(uintptr_t)x;
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  int64_t m = heff_capnumbers - 1, i = (int64_t)(h & (uint64_t)m);
+  while (heff_numbers[i] >= 0 && heff_things[heff_numbers[i]].x != x) i = (i + 1) & m;
+  return i;
+}
+
+// (the things held, numbered again: in four times as many slots, and more)
+static void heff_renumber(void) {
+  int64_t live = 0;
+  for (int64_t n = 0; n < heff_nthings; n++) live += heff_things[n].x != NULL;
+  int64_t cap = 16;
+  while (cap < live * 4) cap *= 2;
+  free(heff_numbers);
+  heff_numbers = heff_alloc(cap * sizeof(int64_t));
+  for (int64_t i = 0; i < cap; i++) heff_numbers[i] = -1;
+  heff_capnumbers = cap;
+  heff_usednumbers = live;
+  for (int64_t n = 0; n < heff_nthings; n++)
+    if (heff_things[n].x) heff_numbers[heff_number_slot(heff_things[n].x)] = n;
+}
+
+static int64_t heff_hold(void *x, void (*let_go)(void *)) {
+  if (!x) heff_fail("the world holds nothing at NULL");
+  if (heff_usednumbers * 2 >= heff_capnumbers) heff_renumber();
+  int64_t s = heff_number_slot(x);
+  if (heff_numbers[s] >= 0) return heff_numbers[s];
+  if (heff_nthings == heff_capthings) {
+    heff_capthings = heff_capthings ? heff_capthings * 2 : 16;
+    HeffThing *t = heff_alloc(heff_capthings * sizeof(HeffThing));
+    if (heff_nthings) memcpy(t, heff_things, heff_nthings * sizeof(HeffThing));
+    free(heff_things);
+    heff_things = t;
+  }
+  heff_things[heff_nthings].x = x;
+  heff_things[heff_nthings].free = let_go;
+  heff_numbers[s] = heff_nthings;
+  heff_usednumbers++;
+  return heff_nthings++;
+}
+
+static void *heff_held(int64_t i) {
+  if (i < 0 || i >= heff_nthings || !heff_things[i].x) {
+    static char why[64];
+    snprintf(why, sizeof why, "the world holds nothing numbered %lld", (long long)i);
+    heff_fail(why);
+  }
+  return heff_things[i].x;
+}
+
+static void heff_release(int64_t i) {
+  void *x = heff_held(i);
+  void (*let_go)(void *) = heff_things[i].free;
+  heff_things[i].x = NULL;
+  heff_things[i].free = NULL;
+  if (let_go) let_go(x);
+}
+
 // Running
 // ---------------------------------------------------------------------
 

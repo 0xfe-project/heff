@@ -1,0 +1,106 @@
+-- Another world's provider acting on what boxes.hf's hands out (for
+-- test/backends.mjs, by each backend): tally.provider.js and
+-- tally.provider.c add one to what a box holds, hold a box again -- the
+-- same number -- and ask the world to let a box go, which boxes'
+-- provider frees.
+
+import co
+import prelude
+import std.handle
+import std.io
+import test.node.boxes
+
+data TallyF (m : Type -> Type) x
+  = Bump (Handle Box) x
+  | Again (Handle Box) (Handle Box -> x)
+  | LetGo (Handle Box) x
+
+tally : HFunctor
+tally =
+  { f = TallyF
+  , hfmap = \fm g p -> case p of
+      Bump b x -> Bump b (g x)
+      Again b k -> Again b (\c -> g (k c))
+      LetGo b x -> LetGo b (g x)
+  , hmap = \nt p -> case p of
+      Bump b x -> Bump b x
+      Again b k -> Again b k
+      LetGo b x -> LetGo b x
+  }
+
+bump : {e : HFunctor} -> {{ev : tally <: e}} -> Handle Box -> Co e Unit
+bump b = op (ev (Bump b MkUnit)) val
+
+again : {e : HFunctor} -> {{ev : tally <: e}} -> Handle Box -> Co e (Handle Box)
+again b = op (ev (Again b (\c -> c))) val
+
+letGo : {e : HFunctor} -> {{ev : tally <: e}} -> Handle Box -> Co e Unit
+letGo b = op (ev (LetGo b MkUnit)) val
+
+world : HFunctor
+world = stdio <+> (boxes <+> tally)
+
+sameOrNot : Handle Box -> Handle Box -> String
+sameOrNot a b = if sameHandle a b then "the same" else "not the same"
+
+-- (boxes made and let go of, one after another)
+churn : {e : HFunctor}
+      -> {{bx : boxes <: e}}
+      -> {{tl : tally <: e}}
+      -> Int
+      -> Co e Unit
+churn 0 = pure MkUnit
+churn n = do
+  b <- newBox n
+  letGo b
+  churn (n - 1)
+
+-- (boxes of 1 to n, kept)
+keep : {e : HFunctor}
+     -> {{bx : boxes <: e}}
+     -> Int
+     -> List (Handle Box)
+     -> Co e (List (Handle Box))
+keep 0 bs = pure bs
+keep n bs = do
+  b <- newBox n
+  keep (n - 1) (Cons b bs)
+
+-- (what the boxes hold, added up)
+total : {e : HFunctor}
+      -> {{bx : boxes <: e}}
+      -> List (Handle Box)
+      -> Int
+      -> Co e Int
+total Nil acc = pure acc
+total (Cons b bs) acc = do
+  m <- peek b
+  total bs (acc + m)
+
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{bx : boxes <: e}}
+        -> {{tl : tally <: e}}
+        -> Co e Unit
+program = do
+  b <- newBox 41
+  bump b
+  n <- peek b
+  print ("bumped: " ++ showInt n)
+  b2 <- again b
+  c <- newBox 1
+  print ("held again: " ++ sameOrNot b b2 ++ "; another: " ++ sameOrNot b c)
+  churn 50
+  bs <- keep 100 Nil
+  t <- total bs 0
+  print ("kept: " ++ showInt t)
+  letGo b
+  m <- freed
+  print ("let go of: " ++ showInt m)
+
+main : Co world Unit
+main =
+  program
+    (io := \p -> InL p)
+    (bx := \p -> InR (InL p))
+    (tl := \p -> InR (InR p))

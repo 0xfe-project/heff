@@ -8,7 +8,9 @@
 // through `heff_tr`.  It owns `p` and `k` (reference counts, as
 // lib/c/runtime.c says): it takes what it keeps of `p` (`heff_dup`),
 // drops `p`, and gives `k` away.  It is bundled after lib/c/runtime.c,
-// whose functions it uses.
+// whose functions it uses -- among them the world's, which hold what
+// every provider hands out (`heff_hold`, `heff_held`, `heff_release`:
+// lib/std/handle.hf says how).
 
 static V heff_provider_stdio(V p, V k) {
   switch (heff_tag_of(p)) {

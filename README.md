@@ -190,9 +190,11 @@ in every module), `prelude`, `co`, `state`, `exn`, `parallel`, `array`,
 `build.hf`).  The batteries ship with it,
 under `lib/std/`: `std.io` (the standard streams), `std.filesystem`,
 `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
-`std.dom` (web pages), `std.path`, `std.cli` (command lines) and
-`std.doc` (documents laid out).  An effect's JavaScript side is in
-`M.provider.js` beside `M.hf`, its C side in `M.provider.c`.
+`std.dom` (web pages), `std.handle` (the world's things, which one
+effect hands out and another takes), `std.path`, `std.cli` (command
+lines) and `std.doc` (documents laid out).  An effect's JavaScript side
+is in `M.provider.js` beside `M.hf`, its C side in `M.provider.c`; the
+things they hand out the world holds for them all.
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.

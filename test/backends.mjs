@@ -174,6 +174,12 @@ for (const be of ["node", "c"]) {
 ran("evidence found in scope", "test/node/evidence.hf", "run", ["one", "two"], { out: "args: one two\nbye\n", status: 0 });
 ran("state peeled in-language", "test/node/counted.hf", "main", [], { out: "0: one\n1: two\n2: three\ncounted 3\n", status: 0 });
 
+// two worlds of the test's own, one's provider acting on the boxes the
+// other's hands out, the world holding them for both (std.handle): held
+// again, the same number; let go of, freed by their maker's provider
+ran("handles shared", "test/node/tally.hf", "main", [],
+  { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 });
+
 // loops, compiled as loops: a million rounds, and the stack does not overflow
 ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 });
 

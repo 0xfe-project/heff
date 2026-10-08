@@ -1610,9 +1610,10 @@ emitDefs defs roots = emitWithShorts defs roots (shortsOf defs)
 -- `$sum` of two algebras gives each operation (`InL`, `InR`) to its
 -- side's, and each world's algebra -- a provider's text, bundled
 -- whole, its factories gathered (`$p0`, `$p1`, ...) -- knows its own
--- operations.  (An operation done at once goes on at once, the
--- stack deeper each time: every so often it goes on after the stack is
--- let go of, lest a long loop of them overflow it.)
+-- operations; what they hand out the world holds (`$world`), for them
+-- all.  (An operation done at once goes on at once, the stack deeper
+-- each time: every so often it goes on after the stack is let go of,
+-- lest a long loop of them overflow it.)
 
 runStr : String
 runStr =
@@ -1631,6 +1632,28 @@ runStr =
 sumStr : String
 sumStr =
   "const $sum = (l, r) => (p, k) => p.$ === \"InL\" ? l(p.a[0], k) : r(p.a[0], k);"
+
+-- The world: the things the providers hand out, held in one table for
+-- them all, so that one effect's provider takes what another's handed
+-- out (lib/std/handle.hf says how).  Each factory is given it.  A
+-- thing's number is a BigInt, the same while it is held; released, the
+-- thing is let go of (by `free`, if its holder gave one) and its number
+-- is no one's again.
+worldStr : String
+worldStr =
+  joinWith
+    "\n"
+    [ "const $world = (() => {"
+    , "  const things = new Map(), numbers = new Map();"
+    , "  let next = 0n;"
+    , "  const at = (i) => { const t = things.get(i); if (!t) throw new Error(\"heff: the world holds nothing numbered \" + i); return t; };"
+    , "  return {"
+    , "    hold: (x, free) => { let i = numbers.get(x); if (i === undefined) { i = next++; numbers.set(x, i); things.set(i, { x, free }); } return i; },"
+    , "    get: (i) => at(i).x,"
+    , "    release: (i) => { const t = at(i); things.delete(i); numbers.delete(t.x); if (t.free) t.free(t.x); },"
+    , "  };"
+    , "})();"
+    ]
 
 hasSum : Ef.Effect -> Bool
 hasSum (Plus _ _) = True
@@ -1706,7 +1729,9 @@ runtimeFor hasTr provs eff =
   joinWith
     "\n"
     (concatList
-       (concatList (if hasTr then Nil else Cons trampolineStr Nil) [runStr])
+       (concatList
+          (if hasTr then Nil else Cons trampolineStr Nil)
+          [runStr, worldStr])
        (concatList
           (if hasSum eff then Cons sumStr Nil else Nil)
           (bundleAll 0 provs)))
@@ -1717,14 +1742,15 @@ provIndexGo i md (Cons p rest) =
   if strEq p.module md then i else provIndexGo (i + 1) md rest
 
 -- (each effect's handler, an operation of a sum going to its side's; a
--- leaf's is its provider's factory, called for a fresh algebra)
+-- leaf's is its provider's factory, called for a fresh algebra, given
+-- the world)
 handlerOf : List Provider -> Ef.Effect -> String
 handlerOf provs (Leaf k) =
   "$p"
   ++ showInt (provIndexGo 0 (Ef.moduleOfKey k) provs)
   ++ "."
   ++ Ef.nameOfKey k
-  ++ "()"
+  ++ "($world)"
 handlerOf provs (Plus a b) =
   "$sum(" ++ handlerOf provs a ++ ", " ++ handlerOf provs b ++ ")"
 
