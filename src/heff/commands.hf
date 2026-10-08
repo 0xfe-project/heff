@@ -408,7 +408,19 @@ writeOut outPath done o = do
             exit 1
     else exit 1
 
--- (the parts of a C program, each `DIR/NAME`, written)
+-- (a part written, unless it is there as it was: a C compiler that goes
+-- by when a file changed -- zig's -- builds it again only if it did)
+writeChanged : {e : HFunctor}
+             -> {{disk : fs <: e}}
+             -> String
+             -> String
+             -> Maybe String
+             -> Co e Bool
+writeChanged path text (Just was) =
+  if strEq was text then pure True else writeFile path text
+writeChanged path text Nothing = writeFile path text
+
+-- (the parts of a C program, each `DIR/NAME`, written where changed)
 writePartsGo : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
@@ -419,11 +431,30 @@ writePartsGo : {e : HFunctor}
 writePartsGo dir Nil = pure True
 writePartsGo dir (Cons (MkPair name text) rest) = do
   st <- styleNow
-  ok <- writeFile (P.join st dir name) text
+  was <- readFile (P.join st dir name)
+  ok <- writeChanged (P.join st dir name) text was
   if ok then writePartsGo dir rest else pure False
 
--- | a C program as parts, in the directory `dir` (what was in it before
--- | gone, so that a module no longer in the program is not built)
+-- (what is in `dir` and is no part of the program -- a module no longer
+-- in it -- gone, so that it is not built)
+removeStale : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> String
+            -> List (Pair String String)
+            -> List String
+            -> Co e Unit
+removeStale dir parts Nil = pure MkUnit
+removeStale dir parts (Cons n rest) = do
+  st <- styleNow
+  gone <-
+    if any (\p -> strEq (fst p) n) parts then pure True
+    else remove (P.join st dir n)
+  removeStale dir parts rest
+
+-- | a C program as parts, in the directory `dir`: each part written
+-- | only if it changed, and what is no part of it gone
 writeParts : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
@@ -436,8 +467,9 @@ writeParts dir done (MkPair parts errors) = do
   emitErrs errors
   if null errors
       then do
-        gone <- remove dir
         made <- mkDir dir
+        names <- readDir dir
+        u <- removeStale dir parts (fromMaybe Nil names)
         ok <- writePartsGo dir parts
         if ok then done
           else do
