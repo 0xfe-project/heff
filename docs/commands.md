@@ -72,3 +72,23 @@ modules checked, each program compiled, zig's own tasks as `zig cc`
 builds it, the packages fetched -- and clear it at the end; written to
 a file or a pipe (or with `TERM=dumb`), they say what they say and
 nothing more (`std.progress`).
+
+## How deep a program goes
+
+A call that is no tail call holds its place on the stack until it
+returns.  A C program (`c`) runs in a thread of its own, with a stack of
+1 GiB, and a Node.js program (`node`, what `heff run` runs) in a worker
+thread, with one of 512 MB: recursion millions deep -- three million of
+`sumTo n = if n == 0 then 0 else n + sumTo (n - 1)`.  An ES module
+(`esm`) and a page's script (`page`) run on the stack of what loads
+them -- Node.js's own, a browser's -- which has room for some ten
+thousand such calls (on Node.js 26, 9765 of `sumTo`, fewer of one that
+calls a closure); a call deeper throws a `RangeError`.
+
+heff does not take those calls off the stack: a trampoline, or
+continuations, would slow every call that is no tail call (twice as
+slow, `sumTo` measured), for a depth few modules need.  What must go
+deeper runs as a Node.js program, recurs by a tail call (`List.foldl`,
+not `List.foldr`), or is loaded on a larger stack: a `Worker`'s
+`resourceLimits.stackSizeMb`, as a Node.js program is, or
+`node --stack-size=N`, kept within what the system gives the thread.
