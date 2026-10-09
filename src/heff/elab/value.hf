@@ -194,12 +194,11 @@ lamDom t = case behavior t of
   _ -> t
 
 coerceToFieldsMaybe : V -> Maybe (D.Dict (Ev V))
-coerceToFieldsMaybe v = case v of
-  VCons fields -> Just fields
-  VNeu h sp ty expansion desc -> case expansion MkUnit of
-    IntoCons fields -> Just (D.mapD (\f -> Nom f) fields)
-    NotApplicable -> Nothing
-  _ -> Nothing
+coerceToFieldsMaybe (VCons fields) = Just fields
+coerceToFieldsMaybe (VNeu h sp ty expansion desc) = case expansion MkUnit of
+  IntoCons fields -> Just (D.mapD (\f -> Nom f) fields)
+  NotApplicable -> Nothing
+coerceToFieldsMaybe v = Nothing
 
 coerceToFields : V -> D.Dict (Ev V)
 coerceToFields v = case coerceToFieldsMaybe v of
@@ -207,9 +206,8 @@ coerceToFields v = case coerceToFieldsMaybe v of
   Nothing -> abandon
 
 proj : V -> String -> Ev V
-proj v x = case v of
-  VOpaque -> Nom VOpaque
-  _ -> D.elemAt (coerceToFields v) x
+proj VOpaque x = Nom VOpaque
+proj v x = D.elemAt (coerceToFields v) x
 
 -- | `expandRecord` makes a neutral for each field not specialized, so it
 -- | takes `reflect` (they are mutually recursive, and definitions are
@@ -274,23 +272,22 @@ mkNeu refl h spine ty desc =
 -- | an element (`Become`), that element.  The spine is only built in the
 -- | first case, so a `Become` never forces the arguments that led to it.
 reflect : Head -> P.Th (Spine V) -> P.Th Ty -> Maybe (Ev V) -> V
-reflect h spineTh ty edesc = case edesc of
-  Just (Describe desc) ->
-    mkNeu
-      (\h2 sp2 ty2 d2 -> reflect h2 sp2 ty2 d2)
-      h
-      (P.forceTh spineTh)
-      ty
-      (Just desc)
-  Just (Become v) -> v
-  Just (Nom v) -> v
-  Nothing ->
-    mkNeu
-      (\h2 sp2 ty2 d2 -> reflect h2 sp2 ty2 d2)
-      h
-      (P.forceTh spineTh)
-      ty
-      Nothing
+reflect h spineTh ty (Just (Describe desc)) =
+  mkNeu
+    (\h2 sp2 ty2 d2 -> reflect h2 sp2 ty2 d2)
+    h
+    (P.forceTh spineTh)
+    ty
+    (Just desc)
+reflect h spineTh ty (Just (Become v)) = v
+reflect h spineTh ty (Just (Nom v)) = v
+reflect h spineTh ty Nothing =
+  mkNeu
+    (\h2 sp2 ty2 d2 -> reflect h2 sp2 ty2 d2)
+    h
+    (P.forceTh spineTh)
+    ty
+    Nothing
 
 -- | field `x` of `v`, of type `a`: a neutral whose fields are not in hand
 -- | (its type was not known to be a record's when it was made) is
@@ -315,15 +312,13 @@ errorHole a = reflect HError (\u -> SpId) (\u -> a) Nothing
 
 -- | is it an error hole (applied, projected), or the type it decodes?
 isError : V -> Bool
-isError v = case v of
-  VNeu h sp ty expansion desc -> headIsError h
-  VCode (VDecode h sp u described el) -> headIsError h
-  _ -> False
+isError (VNeu h sp ty expansion desc) = headIsError h
+isError (VCode (VDecode h sp u described el)) = headIsError h
+isError _ = False
 
 isErrorTy : Ty -> Bool
-isErrorTy t = case t of
-  VDecode h sp u described el -> headIsError h
-  _ -> False
+isErrorTy (VDecode h sp u described el) = headIsError h
+isErrorTy _ = False
 
 -- | decoding a description
 decodeD : V -> Ev Ty
@@ -348,12 +343,12 @@ decodeNeu : Head
           -> P.Universe
           -> Maybe (Ev Ty)
           -> Ty
-decodeNeu h sp ty expansion desc u decoded = case decoded of
-  Just (Describe dty) ->
-    VDecode h sp u (\x -> Just dty) (\x -> VNeu h sp ty expansion desc)
-  Just (Become dty) -> dty
-  Just (Nom dty) -> dty
-  Nothing -> VDecode h sp u (\x -> Nothing) (\x -> VNeu h sp ty expansion desc)
+decodeNeu h sp ty expansion desc u (Just (Describe dty)) =
+  VDecode h sp u (\x -> Just dty) (\x -> VNeu h sp ty expansion desc)
+decodeNeu h sp ty expansion desc u (Just (Become dty)) = dty
+decodeNeu h sp ty expansion desc u (Just (Nom dty)) = dty
+decodeNeu h sp ty expansion desc u Nothing =
+  VDecode h sp u (\x -> Nothing) (\x -> VNeu h sp ty expansion desc)
 
 -- | decoding an element of case N
 decodeN : V -> Ty
@@ -386,24 +381,22 @@ appTy t arg = case behavior t of
 -- | the type of a neutral applied; a metavariable's stays what it is
 -- | past its arity
 neuAppTy : Head -> Ty -> P.Th V -> Ty
-neuAppTy h t arg = case h of
-  HMeta m -> case behavior t of
-    LikeFunction level dom cod implicit -> appTy t arg
-    _ -> t
-  _ -> appTy t arg
+neuAppTy (HMeta m) t arg = case behavior t of
+  LikeFunction level dom cod implicit -> appTy t arg
+  _ -> t
+neuAppTy h t arg = appTy t arg
 
 app : V -> P.Th V -> Ev V
-app f arg = case f of
-  VLam fty clo -> appClo clo arg
-  VNeu h sp ty expansion desc ->
-    Nom
-      (reflect
-         h
-         (\u -> SpApp sp (P.forceTh arg))
-         (\u -> neuAppTy h (P.forceTh ty) arg)
-         (mapMaybe (\d -> app d arg) (desc MkUnit)))
-  VOpaque -> Nom VOpaque
-  _ -> abandon
+app (VLam fty clo) arg = appClo clo arg
+app (VNeu h sp ty expansion desc) arg =
+  Nom
+    (reflect
+       h
+       (\u -> SpApp sp (P.forceTh arg))
+       (\u -> neuAppTy h (P.forceTh ty) arg)
+       (mapMaybe (\d -> app d arg) (desc MkUnit)))
+app VOpaque arg = Nom VOpaque
+app f arg = abandon
 
 setFieldValue : V -> (Locals V -> Field) -> Locals V -> Field
 setFieldValue v field vs = case field vs of
@@ -424,19 +417,17 @@ addSpecialization level capture fieldTypes defaults x v =
     defaults
 
 specialize : V -> String -> V -> V
-specialize v x f = case v of
-  VNeu h sp ty expansion desc -> case desc MkUnit of
-    Just (VCode (VRecord level capture fieldTypes defaults)) ->
-      VNeu
-        h
-        (SpSpec sp x f)
-        ty
-        expansion
-        (\u ->
-           Just
-             (VCode (addSpecialization level capture fieldTypes defaults x f)))
-    _ -> abandon
+specialize (VNeu h sp ty expansion desc) x f = case desc MkUnit of
+  Just (VCode (VRecord level capture fieldTypes defaults)) ->
+    VNeu
+      h
+      (SpSpec sp x f)
+      ty
+      expansion
+      (\u ->
+         Just (VCode (addSpecialization level capture fieldTypes defaults x f)))
   _ -> abandon
+specialize v x f = abandon
 
 -- | an implicit argument's default, of a function type that takes one
 -- | first
@@ -488,18 +479,16 @@ solutionOf mc m = case M.lookup compareInt m mc of
 
 -- | a solved metavariable at the head replaced by its solution
 forceEl : MetaCtx -> V -> V
-forceEl mc v = case v of
-  VNeu (HMeta m) sp ty expansion desc -> case solutionOf mc m of
-    Just sol -> forceEl mc (replay sol sp)
-    Nothing -> v
-  _ -> v
+forceEl mc v@(VNeu (HMeta m) sp ty expansion desc) = case solutionOf mc m of
+  Just sol -> forceEl mc (replay sol sp)
+  Nothing -> v
+forceEl mc v = v
 
 forceTy : MetaCtx -> Ty -> Ty
-forceTy mc t = case t of
-  VDecode (HMeta m) sp u described el -> case solutionOf mc m of
-    Just sol -> forceTy mc (decodeN (forceEl mc (replay sol sp)))
-    Nothing -> t
-  _ -> t
+forceTy mc t@(VDecode (HMeta m) sp u described el) = case solutionOf mc m of
+  Just sol -> forceTy mc (decodeN (forceEl mc (replay sol sp)))
+  Nothing -> t
+forceTy mc t = t
 
 -- Projection types
 --------------------------------------------------------------------------------
