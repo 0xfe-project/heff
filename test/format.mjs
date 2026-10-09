@@ -12,15 +12,18 @@ import { pathToFileURL } from "node:url";
 import { heffBin, root } from "./heff.mjs";
 
 // the formatter, compiled to a module of its own, its `format` called
-// directly: `Right` the text laid out, `Left` why not
+// directly: `Right` the text laid out, `Left` why not -- a heff String
+// as JavaScript has it, each of its bytes, UTF-8, a code unit
 const module = join(root, ".heff", "out", "heff-format.mjs");
 execFileSync(heffBin, ["compile", "src/heff/syntax/format.hf", module, "--backend=esm"], { cwd: root });
 const { format } = (await import(pathToFileURL(module))).default;
+const bytesOf = (text) => Buffer.from(text, "utf8").toString("latin1");
+const textOf = (bytes) => Buffer.from(bytes, "latin1").toString("utf8");
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}:\n${got}`); } };
 const run = (src) => {
-  const r = format(src);
-  return r.$ === "Right" ? { ok: true, out: r.a[0] } : { ok: false, why: r.a[0] };
+  const r = format(bytesOf(src));
+  return r.$ === "Right" ? { ok: true, out: textOf(r.a[0]) } : { ok: false, why: textOf(r.a[0]) };
 };
 // formatted, and formatting it again changes nothing
 const formats = (what, src, want) => {

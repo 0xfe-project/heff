@@ -12,8 +12,8 @@
 --   a tag, a record  ~>  `heff_tag_n`, `heff_rec_n`, built at the size
 --            the emitter knows: tags and labels numbered (`TAG_x`,
 --            `LBL_x`), a record's fields in the order it is written in
---   a string  ~>  a static object, its UTF-16 code units and its UTF-8
---            bytes, of which the runtime takes those its strings are
+--   a string  ~>  a static object, its bytes (with its UTF-16 code
+--            units, which the runtime's macro passes over)
 --   a call last of an unknown function  ~>  `heff_tail` (counted, a
 --            bounce every so often); a call not last, its value through
 --            `heff_tr` -- as src/heff/compile/emit.hf does (`Em.bouncing`).  From
@@ -47,20 +47,20 @@ isAlnum c =
 
 mangleChar : Int -> String
 mangleChar c =
-  if isAlnum c then strFromCharCode c
+  if isAlnum c then strFromByte c
   else "_" ^ hexDigit (intDiv (intMod c 256) 16) ^ hexDigit (intMod c 16)
 
 -- (from `i`, a run of letters and digits scanned to `j`: each run taken
 -- whole, not a letter at a time)
 mangleW : String -> Int -> Int -> String -> String
 mangleW s i j acc =
-  if j < strLength s && isAlnum (charCode s j) then mangleW s i (j + 1) acc
+  if j < strLength s && isAlnum (byteAt s j) then mangleW s i (j + 1) acc
   else if j >= strLength s then acc ^ strSlice s i j
   else mangleW
       s
       (j + 1)
       (j + 1)
-      (acc ^ strSlice s i j ^ mangleChar (charCode s j))
+      (acc ^ strSlice s i j ^ mangleChar (byteAt s j))
 
 -- | a name as C spells it: letters and digits kept, the rest `_xx`
 -- | >>> mangle "co.<+>"
@@ -159,7 +159,7 @@ tagsLbls _ = MkPair Nil Nil
 
 identAt : String -> Int -> Int -> String
 identAt text start i =
-  if i < strLength text && (isAlnum (charCode text i) || charCode text i == 95)
+  if i < strLength text && (isAlnum (byteAt text i) || byteAt text i == 95)
     then identAt text start (i + 1)
   else strSlice text start i
 
@@ -193,7 +193,7 @@ numbered n (Cons x xs) m =
 hashBelow : String -> Int -> Int -> Int -> Int
 hashBelow t m i a =
   if i >= strLength t then a
-  else hashBelow t m (i + 1) ((a * 31 + charCode t i + 1) % m)
+  else hashBelow t m (i + 1) ((a * 31 + byteAt t i + 1) % m)
 
 -- (the number `h` or, if taken, the next free after it)
 slotFrom : Int -> Int -> Int -> M.Map Int Unit -> Int
@@ -386,7 +386,7 @@ traverseC f (Cons x xs) = do
 
 unitsOf : String -> List String
 unitsOf str =
-  List.map (\i -> showInt (charCode str i)) (List.range 0 (strLength str - 1))
+  List.map (\i -> showInt (byteAt str i)) (List.range 0 (strLength str - 1))
 
 -- (a rune's UTF-16 code units: one, or a surrogate pair)
 units16 : Int -> List Int
@@ -394,28 +394,16 @@ units16 c =
   if c < 65536 then [c]
   else [55296 + (c - 65536) / 1024, 56320 + (c - 65536) % 1024]
 
--- (its UTF-8 bytes)
-units8 : Int -> List Int
-units8 c =
-  if c < 128 then [c]
-  else if c < 2048 then [192 + c / 64, 128 + c % 64]
-  else if c < 65536 then [224 + c / 4096, 128 + (c / 64) % 64, 128 + c % 64]
-  else [ 240 + c / 262144
-       , 128 + (c / 4096) % 64
-       , 128 + (c / 64) % 64
-       , 128 + c % 64
-       ]
-
 -- (a list of units, as the runtime's macros take it: in parentheses,
 -- an empty one `(0)`)
 unitList : List String -> String
 unitList Nil = "(0)"
 unitList us = "(" ^ joinWith ", " us ^ ")"
 
--- (a string not ASCII's, by its runes: its UTF-16 code units and its
--- UTF-8 bytes)
-strDefRunes : String -> List Int -> String
-strDefRunes name cs =
+-- (a string not ASCII's: its UTF-16 code units, of its runes, and its
+-- bytes)
+strDefRunes : String -> String -> List Int -> String
+strDefRunes name str cs =
   "HEFF_STR("
   ^ name
   ^ ", "
@@ -423,22 +411,23 @@ strDefRunes name cs =
   ^ ", "
   ^ unitList (List.map showInt (List.concatMap units16 cs))
   ^ ", "
-  ^ showInt (List.length (List.concatMap units8 cs))
+  ^ showInt (strLength str)
   ^ ", "
-  ^ unitList (List.map showInt (List.concatMap units8 cs))
+  ^ unitList (unitsOf str)
   ^ ");"
 
 -- | a static string, by lib/c/runtime.c's macros: an ASCII one by its
--- | units (`HEFF_STRA`), another by both its UTF-16 code units and its
--- | UTF-8 bytes (`HEFF_STR`), of which the runtime takes those its
--- | strings are -- each computed of its runes, whatever the strings of
--- | the compiler that writes it are
+-- | bytes (`HEFF_STRA`), another by both its UTF-16 code units (of its
+-- | runes, what is not UTF-8 U+FFFD) and its bytes (`HEFF_STR`), of
+-- | which the runtime takes its bytes
 -- | >>> strDef "s" "ab"
 -- | "HEFF_STRA(s, 2, (97, 98));"
 -- | >>> strDef "s" ""
 -- | "HEFF_STRA(s, 0, (0));"
 -- | >>> strDef "s" "\u{2026}\u{1F600}"
 -- | "HEFF_STR(s, 3, (8230, 55357, 56832), 7, (226, 128, 166, 240, 159, 152, 128));"
+-- | >>> strDef "s" ("a" ^ fromByte 255)
+-- | "HEFF_STR(s, 2, (97, 65533), 2, (97, 255));"
 strDef : String -> String -> String
 strDef name str =
   if Pr.asciiString str
@@ -449,7 +438,7 @@ strDef name str =
       ^ ", "
       ^ unitList (unitsOf str)
       ^ ");"
-  else strDefRunes name (List.map R.toInt (runes str))
+  else strDefRunes name str (List.map R.toInt (runes str))
 
 -- | a static string
 strLit : String -> C String
@@ -2678,7 +2667,7 @@ programWith runtime provs ending defs names =
 lastDotGo : String -> Int -> Int -> Int
 lastDotGo k i at =
   if i >= strLength k then at
-  else lastDotGo k (i + 1) (if charCode k i == 46 then i else at)
+  else lastDotGo k (i + 1) (if byteAt k i == 46 then i else at)
 
 moduleAt : String -> Int -> String
 moduleAt k at = if at < 0 then k else strSlice k 0 at

@@ -11,6 +11,41 @@ const items = (v) => {
   for (; isTag(v, "Cons", 2); v = v.a[1]) xs.push(v.a[0]);
   return isTag(v, "Nil", 0) ? xs : null;
 };
+// (the rune at `i` of a string, bytes each a code unit, and how many
+// bytes it takes: what is not UTF-8 U+FFFD, of the longest start of a
+// rune's bytes there, or of a byte that starts none -- as TextDecoder
+// and lib/c/runtime.c's heff_u8_decode read it)
+const runeAt = (s, i) => {
+  const b = s.charCodeAt(i);
+  if (b < 0x80) return [b, 1];
+  let m, c, lo = 0x80, hi = 0xbf;
+  if (b >= 0xc2 && b <= 0xdf) { m = 1; c = b & 0x1f; }
+  else if (b >= 0xe0 && b <= 0xef) { m = 2; c = b & 0x0f; if (b === 0xe0) lo = 0xa0; else if (b === 0xed) hi = 0x9f; }
+  else if (b >= 0xf0 && b <= 0xf4) { m = 3; c = b & 0x07; if (b === 0xf0) lo = 0x90; else if (b === 0xf4) hi = 0x8f; }
+  else return [0xfffd, 1];
+  for (let k = 1; k <= m; k++) {
+    const d = i + k < s.length ? s.charCodeAt(i + k) : -1;
+    if (d < lo || d > hi) return [0xfffd, k];
+    lo = 0x80; hi = 0xbf; c = c * 64 + (d & 0x3f);
+  }
+  return [c, m + 1];
+};
+// (a string, as JSON writes its text; each byte of what is not UTF-8
+// in it `\xff`, as a string literal writes it)
+const showString = (s) => {
+  let out = "", text = "";
+  for (let i = 0; i < s.length;) {
+    const [c, w] = runeAt(s, i);
+    if (c !== 0xfffd || s.slice(i, i + w) === "\xef\xbf\xbd") text += String.fromCodePoint(c);
+    else {
+      out += JSON.stringify(text).slice(1, -1);
+      text = "";
+      for (let k = 0; k < w; k++) out += "\\x" + s.charCodeAt(i + k).toString(16).padStart(2, "0");
+    }
+    i += w;
+  }
+  return "\"" + out + JSON.stringify(text).slice(1, -1) + "\"";
+};
 // (a list as `[a, b]` writes it; a tag with arguments is parenthesized
 // where it is an argument)
 export const show = (v, arg = false) => {
@@ -20,7 +55,7 @@ export const show = (v, arg = false) => {
   if (typeof v === "bigint") return v.toString();
   // (a float as a literal writes it: `2.0`, not `2`)
   if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
-  if (typeof v === "string") return JSON.stringify(v);
+  if (typeof v === "string") return showString(v);
   if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {

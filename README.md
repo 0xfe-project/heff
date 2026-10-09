@@ -287,10 +287,21 @@ to U+10FFFF but the surrogates (`'\u{D800}'` is an error, as it is in
 a string, where `"\u{1F600}"` is 😀 and `"\u{41}"` is `"A"`), and a
 `Rune` whatever it is checked at: an integer literal is no rune, nor a
 rune literal an integer.  A rune literal is a pattern too, compared by
-code point.  The prelude takes a string apart into its runes,
-`runes : String -> List Rune`, and puts them together again, `ofRunes`;
-a string is UTF-16 on every backend, so a rune beyond U+FFFF is a
-surrogate pair in it, and a surrogate not in a pair is read as U+FFFD.
+code point.
+
+A `String` is bytes, as Go's is: UTF-8 as a literal writes it (`"é"`
+is two bytes), though any bytes may be in one -- what a file, a stream
+or a command gave, `fromByte 255`, or a string's own escape `"\xff"`, a
+byte of two hexadecimal digits.  Its length (`strLength`), an index
+(`byteAt`, a byte from 0 to 255, -1 out of the string), a slice and its
+order (`strLt`: the bytes', which of UTF-8 is the code points') are of
+bytes, the same on every backend.  The prelude takes a string apart
+into its runes, `runes : String -> List Rune`, and puts them together
+again, `ofRunes`; `runeAt s i` is the rune whose bytes start at `i`
+and how many they are (Go's `utf8.DecodeRuneInString`).  What is not
+UTF-8 is read as U+FFFD, one for each longest start of a rune's bytes,
+or a byte that starts none (as `TextDecoder` reads it), and shown a
+byte at a time, `"a\xff"`, as it is written back.
 
 ```haskell
 import rune as R
@@ -306,7 +317,10 @@ The module `rune` (`import rune as R`) has their comparisons (`eq`,
 `toInt` and `fromInt` (which wraps an integer around to 32 bits, as Go's
 `rune(n)` does: a rune may be no scalar value, `isValid` says, and is
 U+FFFD, `replacement`, in a string made of it), `toString`, `show`
-(`"'a'"`), and ASCII's classes and cases: `isDigit`, `isAlpha`,
+(`"'a'"`), a rune in a string -- `width` (its bytes), `count` (a
+string's runes), `foldl` (each rune with where it starts),
+`validString` and `toValid` (what is not UTF-8 made U+FFFD) -- and
+ASCII's classes and cases: `isDigit`, `isAlpha`,
 `isSpace`, `isUpper`, `toUpper` and the like (`isAlpha 'é'` is
 `False`).  A provider is given a rune as a number in JavaScript, and in
 C as a word of its code point (`INT_OF`, `MK_INT`).
@@ -380,7 +394,18 @@ takes one from it, only through the runtime's helpers, by what the
 string is there -- text, or bytes: `$toJs`, `$fromJs`, `$toBytes` and
 `$fromBytes` in JavaScript (lib/std/dom.provider.js says which is for
 what), `heff_str_text`, `heff_str_bytes`, `heff_cstr` and the like in C
-(lib/c/runtime.c, "What providers share").
+(lib/c/runtime.c, "What providers share").  In JavaScript a string is
+kept as a JavaScript string each of whose code units is one of its
+bytes; in C as its bytes, no NUL after them.  The same on every
+backend: content and paths are bytes as they are (a file's, a
+stream's, what a command wrote, what was fetched, a directory's
+names); names -- the program's arguments, the environment, the working
+directory, a command and its arguments -- and the hosts of text (the
+DOM, JSON) are text, what is not UTF-8 U+FFFD in and out; a path with
+a NUL in it is none, the operation failing.  An ES module
+(`--backend=esm`) gives and takes its strings as they are kept, bytes:
+JavaScript calling it makes them (`Buffer.from(t, "utf8")
+.toString("latin1")`) and reads them back.
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.

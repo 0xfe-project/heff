@@ -12,15 +12,16 @@ import { root } from "./heff.mjs";
 // | cannot be run, `error` set); its standard input `input`, then closed;
 // | of each of its outputs what comes before `keep` characters, the rest
 // | let go (a process that says the same thing over and over, endlessly,
-// | is not held whole)
-export const run = (cmd, args, { cwd = root, timeout = 600000, env = process.env, input, keep = Infinity } = {}) =>
+// | is not held whole); its outputs read as `encoding` says, UTF-8 (or
+// | "latin1": a byte each character, as they are)
+export const run = (cmd, args, { cwd = root, timeout = 600000, env = process.env, input, keep = Infinity, encoding = "utf8" } = {}) =>
   new Promise((resolve) => {
     const p = spawn(cmd, args, { cwd, env });
     p.stdin.on("error", () => {});
     p.stdin.end(input);
     let stdout = "", stderr = "";
-    p.stdout.setEncoding("utf8");
-    p.stderr.setEncoding("utf8");
+    p.stdout.setEncoding(encoding);
+    p.stderr.setEncoding(encoding);
     p.stdout.on("data", (d) => { if (stdout.length < keep) stdout += d; });
     p.stderr.on("data", (d) => { if (stderr.length < keep) stderr += d; });
     const timer = setTimeout(() => p.kill("SIGKILL"), timeout);

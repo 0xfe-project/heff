@@ -164,6 +164,44 @@ checks.push((async () => {
   return msgs;
 })());
 
+// (a string is bytes, to the system and back, the same on each backend:
+// what is not UTF-8 -- an overlong, a surrogate, beyond U+10FFFF, cut
+// short, a byte of no rune -- read and written as it is, by stdin,
+// stdout and a file named not in ASCII; made text, as TextDecoder
+// makes it; the arguments and the environment, which Node.js has as
+// text alone, text on each, given by a shell as bytes)
+checks.push((async () => {
+  const msgs = [];
+  const input = Buffer.from([0x61, 0xc0, 0xaf, 0xe0, 0x80, 0x80, 0xed, 0xa0, 0x80, 0xf4, 0x90, 0x80, 0x80,
+    0xf0, 0x9f, 0x98, 0x20, 0xff, 0x80, 0x00, 0x0d, 0x0a, 0xef, 0xbb, 0xbf, 0xc3, 0xa9, 0xf0, 0x9f, 0x98, 0x80, 0xe2, 0x82]);
+  const hex = (b) => Buffer.from(b).toString("hex");
+  const text = (b) => hex(Buffer.from(new TextDecoder("utf-8", { ignoreBOM: true }).decode(b)));
+  const arg = Buffer.from([0x78, 0xed, 0xa0, 0x80, 0xc3, 0xa9, 0xff]), env = Buffer.from([0xe2, 0x82, 0x79]);
+  const octal = (b) => [...b].map((c) => "\\" + c.toString(8).padStart(3, "0")).join("");
+  const want = input.toString("latin1") + "\n"
+    + `${input.length} bytes, ${[...new TextDecoder("utf-8", { ignoreBOM: true }).decode(input)].length} runes, UTF-8: no\n`
+    + `as text: ${text(input)}\n`
+    + "file: same\n"
+    + `names: ${hex(Buffer.from("bytes-é😀.bin"))}\n`
+    + "a NUL in a path, written: no\n"
+    + "a NUL in a path, read: no\n"
+    + `arguments: ${text(arg)}\n`
+    + `environment: ${text(env)}\n`;
+  for (const [be, build] of Object.entries(programs)) {
+    const p = await build("test/node/bytes.hf", "main");
+    if (p.error !== undefined) { msgs.push(`FAIL bytes (${be}): not compiled\n${p.error}`); continue; }
+    const dir = join(work, `bytes-${be}`);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir);
+    const r = await run("sh", ["-c", `HEFF_BYTES="$(printf '${octal(env)}')" exec "$@" "$(printf '${octal(arg)}')"`, "sh", p.cmd, ...p.pre, dir],
+      { timeout: 60000, input, encoding: "latin1" });
+    if (r.stdout !== want || r.status !== 0)
+      msgs.push(`FAIL bytes (${be}): status ${r.status}, out ${JSON.stringify(r.stdout)}, wanted ${JSON.stringify(want)}\n${r.stderr}`);
+    else if (!readFileSync(join(dir, "bytes-é😀.bin")).equals(input)) msgs.push(`FAIL bytes (${be}): the file`);
+  }
+  return msgs;
+})());
+
 // (`heff run`: compiled for Node.js, then run in heff's place, on its streams)
 checks.push((async () => {
   const r = await heff(["run", "test/node/echo.hf", join(work, "run.txt"), "x"], { cwd: root, input: "in", env: { ...process.env, GREETING: "hi" } });

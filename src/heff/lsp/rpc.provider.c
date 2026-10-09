@@ -89,6 +89,9 @@ static V json_string(Json *j) {
         if (json_hex4(j, &lo) && lo >= 0xDC00 && lo < 0xE000) u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
         else *j = save;
       }
+      // (a surrogate not in a pair, U+FFFD, as JavaScript's string has
+      // it, made UTF-8)
+      if (u >= 0xD800 && u < 0xE000) u = 0xFFFD;
       json_utf8(&b, u);
       break;
     default: free(b.s); return 0;

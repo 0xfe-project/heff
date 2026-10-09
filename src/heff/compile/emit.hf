@@ -59,13 +59,20 @@ unsnocE (Cons x rest) = Just (unsnocGo rest x)
 -- Names
 --------------------------------------------------------------------------------
 
+hexDigitOf : Int -> String
+hexDigitOf d = strSlice "0123456789abcdef" d (d + 1)
+
+-- (a byte not ASCII's as a JavaScript string writes it, `\xc3`: the
+-- code unit of it the byte string has)
 escAt : String -> Int -> String
 escAt s i =
-  if charCode s i == 34 then "\\\""
-  else if charCode s i == 92 then "\\\\"
-  else if charCode s i == 10 then "\\n"
-  else if charCode s i == 13 then "\\r"
-  else if charCode s i == 9 then "\\t"
+  if byteAt s i == 34 then "\\\""
+  else if byteAt s i == 92 then "\\\\"
+  else if byteAt s i == 10 then "\\n"
+  else if byteAt s i == 13 then "\\r"
+  else if byteAt s i == 9 then "\\t"
+  else if byteAt s i >= 128
+    then "\\x" ^ hexDigitOf (byteAt s i / 16) ^ hexDigitOf (byteAt s i % 16)
   else strSlice s i (i + 1)
 
 quoteGo : String -> Int -> String -> String
@@ -103,7 +110,7 @@ wordOf c =
 operatorGo : String -> Int -> List String -> Maybe (List String)
 operatorGo x i acc =
   if i >= strLength x then Just (List.reverse acc)
-  else case wordOf (charCode x i) of
+  else case wordOf (byteAt x i) of
     Just w -> operatorGo x (i + 1) (Cons w acc)
     Nothing -> Nothing
 
@@ -120,7 +127,7 @@ operatorName x =
 lastDotFrom : String -> Int -> Maybe Int
 lastDotFrom s i =
   if i < 0 then Nothing
-  else if charCode s i == 46 then Just i
+  else if byteAt s i == 46 then Just i
   else lastDotFrom s (i - 1)
 
 spellAt : String -> Maybe Int -> String
@@ -230,12 +237,11 @@ safeChars x i acc =
   else safeChars
       x
       (i + 1)
-      (acc ^ (if isWordCode (charCode x i) then strSlice x i (i + 1) else "_"))
+      (acc ^ (if isWordCode (byteAt x i) then strSlice x i (i + 1) else "_"))
 
 safeRes : String -> String
 safeRes s =
-  if elemStr s reserved || (48 <= charCode s 0 && charCode s 0 <= 57)
-    then "_" ^ s
+  if elemStr s reserved || (48 <= byteAt s 0 && byteAt s 0 <= 57) then "_" ^ s
   else s
 
 safeFrom : String -> String
@@ -1070,7 +1076,7 @@ bounceDepth = 500
 atomGo : String -> Int -> Bool
 atomGo c i =
   if i >= strLength c then True
-  else (isWordCode (charCode c i) || charCode c i == 36) && atomGo c (i + 1)
+  else (isWordCode (byteAt c i) || byteAt c i == 36) && atomGo c (i + 1)
 
 -- | code that is a name or a literal: computing it again is nothing
 isAtom : String -> Bool
@@ -1376,19 +1382,27 @@ whenHas : String -> String -> String -> Maybe String
 whenHas code k line = if contains k code then Just line else Nothing
 
 -- | the helpers a String crosses to the host and back by, each its name
--- | and its line (lib/std/dom.provider.js says which is for what): for
--- | now a String is a JavaScript string, the host's text as it is and
--- | its bytes UTF-8
+-- | and its line (lib/std/dom.provider.js says which is for what): a
+-- | String is a JavaScript string each of whose code units is one of its
+-- | bytes; the host's text is its UTF-8 (what is not UTF-8 U+FFFD, and
+-- | a surrogate not in a pair, as `TextDecoder` and `TextEncoder` have
+-- | it, a BOM kept), text that is ASCII as it is, and the host's bytes
+-- | are its bytes -- by `Buffer` where there is one (Node.js), else by
+-- | the web's encoders
 strHelpers : List (Pair String String)
 strHelpers =
-  [ MkPair "$toJs" "const $toJs = (s) => s;"
-  , MkPair "$fromJs" "const $fromJs = (t) => t;"
+  [ MkPair
+    "$toJs"
+    "const $toJs = typeof Buffer === \"function\" ? (s) => /^[\\x00-\\x7f]*$/.test(s) ? s : Buffer.from(s, \"latin1\").toString(\"utf8\") : (s) => /^[\\x00-\\x7f]*$/.test(s) ? s : new TextDecoder(\"utf-8\", { ignoreBOM: true }).decode(Uint8Array.from(s, (c) => c.charCodeAt(0)));"
+  , MkPair
+    "$fromJs"
+    "const $fromJs = typeof Buffer === \"function\" ? (t) => /^[\\x00-\\x7f]*$/.test(t) ? t : Buffer.from(t, \"utf8\").toString(\"latin1\") : (t) => { if (/^[\\x00-\\x7f]*$/.test(t)) return t; const b = new TextEncoder().encode(t); let s = \"\"; for (let i = 0; i < b.length; i += 8192) s += String.fromCharCode.apply(null, b.subarray(i, i + 8192)); return s; };"
   , MkPair
     "$toBytes"
-    "const $toBytes = typeof Buffer === \"function\" ? (s) => Buffer.from(s, \"utf8\") : (s) => new TextEncoder().encode(s);"
+    "const $toBytes = typeof Buffer === \"function\" ? (s) => Buffer.from(s, \"latin1\") : (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));"
   , MkPair
     "$fromBytes"
-    "const $fromBytes = typeof Buffer === \"function\" ? (b) => (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString(\"utf8\") : (b) => new TextDecoder().decode(b);"
+    "const $fromBytes = typeof Buffer === \"function\" ? (b) => (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString(\"latin1\") : (b) => { const u = new Uint8Array(b); let s = \"\"; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode.apply(null, u.subarray(i, i + 8192)); return s; };"
   ]
 
 strHelperIn : String -> Pair String String -> Maybe String

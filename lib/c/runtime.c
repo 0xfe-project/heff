@@ -8,11 +8,12 @@
 // is.  Tags are numbered (`TAG_x`), the ones the runtime knows first
 // (below), the program's after them, each by a hash of its name; record
 // labels too (`LBL_x`), a record's fields in the order it was written
-// with them.  Strings are UTF-16 code units, as JavaScript's are, so
-// that what a program computes with them is what the other backends
-// compute; a provider gives one to the system, and makes one of what the
-// system gives, only through the runtime's helpers ("What providers
-// share" says which).
+// with them.  A string is bytes, `len` of them (no NUL after them, and
+// any byte may be in them), UTF-8 as the program wrote it -- its runes
+// read as `heff_u8_decode` reads them, what is not UTF-8 U+FFFD -- as
+// the other backends have it; a provider gives one to the system, and
+// makes one of what the system gives, only through the runtime's
+// helpers ("What providers share" says which).
 //
 // An object is counted (Perceus): each owner of it holds a reference,
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
@@ -107,12 +108,13 @@ typedef struct { Obj h; int64_t n; uint32_t *lbl; V f[]; } Rec;
 // value, or 0)
 typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V memo; V env[]; } Clo;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
-typedef struct { Obj h; int64_t len; int64_t cap; uint16_t s[]; } Str;
+typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
 // (a string written in the program, static: the emitter gives both its
 // UTF-16 code units and its UTF-8 bytes, `HEFF_STR`, and the runtime
-// takes those its strings are -- the bytes where `HEFF_STR8` is defined;
-// an ASCII one, the same in both, its units once, `HEFF_STRA`; an empty
+// takes those its strings are, the bytes -- `HEFF_STR8` is defined; an
+// ASCII one, the same in both, its units once, `HEFF_STRA`; an empty
 // one's list `(0)`)
+#define HEFF_STR8 1
 #define HEFF_ID(...) __VA_ARGS__
 #ifdef HEFF_STR8
 #define HEFF_UNIT uint8_t
@@ -527,7 +529,7 @@ static size_t heff_size(V v) {
   case K_REC: return sizeof(Rec) + ((Rec *)v)->n * sizeof(V);
   case K_CLO: return sizeof(Clo) + ((Clo *)v)->nenv * sizeof(V);
   case K_PAP: return sizeof(Pap) + ((Pap *)v)->n * sizeof(V);
-  case K_STR: return sizeof(Str) + ((Str *)v)->cap * sizeof(uint16_t);
+  case K_STR: return sizeof(Str) + ((Str *)v)->cap;
   case K_FLT: return sizeof(Flt);
   case K_ARR: return sizeof(Arr) + ((Arr *)v)->n * sizeof(V);
   case K_BNC: return sizeof(Bnc) + ((Bnc *)v)->n * sizeof(V);
@@ -1217,7 +1219,7 @@ static double heff_double_of_int(V v) {
 // ---------------------------------------------------------------------
 
 static Str *heff_str_new(int64_t len) {
-  Str *s = heff_obj_alloc(sizeof(Str) + len * sizeof(uint16_t));
+  Str *s = heff_obj_alloc(sizeof(Str) + len);
   s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = len;
   return s;
 }
@@ -1225,53 +1227,90 @@ static Str *heff_str_new(int64_t len) {
 static V heff_str_ascii(const char *c) {
   int64_t n = (int64_t)strlen(c);
   Str *s = heff_str_new(n);
-  for (int64_t i = 0; i < n; i++) s->s[i] = (uint16_t)(unsigned char)c[i];
+  if (n) memcpy(s->s, c, (size_t)n);
   return (V)s;
 }
 
-// (UTF-8 in, as read; UTF-16 kept.  The runtime's own: a provider
-// builds a string by what it crosses as, "What providers share")
-static V heff_str_utf8(const unsigned char *c, int64_t n) {
+// (`n` bytes, as they are.  The runtime's own: a provider builds a
+// string by what it crosses as, "What providers share")
+static V heff_str_of(const void *c, int64_t n) {
   Str *s = heff_str_new(n);
+  if (n) memcpy(s->s, c, (size_t)n);
+  return (V)s;
+}
+
+// (the rune whose bytes start at `p`, `n` bytes there: how many bytes
+// it takes, the rune `*out`.  What is not UTF-8 is U+FFFD, of as many
+// bytes as start a rune's and go on as one's would, at least one -- the
+// "maximal subpart" WHATWG's decoder takes, as TextDecoder does: after
+// a first byte that starts a rune (C2 to F4), the k-th that does not go
+// on as its (a second byte of E0, ED, F0 and F4 in their own ranges,
+// Unicode's table 3-7) makes one U+FFFD of the k before it; a byte that
+// starts none is one)
+static int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out) {
+  uint8_t b = p[0];
+  if (b < 0x80) { *out = b; return 1; }
+  int w; uint32_t u, lo = 0x80, hi = 0xBF;
+  if (b >= 0xC2 && b <= 0xDF) { w = 2; u = b & 0x1F; }
+  else if (b >= 0xE0 && b <= 0xEF) { w = 3; u = b & 0x0F; if (b == 0xE0) lo = 0xA0; else if (b == 0xED) hi = 0x9F; }
+  else if (b >= 0xF0 && b <= 0xF4) { w = 4; u = b & 0x07; if (b == 0xF0) lo = 0x90; else if (b == 0xF4) hi = 0x8F; }
+  else { *out = 0xFFFD; return 1; }
+  for (int k = 1; k < w; k++) {
+    if (k >= n) { *out = 0xFFFD; return k; }
+    uint8_t c = p[k];
+    if (c < (k == 1 ? lo : 0x80) || c > (k == 1 ? hi : 0xBF)) { *out = 0xFFFD; return k; }
+    u = (u << 6) | (c & 0x3F);
+  }
+  *out = u;
+  return w;
+}
+
+// (a scalar value's UTF-8 bytes, at `o`: how many)
+static int heff_u8_encode(uint8_t *o, uint32_t u) {
+  if (u < 0x80) { o[0] = (uint8_t)u; return 1; }
+  if (u < 0x800) { o[0] = (uint8_t)(0xC0 | (u >> 6)); o[1] = (uint8_t)(0x80 | (u & 0x3F)); return 2; }
+  if (u < 0x10000) { o[0] = (uint8_t)(0xE0 | (u >> 12)); o[1] = (uint8_t)(0x80 | ((u >> 6) & 0x3F)); o[2] = (uint8_t)(0x80 | (u & 0x3F)); return 3; }
+  o[0] = (uint8_t)(0xF0 | (u >> 18)); o[1] = (uint8_t)(0x80 | ((u >> 12) & 0x3F)); o[2] = (uint8_t)(0x80 | ((u >> 6) & 0x3F)); o[3] = (uint8_t)(0x80 | (u & 0x3F));
+  return 4;
+}
+
+// (whether the `w` bytes from `p`, read as `u`, are a rune's: not U+FFFD
+// read for what is not UTF-8)
+static inline int heff_u8_own(const uint8_t *p, uint32_t u, int w) {
+  return u != 0xFFFD || (w == 3 && p[0] == 0xEF && p[1] == 0xBF && p[2] == 0xBD);
+}
+
+// (how many bytes `n` bytes are, made text, what is not UTF-8 in them
+// U+FFFD; as many, where they are UTF-8)
+static int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own) {
+  int64_t m = 0;
+  *own = 1;
+  for (int64_t i = 0; i < n;) {
+    uint32_t u;
+    int w = heff_u8_decode(p + i, n - i, &u);
+    if (heff_u8_own(p + i, u, w)) m += w; else { *own = 0; m += 3; }
+    i += w;
+  }
+  return m;
+}
+
+// (`n` bytes, made text: what is not UTF-8 in them U+FFFD, as
+// TextDecoder reads them -- as they are, where they are UTF-8)
+static V heff_str_valid(const void *c, int64_t n) {
+  const uint8_t *p = c;
+  int own;
+  int64_t m = heff_u8_valid_len(p, n, &own);
+  if (own) return heff_str_of(c, n);
+  Str *s = heff_str_new(m);
   int64_t k = 0;
   for (int64_t i = 0; i < n;) {
-    uint32_t u = c[i];
-    int extra = u >= 0xF0 ? 3 : u >= 0xE0 ? 2 : u >= 0xC0 ? 1 : 0;
-    if (extra) u &= (0x3F >> extra);
-    i++;
-    for (int j = 0; j < extra && i < n; j++, i++) u = (u << 6) | (c[i] & 0x3F);
-    if (u >= 0x10000) {
-      u -= 0x10000;
-      s->s[k++] = (uint16_t)(0xD800 + (u >> 10));
-      s->s[k++] = (uint16_t)(0xDC00 + (u & 0x3FF));
-    } else s->s[k++] = (uint16_t)u;
+    uint32_t u;
+    int w = heff_u8_decode(p + i, n - i, &u);
+    if (heff_u8_own(p + i, u, w)) { memcpy(s->s + k, p + i, (size_t)w); k += w; }
+    else k += heff_u8_encode(s->s + k, 0xFFFD);
+    i += w;
   }
-  s->len = k;
   return (V)s;
-}
-
-// (UTF-16 out, as UTF-8)
-// (a string written out as UTF-8: encoded into a buffer, written a
-// buffer at a time, not a byte -- each fputc takes the stream's lock.
-// The runtime's own, as heff_str_utf8 is: a provider writes by
-// `heff_put`)
-static void heff_put_utf8(FILE *f, V v) {
-  Str *s = (Str *)v;
-  unsigned char buf[8192];
-  size_t n = 0;
-  for (int64_t i = 0; i < s->len; i++) {
-    uint32_t u = s->s[i];
-    if (u >= 0xD800 && u < 0xDC00 && i + 1 < s->len) {
-      uint32_t w = s->s[i + 1];
-      if (w >= 0xDC00 && w < 0xE000) { u = 0x10000 + ((u - 0xD800) << 10) + (w - 0xDC00); i++; }
-    }
-    if (n > sizeof buf - 4) { fwrite(buf, 1, n, f); n = 0; }
-    if (u < 0x80) buf[n++] = (unsigned char)u;
-    else if (u < 0x800) { buf[n++] = (unsigned char)(0xC0 | (u >> 6)); buf[n++] = (unsigned char)(0x80 | (u & 0x3F)); }
-    else if (u < 0x10000) { buf[n++] = (unsigned char)(0xE0 | (u >> 12)); buf[n++] = (unsigned char)(0x80 | ((u >> 6) & 0x3F)); buf[n++] = (unsigned char)(0x80 | (u & 0x3F)); }
-    else { buf[n++] = (unsigned char)(0xF0 | (u >> 18)); buf[n++] = (unsigned char)(0x80 | ((u >> 12) & 0x3F)); buf[n++] = (unsigned char)(0x80 | ((u >> 6) & 0x3F)); buf[n++] = (unsigned char)(0x80 | (u & 0x3F)); }
-  }
-  if (n) fwrite(buf, 1, n, f);
 }
 
 // (the first string, its last reference, grown in place, room made for
@@ -1283,24 +1322,24 @@ static V heff_strAppend(V a, V b) {
   if (x->h.rc == 1) {
     if (n > x->cap) {
       int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
-      size_t was = (sizeof(Str) + x->cap * sizeof(uint16_t) + 7) / 8 * 8;
+      size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
       // (from the allocator objects are given back to, rounded as it
       // rounds: a block it frees to a free list must be the whole of
       // that list's size)
-      Str *g = heff_obj_alloc(sizeof(Str) + cap * sizeof(uint16_t));
-      memcpy(g, x, sizeof(Str) + x->len * sizeof(uint16_t));
+      Str *g = heff_obj_alloc(sizeof(Str) + cap);
+      memcpy(g, x, sizeof(Str) + x->len);
       heff_obj_free(x, was);
       g->cap = cap;
       x = g;
     }
-    memcpy(x->s + x->len, y->s, y->len * sizeof(uint16_t));
+    memcpy(x->s + x->len, y->s, (size_t)y->len);
     x->len = n;
     heff_drop(b);
     return (V)x;
   }
   Str *s = heff_str_new(n);
-  memcpy(s->s, x->s, x->len * sizeof(uint16_t));
-  memcpy(s->s + x->len, y->s, y->len * sizeof(uint16_t));
+  memcpy(s->s, x->s, (size_t)x->len);
+  memcpy(s->s + x->len, y->s, (size_t)y->len);
   heff_drop(a);
   heff_drop(b);
   return (V)s;
@@ -1322,23 +1361,24 @@ static V heff_strSlice(V a, V i, V j) {
   if (e > n) e = n;
   if (e < b) e = b;
   Str *s = heff_str_new(e - b);
-  memcpy(s->s, x->s + b, (e - b) * sizeof(uint16_t));
+  memcpy(s->s, x->s + b, (size_t)(e - b));
   heff_drop(a);
   return (V)s;
 }
 
+// (the bytes' order: of UTF-8, its runes')
 static int heff_str_cmp(V a, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len < y->len ? x->len : y->len;
-  for (int64_t i = 0; i < n; i++)
-    if (x->s[i] != y->s[i]) return x->s[i] < y->s[i] ? -1 : 1;
+  int c = n ? memcmp(x->s, y->s, (size_t)n) : 0;
+  if (c) return c < 0 ? -1 : 1;
   return x->len == y->len ? 0 : x->len < y->len ? -1 : 1;
 }
 
 // (as C's condition, and as a Bool: see `INT_CMP`)
 static int heff_strEq_c(V a, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
-  int c = x == y || (x->len == y->len && memcmp(x->s, y->s, x->len * sizeof(uint16_t)) == 0);
+  int c = x == y || (x->len == y->len && memcmp(x->s, y->s, (size_t)x->len) == 0);
   heff_drop(a);
   heff_drop(b);
   return c;
@@ -1353,7 +1393,8 @@ static int heff_strLt_c(V a, V b) {
 }
 static inline V heff_strLt(V a, V b) { return heff_bool(heff_strLt_c(a, b)); }
 
-static V heff_strCharCode(V a, V i) {
+// (the byte at `i`; out of the string, -1)
+static V heff_strByteAt(V a, V i) {
   Str *x = (Str *)a;
   int64_t k = INT_OF(i);
   V r = k >= 0 && k < x->len ? MK_INT(x->s[k]) : MK_INT(-1);
@@ -1361,11 +1402,12 @@ static V heff_strCharCode(V a, V i) {
   return r;
 }
 
-static V heff_strFromCharCode(V c) {
+// (the string of one byte; of what is no byte, `abandon`)
+static V heff_strFromByte(V c) {
   int64_t k = INT_OF(c);
-  if (k < 0 || k > 65535) return (V)heff_str_new(0);
+  if (k < 0 || k > 255) return heff_abandon();
   Str *s = heff_str_new(1);
-  s->s[0] = (uint16_t)k;
+  s->s[0] = (uint8_t)k;
   return (V)s;
 }
 
@@ -1641,7 +1683,7 @@ static V heff_float32Floor(V a) {
 // `fromInt` wraps an integer around to 32 bits, as `int32FromInt` does,
 // so `toInt` is nothing.  One that is no Unicode scalar value (a
 // surrogate, below 0, beyond U+10FFFF) is U+FFFD in a string made of it;
-// a string's surrogate not in a pair is read as U+FFFD.
+// what is not UTF-8 in a string is read as U+FFFD (`heff_u8_decode`).
 
 static inline int heff_runeEq_c(V a, V b) { return a == b; }
 static inline int heff_runeLt_c(V a, V b) { return INT_OF(a) < INT_OF(b); }
@@ -1652,20 +1694,18 @@ static inline V heff_runeLe(V a, V b) { return heff_bool(heff_runeLe_c(a, b)); }
 static V heff_runeToInt(V a) { return a; }
 static V heff_runeFromInt(V a) { return heff_int32FromInt(a); }
 
-// (a string's runes: the last read first, a low surrogate after a high
-// one the pair's)
+// (a string's runes: read, then put in a list from the last)
 static V heff_strRunes(V a) {
   Str *x = (Str *)a;
+  uint32_t *rs = heff_alloc((size_t)(x->len + 1) * sizeof(uint32_t));
+  int64_t m = 0;
+  for (int64_t i = 0; i < x->len; m++) i += heff_u8_decode(x->s + i, x->len - i, &rs[m]);
   V l = NTAG(TAG_Nil);
-  for (int64_t i = x->len; i > 0;) {
-    uint32_t u = x->s[--i];
-    if (u >= 0xDC00 && u < 0xE000 && i > 0 && x->s[i - 1] >= 0xD800 && x->s[i - 1] < 0xDC00) {
-      u = 0x10000 + ((uint32_t)(x->s[i - 1] - 0xD800) << 10) + (u - 0xDC00);
-      i--;
-    } else if (u >= 0xD800 && u < 0xE000) u = 0xFFFD;
-    V f[2] = { MK_INT((int64_t)u), l };
+  for (int64_t k = m - 1; k >= 0; k--) {
+    V f[2] = { MK_INT((int64_t)rs[k]), l };
     l = heff_tag(TAG_Cons, 2, f);
   }
+  free(rs);
   heff_drop(a);
   return l;
 }
@@ -1674,53 +1714,31 @@ static inline int heff_rune_scalar(int64_t r) {
   return r >= 0 && r <= 0x10FFFF && !(r >= 0xD800 && r < 0xE000);
 }
 
-// (the runes' string: each one code unit, or two, a surrogate pair)
+// (the runes' string: each its UTF-8 bytes)
 static V heff_strOfRunes(V l) {
   int64_t n = 0;
+  uint8_t tmp[4];
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     int64_t r = INT_OF(heff_field(c, 0));
-    n += heff_rune_scalar(r) && r >= 0x10000 ? 2 : 1;
+    n += heff_u8_encode(tmp, heff_rune_scalar(r) ? (uint32_t)r : 0xFFFD);
   }
   Str *s = heff_str_new(n);
   int64_t k = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     int64_t r = INT_OF(heff_field(c, 0));
-    if (!heff_rune_scalar(r)) s->s[k++] = 0xFFFD;
-    else if (r < 0x10000) s->s[k++] = (uint16_t)r;
-    else {
-      s->s[k++] = (uint16_t)(0xD800 + ((r - 0x10000) >> 10));
-      s->s[k++] = (uint16_t)(0xDC00 + ((r - 0x10000) & 0x3FF));
-    }
+    k += heff_u8_encode(s->s + k, heff_rune_scalar(r) ? (uint32_t)r : 0xFFFD);
   }
   heff_drop(l);
   return (V)s;
 }
 
-// (a string as bytes, UTF-8, as no library declares yet: here a string
-// is UTF-16 code units still, so its unit is what `strByteAt` gives, a
-// rune is one unit or a surrogate pair, and its text as JavaScript has
-// it (`strToJS`) is it with U+FFFD for a surrogate not in a pair)
-static V heff_strByteAt(V a, V i) { return heff_strCharCode(a, i); }
-
-static V heff_strFromByte(V c) {
-  int64_t k = INT_OF(c);
-  if (k < 0 || k > 255) return heff_abandon();
-  Str *s = heff_str_new(1);
-  s->s[0] = (uint16_t)k;
-  return (V)s;
-}
-
-// (the rune at `i`, and how many units it takes, `*w`; out of the
+// (the rune at `i`, and how many bytes it takes, `*w`; out of the
 // string, U+FFFD of none)
 static uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
   if (i < 0 || i >= x->len) { *w = 0; return 0xFFFD; }
-  uint32_t u = x->s[i];
-  if (u >= 0xD800 && u < 0xDC00 && i + 1 < x->len && x->s[i + 1] >= 0xDC00 && x->s[i + 1] < 0xE000) {
-    *w = 2;
-    return 0x10000 + ((u - 0xD800) << 10) + (x->s[i + 1] - 0xDC00);
-  }
-  *w = 1;
-  return u >= 0xD800 && u < 0xE000 ? 0xFFFD : u;
+  uint32_t u;
+  *w = heff_u8_decode(x->s + i, x->len - i, &u);
+  return u;
 }
 
 static V heff_strRuneAt(V a, V i) {
@@ -1739,13 +1757,25 @@ static V heff_strRuneWidth(V a, V i) {
 
 static V heff_strRuneCount(V a) {
   Str *x = (Str *)a;
-  int64_t n = 0, w;
-  for (int64_t i = 0; i < x->len; i += w) { heff_str_rune_at(x, i, &w); n++; }
+  int64_t n = 0;
+  uint32_t u;
+  for (int64_t i = 0; i < x->len; n++) i += heff_u8_decode(x->s + i, x->len - i, &u);
   heff_drop(a);
   return MK_INT(n);
 }
 
-static V heff_strToJS(V a) { return heff_strOfRunes(heff_strRunes(a)); }
+// (its text as JavaScript has it: here, the string made text, what is
+// not UTF-8 U+FFFD -- what JavaScript's, read back, is -- and back, as it
+// is)
+static V heff_strToJS(V a) {
+  Str *x = (Str *)a;
+  int own;
+  heff_u8_valid_len(x->s, x->len, &own);
+  if (own) return a;
+  V s = heff_str_valid(x->s, x->len);
+  heff_drop(a);
+  return s;
+}
 static V heff_strFromJS(V a) { return a; }
 
 // Arrays
@@ -1829,7 +1859,7 @@ static V heff_cons(V x, V rest) {
 }
 
 // A string crosses between the program and the system through these
-// alone: a provider neither reads a `Str`'s units nor makes one of its
+// alone: a provider neither reads a `Str`'s bytes nor makes one of its
 // own, and the runtime alone knows how a string is kept.  Which of them
 // it crosses by is what it is to the system:
 //
@@ -1846,17 +1876,16 @@ static V heff_cons(V x, V rest) {
 //
 // A C string out is malloc'd, or NULL where the string cannot be one --
 // it has a NUL in it -- and the operation then fails (its `Nothing`, its
-// `False`).  For now a string is UTF-16 and the system's bytes UTF-8,
-// each of these encoding or decoding as text is, and none is NULL (a
-// NUL in the string ends the C string, as it did); where strings are
-// bytes, content and paths are those bytes, and text is made valid,
-// what is not UTF-8 in it U+FFFD.
+// `False`).  Content and paths are the string's bytes, as they are;
+// text is made valid, what is not UTF-8 in it U+FFFD, both in and out,
+// as the JavaScript backend's names are (Node.js has an argument, the
+// environment, as text alone).
 
 // (content in, `n` bytes, as a string)
-static V heff_str_bytes(const void *c, int64_t n) { return heff_str_utf8((const unsigned char *)c, n); }
+static V heff_str_bytes(const void *c, int64_t n) { return heff_str_of(c, n); }
 
 // (text in, `n` bytes of it, as a string)
-static V heff_str_text_n(const void *c, int64_t n) { return heff_str_utf8((const unsigned char *)c, n); }
+static V heff_str_text_n(const void *c, int64_t n) { return heff_str_valid(c, n); }
 
 // (a C string of text in, as a string: a name)
 static V heff_str_text(const char *c) { return heff_str_text_n(c, (int64_t)strlen(c)); }
@@ -1875,40 +1904,44 @@ static V heff_strs_text(char **xs, int64_t n) {
   return l;
 }
 
-// (the string, UTF-8, as a C string: malloc'd)
-static char *heff_utf8_of(V v) {
+// (a path, as a C string to give the system: malloc'd, or NULL)
+static char *heff_cstr(V v) {
   Str *s = (Str *)v;
-  char *c = heff_alloc(s->len * 3 + 1), *o = c;
-  for (int64_t i = 0; i < s->len; i++) {
-    uint32_t u = s->s[i];
-    if (u >= 0xD800 && u < 0xDC00 && i + 1 < s->len && s->s[i + 1] >= 0xDC00 && s->s[i + 1] < 0xE000) {
-      u = 0x10000 + ((u - 0xD800) << 10) + (s->s[i + 1] - 0xDC00);
-      i++;
-    }
-    if (u < 0x80) *o++ = (char)u;
-    else if (u < 0x800) { *o++ = (char)(0xC0 | (u >> 6)); *o++ = (char)(0x80 | (u & 0x3F)); }
-    else if (u < 0x10000) { *o++ = (char)(0xE0 | (u >> 12)); *o++ = (char)(0x80 | ((u >> 6) & 0x3F)); *o++ = (char)(0x80 | (u & 0x3F)); }
-    else { *o++ = (char)(0xF0 | (u >> 18)); *o++ = (char)(0x80 | ((u >> 12) & 0x3F)); *o++ = (char)(0x80 | ((u >> 6) & 0x3F)); *o++ = (char)(0x80 | (u & 0x3F)); }
-  }
-  *o = 0;
+  if (s->len && memchr(s->s, 0, (size_t)s->len)) return NULL;
+  char *c = heff_alloc((size_t)s->len + 1);
+  if (s->len) memcpy(c, s->s, (size_t)s->len);
+  c[s->len] = 0;
   return c;
 }
 
-// (a path, as a C string to give the system: malloc'd, or NULL)
-static char *heff_cstr(V v) { return heff_utf8_of(v); }
-
 // (a name or text, as a C string to give the system: malloc'd, or NULL)
-static char *heff_cstr_text(V v) { return heff_utf8_of(v); }
+static char *heff_cstr_text(V v) {
+  Str *s = (Str *)v;
+  if (s->len && memchr(s->s, 0, (size_t)s->len)) return NULL;
+  int own;
+  heff_u8_valid_len(s->s, s->len, &own);
+  if (own) return heff_cstr(v);
+  Str *t = (Str *)heff_str_valid(s->s, s->len);
+  char *c = heff_cstr((V)t);
+  heff_drop((V)t);
+  return c;
+}
 
 // (content out, malloc'd, `*n` bytes, a NUL after them)
 static char *heff_bytes(V v, size_t *n) {
-  char *c = heff_utf8_of(v);
-  *n = strlen(c);
+  Str *s = (Str *)v;
+  char *c = heff_alloc((size_t)s->len + 1);
+  if (s->len) memcpy(c, s->s, (size_t)s->len);
+  c[s->len] = 0;
+  *n = (size_t)s->len;
   return c;
 }
 
 // (content written out to `f`)
-static void heff_put(FILE *f, V v) { heff_put_utf8(f, v); }
+static void heff_put(FILE *f, V v) {
+  Str *s = (Str *)v;
+  if (s->len) fwrite(s->s, 1, (size_t)s->len, f);
+}
 
 // (C strings' order, for qsort)
 static int heff_cmp_cstr(const void *a, const void *b) {
@@ -2192,14 +2225,23 @@ static int64_t heff_capture(char **as, Buf *bo, Buf *be) {
   return status;
 }
 
-// (a string as JSON writes one: in quotes, `"` `\` and controls escaped)
-static void buf_json_string(Buf *b, V v) {
+// (a string as JSON writes one: in quotes, `"` `\` and controls escaped;
+// what is not UTF-8 in it U+FFFD -- or, `shown`, each of its bytes
+// `\xnn`, as a string literal writes it, test/load-js.mjs's `show`)
+static void buf_json_string_as(Buf *b, V v, int shown) {
   Str *s = (Str *)v;
   buf_str(b, "\"");
   for (int64_t i = 0; i < s->len; i++) {
     uint32_t u = s->s[i];
     char tmp[16];
-    if (u == '"') buf_str(b, "\\\"");
+    if (u >= 0x80) {
+      int w = heff_u8_decode(s->s + i, s->len - i, &u);
+      if (heff_u8_own(s->s + i, u, w)) buf_put(b, (const char *)s->s + i, (size_t)w);
+      else if (!shown) buf_str(b, "\xEF\xBF\xBD");
+      else for (int k = 0; k < w; k++) { snprintf(tmp, sizeof tmp, "\\x%02x", s->s[i + k]); buf_str(b, tmp); }
+      i += w - 1;
+    }
+    else if (u == '"') buf_str(b, "\\\"");
     else if (u == '\\') buf_str(b, "\\\\");
     else if (u == '\n') buf_str(b, "\\n");
     else if (u == '\t') buf_str(b, "\\t");
@@ -2207,21 +2249,12 @@ static void buf_json_string(Buf *b, V v) {
     else if (u == '\b') buf_str(b, "\\b");
     else if (u == '\f') buf_str(b, "\\f");
     else if (u < 0x20) { snprintf(tmp, sizeof tmp, "\\u%04x", u); buf_str(b, tmp); }
-    else {
-      if (u >= 0xD800 && u < 0xDC00 && i + 1 < s->len && s->s[i + 1] >= 0xDC00 && s->s[i + 1] < 0xE000) {
-        u = 0x10000 + ((u - 0xD800) << 10) + (s->s[i + 1] - 0xDC00);
-        i++;
-      }
-      char o[4]; int k = 0;
-      if (u < 0x80) o[k++] = (char)u;
-      else if (u < 0x800) { o[k++] = (char)(0xC0 | (u >> 6)); o[k++] = (char)(0x80 | (u & 0x3F)); }
-      else if (u < 0x10000) { o[k++] = (char)(0xE0 | (u >> 12)); o[k++] = (char)(0x80 | ((u >> 6) & 0x3F)); o[k++] = (char)(0x80 | (u & 0x3F)); }
-      else { o[k++] = (char)(0xF0 | (u >> 18)); o[k++] = (char)(0x80 | ((u >> 12) & 0x3F)); o[k++] = (char)(0x80 | ((u >> 6) & 0x3F)); o[k++] = (char)(0x80 | (u & 0x3F)); }
-      buf_put(b, o, k);
-    }
+    else { char o = (char)u; buf_put(b, &o, 1); }
   }
   buf_str(b, "\"");
 }
+
+static void buf_json_string(Buf *b, V v) { buf_json_string_as(b, v, 0); }
 
 // (a tag of that name and that many arguments, its arguments `*fs`)
 static int heff_tag_named(V v, const char *name, int n, V **fs) {
@@ -2276,7 +2309,7 @@ static void heff_show(Buf *b, V v, int arg) {
       else buf_str(b, tmp);
       return;
     }
-    case K_STR: buf_json_string(b, v); return;
+    case K_STR: buf_json_string_as(b, v, 1); return;
     case K_ARR: {
       Arr *r = (Arr *)v;
       buf_str(b, "[");
@@ -2321,8 +2354,9 @@ static void heff_check_one(Buf *out, const Global *g) {
     V v = heff_tr(g->get());
     heff_show(&b, v, 0);
     buf_str(out, "{\"value\": ");
-    Str *s = (Str *)heff_str_utf8((const unsigned char *)b.s, (int64_t)b.n);
-    buf_json_string(out, (V)s);
+    V s = heff_str_bytes(b.s, (int64_t)b.n);
+    buf_json_string(out, s);
+    heff_drop(s);
     buf_str(out, "}");
   } else {
     buf_str(out, "{\"threw\": ");
