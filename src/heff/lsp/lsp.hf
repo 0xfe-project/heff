@@ -242,9 +242,8 @@ severityLetter SDebug = "D"
 -- | the message and note of a diagnostic, without the source snippet (an
 -- | editor shows the span itself)
 diagMessage : Diag -> String
-diagMessage d = case d.note of
-  Just n -> d.msg ^ "\n" ^ n
-  Nothing -> d.msg
+diagMessage d@{ note = Just n } = d.msg ^ "\n" ^ n
+diagMessage d@{ note = Nothing } = d.msg
 
 diagCode : Diag -> String
 diagCode d =
@@ -766,19 +765,17 @@ shiftOf t new b =
        t.occurrences)
 
 renamedTarget : Pointed -> String -> Q.Target
-renamedTarget t new = case t.target.local of
-  Just b ->
-    Q.localT
-      t.target.key
-      (Q.mkSpan
-         (b.start + shiftOf t new b)
-         (b.start + shiftOf t new b + strLength new))
-  Nothing -> case t.target.member of
-    Just _ -> Q.memberT t.target.key new
-    Nothing ->
-      Q.globalT
-        (strSlice t.target.key 0 (strLength t.target.key - strLength t.name)
-         ^ new)
+renamedTarget t@{ target = { local = Just b } } new =
+  Q.localT
+    t.target.key
+    (Q.mkSpan
+       (b.start + shiftOf t new b)
+       (b.start + shiftOf t new b + strLength new))
+renamedTarget t@{ target = { local = Nothing, member = Just _ } } new =
+  Q.memberT t.target.key new
+renamedTarget t@{ target = { local = Nothing, member = Nothing } } new =
+  Q.globalT
+    (strSlice t.target.key 0 (strLength t.target.key - strLength t.name) ^ new)
 
 renameVerdict : WithProgram
               -> Pointed
@@ -975,26 +972,28 @@ prepared : {e : HFunctor}
          -> Json
          -> Targeted
          -> Co e St
-prepared id tg = case tg.target of
-  Nothing -> do
-    reply id JNull
+prepared id tg@{ target = Nothing } = do
+  reply id JNull
+  pure tg.st
+prepared id tg@{ target = Just t } = case Q.renameRefused
+    t.target
+    t.name
+    t.name of
+  Just why -> do
+    replyError id (0 - 32803) why
     pure tg.st
-  Just t -> case Q.renameRefused t.target t.name t.name of
-    Just why -> do
-      replyError id (0 - 32803) why
+  Nothing -> case occurrenceAt t tg.off of
+    Just o -> do
+      reply
+          id
+          (obj
+             [ kv "range" (range o.source o.span)
+             , kv "placeholder" (jstr t.name)
+             ])
       pure tg.st
-    Nothing -> case occurrenceAt t tg.off of
-      Just o -> do
-        reply
-            id
-            (obj
-               [ kv "range" (range o.source o.span)
-               , kv "placeholder" (jstr t.name)
-               ])
-        pure tg.st
-      Nothing -> do
-        replyError id (0 - 32803) ("`" ^ t.name ^ "` is not written here")
-        pure tg.st
+    Nothing -> do
+      replyError id (0 - 32803) ("`" ^ t.name ^ "` is not written here")
+      pure tg.st
 
 renamed : {e : HFunctor}
         -> {{disk : fs <: e}}
@@ -1003,24 +1002,26 @@ renamed : {e : HFunctor}
         -> String
         -> Targeted
         -> Co e St
-renamed id new tg = case tg.target of
-  Nothing -> do
-    reply id JNull
+renamed id new tg@{ target = Nothing } = do
+  reply id JNull
+  pure tg.st
+renamed id new tg@{ target = Just t } = case Q.renameRefused
+    t.target
+    t.name
+    new of
+  Just why -> do
+    replyError id (0 - 32803) why
     pure tg.st
-  Just t -> case Q.renameRefused t.target t.name new of
-    Just why -> do
-      replyError id (0 - 32803) why
-      pure tg.st
-    Nothing -> do
-      r <- renameChecked tg.st t new
-      case snd r of
-        Just why -> do
-          replyError id (0 - 32803) why
-          pure (fst r)
-        Nothing -> do
-          cs <- changesOf (fst r) new (byFile t.occurrences)
-          reply id (obj [kv "changes" (JObject cs)])
-          pure (fst r)
+  Nothing -> do
+    r <- renameChecked tg.st t new
+    case snd r of
+      Just why -> do
+        replyError id (0 - 32803) why
+        pure (fst r)
+      Nothing -> do
+        cs <- changesOf (fst r) new (byFile t.occurrences)
+        reply id (obj [kv "changes" (JObject cs)])
+        pure (fst r)
 
 docAt : St -> Maybe String -> Maybe Doc
 docAt st (Just f) = M.lookup compareString f st.docs
