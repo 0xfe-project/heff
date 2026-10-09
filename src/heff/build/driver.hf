@@ -1250,34 +1250,35 @@ expectAfter doc src end =
 expectation : String -> Pm.Span -> Expectation
 expectation src sp = expectAfter (isDocTest src sp.start) src sp.end
 
-evalWatch : String -> G.Globals -> String
-evalWatch name g = case In.evalGlobalsWhere (\k -> strEq k name) g of
-  Cons (MkPair _ res) _ -> In.showResult res
-  Nil -> ""
+-- | a watch's value, in the globals evaluated (`In.globalEnv`, once for
+-- | all the watches of a file)
+evalWatch : In.GlobalEnv -> G.Entry -> String
+evalWatch ge entry = In.showResult (In.evalEntryIn ge entry)
 
 knownG : G.Globals -> String -> Bool
 knownG g x = case G.lookupName g x of
   Just _ -> True
   Nothing -> False
 
-readExpTop : G.Globals -> T.TopResult -> Maybe String
-readExpTop g t =
+readExpTop : In.GlobalEnv -> T.TopResult -> Maybe String
+readExpTop ge t =
   if not (List.null t.diags) then Nothing
   else case List.head t.watches of
-    Just w ->
-      Just (evalWatch "> expectation" (G.addEntry "> expectation" w.entry g))
+    Just w -> Just (evalWatch ge w.entry)
     Nothing -> Nothing
 
-readExpRead : G.Globals -> Su.Read -> Maybe String
-readExpRead g r =
+readExpRead : In.GlobalEnv -> G.Globals -> Su.Read -> Maybe String
+readExpRead ge g r =
   if not (List.null r.diags) then Nothing
-  else readExpTop g (T.topWith g r.decls)
+  else readExpTop ge (T.topWith g r.decls)
 
 -- | the value of an expectation, read as `(e : T)` (one of more than
--- | one line, its lines after the first indented: one expression)
-readExpectation : G.Globals -> String -> String -> Maybe String
-readExpectation g ty e =
+-- | one line, its lines after the first indented: one expression), in
+-- | the globals `g`, evaluated as `ge`
+readExpectation : In.GlobalEnv -> G.Globals -> String -> String -> Maybe String
+readExpectation ge g ty e =
   readExpRead
+    ge
     g
     (Su.readProgram
        (\x -> knownG g x)
@@ -1286,11 +1287,11 @@ readExpectation g ty e =
 -- an expectation is Hippogriff: it holds when it evaluates to the same,
 -- however it is written; what cannot be read (`#fun`) is compared as
 -- text
-holdsOf : G.Globals -> String -> String -> Maybe String -> Bool
-holdsOf g ty value Nothing = True
-holdsOf g ty value (Just e) =
+holdsOf : In.GlobalEnv -> G.Globals -> String -> String -> Maybe String -> Bool
+holdsOf ge g ty value Nothing = True
+holdsOf ge g ty value (Just e) =
   strEq e value
-  || (case readExpectation g ty e of
+  || (case readExpectation ge g ty e of
       Just v -> strEq v value
       Nothing -> False)
 
@@ -1300,8 +1301,14 @@ dropWatchMark s =
   else if startsWith "-- | >>>" s then strSlice s 8 (strLength s)
   else ""
 
-mkWatchInfo : Checked -> T.Watch -> String -> Expectation -> String -> WatchInfo
-mkWatchInfo c w value ex ty =
+mkWatchInfo : Checked
+            -> In.GlobalEnv
+            -> T.Watch
+            -> String
+            -> Expectation
+            -> String
+            -> WatchInfo
+mkWatchInfo c ge w value ex ty =
   { from = w.span.start
   , to = w.span.end
   , expr =
@@ -1309,29 +1316,32 @@ mkWatchInfo c w value ex ty =
   , ty = ty
   , value = value
   , expected = ex.expected
-  , holds = holdsOf c.top.globals ty value ex.expected
+  , holds = holdsOf ge c.top.globals ty value ex.expected
   , expectFrom = ex.from
   , expectTo = ex.to
   , doc = isDocTest c.source w.span.start
   }
 
-watchInfo : Checked -> Int -> T.Watch -> WatchInfo
-watchInfo c i w =
+watchInfo : Checked -> In.GlobalEnv -> T.Watch -> WatchInfo
+watchInfo c ge w =
   mkWatchInfo
     c
+    ge
     w
-    (evalWatch
-       ("> " ^ showInt i)
-       (G.addEntry ("> " ^ showInt i) w.entry c.top.globals))
+    (evalWatch ge w.entry)
     (expectation c.source w.span)
     (showTySx c.top.globals (R.readbTy 0 w.entry.type_))
 
-watchesGo : Checked -> Int -> List T.Watch -> List WatchInfo
-watchesGo c i Nil = Nil
-watchesGo c i (Cons w rest) = Cons (watchInfo c i w) (watchesGo c (i + 1) rest)
+watchesIn : Checked -> In.GlobalEnv -> List T.Watch -> List WatchInfo
+watchesIn c ge ws = List.map (\w -> watchInfo c ge w) ws
+
+-- (the globals evaluated once, for all the watches, if there are any)
+watchesOf : Checked -> List T.Watch -> List WatchInfo
+watchesOf c Nil = Nil
+watchesOf c ws = watchesIn c (In.globalEnv c.top.globals) ws
 
 watches : Checked -> List WatchInfo
-watches c = watchesGo c 0 c.top.watches
+watches c = watchesOf c c.top.watches
 
 -- | a file's tests: the watches with an expectation, each under the
 -- | name of the `test` before it (if any), a doc test under the name of
