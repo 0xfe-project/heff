@@ -359,9 +359,6 @@ atomic (EFloat32 _) = True
 atomic (EPrim _) = True
 atomic e = False
 
-allAtomic : List I.Expr -> Bool
-allAtomic as = I.allI (List.map (\a -> atomic a) as)
-
 -- Constant folding
 --------------------------------------------------------------------------------
 
@@ -491,11 +488,35 @@ occCountOf x b = (I.occurrences x b).count
 singletonM : String -> I.Expr -> M.Map String I.Expr
 singletonM x a = M.insert compareString x a M.empty
 
+-- | the most a known argument -- a closed lambda or record, one a copy
+-- | may be made for -- may be
+specArgSize : Int
+specArgSize = 60
+
+-- | a closed lambda or record, no bigger than a copy may be made for
+closedKnown : I.Expr -> Bool
+closedKnown (ELam xs b) =
+  not (I.sizeAbove specArgSize (ELam xs b)) && Sp.closedIn Nil (ELam xs b)
+closedKnown (ERecord fs) =
+  not (I.sizeAbove specArgSize (ERecord fs)) && Sp.closedIn Nil (ERecord fs)
+closedKnown _ = False
+
+-- | how many uses of a closed value bound may each be given a copy of it
+closedUses : Int
+closedUses = 4
+
+-- (a value bound and used more than once is put where it is used, a
+-- copy each time, if it is small -- or, used a few times, if it is
+-- closed and a copy may be made for it: a handler, `{ ret = ..., bind =
+-- ..., malg = ... }`, bound once and handed to two calls -- Co's `bind`
+-- hands its `hd` on twice -- is known to both, which a variable would
+-- hide from them)
 letPure : SK -> String -> I.Expr -> I.Expr -> Int -> M I.Expr
 letPure r x a b o =
   if o == 0 then r.simp b
   else if atomic a || o == 1 then r.simp (I.subst (singletonM x a) b)
-  else if I.isValue a && not (I.sizeAbove 12 a)
+  else if I.isValue a
+  && (not (I.sizeAbove 12 a) || (o <= closedUses && closedKnown a))
     then do
       b' <- substCopies x a b
       r.simp b'
@@ -503,16 +524,69 @@ letPure r x a b o =
     b' <- r.simp b
     pure (ELet x a b')
 
+-- (a name of its own)
+freshName : String -> M String
+freshName base = \s -> case I.fresh base s.supply of
+  MkPair x n -> MkPair x (withSupply n s)
+
+-- | arguments, those that compute bound to names of their own, in order
+type Split = { binds : List (Pair String I.Expr), args : List I.Expr }
+
+splitCons : Maybe (Pair String I.Expr) -> I.Expr -> Split -> Split
+splitCons (Just bd) a rest =
+  { binds = Cons bd rest.binds, args = Cons a rest.args }
+splitCons Nothing a rest = { binds = rest.binds, args = Cons a rest.args }
+
+splitOne : Bool -> I.Expr -> M (Pair (Maybe (Pair String I.Expr)) I.Expr)
+splitOne True a = pure (MkPair Nothing a)
+splitOne False a = do
+  t <- freshName "t"
+  pure (MkPair (Just (MkPair t a)) (EVar t))
+
+splitArgs : List I.Expr -> M Split
+splitArgs Nil = pure { binds = Nil, args = Nil }
+splitArgs (Cons a as) = do
+  p <- isPure a
+  one <- splitOne p a
+  rest <- splitArgs as
+  pure (splitCons (fst one) (snd one) rest)
+
+-- (fewer arguments than the function takes)
+fewerThan : List I.Expr -> Maybe I.Expr -> Bool
+fewerThan as (Just (ELam xs _)) = List.length as < List.length xs
+fewerThan as _ = False
+
+-- (a known function given fewer arguments than it takes)
+partialApp : St -> I.Expr -> Bool
+partialApp s (EApp (EGlobal g) as) =
+  fewerThan as (M.lookup compareString g s.sp.all)
+partialApp s _ = False
+
+-- (a partial application, its arguments that compute bound before it)
+letSplit : SK -> String -> I.Expr -> I.Expr -> M I.Expr
+letSplit r x (EApp f as) b = do
+  sp <- splitArgs as
+  e <- letPure r x (EApp f sp.args) b (occCountOf x b)
+  pure (letsOf sp.binds e)
+letSplit r x a b = do
+  b' <- r.simp b
+  pure (ELet x a b')
+
 -- | a binding, its value simplified: what could fail is computed where
--- | it was, used or not
+-- | it was, used or not.  A known function given fewer arguments than it
+-- | takes, some computing (`c = lPing (intOr 100000 rest)`), has those
+-- | bound first, in order: what is left is the closure, built of
+-- | values, pure -- put where it is used, and called whole there (with
+-- | a handler, for one: `c hd r k`, a call of a copy for it)
 letIn : SK -> String -> I.Expr -> I.Expr -> M I.Expr
 letIn r x a b = do
   p <- isPure a
-  if not p
-      then do
-        b' <- r.simp b
-        pure (ELet x a b')
-    else letPure r x a b (occCountOf x b)
+  s <- get
+  if p then letPure r x a b (occCountOf x b)
+    else if partialApp s a then letSplit r x a b
+    else do
+      b' <- r.simp b
+      pure (ELet x a b')
 
 -- | `g` is a function known to take more than `n` arguments: given
 -- | `n`, it only builds a closure
@@ -542,6 +616,17 @@ eta kinds (ELam xs (EApp f as)) =
   if paramsAre xs as && etaHead kinds xs f then f else ELam xs (EApp f as)
 eta kinds e = e
 
+-- | a binding of a binding, `x = (let y = a in b)`, is `y = a`, then
+-- | `x = b`: computed in the same order (names are the program's own,
+-- | so `y` is seen by nothing else) -- and `b` judged by itself, a
+-- | lambda put where it is used (`hd.malg p` of a known handler, its
+-- | operation computed first: `p = ...`, then `\k -> perform p k`)
+letFloat : SK -> String -> I.Expr -> I.Expr -> M I.Expr
+letFloat r x (ELet y a1 a2) b = do
+  rest <- letFloat r x a2 b
+  pure (ELet y a1 rest)
+letFloat r x a b = letIn r x a b
+
 simpF : SK -> I.Expr -> M I.Expr
 simpF r (ELam xs b) = do
   b' <- r.simp b
@@ -564,7 +649,7 @@ simpF r (EApp f as) = do
   r.applyTo f' as'
 simpF r (ELet x a b) = do
   a' <- r.simp a
-  letIn r x a' b
+  letFloat r x a' b
 simpF r (ERecord fs) = do
   fs' <- fieldsS (\a -> r.simp a) fs
   pure (ERecord fs')
@@ -735,11 +820,8 @@ tagOfLam xs _ = Nothing
 -- it, as a definition is: with fuel of its own, the copies it calls for
 -- made in turn, each before what calls it.
 
--- | the most that is made: the size of a known argument, of a definition
--- | copied, copies for one program, copies of copies one inside another
-specArgSize : Int
-specArgSize = 60
-
+-- | the most that is made: the size of a definition copied, copies for
+-- | one program, copies of copies one inside another
 specBodySize : Int
 specBodySize = 1200
 
@@ -752,11 +834,7 @@ specDepth = 16
 -- | an argument a copy may be made for
 knownArg : M.Map String Unit -> I.Expr -> Bool
 knownArg kinds (EGlobal g) = M.member compareString g kinds
-knownArg kinds (ELam xs b) =
-  not (I.sizeAbove specArgSize (ELam xs b)) && Sp.closedIn Nil (ELam xs b)
-knownArg kinds (ERecord fs) =
-  not (I.sizeAbove specArgSize (ERecord fs)) && Sp.closedIn Nil (ERecord fs)
-knownArg kinds _ = False
+knownArg kinds e = closedKnown e
 
 nthE : Int -> List I.Expr -> Maybe I.Expr
 nthE i Nil = Nothing
@@ -1201,6 +1279,31 @@ knownField g l = do
       Nothing -> pure Nothing
     _ -> pure Nothing
 
+-- (an argument that may go into every arm of a match it is given to)
+pushable : I.Expr -> Bool
+pushable a = atomic a || (I.isValue a && closedKnown a)
+
+-- | how big the copies the arms of a match are given may be, all told
+pushBudget : Int
+pushBudget = 120
+
+-- (the size of what is not atomic among them)
+copiedSize : List I.Expr -> Int
+copiedSize as = List.foldl (\n a -> if atomic a then n else n + I.size a) 0 as
+
+-- (the arguments may go into every arm: atomic, or closed values whose
+-- copies, one for each arm but the first, are not too big)
+pushInto : List I.Arm -> List I.Expr -> Bool
+pushInto arms as =
+  I.allI (List.map pushable as)
+  && copiedSize as * (List.length arms - 1) <= pushBudget
+
+-- (an arm given the arguments: a copy of each that is not atomic)
+applyArm : SK -> I.Expr -> List I.Expr -> M I.Expr
+applyArm r b as = do
+  as2 <- traverseS (\a -> if atomic a then pure a else copy a) as
+  r.applyTo b as2
+
 -- | an application of simplified parts
 applyToF : SK -> I.Expr -> List I.Expr -> M I.Expr
 applyToF r f as =
@@ -1219,11 +1322,13 @@ applyToF r f as =
     ELet x a b -> do
       b' <- r.applyTo b as
       pure (ELet x a b')
-    -- (the arguments go into every arm: only when that copies nothing)
+    -- (the arguments go into every arm: only when that copies nothing
+    -- but what a copy may be made for, a closed value -- a handler,
+    -- which every arm is then made with)
     EMatch s arms ->
-      if allAtomic as
+      if pushInto arms as
         then do
-          arms' <- armsS (\b -> r.applyTo b as) arms
+          arms' <- armsS (\b -> applyArm r b as) arms
           pure (EMatch s arms')
       else pure (mkApp (EMatch s arms) as)
     EGlobal g -> do
