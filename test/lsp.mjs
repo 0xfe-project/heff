@@ -224,7 +224,7 @@ try {
   open("lib/co.hf", co);
   await diagnosticsOf(uri("lib/co.hf"));
   const hmapAt = pos(co, "hmap :");
-  for (const [what, at] of [["set in a record", pos(co, "hmap = ")], ["projected", pos(co, "hmap nt x")]]) {
+  for (const [what, at] of [["set in a record", pos(co, "hmap = ")], ["projected", pos(co, "hmap m n nt x")]]) {
     const d = await request("textDocument/definition", { textDocument: { uri: uri("lib/co.hf") }, position: at });
     expect("definition of a field " + what, d.result && d.result.range.start.line === hmapAt.line && d.result.range.start.character === hmapAt.character, d.result);
   }
