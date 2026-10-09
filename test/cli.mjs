@@ -65,6 +65,14 @@ expect("promote, doc tests", dPromoted.status === 0 && dText === [
 const dTested = heff("test", "d.hf");
 expect("test after promote, doc tests", dTested.status === 0 && dTested.stdout.includes("2/2 expectations hold"), dTested);
 
+// a diagnostic's code is written as `check` and the language server
+// write it, by `test` too: a doc test of no definition warned of, W0151
+writeFileSync(join(work, "w.hf"), ["-- | >>> 1 + 1", "-- | 2", ""].join("\n"));
+const wTested = heff("test", "w.hf"), wChecked = heff("check", "w.hf");
+expect("test, a warning's code", wTested.status === 0 &&
+  (wTested.stdout + wTested.stderr).includes("warning[W0151]: a doc test is of the definition") &&
+  wChecked.stderr.includes("warning[W0151]: a doc test is of the definition"), { wTested, wChecked });
+
 // test: the definitions of type `Test` run too.  A property that fails on
 // purpose is shrunk to its smallest counterexample, says the seed that
 // runs it again, and fails the run; the same seed runs the same runs,
