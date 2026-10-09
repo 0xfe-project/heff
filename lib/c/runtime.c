@@ -27,9 +27,10 @@
 // function counts itself and every so often gives back a bounce (`K_BNC`),
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
 // backend does (src/heff/compile/emit.hf, "Tail calls") -- unless it is a jump
-// (`HEFF_LAST`), from a lambda to a closure of as many parameters.  A
-// call not last of a closure of as many parameters is made where it is
-// (`heff_call`), not through `heff_apply`.
+// (`HEFF_LAST`), from a lambda to a closure of as many parameters, its
+// arguments put where the lambda's were or, more than those, in
+// `heff_room`.  A call not last of a closure of as many parameters is
+// made where it is (`heff_call`), not through `heff_apply`.
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -619,6 +620,14 @@ HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
 
 HEFF_VAR(long heff_dep);
 
+// (where a lambda's call last of more arguments than it took is put, up
+// to `HEFF_ROOM` of them, to be made a jump: its own are where its
+// caller put them, room for only as many as it takes -- and what is
+// called reads them at once, before it calls anything -- see `roomed`
+// in src/heff/compile/emitc.hf)
+#define HEFF_ROOM 4
+HEFF_VAR(V heff_room[HEFF_ROOM]);
+
 static V heff_apply(V f, int n, V *a);
 
 // (a call's `n` arguments copied, `n` known only where it is run and
@@ -715,10 +724,14 @@ static V heff_apply(V f, int n, V *a) {
       return (V)p;
     }
     // (more arguments than it takes: the rest given to what it gives --
-    // its arity read first, the closure consumed by the call)
-    int ar = c->arity;
+    // its arity read first, the closure consumed by the call; the rest
+    // kept apart first, as they may be in `heff_room`, which the call
+    // may put others in)
+    int ar = c->arity, rest = n - ar;
+    V *more = alloca(rest * sizeof(V));
+    heff_copy(more, a + ar, rest);
     V r = heff_tr(c->fn(f, a));
-    f = r; a = a + ar; n = n - ar;
+    f = r; a = more; n = rest;
   }
 }
 

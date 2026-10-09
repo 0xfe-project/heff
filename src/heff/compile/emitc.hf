@@ -19,8 +19,9 @@
 --            `heff_tr` -- as src/heff/compile/emit.hf does (`Em.bouncing`),
 --            a closure taking the arguments given called where it is
 --            (`heff_call`).  From a lambda, a jump where the function is
---            a closure taking the arguments given, and the lambda took
---            as many (`inPlace`)
+--            a closure taking the arguments given: put where the
+--            lambda's were, if it took as many (`inPlace`), else in
+--            `heff_room` (`roomed`)
 --
 -- A program is one file: the runtime, the providers of its worlds
 -- (`M.provider.c`), and its code; its entry is heff.compile.lower's `entryKey`,
@@ -1335,6 +1336,41 @@ inPlace vs =
        , "return heff_tail(f_, " ^ showInt (List.length vs - 1) ^ ", args);"
        ])
 
+-- | how many arguments a lambda's call last may put in `heff_room`
+-- | (lib/c/runtime.c's `HEFF_ROOM`)
+roomFor : Int
+roomFor = 4
+
+-- (a call last of an unknown function, from a lambda taking fewer
+-- arguments, of no more than fit in `heff_room`: the arguments put there,
+-- and a closure taking exactly those called by a jump, given them there
+-- -- they are read at once by what is called, before anything else is,
+-- so a call made from there that puts its own there is after they are
+-- read.  Anything else, as any call last of an unknown function: given
+-- them where the lambda is, by `heff_tail`, counted)
+roomed : List String -> List String
+roomed vs =
+  List.append
+    (Cons ("V f_ = " ^ fromMaybe "0" (List.head vs) ^ ";") Nil)
+    (List.append
+       (List.zipWith
+          (\v i -> "heff_room[" ^ showInt i ^ "] = " ^ v ^ ";")
+          (List.drop 1 vs)
+          (List.range 0 (List.length vs - 2)))
+       [ "if (heff_exact(f_, "
+       ^ showInt (List.length vs - 1)
+       ^ ", heff_room)) HEFF_LAST return ((Clo *)f_)->fn(f_, heff_room);"
+       , "return heff_tail(f_, "
+       ^ showInt (List.length vs - 1)
+       ^ ", (V[]){"
+       ^ joinWith
+         ", "
+         (List.map
+            (\i -> "heff_room[" ^ showInt i ^ "]")
+            (List.range 0 (List.length vs - 2)))
+       ^ "});"
+       ])
+
 -- (the scrutinee, a variable held, given up on an arm that does not want
 -- it and has fields: `fb` what the arm wants)
 takenFv : CE -> Maybe String -> List String -> List String -> Maybe String
@@ -1980,6 +2016,7 @@ stmtsF r ce Ret (EApp f as) = do
   vs <- operandsF r ce Nil (Cons f as)
   pure
       (if 0 < List.length as && List.length as <= ce.lam then inPlace vs
+       else if 0 < ce.lam && List.length as <= roomFor then roomed vs
        else Cons
            ("return heff_tail("
             ^ fromMaybe "0" (List.head vs)
@@ -2040,7 +2077,9 @@ paramsAt want bi xs =
           xs
           (List.range 0 (List.length xs - 1))))
 
--- (a closure's entry: the arguments given, those lent dropped after)
+-- (a closure's entry: the arguments given, those lent dropped after --
+-- read before the call, as a lambda reads its own: they may be in
+-- `heff_room`, which the call may put others in)
 entryCall : String -> List Int -> Int -> String
 entryCall key bi n =
   if List.null bi
@@ -2051,14 +2090,20 @@ entryCall key bi n =
         ", "
         (List.map (\i -> "a[" ^ showInt i ^ "]") (List.range 0 (n - 1)))
       ^ ");"
-  else "  V r = "
+  else "  "
+    ^ joinWith
+      " "
+      (List.map (\i -> "V a" ^ showInt i ^ " = a[" ^ showInt i ^ "];") bi)
+    ^ " V r = "
     ^ cGlobal key
     ^ "("
     ^ joinWith
       ", "
-      (List.map (\i -> "a[" ^ showInt i ^ "]") (List.range 0 (n - 1)))
+      (List.map
+         (\i -> if elemI i bi then "a" ^ showInt i else "a[" ^ showInt i ^ "]")
+         (List.range 0 (n - 1)))
     ^ "); "
-    ^ joinWith " " (List.map (\i -> "heff_drop(a[" ^ showInt i ^ "]);") bi)
+    ^ joinWith " " (List.map (\i -> "heff_drop(a" ^ showInt i ^ ");") bi)
     ^ " return r;"
 
 funDef : CE -> I.Def -> List String -> I.Expr -> C Emitted1
