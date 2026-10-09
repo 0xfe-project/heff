@@ -12,8 +12,8 @@
 --   a tag, a record  ~>  `heff_tag_n`, `heff_rec_n`, built at the size
 --            the emitter knows: tags and labels numbered (`TAG_x`,
 --            `LBL_x`), a record's fields in the order it is written in
---   a string  ~>  a static object, its bytes (with its UTF-16 code
---            units, which the runtime's macro passes over)
+--   a string  ~>  a static object, its bytes (`HEFF_LIT`, a C string
+--            literal of them)
 --   a call last of an unknown function  ~>  `heff_tail` (counted, a
 --            bounce every so often); a call not last, its value through
 --            `heff_tr` -- as src/heff/compile/emit.hf does (`Em.bouncing`).  From
@@ -33,7 +33,6 @@ import heff.compile.ir as I
 import heff.compile.lower as L
 import heff.compile.prims as Pr
 import map as M
-import rune as R
 
 -- Names
 --------------------------------------------------------------------------------
@@ -384,61 +383,46 @@ traverseC f (Cons x xs) = do
   ys <- traverseC f xs
   pure (Cons y ys)
 
-unitsOf : String -> List String
-unitsOf str =
-  List.map (\i -> showInt (byteAt str i)) (List.range 0 (strLength str - 1))
+-- (a byte in octal, as a C string's escape has it: three digits, so that
+-- no digit after it is read as its)
+octal : Int -> String
+octal b = showInt (b / 64) ^ showInt (b / 8 % 8) ^ showInt (b % 8)
 
--- (a rune's UTF-16 code units: one, or a surrogate pair)
-units16 : Int -> List Int
-units16 c =
-  if c < 65536 then [c]
-  else [55296 + (c - 65536) / 1024, 56320 + (c - 65536) % 1024]
+-- (the byte `b`, at `i`, as a C string literal has it: printable ASCII as
+-- it is but `"`, `\` and `?` (which a trigraph starts with), escaped;
+-- another in octal)
+cByte : String -> Int -> Int -> String
+cByte s i 34 = "\\\""
+cByte s i 92 = "\\\\"
+cByte s i 63 = "\\?"
+cByte s i b =
+  if 32 <= b && b < 127 then strSlice s i (i + 1) else "\\" ^ octal b
 
--- (a list of units, as the runtime's macros take it: in parentheses,
--- an empty one `(0)`)
-unitList : List String -> String
-unitList Nil = "(0)"
-unitList us = "(" ^ joinWith ", " us ^ ")"
+-- (from `i`, between the quotes, into `acc`)
+cBytesGo : String -> Int -> String -> String
+cBytesGo s i acc =
+  if i >= strLength s then acc
+  else cBytesGo s (i + 1) (acc ^ cByte s i (byteAt s i))
 
--- (a string not ASCII's: its UTF-16 code units, of its runes, and its
--- bytes)
-strDefRunes : String -> String -> List Int -> String
-strDefRunes name str cs =
-  "HEFF_STR("
-  ^ name
-  ^ ", "
-  ^ showInt (List.length (List.concatMap units16 cs))
-  ^ ", "
-  ^ unitList (List.map showInt (List.concatMap units16 cs))
-  ^ ", "
-  ^ showInt (strLength str)
-  ^ ", "
-  ^ unitList (unitsOf str)
-  ^ ");"
-
--- | a static string, by lib/c/runtime.c's macros: an ASCII one by its
--- | bytes (`HEFF_STRA`), another by both its UTF-16 code units (of its
--- | runes, what is not UTF-8 U+FFFD) and its bytes (`HEFF_STR`), of
--- | which the runtime takes its bytes
+-- | a static string, by lib/c/runtime.c's `HEFF_LIT`: its bytes, as a C
+-- | string literal writes them
 -- | >>> strDef "s" "ab"
--- | "HEFF_STRA(s, 2, (97, 98));"
+-- | "HEFF_LIT(s, 2, \"ab\");"
 -- | >>> strDef "s" ""
--- | "HEFF_STRA(s, 0, (0));"
--- | >>> strDef "s" "\u{2026}\u{1F600}"
--- | "HEFF_STR(s, 3, (8230, 55357, 56832), 7, (226, 128, 166, 240, 159, 152, 128));"
--- | >>> strDef "s" ("a" ^ fromByte 255)
--- | "HEFF_STR(s, 2, (97, 65533), 2, (97, 255));"
+-- | "HEFF_LIT(s, 0, \"\");"
+-- | >>> strDef "s" "a\"\\??=\n\u{e9}"
+-- | "HEFF_LIT(s, 9, \"a\\\"\\\\\\?\\?=\\012\\303\\251\");"
+-- | >>> strDef "s" ("1" ^ fromByte 255 ^ "2")
+-- | "HEFF_LIT(s, 3, \"1\\3772\");"
 strDef : String -> String -> String
 strDef name str =
-  if Pr.asciiString str
-    then "HEFF_STRA("
-      ^ name
-      ^ ", "
-      ^ showInt (strLength str)
-      ^ ", "
-      ^ unitList (unitsOf str)
-      ^ ");"
-  else strDefRunes name str (List.map R.toInt (runes str))
+  "HEFF_LIT("
+  ^ name
+  ^ ", "
+  ^ showInt (strLength str)
+  ^ ", \""
+  ^ cBytesGo str 0 ""
+  ^ "\");"
 
 -- | a static string
 strLit : String -> C String

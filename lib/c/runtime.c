@@ -127,6 +127,10 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
 #endif
 #define HEFF_STRA(name, n, us) \
   static struct { Obj h; int64_t len; int64_t cap; HEFF_UNIT s[(n) ? (n) : 1]; } name = {{0x80000000u, K_STR, 0}, n, n, {HEFF_ID us}}
+// (a string written in the program, static: its `n` bytes, as a C string
+// literal has them -- the NUL C ends it with, after them, no byte of it)
+#define HEFF_LIT(name, n, bytes) \
+  static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n) + 1]; } name = {{0x80000000u, K_STR, 0}, n, n, bytes}
 typedef struct { Obj h; double d; } Flt;
 typedef struct { Obj h; int64_t n; V a[]; } Arr;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Bnc;
