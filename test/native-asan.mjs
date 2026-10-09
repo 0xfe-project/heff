@@ -5,7 +5,8 @@
 // (`-DSMALL_MAX=0`, so that a use after the last reference is a use after
 // free), then made to check each program of test/programs in .heff/ref/native-asan,
 // where there is no cache but its own (one written by the Node.js
-// compiler would spare it the elaborating).
+// compiler would spare it the elaborating); and a program of them
+// compiled to C by it, built under ASan the same way, and run.
 // (What each part took to build, and each program to check, said as it
 // ends, the slowest again at the end, so that a log shows what held it
 // up; a program checked that has not ended in a minute is killed and
@@ -101,4 +102,20 @@ await pool(files, async (f) => {
   console.log(`FAILED ${f} (${why}):\n${r.stderr.split("\n").slice(0, 40).join("\n")}`);
 }, jobs);
 console.log(`native-asan: ${files.length - failed} of ${files.length} checked in ${since(t2).toFixed(1)}s; the slowest: ${slowest(checked)}`);
+
+// (a program compiled to C by it, built under ASan as it is, each of its
+// definitions shown: test/programs/jsstring.hf, whose JavaScript strings
+// (std.js) are strings in C, held in lists, records and constructors and
+// let go of -- each dropped as a string is, never as a constructor's,
+// which none is)
+for (const f of ["jsstring.hf"]) {
+  const t = performance.now(), c = join(work, basename(f, ".hf") + ".c"), bin = join(work, basename(f, ".hf"));
+  const names = [...readFileSync(join(root, "test", "programs", f), "utf8").matchAll(/^([a-z]\w*) :/gm)].map((m) => m[1]);
+  const r = await run(heff, ["compile", join("test", "programs", f), c, "--backend=c"], { cwd: work, env });
+  const b = r.status === 0 ? await run("clang", [...flags, c, "-o", bin, "-lm", "-lpthread"]) : r;
+  const out = b.status === 0 ? await run(bin, names, { env, timeout: limit * 1000, keep: 1 << 20 }) : b;
+  if (out.status === 0) { console.log(`native-asan: ${f} compiled to C, run in ${since(t).toFixed(1)}s`); continue; }
+  failed++;
+  console.log(`FAILED ${f} compiled to C (${out.signal ?? `status ${out.status}`}):\n${(out.stderr || "").split("\n").slice(0, 40).join("\n")}`);
+}
 process.exit(failed ? 1 : 0);

@@ -383,7 +383,8 @@ their names: `co`, `state`, `exn`, `parallel`, `array`,
 ship with it, under `lib/std/`: `std.io` (the standard streams),
 `std.filesystem`, `std.process`, `std.time`, `std.net`, `std.ref` (the world's cells),
 `std.dom` (web pages), `std.handle` (the world's things, which one
-effect hands out and another takes), `std.path`, `std.cli` (command
+effect hands out and another takes), `std.js` (JavaScript's strings),
+`std.path`, `std.cli` (command
 lines), `std.doc` (documents laid out), `std.progress` (what a
 program is doing, drawn on a terminal) and `std.math` (a float's
 functions: `sin`, `atan2`, `exp`, `log`, `pow`, `round`, `pi`, `e` and
@@ -402,10 +403,21 @@ stream's, what a command wrote, what was fetched, a directory's
 names); names -- the program's arguments, the environment, the working
 directory, a command and its arguments -- and the hosts of text (the
 DOM, JSON) are text, what is not UTF-8 U+FFFD in and out; a path with
-a NUL in it is none, the operation failing.  An ES module
-(`--backend=esm`) gives and takes its strings as they are kept, bytes:
-JavaScript calling it makes them (`Buffer.from(t, "utf8")
-.toString("latin1")`) and reads them back.
+a NUL in it is none, the operation failing.  `std.js` has
+JavaScript's text beside them: a `JSString`, which a string is made by
+`toJS` (what is not UTF-8 in it U+FFFD, as `TextDecoder` reads it) and
+made of by `fromJS` (a surrogate not in a pair U+FFFD), and nothing
+else -- a JavaScript string in JavaScript, and in C and the
+interpreter a string of UTF-8, valid, so that `fromJS (toJS s)` is
+`R.toValid s` on each.  An operation's field of type `JSString` is
+given to a provider, and taken from it, as it is, through no helper: a
+JavaScript string in JavaScript (the library's own effects take
+`String`s, their providers making them what the host has).  An ES
+module (`--backend=esm`) gives and takes its values as they are kept,
+nothing made anew: a function for JavaScript to call takes and gives
+`JSString`s (`greet : JSString -> JSString`), a `String` there in
+JavaScript its bytes -- JavaScript calling it makes one
+(`Buffer.from(t, "utf8").toString("latin1")`) and reads one back.
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.

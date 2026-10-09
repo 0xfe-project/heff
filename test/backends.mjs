@@ -247,6 +247,13 @@ checks.push(ran("state peeled in-language", "test/node/counted.hf", "main", [], 
 checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
   { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 }));
 
+// a `JSString` (std.js) field of an operation: a JavaScript string to the
+// JavaScript provider, given and taken through no helper (its length its
+// text's UTF-16 code units, not its bytes), and to the C one a string of
+// UTF-8, valid, which says the same
+checks.push(ran("JSString given as it is", "test/node/jstext.hf", "main", [],
+  { out: "5 bytes, 5 code units: plain\n7 bytes, 4 code units: é😀a\n3 bytes, 3 code units: x\u{FFFD}y\n", status: 0 }));
+
 // processes, by C alone (test/node/fork.provider.c forks; Node.js cannot
 // give a continuation to another process): the rest of the program run
 // by each of them, each on its own copy, their strings gathered in

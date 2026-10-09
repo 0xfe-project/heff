@@ -1879,7 +1879,10 @@ static V heff_cons(V x, V rest) {
 // `False`).  Content and paths are the string's bytes, as they are;
 // text is made valid, what is not UTF-8 in it U+FFFD, both in and out,
 // as the JavaScript backend's names are (Node.js has an argument, the
-// environment, as text alone).
+// environment, as text alone).  A field of type `JSString` (std.js) is
+// a string too, its text UTF-8 and valid already (all `heff_strToJS`
+// makes): out by `heff_cstr_text`, which gives it as it is, and one
+// made of what the system gives by `heff_str_text`.
 
 // (content in, `n` bytes, as a string)
 static V heff_str_bytes(const void *c, int64_t n) { return heff_str_of(c, n); }
