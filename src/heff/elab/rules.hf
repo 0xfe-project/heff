@@ -1379,11 +1379,13 @@ numLitSyn sp lit =
 type FieldDeclaration = { name : String, typ : Typ, dflt : Maybe Default }
 
 -- | a record type's fields formed: its level, the fields' types, the
--- | defaults of those that have one
+-- | defaults of those that have one, and the first field too large for
+-- | run-time data, written as it is declared (`t : Type`)
 type Formed =
   { level : P.Level
   , fields : List (Pair String Sx.Ty)
   , defaults : List (Pair String Sx.Tm)
+  , large : Maybe String
   }
 
 -- (a default, zonked: it names no local but the `i` fields before it)
@@ -1423,9 +1425,16 @@ consDefault : String
 consDefault x (Just d) ds = Cons (MkPair x d) ds
 consDefault x Nothing ds = ds
 
+-- (the field `x : ty`, if it is too large for run-time data, else the
+-- first such of those after it)
+largeField : ElabEnv -> String -> M.Ty -> Maybe String -> Maybe String
+largeField e x ty after =
+  if P.leq (M.levelOf ty) Small then after else Just (x ^ " : " ^ tyStrM e ty)
+
 -- (the fields from the `i`th on)
 formGo : ElabEnv -> Int -> List FieldDeclaration -> Elab Formed
-formGo e' i Nil = pure { level = Small, fields = Nil, defaults = Nil }
+formGo e' i Nil =
+  pure { level = Small, fields = Nil, defaults = Nil, large = Nothing }
 formGo e' i (Cons fd rest) = do
   ty <- runTyp fd.typ e'
   d <- defaultAt e' i ty fd.dflt
@@ -1434,25 +1443,33 @@ formGo e' i (Cons fd rest) = do
       { level = P.maxLevel f.level (M.levelOf ty)
       , fields = Cons (MkPair fd.name ty.stx) f.fields
       , defaults = consDefault fd.name d f.defaults
+      , large = largeField e' fd.name ty f.large
       }
+
+-- | a record type's fields formed where `e` is
+formRecord : ElabEnv -> List FieldDeclaration -> Elab Formed
+formRecord e fieldTyps =
+  -- (the fields may name the definition being elaborated: the record
+  -- type is nominative, so the recursion is guarded by its name)
+  formGo
+    (withScope (withFor e ForNominative) (undelayScope e.scope))
+    0
+    fieldTyps
+
+recordOf : ElabEnv -> Formed -> M.Ty
+recordOf e f =
+  M.recordM
+    e.globals
+    e.scope.locals
+    f.level
+    (D.fromList f.fields)
+    (D.fromList f.defaults)
 
 recordFormation : List FieldDeclaration -> Typ
 recordFormation fieldTyps =
   MkTyp (\e -> do
-  -- (the fields may name the definition being elaborated: the record
-  -- type is nominative, so the recursion is guarded by its name)
-  f <-
-    formGo
-      (withScope (withFor e ForNominative) (undelayScope e.scope))
-      0
-      fieldTyps
-  pure
-      (M.recordM
-         e.globals
-         e.scope.locals
-         f.level
-         (D.fromList f.fields)
-         (D.fromList f.defaults)))
+  f <- formRecord e fieldTyps
+  pure (recordOf e f))
 
 -- | (`nameSpan`: the field's name, where it is written)
 type FieldSetting =
@@ -2307,23 +2324,54 @@ localDef x typ body rest =
 universeFormation : P.Universe -> Typ
 universeFormation u = MkTyp (\e -> pure (M.univ u))
 
+-- (a type too large for its universe: `note`, what to write instead)
+tooLarge : P.Span -> String -> Maybe String -> Elab M.El
+tooLarge sp msg Nothing = failWith sp 9 msg
+tooLarge sp msg (Just note) = failWithNote sp 9 msg note
+
+-- (the type `ty` as a term of the type `a`, a universe it must be small
+-- enough for)
+universeAt : P.Span -> Maybe String -> ElabEnv -> V.Ty -> M.Ty -> Elab M.El
+universeAt sp note e a ty = case V.behavior a of
+  LikeU u ->
+    if P.leq (M.levelOf ty) (P.decodesInto u) then pure (M.code ty)
+    else tooLarge
+        sp
+        ("type " ^ tyStrM e ty ^ " too large for its universe")
+        note
+  _ ->
+    failWith
+      sp
+      10
+      ("cannot check type "
+       ^ tyStrM e ty
+       ^ " at non-universe type "
+       ^ tyStr e a)
+
 universeIntro : P.Span -> Typ -> Chk
 universeIntro sp typ =
   MkChk (\e a0 -> do
   a <- Mt.forceT a0
   ty <- runTyp typ e
-  case V.behavior a of
-    LikeU u ->
-      if P.leq (M.levelOf ty) (P.decodesInto u) then pure (M.code ty)
-      else failWith sp 9 ("type " ^ tyStrM e ty ^ " too large for its universe")
-    _ ->
-      failWith
-        sp
-        10
-        ("cannot check type "
-         ^ tyStrM e ty
-         ^ " at non-universe type "
-         ^ tyStr e a))
+  universeAt sp Nothing e a ty)
+
+-- (what a record type too large for run-time data is: a theory)
+theoryNote : Maybe String -> Maybe String
+theoryNote Nothing = Nothing
+theoryNote (Just field) =
+  Just
+    ("its field `"
+     ^ field
+     ^ "` is no run-time data: a record with such a field is a theory -- declare it with `theory X where`, a field a line")
+
+-- | a record type as a term (`type X = { ... }`): one with a field too
+-- | large for run-time data is said to be a theory
+recordTypeIntro : P.Span -> List FieldDeclaration -> Chk
+recordTypeIntro sp fieldTyps =
+  MkChk (\e a0 -> do
+  a <- Mt.forceT a0
+  f <- formRecord e fieldTyps
+  universeAt sp (theoryNote f.large) e a (recordOf e f))
 
 universeElim : P.Universe -> Chk -> Typ
 universeElim u chk =

@@ -41,6 +41,21 @@ quiet : Opts
 quiet = { name = "quiet" }   -- { name = "quiet", verbose = False, label = "quiet" }
 ```
 
+A record type's values are run-time data, and a type is none: a record
+with a field that is a type, or a function of types, or a theory's
+record, is a theory, declared as one -- `theory Packed where`, a field a
+line -- and `type Packed = { t : Type, size : Int }` is refused, the
+field named.
+
+```haskell
+theory Packed where
+  t : Type
+  size : Int
+
+packed : Packed
+packed = { t = Int, size = 8 }
+```
+
 ## Implicit arguments
 
 An implicit argument, `{x : A} -> B`, is inferred where the function is
