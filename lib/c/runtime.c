@@ -108,6 +108,23 @@ typedef struct { Obj h; int64_t n; uint32_t *lbl; V f[]; } Rec;
 typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V memo; V env[]; } Clo;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
 typedef struct { Obj h; int64_t len; int64_t cap; uint16_t s[]; } Str;
+// (a string written in the program, static: the emitter gives both its
+// UTF-16 code units and its UTF-8 bytes, `HEFF_STR`, and the runtime
+// takes those its strings are -- the bytes where `HEFF_STR8` is defined;
+// an ASCII one, the same in both, its units once, `HEFF_STRA`; an empty
+// one's list `(0)`)
+#define HEFF_ID(...) __VA_ARGS__
+#ifdef HEFF_STR8
+#define HEFF_UNIT uint8_t
+#define HEFF_STR(name, n16, u16, n8, u8) \
+  static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n8) ? (n8) : 1]; } name = {{0x80000000u, K_STR, 0}, n8, n8, {HEFF_ID u8}}
+#else
+#define HEFF_UNIT uint16_t
+#define HEFF_STR(name, n16, u16, n8, u8) \
+  static struct { Obj h; int64_t len; int64_t cap; uint16_t s[(n16) ? (n16) : 1]; } name = {{0x80000000u, K_STR, 0}, n16, n16, {HEFF_ID u16}}
+#endif
+#define HEFF_STRA(name, n, us) \
+  static struct { Obj h; int64_t len; int64_t cap; HEFF_UNIT s[(n) ? (n) : 1]; } name = {{0x80000000u, K_STR, 0}, n, n, {HEFF_ID us}}
 typedef struct { Obj h; double d; } Flt;
 typedef struct { Obj h; int64_t n; V a[]; } Arr;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Bnc;
@@ -1678,6 +1695,58 @@ static V heff_strOfRunes(V l) {
   heff_drop(l);
   return (V)s;
 }
+
+// (a string as bytes, UTF-8, as no library declares yet: here a string
+// is UTF-16 code units still, so its unit is what `strByteAt` gives, a
+// rune is one unit or a surrogate pair, and its text as JavaScript has
+// it (`strToJS`) is it with U+FFFD for a surrogate not in a pair)
+static V heff_strByteAt(V a, V i) { return heff_strCharCode(a, i); }
+
+static V heff_strFromByte(V c) {
+  int64_t k = INT_OF(c);
+  if (k < 0 || k > 255) return heff_abandon();
+  Str *s = heff_str_new(1);
+  s->s[0] = (uint16_t)k;
+  return (V)s;
+}
+
+// (the rune at `i`, and how many units it takes, `*w`; out of the
+// string, U+FFFD of none)
+static uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
+  if (i < 0 || i >= x->len) { *w = 0; return 0xFFFD; }
+  uint32_t u = x->s[i];
+  if (u >= 0xD800 && u < 0xDC00 && i + 1 < x->len && x->s[i + 1] >= 0xDC00 && x->s[i + 1] < 0xE000) {
+    *w = 2;
+    return 0x10000 + ((u - 0xD800) << 10) + (x->s[i + 1] - 0xDC00);
+  }
+  *w = 1;
+  return u >= 0xD800 && u < 0xE000 ? 0xFFFD : u;
+}
+
+static V heff_strRuneAt(V a, V i) {
+  int64_t w;
+  uint32_t r = heff_str_rune_at((Str *)a, INT_OF(i), &w);
+  heff_drop(a);
+  return MK_INT((int64_t)r);
+}
+
+static V heff_strRuneWidth(V a, V i) {
+  int64_t w;
+  heff_str_rune_at((Str *)a, INT_OF(i), &w);
+  heff_drop(a);
+  return MK_INT(w);
+}
+
+static V heff_strRuneCount(V a) {
+  Str *x = (Str *)a;
+  int64_t n = 0, w;
+  for (int64_t i = 0; i < x->len; i += w) { heff_str_rune_at(x, i, &w); n++; }
+  heff_drop(a);
+  return MK_INT(n);
+}
+
+static V heff_strToJS(V a) { return heff_strOfRunes(heff_strRunes(a)); }
+static V heff_strFromJS(V a) { return a; }
 
 // Arrays
 // ---------------------------------------------------------------------

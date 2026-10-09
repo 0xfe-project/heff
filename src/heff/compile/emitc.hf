@@ -12,7 +12,8 @@
 --   a tag, a record  ~>  `heff_tag_n`, `heff_rec_n`, built at the size
 --            the emitter knows: tags and labels numbered (`TAG_x`,
 --            `LBL_x`), a record's fields in the order it is written in
---   a string  ~>  a static object, its UTF-16 code units
+--   a string  ~>  a static object, its UTF-16 code units and its UTF-8
+--            bytes, of which the runtime takes those its strings are
 --   a call last of an unknown function  ~>  `heff_tail` (counted, a
 --            bounce every so often); a call not last, its value through
 --            `heff_tr` -- as src/heff/compile/emit.hf does (`Em.bouncing`).  From
@@ -32,6 +33,7 @@ import heff.compile.ir as I
 import heff.compile.lower as L
 import heff.compile.prims as Pr
 import map as M
+import rune as R
 
 -- Names
 --------------------------------------------------------------------------------
@@ -386,21 +388,70 @@ unitsOf : String -> List String
 unitsOf str =
   List.map (\i -> showInt (charCode str i)) (List.range 0 (strLength str - 1))
 
+-- (a rune's UTF-16 code units: one, or a surrogate pair)
+units16 : Int -> List Int
+units16 c =
+  if c < 65536 then [c]
+  else [55296 + (c - 65536) / 1024, 56320 + (c - 65536) % 1024]
+
+-- (its UTF-8 bytes)
+units8 : Int -> List Int
+units8 c =
+  if c < 128 then [c]
+  else if c < 2048 then [192 + c / 64, 128 + c % 64]
+  else if c < 65536 then [224 + c / 4096, 128 + (c / 64) % 64, 128 + c % 64]
+  else [ 240 + c / 262144
+       , 128 + (c / 4096) % 64
+       , 128 + (c / 64) % 64
+       , 128 + c % 64
+       ]
+
+-- (a list of units, as the runtime's macros take it: in parentheses,
+-- an empty one `(0)`)
+unitList : List String -> String
+unitList Nil = "(0)"
+unitList us = "(" ^ joinWith ", " us ^ ")"
+
+-- (a string not ASCII's, by its runes: its UTF-16 code units and its
+-- UTF-8 bytes)
+strDefRunes : String -> List Int -> String
+strDefRunes name cs =
+  "HEFF_STR("
+  ^ name
+  ^ ", "
+  ^ showInt (List.length (List.concatMap units16 cs))
+  ^ ", "
+  ^ unitList (List.map showInt (List.concatMap units16 cs))
+  ^ ", "
+  ^ showInt (List.length (List.concatMap units8 cs))
+  ^ ", "
+  ^ unitList (List.map showInt (List.concatMap units8 cs))
+  ^ ");"
+
+-- | a static string, by lib/c/runtime.c's macros: an ASCII one by its
+-- | units (`HEFF_STRA`), another by both its UTF-16 code units and its
+-- | UTF-8 bytes (`HEFF_STR`), of which the runtime takes those its
+-- | strings are -- each computed of its runes, whatever the strings of
+-- | the compiler that writes it are
+-- | >>> strDef "s" "ab"
+-- | "HEFF_STRA(s, 2, (97, 98));"
+-- | >>> strDef "s" ""
+-- | "HEFF_STRA(s, 0, (0));"
+-- | >>> strDef "s" "\u{2026}\u{1F600}"
+-- | "HEFF_STR(s, 3, (8230, 55357, 56832), 7, (226, 128, 166, 240, 159, 152, 128));"
 strDef : String -> String -> String
 strDef name str =
-  "static struct { Obj h; int64_t len; int64_t cap; uint16_t s["
-  ^ showInt (if strLength str == 0 then 1 else strLength str)
-  ^ "]; } "
-  ^ name
-  ^ " = {{0x80000000u, K_STR, 0}, "
-  ^ showInt (strLength str)
-  ^ ", "
-  ^ showInt (strLength str)
-  ^ ", {"
-  ^ (if strLength str == 0 then "0" else joinWith ", " (unitsOf str))
-  ^ "}};"
+  if Pr.asciiString str
+    then "HEFF_STRA("
+      ^ name
+      ^ ", "
+      ^ showInt (strLength str)
+      ^ ", "
+      ^ unitList (unitsOf str)
+      ^ ");"
+  else strDefRunes name (List.map R.toInt (runes str))
 
--- | a static string, its UTF-16 code units
+-- | a static string
 strLit : String -> C String
 strLit str = \s ->
     MkPair
