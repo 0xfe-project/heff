@@ -30,15 +30,18 @@ The expectation is the `-- | ...` lines up to the next doc test, a
 blank line of the doc comment (`-- |`), or its end: it may go on over
 more than one line (read as one expression), and the comment goes on
 after a blank one.  It is compared by value, so `Cons 3 (Cons 2 Nil)`
-holds of `[3, 2]`.  A doc test with no expectation is checked only to
-elaborate; `heff promote` writes the value of each doc test and watch
-under it as its expectation (replacing what was there).  A doc test is
-in the comment right above a definition -- its signature, or a `data`,
-`type`, `theory` or `primitive` -- with nothing but comments between,
-no blank line.  One that is not (a blank line under it, a `test`, a
-watch or an import, the end of the file) is checked where it is, as a
-watch, and warned of: write it as a watch, or move it into the doc
-comment right above its definition.
+holds of `[3, 2]`.  A value is shown as the compiled code has it: a
+function as `#fun`, a type as `#erased`, and a value that takes types
+first -- erased where it is compiled -- given them: `Nil` of
+`{a : Type} -> List a` is `[]`.  A doc test with no expectation is
+checked only to elaborate; `heff promote` writes the value of each doc
+test and watch under it as its expectation (replacing what was there).
+A doc test is in the comment right above a definition -- its
+signature, or a `data`, `type`, `theory` or `primitive` -- with nothing
+but comments between, no blank line.  One that is not (a blank line
+under it, a `test`, a watch or an import, the end of the file) is
+checked where it is, as a watch, and warned of: write it as a watch, or
+move it into the doc comment right above its definition.
 
 ## Watches
 

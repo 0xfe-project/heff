@@ -7,6 +7,7 @@ import array as A
 import heff.syntax.diagnostic
 import heff.util.dict as D
 import heff.elab.effect as Ef
+import heff.compile.erase as Er
 import heff.elab.environment as Env
 import heff.syntax.fixity as F
 import heff.elab.globals as G
@@ -1250,10 +1251,29 @@ expectAfter doc src end =
 expectation : String -> Pm.Span -> Expectation
 expectation src sp = expectAfter (isDocTest src sp.start) src sp.end
 
+-- (how many arguments a value of a type that behaves so takes first
+-- that are types -- erased where it is compiled, as heff.compile.erase
+-- reads them off the type -- the first of them the `lvl`th local)
+typeArgsOf : Int -> V.TB -> Int
+typeArgsOf lvl (LikeFunction level dom cod implicit) =
+  if Er.isType lvl dom
+    then 1
+      + typeArgsOf
+        (lvl + 1)
+        (V.behavior (V.nom (V.appClo cod (\u -> V.local lvl dom))))
+  else 0
+typeArgsOf lvl _ = 0
+
+-- | a value of the type `t` as the tools show it: given its type
+-- | arguments first (as nothing: they are erased), as the compiled code
+-- | has it -- `[]` of `{a : Type} -> List a`, not `#fun`
+shownAt : V.Ty -> In.EvalResult -> String
+shownAt t r = In.showResult (In.applyErased (typeArgsOf 0 (V.behavior t)) r)
+
 -- | a watch's value, in the globals evaluated (`In.globalEnv`, once for
 -- | all the watches of a file)
 evalWatch : In.GlobalEnv -> G.Entry -> String
-evalWatch ge entry = In.showResult (In.evalEntryIn ge entry)
+evalWatch ge entry = shownAt entry.type_ (In.evalEntryIn ge entry)
 
 knownG : G.Globals -> String -> Bool
 knownG g x = case G.lookupName g x of
@@ -1396,18 +1416,28 @@ testFile c = catMaybesD (List.map (\w -> testReportOf c w) (watches c))
 -- | them
 type Evaluated = { name : String, value : String }
 
-evalPick : List (Pair String In.EvalResult) -> List Own -> List Evaluated
-evalPick results Nil = Nil
-evalPick results (Cons o rest) = case List.lookupBy strEq o.key results of
+-- (a global's value as the tools show it, given its type arguments)
+shownGlobal : G.Globals -> String -> In.EvalResult -> String
+shownGlobal g k r = case G.lookupEntry g k of
+  Just e -> shownAt e.type_ r
+  Nothing -> In.showResult r
+
+evalPick : G.Globals
+         -> List (Pair String In.EvalResult)
+         -> List Own
+         -> List Evaluated
+evalPick g results Nil = Nil
+evalPick g results (Cons o rest) = case List.lookupBy strEq o.key results of
   Just r ->
     Cons
-      { name = Ps.named o.name, value = In.showResult r }
-      (evalPick results rest)
-  Nothing -> evalPick results rest
+      { name = Ps.named o.name, value = shownGlobal g o.key r }
+      (evalPick g results rest)
+  Nothing -> evalPick g results rest
 
 evaluate : Checked -> List Evaluated
 evaluate c =
   evalPick
+    c.top.globals
     (In.evalGlobalsWhere
        (\k -> elemStr k (List.map (\(o : Own) -> o.key) c.own))
        c.top.globals)
