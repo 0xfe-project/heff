@@ -15,6 +15,12 @@
 // is bundled after lib/c/runtime.c, whose functions it uses -- among
 // them the world's, which hold what every provider hands out
 // (`heff_hold`, `heff_held`, `heff_release`: lib/std/handle.hf says how).
+// A string it is given, or gives, crosses to the system and back only
+// through the runtime's helpers, by what it is there -- content, a path,
+// a name or text: `heff_str_bytes`, `heff_put`, `heff_cstr`,
+// `heff_str_text`, `heff_cstr_text` and the like ("What providers share"
+// in lib/c/runtime.c says which is which) -- never by its units, so that
+// how the runtime keeps a string is the runtime's alone.
 
 // (the lines std.progress draws on the terminal, once there are any:
 // what is written clears them first, and they come back below it --
@@ -56,7 +62,7 @@ static V heff_provider_stdio(V p, V k) {
         cap *= 2;
       }
     }
-    V s = heff_str_utf8(buf, (int64_t)n);
+    V s = heff_str_bytes(buf, (int64_t)n);
     free(buf);
     V x = heff_tr(heff_app1(f, s));
     return heff_tail(k, 1, &x);

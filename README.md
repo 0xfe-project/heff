@@ -375,7 +375,12 @@ program is doing, drawn on a terminal) and `std.math` (a float's
 functions: `sin`, `atan2`, `exp`, `log`, `pow`, `round`, `pi`, `e` and
 the like).  An effect's JavaScript side is in `M.provider.js` beside
 `M.hf`, its C side in `M.provider.c`; the things they hand out the
-world holds for them all.
+world holds for them all.  A provider gives a string to the host, and
+takes one from it, only through the runtime's helpers, by what the
+string is there -- text, or bytes: `$toJs`, `$fromJs`, `$toBytes` and
+`$fromBytes` in JavaScript (lib/std/dom.provider.js says which is for
+what), `heff_str_text`, `heff_str_bytes`, `heff_cstr` and the like in C
+(lib/c/runtime.c, "What providers share").
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.

@@ -3,7 +3,10 @@
 // `Content-Length: n` header, a blank line, then n bytes of JSON; stdout
 // carries only the messages, logs go to stderr -- and what of the host a
 // language server asks for (the shape of a provider is said in
-// lib/std/io.provider.c).
+// lib/std/io.provider.c).  Its strings are text, a host of text's --
+// JSON's, and the paths and URIs a client names, or that are made of
+// them (`heff_str_text`, `heff_cstr_text`) -- but for what it sends and
+// logs, which is written out as it is (`heff_bytes`, `heff_put`).
 
 #include <dirent.h>
 #ifndef _WIN32
@@ -91,7 +94,7 @@ static V json_string(Json *j) {
     default: free(b.s); return 0;
     }
   }
-  V s = heff_str_utf8((const unsigned char *)(b.s ? b.s : ""), (int64_t)b.n);
+  V s = heff_str_text_n(b.s ? b.s : "", (int64_t)b.n);
   free(b.s);
   return s;
 }
@@ -385,7 +388,7 @@ static V rpc_uri_path(const char *u) {
     if (b.s[i] == '/') b.s[i] = '\\';
   if (b.n == 2) buf_put(&b, "\\", 1);
 #endif
-  V s = heff_str_utf8((const unsigned char *)b.s, (int64_t)b.n);
+  V s = heff_str_text_n(b.s, (int64_t)b.n);
   free(b.s);
   return heff_just(s);
 }
@@ -410,7 +413,7 @@ static V rpc_path_uri(const char *p) {
     } else buf_put(&b, (const char *)c, 1);
   }
   free(abs);
-  V s = heff_str_utf8((const unsigned char *)b.s, (int64_t)b.n);
+  V s = heff_str_text_n(b.s, (int64_t)b.n);
   free(b.s);
   return s;
 }
@@ -503,7 +506,7 @@ static V rpc_project_files(const char *root) {
     }
     rpc_walk(root, &ignored, &files);
   }
-  V l = heff_strs(files.xs, files.n);
+  V l = heff_strs_text(files.xs, files.n);
   names_free(&files);
   names_free(&ignored);
   return l;
@@ -523,10 +526,10 @@ static V heff_provider_rpc(V p, V k) {
     break;
   }
   case TAG_Send: {
-    char *body = heff_cstr(heff_field(p, 0));
+    size_t n;
+    char *body = heff_bytes(heff_field(p, 0), &n);
     x = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    size_t n = strlen(body);
     fprintf(stdout, "Content-Length: %zu\r\n\r\n", n);
     fwrite(body, 1, n, stdout);
     fflush(stdout);
@@ -549,16 +552,20 @@ static V heff_provider_rpc(V p, V k) {
   }
   case TAG_ProjectFiles: case TAG_UriPath: case TAG_PathUri: case TAG_AbsPath: {
     int tag = heff_tag_of(p);
-    char *s = heff_cstr(heff_field(p, 0));
+    char *s = heff_cstr_text(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
+    // (a path or a URI with a NUL in it, which cannot be a C string, is
+    // none: no files, no path, and as it was where one is made of it)
+    V was = s ? 0 : heff_dup(heff_field(p, 0));
     heff_drop(p);
     V r;
-    if (tag == TAG_ProjectFiles) r = rpc_project_files(s);
+    if (!s) r = tag == TAG_ProjectFiles ? NTAG(TAG_Nil) : tag == TAG_UriPath ? heff_nothing : was;
+    else if (tag == TAG_ProjectFiles) r = rpc_project_files(s);
     else if (tag == TAG_UriPath) r = rpc_uri_path(s);
     else if (tag == TAG_PathUri) r = rpc_path_uri(s);
     else {
       char *a = rpc_resolve(s);
-      r = heff_str_c(a);
+      r = heff_str_text(a);
       free(a);
     }
     free(s);

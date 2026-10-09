@@ -7,8 +7,8 @@ export const $host = "page";
 export const paint = (world) => (p, k) => {
   const a = p.a;
   switch (p.$) {
-    case "Paint": world.get(a[0].a[0]).setAttribute("class", a[1]); return k(a[2]);
-    case "Stamp": { const el = document.createElement("mark"); el.textContent = a[0]; return k(a[1]({ $: "MkHandle", a: [world.hold(el)] })); }
+    case "Paint": world.get(a[0].a[0]).setAttribute("class", $toJs(a[1])); return k(a[2]);
+    case "Stamp": { const el = document.createElement("mark"); el.textContent = $toJs(a[0]); return k(a[1]({ $: "MkHandle", a: [world.hold(el)] })); }
     default: throw new Error("heff: not an operation of paint: " + (p && p.$));
   }
 };

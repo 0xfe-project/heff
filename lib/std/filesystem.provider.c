@@ -26,7 +26,7 @@ static V heff_read_file(const char *path) {
   while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_put(&b, chunk, got);
   int bad = ferror(f);
   fclose(f);
-  V s = bad ? 0 : heff_str_utf8((const unsigned char *)(b.s ? b.s : ""), (int64_t)b.n);
+  V s = bad ? 0 : heff_str_bytes(b.s ? b.s : "", (int64_t)b.n);
   free(b.s);
   return bad ? heff_nothing : heff_just(s);
 }
@@ -73,7 +73,7 @@ static V heff_read_dir(const char *path) {
   }
   closedir(d);
   qsort(ns, n, sizeof(char *), heff_cmp_cstr);
-  V l = heff_strs(ns, n);
+  V l = heff_strs_bytes(ns, n);
   for (int64_t i = 0; i < n; i++) free(ns[i]);
   free(ns);
   return heff_just(l);
@@ -176,9 +176,23 @@ static int heff_nothing_at(const char *p) {
   return lstat(p, &st) != 0 && errno == ENOENT;
 }
 
+// (what an operation answers where its path is none, a string with a NUL
+// in it: it fails -- `Nothing` where it reads, `False` where it does)
+static V heff_fs_failed(V p) {
+  int tag = heff_tag_of(p);
+  int at = tag == TAG_WriteFile || tag == TAG_Copy || tag == TAG_Move || tag == TAG_Replace ? 2 : 1;
+  V f = heff_dup(heff_field(p, at));
+  heff_drop(p);
+  return heff_answer(f, tag == TAG_ReadFile || tag == TAG_ReadDir ? heff_nothing : heff_bool(0));
+}
+
 static V heff_provider_fs(V p, V k) {
   char *path = heff_cstr(heff_field(p, 0));
   V x;
+  if (!path) {
+    x = heff_fs_failed(p);
+    return heff_tail(k, 1, &x);
+  }
   switch (heff_tag_of(p)) {
   case TAG_ReadFile: {
     V f = heff_dup(heff_field(p, 1));
@@ -222,7 +236,7 @@ static V heff_provider_fs(V p, V k) {
     char *to = heff_cstr(heff_field(p, 1));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
-    int ok = heff_nothing_at(to) && heff_copy_all(path, to);
+    int ok = to && heff_nothing_at(to) && heff_copy_all(path, to);
     free(to);
     x = heff_answer(f, heff_bool(ok));
     break;
@@ -231,7 +245,7 @@ static V heff_provider_fs(V p, V k) {
     char *to = heff_cstr(heff_field(p, 1));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
-    int ok = heff_nothing_at(to) && rename(path, to) == 0;
+    int ok = to && heff_nothing_at(to) && rename(path, to) == 0;
     free(to);
     x = heff_answer(f, heff_bool(ok));
     break;
@@ -243,9 +257,9 @@ static V heff_provider_fs(V p, V k) {
     // (rename(2) puts a file in place of another at once; Windows' does
     // not over one there, MoveFileEx does)
 #ifdef _WIN32
-    int ok = MoveFileExA(path, to, MOVEFILE_REPLACE_EXISTING) != 0;
+    int ok = to && MoveFileExA(path, to, MOVEFILE_REPLACE_EXISTING) != 0;
 #else
-    int ok = rename(path, to) == 0;
+    int ok = to && rename(path, to) == 0;
 #endif
     free(to);
     x = heff_answer(f, heff_bool(ok));

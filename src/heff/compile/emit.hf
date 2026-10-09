@@ -1390,6 +1390,29 @@ defLines gs curried globalNames d = case M.lookup compareString d.key gs of
 whenHas : String -> String -> String -> Maybe String
 whenHas code k line = if contains k code then Just line else Nothing
 
+-- | the helpers a String crosses to the host and back by, each its name
+-- | and its line (lib/std/dom.provider.js says which is for what): for
+-- | now a String is a JavaScript string, the host's text as it is and
+-- | its bytes UTF-8
+strHelpers : List (Pair String String)
+strHelpers =
+  [ MkPair "$toJs" "const $toJs = (s) => s;"
+  , MkPair "$fromJs" "const $fromJs = (t) => t;"
+  , MkPair
+    "$toBytes"
+    "const $toBytes = typeof Buffer === \"function\" ? (s) => Buffer.from(s, \"utf8\") : (s) => new TextEncoder().encode(s);"
+  , MkPair
+    "$fromBytes"
+    "const $fromBytes = typeof Buffer === \"function\" ? (b) => (Buffer.isBuffer(b) ? b : Buffer.from(b)).toString(\"utf8\") : (b) => new TextDecoder().decode(b);"
+  ]
+
+strHelperIn : String -> Pair String String -> Maybe String
+strHelperIn text (MkPair k line) = whenHas text k line
+
+-- | the string helpers `text` uses
+strHelpersIn : String -> List String
+strHelpersIn text = catMaybesL (List.map (\h -> strHelperIn text h) strHelpers)
+
 -- | bounces (see Tail calls): how many calls last were made since the
 -- | last one, a bounce, and a value asked for through them
 trampolineStr : String
@@ -1405,32 +1428,34 @@ extStr =
 -- | what the code uses of the runtime
 runtime : String -> List String
 runtime code =
-  catMaybesL
-    [ if List.any (\k -> contains k code) ["$tr(", "$Bnc", "$force", "$lazy"]
-      then Just trampolineStr
-    else Nothing
-    -- (either may be used without the other)
-    , if contains "$T" code || contains "$F" code
-      then Just
-          "const $T = { $: \"True\", a: [] }, $F = { $: \"False\", a: [] };"
-    else Nothing
-    , whenHas
-      code
-      "$abandon"
-      "const $abandon = () => { throw new Error(\"heff:abandon\"); };"
-    , whenHas
-      code
-      "$nomatch"
-      "const $nomatch = (s) => { throw new Error(\"heff: no case for '\" + (s && s.$) + \"'\"); };"
-    , whenHas
-      code
-      "$force"
-      "const $force = (f) => { if (f.$m !== undefined) return f.$m; const v = $tr(f({ $: \"MkUnit\", a: [] })); f.$m = v; return v; };"
-    , whenHas
-      code
-      "$lazy"
-      "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"heff: defined by itself\"); state = 1; try { v = $tr(f()); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
-    ]
+  List.append
+    (catMaybesL
+       [ if List.any (\k -> contains k code) ["$tr(", "$Bnc", "$force", "$lazy"]
+         then Just trampolineStr
+       else Nothing
+       -- (either may be used without the other)
+       , if contains "$T" code || contains "$F" code
+         then Just
+             "const $T = { $: \"True\", a: [] }, $F = { $: \"False\", a: [] };"
+       else Nothing
+       , whenHas
+         code
+         "$abandon"
+         "const $abandon = () => { throw new Error(\"heff:abandon\"); };"
+       , whenHas
+         code
+         "$nomatch"
+         "const $nomatch = (s) => { throw new Error(\"heff: no case for '\" + (s && s.$) + \"'\"); };"
+       , whenHas
+         code
+         "$force"
+         "const $force = (f) => { if (f.$m !== undefined) return f.$m; const v = $tr(f({ $: \"MkUnit\", a: [] })); f.$m = v; return v; };"
+       , whenHas
+         code
+         "$lazy"
+         "const $lazy = (f) => { let state = 0, v; return () => { if (state === 2) return v; if (state === 1) throw new Error(\"heff: defined by itself\"); state = 1; try { v = $tr(f()); state = 2; return v; } finally { if (state === 1) state = 0; } }; };"
+       ])
+    (strHelpersIn code)
 
 type Uncurried = { params : List String, body : String }
 
@@ -1741,8 +1766,16 @@ bundleAll : Int -> List Provider -> List String
 bundleAll i Nil = Nil
 bundleAll i (Cons p rest) = Cons (bundleProvider i p) (bundleAll (i + 1) rest)
 
-runtimeFor : Bool -> List Provider -> Ef.Effect -> String
-runtimeFor hasTr provs eff =
+-- (the string helpers the providers use that the program's code, `have`,
+-- has not brought already)
+provStrHelpers : List String -> List Provider -> List String
+provStrHelpers have provs =
+  List.filter
+    (\l -> not (List.any (\h -> strEq h l) have))
+    (strHelpersIn (joinWith "\n" (List.map (\(p : Provider) -> p.text) provs)))
+
+runtimeFor : Bool -> List String -> List Provider -> Ef.Effect -> String
+runtimeFor hasTr have provs eff =
   joinWith
     "\n"
     (List.append
@@ -1751,7 +1784,7 @@ runtimeFor hasTr provs eff =
           [runStr, worldStr])
        (List.append
           (if hasSum eff then Cons sumStr Nil else Nil)
-          (bundleAll 0 provs)))
+          (List.append (provStrHelpers have provs) (bundleAll 0 provs))))
 
 provIndexGo : Int -> String -> List Provider -> Int
 provIndexGo i md Nil = 0
@@ -1882,7 +1915,7 @@ runSource host provs eff key m =
              (List.append
                 m.lines
                 [ ""
-                , runtimeFor (definesTr m) provs eff
+                , runtimeFor (definesTr m) m.lines provs eff
                 , ""
                 , runFor
                   host

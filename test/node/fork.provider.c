@@ -47,7 +47,7 @@ static V heff_fork_read(int fd) {
       cap *= 2;
     }
   }
-  V s = heff_str_utf8(buf, (int64_t)n);
+  V s = heff_str_bytes(buf, (int64_t)n);
   free(buf);
   return s;
 }
@@ -86,9 +86,10 @@ static V heff_fork_gather(V s) {
   if (heff_fork_depth == 0) return heff_cons(s, NTAG(TAG_Nil));
   heff_fork_spread *sp = &heff_fork_spreads[heff_fork_depth - 1];
   if (sp->self != 0) {
-    char *c = heff_cstr(s);
+    size_t n;
+    char *c = heff_bytes(s, &n);
     heff_drop(s);
-    heff_fork_write(sp->wfd, c, strlen(c));
+    heff_fork_write(sp->wfd, c, n);
     close(sp->wfd);
     _exit(0);
   }

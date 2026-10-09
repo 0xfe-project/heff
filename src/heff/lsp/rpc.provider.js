@@ -3,6 +3,10 @@
 // n` header, a blank line, then n bytes of JSON; stdout carries only the
 // messages, logs go to stderr -- and what of the host a language server
 // asks for (the shape of a provider is said in lib/std/dom.provider.js).
+// Its strings are text, a host of text's -- JSON's, and the paths and
+// URIs a client names, or that are made of them (`$toJs`, `$fromJs`) --
+// but for what it sends and logs, which is written out as it is
+// (`$toBytes`).
 import { fileURLToPath as $fileURLToPath, pathToFileURL as $pathToFileURL } from "node:url";
 import { join as $join, resolve as $resolve } from "node:path";
 import { readFileSync as $readFileSync, readdirSync as $readdirSync } from "node:fs";
@@ -16,9 +20,9 @@ export const rpc = () => {
     v === null ? { $: "JNull", a: [] }
     : typeof v === "boolean" ? { $: "JBool", a: [bool(v)] }
     : typeof v === "number" ? (Number.isInteger(v) ? { $: "JInt", a: [BigInt(v)] } : { $: "JFloat", a: [v] })
-    : typeof v === "string" ? { $: "JString", a: [v] }
+    : typeof v === "string" ? { $: "JString", a: [$fromJs(v)] }
     : Array.isArray(v) ? { $: "JArray", a: [list(v.map(json))] }
-    : { $: "JObject", a: [list(Object.entries(v).map(([k, x]) => ({ $: "MkPair", a: [k, json(x)] })))] };
+    : { $: "JObject", a: [list(Object.entries(v).map(([k, x]) => ({ $: "MkPair", a: [$fromJs(k), json(x)] })))] };
   // the messages read and not yet awaited; the await waiting for one
   const queue = [];
   let closed = false, waiting = null, listening = false;
@@ -96,20 +100,21 @@ export const rpc = () => {
         return;
       }
       case "Send": {
-        const body = Buffer.from(a[0], "utf8");
+        const body = $toBytes(a[0]);
         process.stdout.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "ascii"), body]), () => k(a[1]));
         return;
       }
-      case "Log": process.stderr.write("heff lsp: " + a[0] + "\n", () => k(a[1])); return;
+      case "Log": process.stderr.write(Buffer.concat([Buffer.from("heff lsp: "), $toBytes(a[0]), Buffer.from("\n")]), () => k(a[1])); return;
       case "Now": return k(a[0](BigInt(Date.now())));
-      case "ProjectFiles": return k(a[1](list(projectFiles(a[0]))));
+      case "ProjectFiles": return k(a[1](list(projectFiles($toJs(a[0])).map($fromJs))));
       case "UriPath": {
+        const u = $toJs(a[0]);
         let r = { $: "Nothing", a: [] };
-        try { if (a[0].startsWith("file:")) r = { $: "Just", a: [$fileURLToPath(a[0])] }; } catch (_) {}
+        try { if (u.startsWith("file:")) r = { $: "Just", a: [$fromJs($fileURLToPath(u))] }; } catch (_) {}
         return k(a[1](r));
       }
-      case "PathUri": return k(a[1]($pathToFileURL(a[0]).href));
-      case "AbsPath": return k(a[1]($resolve(a[0])));
+      case "PathUri": return k(a[1]($fromJs($pathToFileURL($toJs(a[0])).href)));
+      case "AbsPath": return k(a[1]($fromJs($resolve($toJs(a[0])))));
       case "Quit": { const code = Number(a[0]); process.stdout.write("", () => process.exit(code)); return; }
       default: throw new Error("heff: not an operation of rpc: " + (p && p.$));
     }

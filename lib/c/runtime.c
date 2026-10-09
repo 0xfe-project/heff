@@ -10,7 +10,9 @@
 // labels too (`LBL_x`), a record's fields in the order it was written
 // with them.  Strings are UTF-16 code units, as JavaScript's are, so
 // that what a program computes with them is what the other backends
-// compute.
+// compute; a provider gives one to the system, and makes one of what the
+// system gives, only through the runtime's helpers ("What providers
+// share" says which).
 //
 // An object is counted (Perceus): each owner of it holds a reference,
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
@@ -1210,7 +1212,8 @@ static V heff_str_ascii(const char *c) {
   return (V)s;
 }
 
-// (UTF-8 in, as read; UTF-16 kept)
+// (UTF-8 in, as read; UTF-16 kept.  The runtime's own: a provider
+// builds a string by what it crosses as, "What providers share")
 static V heff_str_utf8(const unsigned char *c, int64_t n) {
   Str *s = heff_str_new(n);
   int64_t k = 0;
@@ -1232,8 +1235,10 @@ static V heff_str_utf8(const unsigned char *c, int64_t n) {
 
 // (UTF-16 out, as UTF-8)
 // (a string written out as UTF-8: encoded into a buffer, written a
-// buffer at a time, not a byte -- each fputc takes the stream's lock)
-static void heff_put(FILE *f, V v) {
+// buffer at a time, not a byte -- each fputc takes the stream's lock.
+// The runtime's own, as heff_str_utf8 is: a provider writes by
+// `heff_put`)
+static void heff_put_utf8(FILE *f, V v) {
   Str *s = (Str *)v;
   unsigned char buf[8192];
   size_t n = 0;
@@ -1746,8 +1751,63 @@ static V heff_arrayToList(V a) {
 // What providers share
 // ---------------------------------------------------------------------
 
-// (a string as a C string, UTF-8, to give the system: malloc'd)
-static char *heff_cstr(V v) {
+static V heff_just(V x) { return heff_tag_n(TAG_Just, 1, &x); }
+#define heff_nothing NTAG(TAG_Nothing)
+
+static V heff_cons(V x, V rest) {
+  V f[2] = { x, rest };
+  return heff_tag_n(TAG_Cons, 2, f);
+}
+
+// A string crosses between the program and the system through these
+// alone: a provider neither reads a `Str`'s units nor makes one of its
+// own, and the runtime alone knows how a string is kept.  Which of them
+// it crosses by is what it is to the system:
+//
+// - content -- a file's, a stream's, a pipe's, what a command wrote,
+//   what was fetched -- is bytes, as they are: in by `heff_str_bytes`,
+//   out by `heff_put` or `heff_bytes`;
+// - a path is bytes too: out as a C string (`heff_cstr`), and a
+//   directory's names in (`heff_strs_bytes`);
+// - a name -- an argument of the program, the environment's, the
+//   working directory, the program's path, a command and its
+//   arguments -- and what a host of text has (JSON, a terminal's
+//   lines) are text: in by `heff_str_text` (`heff_str_text_n`,
+//   `heff_strs_text`), out by `heff_cstr_text`.
+//
+// A C string out is malloc'd, or NULL where the string cannot be one --
+// it has a NUL in it -- and the operation then fails (its `Nothing`, its
+// `False`).  For now a string is UTF-16 and the system's bytes UTF-8,
+// each of these encoding or decoding as text is, and none is NULL (a
+// NUL in the string ends the C string, as it did); where strings are
+// bytes, content and paths are those bytes, and text is made valid,
+// what is not UTF-8 in it U+FFFD.
+
+// (content in, `n` bytes, as a string)
+static V heff_str_bytes(const void *c, int64_t n) { return heff_str_utf8((const unsigned char *)c, n); }
+
+// (text in, `n` bytes of it, as a string)
+static V heff_str_text_n(const void *c, int64_t n) { return heff_str_utf8((const unsigned char *)c, n); }
+
+// (a C string of text in, as a string: a name)
+static V heff_str_text(const char *c) { return heff_str_text_n(c, (int64_t)strlen(c)); }
+
+// (C strings, a directory's names, as a list of strings)
+static V heff_strs_bytes(char **xs, int64_t n) {
+  V l = NTAG(TAG_Nil);
+  for (int64_t i = n - 1; i >= 0; i--) l = heff_cons(heff_str_bytes(xs[i], (int64_t)strlen(xs[i])), l);
+  return l;
+}
+
+// (C strings of text, names, as a list of strings)
+static V heff_strs_text(char **xs, int64_t n) {
+  V l = NTAG(TAG_Nil);
+  for (int64_t i = n - 1; i >= 0; i--) l = heff_cons(heff_str_text(xs[i]), l);
+  return l;
+}
+
+// (the string, UTF-8, as a C string: malloc'd)
+static char *heff_utf8_of(V v) {
   Str *s = (Str *)v;
   char *c = heff_alloc(s->len * 3 + 1), *o = c;
   for (int64_t i = 0; i < s->len; i++) {
@@ -1765,23 +1825,21 @@ static char *heff_cstr(V v) {
   return c;
 }
 
-// (a C string, UTF-8, as a string)
-static V heff_str_c(const char *c) { return heff_str_utf8((const unsigned char *)c, (int64_t)strlen(c)); }
+// (a path, as a C string to give the system: malloc'd, or NULL)
+static char *heff_cstr(V v) { return heff_utf8_of(v); }
 
-static V heff_just(V x) { return heff_tag_n(TAG_Just, 1, &x); }
-#define heff_nothing NTAG(TAG_Nothing)
+// (a name or text, as a C string to give the system: malloc'd, or NULL)
+static char *heff_cstr_text(V v) { return heff_utf8_of(v); }
 
-static V heff_cons(V x, V rest) {
-  V f[2] = { x, rest };
-  return heff_tag_n(TAG_Cons, 2, f);
+// (content out, malloc'd, `*n` bytes, a NUL after them)
+static char *heff_bytes(V v, size_t *n) {
+  char *c = heff_utf8_of(v);
+  *n = strlen(c);
+  return c;
 }
 
-// (C strings, as a list of strings)
-static V heff_strs(char **xs, int64_t n) {
-  V l = NTAG(TAG_Nil);
-  for (int64_t i = n - 1; i >= 0; i--) l = heff_cons(heff_str_c(xs[i]), l);
-  return l;
-}
+// (content written out to `f`)
+static void heff_put(FILE *f, V v) { heff_put_utf8(f, v); }
 
 // (C strings' order, for qsort)
 static int heff_cmp_cstr(const void *a, const void *b) {

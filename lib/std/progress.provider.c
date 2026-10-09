@@ -244,7 +244,11 @@ static void heff_st_show(V l) {
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n++;
   char **lines = heff_alloc((size_t)(n ? n : 1) * sizeof(char *));
   int i = 0;
-  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) lines[i++] = heff_cstr(heff_field(c, 0));
+  // (a line with a NUL in it, which cannot be a C string, drawn empty)
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
+    char *line = heff_cstr_text(heff_field(c, 0));
+    lines[i++] = line ? line : strdup("");
+  }
   heff_st_lock();
   if (heff_st_same(lines, n)) {
     heff_st_unlock();
@@ -287,7 +291,7 @@ static V heff_st_kids(const unsigned char *pk) {
     char name[121];
     memcpy(name, s + 8, 120);
     name[120] = 0;
-    V f[4] = { heff_str_c(name), MK_INT(done), MK_INT(total == 0xFFFFFFFFu ? 0 : total), MK_INT(pk[1 + n * 128 + i]) };
+    V f[4] = { heff_str_text(name), MK_INT(done), MK_INT(total == 0xFFFFFFFFu ? 0 : total), MK_INT(pk[1 + n * 128 + i]) };
     l = heff_cons(heff_tag(TAG_MkKid, 4, f), l);
   }
   return l;
@@ -386,29 +390,36 @@ static V heff_provider_terminal(V p, V k) {
     return heff_tail(k, 1, &x);
   }
   case TAG_ShowRun: {
-    char *c = heff_cstr(heff_field(p, 0));
+    // (a command with a NUL in its name or an argument is not run: -1
+    // its status, as where it cannot be)
+    char *c = heff_cstr_text(heff_field(p, 0));
+    int ok = c != NULL;
     int64_t n = 0;
     for (V l = heff_field(p, 1); heff_tag_of(l) == TAG_Cons; l = heff_field(l, 1)) n++;
     char **as = heff_alloc((size_t)(n + 2) * sizeof(char *));
     as[0] = c;
     int64_t i = 1;
-    for (V l = heff_field(p, 1); heff_tag_of(l) == TAG_Cons; l = heff_field(l, 1)) as[i++] = heff_cstr(heff_field(l, 0));
+    for (V l = heff_field(p, 1); heff_tag_of(l) == TAG_Cons; l = heff_field(l, 1)) {
+      as[i] = heff_cstr_text(heff_field(l, 0));
+      ok = ok && as[i] != NULL;
+      i++;
+    }
     as[i] = NULL;
     V f = heff_dup(heff_field(p, 2)), r = heff_dup(heff_field(p, 3));
     heff_drop(p);
     Buf bo = {0}, be = {0};
 #ifdef _WIN32
-    int64_t status = heff_capture(as, &bo, &be);
+    int64_t status = ok ? heff_capture(as, &bo, &be) : -1;
 #else
-    int64_t status = heff_st_terminal() && !heff_st_over ? heff_st_capture(as, &bo, &be, f) : heff_capture(as, &bo, &be);
+    int64_t status = !ok ? -1 : heff_st_terminal() && !heff_st_over ? heff_st_capture(as, &bo, &be, f) : heff_capture(as, &bo, &be);
 #endif
     heff_drop(f);
     for (int64_t j = 0; j < i; j++) free(as[j]);
     free(as);
     V fs[3] = {
       MK_INT(status),
-      heff_str_utf8((const unsigned char *)(bo.s ? bo.s : ""), (int64_t)bo.n),
-      heff_str_utf8((const unsigned char *)(be.s ? be.s : ""), (int64_t)be.n),
+      heff_str_bytes(bo.s ? bo.s : "", (int64_t)bo.n),
+      heff_str_bytes(be.s ? be.s : "", (int64_t)be.n),
     };
     free(bo.s);
     free(be.s);

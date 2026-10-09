@@ -69,7 +69,7 @@ static V net_fetch(const char *u) {
     }
     free(err.s);
   }
-  V s = heff_str_utf8((const unsigned char *)(b.s ? b.s : ""), (int64_t)b.n);
+  V s = heff_str_bytes(b.s ? b.s : "", (int64_t)b.n);
   free(b.s);
   return s;
 }
@@ -77,10 +77,10 @@ static V net_fetch(const char *u) {
 static V heff_provider_net(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Fetch: {
-    char *u = heff_cstr(heff_field(p, 0));
+    char *u = heff_cstr_text(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    V t = net_fetch(u);
+    V t = u ? net_fetch(u) : heff_str_text("TypeError: fetch failed");
     free(u);
     V x = heff_answer(f, t);
     return heff_tail(k, 1, &x);
