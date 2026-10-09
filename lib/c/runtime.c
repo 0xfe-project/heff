@@ -109,24 +109,6 @@ typedef struct { Obj h; int64_t n; uint32_t *lbl; V f[]; } Rec;
 typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V memo; V env[]; } Clo;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
 typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
-// (a string written in the program, static: the emitter gives both its
-// UTF-16 code units and its UTF-8 bytes, `HEFF_STR`, and the runtime
-// takes those its strings are, the bytes -- `HEFF_STR8` is defined; an
-// ASCII one, the same in both, its units once, `HEFF_STRA`; an empty
-// one's list `(0)`)
-#define HEFF_STR8 1
-#define HEFF_ID(...) __VA_ARGS__
-#ifdef HEFF_STR8
-#define HEFF_UNIT uint8_t
-#define HEFF_STR(name, n16, u16, n8, u8) \
-  static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n8) ? (n8) : 1]; } name = {{0x80000000u, K_STR, 0}, n8, n8, {HEFF_ID u8}}
-#else
-#define HEFF_UNIT uint16_t
-#define HEFF_STR(name, n16, u16, n8, u8) \
-  static struct { Obj h; int64_t len; int64_t cap; uint16_t s[(n16) ? (n16) : 1]; } name = {{0x80000000u, K_STR, 0}, n16, n16, {HEFF_ID u16}}
-#endif
-#define HEFF_STRA(name, n, us) \
-  static struct { Obj h; int64_t len; int64_t cap; HEFF_UNIT s[(n) ? (n) : 1]; } name = {{0x80000000u, K_STR, 0}, n, n, {HEFF_ID us}}
 // (a string written in the program, static: its `n` bytes, as a C string
 // literal has them -- the NUL C ends it with, after them, no byte of it)
 #define HEFF_LIT(name, n, bytes) \
