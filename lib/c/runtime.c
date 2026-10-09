@@ -27,7 +27,9 @@
 // function counts itself and every so often gives back a bounce (`K_BNC`),
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
 // backend does (src/heff/compile/emit.hf, "Tail calls") -- unless it is a jump
-// (`HEFF_LAST`), from a lambda to a closure of as many parameters.
+// (`HEFF_LAST`), from a lambda to a closure of as many parameters.  A
+// call not last of a closure of as many parameters is made where it is
+// (`heff_call`), not through `heff_apply`.
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -721,6 +723,17 @@ static V heff_apply(V f, int n, V *a) {
 }
 
 static inline V heff_app1(V f, V x) { return heff_apply(f, 1, &x); }
+
+// (a call not last of an unknown function: a closure taking exactly the
+// arguments given, and not a thunk forced, called at once, where the
+// call is -- what `heff_apply` would call, without the call of it;
+// anything else through it)
+HEFF_FAST V heff_call(V f, int n, V *a) {
+  Clo *c = (Clo *)f;
+  if (c->h.kind == K_CLO && c->arity == n && !(n == 1 && a[0] == NTAG(TAG_MkUnit)))
+    return c->fn(f, a);
+  return heff_apply(f, n, a);
+}
 
 // (whether `f`, given the `n` arguments at `a`, is a closure taking
 // exactly them and not a thunk forced -- what `heff_apply` would call at
