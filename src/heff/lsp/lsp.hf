@@ -23,6 +23,7 @@ import heff.elab.params as Pm
 import heff.build.query as Q
 import heff.lsp.render as Dg
 import heff.lsp.rpc as R
+import heff.util.rune as Rn
 import heff.build.session as Se
 import map as M
 import std.filesystem
@@ -115,24 +116,64 @@ message fs = obj (Cons (kv "jsonrpc" (jstr "2.0")) fs)
 lineEnd : String -> Int -> Int
 lineEnd src i = fromMaybe (strLength src) (indexFrom "\n" src i)
 
--- | an LSP position (a line, and UTF-16 code units into it) as an
--- | offset: a heff string is JavaScript's, indexed by code units too
+-- An LSP position is a line and UTF-16 code units into it, the
+-- protocol's default (and all VS Code speaks); a heff string's units are
+-- not said to be those, so a line is walked a rune at a time, each one
+-- unit of UTF-16 or, beyond U+FFFF, two.
+
+-- (how many units of UTF-16 a rune takes)
+units16 : Int -> Int
+units16 c = if c >= 65536 then 2 else 1
+
+-- (the units of UTF-16 of the runes that start from `i` and before `j`,
+-- `n` more)
+units16Go : String -> Int -> Int -> Int -> Int
+units16Go src i j n =
+  if i >= j || i >= strLength src then n
+  else if charCode src i < 128 then units16Go src (i + 1) j (n + 1)
+  else (let r = Rn.runeAt src i
+        in units16Go src (i + r.width) j (n + units16 r.code))
+
+-- (from `i`, `n` units of UTF-16 in, by the line's end `e`: the start of
+-- the rune there, or `e`)
+offset16 : String -> Int -> Int -> Int -> Int
+offset16 src i e n =
+  if n <= 0 || i >= e then min i e
+  else if charCode src i < 128 then offset16 src (i + 1) e (n - 1)
+  else (let r = Rn.runeAt src i
+        in offset16 src (i + r.width) e (n - units16 r.code))
+
+-- (line `line` and `ch` units into it, from line `l`, which starts at `i`)
 offsetGo : String -> Int -> Int -> Int -> Int -> Int
 offsetGo src line ch i l =
-  if l >= line then min (i + max 0 ch) (lineEnd src i)
+  if l >= line then offset16 src i (lineEnd src i) ch
   else case indexFrom "\n" src i of
     Just e -> offsetGo src line ch (e + 1) (l + 1)
     Nothing -> strLength src
 
+-- | an LSP position as an offset
+-- | >>> List.map (offsetOf "a\n😀bc" 1) [0, 2, 3, 9]
+-- | [2, strLength "a\n😀", strLength "a\n😀b", strLength "a\n😀bc"]
 offsetOf : String -> Int -> Int -> Int
 offsetOf src line ch = offsetGo src line ch 0 0
 
+-- (`i`, on its line and column)
+positionAt : String -> Int -> Dg.LineCol -> Json
+positionAt src i lc =
+  obj
+    [ kv "line" (num lc.line)
+    , kv "character" (num (units16Go src (i - lc.off) i 0))
+    ]
+
+-- | an offset as an LSP position
+-- | >>> List.map (\i -> stringify (position "a\n😀bc" i)) [2, strLength "a\n😀", 99]
+-- | ["{\"line\":1,\"character\":0}", "{\"line\":1,\"character\":2}", "{\"line\":1,\"character\":4}"]
 position : String -> Int -> Json
 position src i =
-  obj
-    [ kv "line" (num (Dg.lineCol src (max 0 (min (strLength src) i))).line)
-    , kv "character" (num (Dg.lineCol src (max 0 (min (strLength src) i))).col)
-    ]
+  positionAt
+    src
+    (max 0 (min (strLength src) i))
+    (Dg.lineCol src (max 0 (min (strLength src) i)))
 
 range : String -> Pm.Span -> Json
 range src sp =

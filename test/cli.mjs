@@ -270,10 +270,10 @@ writeFileSync(join(work, "diag.hf"), [
   "data C = R | G | B", "",
   "name : C -> String", "name c = case c of", "  R -> \"red\"", "  G -> \"green\"", "",
 ].join("\n"));
-const withEnv = (extra) => {
+const withEnv = (extra, file = "diag.hf") => {
   const env = { ...process.env, ...extra };
   for (const k of ["HEFF_TTY", "NO_COLOR"]) if (!(k in extra)) delete env[k];
-  return spawnSync(heffBin, ["check", "diag.hf"], { cwd: work, encoding: "utf8", env });
+  return spawnSync(heffBin, ["check", file], { cwd: work, encoding: "utf8", env });
 };
 const esc = "\u001b";
 const plain = withEnv({});
@@ -293,6 +293,17 @@ expect("a diagnostic, on a terminal", tty.status === 1 &&
   tty.stderr.replace(/\u001b\[[0-9;]*m/g, "") === plain.stderr, tty);
 const noColor = withEnv({ HEFF_TTY: "1", NO_COLOR: "1" });
 expect("a diagnostic, NO_COLOR", noColor.status === 1 && noColor.stderr === plain.stderr, noColor);
+
+// a diagnostic's column is of runes, and so are its marks: one beyond
+// U+FFFF is one column, whatever units it takes; a character no token
+// starts with is whole
+writeFileSync(join(work, "astral.hf"), 's : Int\ns = {- 😀 -} "😀"\n\nt : Int\nt = 1 😀 2\n');
+const astral = withEnv({}, "astral.hf");
+expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
+  astral.stderr.includes('astral.hf:2:13\nerror[E0311]: expected type Int, but got type String\n2 | s = {- 😀 -} "😀"\n2 |             ^^^\n') &&
+  astral.stderr.includes("astral.hf:5:7\nerror[E0150]: unexpected character 😀\n5 | t = 1 😀 2\n5 |       ^\n") &&
+  astral.stderr.includes("astral.hf:5:5\nerror[E0302]: tried to apply a value that was not of a function type\n5 | t = 1 😀 2\n5 |     ^^^^^\n") &&
+  !astral.stderr.includes("�"), astral);
 
 console.log(`cli: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);

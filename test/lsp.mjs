@@ -80,6 +80,23 @@ try {
   expect("a deep file", ds.length === 0, ds);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-deep.hf") } });
 
+  // a position is UTF-16 code units into its line: a rune beyond U+FFFF
+  // two of them, before a span and in it; a character no token starts
+  // with whole, its message text
+  const astral = 's : Int\ns = {- 😀 -} "😀"\n\nt : Int\nt = 1 😀 2\n\nu : Int\nu = {- 😀 -} t\n';
+  open("test/surface/lsp-astral.hf", astral);
+  ds = await diagnosticsOf(uri("test/surface/lsp-astral.hf"));
+  const strAt = pos(astral, '"😀"'), runeAt = pos(astral, "😀", 2);
+  const e311 = ds.find((d) => d.code === "E0311"), e150 = ds.find((d) => d.code === "E0150");
+  expect("a diagnostic past a rune beyond U+FFFF", e311 && e311.range.start.line === strAt.line && e311.range.start.character === strAt.character &&
+    e311.range.end.character === strAt.character + 4, ds);
+  expect("a character no token starts with, beyond U+FFFF", e150 && e150.message.includes("unexpected character 😀") &&
+    e150.range.start.line === runeAt.line && e150.range.start.character === runeAt.character && e150.range.end.character === runeAt.character + 2, ds);
+  const tAt = pos(astral, "-} t");
+  const tHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-astral.hf") }, position: { line: tAt.line, character: tAt.character + 3 } });
+  expect("hover past a rune beyond U+FFFF", tHover.result && tHover.result.contents.value.includes("t : Int"), tHover.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-astral.hf") } });
+
   // a type error, in the editor's text (not the file's)
   const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = inv (inv "x")\n';
   open("test/modules/src/b.hf", bad);

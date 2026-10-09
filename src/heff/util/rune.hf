@@ -2,10 +2,14 @@
 -- a 32-bit value, as Go's `rune` is (lib/rune.hf has its operations);
 -- here an `Int`.  One that is no Unicode scalar value -- a surrogate,
 -- U+D800 to U+DFFF, one beyond U+10FFFF, or one below 0 -- no literal
--- is, and a string has U+FFFD for it, as Go's does.  A string is UTF-16
--- code units on every backend (lib/c/runtime.c): a rune beyond U+FFFF is
--- two of them, a surrogate pair, and a surrogate not in a pair is read
--- as U+FFFD.
+-- is, and a string has U+FFFD for it, as Go's does.  What a string's
+-- units are -- UTF-16 code units on every backend now (lib/c/runtime.c),
+-- UTF-8 bytes to be -- nothing here says: a rune is read and written
+-- only by the prelude's `runes` and `ofRunes`, which read ill-formed
+-- units (a surrogate not in a pair, a byte of no rune) as U+FFFD.  An
+-- ASCII character is one unit, of its code, in either.
+
+import rune as Ru
 
 -- | whether it is a Unicode scalar value: what a literal may be, and what
 -- | a string holds of it
@@ -16,14 +20,6 @@ isScalar c = 0 <= c && c <= 1114111 && not (55296 <= c && c <= 57343)
 -- | value, and where it has a surrogate not in a pair
 replacement : Int
 replacement = 65533
-
--- | the first of a surrogate pair
-isHigh : Int -> Bool
-isHigh c = 55296 <= c && c <= 56319
-
--- | the second
-isLow : Int -> Bool
-isLow c = 56320 <= c && c <= 57343
 
 hexWith : String -> Int -> String
 hexWith digits n =
@@ -43,48 +39,84 @@ padTo4 s = if strLength s >= 4 then s else padTo4 ("0" ^ s)
 codeName : Int -> String
 codeName c = "U+" ^ padTo4 (hexWith "0123456789ABCDEF" c)
 
--- | the string of one rune: a code unit, or a surrogate pair
+-- | the string of one rune (of one that is no scalar value, U+FFFD)
 encode : Int -> String
-encode c =
-  if not (isScalar c) then fromCharCode replacement
-  else if c < 65536 then fromCharCode c
-  else fromCharCode (55296 + (c - 65536) / 1024)
-    ^ fromCharCode (56320 + (c - 65536) % 1024)
-
--- | the string of runes
-encodeAll : List Int -> String
-encodeAll cs = joinWith "" (List.map encode cs)
-
--- | whether a surrogate pair starts at `i`
-pairAt : String -> Int -> Bool
-pairAt s i = isHigh (charCode s i) && isLow (charCode s (i + 1))
-
--- | the rune at `i` (a surrogate pair's, where one starts there; a
--- | surrogate of none, U+FFFD)
-codeAt : String -> Int -> Int
-codeAt s i =
-  if pairAt s i
-    then 65536 + (charCode s i - 55296) * 1024 + (charCode s (i + 1) - 56320)
-  else if isHigh (charCode s i) || isLow (charCode s i) then replacement
-  else charCode s i
-
--- | how many code units it takes
-widthAt : String -> Int -> Int
-widthAt s i = if pairAt s i then 2 else 1
-
--- (the runes from `i` on, into `acc`, last first)
-decodeFrom : String -> Int -> List Int -> List Int
-decodeFrom s i acc =
-  if i >= strLength s then List.reverse acc
-  else decodeFrom s (i + widthAt s i) (Cons (codeAt s i) acc)
+encode c = ofRunes [Ru.fromInt (if isScalar c then c else replacement)]
 
 -- | a string's runes
--- | >>> decode (encodeAll [97, 233, 128512, 55296, 1114112])
+-- | >>> decode (ofRunes (List.map Ru.fromInt [97, 233, 128512, 55296, 1114112]))
 -- | Cons 97 (Cons 233 (Cons 128512 (Cons 65533 (Cons 65533 Nil))))
--- | >>> decode ("a" ^ fromCharCode 55357 ^ "b" ^ fromCharCode 56832)
--- | Cons 97 (Cons 65533 (Cons 98 (Cons 65533 Nil)))
 decode : String -> List Int
-decode s = decodeFrom s 0 Nil
+decode s = List.map Ru.toInt (runes s)
+
+-- | a rune, and how many units of a string it takes
+type RuneAt = { code : Int, width : Int }
+
+-- (the rune the units from `i` start with: `r`, where they are `e`, its
+-- units, else U+FFFD, of one)
+wholeAt : String -> Int -> Int -> String -> RuneAt
+wholeAt s i r e =
+  if strEq e (strSlice s i (i + strLength e))
+    then { code = r, width = strLength e }
+  else { code = replacement, width = 1 }
+
+-- (the first of runes; of none, U+FFFD)
+firstCode : List Int -> Int
+firstCode Nil = replacement
+firstCode (Cons c _) = c
+
+-- (the rune `r`, at `i`, if the units there are its)
+codeOf : String -> Int -> Int -> RuneAt
+codeOf s i r = wholeAt s i r (encode r)
+
+-- | the rune at `i`, and how many units it takes: an ASCII character's
+-- | unit is its code, and of another the first rune of the four units
+-- | from `i` -- as many as a rune takes, at most -- is the one there,
+-- | where they start with its units; of ill-formed ones, U+FFFD of one;
+-- | out of the string, `-1` of one
+-- | >>> List.map (\i -> (runeAt "a😀b" i).code) [0, 1, strLength "a😀", strLength "a😀b"]
+-- | [97, 128512, 98, -1]
+-- | >>> List.map (\i -> (runeAt "a😀b" i).width) [0, 1, 2, strLength "a😀"]
+-- | Cons 1 (Cons (strLength "😀") (Cons 1 (Cons 1 Nil)))
+runeAt : String -> Int -> RuneAt
+runeAt s i =
+  if charCode s i < 128 then { code = charCode s i, width = 1 }
+  else codeOf s i (firstCode (decode (strSlice s i (i + 4))))
+
+-- | the rune at `i`
+codeAt : String -> Int -> Int
+codeAt s i = (runeAt s i).code
+
+-- | how many units it takes
+widthAt : String -> Int -> Int
+widthAt s i = (runeAt s i).width
+
+-- (how many runes start from `i` and end by `j`, those from `i` on)
+runesGo : String -> Int -> Int -> Int -> Int
+runesGo s i j n =
+  if i >= j || i >= strLength s then n
+  else if charCode s i < 128 then runesGo s (i + 1) j (n + 1)
+  else (let w = widthAt s i
+        in if i + w > j then n else runesGo s (i + w) j (n + 1))
+
+-- | how many runes are between `i` and `j`, those that end by `j` (one
+-- | that `j` cuts is not): a column, `i` where its line starts
+-- | >>> List.map (runesBetween "a😀b" 0) [0, 1, 2, strLength "a😀", strLength "a😀b"]
+-- | Cons 0 (Cons 1 (Cons 1 (Cons 2 (Cons 3 Nil))))
+runesBetween : String -> Int -> Int -> Int
+runesBetween s i j = runesGo s i j 0
+
+-- (the start of the rune `k` is in, from `i`, a rune's start, on)
+runeStartGo : String -> Int -> Int -> Int
+runeStartGo s i k =
+  if i >= strLength s then i
+  else (let w = widthAt s i in if i + w > k then i else runeStartGo s (i + w) k)
+
+-- | where the rune `k` is in starts: `k`, where one starts there
+-- | >>> List.map (runeStart "a😀b") [0, 1, 2, strLength "a😀"]
+-- | Cons 0 (Cons 1 (Cons 1 (Cons (strLength "a😀") Nil)))
+runeStart : String -> Int -> Int
+runeStart s k = runeStartGo s 0 k
 
 -- (a control character: C0's, DEL and C1's, written as an escape)
 isControl : Int -> Bool

@@ -26,7 +26,11 @@ type Cmt = { start : Int, end : Int, text : String }
 type Lexed = { tokens : List Tok, errors : List Err, comments : List Cmt }
 
 -- | One thing read: where the loop is after it, the line bookkeeping, and
--- | the token, error or comment it found, if any.
+-- | the token, error or comment it found, if any.  A column is of runes:
+-- | `lineStart` is where the line starts, on by as many units as its
+-- | runes before `i` take beyond one each (in a string, a rune literal,
+-- | a comment or a character no token starts with, where a rune may be
+-- | more than one unit), so that it is `i - lineStart`.
 type Step =
   { i : Int
   , line : Int
@@ -344,6 +348,11 @@ operandBefore (Cons t _) start =
         ["var", "con", "int", "float", "str", "rune", "field"]
       || strEq t.kind "punct" && List.elemBy strEq t.text [")", "]", "}"])
 
+-- (`lineStart`, past the units from `i` to `j`: on by those of a rune
+-- beyond its first)
+skewed : String -> Int -> Int -> Int -> Int
+skewed src lineStart i j = lineStart + (j - i) - R.runesBetween src i j
+
 mkTok : String -> String -> Int -> Int -> Int -> Int -> Bool -> Tok
 mkTok kind text start end line col first =
   { kind = kind
@@ -423,7 +432,7 @@ strStep : String -> Int -> Int -> Int -> Bool -> StrEnd -> Step
 strStep src i line lineStart first r =
   { i = if r.closed then r.i + 1 else r.i
   , line = line
-  , lineStart = lineStart
+  , lineStart = skewed src lineStart i (if r.closed then r.i + 1 else r.i)
   , first = False
   , tok =
       Just
@@ -441,29 +450,34 @@ strStep src i line lineStart first r =
   , cmt = Nothing
   }
 
--- (a character no token starts with)
-unexpectedStep : String -> Int -> Int -> Int -> Bool -> Step
-unexpectedStep src i line lineStart first =
-  { i = i + 1
+-- (a character no token starts with, of `w` units)
+unexpectedOf : String -> Int -> Int -> Int -> Bool -> Int -> Step
+unexpectedOf src i line lineStart first w =
+  { i = i + w
   , line = line
-  , lineStart = lineStart
+  , lineStart = lineStart + w - 1
   , first = first
   , tok = Nothing
   , err =
       Just
         { start = i
-        , end = i + 1
-        , msg = "unexpected character " ^ strSlice src i (i + 1)
+        , end = i + w
+        , msg = "unexpected character " ^ strSlice src i (i + w)
         }
   , cmt = Nothing
   }
+
+-- | a character no token starts with: the whole of its rune
+unexpectedStep : String -> Int -> Int -> Int -> Bool -> Step
+unexpectedStep src i line lineStart first =
+  unexpectedOf src i line lineStart first (R.widthAt src i)
 
 -- (a rune's token: its text the rune, as a string)
 runeStep : String -> Int -> Int -> Int -> Bool -> CodeEnd -> Step
 runeStep src i line lineStart first r =
   { i = r.end
   , line = line
-  , lineStart = lineStart
+  , lineStart = skewed src lineStart i r.end
   , first = False
   , tok =
       Just (mkTok "rune" (R.encode r.code) i r.end line (i - lineStart) first)
@@ -491,11 +505,15 @@ lineCmtStep src i line lineStart first e =
   , cmt = Just { start = i, end = e, text = strSlice src i e }
   }
 
-blockCmtStep : String -> Int -> BlockEnd -> Step
-blockCmtStep src i r =
+-- (a `{- -}` comment, from `i`, of a line from `lineStart`; where it
+-- ends, its last line's start, on by its runes' units after the first)
+blockCmtStep : String -> Int -> Int -> BlockEnd -> Step
+blockCmtStep src i lineStart r =
   { i = r.i
   , line = r.line
-  , lineStart = r.lineStart
+  , lineStart =
+      if r.lineStart == lineStart then skewed src lineStart i r.i
+      else skewed src r.lineStart r.lineStart r.i
   , first = r.first
   , tok = Nothing
   , err =
@@ -545,7 +563,7 @@ stepAt src i line lineStart first toks c =
   && not (isSymC (charCode src (dashesEnd src i)))
     then lineCmtStep src i line lineStart first (eolEnd src i)
   else if c == 123 && charCode src (i + 1) == 45
-    then blockCmtStep src i (blockScan src i 0 line lineStart first)
+    then blockCmtStep src i lineStart (blockScan src i 0 line lineStart first)
   else if isLetterC c then nameStep src i line lineStart first (nameEnd src i)
   else if c == 46 && isLetterC (charCode src (i + 1)) && operandBefore toks i
     then fieldStep src i line lineStart first (plainEnd src (i + 1))
@@ -714,3 +732,15 @@ test lexing
 
 -- >>> tokFirsts (lex "ab cd\n  ef")
 -- Cons True (Cons False (Cons True (Cons True Nil)))
+
+-- (a column is of runes: a rune beyond U+FFFF, or any not ASCII, one
+-- column, in a string, a rune literal, a comment, or where unexpected)
+-- >>> tokCols (lex "\"😀é\" x '😀' y {- é😀 -} z 😀 w")
+-- [0, 5, 7, 11, 22, 26, 0]
+
+-- >>> tokCols (lex "{- 😀\n😀 -} a\n  b")
+-- [5, 2, 0]
+
+-- (a character no token starts with, whole)
+-- >>> errMsgs (lex "a 😀 é b")
+-- Cons "unexpected character 😀" (Cons "unexpected character é" Nil)
