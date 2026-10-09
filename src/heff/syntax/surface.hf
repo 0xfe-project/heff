@@ -17,6 +17,7 @@ import heff.syntax.fmt.toks as Tk
 import heff.elab.params as Pm
 import heff.syntax.presyntax as Notation
 import heff.util.rune as Rn
+import map as Mp
 
 type Binders = { f : String, names : List String, implicits : List String }
 
@@ -25,14 +26,15 @@ mkBinders f names implicits = { f = f, names = names, implicits = implicits }
 
 -- | `toks`: the tokens read (the lowering looks one past a parenthesis);
 -- | `scope`: the names bound where the lowering is; `binders`: the names
--- | each signature binds; `patVars`: those of the equation being lowered;
--- | `fix`: the fixities in scope; `lenient`: unrelated operators bind as
--- | one left-associative group (the formatter's reading)
+-- | each signature binds, by the name it is of (the last read first);
+-- | `patVars`: those of the equation being lowered; `fix`: the fixities
+-- | in scope; `lenient`: unrelated operators bind as one left-associative
+-- | group (the formatter's reading)
 type St =
   { toks : Array C.T
   , scope : List String
   , known : String -> Bool
-  , binders : List Binders
+  , binders : Mp.Map String (List Binders)
   , patVars : List String
   , fix : F.Fixities
   , lenient : Bool
@@ -69,7 +71,7 @@ diag span msg =
 mkSt : Array C.T
      -> List String
      -> (String -> Bool)
-     -> List Binders
+     -> Mp.Map String (List Binders)
      -> List String
      -> F.Fixities
      -> Bool
@@ -87,7 +89,7 @@ mkSt toks scope known binders patVars fix lenient =
 setScope : List String -> St -> St
 setScope sc s = mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient
 
-setBinders : List Binders -> St -> St
+setBinders : Mp.Map String (List Binders) -> St -> St
 setBinders b s = mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient
 
 setPatVars : List String -> St -> St
@@ -607,24 +609,47 @@ defOf : String
       -> Notation.Decl
 defOf f fsp ty sp eqs = At (DeclEquations f fsp ty eqs) sp
 
-eqnsOf : String
-       -> List Item
-       -> List (Pm.Spanned (Notation.Equation Notation.Expr))
-eqnsOf f Nil = Nil
-eqnsOf f (Cons (Eqn g e esp) rest) =
-  if strEq g f then Cons e (eqnsOf f rest) else eqnsOf f rest
-eqnsOf f (Cons _ rest) = eqnsOf f rest
+-- | the equations of a name, in order, and where the last of them ends
+type Eqns =
+  { eqns : List (Pm.Spanned (Notation.Equation Notation.Expr)), end : Int }
 
-eqnEnd : String -> List Item -> Int -> Int
-eqnEnd f Nil e = e
-eqnEnd f (Cons (Eqn g _ esp) rest) e =
-  if strEq g f then eqnEnd f rest (maxI e esp.end) else eqnEnd f rest e
-eqnEnd f (Cons _ rest) e = eqnEnd f rest e
+-- (`e` before the equations `rest` of its name has after it)
+eqnsCons : Pm.Spanned (Notation.Equation Notation.Expr)
+         -> Pm.Span
+         -> Maybe Eqns
+         -> Eqns
+eqnsCons e esp Nothing = { eqns = Cons e Nil, end = esp.end }
+eqnsCons e esp (Just rest) =
+  { eqns = Cons e rest.eqns, end = maxI esp.end rest.end }
 
-assembleOne : List String -> List Item -> Item -> Maybe Notation.Decl
-assembleOne broken items (Whole d) = Just d
-assembleOne broken items (Doc d) = Just d
-assembleOne broken items (Sig f fsp ty sp) =
+eqnsAdd : String
+        -> Pm.Spanned (Notation.Equation Notation.Expr)
+        -> Pm.Span
+        -> Mp.Map String Eqns
+        -> Mp.Map String Eqns
+eqnsAdd g e esp m =
+  Mp.insert compareString g (eqnsCons e esp (Mp.lookup compareString g m)) m
+
+-- | each name's equations: one pass, not one for each signature
+eqnsByName : List Item -> Mp.Map String Eqns
+eqnsByName Nil = Mp.empty
+eqnsByName (Cons (Eqn g e esp) rest) = eqnsAdd g e esp (eqnsByName rest)
+eqnsByName (Cons _ rest) = eqnsByName rest
+
+assembleSig : String
+            -> Pm.Span
+            -> Notation.Expr
+            -> Pm.Span
+            -> Maybe Eqns
+            -> Maybe Notation.Decl
+assembleSig f fsp ty sp Nothing = Nothing
+assembleSig f fsp ty sp (Just es) =
+  Just (defOf f fsp ty (mkSpan sp.start (maxI sp.end es.end)) es.eqns)
+
+assembleOne : List String -> Mp.Map String Eqns -> Item -> Maybe Notation.Decl
+assembleOne broken byName (Whole d) = Just d
+assembleOne broken byName (Doc d) = Just d
+assembleOne broken byName (Sig f fsp ty sp) =
   if List.elemBy strEq f broken
     then Just
         (defOf
@@ -636,41 +661,38 @@ assembleOne broken items (Sig f fsp ty sp) =
              (MkEquation f fsp Nil (At (EWord AbandonWord) sp))
              (Notation.spanning fsp sp)
            ])
-  else if List.length (eqnsOf f items) == 0 then Nothing
-  else Just
-      (defOf
-         f
-         fsp
-         ty
-         (mkSpan sp.start (eqnEnd f items sp.end))
-         (eqnsOf f items))
-assembleOne broken items (Eqn _ _ _) = Nothing
+  else assembleSig f fsp ty sp (Mp.lookup compareString f byName)
+assembleOne broken byName (Eqn _ _ _) = Nothing
 
 assemble : List String -> List Item -> List Notation.Decl
 assemble broken items =
-  catMaybesS (List.map (\it -> assembleOne broken items it) items)
+  catMaybesS (List.map (assembleOne broken (eqnsByName items)) items)
 
-sigNames : List Item -> List String
-sigNames Nil = Nil
-sigNames (Cons (Sig f _ _ _) rest) = Cons f (sigNames rest)
+-- | the names with a signature
+sigNames : List Item -> Mp.Map String Unit
+sigNames Nil = Mp.empty
+sigNames (Cons (Sig f _ _ _) rest) =
+  Mp.insert compareString f MkUnit (sigNames rest)
 sigNames (Cons _ rest) = sigNames rest
 
-eqnNames : List Item -> List String
-eqnNames Nil = Nil
-eqnNames (Cons (Eqn f _ _) rest) = Cons f (eqnNames rest)
+-- | the names with an equation
+eqnNames : List Item -> Mp.Map String Unit
+eqnNames Nil = Mp.empty
+eqnNames (Cons (Eqn f _ _) rest) =
+  Mp.insert compareString f MkUnit (eqnNames rest)
 eqnNames (Cons _ rest) = eqnNames rest
 
 assembleDiagOne : List String
-                -> List String
-                -> List String
+                -> Mp.Map String Unit
+                -> Mp.Map String Unit
                 -> Item
                 -> Maybe Diag
 assembleDiagOne broken sigs eqns (Sig f _ _ sp) =
-  if not (List.elemBy strEq f eqns) && not (List.elemBy strEq f broken)
+  if not (Mp.member compareString f eqns) && not (List.elemBy strEq f broken)
     then Just (diag sp ("`" ^ f ^ "` has a type but no definition"))
   else Nothing
 assembleDiagOne broken sigs eqns (Eqn f _ sp) =
-  if not (List.elemBy strEq f sigs) && not (List.elemBy strEq f broken)
+  if not (Mp.member compareString f sigs) && not (List.elemBy strEq f broken)
     then Just (diag sp ("`" ^ f ^ "` needs a type: `" ^ f ^ " : ...`"))
   else Nothing
 assembleDiagOne broken sigs eqns (Whole _) = Nothing
@@ -1339,20 +1361,22 @@ firstStart (Cons t _) = t.start
 firstStart Nil = 0
 
 bindersFor : St -> String -> List Binders
-bindersFor s f = List.filter (\(b : Binders) -> strEq b.f f) s.binders
+bindersFor s f = fromMaybe Nil (Mp.lookup compareString f s.binders)
+
+-- | `b` the binders of the signature last read of its name
+addBinders : Binders -> St -> St
+addBinders b s =
+  setBinders
+    (Mp.insert compareString b.f (Cons b (bindersFor s b.f)) s.binders)
+    s
 
 sigL : Lw -> List C.T -> C.E -> P (List Item)
 sigL r names ty = do
   ty' <- r.e ty
   pModify
       (\s ->
-         setBinders
-           (Cons
-              (mkBinders
-                 (declNameOf names).name
-                 (piBinders ty')
-                 (piImplicits ty'))
-              s.binders)
+         addBinders
+           (mkBinders (declNameOf names).name (piBinders ty') (piImplicits ty'))
            s)
   pure
       (Cons
@@ -2035,7 +2059,7 @@ initialSt o toks declared own =
     toks
     Nil
     (\x -> o.known x || List.elemBy strEq x declared)
-    Nil
+    Mp.empty
     Nil
     (F.union o.fixities own)
     o.lenient
