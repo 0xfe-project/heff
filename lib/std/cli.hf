@@ -90,7 +90,7 @@ lookupL : String -> List (Pair String (List String)) -> List String
 lookupL k Nil = Nil
 lookupL k (MkPair x vs :: rest) = if strEq k x then vs else lookupL k rest
 
-headOr : String -> List String -> String
+headOr : {a : Type} -> a -> List a -> a
 headOr d (x :: _) = x
 headOr d Nil = d
 
@@ -113,9 +113,7 @@ reading =
         }
   , pos = \p ->
         { shape = { flags = Nil, pos = [p] }
-        , take = \groups _ -> case groups of
-            g :: _ -> g
-            Nil -> Nil
+        , take = \groups _ -> headOr Nil groups
         }
   }
 
@@ -186,9 +184,7 @@ arg s meta c =
 optional : (s : Args) -> String -> Complete -> s.A (Maybe String)
 optional s meta c =
   s.ap
-    (s.give (\(ws : List String) -> case ws of
-     w :: _ -> Just w
-     Nil -> Nothing))
+    (s.give (\(ws : List String) -> List.head ws))
     (s.pos { meta = meta, arity = Optional, complete = c })
 
 some : (s : Args) -> String -> Complete -> s.A (List String)
@@ -241,9 +237,8 @@ dupOf (x :: rest) = if List.elemBy strEq x rest then Just x else dupOf rest
 lastOnly : List Pos -> Maybe String
 lastOnly Nil = Nothing
 lastOnly (p :: Nil) = Nothing
-lastOnly (p :: rest) = case p.arity of
-  One -> lastOnly rest
-  _ -> Just p.meta
+lastOnly ({ arity = One } :: rest) = lastOnly rest
+lastOnly (p :: rest) = Just p.meta
 
 -- | what is wrong with a shape: a name twice, a short name that is not
 -- | one letter, `help`/`h` taken, a positional of many words before the
@@ -465,9 +460,8 @@ splitter = { words = \at ws -> wordsF splitter at ws }
 
 restIndex : List Pos -> Int -> Int
 restIndex Nil i = 0 - 1
-restIndex (p :: ps) i = case p.arity of
-  Rest -> i
-  _ -> restIndex ps (i + 1)
+restIndex ({ arity = Rest } :: ps) i = i
+restIndex (_ :: ps) i = restIndex ps (i + 1)
 
 -- | the words, split by the shape
 splitWords : Shape -> List String -> Either Problem Split
@@ -513,17 +507,13 @@ consGroup g (Right gs) = Right (g :: gs)
 groupsGo : List Pos -> List String -> Either Problem (List (List String))
 groupsGo Nil Nil = Right Nil
 groupsGo Nil (w :: _) = Left (Extra w)
-groupsGo (p :: ps) ws = case p.arity of
-  One -> case ws of
-    w :: ws2 -> consGroup [w] (groupsGo ps ws2)
-    Nil -> Left (Missing p.meta)
-  Optional -> case ws of
-    w :: ws2 -> consGroup [w] (groupsGo ps ws2)
-    Nil -> consGroup Nil (groupsGo ps Nil)
-  Some ->
-    if List.null ws then Left (Missing (p.meta ^ "..."))
-    else consGroup ws (groupsGo ps Nil)
-  _ -> consGroup ws (groupsGo ps Nil)
+groupsGo ({ arity = One } :: ps) (w :: ws2) = consGroup [w] (groupsGo ps ws2)
+groupsGo ({ meta = m, arity = One } :: ps) Nil = Left (Missing m)
+groupsGo ({ arity = Optional } :: ps) (w :: ws2) =
+  consGroup [w] (groupsGo ps ws2)
+groupsGo ({ arity = Optional } :: ps) Nil = consGroup Nil (groupsGo ps Nil)
+groupsGo ({ meta = m, arity = Some } :: ps) Nil = Left (Missing (m ^ "..."))
+groupsGo (_ :: ps) ws = consGroup ws (groupsGo ps Nil)
 
 -- | the words read as the term says, or what is wrong with them
 parse : {a : Type} -> Term a -> List String -> Either Problem a
@@ -577,65 +567,64 @@ shortWhere sh st cl =
 
 whereGo : Shape -> Int -> Where -> List String -> Where
 whereGo sh ra st Nil = st
-whereGo sh ra st (w :: ws) = case st.waiting of
-  Just f ->
-    whereGo
-      sh
-      ra
-      { on = st.on, waiting = Nothing, count = st.count, given = st.given }
-      ws
-  Nothing ->
-    if not st.on || (ra >= 0 && st.count >= ra)
-      then whereGo
-          sh
-          ra
-          { on = False
-          , waiting = Nothing
-          , count = st.count + 1
-          , given = st.given
-          }
-          ws
-    else if strEq w "--"
-      then whereGo
-          sh
-          ra
-          { on = False, waiting = Nothing, count = st.count, given = st.given }
-          ws
-    else if startsWith (prefix := "--") w
-      then (case longMaybe sh (strSlice w 2 (strLength w)) of
-            Just f ->
+whereGo sh ra st@{ waiting = Just _ } (_ :: ws) =
+  whereGo
+    sh
+    ra
+    { on = st.on, waiting = Nothing, count = st.count, given = st.given }
+    ws
+whereGo sh ra st (w :: ws) =
+  if not st.on || (ra >= 0 && st.count >= ra)
+    then whereGo
+        sh
+        ra
+        { on = False
+        , waiting = Nothing
+        , count = st.count + 1
+        , given = st.given
+        }
+        ws
+  else if strEq w "--"
+    then whereGo
+        sh
+        ra
+        { on = False, waiting = Nothing, count = st.count, given = st.given }
+        ws
+  else if startsWith (prefix := "--") w
+    then (case longMaybe sh (strSlice w 2 (strLength w)) of
+          Just f ->
+            whereGo
+              sh
+              ra
+              { on = True
+              , waiting = if strEq f.meta "" then Nothing else Just f
+              , count = st.count
+              , given = f.long :: st.given
+              }
+              ws
+          Nothing -> case indexOf "=" w of
+            Just i ->
               whereGo
                 sh
                 ra
                 { on = True
-                , waiting = if strEq f.meta "" then Nothing else Just f
+                , waiting = Nothing
                 , count = st.count
-                , given = f.long :: st.given
+                , given =
+                    (case longMaybe sh (strSlice w 2 i) of
+                     Just f -> f.long
+                     Nothing -> "")
+                    :: st.given
                 }
                 ws
-            Nothing -> case indexOf "=" w of
-              Just i ->
-                whereGo
-                  sh
-                  ra
-                  { on = True
-                  , waiting = Nothing
-                  , count = st.count
-                  , given =
-                      (case longMaybe sh (strSlice w 2 i) of
-                       Just f -> f.long
-                       Nothing -> "")
-                      :: st.given
-                  }
-                  ws
-              Nothing -> whereGo sh ra st ws)
-    else if flagLike sh w
-      then whereGo sh ra (shortWhere sh st (strSlice w 1 (strLength w))) ws
-    else whereGo
-        sh
-        ra
-        { on = True, waiting = Nothing, count = st.count + 1, given = st.given }
-        ws
+            Nothing -> whereGo sh ra st ws)
+  else if flagLike sh w
+    then whereGo sh ra (shortWhere sh st (strSlice w 1 (strLength w))) ws
+  else whereGo
+      sh
+      ra
+      { on = True, waiting = Nothing, count = st.count + 1, given = st.given }
+      ws
 
 byComplete : Complete -> String -> Candidates
 byComplete None cur = Nothing
@@ -646,44 +635,42 @@ byComplete (Among ws) cur =
 
 posAt : List Pos -> Int -> Maybe Pos
 posAt Nil i = Nothing
-posAt (p :: ps) i = case p.arity of
-  One -> if i == 0 then Just p else posAt ps (i - 1)
-  Optional -> if i == 0 then Just p else posAt ps (i - 1)
-  _ -> Just p
+posAt (p@{ arity = One } :: ps) i = if i == 0 then Just p else posAt ps (i - 1)
+posAt (p@{ arity = Optional } :: ps) i =
+  if i == 0 then Just p else posAt ps (i - 1)
+posAt (p :: _) i = Just p
 
 ra0 : Shape -> Where -> Bool
 ra0 sh st = restIndex sh.pos 0 >= 0 && st.count >= restIndex sh.pos 0
 
 completeAt : Shape -> Where -> String -> Candidates
-completeAt sh st cur = case st.waiting of
-  Just f ->
-    if List.null f.values then byComplete f.complete cur
-    else Words (List.filter (\w -> startsWith (prefix := cur) w) f.values)
-  Nothing ->
-    if st.on && not (ra0 sh st) && startsWith (prefix := "-") cur
-      then (case indexOf "=" cur of
-            Just i -> case longMaybe sh (strSlice cur 2 i) of
-              Just f ->
-                Words
-                  (List.filter
-                     (\w -> startsWith (prefix := cur) w)
-                     (List.map (\v -> strSlice cur 0 (i + 1) ^ v) f.values))
-              Nothing -> Nothing
-            Nothing ->
+completeAt sh { waiting = Just f } cur =
+  if List.null f.values then byComplete f.complete cur
+  else Words (List.filter (\w -> startsWith (prefix := cur) w) f.values)
+completeAt sh st cur =
+  if st.on && not (ra0 sh st) && startsWith (prefix := "-") cur
+    then (case indexOf "=" cur of
+          Just i -> case longMaybe sh (strSlice cur 2 i) of
+            Just f ->
               Words
                 (List.filter
                    (\w -> startsWith (prefix := cur) w)
-                   ("--help"
-                    :: List.map
-                      (\(f : Flag) -> "--" ^ f.long)
-                      (List.filter
-                         (\(f : Flag) ->
-                            f.repeated
-                            || not (List.elemBy strEq f.long st.given))
-                         sh.flags))))
-    else case posAt sh.pos st.count of
-      Just p -> byComplete p.complete cur
-      Nothing -> Nothing
+                   (List.map (\v -> strSlice cur 0 (i + 1) ^ v) f.values))
+            Nothing -> Nothing
+          Nothing ->
+            Words
+              (List.filter
+                 (\w -> startsWith (prefix := cur) w)
+                 ("--help"
+                  :: List.map
+                    (\(f : Flag) -> "--" ^ f.long)
+                    (List.filter
+                       (\(f : Flag) ->
+                          f.repeated || not (List.elemBy strEq f.long st.given))
+                       sh.flags))))
+  else case posAt sh.pos st.count of
+    Just p -> byComplete p.complete cur
+    Nothing -> Nothing
 
 -- | what `cur` completes to, after the words `before`
 complete : Shape -> List String -> String -> Candidates
@@ -722,12 +709,11 @@ shapeOfCommand k = shapeOf k.args
 --------------------------------------------------------------------------------
 
 posWord : Pos -> String
-posWord p = case p.arity of
-  One -> p.meta
-  Optional -> "[" ^ p.meta ^ "]"
-  Many -> "[" ^ p.meta ^ "...]"
-  Some -> p.meta ^ "..."
-  Rest -> "[" ^ p.meta ^ "...]"
+posWord { meta = m, arity = One } = m
+posWord { meta = m, arity = Optional } = "[" ^ m ^ "]"
+posWord { meta = m, arity = Many } = "[" ^ m ^ "...]"
+posWord { meta = m, arity = Some } = m ^ "..."
+posWord { meta = m, arity = Rest } = "[" ^ m ^ "...]"
 
 flagWord : Flag -> String
 flagWord f =
