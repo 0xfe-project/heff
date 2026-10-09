@@ -1,0 +1,527 @@
+-- Calls at the arity they are made at (#35).  A function is called at
+-- its arity when the call gives it as many arguments as it takes: given
+-- more, it is called with those, and what it gives is called with the
+-- rest -- a closure built and called, one more call, of a function not
+-- known (in the C backend, `heff_apply`'s way of more arguments).  So:
+--
+--   a definition every call of which gives it more arguments than it
+--   takes takes them all (`f = \x -> let t = .. in \y -> b`, every
+--   call `f a b`: `f = \x y -> let t = .. in b`);
+--
+--   a lambda handed to a definition, whose parameter is, wherever it is
+--   used, given more arguments than the lambda takes, takes them all
+--   (`op p (\x -> m)` where `op` calls its `k` as `k x k2`: `\x z -> m z`).
+--
+-- The language is pure, and computes by value: a function every use of
+-- which gives it `n` arguments at once computes, given them, what it
+-- computed given the first and then the rest -- the same, in the same
+-- order, nothing computed twice, as nothing is shared between two of
+-- its uses.  Co's computations, handled by a continuation monad (the
+-- C backend's handler of a program, heff.compile.lower's entry), are
+-- such: a continuation `\x -> c` given `x` and the monad's argument at
+-- once.  Each round finds what more of it there is (a lambda taking more
+-- gives more where it is used), until none.
+
+import heff.compile.ir as I
+import map as M
+
+-- | computations drawing fresh names
+type S a = Int -> Pair a Int
+
+bindTake : {a b : Type} -> (a -> S b) -> Pair a Int -> Pair b Int
+bindTake f (MkPair x n) = f x n
+
+-- `do` is this
+bind : {a b : Type} -> S a -> (a -> S b) -> S b
+bind m f = \n -> bindTake f (m n)
+
+pure : {a : Type} -> a -> S a
+pure x = \n -> MkPair x n
+
+traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
+traverseS f Nil = pure Nil
+traverseS f (Cons x xs) = do
+  y <- f x
+  ys <- traverseS f xs
+  pure (Cons y ys)
+
+freshOne : String -> S String
+freshOne base = \n -> I.fresh base n
+
+freshMany : Int -> S (List String)
+freshMany k =
+  if k <= 0 then pure Nil
+  else do
+    z <- freshOne "z"
+    zs <- freshMany (k - 1)
+    pure (Cons z zs)
+
+dropC : {a : Type} -> Int -> List a -> List a
+dropC n Nil = Nil
+dropC n (Cons x xs) = if n <= 0 then Cons x xs else dropC (n - 1) xs
+
+nthOr : Int -> Int -> List Int -> Int
+nthOr d i Nil = d
+nthOr d i (Cons x xs) = if i == 0 then x else nthOr d (i - 1) xs
+
+isNth : Int -> String -> List String -> Bool
+isNth i x Nil = False
+isNth i x (Cons y ys) = if i == 0 then strEq x y else isNth (i - 1) x ys
+
+zipTo : List String -> List String -> M.Map String I.Expr
+zipTo (Cons y ys) (Cons z zs) = M.insert compareString y (EVar z) (zipTo ys zs)
+zipTo _ _ = M.empty
+
+-- What is known of the calls
+--------------------------------------------------------------------------------
+
+-- | for each definition that is a function, how many arguments each of
+-- | its parameters is given wherever it is used (0: it is not only
+-- | called -- or not known)
+type Tables = { pa : M.Map String (List Int) }
+
+-- | a definition, as it is used: the fewest arguments any use gives it
+-- | (a use that is no call, none), and how often it is used -- twice for
+-- | a use where what uses it may be computed more than once (a function,
+-- | or under a lambda); and how many parameters it takes (none: it is
+-- | not a function)
+type GUse = { calls : Int, uses : Int, takes : Int }
+
+-- | what is noted in a definition: how many arguments its parameters
+-- | are given wherever they are used (the fewest), how the definitions
+-- | are used (in it and in those before it), and whether a lambda in it,
+-- | handed to a definition, takes fewer than that one gives it
+type Notes =
+  { vars : M.Map String Int, globals : M.Map String GUse, dirty : Bool }
+
+-- (a definition's: what it is, and its parameters -- one handed on to
+-- itself, where it was, says nothing of its uses; and whether what is
+-- here may be computed more than once)
+type Here =
+  { key : String, params : List String, many : Bool, ar : M.Map String Int }
+
+underLam : Here -> Here
+underLam h = { key = h.key, params = h.params, many = True, ar = h.ar }
+
+-- (more than any use gives: a parameter used by none but itself)
+unused : Int
+unused = 1000000
+
+-- (a parameter's use, given `k`: the fewest kept; anything else no
+-- parameter)
+lessOf : String -> Int -> Maybe Int -> Notes -> Notes
+lessOf x k (Just k0) n =
+  if k < k0
+    then { vars = M.insert compareString x k n.vars
+         , globals = n.globals
+         , dirty = n.dirty
+         }
+  else n
+lessOf x k Nothing n = n
+
+noteVar : String -> Int -> Notes -> Notes
+noteVar x k n = lessOf x k (M.lookup compareString x n.vars) n
+
+-- (what no more use can make take more: a function called with no more
+-- than it takes; a value used twice, or not called)
+settled : GUse -> Bool
+settled u =
+  if u.takes > 0 then u.calls <= u.takes else u.uses >= 2 || u.calls == 0
+
+withUse : String -> GUse -> Notes -> Notes
+withUse g u n =
+  { vars = n.vars
+  , globals = M.insert compareString g u n.globals
+  , dirty = n.dirty
+  }
+
+noteUse : Here -> String -> Int -> Maybe GUse -> Notes -> Notes
+noteUse here g k (Just u) n =
+  if settled u then n
+  else withUse
+      g
+      { calls = if k < u.calls then k else u.calls
+      , uses = u.uses + (if here.many then 2 else 1)
+      , takes = u.takes
+      }
+      n
+noteUse here g k Nothing n =
+  withUse
+    g
+    { calls = k
+    , uses = if here.many then 2 else 1
+    , takes = fromMaybe 0 (M.lookup compareString g here.ar)
+    }
+    n
+
+-- (a use of `g`, given `k` arguments)
+noteGlobal : Here -> String -> Int -> Notes -> Notes
+noteGlobal here g k n = noteUse here g k (M.lookup compareString g n.globals) n
+
+dirtied : Notes -> Notes
+dirtied n = { vars = n.vars, globals = n.globals, dirty = True }
+
+paramIn : Int -> Maybe (List Int) -> Int
+paramIn j (Just ps) = nthOr 0 j ps
+paramIn j Nothing = 0
+
+-- (what parameter `j` of `h` is given, as far as is known)
+paramOf : Tables -> String -> Int -> Int
+paramOf t h j = paramIn j (M.lookup compareString h t.pa)
+
+-- (a variable handed to `h` as its argument `j` -- past the parameters
+-- `h` takes, to what it gives: given none that is known)
+handed : Tables -> Here -> String -> Int -> String -> Notes -> Notes
+handed t here h j x n =
+  if strEq h here.key && isNth j x here.params then n
+  else noteVar x (paramOf t h j) n
+
+-- (a lambda handed to `h` as its argument `j`, taking fewer than `h`
+-- gives it: to take them all)
+wants : Tables -> String -> Int -> List String -> Bool
+wants t h j ys = paramOf t h j > List.length ys
+
+-- (the arguments of a call of `h`, from `j` on: a variable handed to
+-- it, a lambda that may take more -- the rest walked as any expression)
+argsNote : Tables -> Here -> String -> Int -> List I.Expr -> Notes -> Notes
+argsNote t here h j Nil n = n
+argsNote t here h j (Cons (EVar x) as) n =
+  argsNote t here h (j + 1) as (handed t here h j x n)
+argsNote t here h j (Cons (ELam ys _) as) n =
+  argsNote t here h (j + 1) as (if wants t h j ys then dirtied n else n)
+argsNote t here h j (Cons _ as) n = argsNote t here h (j + 1) as n
+
+-- (an application, by its head: what it says of the head and of the
+-- arguments it is given)
+appNote : Tables -> Here -> I.Expr -> List I.Expr -> Notes -> Notes
+appNote t here (EVar x) as n = noteVar x (List.length as) n
+appNote t here (EGlobal g) as n =
+  argsNote t here g 0 as (noteGlobal here g (List.length as) n)
+appNote t here f as n = n
+
+-- (but the variables handed to a definition: noted already)
+pushNonVars : List I.Expr -> List I.Expr -> List I.Expr
+pushNonVars Nil rest = rest
+pushNonVars (Cons (EVar _) as) rest = pushNonVars as rest
+pushNonVars (Cons a as) rest = Cons a (pushNonVars as rest)
+
+-- (what is left of an application to walk: its arguments, and its head
+-- unless it was noted)
+appPush : I.Expr -> List I.Expr -> List I.Expr -> List I.Expr
+appPush (EVar _) as rest = I.appendI as rest
+appPush (EGlobal _) as rest = pushNonVars as rest
+appPush f as rest = Cons f (I.appendI as rest)
+
+-- | what is noted of the uses in the worklist (a walk that makes no
+-- | closure for each node, as one of `List.foldl` would)
+usesW : Tables -> Here -> List I.Expr -> Notes -> Notes
+usesW t here Nil n = n
+usesW t here (Cons (EVar x) rest) n = usesW t here rest (noteVar x 0 n)
+usesW t here (Cons (EGlobal g) rest) n =
+  usesW t here rest (noteGlobal here g 0 n)
+usesW t here (Cons (ELam _ b) rest) n =
+  usesW t here rest (usesW t (underLam here) (Cons b Nil) n)
+usesW t here (Cons (EApp f as) rest) n =
+  usesW t here (appPush f as rest) (appNote t here f as n)
+usesW t here (Cons (ELet _ a b) rest) n = usesW t here (Cons a (Cons b rest)) n
+usesW t here (Cons (ERecord fs) rest) n = usesW t here (I.pushFields fs rest) n
+usesW t here (Cons (EProj e _ _) rest) n = usesW t here (Cons e rest) n
+usesW t here (Cons (ETag _ as) rest) n = usesW t here (I.appendI as rest) n
+usesW t here (Cons (EMatch s arms) rest) n =
+  usesW t here (Cons s (I.pushArms arms rest)) n
+usesW t here (Cons (EPrimCall _ as) rest) n = usesW t here (I.appendI as rest) n
+usesW t here (Cons (ECall g as) rest) n =
+  usesW t here (appPush (EGlobal g) as rest) (appNote t here (EGlobal g) as n)
+usesW t here (Cons _ rest) n = usesW t here rest n
+
+paramsOf : I.Expr -> List String
+paramsOf (ELam xs _) = xs
+paramsOf _ = Nil
+
+-- (the parameters, each used by none yet)
+seeded : List String -> M.Map String Int
+seeded xs = List.foldl (\m x -> M.insert compareString x unused m) M.empty xs
+
+-- (a definition's uses, noted after those of the definitions before it;
+-- `ar`, the definitions' arities)
+defNotes : Tables -> M.Map String Int -> M.Map String GUse -> I.Def -> Notes
+defNotes t ar gl d =
+  usesW
+    t
+    { key = d.key, params = paramsOf d.body, many = False, ar = ar }
+    (Cons d.body Nil)
+    { vars = seeded (paramsOf d.body), globals = gl, dirty = False }
+
+-- (a parameter, by what its uses gave it: none if it has none)
+givenOf : Maybe Int -> Int
+givenOf (Just k) = if k >= unused then 0 else k
+givenOf Nothing = 0
+
+-- | what is known of the calls of the definitions: what their parameters
+-- | are given, and how each definition is used
+type Known = { tables : Tables, globals : M.Map String GUse }
+
+knownAdd : Known -> I.Def -> Notes -> Known
+knownAdd k d@{ body = ELam xs _ } n =
+  { tables =
+      { pa =
+          M.insert
+            compareString
+            d.key
+            (List.map (\x -> givenOf (M.lookup compareString x n.vars)) xs)
+            k.tables.pa
+      }
+  , globals = n.globals
+  }
+knownAdd k d n = { tables = k.tables, globals = n.globals }
+
+arityOne : M.Map String Int -> I.Def -> M.Map String Int
+arityOne m d@{ body = ELam xs _ } =
+  M.insert compareString d.key (List.length xs) m
+arityOne m d = m
+
+-- Making the calls so
+--------------------------------------------------------------------------------
+
+armWith : (I.Expr -> I.Expr) -> I.Arm -> I.Arm
+armWith f (MkArm tg vs b) = MkArm tg vs (f b)
+
+varsOf : List String -> List I.Expr
+varsOf zs = List.map (\z -> EVar z) zs
+
+-- | `e` given `zs` too, in each way out of it: a lambda's parameters
+-- | the first of them, anything else applied to them
+-- | >>> extend ["z"] (ELet "t" (EInt 1) (ELam ["y"] (EVar "y")))
+-- | ELet "t" (EInt 1) (EVar "z")
+extend : List String -> I.Expr -> I.Expr
+extend Nil e = e
+extend zs (ELam ys b) =
+  if List.length ys > List.length zs
+    then ELam (dropC (List.length zs) ys) (I.subst (zipTo ys zs) b)
+  else extend (dropC (List.length ys) zs) (I.subst (zipTo ys zs) b)
+extend zs (ELet x a b) = ELet x a (extend zs b)
+extend zs (EMatch s arms) = EMatch s (List.map (armWith (extend zs)) arms)
+extend zs (EApp f as) = EApp f (List.append as (varsOf zs))
+extend zs EAbandon = EAbandon
+extend zs e = EApp e (varsOf zs)
+
+-- (a definition every call of which gives it more than it takes: it
+-- takes them all)
+raiseTo : I.Def -> List String -> I.Expr -> Maybe Int -> S I.Def
+raiseTo d xs b (Just m) =
+  if m > List.length xs
+    then do
+      zs <- freshMany (m - List.length xs)
+      pure (I.mkDef d.key d.name (ELam (List.append xs zs) (extend zs b)))
+  else pure d
+raiseTo d xs b Nothing = pure d
+
+-- (a definition that is not a function, used once -- by a call, where
+-- what uses it is computed once: the program's computation, given the
+-- continuation of its handler by the program's entry -- is one, taking
+-- what it is given: computed when it is called, once, as it was when
+-- first used)
+raiseOnce : I.Def -> Maybe Int -> Maybe Int -> S I.Def
+raiseOnce d (Just m) (Just 1) =
+  if m > 0
+    then do
+      zs <- freshMany m
+      pure (I.mkDef d.key d.name (ELam zs (extend zs d.body)))
+  else pure d
+raiseOnce d calls uses = pure d
+
+callsOf : Maybe GUse -> Maybe Int
+callsOf (Just u) = Just u.calls
+callsOf Nothing = Nothing
+
+usesOf : Maybe GUse -> Maybe Int
+usesOf (Just u) = Just u.uses
+usesOf Nothing = Nothing
+
+-- (by how the definitions were used, as the round before found them)
+raiseDef : M.Map String GUse -> I.Def -> S I.Def
+raiseDef gl d@{ body = ELam xs b } =
+  raiseTo d xs b (callsOf (M.lookup compareString d.key gl))
+raiseDef gl d =
+  raiseOnce
+    d
+    (callsOf (M.lookup compareString d.key gl))
+    (usesOf (M.lookup compareString d.key gl))
+
+-- (a lambda given to parameter `j` of `h`, which is given more wherever
+-- it is used: it takes them all)
+expandArg : Tables -> String -> Int -> I.Expr -> S I.Expr
+expandArg t h j (ELam ys b) =
+  if wants t h j ys
+    then do
+      zs <- freshMany (paramOf t h j - List.length ys)
+      pure (ELam (List.append ys zs) (extend zs b))
+  else pure (ELam ys b)
+expandArg t h j a = pure a
+
+type XGo = I.Expr -> S I.Expr
+
+expandArgs : XGo -> Tables -> String -> Int -> List I.Expr -> S (List I.Expr)
+expandArgs go t h j Nil = pure Nil
+expandArgs go t h j (Cons a as) = do
+  a1 <- go a
+  a2 <- expandArg t h j a1
+  rest <- expandArgs go t h (j + 1) as
+  pure (Cons a2 rest)
+
+-- (an application, by its head)
+expandApp : XGo -> Tables -> I.Expr -> List I.Expr -> S I.Expr
+expandApp go t (EGlobal g) as = do
+  as2 <- expandArgs go t g 0 as
+  pure (EApp (EGlobal g) as2)
+expandApp go t f as = do
+  f2 <- go f
+  as2 <- traverseS go as
+  pure (EApp f2 as2)
+
+expandField : XGo -> Pair String I.Expr -> S (Pair String I.Expr)
+expandField go (MkPair l e) = do
+  e2 <- go e
+  pure (MkPair l e2)
+
+expandArm : XGo -> I.Arm -> S I.Arm
+expandArm go (MkArm tg vs b) = do
+  b2 <- go b
+  pure (MkArm tg vs b2)
+
+-- | the lambdas given to definitions in it, each taking what it is given
+expandGo : Tables -> I.Expr -> S I.Expr
+expandGo t (ELam xs b) = do
+  b2 <- expandGo t b
+  pure (ELam xs b2)
+expandGo t (EApp f as) = expandApp (expandGo t) t f as
+expandGo t (ELet x a b) = do
+  a2 <- expandGo t a
+  b2 <- expandGo t b
+  pure (ELet x a2 b2)
+expandGo t (ERecord fs) = do
+  fs2 <- traverseS (expandField (expandGo t)) fs
+  pure (ERecord fs2)
+expandGo t (EProj e l sh) = do
+  e2 <- expandGo t e
+  pure (EProj e2 l sh)
+expandGo t (ETag tg as) = do
+  as2 <- traverseS (expandGo t) as
+  pure (ETag tg as2)
+expandGo t (EMatch s arms) = do
+  s2 <- expandGo t s
+  arms2 <- traverseS (expandArm (expandGo t)) arms
+  pure (EMatch s2 arms2)
+expandGo t (EPrimCall p as) = do
+  as2 <- traverseS (expandGo t) as
+  pure (EPrimCall p as2)
+expandGo t (ECall g as) = do
+  as2 <- expandArgs (expandGo t) t g 0 as
+  pure (ECall g as2)
+expandGo t e = pure e
+
+expandDef : Tables -> I.Def -> S I.Def
+expandDef t d = do
+  b <- expandGo t d.body
+  pure (I.mkDef d.key d.name b)
+
+-- Rounds
+--------------------------------------------------------------------------------
+
+-- A round goes through the definitions in order -- each after those it
+-- uses, as a program's are -- raising each the round before found
+-- called with more, noting its uses, and, where it hands a lambda to a
+-- definition before it that gives that more (known in this round
+-- already), making the lambda take it all and noting it again.  What a
+-- definition is called with is known only once its callers, after it,
+-- are: it is raised the next round.
+
+-- | a round so far: what is known (of the definitions gone through),
+-- | the definitions made, last first, and the names drawn up to
+type Acc = { known : Known, defs : List I.Def, supply : Int }
+
+accWith : Known -> I.Def -> Int -> Acc -> Acc
+accWith k d n acc = { known = k, defs = Cons d acc.defs, supply = n }
+
+expandedThen : M.Map String Int -> Acc -> Pair I.Def Int -> Acc
+expandedThen ar acc (MkPair d n) =
+  accWith
+    (knownAdd acc.known d (defNotes acc.known.tables ar acc.known.globals d))
+    d
+    n
+    acc
+
+-- (a definition noted: if it hands a lambda more than it takes, the
+-- lambda made to take it, and the definition noted again)
+notedThen : M.Map String Int -> Acc -> I.Def -> Int -> Notes -> Acc
+notedThen ar acc d n notes =
+  if notes.dirty then expandedThen ar acc (expandDef acc.known.tables d n)
+  else accWith (knownAdd acc.known d notes) d n acc
+
+raisedThen : M.Map String Int -> Acc -> Pair I.Def Int -> Acc
+raisedThen ar acc (MkPair d n) =
+  notedThen ar acc d n (defNotes acc.known.tables ar acc.known.globals d)
+
+stepDef : M.Map String GUse -> M.Map String Int -> Acc -> I.Def -> Acc
+stepDef before ar acc d = raisedThen ar acc (raiseDef before d acc.supply)
+
+-- | the definitions, and the names drawn up to
+type Called = { defs : List I.Def, supply : Int }
+
+sameInts : List Int -> List Int -> Bool
+sameInts Nil Nil = True
+sameInts (Cons x xs) (Cons y ys) = x == y && sameInts xs ys
+sameInts _ _ = False
+
+sameAll : List (List Int) -> List (List Int) -> Bool
+sameAll Nil Nil = True
+sameAll (Cons x xs) (Cons y ys) = sameInts x y && sameAll xs ys
+sameAll _ _ = False
+
+-- (what the parameters are given, alike)
+sameTables : Tables -> Tables -> Bool
+sameTables a b =
+  M.size a.pa == M.size b.pa && sameAll (M.values a.pa) (M.values b.pa)
+
+type More = Known -> List I.Def -> Int -> Called
+
+-- (after a round: done if it changed nothing -- drew no name -- and
+-- knew what the round before knew; else one more)
+afterRound : More -> Known -> Int -> Acc -> Called
+afterRound more before n acc =
+  if acc.supply == n && sameTables before.tables acc.known.tables
+    then { defs = List.reverse acc.defs, supply = n }
+  else more acc.known (List.reverse acc.defs) acc.supply
+
+-- | the most rounds there are: each notes the whole program again, and
+-- | a fourth found next to nothing in the compiler's own (a lambda made
+-- | to take more, its definition called with more, that one raised, and
+-- | what its ways out call with more raised in turn: Co's computations,
+-- | a handler known, take the three)
+roundsMost : Int
+roundsMost = 3
+
+rounds : Int -> Known -> List I.Def -> Int -> Called
+rounds left before defs n =
+  if left <= 0 then { defs = defs, supply = n }
+  else afterRound
+      (rounds (left - 1))
+      before
+      n
+      (List.foldl
+         (stepDef before.globals (List.foldl arityOne M.empty defs))
+         { known = { tables = { pa = M.empty }, globals = M.empty }
+         , defs = Nil
+         , supply = n
+         }
+         defs)
+
+-- | the definitions, each call of a definition, and of a lambda handed to
+-- | one, at the arity it is made at -- names drawn from `n` on
+-- | >>> List.map (\(d : I.Def) -> d.body) (callArity 0 [I.mkDef "f" "f" (ELam ["x"] (ELam ["y"] (EVar "y"))), I.mkDef "g" "g" (EApp (EGlobal "f") [EInt 1, EInt 2])]).defs
+-- | [ELam ["x", "z$0"] (EVar "z$0"), EApp (EGlobal "f") [EInt 1, EInt 2]]
+-- | >>> List.map (\(d : I.Def) -> d.body) (callArity 0 [I.mkDef "op" "op" (ELam ["k"] (EApp (EVar "k") [EInt 1, EInt 2])), I.mkDef "g" "g" (EApp (EGlobal "op") [ELam ["x"] (EGlobal "h")])]).defs
+-- | [ELam ["k"] (EApp (EVar "k") [EInt 1, EInt 2]), EApp (EGlobal "op") [ELam ["x", "z$0"] (EApp (EGlobal "h") [EVar "z$0"])]]
+callArity : Int -> List I.Def -> Called
+callArity n defs =
+  rounds roundsMost { tables = { pa = M.empty }, globals = M.empty } defs n
