@@ -64,6 +64,28 @@ extern char **environ;
 #define HEFF_VAR(decl) decl
 #endif
 
+// Threads (#36).  A program runs in one thread of its own, unless a
+// provider runs it in more, truly at once: such a provider says so by
+// `#define HEFF_THREADS 1`, a line of its own, which the emitter puts
+// before the runtime too (`-DHEFF_THREADS` does the same).  Then each
+// thread has the runtime's per-run state for itself (`HEFF_TLS`: its
+// free lists, its stack of what is given back, its count of calls and
+// its room, where a failure of it is caught), and a mortal object is
+// only ever one thread's, its count changed by that thread alone --
+// counts are not atomic.  What is immortal, static or made so
+// (`heff_freeze`), is shared: a definition's value is computed once,
+// under a lock, and made immortal (`heff_global`), as is a static
+// thunk's value (`heff_force_shared`).  What a provider gives another
+// thread it copies for it (`heff_copy_for_thread`), and runs there
+// under `heff_try`, ending the thread by `heff_thread_end`.  Without
+// `HEFF_THREADS`, all of this is as one thread has it: `HEFF_TLS` is
+// nothing, and nothing is locked.  (docs/threads.md)
+#ifdef HEFF_THREADS
+#define HEFF_TLS _Thread_local
+#else
+#define HEFF_TLS
+#endif
+
 typedef uintptr_t V;
 
 // (a call last whose callee takes what its caller takes -- the same
@@ -148,8 +170,8 @@ static inline int heff_unique(V v) { return OBJ(v)->rc == 1; }
 // (where a value is asked for that may fail -- `heff compile` without
 // `--name`, each definition printed -- a failure is caught there, and
 // said; otherwise it ends the program)
-HEFF_VAR(jmp_buf *heff_catch);
-HEFF_VAR(const char *heff_caught);
+HEFF_VAR(HEFF_TLS jmp_buf *heff_catch);
+HEFF_VAR(HEFF_TLS const char *heff_caught);
 
 static void heff_fail(const char *why) {
   if (heff_catch) { heff_caught = why; longjmp(*heff_catch, 1); }
@@ -182,7 +204,7 @@ static void *heff_alloc(size_t n) {
 #ifndef SMALL_MAX
 #define SMALL_MAX 128
 #endif
-HEFF_VAR(void *heff_free_list[SMALL_MAX / 8 + 1]);
+HEFF_VAR(HEFF_TLS void *heff_free_list[SMALL_MAX / 8 + 1]);
 
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
@@ -530,9 +552,9 @@ static size_t heff_size(V v) {
 // (what is given back, a stack of it, not a recursion: a long list's
 // cells given back one after another, the stack as deep as the list
 // never)
-HEFF_VAR(V *heff_dead);
-HEFF_VAR(size_t heff_ndead);
-HEFF_VAR(size_t heff_cdead);
+HEFF_VAR(HEFF_TLS V *heff_dead);
+HEFF_VAR(HEFF_TLS size_t heff_ndead);
+HEFF_VAR(HEFF_TLS size_t heff_cdead);
 
 // (a value whose last reference this was, put on the stack)
 static inline void heff_dead_put(V v) {
@@ -615,10 +637,154 @@ HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
   } else if (!(c->h.rc & IMMORTAL)) c->h.rc--;
 }
 
+// Values between threads (#36)
+// ---------------------------------------------------------------------
+
+// (a tag's or a record's fields, an array's elements: `*n` of them --
+// a closure's, a partial application's and a bounce's are said by
+// `HEFF_EACH_SLOT`; a string, a float and a big integer hold none)
+static V *heff_slots(V v, int64_t *n) {
+  Obj *o = OBJ(v);
+  switch (o->kind) {
+  case K_TAG: *n = ((Tag *)v)->n; return ((Tag *)v)->f;
+  case K_REC: *n = ((Rec *)v)->n; return ((Rec *)v)->f;
+  case K_ARR: *n = ((Arr *)v)->n; return ((Arr *)v)->a;
+  default: *n = 0; return NULL;
+  }
+}
+
+// (a stack of objects, for a walk that is not a recursion: a long
+// list's spine never on the C stack)
+typedef struct { V *v; size_t n, cap; } HeffStack;
+
+static void heff_stack_push(HeffStack *s, V v) {
+  if (s->n == s->cap) {
+    s->cap = s->cap ? s->cap * 2 : 256;
+    s->v = realloc(s->v, s->cap * sizeof(V));
+    if (!s->v) heff_fail("out of memory");
+  }
+  s->v[s->n++] = v;
+}
+
+// (each place of the object `v` holds a value in, given to `f`)
+#define HEFF_EACH_SLOT(v, f, u)                                         \
+  do {                                                                  \
+    Obj *o_ = OBJ(v);                                                   \
+    int64_t n_;                                                         \
+    V *s_ = heff_slots(v, &n_);                                         \
+    for (int64_t i_ = 0; i_ < n_; i_++) f(u, &s_[i_]);                  \
+    if (o_->kind == K_CLO) {                                            \
+      Clo *c_ = (Clo *)(v);                                             \
+      for (int32_t i_ = 0; i_ < c_->nenv; i_++) f(u, &c_->env[i_]);     \
+      if (c_->memo) f(u, &c_->memo);                                    \
+    } else if (o_->kind == K_PAP) {                                     \
+      Pap *p_ = (Pap *)(v);                                             \
+      for (int32_t i_ = 0; i_ < p_->n; i_++) f(u, &p_->a[i_]);          \
+      f(u, &p_->fun);                                                   \
+    } else if (o_->kind == K_BNC) {                                     \
+      Bnc *b_ = (Bnc *)(v);                                             \
+      for (int32_t i_ = 0; i_ < b_->n; i_++) f(u, &b_->a[i_]);          \
+      f(u, &b_->fun);                                                   \
+    }                                                                   \
+  } while (0)
+
+static void heff_freeze_one(HeffStack *s, V *at) {
+  V v = *at;
+  if (!IS_OBJ(v) || !v || (OBJ(v)->rc & IMMORTAL)) return;
+  OBJ(v)->rc = IMMORTAL;
+  heff_stack_push(s, v);
+}
+
+// (`v` made immortal, and all it holds: shared between threads from now
+// on, each counting it never, and never freed -- what holds it now
+// leaks it.  `v` is this thread's, and no other's yet)
+static void heff_freeze(V v) {
+  HeffStack s = {0};
+  heff_freeze_one(&s, &v);
+  while (s.n) {
+    V o = s.v[--s.n];
+    HEFF_EACH_SLOT(o, heff_freeze_one, &s);
+  }
+  free(s.v);
+}
+
+// (what a copy has made: each object copied, by the object it is a copy
+// of -- open addressing, by address)
+typedef struct { V *from, *to; size_t cap, n; HeffStack todo; } HeffCopies;
+
+static size_t heff_addr_hash(V v) {
+  uint64_t x = (uint64_t)v;
+  x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+  return (size_t)x;
+}
+
+static void heff_copies_put(HeffCopies *m, V from, V to);
+
+static void heff_copies_grow(HeffCopies *m) {
+  V *from = m->from, *to = m->to;
+  size_t cap = m->cap;
+  m->cap = cap ? cap * 2 : 64;
+  m->n = 0;
+  m->from = calloc(m->cap, sizeof(V));
+  m->to = calloc(m->cap, sizeof(V));
+  if (!m->from || !m->to) heff_fail("out of memory");
+  for (size_t i = 0; i < cap; i++) if (from[i]) heff_copies_put(m, from[i], to[i]);
+  free(from); free(to);
+}
+
+static void heff_copies_put(HeffCopies *m, V from, V to) {
+  if (2 * (m->n + 1) > m->cap) heff_copies_grow(m);
+  size_t i = heff_addr_hash(from) & (m->cap - 1);
+  while (m->from[i]) i = (i + 1) & (m->cap - 1);
+  m->from[i] = from; m->to[i] = to; m->n++;
+}
+
+static V heff_copies_get(HeffCopies *m, V from) {
+  if (!m->cap) return 0;
+  size_t i = heff_addr_hash(from) & (m->cap - 1);
+  for (; m->from[i]; i = (i + 1) & (m->cap - 1))
+    if (m->from[i] == from) return m->to[i];
+  return 0;
+}
+
+// (the value at `at` made its copy's: what is immortal as it is, an
+// object copied before that copy counted once more, any other copied --
+// its shell, what it holds copied after (`todo`))
+static void heff_copy_one(HeffCopies *m, V *at) {
+  V v = *at;
+  if (!IS_OBJ(v) || !v || (OBJ(v)->rc & IMMORTAL)) return;
+  V done = heff_copies_get(m, v);
+  if (done) { OBJ(done)->rc++; *at = done; return; }
+  size_t sz = heff_size(v);
+  if (sz == SMALL_MAX + 1) heff_fail("an object of a kind not known, copied for a thread");
+  Obj *o = heff_obj_alloc(sz);
+  memcpy(o, OBJ(v), sz);
+  o->rc = 1;
+  heff_copies_put(m, v, (V)o);
+  heff_stack_push(&m->todo, (V)o);
+  *at = (V)o;
+}
+
+// (a copy of `v` for another thread, `v` not consumed: what is immortal
+// shared, every other object made again, what is shared in `v` shared in
+// the copy -- so that no object is counted by two threads.  Made of this
+// thread's memory, it is the other's from then on, and given back to
+// its free lists.  `v` is this thread's: no other changes it meanwhile)
+static V heff_copy_for_thread(V v) {
+  HeffCopies m = {0};
+  heff_copy_one(&m, &v);
+  while (m.todo.n) {
+    V o = m.todo.v[--m.todo.n];
+    HEFF_EACH_SLOT(o, heff_copy_one, &m);
+  }
+  free(m.from); free(m.to); free(m.todo.v);
+  return v;
+}
+
 // Calls of what is not known
 // ---------------------------------------------------------------------
 
-HEFF_VAR(long heff_dep);
+HEFF_VAR(HEFF_TLS long heff_dep);
 
 // (where a lambda's call last of more arguments than it took is put, up
 // to `HEFF_ROOM` of them, to be made a jump: its own are where its
@@ -626,7 +792,7 @@ HEFF_VAR(long heff_dep);
 // called reads them at once, before it calls anything -- see `roomed`
 // in src/heff/compile/emitc.hf)
 #define HEFF_ROOM 4
-HEFF_VAR(V heff_room[HEFF_ROOM]);
+HEFF_VAR(HEFF_TLS V heff_room[HEFF_ROOM]);
 
 static V heff_apply(V f, int n, V *a);
 
@@ -675,6 +841,23 @@ static inline V heff_tail(V f, int n, V *a) {
   return heff_apply(f, n, a);
 }
 
+#ifdef HEFF_THREADS
+// (an immortal thunk forced, threads at once: its memo shared by them
+// all, so its value made immortal too, and kept by the first to have it
+// -- another computing it meanwhile, the language pure, has the same
+// value, and lets its own go, leaking it)
+static __attribute__((noinline)) V heff_force_shared(V f, V *a) {
+  Clo *c = (Clo *)f;
+  V m = __atomic_load_n(&c->memo, __ATOMIC_ACQUIRE);
+  if (m) return m;
+  V r = heff_tr(c->fn(f, a));
+  heff_freeze(r);
+  V none = 0;
+  if (__atomic_compare_exchange_n(&c->memo, &none, r, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return r;
+  return none;
+}
+#endif
+
 static V heff_apply(V f, int n, V *a) {
   for (;;) {
     Obj *o = OBJ(f);
@@ -704,6 +887,9 @@ static V heff_apply(V f, int n, V *a) {
     // not compute it again -- the language is pure, `f MkUnit` is the same
     // value every time -- as the JavaScript backend's `$force` keeps it)
     if (n == 1 && c->arity == 1 && a[0] == NTAG(TAG_MkUnit)) {
+#ifdef HEFF_THREADS
+      if (c->h.rc & IMMORTAL) return heff_force_shared(f, a);
+#endif
       if (c->memo) {
         V r = heff_dup(c->memo);
         heff_drop(f);
@@ -756,6 +942,91 @@ static inline int heff_exact(V f, int n, V *a) {
   return HEFF_JUMPS && IS_OBJ(f) && OBJ(f)->kind == K_CLO
       && ((Clo *)f)->arity == n && !(n == 1 && a[0] == NTAG(TAG_MkUnit));
 }
+
+// Definitions' values
+// ---------------------------------------------------------------------
+// A definition that is no function is computed when it is first asked
+// for, and kept (src/heff/compile/emitc.hf, `valDef`): its value
+// `g_X_val`, its state `g_X_st` (`HEFF_ONCE`), asked for by `g_X_get`,
+// which has it at once where it is computed (`HEFF_DONE`), and otherwise
+// asks `heff_global` to compute it by `g_X_init`.  One thread: the state
+// 0, then 1 while it is computed -- asked for again then, it is defined
+// by itself -- then 2.  Threads (`HEFF_THREADS`): computed once, by the
+// first thread to ask, the others asking meanwhile waiting for it, and
+// made immortal (`heff_freeze`), so that every thread has the same value
+// and none counts it; while it is computed, its state is the thread
+// computing it (`heff_me`'s address), so that a thread asking for what
+// it is computing itself is told it is defined by itself, not left to
+// wait.  (Definitions are in order, none using one after it: a thread
+// computing one waits only for one before it, never for one waiting for
+// it.)  A failure caught (`heff_try`) where values were being computed
+// leaves them to be computed again.
+#ifdef HEFF_THREADS
+#define HEFF_ONCE uintptr_t
+#define HEFF_DONE(st) HEFF_LIKELY(__atomic_load_n(&(st), __ATOMIC_ACQUIRE) == 2)
+#ifdef HEFF_PART
+extern pthread_mutex_t heff_once_mu;
+extern pthread_cond_t heff_once_cv;
+#else
+pthread_mutex_t heff_once_mu = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t heff_once_cv = PTHREAD_COND_INITIALIZER;
+#endif
+HEFF_VAR(HEFF_TLS char heff_me);
+// (the states of what this thread is computing, the last innermost)
+HEFF_VAR(HEFF_TLS HEFF_ONCE **heff_open);
+HEFF_VAR(HEFF_TLS size_t heff_nopen);
+HEFF_VAR(HEFF_TLS size_t heff_capopen);
+
+static __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
+  uintptr_t me = (uintptr_t)&heff_me;
+  pthread_mutex_lock(&heff_once_mu);
+  for (;;) {
+    uintptr_t s = __atomic_load_n(st, __ATOMIC_ACQUIRE);
+    if (s == 2) { pthread_mutex_unlock(&heff_once_mu); return *val; }
+    if (s == me) { pthread_mutex_unlock(&heff_once_mu); heff_fail("defined by itself"); }
+    if (s == 0) break;
+    pthread_cond_wait(&heff_once_cv, &heff_once_mu);
+  }
+  __atomic_store_n(st, me, __ATOMIC_RELAXED);
+  pthread_mutex_unlock(&heff_once_mu);
+  if (heff_nopen == heff_capopen) {
+    heff_capopen = heff_capopen ? heff_capopen * 2 : 16;
+    heff_open = realloc(heff_open, heff_capopen * sizeof(HEFF_ONCE *));
+    if (!heff_open) heff_fail("out of memory");
+  }
+  heff_open[heff_nopen++] = st;
+  V v = heff_tr(init());
+  heff_nopen--;
+  heff_freeze(v);
+  pthread_mutex_lock(&heff_once_mu);
+  *val = v;
+  __atomic_store_n(st, 2, __ATOMIC_RELEASE);
+  pthread_cond_broadcast(&heff_once_cv);
+  pthread_mutex_unlock(&heff_once_mu);
+  return v;
+}
+
+// (what this thread was computing when a failure was caught, from the
+// `base`th on, to be computed again: the threads waiting for it woken)
+static void heff_reopen(size_t base) {
+  if (heff_nopen <= base) return;
+  pthread_mutex_lock(&heff_once_mu);
+  while (heff_nopen > base) __atomic_store_n(heff_open[--heff_nopen], 0, __ATOMIC_RELAXED);
+  pthread_cond_broadcast(&heff_once_cv);
+  pthread_mutex_unlock(&heff_once_mu);
+}
+#else
+#define HEFF_ONCE int
+#define HEFF_DONE(st) HEFF_LIKELY((st) == 2)
+
+static __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
+  if (*st == 1) heff_fail("defined by itself");
+  *st = 1;
+  *val = heff_tr(init());
+  *st = 2;
+  return *val;
+}
+#endif
 
 // Integers
 // ---------------------------------------------------------------------
@@ -1200,7 +1471,23 @@ static V heff_big_lit(const char *s) {
   if (IS_OBJ(v)) OBJ(v)->rc = IMMORTAL;
   return v;
 }
+#ifdef HEFF_THREADS
+// (threads at once: made by the first to have it, kept; another making
+// it meanwhile lets its own go, leaking it)
+#define HEFF_BIG(s) ({                                                      \
+  static V heff_lit_;                                                       \
+  V l_ = __atomic_load_n(&heff_lit_, __ATOMIC_ACQUIRE);                     \
+  if (!l_) {                                                                \
+    V none_ = 0;                                                            \
+    l_ = heff_big_lit(s);                                                   \
+    if (!__atomic_compare_exchange_n(&heff_lit_, &none_, l_, 0,             \
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))   \
+      l_ = none_;                                                           \
+  }                                                                         \
+  l_; })
+#else
 #define HEFF_BIG(s) ({ static V heff_lit_; heff_lit_ ? heff_lit_ : (heff_lit_ = heff_big_lit(s)); })
+#endif
 
 // (a float's integer part, beyond a word if it must be)
 static V heff_int_of_double(double f) {
@@ -2024,40 +2311,142 @@ static void heff_renumber(void) {
     if (heff_things[n].x) heff_numbers[heff_number_slot(heff_things[n].x)] = n;
 }
 
+// (threads at once: the table theirs, each holding it while it looks
+// at it -- what a thing is, and when it is let go, still their own
+// providers' to say)
+#ifdef HEFF_THREADS
+#ifdef HEFF_PART
+extern pthread_mutex_t heff_world_mu;
+#else
+pthread_mutex_t heff_world_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+#define HEFF_WORLD_LOCK() pthread_mutex_lock(&heff_world_mu)
+#define HEFF_WORLD_UNLOCK() pthread_mutex_unlock(&heff_world_mu)
+#else
+#define HEFF_WORLD_LOCK() ((void)0)
+#define HEFF_WORLD_UNLOCK() ((void)0)
+#endif
+
 static int64_t heff_hold(void *x, void (*let_go)(void *)) {
   if (!x) heff_fail("the world holds nothing at NULL");
+  HEFF_WORLD_LOCK();
   if (heff_usednumbers * 2 >= heff_capnumbers) heff_renumber();
-  int64_t s = heff_number_slot(x);
-  if (heff_numbers[s] >= 0) return heff_numbers[s];
-  if (heff_nthings == heff_capthings) {
-    heff_capthings = heff_capthings ? heff_capthings * 2 : 16;
-    HeffThing *t = heff_alloc(heff_capthings * sizeof(HeffThing));
-    if (heff_nthings) memcpy(t, heff_things, heff_nthings * sizeof(HeffThing));
-    free(heff_things);
-    heff_things = t;
+  int64_t s = heff_number_slot(x), n = heff_numbers[s];
+  if (n < 0) {
+    if (heff_nthings == heff_capthings) {
+      heff_capthings = heff_capthings ? heff_capthings * 2 : 16;
+      HeffThing *t = heff_alloc(heff_capthings * sizeof(HeffThing));
+      if (heff_nthings) memcpy(t, heff_things, heff_nthings * sizeof(HeffThing));
+      free(heff_things);
+      heff_things = t;
+    }
+    heff_things[heff_nthings].x = x;
+    heff_things[heff_nthings].free = let_go;
+    heff_numbers[s] = heff_nthings;
+    heff_usednumbers++;
+    n = heff_nthings++;
   }
-  heff_things[heff_nthings].x = x;
-  heff_things[heff_nthings].free = let_go;
-  heff_numbers[s] = heff_nthings;
-  heff_usednumbers++;
-  return heff_nthings++;
+  HEFF_WORLD_UNLOCK();
+  return n;
+}
+
+static void heff_held_none(int64_t i) {
+  static HEFF_TLS char why[64];
+  snprintf(why, sizeof why, "the world holds nothing numbered %lld", (long long)i);
+  heff_fail(why);
 }
 
 static void *heff_held(int64_t i) {
-  if (i < 0 || i >= heff_nthings || !heff_things[i].x) {
-    static char why[64];
-    snprintf(why, sizeof why, "the world holds nothing numbered %lld", (long long)i);
-    heff_fail(why);
-  }
-  return heff_things[i].x;
+  HEFF_WORLD_LOCK();
+  void *x = i < 0 || i >= heff_nthings ? NULL : heff_things[i].x;
+  HEFF_WORLD_UNLOCK();
+  if (!x) heff_held_none(i);
+  return x;
 }
 
 static void heff_release(int64_t i) {
-  void *x = heff_held(i);
-  void (*let_go)(void *) = heff_things[i].free;
-  heff_things[i].x = NULL;
-  heff_things[i].free = NULL;
+  HEFF_WORLD_LOCK();
+  void *x = i < 0 || i >= heff_nthings ? NULL : heff_things[i].x;
+  void (*let_go)(void *) = x ? heff_things[i].free : NULL;
+  if (x) {
+    heff_things[i].x = NULL;
+    heff_things[i].free = NULL;
+  }
+  HEFF_WORLD_UNLOCK();
+  if (!x) heff_held_none(i);
   if (let_go) let_go(x);
+}
+
+// Threads a provider starts (#36; docs/threads.md): each runs what it
+// is given -- a copy of it, `heff_copy_for_thread` -- by `heff_try`, so
+// that a failure there is the thread's to hand back, not the end of the
+// process; and ends by `heff_thread_end`.
+// ---------------------------------------------------------------------
+
+// (`f x`, asked for here, a failure caught: 0, its value at `*out`; or
+// why it failed -- "heff:abandon" where it abandoned (`heff_abandon`),
+// the thread's own string otherwise, to be copied before the thread
+// ends.  What was made before the failure is leaked, not given back)
+static const char *heff_try(V f, V x, V *out) {
+  jmp_buf here;
+  jmp_buf *volatile up = heff_catch;
+#ifdef HEFF_THREADS
+  volatile size_t open = heff_nopen;
+#endif
+  heff_catch = &here;
+  if (setjmp(here) == 0) {
+    *out = heff_tr(heff_app1(f, x));
+    heff_catch = up;
+    return NULL;
+  }
+  heff_catch = up;
+#ifdef HEFF_THREADS
+  heff_reopen(open);
+#endif
+  return heff_caught;
+}
+
+// (a failure handed back, as the thread it was caught in would have
+// failed: `why` from `heff_try`, copied)
+static void heff_fail_again(const char *why) {
+  if (strcmp(why, "heff:abandon") == 0) heff_abandon();
+  heff_fail(why);
+}
+
+// (this thread's free lists and what else the runtime keeps for it given
+// back to the system, as it ends)
+static void heff_thread_end(void) {
+  for (size_t c = 0; c <= SMALL_MAX / 8; c++) {
+    void *p = heff_free_list[c];
+    while (p) {
+      void *next = *(void **)p;
+      free(p);
+      p = next;
+    }
+    heff_free_list[c] = NULL;
+  }
+  free(heff_dead);
+  heff_dead = NULL;
+  heff_ndead = heff_cdead = 0;
+#ifdef HEFF_THREADS
+  free(heff_open);
+  heff_open = NULL;
+  heff_nopen = heff_capopen = 0;
+#endif
+}
+
+// (a thread started, as the program's own is, with a large stack: heff's
+// recursion is the C stack's -- 0, or the system's error)
+#ifndef HEFF_THREAD_STACK
+#define HEFF_THREAD_STACK ((size_t)1 << 28)
+#endif
+static int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, HEFF_THREAD_STACK);
+  int r = pthread_create(t, &attr, run, u);
+  pthread_attr_destroy(&attr);
+  return r;
 }
 
 // Running

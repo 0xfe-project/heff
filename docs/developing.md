@@ -42,7 +42,9 @@ language change means the old seed can no longer compile the source.
 `node test/run.mjs [GROUP...]` runs the tests on `.heff/out/heff` (or on
 `HEFF`), by group: `compiler`, `lsp`, `backends` (each backend held to
 the interpreter), `fixpoint` (heff compiles itself to the same C) and
-`asan` (heff under AddressSanitizer).  Among them, `test/golden/` holds
+`asan` (heff under AddressSanitizer).  `HEFF_SANITIZE=1` builds the
+backends' C programs under AddressSanitizer, and `HEFF_TSAN=1` runs the
+threads test under ThreadSanitizer too ([threads.md](threads.md)).  Among them, `test/golden/` holds
 the output of `check`, `explain`, `eval` and `type-at` on the library
 and test files; after an intended change, update it with
 `node test/golden.mjs --update`.

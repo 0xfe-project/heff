@@ -14,7 +14,7 @@
 // (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
 // write, their exit status, loops a million rounds deep, a long loop of
 // operations done at once, time and the network; and, by C alone,
-// processes forked.
+// processes forked, and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -266,6 +266,45 @@ if (process.platform !== "win32") checks.push((async () => {
   const want = "said before the spread, once\nsquares: 0 1 4 9\nnested: 0.0,0.1,0.2 1.0,1.1,1.2\n"
     + "each its own: 0 15 30; the parent's: 15\nfib 15, each Par forked: 610\n";
   return r.status === 0 && r.stdout === want ? [] : [`FAIL processes (c): status ${r.status}\n${r.stdout}${r.stderr}`];
+})());
+
+// threads truly at once, by C alone (test/node/threads.provider.c says
+// `#define HEFF_THREADS 1`: the runtime built for threads,
+// docs/threads.md): the rest of the program run by each thread, each on
+// its own copy, their answers gathered in order; a definition every
+// thread asks for, computed once; tasks taken by threads as they end
+// one; a static thunk forced by threads at once; lib/parallel.hf's `Par`
+// each side a thread; and a thread abandoning, the program abandoning
+// when it is joined.  HEFF_TSAN=1: built with ThreadSanitizer too, by
+// the system's clang, and run again, what it says a failure.
+const threadsWant = "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
+  + "a definition, shared: 333833500 333833501 333833502 333833503\nprimes below 100000, by 4: 9592\n"
+  + "forced at once: 6765 6765 6765 6765\nfib 20, each Par a thread: 6765\n";
+if (process.platform !== "win32") checks.push((async () => {
+  const msgs = [];
+  for (const [name, args, want] of [
+    ["main", [], { out: threadsWant, status: 0 }],
+    ["failing", [], { out: "", err: "heff:abandon\n", status: 1 }],
+    ["cpu", ["queens", "8", "4"], { out: "queens: answer 92\n", status: 0 }],
+  ]) {
+    const p = await programs.c("test/node/threads.hf", name);
+    if (p.error !== undefined) { msgs.push(`FAIL threads ${name} (c): not compiled\n${p.error}`); continue; }
+    const bins = [p.cmd];
+    if (process.env.HEFF_TSAN) {
+      const tsan = `${p.cmd}-tsan`;
+      const b = await run("clang", ["-O1", "-g", "-fsanitize=thread", "-w", p.cmd.replace(/-c$/, ".c"), "-o", tsan, "-lm", "-lpthread"]);
+      if (b.status !== 0) msgs.push(`FAIL threads ${name} (tsan): not built\n${b.stderr}${b.error ?? ""}`);
+      else bins.push(tsan);
+    }
+    for (const bin of bins) {
+      const r = await run(bin, args, { timeout: 60000, env: { ...process.env, ASAN_OPTIONS: "detect_leaks=0" } });
+      const got = { out: r.stdout, err: r.stderr, status: r.status };
+      for (const k of Object.keys(want))
+        if (got[k] !== want[k]) msgs.push(`FAIL threads ${name} (${basename(bin)}): ${k} ${JSON.stringify(got[k])}, wanted ${JSON.stringify(want[k])}`);
+      if (!("err" in want) && r.stderr) msgs.push(`FAIL threads ${name} (${basename(bin)}): said ${r.stderr.split("\n").slice(0, 30).join("\n")}`);
+    }
+  }
+  return msgs;
 })());
 
 // loops, compiled as loops: a million rounds, and the stack does not overflow

@@ -4,7 +4,8 @@ An effect of the world is carried out by its provider: an effect's
 JavaScript side is in `M.provider.js` beside `M.hf`, its C side in
 `M.provider.c`; the things they hand out the world holds for them all.
 This is where a heff program meets its host, and so where how each
-backend keeps a value matters.
+backend keeps a value matters.  A C provider may run the program in
+threads truly at once: see [threads.md](threads.md).
 
 ## Strings
 
