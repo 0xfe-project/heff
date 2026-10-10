@@ -131,7 +131,9 @@ be negative: `-` right before a digit is its sign, unless it is right
 after an operand (a name, a literal, a closing bracket, with no space
 between).  So `a - 1` and `a-1` subtract, while `f -1` and `a -1` are
 applied to -1; `-128` as an `Int8` is its least, and a pattern may be
-negative too.  There is no other unary minus: `0 - x` negates.  Where
+negative too.  There is no other unary minus: the prelude's `neg x`
+negates an `Int` (`negFloat` a `Float64`, and a fixed-width type's
+module's `neg` one of its own).  Where
 the type is not known yet, the literal waits for it, and unification
 finds it from how the literal is used (`id 5` wanted as an `Int32` is
 one).  It must be one of the type's values, however late the type is
