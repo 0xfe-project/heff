@@ -450,6 +450,67 @@ unrequired names Nil = Nothing
 unrequired names (Cons (MkPair n x) rest) =
   if List.elemBy strEq n names then unrequired names rest else Just (MkPair n x)
 
+-- heff's own package
+--------------------------------------------------------------------------------
+-- The package `heff` is heff's: its library and its source.  The
+-- compiler keeps the name: no package requires it or replaces it (it
+-- comes with heff), and a project names itself so only where heff is
+-- built or installed from (src/heff/build/load.hf says where that is).
+
+-- | the package heff is
+heffModule : String
+heffModule = "heff"
+
+-- (a problem with heff's own package: E0347)
+reserved : String -> String
+reserved msg = "error[E0347]: " ^ msg
+
+-- | what is said of a project naming itself heff's own package where
+-- | heff is not built or installed from
+claimMsg : String
+claimMsg =
+  reserved
+    "the package `heff` is heff's own, and this is not the checkout heff is built in or was installed from: name the project otherwise"
+
+-- | what is said of requiring heff's own package
+requireMsg : String
+requireMsg =
+  reserved
+    "the package `heff` is heff's own, which comes with heff: it is not required"
+
+replaceMsg : String -> String
+replaceMsg n =
+  reserved
+    ("`"
+     ^ n
+     ^ "` is the package `heff`, heff's own, which comes with heff: it is not replaced")
+
+-- (the first of `named` whose name is one of `names`)
+firstNamed : List String -> List (Pair String Lit) -> Maybe (Pair String Lit)
+firstNamed names Nil = Nothing
+firstNamed names (Cons (MkPair n x) rest) =
+  if List.elemBy strEq n names then Just (MkPair n x) else firstNamed names rest
+
+requiredPaths : List Lit -> List Require -> List (Pair String Lit)
+requiredPaths xs rs = List.zipWith (\x (r : Require) -> MkPair r.path x) xs rs
+
+-- (the names heff's own package is required by)
+heffNames : List Require -> List String
+heffNames rs =
+  List.map
+    (\(r : Require) -> r.name)
+    (List.filter (\(r : Require) -> strEq r.path heffModule) rs)
+
+-- (heff's own package is neither replaced nor required)
+checkHeff : List Lit -> List Require -> List Lit -> List Replace -> Check Unit
+checkHeff rxs rs pxs ps = case firstNamed
+    (heffNames rs)
+    (replacedNames pxs ps) of
+  Just (MkPair n x) -> Left (problemAt (litTok x) (replaceMsg n))
+  Nothing -> case firstNamed [heffModule] (requiredPaths rxs rs) of
+    Just (MkPair _ x) -> Left (problemAt (litTok x) requireMsg)
+    Nothing -> Right MkUnit
+
 checkNames : List Lit -> List Require -> List Lit -> List Replace -> Check Unit
 checkNames rxs rs pxs ps = case twiceGo Nil (requiredNames rxs rs) of
   Just (MkPair n x) ->
@@ -463,7 +524,7 @@ checkNames rxs rs pxs ps = case twiceGo Nil (requiredNames rxs rs) of
       Just (MkPair n x) ->
         Left
           (problemAt (litTok x) ("`" ^ n ^ "` is replaced, but not required"))
-      Nothing -> Right MkUnit
+      Nothing -> checkHeff rxs rs pxs ps
 
 packageOf4 : Lit -> Lit -> Lit -> Lit -> Check Package
 packageOf4 m h rq rp = case str m of
@@ -483,10 +544,13 @@ packageOf4 m h rq rp = case str m of
               Right _ ->
                 Right { module = mpath, heff = hv, require = rs, replace = ps }
 
+-- (a package.hf's fields)
+packageFields : List Field
+packageFields =
+  [required "module", required "heff", orNone "require", orNone "replace"]
+
 packageOf : Lit -> Check Package
-packageOf x = case fieldsAre
-    [required "module", required "heff", orNone "require", orNone "replace"]
-    x of
+packageOf x = case fieldsAre packageFields x of
   Left p -> Left p
   Right (Cons m (Cons h (Cons rq (Cons rp Nil)))) -> packageOf4 m h rq rp
   Right _ -> Left (problemAt (litTok x) "expected a record `{...}`")
@@ -497,18 +561,40 @@ lexedTokens l = l.tokens
 lexedErrors : L.Lexed -> List L.Err
 lexedErrors l = l.errors
 
--- | a package.hf's text, read
-readPackage : String -> Check Package
-readPackage src = case lexedErrors (L.lex src) of
+-- (a package.hf's text, its `package` literal read)
+packageLit : String -> Check Lit
+packageLit src = case lexedErrors (L.lex src) of
   Cons e _ -> Left { at = e.start, msg = e.msg }
-  Nil -> case declsGo
+  Nil ->
+    declsGo
       "package.hf"
       "package"
       (A.fromList (lexedTokens (L.lex src)))
       0
-      Nothing of
-    Left p -> Left p
-    Right x -> packageOf x
+      Nothing
+
+packageFrom : Check Lit -> Check Package
+packageFrom (Left p) = Left p
+packageFrom (Right x) = packageOf x
+
+-- | a package.hf's text, read
+readPackage : String -> Check Package
+readPackage src = packageFrom (packageLit src)
+
+claimAt : Check (List Lit) -> Problem
+claimAt (Right (Cons m _)) = problemAt (litTok m) claimMsg
+claimAt _ = { at = 0, msg = claimMsg }
+
+claimOf : Check Lit -> Problem
+claimOf (Right x) = claimAt (fieldsAre packageFields x)
+claimOf (Left _) = { at = 0, msg = claimMsg }
+
+-- | what is said of the package.hf `src`, naming itself heff's own
+-- | package where heff is not built or installed from: at its `module`
+-- | >>> (claimed "package = { module = \"heff\", heff = \"0.1.0\" }").at
+-- | 21
+claimed : String -> Problem
+claimed src = claimOf (packageLit src)
 
 -- A program's build.hf
 --------------------------------------------------------------------------------
@@ -640,6 +726,10 @@ saidBuild (Right a) =
 -- | "67: `j` is replaced, but not required"
 -- | >>> said (readPackage "package = { module = \"m\" ^ \"n\", heff = \"0.1.0\", require = [], replace = [] }")
 -- | "25: expected `,` or `}`: a field is a literal, nothing is computed"
+-- | >>> said (readPackage "package = { module = \"m\", heff = \"0.1.0\", require = [{ name = \"h\", path = \"heff\", version = \"0.3.0\" }] }")
+-- | "53: error[E0347]: the package `heff` is heff's own, which comes with heff: it is not required"
+-- | >>> said (readPackage "package = { module = \"m\", heff = \"0.1.0\", require = [{ name = \"h\", path = \"heff\", version = \"0.3.0\" }], replace = [{ name = \"h\", dir = \"../h\" }] }")
+-- | "115: error[E0347]: `h` is the package `heff`, heff's own, which comes with heff: it is not replaced"
 -- | >>> said (readPackage "helper = 1\npackage = { module = \"m\", heff = \"0.1.0\", require = [], replace = [] }")
 -- | "0: package.hf holds imports, and `package` (its signature and its definition), nothing else"
 said : Check Package -> String

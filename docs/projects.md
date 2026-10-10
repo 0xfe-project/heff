@@ -30,6 +30,28 @@ package =
   }
 ```
 
+## heff's own package
+
+The package `heff` is heff's: the compiler and its library, which come
+with heff.  The compiler keeps the name, as Go keeps `std`: no package
+requires `heff`, replaces it, or gets it (`heff get heff`), and `heff
+init` makes no project of that name -- each an error, E0347.
+
+A project's `package.hf` names `heff` only where heff is from, and there
+its `lib/` is the library (see [the library](library.md)):
+
+- the directory the heff running came with -- the checkout it is built
+  in (`.heff/out/heff`), or the heff home it is installed in;
+- the checkout it was installed from: `heff install` of heff's own
+  package writes it to the heff home's `source` (`~/.heff/source`),
+  read from the heff home heff came with and from `HEFF_HOME`'s;
+- a directory whose `lib/` is the library heff has already (`HEFF_LIB`,
+  a release's), which so gains nothing.
+
+Anywhere else, naming `heff` is an error: where heff is from is said by
+heff and its heff home, never by the project.  To work on a checkout of
+heff, build it (`node scripts/build.mjs`) or install from it.
+
 ## Programs
 
 A program is `app/NAME/main.hf`, with an `app/NAME/build.hf` beside it
@@ -50,4 +72,4 @@ build = { backend = C, run = "main" }
 heff itself is such a program: `app/heff/build.hf` ships `lib` and
 `package.hf`, so that `heff install` lays the heff home out as a
 release is -- `bin/heff`, and beside it what heff finds there, its
-library and its version.
+library and its version -- and `source`, the checkout it came from.

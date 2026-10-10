@@ -8,15 +8,15 @@ there).  Its modules alone declare primitives --
 and each primitive once: one a module of a program declares, or one
 declared again, is an error.
 
-heff's own repository is the library's source: in a project whose
-`package.hf` names the package the running heff came with (its
-`module`, `github.com/dannypsnl/heff`), the library is that project's
-`lib/`, whatever `HEFF_LIB` or the installed heff says.  So an installed
-heff, or one built in another checkout, checks the repository's
-`lib/float32.hf` as the library's, its primitives its own and declared
-once.  Any other project's `lib/` is no library; a project that names
-itself heff's package takes its `lib/` for the whole library, as
-`HEFF_LIB` pointed there would.
+heff's own repository is the library's source.  Its `package.hf` names
+the package `heff`, which the compiler keeps for itself (see
+[projects](projects.md#heffs-own-package)): where heff is from, that
+project's `lib/` is the library, whatever `HEFF_LIB` or the installed
+heff says.  So an installed heff, or one built in another checkout,
+checks the repository's `lib/float32.hf` as the library's, its
+primitives its own and declared once.  Any other project's `lib/` is no
+library, and a project elsewhere that names itself `heff` is an error
+(E0347), its `lib/` no library either.
 
 ## Modules
 

@@ -23,10 +23,16 @@ dropHf p = if endsWith ".hf" p then strSlice p 0 (strLength p - 3) else p
 
 -- | where the standard library is, where packages are fetched to, the
 -- | directory heff runs in, the style of the paths of the platform heff
--- | runs on, and the package heff is, as the package.hf it came with
--- | names it ("": none that reads)
+-- | runs on, and where heff is from: the directory it came with (the
+-- | checkout it is built in, or the heff home), and the checkout the heff
+-- | home was installed from, if it was
 type Host =
-  { lib : String, mod : String, cwd : String, style : P.Style, heff : String }
+  { lib : String
+  , mod : String
+  , cwd : String
+  , style : P.Style
+  , heff : List String
+  }
 
 -- | where the project is, where its modules are, where the standard
 -- | library, where packages are fetched to, and the directory a relative
@@ -110,20 +116,31 @@ sameDir h a b =
     (P.normalize h.style (P.join h.style h.cwd a))
     (P.normalize h.style (P.join h.style h.cwd b))
 
+-- | the project at `d` may be heff's own package (`heff`): it is where
+-- | heff is from -- the directory heff came with, the checkout the heff
+-- | home was installed from -- or its `lib/` is the library heff has
+-- | already.  No other project names itself so: where it is is the
+-- | heff's, not the project's, to say.
+heffAt : Host -> String -> Bool
+heffAt h d =
+  List.any (\o -> sameDir h o d) h.heff
+  || sameDir h h.lib (P.join h.style d "lib")
+
 -- (the library of the project at `d`, its package.hf read)
 libRead : Host -> String -> Either Pr.Problem Pr.Package -> String
 libRead h d (Right pk) =
-  if not (strEq h.heff "")
-  && strEq pk.module h.heff
+  if strEq pk.module Pr.heffModule
+  && heffAt h d
   && not (sameDir h h.lib (P.join h.style d "lib"))
     then P.join h.style d "lib"
   else h.lib
 libRead h d (Left _) = h.lib
 
 -- | the library of the project at `d`, the text of its package.hf
--- | `hf`: heff's own package's is its `lib/` -- the library's source,
--- | wherever the library of the heff running is (`HEFF_LIB`, or where
--- | heff is installed) -- any other's the heff running's
+-- | `hf`: heff's own package's (where heff is from, `heffAt`) is its
+-- | `lib/` -- the library's source, wherever the library of the heff
+-- | running is (`HEFF_LIB`, or where heff is installed) -- any other's
+-- | the heff running's
 libOf : Host -> String -> Maybe String -> String
 libOf h d (Just hf) = libRead h d (Pr.readPackage hf)
 libOf h d Nothing = h.lib
@@ -939,18 +956,31 @@ type Loaded =
   , packages : List Pkg
   }
 
+-- (the project's package.hf, its text `src`, read: one naming itself
+-- heff's own package where heff is not from is an error, E0347)
+packageRead : Host
+            -> Paths
+            -> String
+            -> Either Pr.Problem Pr.Package
+            -> Either String Pr.Package
+packageRead h ps src (Left p) =
+  Left (problemMsg (under ps ps.root "package.hf") src p)
+packageRead h ps src (Right pk) =
+  if strEq pk.module Pr.heffModule && not (heffAt h ps.root)
+    then Left (problemMsg (under ps ps.root "package.hf") src (Pr.claimed src))
+  else Right pk
+
 -- | the project's package.hf, read (Nothing: there is none)
 readPackageAt : {e : HFunctor}
               -> {{ev : fs <: e}}
+              -> Host
               -> Paths
               -> Co e (Maybe (Either String Pr.Package))
-readPackageAt ps = do
+readPackageAt h ps = do
   text <- readFile (under ps ps.root "package.hf")
   val (case text of
     Nothing -> Nothing
-    Just src -> case Pr.readPackage src of
-      Left p -> Just (Left (problemMsg (under ps ps.root "package.hf") src p))
-      Right pk -> Just (Right pk))
+    Just src -> Just (packageRead h ps src (Pr.readPackage src)))
 
 packageOf : Maybe (Either String Pr.Package) -> Maybe Pr.Package
 packageOf (Just (Right p)) = Just p
@@ -1030,7 +1060,7 @@ loadProgramWith : {e : HFunctor}
                 -> Co e Loaded
 loadProgramWith read h file = do
   ps <- pathsFor h file
-  pk <- readPackageAt ps
+  pk <- readPackageAt h ps
   pkgs <- packagesOf ps (packageOf pk)
   mSrc <- read file
   case mSrc of

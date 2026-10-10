@@ -93,18 +93,20 @@ ownPackage = do
   self <- programPath
   pure (P.join st (ownRoot st self) "package.hf")
 
-moduleRead : Either Pr.Problem Pr.Package -> String
-moduleRead (Right p) = p.module
-moduleRead (Left _) = ""
+-- | the file in the heff home that says the checkout it was installed
+-- | from: `heff install` of heff's own package writes it
+sourceFile : P.Style -> String -> String
+sourceFile st home = P.join st home "source"
 
--- (the package a package.hf's text names, "" if there is none that
--- reads)
-moduleNamed : Maybe String -> String
-moduleNamed (Just src) = moduleRead (Pr.readPackage src)
-moduleNamed Nothing = ""
+-- (the checkout a heff home's `source` says)
+sourceSaid : Maybe String -> List String
+sourceSaid (Just text) = if strEq (trim text) "" then Nil else [trim text]
+sourceSaid Nothing = Nil
 
 -- | the library, the packages fetched, the directory heff runs in, the
--- | style of the platform's paths, and the package heff is
+-- | style of the platform's paths, and where heff is from: the directory
+-- | it came with, and the checkout it was installed from -- as that
+-- | directory says, if it is a heff home, and as the heff home says
 hostNow : {e : HFunctor}
         -> {{sys : process <: e}}
         -> {{disk : fs <: e}}
@@ -114,9 +116,20 @@ hostNow = do
   mod <- modDir
   cwd <- workingDir
   st <- styleNow
-  own <- ownPackage
-  text <- readFile own
-  pure { lib = lib, mod = mod, cwd = cwd, style = st, heff = moduleNamed text }
+  self <- programPath
+  home <- heffHome
+  came <- readFile (sourceFile st (ownRoot st self))
+  source <- readFile (sourceFile st home)
+  pure
+      { lib = lib
+      , mod = mod
+      , cwd = cwd
+      , style = st
+      , heff =
+          Cons
+            (ownRoot st self)
+            (List.append (sourceSaid came) (sourceSaid source))
+      }
 
 -- | the version of heff running: the heff its own package.hf is for
 ownVersion : {e : HFunctor}
@@ -1595,10 +1608,40 @@ onPathHint st bin = do
          ^ bin
          ^ " is not on the PATH: add it there to run them by their names")
 
+-- (the package.hf's text, read, names heff's own package)
+heffRead : Either Pr.Problem Pr.Package -> Bool
+heffRead (Right pk) = strEq pk.module Pr.heffModule
+heffRead (Left _) = False
+
+isHeffPackage : Maybe String -> Bool
+isHeffPackage (Just text) = heffRead (Pr.readPackage text)
+isHeffPackage Nothing = False
+
+-- (heff's own package installed from `dir` -- where heff is from, or it
+-- would not have been built: the heff home says it was the checkout,
+-- for any heff to take that checkout as heff's own; then `next`)
+sourceSaved : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> P.Style
+            -> Target
+            -> String
+            -> String
+            -> Co e Unit
+            -> Co e Unit
+sourceSaved st t home dir next = do
+  cwd <- workingDir
+  ok <-
+    writeFile (sourceFile st home) (P.normalize st (P.join st cwd dir) ^ "\n")
+  if ok then wrote t (sourceFile st home) next
+    else shipFails ("cannot write " ^ sourceFile st home)
+
 -- | install the project at DIR: built as `heff build` builds it, but to
 -- | run its fastest (zig's `-O2`), its programs into the heff home's
 -- | `bin/` (`HEFF_HOME/bin`, `~/.heff/bin`), and what they ship (their
--- | build.hf's `ships`) into the heff home, beside `bin/`
+-- | build.hf's `ships`) into the heff home, beside `bin/`; heff's own
+-- | package installed, the heff home's `source` says the checkout DIR is
 installCmd : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
@@ -1635,7 +1678,9 @@ installCmd dir = do
               ^ dir
               ^ ": app/X/ with a build.hf is the program X")
          exit 1)
-        (onPathHint st t.bin)
+        (if isHeffPackage text
+           then sourceSaved st t home dir (onPathHint st t.bin)
+         else onPathHint st t.bin)
 
 -- | how `heff compile` was called: FILE, OUT, `--name`, `--backend`
 type CompileOpts =
@@ -2518,6 +2563,11 @@ initCmd dir = do
              ^ name
              ^ "` cannot name a package: a lowercase letter, then letters, digits and `_`")
         exit 1
+    else if strEq name Pr.heffModule
+      then do
+        printErr
+            "heff: `heff` is heff's own package: name the project otherwise"
+        exit 1
     else case there of
       Cons _ _ -> do
         printErr
@@ -2846,16 +2896,18 @@ getCmd spec = do
       Left _ -> getFails "package.hf does not read"
       Right pk -> case spec of
         Nothing -> getAll
-        Just s -> do
-          h <- hostNow
-          ps <- L.pathsFor h "package.hf"
-          v <- case snd (specOf s) of
-            Just v -> pure (Right v)
-            Nothing -> newestTag (fst (specOf s))
-          case v of
-            Left why -> getFails why
-            Right ver -> case Pr.version ver of
-              Nothing -> getFails ("`" ^ ver ^ "` is no version: a.b.c")
-              Just _ -> do
-                ok <- getRequire ps t pk (fst (specOf s)) ver
-                if ok then getAll else pure MkUnit
+        Just s ->
+          if strEq (fst (specOf s)) Pr.heffModule then getFails Pr.requireMsg
+          else do
+            h <- hostNow
+            ps <- L.pathsFor h "package.hf"
+            v <- case snd (specOf s) of
+              Just v -> pure (Right v)
+              Nothing -> newestTag (fst (specOf s))
+            case v of
+              Left why -> getFails why
+              Right ver -> case Pr.version ver of
+                Nothing -> getFails ("`" ^ ver ^ "` is no version: a.b.c")
+                Just _ -> do
+                  ok <- getRequire ps t pk (fst (specOf s)) ver
+                  if ok then getAll else pure MkUnit

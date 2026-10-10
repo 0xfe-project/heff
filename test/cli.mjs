@@ -317,9 +317,13 @@ expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
 // (`HEFF_LIB` elsewhere, as an installed heff's is): its primitives its
 // own, declared once; the lib/ of a project that is not heff is none
 {
+  const { HEFF_LIB: _lib, ...env } = process.env;
+  const noHome = join(work, "no-home");
+  mkdirSync(noHome, { recursive: true });
+  const checkWith = (bin, more, f) => spawnSync(bin, ["check", f], { cwd: work, encoding: "utf8", env: { ...env, HEFF_HOME: noHome, ...more } });
   const elsewhere = join(work, "elsewhere", "lib");
   cpSync(join(root, "lib"), elsewhere, { recursive: true });
-  const checkIn = (f) => spawnSync(heffBin, ["check", f], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_LIB: elsewhere } });
+  const checkIn = (f) => checkWith(heffBin, { HEFF_LIB: elsewhere }, f);
   const own = checkIn(join(root, "lib", "float32.hf"));
   expect("heff's own lib/, the library elsewhere", own.status === 0 && !/E033[56]/.test(own.stderr), own);
   const other = join(work, "other");
@@ -328,6 +332,25 @@ expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
   writeFileSync(join(other, "lib", "sin.hf"), "primitive floatSin : Float -> Float\n");
   const notHeff = checkIn(join(other, "lib", "sin.hf"));
   expect("another project's lib/", notHeff.status === 1 && notHeff.stderr.includes("error[E0335]"), notHeff);
+  // a heff not built in the repository (installed, another checkout's):
+  // the repository is heff's own where its heff home says it was
+  // installed from it (`source`), and nowhere else
+  const home = join(work, "home");
+  const installed = join(home, "bin", basename(heffBin));
+  mkdirSync(join(home, "bin"), { recursive: true });
+  copyFileSync(heffBin, installed);
+  chmodSync(installed, 0o755);
+  cpSync(join(root, "lib"), join(home, "lib"), { recursive: true });
+  copyFileSync(join(root, "package.hf"), join(home, "package.hf"));
+  const unsaid = checkWith(installed, { HEFF_HOME: home }, join(root, "lib", "float32.hf"));
+  expect("heff's own lib/, the heff home not installed from it", unsaid.status === 1 && unsaid.stderr.includes("error[E0347]: the package `heff` is heff's own"), unsaid);
+  writeFileSync(join(home, "source"), root + "\n");
+  const said = checkWith(installed, { HEFF_HOME: home }, join(root, "lib", "float32.hf"));
+  expect("heff's own lib/, the heff home installed from it", said.status === 0 && !/E03(3[56]|47)/.test(said.stderr), said);
+  // (the heff home's own package.hf names heff: its lib/ is the library
+  // a heff given it, `HEFF_LIB`, has)
+  const ofHome = checkWith(heffBin, { HEFF_LIB: join(home, "lib") }, join(home, "lib", "float32.hf"));
+  expect("the heff home's lib/, the library", ofHome.status === 0 && !/E03(3[56]|47)/.test(ofHome.stderr), ofHome);
 }
 
 console.log(`cli: ${checks - failed}/${checks} checks hold`);

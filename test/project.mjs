@@ -182,6 +182,35 @@ const wrong = heff("check", "wrong/src/wrong/main.hf");
 expect("a directory of another package", wrong.status === 1 &&
   wrong.stderr.includes("jsony/package.hf is the package y.org/json, not x.org/json"), wrong);
 
+// heff's own package, `heff`, is the compiler's: a project elsewhere
+// naming itself so is refused (and its lib/ is no library), and none
+// requires it or replaces it, nor gets it, nor is made by that name
+write("fakeheff/package.hf", manifestOf("heff"));
+write("fakeheff/src/x/m.hf", "x : Int\nx = 1\n");
+write("fakeheff/lib/sin.hf", "primitive floatSin : Float -> Float\n");
+const claimed = heff("check", "fakeheff/src/x/m.hf");
+expect("a project naming itself heff", claimed.status === 1 &&
+  claimed.stderr.includes("fakeheff/package.hf:1:22: error[E0347]: the package `heff` is heff's own, and this is not the checkout heff is built in or was installed from"), claimed);
+const claimedLib = heff("check", "fakeheff/lib/sin.hf");
+expect("a project naming itself heff: its lib/", claimedLib.status === 1 &&
+  claimedLib.stderr.includes("error[E0347]") && claimedLib.stderr.includes("error[E0335]"), claimedLib);
+write("reqheff/package.hf", manifestOf("x.org/reqheff", [["h", "heff"]]));
+write("reqheff/src/reqheff/m.hf", "x : Int\nx = 1\n");
+const reqHeff = heff("check", "reqheff/src/reqheff/m.hf");
+expect("a project requiring heff", reqHeff.status === 1 &&
+  reqHeff.stderr.includes("reqheff/package.hf:1:") && reqHeff.stderr.includes(": error[E0347]: the package `heff` is heff's own, which comes with heff: it is not required"), reqHeff);
+write("repheff/package.hf", manifestOf("x.org/repheff", [["h", "heff", "../fakeheff"]]));
+write("repheff/src/repheff/m.hf", "x : Int\nx = 1\n");
+const repHeff = heff("check", "repheff/src/repheff/m.hf");
+expect("a project replacing heff", repHeff.status === 1 &&
+  repHeff.stderr.includes("error[E0347]: `h` is the package `heff`, heff's own, which comes with heff: it is not replaced"), repHeff);
+write("getheff/package.hf", manifestOf("x.org/getheff"));
+const getHeff = spawnSync(heffBin, ["get", "heff"], { cwd: join(work, "getheff"), encoding: "utf8" });
+expect("get heff", getHeff.status === 1 && getHeff.stderr.includes("heff get: error[E0347]: the package `heff` is heff's own") &&
+  readFileSync(join(work, "getheff", "package.hf"), "utf8") === manifestOf("x.org/getheff"), getHeff);
+const initHeff = heff("init", "heff");
+expect("init heff", initHeff.status === 1 && initHeff.stderr.includes("`heff` is heff's own package") && !existsSync(join(work, "heff")), initHeff);
+
 write("two/package.hf", manifestOf("x.org/two"));
 write("two/src/a/a.hf", "x : Int\nx = 1\n");
 write("two/src/b/b.hf", "x : Int\nx = 1\n");
@@ -433,11 +462,17 @@ write("uses-prelude.hf", "xs : List Int\nxs = List.map (\\x -> x + 1) [1, 2]\n")
 const selfChecked = installedHeff("check", "uses-prelude.hf");
 const selfInit = installedHeff("init", "fromhome");
 const selfVersion = installedHeff("version");
+// (the repository installed from: heff's own, its lib/ the library's
+// source to the heff installed, as to the editor's)
+const selfOwn = installedHeff("check", join(root, "lib", "float32.hf"));
 expect("install heff: the heff in the heff home, with its library and its version", selfInstalled.status === 0 &&
   selfInstalled.stdout.includes(`installed ${join(heffHome, "lib")}\n`) && selfInstalled.stdout.includes(`installed ${join(heffHome, "package.hf")}\n`) &&
   selfChecked.status === 0 && selfChecked.stdout.includes("xs : List Int") &&
   selfInit.status === 0 && readFileSync(join(work, "fromhome", "package.hf"), "utf8").includes(`heff = "${version}"`) &&
   selfVersion.status === 0 && selfVersion.stdout === `heff ${version}\n`, [selfInstalled, selfChecked, selfInit, selfVersion]);
+expect("install heff: the heff home says the repository is heff's own", existsSync(join(heffHome, "source")) &&
+  selfInstalled.stdout.includes(`installed ${join(heffHome, "source")}\n`) &&
+  selfOwn.status === 0 && !/E03(3[56]|47)/.test(selfOwn.stderr), [existsSync(join(heffHome, "source")) && readFileSync(join(heffHome, "source"), "utf8"), selfOwn]);
 
 // a manifest's fields with a default in lib/manifest.hf (`require`,
 // `replace`, a build.hf's `ships`: empty lists) left out, or written: heff
