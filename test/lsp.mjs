@@ -173,6 +173,17 @@ try {
   const lDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-list.hf") }, position: pos(listed, "map") });
   expect("definition of `List.map`", lDef.result && lDef.result.uri === uri("lib/list.hf") && lDef.result.range.start.line === pos(disk("lib/list.hf"), "map :").line, lDef.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-list.hf") } });
+  // a module imported under a built-in type's name: `Rune.toInt` the
+  // module's, hovered and gone to
+  const runed = "import rune as Rune\n\nx : Int\nx = Rune.toInt (Rune.fromInt 65)\n";
+  open("test/surface/lsp-rune.hf", runed);
+  const rDiags = await diagnosticsOf(uri("test/surface/lsp-rune.hf"));
+  expect("an alias over a type checks", rDiags.length === 0, rDiags);
+  const rHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-rune.hf") }, position: pos(runed, "toInt") });
+  expect("hover on `Rune.toInt`", rHover.result && rHover.result.contents.value.includes("toInt : Rune -> Int"), rHover.result);
+  const rDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-rune.hf") }, position: pos(runed, "toInt") });
+  expect("definition of `Rune.toInt`", rDef.result && rDef.result.uri === uri("lib/rune.hf") && rDef.result.range.start.line === pos(disk("lib/rune.hf"), "toInt :").line, rDef.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-rune.hf") } });
   const dotted = "import a as A\n\nx : A.Bool\nx = A.";
   open("test/modules/lsp-dot.hf", dotted);
   await diagnosticsOf(uri("test/modules/lsp-dot.hf"));

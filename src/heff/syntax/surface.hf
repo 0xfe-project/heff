@@ -907,25 +907,70 @@ withFields : Notation.Expr -> List C.T -> Notation.Expr
 withFields e fs =
   Notation.app e (List.map (\(f : C.T) -> At (EProject f.text) (spanT f)) fs)
 
+-- (`M.x` is a name `M`, an import's alias, gives)
+qualifiedBy : St -> C.T -> List C.T -> Bool
+qualifiedBy s t (Cons f _) = s.known (t.text ^ "." ^ f.text)
+qualifiedBy s t Nil = False
+
+-- (`M.x`, a definition of the module imported as `M`, and the fields
+-- after it)
+qualifiedE : C.T -> List C.T -> Notation.Expr
+qualifiedE t (Cons f rest) =
+  withFields (At (EVar (t.text ^ "." ^ f.text)) (spanTT t f)) rest
+qualifiedE t Nil = At (ETag t.text) (spanT t)
+
+-- (`M.x` where `M` is an import's alias that has `x` and a local name
+-- too: which is meant is not said)
+clashAt : C.T -> String -> Pm.Span -> Diag
+clashAt t x sp =
+  { code = 152
+  , severity = SError
+  , msg =
+      "`"
+      ^ t.text
+      ^ "` is both an import's alias and a local name here: `"
+      ^ t.text
+      ^ "."
+      ^ x
+      ^ "` could be either"
+  , span = sp
+  , note =
+      Just
+        ("rename the local `"
+         ^ t.text
+         ^ "`, or import the module as another name")
+  }
+
+aliasClash : C.T -> List C.T -> Diag
+aliasClash t (Cons f _) = clashAt t f.text (spanTT t f)
+aliasClash t Nil = clashAt t "" (spanT t)
+
 -- | a capitalised name: a variable or a definition in scope, or a tag;
--- | `M.x`, a definition of the module imported as `M`, unless `M` is a
--- | variable here
+-- | `M.x`, a definition of the module imported as `M` -- an error if `M`
+-- | is a variable here too
 conAtom : C.T -> List C.T -> P Notation.Expr
 conAtom t fs = do
   local <- pGets (\s -> List.elemBy strEq t.text s.scope)
-  qualified <-
-    pGets (\s -> case fs of
-    Cons f rest -> s.known (t.text ^ "." ^ f.text)
-    Nil -> False)
+  qualified <- pGets (\s -> qualifiedBy s t fs)
   inScope <- pGets (\s -> local || s.known t.text)
+  if qualified && local then throwP (aliasClash t fs)
+    else pure
+        (if qualified then qualifiedE t fs
+         else if inScope then withFields (At (EVar t.text) (spanT t)) fs
+         else withFields (At (ETag t.text) (spanT t)) fs)
+
+-- | a capitalised keyword with fields, `Rune.x`: where `Rune` is an
+-- | import's alias, a definition of the module imported as `Rune` (or, if
+-- | it has no `x`, the module, as for any alias) -- a type has no fields;
+-- | else the keyword
+kwAtom : C.T -> List C.T -> P Notation.Expr
+kwAtom t fs = do
+  qualified <- pGets (\s -> qualifiedBy s t fs)
+  aliased <- pGets (\s -> s.known t.text)
   pure
-      (if qualified && not local
-         then case fs of
-           Cons f rest ->
-             withFields (At (EVar (t.text ^ "." ^ f.text)) (spanTT t f)) rest
-           Nil -> At (ETag t.text) (spanT t)
-       else if inScope then withFields (At (EVar t.text) (spanT t)) fs
-       else withFields (At (ETag t.text) (spanT t)) fs)
+      (if qualified then qualifiedE t fs
+       else if aliased then withFields (At (EVar t.text) (spanT t)) fs
+       else withFields (atomTok t) fs)
 
 -- | `e.x.y`: what is projected, and the fields
 data Fields = MkFields C.E (List C.T)
@@ -1232,6 +1277,7 @@ exprL r (Atom t) =
 exprL r (EField e f) = case fieldsOf (EField e f) Nil of
   MkFields (Atom t) fs ->
     if strEq t.kind "con" then conAtom t fs
+    else if strEq t.kind "kw" then kwAtom t fs
     else pure (withFields (atomTok t) fs)
   MkFields b fs -> do
     b' <- r.e b

@@ -23,6 +23,21 @@ used unqualified.  An import a module has already is an error --
 `import prelude`, or one written twice -- but `import prelude as P` is
 another.
 
+`import m as M` imports `m` qualified only: its definitions are `M.x`.
+At `M.x` the alias comes first, before a type or a constructor of the
+same name -- a type has no fields -- so a module may be imported under
+a built-in type's name, and `Rune` anywhere else is still the type.  A
+local name `M` (a binder, a theory's parameter) that the alias's `M.x`
+would also be is an error where `M.x` is written (E0152): rename one of
+them.
+
+```haskell
+import rune as Rune
+
+code : Rune -> Int
+code r = Rune.toInt r   -- the module's `toInt`; `Rune` in the signature, the type
+```
+
 ## Records
 
 A record type names its fields, and a record gives each, in the type's
