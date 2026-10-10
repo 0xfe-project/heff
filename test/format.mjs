@@ -35,7 +35,7 @@ const formats = (what, src, want) => {
 };
 
 // (but those that do not parse, or lex, on purpose, which are left)
-const unparsed = ["test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf"];
+const unparsed = ["test/errors/negation-pattern.hf", "test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf"];
 const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
   // (the index may still list a file the working copy has removed)
   .filter((f) => existsSync(join(root, f)));
@@ -521,6 +521,22 @@ formats("an implicit argument's default: `:=`, the binder written close", [
   "",
 ].join("\n"), [
   "f : {x : Bool := False} -> {a b : Type := Int} -> a -> b -> Bool",
+  "",
+].join("\n"));
+
+formats("`-x`: written close, the space before it kept, a subtraction's `-` spaced", [
+  "f : Int -> Int",
+  "f n = n",
+  "",
+  "g : Int -> Int",
+  "g x = f  -x  +  -(f   x)-x",
+  "",
+].join("\n"), [
+  "f : Int -> Int",
+  "f n = n",
+  "",
+  "g : Int -> Int",
+  "g x = f -x + -(f x) - x",
   "",
 ].join("\n"));
 

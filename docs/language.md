@@ -131,15 +131,13 @@ be negative: `-` right before a digit is its sign, unless it is right
 after an operand (a name, a literal, a closing bracket, with no space
 between).  So `a - 1` and `a-1` subtract, while `f -1` and `a -1` are
 applied to -1; `-128` as an `Int8` is its least, and a pattern may be
-negative too.  There is no other unary minus: the prelude's `neg x`
-negates an `Int` (`negFloat` a `Float64`, and a fixed-width type's
-module's `neg` one of its own).  Where
-the type is not known yet, the literal waits for it, and unification
-finds it from how the literal is used (`id 5` wanted as an `Int32` is
-one).  It must be one of the type's values, however late the type is
-found: `300` as a `UInt8` is an error, as `1.5` as an `Int32` or `5` as
-a `String` is.  What nothing decides is an `Int`, or a `Float64`, when the
-definition is settled, before its instance arguments are last looked
+negative too (and `-x` negates, below).  Where the type is not known
+yet, the literal waits for it, and unification finds it from how the
+literal is used (`id 5` wanted as an `Int32` is one).  It must be one
+of the type's values, however late the type is found: `300` as a
+`UInt8` is an error, as `1.5` as an `Int32` or `5` as a `String` is.
+What nothing decides is an `Int`, or a `Float64`, when the definition
+is settled, before its instance arguments are last looked
 for (an integer literal is a `Float64` where it shares its type with a
 fractional one, `[1, 2.5]`).  A `let` does not generalise: what it binds
 has one type, for every use.  A literal pattern is of the type of what
@@ -171,6 +169,17 @@ module's too, for a module that imports it as it is: the prelude's,
 which it has without writing it, give way to them.  How each number is
 kept by each backend, and given to a provider, is in
 [providers.md](providers.md#numbers-and-runes).
+
+`-` where it would be a number's sign, right before a name or a `(`
+instead of a digit, negates what it is before: a name with its fields
+(`-p.x`) or what is in parentheses (`-(f y)`), an argument's worth.  It
+is the `neg` in scope applied to it, as `a - b` is the `(-)` in scope:
+the prelude's `neg` negates an `Int`, and a fixed-width type's module,
+imported as it is, has its own, which `-x` then is.  So `f -x` is
+`f (-x)`, as `f -1` is `f (-1)`, while `a - x` and `a-x` subtract;
+`-f x` is `(-f) x`, and `- x`, a space after the `-`, is no negation.
+A `Float64` has no `neg`, so no `-x` either (`negFloat x`), and a
+pattern's `-` is only a number's sign.
 
 ## Runes and strings
 
