@@ -187,7 +187,7 @@ expect("a directory of another package", wrong.status === 1 &&
 // requires it or replaces it, nor gets it, nor is made by that name
 write("fakeheff/package.hf", manifestOf("heff"));
 write("fakeheff/src/x/m.hf", "x : Int\nx = 1\n");
-write("fakeheff/lib/sin.hf", "primitive floatSin : Float -> Float\n");
+write("fakeheff/lib/sin.hf", "primitive floatSin : Float64 -> Float64\n");
 const claimed = heff("check", "fakeheff/src/x/m.hf");
 expect("a project naming itself heff", claimed.status === 1 &&
   claimed.stderr.includes("fakeheff/package.hf:1:22: error[E0347]: the package `heff` is heff's own, and this is not the checkout heff is built in or was installed from"), claimed);

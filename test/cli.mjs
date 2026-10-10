@@ -329,7 +329,7 @@ expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
   const other = join(work, "other");
   mkdirSync(join(other, "lib"), { recursive: true });
   writeFileSync(join(other, "package.hf"), readFileSync(join(root, "package.hf"), "utf8").replace(/module = "[^"]*"/, 'module = "example.com/other"'));
-  writeFileSync(join(other, "lib", "sin.hf"), "primitive floatSin : Float -> Float\n");
+  writeFileSync(join(other, "lib", "sin.hf"), "primitive floatSin : Float64 -> Float64\n");
   const notHeff = checkIn(join(other, "lib", "sin.hf"));
   expect("another project's lib/", notHeff.status === 1 && notHeff.stderr.includes("error[E0335]"), notHeff);
   // a heff not built in the repository (installed, another checkout's):

@@ -49,8 +49,8 @@ A provider is given a number as the backend keeps it: in JavaScript an
 `Int`, an `Int64` and a `UInt64` are BigInts, any other number a
 number; in C an integer of up to 32 bits is a word of its value
 (`INT_OF`), one of 64 bits is kept as an `Int` is, a `Float32` is a
-word of its bits (`heff_f32_of`, `heff_f32`), and a `Float` is boxed
-(`FLT_OF`, `heff_flt`).  So in C a `Float`, and an `Int64` or `UInt64`
+word of its bits (`heff_f32_of`, `heff_f32`), and a `Float64` is boxed
+(`FLT_OF`, `heff_flt`).  So in C a `Float64`, and an `Int64` or `UInt64`
 beyond 62 bits (as an `Int` is), costs an allocation each value, where
 an integer of up to 32 bits and a `Float32` cost none.
 

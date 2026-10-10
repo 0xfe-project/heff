@@ -432,7 +432,7 @@ formats("a record type's defaults: `= d` after the field, a long one on the next
 const kept = [
   "-- | the corners: x, y, then r, g, b",
   "-- fmt: skip",
-  "corners : List Float",
+  "corners : List Float64",
   "corners =",
   "  [  0.0,  0.8,   1.0, 0.0, 0.0",
   "  , -0.8, -0.8,   0.0, 1.0, 0.0   -- left  ",

@@ -89,7 +89,7 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   writeFileSync(join(lib, "prelude.hf"), "primitive intAdd : Int -> Int -> Int\n");
   writeFileSync(join(lib, "list.hf"), "none : List Bool\nnone = []\n");
   writeFileSync(join(lib, "again.hf"), "-- the prelude's\nprimitive intAdd : Int -> Int -> Int\n");
-  writeFileSync(join(lib, "twice.hf"), "primitive floatCos : Float -> Float\nprimitive floatCos : Float -> Float\n");
+  writeFileSync(join(lib, "twice.hf"), "primitive floatCos : Float64 -> Float64\nprimitive floatCos : Float64 -> Float64\n");
   writeFileSync(join(lib, "sines.hf"), "primitive floatSin : Float64 -> Float64\n");
   writeFileSync(join(lib, "sinus.hf"), "\nprimitive floatSin : Float64 -> Float64\n");
   writeFileSync(join(lib, "unknown.hf"), "primitive intPlusPlus : Int -> Int -> Int\n");

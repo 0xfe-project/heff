@@ -115,8 +115,7 @@ infixl .+. below +
 
 ## Numbers
 
-`Int` is an integer of any size, `Float` IEEE 754's double (`Float64`
-is another name for it).  Built in beside them are the fixed-width
+`Int` is an integer of any size, `Float64` IEEE 754's double.  Built in beside them are the fixed-width
 numbers: `Int8`, `Int16`, `Int32` and `Int64` (two's complement),
 `UInt8` to `UInt64`, and `Float32` (IEEE 754's single).  An integer of
 one wraps around, as the machine's does, divides rounding toward zero,
@@ -137,9 +136,9 @@ the type is not known yet, the literal waits for it, and unification
 finds it from how the literal is used (`id 5` wanted as an `Int32` is
 one).  It must be one of the type's values, however late the type is
 found: `300` as a `UInt8` is an error, as `1.5` as an `Int32` or `5` as
-a `String` is.  What nothing decides is an `Int`, or a `Float`, when the
+a `String` is.  What nothing decides is an `Int`, or a `Float64`, when the
 definition is settled, before its instance arguments are last looked
-for (an integer literal is a `Float` where it shares its type with a
+for (an integer literal is a `Float64` where it shares its type with a
 fractional one, `[1, 2.5]`).  A `let` does not generalise: what it binds
 has one type, for every use.  A literal pattern is of the type of what
 it matches, and compared by that type's equality (an `Int`'s is the
