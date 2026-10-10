@@ -96,13 +96,27 @@ its name or by an alias, the prelude in every module -- but not in
 those that import them.  Of the instances in scope, exactly one must be
 of the type an instance argument wants: none is an error (E0341), and
 so is more than one (E0342), whatever their values, so that an import
-may make an error of a search, never another answer.  An instance's
-type takes no arguments (E0348): an instance of every `List a`, found
-by finding an `Eq a`, is not had yet.
+may make an error of a search, never another answer.
+
+An instance's type may take implicit and instance arguments before what
+it is an instance of: `instance eqList : {a : Type} -> {{eq : Eq a}} ->
+Eq (List a)` is an instance of each `Eq (List a)` there is an `Eq a`
+of.  A search unifies what it is an instance of with the type wanted,
+which solves its implicit arguments, and is decided on that alone --
+`Eq (List a)`'s and `Eq (List Int)`'s are two for `Eq (List Int)` --
+then finds its instance arguments as it found it, each a search of its
+own, whose error says the instances that wanted it (`no instance for Eq
+Color in scope, wanted by eqList for Eq (List Color)`); one whose type
+what the instance is an instance of leaves undetermined is E0340.
+Searches go 32 deep at most (E0349), as an instance that wants one of a
+type no smaller than its own may want them without end.  An explicit
+argument, which no search gives, is refused (E0348).
 
 The prelude's `Eq` is a type's equality, `equal x y`: its instances are
-`Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s, `Bool`'s and
-`Unit`'s, and each fixed-width type's module has its own (`int8`'s
+`Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s, `Bool`'s,
+`Unit`'s and `Ordering`'s, those of a `List`, a `Maybe`, a `Pair` and an
+`Either` of types that have one (`eqList`, `eqMaybe`, `eqPair`,
+`eqEither`), and each fixed-width type's module has its own (`int8`'s
 `eqInt8`).
 
 ```haskell
@@ -112,6 +126,9 @@ member x (Cons y ys) = equal x y || member x ys
 
 found : Bool
 found = member 2 [1, 2] && member 2.5 [0.5]   -- eqInt found, then eqFloat
+
+same : List (Maybe Int) -> List (Maybe Int) -> Bool
+same xs ys = equal xs ys   -- eqList found, given eqMaybe, given eqInt
 ```
 
 A theory declared again is another type: a module's own `Eq` and its

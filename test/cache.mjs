@@ -4,7 +4,8 @@
 // rewritten), corruption heals over, a new name in a dependency
 // re-elaborates the importer, and a comment-only change does not --
 // the invalidation is at the definitions used, not at whole imports --
-// and an instance gained or lost does, for the searches it may answer.
+// and an instance gained or lost does, for the searches it may answer,
+// as an instance's instance arguments changed do.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -146,6 +147,29 @@ want(g3.status === 1 && g3.stderr.includes("E0341") && g3.stderr.includes("h.hf"
 writeFileSync(join(dir, "g.hf"), eqs(false, true));
 const g4 = heff("test", "i.hf");
 want(g4.status === 0 && /1\/1 expectations hold/.test(g4.stdout), `the instance back, found again\n${g4.stdout.slice(0, 200)}${g4.stderr.slice(0, 200)}`);
+
+// an instance's instance argument changed to one of another theory, of
+// which there is none for the importer's search: its search is made
+// again, and its error says what the instance wants; changed back, found
+const sames = (wants) => [
+  "theory Same (a : Type) where", "  same : a -> a -> Bool", "",
+  "theory Like (a : Type) where", "  like : a -> a -> Bool", "",
+  "isSame : {a : Type} -> {{s : Same a}} -> a -> a -> Bool", "isSame x y = s.same x y", "",
+  "instance sameInt : Same Int", "sameInt = { same = intEq }", "",
+  `instance sameList : {a : Type} -> {{s : ${wants} a}} -> Same (List a)`, "sameList = { same = \\xs ys -> True }", "",
+].join("\n");
+writeFileSync(join(dir, "j.hf"), sames("Same"));
+writeFileSync(join(dir, "k.hf"), "import j\n\nfound : List Int -> Bool\nfound xs = isSame xs xs\n");
+writeFileSync(join(dir, "l.hf"), "import k\n\n-- >>> found [1]\n-- True\n");
+const j1 = heff("test", "l.hf");
+want(j1.status === 0 && /1\/1 expectations hold/.test(j1.stdout), `an instance found by finding another\n${j1.stdout.slice(0, 200)}${j1.stderr.slice(0, 200)}`);
+want(existsSync(hc("k")), "the importer frozen");
+writeFileSync(join(dir, "j.hf"), sames("Like"));
+const j2 = heff("check", "l.hf");
+want(j2.status === 1 && j2.stderr.includes("E0341") && j2.stderr.includes("wanted by sameList") && j2.stderr.includes("k.hf"), `an instance that wants another now leaves the importer's search none\n${j2.stderr.slice(0, 300)}`);
+writeFileSync(join(dir, "j.hf"), sames("Same"));
+const j3 = heff("test", "l.hf");
+want(j3.status === 0 && /1\/1 expectations hold/.test(j3.stdout), `the instance's argument back, found again\n${j3.stdout.slice(0, 200)}${j3.stderr.slice(0, 200)}`);
 
 console.log(`cache: ${failed ? "NOT " : ""}thawed, healed and invalidated at the definitions used`);
 process.exit(failed ? 1 : 0);

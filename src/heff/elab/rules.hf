@@ -461,14 +461,57 @@ instShown e mc goal =
        (Rn.displayName e.globals)
        (U.zonkTy mc (R.readbTy e.scope.len goal)))
 
--- | a candidate for an instance argument: its name, where it is from
--- | (said where more than one fits), its type, and it
-type Witness =
-  { name : String, from : String, ty : V.Ty, stx : Sx.Tm, val : V.V }
+-- | an instance argument's goal, as a search's messages say it: the
+-- | solved metavariables put in (`Eq Int`, not `Eq ((\x -> Int) f)`)
+goalShown : ElabEnv -> V.MetaCtx -> V.Ty -> String
+goalShown e mc goal =
+  Ps.printTy
+    Ps.plainImplicits
+    0
+    e.scope.names
+    (Rn.renameTy
+       (Rn.displayName e.globals)
+       (R.readbTyForced mc e.scope.len goal))
 
-mkWitness : String -> String -> V.Ty -> Sx.Tm -> V.V -> Witness
-mkWitness name from ty stx val =
-  { name = name, from = from, ty = ty, stx = stx, val = val }
+-- | an implicit argument not given, `x : dom`, of the function type `ty`
+-- | that takes it first: its default, where the type has one -- given as
+-- | it is, not inferred -- else a fresh metavariable, inferred
+implicitArg : ElabEnv -> P.Span -> V.Ty -> V.Ty -> String -> Elab M.El
+implicitArg e sp ty dom x = case V.implicitDefault ty of
+  Just d -> pure { stx = d, val = \u -> EV.eval e.globals N d LNil }
+  Nothing -> do
+    meta <- freshMeta e.scope.len e.scope.locals dom x sp
+    pure (mEl meta.stx meta.val)
+
+-- | a candidate for an instance argument: its name (said when it is
+-- | asked for: a global's, as the file knows it, is looked for among all
+-- | the names in scope), where it is from (said where more than one
+-- | fits), whether its type is a scheme, its type, and it.  A top-level
+-- | instance's type is a scheme: its implicit and instance binders are
+-- | given anew in each search, so that `{a : Type} -> {{eq : Eq a}} -> Eq
+-- | (List a)` is an instance of each `Eq (List a)` there is an `Eq a` of;
+-- | an instance binder's is a type as it is.
+type Witness =
+  { name : Unit -> String
+  , from : String
+  , scheme : Bool
+  , ty : V.Ty
+  , stx : Sx.Tm
+  , val : V.V
+  }
+
+mkWitness : (Unit -> String)
+          -> String
+          -> Bool
+          -> V.Ty
+          -> Sx.Tm
+          -> V.V
+          -> Witness
+mkWitness name from scheme ty stx val =
+  { name = name, from = from, scheme = scheme, ty = ty, stx = stx, val = val }
+
+nameOf : Witness -> String
+nameOf w = w.name MkUnit
 
 catMaybesR : {a : Type} -> List (Maybe a) -> List a
 catMaybesR Nil = Nil
@@ -481,8 +524,9 @@ instLocals e =
   List.map
     (\(c : InstLocal) ->
        mkWitness
-         c.name
+         (\u -> c.name)
          "an instance argument"
+         False
          c.ty
          (R.readbEl e.scope.len c.v)
          c.v)
@@ -494,8 +538,9 @@ instGlobal e i = case G.lookupEntry e.globals i.key of
   Just ge ->
     Just
       (mkWitness
-         (Rn.displayName e.globals i.key)
+         (\u -> Rn.displayName e.globals i.key)
          ("declared by " ^ i.module)
+         True
          ge.type_
          (SGlobal i.key)
          ge.value)
@@ -507,25 +552,245 @@ instGlobals : ElabEnv -> List Witness
 instGlobals e =
   catMaybesR (List.map (\i -> instGlobal e i) (G.instancesOf e.globals))
 
-witnessMatches : ElabEnv -> V.Ty -> List Witness -> Elab (List Witness)
-witnessMatches e goal Nil = pure Nil
-witnessMatches e goal (Cons w rest) = do
-  r <- Mt.attempt (Mt.unifyTy e.globals (shape e.scope) goal w.ty)
-  more <- witnessMatches e goal rest
+-- | an instance argument of a candidate, given a hole: a search finds
+-- | what fills it, an instance of `goal`
+type Subgoal = { hole : Hole, goal : V.Ty }
+
+-- | a candidate, its binders given: it applied to them, its conclusion
+-- | (the type it is then of), and the instance arguments it takes, in
+-- | the order it takes them
+type Instantiated =
+  { applied : M.El, conclusion : V.Ty, subgoals : List Subgoal }
+
+-- (each implicit binder a fresh metavariable, which the conclusion's
+-- unification with the goal solves, and each instance binder a hole:
+-- the binders of the type as declared, as the declaration checks them,
+-- no type unfolded for more)
+instantiateGo : ElabEnv
+              -> P.Span
+              -> M.El
+              -> V.Ty
+              -> List Subgoal
+              -> Elab Instantiated
+instantiateGo e sp m ty subgoals = case ty of
+  VFunction level dom cod Impl dflt -> do
+    arg <- implicitArg e sp ty dom (cloNameOr cod)
+    instantiateGo
+        e
+        sp
+        (M.iapp (cloNameOr cod) m arg)
+        (V.nom (V.appClo cod (\u -> M.valN arg)))
+        subgoals
+  VFunction level dom cod Inst dflt -> do
+    hole <- freshMeta e.scope.len e.scope.locals dom (cloNameOr cod) sp
+    instantiateGo
+        e
+        sp
+        (M.app m (mEl hole.stx hole.val))
+        (V.nom (V.appClo cod (\u -> hole.val)))
+        (Cons { hole = hole, goal = dom } subgoals)
+  _ -> pure { applied = m, conclusion = ty, subgoals = List.reverse subgoals }
+
+-- | a candidate, its binders given where its type is a scheme
+instantiate : ElabEnv -> P.Span -> Witness -> Elab Instantiated
+instantiate e sp w =
+  if w.scheme then instantiateGo e sp (mEl w.stx w.val) w.ty Nil
+  else pure { applied = mEl w.stx w.val, conclusion = w.ty, subgoals = Nil }
+
+-- | a candidate whose conclusion is the goal, as its trial left it: its
+-- | binders given, and the state of elaboration the trial came to, which
+-- | committing to it goes on from
+type Fit = { witness : Witness, instantiated : Instantiated, state : StCore }
+
+fitOf : Witness -> Instantiated -> StCore -> Either C.EqErr Unit -> Maybe Fit
+fitOf w inst after (Right _) =
+  Just { witness = w, instantiated = inst, state = after }
+fitOf w inst after (Left _) = Nothing
+
+-- | the global a scheme's conclusion is of, if it is a theory's or a
+-- | type's: its binders given placeholders (rigid locals, looked at for
+-- | the head alone), as the conclusion's head is none of them
+conclusionHead : Int -> V.Ty -> Maybe String
+conclusionHead n ty = case ty of
+  VFunction level dom cod Impl dflt ->
+    conclusionHead (n + 1) (V.nom (V.appClo cod (\u -> V.local n dom)))
+  VFunction level dom cod Inst dflt ->
+    conclusionHead (n + 1) (V.nom (V.appClo cod (\u -> V.local n dom)))
+  VDecode (HGlobal k) sp u described el -> Just k
+  _ -> Nothing
+
+-- | whether a conclusion of the global `k` is apart from the goal, so
+-- | that no unification could make them one: a decoded type's head is
+-- | rigid -- unification compares heads, it unfolds neither -- so a goal
+-- | of another head is apart, and so is one that is no decoded type (but
+-- | an error, equal to anything)
+apartFrom : V.MetaCtx -> V.Ty -> Maybe String -> Bool
+apartFrom mc goal (Just k) = case V.forceTy mc goal of
+  VDecode (HGlobal k2) sp u described el -> not (strEq k k2)
+  VDecode h sp u described el -> False
+  t -> not (V.isErrorTy t)
+apartFrom mc goal Nothing = False
+
+-- | a candidate tried: its binders given, its conclusion unified with the
+-- | goal, and the state put back whatever the answer -- the
+-- | metavariables its binders were given, what the unification solved,
+-- | what was written down of it -- so that each candidate is tried from
+-- | the same state (neither does more than the state of elaboration: no
+-- | check waits on them).  A scheme whose conclusion is apart from the
+-- | goal by its head is not tried: it would be given its binders, in each
+-- | search, for nothing.
+fits : ElabEnv -> P.Span -> V.Ty -> Witness -> Elab (Maybe Fit)
+fits e sp goal w = do
+  mc <- gets (\c -> c.metas)
+  if w.scheme && apartFrom mc goal (conclusionHead 0 w.ty) then pure Nothing
+    else do
+      before <- gets (\c -> c)
+      inst <- instantiate e sp w
+      r <- Mt.unifyTy e.globals (shape e.scope) goal inst.conclusion
+      after <- gets (\c -> c)
+      putSt before
+      pure (fitOf w inst after r)
+
+-- (a candidate that fits, if it does, before the others that do)
+withFit : Maybe Fit -> List Fit -> List Fit
+withFit (Just f) fs = Cons f fs
+withFit Nothing fs = fs
+
+witnessMatches : ElabEnv -> P.Span -> V.Ty -> List Witness -> Elab (List Fit)
+witnessMatches e sp goal Nil = pure Nil
+witnessMatches e sp goal (Cons w rest) = do
+  fit <- fits e sp goal w
+  more <- witnessMatches e sp goal rest
+  pure (withFit fit more)
+
+-- | an instance found that wants an instance argument: its name, and
+-- | the goal it was found for
+type WantedBy = { name : String, goal : V.Ty }
+
+-- | how far a search is into those that wanted it: an instance found
+-- | wants its instance arguments, each found by a search of its own, one
+-- | deeper -- `depth` deep, wanted by the instances `wantedBy` says, the
+-- | nearest first
+type InstanceSearch = { depth : Int, wantedBy : List WantedBy }
+
+-- | a search for an instance argument the program takes: wanted by no
+-- | instance
+topSearch : InstanceSearch
+topSearch = { depth = 0, wantedBy = Nil }
+
+-- | how deep the searches for instances' instance arguments may go: one
+-- | deeper is refused (E0349), as an instance that wants one of a type
+-- | no smaller than its own may want them without end
+instanceDepthLimit : Int
+instanceDepthLimit = 32
+
+-- | a search for an instance argument of `w`, found for `goal`
+deeperSearch : InstanceSearch -> Witness -> V.Ty -> InstanceSearch
+deeperSearch s w goal =
+  { depth = s.depth + 1
+  , wantedBy = Cons { name = nameOf w, goal = goal } s.wantedBy
+  }
+
+-- (an instance found, and the goal it was found for)
+wantedByShown : ElabEnv -> V.MetaCtx -> WantedBy -> String
+wantedByShown e mc w = w.name ^ " for " ^ goalShown e mc w.goal
+
+-- | which instances want what a search is for, said after it: `, wanted
+-- | by eqList for Eq (List Foo)`, and on, outwards
+wantedByWhom : ElabEnv -> V.MetaCtx -> InstanceSearch -> String
+wantedByWhom e mc s =
+  joinWith
+    ""
+    (List.map
+       (\(w : WantedBy) -> ", wanted by " ^ wantedByShown e mc w)
+       s.wantedBy)
+
+-- | a search refused for its depth: the goal it began with, and the
+-- | first instances it went through, outwards in
+tooDeep : ElabEnv -> V.MetaCtx -> InstanceSearch -> V.Ty -> String
+tooDeep e mc s goal = case List.reverse s.wantedBy of
+  Cons outermost _ ->
+    "the search for an instance of "
+    ^ goalShown e mc outermost.goal
+    ^ " goes more than "
+    ^ showInt instanceDepthLimit
+    ^ " instances deep: "
+    ^ joinWith
+      ", then "
+      (List.map
+         (\(w : WantedBy) -> wantedByShown e mc w)
+         (List.take 3 (List.reverse s.wantedBy)))
+    ^ ", and on"
+  Nil ->
+    "the search for an instance of " ^ goalShown e mc goal ^ " goes too deep"
+
+-- (the one candidate found does not fit where the hole is)
+misfit : ElabEnv -> P.Span -> Witness -> C.EqErr -> Elab Instantiated
+misfit e sp w err =
+  failWithNote
+    sp
+    11
+    ("the instance found, " ^ nameOf w ^ ", does not fit here")
+    (prettyEqErr e.globals err)
+
+-- | the one candidate found, committed to: elaboration goes on from the
+-- | state its trial came to -- its binders given, its conclusion unified
+-- | with the goal -- and the hole is filled with it applied to them, its
+-- | instance arguments' holes left to the searches that fill them
+committed : ElabEnv -> P.Span -> Int -> V.V -> V.Ty -> Fit -> Elab Instantiated
+committed e sp hm holeVal goal fit = do
+  mc <- gets (\c -> c.metas)
+  putSt fit.state
+  r <-
+    solveHole
+      e.globals
+      (shape e.scope)
+      hm
+      holeVal
+      fit.instantiated.applied.stx
+      (M.valN fit.instantiated.applied)
   case r of
-    Right _ -> pure (Cons w more)
-    Left _ -> pure more
+    Right _ -> do
+      traceE
+          sp
+          "instance"
+          (\u -> "found " ^ nameOf fit.witness ^ " : " ^ goalShown e mc goal)
+      pure fit.instantiated
+    Left err -> misfit e sp fit.witness err
+
+metaOf : Sx.Tm -> Int
+metaOf (SMetaApp k _ _) = k
+metaOf _ = 0 - 1
+
+-- | each of the instance arguments of an instance found, searched for by
+-- | `find`
+eachSubgoal : (Subgoal -> Elab Unit) -> List Subgoal -> Elab Unit
+eachSubgoal find Nil = pure MkUnit
+eachSubgoal find (Cons sg rest) = do
+  find sg
+  eachSubgoal find rest
 
 -- | find the one witness in scope whose type is the goal, as Agda's
 -- | instance arguments are found: among the instance binders in scope
 -- | (`e.insts`) and the top-level instances in scope (`e.globals`'s), one
--- | pool.  More than one is refused (same-typed witnesses are
--- | definitionally equal here -- small values are opaque -- so no
--- | tie-break can tell them apart), so an import that brings in another
--- | makes an error of a search, never another answer; none is refused
--- | too.
-resolveWanted : ElabEnv -> P.Span -> Int -> V.V -> V.Ty -> Bool -> Elab Bool
-resolveWanted e sp hm holeVal goal final = do
+-- | pool.  A top-level instance whose type takes implicit and instance
+-- | arguments is a witness of the goal if its conclusion is, its
+-- | implicit arguments solved by unifying the two; it is decided on the
+-- | conclusion alone, and then its instance arguments are searched for
+-- | as this one is, one deeper (`search`), to a depth (E0349).  More than
+-- | one is refused (same-typed witnesses are definitionally equal here --
+-- | small values are opaque -- so no tie-break can tell them apart), so
+-- | an import that brings in another makes an error of a search, never
+-- | another answer; none is refused too.
+resolveWanted : ElabEnv
+              -> P.Span
+              -> InstanceSearch
+              -> Int
+              -> V.V
+              -> V.Ty
+              -> Bool
+              -> Elab Bool
+resolveWanted e sp search hm holeVal goal final = do
   mc <- gets (\c -> c.metas)
   if not (List.null (metasLeft e mc goal))
       then if final
@@ -534,35 +799,70 @@ resolveWanted e sp hm holeVal goal final = do
               sp
               40
               ("an instance argument's type is not determined here: "
-               ^ instShown e mc goal)
+               ^ goalShown e mc goal
+               ^ wantedByWhom e mc search)
               "give the argument explicitly, or annotate so the implicits around it are solved"
         else pure False
+    else if search.depth > instanceDepthLimit
+      then failWithNote
+          (a := Bool)
+          sp
+          49
+          (tooDeep e mc search goal)
+          "an instance's instance arguments are found by searches of their own, and one that wants an instance of a type no smaller than its own may want them without end: give the argument explicitly, `(x := e)`"
     else do
       matches <-
-        witnessMatches e goal (List.append (instLocals e) (instGlobals e))
+        witnessMatches e sp goal (List.append (instLocals e) (instGlobals e))
       case matches of
         Cons one Nil -> do
-          r <- solveHole e.globals (shape e.scope) hm holeVal one.stx one.val
-          case r of
-            Right _ -> do
-              traceE
-                  sp
-                  "instance"
-                  (\u -> "found " ^ one.name ^ " : " ^ instShown e mc goal)
-              pure True
-            Left err ->
-              failWithNote
-                (a := Bool)
-                sp
-                11
-                ("the instance found, " ^ one.name ^ ", does not fit here")
-                (prettyEqErr e.globals err)
+          inst <- committed e sp hm holeVal goal one
+          eachSubgoal
+              (\sg -> do
+               mcNow <- gets (\c -> c.metas)
+               traceE
+                   sp
+                   "instance"
+                   (\u ->
+                      "wanted "
+                      ^ goalShown e mcNow sg.goal
+                      ^ "  [by "
+                      ^ nameOf one.witness
+                      ^ " for "
+                      ^ goalShown e mc goal
+                      ^ "]")
+               done <-
+                 resolveWanted
+                   e
+                   sp
+                   (deeperSearch search one.witness goal)
+                   (metaOf sg.hole.stx)
+                   sg.hole.val
+                   sg.goal
+                   final
+               -- (one whose type is not determined yet waits, as any)
+               if done then pure MkUnit
+                 else want
+                     sp
+                     (\later ->
+                        resolveWanted
+                          e
+                          sp
+                          (deeperSearch search one.witness goal)
+                          (metaOf sg.hole.stx)
+                          sg.hole.val
+                          sg.goal
+                          later))
+              inst.subgoals
+          pure True
         Nil ->
           failWithNote
             (a := Bool)
             sp
             41
-            ("no instance for " ^ instShown e mc goal ^ " in scope")
+            ("no instance for "
+             ^ goalShown e mc goal
+             ^ " in scope"
+             ^ wantedByWhom e mc search)
             "declare one, `instance x : T`, bind one, `{{x : T}} -> ...`, where this is used, or give it: `(x := e)`"
         _ ->
           failWithNote
@@ -570,18 +870,16 @@ resolveWanted e sp hm holeVal goal final = do
             sp
             42
             ("more than one instance for "
-             ^ instShown e mc goal
-             ^ " in scope: "
+             ^ goalShown e mc goal
+             ^ " in scope"
+             ^ wantedByWhom e mc search
+             ^ ": "
              ^ joinWith
                ", "
                (List.map
-                  (\(w : Witness) -> w.name ^ " (" ^ w.from ^ ")")
+                  (\(f : Fit) -> nameOf f.witness ^ " (" ^ f.witness.from ^ ")")
                   matches))
             "they cannot be told apart by type (small values are statically opaque): give the argument explicitly"
-
-metaOf : Sx.Tm -> Int
-metaOf (SMetaApp k _ _) = k
-metaOf _ = 0 - 1
 
 -- | an instance argument: a hole, and a `Wanted` that will find
 -- | it
@@ -596,21 +894,14 @@ insertInstance e sp goal name = do
       "instance"
       (\u ->
          "wanted "
-         ^ instShown e mc0 goal
+         ^ goalShown e mc0 goal
          ^ (if List.null (metasLeft e mc0 goal) then "  [ready at the call]"
             else "  [waits for implicits]"))
-  want sp (\final -> resolveWanted e sp (metaOf hole.stx) hole.val goal final)
+  want
+      sp
+      (\final ->
+         resolveWanted e sp topSearch (metaOf hole.stx) hole.val goal final)
   pure (mEl hole.stx hole.val)
-
--- | an implicit argument not given, `x : dom`, of the function type `ty`
--- | that takes it first: its default, where the type has one -- given as
--- | it is, not inferred -- else a fresh metavariable, inferred
-implicitArg : ElabEnv -> P.Span -> V.Ty -> V.Ty -> String -> Elab M.El
-implicitArg e sp ty dom x = case V.implicitDefault ty of
-  Just d -> pure { stx = d, val = \u -> EV.eval e.globals N d LNil }
-  Nothing -> do
-    meta <- freshMeta e.scope.len e.scope.locals dom x sp
-    pure (mEl meta.stx meta.val)
 
 -- | Apply `m : ty` to each implicit argument it takes first: its default,
 -- | or a fresh metavariable.
