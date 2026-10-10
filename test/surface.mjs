@@ -90,8 +90,8 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   writeFileSync(join(lib, "list.hf"), "none : List Bool\nnone = []\n");
   writeFileSync(join(lib, "again.hf"), "-- the prelude's\nprimitive intAdd : Int -> Int -> Int\n");
   writeFileSync(join(lib, "twice.hf"), "primitive floatCos : Float -> Float\nprimitive floatCos : Float -> Float\n");
-  writeFileSync(join(lib, "sines.hf"), "primitive floatSin : Float -> Float\n");
-  writeFileSync(join(lib, "sinus.hf"), "\nprimitive floatSin : Float -> Float\n");
+  writeFileSync(join(lib, "sines.hf"), "primitive floatSin : Float64 -> Float64\n");
+  writeFileSync(join(lib, "sinus.hf"), "\nprimitive floatSin : Float64 -> Float64\n");
   writeFileSync(join(lib, "unknown.hf"), "primitive intPlusPlus : Int -> Int -> Int\n");
   writeFileSync(join(dir, "both.hf"), "import sines\nimport sinus\n");
   writeFileSync(join(dir, "both2.hf"), "import both\n");
@@ -114,7 +114,7 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
     ["one the runtime has not", inLib(join(lib, "unknown.hf")),
       (r) => r.status === 1 && r.stderr.includes("error[E0329]: there is no primitive called `intPlusPlus`")],
     ["one declared once", inLib(join(lib, "sines.hf")),
-      (r) => r.status === 0 && r.stdout === "floatSin : Float -> Float\n"],
+      (r) => r.status === 0 && r.stdout === "floatSin : Float64 -> Float64\n"],
   ];
   for (const [what, r, ok] of checks) {
     if (!ok(r)) {
