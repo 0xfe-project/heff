@@ -6,7 +6,7 @@
 // unknown command say what they should, on the right stream, with the
 // right exit status.
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { heffBin, root } from "./heff.mjs";
@@ -312,6 +312,23 @@ expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
   astral.stderr.includes("astral.hf:5:7\nerror[E0150]: unexpected character 😀\n5 | t = 1 😀 2\n5 |       ^\n") &&
   astral.stderr.includes("astral.hf:5:5\nerror[E0302]: tried to apply a value that was not of a function type\n5 | t = 1 😀 2\n5 |     ^^^^^\n") &&
   !astral.stderr.includes("�"), astral);
+
+// heff's own lib/ is the library, whatever library the heff running has
+// (`HEFF_LIB` elsewhere, as an installed heff's is): its primitives its
+// own, declared once; the lib/ of a project that is not heff is none
+{
+  const elsewhere = join(work, "elsewhere", "lib");
+  cpSync(join(root, "lib"), elsewhere, { recursive: true });
+  const checkIn = (f) => spawnSync(heffBin, ["check", f], { cwd: work, encoding: "utf8", env: { ...process.env, HEFF_LIB: elsewhere } });
+  const own = checkIn(join(root, "lib", "float32.hf"));
+  expect("heff's own lib/, the library elsewhere", own.status === 0 && !/E033[56]/.test(own.stderr), own);
+  const other = join(work, "other");
+  mkdirSync(join(other, "lib"), { recursive: true });
+  writeFileSync(join(other, "package.hf"), readFileSync(join(root, "package.hf"), "utf8").replace(/module = "[^"]*"/, 'module = "example.com/other"'));
+  writeFileSync(join(other, "lib", "sin.hf"), "primitive floatSin : Float -> Float\n");
+  const notHeff = checkIn(join(other, "lib", "sin.hf"));
+  expect("another project's lib/", notHeff.status === 1 && notHeff.stderr.includes("error[E0335]"), notHeff);
+}
 
 console.log(`cli: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
