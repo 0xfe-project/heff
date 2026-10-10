@@ -39,11 +39,15 @@ type Specs =
   , off : Bool
   }
 
+-- (`safe`: the globals that cannot fail when used -- `safeGlobals`'s,
+-- then each definition and copy found so once simplified; `base`: the
+-- same but for the definitions simplified -- see `markCopySafe`)
 type St =
   { supply : Int
   , fuel : Int
   , defs : M.Map String I.Expr
   , safe : M.Map String Unit
+  , base : M.Map String Unit
   , total : M.Map String Int
   , plain : M.Map String Plain
   , sp : Specs
@@ -55,6 +59,7 @@ withSp p s =
   , fuel = s.fuel
   , defs = s.defs
   , safe = s.safe
+  , base = s.base
   , total = s.total
   , plain = s.plain
   , sp = p
@@ -66,6 +71,7 @@ withSupply n s =
   , fuel = s.fuel
   , defs = s.defs
   , safe = s.safe
+  , base = s.base
   , total = s.total
   , plain = s.plain
   , sp = s.sp
@@ -77,6 +83,7 @@ withFuel f s =
   , fuel = f
   , defs = s.defs
   , safe = s.safe
+  , base = s.base
   , total = s.total
   , plain = s.plain
   , sp = s.sp
@@ -88,6 +95,19 @@ withSafe k s =
   , fuel = s.fuel
   , defs = s.defs
   , safe = M.insert compareString k MkUnit s.safe
+  , base = s.base
+  , total = s.total
+  , plain = s.plain
+  , sp = s.sp
+  }
+
+withBase : String -> St -> St
+withBase k s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , base = M.insert compareString k MkUnit s.base
   , total = s.total
   , plain = s.plain
   , sp = s.sp
@@ -99,6 +119,7 @@ withPlain k p s =
   , fuel = s.fuel
   , defs = s.defs
   , safe = s.safe
+  , base = s.base
   , total = s.total
   , plain = M.insert compareString k p s.plain
   , sp = s.sp
@@ -110,6 +131,7 @@ withDefs d s =
   , fuel = s.fuel
   , defs = d
   , safe = s.safe
+  , base = s.base
   , total = s.total
   , plain = s.plain
   , sp = s.sp
@@ -195,6 +217,7 @@ restore saved st =
   , fuel = st.fuel
   , defs = saved.defs
   , safe = st.safe
+  , base = st.base
   , total = saved.total
   , plain = st.plain
   , sp = st.sp
@@ -820,8 +843,9 @@ tagOfLam xs _ = Nothing
 -- it, as a definition is: with fuel of its own, the copies it calls for
 -- made in turn, each before what calls it.
 
--- | the most that is made: the size of a definition copied, copies for
--- | one program, copies of copies one inside another
+-- | the most that is made: the size of a definition copied, copies
+-- | asked for by one definition (or copy) as it is simplified, copies of
+-- | copies one inside another
 specBodySize : Int
 specBodySize = 1200
 
@@ -923,14 +947,26 @@ isKind (ELam _ _) = True
 isKind (ERecord _) = True
 isKind _ = False
 
--- | a copy that is a function, or a value computing nothing, is safe
--- | to use anywhere, as the definitions it was made from were
--- | (`safeGlobals`)
+-- | a definition simplified that is a function, or a value computing
+-- | nothing, is safe to use anywhere
 markSafe : String -> I.Expr -> M Unit
 markSafe h b = \s ->
     MkPair
       MkUnit
       (if I.isValue b || pureIn s.safe s.total b then withSafe h s else s)
+
+-- | ... and so is such a copy, as the definitions it was made from were
+-- | (`safeGlobals`): judged by what was known of the definitions before
+-- | any was simplified, and of the copies (`base`) -- so that it is the
+-- | same whoever asks for the copy first.  (A definition that is safe
+-- | only once simplified is not yet while it asks, and is when a later
+-- | one asks.)
+markCopySafe : String -> I.Expr -> M Unit
+markCopySafe h b = \s ->
+    MkPair
+      MkUnit
+      (if I.isValue b || pureIn s.base s.total b then withSafe h (withBase h s)
+       else s)
 
 -- | a copy asked for, as it is (`b0`, its parameters put in): what is
 -- | known of it, and how deep in copies of copies it is
@@ -1071,12 +1107,13 @@ depthOf ds g args =
     0
     (Cons g (List.concatMap I.globalsIn args))
 
--- What a definition is simplified with is its own: its fuel, and the
--- calls found plain (`plain`), are made anew for each definition and
--- each copy -- so that what it comes to depends on what it uses, not on
--- what was simplified before it.
+-- What a definition is simplified with is its own: its fuel, the calls
+-- found plain (`plain`) and how many copies it may ask for are made anew
+-- for each definition and each copy -- so that what it comes to depends
+-- on what it uses, not on what was simplified before it.
 
--- (a definition's own: fuel, and no call found plain for another)
+-- (a definition's own: fuel, no call found plain for another, and no
+-- copy asked for yet)
 ownSt : M Unit
 ownSt = \s ->
     MkPair
@@ -1085,9 +1122,18 @@ ownSt = \s ->
       , fuel = 4000
       , defs = s.defs
       , safe = s.safe
+      , base = s.base
       , total = s.total
       , plain = M.empty
-      , sp = s.sp
+      , sp =
+          { all = s.sp.all
+          , kinds = s.sp.kinds
+          , recipes = s.sp.recipes
+          , depths = s.sp.depths
+          , made = s.sp.made
+          , count = 0
+          , off = s.sp.off
+          }
       }
 
 -- (asking for copies off, or on again)
@@ -1107,7 +1153,8 @@ setOff o = \s ->
          s)
 
 -- (back to what `saved` was simplifying: its fuel, the calls it found
--- plain, whether it asks for copies -- the rest learnt kept)
+-- plain, how many copies it asked for and whether it asks for more --
+-- the rest learnt kept)
 backTo : St -> M Unit
 backTo saved = \s ->
     MkPair
@@ -1116,6 +1163,7 @@ backTo saved = \s ->
       , fuel = saved.fuel
       , defs = s.defs
       , safe = s.safe
+      , base = s.base
       , total = s.total
       , plain = saved.plain
       , sp =
@@ -1124,7 +1172,7 @@ backTo saved = \s ->
           , recipes = s.sp.recipes
           , depths = s.sp.depths
           , made = s.sp.made
-          , count = s.sp.count
+          , count = saved.sp.count
           , off = saved.sp.off
           }
       }
@@ -1164,7 +1212,7 @@ ask r g xs b marks sh h d = do
       b0 <- specBody g h marks sh lam1
       b1 <- knowing r b0
       u <- askedFor h b1 d
-      markSafe h b1
+      markCopySafe h b1
 
 -- (... named `h`, `d` deep in copies of copies)
 specNamed : SK
@@ -1553,6 +1601,7 @@ initSt n0 sg =
   , fuel = 0
   , defs = M.empty
   , safe = sg.safe
+  , base = sg.safe
   , total = sg.total
   , plain = M.empty
   , sp =
