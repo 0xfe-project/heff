@@ -461,7 +461,8 @@ try {
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
 
   // formatting: one edit, the whole text, a definition under `-- fmt: skip`
-  // as written; what does not parse is left, with a warning
+  // as written; what does not parse is left, and nothing said of it (no
+  // message on each save of a file half written)
   const kept = "-- fmt: skip\nsame  :  Bool -> Bool\nsame   b  =  b\n";
   const messy = "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n\n" + kept;
   open("test/surface/lsp-fmt.hf", messy);
@@ -472,8 +473,10 @@ try {
   open("test/surface/lsp-bad.hf", "x : Bool\nx = (\n");
   await diagnosticsOf(uri("test/surface/lsp-bad.hf"));
   const refused = await request("textDocument/formatting", { textDocument: { uri: uri("test/surface/lsp-bad.hf") }, options: { tabSize: 2, insertSpaces: true } });
-  const shown = await note((m) => m.method === "window/showMessage", "window/showMessage");
-  expect("formatting refused", Array.isArray(refused.result) && refused.result.length === 0 && shown.params.type === 2 && shown.params.message.includes("does not parse"), { refused, shown });
+  // (what the server says comes in the order it says it: a message sent
+  // with the reply would be here by now)
+  const shown = notes.filter((m) => m.method === "window/showMessage");
+  expect("formatting refused, quietly", Array.isArray(refused.result) && refused.result.length === 0 && shown.length === 0, { refused, shown });
 
   const unknown = await request("textDocument/codeLens", { textDocument: { uri: uri("test/modules/src/b.hf") } });
   expect("an unknown request", unknown.error && unknown.error.code === -32601, unknown);
