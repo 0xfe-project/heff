@@ -33,8 +33,10 @@ import heff.compile.emit as Em
 import heff.elab.fixed as Fx
 import heff.elab.globals as G
 import heff.compile.ir as I
+import heff.compile.irtext as Ir
 import heff.compile.lower as L
 import heff.compile.prims as Pr
+import heff.compile.simplify as Si
 import map as M
 
 -- Names
@@ -2930,6 +2932,155 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
              (byOwner s.lams))
           (M.toList (byModule (zipDE defs ems)))))
 
+-- The backend's cache: a definition's C as it keeps it
+--------------------------------------------------------------------------------
+
+-- A definition's C depends on the definition alone -- as it is lowered,
+-- its variables named again from 0 (`defOwn`) -- and on what is known
+-- of itself and of the globals it mentions: whether each is a function
+-- and of how many parameters, whether its calls may give back a bounce,
+-- which of its parameters are lent.  The cache (heff.build.backcache)
+-- keeps it by a hash of those (`emitVer`), with what was made for it on
+-- the way: its strings and lambdas, the shapes and primitives it uses,
+-- each in the order made.
+
+-- | a definition's C, as the cache keeps it
+type EmitKept =
+  { ver : String
+  , protos : List String
+  , code : List String
+  , strs : List String
+  , lprotos : List String
+  , lams : List String
+  , shapes : List String
+  , prims : List String
+  }
+
+-- (what is known of a global)
+globalH : CE -> String -> List Ir.HItem -> List Ir.HItem
+globalH ce g rest =
+  Cons
+    (HS g)
+    (Cons
+       (HN (fromMaybe (0 - 1) (M.lookup compareString g ce.funs)))
+       (Cons
+          (HN (if M.member compareString g ce.bounce then 1 else 0))
+          (Cons (HS (joinWith "," (List.map showInt (borOf ce.bor g)))) rest)))
+
+-- | what a definition's C is made of, hashed: its key, its body (named
+-- | again from 0), and what is known of itself and of what it mentions
+emitVer : CE -> String -> I.Expr -> String
+emitVer ce key b =
+  Ir.hashOf
+    (Cons
+       (HS key)
+       (Cons
+          (HE b)
+          (List.foldr
+             (globalH ce)
+             Nil
+             (sortedOnce (Cons key (I.globalsIn b))))))
+
+-- (what a definition made on its own: the C state it was emitted from
+-- held nothing else)
+ownStart : String -> CS
+ownStart o =
+  { owner = o
+  , nlam = 0
+  , lams = Nil
+  , protos = Nil
+  , nstr = 0
+  , strs = Nil
+  , shapes = Nil
+  , prims = Nil
+  }
+
+madeLines : List (Pair String String) -> List String
+madeLines ps = List.reverse (List.map snd ps)
+
+keptOf : String -> Emitted1 -> CS -> EmitKept
+keptOf v e s =
+  { ver = v
+  , protos = e.protos
+  , code = e.code
+  , strs = madeLines s.strs
+  , lprotos = madeLines s.protos
+  , lams = madeLines s.lams
+  , shapes = madeLines s.shapes
+  , prims = madeLines s.prims
+  }
+
+pushOwn : String
+        -> List String
+        -> List (Pair String String)
+        -> List (Pair String String)
+pushOwn o Nil acc = acc
+pushOwn o (Cons l ls) acc = pushOwn o ls (Cons (MkPair o l) acc)
+
+-- (what the definition `o` made, as if made after what `s` holds)
+mergeKept : String -> EmitKept -> CS -> CS
+mergeKept o k s =
+  { owner = s.owner
+  , nlam = s.nlam
+  , lams = pushOwn o k.lams s.lams
+  , protos = pushOwn o k.lprotos s.protos
+  , nstr = s.nstr
+  , strs = pushOwn o k.strs s.strs
+  , shapes = pushOwn o k.shapes s.shapes
+  , prims = pushOwn o k.prims s.prims
+  }
+
+type EmitAcc =
+  { ems : List Emitted1, s : CS, fresh : List (Pair String EmitKept) }
+
+keptHit : EmitAcc -> String -> EmitKept -> EmitAcc
+keptHit acc key k =
+  { ems = Cons { protos = k.protos, code = k.code } acc.ems
+  , s = mergeKept (cGlobal key) k acc.s
+  , fresh = acc.fresh
+  }
+
+freshEmitted : EmitAcc -> String -> String -> Pair Emitted1 CS -> EmitAcc
+freshEmitted acc key v (MkPair e s1) =
+  { ems = Cons e acc.ems
+  , s = mergeKept (cGlobal key) (keptOf v e s1) acc.s
+  , fresh = Cons (MkPair key (keptOf v e s1)) acc.fresh
+  }
+
+keptAtVer : String -> Maybe EmitKept -> Maybe EmitKept
+keptAtVer v (Just k) = if strEq k.ver v then Just k else Nothing
+keptAtVer v Nothing = Nothing
+
+emitAt : CE
+       -> M.Map String EmitKept
+       -> EmitAcc
+       -> I.Def
+       -> I.Expr
+       -> String
+       -> EmitAcc
+emitAt ce kept acc d b0 v = case keptAtVer
+    v
+    (M.lookup compareString d.key kept) of
+  Just k -> keptHit acc d.key k
+  Nothing ->
+    freshEmitted
+      acc
+      d.key
+      v
+      (defC ce (I.mkDef d.key d.name b0) (ownStart (cGlobal d.key)))
+
+emitWith : CE -> M.Map String EmitKept -> EmitAcc -> I.Def -> I.Expr -> EmitAcc
+emitWith ce kept acc d b0 = emitAt ce kept acc d b0 (emitVer ce d.key b0)
+
+emitOne : CE -> M.Map String EmitKept -> EmitAcc -> I.Def -> EmitAcc
+emitOne ce kept acc d = emitWith ce kept acc d (fst (I.freshen 0 d.body))
+
+-- | each definition emitted as `defsC` does -- as the cache keeps it,
+-- | where it keeps it at its version -- and those emitted here
+defsKept : CE -> M.Map String EmitKept -> List I.Def -> EmitAcc
+defsKept ce kept defs =
+  List.foldl (emitOne ce kept) { ems = Nil, s = emptyCS, fresh = Nil } defs
+
 partsCE : String
         -> List Em.Provider
         -> Ending
@@ -3036,6 +3187,83 @@ compileProgramParts : String
                     -> Pair (List (Pair String String)) (List String)
 compileProgramParts runtime provs g key eff =
   partsOf runtime provs eff (L.lowerProgramAnf g key)
+
+-- | the program as parts, made through the backend's cache: what is
+-- | wrong with it, and what the cache is to keep anew -- definitions of
+-- | the core simplified, copies, definitions' C
+type PartsKept =
+  { parts : List (Pair String String)
+  , errors : List String
+  , groups : List L.GroupOut
+  , copies : List Si.CopyDone
+  , emits : List (Pair String EmitKept)
+  }
+
+keptPartsAcc : String
+             -> List Em.Provider
+             -> Ending
+             -> L.LoweredKept
+             -> CE
+             -> EmitAcc
+             -> PartsKept
+keptPartsAcc runtime provs ending lk ce acc =
+  { parts =
+      partsWith
+        runtime
+        provs
+        ending
+        lk.lowered.defs
+        ce
+        (MkPair (List.reverse acc.ems) acc.s)
+  , errors = lk.lowered.errors
+  , groups = lk.groups
+  , copies = lk.copies
+  , emits = acc.fresh
+  }
+
+keptPartsCE : String
+            -> List Em.Provider
+            -> Ending
+            -> M.Map String EmitKept
+            -> L.LoweredKept
+            -> CE
+            -> PartsKept
+keptPartsCE runtime provs ending kept lk ce =
+  keptPartsAcc runtime provs ending lk ce (defsKept ce kept lk.lowered.defs)
+
+keptParts : String
+          -> List Em.Provider
+          -> Ef.Effect
+          -> M.Map String EmitKept
+          -> L.LoweredKept
+          -> PartsKept
+keptParts runtime provs eff kept lk =
+  keptPartsCE
+    runtime
+    provs
+    { prefix = Nil, end = runEnd eff }
+    kept
+    lk
+    (ceOf
+       provs
+       lk.lowered.defs
+       (namesIn tagsLbls (List.map (\(d : I.Def) -> d.body) lk.lowered.defs)))
+
+-- | the parts `compileProgramParts` makes, made through the backend's
+-- | cache (heff.build.backcache): each definition of the core taken as
+-- | it keeps it at its version (`vers`, `ks`, heff.compile.lower), each
+-- | definition's C as it keeps it at what it is made of (`kept`)
+compileProgramPartsKept : String
+                        -> List Em.Provider
+                        -> G.Globals
+                        -> String
+                        -> Ef.Effect
+                        -> M.Map String String
+                        -> L.Keeps
+                        -> M.Map String EmitKept
+                        -> PartsKept
+compileProgramPartsKept runtime provs g key eff vers ks kept =
+  keptParts runtime provs eff kept (L.lowerProgramKept g key vers ks)
 
 -- | one C file that shows the definitions it is asked for, of those
 -- | given (each by its name and key), as test/load-js.mjs shows

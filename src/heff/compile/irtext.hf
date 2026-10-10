@@ -1,0 +1,294 @@
+-- The intermediate language as text, and hashed, for the backend's cache
+-- (heff.build.backcache): a stream of tokens as heff.build.serial writes
+-- core syntax -- every node a tag of fixed shape, counts before lists,
+-- strings length-prefixed (`3:abc`) -- and `decodeExpr` its inverse; a
+-- hash of an expression, walked without writing it out.
+
+import heff.build.decoder
+import heff.elab.fixed
+import heff.compile.ir as I
+import heff.syntax.surface as Su
+
+-- Writing
+--------------------------------------------------------------------------------
+
+tok : String -> String
+tok s = showInt (strLength s) ^ ":" ^ s
+
+-- (every encoder conses its tokens in front of those that follow)
+strsT : List String -> List String -> List String
+strsT Nil rest = rest
+strsT (Cons x xs) rest = Cons (tok x) (strsT xs rest)
+
+manyT : List String -> List String -> List String
+manyT xs rest = Cons (showInt (List.length xs)) (strsT xs rest)
+
+type EK = { go : I.Expr -> List String -> List String }
+
+exprsT : EK -> List I.Expr -> List String -> List String
+exprsT k Nil rest = rest
+exprsT k (Cons e es) rest = k.go e (exprsT k es rest)
+
+fieldsT : EK -> List (Pair String I.Expr) -> List String -> List String
+fieldsT k Nil rest = rest
+fieldsT k (Cons (MkPair l e) fs) rest =
+  Cons (tok l) (k.go e (fieldsT k fs rest))
+
+armsT : EK -> List I.Arm -> List String -> List String
+armsT k Nil rest = rest
+armsT k (Cons (MkArm t vs b) arms) rest =
+  Cons (tok t) (manyT vs (k.go b (armsT k arms rest)))
+
+encodeF : EK -> I.Expr -> List String -> List String
+encodeF k (EVar x) rest = Cons "v" (Cons (tok x) rest)
+encodeF k (EGlobal g) rest = Cons "g" (Cons (tok g) rest)
+encodeF k (ELam xs b) rest = Cons "l" (manyT xs (k.go b rest))
+encodeF k (EApp f as) rest =
+  Cons "a" (k.go f (Cons (showInt (List.length as)) (exprsT k as rest)))
+encodeF k (ELet x a b) rest = Cons "t" (Cons (tok x) (k.go a (k.go b rest)))
+encodeF k (ERecord fs) rest =
+  Cons "r" (Cons (showInt (List.length fs)) (fieldsT k fs rest))
+encodeF k (EProj e l sh) rest = Cons "p" (k.go e (Cons (tok l) (manyT sh rest)))
+encodeF k (ETag t as) rest =
+  Cons "c" (Cons (tok t) (Cons (showInt (List.length as)) (exprsT k as rest)))
+encodeF k (EMatch s arms) rest =
+  Cons "m" (k.go s (Cons (showInt (List.length arms)) (armsT k arms rest)))
+encodeF k (EPrim p) rest = Cons "q" (Cons (tok p) rest)
+encodeF k (EPrimCall p as) rest =
+  Cons "k" (Cons (tok p) (Cons (showInt (List.length as)) (exprsT k as rest)))
+encodeF k (ECall g as) rest =
+  Cons "K" (Cons (tok g) (Cons (showInt (List.length as)) (exprsT k as rest)))
+encodeF k (EInt i) rest = Cons "i" (Cons (tok (showInt i)) rest)
+encodeF k (EFloat x) rest = Cons "f" (Cons (tok (showFloat x)) rest)
+encodeF k (EStr s) rest = Cons "s" (Cons (tok s) rest)
+encodeF k (EFixed w n) rest =
+  Cons "x" (Cons (fixedName w) (Cons (tok (showInt n)) rest))
+encodeF k (EFloat32 x) rest = Cons "y" (Cons (tok (showFloat x)) rest)
+encodeF k EAbandon rest = Cons "X" rest
+encodeF k (EFix f b) rest = Cons "F" (Cons (tok f) (k.go b rest))
+
+ek : EK
+ek = { go = \e rest -> encodeF ek e rest }
+
+-- | an expression's tokens, in front of `rest`
+encodeExprT : I.Expr -> List String -> List String
+encodeExprT e rest = ek.go e rest
+
+-- | an expression as text
+encodeExpr : I.Expr -> String
+encodeExpr e = joinWith " " (ek.go e Nil)
+
+-- Reading
+--------------------------------------------------------------------------------
+
+type DK = { go : Dec I.Expr }
+
+consD : {a : Type} -> Dec a -> Dec (List a) -> Dec (List a)
+consD d more = do
+  x <- d
+  xs <- more
+  pure (Cons x xs)
+
+-- (`n` of what `d` reads)
+nD : {a : Type} -> Dec a -> Int -> Dec (List a)
+nD d n = if n <= 0 then pure Nil else consD d (nD d (n - 1))
+
+manyD : {a : Type} -> Dec a -> Dec (List a)
+manyD d = bind int (nD d)
+
+fieldD : DK -> Dec (Pair String I.Expr)
+fieldD k = do
+  l <- str
+  e <- k.go
+  pure (MkPair l e)
+
+armD : DK -> Dec I.Arm
+armD k = do
+  t <- str
+  vs <- manyD str
+  b <- k.go
+  pure (MkArm t vs b)
+
+fixedD : Dec Fixed
+fixedD = do
+  w <- word
+  found (fixedOfName w)
+
+exprOf : DK -> String -> Dec I.Expr
+exprOf k "v" = do
+  x <- str
+  pure (EVar x)
+exprOf k "g" = do
+  g <- str
+  pure (EGlobal g)
+exprOf k "l" = do
+  xs <- manyD str
+  b <- k.go
+  pure (ELam xs b)
+exprOf k "a" = do
+  f <- k.go
+  as <- manyD k.go
+  pure (EApp f as)
+exprOf k "t" = do
+  x <- str
+  a <- k.go
+  b <- k.go
+  pure (ELet x a b)
+exprOf k "r" = do
+  fs <- manyD (fieldD k)
+  pure (ERecord fs)
+exprOf k "p" = do
+  e <- k.go
+  l <- str
+  sh <- manyD str
+  pure (EProj e l sh)
+exprOf k "c" = do
+  t <- str
+  as <- manyD k.go
+  pure (ETag t as)
+exprOf k "m" = do
+  s <- k.go
+  arms <- manyD (armD k)
+  pure (EMatch s arms)
+exprOf k "q" = do
+  p <- str
+  pure (EPrim p)
+exprOf k "k" = do
+  p <- str
+  as <- manyD k.go
+  pure (EPrimCall p as)
+exprOf k "K" = do
+  g <- str
+  as <- manyD k.go
+  pure (ECall g as)
+exprOf k "i" = do
+  x <- str
+  pure (EInt (Su.intOfText x))
+exprOf k "f" = do
+  x <- str
+  pure (EFloat (Su.floatOfText x))
+exprOf k "s" = do
+  x <- str
+  pure (EStr x)
+exprOf k "x" = do
+  w <- fixedD
+  x <- str
+  pure (EFixed w (Su.intOfText x))
+exprOf k "y" = do
+  x <- str
+  pure (EFloat32 (Su.floatOfText x))
+exprOf k "X" = pure EAbandon
+exprOf k "F" = do
+  f <- str
+  b <- k.go
+  pure (EFix f b)
+exprOf k _ = fail
+
+dk : DK
+dk = { go = \s i -> bind word (exprOf dk) s i }
+
+-- | an expression, read from where the stream is
+takeExpr : Dec I.Expr
+takeExpr = dk.go
+
+-- | an expression, read whole from its text
+-- | >>> decodeExpr (encodeExpr (ELam ["x$1", "a b"] (EMatch (EVar "x$1") [MkArm "Cons" ["h", "t"] (EApp (EGlobal "m.f") [EStr "3:a b", EInt (0 - 7), EProj (ERecord [MkPair "l" (EFloat 0.5)]) "l" ["l"]])])))
+-- | Just (ELam (Cons "x$1" (Cons "a b" Nil)) (EMatch (EVar "x$1") (Cons (MkArm "Cons" (Cons "h" (Cons "t" Nil)) (EApp (EGlobal "m.f") (Cons (EStr "3:a b") (Cons (EInt (-7)) (Cons (EProj (ERecord (Cons (MkPair "l" (EFloat 0.5)) Nil)) "l" (Cons "l" Nil)) Nil))))) Nil)))
+decodeExpr : String -> Maybe I.Expr
+decodeExpr s = run (whole takeExpr) s
+
+-- Hashing: two polynomial hashes, each modulo a prime below 2^31, of
+-- what the text would be (its tags, counts and strings), walked as a
+-- worklist -- no text made
+--------------------------------------------------------------------------------
+
+stepA : Int -> Int -> Int
+stepA h c = (h * 1000003 + c + 1) % 2147483647
+
+stepB : Int -> Int -> Int
+stepB h c = (h * 999983 + c + 1) % 2147483629
+
+-- | what is still to be hashed: an expression, a string, a number
+data HItem = HE I.Expr | HS String | HN Int
+
+-- (a string's bytes, then its end)
+bytesH : String -> Int -> Int -> Int -> Pair Int Int
+bytesH s i a b =
+  if i >= strLength s then MkPair (stepA a 256) (stepB b 256)
+  else bytesH s (i + 1) (stepA a (byteAt s i)) (stepB b (byteAt s i))
+
+strsH : List String -> List HItem -> List HItem
+strsH Nil rest = rest
+strsH (Cons x xs) rest = Cons (HS x) (strsH xs rest)
+
+exprsH : List I.Expr -> List HItem -> List HItem
+exprsH Nil rest = rest
+exprsH (Cons e es) rest = Cons (HE e) (exprsH es rest)
+
+fieldsH : List (Pair String I.Expr) -> List HItem -> List HItem
+fieldsH Nil rest = rest
+fieldsH (Cons (MkPair l e) fs) rest =
+  Cons (HS l) (Cons (HE e) (fieldsH fs rest))
+
+armsH : List I.Arm -> List HItem -> List HItem
+armsH Nil rest = rest
+armsH (Cons (MkArm t vs b) arms) rest =
+  Cons
+    (HS t)
+    (Cons (HN (List.length vs)) (strsH vs (Cons (HE b) (armsH arms rest))))
+
+-- (a node: its tag's number, then its parts, before the rest)
+nodeH : I.Expr -> List HItem -> List HItem
+nodeH (EVar x) rest = Cons (HN 1) (Cons (HS x) rest)
+nodeH (EGlobal g) rest = Cons (HN 2) (Cons (HS g) rest)
+nodeH (ELam xs b) rest =
+  Cons (HN 3) (Cons (HN (List.length xs)) (strsH xs (Cons (HE b) rest)))
+nodeH (EApp f as) rest =
+  Cons (HN 4) (Cons (HE f) (Cons (HN (List.length as)) (exprsH as rest)))
+nodeH (ELet x a b) rest =
+  Cons (HN 5) (Cons (HS x) (Cons (HE a) (Cons (HE b) rest)))
+nodeH (ERecord fs) rest =
+  Cons (HN 6) (Cons (HN (List.length fs)) (fieldsH fs rest))
+nodeH (EProj e l sh) rest =
+  Cons
+    (HN 7)
+    (Cons (HE e) (Cons (HS l) (Cons (HN (List.length sh)) (strsH sh rest))))
+nodeH (ETag t as) rest =
+  Cons (HN 8) (Cons (HS t) (Cons (HN (List.length as)) (exprsH as rest)))
+nodeH (EMatch s arms) rest =
+  Cons (HN 9) (Cons (HE s) (Cons (HN (List.length arms)) (armsH arms rest)))
+nodeH (EPrim p) rest = Cons (HN 10) (Cons (HS p) rest)
+nodeH (EPrimCall p as) rest =
+  Cons (HN 11) (Cons (HS p) (Cons (HN (List.length as)) (exprsH as rest)))
+nodeH (ECall g as) rest =
+  Cons (HN 12) (Cons (HS g) (Cons (HN (List.length as)) (exprsH as rest)))
+nodeH (EInt i) rest = Cons (HN 13) (Cons (HS (showInt i)) rest)
+nodeH (EFloat x) rest = Cons (HN 14) (Cons (HS (showFloat x)) rest)
+nodeH (EStr s) rest = Cons (HN 15) (Cons (HS s) rest)
+nodeH (EFixed w n) rest =
+  Cons (HN 16) (Cons (HS (fixedName w)) (Cons (HS (showInt n)) rest))
+nodeH (EFloat32 x) rest = Cons (HN 17) (Cons (HS (showFloat x)) rest)
+nodeH EAbandon rest = Cons (HN 18) rest
+nodeH (EFix f b) rest = Cons (HN 19) (Cons (HS f) (Cons (HE b) rest))
+
+hashTake : (Int -> Int -> List HItem -> Pair Int Int)
+         -> List HItem
+         -> Pair Int Int
+         -> Pair Int Int
+hashTake go rest (MkPair a b) = go a b rest
+
+hashW : Int -> Int -> List HItem -> Pair Int Int
+hashW a b Nil = MkPair a b
+hashW a b (Cons (HN n) rest) =
+  hashW (stepA a (n + 300)) (stepB b (n + 300)) rest
+hashW a b (Cons (HS s) rest) = hashTake hashW rest (bytesH s 0 a b)
+hashW a b (Cons (HE e) rest) = hashW a b (nodeH e rest)
+
+-- | strings and expressions hashed, in order, into one hash
+-- | >>> strEq (hashOf [HE (ELam ["x"] (EVar "x"))]) (hashOf [HE (ELam ["x"] (EVar "x"))])
+-- | True
+-- | >>> strEq (hashOf [HE (EStr "ab"), HS "c"]) (hashOf [HE (EStr "a"), HS "bc"])
+-- | False
+hashOf : List HItem -> String
+hashOf items = case hashW 5381 7919 items of
+  MkPair a b -> showInt a ^ "-" ^ showInt b

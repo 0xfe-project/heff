@@ -18,7 +18,7 @@ export const groups = {
   // what heff says of programs: elaborating, formatting, its cache, its
   // command line, projects, what it draws on a terminal, and the texts
   // it said before
-  compiler: [["surface.mjs"], ["format.mjs"], ["cache.mjs"], ["cli.mjs"], ["project.mjs"], ["progress.mjs"], ["golden.mjs"]],
+  compiler: [["surface.mjs"], ["format.mjs"], ["cache.mjs"], ["backcache.mjs"], ["cli.mjs"], ["project.mjs"], ["progress.mjs"], ["golden.mjs"]],
   lsp: [["lsp.mjs"]],
   // programs compiled by each backend and run, held to the interpreter
   backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],

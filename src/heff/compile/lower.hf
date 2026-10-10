@@ -11,6 +11,7 @@ import heff.compile.callarity as Ca
 import heff.compile.erase as Er
 import heff.elab.globals as G
 import heff.compile.ir as I
+import heff.compile.irtext as Ir
 import heff.compile.lift as Lf
 import heff.compile.shake as Sh
 import heff.compile.simplify as Si
@@ -145,3 +146,315 @@ lowerAnf g roots = anfLowered roots (Er.eraseProgram g)
 lowerProgramAnf : G.Globals -> String -> Lowered
 lowerProgramAnf g key =
   anfLowered (Cons entryKey Nil) (withEntry key (Er.eraseProgram g))
+
+-- The backend's cache (heff.build.backcache)
+--------------------------------------------------------------------------------
+
+-- What a definition of the core is simplified to depends on what it is
+-- made of alone (heff.compile.simplify), so the cache keeps it, by its
+-- version -- what it is made of, hashed: given, for each definition of
+-- the core (the elaboration cache's hash of it).  One it keeps at its
+-- version is not erased again, nor simplified: what is lifted from it is
+-- taken as it keeps it, by what it mentions (what it reaches), whether
+-- it was safe before it was simplified, and what it was simplified to.
+
+-- | a definition lifted from one of the core (itself among them), as the
+-- | cache keeps it, with the globals its erased body mentions
+type KeptUnit = { def : Si.KeptDef, refs : List String }
+
+-- | what the cache keeps: for each definition of the core, by its key,
+-- | the version it keeps it at and the definitions lifted from it, in
+-- | order; the copies, by name
+type Keeps =
+  { units : M.Map String (Pair String (List KeptUnit))
+  , copies : M.Map String Si.KeptCopy
+  }
+
+-- | a definition lifted from one of the core, simplified here, as the
+-- | cache is to keep it
+type UnitOut =
+  { done : Si.Done
+  , name : String
+  , refs : List String
+  , sgSafe : Bool
+  , sgTotal : Int
+  }
+
+-- | the definitions lifted from one of the core (`owner`, at version
+-- | `ver`), in order: each simplified here, or taken as the cache keeps
+-- | it (`Nothing`)
+type GroupOut =
+  { owner : String, ver : String, units : List (Pair String (Maybe UnitOut)) }
+
+-- | a program lowered, and what the cache is to keep of it
+type LoweredKept =
+  { lowered : Lowered, groups : List GroupOut, copies : List Si.CopyDone }
+
+-- (what is to be simplified, from the definition of the core `owner`;
+-- what it mentions)
+type Piece =
+  { owner : String
+  , key : String
+  , name : String
+  , item : Si.Item
+  , refs : List String
+  }
+
+findDef : String -> List I.Def -> Maybe I.Def
+findDef k Nil = Nothing
+findDef k (Cons d ds) = if strEq d.key k then Just d else findDef k ds
+
+redoErased : String
+           -> String
+           -> Int
+           -> Either String (Pair I.Expr Int)
+           -> Pair (Maybe I.Def) Int
+redoErased k uk n (Right (MkPair body n2)) =
+  MkPair (findDef uk (Lf.liftDef (I.mkDef k k body))) n2
+redoErased k uk n (Left _) = MkPair Nothing n
+
+keptPiece : G.Globals -> String -> G.Entry -> KeptUnit -> Piece
+keptPiece g k e u =
+  { owner = k
+  , key = u.def.key
+  , name = u.def.name
+  , item = Kept u.def (\n -> redoErased k u.def.key n (Er.definition g k e n))
+  , refs = u.refs
+  }
+
+freshPiece : String -> I.Def -> Piece
+freshPiece k d =
+  { owner = k
+  , key = d.key
+  , name = d.name
+  , item = Fresh d
+  , refs = I.globalsIn d.body
+  }
+
+type PieceAcc = { pieces : List Piece, errors : List String, supply : Int }
+
+revOnto : {a : Type} -> List a -> List a -> List a
+revOnto Nil acc = acc
+revOnto (Cons x xs) acc = revOnto xs (Cons x acc)
+
+-- (the units the cache keeps for `k`, if at the version it has)
+keptFor : M.Map String String -> Keeps -> String -> Maybe (List KeptUnit)
+keptFor vers ks k = case M.lookup compareString k ks.units of
+  Just (MkPair v us) ->
+    if not (strEq v "")
+    && strEq v (fromMaybe "" (M.lookup compareString k vers))
+      then Just us
+    else Nothing
+  Nothing -> Nothing
+
+erasedPieces : String -> PieceAcc -> Either String (Pair I.Expr Int) -> PieceAcc
+erasedPieces k acc (Right (MkPair body n)) =
+  { pieces =
+      revOnto
+        (List.map (freshPiece k) (Lf.liftDef (I.mkDef k k body)))
+        acc.pieces
+  , errors = acc.errors
+  , supply = n
+  }
+erasedPieces k acc (Left err) =
+  { pieces = acc.pieces
+  , errors = Cons (k ^ ": " ^ err) acc.errors
+  , supply = acc.supply
+  }
+
+pieceStep : G.Globals
+          -> M.Map String String
+          -> Keeps
+          -> PieceAcc
+          -> Pair String G.Entry
+          -> PieceAcc
+pieceStep g vers ks acc (MkPair k e) =
+  if Er.isType 0 e.type_ then acc
+  else case keptFor vers ks k of
+    Just us ->
+      { pieces = revOnto (List.map (keptPiece g k e) us) acc.pieces
+      , errors = acc.errors
+      , supply = acc.supply
+      }
+    Nothing -> erasedPieces k acc (Er.definition g k e acc.supply)
+
+-- (the entry's version: its computation's, if it has one)
+entryVer : M.Map String String -> String -> String
+entryVer vers key = case M.lookup compareString key vers of
+  Just v -> if strEq v "" then "" else "entry/" ^ v
+  Nothing -> ""
+
+entryKept : String -> KeptUnit -> Piece
+entryKept key u =
+  { owner = entryKey
+  , key = u.def.key
+  , name = u.def.name
+  , item =
+      Kept
+        u.def
+        (\m ->
+           MkPair (Just (I.mkDef entryKey entryKey (entryBody key m))) (m + 11))
+  , refs = u.refs
+  }
+
+entryPieces : M.Map String String -> Keeps -> String -> Int -> List Piece
+entryPieces vers ks key n = case keptFor vers ks entryKey of
+  Just us -> List.map (entryKept key) us
+  Nothing ->
+    Cons (freshPiece entryKey (I.mkDef entryKey entryKey (entryBody key n))) Nil
+
+-- (each definition's version: of the definition of the core it is lifted
+-- from, and of its key)
+unitVers : M.Map String String -> List Piece -> M.Map String String
+unitVers vers ps =
+  List.foldl
+    (\m (p : Piece) -> case M.lookup compareString p.owner vers of
+     Just v ->
+       if strEq v "" then m
+       else M.insert compareString p.key (Ir.hashOf [HS v, HS p.key]) m
+     Nothing -> m)
+    M.empty
+    ps
+
+doneMap : List Si.Done -> M.Map String Si.Done
+doneMap ds =
+  List.foldl (\m (d : Si.Done) -> M.insert compareString d.key d m) M.empty ds
+
+unitOut : Si.SG -> M.Map String Si.Done -> Piece -> Maybe UnitOut
+unitOut sg dm p = case M.lookup compareString p.key dm of
+  Just d ->
+    Just
+      { done = d
+      , name = p.name
+      , refs = p.refs
+      , sgSafe = M.member compareString p.key sg.safe
+      , sgTotal = fromMaybe (0 - 1) (M.lookup compareString p.key sg.total)
+      }
+  Nothing -> Nothing
+
+-- (one simplified here: the copies it asked for each with a version)
+storable : Maybe UnitOut -> Bool
+storable (Just u) = Si.allVersKnown u.done.touched
+storable Nothing = True
+
+-- (the pieces of each definition of the core, which are together)
+groupCons : Piece -> List (List Piece) -> List (List Piece)
+groupCons p (Cons (Cons q qs) rest) =
+  if strEq p.owner q.owner then Cons (Cons p (Cons q qs)) rest
+  else Cons (Cons p Nil) (Cons (Cons q qs) rest)
+groupCons p gs = Cons (Cons p Nil) gs
+
+groupGo : List Piece -> List (List Piece)
+groupGo Nil = Nil
+groupGo (Cons p ps) = groupCons p (groupGo ps)
+
+-- (a definition of the core, to be kept anew: one with a version, of
+-- which something was simplified here, each storable)
+groupOut : M.Map String String
+         -> Si.SG
+         -> M.Map String Si.Done
+         -> List Piece
+         -> Maybe GroupOut
+groupOut vers sg dm Nil = Nothing
+groupOut vers sg dm (Cons p ps) =
+  if strEq (fromMaybe "" (M.lookup compareString p.owner vers)) ""
+  || not
+    (List.any (\(q : Piece) -> M.member compareString q.key dm) (Cons p ps))
+  || not (List.all (\q -> storable (unitOut sg dm q)) (Cons p ps))
+    then Nothing
+  else Just
+      { owner = p.owner
+      , ver = fromMaybe "" (M.lookup compareString p.owner vers)
+      , units =
+          List.map (\(q : Piece) -> MkPair q.key (unitOut sg dm q)) (Cons p ps)
+      }
+
+keptLowered : List String
+            -> M.Map String String
+            -> Si.SG
+            -> List Piece
+            -> Si.Simplified
+            -> LoweredKept
+keptLowered errors vers sg ps si =
+  { lowered = anfSimplified (Cons entryKey Nil) errors si
+  , groups =
+      Si.catMaybesS (List.map (groupOut vers sg (doneMap si.done)) (groupGo ps))
+  , copies = si.copies
+  }
+
+simplifyWith : List String
+             -> M.Map String String
+             -> Keeps
+             -> Int
+             -> List Piece
+             -> Si.SG
+             -> LoweredKept
+simplifyWith errors vers ks n ps sg =
+  keptLowered
+    errors
+    vers
+    sg
+    ps
+    (Si.simplifyItems
+       n
+       sg
+       (unitVers vers ps)
+       ks.copies
+       (List.map (\(p : Piece) -> p.item) ps))
+
+simplifyPieces : List String
+               -> M.Map String String
+               -> Keeps
+               -> Int
+               -> List Piece
+               -> LoweredKept
+simplifyPieces errors vers ks n ps =
+  simplifyWith
+    errors
+    vers
+    ks
+    n
+    ps
+    (Si.safeItems (List.map (\(p : Piece) -> p.item) ps))
+
+refsMap : List Piece -> M.Map String (List String)
+refsMap ps =
+  List.foldl
+    (\m (q : Piece) -> M.insert compareString q.key q.refs m)
+    M.empty
+    ps
+
+reachedIn : M.Map String Unit -> List Piece -> List Piece
+reachedIn r ps = List.filter (\(p : Piece) -> M.member compareString p.key r) ps
+
+-- (what is reached from the entry)
+reachedPieces : List Piece -> List Piece
+reachedPieces ps = reachedIn (Sh.reached (Cons entryKey Nil) (refsMap ps)) ps
+
+piecesWith : M.Map String String -> Keeps -> String -> PieceAcc -> LoweredKept
+piecesWith vers ks key acc =
+  simplifyPieces
+    (List.reverse acc.errors)
+    vers
+    ks
+    (acc.supply + 11)
+    (reachedPieces
+       (List.reverse (revOnto (entryPieces vers ks key acc.supply) acc.pieces)))
+
+-- | a program, lowered as `lowerProgramAnf` does -- each definition of
+-- | the core the cache keeps at its version (`vers`) taken as it keeps
+-- | it -- and what the cache is to keep of it
+lowerProgramKept : G.Globals
+                 -> String
+                 -> M.Map String String
+                 -> Keeps
+                 -> LoweredKept
+lowerProgramKept g key vers ks =
+  piecesWith
+    (M.insert compareString entryKey (entryVer vers key) vers)
+    ks
+    key
+    (List.foldl
+       (pieceStep g vers ks)
+       { pieces = Nil, errors = Nil, supply = 0 }
+       (G.globalsList g))

@@ -1,0 +1,506 @@
+-- The backend's cache, the pure side: what a file of it says, and what
+-- the C backend is given from it and gives back to it.  For a module
+-- `M`, `.heff/<backDir>/M.hb` keeps
+--
+-- - each of its definitions of the core, simplified (heff.compile.lower):
+--   by the version it was made at -- the elaboration cache's hash of
+--   it, which covers what it uses -- the definitions lifted from it,
+--   each simplified, with what it mentions, whether it was safe before;
+-- - the copies of its definitions (heff.compile.simplify): by the
+--   version each was made at, what it is known by, and what it was made
+--   to, with the copies asked for as it was;
+-- - each of its definitions' C (heff.compile.emitc), by a hash of what
+--   it was made of.
+--
+-- A file is of one compiler: the hash of the program that wrote it (its
+-- own executable), which a file of another is not believed by -- a
+-- compiler's backend is not known by any number to bump.  Nothing in a
+-- file that does not decode is believed; what is not believed is made
+-- again, and written over it.  An entry made again replaces the one of
+-- its key; the others stay, for the programs not compiled this time.
+
+import heff.build.decoder
+import heff.compile.emitc as Ec
+import heff.compile.ir as I
+import heff.compile.irtext as Ir
+import heff.compile.lower as L
+import heff.compile.simplify as Si
+import heff.compile.spec as Sp
+import map as M
+
+version : String
+version = "heff-backend/1"
+
+-- | the directory under `.heff/` the files are in
+backDir : String
+backDir = "b1"
+
+-- Writing
+--------------------------------------------------------------------------------
+
+boolT : Bool -> String
+boolT True = "t"
+boolT False = "f"
+
+-- (strings: their count, then each)
+strsT : List String -> List String -> List String
+strsT xs rest =
+  Cons (showInt (List.length xs)) (List.append (List.map Ir.tok xs) rest)
+
+pairT : Pair String String -> List String -> List String
+pairT (MkPair a b) rest = Cons (Ir.tok a) (Cons (Ir.tok b) rest)
+
+pairsGo : List (Pair String String) -> List String -> List String
+pairsGo Nil rest = rest
+pairsGo (Cons p ps) rest = pairT p (pairsGo ps rest)
+
+pairsT : List (Pair String String) -> List String -> List String
+pairsT ps rest = Cons (showInt (List.length ps)) (pairsGo ps rest)
+
+-- (an expression, as a string: its variables named as they are, named
+-- afresh where it is read)
+exprT : I.Expr -> String
+exprT e = Ir.tok (Ir.encodeExpr e)
+
+unitText : L.UnitOut -> String
+unitText u =
+  joinWith
+    " "
+    (Cons
+       (Ir.tok u.done.key)
+       (Cons
+          (Ir.tok u.name)
+          (strsT
+             u.refs
+             (Cons
+                (boolT u.sgSafe)
+                (Cons
+                   (showInt u.sgTotal)
+                   (Cons
+                      (exprT u.done.body)
+                      (Cons
+                         (boolT u.done.safe)
+                         (pairsT u.done.touched Nil))))))))
+
+madeT : Maybe (Pair I.Expr (List (Pair String String))) -> List String
+madeT (Just (MkPair b t)) = Cons "j" (Cons (exprT b) (pairsT t Nil))
+madeT Nothing = Cons "n" Nil
+
+copyText : Si.CopyDone -> String
+copyText c =
+  joinWith
+    " "
+    (Cons
+       (Ir.tok c.name)
+       (Cons
+          (Ir.tok c.ver)
+          (Cons
+             (exprT c.recipe)
+             (Cons (showInt c.depth) (Cons (boolT c.safe) (madeT c.made))))))
+
+emitText : String -> Ec.EmitKept -> String
+emitText key k =
+  joinWith
+    " "
+    (Cons
+       (Ir.tok key)
+       (Cons
+          (Ir.tok k.ver)
+          (strsT
+             k.protos
+             (strsT
+                k.code
+                (strsT
+                   k.strs
+                   (strsT
+                      k.lprotos
+                      (strsT k.lams (strsT k.shapes (strsT k.prims Nil)))))))))
+
+-- Reading
+--------------------------------------------------------------------------------
+
+-- (what `d` reads, and the text it read: the separator after it left)
+rawEnd : String -> Int -> Int -> Int
+rawEnd s i j = if j > i && byteAt s (j - 1) == 32 then j - 1 else j
+
+rawGot : {a : Type}
+       -> String
+       -> Int
+       -> Maybe (Got a)
+       -> Maybe (Got (Pair a String))
+rawGot s i (Just (MkPair x j)) =
+  Just (MkPair (MkPair x (strSlice s i (rawEnd s i j))) j)
+rawGot s i Nothing = Nothing
+
+withRaw : {a : Type} -> Dec a -> Dec (Pair a String)
+withRaw d = \s i -> rawGot s i (d s i)
+
+pairD : Dec (Pair String String)
+pairD = do
+  a <- str
+  b <- str
+  pure (MkPair a b)
+
+-- (an expression, read when it is wanted)
+later : String -> Unit -> Maybe I.Expr
+later text u = Ir.decodeExpr text
+
+unitD : Dec L.KeptUnit
+unitD = do
+  key <- str
+  name <- str
+  refs <- many str
+  sgSafe <- bool
+  sgTotal <- int
+  body <- str
+  safe <- bool
+  touched <- many pairD
+  pure
+      { def =
+          { key = key
+          , name = name
+          , body = later body
+          , safe = safe
+          , touched = touched
+          , sgSafe = sgSafe
+          , sgTotal = sgTotal
+          }
+      , refs = refs
+      }
+
+-- | a definition of the core, simplified: its key, its version, the
+-- | definitions lifted from it (each with its text)
+type GroupIn =
+  { owner : String, ver : String, units : List (Pair L.KeptUnit String) }
+
+groupD : Dec GroupIn
+groupD = do
+  owner <- str
+  ver <- str
+  units <- many (withRaw unitD)
+  pure { owner = owner, ver = ver, units = units }
+
+madeOf : String -> Dec (Maybe Si.KeptMade)
+madeOf "j" = do
+  body <- str
+  touched <- many pairD
+  pure (Just { body = later body, touched = touched })
+madeOf "n" = pure Nothing
+madeOf _ = fail
+
+copyD : Dec (Pair String Si.KeptCopy)
+copyD = do
+  name <- str
+  ver <- str
+  recipe <- str
+  depth <- int
+  safe <- bool
+  made <- bind word madeOf
+  pure
+      (MkPair
+         name
+         { ver = ver
+         , recipe = later recipe
+         , depth = depth
+         , safe = safe
+         , made = made
+         })
+
+emitD : Dec (Pair String Ec.EmitKept)
+emitD = do
+  key <- str
+  ver <- str
+  protos <- many str
+  code <- many str
+  strs <- many str
+  lprotos <- many str
+  lams <- many str
+  shapes <- many str
+  prims <- many str
+  pure
+      (MkPair
+         key
+         { ver = ver
+         , protos = protos
+         , code = code
+         , strs = strs
+         , lprotos = lprotos
+         , lams = lams
+         , shapes = shapes
+         , prims = prims
+         })
+
+-- | what a file keeps, each entry with its text
+type Back =
+  { groups : List (Pair GroupIn String)
+  , copies : List (Pair (Pair String Si.KeptCopy) String)
+  , emits : List (Pair (Pair String Ec.EmitKept) String)
+  }
+
+noBack : Back
+noBack = { groups = Nil, copies = Nil, emits = Nil }
+
+backD : String -> Dec Back
+backD id = do
+  expect version
+  expect id
+  groups <- many (withRaw groupD)
+  copies <- many (withRaw copyD)
+  emits <- many (withRaw emitD)
+  expect "end"
+  pure { groups = groups, copies = copies, emits = emits }
+
+-- | a file, believed if it is of this compiler (`id`) and decodes whole
+readBack : String -> String -> Back
+readBack id text = fromMaybe noBack (run (whole (backD id)) text)
+
+-- What the backend is given
+--------------------------------------------------------------------------------
+
+-- | what the files keep, for the C backend: definitions of the core
+-- | simplified, copies, definitions' C
+keepsOf : List Back -> L.Keeps
+keepsOf bs =
+  { units =
+      List.foldl
+        (\m (b : Back) ->
+           List.foldl
+             (\m2 (g : Pair GroupIn String) ->
+                M.insert
+                  compareString
+                  (fst g).owner
+                  (MkPair (fst g).ver (List.map fst (fst g).units))
+                  m2)
+             m
+             b.groups)
+        M.empty
+        bs
+  , copies =
+      List.foldl
+        (\m (b : Back) ->
+           List.foldl
+             (\m2 c -> M.insert compareString (fst (fst c)) (snd (fst c)) m2)
+             m
+             b.copies)
+        M.empty
+        bs
+  }
+
+emitsOf : List Back -> M.Map String Ec.EmitKept
+emitsOf bs =
+  List.foldl
+    (\m (b : Back) ->
+       List.foldl
+         (\m2 e -> M.insert compareString (fst (fst e)) (snd (fst e)) m2)
+         m
+         b.emits)
+    M.empty
+    bs
+
+-- What it gives back, written
+--------------------------------------------------------------------------------
+
+lastDotGo : String -> Int -> Int -> Int
+lastDotGo k i at =
+  if i >= strLength k then at
+  else lastDotGo k (i + 1) (if byteAt k i == 46 then i else at)
+
+-- | the module a key is of, among `mods`: the longest of them it starts
+-- | with, then a dot (`_`: none)
+moduleIn : M.Map String Unit -> String -> String
+moduleIn mods k =
+  if M.member compareString k mods then k
+  else if lastDotGo k 0 (0 - 1) <= 0 then "_"
+  else moduleIn mods (strSlice k 0 (lastDotGo k 0 (0 - 1)))
+
+-- | a file anew: what it kept, an entry made again in place of the one
+-- | of its key
+type Entries =
+  { groups : M.Map String String
+  , copies : M.Map String String
+  , emits : M.Map String String
+  }
+
+entriesOf : Back -> Entries
+entriesOf b =
+  { groups =
+      List.foldl
+        (\m (g : Pair GroupIn String) ->
+           M.insert compareString (fst g).owner (snd g) m)
+        M.empty
+        b.groups
+  , copies =
+      List.foldl
+        (\m c -> M.insert compareString (fst (fst c)) (snd c) m)
+        M.empty
+        b.copies
+  , emits =
+      List.foldl
+        (\m e -> M.insert compareString (fst (fst e)) (snd e) m)
+        M.empty
+        b.emits
+  }
+
+withGroup : String -> String -> Entries -> Entries
+withGroup k t es =
+  { groups = M.insert compareString k t es.groups
+  , copies = es.copies
+  , emits = es.emits
+  }
+
+withCopy : String -> String -> Entries -> Entries
+withCopy k t es =
+  { groups = es.groups
+  , copies = M.insert compareString k t es.copies
+  , emits = es.emits
+  }
+
+withEmit : String -> String -> Entries -> Entries
+withEmit k t es =
+  { groups = es.groups
+  , copies = es.copies
+  , emits = M.insert compareString k t es.emits
+  }
+
+backOf : M.Map String Back -> String -> Back
+backOf olds m = fromMaybe noBack (M.lookup compareString m olds)
+
+-- (a module's entries so far: changed here, or as its file kept them)
+entriesAt : M.Map String Back -> M.Map String Entries -> String -> Entries
+entriesAt olds m k = case M.lookup compareString k m of
+  Just es -> es
+  Nothing -> entriesOf (backOf olds k)
+
+-- (a unit's text: made here, or as the file kept it)
+unitTextOf : List (Pair L.KeptUnit String)
+           -> Pair String (Maybe L.UnitOut)
+           -> Maybe String
+unitTextOf old (MkPair k (Just u)) = Just (unitText u)
+unitTextOf old (MkPair k Nothing) = case List.find
+    (\(p : Pair L.KeptUnit String) -> strEq (fst p).def.key k)
+    old of
+  Just p -> Just (snd p)
+  Nothing -> Nothing
+
+consJustB : String -> Maybe (List String) -> Maybe (List String)
+consJustB x (Just xs) = Just (Cons x xs)
+consJustB x Nothing = Nothing
+
+allJustB : List (Maybe String) -> Maybe (List String)
+allJustB Nil = Just Nil
+allJustB (Cons (Just x) rest) = consJustB x (allJustB rest)
+allJustB (Cons Nothing rest) = Nothing
+
+groupText : String -> String -> Maybe (List String) -> Maybe String
+groupText owner ver (Just us) =
+  Just
+    (joinWith
+       " "
+       (Cons
+          (Ir.tok owner)
+          (Cons (Ir.tok ver) (Cons (showInt (List.length us)) us))))
+groupText owner ver Nothing = Nothing
+
+-- (the units the file of `m` kept for `owner`)
+oldUnits : Back -> String -> List (Pair L.KeptUnit String)
+oldUnits b owner =
+  List.concatMap
+    (\(g : Pair GroupIn String) ->
+       if strEq (fst g).owner owner then (fst g).units else Nil)
+    b.groups
+
+-- | what the C backend gives back to be kept
+type Given =
+  { groups : List L.GroupOut
+  , copies : List Si.CopyDone
+  , emits : List (Pair String Ec.EmitKept)
+  }
+
+-- | where the files are: the modules, and what each kept
+type Files = { mods : M.Map String Unit, olds : M.Map String Back }
+
+groupIn : Files
+        -> M.Map String Entries
+        -> String
+        -> L.GroupOut
+        -> Maybe String
+        -> M.Map String Entries
+groupIn fs m md g (Just t) =
+  M.insert compareString md (withGroup g.owner t (entriesAt fs.olds m md)) m
+groupIn fs m md g Nothing = m
+
+addGroup : Files -> M.Map String Entries -> L.GroupOut -> M.Map String Entries
+addGroup fs m g =
+  groupIn
+    fs
+    m
+    (moduleIn fs.mods g.owner)
+    g
+    (groupText
+       g.owner
+       g.ver
+       (allJustB
+          (List.map
+             (unitTextOf
+                (oldUnits (backOf fs.olds (moduleIn fs.mods g.owner)) g.owner))
+             g.units)))
+
+addCopy : Files -> M.Map String Entries -> Si.CopyDone -> M.Map String Entries
+addCopy fs m c =
+  M.insert
+    compareString
+    (moduleIn fs.mods (Sp.rootOf c.name))
+    (withCopy
+       c.name
+       (copyText c)
+       (entriesAt fs.olds m (moduleIn fs.mods (Sp.rootOf c.name))))
+    m
+
+addEmit : Files
+        -> M.Map String Entries
+        -> Pair String Ec.EmitKept
+        -> M.Map String Entries
+addEmit fs m (MkPair k e) =
+  M.insert
+    compareString
+    (moduleIn fs.mods (Sp.rootOf k))
+    (withEmit
+       k
+       (emitText k e)
+       (entriesAt fs.olds m (moduleIn fs.mods (Sp.rootOf k))))
+    m
+
+-- | a module's file, its entries in order of their keys
+backText : String -> Entries -> String
+backText id es =
+  joinWith
+    " "
+    (List.append
+       [Ir.tok version, Ir.tok id, showInt (M.size es.groups)]
+       (List.append
+          (List.map snd (M.toList es.groups))
+          (Cons
+             (showInt (M.size es.copies))
+             (List.append
+                (List.map snd (M.toList es.copies))
+                (Cons
+                   (showInt (M.size es.emits))
+                   (List.append
+                      (List.map snd (M.toList es.emits))
+                      (Cons (Ir.tok "end") Nil)))))))
+
+-- | the files with something made anew in them, each by its module, as
+-- | they are to be: what they kept, what was made in place of the
+-- | entries of its keys
+backTexts : String -> Files -> Given -> List (Pair String String)
+backTexts id fs gv =
+  List.map
+    (\p -> MkPair (fst p) (backText id (snd p)))
+    (M.toList
+       (List.foldl
+          (addEmit fs)
+          (List.foldl
+             (addCopy fs)
+             (List.foldl (addGroup fs) M.empty gv.groups)
+             gv.copies)
+          gv.emits))

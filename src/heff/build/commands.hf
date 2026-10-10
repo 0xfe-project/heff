@@ -6,6 +6,8 @@
 -- so what is here may be used without either (#3).
 
 import co
+import heff.build.backcache as Bc
+import heff.build.cache as Ca
 import heff.build.driver as Dr
 import heff.elab.effect as Ef
 import heff.compile.emit as Em
@@ -23,6 +25,7 @@ import std.io
 import std.path as P
 import std.process
 import std.progress as Pg
+import map as Mp
 
 -- | the style of the paths of the platform heff runs on
 styleNow : {e : HFunctor} -> {{sys : process <: e}} -> Co e P.Style
@@ -777,10 +780,213 @@ providesLeafC (Cons p rest) k =
     then True
   else providesLeafC rest k
 
+-- The backend's cache (heff.build.backcache), `.heff/<backDir>/`
+--------------------------------------------------------------------------------
+
+-- | where a program's backend cache is, and what it is given: the
+-- | project's paths, each definition's hash (the elaboration cache's),
+-- | the program's modules
+type BackIn =
+  { paths : L.Paths, hashes : Mp.Map String String, modules : List String }
+
+backDirOf : L.Paths -> String
+backDirOf ps = L.under ps (L.under ps ps.root ".heff") Bc.backDir
+
+backPath : L.Paths -> String -> String
+backPath ps m = L.under ps (backDirOf ps) (m ^ ".hb")
+
+-- (a file written whole, or not at all: written beside it, then moved in
+-- its place)
+writeWhole : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> String
+           -> String
+           -> Co e Bool
+writeWhole path text = do
+  ok <- writeFile (path ^ "." ^ showInt (strLength text) ^ ".tmp") text
+  if ok then replace (path ^ "." ^ showInt (strLength text) ^ ".tmp") path
+    else pure False
+
+-- (the hash kept with the copy of the executable `b`, if `kept` is one:
+-- the hash, a newline, then the executable)
+keptId : String -> Maybe Int -> String -> Maybe String
+keptId b (Just at) kept =
+  if strLength kept - at - 1 == strLength b
+  && strEq (strSlice kept (at + 1) (strLength kept)) b
+    then Just (strSlice kept 0 at)
+  else Nothing
+keptId b Nothing kept = Nothing
+
+-- (the copy kept, with its hash `id`)
+selfKept : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> L.Paths
+         -> String
+         -> String
+         -> Co e String
+selfKept ps b id = do
+  made <- mkDir (backDirOf ps)
+  ok <- writeWhole (L.under ps (backDirOf ps) "compiler") (id ^ "\n" ^ b)
+  pure id
+
+selfFrom : {e : HFunctor}
+         -> {{disk : fs <: e}}
+         -> L.Paths
+         -> String
+         -> Maybe String
+         -> Co e String
+selfFrom ps b (Just kept) = case keptId b (indexOf "\n" kept) kept of
+  Just id -> pure id
+  Nothing -> selfFrom ps b Nothing
+selfFrom ps b Nothing = selfKept ps b (Ca.strHash b)
+
+-- | the compiler's own hash: of its executable ("" where it cannot be
+-- | read, the cache then not used).  Hashing it would take long each
+-- | time, so a copy of it is kept beside the cache, its hash first: an
+-- | executable the same as the copy has its hash.
+selfHash : {e : HFunctor}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> L.Paths
+         -> Co e String
+selfHash ps = do
+  p <- programPath
+  t <- readFile p
+  case t of
+    Just b -> do
+      kept <- readFile (L.under ps (backDirOf ps) "compiler")
+      selfFrom ps b kept
+    Nothing -> pure ""
+
+-- (each module's file, as it is: its text)
+readBacks : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> L.Paths
+          -> List String
+          -> Co e (List (Pair String String))
+readBacks ps Nil = pure Nil
+readBacks ps (Cons m rest) = do
+  t <- readFile (backPath ps m)
+  more <- readBacks ps rest
+  pure (case t of
+    Just text -> Cons (MkPair m text) more
+    Nothing -> more)
+
+-- (each file written, where it is not as it was)
+writeBacks : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> L.Paths
+           -> Mp.Map String String
+           -> List (Pair String String)
+           -> Co e Unit
+writeBacks ps olds Nil = pure MkUnit
+writeBacks ps olds (Cons (MkPair m text) rest) = do
+  ok <-
+    if strEq text (fromMaybe "" (Mp.lookup compareString m olds)) then pure True
+    else writeWhole (backPath ps m) text
+  writeBacks ps olds rest
+
+textsMap : List (Pair String String) -> Mp.Map String String
+textsMap ps =
+  List.foldl (\m p -> Mp.insert compareString (fst p) (snd p) m) Mp.empty ps
+
+backsOf : String -> List (Pair String String) -> Mp.Map String Bc.Back
+backsOf id ps =
+  List.foldl
+    (\m p -> Mp.insert compareString (fst p) (Bc.readBack id (snd p)) m)
+    Mp.empty
+    ps
+
+modsOf : List String -> Mp.Map String Unit
+modsOf ms = List.foldl (\m k -> Mp.insert compareString k MkUnit m) Mp.empty ms
+
+-- (the parts written, then what the cache is to keep anew -- `texts`,
+-- the files as they were, `backs`, what they kept -- then `done`)
+keptWritten : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> BackIn
+            -> String
+            -> String
+            -> List (Pair String String)
+            -> Mp.Map String Bc.Back
+            -> Co e Unit
+            -> Ec.PartsKept
+            -> Co e Unit
+keptWritten bi dir id texts backs done out =
+  writeParts
+    dir
+    (if strEq id "" then done
+     else do
+       made <- mkDir (backDirOf bi.paths)
+       writeBacks
+           bi.paths
+           (textsMap texts)
+           (Bc.backTexts
+              id
+              { mods = modsOf (Cons "_" bi.modules), olds = backs }
+              { groups = out.groups, copies = out.copies, emits = out.emits })
+       done)
+    (MkPair out.parts out.errors)
+
+keptWith : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> BackIn
+         -> String
+         -> String
+         -> Co e Unit
+         -> Dr.Checked
+         -> List Em.Provider
+         -> Dr.Runnable
+         -> String
+         -> List (Pair String String)
+         -> Mp.Map String Bc.Back
+         -> Co e Unit
+keptWith bi dir runtime done c available r id texts backs =
+  keptWritten
+    bi
+    dir
+    id
+    texts
+    backs
+    done
+    (Ec.compileProgramPartsKept
+       runtime
+       available
+       c.top.globals
+       r.key
+       r.effect
+       bi.hashes
+       (Bc.keepsOf (List.map snd (Mp.toList backs)))
+       (Bc.emitsOf (List.map snd (Mp.toList backs))))
+
+-- (the parts of the program running `r`, made through the cache)
+keptParts : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> BackIn
+          -> String
+          -> String
+          -> Co e Unit
+          -> Dr.Checked
+          -> List Em.Provider
+          -> Dr.Runnable
+          -> Co e Unit
+keptParts bi dir runtime done c available r = do
+  id <- selfHash bi.paths
+  texts <-
+    if strEq id "" then pure Nil else readBacks bi.paths (Cons "_" bi.modules)
+  keptWith bi dir runtime done c available r id texts (backsOf id texts)
+
 compileFoundC : {e : HFunctor}
               -> {{io : stdio <: e}}
               -> {{sys : process <: e}}
               -> {{disk : fs <: e}}
+              -> BackIn
               -> String
               -> Maybe String
               -> String
@@ -789,7 +995,7 @@ compileFoundC : {e : HFunctor}
               -> Dr.Checked
               -> List Em.Provider
               -> Co e Unit
-compileFoundC file name outPath runtime done c available = case Dr.findRunnable
+compileFoundC bi file name outPath runtime done c available = case Dr.findRunnable
     (List.filter (\k -> providesLeafC available k) (Dr.candidateLeaves c))
     c
     name of
@@ -799,15 +1005,14 @@ compileFoundC file name outPath runtime done c available = case Dr.findRunnable
   Right r ->
     -- (a directory, `OUT/`: the program as parts, a file for each module)
     if endsWith "/" outPath
-      then writeParts
+      then keptParts
+          bi
           (strSlice outPath 0 (strLength outPath - 1))
+          runtime
           done
-          (Ec.compileProgramParts
-             runtime
-             available
-             c.top.globals
-             r.key
-             r.effect)
+          c
+          available
+          r
     else writeOut
         outPath
         done
@@ -835,6 +1040,7 @@ compileLastC : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
              -> {{disk : fs <: e}}
+             -> BackIn
              -> List Dr.Source
              -> String
              -> Maybe String
@@ -842,7 +1048,7 @@ compileLastC : {e : HFunctor}
              -> Co e Unit
              -> List Dr.Checked
              -> Co e Unit
-compileLastC sources file name outPath done cs = case Dr.lastChecked cs of
+compileLastC bi sources file name outPath done cs = case Dr.lastChecked cs of
   Nothing -> do
     printErr "no files given"
     exit 1
@@ -862,7 +1068,7 @@ compileLastC sources file name outPath done cs = case Dr.lastChecked cs of
              runtime
              c.top.globals
              (List.map (\(o : Dr.Own) -> MkPair o.name o.key) c.own))
-      Just _ -> compileFoundC file name outPath runtime done c found
+      Just _ -> compileFoundC bi file name outPath runtime done c found
 
 -- | compile the computation `name` of FILE to one C file (with no
 -- | `name`, one that shows each of FILE's definitions asked for, as the
@@ -882,10 +1088,20 @@ cThen : {e : HFunctor}
 cThen name outPath file done = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  putFileDiags cs
-  if badL > 0 || anyErrors cs then exit 1
-    else compileLastC l.sources file name outPath done cs
+  acc <- Se.cachedAcc l
+  putFileDiags acc.done
+  if badL > 0 || anyErrors acc.done then exit 1
+    else compileLastC
+        { paths = l.paths
+        , hashes = acc.hashes
+        , modules = List.map (\(c : Dr.Checked) -> c.module) acc.done
+        }
+        l.sources
+        file
+        name
+        outPath
+        done
+        acc.done
 
 cCmd : {e : HFunctor}
      -> {{io : stdio <: e}}

@@ -10,6 +10,7 @@
 
 import heff.elab.fixed as Fx
 import heff.compile.ir as I
+import heff.compile.irtext as Ir
 import heff.compile.prims as Pr
 import heff.compile.spec as Sp
 import map as M
@@ -39,6 +40,48 @@ type Specs =
   , off : Bool
   }
 
+-- | a copy made, as the backend's cache keeps it (heff.build.backcache):
+-- | what it was made to (read when it is wanted), and the copies asked
+-- | for as it was made, each by its name and version
+type KeptMade =
+  { body : Unit -> Maybe I.Expr, touched : List (Pair String String) }
+
+-- | a copy asked for, as the cache keeps it: its version (`copyVer`),
+-- | what it is known by (`knowing`, read when it is wanted), how deep in
+-- | copies of copies it is, whether it is safe (`markCopySafe`) -- and
+-- | what it was made to, if it was
+type KeptCopy =
+  { ver : String
+  , recipe : Unit -> Maybe I.Expr
+  , depth : Int
+  , safe : Bool
+  , made : Maybe KeptMade
+  }
+
+-- | what the simplifier knows of the cache, and tells it: each global's
+-- | version, where it has one (what it is made of, hashed: a
+-- | definition's is given, a copy's found as it is asked for); the
+-- | copies kept; the copies asked for by what is being simplified, the
+-- | last first; and the copies asked for, and those made, here and not
+-- | as the cache keeps them (those made with the copies they asked for)
+type Keep =
+  { vers : M.Map String String
+  , kept : M.Map String KeptCopy
+  , touched : List String
+  , fresh : M.Map String Unit
+  , madeFresh : M.Map String (List String)
+  }
+
+-- | knowing nothing of a cache
+noKeep : Keep
+noKeep =
+  { vers = M.empty
+  , kept = M.empty
+  , touched = Nil
+  , fresh = M.empty
+  , madeFresh = M.empty
+  }
+
 -- (`safe`: the globals that cannot fail when used -- `safeGlobals`'s,
 -- then each definition and copy found so once simplified; `base`: the
 -- same but for the definitions simplified -- see `markCopySafe`)
@@ -51,6 +94,7 @@ type St =
   , total : M.Map String Int
   , plain : M.Map String Plain
   , sp : Specs
+  , kp : Keep
   }
 
 withSp : Specs -> St -> St
@@ -63,6 +107,7 @@ withSp p s =
   , total = s.total
   , plain = s.plain
   , sp = p
+  , kp = s.kp
   }
 
 withSupply : Int -> St -> St
@@ -75,6 +120,7 @@ withSupply n s =
   , total = s.total
   , plain = s.plain
   , sp = s.sp
+  , kp = s.kp
   }
 
 withFuel : Int -> St -> St
@@ -87,6 +133,7 @@ withFuel f s =
   , total = s.total
   , plain = s.plain
   , sp = s.sp
+  , kp = s.kp
   }
 
 withSafe : String -> St -> St
@@ -99,6 +146,7 @@ withSafe k s =
   , total = s.total
   , plain = s.plain
   , sp = s.sp
+  , kp = s.kp
   }
 
 withBase : String -> St -> St
@@ -111,6 +159,7 @@ withBase k s =
   , total = s.total
   , plain = s.plain
   , sp = s.sp
+  , kp = s.kp
   }
 
 withPlain : String -> Plain -> St -> St
@@ -123,6 +172,7 @@ withPlain k p s =
   , total = s.total
   , plain = M.insert compareString k p s.plain
   , sp = s.sp
+  , kp = s.kp
   }
 
 withDefs : M.Map String I.Expr -> St -> St
@@ -135,6 +185,20 @@ withDefs d s =
   , total = s.total
   , plain = s.plain
   , sp = s.sp
+  , kp = s.kp
+  }
+
+withKp : Keep -> St -> St
+withKp k s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , base = s.base
+  , total = s.total
+  , plain = s.plain
+  , sp = s.sp
+  , kp = k
   }
 
 type M a = St -> Pair a St
@@ -221,6 +285,7 @@ restore saved st =
   , total = saved.total
   , plain = st.plain
   , sp = st.sp
+  , kp = st.kp
   }
 
 copyTake : St -> Pair I.Expr Int -> Pair I.Expr St
@@ -1134,6 +1199,7 @@ ownSt = \s ->
           , count = 0
           , off = s.sp.off
           }
+      , kp = s.kp
       }
 
 -- (asking for copies off, or on again)
@@ -1175,7 +1241,166 @@ backTo saved = \s ->
           , count = saved.sp.count
           , off = saved.sp.off
           }
+      , kp = s.kp
       }
+
+-- The cache
+--------------------------------------------------------------------------------
+
+-- What a definition or a copy is simplified to depends on what it is
+-- made of alone (see `ownSt`), so the backend's cache keeps it, by its
+-- version (heff.build.backcache): a definition's is given, what it is
+-- made of in the core, hashed; a copy's (`copyVer`) is its name and the
+-- versions of the definition copied and of the globals in the arguments
+-- it is made for.  A copy is asked for as the cache keeps it, if it
+-- keeps it at that version -- what it is known by not found again --
+-- and made as the cache keeps it, if it keeps that too, the copies it
+-- asked for as it was made asked for.
+
+-- (the cache's knowledge, changed by `f`)
+keepWith : (Keep -> Keep) -> M Unit
+keepWith f = \s -> MkPair MkUnit (withKp (f s.kp) s)
+
+touchedTo : List String -> Keep -> Keep
+touchedTo t k =
+  { vers = k.vers
+  , kept = k.kept
+  , touched = t
+  , fresh = k.fresh
+  , madeFresh = k.madeFresh
+  }
+
+verTo : String -> String -> Keep -> Keep
+verTo h v k =
+  { vers = M.insert compareString h v k.vers
+  , kept = k.kept
+  , touched = k.touched
+  , fresh = k.fresh
+  , madeFresh = k.madeFresh
+  }
+
+freshTo : String -> Keep -> Keep
+freshTo h k =
+  { vers = k.vers
+  , kept = k.kept
+  , touched = k.touched
+  , fresh = M.insert compareString h MkUnit k.fresh
+  , madeFresh = k.madeFresh
+  }
+
+madeFreshTo : String -> List String -> Keep -> Keep
+madeFreshTo h t k =
+  { vers = k.vers
+  , kept = k.kept
+  , touched = k.touched
+  , fresh = k.fresh
+  , madeFresh = M.insert compareString h t k.madeFresh
+  }
+
+getTouched : M (List String)
+getTouched = \s -> MkPair s.kp.touched s
+
+-- | the copy `h`, of version `v`, asked for by what is being simplified
+touch : String -> String -> M Unit
+touch h v = keepWith (\k -> touchedTo (Cons h k.touched) (verTo h v k))
+
+consVer : String -> Maybe (List String) -> Maybe (List String)
+consVer v (Just vs) = Just (Cons v vs)
+consVer v Nothing = Nothing
+
+-- (each version, if every one is known)
+versAll : List (Maybe String) -> Maybe (List String)
+versAll Nil = Just Nil
+versAll (Cons (Just v) rest) =
+  if strEq v "" then Nothing else consVer v (versAll rest)
+versAll (Cons Nothing rest) = Nothing
+
+verFrom : String -> Maybe (List String) -> String
+verFrom h (Just vs) = Ir.hashOf (Cons (HS h) (List.map (\v -> HS v) vs))
+verFrom h Nothing = ""
+
+-- | the version of the copy `h` of `g` made for `args`: none (`""`)
+-- | if any of them has none
+copyVer : M.Map String String -> String -> String -> List I.Expr -> String
+copyVer vers h g args =
+  verFrom
+    h
+    (versAll
+       (List.map
+          (\k -> M.lookup compareString k vers)
+          (Cons g (List.concatMap I.globalsIn args))))
+
+keptIf : String -> Maybe KeptCopy -> Maybe KeptCopy
+keptIf v (Just kc) =
+  if strEq kc.ver v && not (strEq v "") then Just kc else Nothing
+keptIf v Nothing = Nothing
+
+-- | the copy `h` as the cache keeps it, if it keeps it at the version
+-- | it has here
+keptAt : St -> String -> Maybe KeptCopy
+keptAt s h = case M.lookup compareString h s.kp.vers of
+  Just v -> keptIf v (M.lookup compareString h s.kp.kept)
+  Nothing -> Nothing
+
+markSafeAs : Bool -> String -> M Unit
+markSafeAs True h = \s -> MkPair MkUnit (withSafe h (withBase h s))
+markSafeAs False h = pure MkUnit
+
+askKept : String -> KeptCopy -> Maybe I.Expr -> M Bool
+askKept h kc (Just b) = do
+  b1 <- copy b
+  u <- askedFor h b1 kc.depth
+  u2 <- markSafeAs kc.safe h
+  pure True
+askKept h kc Nothing = pure False
+
+-- | the copy `h` asked for as the cache keeps it, if it does
+fromKept : String -> M Bool
+fromKept h = do
+  s <- get
+  case keptAt s h of
+    Just kc -> askKept h kc (kc.recipe MkUnit)
+    Nothing -> pure False
+
+-- | the copy `h`, of version `v`, asked for if it is not yet: as the
+-- | cache keeps it (`False`: it does not)
+keptAsk : String -> String -> M Bool
+keptAsk h v = do
+  s <- get
+  if M.member compareString h s.sp.recipes then pure True
+    else do
+      u <- keepWith (verTo h v)
+      fromKept h
+
+-- | ... each
+allAsked : List (Pair String String) -> M Bool
+allAsked Nil = pure True
+allAsked (Cons (MkPair h v) rest) = do
+  ok <- keptAsk h v
+  if ok then allAsked rest else pure False
+
+madeKept : KeptMade -> Maybe I.Expr -> M (Maybe I.Expr)
+madeKept km (Just b) = do
+  ok <- allAsked km.touched
+  if ok
+      then do
+        b1 <- copy b
+        pure (Just b1)
+    else pure Nothing
+madeKept km Nothing = pure Nothing
+
+keptMadeOf : Maybe KeptCopy -> M (Maybe I.Expr)
+keptMadeOf (Just kc) = case kc.made of
+  Just km -> madeKept km (km.body MkUnit)
+  Nothing -> pure Nothing
+keptMadeOf Nothing = pure Nothing
+
+-- | the copy `h` made, as the cache keeps it, if it does: the copies it
+-- | asked for as it was made asked for
+keptMade : String -> M (Maybe I.Expr)
+keptMade h = do
+  s <- get
+  keptMadeOf (keptAt s h)
 
 -- | what a copy asked for is known by: what it is as asked for (`b0`),
 -- | simplified as a definition is but with no copy asked for in it --
@@ -1194,7 +1419,8 @@ knowing r b0 = do
   pure b3
 
 -- | the copy named `h` asked for: if it was not before, what it is
--- | known by kept (to make it from, too)
+-- | known by kept (to make it from, too) -- as the cache keeps it, if it
+-- | does
 ask : SK
     -> String
     -> List String
@@ -1206,13 +1432,18 @@ ask : SK
     -> M Unit
 ask r g xs b marks sh h d = do
   s <- get
+  u0 <- touch h (copyVer s.kp.vers h g (markedOf marks sh.args))
   if M.member compareString h s.sp.recipes then pure MkUnit
     else do
-      lam1 <- copy (ELam xs b)
-      b0 <- specBody g h marks sh lam1
-      b1 <- knowing r b0
-      u <- askedFor h b1 d
-      markCopySafe h b1
+      hit <- fromKept h
+      if hit then pure MkUnit
+        else do
+          lam1 <- copy (ELam xs b)
+          b0 <- specBody g h marks sh lam1
+          b1 <- knowing r b0
+          u <- askedFor h b1 d
+          u2 <- keepWith (freshTo h)
+          markCopySafe h b1
 
 -- (... named `h`, `d` deep in copies of copies)
 specNamed : SK
@@ -1544,15 +1775,31 @@ pendingOf s h =
   if M.member compareString h s.sp.made then Nothing
   else M.lookup compareString h s.sp.recipes
 
--- | a copy made: simplified as a definition is (from `b0`, what it is
--- | known by), then the copies it calls for (`more`), before it
-makeOne : (List String -> M (List I.Def)) -> String -> I.Expr -> M (List I.Def)
-makeOne more h b0 = do
-  u <- madeOne h
+-- (a copy made here: simplified as a definition is, from `b0`, what it
+-- is known by -- the copies asked for as it is, kept for the cache)
+makeFresh : String -> I.Expr -> M I.Expr
+makeFresh h b0 = do
+  outer <- getTouched
+  u0 <- keepWith (touchedTo Nil)
   u2 <- ownSt
   b1 <- sk.simp b0
   b2 <- sk.simp b1
   b3 <- raise b2
+  t <- getTouched
+  u3 <- keepWith (\k -> madeFreshTo h t (touchedTo outer k))
+  pure b3
+
+madeBody : String -> I.Expr -> Maybe I.Expr -> M I.Expr
+madeBody h b0 (Just b) = pure b
+madeBody h b0 Nothing = makeFresh h b0
+
+-- | a copy made -- as the cache keeps it, or here -- then the copies it
+-- | calls for (`more`), before it
+makeOne : (List String -> M (List I.Def)) -> String -> I.Expr -> M (List I.Def)
+makeOne more h b0 = do
+  u <- madeOne h
+  kb <- keptMade h
+  b3 <- madeBody h b0 kb
   deps <- more (I.globalsIn b3)
   pure (appendL deps (Cons (I.mkDef h h b3) Nil))
 
@@ -1573,30 +1820,231 @@ makeEach (Cons h rest) = do
   others <- makeEach rest
   pure (appendL here others)
 
--- | a definition simplified, after the copies it calls for
-oneDef : I.Def -> M (List I.Def)
+-- | a definition simplified here, as the cache is to keep it: what it
+-- | came to, whether it is safe, and the copies it asked for, each by
+-- | its name and version
+type Done =
+  { key : String
+  , body : I.Expr
+  , safe : Bool
+  , touched : List (Pair String String)
+  }
+
+-- (each once, the first kept)
+onceEach : M.Map String Unit -> List String -> List String
+onceEach seen Nil = Nil
+onceEach seen (Cons x xs) =
+  if M.member compareString x seen then onceEach seen xs
+  else Cons x (onceEach (M.insert compareString x MkUnit seen) xs)
+
+-- (the copies asked for, the last first: each once, in order, with its
+-- version)
+touchedVers : M.Map String String -> List String -> List (Pair String String)
+touchedVers vers t =
+  List.map
+    (\h -> MkPair h (fromMaybe "" (M.lookup compareString h vers)))
+    (onceEach M.empty (List.reverse t))
+
+doneOf : St -> I.Def -> I.Expr -> List String -> Done
+doneOf s d b t =
+  { key = d.key
+  , body = b
+  , safe = M.member compareString d.key s.safe
+  , touched = touchedVers s.kp.vers t
+  }
+
+-- | a definition simplified, after the copies it calls for; and what the
+-- | cache is to keep of it
+oneDef : I.Def -> M (Pair (List I.Def) (List Done))
 oneDef d = do
   u <- ownSt
+  u0 <- keepWith (touchedTo Nil)
   -- (twice: what the first pass exposes, the second reduces)
   b1 <- sk.simp d.body
   b2 <- sk.simp b1
   b <- raise b2
+  t <- getTouched
   u2 <- recordDef d.key b
   u3 <- markSafe d.key b
+  s <- get
   made <- makeEach (I.globalsIn b)
-  pure (appendL made (Cons (I.mkDef d.key d.name b) Nil))
+  pure
+      (MkPair
+         (appendL made (Cons (I.mkDef d.key d.name b) Nil))
+         (Cons (doneOf s d b t) Nil))
 
-type Simplified = { defs : List I.Def, supply : Int }
+-- | a definition as the cache keeps it, simplified: what it came to
+-- | (read when wanted), whether it is safe, the copies it asked for (by
+-- | name and version) -- and, before it was, whether it was safe and how
+-- | many arguments its application takes and cannot fail with
+-- | (`safeGlobals`; -1: none)
+type KeptDef =
+  { key : String
+  , name : String
+  , body : Unit -> Maybe I.Expr
+  , safe : Bool
+  , touched : List (Pair String String)
+  , sgSafe : Bool
+  , sgTotal : Int
+  }
 
-concatDefs : List (List I.Def) -> List I.Def
+-- | what is to be simplified: a definition, or one the cache keeps --
+-- | with how to have the definition (erased, from where names are drawn
+-- | on), should the cache not do (a copy it asked for not kept)
+data Item = Fresh I.Def | Kept KeptDef (Int -> Pair (Maybe I.Def) Int)
+
+safeAs : Bool -> String -> M Unit
+safeAs True k = \s -> MkPair MkUnit (withSafe k s)
+safeAs False k = pure MkUnit
+
+replayBody : KeptDef -> I.Expr -> M (List I.Def)
+replayBody k b0 = do
+  b <- copy b0
+  u <- recordDef k.key b
+  u2 <- safeAs k.safe k.key
+  made <- makeEach (I.globalsIn b)
+  pure (appendL made (Cons (I.mkDef k.key k.name b) Nil))
+
+replayed : KeptDef -> Maybe I.Expr -> M (Maybe (List I.Def))
+replayed k (Just b0) = do
+  ok <- allAsked k.touched
+  if ok
+      then do
+        ds <- replayBody k b0
+        pure (Just ds)
+    else pure Nothing
+replayed k Nothing = pure Nothing
+
+supplyTo : Int -> M Unit
+supplyTo n = \s -> MkPair MkUnit (withSupply n s)
+
+afresh : Pair (Maybe I.Def) Int -> M (Pair (List I.Def) (List Done))
+afresh (MkPair (Just d) n) = do
+  u <- supplyTo n
+  oneDef d
+afresh (MkPair Nothing n) = pure (MkPair Nil Nil)
+
+orAfresh : St
+         -> (Int -> Pair (Maybe I.Def) Int)
+         -> Maybe (List I.Def)
+         -> M (Pair (List I.Def) (List Done))
+orAfresh saved redo (Just ds) = pure (MkPair ds Nil)
+orAfresh saved redo Nothing = do
+  u <- put saved
+  afresh (redo saved.supply)
+
+-- | a definition the cache keeps, taken as it keeps it -- the copies it
+-- | asked for asked for, what it came to recorded, the copies it calls
+-- | for made -- or simplified afresh, if the cache does not keep a copy
+-- | it asked for
+oneKept : KeptDef
+        -> (Int -> Pair (Maybe I.Def) Int)
+        -> M (Pair (List I.Def) (List Done))
+oneKept k redo = do
+  saved <- get
+  r <- replayed k (k.body MkUnit)
+  orAfresh saved redo r
+
+oneItem : Item -> M (Pair (List I.Def) (List Done))
+oneItem (Fresh d) = oneDef d
+oneItem (Kept k redo) = oneKept k redo
+
+-- | a copy asked for or made here, as the cache is to keep it: its
+-- | version, what it is known by, how deep, whether safe, and what it was
+-- | made to, with the copies it asked for as it was, if it was made here
+type CopyDone =
+  { name : String
+  , ver : String
+  , recipe : I.Expr
+  , depth : Int
+  , safe : Bool
+  , made : Maybe (Pair I.Expr (List (Pair String String)))
+  }
+
+type Simplified =
+  { defs : List I.Def, supply : Int, done : List Done, copies : List CopyDone }
+
+concatDefs : {a : Type} -> List (List a) -> List a
 concatDefs Nil = Nil
 concatDefs (Cons ds rest) = appendL ds (concatDefs rest)
 
-simplifyDone : Pair (List (List I.Def)) St -> Simplified
-simplifyDone (MkPair out st) = { defs = concatDefs out, supply = st.supply }
+allVersKnown : List (Pair String String) -> Bool
+allVersKnown ps = List.all (\p -> not (strEq (snd p) "")) ps
 
-initSt : Int -> SG -> St
-initSt n0 sg =
+madeWith : List (Pair String String)
+         -> Maybe I.Expr
+         -> Maybe (Pair I.Expr (List (Pair String String)))
+madeWith tv (Just b) = if allVersKnown tv then Just (MkPair b tv) else Nothing
+madeWith tv Nothing = Nothing
+
+-- (what a copy made here was made to, with what it asked for, if every
+-- one of those has a version)
+madeOf : St
+       -> M.Map String I.Expr
+       -> String
+       -> Maybe (Pair I.Expr (List (Pair String String)))
+madeOf st bodies h = case M.lookup compareString h st.kp.madeFresh of
+  Just t ->
+    madeWith (touchedVers st.kp.vers t) (M.lookup compareString h bodies)
+  Nothing -> Nothing
+
+copyWith : St
+         -> M.Map String I.Expr
+         -> String
+         -> String
+         -> I.Expr
+         -> Maybe CopyDone
+copyWith st bodies h v r =
+  if strEq v "" then Nothing
+  else Just
+      { name = h
+      , ver = v
+      , recipe = r
+      , depth = fromMaybe 0 (M.lookup compareString h st.sp.depths)
+      , safe = M.member compareString h st.base
+      , made = madeOf st bodies h
+      }
+
+copyDone : St -> M.Map String I.Expr -> String -> Maybe CopyDone
+copyDone st bodies h = case M.lookup compareString h st.sp.recipes of
+  Just r ->
+    copyWith st bodies h (fromMaybe "" (M.lookup compareString h st.kp.vers)) r
+  Nothing -> Nothing
+
+catMaybesS : {a : Type} -> List (Maybe a) -> List a
+catMaybesS Nil = Nil
+catMaybesS (Cons (Just x) rest) = Cons x (catMaybesS rest)
+catMaybesS (Cons Nothing rest) = catMaybesS rest
+
+bodiesMap : List I.Def -> M.Map String I.Expr
+bodiesMap defs =
+  List.foldl
+    (\m (d : I.Def) -> M.insert compareString d.key d.body m)
+    M.empty
+    defs
+
+-- (the copies asked for or made here)
+copiesDone : St -> List I.Def -> List CopyDone
+copiesDone st defs =
+  catMaybesS
+    (List.map
+       (copyDone st (bodiesMap defs))
+       (onceEach
+          M.empty
+          (List.append
+             (List.map fst (M.toList st.kp.fresh))
+             (List.map fst (M.toList st.kp.madeFresh)))))
+
+simplifyDone : Pair (List (Pair (List I.Def) (List Done))) St -> Simplified
+simplifyDone (MkPair out st) =
+  { defs = concatDefs (List.map fst out)
+  , supply = st.supply
+  , done = concatDefs (List.map snd out)
+  , copies = copiesDone st (concatDefs (List.map fst out))
+  }
+
+initSt : Int -> SG -> Keep -> St
+initSt n0 sg kp =
   { supply = n0
   , fuel = 0
   , defs = M.empty
@@ -1613,6 +2061,7 @@ initSt n0 sg =
       , count = 0
       , off = False
       }
+  , kp = kp
   }
 
 -- | each definition, in order, simplified; what is inlined is taken
@@ -1633,4 +2082,45 @@ initSt n0 sg =
 -- | 1
 simplifyProgram : Int -> List I.Def -> Simplified
 simplifyProgram n0 defs =
-  simplifyDone (traverseS (\d -> oneDef d) defs (initSt n0 (safeGlobals defs)))
+  simplifyDone
+    (traverseS (\d -> oneDef d) defs (initSt n0 (safeGlobals defs) noKeep))
+
+sgItem : SG -> Item -> SG
+sgItem acc (Fresh d) = sgFlat acc d.key (flat d.body)
+sgItem acc (Kept k _) =
+  { safe =
+      if k.sgSafe then M.insert compareString k.key MkUnit acc.safe
+      else acc.safe
+  , total =
+      if k.sgTotal >= 0 then M.insert compareString k.key k.sgTotal acc.total
+      else acc.total
+  }
+
+-- | `safeGlobals`, of what is to be simplified
+safeItems : List Item -> SG
+safeItems items = List.foldl sgItem { safe = M.empty, total = M.empty } items
+
+-- | each definition, in order, simplified as `simplifyProgram` does --
+-- | or, one the cache keeps, as it keeps it.  `sg`: what `safeItems`
+-- | says of them; `vers`: each definition's version; `kept`: the copies
+-- | the cache keeps
+simplifyItems : Int
+              -> SG
+              -> M.Map String String
+              -> M.Map String KeptCopy
+              -> List Item
+              -> Simplified
+simplifyItems n0 sg vers kept items =
+  simplifyDone
+    (traverseS
+       oneItem
+       items
+       (initSt
+          n0
+          sg
+          { vers = vers
+          , kept = kept
+          , touched = Nil
+          , fresh = M.empty
+          , madeFresh = M.empty
+          }))
