@@ -100,20 +100,22 @@ may make an error of a search, never another answer.  An instance's
 type takes no arguments (E0348): an instance of every `List a`, found
 by finding an `Eq a`, is not had yet.
 
+The prelude's `Eq` is a type's equality, `equal x y`: its instances are
+`Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s, `Bool`'s and
+`Unit`'s, and each fixed-width type's module has its own (`int8`'s
+`eqInt8`).
+
 ```haskell
-theory Eq (a : Type) where
-  equal : a -> a -> Bool
-
-instance eqInt : Eq Int
-eqInt = { equal = intEq }
-
 member : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool
 member x Nil = False
-member x (Cons y ys) = eq.equal x y || member x ys
+member x (Cons y ys) = equal x y || member x ys
 
 found : Bool
-found = member 2 [1, 2]           -- eqInt found; member (eq := eqInt) gives it
+found = member 2 [1, 2] && member 2.5 [0.5]   -- eqInt found, then eqFloat
 ```
+
+A theory declared again is another type: a module's own `Eq` and its
+instances are none of the prelude's.
 
 ## Operators
 
