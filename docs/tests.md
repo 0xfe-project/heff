@@ -64,11 +64,11 @@ import gen as G
 
 lists : Test
 lists = group "lists"
-  [ unit "append" (equal (showList showInt) ([1] ++ [2]) [1, 2])
+  [ unit "append" (assertEqual (showList showInt) ([1] ++ [2]) [1, 2])
   , property "reversed twice" (do
       xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))
       label (if List.null xs then "empty" else "not empty")
-      equal (showList showInt) (List.reverse (List.reverse xs)) xs)
+      assertEqual (showList showInt) (List.reverse (List.reverse xs)) xs)
   ]
 ```
 
@@ -87,7 +87,7 @@ counterexample and the seed to run it again (`--seed N`; the default
 seed is always the same, so a run of the tests is always the same run).
 A label counts the runs it is given, so that a property that holds only
 of trivial values shows.  There are no type classes, so a value is
-shown, and compared by `equal`, by a function given, and a generator is
+shown, and compared by `assertEqual`, by a function given, and a generator is
 given by hand.  `agree` runs a program of commands on a system and on a
 model of it and compares what they observe; drawn by a property, the
 program shrinks to a short one that tells them apart

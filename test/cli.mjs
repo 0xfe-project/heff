@@ -81,15 +81,15 @@ writeFileSync(join(work, "props.hf"), [
   "import check", "import co", "import gen as G", "",
   "small : Test",
   "small = group \"small\"",
-  "  [ unit \"two\" (equal showInt (1 + 1) 2)",
-  "  , unit \"three\" (equal showInt (1 + 1) 3)",
+  "  [ unit \"two\" (assertEqual showInt (1 + 1) 2)",
+  "  , unit \"three\" (assertEqual showInt (1 + 1) 3)",
   "  , property \"all below 50\" (do",
   "      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))",
   "      assert \"all below 50\" (List.all (\\x -> x < 50) xs))",
   "  , property \"reversed twice\" (do",
   "      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))",
   "      label (if List.null xs then \"empty\" else \"not empty\")",
-  "      equal (showList showInt) (List.reverse (List.reverse xs)) xs)",
+  "      assertEqual (showList showInt) (List.reverse (List.reverse xs)) xs)",
   "  ]", "",
 ].join("\n"));
 const props = heff("test", "props.hf");
