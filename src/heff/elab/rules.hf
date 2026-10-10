@@ -461,21 +461,51 @@ instShown e mc goal =
        (Rn.displayName e.globals)
        (U.zonkTy mc (R.readbTy e.scope.len goal)))
 
-type Witness = { name : String, ty : V.Ty, stx : Sx.Tm, val : V.V }
+-- | a candidate for an instance argument: its name, where it is from
+-- | (said where more than one fits), its type, and it
+type Witness =
+  { name : String, from : String, ty : V.Ty, stx : Sx.Tm, val : V.V }
 
-mkWitness : String -> V.Ty -> Sx.Tm -> V.V -> Witness
-mkWitness name ty stx val = { name = name, ty = ty, stx = stx, val = val }
+mkWitness : String -> String -> V.Ty -> Sx.Tm -> V.V -> Witness
+mkWitness name from ty stx val =
+  { name = name, from = from, ty = ty, stx = stx, val = val }
 
 catMaybesR : {a : Type} -> List (Maybe a) -> List a
 catMaybesR Nil = Nil
 catMaybesR (Cons (Just x) xs) = Cons x (catMaybesR xs)
 catMaybesR (Cons Nothing xs) = catMaybesR xs
 
+-- | the instance binders in scope
 instLocals : ElabEnv -> List Witness
 instLocals e =
   List.map
-    (\(c : InstLocal) -> mkWitness c.name c.ty (R.readbEl e.scope.len c.v) c.v)
+    (\(c : InstLocal) ->
+       mkWitness
+         c.name
+         "an instance argument"
+         c.ty
+         (R.readbEl e.scope.len c.v)
+         c.v)
     e.insts
+
+-- (a top-level instance, by its key: named as the file knows it)
+instGlobal : ElabEnv -> G.Instance -> Maybe Witness
+instGlobal e i = case G.lookupEntry e.globals i.key of
+  Just ge ->
+    Just
+      (mkWitness
+         (Rn.displayName e.globals i.key)
+         ("declared by " ^ i.module)
+         ge.type_
+         (SGlobal i.key)
+         ge.value)
+  Nothing -> Nothing
+
+-- | the top-level instances in scope: the module's own declared before,
+-- | and those of the modules it imports
+instGlobals : ElabEnv -> List Witness
+instGlobals e =
+  catMaybesR (List.map (\i -> instGlobal e i) (G.instancesOf e.globals))
 
 witnessMatches : ElabEnv -> V.Ty -> List Witness -> Elab (List Witness)
 witnessMatches e goal Nil = pure Nil
@@ -486,12 +516,14 @@ witnessMatches e goal (Cons w rest) = do
     Right _ -> pure (Cons w more)
     Left _ -> pure more
 
--- | find the one witness in scope whose type is the goal: the instance
--- | binders in scope (`e.insts`) -- never a global: what is in scope is
--- | what the context gave, as Agda's instance arguments.
--- | More than one is refused (same-typed witnesses are definitionally
--- | equal here -- small values are opaque -- so no tie-break can tell
--- | them apart); none is refused too.
+-- | find the one witness in scope whose type is the goal, as Agda's
+-- | instance arguments are found: among the instance binders in scope
+-- | (`e.insts`) and the top-level instances in scope (`e.globals`'s), one
+-- | pool.  More than one is refused (same-typed witnesses are
+-- | definitionally equal here -- small values are opaque -- so no
+-- | tie-break can tell them apart), so an import that brings in another
+-- | makes an error of a search, never another answer; none is refused
+-- | too.
 resolveWanted : ElabEnv -> P.Span -> Int -> V.V -> V.Ty -> Bool -> Elab Bool
 resolveWanted e sp hm holeVal goal final = do
   mc <- gets (\c -> c.metas)
@@ -506,7 +538,8 @@ resolveWanted e sp hm holeVal goal final = do
               "give the argument explicitly, or annotate so the implicits around it are solved"
         else pure False
     else do
-      matches <- witnessMatches e goal (instLocals e)
+      matches <-
+        witnessMatches e goal (List.append (instLocals e) (instGlobals e))
       case matches of
         Cons one Nil -> do
           r <- solveHole e.globals (shape e.scope) hm holeVal one.stx one.val
@@ -530,7 +563,7 @@ resolveWanted e sp hm holeVal goal final = do
             sp
             41
             ("no instance for " ^ instShown e mc goal ^ " in scope")
-            "bind one, `{{x : T}} -> ...`, where this is used, or give it: `(x := e)`"
+            "declare one, `instance x : T`, bind one, `{{x : T}} -> ...`, where this is used, or give it: `(x := e)`"
         _ ->
           failWithNote
             (a := Bool)
@@ -539,7 +572,11 @@ resolveWanted e sp hm holeVal goal final = do
             ("more than one instance for "
              ^ instShown e mc goal
              ^ " in scope: "
-             ^ joinWith ", " (List.map (\(w : Witness) -> w.name) matches))
+             ^ joinWith
+               ", "
+               (List.map
+                  (\(w : Witness) -> w.name ^ " (" ^ w.from ^ ")")
+                  matches))
             "they cannot be told apart by type (small values are statically opaque): give the argument explicitly"
 
 metaOf : Sx.Tm -> Int

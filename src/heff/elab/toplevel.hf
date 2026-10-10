@@ -476,7 +476,7 @@ localBody tk f eqs sp =
 localsJ : TK -> List Notation.Declaration -> Notation.Checkable -> Elab R.Chk
 localsJ tk Nil body = tk.chkJ body
 localsJ tk (d :: ds) body = case Pm.nodeOf d of
-  DeclEquations name _ tyN eqs -> do
+  DeclEquations name _ _ tyN eqs -> do
     ty <- tk.typJ tyN
     b <- localBody tk name eqs (Pm.spanOf d)
     rest <- localsJ tk ds body
@@ -777,7 +777,7 @@ declJ : Notation.Declaration -> Elab DeclJ
 declJ (At (DeclTheory name _ params bodyN) _) = theoryD name params bodyN
 declJ (At (DeclDefine name _ params tyN bodyN) _) =
   defineD name params tyN bodyN
-declJ d@(At (DeclEquations name _ tyN eqs) _) =
+declJ d@(At (DeclEquations name _ _ tyN eqs) _) =
   equationsD
     name
     tyN
@@ -951,17 +951,33 @@ stuckDiag g fallback p = do
   mc <- gets (\c -> c.metas)
   pure (stuckAt g fallback p mc)
 
+-- | a declaration elaborated: what it defines, under which key, whether
+-- | it is a primitive or an instance, its entry, and why its body did not
+-- | elaborate, if it did not
 type Elaborated =
   { name : String
   , key : String
   , prim : Bool
+  , isInstance : Bool
   , entry : G.Entry
   , failed : Maybe Diag
   }
 
-mkElaborated : String -> String -> Bool -> G.Entry -> Maybe Diag -> Elaborated
-mkElaborated name key prim entry failed =
-  { name = name, key = key, prim = prim, entry = entry, failed = failed }
+mkElaborated : String
+             -> String
+             -> Bool
+             -> Bool
+             -> G.Entry
+             -> Maybe Diag
+             -> Elaborated
+mkElaborated name key prim isInstance entry failed =
+  { name = name
+  , key = key
+  , prim = prim
+  , isInstance = isInstance
+  , entry = entry
+  , failed = failed
+  }
 
 -- | the entry a definition is stored as, from its core syntax alone
 entryFor : G.Globals -> String -> Bool -> Sx.Ty -> Sx.Tm -> G.Entry
@@ -1061,24 +1077,27 @@ keyOf key d = if d.prim then d.name else key d.name
 elabOut : (String -> String)
         -> G.Globals
         -> DeclJ
+        -> Bool
         -> Sx.Ty
         -> V.MetaCtx
         -> Either Diag M.El
         -> Elab Elaborated
-elabOut key g d tyStx mc (Left failed) =
+elabOut key g d isInstance tyStx mc (Left failed) =
   pure
     (mkElaborated
        d.name
        (keyOf key d)
        d.prim
+       isInstance
        (errEntry g (keyOf key d) tyStx)
        (Just failed))
-elabOut key g d tyStx mc (Right t) =
+elabOut key g d isInstance tyStx mc (Right t) =
   pure
     (mkElaborated
        d.name
        (keyOf key d)
        d.prim
+       isInstance
        (entryFor
           g
           (keyOf key d)
@@ -1111,6 +1130,34 @@ primKnown sp d =
          ^ ", and each fixed-width type's, `int32Add` and the like)")
   else pure MkUnit
 
+-- | where an instance's type is written, of a declaration that declares
+-- | one (`instance f : T`)
+instanceTypeAt : Notation.Declaration -> Maybe Pm.Span
+instanceTypeAt (At (DeclEquations _ _ AsInstance tyN _) _) =
+  Just (Pm.spanOf tyN)
+instanceTypeAt _ = Nothing
+
+-- | whether a declaration declares an instance
+declaresInstance : Notation.Declaration -> Bool
+declaresInstance n = case instanceTypeAt n of
+  Just _ -> True
+  Nothing -> False
+
+-- | an instance is of a type that takes nothing: one of every type, found
+-- | by finding others (`{a : Type} -> {{e : Eq a}} -> Eq (List a)`), is
+-- | not had yet
+monomorphicInstance : Maybe Pm.Span -> M.Ty -> Elab Unit
+monomorphicInstance (Just sp) ty = case Ps.unIsTy ty.stx of
+  SFunction _ _ _ _ _ ->
+    failWithNote
+      (a := Unit)
+      sp
+      48
+      "an instance takes no arguments: its type is no function's"
+      "an instance of every type, found by finding others (`{a : Type} -> {{e : Eq a}} -> Eq (List a)`), is not had yet: declare one of each type, or bind it where it is used, `{{x : T}} -> ...`"
+  _ -> pure MkUnit
+monomorphicInstance Nothing ty = pure MkUnit
+
 elabBody : (String -> String)
          -> G.Globals
          -> Notation.Declaration
@@ -1142,7 +1189,7 @@ elabBody key g n d a = do
   modify (setSelfKey Nothing)
   primKnown (Pm.spanOf n) d
   mc <- gets (\c -> c.metas)
-  elabOut key g d (U.zonkTy mc a.stx) mc body
+  elabOut key g d (declaresInstance n) (U.zonkTy mc a.stx) mc body
 
 -- | Elaborate one declaration.  A definition whose type elaborates and
 -- | whose body does not is a definition still, `failed`: an error hole
@@ -1157,6 +1204,7 @@ elabDecl key g n = do
   a <- R.runTyp d.ty (emptyElabEnv g)
   -- (a type with an error hole is no type to give the definition)
   recoveredCheck
+  monomorphicInstance (instanceTypeAt n) a
   elabBody key g n d a
 
 watchSyn : Notation.Checkable -> Elab R.Syn
@@ -1327,6 +1375,22 @@ addElaborated : Elaborated -> G.Globals -> G.Globals
 addElaborated r g =
   if r.prim && knownEntry g r.key then g else G.addEntry r.key r.entry g
 
+-- | the module a key is of, by the name it has there (`m.x`, `x`: `m`;
+-- | a key that is its name, as an expectation's, of none)
+keyModule : String -> String -> String
+keyModule key name =
+  if strEq key name then ""
+  else strSlice key 0 (strLength key - strLength name - 1)
+
+-- | a definition, an instance or not: one is a candidate for the
+-- | instance arguments after it; a definition of the name again, as no
+-- | instance, is none
+withInstance : Bool -> String -> String -> G.Globals -> G.Globals
+withInstance isInstance key name g =
+  if isInstance then G.addInstance key (keyModule key name) g
+  else if G.isInstance g key then G.dropInstance key g
+  else g
+
 topTake : (String -> String)
         -> TopResult
         -> Notation.Declaration
@@ -1340,7 +1404,11 @@ topTake kf acc n (MkPair (Left d) st) =
     (consAll acc.diags (appendT (recChron st) (reportedD d)))
 topTake kf acc n (MkPair (Right r) st) =
   mkTop
-    (G.addOwn r.name r.key (addElaborated r acc.globals))
+    (withInstance
+       r.isInstance
+       r.key
+       r.name
+       (G.addOwn r.name r.key (addElaborated r acc.globals)))
     (consAll acc.diags (appendT (recChron st) (failedList r)))
     (Cons r.key acc.keys)
     acc.broken
@@ -1431,14 +1499,26 @@ topWith : G.Globals -> List Notation.Decl -> TopResult
 topWith g0 decls =
   topGo (\x -> x) (emptyTop g0) (List.map Notation.classify decls)
 
--- | a definition as a cache keeps it: its key, where it is, and its
--- | core syntax (type and body)
+-- | a definition as a cache keeps it: its key, whether it is an
+-- | instance, where it is, and its core syntax (type and body)
 type ThawedDef =
-  { name : String, key : String, span : Pm.Span, ty : Sx.Ty, body : Sx.Tm }
+  { name : String
+  , key : String
+  , isInstance : Bool
+  , span : Pm.Span
+  , ty : Sx.Ty
+  , body : Sx.Tm
+  }
 
-mkThawedDef : String -> String -> Pm.Span -> Sx.Ty -> Sx.Tm -> ThawedDef
-mkThawedDef name key span ty body =
-  { name = name, key = key, span = span, ty = ty, body = body }
+mkThawedDef : String -> String -> Bool -> Pm.Span -> Sx.Ty -> Sx.Tm -> ThawedDef
+mkThawedDef name key isInstance span ty body =
+  { name = name
+  , key = key
+  , isInstance = isInstance
+  , span = span
+  , ty = ty
+  , body = body
+  }
 
 isPrimB : Sx.Tm -> Bool
 isPrimB (SPrim _) = True
@@ -1462,13 +1542,17 @@ thawKeep acc d g =
 -- `topTake` has it)
 thawGlobals : TopResult -> ThawedDef -> G.Globals
 thawGlobals acc d =
-  G.addOwn
-    d.name
+  withInstance
+    d.isInstance
     d.key
-    (G.addEntry
+    d.name
+    (G.addOwn
+       d.name
        d.key
-       (entryFor acc.globals d.key (isPrimB d.body) d.ty d.body)
-       acc.globals)
+       (G.addEntry
+          d.key
+          (entryFor acc.globals d.key (isPrimB d.body) d.ty d.body)
+          acc.globals))
 
 thawOne : TopResult -> ThawedDef -> TopResult
 thawOne acc d =

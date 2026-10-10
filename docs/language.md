@@ -75,7 +75,7 @@ packed = { t = Int, size = 8 }
 
 An implicit argument, `{x : A} -> B`, is inferred where the function is
 applied, unless it is given, `f (x := e)`; an instance argument,
-`{{x : A}} -> B`, is found among the instance binders in scope.  An
+`{{x : A}} -> B`, is found among the instances in scope.  An
 implicit argument may have a default, `{x : A := d} -> B`: where it is
 not given, it is `d`, as it is -- not inferred, so that its type may be
 small.  The default names definitions only, so that it means the same
@@ -87,6 +87,32 @@ greet name = if loud then name ^ "!" else name
 
 calm : String
 calm = greet "hi"                 -- "hi"; greet (loud := True) "hi" is "hi!"
+```
+
+An instance is an instance binder in scope, or a definition declared
+one, `instance x : T` before its equations: it is in scope in the
+definitions after it, and in the modules that import its module -- by
+its name or by an alias, the prelude in every module -- but not in
+those that import them.  Of the instances in scope, exactly one must be
+of the type an instance argument wants: none is an error (E0341), and
+so is more than one (E0342), whatever their values, so that an import
+may make an error of a search, never another answer.  An instance's
+type takes no arguments (E0348): an instance of every `List a`, found
+by finding an `Eq a`, is not had yet.
+
+```haskell
+theory Eq (a : Type) where
+  equal : a -> a -> Bool
+
+instance eqInt : Eq Int
+eqInt = { equal = intEq }
+
+member : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool
+member x Nil = False
+member x (Cons y ys) = eq.equal x y || member x ys
+
+found : Bool
+found = member 2 [1, 2]           -- eqInt found; member (eq := eqInt) gives it
 ```
 
 ## Operators

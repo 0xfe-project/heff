@@ -3,7 +3,8 @@
 // thaws what the first elaborated (the dependency's cache file is not
 // rewritten), corruption heals over, a new name in a dependency
 // re-elaborates the importer, and a comment-only change does not --
-// the invalidation is at the definitions used, not at whole imports.
+// the invalidation is at the definitions used, not at whole imports --
+// and an instance gained or lost does, for the searches it may answer.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -119,6 +120,32 @@ want(d1.status === 0 && /1\/1 expectations hold/.test(d1.stdout), `a default giv
 writeFileSync(join(dir, "d.hf"), opts(2));
 const d2 = heff("test", "f.hf");
 want(d2.status === 1 && /\b2\b/.test(d2.stdout), `a changed default reaches the importer\n${d2.stdout.slice(0, 120)}`);
+
+// an instance gained or lost by a module imported, no name new and no
+// definition changed: the importer's searches are made again -- one
+// that found one instance finds two, then none
+const eqs = (loose, exact) => [
+  "theory Eq (a : Type) where", "  equal : a -> a -> Bool", "",
+  "member : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool",
+  "member x Nil = False", "member x (Cons y ys) = eq.equal x y || member x ys", "",
+  `${exact ? "instance " : ""}eqInt : Eq Int`, "eqInt = { equal = intEq }", "",
+  `${loose ? "instance " : ""}eqLoose : Eq Int`, "eqLoose = { equal = \\a b -> True }", "",
+].join("\n");
+writeFileSync(join(dir, "g.hf"), eqs(false, true));
+writeFileSync(join(dir, "h.hf"), "import g\n\nfound : Bool\nfound = member 1 [2]\n");
+writeFileSync(join(dir, "i.hf"), "import h\n\n-- >>> found\n-- False\n");
+const g1 = heff("test", "i.hf");
+want(g1.status === 0 && /1\/1 expectations hold/.test(g1.stdout), `an imported instance found\n${g1.stdout.slice(0, 200)}${g1.stderr.slice(0, 200)}`);
+want(existsSync(hc("h")), "the importer frozen");
+writeFileSync(join(dir, "g.hf"), eqs(true, true));
+const g2 = heff("check", "i.hf");
+want(g2.status === 1 && g2.stderr.includes("E0342") && g2.stderr.includes("h.hf"), `an instance gained makes the importer's search ambiguous\n${g2.stderr.slice(0, 300)}`);
+writeFileSync(join(dir, "g.hf"), eqs(false, false));
+const g3 = heff("check", "i.hf");
+want(g3.status === 1 && g3.stderr.includes("E0341") && g3.stderr.includes("h.hf"), `an instance lost leaves the importer's search none\n${g3.stderr.slice(0, 300)}`);
+writeFileSync(join(dir, "g.hf"), eqs(false, true));
+const g4 = heff("test", "i.hf");
+want(g4.status === 0 && /1\/1 expectations hold/.test(g4.stdout), `the instance back, found again\n${g4.stdout.slice(0, 200)}${g4.stderr.slice(0, 200)}`);
 
 console.log(`cache: ${failed ? "NOT " : ""}thawed, healed and invalidated at the definitions used`);
 process.exit(failed ? 1 : 0);

@@ -35,7 +35,7 @@ const formats = (what, src, want) => {
 };
 
 // (but those that do not parse, or lex, on purpose, which are left)
-const unparsed = ["test/errors/negation-pattern.hf", "test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf"];
+const unparsed = ["test/errors/instance-where.hf", "test/errors/negation-pattern.hf", "test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf"];
 const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
   // (the index may still list a file the working copy has removed)
   .filter((f) => existsSync(join(root, f)));
@@ -537,6 +537,29 @@ formats("`-x`: written close, the space before it kept, a subtraction's `-` spac
   "",
   "g : Int -> Int",
   "g x = f -x + -(f x) - x",
+  "",
+].join("\n"));
+
+// (an instance's signature keeps `instance` before it -- what it means
+// holds it there -- its equations as any definition's; under `-- fmt:
+// skip`, kept with them)
+formats("`instance`: kept before the signature, the equations after it", [
+  "-- | the integers' equality",
+  "instance   eqInt  :Eq Int",
+  "eqInt =  { equal = intEq }",
+  "",
+  "-- fmt: skip",
+  "instance eqFloat  :  Eq Float64",
+  "eqFloat  =  { equal = floatEq }",
+  "",
+].join("\n"), [
+  "-- | the integers' equality",
+  "instance eqInt : Eq Int",
+  "eqInt = { equal = intEq }",
+  "",
+  "-- fmt: skip",
+  "instance eqFloat  :  Eq Float64",
+  "eqFloat  =  { equal = floatEq }",
   "",
 ].join("\n"));
 

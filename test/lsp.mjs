@@ -184,6 +184,23 @@ try {
   const rDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-rune.hf") }, position: pos(runed, "toInt") });
   expect("definition of `Rune.toInt`", rDef.result && rDef.result.uri === uri("lib/rune.hf") && rDef.result.range.start.line === pos(disk("lib/rune.hf"), "toInt :").line, rDef.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-rune.hf") } });
+  // an instance, `instance x : T`: found where an instance argument is
+  // wanted; in the outline from `instance`, hovered and gone to as any
+  // definition is
+  const inst = "theory Eq (a : Type) where\n  equal : a -> a -> Bool\n\ninstance eqInt : Eq Int\neqInt = { equal = intEq }\n\nmember : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool\nmember x Nil = False\nmember x (Cons y ys) = eq.equal x y || member x ys\n\nfound : Bool\nfound = member 1 [1] && member (eq := eqInt) 2 [2]\n";
+  open("test/surface/lsp-instance.hf", inst);
+  const iDiags = await diagnosticsOf(uri("test/surface/lsp-instance.hf"));
+  expect("an instance found", iDiags.length === 0, iDiags);
+  const iOutline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/lsp-instance.hf") } });
+  const iSym = iOutline.result && iOutline.result.find((y) => y.name === "eqInt");
+  const iAt = pos(inst, "eqInt :");
+  expect("an instance in the outline", iSym && iSym.kind === 12 && iSym.range.start.line === iAt.line && iSym.range.start.character === 0 &&
+    iSym.range.end.line === pos(inst, "eqInt =").line && iSym.selectionRange.start.line === iAt.line && iSym.selectionRange.start.character === iAt.character, iSym);
+  const iHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-instance.hf") }, position: pos(inst, "eqInt)") });
+  expect("hover on an instance", iHover.result && iHover.result.contents.value.includes("eqInt : Eq Int") && iHover.result.contents.value.includes("(global)"), iHover.result);
+  const iDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-instance.hf") }, position: pos(inst, "eqInt)") });
+  expect("definition of an instance", iDef.result && iDef.result.uri === uri("test/surface/lsp-instance.hf") && iDef.result.range.start.line === iAt.line && iDef.result.range.start.character === iAt.character, iDef.result);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-instance.hf") } });
   const dotted = "import a as A\n\nx : A.Bool\nx = A.";
   open("test/modules/lsp-dot.hf", dotted);
   await diagnosticsOf(uri("test/modules/lsp-dot.hf"));

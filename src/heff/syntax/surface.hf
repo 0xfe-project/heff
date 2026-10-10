@@ -589,11 +589,12 @@ resolve apply e0 rest = do
 --------------------------------------------------------------------------------
 
 -- | what a top-level declaration is, before signatures meet equations:
--- | a signature (the name, where it is written, the type, where the
--- | signature is), an equation (where it is), a declaration whole, or a
--- | doc test (a watch, before it meets the definition it is of)
+-- | a signature (what it declares, the name, where it is written, the
+-- | type, where the signature is), an equation (where it is), a
+-- | declaration whole, or a doc test (a watch, before it meets the
+-- | definition it is of)
 data Item
-  = Sig String Pm.Span Notation.Expr Pm.Span
+  = Sig Notation.Declared String Pm.Span Notation.Expr Pm.Span
   | Eqn String (Pm.Spanned (Notation.Equation Notation.Expr)) Pm.Span
   | Whole Notation.Decl
   | Doc Notation.Decl
@@ -601,13 +602,14 @@ data Item
 -- Signatures meet their equations
 --------------------------------------------------------------------------------
 
-defOf : String
+defOf : Notation.Declared
+      -> String
       -> Pm.Span
       -> Notation.Expr
       -> Pm.Span
       -> List (Pm.Spanned (Notation.Equation Notation.Expr))
       -> Notation.Decl
-defOf f fsp ty sp eqs = At (DeclEquations f fsp ty eqs) sp
+defOf declared f fsp ty sp eqs = At (DeclEquations f fsp declared ty eqs) sp
 
 -- | the equations of a name, in order, and where the last of them ends
 type Eqns =
@@ -644,15 +646,16 @@ nameSet (Cons x rest) = Mp.insert compareString x MkUnit (nameSet rest)
 isIn : Mp.Map String Unit -> String -> Bool
 isIn names x = Mp.member compareString x names
 
-assembleSig : String
+assembleSig : Notation.Declared
+            -> String
             -> Pm.Span
             -> Notation.Expr
             -> Pm.Span
             -> Maybe Eqns
             -> Maybe Notation.Decl
-assembleSig f fsp ty sp Nothing = Nothing
-assembleSig f fsp ty sp (Just es) =
-  Just (defOf f fsp ty (mkSpan sp.start (maxI sp.end es.end)) es.eqns)
+assembleSig declared f fsp ty sp Nothing = Nothing
+assembleSig declared f fsp ty sp (Just es) =
+  Just (defOf declared f fsp ty (mkSpan sp.start (maxI sp.end es.end)) es.eqns)
 
 assembleOne : Mp.Map String Unit
             -> Mp.Map String Eqns
@@ -660,10 +663,11 @@ assembleOne : Mp.Map String Unit
             -> Maybe Notation.Decl
 assembleOne broken byName (Whole d) = Just d
 assembleOne broken byName (Doc d) = Just d
-assembleOne broken byName (Sig f fsp ty sp) =
+assembleOne broken byName (Sig declared f fsp ty sp) =
   if isIn broken f
     then Just
         (defOf
+           declared
            f
            fsp
            ty
@@ -672,7 +676,7 @@ assembleOne broken byName (Sig f fsp ty sp) =
              (MkEquation f fsp Nil (At (EWord AbandonWord) sp))
              (Notation.spanning fsp sp)
            ])
-  else assembleSig f fsp ty sp (Mp.lookup compareString f byName)
+  else assembleSig declared f fsp ty sp (Mp.lookup compareString f byName)
 assembleOne broken byName (Eqn _ _ _) = Nothing
 
 assemble : List String -> List Item -> List Notation.Decl
@@ -682,7 +686,7 @@ assemble broken items =
 -- | the names with a signature
 sigNames : List Item -> Mp.Map String Unit
 sigNames Nil = Mp.empty
-sigNames (Cons (Sig f _ _ _) rest) =
+sigNames (Cons (Sig _ f _ _ _) rest) =
   Mp.insert compareString f MkUnit (sigNames rest)
 sigNames (Cons _ rest) = sigNames rest
 
@@ -698,7 +702,7 @@ assembleDiagOne : Mp.Map String Unit
                 -> Mp.Map String Unit
                 -> Item
                 -> Maybe Diag
-assembleDiagOne broken sigs eqns (Sig f _ _ sp) =
+assembleDiagOne broken sigs eqns (Sig _ f _ _ sp) =
   if not (isIn eqns f) && not (isIn broken f)
     then Just (diag sp ("`" ^ f ^ "` has a type but no definition"))
   else Nothing
@@ -743,7 +747,7 @@ commentsOnly : String -> Int -> Int -> Bool
 commentsOnly src from to = commentLinesFrom src (lineEndS src from + 1) to
 
 itemStart : Item -> Int
-itemStart (Sig _ _ _ sp) = sp.start
+itemStart (Sig _ _ _ _ sp) = sp.start
 itemStart (Eqn _ _ sp) = sp.start
 itemStart (Whole d) = (Pm.spanOf d).start
 itemStart (Doc d) = (Pm.spanOf d).start
@@ -757,7 +761,7 @@ definesDecl _ = True
 -- (a signature starts a definition, so does `data`, `type`, `theory` or
 -- `primitive`; an equation, a test or a watch does not)
 definesItem : Item -> Bool
-definesItem (Sig _ _ _ _) = True
+definesItem (Sig _ _ _ _ _) = True
 definesItem (Whole d) = definesDecl d
 definesItem _ = False
 
@@ -1432,8 +1436,10 @@ addBinders b s =
     (Mp.insert compareString b.f (Cons b (bindersFor s b.f)) s.binders)
     s
 
-sigL : Lw -> List C.T -> C.E -> P (List Item)
-sigL r names ty = do
+-- | a signature, of a definition or an instance (`declared`); `start`,
+-- | where it starts -- an instance's, at `instance`
+sigL : Lw -> Notation.Declared -> Int -> List C.T -> C.E -> P (List Item)
+sigL r declared start names ty = do
   ty' <- r.e ty
   pModify
       (\s ->
@@ -1443,10 +1449,11 @@ sigL r names ty = do
   pure
       (Cons
          (Sig
+            declared
             (declNameOf names).name
             (declNameOf names).span
             ty'
-            (mkSpan (firstStart names) (C.lastE ty).end))
+            (mkSpan start (C.lastE ty).end))
          Nil)
 
 lastDEnd : List C.D -> Int -> Int
@@ -1661,7 +1668,8 @@ declL : Lw -> C.D -> P (List Item)
 declL r (DImport t) = pure Nil
 -- (read before the rest, by `fixityDecls`)
 declL r (DFixity kw ts) = pure Nil
-declL r (DSig names cc ty) = sigL r names ty
+declL r (DSig names cc ty) = sigL r AsDefinition (firstStart names) names ty
+declL r (DInstance kw names cc ty) = sigL r AsInstance kw.start names ty
 declL r (DEqn names pats eq rhs w) = eqnL r names pats rhs w
 declL r d@(DData kw name params universe alts) =
   dataL r d kw name params universe alts
@@ -1691,7 +1699,10 @@ prescanGo ts k acc =
   else if (A.index ts k).first
   && (A.index ts k).col == 0
   && strEq (A.index ts k).kind "kw"
-  && List.elemBy strEq (A.index ts k).text ["data", "type", "theory"]
+  && List.elemBy
+    strEq
+    (A.index ts k).text
+    ["data", "type", "theory", "instance"]
   && k + 1 < A.length ts
     then prescanGo ts (k + 1) (Cons (A.index ts (k + 1)).text acc)
   else if (A.index ts k).first
