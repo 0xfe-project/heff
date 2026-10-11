@@ -76,8 +76,13 @@ nothing more (`std.progress`).
 ## How deep a program goes
 
 A call that is no tail call holds its place on the stack until it
-returns.  A C program (`c`) runs in a thread of its own, with a stack of
-1 GiB, and a Node.js program (`node`, what `heff run` runs) in a worker
+returns -- but for a call of itself put in a constructor's last field
+(`map f (x :: xs) = f x :: map f xs`) or right of a string append
+(`showInt x ^ "," ^ showAll xs`): such a function is made a loop, on
+either backend, however long its list.  A C program (`c`) runs in a
+thread of its own, with a stack of 1 GiB (`-DHEFF_MAIN_STACK=BYTES` when
+its C is built, for another size; where it runs out, the program says
+`heff: the stack overflowed` and ends with 1), and a Node.js program (`node`, what `heff run` runs) in a worker
 thread, with one of 512 MB: recursion millions deep -- three million of
 `sumTo n = if n == 0 then 0 else n + sumTo (n - 1)`.  An ES module
 (`esm`) and a page's script (`page`) run on the stack of what loads

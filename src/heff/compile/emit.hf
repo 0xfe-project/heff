@@ -361,53 +361,21 @@ bouncing defs = bounceGo defs M.empty
 -- Loops
 --------------------------------------------------------------------------------
 
-appendEnd : String -> Int -> I.Expr -> Bool
-appendEnd key n (ECall k as) = strEq k key && List.length as == n
-appendEnd key n (EPrimCall p as) = case as of
-  Cons _ (Cons rr Nil) -> strEq p "strAppend" && appendEnd key n rr
-  _ -> False
-appendEnd key n e = False
-
--- | whether it does at the end of a chain of string appends,
--- | `a ^ b ^ f xs`
-appendSelf : String -> Int -> I.Expr -> Bool
-appendSelf key n (ELet _ _ b) = appendSelf key n b
-appendSelf key n (EMatch _ arms) =
-  List.any (\a -> appendSelf key n (I.armBody a)) arms
-appendSelf key n (EPrimCall p as) = case as of
-  Cons _ (Cons rr Nil) -> strEq p "strAppend" && appendEnd key n rr
-  _ -> False
-appendSelf key n e = False
-
-consLast : String -> Int -> Maybe I.Expr -> Bool
-consLast key n (Just (ECall k bs)) = strEq k key && List.length bs == n
-consLast key n _ = False
-
--- | whether it does as a constructor's last argument
-consSelf : String -> Int -> I.Expr -> Bool
-consSelf key n (ELet _ _ b) = consSelf key n b
-consSelf key n (EMatch _ arms) =
-  List.any (\a -> consSelf key n (I.armBody a)) arms
-consSelf key n (ETag _ as) = consLast key n (List.last as)
-consSelf key n e = False
-
--- | whether the function `key` calls itself last somewhere: directly,
--- | as a constructor's last argument, or right of a string append
+-- | whether the function `key` calls itself last somewhere (a call of
+-- | itself put in a tag, or right of a string append, is one too, as
+-- | heff.compile.trmc makes it)
 tailSelf : String -> Int -> I.Expr -> Bool
 tailSelf key n (ELet _ _ b) = tailSelf key n b
 tailSelf key n (EMatch _ arms) =
   List.any (\a -> tailSelf key n (I.armBody a)) arms
 tailSelf key n (ECall k as) = strEq k key && List.length as == n
-tailSelf key n e = consSelf key n e || appendSelf key n e
+tailSelf key n e = False
 
 -- Scope
 --------------------------------------------------------------------------------
 
--- | a function that is a loop: its parameters (`x$`), whether a
--- | constructor with a call of it last is built in place, its hole
--- | filled by the next round (`$root`, `$hole`, `$at`), and whether a
--- | string append ends in a call of it, gathered left to right (`$s`)
-type Self = { key : String, params : List String, trmc : Bool, sapp : Bool }
+-- | a function that is a loop: its parameters (`x$`)
+type Self = { key : String, params : List String }
 
 -- | the names in scope: the JavaScript name of each variable, and every
 -- | name taken; and, in a function that is a loop, the function (where
@@ -528,11 +496,19 @@ primCall p as@(Cons a Nil) = case primUnary p of
   Nothing -> primDefault p as
 primCall p as = primDefault p as
 
+-- | heff.compile.trmc's: a hole, and a cell's field set where its index
+-- | is known, written as JavaScript writes them
+cellPrim : String -> List I.Expr -> Bool
+cellPrim "hole" Nil = True
+cellPrim "setField" (Cons _ (Cons (EInt _) (Cons _ Nil))) = True
+cellPrim _ _ = False
+
 -- | whether `primCall` calls the primitive's function, `$p(...)`
 callsHelper : String -> List I.Expr -> Bool
+callsHelper p as@(Cons _ (Cons (EInt _) (Cons _ Nil))) = not (cellPrim p as)
 callsHelper p (Cons _ (Cons _ Nil)) = maybe True (\_ -> False) (primOp p)
 callsHelper p (Cons _ Nil) = maybe True (\_ -> False) (primUnary p)
-callsHelper p as = True
+callsHelper p as = not (cellPrim p as)
 
 -- Expressions
 --------------------------------------------------------------------------------
@@ -870,6 +846,16 @@ exprGo r env ind EAbandon = p3 "$abandon()"
 -- (lifted before: none is left)
 exprGo r env ind (EFix _ _) = p3 "$abandon()"
 exprGo r env ind (EPrim p) = p3 ("$" ^ p ^ "$c")
+exprGo r env ind (EPrimCall "hole" Nil) = p3 "undefined"
+exprGo r env ind (EPrimCall "setField" (Cons d (Cons (EInt k) (Cons v Nil)))) =
+  { code =
+      atLeast 3 (r.expr env ind d)
+      ^ ".a["
+      ^ showInt k
+      ^ "] = "
+      ^ codeOfC (r.expr env ind v)
+  , prec = 0
+  }
 exprGo r env ind (EPrimCall p as) =
   primCall p (List.map (\a -> r.expr env ind a) as)
 -- (a block, called at once: what it returns last may be a bounce)
@@ -1146,93 +1132,12 @@ returnLines r env ind e@(ECall g as) =
 returnLines r env ind e =
   Cons (indent ind ^ "return " ^ (r.expr env ind e).code ^ ";") Nil
 
-lastTrmc : JK -> Env -> Int -> I.Expr -> BoundN -> List String
-lastTrmc r env ind e rr =
-  [ indent ind ^ "const " ^ rr.js ^ " = " ^ (r.expr env ind e).code ^ ";"
-  , indent ind ^ "if ($hole) { $hole.a[$at] = " ^ rr.js ^ "; return $root; }"
-  , indent ind ^ "return " ^ rr.js ^ ";"
-  ]
-
-lastOther : JK -> Env -> Self -> Int -> I.Expr -> List String
-lastOther r env s ind e =
-  if s.trmc then lastTrmc r env ind e (bindName env "r")
-  else if s.sapp
-    then Cons
-        (indent ind ^ "return $s + " ^ atLeast 2 (r.expr env ind e) ^ ";")
-        Nil
-  else returnLines r env ind e
-
-lastCell : JK
-         -> Env
-         -> Self
-         -> Int
-         -> String
-         -> List I.Expr
-         -> List I.Expr
-         -> BoundN
-         -> List String
-lastCell r env s ind t ini bs rr =
-  List.append
-    [ indent ind
-    ^ "const "
-    ^ rr.js
-    ^ " = { $: "
-    ^ quoteString t
-    ^ ", a: ["
-    ^ joinWith
-      ", "
-      (List.append
-         (List.map (\a -> (r.expr env ind a).code) ini)
-         (Cons "undefined" Nil))
-    ^ "] };"
-    , indent ind
-    ^ "if ($hole) $hole.a[$at] = "
-    ^ rr.js
-    ^ "; else $root = "
-    ^ rr.js
-    ^ ";"
-    , indent ind
-    ^ "$hole = "
-    ^ rr.js
-    ^ "; $at = "
-    ^ showInt (List.length ini)
-    ^ ";"
-    ]
-    (again r env s ind bs)
-
-lastTag : JK
-        -> Env
-        -> Self
-        -> Int
-        -> String
-        -> List I.Expr
-        -> Maybe (Pair (List I.Expr) I.Expr)
-        -> List String
-lastTag r env s ind t as (Just (MkPair ini (ECall k bs))) =
-  if s.trmc && strEq k s.key && List.length bs == List.length s.params
-    then lastCell r env s ind t ini bs (bindName env "cell")
-  else lastOther r env s ind (ETag t as)
-lastTag r env s ind t as _ = lastOther r env s ind (ETag t as)
-
 lastSelf : JK -> Env -> Self -> Int -> I.Expr -> List String
 lastSelf r env s ind (ECall k as) =
   if strEq k s.key && List.length as == List.length s.params
     then again r env s ind as
-  else lastOther r env s ind (ECall k as)
--- `a ^ ... ^ f xs`: the left is gathered into `$s`, and the call
--- goes round; what returns gives `$s` its prefix back
-lastSelf r env s ind (EPrimCall p args) = case args of
-  Cons a (Cons rr Nil) ->
-    if strEq p "strAppend"
-    && s.sapp
-    && appendEnd s.key (List.length s.params) rr
-      then Cons
-          (indent ind ^ "$s += " ^ (r.expr env ind a).code ^ ";")
-          (r.last env ind rr)
-    else lastOther r env s ind (EPrimCall p args)
-  _ -> lastOther r env s ind (EPrimCall p args)
-lastSelf r env s ind (ETag t as) = lastTag r env s ind t as (unsnocE as)
-lastSelf r env s ind e = lastOther r env s ind e
+  else returnLines r env ind (ECall k as)
+lastSelf r env s ind e = returnLines r env ind e
 
 -- | what is last in a function: returned, or, in a loop, the next round
 lastF : JK -> Env -> Int -> I.Expr -> List String
@@ -1274,8 +1179,8 @@ wrapper curried key i js =
 
 -- (a call of itself last: a loop; its parameters `x$`, each round's own
 -- `const`, which what it closes over keeps)
-looped : String -> GInfo -> I.Expr -> BoundNs -> Bool -> Bool -> List String
-looped key i b r trmc sapp =
+looped : String -> GInfo -> I.Expr -> BoundNs -> List String
+looped key i b r =
   List.append
     [ ""
     , "const "
@@ -1285,33 +1190,24 @@ looped key i b r trmc sapp =
     ^ ") => {"
     ]
     (List.append
-       (if trmc then Cons "  let $root, $hole = null, $at = 0;" Nil else Nil)
+       [ "  for (;;) {"
+       , "    const "
+       ^ joinWith
+         ", "
+         (List.zipWith
+            (\x v -> x ^ " = " ^ v)
+            r.js
+            (List.map (\x -> x ^ "$") r.js))
+       ^ ";"
+       ]
        (List.append
-          (if sapp then Cons "  let $s = \"\";" Nil else Nil)
-          (List.append
-             [ "  for (;;) {"
-             , "    const "
-             ^ joinWith
-               ", "
-               (List.zipWith
-                  (\x v -> x ^ " = " ^ v)
-                  r.js
-                  (List.map (\x -> x ^ "$") r.js))
-             ^ ";"
-             ]
-             (List.append
-                (jk.stmts
-                   (withSelf
-                      (Just
-                         { key = key
-                         , params = List.map (\x -> x ^ "$") r.js
-                         , trmc = trmc
-                         , sapp = sapp
-                         })
-                      r.env)
-                   2
-                   b)
-                (Cons "  }" (Cons "};" Nil))))))
+          (jk.stmts
+             (withSelf
+                (Just { key = key, params = List.map (\x -> x ^ "$") r.js })
+                r.env)
+             2
+             b)
+          (Cons "  }" (Cons "};" Nil))))
 
 defFun : M.Map String Unit
        -> String
@@ -1322,14 +1218,7 @@ defFun : M.Map String Unit
        -> List String
 defFun curried key i xs b r =
   List.append
-    (if tailSelf key (List.length xs) b
-       then looped
-           key
-           i
-           b
-           r
-           (consSelf key (List.length xs) b)
-           (appendSelf key (List.length xs) b)
+    (if tailSelf key (List.length xs) b then looped key i b r
      else [ ""
           , "const "
           ^ i.js

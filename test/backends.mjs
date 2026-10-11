@@ -35,7 +35,7 @@ mkdirSync(work, { recursive: true });
 // after free, where it is)
 const cc = spawnSync("zig", ["version"]).status === 0 ? ["zig", "cc"] : ["cc"];
 const ccFlags = process.env.HEFF_SANITIZE ? ["-O0", "-g", "-fsanitize=address,undefined"] : ["-O1"];
-const buildC = (c, bin) => run(cc[0], [...cc.slice(1), ...ccFlags, "-w", c, "-o", bin, "-lm", "-lpthread"]);
+const buildC = (c, bin, flags = []) => run(cc[0], [...cc.slice(1), ...ccFlags, ...flags, "-w", c, "-o", bin, "-lm", "-lpthread"]);
 // (heff run with `args`, a run that does not end in two minutes a
 // failure, not a wait)
 const heff = (args, opts = {}) => run(heffBin, args, { timeout: 120000, ...opts });
@@ -126,28 +126,28 @@ const values = pool(cases, async (c) => {
 // ---------------------------------------------------------------------
 
 // (a program, compiled by each backend: how each is run; its files named
-// by its file and its name)
+// by its file and its name; `cflags`, the C compiler's more)
 const programs = {
   js: async (file, name) => {
     const out = join(work, `${basename(file, ".hf")}-${name}.mjs`);
     const r = await heff(["compile", file, out, "--name", name, "--backend=node"], { cwd: root });
     return r.status !== 0 ? { error: r.stderr } : { cmd: process.execPath, pre: [out] };
   },
-  c: async (file, name) => {
+  c: async (file, name, cflags = []) => {
     const c = join(work, `${basename(file, ".hf")}-${name}.c`), bin = join(work, `${basename(file, ".hf")}-${name}-c`);
     const r = await heff(["compile", file, c, "--name", name, "--backend=c"], { cwd: root });
     if (r.status !== 0) return { error: r.stderr };
-    const b = await buildC(c, bin);
+    const b = await buildC(c, bin, cflags);
     return b.status !== 0 ? { error: b.stderr } : { cmd: bin, pre: [] };
   },
 };
 
 // (the program `name` of `file` run by each backend in turn with `args`,
 // what it wrote and its status held to `want`; what fails, said)
-const ran = async (what, file, name, args, want, opts = {}) => {
+const ran = async (what, file, name, args, want, { cflags, ...opts } = {}) => {
   const msgs = [];
   for (const [be, build] of Object.entries(programs)) {
-    const p = await build(file, name);
+    const p = await build(file, name, cflags);
     if (p.error !== undefined) { msgs.push(`FAIL ${what} (${be}): not compiled\n${p.error}`); continue; }
     const r = await run(p.cmd, [...p.pre, ...args], { timeout: 60000, ...opts });
     const got = { out: r.stdout, err: r.stderr, status: r.status };
@@ -311,8 +311,34 @@ if (process.platform !== "win32") checks.push((async () => {
   return msgs;
 })());
 
-// loops, compiled as loops: a million rounds, and the stack does not overflow
-checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 }));
+// loops, compiled as loops: a million rounds, and the stack does not
+// overflow -- in C, a stack of 8 MiB, which a million calls not made
+// loops would (a call of itself put in a tag, src/heff/compile/trmc.hf)
+checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 },
+  { cflags: ["-DHEFF_MAIN_STACK=8388608"] }));
+
+// (a recursion deeper than the stack, in C: said, what was written before
+// it written, not a signal's silent end -- not where a sanitizer handles
+// faults itself)
+if (!process.env.HEFF_SANITIZE) checks.push((async () => {
+  const deeper = join(work, "deeper.hf");
+  writeFileSync(deeper, [
+    "import co", "import std.io", "",
+    "sumTo : Int -> Int",
+    "sumTo n = if n == 0 then 0 else n + sumTo (n - 1)", "",
+    "main : Co stdio Unit",
+    "main = do",
+    "  print (ev := here stdio) \"before\"",
+    "  print (ev := here stdio) (showInt (sumTo 100000000))", "",
+  ].join("\n"));
+  const p = await programs.c(deeper, "main", ["-DHEFF_MAIN_STACK=8388608"]);
+  if (p.error !== undefined) return [`FAIL a stack overflow (c): not compiled\n${p.error}`];
+  const r = await run(p.cmd, [], { timeout: 60000 });
+  const want = { out: "before\n", err: "heff: the stack overflowed\n", status: 1 };
+  const got = { out: r.stdout, err: r.stderr, status: r.status };
+  return Object.keys(want).filter((k) => got[k] !== want[k])
+    .map((k) => `FAIL a stack overflow (c): ${k} ${JSON.stringify(got[k])}, wanted ${JSON.stringify(want[k])}`);
+})());
 
 // (each operation goes on at once: the stack must not overflow)
 const loop = join(work, "loop.hf");

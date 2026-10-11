@@ -43,6 +43,7 @@
 #include <alloca.h>
 #include <poll.h>
 #include <spawn.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char **environ;
@@ -196,14 +197,19 @@ static void *heff_alloc(size_t n) {
 }
 
 // Objects are small and made and given back all the time (a
-// computation's continuations, its operations): those of up to
-// `SMALL_MAX` bytes come from free lists, one for each multiple of 8
-// bytes, an object given back kept for the next of its size.
-// (`-DSMALL_MAX=0`: none kept, every object given back to the system, so
-// that AddressSanitizer sees a use after its last reference)
+// computation's continuations, its operations, a list's cells): those of
+// up to `SMALL_MAX` bytes are kept, for the next of their size, each
+// multiple of 8 bytes apart.  (`-DSMALL_MAX=0`: none kept, every object
+// given back to the system, so that AddressSanitizer sees a use after
+// its last reference)
 #ifndef SMALL_MAX
 #define SMALL_MAX 128
 #endif
+
+#if defined(HEFF_THREADS) || SMALL_MAX == 0
+// (with threads, an object one thread made may be given back by another
+// (`heff_copy_for_thread`): each its own, from the system, kept on a list
+// of its size of the thread that gives it back)
 HEFF_VAR(HEFF_TLS void *heff_free_list[SMALL_MAX / 8 + 1]);
 
 static inline void *heff_obj_alloc(size_t n) {
@@ -223,6 +229,87 @@ static inline void heff_obj_free(void *p, size_t n) {
     heff_free_list[c] = p;
   } else free(p);
 }
+#else
+// (in pages, each of one size, its own list of what is given back: an
+// object is made in the page made in last, what it was given back first,
+// else in what of it was never used yet, else in another page that has
+// room -- so what is made one after another is near one another, however
+// long the program has run, and a list made a cell at a time from the
+// front is read from the front by addresses that go up, a page at a
+// time.  One list of what is given back for each size, not each page,
+// would hand cells out in the order they came back -- after a list is
+// filtered, every third far from the one before it -- and a long list
+// read through the cache misses at each cell)
+#define HEFF_PAGE ((size_t)1 << 16)
+typedef struct HeffPage {
+  void *free;               // what was given back here
+  char *bump, *end;         // what was never used yet
+  struct HeffPage *next;    // the next of its size with room
+  uint32_t c, listed;       // its size, in words; on that list
+} HeffPage;
+HEFF_VAR(HeffPage *heff_page_at[SMALL_MAX / 8 + 1]);
+HEFF_VAR(HeffPage *heff_page_room[SMALL_MAX / 8 + 1]);
+
+static void *heff_page_alloc(size_t c);
+
+static inline void *heff_obj_alloc(size_t n) {
+  size_t c = (n + 7) / 8;
+  if (c > SMALL_MAX / 8) return heff_alloc(c * 8);
+  HeffPage *pg = heff_page_at[c];
+  if (pg) {
+    void *p = pg->free;
+    if (p) { pg->free = *(void **)p; return p; }
+    if (pg->bump + c * 8 <= pg->end) { p = pg->bump; pg->bump += c * 8; return p; }
+  }
+  return heff_page_alloc(c);
+}
+
+static inline void heff_obj_free(void *p, size_t n) {
+  size_t c = (n + 7) / 8;
+  if (c > SMALL_MAX / 8) { free(p); return; }
+  HeffPage *pg = (HeffPage *)((uintptr_t)p & ~(uintptr_t)(HEFF_PAGE - 1));
+  *(void **)p = pg->free;
+  pg->free = p;
+  if (!pg->listed && pg != heff_page_at[pg->c]) {
+    pg->listed = 1;
+    pg->next = heff_page_room[pg->c];
+    heff_page_room[pg->c] = pg;
+  }
+}
+#endif
+
+#if !(defined(HEFF_THREADS) || SMALL_MAX == 0)
+// (the page made in last full: another of the size with room, else a
+// new one)
+static __attribute__((noinline)) void *heff_page_alloc(size_t c) {
+  HeffPage *pg = heff_page_room[c];
+  if (pg) {
+    heff_page_room[c] = pg->next;
+    pg->listed = 0;
+  } else {
+    void *m = NULL;
+#ifdef _WIN32
+    m = _aligned_malloc(HEFF_PAGE, HEFF_PAGE);
+#else
+    if (posix_memalign(&m, HEFF_PAGE, HEFF_PAGE) != 0) m = NULL;
+#endif
+    if (!m) heff_fail("out of memory");
+    pg = m;
+    pg->free = NULL;
+    pg->bump = (char *)m + (sizeof(HeffPage) + 15) / 16 * 16;
+    pg->end = (char *)m + HEFF_PAGE;
+    pg->next = NULL;
+    pg->c = (uint32_t)c;
+    pg->listed = 0;
+  }
+  heff_page_at[c] = pg;
+  void *p = pg->free;
+  if (p) { pg->free = *(void **)p; return p; }
+  p = pg->bump;
+  pg->bump += c * 8;
+  return p;
+}
+#endif
 
 static inline int heff_tag_of(V v) {
   return IS_NTAG(v) ? (int)(v >> 2) : OBJ(v)->tag;
@@ -410,6 +497,18 @@ HEFF_KNOWN V heff_tag_at_n(V r, int id, int64_t n, V *f) {
   t->h.tag = (uint16_t)id;
   heff_fields_n(t->f, f, n);
   return r;
+}
+
+// (what a tag's field waits as, a hole: no object, nothing to drop; and
+// field `i` of the cell `d`, made with a hole there that nothing has
+// seen yet, set to `v`: what a call of itself gives put where a tag waits
+// for it -- src/heff/compile/trmc.hf's destination; `d` consumed)
+static inline V heff_hole(void) { return MK_INT(0); }
+
+static inline V heff_setField(V d, V i, V v) {
+  ((Tag *)d)->f[INT_OF(i)] = v;
+  heff_drop(d);
+  return NTAG(TAG_MkUnit);
 }
 
 // (a record of `n` fields, its labels `lbl`)
@@ -2436,6 +2535,7 @@ static void heff_fail_again(const char *why) {
 // (this thread's free lists and what else the runtime keeps for it given
 // back to the system, as it ends)
 static void heff_thread_end(void) {
+#if defined(HEFF_THREADS) || SMALL_MAX == 0
   for (size_t c = 0; c <= SMALL_MAX / 8; c++) {
     void *p = heff_free_list[c];
     while (p) {
@@ -2445,6 +2545,7 @@ static void heff_thread_end(void) {
     }
     heff_free_list[c] = NULL;
   }
+#endif
   free(heff_dead);
   heff_dead = NULL;
   heff_ndead = heff_cdead = 0;
@@ -2796,6 +2897,14 @@ HEFF_VAR(int heff_status);
 
 #ifndef HEFF_PART
 
+// (the program's stack, which heff's recursion is: a call last a jump,
+// and a call of itself put in a tag a loop (src/heff/compile/trmc.hf),
+// but what is left is as deep as it goes -- `-DHEFF_MAIN_STACK=BYTES`
+// for another size)
+#ifndef HEFF_MAIN_STACK
+#define HEFF_MAIN_STACK ((size_t)1 << 30)
+#endif
+
 #ifdef HEFF_CHECK
 static const Global *heff_globals = NULL;
 static int heff_nglobals = 0;
@@ -2824,8 +2933,56 @@ static void *heff_thread(void *u) {
 #else
 static V heff_entry(void);
 
+// (where the program's stack ran out, said: a fault at the bottom of its
+// stack, on a stack of the handler's own, is an overflow -- any other
+// fault the system's, as without the handler.  Not where a sanitizer
+// handles faults itself)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define HEFF_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define HEFF_SANITIZED 1
+#endif
+#if !defined(_WIN32) && !defined(HEFF_SANITIZED)
+static char *heff_stack_lo;
+
+static void heff_on_fault(int sig, siginfo_t *si, void *ctx) {
+  (void)ctx;
+  char *a = (char *)si->si_addr;
+  if (heff_stack_lo && a >= heff_stack_lo - ((size_t)1 << 20) && a < heff_stack_lo + ((size_t)1 << 16)) {
+    static const char why[] = "heff: the stack overflowed\n";
+    fflush(stdout);
+    if (write(2, why, sizeof why - 1) < 0) _exit(1);
+    _exit(1);
+  }
+  signal(sig, SIG_DFL);
+}
+
+static void heff_watch_stack(void) {
+  char here;
+  heff_stack_lo = &here - HEFF_MAIN_STACK;
+  stack_t ss;
+  ss.ss_size = 1 << 16;
+  ss.ss_sp = malloc(ss.ss_size);
+  ss.ss_flags = 0;
+  if (!ss.ss_sp || sigaltstack(&ss, NULL) != 0) return;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = heff_on_fault;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGBUS, &sa, NULL);
+}
+#else
+static void heff_watch_stack(void) {}
+#endif
+
 static void *heff_thread(void *u) {
   (void)u;
+  heff_watch_stack();
   heff_tr(heff_entry());
   return NULL;
 }
@@ -2845,7 +3002,7 @@ int main(int argc, char **argv) {
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stderr), _O_BINARY);
   SetConsoleOutputCP(CP_UTF8);
-  HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, heff_win_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+  HANDLE t = CreateThread(NULL, (SIZE_T)HEFF_MAIN_STACK, heff_win_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
   if (!t) heff_fail("cannot start");
   WaitForSingleObject(t, INFINITE);
   fflush(stdout);
@@ -2856,7 +3013,7 @@ int main(int argc, char **argv) {
   heff_argc = argc; heff_argv = argv;
   pthread_attr_t attr;
   pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, (size_t)1 << 30);
+  pthread_attr_setstacksize(&attr, HEFF_MAIN_STACK);
   pthread_t t;
   if (pthread_create(&t, &attr, heff_thread, NULL) != 0) heff_fail("cannot start");
   pthread_join(t, NULL);

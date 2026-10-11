@@ -1,9 +1,12 @@
--- From the core to what a backend emits -- the stages, in order.
+-- From the core to what a backend emits -- the stages, in order, the
+-- same for both backends (#40):
 --
---   core ─[Erase]→ IR ─[Lift]→ ─[Shake]→ ─[Simplify]→ ─[Shake]→ ─[Arity]→ IR
+--   core ─[Erase]→ IR ─[Lift]→ ─[Shake]→ ─[Simplify]→ ─[Shake]→
+--        ─[Call arity]→ ─[Arity]→ ─[TRMC]→ IR
 --
--- and, for the C backend, ─[Call arity]→ before ─[Arity]→, and ─[ANF]→
--- after (`lowerProgramAnf`).
+-- and, for the C backend, ─[ANF]→ after (`lowerProgramAnf`): a binding
+-- for each value computed, where its reference counts are taken and
+-- dropped.  An emitter only prints what this makes.
 
 import heff.compile.anf as An
 import heff.compile.arity as Ar
@@ -15,19 +18,33 @@ import heff.compile.irtext as Ir
 import heff.compile.lift as Lf
 import heff.compile.shake as Sh
 import heff.compile.simplify as Si
+import heff.compile.trmc as Tr
 import map as M
 
 type Lowered = { defs : List I.Def, errors : List String }
 
-saturateAll : M.Map String Int -> List I.Def -> List String -> Lowered
-saturateAll ar kept errors =
-  { defs = List.map (\d -> Ar.saturate ar d) kept, errors = errors }
+-- (the arities, of the whole program, computed once)
+saturated : M.Map String Int -> Ca.Called -> Tr.Trmced
+saturated ar c =
+  Tr.trmcProgram c.supply (List.map (\d -> Ar.saturate ar d) c.defs)
 
-lowerKept : List I.Def -> List String -> Lowered
-lowerKept kept errors = saturateAll (Ar.arities kept) kept errors
+calledShared : Ca.Called -> Tr.Trmced
+calledShared c = saturated (Ar.arities c.defs) c
+
+-- | what both backends are given: each call at the arity it is made at,
+-- | and each at its function's (heff.compile.arity), a call of itself
+-- | built around made a loop (heff.compile.trmc); where fresh names go
+-- | on from
+shared : Int -> List I.Def -> Tr.Trmced
+shared supply kept = calledShared (Ca.callArity supply kept)
+
+lowerKept : Int -> List I.Def -> List String -> Lowered
+lowerKept supply kept errors =
+  { defs = (shared supply kept).defs, errors = errors }
 
 lowerSimplified : List String -> List String -> Si.Simplified -> Lowered
-lowerSimplified roots errors si = lowerKept (Sh.shake roots si.defs) errors
+lowerSimplified roots errors si =
+  lowerKept si.supply (Sh.shake roots si.defs) errors
 
 lowerErased : List String -> Er.Erased -> Lowered
 lowerErased roots er =
@@ -111,18 +128,13 @@ lowerProgram : G.Globals -> String -> Lowered
 lowerProgram g key =
   lowerErased (Cons entryKey Nil) (withEntry key (Er.eraseProgram g))
 
-anfSaturated : Int -> Lowered -> Lowered
-anfSaturated supply l =
-  { defs = An.anfProgram supply l.defs, errors = l.errors }
+anfShared : List String -> Tr.Trmced -> Lowered
+anfShared errors t = { defs = An.anfProgram t.supply t.defs, errors = errors }
 
-anfCalled : List String -> Ca.Called -> Lowered
-anfCalled errors c =
-  anfSaturated c.supply (saturateAll (Ar.arities c.defs) c.defs errors)
-
--- (each call at the arity it is made at, in A-normal form: names from
--- where the simplifier's ended)
+-- (as both backends have it, in A-normal form: names from where the
+-- simplifier's ended)
 anfKept : Int -> List I.Def -> List String -> Lowered
-anfKept supply kept errors = anfCalled errors (Ca.callArity supply kept)
+anfKept supply kept errors = anfShared errors (shared supply kept)
 
 anfSimplified : List String -> List String -> Si.Simplified -> Lowered
 anfSimplified roots errors si =
