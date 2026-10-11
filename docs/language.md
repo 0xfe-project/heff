@@ -99,45 +99,49 @@ so is more than one (E0342), whatever their values, so that an import
 may make an error of a search, never another answer.
 
 An instance's type may take implicit and instance arguments before what
-it is an instance of: `instance eqList : {a : Type} -> {{eq : Eq a}} ->
-Eq (List a)` is an instance of each `Eq (List a)` there is an `Eq a`
-of.  A search unifies what it is an instance of with the type wanted,
-which solves its implicit arguments, and is decided on that alone --
-`Eq (List a)`'s and `Eq (List Int)`'s are two for `Eq (List Int)` --
-then finds its instance arguments as it found it, each a search of its
-own, whose error says the instances that wanted it (`no instance for Eq
-Color in scope, wanted by eqList for Eq (List Color)`); one whose type
-what the instance is an instance of leaves undetermined is E0340.
+it is an instance of: `instance equalityList : {a : Type} -> {{eq :
+Equality a}} -> Equality (List a)` is an instance of each `Equality
+(List a)` there is an `Equality a` of.  A search unifies what it is an
+instance of with the type wanted, which solves its implicit arguments,
+and is decided on that alone -- `Equality (List a)`'s and `Equality
+(List Int)`'s are two for `Equality (List Int)` -- then finds its
+instance arguments as it found it, each a search of its own, whose
+error says the instances that wanted it (`no instance for Equality
+Color in scope, wanted by equalityList for Equality (List Color)`); one
+whose type what the instance is an instance of leaves undetermined is
+E0340.
 Searches go 32 deep at most (E0349), as an instance that wants one of a
 type no smaller than its own may want them without end.  An explicit
 argument, which no search gives, is refused (E0348), and so is an
 implicit one not in what the instance is an instance of, which the
 unification could not solve (E0350).
 
-The prelude's `Eq` is a type's equality, `equal x y` and `x == y`: its
-instances are `Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s,
-`Bool`'s, `Unit`'s and `Ordering`'s, those of a `List`, a `Maybe`, a
-`Pair` and an `Either` of types that have one (`eqList`, `eqMaybe`,
-`eqPair`, `eqEither`), and each fixed-width type's module has its own
-(`int8`'s `eqInt8`).  The prelude's other operators are theories' too
-([operators](#operators)).  A search tries only the instances whose
-type could be the one wanted: `x == y` at `Int` tries `eqInt`, not
-`eqList`, whose `Eq (List a)` no `Eq Int` is.
+The prelude's `Equality` is a type's equality, `equal x y` and `x ==
+y`: its instances are `Int`'s (`equalityInt`), `Float64`'s, `String`'s,
+`Rune`'s, `Bool`'s, `Unit`'s and `Ordering`'s, those of a `List`, a
+`Maybe`, a `Pair` and an `Either` of types that have one
+(`equalityList`, `equalityMaybe`, `equalityPair`, `equalityEither`),
+and each fixed-width type's module has its own (`int8`'s
+`equalityInt8`) -- an instance named by its theory, then its type.  The
+prelude's other operators are theories' too ([operators](#operators)).
+A search tries only the instances whose type could be the one wanted:
+`x == y` at `Int` tries `equalityInt`, not `equalityList`, whose
+`Equality (List a)` no `Equality Int` is.
 
 ```haskell
-member : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool
+member : {a : Type} -> {{eq : Equality a}} -> a -> List a -> Bool
 member x Nil = False
 member x (Cons y ys) = equal x y || member x ys
 
 found : Bool
-found = member 2 [1, 2] && member 2.5 [0.5]   -- eqInt found, then eqFloat
+found = member 2 [1, 2] && member 2.5 [0.5]   -- equalityInt, then equalityFloat64
 
 same : List (Maybe Int) -> List (Maybe Int) -> Bool
-same xs ys = equal xs ys   -- eqList found, given eqMaybe, given eqInt
+same xs ys = equal xs ys   -- equalityList, given equalityMaybe, given equalityInt
 ```
 
-A theory declared again is another type: a module's own `Eq` and its
-instances are none of the prelude's.
+A theory declared again is another type: a module's own `Equality` and
+its instances are none of the prelude's.
 
 ## Operators
 
@@ -164,23 +168,27 @@ infixl .+. below +
 ```
 
 The prelude's operators are each a theory's operation, as Lean's are:
-`+` is `Add`'s `add`, `-` `Sub`'s `sub`, `*` `Mul`'s `mul`, `/` `Div`'s
-`div`, `%` `Mod`'s `mod`, `==` and `/=` `Eq`'s `equal`, `<` and `<=`
-`Ord`'s `lt` and `le` (`>` and `>=` the same, flipped), and `-x`
-`Neg`'s `neg` -- each an instance argument, found at the type it is
-used at: `n + 1` at `Int` is the prelude's `addInt`'s, `x * c` at
-`Int64` `int64`'s `mulInt64`'s, in one file, and a function of any type
-that has one asks for it.  A type has those it has: an integer type
-every one, a float no `/` or `%` -- a `Float64`'s division, IEEE's (by
-0, an infinity), is `/.`, which binds as `*` does.  `Ord`'s `compare`,
-`min` and `max` are the prelude's too, `HasZero`'s `zero` (a theory of
-the name `Zero` would take `Nat`'s tag), and `Bits`', an integer type's
-bits: `and`, `or`, `xor`, `complement`, `shiftL` and `shiftR`.  Where the
-instance is known, what is compiled is the operation itself: `n + 1` at
-`Int` is `intAdd n 1`, as if written so, and `n < 2` a C condition.
+`+` is `Addition`'s `add`, `-` `Subtraction`'s `sub`, `*`
+`Multiplication`'s `mul`, `/` `Division`'s `div`, `%` `Remainder`'s
+`mod`, `/.` `FloatDivision`'s `divide`, `==` and `/=` `Equality`'s
+`equal`, `<` and `<=` `Order`'s `lt` and `le` (`>` and `>=` the same,
+flipped), and `-x` `Negation`'s `neg` -- each an instance argument,
+found at the type it is used at: `n + 1` at `Int` is the prelude's
+`additionInt`'s, `x * c` at `Int64` `int64`'s `multiplicationInt64`'s,
+in one file, and a function of any type that has one asks for it.  A
+type has those it has: an integer type every one but `/.`, a float no
+`/` or `%` -- a float's division, IEEE's (by 0, an infinity), is `/.`,
+which binds as `*` does.  `Order`'s `compare`, `min` and `max` are the
+prelude's too, and `Bitwise`', an integer type's bits: `and`, `or`,
+`xor`, `complement`, `shiftL` and `shiftR`; `IsZero`'s `isZero` says
+whether an integer is its type's zero.  A theory is named by a whole
+noun, so that the short names are a program's own to give: `data Op =
+Add | Sub | Mul | Div` takes none of the prelude's.  Where the instance
+is known, what is compiled is the operation itself: `n + 1` at `Int`
+is `intAdd n 1`, as if written so, and `n < 2` a C condition.
 
 ```haskell
-twice : {a : Type} -> {{add : Add a}} -> a -> a
+twice : {a : Type} -> {{add : Addition a}} -> a -> a
 twice x = x + x   -- twice 21 is 42, twice 1.25 is 2.5
 
 step : Int64 -> Int64
@@ -199,7 +207,8 @@ rounding down, its remainder of the divisor's sign.  An integer's
 division is total, as Lean's and Coq's are: by zero it is 0, and its
 remainder the dividend, so that `(x / y) * y + x % y` is `x` whatever
 `y` is -- for a program that would hear of a zero divisor, `exn`'s
-`exnDiv` and `exnMod` throw `MkDivByZero` instead.
+`exnDiv` and `exnMod` throw `MkDivByZero` instead (of a type with an
+`IsZero`).
 
 A number literal is of the type it is used at: an integer literal of any
 number type, a fractional one (`2.5`) of a float type.  An integer
@@ -234,30 +243,35 @@ mask = 240
 ```
 
 Each fixed-width integer type has a module, imported by a name
-(`import int32 as I32`), whose operations are named as the prelude's:
-`add`, `div`, `rem`, `compare`, `show`, the bits' (`and`, `or`, `xor`,
-`complement`, `shiftL`, `shiftR`), and `fromInt` and `toInt`, by way of
-which one type's value becomes another's (`I8.fromInt (I32.toInt x)`).
-`float32`'s has the arithmetic, `compare` and `show`, `fromInt`,
-`fromFloat`, `toFloat`, `floor` and `sqrt`.  An `Int`'s bits are
-`int`'s (`import int as I`: `I.and`, `I.or`, `I.xor`, `I.complement`,
+(`import int32 as I32`, as each has the same names): `add`, `sub`,
+`mul`, `div`, `rem`, `eq`, `lt`, `le`, `show`, `minBound` and
+`maxBound`, and `fromInt` and `toInt`, by way of which one type's value
+becomes another's (`I8.fromInt (I32.toInt x)`).  `float32`'s has the
+arithmetic, `eq`, `lt`, `le`, `isNaN` and `show`, `fromInt`,
+`fromFloat`, `toFloat`, `floor` and `sqrt`.  None of them has a name
+the prelude has for every type -- `neg`, `compare`, `min`, `max`, the
+bits' -- so that a module opened is in the way of none of them at
+another type: those are its instances'.  An `Int`'s bits are `int`'s
+(`import int as I`: `I.and`, `I.or`, `I.xor`, `I.complement`,
 `I.shiftL`, `I.shiftR`), as two's complement has them with the sign
 extended for ever; a shift right rounds down, and one by a negative
-count abandons.  A fixed-width type's instances are its module's, found
-wherever it is imported, by a name or not: the prelude's operators at
-its type, `x * c + d` at `Int64` beside `n + 1` at `Int`, and `and x y`
-(`int`'s `bitsInt` is an `Int`'s); `float32`'s has all but `Div`, `Mod`
-and `Bits`.  How each number is kept by each backend, and given to a
+count is one the other way (`I.shiftL x -n` is `I.shiftR x n`).  A
+fixed-width type's instances are its module's, found wherever it is
+imported, by a name or not: the prelude's operators at its type, `x *
+c + d` at `Int64` beside `n + 1` at `Int`, `-x`, `min x y` and `and x
+y` (`int`'s `bitwiseInt` is an `Int`'s); `float32`'s has all but
+`Division`, `Remainder`, `Bitwise` and `IsZero`, and `FloatDivision`
+too, its `/.`.  How each number is kept by each backend, and given to a
 provider, is in [providers.md](providers.md#numbers-and-runes).
 
 `-` where it would be a number's sign, right before a name or a `(`
 instead of a digit, negates what it is before: a name with its fields
 (`-p.x`) or what is in parentheses (`-(f y)`), an argument's worth.  It
 is the `neg` in scope applied to it, as `a - b` is the `(-)` in scope:
-the prelude's `neg` is `Neg`'s, of any type that has one -- an `Int`, a
-float (0.0's sign too: `1.0 /. -zero` is -Infinity), a fixed-width type
--- and a fixed-width type's module, imported as it is, has its own,
-which `-x` then is.  So `f -x` is `f (-x)`, as `f -1` is `f (-1)`, while
+the prelude's `neg` is `Negation`'s, of any type that has one -- an
+`Int`, a float (0.0's sign too: `1.0 /. -(0.0)` is -Infinity), a
+fixed-width type -- and a module's own `neg`, where it has one, is what
+`-x` then is.  So `f -x` is `f (-x)`, as `f -1` is `f (-1)`, while
 `a - x` and `a-x` subtract; `-f x` is `(-f) x`, and `- x`, a space after
 the `-`, is no negation.  A pattern's `-` is only a number's sign.
 
@@ -277,11 +291,12 @@ code point.
 
 A `String` is bytes, as Go's is: UTF-8 as a literal writes it (`"é"`
 is two bytes), though any bytes may be in one -- what a file, a stream
-or a command gave, `fromByte 255`, or a string's own escape `"\xff"`, a
-byte of two hexadecimal digits.  Its length (`strLength`), an index
-(`byteAt`, a byte from 0 to 255, -1 out of the string), a slice and its
-order (`strLt`: the bytes', which of UTF-8 is the code points') are of
-bytes, the same on every backend.  The prelude takes a string apart
+or a command gave, `fromByte 255` (a `UInt8`, the byte type, its
+argument: `fromByte (U8.fromInt n)` of an `Int`), or a string's own
+escape `"\xff"`, a byte of two hexadecimal digits.  Its length
+(`strLength`), an index (`byteAt`, a byte from 0 to 255, -1 out of the
+string), a slice and its order (`strLt`: the bytes', which of UTF-8 is
+the code points') are of bytes, the same on every backend.  The prelude takes a string apart
 into its runes, `runes : String -> List Rune`, and puts them together
 again, `ofRunes`; `runeAt s i` is the rune whose bytes start at `i`
 and how many they are (Go's `utf8.DecodeRuneInString`).  What is not

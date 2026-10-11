@@ -1357,11 +1357,14 @@ INT_BITS(heff_intXor, ^)
 
 static int heff_int_neg(V v) { return IS_INT(v) ? INT_OF(v) < 0 : ((Big *)v)->neg; }
 
-// (`a` times 2^`b`; a negative count abandons, one beyond memory fails)
+static V heff_intShr(V a, V b);
+
+// (`a` times 2^`b`; by a negative count, a shift right by its size; one
+// beyond memory fails)
 static V heff_intShl(V a, V b) {
-  int bneg = heff_int_neg(b), bbig = !IS_INT(b);
+  if (heff_int_neg(b)) return heff_intShr(a, heff_intSub(MK_INT(0), b));
+  int bbig = !IS_INT(b);
   heff_drop(b);
-  if (bneg) { heff_drop(a); return heff_abandon(); }
   if (IS_INT(a) && INT_OF(a) == 0) return a;
   if (bbig) heff_fail("a shift beyond memory");
   int64_t k = INT_OF(b);
@@ -1386,11 +1389,11 @@ static V heff_intShl(V a, V b) {
 }
 
 // (`a` divided by 2^`b`, rounding down: its bits shifted out, the sign
-// shifted in; a negative count abandons)
+// shifted in; by a negative count, a shift left by its size)
 static V heff_intShr(V a, V b) {
-  int bneg = heff_int_neg(b), bbig = !IS_INT(b);
+  if (heff_int_neg(b)) return heff_intShl(a, heff_intSub(MK_INT(0), b));
+  int bbig = !IS_INT(b);
   heff_drop(b);
-  if (bneg) { heff_drop(a); return heff_abandon(); }
   int aneg = heff_int_neg(a);
   if (bbig) { heff_drop(a); return MK_INT(aneg ? -1 : 0); }
   int64_t k = INT_OF(b);
@@ -1703,10 +1706,9 @@ static V heff_strByteAt(V a, V i) {
   return r;
 }
 
-// (the string of one byte; of what is no byte, `abandon`)
+// (the string of one byte, a `UInt8`: a word of its value, 0 to 255)
 static V heff_strFromByte(V c) {
   int64_t k = INT_OF(c);
-  if (k < 0 || k > 255) return heff_abandon();
   Str *s = heff_str_new(1);
   s->s[0] = (uint8_t)k;
   return (V)s;
@@ -1763,10 +1765,11 @@ FLT1(heff_floatLog, log)
 FLT2(heff_floatAtan2, heff_flt(atan2(x, y)))
 FLT2(heff_floatPow, heff_flt(pow(x, y)))
 
+// (of what is not finite, 0)
 static V heff_floatFloor(V a) {
   double d = FLT_OF(a);
   heff_drop(a);
-  if (!isfinite(d)) return heff_abandon();
+  if (!isfinite(d)) return MK_INT(0);
   double f = floor(d);
   return heff_int_of_double(f);
 }
@@ -1975,7 +1978,7 @@ static V heff_float32ToFloat(V a) { return heff_flt((double)heff_f32_of(a)); }
 static V heff_float32FromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_f32((float)d); }
 static V heff_float32Floor(V a) {
   double d = heff_f32_of(a);
-  if (!isfinite(d)) return heff_abandon();
+  if (!isfinite(d)) return MK_INT(0);
   return heff_int_of_double(floor(d));
 }
 
@@ -2104,11 +2107,16 @@ static V heff_arrayIndex(V a, V i) {
   return x;
 }
 
-// (an array held only here is set in place: it is not seen again)
+// (an array held only here is set in place: it is not seen again; out of
+// range, the array as it is)
 static V heff_arraySet(V a, V i, V x) {
   Arr *r = (Arr *)a;
   int64_t k = INT_OF(i);
-  if (k < 0 || k >= r->n) return heff_abandon();
+  if (!IS_INT(i) || k < 0 || k >= r->n) {
+    heff_drop(i);
+    heff_drop(x);
+    return a;
+  }
   if (heff_unique(a)) {
     heff_drop(r->a[k]);
     r->a[k] = x;

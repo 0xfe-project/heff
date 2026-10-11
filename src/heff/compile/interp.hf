@@ -7,7 +7,7 @@
 -- first used.  `abandon` is a value, `Abn`, threaded through every
 -- step -- so a watch that abandons reports `<abandoned>` instead of
 -- ending the run.  Evaluation that goes deeper than `deepest` is said
--- to diverge, `Diverged`: every function and every thunk is given the depth
+-- to diverge, `Div`: every function and every thunk is given the depth
 -- it is forced at.
 
 import array as A
@@ -20,11 +20,12 @@ import heff.elab.syntax as Sx
 import map as M
 import rune as Ru
 import std.math as Mt
+import uint8 as U8
 
 -- | a computation forced at a depth
 type Th a = Int -> a
 
-data Res a = Ok a | Abn | Diverged
+data Res a = Ok a | Abn | Div
 
 data Val
   = VFun (Int -> Th (Res Val) -> Res Val)
@@ -44,7 +45,7 @@ type RVal = Res Val
 rbind : RVal -> (Val -> RVal) -> RVal
 rbind (Ok v) f = f v
 rbind Abn f = Abn
-rbind Diverged f = Diverged
+rbind Div f = Div
 
 okTh : Val -> Th RVal
 okTh v = \d -> Ok v
@@ -207,9 +208,12 @@ intBits f a b =
   if (a == 0 || a == -1) && (b == 0 || b == -1) then 0 - f (a % 2) (b % 2)
   else f (a % 2) (b % 2) + 2 * intBits f (a / 2) (b / 2)
 
--- (a shift by a negative count abandons)
-intShift : (Int -> Int -> Int) -> Int -> Int -> RVal
-intShift f a b = if b < 0 then Abn else Ok (VInt (f a (Fx.twoTo b)))
+-- (a shift by `f`, of a power of 2; by a negative count, one the other
+-- way, by `back`)
+intShift : (Int -> Int -> Int) -> (Int -> Int -> Int) -> Int -> Int -> RVal
+intShift f back a b =
+  if b < 0 then Ok (VInt (back a (Fx.twoTo (0 - b))))
+  else Ok (VInt (f a (Fx.twoTo b)))
 
 -- The fixed-width integers (heff.elab.fixed): each an integer of its type's
 -- range, computed with as one and wrapped around to the type
@@ -298,9 +302,10 @@ f32V2 f =
 f32Ok : Float32 -> RVal
 f32Ok x = Ok (VFloat32 x)
 
--- (of what is not finite, `abandon`)
+-- (of what is not finite, 0)
 f32Floor : Float32 -> RVal
-f32Floor a = if isFiniteF (F32.toFloat a) then Ok (VInt (F32.floor a)) else Abn
+f32Floor a =
+  if isFiniteF (F32.toFloat a) then Ok (VInt (F32.floor a)) else Ok (VInt 0)
 
 float32V : Fx.FixedOp -> Val
 float32V OpAdd = f32V2 (\a b -> f32Ok (F32.add a b))
@@ -345,8 +350,8 @@ prim p =
         (\a b -> Ok (VInt (intBits (\x y -> if x + y > 0 then 1 else 0) a b)))
   else if strEq p "intXor"
     then int2 (\a b -> Ok (VInt (intBits (\x y -> (x + y) % 2) a b)))
-  else if strEq p "intShl" then int2 (intShift (\a k -> a * k))
-  else if strEq p "intShr" then int2 (intShift (\a k -> a / k))
+  else if strEq p "intShl" then int2 (intShift (\a k -> a * k) (\a k -> a / k))
+  else if strEq p "intShr" then int2 (intShift (\a k -> a / k) (\a k -> a * k))
   else if strEq p "floatAdd" then float2 (\a b -> Ok (VFloat (a + b)))
   else if strEq p "floatSub" then float2 (\a b -> Ok (VFloat (a - b)))
   else if strEq p "floatMul" then float2 (\a b -> Ok (VFloat (a * b)))
@@ -357,9 +362,9 @@ prim p =
   else if strEq p "floatShow" then float1 (\a -> Ok (VStr (showFloat a)))
   else if strEq p "floatFromInt" then int1 (\a -> Ok (VFloat (toFloat a)))
   else if strEq p "floatSqrt" then float1 (\a -> Ok (VFloat (sqrt a)))
-  -- (of what is not finite, `abandon`)
+  -- (of what is not finite, 0)
   else if strEq p "floatFloor"
-    then float1 (\a -> if isFiniteF a then Ok (VInt (floor a)) else Abn)
+    then float1 (\a -> if isFiniteF a then Ok (VInt (floor a)) else Ok (VInt 0))
   else if strEq p "floatSin" then float1 (\a -> Ok (VFloat (Mt.sin a)))
   else if strEq p "floatCos" then float1 (\a -> Ok (VFloat (Mt.cos a)))
   else if strEq p "floatTan" then float1 (\a -> Ok (VFloat (Mt.tan a)))
@@ -402,7 +407,7 @@ prim p =
                                          (VArr
                                             (A.fromList
                                                (setAt (A.toList xs) i xv)))
-                                   else Abn)))))))
+                                   else Ok (VArr xs))))))))
   else if strEq p "arrayGenerate"
     then tyThen
         (int1
@@ -434,11 +439,12 @@ prim p =
   else if strEq p "strEq" then str2 (\a b -> Ok (boolV (strEq a b)))
   else if strEq p "strLt" then str2 (\a b -> Ok (boolV (strLt a b)))
   -- (a string as bytes: the host's strings, UTF-8 bytes as the
-  -- interpreted program's are; a byte out of 0 to 255 abandons)
+  -- interpreted program's are; a byte, a `UInt8`, an integer from 0 to
+  -- 255)
   else if strEq p "strByteAt"
     then str1 (\a -> Ok (int1 (\i -> Ok (VInt (byteAt a i)))))
   else if strEq p "strFromByte"
-    then int1 (\c -> if 0 <= c && c <= 255 then Ok (VStr (fromByte c)) else Abn)
+    then int1 (\c -> Ok (VStr (fromByte (U8.fromInt c))))
   else if strEq p "strRuneAt"
     then str1 (\a -> Ok (int1 (\i -> Ok (VRune (Ru.toInt (runeAt a i).rune)))))
   else if strEq p "strRuneWidth"
@@ -500,7 +506,7 @@ evalFields ev (Cons (MkPair l t) rest) k =
 
 evalIn : Int -> Env -> Sx.Tm -> RVal
 evalIn d e t =
-  if d > deepest then Diverged
+  if d > deepest then Div
   else case t of
     SLocal i -> case nthTh e.local i of
       Just v -> v d
@@ -640,11 +646,13 @@ fixThunk g t = \d ->
 -- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intDiv") (SLitInt 2)) (SLitInt 0))))
 -- | "0"
 -- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intShl") (SLitInt 2)) (SLitInt -1))))
+-- | "1"
+-- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } SAbandon))
 -- | "<abandoned>"
 resultOf : RVal -> EvalResult
 resultOf (Ok v) = RSucceeded v
 resultOf Abn = RAbandoned
-resultOf Diverged = RDiverged
+resultOf Div = RDiverged
 
 -- | a value given `n` arguments that are types first -- erased where it
 -- | is compiled, so given as nothing -- as it is shown: `[]` of
