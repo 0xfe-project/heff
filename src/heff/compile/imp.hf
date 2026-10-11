@@ -182,8 +182,11 @@ isSimple _ = False
 type Self = { key : String, arity : Int }
 
 -- | the code generator's judgments, knotted
+-- | (`full`: a condition made of any test of a `Bool`; else of a
+-- | comparison alone, looked at where it is made)
 type G =
-  { simple : I.Expr -> N Val
+  { full : Bool
+  , simple : I.Expr -> N Val
   , tail : Maybe Self -> I.Expr -> N Tl
   , bindTo : String -> I.Expr -> N (List St)
   , setTo : String -> I.Expr -> N (List St)
@@ -254,6 +257,11 @@ armsName : String -> List I.Arm -> Bool
 armsName x arms =
   List.any (\a -> (I.occurrences x (I.armBody a)).count > 0) arms
 
+-- (a comparison, what a condition is made of)
+isRelCall : I.Expr -> Bool
+isRelCall (EPrimCall p (Cons _ (Cons _ Nil))) = isRel p
+isRelCall e = False
+
 isJustM : {a : Type} -> Maybe a -> Bool
 isJustM (Just _) = True
 isJustM Nothing = False
@@ -264,11 +272,15 @@ isJustM Nothing = False
 -- | (the binding of `x` sunk to where it is looked at)
 sinkTest : String -> I.Expr -> I.Expr -> Maybe I.Expr
 sinkTest x a (EMatch (EVar y) arms) =
-  if strEq x y && isJustM (boolArms arms) && not (armsName x arms)
+  if strEq x y
+  && isRelCall a
+  && isJustM (boolArms arms)
+  && not (armsName x arms)
     then Just (EMatch a arms)
   else Nothing
 sinkTest x a (ELet z (EMatch (EVar y) arms) e) =
   if strEq x y
+  && isRelCall a
   && isJustM (boolArms arms)
   && not (armsName x arms)
   && (I.occurrences x e).count == 0
@@ -321,21 +333,19 @@ predValue g e =
     ss <- g.bindTo t e
     pure (predLets ss (PBool (SVar t)))
 
--- | a `Bool`, as a condition (none, where what computes it is not
--- | bindings alone)
-predOf : G -> I.Expr -> N (Maybe Cond)
-predOf g (ETag t Nil) =
+predAny : G -> I.Expr -> N (Maybe Cond)
+predAny g (ETag t Nil) =
   if strEq t "True" then pure (Just PTrue)
   else if strEq t "False" then pure (Just PFalse)
   else pure (Just (PBool (STag t Nil)))
-predOf g e@(EPrimCall p (Cons a (Cons b Nil))) =
+predAny g e@(EPrimCall p (Cons a (Cons b Nil))) =
   if isRel p
     then do
       pa <- g.atom a
       pb <- g.atom b
       pure (predLets (appendL (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
   else predValue g e
-predOf g e@(EMatch s arms) = case boolArms arms of
+predAny g e@(EMatch s arms) = case boolArms arms of
   Just (MkPair t f) -> do
     ps <- g.pred s
     pt <- g.pred t
@@ -348,7 +358,7 @@ predOf g e@(EMatch s arms) = case boolArms arms of
         Nothing -> Nothing
       Nothing -> Nothing)
   Nothing -> predValue g e
-predOf g (ELet x a b) = case sinkTest x a b of
+predAny g (ELet x a b) = case sinkTest x a b of
   Just e2 -> g.pred e2
   Nothing -> do
     ss <- g.bindTo x a
@@ -356,7 +366,12 @@ predOf g (ELet x a b) = case sinkTest x a b of
     pure (case pb of
       Just q -> predLets ss q
       Nothing -> Nothing)
-predOf g e = predValue g e
+predAny g e = predValue g e
+
+-- | a `Bool`, as a condition (none, where what computes it is not
+-- | bindings alone; nor, not `full`, where it is not a comparison)
+predOf : G -> I.Expr -> N (Maybe Cond)
+predOf g e = if g.full || isRelCall e then predAny g e else pure Nothing
 
 -- Statements
 --------------------------------------------------------------------------------
@@ -495,13 +510,20 @@ matchSet g x s arms = case boolArms arms of
       Nothing -> caseSet g x s arms
   Nothing -> caseSet g x s arms
 
+-- (`x` declared right before the statement that sets it, after what
+-- that statement looks at is bound)
+declBefore : String -> List St -> List St
+declBefore x Nil = Cons (SDecl x) Nil
+declBefore x (Cons st Nil) = Cons (SDecl x) (Cons st Nil)
+declBefore x (Cons st rest) = Cons st (declBefore x rest)
+
 -- | a match that sets the destination in each arm: where it is bound, it
 -- | is declared first
 matchTo : G -> Dest -> I.Expr -> List I.Arm -> N (List St)
 matchTo g d s arms = do
   sw <- matchSet g (setOf d) s arms
   pure (case d of
-    DLet x -> Cons (SDecl x) sw
+    DLet x -> declBefore x sw
     DSet _ -> sw)
 
 -- | `e`'s value, given to the destination
@@ -514,7 +536,7 @@ toDest g d (ELet y a b) = case sinkTest y a b of
     pure (appendL sa sb)
 toDest g d e@(EMatch s arms) = case boolArms arms of
   Just (MkPair t f) ->
-    if condShaped t && condShaped f
+    if g.full && condShaped t && condShaped f
       then do
         bo <- boolOf g e
         case bo of
@@ -570,7 +592,7 @@ tailOf g self (ELet y a b) = case sinkTest y a b of
     pure (tailSeq sa tb)
 tailOf g self e@(EMatch s arms) = case boolArms arms of
   Just (MkPair t f) ->
-    if isNothingM self && condShaped t && condShaped f
+    if g.full && isNothingM self && condShaped t && condShaped f
       then do
         bo <- boolOf g e
         case bo of
@@ -593,15 +615,17 @@ tailOf g self e@(ECall k as) =
   else opTail g e
 tailOf g self e = opTail g e
 
-gen : G
-gen =
-  { simple = \e -> simpleOf gen e
-  , tail = \self e -> tailOf gen self e
-  , bindTo = \x e -> toDest gen (DLet x) e
-  , setTo = \x e -> toDest gen (DSet x) e
-  , atom = \e -> atomOf gen e
-  , op = \e -> opOf gen e
-  , pred = \e -> predOf gen e
+-- | the code generator: `full`, or with conditions of comparisons alone
+genOf : Bool -> G
+genOf full =
+  { full = full
+  , simple = \e -> simpleOf (genOf full) e
+  , tail = \self e -> tailOf (genOf full) self e
+  , bindTo = \x e -> toDest (genOf full) (DLet x) e
+  , setTo = \x e -> toDest (genOf full) (DSet x) e
+  , atom = \e -> atomOf (genOf full) e
+  , op = \e -> opOf (genOf full) e
+  , pred = \e -> predOf (genOf full) e
   }
 
 -- Definitions
@@ -622,14 +646,19 @@ loopOf key xs b =
     then Just ({ key = key, arity = List.length xs } : Self)
   else Nothing
 
-defOf : I.Def -> N Def
-defOf d = case d.body of
+defOf : G -> I.Def -> N Def
+defOf g d = case d.body of
   ELam xs b -> do
-    t <- gen.tail (loopOf d.key xs b) b
+    t <- g.tail (loopOf d.key xs b) b
     pure (MkDef d.key d.name (DefFun xs (MkBlock t)))
   b -> do
-    t <- gen.tail Nothing b
+    t <- g.tail Nothing b
     pure (MkDef d.key d.name (DefVal (MkBlock t)))
+
+-- | a definition, imperative (`full` as `genOf` says), fresh names drawn
+-- | from `supply` on
+impDef : Bool -> Int -> I.Def -> Def
+impDef full supply d = fst (defOf (genOf full) d supply)
 
 -- | the definitions, and where fresh names go on from
 type Imped = { defs : List Def, supply : Int }
@@ -638,7 +667,7 @@ type Imped = { defs : List Def, supply : Int }
 -- | >>> List.map defKey (impProgram 0 [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]).defs
 -- | ["f"]
 impProgram : Int -> List I.Def -> Imped
-impProgram supply defs = case traverseN defOf defs supply of
+impProgram supply defs = case traverseN (defOf (genOf True)) defs supply of
   MkPair ds n -> { defs = ds, supply = n }
 
 -- Parts
