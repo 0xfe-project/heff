@@ -17,6 +17,7 @@ import heff.elab.effect as Ef
 import heff.compile.facts as F
 import heff.elab.fixed as Fx
 import heff.elab.globals as G
+import heff.compile.imp as Mp
 import heff.compile.ir as I
 import heff.compile.lower as L
 import heff.compile.prims as Pr
@@ -278,27 +279,15 @@ ref gs k = case M.lookup compareString k gs of
     if i.arity >= 2 then i.js ^ "$c" else if i.lazy then i.js ^ "()" else i.js
   Nothing -> "undefined"
 
--- | the globals an expression uses as values (not called at once)
-valueRefs : I.Expr -> List String
-valueRefs (EGlobal g) = Cons g Nil
-valueRefs (ELam _ b) = valueRefs b
-valueRefs (EApp f as) =
-  List.append (valueRefs f) (List.concatMap (\a -> valueRefs a) as)
-valueRefs (ELet _ a b) = List.append (valueRefs a) (valueRefs b)
-valueRefs (ERecord fs) =
-  List.concatMap
-    (\p -> case p of
-     MkPair _ e2 -> valueRefs e2)
-    fs
-valueRefs (EProj e2 _ _) = valueRefs e2
-valueRefs (ETag _ as) = List.concatMap (\a -> valueRefs a) as
-valueRefs (EMatch s arms) =
-  List.append
-    (valueRefs s)
-    (List.concatMap (\a -> valueRefs (I.armBody a)) arms)
-valueRefs (EPrimCall _ as) = List.concatMap (\a -> valueRefs a) as
-valueRefs (ECall _ as) = List.concatMap (\a -> valueRefs a) as
-valueRefs e = Nil
+-- | the globals a definition uses as values (not called at once)
+valueRefs : Mp.Def -> List String
+valueRefs d =
+  catMaybesL
+    (List.map
+       (\p -> case p of
+        PartVal (SGlobal g) -> Just g
+        _ -> Nothing)
+       (Mp.partsOf d))
 
 -- Tail calls
 --------------------------------------------------------------------------------
@@ -324,37 +313,41 @@ valueRefs e = Nil
 -- Loops
 --------------------------------------------------------------------------------
 
--- | whether the function `key` calls itself last somewhere (a call of
--- | itself put in a tag, or right of a string append, is one too, as
--- | heff.compile.trmc makes it)
-tailSelf : String -> Int -> I.Expr -> Bool
-tailSelf key n (ELet _ _ b) = tailSelf key n b
-tailSelf key n (EMatch _ arms) =
-  List.any (\a -> tailSelf key n (I.armBody a)) arms
-tailSelf key n (ECall k as) = strEq k key && List.length as == n
-tailSelf key n e = False
-
 -- Scope
 --------------------------------------------------------------------------------
 
 -- | a function that is a loop: its parameters (`x$`)
 type Self = { key : String, params : List String }
 
+-- | precedences: 0 an arrow or a conditional, 1 a binary operation, 2 a
+-- | unary one, 3 anything that can be called or projected
+type Code = { code : String, prec : Int }
+
 -- | the names in scope: the JavaScript name of each variable, and every
 -- | name taken; and, in a function that is a loop, the function (where
 -- | a call of it is last, it goes round again)
+-- | (`inl`: the names whose one use computes them, by their code: see
+-- | `inlined`)
 type Env =
   { gs : M.Map String GInfo
   , names : M.Map String String
   , used : M.Map String Unit
   , self : Maybe Self
+  , inl : M.Map String Code
   }
 
 noSelf : Env -> Env
-noSelf env = { gs = env.gs, names = env.names, used = env.used, self = Nothing }
+noSelf env =
+  { gs = env.gs
+  , names = env.names
+  , used = env.used
+  , self = Nothing
+  , inl = env.inl
+  }
 
 withSelf : Maybe Self -> Env -> Env
-withSelf s env = { gs = env.gs, names = env.names, used = env.used, self = s }
+withSelf s env =
+  { gs = env.gs, names = env.names, used = env.used, self = s, inl = env.inl }
 
 bound : String -> String -> Env -> Env
 bound x v env =
@@ -362,6 +355,7 @@ bound x v env =
   , names = M.insert compareString x v env.names
   , used = M.insert compareString v MkUnit env.used
   , self = env.self
+  , inl = env.inl
   }
 
 type BoundN = { js : String, env : Env }
@@ -391,10 +385,6 @@ bindAll env xs =
 
 indent : Int -> String
 indent n = joinWith "" (List.replicate n "  ")
-
--- | precedences: 0 an arrow or a conditional, 1 a binary operation, 2 a
--- | unary one, 3 anything that can be called or projected
-type Code = { code : String, prec : Int }
 
 atLeast : Int -> Code -> String
 atLeast p c = if c.prec < p then "(" ^ c.code ^ ")" else c.code
@@ -461,103 +451,68 @@ primCall p as = primDefault p as
 
 -- | heff.compile.trmc's: a hole, and a cell's field set where its index
 -- | is known, written as JavaScript writes them
-cellPrim : String -> List I.Expr -> Bool
+cellPrim : String -> List Mp.Val -> Bool
 cellPrim "hole" Nil = True
-cellPrim "setField" (Cons _ (Cons (EInt _) (Cons _ Nil))) = True
+cellPrim "setField" (Cons _ (Cons (SInt _) (Cons _ Nil))) = True
 cellPrim _ _ = False
 
 -- | whether `primCall` calls the primitive's function, `$p(...)`
-callsHelper : String -> List I.Expr -> Bool
-callsHelper p as@(Cons _ (Cons (EInt _) (Cons _ Nil))) = not (cellPrim p as)
+callsHelper : String -> List Mp.Val -> Bool
+callsHelper p as@(Cons _ (Cons (SInt _) (Cons _ Nil))) = not (cellPrim p as)
 callsHelper p (Cons _ (Cons _ Nil)) = maybe True (\_ -> False) (primOp p)
 callsHelper p (Cons _ Nil) = maybe True (\_ -> False) (primUnary p)
 callsHelper p as = not (cellPrim p as)
 
--- Expressions
---------------------------------------------------------------------------------
-
--- | the emitter's judgments, knotted
-type JK =
-  { expr : Env -> Int -> I.Expr -> Code
-  , body : Env -> Int -> I.Expr -> String
-  , block : Env -> Int -> I.Expr -> String
-  , stmts : Env -> Int -> I.Expr -> List String
-  , last : Env -> Int -> I.Expr -> List String
-  }
-
 -- Conditions
 --------------------------------------------------------------------------------
 
--- A boolean in the position of a test -- what a match on `True`/`False`
--- looks at, and its arms where they are booleans again -- is compiled to
--- a sublanguage of its own (Danvy's boolean position, Chez's `Pred`): a
--- JavaScript condition, never a `True` or `False` built to be switched on.
-data Pred
-  = PTrue
-  | PFalse
-  | PRel String
-  | PNot Pred
-  | PIf Pred Pred Pred
-  -- | a binding, then the condition: `(x = a, p)`, `x` declared before
-  -- | the statement the condition is in (AB-normal: the binding is an
-  -- | assignment, so it can sit inside a condition)
-  | PSeq String String Pred
-
-isConstant : Pred -> Bool
-isConstant PTrue = True
-isConstant PFalse = True
-isConstant _ = False
-
--- | `if c then t else e`, what is known of it worked out: a test of a
--- | test whose arms are constants is the inner test's arms tested
--- | (case-of-case, copying only constants)
-condIf : Pred -> Pred -> Pred -> Pred
-condIf (PSeq x a c) t e = PSeq x a (condIf c t e)
-condIf PTrue t e = t
-condIf PFalse t e = e
-condIf (PNot c) t e = condIf c e t
-condIf (PIf a b c) t e =
-  if isConstant t && isConstant e then condIf a (condIf b t e) (condIf c t e)
-  else PIf (PIf a b c) t e
-condIf c PTrue PFalse = c
-condIf c PFalse PTrue = PNot c
-condIf c t e = PIf c t e
+-- A condition (heff.compile.imp's `Pred`) as JavaScript writes it: `&&`,
+-- `||`, `?:` and `!` of comparisons, a `Bool` looked at by its tag, and a
+-- binding inside it an assignment, `(x = a, p)`, `x` declared before the
+-- statement the condition is in.
+data JPred
+  = JTrue
+  | JFalse
+  | JRel String
+  | JNot JPred
+  | JIf JPred JPred JPred
+  | JSeq String String JPred
 
 -- | a condition's code and how tightly it binds: 0 a conditional, 1 `||`,
 -- | 2 `&&`, 3 a comparison, 4 `!` or an atom
-type Cond = { code : String, prec : Int }
+type CondCode = { code : String, prec : Int }
 
-condAtLeast : Int -> Cond -> String
+condAtLeast : Int -> CondCode -> String
 condAtLeast n c = if c.prec < n then "(" ^ c.code ^ ")" else c.code
 
-condCode : Pred -> Cond
-condCode PTrue = { code = "true", prec = 4 }
-condCode PFalse = { code = "false", prec = 4 }
-condCode (PRel s) = { code = s, prec = 3 }
-condCode (PSeq x a q) =
+condCode : JPred -> CondCode
+condCode JTrue = { code = "true", prec = 4 }
+condCode JFalse = { code = "false", prec = 4 }
+condCode (JRel s) = { code = s, prec = 3 }
+condCode (JSeq x a q) =
   { code = "(" ^ x ^ " = " ^ a ^ ", " ^ condAtLeast 1 (condCode q) ^ ")"
   , prec = 4
   }
-condCode (PNot q) = { code = "!" ^ condAtLeast 4 (condCode q), prec = 4 }
-condCode (PIf c t PFalse) =
+condCode (JNot q) = { code = "!" ^ condAtLeast 4 (condCode q), prec = 4 }
+condCode (JIf c t JFalse) =
   { code = condAtLeast 2 (condCode c) ^ " && " ^ condAtLeast 2 (condCode t)
   , prec = 2
   }
-condCode (PIf c PTrue e) =
+condCode (JIf c JTrue e) =
   { code = condAtLeast 1 (condCode c) ^ " || " ^ condAtLeast 1 (condCode e)
   , prec = 1
   }
-condCode (PIf c PFalse e) =
+condCode (JIf c JFalse e) =
   { code =
-      condAtLeast 2 (condCode (PNot c)) ^ " && " ^ condAtLeast 2 (condCode e)
+      condAtLeast 2 (condCode (JNot c)) ^ " && " ^ condAtLeast 2 (condCode e)
   , prec = 2
   }
-condCode (PIf c t PTrue) =
+condCode (JIf c t JTrue) =
   { code =
-      condAtLeast 1 (condCode (PNot c)) ^ " || " ^ condAtLeast 1 (condCode t)
+      condAtLeast 1 (condCode (JNot c)) ^ " || " ^ condAtLeast 1 (condCode t)
   , prec = 1
   }
-condCode (PIf c t e) =
+condCode (JIf c t e) =
   { code =
       condAtLeast 1 (condCode c)
       ^ " ? "
@@ -569,10 +524,10 @@ condCode (PIf c t e) =
 
 -- | the names a condition binds, to be declared before it (a name two
 -- | arms each bind is one variable: the scopes do not overlap)
-seqsOf : Pred -> List String
-seqsOf (PSeq x _ q) = Cons x (seqsOf q)
-seqsOf (PNot q) = seqsOf q
-seqsOf (PIf c t e) = List.append (seqsOf c) (List.append (seqsOf t) (seqsOf e))
+seqsOf : JPred -> List String
+seqsOf (JSeq x _ q) = Cons x (seqsOf q)
+seqsOf (JNot q) = seqsOf q
+seqsOf (JIf c t e) = List.append (seqsOf c) (List.append (seqsOf t) (seqsOf e))
 seqsOf p = Nil
 
 letDeclarations : Int -> List String -> List String
@@ -602,106 +557,42 @@ primRel "runeLt" = Just "<"
 primRel "runeLe" = Just "<="
 primRel p = maybe Nothing fixedRel (Fx.fixedPrimOf p)
 
-armNamed : String -> List I.Arm -> Maybe I.Expr
-armNamed t Nil = Nothing
-armNamed t (Cons (MkArm t2 vs b) rest) =
-  if strEq t2 t && List.null vs then Just b else armNamed t rest
+-- | a `Bool` from a condition
+boolCode : JPred -> Code
+boolCode JTrue = p3 "$T"
+boolCode JFalse = p3 "$F"
+boolCode c = { code = condAtLeast 1 (condCode c) ^ " ? $T : $F", prec = 0 }
 
--- | a match's arms, if it is a test: one for `True`, one for `False`
-boolArms : List I.Arm -> Maybe (Pair I.Expr I.Expr)
-boolArms arms =
-  if List.length arms == 2
-    then case armNamed "True" arms of
-      Just t -> case armNamed "False" arms of
-        Just f -> Just (MkPair t f)
-        Nothing -> Nothing
-      Nothing -> Nothing
-  else Nothing
+-- (a name made a variable that something after it may not take)
+using : Env -> String -> Env
+using env x =
+  { gs = env.gs
+  , names = env.names
+  , used = M.insert compareString x MkUnit env.used
+  , self = env.self
+  , inl = env.inl
+  }
 
--- | whether it is a boolean all the way down, as a condition
-condShaped : I.Expr -> Bool
-condShaped (ETag t Nil) = strEq t "True" || strEq t "False"
-condShaped (EPrimCall p (Cons _ (Cons _ Nil))) =
-  maybe False (\_ -> True) (primRel p)
-condShaped (EMatch s arms) = case boolArms arms of
-  Just (MkPair t f) -> condShaped t && condShaped f
-  Nothing -> False
-condShaped (ELet _ _ b) = condShaped b
-condShaped e = False
+usingAll : Env -> List String -> Env
+usingAll env xs = List.foldl using env xs
 
-predOfValue : JK -> Env -> Int -> I.Expr -> Pred
-predOfValue r env ind e =
-  PRel (atLeast 3 (r.expr env ind e) ^ ".$ === \"True\"")
+-- Values
+--------------------------------------------------------------------------------
 
-predOfPrim : JK -> Env -> Int -> I.Expr -> String -> List I.Expr -> Pred
-predOfPrim r env ind e p as = case primRel p of
-  Just op -> case as of
-    Cons a (Cons b Nil) ->
-      PRel
-        (atLeast 2 (r.expr env ind a)
-         ^ " "
-         ^ op
-         ^ " "
-         ^ atLeast 2 (r.expr env ind b))
-    _ -> predOfValue r env ind e
-  Nothing -> predOfValue r env ind e
+-- | statements' lines, and the names after them
+type Printed = { lines : List String, env : Env }
 
-predOfLet : (Env -> I.Expr -> Pred) -> String -> I.Expr -> BoundN -> Pred
-predOfLet go a b nb = PSeq nb.js a (go nb.env b)
-
--- | a boolean, as a condition
-predOf : JK -> Env -> Int -> I.Expr -> Pred
-predOf r env ind e@(ETag t Nil) =
-  if strEq t "True" then PTrue
-  else if strEq t "False" then PFalse
-  else predOfValue r env ind e
-predOf r env ind e@(EPrimCall p as) = predOfPrim r env ind e p as
-predOf r env ind e@(EMatch s arms) = case boolArms arms of
-  Just (MkPair t f) ->
-    condIf (predOf r env ind s) (predOf r env ind t) (predOf r env ind f)
-  Nothing -> predOfValue r env ind e
-predOf r env ind (ELet x a b) =
-  predOfLet
-    (\env2 q -> predOf r env2 ind q)
-    (r.expr env ind a).code
-    b
-    (bindName env x)
-predOf r env ind e = predOfValue r env ind e
-
--- | a condition in an expression: where it binds, there is no statement
--- | to declare the names before, so the match is a block of its own
-exprCond : JK -> Env -> Int -> I.Expr -> Pred -> (Cond -> Code) -> Code
-exprCond r env ind e c k =
-  if List.null (seqsOf c) then k (condCode c)
-  else p3 ("(() => " ^ r.block env ind e ^ ")()")
-
--- | a test in an expression: a boolean built from the condition, or
--- | the arms chosen by it
-exprTest : JK -> Env -> Int -> I.Expr -> I.Expr -> I.Expr -> I.Expr -> Code
-exprTest r env ind e s t f =
-  if condShaped t && condShaped f
-    then exprCond
-        r
-        env
-        ind
-        e
-        (predOf r env ind e)
-        (\c -> { code = condAtLeast 1 c ^ " ? $T : $F", prec = 0 })
-  else exprCond
-      r
-      env
-      ind
-      e
-      (predOf r env ind s)
-      (\c ->
-         { code =
-             condAtLeast 1 c
-             ^ " ? "
-             ^ atLeast 1 (r.expr env ind t)
-             ^ " : "
-             ^ atLeast 1 (r.expr env ind f)
-         , prec = 0
-         })
+-- | the printer's judgments, knotted: a value, a step not last, a
+-- | condition, a body (an expression or a block), what is last,
+-- | statements
+type JK =
+  { val : Env -> Int -> Mp.Val -> Code
+  , op : Env -> Int -> Mp.Comp -> Code
+  , cond : Env -> Int -> Mp.Cond -> JPred
+  , body : Env -> Int -> Mp.Tl -> String
+  , tail : Env -> Int -> Mp.Tl -> List String
+  , stmts : Env -> Int -> List Mp.St -> Maybe Mp.Tl -> Printed
+  }
 
 callName : Env -> String -> String
 callName env g = case M.lookup compareString g env.gs of
@@ -725,20 +616,70 @@ fixedCode : Fx.Fixed -> Int -> Code
 fixedCode w n =
   if Fx.fixedBits w == 64 then intCode (showInt n) else floatCode (showInt n)
 
-lamCode : JK -> Env -> Int -> I.Expr -> BoundNs -> Code
-lamCode r env ind b rb =
+lamCode : JK -> Int -> Mp.Tl -> BoundNs -> Code
+lamCode r ind t rb =
   { code =
       joinWith "" (List.map (\p -> "(" ^ p ^ ") => ") rb.js)
-      ^ r.body rb.env ind b
+      ^ r.body rb.env ind t
   , prec = 0
   }
 
-fieldCode : JK -> Env -> Int -> Pair String I.Expr -> String
-fieldCode r env ind (MkPair l e2) = propName l ^ ": " ^ (r.expr env ind e2).code
+fieldCode : JK -> Env -> Int -> Pair String Mp.Val -> String
+fieldCode r env ind (MkPair l v) = propName l ^ ": " ^ (r.val env ind v).code
 
--- (what is inside an expression is not last in the function)
-isUnitArgs : List I.Expr -> Bool
-isUnitArgs (Cons (ETag t Nil) Nil) = strEq t "MkUnit"
+-- (a primitive given all its arguments; heff.compile.trmc's written as
+-- JavaScript writes them)
+primVal : JK -> Env -> Int -> String -> List Mp.Val -> Code
+primVal r env ind "hole" Nil = p3 "undefined"
+primVal r env ind "setField" (Cons d (Cons (SInt k) (Cons v Nil))) =
+  { code =
+      atLeast 3 (r.val env ind d)
+      ^ ".a["
+      ^ showInt k
+      ^ "] = "
+      ^ codeOfC (r.val env ind v)
+  , prec = 0
+  }
+primVal r env ind p as = primCall p (List.map (r.val env ind) as)
+
+valGo : JK -> Env -> Int -> Mp.Val -> Code
+valGo r env ind (SVar x) = case M.lookup compareString x env.inl of
+  Just c -> c
+  Nothing -> p3 (fromMaybe (safe x) (M.lookup compareString x env.names))
+valGo r env ind (SGlobal g) = p3 (ref env.gs g)
+valGo r env ind (SInt i) = intCode (showInt i)
+valGo r env ind (SFloat x) = floatCode (showFloat x)
+valGo r env ind (SFixed w n) = fixedCode w n
+-- (a `Float32` is a number, rounded to one)
+valGo r env ind (SFloat32 x) = p3 ("Math.fround(" ^ showFloat x ^ ")")
+valGo r env ind (SStr s) = p3 (quoteString s)
+valGo r env ind (SPrimFn p) = p3 ("$" ^ p ^ "$c")
+valGo r env ind (SLam xs (MkBlock t)) =
+  lamCode r ind t (bindAll (noSelf env) xs)
+valGo r env ind (STag t Nil) =
+  if strEq t "True" then p3 "$T"
+  else if strEq t "False" then p3 "$F"
+  else p3 ("{ $: " ^ quoteString t ^ ", a: [] }")
+valGo r env ind (STag t as) =
+  p3
+    ("{ $: "
+     ^ quoteString t
+     ^ ", a: ["
+     ^ joinWith ", " (List.map (\a -> (r.val env ind a).code) as)
+     ^ "] }")
+valGo r env ind (SRec fs) =
+  p3 ("{ " ^ joinWith ", " (List.map (\f -> fieldCode r env ind f) fs) ^ " }")
+valGo r env ind (SProj v l _) = p3 (atLeast 3 (r.val env ind v) ^ projSuffix l)
+valGo r env ind (SPrim p as) = primVal r env ind p as
+
+-- Steps
+--------------------------------------------------------------------------------
+
+-- (a thunk forced: its value kept on it, so that forcing it again does
+-- not compute it again -- the language is pure, `f MkUnit` is the same
+-- value every time, and what abandons is not kept)
+isUnitArgs : List Mp.Val -> Bool
+isUnitArgs (Cons (STag t Nil) Nil) = strEq t "MkUnit"
 isUnitArgs _ = False
 
 bouncesG : Env -> String -> Bool
@@ -750,131 +691,92 @@ bouncesG env g = case M.lookup compareString g env.gs of
 trCode : String -> String
 trCode c = "$tr(" ^ c ^ ")"
 
--- | whether what it returns last may be a bounce
-mayBounce : Env -> I.Expr -> Bool
-mayBounce env e =
-  F.tailApp e || List.any (\g -> bouncesG env g) (F.tailGlobals e)
-
 trWhen : Bool -> String -> String
 trWhen b c = if b then trCode c else c
 
 -- | a known definition called, as it is (what it gives back may be a
 -- | bounce)
-callCode : JK -> Env -> Int -> String -> List I.Expr -> String
+callCode : JK -> Env -> Int -> String -> List Mp.Val -> String
 callCode r env ind g as =
   callName env g
   ^ "("
-  ^ joinWith ", " (List.map (\a -> (r.expr env ind a).code) as)
+  ^ joinWith ", " (List.map (\a -> (r.val env ind a).code) as)
   ^ ")"
 
-exprGo : JK -> Env -> Int -> I.Expr -> Code
-exprGo r env ind (EVar x) =
-  p3 (fromMaybe (safe x) (M.lookup compareString x env.names))
-exprGo r env ind (EGlobal g) = p3 (ref env.gs g)
-exprGo r env ind (ELam xs b) = lamCode r env ind b (bindAll env xs)
--- (a thunk forced: its value kept on it, so that forcing it again
--- does not compute it again -- the language is pure, `f MkUnit` is
--- the same value every time, and what abandons is not kept)
--- (a call not last: its value asked for, through any bounces)
-exprGo r env ind (EApp f as) =
-  if isUnitArgs as then p3 ("$force(" ^ (r.expr env ind f).code ^ ")")
-  else List.foldl
-      (\c a -> p3 (trCode (atLeast 3 c ^ "(" ^ (r.expr env ind a).code ^ ")")))
-      (r.expr env ind f)
-      as
-exprGo r env ind (ECall g as) =
+-- | a function applied to arguments one at a time, each call's value
+-- | asked for through its bounces
+applied : JK -> Env -> Int -> Code -> List Mp.Val -> Code
+applied r env ind c as =
+  List.foldl
+    (\c2 a -> p3 (trCode (atLeast 3 c2 ^ "(" ^ (r.val env ind a).code ^ ")")))
+    c
+    as
+
+-- | a step not last: its value, through any bounces
+opGo : JK -> Env -> Int -> Mp.Comp -> Code
+opGo r env ind (OSimple v) = r.val env ind v
+opGo r env ind (OCall g as) =
   if isUnitArgs as then p3 ("$force(" ^ callName env g ^ ")")
   else p3 (trWhen (bouncesG env g) (callCode r env ind g as))
-exprGo r env ind (EProj e2 l _) =
-  p3 (atLeast 3 (r.expr env ind e2) ^ projSuffix l)
-exprGo r env ind (ERecord fs) =
-  p3 ("{ " ^ joinWith ", " (List.map (\p -> fieldCode r env ind p) fs) ^ " }")
-exprGo r env ind (ETag t Nil) =
-  if strEq t "True" then p3 "$T"
-  else if strEq t "False" then p3 "$F"
-  else p3 ("{ $: " ^ quoteString t ^ ", a: [] }")
-exprGo r env ind (ETag t as) =
-  p3
-    ("{ $: "
-     ^ quoteString t
-     ^ ", a: ["
-     ^ joinWith ", " (List.map (\a -> (r.expr env ind a).code) as)
-     ^ "] }")
-exprGo r env ind (EInt i) = intCode (showInt i)
-exprGo r env ind (EFloat x) = floatCode (showFloat x)
-exprGo r env ind (EFixed w n) = fixedCode w n
--- (a `Float32` is a number, rounded to one)
-exprGo r env ind (EFloat32 x) = p3 ("Math.fround(" ^ showFloat x ^ ")")
-exprGo r env ind (EStr s) = p3 (quoteString s)
-exprGo r env ind EAbandon = p3 "$abandon()"
--- (lifted before: none is left)
-exprGo r env ind (EFix _ _) = p3 "$abandon()"
-exprGo r env ind (EPrim p) = p3 ("$" ^ p ^ "$c")
-exprGo r env ind (EPrimCall "hole" Nil) = p3 "undefined"
-exprGo r env ind (EPrimCall "setField" (Cons d (Cons (EInt k) (Cons v Nil)))) =
-  { code =
-      atLeast 3 (r.expr env ind d)
-      ^ ".a["
-      ^ showInt k
-      ^ "] = "
-      ^ codeOfC (r.expr env ind v)
-  , prec = 0
-  }
-exprGo r env ind (EPrimCall p as) =
-  primCall p (List.map (\a -> r.expr env ind a) as)
--- (a block, called at once: what it returns last may be a bounce)
-exprGo r env ind e@(ELet x a b) =
-  p3
-    (trWhen
-       (mayBounce env e)
-       ("(() => " ^ r.block env ind (ELet x a b) ^ ")()"))
-exprGo r env ind e@(EMatch s arms) = case boolArms arms of
-  Just (MkPair t f) -> exprTest r env ind e s t f
-  Nothing ->
-    p3
-      (trWhen
-         (mayBounce env e)
-         ("(() => " ^ r.block env ind (EMatch s arms) ^ ")()"))
+opGo r env ind (OApply f as) =
+  if isUnitArgs as then p3 ("$force(" ^ (r.val env ind f).code ^ ")")
+  else applied r env ind (r.val env ind f) as
+opGo r env ind (OPrim p as) = primCall p (List.map (r.val env ind) as)
+opGo r env ind OAbandon = p3 "$abandon()"
+opGo r env ind (OBool c) = boolCode (r.cond env ind c)
 
-exprF : JK -> Env -> Int -> I.Expr -> Code
-exprF r env0 ind e = exprGo r (noSelf env0) ind e
+seqAs : JK -> Env -> Int -> Mp.Comp -> Mp.Cond -> BoundN -> JPred
+seqAs r env ind o c nb = JSeq nb.js (r.op env ind o).code (r.cond nb.env ind c)
 
-bodyCode : String -> String
-bodyCode c = if strEq (strSlice c 0 1) "{" then "(" ^ c ^ ")" else c
+-- | the condition, the names it binds chosen
+condGo : JK -> Env -> Int -> Mp.Cond -> JPred
+condGo r env ind PTrue = JTrue
+condGo r env ind PFalse = JFalse
+condGo r env ind (PRel p a b) =
+  JRel
+    (atLeast 2 (r.val env ind a)
+     ^ " "
+     ^ fromMaybe "===" (primRel p)
+     ^ " "
+     ^ atLeast 2 (r.val env ind b))
+condGo r env ind (PBool v) =
+  JRel (atLeast 3 (r.val env ind v) ^ ".$ === \"True\"")
+condGo r env ind (PNot c) = JNot (r.cond env ind c)
+condGo r env ind (PIf a b c) =
+  JIf (r.cond env ind a) (r.cond env ind b) (r.cond env ind c)
+condGo r env ind (PLet x o c) = seqAs r env ind o c (bindName env x)
 
--- | a function's body: an expression, or a block if it binds or matches
-bodyF : JK -> Env -> Int -> I.Expr -> String
-bodyF r env ind (ELet x a b) = r.block env ind (ELet x a b)
-bodyF r env ind (EMatch s arms) = r.block env ind (EMatch s arms)
-bodyF r env ind (EApp f as) = r.block env ind (EApp f as)
--- (a call last that may give back a bounce gives it back: asked for
--- here, through `$tr`, each round's stack would stay)
-bodyF r env ind e@(ECall g as) =
-  if bouncesG env g then r.block env ind (ECall g as)
-  else bodyCode ((r.expr env ind e).code)
-bodyF r env ind e = bodyCode ((r.expr env ind e).code)
+-- (a step and the names its condition binds, declared before it)
+type Stepped = { code : Code, decls : List String }
 
-blockF : JK -> Env -> Int -> I.Expr -> String
-blockF r env ind e =
-  "{\n" ^ joinWith "\n" (r.stmts env (ind + 1) e) ^ "\n" ^ indent ind ^ "}"
+boolStep : JPred -> Stepped
+boolStep jc = { code = boolCode jc, decls = seqsOf jc }
 
+stepOf : JK -> Env -> Int -> Mp.Comp -> Stepped
+stepOf r env ind (OBool c) = boolStep (r.cond env ind c)
+stepOf r env ind o = { code = r.op env ind o, decls = Nil }
+
+-- Statements
+--------------------------------------------------------------------------------
+
+-- | what a match looks at: a name, or a value bound to one first
 type Scrut = { js : String, env : Env, pre : List String }
 
-scrutBound : JK -> Env -> Int -> I.Expr -> BoundN -> Scrut
-scrutBound r env ind s b =
+scrutBound : JK -> Env -> Int -> Mp.Val -> BoundN -> Scrut
+scrutBound r env ind v b =
   { js = b.js
   , env = b.env
   , pre =
       Cons
-        (indent ind ^ "const " ^ b.js ^ " = " ^ (r.expr env ind s).code ^ ";")
+        (indent ind ^ "const " ^ b.js ^ " = " ^ (r.val env ind v).code ^ ";")
         Nil
   }
 
-scrutOf : JK -> Env -> Int -> I.Expr -> Scrut
-scrutOf r env ind (EVar x) = case M.lookup compareString x env.names of
+scrutOf : JK -> Env -> Int -> Mp.Val -> Scrut
+scrutOf r env ind (SVar x) = case M.lookup compareString x env.names of
   Just js -> { js = js, env = env, pre = Nil }
-  Nothing -> scrutBound r env ind (EVar x) (bindName env "s")
-scrutOf r env ind s = scrutBound r env ind s (bindName env "s")
+  Nothing -> scrutBound r env ind (SVar x) (bindName env "s")
+scrutOf r env ind v = scrutBound r env ind v (bindName env "s")
 
 declsOf : String -> Int -> List String -> Int -> List String
 declsOf js ind Nil i = Nil
@@ -882,20 +784,6 @@ declsOf js ind (Cons v rest) i =
   Cons
     (indent ind ^ "const " ^ v ^ " = " ^ js ^ ".a[" ^ showInt i ^ "];")
     (declsOf js ind rest (i + 1))
-
-armBound : JK -> Scrut -> Int -> String -> I.Expr -> BoundNs -> List String
-armBound r sc ind tag bdy rb =
-  List.append
-    (Cons (indent (ind + 1) ^ "case " ^ quoteString tag ^ ": {") Nil)
-    (List.append
-       (declsOf sc.js (ind + 2) rb.js 0)
-       (List.append
-          (r.stmts rb.env (ind + 2) bdy)
-          (Cons (indent (ind + 1) ^ "}") Nil)))
-
-armLines : JK -> Scrut -> Int -> I.Arm -> List String
-armLines r sc ind (MkArm tag vs bdy) =
-  armBound r sc ind tag bdy (bindAll sc.env vs)
 
 -- | an arm, laid out: its tag, whether it uses none of the fields it
 -- | binds, and its lines -- the body alone if so (arms whose bodies are
@@ -911,11 +799,37 @@ armJsKey : ArmJs -> Maybe String
 armJsKey (MkArmJs _ True ls) = Just (joinWith "\n" ls)
 armJsKey (MkArmJs _ False _) = Nothing
 
-armJs : JK -> Scrut -> Int -> I.Arm -> ArmJs
-armJs r sc ind (MkArm tag vs bdy) =
-  if List.all (\v -> (I.occurrences v bdy).count == 0) vs
-    then MkArmJs tag True (r.stmts sc.env (ind + 2) bdy)
-  else MkArmJs tag False (armLines r sc ind (MkArm tag vs bdy))
+armBound : Scrut
+         -> Int
+         -> String
+         -> (Env -> Int -> List String)
+         -> BoundNs
+         -> ArmJs
+armBound sc ind tag lines rb =
+  MkArmJs
+    tag
+    False
+    (List.append
+       (Cons (indent (ind + 1) ^ "case " ^ quoteString tag ^ ": {") Nil)
+       (List.append
+          (declsOf sc.js (ind + 2) rb.js 0)
+          (List.append
+             (lines rb.env (ind + 2))
+             (Cons (indent (ind + 1) ^ "}") Nil))))
+
+-- | an arm, its body's lines made by `lines` (an environment, an
+-- | indentation) and its parts (whether it names its fields)
+armJs : Scrut
+      -> Int
+      -> String
+      -> List String
+      -> List Mp.Part
+      -> (Env -> Int -> List String)
+      -> ArmJs
+armJs sc ind tag vs parts lines =
+  if List.all (\v -> not (Mp.namedIn v parts)) vs
+    then MkArmJs tag True (lines sc.env (ind + 2))
+  else armBound sc ind tag lines (bindAll sc.env vs)
 
 sameKey : Maybe String -> ArmJs -> Bool
 sameKey (Just k) a = case armJsKey a of
@@ -943,80 +857,179 @@ sharedGo ind before (Cons a@(MkArmJs tag True ls) rest) =
                (Cons (indent (ind + 1) ^ "}") Nil)
                (sharedGo ind (Cons a before) rest))))
 
-stmtsMatch2 : JK -> Int -> List I.Arm -> Scrut -> List String
-stmtsMatch2 r ind arms sc =
-  if List.null arms
-    then List.append
-        sc.pre
-        (Cons (indent ind ^ "return $nomatch(" ^ sc.js ^ ");") Nil)
-  else List.append
-      sc.pre
-      (List.append
-         (Cons (indent ind ^ "switch (" ^ sc.js ^ ".$) {") Nil)
-         (List.append
-            (sharedGo ind Nil (List.map (\a -> armJs r sc ind a) arms))
-            (Cons
-               (indent ind ^ "}")
-               (Cons (indent ind ^ "return $nomatch(" ^ sc.js ^ ");") Nil))))
+-- | a match: `switch` on the tag, the arms, then `inside` (a default)
+-- | and `after` (what follows if no arm is taken)
+switchLines : Scrut
+            -> Int
+            -> List ArmJs
+            -> List String
+            -> List String
+            -> List String
+switchLines sc ind arms inside after =
+  List.append
+    sc.pre
+    (List.append
+       (Cons (indent ind ^ "switch (" ^ sc.js ^ ".$) {") Nil)
+       (List.append
+          (sharedGo ind Nil arms)
+          (List.append inside (Cons (indent ind ^ "}") after))))
 
-stmtsLet2 : JK -> Int -> I.Expr -> Code -> BoundN -> List String
-stmtsLet2 r ind b ac nb =
-  Cons
-    (indent ind ^ "const " ^ nb.js ^ " = " ^ ac.code ^ ";")
-    (r.stmts nb.env ind b)
-
--- | a test, as a statement: the arm the condition chooses
-stmtsIf : JK -> Env -> Int -> Pred -> I.Expr -> I.Expr -> List String
-stmtsIf r env ind PTrue t f = r.stmts env ind t
-stmtsIf r env ind PFalse t f = r.stmts env ind f
-stmtsIf r env ind c t f =
+-- (an `if`, each arm's lines made by `lines`, a constant condition the
+-- one arm alone)
+ifLines : Int
+        -> JPred
+        -> (Int -> List String)
+        -> (Int -> List String)
+        -> List String
+ifLines ind JTrue t f = t ind
+ifLines ind JFalse t f = f ind
+ifLines ind c t f =
   List.append
     (letDeclarations ind (seqsOf c))
     (List.append
        (Cons (indent ind ^ "if (" ^ (condCode c).code ^ ") {") Nil)
        (List.append
-          (r.stmts env (ind + 1) t)
+          (t (ind + 1))
           (Cons
              (indent ind ^ "} else {")
-             (List.append
-                (r.stmts env (ind + 1) f)
-                (Cons (indent ind ^ "}") Nil)))))
+             (List.append (f (ind + 1)) (Cons (indent ind ^ "}") Nil)))))
 
--- | a boolean returned: the condition, as a value
-stmtsReturnCond : Int -> Pred -> List String
-stmtsReturnCond ind PTrue = Cons (indent ind ^ "return $T;") Nil
-stmtsReturnCond ind PFalse = Cons (indent ind ^ "return $F;") Nil
-stmtsReturnCond ind c =
-  List.append
-    (letDeclarations ind (seqsOf c))
-    (Cons
-       (indent ind ^ "return " ^ condAtLeast 1 (condCode c) ^ " ? $T : $F;")
-       Nil)
+letBound : Int -> Stepped -> BoundN -> Printed
+letBound ind st nb =
+  { lines =
+      List.append
+        (letDeclarations ind st.decls)
+        (Cons (indent ind ^ "const " ^ nb.js ^ " = " ^ st.code.code ^ ";") Nil)
+  , env = nb.env
+  }
 
-stmtsF : JK -> Env -> Int -> I.Expr -> List String
-stmtsF r env ind (ELet x a b) =
-  stmtsLet2 r ind b (r.expr env ind a) (bindName env x)
-stmtsF r env ind e@(EMatch s arms) = case boolArms arms of
-  Just (MkPair t f) ->
-    if maybe True (\_ -> False) env.self && condShaped t && condShaped f
-      then stmtsReturnCond ind (predOf r env ind e)
-    else stmtsIf r env ind (predOf r env ind s) t f
-  Nothing -> stmtsMatch2 r ind arms (scrutOf r env ind s)
-stmtsF r env ind e = r.last env ind e
+letStmt : Int -> Stepped -> String -> Env -> Printed
+letStmt ind st x env = letBound ind st (bindName (usingAll env st.decls) x)
+
+declStmt : Int -> BoundN -> Printed
+declStmt ind nb =
+  { lines = Cons (indent ind ^ "let " ^ nb.js ^ ";") Nil, env = nb.env }
+
+setStmt : Int -> Stepped -> String -> Env -> Printed
+setStmt ind st x env =
+  { lines =
+      List.append
+        (letDeclarations ind st.decls)
+        (Cons
+           (indent ind
+            ^ fromMaybe (safe x) (M.lookup compareString x env.names)
+            ^ " = "
+            ^ st.code.code
+            ^ ";")
+           Nil)
+  , env = usingAll env st.decls
+  }
+
+-- (a match as a statement: each arm's statements, then on; no arm taken,
+-- the program fails)
+caseStmt : JK -> Int -> List (Mp.Arm (List Mp.St)) -> Scrut -> Printed
+caseStmt r ind arms sc =
+  { lines =
+      switchLines
+        sc
+        ind
+        (List.map
+           (\arm -> case arm of
+            MkArm tag vs ss ->
+              armJs
+                sc
+                ind
+                tag
+                vs
+                (Mp.stmtsParts ss)
+                (\e i ->
+                   List.append
+                     (r.stmts e i ss Nothing).lines
+                     (Cons (indent i ^ "break;") Nil)))
+           arms)
+        (Cons (indent (ind + 1) ^ "default: $nomatch(" ^ sc.js ^ ");") Nil)
+        Nil
+  , env = sc.env
+  }
+
+-- | a statement's lines, and the names after it
+stmtGo : JK -> Env -> Int -> Mp.St -> Printed
+stmtGo r env ind (SLet x o) = letStmt ind (stepOf r env ind o) x env
+stmtGo r env ind (SDecl x) = declStmt ind (bindName env x)
+stmtGo r env ind (SSet x o) = setStmt ind (stepOf r env ind o) x env
+stmtGo r env ind (SIf c ts fs) =
+  { lines =
+      ifLines
+        ind
+        (r.cond env ind c)
+        (\i -> (r.stmts env i ts Nothing).lines)
+        (\i -> (r.stmts env i fs Nothing).lines)
+  , env = usingAll env (seqsOf (r.cond env ind c))
+  }
+stmtGo r env ind (SCase v arms) = caseStmt r ind arms (scrutOf r env ind v)
+
+stmtsAfter : Printed -> Printed -> Printed
+stmtsAfter a b = { lines = List.append a.lines b.lines, env = b.env }
+
+stmtsThen : JK -> Int -> List Mp.St -> Maybe Mp.Tl -> Printed -> Printed
+stmtsThen r ind rest after p = stmtsAfter p (r.stmts p.env ind rest after)
+
+-- (a name whose one use, in what follows it, computes it instead: in
+-- JavaScript, a value a `const` holds is held to the end of its block --
+-- in a loop, a round -- however soon it is used, so a long list one step
+-- makes and the next takes apart would be held while the steps after go
+-- on, where a call made in place lets it go once it is taken apart)
+inlined : Env -> String -> Code -> Env
+inlined env x c =
+  { gs = env.gs
+  , names = env.names
+  , used = env.used
+  , self = env.self
+  , inl = M.insert compareString x c env.inl
+  }
+
+-- (whether a binding computes its one use instead: not a condition's
+-- `Bool`, whose names are declared before)
+inlinable : String -> Mp.Comp -> List Mp.St -> Maybe Mp.Tl -> Bool
+inlinable x (OBool _) rest after = False
+inlinable x o rest after =
+  Mp.usedOnceNext
+    x
+    (case rest of
+     Cons st _ -> Mp.firstNames st
+     Nil -> case after of
+       Just t -> Mp.firstNamesTl t
+       Nothing -> Nil)
+    (List.append (Mp.stmtsParts rest) (case after of
+     Just t -> Mp.tailParts t
+     Nothing -> Nil))
+
+stmtsGo : JK -> Env -> Int -> List Mp.St -> Maybe Mp.Tl -> Printed
+stmtsGo r env ind Nil after = { lines = Nil, env = env }
+stmtsGo r env ind (Cons (SLet x o) rest) after =
+  if inlinable x o rest after
+    then r.stmts (inlined env x (r.op env ind o)) ind rest after
+  else stmtsThen r ind rest after (stmtGo r env ind (SLet x o))
+stmtsGo r env ind (Cons st rest) after =
+  stmtsThen r ind rest after (stmtGo r env ind st)
+
+-- What is last
+--------------------------------------------------------------------------------
 
 -- (the arguments are of this round's `const`s: assigned one by one)
-again : JK -> Env -> Self -> Int -> List I.Expr -> List String
-again r env s ind as =
+again : JK -> Env -> Int -> List Mp.Val -> List String
+again r env@{ self = Just s } ind as =
   Cons
     (indent ind
      ^ joinWith
        " "
        (List.zipWith
-          (\p a -> p ^ " = " ^ (r.expr env ind a).code ^ ";")
+          (\p a -> p ^ " = " ^ (r.val env ind a).code ^ ";")
           s.params
           as)
      ^ " continue;")
     Nil
+again r env ind as = Cons (indent ind ^ "return $abandon();") Nil
 
 -- | the most calls of unknown functions made last, one inside the
 -- | other, before the stack is let go of
@@ -1074,47 +1087,94 @@ bounceNamed ind ac f = bounceGive ind f (named f.env ind "a" ac)
 bounceLines : Env -> Int -> Code -> Code -> List String
 bounceLines env ind fc ac = bounceNamed ind ac (named env ind "f" fc)
 
+-- | a `Bool` returned: the condition, as a value
+returnCond : Int -> JPred -> List String
+returnCond ind JTrue = Cons (indent ind ^ "return $T;") Nil
+returnCond ind JFalse = Cons (indent ind ^ "return $F;") Nil
+returnCond ind c =
+  List.append
+    (letDeclarations ind (seqsOf c))
+    (Cons
+       (indent ind ^ "return " ^ condAtLeast 1 (condCode c) ^ " ? $T : $F;")
+       Nil)
+
 -- | a value returned: an unknown function's, called last, counted (and,
--- | every so often, a bounce instead)
-returnLines : JK -> Env -> Int -> I.Expr -> List String
-returnLines r env ind e@(EApp f as) =
-  if isUnitArgs as then bounceLines env ind (p3 "$force") (r.expr env ind f)
+-- | every so often, a bounce instead); a known definition's, called
+-- | last, not counted, its bounce handed on
+returnLines : JK -> Env -> Int -> Mp.Comp -> List String
+returnLines r env ind (OApply f as) =
+  if isUnitArgs as then bounceLines env ind (p3 "$force") (r.val env ind f)
   else case unsnocE as of
     Just (MkPair ini a) ->
       bounceLines
         env
         ind
-        (if List.null ini then r.expr env ind f
-         else r.expr env ind (EApp f ini))
-        (r.expr env ind a)
-    Nothing -> Cons (indent ind ^ "return " ^ (r.expr env ind e).code ^ ";") Nil
--- (a known definition called last: not counted, its bounce handed on)
-returnLines r env ind e@(ECall g as) =
+        (applied r env ind (r.val env ind f) ini)
+        (r.val env ind a)
+    Nothing -> Cons (indent ind ^ "return " ^ (r.val env ind f).code ^ ";") Nil
+returnLines r env ind o@(OCall g as) =
   if isUnitArgs as
-    then Cons (indent ind ^ "return " ^ (r.expr env ind e).code ^ ";") Nil
+    then Cons (indent ind ^ "return " ^ (r.op env ind o).code ^ ";") Nil
   else Cons (indent ind ^ "return " ^ callCode r env ind g as ^ ";") Nil
-returnLines r env ind e =
-  Cons (indent ind ^ "return " ^ (r.expr env ind e).code ^ ";") Nil
+returnLines r env ind (OBool c) = returnCond ind (r.cond env ind c)
+returnLines r env ind o =
+  Cons (indent ind ^ "return " ^ (r.op env ind o).code ^ ";") Nil
 
-lastSelf : JK -> Env -> Self -> Int -> I.Expr -> List String
-lastSelf r env s ind (ECall k as) =
-  if strEq k s.key && List.length as == List.length s.params
-    then again r env s ind as
-  else returnLines r env ind (ECall k as)
-lastSelf r env s ind e = returnLines r env ind e
+tailAfter : JK -> Int -> Mp.Tl -> Printed -> List String
+tailAfter r ind t p = List.append p.lines (r.tail p.env ind t)
 
--- | what is last in a function: returned, or, in a loop, the next round
-lastF : JK -> Env -> Int -> I.Expr -> List String
-lastF r env@{ self = Just s } ind e = lastSelf r env s ind e
-lastF r env@{ self = Nothing } ind e = returnLines r env ind e
+caseTail : JK -> Int -> List (Mp.Arm Mp.Tl) -> Scrut -> List String
+caseTail r ind arms sc =
+  switchLines
+    sc
+    ind
+    (List.map
+       (\arm -> case arm of
+        MkArm tag vs t ->
+          armJs sc ind tag vs (Mp.tailParts t) (\e i -> r.tail e i t))
+       arms)
+    Nil
+    (Cons (indent ind ^ "return $nomatch(" ^ sc.js ^ ");") Nil)
+
+-- | what is last: returned, or, in a loop, the next round
+tailGo : JK -> Env -> Int -> Mp.Tl -> List String
+tailGo r env ind (TSeq ss t) = tailAfter r ind t (r.stmts env ind ss (Just t))
+tailGo r env ind (TReturn o) = returnLines r env ind o
+tailGo r env ind (TLoop as) = again r env ind as
+tailGo r env ind (TIf c t f) =
+  ifLines ind (r.cond env ind c) (\i -> r.tail env i t) (\i -> r.tail env i f)
+tailGo r env ind (TCase v arms) = caseTail r ind arms (scrutOf r env ind v)
+
+bodyCode : String -> String
+bodyCode c = if strEq (strSlice c 0 1) "{" then "(" ^ c ^ ")" else c
+
+-- (a step returned that is an expression's worth: not an unknown
+-- function's call, counted, nor a known one's that may bounce, nor a
+-- condition's `Bool`)
+exprBody : Env -> Mp.Comp -> Bool
+exprBody env (OApply _ _) = False
+exprBody env (OCall g _) = not (bouncesG env g)
+exprBody env (OBool _) = False
+exprBody env o = True
+
+blockOf : JK -> Env -> Int -> Mp.Tl -> String
+blockOf r env ind t =
+  "{\n" ^ joinWith "\n" (r.tail env (ind + 1) t) ^ "\n" ^ indent ind ^ "}"
+
+-- | a function's body: an expression, or a block if it does more
+bodyGo : JK -> Env -> Int -> Mp.Tl -> String
+bodyGo r env ind t@(TReturn o) =
+  if exprBody env o then bodyCode (r.op env ind o).code else blockOf r env ind t
+bodyGo r env ind t = blockOf r env ind t
 
 jk : JK
 jk =
-  { expr = \env ind e -> exprF jk env ind e
-  , body = \env ind e -> bodyF jk env ind e
-  , block = \env ind e -> blockF jk env ind e
-  , stmts = \env ind e -> stmtsF jk env ind e
-  , last = \env ind e -> lastF jk env ind e
+  { val = \env ind v -> valGo jk env ind v
+  , op = \env ind o -> opGo jk env ind o
+  , cond = \env ind c -> condGo jk env ind c
+  , body = \env ind t -> bodyGo jk env ind t
+  , tail = \env ind t -> tailGo jk env ind t
+  , stmts = \env ind ss after -> stmtsGo jk env ind ss after
   }
 
 -- Definitions
@@ -1122,7 +1182,12 @@ jk =
 
 env0Of : M.Map String GInfo -> M.Map String Unit -> Env
 env0Of gs globalNames =
-  { gs = gs, names = M.empty, used = globalNames, self = Nothing }
+  { gs = gs
+  , names = M.empty
+  , used = globalNames
+  , self = Nothing
+  , inl = M.empty
+  }
 
 -- where a function of several parameters is used as a value, it needs
 -- its curried form
@@ -1141,10 +1206,22 @@ wrapper curried key i js =
         Nil
   else Nil
 
--- (a call of itself last: a loop; its parameters `x$`, each round's own
--- `const`, which what it closes over keeps)
-looped : String -> GInfo -> I.Expr -> BoundNs -> List String
-looped key i b r =
+-- | whether it goes round again somewhere (heff.compile.imp's `TLoop`)
+loops : Mp.Tl -> Bool
+loops (TSeq _ t) = loops t
+loops (TLoop _) = True
+loops (TIf _ t e) = loops t || loops e
+loops (TCase _ arms) =
+  List.any
+    (\arm -> case arm of
+     MkArm _ _ t -> loops t)
+    arms
+loops t = False
+
+-- (a loop; its parameters `x$`, each round's own `const`, which what it
+-- closes over keeps)
+looped : String -> GInfo -> Mp.Tl -> BoundNs -> List String
+looped key i t r =
   List.append
     [ ""
     , "const "
@@ -1165,68 +1242,65 @@ looped key i b r =
        ^ ";"
        ]
        (List.append
-          (jk.stmts
+          (jk.tail
              (withSelf
                 (Just { key = key, params = List.map (\x -> x ^ "$") r.js })
                 r.env)
              2
-             b)
+             t)
           (Cons "  }" (Cons "};" Nil))))
 
-defFun : M.Map String Unit
-       -> String
-       -> GInfo
-       -> List String
-       -> I.Expr
-       -> BoundNs
-       -> List String
-defFun curried key i xs b r =
+defFun : M.Map String Unit -> String -> GInfo -> Mp.Tl -> BoundNs -> List String
+defFun curried key i t r =
   List.append
-    (if tailSelf key (List.length xs) b then looped key i b r
+    (if loops t then looped key i t r
      else [ ""
           , "const "
           ^ i.js
           ^ " = ("
           ^ joinWith ", " r.js
           ^ ") => "
-          ^ jk.body r.env 0 b
+          ^ jk.body r.env 0 t
           ^ ";"
           ])
     (wrapper curried key i r.js)
 
-defBody : M.Map String GInfo
-        -> M.Map String Unit
-        -> M.Map String Unit
-        -> I.Def
-        -> GInfo
-        -> List String
-defBody gs curried globalNames d@{ body = ELam xs b } i =
-  defFun curried d.key i xs b (bindAll (env0Of gs globalNames) xs)
-defBody gs curried globalNames d i =
+-- (a value computed at once: an expression; else in a block, called)
+eagerCode : Env -> Mp.Tl -> String
+eagerCode env (TReturn o) = (jk.op env 0 o).code
+eagerCode env t = "(() => " ^ blockOf jk env 0 t ^ ")()"
+
+defBodyOf : M.Map String GInfo
+          -> M.Map String Unit
+          -> M.Map String Unit
+          -> String
+          -> Mp.Body
+          -> GInfo
+          -> List String
+defBodyOf gs curried globalNames key (DefFun xs (MkBlock t)) i =
+  defFun curried key i t (bindAll (env0Of gs globalNames) xs)
+defBodyOf gs curried globalNames key (DefVal (MkBlock t)) i =
   if i.lazy
     then [ ""
          , "const "
          ^ i.js
          ^ " = $lazy(() => "
-         ^ jk.body (env0Of gs globalNames) 0 d.body
+         ^ jk.body (env0Of gs globalNames) 0 t
          ^ ");"
          ]
-  else [ ""
-       , "const "
-       ^ i.js
-       ^ " = "
-       ^ (jk.expr (env0Of gs globalNames) 0 d.body).code
-       ^ ";"
-       ]
+  else ["", "const " ^ i.js ^ " = " ^ eagerCode (env0Of gs globalNames) t ^ ";"]
 
 defLines : M.Map String GInfo
          -> M.Map String Unit
          -> M.Map String Unit
-         -> I.Def
+         -> Mp.Def
          -> List String
-defLines gs curried globalNames d = case M.lookup compareString d.key gs of
+defLines gs curried globalNames d = case M.lookup
+    compareString
+    (Mp.defKey d)
+    gs of
   Nothing -> Nil
-  Just i -> defBody gs curried globalNames d i
+  Just i -> defBodyOf gs curried globalNames (Mp.defKey d) (Mp.defBody d) i
 
 -- Programs
 --------------------------------------------------------------------------------
@@ -1331,26 +1405,19 @@ uncurryGo ps s =
 uncurryJs : String -> Uncurried
 uncurryJs js = uncurryGo Nil js
 
+primCalled : M.Map String Unit -> String -> List Mp.Val -> M.Map String Unit
+primCalled m p as =
+  if callsHelper p as then M.insert compareString ("$" ^ p ^ "(") MkUnit m
+  else m
+
 -- | the primitives the code uses, as it writes them: `$p(` (given all
 -- | its arguments) and `$p$c` (curried)
-primUses : M.Map String Unit -> I.Expr -> M.Map String Unit
-primUses m (ELam _ b) = primUses m b
-primUses m (EApp f as) = List.foldl primUses (primUses m f) as
-primUses m (ELet _ e1 b) = primUses (primUses m e1) b
-primUses m (ERecord fs) = List.foldl (\m2 f -> primUses m2 (snd f)) m fs
-primUses m (EProj e2 _ _) = primUses m e2
-primUses m (ETag _ as) = List.foldl primUses m as
-primUses m (EMatch s arms) =
-  List.foldl (\m2 a -> primUses m2 (I.armBody a)) (primUses m s) arms
-primUses m (EPrim p) = M.insert compareString ("$" ^ p ^ "$c") MkUnit m
-primUses m (EPrimCall p as) =
-  List.foldl
-    primUses
-    (if callsHelper p as then M.insert compareString ("$" ^ p ^ "(") MkUnit m
-     else m)
-    as
-primUses m (ECall _ as) = List.foldl primUses m as
-primUses m e = m
+primUses : M.Map String Unit -> Mp.Part -> M.Map String Unit
+primUses m (PartVal (SPrimFn p)) =
+  M.insert compareString ("$" ^ p ^ "$c") MkUnit m
+primUses m (PartVal (SPrim p as)) = primCalled m p as
+primUses m (PartOp (OPrim p as)) = primCalled m p as
+primUses m part = m
 
 primHelperU : M.Map String Unit -> String -> Uncurried -> List String
 primHelperU uses p u =
@@ -1389,14 +1456,15 @@ primHelpersOf : M.Map String Unit -> List String
 primHelpersOf uses = List.concatMap (\p -> primHelperOne uses p) Pr.allPrims
 
 -- | the helpers of the primitives the definitions use
-primHelpers : List I.Def -> List String
+primHelpers : List Mp.Def -> List String
 primHelpers defs =
-  primHelpersOf (List.foldl (\m (d : I.Def) -> primUses m d.body) M.empty defs)
+  primHelpersOf
+    (List.foldl (\m d -> List.foldl primUses m (Mp.partsOf d)) M.empty defs)
 
 type Emitted = { lines : List String, globals : M.Map String GInfo }
 
-shortsOf : List I.Def -> List String
-shortsOf defs = List.map (\(d : I.Def) -> safe (shortName d.key)) defs
+shortsOf : List Mp.Def -> List String
+shortsOf defs = List.map (\d -> safe (shortName (Mp.defKey d))) defs
 
 -- names: the short one, unless two definitions share it
 jsPick : List String -> String -> String -> String
@@ -1409,16 +1477,16 @@ jsNameOf shorts key = jsPick shorts key (safe (shortName key))
 infoOne : List String
         -> F.Facts
         -> M.Map String GInfo
-        -> I.Def
+        -> String
         -> M.Map String GInfo
-infoOne shorts facts acc d =
+infoOne shorts facts acc key =
   M.insert
     compareString
-    d.key
-    { js = jsNameOf shorts d.key
-    , arity = fromMaybe 0 (M.lookup compareString d.key facts.arity)
-    , lazy = M.member compareString d.key facts.lazy
-    , bounce = M.member compareString d.key facts.bounce
+    key
+    { js = jsNameOf shorts key
+    , arity = fromMaybe 0 (M.lookup compareString key facts.arity)
+    , lazy = M.member compareString key facts.lazy
+    , bounce = M.member compareString key facts.bounce
     }
     acc
 
@@ -1435,10 +1503,10 @@ emitLines info code helpers =
   }
 
 -- (a primitive's helper may use the runtime too: `$abandon`, `$T`)
-emitDone : List I.Def -> M.Map String GInfo -> List String -> Emitted
+emitDone : List Mp.Def -> M.Map String GInfo -> List String -> Emitted
 emitDone defs info code = emitLines info code (primHelpers defs)
 
-emitCode : List I.Def
+emitCode : List Mp.Def
          -> M.Map String GInfo
          -> M.Map String Unit
          -> M.Map String Unit
@@ -1449,24 +1517,21 @@ emitCode defs info curried globalNames =
     info
     (List.concatMap (\d -> defLines info curried globalNames d) defs)
 
-infoAll : List String -> F.Facts -> List I.Def -> M.Map String GInfo
+infoAll : List String -> F.Facts -> List Mp.Def -> M.Map String GInfo
 infoAll shorts facts defs =
-  List.foldl (\acc d -> infoOne shorts facts acc d) M.empty defs
+  List.foldl (\acc d -> infoOne shorts facts acc (Mp.defKey d)) M.empty defs
 
-emitWithShorts : F.Facts -> List I.Def -> List String -> List String -> Emitted
+emitWithShorts : F.Facts -> List Mp.Def -> List String -> List String -> Emitted
 emitWithShorts facts defs roots shorts =
   emitCode
     defs
     (infoAll shorts facts defs)
-    (setFrom
-       (List.append
-          (List.concatMap (\(d : I.Def) -> valueRefs d.body) defs)
-          roots))
-    (setFrom (List.map (\(d : I.Def) -> jsNameOf shorts d.key) defs))
+    (setFrom (List.append (List.concatMap valueRefs defs) roots))
+    (setFrom (List.map (\d -> jsNameOf shorts (Mp.defKey d)) defs))
 
--- | >>> (emitDefs (F.factsOf [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))] ["f"]).lines
+-- | >>> (emitDefs (F.factsOf [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) (Mp.impProgram 0 [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]).defs ["f"]).lines
 -- | ["", "const f = (x) => x;"]
-emitDefs : F.Facts -> List I.Def -> List String -> Emitted
+emitDefs : F.Facts -> List Mp.Def -> List String -> Emitted
 emitDefs facts defs roots = emitWithShorts facts defs roots (shortsOf defs)
 
 -- Runtime
@@ -1763,7 +1828,7 @@ compileLowered : String
                -> List Provider
                -> Ef.Effect
                -> String
-               -> L.Lowered
+               -> L.LoweredImp
                -> Output
 compileLowered host provs eff key l =
   { source =
@@ -1814,7 +1879,7 @@ jsSource exports m =
                       exports))
                 (Cons "};" (Cons "" Nil))))))
 
-compileExports : List Export -> L.Lowered -> Output
+compileExports : List Export -> L.LoweredImp -> Output
 compileExports exports l =
   { source =
       jsSource

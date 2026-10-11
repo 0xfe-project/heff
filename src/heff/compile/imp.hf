@@ -1,0 +1,803 @@
+-- The imperative form both backends print (#40): Bowman's AB-normal form
+-- ("A Low-Level Look at A-Normal Form", OOPSLA 2024, figures 10 and 20).
+-- What is lowered (heff.compile.lower) is in monadic form, a binding of
+-- a match kept one; here it is made statements and a tail:
+--
+--   let x = case s of A -> a; B -> b in c   ~>   var x; switch s { A: x = a; B: x = b }; c
+--
+-- each arm setting `x` -- the binding pushed into the arms, not `c`
+-- copied into them, nor a join point made: what A-normal form cannot do
+-- without, a variable set does here (`set! x (if v t1 t2)` is `if v (set!
+-- x t1) (set! x t2)`, figure 11).  An operand is simple: a name, a
+-- literal, a lambda, or a tag, a record, a field or a primitive that
+-- cannot fail, of simple ones; what is not is bound before.
+--
+-- A test of a `Bool` -- a match with arms `True` and `False` -- is in
+-- boolean position (Bowman, section 6.2; Chez's L11 `Pred`): its
+-- condition is a `Pred`, a comparison or a `Bool` looked at, never a
+-- `True` or `False` built to be matched on, and a match on a test whose
+-- arms are constants is the test the other way round (case of case).
+--
+-- A call of itself last, from a function's own body (not a lambda in
+-- it), is the next round of a loop (`TLoop`).
+--
+-- Types are defined one after another: what holds a lambda's body is
+-- parametric in it (`b`), and `Block` closes the knot.
+
+import heff.compile.ir as I
+import heff.compile.simplify as Si
+import heff.elab.fixed as Fx
+import map as M
+
+-- | an operand: computing it cannot fail nor do anything
+data Simple b
+  = SVar String
+  | SGlobal String
+  | SInt Int
+  | SFloat Float64
+  | SStr String
+  | SFixed Fx.Fixed Int
+  | SFloat32 Float64
+  -- | a primitive, as a (curried) function
+  | SPrimFn String
+  | SLam (List String) b
+  | STag String (List (Simple b))
+  | SRec (List (Pair String (Simple b)))
+  -- | a field, by its label, of a record of the shape (if known)
+  | SProj (Simple b) String (List String)
+  -- | a primitive that cannot fail, given all its arguments
+  | SPrim String (List (Simple b))
+
+-- | what is computed in one step, its operands simple (`p` a condition)
+data Op p b
+  = OSimple (Simple b)
+  -- | a definition of that arity, given all its arguments
+  | OCall String (List (Simple b))
+  | OApply (Simple b) (List (Simple b))
+  -- | a primitive that may fail
+  | OPrim String (List (Simple b))
+  | OAbandon
+  -- | the `Bool` a condition is
+  | OBool p
+
+-- | a condition: `PRel`, a comparison, a primitive of two operands; `PBool`,
+-- | a `Bool` looked at; `PLet`, a name bound in it, before what follows
+-- | in it (and only where that is computed)
+data Pred b
+  = PTrue
+  | PFalse
+  | PRel String (Simple b) (Simple b)
+  | PBool (Simple b)
+  | PNot (Pred b)
+  | PIf (Pred b) (Pred b) (Pred b)
+  | PLet String (Op (Pred b) b) (Pred b)
+
+-- | an arm: its tag, the names bound to its fields (in order), its body
+data Arm a = MkArm String (List String) a
+
+-- | a statement: `SLet`, a name bound to what is computed; `SDecl`, a name
+-- | that statements after it set (`SSet`), each where it is reached
+data Stmt b
+  = SLet String (Op (Pred b) b)
+  | SDecl String
+  | SSet String (Op (Pred b) b)
+  | SIf (Pred b) (List (Stmt b)) (List (Stmt b))
+  | SCase (Simple b) (List (Arm (List (Stmt b))))
+
+-- | what is last: statements, then what follows them; a value returned;
+-- | the next round of the loop the function is
+data Tail b
+  = TSeq (List (Stmt b)) (Tail b)
+  | TReturn (Op (Pred b) b)
+  | TLoop (List (Simple b))
+  | TIf (Pred b) (Tail b) (Tail b)
+  | TCase (Simple b) (List (Arm (Tail b)))
+
+-- | a body: what a function or a lambda does
+data Block = MkBlock (Tail Block)
+
+type Val = Simple Block
+
+type Cond = Pred Block
+
+type Comp = Op Cond Block
+
+type St = Stmt Block
+
+type Tl = Tail Block
+
+blockTail : Block -> Tl
+blockTail (MkBlock t) = t
+
+-- | a definition: a function, its parameters and body; or a value,
+-- | computed by a body
+data Body = DefFun (List String) Block | DefVal Block
+
+-- | a definition, by its key and the name it is known by
+data Def = MkDef String String Body
+
+defKey : Def -> String
+defKey (MkDef k _ _) = k
+
+defName : Def -> String
+defName (MkDef _ n _) = n
+
+defBody : Def -> Body
+defBody (MkDef _ _ b) = b
+
+-- Fresh names
+--------------------------------------------------------------------------------
+
+-- | computations drawing fresh names
+type N a = Int -> Pair a Int
+
+bindTake : {a b : Type} -> (a -> N b) -> Pair a Int -> Pair b Int
+bindTake f (MkPair x n) = f x n
+
+-- `do` is this
+bind : {a b : Type} -> N a -> (a -> N b) -> N b
+bind m f = \n -> bindTake f (m n)
+
+pure : {a : Type} -> a -> N a
+pure x = \n -> MkPair x n
+
+traverseN : {a b : Type} -> (a -> N b) -> List a -> N (List b)
+traverseN f Nil = pure Nil
+traverseN f (Cons x xs) = do
+  y <- f x
+  ys <- traverseN f xs
+  pure (Cons y ys)
+
+freshN : String -> N String
+freshN base = \n -> I.fresh base n
+
+appendL : {a : Type} -> List a -> List a -> List a
+appendL xs ys = List.append xs ys
+
+-- What is simple
+--------------------------------------------------------------------------------
+
+allL : {a : Type} -> (a -> Bool) -> List a -> Bool
+allL p Nil = True
+allL p (Cons x xs) = p x && allL p xs
+
+-- | whether it is simple: computed where it is or before, the same
+isSimple : I.Expr -> Bool
+isSimple (EVar _) = True
+isSimple (EGlobal _) = True
+isSimple (EInt _) = True
+isSimple (EFloat _) = True
+isSimple (EStr _) = True
+isSimple (EFixed _ _) = True
+isSimple (EFloat32 _) = True
+isSimple (EPrim _) = True
+isSimple (ELam _ _) = True
+isSimple (ETag _ as) = allL isSimple as
+isSimple (ERecord fs) = allL (\f -> isSimple (snd f)) fs
+isSimple (EProj e _ _) = isSimple e
+isSimple (EPrimCall p as) = not (Si.primFails p) && allL isSimple as
+isSimple _ = False
+
+-- | the function a body is a loop of, if it is one's own (not a lambda's)
+type Self = { key : String, arity : Int }
+
+-- | the code generator's judgments, knotted
+type G =
+  { simple : I.Expr -> N Val
+  , tail : Maybe Self -> I.Expr -> N Tl
+  , bindTo : String -> I.Expr -> N (List St)
+  , setTo : String -> I.Expr -> N (List St)
+  , atom : I.Expr -> N (Pair (List St) Val)
+  , op : I.Expr -> N (Pair (List St) Comp)
+  , pred : I.Expr -> N (Maybe Cond)
+  }
+
+-- Conditions
+--------------------------------------------------------------------------------
+
+-- (a fixed-width type's comparison)
+fixedRel : Fx.FixedPrim -> Bool
+fixedRel { op = OpEq } = True
+fixedRel { op = OpLt } = True
+fixedRel { op = OpLe } = True
+fixedRel p = False
+
+-- | the comparisons a condition is made of (the backends each have them
+-- | as an operator, or a test of their own)
+relPrims : List String
+relPrims =
+  [ "intEq"
+  , "intLt"
+  , "intLe"
+  , "floatEq"
+  , "floatLt"
+  , "floatLe"
+  , "strEq"
+  , "strLt"
+  , "runeEq"
+  , "runeLt"
+  , "runeLe"
+  ]
+
+isRel : String -> Bool
+isRel p =
+  List.any (\q -> strEq p q) relPrims || maybe False fixedRel (Fx.fixedPrimOf p)
+
+armNamed : String -> List I.Arm -> Maybe I.Expr
+armNamed t Nil = Nothing
+armNamed t (Cons (MkArm t2 vs b) rest) =
+  if strEq t2 t && List.null vs then Just b else armNamed t rest
+
+-- | a match's arms, if it is a test: one for `True`, one for `False`
+boolArms : List I.Arm -> Maybe (Pair I.Expr I.Expr)
+boolArms arms =
+  if List.length arms == 2
+    then case armNamed "True" arms of
+      Just t -> case armNamed "False" arms of
+        Just f -> Just (MkPair t f)
+        Nothing -> Nothing
+      Nothing -> Nothing
+  else Nothing
+
+-- | whether it is a boolean all the way down, as a condition
+condShaped : I.Expr -> Bool
+condShaped (ETag t Nil) = strEq t "True" || strEq t "False"
+condShaped (EPrimCall p (Cons _ (Cons _ Nil))) = isRel p
+condShaped (EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) -> condShaped t && condShaped f
+  Nothing -> False
+condShaped (ELet _ _ b) = condShaped b
+condShaped e = False
+
+-- (whether `x` is named in the arms)
+armsName : String -> List I.Arm -> Bool
+armsName x arms =
+  List.any (\a -> (I.occurrences x (I.armBody a)).count > 0) arms
+
+isJustM : {a : Type} -> Maybe a -> Bool
+isJustM (Just _) = True
+isJustM Nothing = False
+
+-- | `let x = a in case x of True -> ..; False -> ..`, `x` named nowhere
+-- | else -- as monadic form binds what a match looks at -- as the test
+-- | of `a`; and so where the match is bound, `let y = case x of .. in e`
+-- | (the binding of `x` sunk to where it is looked at)
+sinkTest : String -> I.Expr -> I.Expr -> Maybe I.Expr
+sinkTest x a (EMatch (EVar y) arms) =
+  if strEq x y && isJustM (boolArms arms) && not (armsName x arms)
+    then Just (EMatch a arms)
+  else Nothing
+sinkTest x a (ELet z (EMatch (EVar y) arms) e) =
+  if strEq x y
+  && isJustM (boolArms arms)
+  && not (armsName x arms)
+  && (I.occurrences x e).count == 0
+    then Just (ELet z (EMatch a arms) e)
+  else Nothing
+sinkTest x a b = Nothing
+
+isConstant : Cond -> Bool
+isConstant PTrue = True
+isConstant PFalse = True
+isConstant _ = False
+
+-- | `if c then t else e`, as a condition: a test of a test whose arms
+-- | are constants taken apart (case of case), where that copies only
+-- | constants
+condIf : Cond -> Cond -> Cond -> Cond
+condIf (PLet x o c) t e = PLet x o (condIf c t e)
+condIf PTrue t e = t
+condIf PFalse t e = e
+condIf (PNot c) t e = condIf c e t
+condIf (PIf a b c) t e =
+  if isConstant t && isConstant e then condIf a (condIf b t e) (condIf c t e)
+  else PIf (PIf a b c) t e
+condIf c PTrue PFalse = c
+condIf c PFalse PTrue = PNot c
+condIf c t e = PIf c t e
+
+letIn : String -> Comp -> Maybe Cond -> Maybe Cond
+letIn x o (Just q) = Just (PLet x o q)
+letIn x o Nothing = Nothing
+
+-- (statements in a condition: only bindings, each where it is computed)
+predLets : List St -> Cond -> Maybe Cond
+predLets Nil p = Just p
+predLets (Cons (SLet x o) rest) p = letIn x o (predLets rest p)
+predLets _ p = Nothing
+
+predSeq : Pair (List St) Cond -> Maybe Cond
+predSeq (MkPair ss p) = predLets ss p
+
+-- | a `Bool` computed, looked at
+predValue : G -> I.Expr -> N (Maybe Cond)
+predValue g e =
+  if isSimple e
+    then do
+      v <- g.simple e
+      pure (Just (PBool v))
+  else do
+    t <- freshN "c"
+    ss <- g.bindTo t e
+    pure (predLets ss (PBool (SVar t)))
+
+-- | a `Bool`, as a condition (none, where what computes it is not
+-- | bindings alone)
+predOf : G -> I.Expr -> N (Maybe Cond)
+predOf g (ETag t Nil) =
+  if strEq t "True" then pure (Just PTrue)
+  else if strEq t "False" then pure (Just PFalse)
+  else pure (Just (PBool (STag t Nil)))
+predOf g e@(EPrimCall p (Cons a (Cons b Nil))) =
+  if isRel p
+    then do
+      pa <- g.atom a
+      pb <- g.atom b
+      pure (predLets (appendL (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
+  else predValue g e
+predOf g e@(EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) -> do
+    ps <- g.pred s
+    pt <- g.pred t
+    pf <- g.pred f
+    pure (case ps of
+      Just cs -> case pt of
+        Just ct -> case pf of
+          Just cf -> Just (condIf cs ct cf)
+          Nothing -> Nothing
+        Nothing -> Nothing
+      Nothing -> Nothing)
+  Nothing -> predValue g e
+predOf g (ELet x a b) = case sinkTest x a b of
+  Just e2 -> g.pred e2
+  Nothing -> do
+    ss <- g.bindTo x a
+    pb <- g.pred b
+    pure (case pb of
+      Just q -> predLets ss q
+      Nothing -> Nothing)
+predOf g e = predValue g e
+
+-- Statements
+--------------------------------------------------------------------------------
+
+simpleOf : G -> I.Expr -> N Val
+simpleOf g (EVar x) = pure (SVar x)
+simpleOf g (EGlobal k) = pure (SGlobal k)
+simpleOf g (EInt i) = pure (SInt i)
+simpleOf g (EFloat x) = pure (SFloat x)
+simpleOf g (EStr s) = pure (SStr s)
+simpleOf g (EFixed w i) = pure (SFixed w i)
+simpleOf g (EFloat32 x) = pure (SFloat32 x)
+simpleOf g (EPrim p) = pure (SPrimFn p)
+simpleOf g (ELam xs b) = do
+  t <- g.tail Nothing b
+  pure (SLam xs (MkBlock t))
+simpleOf g (ETag t as) = do
+  vs <- traverseN g.simple as
+  pure (STag t vs)
+simpleOf g (ERecord fs) = do
+  vs <- traverseN (\f -> g.simple (snd f)) fs
+  pure (SRec (List.zipWith (\f v -> MkPair (fst f) v) fs vs))
+simpleOf g (EProj e l sh) = do
+  v <- g.simple e
+  pure (SProj v l sh)
+simpleOf g (EPrimCall p as) = do
+  vs <- traverseN g.simple as
+  pure (SPrim p vs)
+-- (not simple: no operand is made of it -- `isSimple` is asked first)
+simpleOf g e = pure (SPrim "$notSimple" Nil)
+
+-- | an operand: simple, or bound before by the statements given
+atomOf : G -> I.Expr -> N (Pair (List St) Val)
+atomOf g e =
+  if isSimple e
+    then do
+      v <- g.simple e
+      pure (MkPair Nil v)
+  else do
+    t <- freshN "t"
+    ss <- g.bindTo t e
+    pure (MkPair ss (SVar t))
+
+atomsOf : G -> List I.Expr -> N (Pair (List St) (List Val))
+atomsOf g Nil = pure (MkPair Nil Nil)
+atomsOf g (Cons e es) = do
+  a <- g.atom e
+  rest <- atomsOf g es
+  pure (MkPair (appendL (fst a) (fst rest)) (Cons (snd a) (snd rest)))
+
+opWith : Pair (List St) (List Val) -> (List Val -> Comp) -> Pair (List St) Comp
+opWith (MkPair ss vs) k = MkPair ss (k vs)
+
+-- | what is computed in one step (not a binding, nor a match), its
+-- | operands bound before where they are not simple
+opOf : G -> I.Expr -> N (Pair (List St) Comp)
+opOf g (ECall k as) = do
+  r <- atomsOf g as
+  pure (opWith r (\vs -> OCall k vs))
+opOf g (EApp f as) = do
+  r <- atomsOf g (Cons f as)
+  pure
+      (opWith r (\vs -> case vs of
+       Cons fv avs -> OApply fv avs
+       Nil -> OAbandon))
+opOf g (EPrimCall p as) = do
+  r <- atomsOf g as
+  pure
+      (opWith
+         r
+         (\vs -> if Si.primFails p then OPrim p vs else OSimple (SPrim p vs)))
+opOf g (ETag t as) = do
+  r <- atomsOf g as
+  pure (opWith r (\vs -> OSimple (STag t vs)))
+opOf g (ERecord fs) = do
+  r <- atomsOf g (List.map snd fs)
+  pure
+      (opWith
+         r
+         (\vs ->
+            OSimple (SRec (List.zipWith (\f v -> MkPair (fst f) v) fs vs))))
+opOf g (EProj e l sh) = do
+  r <- atomsOf g (Cons e Nil)
+  pure
+      (opWith r (\vs -> case vs of
+       Cons v _ -> OSimple (SProj v l sh)
+       Nil -> OAbandon))
+opOf g EAbandon = pure (MkPair Nil OAbandon)
+opOf g (EFix _ _) = pure (MkPair Nil OAbandon)
+opOf g e = do
+  v <- g.simple e
+  pure (MkPair Nil (OSimple v))
+
+-- | a test whose arms are `Bool`s too: the `Bool` the whole is
+boolOf : G -> I.Expr -> N (Maybe Comp)
+boolOf g e = do
+  p <- g.pred e
+  pure (case p of
+    Just c -> Just (OBool c)
+    Nothing -> Nothing)
+
+-- | statements that end setting `x` (`set`) or binding it (`let`) to
+-- | what is computed
+data Dest = DSet String | DLet String
+
+destStmt : Dest -> Comp -> St
+destStmt (DSet x) o = SSet x o
+destStmt (DLet x) o = SLet x o
+
+setOf : Dest -> String
+setOf (DSet x) = x
+setOf (DLet x) = x
+
+caseSet : G -> String -> I.Expr -> List I.Arm -> N (List St)
+caseSet g x s arms = do
+  sv <- g.atom s
+  as <-
+    traverseN
+      (\arm -> case arm of
+       MkArm t vs b -> do
+         sb <- g.setTo x b
+         pure (MkArm t vs sb))
+      arms
+  pure (appendL (fst sv) (Cons (SCase (snd sv) as) Nil))
+
+-- (each arm setting `x`; a test, by its condition)
+matchSet : G -> String -> I.Expr -> List I.Arm -> N (List St)
+matchSet g x s arms = case boolArms arms of
+  Just (MkPair t f) -> do
+    p <- g.pred s
+    case p of
+      Just c -> do
+        st <- g.setTo x t
+        sf <- g.setTo x f
+        pure (Cons (SIf c st sf) Nil)
+      Nothing -> caseSet g x s arms
+  Nothing -> caseSet g x s arms
+
+-- | a match that sets the destination in each arm: where it is bound, it
+-- | is declared first
+matchTo : G -> Dest -> I.Expr -> List I.Arm -> N (List St)
+matchTo g d s arms = do
+  sw <- matchSet g (setOf d) s arms
+  pure (case d of
+    DLet x -> Cons (SDecl x) sw
+    DSet _ -> sw)
+
+-- | `e`'s value, given to the destination
+toDest : G -> Dest -> I.Expr -> N (List St)
+toDest g d (ELet y a b) = case sinkTest y a b of
+  Just e2 -> toDest g d e2
+  Nothing -> do
+    sa <- g.bindTo y a
+    sb <- toDest g d b
+    pure (appendL sa sb)
+toDest g d e@(EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) ->
+    if condShaped t && condShaped f
+      then do
+        bo <- boolOf g e
+        case bo of
+          Just o -> pure (Cons (destStmt d o) Nil)
+          Nothing -> matchTo g d s arms
+    else matchTo g d s arms
+  Nothing -> matchTo g d s arms
+toDest g d e = do
+  r <- g.op e
+  pure (appendL (fst r) (Cons (destStmt d (snd r)) Nil))
+
+-- Tails
+--------------------------------------------------------------------------------
+
+isSelf : Maybe Self -> String -> List I.Expr -> Bool
+isSelf (Just s) k as = strEq s.key k && List.length as == s.arity
+isSelf Nothing k as = False
+
+tailSeq : List St -> Tl -> Tl
+tailSeq Nil t = t
+tailSeq ss (TSeq ss2 t) = TSeq (appendL ss ss2) t
+tailSeq ss t = TSeq ss t
+
+isNothingM : {a : Type} -> Maybe a -> Bool
+isNothingM Nothing = True
+isNothingM (Just _) = False
+
+opTail : G -> I.Expr -> N Tl
+opTail g e = do
+  r <- g.op e
+  pure (tailSeq (fst r) (TReturn (snd r)))
+
+caseTail : G -> Maybe Self -> I.Expr -> List I.Arm -> N Tl
+caseTail g self s arms = do
+  sv <- g.atom s
+  as <-
+    traverseN
+      (\arm -> case arm of
+       MkArm t vs b -> do
+         tb <- g.tail self b
+         pure (MkArm t vs tb))
+      arms
+  pure (tailSeq (fst sv) (TCase (snd sv) as))
+
+-- | what is last, in a function's body (`self`, the function, where a
+-- | call of it is the next round) or a lambda's
+tailOf : G -> Maybe Self -> I.Expr -> N Tl
+tailOf g self (ELet y a b) = case sinkTest y a b of
+  Just e2 -> g.tail self e2
+  Nothing -> do
+    sa <- g.bindTo y a
+    tb <- g.tail self b
+    pure (tailSeq sa tb)
+tailOf g self e@(EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) ->
+    if isNothingM self && condShaped t && condShaped f
+      then do
+        bo <- boolOf g e
+        case bo of
+          Just o -> pure (TReturn o)
+          Nothing -> caseTail g self s arms
+    else do
+      p <- g.pred s
+      case p of
+        Just c -> do
+          tt <- g.tail self t
+          tf <- g.tail self f
+          pure (TIf c tt tf)
+        Nothing -> caseTail g self s arms
+  Nothing -> caseTail g self s arms
+tailOf g self e@(ECall k as) =
+  if isSelf self k as
+    then do
+      r <- atomsOf g as
+      pure (tailSeq (fst r) (TLoop (snd r)))
+  else opTail g e
+tailOf g self e = opTail g e
+
+gen : G
+gen =
+  { simple = \e -> simpleOf gen e
+  , tail = \self e -> tailOf gen self e
+  , bindTo = \x e -> toDest gen (DLet x) e
+  , setTo = \x e -> toDest gen (DSet x) e
+  , atom = \e -> atomOf gen e
+  , op = \e -> opOf gen e
+  , pred = \e -> predOf gen e
+  }
+
+-- Definitions
+--------------------------------------------------------------------------------
+
+-- | whether it calls itself last somewhere: a loop
+tailSelf : String -> Int -> I.Expr -> Bool
+tailSelf key n (ELet _ _ b) = tailSelf key n b
+tailSelf key n (EMatch _ arms) =
+  List.any (\a -> tailSelf key n (I.armBody a)) arms
+tailSelf key n (ECall k as) = strEq k key && List.length as == n
+tailSelf key n e = False
+
+-- (the function, where it is a loop)
+loopOf : String -> List String -> I.Expr -> Maybe Self
+loopOf key xs b =
+  if tailSelf key (List.length xs) b
+    then Just ({ key = key, arity = List.length xs } : Self)
+  else Nothing
+
+defOf : I.Def -> N Def
+defOf d = case d.body of
+  ELam xs b -> do
+    t <- gen.tail (loopOf d.key xs b) b
+    pure (MkDef d.key d.name (DefFun xs (MkBlock t)))
+  b -> do
+    t <- gen.tail Nothing b
+    pure (MkDef d.key d.name (DefVal (MkBlock t)))
+
+-- | the definitions, and where fresh names go on from
+type Imped = { defs : List Def, supply : Int }
+
+-- | the definitions, imperative, fresh names drawn from `supply` on
+-- | >>> List.map defKey (impProgram 0 [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]).defs
+-- | ["f"]
+impProgram : Int -> List I.Def -> Imped
+impProgram supply defs = case traverseN defOf defs supply of
+  MkPair ds n -> { defs = ds, supply = n }
+
+-- Parts
+--------------------------------------------------------------------------------
+
+-- | a part of a body: each simple value, each step
+data Part = PartVal Val | PartOp Comp
+
+-- | the walk, knotted: each of a kind's parts, before `acc`
+type PK =
+  { val : Val -> List Part -> List Part
+  , op : Comp -> List Part -> List Part
+  , cond : Cond -> List Part -> List Part
+  , sts : List St -> List Part -> List Part
+  , tl : Tl -> List Part -> List Part
+  }
+
+partsVals : PK -> List Val -> List Part -> List Part
+partsVals r vs acc = List.foldr (\v a -> r.val v a) acc vs
+
+-- (a value and what it is made of, inside a lambda too)
+partsVal : PK -> Val -> List Part -> List Part
+partsVal r v@(SLam _ (MkBlock t)) acc = Cons (PartVal v) (r.tl t acc)
+partsVal r v@(STag _ as) acc = Cons (PartVal v) (partsVals r as acc)
+partsVal r v@(SRec fs) acc =
+  Cons (PartVal v) (partsVals r (List.map snd fs) acc)
+partsVal r v@(SProj w _ _) acc = Cons (PartVal v) (r.val w acc)
+partsVal r v@(SPrim _ as) acc = Cons (PartVal v) (partsVals r as acc)
+partsVal r v acc = Cons (PartVal v) acc
+
+partsOp : PK -> Comp -> List Part -> List Part
+partsOp r o@(OSimple v) acc = Cons (PartOp o) (r.val v acc)
+partsOp r o@(OCall _ as) acc = Cons (PartOp o) (partsVals r as acc)
+partsOp r o@(OApply f as) acc = Cons (PartOp o) (partsVals r (Cons f as) acc)
+partsOp r o@(OPrim _ as) acc = Cons (PartOp o) (partsVals r as acc)
+partsOp r o@(OBool c) acc = Cons (PartOp o) (r.cond c acc)
+partsOp r o acc = Cons (PartOp o) acc
+
+partsCond : PK -> Cond -> List Part -> List Part
+partsCond r (PRel _ a b) acc = r.val a (r.val b acc)
+partsCond r (PBool v) acc = r.val v acc
+partsCond r (PNot c) acc = r.cond c acc
+partsCond r (PIf a b c) acc = r.cond a (r.cond b (r.cond c acc))
+partsCond r (PLet _ o c) acc = r.op o (r.cond c acc)
+partsCond r _ acc = acc
+
+partsSt : PK -> St -> List Part -> List Part
+partsSt r (SLet _ o) acc = r.op o acc
+partsSt r (SSet _ o) acc = r.op o acc
+partsSt r (SIf c ts fs) acc = r.cond c (r.sts ts (r.sts fs acc))
+partsSt r (SCase v arms) acc =
+  r.val
+    v
+    (List.foldr
+       (\arm a -> case arm of
+        MkArm _ _ ss -> r.sts ss a)
+       acc
+       arms)
+partsSt r _ acc = acc
+
+partsSts : PK -> List St -> List Part -> List Part
+partsSts r ss acc = List.foldr (\st a -> partsSt r st a) acc ss
+
+partsTl : PK -> Tl -> List Part -> List Part
+partsTl r (TSeq ss t) acc = r.sts ss (r.tl t acc)
+partsTl r (TReturn o) acc = r.op o acc
+partsTl r (TLoop vs) acc = partsVals r vs acc
+partsTl r (TIf c t e) acc = r.cond c (r.tl t (r.tl e acc))
+partsTl r (TCase v arms) acc =
+  r.val
+    v
+    (List.foldr
+       (\arm a -> case arm of
+        MkArm _ _ t -> r.tl t a)
+       acc
+       arms)
+
+pk : PK
+pk =
+  { val = \v acc -> partsVal pk v acc
+  , op = \o acc -> partsOp pk o acc
+  , cond = \c acc -> partsCond pk c acc
+  , sts = \ss acc -> partsSts pk ss acc
+  , tl = \t acc -> partsTl pk t acc
+  }
+
+-- | the parts of a tail
+tailParts : Tl -> List Part
+tailParts t = pk.tl t Nil
+
+-- | the parts of statements
+stmtsParts : List St -> List Part
+stmtsParts ss = pk.sts ss Nil
+
+-- | the parts of a definition
+partsOf : Def -> List Part
+partsOf (MkDef _ _ (DefFun _ (MkBlock t))) = tailParts t
+partsOf (MkDef _ _ (DefVal (MkBlock t))) = tailParts t
+
+-- | whether `x` is named in the parts
+namedIn : String -> List Part -> Bool
+namedIn x ps =
+  List.any
+    (\p -> case p of
+     PartVal (SVar y) -> strEq x y
+     _ -> False)
+    ps
+
+-- What is computed first
+--------------------------------------------------------------------------------
+
+-- (the names a value mentions, outside any lambda)
+valNamesTop : Val -> List String -> List String
+valNamesTop (SVar x) acc = Cons x acc
+valNamesTop (STag _ as) acc = List.foldr valNamesTop acc as
+valNamesTop (SRec fs) acc = List.foldr valNamesTop acc (List.map snd fs)
+valNamesTop (SProj v _ _) acc = valNamesTop v acc
+valNamesTop (SPrim _ as) acc = List.foldr valNamesTop acc as
+valNamesTop v acc = acc
+
+-- (... of a step's operands: not a condition's, which may bind names)
+opNamesTop : Comp -> List String
+opNamesTop (OSimple v) = valNamesTop v Nil
+opNamesTop (OCall _ as) = List.foldr valNamesTop Nil as
+opNamesTop (OApply f as) = List.foldr valNamesTop Nil (Cons f as)
+opNamesTop (OPrim _ as) = List.foldr valNamesTop Nil as
+opNamesTop o = Nil
+
+-- | the names a statement mentions in what it computes first, before
+-- | anything that may fail or not be computed at all (an arm, a lambda):
+-- | where a name bound just before it, and named nowhere else, may be
+-- | computed instead -- the same, in the same order
+firstNames : St -> List String
+firstNames (SLet _ o) = opNamesTop o
+firstNames (SSet _ o) = opNamesTop o
+firstNames (SCase v _) = valNamesTop v Nil
+firstNames st = Nil
+
+-- | ... a tail's
+firstNamesTl : Tl -> List String
+firstNamesTl (TSeq (Cons st _) _) = firstNames st
+firstNamesTl (TReturn o) = opNamesTop o
+firstNamesTl (TLoop vs) = List.foldr valNamesTop Nil vs
+firstNamesTl (TCase v _) = valNamesTop v Nil
+firstNamesTl t = Nil
+
+-- | how many times `x` is named in the parts
+timesIn : String -> List Part -> Int
+timesIn x ps =
+  List.length
+    (List.filter
+       (\p -> case p of
+        PartVal (SVar y) -> strEq x y
+        _ -> False)
+       ps)
+
+-- | whether a binding of `x` may be computed where it is used instead:
+-- | named once in what follows it, there, first (`next`, what comes right
+-- | after it; `rest`, all that does)
+usedOnceNext : String -> List String -> List Part -> Bool
+usedOnceNext x next rest =
+  List.length (List.filter (\y -> strEq x y) next) == 1 && timesIn x rest == 1
