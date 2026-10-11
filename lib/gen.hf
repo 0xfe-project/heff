@@ -208,24 +208,21 @@ nth : {a : Type} -> Int -> List a -> Maybe a
 nth i Nil = Nothing
 nth i (Cons x xs) = if i <= 0 then Just x else nth (i - 1) xs
 
--- | One of these, shrinking toward the first.  (Of none, `abandon`.)
-element : {a : Type} -> List a -> Gen a
-element xs = map chosen (uniform 0 (List.length xs - 1))
-  where
-    chosen : Int -> a
-    chosen i = case nth i xs of
-      Just x -> x
-      Nothing -> abandon
+-- | A list of one element at least: the first, and the rest -- what
+-- | `element`, `oneOf` and `frequency` choose from.
+data NonEmptyList a = MkNonEmptyList a (List a)
 
--- | What one of these makes, shrinking toward the first.  (Of none,
--- | `abandon`.)
-oneOf : {a : Type} -> List (Gen a) -> Gen a
-oneOf gs = bind (uniform 0 (List.length gs - 1)) chosen
-  where
-    chosen : Int -> Gen a
-    chosen i = case nth i gs of
-      Just g -> g
-      Nothing -> abandon
+-- | One of these, shrinking toward the first.
+-- | >>> sample (element (MkNonEmptyList "a" ["b", "c"]))
+-- | Cons "c" (Cons "a" (Cons "c" (Cons "b" (Cons "c" (Cons "a" (Cons "b" (Cons "c" (Cons "b" (Cons "b" Nil)))))))))
+element : {a : Type} -> NonEmptyList a -> Gen a
+element (MkNonEmptyList x rest) =
+  map (\i -> fromMaybe x (nth i (Cons x rest))) (uniform 0 (List.length rest))
+
+-- | What one of these makes, shrinking toward the first.
+oneOf : {a : Type} -> NonEmptyList (Gen a) -> Gen a
+oneOf (MkNonEmptyList g rest) =
+  bind (uniform 0 (List.length rest)) (\i -> fromMaybe g (nth i (Cons g rest)))
 
 -- (the generator whose weights, added from the first, pass `i`, if one
 -- does)
@@ -234,24 +231,32 @@ pick i Nil = Nothing
 pick i (Cons p rest) = if i < fst p then Just (snd p) else pick (i - fst p) rest
 
 -- | What one of these makes, each as often as its weight says, shrinking
--- | toward the first.  (Of none, `abandon`.)
-frequency : {a : Type} -> List (Pair Int (Gen a)) -> Gen a
-frequency ws =
-  bind
-    (uniform 0 (List.sum (List.map (\(p : Pair Int (Gen a)) -> fst p) ws) - 1))
-    chosen
-  where
-    chosen : Int -> Gen a
-    chosen i = case pick i ws of
-      Just g -> g
-      Nothing -> abandon
+-- | toward the first.  (Of weights all 0, each as often as the others, as
+-- | `oneOf` chooses.)
+-- | >>> sample (frequency (MkNonEmptyList (MkPair 0 (constant "a")) [MkPair 0 (constant "b")]))
+-- | Cons "a" (Cons "b" (Cons "a" (Cons "a" (Cons "b" (Cons "a" (Cons "b" (Cons "a" (Cons "a" (Cons "a" Nil)))))))))
+frequency : {a : Type} -> NonEmptyList (Pair Int (Gen a)) -> Gen a
+frequency (MkNonEmptyList w rest) =
+  if List.all (\(p : Pair Int (Gen a)) -> fst p == 0) (Cons w rest)
+    then oneOf
+        (MkNonEmptyList
+           (snd w)
+           (List.map (\(p : Pair Int (Gen a)) -> snd p) rest))
+  else bind
+      (uniform
+         0
+         (List.sum (List.map (\(p : Pair Int (Gen a)) -> fst p) (Cons w rest))
+          - 1))
+      (\i -> fromMaybe (snd w) (pick i (Cons w rest)))
 
 -- | `Nothing` now and then, else `Just` of what `g` makes; it shrinks to
 -- | `Nothing`.
 maybe : {a : Type} -> Gen a -> Gen (Maybe a)
 maybe g =
   frequency
-    [MkPair 1 (constant Nothing), MkPair 4 (map (\x -> (Just x : Maybe a)) g)]
+    (MkNonEmptyList
+       (MkPair 1 (constant Nothing))
+       [MkPair 4 (map (\x -> (Just x : Maybe a)) g)])
 
 -- Lists
 --------------------------------------------------------------------------------
@@ -329,16 +334,10 @@ listOn lo hi g n (MkPair s1 s2) =
 list : {a : Type} -> Int -> Int -> Gen a -> Gen (List a)
 list lo hi g = MkGen (\s n -> listOn lo hi g n (split s))
 
--- | A string of `lo` to `hi` of the characters of `alphabet`, its runes
--- | (whatever units each takes).
-string : Int -> Int -> String -> Gen String
-string lo hi alphabet =
-  map
-    (\cs -> joinWith "" cs)
-    (list
-       lo
-       hi
-       (element (List.map (\(r : Rune) -> ofRunes [r]) (runes alphabet))))
+-- | A string of `lo` to `hi` of the characters of `alphabet` (whatever
+-- | units each takes).
+string : Int -> Int -> NonEmptyList Rune -> Gen String
+string lo hi alphabet = map (\cs -> ofRunes cs) (list lo hi (element alphabet))
 
 -- | The shrinks of a tree, a level deep: what a generator tries first
 -- | instead of what it made.

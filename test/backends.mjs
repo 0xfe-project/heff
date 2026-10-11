@@ -79,6 +79,10 @@ const values = pool(cases, async (c) => {
   const file = join(work, `${c.name}.hf`);
   writeFileSync(file, c.src);
   const ev = await heff(["dump-eval", file]);
+  // (a value the interpreter met a bug of the compiler in agrees with
+  // nothing: said, and the program not compiled)
+  const bugs = (ev.stdout ?? "").split("\n").filter((l) => /^\S+ = <compiler bug: /.test(l));
+  if (bugs.length) { fail(`COMPILER BUG ${c.name}:\n${bugs.join("\n")}`); return msgs; }
   if (ev.status !== 0) { fail(`NOT EVALUATED ${c.name}:\n${ev.stderr}${ev.error || ""}`); return msgs; }
   // `name = value`, a value going on over the lines that do not start so;
   // an operator's name without its parentheses, as the module exports it

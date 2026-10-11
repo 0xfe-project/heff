@@ -340,6 +340,27 @@ expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
   const checkIn = (f) => checkWith(heffBin, { HEFF_LIB: elsewhere }, f);
   const own = checkIn(join(root, "lib", "float32.hf"));
   expect("heff's own lib/, the library elsewhere", own.status === 0 && !/E033[56]/.test(own.stderr), own);
+  // a primitive the library declares at a type the runtime does not have
+  // it at is what type checking cannot see: the interpreter, given a
+  // value of the wrong shape, says it met a bug of the compiler -- a
+  // watch that meets one fails, whatever its expectation, as a test
+  // does, and so does `dump-eval`, saying where
+  writeFileSync(join(elsewhere, "wrong.hf"), [
+    "import check", "",
+    "primitive floatSin : Int -> Int", "",
+    "-- >>> floatSin 4", "-- <compiler bug: a primitive given what is not a `Float64`>", "",
+    "-- >>> floatSin 5", "",
+    "root : Int", "root = floatSin 4", "",
+    "bugged : Test", "bugged = unit \"met a bug\" (assert \"never\" (floatSin 4 == 2))", "",
+  ].join("\n"));
+  const inElsewhere = (...args) => spawnSync(heffBin, args, { cwd: work, encoding: "utf8", env: { ...env, HEFF_HOME: noHome, HEFF_LIB: elsewhere } });
+  const bug = "<compiler bug: a primitive given what is not a `Float64`>";
+  const bugTested = inElsewhere("test", join(elsewhere, "wrong.hf"));
+  expect("a compiler bug met, by a watch and a test", bugTested.status === 1 &&
+    bugTested.stdout.includes(`but got  ${bug}\n`) && bugTested.stdout.includes(`FAIL  bugged\n        ${bug}\n`) &&
+    bugTested.stdout.includes("0/2 expectations hold, 0/1 tests hold"), bugTested);
+  const bugEvaluated = inElsewhere("dump-eval", join(elsewhere, "wrong.hf"));
+  expect("a compiler bug met, evaluated", bugEvaluated.status === 1 && bugEvaluated.stdout.includes(`root = ${bug}\n`), bugEvaluated);
   const other = join(work, "other");
   mkdirSync(join(other, "lib"), { recursive: true });
   writeFileSync(join(other, "package.hf"), readFileSync(join(root, "package.hf"), "utf8").replace(/module = "[^"]*"/, 'module = "example.com/other"'));

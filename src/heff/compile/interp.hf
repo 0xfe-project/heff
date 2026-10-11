@@ -8,7 +8,9 @@
 -- step -- so a watch that abandons reports `<abandoned>` instead of
 -- ending the run.  Evaluation that goes deeper than `deepest` is said
 -- to diverge, `Div`: every function and every thunk is given the depth
--- it is forced at.
+-- it is forced at.  What type checking rules out -- a value of the wrong
+-- shape, a name not in scope -- is a bug of the compiler, `Bug`, said
+-- (`<compiler bug: ...>`) and never taken for a value.
 
 import array as A
 import float32 as F32
@@ -25,7 +27,7 @@ import uint8 as U8
 -- | a computation forced at a depth
 type Th a = Int -> a
 
-data Res a = Ok a | Abn | Div
+data Res a = Ok a | Abn | Div | Bug String
 
 data Val
   = VFun (Int -> Th (Res Val) -> Res Val)
@@ -46,6 +48,7 @@ rbind : RVal -> (Val -> RVal) -> RVal
 rbind (Ok v) f = f v
 rbind Abn f = Abn
 rbind Div f = Div
+rbind (Bug what) f = Bug what
 
 okTh : Val -> Th RVal
 okTh v = \d -> Ok v
@@ -59,12 +62,12 @@ deepest = 1000000
 app : Int -> Val -> Th RVal -> RVal
 app d (VFun f) v = f d v
 app d VErased _ = Ok VErased
-app d _ _ = abandon
+app d _ _ = Bug "applied what is not a function"
 
 projV : Val -> String -> RVal
 projV (VCons fs) x = Ok (D.elemAt fs x)
 projV VErased _ = Ok VErased
-projV _ _ = abandon
+projV _ x = Bug ("`." ^ x ^ "` of what is not a record")
 
 -- Primitives (the interpreter's side of `heff.compile.prims`): answers are
 -- builtin's Bool, the tags True/False
@@ -73,9 +76,29 @@ projV _ _ = abandon
 boolV : Bool -> Val
 boolV b = VTag (if b then "True" else "False") Nil
 
+-- (a primitive given a value of the wrong shape, a bug of the compiler:
+-- each said once, not at every primitive that takes such a value)
+notAnInt : RVal
+notAnInt = Bug "a primitive given what is not an `Int`"
+
+notAFloat64 : RVal
+notAFloat64 = Bug "a primitive given what is not a `Float64`"
+
+notAString : RVal
+notAString = Bug "a primitive given what is not a `String`"
+
+notARune : RVal
+notARune = Bug "a primitive given what is not a `Rune`"
+
+notAnArray : RVal
+notAnArray = Bug "a primitive given what is not an array"
+
+notAFloat32 : RVal
+notAFloat32 = Bug "a primitive given what is not a `Float32`"
+
 intTake2 : (Int -> Int -> RVal) -> Val -> Val -> RVal
 intTake2 f (VInt a) (VInt b) = f a b
-intTake2 f _ _ = abandon
+intTake2 f _ _ = notAnInt
 
 int2 : (Int -> Int -> RVal) -> Val
 int2 f =
@@ -88,14 +111,14 @@ int2 f =
 
 floatTake1 : (Float64 -> RVal) -> Val -> RVal
 floatTake1 f (VFloat a) = f a
-floatTake1 f _ = abandon
+floatTake1 f _ = notAFloat64
 
 float1 : (Float64 -> RVal) -> Val
 float1 f = VFun (\d a -> rbind (a d) (\av -> floatTake1 f av))
 
 floatTake2 : (Float64 -> Float64 -> RVal) -> Val -> Val -> RVal
 floatTake2 f (VFloat a) (VFloat b) = f a b
-floatTake2 f _ _ = abandon
+floatTake2 f _ _ = notAFloat64
 
 float2 : (Float64 -> Float64 -> RVal) -> Val
 float2 f =
@@ -108,14 +131,14 @@ float2 f =
 
 strTake1 : (String -> RVal) -> Val -> RVal
 strTake1 f (VStr a) = f a
-strTake1 f _ = abandon
+strTake1 f _ = notAString
 
 str1 : (String -> RVal) -> Val
 str1 f = VFun (\d a -> rbind (a d) (\av -> strTake1 f av))
 
 strTake2 : (String -> String -> RVal) -> Val -> Val -> RVal
 strTake2 f (VStr a) (VStr b) = f a b
-strTake2 f _ _ = abandon
+strTake2 f _ _ = notAString
 
 str2 : (String -> String -> RVal) -> Val
 str2 f =
@@ -128,14 +151,14 @@ str2 f =
 
 runeTake1 : (Int -> RVal) -> Val -> RVal
 runeTake1 f (VRune a) = f a
-runeTake1 f _ = abandon
+runeTake1 f _ = notARune
 
 rune1 : (Int -> RVal) -> Val
 rune1 f = VFun (\d a -> rbind (a d) (\av -> runeTake1 f av))
 
 runeTake2 : (Int -> Int -> RVal) -> Val -> Val -> RVal
 runeTake2 f (VRune a) (VRune b) = f a b
-runeTake2 f _ _ = abandon
+runeTake2 f _ _ = notARune
 
 rune2 : (Int -> Int -> RVal) -> Val
 rune2 f =
@@ -154,7 +177,7 @@ runeCodes (Cons _ rest) = runeCodes rest
 
 intTake1 : (Int -> RVal) -> Val -> RVal
 intTake1 f (VInt a) = f a
-intTake1 f _ = abandon
+intTake1 f _ = notAnInt
 
 int1 : (Int -> RVal) -> Val
 int1 f = VFun (\d a -> rbind (a d) (\av -> intTake1 f av))
@@ -165,7 +188,7 @@ tyThen k = VFun (\d u -> Ok k)
 
 arrTake1 : (Array Val -> RVal) -> Val -> RVal
 arrTake1 f (VArr xs) = f xs
-arrTake1 f _ = abandon
+arrTake1 f _ = notAnArray
 
 arr1 : (Array Val -> RVal) -> Val
 arr1 f = VFun (\d a -> rbind (a d) (\av -> arrTake1 f av))
@@ -249,7 +272,7 @@ bitsOf w f a b =
 wrapV : Fx.Fixed -> Int -> RVal
 wrapV w n = Ok (VInt (Fx.wrapFixed w n))
 
--- (a shift's amount: modulo the bits)
+-- (a shift's amount, of a count from 0: modulo the bits)
 shiftOf : Fx.Fixed -> Int -> Int
 shiftOf w b = Fx.twoTo (b % Fx.fixedBits w)
 
@@ -266,29 +289,34 @@ fixedInt2 w OpLe a b = Ok (boolV (a <= b))
 fixedInt2 w OpAnd a b = bitsOf w (\x y -> x * y) a b
 fixedInt2 w OpOr a b = bitsOf w (\x y -> if x + y > 0 then 1 else 0) a b
 fixedInt2 w OpXor a b = bitsOf w (\x y -> (x + y) % 2) a b
-fixedInt2 w OpShl a b = wrapV w (a * shiftOf w b)
--- (rounding down: arithmetic, of a negative value)
-fixedInt2 w OpShr a b = Ok (VInt (a / shiftOf w b))
-fixedInt2 w _ a b = Abn
+-- (by a negative count, of a signed type, a shift the other way by its
+-- size; right, rounding down: arithmetic, of a negative value)
+fixedInt2 w OpShl a b =
+  if b < 0 then Ok (VInt (a / shiftOf w (0 - b))) else wrapV w (a * shiftOf w b)
+fixedInt2 w OpShr a b =
+  if b < 0 then wrapV w (a * shiftOf w (0 - b)) else Ok (VInt (a / shiftOf w b))
+fixedInt2 w op a b =
+  Bug ("no primitive " ^ Fx.fixedPrimName (Fx.mkFixedPrim w op))
 
 fixedInt1 : Fx.Fixed -> Fx.FixedOp -> Int -> RVal
 fixedInt1 w OpShow a = Ok (VStr (showInt a))
 fixedInt1 w OpFromInt a = wrapV w a
 fixedInt1 w OpToInt a = Ok (VInt a)
-fixedInt1 w _ a = Abn
+fixedInt1 w op a =
+  Bug ("no primitive " ^ Fx.fixedPrimName (Fx.mkFixedPrim w op))
 
 -- `Float32`: the host's (lib/float32.hf)
 
 f32Take1 : (Float32 -> RVal) -> Val -> RVal
 f32Take1 f (VFloat32 a) = f a
-f32Take1 f _ = abandon
+f32Take1 f _ = notAFloat32
 
 f32V1 : (Float32 -> RVal) -> Val
 f32V1 f = VFun (\d a -> rbind (a d) (\av -> f32Take1 f av))
 
 f32Take2 : (Float32 -> Float32 -> RVal) -> Val -> Val -> RVal
 f32Take2 f (VFloat32 a) (VFloat32 b) = f a b
-f32Take2 f _ _ = abandon
+f32Take2 f _ _ = notAFloat32
 
 f32V2 : (Float32 -> Float32 -> RVal) -> Val
 f32V2 f =
@@ -321,7 +349,7 @@ float32V OpFromFloat = float1 (\a -> f32Ok (F32.fromFloat a))
 float32V OpToFloat = f32V1 (\a -> Ok (VFloat (F32.toFloat a)))
 float32V OpFromInt = int1 (\a -> f32Ok (F32.fromInt a))
 float32V OpFloor = f32V1 f32Floor
-float32V _ = VFun (\d a -> Abn)
+float32V op = VFun (\d a -> Bug ("no primitive float32" ^ Fx.opName op))
 
 fixedPrimV : Fx.FixedPrim -> Val
 fixedPrimV p =
@@ -387,7 +415,7 @@ prim p =
                       if 0 <= i && i < List.length (A.toList xs)
                         then (case nthV (A.toList xs) i of
                               Just v -> Ok v
-                              Nothing -> Abn)
+                              Nothing -> Bug "an index in range, of no element")
                       else Abn))))
   else if strEq p "arraySet"
     then tyThen
@@ -475,7 +503,7 @@ prim p =
                         (List.map Ru.fromInt (runeCodes (fromListV lv Nil)))))))
   else case Fx.fixedPrimOf p of
     Just fp -> fixedPrimV fp
-    Nothing -> abandon
+    Nothing -> VFun (\d a -> Bug ("no primitive " ^ p))
 
 type Env = { local : List (Th RVal), global : M.Map String (Th RVal) }
 
@@ -510,10 +538,10 @@ evalIn d e t =
   else case t of
     SLocal i -> case nthTh e.local i of
       Just v -> v d
-      Nothing -> abandon
+      Nothing -> Bug ("local " ^ showInt i ^ " is not in scope")
     SGlobal x -> case M.lookup compareString x e.global of
       Just v -> v d
-      Nothing -> abandon
+      Nothing -> Bug (x ^ " is not in scope")
     SLam _ (MkAbs _ body) ->
       Ok (VFun (\dc v -> evalIn (dc + 1) (bindLocal e v) body))
     SLam _ (AbsConst body) -> Ok (VFun (\dc u -> evalIn (dc + 1) e body))
@@ -537,9 +565,9 @@ evalIn d e t =
       VTag x vs ->
         (case D.lookup cases x of
          Just (MkPair _ body) -> evalIn (d + 1) (bindVals e vs) body
-         Nothing -> abandon)
+         Nothing -> Bug ("no case for " ^ x))
       VErased -> Ok VErased
-      _ -> abandon)
+      _ -> Bug "a case of what is not a tag")
     SCode _ -> Ok VErased
     SIs t2 -> evalIn (d + 1) e t2
     SAbandon -> Abn
@@ -562,12 +590,12 @@ evalIn d e t =
     SLitFloat32 x -> Ok (VFloat32 (F32.fromFloat x))
     SImplicit _ t2 -> evalIn (d + 1) e t2
     SSpecialize _ _ _ -> Ok VErased
-    _ -> abandon
+    _ -> Bug "a term that is not evaluated"
 
 -- Results, as the tools show them
 --------------------------------------------------------------------------------
 
-data EvalResult = RSucceeded Val | RAbandoned | RDiverged
+data EvalResult = RSucceeded Val | RAbandoned | RDiverged | RBug String
 
 scalarV : Val -> String
 scalarV (VFun _) = "#fun"
@@ -630,6 +658,7 @@ showResult : EvalResult -> String
 showResult (RSucceeded v) = showVal v
 showResult RAbandoned = "<abandoned>"
 showResult RDiverged = "<diverged>"
+showResult (RBug what) = "<compiler bug: " ^ what ^ ">"
 
 -- Globals
 --------------------------------------------------------------------------------
@@ -649,10 +678,13 @@ fixThunk g t = \d ->
 -- | "1"
 -- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } SAbandon))
 -- | "<abandoned>"
+-- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SLitInt 1) (SLitInt 2))))
+-- | "<compiler bug: applied what is not a function>"
 resultOf : RVal -> EvalResult
 resultOf (Ok v) = RSucceeded v
 resultOf Abn = RAbandoned
 resultOf Div = RDiverged
+resultOf (Bug what) = RBug what
 
 -- | a value given `n` arguments that are types first -- erased where it
 -- | is compiled, so given as nothing -- as it is shown: `[]` of

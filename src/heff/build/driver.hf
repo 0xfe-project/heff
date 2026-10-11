@@ -1288,16 +1288,17 @@ typeArgsOf lvl (LikeFunction level dom cod implicit) =
   else 0
 typeArgsOf lvl _ = 0
 
--- | a value of the type `t` as the tools show it: given its type
--- | arguments first (as nothing: they are erased), as the compiled code
--- | has it -- `[]` of `{a : Type} -> List a`, not `#fun`
-shownAt : V.Ty -> In.EvalResult -> String
-shownAt t r = In.showResult (In.applyErased (typeArgsOf 0 (V.behavior t)) r)
+-- | a value of the type `t` as the tools show it (`In.showResult`):
+-- | given its type arguments first (as nothing: they are erased), as the
+-- | compiled code has it -- `[]` of `{a : Type} -> List a`, not `#fun`
+shownAt : V.Ty -> In.EvalResult -> In.EvalResult
+shownAt t r = In.applyErased (typeArgsOf 0 (V.behavior t)) r
 
 -- | a watch's value, in the globals evaluated (`In.globalEnv`, once for
 -- | all the watches of a file)
 evalWatch : In.GlobalEnv -> G.Entry -> String
-evalWatch ge entry = shownAt entry.type_ (In.evalEntryIn ge entry)
+evalWatch ge entry =
+  In.showResult (shownAt entry.type_ (In.evalEntryIn ge entry))
 
 knownG : G.Globals -> String -> Bool
 knownG g x = case G.lookupName g x of
@@ -1330,10 +1331,18 @@ readExpectation ge g ty e =
 
 -- an expectation is Hippogriff: it holds when it evaluates to the same,
 -- however it is written; what cannot be read (`#fun`) is compared as
--- text
-holdsOf : In.GlobalEnv -> G.Globals -> String -> String -> Maybe String -> Bool
-holdsOf ge g ty value Nothing = True
-holdsOf ge g ty value (Just e) =
+-- text.  A watch whose evaluation met a bug of the compiler holds
+-- nothing, with an expectation or without
+holdsOf : In.GlobalEnv
+        -> G.Globals
+        -> String
+        -> In.EvalResult
+        -> String
+        -> Maybe String
+        -> Bool
+holdsOf ge g ty (RBug _) value e = False
+holdsOf ge g ty r value Nothing = True
+holdsOf ge g ty r value (Just e) =
   strEq e value
   || (case readExpectation ge g ty e of
       Just v -> strEq v value
@@ -1348,19 +1357,19 @@ dropWatchMark s =
 mkWatchInfo : Checked
             -> In.GlobalEnv
             -> T.Watch
-            -> String
+            -> In.EvalResult
             -> Expectation
             -> String
             -> WatchInfo
-mkWatchInfo c ge w value ex ty =
+mkWatchInfo c ge w r ex ty =
   { from = w.span.start
   , to = w.span.end
   , expr =
       trim (dropWatchMark (trim (strSlice c.source w.span.start w.span.end)))
   , ty = ty
-  , value = value
+  , value = In.showResult r
   , expected = ex.expected
-  , holds = holdsOf ge c.top.globals ty value ex.expected
+  , holds = holdsOf ge c.top.globals ty r (In.showResult r) ex.expected
   , expectFrom = ex.from
   , expectTo = ex.to
   , doc = isDocTest c.source w.span.start
@@ -1372,7 +1381,7 @@ watchInfo c ge w =
     c
     ge
     w
-    (evalWatch ge w.entry)
+    (shownAt w.entry.type_ (In.evalEntryIn ge w.entry))
     (expectation c.source w.span)
     (showTySx c.top.globals (R.readbTy 0 w.entry.type_))
 
@@ -1424,27 +1433,29 @@ docOwner c w = case List.foldl (defUnder w.to) Nothing c.top.spans of
 ownerOf : Checked -> WatchInfo -> Maybe String
 ownerOf c w = if w.doc then docOwner c w else testOwner c w.from
 
+-- (a watch without an expectation is no test, but where its evaluation
+-- met a bug of the compiler: that fails)
 testReportOf : Checked -> WatchInfo -> Maybe TestReport
-testReportOf c w@{ expected = Just _ } =
+testReportOf c { expected = Nothing, holds = True } = Nothing
+testReportOf c w =
   Just
     { owner = ownerOf c w
     , line = (Dg.lineCol c.source w.from).line + 1
     , watch = w
     }
-testReportOf c { expected = Nothing } = Nothing
 
 testFile : Checked -> List TestReport
 testFile c = catMaybesD (List.map (\w -> testReportOf c w) (watches c))
 
 -- | a file's own definitions, evaluated (by value), as a watch shows
--- | them
-type Evaluated = { name : String, value : String }
+-- | them; `bug`, whether its evaluation met a bug of the compiler
+type Evaluated = { name : String, value : String, bug : Bool }
 
 -- (a global's value as the tools show it, given its type arguments)
-shownGlobal : G.Globals -> String -> In.EvalResult -> String
+shownGlobal : G.Globals -> String -> In.EvalResult -> In.EvalResult
 shownGlobal g k r = case G.lookupEntry g k of
   Just e -> shownAt e.type_ r
-  Nothing -> In.showResult r
+  Nothing -> r
 
 evalPick : G.Globals
          -> List (Pair String In.EvalResult)
@@ -1452,10 +1463,16 @@ evalPick : G.Globals
          -> List Evaluated
 evalPick g results Nil = Nil
 evalPick g results (Cons o rest) = case List.lookupBy strEq o.key results of
-  Just r ->
-    Cons
-      { name = Ps.named o.name, value = shownGlobal g o.key r }
-      (evalPick g results rest)
+  Just r -> case shownGlobal g o.key r of
+    shown ->
+      Cons
+        { name = Ps.named o.name
+        , value = In.showResult shown
+        , bug = case shown of
+            RBug _ -> True
+            _ -> False
+        }
+        (evalPick g results rest)
   Nothing -> evalPick g results rest
 
 evaluate : Checked -> List Evaluated
@@ -1598,7 +1615,8 @@ outcomeOfV v =
   , seed = intOfV (fieldV v "seed")
   }
 
--- (a test that came to no outcome: it abandoned, or went too deep)
+-- (a test that came to no outcome: it abandoned, went too deep, or met a
+-- bug of the compiler)
 brokenOutcome : String -> Int -> String -> TestOutcome
 brokenOutcome name seed why =
   { name = name

@@ -1887,7 +1887,8 @@ static inline uint64_t fx_get_uint64_t(V v) { return fx_get_int64_t(v); }
 static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
 
 // (an integer type's primitives: `heff_int32Add` and the rest, `T` its C
-// type, `BITS` its bits)
+// type, `BITS` its bits; a shift is by the count modulo the bits, and by
+// a negative count, of a signed type, the other way by its size)
 #define FX_INT(name, T, BITS)                                                        \
   static V heff_##name##Add(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x + y); }       \
@@ -1920,12 +1921,20 @@ static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x | y); }       \
   static V heff_##name##Xor(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x ^ y); }       \
+  static inline uint64_t heff_##name##Left(uint64_t x, uint64_t n) {                 \
+    return x << (n & (BITS - 1)); }                                                  \
+  static inline uint64_t heff_##name##Right(uint64_t x, uint64_t n) {                \
+    return (uint64_t)((T)x >> (n & (BITS - 1))); }                                   \
   static V heff_##name##Shl(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b);                                  \
-    return fx_mk_##T(x << (y & (BITS - 1))); }                                       \
+    if ((T)-1 < (T)0 && (int64_t)y < 0)                                              \
+      return fx_mk_##T(heff_##name##Right(x, 0 - y));                                \
+    return fx_mk_##T(heff_##name##Left(x, y)); }                                     \
   static V heff_##name##Shr(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b);                                  \
-    return fx_mk_##T((uint64_t)((T)x >> (y & (BITS - 1)))); }                        \
+    if ((T)-1 < (T)0 && (int64_t)y < 0)                                              \
+      return fx_mk_##T(heff_##name##Left(x, 0 - y));                                 \
+    return fx_mk_##T(heff_##name##Right(x, y)); }                                    \
   static V heff_##name##Show(V a) { return heff_intShow(a); }                        \
   static V heff_##name##FromInt(V a) {                                               \
     uint64_t u = heff_int_low64(a); heff_drop(a); return fx_mk_##T(u); }             \

@@ -201,7 +201,8 @@ step x = x * 6364136223846793005 + 1442695040888963407   -- with `import int64 a
 numbers: `Int8`, `Int16`, `Int32` and `Int64` (two's complement),
 `UInt8` to `UInt64`, and `Float32` (IEEE 754's single).  An integer of
 one wraps around, as the machine's does (the least by -1 is itself),
-divides rounding toward zero, and shifts by the amount modulo its bits;
+divides rounding toward zero, and shifts by the amount modulo its bits
+(by a negative one, of a signed type, the other way by its size);
 each operation of a `Float32` is rounded to one.  An `Int` divides
 rounding down, its remainder of the divisor's sign.  An integer's
 division is total, as Lean's and Coq's are: by zero it is 0, and its
@@ -251,18 +252,19 @@ arithmetic, `eq`, `lt`, `le`, `isNaN` and `show`, `fromInt`,
 `fromFloat`, `toFloat`, `floor` and `sqrt`.  None of them has a name
 the prelude has for every type -- `neg`, `compare`, `min`, `max`, the
 bits' -- so that a module opened is in the way of none of them at
-another type: those are its instances'.  An `Int`'s bits are `int`'s
-(`import int as I`: `I.and`, `I.or`, `I.xor`, `I.complement`,
-`I.shiftL`, `I.shiftR`), as two's complement has them with the sign
-extended for ever; a shift right rounds down, and one by a negative
-count is one the other way (`I.shiftL x -n` is `I.shiftR x n`).  A
-fixed-width type's instances are its module's, found wherever it is
-imported, by a name or not: the prelude's operators at its type, `x *
-c + d` at `Int64` beside `n + 1` at `Int`, `-x`, `min x y` and `and x
-y` (`int`'s `bitwiseInt` is an `Int`'s); `float32`'s has all but
-`Division`, `Remainder`, `Bitwise` and `IsZero`, and `FloatDivision`
-too, its `/.`.  How each number is kept by each backend, and given to a
-provider, is in [providers.md](providers.md#numbers-and-runes).
+another type: those are its instances'.  An `Int`'s bits are the
+prelude's `and`, `or`, `xor`, `complement`, `shiftL` and `shiftR`, by
+`int`'s instance, `bitwiseInt` (`import int as I`), as two's complement
+has them with the sign extended for ever; a shift right rounds down,
+and one by a negative count is one the other way (`shiftL x -n` is
+`shiftR x n`), as a signed fixed-width type's is.  A fixed-width type's
+instances are its module's, found wherever it is imported, by a name
+or not: the prelude's operators at its type, `x * c + d` at `Int64`
+beside `n + 1` at `Int`, `-x`, `min x y` and `and x y`; `float32`'s has
+all but `Division`, `Remainder`, `Bitwise` and `IsZero`, and
+`FloatDivision` too, its `/.`.  How each number is kept by each
+backend, and given to a provider, is in
+[providers.md](providers.md#numbers-and-runes).
 
 `-` where it would be a number's sign, right before a name or a `(`
 instead of a digit, negates what it is before: a name with its fields
