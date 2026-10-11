@@ -53,6 +53,12 @@ data E
   -- | `(a, b)`, or `[a, b]` (its brackets say which)
   | Tup T (List E) (List T) T
   | Braces T (List E) (List T) T
+  -- | `{ e | x = v, y.z = w }`, a record with fields replaced: the
+  -- | record, `|`, the settings (each `EUSet`)
+  | Update T E T (List E) (List T) T
+  -- | `x.y = v` in an update: the field's path (a name, its fields), `=`,
+  -- | the value
+  | EUSet E T E
   -- | `{{x : T}}`, an instance binder
   | InstB T T E T T
   | EFSet T T E
@@ -440,6 +446,9 @@ mkSum kw o (MkSep items seps) c = Sum kw o items seps c
 mkBraces : T -> Sep E -> T -> E
 mkBraces o (MkSep items seps) c = Braces o items seps c
 
+mkUpdate : T -> E -> T -> Sep E -> T -> E
+mkUpdate o r bar (MkSep items seps) c = Update o r bar items seps c
+
 mkTup : T -> Sep E -> T -> E
 mkTup o (MkSep items seps) c = Tup o items seps c
 
@@ -564,6 +573,30 @@ settingF g = do
   e <- g.expr
   pure (EFSet x eq e)
 
+-- | `x.y = v`, a setting of an update
+updateSettingF : Gram -> P E
+updateSettingF g = do
+  t <- peek
+  if not (isKind t "var")
+      then throwP
+          (diag
+             (spanOf t)
+             "an update sets a field by its name: `{ r | x = v }`")
+    else do
+      x <- next
+      path <- fieldsGo (Atom x)
+      eq <- expectSym "="
+      e <- g.expr
+      pure (EUSet path eq e)
+
+-- | `| x = v, ...` after the record in `{ r | x = v, ... }`
+updateF : Gram -> T -> E -> P E
+updateF g o r = do
+  bar <- next
+  fs <- sepBy1 "," (updateSettingF g)
+  c <- expectPunct "}"
+  pure (mkUpdate o r bar fs c)
+
 -- | what is in braces, and `= d` after it: a record type's field and its
 -- | default; or `:= d`, an implicit argument's
 defaultedF : Gram -> P E
@@ -579,8 +612,9 @@ defaultedF g = do
     else pure e
 
 -- | `{ x : A, ... }` (a record type, its fields perhaps with defaults,
--- | `x : A = d`), `{ x = e, ... }` (a record), `{}`, `{x : A}` (an
--- | implicit binder), and `{{x : A}}` (an instance one)
+-- | `x : A = d`), `{ x = e, ... }` (a record), `{ r | x = e, ... }` (a
+-- | record updated), `{}`, `{x : A}` (an implicit binder), and `{{x :
+-- | A}}` (an instance one)
 bracesF : Gram -> P E
 bracesF g = do
   o <- next
@@ -604,9 +638,13 @@ bracesF g = do
           c <- expectPunct "}"
           pure (mkBraces o fs c)
       else do
-        fs <- sepBy1 "," (defaultedF g)
-        c <- expectPunct "}"
-        pure (mkBraces o fs c))
+        f <- defaultedF g
+        t' <- peek
+        if isKind t' "sym" && isText t' "|" then updateF g o f
+          else do
+            fs <- sepGo "," (defaultedF g) (Cons f Nil) Nil
+            c <- expectPunct "}"
+            pure (mkBraces o fs c))
 
 -- | `C x y`, an alternative of a sum
 altConF : Gram -> P E
@@ -1323,6 +1361,8 @@ firstE (Named o x k e c) = o
 firstE (Tup o es commas c) = o
 firstE (Braces o fs commas c) = o
 firstE (InstB o o2 d c1 c) = o
+firstE (Update o r bar fs commas c) = o
+firstE (EUSet x eq e) = firstE x
 firstE (EFSet x eq e) = x
 firstE (EFDefault e eq d) = firstE e
 firstE (Sum kw o alts bars c) = kw
@@ -1352,6 +1392,8 @@ lastE (Named o x k e c) = c
 lastE (Tup o es commas c) = c
 lastE (Braces o fs commas c) = c
 lastE (InstB o o2 d c1 c) = c
+lastE (Update o r bar fs commas c) = c
+lastE (EUSet x eq e) = lastE e
 lastE (EFSet x eq e) = lastE e
 lastE (EFDefault e eq d) = lastE d
 lastE (Sum kw o alts bars c) = c
@@ -1478,6 +1520,15 @@ tsE (Braces o fs commas c) =
   Cons o (List.append (interleaveT (List.map tsE fs) commas) (Cons c Nil))
 tsE (InstB o o2 d c1 c) =
   Cons o (Cons o2 (List.append (tsE d) (Cons c1 (Cons c Nil))))
+tsE (Update o r bar fs commas c) =
+  Cons
+    o
+    (List.append
+       (tsE r)
+       (Cons
+          bar
+          (List.append (interleaveT (List.map tsE fs) commas) (Cons c Nil))))
+tsE (EUSet x eq e) = List.append (tsE x) (Cons eq (tsE e))
 tsE (EFSet x eq e) = Cons x (Cons eq (tsE e))
 tsE (EFDefault e eq d) = List.append (tsE e) (Cons eq (tsE d))
 tsE (Sum kw o alts bars c) =

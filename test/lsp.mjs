@@ -303,6 +303,26 @@ try {
   const inLo = await request("textDocument/hover", { textDocument: { uri: du }, position: pos(defaults, "lo\n  , width") });
   expect("hover on a field a default names", inLo.result && inLo.result.contents.value.includes("lo : Int") && inLo.result.contents.value.includes("(local)"), inLo.result);
 
+  // a record updated, `{ r | x = v }`: a field it sets, and a field of
+  // one, `pos.py`, as fields set are; a field's references and rename
+  // take in where an update sets it
+  const upd = disk("test/surface/record-update.hf");
+  const uu = uri("test/surface/record-update.hf");
+  open("test/surface/record-update.hf", upd);
+  ds = await diagnosticsOf(uu);
+  expect("an update: no diagnostics", ds.length === 0, ds);
+  for (const [what, at, says] of [["a field set", pos(upd, "x = b.x"), "x : Float64"], ["a field whose field is set", pos(upd, "pos.py"), "pos : Pos"], ["a field of a field", pos(upd, "py = 20"), "py : Int"]]) {
+    const h = await request("textDocument/hover", { textDocument: { uri: uu }, position: at });
+    expect("hover on " + what + " in an update", h.result && h.result.contents.value.includes(says), h.result);
+  }
+  const pyRefs = await request("textDocument/references", { textDocument: { uri: uu }, position: pos(upd, "py = 2 }"), context: { includeDeclaration: true } });
+  const pyLines = pyRefs.result ? pyRefs.result.map((r) => r.range.start.line) : [];
+  expect("references of a field take in an update's", pyLines.includes(pos(upd, "pos.py = 20").line), pyRefs.result);
+  const unitRen = await request("textDocument/rename", { textDocument: { uri: uu }, position: pos(upd, "unit : t"), newName: "one" });
+  const unitEdits = unitRen.result && unitRen.result.changes && unitRen.result.changes[uu];
+  expect("a rename of a field takes in an update's", unitEdits && unitEdits.some((e) => e.range.start.line === pos(upd, "unit = 1").line && e.newText === "one"), unitRen);
+  notify("textDocument/didClose", { textDocument: { uri: uu } });
+
   // an outline: each definition, a data's tags and a theory's fields under it
   const outline = await request("textDocument/documentSymbol", { textDocument: { uri: uri("test/surface/basics.hf") } });
   const sym = (n) => outline.result && outline.result.find((s) => s.name === n);

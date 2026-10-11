@@ -71,6 +71,24 @@ packed : Packed
 packed = { t = Int, size = 8 }
 ```
 
+A record with some fields replaced, `{ r | x = v, ... }`, is of `r`'s
+type: each field set is one of the type's, set once and at its type, in
+any order, and every other field is `r`'s, `r` computed once.  A field
+of a field is set by its path: `{ s | pos.x = 1 }` is
+`{ s | pos = { s.pos | x = 1 } }`.  A field not set keeps `r`'s value
+though it has a default -- defaults are given where a record is built,
+not where one is updated -- and one whose type a field set changes (a
+theory's `unit : t`, where `t` is set) is set too.  A theory's record
+is updated the same way.
+
+```haskell
+move : Float64 -> Body -> Body
+move dt b = { b | x = b.x + dt * b.vx, y = b.y + dt * b.vy }
+
+loud : Opts
+loud = { quiet | name = "loud" }   -- { name = "loud", verbose = False, label = "quiet" }
+```
+
 ## Implicit arguments
 
 An implicit argument, `{x : A} -> B`, is inferred where the function is

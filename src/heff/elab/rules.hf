@@ -2711,6 +2711,252 @@ localDef x typ body rest =
             (MkAbs x erest))
          (M.fixM ty x ebody)))
 
+-- Update
+--------------------------------------------------------------------------------
+
+-- `{ r | x = v }` is `r` bound once, and the record of its type with
+-- `x` set to `v`, every other field `r`'s own:
+--
+--   { r | x = v }  at  { x : Int, y : Int }  is  (\r' -> { x = v, y = r'.y }) r
+--
+-- A field not set keeps `r`'s value, a default too: defaults are given
+-- where a record is built, not where one is updated.  `x.y = v` sets
+-- field `y` of `r.x` the same way, the settings under one field put
+-- together.
+
+-- | a setting of an update: the field (where its name is, where the
+-- | setting is) set to a value, or its own fields set (`x.y = v`)
+data UpdateField
+  = UpdateTo String P.Span P.Span Chk
+  | UpdateIn String P.Span P.Span (List UpdateField)
+
+updateName : UpdateField -> String
+updateName (UpdateTo x _ _ _) = x
+updateName (UpdateIn x _ _ _) = x
+
+updateSpan : UpdateField -> P.Span
+updateSpan (UpdateTo _ _ sp _) = sp
+updateSpan (UpdateIn _ _ sp _) = sp
+
+appendInner : List UpdateField
+            -> Maybe (List UpdateField)
+            -> Maybe (List UpdateField)
+appendInner fs (Just more) = Just (appendP fs more)
+appendInner fs Nothing = Nothing
+
+-- | the settings of `x.y = v`, `x.z = w`: `y = v`, `z = w`
+updateInner : List UpdateField -> Maybe (List UpdateField)
+updateInner Nil = Just Nil
+updateInner (Cons (UpdateIn _ _ _ fs) rest) = appendInner fs (updateInner rest)
+updateInner (Cons (UpdateTo _ _ _ _) rest) = Nothing
+
+-- | a field kept or set, whose type in the record updated `t` must be
+-- | its type in the record made, `fty` (one a field set depends on is
+-- | not: it is set too)
+sameField : P.Span -> ElabEnv -> String -> V.Ty -> M.El -> V.Ty -> Elab M.El
+sameField sp e x fty m t = do
+  r <- Mt.attempt (Mt.unifyTy e.globals (shape e.scope) fty t)
+  case r of
+    Right _ -> do
+      Mt.runDelayed False
+      pure m
+    Left err -> do
+      want <- tyStrZ e fty
+      got <- tyStrZ e t
+      failWithNote
+          sp
+          11
+          ("field "
+           ^ x
+           ^ " is of type "
+           ^ got
+           ^ " in the record updated, but of type "
+           ^ want
+           ^ " in the record made: set it too")
+          (prettyEqErr e.globals err)
+
+-- | field `x` of the record `g` (of type `a`), bound to `r`, and its
+-- | type: named by the binder, so that `g` is computed once, but `g`'s
+-- | own as a value -- the redex the binder is of is, reduced -- so that
+-- | a field a type depends on is what it is (`r.t` is `Int`)
+updatedField : P.Span
+             -> ElabEnv
+             -> String
+             -> M.El
+             -> V.Ty
+             -> String
+             -> Elab (Pair M.El V.Ty)
+updatedField sp e r g a x = case findLocal e r of
+  Right (MkPair v _) ->
+    let bound = M.boundTo v g
+    in case V.behavior a of
+    LikeRecord level capture fieldTypes -> case V.projTyMaybe a (M.valN g) x of
+      Just t -> pure (MkPair (M.proj bound x) t)
+      Nothing -> case fieldTyApart e.scope.len level capture fieldTypes x of
+        Just t -> pure (MkPair (M.projAt bound x t) t)
+        Nothing ->
+          failWith
+            sp
+            32
+            ("the type of field "
+             ^ x
+             ^ " depends on the fields before it, and what the record's are is not known here")
+    _ -> failWith sp 6 "tried to update a value that was not of a record type"
+  Left _ -> failWith sp 3 "the record updated is out of scope"
+
+-- | a field the update does not set: the record's own
+keptField : P.Span -> String -> M.El -> V.Ty -> String -> Chk
+keptField sp r g a x =
+  MkChk (\e fty -> do
+  pt <- updatedField sp e r g a x
+  case pt of
+    MkPair m t -> sameField sp e x fty m t)
+
+-- (the field's name, where it is written, as `recordName` has it)
+recordNameOf : ElabEnv -> V.Ty -> String -> P.Span -> Elab Unit
+recordNameOf e a x xsp = case V.behavior a of
+  LikeRecord level capture fieldTypes -> case fieldTyApart
+      e.scope.len
+      level
+      capture
+      fieldTypes
+      x of
+    Just t -> recordName e a x xsp t
+    Nothing -> pure MkUnit
+  _ -> pure MkUnit
+
+-- | field `x` set twice, or set and a field of it set too
+givenTwice : {b : Type} -> List UpdateField -> String -> Elab b
+givenTwice fs x = case List.drop
+    1
+    (List.filter (\f -> strEq (updateName f) x) fs) of
+  Cons f _ -> failWith (updateSpan f) 4 ("record field " ^ x ^ " is set twice")
+  Nil -> failWith P.noSpan 4 ("record field " ^ x ^ " is set twice")
+
+-- | how a record is updated (`updateOf`, below)
+type Updater =
+  P.Span -> String -> ElabEnv -> M.El -> V.Ty -> List UpdateField -> Elab M.El
+
+-- | a field whose own fields the update sets: the record's, updated
+nestedField : Updater
+            -> P.Span
+            -> String
+            -> M.El
+            -> V.Ty
+            -> String
+            -> List UpdateField
+            -> Chk
+nestedField upd sp r g a x fs =
+  MkChk (\e fty -> do
+  pt <- updatedField sp e r g a x
+  case pt of
+    MkPair m t -> do
+      m' <- upd sp r e m t fs
+      sameField sp e x fty m' t)
+
+-- | field `x` of the record made: kept, or as the settings of it say
+updateSetting : Updater
+              -> ElabEnv
+              -> P.Span
+              -> String
+              -> M.El
+              -> V.Ty
+              -> List UpdateField
+              -> String
+              -> Elab FieldSetting
+updateSetting upd e sp r g a fs x = case List.filter
+    (\f -> strEq (updateName f) x)
+    fs of
+  Nil ->
+    pure
+      { name = x, chk = keptField sp r g a x, span = sp, nameSpan = P.noSpan }
+  Cons (UpdateTo _ xsp fsp c) Nil ->
+    pure { name = x, chk = c, span = fsp, nameSpan = xsp }
+  Cons (UpdateIn _ xsp fsp inner) more -> case updateInner more of
+    Just rest -> do
+      recordNameOf e a x xsp
+      pure
+          { name = x
+          , chk = nestedField upd fsp r g a x (appendP inner rest)
+          , span = fsp
+          , nameSpan = P.noSpan
+          }
+    Nothing -> givenTwice fs x
+  _ -> givenTwice fs x
+
+-- | a setting of a field the type does not have
+noSuchSetting : ElabEnv -> V.Ty -> List String -> List UpdateField -> Elab Unit
+noSuchSetting e a keys Nil = pure MkUnit
+noSuchSetting e a keys (Cons f rest) =
+  if List.elemBy strEq (updateName f) keys then noSuchSetting e a keys rest
+  else failWithNote
+      (updateSpan f)
+      7
+      ("no such field " ^ updateName f ^ " in type " ^ tyStr e a)
+      ("the fields are " ^ joinWith ", " keys)
+
+-- | the record `g`, of type `a0`, its fields set as `fs` say: bound to
+-- | `r`, and made anew of it
+updateOf : P.Span
+         -> String
+         -> ElabEnv
+         -> M.El
+         -> V.Ty
+         -> List UpdateField
+         -> Elab M.El
+updateOf sp r e g a0 fs = do
+  a <- Mt.forceT a0
+  case V.behavior a of
+    LikeRecord level capture fieldTypes -> do
+      let keys = A.toList fieldTypes.keys
+      noSuchSetting e a keys fs
+      settings <- traverseE (\x -> updateSetting updateOf e sp r g a fs x) keys
+      -- (bound by a beta-redex, as `let` binds)
+      body <-
+        withBound
+          r
+          a
+          e.scope
+          (\v scope' -> runChk (recordIntro sp settings) (withScope e scope') a)
+      pure
+          (M.app
+             (M.lam
+                (caseOf e.elabFor)
+                e.globals
+                e.scope.locals
+                (M.function
+                   e.globals
+                   e.scope.locals
+                   (M.fromVTy N e.scope.len a)
+                   (MkAbs r (M.fromVTy N (e.scope.len + 1) a)))
+                (MkAbs r body))
+             g)
+    NoRules -> do
+      blocked <- Mt.blockedTy a
+      if blocked then pure (errorHole a)
+        else failWith
+            sp
+            32
+            "the record's shape is not in hand here for the update: annotate the binder, `\\(x : T) -> ...`, or give the implicit argument, `(a := T)`"
+    _ -> do
+      blocked <- Mt.blockedTy a
+      if blocked then pure (errorHole a)
+        else failWith
+            sp
+            6
+            "tried to update a value that was not of a record type"
+
+-- | `{ s | fs }`, bound to `r` (a name none of the settings has)
+recordUpdate : P.Span -> Syn -> String -> List UpdateField -> Syn
+recordUpdate sp s r fs =
+  MkSyn (\e -> do
+  ps <- runSyn s e
+  given <- insertImplicits e sp (fst ps) (snd ps)
+  case given of
+    MkPair g a -> do
+      m <- updateOf sp r e g a fs
+      pure (MkPair m a))
+
 -- Universe
 --------------------------------------------------------------------------------
 
