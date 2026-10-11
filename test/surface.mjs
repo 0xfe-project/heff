@@ -24,7 +24,7 @@ const n = Math.min(availableParallelism(), files.length);
 const runs = await pool(Array.from({ length: n }, (_, i) => files.filter((_, k) => k % n === i)), (some) => run(heffBin, ["test", ...some]));
 const held = [0, 0, 0, 0];
 for (const t of runs) {
-  const m = /(\d+)\/(\d+) expectations hold(?:, (\d+)\/(\d+) tests hold)?\n$/.exec(t.stdout) ?? [];
+  const m = /(\d+)\/(\d+) expectations hold(?:, (\d+)\/(\d+) tests hold)?(?:, \d+ files? do(?:es)? not check: .*)?\n$/.exec(t.stdout) ?? [];
   for (let i = 0; i < 4; i++) held[i] += Number(m[i + 1] ?? 0);
   if (t.status !== 0 || !m.length) { failed++; console.log(t.stdout + t.stderr); }
 }

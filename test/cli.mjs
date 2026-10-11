@@ -106,6 +106,20 @@ expect("test --seed", seeded.status === 1 && seeded.stdout.includes("again: --se
   runsOf(seeded) !== undefined && runsOf(seeded) !== runsOf(props), { seeded, props });
 expect("test --seed, again", heff("test", "props.hf", "-s", "99").stdout === seeded.stdout, seeded);
 
+// test: a file that does not check fails the run, and the last line says
+// so and names it, though every expectation counted holds -- one with a
+// type error, its watch evaluated still, and one that does not parse
+writeFileSync(join(work, "mistyped.hf"), ["-- >>> 1 + 1", "-- 2", "", "oops : Int", "oops = True", ""].join("\n"));
+writeFileSync(join(work, "unparsed.hf"), ["x : Int", "x = (1 +", ""].join("\n"));
+const mistyped = heff("test", "p.hf", "mistyped.hf");
+expect("test, a file that does not check", mistyped.status === 1 &&
+  mistyped.stdout.includes("FAIL  mistyped.hf  1/1\n") &&
+  mistyped.stdout.endsWith("4/4 expectations hold, 1 file does not check: mistyped.hf\n"), mistyped);
+const unchecked = heff("test", "p.hf", "mistyped.hf", "unparsed.hf");
+expect("test, files that do not check", unchecked.status === 1 &&
+  unchecked.stdout.includes("FAIL  unparsed.hf  0/0\n") &&
+  unchecked.stdout.endsWith("4/4 expectations hold, 2 files do not check: mistyped.hf, unparsed.hf\n"), unchecked);
+
 // fmt: --check names what is not laid out (and fails), leaves it; without
 // it, lays it out; a file that does not parse is refused, untouched
 writeFileSync(join(work, "messy.hf"), "f :  Int -> Int\nf x   =  x + 1\n");
