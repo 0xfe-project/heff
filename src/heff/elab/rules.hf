@@ -596,7 +596,7 @@ instantiateGo e sp m ty subgoals = case ty of
     instantiateGo
         e
         sp
-        (M.app m (mEl hole.stx hole.val))
+        (M.iapp (cloNameOr cod) m (mEl hole.stx hole.val))
         (V.nom (V.appClo cod (\u -> hole.val)))
         (Cons { hole = hole, goal = dom } subgoals)
   _ -> pure { applied = m, conclusion = ty, subgoals = List.reverse subgoals }
@@ -617,29 +617,68 @@ fitOf w inst after (Right _) =
   Just { witness = w, instantiated = inst, state = after }
 fitOf w inst after (Left _) = Nothing
 
--- | the global a scheme's conclusion is of, if it is a theory's or a
--- | type's: its binders given placeholders (rigid locals, looked at for
--- | the head alone), as the conclusion's head is none of them
-conclusionHead : Int -> V.Ty -> Maybe String
-conclusionHead n ty = case ty of
+-- | a scheme's conclusion, its binders given placeholders (rigid locals,
+-- | looked at for what is rigid in the conclusion alone: a placeholder
+-- | is none of it)
+conclusionOf : Int -> V.Ty -> V.Ty
+conclusionOf n ty = case ty of
   VFunction level dom cod Impl dflt ->
-    conclusionHead (n + 1) (V.nom (V.appClo cod (\u -> V.local n dom)))
+    conclusionOf (n + 1) (V.nom (V.appClo cod (\u -> V.local n dom)))
   VFunction level dom cod Inst dflt ->
-    conclusionHead (n + 1) (V.nom (V.appClo cod (\u -> V.local n dom)))
-  VDecode (HGlobal k) sp u described el -> Just k
+    conclusionOf (n + 1) (V.nom (V.appClo cod (\u -> V.local n dom)))
+  _ -> ty
+
+-- | a type, as an argument, by its former, where no unification could
+-- | make it another: a built-in or fixed-width type, a decoded type's
+-- | global head, or a global no record of fields stands for (a data
+-- | type, `List a`) -- unification compares heads, it unfolds none
+rigidFormer : V.MetaCtx -> V.V -> Maybe String
+rigidFormer mc v = case V.forceEl mc v of
+  VNeu (HGlobal k) sp ty expansion desc -> case expansion MkUnit of
+    NotApplicable -> Just k
+    IntoCons _ -> Nothing
+  VCode t -> case V.forceTy mc t of
+    VPrimInt -> Just "Int"
+    VPrimFloat -> Just "Float64"
+    VPrimString -> Just "String"
+    VPrimRune -> Just "Rune"
+    VPrimArray _ -> Just "Array"
+    VFixed w -> Just (Fx.fixedName w)
+    VDecode (HGlobal k) sp u described el -> Just k
+    _ -> Nothing
   _ -> Nothing
 
--- | whether a conclusion of the global `k` is apart from the goal, so
--- | that no unification could make them one: a decoded type's head is
--- | rigid -- unification compares heads, it unfolds neither -- so a goal
--- | of another head is apart, and so is one that is no decoded type (but
--- | an error, equal to anything)
-apartFrom : V.MetaCtx -> V.Ty -> Maybe String -> Bool
-apartFrom mc goal (Just k) = case V.forceTy mc goal of
-  VDecode (HGlobal k2) sp u described el -> not (strEq k k2)
-  VDecode h sp u described el -> False
-  t -> not (V.isErrorTy t)
-apartFrom mc goal Nothing = False
+-- | whether two arguments are of rigid formers that differ
+apartArgs : V.MetaCtx -> V.V -> V.V -> Bool
+apartArgs mc a b = case rigidFormer mc a of
+  Just k -> case rigidFormer mc b of
+    Just k2 -> not (strEq k k2)
+    Nothing -> False
+  Nothing -> False
+
+-- | whether two spines, argument by argument, have a pair that is apart
+apartSpines : V.MetaCtx -> V.Spine V.V -> V.Spine V.V -> Bool
+apartSpines mc (SpApp sp a) (SpApp sp2 b) =
+  apartArgs mc a b || apartSpines mc sp sp2
+apartSpines mc _ _ = False
+
+-- (`apartFrom`, the goal forced)
+apartForced : V.MetaCtx -> V.Ty -> V.Ty -> Bool
+apartForced mc (VDecode (HGlobal k2) sp _ _ _) (VDecode (HGlobal k) csp _ _ _) =
+  not (strEq k k2) || apartSpines mc sp csp
+apartForced mc (VDecode _ _ _ _ _) conclusion = False
+apartForced mc t (VDecode (HGlobal k) _ _ _ _) = not (V.isErrorTy t)
+apartForced mc t conclusion = False
+
+-- | whether a scheme's conclusion is apart from the goal, so that no
+-- | unification could make them one: a decoded type's head is rigid --
+-- | unification compares heads, it unfolds neither -- so a goal of
+-- | another head is apart, and so is one that is no decoded type (but an
+-- | error, equal to anything); and of the same head, one an argument of
+-- | which is of another rigid former (`Eq Int` and `eqList`'s `Eq (List
+-- | a)`), so that a search for `x == y` at `Int` tries `eqInt` alone
+apartFrom : V.MetaCtx -> V.Ty -> V.Ty -> Bool
+apartFrom mc goal conclusion = apartForced mc (V.forceTy mc goal) conclusion
 
 -- | a candidate tried: its binders given, its conclusion unified with the
 -- | goal, and the state put back whatever the answer -- the
@@ -647,12 +686,12 @@ apartFrom mc goal Nothing = False
 -- | what was written down of it -- so that each candidate is tried from
 -- | the same state (neither does more than the state of elaboration: no
 -- | check waits on them).  A scheme whose conclusion is apart from the
--- | goal by its head is not tried: it would be given its binders, in each
--- | search, for nothing.
+-- | goal is not tried: it would be given its binders, in each search,
+-- | for nothing.
 fits : ElabEnv -> P.Span -> V.Ty -> Witness -> Elab (Maybe Fit)
 fits e sp goal w = do
   mc <- gets (\c -> c.metas)
-  if w.scheme && apartFrom mc goal (conclusionHead 0 w.ty) then pure Nothing
+  if w.scheme && apartFrom mc goal (conclusionOf 0 w.ty) then pure Nothing
     else do
       before <- gets (\c -> c)
       inst <- instantiate e sp w
@@ -937,12 +976,14 @@ insertImplicits e sp m ty0 = do
           (V.nom (V.appClo cod (\u -> M.valN arg)))
     -- an instance argument gets a hole, to be found (`settle`)
     -- among the witnesses in scope once its goal type has no metas left
+    -- (marked implicit, as it is not written: printed, it is left out,
+    -- and `n + 1` is printed so)
     LikeFunction level dom cod Inst -> do
       arg <- insertInstance e sp dom (cloNameOr cod)
       insertImplicits
           e
           sp
-          (M.app m arg)
+          (M.iapp (cloNameOr cod) m arg)
           (V.nom (V.appClo cod (\u -> M.valN arg)))
     _ -> pure (MkPair m ty)
 
@@ -1225,7 +1266,7 @@ functionElimImplicit sp callee arg =
           earg <- runChk arg e dom
           pure
               (MkPair
-                 (M.app ecallee earg)
+                 (M.iapp (cloNameOr cod) ecallee earg)
                  (V.nom (V.appClo cod (\u -> M.valN earg))))
         LikeFunction level dom cod implicit ->
           failWith
@@ -1260,8 +1301,8 @@ namedGo sp x arg e m ty0 = do
           earg <- runChk arg e dom
           pure
               (MkPair
-                 (if P.eqPlicity implicit Impl then M.iapp x m earg
-                  else M.app m earg)
+                 (if P.eqPlicity implicit Expl then M.app m earg
+                  else M.iapp x m earg)
                  (V.nom (V.appClo cod (\u -> M.valN earg))))
       else if P.eqPlicity implicit Impl
         then do
@@ -1282,7 +1323,7 @@ namedGo sp x arg e m ty0 = do
               x
               arg
               e
-              (M.app m earg)
+              (M.iapp (cloNameOr cod) m earg)
               (V.nom (V.appClo cod (\u -> M.valN earg)))
       else noArgNamed sp x
     _ -> noArgNamed sp x

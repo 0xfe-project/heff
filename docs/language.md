@@ -114,12 +114,15 @@ argument, which no search gives, is refused (E0348), and so is an
 implicit one not in what the instance is an instance of, which the
 unification could not solve (E0350).
 
-The prelude's `Eq` is a type's equality, `equal x y`: its instances are
-`Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s, `Bool`'s,
-`Unit`'s and `Ordering`'s, those of a `List`, a `Maybe`, a `Pair` and an
-`Either` of types that have one (`eqList`, `eqMaybe`, `eqPair`,
-`eqEither`), and each fixed-width type's module has its own (`int8`'s
-`eqInt8`).
+The prelude's `Eq` is a type's equality, `equal x y` and `x == y`: its
+instances are `Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s,
+`Bool`'s, `Unit`'s and `Ordering`'s, those of a `List`, a `Maybe`, a
+`Pair` and an `Either` of types that have one (`eqList`, `eqMaybe`,
+`eqPair`, `eqEither`), and each fixed-width type's module has its own
+(`int8`'s `eqInt8`).  The prelude's other operators are theories' too
+([operators](#operators)).  A search tries only the instances whose
+type could be the one wanted: `x == y` at `Int` tries `eqInt`, not
+`eqList`, whose `Eq (List a)` no `Eq Int` is.
 
 ```haskell
 member : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool
@@ -160,14 +163,43 @@ infixl .+. below +
 (.+.) a b = a * 10 + b
 ```
 
+The prelude's operators are each a theory's operation, as Lean's are:
+`+` is `Add`'s `add`, `-` `Sub`'s `sub`, `*` `Mul`'s `mul`, `/` `Div`'s
+`div`, `%` `Mod`'s `mod`, `==` and `/=` `Eq`'s `equal`, `<` and `<=`
+`Ord`'s `lt` and `le` (`>` and `>=` the same, flipped), and `-x`
+`Neg`'s `neg` -- each an instance argument, found at the type it is
+used at: `n + 1` at `Int` is the prelude's `addInt`'s, `x * c` at
+`Int64` `int64`'s `mulInt64`'s, in one file, and a function of any type
+that has one asks for it.  A type has those it has: an integer type
+every one, a float no `/` or `%` -- a `Float64`'s division, IEEE's (by
+0, an infinity), is `/.`, which binds as `*` does.  `Ord`'s `compare`,
+`min` and `max` are the prelude's too, `HasZero`'s `zero` (a theory of
+the name `Zero` would take `Nat`'s tag), and `Bits`', an integer type's
+bits: `and`, `or`, `xor`, `complement`, `shiftL` and `shiftR`.  Where the
+instance is known, what is compiled is the operation itself: `n + 1` at
+`Int` is `intAdd n 1`, as if written so, and `n < 2` a C condition.
+
+```haskell
+twice : {a : Type} -> {{add : Add a}} -> a -> a
+twice x = x + x   -- twice 21 is 42, twice 1.25 is 2.5
+
+step : Int64 -> Int64
+step x = x * 6364136223846793005 + 1442695040888963407   -- with `import int64 as I64`
+```
+
 ## Numbers
 
 `Int` is an integer of any size, `Float64` IEEE 754's double.  Built in beside them are the fixed-width
 numbers: `Int8`, `Int16`, `Int32` and `Int64` (two's complement),
 `UInt8` to `UInt64`, and `Float32` (IEEE 754's single).  An integer of
-one wraps around, as the machine's does, divides rounding toward zero,
-and shifts by the amount modulo its bits; each operation of a `Float32`
-is rounded to one.
+one wraps around, as the machine's does (the least by -1 is itself),
+divides rounding toward zero, and shifts by the amount modulo its bits;
+each operation of a `Float32` is rounded to one.  An `Int` divides
+rounding down, its remainder of the divisor's sign.  An integer's
+division is total, as Lean's and Coq's are: by zero it is 0, and its
+remainder the dividend, so that `(x / y) * y + x % y` is `x` whatever
+`y` is -- for a program that would hear of a zero divisor, `exn`'s
+`exnDiv` and `exnMod` throw `MkDivByZero` instead.
 
 A number literal is of the type it is used at: an integer literal of any
 number type, a fractional one (`2.5`) of a float type.  An integer
@@ -211,22 +243,23 @@ which one type's value becomes another's (`I8.fromInt (I32.toInt x)`).
 `int`'s (`import int as I`: `I.and`, `I.or`, `I.xor`, `I.complement`,
 `I.shiftL`, `I.shiftR`), as two's complement has them with the sign
 extended for ever; a shift right rounds down, and one by a negative
-count abandons.  A fixed-width type's operators, `+` to `>=`, are its
-module's too, for a module that imports it as it is: the prelude's,
-which it has without writing it, give way to them.  How each number is
-kept by each backend, and given to a provider, is in
-[providers.md](providers.md#numbers-and-runes).
+count abandons.  A fixed-width type's instances are its module's, found
+wherever it is imported, by a name or not: the prelude's operators at
+its type, `x * c + d` at `Int64` beside `n + 1` at `Int`, and `and x y`
+(`int`'s `bitsInt` is an `Int`'s); `float32`'s has all but `Div`, `Mod`
+and `Bits`.  How each number is kept by each backend, and given to a
+provider, is in [providers.md](providers.md#numbers-and-runes).
 
 `-` where it would be a number's sign, right before a name or a `(`
 instead of a digit, negates what it is before: a name with its fields
 (`-p.x`) or what is in parentheses (`-(f y)`), an argument's worth.  It
 is the `neg` in scope applied to it, as `a - b` is the `(-)` in scope:
-the prelude's `neg` negates an `Int`, and a fixed-width type's module,
-imported as it is, has its own, which `-x` then is.  So `f -x` is
-`f (-x)`, as `f -1` is `f (-1)`, while `a - x` and `a-x` subtract;
-`-f x` is `(-f) x`, and `- x`, a space after the `-`, is no negation.
-A `Float64` has no `neg`, so no `-x` either (`negFloat x`), and a
-pattern's `-` is only a number's sign.
+the prelude's `neg` is `Neg`'s, of any type that has one -- an `Int`, a
+float (0.0's sign too: `1.0 /. -zero` is -Infinity), a fixed-width type
+-- and a fixed-width type's module, imported as it is, has its own,
+which `-x` then is.  So `f -x` is `f (-x)`, as `f -1` is `f (-1)`, while
+`a - x` and `a-x` subtract; `-f x` is `(-f) x`, and `- x`, a space after
+the `-`, is no negation.  A pattern's `-` is only a number's sign.
 
 ## Runes and strings
 

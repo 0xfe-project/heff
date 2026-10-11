@@ -25,7 +25,8 @@ writing them ([how names are found](language.md#modules)).  The others
 are imported by their names:
 
 - `co` ([effects](language.md#effects)), and effects made with it:
-  `state`, `exn` and `parallel`;
+  `state`, `exn` (with `exnDiv` and `exnMod`, a division that throws by
+  zero) and `parallel`;
 - `array`, `map` and `set`;
 - `check` and `gen`, the tests and their generators
   ([tests.md](tests.md#unit-tests-and-properties));

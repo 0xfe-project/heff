@@ -1262,9 +1262,10 @@ HEFF_FAST V heff_intMul(V a, V b) {
   return heff_intMul_big(a, b);
 }
 
-// (rounded down, as the other backends round; by 0, `abandon`, which
-// the call does.  Of two words only -2^62 / -1 is beyond a word)
-INT_BIG(V, heff_intDiv, y.n == 0 ? heff_abandon() : num_divmod(&x, &y, 0))
+// (rounded down, as the other backends round; by 0, 0 -- a division is
+// total -- which the call gives.  Of two words only -2^62 / -1 is beyond
+// a word)
+INT_BIG(V, heff_intDiv, y.n == 0 ? MK_INT(0) : num_divmod(&x, &y, 0))
 HEFF_FAST V heff_intDiv(V a, V b) {
   if (BOTH_INT(a, b) && b != MK_INT(0)) {
     int64_t x = INT_OF(a), y = INT_OF(b), q = x / y, r = x % y;
@@ -1274,8 +1275,9 @@ HEFF_FAST V heff_intDiv(V a, V b) {
   return heff_intDiv_big(a, b);
 }
 
-// (of the divisor's sign, and nearer 0 than it: a word)
-INT_BIG(V, heff_intMod, y.n == 0 ? heff_abandon() : num_divmod(&x, &y, 1))
+// (of the divisor's sign, and nearer 0 than it: a word; by 0, the
+// dividend, which the call gives -- `(a / b) * b + a % b` is `a` still)
+INT_BIG(V, heff_intMod, y.n == 0 ? heff_dup(a) : num_divmod(&x, &y, 1))
 HEFF_FAST V heff_intMod(V a, V b) {
   if (BOTH_INT(a, b) && b != MK_INT(0)) {
     int64_t y = INT_OF(b), r = INT_OF(a) % y;
@@ -1840,7 +1842,8 @@ static inline float heff_f32_of(V v) {
 // beyond 62 bits), so `toInt` is nothing.  An integer's operation is
 // done on its 64 bits, unsigned (where no overflow is undefined), and the
 // result wrapped around to its type; a division by -1 is a negation
-// (that of the least, itself), as no C division by -1 is safe.  A
+// (that of the least, itself), as no C division by -1 is safe, and one
+// by 0 is 0, its remainder the dividend, as an `Int`'s are.  A
 // `Float32` is a word of its bits (`heff_f32`): C's `float` is IEEE's,
 // each operation rounded, as JavaScript's `Math.fround` rounds.
 
@@ -1891,12 +1894,12 @@ static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x * y); }       \
   static V heff_##name##Div(V a, V b) {                                              \
     T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
-    if (y == 0) return heff_abandon();                                               \
+    if (y == 0) return fx_mk_##T(0);                                                 \
     if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T((uint64_t)0 - (uint64_t)x);    \
     return fx_mk_##T((uint64_t)(x / y)); }                                           \
   static V heff_##name##Rem(V a, V b) {                                              \
     T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
-    if (y == 0) return heff_abandon();                                               \
+    if (y == 0) return fx_mk_##T((uint64_t)x);                                       \
     if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T(0);                            \
     return fx_mk_##T((uint64_t)(x % y)); }                                           \
   static inline int heff_##name##Eq_c(V a, V b) {                                   \

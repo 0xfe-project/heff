@@ -7,7 +7,7 @@
 -- first used.  `abandon` is a value, `Abn`, threaded through every
 -- step -- so a watch that abandons reports `<abandoned>` instead of
 -- ending the run.  Evaluation that goes deeper than `deepest` is said
--- to diverge, `Div`: every function and every thunk is given the depth
+-- to diverge, `Diverged`: every function and every thunk is given the depth
 -- it is forced at.
 
 import array as A
@@ -24,7 +24,7 @@ import std.math as Mt
 -- | a computation forced at a depth
 type Th a = Int -> a
 
-data Res a = Ok a | Abn | Div
+data Res a = Ok a | Abn | Diverged
 
 data Val
   = VFun (Int -> Th (Res Val) -> Res Val)
@@ -44,7 +44,7 @@ type RVal = Res Val
 rbind : RVal -> (Val -> RVal) -> RVal
 rbind (Ok v) f = f v
 rbind Abn f = Abn
-rbind Div f = Div
+rbind Diverged f = Diverged
 
 okTh : Val -> Th RVal
 okTh v = \d -> Ok v
@@ -170,7 +170,7 @@ arr1 : (Array Val -> RVal) -> Val
 arr1 f = VFun (\d a -> rbind (a d) (\av -> arrTake1 f av))
 
 isFiniteF : Float64 -> Bool
-isFiniteF x = (x -. x) ==. 0.0
+isFiniteF x = x - x == 0.0
 
 setAt : List Val -> Int -> Val -> List Val
 setAt Nil i x = Nil
@@ -253,8 +253,9 @@ fixedInt2 : Fx.Fixed -> Fx.FixedOp -> Int -> Int -> RVal
 fixedInt2 w OpAdd a b = wrapV w (a + b)
 fixedInt2 w OpSub a b = wrapV w (a - b)
 fixedInt2 w OpMul a b = wrapV w (a * b)
-fixedInt2 w OpDiv a b = if b == 0 then Abn else wrapV w (truncDiv a b)
-fixedInt2 w OpRem a b = if b == 0 then Abn else wrapV w (a - b * truncDiv a b)
+fixedInt2 w OpDiv a b = if b == 0 then wrapV w 0 else wrapV w (truncDiv a b)
+fixedInt2 w OpRem a b =
+  if b == 0 then wrapV w a else wrapV w (a - b * truncDiv a b)
 fixedInt2 w OpEq a b = Ok (boolV (a == b))
 fixedInt2 w OpLt a b = Ok (boolV (a < b))
 fixedInt2 w OpLe a b = Ok (boolV (a <= b))
@@ -328,11 +329,11 @@ prim p =
   if strEq p "intAdd" then int2 (\a b -> Ok (VInt (a + b)))
   else if strEq p "intSub" then int2 (\a b -> Ok (VInt (a - b)))
   else if strEq p "intMul" then int2 (\a b -> Ok (VInt (a * b)))
-  -- (by zero, `abandon` -- the value, not the end of the run)
+  -- (by zero, 0, and the remainder the dividend: a division is total)
   else if strEq p "intDiv"
-    then int2 (\a b -> if b == 0 then Abn else Ok (VInt (a / b)))
+    then int2 (\a b -> if b == 0 then Ok (VInt 0) else Ok (VInt (a / b)))
   else if strEq p "intMod"
-    then int2 (\a b -> if b == 0 then Abn else Ok (VInt (a % b)))
+    then int2 (\a b -> if b == 0 then Ok (VInt a) else Ok (VInt (a % b)))
   else if strEq p "intEq" then int2 (\a b -> Ok (boolV (a == b)))
   else if strEq p "intLt" then int2 (\a b -> Ok (boolV (a < b)))
   else if strEq p "intLe" then int2 (\a b -> Ok (boolV (a <= b)))
@@ -346,13 +347,13 @@ prim p =
     then int2 (\a b -> Ok (VInt (intBits (\x y -> (x + y) % 2) a b)))
   else if strEq p "intShl" then int2 (intShift (\a k -> a * k))
   else if strEq p "intShr" then int2 (intShift (\a k -> a / k))
-  else if strEq p "floatAdd" then float2 (\a b -> Ok (VFloat (a +. b)))
-  else if strEq p "floatSub" then float2 (\a b -> Ok (VFloat (a -. b)))
-  else if strEq p "floatMul" then float2 (\a b -> Ok (VFloat (a *. b)))
+  else if strEq p "floatAdd" then float2 (\a b -> Ok (VFloat (a + b)))
+  else if strEq p "floatSub" then float2 (\a b -> Ok (VFloat (a - b)))
+  else if strEq p "floatMul" then float2 (\a b -> Ok (VFloat (a * b)))
   else if strEq p "floatDiv" then float2 (\a b -> Ok (VFloat (a /. b)))
-  else if strEq p "floatEq" then float2 (\a b -> Ok (boolV (a ==. b)))
-  else if strEq p "floatLt" then float2 (\a b -> Ok (boolV (a <. b)))
-  else if strEq p "floatLe" then float2 (\a b -> Ok (boolV (a <=. b)))
+  else if strEq p "floatEq" then float2 (\a b -> Ok (boolV (a == b)))
+  else if strEq p "floatLt" then float2 (\a b -> Ok (boolV (a < b)))
+  else if strEq p "floatLe" then float2 (\a b -> Ok (boolV (a <= b)))
   else if strEq p "floatShow" then float1 (\a -> Ok (VStr (showFloat a)))
   else if strEq p "floatFromInt" then int1 (\a -> Ok (VFloat (toFloat a)))
   else if strEq p "floatSqrt" then float1 (\a -> Ok (VFloat (sqrt a)))
@@ -499,7 +500,7 @@ evalFields ev (Cons (MkPair l t) rest) k =
 
 evalIn : Int -> Env -> Sx.Tm -> RVal
 evalIn d e t =
-  if d > deepest then Div
+  if d > deepest then Diverged
   else case t of
     SLocal i -> case nthTh e.local i of
       Just v -> v d
@@ -637,11 +638,13 @@ fixThunk g t = \d ->
 -- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intAdd") (SLitInt 2)) (SLitInt 3))))
 -- | "5"
 -- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intDiv") (SLitInt 2)) (SLitInt 0))))
+-- | "0"
+-- | >>> showResult (resultOf (evalIn 0 { local = Nil, global = M.empty } (SApp (SApp (SPrim "intShl") (SLitInt 2)) (SLitInt -1))))
 -- | "<abandoned>"
 resultOf : RVal -> EvalResult
 resultOf (Ok v) = RSucceeded v
 resultOf Abn = RAbandoned
-resultOf Div = RDiverged
+resultOf Diverged = RDiverged
 
 -- | a value given `n` arguments that are types first -- erased where it
 -- | is compiled, so given as nothing -- as it is shown: `[]` of
