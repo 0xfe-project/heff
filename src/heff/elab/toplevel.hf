@@ -1143,24 +1143,62 @@ declaresInstance n = case instanceTypeAt n of
   Just _ -> True
   Nothing -> False
 
+-- | an implicit argument of an instance, by its name, and how many
+-- | binders are outside it
+type ImplicitBound = { name : String, level : Int }
+
+-- (an implicit argument the instance is of no type by: a search, which
+-- solves it by unifying what the instance is an instance of with the
+-- type wanted, could not)
+unsolvedImplicit : Pm.Span -> String -> Elab Unit
+unsolvedImplicit sp x =
+  failWithNote
+    sp
+    50
+    ("the instance's implicit argument `"
+     ^ x
+     ^ "` is not in what it is an instance of: a search, unifying that with the type wanted, cannot solve it")
+    "use it in what the instance is an instance of (`{a : Type} -> {{e : Eq a}} -> Eq (List a)`), or leave it out"
+
+-- | what the instance is an instance of mentions each of its implicit
+-- | arguments, `depth` binders inside the outermost
+everyImplicitIn : Pm.Span -> Int -> Sx.Ty -> List ImplicitBound -> Elab Unit
+everyImplicitIn sp depth conclusion Nil = pure MkUnit
+everyImplicitIn sp depth conclusion (Cons b rest) =
+  if (R.mentionsLocal (depth - 1 - b.level)).ty 0 conclusion
+    then everyImplicitIn sp depth conclusion rest
+  else unsolvedImplicit sp b.name
+
 -- | an instance's type takes implicit and instance arguments, if any,
 -- | before what it is an instance of (`{a : Type} -> {{e : Eq a}} -> Eq
 -- | (List a)`): a search solves the one by unification, finds the other,
--- | and gives no explicit one
-searchedInstance : Pm.Span -> Sx.Ty -> Elab Unit
-searchedInstance sp (SFunction _ _ _ Expl _) =
+-- | and gives no explicit one -- so each implicit argument is in what it
+-- | is an instance of, for the unification to solve
+searchedInstance : Pm.Span -> List ImplicitBound -> Int -> Sx.Ty -> Elab Unit
+searchedInstance sp implicits depth (SFunction _ _ _ Expl _) =
   failWithNote
     sp
     48
     "an instance takes only implicit and instance arguments, `{x : A}` and `{{x : A}}`: a search gives it no explicit one"
     "make it implicit, solved where the instance is found (`{a : Type} -> {{e : Eq a}} -> Eq (List a)`), or declare a definition, no instance, and give it its arguments where it is used"
-searchedInstance sp (SFunction _ _ cod _ _) =
-  searchedInstance sp (Ps.unIsTy (absBody cod))
-searchedInstance sp _ = pure MkUnit
+searchedInstance sp implicits depth (SFunction _ _ (MkAbs x cod) Impl _) =
+  searchedInstance
+    sp
+    (Cons { name = x, level = depth } implicits)
+    (depth + 1)
+    (Ps.unIsTy cod)
+searchedInstance sp implicits depth (SFunction _ _ (AbsConst cod) Impl _) =
+  unsolvedImplicit sp "_"
+searchedInstance sp implicits depth (SFunction _ _ (MkAbs x cod) _ _) =
+  searchedInstance sp implicits (depth + 1) (Ps.unIsTy cod)
+searchedInstance sp implicits depth (SFunction _ _ (AbsConst cod) _ _) =
+  searchedInstance sp implicits depth (Ps.unIsTy cod)
+searchedInstance sp implicits depth conclusion =
+  everyImplicitIn sp depth conclusion (List.reverse implicits)
 
 -- | an instance is of a type a search can find it by
 instanceType : Maybe Pm.Span -> M.Ty -> Elab Unit
-instanceType (Just sp) ty = searchedInstance sp (Ps.unIsTy ty.stx)
+instanceType (Just sp) ty = searchedInstance sp Nil 0 (Ps.unIsTy ty.stx)
 instanceType Nothing ty = pure MkUnit
 
 elabBody : (String -> String)
@@ -1320,6 +1358,35 @@ failedList : Elaborated -> List Diag
 failedList { failed = Just d } = reportedD d
 failedList { failed = Nothing } = Nil
 
+-- | the module a key is of, by the name it has there (`m.x`, `x`: `m`;
+-- | a key that is its name, as an expectation's, of none)
+keyModule : String -> String -> String
+keyModule key name =
+  if strEq key name then ""
+  else strSlice key 0 (strLength key - strLength name - 1)
+
+-- | a definition, an instance or not: one is a candidate for the
+-- | instance arguments after it; a definition of the name again, as no
+-- | instance, is none
+withInstance : Bool -> String -> String -> G.Globals -> G.Globals
+withInstance isInstance key name g =
+  if isInstance then G.addInstance key (keyModule key name) g
+  else if G.isInstance g key then G.dropInstance key g
+  else g
+
+-- | an instance declared that does not elaborate is in scope still, of
+-- | no type: a search that finds no instance may have wanted it, and is
+-- | no error of its own
+withBrokenInstance : (String -> String)
+                   -> Notation.Declaration
+                   -> G.Globals
+                   -> G.Globals
+withBrokenInstance kf n g = case Notation.declName n of
+  Just x ->
+    if declaresInstance n then G.addInstance (kf x) (keyModule (kf x) x) g
+    else g
+  Nothing -> g
+
 -- (not even its type: what uses it is not checked, and not refused)
 topBroken : (String -> String)
           -> TopResult
@@ -1329,10 +1396,13 @@ topBroken : (String -> String)
 topBroken kf acc n diags = case Notation.declName n of
   Just x ->
     mkTop
-      (G.addBroken
-         (kf x)
-         (if strEq (kf x) x then acc.globals
-          else G.addOwn x (kf x) acc.globals))
+      (withBrokenInstance
+         kf
+         n
+         (G.addBroken
+            (kf x)
+            (if strEq (kf x) x then acc.globals
+             else G.addOwn x (kf x) acc.globals)))
       diags
       acc.keys
       (Cons (MkPair x (Pm.spanOf n)) acc.broken)
@@ -1379,22 +1449,6 @@ knownEntry g k = case G.keyedEntry g k of
 addElaborated : Elaborated -> G.Globals -> G.Globals
 addElaborated r g =
   if r.prim && knownEntry g r.key then g else G.addEntry r.key r.entry g
-
--- | the module a key is of, by the name it has there (`m.x`, `x`: `m`;
--- | a key that is its name, as an expectation's, of none)
-keyModule : String -> String -> String
-keyModule key name =
-  if strEq key name then ""
-  else strSlice key 0 (strLength key - strLength name - 1)
-
--- | a definition, an instance or not: one is a candidate for the
--- | instance arguments after it; a definition of the name again, as no
--- | instance, is none
-withInstance : Bool -> String -> String -> G.Globals -> G.Globals
-withInstance isInstance key name g =
-  if isInstance then G.addInstance key (keyModule key name) g
-  else if G.isInstance g key then G.dropInstance key g
-  else g
 
 topTake : (String -> String)
         -> TopResult

@@ -110,7 +110,9 @@ Color in scope, wanted by eqList for Eq (List Color)`); one whose type
 what the instance is an instance of leaves undetermined is E0340.
 Searches go 32 deep at most (E0349), as an instance that wants one of a
 type no smaller than its own may want them without end.  An explicit
-argument, which no search gives, is refused (E0348).
+argument, which no search gives, is refused (E0348), and so is an
+implicit one not in what the instance is an instance of, which the
+unification could not solve (E0350).
 
 The prelude's `Eq` is a type's equality, `equal x y`: its instances are
 `Int`'s (`eqInt`), `Float64`'s, `String`'s, `Rune`'s, `Bool`'s,
