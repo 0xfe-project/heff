@@ -14,6 +14,7 @@
 -- interpreter is lazy.
 
 import heff.elab.effect as Ef
+import heff.compile.facts as F
 import heff.elab.fixed as Fx
 import heff.elab.globals as G
 import heff.compile.ir as I
@@ -318,45 +319,7 @@ valueRefs e = Nil
 -- program -- the runtime, a provider, a module's user -- `$tr` and
 -- `$ext` stand between.)
 
--- | whether it applies an unknown function last
-tailApp : I.Expr -> Bool
-tailApp (ELet _ _ b) = tailApp b
-tailApp (EMatch _ arms) = List.any (\a -> tailApp (I.armBody a)) arms
-tailApp (EApp _ _) = True
-tailApp e = False
-
--- | the definitions it calls last
-tailGlobals : I.Expr -> List String
-tailGlobals (ELet _ _ b) = tailGlobals b
-tailGlobals (EMatch _ arms) =
-  List.concatMap (\a -> tailGlobals (I.armBody a)) arms
-tailGlobals (ECall g _) = Cons g Nil
-tailGlobals e = Nil
-
-bodyBounces : M.Map String Unit -> I.Def -> Bool
-bodyBounces set d@{ body = ELam _ b } =
-  tailApp b
-  || List.any
-    (\g -> not (strEq g d.key) && M.member compareString g set)
-    (tailGlobals b)
-bodyBounces set d = False
-
-bounceStep : List I.Def -> M.Map String Unit -> M.Map String Unit
-bounceStep defs set =
-  List.foldl
-    (\m (d : I.Def) ->
-       if bodyBounces set d then M.insert compareString d.key MkUnit m else m)
-    set
-    defs
-
-bounceGo : List I.Def -> M.Map String Unit -> M.Map String Unit
-bounceGo defs set =
-  if M.size (bounceStep defs set) == M.size set then set
-  else bounceGo defs (bounceStep defs set)
-
--- | the definitions that may give back a bounce
-bouncing : List I.Def -> M.Map String Unit
-bouncing defs = bounceGo defs M.empty
+-- (which definitions may: heff.compile.facts's `bounce`)
 
 -- Loops
 --------------------------------------------------------------------------------
@@ -789,7 +752,8 @@ trCode c = "$tr(" ^ c ^ ")"
 
 -- | whether what it returns last may be a bounce
 mayBounce : Env -> I.Expr -> Bool
-mayBounce env e = tailApp e || List.any (\g -> bouncesG env g) (tailGlobals e)
+mayBounce env e =
+  F.tailApp e || List.any (\g -> bouncesG env g) (F.tailGlobals e)
 
 trWhen : Bool -> String -> String
 trWhen b c = if b then trCode c else c
@@ -1442,36 +1406,19 @@ jsPick shorts key s =
 jsNameOf : List String -> String -> String
 jsNameOf shorts key = jsPick shorts key (safe (shortName key))
 
-arityOfBody : I.Expr -> Int
-arityOfBody (ELam xs _) = List.length xs
-arityOfBody b = 0
-
-depEager : M.Map String GInfo -> String -> Bool
-depEager acc k = case M.lookup compareString k acc of
-  Just i -> not i.lazy
-  Nothing -> False
-
--- (a definition is computed at once when that cannot fail)
-lazyOf : M.Map String GInfo -> String -> I.Expr -> Int -> Bool
-lazyOf acc key b ar =
-  ar == 0
-  && not
-    (I.isValue b
-     && List.all (\k -> not (strEq k key) && depEager acc k) (I.globalsIn b))
-
 infoOne : List String
-        -> M.Map String Unit
+        -> F.Facts
         -> M.Map String GInfo
         -> I.Def
         -> M.Map String GInfo
-infoOne shorts bnc acc d =
+infoOne shorts facts acc d =
   M.insert
     compareString
     d.key
     { js = jsNameOf shorts d.key
-    , arity = arityOfBody d.body
-    , lazy = lazyOf acc d.key d.body (arityOfBody d.body)
-    , bounce = M.member compareString d.key bnc
+    , arity = fromMaybe 0 (M.lookup compareString d.key facts.arity)
+    , lazy = M.member compareString d.key facts.lazy
+    , bounce = M.member compareString d.key facts.bounce
     }
     acc
 
@@ -1502,25 +1449,25 @@ emitCode defs info curried globalNames =
     info
     (List.concatMap (\d -> defLines info curried globalNames d) defs)
 
-infoAll : List String -> M.Map String Unit -> List I.Def -> M.Map String GInfo
-infoAll shorts bnc defs =
-  List.foldl (\acc d -> infoOne shorts bnc acc d) M.empty defs
+infoAll : List String -> F.Facts -> List I.Def -> M.Map String GInfo
+infoAll shorts facts defs =
+  List.foldl (\acc d -> infoOne shorts facts acc d) M.empty defs
 
-emitWithShorts : List I.Def -> List String -> List String -> Emitted
-emitWithShorts defs roots shorts =
+emitWithShorts : F.Facts -> List I.Def -> List String -> List String -> Emitted
+emitWithShorts facts defs roots shorts =
   emitCode
     defs
-    (infoAll shorts (bouncing defs) defs)
+    (infoAll shorts facts defs)
     (setFrom
        (List.append
           (List.concatMap (\(d : I.Def) -> valueRefs d.body) defs)
           roots))
     (setFrom (List.map (\(d : I.Def) -> jsNameOf shorts d.key) defs))
 
--- | >>> (emitDefs [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))] ["f"]).lines
+-- | >>> (emitDefs (F.factsOf [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))] ["f"]).lines
 -- | ["", "const f = (x) => x;"]
-emitDefs : List I.Def -> List String -> Emitted
-emitDefs defs roots = emitWithShorts defs roots (shortsOf defs)
+emitDefs : F.Facts -> List I.Def -> List String -> Emitted
+emitDefs facts defs roots = emitWithShorts facts defs roots (shortsOf defs)
 
 -- Runtime
 --------------------------------------------------------------------------------
@@ -1820,7 +1767,12 @@ compileLowered : String
                -> Output
 compileLowered host provs eff key l =
   { source =
-      runSource host provs eff key (emitDefs l.defs (Cons L.entryKey Nil))
+      runSource
+        host
+        provs
+        eff
+        key
+        (emitDefs l.facts l.defs (Cons L.entryKey Nil))
   , errors = l.errors
   }
 
@@ -1867,7 +1819,7 @@ compileExports exports l =
   { source =
       jsSource
         exports
-        (emitDefs l.defs (List.map (\(o : Export) -> o.key) exports))
+        (emitDefs l.facts l.defs (List.map (\(o : Export) -> o.key) exports))
   , errors = l.errors
   }
 

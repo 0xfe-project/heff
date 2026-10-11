@@ -1,0 +1,179 @@
+-- Borrowing, for the C backend: which of each function's parameters
+-- are lent to it, not given (heff.compile.facts's `lent`), worked out
+-- over the program in A-normal form (heff.compile.lower).
+
+import heff.compile.ir as I
+import map as M
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+elemI : Int -> List Int -> Bool
+elemI i Nil = False
+elemI i (Cons j js) = i == j || elemI i js
+
+borOf : M.Map String (List Int) -> String -> List Int
+borOf bor g = fromMaybe Nil (M.lookup compareString g bor)
+
+paramsAt : Bool -> List Int -> List String -> List String
+paramsAt want bi xs =
+  List.map
+    fst
+    (List.filter
+       (\p -> if want then elemI (snd p) bi else not (elemI (snd p) bi))
+       (List.zipWith
+          (\x i -> MkPair x i)
+          xs
+          (List.range 0 (List.length xs - 1))))
+
+-- A function's parameter is lent, not given (borrowed), where the
+-- function only looks at it: matches on it, or lends it on to a call's
+-- borrowed parameter -- the fields a match on it binds are then lent
+-- too.  The caller keeps its reference; the callee counts none.  A
+-- parameter one of whose matches builds a tag of the matched one's size
+-- stays given (its cell is reused there), and so does one a loop (a call
+-- of itself) would be given a value held.  Every parameter is lent at
+-- first; what is not is taken away until nothing changes.
+
+isVar : String -> I.Expr -> Bool
+isVar p (EVar x) = strEq p x
+isVar p _ = False
+
+indexedE : List I.Expr -> List (Pair I.Expr Int)
+indexedE es =
+  List.zipWith (\e i -> MkPair e i) es (List.range 0 (List.length es - 1))
+
+-- (each use of `p` in it only looked at or lent)
+onlyLent : M.Map String (List Int) -> String -> I.Expr -> Bool
+onlyLent bor p (EVar x) = not (strEq p x)
+onlyLent bor p (EMatch s arms) =
+  (isVar p s || onlyLent bor p s)
+  && List.all (\a -> onlyLent bor p (I.armBody a)) arms
+onlyLent bor p (ECall g as) =
+  List.all
+    (\pr ->
+       (isVar p (fst pr) && elemI (snd pr) (borOf bor g))
+       || onlyLent bor p (fst pr))
+    (indexedE as)
+onlyLent bor p (ELam _ b) = onlyLent bor p b
+onlyLent bor p (EApp f as) = List.all (onlyLent bor p) (Cons f as)
+onlyLent bor p (ELet _ a b) = onlyLent bor p a && onlyLent bor p b
+onlyLent bor p (ERecord fs) = List.all (\f -> onlyLent bor p (snd f)) fs
+onlyLent bor p (EProj e _ _) = onlyLent bor p e
+onlyLent bor p (ETag _ as) = List.all (onlyLent bor p) as
+onlyLent bor p (EPrimCall _ as) = List.all (onlyLent bor p) as
+onlyLent bor p _ = True
+
+-- (whether it builds a tag of `n` fields)
+buildsSize : Int -> I.Expr -> Bool
+buildsSize n (ETag _ as) = List.length as == n || List.any (buildsSize n) as
+buildsSize n (ELam _ b) = buildsSize n b
+buildsSize n (EApp f as) = List.any (buildsSize n) (Cons f as)
+buildsSize n (ELet _ a b) = buildsSize n a || buildsSize n b
+buildsSize n (ERecord fs) = List.any (\f -> buildsSize n (snd f)) fs
+buildsSize n (EProj e _ _) = buildsSize n e
+buildsSize n (EMatch s arms) =
+  buildsSize n s || List.any (\a -> buildsSize n (I.armBody a)) arms
+buildsSize n (ECall _ as) = List.any (buildsSize n) as
+buildsSize n (EPrimCall _ as) = List.any (buildsSize n) as
+buildsSize n _ = False
+
+armReuses : I.Arm -> Bool
+armReuses (MkArm _ vs b) = not (List.null vs) && buildsSize (List.length vs) b
+
+-- (whether a match on `p` may reuse its cell)
+reuses : String -> I.Expr -> Bool
+reuses p (EMatch s arms) =
+  (isVar p s && List.any armReuses arms)
+  || reuses p s
+  || List.any (\a -> reuses p (I.armBody a)) arms
+reuses p (ELam _ b) = reuses p b
+reuses p (EApp f as) = List.any (reuses p) (Cons f as)
+reuses p (ELet _ a b) = reuses p a || reuses p b
+reuses p (ERecord fs) = List.any (\f -> reuses p (snd f)) fs
+reuses p (EProj e _ _) = reuses p e
+reuses p (ETag _ as) = List.any (reuses p) as
+reuses p (ECall _ as) = List.any (reuses p) as
+reuses p (EPrimCall _ as) = List.any (reuses p) as
+reuses p _ = False
+
+scrutLent : List String -> I.Expr -> Bool
+scrutLent ds (EVar x) = elemS x ds
+scrutLent ds _ = False
+
+-- (the variables lent with `ds`: the fields of matches on them)
+lentVars : List String -> I.Expr -> List String
+lentVars ds (EMatch s arms) =
+  List.concatMap
+    (\a ->
+       if scrutLent ds s
+         then List.append
+             (I.armVars a)
+             (lentVars (List.append (I.armVars a) ds) (I.armBody a))
+       else lentVars ds (I.armBody a))
+    arms
+lentVars ds (ELet _ a b) = List.append (lentVars ds a) (lentVars ds b)
+lentVars ds _ = Nil
+
+-- (each call of `key` given at `i` one of `ds`)
+loopLent : String -> Int -> List String -> I.Expr -> Bool
+loopLent key i ds (ECall g as) =
+  (not (strEq g key)
+   || List.all
+     (\pr -> not (snd pr == i) || List.any (\d -> isVar d (fst pr)) ds)
+     (indexedE as))
+  && List.all (loopLent key i ds) as
+loopLent key i ds (EMatch s arms) =
+  loopLent key i ds s && List.all (\a -> loopLent key i ds (I.armBody a)) arms
+loopLent key i ds (ELet _ a b) = loopLent key i ds a && loopLent key i ds b
+loopLent key i ds (ETag _ as) = List.all (loopLent key i ds) as
+loopLent key i ds (EApp f as) = List.all (loopLent key i ds) (Cons f as)
+loopLent key i ds _ = True
+
+lentAt : M.Map String (List Int)
+       -> String
+       -> List String
+       -> I.Expr
+       -> List String
+       -> Int
+       -> Bool
+lentAt bor key xs b ds i = case List.drop i xs of
+  Cons p _ -> onlyLent bor p b && not (reuses p b) && loopLent key i ds b
+  Nil -> False
+
+borDef : M.Map String (List Int) -> I.Def -> M.Map String (List Int)
+borDef bor d@{ body = ELam xs b } =
+  M.insert
+    compareString
+    d.key
+    (List.filter
+       (lentAt
+          bor
+          d.key
+          xs
+          b
+          (List.append
+             (paramsAt True (borOf bor d.key) xs)
+             (lentVars (paramsAt True (borOf bor d.key) xs) b)))
+       (borOf bor d.key))
+    bor
+borDef bor d = bor
+
+borSize : M.Map String (List Int) -> Int
+borSize bor = List.sum (List.map (\p -> List.length (snd p)) (M.toList bor))
+
+-- (again until no parameter is taken away: `size` how many were lent)
+borFix : List I.Def -> Int -> M.Map String (List Int) -> M.Map String (List Int)
+borFix defs size bor =
+  if borSize bor == size then bor
+  else borFix defs (borSize bor) (List.foldl borDef bor defs)
+
+borAll : M.Map String (List Int) -> I.Def -> M.Map String (List Int)
+borAll m d@{ body = ELam xs _ } =
+  M.insert compareString d.key (List.range 0 (List.length xs - 1)) m
+borAll m d = m
+
+-- | each function's borrowed parameters, by index
+borrowing : List I.Def -> M.Map String (List Int)
+borrowing defs = borFix defs (0 - 1) (List.foldl borAll M.empty defs)
