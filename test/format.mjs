@@ -48,6 +48,13 @@ for (const f of files) {
 formats("spacing", "data Bool = True | False\nnot : Bool -> Bool\nnot   True =    False\nnot False = True\n",
   "data Bool = True | False\nnot : Bool -> Bool\nnot True = False\nnot False = True\n");
 
+formats("alternatives written broken stay broken", "data Tree (a : Type)\n  = Leaf\n  | Node a (Tree a) (Tree a)\n",
+  "data Tree (a : Type)\n  = Leaf\n  | Node a (Tree a) (Tree a)\n");
+formats("alternatives broken anywhere break each", "data Tree (a : Type) = Leaf\n  | Node a (Tree a) (Tree a)\n",
+  "data Tree (a : Type)\n  = Leaf\n  | Node a (Tree a) (Tree a)\n");
+formats("alternatives written flat, if they fit", "data Tree (a : Type) = Leaf | Node a (Tree a) (Tree a)\n",
+  "data Tree (a : Type) = Leaf | Node a (Tree a) (Tree a)\n");
+
 formats("rune literals, as written", "x : List Rune\nx = ['\\u{41}',   '😀', '\\'',x' ]\n",
   "x : List Rune\nx = ['\\u{41}', '😀', '\\'', x']\n");
 
