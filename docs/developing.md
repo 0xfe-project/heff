@@ -20,34 +20,78 @@ with is `lib/` ([library.md](library.md)).
 
 ## Building
 
-With Node.js and [zig](https://ziglang.org/download/):
+With Node.js, [zig](https://ziglang.org/download/) and GNU make (3.81,
+macOS's, or newer).  `make` lists every target and the variables they
+take; each runs a script of `scripts/`, `test/`, `bench/` or
+`editors/`, and its line in the `Makefile` says which.
 
 ```sh
-node scripts/build.mjs     # .heff/out/heff
-.heff/out/heff install     # ~/.heff/bin/heff (HEFF_HOME/bin/heff)
+make build         # .heff/out/heff
+make install       # ~/.heff/bin/heff, with its library
 ```
 
-The build compiles the program to C with the heff built before
-(`.heff/out/heff`), and `zig cc` builds it into `.heff/out/heff`.
-Where there is no heff yet, or only one of another seed, it starts from
-the seed, `boot/heff.tar.xz`: heff compiled by itself to C, which zig
-builds for whatever machine it is on.
+The build (`node scripts/build.mjs`) compiles the program to C with the
+heff built before (`.heff/out/heff`), and `zig cc` builds it into
+`.heff/out/heff`.  Where there is no heff yet, or only one of another
+seed, it starts from the seed, `boot/heff.tar.xz`: heff compiled by
+itself to C, which zig builds for whatever machine it is on.  `make
+build-seed` (`--seed`) always starts from the seed.
 
-`node scripts/boot.mjs` replaces the seed with the current compiler's
-C, once it compiles itself to the same C.  This is needed only when a
-language change means the old seed can no longer compile the source.
+`make install` installs into `~/.heff` whatever `HEFF_HOME` says (to
+install elsewhere, `HEFF_HOME=DIR .heff/out/heff install`); `make
+install-all` installs the VS Code extension too (`make vsix`, then
+`code --install-extension`) and builds bat's cache again.
+
+`make boot` (`node scripts/boot.mjs`) replaces the seed with the
+current compiler's C, once it compiles itself to the same C.  This is
+needed only when a language change means the old seed can no longer
+compile the source.
+
+`make native TARGETS="x86_64-linux-musl aarch64-macos"`
+(`scripts/native.mjs`) builds heff for other systems, as a release
+does, into `.heff/out/native/TARGET/`.
+
+`make clean` removes what the builds and the tests made under `.heff/`,
+keeping the caches (`vN/`, `bN/`, the parts zig built in `out/heff.o/`
+and those built under ASan in `ref/native-asan.o/`); it never touches
+the seed.
 
 ## Testing
 
-`node test/run.mjs [GROUP...]` runs the tests on `.heff/out/heff` (or on
-`HEFF`), by group: `compiler`, `lsp`, `backends` (each backend held to
-the interpreter), `fixpoint` (heff compiles itself to the same C) and
-`asan` (heff under AddressSanitizer).  `HEFF_SANITIZE=1` builds the
-backends' C programs under AddressSanitizer, and `HEFF_TSAN=1` runs the
-threads test under ThreadSanitizer too ([threads.md](threads.md)).  Among them, `test/golden/` holds
-the output of `check`, `explain`, `eval` and `type-at` on the library
-and test files; after an intended change, update it with
-`node test/golden.mjs --update`.
+The tests run on the heff built (`make build` first), or on `HEFF`:
+
+```sh
+make test                  # every group, all at once
+make test GROUPS="compiler lsp"
+make test-lsp              # one group: test-compiler, test-lsp,
+                           # test-backends, test-fixpoint, test-asan
+make check                 # build-seed, test, fmt-check: all a change is held to
+```
+
+`make test` is `node test/run.mjs [GROUP...]`, and the groups are
+`compiler`, `lsp`, `backends` (each backend held to the interpreter),
+`fixpoint` (heff compiles itself to the same C) and `asan` (heff under
+AddressSanitizer, by clang; `make test-asan JOBS=4 TIMEOUT=120` sets
+`HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`).  Each script decides how
+much it runs at once, so there is no need for `make -j`, and the
+targets run one after another even with it.
+
+`make sanitize` (`HEFF_SANITIZE=1 node test/backends.mjs`) builds the
+backends' C programs under AddressSanitizer, and `make tsan`
+(`HEFF_TSAN=1`) runs the threads test under ThreadSanitizer too
+([threads.md](threads.md)).  Among the tests, `test/golden/` holds the
+output of `check`, `explain`, `eval` and `type-at` on the library and
+test files; after an intended change, update it with `make golden`
+(`node test/golden.mjs --update`).
+
+`make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
+arguments) times the benchmarks of `bench/`.
+
+## Formatting
+
+`make fmt` lays out the repository's `.hf` files as `heff fmt` does,
+and `make fmt-check` names those that are not (the tests' files are
+left as they are, as `.pre-commit-config.yaml` leaves them).
 
 ## What is made
 
@@ -73,5 +117,7 @@ compiler, by which it knows itself without hashing itself each time.
 
 `editors/vscode` is a VS Code extension for the language server
 ([its README](../editors/vscode/README.md) says how to run it from the
-repository); `editors/bat` is its grammar for bat, made from the VS
-Code grammar ([its README](../editors/bat/README.md)).
+repository); `make vsix` packages it.  `editors/bat` is its grammar for
+bat, made from the VS Code grammar ([its README](../editors/bat/README.md)):
+`make bat` makes it again, and `make bat-check` fails where it is not
+made from the grammar as it is.

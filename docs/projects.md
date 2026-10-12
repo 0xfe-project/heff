@@ -50,7 +50,7 @@ its `lib/` is the library (see [the library](library.md)):
 
 Anywhere else, naming `heff` is an error: where heff is from is said by
 heff and its heff home, never by the project.  To work on a checkout of
-heff, build it (`node scripts/build.mjs`) or install from it.
+heff, build it (`make build`) or install from it.
 
 ## Programs
 

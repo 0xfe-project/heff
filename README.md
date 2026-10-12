@@ -57,11 +57,11 @@ tar xzf heff-0.3.0-linux-x64.tar.gz
 heff-0.3.0-linux-x64/bin/heff help
 ```
 
-From the repository, with Node.js and [zig](https://ziglang.org/download/):
+From the repository, with Node.js, [zig](https://ziglang.org/download/)
+and make:
 
 ```sh
-node scripts/build.mjs     # .heff/out/heff
-.heff/out/heff install     # ~/.heff/bin/heff (HEFF_HOME/bin/heff)
+make install               # build .heff/out/heff, then install it into ~/.heff/bin/
 ```
 
 Put `~/.heff/bin` on your `PATH`.
@@ -105,8 +105,9 @@ heff fmt src/hello/*.hf    # format in place
 ## Developing
 
 ```sh
-node scripts/build.mjs           # build .heff/out/heff (from the seed, the first time)
-node test/run.mjs compiler lsp   # the tests, by group
+make build   # .heff/out/heff (from the seed, the first time)
+make check   # all a change is held to: from the seed, every test, the layout
+make         # every target
 ```
 
 How the source is laid out, the seed and the test groups are in
