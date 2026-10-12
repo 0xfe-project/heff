@@ -288,6 +288,43 @@ keptBits : List Int -> Int
 keptBits is =
   List.foldl (\n i -> if i < flatFields then n + 3 * fourTo i else n) 0 is
 
+-- Tags' fields (#64)
+--------------------------------------------------------------------------------
+
+-- A tag's field is kept as a record's is: flat where the tag is built
+-- knowing its type (heff.compile.erase's `IR.FieldTy`), and the tag says
+-- which (lib/c/runtime.c, "Flat fields").  Where a match reads one, the
+-- type is not at hand, but it is known of the program which fields of a
+-- tag any of its tags is built with flat (heff.compile.facts's `flat`):
+-- such a field's variable is not pinned a `V` but kept as its class is,
+-- and read so, as a number or a `V`, whichever the tag holds.
+
+-- (field `i`'s type, of those given: past them, not known)
+tyIn : Int -> List IR.FieldTy -> IR.FieldTy
+tyIn i Nil = FtAny
+tyIn i (Cons t ts) = if i <= 0 then t else tyIn (i - 1) ts
+
+-- | how a tag's `n` fields are kept, built knowing their types
+-- | >>> List.map reprName (tagSlots [FtFloat, FtOther] 3)
+-- | ["Float64", "_", "_"]
+tagSlots : List IR.FieldTy -> Int -> List Repr
+tagSlots ts n = List.map (\i -> slotRepr i (tyIn i ts)) (List.range 0 (n - 1))
+
+-- | of each tag, the fields any of its tags may be built with flat
+type FlatTags = Map.Map String (List Int)
+
+-- | whether field `i` of a tag `t` may be flat
+flatAt : FlatTags -> String -> Int -> Bool
+flatAt fl t i =
+  List.any (\j -> j == i) (fromMaybe Nil (Map.lookup compareString t fl))
+
+-- | what a definition's walk knows of the program: the workers, and the
+-- | tags' fields that may be flat
+type Know = { sigs : Sigs, flat : FlatTags }
+
+noKnow : Know
+noKnow = { sigs = Map.empty, flat = Map.empty }
+
 -- What gives and what uses
 --------------------------------------------------------------------------------
 
@@ -354,8 +391,29 @@ sourceOf x (SPrim p _) =
 sourceOf x (SProj _ l sh t) = givenAs x (readRepr (indexOfL l 0 sh) t)
 sourceOf x v = Boxed x
 
-pinAll : List String -> List Event -> List Event
-pinAll xs acc = List.foldl (\a x -> Cons (Pinned x) (Cons (Binds x) a)) acc xs
+-- (an arm's field: pinned a `V`, unless it may be flat, of the places
+-- `ps`)
+pinField : List Int -> List Event -> Pair String Int -> List Event
+pinField ps acc (MkPair x i) =
+  if List.any (\j -> j == i) ps then Cons (Binds x) acc
+  else Cons (Pinned x) (Cons (Binds x) acc)
+
+pinFields : List Int -> List Event -> List String -> List Event
+pinFields Nil acc vs =
+  List.foldl (\a x -> Cons (Pinned x) (Cons (Binds x) a)) acc vs
+pinFields ps acc vs =
+  List.foldl (pinField ps) acc (List.zip vs (List.range 0 (List.length vs - 1)))
+
+pinArm : {a : Type} -> FlatTags -> List Event -> Imperative.Arm a -> List Event
+pinArm fl acc (MkArm t vs _) =
+  pinFields (fromMaybe Nil (Map.lookup compareString t fl)) acc vs
+
+pinArms : {a : Type}
+        -> FlatTags
+        -> List (Imperative.Arm a)
+        -> List Event
+        -> List Event
+pinArms fl arms acc = List.foldl (pinArm fl) acc arms
 
 -- (the names mentioned, and bound)
 mentionedBy : Event -> List String
@@ -419,13 +477,6 @@ armsTl ps rt arms rest =
     rest
     arms
 
-armVars : {a : Type} -> List (Imperative.Arm a) -> List String
-armVars arms =
-  List.concatMap
-    (\arm -> case arm of
-     MkArm _ vs _ -> vs)
-    arms
-
 -- (each parameter given what the loop's next round gives it)
 loopBinds : List String -> List Imperative.Val -> List Item -> List Item
 loopBinds ps vs rest =
@@ -441,13 +492,13 @@ returned (RetAs r) o rest = Cons (IOp o) rest
 returned RetClass o rest = Cons (IBind retName o) rest
 
 -- | the events of the worklist, last first
-walk : Sigs -> List Event -> List Item -> List Event
+walk : Know -> List Event -> List Item -> List Event
 walk sg acc Nil = acc
 walk sg acc (Cons (IVal r (SVar x)) rest) = walk sg (Cons (Wants x r) acc) rest
 walk sg acc (Cons (IVal r (SPrim p as)) rest) =
   walk sg acc (pushArgs (argReprs p as) as rest)
-walk sg acc (Cons (IVal r (STag _ as)) rest) =
-  walk sg acc (pushVals RepV as rest)
+walk sg acc (Cons (IVal r (STag _ as ts)) rest) =
+  walk sg acc (pushArgs (tagSlots ts (List.length as)) as rest)
 walk sg acc (Cons (IVal r (SRec fs ts)) rest) =
   walk sg acc (pushArgs (slotReprs ts) (List.map snd fs) rest)
 walk sg acc (Cons (IVal r (SProj v _ _ _)) rest) =
@@ -464,13 +515,16 @@ walk sg acc (Cons (IBind x (OSimple v)) rest) =
   walk sg (Cons (sourceOf x v) acc) (Cons (IVal RepV v) rest)
 walk sg acc (Cons (IBind x OAbandon) rest) = walk sg acc rest
 walk sg acc (Cons (IBind x (OCall g as)) rest) =
-  walk sg (Cons (givenAs x (resultIn sg g)) acc) (Cons (IOp (OCall g as)) rest)
+  walk
+    sg
+    (Cons (givenAs x (resultIn sg.sigs g)) acc)
+    (Cons (IOp (OCall g as)) rest)
 walk sg acc (Cons (IBind x o) rest) =
   walk sg (Cons (Boxed x) acc) (Cons (IOp o) rest)
 walk sg acc (Cons (IOp (OSimple v)) rest) =
   walk sg acc (Cons (IVal RepV v) rest)
 walk sg acc (Cons (IOp (OCall g as)) rest) =
-  walk sg acc (pushArgs (paramReprsIn sg g as) as rest)
+  walk sg acc (pushArgs (paramReprsIn sg.sigs g as) as rest)
 walk sg acc (Cons (IOp (OApply f as)) rest) =
   walk sg acc (pushVals RepV (Cons f as) rest)
 walk sg acc (Cons (IOp (OPrim _ as)) rest) = walk sg acc (pushVals RepV as rest)
@@ -501,7 +555,7 @@ walk sg acc (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
 walk sg acc (Cons (ISts (Cons (SCase v arms) ss)) rest) =
   walk
     sg
-    (pinAll (armVars arms) acc)
+    (pinArms sg.flat arms acc)
     (Cons (IVal RepV v) (armsSts arms (Cons (ISts ss) rest)))
 walk sg acc (Cons (ITl ps rt (TSeq ss t)) rest) =
   walk sg acc (Cons (ISts ss) (Cons (ITl ps rt t) rest))
@@ -514,7 +568,7 @@ walk sg acc (Cons (ITl ps rt (TIf c t e)) rest) =
 walk sg acc (Cons (ITl ps rt (TCase v arms)) rest) =
   walk
     sg
-    (pinAll (armVars arms) acc)
+    (pinArms sg.flat arms acc)
     (Cons (IVal RepV v) (armsTl ps rt arms rest))
 
 -- (a parameter where the function is entered: given unboxed, as its
@@ -527,19 +581,19 @@ entered acc (MkPair x r) = Cons (Kept x r) (Cons (Binds x) acc)
 -- | takes them, if it has one (`sg`), else `V`s, where it is entered, and
 -- | the loop's next round giving them their values; what it returns
 -- | wanted as its worker gives it
-defEvents : Sigs -> Imperative.Def -> List Event
+defEvents : Know -> Imperative.Def -> List Event
 defEvents sg (MkDef key _ (DefFun xs (MkBlock t))) =
   walk
     sg
-    (List.foldl entered Nil (List.zip xs (paramReprsIn sg key xs)))
-    (Cons (ITl xs (RetAs (resultIn sg key)) t) Nil)
+    (List.foldl entered Nil (List.zip xs (paramReprsIn sg.sigs key xs)))
+    (Cons (ITl xs (RetAs (resultIn sg.sigs key)) t) Nil)
 defEvents sg (MkDef _ _ (DefVal (MkBlock t))) =
   walk sg Nil (Cons (ITl Nil (RetAs RepV) t) Nil)
 
 -- | the events of a function's body as heff.compile.worker weighs its
 -- | worker: its parameters given `V`s, as a call of it today gives them;
 -- | what it returns given to `retName`, which its caller wants a `V` of
-proposalEvents : Sigs -> List String -> Imperative.Tl -> List Event
+proposalEvents : Know -> List String -> Imperative.Tl -> List Event
 proposalEvents sg xs t =
   Cons
     (Wants retName RepV)
@@ -752,9 +806,9 @@ eventsOf : List Event -> List Event
 eventsOf evs = unpinned (pinnedIn evs) evs
 
 -- | a definition's unboxed variables, the workers being `sg`
--- | >>> Map.toList (reprsWith Map.empty (MkDef "f" "f" (DefFun ["x"] (MkBlock (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"])))))))
+-- | >>> Map.toList (reprsWith noKnow (MkDef "f" "f" (DefFun ["x"] (MkBlock (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"])))))))
 -- | [MkPair "x" (RepFix I64)]
-reprsWith : Sigs -> Imperative.Def -> Reprs
+reprsWith : Know -> Imperative.Def -> Reprs
 reprsWith sg d = reprsFrom (eventsOf (defEvents sg d))
 
 -- What a worker is proposed to be (heff.compile.worker)
@@ -791,9 +845,9 @@ proposalFrom evs bounces xs =
 -- | be were the function given `V`s and its caller wanting a `V` (so
 -- | that no call costs more than it did) -- a function a call of which
 -- | may give back a bounce giving a `V`
--- | >>> sigName (proposeSig Map.empty False ["x"] (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"]))))
+-- | >>> sigName (proposeSig noKnow False ["x"] (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"]))))
 -- | "Int64->Int64"
-proposeSig : Sigs -> Bool -> List String -> Imperative.Tl -> Sig
+proposeSig : Know -> Bool -> List String -> Imperative.Tl -> Sig
 proposeSig sg bounces xs t =
   proposalFrom (eventsOf (proposalEvents sg xs t)) bounces xs
 
@@ -804,8 +858,8 @@ hopeFrom evs bounces xs = proposalIn hopedIn (classesOf evs) evs bounces xs
 -- | being `sg`: each parameter, and its result, unboxed where all the
 -- | evidence of its class says one type, whatever that costs (what
 -- | heff.compile.worker starts a cycle of calls from)
--- | >>> sigName (hopeSig Map.empty False ["x", "y"] (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"]))))
+-- | >>> sigName (hopeSig noKnow False ["x", "y"] (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"]))))
 -- | "Int64,_->Int64"
-hopeSig : Sigs -> Bool -> List String -> Imperative.Tl -> Sig
+hopeSig : Know -> Bool -> List String -> Imperative.Tl -> Sig
 hopeSig sg bounces xs t =
   hopeFrom (eventsOf (proposalEvents sg xs t)) bounces xs

@@ -31,6 +31,11 @@ fieldTyOfName "_" = Just FtOther
 fieldTyOfName "?" = Just FtAny
 fieldTyOfName x = maybe Nothing (\w -> Just (FtFixed w)) (fixedOfName x)
 
+-- | as many fields' types as there are of `as`, none of them known: of
+-- | a tag built where its type is not at hand
+anyTys : {a : Type} -> List a -> List FieldTy
+anyTys as = List.map (\_ -> FtAny) as
+
 data Expr
   = EVar String
   | EGlobal String
@@ -43,7 +48,9 @@ data Expr
   -- | runs are those labelled, in order (none: they are not known), and
   -- | the field's type
   | EProj Expr String (List String) FieldTy
-  | ETag String (List Expr)
+  -- | a tag: its arguments, and each one's type, as a backend may lay
+  -- | the tag out (as many; `FtAny` where it is not known)
+  | ETag String (List Expr) (List FieldTy)
   | EMatch Expr (List (ArmOf Expr))
   -- | a primitive, as a (curried) function
   | EPrim String
@@ -186,8 +193,8 @@ freshGo r m n (ERecord fs ts) = case freshFields r m n fs of
   MkPair fs' n1 -> MkPair (ERecord fs' ts) n1
 freshGo r m n (EProj e2 l sh t) = case r.go m n e2 of
   MkPair e' n1 -> MkPair (EProj e' l sh t) n1
-freshGo r m n (ETag t as) = case freshMany r m n as of
-  MkPair as' n1 -> MkPair (ETag t as') n1
+freshGo r m n (ETag t as ts) = case freshMany r m n as of
+  MkPair as' n1 -> MkPair (ETag t as' ts) n1
 freshGo r m n (EMatch s arms) = case r.go m n s of
   MkPair s' n1 -> case freshArms r m n1 arms of
     MkPair arms' n2 -> MkPair (EMatch s' arms') n2
@@ -221,7 +228,7 @@ substGo m (ERecord fs ts) =
        fs)
     ts
 substGo m (EProj e2 l sh t) = EProj (substGo m e2) l sh t
-substGo m (ETag t as) = ETag t (List.map (\a -> substGo m a) as)
+substGo m (ETag t as ts) = ETag t (List.map (\a -> substGo m a) as) ts
 substGo m (EMatch s arms) =
   EMatch
     (substGo m s)
@@ -263,7 +270,7 @@ countW x n (Cons (EApp f as) rest) = countW x n (Cons f (appendI as rest))
 countW x n (Cons (ELet _ a b) rest) = countW x n (Cons a (Cons b rest))
 countW x n (Cons (ERecord fs _) rest) = countW x n (pushFields fs rest)
 countW x n (Cons (EProj e _ _ _) rest) = countW x n (Cons e rest)
-countW x n (Cons (ETag _ as) rest) = countW x n (appendI as rest)
+countW x n (Cons (ETag _ as _) rest) = countW x n (appendI as rest)
 countW x n (Cons (EMatch s arms) rest) =
   countW x n (Cons s (pushArms arms rest))
 countW x n (Cons (EPrimCall _ as) rest) = countW x n (appendI as rest)
@@ -279,7 +286,7 @@ lamW x (Cons (EApp f as) rest) = lamW x (Cons f (appendI as rest))
 lamW x (Cons (ELet _ a b) rest) = lamW x (Cons a (Cons b rest))
 lamW x (Cons (ERecord fs _) rest) = lamW x (pushFields fs rest)
 lamW x (Cons (EProj e _ _ _) rest) = lamW x (Cons e rest)
-lamW x (Cons (ETag _ as) rest) = lamW x (appendI as rest)
+lamW x (Cons (ETag _ as _) rest) = lamW x (appendI as rest)
 lamW x (Cons (EMatch s arms) rest) = lamW x (Cons s (pushArms arms rest))
 lamW x (Cons (EPrimCall _ as) rest) = lamW x (appendI as rest)
 lamW x (Cons (ECall _ as) rest) = lamW x (appendI as rest)
@@ -301,7 +308,7 @@ sizeW n (Cons (EApp f as) rest) = sizeW (n + 1) (Cons f (appendI as rest))
 sizeW n (Cons (ELet _ a b) rest) = sizeW (n + 1) (Cons a (Cons b rest))
 sizeW n (Cons (ERecord fs _) rest) = sizeW (n + 1) (pushFields fs rest)
 sizeW n (Cons (EProj e _ _ _) rest) = sizeW (n + 1) (Cons e rest)
-sizeW n (Cons (ETag _ as) rest) = sizeW (n + 1) (appendI as rest)
+sizeW n (Cons (ETag _ as _) rest) = sizeW (n + 1) (appendI as rest)
 sizeW n (Cons (EMatch s arms) rest) =
   sizeW (n + 1) (Cons s (pushArms arms rest))
 sizeW n (Cons (EPrimCall _ as) rest) = sizeW (n + 1) (appendI as rest)
@@ -324,7 +331,7 @@ sizeB lim n (Cons e rest) =
     ELet _ a b -> sizeB lim (n + 1) (Cons a (Cons b rest))
     ERecord fs _ -> sizeB lim (n + 1) (pushFields fs rest)
     EProj e2 _ _ _ -> sizeB lim (n + 1) (Cons e2 rest)
-    ETag _ as -> sizeB lim (n + 1) (appendI as rest)
+    ETag _ as _ -> sizeB lim (n + 1) (appendI as rest)
     EMatch sc arms -> sizeB lim (n + 1) (Cons sc (pushArms arms rest))
     EPrimCall _ as -> sizeB lim (n + 1) (appendI as rest)
     ECall _ as -> sizeB lim (n + 1) (appendI as rest)
@@ -348,7 +355,7 @@ globalsGo (ERecord fs _) =
      MkPair _ e2 -> globalsGo e2)
     fs
 globalsGo (EProj e2 _ _ _) = globalsGo e2
-globalsGo (ETag _ as) = concatMapI (\a -> globalsGo a) as
+globalsGo (ETag _ as _) = concatMapI (\a -> globalsGo a) as
 globalsGo (EMatch s arms) =
   appendI (globalsGo s) (concatMapI (\a -> globalsGo (armBody a)) arms)
 globalsGo (EPrimCall _ as) = concatMapI (\a -> globalsGo a) as
@@ -374,7 +381,7 @@ isValue (ERecord fs _) =
        (\p -> case p of
         MkPair _ e2 -> isValue e2)
        fs)
-isValue (ETag _ as) = allI (List.map (\a -> isValue a) as)
+isValue (ETag _ as _) = allI (List.map (\a -> isValue a) as)
 isValue (EPrim _) = True
 isValue (EInt _) = True
 isValue (EFloat _) = True

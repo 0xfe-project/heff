@@ -124,7 +124,9 @@ enum {
   TAG_MkPair, TAG_InL, TAG_InR, TAG_KNOWN
 };
 
-enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT };
+// (`K_TAGF`, a tag with flat fields (#64): one without is given back as
+// ever, nothing looked for in it)
+enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT, K_TAGF };
 
 typedef struct Obj {
   uint32_t rc;
@@ -134,7 +136,19 @@ typedef struct Obj {
 
 typedef V (*Fn)(V self, V *args);
 
-typedef struct { Obj h; int64_t n; V f[]; } Tag;
+// (a tag: its fields, `n` of them; `flat`, which of its first 16 are
+// flat (#64), as a record's are, below)
+typedef struct { Obj h; int32_t n; uint32_t flat; V f[]; } Tag;
+
+// (a tag's size and its flat fields, said at once: one word)
+static inline void heff_tag_head(Tag *t, int64_t n, uint32_t flat) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  uint64_t w = (uint64_t)(uint32_t)n | ((uint64_t)flat << 32);
+  memcpy(&t->n, &w, sizeof w);
+#else
+  t->n = (int32_t)n; t->flat = flat;
+#endif
+}
 // (a record: its fields, `n` of them, their labels `lbl`; `flat`, which
 // of its first 16 fields are flat (#39) -- not a `V` but a number's 64
 // bits, a `Float64`'s, an `Int64`'s or a `UInt64`'s: 2 bits each, as
@@ -336,7 +350,7 @@ static inline int heff_tag_of(V v) {
 static V heff_tag(int id, int64_t n, V *f) {
   if (n == 0) return NTAG(id);
   Tag *t = heff_obj_alloc(sizeof(Tag) + n * sizeof(V));
-  t->h.rc = 1; t->h.kind = K_TAG; t->h.tag = (uint16_t)id; t->n = n;
+  t->h.rc = 1; t->h.kind = K_TAG; t->h.tag = (uint16_t)id; heff_tag_head(t, n, 0);
   memcpy(t->f, f, n * sizeof(V));
   return (V)t;
 }
@@ -350,7 +364,10 @@ static inline V heff_field(V v, int i) { return ((Tag *)v)->f[i]; }
 // field (`Rec`'s `flat`), so that what walks it -- a drop, a copy, a
 // field looked for by its label, a value shown -- does not take the bits
 // for a `V`, and a read where the type is not known boxes them.  Only the
-// first `HEFF_FLAT_FIELDS` fields may be flat.
+// first `HEFF_FLAT_FIELDS` fields may be flat.  A tag's fields are kept
+// so too (#64, `Tag`'s `flat`): a match reads one that may be flat as the
+// tag holds it (`heff_tget_S`), and a provider given a tag with a field
+// of such a type, or of a type not known, reads it by `heff_tget_v`.
 enum { HEFF_FLAT_V, HEFF_FLAT_F64, HEFF_FLAT_I64, HEFF_FLAT_U64 };
 #define HEFF_FLAT_FIELDS 16
 // (what field `i` is, of the bits `flat`)
@@ -405,7 +422,7 @@ static inline void heff_take(V v, uint64_t keep) {
   Tag *t = (Tag *)v;
   if (t->h.rc == 1) {
     for (int64_t i = 0; i < t->n; i++)
-      if (!((keep >> i) & 1)) heff_drop(t->f[i]);
+      if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + t->n * sizeof(V));
   } else {
     for (int64_t i = 0; i < t->n; i++)
@@ -421,9 +438,10 @@ static inline V heff_take_reuse(V v, uint64_t keep) {
   Tag *t = (Tag *)v;
   if (t->h.rc == 1) {
     for (int64_t i = 0; i < t->n; i++) {
-      if (!((keep >> i) & 1)) heff_drop(t->f[i]);
+      if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
       t->f[i] = MK_INT(0);
     }
+    t->flat = 0; t->h.kind = K_TAG;
     return v;
   }
   for (int64_t i = 0; i < t->n; i++)
@@ -448,6 +466,12 @@ static inline V heff_take_reuse(V v, uint64_t keep) {
 #define HEFF_KNOWN static inline
 #endif
 
+// (the fields of a tag not in `keep` dropped, its flat ones (#64) none)
+static __attribute__((noinline)) void heff_tag_unset(Tag *t, uint64_t keep, int64_t n) {
+  for (int64_t i = 0; i < n; i++)
+    if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
+}
+
 // (`heff_take`, of a tag of `n` fields)
 HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
@@ -460,6 +484,17 @@ HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
       if ((keep >> i) & 1) heff_dup(t->f[i]);
     if (!(t->h.rc & IMMORTAL)) t->h.rc--;
   }
+}
+
+// (... of a tag that may have flat fields (#64): one of them is never in
+// `keep` -- it is read as the tag holds it -- and dropped here only if it
+// is a `V`)
+HEFF_KNOWN void heff_take_nf(V v, uint64_t keep, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1 && t->flat) {
+    heff_tag_unset(t, keep, n);
+    heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
+  } else heff_take_n(v, keep, n);
 }
 
 // (`heff_take_reuse`, of a tag of `n` fields: its fields not blanked, the
@@ -478,12 +513,27 @@ HEFF_KNOWN V heff_take_reuse_n(V v, uint64_t keep, int64_t n) {
   return MK_INT(0);
 }
 
+// (... of a tag that may have flat fields (#64), as `heff_take_nf`: the
+// cell kept made plain, as `heff_tag_at_n` wants it -- `heff_tag_at_nf`
+// says its flat fields anew)
+HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1 && t->flat) {
+    heff_tag_unset(t, keep, n);
+    t->flat = 0; t->h.kind = K_TAG;
+    return v;
+  }
+  return heff_take_reuse_n(v, keep, n);
+}
+
 // (a tag of `n` fields dropped: its last reference, its fields dropped
 // and its cell freed at once; otherwise counted down)
 HEFF_KNOWN void heff_drop_tag(V v, int64_t n) {
   Tag *t = (Tag *)v;
   if (t->h.rc == 1) {
-    for (int64_t i = 0; i < n; i++) heff_drop(t->f[i]);
+    if (t->flat) heff_tag_unset(t, 0, n);
+    else
+      for (int64_t i = 0; i < n; i++) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
   } else if (!(t->h.rc & IMMORTAL)) t->h.rc--;
 }
@@ -499,7 +549,7 @@ HEFF_KNOWN void heff_drop_cell(V r, int64_t n) {
 static inline V heff_tag_at(V r, int id, int64_t n, V *f) {
   if (!IS_OBJ(r)) return heff_tag(id, n, f);
   Tag *t = (Tag *)r;
-  t->h.tag = (uint16_t)id;
+  t->h.kind = K_TAG; t->h.tag = (uint16_t)id; t->flat = 0;
   memcpy(t->f, f, n * sizeof(V));
   return r;
 }
@@ -532,16 +582,34 @@ HEFF_KNOWN void heff_fields_n(V *to, V *f, int64_t n) {
 // (a tag of `n` fields, `n` more than none)
 HEFF_KNOWN V heff_tag_n(int id, int64_t n, V *f) {
   Tag *t = heff_obj_alloc(sizeof(Tag) + n * sizeof(V));
-  t->h.rc = 1; t->h.kind = K_TAG; t->h.tag = (uint16_t)id; t->n = n;
+  t->h.rc = 1; t->h.kind = K_TAG; t->h.tag = (uint16_t)id; heff_tag_head(t, n, 0);
   heff_fields_n(t->f, f, n);
   return (V)t;
 }
 
-// (a tag of `n` fields built in the cell `r` kept for it, or a new one)
+// (... some of its fields flat (#64), as `flat` says: each given as its
+// bits, `heff_word_f64` and the others)
+HEFF_KNOWN V heff_tag_nf(int id, int64_t n, uint32_t flat, V *f) {
+  Tag *t = heff_obj_alloc(sizeof(Tag) + n * sizeof(V));
+  t->h.rc = 1; t->h.kind = K_TAGF; t->h.tag = (uint16_t)id; heff_tag_head(t, n, flat);
+  heff_fields_n(t->f, f, n);
+  return (V)t;
+}
+
+// (a tag of `n` fields built in the cell `r` kept for it, or a new one:
+// a cell kept by `heff_take_reuse_n`, which says it has no flat fields)
 HEFF_KNOWN V heff_tag_at_n(V r, int id, int64_t n, V *f) {
   if (!IS_OBJ(r)) return heff_tag_n(id, n, f);
   Tag *t = (Tag *)r;
   t->h.tag = (uint16_t)id;
+  heff_fields_n(t->f, f, n);
+  return r;
+}
+
+HEFF_KNOWN V heff_tag_at_nf(V r, int id, int64_t n, uint32_t flat, V *f) {
+  if (!IS_OBJ(r)) return heff_tag_nf(id, n, flat, f);
+  Tag *t = (Tag *)r;
+  t->h.kind = K_TAGF; t->h.tag = (uint16_t)id; t->flat = flat;
   heff_fields_n(t->f, f, n);
   return r;
 }
@@ -737,7 +805,7 @@ static inline __attribute__((always_inline)) void heff_clo_take(V self, int64_t 
 static size_t heff_size(V v) {
   Obj *o = OBJ(v);
   switch (o->kind) {
-  case K_TAG: return sizeof(Tag) + ((Tag *)v)->n * sizeof(V);
+  case K_TAG: case K_TAGF: return sizeof(Tag) + ((Tag *)v)->n * sizeof(V);
   case K_REC: return sizeof(Rec) + ((Rec *)v)->n * sizeof(V);
   case K_CLO: return sizeof(Clo) + ((Clo *)v)->nenv * sizeof(V);
   case K_PAP: return sizeof(Pap) + ((Pap *)v)->n * sizeof(V);
@@ -750,11 +818,12 @@ static size_t heff_size(V v) {
   }
 }
 
-// (a record whose last reference is gone, its flat fields (#39) made
-// words that drop as nothing, as its other fields are given back)
-static __attribute__((noinline)) void heff_flat_clear(Rec *r) {
-  for (int64_t i = 0; i < r->n && i < HEFF_FLAT_FIELDS; i++)
-    if (heff_flat_kind(r->flat, i)) r->f[i] = MK_INT(0);
+// (a record or a tag whose last reference is gone, its flat fields (#39,
+// #64) made words that drop as nothing, as its other fields are given
+// back)
+static __attribute__((noinline)) void heff_flat_clear(V *f, int64_t n, uint32_t flat) {
+  for (int64_t i = 0; i < n && i < HEFF_FLAT_FIELDS; i++)
+    if (heff_flat_kind(flat, i)) f[i] = MK_INT(0);
 }
 
 // (what is given back, a stack of it, not a recursion: a long list's
@@ -794,9 +863,14 @@ __attribute__((noinline)) static void heff_free(V v) {
     size_t size;
     switch (o->kind) {
     case K_TAG: { Tag *t = (Tag *)v; n = t->n; f = t->f; size = sizeof(Tag) + n * sizeof(V); break; }
+    case K_TAGF: {
+      Tag *t = (Tag *)v; n = t->n; f = t->f; size = sizeof(Tag) + n * sizeof(V);
+      heff_flat_clear(t->f, t->n, t->flat);
+      break;
+    }
     case K_REC: {
       Rec *r = (Rec *)v; n = r->n; f = r->f; size = sizeof(Rec) + n * sizeof(V);
-      if (r->flat) heff_flat_clear(r);
+      if (r->flat) heff_flat_clear(r->f, r->n, r->flat);
       break;
     }
     case K_CLO: {
@@ -861,7 +935,7 @@ HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
 static V *heff_slots(V v, int64_t *n) {
   Obj *o = OBJ(v);
   switch (o->kind) {
-  case K_TAG: *n = ((Tag *)v)->n; return ((Tag *)v)->f;
+  case K_TAG: case K_TAGF: *n = ((Tag *)v)->n; return ((Tag *)v)->f;
   case K_REC: *n = ((Rec *)v)->n; return ((Rec *)v)->f;
   case K_ARR: *n = ((Arr *)v)->n; return ((Arr *)v)->a;
   default: *n = 0; return NULL;
@@ -882,13 +956,14 @@ static void heff_stack_push(HeffStack *s, V v) {
 }
 
 // (each place of the object `v` holds a value in, given to `f`)
-// (a record's flat fields (#39) none)
+// (a record's flat fields (#39) none, nor a tag's (#64))
 #define HEFF_EACH_SLOT(v, f, u)                                         \
   do {                                                                  \
     Obj *o_ = OBJ(v);                                                   \
     int64_t n_;                                                         \
     V *s_ = heff_slots(v, &n_);                                         \
-    uint32_t fl_ = o_->kind == K_REC ? ((Rec *)(v))->flat : 0;          \
+    uint32_t fl_ = o_->kind == K_REC ? ((Rec *)(v))->flat               \
+                 : o_->kind == K_TAGF ? ((Tag *)(v))->flat : 0;         \
     for (int64_t i_ = 0; i_ < n_; i_++)                                 \
       if (!heff_flat_kind(fl_, i_)) f(u, &s_[i_]);                      \
     if (o_->kind == K_CLO) {                                            \
@@ -2313,6 +2388,41 @@ HEFF_GET_N_FLAT(f64, double)
 HEFF_GET_N_FLAT(i64, int64_t)
 HEFF_GET_N_FLAT(u64, uint64_t)
 
+// A tag's fields that may be flat (#64), read where a match binds one:
+// as a number, whichever the tag holds (`heff_tget_S`, the tag looked at;
+// of a type never kept flat, the `V` looked at), or as a `V` of its own
+// (`heff_tget_v`: counted, boxed if it is flat).
+
+HEFF_FAST double heff_tget_f64(V v, int64_t i) {
+  Tag *t = (Tag *)v;
+  V w = t->f[i];
+  return heff_flat_kind(t->flat, i) ? heff_f64_of_word(w) : FLT_OF(w);
+}
+HEFF_FAST int64_t heff_tget_i64(V v, int64_t i) {
+  Tag *t = (Tag *)v;
+  V w = t->f[i];
+  return heff_flat_kind(t->flat, i) ? (int64_t)w : (int64_t)heff_int_low64(w);
+}
+HEFF_FAST uint64_t heff_tget_u64(V v, int64_t i) {
+  Tag *t = (Tag *)v;
+  V w = t->f[i];
+  return heff_flat_kind(t->flat, i) ? (uint64_t)w : heff_int_low64(w);
+}
+#define HEFF_TGET_PEEK(S, T)                                                \
+  HEFF_FAST T heff_tget_##S(V v, int64_t i) { return heff_peek_##S(((Tag *)v)->f[i]); }
+HEFF_TGET_PEEK(i8, int8_t)
+HEFF_TGET_PEEK(i16, int16_t)
+HEFF_TGET_PEEK(i32, int32_t)
+HEFF_TGET_PEEK(u8, uint8_t)
+HEFF_TGET_PEEK(u16, uint16_t)
+HEFF_TGET_PEEK(u32, uint32_t)
+HEFF_TGET_PEEK(f32, float)
+HEFF_FAST V heff_tget_v(V v, int64_t i) {
+  Tag *t = (Tag *)v;
+  unsigned k = heff_flat_kind(t->flat, i);
+  return k ? heff_flat_box(t->f[i], k) : heff_dup(t->f[i]);
+}
+
 // (of what is not finite, 0)
 static V heff_floor_f64(double d) {
   if (!isfinite(d)) return MK_INT(0);
@@ -3104,7 +3214,7 @@ static int heff_tag_named(V v, const char *name, int n, V **fs) {
   int tag, m = 0;
   V *f = NULL;
   if (IS_NTAG(v)) tag = (int)(v >> 2);
-  else if (IS_OBJ(v) && OBJ(v)->kind == K_TAG) { tag = OBJ(v)->tag; m = (int)((Tag *)v)->n; f = ((Tag *)v)->f; }
+  else if (IS_OBJ(v) && (OBJ(v)->kind == K_TAG || OBJ(v)->kind == K_TAGF)) { tag = OBJ(v)->tag; m = (int)((Tag *)v)->n; f = ((Tag *)v)->f; }
   else return 0;
   if (m != n || strcmp(heff_name_of(heff_tag_names, heff_ntag_names, (uint32_t)tag), name)) return 0;
   *fs = f;
@@ -3139,6 +3249,15 @@ static void heff_show_bytes(Buf *b, V v) {
   buf_str(b, "\"");
 }
 
+static void heff_show(Buf *b, V v, int arg);
+
+// (field `i` of the tag `v` shown, as a `V`: boxed, if it is flat, #64)
+static void heff_show_field(Buf *b, V v, int i, int arg) {
+  V x = heff_tget_v(v, i);
+  heff_show(b, x, arg);
+  heff_drop(x);
+}
+
 static void heff_show(Buf *b, V v, int arg) {
   char tmp[64];
   if (heff_is_list(v)) {
@@ -3146,7 +3265,7 @@ static void heff_show(Buf *b, V v, int arg) {
     buf_str(b, "[");
     for (int i = 0; heff_tag_named(v, "Cons", 2, &f); i++, v = f[1]) {
       if (i) buf_str(b, ", ");
-      heff_show(b, f[0], 0);
+      heff_show_field(b, v, 0, 0);
     }
     buf_str(b, "]");
     return;
@@ -3164,7 +3283,7 @@ static void heff_show(Buf *b, V v, int arg) {
   else {
     Obj *o = OBJ(v);
     switch (o->kind) {
-    case K_TAG: tag = o->tag; n = (int)((Tag *)v)->n; fs = ((Tag *)v)->f; break;
+    case K_TAG: case K_TAGF: tag = o->tag; n = (int)((Tag *)v)->n; fs = ((Tag *)v)->f; break;
     case K_FLT: {
       heff_js_number(FLT_OF(v), tmp);
       if (!strpbrk(tmp, ".eNI")) strcat(tmp, ".0");
@@ -3201,7 +3320,7 @@ static void heff_show(Buf *b, V v, int arg) {
   const char *name = heff_name_of(heff_tag_names, heff_ntag_names, (uint32_t)tag);
   if (n && arg) buf_str(b, "(");
   buf_str(b, name);
-  for (int i = 0; i < n; i++) { buf_str(b, " "); heff_show(b, fs[i], 1); }
+  for (int i = 0; i < n; i++) { buf_str(b, " "); heff_show_field(b, v, i, 1); }
   if (n && arg) buf_str(b, ")");
 }
 

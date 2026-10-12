@@ -354,7 +354,7 @@ pureIn safe total (ERecord fs _) =
        (\p -> case p of
         MkPair _ e2 -> pureIn safe total e2)
        fs)
-pureIn safe total (ETag _ as) =
+pureIn safe total (ETag _ as _) =
   IR.allI (List.map (\a -> pureIn safe total a) as)
 pureIn safe total (EProj e2 _ _ _) = pureIn safe total e2
 pureIn safe total (EApp (EGlobal g) as) = case Map.lookup
@@ -459,7 +459,7 @@ atomic e = False
 --------------------------------------------------------------------------------
 
 boolE : Bool -> IR.Expr
-boolE b = ETag (if b then "True" else "False") Nil
+boolE b = ETag (if b then "True" else "False") Nil Nil
 
 -- | a primitive of two integers, computed (those that cannot fail)
 intOp : String -> Int -> Int -> Maybe IR.Expr
@@ -550,9 +550,9 @@ substCopies x a (ERecord fs ts) = do
 substCopies x a (EProj e2 l sh t) = do
   e2' <- substCopies x a e2
   pure (EProj e2' l sh t)
-substCopies x a (ETag t as) = do
+substCopies x a (ETag t as ts) = do
   as' <- traverseS (\q -> substCopies x a q) as
-  pure (ETag t as')
+  pure (ETag t as' ts)
 substCopies x a (EMatch s arms) = do
   s' <- substCopies x a s
   arms' <- armsS (\q -> substCopies x a q) arms
@@ -753,9 +753,9 @@ simpF r (ERecord fs ts) = do
 simpF r (EProj e2 l sh t) = do
   e2' <- r.simp e2
   r.project l sh t e2'
-simpF r (ETag t as) = do
+simpF r (ETag t as ts) = do
   as' <- traverseS (\a -> r.simp a) as
-  pure (ETag t as')
+  pure (ETag t as' ts)
 simpF r (EMatch s arms) = do
   s' <- r.simp s
   arms' <- armsS (\a -> r.simp a) arms
@@ -885,7 +885,7 @@ plainCall r f g as = do
 -- | effect's signature: 8% slower, for a handler of four effects at
 -- | once alone.)
 telling : IR.Expr -> Bool
-telling (ETag _ _) = True
+telling (ETag _ _ _) = True
 telling (ERecord _ _) = True
 telling _ = False
 
@@ -905,7 +905,7 @@ apartW x (Cons (EProj e _ _ _) rest) = isVar x e || apartW x (Cons e rest)
 apartW x (Cons (ELam _ b) rest) = apartW x (Cons b rest)
 apartW x (Cons (ELet _ a b) rest) = apartW x (Cons a (Cons b rest))
 apartW x (Cons (ERecord fs _) rest) = apartW x (IR.pushFields fs rest)
-apartW x (Cons (ETag _ as) rest) = apartW x (IR.appendI as rest)
+apartW x (Cons (ETag _ as _) rest) = apartW x (IR.appendI as rest)
 apartW x (Cons (EPrimCall _ as) rest) = apartW x (IR.appendI as rest)
 apartW x (Cons (ECall _ as) rest) = apartW x (IR.appendI as rest)
 apartW x (Cons _ rest) = apartW x rest
@@ -969,7 +969,7 @@ varsAre _ _ = False
 
 -- | a function that is another name for a tag, `\x y -> C x y`: the tag
 tagOfLam : List String -> IR.Expr -> Maybe String
-tagOfLam xs (ETag t es) = if varsAre xs es then Just t else Nothing
+tagOfLam xs (ETag t es _) = if varsAre xs es then Just t else Nothing
 tagOfLam xs _ = Nothing
 
 -- Specialisation
@@ -1237,7 +1237,7 @@ cheap safe all (EStr _) = True
 cheap safe all (EBytes _) = True
 cheap safe all (EFixed _ _) = True
 cheap safe all (EFloat32 _) = True
-cheap safe all (ETag _ as) = IR.allI (List.map (cheap safe all) as)
+cheap safe all (ETag _ as _) = IR.allI (List.map (cheap safe all) as)
 cheap safe all (ERecord fs _) =
   IR.allI (List.map (cheap safe all) (List.map snd fs))
 cheap safe all (EProj e _ _ _) = cheap safe all e
@@ -1758,9 +1758,10 @@ applyToF r f as =
     -- them, with no bindings between -- the tag computes its fields in
     -- order, as the bindings would, and a call in a field stays where
     -- a loop can build the value)
-    ELam xs (ETag t es) ->
-      if List.length xs == List.length as && varsAre xs es then pure (ETag t as)
-      else applyLam r xs (ETag t es) as
+    ELam xs (ETag t es ts) ->
+      if List.length xs == List.length as && varsAre xs es
+        then pure (ETag t as ts)
+      else applyLam r xs (ETag t es ts) as
     ELam xs b -> applyLam r xs b as
     ELet x a b -> do
       b' <- r.applyTo b as
@@ -1842,7 +1843,7 @@ caseBudget : Int
 caseBudget = 40
 
 tagBody : IR.Arm -> Bool
-tagBody (MkArm _ _ (ETag _ _)) = True
+tagBody (MkArm _ _ (ETag _ _ _)) = True
 tagBody _ = False
 
 armsOf : IR.Expr -> List IR.Arm
@@ -1867,7 +1868,7 @@ caseOfCase r s2 arms2 arms =
 
 matchF : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
 matchF r (EMatch s2 arms2) arms = caseOfCase r s2 arms2 arms
-matchF r s@(ETag t as) arms = case findArm t arms of
+matchF r s@(ETag t as _) arms = case findArm t arms of
   Just (MkArm _ vs b) -> r.simp (letsOf (zipL vs as) b)
   Nothing -> pure (EMatch s arms)
 matchF r (ELet x a b) arms = do
@@ -1876,7 +1877,7 @@ matchF r (ELet x a b) arms = do
 matchF r s@(EGlobal g) arms = do
   mb <- known g
   case mb of
-    Just (ETag t2 as2) -> r.match (ETag t2 as2) arms
+    Just (ETag t2 as2 ts2) -> r.match (ETag t2 as2 ts2) arms
     _ -> pure (EMatch s arms)
 matchF r s arms = pure (EMatch s arms)
 
@@ -2240,17 +2241,17 @@ initSt n0 sg kp =
 -- | simplified already
 -- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "f" "f" (EApp (ELam ["x"] (EVar "x")) [EInt 1])]).defs
 -- | [EInt 1]
--- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "g" "g" (EMatch (ETag "Just" [EInt 5]) [MkArm "Just" ["x"] (EVar "x"), MkArm "Nothing" [] (EInt 0)])]).defs
+-- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "g" "g" (EMatch (ETag "Just" [EInt 5] [FtAny]) [MkArm "Just" ["x"] (EVar "x"), MkArm "Nothing" [] (EInt 0)])]).defs
 -- | [EInt 5]
 -- |
 -- | another name for a tag, given a call: the tag given it, no binding
 -- | between, so a loop can build the value
--- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "c" "c" (ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"])), IR.mkDef "f" "f" (ELam ["z"] (EApp (EApp (EGlobal "c") [EPrimCall "add" [EVar "z"]]) [EApp (EGlobal "f") [EVar "z"]]))]).defs
--- | [ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"]), ELam ["z"] (ETag "Cons" [EPrimCall "add" [EVar "z"], EApp (EGlobal "f") [EVar "z"]])]
+-- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "c" "c" (ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"] [FtAny, FtOther])), IR.mkDef "f" "f" (ELam ["z"] (EApp (EApp (EGlobal "c") [EPrimCall "add" [EVar "z"]]) [EApp (EGlobal "f") [EVar "z"]]))]).defs
+-- | [ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"] [FtAny, FtOther]), ELam ["z"] (ETag "Cons" [EPrimCall "add" [EVar "z"], EApp (EGlobal "f") [EVar "z"]] [FtAny, FtOther])]
 -- |
 -- | two arguments alike but for a number in them: one copy, the number
 -- | given it where it is called
--- | >>> List.length (List.filter (\(d : IR.Def) -> strEq (Spec.rootOf d.key) "m" && not (strEq d.key "m")) (simplifyProgram 0 [IR.mkDef "m" "m" (ELam ["f", "xs"] (EMatch (EVar "xs") [MkArm "Nil" [] (ETag "Nil" []), MkArm "Cons" ["x", "r"] (ETag "Cons" [EApp (EVar "f") [EVar "x"], EApp (EGlobal "m") [EVar "f", EVar "r"]])])), IR.mkDef "a" "a" (ELam ["us"] (EApp (EGlobal "m") [ELam ["u"] (EPrimCall "intAdd" [EVar "u", EInt 1]), EVar "us"])), IR.mkDef "b" "b" (ELam ["vs"] (EApp (EGlobal "m") [ELam ["v"] (EPrimCall "intAdd" [EVar "v", EInt 2]), EVar "vs"]))]).defs)
+-- | >>> List.length (List.filter (\(d : IR.Def) -> strEq (Spec.rootOf d.key) "m" && not (strEq d.key "m")) (simplifyProgram 0 [IR.mkDef "m" "m" (ELam ["f", "xs"] (EMatch (EVar "xs") [MkArm "Nil" [] (ETag "Nil" [] []), MkArm "Cons" ["x", "r"] (ETag "Cons" [EApp (EVar "f") [EVar "x"], EApp (EGlobal "m") [EVar "f", EVar "r"]] [FtAny, FtOther])])), IR.mkDef "a" "a" (ELam ["us"] (EApp (EGlobal "m") [ELam ["u"] (EPrimCall "intAdd" [EVar "u", EInt 1]), EVar "us"])), IR.mkDef "b" "b" (ELam ["vs"] (EApp (EGlobal "m") [ELam ["v"] (EPrimCall "intAdd" [EVar "v", EInt 2]), EVar "vs"]))]).defs)
 -- | 1
 simplifyProgram : Int -> List IR.Def -> Simplified
 simplifyProgram n0 defs =

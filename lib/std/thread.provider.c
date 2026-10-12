@@ -185,7 +185,7 @@ static V th_pool(int64_t w, V f, V l) {
     V *got = heff_alloc(sizeof(V) * (size_t)(n > 0 ? n : 1));
     int64_t i = 0;
     for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1))
-      got[i++] = heff_tr(heff_app1(heff_dup(f), heff_dup(heff_field(c, 0))));
+      got[i++] = heff_tr(heff_app1(heff_dup(f), heff_tget_v(c, 0)));
     heff_drop(f); heff_drop(l);
     V r = NTAG(TAG_Nil);
     for (i = n - 1; i >= 0; i--) r = heff_cons(got[i], r);
@@ -196,8 +196,12 @@ static V th_pool(int64_t w, V f, V l) {
   j.n = n;
   j.xs = heff_alloc(sizeof(V) * (size_t)n);
   int64_t i = 0;
-  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1))
-    j.xs[i++] = heff_copy_for_thread(heff_field(c, 0));
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
+    // (an element of a list of anything: one kept flat (#64) boxed)
+    V x = heff_tget_v(c, 0);
+    j.xs[i++] = heff_copy_for_thread(x);
+    heff_drop(x);
+  }
   heff_drop(l);
   j.fs = heff_alloc(sizeof(V) * (size_t)w);
   j.fs[0] = f;

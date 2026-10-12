@@ -164,7 +164,7 @@ tagsLbls (ELet _ a b) = namesIn tagsLbls [a, b]
 tagsLbls (ERecord fs _) =
   withLbls (List.map fst fs) (namesIn tagsLbls (List.map snd fs))
 tagsLbls (EProj e l _ _) = withLbls (Cons l Nil) (tagsLbls e)
-tagsLbls (ETag t as) = withTags (Cons t Nil) (namesIn tagsLbls as)
+tagsLbls (ETag t as _) = withTags (Cons t Nil) (namesIn tagsLbls as)
 tagsLbls (EMatch s arms) =
   withTags (armTags arms) (namesIn tagsLbls (Cons s (List.map IR.armBody arms)))
 tagsLbls (EPrimCall _ as) = namesIn tagsLbls as
@@ -915,26 +915,26 @@ expF k (RBytes s) = strLit "HEFF_BYTES" s
 expF k (RFixed w n) = pure (fixedLit w n)
 expF k (RF32 x) = pure ("heff_f32((float)" ^ showFloat x ^ ")")
 expF k (RNTag t) = pure ("NTAG(" ^ tagName t ^ ")")
-expF k (RTag t es) = do
+expF k (RTag t flat es) = do
   vs <- traverseC k.exp es
   pure
-      ("heff_tag_n("
+      ((if flat == 0 then "heff_tag_n(" else "heff_tag_nf(")
        ^ tagName t
        ^ ", "
        ^ showInt (List.length es)
-       ^ ", "
+       ^ (if flat == 0 then ", " else ", " ^ showInt flat ^ "u, ")
        ^ argsArr vs
        ^ ")")
-expF k (RTagIn ru t es) = do
+expF k (RTagIn ru t flat es) = do
   vs <- traverseC k.exp (Cons ru es)
   pure
-      ("heff_tag_at_n("
+      ((if flat == 0 then "heff_tag_at_n(" else "heff_tag_at_nf(")
        ^ fromMaybe "0" (List.head vs)
        ^ ", "
        ^ tagName t
        ^ ", "
        ^ showInt (List.length es)
-       ^ ", "
+       ^ (if flat == 0 then ", " else ", " ^ showInt flat ^ "u, ")
        ^ argsArr (List.drop 1 vs)
        ^ ")")
 expF k (RRec ls flat es) = do
@@ -1088,19 +1088,50 @@ fieldLine sv plain (MkPair v i) =
      else "heff_dup(heff_field(" ^ sv ^ ", " ^ showInt i ^ "))")
   ^ ";"
 
+-- (a field that may be flat (#64), read as its variable is kept: a
+-- number, flat or not; a `V` of its own, boxed if it is flat)
+flatLine : CK -> String -> Pair String (Pair Int Repr.Repr) -> String
+flatLine k sv (MkPair v (MkPair i r)) =
+  "  "
+  ^ k.ctype v
+  ^ " "
+  ^ cLocal v
+  ^ " = heff_tget_"
+  ^ reprSuffix r
+  ^ "("
+  ^ sv
+  ^ ", "
+  ^ showInt i
+  ^ ");"
+
+-- (... of a tag that may have flat fields (#64), which look)
+flatSuffix : Bool -> String
+flatSuffix True = "f"
+flatSuffix False = ""
+
 -- (the scrutinee given up at once (`heff_take_n`): its shell freed and
 -- the fields not wanted dropped; or its cell kept (`heff_take_reuse_n`))
 takeLines : String -> RefCount.Take -> List String
 takeLines sv TakeNone = Nil
-takeLines sv (TakeN mask n) =
+takeLines sv (TakeN fl mask n) =
   Cons
-    ("heff_take_n(" ^ sv ^ ", " ^ showInt mask ^ "ULL, " ^ showInt n ^ ");")
+    ("heff_take_n"
+     ^ flatSuffix fl
+     ^ "("
+     ^ sv
+     ^ ", "
+     ^ showInt mask
+     ^ "ULL, "
+     ^ showInt n
+     ^ ");")
     Nil
-takeLines sv (TakeKeep ru mask n) =
+takeLines sv (TakeKeep fl ru mask n) =
   Cons
     ("V "
      ^ cLocal ru
-     ^ " = heff_take_reuse_n("
+     ^ " = heff_take_reuse_n"
+     ^ flatSuffix fl
+     ^ "("
      ^ sv
      ^ ", "
      ^ showInt mask
@@ -1110,13 +1141,15 @@ takeLines sv (TakeKeep ru mask n) =
     Nil
 
 armF : CK -> String -> RefCount.CaseArm -> C (List String)
-armF k sv (MkCArm t fields plain take body leaves) = do
+armF k sv (MkCArm t fields flats plain take body leaves) = do
   ls <- k.stmts body
   pure
       (List.append
          (Cons ("case " ^ tagName t ^ ": {") Nil)
          (List.append
-            (List.map (fieldLine sv plain) fields)
+            (List.append
+               (List.map (fieldLine sv plain) fields)
+               (List.map (flatLine k sv) flats))
             (List.append
                (indented (List.append (takeLines sv take) ls))
                (List.append
@@ -2102,8 +2135,23 @@ globalH ce g rest =
                 (HS (maybe "" Repr.sigName (Repr.sigIn ce.facts.workers g)))
                 rest))))
 
+-- (what is known of a tag: its fields that may be flat, #64)
+tagH : CE -> String -> List IRText.HItem -> List IRText.HItem
+tagH ce t rest =
+  Cons
+    (HS t)
+    (Cons
+       (HS
+          (joinWith
+             ","
+             (List.map
+                showInt
+                (fromMaybe Nil (Map.lookup compareString t ce.facts.flat)))))
+       rest)
+
 -- | what a definition's C is made of, hashed: its key, its body (named
--- | again from 0), and what is known of itself and of what it mentions
+-- | again from 0), and what is known of itself, of what it mentions and
+-- | of the tags it matches
 emitVer : CE -> String -> IR.Expr -> String
 emitVer ce key b =
   IRText.hashOf
@@ -2113,7 +2161,12 @@ emitVer ce key b =
           (HE b)
           (List.foldr
              (globalH ce)
-             Nil
+             (List.foldr
+                (tagH ce)
+                Nil
+                (List.filter
+                   (\t -> Map.member compareString t ce.facts.flat)
+                   (sortedOnce (fst (tagsLbls b)))))
              (sortedOnce (Cons key (IR.globalsIn b))))))
 
 -- (what a definition made on its own: the C state it was emitted from

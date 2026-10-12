@@ -112,9 +112,11 @@ data Exp b
   | RF32 Float64
   -- | a tag of no fields: a word
   | RNTag String
-  | RTag String (List (Exp b))
-  -- | a tag built in the cell kept for it
-  | RTagIn (Exp b) String (List (Exp b))
+  -- | a tag: the bits of its flat fields (#64, `Repr.flatBits`), its
+  -- | fields (a flat one's bits, `RWord`)
+  | RTag String Int (List (Exp b))
+  -- | ... built in the cell kept for it
+  | RTagIn (Exp b) String Int (List (Exp b))
   -- | a record of its labels, the bits of its flat fields (#39,
   -- | `Repr.flatBits`), its fields (a flat one's bits, `RWord`)
   | RRec (List String) Int (List (Exp b))
@@ -167,13 +169,21 @@ data Exp b
 
 -- | what a match's arm does with what it matched, given up: nothing (it
 -- | wants it, or it is lent); given up at once, the fields of the mask
--- | kept; its cell kept for a tag of its size, `ru`
-data Take = TakeNone | TakeN Int Int | TakeKeep String Int Int
+-- | kept; its cell kept for a tag of its size, `ru` -- each knowing
+-- | whether the tag may have flat fields (#64)
+data Take = TakeNone | TakeN Bool Int Int | TakeKeep Bool String Int Int
 
--- | an arm: its tag, the fields it wants (each its place), whether they
--- | are taken over or lent (not counted), what it does with what it
--- | matched, its body, and whether it leaves the `switch`
-data Arm a = MkCArm String (List (Pair String Int)) Bool Take a Bool
+-- | a field that may be flat (#64), as an arm reads it: its variable,
+-- | its place, the repr it is read as
+type FlatRead = Pair String (Pair Int Repr.Repr)
+
+-- | an arm: its tag, the fields it wants (each its place), those of them
+-- | that may be flat (#64), each read as the repr (a number, or a `V`
+-- | counted, boxed if it is flat), whether the others are taken over or
+-- | lent (not counted), what it does with what it matched, its body, and
+-- | whether it leaves the `switch`
+data Arm a
+  = MkCArm String (List (Pair String Int)) (List FlatRead) Bool Take a Bool
 
 -- | a statement, or what is last
 data Stmt b
@@ -253,8 +263,8 @@ type Self = { key : String, params : List String }
 -- lambda's body, how many parameters it takes, else 0 -- see `CInPlace`;
 -- `takes`: the fields, by their records and labels, that the operands
 -- being made take out of their records -- see `takesFor`; `sigs`: the
--- workers; `ret`: what the code being made returns, as its worker gives
--- it, a `V` in a lambda)
+-- workers; `flat`: the tags' fields that may be flat (#64); `ret`: what
+-- the code being made returns, as its worker gives it, a `V` in a lambda)
 type CE =
   { funs : Map.Map String Int
   , bounce : Map.Map String Unit
@@ -268,6 +278,7 @@ type CE =
   , takes : List (Pair String String)
   , reprs : Repr.Reprs
   , sigs : Repr.Sigs
+  , flat : Repr.FlatTags
   , ret : Repr.Repr
   }
 
@@ -291,6 +302,7 @@ withFrame s n ce =
   , takes = Nil
   , reprs = ce.reprs
   , sigs = ce.sigs
+  , flat = ce.flat
   , ret = retOf ce.sigs s
   }
 
@@ -308,6 +320,7 @@ withPath owned after ce =
   , takes = ce.takes
   , reprs = ce.reprs
   , sigs = ce.sigs
+  , flat = ce.flat
   , ret = ce.ret
   }
 
@@ -326,6 +339,7 @@ withBorrowed bs ce =
   , takes = ce.takes
   , reprs = ce.reprs
   , sigs = ce.sigs
+  , flat = ce.flat
   , ret = ce.ret
   }
 
@@ -343,6 +357,7 @@ withKnown x k ce =
   , takes = ce.takes
   , reprs = ce.reprs
   , sigs = ce.sigs
+  , flat = ce.flat
   , ret = ce.ret
   }
 
@@ -360,6 +375,7 @@ withTakes ts ce =
   , takes = ts
   , reprs = ce.reprs
   , sigs = ce.sigs
+  , flat = ce.flat
   , ret = ce.ret
   }
 
@@ -379,6 +395,7 @@ ceOfFacts facts reprs =
   , takes = Nil
   , reprs = reprs
   , sigs = facts.workers
+  , flat = facts.flat
   , ret = RepV
   }
 
@@ -433,7 +450,7 @@ fvW bs ms Nil = MkPair bs ms
 fvW bs ms (Cons (IVal (SVar x)) rest) = fvW bs (Cons x ms) rest
 fvW bs ms (Cons (IVal (SLam xs (MkBlock t))) rest) =
   fvW (List.append xs bs) ms (Cons (ITl t) rest)
-fvW bs ms (Cons (IVal (STag _ as)) rest) = fvW bs ms (pushVals as rest)
+fvW bs ms (Cons (IVal (STag _ as _)) rest) = fvW bs ms (pushVals as rest)
 fvW bs ms (Cons (IVal (SRec fs _)) rest) =
   fvW bs ms (pushVals (List.map snd fs) rest)
 fvW bs ms (Cons (IVal (SProj v _ _ _)) rest) = fvW bs ms (Cons (IVal v) rest)
@@ -937,16 +954,6 @@ lamVal r ce live xs t = lamWith r ce live xs t (freeOf xs t)
 reusePrim : String
 reusePrim = "$reuse"
 
--- (a tag built in the cell, the first operand)
-tagIn : String -> List Value -> Value
-tagIn t (Cons rv vs) = RTagIn rv t vs
-tagIn t Nil = RAbandon
-
-reuseVal : RcK -> CE -> List String -> List Imperative.Val -> Value
-reuseVal r ce live (Cons ru (Cons (STag t as) Nil)) =
-  tagIn t (operandsF r ce live (Cons ru as))
-reuseVal r ce live _ = RInt 0
-
 -- (field `i` of a record, counted, the record not touched: one that may
 -- be flat (#39) boxed if it is)
 fieldDup : Bool -> Value -> Int -> Value
@@ -1142,6 +1149,35 @@ storedAs : RcK
 storedAs r ce live rps vs =
   List.zipWith wordOf rps (operandsAs r ce live rps vs)
 
+-- (the bits a tag's flat fields are said by, of how they are stored)
+slotBits : List Repr.Repr -> Int
+slotBits rps = Repr.flatBits (List.zip (List.range 0 (List.length rps - 1)) rps)
+
+-- | a tag built, each field stored as `Repr.tagSlots` says of its type
+-- | (#64)
+tagVal : RcK
+       -> CE
+       -> List String
+       -> String
+       -> List Imperative.Val
+       -> List IR.FieldTy
+       -> Value
+tagVal r ce live t as ts =
+  RTag
+    t
+    (slotBits (Repr.tagSlots ts (List.length as)))
+    (storedAs r ce live (Repr.tagSlots ts (List.length as)) as)
+
+-- | ... in the cell `ru` kept for it
+reuseVal : RcK -> CE -> List String -> List Imperative.Val -> Value
+reuseVal r ce live (Cons ru (Cons (STag t as ts) Nil)) =
+  RTagIn
+    (r.val ce (unionS (fvList as) live) ru)
+    t
+    (slotBits (Repr.tagSlots ts (List.length as)))
+    (storedAs r ce live (Repr.tagSlots ts (List.length as)) as)
+reuseVal r ce live _ = RInt 0
+
 -- | a record built from `x`'s
 updateVal : RcK
           -> CE
@@ -1207,8 +1243,8 @@ valF r ce live (SStr s) = RStr s
 valF r ce live (SBytes s) = RBytes s
 valF r ce live (SFixed w n) = RFixed w n
 valF r ce live (SFloat32 x) = RF32 x
-valF r ce live (STag t as) =
-  if List.null as then RNTag t else RTag t (operandsF r ce live as)
+valF r ce live (STag t as ts) =
+  if List.null as then RNTag t else tagVal r ce live t as ts
 valF r ce live (SRec fs ts) =
   recordVal r ce live fs ts (updatedIn ce live (List.map fst fs) fs)
 valF r ce live (SProj e l sh t) =
@@ -1478,13 +1514,73 @@ fieldMask used i Nil = 0
 fieldMask used i (Cons v vs) =
   (if elemS v used then pow2 i else 0) + fieldMask used (i + 1) vs
 
+-- Fields that may be flat (#64): a field of a tag that any tag of it is
+-- built with flat (`ce.flat`) is read as the tag holds it, as its
+-- variable is kept (heff.compile.repr leaves it unpinned): a number, or a
+-- `V` of its own -- counted, a box if it is flat -- held by the arm, not
+-- lent nor kept in the tag's mask (whose drop skips a flat field).
+
+-- (those of `xs` not in `ys`)
+minusS : List String -> List String -> List String
+minusS xs Nil = xs
+minusS xs ys = List.filter (\x -> not (elemS x ys)) xs
+
+-- | how an arm reads the fields it wants: those that may not be flat, as
+-- | ever; those that may (each read as the repr), their names, those of
+-- | them read as `V`s of their own; whether the tag may have flat fields
+type Reads =
+  { plain : List (Pair String Int)
+  , flats : List FlatRead
+  , names : List String
+  , counted : List String
+  , flat : Bool
+  }
+
+-- (those of the wanted `ws` that may be flat, of the places `ps`)
+flatOnes : CE -> List Int -> List (Pair String Int) -> List FlatRead
+flatOnes ce ps ws =
+  List.map
+    (\p -> MkPair (fst p) (MkPair (snd p) (Repr.reprOf ce.reprs (fst p))))
+    (List.filter (\p -> elemI (snd p) ps) ws)
+
+readsFrom : List (Pair String Int) -> List FlatRead -> Reads
+readsFrom ws fs =
+  { plain =
+      List.filter (\p -> not (List.any (\q -> strEq (fst q) (fst p)) fs)) ws
+  , flats = fs
+  , names = List.map fst fs
+  , counted = List.map fst (List.filter (\q -> Repr.isBoxed (snd (snd q))) fs)
+  , flat = True
+  }
+
+readsWith : CE -> List (Pair String Int) -> Maybe (List Int) -> Reads
+readsWith ce ws (Just ps) = readsFrom ws (flatOnes ce ps ws)
+readsWith ce ws Nothing =
+  { plain = ws, flats = Nil, names = Nil, counted = Nil, flat = False }
+
+-- | how an arm of the tag `t` reads the fields it wants
+readsOf : CE -> String -> List (Pair String Int) -> Reads
+readsOf ce t ws = readsWith ce ws (Map.lookup compareString t ce.flat)
+
+-- (the fields an arm holds a reference to: those it wants, unless lent;
+-- those of them read counted, always)
+heldOf : Bool -> List String -> List String -> List String -> List String
+heldOf True vs fb counted = counted
+heldOf False vs fb counted = fieldsHeld False vs fb
+
 -- (what an arm does with the scrutinee it gives up (`taken`): its cell
 -- kept (`ru`), or given up at once; the fields it wants kept)
-takeOf : Maybe String -> Maybe String -> List String -> List String -> Take
-takeOf (Just ru) taken vs used =
-  TakeKeep ru (fieldMask used 0 vs) (List.length vs)
-takeOf Nothing (Just _) vs used = TakeN (fieldMask used 0 vs) (List.length vs)
-takeOf Nothing Nothing vs used = TakeNone
+takeOf : Bool
+       -> Maybe String
+       -> Maybe String
+       -> List String
+       -> List String
+       -> Take
+takeOf fl (Just ru) taken vs used =
+  TakeKeep fl ru (fieldMask used 0 vs) (List.length vs)
+takeOf fl Nothing (Just _) vs used =
+  TakeN fl (fieldMask used 0 vs) (List.length vs)
+takeOf fl Nothing Nothing vs used = TakeNone
 
 -- Cells kept
 --------------------------------------------------------------------------------
@@ -1512,15 +1608,20 @@ reuseArgs go vs =
     (MkPair False Nil)
     vs
 
-withTag : String -> Pair Bool (List Imperative.Val) -> Pair Bool Imperative.Val
-withTag t (MkPair b as) = MkPair b (STag t as)
+withTag : String
+        -> List IR.FieldTy
+        -> Pair Bool (List Imperative.Val)
+        -> Pair Bool Imperative.Val
+withTag t ts (MkPair b as) = MkPair b (STag t as ts)
 
 -- (a tag of `n` fields, built in the cell; or one of its operands)
 reuseV : String -> Int -> Imperative.Val -> Pair Bool Imperative.Val
-reuseV ru n (STag t as) =
+reuseV ru n (STag t as ts) =
   if List.length as == n
-    then MkPair True (SPrim reusePrim (Cons (SVar ru) (Cons (STag t as) Nil)))
-  else withTag t (reuseArgs (\v -> reuseV ru n v) as)
+    then MkPair
+        True
+        (SPrim reusePrim (Cons (SVar ru) (Cons (STag t as ts) Nil)))
+  else withTag t ts (reuseArgs (\v -> reuseV ru n v) as)
 reuseV ru n v = MkPair False v
 
 reuseVals : String
@@ -1668,6 +1769,49 @@ knowCell : Maybe String -> Int -> CE -> CE
 knowCell Nothing n ce = ce
 knowCell (Just ru) n ce = withKnown ru (KnownCell n) ce
 
+-- (an arm, reading the fields it wants as `rd` says)
+armRead : RcK
+        -> CE
+        -> Maybe String
+        -> Bool
+        -> String
+        -> List String
+        -> List String
+        -> Bool
+        -> Reads
+        -> Pair (Maybe String) ArmBody
+        -> CaseArm
+armRead r ce taken lent t vs fb leaves rd (MkPair ru b2) =
+  MkCArm
+    t
+    rd.plain
+    rd.flats
+    (lent || isJustS taken)
+    (takeOf rd.flat ru taken vs (minusS fb rd.names))
+    (List.append
+       (dropsIn
+          ce
+          (List.filter
+             (\v -> not (elemS v (maybeList taken)))
+             (deadIn
+                (List.append ce.owned (heldOf lent vs fb rd.counted))
+                (unionS fb ce.after))))
+       (armBodyF
+          r
+          (withPath
+             (deadKept
+                (List.append
+                   ce.owned
+                   (List.append (heldOf lent vs fb rd.counted) (maybeList ru)))
+                (unionS (List.append fb (maybeList ru)) ce.after))
+             ce.after
+             (withBorrowed
+                (if lent then List.append (minusS vs rd.counted) ce.borrowed
+                 else ce.borrowed)
+                (knowCell ru (List.length vs) ce)))
+          b2))
+    leaves
+
 -- (an arm: the fields it wants, a reference to each; what is held and
 -- not wanted on it, dropped.  The scrutinee held and not wanted on it is
 -- given up at once: its last reference, its shell freed and the fields
@@ -1682,34 +1826,8 @@ armKept : RcK
         -> Bool
         -> Pair (Maybe String) ArmBody
         -> CaseArm
-armKept r ce taken lent t vs fb leaves (MkPair ru b2) =
-  MkCArm
-    t
-    (fieldsWanted vs fb)
-    (lent || isJustS taken)
-    (takeOf ru taken vs fb)
-    (List.append
-       (dropsIn
-          ce
-          (List.filter
-             (\v -> not (elemS v (maybeList taken)))
-             (deadIn
-                (List.append ce.owned (fieldsHeld lent vs fb))
-                (unionS fb ce.after))))
-       (armBodyF
-          r
-          (withPath
-             (deadKept
-                (List.append
-                   ce.owned
-                   (List.append (fieldsHeld lent vs fb) (maybeList ru)))
-                (unionS (List.append fb (maybeList ru)) ce.after))
-             ce.after
-             (withBorrowed
-                (if lent then List.append vs ce.borrowed else ce.borrowed)
-                (knowCell ru (List.length vs) ce)))
-          b2))
-    leaves
+armKept r ce taken lent t vs fb leaves p =
+  armRead r ce taken lent t vs fb leaves (readsOf ce t (fieldsWanted vs fb)) p
 
 armTaken : RcK
          -> CE
@@ -1798,11 +1916,11 @@ stArmsOf arms =
 
 -- (what a binding builds: a tag, known by its size)
 reusedOf : List Imperative.Val -> Maybe Known
-reusedOf (Cons _ (Cons (STag _ as) Nil)) = Just (KnownTag (List.length as))
+reusedOf (Cons _ (Cons (STag _ as _) Nil)) = Just (KnownTag (List.length as))
 reusedOf _ = Nothing
 
 builtOf : Imperative.Comp -> Maybe Known
-builtOf (OSimple (STag _ as)) = Just (KnownTag (List.length as))
+builtOf (OSimple (STag _ as _)) = Just (KnownTag (List.length as))
 builtOf (OSimple (SRec fs _)) = Just (KnownRec (List.length fs))
 builtOf (OSimple (SLam xs (MkBlock t))) =
   Just (KnownClo (List.length (freeOf xs t)))
@@ -1940,7 +2058,7 @@ othersW x l (Cons (IVal (SProj e l2 _ _)) rest) =
   else othersW x l (Cons (IVal e) rest)
 othersW x l (Cons (IVal (SLam _ (MkBlock t))) rest) =
   Imperative.timesIn x (Imperative.tailParts t) == 0 && othersW x l rest
-othersW x l (Cons (IVal (STag _ as)) rest) = othersW x l (pushVals as rest)
+othersW x l (Cons (IVal (STag _ as _)) rest) = othersW x l (pushVals as rest)
 othersW x l (Cons (IVal (SRec fs _)) rest) =
   othersW x l (pushVals (List.map snd fs) rest)
 othersW x l (Cons (IVal (SPrim _ as)) rest) = othersW x l (pushVals as rest)
@@ -1988,7 +2106,7 @@ othersW x l (Cons (ITl (TCase v arms)) rest) =
 operandsOf : Imperative.Comp -> List Imperative.Val
 operandsOf (OApply f as) = Cons f as
 operandsOf (OCall _ as) = as
-operandsOf (OSimple (STag _ as)) = as
+operandsOf (OSimple (STag _ as _)) = as
 operandsOf (OSimple (SRec fs _)) = List.map snd fs
 operandsOf (OSimple (SPrim _ as)) = as
 operandsOf (OPrim _ as) = as

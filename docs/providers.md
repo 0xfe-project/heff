@@ -99,9 +99,9 @@ number; in C an integer of up to 32 bits is a word of its value
 word of its bits (`heff_f32_of`, `heff_f32`), and a `Float64` is boxed
 (`FLT_OF`, `heff_flt`).  So in C a `Float64`, and an `Int64` or `UInt64`
 beyond 62 bits (as an `Int` is), costs an allocation each value given
-as one -- to a provider, into a list, a tag or a closure, to a function
-or back from it -- where an integer of up to 32 bits and a `Float32`
-cost none.  Where a program computes with a fixed-width number or a
+as one -- to a provider, into a closure, into a list, a tag or a record
+where its type is not known, to a function or back from it -- where an
+integer of up to 32 bits and a `Float32` cost none.  Where a program computes with a fixed-width number or a
 `Float64`, it keeps it unboxed, as its C type (`int64_t`, `double`,
 ...), and boxes it only where it is given so (src/heff/compile/repr.hf);
 a function that takes such a number as a number, or gives one back, is
@@ -113,7 +113,11 @@ A record's `Float64`, `Int64` and `UInt64` fields (of its first 16),
 built where their type is known, are kept flat, their bits in the
 record: a provider given a record reads a field by `heff_rget_v` (the
 field as a `V`, counted; boxed if it is flat), not out of the record
-itself.
+itself.  A tag's are kept so too (`Just 1.5`, a `List Float64`'s cells
+built where the type is known): a provider given a tag one of whose
+fields is of such a type, or of a type it does not know (a list's
+element), reads that field by `heff_tget_v` (as `heff_rget_v`), not by
+`heff_field`.
 
 A provider is given a rune as a number in JavaScript, and in C as a
 word of its code point (`INT_OF`, `MK_INT`).
