@@ -971,7 +971,8 @@ tagOfLam xs _ = Nothing
 
 -- A known definition that is not inlined -- it calls itself, or is too
 -- big -- given arguments known where it is called (a definition that is
--- a function or a record, a closed lambda or record) is called as a copy
+-- a function or a record, a closed lambda or record; to a loop, a small
+-- lambda that calls nothing, whatever it captures) is called as a copy
 -- of it made for them: their parameters gone, the arguments in their
 -- place, the copy simplified with them (`e.hmap`, `hd.bind`, `r.simp`
 -- known now: inlined, or calls of known definitions in turn).  For a
@@ -1007,16 +1008,51 @@ knownArg : M.Map String Unit -> I.Expr -> Bool
 knownArg kinds (EGlobal g) = M.member compareString g kinds
 knownArg kinds e = closedKnown e
 
+-- | ... and, given to a loop (a definition calling itself, `loops`), a
+-- | lambda capturing variables that calls nothing (`Sp.callsNothing`):
+-- | the copy is given those in its place (`Sp.shapeOf`), and computes
+-- | it where it is called, at each round, no closure built
+capturing : I.Expr -> Bool
+capturing (ELam xs b) =
+  not (I.sizeAbove specArgSize (ELam xs b)) && Sp.callsNothing (ELam xs b)
+capturing _ = False
+
+loops : String -> I.Expr -> Bool
+loops g b = elemStr g (I.globalsIn b)
+
+knownIn : Bool -> M.Map String Unit -> I.Expr -> Bool
+knownIn loop kinds e = knownArg kinds e || (loop && capturing e)
+
 nthE : Int -> List I.Expr -> Maybe I.Expr
 nthE i Nil = Nothing
 nthE i (Cons x xs) = if i == 0 then Just x else nthE (i - 1) xs
 
-markGo : M.Map String Unit -> List I.Expr -> List Bool -> Int -> List Bool
-markGo all as Nil i = Nil
-markGo all as (Cons st rest) i =
+markGo : Bool
+       -> M.Map String Unit
+       -> List I.Expr
+       -> List Bool
+       -> Int
+       -> List Bool
+markGo loop all as Nil i = Nil
+markGo loop all as (Cons st rest) i =
   Cons
-    (st && maybe False (\a -> knownArg all a) (nthE i as))
-    (markGo all as rest (i + 1))
+    (st && maybe False (\a -> knownIn loop all a) (nthE i as))
+    (markGo loop all as rest (i + 1))
+
+marksIn : Bool
+        -> M.Map String Unit
+        -> String
+        -> List String
+        -> I.Expr
+        -> List I.Expr
+        -> List Bool
+marksIn loop all g xs b as =
+  markGo
+    loop
+    all
+    as
+    (if loop then Sp.statics g xs b else List.map (\x -> True) xs)
+    0
 
 -- | the parameters a copy is made for: known there, and handed on as
 -- | they are if `g` calls itself
@@ -1026,22 +1062,21 @@ marksOf : M.Map String Unit
         -> I.Expr
         -> List I.Expr
         -> List Bool
-marksOf all g xs b as =
-  markGo
-    all
-    as
-    (if elemStr g (I.globalsIn b) then Sp.statics g xs b
-     else List.map (\x -> True) xs)
-    0
+marksOf all g xs b as = marksIn (loops g b) all g xs b as
 
-specKey : String -> List Bool -> List I.Expr -> String
-specKey g marks as =
+-- | whether a copy may be made for any of the arguments
+anyKnown : M.Map String Unit -> String -> I.Expr -> List I.Expr -> Bool
+anyKnown kinds g b as =
+  List.any (\a -> knownArg kinds a) as || (List.any capturing as && loops g b)
+
+specKey : String -> List Bool -> List String -> List I.Expr -> String
+specKey g marks vars as =
   g
   ^ "("
   ^ joinWith
     ","
     (List.zipWith
-       (\m a -> if m then Sp.key a else "_")
+       (\m a -> if m then Sp.keyIn vars a else "_")
        marks
        (takeL (List.length marks) as))
   ^ ")"
@@ -1611,7 +1646,7 @@ specShaped r g xs b as marks sh = \s ->
         as
         marks
         sh
-        (Sp.copyName g (specKey g marks sh.args))
+        (Sp.copyName g (specKey g marks sh.vars sh.args))
         (depthOf s.sp.depths g (markedOf marks sh.args))
         s
 
@@ -1638,9 +1673,7 @@ specMarked r g xs b as marks =
 specLam : SK -> String -> List String -> I.Expr -> List I.Expr -> M I.Expr
 specLam r g xs b as = do
   s <- get
-  if s.sp.off
-    || s.sp.count >= specLimit
-    || not (List.any (\a -> knownArg s.sp.kinds a) as)
+  if s.sp.off || s.sp.count >= specLimit || not (anyKnown s.sp.kinds g b as)
       then pure (mkApp (EGlobal g) as)
     else specMarked r g xs b as (marksOf s.sp.kinds g xs b as)
 
