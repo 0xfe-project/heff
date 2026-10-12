@@ -1,0 +1,1654 @@
+-- Reference counts, and what the C backend does with them (#40): the
+-- imperative form (heff.compile.imp) made `Rc`, each decision written in
+-- it, which heff.compile.emitc prints as C.
+--
+-- Perceus: a variable holds a reference to its value, which the code
+-- holding the variable consumes or drops, exactly once on each path.
+--
+-- - Each use of a variable consumes a reference: the last use on its
+--   path gives its own away; a use before that takes one more
+--   (`RDup`).  A use is last where the variable is not wanted after it:
+--   by the operands after it, or by what comes after the step (`live`).
+--   What uses its operands consumes them: a call, a tag or a record
+--   built, a closure made, a primitive, a field taken.
+-- - Where a path starts -- a function's or a lambda's body, a match's
+--   arm, what follows a binding -- a variable held and not wanted on it
+--   is dropped (`CDrop`).
+-- - A match only looks at what it matches: an arm takes a reference to
+--   each field it wants, and the matched value is dropped there if the
+--   arm does not want it.
+-- - A definition's value is the definition's, never dropped: a use of it
+--   takes a reference.  A lambda's closure holds what it mentions: its
+--   body takes what it holds, and gives the closure up.
+-- - A drop is specialised where what is dropped is known (`Known`): a tag
+--   of no fields is a word, nothing to give back; a tag of `n` fields --
+--   in an arm matching it, or bound to one built -- is given back as one,
+--   not looked at; a cell kept and not built in is freed; so are a record
+--   and a closure of known size.
+--
+-- And besides: a function's parameter lent, not given (heff.compile.borrow,
+-- `lent`); a tag built in the cell of the one a match took apart, where
+-- that was its last reference (`RTagIn`); a record built of the same shape
+-- as one it reads fields of, in that one's cell (`RRecIn`); a field taken
+-- out of its record (`RTakeField`); and how each call last is made -- the
+-- loop again, a jump, an unknown function's arguments where a lambda's
+-- were.
+
+import heff.compile.borrow as Bo
+import heff.compile.facts as F
+import heff.elab.fixed as Fx
+import heff.compile.imp as Mp
+import map as M
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+-- The form
+--------------------------------------------------------------------------------
+
+-- Types are defined one after another, as heff.compile.imp's are: what
+-- holds a lambda's body is parametric in it (`b`), and `Code` closes the
+-- knot.
+
+-- | what a variable is known to be where it is dropped (#26): a tag of
+-- | `n` fields -- the arm it is in matching it, or built where it is
+-- | bound -- or the cell kept for a tag of `n` fields (`reusing`); a
+-- | record of `n` fields -- built where it is bound, or read a field of
+-- | at its shape -- or a closure holding `n`, built where it is bound
+-- | (#34)
+data Known = KnownTag Int | KnownCell Int | KnownRec Int | KnownClo Int
+
+-- | a drop of a variable, as what it is known to be (if anything)
+data Drop = MkDrop String (Maybe Known)
+
+-- | a call's operand (`e` a value): given; a variable lent, dropped after
+-- | the call where nothing wants it after (its drops); a value lent,
+-- | computed before the call and dropped after it
+data Arg e = Given e | LentVar String (List Drop) | LentValue e
+
+-- | a value, made: each operand consumed (`RLocal`, a variable's
+-- | reference given; `RDup`, one more taken)
+data Exp b
+  = RLocal String
+  | RDup String
+  -- | a function, as a closure (static)
+  | RClo String
+  -- | a definition's value, a reference taken (`RGet`), or looked at
+  -- | (`RGetRaw`)
+  | RGet String
+  | RGetRaw String
+  | RInt Int
+  | RFloat Float64
+  | RStr String
+  | RFixed Fx.Fixed Int
+  | RF32 Float64
+  -- | a tag of no fields: a word
+  | RNTag String
+  | RTag String (List (Exp b))
+  -- | a tag built in the cell kept for it
+  | RTagIn (Exp b) String (List (Exp b))
+  -- | a record of its labels, its fields
+  | RRec (List String) (List (Exp b))
+  -- | a record built in the cell of `x`, of `n` fields, the bits of
+  -- | those kept: its labels, the others each at its place
+  | RRecIn String Int Int (List String) (List (Pair Int (Exp b)))
+  -- | field `i` of a record, not counted
+  | RField (Exp b) Int
+  | RDupE (Exp b)
+  -- | field `i` of a record of `n` fields, the record consumed
+  | RGetN (Exp b) Int Int
+  -- | field `i` taken out of the record `x`
+  | RTakeField String Int
+  -- | a field looked for by its label
+  | RGetLabel (Exp b) String
+  | RPrimFn String
+  | RPrim String (List (Exp b))
+  -- | a lambda's closure: its parameters, what it holds (the names in
+  -- | its body, the values given), its body (its parameters not wanted
+  -- | dropped first)
+  | RLam (List String) (List String) (List (Exp b)) b
+  -- | a known definition called: through any bounces (`tr`), each
+  -- | operand given or lent
+  | RCall String Bool (List (Arg (Exp b)))
+  | RApply (Exp b) (List (Exp b))
+  | RAbandon
+
+-- | what a match's arm does with what it matched, given up: nothing (it
+-- | wants it, or it is lent); given up at once, the fields of the mask
+-- | kept; its cell kept for a tag of its size, `ru`
+data Take = TakeNone | TakeN Int Int | TakeKeep String Int Int
+
+-- | an arm: its tag, the fields it wants (each its place), whether they
+-- | are taken over or lent (not counted), what it does with what it
+-- | matched, its body, and whether it leaves the `switch`
+data Arm a = MkCArm String (List (Pair String Int)) Bool Take a Bool
+
+-- | a statement, or what is last
+data Stmt b
+  = CDrop Drop
+  | CLet String (Exp b)
+  | CDecl String
+  | CSet String (Exp b)
+  -- | a name set to nothing it can be: not reached
+  | CAbandon
+  -- | `if` the comparison of the operands, then, else
+  | CIf String (List (Exp b)) (List (Stmt b)) (List (Stmt b))
+  -- | a `switch` on what is looked at: its arms, and whether one not
+  -- | there returns (else it is a statement)
+  | CSwitch (Exp b) (List (Arm (List (Stmt b)))) Bool
+  | CReturn (Exp b)
+  -- | an unknown function called last: its arguments where a lambda's
+  -- | were; in `heff_room`; given, counted
+  | CInPlace (Exp b) (List (Exp b))
+  | CRoomed (Exp b) (List (Exp b))
+  | CTail (Exp b) (List (Exp b))
+  -- | the loop again: its parameters, the arguments
+  | CLoop (List String) (List (Exp b))
+  -- | a known definition of the same parameters called last: a jump
+  | CJump String (List (Exp b))
+
+-- | a body: what a function or a lambda does
+data Code = MkCode (List (Stmt Code))
+
+type Value = Exp Code
+
+type Statement = Stmt Code
+
+type Operand = Arg Value
+
+type CaseArm = Arm (List Statement)
+
+-- | a definition: a function, its parameters, those lent, its body (its
+-- | parameters not wanted dropped first); a value, its body
+data Def
+  = DFun String (List String) (List Int) (List Statement)
+  | DVal String (List Statement)
+
+-- What is known where
+--------------------------------------------------------------------------------
+
+-- | a definition being made that calls itself last: its key and
+-- | parameters (the loop's)
+type Self = { key : String, params : List String }
+
+-- (`owned`: the variables this code holds a reference to, to consume or
+-- drop; `after`: those wanted after what is being made, by what comes
+-- after it; `known`: what some of them are known to be; `lam`: in a
+-- lambda's body, how many parameters it takes, else 0 -- see `CInPlace`;
+-- `takes`: the fields, by their records and labels, that the operands
+-- being made take out of their records -- see `takesFor`)
+type CE =
+  { funs : M.Map String Int
+  , bounce : M.Map String Unit
+  , self : Maybe Self
+  , lam : Int
+  , owned : List String
+  , after : List String
+  , borrowed : List String
+  , bor : M.Map String (List Int)
+  , known : M.Map String Known
+  , takes : List (Pair String String)
+  }
+
+-- (the code of a definition (`s`) or of a lambda of `n` parameters)
+withFrame : Maybe Self -> Int -> CE -> CE
+withFrame s n ce =
+  { funs = ce.funs
+  , bounce = ce.bounce
+  , self = s
+  , lam = n
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  , known = ce.known
+  , takes = Nil
+  }
+
+withPath : List String -> List String -> CE -> CE
+withPath owned after ce =
+  { funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , lam = ce.lam
+  , owned = owned
+  , after = after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  , known = ce.known
+  , takes = ce.takes
+  }
+
+-- (the variables lent to this code: it holds no reference to them)
+withBorrowed : List String -> CE -> CE
+withBorrowed bs ce =
+  { funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , lam = ce.lam
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = bs
+  , bor = ce.bor
+  , known = ce.known
+  , takes = ce.takes
+  }
+
+withKnown : String -> Known -> CE -> CE
+withKnown x k ce =
+  { funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , lam = ce.lam
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  , known = M.insert compareString x k ce.known
+  , takes = ce.takes
+  }
+
+withTakes : List (Pair String String) -> CE -> CE
+withTakes ts ce =
+  { funs = ce.funs
+  , bounce = ce.bounce
+  , self = ce.self
+  , lam = ce.lam
+  , owned = ce.owned
+  , after = ce.after
+  , borrowed = ce.borrowed
+  , bor = ce.bor
+  , known = ce.known
+  , takes = ts
+  }
+
+-- | what is known of the program, where a definition starts
+ceOfFacts : F.Facts -> CE
+ceOfFacts facts =
+  { funs = facts.arity
+  , bounce = facts.bounce
+  , self = Nothing
+  , lam = 0
+  , owned = Nil
+  , after = Nil
+  , borrowed = Nil
+  , bor = facts.lent
+  , known = M.empty
+  , takes = Nil
+  }
+
+-- Free variables
+--------------------------------------------------------------------------------
+
+-- | a part of the imperative form (heff.compile.imp), in a walk
+data Item
+  = IVal Mp.Val
+  | IOp Mp.Comp
+  | ICond Mp.Cond
+  | ISts (List Mp.St)
+  | ITl Mp.Tl
+
+pushVals : List Mp.Val -> List Item -> List Item
+pushVals vs rest = List.foldr (\v r -> Cons (IVal v) r) rest vs
+
+armVarsOf : {a : Type} -> List (Mp.Arm a) -> List String
+armVarsOf arms =
+  List.concatMap
+    (\arm -> case arm of
+     MkArm _ vs _ -> vs)
+    arms
+
+pushStArms : List (Mp.Arm (List Mp.St)) -> List Item -> List Item
+pushStArms arms rest =
+  List.foldr
+    (\arm r -> case arm of
+     MkArm _ _ ss -> Cons (ISts ss) r)
+    rest
+    arms
+
+pushTlArms : List (Mp.Arm Mp.Tl) -> List Item -> List Item
+pushTlArms arms rest =
+  List.foldr
+    (\arm r -> case arm of
+     MkArm _ _ t -> Cons (ITl t) r)
+    rest
+    arms
+
+-- (the variables a worklist binds, `bs`, and mentions, `ms`, last first:
+-- names being unique, what it mentions and does not bind is free --
+-- both gathered in one walk; a variable set, `x = ...`, is not one
+-- mentioned)
+fvW : List String
+    -> List String
+    -> List Item
+    -> Pair (List String) (List String)
+fvW bs ms Nil = MkPair bs ms
+fvW bs ms (Cons (IVal (SVar x)) rest) = fvW bs (Cons x ms) rest
+fvW bs ms (Cons (IVal (SLam xs (MkBlock t))) rest) =
+  fvW (List.append xs bs) ms (Cons (ITl t) rest)
+fvW bs ms (Cons (IVal (STag _ as)) rest) = fvW bs ms (pushVals as rest)
+fvW bs ms (Cons (IVal (SRec fs)) rest) =
+  fvW bs ms (pushVals (List.map snd fs) rest)
+fvW bs ms (Cons (IVal (SProj v _ _)) rest) = fvW bs ms (Cons (IVal v) rest)
+fvW bs ms (Cons (IVal (SPrim _ as)) rest) = fvW bs ms (pushVals as rest)
+fvW bs ms (Cons (IVal _) rest) = fvW bs ms rest
+fvW bs ms (Cons (IOp (OSimple v)) rest) = fvW bs ms (Cons (IVal v) rest)
+fvW bs ms (Cons (IOp (OCall _ as)) rest) = fvW bs ms (pushVals as rest)
+fvW bs ms (Cons (IOp (OApply f as)) rest) =
+  fvW bs ms (pushVals (Cons f as) rest)
+fvW bs ms (Cons (IOp (OPrim _ as)) rest) = fvW bs ms (pushVals as rest)
+fvW bs ms (Cons (IOp (OBool c)) rest) = fvW bs ms (Cons (ICond c) rest)
+fvW bs ms (Cons (IOp _) rest) = fvW bs ms rest
+fvW bs ms (Cons (ICond (PRel _ a b)) rest) =
+  fvW bs ms (Cons (IVal a) (Cons (IVal b) rest))
+fvW bs ms (Cons (ICond (PBool v)) rest) = fvW bs ms (Cons (IVal v) rest)
+fvW bs ms (Cons (ICond (PNot c)) rest) = fvW bs ms (Cons (ICond c) rest)
+fvW bs ms (Cons (ICond (PIf a b c)) rest) =
+  fvW bs ms (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
+fvW bs ms (Cons (ICond (PLet x o c)) rest) =
+  fvW (Cons x bs) ms (Cons (IOp o) (Cons (ICond c) rest))
+fvW bs ms (Cons (ICond _) rest) = fvW bs ms rest
+fvW bs ms (Cons (ISts Nil) rest) = fvW bs ms rest
+fvW bs ms (Cons (ISts (Cons (SLet x o) ss)) rest) =
+  fvW (Cons x bs) ms (Cons (IOp o) (Cons (ISts ss) rest))
+fvW bs ms (Cons (ISts (Cons (SDecl x) ss)) rest) =
+  fvW (Cons x bs) ms (Cons (ISts ss) rest)
+fvW bs ms (Cons (ISts (Cons (SSet x o) ss)) rest) =
+  fvW bs ms (Cons (IOp o) (Cons (ISts ss) rest))
+fvW bs ms (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
+  fvW
+    bs
+    ms
+    (Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest))))
+fvW bs ms (Cons (ISts (Cons (SCase v arms) ss)) rest) =
+  fvW
+    (List.append (armVarsOf arms) bs)
+    ms
+    (Cons (IVal v) (pushStArms arms (Cons (ISts ss) rest)))
+fvW bs ms (Cons (ITl (TSeq ss t)) rest) =
+  fvW bs ms (Cons (ISts ss) (Cons (ITl t) rest))
+fvW bs ms (Cons (ITl (TReturn o)) rest) = fvW bs ms (Cons (IOp o) rest)
+fvW bs ms (Cons (ITl (TLoop vs)) rest) = fvW bs ms (pushVals vs rest)
+fvW bs ms (Cons (ITl (TIf c t e)) rest) =
+  fvW bs ms (Cons (ICond c) (Cons (ITl t) (Cons (ITl e) rest)))
+fvW bs ms (Cons (ITl (TCase v arms)) rest) =
+  fvW
+    (List.append (armVarsOf arms) bs)
+    ms
+    (Cons (IVal v) (pushTlArms arms rest))
+
+-- (those mentioned not bound: `bs` reckoned once, not for each)
+setOf : List String -> M.Map String Unit
+setOf xs =
+  List.foldl (\m x -> M.insert compareString x (MkUnit : Unit) m) M.empty xs
+
+-- (those of `ms` not in `bs` nor before, in order)
+freeGo : M.Map String Unit
+       -> M.Map String Unit
+       -> List String
+       -> List String
+       -> List String
+freeGo bs seen Nil acc = List.reverse acc
+freeGo bs seen (Cons v vs) acc =
+  if M.member compareString v bs || M.member compareString v seen
+    then freeGo bs seen vs acc
+  else freeGo bs (M.insert compareString v (MkUnit : Unit) seen) vs (Cons v acc)
+
+freeAmong : List String -> List String -> List String
+freeAmong bs ms = freeGo (setOf bs) M.empty ms Nil
+
+freeFrom : List String -> Pair (List String) (List String) -> List String
+freeFrom xs (MkPair bs ms) = freeAmong (List.append xs bs) (List.reverse ms)
+
+-- | the variables the items mention and do not bind (nor `xs`), in the
+-- | order first mentioned
+freeIn : List String -> List Item -> List String
+freeIn xs items = freeFrom xs (fvW Nil Nil items)
+
+-- | ... a lambda's body, its parameters `xs`
+freeOf : List String -> Mp.Tl -> List String
+freeOf xs t = freeIn xs (Cons (ITl t) Nil)
+
+-- (a variable read a field of at a known shape: a record of its size)
+shapedVar : Mp.Val
+          -> List String
+          -> List (Pair String Known)
+          -> List (Pair String Known)
+shapedVar (SVar x) sh acc =
+  if List.null sh then acc else Cons (MkPair x (KnownRec (List.length sh))) acc
+shapedVar v sh acc = acc
+
+-- | a definition's code, knowing the records it reads fields of at their
+-- | shapes -- in its lambdas too, its variables named once in it all
+knowingShapes : Mp.Tl -> CE -> CE
+knowingShapes t ce =
+  List.foldl
+    (\c p -> withKnown (fst p) (snd p) c)
+    ce
+    (List.foldl
+       (\acc p -> case p of
+        PartVal (SProj v _ sh) -> shapedVar v sh acc
+        _ -> acc)
+       Nil
+       (Mp.tailParts t))
+
+-- Reference counts
+--------------------------------------------------------------------------------
+
+unionS : List String -> List String -> List String
+unionS xs ys = List.append xs ys
+
+-- | the variables it mentions and does not bind
+fvVal : Mp.Val -> List String
+fvVal v = freeIn Nil (Cons (IVal v) Nil)
+
+fvList : List Mp.Val -> List String
+fvList vs = List.concatMap fvVal vs
+
+fvOp : Mp.Comp -> List String
+fvOp o = freeIn Nil (Cons (IOp o) Nil)
+
+fvTl : Mp.Tl -> List String
+fvTl t = freeIn Nil (Cons (ITl t) Nil)
+
+fvSts : List Mp.St -> List String
+fvSts ss = freeIn Nil (Cons (ISts ss) Nil)
+
+-- (of statements and what follows them)
+fvRest : List Mp.St -> Maybe Mp.Tl -> List String
+fvRest ss (Just t) = freeIn Nil (Cons (ISts ss) (Cons (ITl t) Nil))
+fvRest ss Nothing = fvSts ss
+
+-- (a use of `x`: its reference, or one more if it is wanted after or
+-- lent)
+varUse : List String -> List String -> String -> Value
+varUse lent live x = if elemS x live || elemS x lent then RDup x else RLocal x
+
+-- (whether a drop gives anything back: a tag of no fields is a word, a
+-- closure holding nothing static)
+givesBack : Maybe Known -> Bool
+givesBack (Just (KnownTag n)) = n > 0
+givesBack (Just (KnownClo n)) = n > 0
+givesBack _ = True
+
+dropOf : String -> Maybe Known -> List Drop
+dropOf x k = if givesBack k then Cons (MkDrop x k) Nil else Nil
+
+-- | the drops of `xs`, each specialised where what it is is known
+dropsOf : CE -> List String -> List Drop
+dropsOf ce xs =
+  List.concatMap (\x -> dropOf x (M.lookup compareString x ce.known)) xs
+
+dropsIn : CE -> List String -> List Statement
+dropsIn ce xs = List.map (\d -> (CDrop d : Statement)) (dropsOf ce xs)
+
+-- (the drops of `xs`, as nothing is known of them)
+plainDrops : List String -> List Statement
+plainDrops xs = List.map (\x -> (CDrop (MkDrop x Nothing) : Statement)) xs
+
+-- | what is held and not wanted: given back where a path starts
+deadIn : List String -> List String -> List String
+deadIn owned wanted = List.filter (\v -> not (elemS v wanted)) owned
+
+-- | what is held and wanted, of what is held
+deadKept : List String -> List String -> List String
+deadKept owned wanted = List.filter (\v -> elemS v wanted) owned
+
+-- Values
+--------------------------------------------------------------------------------
+
+-- | the judgments, knotted: a value (an operand, consumed, `live` what
+-- | is wanted after it), a step not last (the same), statements
+-- | (`CE.owned` and `CE.after` saying what is held and wanted after; then
+-- | what is last, if they are followed by it), what is last
+type RcK =
+  { val : CE -> List String -> Mp.Val -> Value
+  , comp : CE -> List String -> Mp.Comp -> Value
+  , stmts : CE -> List Mp.St -> Maybe Mp.Tl -> List Statement
+  , tail : CE -> Mp.Tl -> List Statement
+  }
+
+varOfV : Mp.Val -> Maybe String
+varOfV (SVar x) = Just x
+varOfV _ = Nothing
+
+globalOfV : Mp.Val -> Maybe String
+globalOfV (SGlobal g) = Just g
+globalOfV _ = Nothing
+
+-- | operands, left to right: each consumed, wanted after it what the
+-- | ones after it want, and `live`
+operandsF : RcK -> CE -> List String -> List Mp.Val -> List Value
+operandsF r ce live Nil = Nil
+operandsF r ce live (Cons e es) =
+  Cons (r.val ce (unionS (fvList es) live) e) (operandsF r ce live es)
+
+elemI : Int -> List Int -> Bool
+elemI i Nil = False
+elemI i (Cons j js) = i == j || elemI i js
+
+-- (a call's operand at a borrowed parameter, a variable: lent, not
+-- given -- held and wanted after by none, dropped after the call)
+lentVar : CE -> List String -> String -> Operand
+lentVar ce live x =
+  if elemS x live || elemS x ce.borrowed then Given (RLocal x)
+  else LentVar x (dropsOf ce (Cons x Nil))
+
+-- (a label's place among a shape's labels)
+indexIn : String -> Int -> List String -> Maybe Int
+indexIn l i Nil = Nothing
+indexIn l i (Cons k ks) = if strEq l k then Just i else indexIn l (i + 1) ks
+
+fieldLent : CE -> List String -> String -> Maybe Int -> Maybe Value
+fieldLent ce after x (Just i) =
+  if elemS x after || elemS x ce.borrowed then Just (RField (RLocal x) i)
+  else Nothing
+fieldLent ce after x Nothing = Nothing
+
+fieldLentOf : CE -> List String -> Maybe String -> Maybe Int -> Maybe Value
+fieldLentOf ce after (Just x) i = fieldLent ce after x i
+fieldLentOf ce after Nothing i = Nothing
+
+-- (at a borrowed parameter, a field of a record that outlives the call
+-- -- wanted after it (`after`), or lent to this code -- lent on where it
+-- is: not counted, up or down)
+lentField : CE -> List String -> Mp.Val -> Maybe Value
+lentField ce after (SProj e l sh) =
+  fieldLentOf ce after (varOfV e) (indexIn l 0 sh)
+lentField ce after _ = Nothing
+
+lentVarOr : RcK
+          -> CE
+          -> List String
+          -> List Int
+          -> Int
+          -> Mp.Val
+          -> Maybe String
+          -> Operand
+lentVarOr r ce live bi i e (Just x) =
+  if elemI i bi then lentVar ce live x else Given (r.val ce live e)
+lentVarOr r ce live bi i e Nothing =
+  if elemI i bi then LentValue (r.val ce live e) else Given (r.val ce live e)
+
+lentOr : RcK
+       -> CE
+       -> List String
+       -> List Int
+       -> Int
+       -> Mp.Val
+       -> Maybe Value
+       -> Operand
+lentOr r ce live bi i e (Just a) = Given a
+lentOr r ce live bi i e Nothing = lentVarOr r ce live bi i e (varOfV e)
+
+lentOne : RcK
+        -> CE
+        -> List String
+        -> List String
+        -> List Int
+        -> Int
+        -> Mp.Val
+        -> Operand
+lentOne r ce after live bi i e =
+  lentOr r ce live bi i e (if elemI i bi then lentField ce after e else Nothing)
+
+lentOperands : RcK
+             -> CE
+             -> List String
+             -> List Int
+             -> Int
+             -> List Mp.Val
+             -> List Operand
+lentOperands r ce live bi i Nil = Nil
+lentOperands r ce live bi i (Cons e es) =
+  Cons
+    (lentOne r ce live (unionS (fvList es) live) bi i e)
+    (lentOperands r ce live bi (i + 1) es)
+
+-- | whether each operand is given, none lent
+plainArg : Operand -> Bool
+plainArg (Given _) = True
+plainArg (LentVar _ Nil) = True
+plainArg _ = False
+
+lentPlain : List Operand -> Bool
+lentPlain ls = List.all plainArg ls
+
+-- | an operand's value, as the call is given it
+argExp : Operand -> Value
+argExp (Given e) = e
+argExp (LentVar x _) = RLocal x
+argExp (LentValue e) = e
+
+lamBody : RcK -> CE -> List String -> Mp.Tl -> List String -> List Statement
+lamBody r ce xs t fv =
+  r.tail
+    (withPath
+       (deadKept (List.append xs fv) (fvTl t))
+       Nil
+       (withBorrowed Nil (withFrame Nothing (List.length xs) ce)))
+    t
+
+lamWith : RcK
+        -> CE
+        -> List String
+        -> List String
+        -> Mp.Tl
+        -> List String
+        -> Value
+lamWith r ce live xs t fv =
+  RLam
+    xs
+    fv
+    (List.map (varUse ce.borrowed live) fv)
+    (MkCode
+       (List.append (plainDrops (deadIn xs (fvTl t))) (lamBody r ce xs t fv)))
+
+-- | a lambda's closure: what it mentions held, each a use of it here
+lamVal : RcK -> CE -> List String -> List String -> Mp.Tl -> Value
+lamVal r ce live xs t = lamWith r ce live xs t (freeOf xs t)
+
+-- (the primitive a tag built in a kept cell is, while it is made: see
+-- `reusing`)
+reusePrim : String
+reusePrim = "$reuse"
+
+-- (a tag built in the cell, the first operand)
+tagIn : String -> List Value -> Value
+tagIn t (Cons rv vs) = RTagIn rv t vs
+tagIn t Nil = RAbandon
+
+reuseVal : RcK -> CE -> List String -> List Mp.Val -> Value
+reuseVal r ce live (Cons ru (Cons (STag t as) Nil)) =
+  tagIn t (operandsF r ce live (Cons ru as))
+reuseVal r ce live _ = RInt 0
+
+-- (field `i` of a record of `n` fields, read where it is: of a variable
+-- wanted after or lent, or of a definition's value, the field counted and
+-- the record not touched; otherwise the record consumed, the field taken
+-- over where it was the last reference)
+fieldIn : RcK
+        -> CE
+        -> List String
+        -> Mp.Val
+        -> Int
+        -> Int
+        -> Maybe String
+        -> Maybe String
+        -> Value
+fieldIn r ce live e i n (Just x) g =
+  if elemS x live || elemS x ce.borrowed then RDupE (RField (RLocal x) i)
+  else RGetN (RLocal x) i n
+fieldIn r ce live e i n Nothing (Just g) = RDupE (RField (RGetRaw g) i)
+fieldIn r ce live e i n Nothing Nothing = RGetN (r.val ce live e) i n
+
+fieldAt : RcK -> CE -> List String -> Mp.Val -> Int -> Int -> Value
+fieldAt r ce live e i n = fieldIn r ce live e i n (varOfV e) (globalOfV e)
+
+-- (the field taken out of its record, if this operand takes it and the
+-- record is wanted after it: see `takesFor`)
+takeVarIn : List (Pair String String)
+          -> List String
+          -> Maybe String
+          -> String
+          -> Int
+          -> Maybe Value
+takeVarIn ts live (Just x) l i =
+  if elemS x live && List.any (\p -> strEq (fst p) x && strEq (snd p) l) ts
+    then Just (RTakeField x i)
+  else Nothing
+takeVarIn ts live Nothing l i = Nothing
+
+takeIn : List (Pair String String)
+       -> List String
+       -> Mp.Val
+       -> String
+       -> Int
+       -> Maybe Value
+takeIn ts live e l i = takeVarIn ts live (varOfV e) l i
+
+fieldOr : RcK
+        -> CE
+        -> List String
+        -> Mp.Val
+        -> Int
+        -> Int
+        -> Maybe Value
+        -> Value
+fieldOr r ce live e i n (Just t) = t
+fieldOr r ce live e i n Nothing = fieldAt r ce live e i n
+
+-- | a field: at its place, where the record's shape is known; else
+-- | looked for by its label
+projAt : RcK
+       -> CE
+       -> List String
+       -> Mp.Val
+       -> String
+       -> Int
+       -> Maybe Int
+       -> Value
+projAt r ce live e l n (Just i) =
+  fieldOr r ce live e i n (takeIn ce.takes live e l i)
+projAt r ce live e l n Nothing = RGetLabel (r.val ce live e) l
+
+-- Records updated: a record built of the same shape as one it reads
+-- fields of at their own places, `{ a = x, b = r.b, c = r.c }`, the one
+-- read (`r`) held and given up there, is built in `r`'s cell where that
+-- is `r`'s last reference: the fields kept where they are, the others
+-- computed first -- `r` wanted by them still -- and stored in it.
+
+sameS : List String -> List String -> Bool
+sameS Nil Nil = True
+sameS (Cons x xs) (Cons y ys) = strEq x y && sameS xs ys
+sameS _ _ = False
+
+-- (a field read from a record's at its own place, that record's shape
+-- `ls`, the one being built: the record read)
+keptFrom : List String -> Pair String Mp.Val -> Maybe String
+keptFrom ls (MkPair l (SProj e l2 sh)) =
+  if strEq l l2 && sameS ls sh then varOfV e else Nothing
+keptFrom ls _ = Nothing
+
+isJustOf : String -> Maybe String -> Bool
+isJustOf x (Just y) = strEq x y
+isJustOf x Nothing = False
+
+isKeptFrom : List String -> String -> Pair String Mp.Val -> Bool
+isKeptFrom ls x f = isJustOf x (keptFrom ls f)
+
+justsOf : List (Maybe String) -> List String
+justsOf Nil = Nil
+justsOf (Cons (Just x) rest) = Cons x (justsOf rest)
+justsOf (Cons Nothing rest) = justsOf rest
+
+-- (the first record a field is kept from that this code holds and gives
+-- up here: wanted by nothing after, nor lent)
+updatedIn : CE
+          -> List String
+          -> List String
+          -> List (Pair String Mp.Val)
+          -> Maybe String
+updatedIn ce live ls fs =
+  if List.length fs > 62 then Nothing
+  else List.head
+      (List.filter
+         (\x ->
+            elemS x ce.owned && not (elemS x live) && not (elemS x ce.borrowed))
+         (justsOf (List.map (keptFrom ls) fs)))
+
+-- (a bit for each field kept, the first the lowest)
+keepBits : List Bool -> Int
+keepBits Nil = 0
+keepBits (Cons b bs) = (if b then 1 else 0) + 2 * keepBits bs
+
+-- (the fields not kept from `x`, each with its place)
+changedOf : List String
+          -> String
+          -> List (Pair String Mp.Val)
+          -> List (Pair Int Mp.Val)
+changedOf ls x fs =
+  List.map
+    (\p -> MkPair (snd p) (snd (fst p)))
+    (List.filter
+       (\p -> not (isKeptFrom ls x (fst p)))
+       (List.zipWith
+          (\f i -> MkPair f i)
+          fs
+          (List.range 0 (List.length fs - 1))))
+
+-- | a record built from `x`'s
+updateVal : RcK
+          -> CE
+          -> List String
+          -> List (Pair String Mp.Val)
+          -> String
+          -> Value
+updateVal r ce live fs x =
+  RRecIn
+    x
+    (keepBits (List.map (isKeptFrom (List.map fst fs) x) fs))
+    (List.length fs)
+    (List.map fst fs)
+    (List.zipWith
+       (\p v -> MkPair (fst p) v)
+       (changedOf (List.map fst fs) x fs)
+       (operandsF
+          r
+          ce
+          (Cons x live)
+          (List.map snd (changedOf (List.map fst fs) x fs))))
+
+-- | a record built: in the cell of the one it is updated from, if any
+recordVal : RcK
+          -> CE
+          -> List String
+          -> List (Pair String Mp.Val)
+          -> Maybe String
+          -> Value
+recordVal r ce live fs (Just x) = updateVal r ce live fs x
+recordVal r ce live fs Nothing =
+  RRec (List.map fst fs) (operandsF r ce live (List.map snd fs))
+
+valF : RcK -> CE -> List String -> Mp.Val -> Value
+valF r ce live (SVar x) = varUse ce.borrowed live x
+valF r ce live (SGlobal g) =
+  if M.member compareString g ce.funs then RClo g else RGet g
+valF r ce live (SInt n) = RInt n
+valF r ce live (SFloat x) = RFloat x
+valF r ce live (SStr s) = RStr s
+valF r ce live (SFixed w n) = RFixed w n
+valF r ce live (SFloat32 x) = RF32 x
+valF r ce live (STag t as) =
+  if List.null as then RNTag t else RTag t (operandsF r ce live as)
+valF r ce live (SRec fs) =
+  recordVal r ce live fs (updatedIn ce live (List.map fst fs) fs)
+valF r ce live (SProj e l sh) =
+  projAt r ce live e l (List.length sh) (indexIn l 0 sh)
+valF r ce live (SPrimFn p) = RPrimFn p
+valF r ce live (SPrim p as) =
+  if strEq p reusePrim then reuseVal r ce live as
+  else RPrim p (operandsF r ce live as)
+valF r ce live (SLam xs (MkBlock t)) = lamVal r ce live xs t
+
+-- | a step not last: its value, through any bounces
+compF : RcK -> CE -> List String -> Mp.Comp -> Value
+compF r ce live (OApply f as) = case operandsF r ce live (Cons f as) of
+  Cons fv vs -> RApply fv vs
+  Nil -> RAbandon
+compF r ce live (OCall g as) =
+  RCall
+    g
+    (M.member compareString g ce.bounce)
+    (lentOperands r ce live (Bo.borOf ce.bor g) 0 as)
+compF r ce live (OPrim p as) = RPrim p (operandsF r ce live as)
+compF r ce live (OSimple v) = r.val ce live v
+compF r ce live OAbandon = RAbandon
+-- (a condition's `Bool`: the C backend is given none, heff.compile.imp's
+-- `genOf False`)
+compF r ce live (OBool _) = RAbandon
+
+-- Statements and what is last
+--------------------------------------------------------------------------------
+
+-- | an arm's body: what is last, or statements (that set a name; the
+-- | arm then leaves the `switch`)
+data ArmBody = ATail Mp.Tl | ASts (List Mp.St)
+
+fvArm : ArmBody -> List String
+fvArm (ATail t) = fvTl t
+fvArm (ASts ss) = fvSts ss
+
+armLeaves : ArmBody -> Bool
+armLeaves (ATail _) = False
+armLeaves (ASts _) = True
+
+armBodyF : RcK -> CE -> ArmBody -> List Statement
+armBodyF r ce (ATail t) = r.tail ce t
+armBodyF r ce (ASts ss) = r.stmts ce ss Nothing
+
+isSelfCall : CE -> String -> List Mp.Val -> Bool
+isSelfCall { self = Just s } g as =
+  strEq s.key g && List.length s.params == List.length as
+isSelfCall { self = Nothing } g as = False
+
+-- (the loop again: its parameters given the arguments)
+again : CE -> List Value -> List Statement
+again { self = Just s } vs = Cons (CLoop s.params vs) Nil
+again { self = Nothing } vs = Nil
+
+arityIs : Int -> Maybe Int -> Bool
+arityIs n (Just m) = n == m
+arityIs n Nothing = False
+
+agreesWith : Maybe Self -> Maybe Int -> Int -> Bool
+agreesWith (Just s) m n = List.length s.params == n && arityIs n m
+agreesWith Nothing m n = False
+
+-- (a call last of `g`, from a definition taking as many parameters as
+-- `g` does: their C functions' types the same, the call a jump)
+agrees : CE -> String -> List Mp.Val -> Bool
+agrees ce g as =
+  agreesWith ce.self (M.lookup compareString g ce.funs) (List.length as)
+
+-- | how many arguments a lambda's call last may put in `heff_room`
+-- | (lib/c/runtime.c's `HEFF_ROOM`)
+roomFor : Int
+roomFor = 4
+
+-- (a call last of an unknown function, from a lambda: taking at least as
+-- many arguments, they are put where the lambda's were (`CInPlace`);
+-- fewer, of no more than fit in `heff_room`, put there (`CRoomed`).
+-- Anything else, as any call last of an unknown function: `CTail`)
+applyLast : CE -> Int -> List Value -> List Statement
+applyLast ce n (Cons f vs) =
+  Cons
+    (if 0 < n && n <= ce.lam then CInPlace f vs
+     else if 0 < ce.lam && n <= roomFor then CRoomed f vs
+     else CTail f vs)
+    Nil
+applyLast ce n Nil = Cons (CReturn RAbandon) Nil
+
+-- (the scrutinee, a variable held, given up on an arm that does not want
+-- it and has fields: `fb` what the arm wants)
+takenFv : CE -> Maybe String -> List String -> List String -> Maybe String
+takenFv ce Nothing vs fb = Nothing
+takenFv ce (Just x) vs fb =
+  if not (List.null vs)
+  && List.length vs <= 60
+  && not (elemS x fb)
+  && not (elemS x ce.after)
+    then Just x
+  else Nothing
+
+maybeList : Maybe String -> List String
+maybeList Nothing = Nil
+maybeList (Just x) = Cons x Nil
+
+isJustS : Maybe String -> Bool
+isJustS (Just _) = True
+isJustS Nothing = False
+
+-- (the fields an arm holds a reference to: those it wants, unless lent)
+fieldsHeld : Bool -> List String -> List String -> List String
+fieldsHeld True vs fb = Nil
+fieldsHeld False vs fb = List.filter (\v -> elemS v fb) vs
+
+-- (the fields an arm wants, each with its place)
+fieldsWanted : List String -> List String -> List (Pair String Int)
+fieldsWanted vs fb =
+  List.filter
+    (\p -> elemS (fst p) fb)
+    (List.zipWith (\v i -> MkPair v i) vs (List.range 0 (List.length vs - 1)))
+
+pow2 : Int -> Int
+pow2 0 = 1
+pow2 n = 2 * pow2 (n - 1)
+
+fieldMask : List String -> Int -> List String -> Int
+fieldMask used i Nil = 0
+fieldMask used i (Cons v vs) =
+  (if elemS v used then pow2 i else 0) + fieldMask used (i + 1) vs
+
+-- (what an arm does with the scrutinee it gives up (`taken`): its cell
+-- kept (`ru`), or given up at once; the fields it wants kept)
+takeOf : Maybe String -> Maybe String -> List String -> List String -> Take
+takeOf (Just ru) taken vs used =
+  TakeKeep ru (fieldMask used 0 vs) (List.length vs)
+takeOf Nothing (Just _) vs used = TakeN (fieldMask used 0 vs) (List.length vs)
+takeOf Nothing Nothing vs used = TakeNone
+
+-- Cells kept
+--------------------------------------------------------------------------------
+
+-- An arm whose scrutinee is given up keeps its cell where the arm builds
+-- a tag of its size: the first such tag built on each path (in a binding
+-- before what follows it, an operand of a call or of a tag before the
+-- operands after it, each arm of a match), not in a lambda, is built in
+-- the cell (`$reuse`, `reuseVal`).
+
+argDone : List Mp.Val -> Pair Bool Mp.Val -> Pair Bool (List Mp.Val)
+argDone done (MkPair b e) = MkPair b (List.append done (Cons e Nil))
+
+-- (operands, the first that builds a tag of `n` fields in the kept cell)
+reuseArgs : (Mp.Val -> Pair Bool Mp.Val)
+          -> List Mp.Val
+          -> Pair Bool (List Mp.Val)
+reuseArgs go vs =
+  List.foldl
+    (\acc v ->
+       if fst acc then MkPair True (List.append (snd acc) (Cons v Nil))
+       else argDone (snd acc) (go v))
+    (MkPair False Nil)
+    vs
+
+withTag : String -> Pair Bool (List Mp.Val) -> Pair Bool Mp.Val
+withTag t (MkPair b as) = MkPair b (STag t as)
+
+-- (a tag of `n` fields, built in the cell; or one of its operands)
+reuseV : String -> Int -> Mp.Val -> Pair Bool Mp.Val
+reuseV ru n (STag t as) =
+  if List.length as == n
+    then MkPair True (SPrim reusePrim (Cons (SVar ru) (Cons (STag t as) Nil)))
+  else withTag t (reuseArgs (\v -> reuseV ru n v) as)
+reuseV ru n v = MkPair False v
+
+reuseVals : String -> Int -> List Mp.Val -> Pair Bool (List Mp.Val)
+reuseVals ru n vs = reuseArgs (\v -> reuseV ru n v) vs
+
+reuseOp : String -> Int -> Mp.Comp -> Pair Bool Mp.Comp
+reuseOp ru n (OSimple v) = case reuseV ru n v of
+  MkPair b v2 -> MkPair b (OSimple v2)
+reuseOp ru n (OCall g as) = case reuseVals ru n as of
+  MkPair b as2 -> MkPair b (OCall g as2)
+reuseOp ru n o = MkPair False o
+
+-- | the walk, knotted: statements (each path's first, then what follows
+-- | where none was), what is last
+type ReuseK =
+  { sts : String -> Int -> List Mp.St -> Pair Bool (List Mp.St)
+  , tl : String -> Int -> Mp.Tl -> Pair Bool Mp.Tl
+  }
+
+consSt : Mp.St -> Pair Bool (List Mp.St) -> Pair Bool (List Mp.St)
+consSt st (MkPair b ss) = MkPair b (Cons st ss)
+
+-- (each arm, apart)
+stArms : ReuseK
+       -> String
+       -> Int
+       -> List (Mp.Arm (List Mp.St))
+       -> Pair Bool (List (Mp.Arm (List Mp.St)))
+stArms r ru n arms =
+  MkPair
+    (List.any
+       (\arm -> case arm of
+        MkArm _ _ ss -> fst (r.sts ru n ss))
+       arms)
+    (List.map
+       (\arm -> case arm of
+        MkArm t vs ss -> MkArm t vs (snd (r.sts ru n ss)))
+       arms)
+
+tlArms : ReuseK
+       -> String
+       -> Int
+       -> List (Mp.Arm Mp.Tl)
+       -> Pair Bool (List (Mp.Arm Mp.Tl))
+tlArms r ru n arms =
+  MkPair
+    (List.any
+       (\arm -> case arm of
+        MkArm _ _ t -> fst (r.tl ru n t))
+       arms)
+    (List.map
+       (\arm -> case arm of
+        MkArm t vs b -> MkArm t vs (snd (r.tl ru n b)))
+       arms)
+
+-- (a statement that builds one, and what follows it unsearched; else the
+-- statement and what follows searched)
+stThen : ReuseK
+       -> String
+       -> Int
+       -> List Mp.St
+       -> Pair Bool Mp.St
+       -> Pair Bool (List Mp.St)
+stThen r ru n rest (MkPair True st) = MkPair True (Cons st rest)
+stThen r ru n rest (MkPair False st) = consSt st (r.sts ru n rest)
+
+reuseSts : ReuseK -> String -> Int -> List Mp.St -> Pair Bool (List Mp.St)
+reuseSts r ru n Nil = MkPair False Nil
+reuseSts r ru n (Cons (SLet x o) rest) =
+  stThen r ru n rest (case reuseOp ru n o of
+  MkPair b o2 -> MkPair b (SLet x o2))
+reuseSts r ru n (Cons (SSet x o) rest) =
+  stThen r ru n rest (case reuseOp ru n o of
+  MkPair b o2 -> MkPair b (SSet x o2))
+reuseSts r ru n (Cons (SCase v arms) rest) =
+  stThen r ru n rest (case stArms r ru n arms of
+  MkPair b as2 -> MkPair b (SCase v as2))
+reuseSts r ru n (Cons (SIf c ts fs) rest) =
+  stThen r ru n rest (case r.sts ru n ts of
+  MkPair bt ts2 -> case r.sts ru n fs of
+    MkPair bf fs2 -> MkPair (bt || bf) (SIf c ts2 fs2))
+reuseSts r ru n (Cons st rest) = consSt st (r.sts ru n rest)
+
+reuseTl : ReuseK -> String -> Int -> Mp.Tl -> Pair Bool Mp.Tl
+reuseTl r ru n (TSeq ss t) = case r.sts ru n ss of
+  MkPair True ss2 -> MkPair True (TSeq ss2 t)
+  MkPair False _ -> case r.tl ru n t of
+    MkPair b t2 -> MkPair b (TSeq ss t2)
+reuseTl r ru n (TReturn o) = case reuseOp ru n o of
+  MkPair b o2 -> MkPair b (TReturn o2)
+reuseTl r ru n (TLoop vs) = case reuseVals ru n vs of
+  MkPair b vs2 -> MkPair b (TLoop vs2)
+reuseTl r ru n (TIf c t e) = case r.tl ru n t of
+  MkPair bt t2 -> case r.tl ru n e of
+    MkPair be e2 -> MkPair (bt || be) (TIf c t2 e2)
+reuseTl r ru n (TCase v arms) = case tlArms r ru n arms of
+  MkPair b as2 -> MkPair b (TCase v as2)
+
+reuseK : ReuseK
+reuseK =
+  { sts = \ru n ss -> reuseSts reuseK ru n ss
+  , tl = \ru n t -> reuseTl reuseK ru n t
+  }
+
+reuseArm : String -> Int -> ArmBody -> Pair Bool ArmBody
+reuseArm ru n (ATail t) = case reuseK.tl ru n t of
+  MkPair b t2 -> MkPair b (ATail t2)
+reuseArm ru n (ASts ss) = case reuseK.sts ru n ss of
+  MkPair b ss2 -> MkPair b (ASts ss2)
+
+-- (an arm whose scrutinee is given up: its cell kept, `ru`, where the
+-- arm builds a tag of its size -- the body, so built)
+reusing : Maybe String
+        -> String
+        -> List String
+        -> ArmBody
+        -> Pair (Maybe String) ArmBody
+reusing Nothing t vs b = MkPair Nothing b
+reusing (Just x) t vs b = case reuseArm
+    ("ru$" ^ x ^ "$" ^ t)
+    (List.length vs)
+    b of
+  MkPair True b2 -> MkPair (Just ("ru$" ^ x ^ "$" ^ t)) b2
+  MkPair False _ -> MkPair Nothing b
+
+-- Matches
+--------------------------------------------------------------------------------
+
+-- (in an arm, the scrutinee held: known to be a tag of the arm's size)
+knowing : Maybe String -> Int -> CE -> CE
+knowing Nothing n ce = ce
+knowing (Just x) n ce = withKnown x (KnownTag n) ce
+
+-- (in an arm, the cell kept: known to be one for a tag of its size)
+knowCell : Maybe String -> Int -> CE -> CE
+knowCell Nothing n ce = ce
+knowCell (Just ru) n ce = withKnown ru (KnownCell n) ce
+
+-- (an arm: the fields it wants, a reference to each; what is held and
+-- not wanted on it, dropped.  The scrutinee held and not wanted on it is
+-- given up at once: its last reference, its shell freed and the fields
+-- not wanted dropped -- no field counted up and then down)
+armKept : RcK
+        -> CE
+        -> Maybe String
+        -> Bool
+        -> String
+        -> List String
+        -> List String
+        -> Bool
+        -> Pair (Maybe String) ArmBody
+        -> CaseArm
+armKept r ce taken lent t vs fb leaves (MkPair ru b2) =
+  MkCArm
+    t
+    (fieldsWanted vs fb)
+    (lent || isJustS taken)
+    (takeOf ru taken vs fb)
+    (List.append
+       (dropsIn
+          ce
+          (List.filter
+             (\v -> not (elemS v (maybeList taken)))
+             (deadIn
+                (List.append ce.owned (fieldsHeld lent vs fb))
+                (unionS fb ce.after))))
+       (armBodyF
+          r
+          (withPath
+             (deadKept
+                (List.append
+                   ce.owned
+                   (List.append (fieldsHeld lent vs fb) (maybeList ru)))
+                (unionS (List.append fb (maybeList ru)) ce.after))
+             ce.after
+             (withBorrowed
+                (if lent then List.append vs ce.borrowed else ce.borrowed)
+                (knowCell ru (List.length vs) ce)))
+          b2))
+    leaves
+
+armTaken : RcK
+         -> CE
+         -> Bool
+         -> String
+         -> List String
+         -> ArmBody
+         -> List String
+         -> Maybe String
+         -> CaseArm
+armTaken r ce lent t vs b fb taken =
+  armKept r ce taken lent t vs fb (armLeaves b) (reusing taken t vs b)
+
+armFb : RcK
+      -> CE
+      -> Maybe String
+      -> Bool
+      -> String
+      -> List String
+      -> ArmBody
+      -> List String
+      -> CaseArm
+armFb r ce held lent t vs b fb =
+  armTaken r ce lent t vs b fb (takenFv ce held vs fb)
+
+armOf : RcK
+      -> CE
+      -> Maybe String
+      -> Bool
+      -> String
+      -> List String
+      -> ArmBody
+      -> CaseArm
+armOf r ce0 held lent t vs b =
+  armFb r (knowing held (List.length vs) ce0) held lent t vs b (fvArm b)
+
+-- (the variable a match looks at, if it holds a reference to it)
+heldVar : CE -> Mp.Val -> Maybe String
+heldVar ce (SVar x) = if elemS x ce.owned then Just x else Nothing
+heldVar ce _ = Nothing
+
+-- (whether a match looks at a variable lent)
+lentScrut : CE -> Mp.Val -> Bool
+lentScrut ce (SVar x) = elemS x ce.borrowed
+lentScrut ce _ = False
+
+-- (what a match looks at: looked at, not consumed)
+scrutF : RcK -> CE -> Mp.Val -> Value
+scrutF r ce (SVar x) = RLocal x
+scrutF r ce (SGlobal g) =
+  if M.member compareString g ce.funs then RClo g else RGetRaw g
+scrutF r ce v = r.val ce Nil v
+
+-- | a match: a `switch` on the tag, each arm (`returns`: what is last)
+matchOf : RcK
+        -> CE
+        -> Bool
+        -> Mp.Val
+        -> List (Pair (Pair String (List String)) ArmBody)
+        -> Statement
+matchOf r ce returns v arms =
+  CSwitch
+    (scrutF r ce v)
+    (List.map
+       (\p -> case p of
+        MkPair (MkPair t vs) b ->
+          armOf r ce (heldVar ce v) (lentScrut ce v) t vs b)
+       arms)
+    returns
+
+tlArmsOf : List (Mp.Arm Mp.Tl)
+         -> List (Pair (Pair String (List String)) ArmBody)
+tlArmsOf arms =
+  List.map
+    (\arm -> case arm of
+     MkArm t vs b -> MkPair (MkPair t vs) (ATail b))
+    arms
+
+stArmsOf : List (Mp.Arm (List Mp.St))
+         -> List (Pair (Pair String (List String)) ArmBody)
+stArmsOf arms =
+  List.map
+    (\arm -> case arm of
+     MkArm t vs ss -> MkPair (MkPair t vs) (ASts ss))
+    arms
+
+-- (what a binding builds: a tag, known by its size)
+reusedOf : List Mp.Val -> Maybe Known
+reusedOf (Cons _ (Cons (STag _ as) Nil)) = Just (KnownTag (List.length as))
+reusedOf _ = Nothing
+
+builtOf : Mp.Comp -> Maybe Known
+builtOf (OSimple (STag _ as)) = Just (KnownTag (List.length as))
+builtOf (OSimple (SRec fs)) = Just (KnownRec (List.length fs))
+builtOf (OSimple (SLam xs (MkBlock t))) =
+  Just (KnownClo (List.length (freeOf xs t)))
+builtOf (OSimple (SPrim p as)) =
+  if strEq p reusePrim then reusedOf as else Nothing
+builtOf _ = Nothing
+
+knownLet : String -> Maybe Known -> CE -> CE
+knownLet x Nothing ce = ce
+knownLet x (Just k) ce = withKnown x k ce
+
+-- Conditions
+--------------------------------------------------------------------------------
+
+-- A comparison whose Bool is only looked at -- `if`, `&&`, `||` and an
+-- equation matching a Bool, a test whose condition (heff.compile.imp's
+-- `Pred`) is the comparison -- is tested where it is (`CIf`): no Bool
+-- made, nor taken apart again.
+
+-- (an arm of a condition: what is held and wanted neither by it nor
+-- after it dropped first, as a match's arm drops it)
+condArm : RcK -> CE -> ArmBody -> List Statement
+condArm r ce b =
+  List.append
+    (dropsIn ce (deadIn ce.owned (unionS (fvArm b) ce.after)))
+    (armBodyF
+       r
+       (withPath (deadKept ce.owned (unionS (fvArm b) ce.after)) ce.after ce)
+       b)
+
+-- (`fa` what the comparison wants, `wb` what its arms and what comes
+-- after want: the comparison's operands, then the test, then each arm)
+condWith : RcK
+         -> CE
+         -> String
+         -> List Mp.Val
+         -> ArmBody
+         -> ArmBody
+         -> List String
+         -> List String
+         -> List Statement
+condWith r ce p args yes no fa wb =
+  List.append
+    (dropsIn ce (deadIn ce.owned (unionS fa wb)))
+    (Cons
+       (CIf
+          p
+          (operandsF
+             r
+             (withPath (deadKept ce.owned (unionS fa wb)) wb ce)
+             wb
+             args)
+          (condArm r (withPath (deadKept ce.owned wb) ce.after ce) yes)
+          (condArm r (withPath (deadKept ce.owned wb) ce.after ce) no))
+       Nil)
+
+condOf : RcK
+       -> CE
+       -> String
+       -> List Mp.Val
+       -> ArmBody
+       -> ArmBody
+       -> List Statement
+condOf r ce p args yes no =
+  condWith
+    r
+    ce
+    p
+    args
+    yes
+    no
+    (fvList args)
+    (unionS (List.append (fvArm yes) (fvArm no)) ce.after)
+
+-- Fields taken: `let y = f r.a .. in b`, `r` held and wanted by nothing
+-- after the binding, and -- in what the binding computes besides, and in
+-- `b` -- only read other fields of, outside any lambda: `r.a` is taken
+-- out of `r` (`RTakeField`) where that is `r`'s last reference -- moved,
+-- not counted, a hole left in `r` that drops as nothing.  `r` is not
+-- looked at whole again, nor its `a` read: it is read other fields of,
+-- then updated with another `a` or dropped.  So the field's value is held
+-- once, not by `y` and by `r` both, and may be built in in turn: a
+-- scheduler's queue taken out of its state, put to, and the state updated
+-- with it, each in its own cell.
+
+varIs : String -> Mp.Val -> Bool
+varIs x (SVar y) = strEq x y
+varIs x _ = False
+
+-- (whether `x`, in the worklist, is only read fields of, none of them
+-- `l`, and outside any lambda)
+othersW : String -> String -> List Item -> Bool
+othersW x l Nil = True
+othersW x l (Cons (IVal (SVar y)) rest) = not (strEq x y) && othersW x l rest
+othersW x l (Cons (IVal (SProj e l2 _)) rest) =
+  if varIs x e then not (strEq l l2) && othersW x l rest
+  else othersW x l (Cons (IVal e) rest)
+othersW x l (Cons (IVal (SLam _ (MkBlock t))) rest) =
+  Mp.timesIn x (Mp.tailParts t) == 0 && othersW x l rest
+othersW x l (Cons (IVal (STag _ as)) rest) = othersW x l (pushVals as rest)
+othersW x l (Cons (IVal (SRec fs)) rest) =
+  othersW x l (pushVals (List.map snd fs) rest)
+othersW x l (Cons (IVal (SPrim _ as)) rest) = othersW x l (pushVals as rest)
+othersW x l (Cons (IVal _) rest) = othersW x l rest
+othersW x l (Cons (IOp (OSimple v)) rest) = othersW x l (Cons (IVal v) rest)
+othersW x l (Cons (IOp (OCall _ as)) rest) = othersW x l (pushVals as rest)
+othersW x l (Cons (IOp (OApply f as)) rest) =
+  othersW x l (pushVals (Cons f as) rest)
+othersW x l (Cons (IOp (OPrim _ as)) rest) = othersW x l (pushVals as rest)
+othersW x l (Cons (IOp (OBool c)) rest) = othersW x l (Cons (ICond c) rest)
+othersW x l (Cons (IOp _) rest) = othersW x l rest
+othersW x l (Cons (ICond (PRel _ a b)) rest) =
+  othersW x l (Cons (IVal a) (Cons (IVal b) rest))
+othersW x l (Cons (ICond (PBool v)) rest) = othersW x l (Cons (IVal v) rest)
+othersW x l (Cons (ICond (PNot c)) rest) = othersW x l (Cons (ICond c) rest)
+othersW x l (Cons (ICond (PIf a b c)) rest) =
+  othersW x l (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
+othersW x l (Cons (ICond (PLet _ o c)) rest) =
+  othersW x l (Cons (IOp o) (Cons (ICond c) rest))
+othersW x l (Cons (ICond _) rest) = othersW x l rest
+othersW x l (Cons (ISts Nil) rest) = othersW x l rest
+othersW x l (Cons (ISts (Cons (SLet _ o) ss)) rest) =
+  othersW x l (Cons (IOp o) (Cons (ISts ss) rest))
+othersW x l (Cons (ISts (Cons (SDecl _) ss)) rest) =
+  othersW x l (Cons (ISts ss) rest)
+othersW x l (Cons (ISts (Cons (SSet _ o) ss)) rest) =
+  othersW x l (Cons (IOp o) (Cons (ISts ss) rest))
+othersW x l (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
+  othersW
+    x
+    l
+    (Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest))))
+othersW x l (Cons (ISts (Cons (SCase v arms) ss)) rest) =
+  othersW x l (Cons (IVal v) (pushStArms arms (Cons (ISts ss) rest)))
+othersW x l (Cons (ITl (TSeq ss t)) rest) =
+  othersW x l (Cons (ISts ss) (Cons (ITl t) rest))
+othersW x l (Cons (ITl (TReturn o)) rest) = othersW x l (Cons (IOp o) rest)
+othersW x l (Cons (ITl (TLoop vs)) rest) = othersW x l (pushVals vs rest)
+othersW x l (Cons (ITl (TIf c t e)) rest) =
+  othersW x l (Cons (ICond c) (Cons (ITl t) (Cons (ITl e) rest)))
+othersW x l (Cons (ITl (TCase v arms)) rest) =
+  othersW x l (Cons (IVal v) (pushTlArms arms rest))
+
+-- (the operands of what a binding computes, as they are made)
+operandsOf : Mp.Comp -> List Mp.Val
+operandsOf (OApply f as) = Cons f as
+operandsOf (OCall _ as) = as
+operandsOf (OSimple (STag _ as)) = as
+operandsOf (OSimple (SRec fs)) = List.map snd fs
+operandsOf (OSimple (SPrim _ as)) = as
+operandsOf (OPrim _ as) = as
+operandsOf (OSimple (SProj e l sh)) = Cons (SProj e l sh) Nil
+operandsOf _ = Nil
+
+-- (an operand that takes its field, `rest` all that may look at its
+-- record after it)
+takeVar : CE
+        -> List Item
+        -> Maybe String
+        -> String
+        -> List String
+        -> List (Pair String String)
+takeVar ce rest (Just x) l sh =
+  if not (List.null sh)
+  && elemS x ce.owned
+  && not (elemS x ce.borrowed)
+  && not (elemS x ce.after)
+  && othersW x l rest
+    then Cons (MkPair x l) Nil
+  else Nil
+takeVar ce rest Nothing l sh = Nil
+
+takeOne : CE -> List Item -> Mp.Val -> List (Pair String String)
+takeOne ce rest (SProj e l sh) = takeVar ce rest (varOfV e) l sh
+takeOne ce rest e = Nil
+
+takesAt : CE
+        -> List Mp.Val
+        -> List Item
+        -> List Mp.Val
+        -> List (Pair String String)
+takesAt ce before after Nil = Nil
+takesAt ce before after (Cons e es) =
+  List.append
+    (takeOne ce (pushVals before (pushVals es after)) e)
+    (takesAt ce (List.append before (Cons e Nil)) after es)
+
+-- | the fields the operands of `o`, bound before what follows, take out
+-- | of their records
+takesFor : CE -> Mp.Comp -> List Item -> List (Pair String String)
+takesFor ce o after = takesAt ce Nil after (operandsOf o)
+
+-- (what follows a statement, as items)
+restItems : List Mp.St -> Maybe Mp.Tl -> List Item
+restItems ss (Just t) = Cons (ISts ss) (Cons (ITl t) Nil)
+restItems ss Nothing = Cons (ISts ss) Nil
+
+-- Statements
+--------------------------------------------------------------------------------
+
+bindWith : RcK
+         -> CE
+         -> String
+         -> List String
+         -> (CE -> List Statement)
+         -> Maybe Known
+         -> List (Pair String String)
+         -> List Mp.St
+         -> Maybe Mp.Tl
+         -> List String
+         -> List Statement
+bindWith r ce x fa binding known takes rest after wb =
+  List.append
+    (dropsIn ce (deadIn ce.owned (unionS fa wb)))
+    (List.append
+       (binding
+          (withTakes takes (withPath (deadKept ce.owned (unionS fa wb)) wb ce)))
+       (List.append
+          (if elemS x wb then Nil
+           else dropsIn (knownLet x known ce) (Cons x Nil))
+          (r.stmts
+             (withPath
+                (List.append
+                   (deadKept ce.owned wb)
+                   (if elemS x wb then Cons x Nil else Nil))
+                ce.after
+                (withTakes Nil (knownLet x known ce)))
+             rest
+             after)))
+
+-- (`let x = a` and what follows: what is held and wanted neither by `a`
+-- nor after it dropped first; then `a`, wanted after it what follows and
+-- what comes after want; then `x`, dropped if nothing wants it --
+-- `binding` its statements, given the code's state for it; `known`, what
+-- `x` is known to be)
+bindThen : RcK
+         -> CE
+         -> String
+         -> List String
+         -> (CE -> List Statement)
+         -> Maybe Known
+         -> List (Pair String String)
+         -> List Mp.St
+         -> Maybe Mp.Tl
+         -> List Statement
+bindThen r ce x fa binding known takes rest after =
+  bindWith
+    r
+    ce
+    x
+    fa
+    binding
+    known
+    takes
+    rest
+    after
+    (unionS (fvRest rest after) ce.after)
+
+-- (a statement that sets `x`: a match, a condition)
+setting : RcK -> CE -> Mp.St -> List Statement
+setting r ce (SCase v arms) = Cons (matchOf r ce False v (stArmsOf arms)) Nil
+setting r ce (SIf (PRel p a b) ts fs) = condOf r ce p [a, b] (ASts ts) (ASts fs)
+setting r ce st = Cons CAbandon Nil
+
+stmtsF : RcK -> CE -> List Mp.St -> Maybe Mp.Tl -> List Statement
+stmtsF r ce Nil (Just t) = r.tail ce t
+stmtsF r ce Nil Nothing = Nil
+stmtsF r ce (Cons (SLet x o) rest) after =
+  bindThen
+    r
+    ce
+    x
+    (fvOp o)
+    (\ce2 -> Cons (CLet x (r.comp ce2 ce2.after o)) Nil)
+    (builtOf o)
+    (takesFor ce o (restItems rest after))
+    rest
+    after
+stmtsF r ce (Cons (SDecl x) (Cons st rest)) after =
+  bindThen
+    r
+    ce
+    x
+    (fvSts (Cons st Nil))
+    (\ce2 -> Cons (CDecl x) (setting r ce2 st))
+    Nothing
+    Nil
+    rest
+    after
+stmtsF r ce (Cons (SSet x o) rest) after =
+  Cons (CSet x (r.comp ce ce.after o)) (r.stmts ce rest after)
+-- (a match, a condition, setting a name declared before: in an arm
+-- that sets it, last)
+stmtsF r ce (Cons st rest) after =
+  List.append (setting r ce st) (r.stmts ce rest after)
+
+-- (a known definition called last: itself, the loop again; one of the
+-- same parameters, a jump; else called, its bounce given back)
+callAs : CE -> String -> List Mp.Val -> List Operand -> List Statement
+callAs ce g as ls =
+  if isSelfCall ce g as && lentPlain ls then again ce (List.map argExp ls)
+  else if agrees ce g as && lentPlain ls
+    then Cons (CJump g (List.map argExp ls)) Nil
+  else Cons (CReturn (RCall g False ls)) Nil
+
+callLast : RcK -> CE -> String -> List Mp.Val -> List Statement
+callLast r ce g as =
+  callAs ce g as (lentOperands r ce Nil (Bo.borOf ce.bor g) 0 as)
+
+-- | what is last
+tailF : RcK -> CE -> Mp.Tl -> List Statement
+tailF r ce (TSeq ss t) = r.stmts ce ss (Just t)
+tailF r ce (TReturn (OApply f as)) =
+  applyLast ce (List.length as) (operandsF r ce Nil (Cons f as))
+tailF r ce (TReturn (OCall g as)) = callLast r ce g as
+tailF r ce (TReturn o) = Cons (CReturn (r.comp ce Nil o)) Nil
+tailF r ce (TLoop as) = case ce.self of
+  Just s -> callLast r ce s.key as
+  Nothing -> Cons (CReturn RAbandon) Nil
+tailF r ce (TIf (PRel p a b) t e) = condOf r ce p [a, b] (ATail t) (ATail e)
+tailF r ce (TIf _ t e) = Cons (CReturn RAbandon) Nil
+tailF r ce (TCase v arms) = Cons (matchOf r ce True v (tlArmsOf arms)) Nil
+
+rcK : RcK
+rcK =
+  { val = \ce live e -> valF rcK ce live e
+  , comp = \ce live o -> compF rcK ce live o
+  , stmts = \ce ss after -> stmtsF rcK ce ss after
+  , tail = \ce t -> tailF rcK ce t
+  }
+
+-- Definitions
+--------------------------------------------------------------------------------
+
+funRc : CE -> String -> List String -> Mp.Tl -> Def
+funRc ce key xs b =
+  DFun
+    key
+    xs
+    (Bo.borOf ce.bor key)
+    (List.append
+       (plainDrops
+          (deadIn (Bo.paramsAt False (Bo.borOf ce.bor key) xs) (fvTl b)))
+       (rcK.tail
+          (withPath
+             (deadKept (Bo.paramsAt False (Bo.borOf ce.bor key) xs) (fvTl b))
+             Nil
+             (withBorrowed
+                (Bo.paramsAt True (Bo.borOf ce.bor key) xs)
+                (withFrame
+                   (Just { key = key, params = xs })
+                   0
+                   (knowingShapes b ce))))
+          b))
+
+valRc : CE -> String -> Mp.Tl -> Def
+valRc ce key t =
+  DVal
+    key
+    (rcK.tail (withPath Nil Nil (withFrame Nothing 0 (knowingShapes t ce))) t)
+
+-- | a definition of the imperative form, its references counted, what
+-- | is known of the program (`facts`) known
+rcDef : F.Facts -> Mp.Def -> Def
+rcDef facts (MkDef key _ (DefFun xs (MkBlock t))) =
+  funRc (ceOfFacts facts) key xs t
+rcDef facts (MkDef key _ (DefVal (MkBlock t))) = valRc (ceOfFacts facts) key t
