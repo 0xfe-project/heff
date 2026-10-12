@@ -95,6 +95,12 @@ arguments) times the benchmarks of `bench/`.
 and `make fmt-check` names those that are not (the tests' files are
 left as they are, as `.pre-commit-config.yaml` leaves them).
 
+`make aliases` (`heff run scripts/aliases.hf [--check] [FILE...]`)
+gives each `import m as X` the alias its table says, a word that names
+the module (`Driver`, not `Dr`), and every `X.y` of the file with it;
+`--check` only says what it would change.  A new module's alias goes in
+the table.
+
 ## What is made
 
 All that is made is under `.heff/`: the compiler built (`out/`), the

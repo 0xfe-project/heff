@@ -26,7 +26,7 @@ BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 .NOTPARALLEL:
 .PHONY: help build build-seed boot native test test-compiler test-lsp \
   test-backends test-fixpoint test-asan check golden sanitize tsan fmt \
-  fmt-check bat bat-check vsix install install-all bench clean
+  fmt-check aliases aliases-check bat bat-check vsix install install-all bench clean
 
 help: ## this list
 	@echo "make TARGET [VARIABLE=VALUE...]"
@@ -95,6 +95,12 @@ fmt: ## lay out the .hf files in place, as heff fmt does
 fmt-check: ## name the .hf files not laid out so
 	@echo "$(HEFF) fmt --check \$$(git ls-files '*.hf' ':!test/')"
 	@$(HEFF) fmt --check $(HF_FILES)
+
+aliases: ## each import's alias the word scripts/aliases.hf's table says (#60)
+	HEFF=$(HEFF) $(HEFF) run scripts/aliases.hf
+
+aliases-check: ## which aliases are not yet the table's words, no file written
+	HEFF=$(HEFF) $(HEFF) run scripts/aliases.hf --check
 
 ##@ Editors
 
