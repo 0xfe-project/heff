@@ -1551,11 +1551,111 @@ modulePart head ce s shapes prims strs protos lams (MkPair m ps) =
                          (sortedOnce (List.concatMap usesOf ps)))
                       (List.concatMap (ownLines s strs protos lams) ps)))))))
 
+-- Parts bounded in size (#38): a module's definitions are put in as many
+-- parts as keep each to about `partBytes` of C -- a power of two of them,
+-- so that one more splits each in two -- and a definition in the part its
+-- key hashes to, so that an edit leaves every other definition where it
+-- was, and only the parts holding what changed are compiled again.
+
+partBytes : Int
+partBytes = 160000
+
+partsMost : Int
+partsMost = 64
+
+keyHashGo : String -> Int -> Int -> Int
+keyHashGo k i h =
+  if i >= strLength k then h
+  else keyHashGo k (i + 1) ((h * 31 + byteAt k i) % 1000000007)
+
+-- | >>> keyHash "list.map" == keyHash "list.map"
+-- | True
+keyHash : String -> Int
+keyHash k = keyHashGo k 0 7
+
+-- | how many parts `bytes` of C take, from `b`, doubling
+-- | >>> List.map (\n -> partCount n 1) [0, 160000, 160001, 1338607]
+-- | [1, 1, 2, 16]
+partCount : Int -> Int -> Int
+partCount bytes b =
+  if b >= partsMost || bytes <= b * partBytes then b
+  else partCount bytes (b * 2)
+
+linesBytes : List String -> Int
+linesBytes ls = List.foldl (\n l -> n + strLength l + 1) 0 ls
+
+inPart : Int -> Int -> Pair I.Def Emitted1 -> Bool
+inPart b k p = keyHash (pairKey p) % b == k
+
+consPart : {a : Type}
+         -> String
+         -> List a
+         -> List (Pair String (List a))
+         -> List (Pair String (List a))
+consPart n Nil rest = rest
+consPart n qs rest = Cons (MkPair n qs) rest
+
+partsFrom : String
+          -> Int
+          -> List (Pair I.Def Emitted1)
+          -> Int
+          -> List (Pair String (List (Pair I.Def Emitted1)))
+partsFrom m b ps k =
+  if k >= b then Nil
+  else consPart
+      (m ^ "." ^ showInt k)
+      (List.filter (inPart b k) ps)
+      (partsFrom m b ps (k + 1))
+
+partsOfCount : String
+             -> List (Pair I.Def Emitted1)
+             -> Int
+             -> List (Pair String (List (Pair I.Def Emitted1)))
+partsOfCount m ps b =
+  if b == 1 then Cons (MkPair m ps) Nil else partsFrom m b ps 0
+
+-- (a module's definitions, as its parts: one, named as the module, where
+-- it is small; else `MODULE.K`, K the part a definition's key hashes to)
+moduleParts : (Pair I.Def Emitted1 -> Int)
+            -> Pair String (List (Pair I.Def Emitted1))
+            -> List (Pair String (List (Pair I.Def Emitted1)))
+moduleParts size (MkPair m ps) =
+  partsOfCount m ps (partCount (List.foldl (\n p -> n + size p) 0 ps) 1)
+
 -- | the part with the program's `main`, its worlds' providers and its
 -- | algebra: named, as `run$entry.c` is, as no module's part is -- a
 -- | module `main` has its own, `main.c`
 entryPart : String
 entryPart = "run$main.c"
+
+-- (every module's parts, each bounded in size)
+modulesParts : CE
+             -> CS
+             -> M.Map String (List String)
+             -> M.Map String (List String)
+             -> M.Map String (List String)
+             -> List I.Def
+             -> List Emitted1
+             -> List (Pair String String)
+modulesParts ce s strs protos lams defs ems =
+  List.map
+    (modulePart
+       [ "// Generated from Hippogriff; do not edit."
+       , "#define HEFF_PART"
+       , "#include \"heff.h\""
+       ]
+       ce
+       s
+       (byOwner s.shapes)
+       (byOwner s.prims)
+       strs
+       protos
+       lams)
+    (List.concatMap
+       (moduleParts
+          (\(p : Pair I.Def Emitted1) ->
+             linesBytes (ownLines s strs protos lams p)))
+       (M.toList (byModule (zipDE defs ems))))
 
 partsWith : String
           -> List Em.Provider
@@ -1591,20 +1691,14 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
                       (List.append
                          (List.map (\(p : Em.Provider) -> p.text) provs)
                          (List.map pubLine (ending.end ce))))))))
-       (List.map
-          (modulePart
-             [ "// Generated from Hippogriff; do not edit."
-             , "#define HEFF_PART"
-             , "#include \"heff.h\""
-             ]
-             ce
-             s
-             (byOwner s.shapes)
-             (byOwner s.prims)
-             (byOwner s.strs)
-             (byOwner s.protos)
-             (byOwner s.lams))
-          (M.toList (byModule (zipDE defs ems)))))
+       (modulesParts
+          ce
+          s
+          (byOwner s.strs)
+          (byOwner s.protos)
+          (byOwner s.lams)
+          defs
+          ems))
 
 -- The backend's cache: a definition's C as it keeps it
 --------------------------------------------------------------------------------
@@ -1954,7 +2048,12 @@ compileProgramPartsKept : String
                         -> M.Map String EmitKept
                         -> PartsKept
 compileProgramPartsKept runtime provs g key eff vers ks kept =
-  keptParts runtime provs eff kept (L.cKeptOf (L.lowerProgramKept g key vers ks))
+  keptParts
+    runtime
+    provs
+    eff
+    kept
+    (L.cKeptOf (L.lowerProgramKept g key vers ks))
 
 -- | one C file that shows the definitions it is asked for, of those
 -- | given (each by its name and key), as test/load-js.mjs shows
