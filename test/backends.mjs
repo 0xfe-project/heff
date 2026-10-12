@@ -13,7 +13,7 @@
 // Programs: those of test/node, compiled to a program by each backend
 // (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
 // write, their exit status, loops a million rounds deep, a long loop of
-// operations done at once, time; and, by C alone, the network,
+// operations done at once, and time; and, by C alone, an HTTP client,
 // processes forked, and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
@@ -219,28 +219,43 @@ checks.push((async () => {
 // time: done later, the rest going on then
 checks.push(ran("sleep", "test/node/timed.hf", "timed", [], { out: "slept\n", status: 0 }));
 
-// the network, by C alone (std.net has no provider for Node.js): a server of the test's own and `data:` URLs fetched by libcurl in
-// the process and by the curl spawned (`-DHEFF_NET_SPAWN`), the same
-// text from each -- a page, a failure's message -- and each as wanted
-// (where it is curl's version's to say, the start of it).  Run again
-// with no curl on the PATH, libcurl's the same still: it is in the
-// process, not spawned.
+// the HTTP client, by C alone (std.http): a server of the test's own,
+// sent requests by libcurl in the process and by the curl spawned
+// (`-DHEFF_HTTP_SPAWN`), the same from each -- a response, whatever its
+// status; why none came, curl's code and what it says -- and each as
+// wanted (where it is curl's version's to say, the start of it).  Run
+// again with no curl on the PATH, libcurl's the same still: it is in
+// the process, not spawned.
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
-  const big = "0123456789abcdef".repeat(16384);
+  const big = Buffer.from(Array.from({ length: 1 << 18 }, (_, i) => (i * 7) % 251));
+  const sum = (b) => b.reduce((s, c) => s + c, 0);
+  const every = Buffer.from(Array.from({ length: 512 }, (_, i) => i % 256));
   const server = createServer((q, r) => {
     const say = (status, body, headers = {}) => { r.writeHead(status, headers); r.end(body); };
     switch (q.url) {
       case "/item": return say(200, "item 3\n".repeat(4));
+      // (what it was sent, said back: its method, a header of the
+      // test's, its type, how long its body, whether it waits to go on;
+      // and the body)
+      case "/echo": {
+        const parts = [];
+        q.on("data", (c) => parts.push(c));
+        return q.on("end", () => {
+          const body = Buffer.concat(parts);
+          say(200, body, {
+            "X-Method": q.method, "X-Heff": q.headers["x-heff"] ?? "none", "X-Type": q.headers["content-type"] ?? "none",
+            "X-Length": String(body.length), "X-Expect": q.headers.expect ?? "none",
+          });
+        });
+      }
       case "/nope": return say(404, "not here");
-      case "/bad": return say(400, "bad");
-      case "/empty": return say(200);
-      case "/moved": return say(302, "moving", { Location: "/ping" });
+      case "/fails": return say(500, "broken");
+      case "/moved": return say(302, "moving", { Location: "/item" });
       case "/loop": return say(302, "", { Location: "/loop" });
-      case "/ping": return say(200, "pong");
+      case "/slow": return setTimeout(() => say(200, "late"), 500);
       case "/big": return say(200, big, { "Content-Length": big.length });
       case "/chunked": r.write("one,"); r.write("two,"); return r.end("three");
-      case "/agent": return say(200, q.headers["user-agent"] ?? "none");
       case "/short": r.writeHead(200, { "Content-Length": 100 }); r.write("cut"); return setTimeout(() => r.socket.destroy(), 50);
       default: return say(500);
     }
@@ -249,31 +264,36 @@ if (process.platform !== "win32") checks.push((async () => {
   const port = await listening(server);
   const shut = createServer(), refused = await listening(shut);
   shut.close();
-  const at = `http://127.0.0.1:${port}`, failed = "TypeError: fetch failed";
-  const cases = [
-    [`${at}/item`, "28 item 3\nitem 3\nitem 3\nitem 3\n"],
-    [`${at}/nope`, `73 ${failed}: curl: (22) The requested URL returned error: 404`],
-    [`${at}/bad`, `73 ${failed}: curl: (22) The requested URL returned error: 400`],
-    [`http://127.0.0.1:${refused}/`, new RegExp(`^\\d+ ${failed}: curl: \\(7\\) Failed to connect to 127\\.0\\.0\\.1 port ${refused}`)],
-    ["data:,hi%20there", "8 hi there"],
-    ["data:text/plain;base64,aGkgdGhlcmU=", "8 hi there"],
-    ["data:no-comma", `23 ${failed}`],
-    [`http://localhost:${port}/ping`, "4 pong"],
-    [`${at}/empty`, "0 "],
-    [`${at}/moved`, "4 pong"],
-    [`${at}/loop`, new RegExp(`^\\d+ ${failed}: curl: \\(47\\) `)],
-    [`${at}/chunked`, "13 one,two,three"],
-    [`${at}/agent`, /^\d+ curl\/\S+$/],
-    [`${at}/short`, new RegExp(`^\\d+ ${failed}: curl: \\(18\\) `)],
-    [`127.0.0.1:${port}/ping`, "4 pong"],
-    ["nope://x/", new RegExp(`^\\d+ ${failed}: curl: \\(1\\) `)],
-    ["http://", new RegExp(`^\\d+ ${failed}: curl: \\(3\\) `)],
-    [`${at}/big`, `${big.length} ${big}`],
+  const at = `http://127.0.0.1:${port}`;
+  const item = 'b"item 3\\nitem 3\\nitem 3\\nitem 3\\n"';
+  const echoed = (method, heff, type, length, body) =>
+    `200 [X-Method: ${method}, X-Heff: ${heff}, X-Type: ${type}, X-Length: ${length}, X-Expect: none] ${body}`;
+  const want = [
+    `get: 200 [] ${item}`,
+    `post: ${echoed("POST", "one two", "application/octet-stream", 512, `512 bytes, sum ${sum(every)}`)}`,
+    `post, big: ${echoed("POST", "none", "none", 512 << 12, `${512 << 12} bytes, sum ${sum(every) << 12}`)}`,
+    `post, nothing: ${echoed("POST", "none", "none", 0, 'b""')}`,
+    `put: ${echoed("PUT", "none", "none", 3, 'b"put"')}`,
+    `delete: ${echoed("DELETE", "", "none", 0, 'b""')}`,
+    `head: ${echoed("HEAD", "none", "none", 0, 'b""')}`,
+    '404: 404 [] b"not here"',
+    '500: 500 [] b"broken"',
+    new RegExp(`^refused: curl: \\(7\\) Failed to connect to 127\\.0\\.0\\.1 port ${refused}`),
+    `followed: 200 [] ${item}`,
+    'not followed: 302 [Location: /item] b"moving"',
+    /^redirects for ever: curl: \(47\) Maximum \(50\) redirects followed$/,
+    'in time: 200 [] b"late"',
+    /^timed out: curl: \(28\) /,
+    `big: 200 [] ${big.length} bytes, sum ${sum(big)}`,
+    'chunked: 200 [] b"one,two,three"',
+    /^cut short: curl: \(18\) /,
+    /^no scheme: curl: \(1\) /,
+    /^no host: curl: \(3\) /,
+    `getText: ${"item 3\n".repeat(4)}`,
+    "getText, refused: code 7",
+    "get: GET",
   ];
-  const urls = cases.map(([u]) => u);
-  // (what the program wrote, a fetch's lines each, by `cases`: a page may
-  // have lines of its own)
-  const want = cases.map(([, w]) => w);
+  // (the lines, by `want`: a text may have lines of its own)
   const split = (out) => {
     const got = [];
     let rest = out;
@@ -284,28 +304,28 @@ if (process.platform !== "win32") checks.push((async () => {
     }
     return got;
   };
-  const curt = (s) => JSON.stringify(s.length > 120 ? `${s.slice(0, 120)}...` : s);
+  const curt = (s) => JSON.stringify(s.length > 160 ? `${s.slice(0, 160)}...` : s);
   const outs = {};
   const noCurl = { ...process.env, PATH: join(work, "no-such-dir") };
   for (const [built, cflags, runs] of [
     ["libcurl", [], [["libcurl", process.env], ["libcurl, no curl on the PATH", noCurl]]],
-    ["spawned", ["-DHEFF_NET_SPAWN"], [["spawned", process.env]]],
+    ["spawned", ["-DHEFF_HTTP_SPAWN"], [["spawned", process.env]]],
   ]) {
     const p = await programs.c("test/node/fetched.hf", "main", cflags);
-    if (p.error !== undefined) { msgs.push(`FAIL the network, ${built} (c): not compiled\n${p.error}`); continue; }
+    if (p.error !== undefined) { msgs.push(`FAIL http, ${built} (c): not compiled\n${p.error}`); continue; }
     for (const [how, env] of runs) {
-      const r = await run(p.cmd, urls, { timeout: 60000, env });
-      if (r.status !== 0 || r.stderr) { msgs.push(`FAIL the network, ${how} (c): status ${r.status}\n${r.stderr}`); continue; }
+      const r = await run(p.cmd, [at, `http://127.0.0.1:${refused}/`], { timeout: 60000, env });
+      if (r.status !== 0 || r.stderr) { msgs.push(`FAIL http, ${how} (c): status ${r.status}\n${r.stderr}`); continue; }
       const got = split(r.stdout);
-      cases.forEach(([u, w], i) => {
+      want.forEach((w, i) => {
         if (typeof w === "string" ? got[i] !== w : !w.test(got[i]))
-          msgs.push(`FAIL the network, ${how} (c): ${u} gave ${curt(got[i])}, wanted ${curt(String(w))}`);
+          msgs.push(`FAIL http, ${how} (c): ${curt(got[i])}, wanted ${curt(String(w))}`);
       });
-      outs[how] = r.stdout.replace(/ after \d+ ms/g, " after N ms");
+      outs[how] = r.stdout.replace(/ after \d+ (ms|milliseconds)/g, " after N $1");
     }
   }
   for (const how of Object.keys(outs).slice(1))
-    if (outs[how] !== outs.libcurl) msgs.push(`FAIL the network, ${how} (c): not as libcurl's\n${curt(outs[how])}\n${curt(outs.libcurl)}`);
+    if (outs[how] !== outs.libcurl) msgs.push(`FAIL http, ${how} (c): not as libcurl's\n${curt(outs[how])}\n${curt(outs.libcurl)}`);
   server.close();
   return msgs;
 })());

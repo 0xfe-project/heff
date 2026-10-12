@@ -16,7 +16,7 @@ const $host = "page"` (a page's script, `--backend=page`) or `"node"`
 library is split by it ([library.md](library.md#the-batteries)):
 
 - `lib/std/`'s effects are the system's, with a provider in C:
-  `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.net`;
+  `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.http`;
 - `std.ref` and `std.time` are needed on both sides: one module each,
   with a provider in C and one in JavaScript of no `$host`, which a
   page's script runs as Node.js does;

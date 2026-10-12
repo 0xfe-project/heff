@@ -1,31 +1,138 @@
--- What each fetch of the URLs given gives, a line each: its length and
--- its text, a failure's message too (test/backends.mjs, the C backend's
--- libcurl in the process held to the curl it spawns, on a server of the
--- test's own).
+-- Requests of a server of the test's own, a line each: its response --
+-- its status, the headers the server said of what it was sent, its body
+-- -- or why none came (test/backends.mjs, the C backend's libcurl in
+-- the process held to the curl it spawns).  `main AT REFUSED`: the
+-- server's address, and an address where nothing listens.
 
+import bytes as Bytes
 import co
+import std.http as Http
 import std.io
-import std.net
 import std.process
+import uint8 as UInt8
 
 world : HFunctor
-world = stdio <+> (net <+> process)
+world = stdio <+> (Http.http <+> process)
 
-each : {e : HFunctor} -> {{io : stdio <: e}} -> {{web : net <: e}} -> List String -> Co e Unit
+-- (every byte, 0 to 255, twice)
+everyByte : Bytes
+everyByte =
+  Bytes.fromList (List.map (\i -> UInt8.fromInt (i % 256)) (List.range 0 511))
+
+-- (`b` doubled `n` times: 512 bytes doubled 12 times, 2 MiB)
+doubled : Bytes -> Int -> Bytes
+doubled b 0 = b
+doubled b n = doubled (Bytes.append b b) (n - 1)
+
+-- (a header shown: the server's own, `X-...`, and where a redirect goes)
+shownHeader : Pair String String -> Bool
+shownHeader (MkPair n v) = startsWith "X-" n || strEq n "Location"
+
+showHeaders : List (Pair String String) -> String
+showHeaders hs =
+  joinWith
+    ", "
+    (List.map (\h -> fst h ^ ": " ^ snd h) (List.filter shownHeader hs))
+
+-- (a body shown: as `b"..."` where it is short, else its length and its
+-- bytes added up)
+showBody : Bytes -> String
+showBody b =
+  if Bytes.length b <= 64 then Bytes.show b
+  else showInt (Bytes.length b)
+    ^ " bytes, sum "
+    ^ showInt (List.foldl (\s c -> s + UInt8.toInt c) 0 (Bytes.toList b))
+
+showGot : Either Http.HttpError Http.Response -> String
+showGot (Left err) = Http.showError err
+showGot (Right r) =
+  showInt r.status ^ " [" ^ showHeaders r.headers ^ "] " ^ showBody r.body
+
+each : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{web : Http.http <: e}}
+     -> List (Pair String Http.Request)
+     -> Co e Unit
 each Nil = pure MkUnit
-each (u :: us) = do
-  t <- fetchText u
-  print (showInt (strLength t) ^ " " ^ t)
-  each us
+each (MkPair what rq :: rest) = do
+  got <- Http.send rq
+  print (what ^ ": " ^ showGot got)
+  each rest
+
+requests : String -> String -> List (Pair String Http.Request)
+requests at refused =
+  [ MkPair "get" { url = at ^ "/item" }
+  , MkPair
+    "post"
+    { url = at ^ "/echo"
+    , method = "POST"
+    , headers =
+        [ MkPair "X-Heff" "one two"
+        , MkPair "Content-Type" "application/octet-stream"
+        ]
+    , body = everyByte
+    }
+  , MkPair
+    "post, big"
+    { url = at ^ "/echo", method = "POST", body = doubled everyByte 12 }
+  , MkPair "post, nothing" { url = at ^ "/echo", method = "POST" }
+  , MkPair
+    "put"
+    { url = at ^ "/echo", method = "PUT", body = Bytes.fromString "put" }
+  , MkPair
+    "delete"
+    { url = at ^ "/echo", method = "DELETE", headers = [MkPair "X-Heff" ""] }
+  , MkPair "head" { url = at ^ "/echo", method = "HEAD" }
+  , MkPair "404" { url = at ^ "/nope" }
+  , MkPair "500" { url = at ^ "/fails" }
+  , MkPair "refused" { url = refused }
+  , MkPair "followed" { url = at ^ "/moved" }
+  , MkPair "not followed" { url = at ^ "/moved", follow = False }
+  , MkPair "redirects for ever" { url = at ^ "/loop" }
+  , MkPair "in time" { url = at ^ "/slow", timeout = 5000 }
+  , MkPair "timed out" { url = at ^ "/slow", timeout = 100 }
+  , MkPair "big" { url = at ^ "/big" }
+  , MkPair "chunked" { url = at ^ "/chunked" }
+  , MkPair "cut short" { url = at ^ "/short" }
+  , MkPair "no scheme" { url = "nope://x/" }
+  , MkPair "no host" { url = "http://" }
+  ]
+
+codeOf : Http.HttpError -> String
+codeOf err = "code " ^ showInt err.code
+
+-- (`getText` and `get` too)
+texts : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{web : Http.http <: e}}
+      -> String
+      -> String
+      -> Co e Unit
+texts at refused = do
+  t <- Http.getText (at ^ "/item")
+  print ("getText: " ^ either Http.showError (\s -> s) t)
+  n <- Http.getText refused
+  print ("getText, refused: " ^ either codeOf (\s -> s) n)
+  r <- Http.get (at ^ "/echo")
+  print
+      ("get: "
+       ^ either
+         Http.showError
+         (\x -> fromMaybe "none" (Http.header "x-method" x))
+         r)
 
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
-        -> {{web : net <: e}}
+        -> {{web : Http.http <: e}}
         -> {{sys : process <: e}}
         -> Co e Unit
 program = do
   as <- args
-  each as
+  case as of
+    (at :: refused :: _) -> do
+      each (requests at refused)
+      texts at refused
+    _ -> printErr "main AT REFUSED"
 
 main : Co world Unit
 main =

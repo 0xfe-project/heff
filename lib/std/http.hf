@@ -1,0 +1,120 @@
+-- An HTTP client as an effect (lib/co.hf): a request sent, and its
+-- response, or why none came.  The C backend's alone: libcurl in the
+-- process, or a `curl` spawned where there is none
+-- (lib/std/http.provider.c); a page's `fetch` is another module's.
+-- Import it by a name, `import std.http as Http`, as its names are
+-- common ones: `Http.get`, `Http.send`.
+--
+-- A response is whatever the server answered, a 404 or a 500 too; an
+-- error is that no response came -- the connection refused, the name
+-- not found, TLS, the time up -- with curl's code and what it says.
+
+import bytes as Bytes
+import co
+
+-- | A request: where it goes, its method, its headers (a name and a
+-- | value each, sent in their order), its body, how long it may take
+-- | in all in milliseconds (0: as long as it takes), and whether a
+-- | redirect is followed (up to 50 of them) or is the response.  A body
+-- | is sent with a `POST`, or with any method where it is not empty,
+-- | and with no `Content-Type` but the one in its headers.
+type Request =
+  { url : String
+  , method : String = "GET"
+  , headers : List (Pair String String) = Nil
+  , body : Bytes = Bytes.empty
+  , timeout : Int = 0
+  , follow : Bool = True
+  }
+
+-- | A response: its status, its headers (a name and a value each, as the
+-- | server wrote them, of the last response where a redirect was
+-- | followed), and its body.
+type Response =
+  { status : Int, headers : List (Pair String String), body : Bytes }
+
+-- | Why no response came: curl's code (`7`, a connection refused; `28`,
+-- | the time up) and what it says of it.
+type HttpError = { code : Int, message : String }
+
+data HttpF (m : Type -> Type) x = Send Request (Either HttpError Response -> x)
+
+-- | An HTTP client as an effect.
+http : HFunctor
+http =
+  { f = HttpF
+  , hfmap = \m g p -> case p of
+      Send rq k -> Send rq (\r -> g (k r))
+  , hmap = \m n nt p -> case p of
+      Send rq k -> Send rq k
+  }
+
+-- | The request sent: its response, or why none came.
+send : {e : HFunctor}
+     -> {{ev : http <: e}}
+     -> Request
+     -> Co e (Either HttpError Response)
+send rq = op (ev (Send rq (\r -> r))) val
+
+-- | A `GET` of the URL.
+get : {e : HFunctor}
+    -> {{ev : http <: e}}
+    -> String
+    -> Co e (Either HttpError Response)
+get u = send { url = u }
+
+-- | The body as text: UTF-8, what is not UTF-8 U+FFFD.
+-- | >>> text { status = 200, headers = Nil, body = Bytes.fromList [104, 105, 255] }
+-- | "hi\u{FFFD}"
+text : Response -> String
+text r = Bytes.toString r.body
+
+-- (a response's text, or why none came)
+textOf : Either HttpError Response -> Either HttpError String
+textOf (Left err) = Left err
+textOf (Right r) = Right (text r)
+
+-- | A `GET` of the URL: its body as text, whatever its status (`get`
+-- | says the status), or why no response came.
+getText : {e : HFunctor}
+        -> {{ev : http <: e}}
+        -> String
+        -> Co e (Either HttpError String)
+getText u = do
+  r <- get u
+  pure (textOf r)
+
+-- (a byte of ASCII's upper case, lowered)
+lowerByte : Int -> Int
+lowerByte c = if 65 <= c && c <= 90 then c + 32 else c
+
+-- (whether `a` and `b` are the same from `i` on, ASCII's case not minded)
+sameFrom : String -> String -> Int -> Bool
+sameFrom a b i =
+  if i >= strLength a then True
+  else if lowerByte (byteAt a i) == lowerByte (byteAt b i)
+    then sameFrom a b (i + 1)
+  else False
+
+-- (whether two header names are the same, ASCII's case not minded)
+sameName : String -> String -> Bool
+sameName a b = strLength a == strLength b && sameFrom a b 0
+
+-- (the first header named `name`'s value)
+headerIn : String -> List (Pair String String) -> Maybe String
+headerIn name Nil = Nothing
+headerIn name (MkPair n v :: rest) =
+  if sameName name n then Just v else headerIn name rest
+
+-- | The first header of that name, its case not minded (an ASCII
+-- | name's), if there is one.
+-- | >>> header "content-type" { status = 200, headers = [MkPair "Content-Type" "text/plain"], body = Bytes.empty }
+-- | Just "text/plain"
+header : String -> Response -> Maybe String
+header name r = headerIn name r.headers
+
+-- | As curl's tool says it: `curl: (7) Failed to connect ...`.
+-- | >>> showError { code = 28, message = "Operation timed out" }
+-- | "curl: (28) Operation timed out"
+showError : HttpError -> String
+showError err = "curl: (" ^ showInt err.code ^ ") " ^ err.message
