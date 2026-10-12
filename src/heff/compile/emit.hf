@@ -1183,13 +1183,8 @@ jk =
 --------------------------------------------------------------------------------
 
 env0Of : M.Map String GInfo -> M.Map String Unit -> Env
-env0Of gs globalNames =
-  { gs = gs
-  , names = M.empty
-  , used = globalNames
-  , self = Nothing
-  , inl = M.empty
-  }
+env0Of gs met =
+  { gs = gs, names = M.empty, used = met, self = Nothing, inl = M.empty }
 
 -- where a function of several parameters is used as a value, it needs
 -- its curried form
@@ -1283,21 +1278,19 @@ defCodeOf : M.Map String GInfo
           -> Mp.Body
           -> GInfo
           -> DefCode
-defCodeOf gs globalNames key (DefFun xs (MkBlock t)) i =
-  defFunCode key i t (bindAll (env0Of gs globalNames) xs)
-defCodeOf gs globalNames key (DefVal (MkBlock t)) i =
+defCodeOf gs met key (DefFun xs (MkBlock t)) i =
+  defFunCode key i t (bindAll (env0Of gs met) xs)
+defCodeOf gs met key (DefVal (MkBlock t)) i =
   { lines =
       if i.lazy
         then [ ""
              , "const "
              ^ i.js
              ^ " = $lazy(() => "
-             ^ jk.body (env0Of gs globalNames) 0 t
+             ^ jk.body (env0Of gs met) 0 t
              ^ ");"
              ]
-      else [ ""
-           , "const " ^ i.js ^ " = " ^ eagerCode (env0Of gs globalNames) t ^ ";"
-           ]
+      else ["", "const " ^ i.js ^ " = " ^ eagerCode (env0Of gs met) t ^ ";"]
   , params = Nil
   }
 
@@ -1504,10 +1497,10 @@ infoAll shorts facts keys =
 
 -- A definition's JavaScript depends on the definition alone -- as both
 -- backends are given it (heff.compile.lower's `shared`), its variables
--- named again from 0 -- on what is known of itself and of the globals
--- it mentions (their names, arities, whether lazy, whether their calls
--- may bounce), and on the globals' names its own may meet: a local is
--- named by its base, then a number, past every global's name.  The cache
+-- named again from 0 -- and on what is known of itself and of the
+-- globals it mentions (their names, arities, whether lazy, whether their
+-- calls may bounce): a local is named past the names of those alone, not
+-- of every global (`namesIn`).  The cache
 -- (heff.build.backcache) keeps it by a hash of those (`jsVer`), with what
 -- the program wants of it: its parameters' names, for its curried form;
 -- the globals it uses as values, which have one; the primitives it uses,
@@ -1523,111 +1516,16 @@ type JsKept =
   }
 
 -- | what the printer knows of the whole program: each global's name and
--- | facts, the names taken, and the names a local's base may meet
--- | (`clash`, by each base they start with)
-type JsProgram =
-  { info : M.Map String GInfo
-  , names : M.Map String Unit
-  , clash : M.Map String (List String)
-  }
-
--- (the bases names are drawn from besides a definition's binders:
--- monadic form's and heff.compile.imp's temporaries, `t` and `c`, and the
--- printer's own, `s`, `f` and `a`)
-ownBases : List String
-ownBases = ["t", "c", "s", "f", "a"]
-
--- (the variables a body binds)
-bindersGo : List String -> List I.Expr -> List String
-bindersGo acc Nil = acc
-bindersGo acc (Cons (ELam xs b) rest) =
-  bindersGo (List.append xs acc) (Cons b rest)
-bindersGo acc (Cons (ELet x a b) rest) =
-  bindersGo (Cons x acc) (Cons a (Cons b rest))
-bindersGo acc (Cons (EMatch e arms) rest) =
-  bindersGo
-    (List.append
-       (List.concatMap
-          (\(arm : I.Arm) -> case arm of
-           MkArm _ vs _ -> vs)
-          arms)
-       acc)
-    (Cons e (List.append (List.map I.armBody arms) rest))
-bindersGo acc (Cons (EFix x b) rest) = bindersGo (Cons x acc) (Cons b rest)
-bindersGo acc (Cons (EApp f as) rest) =
-  bindersGo acc (Cons f (List.append as rest))
-bindersGo acc (Cons (ERecord fs) rest) =
-  bindersGo acc (List.append (List.map snd fs) rest)
-bindersGo acc (Cons (EProj e _ _) rest) = bindersGo acc (Cons e rest)
-bindersGo acc (Cons (ETag _ as) rest) = bindersGo acc (List.append as rest)
-bindersGo acc (Cons (EPrimCall _ as) rest) = bindersGo acc (List.append as rest)
-bindersGo acc (Cons (ECall _ as) rest) = bindersGo acc (List.append as rest)
-bindersGo acc (Cons _ rest) = bindersGo acc rest
-
-isDigitAt : String -> Int -> Bool
-isDigitAt s i = 48 <= byteAt s i && byteAt s i <= 57
-
--- (a name, under each base a local may be numbered from to meet it: the
--- name, and the name less trailing digits)
-clashUnder : String
-           -> Int
-           -> M.Map String (List String)
-           -> M.Map String (List String)
-clashUnder g n m =
-  if n > 0 && isDigitAt g (n - 1)
-    then clashUnder
-        g
-        (n - 1)
-        (M.insert
-           compareString
-           (strSlice g 0 (n - 1))
-           (Cons
-              g
-              (fromMaybe Nil (M.lookup compareString (strSlice g 0 (n - 1)) m)))
-           m)
-  else m
-
-clashOne : M.Map String (List String) -> String -> M.Map String (List String)
-clashOne m g =
-  clashUnder
-    g
-    (strLength g)
-    (M.insert
-       compareString
-       g
-       (Cons g (fromMaybe Nil (M.lookup compareString g m)))
-       m)
+-- | facts
+type JsProgram = { info : M.Map String GInfo }
 
 -- (each once, in order: through a map, not a list searched)
 sortedOnceJ : List String -> List String
 sortedOnceJ xs = List.map fst (M.toList (setFrom xs))
 
-jsProgramWith : M.Map String GInfo -> JsProgram
-jsProgramWith info =
-  { info = info
-  , names =
-      setFrom
-        (List.map (\(p : Pair String GInfo) -> (snd p).js) (M.toList info))
-  , clash =
-      List.foldl
-        clashOne
-        M.empty
-        (List.map (\(p : Pair String GInfo) -> (snd p).js) (M.toList info))
-  }
-
 -- | what the printer knows of a program of the definitions `keys`
 jsProgramOf : F.Facts -> List String -> JsProgram
-jsProgramOf facts keys = jsProgramWith (infoAll (shortsOf keys) facts keys)
-
--- (the globals' names a body's locals may meet)
-clashesOf : JsProgram -> I.Expr -> List String
-clashesOf p b =
-  sortedOnceJ
-    (List.concatMap
-       (\base -> fromMaybe Nil (M.lookup compareString base p.clash))
-       (List.append
-          ownBases
-          (List.map (\x -> safe (I.baseOf x)) (bindersGo Nil (Cons b Nil)))))
+jsProgramOf facts keys = { info = infoAll (shortsOf keys) facts keys }
 
 -- (what is known of a global)
 globalJsH : JsProgram -> String -> List Ir.HItem -> List Ir.HItem
@@ -1646,7 +1544,7 @@ globalJsH p g rest = case M.lookup compareString g p.info of
 
 -- | what a definition's JavaScript is made of, hashed: its key, its body
 -- | (named again from 0), what is known of itself and of what it
--- | mentions, the names its locals may meet
+-- | mentions
 jsVer : JsProgram -> String -> I.Expr -> String
 jsVer p key b =
   Ir.hashOf
@@ -1658,7 +1556,7 @@ jsVer p key b =
              (HE b)
              (List.foldr
                 (globalJsH p)
-                (Cons (HS (joinWith " " (clashesOf p b))) Nil)
+                Nil
                 (sortedOnceJ (Cons key (I.globalsIn b)))))))
 
 keptCode : String -> Mp.Def -> DefCode -> JsKept
@@ -1670,11 +1568,35 @@ keptCode v d c =
   , prims = List.map fst (M.toList (List.foldl primUses M.empty (Mp.partsOf d)))
   }
 
+-- (a global a definition mentions)
+globalOfPart : Mp.Part -> Maybe String
+globalOfPart (PartVal (SGlobal g)) = Just g
+globalOfPart (PartOp (OCall g _)) = Just g
+globalOfPart _ = Nothing
+
+jsOfGlobal : JsProgram -> String -> Maybe String
+jsOfGlobal p g = case M.lookup compareString g p.info of
+  Just i -> Just i.js
+  Nothing -> Nothing
+
+-- | the names a definition's locals are named past: of itself and of the
+-- | globals it mentions, not of every global -- one it does not mention
+-- | a local of its may hide, unharmed
+namesIn : JsProgram -> Mp.Def -> M.Map String Unit
+namesIn p d =
+  setFrom
+    (catMaybesL
+       (List.map
+          (jsOfGlobal p)
+          (Cons
+             (Mp.defKey d)
+             (catMaybesL (List.map globalOfPart (Mp.partsOf d))))))
+
 -- | a definition printed
 keptOfDef : JsProgram -> String -> Mp.Def -> JsKept
 keptOfDef p v d = case M.lookup compareString (Mp.defKey d) p.info of
   Just i ->
-    keptCode v d (defCodeOf p.info p.names (Mp.defKey d) (Mp.defBody d) i)
+    keptCode v d (defCodeOf p.info (namesIn p d) (Mp.defKey d) (Mp.defBody d) i)
   Nothing -> keptCode v d { lines = Nil, params = Nil }
 
 -- | the definitions' entries, last first, and those made here

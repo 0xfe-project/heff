@@ -6,7 +6,7 @@
 // ran before; a definition that is inlined into another, or a copy made
 // for it, changed, makes that other be made again: the program runs as
 // the edit says; and a global newly named as a definition's local is,
-// that definition's JavaScript is made again, its local named past it.
+// not mentioned by it, leaves its JavaScript as a cold run makes it.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -127,7 +127,7 @@ for (const f of hbs()) writeFileSync(join(back(), f), readFileSync(join(back(), 
 want(same(j1, compileJs("jh.mjs")), "corrupt files of the cache are compiled over, the JavaScript too");
 
 // a global named as `count`'s local is, newly: `count` unchanged, its
-// local named past it, as a cold run names it
+// local as a cold run names it
 const counting = (withX) => `import co
 import std.io
 ${withX ? "\nx : Int\nx = 5\n" : ""}
