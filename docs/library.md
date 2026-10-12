@@ -46,10 +46,12 @@ What is above, in `lib/`, is pure, the same on every backend.
 `lib/std/` is the system's, for the C backend (`--backend=c`):
 
 - `std.io` (the standard streams), `std.filesystem`, `std.process`,
-  `std.http` (an HTTP client), `std.progress` (what a program is doing,
-  drawn on a terminal), `std.thread` (threads truly at once: a pool,
-  spreads, and `Par` handled by them -- [threads.md](threads.md)):
-  effects of the system, C's alone;
+  `std.http` (an HTTP client), `std.net` (TCP sockets), `std.progress`
+  (what a program is doing, drawn on a terminal), `std.thread` (threads
+  truly at once: a pool, spreads, and `Par` handled by them --
+  [threads.md](threads.md)): effects of the system, C's alone;
+- `std.http.server`, an HTTP/1.1 server written over `std.net`, C's
+  as `std.net` is;
 - `std.ref` (the world's cells) and `std.time`: effects needed on both
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
@@ -114,6 +116,100 @@ Windows), a `curl` spawned for each, given what libcurl is, so that
 either answers the same.  A body is sent with a `POST`, and with any
 method where it is not empty, with no `Content-Type` but the request's
 own.
+
+`std.net` is TCP's sockets, on the C backend alone.  Import it by a
+name, `import std.net as Net`.  A `Net.Connection` (a `Handle
+TcpStream`) is made by `Net.connect host port`, or accepted by
+`Net.accept` from a `Net.Listener` (a `Handle TcpListener`), which
+`Net.listen address port backlog` makes -- the address `""` for all of
+the host's, the port 0 for one the system picks, which `Net.local`
+says.  A host or an address is a name the system resolves
+(getaddrinfo), to IPv4 and IPv6 addresses, each tried in turn, or one
+written as it is (`127.0.0.1`, `::1`).  `Net.read c n` is up to `n`
+bytes (a mebibyte at most) of what has come, `Bytes`, waiting for one,
+and none at the end, where the other side has closed or shut down its
+side; `Net.write c b` writes them all; `Net.shutdown c` ends this
+side's writing; `Net.peer c` and `Net.local s` are where each side is,
+an `Address`, its `host` numeric and its `port`; `Net.close s` closes a
+connection or a listener and lets its handle go (an operation given it
+after that fails the program, as one given a handle that is no
+socket).  What may fail gives `Either NetError a`: the system's `code`
+(errno, or getaddrinfo's where a name was not resolved), its `name`,
+the same on every system (`ECONNREFUSED`, `EADDRINUSE`, `EAI_NONAME`),
+and its `message`, as the system says it (`Net.showError`).  A read at
+the end is no error, but no bytes.
+
+```haskell
+import bytes as Bytes
+import std.net as Net
+
+-- (what was read, written back, and `again`; at the end, closed)
+echoed : {e : HFunctor}
+       -> {{nt : Net.net <: e}}
+       -> (Unit -> Co e Unit)
+       -> Net.Connection
+       -> Either Net.NetError Bytes
+       -> Co e Unit
+echoed again c (Left err) = Net.close c
+echoed again c (Right b) =
+  if Bytes.length b == 0 then Net.close c
+  else bind (Net.write c b) (\w -> again MkUnit)
+
+-- (what the other side writes, written back to it until it ends)
+echo : {e : HFunctor} -> {{nt : Net.net <: e}} -> Net.Connection -> Co e Unit
+echo c = bind (Net.read c 65536) (echoed (\u -> echo c) c)
+```
+
+An operation waits until it is done, the whole program with it: the
+green threads of a scheduler in the language do not go on while one of
+them reads (#43 is to change that, the heff side as it is).  Windows
+has no sockets yet: an operation there fails the program.
+
+`std.http.server` is an HTTP/1.1 server, a library in heff over
+`std.net`: import it by a name, `import std.http.server as Server`.
+`Server.serve listener handle` accepts the listener's connections, one
+at a time, for ever, and answers each request of each by `handle :
+Server.Request -> Co e Http.Response` -- std.http's `Response`, its
+status, headers and body.  A `Server.Request` is the server's, not
+std.http's (which is a client's, its URL, its time and redirects): its
+`method`, its `target` as the request line has it (`/items?id=3`), its
+`version`, its `headers` (`Server.header` finds one), its `body`
+(`Bytes`) and its `peer`.  `Server.serveUntil last listener handle`
+stops after the request `last` says is the last, answered;
+`Server.serveConnection` serves one connection accepted already; and
+`Server.plain status text` is a response of text.
+
+```haskell
+import std.http as Http
+import std.http.server as Server
+import std.net as Net
+
+hello : {e : HFunctor} -> Server.Request -> Co e Http.Response
+hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
+
+-- (`hello` served on the port, for ever)
+helloAt : {e : HFunctor} -> {{nt : Net.net <: e}} -> Int -> Co e Unit
+helloAt port = do
+  l <- Net.listen "127.0.0.1" port 64
+  either (\err -> pure MkUnit) (\ln -> Server.serve ln hello) l
+```
+
+Each request's head is read -- its line and headers, 64 KiB at most --
+and its body, of the length its `Content-Length` says (64 MiB at most);
+a client that waits for `100 Continue` is sent one.  The response is
+written with its length (`Content-Length`, which the server writes
+itself, as `Connection`), and no body for a `HEAD`, a 1xx, a 204 or a
+304.  The connection is kept for the next request -- requests sent one
+after another without waiting are answered in turn -- unless the
+request is HTTP/1.0 without `Connection: keep-alive`, either side says
+`Connection: close`, or the request is the last.  A request whose body
+comes in chunks (`Transfer-Encoding`) is answered `501`, one that is no
+HTTP/1.x's `400` or `505`, one too long `431` or `413`, and the
+connection is closed.  One connection is served at a time: a client
+that keeps its connection keeps the others waiting, until #43's green
+threads (std.thread's threads join where they spread: a thread for
+each connection, joined only when the server ends, would be one kept
+for each connection served).
 
 ## Examples
 

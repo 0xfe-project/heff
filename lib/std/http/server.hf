@@ -1,0 +1,532 @@
+-- An HTTP/1.1 server, written over std.net's sockets: a listener's
+-- connections accepted, one at a time, each one's requests read in
+-- turn -- the request line, the headers, and a body of the length its
+-- `Content-Length` says -- each given to a handler, and its response
+-- written with its length, the connection kept for the next request
+-- unless it is to be closed.  So it is the C backend's alone, as
+-- std.net is.  Import it by a name, `import std.http.server as
+-- Server`, beside `import std.http as Http`, whose `Response` a
+-- handler gives.
+--
+-- A request whose body is sent in chunks (`Transfer-Encoding`) is
+-- answered `501 Not Implemented`, and its connection closed; a head
+-- longer than 64 KiB, `431`; a body longer than 64 MiB, `413`; a
+-- request that is no HTTP/1.x, `400` or `505`.
+
+import bytes as Bytes
+import co
+import std.http as Http
+import std.net as Net
+import uint8 as UInt8
+
+-- | A request, as a server is sent it: its method (`GET`), its target as
+-- | the request line says it (`/items?id=3`), its version (`HTTP/1.1`),
+-- | its headers (a name and a value each, in their order), its body,
+-- | and where it came from.  (std.http's `Request` is a client's: a URL,
+-- | a time to wait, redirects followed.)
+type Request =
+  { method : String
+  , target : String
+  , version : String
+  , headers : List (Pair String String)
+  , body : Bytes
+  , peer : Net.Address
+  }
+
+-- | The first header of that name, its case not minded (an ASCII
+-- | name's), if there is one.
+header : String -> Request -> Maybe String
+header name r = Http.headerIn name r.headers
+
+-- | A response of text, `text/plain`, UTF-8.
+-- | >>> (plain 404 "no such item").headers
+-- | [MkPair "Content-Type" "text/plain; charset=utf-8"]
+plain : Int -> String -> Http.Response
+plain status t =
+  { status = status
+  , headers = [MkPair "Content-Type" "text/plain; charset=utf-8"]
+  , body = Bytes.fromString t
+  }
+
+-- Limits
+--------------------------------------------------------------------------------
+
+-- (a head's most, its lines and the blank one after them)
+headMost : Int
+headMost = 65536
+
+-- (a body's most)
+bodyMost : Int
+bodyMost = 67108864
+
+-- (how much is read at a time)
+readSize : Int
+readSize = 65536
+
+-- Reading a request
+--------------------------------------------------------------------------------
+
+-- (whether the byte at `i` is `c`)
+byteIs : Bytes -> Int -> Int -> Bool
+byteIs b i c = UInt8.toInt (Bytes.bytesAt b i) == c
+
+-- (where the blank line after the head starts, `\r\n\r\n`, from `i` on;
+-- -1 where it is not yet)
+headEnd : Bytes -> Int -> Int
+headEnd b i =
+  if i + 4 > Bytes.length b then 0 - 1
+  else if byteIs b i 13
+  && byteIs b (i + 1) 10
+  && byteIs b (i + 2) 13
+  && byteIs b (i + 3) 10
+    then i
+  else headEnd b (i + 1)
+
+-- (a header line's name, up to `i`, and its value after it)
+headerAt : String -> Maybe Int -> Maybe (Pair String String)
+headerAt l Nothing = Nothing
+headerAt l (Just i) =
+  let name = strSlice l 0 i
+  in if i == 0 || contains " " name || contains "\t" name then Nothing
+  else Just (MkPair name (trim (strSlice l (i + 1) (strLength l))))
+
+-- (a header line, `Name: value`: its name, with no space in it, and its
+-- value, trimmed)
+headerLine : String -> Maybe (Pair String String)
+headerLine l = headerAt l (indexOf ":" l)
+
+consBoth : {a : Type} -> Maybe a -> Maybe (List a) -> Maybe (List a)
+consBoth (Just x) (Just xs) = Just (x :: xs)
+consBoth _ _ = Nothing
+
+-- (each line a header's, or none)
+headerLines : List String -> Maybe (List (Pair String String))
+headerLines Nil = Just Nil
+headerLines (l :: rest) = consBoth (headerLine l) (headerLines rest)
+
+-- (a request of its line's three parts and its headers, its body to come)
+requestOf : Net.Address
+          -> List String
+          -> Maybe (List (Pair String String))
+          -> Maybe Request
+requestOf peer (m :: t :: v :: Nil) (Just hs) =
+  if strLength m == 0 || strLength t == 0 then Nothing
+  else Just
+      { method = m
+      , target = t
+      , version = v
+      , headers = hs
+      , body = Bytes.empty
+      , peer = peer
+      }
+requestOf peer _ _ = Nothing
+
+headOfLines : Net.Address -> List String -> Maybe Request
+headOfLines peer Nil = Nothing
+headOfLines peer (l :: rest) = requestOf peer (split " " l) (headerLines rest)
+
+-- | A request's head, its lines without the blank one after them: its
+-- | method, target, version and headers, its body to come; none where
+-- | it is no request's.
+-- | >>> maybe "none" (\(r : Request) -> r.method ^ " " ^ r.target) (parseHead { host = "::1", port = 1 } "GET /a?b HTTP/1.1\r\nHost: x\r\nX-Y:  z ")
+-- | "GET /a?b"
+-- | >>> maybe Nil (\(r : Request) -> r.headers) (parseHead { host = "::1", port = 1 } "GET / HTTP/1.1\r\nHost: x\r\nX-Y:  z ")
+-- | [MkPair "Host" "x", MkPair "X-Y" "z"]
+-- | >>> maybe "none" (\(r : Request) -> r.method) (parseHead { host = "::1", port = 1 } "GET  HTTP/1.1")
+-- | "none"
+parseHead : Net.Address -> String -> Maybe Request
+parseHead peer text = headOfLines peer (split "\r\n" text)
+
+-- (what a request's head says of its body: its length, or the status it
+-- is answered with, its connection then closed)
+data BodyIs = Length Int | Refuse Int
+
+sized : Maybe Int -> BodyIs
+sized Nothing = Refuse 400
+sized (Just n) =
+  if n < 0 then Refuse 400 else if n > bodyMost then Refuse 413 else Length n
+
+lengthOf : Maybe String -> BodyIs
+lengthOf Nothing = Length 0
+lengthOf (Just s) = sized (parseInt s)
+
+isSome : {a : Type} -> Maybe a -> Bool
+isSome m = maybe False (\_ -> True) m
+
+bodyOf : Request -> BodyIs
+bodyOf r =
+  if not (strEq r.version "HTTP/1.1" || strEq r.version "HTTP/1.0")
+    then Refuse (if startsWith "HTTP/" r.version then 505 else 400)
+  else if isSome (header "transfer-encoding" r) then Refuse 501
+  else lengthOf (header "content-length" r)
+
+-- (whether the client waits for `100 Continue` before it sends its body)
+expects : Request -> Bool
+expects r =
+  strEq r.version "HTTP/1.1"
+  && maybe False (\v -> Http.sameName v "100-continue") (header "expect" r)
+
+-- (more bytes after `buf`: `again` of them all; where the connection
+-- ended, or failed, `ended`)
+moreBytes : {e : HFunctor}
+          -> {a : Type}
+          -> (Bytes -> Co e a)
+          -> a
+          -> Bytes
+          -> Either Net.NetError Bytes
+          -> Co e a
+moreBytes again ended buf (Left err) = pure ended
+moreBytes again ended buf (Right b) =
+  if Bytes.length b == 0 then pure ended else again (Bytes.append buf b)
+
+-- (a head read: the bytes read, and where its blank line starts)
+data Head = HeadAt Bytes Int | HeadTooLong | HeadEnded
+
+-- (bytes read until `buf` has a head, looked for from `from` on)
+readHead : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> Net.Connection
+         -> Bytes
+         -> Int
+         -> Co e Head
+readHead c buf from =
+  let i = headEnd buf from
+  in if i >= 0 then pure (HeadAt buf i)
+  else if Bytes.length buf > headMost then pure HeadTooLong
+  else bind
+      (Net.read c readSize)
+      (moreBytes
+         (\b ->
+            readHead
+              c
+              b
+              (if Bytes.length buf > 3 then Bytes.length buf - 3 else 0))
+         HeadEnded
+         buf)
+
+-- (each two put together, one after another)
+pairs : List Bytes -> List Bytes
+pairs (a :: b :: rest) = Bytes.append a b :: pairs rest
+pairs bs = bs
+
+-- (the bytes put together, two at a time: each copied as many times as
+-- the list is halved, where `Bytes.concat` copies the first as many
+-- times as there are)
+-- | >>> joined [b"a", b"bc", b"", b"d", b"ef"]
+-- | b"abcdef"
+joined : List Bytes -> Bytes
+joined Nil = Bytes.empty
+joined (b :: Nil) = b
+joined bs = joined (pairs bs)
+
+-- (a read's bytes, after the parts before, `got` bytes in all: `again`
+-- of them; where the connection ended, or failed, none)
+moreBody : {e : HFunctor}
+         -> (Int -> List Bytes -> Co e (Maybe Bytes))
+         -> Int
+         -> List Bytes
+         -> Either Net.NetError Bytes
+         -> Co e (Maybe Bytes)
+moreBody again got parts (Left err) = pure Nothing
+moreBody again got parts (Right b) =
+  if Bytes.length b == 0 then pure Nothing
+  else again (got + Bytes.length b) (b :: parts)
+
+-- (bytes read until there are `n` at least, `got` of them in `parts`,
+-- the last first: all of them; none where the connection ends first)
+readBody : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> Net.Connection
+         -> Int
+         -> Int
+         -> List Bytes
+         -> Co e (Maybe Bytes)
+readBody c n got parts =
+  if got >= n then pure (Just (joined (List.reverse parts)))
+  else bind (Net.read c (n - got)) (moreBody (readBody c n) got parts)
+
+-- (what reading a request came to: the request, and what was read after
+-- it; a status it is answered with, the connection then closed; or the
+-- connection's end)
+data Got = Asked Request Bytes | Refused Int | Ended
+
+bodied : Request -> Int -> Maybe Bytes -> Got
+bodied r n Nothing = Ended
+bodied r n (Just b) =
+  Asked { r | body = Bytes.slice b 0 n } (Bytes.slice b n (Bytes.length b))
+
+-- (the request whose head ends at `i` of `buf`, its body read)
+withBody : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> Net.Connection
+         -> Bytes
+         -> Int
+         -> Request
+         -> BodyIs
+         -> Co e Got
+withBody c buf i r (Refuse status) = pure (Refused status)
+withBody c buf i r (Length n) = do
+  let rest = Bytes.slice buf (i + 4) (Bytes.length buf)
+  w <-
+    (if n > Bytes.length rest && expects r
+       then Net.write c b"HTTP/1.1 100 Continue\r\n\r\n"
+     else pure (Right MkUnit))
+  got <- readBody c n (Bytes.length rest) [rest]
+  pure (bodied r n got)
+
+parsed : {e : HFunctor}
+       -> {{nt : Net.net <: e}}
+       -> Net.Connection
+       -> Bytes
+       -> Int
+       -> Maybe Request
+       -> Co e Got
+parsed c buf i Nothing = pure (Refused 400)
+parsed c buf i (Just r) = withBody c buf i r (bodyOf r)
+
+headed : {e : HFunctor}
+       -> {{nt : Net.net <: e}}
+       -> Net.Connection
+       -> Net.Address
+       -> Head
+       -> Co e Got
+headed c peer (HeadAt buf i) =
+  parsed c buf i (parseHead peer (Bytes.toString (Bytes.slice buf 0 i)))
+headed c peer HeadTooLong = pure (Refused 431)
+headed c peer HeadEnded = pure Ended
+
+-- (the next request of the connection, `buf` read of it already)
+readRequest : {e : HFunctor}
+            -> {{nt : Net.net <: e}}
+            -> Net.Connection
+            -> Net.Address
+            -> Bytes
+            -> Co e Got
+readRequest c peer buf = bind (readHead c buf 0) (headed c peer)
+
+-- Writing a response
+--------------------------------------------------------------------------------
+
+-- | A status's reason, as a status line says it (`OK`, `Not Found`); a
+-- | status not known, none.
+reason : Int -> String
+reason 100 = "Continue"
+reason 101 = "Switching Protocols"
+reason 200 = "OK"
+reason 201 = "Created"
+reason 202 = "Accepted"
+reason 204 = "No Content"
+reason 206 = "Partial Content"
+reason 301 = "Moved Permanently"
+reason 302 = "Found"
+reason 303 = "See Other"
+reason 304 = "Not Modified"
+reason 307 = "Temporary Redirect"
+reason 308 = "Permanent Redirect"
+reason 400 = "Bad Request"
+reason 401 = "Unauthorized"
+reason 403 = "Forbidden"
+reason 404 = "Not Found"
+reason 405 = "Method Not Allowed"
+reason 408 = "Request Timeout"
+reason 409 = "Conflict"
+reason 410 = "Gone"
+reason 411 = "Length Required"
+reason 413 = "Content Too Large"
+reason 414 = "URI Too Long"
+reason 415 = "Unsupported Media Type"
+reason 422 = "Unprocessable Content"
+reason 429 = "Too Many Requests"
+reason 431 = "Request Header Fields Too Large"
+reason 500 = "Internal Server Error"
+reason 501 = "Not Implemented"
+reason 502 = "Bad Gateway"
+reason 503 = "Service Unavailable"
+reason 504 = "Gateway Timeout"
+reason 505 = "HTTP Version Not Supported"
+reason _ = ""
+
+-- (a status whose response has no body: 1xx, 204, 304)
+bodiless : Int -> Bool
+bodiless s = s < 200 || s == 204 || s == 304
+
+-- (a header the server writes itself: the length, and the connection)
+ownHeader : Pair String String -> Bool
+ownHeader (MkPair n v) =
+  Http.sameName n "Content-Length"
+  || Http.sameName n "Transfer-Encoding"
+  || Http.sameName n "Connection"
+
+headerText : String -> Pair String String -> String
+headerText acc (MkPair n v) = acc ^ n ^ ": " ^ v ^ "\r\n"
+
+-- | A response as it is written: its status line, its headers but its
+-- | own length and connection, its length (`Content-Length`, where its
+-- | status has a body), `Connection: connection` where that is not
+-- | empty, and its body where `withBody` (not for a `HEAD`).
+-- | >>> Bytes.show (responseBytes "close" True (plain 200 "hi"))
+-- | "b\"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain; charset=utf-8\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nhi\""
+-- | >>> Bytes.show (responseBytes "" False { status = 204, headers = [MkPair "Content-Length" "9"], body = b"x" })
+-- | "b\"HTTP/1.1 204 No Content\\r\\n\\r\\n\""
+responseBytes : String -> Bool -> Http.Response -> Bytes
+responseBytes connection withBody res =
+  let none = bodiless res.status
+  in let head =
+    "HTTP/1.1 "
+    ^ showInt res.status
+    ^ " "
+    ^ reason res.status
+    ^ "\r\n"
+    ^ List.foldl
+      headerText
+      ""
+      (List.filter (\h -> not (ownHeader h)) res.headers)
+    ^ (if none then ""
+       else "Content-Length: " ^ showInt (Bytes.length res.body) ^ "\r\n")
+    ^ (if strLength connection == 0 then ""
+       else "Connection: " ^ connection ^ "\r\n")
+    ^ "\r\n"
+  in if withBody && not none then Bytes.append (Bytes.fromString head) res.body
+  else Bytes.fromString head
+
+-- (whether a `Connection` header of these has the token, its case not
+-- minded)
+connectionSays : String -> List (Pair String String) -> Bool
+connectionSays token Nil = False
+connectionSays token (MkPair n v :: rest) =
+  (Http.sameName n "Connection"
+   && List.any (\t -> Http.sameName (trim t) token) (split "," v))
+  || connectionSays token rest
+
+-- | Whether a request's connection is kept after its response, as the
+-- | request asks: HTTP/1.1's unless it says `Connection: close`,
+-- | HTTP/1.0's where it says `Connection: keep-alive`.
+keptAlive : Request -> Bool
+keptAlive r =
+  if strEq r.version "HTTP/1.1" then not (connectionSays "close" r.headers)
+  else connectionSays "keep-alive" r.headers
+
+-- (what a response says of its connection: closed, or kept where
+-- HTTP/1.0 has to be told so)
+connectionWord : Request -> Bool -> String
+connectionWord r True = "close"
+connectionWord r False = if strEq r.version "HTTP/1.0" then "keep-alive" else ""
+
+-- Serving
+--------------------------------------------------------------------------------
+
+-- (what a request answered came to: the connection's next request, what
+-- was read of it already; or the connection done, and whether the
+-- server stops)
+data After = Next Bytes | Done Bool
+
+afterWrite : Bytes -> Bool -> Bool -> Either Net.NetError Unit -> After
+afterWrite rest close stop (Left err) = Done stop
+afterWrite rest close stop (Right _) = if close then Done stop else Next rest
+
+-- (what was read, answered)
+answered : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> Net.Connection
+         -> (Request -> Bool)
+         -> (Request -> Co e Http.Response)
+         -> Got
+         -> Co e After
+answered c last handle (Asked r rest) = do
+  res <- handle r
+  let close = last r || not (keptAlive r) || connectionSays "close" res.headers
+  w <-
+    Net.write
+      c
+      (responseBytes (connectionWord r close) (not (strEq r.method "HEAD")) res)
+  pure (afterWrite rest close (last r) w)
+answered c last handle (Refused status) = do
+  w <-
+    Net.write
+      c
+      (responseBytes "close" True (plain status (reason status ^ "\n")))
+  pure (Done False)
+answered c last handle Ended = pure (Done False)
+
+-- (the connection's next request, `again`; or it closed)
+goOn : {e : HFunctor}
+     -> {{nt : Net.net <: e}}
+     -> (Bytes -> Co e Bool)
+     -> Net.Connection
+     -> After
+     -> Co e Bool
+goOn again c (Next rest) = again rest
+goOn again c (Done stop) = do
+  Net.close c
+  pure stop
+
+-- (the connection's requests answered, `buf` read of them already)
+serveFrom : {e : HFunctor}
+          -> {{nt : Net.net <: e}}
+          -> (Request -> Bool)
+          -> (Request -> Co e Http.Response)
+          -> Net.Connection
+          -> Net.Address
+          -> Bytes
+          -> Co e Bool
+serveFrom last handle c peer buf = do
+  got <- readRequest c peer buf
+  after <- answered c last handle got
+  goOn (serveFrom last handle c peer) c after
+
+closedWith : {e : HFunctor}
+           -> {{nt : Net.net <: e}}
+           -> (Request -> Bool)
+           -> (Request -> Co e Http.Response)
+           -> Net.Connection
+           -> Either Net.NetError Net.Address
+           -> Co e Bool
+closedWith last handle c (Left err) = do
+  Net.close c
+  pure False
+closedWith last handle c (Right peer) = serveFrom last handle c peer Bytes.empty
+
+-- | A connection's requests answered by `handle`, one after another,
+-- | until it ends, a request asks for it to be closed, or `last` says
+-- | the request is the last the server answers; then it is closed.
+-- | Whether `last` said so.
+serveConnection : {e : HFunctor}
+                -> {{nt : Net.net <: e}}
+                -> (Request -> Bool)
+                -> (Request -> Co e Http.Response)
+                -> Net.Connection
+                -> Co e Bool
+serveConnection last handle c = bind (Net.peer c) (closedWith last handle c)
+
+servedOn : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> (Request -> Bool)
+         -> (Request -> Co e Http.Response)
+         -> Either Net.NetError Net.Connection
+         -> Co e Bool
+servedOn last handle (Left err) = pure False
+servedOn last handle (Right c) = serveConnection last handle c
+
+-- | The listener's connections accepted, one at a time, and each one's
+-- | requests answered by `handle` (`serveConnection`), until `last` says
+-- | a request is the last: answered, its connection closed, and the
+-- | listener left as it is.  A connection that fails to be accepted is
+-- | let be.
+serveUntil : {e : HFunctor}
+           -> {{nt : Net.net <: e}}
+           -> (Request -> Bool)
+           -> Net.Listener
+           -> (Request -> Co e Http.Response)
+           -> Co e Unit
+serveUntil last l handle = do
+  a <- Net.accept l
+  stop <- servedOn last handle a
+  if stop then pure MkUnit else serveUntil last l handle
+
+-- | The listener's connections served, for ever.
+serve : {e : HFunctor}
+      -> {{nt : Net.net <: e}}
+      -> Net.Listener
+      -> (Request -> Co e Http.Response)
+      -> Co e Unit
+serve l handle = serveUntil (\r -> False) l handle

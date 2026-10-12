@@ -1,0 +1,224 @@
+-- An HTTP server of std.http.server's, by C alone (test/backends.mjs),
+-- on 127.0.0.1 at the port the test picked, until it is asked for
+-- `/stop`.  `main PORT`: served to the test's clients (node:http, curl,
+-- a socket's bytes), each request said on a line as it is answered.
+-- `self`: served, at a port the system picked, to std.http's client in
+-- the same program, a thread of its own (std.thread), what the client
+-- got said.
+
+import bytes as Bytes
+import co
+import std.http as Http
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.process
+import std.thread
+import uint8 as UInt8
+
+world : HFunctor
+world = stdio <+> (Net.net <+> (Http.http <+> (threads <+> process)))
+
+-- (every byte, 0 to 255, `n` times)
+bytesOf : Int -> Bytes
+bytesOf n =
+  Bytes.fromList
+    (List.map (\i -> UInt8.fromInt (i % 256)) (List.range 0 (256 * n - 1)))
+
+-- (`b` doubled `n` times)
+doubled : Bytes -> Int -> Bytes
+doubled b 0 = b
+doubled b n = doubled (Bytes.append b b) (n - 1)
+
+-- (what `/big` answers: 4 MiB)
+big : Bytes
+big = doubled (bytesOf 4) 12
+
+-- (bytes added up)
+sumOf : Bytes -> Int
+sumOf b = List.foldl (\s c -> s + UInt8.toInt c) 0 (Bytes.toList b)
+
+-- (a body shown: as `b"..."` where it is short, else its length and its
+-- bytes added up)
+showBody : Bytes -> String
+showBody b =
+  if Bytes.length b <= 64 then Bytes.show b
+  else showInt (Bytes.length b) ^ " bytes, sum " ^ showInt (sumOf b)
+
+routed : Server.Request -> Http.Response
+routed r =
+  if strEq r.target "/hello" then Server.plain 200 ("hello, " ^ r.method ^ "\n")
+  else if strEq r.target "/echo"
+    then { status = 200
+         , headers =
+             [ MkPair "X-Method" r.method
+             , MkPair "X-Version" r.version
+             , MkPair "X-Peer" r.peer.host
+             , MkPair "X-Heff" (fromMaybe "none" (Server.header "x-heff" r))
+             ]
+         , body = r.body
+         }
+  else if strEq r.target "/big" then { status = 200, headers = Nil, body = big }
+  else if strEq r.target "/close"
+    then { status = 200
+         , headers = [MkPair "Connection" "close"]
+         , body = b"bye"
+         }
+  else if strEq r.target "/stop" then Server.plain 200 "stopping\n"
+  else Server.plain 404 "no such thing\n"
+
+-- (each request said, as it is answered)
+said : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> Server.Request
+     -> Co e Http.Response
+said r = do
+  print (r.method ^ " " ^ r.target ^ " " ^ r.version ^ ", " ^ showBody r.body)
+  pure (routed r)
+
+isStop : Server.Request -> Bool
+isStop r = strEq r.target "/stop"
+
+serveAt : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> Int
+        -> Co e Unit
+serveAt port = do
+  l <- Net.listen "127.0.0.1" port 16
+  either
+      (\err -> printErr ("listen: " ^ Net.showError err))
+      (\(ln : Net.Listener) -> Server.serveUntil isStop ln said)
+      l
+
+-- std.http's client, a thread of its own --------------------------------------------
+
+showGot : Either Http.HttpError Http.Response -> String
+showGot (Left err) = Http.showError err
+showGot (Right r) =
+  showInt r.status
+  ^ " ["
+  ^ fromMaybe "-" (Http.header "x-method" r)
+  ^ " "
+  ^ fromMaybe "-" (Http.header "x-peer" r)
+  ^ " "
+  ^ fromMaybe "-" (Http.header "content-length" r)
+  ^ "] "
+  ^ showBody r.body
+
+asked : {e : HFunctor}
+      -> {{web : Http.http <: e}}
+      -> String
+      -> List String
+      -> Pair String Http.Request
+      -> Co e (List String)
+asked at acc (MkPair what rq) = do
+  got <- Http.send { rq | url = at ^ rq.url }
+  pure ((what ^ ": " ^ showGot got) :: acc)
+
+askAll : {e : HFunctor}
+       -> {{web : Http.http <: e}}
+       -> String
+       -> List String
+       -> List (Pair String Http.Request)
+       -> Co e (List String)
+askAll at acc Nil = pure (List.reverse acc)
+askAll at acc (q :: qs) = do
+  acc2 <- asked at acc q
+  askAll at acc2 qs
+
+requests : List (Pair String Http.Request)
+requests =
+  [ MkPair "get" { url = "/hello" }
+  , MkPair
+    "post"
+    { url = "/echo"
+    , method = "POST"
+    , headers = [MkPair "X-Heff" "one two"]
+    , body = bytesOf 2
+    }
+  , MkPair
+    "post, big"
+    { url = "/echo", method = "POST", body = doubled (bytesOf 2) 12 }
+  , MkPair "put, nothing" { url = "/echo", method = "PUT" }
+  , MkPair "head" { url = "/hello", method = "HEAD" }
+  , MkPair "404" { url = "/nope" }
+  , MkPair "big" { url = "/big" }
+  , MkPair "closed after" { url = "/close" }
+  , MkPair "again" { url = "/hello" }
+  , MkPair "stop" { url = "/stop" }
+  ]
+
+printAll : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
+printAll Nil = pure MkUnit
+printAll (s :: rest) = do
+  print s
+  printAll rest
+
+-- (thread 0 the server, thread 1 the client: what the client got)
+sides : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{nt : Net.net <: e}}
+      -> {{web : Http.http <: e}}
+      -> Net.Listener
+      -> String
+      -> Int
+      -> Co e (List String)
+sides l at 0 = do
+  Server.serveUntil isStop l (\r -> pure (routed r))
+  pure Nil
+sides l at _ = askAll at Nil requests
+
+selfAt : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{nt : Net.net <: e}}
+       -> {{web : Http.http <: e}}
+       -> {{th : threads <: e}}
+       -> Net.Listener
+       -> Co e Unit
+selfAt l = do
+  at <- Net.local l
+  let url =
+    "http://127.0.0.1:"
+    ^ either (\err -> "0") (\(a : Net.Address) -> showInt a.port) at
+  i <- spread 2
+  lines <- sides l url i
+  got <- gather lines
+  printAll (List.concatMap (\(ls : List String) -> ls) got)
+  Net.close l
+
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{sys : process <: e}}
+        -> Co e Unit
+program = do
+  as <- args
+  case as of
+    (p :: _) -> serveAt (fromMaybe 0 (parseInt p))
+    _ -> printErr "main PORT"
+
+selfProgram : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{nt : Net.net <: e}}
+            -> {{web : Http.http <: e}}
+            -> {{th : threads <: e}}
+            -> Co e Unit
+selfProgram = do
+  l <- Net.listen "127.0.0.1" 0 16
+  either (\err -> printErr ("listen: " ^ Net.showError err)) selfAt l
+
+main : Co world Unit
+main =
+  program
+    (io := \p -> InL p)
+    (nt := \p -> InR (InL p))
+    (sys := \p -> InR (InR (InR (InR p))))
+
+self : Co world Unit
+self =
+  selfProgram
+    (io := \p -> InL p)
+    (nt := \p -> InR (InL p))
+    (web := \p -> InR (InR (InL p)))
+    (th := \p -> InR (InR (InR (InL p))))

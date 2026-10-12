@@ -172,8 +172,9 @@ Not safe, or not as one thread would do:
   `std.ref` copies a value each time it is read or written.
 - Other providers' tables are their own to lock.  The library's:
   `std.ref` and the world's table are locked; `std.progress` locks its
-  own; `std.io`, `std.filesystem`, `std.http`, `std.time` and
-  `std.process` keep no tables (`exit` in a thread ends the process).
+  own; `std.io`, `std.filesystem`, `std.http`, `std.net`, `std.time`
+  and `std.process` keep no tables (`exit` in a thread ends the
+  process; `std.net`'s sockets are the world's).
   `heff_held(i)` is a pointer: a thing let go of by one thread while
   another uses it is the providers' to prevent.
 - Per-thread state costs: on macOS a `_Thread_local` is reached through

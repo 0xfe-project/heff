@@ -1,0 +1,229 @@
+-- TCP sockets (std.net), by C alone (test/backends.mjs): a connection
+-- to a listener of the program's own, on 127.0.0.1 at the port the test
+-- picked, each side echoing what the other wrote, one side shut down
+-- and then closed; a port the system picks, on IPv4, on IPv6 where the
+-- host has it, and by a name; and what fails, as values: a port already
+-- in use, a connection refused, a port out of range, a name not
+-- resolved.  `main PORT REFUSED`: a port to listen on, and one where
+-- nothing listens.
+
+import bytes as Bytes
+import co
+import std.io
+import std.net as Net
+import std.process
+import uint8 as UInt8
+
+world : HFunctor
+world = stdio <+> (Net.net <+> process)
+
+-- (`k` of the value; where there is none, why, said)
+onRight : {e : HFunctor}
+        -> {a : Type}
+        -> {{io : stdio <: e}}
+        -> String
+        -> (a -> Co e Unit)
+        -> Either Net.NetError a
+        -> Co e Unit
+onRight what k (Left err) = print (what ^ ": " ^ Net.showError err)
+onRight what k (Right x) = k x
+
+-- (what an operation that may fail came to: its error's name, or `ok`)
+nameOf : {a : Type} -> Either Net.NetError a -> String
+nameOf (Left err) = err.name
+nameOf (Right _) = "ok"
+
+-- (a read's bytes after those before: `more` of them all; where it read
+-- none -- the other side ended -- those before)
+afterRead : {e : HFunctor}
+          -> (Bytes -> Co e (Either Net.NetError Bytes))
+          -> Bytes
+          -> Either Net.NetError Bytes
+          -> Co e (Either Net.NetError Bytes)
+afterRead more acc (Left err) = pure (Left err)
+afterRead more acc (Right b) =
+  if Bytes.length b == 0 then pure (Right acc) else more (Bytes.append acc b)
+
+-- (`n` bytes read, in as many reads as they take; fewer where the other
+-- side ends first)
+readAll : {e : HFunctor}
+        -> {{nt : Net.net <: e}}
+        -> Net.Connection
+        -> Int
+        -> Bytes
+        -> Co e (Either Net.NetError Bytes)
+readAll c n acc =
+  if Bytes.length acc >= n then pure (Right acc)
+  else bind (Net.read c (n - Bytes.length acc)) (afterRead (readAll c n) acc)
+
+-- (some text, and a byte of each value, 0 to 255)
+sent : Bytes
+sent =
+  Bytes.append
+    b"hello, sockets\r\n"
+    (Bytes.fromList (List.map UInt8.fromInt (List.range 0 255)))
+
+showRead : Either Net.NetError Bytes -> String
+showRead (Left err) = Net.showError err
+showRead (Right b) =
+  if Bytes.length b <= 32 then Bytes.show b
+  else showInt (Bytes.length b)
+    ^ " bytes, those sent: "
+    ^ (if b == sent then "yes" else "no")
+
+-- (where the client is, as the server sees it: its address, and whether
+-- its port is the client's own)
+showPeer : Either Net.NetError Net.Address
+         -> Either Net.NetError Net.Address
+         -> String
+showPeer (Left err) _ = Net.showError err
+showPeer _ (Left err) = Net.showError err
+showPeer (Right p) (Right mine) =
+  p.host
+  ^ ", the client's port: "
+  ^ (if p.port == mine.port then "yes" else "no")
+
+-- (the client `c` and the server's side `s` of one connection)
+talk : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{nt : Net.net <: e}}
+     -> Net.Connection
+     -> Net.Connection
+     -> Co e Unit
+talk c s = do
+  p <- Net.peer s
+  mine <- Net.local c
+  print ("peer: " ^ showPeer p mine)
+  w <- Net.write c sent
+  print ("written: " ^ nameOf w)
+  got <- readAll s (Bytes.length sent) Bytes.empty
+  print ("server read: " ^ showRead got)
+  back <- Net.write s (either (\_ -> Bytes.empty) (\b -> b) got)
+  echoed <- readAll c (Bytes.length sent) Bytes.empty
+  print ("client read: " ^ showRead echoed)
+  d <- Net.shutdown c
+  print ("shut down: " ^ nameOf d)
+  end <- Net.read s 100
+  print ("server read at the end: " ^ showRead end)
+  late <- Net.write s b"still here"
+  still <- readAll c 10 Bytes.empty
+  print ("client read after its shutdown: " ^ showRead still)
+  Net.close s
+  gone <- Net.read c 100
+  print ("client read, the server's side closed: " ^ showRead gone)
+  Net.close c
+
+-- (the server's side of a connection to `l`: whom it sees)
+seen : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{nt : Net.net <: e}}
+     -> String
+     -> Net.Listener
+     -> Net.Connection
+     -> Co e Unit
+seen what l c = do
+  s <- Net.accept l
+  p <- either (\err -> pure (Left err)) Net.peer s
+  print (what ^ ": " ^ either Net.showError (\(x : Net.Address) -> x.host) p)
+  either (\err -> pure MkUnit) Net.close s
+  Net.close c
+
+-- (a connection to `host`, at the port the system picked for `l`)
+connectTo : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{nt : Net.net <: e}}
+          -> String
+          -> String
+          -> Net.Listener
+          -> Net.Address
+          -> Co e Unit
+connectTo what host l a = do
+  print (what ^ ", a port picked: " ^ (if a.port > 0 then "yes" else "no"))
+  c <- Net.connect host a.port
+  onRight what (seen what l) c
+
+-- (a listener of a port the system picks, on `host`, and a connection to
+-- it there: what the server sees of the client)
+picked : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{nt : Net.net <: e}}
+       -> String
+       -> String
+       -> Net.Listener
+       -> Co e Unit
+picked what host l = do
+  at <- Net.local l
+  onRight what (connectTo what host l) at
+  Net.close l
+
+-- (the connection, both sides of it)
+connected : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Net.Listener
+          -> Net.Connection
+          -> Co e Unit
+connected l c = do
+  s <- Net.accept l
+  onRight "accept" (talk c) s
+
+-- (a name's start: `EAI_...` for any of getaddrinfo's)
+nameStart : String -> String
+nameStart n = if startsWith "EAI_" n then "EAI_..." else n
+
+-- (the listener `l`, on `port`: a connection to it, then the errors,
+-- then ports picked)
+sockets : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> Int
+        -> Int
+        -> Net.Listener
+        -> Co e Unit
+sockets port refused l = do
+  at <- Net.local l
+  print
+      ("listening: "
+       ^ either
+         Net.showError
+         (\(a : Net.Address) ->
+            if a.port == port then "the port given" else showInt a.port)
+         at)
+  c <- Net.connect "127.0.0.1" port
+  onRight "connect" (connected l) c
+  again <- Net.listen "127.0.0.1" port 8
+  print ("listening again on the port: " ^ nameOf again)
+  Net.close l
+  r <- Net.connect "127.0.0.1" refused
+  print ("refused: " ^ nameOf r)
+  out <- Net.connect "127.0.0.1" 70000
+  print ("a port out of range: " ^ nameOf out)
+  bad <- Net.connect "no-such-host.invalid" 80
+  print ("a name not resolved: " ^ nameStart (nameOf bad))
+  four <- Net.listen "127.0.0.1" 0 1
+  onRight "ipv4" (picked "ipv4" "127.0.0.1") four
+  six <- Net.listen "::1" 0 1
+  either (\err -> print "ipv6: none here") (picked "ipv6" "::1") six
+  name <- Net.listen "localhost" 0 1
+  onRight "localhost" (picked "a name, localhost" "localhost") name
+
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{sys : process <: e}}
+        -> Co e Unit
+program = do
+  as <- args
+  case as of
+    (p :: r :: _) -> do
+      let port = fromMaybe 0 (parseInt p)
+      l <- Net.listen "127.0.0.1" port 8
+      onRight "listen" (sockets port (fromMaybe 0 (parseInt r))) l
+    _ -> printErr "main PORT REFUSED"
+
+main : Co world Unit
+main =
+  program
+    (io := \p -> InL p)
+    (nt := \p -> InR (InL p))
+    (sys := \p -> InR (InR p))

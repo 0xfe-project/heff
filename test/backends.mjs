@@ -14,10 +14,12 @@
 // (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
 // write, their exit status, loops a million rounds deep, a long loop of
 // operations done at once, and time; and, by C alone, an HTTP client,
-// processes forked, and threads truly at once.
+// TCP sockets and an HTTP server over them, processes forked, and
+// threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
-import { createServer } from "node:http";
+import { Agent, createServer, request } from "node:http";
+import { connect } from "node:net";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -328,6 +330,199 @@ if (process.platform !== "win32") checks.push((async () => {
   for (const how of Object.keys(outs).slice(1))
     if (outs[how] !== outs.libcurl) msgs.push(`FAIL http, ${how} (c): not as libcurl's\n${curt(outs[how])}\n${curt(outs.libcurl)}`);
   server.close();
+  return msgs;
+})());
+
+// (`n` ports nothing listens on, as the system picked them: each held
+// until all are picked, so that they are not the same)
+const freePorts = async (n) => {
+  const held = [];
+  for (let i = 0; i < n; i++) {
+    const s = createServer();
+    await new Promise((ok) => s.listen(0, "127.0.0.1", ok));
+    held.push(s);
+  }
+  const ports = held.map((s) => s.address().port);
+  await Promise.all(held.map((s) => new Promise((ok) => s.close(ok))));
+  return ports;
+};
+
+// TCP sockets, by C alone (std.net): a connection to a listener of the
+// program's own at the port the test picked, each side echoing the
+// other, one side shut down, then closed; a port the system picks, on
+// IPv4, on IPv6 where the host has it, by a name; and what fails, as
+// values -- a port already in use, a connection refused, a port out of
+// range, a name not resolved
+if (process.platform !== "win32") checks.push((async () => {
+  const p = await programs.c("test/node/sockets.hf", "main");
+  if (p.error !== undefined) return [`FAIL sockets (c): not compiled\n${p.error}`];
+  const [port, refused] = await freePorts(2);
+  const r = await run(p.cmd, [String(port), String(refused)], { timeout: 60000 });
+  const quoted = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const want = new RegExp("^" + [
+    "listening: the port given",
+    "peer: 127.0.0.1, the client's port: yes",
+    "written: ok",
+    "server read: 272 bytes, those sent: yes",
+    "client read: 272 bytes, those sent: yes",
+    "shut down: ok",
+    'server read at the end: b""',
+    'client read after its shutdown: b"still here"',
+    `client read, the server's side closed: b""`,
+    "listening again on the port: EADDRINUSE",
+    "refused: ECONNREFUSED",
+    "a port out of range: EINVAL",
+    "a name not resolved: EAI_...",
+    "ipv4, a port picked: yes",
+    "ipv4: 127.0.0.1",
+  ].map(quoted).join("\n") + "\n(ipv6, a port picked: yes\nipv6: ::1|ipv6: none here)\n"
+    + "a name, localhost, a port picked: yes\na name, localhost: (::1|127\\.0\\.0\\.1)\n$");
+  return r.status === 0 && !r.stderr && want.test(r.stdout) ? []
+    : [`FAIL sockets (c): status ${r.status}\n${r.stdout}${r.stderr}`];
+})());
+
+// an HTTP server over them, by C alone (std.http.server): asked by
+// std.http's client in the same program, a thread of its own; and by
+// the test's own -- node:http, its connection kept for each request,
+// bytes written to a socket (requests one after another in one write, a
+// head in parts, HTTP/1.0, `Expect: 100-continue`, a chunked body, no
+// request at all), and curl, two requests on one connection -- each
+// request said by the server as it answers it, until it is asked for
+// `/stop`
+if (process.platform !== "win32") checks.push((async () => {
+  const msgs = [];
+  const bytesOf = (n) => Buffer.from(Array.from({ length: 256 * n }, (_, i) => i % 256));
+  const sum = (b) => b.reduce((s, c) => s + c, 0);
+  const big = Buffer.concat(Array.from({ length: 4096 }, () => bytesOf(4)));
+  const self = await programs.c("test/node/served.hf", "self");
+  if (self.error !== undefined) msgs.push(`FAIL http server, self (c): not compiled\n${self.error}`);
+  else {
+    const r = await run(self.cmd, [], { timeout: 60000 });
+    const want = [
+      'get: 200 [- - 11] b"hello, GET\\n"',
+      `post: 200 [POST 127.0.0.1 512] 512 bytes, sum ${sum(bytesOf(2))}`,
+      `post, big: 200 [POST 127.0.0.1 ${512 << 12}] ${512 << 12} bytes, sum ${sum(bytesOf(2)) << 12}`,
+      'put, nothing: 200 [PUT 127.0.0.1 0] b""',
+      'head: 200 [- - 12] b""',
+      '404: 404 [- - 14] b"no such thing\\n"',
+      `big: 200 [- - ${big.length}] ${big.length} bytes, sum ${sum(big)}`,
+      'closed after: 200 [- - 3] b"bye"',
+      'again: 200 [- - 11] b"hello, GET\\n"',
+      'stop: 200 [- - 9] b"stopping\\n"',
+    ].join("\n") + "\n";
+    if (r.status !== 0 || r.stderr || r.stdout !== want)
+      msgs.push(`FAIL http server, self (c): status ${r.status}\n${r.stdout}${r.stderr}`);
+  }
+  const p = await programs.c("test/node/served.hf", "main");
+  if (p.error !== undefined) return [...msgs, `FAIL http server (c): not compiled\n${p.error}`];
+  const [port] = await freePorts(1);
+  const served = run(p.cmd, [String(port)], { timeout: 60000 });
+  // (bytes written to a connection, in parts -- each after a pause, or
+  // after what it waits for has come -- and all that came back, until the
+  // server closed it)
+  const raw = (parts) => new Promise((ok) => {
+    const s = connect({ host: "127.0.0.1", port });
+    let got = "", next = 0;
+    const timer = setTimeout(() => { s.destroy(); ok(`${got}(no end)`); }, 10000);
+    const send = () => {
+      if (next >= parts.length) return;
+      const [after, text] = parts[next];
+      if (typeof after === "number") { next++; setTimeout(() => { s.write(text); send(); }, after); }
+      else if (got.includes(after)) { next++; s.write(text); send(); }
+    };
+    s.setEncoding("latin1");
+    s.on("connect", send);
+    s.on("data", (d) => { got += d; send(); });
+    s.on("error", (e) => { got += `(${e.code})`; });
+    s.on("close", () => { clearTimeout(timer); ok(got); });
+  });
+  // (the server up: connected to, the connection closed at once)
+  const up = async () => {
+    for (let i = 0; i < 600; i++) {
+      if (await new Promise((ok) => {
+        const s = connect({ host: "127.0.0.1", port });
+        s.on("connect", () => { s.destroy(); ok(true); });
+        s.on("error", () => ok(false));
+      })) return true;
+      await new Promise((ok) => setTimeout(ok, 50));
+    }
+    return false;
+  };
+  if (!(await up())) return [...msgs, `FAIL http server (c): not listening\n${(await served).stderr}`];
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  // (a request by node:http, on the connection kept, or `via` another)
+  const ask = (method, path, body, headers = {}, via = agent) => new Promise((ok) => {
+    const q = request({ host: "127.0.0.1", port, method, path, agent: via, headers }, (r) => {
+      const parts = [];
+      r.on("data", (c) => parts.push(c));
+      r.on("end", () => ok({ status: r.statusCode, headers: r.headers, body: Buffer.concat(parts), reused: q.reusedSocket }));
+    });
+    q.on("error", (e) => ok({ status: e.code, headers: {}, body: Buffer.alloc(0), reused: false }));
+    q.end(body);
+  });
+  const log = [];
+  const check = (what, got, want) => {
+    if (got !== want) msgs.push(`FAIL http server, ${what} (c): ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+  };
+  const posted = Buffer.from(Array.from({ length: 300000 }, (_, i) => (i * 13) % 256));
+  for (const [what, method, path, body, headers, shown, want, said] of [
+    ["get", "GET", "/hello", undefined, {}, (r) => `${r.status} ${r.headers["content-length"]} ${r.body} ${r.reused}`,
+      "200 11 hello, GET\n false", 'GET /hello HTTP/1.1, b""'],
+    ["post", "POST", "/echo", posted, { "X-Heff": "node" },
+      (r) => `${r.status} ${r.headers["x-method"]} ${r.headers["x-version"]} ${r.headers["x-peer"]} ${r.headers["x-heff"]} ${r.body.equals(posted)} ${r.reused}`,
+      "200 POST HTTP/1.1 127.0.0.1 node true true", `POST /echo HTTP/1.1, ${posted.length} bytes, sum ${sum(posted)}`],
+    ["head", "HEAD", "/hello", undefined, {}, (r) => `${r.status} ${r.headers["content-length"]} ${r.body.length} ${r.reused}`,
+      "200 12 0 true", 'HEAD /hello HTTP/1.1, b""'],
+    ["404", "GET", "/nope", undefined, {}, (r) => `${r.status} ${r.body} ${r.reused}`,
+      "404 no such thing\n true", 'GET /nope HTTP/1.1, b""'],
+    ["big", "GET", "/big", undefined, {}, (r) => `${r.status} ${r.body.equals(big)} ${r.reused}`,
+      "200 true true", 'GET /big HTTP/1.1, b""'],
+  ]) {
+    check(what, shown(await ask(method, path, body, headers)), want);
+    log.push(said);
+  }
+  // (the connection kept, closed: the server, one connection at a time,
+  // goes on to the next)
+  agent.destroy();
+  const hello = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 11\r\n";
+  for (const [what, parts, want, said] of [
+    ["one after another, in one write",
+      [[0, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]],
+      `${hello}\r\nhello, GET\n${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.1, b""', 'GET /hello HTTP/1.1, b""']],
+    ["a head in parts",
+      [[0, "GET /hel"], [50, "lo HTTP/1.1\r\nHost: x\r\nConnection: close\r"], [50, "\n\r\n"]],
+      `${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.1, b""']],
+    ["HTTP/1.0", [[0, "GET /hello HTTP/1.0\r\n\r\n"]],
+      `${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.0, b""']],
+    ["HTTP/1.0, kept alive", [[0, "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET /hello HTTP/1.0\r\n\r\n"]],
+      `${hello}Connection: keep-alive\r\n\r\nhello, GET\n${hello}Connection: close\r\n\r\nhello, GET\n`,
+      ['GET /hello HTTP/1.0, b""', 'GET /hello HTTP/1.0, b""']],
+    ["Expect: 100-continue",
+      [[0, "POST /echo HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"], ["100 Continue\r\n\r\n", "hello"]],
+      "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nX-Method: POST\r\nX-Version: HTTP/1.1\r\nX-Peer: 127.0.0.1\r\nX-Heff: none\r\n"
+        + "Content-Length: 5\r\nConnection: close\r\n\r\nhello",
+      ['POST /echo HTTP/1.1, b"hello"']],
+    ["a chunked body", [[0, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"]],
+      "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 16\r\nConnection: close\r\n\r\nNot Implemented\n", []],
+    ["no request", [[0, "NONSENSE\r\n\r\n"]],
+      "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Request\n", []],
+  ]) {
+    check(what, await raw(parts), want);
+    log.push(...said);
+  }
+  if (spawnSync("curl", ["--version"]).status === 0) {
+    const at = `http://127.0.0.1:${port}`;
+    const r = await run("curl", ["-sS", "--http1.1", "-o", "/dev/null", "-o", "/dev/null", "-w", "%{http_code} %{num_connects} %{size_download}\n",
+      `${at}/hello`, `${at}/big`], { timeout: 30000, slot: false });
+    check("curl, two requests on one connection", `${r.stdout}${r.stderr}`, `200 1 11\n200 0 ${big.length}\n`);
+    log.push('GET /hello HTTP/1.1, b""', 'GET /big HTTP/1.1, b""');
+  }
+  const stop = await ask("GET", "/stop", undefined, {}, false);
+  check("stop", `${stop.status} ${stop.body}`, "200 stopping\n");
+  log.push('GET /stop HTTP/1.1, b""');
+  const r = await served;
+  if (r.status !== 0 || r.stderr) msgs.push(`FAIL http server (c): status ${r.status}\n${r.stderr}`);
+  check("what the server said", r.stdout, log.map((l) => `${l}\n`).join(""));
   return msgs;
 })());
 

@@ -1,0 +1,194 @@
+-- TCP sockets as an effect (lib/co.hf): a connection made to a host and
+-- a port, or a port listened on and its connections accepted; bytes
+-- read from a connection and written to it; a connection's ends and
+-- where they are.  The C backend's alone (lib/std/net.provider.c): a
+-- page has no sockets.  Import it by a name, `import std.net as Net`,
+-- as its names are common ones: `Net.connect`, `Net.read`.
+--
+-- A connection and a listener are handles (lib/std/handle.hf), the
+-- world's numbers for the sockets, held until they are closed.  What
+-- fails is a value, an `Either NetError a`, the system's errno and
+-- what it says of it -- never data: a read at the end of what the
+-- other side sends is no error but no bytes.
+--
+-- Each operation waits until it is done (a read, until there is
+-- something to read): one thing at a time, as the rest of a program's
+-- outside operations.
+
+import co
+import std.handle
+
+-- | (`Handle TcpStream`, std.handle: a TCP connection; no value has it.)
+data TcpStream
+
+-- | (`Handle TcpListener`: a socket listening for connections; no value
+-- | has it.)
+data TcpListener
+
+-- | A TCP connection: read from, written to, closed.
+type Connection = Handle TcpStream
+
+-- | A socket listening on a port: its connections accepted, it closed.
+type Listener = Handle TcpListener
+
+-- | Where a socket is: its host's address as it is written, numeric
+-- | (`127.0.0.1`, `::1`), and its port.
+type Address = { host : String, port : Int }
+
+-- | Why an operation failed: the system's number for it -- errno, or
+-- | where a name was not resolved, getaddrinfo's -- its name (`ECONNREFUSED`,
+-- | `EADDRINUSE`, `EAI_NONAME`; the same on every system, where the
+-- | number is not), and what the system says of it.
+type NetError = { code : Int, name : String, message : String }
+
+data NetF (m : Type -> Type) x
+  = Connect String Int (Either NetError Connection -> x)
+  | Listen String Int Int (Either NetError Listener -> x)
+  | Accept Listener (Either NetError Connection -> x)
+  | Read Connection Int (Either NetError Bytes -> x)
+  | Write Connection Bytes (Either NetError Unit -> x)
+  | Shutdown Connection (Either NetError Unit -> x)
+  | Close Int x
+  | Peer Connection (Either NetError Address -> x)
+  | Local Int (Either NetError Address -> x)
+
+-- | TCP sockets as an effect.
+net : HFunctor
+net =
+  { f = NetF
+  , hfmap = \m g p -> case p of
+      Connect h port k -> Connect h port (\r -> g (k r))
+      Listen h port n k -> Listen h port n (\r -> g (k r))
+      Accept l k -> Accept l (\r -> g (k r))
+      Read c n k -> Read c n (\r -> g (k r))
+      Write c b k -> Write c b (\r -> g (k r))
+      Shutdown c k -> Shutdown c (\r -> g (k r))
+      Close i x -> Close i (g x)
+      Peer c k -> Peer c (\r -> g (k r))
+      Local i k -> Local i (\r -> g (k r))
+  , hmap = \m n nt p -> case p of
+      Connect h port k -> Connect h port k
+      Listen h port b k -> Listen h port b k
+      Accept l k -> Accept l k
+      Read c b k -> Read c b k
+      Write c b k -> Write c b k
+      Shutdown c k -> Shutdown c k
+      Close i x -> Close i x
+      Peer c k -> Peer c k
+      Local i k -> Local i k
+  }
+
+-- (a handle's number)
+numberOf : {t : Type} -> Handle t -> Int
+numberOf (MkHandle i) = i
+
+-- Connections
+--------------------------------------------------------------------------------
+
+-- | A connection to `host`'s `port`: the host a name (resolved by the
+-- | system, getaddrinfo, to IPv4 and IPv6 addresses, each tried in the
+-- | order it gives them until one connects) or an address
+-- | (`127.0.0.1`, `::1`).
+connect : {e : HFunctor}
+        -> {{ev : net <: e}}
+        -> String
+        -> Int
+        -> Co e (Either NetError Connection)
+connect host port = op (ev (Connect host port (\r -> r))) val
+
+-- | Up to `n` bytes of what the other side sent, as many as have come,
+-- | waiting for one at least; none at its end, where it has closed its
+-- | side (or shut it down).  At most a mebibyte at a time.
+read : {e : HFunctor}
+     -> {{ev : net <: e}}
+     -> Connection
+     -> Int
+     -> Co e (Either NetError Bytes)
+read c n = op (ev (Read c n (\r -> r))) val
+
+-- | All the bytes written, waiting until the system has taken them.
+write : {e : HFunctor}
+      -> {{ev : net <: e}}
+      -> Connection
+      -> Bytes
+      -> Co e (Either NetError Unit)
+write c b = op (ev (Write c b (\r -> r))) val
+
+-- | This side done writing: the other side reads to its end, and may
+-- | still write, which this side reads.
+shutdown : {e : HFunctor}
+         -> {{ev : net <: e}}
+         -> Connection
+         -> Co e (Either NetError Unit)
+shutdown c = op (ev (Shutdown c (\r -> r))) val
+
+-- | Where the other side is.
+peer : {e : HFunctor}
+     -> {{ev : net <: e}}
+     -> Connection
+     -> Co e (Either NetError Address)
+peer c = op (ev (Peer c (\r -> r))) val
+
+-- Listeners
+--------------------------------------------------------------------------------
+
+-- | A socket listening on `address`'s `port`, at most `backlog`
+-- | connections waiting to be accepted: the address one of the host's
+-- | (`127.0.0.1`, `::1`, a name), or `""` for all of them; the port 0
+-- | for one the system picks, which `local` says.
+listen : {e : HFunctor}
+       -> {{ev : net <: e}}
+       -> String
+       -> Int
+       -> Int
+       -> Co e (Either NetError Listener)
+listen address port backlog =
+  op (ev (Listen address port backlog (\r -> r))) val
+
+-- | The next connection made to the listener, waiting for one.
+accept : {e : HFunctor}
+       -> {{ev : net <: e}}
+       -> Listener
+       -> Co e (Either NetError Connection)
+accept l = op (ev (Accept l (\r -> r))) val
+
+-- Either
+--------------------------------------------------------------------------------
+
+-- | Where a connection or a listener is, on this side: a listener's
+-- | port, where the system picked it.
+local : {e : HFunctor}
+      -> {t : Type}
+      -> {{ev : net <: e}}
+      -> Handle t
+      -> Co e (Either NetError Address)
+local s = op (ev (Local (numberOf s) (\r -> r))) val
+
+-- | A connection or a listener closed, and the handle let go of: the
+-- | world holds nothing of that number after it (an operation given it
+-- | fails the program, as std.handle says).  A handle that is no
+-- | socket fails the program too.
+close : {e : HFunctor}
+      -> {t : Type}
+      -> {{ev : net <: e}}
+      -> Handle t
+      -> Co e Unit
+close s = op (ev (Close (numberOf s) MkUnit)) val
+
+-- Errors
+--------------------------------------------------------------------------------
+
+-- | As a system's tools say it: its name, and what it is.
+-- | >>> showError { code = 61, name = "ECONNREFUSED", message = "Connection refused" }
+-- | "ECONNREFUSED: Connection refused"
+showError : NetError -> String
+showError err = err.name ^ ": " ^ err.message
+
+-- | An address as a URL has it: an IPv6 host in brackets.
+-- | >>> List.map showAddress [{ host = "127.0.0.1", port = 80 }, { host = "::1", port = 8080 }]
+-- | ["127.0.0.1:80", "[::1]:8080"]
+showAddress : Address -> String
+showAddress a =
+  (if contains ":" a.host then "[" ^ a.host ^ "]" else a.host)
+  ^ ":"
+  ^ showInt a.port
