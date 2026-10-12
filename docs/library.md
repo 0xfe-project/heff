@@ -26,7 +26,7 @@ are imported by their names:
 
 - `co` ([effects](language.md#effects)), and effects made with it:
   `state`, `exn` (with `exnDiv` and `exnMod`, a division that throws by
-  zero) and `parallel`;
+  zero), `parallel` and `green` ([green threads](#green-threads));
 - `array`, `map` and `set`;
 - `check` and `gen`, the tests and their generators
   ([tests.md](tests.md#unit-tests-and-properties));
@@ -218,6 +218,45 @@ that keeps its connection keeps the others waiting, until #43's green
 threads (std.thread's threads join where they spread: a thread for
 each connection, joined only when the server ends, would be one kept
 for each connection served).
+
+## Green threads
+
+`green` is green threads, an effect and a scheduler that is a handler
+in the language, the same on every backend: many threads in one thread
+of the system, taking turns at `yield`, at a `recv` with nothing to
+take, and where they end, round robin.  `spawn c` makes `c` a thread
+of its own, `yield` gives the next thread its turn, `newChan` is a
+channel of Ints, `send ch x` puts `x` on it (never waiting) and `recv
+ch` takes the first there, waiting for one.  `scheduled e c` runs `c`
+and the threads it spawns in `Co e` (`c : Co (green <+> e) a`): main's
+answer, `Just`, or `Nothing` where every thread waits on a channel; the
+other threads are let go of when main is done.
+
+```haskell
+import co
+import green
+
+ponger : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Co e Unit
+ponger a b = do
+  x <- recv a
+  send b (x + 1)
+  ponger a b
+
+-- (main and a thread of its own: 1, sent there and back)
+there : {e : HFunctor} -> Co e (Maybe Int)
+there = scheduled e (do
+  a <- newChan (ev := \p -> InL p)
+  b <- newChan (ev := \p -> InL p)
+  spawn (ev := \p -> InL p) (ponger (ev := \p -> InL p) a b)
+  send (ev := \p -> InL p) a 0
+  recv (ev := \p -> InL p) b)
+```
+
+A thread's operations of the rest of the world -- `e`'s, which the
+scheduler does not handle -- are done as its `Outside` says
+(`scheduledWith e o c`).  `scheduled`'s, `blocking e`, does each where
+it is started, every thread waiting with it: a pure world's, or a
+page's, whose providers do not wait.
 
 ## Examples
 

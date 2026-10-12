@@ -1,0 +1,409 @@
+-- Green threads, as an effect (lib/co.hf), and a scheduler that is a
+-- handler in the language: threads take turns at `yield`, at a `recv`
+-- with nothing to take, and where they end, round robin, many of them
+-- in one thread of the system.  Pure, the same on every backend.
+--
+--   spawn c        c is a thread of its own; this one goes on
+--   yield          the next thread's turn
+--   newChan        a channel of Ints
+--   send ch x      x put on ch (never waits)
+--   recv ch        the first on ch, waiting for one if there is none
+--
+-- A thread's operations of the rest of the world (`e`, outside the
+-- scheduler) are done as the scheduler's `Outside` says: by `scheduled`,
+-- one at a time, each waited for there, every thread with it (a pure
+-- world's, or JavaScript's, whose providers do not wait); by
+-- std.reactor's, on the C backend, begun, the other threads going on
+-- while it is pending, and its thread going on once it is done.
+-- Import it as it is, `import green`, or by a name, `import green as
+-- Green`.
+
+import co
+import map as Map
+
+data GreenF (m : Type -> Type) x
+  = Spawn (m Unit) x
+  | Yield x
+  | NewChan (Int -> x)
+  | Send Int Int x
+  | Recv Int (Int -> x)
+
+-- | Green threads, as an effect.
+green : HFunctor
+green =
+  { f = GreenF
+  , hfmap = \m g p -> case p of
+      Spawn c x -> Spawn c (g x)
+      Yield x -> Yield (g x)
+      NewChan k -> NewChan (\n -> g (k n))
+      Send ch v x -> Send ch v (g x)
+      Recv ch k -> Recv ch (\v -> g (k v))
+  , hmap = \m n nt p -> case p of
+      Spawn c x -> Spawn (nt c) x
+      Yield x -> Yield x
+      NewChan k -> NewChan k
+      Send ch v x -> Send ch v x
+      Recv ch k -> Recv ch k
+  }
+
+-- | `c`, a thread of its own; this one goes on.
+spawn : {e : HFunctor} -> {{ev : green <: e}} -> Co e Unit -> Co e Unit
+spawn c = op (ev (Spawn c MkUnit)) val
+
+-- | The next thread's turn; this one's again after the others'.
+yield : {e : HFunctor} -> {{ev : green <: e}} -> Co e Unit
+yield = op (ev (Yield MkUnit)) val
+
+-- | A channel of Ints, new.
+newChan : {e : HFunctor} -> {{ev : green <: e}} -> Co e Int
+newChan = op (ev (NewChan (\n -> n))) val
+
+-- | `v` put on the channel: a thread waiting there takes it, its turn
+-- | to come; this one goes on.
+send : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Int -> Co e Unit
+send ch v = op (ev (Send ch v MkUnit)) val
+
+-- | The first value on the channel, waiting for one, the others going
+-- | on, if there is none.
+recv : {e : HFunctor} -> {{ev : green <: e}} -> Int -> Co e Int
+recv ch = op (ev (Recv ch (\v -> v))) val
+
+-- Outside operations
+--------------------------------------------------------------------------------
+
+-- | How a scheduler has its threads' operations of the rest of the
+-- | world done.  A scheduler opens a `Group` of its own, of its
+-- | threads' type; `start`s each operation -- a computation of `e`, its
+-- | answer the thread's next step -- which is done now, `Just` it, or
+-- | pending, `Nothing`, to be among those `finished` later; and closes
+-- | the group when it ends, what is pending in it let go of.
+-- | `finished g wait`: the group's done since it was last asked, in the
+-- | order they were done -- waiting for one at least, where `wait`;
+-- | none where none of it is pending.
+theory Outside (e : HFunctor) where
+  Group : Type -> Type
+  group : {t : Type} -> Co e (Group t)
+  start : {t : Type} -> Group t -> Co e t -> Co e (Maybe t)
+  finished : {t : Type} -> Group t -> Bool -> Co e (List t)
+  close : {t : Type} -> Group t -> Co e Unit
+
+-- | Each operation done where it is started, every thread waiting with
+-- | it: none is ever pending.
+blocking : (e : HFunctor) -> Outside e
+blocking e =
+  { Group = \t -> Unit
+  , group = pure MkUnit
+  , start = \g c -> bind c (\x -> pure (Just x))
+  , finished = \g wait -> pure Nil
+  , close = \g -> pure MkUnit
+  }
+
+-- The handler: a thread as a resumption
+--------------------------------------------------------------------------------
+
+-- | A thread, stopped where the scheduler has a say.
+data Res (e : HFunctor) a
+  = RDone a
+  | RYield (Unit -> Res e a)
+  | RSpawn (Res e Unit) (Unit -> Res e a)
+  | RNew (Int -> Res e a)
+  | RSend Int Int (Unit -> Res e a)
+  | RRecv Int (Int -> Res e a)
+  | RAct (Co e (Res e a))
+
+thenRes : {e : HFunctor} -> {a b : Type} -> Res e a -> (a -> Res e b) -> Res e b
+thenRes (RDone x) f = f x
+thenRes (RYield k) f = RYield (\u -> thenRes (k u) f)
+thenRes (RSpawn c k) f = RSpawn c (\u -> thenRes (k u) f)
+thenRes (RNew k) f = RNew (\n -> thenRes (k n) f)
+thenRes (RSend ch v k) f = RSend ch v (\u -> thenRes (k u) f)
+thenRes (RRecv ch k) f = RRecv ch (\v -> thenRes (k v) f)
+thenRes (RAct m) f = RAct (bind m (\r -> pure (thenRes r f)))
+
+-- (a thread run alone to its end: what an operation of `e` holding
+-- computations is given, its computations not scheduled)
+alone : {e : HFunctor} -> {a : Type} -> Res e a -> Co e a
+alone (RDone x) = pure x
+alone (RYield k) = alone (k MkUnit)
+alone (RSpawn c k) = alone (k MkUnit)
+alone (RNew k) = alone (k 0)
+alone (RSend ch v k) = alone (k MkUnit)
+alone (RRecv ch k) = alone (k 0)
+alone (RAct m) = bind m alone
+
+-- | Each operation, a thread stopped there; one of `e`'s, to be done in
+-- | `Co e`.
+greenAlg : (e : HFunctor) -> {a : Type} -> (green <+> e).f (Res e) a -> Res e a
+greenAlg e (InL (Spawn c x)) = RSpawn c (\u -> RDone x)
+greenAlg e (InL (Yield x)) = RYield (\u -> RDone x)
+greenAlg e (InL (NewChan k)) = RNew (\n -> RDone (k n))
+greenAlg e (InL (Send ch v x)) = RSend ch v (\u -> RDone x)
+greenAlg e (InL (Recv ch k)) = RRecv ch (\v -> RDone (k v))
+greenAlg e (InR q) =
+  RAct
+    (op
+       (e.hmap
+          { f = Res e, fmap = \g r -> thenRes r (\x -> RDone (g x)) }
+          (coFunctor e)
+          (\r -> alone r)
+          q)
+       (\x -> pure (RDone x)))
+
+greenHandler : (e : HFunctor) -> Handler (green <+> e)
+greenHandler e =
+  { M = Res e
+  , ret = \x -> RDone x
+  , bind = \m f -> thenRes m f
+  , malg = \p -> greenAlg e p
+  }
+
+-- The scheduler
+--------------------------------------------------------------------------------
+
+-- | main (whose answer ends it all), or another thread.
+data Thread (e : HFunctor) a = Main (Res e a) | Other (Res e Unit)
+
+-- | What the scheduler does next: a thread's next step, the same for
+-- | main and the others; or, where no thread is ready, wait for an
+-- | outside operation to be done (`SWait`), or end, every thread
+-- | waiting on a channel (`SStuck`); or, the threads ready, first put
+-- | among them those whose outside operations are done (`SPoll`).
+data Step (e : HFunctor) a
+  = SFinal a
+  | SEnd
+  | SYield (Unit -> Thread e a)
+  | SSpawn (Res e Unit) (Unit -> Thread e a)
+  | SNew (Int -> Thread e a)
+  | SSend Int Int (Unit -> Thread e a)
+  | SRecv Int (Int -> Thread e a)
+  | SAct (Co e (Thread e a))
+  | SWait
+  | SStuck
+  | SPoll
+
+view : {e : HFunctor} -> {a : Type} -> Thread e a -> Step e a
+view (Main (RDone x)) = SFinal x
+view (Main (RYield k)) = SYield (\u -> Main (k u))
+view (Main (RSpawn c k)) = SSpawn c (\u -> Main (k u))
+view (Main (RNew k)) = SNew (\n -> Main (k n))
+view (Main (RSend ch v k)) = SSend ch v (\u -> Main (k u))
+view (Main (RRecv ch k)) = SRecv ch (\v -> Main (k v))
+view (Main (RAct m)) = SAct (bind m (\r -> pure (Main r)))
+view (Other (RDone _)) = SEnd
+view (Other (RYield k)) = SYield (\u -> Other (k u))
+view (Other (RSpawn c k)) = SSpawn c (\u -> Other (k u))
+view (Other (RNew k)) = SNew (\n -> Other (k n))
+view (Other (RSend ch v k)) = SSend ch v (\u -> Other (k u))
+view (Other (RRecv ch k)) = SRecv ch (\v -> Other (k v))
+view (Other (RAct m)) = SAct (bind m (\r -> pure (Other r)))
+
+-- | A queue: taken from the front, put at the back (two lists).
+type Queue a = { front : List a, back : List a }
+
+emptyQ : {a : Type} -> Queue a
+emptyQ = { front = [], back = [] }
+
+putQ : {a : Type} -> a -> Queue a -> Queue a
+putQ x q = { front = q.front, back = x :: q.back }
+
+-- (the back turned round, the front)
+fromBack : {a : Type} -> List a -> Maybe (Pair a (Queue a))
+fromBack (x :: rest) = Just (MkPair x { front = rest, back = [] })
+fromBack Nil = Nothing
+
+takeQ : {a : Type} -> Queue a -> Maybe (Pair a (Queue a))
+takeQ { front = x :: rest, back = b } =
+  Just (MkPair x { front = rest, back = b })
+takeQ { back = b } = fromBack (List.reverse b)
+
+-- | What the scheduler holds: the threads ready, each channel's values
+-- | and the threads waiting on it, the next channel's number, how many
+-- | threads' outside operations are pending, and how many turns since
+-- | it last asked which are done.
+type Sched (e : HFunctor) a =
+  { ready : Queue (Unit -> Thread e a)
+  , chans : Map.Map Int (Queue Int)
+  , waiting : Map.Map Int (Queue (Int -> Thread e a))
+  , next : Int
+  , pending : Int
+  , turns : Int
+  }
+
+-- | Where a schedule is: what the scheduler holds, and what it does next.
+type At (e : HFunctor) a = Pair (Sched e a) (Step e a)
+
+-- (how many turns are taken, threads ready and outside operations
+-- pending, before it asks which of those are done, not waiting)
+turnsBetween : Int
+turnsBetween = 64
+
+queueOf : {a : Type} -> Int -> Map.Map Int (Queue a) -> Queue a
+queueOf ch m = fromMaybe emptyQ (Map.lookup compareInt ch m)
+
+-- (the thread at the front, its turn; where none is ready, those
+-- pending waited for; where none is pending either, a deadlock)
+fronted : {e : HFunctor}
+        -> {a : Type}
+        -> Sched e a
+        -> Maybe (Pair (Unit -> Thread e a) (Queue (Unit -> Thread e a)))
+        -> At e a
+fronted s (Just (MkPair t q)) = MkPair { s | ready = q } (view (t MkUnit))
+fronted s Nothing = MkPair s (if s.pending > 0 then SWait else SStuck)
+
+-- | The next thread's turn: every `turnsBetween` turns, while some
+-- | thread's outside operation is pending, those done are put among the
+-- | ready first, not waited for.
+switch : {e : HFunctor} -> {a : Type} -> Sched e a -> At e a
+switch s =
+  if s.pending == 0 then fronted s (takeQ s.ready)
+  else if s.turns >= turnsBetween then MkPair s SPoll
+  else fronted { s | turns = s.turns + 1 } (takeQ s.ready)
+
+-- (the threads whose operations were done, ready, at the back)
+withDone : {e : HFunctor}
+         -> {a : Type}
+         -> List (Thread e a)
+         -> Sched e a
+         -> Sched e a
+withDone ts s =
+  { s
+  | ready = List.foldl (\q t -> putQ (\u -> t) q) s.ready ts
+  , pending = s.pending - List.length ts
+  , turns = 0
+  }
+
+-- (the threads done, waited for, ready; where none came -- none was
+-- pending after all -- every thread waits on a channel)
+woken : {e : HFunctor} -> {a : Type} -> Sched e a -> List (Thread e a) -> At e a
+woken s Nil = MkPair s SStuck
+woken s ts = switch (withDone ts s)
+
+-- (a value sent on `ch`: to a thread waiting there, or put on it)
+sentTo : {e : HFunctor}
+       -> {a : Type}
+       -> Sched e a
+       -> Int
+       -> Int
+       -> (Unit -> Thread e a)
+       -> Maybe (Pair (Int -> Thread e a) (Queue (Int -> Thread e a)))
+       -> At e a
+sentTo s ch v k (Just (MkPair w ws)) =
+  MkPair
+    { s
+    | ready = putQ (\u -> w v) s.ready
+    , waiting = Map.insert compareInt ch ws s.waiting
+    }
+    (view (k MkUnit))
+sentTo s ch v k Nothing =
+  MkPair
+    { s
+    | chans = Map.insert compareInt ch (putQ v (queueOf ch s.chans)) s.chans
+    }
+    (view (k MkUnit))
+
+-- (a value received on `ch`: the first there; where there is none, the
+-- thread waits there, the next one's turn)
+takenFrom : {e : HFunctor}
+          -> {a : Type}
+          -> Sched e a
+          -> Int
+          -> (Int -> Thread e a)
+          -> Maybe (Pair Int (Queue Int))
+          -> At e a
+takenFrom s ch k (Just (MkPair v vs)) =
+  MkPair { s | chans = Map.insert compareInt ch vs s.chans } (view (k v))
+takenFrom s ch k Nothing =
+  switch
+    { s
+    | waiting =
+        Map.insert compareInt ch (putQ k (queueOf ch s.waiting)) s.waiting
+    }
+
+-- (an outside operation started: done, the thread goes on; pending, the
+-- next one's turn)
+acted : {e : HFunctor}
+      -> {a : Type}
+      -> Sched e a
+      -> Maybe (Thread e a)
+      -> At e a
+acted s (Just t) = MkPair s (view t)
+acted s Nothing = switch { s | pending = s.pending + 1 }
+
+-- (the group closed, and what the schedule came to)
+ended : {e : HFunctor}
+      -> {a : Type}
+      -> (o : Outside e)
+      -> o.Group (Thread e a)
+      -> Maybe a
+      -> Co e (Maybe a)
+ended o g r = bind (o.close g) (\u -> pure r)
+
+-- | The schedule from where it is, until main is done: its answer; or
+-- | Nothing, where every thread waits on a channel (a deadlock).
+go : {e : HFunctor}
+   -> {a : Type}
+   -> (o : Outside e)
+   -> o.Group (Thread e a)
+   -> At e a
+   -> Co e (Maybe a)
+go o g (MkPair s (SFinal x)) = ended o g (Just x)
+go o g (MkPair s SEnd) = go o g (switch s)
+go o g (MkPair s (SYield k)) = go o g (switch { s | ready = putQ k s.ready })
+go o g (MkPair s (SSpawn c k)) =
+  go o g (MkPair { s | ready = putQ (\u -> Other c) s.ready } (view (k MkUnit)))
+go o g (MkPair s (SNew k)) =
+  go o g (MkPair { s | next = s.next + 1 } (view (k s.next)))
+go o g (MkPair s (SSend ch v k)) =
+  go o g (sentTo s ch v k (takeQ (queueOf ch s.waiting)))
+go o g (MkPair s (SRecv ch k)) =
+  go o g (takenFrom s ch k (takeQ (queueOf ch s.chans)))
+go o g (MkPair s (SAct m)) = bind (o.start g m) (\r -> go o g (acted s r))
+go o g (MkPair s SWait) = bind (o.finished g True) (\ts -> go o g (woken s ts))
+go o g (MkPair s SStuck) = ended o g Nothing
+go o g (MkPair s SPoll) =
+  bind
+    (o.finished g False)
+    (\ts -> go o g (fronted (withDone ts s) (takeQ (withDone ts s).ready)))
+
+-- | Nothing scheduled yet.
+begun : {e : HFunctor} -> {a : Type} -> Sched e a
+begun =
+  { ready = emptyQ
+  , chans = Map.empty
+  , waiting = Map.empty
+  , next = 0
+  , pending = 0
+  , turns = 0
+  }
+
+-- | `c` and the threads it spawns, round robin, in `Co e`, their
+-- | operations of `e` done as `o` says: main's answer, or Nothing where
+-- | every thread waits on a channel.  The other threads are let go of
+-- | when main is done, and what they had pending with them.  Scheduled
+-- | when the `Co e` runs, not when it is made.
+scheduledWith : (e : HFunctor)
+              -> (o : Outside e)
+              -> {a : Type}
+              -> Co (green <+> e) a
+              -> Co e (Maybe a)
+scheduledWith e o c =
+  bind
+    o.group
+    (\g -> go o g (MkPair begun (view (Main (handle (greenHandler e) c)))))
+
+-- | ... each operation of `e` done where it is started, every thread
+-- | waiting for it (`blocking`).
+scheduled : (e : HFunctor) -> {a : Type} -> Co (green <+> e) a -> Co e (Maybe a)
+scheduled e c = scheduledWith e (blocking e) c
+
+-- | ... scheduled where it is made: up to the first operation of `e`,
+-- | the pure steps of every thread are taken there.
+scheduledNow : (e : HFunctor)
+             -> {a : Type}
+             -> Co (green <+> e) a
+             -> Co e (Maybe a)
+scheduledNow e c =
+  go
+    (blocking e)
+    MkUnit
+    (MkPair begun (view (Main (handle (greenHandler e) c))))
