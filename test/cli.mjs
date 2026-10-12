@@ -100,25 +100,53 @@ expect("test runs the tests", props.status === 1 &&
   /  FAIL  small \/ all below 50  \(failed after \d+ runs held; shrunk (once|\d+ times); again: --seed 2026\)\n        \[50\]\n        all below 50\n/.test(props.stdout) &&
   /  ok    small \/ reversed twice  \(100 runs, \d+% empty, \d+% not empty\)\n/.test(props.stdout) &&
   props.stdout.includes("FAIL  props.hf  0/0, tests 2/4\n") &&
-  props.stdout.endsWith("0/0 expectations hold, 2/4 tests hold\n"), props);
+  props.stdout.endsWith("0/0 expectations hold, 2/4 tests hold, 1/1 files check as they should\n"), props);
 const seeded = heff("test", "--seed", "99", "props.hf");
 expect("test --seed", seeded.status === 1 && seeded.stdout.includes("again: --seed 99)\n        [50]\n") &&
   runsOf(seeded) !== undefined && runsOf(seeded) !== runsOf(props), { seeded, props });
 expect("test --seed, again", heff("test", "props.hf", "-s", "99").stdout === seeded.stdout, seeded);
 
-// test: a file that does not check fails the run, and the last line says
-// so and names it, though every expectation counted holds -- one with a
-// type error, its watch evaluated still, and one that does not parse
+// test: a file that does not check fails the run, though every
+// expectation counted holds: it is named in a list above the last line,
+// a line each, where its first error is -- one with a type error, its
+// watch evaluated still, and one that does not parse
 writeFileSync(join(work, "mistyped.hf"), ["-- >>> 1 + 1", "-- 2", "", "oops : Int", "oops = True", ""].join("\n"));
 writeFileSync(join(work, "unparsed.hf"), ["x : Int", "x = (1 +", ""].join("\n"));
 const mistyped = heff("test", "p.hf", "mistyped.hf");
 expect("test, a file that does not check", mistyped.status === 1 &&
   mistyped.stdout.includes("FAIL  mistyped.hf  1/1\n") &&
-  mistyped.stdout.endsWith("4/4 expectations hold, 1 file does not check: mistyped.hf\n"), mistyped);
+  mistyped.stdout.endsWith("files that do not check as they should:\n" +
+    "  mistyped.hf:5:8: error[E0314]: expected type Int, but got the tag True\n" +
+    "4/4 expectations hold, 1/2 files check as they should\n"), mistyped);
 const unchecked = heff("test", "p.hf", "mistyped.hf", "unparsed.hf");
 expect("test, files that do not check", unchecked.status === 1 &&
   unchecked.stdout.includes("FAIL  unparsed.hf  0/0\n") &&
-  unchecked.stdout.endsWith("4/4 expectations hold, 2 files do not check: mistyped.hf, unparsed.hf\n"), unchecked);
+  unchecked.stdout.endsWith("files that do not check as they should:\n" +
+    "  mistyped.hf:5:8: error[E0314]: expected type Int, but got the tag True\n" +
+    "  unparsed.hf:2:9: error[E0150]: expected an expression, not the end of the declaration\n" +
+    "4/4 expectations hold, 1/3 files check as they should\n"), unchecked);
+
+// test: a file whose first line is `-- test: expect errors` (a test of
+// the errors said) passes by having errors, not said; it fails if it
+// checks; the line anywhere else is a comment like another
+writeFileSync(join(work, "wants.hf"), ["-- test: expect errors", "oops : Int", "oops = True", ""].join("\n"));
+writeFileSync(join(work, "checks.hf"), ["-- test: expect errors", "fine : Int", "fine = 1", ""].join("\n"));
+writeFileSync(join(work, "below.hf"), ["", "-- test: expect errors", "oops : Int", "oops = True", ""].join("\n"));
+const wanted = heff("test", "p.hf", "wants.hf");
+expect("test, a file that expects errors and has them", wanted.status === 0 &&
+  wanted.stdout.includes("ok    wants.hf  errors, as expected\n") &&
+  !(wanted.stdout + wanted.stderr).includes("E0314") &&
+  wanted.stdout.endsWith("\n3/3 expectations hold, 2/2 files check as they should (1 with expected errors)\n"), wanted);
+const unwanted = heff("test", "wants.hf", "checks.hf");
+expect("test, a file that expects errors but checks", unwanted.status === 1 &&
+  unwanted.stdout.includes("FAIL  checks.hf  checks, but expects errors\n") &&
+  unwanted.stdout.endsWith("files that do not check as they should:\n" +
+    "  checks.hf: checks, but its first line expects errors\n" +
+    "0/0 expectations hold, 1/2 files check as they should (1 with expected errors)\n"), unwanted);
+const below = heff("test", "below.hf");
+expect("test, `-- test: expect errors` not the first line", below.status === 1 &&
+  below.stdout.endsWith("  below.hf:4:8: error[E0314]: expected type Int, but got the tag True\n" +
+    "0/0 expectations hold, 0/1 files check as they should\n"), below);
 
 // fmt: --check names what is not laid out (and fails), leaves it; without
 // it, lays it out; a file that does not parse is refused, untouched

@@ -2082,12 +2082,66 @@ promoteCmd file = do
   cs <- Se.cachedProgram l
   promoteDiags file (badL > 0) cs
 
+-- | what testing files came to: how many files, of them how many
+-- | expect errors (and have them), the expectations and how many do
+-- | not hold, a line each for the files that do not check as they should
+-- | (where they first went wrong), the tests and how many fail
 type TestRes =
-  { total : Int
+  { files : Int
+  , expectErrors : Int
+  , total : Int
   , failed : Int
   , unchecked : List String
   , tests : Int
   , testsFailed : Int
+  }
+
+-- | nothing tested yet
+noRes : TestRes
+noRes =
+  { files = 0
+  , expectErrors = 0
+  , total = 0
+  , failed = 0
+  , unchecked = Nil
+  , tests = 0
+  , testsFailed = 0
+  }
+
+-- | what two runs came to, together
+addRes : TestRes -> TestRes -> TestRes
+addRes a b =
+  { files = a.files + b.files
+  , expectErrors = a.expectErrors + b.expectErrors
+  , total = a.total + b.total
+  , failed = a.failed + b.failed
+  , unchecked = List.append a.unchecked b.unchecked
+  , tests = a.tests + b.tests
+  , testsFailed = a.testsFailed + b.testsFailed
+  }
+
+-- (a file that does not check as it should, `why`)
+uncheckedRes : String -> TestRes
+uncheckedRes why =
+  { files = 1
+  , expectErrors = 0
+  , total = 0
+  , failed = 0
+  , unchecked = [why]
+  , tests = 0
+  , testsFailed = 0
+  }
+
+-- (a file that expects errors, and has them)
+expectedRes : TestRes
+expectedRes =
+  { files = 1
+  , expectErrors = 1
+  , total = 0
+  , failed = 0
+  , unchecked = Nil
+  , tests = 0
+  , testsFailed = 0
   }
 
 failLine : String -> Dr.TestReport -> Rp.Mismatch -> String
@@ -2224,16 +2278,18 @@ testReport : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{rep : Rp.report <: e}}
            -> String
-           -> Int
+           -> List String
            -> List Dr.TestReport
            -> List Dr.TestOutcome
            -> Co e TestRes
-testReport f bad ts os = do
+testReport f wrong ts os = do
   color <- Rp.useColor
   printFails f color (badReports ts)
   printOutcomes color os
   print
-      ((if List.null (badReports ts) && List.null (badOutcomes os) && bad == 0
+      ((if List.null (badReports ts)
+        && List.null (badOutcomes os)
+        && List.null wrong
           then "ok    "
         else "FAIL  ")
        ^ f
@@ -2243,34 +2299,97 @@ testReport f bad ts os = do
        ^ showInt (List.length ts)
        ^ testsSaid os)
   pure
-      { total = List.length ts
+      { files = 1
+      , expectErrors = 0
+      , total = List.length ts
       , failed = List.length (badReports ts)
-      , unchecked = if bad == 0 then Nil else [f]
+      , unchecked = wrong
       , tests = List.length os
       , testsFailed = List.length (badOutcomes os)
       }
+
+-- (the first error of the modules checked, where it is)
+firstErrorOf : List Dr.Checked -> Maybe String
+firstErrorOf Nil = Nothing
+firstErrorOf (Cons c rest) = case Dr.firstError c of
+  Just why -> Just why
+  Nothing -> firstErrorOf rest
+
+-- | the first thing wrong with a file, its line in `heff test`'s list of
+-- | the files that do not check: a module not loaded, else the first
+-- | error, `path:line:col: error[E…]: what`
+firstWrong : String -> List String -> List Dr.Checked -> String
+firstWrong f (Cons why _) cs = why
+firstWrong f Nil cs = fromMaybe (f ^ ": not checked") (firstErrorOf cs)
 
 testOneC : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{rep : Rp.report <: e}}
          -> Int
          -> String
-         -> Int
+         -> List String
          -> List Dr.Checked
          -> Co e TestRes
-testOneC seed f bad0 cs = do
+testOneC seed f loadErrs cs = do
   bad <- diagCount cs
   case Dr.lastChecked cs of
     Nothing -> do
       print ("FAIL  " ^ f ^ "  0/0")
-      pure
-          { total = 0, failed = 0, unchecked = [f], tests = 0, testsFailed = 0 }
+      pure (uncheckedRes (firstWrong f loadErrs cs))
     Just c ->
       testReport
         f
-        (bad0 + bad)
+        (if List.null loadErrs && bad == 0 then Nil
+         else [firstWrong f loadErrs cs])
         (Dr.testFile c)
-        (if bad0 + bad > 0 then Nil else Dr.runTests seed c)
+        (if List.null loadErrs && bad == 0 then Dr.runTests seed c else Nil)
+
+-- | the line that, the first of a file, says that the file is to report
+-- | errors (a test of them): `heff test` passes it if it does, fails it
+-- | if it checks, and says nothing of its errors
+expectErrorsLine : String
+expectErrorsLine = "-- test: expect errors"
+
+-- | does the file's first line say it expects errors
+-- | >>> List.map expectsErrors ["-- test: expect errors\nx = y\n", "-- test: expect errors", "x : Int\n-- test: expect errors\n", ""]
+-- | [True, True, False, False]
+expectsErrors : String -> Bool
+expectsErrors src =
+  strEq
+    (strSlice src 0 (fromMaybe (strLength src) (indexOf "\n" src)))
+    expectErrorsLine
+
+-- (a file that expects errors: whether it has some)
+testExpecting : {e : HFunctor}
+              -> {{io : stdio <: e}}
+              -> String
+              -> Bool
+              -> Co e TestRes
+testExpecting f True = do
+  print ("ok    " ^ f ^ "  errors, as expected")
+  pure expectedRes
+testExpecting f False = do
+  print ("FAIL  " ^ f ^ "  checks, but expects errors")
+  pure (uncheckedRes (f ^ ": checks, but its first line expects errors"))
+
+-- (a file loaded, tested: one that expects errors held to having some)
+testLoaded : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : fs <: e}}
+           -> {{rep : Rp.report <: e}}
+           -> Int
+           -> String
+           -> Bool
+           -> L.Loaded
+           -> Co e TestRes
+testLoaded seed f True l = do
+  cs <- Se.cachedProgram l
+  testExpecting f (not (List.null l.errors) || anyErrors cs)
+testLoaded seed f False l = do
+  badL <- printErrs "heff" l.errors 0
+  cs <- Se.cachedProgram l
+  testOneC seed f l.errors cs
 
 testOneF : {e : HFunctor}
          -> {{io : stdio <: e}}
@@ -2281,10 +2400,9 @@ testOneF : {e : HFunctor}
          -> String
          -> Co e TestRes
 testOneF seed f = do
+  src <- readFile f
   l <- load f
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  testOneC seed f badL cs
+  testLoaded seed f (expectsErrors (fromMaybe "" src)) l
 
 -- (the tests' part of the last line: said only if there were some)
 testsHeld : Int -> Int -> String
@@ -2292,14 +2410,28 @@ testsHeld tests failed =
   if tests == 0 then ""
   else ", " ^ showInt (tests - failed) ^ "/" ^ showInt tests ^ " tests hold"
 
--- (the files that did not check, named in the last line if there were
--- some, as the counts of what held do not say it, and their FAIL lines
--- may be far above)
-uncheckedSaid : List String -> String
-uncheckedSaid Nil = ""
-uncheckedSaid (Cons f Nil) = ", 1 file does not check: " ^ f
-uncheckedSaid fs =
-  ", " ^ showInt (List.length fs) ^ " files do not check: " ^ joinWith ", " fs
+-- (the files' part of the last line: how many check as they should --
+-- those that expect errors by having some -- of how many)
+filesSaid : TestRes -> String
+filesSaid r =
+  ", "
+  ^ showInt (r.files - List.length r.unchecked)
+  ^ "/"
+  ^ showInt r.files
+  ^ " files check as they should"
+  ^ (if r.expectErrors == 0 then ""
+     else " (" ^ showInt r.expectErrors ^ " with expected errors)")
+
+-- (the files that do not check as they should, a line each, where each
+-- first went wrong, as their FAIL lines may be far above)
+printUnchecked : {e : HFunctor}
+               -> {{io : stdio <: e}}
+               -> List String
+               -> Co e Unit
+printUnchecked Nil = pure MkUnit
+printUnchecked ws = do
+  print "files that do not check as they should:"
+  printLines (List.map (\w -> "  " ^ w) ws)
 
 -- (the `.hf` files under the paths, the directories walked; a name
 -- starting with `.`, and a directory below them that is a project of its
@@ -2365,13 +2497,14 @@ testCmd : {e : HFunctor}
         -> Co e Unit
 testCmd tk seed Nil acc = do
   Pg.end tk
+  printUnchecked acc.unchecked
   print
       (showInt (acc.total - acc.failed)
        ^ "/"
        ^ showInt acc.total
        ^ " expectations hold"
        ^ testsHeld acc.tests acc.testsFailed
-       ^ uncheckedSaid acc.unchecked)
+       ^ filesSaid acc)
   if acc.failed > 0 || acc.testsFailed > 0 || not (List.null acc.unchecked)
       then exit 1
     else pure MkUnit
@@ -2379,16 +2512,7 @@ testCmd tk seed (Cons f rest) acc = do
   ft <- Pg.start tk f 0
   r <- testOneF seed f
   Pg.end ft
-  testCmd
-      tk
-      seed
-      rest
-      { total = acc.total + r.total
-      , failed = acc.failed + r.failed
-      , unchecked = List.append acc.unchecked r.unchecked
-      , tests = acc.tests + r.tests
-      , testsFailed = acc.testsFailed + r.testsFailed
-      }
+  testCmd tk seed rest (addRes acc r)
 
 -- | `heff test`: the watches' expectations of the files checked, and
 -- | their tests run (each property from `seed`), a task meanwhile, each
@@ -2404,11 +2528,7 @@ testsCmd : {e : HFunctor}
          -> Co e Unit
 testsCmd seed files = do
   tk <- Pg.start Pg.root "testing" (List.length files)
-  testCmd
-      tk
-      seed
-      files
-      { total = 0, failed = 0, unchecked = Nil, tests = 0, testsFailed = 0 }
+  testCmd tk seed files noRes
 
 -- | the seed the properties are run from, unless `--seed` gives one:
 -- | always the same, so that a run of the tests is a run of the same
@@ -2571,14 +2691,7 @@ testAll : {e : HFunctor}
 testAll Nil acc = pure acc
 testAll (Cons f rest) acc = do
   r <- testOneF defaultSeed f
-  testAll
-      rest
-      { total = acc.total + r.total
-      , failed = acc.failed + r.failed
-      , unchecked = List.append acc.unchecked r.unchecked
-      , tests = acc.tests + r.tests
-      , testsFailed = acc.testsFailed + r.testsFailed
-      }
+  testAll rest (addRes acc r)
 
 publishFails : {e : HFunctor}
              -> {{io : stdio <: e}}
@@ -2658,10 +2771,7 @@ publishGit v pk src = do
       then publishFails ("v" ^ v ^ " is tagged already")
     else do
       files <- hfFilesGo [src] Nil
-      r <-
-        testAll
-          files
-          { total = 0, failed = 0, unchecked = Nil, tests = 0, testsFailed = 0 }
+      r <- testAll files noRes
       publishTested v pk r
 
 publishChecked : {e : HFunctor}

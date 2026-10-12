@@ -92,3 +92,44 @@ given by hand.  `agree` runs a program of commands on a system and on a
 model of it and compares what they observe; drawn by a property, the
 program shrinks to a short one that tells them apart
 (`test/check/map.hf` holds `lib/map.hf` to a list of pairs).
+
+## Files that expect errors
+
+A file written to be wrong -- a test of what heff says of an error,
+as those of `test/errors/` are -- says so on its first line:
+
+```haskell
+-- test: expect errors
+-- a type defined as itself
+
+a : Type
+a = a
+```
+
+`heff test` then holds it to having errors, and says nothing of them:
+it passes if it has some, and fails if it checks.  The line counts only
+as the file's first; anywhere else it is a comment like another.  (What
+the errors say is held by `test/golden.mjs`, against `test/golden/`.)
+
+## The report
+
+`heff test` says a line for each file, `ok` or `FAIL`, with how many of
+its expectations hold (and of its tests, if it has some), or `errors, as
+expected` for a file that expects them; each expectation or test that
+fails is shown above its file's line, and each error of a file that does
+not check is said on the standard error.  Then, if some files do not
+check as they should, it lists them, a line each, where each first went
+wrong -- its first error, as `path:line:col: error[E…]: what it says`,
+a module it imports that is not there, or that it checks though it
+expects errors.  The last line adds it up:
+
+```
+ok    test/errors/rec.hf  errors, as expected
+FAIL  test/surface/oops.hf  0/0
+files that do not check as they should:
+  test/surface/oops.hf:5:8: error[E0314]: expected type Int, but got the tag True
+485/485 expectations hold, 24/24 tests hold, 194/195 files check as they should (50 with expected errors)
+```
+
+It exits 1 if an expectation does not hold, a test fails, or a file does
+not check as it should.
