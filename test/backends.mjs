@@ -318,7 +318,7 @@ if (process.platform !== "win32") checks.push((async () => {
   // (the same, from a green thread scheduled by std.reactor: libcurl's
   // multi interface)
   {
-    const p = await programs.c("test/node/fetched.hf", "multi");
+    const p = await program("test/node/fetched.hf", "multi");
     if (p.error !== undefined) msgs.push(`FAIL http, multi (c): not compiled\n${p.error}`);
     else {
       const r = await run(p.cmd, [at, `http://127.0.0.1:${refused}/`], { timeout: 60000 });
@@ -391,7 +391,7 @@ if (process.platform !== "win32") checks.push((async () => {
 // thread of the system), and run again.
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
-  const p = await programs.c("test/node/green-sockets.hf", "main");
+  const p = await program("test/node/green-sockets.hf", "main");
   if (p.error !== undefined) return [`FAIL green sockets (c): not compiled\n${p.error}`];
   const bins = [p.cmd];
   if (process.env.HEFF_TSAN) {
@@ -441,7 +441,7 @@ if (process.platform !== "win32") checks.push((async () => {
   const listening = (s) => new Promise((ok) => s.listen(0, "127.0.0.1", () => ok(s.address().port)));
   const port = await listening(server);
   const [refused] = await freePorts(1);
-  const p = await programs.c("test/node/green-http.hf", "main");
+  const p = await program("test/node/green-http.hf", "main");
   if (p.error !== undefined) msgs.push(`FAIL green http (c): not compiled\n${p.error}`);
   else {
     const t = Date.now();
@@ -454,7 +454,7 @@ if (process.platform !== "win32") checks.push((async () => {
       msgs.push(`FAIL green http (c): ${n} requests of ${delay} ms each took ${took} ms, not at once`);
   }
   server.close();
-  const self = await programs.c("test/node/green-http.hf", "self");
+  const self = await program("test/node/green-http.hf", "self");
   if (self.error !== undefined) msgs.push(`FAIL green http, self (c): not compiled\n${self.error}`);
   else {
     const r = await run(self.cmd, [], { timeout: 60000 });
@@ -468,15 +468,9 @@ if (process.platform !== "win32") checks.push((async () => {
 // connection, forty clients holding theirs open at once, each answered
 // (a server of one connection at a time never answers the second), then
 // asked again on the same connection
-if (process.platform !== "win32") checks.push((async () => {
-  const p = await programs.c("test/node/green-served.hf", "main");
-  if (p.error !== undefined) return [`FAIL green server (c): not compiled\n${p.error}`];
-  const r = await run(p.cmd, [], { timeout: 60000 });
-  const want = "first requests answered, every connection held open: 40\n"
-    + "second requests answered, on the same connections: 40\nmain done\n";
-  return r.status === 0 && !r.stderr && r.stdout === want ? []
-    : [`FAIL green server (c): status ${r.status}\n${r.stdout}${r.stderr}`];
-})());
+if (process.platform !== "win32") checks.push(ran("green server", "test/node/green-served.hf", "main", [],
+  { out: "first requests answered, every connection held open: 40\n"
+    + "second requests answered, on the same connections: 40\nmain done\n", status: 0 }));
 
 // an HTTP server over them, by C alone (std.http.server): asked by
 // std.http's client in the same program, a thread of its own; and by
