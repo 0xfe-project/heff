@@ -149,8 +149,11 @@ typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
 typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
 // (a string written in the program, static: its `n` bytes, as a C string
 // literal has them -- the NUL C ends it with, after them, no byte of it)
-#define HEFF_LIT(name, n, bytes) \
-  static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n) + 1]; } name = {{0x80000000u, K_STR, 0}, n, n, bytes}
+#define HEFF_STATIC_STR(name, kind, n, bytes) \
+  static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n) + 1]; } name = {{0x80000000u, kind, 0}, n, n, bytes}
+#define HEFF_LIT(name, n, bytes) HEFF_STATIC_STR(name, K_STR, n, bytes)
+// (`Bytes` written in the program, `b"..."`, static as a string is)
+#define HEFF_BYTES(name, n, bytes) HEFF_STATIC_STR(name, K_BYT, n, bytes)
 typedef struct { Obj h; double d; } Flt;
 typedef struct { Obj h; int64_t n; V a[]; } Arr;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Bnc;

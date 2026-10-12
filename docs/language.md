@@ -372,16 +372,36 @@ string's, `strSlice`: clamped, a negative index from the end),
 `toValid` makes a string), `eq` and its instance, `equalityBytes`, and
 `show`, which writes them as `b"..."`: a byte of ASCII that is printed
 as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any other
-byte `\xff`.  No literal is of type `Bytes`; the tools show one as
-`show` does.
+byte `\xff`.
+
+So a literal writes them: `b` right before a string, where a token
+starts (`b "x"` is a name and a string, and so is `ab"x"`), read as a
+string is, its escapes alike -- `b"GET \xff\r\n"`.  A character as it
+is written is its UTF-8 bytes, as in a string (`b"é"` is two), `\xff`
+a byte, any, and `\u{...}` its code point's UTF-8 bytes too (`b"\u{e9}"`
+is `b"\xc3\xa9"`), a Unicode scalar value as a string's is.  What
+`show` writes is a literal of the same bytes, and the tools show a
+`Bytes` as `show` does.  A literal is a `Bytes` whatever it is checked
+at, and a pattern too, compared by bytes.  A C program has it as a
+static object, as it has a string literal; a JavaScript one makes a
+`Uint8Array` of its bytes.
 
 ```haskell
 import bytes as Bytes
 
 -- | >>> Bytes.show (greeting "hé")
 -- | "b\"hi h\\xc3\\xa9\""
+-- | >>> greeting "hé" == b"hi h\u{e9}"
+-- | True
 greeting : String -> Bytes
-greeting name = Bytes.append (Bytes.fromList [104, 105, 32]) (Bytes.fromString name)
+greeting name = Bytes.append b"hi " (Bytes.fromString name)
+
+-- | >>> List.map method [b"GET", Bytes.fromString "PUT"]
+-- | [Just "get", Nothing]
+method : Bytes -> Maybe String
+method b"GET" = Just "get"
+method b"POST" = Just "post"
+method _ = Nothing
 ```
 
 A C program keeps them as a buffer of bytes, a JavaScript one as a
