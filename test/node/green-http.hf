@@ -1,0 +1,142 @@
+-- std.http's requests from green threads, scheduled by std.reactor:
+-- each pending while the others go on (libcurl's multi interface).  By
+-- C alone (test/backends.mjs).
+--
+--   main BASE N REFUSED   N requests of BASE/item/I at once, from a
+--                         thread each, to a server that takes its time
+--                         over each (the test's): all of them in about
+--                         the time of one; and one to a port nothing
+--                         listens on, refused, while they wait
+--   self                  this program's own server (serveConcurrently)
+--                         asked by ten threads at once, std.net's and
+--                         libcurl's sockets waited on together
+
+import co
+import green
+import std.http as Http
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.process
+import std.reactor as Reactor
+
+world : HFunctor
+world = stdio <+> (Http.http <+> (Net.net <+> (Reactor.reactor <+> process)))
+
+repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
+repeatG 0 c = pure MkUnit
+repeatG n c = bind c (\u -> repeatG (n - 1) c)
+
+-- (n strings received on ch... as Ints: their sum)
+recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum ch 0 acc = pure acc
+recvSum ch n acc = do
+  x <- recv ch
+  recvSum ch (n - 1) (acc + x)
+
+-- (what came back, as the test checks it: 1 where it is the item's)
+itemIs : Int -> Either Http.HttpError String -> Int
+itemIs i (Right t) = if strEq t ("item " ^ showInt i ^ "\n") then 1 else 0
+itemIs i (Left err) = 0
+
+-- (a thread fetching item i, saying on `back` whether it came)
+fetcher : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{web : Http.http <: e}}
+        -> String
+        -> Int
+        -> Int
+        -> Co e Unit
+fetcher base back i = do
+  r <- Http.getText (base ^ "/item/" ^ showInt i)
+  send back (itemIs i r)
+
+-- (where no response came: curl's code)
+codeOf : Either Http.HttpError Http.Response -> String
+codeOf (Left err) = "code " ^ showInt err.code
+codeOf (Right r) = "status " ^ showInt r.status
+
+fetches : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{io : stdio <: e}}
+        -> {{web : Http.http <: e}}
+        -> String
+        -> Int
+        -> Int
+        -> Co e Unit
+fetches base n refused = do
+  back <- newChan
+  repeatG n (bind newChan (\i -> spawn (fetcher base back i)))
+  r <- Http.get ("http://127.0.0.1:" ^ showInt refused ^ "/")
+  print ("refused, while the others wait: " ^ codeOf r)
+  got <- recvSum back n 0
+  print ("items fetched at once: " ^ showInt got)
+
+-- (the arguments: BASE N REFUSED)
+argsOf : List String -> Maybe (Pair String (Pair Int Int))
+argsOf (b :: n :: r :: _) =
+  Just (MkPair b (MkPair (fromMaybe 0 (parseInt n)) (fromMaybe 1 (parseInt r))))
+argsOf _ = Nothing
+
+ran : {e : HFunctor} -> {{io : stdio <: e}} -> Maybe Unit -> Co e Unit
+ran r = print (maybe "a deadlock" (\u -> "main done") r)
+
+main : Co world Unit
+main = do
+  as <- args (ev := \p -> InR (InR (InR (InR p))))
+  case argsOf as of
+    Just (MkPair b (MkPair n r)) -> do
+      done <-
+        Reactor.scheduled
+          world
+          (rx := \p -> InR (InR (InR (InL p))))
+          (fetches
+             (gr := \p -> InL p)
+             (io := \p -> InR (InL p))
+             (web := \p -> InR (InR (InL p)))
+             b
+             n
+             r)
+      ran (io := \p -> InL p) done
+    Nothing -> printErr (ev := \p -> InL p) "main BASE N REFUSED"
+
+-- This program's own server
+--------------------------------------------------------------------------------
+
+-- (the value of a `Right`; where there is none, the program abandoned)
+must : {a : Type} -> Either Net.NetError a -> a
+must (Right x) = x
+must (Left err) = abandon
+
+-- (each item answered as the server of the test's answers it)
+item : {e : HFunctor} -> Server.Request -> Co e Http.Response
+item r = pure (Server.plain 200 ("item " ^ strSlice r.target 6 (strLength r.target) ^ "\n"))
+
+asked : {e : HFunctor}
+      -> {{gr : green <: e}}
+      -> {{io : stdio <: e}}
+      -> {{web : Http.http <: e}}
+      -> {{nt : Net.net <: e}}
+      -> Co e Unit
+asked = do
+  l <- Net.listen "127.0.0.1" 0 64
+  at <- Net.local (must l)
+  spawn (bind (Server.serveConcurrently (must l) item) (\err -> pure MkUnit))
+  back <- newChan
+  let base = "http://127.0.0.1:" ^ showInt (must at).port
+  repeatG 10 (bind newChan (\i -> spawn (fetcher base back i)))
+  got <- recvSum back 10 0
+  print ("asked of its own server, at once: " ^ showInt got)
+
+self : Co world Unit
+self = do
+  done <-
+    Reactor.scheduled
+      world
+      (rx := \p -> InR (InR (InR (InL p))))
+      (asked
+         (gr := \p -> InL p)
+         (io := \p -> InR (InL p))
+         (web := \p -> InR (InR (InL p)))
+         (nt := \p -> InR (InR (InR (InL p)))))
+  ran (io := \p -> InL p) done

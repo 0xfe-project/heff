@@ -209,8 +209,9 @@ checks.push((async () => {
 checks.push(ran("sleep", "test/node/timed.hf", "timed", [], { out: "slept\n", status: 0 }));
 
 // the HTTP client, by C alone (std.http): a server of the test's own,
-// sent requests by libcurl in the process and by the curl spawned
-// (`-DHEFF_HTTP_SPAWN`), the same from each -- a response, whatever its
+// sent requests by libcurl in the process, by the curl spawned
+// (`-DHEFF_HTTP_SPAWN`) and by libcurl's multi interface (a green
+// thread of std.reactor's), the same from each -- a response, whatever its
 // status; why none came, curl's code and what it says -- and each as
 // wanted (where it is curl's version's to say, the start of it).  Run
 // again with no curl on the PATH, libcurl's the same still: it is in
@@ -314,6 +315,17 @@ if (process.platform !== "win32") checks.push((async () => {
       outs[how] = r.stdout.replace(/ after \d+ (ms|milliseconds)/g, " after N $1");
     }
   }
+  // (the same, from a green thread scheduled by std.reactor: libcurl's
+  // multi interface)
+  {
+    const p = await programs.c("test/node/fetched.hf", "multi");
+    if (p.error !== undefined) msgs.push(`FAIL http, multi (c): not compiled\n${p.error}`);
+    else {
+      const r = await run(p.cmd, [at, `http://127.0.0.1:${refused}/`], { timeout: 60000 });
+      if (r.status !== 0 || r.stderr) msgs.push(`FAIL http, multi (c): status ${r.status}\n${r.stderr}`);
+      else outs["libcurl's multi, a green thread"] = r.stdout.replace(/ after \d+ (ms|milliseconds)/g, " after N $1");
+    }
+  }
   for (const how of Object.keys(outs).slice(1))
     if (outs[how] !== outs.libcurl) msgs.push(`FAIL http, ${how} (c): not as libcurl's\n${curt(outs[how])}\n${curt(outs.libcurl)}`);
   server.close();
@@ -410,6 +422,44 @@ if (process.platform !== "win32") checks.push((async () => {
     const r = await run(bin, [String(refused)], { timeout: 60000 });
     if (r.status !== 0 || r.stderr || r.stdout !== want)
       msgs.push(`FAIL green sockets (${basename(bin)}): status ${r.status}\n${r.stdout}${r.stderr}`);
+  }
+  return msgs;
+})());
+
+// std.http's requests from green threads, by C alone: ten at once, to a
+// server that takes half a second over each, all done in about the time
+// of one (one after another, five seconds), and one refused while they
+// wait; and ten asked of the program's own server, std.net's sockets
+// and libcurl's waited on together
+if (process.platform !== "win32") checks.push((async () => {
+  const msgs = [];
+  const delay = 500, n = 10;
+  const server = createServer((q, r) => {
+    const i = q.url.replace(/^\/item\//, "");
+    setTimeout(() => { r.writeHead(200, { "Content-Type": "text/plain" }); r.end(`item ${i}\n`); }, delay);
+  });
+  const listening = (s) => new Promise((ok) => s.listen(0, "127.0.0.1", () => ok(s.address().port)));
+  const port = await listening(server);
+  const [refused] = await freePorts(1);
+  const p = await programs.c("test/node/green-http.hf", "main");
+  if (p.error !== undefined) msgs.push(`FAIL green http (c): not compiled\n${p.error}`);
+  else {
+    const t = Date.now();
+    const r = await run(p.cmd, [`http://127.0.0.1:${port}`, String(n), String(refused)], { timeout: 60000 });
+    const took = Date.now() - t;
+    const want = `refused, while the others wait: code 7\nitems fetched at once: ${n}\nmain done\n`;
+    if (r.status !== 0 || r.stderr || r.stdout !== want)
+      msgs.push(`FAIL green http (c): status ${r.status}\n${r.stdout}${r.stderr}`);
+    else if (took > (n * delay) / 2)
+      msgs.push(`FAIL green http (c): ${n} requests of ${delay} ms each took ${took} ms, not at once`);
+  }
+  server.close();
+  const self = await programs.c("test/node/green-http.hf", "self");
+  if (self.error !== undefined) msgs.push(`FAIL green http, self (c): not compiled\n${self.error}`);
+  else {
+    const r = await run(self.cmd, [], { timeout: 60000 });
+    if (r.status !== 0 || r.stderr || r.stdout !== "asked of its own server, at once: 10\nmain done\n")
+      msgs.push(`FAIL green http, self (c): status ${r.status}\n${r.stdout}${r.stderr}`);
   }
   return msgs;
 })());

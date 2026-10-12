@@ -364,6 +364,20 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
 #define HTTP_OPT_HEADERFUNCTION 20079
 #define HTTP_OPT_POSTFIELDSIZE_LARGE 30120
 #define HTTP_INFO_CONTENT_LENGTH_DOWNLOAD_T (0x600000 + 15)
+#define HTTP_OPT_PRIVATE 10103
+#define HTTP_INFO_PRIVATE (0x100000 + 21)
+#define HTTP_MOPT_SOCKETFUNCTION 20001
+#define HTTP_MOPT_SOCKETDATA 10002
+#define HTTP_MOPT_TIMERFUNCTION 20004
+#define HTTP_MOPT_TIMERDATA 10005
+#define HTTP_POLL_IN 1
+#define HTTP_POLL_OUT 2
+#define HTTP_POLL_REMOVE 4
+#define HTTP_CSELECT_IN 1
+#define HTTP_CSELECT_OUT 2
+#define HTTP_CSELECT_ERR 4
+#define HTTP_SOCKET_TIMEOUT (-1)
+#define HTTP_MSG_DONE 1
 #define HTTP_ERROR_SIZE 256
 
 // (a body said to be no longer than this is given room for all of it at
@@ -383,6 +397,13 @@ static struct {
   void (*slist_free_all)(void *);
   int (*getinfo)(void *, int, ...);   // (may be missing)
   const char *(*version)(void);       // (may be missing)
+  // (the multi interface, for green threads: may be missing)
+  void *(*multi_init)(void);
+  int (*multi_setopt)(void *, int, ...);
+  int (*multi_add)(void *, void *);
+  int (*multi_remove)(void *, void *);
+  int (*multi_action)(void *, int, int, int *);
+  void *(*multi_info)(void *, int *);
 } http_lc;
 static int http_lc_ok;
 // (the user agent curl's tool says, `curl/VERSION`; "" where unknown)
@@ -436,6 +457,12 @@ static void http_load(void) {
   HTTP_SYM(slist_free_all, "curl_slist_free_all");
   HTTP_SYM(getinfo, "curl_easy_getinfo");
   HTTP_SYM(version, "curl_version");
+  HTTP_SYM(multi_init, "curl_multi_init");
+  HTTP_SYM(multi_setopt, "curl_multi_setopt");
+  HTTP_SYM(multi_add, "curl_multi_add_handle");
+  HTTP_SYM(multi_remove, "curl_multi_remove_handle");
+  HTTP_SYM(multi_action, "curl_multi_socket_action");
+  HTTP_SYM(multi_info, "curl_multi_info_read");
 #undef HTTP_SYM
   if (!http_lc.global_init || !http_lc.easy_init || !http_lc.easy_cleanup || !http_lc.easy_reset
       || !http_lc.setopt || !http_lc.perform || !http_lc.strerror || !http_lc.slist_append
@@ -454,11 +481,21 @@ static void http_load(void) {
   http_lc_ok = 1;
 }
 
-// (this thread's handle -- or NULL, libcurl not to be used)
-static HttpEasy *http_mine(void) {
+// (libcurl found and ready, once: whether it is to be used)
+static int http_loaded(void) {
 #ifdef HEFF_THREADS
   pthread_once(&http_once, http_load);
-  if (!http_lc_ok) return NULL;
+#else
+  static int loaded;
+  if (!loaded) { loaded = 1; http_load(); }
+#endif
+  return http_lc_ok;
+}
+
+// (this thread's handle -- or NULL, libcurl not to be used)
+static HttpEasy *http_mine(void) {
+  if (!http_loaded()) return NULL;
+#ifdef HEFF_THREADS
   HttpEasy *e = pthread_getspecific(http_key);
   if (!e) {
     e = calloc(1, sizeof *e);
@@ -466,9 +503,6 @@ static HttpEasy *http_mine(void) {
     if (pthread_setspecific(http_key, e) != 0) { free(e); return NULL; }
   }
 #else
-  static int loaded;
-  if (!loaded) { loaded = 1; http_load(); }
-  if (!http_lc_ok) return NULL;
   HttpEasy *e = &http_easy;
 #endif
   pid_t me = getpid();
@@ -516,23 +550,15 @@ static size_t http_head_sink(char *p, size_t size, size_t n, void *u) {
   return size * n;
 }
 
-// (the request, by libcurl: 1, done, in `g`; 0, nothing done, where
-// libcurl is not to be used)
-static int http_curl(HttpReq *q, HttpGot *g) {
-  HttpEasy *e = http_mine();
-  if (!e) return 0;
-  void *h = e->h, *list = NULL;
-  for (int i = 0; i < q->nh; i++) {
-    void *more = http_lc.slist_append(list, q->hs[i]);
-    if (!more) { http_lc.slist_free_all(list); return 0; }
-    list = more;
-  }
-  HttpSink sink = { &g->body, h, 0 };
+// (the handle `h` set up for the request, as the tool sets its own --
+// its body to `sink`, its headers to `g`, its headers sent `list`, why
+// it failed to `err` -- from reset: 0, or 1 where libcurl refused it)
+static int http_setup(void *h, HttpReq *q, HttpGot *g, HttpSink *sink, void *list, char *err) {
   http_lc.easy_reset(h);
-  int bad = http_lc.setopt(h, HTTP_OPT_ERRORBUFFER, e->err) != 0
+  int bad = http_lc.setopt(h, HTTP_OPT_ERRORBUFFER, err) != 0
     || http_lc.setopt(h, HTTP_OPT_URL, q->url) != 0
     || http_lc.setopt(h, HTTP_OPT_WRITEFUNCTION, http_sink) != 0
-    || http_lc.setopt(h, HTTP_OPT_WRITEDATA, &sink) != 0
+    || http_lc.setopt(h, HTTP_OPT_WRITEDATA, sink) != 0
     || http_lc.setopt(h, HTTP_OPT_HEADERFUNCTION, http_head_sink) != 0
     || http_lc.setopt(h, HTTP_OPT_HEADERDATA, &g->head) != 0
     || http_lc.setopt(h, HTTP_OPT_HTTPHEADER, list) != 0
@@ -545,31 +571,305 @@ static int http_curl(HttpReq *q, HttpGot *g) {
     || (q->timeout > 0 && http_lc.setopt(h, HTTP_OPT_TIMEOUT_MS, (long)q->timeout) != 0);
   if (bad) {
     http_lc.easy_reset(h);
-    http_lc.slist_free_all(list);
-    return 0;
+    return 1;
   }
   // (as the tool has them; what an older libcurl has not, it goes without)
   http_lc.setopt(h, HTTP_OPT_BUFFERSIZE, 102400L);
   http_lc.setopt(h, HTTP_OPT_TCP_KEEPALIVE, 1L);
   http_lc.setopt(h, HTTP_OPT_NOSIGNAL, 1L);
   if (http_agent[0]) http_lc.setopt(h, HTTP_OPT_USERAGENT, http_agent);
-  e->err[0] = 0;
+  err[0] = 0;
+  return 0;
+}
+
+// (the request's headers, as libcurl takes them; NULL, with `*ok` 0,
+// where it could not)
+static void *http_list(HttpReq *q, int *ok) {
+  void *list = NULL;
+  *ok = 1;
+  for (int i = 0; i < q->nh; i++) {
+    void *more = http_lc.slist_append(list, q->hs[i]);
+    if (!more) {
+      http_lc.slist_free_all(list);
+      *ok = 0;
+      return NULL;
+    }
+    list = more;
+  }
+  return list;
+}
+
+// (what libcurl's code `r` comes to, in `g`)
+static void http_ended(HttpGot *g, int r, const char *err) {
+  if (r == 0) {
+    g->ok = 1;
+    return;
+  }
+  g->body.n = 0;
+  g->code = r;
+  const char *why = err[0] ? err : http_lc.strerror(r);
+  buf_str(&g->why, why ? why : "");
+}
+
+// (the request, by libcurl: 1, done, in `g`; 0, nothing done, where
+// libcurl is not to be used)
+static int http_curl(HttpReq *q, HttpGot *g) {
+  HttpEasy *e = http_mine();
+  if (!e) return 0;
+  void *h = e->h;
+  int ok;
+  void *list = http_list(q, &ok);
+  if (!ok) return 0;
+  HttpSink sink = { &g->body, h, 0 };
+  if (http_setup(h, q, g, &sink, list, e->err)) {
+    http_lc.slist_free_all(list);
+    return 0;
+  }
   int r = http_lc.perform(h);
   // (nothing of this call's left where the handle points)
   http_lc.easy_reset(h);
   http_lc.slist_free_all(list);
-  if (r == 0) {
-    g->ok = 1;
-    return 1;
-  }
-  g->body.n = 0;
-  g->code = r;
-  const char *why = e->err[0] ? e->err : http_lc.strerror(r);
-  buf_str(&g->why, why ? why : "");
+  http_ended(g, r, e->err);
   return 1;
+}
+
+// Green threads: libcurl's multi interface
+// ---------------------------------------------------------------------
+//
+// Where a scheduler of std.reactor's runs (lib/c/runtime.c's reactor, a
+// group being started in), a request is a transfer of this thread's
+// multi handle, pending while the other green threads go on: its easy
+// handle added to the multi, the request's wait done when libcurl says
+// so.  The multi is a source of the reactor's: the sockets libcurl asks
+// to be watched (its socket function) and how long until it is to be
+// told the time is up (its timer function) are polled with the
+// reactor's others, and libcurl told of each ready, and of the time
+// (`curl_multi_socket_action`); a transfer done (`curl_multi_info_read`)
+// is its wait done.  Connections are the multi's, kept for the next
+// transfer; easy handles let go of are kept, a few, for the next.  Each
+// thread of the system has a multi of its own, made at its first such
+// request; one a process was forked with is the parent's, left as it
+// is.  Where libcurl has no multi interface, a request waits, as without
+// a scheduler.
+
+typedef struct {
+  HeffWait w;          // (first: a transfer is its wait, its `fd` -1:
+                       //  the multi's to say when it is done)
+  void *h;
+  void *list;
+  HttpReq q;
+  HttpGot g;
+  HttpSink sink;
+  char err[HTTP_ERROR_SIZE];
+  V held;              // (the operation: the request's body is its)
+  int result;
+} HttpTransfer;
+
+typedef struct { int fd; short events; } HttpWatched;
+
+// (this thread's multi: its sockets watched, the time it is to be
+// told of, easy handles kept)
+typedef struct {
+  void *multi;
+  pid_t pid;
+  HttpWatched *watched;
+  int nwatched, capwatched;
+  int64_t deadline;    // (ms of the monotonic clock; -1, none)
+  void *idle[8];
+  int nidle;
+  HeffSource source;
+} HttpMulti;
+
+static HEFF_TLS HttpMulti http_m;
+
+static int64_t http_now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+// (libcurl's word on a socket: watched for these, or no longer)
+static int http_socket_fn(void *easy, int fd, int what, void *u, void *sp) {
+  (void)easy; (void)u; (void)sp;
+  int i = 0;
+  while (i < http_m.nwatched && http_m.watched[i].fd != fd) i++;
+  if (what == HTTP_POLL_REMOVE) {
+    if (i < http_m.nwatched) http_m.watched[i] = http_m.watched[--http_m.nwatched];
+    return 0;
+  }
+  if (i == http_m.nwatched) {
+    if (http_m.nwatched == http_m.capwatched) {
+      int cap = http_m.capwatched ? http_m.capwatched * 2 : 16;
+      HttpWatched *m = heff_alloc(sizeof *m * (size_t)cap);
+      if (http_m.nwatched) memcpy(m, http_m.watched, sizeof *m * (size_t)http_m.nwatched);
+      free(http_m.watched);
+      http_m.watched = m;
+      http_m.capwatched = cap;
+    }
+    http_m.nwatched++;
+  }
+  http_m.watched[i].fd = fd;
+  http_m.watched[i].events = (short)(((what & HTTP_POLL_IN) ? POLLIN : 0) | ((what & HTTP_POLL_OUT) ? POLLOUT : 0));
+  return 0;
+}
+
+// (libcurl's word on its time: to be told in `ms`, or never, -1)
+static int http_timer_fn(void *multi, long ms, void *u) {
+  (void)multi; (void)u;
+  http_m.deadline = ms < 0 ? -1 : http_now() + ms;
+  return 0;
+}
+
+// (the source's descriptors, and how long at most to wait for them)
+static int http_fds(struct pollfd *p, int room, int *ms) {
+  if (room >= http_m.nwatched)
+    for (int i = 0; i < http_m.nwatched; i++) {
+      p[i].fd = http_m.watched[i].fd;
+      p[i].events = http_m.watched[i].events;
+    }
+  if (http_m.deadline >= 0) {
+    int64_t left = http_m.deadline - http_now();
+    *ms = left < 0 ? 0 : left > 1000000 ? 1000000 : (int)left;
+  }
+  return http_m.nwatched;
+}
+
+// (the transfers libcurl is done with: their waits done)
+static void http_finished(void) {
+  int left;
+  int *m;
+  while ((m = http_lc.multi_info(http_m.multi, &left))) {
+    // (a CURLMsg: its kind, its easy handle, its code)
+    struct { int msg; void *easy; union { void *p; int result; } data; } *msg = (void *)m;
+    if (msg->msg != HTTP_MSG_DONE) continue;
+    HttpTransfer *t = NULL;
+    http_lc.getinfo(msg->easy, HTTP_INFO_PRIVATE, &t);
+    if (!t) continue;
+    t->result = msg->data.result;
+    http_lc.multi_remove(http_m.multi, t->h);
+    heff_wait_done(&t->w);
+  }
+}
+
+// (after the poll: libcurl told of each socket ready, and of its time)
+static void http_ready(struct pollfd *p, int n) {
+  int running;
+  for (int i = 0; i < n; i++) {
+    if (!p[i].revents) continue;
+    // (a socket closed or failed is read from, or written to, as libcurl
+    // waits to: what it then finds is its to say, as when it polls itself)
+    int ev = ((p[i].revents & (POLLIN | POLLHUP | POLLERR)) ? HTTP_CSELECT_IN : 0)
+      | ((p[i].revents & (POLLOUT | POLLERR)) ? HTTP_CSELECT_OUT : 0)
+      | ((p[i].revents & POLLNVAL) ? HTTP_CSELECT_ERR : 0);
+    http_lc.multi_action(http_m.multi, p[i].fd, ev, &running);
+  }
+  if (http_m.deadline >= 0 && http_now() >= http_m.deadline) {
+    http_m.deadline = -1;
+    http_lc.multi_action(http_m.multi, HTTP_SOCKET_TIMEOUT, 0, &running);
+  }
+  http_finished();
+}
+
+// (this thread's multi, made at its first request: 0, or -1 where
+// there is none to be had)
+static int http_multi_mine(void) {
+  if (!http_loaded() || !http_lc.multi_init || !http_lc.multi_setopt || !http_lc.multi_add
+      || !http_lc.multi_remove || !http_lc.multi_action || !http_lc.multi_info || !http_lc.getinfo)
+    return -1;
+  pid_t me = getpid();
+  if (http_m.multi && http_m.pid == me) return 0;
+  // (none yet, or the parent's: one of this process's own)
+  void *m = http_lc.multi_init();
+  if (!m) return -1;
+  http_lc.multi_setopt(m, HTTP_MOPT_SOCKETFUNCTION, http_socket_fn);
+  http_lc.multi_setopt(m, HTTP_MOPT_SOCKETDATA, NULL);
+  http_lc.multi_setopt(m, HTTP_MOPT_TIMERFUNCTION, http_timer_fn);
+  http_lc.multi_setopt(m, HTTP_MOPT_TIMERDATA, NULL);
+  http_m.multi = m;
+  http_m.pid = me;
+  http_m.nwatched = 0;
+  http_m.deadline = -1;
+  http_m.nidle = 0;
+  http_m.source.fds = http_fds;
+  http_m.source.ready = http_ready;
+  heff_reactor_source(&http_m.source);
+  return 0;
+}
+
+// (the transfer's handle kept for the next, or let go of; and what it
+// held)
+static void http_transfer_free(HttpTransfer *t) {
+  if (t->h) {
+    http_lc.easy_reset(t->h);
+    if (http_m.nidle < (int)(sizeof http_m.idle / sizeof http_m.idle[0])) http_m.idle[http_m.nidle++] = t->h;
+    else http_lc.easy_cleanup(t->h);
+  }
+  if (t->list) http_lc.slist_free_all(t->list);
+  http_req_free(&t->q);
+  heff_drop(t->held);
+  free(t);
+}
+
+static V http_transfer_answer(HeffWait *w) {
+  HttpTransfer *t = (HttpTransfer *)w;
+  http_ended(&t->g, t->result, t->err);
+  V r = http_answer(&t->g);
+  http_transfer_free(t);
+  return r;
+}
+
+static void http_transfer_cancel(HeffWait *w) {
+  HttpTransfer *t = (HttpTransfer *)w;
+  if (!t->w.done) http_lc.multi_remove(http_m.multi, t->h);
+  free(t->g.head.s);
+  free(t->g.body.s);
+  free(t->g.why.s);
+  http_transfer_free(t);
+}
+
+// (never stepped: the multi says when it is done)
+static int http_transfer_step(HeffWait *w) {
+  (void)w;
+  return HEFF_STEP_WAIT;
+}
+
+// (the request `q` of the operation `p`, a transfer of this thread's
+// multi, pending: what `heff_outside` gives back; or 0, nothing done,
+// where there is no multi -- `q` and `p` the caller's again)
+static V http_transfer(HttpReq *q, V p, V f, V k) {
+  if (http_multi_mine() < 0) return 0;
+  void *h = http_m.nidle ? http_m.idle[--http_m.nidle] : http_lc.easy_init();
+  if (!h) return 0;
+  HttpTransfer *t = heff_alloc(sizeof *t);
+  memset(t, 0, sizeof *t);
+  t->h = h;
+  t->w.fd = -1;
+  t->w.step = http_transfer_step;
+  t->w.answer = http_transfer_answer;
+  t->w.cancel = http_transfer_cancel;
+  int ok;
+  t->list = http_list(q, &ok);
+  t->sink.b = &t->g.body;
+  t->sink.h = h;
+  if (!ok || http_setup(h, q, &t->g, &t->sink, t->list, t->err)
+      || http_lc.setopt(h, HTTP_OPT_PRIVATE, (void *)t) != 0
+      || http_lc.multi_add(http_m.multi, h) != 0) {
+    if (t->list) http_lc.slist_free_all(t->list);
+    http_lc.easy_reset(h);
+    if (http_m.nidle < (int)(sizeof http_m.idle / sizeof http_m.idle[0])) http_m.idle[http_m.nidle++] = h;
+    else http_lc.easy_cleanup(h);
+    free(t);
+    return 0;
+  }
+  // (the request and the operation the transfer's from now on)
+  t->q = *q;
+  memset(q, 0, sizeof *q);
+  t->held = p;
+  return heff_outside(&t->w, f, k);
 }
 #else
 static int http_curl(HttpReq *q, HttpGot *g) { (void)q; (void)g; return 0; }
+static V http_transfer(HttpReq *q, V p, V f, V k) { (void)q; (void)p; (void)f; (void)k; return 0; }
 #endif
 
 static V heff_provider_http(V p, V k) {
@@ -578,7 +878,13 @@ static V heff_provider_http(V p, V k) {
     V f = heff_dup(heff_field(p, 1));
     HttpReq q;
     HttpGot g = {0};
-    if (!http_req(heff_field(p, 0), &q)) {
+    int ok = http_req(heff_field(p, 0), &q);
+    // (under a scheduler, pending while the other green threads go on)
+    if (ok && heff_group) {
+      V r = http_transfer(&q, p, f, k);
+      if (r) return r;
+    }
+    if (!ok) {
       g.code = HTTP_BAD_ARGUMENT;
       buf_str(&g.why, "A libcurl function was given a bad argument");
     } else if (!http_curl(&q, &g)) {

@@ -114,7 +114,10 @@ It is libcurl, loaded into the process at the first request (no
 `-lcurl`), each thread a handle of its own whose connections are kept
 for the next request; where there is no libcurl (a static musl program,
 Windows), a `curl` spawned for each, given what libcurl is, so that
-either answers the same.  A body is sent with a `POST`, and with any
+either answers the same.  A green thread's request, scheduled by
+`Reactor.scheduled`, is a transfer of libcurl's multi interface,
+pending while the other threads go on, its answer the same (a `curl`
+spawned waits, every thread with it).  A body is sent with a `POST`, and with any
 method where it is not empty, with no `Content-Type` but the request's
 own.
 
@@ -282,7 +285,8 @@ On the C backend, `std.reactor` (`import std.reactor as Reactor`, its
 effect `Reactor.reactor` in the world) has them wait apart:
 `Reactor.scheduled e c` is `scheduledWith e Reactor.outside c`, where
 a thread whose `Net.read`, `Net.accept`, `Net.connect` or `Net.write`
-would wait is pending while the other threads go on, and goes on with its answer once it is done --
+would wait, or whose `Http.send` (`Http.get`, `Http.getText`) is
+under way, is pending while the other threads go on, and goes on with its answer once it is done --
 from the thread's own view the call returns its result, as it always
 did.  When no thread is ready, the scheduler waits for the first
 pending one to be done (the system's `poll`, of every socket waited
@@ -290,7 +294,7 @@ on); while threads are ready, every 64 turns it puts among them those
 done meanwhile.  A name that is no address (`localhost`, a host's) is
 resolved by a thread of the system of its own, the others going on.
 When main is done, what the other threads have pending is let go of:
-a connection being made closed.
+a connection being made closed, a request dropped.
 
 ```haskell
 import co
@@ -312,7 +316,8 @@ main = do
 
 How it is done -- an operation begun, pending, and finished later -- is
 the providers' ([providers.md](providers.md#outside-operations-done-later)):
-std.net's are, others' wait where they are, every thread with them.  It is one reactor for each thread of the system: green
+std.net's and std.http's are, others' wait where they are, every thread
+with them.  It is one reactor for each thread of the system: green
 threads in a thread of std.thread's are that thread's own
 ([threads.md](threads.md#green-threads-in-threads)).
 
