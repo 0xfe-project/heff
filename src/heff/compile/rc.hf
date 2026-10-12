@@ -38,6 +38,7 @@ import heff.compile.borrow as Bo
 import heff.compile.facts as F
 import heff.elab.fixed as Fx
 import heff.compile.imp as Mp
+import heff.compile.repr as Repr
 import map as M
 
 elemS : String -> List String -> Bool
@@ -68,18 +69,20 @@ data Drop = MkDrop String (Maybe Known)
 data Arg e = Given e | LentVar String (List Drop) | LentValue e
 
 -- | a condition, tested where it is (`e` a value): a comparison of
--- | operands, consumed (`CondRel`); a `Bool` looked at; not; a test of
--- | tests; a name bound in it, dropped where it is decided.  Of more than
--- | a comparison, its operands are lent: what it holds it holds after it
--- | on every path, however far it was looked at (see `condTest`)
+-- | operands, consumed (`CondRel`), or of unboxed ones (`CondRelU`, #39);
+-- | a `Bool` looked at; not; a test of tests; a name bound in it, its
+-- | drops where it is decided.  Of more than a comparison, its operands
+-- | are lent: what it holds it holds after it on every path, however far
+-- | it was looked at (see `condTest`)
 data Cond e
   = CondTrue
   | CondFalse
   | CondRel String (List e)
+  | CondRelU String (List e)
   | CondBool e
   | CondNot (Cond e)
   | CondIf (Cond e) (Cond e) (Cond e)
-  | CondLet String e (Cond e)
+  | CondLet String e (Cond e) (List Drop)
 
 -- | a value, made: each operand consumed (`RLocal`, a variable's
 -- | reference given; `RDup`, one more taken)
@@ -129,6 +132,16 @@ data Exp b
   -- | the `Bool` a condition is
   | RBool (Cond (Exp b))
   | RAbandon
+  -- | unboxed values (#39, heff.compile.repr): one made a `V`; a `V` made
+  -- | one, consumed (`RUnbox`) or looked at (`RPeek`); a primitive done
+  -- | on unboxed operands (as `Repr.primShape` says); a literal
+  | RBox Repr.Repr (Exp b)
+  | RUnbox Repr.Repr (Exp b)
+  | RPeek Repr.Repr (Exp b)
+  | RPrimU String (List (Exp b))
+  | RFixU Fx.Fixed Int
+  | RF32U Float64
+  | RF64U Float64
 
 -- | what a match's arm does with what it matched, given up: nothing (it
 -- | wants it, or it is lent); given up at once, the fields of the mask
@@ -177,11 +190,16 @@ type Test = Cond Value
 
 type CaseArm = Arm (List Statement)
 
--- | a definition: a function, its parameters, those lent, its body (its
--- | parameters not wanted dropped first); a value, its body
+type Statements = List Statement
+
+-- | a definition: a function, its parameters, those lent, what it does
+-- | where it is entered -- each parameter kept unboxed unboxed, the loop
+-- | going on after it -- and its body (its parameters not wanted dropped
+-- | first); a value, its body.  Each with its variables kept unboxed
+-- | (heff.compile.repr)
 data Def
-  = DFun String (List String) (List Int) (List Statement)
-  | DVal String (List Statement)
+  = DFun String (List String) (List Int) Statements Statements Repr.Reprs
+  | DVal String Statements Repr.Reprs
 
 -- What is known where
 --------------------------------------------------------------------------------
@@ -207,6 +225,7 @@ type CE =
   , bor : M.Map String (List Int)
   , known : M.Map String Known
   , takes : List (Pair String String)
+  , reprs : Repr.Reprs
   }
 
 -- (the code of a definition (`s`) or of a lambda of `n` parameters)
@@ -222,6 +241,7 @@ withFrame s n ce =
   , bor = ce.bor
   , known = ce.known
   , takes = Nil
+  , reprs = ce.reprs
   }
 
 withPath : List String -> List String -> CE -> CE
@@ -236,6 +256,7 @@ withPath owned after ce =
   , bor = ce.bor
   , known = ce.known
   , takes = ce.takes
+  , reprs = ce.reprs
   }
 
 -- (the variables lent to this code: it holds no reference to them)
@@ -251,6 +272,7 @@ withBorrowed bs ce =
   , bor = ce.bor
   , known = ce.known
   , takes = ce.takes
+  , reprs = ce.reprs
   }
 
 withKnown : String -> Known -> CE -> CE
@@ -265,6 +287,7 @@ withKnown x k ce =
   , bor = ce.bor
   , known = M.insert compareString x k ce.known
   , takes = ce.takes
+  , reprs = ce.reprs
   }
 
 withTakes : List (Pair String String) -> CE -> CE
@@ -279,11 +302,13 @@ withTakes ts ce =
   , bor = ce.bor
   , known = ce.known
   , takes = ts
+  , reprs = ce.reprs
   }
 
--- | what is known of the program, where a definition starts
-ceOfFacts : F.Facts -> CE
-ceOfFacts facts =
+-- | what is known of the program, where a definition starts, and how
+-- | its variables are kept
+ceOfFacts : F.Facts -> Repr.Reprs -> CE
+ceOfFacts facts reprs =
   { funs = facts.arity
   , bounce = facts.bounce
   , self = Nothing
@@ -294,6 +319,7 @@ ceOfFacts facts =
   , bor = facts.lent
   , known = M.empty
   , takes = Nil
+  , reprs = reprs
   }
 
 -- Free variables
@@ -478,10 +504,21 @@ fvRest : List Mp.St -> Maybe Mp.Tl -> List String
 fvRest ss (Just t) = freeIn Nil (Cons (ISts ss) (Cons (ITl t) Nil))
 fvRest ss Nothing = fvSts ss
 
+-- | whether a variable is kept unboxed: no reference, nothing counted
+unboxedVar : CE -> String -> Bool
+unboxedVar ce x = Repr.unboxedIn ce.reprs x
+
+-- | those of `xs` that are `V`s: what is held of them
+boxedOnly : CE -> List String -> List String
+boxedOnly ce xs = List.filter (\x -> not (unboxedVar ce x)) xs
+
 -- (a use of `x`: its reference, or one more if it is wanted after or
--- lent)
-varUse : List String -> List String -> String -> Value
-varUse lent live x = if elemS x live || elemS x lent then RDup x else RLocal x
+-- lent; kept unboxed, its value)
+varUse : CE -> List String -> String -> Value
+varUse ce live x =
+  if unboxedVar ce x then RLocal x
+  else if elemS x live || elemS x ce.borrowed then RDup x
+  else RLocal x
 
 -- (whether a drop gives anything back: a tag of no fields is a word, a
 -- closure holding nothing static)
@@ -493,10 +530,13 @@ givesBack _ = True
 dropOf : String -> Maybe Known -> List Drop
 dropOf x k = if givesBack k then Cons (MkDrop x k) Nil else Nil
 
--- | the drops of `xs`, each specialised where what it is is known
+-- | the drops of `xs`, each specialised where what it is is known (none
+-- | of one kept unboxed)
 dropsOf : CE -> List String -> List Drop
 dropsOf ce xs =
-  List.concatMap (\x -> dropOf x (M.lookup compareString x ce.known)) xs
+  List.concatMap
+    (\x -> dropOf x (M.lookup compareString x ce.known))
+    (boxedOnly ce xs)
 
 dropsIn : CE -> List String -> List Statement
 dropsIn ce xs = List.map (\d -> (CDrop d : Statement)) (dropsOf ce xs)
@@ -517,12 +557,14 @@ deadKept owned wanted = List.filter (\v -> elemS v wanted) owned
 --------------------------------------------------------------------------------
 
 -- | the judgments, knotted: a value (an operand, consumed, `live` what
--- | is wanted after it), a step not last (the same), statements
--- | (`CE.owned` and `CE.after` saying what is held and wanted after; then
--- | what is last, if they are followed by it), what is last
+-- | is wanted after it), as a `V` or as the repr wanted; a step not last
+-- | (the same), as the repr wanted; statements (`CE.owned` and
+-- | `CE.after` saying what is held and wanted after; then what is last,
+-- | if they are followed by it), what is last
 type RcK =
   { val : CE -> List String -> Mp.Val -> Value
-  , comp : CE -> List String -> Mp.Comp -> Value
+  , valAs : CE -> List String -> Repr.Repr -> Mp.Val -> Value
+  , comp : CE -> List String -> Repr.Repr -> Mp.Comp -> Value
   , stmts : CE -> List Mp.St -> Maybe Mp.Tl -> List Statement
   , tail : CE -> Mp.Tl -> List Statement
   }
@@ -541,6 +583,17 @@ operandsF : RcK -> CE -> List String -> List Mp.Val -> List Value
 operandsF r ce live Nil = Nil
 operandsF r ce live (Cons e es) =
   Cons (r.val ce (unionS (fvList es) live) e) (operandsF r ce live es)
+
+-- | ... each as its repr says
+operandsAs : RcK
+           -> CE
+           -> List String
+           -> List Repr.Repr
+           -> List Mp.Val
+           -> List Value
+operandsAs r ce live (Cons rp rps) (Cons e es) =
+  Cons (r.valAs ce (unionS (fvList es) live) rp e) (operandsAs r ce live rps es)
+operandsAs r ce live _ _ = Nil
 
 elemI : Int -> List Int -> Bool
 elemI i Nil = False
@@ -576,6 +629,12 @@ lentField ce after (SProj e l sh) =
   fieldLentOf ce after (varOfV e) (indexIn l 0 sh)
 lentField ce after _ = Nothing
 
+-- (a variable held: a `V`, not one kept unboxed -- which is boxed where
+-- it is an operand, a value)
+heldOfV : CE -> Mp.Val -> Maybe String
+heldOfV ce (SVar x) = if unboxedVar ce x then Nothing else Just x
+heldOfV ce _ = Nothing
+
 lentVarOr : RcK
           -> CE
           -> List String
@@ -598,7 +657,7 @@ lentOr : RcK
        -> Maybe Value
        -> Operand
 lentOr r ce live bi i e (Just a) = Given a
-lentOr r ce live bi i e Nothing = lentVarOr r ce live bi i e (varOfV e)
+lentOr r ce live bi i e Nothing = lentVarOr r ce live bi i e (heldOfV ce e)
 
 lentOne : RcK
         -> CE
@@ -643,10 +702,35 @@ lamBody : RcK -> CE -> List String -> Mp.Tl -> List String -> List Statement
 lamBody r ce xs t fv =
   r.tail
     (withPath
-       (deadKept (List.append xs fv) (fvTl t))
+       (boxedOnly ce (deadKept (List.append xs fv) (fvTl t)))
        Nil
        (withBorrowed Nil (withFrame Nothing (List.length xs) ce)))
     t
+
+-- Unboxed where a body starts (#39): a parameter kept unboxed -- of a
+-- function, of a lambda, or what a lambda's closure holds -- is given as
+-- a `V`, named `box$x`, and unboxed first: consumed, or, lent, looked at.
+
+boxName : String -> String
+boxName x = "box$" ^ x
+
+-- | a parameter's name, as the body is given it
+givenName : CE -> String -> String
+givenName ce x = if unboxedVar ce x then boxName x else x
+
+unboxAs : Bool -> Repr.Repr -> Value -> Value
+unboxAs True rp v = RPeek rp v
+unboxAs False rp v = RUnbox rp v
+
+-- | where a body starts: a parameter kept unboxed unboxed (`lent`: looked
+-- | at)
+unboxParam : CE -> Bool -> String -> List Statement
+unboxParam ce lent x =
+  if unboxedVar ce x
+    then Cons
+        (CLet x (unboxAs lent (Repr.reprOf ce.reprs x) (RLocal (boxName x))))
+        Nil
+  else Nil
 
 lamWith : RcK
         -> CE
@@ -657,11 +741,15 @@ lamWith : RcK
         -> Value
 lamWith r ce live xs t fv =
   RLam
-    xs
-    fv
-    (List.map (varUse ce.borrowed live) fv)
+    (List.map (givenName ce) xs)
+    (List.map (givenName ce) fv)
+    (List.map (\x -> r.val ce live (SVar x)) fv)
     (MkCode
-       (List.append (plainDrops (deadIn xs (fvTl t))) (lamBody r ce xs t fv)))
+       (List.append
+          (List.concatMap (unboxParam ce False) (List.append xs fv))
+          (List.append
+             (plainDrops (boxedOnly ce (deadIn xs (fvTl t))))
+             (lamBody r ce xs t fv))))
 
 -- | a lambda's closure: what it mentions held, each a use of it here
 lamVal : RcK -> CE -> List String -> List String -> Mp.Tl -> Value
@@ -850,7 +938,7 @@ recordVal r ce live fs Nothing =
   RRec (List.map fst fs) (operandsF r ce live (List.map snd fs))
 
 valF : RcK -> CE -> List String -> Mp.Val -> Value
-valF r ce live (SVar x) = varUse ce.borrowed live x
+valF r ce live (SVar x) = varUse ce live x
 valF r ce live (SGlobal g) =
   if M.member compareString g ce.funs then RClo g else RGet g
 valF r ce live (SInt n) = RInt n
@@ -870,36 +958,115 @@ valF r ce live (SPrim p as) =
   else RPrim p (operandsF r ce live as)
 valF r ce live (SLam xs (MkBlock t)) = lamVal r ce live xs t
 
+-- Boxes (#39): a value is made as it comes -- a variable as it is kept,
+-- a primitive done unboxed (`Repr.primShape`) as it gives, anything else
+-- a `V` -- and boxed or unboxed where another repr is wanted; a literal
+-- is made as it is wanted.
+
+-- (unboxed, a `V` consumed; one whose reference was taken just to be
+-- given up, looked at instead)
+unboxOf : Repr.Repr -> Value -> Value
+unboxOf rp (RDup x) = RPeek rp (RLocal x)
+unboxOf rp (RDupE e) = RPeek rp e
+unboxOf rp (RGet g) = RPeek rp (RGetRaw g)
+unboxOf rp v = RUnbox rp v
+
+-- | a value of the repr `from`, as one of `to`
+coerce : Repr.Repr -> Repr.Repr -> Value -> Value
+coerce from to v =
+  if Repr.reprEq from to then v
+  else if Repr.isBoxed to then RBox from v
+  else if Repr.isBoxed from then unboxOf to v
+  else unboxOf to (RBox from v)
+
+-- (the repr a value comes as)
+naturalOf : CE -> Mp.Val -> Repr.Repr
+naturalOf ce (SVar x) = Repr.reprOf ce.reprs x
+naturalOf ce (SPrim p _) = Repr.resultRepr p
+naturalOf ce v = RepV
+
+isRepFix : Fx.Fixed -> Repr.Repr -> Bool
+isRepFix w rp = Repr.reprEq (RepFix w) rp
+
+primAs : RcK
+       -> CE
+       -> List String
+       -> Repr.Repr
+       -> String
+       -> List Mp.Val
+       -> Maybe Repr.Shape
+       -> Value
+primAs r ce live want p as (Just sh) =
+  coerce sh.result want (RPrimU p (operandsAs r ce live sh.args as))
+primAs r ce live want p as Nothing =
+  coerce RepV want (valF r ce live (SPrim p as))
+
+-- | a value, as the repr `want`
+valAsF : RcK -> CE -> List String -> Repr.Repr -> Mp.Val -> Value
+valAsF r ce live want (SFixed w n) =
+  if isRepFix w want then RFixU w n else coerce RepV want (RFixed w n)
+valAsF r ce live want (SFloat x) =
+  if Repr.reprEq RepF64 want then RF64U x else coerce RepV want (RFloat x)
+valAsF r ce live want (SFloat32 x) =
+  if isRepFix F32 want then RF32U x else coerce RepV want (RF32 x)
+valAsF r ce live want (SPrim p as) =
+  primAs r ce live want p as (Repr.primShape p)
+valAsF r ce live want v = coerce (naturalOf ce v) want (valF r ce live v)
+
 -- (a condition's code: what is held lent to it -- see `Cond`)
 lentTo : CE -> CE
 lentTo ce = withTakes Nil (withBorrowed (List.append ce.owned ce.borrowed) ce)
+
+relWith : RcK
+        -> CE
+        -> List String
+        -> String
+        -> List Mp.Val
+        -> Maybe Repr.Shape
+        -> Test
+relWith r ce live p args (Just sh) =
+  CondRelU p (operandsAs r ce live sh.args args)
+relWith r ce live p args Nothing = CondRel p (operandsF r ce live args)
+
+-- | a comparison: of unboxed operands, where it is done so
+relTest : RcK -> CE -> List String -> String -> List Mp.Val -> Test
+relTest r ce live p args = relWith r ce live p args (Repr.primShape p)
 
 -- | a condition, its operands lent (`ce` as `lentTo` makes it); a name
 -- | bound in it lent to what follows in it, dropped after
 condF : RcK -> CE -> Mp.Cond -> Test
 condF r ce PTrue = CondTrue
 condF r ce PFalse = CondFalse
-condF r ce (PRel p a b) = CondRel p (operandsF r ce Nil [a, b])
+condF r ce (PRel p a b) = relTest r ce Nil p [a, b]
 condF r ce (PBool v) = CondBool (r.val ce Nil v)
 condF r ce (PNot c) = CondNot (condF r ce c)
 condF r ce (PIf a b c) = CondIf (condF r ce a) (condF r ce b) (condF r ce c)
 condF r ce (PLet x o c) =
-  CondLet x (r.comp ce Nil o) (condF r (withBorrowed (Cons x ce.borrowed) ce) c)
+  CondLet
+    x
+    (r.comp ce Nil (Repr.reprOf ce.reprs x) o)
+    (condF r (withBorrowed (Cons x ce.borrowed) ce) c)
+    (List.map (\y -> MkDrop y Nothing) (boxedOnly ce (Cons x Nil)))
 
--- | a step not last: its value, through any bounces
-compF : RcK -> CE -> List String -> Mp.Comp -> Value
-compF r ce live (OApply f as) = case operandsF r ce live (Cons f as) of
+-- (a step not last, as a `V`)
+compV : RcK -> CE -> List String -> Mp.Comp -> Value
+compV r ce live (OApply f as) = case operandsF r ce live (Cons f as) of
   Cons fv vs -> RApply fv vs
   Nil -> RAbandon
-compF r ce live (OCall g as) =
+compV r ce live (OCall g as) =
   RCall
     g
     (M.member compareString g ce.bounce)
     (lentOperands r ce live (Bo.borOf ce.bor g) 0 as)
-compF r ce live (OPrim p as) = RPrim p (operandsF r ce live as)
-compF r ce live (OSimple v) = r.val ce live v
-compF r ce live OAbandon = RAbandon
-compF r ce live (OBool c) = RBool (condF r (lentTo ce) c)
+compV r ce live (OPrim p as) = RPrim p (operandsF r ce live as)
+compV r ce live (OSimple v) = r.val ce live v
+compV r ce live OAbandon = RAbandon
+compV r ce live (OBool c) = RBool (condF r (lentTo ce) c)
+
+-- | a step not last: its value, through any bounces, as the repr wanted
+compF : RcK -> CE -> List String -> Repr.Repr -> Mp.Comp -> Value
+compF r ce live want (OSimple v) = r.valAs ce live want v
+compF r ce live want o = coerce RepV want (compV r ce live o)
 
 -- Statements and what is last
 --------------------------------------------------------------------------------
@@ -1363,13 +1530,12 @@ condWith r ce p args yes no fa wb =
     (dropsIn ce (deadIn ce.owned (unionS fa wb)))
     (Cons
        (CIf
-          (CondRel
+          (relTest
+             r
+             (withPath (deadKept ce.owned (unionS fa wb)) wb ce)
+             wb
              p
-             (operandsF
-                r
-                (withPath (deadKept ce.owned (unionS fa wb)) wb ce)
-                wb
-                args))
+             args)
           (condArm r (withPath (deadKept ce.owned wb) ce.after ce) yes)
           (condArm r (withPath (deadKept ce.owned wb) ce.after ce) no))
        Nil)
@@ -1580,7 +1746,7 @@ bindWith r ce x fa binding known takes rest after wb =
              (withPath
                 (List.append
                    (deadKept ce.owned wb)
-                   (if elemS x wb then Cons x Nil else Nil))
+                   (if elemS x wb then boxedOnly ce (Cons x Nil) else Nil))
                 ce.after
                 (withTakes Nil (knownLet x known ce)))
              rest
@@ -1630,7 +1796,10 @@ stmtsF r ce (Cons (SLet x o) rest) after =
     ce
     x
     (fvOp o)
-    (\ce2 -> Cons (CLet x (r.comp ce2 ce2.after o)) (boolDone ce2 o))
+    (\ce2 ->
+       Cons
+         (CLet x (r.comp ce2 ce2.after (Repr.reprOf ce.reprs x) o))
+         (boolDone ce2 o))
     (builtOf o)
     (takesFor ce o (restItems rest after))
     rest
@@ -1648,7 +1817,7 @@ stmtsF r ce (Cons (SDecl x) (Cons st rest)) after =
     after
 stmtsF r ce (Cons (SSet x o) rest) after =
   Cons
-    (CSet x (r.comp ce ce.after o))
+    (CSet x (r.comp ce ce.after (Repr.reprOf ce.reprs x) o))
     (List.append (boolDone ce o) (r.stmts ce rest after))
 -- (a match, a condition, setting a name declared before: in an arm
 -- that sets it, last)
@@ -1657,16 +1826,51 @@ stmtsF r ce (Cons st rest) after =
 
 -- (a known definition called last: itself, the loop again; one of the
 -- same parameters, a jump; else called, its bounce given back)
-callAs : CE -> String -> List Mp.Val -> List Operand -> List Statement
-callAs ce g as ls =
-  if isSelfCall ce g as && lentPlain ls then again ce (List.map argExp ls)
+-- (`loop`: the operands as the loop's next round is given them, each
+-- parameter kept unboxed given its value so)
+callAs : CE
+       -> String
+       -> List Mp.Val
+       -> List Operand
+       -> List Operand
+       -> List Statement
+callAs ce g as loop ls =
+  if isSelfCall ce g as && lentPlain loop then again ce (List.map argExp loop)
   else if agrees ce g as && lentPlain ls
     then Cons (CJump g (List.map argExp ls)) Nil
   else Cons (CReturn (RCall g False ls)) Nil
 
+-- (the loop's next round's operands: a parameter kept unboxed given its
+-- value so, the others as a call's)
+loopOperands : RcK
+             -> CE
+             -> List String
+             -> List Int
+             -> Int
+             -> List String
+             -> List Mp.Val
+             -> List Operand
+loopOperands r ce live bi i (Cons p ps) (Cons e es) =
+  Cons
+    (if unboxedVar ce p
+       then Given
+           (r.valAs ce (unionS (fvList es) live) (Repr.reprOf ce.reprs p) e)
+     else lentOne r ce live (unionS (fvList es) live) bi i e)
+    (loopOperands r ce live bi (i + 1) ps es)
+loopOperands r ce live bi i _ _ = Nil
+
+selfParams : CE -> List String
+selfParams { self = Just s } = s.params
+selfParams { self = Nothing } = Nil
+
 callLast : RcK -> CE -> String -> List Mp.Val -> List Statement
 callLast r ce g as =
-  callAs ce g as (lentOperands r ce Nil (Bo.borOf ce.bor g) 0 as)
+  callAs
+    ce
+    g
+    as
+    (loopOperands r ce Nil (Bo.borOf ce.bor g) 0 (selfParams ce) as)
+    (lentOperands r ce Nil (Bo.borOf ce.bor g) 0 as)
 
 -- (the name a `Bool` returned is bound to, its condition's operands
 -- dropped before it is: one no other name is, each given a `$` and a
@@ -1682,9 +1886,9 @@ tailF r ce (TReturn (OApply f as)) =
 tailF r ce (TReturn (OCall g as)) = callLast r ce g as
 tailF r ce (TReturn (OBool c)) =
   Cons
-    (CLet boolName (r.comp ce Nil (OBool c)))
+    (CLet boolName (r.comp ce Nil RepV (OBool c)))
     (List.append (dropsIn ce ce.owned) (Cons (CReturn (RLocal boolName)) Nil))
-tailF r ce (TReturn o) = Cons (CReturn (r.comp ce Nil o)) Nil
+tailF r ce (TReturn o) = Cons (CReturn (r.comp ce Nil RepV o)) Nil
 tailF r ce (TLoop as) = case ce.self of
   Just s -> callLast r ce s.key as
   Nothing -> Cons (CReturn RAbandon) Nil
@@ -1694,8 +1898,9 @@ tailF r ce (TCase v arms) = Cons (matchOf r ce True v (tlArmsOf arms)) Nil
 
 rcK : RcK
 rcK =
-  { val = \ce live e -> valF rcK ce live e
-  , comp = \ce live o -> compF rcK ce live o
+  { val = \ce live e -> valAsF rcK ce live RepV e
+  , valAs = \ce live want e -> valAsF rcK ce live want e
+  , comp = \ce live want o -> compF rcK ce live want o
   , stmts = \ce ss after -> stmtsF rcK ce ss after
   , tail = \ce t -> tailF rcK ce t
   }
@@ -1703,18 +1908,36 @@ rcK =
 -- Definitions
 --------------------------------------------------------------------------------
 
+-- (each parameter kept unboxed unboxed, where the function is entered;
+-- one lent looked at)
+unboxParams : CE -> List Int -> List String -> List Statement
+unboxParams ce bi xs =
+  List.concatMap
+    (\ss -> ss)
+    (List.zipWith
+       (\x i -> unboxParam ce (elemI i bi) x)
+       xs
+       (List.range 0 (List.length xs - 1)))
+
 funRc : CE -> String -> List String -> Mp.Tl -> Def
 funRc ce key xs b =
   DFun
     key
-    xs
+    (List.map (givenName ce) xs)
     (Bo.borOf ce.bor key)
+    (unboxParams ce (Bo.borOf ce.bor key) xs)
     (List.append
        (plainDrops
-          (deadIn (Bo.paramsAt False (Bo.borOf ce.bor key) xs) (fvTl b)))
+          (boxedOnly
+             ce
+             (deadIn (Bo.paramsAt False (Bo.borOf ce.bor key) xs) (fvTl b))))
        (rcK.tail
           (withPath
-             (deadKept (Bo.paramsAt False (Bo.borOf ce.bor key) xs) (fvTl b))
+             (boxedOnly
+                ce
+                (deadKept
+                   (Bo.paramsAt False (Bo.borOf ce.bor key) xs)
+                   (fvTl b)))
              Nil
              (withBorrowed
                 (Bo.paramsAt True (Bo.borOf ce.bor key) xs)
@@ -1723,16 +1946,20 @@ funRc ce key xs b =
                    0
                    (knowingShapes b ce))))
           b))
+    ce.reprs
 
 valRc : CE -> String -> Mp.Tl -> Def
 valRc ce key t =
   DVal
     key
     (rcK.tail (withPath Nil Nil (withFrame Nothing 0 (knowingShapes t ce))) t)
+    ce.reprs
 
 -- | a definition of the imperative form, its references counted, what
--- | is known of the program (`facts`) known
-rcDef : F.Facts -> Mp.Def -> Def
-rcDef facts (MkDef key _ (DefFun xs (MkBlock t))) =
-  funRc (ceOfFacts facts) key xs t
-rcDef facts (MkDef key _ (DefVal (MkBlock t))) = valRc (ceOfFacts facts) key t
+-- | is known of the program (`facts`) known, its variables kept as
+-- | `reprs` says (heff.compile.repr)
+rcDef : F.Facts -> Repr.Reprs -> Mp.Def -> Def
+rcDef facts reprs (MkDef key _ (DefFun xs (MkBlock t))) =
+  funRc (ceOfFacts facts reprs) key xs t
+rcDef facts reprs (MkDef key _ (DefVal (MkBlock t))) =
+  valRc (ceOfFacts facts reprs) key t

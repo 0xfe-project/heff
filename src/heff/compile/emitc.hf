@@ -41,6 +41,7 @@ import heff.compile.irtext as Ir
 import heff.compile.lower as L
 import heff.compile.prims as Pr
 import heff.compile.rc as Rc
+import heff.compile.repr as Repr
 import heff.compile.simplify as Si
 import map as M
 import uint8 as U8
@@ -420,9 +421,187 @@ addLam proto def = \s ->
 -- Expressions
 --------------------------------------------------------------------------------
 
--- | the printer's judgments, knotted: an expression, statements
+-- | the printer's judgments, knotted: an expression, statements; and
+-- | the C type of each variable (heff.compile.repr's)
 type CK =
-  { exp : Rc.Value -> C String, stmts : List Rc.Statement -> C (List String) }
+  { exp : Rc.Value -> C String
+  , stmts : List Rc.Statement -> C (List String)
+  , ctype : String -> String
+  }
+
+-- Unboxed numbers (#39): each fixed-width type its C type, `Float64` a
+-- `double`, by a suffix in the runtime's names (`heff_box_i64`)
+--------------------------------------------------------------------------------
+
+fixedSuffix : Fx.Fixed -> String
+fixedSuffix w =
+  if Fx.isFloat32 w then "f32"
+  else (if Fx.fixedSigned w then "i" else "u") ^ showInt (Fx.fixedBits w)
+
+reprSuffix : Repr.Repr -> String
+reprSuffix (RepFix w) = fixedSuffix w
+reprSuffix RepF64 = "f64"
+reprSuffix RepV = "v"
+
+fixedType : Fx.Fixed -> String
+fixedType w =
+  if Fx.isFloat32 w then "float"
+  else (if Fx.fixedSigned w then "int" else "uint")
+    ^ showInt (Fx.fixedBits w)
+    ^ "_t"
+
+-- | how C declares a variable kept so
+cType : Repr.Repr -> String
+cType (RepFix w) = fixedType w
+cType RepF64 = "double"
+cType RepV = "V"
+
+-- (an integer of the type, a C constant: its value modulo 2^64, as an
+-- unsigned constant, made the type)
+fixedConst : Fx.Fixed -> Int -> String
+fixedConst w n =
+  if n < 0 then "((" ^ fixedType w ^ ")-" ^ showInt (0 - n) ^ "ULL)"
+  else "((" ^ fixedType w ^ ")" ^ showInt n ^ "ULL)"
+
+-- (a double, a C constant)
+doubleConst : Float64 -> String
+doubleConst x =
+  if strEq (showFloat x) "NaN" then "NAN"
+  else if strEq (showFloat x) "Infinity" then "INFINITY"
+  else if strEq (showFloat x) "-Infinity" then "(-INFINITY)"
+  else "(" ^ showFloat x ^ ")"
+
+-- (a C operator, of a primitive done as one)
+opSymbol : Fx.FixedOp -> String
+opSymbol OpAdd = "+"
+opSymbol OpSub = "-"
+opSymbol OpMul = "*"
+opSymbol OpDiv = "/"
+opSymbol OpAnd = "&"
+opSymbol OpOr = "|"
+opSymbol OpXor = "^"
+opSymbol OpEq = "=="
+opSymbol OpLt = "<"
+opSymbol OpLe = "<="
+opSymbol o = ""
+
+-- (`Float64`'s primitives done as C's operators, and as libm's functions)
+floatSymbols : List (Pair String String)
+floatSymbols =
+  [ MkPair "floatAdd" "+"
+  , MkPair "floatSub" "-"
+  , MkPair "floatMul" "*"
+  , MkPair "floatDiv" "/"
+  , MkPair "floatEq" "=="
+  , MkPair "floatLt" "<"
+  , MkPair "floatLe" "<="
+  ]
+
+floatSymbol : String -> String
+floatSymbol p = fromMaybe "" (List.lookupBy strEq p floatSymbols)
+
+libmNames : List (Pair String String)
+libmNames =
+  [ MkPair "floatSqrt" "sqrt"
+  , MkPair "floatSin" "sin"
+  , MkPair "floatCos" "cos"
+  , MkPair "floatTan" "tan"
+  , MkPair "floatAsin" "asin"
+  , MkPair "floatAcos" "acos"
+  , MkPair "floatAtan" "atan"
+  , MkPair "floatExp" "exp"
+  , MkPair "floatLog" "log"
+  , MkPair "floatAtan2" "atan2"
+  , MkPair "floatPow" "pow"
+  , MkPair "floatFromInt" "heff_from_int_f64"
+  , MkPair "floatFloor" "heff_floor_f64"
+  ]
+
+arg0 : List String -> String
+arg0 vs = fromMaybe "0" (List.head vs)
+
+arg1 : List String -> String
+arg1 vs = fromMaybe "0" (List.head (List.drop 1 vs))
+
+infixC : String -> List String -> String
+infixC op vs = "(" ^ arg0 vs ^ " " ^ op ^ " " ^ arg1 vs ^ ")"
+
+callOf : String -> List String -> String
+callOf f vs = f ^ "(" ^ joinWith ", " vs ^ ")"
+
+-- (`a op b` on 64 bits, unsigned, where no overflow is undefined,
+-- wrapped to the type)
+wrapped : Fx.Fixed -> String -> List String -> String
+wrapped w op vs =
+  "(("
+  ^ fixedType w
+  ^ ")((uint64_t)"
+  ^ arg0 vs
+  ^ " "
+  ^ op
+  ^ " (uint64_t)"
+  ^ arg1 vs
+  ^ "))"
+
+-- (an integer type's operation: on 64 bits, unsigned (where no overflow
+-- is undefined), wrapped to the type; a division, a shift, the
+-- runtime's, as its primitives do them)
+intU : Fx.Fixed -> Fx.FixedOp -> List String -> String
+intU w OpAdd vs = wrapped w "+" vs
+intU w OpSub vs = wrapped w "-" vs
+intU w OpMul vs = wrapped w "*" vs
+intU w OpDiv vs = callOf ("heff_div_" ^ fixedSuffix w) vs
+intU w OpRem vs = callOf ("heff_rem_" ^ fixedSuffix w) vs
+intU w OpShl vs = callOf ("heff_shl_" ^ fixedSuffix w) vs
+intU w OpShr vs = callOf ("heff_shr_" ^ fixedSuffix w) vs
+intU w OpFromInt vs = callOf ("heff_from_int_" ^ fixedSuffix w) vs
+intU w OpToInt vs = callOf ("heff_box_" ^ fixedSuffix w) vs
+intU w op vs = "((" ^ fixedType w ^ ")" ^ infixC (opSymbol op) vs ^ ")"
+
+-- | ... of a `Float32`
+float32U : Fx.FixedOp -> List String -> String
+float32U OpSqrt vs = callOf "sqrtf" vs
+float32U OpFromFloat vs = "((float)" ^ arg0 vs ^ ")"
+float32U OpToFloat vs = "((double)" ^ arg0 vs ^ ")"
+float32U OpFromInt vs = callOf "heff_from_int_f32" vs
+float32U OpFloor vs = callOf "heff_floor_f32" vs
+float32U op vs = "((float)" ^ infixC (opSymbol op) vs ^ ")"
+
+isRelOp : Fx.FixedOp -> Bool
+isRelOp OpEq = True
+isRelOp OpLt = True
+isRelOp OpLe = True
+isRelOp o = False
+
+fixedU : Fx.FixedPrim -> List String -> String
+fixedU fp vs =
+  if isRelOp fp.op then "heff_bool(" ^ infixC (opSymbol fp.op) vs ^ ")"
+  else if Fx.isFloat32 fp.fixed then float32U fp.op vs
+  else intU fp.fixed fp.op vs
+
+-- | ... of a `Float64`: C's operator, or libm's function
+float64U : String -> List String -> String
+float64U p vs =
+  if strEq p "floatEq" || strEq p "floatLt" || strEq p "floatLe"
+    then "heff_bool(" ^ infixC (floatSymbol p) vs ^ ")"
+  else if strLength (floatSymbol p) > 0 then infixC (floatSymbol p) vs
+  else callOf (fromMaybe p (List.lookupBy strEq p libmNames)) vs
+
+primUOf : String -> Maybe Fx.FixedPrim -> List String -> String
+primUOf p (Just fp) vs = fixedU fp vs
+primUOf p Nothing vs = float64U p vs
+
+-- | a primitive done on unboxed operands (heff.compile.repr's `primShape`)
+primU : String -> List String -> String
+primU p vs = primUOf p (Fx.fixedPrimOf p) vs
+
+relSymbol : String -> Maybe Fx.FixedPrim -> String
+relSymbol p (Just fp) = opSymbol fp.op
+relSymbol p Nothing = floatSymbol p
+
+-- | a comparison of unboxed operands, as C's condition
+relU : String -> List String -> String
+relU p vs = infixC (relSymbol p (Fx.fixedPrimOf p)) vs
 
 argsArr : List String -> String
 argsArr vs = if List.null vs then "NULL" else "(V[]){" ^ joinWith ", " vs ^ "}"
@@ -633,6 +812,7 @@ testC k (CondRel p es) =
   bind
     (traverseC k.exp es)
     (\vs -> pure (primName p ^ "_c(" ^ joinWith ", " vs ^ ")"))
+testC k (CondRelU p es) = bind (traverseC k.exp es) (\vs -> pure (relU p vs))
 testC k (CondBool e) =
   bind (k.exp e) (\v -> pure ("(" ^ v ^ " == NTAG(TAG_True))"))
 testC k (CondNot c) = bind (testC k c) (\v -> pure ("!" ^ v))
@@ -649,19 +829,21 @@ testC k (CondIf a b c) = do
   vb <- testC k b
   vc <- testC k c
   pure ("(" ^ va ^ " ? " ^ vb ^ " : " ^ vc ^ ")")
-testC k (CondLet x e c) = do
+testC k (CondLet x e c drops) = do
   v <- k.exp e
   vc <- testC k c
   pure
-      ("({ V "
+      ("({ "
+       ^ k.ctype x
+       ^ " "
        ^ cLocal x
        ^ " = "
        ^ v
        ^ "; int c_ = "
        ^ vc
-       ^ "; heff_drop("
-       ^ cLocal x
-       ^ "); c_; })")
+       ^ "; "
+       ^ joinWith "" (List.map (\d -> dropLine d ^ " ") drops)
+       ^ "c_; })")
 
 -- (an operator of one operand: its name, then the operand's, closed)
 wrapC : CK -> String -> String -> Rc.Value -> C String
@@ -741,6 +923,13 @@ expF k (RApply f es) = do
        ^ "))")
 expF k (RBool c) = bind (testC k c) (\v -> pure ("heff_bool(" ^ v ^ ")"))
 expF k RAbandon = pure "heff_abandon()"
+expF k (RBox r e) = wrapC k ("heff_box_" ^ reprSuffix r ^ "(") ")" e
+expF k (RUnbox r e) = wrapC k ("heff_unbox_" ^ reprSuffix r ^ "(") ")" e
+expF k (RPeek r e) = wrapC k ("heff_peek_" ^ reprSuffix r ^ "(") ")" e
+expF k (RPrimU p es) = bind (traverseC k.exp es) (\vs -> pure (primU p vs))
+expF k (RFixU w n) = pure (fixedConst w n)
+expF k (RF32U x) = pure ("((float)" ^ doubleConst x ^ ")")
+expF k (RF64U x) = pure (doubleConst x)
 
 -- Statements
 --------------------------------------------------------------------------------
@@ -748,13 +937,14 @@ expF k RAbandon = pure "heff_abandon()"
 indented : List String -> List String
 indented ls = List.map (\l -> "  " ^ l) ls
 
--- (the loop again: the arguments, then the parameters)
-again : List String -> List String -> List String
-again ps vs =
+-- (the loop again: the arguments, then the parameters -- each as its
+-- parameter is kept, `ts`)
+again : List String -> List String -> List String -> List String
+again ts ps vs =
   List.append
     (List.zipWith
-       (\v i -> "V t_" ^ showInt i ^ " = " ^ v ^ ";")
-       vs
+       (\tv i -> fst tv ^ " t_" ^ showInt i ^ " = " ^ snd tv ^ ";")
+       (List.zip ts vs)
        (List.range 0 (List.length vs - 1)))
     (List.append
        (List.zipWith
@@ -871,8 +1061,8 @@ lineC k pre post e = bind (k.exp e) (\v -> pure (Cons (pre ^ v ^ post) Nil))
 
 stmtF : CK -> Rc.Statement -> C (List String)
 stmtF k (CDrop d) = pure (Cons (dropLine d) Nil)
-stmtF k (CLet x e) = lineC k ("V " ^ cLocal x ^ " = ") ";" e
-stmtF k (CDecl x) = pure (Cons ("V " ^ cLocal x ^ ";") Nil)
+stmtF k (CLet x e) = lineC k (k.ctype x ^ " " ^ cLocal x ^ " = ") ";" e
+stmtF k (CDecl x) = pure (Cons (k.ctype x ^ " " ^ cLocal x ^ ";") Nil)
 stmtF k (CSet x e) = lineC k (cLocal x ^ " = ") ";" e
 stmtF k CAbandon = pure (Cons "heff_abandon();" Nil)
 stmtF k (CIf c yes no) = do
@@ -911,7 +1101,8 @@ stmtF k (CTail f es) = do
           ^ argsArr (List.drop 1 vs)
           ^ ");")
          Nil)
-stmtF k (CLoop ps es) = bind (traverseC k.exp es) (\vs -> pure (again ps vs))
+stmtF k (CLoop ps es) =
+  bind (traverseC k.exp es) (\vs -> pure (again (List.map k.ctype ps) ps vs))
 stmtF k (CJump g es) = do
   vs <- traverseC k.exp es
   pure
@@ -923,8 +1114,13 @@ stmtsF : CK -> List Rc.Statement -> C (List String)
 stmtsF k ss =
   bind (traverseC (stmtF k) ss) (\ls -> pure (List.concatMap (\x -> x) ls))
 
-ck : CK
-ck = { exp = \e -> expF ck e, stmts = \ss -> stmtsF ck ss }
+-- | the printer, of a definition whose variables are kept as `rs` says
+ckOf : Repr.Reprs -> CK
+ckOf rs =
+  { exp = \e -> expF (ckOf rs) e
+  , stmts = \ss -> stmtsF (ckOf rs) ss
+  , ctype = \x -> cType (Repr.reprOf rs x)
+  }
 
 -- Definitions
 --------------------------------------------------------------------------------
@@ -970,9 +1166,16 @@ entryCall key bi n =
     ^ joinWith " " (List.map (\i -> "heff_drop(a" ^ showInt i ^ ");") bi)
     ^ " return r;"
 
-funDef : String -> List String -> List Int -> List Rc.Statement -> C Emitted1
-funDef key xs bi body = do
-  ls <- ck.stmts body
+funDef : String
+       -> List String
+       -> List Int
+       -> List Rc.Statement
+       -> List Rc.Statement
+       -> Repr.Reprs
+       -> C Emitted1
+funDef key xs bi entry body rs = do
+  es <- (ckOf rs).stmts entry
+  ls <- (ckOf rs).stmts body
   pure
       { protos =
           [ "static V " ^ cGlobal key ^ "(" ^ paramList xs ^ ");"
@@ -987,10 +1190,11 @@ funDef key xs bi body = do
           ]
       , code =
           List.append
-            [ ""
-            , "static V " ^ cGlobal key ^ "(" ^ paramList xs ^ ") {"
-            , "top: ;"
-            ]
+            (Cons
+               ""
+               (Cons
+                  ("static V " ^ cGlobal key ^ "(" ^ paramList xs ^ ") {")
+                  (List.append (indented es) (Cons "top: ;" Nil))))
             (List.append
                (indented ls)
                [ "}"
@@ -1001,9 +1205,9 @@ funDef key xs bi body = do
                ])
       }
 
-valDef : String -> List Rc.Statement -> C Emitted1
-valDef key body = do
-  ls <- ck.stmts body
+valDef : String -> List Rc.Statement -> Repr.Reprs -> C Emitted1
+valDef key body rs = do
+  ls <- (ckOf rs).stmts body
   pure
       { protos = Cons ("static V " ^ cGlobal key ^ "_get(void);") Nil
       , code =
@@ -1034,8 +1238,8 @@ valDef key body = do
       }
 
 defC : Rc.Def -> C Emitted1
-defC (DFun key xs bi body) = funDef key xs bi body
-defC (DVal key body) = valDef key body
+defC (DFun key xs bi entry body rs) = funDef key xs bi entry body rs
+defC (DVal key body rs) = valDef key body rs
 
 -- The world's algebra
 --------------------------------------------------------------------------------

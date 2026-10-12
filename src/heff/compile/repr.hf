@@ -1,0 +1,518 @@
+-- Representations, for the C backend (#39): which of a definition's
+-- variables are kept unboxed -- a fixed-width number as its C integer
+-- type (`int64_t`, `uint8_t`, ...), a `Float32` as a `float`, a
+-- `Float64` as a `double` -- and which as a `V`, the runtime's uniform
+-- word, worked out on the imperative form (heff.compile.imp) of each
+-- definition apart, and read by heff.compile.rc, which boxes and unboxes
+-- where a value crosses from one to the other.
+--
+-- The form has no types, but the program was checked, so what a
+-- variable is is told by what gives it its value and what uses it:
+--
+-- - a primitive of a fixed-width type or of `Float64` takes and gives
+--   its numbers unboxed (`primShape`), and a literal is one;
+-- - a variable copied to another (`let y = x`, `x = y`, the loop's
+--   next round giving a parameter its value) is kept as that one is:
+--   they are one class, and so is a loop's parameter with what it is
+--   given;
+-- - anything else -- a call, a field, a parameter where the function is
+--   entered -- gives a `V`, and anything else -- a call's operand, a
+--   tag's, a record's, a closure's, what is returned -- wants one.
+--
+-- A class all of whose evidence is of one type is unboxed where that
+-- costs no more than keeping it a `V` (`decide`): a box made where a
+-- `V` is wanted (an allocation, for a `Float64` or a 64-bit integer
+-- beyond 62 bits), against an unbox where a `V` comes in.  A field a
+-- match binds stays a `V` (`Pinned`), and is unboxed where it is used.
+
+import heff.compile.imp as Imp
+import heff.elab.fixed as Fixed
+import map as Map
+
+-- | how a variable is kept: as a `V`; as a fixed-width type's C type;
+-- | as a `double`
+data Repr = RepV | RepFix Fixed.Fixed | RepF64
+
+reprEq : Repr -> Repr -> Bool
+reprEq RepV RepV = True
+reprEq RepF64 RepF64 = True
+reprEq (RepFix a) (RepFix b) = Fixed.eqFixed a b
+reprEq a b = False
+
+isBoxed : Repr -> Bool
+isBoxed RepV = True
+isBoxed r = False
+
+-- | each definition's unboxed variables, by name (the others are `V`s)
+type Reprs = Map.Map String Repr
+
+-- | how a variable is kept
+reprOf : Reprs -> String -> Repr
+reprOf rs x = fromMaybe RepV (Map.lookup compareString x rs)
+
+-- | whether a variable is kept unboxed
+unboxedIn : Reprs -> String -> Bool
+unboxedIn rs x = Map.member compareString x rs
+
+-- Primitives
+--------------------------------------------------------------------------------
+
+-- | what a primitive done unboxed takes, operand by operand, and gives
+type Shape = { args : List Repr, result : Repr }
+
+binaryOf : Repr -> Maybe Shape
+binaryOf r = Just { args = [r, r], result = r }
+
+unaryOf : Repr -> Maybe Shape
+unaryOf r = Just { args = [r], result = r }
+
+-- (a comparison: a `Bool`)
+relationOf : Repr -> Maybe Shape
+relationOf r = Just { args = [r, r], result = RepV }
+
+fromTo : Repr -> Repr -> Maybe Shape
+fromTo a b = Just { args = [a], result = b }
+
+-- (a fixed-width type's primitive: all but `show`, whose string is made
+-- of the `V`)
+opShape : Repr -> Fixed.FixedOp -> Maybe Shape
+opShape r OpAdd = binaryOf r
+opShape r OpSub = binaryOf r
+opShape r OpMul = binaryOf r
+opShape r OpDiv = binaryOf r
+opShape r OpRem = binaryOf r
+opShape r OpAnd = binaryOf r
+opShape r OpOr = binaryOf r
+opShape r OpXor = binaryOf r
+opShape r OpShl = binaryOf r
+opShape r OpShr = binaryOf r
+opShape r OpEq = relationOf r
+opShape r OpLt = relationOf r
+opShape r OpLe = relationOf r
+opShape r OpSqrt = unaryOf r
+opShape r OpFromInt = fromTo RepV r
+opShape r OpToInt = fromTo r RepV
+opShape r OpFromFloat = fromTo RepF64 r
+opShape r OpToFloat = fromTo r RepF64
+opShape r OpFloor = fromTo r RepV
+opShape r OpShow = Nothing
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+-- | `Float64`'s primitives done on `double`s: of two, of one
+float2Prims : List String
+float2Prims =
+  ["floatAdd", "floatSub", "floatMul", "floatDiv", "floatAtan2", "floatPow"]
+
+float1Prims : List String
+float1Prims =
+  [ "floatSqrt"
+  , "floatSin"
+  , "floatCos"
+  , "floatTan"
+  , "floatAsin"
+  , "floatAcos"
+  , "floatAtan"
+  , "floatExp"
+  , "floatLog"
+  ]
+
+floatRelPrims : List String
+floatRelPrims = ["floatEq", "floatLt", "floatLe"]
+
+floatShape : String -> Maybe Shape
+floatShape p =
+  if elemS p float2Prims then binaryOf RepF64
+  else if elemS p float1Prims then unaryOf RepF64
+  else if elemS p floatRelPrims then relationOf RepF64
+  else if strEq p "floatFromInt" then fromTo RepV RepF64
+  else if strEq p "floatFloor" then fromTo RepF64 RepV
+  else Nothing
+
+shapeOf : String -> Maybe Fixed.FixedPrim -> Maybe Shape
+shapeOf p (Just fp) = opShape (RepFix fp.fixed) fp.op
+shapeOf p Nothing = floatShape p
+
+-- | how a primitive is done unboxed, if it is
+-- | >>> maybe False (\(s : Shape) -> isBoxed s.result) (primShape "int64Lt")
+-- | True
+-- | >>> maybe 0 (\(s : Shape) -> List.length s.args) (primShape "int64Show")
+-- | 0
+primShape : String -> Maybe Shape
+primShape p = shapeOf p (Fixed.fixedPrimOf p)
+
+argsOf : {a : Type} -> Maybe Shape -> List a -> List Repr
+argsOf (Just s) as = s.args
+argsOf Nothing as = List.map (\_ -> RepV) as
+
+resultOf : Maybe Shape -> Repr
+resultOf (Just s) = s.result
+resultOf Nothing = RepV
+
+-- | what each operand of a primitive is wanted as
+argReprs : {a : Type} -> String -> List a -> List Repr
+argReprs p as = argsOf (primShape p) as
+
+-- | what a primitive gives
+resultRepr : String -> Repr
+resultRepr p = resultOf (primShape p)
+
+-- What gives and what uses
+--------------------------------------------------------------------------------
+
+-- | what is seen of a variable: two kept alike; given a `V`; given an
+-- | unboxed value; given a literal; used where the repr is wanted (a
+-- | `V` by a uniform use); bound; a field a match binds
+data Event
+  = Merge String String
+  | Boxed String
+  | Unboxed String Repr
+  | Literal String Repr
+  | Wants String Repr
+  | Binds String
+  | Pinned String
+
+-- | what is walked: a value where a repr is wanted; a name bound or set
+-- | to what is computed; a step returned; a condition; statements; what
+-- | is last (the loop's parameters, if it is a function's body)
+data Item
+  = IVal Repr Imp.Val
+  | IBind String Imp.Comp
+  | IOp Imp.Comp
+  | ICond Imp.Cond
+  | ISts (List Imp.St)
+  | ITl (List String) Imp.Tl
+
+pushVals : Repr -> List Imp.Val -> List Item -> List Item
+pushVals r vs rest = List.foldr (\v acc -> Cons (IVal r v) acc) rest vs
+
+pushArgs : List Repr -> List Imp.Val -> List Item -> List Item
+pushArgs rs vs rest =
+  List.foldr (\p acc -> Cons (IVal (fst p) (snd p)) acc) rest (List.zip rs vs)
+
+-- (a name given a value, not a variable: what it is)
+sourceOf : String -> Imp.Val -> Event
+sourceOf x (SFixed w _) = Literal x (RepFix w)
+sourceOf x (SFloat _) = Literal x RepF64
+sourceOf x (SFloat32 _) = Literal x (RepFix F32)
+sourceOf x (SPrim p _) =
+  if isBoxed (resultRepr p) then Boxed x else Unboxed x (resultRepr p)
+sourceOf x v = Boxed x
+
+pinAll : List String -> List Event -> List Event
+pinAll xs acc = List.foldl (\a x -> Cons (Pinned x) (Cons (Binds x) a)) acc xs
+
+-- (the names mentioned, and bound)
+mentionedBy : Event -> List String
+mentionedBy (Wants x _) = Cons x Nil
+mentionedBy (Merge _ y) = Cons y Nil
+mentionedBy e = Nil
+
+mentioned : List Event -> List String
+mentioned evs = List.concatMap mentionedBy evs
+
+bindsOne : Map.Map String Unit -> Event -> Map.Map String Unit
+bindsOne m (Binds x) = Map.insert compareString x MkUnit m
+bindsOne m e = m
+
+boundBy : List Event -> Map.Map String Unit
+boundBy evs = List.foldl bindsOne Map.empty evs
+
+-- (those of `xs` not in `bs` nor before, in order)
+freeGo : Map.Map String Unit -> List String -> List String -> List String
+freeGo bs Nil acc = List.reverse acc
+freeGo bs (Cons x xs) acc =
+  if Map.member compareString x bs then freeGo bs xs acc
+  else freeGo (Map.insert compareString x MkUnit bs) xs (Cons x acc)
+
+-- | a lambda: its parameters given `V`s; what its body mentions and does
+-- | not bind (its closure's) wanted as a `V` where it is made and given
+-- | as one where its body starts; its body's own events (`evs`)
+lamEvents : List String -> List Event -> List Event -> List Event
+lamEvents xs evs acc =
+  List.foldl
+    (\a y -> Cons (Wants y RepV) (Cons (Boxed y) a))
+    (List.foldl
+       (\a x -> Cons (Boxed x) (Cons (Binds x) a))
+       (List.append evs acc)
+       xs)
+    (freeGo
+       (List.foldl
+          (\m x -> Map.insert compareString x MkUnit m)
+          (boundBy evs)
+          xs)
+       (mentioned evs)
+       Nil)
+
+armsSts : List (Imp.Arm (List Imp.St)) -> List Item -> List Item
+armsSts arms rest =
+  List.foldr
+    (\arm acc -> case arm of
+     MkArm _ _ ss -> Cons (ISts ss) acc)
+    rest
+    arms
+
+armsTl : List String -> List (Imp.Arm Imp.Tl) -> List Item -> List Item
+armsTl ps arms rest =
+  List.foldr
+    (\arm acc -> case arm of
+     MkArm _ _ t -> Cons (ITl ps t) acc)
+    rest
+    arms
+
+armVars : {a : Type} -> List (Imp.Arm a) -> List String
+armVars arms =
+  List.concatMap
+    (\arm -> case arm of
+     MkArm _ vs _ -> vs)
+    arms
+
+-- (each parameter given what the loop's next round gives it)
+loopBinds : List String -> List Imp.Val -> List Item -> List Item
+loopBinds ps vs rest =
+  List.foldr
+    (\p acc -> Cons (IBind (fst p) (OSimple (snd p))) acc)
+    rest
+    (List.zip ps vs)
+
+-- | the events of the worklist, last first
+walk : List Event -> List Item -> List Event
+walk acc Nil = acc
+walk acc (Cons (IVal r (SVar x)) rest) = walk (Cons (Wants x r) acc) rest
+walk acc (Cons (IVal r (SPrim p as)) rest) =
+  walk acc (pushArgs (argReprs p as) as rest)
+walk acc (Cons (IVal r (STag _ as)) rest) = walk acc (pushVals RepV as rest)
+walk acc (Cons (IVal r (SRec fs)) rest) =
+  walk acc (pushVals RepV (List.map snd fs) rest)
+walk acc (Cons (IVal r (SProj v _ _)) rest) = walk acc (Cons (IVal RepV v) rest)
+walk acc (Cons (IVal r (SLam xs (MkBlock t))) rest) =
+  walk (lamEvents xs (walk Nil (Cons (ITl Nil t) Nil)) acc) rest
+walk acc (Cons (IVal r _) rest) = walk acc rest
+walk acc (Cons (IBind x (OSimple (SVar y))) rest) =
+  walk (Cons (Merge x y) acc) rest
+walk acc (Cons (IBind x (OSimple v)) rest) =
+  walk (Cons (sourceOf x v) acc) (Cons (IVal RepV v) rest)
+walk acc (Cons (IBind x OAbandon) rest) = walk acc rest
+walk acc (Cons (IBind x o) rest) = walk (Cons (Boxed x) acc) (Cons (IOp o) rest)
+walk acc (Cons (IOp (OSimple v)) rest) = walk acc (Cons (IVal RepV v) rest)
+walk acc (Cons (IOp (OCall _ as)) rest) = walk acc (pushVals RepV as rest)
+walk acc (Cons (IOp (OApply f as)) rest) =
+  walk acc (pushVals RepV (Cons f as) rest)
+walk acc (Cons (IOp (OPrim _ as)) rest) = walk acc (pushVals RepV as rest)
+walk acc (Cons (IOp (OBool c)) rest) = walk acc (Cons (ICond c) rest)
+walk acc (Cons (IOp _) rest) = walk acc rest
+walk acc (Cons (ICond (PRel p a b)) rest) =
+  walk acc (pushArgs (argReprs p [a, b]) [a, b] rest)
+walk acc (Cons (ICond (PBool v)) rest) = walk acc (Cons (IVal RepV v) rest)
+walk acc (Cons (ICond (PNot c)) rest) = walk acc (Cons (ICond c) rest)
+walk acc (Cons (ICond (PIf a b c)) rest) =
+  walk acc (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
+walk acc (Cons (ICond (PLet x o c)) rest) =
+  walk (Cons (Binds x) acc) (Cons (IBind x o) (Cons (ICond c) rest))
+walk acc (Cons (ICond _) rest) = walk acc rest
+walk acc (Cons (ISts Nil) rest) = walk acc rest
+walk acc (Cons (ISts (Cons (SLet x o) ss)) rest) =
+  walk (Cons (Binds x) acc) (Cons (IBind x o) (Cons (ISts ss) rest))
+walk acc (Cons (ISts (Cons (SDecl x) ss)) rest) =
+  walk (Cons (Binds x) acc) (Cons (ISts ss) rest)
+walk acc (Cons (ISts (Cons (SSet x o) ss)) rest) =
+  walk acc (Cons (IBind x o) (Cons (ISts ss) rest))
+walk acc (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
+  walk
+    acc
+    (Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest))))
+walk acc (Cons (ISts (Cons (SCase v arms) ss)) rest) =
+  walk
+    (pinAll (armVars arms) acc)
+    (Cons (IVal RepV v) (armsSts arms (Cons (ISts ss) rest)))
+walk acc (Cons (ITl ps (TSeq ss t)) rest) =
+  walk acc (Cons (ISts ss) (Cons (ITl ps t) rest))
+walk acc (Cons (ITl ps (TReturn o)) rest) = walk acc (Cons (IOp o) rest)
+walk acc (Cons (ITl ps (TLoop vs)) rest) = walk acc (loopBinds ps vs rest)
+walk acc (Cons (ITl ps (TIf c t e)) rest) =
+  walk acc (Cons (ICond c) (Cons (ITl ps t) (Cons (ITl ps e) rest)))
+walk acc (Cons (ITl ps (TCase v arms)) rest) =
+  walk (pinAll (armVars arms) acc) (Cons (IVal RepV v) (armsTl ps arms rest))
+
+-- | the events of a definition: its parameters given `V`s where it is
+-- | entered, and the loop's next round giving them their values
+defEvents : Imp.Def -> List Event
+defEvents (MkDef _ _ (DefFun xs (MkBlock t))) =
+  walk
+    (List.foldl (\a x -> Cons (Boxed x) (Cons (Binds x) a)) Nil xs)
+    (Cons (ITl xs t) Nil)
+defEvents (MkDef _ _ (DefVal (MkBlock t))) = walk Nil (Cons (ITl Nil t) Nil)
+
+-- Classes
+--------------------------------------------------------------------------------
+
+-- (the class a name is in, by the name it is known by)
+rootFrom : Map.Map String String -> String -> Maybe String -> String
+rootFrom parent x (Just y) =
+  if strEq x y then x else rootFrom parent y (Map.lookup compareString y parent)
+rootFrom parent x Nothing = x
+
+rootOf : Map.Map String String -> String -> String
+rootOf parent x = rootFrom parent x (Map.lookup compareString x parent)
+
+unite : Map.Map String String -> String -> String -> Map.Map String String
+unite parent a b =
+  if strEq (rootOf parent a) (rootOf parent b) then parent
+  else Map.insert compareString (rootOf parent a) (rootOf parent b) parent
+
+pinsOne : Map.Map String Unit -> Event -> Map.Map String Unit
+pinsOne m (Pinned x) = Map.insert compareString x MkUnit m
+pinsOne m e = m
+
+pinnedIn : List Event -> Map.Map String Unit
+pinnedIn evs = List.foldl pinsOne Map.empty evs
+
+-- (a copy to or from a field a match binds -- which stays a `V` -- a
+-- `V` given and one wanted)
+unpinOne : Map.Map String Unit -> Event -> List Event
+unpinOne pins (Merge x y) =
+  if Map.member compareString x pins || Map.member compareString y pins
+    then [Boxed x, Wants y RepV]
+  else Cons (Merge x y) Nil
+unpinOne pins e = Cons e Nil
+
+unpinned : Map.Map String Unit -> List Event -> List Event
+unpinned pins evs = List.concatMap (unpinOne pins) evs
+
+classOne : Map.Map String String -> Event -> Map.Map String String
+classOne m (Merge x y) = unite m x y
+classOne m e = m
+
+classesOf : List Event -> Map.Map String String
+classesOf evs = List.foldl classOne Map.empty evs
+
+-- | what is seen of a class: the reprs its evidence says, how many `V`s
+-- | and unboxed values it is given, how many uses want a `V` and how many
+-- | an unboxed value, whether it holds a field a match binds
+type Stats =
+  { reprs : List Repr
+  , boxedIn : Int
+  , unboxedIn : Int
+  , boxedOut : Int
+  , unboxedOut : Int
+  , pinned : Bool
+  }
+
+noStats : Stats
+noStats =
+  { reprs = Nil
+  , boxedIn = 0
+  , unboxedIn = 0
+  , boxedOut = 0
+  , unboxedOut = 0
+  , pinned = False
+  }
+
+withRepr : Repr -> List Repr -> List Repr
+withRepr RepV rs = rs
+withRepr r rs = if List.any (reprEq r) rs then rs else Cons r rs
+
+-- (`bi`, `ui`, `bo`, `uo` added; `r` evidence)
+statsWith : Repr -> Int -> Int -> Int -> Int -> Bool -> Stats -> Stats
+statsWith r bi ui bo uo pin s =
+  { reprs = withRepr r s.reprs
+  , boxedIn = s.boxedIn + bi
+  , unboxedIn = s.unboxedIn + ui
+  , boxedOut = s.boxedOut + bo
+  , unboxedOut = s.unboxedOut + uo
+  , pinned = s.pinned || pin
+  }
+
+seen : Event -> Stats -> Stats
+seen (Boxed _) s = statsWith RepV 1 0 0 0 False s
+seen (Unboxed _ r) s = statsWith r 0 1 0 0 False s
+seen (Literal _ r) s = statsWith r 0 0 0 0 False s
+seen (Wants _ RepV) s = statsWith RepV 0 0 1 0 False s
+seen (Wants _ r) s = statsWith r 0 0 0 1 False s
+seen (Pinned _) s = statsWith RepV 0 0 0 0 True s
+seen e s = s
+
+eventName : Event -> String
+eventName (Boxed x) = x
+eventName (Unboxed x _) = x
+eventName (Literal x _) = x
+eventName (Wants x _) = x
+eventName (Pinned x) = x
+eventName (Binds x) = x
+eventName (Merge x _) = x
+
+-- (an event of the class `root`)
+seenIn : Map.Map String Stats -> Event -> String -> Map.Map String Stats
+seenIn m e root =
+  Map.insert
+    compareString
+    root
+    (seen e (fromMaybe noStats (Map.lookup compareString root m)))
+    m
+
+statsOf : Map.Map String String -> List Event -> Map.Map String Stats
+statsOf parent evs =
+  List.foldl (\m e -> seenIn m e (rootOf parent (eventName e))) Map.empty evs
+
+-- (what a box costs, and an unbox: a `Float64`'s box is an allocation,
+-- its unbox of a `V` held gives it up; a 64-bit integer's, a test and,
+-- beyond 62 bits, the same; a narrower one's, a shift)
+boxCost : Repr -> Int
+boxCost RepF64 = 3
+boxCost (RepFix w) = if Fixed.fixedBits w == 64 then 2 else 1
+boxCost RepV = 0
+
+unboxCost : Repr -> Int
+unboxCost RepF64 = 2
+unboxCost r = 1
+
+-- | how a class is kept: unboxed, where all its evidence says one type,
+-- | and keeping it so costs no more than keeping it a `V` -- the `V`s
+-- | it is given unboxed and the uses wanting a `V` boxed, against the
+-- | unboxed values it is given boxed and the uses wanting one unboxed
+decideOf : Stats -> List Repr -> Repr
+decideOf s (Cons r Nil) =
+  if s.boxedIn * unboxCost r + s.boxedOut * boxCost r
+  <= s.unboxedIn * boxCost r + s.unboxedOut * unboxCost r
+    then r
+  else RepV
+decideOf s rs = RepV
+
+decide : Stats -> Repr
+decide s = if s.pinned then RepV else decideOf s s.reprs
+
+-- (a name, kept as its class is, if unboxed)
+keptAs : Reprs -> String -> Repr -> Reprs
+keptAs m x RepV = m
+keptAs m x r = Map.insert compareString x r m
+
+keptOne : Map.Map String String
+        -> Map.Map String Stats
+        -> Reprs
+        -> Event
+        -> Reprs
+keptOne parent stats m (Binds x) =
+  keptAs
+    m
+    x
+    (decide
+       (fromMaybe noStats (Map.lookup compareString (rootOf parent x) stats)))
+keptOne parent stats m e = m
+
+reprsIn : Map.Map String String -> List Event -> Reprs
+reprsIn parent evs =
+  List.foldl (keptOne parent (statsOf parent evs)) Map.empty evs
+
+reprsFrom : List Event -> Reprs
+reprsFrom evs = reprsIn (classesOf evs) evs
+
+eventsOf : List Event -> List Event
+eventsOf evs = unpinned (pinnedIn evs) evs
+
+-- | a definition's unboxed variables
+-- | >>> Map.toList (reprsOf (MkDef "f" "f" (DefFun ["x"] (MkBlock (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"])))))))
+-- | [MkPair "x" (RepFix I64)]
+reprsOf : Imp.Def -> Reprs
+reprsOf d = reprsFrom (eventsOf (defEvents d))

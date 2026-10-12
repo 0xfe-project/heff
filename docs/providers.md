@@ -51,8 +51,13 @@ number; in C an integer of up to 32 bits is a word of its value
 (`INT_OF`), one of 64 bits is kept as an `Int` is, a `Float32` is a
 word of its bits (`heff_f32_of`, `heff_f32`), and a `Float64` is boxed
 (`FLT_OF`, `heff_flt`).  So in C a `Float64`, and an `Int64` or `UInt64`
-beyond 62 bits (as an `Int` is), costs an allocation each value, where
-an integer of up to 32 bits and a `Float32` cost none.
+beyond 62 bits (as an `Int` is), costs an allocation each value given
+as one -- to a provider, into a list, a record or a closure, to a
+function or back from it -- where an integer of up to 32 bits and a
+`Float32` cost none.  Where a program computes with a fixed-width number
+or a `Float64`, it keeps it unboxed, as its C type (`int64_t`,
+`double`, ...), and boxes it only where it is given so
+(src/heff/compile/repr.hf).
 
 A provider is given a rune as a number in JavaScript, and in C as a
 word of its code point (`INT_OF`, `MK_INT`).

@@ -56,6 +56,11 @@ extern char **environ;
 #include <stdlib.h>
 #include <string.h>
 
+// (a float's operations each rounded, as JavaScript's are: none of them
+// fused into another, `a * b + c` into an FMA -- the program's own,
+// written as C's operators where its numbers are unboxed (#39))
+#pragma STDC FP_CONTRACT OFF
+
 // (the runtime's state: defined once, in the program's first file; a
 // program split into parts (`HEFF_PART`, `heff build`) declares it in the
 // others, each of which has its own copy of the runtime's functions)
@@ -1985,10 +1990,37 @@ static inline V fx_mk_int64_t(uint64_t u) { return heff_int((int64_t)u); }
 static inline uint64_t fx_get_uint64_t(V v) { return fx_get_int64_t(v); }
 static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
 
+// (an integer type's operations on its C type `T` (`heff_div_i32` and the
+// rest, `S` its suffix, `BITS` its bits), which its primitives are made of
+// and a program's unboxed numbers (#39) are computed by: a shift is by the
+// count modulo the bits, and by a negative count, of a signed type, the
+// other way by its size)
+#define FX_OPS(name, S, T, BITS)                                                     \
+  static inline T heff_div_##S(T x, T y) {                                           \
+    if (y == 0) return 0;                                                            \
+    if ((T)-1 < (T)0 && y == (T)-1) return (T)((uint64_t)0 - (uint64_t)x);          \
+    return (T)(x / y); }                                                             \
+  static inline T heff_rem_##S(T x, T y) {                                           \
+    if (y == 0) return x;                                                            \
+    if ((T)-1 < (T)0 && y == (T)-1) return 0;                                        \
+    return (T)(x % y); }                                                             \
+  static inline uint64_t heff_##name##Left(uint64_t x, uint64_t n) {                 \
+    return x << (n & (BITS - 1)); }                                                  \
+  static inline uint64_t heff_##name##Right(uint64_t x, uint64_t n) {                \
+    return (uint64_t)((T)x >> (n & (BITS - 1))); }                                   \
+  static inline T heff_shl_##S(T a, T b) {                                           \
+    uint64_t x = (uint64_t)a, y = (uint64_t)b;                                       \
+    if ((T)-1 < (T)0 && (int64_t)y < 0) return (T)heff_##name##Right(x, 0 - y);      \
+    return (T)heff_##name##Left(x, y); }                                             \
+  static inline T heff_shr_##S(T a, T b) {                                           \
+    uint64_t x = (uint64_t)a, y = (uint64_t)b;                                       \
+    if ((T)-1 < (T)0 && (int64_t)y < 0) return (T)heff_##name##Left(x, 0 - y);       \
+    return (T)heff_##name##Right(x, y); }
+
 // (an integer type's primitives: `heff_int32Add` and the rest, `T` its C
-// type, `BITS` its bits; a shift is by the count modulo the bits, and by
-// a negative count, of a signed type, the other way by its size)
-#define FX_INT(name, T, BITS)                                                        \
+// type, `S` its suffix, `BITS` its bits)
+#define FX_INT(name, S, T, BITS)                                                     \
+  FX_OPS(name, S, T, BITS)                                                           \
   static V heff_##name##Add(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x + y); }       \
   static V heff_##name##Sub(V a, V b) {                                              \
@@ -1997,14 +2029,10 @@ static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x * y); }       \
   static V heff_##name##Div(V a, V b) {                                              \
     T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
-    if (y == 0) return fx_mk_##T(0);                                                 \
-    if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T((uint64_t)0 - (uint64_t)x);    \
-    return fx_mk_##T((uint64_t)(x / y)); }                                           \
+    return fx_mk_##T((uint64_t)heff_div_##S(x, y)); }                                \
   static V heff_##name##Rem(V a, V b) {                                              \
     T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
-    if (y == 0) return fx_mk_##T((uint64_t)x);                                       \
-    if ((T)-1 < (T)0 && y == (T)-1) return fx_mk_##T(0);                            \
-    return fx_mk_##T((uint64_t)(x % y)); }                                           \
+    return fx_mk_##T((uint64_t)heff_rem_##S(x, y)); }                                \
   static inline int heff_##name##Eq_c(V a, V b) {                                   \
     T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b); return x == y; }                  \
   static inline int heff_##name##Lt_c(V a, V b) {                                   \
@@ -2020,32 +2048,24 @@ static inline V fx_mk_uint64_t(uint64_t u) { return heff_int_u64(u); }
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x | y); }       \
   static V heff_##name##Xor(V a, V b) {                                              \
     uint64_t x = fx_get_##T(a), y = fx_get_##T(b); return fx_mk_##T(x ^ y); }       \
-  static inline uint64_t heff_##name##Left(uint64_t x, uint64_t n) {                 \
-    return x << (n & (BITS - 1)); }                                                  \
-  static inline uint64_t heff_##name##Right(uint64_t x, uint64_t n) {                \
-    return (uint64_t)((T)x >> (n & (BITS - 1))); }                                   \
   static V heff_##name##Shl(V a, V b) {                                              \
-    uint64_t x = fx_get_##T(a), y = fx_get_##T(b);                                  \
-    if ((T)-1 < (T)0 && (int64_t)y < 0)                                              \
-      return fx_mk_##T(heff_##name##Right(x, 0 - y));                                \
-    return fx_mk_##T(heff_##name##Left(x, y)); }                                     \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
+    return fx_mk_##T((uint64_t)heff_shl_##S(x, y)); }                                \
   static V heff_##name##Shr(V a, V b) {                                              \
-    uint64_t x = fx_get_##T(a), y = fx_get_##T(b);                                  \
-    if ((T)-1 < (T)0 && (int64_t)y < 0)                                              \
-      return fx_mk_##T(heff_##name##Left(x, 0 - y));                                 \
-    return fx_mk_##T(heff_##name##Right(x, y)); }                                    \
+    T x = (T)fx_get_##T(a), y = (T)fx_get_##T(b);                                   \
+    return fx_mk_##T((uint64_t)heff_shr_##S(x, y)); }                                \
   static V heff_##name##Show(V a) { return heff_intShow(a); }                        \
   static V heff_##name##FromInt(V a) {                                               \
     uint64_t u = heff_int_low64(a); heff_drop(a); return fx_mk_##T(u); }             \
   static V heff_##name##ToInt(V a) { return a; }
-FX_INT(int8, int8_t, 8)
-FX_INT(int16, int16_t, 16)
-FX_INT(int32, int32_t, 32)
-FX_INT(int64, int64_t, 64)
-FX_INT(uint8, uint8_t, 8)
-FX_INT(uint16, uint16_t, 16)
-FX_INT(uint32, uint32_t, 32)
-FX_INT(uint64, uint64_t, 64)
+FX_INT(int8, i8, int8_t, 8)
+FX_INT(int16, i16, int16_t, 16)
+FX_INT(int32, i32, int32_t, 32)
+FX_INT(int64, i64, int64_t, 64)
+FX_INT(uint8, u8, uint8_t, 8)
+FX_INT(uint16, u16, uint16_t, 16)
+FX_INT(uint32, u32, uint32_t, 32)
+FX_INT(uint64, u64, uint64_t, 64)
 
 #define F32_2(name, expr) \
   static V heff_float32##name(V a, V b) { float x = heff_f32_of(a), y = heff_f32_of(b); return expr; }
@@ -2089,6 +2109,49 @@ static V heff_float32Floor(V a) {
   if (!isfinite(d)) return MK_INT(0);
   return heff_int_of_double(floor(d));
 }
+
+// Unboxed numbers (#39)
+// ---------------------------------------------------------------------
+// Where a program computes with a fixed-width number or a `Float64`, it
+// keeps it as its C type (src/heff/compile/repr.hf), and makes it a `V`
+// only where one is wanted: `heff_box_S` (`S` the type's suffix, `i64`,
+// `f32`, ...), the `V` made of it; `heff_unbox_S`, the number of a `V`,
+// consumed; `heff_peek_S`, looked at.  `heff_from_int_S` is the type's
+// `fromInt` of an `Int` (consumed), `heff_floor_S` its `floor`.
+
+#define FX_BOXES(S, T)                                                      \
+  static inline V heff_box_##S(T x) { return fx_mk_##T((uint64_t)x); }      \
+  static inline T heff_unbox_##S(V v) { return (T)fx_get_##T(v); }         \
+  static inline T heff_peek_##S(V v) { return (T)heff_int_low64(v); }      \
+  static inline T heff_from_int_##S(V v) {                                 \
+    uint64_t u = heff_int_low64(v); heff_drop(v); return (T)u; }
+FX_BOXES(i8, int8_t)
+FX_BOXES(i16, int16_t)
+FX_BOXES(i32, int32_t)
+FX_BOXES(i64, int64_t)
+FX_BOXES(u8, uint8_t)
+FX_BOXES(u16, uint16_t)
+FX_BOXES(u32, uint32_t)
+FX_BOXES(u64, uint64_t)
+
+static inline V heff_box_f32(float x) { return heff_f32(x); }
+static inline float heff_unbox_f32(V v) { return heff_f32_of(v); }
+static inline float heff_peek_f32(V v) { return heff_f32_of(v); }
+static inline float heff_from_int_f32(V v) {
+  double d = heff_double_of_int(v); heff_drop(v); return (float)d; }
+
+static inline V heff_box_f64(double x) { return heff_flt(x); }
+static inline double heff_unbox_f64(V v) { double d = FLT_OF(v); heff_drop(v); return d; }
+static inline double heff_peek_f64(V v) { return FLT_OF(v); }
+static inline double heff_from_int_f64(V v) {
+  double d = heff_double_of_int(v); heff_drop(v); return d; }
+
+// (of what is not finite, 0)
+static V heff_floor_f64(double d) {
+  if (!isfinite(d)) return MK_INT(0);
+  return heff_int_of_double(floor(d));
+}
+static V heff_floor_f32(float f) { return heff_floor_f64((double)f); }
 
 // Runes
 // ---------------------------------------------------------------------
