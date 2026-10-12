@@ -12,6 +12,9 @@ A module is a file under a project's `src/`, named by its path there:
 `src/parse/surface.hf` is `parse.surface`.  Modules are looked up there
 and in `lib/` (`std.io` is `lib/std/io.hf`); a file outside `src/` (a
 test) may also import files beside it, by their paths from the root.
+A module found at more than one file -- a `list.hf` of the program's
+beside the library's -- is an error, and is loaded from neither: what
+is used of it is no error of its own, until one file is renamed.
 
 Every module imports `builtin` and `prelude` without writing them, and
 `list` as `List`, the operations of lists (`List.map`, `List.length`)

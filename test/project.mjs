@@ -123,6 +123,24 @@ rmSync(join(work, "hello/src/hello/Shout.hf")); rmSync(join(work, "hello/src/hel
 write("hello/src/prelude.hf", "x : Int\nx = 1\n");
 const clash = await heff("check", "hello/src/hello/words.hf");
 expect("a module twice", clash.status === 1 && clash.stderr.includes("module prelude is more than one file: hello/src/prelude.hf and "), clash);
+rmSync(join(work, "hello/src/prelude.hf"));
+// ... loaded from neither, the file to rename said: what is used of it,
+// `List.length`, is no error of its own -- in a project, and in a
+// program of no project, beside its `main.hf`
+write("hello/src/list.hf", "x : Int\nx = 1\n");
+write("hello/src/hello/len.hf", "n : Int\nn = List.length [1, 2]\n");
+const listClash = await heff("check", "hello/src/hello/len.hf");
+expect("a module of the library's name, in a project", listClash.status === 1 &&
+  listClash.stderr.includes("module list is more than one file: hello/src/list.hf and ") &&
+  listClash.stderr.includes(", so it is loaded from neither: rename hello/src/list.hf, and the imports of it, so that the name is one file's") &&
+  !listClash.stderr.includes("error["), listClash);
+rmSync(join(work, "hello/src/list.hf")); rmSync(join(work, "hello/src/hello/len.hf"));
+write("loose/list.hf", "x : Int\nx = 1\n");
+write("loose/main.hf", "n : Int\nn = List.length [1, 2]\n");
+const looseClash = await heff("check", "loose/main.hf");
+expect("a module of the library's name, beside a program", looseClash.status === 1 &&
+  looseClash.stderr.includes("module list is more than one file: loose/list.hf and ") &&
+  looseClash.stderr.includes("rename loose/list.hf") && !looseClash.stderr.includes("error["), looseClash);
 
 // package.hf that does not read; one for another heff
 write("bad/package.hf", "package =\n  { module = \"bad\"\n  , heff = \"0.1\"\n  , require = []\n  , replace = []\n  }\n");
