@@ -104,11 +104,11 @@ await pool(files, async (f) => {
 console.log(`native-asan: ${files.length - failed} of ${files.length} checked in ${since(t2).toFixed(1)}s; the slowest: ${slowest(checked)}`);
 
 // (a program compiled to C by it, built under ASan as it is, each of its
-// definitions shown: test/programs/jsstring.hf, whose JavaScript strings
-// (std.js) are strings in C, held in lists, records and constructors and
-// let go of -- each dropped as a string is, never as a constructor's,
-// which none is)
-for (const f of ["jsstring.hf"]) {
+// definitions shown: test/programs/bytes-values.hf, whose Bytes are
+// strings' objects of their own kind in C, held in lists, records,
+// constructors and closures, grown in place and let go of -- each
+// dropped as a string is, never as a constructor's)
+for (const f of ["bytes-values.hf"]) {
   const t = performance.now(), c = join(work, basename(f, ".hf") + ".c"), bin = join(work, basename(f, ".hf"));
   const names = [...readFileSync(join(root, "test", "programs", f), "utf8").matchAll(/^([a-z]\w*) :/gm)].map((m) => m[1]);
   const r = await run(heff, ["compile", join("test", "programs", f), c, "--backend=c"], { cwd: work, env });

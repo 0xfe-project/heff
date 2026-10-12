@@ -1,5 +1,5 @@
 // The terminal's side of src/heff/lsp/report.hf: an effect provider (the
-// shape of one is said in lib/std/dom.provider.js).
+// shape of one is said in lib/browser/dom.provider.js).
 export const $host = "node";
 // (colour on `stream`: it is a terminal, or `HEFF_TTY=1` says it is, and
 // `NO_COLOR` is not set)

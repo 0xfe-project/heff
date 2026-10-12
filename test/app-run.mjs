@@ -91,6 +91,13 @@ if (finder) {
 const withOut = (page) => { const p = new Node("p"); p.setAttribute("id", "out"); page.appendChild(p); };
 const aliased = await run("test/apps/aliased.hf", "aliased", withOut);
 if (aliased) check("an effect by its definition", aliased.children[0].text, "42");
+// std.time beside the page's world, its provider the page's too
+const slept = await run("test/apps/slept.hf", "slept", withOut);
+if (slept) {
+  check("std.time, before the time has passed", slept.children[0].text, "sleeping");
+  tick();
+  check("std.time, after", slept.children[0].text, "slept");
+}
 // a world of the test's own beside the page's, each acting on what the
 // other's provider handed out: the world holds them for both (std.handle)
 const painted = await run("test/apps/paint.hf", "painted", withOut);
@@ -129,5 +136,5 @@ if (counter && clock && load(win, join(work, "counter.js")) && load(win, join(wo
   check("two apps: the counter", label.text, "count: 1");
   check("two apps: the clock", ticks.text, "1 ticks");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, painted, names and greet run, and counter and clock on one page"}`);
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, names and greet run, and counter and clock on one page"}`);
 process.exit(failed ? 1 : 0);

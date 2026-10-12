@@ -2,7 +2,7 @@
 // Language Server Protocol frames it -- each message a `Content-Length:
 // n` header, a blank line, then n bytes of JSON; stdout carries only the
 // messages, logs go to stderr -- and what of the host a language server
-// asks for (the shape of a provider is said in lib/std/dom.provider.js).
+// asks for (the shape of a provider is said in lib/browser/dom.provider.js).
 // Its strings are text, a host of text's -- JSON's, and the paths and
 // URIs a client names, or that are made of them (`$toJs`, `$fromJs`) --
 // but for what it sends and logs, which is written out as it is

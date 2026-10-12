@@ -391,6 +391,92 @@ forHost host p = case Em.hostOf p.text of
   Nothing -> True
   Just h -> strEq h host
 
+-- The library's halves: lib/browser/ is the page's, lib/std/'s effects
+-- the system's, by C (but those with a provider in JavaScript too:
+-- std.ref, std.time).  An import of the other half is an error there.
+--------------------------------------------------------------------------------
+
+browserRefused : Dr.Source -> Dr.Refused
+browserRefused s =
+  { module = s.module
+  , code = 351
+  , msg =
+      "`"
+      ^ s.module
+      ^ "` is the browser's (lib/browser/), for JavaScript: a C program (--backend=c) cannot import it"
+  }
+
+systemRefused : String -> Dr.Source -> Dr.Refused
+systemRefused host s =
+  { module = s.module
+  , code = 352
+  , msg =
+      "`"
+      ^ s.module
+      ^ "` is an effect of the system (lib/std/), for C: it has no provider for --backend="
+      ^ host
+  }
+
+isBrowser : Dr.Source -> Bool
+isBrowser s = s.library && startsWith "browser." s.module
+
+jsFor : String -> String -> Maybe String -> Bool
+jsFor host m Nothing = False
+jsFor host m (Just t) = forHost host { module = m, text = t }
+
+-- (one of lib/std/'s with a provider in C, and none in JavaScript for
+-- `host`: one for another host, or none at all)
+systemOnly : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> String
+           -> Dr.Source
+           -> Co e Bool
+systemOnly host s = do
+  c <- readFile (L.dropHf s.path ^ ".provider.c")
+  js <- readFile (L.dropHf s.path ^ ".provider.js")
+  pure (case c of
+    Just _ -> not (jsFor host s.module js)
+    Nothing -> False)
+
+refusedJs : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> String
+          -> List Dr.Source
+          -> Co e (List Dr.Refused)
+refusedJs host Nil = pure Nil
+refusedJs host (Cons s rest) = do
+  rs <- refusedJs host rest
+  if s.library && startsWith "std." s.module
+      then do
+        only <- systemOnly host s
+        pure (if only then Cons (systemRefused host s) rs else rs)
+    else pure rs
+
+-- | the library's modules a program for `host` may not import: in C,
+-- | lib/browser/'s; in JavaScript, lib/std/'s effects of the system
+refusedFor : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> String
+           -> List Dr.Source
+           -> Co e (List Dr.Refused)
+refusedFor host sources =
+  if strEq host "c"
+    then pure
+        (List.map (\s -> browserRefused s) (List.filter isBrowser sources))
+  else refusedJs host sources
+
+-- | the modules checked, each import of what `host` refuses an error at
+-- | the import
+refusedChecked : {e : HFunctor}
+               -> {{disk : fs <: e}}
+               -> String
+               -> List Dr.Source
+               -> List Dr.Checked
+               -> Co e (List Dr.Checked)
+refusedChecked host sources cs = do
+  rs <- refusedFor host sources
+  pure (List.map (\c -> Dr.withRefused rs sources c) cs)
+
 providesLeaf : List Em.Provider -> String -> Bool
 providesLeaf Nil k = False
 providesLeaf (Cons p rest) k =
@@ -857,7 +943,8 @@ compileDiags : {e : HFunctor}
              -> Bool
              -> List Dr.Checked
              -> Co e Unit
-compileDiags bi sources host file name outPath done badL cs = do
+compileDiags bi sources host file name outPath done badL checked = do
+  cs <- refusedChecked host sources checked
   putFileDiags cs
   if badL || anyErrors cs then exit 1
     else compileLast bi sources host file name outPath done cs
@@ -1181,9 +1268,10 @@ cThen name outPath file done = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
   acc <- Se.cachedAcc l
-  putFileDiags acc.done
-  if badL > 0 || anyErrors acc.done then exit 1
-    else compileLastC (backInOf l acc) l.sources file name outPath done acc.done
+  cs <- refusedChecked "c" l.sources acc.done
+  putFileDiags cs
+  if badL > 0 || anyErrors cs then exit 1
+    else compileLastC (backInOf l acc) l.sources file name outPath done cs
 
 cCmd : {e : HFunctor}
      -> {{io : stdio <: e}}

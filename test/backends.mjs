@@ -13,7 +13,7 @@
 // Programs: those of test/node, compiled to a program by each backend
 // (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
 // write, their exit status, loops a million rounds deep, a long loop of
-// operations done at once, time and the network; and, by C alone,
+// operations done at once, time; and, by C alone, the network,
 // processes forked, and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
@@ -96,6 +96,8 @@ const values = pool(cases, async (c) => {
   // loops as loops, it may run for ever)
   const wanted = [...interp.keys()].filter((n) => interp.get(n) !== "<diverged>");
   for (const [be, compile] of Object.entries(backends)) {
+    // (the browser's modules are JavaScript's: a C program refuses them)
+    if (be === "c" && /^import browser\./m.test(c.src)) continue;
     const r = await compile(file, join(work, `${c.name}-${be}`), wanted);
     if (r.compile !== undefined) { fail(`NOT COMPILED ${c.name} (${be}):\n${r.compile}`); continue; }
     if (r.load.status !== 0 || r.load.error) { fail(`LOAD FAILED ${c.name} (${be}): ${(r.load.stderr || String(r.load.error ?? r.load.signal)).split("\n").slice(0, 6).join("\n")}`); continue; }
@@ -144,10 +146,11 @@ const programs = {
 };
 
 // (the program `name` of `file` run by each backend in turn with `args`,
-// what it wrote and its status held to `want`; what fails, said)
-const ran = async (what, file, name, args, want, { cflags, ...opts } = {}) => {
+// what it wrote and its status held to `want`; what fails, said; `on`,
+// the backends, if not each)
+const ran = async (what, file, name, args, want, { cflags, on = Object.keys(programs), ...opts } = {}) => {
   const msgs = [];
-  for (const [be, build] of Object.entries(programs)) {
+  for (const [be, build] of Object.entries(programs).filter(([be]) => on.includes(be))) {
     const p = await build(file, name, cflags);
     if (p.error !== undefined) { msgs.push(`FAIL ${what} (${be}): not compiled\n${p.error}`); continue; }
     const r = await run(p.cmd, [...p.pre, ...args], { timeout: 60000, ...opts });
@@ -213,11 +216,10 @@ checks.push((async () => {
   return r.status !== 3 || r.stderr !== "to stderr\n" ? [`FAIL heff run: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`] : [];
 })());
 
-// time and the network: done later, the rest going on then
-checks.push(ran("sleep and fetch", "test/node/timed.hf", "timed", [], { out: "fetched\n", status: 0 }));
+// time: done later, the rest going on then
+checks.push(ran("sleep", "test/node/timed.hf", "timed", [], { out: "slept\n", status: 0 }));
 
-// the network, by C alone (Node.js's fetch gives a page of 404 as it
-// is): a server of the test's own and `data:` URLs fetched by libcurl in
+// the network, by C alone (std.net has no provider for Node.js): a server of the test's own and `data:` URLs fetched by libcurl in
 // the process and by the curl spawned (`-DHEFF_NET_SPAWN`), the same
 // text from each -- a page, a failure's message -- and each as wanted
 // (where it is curl's version's to say, the start of it).  Run again
@@ -325,10 +327,13 @@ checks.push((async () => {
 })());
 
 // a computation of an effect the backend has no provider for is refused,
-// and why
-for (const be of ["node", "c"]) checks.push((async () => {
+// and why: in C at the import of the browser's module already
+for (const [be, why] of [
+  ["node", "counter has the effect browser.dom.dom, which is not provided here"],
+  ["c", "examples/counter/counter.hf:7:1\nerror[E0351]: `browser.dom` is the browser's (lib/browser/), for JavaScript: a C program (--backend=c) cannot import it"],
+]) checks.push((async () => {
   const r = await heff(["compile", "examples/counter/counter.hf", join(work, `counter.${be}`), "--name", "counter", `--backend=${be}`], { cwd: root });
-  return r.status !== 0 && r.stderr.includes("counter has the effect std.dom.dom, which is not provided here") ? []
+  return r.status !== 0 && r.stderr.includes(why) ? []
     : [`FAIL an app is not a program (${be}): ${r.status} ${r.stderr}`];
 })());
 
@@ -344,12 +349,13 @@ checks.push(ran("state peeled in-language", "test/node/counted.hf", "main", [], 
 checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
   { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 }));
 
-// a `JSString` (std.js) field of an operation: a JavaScript string to the
-// JavaScript provider, given and taken through no helper (its length its
-// text's UTF-16 code units, not its bytes), and to the C one a string of
-// UTF-8, valid, which says the same
+// a `JSString` (browser.js) field of an operation: a JavaScript string to the
+// provider, given and taken through no helper (its length its text's
+// UTF-16 code units, not its bytes); by JavaScript alone, the browser's
+// modules C's to refuse
 checks.push(ran("JSString given as it is", "test/node/jstext.hf", "main", [],
-  { out: "5 bytes, 5 code units: plain\n7 bytes, 4 code units: é😀a\n3 bytes, 3 code units: x\u{FFFD}y\n", status: 0 }));
+  { out: "5 bytes, 5 code units: plain\n7 bytes, 4 code units: é😀a\n3 bytes, 3 code units: x\u{FFFD}y\n", status: 0 },
+  { on: ["js"] }));
 
 // processes, by C alone (test/node/fork.provider.c forks; Node.js cannot
 // give a continuation to another process): the rest of the program run

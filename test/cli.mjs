@@ -250,7 +250,7 @@ expect("version, a package.hf that does not read", badPkg.status === 1 && badPkg
 // what a word completes to: the commands, a command's flags, a flag's
 // values, its files
 for (const [words, out] of [
-  [["co"], "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), node (a Node.js program running NAME), c (a C program running NAME, for `zig cc`)\ncompletions\ta completion script for SHELL\n"],
+  [["co"], "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), c (a C program running NAME, for `zig cc`); node (a Node.js program running NAME) is for heff's own tests\ncompletions\ta completion script for SHELL\n"],
   [["compile", "a.hf", "--b"], "--backend\twhat it is compiled to\n"],
   [["compile", "a.hf", "-b", ""], "esm\npage\nnode\nc\n"],
   [["compile", "a.hf", "--backend=n"], "--backend=node\n"],

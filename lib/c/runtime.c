@@ -2396,20 +2396,6 @@ static V heff_strRuneCount(V a) {
   return MK_INT(n);
 }
 
-// (its text as JavaScript has it: here, the string made text, what is
-// not UTF-8 U+FFFD -- what JavaScript's, read back, is -- and back, as it
-// is)
-static V heff_strToJS(V a) {
-  Str *x = (Str *)a;
-  int own;
-  heff_u8_valid_len(x->s, x->len, &own);
-  if (own) return a;
-  V s = heff_str_valid(x->s, x->len);
-  heff_drop(a);
-  return s;
-}
-static V heff_strFromJS(V a) { return a; }
-
 // Arrays
 // ---------------------------------------------------------------------
 
@@ -2589,10 +2575,7 @@ static V heff_cons(V x, V rest) {
 // `False`).  Content and paths are the string's bytes, as they are;
 // text is made valid, what is not UTF-8 in it U+FFFD, both in and out,
 // as the JavaScript backend's names are (Node.js has an argument, the
-// environment, as text alone).  A field of type `JSString` (std.js) is
-// a string too, its text UTF-8 and valid already (all `heff_strToJS`
-// makes): out by `heff_cstr_text`, which gives it as it is, and one
-// made of what the system gives by `heff_str_text`.
+// environment, as text alone).
 
 // (content in, `n` bytes, as a string)
 static V heff_str_bytes(const void *c, int64_t n) { return heff_str_of(c, n); }

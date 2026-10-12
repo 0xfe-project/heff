@@ -1,5 +1,5 @@
 // test/node/boxes.hf's world: an effect provider (the shape of one is
-// said in lib/std/dom.provider.js).  A box is an object of its own, `{ n
+// said in lib/browser/dom.provider.js).  A box is an object of its own, `{ n
 // }`, held by the world (lib/std/handle.hf) and counted when the world
 // lets it go -- whichever provider asked it to.
 export const boxes = (world) => {

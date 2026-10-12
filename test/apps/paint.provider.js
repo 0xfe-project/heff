@@ -1,6 +1,6 @@
 // test/apps/paint.hf's world: an effect provider (the shape of one is
-// said in lib/std/dom.provider.js).  The elements it paints std.dom's
-// provider found, and the stamps it makes std.dom's puts on the page:
+// said in lib/browser/dom.provider.js).  The elements it paints browser.dom's
+// provider found, and the stamps it makes browser.dom's puts on the page:
 // each is the world's, held for both (lib/std/handle.hf), a handle
 // `MkHandle i` the world's `i`th.
 export const $host = "page";

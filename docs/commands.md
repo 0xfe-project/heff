@@ -12,9 +12,8 @@ heff promote FILE              # write each doc test's and watch's value as
                                # its expectation
 heff fmt [--check] FILE...     # format in place
 heff compile FILE OUT --backend=MODE [--name NAME]
-                               # esm: an ES module
                                # page: a script running the app NAME in a web page
-                               # node: a Node.js program running NAME
+                               # esm: an ES module
                                # c: a C program running NAME, for `zig cc`
 heff explain FILE              # the elaboration's trace
 heff type-at FILE OFFSET...    # what the name at each offset resolved to, and its type
@@ -34,8 +33,16 @@ heff help [COMMAND]            # the commands, or a command's flags
 heff completions SHELL         # fish, bash or zsh completions
 ```
 
-Flags go anywhere among the words, as getopt_long reads them (`-b node`,
-`--back=node`, `--`); `std.cli` reads them, for any heff program.
+Flags go anywhere among the words, as getopt_long reads them (`-b c`,
+`--back=c`, `--`); `std.cli` reads them, for any heff program.
+
+The backends are `page` and `esm`, JavaScript for the browser, and `c`,
+for everything else; a program imports the library's half that is its
+backend's, `lib/browser/` or `lib/std/` ([library.md](library.md#the-batteries)).
+`--backend=node`, a Node.js program running NAME, is heff's own, for
+its tests and itself (what `heff run` runs): the providers it has are
+those heff uses, `std.io`, `std.filesystem`, `std.process` and
+`std.progress` ([providers.md](providers.md#where-each-runs)).
 
 What `heff test` and `heff promote` check is in [tests.md](tests.md);
 how a project and its programs are laid out for `heff build`, `heff

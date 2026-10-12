@@ -355,7 +355,7 @@ string's runes), `foldl` (each rune with where it starts),
 ASCII's classes and cases: `isDigit`, `isAlpha`, `isSpace`, `isUpper`,
 `toUpper` and the like (`isAlpha 'é'` is `False`).
 
-JavaScript's own text, UTF-16, is another type, `std.js`'s `JSString`:
+JavaScript's own text, UTF-16, is another type, `browser.js`'s `JSString`:
 see [providers.md](providers.md#jsstring).
 
 ### Bytes

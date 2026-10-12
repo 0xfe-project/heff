@@ -1,5 +1,5 @@
 // test/node/jstext.hf's world: an effect provider (the shape of one is
-// said in lib/std/dom.provider.js).  A `JSString` field is a JavaScript
+// said in lib/browser/dom.provider.js).  A `JSString` field is a JavaScript
 // string, given and taken as it is: no helper between.
 export const jstext = (world) => (p, k) => {
   const a = p.a;

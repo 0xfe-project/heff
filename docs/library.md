@@ -40,27 +40,47 @@ are imported by their names:
 
 ## The batteries
 
-The batteries ship with it, under `lib/std/`:
+The batteries ship with it, in two halves, by where a program runs.
+What is above, in `lib/`, is pure, the same on every backend.
+
+`lib/std/` is the system's, for the C backend (`--backend=c`):
 
 - `std.io` (the standard streams), `std.filesystem`, `std.process`,
-  `std.time`, `std.net`;
-- `std.ref` (the world's cells), `std.handle` (the world's things, which
-  one effect hands out and another takes);
-- `std.dom` (web pages), `std.js` (JavaScript's strings);
-- `std.path`, `std.cli` (command lines), `std.doc` (documents laid
-  out), `std.progress` (what a program is doing, drawn on a terminal);
-- `std.math` (a float's functions: `sin`, `atan2`, `exp`, `log`, `pow`,
-  `round`, `pi`, `e` and the like).
+  `std.net`, `std.progress` (what a program is doing, drawn on a
+  terminal): effects of the system, C's alone;
+- `std.ref` (the world's cells) and `std.time`: effects needed on both
+  sides, one module each with a provider in C and one in JavaScript,
+  which a page's script has too;
+- `std.handle` (the world's things, which one effect hands out and
+  another takes), `std.path`, `std.cli` (command lines), `std.doc`
+  (documents laid out) and `std.math` (a float's functions: `sin`,
+  `atan2`, `exp`, `log`, `pow`, `round`, `pi`, `e` and the like): pure,
+  for any backend.
+
+`lib/browser/` is the browser's, for JavaScript (`--backend=page`, and
+`esm`):
+
+- `browser.dom` (web pages);
+- `browser.js` (JavaScript's strings, `JSString`).
+
+A program imports only its own half: a C program that imports a module
+of `lib/browser/` is refused at the import (E0351), and so is a page's
+script that imports an effect of `lib/std/` with no provider there
+(E0352), each naming the module and the backend -- before `main`'s
+effect is looked at.  (`std.io`, `std.filesystem`, `std.process` and
+`std.progress` have providers for Node.js too, kept for heff itself
+and its tests, `--backend=node`; no other module of `lib/std/` has
+one.)
 
 An effect's JavaScript side is in `M.provider.js` beside `M.hf`, its C
 side in `M.provider.c`: see [providers.md](providers.md).
 
-`std.net`'s `fetchText` is Node.js's `fetch` in JavaScript.  In C it is
-libcurl, loaded into the process when the program first fetches (no
-`-lcurl`), its connections kept for the next fetch; where there is no
-libcurl (a static musl program, Windows), a `curl` spawned for each.
-Either way a failure is `TypeError: fetch failed: ` and what `curl
--sSL --fail` says.
+`std.net`'s `fetchText` is libcurl, loaded into the process when the
+program first fetches (no `-lcurl`), its connections kept for the next
+fetch; where there is no libcurl (a static musl program, Windows), a
+`curl` spawned for each.  Either way a failure is `TypeError: fetch
+failed: ` and what `curl -sSL --fail` says.  (A page fetches by
+`browser.dom`'s `fetchText`, the browser's `fetch`.)
 
 ## Examples
 

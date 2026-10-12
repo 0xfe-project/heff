@@ -2,7 +2,9 @@
 // What heff says of the repository's files, held to what it said: for
 // each file of the library and the tests, `check` (its interface and its
 // diagnostics), `explain` (the elaboration's trace), `eval` (each
-// definition's value, `dump-eval`) and `type-at` (at some names), against the text
+// definition's value, `dump-eval`), `type-at` (at some names) and, of a
+// file of test/errors/ whose first comment names a backend
+// (`--backend=B`), `compile` for it -- against the text
 // kept under test/golden/, byte for byte.  A change of them is a change
 // of heff, to be looked at -- and kept with
 // `node test/golden.mjs --update`.
@@ -15,7 +17,7 @@ import { run, pool } from "./pool.mjs";
 import { heffBin, root } from "./heff.mjs";
 
 // (`node test/golden.mjs [--update] [KIND...]`: only the kinds named,
-// check, explain, eval, type-at; all by default)
+// check, explain, eval, type-at, compile; all by default)
 const update = process.argv.includes("--update");
 const only = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 const heff = (args) => run(heffBin, args);
@@ -50,14 +52,20 @@ const offsetsIn = (f) => {
   return [...starts.filter((_, i) => i % stride === 0).slice(0, 8).map((o) => String(o + 1)), "0", "nope"];
 };
 
+// compile: the backend a file's first comment names, what it makes
+// thrown away (what is held is what heff says)
+const backendOf = (f) => /^--.*--backend=(\w+)/m.exec(readFileSync(join(root, f), "utf8").split(/\n(?!--)/)[0])?.[1];
+const thrown = join(root, ".heff", "ref", "golden");
+mkdirSync(thrown, { recursive: true });
+
 const kinds = [
-  { kind: "check", files: filesIn(["lib", "lib/std", "test/nbe", "test/surface", "test/errors", "test/modules", "test/modules/src"]),
+  { kind: "check", files: filesIn(["lib", "lib/std", "lib/browser", "test/nbe", "test/surface", "test/errors", "test/modules", "test/modules/src"]),
     say: async (f) => said(await heff(["check", f])) },
-  { kind: "explain", files: filesIn(["lib", "lib/std", "test/nbe", "test/surface", "test/errors"]),
+  { kind: "explain", files: filesIn(["lib", "lib/std", "lib/browser", "test/nbe", "test/surface", "test/errors"]),
     say: async (f) => said(await heff(["explain", f])) },
-  { kind: "eval", files: filesIn(["lib", "lib/std", "test/nbe"]),
+  { kind: "eval", files: filesIn(["lib", "lib/std", "lib/browser", "test/nbe"]),
     say: async (f) => said(await heff(["dump-eval", f])) },
-  { kind: "type-at", files: filesIn(["lib", "lib/std", "test/surface", "test/nbe"]),
+  { kind: "type-at", files: filesIn(["lib", "lib/std", "lib/browser", "test/surface", "test/nbe"]),
     say: async (f) => {
       // (one run for all of them, a line each)
       const offsets = offsetsIn(f);
@@ -66,6 +74,8 @@ const kinds = [
       const answers = offsets.map((o, i) => `@${o}\n${lines[i] ?? ""}\n`).join("");
       return said({ ...r, stdout: answers + lines.slice(offsets.length).join("\n") });
     } },
+  { kind: "compile", files: filesIn(["test/errors"]).filter((f) => backendOf(f)),
+    say: async (f) => said(await heff(["compile", f, join(thrown, f.replaceAll("/", "_") + ".out"), `--backend=${backendOf(f)}`])) },
 ];
 
 const jobs = kinds.filter((k) => only.length === 0 || only.includes(k.kind)).flatMap((k) => k.files.map((f) => ({ kind: k.kind, f, say: k.say })));

@@ -7,12 +7,44 @@ This is where a heff program meets its host, and so where how each
 backend keeps a value matters.  A C provider may run the program in
 threads truly at once: see [threads.md](threads.md).
 
+## Where each runs
+
+A JavaScript provider that lives in one host only says so, `export
+const $host = "page"` (a page's script, `--backend=page`) or `"node"`
+(Node.js, `--backend=node`); without it, both
+(`lib/browser/dom.provider.js` says the shape of a provider).  The
+library is split by it ([library.md](library.md#the-batteries)):
+
+- `lib/std/`'s effects are the system's, with a provider in C:
+  `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.net`;
+- `std.ref` and `std.time` are needed on both sides: one module each,
+  with a provider in C and one in JavaScript of no `$host`, which a
+  page's script runs as Node.js does;
+- `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
+  (`$host = "page"`) and `browser.js`, which has no effect, only its
+  type.
+
+`std.io`, `std.filesystem`, `std.process` and `std.progress` keep a
+provider for Node.js (`$host = "node"`), for heff itself and its tests
+only, as each says at its top; no other module of `lib/std/` is given
+one.  `--backend=node` is there for them, not for programs.
+
+What a backend has no side of is refused where it is imported, before
+the program's effect is looked at: by `heff compile --backend=c` (and
+`heff build`'s C programs), an import of a module of `lib/browser/`
+(E0351); by `--backend=page` or `node`, an import of an effect of
+`lib/std/` with a provider in C and none in JavaScript for that host
+(E0352).  The library's own imports are its own; a program's modules'
+are each said, at the import, naming the module and the backend.  An
+effect of a program's own, with no provider for the backend, is said
+at its computation: it "is not provided here".
+
 ## Strings
 
 A provider gives a string to the host, and takes one from it, only
 through the runtime's helpers, by what the string is there -- text, or
 bytes: `$toJs`, `$fromJs`, `$toBytes` and `$fromBytes` in JavaScript
-(`lib/std/dom.provider.js` says which is for what), `heff_str_text`,
+(`lib/browser/dom.provider.js` says which is for what), `heff_str_text`,
 `heff_str_bytes`, `heff_cstr` and the like in C (`lib/c/runtime.c`,
 "What providers share").  In JavaScript a string is kept as a
 JavaScript string each of whose code units is one of its bytes; in C as
@@ -36,12 +68,13 @@ holds the value), and neither looks into nor changes otherwise.
 
 ## JSString
 
-`std.js` has JavaScript's text beside them: a `JSString`, which a
+`browser.js` has JavaScript's text beside them: a `JSString`, which a
 string is made by `toJS` (what is not UTF-8 in it U+FFFD, as
 `TextDecoder` reads it) and made of by `fromJS` (a surrogate not in a
 pair U+FFFD), and nothing else -- a JavaScript string in JavaScript,
-and in C and the interpreter a string of UTF-8, valid, so that
-`fromJS (toJS s)` is `R.toValid s` on each.  An operation's field of
+and in the interpreter a string of UTF-8, valid, so that `fromJS (toJS
+s)` is `R.toValid s` on each (a C program does not import it, E0351).
+An operation's field of
 type `JSString` is given to a provider, and taken from it, as it is,
 through no helper: a JavaScript string in JavaScript (the library's own
 effects take `String`s, their providers making them what the host has).

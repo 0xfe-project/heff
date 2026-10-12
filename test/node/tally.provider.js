@@ -1,5 +1,5 @@
 // test/node/tally.hf's world: an effect provider (the shape of one is
-// said in lib/std/dom.provider.js).  It acts on the boxes boxes.hf's
+// said in lib/browser/dom.provider.js).  It acts on the boxes boxes.hf's
 // provider hands out, by the world's numbers for them
 // (lib/std/handle.hf): a box is that provider's `{ n }`.
 export const tally = (world) => (p, k) => {
