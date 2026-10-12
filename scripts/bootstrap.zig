@@ -163,19 +163,19 @@ const Bootstrap = struct {
     /// a part changed, as many at once as there are cores.  (A part is
     /// known by its path, its time and its inode: heff writes again only
     /// the parts whose C changed, and the seed is unpacked so too.)
-    fn cc(b: *const Bootstrap, directory: []const u8, to: []const u8, target: []const []const u8) bool {
+    fn cc(b: *const Bootstrap, who: []const u8, directory: []const u8, to: []const u8, target: []const []const u8) bool {
         const files = b.filesOf(directory, &.{".c"}) orelse return false;
         var argv: std.ArrayList([]const u8) = .empty;
         argv.appendSlice(b.arena, &.{ b.zig, "cc" }) catch return false;
         argv.appendSlice(b.arena, target) catch return false;
         for (files) |file| argv.append(b.arena, b.concat(&.{ directory, "/", file })) catch return false;
         argv.appendSlice(b.arena, &.{ "-o", to, "-lm" }) catch return false;
-        const name = std.fs.path.basename(to);
+        const name = if (target.ptr == &flags) std.fs.path.basename(to) else to;
         const node = b.progress.start(b.concat(&.{ "zig builds ", name }), 0);
         defer node.end();
         const start = Io.Timestamp.now(b.io, .awake);
         if (!b.run(argv.items, node)) return false;
-        b.say("heff build: zig built {s} from its {d} parts in {d:.1} s", .{ name, files.len, b.seconds(start) });
+        b.say("{s}: zig built {s} from its {d} parts in {d:.1} s", .{ who, name, files.len, b.seconds(start) });
         return true;
     }
 
@@ -245,7 +245,7 @@ const Bootstrap = struct {
                 // (the heff there is, set apart: the build writes over it)
                 if (!b.toC(stage0, stage1C))
                     b.complain("heff build: the heff there is cannot compile the source; from the seed", .{})
-                else if (!b.cc(stage1C, stage1, &flags))
+                else if (!b.cc("heff build", stage1C, stage1, &flags))
                     b.complain("heff build: the heff there is compiles the source to C zig cannot build; from the seed", .{})
                 else
                     first = true;
@@ -257,12 +257,12 @@ const Bootstrap = struct {
             const start = Io.Timestamp.now(b.io, .awake);
             b.unpack(seedC) catch |err| b.fail("heff build: unpacking the seed failed: {t}", .{err});
             b.say("heff build: the seed unpacked in {d:.1} s", .{b.seconds(start)});
-            if (!b.cc(seedC, seedExe, &flags)) b.fail("heff build: zig cc failed", .{});
+            if (!b.cc("heff build", seedC, seedExe, &flags)) b.fail("heff build: zig cc failed", .{});
             if (!b.toC(seedExe, seedStage1C)) b.fail("heff build: the seed compiling app/heff/main.hf failed", .{});
-            if (!b.cc(seedStage1C, seedStage1, &flags)) b.fail("heff build: zig cc failed", .{});
+            if (!b.cc("heff build", seedStage1C, seedStage1, &flags)) b.fail("heff build: zig cc failed", .{});
         }
         if (!b.toC(if (first) stage1 else seedStage1, parts)) b.fail("heff build: the first stage could not compile itself", .{});
-        if (!b.cc(parts, heff, &flags)) b.fail("heff build: zig cc failed", .{});
+        if (!b.cc("heff build", parts, heff, &flags)) b.fail("heff build: zig cc failed", .{});
         // (the heff built comes of the seed there is: built from it, or with
         // a heff of it)
         b.root.writeFile(b.io, .{ .sub_path = seedOf, .data = b.concat(&.{ &hash, "\n" }) }) catch |err|
@@ -380,8 +380,7 @@ const Bootstrap = struct {
             const directory = b.concat(&.{ out, "/native/", target });
             b.root.createDirPath(b.io, directory) catch |err| b.fail("heff native: {s}: {t}", .{ directory, err });
             const program = b.concat(&.{ directory, if (std.mem.indexOf(u8, target, "windows") != null) "/heff.exe" else "/heff" });
-            if (!b.cc(parts, program, &.{ "-target", target, "-O2", "-s", "-w" })) b.fail("heff native: {s} failed", .{target});
-            b.say("heff native: {s}", .{program});
+            if (!b.cc("heff native", parts, program, &.{ "-target", target, "-O2", "-s", "-w" })) b.fail("heff native: {s} failed", .{target});
         }
     }
 };
