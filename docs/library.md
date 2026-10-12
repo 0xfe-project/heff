@@ -69,9 +69,11 @@ What is above, in `lib/`, is pure, the same on every backend.
 
 A program imports only its own half: a C program that imports a module
 of `lib/browser/` is refused at the import (E0351), and so is a page's
-script that imports an effect of `lib/std/` with no provider there
-(E0352), each naming the module and the backend -- before `main`'s
-effect is looked at.  (`std.io`, `std.filesystem`, `std.process` and
+script that imports an effect of `lib/std/` with no provider there, or
+a module of `lib/std/` that imports one, however far down
+(`std.http.server`, by `std.http` and `std.net`) (E0352), each naming
+the module and the backend -- and, for one that imports it, which
+effect it reaches -- before `main`'s effect is looked at.  (`std.io`, `std.filesystem`, `std.process` and
 `std.progress` have providers for Node.js too, kept for heff itself
 and its tests, `--backend=node`; no other module of `lib/std/` has
 one.)

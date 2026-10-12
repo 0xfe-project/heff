@@ -393,7 +393,9 @@ forHost host p = case Em.hostOf p.text of
 
 -- The library's halves: lib/browser/ is the page's, lib/std/'s effects
 -- the system's, by C (but those with a provider in JavaScript too:
--- std.ref, std.time).  An import of the other half is an error there.
+-- std.ref, std.time), and so are those of lib/std/ that import one of
+-- them, however far down (std.http.server, by std.http and std.net).
+-- An import of the other half is an error there.
 --------------------------------------------------------------------------------
 
 browserRefused : Dr.Source -> Dr.Refused
@@ -404,6 +406,7 @@ browserRefused s =
       "`"
       ^ s.module
       ^ "` is the browser's (lib/browser/), for JavaScript: a C program (--backend=c) cannot import it"
+  , note = Nothing
   }
 
 systemRefused : String -> Dr.Source -> Dr.Refused
@@ -415,10 +418,43 @@ systemRefused host s =
       ^ s.module
       ^ "` is an effect of the system (lib/std/), for C: it has no provider for --backend="
       ^ host
+  , note = Nothing
+  }
+
+-- (what the first of the imports `path` does, by which the last is
+-- reached: "imports `b`, which imports it")
+importsOn : List String -> String
+importsOn (Cons a (Cons b Nil)) = "imports it"
+importsOn (Cons a (Cons b rest)) =
+  "imports `" ^ b ^ "`, which " ^ importsOn (Cons b rest)
+importsOn _ = ""
+
+-- (a module of lib/std/ that imports one with no provider for `host`, by
+-- the imports `path`, the last that one)
+reachingRefused : String -> Dr.Source -> List String -> Dr.Refused
+reachingRefused host s path =
+  { module = s.module
+  , code = 352
+  , msg =
+      "`"
+      ^ s.module
+      ^ "` is the system's (lib/std/), for C: it imports an effect with no provider for --backend="
+      ^ host
+  , note =
+      Just
+        ("`"
+         ^ fromMaybe s.module (List.last path)
+         ^ "` is that effect: `"
+         ^ s.module
+         ^ "` "
+         ^ importsOn path)
   }
 
 isBrowser : Dr.Source -> Bool
 isBrowser s = s.library && startsWith "browser." s.module
+
+isStd : Dr.Source -> Bool
+isStd s = s.library && startsWith "std." s.module
 
 jsFor : String -> String -> Maybe String -> Bool
 jsFor host m Nothing = False
@@ -438,22 +474,80 @@ systemOnly host s = do
     Just _ -> not (jsFor host s.module js)
     Nothing -> False)
 
+-- (lib/std/'s effects of the system with no provider for `host`)
+systemOnlyOf : {e : HFunctor}
+             -> {{disk : fs <: e}}
+             -> String
+             -> List Dr.Source
+             -> Co e (List String)
+systemOnlyOf host Nil = pure Nil
+systemOnlyOf host (Cons s rest) = do
+  ms <- systemOnlyOf host rest
+  if isStd s
+      then do
+        only <- systemOnly host s
+        pure (if only then Cons s.module ms else ms)
+    else pure ms
+
+hasName : String -> List String -> Bool
+hasName m ms = List.any (\n -> strEq n m) ms
+
+-- (the modules a module imports, as `sources` has it)
+importedBy : List Dr.Source -> String -> List String
+importedBy sources m =
+  maybe
+    Nil
+    (\(s : Dr.Source) -> Dr.importNames (Dr.importsOfSource s).imports)
+    (List.find (\(s : Dr.Source) -> strEq s.module m) sources)
+
+-- (from the modules to go through, each with the imports it was reached
+-- by, the last it, those gone through already left: the imports by
+-- which one of `only` is reached first, depth first)
+reachOnly : List Dr.Source
+          -> List String
+          -> List String
+          -> List (List String)
+          -> Maybe (List String)
+reachOnly sources only seen Nil = Nothing
+reachOnly sources only seen (Cons path rest) =
+  let m = fromMaybe "" (List.last path)
+  in if hasName m seen then reachOnly sources only seen rest
+  else if hasName m only then Just path
+  else reachOnly
+      sources
+      only
+      (Cons m seen)
+      (List.append
+         (List.map (\i -> List.append path [i]) (importedBy sources m))
+         rest)
+
+-- (a module of lib/std/ refused, where it is an effect with no provider
+-- for `host` or reaches one)
+refusedReaching : String
+                -> List Dr.Source
+                -> List String
+                -> Dr.Source
+                -> Maybe Dr.Refused
+refusedReaching host sources only s =
+  if not (isStd s) then Nothing
+  else if hasName s.module only then Just (systemRefused host s)
+  else maybe
+      Nothing
+      (\path -> Just (reachingRefused host s path))
+      (reachOnly sources only Nil [[s.module]])
+
 refusedJs : {e : HFunctor}
           -> {{disk : fs <: e}}
           -> String
           -> List Dr.Source
           -> Co e (List Dr.Refused)
-refusedJs host Nil = pure Nil
-refusedJs host (Cons s rest) = do
-  rs <- refusedJs host rest
-  if s.library && startsWith "std." s.module
-      then do
-        only <- systemOnly host s
-        pure (if only then Cons (systemRefused host s) rs else rs)
-    else pure rs
+refusedJs host sources = do
+  only <- systemOnlyOf host sources
+  pure (Dr.catMaybesD (List.map (refusedReaching host sources only) sources))
 
 -- | the library's modules a program for `host` may not import: in C,
--- | lib/browser/'s; in JavaScript, lib/std/'s effects of the system
+-- | lib/browser/'s; in JavaScript, lib/std/'s effects of the system, and
+-- | lib/std/'s modules that import one, however far down
 refusedFor : {e : HFunctor}
            -> {{disk : fs <: e}}
            -> String

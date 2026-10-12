@@ -34,9 +34,13 @@ What a backend has no side of is refused where it is imported, before
 the program's effect is looked at: by `heff compile --backend=c` (and
 `heff build`'s C programs), an import of a module of `lib/browser/`
 (E0351); by `--backend=page` or `node`, an import of an effect of
-`lib/std/` with a provider in C and none in JavaScript for that host
-(E0352).  The library's own imports are its own; a program's modules'
-are each said, at the import, naming the module and the backend.  An
+`lib/std/` with a provider in C and none in JavaScript for that host,
+or of a module of `lib/std/` that imports one, itself or by the modules
+it imports (E0352; one that imports only pure modules, as `std.path`
+and `std.handle` do, is not refused).  The library's own imports are
+its own; a program's modules' are each said, at the import, naming the
+module and the backend, and in a note, for a module that reaches an
+effect by its imports, that effect and the imports by which it does.  An
 effect of a program's own, with no provider for the backend, is said
 at its computation: it "is not provided here".
 
