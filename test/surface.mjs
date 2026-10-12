@@ -5,14 +5,13 @@
 // file of the library and the tests -- among them the errors of
 // test/errors/ and the module rules' of test/modules/ -- is held by
 // test/golden.mjs, byte for byte.)
-import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { heffBin, root } from "./heff.mjs";
 import { pool, run } from "./pool.mjs";
 
-const heff = (...args) => spawnSync(heffBin, [...args], { cwd: root, encoding: "utf8" });
+const heff = (...args) => run(heffBin, [...args]);
 const hfIn = (dir) => readdirSync(join(root, dir)).filter((f) => f.endsWith(".hf")).map((f) => join(dir, f));
 let failed = 0;
 
@@ -34,7 +33,7 @@ console.log(`${held[0]}/${held[1]} expectations hold, ${held[2]}/${held[3]} test
 mkdirSync(join(root, ".heff", "ref"), { recursive: true });
 const wrong = join(root, ".heff", "ref", "wrong-expectation.hf");
 writeFileSync(wrong, `-- >>> "${"x".repeat(60)} on click"\n-- "${"x".repeat(60)} onn click"\n`);
-const w = heff("test", wrong);
+const w = await heff("test", wrong);
 const report = w.stdout.slice(w.stdout.indexOf("  expected"));
 if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…") || report.includes("x".repeat(60))) {
   failed++;
@@ -55,10 +54,10 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   writeFileSync(join(lib, "other.hf"), "noes : List Bool\nnoes = [no, no]\n");
   writeFileSync(join(lib, "list.hf"), "none : List Bool\nnone = []\n");
   writeFileSync(join(dir, "use.hf"), "import other\n\n-- >>> both\n-- Cons True (Cons False Nil)\n\n-- >>> noes\n-- Cons False (Cons False Nil)\n\n-- >>> List.none\n-- Nil\n");
-  const inLib = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", env: { ...process.env, HEFF_LIB: lib } });
-  const used = inLib("test", "use.hf");
-  const core = inLib("check", join(lib, "core.hf"));
-  const prelude = inLib("check", join(lib, "prelude.hf"));
+  const inLib = (...args) => run(heffBin, args, { cwd: dir, env: { ...process.env, HEFF_LIB: lib } });
+  const used = await inLib("test", "use.hf");
+  const core = await inLib("check", join(lib, "core.hf"));
+  const prelude = await inLib("check", join(lib, "prelude.hf"));
   if (used.status !== 0 || core.status !== 0 || core.stdout !== "yes : Bool\n" || prelude.status !== 0) {
     failed++;
     console.log(`FAIL the prelude without an import, and what it is made of:\n${[used, core, prelude].map((r) => r.stdout + r.stderr).join("\n")}`);
@@ -66,7 +65,7 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   // (`core` is what the prelude is made of: the prelude's names are not in
   // its scope)
   writeFileSync(join(lib, "core.hf"), "yes : Bool\nyes = no\n");
-  const coreUses = inLib("check", join(lib, "core.hf"));
+  const coreUses = await inLib("check", join(lib, "core.hf"));
   if (coreUses.status === 0 || !coreUses.stderr.includes("no such variable no in scope")) {
     failed++;
     console.log(`FAIL a module the prelude is made of has not the prelude:\n${coreUses.stdout}${coreUses.stderr}`);
@@ -96,24 +95,24 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
   writeFileSync(join(dir, "both.hf"), "import sines\nimport sinus\n");
   writeFileSync(join(dir, "both2.hf"), "import both\n");
   writeFileSync(join(dir, "again2.hf"), "import again\n");
-  const inLib = (f) => spawnSync(heffBin, ["check", f], { cwd: dir, encoding: "utf8", env: { ...process.env, HEFF_LIB: lib } });
+  const inLib = (f) => run(heffBin, ["check", f], { cwd: dir, env: { ...process.env, HEFF_LIB: lib } });
   const said = (r) => r.stdout + r.stderr;
   const twice = (k, a, b) => `error[E0336]: the primitive \`${k}\` is declared by ${a}, and by ${b}\n`;
   const errors = (r) => (r.stderr.match(/error\[/g) ?? []).length;
   const checks = [
-    ["one the prelude declares", inLib(join(lib, "again.hf")),
+    ["one the prelude declares", await inLib(join(lib, "again.hf")),
       (r) => r.stderr.includes(`again.hf:2:1\n${twice("intAdd", "prelude, at lib/prelude.hf:1", "again, at lib/again.hf:2")}`) && errors(r) === 1],
-    ["one declared above", inLib(join(lib, "twice.hf")),
+    ["one declared above", await inLib(join(lib, "twice.hf")),
       (r) => r.stderr.includes(`twice.hf:2:1\n${twice("floatCos", "twice, at lib/twice.hf:1", "twice, at lib/twice.hf:2")}`) && errors(r) === 1],
-    ["two modules' where they meet", inLib("both.hf"),
+    ["two modules' where they meet", await inLib("both.hf"),
       (r) => r.stderr.includes(`both.hf:2:1\n${twice("floatSin", "sines, at lib/sines.hf:1", "sinus, at lib/sinus.hf:2")}2 | import sinus\n`) && errors(r) === 1],
-    ["two modules', not again in what is made of where they meet", inLib("both2.hf"),
+    ["two modules', not again in what is made of where they meet", await inLib("both2.hf"),
       (r) => r.status === 1 && errors(r) === 1 && !r.stderr.includes("both2.hf:")],
-    ["one declared again, not again in what is made of it", inLib("again2.hf"),
+    ["one declared again, not again in what is made of it", await inLib("again2.hf"),
       (r) => r.status === 1 && errors(r) === 1 && !r.stderr.includes("again2.hf:")],
-    ["one the runtime has not", inLib(join(lib, "unknown.hf")),
+    ["one the runtime has not", await inLib(join(lib, "unknown.hf")),
       (r) => r.status === 1 && r.stderr.includes("error[E0329]: there is no primitive called `intPlusPlus`")],
-    ["one declared once", inLib(join(lib, "sines.hf")),
+    ["one declared once", await inLib(join(lib, "sines.hf")),
       (r) => r.status === 0 && r.stdout === "floatSin : Float64 -> Float64\n"],
   ];
   for (const [what, r, ok] of checks) {

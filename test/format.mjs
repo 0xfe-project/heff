@@ -9,13 +9,18 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { heffBin, root } from "./heff.mjs";
+import { heff, root } from "./heff.mjs";
+import { slot } from "./pool.mjs";
 
 // the formatter, compiled to a module of its own, its `format` called
 // directly: `Right` the text laid out, `Left` why not -- a heff String
 // as JavaScript has it, each of its bytes, UTF-8, a code unit
+// (called here, in this process: which takes a slot of the tests'
+// budget for it, as a process run does, until it ends)
 const module = join(root, ".heff", "out", "heff-format.mjs");
-execFileSync(heffBin, ["compile", "src/heff/syntax/format.hf", module, "--backend=esm"], { cwd: root });
+const compiled = await heff(["compile", "src/heff/syntax/format.hf", module, "--backend=esm"]);
+if (compiled.status !== 0) { console.log(`FAIL format: the formatter not compiled\n${compiled.stdout}${compiled.stderr}`); process.exit(1); }
+await slot();
 const { format } = (await import(pathToFileURL(module))).default;
 const bytesOf = (text) => Buffer.from(text, "utf8").toString("latin1");
 const textOf = (bytes) => Buffer.from(bytes, "latin1").toString("utf8");

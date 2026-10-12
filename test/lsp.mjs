@@ -10,6 +10,7 @@ import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { heffBin, root } from "./heff.mjs";
+import { slot } from "./pool.mjs";
 
 const uri = (f) => pathToFileURL(join(root, f)).href;
 const disk = (f) => readFileSync(join(root, f), "utf8");
@@ -17,6 +18,10 @@ const disk = (f) => readFileSync(join(root, f), "utf8");
 // (as vscode-languageclient starts it, with `--stdio`)
 // (with a bounded heap: what it keeps must fit, on any machine; told it
 // is on a terminal, which it says nothing to in colour all the same)
+// (a slot of the tests' budget taken for it, as test/pool.mjs takes one
+// for a process run, and held while it runs -- idle mostly, but deep in
+// elaborating at times -- its waits counted only once it has one)
+await slot();
 const server = spawn(heffBin, ["lsp", "--stdio"], { cwd: root, stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, HEFF_HEAP_MB: "1024", HEFF_TTY: "1" } });
 let buf = Buffer.alloc(0), nextId = 1, failed = 0, checks = 0;
 const waiting = new Map(), notes = [], noteWaiters = [];

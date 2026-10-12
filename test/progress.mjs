@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { heffBin } from "./heff.mjs";
+import { run } from "./pool.mjs";
 
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}: ${JSON.stringify(got)}`); } };
@@ -24,16 +25,16 @@ if (process.platform === "win32" || spawnSync("which", ["script"]).status !== 0)
 }
 
 const work = mkdtempSync(join(tmpdir(), "heff-progress-"));
-const plain = (cwd, ...args) => spawnSync(heffBin, args, { cwd, encoding: "utf8", env: { ...process.env, TERM: "xterm-256color" } });
+const plain = (cwd, ...args) => run(heffBin, args, { cwd, env: { ...process.env, TERM: "xterm-256color" } });
 
 // (heff run on a terminal, `TERM` as given: all it put there, as bytes
 // read back as UTF-8, and its status)
-const onTerminal = (cwd, term, ...args) => {
+const onTerminal = async (cwd, term, ...args) => {
   const env = { ...process.env, TERM: term };
   const q = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
   const r = process.platform === "darwin"
-    ? spawnSync("script", ["-q", "/dev/null", heffBin, ...args], { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
-    : spawnSync("script", ["-q", "-e", "-c", [heffBin, ...args].map(q).join(" "), "/dev/null"], { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    ? await run("script", ["-q", "/dev/null", heffBin, ...args], { cwd, env, input: null })
+    : await run("script", ["-q", "-e", "-c", [heffBin, ...args].map(q).join(" "), "/dev/null"], { cwd, env, input: null });
   return { raw: r.stdout, status: r.status };
 };
 
@@ -68,7 +69,7 @@ const screen = (raw) => {
 // a project whose program is big enough to take its time: a module of
 // a few hundred definitions, checked, compiled to C and built by zig --
 // long enough to be drawn (after 200 ms), and zig's own tasks with it
-spawnSync(heffBin, ["init", "hello"], { cwd: work });
+await run(heffBin, ["init", "hello"], { cwd: work });
 const hello = join(work, "hello");
 const n = 600;
 const defs = Array.from({ length: n }, (_, i) =>
@@ -85,20 +86,20 @@ writeFileSync(join(hello, "app", "hello", "main.hf"), [
 // program compiled, zig's tasks under `zig cc` -- then cleared, the
 // screen left with what heff wrote; the program built
 const said = ["heff build: 2 modules checked", "wrote .heff/bin/hello"];
-const drawn = onTerminal(hello, "xterm-256color", "build");
+const drawn = await onTerminal(hello, "xterm-256color", "build");
 const shown = screen(drawn.raw);
 expect("build on a terminal", drawn.status === 0 && shown.join("\n") === said.join("\n"), { shown, raw: drawn.raw.slice(-2000) });
 expect("build on a terminal: its progress drawn", drawn.raw.includes("\x1b[J") &&
   /\[\d+\/2\] checking modules|building programs/.test(drawn.raw) && /compiling to C|zig cc/.test(drawn.raw), drawn.raw.slice(0, 2000));
 expect("build on a terminal: zig's tasks under `zig cc`", /zig cc\r?\n {6}[├└]─ /.test(drawn.raw), drawn.raw.slice(-3000));
-expect("build on a terminal: the program", spawnSync(join(hello, ".heff", "bin", "hello"), { encoding: "utf8" }).stdout.startsWith("Hello, "), null);
+expect("build on a terminal: the program", (await run(join(hello, ".heff", "bin", "hello"), [])).stdout.startsWith("Hello, "), null);
 
 // not on a terminal: not a byte more than it says
-const piped = plain(hello, "build");
+const piped = await plain(hello, "build");
 expect("build into pipes", piped.status === 0 && piped.stdout === said.map((l) => l + "\n").join("") && piped.stderr === "", piped);
 
 // TERM=dumb: a terminal, nothing drawn
-const dumb = onTerminal(hello, "dumb", "build");
+const dumb = await onTerminal(hello, "dumb", "build");
 expect("build on a dumb terminal", dumb.status === 0 && !dumb.raw.includes("\x1b") && screen(dumb.raw).join("\n") === said.join("\n"), dumb.raw);
 
 // installed, and tested, on a terminal: the screen left with what each
@@ -106,7 +107,7 @@ expect("build on a dumb terminal", dumb.status === 0 && !dumb.raw.includes("\x1b
 const lines = (r) => (r.stdout + r.stderr).split("\n").map((l) => l.trimEnd()).filter((l) => l !== "");
 process.env.HEFF_HOME = join(work, "home");
 for (const args of [["install"], ["test"]]) {
-  const t = onTerminal(hello, "xterm-256color", ...args), p = plain(hello, ...args);
+  const t = await onTerminal(hello, "xterm-256color", ...args), p = await plain(hello, ...args);
   expect(`${args[0]} on a terminal`, t.status === 0 && p.status === 0 && screen(t.raw).join("\n") === lines(p).join("\n"), { shown: screen(t.raw), plain: lines(p) });
 }
 delete process.env.HEFF_HOME;
@@ -116,8 +117,8 @@ delete process.env.HEFF_HOME;
 // it (`exit 1` ends it), the screen what it says without a terminal
 writeFileSync(join(hello, "src", "hello", "wrong.hf"), "wrong : Int\nwrong = \"no\"\n");
 rmSync(join(hello, ".heff"), { recursive: true, force: true });
-const failing = onTerminal(hello, "xterm-256color", "build");
-const failingPlain = plain(hello, "build");
+const failing = await onTerminal(hello, "xterm-256color", "build");
+const failingPlain = await plain(hello, "build");
 expect("an error, on a terminal", failing.status === 1 && failingPlain.status === 1 &&
   screen(failing.raw).join("\n") === lines(failingPlain).join("\n"),
   { shown: screen(failing.raw), plain: failingPlain.stdout + failingPlain.stderr });

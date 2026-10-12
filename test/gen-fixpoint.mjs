@@ -12,7 +12,7 @@ const gen = join(root, ".heff", "out", "heff-gen.d");
 
 if (!existsSync(heffBin) || !existsSync(built)) { console.log("FAIL gen-fixpoint: no .heff/out/heff and .heff/out/heff.d (run node scripts/build.mjs first)"); process.exit(1); }
 
-const r = heff(["compile", "app/heff/main.hf", gen + "/", "--name", "main", "--backend=c"], { cwd: root });
+const r = await heff(["compile", "app/heff/main.hf", gen + "/", "--name", "main", "--backend=c"], { cwd: root });
 if (r.status !== 0) { console.log(`FAIL gen-fixpoint: the compiler refused its own source (status ${r.status}, signal ${r.signal}${r.error ? `, ${r.error}` : ""})\n${r.stdout}${r.stderr}`.split("\n").slice(0, 12).join("\n")); process.exit(1); }
 
 const files = (d) => readdirSync(d).filter((f) => f.endsWith(".c") || f.endsWith(".h")).sort();

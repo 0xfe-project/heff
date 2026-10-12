@@ -72,9 +72,11 @@ make check                 # build-seed, test, fmt-check: all a change is held t
 `compiler`, `lsp`, `backends` (each backend held to the interpreter),
 `fixpoint` (heff compiles itself to the same C) and `asan` (heff under
 AddressSanitizer, by clang; `make test-asan JOBS=4 TIMEOUT=120` sets
-`HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`).  Each script decides how
-much it runs at once, so there is no need for `make -j`, and the
-targets run one after another even with it.
+`HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`).  The scripts run at once,
+and what they run shares one budget, as make's jobserver does: as many
+processes at once as there are cores, or `HEFF_TEST_JOBS` (a script
+run by itself has its own pools).  So there is no need for `make -j`,
+and the targets run one after another even with it.
 
 `make sanitize` (`HEFF_SANITIZE=1 node test/backends.mjs`) builds the
 backends' C programs under AddressSanitizer, and `make tsan`

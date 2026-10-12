@@ -12,6 +12,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { heffBin, root } from "./heff.mjs";
+import { run } from "./pool.mjs";
 
 if (!existsSync(heffBin)) { console.log(`FAIL backcache: no ${heffBin} (run node scripts/build.mjs first)`); process.exit(1); }
 
@@ -40,91 +41,91 @@ main : Co stdio Unit
 main = program (io := \\p -> p)
 `);
 
-const heff = (...args) => spawnSync(heffBin, args, { cwd: dir, encoding: "utf8", maxBuffer: 1e9, timeout: 600000 });
+const heff = (...args) => run(heffBin, args, { cwd: dir });
 const back = () => join(dir, ".heff", readdirSync(join(dir, ".heff")).find((d) => /^b\d+$/.test(d)) ?? "b?");
 const hbs = () => existsSync(back()) ? readdirSync(back()).filter((f) => f.endsWith(".hb")).sort() : [];
 // (the program compiled to parts in `out`, through the cache: its files)
-const compile = (out) => {
+const compile = async (out) => {
   rmSync(join(dir, out), { recursive: true, force: true });
-  const r = heff("compile", "main.hf", out + "/", "--name", "main", "--backend=c");
+  const r = await heff("compile", "main.hf", out + "/", "--name", "main", "--backend=c");
   if (r.status !== 0) return { error: r.stderr.slice(0, 400) };
   const files = {};
   for (const f of readdirSync(join(dir, out)).sort()) files[f] = readFileSync(join(dir, out, f), "utf8");
   return { files };
 };
 const same = (x, y) => !x.error && !y.error && JSON.stringify(x.files) === JSON.stringify(y.files);
-const cold = (out) => { for (const f of hbs()) rmSync(join(back(), f)); return compile(out); };
+const cold = async (out) => { for (const f of hbs()) rmSync(join(back(), f)); return compile(out); };
 const cc = spawnSync("zig", ["version"]).status === 0 ? ["zig", "cc"] : ["cc"];
-const runs = (out) => {
+const runs = async (out) => {
   const exe = join(dir, out, "prog");
-  const b = spawnSync(cc[0], [...cc.slice(1), "-O0", "-w", ...readdirSync(join(dir, out)).filter((f) => f.endsWith(".c")).map((f) => join(dir, out, f)), "-o", exe, "-lm", "-lpthread"], { encoding: "utf8" });
+  const b = await run(cc[0], [...cc.slice(1), "-O0", "-w", ...readdirSync(join(dir, out)).filter((f) => f.endsWith(".c")).map((f) => join(dir, out, f)), "-o", exe, "-lm", "-lpthread"]);
   if (b.status !== 0) return `(not built: ${b.stderr.slice(0, 200)})`;
-  return spawnSync(exe, [], { encoding: "utf8" }).stdout.trim();
+  return (await run(exe, [])).stdout.trim();
 };
 
 let failed = 0;
 const want = (cond, what) => { if (!cond) { failed++; console.log(`FAIL backcache: ${what}`); } };
 
 // cold: compiled, kept
-const c1 = compile("c1");
+const c1 = await compile("c1");
 want(!c1.error, `cold compile failed\n${c1.error}`);
 want(hbs().includes("a.hb") && hbs().includes("main.hb"), `a cold run keeps a and main\n${hbs().join(" ")}`);
 
 // warm: the same C, no file of the cache written again
 const times = Object.fromEntries(hbs().map((f) => [f, statSync(join(back(), f)).mtimeMs]));
-const w1 = compile("w1");
+const w1 = await compile("w1");
 want(same(c1, w1), "a warm run makes the C a cold run made");
 want(hbs().every((f) => statSync(join(back(), f)).mtimeMs === times[f]), "a warm run leaves the cache's files alone");
-want(runs("w1") === "14", `the program runs\n${runs("w1")}`);
+want((await runs("w1")) === "14", `the program runs\n${await runs("w1")}`);
 
 // an edit to `step`, inlined into main and into the copy of `loop`: the
 // C as a cold run makes it, and the program as the edit says
 writeFileSync(join(dir, "a.hf"), a(2));
-const e1 = compile("e1");
+const e1 = await compile("e1");
 want(!e1.error && !same(c1, e1), `an edit to an inlined definition changes the C\n${e1.error ?? ""}`);
-want(runs("e1") === "18", `an edit to an inlined definition reaches what inlines it\n${runs("e1")}`);
-const e2 = cold("e2");
+want((await runs("e1")) === "18", `an edit to an inlined definition reaches what inlines it\n${await runs("e1")}`);
+const e2 = await cold("e2");
 want(same(e1, e2), "after an edit, the C is what a cold run makes");
 
 // back as it was: the C as it was
 writeFileSync(join(dir, "a.hf"), a(1));
-const b1 = compile("b1");
+const b1 = await compile("b1");
 want(same(c1, b1), "an edit undone: the C as it was");
 
 // a corrupt file of the cache: compiled over, the same C
 for (const f of hbs()) writeFileSync(join(back(), f), readFileSync(join(back(), f), "utf8").slice(0, 100));
-const h1 = compile("h1");
+const h1 = await compile("h1");
 want(same(c1, h1), "corrupt files of the cache are compiled over");
-const h2 = compile("h2");
+const h2 = await compile("h2");
 want(same(c1, h2), "and kept again");
 
 // JavaScript, through the same files
-const compileJs = (out) => {
-  const r = heff("compile", "main.hf", out, "--name", "main", "--backend=node");
+const compileJs = async (out) => {
+  const r = await heff("compile", "main.hf", out, "--name", "main", "--backend=node");
   if (r.status !== 0) return { error: r.stderr.slice(0, 400) };
   return { files: { js: readFileSync(join(dir, out), "utf8") } };
 };
-const coldJs = (out) => { for (const f of hbs()) rmSync(join(back(), f)); return compileJs(out); };
-const runsJs = (out) => spawnSync("node", [join(dir, out)], { encoding: "utf8" }).stdout.trim();
-const j1 = coldJs("j1.mjs");
+const coldJs = async (out) => { for (const f of hbs()) rmSync(join(back(), f)); return compileJs(out); };
+const runsJs = async (out) => (await run(process.execPath, [join(dir, out)])).stdout.trim();
+const j1 = await coldJs("j1.mjs");
 want(!j1.error, `cold JavaScript compile failed\n${j1.error}`);
-want(runsJs("j1.mjs") === "14", `the JavaScript runs\n${runsJs("j1.mjs")}`);
-const c2 = compile("c2");
+want((await runsJs("j1.mjs")) === "14", `the JavaScript runs\n${await runsJs("j1.mjs")}`);
+const c2 = await compile("c2");
 want(same(c1, c2), "C after JavaScript: the C a cold run made");
 const times2 = Object.fromEntries(hbs().map((f) => [f, statSync(join(back(), f)).mtimeMs]));
-const j2 = compileJs("j2.mjs");
+const j2 = await compileJs("j2.mjs");
 want(same(j1, j2), "a warm run makes the JavaScript a cold run made");
-const c3 = compile("c3");
+const c3 = await compile("c3");
 want(same(c1, c3), "and the C");
 want(hbs().every((f) => statSync(join(back(), f)).mtimeMs === times2[f]), "warm runs of both leave the cache's files alone");
 writeFileSync(join(dir, "a.hf"), a(2));
-const je = compileJs("je.mjs");
+const je = await compileJs("je.mjs");
 want(!je.error && !same(j1, je), `an edit to an inlined definition changes the JavaScript\n${je.error ?? ""}`);
-want(runsJs("je.mjs") === "18", `an edit reaches the JavaScript\n${runsJs("je.mjs")}`);
-want(same(je, coldJs("je2.mjs")), "after an edit, the JavaScript is what a cold run makes");
+want((await runsJs("je.mjs")) === "18", `an edit reaches the JavaScript\n${await runsJs("je.mjs")}`);
+want(same(je, await coldJs("je2.mjs")), "after an edit, the JavaScript is what a cold run makes");
 writeFileSync(join(dir, "a.hf"), a(1));
 for (const f of hbs()) writeFileSync(join(back(), f), readFileSync(join(back(), f), "utf8").slice(0, 100));
-want(same(j1, compileJs("jh.mjs")), "corrupt files of the cache are compiled over, the JavaScript too");
+want(same(j1, await compileJs("jh.mjs")), "corrupt files of the cache are compiled over, the JavaScript too");
 
 // a global named as `count`'s local is, newly: `count` unchanged, its
 // local as a cold run names it
@@ -141,12 +142,12 @@ main : Co stdio Unit
 main = program (io := \\p -> p)
 `;
 writeFileSync(join(dir, "main.hf"), counting(false));
-const k1 = compileJs("k1.mjs");
-want(!k1.error && runsJs("k1.mjs") === "14", `count runs\n${k1.error ?? runsJs("k1.mjs")}`);
+const k1 = await compileJs("k1.mjs");
+want(!k1.error && (await runsJs("k1.mjs")) === "14", `count runs\n${k1.error ?? await runsJs("k1.mjs")}`);
 writeFileSync(join(dir, "main.hf"), counting(true));
-const k2 = compileJs("k2.mjs");
-want(!k2.error && runsJs("k2.mjs") === "19", `count runs past a global x\n${k2.error ?? runsJs("k2.mjs")}`);
-want(same(k2, coldJs("k3.mjs")), "a global newly met: the JavaScript a cold run makes");
+const k2 = await compileJs("k2.mjs");
+want(!k2.error && (await runsJs("k2.mjs")) === "19", `count runs past a global x\n${k2.error ?? await runsJs("k2.mjs")}`);
+want(same(k2, await coldJs("k3.mjs")), "a global newly met: the JavaScript a cold run makes");
 
 rmSync(dir, { recursive: true, force: true });
 console.log(`backcache: ${failed ? "NOT " : ""}the same C and JavaScript through the cache, kept and made again where what it inlines changed`);
