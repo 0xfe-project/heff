@@ -25,7 +25,7 @@
 // primitive and the runtime's calls consume their arguments too.  What
 // is static (a string written in the program, a definition's closure) is
 // immortal, its count never changed.  A program runs in a thread of its
-// own with a large stack, as the Node.js backend's does.  A call last of an unknown
+// own with a large stack.  A call last of an unknown
 // function counts itself and every so often gives back a bounce (`K_BNC`),
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
 // backend does (src/heff/compile/emit.hf, "Tail calls") -- unless it is a jump
@@ -2710,9 +2710,7 @@ static V heff_cons(V x, V rest) {
 // A C string out is malloc'd, or NULL where the string cannot be one --
 // it has a NUL in it -- and the operation then fails (its `Nothing`, its
 // `False`).  Content and paths are the string's bytes, as they are;
-// text is made valid, what is not UTF-8 in it U+FFFD, both in and out,
-// as the JavaScript backend's names are (Node.js has an argument, the
-// environment, as text alone).
+// text is made valid, what is not UTF-8 in it U+FFFD, both in and out.
 
 // (content in, `n` bytes, as a string)
 static V heff_str_bytes(const void *c, int64_t n) { return heff_str_of(c, n); }

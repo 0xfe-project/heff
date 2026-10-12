@@ -1,7 +1,6 @@
 // The process's side of lib/std/process.hf, for the C backend: an effect
 // provider (the shape of one is said in lib/std/io.provider.c).
-// `Exit` ends the program there; `Exec` runs the command in its place
-// (Node.js's first thread does that once the program has ended).
+// `Exit` ends the program there; `Exec` runs the command in its place.
 
 #ifdef _WIN32
 #include <direct.h>
