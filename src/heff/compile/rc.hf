@@ -696,53 +696,96 @@ heldOfV : CE -> Mp.Val -> Maybe String
 heldOfV ce (SVar x) = if unboxedVar ce x then Nothing else Just x
 heldOfV ce _ = Nothing
 
+-- (a variable lent is wanted through the whole call: lent where it is
+-- lent again later (`lent`, held and dropped after the call by the last
+-- that lends it), and counted where it is given too, before or after
+-- (`live`) -- the callee may take apart in place what it is given, and
+-- read what it is lent)
 lentVarOr : RcK
           -> CE
+          -> List String
           -> List String
           -> List Int
           -> Int
           -> Mp.Val
           -> Maybe String
           -> Operand
-lentVarOr r ce live bi i e (Just x) =
-  if elemI i bi then lentVar ce live x else Given (r.val ce live e)
-lentVarOr r ce live bi i e Nothing =
+lentVarOr r ce lent live bi i e (Just x) =
+  if elemI i bi then lentVar ce lent x else Given (r.val ce live e)
+lentVarOr r ce lent live bi i e Nothing =
   if elemI i bi then LentValue (r.val ce live e) else Given (r.val ce live e)
 
 lentOr : RcK
        -> CE
+       -> List String
        -> List String
        -> List Int
        -> Int
        -> Mp.Val
        -> Maybe Value
        -> Operand
-lentOr r ce live bi i e (Just a) = Given a
-lentOr r ce live bi i e Nothing = lentVarOr r ce live bi i e (heldOfV ce e)
+lentOr r ce lent live bi i e (Just a) = Given a
+lentOr r ce lent live bi i e Nothing =
+  lentVarOr r ce lent live bi i e (heldOfV ce e)
 
 lentOne : RcK
         -> CE
+        -> List String
         -> List String
         -> List String
         -> List Int
         -> Int
         -> Mp.Val
         -> Operand
-lentOne r ce after live bi i e =
-  lentOr r ce live bi i e (if elemI i bi then lentField ce after e else Nothing)
+lentOne r ce after lent live bi i e =
+  lentOr
+    r
+    ce
+    lent
+    live
+    bi
+    i
+    e
+    (if elemI i bi then lentField ce after e else Nothing)
 
-lentOperands : RcK
-             -> CE
-             -> List String
-             -> List Int
-             -> Int
-             -> List Mp.Val
-             -> List Operand
-lentOperands r ce live bi i Nil = Nil
-lentOperands r ce live bi i (Cons e es) =
-  Cons
-    (lentOne r ce live (unionS (fvList es) live) bi i e)
-    (lentOperands r ce live bi (i + 1) es)
+consHeld : Maybe String -> List String -> List String
+consHeld (Just x) xs = Cons x xs
+consHeld Nothing xs = xs
+
+-- | the variables a call lends, at its borrowed parameters from the
+-- | `i`th on
+lentIn : CE -> List Int -> Int -> List Mp.Val -> List String
+lentIn ce bi i Nil = Nil
+lentIn ce bi i (Cons e es) =
+  if elemI i bi then consHeld (heldOfV ce e) (lentIn ce bi (i + 1) es)
+  else lentIn ce bi (i + 1) es
+
+-- (the variables lent so far, and the `i`th's if it is)
+lentThen : CE -> List Int -> Int -> Mp.Val -> List String -> List String
+lentThen ce bi i e before =
+  if elemI i bi then consHeld (heldOfV ce e) before else before
+
+-- (the `i`th operand, `before` lent before it: wanted after it, lent
+-- after it, and given)
+lentAt : RcK
+       -> CE
+       -> List String
+       -> List String
+       -> List Int
+       -> Int
+       -> Mp.Val
+       -> List Mp.Val
+       -> Operand
+lentAt r ce live before bi i e es =
+  lentOne
+    r
+    ce
+    live
+    (unionS (lentIn ce bi (i + 1) es) live)
+    (unionS before (unionS (fvList es) live))
+    bi
+    i
+    e
 
 -- (an operand of a known call, of a parameter its worker takes as `rp`
 -- (#39): unboxed, given so; else given or lent, as `lentOne` has it)
@@ -754,23 +797,26 @@ sigOne : RcK
        -> Int
        -> Repr.Repr
        -> Mp.Val
+       -> List Mp.Val
        -> Operand
-sigOne r ce after live bi i RepV e = lentOne r ce after live bi i e
-sigOne r ce after live bi i rp e = GivenU rp (r.valAs ce live rp e)
+sigOne r ce live before bi i RepV e es = lentAt r ce live before bi i e es
+sigOne r ce live before bi i rp e es =
+  GivenU rp (r.valAs ce (unionS before (unionS (fvList es) live)) rp e)
 
 sigOperands : RcK
             -> CE
+            -> List String
             -> List String
             -> List Int
             -> Int
             -> List Repr.Repr
             -> List Mp.Val
             -> List Operand
-sigOperands r ce live bi i (Cons rp rps) (Cons e es) =
+sigOperands r ce live before bi i (Cons rp rps) (Cons e es) =
   Cons
-    (sigOne r ce live (unionS (fvList es) live) bi i rp e)
-    (sigOperands r ce live bi (i + 1) rps es)
-sigOperands r ce live bi i _ _ = Nil
+    (sigOne r ce live before bi i rp e es)
+    (sigOperands r ce live (lentThen ce bi i e before) bi (i + 1) rps es)
+sigOperands r ce live before bi i _ _ = Nil
 
 -- | the operands of a known call of `g`: as its worker takes them, if it
 -- | has one, each else given or lent
@@ -780,6 +826,7 @@ callOperands r ce live g as =
     r
     ce
     live
+    Nil
     (Bo.borOf ce.bor g)
     0
     (Repr.paramReprsIn ce.sigs g as)
@@ -2090,19 +2137,24 @@ callAs ce g as loop ls =
 loopOperands : RcK
              -> CE
              -> List String
+             -> List String
              -> List Int
              -> Int
              -> List String
              -> List Mp.Val
              -> List Operand
-loopOperands r ce live bi i (Cons p ps) (Cons e es) =
+loopOperands r ce live before bi i (Cons p ps) (Cons e es) =
   Cons
     (if unboxedVar ce p
        then Given
-           (r.valAs ce (unionS (fvList es) live) (Repr.reprOf ce.reprs p) e)
-     else lentOne r ce live (unionS (fvList es) live) bi i e)
-    (loopOperands r ce live bi (i + 1) ps es)
-loopOperands r ce live bi i _ _ = Nil
+           (r.valAs
+              ce
+              (unionS before (unionS (fvList es) live))
+              (Repr.reprOf ce.reprs p)
+              e)
+     else lentAt r ce live before bi i e es)
+    (loopOperands r ce live (lentThen ce bi i e before) bi (i + 1) ps es)
+loopOperands r ce live before bi i _ _ = Nil
 
 selfParams : CE -> List String
 selfParams { self = Just s } = s.params
@@ -2114,7 +2166,7 @@ callLast r ce g as =
     ce
     g
     as
-    (loopOperands r ce Nil (Bo.borOf ce.bor g) 0 (selfParams ce) as)
+    (loopOperands r ce Nil Nil (Bo.borOf ce.bor g) 0 (selfParams ce) as)
     (callOperands r ce Nil g as)
 
 -- (the name a `Bool` returned is bound to, its condition's operands
