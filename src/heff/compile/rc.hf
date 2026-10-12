@@ -32,7 +32,9 @@
 -- as one it reads fields of, in that one's cell (`RRecIn`); a field taken
 -- out of its record (`RTakeField`); and how each call last is made -- the
 -- loop again, a jump, an unknown function's arguments where a lambda's
--- were.
+-- were.  A function with a worker (heff.compile.worker) is made its
+-- worker, known calls of it calling that with numbers unboxed, and its
+-- wrapper (`Wrapper`), which a closure's entry calls.
 
 import heff.compile.borrow as Bo
 import heff.compile.facts as F
@@ -64,10 +66,15 @@ data Known = KnownTag Int | KnownCell Int | KnownRec Int | KnownClo Int
 -- | a drop of a variable, as what it is known to be (if anything)
 data Drop = MkDrop String (Maybe Known)
 
--- | a call's operand (`e` a value): given; a variable lent, dropped after
--- | the call where nothing wants it after (its drops); a value lent,
--- | computed before the call and dropped after it
-data Arg e = Given e | LentVar String (List Drop) | LentValue e
+-- | a call's operand (`e` a value): given; given unboxed, of the repr (a
+-- | worker's, #39); a variable lent, dropped after the call where nothing
+-- | wants it after (its drops); a value lent, computed before the call
+-- | and dropped after it
+data Arg e
+  = Given e
+  | GivenU Repr.Repr e
+  | LentVar String (List Drop)
+  | LentValue e
 
 -- | a condition, tested where it is (`e` a value): a comparison of
 -- | operands, consumed (`CondRel`), or of unboxed ones (`CondRelU`, #39);
@@ -137,9 +144,10 @@ data Exp b
   -- | its body, the values given), its body (its parameters not wanted
   -- | dropped first)
   | RLam (List String) (List String) (List (Exp b)) b
-  -- | a known definition called: through any bounces (`tr`), each
-  -- | operand given or lent
-  | RCall String Bool (List (Arg (Exp b)))
+  -- | a known definition called: through any bounces (`tr`); its worker,
+  -- | which gives the repr, or the function itself (`Nothing`, a `V`);
+  -- | each operand given or lent
+  | RCall String Bool (Maybe Repr.Repr) (List (Arg (Exp b)))
   | RApply (Exp b) (List (Exp b))
   -- | the `Bool` a condition is
   | RBool (Cond (Exp b))
@@ -186,8 +194,9 @@ data Stmt b
   | CTail (Exp b) (List (Exp b))
   -- | the loop again: its parameters, the arguments
   | CLoop (List String) (List (Exp b))
-  -- | a known definition of the same parameters called last: a jump
-  | CJump String (List (Exp b))
+  -- | a known definition of the same parameters called last: a jump, to
+  -- | its worker or to the function itself
+  | CJump String Bool (List (Exp b))
 
 -- | a body: what a function or a lambda does
 data Code = MkCode (List (Stmt Code))
@@ -204,14 +213,30 @@ type CaseArm = Arm (List Statement)
 
 type Statements = List Statement
 
--- | a definition: a function, its parameters, those lent, what it does
--- | where it is entered -- each parameter kept unboxed unboxed, the loop
--- | going on after it -- and its body (its parameters not wanted dropped
--- | first); a value, its body.  Each with its variables kept unboxed
--- | (heff.compile.repr)
-data Def
-  = DFun String (List String) (List Int) Statements Statements Repr.Reprs
-  | DVal String Statements Repr.Reprs
+-- | a function's wrapper (#39): its parameters, `V`s, and what it does --
+-- | unbox those its worker takes unboxed, call it, box what it gives
+data Wrapper = MkWrapper (List String) Statements
+
+-- | a function: its key, its parameters, those lent, what it does where
+-- | it is entered -- each parameter kept unboxed unboxed, the loop going
+-- | on after it -- its body (its parameters not wanted dropped first),
+-- | its variables kept unboxed (heff.compile.repr), what it gives; and,
+-- | if it has a worker, its wrapper (the function is then the worker, a
+-- | parameter it takes unboxed one of the variables kept so)
+type Fun =
+  { key : String
+  , params : List String
+  , lent : List Int
+  , entry : Statements
+  , body : Statements
+  , reprs : Repr.Reprs
+  , ret : Repr.Repr
+  , wrapper : Maybe Wrapper
+  }
+
+-- | a definition: a function; a value, its body and its variables kept
+-- | unboxed
+data Def = DFun Fun | DVal String Statements Repr.Reprs
 
 -- What is known where
 --------------------------------------------------------------------------------
@@ -225,7 +250,9 @@ type Self = { key : String, params : List String }
 -- after it; `known`: what some of them are known to be; `lam`: in a
 -- lambda's body, how many parameters it takes, else 0 -- see `CInPlace`;
 -- `takes`: the fields, by their records and labels, that the operands
--- being made take out of their records -- see `takesFor`)
+-- being made take out of their records -- see `takesFor`; `sigs`: the
+-- workers; `ret`: what the code being made returns, as its worker gives
+-- it, a `V` in a lambda)
 type CE =
   { funs : M.Map String Int
   , bounce : M.Map String Unit
@@ -238,7 +265,14 @@ type CE =
   , known : M.Map String Known
   , takes : List (Pair String String)
   , reprs : Repr.Reprs
+  , sigs : Repr.Sigs
+  , ret : Repr.Repr
   }
+
+-- (what the code of a definition (`s`) or of a lambda returns)
+retOf : Repr.Sigs -> Maybe Self -> Repr.Repr
+retOf sg (Just s) = Repr.resultIn sg s.key
+retOf sg Nothing = RepV
 
 -- (the code of a definition (`s`) or of a lambda of `n` parameters)
 withFrame : Maybe Self -> Int -> CE -> CE
@@ -254,6 +288,8 @@ withFrame s n ce =
   , known = ce.known
   , takes = Nil
   , reprs = ce.reprs
+  , sigs = ce.sigs
+  , ret = retOf ce.sigs s
   }
 
 withPath : List String -> List String -> CE -> CE
@@ -269,6 +305,8 @@ withPath owned after ce =
   , known = ce.known
   , takes = ce.takes
   , reprs = ce.reprs
+  , sigs = ce.sigs
+  , ret = ce.ret
   }
 
 -- (the variables lent to this code: it holds no reference to them)
@@ -285,6 +323,8 @@ withBorrowed bs ce =
   , known = ce.known
   , takes = ce.takes
   , reprs = ce.reprs
+  , sigs = ce.sigs
+  , ret = ce.ret
   }
 
 withKnown : String -> Known -> CE -> CE
@@ -300,6 +340,8 @@ withKnown x k ce =
   , known = M.insert compareString x k ce.known
   , takes = ce.takes
   , reprs = ce.reprs
+  , sigs = ce.sigs
+  , ret = ce.ret
   }
 
 withTakes : List (Pair String String) -> CE -> CE
@@ -315,6 +357,8 @@ withTakes ts ce =
   , known = ce.known
   , takes = ts
   , reprs = ce.reprs
+  , sigs = ce.sigs
+  , ret = ce.ret
   }
 
 -- | what is known of the program, where a definition starts, and how
@@ -332,6 +376,8 @@ ceOfFacts facts reprs =
   , known = M.empty
   , takes = Nil
   , reprs = reprs
+  , sigs = facts.workers
+  , ret = RepV
   }
 
 -- Free variables
@@ -696,9 +742,61 @@ lentOperands r ce live bi i (Cons e es) =
     (lentOne r ce live (unionS (fvList es) live) bi i e)
     (lentOperands r ce live bi (i + 1) es)
 
+-- (an operand of a known call, of a parameter its worker takes as `rp`
+-- (#39): unboxed, given so; else given or lent, as `lentOne` has it)
+sigOne : RcK
+       -> CE
+       -> List String
+       -> List String
+       -> List Int
+       -> Int
+       -> Repr.Repr
+       -> Mp.Val
+       -> Operand
+sigOne r ce after live bi i RepV e = lentOne r ce after live bi i e
+sigOne r ce after live bi i rp e = GivenU rp (r.valAs ce live rp e)
+
+sigOperands : RcK
+            -> CE
+            -> List String
+            -> List Int
+            -> Int
+            -> List Repr.Repr
+            -> List Mp.Val
+            -> List Operand
+sigOperands r ce live bi i (Cons rp rps) (Cons e es) =
+  Cons
+    (sigOne r ce live (unionS (fvList es) live) bi i rp e)
+    (sigOperands r ce live bi (i + 1) rps es)
+sigOperands r ce live bi i _ _ = Nil
+
+-- | the operands of a known call of `g`: as its worker takes them, if it
+-- | has one, each else given or lent
+callOperands : RcK -> CE -> List String -> String -> List Mp.Val -> List Operand
+callOperands r ce live g as =
+  sigOperands
+    r
+    ce
+    live
+    (Bo.borOf ce.bor g)
+    0
+    (Repr.paramReprsIn ce.sigs g as)
+    as
+
+-- | the worker a known call of `g` calls, by what it gives (`Nothing`:
+-- | none, the function itself)
+workerOf : CE -> String -> Maybe Repr.Repr
+workerOf ce g =
+  maybe Nothing (\(sg : Repr.Sig) -> Just sg.result) (Repr.sigIn ce.sigs g)
+
+toWorker : Maybe Repr.Repr -> Bool
+toWorker (Just _) = True
+toWorker Nothing = False
+
 -- | whether each operand is given, none lent
 plainArg : Operand -> Bool
 plainArg (Given _) = True
+plainArg (GivenU _ _) = True
 plainArg (LentVar _ Nil) = True
 plainArg _ = False
 
@@ -708,6 +806,7 @@ lentPlain ls = List.all plainArg ls
 -- | an operand's value, as the call is given it
 argExp : Operand -> Value
 argExp (Given e) = e
+argExp (GivenU _ e) = e
 argExp (LentVar x _) = RLocal x
 argExp (LentValue e) = e
 
@@ -1176,7 +1275,8 @@ compV r ce live (OCall g as) =
   RCall
     g
     (M.member compareString g ce.bounce)
-    (lentOperands r ce live (Bo.borOf ce.bor g) 0 as)
+    (workerOf ce g)
+    (callOperands r ce live g as)
 compV r ce live (OPrim p as) = RPrim p (operandsF r ce live as)
 compV r ce live (OSimple v) = r.val ce live v
 compV r ce live OAbandon = RAbandon
@@ -1185,6 +1285,8 @@ compV r ce live (OBool c) = RBool (condF r (lentTo ce) c)
 -- | a step not last: its value, through any bounces, as the repr wanted
 compF : RcK -> CE -> List String -> Repr.Repr -> Mp.Comp -> Value
 compF r ce live want (OSimple v) = r.valAs ce live want v
+compF r ce live want (OCall g as) =
+  coerce (Repr.resultIn ce.sigs g) want (compV r ce live (OCall g as))
 compF r ce live want o = coerce RepV want (compV r ce live o)
 
 -- Statements and what is last
@@ -1224,11 +1326,25 @@ agreesWith : Maybe Self -> Maybe Int -> Int -> Bool
 agreesWith (Just s) m n = List.length s.params == n && arityIs n m
 agreesWith Nothing m n = False
 
+-- (whether two functions' workers, if any, are of one signature)
+sameSigs : Maybe Repr.Sig -> Maybe Repr.Sig -> Bool
+sameSigs (Just a) (Just b) = Repr.sigEq a b
+sameSigs Nothing Nothing = True
+sameSigs a b = False
+
+sameAs : CE -> Maybe Self -> String -> Bool
+sameAs ce (Just s) g =
+  sameSigs (Repr.sigIn ce.sigs s.key) (Repr.sigIn ce.sigs g)
+sameAs ce Nothing g = False
+
 -- (a call last of `g`, from a definition taking as many parameters as
--- `g` does: their C functions' types the same, the call a jump)
+-- `g` does, and taking and giving them as `g` does (#39,
+-- heff.compile.worker): their C functions' types the same, the call a
+-- jump)
 agrees : CE -> String -> List Mp.Val -> Bool
 agrees ce g as =
   agreesWith ce.self (M.lookup compareString g ce.funs) (List.length as)
+  && sameAs ce ce.self g
 
 -- | how many arguments a lambda's call last may put in `heff_room`
 -- | (lib/c/runtime.c's `HEFF_ROOM`)
@@ -1957,8 +2073,14 @@ callAs : CE
 callAs ce g as loop ls =
   if isSelfCall ce g as && lentPlain loop then again ce (List.map argExp loop)
   else if agrees ce g as && lentPlain ls
-    then Cons (CJump g (List.map argExp ls)) Nil
-  else Cons (CReturn (RCall g False ls)) Nil
+    then Cons (CJump g (toWorker (workerOf ce g)) (List.map argExp ls)) Nil
+  else Cons
+      (CReturn
+         (coerce
+            (Repr.resultIn ce.sigs g)
+            ce.ret
+            (RCall g False (workerOf ce g) ls)))
+      Nil
 
 -- (the loop's next round's operands: a parameter kept unboxed given its
 -- value so, the others as a call's)
@@ -1990,7 +2112,7 @@ callLast r ce g as =
     g
     as
     (loopOperands r ce Nil (Bo.borOf ce.bor g) 0 (selfParams ce) as)
-    (lentOperands r ce Nil (Bo.borOf ce.bor g) 0 as)
+    (callOperands r ce Nil g as)
 
 -- (the name a `Bool` returned is bound to, its condition's operands
 -- dropped before it is: one no other name is, each given a `$` and a
@@ -2002,13 +2124,17 @@ boolName = "ret$bool"
 tailF : RcK -> CE -> Mp.Tl -> List Statement
 tailF r ce (TSeq ss t) = r.stmts ce ss (Just t)
 tailF r ce (TReturn (OApply f as)) =
-  applyLast ce (List.length as) (operandsF r ce Nil (Cons f as))
+  if Repr.isBoxed ce.ret
+    then applyLast ce (List.length as) (operandsF r ce Nil (Cons f as))
+  else Cons (CReturn (r.comp ce Nil ce.ret (OApply f as))) Nil
 tailF r ce (TReturn (OCall g as)) = callLast r ce g as
 tailF r ce (TReturn (OBool c)) =
   Cons
     (CLet boolName (r.comp ce Nil RepV (OBool c)))
-    (List.append (dropsIn ce ce.owned) (Cons (CReturn (RLocal boolName)) Nil))
-tailF r ce (TReturn o) = Cons (CReturn (r.comp ce Nil RepV o)) Nil
+    (List.append
+       (dropsIn ce ce.owned)
+       (Cons (CReturn (coerce RepV ce.ret (RLocal boolName))) Nil))
+tailF r ce (TReturn o) = Cons (CReturn (r.comp ce Nil ce.ret o)) Nil
 tailF r ce (TLoop as) = case ce.self of
   Just s -> callLast r ce s.key as
   Nothing -> Cons (CReturn RAbandon) Nil
@@ -2028,45 +2154,118 @@ rcK =
 -- Definitions
 --------------------------------------------------------------------------------
 
--- (each parameter kept unboxed unboxed, where the function is entered;
--- one lent looked at)
-unboxParams : CE -> List Int -> List String -> List Statement
-unboxParams ce bi xs =
+-- (a parameter given a `V`, kept unboxed, unboxed where the function is
+-- entered -- one lent looked at; one its worker takes unboxed (`rp`,
+-- #39) is given so)
+unboxGiven : CE -> Bool -> Repr.Repr -> String -> List Statement
+unboxGiven ce lent RepV x = unboxParam ce lent x
+unboxGiven ce lent rp x = Nil
+
+-- (each parameter's place)
+placesOf : {a : Type} -> List a -> List Int
+placesOf xs = List.range 0 (List.length xs - 1)
+
+unboxParams : CE -> List Int -> List Repr.Repr -> List String -> List Statement
+unboxParams ce bi rps xs =
   List.concatMap
     (\ss -> ss)
     (List.zipWith
-       (\x i -> unboxParam ce (elemI i bi) x)
-       xs
-       (List.range 0 (List.length xs - 1)))
+       (\p i -> unboxGiven ce (elemI i bi) (snd p) (fst p))
+       (List.zip xs rps)
+       (placesOf xs))
+
+-- (a parameter's name, as the function is given it: its worker's taken
+-- unboxed as it is, any other a `V`)
+paramName : CE -> Repr.Repr -> String -> String
+paramName ce RepV x = givenName ce x
+paramName ce rp x = x
+
+-- Wrappers (#39): a function with a worker (heff.compile.worker) is, to
+-- a closure's entry and any other caller of `V`s, its wrapper -- which
+-- unboxes what its worker takes unboxed (looked at, if lent: the caller
+-- drops it), calls it, and boxes what it gives -- and the worker is the
+-- function's code itself.
+
+wrapParam : CE -> Repr.Repr -> String -> String
+wrapParam ce RepV x = givenName ce x
+wrapParam ce rp x = boxName x
+
+wrapUnbox : Bool -> Repr.Repr -> String -> List Statement
+wrapUnbox lent RepV x = Nil
+wrapUnbox lent rp x = Cons (CLet x (unboxAs lent rp (RLocal (boxName x)))) Nil
+
+wrapArg : CE -> Repr.Repr -> String -> Operand
+wrapArg ce RepV x = Given (RLocal (givenName ce x))
+wrapArg ce rp x = GivenU rp (RLocal x)
+
+wrapperOf : CE -> String -> List Int -> Repr.Sig -> List String -> Wrapper
+wrapperOf ce key bi sg xs =
+  MkWrapper
+    (List.zipWith (wrapParam ce) sg.params xs)
+    (List.append
+       (List.concatMap
+          (\ss -> ss)
+          (List.zipWith
+             (\p i -> wrapUnbox (elemI i bi) (fst p) (snd p))
+             (List.zip sg.params xs)
+             (placesOf xs)))
+       (Cons
+          (CReturn
+             (coerce
+                sg.result
+                RepV
+                (RCall
+                   key
+                   False
+                   (Just sg.result)
+                   (List.zipWith (wrapArg ce) sg.params xs))))
+          Nil))
+
+funWith : CE
+        -> String
+        -> List String
+        -> Mp.Tl
+        -> List Int
+        -> List Repr.Repr
+        -> Maybe Repr.Sig
+        -> Def
+funWith ce key xs b bi rps sg =
+  DFun
+    { key = key
+    , params = List.zipWith (paramName ce) rps xs
+    , lent = bi
+    , entry = unboxParams ce bi rps xs
+    , body =
+        List.append
+          (plainDrops
+             (boxedOnly ce (deadIn (Bo.paramsAt False bi xs) (fvTl b))))
+          (rcK.tail
+             (withPath
+                (boxedOnly ce (deadKept (Bo.paramsAt False bi xs) (fvTl b)))
+                Nil
+                (withBorrowed
+                   (Bo.paramsAt True bi xs)
+                   (withFrame
+                      (Just { key = key, params = xs })
+                      0
+                      (knowingShapes b ce))))
+             b)
+    , reprs = ce.reprs
+    , ret = Repr.resultIn ce.sigs key
+    , wrapper =
+        maybe Nothing (\(s : Repr.Sig) -> Just (wrapperOf ce key bi s xs)) sg
+    }
 
 funRc : CE -> String -> List String -> Mp.Tl -> Def
 funRc ce key xs b =
-  DFun
+  funWith
+    ce
     key
-    (List.map (givenName ce) xs)
+    xs
+    b
     (Bo.borOf ce.bor key)
-    (unboxParams ce (Bo.borOf ce.bor key) xs)
-    (List.append
-       (plainDrops
-          (boxedOnly
-             ce
-             (deadIn (Bo.paramsAt False (Bo.borOf ce.bor key) xs) (fvTl b))))
-       (rcK.tail
-          (withPath
-             (boxedOnly
-                ce
-                (deadKept
-                   (Bo.paramsAt False (Bo.borOf ce.bor key) xs)
-                   (fvTl b)))
-             Nil
-             (withBorrowed
-                (Bo.paramsAt True (Bo.borOf ce.bor key) xs)
-                (withFrame
-                   (Just { key = key, params = xs })
-                   0
-                   (knowingShapes b ce))))
-          b))
-    ce.reprs
+    (Repr.paramReprsIn ce.sigs key xs)
+    (Repr.sigIn ce.sigs key)
 
 valRc : CE -> String -> Mp.Tl -> Def
 valRc ce key t =

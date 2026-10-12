@@ -56,7 +56,12 @@ as one -- to a provider, into a list, a tag or a closure, to a function
 or back from it -- where an integer of up to 32 bits and a `Float32`
 cost none.  Where a program computes with a fixed-width number or a
 `Float64`, it keeps it unboxed, as its C type (`int64_t`, `double`,
-...), and boxes it only where it is given so (src/heff/compile/repr.hf).
+...), and boxes it only where it is given so (src/heff/compile/repr.hf);
+a function that takes such a number as a number, or gives one back, is
+called, where the call is known, by a C function of its own taking and
+giving it unboxed (its worker, `g_K_w`, src/heff/compile/worker.hf),
+and from a closure or a provider as any other, through a function of
+`V`s that unboxes and boxes (its wrapper, `g_K`).
 A record's `Float64`, `Int64` and `UInt64` fields (of its first 16),
 built where their type is known, are kept flat, their bits in the
 record: a provider given a record reads a field by `heff_rget_v` (the

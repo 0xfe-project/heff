@@ -1,0 +1,360 @@
+-- Workers and wrappers, for the C backend (#39): which functions have a
+-- worker, and its signature (`Repr.Sig`).  A worker is the function's
+-- C function taking some of its parameters, and giving its result,
+-- unboxed -- a fixed-width number as its C integer type, a `Float64` as
+-- a `double` -- which a known call calls with them so: nothing boxed to
+-- be given, nor unboxed where it is taken.  Its wrapper, a function of
+-- `V`s as any other, unboxes them, calls it, and boxes what it gives:
+-- what a closure's entry calls (heff.compile.rc makes both).
+--
+-- The form has no types, so what a parameter is is told by what its body
+-- does with it, as heff.compile.repr tells a variable's: a parameter, or
+-- the result, is unboxed where its class would be were the function given
+-- `V`s and its caller wanting a `V` (`Repr.proposeSig`) -- used as a
+-- number, so that no call of the worker costs more than a call of the
+-- function did.  What a body does with a known call's operands and
+-- result is told by the workers there are, so this is a fixpoint on the
+-- calls: from no workers, each function weighed again where one it calls
+-- has a new one, a parameter once unboxed staying so, until none changes
+-- (each round in the order of the keys, against the workers at its
+-- start: what it comes to is the same whatever order the program is in).
+--
+-- Only what a body says is evidence, never what a caller gives: a
+-- function called with an `Int64` at one call and a `Float64` at another
+-- is generic, and is called through its wrapper from a closure with
+-- anything.
+--
+-- A function calling another of as many parameters last jumps to it
+-- (`HEFF_LAST`), which C allows only between functions of one type: the
+-- functions that jump to one another round a cycle, which may go round
+-- any number of times, are given one signature, unboxed only where all of
+-- theirs are (`meetCycles`); a call last out of a cycle, of another type,
+-- is a call.  A function a call of which may give back a bounce gives a
+-- `V`.
+
+import heff.compile.facts as Facts
+import heff.compile.imp as Imp
+import heff.compile.ir as IR
+import heff.compile.repr as Repr
+import map as Map
+
+-- What may have a worker
+--------------------------------------------------------------------------------
+
+-- (a field's type, kept flat where it is read: see `Repr.flatOf`)
+flatTy : IR.FieldTy -> Bool
+flatTy FtFloat = True
+flatTy (FtFixed _) = True
+flatTy t = False
+
+shaped : Maybe Repr.Shape -> Bool
+shaped (Just _) = True
+shaped Nothing = False
+
+-- (whether the worklist has evidence of a number: a literal, a primitive
+-- done unboxed, a field kept flat)
+numericW : List IR.Expr -> Bool
+numericW Nil = False
+numericW (Cons (EFixed _ _) _) = True
+numericW (Cons (EFloat _) _) = True
+numericW (Cons (EFloat32 _) _) = True
+numericW (Cons (EPrimCall p as) rest) =
+  shaped (Repr.primShape p) || numericW (IR.appendI as rest)
+numericW (Cons (EProj e _ _ t) rest) = flatTy t || numericW (Cons e rest)
+numericW (Cons (ELam _ b) rest) = numericW (Cons b rest)
+numericW (Cons (EApp f as) rest) = numericW (Cons f (IR.appendI as rest))
+numericW (Cons (ELet _ a b) rest) = numericW (Cons a (Cons b rest))
+numericW (Cons (ERecord fs _) rest) = numericW (IR.pushFields fs rest)
+numericW (Cons (ETag _ as) rest) = numericW (IR.appendI as rest)
+numericW (Cons (EMatch s arms) rest) = numericW (Cons s (IR.pushArms arms rest))
+numericW (Cons (ECall _ as) rest) = numericW (IR.appendI as rest)
+numericW (Cons _ rest) = numericW rest
+
+-- | whether a function's body has evidence of a number of its own: those
+-- | that have none have a worker only where one they call has
+numeric : IR.Def -> Bool
+numeric d = numericW (Cons d.body Nil)
+
+isFunction : IR.Def -> Bool
+isFunction { body = ELam _ _ } = True
+isFunction d = False
+
+-- (each function, by the definitions that mention it: those weighed
+-- again where it has a new worker)
+callersOne : Map.Map String (List String)
+           -> IR.Def
+           -> Map.Map String (List String)
+callersOne m d =
+  List.foldl
+    (\acc g ->
+       Map.insert
+         compareString
+         g
+         (Cons d.key (fromMaybe Nil (Map.lookup compareString g acc)))
+         acc)
+    m
+    (IR.globalsIn d.body)
+
+callersOf : List IR.Def -> Map.Map String (List String)
+callersOf defs = List.foldl callersOne Map.empty defs
+
+-- (each once, in order)
+sortedOnce : List String -> List String
+sortedOnce xs =
+  List.map
+    fst
+    (Map.toList
+       (List.foldl
+          (\m x -> Map.insert compareString x (MkUnit : Unit) m)
+          Map.empty
+          xs))
+
+-- The fixpoint
+--------------------------------------------------------------------------------
+
+-- | what the rounds go on with: the workers so far, and the functions'
+-- | imperative forms made so far (each made once, when first weighed)
+type Round = { sigs : Repr.Sigs, imps : Map.Map String Imp.Def }
+
+-- (a function's imperative form, its names drawn afresh, as the C
+-- backend makes it: heff.compile.lower's `cDef`)
+impOf : IR.Def -> Imp.Def
+impOf d = case IR.freshen 0 d.body of
+  MkPair b n -> Imp.impDef True n (IR.mkDef d.key d.name b)
+
+-- (the one made before, if it was: made only if it was not)
+impFrom : IR.Def -> Maybe Imp.Def -> Imp.Def
+impFrom d (Just md) = md
+impFrom d Nothing = impOf d
+
+impIn : Map.Map String Imp.Def -> IR.Def -> Imp.Def
+impIn imps d = impFrom d (Map.lookup compareString d.key imps)
+
+plainSig : Int -> Repr.Sig
+plainSig n = { params = List.replicate n RepV, result = RepV }
+
+-- (as it was, unboxed where it was, else as proposed)
+grownRepr : Repr.Repr -> Repr.Repr -> Repr.Repr
+grownRepr RepV r = r
+grownRepr old r = old
+
+grown : Repr.Sig -> Repr.Sig -> Repr.Sig
+grown old new =
+  { params = List.zipWith grownRepr old.params new.params
+  , result = grownRepr old.result new.result
+  }
+
+sigOr : Repr.Sigs -> String -> Int -> Repr.Sig
+sigOr sg k n = fromMaybe (plainSig n) (Repr.sigIn sg k)
+
+-- | a round's work so far: the changed workers, and the forms made
+type Weighed =
+  { changed : List (Pair String Repr.Sig), imps : Map.Map String Imp.Def }
+
+weighedWith : Weighed -> String -> Imp.Def -> Repr.Sig -> Repr.Sig -> Weighed
+weighedWith acc k md old new =
+  { changed =
+      if Repr.sigEq old new then acc.changed
+      else Cons (MkPair k new) acc.changed
+  , imps = Map.insert compareString k md acc.imps
+  }
+
+-- (a function weighed against the workers `sg`, its form `md`)
+weighImp : Facts.Facts -> Repr.Sigs -> Weighed -> String -> Imp.Def -> Weighed
+weighImp facts sg acc k md@(MkDef _ _ (DefFun xs (MkBlock t))) =
+  weighedWith
+    acc
+    k
+    md
+    (sigOr sg k (List.length xs))
+    (grown
+       (sigOr sg k (List.length xs))
+       (Repr.proposeSig sg (Map.member compareString k facts.bounce) xs t))
+weighImp facts sg acc k md = acc
+
+weighOne : Facts.Facts
+         -> Map.Map String IR.Def
+         -> Repr.Sigs
+         -> Weighed
+         -> String
+         -> Weighed
+weighOne facts defs sg acc k = case Map.lookup compareString k defs of
+  Just d ->
+    if isFunction d then weighImp facts sg acc k (impIn acc.imps d) else acc
+  Nothing -> acc
+
+withChanges : Repr.Sigs -> List (Pair String Repr.Sig) -> Repr.Sigs
+withChanges sg cs =
+  List.foldl (\m p -> Map.insert compareString (fst p) (snd p) m) sg cs
+
+-- | what the next round weighs: the workers so far, and those whose
+-- | callees' workers changed (and those changed themselves)
+type Next = { round : Round, dirty : List String }
+
+nextOf : Map.Map String (List String) -> Round -> Weighed -> Next
+nextOf callers r w =
+  { round = { sigs = withChanges r.sigs w.changed, imps = w.imps }
+  , dirty =
+      sortedOnce
+        (List.concatMap
+           (\p ->
+              Cons
+                (fst p)
+                (fromMaybe Nil (Map.lookup compareString (fst p) callers)))
+           w.changed)
+  }
+
+-- (the rounds, `n` more at most, until no worker changes)
+rounds : Facts.Facts
+       -> Map.Map String IR.Def
+       -> Map.Map String (List String)
+       -> Int
+       -> Next
+       -> Repr.Sigs
+rounds facts defs callers n nx =
+  if n <= 0 || List.null nx.dirty then nx.round.sigs
+  else rounds
+      facts
+      defs
+      callers
+      (n - 1)
+      (nextOf
+         callers
+         nx.round
+         (List.foldl
+            (weighOne facts defs nx.round.sigs)
+            { changed = Nil, imps = nx.round.imps }
+            nx.dirty))
+
+-- Cycles of jumps
+--------------------------------------------------------------------------------
+
+-- (the calls last of a body: each callee, and how many operands)
+tailCalls : IR.Expr -> List (Pair String Int)
+tailCalls (ELet _ _ b) = tailCalls b
+tailCalls (EMatch _ arms) = List.concatMap (\a -> tailCalls (IR.armBody a)) arms
+tailCalls (ECall g as) = Cons (MkPair g (List.length as)) Nil
+tailCalls e = Nil
+
+arityIs : Int -> Maybe Int -> Bool
+arityIs n (Just m) = n == m
+arityIs n Nothing = False
+
+-- (a call last of another function, of as many parameters as `n`, with
+-- as many: a jump, heff.compile.rc's `agrees`)
+jumpTo : Map.Map String Int -> String -> Int -> Pair String Int -> Bool
+jumpTo ar k n (MkPair g m) =
+  not (strEq g k) && m == n && arityIs n (Map.lookup compareString g ar)
+
+-- | whom a function jumps to
+jumpsOf : Map.Map String Int -> IR.Def -> List String
+jumpsOf ar d@{ body = ELam xs b } =
+  List.map fst (List.filter (jumpTo ar d.key (List.length xs)) (tailCalls b))
+jumpsOf ar d = Nil
+
+jumpsAll : Map.Map String Int -> List IR.Def -> Map.Map String (List String)
+jumpsAll ar defs =
+  List.foldl
+    (\m (d : IR.Def) -> Map.insert compareString d.key (jumpsOf ar d) m)
+    Map.empty
+    defs
+
+-- (what the worklist reaches by jumps, `seen` so far)
+reachGo : Map.Map String (List String)
+        -> Map.Map String Unit
+        -> List String
+        -> Map.Map String Unit
+reachGo js seen Nil = seen
+reachGo js seen (Cons k rest) =
+  if Map.member compareString k seen then reachGo js seen rest
+  else reachGo
+      js
+      (Map.insert compareString k MkUnit seen)
+      (List.append (fromMaybe Nil (Map.lookup compareString k js)) rest)
+
+-- | what a function's jumps reach, and theirs, and so on
+reach : Map.Map String (List String) -> String -> Map.Map String Unit
+reach js k =
+  reachGo js Map.empty (fromMaybe Nil (Map.lookup compareString k js))
+
+-- | the functions on a cycle of jumps with `k`, itself among them if it
+-- | is on one
+cycleOf : Map.Map String (List String) -> String -> List String
+cycleOf js k =
+  List.filter
+    (\h -> Map.member compareString k (reach js h))
+    (List.map fst (Map.toList (reach js k)))
+
+-- (unboxed where both are, as the same)
+meetRepr : Repr.Repr -> Repr.Repr -> Repr.Repr
+meetRepr a b = if Repr.reprEq a b then a else RepV
+
+meetSig : Repr.Sig -> Repr.Sig -> Repr.Sig
+meetSig a b =
+  { params = List.zipWith meetRepr a.params b.params
+  , result = meetRepr a.result b.result
+  }
+
+-- (a function given the signature: a worker, if it has one)
+withSig : Repr.Sigs -> String -> Repr.Sig -> Repr.Sigs
+withSig sg k s =
+  if Repr.hasWorker s then Map.insert compareString k s sg
+  else Map.delete compareString k sg
+
+-- (the functions on a cycle of jumps given one signature: unboxed where
+-- all of theirs are)
+meetIn : Repr.Sigs -> Repr.Sig -> List String -> Repr.Sigs
+meetIn sg s ks =
+  List.foldl
+    (\m k ->
+       withSig
+         m
+         k
+         (List.foldl
+            meetSig
+            s
+            (List.map (\h -> sigOr sg h (List.length s.params)) ks)))
+    sg
+    ks
+
+meetAt : Map.Map String (List String)
+       -> Repr.Sigs
+       -> Pair String Repr.Sig
+       -> Repr.Sigs
+meetAt js sg (MkPair k s) =
+  if List.length (cycleOf js k) >= 2 then meetIn sg s (cycleOf js k) else sg
+
+-- | each cycle of jumps with a worker on it given one signature
+meetCycles : Map.Map String (List String) -> Repr.Sigs -> Repr.Sigs
+meetCycles js sg = List.foldl (meetAt js) sg (Map.toList sg)
+
+-- Workers
+--------------------------------------------------------------------------------
+
+byKey : List IR.Def -> Map.Map String IR.Def
+byKey defs =
+  List.foldl
+    (\m (d : IR.Def) -> Map.insert compareString d.key d m)
+    Map.empty
+    defs
+
+-- | the functions with a worker, of the program's definitions as the C
+-- | backend lowers them (in monadic form), what is known of them `facts`
+-- | >>> Map.size (workers (Facts.factsOf Nil) Nil)
+-- | 0
+workers : Facts.Facts -> List IR.Def -> Repr.Sigs
+workers facts defs =
+  meetCycles
+    (jumpsAll facts.arity defs)
+    (rounds
+       facts
+       (byKey defs)
+       (callersOf defs)
+       64
+       { round = { sigs = Map.empty, imps = Map.empty }
+       , dirty =
+           sortedOnce
+             (List.map
+                (\(d : IR.Def) -> d.key)
+                (List.filter (\(d : IR.Def) -> isFunction d && numeric d) defs))
+       })

@@ -370,13 +370,16 @@ if (process.platform !== "win32") checks.push((async () => {
 // docs/threads.md): the rest of the program run by each thread, each on
 // its own copy, their answers gathered in order; a definition every
 // thread asks for, computed once; tasks taken by threads as they end
-// one; a static thunk forced by threads at once; lib/parallel.hf's `Par`
-// each side a thread; and a thread abandoning, the program abandoning
-// when it is joined.  HEFF_TSAN=1: built with ThreadSanitizer too, by
-// the system's clang, and run again, what it says a failure.
+// one; a static thunk forced by threads at once; functions whose C
+// workers take their numbers unboxed (#39) called in each;
+// lib/parallel.hf's `Par` each side a thread; and a thread abandoning,
+// the program abandoning when it is joined.  HEFF_TSAN=1: built with
+// ThreadSanitizer too, by the system's clang, and run again, what it says
+// a failure.
 const threadsWant = "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
   + "a definition, shared: 333833500 333833501 333833502 333833503\n"
-  + "flat fields, shared and copied: 2528 2529 2530\nprimes below 100000, by 4: 9592\n"
+  + "flat fields, shared and copied: 2528 2529 2530\nworkers: 82810 92940 102988\n"
+  + "primes below 100000, by 4: 9592\n"
   + "forced at once: 6765 6765 6765 6765\nfib 20, each Par a thread: 6765\n";
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
@@ -407,8 +410,11 @@ if (process.platform !== "win32") checks.push((async () => {
 
 // loops, compiled as loops: a million rounds, and the stack does not
 // overflow -- in C, a stack of 8 MiB, which a million calls not made
-// loops would (a call of itself put in a tag, src/heff/compile/trmc.hf)
-checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n", status: 0 },
+// loops would (a call of itself put in a tag, src/heff/compile/trmc.hf;
+// functions calling one another last, round a cycle, workers among them:
+// src/heff/compile/worker.hf)
+checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n"
+  + "4079499309867987239\n17319587194678911062\n", status: 0 },
   { cflags: ["-DHEFF_MAIN_STACK=8388608"] }));
 
 // (a recursion deeper than the stack, in C: said, what was written before

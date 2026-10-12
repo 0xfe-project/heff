@@ -6,7 +6,10 @@
 --   a definition of n parameters  ~>  a C function of n parameters
 --            (`g_K`), and a closure of it (`g_K_clo`) where it is a value;
 --            a call of itself last, a loop (`goto top`); of another
---            of n parameters, a jump (`HEFF_LAST`: clang's `musttail`)
+--            of n parameters, a jump (`HEFF_LAST`: clang's `musttail`).
+--            One with a worker (heff.compile.worker), its worker
+--            (`g_K_w`), taking and giving numbers unboxed, which a known
+--            call calls, and `g_K` its wrapper
 --   a definition that is not a function  ~>  computed when first used
 --            (`g_K_get`)
 --   a lambda  ~>  a C function of its own (`lam_N`), what it mentions
@@ -659,6 +662,13 @@ argC : CK -> Int -> Rc.Operand -> C Bound
 argC k i (Given e) = do
   v <- k.exp e
   pure (boundAs i v Nil)
+argC k i (GivenU r e) = do
+  v <- k.exp e
+  pure
+      { arg = "a_" ^ showInt i
+      , pre = Cons (cType r ^ " a_" ^ showInt i ^ " = " ^ v ^ ";") Nil
+      , post = Nil
+      }
 argC k i (LentVar x drops) =
   pure (boundAs i (cLocal x) (List.map dropLine drops))
 argC k i (LentValue e) = do
@@ -669,26 +679,49 @@ argC k i (LentValue e) = do
       , post = Cons ("heff_drop(b_" ^ showInt i ^ ");") Nil
       }
 
-callHead : String -> Bool -> String
-callHead g tr = (if tr then "heff_tr(" else "(") ^ cGlobal g ^ "("
+-- | the C function a known call calls: the function's, or its worker
+-- | (`g_K_w`, #39)
+calleeName : String -> Bool -> String
+calleeName g True = cGlobal g ^ "_w"
+calleeName g False = cGlobal g
+
+isWorkerCall : Maybe Repr.Repr -> Bool
+isWorkerCall (Just _) = True
+isWorkerCall Nothing = False
+
+-- (what a known call gives: its worker's repr, else a `V`)
+givenOf : Maybe Repr.Repr -> Repr.Repr
+givenOf (Just r) = r
+givenOf Nothing = RepV
+
+callHead : String -> Bool -> Maybe Repr.Repr -> String
+callHead g tr w =
+  (if tr then "heff_tr(" else "(") ^ calleeName g (isWorkerCall w) ^ "("
 
 -- (a call with any lent: every operand computed before the call in its
 -- order, since a lent one computed first would run before the operands
 -- left of it, which may still want what it consumes; the lent dropped
 -- after)
-callBound : String -> Bool -> List Bound -> String
-callBound g tr bs =
+callBound : String -> Bool -> Maybe Repr.Repr -> List Bound -> String
+callBound g tr w bs =
   "({ "
   ^ joinWith " " (List.concatMap (\(b : Bound) -> b.pre) bs)
-  ^ " V r_ = "
-  ^ callHead g tr
+  ^ " "
+  ^ cType (givenOf w)
+  ^ " r_ = "
+  ^ callHead g tr w
   ^ joinWith ", " (List.map (\(b : Bound) -> b.arg) bs)
   ^ ")); "
   ^ joinWith " " (List.concatMap (\(b : Bound) -> b.post) bs)
   ^ " r_; })"
 
-callLent : CK -> String -> Bool -> List Rc.Operand -> C String
-callLent k g tr args = do
+callLent : CK
+         -> String
+         -> Bool
+         -> Maybe Repr.Repr
+         -> List Rc.Operand
+         -> C String
+callLent k g tr w args = do
   bs <-
     traverseC
       (\p -> argC k (snd p) (fst p))
@@ -696,16 +729,16 @@ callLent k g tr args = do
          (\a i -> MkPair a i)
          args
          (List.range 0 (List.length args - 1)))
-  pure (callBound g tr bs)
+  pure (callBound g tr w bs)
 
--- | a call of `g`, through any bounces if `tr`
-callC : CK -> String -> Bool -> List Rc.Operand -> C String
-callC k g tr args =
+-- | a call of `g` (its worker, if `w`), through any bounces if `tr`
+callC : CK -> String -> Bool -> Maybe Repr.Repr -> List Rc.Operand -> C String
+callC k g tr w args =
   if Rc.lentPlain args
     then bind
         (traverseC k.exp (List.map Rc.argExp args))
-        (\vs -> pure (callHead g tr ^ joinWith ", " vs ^ "))"))
-  else callLent k g tr args
+        (\vs -> pure (callHead g tr w ^ joinWith ", " vs ^ "))"))
+  else callLent k g tr w args
 
 -- (the closure given up where the body starts, what it holds taken: a
 -- closure holding nothing is static, nothing to give back)
@@ -938,7 +971,7 @@ expF k (RPrim p es) = do
   vs <- traverseC k.exp es
   pure (primName p ^ "(" ^ joinWith ", " vs ^ ")")
 expF k (RLam xs fv held (MkCode body)) = lamC k xs fv held body
-expF k (RCall g tr args) = callC k g tr args
+expF k (RCall g tr w args) = callC k g tr w args
 expF k (RApply f es) = do
   vs <- traverseC k.exp (Cons f es)
   pure
@@ -1131,11 +1164,11 @@ stmtF k (CTail f es) = do
          Nil)
 stmtF k (CLoop ps es) =
   bind (traverseC k.exp es) (\vs -> pure (again (List.map k.ctype ps) ps vs))
-stmtF k (CJump g es) = do
+stmtF k (CJump g w es) = do
   vs <- traverseC k.exp es
   pure
       (Cons
-         ("HEFF_LAST return " ^ cGlobal g ^ "(" ^ joinWith ", " vs ^ ");")
+         ("HEFF_LAST return " ^ calleeName g w ^ "(" ^ joinWith ", " vs ^ ");")
          Nil)
 
 stmtsF : CK -> List Rc.Statement -> C (List String)
@@ -1153,10 +1186,11 @@ ckOf rs =
 -- Definitions
 --------------------------------------------------------------------------------
 
-paramList : List String -> String
-paramList xs =
+-- (each parameter of its C type: a `V`, or unboxed, a worker's)
+paramList : CK -> List String -> String
+paramList k xs =
   if List.null xs then "void"
-  else joinWith ", " (List.map (\x -> "V " ^ cLocal x) xs)
+  else joinWith ", " (List.map (\x -> k.ctype x ^ " " ^ cLocal x) xs)
 
 -- | a definition's prototypes, and its code
 type Emitted1 = { protos : List String, code : List String }
@@ -1194,43 +1228,76 @@ entryCall key bi n =
     ^ joinWith " " (List.map (\i -> "heff_drop(a" ^ showInt i ^ ");") bi)
     ^ " return r;"
 
-funDef : String
-       -> List String
-       -> List Int
-       -> List Rc.Statement
-       -> List Rc.Statement
-       -> Repr.Reprs
-       -> C Emitted1
-funDef key xs bi entry body rs = do
-  es <- (ckOf rs).stmts entry
+hasWrapper : Maybe Rc.Wrapper -> Bool
+hasWrapper (Just _) = True
+hasWrapper Nothing = False
+
+-- (a function's C function's head: the function's, or its worker's)
+funHead : String -> List String -> Repr.Reprs -> Repr.Repr -> Bool -> String
+funHead key xs rs ret w =
+  "static "
+  ^ cType ret
+  ^ " "
+  ^ calleeName key w
+  ^ "("
+  ^ paramList (ckOf rs) xs
+  ^ ")"
+
+-- (a function with a worker: its wrapper, of `V`s, a function of the
+-- function's own name -- what its closure's entry calls)
+wrapperProto : String -> Repr.Reprs -> Maybe Rc.Wrapper -> List String
+wrapperProto key rs (Just (MkWrapper ws _)) =
+  Cons ("static V " ^ cGlobal key ^ "(" ^ paramList (ckOf rs) ws ^ ");") Nil
+wrapperProto key rs Nothing = Nil
+
+wrapperCode : String -> Repr.Reprs -> Maybe Rc.Wrapper -> C (List String)
+wrapperCode key rs (Just (MkWrapper ws body)) = do
   ls <- (ckOf rs).stmts body
   pure
+      (Cons
+         ("static V " ^ cGlobal key ^ "(" ^ paramList (ckOf rs) ws ^ ") {")
+         (List.append (indented ls) (Cons "}" Nil)))
+wrapperCode key rs Nothing = pure Nil
+
+funDef : Rc.Fun -> C Emitted1
+funDef f = do
+  es <- (ckOf f.reprs).stmts f.entry
+  ls <- (ckOf f.reprs).stmts f.body
+  wl <- wrapperCode f.key f.reprs f.wrapper
+  pure
       { protos =
-          [ "static V " ^ cGlobal key ^ "(" ^ paramList xs ^ ");"
-          , "static V " ^ cGlobal key ^ "_entry(V self, V *a);"
-          , "static Clo "
-          ^ cGlobal key
-          ^ "_clo = {{0x80000000u, K_CLO, 0}, "
-          ^ cGlobal key
-          ^ "_entry, "
-          ^ showInt (List.length xs)
-          ^ ", 0};"
-          ]
+          Cons
+            (funHead f.key f.params f.reprs f.ret (hasWrapper f.wrapper) ^ ";")
+            (List.append
+               (wrapperProto f.key f.reprs f.wrapper)
+               [ "static V " ^ cGlobal f.key ^ "_entry(V self, V *a);"
+               , "static Clo "
+               ^ cGlobal f.key
+               ^ "_clo = {{0x80000000u, K_CLO, 0}, "
+               ^ cGlobal f.key
+               ^ "_entry, "
+               ^ showInt (List.length f.params)
+               ^ ", 0};"
+               ])
       , code =
           List.append
             (Cons
                ""
                (Cons
-                  ("static V " ^ cGlobal key ^ "(" ^ paramList xs ^ ") {")
+                  (funHead f.key f.params f.reprs f.ret (hasWrapper f.wrapper)
+                   ^ " {")
                   (List.append (indented es) (Cons "top: ;" Nil))))
             (List.append
                (indented ls)
-               [ "}"
-               , "static V " ^ cGlobal key ^ "_entry(V self, V *a) {"
-               , "  (void)self;"
-               , entryCall key bi (List.length xs)
-               , "}"
-               ])
+               (Cons
+                  "}"
+                  (List.append
+                     wl
+                     [ "static V " ^ cGlobal f.key ^ "_entry(V self, V *a) {"
+                     , "  (void)self;"
+                     , entryCall f.key f.lent (List.length f.params)
+                     , "}"
+                     ])))
       }
 
 valDef : String -> List Rc.Statement -> Repr.Reprs -> C Emitted1
@@ -1266,7 +1333,7 @@ valDef key body rs = do
       }
 
 defC : Rc.Def -> C Emitted1
-defC (DFun key xs bi entry body rs) = funDef key xs bi entry body rs
+defC (DFun f) = funDef f
 defC (DVal key body rs) = valDef key body rs
 
 -- The world's algebra
@@ -1613,6 +1680,26 @@ moduleOfKey k = moduleAt k (lastDotGo k 0 (0 - 1))
 -- (a line of the program as a part has it: a definition's functions
 -- seen from every part, not only its own -- what a definition keeps to
 -- itself (`_val`, `_st`, `_init`) stays its own)
+-- (the C types of what a worker takes and gives unboxed, #39)
+unboxedCTypes : List String
+unboxedCTypes =
+  [ "double"
+  , "float"
+  , "int8_t"
+  , "int16_t"
+  , "int32_t"
+  , "int64_t"
+  , "uint8_t"
+  , "uint16_t"
+  , "uint32_t"
+  , "uint64_t"
+  ]
+
+-- (a worker's head: its C type, then its name)
+isWorkerLine : String -> Bool
+isWorkerLine l =
+  List.any (\t -> startsWith ("static " ^ t ^ " g_") l) unboxedCTypes
+
 pubLine : String -> String
 pubLine l =
   if startsWith "static V g_" l
@@ -1620,6 +1707,7 @@ pubLine l =
   && not (contains "_init(void)" l)
     then strSlice l 7 (strLength l)
   else if startsWith "static V heff_perform(" l then strSlice l 7 (strLength l)
+  else if isWorkerLine l then strSlice l 7 (strLength l)
   else l
 
 -- (a definition's closure: defined in its own part, declared in others)
@@ -1660,20 +1748,37 @@ numbersOf ce (MkPair ts ls) =
           ^ showInt (fromMaybe 0 (M.lookup compareString l ce.lbls)))
        (sortedOnce ls))
 
+-- (a function's worker, declared: by its signature)
+workerDecl : String -> Maybe Repr.Sig -> List String
+workerDecl k (Just sg) =
+  Cons
+    (cType sg.result
+     ^ " "
+     ^ calleeName k True
+     ^ "("
+     ^ (if List.null sg.params then "void"
+        else joinWith ", " (List.map cType sg.params))
+     ^ ");")
+    Nil
+workerDecl k Nothing = Nil
+
 -- (a definition, declared to a part that uses it: a function's code,
--- entry and closure, a value's getter -- by its arity, not by its
--- parameters' names, so that a part changes only when what it uses does)
+-- its worker's, entry and closure, a value's getter -- by its arity and
+-- its worker's signature, not by its parameters' names, so that a part
+-- changes only when what it uses does)
 declOf : CE -> String -> List String
 declOf ce k = case M.lookup compareString k ce.facts.arity of
   Just n ->
-    [ "V "
-    ^ cGlobal k
-    ^ "("
-    ^ (if n == 0 then "void" else joinWith ", " (List.replicate n "V"))
-    ^ ");"
-    , "V " ^ cGlobal k ^ "_entry(V self, V *a);"
-    , "extern Clo " ^ cGlobal k ^ "_clo;"
-    ]
+    List.append
+      (workerDecl k (Repr.sigIn ce.facts.workers k))
+      [ "V "
+      ^ cGlobal k
+      ^ "("
+      ^ (if n == 0 then "void" else joinWith ", " (List.replicate n "V"))
+      ^ ");"
+      , "V " ^ cGlobal k ^ "_entry(V self, V *a);"
+      , "extern Clo " ^ cGlobal k ^ "_clo;"
+      ]
   Nothing -> ["V " ^ cGlobal k ^ "_get(void);"]
 
 -- (what was made for each definition -- its strings, its lambdas --
@@ -1939,10 +2044,10 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
 -- its variables named again from 0 (`defOwn`) -- and on what is known
 -- of itself and of the globals it mentions: whether each is a function
 -- and of how many parameters, whether its calls may give back a bounce,
--- which of its parameters are lent.  The cache (heff.build.backcache)
--- keeps it by a hash of those (`emitVer`), with what was made for it on
--- the way: its strings and lambdas, the shapes and primitives it uses,
--- each in the order made.
+-- which of its parameters are lent, its worker's signature.  The cache
+-- (heff.build.backcache) keeps it by a hash of those (`emitVer`), with
+-- what was made for it on the way: its strings and lambdas, the shapes
+-- and primitives it uses, each in the order made.
 
 -- | a definition's C, as the cache keeps it
 type EmitKept =
@@ -1967,7 +2072,9 @@ globalH ce g rest =
           (HN (if M.member compareString g ce.facts.bounce then 1 else 0))
           (Cons
              (HS (joinWith "," (List.map showInt (Bo.borOf ce.facts.lent g))))
-             rest)))
+             (Cons
+                (HS (maybe "" Repr.sigName (Repr.sigIn ce.facts.workers g)))
+                rest))))
 
 -- | what a definition's C is made of, hashed: its key, its body (named
 -- | again from 0), and what is known of itself and of what it mentions
