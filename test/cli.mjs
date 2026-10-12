@@ -353,7 +353,7 @@ const astral = await withEnv({}, "astral.hf");
 expect("a diagnostic past a rune beyond U+FFFF", astral.status === 1 &&
   astral.stderr.includes('astral.hf:2:13\nerror[E0311]: expected type Int, but got type String\n2 | s = {- 😀 -} "😀"\n2 |             ^^^\n') &&
   astral.stderr.includes("astral.hf:5:7\nerror[E0150]: unexpected character 😀\n5 | t = 1 😀 2\n5 |       ^\n") &&
-  astral.stderr.includes("astral.hf:5:5\nerror[E0302]: tried to apply a value that was not of a function type\n5 | t = 1 😀 2\n5 |     ^^^^^\n") &&
+  astral.stderr.includes("astral.hf:5:5\nerror[E0302]: tried to apply a value as a function, where its type is not known\n5 | t = 1 😀 2\n5 |     ^^^^^\n") &&
   !astral.stderr.includes("�"), astral);
 
 // heff's own lib/ is the library, whatever library the heff running has
