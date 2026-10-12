@@ -67,6 +67,20 @@ data Drop = MkDrop String (Maybe Known)
 -- | computed before the call and dropped after it
 data Arg e = Given e | LentVar String (List Drop) | LentValue e
 
+-- | a condition, tested where it is (`e` a value): a comparison of
+-- | operands, consumed (`CondRel`); a `Bool` looked at; not; a test of
+-- | tests; a name bound in it, dropped where it is decided.  Of more than
+-- | a comparison, its operands are lent: what it holds it holds after it
+-- | on every path, however far it was looked at (see `condTest`)
+data Cond e
+  = CondTrue
+  | CondFalse
+  | CondRel String (List e)
+  | CondBool e
+  | CondNot (Cond e)
+  | CondIf (Cond e) (Cond e) (Cond e)
+  | CondLet String e (Cond e)
+
 -- | a value, made: each operand consumed (`RLocal`, a variable's
 -- | reference given; `RDup`, one more taken)
 data Exp b
@@ -112,6 +126,8 @@ data Exp b
   -- | operand given or lent
   | RCall String Bool (List (Arg (Exp b)))
   | RApply (Exp b) (List (Exp b))
+  -- | the `Bool` a condition is
+  | RBool (Cond (Exp b))
   | RAbandon
 
 -- | what a match's arm does with what it matched, given up: nothing (it
@@ -132,8 +148,8 @@ data Stmt b
   | CSet String (Exp b)
   -- | a name set to nothing it can be: not reached
   | CAbandon
-  -- | `if` the comparison of the operands, then, else
-  | CIf String (List (Exp b)) (List (Stmt b)) (List (Stmt b))
+  -- | `if` the condition, then, else
+  | CIf (Cond (Exp b)) (List (Stmt b)) (List (Stmt b))
   -- | a `switch` on what is looked at: its arms, and whether one not
   -- | there returns (else it is a statement)
   | CSwitch (Exp b) (List (Arm (List (Stmt b)))) Bool
@@ -156,6 +172,8 @@ type Value = Exp Code
 type Statement = Stmt Code
 
 type Operand = Arg Value
+
+type Test = Cond Value
 
 type CaseArm = Arm (List Statement)
 
@@ -852,6 +870,22 @@ valF r ce live (SPrim p as) =
   else RPrim p (operandsF r ce live as)
 valF r ce live (SLam xs (MkBlock t)) = lamVal r ce live xs t
 
+-- (a condition's code: what is held lent to it -- see `Cond`)
+lentTo : CE -> CE
+lentTo ce = withTakes Nil (withBorrowed (List.append ce.owned ce.borrowed) ce)
+
+-- | a condition, its operands lent (`ce` as `lentTo` makes it); a name
+-- | bound in it lent to what follows in it, dropped after
+condF : RcK -> CE -> Mp.Cond -> Test
+condF r ce PTrue = CondTrue
+condF r ce PFalse = CondFalse
+condF r ce (PRel p a b) = CondRel p (operandsF r ce Nil [a, b])
+condF r ce (PBool v) = CondBool (r.val ce Nil v)
+condF r ce (PNot c) = CondNot (condF r ce c)
+condF r ce (PIf a b c) = CondIf (condF r ce a) (condF r ce b) (condF r ce c)
+condF r ce (PLet x o c) =
+  CondLet x (r.comp ce Nil o) (condF r (withBorrowed (Cons x ce.borrowed) ce) c)
+
 -- | a step not last: its value, through any bounces
 compF : RcK -> CE -> List String -> Mp.Comp -> Value
 compF r ce live (OApply f as) = case operandsF r ce live (Cons f as) of
@@ -865,9 +899,7 @@ compF r ce live (OCall g as) =
 compF r ce live (OPrim p as) = RPrim p (operandsF r ce live as)
 compF r ce live (OSimple v) = r.val ce live v
 compF r ce live OAbandon = RAbandon
--- (a condition's `Bool`: the C backend is given none, heff.compile.imp's
--- `genOf False`)
-compF r ce live (OBool _) = RAbandon
+compF r ce live (OBool c) = RBool (condF r (lentTo ce) c)
 
 -- Statements and what is last
 --------------------------------------------------------------------------------
@@ -1331,12 +1363,13 @@ condWith r ce p args yes no fa wb =
     (dropsIn ce (deadIn ce.owned (unionS fa wb)))
     (Cons
        (CIf
-          p
-          (operandsF
-             r
-             (withPath (deadKept ce.owned (unionS fa wb)) wb ce)
-             wb
-             args)
+          (CondRel
+             p
+             (operandsF
+                r
+                (withPath (deadKept ce.owned (unionS fa wb)) wb ce)
+                wb
+                args))
           (condArm r (withPath (deadKept ce.owned wb) ce.after ce) yes)
           (condArm r (withPath (deadKept ce.owned wb) ce.after ce) no))
        Nil)
@@ -1358,6 +1391,44 @@ condOf r ce p args yes no =
     no
     (fvList args)
     (unionS (List.append (fvArm yes) (fvArm no)) ce.after)
+
+-- (a condition of more than a comparison: its operands lent, what it
+-- wants still held on each arm, dropped there if the arm does not want
+-- it)
+condTestWith : RcK
+             -> CE
+             -> Mp.Cond
+             -> ArmBody
+             -> ArmBody
+             -> List String
+             -> List Statement
+condTestWith r ce c yes no wanted =
+  List.append
+    (dropsIn ce (deadIn ce.owned wanted))
+    (Cons
+       (CIf
+          (condF r (lentTo (withPath (deadKept ce.owned wanted) wanted ce)) c)
+          (condArm r (withPath (deadKept ce.owned wanted) ce.after ce) yes)
+          (condArm r (withPath (deadKept ce.owned wanted) ce.after ce) no))
+       Nil)
+
+condTest : RcK -> CE -> Mp.Cond -> ArmBody -> ArmBody -> List Statement
+condTest r ce c yes no =
+  condTestWith
+    r
+    ce
+    c
+    yes
+    no
+    (unionS
+       (freeIn Nil (Cons (ICond c) Nil))
+       (unionS (List.append (fvArm yes) (fvArm no)) ce.after))
+
+-- (after a `Bool` made of a condition: what it was lent, held and not
+-- wanted after, dropped)
+boolDone : CE -> Mp.Comp -> List Statement
+boolDone ce (OBool _) = dropsIn ce (deadIn ce.owned ce.after)
+boolDone ce o = Nil
 
 -- Fields taken: `let y = f r.a .. in b`, `r` held and wanted by nothing
 -- after the binding, and -- in what the binding computes besides, and in
@@ -1547,6 +1618,7 @@ bindThen r ce x fa binding known takes rest after =
 setting : RcK -> CE -> Mp.St -> List Statement
 setting r ce (SCase v arms) = Cons (matchOf r ce False v (stArmsOf arms)) Nil
 setting r ce (SIf (PRel p a b) ts fs) = condOf r ce p [a, b] (ASts ts) (ASts fs)
+setting r ce (SIf c ts fs) = condTest r ce c (ASts ts) (ASts fs)
 setting r ce st = Cons CAbandon Nil
 
 stmtsF : RcK -> CE -> List Mp.St -> Maybe Mp.Tl -> List Statement
@@ -1558,7 +1630,7 @@ stmtsF r ce (Cons (SLet x o) rest) after =
     ce
     x
     (fvOp o)
-    (\ce2 -> Cons (CLet x (r.comp ce2 ce2.after o)) Nil)
+    (\ce2 -> Cons (CLet x (r.comp ce2 ce2.after o)) (boolDone ce2 o))
     (builtOf o)
     (takesFor ce o (restItems rest after))
     rest
@@ -1575,7 +1647,9 @@ stmtsF r ce (Cons (SDecl x) (Cons st rest)) after =
     rest
     after
 stmtsF r ce (Cons (SSet x o) rest) after =
-  Cons (CSet x (r.comp ce ce.after o)) (r.stmts ce rest after)
+  Cons
+    (CSet x (r.comp ce ce.after o))
+    (List.append (boolDone ce o) (r.stmts ce rest after))
 -- (a match, a condition, setting a name declared before: in an arm
 -- that sets it, last)
 stmtsF r ce (Cons st rest) after =
@@ -1594,18 +1668,28 @@ callLast : RcK -> CE -> String -> List Mp.Val -> List Statement
 callLast r ce g as =
   callAs ce g as (lentOperands r ce Nil (Bo.borOf ce.bor g) 0 as)
 
+-- (the name a `Bool` returned is bound to, its condition's operands
+-- dropped before it is: one no other name is, each given a `$` and a
+-- number)
+boolName : String
+boolName = "ret$bool"
+
 -- | what is last
 tailF : RcK -> CE -> Mp.Tl -> List Statement
 tailF r ce (TSeq ss t) = r.stmts ce ss (Just t)
 tailF r ce (TReturn (OApply f as)) =
   applyLast ce (List.length as) (operandsF r ce Nil (Cons f as))
 tailF r ce (TReturn (OCall g as)) = callLast r ce g as
+tailF r ce (TReturn (OBool c)) =
+  Cons
+    (CLet boolName (r.comp ce Nil (OBool c)))
+    (List.append (dropsIn ce ce.owned) (Cons (CReturn (RLocal boolName)) Nil))
 tailF r ce (TReturn o) = Cons (CReturn (r.comp ce Nil o)) Nil
 tailF r ce (TLoop as) = case ce.self of
   Just s -> callLast r ce s.key as
   Nothing -> Cons (CReturn RAbandon) Nil
 tailF r ce (TIf (PRel p a b) t e) = condOf r ce p [a, b] (ATail t) (ATail e)
-tailF r ce (TIf _ t e) = Cons (CReturn RAbandon) Nil
+tailF r ce (TIf c t e) = condTest r ce c (ATail t) (ATail e)
 tailF r ce (TCase v arms) = Cons (matchOf r ce True v (tlArmsOf arms)) Nil
 
 rcK : RcK
