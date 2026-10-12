@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// The benchmarks: each program here compiled by each backend (Node.js,
-// and C by `zig cc -O2`) and run, the compiler checking itself
-// (elaboration only: the code the compiler emits, measured apart from
-// what its simplifier does), and compiling itself to C (its cache warm,
-// then cold), each timed; the best of `--runs N` (3) is said, with its
+// The benchmarks: each program here compiled to C, built by `zig cc
+// -O2`, and run, the compiler checking itself (elaboration only: the
+// code the compiler emits, measured apart from what its simplifier
+// does), and compiling itself to C (its cache warm, then cold), each
+// timed; the best of `--runs N` (3) is said, with its
 // peak memory.  `--heff FILE` measures another compiler (one built
 // before, say).
 //
@@ -53,10 +53,6 @@ const best = (name, once) => {
 for (const f of readdirSync(join(root, "bench")).filter((f) => f.endsWith(".hf")).sort()) {
   const name = basename(f, ".hf");
   if (!wanted(name)) continue;
-  const out = join(work, name + ".mjs");
-  const c = spawnSync(heff, ["compile", join("bench", f), out, "--name", "main", "--backend=node"], { cwd: root, encoding: "utf8" });
-  if (c.status !== 0) { console.log(`${name.padEnd(16)} did not compile\n${c.stdout}${c.stderr}`); continue; }
-  best(`${name} (node)`, () => timed(["node", out]));
   const cOut = join(work, name + ".c"), bin = join(work, name);
   const cc = spawnSync(heff, ["compile", join("bench", f), cOut, "--name", "main", "--backend=c"], { cwd: root, encoding: "utf8" });
   const z = cc.status === 0 ? spawnSync("zig", ["cc", "-O2", "-w", cOut, "-o", bin, "-lm"], { encoding: "utf8" }) : cc;

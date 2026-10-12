@@ -368,7 +368,7 @@ const program = (says) => "import co\nimport std.io\nimport tool.greet\n\nprogra
 const buildOf = (backend, ships = []) =>
   `import manifest\n\nbuild : Build\nbuild = { backend = ${backend}, run = "main"${listField("ships", ships.map((n) => `"${n}"`))} }\n`;
 for (const [x, says] of [["tool", "greeting"], ["again", "(greeting ^ \", again\")"]]) {
-  write(`tool/app/${x}/build.hf`, buildOf("Node"));
+  write(`tool/app/${x}/build.hf`, buildOf("C"));
   write(`tool/app/${x}/main.hf`, program(says));
 }
 const inTool = (...args) => run(heffBin, args, { cwd: join(work, "tool") });
@@ -412,8 +412,8 @@ write("tool/share/old.txt", "old\n");
 write("tool/share/run.sh", "#!/bin/sh\necho run\n");
 chmodSync(join(work, "tool", "share", "run.sh"), 0o755);
 write("tool/NOTICE", "notice 1\n");
-write("tool/app/tool/build.hf", buildOf("Node", ["share", "NOTICE"]));
-write("tool/app/again/build.hf", buildOf("Node", ["share"]));
+write("tool/app/tool/build.hf", buildOf("C", ["share", "NOTICE"]));
+write("tool/app/again/build.hf", buildOf("C", ["share"]));
 const shipped = await install(process.env.PATH);
 expect("install: what a program ships, beside bin/", shipped.status === 0 &&
   shipped.stdout.includes(`installed ${join(home, "share")}\n`) && shipped.stdout.includes(`installed ${join(home, "NOTICE")}\n`) &&
@@ -427,7 +427,7 @@ const reshipped = await install(process.env.PATH);
 expect("install again: what is shipped, in place of what was there", reshipped.status === 0 &&
   readFileSync(join(home, "share", "greeting.txt"), "utf8") === "hello again\n" && !existsSync(join(home, "share", "old.txt")) &&
   readFileSync(join(home, "NOTICE"), "utf8") === "notice 2\n" && readdirSync(home).sort().join(",") === "NOTICE,bin,share", [reshipped, readdirSync(home)]);
-write("tool/app/tool/build.hf", buildOf("Node", ["share", "nowhere"]));
+write("tool/app/tool/build.hf", buildOf("C", ["share", "nowhere"]));
 rmSync(homeBin, { recursive: true });
 const unshipped = await install(process.env.PATH);
 expect("install: a program shipping what the project does not have, nothing installed", unshipped.status === 1 &&
@@ -512,17 +512,17 @@ const agreeing = [
   ["package.hf", "package : Package\npackage", `{ module = "agree", heff = "${version}", replace = [] }`, null],
   ["package.hf", "package : Package\npackage", `{ module = "agree" }`, packageFields],
   ["package.hf", "package : Package\npackage", `{ module = "agree", heff = "${version}", replace = [], require = [] }`, packageFields],
-  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node, run = "main" }`, null],
-  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node, run = "main", ships = [] }`, null],
-  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node }`, buildFields],
-  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Node, ships = [], run = "main" }`, buildFields],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Page, run = "main" }`, null],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Page, run = "main", ships = [] }`, null],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Page }`, buildFields],
+  ["app/agree/build.hf", "build : Build\nbuild", `{ backend = Page, ships = [], run = "main" }`, buildFields],
 ];
 const inAgree = (...args) => run(heffBin, args, { cwd: join(work, "agree") });
 write("agree/src/agree/m.hf", "x : Int\nx = 1\n");
-write("agree/app/agree/main.hf", "import co\nimport std.io\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print \"agree\"\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n");
+write("agree/app/agree/main.hf", "import co\nimport browser.dom\n\nmain : Co dom Unit\nmain = pure MkUnit\n");
 for (const [file, head, literal, fields] of agreeing) {
   write("agree/package.hf", manifestOf("agree"));
-  write("agree/app/agree/build.hf", buildOf("Node"));
+  write("agree/app/agree/build.hf", buildOf("Page"));
   write(`agree/${file}`, `import manifest\n\n${head} = ${literal}\n`);
   const read = await inAgree("build"), checked = await inAgree("check", file);
   expect(`${file}, ${literal}: read and elaborated alike`, fields === null

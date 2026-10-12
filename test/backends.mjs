@@ -10,12 +10,12 @@
 // `zig cc` (`cc` where there is no zig) -- and each definition the
 // interpreter has a value of (`heff dump-eval`) compared.
 //
-// Programs: those of test/node, compiled to a program by each backend
-// (`--backend=node`, run by Node.js; `--backend=c --name`), run: what they
-// write, their exit status, loops a million rounds deep, a long loop of
-// operations done at once, and time; and, by C alone, an HTTP client,
-// TCP sockets and an HTTP server over them, processes forked, and
-// threads truly at once.
+// Programs: those of test/node, compiled to C (`--backend=c --name`),
+// built and run, held to what they are to do (the interpreter runs no
+// provider): what they write, their exit status, loops a million rounds
+// deep, a long loop of operations done at once, and time; an HTTP
+// client, TCP sockets and an HTTP server over them, processes forked,
+// and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
 import { Agent, createServer, request } from "node:http";
@@ -130,41 +130,30 @@ const values = pool(cases, async (c) => {
 // Programs
 // ---------------------------------------------------------------------
 
-// (a program, compiled by each backend: how each is run; its files named
-// by its file and its name; `cflags`, the C compiler's more)
-const programs = {
-  js: async (file, name) => {
-    const out = join(work, `${basename(file, ".hf")}-${name}.mjs`);
-    const r = await heff(["compile", file, out, "--name", name, "--backend=node"], { cwd: root });
-    return r.status !== 0 ? { error: r.stderr } : { cmd: process.execPath, pre: [out] };
-  },
-  c: async (file, name, cflags = []) => {
-    const c = join(work, `${basename(file, ".hf")}-${name}.c`), bin = join(work, `${basename(file, ".hf")}-${name}-c`);
-    const r = await heff(["compile", file, c, "--name", name, "--backend=c"], { cwd: root });
-    if (r.status !== 0) return { error: r.stderr };
-    const b = await buildC(c, bin, cflags);
-    return b.status !== 0 ? { error: b.stderr } : { cmd: bin, pre: [] };
-  },
+// (the program `name` of `file`, compiled to C and built: what runs it;
+// its files named by its file and its name; `cflags`, the C compiler's
+// more)
+const program = async (file, name, cflags = []) => {
+  const c = join(work, `${basename(file, ".hf")}-${name}.c`), bin = join(work, `${basename(file, ".hf")}-${name}-c`);
+  const r = await heff(["compile", file, c, "--name", name, "--backend=c"], { cwd: root });
+  if (r.status !== 0) return { error: r.stderr };
+  const b = await buildC(c, bin, cflags);
+  return b.status !== 0 ? { error: b.stderr } : { cmd: bin };
 };
 
-// (the program `name` of `file` run by each backend in turn with `args`,
-// what it wrote and its status held to `want`; what fails, said; `on`,
-// the backends, if not each)
-const ran = async (what, file, name, args, want, { cflags, on = Object.keys(programs), ...opts } = {}) => {
-  const msgs = [];
-  for (const [be, build] of Object.entries(programs).filter(([be]) => on.includes(be))) {
-    const p = await build(file, name, cflags);
-    if (p.error !== undefined) { msgs.push(`FAIL ${what} (${be}): not compiled\n${p.error}`); continue; }
-    const r = await run(p.cmd, [...p.pre, ...args], { timeout: 60000, ...opts });
-    const got = { out: r.stdout, err: r.stderr, status: r.status };
-    for (const k of Object.keys(want))
-      if (got[k] !== want[k]) msgs.push(`FAIL ${what} (${be}): ${k} ${JSON.stringify(got[k])}, wanted ${JSON.stringify(want[k])}`);
-  }
-  return msgs;
+// (the program `name` of `file` run with `args`, what it wrote and its
+// status held to `want`; what fails, said)
+const ran = async (what, file, name, args, want, { cflags, ...opts } = {}) => {
+  const p = await program(file, name, cflags);
+  if (p.error !== undefined) return [`FAIL ${what}: not compiled\n${p.error}`];
+  const r = await run(p.cmd, args, { timeout: 60000, ...opts });
+  const got = { out: r.stdout, err: r.stderr, status: r.status };
+  return Object.keys(want).filter((k) => got[k] !== want[k])
+    .map((k) => `FAIL ${what}: ${k} ${JSON.stringify(got[k])}, wanted ${JSON.stringify(want[k])}`);
 };
 const checks = [];
 
-// (each backend's world: stdin, the environment, arguments, a file)
+// (the world: stdin, the environment, arguments, a file)
 checks.push((async () => {
   const copied = join(work, "copied.txt");
   const msgs = await ran("echo", "test/node/echo.hf", "main", [copied, "two words"],
@@ -174,12 +163,11 @@ checks.push((async () => {
   return msgs;
 })());
 
-// (a string is bytes, to the system and back, the same on each backend:
-// what is not UTF-8 -- an overlong, a surrogate, beyond U+10FFFF, cut
-// short, a byte of no rune -- read and written as it is, by stdin,
-// stdout and a file named not in ASCII; made text, as TextDecoder
-// makes it; the arguments and the environment, which Node.js has as
-// text alone, text on each, given by a shell as bytes)
+// (a string is bytes, to the system and back: what is not UTF-8 -- an
+// overlong, a surrogate, beyond U+10FFFF, cut short, a byte of no rune
+// -- read and written as it is, by stdin, stdout and a file named not in
+// ASCII; made text, as TextDecoder makes it; the arguments and the
+// environment text, given by a shell as bytes)
 checks.push((async () => {
   const msgs = [];
   const input = Buffer.from([0x61, 0xc0, 0xaf, 0xe0, 0x80, 0x80, 0xed, 0xa0, 0x80, 0xf4, 0x90, 0x80, 0x80,
@@ -197,22 +185,21 @@ checks.push((async () => {
     + "a NUL in a path, read: no\n"
     + `arguments: ${text(arg)}\n`
     + `environment: ${text(env)}\n`;
-  for (const [be, build] of Object.entries(programs)) {
-    const p = await build("test/node/bytes.hf", "main");
-    if (p.error !== undefined) { msgs.push(`FAIL bytes (${be}): not compiled\n${p.error}`); continue; }
-    const dir = join(work, `bytes-${be}`);
-    rmSync(dir, { recursive: true, force: true });
-    mkdirSync(dir);
-    const r = await run("sh", ["-c", `HEFF_BYTES="$(printf '${octal(env)}')" exec "$@" "$(printf '${octal(arg)}')"`, "sh", p.cmd, ...p.pre, dir],
-      { timeout: 60000, input, encoding: "latin1" });
-    if (r.stdout !== want || r.status !== 0)
-      msgs.push(`FAIL bytes (${be}): status ${r.status}, out ${JSON.stringify(r.stdout)}, wanted ${JSON.stringify(want)}\n${r.stderr}`);
-    else if (!readFileSync(join(dir, "bytes-é😀.bin")).equals(input)) msgs.push(`FAIL bytes (${be}): the file`);
-  }
+  const p = await program("test/node/bytes.hf", "main");
+  if (p.error !== undefined) return [`FAIL bytes: not compiled\n${p.error}`];
+  const dir = join(work, "bytes-c");
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir);
+  const r = await run("sh", ["-c", `HEFF_BYTES="$(printf '${octal(env)}')" exec "$@" "$(printf '${octal(arg)}')"`, "sh", p.cmd, dir],
+    { timeout: 60000, input, encoding: "latin1" });
+  if (r.stdout !== want || r.status !== 0)
+    msgs.push(`FAIL bytes: status ${r.status}, out ${JSON.stringify(r.stdout)}, wanted ${JSON.stringify(want)}\n${r.stderr}`);
+  else if (!readFileSync(join(dir, "bytes-é😀.bin")).equals(input)) msgs.push("FAIL bytes: the file");
   return msgs;
 })());
 
-// (`heff run`: compiled for Node.js, then run in heff's place, on its streams)
+// (`heff run`: compiled to C and built in .heff/run/, then run in heff's
+// place, on its streams)
 checks.push((async () => {
   const r = await heff(["run", "test/node/echo.hf", join(work, "run.txt"), "x"], { cwd: root, input: "in", env: { ...process.env, GREETING: "hi" } });
   return r.status !== 3 || r.stderr !== "to stderr\n" ? [`FAIL heff run: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`] : [];
@@ -314,7 +301,7 @@ if (process.platform !== "win32") checks.push((async () => {
     ["libcurl", [], [["libcurl", process.env], ["libcurl, no curl on the PATH", noCurl]]],
     ["spawned", ["-DHEFF_HTTP_SPAWN"], [["spawned", process.env]]],
   ]) {
-    const p = await programs.c("test/node/fetched.hf", "main", cflags);
+    const p = await program("test/node/fetched.hf", "main", cflags);
     if (p.error !== undefined) { msgs.push(`FAIL http, ${built} (c): not compiled\n${p.error}`); continue; }
     for (const [how, env] of runs) {
       const r = await run(p.cmd, [at, `http://127.0.0.1:${refused}/`], { timeout: 60000, env });
@@ -354,7 +341,7 @@ const freePorts = async (n) => {
 // values -- a port already in use, a connection refused, a port out of
 // range, a name not resolved
 if (process.platform !== "win32") checks.push((async () => {
-  const p = await programs.c("test/node/sockets.hf", "main");
+  const p = await program("test/node/sockets.hf", "main");
   if (p.error !== undefined) return [`FAIL sockets (c): not compiled\n${p.error}`];
   const [port, refused] = await freePorts(2);
   const r = await run(p.cmd, [String(port), String(refused)], { timeout: 60000 });
@@ -396,7 +383,7 @@ if (process.platform !== "win32") checks.push((async () => {
   const bytesOf = (n) => Buffer.from(Array.from({ length: 256 * n }, (_, i) => i % 256));
   const sum = (b) => b.reduce((s, c) => s + c, 0);
   const big = Buffer.concat(Array.from({ length: 4096 }, () => bytesOf(4)));
-  const self = await programs.c("test/node/served.hf", "self");
+  const self = await program("test/node/served.hf", "self");
   if (self.error !== undefined) msgs.push(`FAIL http server, self (c): not compiled\n${self.error}`);
   else {
     const r = await run(self.cmd, [], { timeout: 60000 });
@@ -417,7 +404,7 @@ if (process.platform !== "win32") checks.push((async () => {
   }
   // (no descriptor left for a connection accepted: the server stops, and
   // says why, not trying again for ever)
-  const crowded = await programs.c("test/node/served.hf", "crowded");
+  const crowded = await program("test/node/served.hf", "crowded");
   if (crowded.error !== undefined) msgs.push(`FAIL http server, crowded (c): not compiled\n${crowded.error}`);
   else {
     const r = await run("sh", ["-c", 'ulimit -n 32 && exec "$0"', crowded.cmd], { timeout: 30000 });
@@ -425,7 +412,7 @@ if (process.platform !== "win32") checks.push((async () => {
     if (r.status !== 0 || r.stderr || r.stdout !== want)
       msgs.push(`FAIL http server, crowded (c): status ${r.status}\n${r.stdout}${r.stderr}`);
   }
-  const p = await programs.c("test/node/served.hf", "main");
+  const p = await program("test/node/served.hf", "main");
   if (p.error !== undefined) return [...msgs, `FAIL http server (c): not compiled\n${p.error}`];
   const [port] = await freePorts(1);
   const served = run(p.cmd, [String(port)], { timeout: 60000 });
@@ -562,15 +549,12 @@ checks.push((async () => {
     : [`FAIL a module named main, as parts: ${parts.join(" ")}\n${out.stdout ?? ""}${out.stderr ?? ""}`];
 })());
 
-// a computation of an effect the backend has no provider for is refused,
-// and why: in C at the import of the browser's module already
-for (const [be, why] of [
-  ["node", "counter has the effect browser.dom.dom, which is not provided here"],
-  ["c", "examples/counter/counter.hf:7:1\nerror[E0351]: `browser.dom` is the browser's (lib/browser/), for JavaScript: a C program (--backend=c) cannot import it"],
-]) checks.push((async () => {
-  const r = await heff(["compile", "examples/counter/counter.hf", join(work, `counter.${be}`), "--name", "counter", `--backend=${be}`], { cwd: root });
-  return r.status !== 0 && r.stderr.includes(why) ? []
-    : [`FAIL an app is not a program (${be}): ${r.status} ${r.stderr}`];
+// an app is not a C program: refused at the import of the browser's
+// module, and why
+checks.push((async () => {
+  const why = "examples/counter/counter.hf:7:1\nerror[E0351]: `browser.dom` is the browser's (lib/browser/), for JavaScript: a C program (--backend=c) cannot import it";
+  const r = await heff(["compile", "examples/counter/counter.hf", join(work, "counter.c"), "--name", "counter", "--backend=c"], { cwd: root });
+  return r.status !== 0 && r.stderr.includes(why) ? [] : [`FAIL an app is not a program: ${r.status} ${r.stderr}`];
 })());
 
 // one world handled at home (a counter: state, peeled off in the
@@ -585,21 +569,12 @@ checks.push(ran("state peeled in-language", "test/node/counted.hf", "main", [], 
 checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
   { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 }));
 
-// a `JSString` (browser.js) field of an operation: a JavaScript string to the
-// provider, given and taken through no helper (its length its text's
-// UTF-16 code units, not its bytes); by JavaScript alone, the browser's
-// modules C's to refuse
-checks.push(ran("JSString given as it is", "test/node/jstext.hf", "main", [],
-  { out: "5 bytes, 5 code units: plain\n7 bytes, 4 code units: é😀a\n3 bytes, 3 code units: x\u{FFFD}y\n", status: 0 },
-  { on: ["js"] }));
-
-// processes, by C alone (test/node/fork.provider.c forks; Node.js cannot
-// give a continuation to another process): the rest of the program run
+// processes (test/node/fork.provider.c forks): the rest of the program run
 // by each of them, each on its own copy, their strings gathered in
 // order, and lib/parallel.hf's `Par` each side a process -- what was
 // written before a spread written once
 if (process.platform !== "win32") checks.push((async () => {
-  const p = await programs.c("test/node/fork.hf", "main");
+  const p = await program("test/node/fork.hf", "main");
   if (p.error !== undefined) return [`FAIL processes (c): not compiled\n${p.error}`];
   const r = await run(p.cmd, [], { timeout: 60000 });
   const want = "said before the spread, once\nsquares: 0 1 4 9\nnested: 0.0,0.1,0.2 1.0,1.1,1.2\n"
@@ -607,7 +582,7 @@ if (process.platform !== "win32") checks.push((async () => {
   return r.status === 0 && r.stdout === want ? [] : [`FAIL processes (c): status ${r.status}\n${r.stdout}${r.stderr}`];
 })());
 
-// threads truly at once, by C alone (std.thread, whose provider,
+// threads truly at once (std.thread, whose provider,
 // lib/std/thread.provider.c, says `#define HEFF_THREADS 1`: the runtime
 // built for threads, docs/threads.md): the rest of the program run by
 // each thread, each on its own copy, their answers gathered in order; a
@@ -636,7 +611,7 @@ if (process.platform !== "win32") checks.push((async () => {
     ["failingTask", [], { out: "said before the pool\n", err: "heff:abandon\n", status: 1 }],
     ["cpu", ["queens", "8", "4"], { out: "queens: answer 92\n", status: 0 }],
   ]) {
-    const p = await programs.c("test/node/threads.hf", name);
+    const p = await program("test/node/threads.hf", name);
     if (p.error !== undefined) { msgs.push(`FAIL threads ${name} (c): not compiled\n${p.error}`); continue; }
     const bins = [p.cmd];
     if (process.env.HEFF_TSAN) {
@@ -679,7 +654,7 @@ if (!process.env.HEFF_SANITIZE) checks.push((async () => {
     "  print (ev := here stdio) \"before\"",
     "  print (ev := here stdio) (showInt (sumTo 100000000))", "",
   ].join("\n"));
-  const p = await programs.c(deeper, "main", ["-DHEFF_MAIN_STACK=8388608"]);
+  const p = await program(deeper, "main", ["-DHEFF_MAIN_STACK=8388608"]);
   if (p.error !== undefined) return [`FAIL a stack overflow (c): not compiled\n${p.error}`];
   const r = await run(p.cmd, [], { timeout: 60000 });
   const want = { out: "before\n", err: "heff: the stack overflowed\n", status: 1 };
@@ -706,8 +681,7 @@ checks.push(ran("a long loop", loop, "main", [], { out: "100000\n", status: 0 })
 // a loop of operations a handler of the language handles: each step's
 // rest called last, a million times, in a small heap -- the stack let go
 // of every so often (a bounce), not as deep as the loop is long
-checks.push(ran("a long loop, handled in the language", "bench/state.hf", "main", [], { out: "1000000\n", status: 0 },
-  { env: { ...process.env, HEFF_HEAP_MB: "256" } }));
+checks.push(ran("a long loop, handled in the language", "bench/state.hf", "main", [], { out: "1000000\n", status: 0 }));
 
 for (const msgs of await values) said(msgs);
 console.log(`backends: ${cases.length} programs, ${compared} values compared`);

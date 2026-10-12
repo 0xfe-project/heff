@@ -31,10 +31,10 @@ const pretendDocument = (page) => ({
 let timers = [];
 const tick = () => { const ts = timers; timers = []; for (const f of ts) f(); };
 // The page's window: its global scope, which a classic script's top-level definitions would
-// be part of.  `top` is the window's own and cannot be declared again (as a browser's
+// be part of, with a browser's text codecs.  `top` is the window's own and cannot be declared again (as a browser's
 // `window.top`); `name`, `status`, `self` and `parent` are the window's too.
 const pageWindow = (page) => {
-  const win = vm.createContext({ document: pretendDocument(page), setTimeout: (f, ms) => { timers.push(f); } });
+  const win = vm.createContext({ document: pretendDocument(page), setTimeout: (f, ms) => { timers.push(f); }, TextDecoder, TextEncoder });
   vm.runInContext(`Object.defineProperty(globalThis, "top", { get: () => globalThis, configurable: false });
 Object.assign(globalThis, { self: globalThis, parent: globalThis, name: "", status: "" });`, win);
   return win;
@@ -107,6 +107,12 @@ if (painted) {
   check("its stamp, put on the page", out.children.map((c) => `${c.tag}: ${c.text}`).join(), "mark: stamped");
   check("found again, the same handle", out.attrs["data-same"], "yes");
 }
+// a `JSString` (browser.js) field of an operation: a JavaScript string
+// to the provider, given and taken through no helper (its length its
+// text's UTF-16 code units, not its bytes)
+const texts = await run("test/apps/jstext.hf", "texts", withOut);
+if (texts) check("JSString given as it is", texts.children[0].children.map((c) => c.text).join("\n"),
+  "5 bytes, 5 code units: plain\n7 bytes, 4 code units: é😀a\n3 bytes, 3 code units: x\u{FFFD}y");
 // an app whose definitions have the names of the window's own
 const names = await run("test/apps/names.hf", "names", withOut);
 if (names) check("the window's names, the app's", names.children[0].text, "top name status self parent");
@@ -136,5 +142,5 @@ if (counter && clock && load(win, join(work, "counter.js")) && load(win, join(wo
   check("two apps: the counter", label.text, "count: 1");
   check("two apps: the clock", ticks.text, "1 ticks");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, names and greet run, and counter and clock on one page"}`);
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, texts, names and greet run, and counter and clock on one page"}`);
 process.exit(failed ? 1 : 0);
