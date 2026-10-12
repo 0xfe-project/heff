@@ -1,0 +1,149 @@
+-- Threads as an effect (lib/co.hf): work run truly at once, by C alone
+-- (thread.provider.c, which builds the runtime for threads:
+-- docs/threads.md says what is safe in them, and what is not).  A pool
+-- of workers maps a function over a list or a range (`parMap`,
+-- `parFor`, `parAll`), each value given to a thread a copy of its own,
+-- each answer handed back, of any type; a spread gives the rest of the
+-- program to each of n threads, a gather joins them; and
+-- lib/parallel.hf's `Par` is handled by them, each side a thread
+-- (`inThreads`).  A failure in a thread is the caller's when the threads
+-- are joined: the program fails as it would have, one thread doing all.
+-- There is no JavaScript side: a program with this effect is compiled
+-- for C, `--backend=c`.
+
+import co
+import parallel
+
+-- | Work for a pool: `f` of each of `xs`, their answers given to `k`, in
+-- | order.  What a task takes and gives are the work's own types, not
+-- | the effect's -- one effect for all the types a program maps -- so
+-- | the work is what it does with whatever is done with them.
+type Work x =
+  (r : Type) -> ((t a : Type) -> (t -> a) -> List t -> (List a -> x) -> r) -> r
+
+-- | A thread's value at a gather, and what is done with all of them.
+type Joined x = (r : Type) -> ((a : Type) -> a -> (List a -> x) -> r) -> r
+
+data ThreadsF (m : Type -> Type) x
+  = Pool Int (Work x)
+  | Spread Int (Int -> x)
+  | Gather (Joined x)
+  | Cores (Int -> x)
+
+work : {t a x : Type} -> (t -> a) -> List t -> (List a -> x) -> Work x
+work f xs k = \r use -> use t a f xs k
+
+joined : {a x : Type} -> a -> (List a -> x) -> Joined x
+joined v k = \r use -> use a v k
+
+workThen : {x y : Type} -> (x -> y) -> Work x -> Work y
+workThen g w = \r use -> w r (\t a f xs k -> use t a f xs (\l -> g (k l)))
+
+joinedThen : {x y : Type} -> (x -> y) -> Joined x -> Joined y
+joinedThen g j = \r use -> j r (\a v k -> use a v (\l -> g (k l)))
+
+-- | Threads as an effect.
+threads : HFunctor
+threads =
+  { f = ThreadsF
+  , hfmap = \m g p -> case p of
+      Pool n w -> Pool n (workThen g w)
+      Spread n k -> Spread n (\i -> g (k i))
+      Gather j -> Gather (joinedThen g j)
+      Cores k -> Cores (\c -> g (k c))
+  , hmap = \m n nt p -> case p of
+      Pool n w -> Pool n w
+      Spread n k -> Spread n k
+      Gather j -> Gather j
+      Cores k -> Cores k
+  }
+
+-- The pool ---------------------------------------------------------------------------
+
+-- | `f` of each of `xs`, by `n` threads (the caller one of them), each
+-- | taking the next value as it ends one: the answers, in order.  `f` is
+-- | copied once for each thread, and each value once, for the thread
+-- | that takes it; an answer is handed back as it is.  A task that fails
+-- | stops the others taking more, and the first that failed, in the
+-- | list's order, fails the caller.
+parMap : {e : HFunctor}
+       -> {{th : threads <: e}}
+       -> {b a : Type}
+       -> Int
+       -> (b -> a)
+       -> List b
+       -> Co e (List a)
+parMap n f xs = op (th (Pool n (work f xs (\r -> r)))) val
+
+-- | `f 0 .. f (count - 1)`, by `n` threads.
+parFor : {e : HFunctor}
+       -> {{th : threads <: e}}
+       -> {a : Type}
+       -> Int
+       -> Int
+       -> (Int -> a)
+       -> Co e (List a)
+parFor n count f = parMap n f (List.range 0 (count - 1))
+
+-- | Each task run, by `n` threads: their answers, in order.
+parAll : {e : HFunctor}
+       -> {{th : threads <: e}}
+       -> {a : Type}
+       -> Int
+       -> List (Unit -> a)
+       -> Co e (List a)
+parAll n tasks = parMap n (\(task : Unit -> a) -> task MkUnit) tasks
+
+-- | How many threads the machine runs at once: its cores, as the system
+-- | says (1 where it does not).
+cores : {e : HFunctor} -> {{th : threads <: e}} -> Co e Int
+cores = op (th (Cores (\c -> c))) val
+
+-- Spreads ----------------------------------------------------------------------------
+
+-- | `n` threads from here on, each with a copy of the rest of the
+-- | program: this one is 0, the others 1 to n-1.
+spread : {e : HFunctor} -> {{th : threads <: e}} -> Int -> Co e Int
+spread n = op (th (Spread n (\i -> i))) val
+
+-- | The threads of the last spread joined: in thread 0, every one's
+-- | value, in order; every other thread ends here.  Outside a spread,
+-- | the value alone.
+gather : {e : HFunctor}
+       -> {{th : threads <: e}}
+       -> {a : Type}
+       -> a
+       -> Co e (List a)
+gather v = op (th (Gather (joined v (\r -> r)))) val
+
+-- Par, by threads --------------------------------------------------------------------
+
+-- (`k` of thread 0's answer and thread 1's)
+bothSides : {a b x : Type} -> (a -> b -> x) -> List (Either a b) -> x
+bothSides k (Left y :: Right z :: _) = k y z
+bothSides k _ = abandon
+
+-- | `Par` into `Co e`, each side a thread of its own: a spread into two,
+-- | joined again.  A side's pure work is done where it is handled, before
+-- | the spread, unless it comes after an operation or after `later`
+-- | (lib/parallel.hf's `parIn` says so): `parIn (later (\u -> fib n)) ...`.
+threaded : {e : HFunctor}
+         -> {{th : threads <: e}}
+         -> {a b x : Type}
+         -> ParF a b (Co e) x
+         -> Co e x
+threaded (Par l r k) = do
+  i <- spread 2
+  y <-
+    (if i == 0 then bind l (\v -> val (Left v : Either a b))
+     else bind r (\v -> val (Right v : Either a b)))
+  ys <- gather y
+  pure (bothSides k ys)
+
+-- | `Par` handled by threads, into `Co e`: the rest of the world left as
+-- | it is.
+inThreads : (a b : Type)
+          -> (e : HFunctor)
+          -> {{th : threads <: e}}
+          -> Handler (parOf a b <+> e)
+inThreads a b e = through (parOf a b) e (\p -> threaded p)

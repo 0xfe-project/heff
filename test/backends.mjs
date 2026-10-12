@@ -391,27 +391,33 @@ if (process.platform !== "win32") checks.push((async () => {
   return r.status === 0 && r.stdout === want ? [] : [`FAIL processes (c): status ${r.status}\n${r.stdout}${r.stderr}`];
 })());
 
-// threads truly at once, by C alone (test/node/threads.provider.c says
-// `#define HEFF_THREADS 1`: the runtime built for threads,
-// docs/threads.md): the rest of the program run by each thread, each on
-// its own copy, their answers gathered in order; a definition every
-// thread asks for, computed once; tasks taken by threads as they end
-// one; a static thunk forced by threads at once; functions whose C
-// workers take their numbers unboxed (#39) called in each;
-// lib/parallel.hf's `Par` each side a thread; and a thread abandoning,
-// the program abandoning when it is joined.  HEFF_TSAN=1: built with
-// ThreadSanitizer too, by the system's clang, and run again, what it says
-// a failure.
+// threads truly at once, by C alone (std.thread, whose provider,
+// lib/std/thread.provider.c, says `#define HEFF_THREADS 1`: the runtime
+// built for threads, docs/threads.md): the rest of the program run by
+// each thread, each on its own copy, their answers gathered in order; a
+// definition every thread asks for, computed once; tasks taken by
+// threads as they end one; a static thunk forced by threads at once;
+// functions whose C workers take their numbers unboxed (#39) called in
+// each; lib/parallel.hf's `Par` each side a thread; answers of any type
+// (strings, lists, pairs) mapped, gathered and each side of a `Par`; and
+// a thread abandoning, a spread's or a pool's task, the program
+// abandoning when it is joined.  HEFF_TSAN=1: built with ThreadSanitizer
+// too, by the system's clang, and run again, what it says a failure.
 const threadsWant = "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
   + "a definition, shared: 333833500 333833501 333833502 333833503\n"
   + "flat fields, shared and copied: 2528 2529 2530\nworkers: 82810 92940 102988\n"
   + "primes below 100000, by 4: 9592\n"
   + "forced at once: 6765 6765 6765 6765\nfib 20, each Par a thread: 6765\n";
+const genericWant = "strings, by 3: a! bb! ccc! dddd! eeeee!\nlists, by 4: [] [1] [1,2] [1,2,3] [1,2,3,4]\n"
+  + "a list of the caller's, in each: 0 3 165 15150 15150\npairs: one=55 two=89\nof none: []\n"
+  + "gathered: ,ab,abab\na Par of two types: fib 15 is 610; [1,1,2,3,5,8,13,21]\ncores: at least one\n";
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
   for (const [name, args, want] of [
     ["main", [], { out: threadsWant, status: 0 }],
+    ["generic", [], { out: genericWant, status: 0 }],
     ["failing", [], { out: "", err: "heff:abandon\n", status: 1 }],
+    ["failingTask", [], { out: "said before the pool\n", err: "heff:abandon\n", status: 1 }],
     ["cpu", ["queens", "8", "4"], { out: "queens: answer 92\n", status: 0 }],
   ]) {
     const p = await programs.c("test/node/threads.hf", name);

@@ -2,10 +2,68 @@
 
 `lib/parallel.hf`'s `Par` says what may run at once; a handler says how
 it runs.  In C, a provider may run heff in threads of its own, truly at
-once (#36).  `test/node/threads.hf` and its `threads.provider.c` are an
-example: a spread of threads, each going on with a copy of the rest of
-the program (as `test/node/fork.hf` does with processes), a pool of
-workers for `f 0 .. f (n - 1)`, and `Par` each side a thread.
+once (#36).  The library's is `std.thread` (`lib/std/thread.hf`, its
+provider `thread.provider.c`); `test/node/threads.hf` uses all of it.
+
+## std.thread
+
+```haskell
+import co
+import parallel
+import std.io
+import std.thread
+
+world : HFunctor
+world = stdio <+> threads
+
+program : {{io : stdio <: world}} -> {{th : threads <: world}} -> Co world Unit
+program = do
+  n <- cores
+  counts <- parFor n 1000 (primesInBlock 5000000)
+  print (showInt (List.sum counts))
+  names <- parMap 4 (\s -> s ^ "!") ["a", "b", "c"]
+  r <- handle (inThreads Int Int world) (fibPar 3 30)
+  ...
+```
+
+- `parMap n f xs`: `f` of each of `xs`, by `n` threads (the caller one
+  of them), each taking the next value as it ends one; the answers, in
+  order.  `parFor n count f` is `f 0 .. f (count - 1)`, and `parAll n
+  tasks` each `Unit -> a` of a list run.  What a task takes and gives
+  may be of any type -- a string, a list, a record -- and one `threads`
+  in the world serves them all: an operation keeps its types to itself.
+  One thread, or one value, runs in the caller, nothing copied.
+- `cores`: how many threads the machine runs at once.
+- `spread n`: the rest of the program given to each of `n` threads, a
+  copy each, its index its answer; `gather v`: in thread 0, every
+  thread's `v`, in order, every other thread ending there.  Spreads
+  nest: a gather joins its own spread's threads.
+- `inThreads a b e`: `Par` handled into `Co e`, each side a thread (a
+  spread into two, joined again); `threaded` is its algebra, for a
+  handler of one's own.  As with any handler into `Co e`, a side's pure
+  work is done where it is handled, before the spread, unless it comes
+  after an operation or after `later`: `parIn (later (\u -> fib n))
+  ...`.
+- A task that fails (`abandon`, say) stops the others taking more, and
+  the caller fails as the first that failed, in the list's order, would
+  have failed it: the program fails as it would have, one thread doing
+  all.  A thread of a spread that fails fails thread 0 at the gather.
+
+There is no JavaScript side: the JavaScript backend is the browser's,
+and a program with `threads` in its world is compiled for C
+(`--backend=c`; for Node.js it is refused, the effect not provided).
+
+### What it costs
+
+- `f` is copied once for each thread, and each value once, for the
+  thread that takes it; an answer is handed back as it is, not copied.
+  A task of `parAll` is copied whole, and what it holds with it: tasks
+  that each hold the same large value copy it each, where `parMap` of
+  a function holding it copies it once a thread.  A definition is not
+  copied at all (below): a large table every task reads is best one.
+- A spread copies the rest of the program for each thread, all it
+  holds: what was made before the spread, and is used after it, is
+  copied, as a process's memory is when it forks.
 
 ## Turning it on
 
@@ -56,7 +114,8 @@ it costs: the value is walked once, when it is made, and is never freed
 
 ## What a provider does
 
-What a provider hands another thread, it copies, and it runs it there
+`lib/std/thread.provider.c` is a provider that runs heff in threads;
+another may do the same.  What a provider hands another thread, it copies, and it runs it there
 under a catch:
 
 - `V heff_copy_for_thread(V v)` -- a copy of `v` for another thread, `v`
@@ -84,8 +143,19 @@ What a thread gives back (its answer) is its own; once the thread is
 joined it is the joiner's, and nothing more is needed: no other thread
 holds it.
 
-## What is still not safe, or costs
+## What is safe, and what is not
 
+Safe, in threads at once: pure code, all of it -- a task, a side of a
+`Par`, a spread's thread -- and the definitions it reads; `std.io`
+(a write is one `fwrite`, whole: C locks the stream); `std.ref`'s cells (locked,
+a value going in and out a copy); the world's table of handles
+(locked).  A task of a pool is pure: it has no effects to run.
+
+Not safe, or not as one thread would do:
+
+- A thread of a spread runs the rest of the program, effects and all:
+  what one prints, all print, in no order but their own; a file written
+  by each is written by each.  `exit` in any ends the process.
 - A failure in a thread not run under `heff_try` ends the process (it
   prints why and exits), as it does in one thread; under `heff_try` it
   is handed back.  A definition being computed when a failure is caught
@@ -125,7 +195,7 @@ program not built for threads:
 
 ## Testing
 
-`test/backends.mjs` runs `test/node/threads.hf` (its `main`, `failing`
-and `cpu`); with `HEFF_SANITIZE=1` under AddressSanitizer, and with
-`HEFF_TSAN=1` again under ThreadSanitizer, built by the system's
-clang.
+`test/backends.mjs` runs `test/node/threads.hf` (its `main`, `generic`,
+`failing`, `failingTask` and `cpu`); with `HEFF_SANITIZE=1` under
+AddressSanitizer (`make sanitize`), and with `HEFF_TSAN=1` again under
+ThreadSanitizer (`make tsan`), built by the system's clang.

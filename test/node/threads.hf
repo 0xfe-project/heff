@@ -1,73 +1,20 @@
--- Threads truly at once, as an effect, for test/backends.mjs, by C alone
--- (threads.provider.c, which says `#define HEFF_THREADS 1`; the runtime
--- built for threads, docs/threads.md).  `tspread n` gives the rest of
--- the program to each of n threads, a copy each, its index its answer;
--- `tgather x` joins them, each thread's Int, in order, in thread 0,
--- every other thread ending there -- test/node/fork.hf's, by threads.
--- `parFor w n f` is `f 0 .. f (n - 1)`, by `w` threads taking the next
--- as they end one; `forced n f` is `f MkUnit` in n threads at once.
--- And lib/parallel.hf's `Par`, each side a thread.
+-- Threads truly at once, by std.thread (lib/std/thread.hf, its C
+-- provider building the runtime for threads: docs/threads.md), for
+-- test/backends.mjs.  `spread n` gives the rest of the program to each
+-- of n threads, a copy each, its index its answer; `gather x` joins
+-- them, each thread's value, in order, in thread 0, every other thread
+-- ending there.  `parFor w n f` is `f 0 .. f (n - 1)`, by `w` threads
+-- taking the next as they end one, `parMap` the same over a list, and
+-- `parAll` each of a list of tasks: their answers any type, handed back.
+-- And lib/parallel.hf's `Par`, each side a thread (`inThreads`).
 
 import co
 import int64 as Int64
 import parallel
 import std.io
 import std.process
+import std.thread
 import uint64 as UInt64
-
-data ThreadsF (m : Type -> Type) x
-  = TSpread Int (Int -> x)
-  | TGather Int (List Int -> x)
-  | TLater x
-  | TParFor Int Int (Int -> Int) (List Int -> x)
-  | TForced Int (Unit -> Int) (List Int -> x)
-
-threads : HFunctor
-threads =
-  { f = ThreadsF
-  , hfmap = \m g p -> case p of
-      TSpread n k -> TSpread n (\i -> g (k i))
-      TGather s k -> TGather s (\ss -> g (k ss))
-      TLater x -> TLater (g x)
-      TParFor w n f k -> TParFor w n f (\xs -> g (k xs))
-      TForced n f k -> TForced n f (\xs -> g (k xs))
-  , hmap = \m n nt p -> case p of
-      TSpread n k -> TSpread n k
-      TGather s k -> TGather s k
-      TLater x -> TLater x
-      TParFor w n f k -> TParFor w n f k
-      TForced n f k -> TForced n f k
-  }
-
-tspread : {e : HFunctor} -> {{th : threads <: e}} -> Int -> Co e Int
-tspread n = op (th (TSpread n (\i -> i))) val
-
-tgather : {e : HFunctor} -> {{th : threads <: e}} -> Int -> Co e (List Int)
-tgather x = op (th (TGather x (\xs -> xs))) val
-
--- | `f ()`, computed where the computation runs, not where it is
--- | handled (test/programs/par-handlers.hf says why).
-later : {e : HFunctor}
-      -> {{th : threads <: e}}
-      -> {a : Type}
-      -> (Unit -> a)
-      -> Co e a
-later f = bind (op (th (TLater MkUnit)) val) (\u -> pure (f u))
-
-parFor : {e : HFunctor}
-       -> {{th : threads <: e}}
-       -> Int
-       -> Int
-       -> (Int -> Int)
-       -> Co e (List Int)
-parFor w n f = op (th (TParFor w n f (\xs -> xs))) val
-
-forced : {e : HFunctor}
-       -> {{th : threads <: e}}
-       -> Int
-       -> (Unit -> Int)
-       -> Co e (List Int)
-forced n f = op (th (TForced n f (\xs -> xs))) val
 
 world : HFunctor
 world = stdio <+> (process <+> threads)
@@ -169,27 +116,12 @@ spun t =
 
 -- Par, by threads ------------------------------------------------------------------
 
-pairOf : List Int -> Pair Int Int
-pairOf (a :: b :: _) = MkPair a b
-pairOf _ = MkPair 0 0
-
-threaded : {e : HFunctor}
-         -> {{th : threads <: e}}
-         -> {a : Type}
-         -> ParF Int Int (Co e) a
-         -> Co e a
-threaded (Par l r k) = do
-  i <- tspread 2
-  x <- (if i == 0 then l else r)
-  xs <- tgather x
-  pure (k (fst (pairOf xs)) (snd (pairOf xs)))
-
 pw : HFunctor
 pw = parOf Int Int <+> world
 
 fibPar : Int -> Int -> Co pw Int
 fibPar d n =
-  if d == 0 || n < 2 then later (th := \p -> InR (InR (InR p))) (\u -> fib n)
+  if d == 0 || n < 2 then later (\u -> fib n)
   else do
     ab <-
       parIn
@@ -206,35 +138,35 @@ showInts xs = unwords (List.map showInt xs)
 program : {{io : stdio <: world}} -> {{th : threads <: world}} -> Co world Unit
 program = do
   print "said before the spread, once"
-  i <- tspread 4
-  sq <- tgather (i * i)
+  i <- spread 4
+  sq <- gather (i * i)
   print ("squares: " ^ showInts sq)
-  j <- tspread 2
-  k <- tspread 3
-  inner <- tgather (j * 10 + k)
-  outer <- tgather (List.sum inner)
+  j <- spread 2
+  k <- spread 3
+  inner <- gather (j * 10 + k)
+  outer <- gather (List.sum inner)
   print ("nested: " ^ showInts outer)
-  m <- tspread 3
-  own <- tgather (List.sum (List.map (\x -> x * m) (List.range 1 5)))
+  m <- spread 3
+  own <- gather (List.sum (List.map (\x -> x * m) (List.range 1 5)))
   print ("each its own: " ^ showInts own)
-  n <- tspread 4
-  shared <- tgather (List.sum squares + n)
+  n <- spread 4
+  shared <- gather (List.sum squares + n)
   print ("a definition, shared: " ^ showInts shared)
   mine <-
     pure
       ({ m = 2.5, k = 9223372036854775807, u = 18446744073709551615, tag = "own" }
        : Mass)
-  f <- tspread 3
-  flat <- tgather (massOf mine + f)
+  f <- spread 3
+  flat <- gather (massOf mine + f)
   print ("flat fields, shared and copied: " ^ showInts flat)
-  t <- tspread 3
-  ws <- tgather (spun t)
+  t <- spread 3
+  ws <- gather (spun t)
   print ("workers: " ^ showInts ws)
   ps <- parFor 4 (100000 / 4096 + 1) (primesIn 100000)
   print ("primes below 100000, by 4: " ^ showInt (List.sum ps))
-  fs <- forced 4 (\u -> fib 20)
+  fs <- parAll 4 (List.replicate 4 (\u -> fib 20))
   print ("forced at once: " ^ showInts fs)
-  r <- handle (through (parOf Int Int) world (\p -> threaded p)) (fibPar 3 20)
+  r <- handle (inThreads Int Int world) (fibPar 3 20)
   print ("fib 20, each Par a thread: " ^ showInt r)
 
 main : Co world Unit
@@ -246,13 +178,73 @@ abandoning : {{io : stdio <: world}}
            -> {{th : threads <: world}}
            -> Co world Unit
 abandoning = do
-  i <- tspread 3
+  i <- spread 3
   x <- later (\u -> if i == 2 then abandon else i)
-  xs <- tgather x
+  xs <- gather x
   print ("not said: " ^ showInts xs)
 
 failing : Co world Unit
 failing = abandoning (io := \p -> InL p) (th := \p -> InR (InR p))
+
+-- (any value, there and back: strings and lists mapped, gathered, and
+-- each side of a `Par` of two types; a value of the caller's, not a
+-- definition, copied to each task that holds it)
+mixed : Co (parOf String (List Int) <+> world) (Pair String (List Int))
+mixed =
+  parIn
+    (inj := \p -> InL p)
+    (later (\u -> "fib 15 is " ^ showInt (fib 15)))
+    (later (\u -> List.map fib (List.range 1 8)))
+
+showList : List Int -> String
+showList xs = "[" ^ joinWith "," (List.map showInt xs) ^ "]"
+
+generics : {{io : stdio <: world}}
+         -> {{th : threads <: world}}
+         -> Co world Unit
+generics = do
+  shouted <- parMap 3 (\s -> s ^ "!") ["a", "bb", "ccc", "dddd", "eeeee"]
+  print ("strings, by 3: " ^ unwords shouted)
+  ranges <- parFor 4 5 (\i -> List.range 1 i)
+  print ("lists, by 4: " ^ unwords (List.map showList ranges))
+  mine <- pure (List.map (\x -> x * 3) (List.range 1 100))
+  sums <- parMap 4 (\n -> List.sum (List.take n mine)) [0, 1, 10, 100, 1000]
+  print ("a list of the caller's, in each: " ^ showInts sums)
+  pairs <- parAll 2 [\u -> MkPair "one" (fib 10), \u -> MkPair "two" (fib 11)]
+  print ("pairs: " ^ unwords (List.map (\(p : Pair String Int) -> fst p ^ "=" ^ showInt (snd p)) pairs))
+  none <- parMap 4 (\(x : Int) -> x) Nil
+  print ("of none: " ^ showList none)
+  i <- spread 3
+  names <- gather (joinWith "" (List.replicate i "ab"))
+  print ("gathered: " ^ joinWith "," names)
+  both <- handle (inThreads String (List Int) world) mixed
+  print ("a Par of two types: " ^ fst both ^ "; " ^ showList (snd both))
+  c <- cores
+  print (if c >= 1 then "cores: at least one" else "cores: none")
+
+generic : Co world Unit
+generic = generics (io := \p -> InL p) (th := \p -> InR (InR p))
+
+-- (tasks that abandon: the others take no more, and the caller
+-- abandons, as it would have, one thread doing all -- the first that
+-- failed in the list's order the one it fails as, though a later one,
+-- here, fails sooner)
+failAt : Int -> Int
+failAt i =
+  if i == 2 then (if fib 25 > 0 then abandon else 0)
+  else if i == 4 then abandon
+  else i
+
+poolFailing : {{io : stdio <: world}}
+            -> {{th : threads <: world}}
+            -> Co world Unit
+poolFailing = do
+  print "said before the pool"
+  xs <- parFor 4 8 failAt
+  print ("not said: " ^ showInts xs)
+
+failingTask : Co world Unit
+failingTask = poolFailing (io := \p -> InL p) (th := \p -> InR (InR p))
 
 -- (`cpu WORK N W`: WORK -- primes, queens or fib -- of N, by W threads)
 tasks : String -> Int -> Pair Int (Int -> Int)

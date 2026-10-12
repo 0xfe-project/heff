@@ -47,7 +47,9 @@ What is above, in `lib/`, is pure, the same on every backend.
 
 - `std.io` (the standard streams), `std.filesystem`, `std.process`,
   `std.http` (an HTTP client), `std.progress` (what a program is doing,
-  drawn on a terminal): effects of the system, C's alone;
+  drawn on a terminal), `std.thread` (threads truly at once: a pool,
+  spreads, and `Par` handled by them -- [threads.md](threads.md)):
+  effects of the system, C's alone;
 - `std.ref` (the world's cells) and `std.time`: effects needed on both
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
