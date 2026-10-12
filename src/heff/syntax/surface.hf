@@ -29,7 +29,8 @@ mkBinders f names implicits = { f = f, names = names, implicits = implicits }
 -- | each signature binds, by the name it is of (the last read first);
 -- | `patVars`: those of the equation being lowered; `fix`: the fixities
 -- | in scope; `lenient`: unrelated operators bind as one left-associative
--- | group (the formatter's reading)
+-- | group (the formatter's reading); `at`: where an offset is, said
+-- | `path:line:col`
 type St =
   { toks : Array C.T
   , scope : List String
@@ -38,6 +39,7 @@ type St =
   , patVars : List String
   , fix : F.Fixities
   , lenient : Bool
+  , at : Int -> String
   }
 
 type P a = St -> Pair (Either Diag a) St
@@ -75,8 +77,9 @@ mkSt : Array C.T
      -> List String
      -> F.Fixities
      -> Bool
+     -> (Int -> String)
      -> St
-mkSt toks scope known binders patVars fix lenient =
+mkSt toks scope known binders patVars fix lenient at =
   { toks = toks
   , scope = scope
   , known = known
@@ -84,16 +87,17 @@ mkSt toks scope known binders patVars fix lenient =
   , patVars = patVars
   , fix = fix
   , lenient = lenient
+  , at = at
   }
 
 setScope : List String -> St -> St
-setScope sc s = mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient
+setScope sc s = mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient s.at
 
 setBinders : Mp.Map String (List Binders) -> St -> St
-setBinders b s = mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient
+setBinders b s = mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient s.at
 
 setPatVars : List String -> St -> St
-setPatVars pv s = mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient
+setPatVars pv s = mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient s.at
 
 -- Tokens and spans
 --------------------------------------------------------------------------------
@@ -624,19 +628,23 @@ eqnsCons e esp Nothing = { eqns = Cons e Nil, end = esp.end }
 eqnsCons e esp (Just rest) =
   { eqns = Cons e rest.eqns, end = maxI esp.end rest.end }
 
-eqnsAdd : String
-        -> Pm.Spanned (Notation.Equation Notation.Expr)
-        -> Pm.Span
-        -> Mp.Map String Eqns
-        -> Mp.Map String Eqns
-eqnsAdd g e esp m =
-  Mp.insert compareString g (eqnsCons e esp (Mp.lookup compareString g m)) m
+-- (a declaration that defines a name: what a doc test may be of)
+definesDecl : Notation.Decl -> Bool
+definesDecl (At (DeclTest _ _) _) = False
+definesDecl (At (DeclWatch _) _) = False
+definesDecl _ = True
 
--- | each name's equations: one pass, not one for each signature
-eqnsByName : List Item -> Mp.Map String Eqns
-eqnsByName Nil = Mp.empty
-eqnsByName (Cons (Eqn g e esp) rest) = eqnsAdd g e esp (eqnsByName rest)
-eqnsByName (Cons _ rest) = eqnsByName rest
+-- | the equations of `f` right under its signature, of the items after
+-- | it: up to the next definition (a test or a watch between them is
+-- | passed over)
+eqnsUnder : String -> List Item -> Maybe Eqns
+eqnsUnder f Nil = Nothing
+eqnsUnder f (Cons (Eqn g e esp) rest) =
+  if strEq f g then Just (eqnsCons e esp (eqnsUnder f rest)) else Nothing
+eqnsUnder f (Cons (Whole d) rest) =
+  if definesDecl d then Nothing else eqnsUnder f rest
+eqnsUnder f (Cons (Doc _) rest) = eqnsUnder f rest
+eqnsUnder f (Cons (Sig _ _ _ _ _) rest) = Nothing
 
 -- | the names, to be looked up: one pass, not one for each look
 nameSet : List String -> Mp.Map String Unit
@@ -657,13 +665,11 @@ assembleSig declared f fsp ty sp Nothing = Nothing
 assembleSig declared f fsp ty sp (Just es) =
   Just (defOf declared f fsp ty (mkSpan sp.start (maxI sp.end es.end)) es.eqns)
 
-assembleOne : Mp.Map String Unit
-            -> Mp.Map String Eqns
-            -> Item
-            -> Maybe Notation.Decl
-assembleOne broken byName (Whole d) = Just d
-assembleOne broken byName (Doc d) = Just d
-assembleOne broken byName (Sig declared f fsp ty sp) =
+-- (`rest`, the items after the one assembled)
+assembleOne : Mp.Map String Unit -> List Item -> Item -> Maybe Notation.Decl
+assembleOne broken rest (Whole d) = Just d
+assembleOne broken rest (Doc d) = Just d
+assembleOne broken rest (Sig declared f fsp ty sp) =
   if isIn broken f
     then Just
         (defOf
@@ -676,12 +682,24 @@ assembleOne broken byName (Sig declared f fsp ty sp) =
              (MkEquation f fsp Nil (At (EWord AbandonWord) sp))
              (Notation.spanning fsp sp)
            ])
-  else assembleSig declared f fsp ty sp (Mp.lookup compareString f byName)
-assembleOne broken byName (Eqn _ _ _) = Nothing
+  else assembleSig declared f fsp ty sp (eqnsUnder f rest)
+assembleOne broken rest (Eqn _ _ _) = Nothing
 
+consJust : {a : Type} -> Maybe a -> List a -> List a
+consJust Nothing xs = xs
+consJust (Just x) xs = Cons x xs
+
+assembleGo : Mp.Map String Unit
+           -> List Item
+           -> List Notation.Decl
+           -> List Notation.Decl
+assembleGo broken Nil acc = List.reverse acc
+assembleGo broken (Cons it rest) acc =
+  assembleGo broken rest (consJust (assembleOne broken rest it) acc)
+
+-- | each signature met with the equations right under it
 assemble : List String -> List Item -> List Notation.Decl
-assemble broken items =
-  catMaybesS (List.map (assembleOne (nameSet broken) (eqnsByName items)) items)
+assemble broken items = assembleGo (nameSet broken) items Nil
 
 -- | the names with a signature
 sigNames : List Item -> Mp.Map String Unit
@@ -720,6 +738,120 @@ assembleDiags broken items =
        (assembleDiagOne (nameSet broken) (sigNames items) (eqnNames items))
        items)
 
+-- Each name defined once
+--------------------------------------------------------------------------------
+
+-- | what an item defines: a name, where it is written, the name whose
+-- | equations may come after it, what is said if the name is defined
+-- | already, whether it is a primitive's; or nothing (an equation under
+-- | its signature, a test, a watch)
+data Defines = Names String Pm.Span (Maybe String) String Bool | Passes
+
+twiceMsg : String -> String
+twiceMsg x = "`" ^ x ^ "` is defined twice"
+
+apartMsg : String -> String
+apartMsg x =
+  "`"
+  ^ x
+  ^ "` is defined twice: its equations are apart, another definition between them"
+
+isOpen : Maybe String -> String -> Bool
+isOpen Nothing g = False
+isOpen (Just f) g = strEq f g
+
+eqnNameSpan : Pm.Spanned (Notation.Equation Notation.Expr) -> Pm.Span
+eqnNameSpan (At (MkEquation _ fsp _ _) _) = fsp
+
+wholeDefines : Notation.Decl -> Defines
+wholeDefines (At (DeclDefine x xsp _ _ _) _) =
+  Names x xsp Nothing (twiceMsg x) False
+wholeDefines (At (DeclTheory x xsp _ _) _) =
+  Names x xsp Nothing (twiceMsg x) False
+wholeDefines (At (DeclPrimitive x xsp _) _) =
+  Names x xsp Nothing (twiceMsg x) True
+wholeDefines _ = Passes
+
+-- (`open`: the name whose equations may come next)
+definesOf : Maybe String -> Item -> Defines
+definesOf open (Sig _ f fsp _ _) = Names f fsp (Just f) (twiceMsg f) False
+definesOf open (Eqn g e _) =
+  if isOpen open g then Passes
+  else Names g (eqnNameSpan e) (Just g) (apartMsg g) False
+definesOf open (Whole d) = wholeDefines d
+definesOf open (Doc _) = Passes
+
+-- | the names defined so far, each where it is first; those of them
+-- | declared primitives; the name whose equations may come next; what
+-- | is wrong (the last first)
+type Defined =
+  { seen : Mp.Map String Pm.Span
+  , prims : Mp.Map String Unit
+  , open : Maybe String
+  , diags : List Diag
+  }
+
+seenPlus : Mp.Map String Pm.Span -> String -> Pm.Span -> Mp.Map String Pm.Span
+seenPlus seen x sp =
+  if Mp.member compareString x seen then seen
+  else Mp.insert compareString x sp seen
+
+-- (`x`, defined again at `sp`, if it is defined already; `at` says where
+-- the first is)
+twiceOf : (Int -> String)
+        -> String
+        -> Pm.Span
+        -> String
+        -> Maybe Pm.Span
+        -> List Diag
+        -> List Diag
+twiceOf at x sp msg Nothing diags = diags
+twiceOf at x sp msg (Just first) diags =
+  Cons
+    { code = 153
+    , severity = SError
+    , msg = msg
+    , span = sp
+    , note = Just ("`" ^ x ^ "` is first defined at " ^ at first.start)
+    }
+    diags
+
+-- (where `x` is first defined, if it is; a primitive declared again is
+-- E0336's, which says both places)
+firstOf : Defined -> String -> Bool -> Maybe Pm.Span
+firstOf d x True =
+  if isIn d.prims x then Nothing else Mp.lookup compareString x d.seen
+firstOf d x False = Mp.lookup compareString x d.seen
+
+primsPlus : Mp.Map String Unit -> String -> Bool -> Mp.Map String Unit
+primsPlus prims x True = Mp.insert compareString x MkUnit prims
+primsPlus prims x False = prims
+
+definedStep : (Int -> String) -> Defined -> Defines -> Defined
+definedStep at d Passes = d
+definedStep at d (Names x sp next msg prim) =
+  { seen = seenPlus d.seen x sp
+  , prims = primsPlus d.prims x prim
+  , open = next
+  , diags = twiceOf at x sp msg (firstOf d x prim) d.diags
+  }
+
+definedDiags : Defined -> List Diag
+definedDiags d = d.diags
+
+-- | a name defined twice, at the second: by a signature, a `data`,
+-- | `type`, `theory` or `primitive` (not a primitive declared again),
+-- | or equations with no signature right above them (definitions are in order, each after those it uses, so a
+-- | definition's equations are right under its signature)
+twiceDiags : (Int -> String) -> List Item -> List Diag
+twiceDiags at items =
+  List.reverse
+    (definedDiags
+       (List.foldl
+          (\(d : Defined) it -> definedStep at d (definesOf d.open it))
+          { seen = Mp.empty, prims = Mp.empty, open = Nothing, diags = Nil }
+          items))
+
 -- Doc tests meet their definitions
 --------------------------------------------------------------------------------
 
@@ -751,12 +883,6 @@ itemStart (Sig _ _ _ _ sp) = sp.start
 itemStart (Eqn _ _ sp) = sp.start
 itemStart (Whole d) = (Pm.spanOf d).start
 itemStart (Doc d) = (Pm.spanOf d).start
-
--- (a declaration that defines a name: what a doc test may be of)
-definesDecl : Notation.Decl -> Bool
-definesDecl (At (DeclTest _ _) _) = False
-definesDecl (At (DeclWatch _) _) = False
-definesDecl _ = True
 
 -- (a signature starts a definition, so does `data`, `type`, `theory` or
 -- `primitive`; an equation, a test or a watch does not)
@@ -1489,7 +1615,10 @@ whereL r kw ds rhs = do
   saved <- pGets (\s -> s.binders)
   items <- block r.decl ds
   pModify (\s -> setBinders saved s)
-  case assembleDiags Nil (concatMapS (\x -> x) items) of
+  at <- pGets (\s -> s.at)
+  case appendS
+      (twiceDiags at (concatMapS (\x -> x) items))
+      (assembleDiags Nil (concatMapS (\x -> x) items)) of
     Cons d _ -> throwP d
     Nil ->
       pure
@@ -2120,12 +2249,14 @@ progGo cs s items diags broken =
 --------------------------------------------------------------------------------
 
 -- | `place`: the file, said, `by prelude, at lib/prelude.hf` (where its
--- | fixities are declared, said with the line)
+-- | fixities are declared, said with the line); `path`: the file's path,
+-- | as a diagnostic names it (where a name is first defined, said)
 type Options =
   { known : String -> Bool
   , fixities : F.Fixities
   , lenient : Bool
   , place : String = ""
+  , path : String = ""
   }
 
 type Read =
@@ -2148,8 +2279,29 @@ lexDiagOf e =
 knownOr : (String -> Bool) -> Mp.Map String Unit -> String -> Bool
 knownOr known declared x = known x || isIn declared x
 
-initialSt : Options -> Array C.T -> List String -> F.Fixities -> St
-initialSt o toks declared own =
+-- (the line and column, each from 1, of `i`, on line `l`, which starts
+-- at `start`; a column counts runes)
+lineColFrom : String -> Int -> Int -> Int -> String
+lineColFrom src i l start = case indexFrom "\n" src start of
+  Just nl ->
+    if nl < i then lineColFrom src i (l + 1) (nl + 1)
+    else showInt l ^ ":" ^ showInt (Rn.runesBetween src start i + 1)
+  Nothing -> showInt l ^ ":" ^ showInt (Rn.runesBetween src start i + 1)
+
+-- | where the offset `i` of `src` is, said `path:line:col`
+-- | >>> placeOfOffset "a.hf" "x\ny = 1\n" 4
+-- | "a.hf:2:3"
+placeOfOffset : String -> String -> Int -> String
+placeOfOffset "" src i = lineColFrom src i 1 0
+placeOfOffset path src i = path ^ ":" ^ lineColFrom src i 1 0
+
+initialSt : Options
+          -> (Int -> String)
+          -> Array C.T
+          -> List String
+          -> F.Fixities
+          -> St
+initialSt o at toks declared own =
   mkSt
     toks
     Nil
@@ -2158,9 +2310,15 @@ initialSt o toks declared own =
     Nil
     (F.union o.fixities own)
     o.lenient
+    at
 
-readPlaced : List Diag -> FixRead -> ProgRes -> Placed -> Read
-readPlaced lexDiags own r placed =
+readPlaced : (Int -> String)
+           -> List Diag
+           -> FixRead
+           -> ProgRes
+           -> Placed
+           -> Read
+readPlaced at lexDiags own r placed =
   { decls = assemble r.broken (List.reverse placed.items)
   , diags =
       appendS
@@ -2171,13 +2329,16 @@ readPlaced lexDiags own r placed =
               r.diags
               (appendS
                  (List.reverse placed.diags)
-                 (assembleDiags r.broken r.items))))
+                 (appendS
+                    (assembleDiags r.broken r.items)
+                    (twiceDiags at r.items)))))
   , fixities = own.fixities
   , broken = r.broken
   }
 
-readOut : String -> List Diag -> FixRead -> ProgRes -> Read
-readOut src lexDiags own r = readPlaced lexDiags own r (placeDocs src r.items)
+readOut : (Int -> String) -> String -> List Diag -> FixRead -> ProgRes -> Read
+readOut at src lexDiags own r =
+  readPlaced at lexDiags own r (placeDocs src r.items)
 
 readRun : String
         -> Options
@@ -2188,12 +2349,13 @@ readRun : String
         -> Read
 readRun src o toks lexDiags declared own =
   readOut
+    (placeOfOffset o.path src)
     src
     lexDiags
     own
     (progGo
        (C.initialSt toks)
-       (initialSt o toks declared own.fixities)
+       (initialSt o (placeOfOffset o.path src) toks declared own.fixities)
        Nil
        Nil
        Nil)

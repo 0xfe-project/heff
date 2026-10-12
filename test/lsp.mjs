@@ -97,6 +97,16 @@ try {
   expect("hover past a rune beyond U+FFFF", tHover.result && tHover.result.contents.value.includes("t : Int"), tHover.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-astral.hf") } });
 
+  // a name defined twice: at the second, saying where the first is
+  const twice = "one : Int\none = 1\n\none : Int\none = 2\n";
+  open("test/surface/lsp-twice.hf", twice);
+  ds = await diagnosticsOf(uri("test/surface/lsp-twice.hf"));
+  const againAt = pos(twice, "one :", 1);
+  expect("a name defined twice", ds.length === 1 && ds[0].code === "E0153" && ds[0].severity === 1 &&
+    ds[0].range.start.line === againAt.line && ds[0].range.start.character === 0 && ds[0].range.end.character === 3 &&
+    ds[0].message.includes("`one` is defined twice") && ds[0].message.includes("lsp-twice.hf:1:1"), ds);
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-twice.hf") } });
+
   // a type error, in the editor's text (not the file's)
   const bad = 'import a\n\ntwice : Bool -> Bool\ntwice b = inv (inv "x")\n';
   open("test/modules/src/b.hf", bad);

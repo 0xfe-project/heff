@@ -23,6 +23,13 @@ used unqualified.  An import a module has already is an error --
 `import prelude`, or one written twice -- but `import prelude as P` is
 another.
 
+A module defines a name once: a second definition of it is an error
+(E0153) that says where the first is -- a second signature, `data`,
+`type`, `theory` or `primitive` of the name, or equations of it apart
+from its signature, which they are right under, no other definition
+between them (a watch may be).  A tag is no definition: two types may
+have the same.
+
 `import m as M` imports `m` qualified only: its definitions are `M.x`.
 At `M.x` the alias comes first, before a type or a constructor of the
 same name -- a type has no fields -- so a module may be imported under
