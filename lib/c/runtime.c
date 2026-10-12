@@ -21,7 +21,7 @@
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
 // freeing it.  What a function is given it owns: it consumes it (gives
 // it to what it calls, keeps it in what it builds) or drops it -- the
-// compiler says where (src/heff/compile/rc.hf, "Reference counts"); every
+// compiler says where (src/heff/compile/refcount.hf, "Reference counts"); every
 // primitive and the runtime's calls consume their arguments too.  What
 // is static (a string written in the program, a definition's closure) is
 // immortal, its count never changed.  A program runs in a thread of its
@@ -635,7 +635,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
 }
 
 // (field `i` of a record wanted after, which after it is only read other
-// fields of, then updated or dropped (src/heff/compile/rc.hf, `takesFor`):
+// fields of, then updated or dropped (src/heff/compile/refcount.hf, `takesFor`):
 // its last reference, the field taken out of it -- moved, not counted, a
 // hole left that drops as nothing; otherwise the field counted.  Never a
 // field that may be flat: one that is is read where it is)
