@@ -11,7 +11,10 @@
 -- A request whose body is sent in chunks (`Transfer-Encoding`) is
 -- answered `501 Not Implemented`, and its connection closed; a head
 -- longer than 64 KiB, `431`; a body longer than 64 MiB, `413`; a
--- request that is no HTTP/1.x, `400` or `505`.
+-- request that is no HTTP/1.x, `400` or `505`.  Before it is closed,
+-- the server shuts its side down and reads what the client still sends
+-- -- a mebibyte of it at most -- so that the client is not reset before
+-- it has read the response.
 
 import bytes as Bytes
 import co
@@ -62,6 +65,11 @@ bodyMost = 67108864
 -- (how much is read at a time)
 readSize : Int
 readSize = 65536
+
+-- (how much of what a client still sends, after a request refused, is
+-- read and let go of before its connection is closed)
+drainMost : Int
+drainMost = 1048576
 
 -- Reading a request
 --------------------------------------------------------------------------------
@@ -409,6 +417,40 @@ afterWrite : Bytes -> Bool -> Bool -> Either Net.NetError Unit -> After
 afterWrite rest close stop (Left err) = Done stop
 afterWrite rest close stop (Right _) = if close then Done stop else Next rest
 
+-- (what a read came to, `got` bytes let go of before it: `again`; at
+-- the end of what the client sends, or where reading failed, done)
+drainedOn : {e : HFunctor}
+          -> (Int -> Co e Unit)
+          -> Int
+          -> Either Net.NetError Bytes
+          -> Co e Unit
+drainedOn again got (Left err) = pure MkUnit
+drainedOn again got (Right b) =
+  if Bytes.length b == 0 then pure MkUnit else again (got + Bytes.length b)
+
+-- (what the client sends read and let go of, `got` bytes of it already,
+-- until it ends or there has been `drainMost` of it)
+drain : {e : HFunctor}
+      -> {{nt : Net.net <: e}}
+      -> Net.Connection
+      -> Int
+      -> Co e Unit
+drain c got =
+  if got >= drainMost then pure MkUnit
+  else bind (Net.read c readSize) (drainedOn (drain c) got)
+
+-- (a refusal written: this side shut down, so that the client reads the
+-- response to its end, and what it still sends drained, so that the
+-- connection closed with bytes unread -- a reset, which may come before
+-- the client has read the response -- is not what it is sent)
+lingered : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> Net.Connection
+         -> Either Net.NetError Unit
+         -> Co e Unit
+lingered c (Left err) = pure MkUnit
+lingered c (Right _) = bind (Net.shutdown c) (\s -> drain c 0)
+
 -- (what was read, answered)
 answered : {e : HFunctor}
          -> {{nt : Net.net <: e}}
@@ -430,6 +472,7 @@ answered c last handle (Refused status) = do
     Net.write
       c
       (responseBytes "close" True (plain status (reason status ^ "\n")))
+  lingered c w
   pure (Done False)
 answered c last handle Ended = pure (Done False)
 

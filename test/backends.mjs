@@ -385,8 +385,9 @@ if (process.platform !== "win32") checks.push((async () => {
 // std.http's client in the same program, a thread of its own; and by
 // the test's own -- node:http, its connection kept for each request,
 // bytes written to a socket (requests one after another in one write, a
-// head in parts, HTTP/1.0, `Expect: 100-continue`, a chunked body, no
-// request at all), and curl, two requests on one connection -- each
+// head in parts, HTTP/1.0, `Expect: 100-continue`, a chunked body, a
+// body refused that the client sends on after the response, no request
+// at all), and curl, two requests on one connection -- each
 // request said by the server as it answers it, until it is asked for
 // `/stop`; and stopped by a connection it cannot accept, with no
 // descriptor left
@@ -514,6 +515,14 @@ if (process.platform !== "win32") checks.push((async () => {
         + "Content-Length: 5\r\nConnection: close\r\n\r\nhello",
       ['POST /echo HTTP/1.1, b"hello"']],
     ["a chunked body", [[0, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"]],
+      "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 16\r\nConnection: close\r\n\r\nNot Implemented\n", []],
+    // (refused, the client sending on after the response: drained, not
+    // reset, so that it reads the response)
+    ["a body too long, sent on",
+      [[0, "POST /echo HTTP/1.1\r\nContent-Length: 100000000\r\n\r\n" + "x".repeat(32768)], ["Content Too Large\n", "y".repeat(524288)]],
+      "HTTP/1.1 413 Content Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 18\r\nConnection: close\r\n\r\nContent Too Large\n", []],
+    ["a chunked body, sent on",
+      [[0, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8000\r\n" + "x".repeat(32768)], ["Not Implemented\n", "y".repeat(524288)]],
       "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 16\r\nConnection: close\r\n\r\nNot Implemented\n", []],
     ["no request", [[0, "NONSENSE\r\n\r\n"]],
       "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: close\r\n\r\nBad Request\n", []],

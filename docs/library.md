@@ -211,7 +211,10 @@ request is HTTP/1.0 without `Connection: keep-alive`, either side says
 `Connection: close`, or the request is the last.  A request whose body
 comes in chunks (`Transfer-Encoding`) is answered `501`, one that is no
 HTTP/1.x's `400` or `505`, one too long `431` or `413`, and the
-connection is closed.  One connection is served at a time: a client
+connection is closed: after the response the server shuts its side
+down and reads what the client still sends, a mebibyte of it at most,
+and lets it go, so that a client still sending its body reads the
+response before the connection is closed, not a reset.  One connection is served at a time: a client
 that keeps its connection keeps the others waiting, until #43's green
 threads (std.thread's threads join where they spread: a thread for
 each connection, joined only when the server ends, would be one kept
