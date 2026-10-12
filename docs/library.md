@@ -168,14 +168,19 @@ has no sockets yet: an operation there fails the program.
 `std.http.server` is an HTTP/1.1 server, a library in heff over
 `std.net`: import it by a name, `import std.http.server as Server`.
 `Server.serve listener handle` accepts the listener's connections, one
-at a time, for ever, and answers each request of each by `handle :
+at a time, and answers each request of each by `handle :
 Server.Request -> Co e Http.Response` -- std.http's `Response`, its
 status, headers and body.  A `Server.Request` is the server's, not
 std.http's (which is a client's, its URL, its time and redirects): its
 `method`, its `target` as the request line has it (`/items?id=3`), its
 `version`, its `headers` (`Server.header` finds one), its `body`
 (`Bytes`) and its `peer`.  `Server.serveUntil last listener handle`
-stops after the request `last` says is the last, answered;
+stops after the request `last` says is the last, answered, `Right
+MkUnit`.  Where a connection fails to be accepted -- the program out of
+descriptors, `EMFILE` -- both stop there and give back the `NetError`
+(`serve`'s result is `Co e Net.NetError`, `serveUntil`'s `Co e (Either
+Net.NetError Unit)`), the listener left open: whether to wait and serve
+again is the caller's to say, not the library's.
 `Server.serveConnection` serves one connection accepted already; and
 `Server.plain status text` is a response of text.
 
@@ -187,11 +192,12 @@ import std.net as Net
 hello : {e : HFunctor} -> Server.Request -> Co e Http.Response
 hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
 
--- (`hello` served on the port, for ever)
-helloAt : {e : HFunctor} -> {{nt : Net.net <: e}} -> Int -> Co e Unit
+-- (`hello` served on the port, until a connection fails to be accepted:
+-- why, or why it could not listen)
+helloAt : {e : HFunctor} -> {{nt : Net.net <: e}} -> Int -> Co e Net.NetError
 helloAt port = do
   l <- Net.listen "127.0.0.1" port 64
-  either (\err -> pure MkUnit) (\ln -> Server.serve ln hello) l
+  either (\err -> pure err) (\ln -> Server.serve ln hello) l
 ```
 
 Each request's head is read -- its line and headers, 64 KiB at most --

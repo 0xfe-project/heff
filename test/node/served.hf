@@ -4,7 +4,9 @@
 -- a socket's bytes), each request said on a line as it is answered.
 -- `self`: served, at a port the system picked, to std.http's client in
 -- the same program, a thread of its own (std.thread), what the client
--- got said.
+-- got said.  `crowded`, run with few descriptors: connected to until
+-- there is none left, then served -- `serveUntil` and `serve` stop at
+-- the connection they cannot accept, and say why.
 
 import bytes as Bytes
 import co
@@ -79,6 +81,14 @@ said r = do
 isStop : Server.Request -> Bool
 isStop r = strEq r.target "/stop"
 
+-- (where the server stopped: asked to, or accepting failed)
+stopped : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> Either Net.NetError Unit
+        -> Co e Unit
+stopped (Left err) = printErr ("accept: " ^ Net.showError err)
+stopped (Right _) = pure MkUnit
+
 serveAt : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
@@ -88,8 +98,71 @@ serveAt port = do
   l <- Net.listen "127.0.0.1" port 16
   either
       (\err -> printErr ("listen: " ^ Net.showError err))
-      (\(ln : Net.Listener) -> Server.serveUntil isStop ln said)
+      (\(ln : Net.Listener) -> bind (Server.serveUntil isStop ln said) stopped)
       l
+
+-- Out of descriptors --------------------------------------------------------------
+
+-- (the connections made, and why the next was not; or a hundred made)
+type Crowd = { made : List Net.Connection, failed : Maybe Net.NetError }
+
+crowdOn : {e : HFunctor}
+        -> (List Net.Connection -> Co e Crowd)
+        -> List Net.Connection
+        -> Either Net.NetError Net.Connection
+        -> Co e Crowd
+crowdOn again cs (Left err) = pure { made = cs, failed = Just err }
+crowdOn again cs (Right c) =
+  if List.length cs >= 100 then pure { made = c :: cs, failed = Nothing }
+  else again (c :: cs)
+
+-- (connections made to the port, each waiting to be accepted, until the
+-- program has no descriptor left for one more)
+crowd : {e : HFunctor}
+      -> {{nt : Net.net <: e}}
+      -> Int
+      -> List Net.Connection
+      -> Co e Crowd
+crowd port cs = bind (Net.connect "127.0.0.1" port) (crowdOn (crowd port) cs)
+
+errorName : Maybe Net.NetError -> String
+errorName Nothing = "none"
+errorName (Just err) = err.name
+
+closeAll : {e : HFunctor}
+         -> {{nt : Net.net <: e}}
+         -> List Net.Connection
+         -> Co e Unit
+closeAll Nil = pure MkUnit
+closeAll (c :: rest) = do
+  Net.close c
+  closeAll rest
+
+-- (the server, with no descriptor left for a connection it accepts:
+-- stopped, why said, not trying again for ever)
+crowdedAt : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Net.Listener
+          -> Co e Unit
+crowdedAt l = do
+  at <- Net.local l
+  cs <- crowd (either (\e -> 0) (\(a : Net.Address) -> a.port) at) Nil
+  print ("connect: " ^ errorName cs.failed)
+  served <- Server.serveUntil (\r -> True) l (\r -> pure (routed r))
+  print ("serveUntil: " ^ either (\(e : Net.NetError) -> e.name) (\u -> "stopped") served)
+  failed <- Server.serve l (\r -> pure (routed r))
+  print ("serve: " ^ failed.name)
+  closeAll cs.made
+  Net.close l
+
+crowdedProgram : {e : HFunctor}
+               -> {{io : stdio <: e}}
+               -> {{nt : Net.net <: e}}
+               -> Co e Unit
+crowdedProgram = do
+  l <- Net.listen "127.0.0.1" 0 256
+  either (\err -> printErr ("listen: " ^ Net.showError err)) crowdedAt l
 
 -- std.http's client, a thread of its own --------------------------------------------
 
@@ -165,8 +238,8 @@ sides : {e : HFunctor}
       -> Int
       -> Co e (List String)
 sides l at 0 = do
-  Server.serveUntil isStop l (\r -> pure (routed r))
-  pure Nil
+  served <- Server.serveUntil isStop l (\r -> pure (routed r))
+  pure (either (\err -> ["accept: " ^ Net.showError err]) (\u -> Nil) served)
 sides l at _ = askAll at Nil requests
 
 selfAt : {e : HFunctor}
@@ -222,3 +295,6 @@ self =
     (nt := \p -> InR (InL p))
     (web := \p -> InR (InR (InL p)))
     (th := \p -> InR (InR (InR (InL p))))
+
+crowded : Co world Unit
+crowded = crowdedProgram (io := \p -> InL p) (nt := \p -> InR (InL p))

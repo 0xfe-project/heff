@@ -483,35 +483,63 @@ serveConnection : {e : HFunctor}
                 -> Co e Bool
 serveConnection last handle c = bind (Net.peer c) (closedWith last handle c)
 
+-- (a connection accepted, served: whether `last` said a request was the
+-- last; where accepting failed, why)
 servedOn : {e : HFunctor}
          -> {{nt : Net.net <: e}}
          -> (Request -> Bool)
          -> (Request -> Co e Http.Response)
          -> Either Net.NetError Net.Connection
-         -> Co e Bool
-servedOn last handle (Left err) = pure False
-servedOn last handle (Right c) = serveConnection last handle c
+         -> Co e (Either Net.NetError Bool)
+servedOn last handle (Left err) = pure (Left err)
+servedOn last handle (Right c) =
+  bind (serveConnection last handle c) (\stop -> pure (Right stop))
+
+-- (the next connection, `again`; or the server done: `last` said so, or
+-- accepting failed)
+nextOr : {e : HFunctor}
+       -> (Unit -> Co e (Either Net.NetError Unit))
+       -> Either Net.NetError Bool
+       -> Co e (Either Net.NetError Unit)
+nextOr again (Left err) = pure (Left err)
+nextOr again (Right True) = pure (Right MkUnit)
+nextOr again (Right False) = again MkUnit
 
 -- | The listener's connections accepted, one at a time, and each one's
 -- | requests answered by `handle` (`serveConnection`), until `last` says
 -- | a request is the last: answered, its connection closed, and the
--- | listener left as it is.  A connection that fails to be accepted is
--- | let be.
+-- | listener left as it is, `Right`.  Where a connection fails to be
+-- | accepted -- the system out of descriptors (`EMFILE`), say -- the
+-- | server stops there, `Left` why, the listener left as it is: whether
+-- | to wait and serve again is its caller's to say.
 serveUntil : {e : HFunctor}
            -> {{nt : Net.net <: e}}
            -> (Request -> Bool)
            -> Net.Listener
            -> (Request -> Co e Http.Response)
-           -> Co e Unit
+           -> Co e (Either Net.NetError Unit)
 serveUntil last l handle = do
   a <- Net.accept l
-  stop <- servedOn last handle a
-  if stop then pure MkUnit else serveUntil last l handle
+  served <- servedOn last handle a
+  nextOr (\u -> serveUntil last l handle) served
 
--- | The listener's connections served, for ever.
+-- (a connection accepted, served, then `again`; where accepting failed,
+-- why)
+servedFor : {e : HFunctor}
+          -> {{nt : Net.net <: e}}
+          -> (Unit -> Co e Net.NetError)
+          -> (Request -> Co e Http.Response)
+          -> Either Net.NetError Net.Connection
+          -> Co e Net.NetError
+servedFor again handle (Left err) = pure err
+servedFor again handle (Right c) =
+  bind (serveConnection (\r -> False) handle c) (\stop -> again MkUnit)
+
+-- | The listener's connections served, until one fails to be accepted:
+-- | why, the listener left as it is (`serveUntil`).
 serve : {e : HFunctor}
       -> {{nt : Net.net <: e}}
       -> Net.Listener
       -> (Request -> Co e Http.Response)
-      -> Co e Unit
-serve l handle = serveUntil (\r -> False) l handle
+      -> Co e Net.NetError
+serve l handle = bind (Net.accept l) (servedFor (\u -> serve l handle) handle)

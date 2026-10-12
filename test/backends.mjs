@@ -388,7 +388,8 @@ if (process.platform !== "win32") checks.push((async () => {
 // head in parts, HTTP/1.0, `Expect: 100-continue`, a chunked body, no
 // request at all), and curl, two requests on one connection -- each
 // request said by the server as it answers it, until it is asked for
-// `/stop`
+// `/stop`; and stopped by a connection it cannot accept, with no
+// descriptor left
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
   const bytesOf = (n) => Buffer.from(Array.from({ length: 256 * n }, (_, i) => i % 256));
@@ -412,6 +413,16 @@ if (process.platform !== "win32") checks.push((async () => {
     ].join("\n") + "\n";
     if (r.status !== 0 || r.stderr || r.stdout !== want)
       msgs.push(`FAIL http server, self (c): status ${r.status}\n${r.stdout}${r.stderr}`);
+  }
+  // (no descriptor left for a connection accepted: the server stops, and
+  // says why, not trying again for ever)
+  const crowded = await programs.c("test/node/served.hf", "crowded");
+  if (crowded.error !== undefined) msgs.push(`FAIL http server, crowded (c): not compiled\n${crowded.error}`);
+  else {
+    const r = await run("sh", ["-c", 'ulimit -n 32 && exec "$0"', crowded.cmd], { timeout: 30000 });
+    const want = "connect: EMFILE\nserveUntil: EMFILE\nserve: EMFILE\n";
+    if (r.status !== 0 || r.stderr || r.stdout !== want)
+      msgs.push(`FAIL http server, crowded (c): status ${r.status}\n${r.stdout}${r.stderr}`);
   }
   const p = await programs.c("test/node/served.hf", "main");
   if (p.error !== undefined) return [...msgs, `FAIL http server (c): not compiled\n${p.error}`];
