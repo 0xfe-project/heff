@@ -263,9 +263,9 @@ prelude's `intEq`, a fixed-width type's builtin's, `int32Eq` and the
 others).
 
 ```haskell
-import uint8 as U8
+import uint8 as UInt8
 
--- | >>> U8.show (U8.add mask 255)
+-- | >>> UInt8.show (UInt8.add mask 255)
 -- | "239"
 mask : UInt8
 mask = 240
@@ -335,12 +335,12 @@ or a byte that starts none (as `TextDecoder` reads it), and shown a
 byte at a time, `"a\xff"`, as it is written back.
 
 ```haskell
-import rune as R
+import rune as Rune
 
 -- | >>> initials "héllo"
 -- | "Hé"
 initials : String -> String
-initials s = ofRunes (List.map R.toUpper (List.take 2 (runes s)))
+initials s = ofRunes (List.map Rune.toUpper (List.take 2 (runes s)))
 ```
 
 The module `rune` (`import rune as R`) has their comparisons (`eq`,

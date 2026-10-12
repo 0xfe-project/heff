@@ -3,15 +3,15 @@
 -- is read off the types, so the core is checked again, with the NbE.  The three judgments are one knot
 -- record, `ek`; this module's `bind` is its supply-and-failure monad's.
 
-import array as A
-import heff.util.dict as D
-import heff.elab.eval as EV
-import heff.elab.globals as G
-import heff.compile.ir as I
-import heff.elab.params as Pm
-import heff.elab.rules as RL
-import heff.elab.syntax as Sx
-import heff.elab.value as V
+import array as Array
+import heff.util.dict as Dict
+import heff.elab.eval as Eval
+import heff.elab.globals as Globals
+import heff.compile.ir as IR
+import heff.elab.params as Params
+import heff.elab.rules as Rules
+import heff.elab.syntax as Syntax
+import heff.elab.value as Value
 
 type M a = Int -> Either String (Pair a Int)
 
@@ -45,46 +45,54 @@ tryM m = \n -> tryTake n (m n)
 
 freshName : String -> M String
 freshName x = \n ->
-    Right (I.fresh (if strEq x "" || strEq x "_" then "x" else x) n)
+    Right (IR.fresh (if strEq x "" || strEq x "_" then "x" else x) n)
 
 -- | a local: what it is in the IR (nothing, if it was a type), its type
-type Local = { ir : Maybe I.Expr, ty : V.Ty }
+type Local = { ir : Maybe IR.Expr, ty : Value.Ty }
 
-mkLocal : Maybe I.Expr -> V.Ty -> Local
+mkLocal : Maybe IR.Expr -> Value.Ty -> Local
 mkLocal ir ty = { ir = ir, ty = ty }
 
 type Ctx =
-  { locals : List Local, env : V.Locals V.V, len : Int, globals : G.Globals }
+  { locals : List Local
+  , env : Value.Locals Value.V
+  , len : Int
+  , globals : Globals.Globals
+  }
 
-extend : Ctx -> Maybe I.Expr -> V.Ty -> Ctx
+extend : Ctx -> Maybe IR.Expr -> Value.Ty -> Ctx
 extend c ir ty =
   { locals = Cons (mkLocal ir ty) c.locals
-  , env = V.snocL c.env (V.local c.len ty)
+  , env = Value.snocL c.env (Value.local c.len ty)
   , len = c.len + 1
   , globals = c.globals
   }
 
-evalIn : Ctx -> Sx.Tm -> V.V
-evalIn c t = V.nom (EV.eval c.globals N t c.env)
+evalIn : Ctx -> Syntax.Tm -> Value.V
+evalIn c t = Value.nom (Eval.eval c.globals N t c.env)
 
 -- | does a type classify types (possibly type families): a universe, or
 -- | a function into one
-isType : Int -> V.Ty -> Bool
-isType lvl t = case V.behavior t of
+isType : Int -> Value.Ty -> Bool
+isType lvl t = case Value.behavior t of
   LikeU _ -> True
   LikeFunction level dom cod implicit ->
-    isType (lvl + 1) (V.nom (V.appClo cod (\u -> V.local lvl dom)))
+    isType (lvl + 1) (Value.nom (Value.appClo cod (\u -> Value.local lvl dom)))
   _ -> False
 
 -- | The type of field `l`: through the value's fields `fs` where they are
 -- | in hand (expanded once for a record's fields, not once each); else
 -- | each field before it a local of its own, if the type depends on none
 -- | of them
-projTyInWith : Int -> V.Ty -> Maybe (D.Dict (V.Ev V.V)) -> String -> M V.Ty
-projTyInWith len t fs l = case V.projTyWith t fs l of
+projTyInWith : Int
+             -> Value.Ty
+             -> Maybe (Dict.Dict (Value.Ev Value.V))
+             -> String
+             -> M Value.Ty
+projTyInWith len t fs l = case Value.projTyWith t fs l of
   Just ty -> pure ty
-  Nothing -> case V.behavior t of
-    LikeRecord level capture fieldTypes -> case RL.fieldTyApart
+  Nothing -> case Value.behavior t of
+    LikeRecord level capture fieldTypes -> case Rules.fieldTyApart
         len
         level
         capture
@@ -96,72 +104,81 @@ projTyInWith len t fs l = case V.projTyWith t fs l of
     _ -> failWith "projecting from something that is not of a record type"
 
 -- | as `projTyInWith`, the value given
-projTyIn : Int -> V.Ty -> V.V -> String -> M V.Ty
-projTyIn len t v l = projTyInWith len t (V.coerceToFieldsMaybe v) l
+projTyIn : Int -> Value.Ty -> Value.V -> String -> M Value.Ty
+projTyIn len t v l = projTyInWith len t (Value.coerceToFieldsMaybe v) l
 
 -- (a field of the value, its fields given if they are in hand)
-projWith : Maybe (D.Dict (V.Ev V.V)) -> V.V -> String -> V.Ev V.V
-projWith (Just fs) v l = D.elemAt fs l
-projWith Nothing v l = V.proj v l
+projWith : Maybe (Dict.Dict (Value.Ev Value.V))
+         -> Value.V
+         -> String
+         -> Value.Ev Value.V
+projWith (Just fs) v l = Dict.elemAt fs l
+projWith Nothing v l = Value.proj v l
 
 -- (field `k`'s type, of a record whose fields are not in hand: each field
 -- before it a local of its own)
-apartIn : Int -> String -> V.TB -> Maybe V.Ty
+apartIn : Int -> String -> Value.TB -> Maybe Value.Ty
 apartIn len k (LikeRecord level capture fieldTypes) =
-  RL.fieldTyApart len level capture fieldTypes k
+  Rules.fieldTyApart len level capture fieldTypes k
 apartIn len k _ = Nothing
 
-fieldTyOr : Int -> V.Ty -> String -> Maybe V.Ty -> Maybe V.Ty
+fieldTyOr : Int -> Value.Ty -> String -> Maybe Value.Ty -> Maybe Value.Ty
 fieldTyOr len t k (Just ty) = Just ty
-fieldTyOr len t k Nothing = apartIn len k (V.behavior t)
+fieldTyOr len t k Nothing = apartIn len k (Value.behavior t)
 
 -- (of the fields, by their types, those a record has where the program
 -- runs, in order: those that are not types, as a record built is erased;
 -- none said where a field's type is not known)
-keptOf : Int -> List String -> List (Pair String (Maybe V.Ty)) -> List String
+keptOf : Int
+       -> List String
+       -> List (Pair String (Maybe Value.Ty))
+       -> List String
 keptOf len acc Nil = List.reverse acc
 keptOf len acc (Cons (MkPair k (Just ty)) rest) =
   keptOf len (if isType len ty then acc else Cons k acc) rest
 keptOf len acc (Cons (MkPair k Nothing) rest) = Nil
 
-keysIn : V.TB -> List String
-keysIn (LikeRecord level capture fieldTypes) = A.toList fieldTypes.keys
+keysIn : Value.TB -> List String
+keysIn (LikeRecord level capture fieldTypes) = Array.toList fieldTypes.keys
 keysIn _ = Nil
 
-shapeWith : Int -> V.Ty -> Maybe (D.Dict (V.Ev V.V)) -> List String
+shapeWith : Int
+          -> Value.Ty
+          -> Maybe (Dict.Dict (Value.Ev Value.V))
+          -> List String
 shapeWith len t fs =
   keptOf
     len
     Nil
     (List.map
-       (\k -> MkPair k (fieldTyOr len t k (V.projTyWith t fs k)))
-       (keysIn (V.behavior t)))
+       (\k -> MkPair k (fieldTyOr len t k (Value.projTyWith t fs k)))
+       (keysIn (Value.behavior t)))
 
 -- | the labels of the fields a record of type `t`, the value `v`, has
 -- | where the program runs, in order: its shape, which a backend reads a
 -- | field at (`EProj`)
-shapeOfTy : Int -> V.Ty -> V.V -> List String
-shapeOfTy len t v = shapeWith len t (V.coerceToFieldsMaybe v)
+shapeOfTy : Int -> Value.Ty -> Value.V -> List String
+shapeOfTy len t v = shapeWith len t (Value.coerceToFieldsMaybe v)
 
 -- | a field's type, as a backend may lay the record out (#39): a type
 -- | with no rules here -- a variable's, one not known -- is any
-fieldTyOfB : V.TB -> I.FieldTy
+fieldTyOfB : Value.TB -> IR.FieldTy
 fieldTyOfB LikeFloat = FtFloat
 fieldTyOfB (LikeFixed w) = FtFixed w
 fieldTyOfB NoRules = FtAny
 fieldTyOfB _ = FtOther
 
-fieldTyOf : V.Ty -> I.FieldTy
-fieldTyOf t = fieldTyOfB (V.behavior t)
+fieldTyOf : Value.Ty -> IR.FieldTy
+fieldTyOf t = fieldTyOfB (Value.behavior t)
 
-matchVariants : V.Ty -> M (Pm.Variants (Pm.Th V.Ty))
-matchVariants sty = case V.behavior sty of
+matchVariants : Value.Ty -> M (Params.Variants (Params.Th Value.Ty))
+matchVariants sty = case Value.behavior sty of
   LikeSum vs -> pure vs
   _ -> failWith "matching on something that is not of a sum type"
 
-argTysOf : Pm.Variants (Pm.Th V.Ty) -> String -> List V.Ty
-argTysOf vs tag = case D.lookup vs tag of
-  Just ts -> List.map (\t -> Pm.forceTh t) (A.toList ts)
+argTysOf : Params.Variants (Params.Th Value.Ty) -> String -> List Value.Ty
+argTysOf vs tag = case Dict.lookup vs tag of
+  Just ts -> List.map (\t -> Params.forceTh t) (Array.toList ts)
   Nothing -> Nil
 
 type Bound = { c : Ctx, vars : List String }
@@ -170,7 +187,7 @@ zipE : {a b : Type} -> List a -> List b -> List (Pair a b)
 zipE (Cons x xs) (Cons y ys) = Cons (MkPair x y) (zipE xs ys)
 zipE _ _ = Nil
 
-armBindGo : Bound -> List (Pair String V.Ty) -> M Bound
+armBindGo : Bound -> List (Pair String Value.Ty) -> M Bound
 armBindGo acc Nil = pure { c = acc.c, vars = List.reverse acc.vars }
 armBindGo acc (Cons (MkPair x aty) rest) =
   if isType acc.c.len aty
@@ -183,25 +200,29 @@ armBindGo acc (Cons (MkPair x aty) rest) =
 
 -- (an alternative's context: its pattern's variables bound, the type
 -- arguments erased)
-armBind : Ctx -> Pm.Variants (Pm.Th V.Ty) -> String -> List String -> M Bound
+armBind : Ctx
+        -> Params.Variants (Params.Th Value.Ty)
+        -> String
+        -> List String
+        -> M Bound
 armBind c vs tag xs =
   armBindGo { c = c, vars = Nil } (zipE xs (argTysOf vs tag))
 
 -- | the judgments, knotted
 type EK =
-  { chkD : Ctx -> Sx.Tm -> V.Ty -> V.V -> M I.Expr
-  , chk : Ctx -> Sx.Tm -> V.Ty -> M I.Expr
-  , syn : Ctx -> Sx.Tm -> M (Pair I.Expr V.Ty)
+  { chkD : Ctx -> Syntax.Tm -> Value.Ty -> Value.V -> M IR.Expr
+  , chk : Ctx -> Syntax.Tm -> Value.Ty -> M IR.Expr
+  , syn : Ctx -> Syntax.Tm -> M (Pair IR.Expr Value.Ty)
   }
 
 armOf : EK
       -> Ctx
-      -> Pm.Variants (Pm.Th V.Ty)
-      -> V.Ty
-      -> Pair String (Pair (Array String) Sx.Tm)
-      -> M I.Arm
+      -> Params.Variants (Params.Th Value.Ty)
+      -> Value.Ty
+      -> Pair String (Pair (Array String) Syntax.Tm)
+      -> M IR.Arm
 armOf r c vs ty (MkPair tag (MkPair xs body)) = do
-  b0 <- armBind c vs tag (A.toList xs)
+  b0 <- armBind c vs tag (Array.toList xs)
   b <- r.chk b0.c body ty
   pure (MkArm tag b0.vars b)
 
@@ -209,12 +230,12 @@ armOf r c vs ty (MkPair tag (MkPair xs body)) = do
 -- can say it)
 armsTy : EK
        -> Ctx
-       -> Pm.Variants (Pm.Th V.Ty)
-       -> List (Pair String (Pair (Array String) Sx.Tm))
-       -> M V.Ty
+       -> Params.Variants (Params.Th Value.Ty)
+       -> List (Pair String (Pair (Array String) Syntax.Tm))
+       -> M Value.Ty
 armsTy r c vs Nil = failWith "this needs an expected type"
 armsTy r c vs (Cons (MkPair tag (MkPair xs body)) tail) = do
-  b0 <- armBind c vs tag (A.toList xs)
+  b0 <- armBind c vs tag (Array.toList xs)
   m <- tryM (r.syn b0.c body)
   case m of
     Just (MkPair _ ty) -> pure ty
@@ -237,17 +258,17 @@ catMaybesE Nil = Nil
 catMaybesE (Cons (Just x) xs) = Cons x (catMaybesE xs)
 catMaybesE (Cons Nothing xs) = catMaybesE xs
 
-lamParts : Sx.Abs Sx.Tm -> Pair (Pair String Bool) Sx.Tm
+lamParts : Syntax.Abs Syntax.Tm -> Pair (Pair String Bool) Syntax.Tm
 lamParts (MkAbs n b) = MkPair (MkPair n True) b
 lamParts (AbsConst b) = MkPair (MkPair "_" False) b
 
-synF : EK -> Ctx -> Sx.Tm -> M (Pair I.Expr V.Ty)
+synF : EK -> Ctx -> Syntax.Tm -> M (Pair IR.Expr Value.Ty)
 synF r c (SLocal i) = case nthLocal c.locals i of
   Just l -> case l.ir of
     Just x -> pure (MkPair x l.ty)
     Nothing -> failWith "a type used as a value"
   Nothing -> failWith "an unbound local"
-synF r c (SGlobal x) = case G.lookupEntry c.globals x of
+synF r c (SGlobal x) = case Globals.lookupEntry c.globals x of
   Just e ->
     if isType 0 e.type_ then failWith ("the type " ^ x ^ " used as a value")
     else pure (MkPair (EGlobal x) e.type_)
@@ -255,16 +276,17 @@ synF r c (SGlobal x) = case G.lookupEntry c.globals x of
 synF r c (SApp f a) = do
   pf <- r.syn c f
   case pf of
-    MkPair f' fty -> case V.behavior fty of
+    MkPair f' fty -> case Value.behavior fty of
       LikeFunction level dom cod implicit ->
         if isType c.len dom
-          then pure (MkPair f' (V.nom (V.appClo cod (\u -> evalIn c a))))
+          then pure
+              (MkPair f' (Value.nom (Value.appClo cod (\u -> evalIn c a))))
         else do
           a' <- r.chk c a dom
           pure
               (MkPair
                  (EApp f' (Cons a' Nil))
-                 (V.nom (V.appClo cod (\u -> evalIn c a))))
+                 (Value.nom (Value.appClo cod (\u -> evalIn c a))))
       _ -> failWith "applying something that is not a function"
 synF r c (SProj e l) = do
   pe <- r.syn c e
@@ -277,14 +299,14 @@ synF r c (SProj e l) = do
              fty)
 -- a lambda says its type
 synF r c (SLam ty abs) = do
-  t' <- r.chk c (SLam ty abs) (V.nom (EV.evalTy c.globals N ty c.env))
-  pure (MkPair t' (V.nom (EV.evalTy c.globals N ty c.env)))
+  t' <- r.chk c (SLam ty abs) (Value.nom (Eval.evalTy c.globals N ty c.env))
+  pure (MkPair t' (Value.nom (Eval.evalTy c.globals N ty c.env)))
 synF r c (SIs t2) = r.syn c t2
 synF r c (SRec t2) = r.syn c t2
 -- a local definition says its type
 synF r c (SFix ty abs) = do
-  t' <- r.chk c (SFix ty abs) (V.nom (EV.evalTy c.globals N ty c.env))
-  pure (MkPair t' (V.nom (EV.evalTy c.globals N ty c.env)))
+  t' <- r.chk c (SFix ty abs) (Value.nom (Eval.evalTy c.globals N ty c.env))
+  pure (MkPair t' (Value.nom (Eval.evalTy c.globals N ty c.env)))
 synF r c (SImplicit _ t2) = r.syn c t2
 synF r c (SLitInt i) = pure (MkPair (EInt i) VPrimInt)
 synF r c (SLitFloat x) = pure (MkPair (EFloat x) VPrimFloat)
@@ -294,8 +316,8 @@ synF r c (SLitBytes s) =
   pure
     (MkPair
        (EBytes s)
-       (V.nom
-          (EV.evalTy c.globals N (SDecode (SGlobal "prelude.Bytes")) c.env)))
+       (Value.nom
+          (Eval.evalTy c.globals N (SDecode (SGlobal "prelude.Bytes")) c.env)))
 -- (a rune is, where it runs, the `Int32` of its code point)
 synF r c (SLitRune n) = pure (MkPair (EFixed I32 n) VPrimRune)
 synF r c (SLitFixed w n) = pure (MkPair (EFixed w n) (VFixed w))
@@ -307,31 +329,31 @@ synF r c (SMatch scrut cases) = do
   case ps of
     MkPair s' sty -> do
       vs <- matchVariants sty
-      ty <- armsTy r c vs (D.toList cases)
-      arms <- traverseM (\p -> armOf r c vs ty p) (D.toList cases)
+      ty <- armsTy r c vs (Dict.toList cases)
+      arms <- traverseM (\p -> armOf r c vs ty p) (Dict.toList cases)
       pure (MkPair (EMatch s' arms) ty)
 synF r c t = failWith "this needs an expected type"
 
-chkLam : EK -> Ctx -> Sx.Abs Sx.Tm -> V.Ty -> M I.Expr
-chkLam r c abs ty = case V.behavior ty of
+chkLam : EK -> Ctx -> Syntax.Abs Syntax.Tm -> Value.Ty -> M IR.Expr
+chkLam r c abs ty = case Value.behavior ty of
   LikeFunction level dom cod implicit -> case lamParts abs of
     MkPair (MkPair hint bound) body ->
       if isType c.len dom
         then r.chk
             (if bound then extend c Nothing dom else c)
             body
-            (V.nom (V.appClo cod (\u -> V.local c.len dom)))
+            (Value.nom (Value.appClo cod (\u -> Value.local c.len dom)))
       else do
         v <- freshName hint
         b <-
           r.chk
             (if bound then extend c (Just (EVar v)) dom else c)
             body
-            (V.nom (V.appClo cod (\u -> V.local c.len dom)))
+            (Value.nom (Value.appClo cod (\u -> Value.local c.len dom)))
         pure (ELam (Cons v Nil) b)
   _ -> failWith "a function checked against a non-function type"
 
-chkTagArg : EK -> Ctx -> Pair Sx.Tm V.Ty -> M (Maybe I.Expr)
+chkTagArg : EK -> Ctx -> Pair Syntax.Tm Value.Ty -> M (Maybe IR.Expr)
 chkTagArg r c (MkPair a aty) =
   if isType c.len aty then pure Nothing
   else do
@@ -339,24 +361,24 @@ chkTagArg r c (MkPair a aty) =
     pure (Just a')
 
 type RecAcc =
-  { vs : List V.V, out : List (Pair String I.Expr), tys : List I.FieldTy }
+  { vs : List Value.V, out : List (Pair String IR.Expr), tys : List IR.FieldTy }
 
 chkFieldsGo : EK
             -> Ctx
-            -> V.Locals V.V
-            -> D.Dict (V.Locals V.V -> V.Field)
+            -> Value.Locals Value.V
+            -> Dict.Dict (Value.Locals Value.V -> Value.Field)
             -> RecAcc
-            -> List (Pair String Sx.Tm)
-            -> M I.Expr
+            -> List (Pair String Syntax.Tm)
+            -> M IR.Expr
 chkFieldsGo r c capture fieldTypes acc Nil =
   pure (ERecord (List.reverse acc.out) (List.reverse acc.tys))
-chkFieldsGo r c capture fieldTypes acc (Cons (MkPair l fe) tail) = case V.typeForProjection
+chkFieldsGo r c capture fieldTypes acc (Cons (MkPair l fe) tail) = case Value.typeForProjection
     capture
     fieldTypes
     l
     { keys = fieldTypes.keys
     , byName = fieldTypes.byName
-    , values = A.fromList (List.reverse acc.vs)
+    , values = Array.fromList (List.reverse acc.vs)
     } of
   MkField fty fvalue ->
     -- a type field is static only
@@ -381,7 +403,7 @@ chkFieldsGo r c capture fieldTypes acc (Cons (MkPair l fe) tail) = case V.typeFo
           }
           tail
 
-chkF : EK -> Ctx -> Sx.Tm -> V.Ty -> M I.Expr
+chkF : EK -> Ctx -> Syntax.Tm -> Value.Ty -> M IR.Expr
 chkF r c (SIs t') ty = r.chk c t' ty
 chkF r c (SRec t') ty = r.chk c t' ty
 -- (the definition itself, bound in its body: `EFix`, lifted to a
@@ -394,17 +416,19 @@ chkF r c (SFix _ (AbsConst body)) ty = r.chk c body ty
 chkF r c (SImplicit _ t') ty = r.chk c t' ty
 chkF r c (SLam _ abs) ty = chkLam r c abs ty
 chkF r c (SPrim x) ty = pure (EPrim x)
-chkF r c (STag x args) ty = case V.behavior ty of
-  LikeSum vs -> case D.lookup vs x of
+chkF r c (STag x args) ty = case Value.behavior ty of
+  LikeSum vs -> case Dict.lookup vs x of
     Just ts -> do
       out <-
         traverseM
           (\p -> chkTagArg r c p)
-          (zipE (A.toList args) (List.map (\t2 -> Pm.forceTh t2) (A.toList ts)))
+          (zipE
+             (Array.toList args)
+             (List.map (\t2 -> Params.forceTh t2) (Array.toList ts)))
       pure (ETag x (catMaybesE out))
     Nothing -> failWith ("no tag " ^ x)
   _ -> failWith "a tag checked against a non-sum type"
-chkF r c (SCons d) ty = case V.behavior ty of
+chkF r c (SCons d) ty = case Value.behavior ty of
   LikeRecord level capture fieldTypes ->
     chkFieldsGo
       r
@@ -412,14 +436,14 @@ chkF r c (SCons d) ty = case V.behavior ty of
       capture
       fieldTypes
       { vs = Nil, out = Nil, tys = Nil }
-      (D.toList d)
+      (Dict.toList d)
   _ -> failWith "a record checked against a non-record type"
 chkF r c (SMatch scrut cases) ty = do
   ps <- r.syn c scrut
   case ps of
     MkPair s' sty -> do
       vs <- matchVariants sty
-      arms <- traverseM (\p -> armOf r c vs ty p) (D.toList cases)
+      arms <- traverseM (\p -> armOf r c vs ty p) (Dict.toList cases)
       pure (EMatch s' arms)
 chkF r c SAbandon ty = pure EAbandon
 chkF r c SOpaque ty = failWith "an opaque term"
@@ -431,26 +455,26 @@ chkF r c t ty = do
 
 chkDField : EK
           -> Ctx
-          -> V.Ty
-          -> V.V
-          -> Maybe (D.Dict (V.Ev V.V))
-          -> Pair String Sx.Tm
-          -> M (Maybe (Pair (Pair String I.Expr) I.FieldTy))
+          -> Value.Ty
+          -> Value.V
+          -> Maybe (Dict.Dict (Value.Ev Value.V))
+          -> Pair String Syntax.Tm
+          -> M (Maybe (Pair (Pair String IR.Expr) IR.FieldTy))
 chkDField r c ty v fs (MkPair l fe) = do
   fty <- projTyInWith c.len ty fs l
   if isType c.len fty then pure Nothing
     else do
-      e <- r.chkD c fe fty (V.nom (projWith fs v l))
+      e <- r.chkD c fe fty (Value.nom (projWith fs v l))
       pure (Just (MkPair (MkPair l e) (fieldTyOf fty)))
 
 -- (a record's fields, its value's fields expanded once for them all)
 chkDFields : EK
            -> Ctx
-           -> V.Ty
-           -> V.V
-           -> List (Pair String Sx.Tm)
-           -> Maybe (D.Dict (V.Ev V.V))
-           -> M I.Expr
+           -> Value.Ty
+           -> Value.V
+           -> List (Pair String Syntax.Tm)
+           -> Maybe (Dict.Dict (Value.Ev Value.V))
+           -> M IR.Expr
 chkDFields r c ty v ps fs = do
   fields <- traverseM (\p -> chkDField r c ty v fs p) ps
   pure
@@ -460,29 +484,29 @@ chkDFields r c ty v ps fs = do
 
 -- | a definition's own syntax, whose value `v` is known: under its
 -- | lambdas and through its record's fields the value is followed along
-chkDF : EK -> Ctx -> Sx.Tm -> V.Ty -> V.V -> M I.Expr
-chkDF r c t@(SLam _ abs) ty v = case V.behavior ty of
+chkDF : EK -> Ctx -> Syntax.Tm -> Value.Ty -> Value.V -> M IR.Expr
+chkDF r c t@(SLam _ abs) ty v = case Value.behavior ty of
   LikeFunction level dom cod implicit -> case lamParts abs of
     MkPair (MkPair hint bound) body ->
       if isType c.len dom
         then r.chkD
             (if bound then extend c Nothing dom else c)
             body
-            (V.nom (V.appClo cod (\u -> V.local c.len dom)))
-            (V.nom (V.app v (\u -> V.local c.len dom)))
+            (Value.nom (Value.appClo cod (\u -> Value.local c.len dom)))
+            (Value.nom (Value.app v (\u -> Value.local c.len dom)))
       else do
         n <- freshName hint
         b <-
           r.chkD
             (if bound then extend c (Just (EVar n)) dom else c)
             body
-            (V.nom (V.appClo cod (\u -> V.local c.len dom)))
-            (V.nom (V.app v (\u -> V.local c.len dom)))
+            (Value.nom (Value.appClo cod (\u -> Value.local c.len dom)))
+            (Value.nom (Value.app v (\u -> Value.local c.len dom)))
         pure (ELam (Cons n Nil) b)
   _ -> r.chk c t ty
-chkDF r c t@(SCons d) ty v = case V.behavior ty of
+chkDF r c t@(SCons d) ty v = case Value.behavior ty of
   LikeRecord level capture fieldTypes ->
-    chkDFields r c ty v (D.toList d) (V.coerceToFieldsMaybe v)
+    chkDFields r c ty v (Dict.toList d) (Value.coerceToFieldsMaybe v)
   _ -> r.chk c t ty
 chkDF r c t ty v = r.chk c t ty
 
@@ -494,11 +518,11 @@ ek =
   }
 
 -- | (the definition itself is local 0)
-definition : G.Globals -> String -> G.Entry -> M I.Expr
+definition : Globals.Globals -> String -> Globals.Entry -> M IR.Expr
 definition g key e =
   ek.chkD
     { locals = Cons (mkLocal (Just (EGlobal key)) e.type_) Nil
-    , env = V.snocL LNil e.value
+    , env = Value.snocL LNil e.value
     , len = 1
     , globals = g
     }
@@ -506,14 +530,14 @@ definition g key e =
     e.type_
     e.value
 
-type Erased = { defs : List I.Def, errors : List String, supply : Int }
+type Erased = { defs : List IR.Def, errors : List String, supply : Int }
 
-eraseOne : G.Globals -> Erased -> Pair String G.Entry -> Erased
+eraseOne : Globals.Globals -> Erased -> Pair String Globals.Entry -> Erased
 eraseOne g acc (MkPair key e) =
   if isType 0 e.type_ then acc
   else case definition g key e acc.supply of
     Right (MkPair body n) ->
-      { defs = Cons (I.mkDef key key body) acc.defs
+      { defs = Cons (IR.mkDef key key body) acc.defs
       , errors = acc.errors
       , supply = n
       }
@@ -532,12 +556,12 @@ eraseDone acc =
 
 -- | a program's definitions, in order; the types among them are gone.
 -- | What cannot be lowered is said, by key.
--- | >>> List.length (eraseProgram G.emptyGlobals).defs
+-- | >>> List.length (eraseProgram Globals.emptyGlobals).defs
 -- | 0
-eraseProgram : G.Globals -> Erased
+eraseProgram : Globals.Globals -> Erased
 eraseProgram g =
   eraseDone
     (List.foldl
        (\acc p -> eraseOne g acc p)
        { defs = Nil, errors = Nil, supply = 0 }
-       (G.globalsList g))
+       (Globals.globalsList g))

@@ -3,71 +3,81 @@
 -- settled together, unsolved metavariables reported.  `do` here is
 -- src/heff/elab/environment.hf's `bind`.
 
-import array as A
+import array as Array
 import co
-import exn as X
-import heff.elab.conversion as C
+import exn as Exn
+import heff.elab.conversion as Conversion
 import heff.syntax.diagnostic
 import heff.elab.environment
-import heff.elab.eval as EV
-import heff.elab.globals as G
-import heff.elab.params as P
-import heff.elab.readback as R
-import heff.elab.syntax as Sx
-import heff.elab.unify as U
-import heff.elab.value as V
-import map as M
-import state as S
+import heff.elab.eval as Eval
+import heff.elab.globals as Globals
+import heff.elab.params as Params
+import heff.elab.readback as Readback
+import heff.elab.syntax as Syntax
+import heff.elab.unify as Unify
+import heff.elab.value as Value
+import map as Map
+import state as State
 
-force : V.V -> Elab V.V
-force v = gets (\c -> V.forceEl c.metas v)
+force : Value.V -> Elab Value.V
+force v = gets (\c -> Value.forceEl c.metas v)
 
-forceT : V.Ty -> Elab V.Ty
-forceT t = gets (\c -> V.forceTy c.metas t)
+forceT : Value.Ty -> Elab Value.Ty
+forceT t = gets (\c -> Value.forceTy c.metas t)
 
 liftTake : {a : Type}
-         -> Pair (Either C.EqErr a) StCore
-         -> Elab (Either C.EqErr a)
+         -> Pair (Either Conversion.EqErr a) StCore
+         -> Elab (Either Conversion.EqErr a)
 liftTake (MkPair r c2) = bind (putSt c2) (\u -> val r)
 
 -- | a unification, in elaboration: run on the core state, by itself
 -- | (it has no other effect), its failure a value
-liftU : {a : Type} -> Co U.uW a -> Elab (Either C.EqErr a)
-liftU u = bind (gets (\c -> U.runU u c)) liftTake
+liftU : {a : Type} -> Co Unify.uW a -> Elab (Either Conversion.EqErr a)
+liftU u = bind (gets (\c -> Unify.runU u c)) liftTake
 
-unifyTy : G.Globals -> P.CtxShape -> V.Ty -> V.Ty -> Elab (Either C.EqErr Unit)
-unifyTy g cs a b = liftU (U.uTy (ms := U.msEv) (uf := U.ufEv) g cs a b)
+unifyTy : Globals.Globals
+        -> Params.CtxShape
+        -> Value.Ty
+        -> Value.Ty
+        -> Elab (Either Conversion.EqErr Unit)
+unifyTy g cs a b =
+  liftU (Unify.uTy (ms := Unify.msEv) (uf := Unify.ufEv) g cs a b)
 
-unifyEl : G.Globals -> P.CtxShape -> V.V -> V.V -> Elab (Either C.EqErr Unit)
-unifyEl g cs a b = liftU (U.uEl (ms := U.msEv) (uf := U.ufEv) g cs a b)
+unifyEl : Globals.Globals
+        -> Params.CtxShape
+        -> Value.V
+        -> Value.V
+        -> Elab (Either Conversion.EqErr Unit)
+unifyEl g cs a b =
+  liftU (Unify.uEl (ms := Unify.msEv) (uf := Unify.ufEv) g cs a b)
 
-blockedFlex : M.Map Int Unit -> V.Ty -> Bool
-blockedFlex ps a = case U.flexTy a of
-  Just (MkPair m _) -> M.member compareInt m ps
+blockedFlex : Map.Map Int Unit -> Value.Ty -> Bool
+blockedFlex ps a = case Unify.flexTy a of
+  Just (MkPair m _) -> Map.member compareInt m ps
   Nothing -> False
 
 -- | is a type one nothing can be asked of, for an error elsewhere: an
 -- | error hole's, or a metavariable an error hole kept from being solved?
-blockedTy : V.Ty -> Elab Bool
+blockedTy : Value.Ty -> Elab Bool
 blockedTy a0 = do
   a <- forceT a0
-  gets (\c -> V.isErrorTy a || blockedFlex c.poisoned a)
+  gets (\c -> Value.isErrorTy a || blockedFlex c.poisoned a)
 
-type Unsolved = { name : String, span : P.Span }
+type Unsolved = { name : String, span : Params.Span }
 
-keepUnsolved : List Unsolved -> V.MetaEntry -> List Unsolved
+keepUnsolved : List Unsolved -> Value.MetaEntry -> List Unsolved
 keepUnsolved acc e@{ sol = Nothing } = Cons { name = e.name, span = e.span } acc
 keepUnsolved acc { sol = Just _ } = acc
 
 -- | the metavariables that were created and never solved
 unsolvedMetas : Elab (List Unsolved)
 unsolvedMetas =
-  gets (\c -> List.reverse (List.foldl keepUnsolved Nil (M.values c.metas)))
+  gets (\c -> List.reverse (List.foldl keepUnsolved Nil (Map.values c.metas)))
 
 -- Postponed problems and delayed checks
 --------------------------------------------------------------------------------
 
-keepFailed : Postponed -> Either C.EqErr Unit -> Elab Unit
+keepFailed : Postponed -> Either Conversion.EqErr Unit -> Elab Unit
 keepFailed p (Left _) =
   modify
     (\c ->
@@ -88,8 +98,8 @@ undoTo before c =
 undoIfFailed : {a : Type}
              -> StCore
              -> Saved
-             -> Either C.EqErr a
-             -> Elab (Either C.EqErr a)
+             -> Either Conversion.EqErr a
+             -> Elab (Either Conversion.EqErr a)
 undoIfFailed before waiting (Right x) = pure (Right x)
 undoIfFailed before waiting (Left err) = do
   modify (undoTo before)
@@ -100,23 +110,32 @@ undoIfFailed before waiting (Left err) = do
 -- | metavariables it solved or made, the problems it postponed, the
 -- | checks it left waiting -- for what is tried next to start from what
 -- | was there before (#19)
-attempt : {a : Type} -> Elab (Either C.EqErr a) -> Elab (Either C.EqErr a)
+attempt : {a : Type}
+        -> Elab (Either Conversion.EqErr a)
+        -> Elab (Either Conversion.EqErr a)
 attempt m = do
   before <- gets (\c -> c)
   waiting <- saveDelayed
   r <- m
   undoIfFailed before waiting r
 
-retryEach : G.Globals -> List Postponed -> Elab Unit
+retryEach : Globals.Globals -> List Postponed -> Elab Unit
 retryEach g Nil = pure MkUnit
 retryEach g (Cons p rest) = do
   r <-
     attempt
-      (liftU (U.uEl (ms := U.msEv) (uf := U.ufEv) g p.shape p.left p.right))
+      (liftU
+         (Unify.uEl
+            (ms := Unify.msEv)
+            (uf := Unify.ufEv)
+            g
+            p.shape
+            p.left
+            p.right))
   keepFailed p r
   retryEach g rest
 
-retryGo : G.Globals -> Int -> Elab (List Postponed)
+retryGo : Globals.Globals -> Int -> Elab (List Postponed)
 retryGo g fuel = do
   ps <- gets (\c -> List.reverse c.postponed)
   modify (setPostponed Nil)
@@ -129,14 +148,14 @@ retryGo g fuel = do
 -- | Retry the postponed problems until no more are solved; a problem
 -- | that fails outright is kept, to be reported as stuck: it holds the
 -- | contradiction.
-retryPostponed : G.Globals -> Elab (List Postponed)
+retryPostponed : Globals.Globals -> Elab (List Postponed)
 retryPostponed g = retryGo g 0
 
-delayedReady : V.MetaCtx -> Bool -> Delayed ElabSt -> Bool
+delayedReady : Value.MetaCtx -> Bool -> Delayed ElabSt -> Bool
 delayedReady mc all (MkDelayed ty chk) =
-  all || not (U.isFlexTy (V.forceTy mc ty))
+  all || not (Unify.isFlexTy (Value.forceTy mc ty))
 
-anyDelayed : V.MetaCtx -> List (Delayed ElabSt) -> Bool
+anyDelayed : Value.MetaCtx -> List (Delayed ElabSt) -> Bool
 anyDelayed mc Nil = False
 anyDelayed mc (Cons d rest) = delayedReady mc False d || anyDelayed mc rest
 
@@ -224,11 +243,11 @@ resolveS final = \st ->
              (Right (resolveAny rs))
              (withWanted (\w -> List.append w (resolveKept rs)) st2))
 
-stateAlg : {a : Type} -> S.StateF StCore Step a -> Step a
+stateAlg : {a : Type} -> State.StateF StCore Step a -> Step a
 stateAlg (Get k) = \st -> MkPair (Right (k (core st))) st
 stateAlg (Put c x) = \st -> MkPair (Right x) (withCore (\old -> c) st)
 
-exnAlg : {a : Type} -> X.ExnF Diag Step a -> Step a
+exnAlg : {a : Type} -> Exn.ExnF Diag Step a -> Step a
 exnAlg (Throw d) = \st -> MkPair (Left d) st
 exnAlg (Catch c h) = \st -> catchStep h (c st)
 
@@ -255,12 +274,12 @@ notesAlg (Trace ev x) = \st -> MkPair (Right x) (withCore (pushTrace ev) st)
 notesAlg (Record i x) = \st -> MkPair (Right x) (withCore (pushInfo i) st)
 
 -- (the sum, one level at a time: `((state <+> exn) <+> defer) <+> notes`)
-alg2 : {a : Type} -> SumF (S.StateF StCore) (X.ExnF Diag) Step a -> Step a
+alg2 : {a : Type} -> SumF (State.StateF StCore) (Exn.ExnF Diag) Step a -> Step a
 alg2 (InL t) = stateAlg t
 alg2 (InR q) = exnAlg q
 
 alg3 : {a : Type}
-     -> SumF (SumF (S.StateF StCore) (X.ExnF Diag)) DeferF Step a
+     -> SumF (SumF (State.StateF StCore) (Exn.ExnF Diag)) DeferF Step a
      -> Step a
 alg3 (InL p) = alg2 p
 alg3 (InR q) = deferAlg q
@@ -292,7 +311,7 @@ runDelayed all = wake all
 resolveWanteds : Bool -> Elab Bool
 resolveWanteds final = resolve final
 
-settleGo : G.Globals -> Int -> Elab (List Postponed)
+settleGo : Globals.Globals -> Int -> Elab (List Postponed)
 settleGo g fuel = do
   runDelayed False
   retryPostponed g
@@ -307,34 +326,34 @@ settleGo g fuel = do
 
 -- | Let the postponed problems and the delayed checks feed one another
 -- | until neither moves; then force what is left, and retry once more.
-settle : G.Globals -> Elab (List Postponed)
+settle : Globals.Globals -> Elab (List Postponed)
 settle g = settleGo g 0
 
--- >>> List.length (M.values (M.insert compareInt 1 "a" M.empty))
+-- >>> List.length (Map.values (Map.insert compareInt 1 "a" Map.empty))
 -- 1
 
 -- | >>> resultOf (runE (bind (val 20) (\x -> val (x + 22))) emptySt)
 -- | 42
--- | >>> resultOf (runE (bind (failWith (a := Int) P.noSpan 8 "no") (\x -> val 1)) emptySt)
+-- | >>> resultOf (runE (bind (failWith (a := Int) Params.noSpan 8 "no") (\x -> val 1)) emptySt)
 -- | -1
 resultOf : Pair (Either Diag Int) ElabSt -> Int
 resultOf (MkPair (Right n) _) = n
 resultOf (MkPair (Left _) _) = 0 - 1
 
 -- (a unification that makes a metavariable, then fails)
-madeThenFailed : Elab (Either C.EqErr Int)
+madeThenFailed : Elab (Either Conversion.EqErr Int)
 madeThenFailed =
   bind
     (liftU
-       (U.newMetaFrom
-          (ms := U.msEv)
-          (uf := U.ufEv)
+       (Unify.newMetaFrom
+          (ms := Unify.msEv)
+          (uf := Unify.ufEv)
           { ty = VPrimInt
           , sol = Nothing
           , solStx = Nothing
           , arity = 0
           , name = "m"
-          , span = P.noSpan
+          , span = Params.noSpan
           }
           0
           VPrimInt))
@@ -346,4 +365,4 @@ madeThenFailed =
 -- | >>> metaCount (runE madeThenFailed emptySt)
 -- | 1
 metaCount : {a : Type} -> Pair (Either Diag a) ElabSt -> Int
-metaCount (MkPair _ st) = M.size (core st).metas
+metaCount (MkPair _ st) = Map.size (core st).metas

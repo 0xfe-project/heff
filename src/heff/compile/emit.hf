@@ -13,17 +13,17 @@
 -- Arguments are evaluated before the call (call-by-value); the
 -- interpreter is lazy.
 
-import heff.elab.effect as Ef
-import heff.compile.facts as F
-import heff.elab.fixed as Fx
-import heff.elab.globals as G
-import heff.compile.imperative as Mp
-import heff.compile.ir as I
-import heff.compile.irtext as Ir
-import heff.compile.lower as L
-import heff.compile.prims as Pr
-import heff.compile.simplify as Si
-import map as M
+import heff.elab.effect as Effect
+import heff.compile.facts as Facts
+import heff.elab.fixed as Fixed
+import heff.elab.globals as Globals
+import heff.compile.imperative as Imperative
+import heff.compile.ir as IR
+import heff.compile.irtext as IRText
+import heff.compile.lower as Lower
+import heff.compile.prims as Prims
+import heff.compile.simplify as Simplify
+import map as Map
 
 type Output = { source : String, errors : List String }
 
@@ -276,21 +276,21 @@ shortName k = fromMaybe k (List.last (split "." k))
 type GInfo = { js : String, arity : Int, lazy : Bool, bounce : Bool }
 
 -- | a global as a value
-ref : M.Map String GInfo -> String -> String
-ref gs k = case M.lookup compareString k gs of
+ref : Map.Map String GInfo -> String -> String
+ref gs k = case Map.lookup compareString k gs of
   Just i ->
     if i.arity >= 2 then i.js ^ "$c" else if i.lazy then i.js ^ "()" else i.js
   Nothing -> "undefined"
 
 -- | the globals a definition uses as values (not called at once)
-valueRefs : Mp.Def -> List String
+valueRefs : Imperative.Def -> List String
 valueRefs d =
   catMaybesL
     (List.map
        (\p -> case p of
         PartVal (SGlobal g) -> Just g
         _ -> Nothing)
-       (Mp.partsOf d))
+       (Imperative.partsOf d))
 
 -- Tail calls
 --------------------------------------------------------------------------------
@@ -332,11 +332,11 @@ type Code = { code : String, prec : Int }
 -- | (`inl`: the names whose one use computes them, by their code: see
 -- | `inlined`)
 type Env =
-  { gs : M.Map String GInfo
-  , names : M.Map String String
-  , used : M.Map String Unit
+  { gs : Map.Map String GInfo
+  , names : Map.Map String String
+  , used : Map.Map String Unit
   , self : Maybe Self
-  , inl : M.Map String Code
+  , inl : Map.Map String Code
   }
 
 noSelf : Env -> Env
@@ -355,8 +355,8 @@ withSelf s env =
 bound : String -> String -> Env -> Env
 bound x v env =
   { gs = env.gs
-  , names = M.insert compareString x v env.names
-  , used = M.insert compareString v MkUnit env.used
+  , names = Map.insert compareString x v env.names
+  , used = Map.insert compareString v MkUnit env.used
   , self = env.self
   , inl = env.inl
   }
@@ -365,14 +365,17 @@ type BoundN = { js : String, env : Env }
 
 bindFrom : Env -> String -> String -> Int -> BoundN
 bindFrom env x base i =
-  if M.member compareString (if i == 0 then base else base ^ showInt i) env.used
+  if Map.member
+    compareString
+    (if i == 0 then base else base ^ showInt i)
+    env.used
     then bindFrom env x base (i + 1)
   else { js = if i == 0 then base else base ^ showInt i
        , env = bound x (if i == 0 then base else base ^ showInt i) env
        }
 
 bindName : Env -> String -> BoundN
-bindName env x = bindFrom env x (safe (I.baseOf x)) 0
+bindName env x = bindFrom env x (safe (IR.baseOf x)) 0
 
 type BoundNs = { js : List String, env : Env }
 
@@ -454,13 +457,13 @@ primCall p as = primDefault p as
 
 -- | heff.compile.trmc's: a hole, and a cell's field set where its index
 -- | is known, written as JavaScript writes them
-cellPrim : String -> List Mp.Val -> Bool
+cellPrim : String -> List Imperative.Val -> Bool
 cellPrim "hole" Nil = True
 cellPrim "setField" (Cons _ (Cons (SInt _) (Cons _ Nil))) = True
 cellPrim _ _ = False
 
 -- | whether `primCall` calls the primitive's function, `$p(...)`
-callsHelper : String -> List Mp.Val -> Bool
+callsHelper : String -> List Imperative.Val -> Bool
 callsHelper p as@(Cons _ (Cons (SInt _) (Cons _ Nil))) = not (cellPrim p as)
 callsHelper p (Cons _ (Cons _ Nil)) = maybe True (\_ -> False) (primOp p)
 callsHelper p (Cons _ Nil) = maybe True (\_ -> False) (primUnary p)
@@ -539,7 +542,7 @@ letDeclarations ind xs =
   Cons (indent ind ^ "let " ^ joinWith ", " (nubStr xs) ^ ";") Nil
 
 -- (a fixed-width type's comparison, its values numbers or BigInts)
-fixedRel : Fx.FixedPrim -> Maybe String
+fixedRel : Fixed.FixedPrim -> Maybe String
 fixedRel { op = OpEq } = Just "==="
 fixedRel { op = OpLt } = Just "<"
 fixedRel { op = OpLe } = Just "<="
@@ -558,7 +561,7 @@ primRel "floatLe" = Just "<="
 primRel "runeEq" = Just "==="
 primRel "runeLt" = Just "<"
 primRel "runeLe" = Just "<="
-primRel p = maybe Nothing fixedRel (Fx.fixedPrimOf p)
+primRel p = maybe Nothing fixedRel (Fixed.fixedPrimOf p)
 
 -- | a `Bool` from a condition
 boolCode : JPred -> Code
@@ -571,7 +574,7 @@ using : Env -> String -> Env
 using env x =
   { gs = env.gs
   , names = env.names
-  , used = M.insert compareString x MkUnit env.used
+  , used = Map.insert compareString x MkUnit env.used
   , self = env.self
   , inl = env.inl
   }
@@ -589,16 +592,16 @@ type Printed = { lines : List String, env : Env }
 -- | condition, a body (an expression or a block), what is last,
 -- | statements
 type JK =
-  { val : Env -> Int -> Mp.Val -> Code
-  , op : Env -> Int -> Mp.Comp -> Code
-  , cond : Env -> Int -> Mp.Cond -> JPred
-  , body : Env -> Int -> Mp.Tl -> String
-  , tail : Env -> Int -> Mp.Tl -> List String
-  , stmts : Env -> Int -> List Mp.St -> Maybe Mp.Tl -> Printed
+  { val : Env -> Int -> Imperative.Val -> Code
+  , op : Env -> Int -> Imperative.Comp -> Code
+  , cond : Env -> Int -> Imperative.Cond -> JPred
+  , body : Env -> Int -> Imperative.Tl -> String
+  , tail : Env -> Int -> Imperative.Tl -> List String
+  , stmts : Env -> Int -> List Imperative.St -> Maybe Imperative.Tl -> Printed
   }
 
 callName : Env -> String -> String
-callName env g = case M.lookup compareString g env.gs of
+callName env g = case Map.lookup compareString g env.gs of
   Just i -> i.js
   Nothing -> safe g
 
@@ -615,11 +618,11 @@ floatCode s = if startsWith "-" s then { code = s, prec = 2 } else p3 s
 
 -- | a fixed-width integer: of 64 bits, a BigInt, as an `Int` is; of fewer,
 -- | a number
-fixedCode : Fx.Fixed -> Int -> Code
+fixedCode : Fixed.Fixed -> Int -> Code
 fixedCode w n =
-  if Fx.fixedBits w == 64 then intCode (showInt n) else floatCode (showInt n)
+  if Fixed.fixedBits w == 64 then intCode (showInt n) else floatCode (showInt n)
 
-lamCode : JK -> Int -> Mp.Tl -> BoundNs -> Code
+lamCode : JK -> Int -> Imperative.Tl -> BoundNs -> Code
 lamCode r ind t rb =
   { code =
       joinWith "" (List.map (\p -> "(" ^ p ^ ") => ") rb.js)
@@ -627,12 +630,12 @@ lamCode r ind t rb =
   , prec = 0
   }
 
-fieldCode : JK -> Env -> Int -> Pair String Mp.Val -> String
+fieldCode : JK -> Env -> Int -> Pair String Imperative.Val -> String
 fieldCode r env ind (MkPair l v) = propName l ^ ": " ^ (r.val env ind v).code
 
 -- (a primitive given all its arguments; heff.compile.trmc's written as
 -- JavaScript writes them)
-primVal : JK -> Env -> Int -> String -> List Mp.Val -> Code
+primVal : JK -> Env -> Int -> String -> List Imperative.Val -> Code
 primVal r env ind "hole" Nil = p3 "undefined"
 primVal r env ind "setField" (Cons d (Cons (SInt k) (Cons v Nil))) =
   { code =
@@ -645,10 +648,10 @@ primVal r env ind "setField" (Cons d (Cons (SInt k) (Cons v Nil))) =
   }
 primVal r env ind p as = primCall p (List.map (r.val env ind) as)
 
-valGo : JK -> Env -> Int -> Mp.Val -> Code
-valGo r env ind (SVar x) = case M.lookup compareString x env.inl of
+valGo : JK -> Env -> Int -> Imperative.Val -> Code
+valGo r env ind (SVar x) = case Map.lookup compareString x env.inl of
   Just c -> c
-  Nothing -> p3 (fromMaybe (safe x) (M.lookup compareString x env.names))
+  Nothing -> p3 (fromMaybe (safe x) (Map.lookup compareString x env.names))
 valGo r env ind (SGlobal g) = p3 (ref env.gs g)
 valGo r env ind (SInt i) = intCode (showInt i)
 valGo r env ind (SFloat x) = floatCode (showFloat x)
@@ -690,12 +693,12 @@ valGo r env ind (SPrim p as) = primVal r env ind p as
 -- (a thunk forced: its value kept on it, so that forcing it again does
 -- not compute it again -- the language is pure, `f MkUnit` is the same
 -- value every time, and what abandons is not kept)
-isUnitArgs : List Mp.Val -> Bool
+isUnitArgs : List Imperative.Val -> Bool
 isUnitArgs (Cons (STag t Nil) Nil) = strEq t "MkUnit"
 isUnitArgs _ = False
 
 bouncesG : Env -> String -> Bool
-bouncesG env g = case M.lookup compareString g env.gs of
+bouncesG env g = case Map.lookup compareString g env.gs of
   Just i -> i.bounce
   Nothing -> False
 
@@ -708,7 +711,7 @@ trWhen b c = if b then trCode c else c
 
 -- | a known definition called, as it is (what it gives back may be a
 -- | bounce)
-callCode : JK -> Env -> Int -> String -> List Mp.Val -> String
+callCode : JK -> Env -> Int -> String -> List Imperative.Val -> String
 callCode r env ind g as =
   callName env g
   ^ "("
@@ -717,7 +720,7 @@ callCode r env ind g as =
 
 -- | a function applied to arguments one at a time, each call's value
 -- | asked for through its bounces
-applied : JK -> Env -> Int -> Code -> List Mp.Val -> Code
+applied : JK -> Env -> Int -> Code -> List Imperative.Val -> Code
 applied r env ind c as =
   List.foldl
     (\c2 a -> p3 (trCode (atLeast 3 c2 ^ "(" ^ (r.val env ind a).code ^ ")")))
@@ -725,7 +728,7 @@ applied r env ind c as =
     as
 
 -- | a step not last: its value, through any bounces
-opGo : JK -> Env -> Int -> Mp.Comp -> Code
+opGo : JK -> Env -> Int -> Imperative.Comp -> Code
 opGo r env ind (OSimple v) = r.val env ind v
 opGo r env ind (OCall g as) =
   if isUnitArgs as then p3 ("$force(" ^ callName env g ^ ")")
@@ -737,11 +740,17 @@ opGo r env ind (OPrim p as) = primCall p (List.map (r.val env ind) as)
 opGo r env ind OAbandon = p3 "$abandon()"
 opGo r env ind (OBool c) = boolCode (r.cond env ind c)
 
-seqAs : JK -> Env -> Int -> Mp.Comp -> Mp.Cond -> BoundN -> JPred
+seqAs : JK
+      -> Env
+      -> Int
+      -> Imperative.Comp
+      -> Imperative.Cond
+      -> BoundN
+      -> JPred
 seqAs r env ind o c nb = JSeq nb.js (r.op env ind o).code (r.cond nb.env ind c)
 
 -- | the condition, the names it binds chosen
-condGo : JK -> Env -> Int -> Mp.Cond -> JPred
+condGo : JK -> Env -> Int -> Imperative.Cond -> JPred
 condGo r env ind PTrue = JTrue
 condGo r env ind PFalse = JFalse
 condGo r env ind (PRel p a b) =
@@ -764,7 +773,7 @@ type Stepped = { code : Code, decls : List String }
 boolStep : JPred -> Stepped
 boolStep jc = { code = boolCode jc, decls = seqsOf jc }
 
-stepOf : JK -> Env -> Int -> Mp.Comp -> Stepped
+stepOf : JK -> Env -> Int -> Imperative.Comp -> Stepped
 stepOf r env ind (OBool c) = boolStep (r.cond env ind c)
 stepOf r env ind o = { code = r.op env ind o, decls = Nil }
 
@@ -774,7 +783,7 @@ stepOf r env ind o = { code = r.op env ind o, decls = Nil }
 -- | what a match looks at: a name, or a value bound to one first
 type Scrut = { js : String, env : Env, pre : List String }
 
-scrutBound : JK -> Env -> Int -> Mp.Val -> BoundN -> Scrut
+scrutBound : JK -> Env -> Int -> Imperative.Val -> BoundN -> Scrut
 scrutBound r env ind v b =
   { js = b.js
   , env = b.env
@@ -784,8 +793,8 @@ scrutBound r env ind v b =
         Nil
   }
 
-scrutOf : JK -> Env -> Int -> Mp.Val -> Scrut
-scrutOf r env ind (SVar x) = case M.lookup compareString x env.names of
+scrutOf : JK -> Env -> Int -> Imperative.Val -> Scrut
+scrutOf r env ind (SVar x) = case Map.lookup compareString x env.names of
   Just js -> { js = js, env = env, pre = Nil }
   Nothing -> scrutBound r env ind (SVar x) (bindName env "s")
 scrutOf r env ind v = scrutBound r env ind v (bindName env "s")
@@ -835,11 +844,11 @@ armJs : Scrut
       -> Int
       -> String
       -> List String
-      -> List Mp.Part
+      -> List Imperative.Part
       -> (Env -> Int -> List String)
       -> ArmJs
 armJs sc ind tag vs parts lines =
-  if List.all (\v -> not (Mp.namedIn v parts)) vs
+  if List.all (\v -> not (Imperative.namedIn v parts)) vs
     then MkArmJs tag True (lines sc.env (ind + 2))
   else armBound sc ind tag lines (bindAll sc.env vs)
 
@@ -929,7 +938,7 @@ setStmt ind st x env =
         (letDeclarations ind st.decls)
         (Cons
            (indent ind
-            ^ fromMaybe (safe x) (M.lookup compareString x env.names)
+            ^ fromMaybe (safe x) (Map.lookup compareString x env.names)
             ^ " = "
             ^ st.code.code
             ^ ";")
@@ -939,7 +948,11 @@ setStmt ind st x env =
 
 -- (a match as a statement: each arm's statements, then on; no arm taken,
 -- the program fails)
-caseStmt : JK -> Int -> List (Mp.Arm (List Mp.St)) -> Scrut -> Printed
+caseStmt : JK
+         -> Int
+         -> List (Imperative.Arm (List Imperative.St))
+         -> Scrut
+         -> Printed
 caseStmt r ind arms sc =
   { lines =
       switchLines
@@ -953,7 +966,7 @@ caseStmt r ind arms sc =
                 ind
                 tag
                 vs
-                (Mp.stmtsParts ss)
+                (Imperative.stmtsParts ss)
                 (\e i ->
                    List.append
                      (r.stmts e i ss Nothing).lines
@@ -965,7 +978,7 @@ caseStmt r ind arms sc =
   }
 
 -- | a statement's lines, and the names after it
-stmtGo : JK -> Env -> Int -> Mp.St -> Printed
+stmtGo : JK -> Env -> Int -> Imperative.St -> Printed
 stmtGo r env ind (SLet x o) = letStmt ind (stepOf r env ind o) x env
 stmtGo r env ind (SDecl x) = declStmt ind (bindName env x)
 stmtGo r env ind (SSet x o) = setStmt ind (stepOf r env ind o) x env
@@ -983,7 +996,12 @@ stmtGo r env ind (SCase v arms) = caseStmt r ind arms (scrutOf r env ind v)
 stmtsAfter : Printed -> Printed -> Printed
 stmtsAfter a b = { lines = List.append a.lines b.lines, env = b.env }
 
-stmtsThen : JK -> Int -> List Mp.St -> Maybe Mp.Tl -> Printed -> Printed
+stmtsThen : JK
+          -> Int
+          -> List Imperative.St
+          -> Maybe Imperative.Tl
+          -> Printed
+          -> Printed
 stmtsThen r ind rest after p = stmtsAfter p (r.stmts p.env ind rest after)
 
 -- (a name whose one use, in what follows it, computes it instead: in
@@ -997,26 +1015,35 @@ inlined env x c =
   , names = env.names
   , used = env.used
   , self = env.self
-  , inl = M.insert compareString x c env.inl
+  , inl = Map.insert compareString x c env.inl
   }
 
 -- (whether a binding computes its one use instead: not a condition's
 -- `Bool`, whose names are declared before)
-inlinable : String -> Mp.Comp -> List Mp.St -> Maybe Mp.Tl -> Bool
+inlinable : String
+          -> Imperative.Comp
+          -> List Imperative.St
+          -> Maybe Imperative.Tl
+          -> Bool
 inlinable x (OBool _) rest after = False
 inlinable x o rest after =
-  Mp.usedOnceNext
+  Imperative.usedOnceNext
     x
     (case rest of
-     Cons st _ -> Mp.firstNames st
+     Cons st _ -> Imperative.firstNames st
      Nil -> case after of
-       Just t -> Mp.firstNamesTl t
+       Just t -> Imperative.firstNamesTl t
        Nothing -> Nil)
-    (List.append (Mp.stmtsParts rest) (case after of
-     Just t -> Mp.tailParts t
+    (List.append (Imperative.stmtsParts rest) (case after of
+     Just t -> Imperative.tailParts t
      Nothing -> Nil))
 
-stmtsGo : JK -> Env -> Int -> List Mp.St -> Maybe Mp.Tl -> Printed
+stmtsGo : JK
+        -> Env
+        -> Int
+        -> List Imperative.St
+        -> Maybe Imperative.Tl
+        -> Printed
 stmtsGo r env ind Nil after = { lines = Nil, env = env }
 stmtsGo r env ind (Cons (SLet x o) rest) after =
   if inlinable x o rest after
@@ -1029,7 +1056,7 @@ stmtsGo r env ind (Cons st rest) after =
 --------------------------------------------------------------------------------
 
 -- (the arguments are of this round's `const`s: assigned one by one)
-again : JK -> Env -> Int -> List Mp.Val -> List String
+again : JK -> Env -> Int -> List Imperative.Val -> List String
 again r env@{ self = Just s } ind as =
   Cons
     (indent ind
@@ -1113,7 +1140,7 @@ returnCond ind c =
 -- | a value returned: an unknown function's, called last, counted (and,
 -- | every so often, a bounce instead); a known definition's, called
 -- | last, not counted, its bounce handed on
-returnLines : JK -> Env -> Int -> Mp.Comp -> List String
+returnLines : JK -> Env -> Int -> Imperative.Comp -> List String
 returnLines r env ind (OApply f as) =
   if isUnitArgs as then bounceLines env ind (p3 "$force") (r.val env ind f)
   else case unsnocE as of
@@ -1132,10 +1159,14 @@ returnLines r env ind (OBool c) = returnCond ind (r.cond env ind c)
 returnLines r env ind o =
   Cons (indent ind ^ "return " ^ (r.op env ind o).code ^ ";") Nil
 
-tailAfter : JK -> Int -> Mp.Tl -> Printed -> List String
+tailAfter : JK -> Int -> Imperative.Tl -> Printed -> List String
 tailAfter r ind t p = List.append p.lines (r.tail p.env ind t)
 
-caseTail : JK -> Int -> List (Mp.Arm Mp.Tl) -> Scrut -> List String
+caseTail : JK
+         -> Int
+         -> List (Imperative.Arm Imperative.Tl)
+         -> Scrut
+         -> List String
 caseTail r ind arms sc =
   switchLines
     sc
@@ -1143,13 +1174,13 @@ caseTail r ind arms sc =
     (List.map
        (\arm -> case arm of
         MkArm tag vs t ->
-          armJs sc ind tag vs (Mp.tailParts t) (\e i -> r.tail e i t))
+          armJs sc ind tag vs (Imperative.tailParts t) (\e i -> r.tail e i t))
        arms)
     Nil
     (Cons (indent ind ^ "return $nomatch(" ^ sc.js ^ ");") Nil)
 
 -- | what is last: returned, or, in a loop, the next round
-tailGo : JK -> Env -> Int -> Mp.Tl -> List String
+tailGo : JK -> Env -> Int -> Imperative.Tl -> List String
 tailGo r env ind (TSeq ss t) = tailAfter r ind t (r.stmts env ind ss (Just t))
 tailGo r env ind (TReturn o) = returnLines r env ind o
 tailGo r env ind (TLoop as) = again r env ind as
@@ -1163,18 +1194,18 @@ bodyCode c = if strEq (strSlice c 0 1) "{" then "(" ^ c ^ ")" else c
 -- (a step returned that is an expression's worth: not an unknown
 -- function's call, counted, nor a known one's that may bounce, nor a
 -- condition's `Bool`)
-exprBody : Env -> Mp.Comp -> Bool
+exprBody : Env -> Imperative.Comp -> Bool
 exprBody env (OApply _ _) = False
 exprBody env (OCall g _) = not (bouncesG env g)
 exprBody env (OBool _) = False
 exprBody env o = True
 
-blockOf : JK -> Env -> Int -> Mp.Tl -> String
+blockOf : JK -> Env -> Int -> Imperative.Tl -> String
 blockOf r env ind t =
   "{\n" ^ joinWith "\n" (r.tail env (ind + 1) t) ^ "\n" ^ indent ind ^ "}"
 
 -- | a function's body: an expression, or a block if it does more
-bodyGo : JK -> Env -> Int -> Mp.Tl -> String
+bodyGo : JK -> Env -> Int -> Imperative.Tl -> String
 bodyGo r env ind t@(TReturn o) =
   if exprBody env o then bodyCode (r.op env ind o).code else blockOf r env ind t
 bodyGo r env ind t = blockOf r env ind t
@@ -1192,15 +1223,15 @@ jk =
 -- Definitions
 --------------------------------------------------------------------------------
 
-env0Of : M.Map String GInfo -> M.Map String Unit -> Env
+env0Of : Map.Map String GInfo -> Map.Map String Unit -> Env
 env0Of gs met =
-  { gs = gs, names = M.empty, used = met, self = Nothing, inl = M.empty }
+  { gs = gs, names = Map.empty, used = met, self = Nothing, inl = Map.empty }
 
 -- where a function of several parameters is used as a value, it needs
 -- its curried form
-wrapper : M.Map String Unit -> String -> GInfo -> List String -> List String
+wrapper : Map.Map String Unit -> String -> GInfo -> List String -> List String
 wrapper curried key i js =
-  if i.arity >= 2 && M.member compareString key curried
+  if i.arity >= 2 && Map.member compareString key curried
     then Cons
         ("const "
          ^ i.js
@@ -1214,7 +1245,7 @@ wrapper curried key i js =
   else Nil
 
 -- | whether it goes round again somewhere (heff.compile.imperative's `TLoop`)
-loops : Mp.Tl -> Bool
+loops : Imperative.Tl -> Bool
 loops (TSeq _ t) = loops t
 loops (TLoop _) = True
 loops (TIf _ t e) = loops t || loops e
@@ -1227,7 +1258,7 @@ loops t = False
 
 -- (a loop; its parameters `x$`, each round's own `const`, which what it
 -- closes over keeps)
-looped : String -> GInfo -> Mp.Tl -> BoundNs -> List String
+looped : String -> GInfo -> Imperative.Tl -> BoundNs -> List String
 looped key i t r =
   List.append
     [ ""
@@ -1257,7 +1288,7 @@ looped key i t r =
              t)
           (Cons "  }" (Cons "};" Nil))))
 
-defFun : String -> GInfo -> Mp.Tl -> BoundNs -> List String
+defFun : String -> GInfo -> Imperative.Tl -> BoundNs -> List String
 defFun key i t r =
   if loops t then looped key i t r
   else [ ""
@@ -1271,7 +1302,7 @@ defFun key i t r =
        ]
 
 -- (a value computed at once: an expression; else in a block, called)
-eagerCode : Env -> Mp.Tl -> String
+eagerCode : Env -> Imperative.Tl -> String
 eagerCode env (TReturn o) = (jk.op env 0 o).code
 eagerCode env t = "(() => " ^ blockOf jk env 0 t ^ ")()"
 
@@ -1279,13 +1310,13 @@ eagerCode env t = "(() => " ^ blockOf jk env 0 t ^ ")()"
 -- | program's to say (`wrapper`) -- and its parameters' names
 type DefCode = { lines : List String, params : List String }
 
-defFunCode : String -> GInfo -> Mp.Tl -> BoundNs -> DefCode
+defFunCode : String -> GInfo -> Imperative.Tl -> BoundNs -> DefCode
 defFunCode key i t r = { lines = defFun key i t r, params = r.js }
 
-defCodeOf : M.Map String GInfo
-          -> M.Map String Unit
+defCodeOf : Map.Map String GInfo
+          -> Map.Map String Unit
           -> String
-          -> Mp.Body
+          -> Imperative.Body
           -> GInfo
           -> DefCode
 defCodeOf gs met key (DefFun xs (MkBlock t)) i =
@@ -1408,25 +1439,28 @@ uncurryGo ps s =
 uncurryJs : String -> Uncurried
 uncurryJs js = uncurryGo Nil js
 
-primCalled : M.Map String Unit -> String -> List Mp.Val -> M.Map String Unit
+primCalled : Map.Map String Unit
+           -> String
+           -> List Imperative.Val
+           -> Map.Map String Unit
 primCalled m p as =
-  if callsHelper p as then M.insert compareString ("$" ^ p ^ "(") MkUnit m
+  if callsHelper p as then Map.insert compareString ("$" ^ p ^ "(") MkUnit m
   else m
 
 -- | the primitives the code uses, as it writes them: `$p(` (given all
 -- | its arguments) and `$p$c` (curried)
-primUses : M.Map String Unit -> Mp.Part -> M.Map String Unit
+primUses : Map.Map String Unit -> Imperative.Part -> Map.Map String Unit
 primUses m (PartVal (SPrimFn p)) =
-  M.insert compareString ("$" ^ p ^ "$c") MkUnit m
+  Map.insert compareString ("$" ^ p ^ "$c") MkUnit m
 primUses m (PartVal (SPrim p as)) = primCalled m p as
 primUses m (PartOp (OPrim p as)) = primCalled m p as
 primUses m part = m
 
-primHelperU : M.Map String Unit -> String -> Uncurried -> List String
+primHelperU : Map.Map String Unit -> String -> Uncurried -> List String
 primHelperU uses p u =
   List.append
-    (if M.member compareString ("$" ^ p ^ "(") uses
-     || M.member compareString ("$" ^ p ^ "$c") uses
+    (if Map.member compareString ("$" ^ p ^ "(") uses
+     || Map.member compareString ("$" ^ p ^ "$c") uses
        then Cons
            ("const $"
             ^ p
@@ -1437,7 +1471,7 @@ primHelperU uses p u =
             ^ ";")
            Nil
      else Nil)
-    (if M.member compareString ("$" ^ p ^ "$c") uses
+    (if Map.member compareString ("$" ^ p ^ "$c") uses
        then Cons
            ("const $"
             ^ p
@@ -1451,14 +1485,14 @@ primHelperU uses p u =
            Nil
      else Nil)
 
-primHelperOne : M.Map String Unit -> Pair String Pr.PrimImpl -> List String
+primHelperOne : Map.Map String Unit -> Pair String Prims.PrimImpl -> List String
 primHelperOne uses (MkPair p i) = primHelperU uses p (uncurryJs i.js)
 
 -- (the helpers of those of the primitives `uses` has)
-primHelpersOf : M.Map String Unit -> List String
-primHelpersOf uses = List.concatMap (\p -> primHelperOne uses p) Pr.allPrims
+primHelpersOf : Map.Map String Unit -> List String
+primHelpersOf uses = List.concatMap (\p -> primHelperOne uses p) Prims.allPrims
 
-type Emitted = { lines : List String, globals : M.Map String GInfo }
+type Emitted = { lines : List String, globals : Map.Map String GInfo }
 
 shortsOf : List String -> List String
 shortsOf keys = List.map (\k -> safe (shortName k)) keys
@@ -1472,25 +1506,26 @@ jsNameOf : List String -> String -> String
 jsNameOf shorts key = jsPick shorts key (safe (shortName key))
 
 infoOne : List String
-        -> F.Facts
-        -> M.Map String GInfo
+        -> Facts.Facts
+        -> Map.Map String GInfo
         -> String
-        -> M.Map String GInfo
+        -> Map.Map String GInfo
 infoOne shorts facts acc key =
-  M.insert
+  Map.insert
     compareString
     key
     { js = jsNameOf shorts key
-    , arity = fromMaybe 0 (M.lookup compareString key facts.arity)
-    , lazy = M.member compareString key facts.lazy
-    , bounce = M.member compareString key facts.bounce
+    , arity = fromMaybe 0 (Map.lookup compareString key facts.arity)
+    , lazy = Map.member compareString key facts.lazy
+    , bounce = Map.member compareString key facts.bounce
     }
     acc
 
-setFrom : List String -> M.Map String Unit
-setFrom xs = List.foldl (\m k -> M.insert compareString k MkUnit m) M.empty xs
+setFrom : List String -> Map.Map String Unit
+setFrom xs =
+  List.foldl (\m k -> Map.insert compareString k MkUnit m) Map.empty xs
 
-emitLines : M.Map String GInfo -> List String -> List String -> Emitted
+emitLines : Map.Map String GInfo -> List String -> List String -> Emitted
 emitLines info code helpers =
   { lines =
       List.append
@@ -1499,9 +1534,9 @@ emitLines info code helpers =
   , globals = info
   }
 
-infoAll : List String -> F.Facts -> List String -> M.Map String GInfo
+infoAll : List String -> Facts.Facts -> List String -> Map.Map String GInfo
 infoAll shorts facts keys =
-  List.foldl (\acc k -> infoOne shorts facts acc k) M.empty keys
+  List.foldl (\acc k -> infoOne shorts facts acc k) Map.empty keys
 
 -- The backend's cache: a definition's JavaScript as it keeps it
 --------------------------------------------------------------------------------
@@ -1528,19 +1563,19 @@ type JsKept =
 
 -- | what the printer knows of the whole program: each global's name and
 -- | facts
-type JsProgram = { info : M.Map String GInfo }
+type JsProgram = { info : Map.Map String GInfo }
 
 -- (each once, in order: through a map, not a list searched)
 sortedOnceJ : List String -> List String
-sortedOnceJ xs = List.map fst (M.toList (setFrom xs))
+sortedOnceJ xs = List.map fst (Map.toList (setFrom xs))
 
 -- | what the printer knows of a program of the definitions `keys`
-jsProgramOf : F.Facts -> List String -> JsProgram
+jsProgramOf : Facts.Facts -> List String -> JsProgram
 jsProgramOf facts keys = { info = infoAll (shortsOf keys) facts keys }
 
 -- (what is known of a global)
-globalJsH : JsProgram -> String -> List Ir.HItem -> List Ir.HItem
-globalJsH p g rest = case M.lookup compareString g p.info of
+globalJsH : JsProgram -> String -> List IRText.HItem -> List IRText.HItem
+globalJsH p g rest = case Map.lookup compareString g p.info of
   Just i ->
     Cons
       (HS g)
@@ -1556,9 +1591,9 @@ globalJsH p g rest = case M.lookup compareString g p.info of
 -- | what a definition's JavaScript is made of, hashed: its key, its body
 -- | (named again from 0), what is known of itself and of what it
 -- | mentions
-jsVer : JsProgram -> String -> I.Expr -> String
+jsVer : JsProgram -> String -> IR.Expr -> String
 jsVer p key b =
-  Ir.hashOf
+  IRText.hashOf
     (Cons
        (HS "js")
        (Cons
@@ -1568,46 +1603,57 @@ jsVer p key b =
              (List.foldr
                 (globalJsH p)
                 Nil
-                (sortedOnceJ (Cons key (I.globalsIn b)))))))
+                (sortedOnceJ (Cons key (IR.globalsIn b)))))))
 
-keptCode : String -> Mp.Def -> DefCode -> JsKept
+keptCode : String -> Imperative.Def -> DefCode -> JsKept
 keptCode v d c =
   { ver = v
   , lines = c.lines
   , params = c.params
   , refs = valueRefs d
-  , prims = List.map fst (M.toList (List.foldl primUses M.empty (Mp.partsOf d)))
+  , prims =
+      List.map
+        fst
+        (Map.toList (List.foldl primUses Map.empty (Imperative.partsOf d)))
   }
 
 -- (a global a definition mentions)
-globalOfPart : Mp.Part -> Maybe String
+globalOfPart : Imperative.Part -> Maybe String
 globalOfPart (PartVal (SGlobal g)) = Just g
 globalOfPart (PartOp (OCall g _)) = Just g
 globalOfPart _ = Nothing
 
 jsOfGlobal : JsProgram -> String -> Maybe String
-jsOfGlobal p g = case M.lookup compareString g p.info of
+jsOfGlobal p g = case Map.lookup compareString g p.info of
   Just i -> Just i.js
   Nothing -> Nothing
 
 -- | the names a definition's locals are named past: of itself and of the
 -- | globals it mentions, not of every global -- one it does not mention
 -- | a local of its may hide, unharmed
-namesIn : JsProgram -> Mp.Def -> M.Map String Unit
+namesIn : JsProgram -> Imperative.Def -> Map.Map String Unit
 namesIn p d =
   setFrom
     (catMaybesL
        (List.map
           (jsOfGlobal p)
           (Cons
-             (Mp.defKey d)
-             (catMaybesL (List.map globalOfPart (Mp.partsOf d))))))
+             (Imperative.defKey d)
+             (catMaybesL (List.map globalOfPart (Imperative.partsOf d))))))
 
 -- | a definition printed
-keptOfDef : JsProgram -> String -> Mp.Def -> JsKept
-keptOfDef p v d = case M.lookup compareString (Mp.defKey d) p.info of
+keptOfDef : JsProgram -> String -> Imperative.Def -> JsKept
+keptOfDef p v d = case Map.lookup compareString (Imperative.defKey d) p.info of
   Just i ->
-    keptCode v d (defCodeOf p.info (namesIn p d) (Mp.defKey d) (Mp.defBody d) i)
+    keptCode
+      v
+      d
+      (defCodeOf
+         p.info
+         (namesIn p d)
+         (Imperative.defKey d)
+         (Imperative.defBody d)
+         i)
   Nothing -> keptCode v d { lines = Nil, params = Nil }
 
 -- | the definitions' entries, last first, and those made here
@@ -1625,32 +1671,38 @@ jsMade acc key k =
   }
 
 jsAt : JsProgram
-     -> M.Map String JsKept
+     -> Map.Map String JsKept
      -> JsAcc
-     -> I.Def
-     -> Pair I.Expr Int
+     -> IR.Def
+     -> Pair IR.Expr Int
      -> String
      -> JsAcc
 jsAt p kept acc d own v = case keptAtVerJ
     v
-    (M.lookup compareString d.key kept) of
+    (Map.lookup compareString d.key kept) of
   Just k -> { entries = Cons (MkPair d.key k) acc.entries, fresh = acc.fresh }
-  Nothing -> jsMade acc d.key (keptOfDef p v (L.jsDef d own))
+  Nothing -> jsMade acc d.key (keptOfDef p v (Lower.jsDef d own))
 
 jsWith : JsProgram
-       -> M.Map String JsKept
+       -> Map.Map String JsKept
        -> JsAcc
-       -> I.Def
-       -> Pair I.Expr Int
+       -> IR.Def
+       -> Pair IR.Expr Int
        -> JsAcc
 jsWith p kept acc d own = jsAt p kept acc d own (jsVer p d.key (fst own))
 
-jsOne : JsProgram -> M.Map String JsKept -> JsAcc -> I.Def -> JsAcc
-jsOne p kept acc d = jsWith p kept acc d (I.freshen 0 d.body)
+jsOne : JsProgram -> Map.Map String JsKept -> JsAcc -> IR.Def -> JsAcc
+jsOne p kept acc d = jsWith p kept acc d (IR.freshen 0 d.body)
 
 -- (a definition's lines, and its curried form where it has one)
-entryLines : JsProgram -> M.Map String Unit -> Pair String JsKept -> List String
-entryLines p curried (MkPair key k) = case M.lookup compareString key p.info of
+entryLines : JsProgram
+           -> Map.Map String Unit
+           -> Pair String JsKept
+           -> List String
+entryLines p curried (MkPair key k) = case Map.lookup
+    compareString
+    key
+    p.info of
   Just i -> List.append k.lines (wrapper curried key i k.params)
   Nothing -> k.lines
 
@@ -1658,7 +1710,7 @@ entryLines p curried (MkPair key k) = case M.lookup compareString key p.info of
 -- each with its curried form)
 assembled : JsProgram
           -> List (Pair String JsKept)
-          -> M.Map String Unit
+          -> Map.Map String Unit
           -> Emitted
 assembled p es curried =
   emitLines
@@ -1688,9 +1740,9 @@ emittedOf p roots acc =
   }
 
 emitKeptIn : JsProgram
-           -> List I.Def
+           -> List IR.Def
            -> List String
-           -> M.Map String JsKept
+           -> Map.Map String JsKept
            -> EmittedKept
 emitKeptIn p defs roots kept =
   emittedOf
@@ -1701,22 +1753,22 @@ emitKeptIn p defs roots kept =
 -- | the definitions (as both backends are given them), each printed --
 -- | or taken as the cache keeps it, where it keeps it at its version --
 -- | `roots` the globals the program's host uses
-emitKept : F.Facts
-         -> List I.Def
+emitKept : Facts.Facts
+         -> List IR.Def
          -> List String
-         -> M.Map String JsKept
+         -> Map.Map String JsKept
          -> EmittedKept
 emitKept facts defs roots kept =
   emitKeptIn
-    (jsProgramOf facts (List.map (\(d : I.Def) -> d.key) defs))
+    (jsProgramOf facts (List.map (\(d : IR.Def) -> d.key) defs))
     defs
     roots
     kept
 
--- | >>> (emitDefs (F.factsOf [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))] ["f"]).lines
+-- | >>> (emitDefs (Facts.factsOf [IR.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) [IR.mkDef "f" "f" (ELam ["x"] (EVar "x"))] ["f"]).lines
 -- | ["", "const f = (x) => x;"]
-emitDefs : F.Facts -> List I.Def -> List String -> Emitted
-emitDefs facts defs roots = (emitKept facts defs roots M.empty).emitted
+emitDefs : Facts.Facts -> List IR.Def -> List String -> Emitted
+emitDefs facts defs roots = (emitKept facts defs roots Map.empty).emitted
 
 -- Runtime
 --------------------------------------------------------------------------------
@@ -1778,7 +1830,7 @@ worldStr =
     , "})();"
     ]
 
-hasSum : Ef.Effect -> Bool
+hasSum : Effect.Effect -> Bool
 hasSum (Plus _ _) = True
 hasSum (Leaf _) = False
 
@@ -1856,7 +1908,7 @@ provStrHelpers have provs =
     (\l -> not (List.any (\h -> strEq h l) have))
     (strHelpersIn (joinWith "\n" (List.map (\(p : Provider) -> p.text) provs)))
 
-runtimeFor : Bool -> List String -> List Provider -> Ef.Effect -> String
+runtimeFor : Bool -> List String -> List Provider -> Effect.Effect -> String
 runtimeFor hasTr have provs eff =
   joinWith
     "\n"
@@ -1876,12 +1928,12 @@ provIndexGo i md (Cons p rest) =
 -- (each effect's handler, an operation of a sum going to its side's; a
 -- leaf's is its provider's factory, called for a fresh algebra, given
 -- the world)
-handlerOf : List Provider -> Ef.Effect -> String
+handlerOf : List Provider -> Effect.Effect -> String
 handlerOf provs (Leaf k) =
   "$p"
-  ^ showInt (provIndexGo 0 (Ef.moduleOfKey k) provs)
+  ^ showInt (provIndexGo 0 (Effect.moduleOfKey k) provs)
   ^ "."
-  ^ Ef.nameOfKey k
+  ^ Effect.nameOfKey k
   ^ "($world)"
 handlerOf provs (Plus a b) =
   "$sum(" ^ handlerOf provs a ^ ", " ^ handlerOf provs b ^ ")"
@@ -1901,11 +1953,11 @@ provsForGo available (Cons md rest) = case findProv md available of
   Nothing -> provsForGo available rest
 
 -- (the chosen effect's providers, one per module, in the row's order)
-provsFor : List Provider -> Ef.Effect -> List Provider
+provsFor : List Provider -> Effect.Effect -> List Provider
 provsFor available eff =
   provsForGo
     available
-    (nubStr (List.map (\k -> Ef.moduleOfKey k) (Ef.leaves eff)))
+    (nubStr (List.map (\k -> Effect.moduleOfKey k) (Effect.leaves eff)))
 
 importLinesOf : List Provider -> List String
 importLinesOf Nil = Nil
@@ -1983,7 +2035,12 @@ scopeFor host body =
         (Cons "\"use strict\";" (List.append body ["})();", ""]))
   else List.append body [""]
 
-runSource : String -> List Provider -> Ef.Effect -> String -> Emitted -> String
+runSource : String
+          -> List Provider
+          -> Effect.Effect
+          -> String
+          -> Emitted
+          -> String
 runSource host provs eff key m =
   joinWith
     "\n"
@@ -2002,7 +2059,7 @@ runSource host provs eff key m =
                 , runFor
                   host
                   ("$run(() => "
-                   ^ ref m.globals L.entryKey
+                   ^ ref m.globals Lower.entryKey
                    ^ ", "
                    ^ handlerOf provs eff
                    ^ ");")
@@ -2010,9 +2067,9 @@ runSource host provs eff key m =
 
 compileLowered : String
                -> List Provider
-               -> Ef.Effect
+               -> Effect.Effect
                -> String
-               -> L.LoweredShared
+               -> Lower.LoweredShared
                -> Output
 compileLowered host provs eff key l =
   { source =
@@ -2021,7 +2078,7 @@ compileLowered host provs eff key l =
         provs
         eff
         key
-        (emitDefs l.facts l.defs (Cons L.entryKey Nil))
+        (emitDefs l.facts l.defs (Cons Lower.entryKey Nil))
   , errors = l.errors
   }
 
@@ -2032,28 +2089,33 @@ compileLowered host provs eff key l =
 -- | hoisted), so a page loads it from file:// too
 compileProgram : String
                -> List Provider
-               -> G.Globals
+               -> Globals.Globals
                -> String
-               -> Ef.Effect
+               -> Effect.Effect
                -> Output
 compileProgram host available g key eff =
-  compileLowered host (provsFor available eff) eff key (L.lowerProgram g key)
+  compileLowered
+    host
+    (provsFor available eff)
+    eff
+    key
+    (Lower.lowerProgram g key)
 
 -- | a program `compileProgram` makes through the backend's cache
 -- | (heff.build.backcache), and what the cache is to keep anew
 type OutputKept =
   { output : Output
-  , groups : List L.GroupOut
-  , copies : List Si.CopyDone
+  , groups : List Lower.GroupOut
+  , copies : List Simplify.CopyDone
   , jss : List (Pair String JsKept)
   }
 
 keptEmitted : String
             -> List Provider
-            -> Ef.Effect
+            -> Effect.Effect
             -> String
-            -> L.SimplifiedKept
-            -> L.LoweredShared
+            -> Lower.SimplifiedKept
+            -> Lower.LoweredShared
             -> EmittedKept
             -> OutputKept
 keptEmitted host provs eff key sk l ek =
@@ -2066,11 +2128,11 @@ keptEmitted host provs eff key sk l ek =
 
 keptLowered : String
             -> List Provider
-            -> Ef.Effect
+            -> Effect.Effect
             -> String
-            -> M.Map String JsKept
-            -> L.SimplifiedKept
-            -> L.LoweredShared
+            -> Map.Map String JsKept
+            -> Lower.SimplifiedKept
+            -> Lower.LoweredShared
             -> OutputKept
 keptLowered host provs eff key kept sk l =
   keptEmitted
@@ -2080,17 +2142,17 @@ keptLowered host provs eff key kept sk l =
     key
     sk
     l
-    (emitKept l.facts l.defs (Cons L.entryKey Nil) kept)
+    (emitKept l.facts l.defs (Cons Lower.entryKey Nil) kept)
 
 keptOutput : String
            -> List Provider
-           -> Ef.Effect
+           -> Effect.Effect
            -> String
-           -> M.Map String JsKept
-           -> L.SimplifiedKept
+           -> Map.Map String JsKept
+           -> Lower.SimplifiedKept
            -> OutputKept
 keptOutput host provs eff key kept sk =
-  keptLowered host provs eff key kept sk (L.sharedKeptOf sk)
+  keptLowered host provs eff key kept sk (Lower.sharedKeptOf sk)
 
 -- | the program `compileProgram` makes, each definition of the core the
 -- | cache keeps at its version (`vers`, `ks`, heff.compile.lower) taken
@@ -2098,12 +2160,12 @@ keptOutput host provs eff key kept sk =
 -- | what it is made of (`kept`)
 compileProgramKept : String
                    -> List Provider
-                   -> G.Globals
+                   -> Globals.Globals
                    -> String
-                   -> Ef.Effect
-                   -> M.Map String String
-                   -> L.Keeps
-                   -> M.Map String JsKept
+                   -> Effect.Effect
+                   -> Map.Map String String
+                   -> Lower.Keeps
+                   -> Map.Map String JsKept
                    -> OutputKept
 compileProgramKept host available g key eff vers ks kept =
   keptOutput
@@ -2112,9 +2174,9 @@ compileProgramKept host available g key eff vers ks kept =
     eff
     key
     kept
-    (L.lowerProgramKept g key vers ks)
+    (Lower.lowerProgramKept g key vers ks)
 
-getterOf : M.Map String GInfo -> Export -> String
+getterOf : Map.Map String GInfo -> Export -> String
 getterOf gs o =
   "  get " ^ propName o.name ^ "() { return $ext(" ^ ref gs o.key ^ "); },"
 
@@ -2134,11 +2196,12 @@ jsSource exports m =
                 (List.map
                    (\o -> getterOf m.globals o)
                    (List.filter
-                      (\(o : Export) -> M.member compareString o.key m.globals)
+                      (\(o : Export) ->
+                         Map.member compareString o.key m.globals)
                       exports))
                 (Cons "};" (Cons "" Nil))))))
 
-compileExports : List Export -> L.LoweredShared -> Output
+compileExports : List Export -> Lower.LoweredShared -> Output
 compileExports exports l =
   { source =
       jsSource
@@ -2149,11 +2212,13 @@ compileExports exports l =
 
 -- | a module whose default export has the given definitions by the
 -- | given names (all of them, by their keys, if none is given)
-compileJsWith : G.Globals -> List Export -> Output
+compileJsWith : Globals.Globals -> List Export -> Output
 compileJsWith g exports =
-  compileExports exports (L.lower g (List.map (\(o : Export) -> o.key) exports))
+  compileExports
+    exports
+    (Lower.lower g (List.map (\(o : Export) -> o.key) exports))
 
-compileJs : G.Globals -> List Export -> Output
+compileJs : Globals.Globals -> List Export -> Output
 compileJs g exports0 =
   compileJsWith
     g
@@ -2161,5 +2226,5 @@ compileJs g exports0 =
        then List.map
            (\p -> case p of
             MkPair k _ -> mkExport k k)
-           (G.globalsList g)
+           (Globals.globalsList g)
      else exports0)

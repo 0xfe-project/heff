@@ -6,7 +6,7 @@
 -- local definition is a loop of the global, and a call of it a call of
 -- the global.
 
-import heff.compile.ir as I
+import heff.compile.ir as IR
 
 -- The variables an expression mentions and does not bind
 --------------------------------------------------------------------------------
@@ -16,9 +16,9 @@ addFree : List String -> String -> List String -> List String
 addFree bound x acc =
   if List.elemBy strEq x bound || List.elemBy strEq x acc then acc else x :: acc
 
-freeGo : List String -> I.Expr -> List String -> List String
+freeGo : List String -> IR.Expr -> List String -> List String
 freeGo bound (EVar x) acc = addFree bound x acc
-freeGo bound (ELam xs b) acc = freeGo (I.appendI xs bound) b acc
+freeGo bound (ELam xs b) acc = freeGo (IR.appendI xs bound) b acc
 freeGo bound (EApp f as) acc =
   List.foldl (\a x -> freeGo bound x a) (freeGo bound f acc) as
 freeGo bound (ELet x a b) acc = freeGo (x :: bound) b (freeGo bound a acc)
@@ -28,7 +28,7 @@ freeGo bound (EProj x _ _ _) acc = freeGo bound x acc
 freeGo bound (ETag _ es) acc = List.foldl (\a x -> freeGo bound x a) acc es
 freeGo bound (EMatch x arms) acc =
   List.foldl
-    (\a arm -> freeGo (I.appendI (I.armVars arm) bound) (I.armBody arm) a)
+    (\a arm -> freeGo (IR.appendI (IR.armVars arm) bound) (IR.armBody arm) a)
     (freeGo bound x acc)
     arms
 freeGo bound (EPrimCall _ es) acc = List.foldl (\a x -> freeGo bound x a) acc es
@@ -37,14 +37,14 @@ freeGo bound (EFix f b) acc = freeGo (f :: bound) b acc
 freeGo bound e acc = acc
 
 -- | the variables `e` mentions and does not bind, but `bound`
-freeVars : List String -> I.Expr -> List String
+freeVars : List String -> IR.Expr -> List String
 freeVars bound e = List.reverse (freeGo bound e Nil)
 
 -- A variable replaced (the names in a program are its own: nothing is
 -- captured)
 --------------------------------------------------------------------------------
 
-replaceGo : String -> I.Expr -> I.Expr -> I.Expr
+replaceGo : String -> IR.Expr -> IR.Expr -> IR.Expr
 replaceGo x r e@(EVar y) = if strEq y x then r else e
 replaceGo x r (ELam xs b) = ELam xs (replaceGo x r b)
 replaceGo x r (EApp f as) = EApp (replaceGo x r f) (List.map (replaceGo x r) as)
@@ -58,7 +58,10 @@ replaceGo x r (EMatch y arms) =
     (replaceGo x r y)
     (List.map
        (\arm ->
-          MkArm (I.armTag arm) (I.armVars arm) (replaceGo x r (I.armBody arm)))
+          MkArm
+            (IR.armTag arm)
+            (IR.armVars arm)
+            (replaceGo x r (IR.armBody arm)))
        arms)
 replaceGo x r (EPrimCall p es) = EPrimCall p (List.map (replaceGo x r) es)
 replaceGo x r (ECall k es) = ECall k (List.map (replaceGo x r) es)
@@ -69,60 +72,63 @@ replaceGo x r e = e
 --------------------------------------------------------------------------------
 
 -- | the globals made so far (the last first), and how many
-type Acc = { out : List I.Def, n : Int }
+type Acc = { out : List IR.Def, n : Int }
 
-type LiftK = { go : I.Def -> Acc -> I.Expr -> Pair I.Expr Acc }
+type LiftK = { go : IR.Def -> Acc -> IR.Expr -> Pair IR.Expr Acc }
 
-consLifted : I.Expr -> Pair (List I.Expr) Acc -> Pair (List I.Expr) Acc
+consLifted : IR.Expr -> Pair (List IR.Expr) Acc -> Pair (List IR.Expr) Acc
 consLifted x (MkPair xs acc) = MkPair (x :: xs) acc
 
 -- (each of a list, in order)
-liftMany : LiftK -> I.Def -> Acc -> List I.Expr -> Pair (List I.Expr) Acc
+liftMany : LiftK -> IR.Def -> Acc -> List IR.Expr -> Pair (List IR.Expr) Acc
 liftMany k d acc Nil = MkPair Nil acc
 liftMany k d acc (x :: xs) = case k.go d acc x of
   MkPair x2 acc2 -> consLifted x2 (liftMany k d acc2 xs)
 
 liftFields : LiftK
-           -> I.Def
+           -> IR.Def
            -> Acc
-           -> List (Pair String I.Expr)
-           -> Pair (List (Pair String I.Expr)) Acc
+           -> List (Pair String IR.Expr)
+           -> Pair (List (Pair String IR.Expr)) Acc
 liftFields k d acc fs = case liftMany k d acc (List.map snd fs) of
   MkPair es acc2 -> MkPair (List.zipWith (\f x -> MkPair (fst f) x) fs es) acc2
 
-liftArms : LiftK -> I.Def -> Acc -> List I.Arm -> Pair (List I.Arm) Acc
-liftArms k d acc arms = case liftMany k d acc (List.map I.armBody arms) of
+liftArms : LiftK -> IR.Def -> Acc -> List IR.Arm -> Pair (List IR.Arm) Acc
+liftArms k d acc arms = case liftMany k d acc (List.map IR.armBody arms) of
   MkPair bs acc2 ->
     MkPair
-      (List.zipWith (\arm b -> MkArm (I.armTag arm) (I.armVars arm) b) arms bs)
+      (List.zipWith
+         (\arm b -> MkArm (IR.armTag arm) (IR.armVars arm) b)
+         arms
+         bs)
       acc2
 
 -- | the global a local definition is, given the variables it takes
-calledAs : String -> List String -> I.Expr
+calledAs : String -> List String -> IR.Expr
 calledAs key Nil = EGlobal key
 calledAs key fvs = EApp (EGlobal key) (List.map (\x -> EVar x) fvs)
 
 -- | its body, taking those variables first
-withParams : List String -> I.Expr -> I.Expr
+withParams : List String -> IR.Expr -> IR.Expr
 withParams Nil b = b
-withParams fvs (ELam xs b) = ELam (I.appendI fvs xs) b
+withParams fvs (ELam xs b) = ELam (IR.appendI fvs xs) b
 withParams fvs b = ELam fvs b
 
 -- | the global of a local definition `f`, of the definition `d`
-liftedDef : I.Def -> Int -> String -> List String -> I.Expr -> I.Def
+liftedDef : IR.Def -> Int -> String -> List String -> IR.Expr -> IR.Def
 liftedDef d n f fvs body =
-  I.mkDef
-    (d.key ^ "." ^ I.baseOf f ^ "$" ^ showInt n)
-    (d.name ^ "." ^ I.baseOf f)
+  IR.mkDef
+    (d.key ^ "." ^ IR.baseOf f ^ "$" ^ showInt n)
+    (d.name ^ "." ^ IR.baseOf f)
     (withParams
        fvs
        (replaceGo
           f
-          (calledAs (d.key ^ "." ^ I.baseOf f ^ "$" ^ showInt n) fvs)
+          (calledAs (d.key ^ "." ^ IR.baseOf f ^ "$" ^ showInt n) fvs)
           body))
 
 -- (the local definition's global, its own local definitions lifted too)
-liftFixDef : LiftK -> Acc -> List String -> I.Def -> Pair I.Expr Acc
+liftFixDef : LiftK -> Acc -> List String -> IR.Def -> Pair IR.Expr Acc
 liftFixDef k acc fvs ld = case k.go
     ld
     { out = acc.out, n = acc.n + 1 }
@@ -130,9 +136,9 @@ liftFixDef k acc fvs ld = case k.go
   MkPair b2 acc2 ->
     MkPair
       (calledAs ld.key fvs)
-      { out = I.mkDef ld.key ld.name b2 :: acc2.out, n = acc2.n }
+      { out = IR.mkDef ld.key ld.name b2 :: acc2.out, n = acc2.n }
 
-liftFix : LiftK -> I.Def -> Acc -> String -> I.Expr -> Pair I.Expr Acc
+liftFix : LiftK -> IR.Def -> Acc -> String -> IR.Expr -> Pair IR.Expr Acc
 liftFix k d acc f body =
   liftFixDef
     k
@@ -140,18 +146,18 @@ liftFix k d acc f body =
     (freeVars (f :: Nil) body)
     (liftedDef d acc.n f (freeVars (f :: Nil) body) body)
 
-fixOf : I.Expr -> Maybe (Pair String I.Expr)
+fixOf : IR.Expr -> Maybe (Pair String IR.Expr)
 fixOf (EFix f b) = Just (MkPair f b)
 fixOf e = Nothing
 
 -- (`\x -> b`, of one parameter)
-oneParam : I.Expr -> Maybe (Pair String I.Expr)
+oneParam : IR.Expr -> Maybe (Pair String IR.Expr)
 oneParam (ELam xs b) = case xs of
   x :: Nil -> Just (MkPair x b)
   _ -> Nothing
 oneParam e = Nothing
 
-liftArgs : LiftK -> I.Def -> Acc -> I.Expr -> List I.Expr -> Pair I.Expr Acc
+liftArgs : LiftK -> IR.Def -> Acc -> IR.Expr -> List IR.Expr -> Pair IR.Expr Acc
 liftArgs k d acc f as = case liftMany k d acc (f :: as) of
   MkPair (f2 :: as2) acc2 -> MkPair (EApp f2 as2) acc2
   MkPair Nil acc2 -> MkPair (EApp f as) acc2
@@ -160,25 +166,25 @@ liftArgs k d acc f as = case liftMany k d acc (f :: as) of
 -- name is its global, given the variables, wherever it is used -- so that
 -- what is defined after it takes those variables, not it)
 liftRedex : LiftK
-          -> I.Def
+          -> IR.Def
           -> Acc
           -> String
-          -> I.Expr
-          -> I.Expr
-          -> Pair I.Expr Acc
+          -> IR.Expr
+          -> IR.Expr
+          -> Pair IR.Expr Acc
 liftRedex k d acc x b a = case fixOf a of
   Just (MkPair f fb) -> case liftFix k d acc f fb of
     MkPair call acc2 -> k.go d acc2 (replaceGo x call b)
   Nothing -> liftArgs k d acc (ELam [x] b) [a]
 
-liftApp : LiftK -> I.Def -> Acc -> I.Expr -> List I.Expr -> Pair I.Expr Acc
+liftApp : LiftK -> IR.Def -> Acc -> IR.Expr -> List IR.Expr -> Pair IR.Expr Acc
 liftApp k d acc f as = case oneParam f of
   Just (MkPair x b) -> case as of
     a :: Nil -> liftRedex k d acc x b a
     _ -> liftArgs k d acc f as
   Nothing -> liftArgs k d acc f as
 
-liftGo : LiftK -> I.Def -> Acc -> I.Expr -> Pair I.Expr Acc
+liftGo : LiftK -> IR.Def -> Acc -> IR.Expr -> Pair IR.Expr Acc
 liftGo k d acc (EFix f b) = liftFix k d acc f b
 liftGo k d acc (ELam xs b) = case k.go d acc b of
   MkPair b2 acc2 -> MkPair (ELam xs b2) acc2
@@ -205,12 +211,12 @@ lk : LiftK
 lk = { go = \d acc e -> liftGo lk d acc e }
 
 -- | a definition, and the globals of its local definitions
-liftDef : I.Def -> List I.Def
+liftDef : IR.Def -> List IR.Def
 liftDef d = case lk.go d { out = Nil, n = 0 } d.body of
-  MkPair b acc -> I.mkDef d.key d.name b :: List.reverse acc.out
+  MkPair b acc -> IR.mkDef d.key d.name b :: List.reverse acc.out
 
 -- | every local definition of the program a global of its own
--- | >>> List.map (\(d : I.Def) -> d.body) (liftProgram [I.mkDef "m.f" "f" (ELam ["n"] (ELet "go" (EFix "go" (ELam ["i"] (EApp (EVar "go") [EVar "n"]))) (EApp (EVar "go") [EInt 0])))])
+-- | >>> List.map (\(d : IR.Def) -> d.body) (liftProgram [IR.mkDef "m.f" "f" (ELam ["n"] (ELet "go" (EFix "go" (ELam ["i"] (EApp (EVar "go") [EVar "n"]))) (EApp (EVar "go") [EInt 0])))])
 -- | Cons (ELam (Cons "n" Nil) (ELet "go" (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (EApp (EVar "go") (Cons (EInt 0) Nil)))) (Cons (ELam (Cons "n" (Cons "i" Nil)) (EApp (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (Cons (EVar "n") Nil))) Nil)
-liftProgram : List I.Def -> List I.Def
+liftProgram : List IR.Def -> List IR.Def
 liftProgram defs = List.concatMap liftDef defs

@@ -60,13 +60,13 @@ unit test checks; a property draws values from generators
 ```haskell
 import check
 import co
-import gen as G
+import gen as Gen
 
 lists : Test
 lists = group "lists"
   [ unit "append" (assertEqual (showList showInt) ([1] ++ [2]) [1, 2])
   , property "reversed twice" (do
-      xs <- forAll (showList showInt) (G.list 0 20 (G.int 0 99))
+      xs <- forAll (showList showInt) (Gen.list 0 20 (Gen.int 0 99))
       label (if List.null xs then "empty" else "not empty")
       assertEqual (showList showInt) (List.reverse (List.reverse xs)) xs)
   ]

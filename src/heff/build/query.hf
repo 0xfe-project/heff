@@ -3,18 +3,18 @@
 -- there), every occurrence of what a name refers to, and an outline.
 
 import heff.syntax.diagnostic
-import heff.build.driver as Dr
-import heff.elab.environment as Env
-import heff.elab.globals as G
-import heff.elab.locals as Lc
-import heff.elab.params as Pm
-import heff.syntax.presyntax as Notation
-import heff.syntax.surfaceprint as Ps
-import heff.elab.readback as R
-import heff.lsp.render as Dg
-import heff.elab.syntax as Sx
-import heff.elab.toplevel as T
-import map as Mp
+import heff.build.driver as Driver
+import heff.elab.environment as Environment
+import heff.elab.globals as Globals
+import heff.elab.locals as Locals
+import heff.elab.params as Params
+import heff.syntax.presyntax as Presyntax
+import heff.syntax.surfaceprint as SurfacePrint
+import heff.elab.readback as Readback
+import heff.lsp.render as Render
+import heff.elab.syntax as Syntax
+import heff.elab.toplevel as TopLevel
+import map as Map
 
 -- Small things
 --------------------------------------------------------------------------------
@@ -24,10 +24,10 @@ catMaybesQ Nil = Nil
 catMaybesQ (Cons (Just x) rest) = Cons x (catMaybesQ rest)
 catMaybesQ (Cons Nothing rest) = catMaybesQ rest
 
-sameSpan : Pm.Span -> Pm.Span -> Bool
+sameSpan : Params.Span -> Params.Span -> Bool
 sameSpan a b = a.start == b.start && a.end == b.end
 
-mkSpan : Int -> Int -> Pm.Span
+mkSpan : Int -> Int -> Params.Span
 mkSpan s e = { start = s, end = e }
 
 -- | a character of a name (a module path's `/` too)
@@ -47,7 +47,7 @@ wordAt src p x =
   && not (isNameChar (byteAt src (p + strLength x)))
 
 -- | the first occurrence of a name, as a word, in a span (else the span)
-nameInGo : String -> String -> Pm.Span -> Int -> Pm.Span
+nameInGo : String -> String -> Params.Span -> Int -> Params.Span
 nameInGo src x sp from = case indexFrom x src from of
   Just p ->
     if p + strLength x <= sp.end
@@ -56,7 +56,7 @@ nameInGo src x sp from = case indexFrom x src from of
     else sp
   Nothing -> sp
 
-nameIn : String -> String -> Pm.Span -> Pm.Span
+nameIn : String -> String -> Params.Span -> Params.Span
 nameIn src x sp = nameInGo src x sp sp.start
 
 stripPrefixS : String -> String -> Maybe String
@@ -64,37 +64,39 @@ stripPrefixS pre s =
   if startsWith pre s then Just (strSlice s (strLength pre) (strLength s))
   else Nothing
 
-nubByStart : List Pm.Span -> List Pm.Span
+nubByStart : List Params.Span -> List Params.Span
 nubByStart Nil = Nil
 nubByStart (Cons x xs) =
-  Cons x (nubByStart (List.filter (\(y : Pm.Span) -> y.start /= x.start) xs))
+  Cons
+    x
+    (nubByStart (List.filter (\(y : Params.Span) -> y.start /= x.start) xs))
 
-sortSpans : List Pm.Span -> List Pm.Span
+sortSpans : List Params.Span -> List Params.Span
 sortSpans xs =
-  List.sortBy (\(a : Pm.Span) (b : Pm.Span) -> a.start <= b.start) xs
+  List.sortBy (\(a : Params.Span) (b : Params.Span) -> a.start <= b.start) xs
 
 -- The trace
 --------------------------------------------------------------------------------
 
-atLine : String -> Pm.Span -> String
+atLine : String -> Params.Span -> String
 atLine src sp =
-  showInt ((Dg.lineCol src sp.start).line + 1)
+  showInt ((Render.lineCol src sp.start).line + 1)
   ^ ":"
-  ^ showInt ((Dg.lineCol src sp.start).col + 1)
+  ^ showInt ((Render.lineCol src sp.start).col + 1)
 
 -- | the elaboration trace of a file, one line per event: where, what
-explain : Dr.Checked -> List String
+explain : Driver.Checked -> List String
 explain c =
   List.append
     (List.map
-       (\(ev : Env.TraceEvent) ->
+       (\(ev : Environment.TraceEvent) ->
           atLine c.source ev.span ^ "  " ^ ev.kind ^ "  " ^ ev.text MkUnit)
        c.top.trace)
     (List.map
        (\(d : Diag) ->
           atLine c.source d.span
           ^ "  "
-          ^ Dg.severityWord d.severity
+          ^ Render.severityWord d.severity
           ^ "  "
           ^ d.msg)
        c.diags)
@@ -102,19 +104,20 @@ explain c =
 -- The name at an offset
 --------------------------------------------------------------------------------
 
-infoLen : Env.Info -> Int
+infoLen : Environment.Info -> Int
 infoLen i = i.span.end - i.span.start
 
 -- | the name at an offset: one written there, the innermost.  (What `do`
 -- | is read into, `bind`, is no name written: its span is the block's,
 -- | wider than the name, and it must not hide what is in the block.)
-infoAt : Dr.Checked -> Int -> Maybe Env.Info
+infoAt : Driver.Checked -> Int -> Maybe Environment.Info
 infoAt c off =
   List.head
     (List.sortBy
-       (\(a : Env.Info) (b : Env.Info) -> infoLen a <= infoLen b)
+       (\(a : Environment.Info) (b : Environment.Info) ->
+          infoLen a <= infoLen b)
        (List.filter
-          (\(i : Env.Info) ->
+          (\(i : Environment.Info) ->
              -- (a field is written with its `.`: `.x`)
              infoLen
                i
@@ -124,11 +127,11 @@ infoAt c off =
           c.top.infos))
 
 -- | what the name at an offset resolved to, and its type
-typeAt : Dr.Checked -> Int -> Maybe String
+typeAt : Driver.Checked -> Int -> Maybe String
 typeAt c off = case infoAt c off of
   Just i ->
     Just
-      (Ps.named i.name
+      (SurfacePrint.named i.name
        ^ " : "
        ^ i.ty MkUnit
        ^ (case i.key of
@@ -157,14 +160,14 @@ lastDot s i =
 
 type Completion = { label : String, detail : String }
 
-completionDetail : Dr.Checked -> String -> String
-completionDetail c x = case G.lookupName c.top.globals x of
-  Just e -> Dr.showTySx c.top.globals (R.readbTy 0 e.type_)
-  Nothing -> case G.lookupEntry c.top.globals (c.module ^ "." ^ x) of
-    Just e -> Dr.showTySx c.top.globals (R.readbTy 0 e.type_)
+completionDetail : Driver.Checked -> String -> String
+completionDetail c x = case Globals.lookupName c.top.globals x of
+  Just e -> Driver.showTySx c.top.globals (Readback.readbTy 0 e.type_)
+  Nothing -> case Globals.lookupEntry c.top.globals (c.module ^ "." ^ x) of
+    Just e -> Driver.showTySx c.top.globals (Readback.readbTy 0 e.type_)
     Nothing -> ""
 
-completionOf : Dr.Checked -> String -> String -> String -> Maybe Completion
+completionOf : Driver.Checked -> String -> String -> String -> Maybe Completion
 completionOf c typed qualifier x =
   if startsWith typed x && (not (strEq qualifier "") || not (contains "." x))
     then Just
@@ -178,27 +181,28 @@ qualifierOf typed = case lastDot typed (strLength typed - 1) of
   Just i -> strSlice typed 0 (i + 1)
   Nothing -> ""
 
-typedAt : Dr.Checked -> Int -> String
+typedAt : Driver.Checked -> Int -> String
 typedAt c offset = strSlice c.source (typedFrom c.source offset) offset
 
 -- (a primitive is named by its key, by no alias)
-primitiveName : String -> Sx.Tm -> Maybe String
+primitiveName : String -> Syntax.Tm -> Maybe String
 primitiveName k (SPrim _) = Just k
 primitiveName k _ = Nothing
 
 -- | the primitives in scope, the library's
-primitivesIn : G.Globals -> List String
+primitivesIn : Globals.Globals -> List String
 primitivesIn g =
   catMaybesQ
     (List.map
-       (\(p : Pair String G.Entry) -> primitiveName (fst p) (snd p).syntax)
-       (G.globalsList g))
+       (\(p : Pair String Globals.Entry) ->
+          primitiveName (fst p) (snd p).syntax)
+       (Globals.globalsList g))
 
 -- | What may be written where the name being typed ends, at `offset`:
 -- | the names in scope that start as it does, the primitives too, each
 -- | with its type.  After `M.`, the definitions of the module imported as
 -- | `M`, without the `M.`.
-completionsAt : Dr.Checked -> Int -> List Completion
+completionsAt : Driver.Checked -> Int -> List Completion
 completionsAt c offset =
   List.sortBy
     (\(a : Completion) (b : Completion) -> not (strLt b.label a.label))
@@ -210,11 +214,11 @@ completionsAt c offset =
                (typedAt c offset)
                (qualifierOf (typedAt c offset))
                x)
-          (Dr.nubStrD
+          (Driver.nubStrD
              (List.append
-                (List.map (\(o : Dr.Own) -> o.name) c.own)
+                (List.map (\(o : Driver.Own) -> o.name) c.own)
                 (List.append
-                   (Mp.keys c.top.globals.aliases)
+                   (Map.keys c.top.globals.aliases)
                    (primitivesIn c.top.globals))))))
 
 -- References
@@ -223,7 +227,7 @@ completionsAt c offset =
 -- | What a name refers to: a global, by its key; a tag or a field
 -- | (`member`) of the type `key` names; or a local (`local`: where its
 -- | binder is) of the file `key` is the path of.
-type Target = { key : String, member : Maybe String, local : Maybe Pm.Span }
+type Target = { key : String, member : Maybe String, local : Maybe Params.Span }
 
 globalT : String -> Target
 globalT k = { key = k, member = Nothing, local = Nothing }
@@ -231,7 +235,7 @@ globalT k = { key = k, member = Nothing, local = Nothing }
 memberT : String -> String -> Target
 memberT k m = { key = k, member = Just m, local = Nothing }
 
-localT : String -> Pm.Span -> Target
+localT : String -> Params.Span -> Target
 localT path b = { key = path, member = Nothing, local = Just b }
 
 eqMaybeStr : Maybe String -> Maybe String -> Bool
@@ -239,7 +243,7 @@ eqMaybeStr Nothing Nothing = True
 eqMaybeStr (Just a) (Just b) = strEq a b
 eqMaybeStr _ _ = False
 
-eqMaybeSpan : Maybe Pm.Span -> Maybe Pm.Span -> Bool
+eqMaybeSpan : Maybe Params.Span -> Maybe Params.Span -> Bool
 eqMaybeSpan Nothing Nothing = True
 eqMaybeSpan (Just a) (Just b) = sameSpan a b
 eqMaybeSpan _ _ = False
@@ -253,52 +257,52 @@ eqTarget a b =
 -- | a name written in a file; the span is the name's alone; `defines`:
 -- | where it is defined
 type Occurrence =
-  { path : String, source : String, span : Pm.Span, defines : Bool }
+  { path : String, source : String, span : Params.Span, defines : Bool }
 
-type Site = { target : Target, name : String, span : Pm.Span }
+type Site = { target : Target, name : String, span : Params.Span }
 
-type Named = { name : String, span : Pm.Span }
+type Named = { name : String, span : Params.Span }
 
-keyOf : Dr.Checked -> String -> Maybe String
-keyOf c x = case List.find (\(o : Dr.Own) -> strEq o.name x) c.own of
+keyOf : Driver.Checked -> String -> Maybe String
+keyOf c x = case List.find (\(o : Driver.Own) -> strEq o.name x) c.own of
   Just o -> Just o.key
   Nothing -> Nothing
 
 -- (the name alone: a tag's `'` is not part of it)
-site : Target -> String -> Pm.Span -> Site
+site : Target -> String -> Params.Span -> Site
 site t x sp =
   { target = t
   , name = x
   , span = mkSpan (max sp.start (sp.end - strLength x)) sp.end
   }
 
-globalSites : Dr.Checked -> String -> List Pm.Span -> List Site
+globalSites : Driver.Checked -> String -> List Params.Span -> List Site
 globalSites c x sps = case keyOf c x of
   Just k -> List.map (\sp -> site (globalT k) x sp) sps
   Nothing -> Nil
 
-memberSites : Dr.Checked -> String -> List Named -> List Site
+memberSites : Driver.Checked -> String -> List Named -> List Site
 memberSites c x ms = case keyOf c x of
   Just k -> List.map (\(m : Named) -> site (memberT k m.name) m.name m.span) ms
   Nothing -> Nil
 
-tagOf : Pm.Spanned (Notation.Variant Notation.Expr) -> Maybe Named
+tagOf : Params.Spanned (Presyntax.Variant Presyntax.Expr) -> Maybe Named
 tagOf (At (TagVariant t tsp _) _) = Just { name = t, span = tsp }
 tagOf _ = Nothing
 
-fieldOf : Pm.Spanned (Notation.FieldDecl Notation.Expr Notation.Expr)
+fieldOf : Params.Spanned (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)
         -> Maybe Named
 fieldOf (At (DeclareField x sp _ _) _) = Just { name = x, span = sp }
 fieldOf _ = Nothing
 
-sumTags : Notation.Expr -> List Named
+sumTags : Presyntax.Expr -> List Named
 sumTags (At (ESum alts) _) = catMaybesQ (List.map tagOf alts)
 sumTags _ = Nil
 
-equationHead : Pm.Spanned (Notation.Equation Notation.Expr) -> Pm.Span
+equationHead : Params.Spanned (Presyntax.Equation Presyntax.Expr) -> Params.Span
 equationHead (At (MkEquation _ fsp _ _) _) = fsp
 
-declSites : Dr.Checked -> Notation.Decl -> List Site
+declSites : Driver.Checked -> Presyntax.Decl -> List Site
 declSites c (At (DeclEquations f fsp _ _ eqs) _) =
   globalSites c f (Cons fsp (List.map equationHead eqs))
 -- (a definition with named arguments, `data Pair a b = ...`: its name
@@ -316,27 +320,27 @@ declSites c _ = Nil
 -- | declaration's name, in its signature and at the head of each
 -- | equation; a `data`'s tags; a `theory`'s fields.  (A declaration that
 -- | did not elaborate defines nothing to refer to.)
-sites : Dr.Checked -> List Site
+sites : Driver.Checked -> List Site
 sites c = List.concatMap (\d -> declSites c d) c.decls
 
 -- | where the global the name at an offset resolved to is defined, in a
 -- | program (the file last): its file, and the span of its name there.
 -- | (A local's binder is not kept by the elaborator: nothing, for one.)
-type Definition = { path : String, source : String, span : Pm.Span }
+type Definition = { path : String, source : String, span : Params.Span }
 
-type Defines = { c : Dr.Checked, name : String, span : Pm.Span }
+type Defines = { c : Driver.Checked, name : String, span : Params.Span }
 
 definesGo : String
-          -> Dr.Checked
-          -> List Dr.Own
-          -> List (Pair String Pm.Span)
+          -> Driver.Checked
+          -> List Driver.Own
+          -> List (Pair String Params.Span)
           -> Maybe Defines
 definesGo k c (Cons o os) (Cons (MkPair _ sp) sps) =
   if strEq o.key k then Just { c = c, name = o.name, span = sp }
   else definesGo k c os sps
 definesGo k c _ _ = Nothing
 
-definitionIn : Env.Info -> String -> Defines -> Definition
+definitionIn : Environment.Info -> String -> Defines -> Definition
 definitionIn i k d =
   { path = d.c.path
   , source = d.c.source
@@ -351,7 +355,7 @@ definitionIn i k d =
       Nothing -> nameIn d.c.source i.name d.span
   }
 
-definitionAt : List Dr.Checked -> Int -> Maybe Definition
+definitionAt : List Driver.Checked -> Int -> Maybe Definition
 definitionAt program off = case List.last program of
   Nothing -> Nothing
   Just c -> case infoAt c off of
@@ -364,7 +368,7 @@ definitionAt program off = case List.last program of
         case List.head
           (catMaybesQ
              (List.map
-                (\(c2 : Dr.Checked) -> definesGo k c2 c2.own c2.top.spans)
+                (\(c2 : Driver.Checked) -> definesGo k c2 c2.own c2.top.spans)
                 (List.reverse program))) of
         Just d -> Just (definitionIn i k d)
         Nothing -> Nothing
@@ -372,28 +376,28 @@ definitionAt program off = case List.last program of
 -- | a target found, and the name it is defined as
 type Found = { target : Target, name : String }
 
-ownNameOf : List Dr.Checked -> String -> Maybe String
+ownNameOf : List Driver.Checked -> String -> Maybe String
 ownNameOf Nil k = Nothing
 ownNameOf (Cons c rest) k = case List.find
-    (\(o : Dr.Own) -> strEq o.key k)
+    (\(o : Driver.Own) -> strEq o.key k)
     c.own of
   Just o -> Just o.name
   Nothing -> ownNameOf rest k
 
-withName : List Dr.Checked -> Target -> Maybe Found
+withName : List Driver.Checked -> Target -> Maybe Found
 withName program t@{ member = Just m } = Just { target = t, name = m }
 withName program t@{ member = Nothing } = case ownNameOf program t.key of
   Just x -> Just { target = t, name = x }
   Nothing -> Nothing
 
-atOff : Int -> Pm.Span -> Bool
+atOff : Int -> Params.Span -> Bool
 atOff off sp = sp.start <= off && off <= sp.end
 
 orElse : {a : Type} -> Maybe a -> Maybe a -> Maybe a
 orElse (Just x) _ = Just x
 orElse Nothing y = y
 
-siteFound : List Dr.Checked -> Dr.Checked -> Int -> Maybe Found
+siteFound : List Driver.Checked -> Driver.Checked -> Int -> Maybe Found
 siteFound program c off = case List.find
     (\(s : Site) -> atOff off s.span)
     (sites c) of
@@ -401,27 +405,35 @@ siteFound program c off = case List.find
   Nothing -> Nothing
 
 -- (a field used by the fields after it: the field's)
-fieldFound : List Dr.Checked -> Dr.Checked -> Lc.Locals -> Int -> Maybe Found
+fieldFound : List Driver.Checked
+           -> Driver.Checked
+           -> Locals.Locals
+           -> Int
+           -> Maybe Found
 fieldFound program c ls off = case List.find
-    (\(f : Lc.FieldUse) -> atOff off f.use)
+    (\(f : Locals.FieldUse) -> atOff off f.use)
     ls.fields of
   Just f -> case List.find (\(s : Site) -> sameSpan s.span f.field) (sites c) of
     Just s -> withName program s.target
     Nothing -> Nothing
   Nothing -> Nothing
 
-atLocal : Int -> Lc.Local -> Bool
+atLocal : Int -> Locals.Local -> Bool
 atLocal off l = atOff off l.binder || List.any (\sp -> atOff off sp) l.uses
 
-foundLocal : String -> Lc.Local -> Found
+foundLocal : String -> Locals.Local -> Found
 foundLocal path l = { target = localT path l.binder, name = l.name }
 
-localFound : Dr.Checked -> Lc.Locals -> Int -> Maybe Found
+localFound : Driver.Checked -> Locals.Locals -> Int -> Maybe Found
 localFound c ls off = case List.find (\l -> atLocal off l) ls.locals of
   Just l -> Just (foundLocal c.path l)
   Nothing -> Nothing
 
-targetIn : List Dr.Checked -> Dr.Checked -> Lc.Locals -> Int -> Maybe Found
+targetIn : List Driver.Checked
+         -> Driver.Checked
+         -> Locals.Locals
+         -> Int
+         -> Maybe Found
 targetIn program c ls off = case infoAt c off of
   Just i -> case i.key of
     Just k ->
@@ -438,13 +450,13 @@ targetIn program c ls off = case infoAt c off of
 -- | the name at an offset, in a program (the file last), as what it
 -- | refers to: a global or a member used there, or one the file defines
 -- | there; a local, at its binder or a use; and the name it is defined as
-targetAt : List Dr.Checked -> Int -> Maybe Found
+targetAt : List Driver.Checked -> Int -> Maybe Found
 targetAt program off = case List.last program of
-  Just c -> targetIn program c (Lc.locals c.decls) off
+  Just c -> targetIn program c (Locals.locals c.decls) off
   Nothing -> Nothing
 
 -- (a name's use, as the elaborator recorded it: the name alone)
-useOf : Target -> String -> Env.Info -> Maybe Pm.Span
+useOf : Target -> String -> Environment.Info -> Maybe Params.Span
 useOf t name i =
   if eqMaybeStr i.key (Just t.key)
   && (if i.member then eqMaybeStr t.member (Just i.name)
@@ -453,7 +465,7 @@ useOf t name i =
         (mkSpan (max i.span.start (i.span.end - strLength name)) i.span.end)
   else Nothing
 
-type Word = { text : String, span : Pm.Span }
+type Word = { text : String, span : Params.Span }
 
 -- (a line's words, split at spaces, where they are)
 wordsOf : Int -> String -> Int -> List Word -> List Word
@@ -474,7 +486,7 @@ wordsOf base line i acc =
          }
          acc)
 
-fixityWords : String -> List Word -> List Pm.Span
+fixityWords : String -> List Word -> List Params.Span
 fixityWords name ws@(Cons w _) =
   if strEq w.text "infixl" || strEq w.text "infixr" || strEq w.text "infix"
     then List.map
@@ -484,7 +496,7 @@ fixityWords name ws@(Cons w _) =
 fixityWords name Nil = Nil
 
 -- (`infixl + - above ==`: its words that are the name)
-fixityLine : String -> String -> Int -> List Pm.Span
+fixityLine : String -> String -> Int -> List Params.Span
 fixityLine name src p =
   fixityWords
     name
@@ -506,8 +518,8 @@ wordsIn : (Int -> Bool)
         -> String
         -> Int
         -> Int
-        -> List Pm.Span
-        -> List Pm.Span
+        -> List Params.Span
+        -> List Params.Span
 wordsIn fits name src i to acc = case indexFrom name src i of
   Just p ->
     if p + strLength name <= to
@@ -568,32 +580,32 @@ expectedFits t src n p =
       else not (isLabelAt src p n))
 
 -- (in a watch's expectation, a doc test's too, as text)
-expectedIn : Target -> String -> Dr.Checked -> List Pm.Span
+expectedIn : Target -> String -> Driver.Checked -> List Params.Span
 expectedIn t name c =
   List.concatMap
-    (\(w : T.Watch) ->
+    (\(w : TopLevel.Watch) ->
        wordsIn
          (\p -> expectedFits t c.source (strLength name) p)
          name
          c.source
-         (Dr.expectation c.source w.span).from
-         (Dr.expectation c.source w.span).to
+         (Driver.expectation c.source w.span).from
+         (Driver.expectation c.source w.span).to
          Nil)
     c.top.watches
 
 isOperatorName : String -> Bool
 isOperatorName name = not (isNameChar (byteAt name 0))
 
-fieldUsesOf : List Site -> Lc.Locals -> List Pm.Span
+fieldUsesOf : List Site -> Locals.Locals -> List Params.Span
 fieldUsesOf ss ls =
   List.map
-    (\(f : Lc.FieldUse) -> f.use)
+    (\(f : Locals.FieldUse) -> f.use)
     (List.filter
-       (\(f : Lc.FieldUse) ->
+       (\(f : Locals.FieldUse) ->
           List.any (\(s : Site) -> sameSpan s.span f.field) ss)
        ls.fields)
 
-moreIn : Target -> String -> Dr.Checked -> List Pm.Span
+moreIn : Target -> String -> Driver.Checked -> List Params.Span
 moreIn t name c =
   List.append
     (if isOperatorName name && eqMaybeStr t.member Nothing
@@ -603,25 +615,28 @@ moreIn t name c =
      else Nil)
     (if isOperatorName name then Nil else expectedIn t name c)
 
-mkOccurrence : Dr.Checked -> Pm.Span -> Bool -> Occurrence
+mkOccurrence : Driver.Checked -> Params.Span -> Bool -> Occurrence
 mkOccurrence c sp defines =
   { path = c.path, source = c.source, span = sp, defines = defines }
 
-occurrencesOf : Dr.Checked -> List Pm.Span -> List Pm.Span -> List Occurrence
+occurrencesOf : Driver.Checked
+              -> List Params.Span
+              -> List Params.Span
+              -> List Occurrence
 occurrencesOf c defs spans =
   List.map
     (\sp ->
        mkOccurrence
          c
          sp
-         (List.any (\(d : Pm.Span) -> d.start == sp.start) defs))
+         (List.any (\(d : Params.Span) -> d.start == sp.start) defs))
     (nubByStart (sortSpans spans))
 
 inFileFound : Target
             -> String
-            -> Dr.Checked
+            -> Driver.Checked
             -> List Site
-            -> List Pm.Span
+            -> List Params.Span
             -> List Occurrence
 inFileFound t name c ss found =
   occurrencesOf
@@ -629,7 +644,7 @@ inFileFound t name c ss found =
     (List.map (\(s : Site) -> s.span) ss)
     (List.append found (if List.null found then Nil else moreIn t name c))
 
-inFileSites : Target -> String -> Dr.Checked -> List Site -> List Occurrence
+inFileSites : Target -> String -> Driver.Checked -> List Site -> List Occurrence
 inFileSites t name c ss =
   inFileFound
     t
@@ -640,9 +655,9 @@ inFileSites t name c ss =
        (catMaybesQ (List.map (\i -> useOf t name i) c.top.infos))
        (List.append
           (List.map (\(s : Site) -> s.span) ss)
-          (fieldUsesOf ss (Lc.locals c.decls))))
+          (fieldUsesOf ss (Locals.locals c.decls))))
 
-inFile : Target -> String -> Dr.Checked -> List Occurrence
+inFile : Target -> String -> Driver.Checked -> List Occurrence
 inFile t name c =
   inFileSites
     t
@@ -650,24 +665,24 @@ inFile t name c =
     c
     (List.filter (\(s : Site) -> eqTarget s.target t) (sites c))
 
-nubByPath : List Dr.Checked -> List Dr.Checked
+nubByPath : List Driver.Checked -> List Driver.Checked
 nubByPath Nil = Nil
 nubByPath (Cons c cs) =
   Cons
     c
     (nubByPath
-       (List.filter (\(d : Dr.Checked) -> not (strEq d.path c.path)) cs))
+       (List.filter (\(d : Driver.Checked) -> not (strEq d.path c.path)) cs))
 
-sameBinder : Pm.Span -> Lc.Local -> Bool
+sameBinder : Params.Span -> Locals.Local -> Bool
 sameBinder b l = sameSpan l.binder b
 
-spansOfLocal : Lc.Local -> List Pm.Span
+spansOfLocal : Locals.Local -> List Params.Span
 spansOfLocal l = Cons l.binder l.uses
 
-localOccurrences : Dr.Checked -> Pm.Span -> List Occurrence
+localOccurrences : Driver.Checked -> Params.Span -> List Occurrence
 localOccurrences c b = case List.find
     (\l -> sameBinder b l)
-    (Lc.locals c.decls).locals of
+    (Locals.locals c.decls).locals of
   Just l ->
     List.map
       (\sp -> mkOccurrence c sp (sameSpan sp b))
@@ -679,9 +694,9 @@ localOccurrences c b = case List.find
 -- | elaborator's record of each -- and, as text, in the files that use
 -- | it, in a fixity declaration (an operator) and in a watch's
 -- | expectation (a local: its binder and its uses, in its file)
-occurrences : List Dr.Checked -> Target -> String -> List Occurrence
+occurrences : List Driver.Checked -> Target -> String -> List Occurrence
 occurrences program t@{ local = Just b } name = case List.find
-    (\(c : Dr.Checked) -> strEq c.path t.key)
+    (\(c : Driver.Checked) -> strEq c.path t.key)
     program of
   Just c -> localOccurrences c b
   Nothing -> Nil
@@ -799,7 +814,7 @@ docMarkdown ls =
 -- | the documentation of the global the name at an offset resolved to,
 -- | in a program (the file last): the doc comment above its definition,
 -- | as Markdown ("" where there is none)
-docAt : List Dr.Checked -> Int -> String
+docAt : List Driver.Checked -> Int -> String
 docAt program off = case definitionAt program off of
   Just d -> docMarkdown (docLines d.source (lineStartOf d.source d.span.start))
   Nothing -> ""
@@ -807,7 +822,7 @@ docAt program off = case definitionAt program off of
 -- Symbols
 --------------------------------------------------------------------------------
 
-type Child = { name : String, kind : Int, span : Pm.Span }
+type Child = { name : String, kind : Int, span : Params.Span }
 
 -- | a file's definitions, for an outline: each with where it is, where
 -- | its name is, and its tags or fields, or its local definitions (the
@@ -816,8 +831,8 @@ type Child = { name : String, kind : Int, span : Pm.Span }
 type DocSymbol =
   { name : String
   , kind : Int
-  , span : Pm.Span
-  , selection : Pm.Span
+  , span : Params.Span
+  , selection : Params.Span
   , children : List Child
   }
 
@@ -829,7 +844,7 @@ kindOf x text =
   else 12
 
 -- (one that did not elaborate, not even its type: still where it is)
-brokenSymbol : Dr.Checked -> Pair String Pm.Span -> DocSymbol
+brokenSymbol : Driver.Checked -> Pair String Params.Span -> DocSymbol
 brokenSymbol c (MkPair x sp) =
   { name = x
   , kind = kindOf x (strSlice c.source sp.start sp.end)
@@ -847,7 +862,7 @@ childOf isData m =
   { name = m.name, kind = if isData then 22 else 8, span = m.span }
 
 -- | a local definition (`where`), as a child of what it is in
-localChild : Notation.Decl -> List Child
+localChild : Presyntax.Decl -> List Child
 localChild (At (DeclEquations f fsp _ _ _) _) =
   [{ name = f, kind = 12, span = fsp }]
 localChild _ = Nil
@@ -855,20 +870,20 @@ localChild _ = Nil
 -- | what a walk for local definitions looks in: the expressions in an
 -- | expression, in a declaration, in the order they are written
 type Children =
-  { e : Notation.Expr -> List Child, decl : Notation.Decl -> List Child }
+  { e : Presyntax.Expr -> List Child, decl : Presyntax.Decl -> List Child }
 
 paramChildren : Children
-              -> Pm.Spanned (Notation.Param Notation.Expr)
+              -> Params.Spanned (Presyntax.Param Presyntax.Expr)
               -> List Child
 paramChildren r (At (ExplicitParam _ _ t) _) = r.e t
 paramChildren r (At (ImplicitParam _ _ t) _) = r.e t
 
 equationChildren : Children
-                 -> Pm.Spanned (Notation.Equation Notation.Expr)
+                 -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
                  -> List Child
 equationChildren r (At (MkEquation _ _ _ rhs) _) = r.e rhs
 
-localDeclF : Children -> Notation.Decl -> List Child
+localDeclF : Children -> Presyntax.Decl -> List Child
 localDeclF r (At (DeclEquations _ _ _ ty eqs) _) =
   List.append (r.e ty) (List.concatMap (\eq -> equationChildren r eq) eqs)
 localDeclF r (At (DeclDefine _ _ ps u body) _) =
@@ -883,47 +898,50 @@ localDeclF r (At (DeclWatch e) _) = r.e e
 
 -- | the local definitions in a declaration, those in them too
 piChildren : Children
-           -> Notation.PiBinder Notation.Expr Notation.Expr
+           -> Presyntax.PiBinder Presyntax.Expr Presyntax.Expr
            -> List Child
 piChildren r (PiNamed _ _ t) = r.e t
 piChildren r (PiImplicit _ _ _ t d) = List.append (r.e t) (maybe Nil r.e d)
 piChildren r (PiInstance _ _ _ t) = r.e t
 piChildren r (PiAnon t) = r.e t
 
-lamChildren : Children -> Notation.LamBinder Notation.Expr -> List Child
+lamChildren : Children -> Presyntax.LamBinder Presyntax.Expr -> List Child
 lamChildren r (LamAnn _ _ t) = r.e t
 lamChildren r _ = Nil
 
 fieldDeclChildren : Children
-                  -> Pm.Spanned (Notation.FieldDecl Notation.Expr Notation.Expr)
+                  -> Params.Spanned
+                    (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)
                   -> List Child
 fieldDeclChildren r (At (DeclareField _ _ t d) _) =
   List.append (r.e t) (maybe Nil r.e d)
 fieldDeclChildren r (At (BadFieldDecl e) _) = r.e e
 
 variantChildren : Children
-                -> Pm.Spanned (Notation.Variant Notation.Expr)
+                -> Params.Spanned (Presyntax.Variant Presyntax.Expr)
                 -> List Child
 variantChildren r (At (TagVariant _ _ args) _) = List.concatMap r.e args
 variantChildren r (At (BadVariant e) _) = r.e e
 
 fieldSetChildren : Children
-                 -> Pm.Spanned (Notation.FieldSet Notation.Expr)
+                 -> Params.Spanned (Presyntax.FieldSet Presyntax.Expr)
                  -> List Child
 fieldSetChildren r (At (SetField _ _ e) _) = r.e e
 fieldSetChildren r (At (BadFieldSet e) _) = r.e e
 
-altChildren : Children -> Pm.Spanned (Notation.Alt Notation.Expr) -> List Child
+altChildren : Children
+            -> Params.Spanned (Presyntax.Alt Presyntax.Expr)
+            -> List Child
 altChildren r (At (MkAlt _ e) _) = r.e e
 
 stmtChildren : Children
-             -> Pm.Spanned (Notation.Stmt Notation.Expr)
+             -> Params.Spanned (Presyntax.Stmt Presyntax.Expr)
              -> List Child
 stmtChildren r (At (StmtBind _ _ e) _) = r.e e
 stmtChildren r (At (StmtLet _ e) _) = r.e e
 stmtChildren r (At (StmtExpr e) _) = r.e e
 
-localTermF : Children -> Notation.Expr -> List Child
+localTermF : Children -> Presyntax.Expr -> List Child
 localTermF r (At (ELocal b defs) _) =
   List.append
     (List.concatMap (\m -> localChild m) defs)
@@ -957,7 +975,11 @@ localWalk : Children
 localWalk =
   { e = \n -> localTermF localWalk n, decl = \d -> localDeclF localWalk d }
 
-symbolWith : Dr.Checked -> Dr.Own -> Pm.Span -> List Site -> DocSymbol
+symbolWith : Driver.Checked
+           -> Driver.Own
+           -> Params.Span
+           -> List Site
+           -> DocSymbol
 symbolWith c o sp own =
   { name = o.name
   , kind = kindOf o.name (strSlice c.source sp.start sp.end)
@@ -978,7 +1000,7 @@ symbolWith c o sp own =
            (List.concatMap localWalk.decl c.decls))
   }
 
-symbolOf : Dr.Checked -> List Site -> Dr.Own -> Pm.Span -> DocSymbol
+symbolOf : Driver.Checked -> List Site -> Driver.Own -> Params.Span -> DocSymbol
 symbolOf c ss o sp =
   symbolWith
     c
@@ -988,16 +1010,16 @@ symbolOf c ss o sp =
        (\(s : Site) -> s.span.start >= sp.start && s.span.end <= sp.end)
        ss)
 
-symbolsGo : Dr.Checked
+symbolsGo : Driver.Checked
           -> List Site
-          -> List Dr.Own
-          -> List (Pair String Pm.Span)
+          -> List Driver.Own
+          -> List (Pair String Params.Span)
           -> List DocSymbol
 symbolsGo c ss (Cons o os) (Cons (MkPair _ sp) sps) =
   Cons (symbolOf c ss o sp) (symbolsGo c ss os sps)
 symbolsGo c ss _ _ = Nil
 
-symbols : Dr.Checked -> List DocSymbol
+symbols : Driver.Checked -> List DocSymbol
 symbols c =
   List.sortBy
     (\(a : DocSymbol) (b : DocSymbol) -> a.span.start <= b.span.start)

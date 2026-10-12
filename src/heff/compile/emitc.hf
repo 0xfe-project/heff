@@ -33,21 +33,21 @@
 -- its algebra (`perform`) handing each operation to its world's
 -- provider by the sum the effect is.
 
-import heff.elab.effect as Ef
-import heff.compile.borrow as Bo
-import heff.compile.emit as Em
-import heff.compile.facts as F
-import heff.elab.fixed as Fx
-import heff.elab.globals as G
-import heff.compile.ir as I
-import heff.compile.irtext as Ir
-import heff.compile.lower as L
-import heff.compile.prims as Pr
-import heff.compile.refcount as Rc
+import heff.elab.effect as Effect
+import heff.compile.borrow as Borrow
+import heff.compile.emit as Emit
+import heff.compile.facts as Facts
+import heff.elab.fixed as Fixed
+import heff.elab.globals as Globals
+import heff.compile.ir as IR
+import heff.compile.irtext as IRText
+import heff.compile.lower as Lower
+import heff.compile.prims as Prims
+import heff.compile.refcount as RefCount
 import heff.compile.repr as Repr
-import heff.compile.simplify as Si
-import map as M
-import uint8 as U8
+import heff.compile.simplify as Simplify
+import map as Map
+import uint8 as UInt8
 
 -- Names
 --------------------------------------------------------------------------------
@@ -61,7 +61,7 @@ isAlnum c =
 
 mangleChar : Int -> String
 mangleChar c =
-  if isAlnum c then strFromByte (U8.fromInt c)
+  if isAlnum c then strFromByte (UInt8.fromInt c)
   else "_" ^ hexDigit (intDiv (intMod c 256) 16) ^ hexDigit (intMod c 16)
 
 -- (from `i`, a run of letters and digits scanned to `j`: each run taken
@@ -119,11 +119,11 @@ elemS x (Cons y ys) = strEq x y || elemS x ys
 -- (the variable an expression is, if it is one; the definition: so that
 -- an equation looking for one does not copy its fallback into an arm for
 -- each other kind of expression)
-varOf : I.Expr -> Maybe String
+varOf : IR.Expr -> Maybe String
 varOf (EVar x) = Just x
 varOf _ = Nothing
 
-globalOf : I.Expr -> Maybe String
+globalOf : IR.Expr -> Maybe String
 globalOf (EGlobal g) = Just g
 globalOf _ = Nothing
 
@@ -131,8 +131,8 @@ nubS : List String -> List String -> List String
 nubS acc Nil = List.reverse acc
 nubS acc (Cons x xs) = if elemS x acc then nubS acc xs else nubS (Cons x acc) xs
 
-armTags : List I.Arm -> List String
-armTags arms = List.map I.armTag arms
+armTags : List IR.Arm -> List String
+armTags arms = List.map IR.armTag arms
 
 -- (each the one's before the other's: only the first copied)
 pairCat : Pair (List String) (List String)
@@ -142,8 +142,8 @@ pairCat (MkPair ts ls) (MkPair ts2 ls2) =
   MkPair (List.append ts ts2) (List.append ls ls2)
 
 -- (the tags and labels an expression mentions)
-namesIn : (I.Expr -> Pair (List String) (List String))
-        -> List I.Expr
+namesIn : (IR.Expr -> Pair (List String) (List String))
+        -> List IR.Expr
         -> Pair (List String) (List String)
 namesIn go es = List.foldr (\e acc -> pairCat (go e) acc) (MkPair Nil Nil) es
 
@@ -157,7 +157,7 @@ withTags : List String
          -> Pair (List String) (List String)
 withTags ts (MkPair ts2 ls) = MkPair (List.append ts ts2) ls
 
-tagsLbls : I.Expr -> Pair (List String) (List String)
+tagsLbls : IR.Expr -> Pair (List String) (List String)
 tagsLbls (ELam _ b) = tagsLbls b
 tagsLbls (EApp f as) = namesIn tagsLbls (Cons f as)
 tagsLbls (ELet _ a b) = namesIn tagsLbls [a, b]
@@ -166,7 +166,7 @@ tagsLbls (ERecord fs _) =
 tagsLbls (EProj e l _ _) = withLbls (Cons l Nil) (tagsLbls e)
 tagsLbls (ETag t as) = withTags (Cons t Nil) (namesIn tagsLbls as)
 tagsLbls (EMatch s arms) =
-  withTags (armTags arms) (namesIn tagsLbls (Cons s (List.map I.armBody arms)))
+  withTags (armTags arms) (namesIn tagsLbls (Cons s (List.map IR.armBody arms)))
 tagsLbls (EPrimCall _ as) = namesIn tagsLbls as
 tagsLbls (ECall _ as) = namesIn tagsLbls as
 tagsLbls _ = MkPair Nil Nil
@@ -191,11 +191,11 @@ namesInGo pre text i acc = case indexOf
       (i + j + strLength pre)
       (Cons (identAt text (i + j + strLength pre) (i + j + strLength pre)) acc)
 
-numbered : Int -> List String -> M.Map String Int -> M.Map String Int
+numbered : Int -> List String -> Map.Map String Int -> Map.Map String Int
 numbered n Nil m = m
 numbered n (Cons x xs) m =
-  if M.member compareString x m then numbered n xs m
-  else numbered (n + 1) xs (M.insert compareString x n m)
+  if Map.member compareString x m then numbered n xs m
+  else numbered (n + 1) xs (Map.insert compareString x n m)
 
 -- A tag's number, and a label's, is by its name, not by what other
 -- tags and labels the program has: a hash of the name (the next number
@@ -210,9 +210,9 @@ hashBelow t m i a =
   else hashBelow t m (i + 1) ((a * 31 + byteAt t i + 1) % m)
 
 -- (the number `h` or, if taken, the next free after it)
-slotFrom : Int -> Int -> Int -> M.Map Int Unit -> Int
+slotFrom : Int -> Int -> Int -> Map.Map Int Unit -> Int
 slotFrom base m h taken =
-  if M.member compareInt (base + h) taken
+  if Map.member compareInt (base + h) taken
     then slotFrom base m ((h + 1) % m) taken
   else base + h
 
@@ -220,22 +220,22 @@ slotFrom base m h taken =
 hashedGo : Int
          -> Int
          -> List String
-         -> M.Map String Int
-         -> M.Map Int Unit
-         -> M.Map String Int
+         -> Map.Map String Int
+         -> Map.Map Int Unit
+         -> Map.Map String Int
 hashedGo base m Nil names taken = names
 hashedGo base m (Cons x xs) names taken =
-  if M.member compareString x names then hashedGo base m xs names taken
+  if Map.member compareString x names then hashedGo base m xs names taken
   else hashedGo
       base
       m
       xs
-      (M.insert
+      (Map.insert
          compareString
          x
          (slotFrom base m (hashBelow x m 0 7) taken)
          names)
-      (M.insert
+      (Map.insert
          compareInt
          (slotFrom base m (hashBelow x m 0 7) taken)
          MkUnit
@@ -245,7 +245,8 @@ hashedGo base m (Cons x xs) names taken =
 -- of the program (heff.compile.facts)
 --------------------------------------------------------------------------------
 
-type CE = { tags : M.Map String Int, lbls : M.Map String Int, facts : F.Facts }
+type CE =
+  { tags : Map.Map String Int, lbls : Map.Map String Int, facts : Facts.Facts }
 
 -- What emitting makes on the way: the lambdas, the strings and the
 -- labels of records, each a C definition of its own
@@ -431,8 +432,8 @@ addLam proto def = \s ->
 -- | the printer's judgments, knotted: an expression, statements; and
 -- | the C type of each variable (heff.compile.repr's)
 type CK =
-  { exp : Rc.Value -> C String
-  , stmts : List Rc.Statement -> C (List String)
+  { exp : RefCount.Value -> C String
+  , stmts : List RefCount.Statement -> C (List String)
   , ctype : String -> String
   }
 
@@ -440,21 +441,21 @@ type CK =
 -- `double`, by a suffix in the runtime's names (`heff_box_i64`)
 --------------------------------------------------------------------------------
 
-fixedSuffix : Fx.Fixed -> String
+fixedSuffix : Fixed.Fixed -> String
 fixedSuffix w =
-  if Fx.isFloat32 w then "f32"
-  else (if Fx.fixedSigned w then "i" else "u") ^ showInt (Fx.fixedBits w)
+  if Fixed.isFloat32 w then "f32"
+  else (if Fixed.fixedSigned w then "i" else "u") ^ showInt (Fixed.fixedBits w)
 
 reprSuffix : Repr.Repr -> String
 reprSuffix (RepFix w) = fixedSuffix w
 reprSuffix RepF64 = "f64"
 reprSuffix RepV = "v"
 
-fixedType : Fx.Fixed -> String
+fixedType : Fixed.Fixed -> String
 fixedType w =
-  if Fx.isFloat32 w then "float"
-  else (if Fx.fixedSigned w then "int" else "uint")
-    ^ showInt (Fx.fixedBits w)
+  if Fixed.isFloat32 w then "float"
+  else (if Fixed.fixedSigned w then "int" else "uint")
+    ^ showInt (Fixed.fixedBits w)
     ^ "_t"
 
 -- | how C declares a variable kept so
@@ -465,7 +466,7 @@ cType RepV = "V"
 
 -- (an integer of the type, a C constant: its value modulo 2^64, as an
 -- unsigned constant, made the type)
-fixedConst : Fx.Fixed -> Int -> String
+fixedConst : Fixed.Fixed -> Int -> String
 fixedConst w n =
   if n < 0 then "((" ^ fixedType w ^ ")-" ^ showInt (0 - n) ^ "ULL)"
   else "((" ^ fixedType w ^ ")" ^ showInt n ^ "ULL)"
@@ -479,7 +480,7 @@ doubleConst x =
   else "(" ^ showFloat x ^ ")"
 
 -- (a C operator, of a primitive done as one)
-opSymbol : Fx.FixedOp -> String
+opSymbol : Fixed.FixedOp -> String
 opSymbol OpAdd = "+"
 opSymbol OpSub = "-"
 opSymbol OpMul = "*"
@@ -538,7 +539,7 @@ callOf f vs = f ^ "(" ^ joinWith ", " vs ^ ")"
 
 -- (`a op b` on 64 bits, unsigned, where no overflow is undefined,
 -- wrapped to the type)
-wrapped : Fx.Fixed -> String -> List String -> String
+wrapped : Fixed.Fixed -> String -> List String -> String
 wrapped w op vs =
   "(("
   ^ fixedType w
@@ -553,7 +554,7 @@ wrapped w op vs =
 -- (an integer type's operation: on 64 bits, unsigned (where no overflow
 -- is undefined), wrapped to the type; a division, a shift, the
 -- runtime's, as its primitives do them)
-intU : Fx.Fixed -> Fx.FixedOp -> List String -> String
+intU : Fixed.Fixed -> Fixed.FixedOp -> List String -> String
 intU w OpAdd vs = wrapped w "+" vs
 intU w OpSub vs = wrapped w "-" vs
 intU w OpMul vs = wrapped w "*" vs
@@ -566,7 +567,7 @@ intU w OpToInt vs = callOf ("heff_box_" ^ fixedSuffix w) vs
 intU w op vs = "((" ^ fixedType w ^ ")" ^ infixC (opSymbol op) vs ^ ")"
 
 -- | ... of a `Float32`
-float32U : Fx.FixedOp -> List String -> String
+float32U : Fixed.FixedOp -> List String -> String
 float32U OpSqrt vs = callOf "sqrtf" vs
 float32U OpFromFloat vs = "((float)" ^ arg0 vs ^ ")"
 float32U OpToFloat vs = "((double)" ^ arg0 vs ^ ")"
@@ -574,16 +575,16 @@ float32U OpFromInt vs = callOf "heff_from_int_f32" vs
 float32U OpFloor vs = callOf "heff_floor_f32" vs
 float32U op vs = "((float)" ^ infixC (opSymbol op) vs ^ ")"
 
-isRelOp : Fx.FixedOp -> Bool
+isRelOp : Fixed.FixedOp -> Bool
 isRelOp OpEq = True
 isRelOp OpLt = True
 isRelOp OpLe = True
 isRelOp o = False
 
-fixedU : Fx.FixedPrim -> List String -> String
+fixedU : Fixed.FixedPrim -> List String -> String
 fixedU fp vs =
   if isRelOp fp.op then "heff_bool(" ^ infixC (opSymbol fp.op) vs ^ ")"
-  else if Fx.isFloat32 fp.fixed then float32U fp.op vs
+  else if Fixed.isFloat32 fp.fixed then float32U fp.op vs
   else intU fp.fixed fp.op vs
 
 -- | ... of a `Float64`: C's operator, or libm's function
@@ -594,21 +595,21 @@ float64U p vs =
   else if strLength (floatSymbol p) > 0 then infixC (floatSymbol p) vs
   else callOf (fromMaybe p (List.lookupBy strEq p libmNames)) vs
 
-primUOf : String -> Maybe Fx.FixedPrim -> List String -> String
+primUOf : String -> Maybe Fixed.FixedPrim -> List String -> String
 primUOf p (Just fp) vs = fixedU fp vs
 primUOf p Nothing vs = float64U p vs
 
 -- | a primitive done on unboxed operands (heff.compile.repr's `primShape`)
 primU : String -> List String -> String
-primU p vs = primUOf p (Fx.fixedPrimOf p) vs
+primU p vs = primUOf p (Fixed.fixedPrimOf p) vs
 
-relSymbol : String -> Maybe Fx.FixedPrim -> String
+relSymbol : String -> Maybe Fixed.FixedPrim -> String
 relSymbol p (Just fp) = opSymbol fp.op
 relSymbol p Nothing = floatSymbol p
 
 -- | a comparison of unboxed operands, as C's condition
 relU : String -> List String -> String
-relU p vs = infixC (relSymbol p (Fx.fixedPrimOf p)) vs
+relU p vs = infixC (relSymbol p (Fixed.fixedPrimOf p)) vs
 
 argsArr : List String -> String
 argsArr vs = if List.null vs then "NULL" else "(V[]){" ^ joinWith ", " vs ^ "}"
@@ -630,9 +631,9 @@ floatLit x =
 
 -- (a fixed-width integer: of 64 bits, kept as an `Int` is; of fewer, in a
 -- word)
-fixedLit : Fx.Fixed -> Int -> String
+fixedLit : Fixed.Fixed -> Int -> String
 fixedLit w n =
-  if Fx.fixedBits w == 64 then intLit n else "MK_INT(" ^ showInt n ^ "LL)"
+  if Fixed.fixedBits w == 64 then intLit n else "MK_INT(" ^ showInt n ^ "LL)"
 
 primName : String -> String
 primName p = "heff_" ^ p
@@ -641,13 +642,13 @@ primName p = "heff_" ^ p
 -- (`heff_drop_tag`), not looked at by `heff_drop`; a cell kept and not
 -- built in, freed (`heff_drop_cell`); so are a record (`heff_drop_rec`)
 -- and a closure (`heff_drop_clo`) of known size)
-dropAs : String -> Rc.Known -> String
+dropAs : String -> RefCount.Known -> String
 dropAs x (KnownTag n) = "heff_drop_tag(" ^ cLocal x ^ ", " ^ showInt n ^ ");"
 dropAs x (KnownCell n) = "heff_drop_cell(" ^ cLocal x ^ ", " ^ showInt n ^ ");"
 dropAs x (KnownRec n) = "heff_drop_rec(" ^ cLocal x ^ ", " ^ showInt n ^ ");"
 dropAs x (KnownClo n) = "heff_drop_clo(" ^ cLocal x ^ ", " ^ showInt n ^ ");"
 
-dropLine : Rc.Drop -> String
+dropLine : RefCount.Drop -> String
 dropLine (MkDrop x Nothing) = "heff_drop(" ^ cLocal x ^ ");"
 dropLine (MkDrop x (Just k)) = dropAs x k
 
@@ -662,7 +663,7 @@ boundAs i v post =
   , post = post
   }
 
-argC : CK -> Int -> Rc.Operand -> C Bound
+argC : CK -> Int -> RefCount.Operand -> C Bound
 argC k i (Given e) = do
   v <- k.exp e
   pure (boundAs i v Nil)
@@ -723,7 +724,7 @@ callLent : CK
          -> String
          -> Bool
          -> Maybe Repr.Repr
-         -> List Rc.Operand
+         -> List RefCount.Operand
          -> C String
 callLent k g tr w args = do
   bs <-
@@ -736,11 +737,16 @@ callLent k g tr w args = do
   pure (callBound g tr w bs)
 
 -- | a call of `g` (its worker, if `w`), through any bounces if `tr`
-callC : CK -> String -> Bool -> Maybe Repr.Repr -> List Rc.Operand -> C String
+callC : CK
+      -> String
+      -> Bool
+      -> Maybe Repr.Repr
+      -> List RefCount.Operand
+      -> C String
 callC k g tr w args =
-  if Rc.lentPlain args
+  if RefCount.lentPlain args
     then bind
-        (traverseC k.exp (List.map Rc.argExp args))
+        (traverseC k.exp (List.map RefCount.argExp args))
         (\vs -> pure (callHead g tr w ^ joinWith ", " vs ^ "))"))
   else callLent k g tr w args
 
@@ -791,8 +797,8 @@ lamProto k n fv =
 lamC : CK
      -> List String
      -> List String
-     -> List Rc.Value
-     -> List Rc.Statement
+     -> List RefCount.Value
+     -> List RefCount.Statement
      -> C String
 lamC k xs fv held body = do
   name <- newLam
@@ -852,7 +858,7 @@ updateText x shape keep flats n vs changed =
 -- | a condition, as C's (an `int`): a comparison, the runtime's of it
 -- | (`heff_intLt_c`); a test of tests, `&&`, `||` or `?:`; a name bound
 -- | in it, dropped once it is decided
-testC : CK -> Rc.Test -> C String
+testC : CK -> RefCount.Test -> C String
 testC k CondTrue = pure "1"
 testC k CondFalse = pure "0"
 testC k (CondRel p es) =
@@ -893,10 +899,10 @@ testC k (CondLet x e c drops) = do
        ^ "c_; })")
 
 -- (an operator of one operand: its name, then the operand's, closed)
-wrapC : CK -> String -> String -> Rc.Value -> C String
+wrapC : CK -> String -> String -> RefCount.Value -> C String
 wrapC k pre post e = bind (k.exp e) (\v -> pure (pre ^ v ^ post))
 
-expF : CK -> Rc.Value -> C String
+expF : CK -> RefCount.Value -> C String
 expF k (RLocal x) = pure (cLocal x)
 expF k (RDup x) = pure ("heff_dup(" ^ cLocal x ^ ")")
 expF k (RClo g) = pure ("((V)&" ^ cGlobal g ^ "_clo)")
@@ -1084,7 +1090,7 @@ fieldLine sv plain (MkPair v i) =
 
 -- (the scrutinee given up at once (`heff_take_n`): its shell freed and
 -- the fields not wanted dropped; or its cell kept (`heff_take_reuse_n`))
-takeLines : String -> Rc.Take -> List String
+takeLines : String -> RefCount.Take -> List String
 takeLines sv TakeNone = Nil
 takeLines sv (TakeN mask n) =
   Cons
@@ -1103,7 +1109,7 @@ takeLines sv (TakeKeep ru mask n) =
      ^ ");")
     Nil
 
-armF : CK -> String -> Rc.CaseArm -> C (List String)
+armF : CK -> String -> RefCount.CaseArm -> C (List String)
 armF k sv (MkCArm t fields plain take body leaves) = do
   ls <- k.stmts body
   pure
@@ -1122,10 +1128,10 @@ nomatchLine True sv = "default: return heff_nomatch(" ^ sv ^ ");"
 nomatchLine False sv = "default: heff_nomatch(" ^ sv ^ ");"
 
 -- (a statement of one line, of an expression)
-lineC : CK -> String -> String -> Rc.Value -> C (List String)
+lineC : CK -> String -> String -> RefCount.Value -> C (List String)
 lineC k pre post e = bind (k.exp e) (\v -> pure (Cons (pre ^ v ^ post) Nil))
 
-stmtF : CK -> Rc.Statement -> C (List String)
+stmtF : CK -> RefCount.Statement -> C (List String)
 stmtF k (CDrop d) = pure (Cons (dropLine d) Nil)
 stmtF k (CLet x e) = lineC k (k.ctype x ^ " " ^ cLocal x ^ " = ") ";" e
 stmtF k (CDecl x) = pure (Cons (k.ctype x ^ " " ^ cLocal x ^ ";") Nil)
@@ -1176,7 +1182,7 @@ stmtF k (CJump g w es) = do
          ("HEFF_LAST return " ^ calleeName g w ^ "(" ^ joinWith ", " vs ^ ");")
          Nil)
 
-stmtsF : CK -> List Rc.Statement -> C (List String)
+stmtsF : CK -> List RefCount.Statement -> C (List String)
 stmtsF k ss =
   bind (traverseC (stmtF k) ss) (\ls -> pure (List.concatMap (\x -> x) ls))
 
@@ -1233,7 +1239,7 @@ entryCall key bi n =
     ^ joinWith " " (List.map (\i -> "heff_drop(a" ^ showInt i ^ ");") bi)
     ^ " return r;"
 
-hasWrapper : Maybe Rc.Wrapper -> Bool
+hasWrapper : Maybe RefCount.Wrapper -> Bool
 hasWrapper (Just _) = True
 hasWrapper Nothing = False
 
@@ -1250,12 +1256,12 @@ funHead key xs rs ret w =
 
 -- (a function with a worker: its wrapper, of `V`s, a function of the
 -- function's own name -- what its closure's entry calls)
-wrapperProto : String -> Repr.Reprs -> Maybe Rc.Wrapper -> List String
+wrapperProto : String -> Repr.Reprs -> Maybe RefCount.Wrapper -> List String
 wrapperProto key rs (Just (MkWrapper ws _)) =
   Cons ("static V " ^ cGlobal key ^ "(" ^ paramList (ckOf rs) ws ^ ");") Nil
 wrapperProto key rs Nothing = Nil
 
-wrapperCode : String -> Repr.Reprs -> Maybe Rc.Wrapper -> C (List String)
+wrapperCode : String -> Repr.Reprs -> Maybe RefCount.Wrapper -> C (List String)
 wrapperCode key rs (Just (MkWrapper ws body)) = do
   ls <- (ckOf rs).stmts body
   pure
@@ -1264,7 +1270,7 @@ wrapperCode key rs (Just (MkWrapper ws body)) = do
          (List.append (indented ls) (Cons "}" Nil)))
 wrapperCode key rs Nothing = pure Nil
 
-funDef : Rc.Fun -> C Emitted1
+funDef : RefCount.Fun -> C Emitted1
 funDef f = do
   es <- (ckOf f.reprs).stmts f.entry
   ls <- (ckOf f.reprs).stmts f.body
@@ -1305,7 +1311,7 @@ funDef f = do
                      ])))
       }
 
-valDef : String -> List Rc.Statement -> Repr.Reprs -> C Emitted1
+valDef : String -> List RefCount.Statement -> Repr.Reprs -> C Emitted1
 valDef key body rs = do
   ls <- (ckOf rs).stmts body
   pure
@@ -1337,7 +1343,7 @@ valDef key body rs = do
                ])
       }
 
-defC : Rc.Def -> C Emitted1
+defC : RefCount.Def -> C Emitted1
 defC (DFun f) = funDef f
 defC (DVal key body rs) = valDef key body rs
 
@@ -1368,26 +1374,26 @@ plusDone n la na (MkPair lb nb) =
           ]))
     nb
 
-plusNodes : (Ef.Effect -> Int -> Pair (List String) Int)
+plusNodes : (Effect.Effect -> Int -> Pair (List String) Int)
           -> Int
-          -> Ef.Effect
+          -> Effect.Effect
           -> Pair (List String) Int
           -> Pair (List String) Int
 plusNodes go n b (MkPair la na) = plusDone n la na (go b na)
 
-performNodes : Ef.Effect -> Int -> Pair (List String) Int
+performNodes : Effect.Effect -> Int -> Pair (List String) Int
 performNodes (Leaf k) n =
   MkPair
     [ "static V heff_perform_"
     ^ showInt n
     ^ "(V p, V k) { return heff_provider_"
-    ^ Ef.nameOfKey k
+    ^ Effect.nameOfKey k
     ^ "(p, k); }"
     ]
     (n + 1)
 performNodes (Plus a b) n = plusNodes performNodes n b (performNodes a (n + 1))
 
-performCode : Ef.Effect -> List String
+performCode : Effect.Effect -> List String
 performCode eff =
   List.append
     (fst (performNodes eff 0))
@@ -1397,7 +1403,7 @@ performCode eff =
 --------------------------------------------------------------------------------
 
 primCloDef : String -> List String
-primCloDef p = case Pr.primArity p of
+primCloDef p = case Prims.primArity p of
   Just n ->
     [ "static V prim_"
     ^ p
@@ -1448,12 +1454,12 @@ ownDef o = \s ->
       , prims = s.prims
       }
 
-defOwn : CE -> I.Def -> C Emitted1
+defOwn : CE -> IR.Def -> C Emitted1
 defOwn ce d = do
   u <- ownDef (cGlobal d.key)
-  defC (L.cDef ce.facts d (I.freshen 0 d.body))
+  defC (Lower.cDef ce.facts d (IR.freshen 0 d.body))
 
-defsC : CE -> List I.Def -> C (List Emitted1)
+defsC : CE -> List IR.Def -> C (List Emitted1)
 defsC ce defs = traverseC (defOwn ce) defs
 
 emptyCS : CS
@@ -1469,18 +1475,18 @@ emptyCS =
   }
 
 -- (each once, the first kept, in order)
-onceInOrder : M.Map String Unit -> List String -> List String
+onceInOrder : Map.Map String Unit -> List String -> List String
 onceInOrder seen Nil = Nil
 onceInOrder seen (Cons x xs) =
-  if M.member compareString x seen then onceInOrder seen xs
-  else Cons x (onceInOrder (M.insert compareString x MkUnit seen) xs)
+  if Map.member compareString x seen then onceInOrder seen xs
+  else Cons x (onceInOrder (Map.insert compareString x MkUnit seen) xs)
 
 -- (what the owners use, each once, in the order first used)
 usedOnce : List (Pair String String) -> List String
-usedOnce ps = onceInOrder M.empty (List.map snd (List.reverse ps))
+usedOnce ps = onceInOrder Map.empty (List.map snd (List.reverse ps))
 
 -- | the names of what is numbered, each with its number (`heff_show`'s)
-namesTable : String -> M.Map String Int -> List String
+namesTable : String -> Map.Map String Int -> List String
 namesTable name m =
   [ "static const HeffName "
   ^ name
@@ -1489,8 +1495,8 @@ namesTable name m =
     ", "
     (List.map
        (\p -> "{" ^ showInt (snd p) ^ ", \"" ^ fst p ^ "\"}")
-       (M.toList m))
-  ^ (if M.size m == 0 then "{0, NULL}" else "")
+       (Map.toList m))
+  ^ (if Map.size m == 0 then "{0, NULL}" else "")
   ^ "};"
   ]
 
@@ -1498,19 +1504,21 @@ namesTable name m =
 -- | file's definitions, by its name, shown
 type Ending = { prefix : List String, end : CE -> List String }
 
-runEnd : Ef.Effect -> CE -> List String
+runEnd : Effect.Effect -> CE -> List String
 runEnd eff ce =
   List.append
     (performCode eff)
     [ ""
-    , "static V heff_entry(void) { return " ^ cGlobal L.entryKey ^ "_get(); }"
+    , "static V heff_entry(void) { return "
+    ^ cGlobal Lower.entryKey
+    ^ "_get(); }"
     , ""
     ]
 
 -- (a definition's value, as a getter: a function's is its closure)
 globalGet : CE -> Pair String String -> List String
 globalGet ce (MkPair name key) =
-  if M.member compareString key ce.facts.arity
+  if Map.member compareString key ce.facts.arity
     then [ "static V gget_"
          ^ mangle key
          ^ "(void) { return (V)&"
@@ -1521,13 +1529,13 @@ globalGet ce (MkPair name key) =
 
 getterOf : CE -> String -> String
 getterOf ce key =
-  if M.member compareString key ce.facts.arity then "gget_" ^ mangle key
+  if Map.member compareString key ce.facts.arity then "gget_" ^ mangle key
   else cGlobal key ^ "_get"
 
-definedIn : List I.Def -> String -> Bool
-definedIn defs key = List.any (\(d : I.Def) -> strEq d.key key) defs
+definedIn : List IR.Def -> String -> Bool
+definedIn defs key = List.any (\(d : IR.Def) -> strEq d.key key) defs
 
-checkEnd : List (Pair String String) -> List I.Def -> CE -> List String
+checkEnd : List (Pair String String) -> List IR.Def -> CE -> List String
 checkEnd exports defs ce =
   List.append
     [ "static V heff_perform(V p, V k) { (void)p; (void)k; return heff_abandon(); }"
@@ -1559,14 +1567,19 @@ checkEnd exports defs ce =
                   (List.filter (\p -> definedIn defs (snd p)) exports))
              ^ ";"
              , "  heff_tag_names = heff_tag_names_arr;"
-             , "  heff_ntag_names = " ^ showInt (M.size ce.tags) ^ ";"
+             , "  heff_ntag_names = " ^ showInt (Map.size ce.tags) ^ ";"
              , "  heff_lbl_names = heff_lbl_names_arr;"
-             , "  heff_nlbl_names = " ^ showInt (M.size ce.lbls) ^ ";"
+             , "  heff_nlbl_names = " ^ showInt (Map.size ce.lbls) ^ ";"
              , "}"
              , ""
              ])))
 
-programCE : String -> List Em.Provider -> Ending -> List I.Def -> CE -> String
+programCE : String
+          -> List Emit.Provider
+          -> Ending
+          -> List IR.Def
+          -> CE
+          -> String
 programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
   MkPair ems s ->
     joinWith
@@ -1578,15 +1591,15 @@ programCE runtime provs ending defs ce = case defsC ce defs emptyCS of
                (\p -> "#define " ^ tagName (fst p) ^ " " ^ showInt (snd p))
                (List.filter
                   (\p -> not (elemS (fst p) knownTags))
-                  (M.toList ce.tags)))
+                  (Map.toList ce.tags)))
             (List.append
                (List.map
                   (\p -> "#define " ^ lblName (fst p) ^ " " ^ showInt (snd p))
-                  (M.toList ce.lbls))
+                  (Map.toList ce.lbls))
                (List.append
                   (Cons runtime Nil)
                   (List.append
-                     (List.map (\(p : Em.Provider) -> p.text) provs)
+                     (List.map (\(p : Emit.Provider) -> p.text) provs)
                      (List.append
                         (Cons "static V heff_perform(V p, V k);" Nil)
                         (List.append
@@ -1618,14 +1631,17 @@ sortedOnce : List String -> List String
 sortedOnce xs =
   List.map
     fst
-    (M.toList
+    (Map.toList
        (List.foldl
-          (\m x -> M.insert compareString x (MkUnit : Unit) m)
-          M.empty
+          (\m x -> Map.insert compareString x (MkUnit : Unit) m)
+          Map.empty
           xs))
 
 -- (what the emitter knows of the whole program)
-ceOf : List Em.Provider -> F.Facts -> Pair (List String) (List String) -> CE
+ceOf : List Emit.Provider
+     -> Facts.Facts
+     -> Pair (List String) (List String)
+     -> CE
 ceOf provs facts names =
   { tags =
       hashedGo
@@ -1637,10 +1653,10 @@ ceOf provs facts names =
               (List.append
                  (fst names)
                  (List.concatMap
-                    (\(p : Em.Provider) -> namesInGo "TAG_" p.text 0 Nil)
+                    (\(p : Emit.Provider) -> namesInGo "TAG_" p.text 0 Nil)
                     provs))))
-        (numbered 0 knownTags M.empty)
-        M.empty
+        (numbered 0 knownTags Map.empty)
+        Map.empty
   , lbls =
       hashedGo
         0
@@ -1649,18 +1665,18 @@ ceOf provs facts names =
            (List.append
               (snd names)
               (List.concatMap
-                 (\(p : Em.Provider) -> namesInGo "LBL_" p.text 0 Nil)
+                 (\(p : Emit.Provider) -> namesInGo "LBL_" p.text 0 Nil)
                  provs)))
-        M.empty
-        M.empty
+        Map.empty
+        Map.empty
   , facts = facts
   }
 
 programWith : String
-            -> List Em.Provider
+            -> List Emit.Provider
             -> Ending
-            -> F.Facts
-            -> List I.Def
+            -> Facts.Facts
+            -> List IR.Def
             -> Pair (List String) (List String)
             -> String
 programWith runtime provs ending facts defs names =
@@ -1743,14 +1759,14 @@ numbersOf ce (MkPair ts ls) =
           "#define "
           ^ tagName t
           ^ " "
-          ^ showInt (fromMaybe 0 (M.lookup compareString t ce.tags)))
+          ^ showInt (fromMaybe 0 (Map.lookup compareString t ce.tags)))
        (List.filter (\t -> not (elemS t knownTags)) (sortedOnce ts)))
     (List.map
        (\l ->
           "#define "
           ^ lblName l
           ^ " "
-          ^ showInt (fromMaybe 0 (M.lookup compareString l ce.lbls)))
+          ^ showInt (fromMaybe 0 (Map.lookup compareString l ce.lbls)))
        (sortedOnce ls))
 
 -- (a function's worker, declared: by its signature)
@@ -1772,7 +1788,7 @@ workerDecl k Nothing = Nil
 -- its worker's signature, not by its parameters' names, so that a part
 -- changes only when what it uses does)
 declOf : CE -> String -> List String
-declOf ce k = case M.lookup compareString k ce.facts.arity of
+declOf ce k = case Map.lookup compareString k ce.facts.arity of
   Just n ->
     List.append
       (workerDecl k (Repr.sigIn ce.facts.workers k))
@@ -1788,27 +1804,27 @@ declOf ce k = case M.lookup compareString k ce.facts.arity of
 
 -- (what was made for each definition -- its strings, its lambdas --
 -- by the definition it was made for)
-byOwner : List (Pair String String) -> M.Map String (List String)
+byOwner : List (Pair String String) -> Map.Map String (List String)
 byOwner ps =
   List.foldl
     (\m p ->
-       M.insert
+       Map.insert
          compareString
          (fst p)
-         (Cons (snd p) (fromMaybe Nil (M.lookup compareString (fst p) m)))
+         (Cons (snd p) (fromMaybe Nil (Map.lookup compareString (fst p) m)))
          m)
-    M.empty
+    Map.empty
     ps
 
-linesOf : M.Map String (List String) -> String -> List String
-linesOf m o = fromMaybe Nil (M.lookup compareString o m)
+linesOf : Map.Map String (List String) -> String -> List String
+linesOf m o = fromMaybe Nil (Map.lookup compareString o m)
 
 -- (a definition, as its part has it)
 ownLines : CS
-         -> M.Map String (List String)
-         -> M.Map String (List String)
-         -> M.Map String (List String)
-         -> Pair I.Def Emitted1
+         -> Map.Map String (List String)
+         -> Map.Map String (List String)
+         -> Map.Map String (List String)
+         -> Pair IR.Def Emitted1
          -> List String
 ownLines s strs protos lams (MkPair d e) =
   List.append
@@ -1823,38 +1839,40 @@ ownLines s strs protos lams (MkPair d e) =
              (List.map pubLine e.code)
              (List.map pubLine (linesOf lams (cGlobal d.key))))))
 
-pairKey : Pair I.Def Emitted1 -> String
+pairKey : Pair IR.Def Emitted1 -> String
 pairKey (MkPair d _) = d.key
 
 -- (the definitions, by module, each module's in order)
-byModule : List (Pair I.Def Emitted1)
-         -> M.Map String (List (Pair I.Def Emitted1))
+byModule : List (Pair IR.Def Emitted1)
+         -> Map.Map String (List (Pair IR.Def Emitted1))
 byModule ps =
   List.foldl
     (\m p ->
-       M.insert
+       Map.insert
          compareString
          (moduleOfKey (pairKey p))
          (Cons
             p
             (fromMaybe
                Nil
-               (M.lookup compareString (moduleOfKey (pairKey p)) m)))
+               (Map.lookup compareString (moduleOfKey (pairKey p)) m)))
          m)
-    M.empty
+    Map.empty
     (List.reverse ps)
 
-zipDE : List I.Def -> List Emitted1 -> List (Pair I.Def Emitted1)
+zipDE : List IR.Def -> List Emitted1 -> List (Pair IR.Def Emitted1)
 zipDE (Cons d ds) (Cons e es) = Cons (MkPair d e) (zipDE ds es)
 zipDE _ _ = Nil
 
 -- (what a definition uses: the definitions it calls or mentions, and
 -- itself)
-usesOf : Pair I.Def Emitted1 -> List String
-usesOf (MkPair d _) = Cons d.key (I.globalsIn d.body)
+usesOf : Pair IR.Def Emitted1 -> List String
+usesOf (MkPair d _) = Cons d.key (IR.globalsIn d.body)
 
 -- (what the owners of a part use, each once: shapes, primitives)
-usedBy : M.Map String (List String) -> List (Pair I.Def Emitted1) -> List String
+usedBy : Map.Map String (List String)
+       -> List (Pair IR.Def Emitted1)
+       -> List String
 usedBy m ps =
   sortedOnce (List.concatMap (\p -> linesOf m (cGlobal (pairKey p))) ps)
 
@@ -1863,12 +1881,12 @@ usedBy m ps =
 modulePart : List String
            -> CE
            -> CS
-           -> M.Map String (List String)
-           -> M.Map String (List String)
-           -> M.Map String (List String)
-           -> M.Map String (List String)
-           -> M.Map String (List String)
-           -> Pair String (List (Pair I.Def Emitted1))
+           -> Map.Map String (List String)
+           -> Map.Map String (List String)
+           -> Map.Map String (List String)
+           -> Map.Map String (List String)
+           -> Map.Map String (List String)
+           -> Pair String (List (Pair IR.Def Emitted1))
            -> Pair String String
 modulePart head ce s shapes prims strs protos lams (MkPair m ps) =
   MkPair
@@ -1882,7 +1900,7 @@ modulePart head ce s shapes prims strs protos lams (MkPair m ps) =
                 ce
                 (namesIn
                    tagsLbls
-                   (List.map (\(p : Pair I.Def Emitted1) -> (fst p).body) ps)))
+                   (List.map (\(p : Pair IR.Def Emitted1) -> (fst p).body) ps)))
              (List.append
                 (List.map shapeDef (usedBy shapes ps))
                 (List.append
@@ -1926,7 +1944,7 @@ partCount bytes b =
 linesBytes : List String -> Int
 linesBytes ls = List.foldl (\n l -> n + strLength l + 1) 0 ls
 
-inPart : Int -> Int -> Pair I.Def Emitted1 -> Bool
+inPart : Int -> Int -> Pair IR.Def Emitted1 -> Bool
 inPart b k p = keyHash (pairKey p) % b == k
 
 consPart : {a : Type}
@@ -1939,9 +1957,9 @@ consPart n qs rest = Cons (MkPair n qs) rest
 
 partsFrom : String
           -> Int
-          -> List (Pair I.Def Emitted1)
+          -> List (Pair IR.Def Emitted1)
           -> Int
-          -> List (Pair String (List (Pair I.Def Emitted1)))
+          -> List (Pair String (List (Pair IR.Def Emitted1)))
 partsFrom m b ps k =
   if k >= b then Nil
   else consPart
@@ -1950,17 +1968,17 @@ partsFrom m b ps k =
       (partsFrom m b ps (k + 1))
 
 partsOfCount : String
-             -> List (Pair I.Def Emitted1)
+             -> List (Pair IR.Def Emitted1)
              -> Int
-             -> List (Pair String (List (Pair I.Def Emitted1)))
+             -> List (Pair String (List (Pair IR.Def Emitted1)))
 partsOfCount m ps b =
   if b == 1 then Cons (MkPair m ps) Nil else partsFrom m b ps 0
 
 -- (a module's definitions, as its parts: one, named as the module, where
 -- it is small; else `MODULE.K`, K the part a definition's key hashes to)
-moduleParts : (Pair I.Def Emitted1 -> Int)
-            -> Pair String (List (Pair I.Def Emitted1))
-            -> List (Pair String (List (Pair I.Def Emitted1)))
+moduleParts : (Pair IR.Def Emitted1 -> Int)
+            -> Pair String (List (Pair IR.Def Emitted1))
+            -> List (Pair String (List (Pair IR.Def Emitted1)))
 moduleParts size (MkPair m ps) =
   partsOfCount m ps (partCount (List.foldl (\n p -> n + size p) 0 ps) 1)
 
@@ -1973,10 +1991,10 @@ entryPart = "run$main.c"
 -- (every module's parts, each bounded in size)
 modulesParts : CE
              -> CS
-             -> M.Map String (List String)
-             -> M.Map String (List String)
-             -> M.Map String (List String)
-             -> List I.Def
+             -> Map.Map String (List String)
+             -> Map.Map String (List String)
+             -> Map.Map String (List String)
+             -> List IR.Def
              -> List Emitted1
              -> List (Pair String String)
 modulesParts ce s strs protos lams defs ems =
@@ -1995,14 +2013,14 @@ modulesParts ce s strs protos lams defs ems =
        lams)
     (List.concatMap
        (moduleParts
-          (\(p : Pair I.Def Emitted1) ->
+          (\(p : Pair IR.Def Emitted1) ->
              linesBytes (ownLines s strs protos lams p)))
-       (M.toList (byModule (zipDE defs ems))))
+       (Map.toList (byModule (zipDE defs ems))))
 
 partsWith : String
-          -> List Em.Provider
+          -> List Emit.Provider
           -> Ending
-          -> List I.Def
+          -> List IR.Def
           -> CE
           -> Pair (List Emitted1) CS
           -> List (Pair String String)
@@ -2021,17 +2039,17 @@ partsWith runtime provs ending defs ce (MkPair ems s) =
                       ce
                       (MkPair
                          (List.concatMap
-                            (\(p : Em.Provider) ->
+                            (\(p : Emit.Provider) ->
                                namesInGo "TAG_" p.text 0 Nil)
                             provs)
                          (List.concatMap
-                            (\(p : Em.Provider) ->
+                            (\(p : Emit.Provider) ->
                                namesInGo "LBL_" p.text 0 Nil)
                             provs)))
                    (List.append
-                      (declOf ce L.entryKey)
+                      (declOf ce Lower.entryKey)
                       (List.append
-                         (List.map (\(p : Em.Provider) -> p.text) provs)
+                         (List.map (\(p : Emit.Provider) -> p.text) provs)
                          (List.map pubLine (ending.end ce))))))))
        (modulesParts
           ce
@@ -2067,25 +2085,28 @@ type EmitKept =
   }
 
 -- (what is known of a global)
-globalH : CE -> String -> List Ir.HItem -> List Ir.HItem
+globalH : CE -> String -> List IRText.HItem -> List IRText.HItem
 globalH ce g rest =
   Cons
     (HS g)
     (Cons
-       (HN (fromMaybe (0 - 1) (M.lookup compareString g ce.facts.arity)))
+       (HN (fromMaybe (0 - 1) (Map.lookup compareString g ce.facts.arity)))
        (Cons
-          (HN (if M.member compareString g ce.facts.bounce then 1 else 0))
+          (HN (if Map.member compareString g ce.facts.bounce then 1 else 0))
           (Cons
-             (HS (joinWith "," (List.map showInt (Bo.borOf ce.facts.lent g))))
+             (HS
+                (joinWith
+                   ","
+                   (List.map showInt (Borrow.borOf ce.facts.lent g))))
              (Cons
                 (HS (maybe "" Repr.sigName (Repr.sigIn ce.facts.workers g)))
                 rest))))
 
 -- | what a definition's C is made of, hashed: its key, its body (named
 -- | again from 0), and what is known of itself and of what it mentions
-emitVer : CE -> String -> I.Expr -> String
+emitVer : CE -> String -> IR.Expr -> String
 emitVer ce key b =
-  Ir.hashOf
+  IRText.hashOf
     (Cons
        (HS key)
        (Cons
@@ -2093,7 +2114,7 @@ emitVer ce key b =
           (List.foldr
              (globalH ce)
              Nil
-             (sortedOnce (Cons key (I.globalsIn b))))))
+             (sortedOnce (Cons key (IR.globalsIn b))))))
 
 -- (what a definition made on its own: the C state it was emitted from
 -- held nothing else)
@@ -2166,45 +2187,45 @@ keptAtVer v (Just k) = if strEq k.ver v then Just k else Nothing
 keptAtVer v Nothing = Nothing
 
 emitAt : CE
-       -> M.Map String EmitKept
+       -> Map.Map String EmitKept
        -> EmitAcc
-       -> I.Def
-       -> Pair I.Expr Int
+       -> IR.Def
+       -> Pair IR.Expr Int
        -> String
        -> EmitAcc
 emitAt ce kept acc d own v = case keptAtVer
     v
-    (M.lookup compareString d.key kept) of
+    (Map.lookup compareString d.key kept) of
   Just k -> keptHit acc d.key k
   Nothing ->
     freshEmitted
       acc
       d.key
       v
-      (defC (L.cDef ce.facts d own) (ownStart (cGlobal d.key)))
+      (defC (Lower.cDef ce.facts d own) (ownStart (cGlobal d.key)))
 
 emitWith : CE
-         -> M.Map String EmitKept
+         -> Map.Map String EmitKept
          -> EmitAcc
-         -> I.Def
-         -> Pair I.Expr Int
+         -> IR.Def
+         -> Pair IR.Expr Int
          -> EmitAcc
 emitWith ce kept acc d own =
   emitAt ce kept acc d own (emitVer ce d.key (fst own))
 
-emitOne : CE -> M.Map String EmitKept -> EmitAcc -> I.Def -> EmitAcc
-emitOne ce kept acc d = emitWith ce kept acc d (I.freshen 0 d.body)
+emitOne : CE -> Map.Map String EmitKept -> EmitAcc -> IR.Def -> EmitAcc
+emitOne ce kept acc d = emitWith ce kept acc d (IR.freshen 0 d.body)
 
 -- | each definition emitted as `defsC` does -- as the cache keeps it,
 -- | where it keeps it at its version -- and those emitted here
-defsKept : CE -> M.Map String EmitKept -> List I.Def -> EmitAcc
+defsKept : CE -> Map.Map String EmitKept -> List IR.Def -> EmitAcc
 defsKept ce kept defs =
   List.foldl (emitOne ce kept) { ems = Nil, s = emptyCS, fresh = Nil } defs
 
 partsCE : String
-        -> List Em.Provider
+        -> List Emit.Provider
         -> Ending
-        -> List I.Def
+        -> List IR.Def
         -> CE
         -> List (Pair String String)
 partsCE runtime provs ending defs ce =
@@ -2213,10 +2234,10 @@ partsCE runtime provs ending defs ce =
 -- | the program as parts, each by its file's name: heff.h, run$main.c
 -- | (`entryPart`), then a part for each module
 programParts : String
-             -> List Em.Provider
+             -> List Emit.Provider
              -> Ending
-             -> F.Facts
-             -> List I.Def
+             -> Facts.Facts
+             -> List IR.Def
              -> List (Pair String String)
 programParts runtime provs ending facts defs =
   partsCE
@@ -2227,14 +2248,14 @@ programParts runtime provs ending facts defs =
     (ceOf
        provs
        facts
-       (namesIn tagsLbls (List.map (\(d : I.Def) -> d.body) defs)))
+       (namesIn tagsLbls (List.map (\(d : IR.Def) -> d.body) defs)))
 
 -- | the program, its runtime and its providers before it
 programC : String
-         -> List Em.Provider
+         -> List Emit.Provider
          -> Ending
-         -> F.Facts
-         -> List I.Def
+         -> Facts.Facts
+         -> List IR.Def
          -> String
 programC runtime provs ending facts defs =
   programWith
@@ -2243,13 +2264,17 @@ programC runtime provs ending facts defs =
     ending
     facts
     defs
-    (namesIn tagsLbls (List.map (\(d : I.Def) -> d.body) defs))
+    (namesIn tagsLbls (List.map (\(d : IR.Def) -> d.body) defs))
 
-outputOf : String -> List Em.Provider -> Ending -> L.Lowered -> Em.Output
+outputOf : String
+         -> List Emit.Provider
+         -> Ending
+         -> Lower.Lowered
+         -> Emit.Output
 outputOf runtime provs ending l =
   { source = programC runtime provs ending l.facts l.defs, errors = l.errors }
 
-checkOut : String -> List (Pair String String) -> L.Lowered -> Em.Output
+checkOut : String -> List (Pair String String) -> Lower.Lowered -> Emit.Output
 checkOut runtime exports l =
   { source =
       programC
@@ -2269,32 +2294,32 @@ checkOut runtime exports l =
 threadsLine : String
 threadsLine = "#define HEFF_THREADS 1"
 
-saysThreads : Em.Provider -> Bool
+saysThreads : Emit.Provider -> Bool
 saysThreads p =
   List.any (\l -> startsWith "#define HEFF_THREADS" l) (lines p.text)
 
-runPrefix : List Em.Provider -> List String
+runPrefix : List Emit.Provider -> List String
 runPrefix provs = if List.any saysThreads provs then [threadsLine] else Nil
 
 -- | one C file that runs the computation `key` of the effect `eff`: the
 -- | runtime (lib/c/runtime.c), each world's provider, and the program
 compileProgramC : String
-                -> List Em.Provider
-                -> G.Globals
+                -> List Emit.Provider
+                -> Globals.Globals
                 -> String
-                -> Ef.Effect
-                -> Em.Output
+                -> Effect.Effect
+                -> Emit.Output
 compileProgramC runtime provs g key eff =
   outputOf
     runtime
     provs
     { prefix = runPrefix provs, end = runEnd eff }
-    (L.lowerProgramC g key)
+    (Lower.lowerProgramC g key)
 
 partsOf : String
-        -> List Em.Provider
-        -> Ef.Effect
-        -> L.Lowered
+        -> List Emit.Provider
+        -> Effect.Effect
+        -> Lower.Lowered
         -> Pair (List (Pair String String)) (List String)
 partsOf runtime provs eff l =
   MkPair
@@ -2309,13 +2334,13 @@ partsOf runtime provs eff l =
 -- | the program `compileProgramC` makes, as parts (`programParts`), and
 -- | what is wrong with it
 compileProgramParts : String
-                    -> List Em.Provider
-                    -> G.Globals
+                    -> List Emit.Provider
+                    -> Globals.Globals
                     -> String
-                    -> Ef.Effect
+                    -> Effect.Effect
                     -> Pair (List (Pair String String)) (List String)
 compileProgramParts runtime provs g key eff =
-  partsOf runtime provs eff (L.lowerProgramC g key)
+  partsOf runtime provs eff (Lower.lowerProgramC g key)
 
 -- | the program as parts, made through the backend's cache: what is
 -- | wrong with it, and what the cache is to keep anew -- definitions of
@@ -2323,15 +2348,15 @@ compileProgramParts runtime provs g key eff =
 type PartsKept =
   { parts : List (Pair String String)
   , errors : List String
-  , groups : List L.GroupOut
-  , copies : List Si.CopyDone
+  , groups : List Lower.GroupOut
+  , copies : List Simplify.CopyDone
   , emits : List (Pair String EmitKept)
   }
 
 keptPartsAcc : String
-             -> List Em.Provider
+             -> List Emit.Provider
              -> Ending
-             -> L.LoweredKept
+             -> Lower.LoweredKept
              -> CE
              -> EmitAcc
              -> PartsKept
@@ -2351,20 +2376,20 @@ keptPartsAcc runtime provs ending lk ce acc =
   }
 
 keptPartsCE : String
-            -> List Em.Provider
+            -> List Emit.Provider
             -> Ending
-            -> M.Map String EmitKept
-            -> L.LoweredKept
+            -> Map.Map String EmitKept
+            -> Lower.LoweredKept
             -> CE
             -> PartsKept
 keptPartsCE runtime provs ending kept lk ce =
   keptPartsAcc runtime provs ending lk ce (defsKept ce kept lk.lowered.defs)
 
 keptParts : String
-          -> List Em.Provider
-          -> Ef.Effect
-          -> M.Map String EmitKept
-          -> L.LoweredKept
+          -> List Emit.Provider
+          -> Effect.Effect
+          -> Map.Map String EmitKept
+          -> Lower.LoweredKept
           -> PartsKept
 keptParts runtime provs eff kept lk =
   keptPartsCE
@@ -2376,20 +2401,20 @@ keptParts runtime provs eff kept lk =
     (ceOf
        provs
        lk.lowered.facts
-       (namesIn tagsLbls (List.map (\(d : I.Def) -> d.body) lk.lowered.defs)))
+       (namesIn tagsLbls (List.map (\(d : IR.Def) -> d.body) lk.lowered.defs)))
 
 -- | the parts `compileProgramParts` makes, made through the backend's
 -- | cache (heff.build.backcache): each definition of the core taken as
 -- | it keeps it at its version (`vers`, `ks`, heff.compile.lower), each
 -- | definition's C as it keeps it at what it is made of (`kept`)
 compileProgramPartsKept : String
-                        -> List Em.Provider
-                        -> G.Globals
+                        -> List Emit.Provider
+                        -> Globals.Globals
                         -> String
-                        -> Ef.Effect
-                        -> M.Map String String
-                        -> L.Keeps
-                        -> M.Map String EmitKept
+                        -> Effect.Effect
+                        -> Map.Map String String
+                        -> Lower.Keeps
+                        -> Map.Map String EmitKept
                         -> PartsKept
 compileProgramPartsKept runtime provs g key eff vers ks kept =
   keptParts
@@ -2397,14 +2422,17 @@ compileProgramPartsKept runtime provs g key eff vers ks kept =
     provs
     eff
     kept
-    (L.cKeptOf (L.lowerProgramKept g key vers ks))
+    (Lower.cKeptOf (Lower.lowerProgramKept g key vers ks))
 
 -- | one C file that shows the definitions it is asked for, of those
 -- | given (each by its name and key), as test/load-js.mjs shows
 -- | JavaScript's: what the tests hold the backend to
-compileCheckC : String -> G.Globals -> List (Pair String String) -> Em.Output
+compileCheckC : String
+              -> Globals.Globals
+              -> List (Pair String String)
+              -> Emit.Output
 compileCheckC runtime g exports =
-  checkOut runtime exports (L.lowerC g (List.map snd exports))
+  checkOut runtime exports (Lower.lowerC g (List.map snd exports))
 
 catMaybesC : {a : Type} -> List (Maybe a) -> List a
 catMaybesC Nil = Nil

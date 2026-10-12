@@ -14,17 +14,17 @@
 -- `version` (and `versionDir` with it) must be bumped when elaboration
 -- changes, there being no build stamp to read from inside.
 
-import array as A
+import array as Array
 import heff.build.decoder
-import heff.build.driver as Dr
-import heff.syntax.fixity as F
-import heff.elab.globals as G
-import heff.syntax.import as I
-import heff.elab.params as Pm
-import heff.elab.rename as Rn
-import heff.build.serial as Se
-import heff.elab.toplevel as T
-import map as Mp
+import heff.build.driver as Driver
+import heff.syntax.fixity as Fixity
+import heff.elab.globals as Globals
+import heff.syntax.import as Import
+import heff.elab.params as Params
+import heff.elab.rename as Rename
+import heff.build.serial as Serial
+import heff.elab.toplevel as TopLevel
+import map as Map
 
 version : String
 version = "heff-cache-port/44"
@@ -59,34 +59,37 @@ strHash s = hashGo s 0 5381 7919
 -- Hashes of the definitions, and of what a parse takes
 --------------------------------------------------------------------------------
 
-hashOf : Mp.Map String String -> String -> String
-hashOf m k = fromMaybe "?" (Mp.lookup compareString k m)
+hashOf : Map.Map String String -> String -> String
+hashOf m k = fromMaybe "?" (Map.lookup compareString k m)
 
 nubCa : List String -> List String
 nubCa Nil = Nil
 nubCa (Cons x xs) = Cons x (nubCa (List.filter (\y -> not (strEq y x)) xs))
 
-refsOf : G.Entry -> List String
+refsOf : Globals.Entry -> List String
 refsOf e =
   List.sortBy
     strLt
-    (nubCa (List.append (Rn.globalsInTy e.tySyntax) (Rn.globalsInEl e.syntax)))
+    (nubCa
+       (List.append
+          (Rename.globalsInTy e.tySyntax)
+          (Rename.globalsInEl e.syntax)))
 
-defHashOne : Mp.Map String String
-           -> Dr.Checked
-           -> Dr.Own
-           -> Mp.Map String String
+defHashOne : Map.Map String String
+           -> Driver.Checked
+           -> Driver.Own
+           -> Map.Map String String
 defHashOne m c o =
-  if Mp.member compareString o.key m then m
-  else case G.lookupEntry c.top.globals o.key of
+  if Map.member compareString o.key m then m
+  else case Globals.lookupEntry c.top.globals o.key of
     Just e ->
-      Mp.insert
+      Map.insert
         compareString
         o.key
         (strHash
-           (Se.encodeTy e.tySyntax
+           (Serial.encodeTy e.tySyntax
             ^ "\n"
-            ^ Se.encodeEl e.syntax
+            ^ Serial.encodeEl e.syntax
             ^ "\n"
             ^ joinWith "," (List.map (\k -> k ^ ":" ^ hashOf m k) (refsOf e))))
         m
@@ -94,37 +97,39 @@ defHashOne m c o =
 
 -- the module itself, a struct of its definitions, and its theory:
 -- mentioned bare (`M`), they hash as all of it
-wholeHash : Mp.Map String String -> Dr.Checked -> Mp.Map String String
+wholeHash : Map.Map String String -> Driver.Checked -> Map.Map String String
 wholeHash m c =
-  Mp.insert
+  Map.insert
     compareString
     (c.module ^ "#")
     (strHash
        (joinWith
           ","
-          (List.map (\(o : Dr.Own) -> o.key ^ ":" ^ hashOf m o.key) c.own)))
-    (Mp.insert
+          (List.map (\(o : Driver.Own) -> o.key ^ ":" ^ hashOf m o.key) c.own)))
+    (Map.insert
        compareString
        (c.module ^ "#T")
        (strHash
           (joinWith
              ","
-             (List.map (\(o : Dr.Own) -> o.key ^ ":" ^ hashOf m o.key) c.own)))
+             (List.map
+                (\(o : Driver.Own) -> o.key ^ ":" ^ hashOf m o.key)
+                c.own)))
        m)
 
 -- | a thawed module's hashes: each definition's as it was frozen -- what
 -- | it is made of being unchanged, so is its hash -- not computed again
-thawedHashesInto : Mp.Map String String
-                 -> Dr.Thawed
-                 -> Dr.Checked
-                 -> Mp.Map String String
+thawedHashesInto : Map.Map String String
+                 -> Driver.Thawed
+                 -> Driver.Checked
+                 -> Map.Map String String
 thawedHashesInto hs th c =
   wholeHash
     (List.foldl
        (\m p -> case p of
         MkPair k h ->
-          if Mp.member compareString k m then m
-          else Mp.insert compareString k h m)
+          if Map.member compareString k m then m
+          else Map.insert compareString k h m)
        hs
        th.hashes)
     c
@@ -133,139 +138,142 @@ thawedHashesInto hs th c =
 -- | definitions it mentions -- so a hash covers a definition's making,
 -- | transitively.  (A primitive declared again is the same one: the
 -- | first hash stands.)
-defHashesInto : Mp.Map String String -> Dr.Checked -> Mp.Map String String
+defHashesInto : Map.Map String String -> Driver.Checked -> Map.Map String String
 defHashesInto hs c =
   wholeHash (List.foldl (\m o -> defHashOne m c o) hs c.own) c
 
-assocInt : F.Assoc -> Int
+assocInt : Fixity.Assoc -> Int
 assocInt AssocLeft = 0
 assocInt AssocRight = 1
 assocInt AssocNone = 2
 
-fixSig : F.Fixities -> String
+fixSig : Fixity.Fixities -> String
 fixSig f =
   joinWith
     ";"
     (List.map
-       (\(g : F.Group) ->
+       (\(g : Fixity.Group) ->
           g.id
           ^ ":"
           ^ showInt (assocInt g.assoc)
-          ^ Se.tokBool g.loosest
+          ^ Serial.tokBool g.loosest
           ^ ":"
           ^ joinWith " " g.ops)
        f.groups)
   ^ "|"
   ^ joinWith
     ";"
-    (List.map (\(e : F.Edge) -> e.tighter ^ ">" ^ e.looser) f.above)
+    (List.map (\(e : Fixity.Edge) -> e.tighter ^ ">" ^ e.looser) f.above)
 
 -- | an instance a module declares, as a search in a module importing it
 -- | sees it: its key, and its type -- with what the type mentions,
 -- | transitively -- for the search to be made again where either changes
-instanceSig : Mp.Map String String -> Dr.Checked -> String -> String
-instanceSig hashes c k = case G.lookupEntry c.top.globals k of
+instanceSig : Map.Map String String -> Driver.Checked -> String -> String
+instanceSig hashes c k = case Globals.lookupEntry c.top.globals k of
   Just e ->
     k
     ^ ":"
     ^ strHash
-      (Se.encodeTy e.tySyntax
+      (Serial.encodeTy e.tySyntax
        ^ "\n"
        ^ joinWith
          ","
          (List.map
             (\r -> r ^ ":" ^ hashOf hashes r)
-            (List.sortBy strLt (Rn.globalsInTy e.tySyntax))))
+            (List.sortBy strLt (Rename.globalsInTy e.tySyntax))))
   Nothing -> k
 
 -- | what a module's parse takes from a direct import -- the names it
 -- | defines, and the fixities it declares -- and what its instance
 -- | searches may find there, the instances it declares
-nsHashOf : Mp.Map String String -> Dr.Checked -> String
+nsHashOf : Map.Map String String -> Driver.Checked -> String
 nsHashOf hashes c =
   strHash
-    (joinWith "," (List.map (\(o : Dr.Own) -> o.name) c.own)
+    (joinWith "," (List.map (\(o : Driver.Own) -> o.name) c.own)
      ^ "|"
      ^ fixSig c.fixities
      ^ "|"
      ^ joinWith
        ","
-       (List.map (\k -> instanceSig hashes c k) (Dr.ownInstances c)))
+       (List.map (\k -> instanceSig hashes c k) (Driver.ownInstances c)))
 
 -- | the modules a file imports directly, in scope by name or by alias
-directOf : Dr.Source -> List String
-directOf s = Dr.importNames (Dr.importsOfSource s).imports
+directOf : Driver.Source -> List String
+directOf s = Driver.importNames (Driver.importsOfSource s).imports
 
 -- Freezing: a clean module as the cache file keeps it
 --------------------------------------------------------------------------------
 
 tokPair : Pair String String -> List String
-tokPair (MkPair a b) = Cons (Se.tokStr a) (Cons (Se.tokStr b) Nil)
+tokPair (MkPair a b) = Cons (Serial.tokStr a) (Cons (Serial.tokStr b) Nil)
 
 tokCount : {a : Type} -> (a -> List String) -> List a -> List String
 tokCount f xs = Cons (showInt (List.length xs)) (List.concatMap f xs)
 
-freezeFix : F.Fixities -> List String
+freezeFix : Fixity.Fixities -> List String
 freezeFix f =
   List.append
     (tokCount
-       (\(g : F.Group) ->
+       (\(g : Fixity.Group) ->
           Cons
-            (Se.tokStr g.id)
+            (Serial.tokStr g.id)
             (Cons
                (showInt (assocInt g.assoc))
                (Cons
-                  (Se.tokBool g.loosest)
+                  (Serial.tokBool g.loosest)
                   (Cons
-                     (Se.tokStr g.at)
-                     (tokCount (\o -> Cons (Se.tokStr o) Nil) g.ops)))))
+                     (Serial.tokStr g.at)
+                     (tokCount (\o -> Cons (Serial.tokStr o) Nil) g.ops)))))
        f.groups)
     (tokCount
-       (\(e : F.Edge) ->
-          Cons (Se.tokStr e.tighter) (Cons (Se.tokStr e.looser) Nil))
+       (\(e : Fixity.Edge) ->
+          Cons (Serial.tokStr e.tighter) (Cons (Serial.tokStr e.looser) Nil))
        f.above)
 
-nsOf : Mp.Map String String -> List Dr.Checked -> String -> String
+nsOf : Map.Map String String -> List Driver.Checked -> String -> String
 nsOf hashes done m = case List.find
-    (\(d : Dr.Checked) -> strEq d.module m)
+    (\(d : Driver.Checked) -> strEq d.module m)
     done of
   Just d -> nsHashOf hashes d
   Nothing -> "?"
 
-needsOf : Dr.Checked -> List String
+needsOf : Driver.Checked -> List String
 needsOf c =
   List.sortBy
     strLt
     (List.filter
        (\k ->
-          not (List.elemBy strEq k (List.map (\(o : Dr.Own) -> o.key) c.own)))
+          not
+            (List.elemBy strEq k (List.map (\(o : Driver.Own) -> o.key) c.own)))
        (nubCa
           (List.concatMap
-             (\(o : Dr.Own) -> case G.lookupEntry c.top.globals o.key of
+             (\(o : Driver.Own) -> case Globals.lookupEntry
+                c.top.globals
+                o.key of
               Just e ->
                 List.append
-                  (Rn.globalsInTy e.tySyntax)
-                  (Rn.globalsInEl e.syntax)
+                  (Rename.globalsInTy e.tySyntax)
+                  (Rename.globalsInEl e.syntax)
               Nothing -> Nil)
              c.own)))
 
-freezeDef : Mp.Map String String
-          -> Dr.Checked
-          -> Pair Dr.Own (Pair String Pm.Span)
+freezeDef : Map.Map String String
+          -> Driver.Checked
+          -> Pair Driver.Own (Pair String Params.Span)
           -> Maybe (List String)
-freezeDef hashes c (MkPair o (MkPair _ sp)) = case G.lookupEntry
+freezeDef hashes c (MkPair o (MkPair _ sp)) = case Globals.lookupEntry
     c.top.globals
     o.key of
   Just e ->
     Just
-      [ Se.tokStr o.name
-      , Se.tokStr o.key
-      , Se.tokBool (G.isInstance c.top.globals o.key)
-      , Se.tokStr (hashOf hashes o.key)
+      [ Serial.tokStr o.name
+      , Serial.tokStr o.key
+      , Serial.tokBool (Globals.isInstance c.top.globals o.key)
+      , Serial.tokStr (hashOf hashes o.key)
       , showInt sp.start
       , showInt sp.end
-      , Se.encodeTy e.tySyntax
-      , Se.encodeEl e.syntax
+      , Serial.encodeTy e.tySyntax
+      , Serial.encodeEl e.syntax
       ]
   Nothing -> Nothing
 
@@ -287,10 +295,10 @@ allJust (Cons (Just x) xs) = consJust x (allJust xs)
 -- | file for `a.B` and `a.b`) and from which source it elaborated, what its parse took from each direct import,
 -- | which outside definitions it mentions (at which hashes), and its
 -- | own definitions' syntax
-freeze : Mp.Map String String
-       -> List Dr.Checked
-       -> Dr.Source
-       -> Dr.Checked
+freeze : Map.Map String String
+       -> List Driver.Checked
+       -> Driver.Source
+       -> Driver.Checked
        -> Maybe String
 freeze hashes done s c = case allJust
     (List.map (\p -> freezeDef hashes c p) (zipCa c.own c.top.spans)) of
@@ -301,10 +309,12 @@ freeze hashes done s c = case allJust
          " "
          (List.append
             (Cons
-               (Se.tokStr version)
+               (Serial.tokStr version)
                (Cons
-                  (Se.tokStr s.module)
-                  (Cons (Se.tokStr (strHash c.source)) (freezeFix c.fixities))))
+                  (Serial.tokStr s.module)
+                  (Cons
+                     (Serial.tokStr (strHash c.source))
+                     (freezeFix c.fixities))))
             (List.append
                (tokCount
                   (\m -> tokPair (MkPair m (nsOf hashes done m)))
@@ -318,23 +328,28 @@ freeze hashes done s c = case allJust
 -- Melting: believing a cache file, or not
 --------------------------------------------------------------------------------
 
-mkGroup : String -> F.Assoc -> Bool -> String -> List String -> F.Group
+mkGroup : String
+        -> Fixity.Assoc
+        -> Bool
+        -> String
+        -> List String
+        -> Fixity.Group
 mkGroup gid assoc loosest at ops =
   { id = gid, assoc = assoc, ops = ops, loosest = loosest, at = at }
 
-mkEdge : String -> String -> F.Edge
+mkEdge : String -> String -> Fixity.Edge
 mkEdge tighter looser = { tighter = tighter, looser = looser }
 
-mkFixities : List F.Group -> List F.Edge -> F.Fixities
+mkFixities : List Fixity.Group -> List Fixity.Edge -> Fixity.Fixities
 mkFixities groups above = { groups = groups, above = above }
 
-assocOf : Int -> Dec F.Assoc
+assocOf : Int -> Dec Fixity.Assoc
 assocOf 0 = pure AssocLeft
 assocOf 1 = pure AssocRight
 assocOf 2 = pure AssocNone
 assocOf _ = fail
 
-meltFixGroup : Dec F.Group
+meltFixGroup : Dec Fixity.Group
 meltFixGroup = do
   gid <- str
   a <- int
@@ -344,13 +359,13 @@ meltFixGroup = do
   assoc <- assocOf a
   pure (mkGroup gid assoc loosest at ops)
 
-meltFixEdge : Dec F.Edge
+meltFixEdge : Dec Fixity.Edge
 meltFixEdge = do
   tighter <- str
   looser <- str
   pure (mkEdge tighter looser)
 
-meltFix : Dec F.Fixities
+meltFix : Dec Fixity.Fixities
 meltFix = do
   groups <- many meltFixGroup
   above <- many meltFixEdge
@@ -362,7 +377,7 @@ meltPair = do
   b <- str
   pure (MkPair a b)
 
-meltDef : Dec (Pair T.ThawedDef String)
+meltDef : Dec (Pair TopLevel.ThawedDef String)
 meltDef = do
   name <- str
   key <- str
@@ -370,11 +385,11 @@ meltDef = do
   hash <- str
   start <- int
   end <- int
-  ty <- Se.takeTy
-  body <- Se.takeEl
+  ty <- Serial.takeTy
+  body <- Serial.takeEl
   pure
       (MkPair
-         (T.mkThawedDef
+         (TopLevel.mkThawedDef
             name
             key
             isInstance
@@ -389,7 +404,9 @@ keyHash kh = case split "\n" kh of
   Cons k (Cons h _) -> MkPair k h
   _ -> MkPair kh "?"
 
-mkThawed : F.Fixities -> List (Pair T.ThawedDef String) -> Dr.Thawed
+mkThawed : Fixity.Fixities
+         -> List (Pair TopLevel.ThawedDef String)
+         -> Driver.Thawed
 mkThawed fixities defs =
   { fixities = fixities
   , defs = List.map fst defs
@@ -397,34 +414,37 @@ mkThawed fixities defs =
   }
 
 -- (a direct import, its namespace as it was)
-importHolds : Mp.Map String String
-            -> List Dr.Checked
+importHolds : Map.Map String String
+            -> List Driver.Checked
             -> Pair String String
             -> Bool
 importHolds hashes done (MkPair m h) = strEq (nsOf hashes done m) h
 
 -- (a needed definition, at the hash it had)
-needHolds : Mp.Map String String -> Pair String String -> Bool
+needHolds : Map.Map String String -> Pair String String -> Bool
 needHolds hashes (MkPair k h) = strEq (hashOf hashes k) h
 
 -- | every direct import's namespace as it was, and no other import
-importsHold : Mp.Map String String
-            -> List Dr.Checked
-            -> Dr.Source
+importsHold : Map.Map String String
+            -> List Driver.Checked
+            -> Driver.Source
             -> List (Pair String String)
             -> Bool
 importsHold hashes done s ns =
   List.all (importHolds hashes done) ns
   && List.length ns == List.length (directOf s)
 
-needsHold : Mp.Map String String -> List (Pair String String) -> Bool
+needsHold : Map.Map String String -> List (Pair String String) -> Bool
 needsHold hashes needs = List.all (needHolds hashes) needs
 
 -- | a module believed back from its cache file: same version, same
 -- | module, same source, every direct import's namespace as it was (the
 -- | source is the same, so the import list is too), every needed
 -- | definition at the hash it had
-meltFrom : Mp.Map String String -> List Dr.Checked -> Dr.Source -> Dec Dr.Thawed
+meltFrom : Map.Map String String
+         -> List Driver.Checked
+         -> Driver.Source
+         -> Dec Driver.Thawed
 meltFrom hashes done s = do
   expect version
   expect s.module
@@ -437,9 +457,9 @@ meltFrom hashes done s = do
   defs <- many meltDef
   pure (mkThawed fixities defs)
 
-melt : Mp.Map String String
-     -> List Dr.Checked
-     -> Dr.Source
+melt : Map.Map String String
+     -> List Driver.Checked
+     -> Driver.Source
      -> String
-     -> Maybe Dr.Thawed
+     -> Maybe Driver.Thawed
 melt hashes done s text = run (meltFrom hashes done s) text

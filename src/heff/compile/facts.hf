@@ -16,125 +16,126 @@
 --   parameters, or gives their result, unboxed, and how -- the C
 --   backend's (heff.compile.worker), none until it is told.
 
-import heff.compile.ir as I
+import heff.compile.ir as IR
 import heff.compile.repr as Repr
-import map as M
+import map as Map
 
 type Facts =
-  { arity : M.Map String Int
-  , bounce : M.Map String Unit
-  , lazy : M.Map String Unit
-  , lent : M.Map String (List Int)
+  { arity : Map.Map String Int
+  , bounce : Map.Map String Unit
+  , lazy : Map.Map String Unit
+  , lent : Map.Map String (List Int)
   , workers : Repr.Sigs
   }
 
 -- Arities
 --------------------------------------------------------------------------------
 
-arityOfBody : I.Expr -> Int
+arityOfBody : IR.Expr -> Int
 arityOfBody (ELam xs _) = List.length xs
 arityOfBody b = 0
 
 -- (a function's: a definition that is no function has none)
-arityOne : M.Map String Int -> I.Def -> M.Map String Int
+arityOne : Map.Map String Int -> IR.Def -> Map.Map String Int
 arityOne m d@{ body = ELam xs _ } =
-  M.insert compareString d.key (List.length xs) m
+  Map.insert compareString d.key (List.length xs) m
 arityOne m d = m
 
 -- Bounces
 --------------------------------------------------------------------------------
 
 -- | whether it applies an unknown function last
-tailApp : I.Expr -> Bool
+tailApp : IR.Expr -> Bool
 tailApp (ELet _ _ b) = tailApp b
-tailApp (EMatch _ arms) = List.any (\a -> tailApp (I.armBody a)) arms
+tailApp (EMatch _ arms) = List.any (\a -> tailApp (IR.armBody a)) arms
 tailApp (EApp _ _) = True
 tailApp e = False
 
 -- | the definitions it calls last
-tailGlobals : I.Expr -> List String
+tailGlobals : IR.Expr -> List String
 tailGlobals (ELet _ _ b) = tailGlobals b
 tailGlobals (EMatch _ arms) =
-  List.concatMap (\a -> tailGlobals (I.armBody a)) arms
+  List.concatMap (\a -> tailGlobals (IR.armBody a)) arms
 tailGlobals (ECall g _) = Cons g Nil
 tailGlobals e = Nil
 
-bodyBounces : M.Map String Unit -> I.Def -> Bool
+bodyBounces : Map.Map String Unit -> IR.Def -> Bool
 bodyBounces set d@{ body = ELam _ b } =
   tailApp b
   || List.any
-    (\g -> not (strEq g d.key) && M.member compareString g set)
+    (\g -> not (strEq g d.key) && Map.member compareString g set)
     (tailGlobals b)
 bodyBounces set d = False
 
-bounceStep : List I.Def -> M.Map String Unit -> M.Map String Unit
+bounceStep : List IR.Def -> Map.Map String Unit -> Map.Map String Unit
 bounceStep defs set =
   List.foldl
-    (\m (d : I.Def) ->
-       if bodyBounces set d then M.insert compareString d.key MkUnit m else m)
+    (\m (d : IR.Def) ->
+       if bodyBounces set d then Map.insert compareString d.key MkUnit m else m)
     set
     defs
 
-bounceGo : List I.Def -> M.Map String Unit -> M.Map String Unit
+bounceGo : List IR.Def -> Map.Map String Unit -> Map.Map String Unit
 bounceGo defs set =
-  if M.size (bounceStep defs set) == M.size set then set
+  if Map.size (bounceStep defs set) == Map.size set then set
   else bounceGo defs (bounceStep defs set)
 
 -- | the definitions that may give back a bounce
-bouncing : List I.Def -> M.Map String Unit
-bouncing defs = bounceGo defs M.empty
+bouncing : List IR.Def -> Map.Map String Unit
+bouncing defs = bounceGo defs Map.empty
 
 -- Laziness
 --------------------------------------------------------------------------------
 
 -- (each definition before, by whether it is lazy)
-type Seen = M.Map String Bool
+type Seen = Map.Map String Bool
 
 eagerSeen : Seen -> String -> Bool
-eagerSeen seen k = case M.lookup compareString k seen of
+eagerSeen seen k = case Map.lookup compareString k seen of
   Just lz -> not lz
   Nothing -> False
 
 -- | whether a definition is computed when first used: not when it is a
 -- | value that mentions only definitions before it computed at once
-lazyOf : Seen -> String -> I.Expr -> Bool
+lazyOf : Seen -> String -> IR.Expr -> Bool
 lazyOf seen key b =
   arityOfBody b == 0
   && not
-    (I.isValue b
-     && List.all (\k -> not (strEq k key) && eagerSeen seen k) (I.globalsIn b))
+    (IR.isValue b
+     && List.all (\k -> not (strEq k key) && eagerSeen seen k) (IR.globalsIn b))
 
-lazySeen : List I.Def -> Seen
+lazySeen : List IR.Def -> Seen
 lazySeen defs =
   List.foldl
-    (\m (d : I.Def) -> M.insert compareString d.key (lazyOf m d.key d.body) m)
-    M.empty
+    (\m (d : IR.Def) ->
+       Map.insert compareString d.key (lazyOf m d.key d.body) m)
+    Map.empty
     defs
 
-lazies : List I.Def -> M.Map String Unit
+lazies : List IR.Def -> Map.Map String Unit
 lazies defs =
   List.foldl
-    (\m p -> if snd p then M.insert compareString (fst p) MkUnit m else m)
-    M.empty
-    (M.toList (lazySeen defs))
+    (\m p -> if snd p then Map.insert compareString (fst p) MkUnit m else m)
+    Map.empty
+    (Map.toList (lazySeen defs))
 
 -- Facts
 --------------------------------------------------------------------------------
 
 -- | what is known of the definitions (none lent, no workers)
--- | >>> M.toList (factsOf [I.mkDef "f" "f" (ELam ["x"] (EApp (EVar "x") [EInt 1])), I.mkDef "n" "n" (EInt 1)]).arity
+-- | >>> Map.toList (factsOf [IR.mkDef "f" "f" (ELam ["x"] (EApp (EVar "x") [EInt 1])), IR.mkDef "n" "n" (EInt 1)]).arity
 -- | [MkPair "f" 1]
-factsOf : List I.Def -> Facts
+factsOf : List IR.Def -> Facts
 factsOf defs =
-  { arity = List.foldl arityOne M.empty defs
+  { arity = List.foldl arityOne Map.empty defs
   , bounce = bouncing defs
   , lazy = lazies defs
-  , lent = M.empty
-  , workers = M.empty
+  , lent = Map.empty
+  , workers = Map.empty
   }
 
 -- | ... and the parameters lent
-withLent : M.Map String (List Int) -> Facts -> Facts
+withLent : Map.Map String (List Int) -> Facts -> Facts
 withLent lent f =
   { arity = f.arity
   , bounce = f.bounce

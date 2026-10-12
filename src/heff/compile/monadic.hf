@@ -18,8 +18,8 @@
 -- point.  That is done where it is cheap and safe, in the imperative
 -- form the backends print (`set x` in each arm).
 
-import heff.compile.ir as I
-import heff.compile.simplify as Si
+import heff.compile.ir as IR
+import heff.compile.simplify as Simplify
 
 -- | computations drawing fresh names
 type N a = Int -> Pair a Int
@@ -49,7 +49,7 @@ allA p Nil = True
 allA p (Cons x xs) = p x && allA p xs
 
 -- | a name or a literal
-atom : I.Expr -> Bool
+atom : IR.Expr -> Bool
 atom (EVar _) = True
 atom (EGlobal _) = True
 atom (EInt _) = True
@@ -62,22 +62,22 @@ atom (EPrim _) = True
 atom _ = False
 
 -- | ... or a lambda
-value : I.Expr -> Bool
+value : IR.Expr -> Bool
 value (ELam _ _) = True
 value e = atom e
 
 -- | an operand that may stay where it is
-inPlace : I.Expr -> Bool
+inPlace : IR.Expr -> Bool
 inPlace (ELam _ _) = True
 inPlace (ETag _ as) = allA value as
 inPlace (ERecord fs _) = allA value (List.map snd fs)
 inPlace (EProj e _ _ _) = atom e
-inPlace (EPrimCall p as) = not (Si.primFails p) && allA atom as
+inPlace (EPrimCall p as) = not (Simplify.primFails p) && allA atom as
 inPlace e = atom e
 
 -- | an operand, normal (by `go`), given to `k`: bound first unless it may
 -- | stay; the bindings it made on the way bound before it
-bindAs : I.Expr -> (I.Expr -> N I.Expr) -> N I.Expr
+bindAs : IR.Expr -> (IR.Expr -> N IR.Expr) -> N IR.Expr
 bindAs (ELet y c d) k = do
   r <- bindAs d k
   pure (ELet y c r)
@@ -91,7 +91,7 @@ bindAs e k =
 -- | ... bound unless it is a name or a literal: what a match looks at
 -- | (its arms then see what it looked at by a name, and the C backend's
 -- | reference counts know it)
-bindAtom : I.Expr -> (I.Expr -> N I.Expr) -> N I.Expr
+bindAtom : IR.Expr -> (IR.Expr -> N IR.Expr) -> N IR.Expr
 bindAtom (ELet y c d) k = do
   r <- bindAtom d k
   pure (ELet y c r)
@@ -102,41 +102,44 @@ bindAtom e k =
     body <- k (EVar t)
     pure (ELet t e body)
 
-operandWith : (I.Expr -> N I.Expr) -> I.Expr -> (I.Expr -> N I.Expr) -> N I.Expr
+operandWith : (IR.Expr -> N IR.Expr)
+            -> IR.Expr
+            -> (IR.Expr -> N IR.Expr)
+            -> N IR.Expr
 operandWith go e k = do
   e' <- go e
   bindAs e' k
 
-operandsWith : (I.Expr -> N I.Expr)
-             -> List I.Expr
-             -> (List I.Expr -> N I.Expr)
-             -> N I.Expr
+operandsWith : (IR.Expr -> N IR.Expr)
+             -> List IR.Expr
+             -> (List IR.Expr -> N IR.Expr)
+             -> N IR.Expr
 operandsWith go Nil k = k Nil
 operandsWith go (Cons a rest) k =
   operandWith go a (\a' -> operandsWith go rest (\rest' -> k (Cons a' rest')))
 
 -- (a binding of a binding: the inner first, names being unique)
-flatLet : String -> I.Expr -> I.Expr -> I.Expr
+flatLet : String -> IR.Expr -> IR.Expr -> IR.Expr
 flatLet x (ELet y c d) b = ELet y c (flatLet x d b)
 flatLet x a b = ELet x a b
 
-fieldN : (I.Expr -> N I.Expr)
-       -> List (Pair String I.Expr)
-       -> List I.FieldTy
-       -> N I.Expr
+fieldN : (IR.Expr -> N IR.Expr)
+       -> List (Pair String IR.Expr)
+       -> List IR.FieldTy
+       -> N IR.Expr
 fieldN go fs ts =
   operandsWith
     go
     (List.map snd fs)
     (\vs -> pure (ERecord (List.zipWith (\p v -> MkPair (fst p) v) fs vs) ts))
 
-armN : (I.Expr -> N I.Expr) -> I.Arm -> N I.Arm
+armN : (IR.Expr -> N IR.Expr) -> IR.Arm -> N IR.Arm
 armN go (MkArm t vs b) = do
   b' <- go b
   pure (MkArm t vs b')
 
 -- | an expression in monadic form
-norm : I.Expr -> N I.Expr
+norm : IR.Expr -> N IR.Expr
 norm (ELam xs b) = do
   b' <- norm b
   pure (ELam xs b')
@@ -158,17 +161,17 @@ norm (EMatch s arms) = do
     pure (EMatch s' arms'))
 norm e = pure e
 
-defN : I.Def -> N I.Def
+defN : IR.Def -> N IR.Def
 defN d = do
   b <- norm d.body
-  pure (I.mkDef d.key d.name b)
+  pure (IR.mkDef d.key d.name b)
 
 -- | the definitions in monadic form, names drawn from `supply` on
--- | >>> monadicProgram 0 [I.mkDef "f" "f" (ELam ["x"] (ECall "g" [ECall "h" [EVar "x"], EInt 1]))]
--- | [I.mkDef "f" "f" (ELam ["x"] (ELet "t$0" (ECall "h" [EVar "x"]) (ECall "g" [EVar "t$0", EInt 1])))]
-monadicProgram : Int -> List I.Def -> List I.Def
+-- | >>> monadicProgram 0 [IR.mkDef "f" "f" (ELam ["x"] (ECall "g" [ECall "h" [EVar "x"], EInt 1]))]
+-- | [IR.mkDef "f" "f" (ELam ["x"] (ELet "t$0" (ECall "h" [EVar "x"]) (ECall "g" [EVar "t$0", EInt 1])))]
+monadicProgram : Int -> List IR.Def -> List IR.Def
 monadicProgram supply defs = fst (traverseN defN defs supply)
 
 -- | ... and where fresh names go on from
-monadicFrom : Int -> List I.Def -> Pair (List I.Def) Int
+monadicFrom : Int -> List IR.Def -> Pair (List IR.Def) Int
 monadicFrom supply defs = traverseN defN defs supply
