@@ -54,6 +54,13 @@ The batteries ship with it, under `lib/std/`:
 An effect's JavaScript side is in `M.provider.js` beside `M.hf`, its C
 side in `M.provider.c`: see [providers.md](providers.md).
 
+`std.net`'s `fetchText` is Node.js's `fetch` in JavaScript.  In C it is
+libcurl, loaded into the process when the program first fetches (no
+`-lcurl`), its connections kept for the next fetch; where there is no
+libcurl (a static musl program, Windows), a `curl` spawned for each.
+Either way a failure is `TypeError: fetch failed: ` and what `curl
+-sSL --fail` says.
+
 ## Examples
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds

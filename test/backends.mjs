@@ -17,6 +17,7 @@
 // processes forked, and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -214,6 +215,98 @@ checks.push((async () => {
 
 // time and the network: done later, the rest going on then
 checks.push(ran("sleep and fetch", "test/node/timed.hf", "timed", [], { out: "fetched\n", status: 0 }));
+
+// the network, by C alone (Node.js's fetch gives a page of 404 as it
+// is): a server of the test's own and `data:` URLs fetched by libcurl in
+// the process and by the curl spawned (`-DHEFF_NET_SPAWN`), the same
+// text from each -- a page, a failure's message -- and each as wanted
+// (where it is curl's version's to say, the start of it).  Run again
+// with no curl on the PATH, libcurl's the same still: it is in the
+// process, not spawned.
+if (process.platform !== "win32") checks.push((async () => {
+  const msgs = [];
+  const big = "0123456789abcdef".repeat(16384);
+  const server = createServer((q, r) => {
+    const say = (status, body, headers = {}) => { r.writeHead(status, headers); r.end(body); };
+    switch (q.url) {
+      case "/item": return say(200, "item 3\n".repeat(4));
+      case "/nope": return say(404, "not here");
+      case "/bad": return say(400, "bad");
+      case "/empty": return say(200);
+      case "/moved": return say(302, "moving", { Location: "/ping" });
+      case "/loop": return say(302, "", { Location: "/loop" });
+      case "/ping": return say(200, "pong");
+      case "/big": return say(200, big, { "Content-Length": big.length });
+      case "/chunked": r.write("one,"); r.write("two,"); return r.end("three");
+      case "/agent": return say(200, q.headers["user-agent"] ?? "none");
+      case "/short": r.writeHead(200, { "Content-Length": 100 }); r.write("cut"); return setTimeout(() => r.socket.destroy(), 50);
+      default: return say(500);
+    }
+  });
+  const listening = (s) => new Promise((ok) => s.listen(0, "127.0.0.1", () => ok(s.address().port)));
+  const port = await listening(server);
+  const shut = createServer(), refused = await listening(shut);
+  shut.close();
+  const at = `http://127.0.0.1:${port}`, failed = "TypeError: fetch failed";
+  const cases = [
+    [`${at}/item`, "28 item 3\nitem 3\nitem 3\nitem 3\n"],
+    [`${at}/nope`, `73 ${failed}: curl: (22) The requested URL returned error: 404`],
+    [`${at}/bad`, `73 ${failed}: curl: (22) The requested URL returned error: 400`],
+    [`http://127.0.0.1:${refused}/`, new RegExp(`^\\d+ ${failed}: curl: \\(7\\) Failed to connect to 127\\.0\\.0\\.1 port ${refused}`)],
+    ["data:,hi%20there", "8 hi there"],
+    ["data:text/plain;base64,aGkgdGhlcmU=", "8 hi there"],
+    ["data:no-comma", `23 ${failed}`],
+    [`http://localhost:${port}/ping`, "4 pong"],
+    [`${at}/empty`, "0 "],
+    [`${at}/moved`, "4 pong"],
+    [`${at}/loop`, new RegExp(`^\\d+ ${failed}: curl: \\(47\\) `)],
+    [`${at}/chunked`, "13 one,two,three"],
+    [`${at}/agent`, /^\d+ curl\/\S+$/],
+    [`${at}/short`, new RegExp(`^\\d+ ${failed}: curl: \\(18\\) `)],
+    [`127.0.0.1:${port}/ping`, "4 pong"],
+    ["nope://x/", new RegExp(`^\\d+ ${failed}: curl: \\(1\\) `)],
+    ["http://", new RegExp(`^\\d+ ${failed}: curl: \\(3\\) `)],
+    [`${at}/big`, `${big.length} ${big}`],
+  ];
+  const urls = cases.map(([u]) => u);
+  // (what the program wrote, a fetch's lines each, by `cases`: a page may
+  // have lines of its own)
+  const want = cases.map(([, w]) => w);
+  const split = (out) => {
+    const got = [];
+    let rest = out;
+    for (const w of want) {
+      const n = typeof w === "string" ? w.length : rest.indexOf("\n");
+      got.push(rest.slice(0, n));
+      rest = rest.slice(n + 1);
+    }
+    return got;
+  };
+  const curt = (s) => JSON.stringify(s.length > 120 ? `${s.slice(0, 120)}...` : s);
+  const outs = {};
+  const noCurl = { ...process.env, PATH: join(work, "no-such-dir") };
+  for (const [built, cflags, runs] of [
+    ["libcurl", [], [["libcurl", process.env], ["libcurl, no curl on the PATH", noCurl]]],
+    ["spawned", ["-DHEFF_NET_SPAWN"], [["spawned", process.env]]],
+  ]) {
+    const p = await programs.c("test/node/fetched.hf", "main", cflags);
+    if (p.error !== undefined) { msgs.push(`FAIL the network, ${built} (c): not compiled\n${p.error}`); continue; }
+    for (const [how, env] of runs) {
+      const r = await run(p.cmd, urls, { timeout: 60000, env });
+      if (r.status !== 0 || r.stderr) { msgs.push(`FAIL the network, ${how} (c): status ${r.status}\n${r.stderr}`); continue; }
+      const got = split(r.stdout);
+      cases.forEach(([u, w], i) => {
+        if (typeof w === "string" ? got[i] !== w : !w.test(got[i]))
+          msgs.push(`FAIL the network, ${how} (c): ${u} gave ${curt(got[i])}, wanted ${curt(String(w))}`);
+      });
+      outs[how] = r.stdout.replace(/ after \d+ ms/g, " after N ms");
+    }
+  }
+  for (const how of Object.keys(outs).slice(1))
+    if (outs[how] !== outs.libcurl) msgs.push(`FAIL the network, ${how} (c): not as libcurl's\n${curt(outs[how])}\n${curt(outs.libcurl)}`);
+  server.close();
+  return msgs;
+})());
 
 // a module named `main` (main.hf, in no project), compiled to C as
 // parts: its part, main.c, is not the program's entry, which is a part of
