@@ -2515,6 +2515,22 @@ static V heff_bytesSlice(V a, V i, V j) {
 
 static V heff_bytesAppend(V a, V b) { return heff_buf_append(a, b, K_BYT); }
 
+// (a list's bytes, one after another: their length added up first, so
+// that they are made once, each copied once)
+static V heff_bytesConcat(V l) {
+  int64_t n = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n += ((Str *)heff_field(c, 0))->len;
+  Str *s = heff_bytes_new(n);
+  int64_t k = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
+    Str *x = (Str *)heff_field(c, 0);
+    if (x->len) memcpy(s->s + k, x->s, (size_t)x->len);
+    k += x->len;
+  }
+  heff_drop(l);
+  return (V)s;
+}
+
 static V heff_bytesEq(V a, V b) { return heff_strEq(a, b); }
 
 static V heff_bytesFromList(V l) {
