@@ -1028,17 +1028,25 @@ static inline void heff_copy(V *to, const V *from, int64_t n) {
   }
 }
 
+// (the bounces run until a value comes: each a chain of calls last
+// counted from naught -- and, done, the count of the chain it was called
+// in put back, so that a chain calling one in each of its steps still
+// comes to its bounce, not ever deeper on the C stack.  A bounce's
+// arguments are in an array of the loop's step, not `alloca`'s, which
+// would keep each step's until the end.)
 static V heff_trs(V r) {
+  long outer = heff_dep;
   do {
     Bnc *b = (Bnc *)r;
     heff_dep = 0;
     V fun = b->fun;
     int n = b->n;
-    V *a = alloca(n * sizeof(V));
+    V a[n > 0 ? n : 1];
     heff_copy(a, b->a, n);
     heff_obj_free(b, sizeof(Bnc) + n * sizeof(V));
     r = heff_apply(fun, n, a);
   } while (!IS_INT(r) && !IS_NTAG(r) && OBJ(r)->kind == K_BNC);
+  heff_dep = outer;
   return r;
 }
 
