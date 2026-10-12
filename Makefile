@@ -55,10 +55,11 @@ boot: ## renew the seed, boot/heff.tar.xz, once heff compiles itself to itself (
 native: ## heff for other systems, .heff/out/native/TARGET/ (TARGETS=...)
 	$(ZIG) build native -Dtargets="$(TARGETS)"
 
-##@ Testing (on the heff built: make build first)
+##@ Testing (on the heff built: make build first; Node.js but test-fixpoint)
 
-test: ## the test groups, all at once (GROUPS=..., all by default)
+test: ## the test groups, all at once (GROUPS=..., all and the fixpoint by default)
 	$(NODE) test/run.mjs $(GROUPS)
+	$(if $(GROUPS),,$(ZIG) build fixpoint)
 
 test-compiler: ## elaborating, formatting, the cache, the command line, the goldens
 	$(NODE) test/run.mjs compiler
@@ -69,8 +70,8 @@ test-lsp: ## the language server
 test-backends: ## each backend held to the interpreter, the example apps
 	$(NODE) test/run.mjs backends
 
-test-fixpoint: ## heff compiles itself to the same C
-	$(NODE) test/run.mjs fixpoint
+test-fixpoint: ## heff compiles itself to the same C (by zig, as make boot checks)
+	$(ZIG) build fixpoint
 
 test-asan: ## heff under AddressSanitizer, by clang (JOBS=..., TIMEOUT=...)
 	$(if $(JOBS),HEFF_ASAN_JOBS=$(JOBS) )$(if $(TIMEOUT),HEFF_ASAN_TIMEOUT=$(TIMEOUT) )$(NODE) test/native-asan.mjs

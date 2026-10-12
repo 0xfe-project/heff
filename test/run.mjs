@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // The tests, by group: each GROUP given (all without one), each of its
 // tests a script of test/, on heff as test/heff.mjs says (`HEFF`, else
-// .heff/out/heff, built by scripts/build.mjs).  CI runs them all but
-// asan in one job, on a runner of two cores.
+// .heff/out/heff, built by `make build`).  CI runs them all but asan in
+// one job, on a runner of two cores.  (That heff compiles itself to
+// itself is `make test-fixpoint`'s, by zig: `zig build fixpoint`.)
 // (The scripts run all at once -- each makes what it makes in a
 // directory of its own, the cache shared as test/pool.mjs says -- what
 // each says kept, and shown whole when it is done.  What they run, they
@@ -29,8 +30,6 @@ export const groups = {
   lsp: [["lsp.mjs"]],
   // programs compiled by each backend and run, held to the interpreter
   backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],
-  // heff compiles itself to itself
-  fixpoint: [["gen-fixpoint.mjs"]],
   // heff through C, under AddressSanitizer
   asan: [["native-asan.mjs"]],
 };
