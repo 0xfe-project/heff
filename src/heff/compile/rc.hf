@@ -38,6 +38,7 @@ import heff.compile.borrow as Bo
 import heff.compile.facts as F
 import heff.elab.fixed as Fx
 import heff.compile.imp as Mp
+import heff.compile.ir as I
 import heff.compile.repr as Repr
 import map as M
 
@@ -105,16 +106,27 @@ data Exp b
   | RTag String (List (Exp b))
   -- | a tag built in the cell kept for it
   | RTagIn (Exp b) String (List (Exp b))
-  -- | a record of its labels, its fields
-  | RRec (List String) (List (Exp b))
+  -- | a record of its labels, the bits of its flat fields (#39,
+  -- | `Repr.flatBits`), its fields (a flat one's bits, `RWord`)
+  | RRec (List String) Int (List (Exp b))
   -- | a record built in the cell of `x`, of `n` fields, the bits of
-  -- | those kept: its labels, the others each at its place
-  | RRecIn String Int Int (List String) (List (Pair Int (Exp b)))
+  -- | those kept, the bits of its flat fields kept as they are
+  -- | (`Repr.keptBits`) and of those stored flat: its labels, the others
+  -- | each at its place
+  | RRecIn String Int Int Int Int (List String) (List (Pair Int (Exp b)))
   -- | field `i` of a record, not counted
   | RField (Exp b) Int
   | RDupE (Exp b)
+  -- | field `i` of a record, counted, a `V`: boxed, if it is flat
+  | RFieldV (Exp b) Int
   -- | field `i` of a record of `n` fields, the record consumed
   | RGetN (Exp b) Int Int
+  -- | field `i` of a record, a number of the repr, flat or not: the
+  -- | record lent (`RFieldU`), or of `n` fields and consumed (`RGetNU`)
+  | RFieldU Repr.Repr (Exp b) Int
+  | RGetNU Repr.Repr (Exp b) Int Int
+  -- | an unboxed value, the bits of a flat field
+  | RWord Repr.Repr (Exp b)
   -- | field `i` taken out of the record `x`
   | RTakeField String Int
   -- | a field looked for by its label
@@ -372,9 +384,9 @@ fvW bs ms (Cons (IVal (SVar x)) rest) = fvW bs (Cons x ms) rest
 fvW bs ms (Cons (IVal (SLam xs (MkBlock t))) rest) =
   fvW (List.append xs bs) ms (Cons (ITl t) rest)
 fvW bs ms (Cons (IVal (STag _ as)) rest) = fvW bs ms (pushVals as rest)
-fvW bs ms (Cons (IVal (SRec fs)) rest) =
+fvW bs ms (Cons (IVal (SRec fs _)) rest) =
   fvW bs ms (pushVals (List.map snd fs) rest)
-fvW bs ms (Cons (IVal (SProj v _ _)) rest) = fvW bs ms (Cons (IVal v) rest)
+fvW bs ms (Cons (IVal (SProj v _ _ _)) rest) = fvW bs ms (Cons (IVal v) rest)
 fvW bs ms (Cons (IVal (SPrim _ as)) rest) = fvW bs ms (pushVals as rest)
 fvW bs ms (Cons (IVal _) rest) = fvW bs ms rest
 fvW bs ms (Cons (IOp (OSimple v)) rest) = fvW bs ms (Cons (IVal v) rest)
@@ -472,7 +484,7 @@ knowingShapes t ce =
     ce
     (List.foldl
        (\acc p -> case p of
-        PartVal (SProj v _ sh) -> shapedVar v sh acc
+        PartVal (SProj v _ sh _) -> shapedVar v sh acc
         _ -> acc)
        Nil
        (Mp.tailParts t))
@@ -623,10 +635,11 @@ fieldLentOf ce after Nothing i = Nothing
 
 -- (at a borrowed parameter, a field of a record that outlives the call
 -- -- wanted after it (`after`), or lent to this code -- lent on where it
--- is: not counted, up or down)
+-- is: not counted, up or down.  Not one that may be flat, not a `V`)
 lentField : CE -> List String -> Mp.Val -> Maybe Value
-lentField ce after (SProj e l sh) =
-  fieldLentOf ce after (varOfV e) (indexIn l 0 sh)
+lentField ce after (SProj e l sh t) =
+  if Repr.mayBeFlat t then Nothing
+  else fieldLentOf ce after (varOfV e) (indexIn l 0 sh)
 lentField ce after _ = Nothing
 
 -- (a variable held: a `V`, not one kept unboxed -- which is boxed where
@@ -770,27 +783,52 @@ reuseVal r ce live (Cons ru (Cons (STag t as) Nil)) =
   tagIn t (operandsF r ce live (Cons ru as))
 reuseVal r ce live _ = RInt 0
 
+-- (field `i` of a record, counted, the record not touched: one that may
+-- be flat (#39) boxed if it is)
+fieldDup : Bool -> Value -> Int -> Value
+fieldDup True e i = RFieldV e i
+fieldDup False e i = RDupE (RField e i)
+
 -- (field `i` of a record of `n` fields, read where it is: of a variable
 -- wanted after or lent, or of a definition's value, the field counted and
 -- the record not touched; otherwise the record consumed, the field taken
--- over where it was the last reference)
+-- over where it was the last reference.  `may`: it may be flat)
 fieldIn : RcK
         -> CE
         -> List String
         -> Mp.Val
         -> Int
         -> Int
+        -> Bool
         -> Maybe String
         -> Maybe String
         -> Value
-fieldIn r ce live e i n (Just x) g =
-  if elemS x live || elemS x ce.borrowed then RDupE (RField (RLocal x) i)
+fieldIn r ce live e i n may (Just x) g =
+  if elemS x live || elemS x ce.borrowed then fieldDup may (RLocal x) i
   else RGetN (RLocal x) i n
-fieldIn r ce live e i n Nothing (Just g) = RDupE (RField (RGetRaw g) i)
-fieldIn r ce live e i n Nothing Nothing = RGetN (r.val ce live e) i n
+fieldIn r ce live e i n may Nothing (Just g) = fieldDup may (RGetRaw g) i
+fieldIn r ce live e i n may Nothing Nothing = RGetN (r.val ce live e) i n
 
-fieldAt : RcK -> CE -> List String -> Mp.Val -> Int -> Int -> Value
-fieldAt r ce live e i n = fieldIn r ce live e i n (varOfV e) (globalOfV e)
+fieldAt : RcK -> CE -> List String -> Mp.Val -> Int -> Int -> Bool -> Value
+fieldAt r ce live e i n may =
+  fieldIn r ce live e i n may (varOfV e) (globalOfV e)
+
+-- (... a number of the repr `rp`, flat or not: see `fieldIn`)
+fieldNum : RcK
+         -> CE
+         -> List String
+         -> Mp.Val
+         -> Repr.Repr
+         -> Int
+         -> Int
+         -> Maybe String
+         -> Maybe String
+         -> Value
+fieldNum r ce live e rp i n (Just x) g =
+  if elemS x live || elemS x ce.borrowed then RFieldU rp (RLocal x) i
+  else RGetNU rp (RLocal x) i n
+fieldNum r ce live e rp i n Nothing (Just g) = RFieldU rp (RGetRaw g) i
+fieldNum r ce live e rp i n Nothing Nothing = RGetNU rp (r.val ce live e) i n
 
 -- (the field taken out of its record, if this operand takes it and the
 -- record is wanted after it: see `takesFor`)
@@ -820,24 +858,26 @@ fieldOr : RcK
         -> Mp.Val
         -> Int
         -> Int
+        -> Bool
         -> Maybe Value
         -> Value
-fieldOr r ce live e i n (Just t) = t
-fieldOr r ce live e i n Nothing = fieldAt r ce live e i n
+fieldOr r ce live e i n may (Just t) = t
+fieldOr r ce live e i n may Nothing = fieldAt r ce live e i n may
 
--- | a field: at its place, where the record's shape is known; else
+-- | a field, a `V`: at its place, where the record's shape is known; else
 -- | looked for by its label
 projAt : RcK
        -> CE
        -> List String
        -> Mp.Val
        -> String
+       -> I.FieldTy
        -> Int
        -> Maybe Int
        -> Value
-projAt r ce live e l n (Just i) =
-  fieldOr r ce live e i n (takeIn ce.takes live e l i)
-projAt r ce live e l n Nothing = RGetLabel (r.val ce live e) l
+projAt r ce live e l t n (Just i) =
+  fieldOr r ce live e i n (Repr.mayBeFlat t) (takeIn ce.takes live e l i)
+projAt r ce live e l t n Nothing = RGetLabel (r.val ce live e) l
 
 -- Records updated: a record built of the same shape as one it reads
 -- fields of at their own places, `{ a = x, b = r.b, c = r.c }`, the one
@@ -853,7 +893,7 @@ sameS _ _ = False
 -- (a field read from a record's at its own place, that record's shape
 -- `ls`, the one being built: the record read)
 keptFrom : List String -> Pair String Mp.Val -> Maybe String
-keptFrom ls (MkPair l (SProj e l2 sh)) =
+keptFrom ls (MkPair l (SProj e l2 sh _)) =
   if strEq l l2 && sameS ls sh then varOfV e else Nothing
 keptFrom ls _ = Nothing
 
@@ -904,38 +944,87 @@ changedOf ls x fs =
           fs
           (List.range 0 (List.length fs - 1))))
 
+-- Flat fields (#39): a field is stored as `Repr.slotRepr` says of its
+-- type, flat (its bits, `RWord`) or a `V`, and the record built says
+-- which are flat; one updated keeps the bits of the fields kept.
+
+-- (field `i`'s type, of a record's)
+tyAt : Int -> List I.FieldTy -> I.FieldTy
+tyAt i Nil = FtOther
+tyAt i (Cons t ts) = if i <= 0 then t else tyAt (i - 1) ts
+
+slotAt : List I.FieldTy -> Int -> Repr.Repr
+slotAt ts i = Repr.slotRepr i (tyAt i ts)
+
+-- (a field's value, as it is stored: its bits, if flat)
+wordOf : Repr.Repr -> Value -> Value
+wordOf RepV v = v
+wordOf rp v = RWord rp v
+
+-- (the fields' values, as they are stored, each of the repr given)
+storedAs : RcK
+         -> CE
+         -> List String
+         -> List Repr.Repr
+         -> List Mp.Val
+         -> List Value
+storedAs r ce live rps vs =
+  List.zipWith wordOf rps (operandsAs r ce live rps vs)
+
 -- | a record built from `x`'s
 updateVal : RcK
           -> CE
           -> List String
           -> List (Pair String Mp.Val)
+          -> List I.FieldTy
           -> String
+          -> List (Pair Int Mp.Val)
           -> Value
-updateVal r ce live fs x =
+updateVal r ce live fs ts x changed =
   RRecIn
     x
     (keepBits (List.map (isKeptFrom (List.map fst fs) x) fs))
+    (Repr.keptBits
+       (List.filter
+          (\i -> not (List.any (\p -> fst p == i) changed))
+          (List.range 0 (List.length fs - 1))))
+    (Repr.flatBits
+       (List.map (\p -> MkPair (fst p) (slotAt ts (fst p))) changed))
     (List.length fs)
     (List.map fst fs)
     (List.zipWith
        (\p v -> MkPair (fst p) v)
-       (changedOf (List.map fst fs) x fs)
-       (operandsF
+       changed
+       (storedAs
           r
           ce
           (Cons x live)
-          (List.map snd (changedOf (List.map fst fs) x fs))))
+          (List.map (\p -> slotAt ts (fst p)) changed)
+          (List.map snd changed)))
 
 -- | a record built: in the cell of the one it is updated from, if any
 recordVal : RcK
           -> CE
           -> List String
           -> List (Pair String Mp.Val)
+          -> List I.FieldTy
           -> Maybe String
           -> Value
-recordVal r ce live fs (Just x) = updateVal r ce live fs x
-recordVal r ce live fs Nothing =
-  RRec (List.map fst fs) (operandsF r ce live (List.map snd fs))
+recordVal r ce live fs ts (Just x) =
+  updateVal r ce live fs ts x (changedOf (List.map fst fs) x fs)
+recordVal r ce live fs ts Nothing =
+  RRec
+    (List.map fst fs)
+    (Repr.flatBits
+       (List.map
+          (\i -> MkPair i (slotAt ts i))
+          (List.range 0 (List.length fs - 1))))
+    (storedAs
+       r
+       ce
+       live
+       (List.map (slotAt ts) (List.range 0 (List.length fs - 1)))
+       (List.map snd fs))
 
 valF : RcK -> CE -> List String -> Mp.Val -> Value
 valF r ce live (SVar x) = varUse ce live x
@@ -948,10 +1037,10 @@ valF r ce live (SFixed w n) = RFixed w n
 valF r ce live (SFloat32 x) = RF32 x
 valF r ce live (STag t as) =
   if List.null as then RNTag t else RTag t (operandsF r ce live as)
-valF r ce live (SRec fs) =
-  recordVal r ce live fs (updatedIn ce live (List.map fst fs) fs)
-valF r ce live (SProj e l sh) =
-  projAt r ce live e l (List.length sh) (indexIn l 0 sh)
+valF r ce live (SRec fs ts) =
+  recordVal r ce live fs ts (updatedIn ce live (List.map fst fs) fs)
+valF r ce live (SProj e l sh t) =
+  projAt r ce live e l t (List.length sh) (indexIn l 0 sh)
 valF r ce live (SPrimFn p) = RPrimFn p
 valF r ce live (SPrim p as) =
   if strEq p reusePrim then reuseVal r ce live as
@@ -1001,6 +1090,25 @@ primAs r ce live want p as (Just sh) =
 primAs r ce live want p as Nothing =
   coerce RepV want (valF r ce live (SPrim p as))
 
+-- | a field `v` of `e`, as the repr `want`: a number kept as `rp` (where
+-- | it may be flat, `Repr.readRepr`) read as one, where one is wanted;
+-- | otherwise a `V`
+projAs : RcK
+       -> CE
+       -> List String
+       -> Repr.Repr
+       -> Mp.Val
+       -> Mp.Val
+       -> Int
+       -> Maybe Int
+       -> Repr.Repr
+       -> Value
+projAs r ce live want v e n (Just i) rp =
+  if Repr.isBoxed rp || Repr.isBoxed want
+    then coerce RepV want (valF r ce live v)
+  else coerce rp want (fieldNum r ce live e rp i n (varOfV e) (globalOfV e))
+projAs r ce live want v e n Nothing rp = coerce RepV want (valF r ce live v)
+
 -- | a value, as the repr `want`
 valAsF : RcK -> CE -> List String -> Repr.Repr -> Mp.Val -> Value
 valAsF r ce live want (SFixed w n) =
@@ -1011,6 +1119,17 @@ valAsF r ce live want (SFloat32 x) =
   if isRepFix F32 want then RF32U x else coerce RepV want (RF32 x)
 valAsF r ce live want (SPrim p as) =
   primAs r ce live want p as (Repr.primShape p)
+valAsF r ce live want (SProj e l sh t) =
+  projAs
+    r
+    ce
+    live
+    want
+    (SProj e l sh t)
+    e
+    (List.length sh)
+    (indexIn l 0 sh)
+    (Repr.readRepr (indexIn l 0 sh) t)
 valAsF r ce live want v = coerce (naturalOf ce v) want (valF r ce live v)
 
 -- (a condition's code: what is held lent to it -- see `Cond`)
@@ -1484,7 +1603,7 @@ reusedOf _ = Nothing
 
 builtOf : Mp.Comp -> Maybe Known
 builtOf (OSimple (STag _ as)) = Just (KnownTag (List.length as))
-builtOf (OSimple (SRec fs)) = Just (KnownRec (List.length fs))
+builtOf (OSimple (SRec fs _)) = Just (KnownRec (List.length fs))
 builtOf (OSimple (SLam xs (MkBlock t))) =
   Just (KnownClo (List.length (freeOf xs t)))
 builtOf (OSimple (SPrim p as)) =
@@ -1616,13 +1735,13 @@ varIs x _ = False
 othersW : String -> String -> List Item -> Bool
 othersW x l Nil = True
 othersW x l (Cons (IVal (SVar y)) rest) = not (strEq x y) && othersW x l rest
-othersW x l (Cons (IVal (SProj e l2 _)) rest) =
+othersW x l (Cons (IVal (SProj e l2 _ _)) rest) =
   if varIs x e then not (strEq l l2) && othersW x l rest
   else othersW x l (Cons (IVal e) rest)
 othersW x l (Cons (IVal (SLam _ (MkBlock t))) rest) =
   Mp.timesIn x (Mp.tailParts t) == 0 && othersW x l rest
 othersW x l (Cons (IVal (STag _ as)) rest) = othersW x l (pushVals as rest)
-othersW x l (Cons (IVal (SRec fs)) rest) =
+othersW x l (Cons (IVal (SRec fs _)) rest) =
   othersW x l (pushVals (List.map snd fs) rest)
 othersW x l (Cons (IVal (SPrim _ as)) rest) = othersW x l (pushVals as rest)
 othersW x l (Cons (IVal _) rest) = othersW x l rest
@@ -1670,10 +1789,10 @@ operandsOf : Mp.Comp -> List Mp.Val
 operandsOf (OApply f as) = Cons f as
 operandsOf (OCall _ as) = as
 operandsOf (OSimple (STag _ as)) = as
-operandsOf (OSimple (SRec fs)) = List.map snd fs
+operandsOf (OSimple (SRec fs _)) = List.map snd fs
 operandsOf (OSimple (SPrim _ as)) = as
 operandsOf (OPrim _ as) = as
-operandsOf (OSimple (SProj e l sh)) = Cons (SProj e l sh) Nil
+operandsOf (OSimple (SProj e l sh t)) = Cons (SProj e l sh t) Nil
 operandsOf _ = Nil
 
 -- (an operand that takes its field, `rest` all that may look at its
@@ -1695,7 +1814,8 @@ takeVar ce rest (Just x) l sh =
 takeVar ce rest Nothing l sh = Nil
 
 takeOne : CE -> List Item -> Mp.Val -> List (Pair String String)
-takeOne ce rest (SProj e l sh) = takeVar ce rest (varOfV e) l sh
+takeOne ce rest (SProj e l sh t) =
+  if Repr.mayBeFlat t then Nil else takeVar ce rest (varOfV e) l sh
 takeOne ce rest e = Nil
 
 takesAt : CE

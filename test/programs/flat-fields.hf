@@ -1,0 +1,121 @@
+-- Records whose `Float64`, `Int64` and `UInt64` fields the C backend
+-- keeps flat (#39): built, read, updated in their cells and copied where
+-- shared, put into a list, shown, given to code that does not know the
+-- field's type -- and built by it, then read where the type is known --
+-- a theory's value of a type it sets, a field beyond the 16th, and
+-- integers beyond 62 bits.  Each backend held to the interpreter.
+
+import int64 as Int64
+import uint64 as UInt64
+
+type Body = { x : Float64, vx : Float64, mass : Float64, id : Int64, seed : UInt64, name : String }
+
+-- (beyond 62 bits, both ways)
+body : Int -> Body
+body k =
+  { x = toFloat k
+  , vx = toFloat k /. 4.0
+  , mass = 1.5 + toFloat k
+  , id = Int64.fromInt k * 4611686018427387903
+  , seed = UInt64.fromInt k * 0x9E3779B97F4A7C15
+  , name = "b" ^ showInt k
+  }
+
+-- (updated: in its cell where it is the last reference)
+step : Float64 -> Body -> Body
+step dt b =
+  { b | x = b.x + dt * b.vx, seed = b.seed * 6364136223846793005 + 1, id = b.id + b.id }
+
+stepped : List Body
+stepped = List.map (step 0.5) (List.map body (List.range 0 4))
+
+shown : String
+shown = joinWith ", " (List.map (\(b : Body) -> b.name ^ ":" ^ showFloat b.x ^ ":" ^ Int64.show b.id ^ ":" ^ UInt64.show b.seed) stepped)
+
+-- (shared: copied, the one it is made of read after)
+shared : String
+shared =
+  let b = body 7 in
+  let c = { b | vx = 0.0 - b.vx, name = "c" } in
+  showFloat (b.vx + c.vx) ^ " " ^ showFloat c.x ^ " " ^ Int64.show (c.id - b.id) ^ " " ^ c.name ^ " " ^ b.name
+
+-- (a record itself as a value: shown by each backend)
+one : Body
+one = step 0.25 (body 3)
+
+-- (a field read where its type is not known, and a record built there)
+fieldOf : {a : Type} -> (Body -> a) -> List Body -> List a
+fieldOf f bs = List.map f bs
+
+type Box a = { v : a, n : Int }
+
+boxed : {a : Type} -> a -> Box a
+boxed x = { v = x, n = 1 }
+
+bump : {a : Type} -> Box a -> Box a
+bump b = { b | n = b.n + 1 }
+
+unboxedSum : List (Box Float64) -> Float64
+unboxedSum bs = List.foldl (\s (b : Box Float64) -> s + b.v * toFloat b.n) 0.0 bs
+
+generic : String
+generic =
+  let masses = fieldOf (\(b : Body) -> b.mass) stepped in
+  let ids = fieldOf (\(b : Body) -> b.id) stepped in
+  let built = List.map (\m -> bump (boxed m)) masses in
+  let known : List (Box Float64) = List.map (\m -> ({ v = m * 2.0, n = 3 } : Box Float64)) masses in
+  showFloat (List.foldl (\s m -> s + m) 0.0 masses)
+  ^ " " ^ Int64.show (List.foldl (\s i -> s + i) 0 ids)
+  ^ " " ^ showFloat (unboxedSum built)
+  ^ " " ^ showFloat (unboxedSum (List.map bump known))
+  ^ " " ^ showFloat (List.foldl (\s (b : Box Float64) -> s + b.v) 0.0 (List.map (\(b : Box Float64) -> boxed b.v) known))
+
+boxes : List (Box UInt64)
+boxes = List.map (\k -> bump { v = UInt64.fromInt k * 0xF000000000000001, n = k }) (List.range 1 3)
+
+-- (a theory's value of the type it sets)
+theory Scale where
+  t : Type
+  unit : t
+  twice : t -> t
+
+scaleF : Scale
+scaleF = { t = Float64, unit = 1.25, twice = \x -> x + x }
+
+-- (where the type is not known)
+twiceUnit : (s : Scale) -> s.t
+twiceUnit s = s.twice (s.twice s.unit)
+
+theoried : String
+theoried = showFloat (twiceUnit scaleF) ^ " " ^ showFloat scaleF.unit
+
+-- (more fields than may be flat: those past the 16th are `V`s)
+type Wide = { f0 : Float64, f1 : Float64, f2 : Float64, f3 : Float64, f4 : Float64, f5 : Float64, f6 : Float64, f7 : Float64, f8 : Float64, f9 : Float64, f10 : Float64, f11 : Float64, f12 : Float64, f13 : Float64, f14 : Float64, f15 : Float64, f16 : Float64, f17 : Int64, f18 : String }
+
+wide : Float64 -> Wide
+wide z =
+  { f0 = z, f1 = z + 1.0, f2 = z + 2.0, f3 = z + 3.0, f4 = z + 4.0, f5 = z + 5.0, f6 = z + 6.0, f7 = z + 7.0
+  , f8 = z + 8.0, f9 = z + 9.0, f10 = z + 10.0, f11 = z + 11.0, f12 = z + 12.0, f13 = z + 13.0, f14 = z + 14.0
+  , f15 = z + 15.0, f16 = z + 16.0, f17 = 9223372036854775807, f18 = "w" }
+
+wideSum : Wide -> Float64
+wideSum w =
+  w.f0 + w.f7 + w.f15 + w.f16 + toFloat (Int64.toInt (w.f17 / 1000000000000))
+
+wides : String
+wides =
+  let w = wide 0.5 in
+  let w2 = { w | f16 = w.f16 * 2.0, f15 = w.f15 * 3.0, f17 = w.f17 + 1 } in
+  showFloat (wideSum w) ^ " " ^ showFloat (wideSum w2) ^ " " ^ Int64.show w2.f17 ^ " " ^ w2.f18
+
+wideOne : Wide
+wideOne = wide (-0.0)
+
+-- (dropped: many made and let go, a few kept)
+churn : Int -> Float64 -> Float64
+churn k acc =
+  if k == 0 then acc
+  else let b = step 0.1 (body k) in churn (k - 1) (acc + b.x - b.vx)
+
+churned : Float64
+churned = churn 2000 0.0

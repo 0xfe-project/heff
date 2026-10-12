@@ -282,7 +282,8 @@ if (process.platform !== "win32") checks.push((async () => {
 // when it is joined.  HEFF_TSAN=1: built with ThreadSanitizer too, by
 // the system's clang, and run again, what it says a failure.
 const threadsWant = "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
-  + "a definition, shared: 333833500 333833501 333833502 333833503\nprimes below 100000, by 4: 9592\n"
+  + "a definition, shared: 333833500 333833501 333833502 333833503\n"
+  + "flat fields, shared and copied: 2528 2529 2530\nprimes below 100000, by 4: 9592\n"
   + "forced at once: 6765 6765 6765 6765\nfib 20, each Par a thread: 6765\n";
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];

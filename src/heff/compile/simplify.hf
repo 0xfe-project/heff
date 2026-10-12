@@ -344,14 +344,14 @@ pureIn : M.Map String Unit -> M.Map String Int -> I.Expr -> Bool
 pureIn safe total (EVar _) = True
 pureIn safe total (EGlobal g) = M.member compareString g safe
 pureIn safe total (ELam _ _) = True
-pureIn safe total (ERecord fs) =
+pureIn safe total (ERecord fs _) =
   I.allI
     (List.map
        (\p -> case p of
         MkPair _ e2 -> pureIn safe total e2)
        fs)
 pureIn safe total (ETag _ as) = I.allI (List.map (\a -> pureIn safe total a) as)
-pureIn safe total (EProj e2 _ _) = pureIn safe total e2
+pureIn safe total (EProj e2 _ _ _) = pureIn safe total e2
 pureIn safe total (EApp (EGlobal g) as) = case M.lookup compareString g total of
   Just ar ->
     List.length as <= ar && I.allI (List.map (\a -> pureIn safe total a) as)
@@ -526,12 +526,12 @@ substCopies x a (ELet y e2 b) = do
   e2' <- substCopies x a e2
   b' <- substCopies x a b
   pure (ELet y e2' b')
-substCopies x a (ERecord fs) = do
+substCopies x a (ERecord fs ts) = do
   fs' <- fieldsS (\q -> substCopies x a q) fs
-  pure (ERecord fs')
-substCopies x a (EProj e2 l sh) = do
+  pure (ERecord fs' ts)
+substCopies x a (EProj e2 l sh t) = do
   e2' <- substCopies x a e2
-  pure (EProj e2' l sh)
+  pure (EProj e2' l sh t)
 substCopies x a (ETag t as) = do
   as' <- traverseS (\q -> substCopies x a q) as
   pure (ETag t as')
@@ -556,7 +556,7 @@ lam xs e = ELam xs e
 type SK =
   { simp : I.Expr -> M I.Expr
   , applyTo : I.Expr -> List I.Expr -> M I.Expr
-  , project : String -> List String -> I.Expr -> M I.Expr
+  , project : String -> List String -> I.FieldTy -> I.Expr -> M I.Expr
   , match : I.Expr -> List I.Arm -> M I.Expr
   }
 
@@ -575,8 +575,9 @@ specArgSize = 60
 closedKnown : I.Expr -> Bool
 closedKnown (ELam xs b) =
   not (I.sizeAbove specArgSize (ELam xs b)) && Sp.closedIn Nil (ELam xs b)
-closedKnown (ERecord fs) =
-  not (I.sizeAbove specArgSize (ERecord fs)) && Sp.closedIn Nil (ERecord fs)
+closedKnown (ERecord fs ts) =
+  not (I.sizeAbove specArgSize (ERecord fs ts))
+  && Sp.closedIn Nil (ERecord fs ts)
 closedKnown _ = False
 
 -- | how many uses of a closed value bound may each be given a copy of it
@@ -728,12 +729,12 @@ simpF r (EApp f as) = do
 simpF r (ELet x a b) = do
   a' <- r.simp a
   letFloat r x a' b
-simpF r (ERecord fs) = do
+simpF r (ERecord fs ts) = do
   fs' <- fieldsS (\a -> r.simp a) fs
-  pure (ERecord fs')
-simpF r (EProj e2 l sh) = do
+  pure (ERecord fs' ts)
+simpF r (EProj e2 l sh t) = do
   e2' <- r.simp e2
-  r.project l sh e2'
+  r.project l sh t e2'
 simpF r (ETag t as) = do
   as' <- traverseS (\a -> r.simp a) as
   pure (ETag t as')
@@ -999,7 +1000,7 @@ shapesOf _ as = pure { args = as, vars = Nil, holes = Nil }
 
 isKind : I.Expr -> Bool
 isKind (ELam _ _) = True
-isKind (ERecord _) = True
+isKind (ERecord _ _) = True
 isKind _ = False
 
 -- | a definition simplified that is a function, or a value computing
@@ -1084,8 +1085,8 @@ cheap safe (EStr _) = True
 cheap safe (EFixed _ _) = True
 cheap safe (EFloat32 _) = True
 cheap safe (ETag _ as) = I.allI (List.map (cheap safe) as)
-cheap safe (ERecord fs) = I.allI (List.map (cheap safe) (List.map snd fs))
-cheap safe (EProj e _ _) = cheap safe e
+cheap safe (ERecord fs _) = I.allI (List.map (cheap safe) (List.map snd fs))
+cheap safe (EProj e _ _ _) = cheap safe e
 cheap safe (ELet _ a b) = cheap safe a && cheap safe b
 cheap safe (EPrimCall p as) =
   not (primFails p) && I.allI (List.map (cheap safe) as)
@@ -1537,7 +1538,7 @@ knownField : String -> String -> M (Maybe I.Expr)
 knownField g l = do
   s <- get
   case M.lookup compareString g s.sp.all of
-    Just (ERecord fs) -> case fieldIn l fs of
+    Just (ERecord fs _) -> case fieldIn l fs of
       Just v ->
         if I.isValue v && s.fuel > 0
           then do
@@ -1606,12 +1607,12 @@ applyToF r f as =
       specAfter r g as e1
     -- (a field of a known record, applied: judged by what the
     -- application comes to, not by the size of the field)
-    EProj (EGlobal g) l sh -> do
+    EProj (EGlobal g) l sh t -> do
       mb <- known g
       case mb of
         Just b ->
           attempt (mkApp f as) (do
-          h <- r.project l sh b
+          h <- r.project l sh t b
           r.applyTo h as)
         Nothing -> do
           mv <- knownField g l
@@ -1634,21 +1635,21 @@ othersPure l (Cons (MkPair k f) rest) =
     p <- isPure f
     if p then othersPure l rest else pure False
 
-projectF : SK -> String -> List String -> I.Expr -> M I.Expr
-projectF r l sh (ERecord fs) = case findField l fs of
+projectF : SK -> String -> List String -> I.FieldTy -> I.Expr -> M I.Expr
+projectF r l sh t (ERecord fs ts) = case findField l fs of
   Just v -> do
     others <- othersPure l fs
-    pure (if others then v else EProj (ERecord fs) l sh)
-  Nothing -> pure (EProj (ERecord fs) l sh)
-projectF r l sh (ELet x a b) = do
-  b' <- r.project l sh b
+    pure (if others then v else EProj (ERecord fs ts) l sh t)
+  Nothing -> pure (EProj (ERecord fs ts) l sh t)
+projectF r l sh t (ELet x a b) = do
+  b' <- r.project l sh t b
   pure (ELet x a b')
-projectF r l sh e@(EGlobal g) = do
+projectF r l sh t e@(EGlobal g) = do
   mb <- known g
   case mb of
-    Just b -> attempt (EProj e l sh) (r.project l sh b)
-    Nothing -> pure (EProj e l sh)
-projectF r l sh e = pure (EProj e l sh)
+    Just b -> attempt (EProj e l sh t) (r.project l sh t b)
+    Nothing -> pure (EProj e l sh t)
+projectF r l sh t e = pure (EProj e l sh t)
 
 findArm : String -> List I.Arm -> Maybe I.Arm
 findArm t Nil = Nothing
@@ -1710,7 +1711,7 @@ sk : SK
 sk =
   { simp = \e -> simpF sk e
   , applyTo = \f as -> applyToF sk f as
-  , project = \l sh e -> projectF sk l sh e
+  , project = \l sh t e -> projectF sk l sh t e
   , match = \s arms -> matchF sk s arms
   }
 

@@ -24,8 +24,17 @@
 -- `V` is wanted (an allocation, for a `Float64` or a 64-bit integer
 -- beyond 62 bits), against an unbox where a `V` comes in.  A field a
 -- match binds stays a `V` (`Pinned`), and is unboxed where it is used.
+--
+-- A record's field is told by its type (heff.compile.erase's
+-- `I.FieldTy`): one whose `V` would be allocated -- a `Float64`, an
+-- `Int64`, a `UInt64` -- is kept flat in the record, its bits, where the
+-- record is built knowing the type (`slotRepr`), and read as its number
+-- where it is read knowing it.  What is built where the type is not known
+-- (`{ v : a }`) is a `V`, so a read checks, as the record says
+-- (lib/c/runtime.c, "Flat fields"): a record is one `V`, whoever built it.
 
 import heff.compile.imp as Imp
+import heff.compile.ir as I
 import heff.elab.fixed as Fixed
 import map as Map
 
@@ -159,6 +168,67 @@ argReprs p as = argsOf (primShape p) as
 resultRepr : String -> Repr
 resultRepr p = resultOf (primShape p)
 
+-- Records' fields
+--------------------------------------------------------------------------------
+
+-- | how many of a record's first fields may be flat (lib/c/runtime.c's
+-- | `HEFF_FLAT_FIELDS`)
+flatFields : Int
+flatFields = 16
+
+-- | how a field of the type is kept, flat (a number's bits) or a `V`:
+-- | flat where a `V` of it would be allocated for
+-- | >>> reprEq RepF64 (flatOf FtFloat) && isBoxed (flatOf (FtFixed I32))
+-- | True
+flatOf : I.FieldTy -> Repr
+flatOf FtFloat = RepF64
+flatOf (FtFixed w) = if Fixed.fixedBits w == 64 then RepFix w else RepV
+flatOf t = RepV
+
+-- | how field `i` of the type is kept where it is known (the others: as
+-- | a `V`)
+slotRepr : Int -> I.FieldTy -> Repr
+slotRepr i t = if i < flatFields then flatOf t else RepV
+
+-- | how a record's fields are kept, built knowing their types
+slotReprs : List I.FieldTy -> List Repr
+slotReprs ts = List.zipWith slotRepr (List.range 0 (List.length ts - 1)) ts
+
+-- | whether a field of the type may be flat, built where the type was
+-- | known: one of a type not known here too
+mayBeFlat : I.FieldTy -> Bool
+mayBeFlat FtAny = True
+mayBeFlat t = not (isBoxed (flatOf t))
+
+-- | how a field is read, where its record's shape is known: as it may be
+-- | kept (`Nothing`: not known, a `V`)
+readRepr : Maybe Int -> I.FieldTy -> Repr
+readRepr (Just i) t = slotRepr i t
+readRepr Nothing t = RepV
+
+-- | a flat field's kind, as a record says it (lib/c/runtime.c's
+-- | `HEFF_FLAT_F64` and the others; 0, a `V`)
+flatCode : Repr -> Int
+flatCode RepF64 = 1
+flatCode (RepFix I64) = 2
+flatCode (RepFix U64) = 3
+flatCode r = 0
+
+-- (4 to the `i`th)
+fourTo : Int -> Int
+fourTo i = if i <= 0 then 1 else 4 * fourTo (i - 1)
+
+-- | the bits a record's header has of its flat fields, each at its place
+-- | >>> flatBits [MkPair 0 RepF64, MkPair 2 (RepFix U64), MkPair 3 RepV]
+-- | 49
+flatBits : List (Pair Int Repr) -> Int
+flatBits ps = List.foldl (\n p -> n + flatCode (snd p) * fourTo (fst p)) 0 ps
+
+-- | the bits of the fields at those places that may be flat, all set: kept
+keptBits : List Int -> Int
+keptBits is =
+  List.foldl (\n i -> if i < flatFields then n + 3 * fourTo i else n) 0 is
+
 -- What gives and what uses
 --------------------------------------------------------------------------------
 
@@ -192,6 +262,16 @@ pushArgs : List Repr -> List Imp.Val -> List Item -> List Item
 pushArgs rs vs rest =
   List.foldr (\p acc -> Cons (IVal (fst p) (snd p)) acc) rest (List.zip rs vs)
 
+-- (a label's place among a shape's labels)
+indexOfL : String -> Int -> List String -> Maybe Int
+indexOfL l i Nil = Nothing
+indexOfL l i (Cons k ks) = if strEq l k then Just i else indexOfL l (i + 1) ks
+
+-- (a name given a value of the repr)
+givenAs : String -> Repr -> Event
+givenAs x RepV = Boxed x
+givenAs x r = Unboxed x r
+
 -- (a name given a value, not a variable: what it is)
 sourceOf : String -> Imp.Val -> Event
 sourceOf x (SFixed w _) = Literal x (RepFix w)
@@ -199,6 +279,7 @@ sourceOf x (SFloat _) = Literal x RepF64
 sourceOf x (SFloat32 _) = Literal x (RepFix F32)
 sourceOf x (SPrim p _) =
   if isBoxed (resultRepr p) then Boxed x else Unboxed x (resultRepr p)
+sourceOf x (SProj _ l sh t) = givenAs x (readRepr (indexOfL l 0 sh) t)
 sourceOf x v = Boxed x
 
 pinAll : List String -> List Event -> List Event
@@ -284,9 +365,10 @@ walk acc (Cons (IVal r (SVar x)) rest) = walk (Cons (Wants x r) acc) rest
 walk acc (Cons (IVal r (SPrim p as)) rest) =
   walk acc (pushArgs (argReprs p as) as rest)
 walk acc (Cons (IVal r (STag _ as)) rest) = walk acc (pushVals RepV as rest)
-walk acc (Cons (IVal r (SRec fs)) rest) =
-  walk acc (pushVals RepV (List.map snd fs) rest)
-walk acc (Cons (IVal r (SProj v _ _)) rest) = walk acc (Cons (IVal RepV v) rest)
+walk acc (Cons (IVal r (SRec fs ts)) rest) =
+  walk acc (pushArgs (slotReprs ts) (List.map snd fs) rest)
+walk acc (Cons (IVal r (SProj v _ _ _)) rest) =
+  walk acc (Cons (IVal RepV v) rest)
 walk acc (Cons (IVal r (SLam xs (MkBlock t))) rest) =
   walk (lamEvents xs (walk Nil (Cons (ITl Nil t) Nil)) acc) rest
 walk acc (Cons (IVal r _) rest) = walk acc rest

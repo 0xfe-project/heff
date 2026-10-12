@@ -143,6 +143,17 @@ shapeWith len t fs =
 shapeOfTy : Int -> V.Ty -> V.V -> List String
 shapeOfTy len t v = shapeWith len t (V.coerceToFieldsMaybe v)
 
+-- | a field's type, as a backend may lay the record out (#39): a type
+-- | with no rules here -- a variable's, one not known -- is any
+fieldTyOfB : V.TB -> I.FieldTy
+fieldTyOfB LikeFloat = FtFloat
+fieldTyOfB (LikeFixed w) = FtFixed w
+fieldTyOfB NoRules = FtAny
+fieldTyOfB _ = FtOther
+
+fieldTyOf : V.Ty -> I.FieldTy
+fieldTyOf t = fieldTyOfB (V.behavior t)
+
 matchVariants : V.Ty -> M (Pm.Variants (Pm.Th V.Ty))
 matchVariants sty = case V.behavior sty of
   LikeSum vs -> pure vs
@@ -260,7 +271,10 @@ synF r c (SProj e l) = do
   case pe of
     MkPair e' ety -> do
       fty <- projTyIn c.len ety (evalIn c e) l
-      pure (MkPair (EProj e' l (shapeOfTy c.len ety (evalIn c e))) fty)
+      pure
+          (MkPair
+             (EProj e' l (shapeOfTy c.len ety (evalIn c e)) (fieldTyOf fty))
+             fty)
 -- a lambda says its type
 synF r c (SLam ty abs) = do
   t' <- r.chk c (SLam ty abs) (V.nom (EV.evalTy c.globals N ty c.env))
@@ -317,7 +331,8 @@ chkTagArg r c (MkPair a aty) =
     a' <- r.chk c a aty
     pure (Just a')
 
-type RecAcc = { vs : List V.V, out : List (Pair String I.Expr) }
+type RecAcc =
+  { vs : List V.V, out : List (Pair String I.Expr), tys : List I.FieldTy }
 
 chkFieldsGo : EK
             -> Ctx
@@ -325,8 +340,9 @@ chkFieldsGo : EK
             -> D.Dict (V.Locals V.V -> V.Field)
             -> RecAcc
             -> List (Pair String Sx.Tm)
-            -> M (List (Pair String I.Expr))
-chkFieldsGo r c capture fieldTypes acc Nil = pure (List.reverse acc.out)
+            -> M I.Expr
+chkFieldsGo r c capture fieldTypes acc Nil =
+  pure (ERecord (List.reverse acc.out) (List.reverse acc.tys))
 chkFieldsGo r c capture fieldTypes acc (Cons (MkPair l fe) tail) = case V.typeForProjection
     capture
     fieldTypes
@@ -343,7 +359,7 @@ chkFieldsGo r c capture fieldTypes acc (Cons (MkPair l fe) tail) = case V.typeFo
           c
           capture
           fieldTypes
-          { vs = Cons (evalIn c fe) acc.vs, out = acc.out }
+          { vs = Cons (evalIn c fe) acc.vs, out = acc.out, tys = acc.tys }
           tail
     else do
       fe' <- r.chk c fe fty
@@ -352,7 +368,10 @@ chkFieldsGo r c capture fieldTypes acc (Cons (MkPair l fe) tail) = case V.typeFo
           c
           capture
           fieldTypes
-          { vs = Cons (evalIn c fe) acc.vs, out = Cons (MkPair l fe') acc.out }
+          { vs = Cons (evalIn c fe) acc.vs
+          , out = Cons (MkPair l fe') acc.out
+          , tys = Cons (fieldTyOf fty) acc.tys
+          }
           tail
 
 chkF : EK -> Ctx -> Sx.Tm -> V.Ty -> M I.Expr
@@ -379,10 +398,14 @@ chkF r c (STag x args) ty = case V.behavior ty of
     Nothing -> failWith ("no tag " ^ x)
   _ -> failWith "a tag checked against a non-sum type"
 chkF r c (SCons d) ty = case V.behavior ty of
-  LikeRecord level capture fieldTypes -> do
-    fs <-
-      chkFieldsGo r c capture fieldTypes { vs = Nil, out = Nil } (D.toList d)
-    pure (ERecord fs)
+  LikeRecord level capture fieldTypes ->
+    chkFieldsGo
+      r
+      c
+      capture
+      fieldTypes
+      { vs = Nil, out = Nil, tys = Nil }
+      (D.toList d)
   _ -> failWith "a record checked against a non-record type"
 chkF r c (SMatch scrut cases) ty = do
   ps <- r.syn c scrut
@@ -405,13 +428,13 @@ chkDField : EK
           -> V.V
           -> Maybe (D.Dict (V.Ev V.V))
           -> Pair String Sx.Tm
-          -> M (Maybe (Pair String I.Expr))
+          -> M (Maybe (Pair (Pair String I.Expr) I.FieldTy))
 chkDField r c ty v fs (MkPair l fe) = do
   fty <- projTyInWith c.len ty fs l
   if isType c.len fty then pure Nothing
     else do
       e <- r.chkD c fe fty (V.nom (projWith fs v l))
-      pure (Just (MkPair l e))
+      pure (Just (MkPair (MkPair l e) (fieldTyOf fty)))
 
 -- (a record's fields, its value's fields expanded once for them all)
 chkDFields : EK
@@ -423,7 +446,10 @@ chkDFields : EK
            -> M I.Expr
 chkDFields r c ty v ps fs = do
   fields <- traverseM (\p -> chkDField r c ty v fs p) ps
-  pure (ERecord (catMaybesE fields))
+  pure
+      (ERecord
+         (List.map fst (catMaybesE fields))
+         (List.map snd (catMaybesE fields)))
 
 -- | a definition's own syntax, whose value `v` is known: under its
 -- | lambdas and through its record's fields the value is followed along

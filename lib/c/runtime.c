@@ -133,7 +133,11 @@ typedef struct Obj {
 typedef V (*Fn)(V self, V *args);
 
 typedef struct { Obj h; int64_t n; V f[]; } Tag;
-typedef struct { Obj h; int64_t n; uint32_t *lbl; V f[]; } Rec;
+// (a record: its fields, `n` of them, their labels `lbl`; `flat`, which
+// of its first 16 fields are flat (#39) -- not a `V` but a number's 64
+// bits, a `Float64`'s, an `Int64`'s or a `UInt64`'s: 2 bits each, as
+// `HEFF_FLAT_F64` and the others say, 0 a `V`)
+typedef struct { Obj h; int32_t n; uint32_t flat; uint32_t *lbl; V f[]; } Rec;
 // (a closure: its code, how many arguments it takes, and what it holds;
 // `memo`, once a thunk -- a function of one argument -- is forced, its
 // value, or 0)
@@ -333,13 +337,45 @@ static V heff_tag(int id, int64_t n, V *f) {
 
 static inline V heff_field(V v, int i) { return ((Tag *)v)->f[i]; }
 
+// Flat fields (#39): a record's field of a type of 64 bits a `V` would
+// allocate for -- `Float64`, `Int64`, `UInt64` -- is kept as its bits
+// where the code building the record knows the type
+// (src/heff/compile/repr.hf, `flatOf`), and the record says so, 2 bits a
+// field (`Rec`'s `flat`), so that what walks it -- a drop, a copy, a
+// field looked for by its label, a value shown -- does not take the bits
+// for a `V`, and a read where the type is not known boxes them.  Only the
+// first `HEFF_FLAT_FIELDS` fields may be flat.
+enum { HEFF_FLAT_V, HEFF_FLAT_F64, HEFF_FLAT_I64, HEFF_FLAT_U64 };
+#define HEFF_FLAT_FIELDS 16
+// (what field `i` is, of the bits `flat`)
+#define heff_flat_kind(flat, i) \
+  ((i) < HEFF_FLAT_FIELDS ? (unsigned)(((flat) >> (2 * (i))) & 3) : 0u)
+
+// (of the first `n` fields, the low bit of each's 2: `n` a constant where
+// it is asked, so is this)
+static inline uint32_t heff_flat_lows(int64_t n) {
+  return n >= HEFF_FLAT_FIELDS ? 0x55555555u
+                               : (uint32_t)(((uint64_t)1 << (2 * n)) - 1) & 0x55555555u;
+}
+// (whether each of the fields `lows` says is flat)
+#define heff_flat_all(flat, lows) ((((flat) | ((flat) >> 1)) & (lows)) == (lows))
+
+// (a flat field's bits, of the kind `k`, as a `V`: (below))
+static V heff_flat_box(V w, unsigned k);
+
 // (the labels, in the order the record was written, are the program's:
 // one array for each)
 static V heff_rec(int64_t n, uint32_t *lbl, V *f) {
   Rec *r = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
-  r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = n; r->lbl = lbl;
+  r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = (int32_t)n; r->flat = 0; r->lbl = lbl;
   memcpy(r->f, f, n * sizeof(V));
   return (V)r;
+}
+
+// (field `i` as a `V` counted, a flat one boxed)
+static inline V heff_rec_dup_field(Rec *r, int64_t i) {
+  unsigned k = heff_flat_kind(r->flat, i);
+  return k ? heff_flat_box(r->f[i], k) : heff_dup(r->f[i]);
 }
 
 // (a field, the record consumed)
@@ -347,7 +383,7 @@ static V heff_get(V v, uint32_t l) {
   Rec *r = (Rec *)v;
   for (int64_t i = 0; i < r->n; i++)
     if (r->lbl[i] == l) {
-      V x = heff_dup(r->f[i]);
+      V x = heff_rec_dup_field(r, i);
       heff_drop(v);
       return x;
     }
@@ -519,7 +555,16 @@ static inline V heff_setField(V d, V i, V v) {
 // (a record of `n` fields, its labels `lbl`)
 HEFF_KNOWN V heff_rec_n(int64_t n, uint32_t *lbl, V *f) {
   Rec *r = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
-  r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = n; r->lbl = lbl;
+  r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = (int32_t)n; r->flat = 0; r->lbl = lbl;
+  heff_fields_n(r->f, f, n);
+  return (V)r;
+}
+
+// (... some of its fields flat, as `flat` says: each given as its bits,
+// `heff_word_f64` and the others)
+HEFF_KNOWN V heff_rec_nf(int64_t n, uint32_t *lbl, uint32_t flat, V *f) {
+  Rec *r = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
+  r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = (int32_t)n; r->flat = flat; r->lbl = lbl;
   heff_fields_n(r->f, f, n);
   return (V)r;
 }
@@ -554,11 +599,20 @@ static __attribute__((noinline)) void heff_rec_give(V v, int64_t i) {
   heff_obj_free(r, sizeof(Rec) + r->n * sizeof(V));
 }
 
+// (`heff_get_n` of a record with flat fields: the field as a `V`, the
+// record dropped)
+static __attribute__((noinline)) V heff_get_flat(V v, int64_t i) {
+  V x = heff_rec_dup_field((Rec *)v, i);
+  heff_drop(v);
+  return x;
+}
+
 // (field `i` of a record of `n` fields, the record consumed: its last
 // reference, the field taken over, the others dropped and its cell freed;
 // otherwise the field counted)
 HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
   Rec *r = (Rec *)v;
+  if (r->flat) return heff_get_flat(v, i);
   V x = r->f[i];
   if (r->h.rc == 1) {
     if (n > HEFF_FEW_FIELDS) heff_rec_give(v, i);
@@ -577,7 +631,8 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
 // (field `i` of a record wanted after, which after it is only read other
 // fields of, then updated or dropped (src/heff/compile/rc.hf, `takesFor`):
 // its last reference, the field taken out of it -- moved, not counted, a
-// hole left that drops as nothing; otherwise the field counted)
+// hole left that drops as nothing; otherwise the field counted.  Never a
+// field that may be flat: one that is is read where it is)
 HEFF_KNOWN V heff_take_field(V v, int64_t i) {
   Rec *r = (Rec *)v;
   V x = r->f[i];
@@ -594,32 +649,68 @@ HEFF_KNOWN V heff_take_field(V v, int64_t i) {
 // is in a cell kept for it (Perceus's reuse).  Shared, `v` is copied:
 // the fields kept counted, `v` counted down.  Either way the fields not
 // kept are stored by the caller, at once.
-static __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *lbl) {
+//
+// Its flat fields (#39) are as `v`'s are where they are kept -- `kept`,
+// the bits of those of them that may be flat, 3 each -- and as `flat`
+// says where they are stored (`heff_rec_reuse_nf`).
+static __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
   int64_t n = r->n;
+  uint32_t was = r->flat;
   Rec *c = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
-  c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = n; c->lbl = lbl;
+  c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = (int32_t)n; c->lbl = lbl;
+  c->flat = (was & kept) | flat;
   for (int64_t i = 0; i < n; i++)
-    c->f[i] = ((keep >> i) & 1) ? heff_dup(r->f[i]) : MK_INT(0);
+    c->f[i] = !((keep >> i) & 1) ? MK_INT(0)
+            : heff_flat_kind(was, i) ? r->f[i] : heff_dup(r->f[i]);
   if (!(r->h.rc & IMMORTAL)) r->h.rc--;
   return (V)c;
 }
 
-HEFF_KNOWN V heff_rec_reuse_n(V v, uint64_t keep, int64_t n, uint32_t *lbl) {
+// (a record with flat fields, built in its cell: the fields not kept
+// dropped, as they were)
+static __attribute__((noinline)) void heff_rec_unset(Rec *r, uint64_t keep) {
+  for (int64_t i = 0; i < r->n; i++)
+    if (!((keep >> i) & 1) && !heff_flat_kind(r->flat, i)) heff_drop(r->f[i]);
+}
+
+HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
   if (r->h.rc != 1) {
-    if (n > HEFF_FEW_FIELDS) return heff_rec_copy(v, keep, lbl);
+    if (n > HEFF_FEW_FIELDS || r->flat) return heff_rec_copy(v, keep, lbl, kept, flat);
     Rec *c = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
-    c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = n; c->lbl = lbl;
+    c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = (int32_t)n; c->flat = flat; c->lbl = lbl;
     for (int64_t i = 0; i < n; i++)
       if ((keep >> i) & 1) c->f[i] = heff_dup(r->f[i]);
     if (!(r->h.rc & IMMORTAL)) r->h.rc--;
     return (V)c;
   }
-  for (int64_t i = 0; i < n; i++)
-    if (!((keep >> i) & 1)) heff_drop(r->f[i]);
+  uint32_t was = r->flat;
+  if (was) {
+    // (none to drop where each field stored anew was flat: a number's
+    // record updated with numbers)
+    uint32_t anew = heff_flat_lows(n) & ~kept;
+    if (n > HEFF_FLAT_FIELDS || !heff_flat_all(was, anew)) heff_rec_unset(r, keep);
+    r->flat = (was & kept) | flat;
+  } else {
+    for (int64_t i = 0; i < n; i++)
+      if (!((keep >> i) & 1)) heff_drop(r->f[i]);
+    if (flat) r->flat = flat;
+  }
   r->lbl = lbl;
   return v;
+}
+
+// (... of a compiler from before #39, which keeps no field flat)
+static inline uint32_t heff_kept_bits(uint64_t keep) {
+  uint32_t kept = 0;
+  for (int i = 0; i < HEFF_FLAT_FIELDS; i++)
+    if ((keep >> i) & 1) kept |= 3u << (2 * i);
+  return kept;
+}
+
+HEFF_KNOWN V heff_rec_reuse_n(V v, uint64_t keep, int64_t n, uint32_t *lbl) {
+  return heff_rec_reuse_nf(v, keep, n, lbl, heff_kept_bits(keep), 0);
 }
 
 // (a lambda's closure, holding `n`, given up where its body starts,
@@ -651,6 +742,13 @@ static size_t heff_size(V v) {
   case K_BIG: return sizeof(Big) + ((Big *)v)->n * sizeof(uint32_t);
   default: return SMALL_MAX + 1;
   }
+}
+
+// (a record whose last reference is gone, its flat fields (#39) made
+// words that drop as nothing, as its other fields are given back)
+static __attribute__((noinline)) void heff_flat_clear(Rec *r) {
+  for (int64_t i = 0; i < r->n && i < HEFF_FLAT_FIELDS; i++)
+    if (heff_flat_kind(r->flat, i)) r->f[i] = MK_INT(0);
 }
 
 // (what is given back, a stack of it, not a recursion: a long list's
@@ -690,7 +788,11 @@ __attribute__((noinline)) static void heff_free(V v) {
     size_t size;
     switch (o->kind) {
     case K_TAG: { Tag *t = (Tag *)v; n = t->n; f = t->f; size = sizeof(Tag) + n * sizeof(V); break; }
-    case K_REC: { Rec *r = (Rec *)v; n = r->n; f = r->f; size = sizeof(Rec) + n * sizeof(V); break; }
+    case K_REC: {
+      Rec *r = (Rec *)v; n = r->n; f = r->f; size = sizeof(Rec) + n * sizeof(V);
+      if (r->flat) heff_flat_clear(r);
+      break;
+    }
     case K_CLO: {
       Clo *c = (Clo *)v; n = c->nenv; f = c->env; size = sizeof(Clo) + n * sizeof(V);
       if (c->memo) heff_dead_push(c->memo);
@@ -720,7 +822,10 @@ __attribute__((noinline)) static void heff_free(V v) {
 HEFF_KNOWN void heff_drop_rec(V v, int64_t n) {
   Rec *r = (Rec *)v;
   if (r->h.rc == 1) {
-    if (n > HEFF_FEW_FIELDS) heff_free(v);
+    // (a record of numbers, all flat: its cell, nothing in it)
+    if (r->flat && n <= HEFF_FLAT_FIELDS && heff_flat_all(r->flat, heff_flat_lows(n)))
+      heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
+    else if (n > HEFF_FEW_FIELDS || r->flat) heff_free(v);
     else {
       for (int64_t i = 0; i < n; i++) heff_drop(r->f[i]);
       heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
@@ -771,12 +876,15 @@ static void heff_stack_push(HeffStack *s, V v) {
 }
 
 // (each place of the object `v` holds a value in, given to `f`)
+// (a record's flat fields (#39) none)
 #define HEFF_EACH_SLOT(v, f, u)                                         \
   do {                                                                  \
     Obj *o_ = OBJ(v);                                                   \
     int64_t n_;                                                         \
     V *s_ = heff_slots(v, &n_);                                         \
-    for (int64_t i_ = 0; i_ < n_; i_++) f(u, &s_[i_]);                  \
+    uint32_t fl_ = o_->kind == K_REC ? ((Rec *)(v))->flat : 0;          \
+    for (int64_t i_ = 0; i_ < n_; i_++)                                 \
+      if (!heff_flat_kind(fl_, i_)) f(u, &s_[i_]);                      \
     if (o_->kind == K_CLO) {                                            \
       Clo *c_ = (Clo *)(v);                                             \
       for (int32_t i_ = 0; i_ < c_->nenv; i_++) f(u, &c_->env[i_]);     \
@@ -2146,6 +2254,47 @@ static inline double heff_peek_f64(V v) { return FLT_OF(v); }
 static inline double heff_from_int_f64(V v) {
   double d = heff_double_of_int(v); heff_drop(v); return d; }
 
+// A record's flat fields (#39, "Flat fields" above): a number's bits, the
+// field so made (`heff_word_S`), and the field read as a number,
+// whichever it is, flat or a `V` (`heff_rget_S`); the record consumed
+// after (`heff_get_n_S`), or the field as a `V`, boxed if it is flat
+// (`heff_rget_v`).
+
+static inline V heff_word_f64(double d) { V w; memcpy(&w, &d, sizeof w); return w; }
+static inline V heff_word_i64(int64_t x) { return (V)(uint64_t)x; }
+static inline V heff_word_u64(uint64_t x) { return (V)x; }
+static inline double heff_f64_of_word(V w) { double d; memcpy(&d, &w, sizeof d); return d; }
+
+static V heff_flat_box(V w, unsigned k) {
+  if (k == HEFF_FLAT_F64) return heff_flt(heff_f64_of_word(w));
+  if (k == HEFF_FLAT_I64) return heff_int((int64_t)w);
+  return heff_int_u64((uint64_t)w);
+}
+
+HEFF_FAST double heff_rget_f64(V v, int64_t i) {
+  Rec *r = (Rec *)v;
+  V w = r->f[i];
+  return heff_flat_kind(r->flat, i) ? heff_f64_of_word(w) : FLT_OF(w);
+}
+HEFF_FAST int64_t heff_rget_i64(V v, int64_t i) {
+  Rec *r = (Rec *)v;
+  V w = r->f[i];
+  return heff_flat_kind(r->flat, i) ? (int64_t)w : (int64_t)heff_int_low64(w);
+}
+HEFF_FAST uint64_t heff_rget_u64(V v, int64_t i) {
+  Rec *r = (Rec *)v;
+  V w = r->f[i];
+  return heff_flat_kind(r->flat, i) ? (uint64_t)w : heff_int_low64(w);
+}
+HEFF_FAST V heff_rget_v(V v, int64_t i) { return heff_rec_dup_field((Rec *)v, i); }
+
+#define HEFF_GET_N_FLAT(S, T)                                               \
+  HEFF_KNOWN T heff_get_n_##S(V v, int64_t i, int64_t n) {                  \
+    T x = heff_rget_##S(v, i); heff_drop_rec(v, n); return x; }
+HEFF_GET_N_FLAT(f64, double)
+HEFF_GET_N_FLAT(i64, int64_t)
+HEFF_GET_N_FLAT(u64, uint64_t)
+
 // (of what is not finite, 0)
 static V heff_floor_f64(double d) {
   if (!isfinite(d)) return MK_INT(0);
@@ -2912,7 +3061,9 @@ static void heff_show(Buf *b, V v, int arg) {
         if (i) buf_str(b, ", ");
         buf_str(b, heff_name_of(heff_lbl_names, heff_nlbl_names, r->lbl[i]));
         buf_str(b, " = ");
-        heff_show(b, r->f[i], 0);
+        V x = heff_rec_dup_field(r, i);
+        heff_show(b, x, 0);
+        heff_drop(x);
       }
       buf_str(b, " }");
       return;
