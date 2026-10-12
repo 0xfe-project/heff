@@ -9,8 +9,8 @@
 -- - the copies of its definitions (heff.compile.simplify): by the
 --   version each was made at, what it is known by, and what it was made
 --   to, with the copies asked for as it was;
--- - each of its definitions' C (heff.compile.emitc), by a hash of what
---   it was made of.
+-- - each of its definitions' C (heff.compile.emitc), and each one's
+--   JavaScript (heff.compile.emit), by a hash of what it was made of.
 --
 -- A file is of one compiler: the hash of the program that wrote it (its
 -- own executable), which a file of another is not believed by -- a
@@ -20,6 +20,7 @@
 -- its key; the others stay, for the programs not compiled this time.
 
 import heff.build.decoder
+import heff.compile.emit as Em
 import heff.compile.emitc as Ec
 import heff.compile.ir as I
 import heff.compile.irtext as Ir
@@ -29,7 +30,7 @@ import heff.compile.spec as Sp
 import map as M
 
 version : String
-version = "heff-backend/1"
+version = "heff-backend/2"
 
 -- | the directory under `.heff/` the files are in
 backDir : String
@@ -115,6 +116,16 @@ emitText key k =
                    (strsT
                       k.lprotos
                       (strsT k.lams (strsT k.shapes (strsT k.prims Nil)))))))))
+
+jsText : String -> Em.JsKept -> String
+jsText key k =
+  joinWith
+    " "
+    (Cons
+       (Ir.tok key)
+       (Cons
+          (Ir.tok k.ver)
+          (strsT k.lines (strsT k.params (strsT k.refs (strsT k.prims Nil))))))
 
 -- Reading
 --------------------------------------------------------------------------------
@@ -230,15 +241,34 @@ emitD = do
          , prims = prims
          })
 
+jsD : Dec (Pair String Em.JsKept)
+jsD = do
+  key <- str
+  ver <- str
+  lines <- many str
+  params <- many str
+  refs <- many str
+  prims <- many str
+  pure
+      (MkPair
+         key
+         { ver = ver
+         , lines = lines
+         , params = params
+         , refs = refs
+         , prims = prims
+         })
+
 -- | what a file keeps, each entry with its text
 type Back =
   { groups : List (Pair GroupIn String)
   , copies : List (Pair (Pair String Si.KeptCopy) String)
   , emits : List (Pair (Pair String Ec.EmitKept) String)
+  , jss : List (Pair (Pair String Em.JsKept) String)
   }
 
 noBack : Back
-noBack = { groups = Nil, copies = Nil, emits = Nil }
+noBack = { groups = Nil, copies = Nil, emits = Nil, jss = Nil }
 
 backD : String -> Dec Back
 backD id = do
@@ -247,8 +277,9 @@ backD id = do
   groups <- many (withRaw groupD)
   copies <- many (withRaw copyD)
   emits <- many (withRaw emitD)
+  jss <- many (withRaw jsD)
   expect "end"
-  pure { groups = groups, copies = copies, emits = emits }
+  pure { groups = groups, copies = copies, emits = emits, jss = jss }
 
 -- | a file, believed if it is of this compiler (`id`) and decodes whole
 readBack : String -> String -> Back
@@ -257,8 +288,8 @@ readBack id text = fromMaybe noBack (run (whole (backD id)) text)
 -- What the backend is given
 --------------------------------------------------------------------------------
 
--- | what the files keep, for the C backend: definitions of the core
--- | simplified, copies, definitions' C
+-- | what the files keep, for both backends: definitions of the core
+-- | simplified, copies
 keepsOf : List Back -> L.Keeps
 keepsOf bs =
   { units =
@@ -297,6 +328,17 @@ emitsOf bs =
     M.empty
     bs
 
+jssOf : List Back -> M.Map String Em.JsKept
+jssOf bs =
+  List.foldl
+    (\m (b : Back) ->
+       List.foldl
+         (\m2 e -> M.insert compareString (fst (fst e)) (snd (fst e)) m2)
+         m
+         b.jss)
+    M.empty
+    bs
+
 -- What it gives back, written
 --------------------------------------------------------------------------------
 
@@ -319,6 +361,7 @@ type Entries =
   { groups : M.Map String String
   , copies : M.Map String String
   , emits : M.Map String String
+  , jss : M.Map String String
   }
 
 entriesOf : Back -> Entries
@@ -339,6 +382,11 @@ entriesOf b =
         (\m e -> M.insert compareString (fst (fst e)) (snd e) m)
         M.empty
         b.emits
+  , jss =
+      List.foldl
+        (\m e -> M.insert compareString (fst (fst e)) (snd e) m)
+        M.empty
+        b.jss
   }
 
 withGroup : String -> String -> Entries -> Entries
@@ -346,6 +394,7 @@ withGroup k t es =
   { groups = M.insert compareString k t es.groups
   , copies = es.copies
   , emits = es.emits
+  , jss = es.jss
   }
 
 withCopy : String -> String -> Entries -> Entries
@@ -353,6 +402,7 @@ withCopy k t es =
   { groups = es.groups
   , copies = M.insert compareString k t es.copies
   , emits = es.emits
+  , jss = es.jss
   }
 
 withEmit : String -> String -> Entries -> Entries
@@ -360,6 +410,15 @@ withEmit k t es =
   { groups = es.groups
   , copies = es.copies
   , emits = M.insert compareString k t es.emits
+  , jss = es.jss
+  }
+
+withJs : String -> String -> Entries -> Entries
+withJs k t es =
+  { groups = es.groups
+  , copies = es.copies
+  , emits = es.emits
+  , jss = M.insert compareString k t es.jss
   }
 
 backOf : M.Map String Back -> String -> Back
@@ -409,11 +468,13 @@ oldUnits b owner =
        if strEq (fst g).owner owner then (fst g).units else Nil)
     b.groups
 
--- | what the C backend gives back to be kept
+-- | what a backend gives back to be kept: each definition's C, or its
+-- | JavaScript
 type Given =
   { groups : List L.GroupOut
   , copies : List Si.CopyDone
   , emits : List (Pair String Ec.EmitKept)
+  , jss : List (Pair String Em.JsKept)
   }
 
 -- | where the files are: the modules, and what each kept
@@ -470,6 +531,20 @@ addEmit fs m (MkPair k e) =
        (entriesAt fs.olds m (moduleIn fs.mods (Sp.rootOf k))))
     m
 
+addJs : Files
+      -> M.Map String Entries
+      -> Pair String Em.JsKept
+      -> M.Map String Entries
+addJs fs m (MkPair k e) =
+  M.insert
+    compareString
+    (moduleIn fs.mods (Sp.rootOf k))
+    (withJs
+       k
+       (jsText k e)
+       (entriesAt fs.olds m (moduleIn fs.mods (Sp.rootOf k))))
+    m
+
 -- | a module's file, its entries in order of their keys
 backText : String -> Entries -> String
 backText id es =
@@ -487,7 +562,11 @@ backText id es =
                    (showInt (M.size es.emits))
                    (List.append
                       (List.map snd (M.toList es.emits))
-                      (Cons (Ir.tok "end") Nil)))))))
+                      (Cons
+                         (showInt (M.size es.jss))
+                         (List.append
+                            (List.map snd (M.toList es.jss))
+                            (Cons (Ir.tok "end") Nil)))))))))
 
 -- | the files with something made anew in them, each by its module, as
 -- | they are to be: what they kept, what was made in place of the
@@ -498,9 +577,12 @@ backTexts id fs gv =
     (\p -> MkPair (fst p) (backText id (snd p)))
     (M.toList
        (List.foldl
-          (addEmit fs)
+          (addJs fs)
           (List.foldl
-             (addCopy fs)
-             (List.foldl (addGroup fs) M.empty gv.groups)
-             gv.copies)
-          gv.emits))
+             (addEmit fs)
+             (List.foldl
+                (addCopy fs)
+                (List.foldl (addGroup fs) M.empty gv.groups)
+                gv.copies)
+             gv.emits)
+          gv.jss))

@@ -4,12 +4,12 @@
 --   core ─[Erase]→ IR ─[Lift]→ ─[Shake]→ ─[Simplify]→ ─[Shake]→
 --        ─[Call arity]→ ─[Arity]→ ─[TRMC]→ IR
 --
--- then, for the JavaScript backend, ─[Monadic]→ ─[Imp]→ (`lower`,
--- heff.compile.imp); for the C backend, ─[Monadic]→ (`lowerProgramC`,
--- heff.compile.monadic: a binding for each value computed, where its
--- reference counts are taken and dropped), then for each definition
--- ─[Imp]→ ─[Rc]→ (`cDef`, heff.compile.rc).  An emitter only prints what
--- this makes.
+-- then, for the JavaScript backend, for each definition ─[Monadic]→
+-- ─[Imp]→ (`jsDef`, heff.compile.imp); for the C backend, ─[Monadic]→
+-- (`lowerProgramC`, heff.compile.monadic: a binding for each value
+-- computed, where its reference counts are taken and dropped), then for
+-- each definition ─[Imp]→ ─[Rc]→ (`cDef`, heff.compile.rc).  An emitter
+-- only prints what this makes.
 
 import heff.compile.arity as Ar
 import heff.compile.borrow as Bo
@@ -47,28 +47,35 @@ calledShared c = saturated (Ar.arities c.defs) c
 shared : Int -> List I.Def -> Tr.Trmced
 shared supply kept = calledShared (Ca.callArity supply kept)
 
--- | the definitions in the imperative form both backends print
--- | (heff.compile.imp), what is known of them, and what could not be
--- | lowered, said by key
-type LoweredImp = { defs : List Mp.Def, facts : F.Facts, errors : List String }
+-- | the definitions as both backends are given them (`shared`), what is
+-- | known of them, and what could not be lowered, said by key: the
+-- | JavaScript backend's, each made imperative apart (`jsDef`)
+type LoweredShared =
+  { defs : List I.Def, facts : F.Facts, errors : List String }
 
--- (made imperative from monadic form: names from where it ended)
-impFrom : List String -> F.Facts -> Pair (List I.Def) Int -> LoweredImp
-impFrom errors facts (MkPair defs n) =
-  { defs = (Mp.impProgram n defs).defs, facts = facts, errors = errors }
-
-sharedLowered : List String -> Tr.Trmced -> LoweredImp
+sharedLowered : List String -> Tr.Trmced -> LoweredShared
 sharedLowered errors t =
-  impFrom errors (F.factsOf t.defs) (Mo.monadicFrom t.supply t.defs)
+  { defs = t.defs, facts = F.factsOf t.defs, errors = errors }
 
-lowerKept : Int -> List I.Def -> List String -> LoweredImp
+-- | a definition as the JavaScript backend prints it, from its body named
+-- | again from 0 (`I.freshen`: so that it is the same whatever is
+-- | lowered with it, its names drawn past `n`): in monadic form
+-- | (heff.compile.monadic), made imperative (heff.compile.imp)
+jsDef : I.Def -> Pair I.Expr Int -> Mp.Def
+jsDef d (MkPair b0 n) = case Mo.monadicFrom
+    n
+    (Cons (I.mkDef d.key d.name b0) Nil) of
+  MkPair (Cons m _) n2 -> Mp.impDef True n2 m
+  MkPair Nil n2 -> Mp.impDef True n2 (I.mkDef d.key d.name b0)
+
+lowerKept : Int -> List I.Def -> List String -> LoweredShared
 lowerKept supply kept errors = sharedLowered errors (shared supply kept)
 
-lowerSimplified : List String -> List String -> Si.Simplified -> LoweredImp
+lowerSimplified : List String -> List String -> Si.Simplified -> LoweredShared
 lowerSimplified roots errors si =
   lowerKept si.supply (Sh.shake roots si.defs) errors
 
-lowerErased : List String -> Er.Erased -> LoweredImp
+lowerErased : List String -> Er.Erased -> LoweredShared
 lowerErased roots er =
   lowerSimplified
     roots
@@ -78,7 +85,7 @@ lowerErased roots er =
 -- | what is reached from `roots`, lowered; what cannot be, said by key
 -- | >>> (lower G.emptyGlobals Nil).defs
 -- | []
-lower : G.Globals -> List String -> LoweredImp
+lower : G.Globals -> List String -> LoweredShared
 lower g roots = lowerErased roots (Er.eraseProgram g)
 
 -- A program's entry: its computation (`key`) given the runtime's handler,
@@ -146,7 +153,7 @@ withEntry key er =
 
 -- | a program running the computation `key`: its entry (`entryKey`) and
 -- | what it reaches, lowered
-lowerProgram : G.Globals -> String -> LoweredImp
+lowerProgram : G.Globals -> String -> LoweredShared
 lowerProgram g key =
   lowerErased (Cons entryKey Nil) (withEntry key (Er.eraseProgram g))
 
@@ -236,9 +243,30 @@ type UnitOut =
 type GroupOut =
   { owner : String, ver : String, units : List (Pair String (Maybe UnitOut)) }
 
--- | a program lowered, and what the cache is to keep of it
+-- | a program simplified -- what both backends lower on from -- what
+-- | could not be, said by key, and what the cache is to keep of it
+type SimplifiedKept =
+  { simplified : Si.Simplified
+  , errors : List String
+  , groups : List GroupOut
+  , copies : List Si.CopyDone
+  }
+
+-- | a program lowered for the C backend, and what the cache is to keep
 type LoweredKept =
   { lowered : Lowered, groups : List GroupOut, copies : List Si.CopyDone }
+
+-- | ... lowered on as `lowerProgramC` does
+cKeptOf : SimplifiedKept -> LoweredKept
+cKeptOf sk =
+  { lowered = cSimplified (Cons entryKey Nil) sk.errors sk.simplified
+  , groups = sk.groups
+  , copies = sk.copies
+  }
+
+-- | ... lowered on as `lowerProgram` does
+sharedKeptOf : SimplifiedKept -> LoweredShared
+sharedKeptOf sk = lowerSimplified (Cons entryKey Nil) sk.errors sk.simplified
 
 -- (what is to be simplified, from the definition of the core `owner`;
 -- what it mentions)
@@ -424,9 +452,10 @@ keptLowered : List String
             -> Si.SG
             -> List Piece
             -> Si.Simplified
-            -> LoweredKept
+            -> SimplifiedKept
 keptLowered errors vers sg ps si =
-  { lowered = cSimplified (Cons entryKey Nil) errors si
+  { simplified = si
+  , errors = errors
   , groups =
       Si.catMaybesS (List.map (groupOut vers sg (doneMap si.done)) (groupGo ps))
   , copies = si.copies
@@ -438,7 +467,7 @@ simplifyWith : List String
              -> Int
              -> List Piece
              -> Si.SG
-             -> LoweredKept
+             -> SimplifiedKept
 simplifyWith errors vers ks n ps sg =
   keptLowered
     errors
@@ -457,7 +486,7 @@ simplifyPieces : List String
                -> Keeps
                -> Int
                -> List Piece
-               -> LoweredKept
+               -> SimplifiedKept
 simplifyPieces errors vers ks n ps =
   simplifyWith
     errors
@@ -481,7 +510,11 @@ reachedIn r ps = List.filter (\(p : Piece) -> M.member compareString p.key r) ps
 reachedPieces : List Piece -> List Piece
 reachedPieces ps = reachedIn (Sh.reached (Cons entryKey Nil) (refsMap ps)) ps
 
-piecesWith : M.Map String String -> Keeps -> String -> PieceAcc -> LoweredKept
+piecesWith : M.Map String String
+           -> Keeps
+           -> String
+           -> PieceAcc
+           -> SimplifiedKept
 piecesWith vers ks key acc =
   simplifyPieces
     (List.reverse acc.errors)
@@ -491,14 +524,14 @@ piecesWith vers ks key acc =
     (reachedPieces
        (List.reverse (revOnto (entryPieces vers ks key acc.supply) acc.pieces)))
 
--- | a program, lowered as `lowerProgramC` does -- each definition of
--- | the core the cache keeps at its version (`vers`) taken as it keeps
--- | it -- and what the cache is to keep of it
+-- | a program, simplified as `lowerProgram` and `lowerProgramC` do --
+-- | each definition of the core the cache keeps at its version (`vers`)
+-- | taken as it keeps it -- and what the cache is to keep of it
 lowerProgramKept : G.Globals
                  -> String
                  -> M.Map String String
                  -> Keeps
-                 -> LoweredKept
+                 -> SimplifiedKept
 lowerProgramKept g key vers ks =
   piecesWith
     (M.insert compareString entryKey (entryVer vers key) vers)

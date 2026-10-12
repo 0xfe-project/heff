@@ -510,276 +510,6 @@ writeParts dir done (MkPair parts errors) = do
             exit 1
     else exit 1
 
-compileFound : {e : HFunctor}
-             -> {{io : stdio <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : fs <: e}}
-             -> String
-             -> String
-             -> Maybe String
-             -> String
-             -> Co e Unit
-             -> Dr.Checked
-             -> List Em.Provider
-             -> Co e Unit
-compileFound host file name outPath done c available = case Dr.findRunnable
-    (List.filter (\k -> providesLeaf available k) (Dr.candidateLeaves c))
-    c
-    name of
-  Left why -> do
-    printErr ("heff: " ^ file ^ ": " ^ why)
-    exit 1
-  Right r ->
-    writeOut
-      outPath
-      done
-      (Em.compileProgram host available c.top.globals r.key r.effect)
-
--- (a computation whose effects all have providers for this host: each
--- world's algebra is bundled in from its module's M.provider.js)
-compileLast : {e : HFunctor}
-            -> {{io : stdio <: e}}
-            -> {{sys : process <: e}}
-            -> {{disk : fs <: e}}
-            -> List Dr.Source
-            -> String
-            -> String
-            -> Maybe String
-            -> String
-            -> Co e Unit
-            -> List Dr.Checked
-            -> Co e Unit
-compileLast sources host file name outPath done cs = case Dr.lastChecked cs of
-  Nothing -> do
-    printErr "no files given"
-    exit 1
-  Just c -> do
-    found <-
-      readProviders
-        sources
-        (nubStrM (List.map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
-    compileFound
-        host
-        file
-        name
-        outPath
-        done
-        c
-        (List.filter (\p -> forHost host p) found)
-
-compileDiags : {e : HFunctor}
-             -> {{io : stdio <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : fs <: e}}
-             -> {{rep : Rp.report <: e}}
-             -> List Dr.Source
-             -> String
-             -> String
-             -> Maybe String
-             -> String
-             -> Co e Unit
-             -> Bool
-             -> List Dr.Checked
-             -> Co e Unit
-compileDiags sources host file name outPath done badL cs = do
-  putFileDiags cs
-  if badL || anyErrors cs then exit 1
-    else compileLast sources host file name outPath done cs
-
--- | compile the computation `name` of FILE to a program of `host`, then
--- | go on with `done`
-compileThen : {e : HFunctor}
-            -> {{io : stdio <: e}}
-            -> {{sys : process <: e}}
-            -> {{disk : fs <: e}}
-            -> {{rep : Rp.report <: e}}
-            -> String
-            -> Maybe String
-            -> String
-            -> String
-            -> Co e Unit
-            -> Co e Unit
-compileThen host name outPath file done = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  compileDiags l.sources host file name outPath done (badL > 0) cs
-
--- | compile the computation `name` of FILE to a program of `host`:
--- | FILE's import closure loaded with the compiler's own loader
-compileCmd : {e : HFunctor}
-           -> {{io : stdio <: e}}
-           -> {{sys : process <: e}}
-           -> {{disk : fs <: e}}
-           -> {{rep : Rp.report <: e}}
-           -> String
-           -> Maybe String
-           -> String
-           -> String
-           -> String
-           -> Co e Unit
-compileCmd host name outPath how file =
-  compileThen host name outPath file (print ("wrote " ^ outPath ^ ": " ^ how))
-
-nodeCmd : {e : HFunctor}
-        -> {{io : stdio <: e}}
-        -> {{sys : process <: e}}
-        -> {{disk : fs <: e}}
-        -> {{rep : Rp.report <: e}}
-        -> Maybe String
-        -> String
-        -> String
-        -> Co e Unit
-nodeCmd name outPath file =
-  compileCmd
-    "node"
-    name
-    outPath
-    ("run it with `node " ^ outPath ^ " ARGS...`")
-    file
-
-appCmd : {e : HFunctor}
-       -> {{io : stdio <: e}}
-       -> {{sys : process <: e}}
-       -> {{disk : fs <: e}}
-       -> {{rep : Rp.report <: e}}
-       -> Maybe String
-       -> String
-       -> String
-       -> Co e Unit
-appCmd name outPath file =
-  compileCmd
-    "page"
-    name
-    outPath
-    "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
-    file
-
-runDir : L.Paths -> String
-runDir paths = L.under paths paths.root ".heff/run"
-
--- (FILE's path, its separators underscores)
-runPath : L.Paths -> String -> String
-runPath paths file =
-  L.under
-    paths
-    (runDir paths)
-    (joinWith "_" (P.components paths.style file) ^ ".mjs")
-
--- | run FILE's `main` with ARGS: compiled for Node.js to `.heff/run/`,
--- | which runs in heff's place
-runCmd : {e : HFunctor}
-       -> {{io : stdio <: e}}
-       -> {{sys : process <: e}}
-       -> {{disk : fs <: e}}
-       -> {{rep : Rp.report <: e}}
-       -> String
-       -> List String
-       -> Co e Unit
-runCmd file progArgs = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  ok <- mkDir (runDir l.paths)
-  compileDiags
-      l.sources
-      "node"
-      file
-      (Just "main")
-      (runPath l.paths file)
-      (exec "node" (runPath l.paths file :: progArgs))
-      (badL > 0)
-      cs
-
-ownExport : Dr.Own -> Em.Export
-ownExport o = Em.mkExport o.name o.key
-
-compileJsOut : {e : HFunctor}
-             -> {{io : stdio <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : fs <: e}}
-             -> String
-             -> Bool
-             -> Em.Output
-             -> Co e Unit
-compileJsOut outPath bad o = do
-  ok <- writeFile outPath o.source
-  emitErrs o.errors
-  if ok && not bad && List.null o.errors then pure MkUnit else exit 1
-
-compileJsDiags : {e : HFunctor}
-               -> {{io : stdio <: e}}
-               -> {{sys : process <: e}}
-               -> {{disk : fs <: e}}
-               -> {{rep : Rp.report <: e}}
-               -> String
-               -> String
-               -> Bool
-               -> List Dr.Checked
-               -> Co e Unit
-compileJsDiags file outPath badL cs = do
-  putFileDiags cs
-  case Dr.lastChecked cs of
-    Nothing -> exit 1
-    Just c ->
-      compileJsOut
-        outPath
-        (badL || anyErrors cs)
-        (Em.compileJs c.top.globals (List.map (\o -> ownExport o) c.own))
-
--- | an ES module of FILE and what it imports
-compileJsCmd : {e : HFunctor}
-             -> {{io : stdio <: e}}
-             -> {{sys : process <: e}}
-             -> {{disk : fs <: e}}
-             -> {{rep : Rp.report <: e}}
-             -> String
-             -> String
-             -> Co e Unit
-compileJsCmd file outPath = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  cs <- Se.cachedProgram l
-  compileJsDiags file outPath (badL > 0) cs
-
--- The C backend
---------------------------------------------------------------------------------
-
--- (a world's provider for the C backend: `M.provider.c` beside `M.hf`)
-readProviderC : {e : HFunctor}
-              -> {{disk : fs <: e}}
-              -> List Dr.Source
-              -> String
-              -> Co e (Maybe Em.Provider)
-readProviderC sources m = case pathOfModule sources m of
-  Nothing -> pure Nothing
-  Just path -> do
-    text <- readFile (L.dropHf path ^ ".provider.c")
-    pure (case text of
-      Just t -> Just { module = m, text = t }
-      Nothing -> Nothing)
-
-readProvidersC : {e : HFunctor}
-               -> {{disk : fs <: e}}
-               -> List Dr.Source
-               -> List String
-               -> Co e (List Em.Provider)
-readProvidersC sources Nil = pure Nil
-readProvidersC sources (Cons m rest) = do
-  p <- readProviderC sources m
-  ps <- readProvidersC sources rest
-  pure (case p of
-    Just pr -> Cons pr ps
-    Nothing -> ps)
-
-providesLeafC : List Em.Provider -> String -> Bool
-providesLeafC Nil k = False
-providesLeafC (Cons p rest) k =
-  if strEq p.module (Ef.moduleOfKey k)
-  && elemStrM (Ef.nameOfKey k) (Ec.providedNames p.text)
-    then True
-  else providesLeafC rest k
-
 -- The backend's cache (heff.build.backcache), `.heff/<backDir>/`
 --------------------------------------------------------------------------------
 
@@ -926,7 +656,11 @@ keptWritten bi dir id texts backs done out =
            (Bc.backTexts
               id
               { mods = modsOf (Cons "_" bi.modules), olds = backs }
-              { groups = out.groups, copies = out.copies, emits = out.emits })
+              { groups = out.groups
+              , copies = out.copies
+              , emits = out.emits
+              , jss = Nil
+              })
        done)
     (MkPair out.parts out.errors)
 
@@ -981,6 +715,364 @@ keptParts bi dir runtime done c available r = do
   texts <-
     if strEq id "" then pure Nil else readBacks bi.paths (Cons "_" bi.modules)
   keptWith bi dir runtime done c available r id texts (backsOf id texts)
+
+-- (the JavaScript of the program running `r`, written -- then what the
+-- cache is to keep anew, `texts` the files as they were, `backs` what
+-- they kept -- then `done`)
+jsKeptWritten : {e : HFunctor}
+              -> {{io : stdio <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : fs <: e}}
+              -> BackIn
+              -> String
+              -> String
+              -> List (Pair String String)
+              -> Mp.Map String Bc.Back
+              -> Co e Unit
+              -> Em.OutputKept
+              -> Co e Unit
+jsKeptWritten bi outPath id texts backs done out =
+  writeOut
+    outPath
+    (if strEq id "" then done
+     else do
+       made <- mkDir (backDirOf bi.paths)
+       writeBacks
+           bi.paths
+           (textsMap texts)
+           (Bc.backTexts
+              id
+              { mods = modsOf (Cons "_" bi.modules), olds = backs }
+              { groups = out.groups
+              , copies = out.copies
+              , emits = Nil
+              , jss = out.jss
+              })
+       done)
+    out.output
+
+-- (the program running `r` for `host`, simplified through the cache)
+jsKept : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> BackIn
+       -> String
+       -> String
+       -> Co e Unit
+       -> Dr.Checked
+       -> List Em.Provider
+       -> Dr.Runnable
+       -> Co e Unit
+jsKept bi host outPath done c available r = do
+  id <- selfHash bi.paths
+  texts <-
+    if strEq id "" then pure Nil else readBacks bi.paths (Cons "_" bi.modules)
+  jsKeptWritten
+      bi
+      outPath
+      id
+      texts
+      (backsOf id texts)
+      done
+      (Em.compileProgramKept
+         host
+         available
+         c.top.globals
+         r.key
+         r.effect
+         bi.hashes
+         (Bc.keepsOf (List.map snd (Mp.toList (backsOf id texts))))
+         (Bc.jssOf (List.map snd (Mp.toList (backsOf id texts)))))
+
+compileFound : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> BackIn
+             -> String
+             -> String
+             -> Maybe String
+             -> String
+             -> Co e Unit
+             -> Dr.Checked
+             -> List Em.Provider
+             -> Co e Unit
+compileFound bi host file name outPath done c available = case Dr.findRunnable
+    (List.filter (\k -> providesLeaf available k) (Dr.candidateLeaves c))
+    c
+    name of
+  Left why -> do
+    printErr ("heff: " ^ file ^ ": " ^ why)
+    exit 1
+  Right r -> jsKept bi host outPath done c available r
+
+-- (a computation whose effects all have providers for this host: each
+-- world's algebra is bundled in from its module's M.provider.js)
+compileLast : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> BackIn
+            -> List Dr.Source
+            -> String
+            -> String
+            -> Maybe String
+            -> String
+            -> Co e Unit
+            -> List Dr.Checked
+            -> Co e Unit
+compileLast bi sources host file name outPath done cs = case Dr.lastChecked
+    cs of
+  Nothing -> do
+    printErr "no files given"
+    exit 1
+  Just c -> do
+    found <-
+      readProviders
+        sources
+        (nubStrM (List.map (\k -> Ef.moduleOfKey k) (Dr.candidateLeaves c)))
+    compileFound
+        bi
+        host
+        file
+        name
+        outPath
+        done
+        c
+        (List.filter (\p -> forHost host p) found)
+
+compileDiags : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> {{rep : Rp.report <: e}}
+             -> BackIn
+             -> List Dr.Source
+             -> String
+             -> String
+             -> Maybe String
+             -> String
+             -> Co e Unit
+             -> Bool
+             -> List Dr.Checked
+             -> Co e Unit
+compileDiags bi sources host file name outPath done badL cs = do
+  putFileDiags cs
+  if badL || anyErrors cs then exit 1
+    else compileLast bi sources host file name outPath done cs
+
+-- (what the backend's cache is given, of a program loaded and checked)
+backInOf : L.Loaded -> Se.CacheAcc -> BackIn
+backInOf l acc =
+  { paths = l.paths
+  , hashes = acc.hashes
+  , modules = List.map (\(c : Dr.Checked) -> c.module) acc.done
+  }
+
+-- | compile the computation `name` of FILE to a program of `host`, then
+-- | go on with `done`
+compileThen : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : fs <: e}}
+            -> {{rep : Rp.report <: e}}
+            -> String
+            -> Maybe String
+            -> String
+            -> String
+            -> Co e Unit
+            -> Co e Unit
+compileThen host name outPath file done = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  acc <- Se.cachedAcc l
+  compileDiags
+      (backInOf l acc)
+      l.sources
+      host
+      file
+      name
+      outPath
+      done
+      (badL > 0)
+      acc.done
+
+-- | compile the computation `name` of FILE to a program of `host`:
+-- | FILE's import closure loaded with the compiler's own loader
+compileCmd : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : fs <: e}}
+           -> {{rep : Rp.report <: e}}
+           -> String
+           -> Maybe String
+           -> String
+           -> String
+           -> String
+           -> Co e Unit
+compileCmd host name outPath how file =
+  compileThen host name outPath file (print ("wrote " ^ outPath ^ ": " ^ how))
+
+nodeCmd : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{rep : Rp.report <: e}}
+        -> Maybe String
+        -> String
+        -> String
+        -> Co e Unit
+nodeCmd name outPath file =
+  compileCmd
+    "node"
+    name
+    outPath
+    ("run it with `node " ^ outPath ^ " ARGS...`")
+    file
+
+appCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> {{rep : Rp.report <: e}}
+       -> Maybe String
+       -> String
+       -> String
+       -> Co e Unit
+appCmd name outPath file =
+  compileCmd
+    "page"
+    name
+    outPath
+    "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
+    file
+
+runDir : L.Paths -> String
+runDir paths = L.under paths paths.root ".heff/run"
+
+-- (FILE's path, its separators underscores)
+runPath : L.Paths -> String -> String
+runPath paths file =
+  L.under
+    paths
+    (runDir paths)
+    (joinWith "_" (P.components paths.style file) ^ ".mjs")
+
+-- | run FILE's `main` with ARGS: compiled for Node.js to `.heff/run/`,
+-- | which runs in heff's place
+runCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> {{rep : Rp.report <: e}}
+       -> String
+       -> List String
+       -> Co e Unit
+runCmd file progArgs = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  acc <- Se.cachedAcc l
+  ok <- mkDir (runDir l.paths)
+  compileDiags
+      (backInOf l acc)
+      l.sources
+      "node"
+      file
+      (Just "main")
+      (runPath l.paths file)
+      (exec "node" (runPath l.paths file :: progArgs))
+      (badL > 0)
+      acc.done
+
+ownExport : Dr.Own -> Em.Export
+ownExport o = Em.mkExport o.name o.key
+
+compileJsOut : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> String
+             -> Bool
+             -> Em.Output
+             -> Co e Unit
+compileJsOut outPath bad o = do
+  ok <- writeFile outPath o.source
+  emitErrs o.errors
+  if ok && not bad && List.null o.errors then pure MkUnit else exit 1
+
+compileJsDiags : {e : HFunctor}
+               -> {{io : stdio <: e}}
+               -> {{sys : process <: e}}
+               -> {{disk : fs <: e}}
+               -> {{rep : Rp.report <: e}}
+               -> String
+               -> String
+               -> Bool
+               -> List Dr.Checked
+               -> Co e Unit
+compileJsDiags file outPath badL cs = do
+  putFileDiags cs
+  case Dr.lastChecked cs of
+    Nothing -> exit 1
+    Just c ->
+      compileJsOut
+        outPath
+        (badL || anyErrors cs)
+        (Em.compileJs c.top.globals (List.map (\o -> ownExport o) c.own))
+
+-- | an ES module of FILE and what it imports
+compileJsCmd : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : fs <: e}}
+             -> {{rep : Rp.report <: e}}
+             -> String
+             -> String
+             -> Co e Unit
+compileJsCmd file outPath = do
+  l <- load file
+  badL <- printErrs "heff" l.errors 0
+  cs <- Se.cachedProgram l
+  compileJsDiags file outPath (badL > 0) cs
+
+-- The C backend
+--------------------------------------------------------------------------------
+
+-- (a world's provider for the C backend: `M.provider.c` beside `M.hf`)
+readProviderC : {e : HFunctor}
+              -> {{disk : fs <: e}}
+              -> List Dr.Source
+              -> String
+              -> Co e (Maybe Em.Provider)
+readProviderC sources m = case pathOfModule sources m of
+  Nothing -> pure Nothing
+  Just path -> do
+    text <- readFile (L.dropHf path ^ ".provider.c")
+    pure (case text of
+      Just t -> Just { module = m, text = t }
+      Nothing -> Nothing)
+
+readProvidersC : {e : HFunctor}
+               -> {{disk : fs <: e}}
+               -> List Dr.Source
+               -> List String
+               -> Co e (List Em.Provider)
+readProvidersC sources Nil = pure Nil
+readProvidersC sources (Cons m rest) = do
+  p <- readProviderC sources m
+  ps <- readProvidersC sources rest
+  pure (case p of
+    Just pr -> Cons pr ps
+    Nothing -> ps)
+
+providesLeafC : List Em.Provider -> String -> Bool
+providesLeafC Nil k = False
+providesLeafC (Cons p rest) k =
+  if strEq p.module (Ef.moduleOfKey k)
+  && elemStrM (Ef.nameOfKey k) (Ec.providedNames p.text)
+    then True
+  else providesLeafC rest k
 
 compileFoundC : {e : HFunctor}
               -> {{io : stdio <: e}}
@@ -1091,17 +1183,7 @@ cThen name outPath file done = do
   acc <- Se.cachedAcc l
   putFileDiags acc.done
   if badL > 0 || anyErrors acc.done then exit 1
-    else compileLastC
-        { paths = l.paths
-        , hashes = acc.hashes
-        , modules = List.map (\(c : Dr.Checked) -> c.module) acc.done
-        }
-        l.sources
-        file
-        name
-        outPath
-        done
-        acc.done
+    else compileLastC (backInOf l acc) l.sources file name outPath done acc.done
 
 cCmd : {e : HFunctor}
      -> {{io : stdio <: e}}

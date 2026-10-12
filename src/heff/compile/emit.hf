@@ -19,8 +19,10 @@ import heff.elab.fixed as Fx
 import heff.elab.globals as G
 import heff.compile.imp as Mp
 import heff.compile.ir as I
+import heff.compile.irtext as Ir
 import heff.compile.lower as L
 import heff.compile.prims as Pr
+import heff.compile.simplify as Si
 import map as M
 
 type Output = { source : String, errors : List String }
@@ -1250,57 +1252,54 @@ looped key i t r =
              t)
           (Cons "  }" (Cons "};" Nil))))
 
-defFun : M.Map String Unit -> String -> GInfo -> Mp.Tl -> BoundNs -> List String
-defFun curried key i t r =
-  List.append
-    (if loops t then looped key i t r
-     else [ ""
-          , "const "
-          ^ i.js
-          ^ " = ("
-          ^ joinWith ", " r.js
-          ^ ") => "
-          ^ jk.body r.env 0 t
-          ^ ";"
-          ])
-    (wrapper curried key i r.js)
+defFun : String -> GInfo -> Mp.Tl -> BoundNs -> List String
+defFun key i t r =
+  if loops t then looped key i t r
+  else [ ""
+       , "const "
+       ^ i.js
+       ^ " = ("
+       ^ joinWith ", " r.js
+       ^ ") => "
+       ^ jk.body r.env 0 t
+       ^ ";"
+       ]
 
 -- (a value computed at once: an expression; else in a block, called)
 eagerCode : Env -> Mp.Tl -> String
 eagerCode env (TReturn o) = (jk.op env 0 o).code
 eagerCode env t = "(() => " ^ blockOf jk env 0 t ^ ")()"
 
-defBodyOf : M.Map String GInfo
-          -> M.Map String Unit
+-- | a definition's lines -- its curried form apart, which is the
+-- | program's to say (`wrapper`) -- and its parameters' names
+type DefCode = { lines : List String, params : List String }
+
+defFunCode : String -> GInfo -> Mp.Tl -> BoundNs -> DefCode
+defFunCode key i t r = { lines = defFun key i t r, params = r.js }
+
+defCodeOf : M.Map String GInfo
           -> M.Map String Unit
           -> String
           -> Mp.Body
           -> GInfo
-          -> List String
-defBodyOf gs curried globalNames key (DefFun xs (MkBlock t)) i =
-  defFun curried key i t (bindAll (env0Of gs globalNames) xs)
-defBodyOf gs curried globalNames key (DefVal (MkBlock t)) i =
-  if i.lazy
-    then [ ""
-         , "const "
-         ^ i.js
-         ^ " = $lazy(() => "
-         ^ jk.body (env0Of gs globalNames) 0 t
-         ^ ");"
-         ]
-  else ["", "const " ^ i.js ^ " = " ^ eagerCode (env0Of gs globalNames) t ^ ";"]
-
-defLines : M.Map String GInfo
-         -> M.Map String Unit
-         -> M.Map String Unit
-         -> Mp.Def
-         -> List String
-defLines gs curried globalNames d = case M.lookup
-    compareString
-    (Mp.defKey d)
-    gs of
-  Nothing -> Nil
-  Just i -> defBodyOf gs curried globalNames (Mp.defKey d) (Mp.defBody d) i
+          -> DefCode
+defCodeOf gs globalNames key (DefFun xs (MkBlock t)) i =
+  defFunCode key i t (bindAll (env0Of gs globalNames) xs)
+defCodeOf gs globalNames key (DefVal (MkBlock t)) i =
+  { lines =
+      if i.lazy
+        then [ ""
+             , "const "
+             ^ i.js
+             ^ " = $lazy(() => "
+             ^ jk.body (env0Of gs globalNames) 0 t
+             ^ ");"
+             ]
+      else [ ""
+           , "const " ^ i.js ^ " = " ^ eagerCode (env0Of gs globalNames) t ^ ";"
+           ]
+  , params = Nil
+  }
 
 -- Programs
 --------------------------------------------------------------------------------
@@ -1455,16 +1454,10 @@ primHelperOne uses (MkPair p i) = primHelperU uses p (uncurryJs i.js)
 primHelpersOf : M.Map String Unit -> List String
 primHelpersOf uses = List.concatMap (\p -> primHelperOne uses p) Pr.allPrims
 
--- | the helpers of the primitives the definitions use
-primHelpers : List Mp.Def -> List String
-primHelpers defs =
-  primHelpersOf
-    (List.foldl (\m d -> List.foldl primUses m (Mp.partsOf d)) M.empty defs)
-
 type Emitted = { lines : List String, globals : M.Map String GInfo }
 
-shortsOf : List Mp.Def -> List String
-shortsOf defs = List.map (\d -> safe (shortName (Mp.defKey d))) defs
+shortsOf : List String -> List String
+shortsOf keys = List.map (\k -> safe (shortName k)) keys
 
 -- names: the short one, unless two definitions share it
 jsPick : List String -> String -> String -> String
@@ -1502,37 +1495,295 @@ emitLines info code helpers =
   , globals = info
   }
 
--- (a primitive's helper may use the runtime too: `$abandon`, `$T`)
-emitDone : List Mp.Def -> M.Map String GInfo -> List String -> Emitted
-emitDone defs info code = emitLines info code (primHelpers defs)
+infoAll : List String -> F.Facts -> List String -> M.Map String GInfo
+infoAll shorts facts keys =
+  List.foldl (\acc k -> infoOne shorts facts acc k) M.empty keys
 
-emitCode : List Mp.Def
-         -> M.Map String GInfo
-         -> M.Map String Unit
-         -> M.Map String Unit
-         -> Emitted
-emitCode defs info curried globalNames =
-  emitDone
+-- The backend's cache: a definition's JavaScript as it keeps it
+--------------------------------------------------------------------------------
+
+-- A definition's JavaScript depends on the definition alone -- as both
+-- backends are given it (heff.compile.lower's `shared`), its variables
+-- named again from 0 -- on what is known of itself and of the globals
+-- it mentions (their names, arities, whether lazy, whether their calls
+-- may bounce), and on the globals' names its own may meet: a local is
+-- named by its base, then a number, past every global's name.  The cache
+-- (heff.build.backcache) keeps it by a hash of those (`jsVer`), with what
+-- the program wants of it: its parameters' names, for its curried form;
+-- the globals it uses as values, which have one; the primitives it uses,
+-- which have helpers.
+
+-- | a definition's JavaScript, as the cache keeps it
+type JsKept =
+  { ver : String
+  , lines : List String
+  , params : List String
+  , refs : List String
+  , prims : List String
+  }
+
+-- | what the printer knows of the whole program: each global's name and
+-- | facts, the names taken, and the names a local's base may meet
+-- | (`clash`, by each base they start with)
+type JsProgram =
+  { info : M.Map String GInfo
+  , names : M.Map String Unit
+  , clash : M.Map String (List String)
+  }
+
+-- (the bases names are drawn from besides a definition's binders:
+-- monadic form's and heff.compile.imp's temporaries, `t` and `c`, and the
+-- printer's own, `s`, `f` and `a`)
+ownBases : List String
+ownBases = ["t", "c", "s", "f", "a"]
+
+-- (the variables a body binds)
+bindersGo : List String -> List I.Expr -> List String
+bindersGo acc Nil = acc
+bindersGo acc (Cons (ELam xs b) rest) =
+  bindersGo (List.append xs acc) (Cons b rest)
+bindersGo acc (Cons (ELet x a b) rest) =
+  bindersGo (Cons x acc) (Cons a (Cons b rest))
+bindersGo acc (Cons (EMatch e arms) rest) =
+  bindersGo
+    (List.append
+       (List.concatMap
+          (\(arm : I.Arm) -> case arm of
+           MkArm _ vs _ -> vs)
+          arms)
+       acc)
+    (Cons e (List.append (List.map I.armBody arms) rest))
+bindersGo acc (Cons (EFix x b) rest) = bindersGo (Cons x acc) (Cons b rest)
+bindersGo acc (Cons (EApp f as) rest) =
+  bindersGo acc (Cons f (List.append as rest))
+bindersGo acc (Cons (ERecord fs) rest) =
+  bindersGo acc (List.append (List.map snd fs) rest)
+bindersGo acc (Cons (EProj e _ _) rest) = bindersGo acc (Cons e rest)
+bindersGo acc (Cons (ETag _ as) rest) = bindersGo acc (List.append as rest)
+bindersGo acc (Cons (EPrimCall _ as) rest) = bindersGo acc (List.append as rest)
+bindersGo acc (Cons (ECall _ as) rest) = bindersGo acc (List.append as rest)
+bindersGo acc (Cons _ rest) = bindersGo acc rest
+
+isDigitAt : String -> Int -> Bool
+isDigitAt s i = 48 <= byteAt s i && byteAt s i <= 57
+
+-- (a name, under each base a local may be numbered from to meet it: the
+-- name, and the name less trailing digits)
+clashUnder : String
+           -> Int
+           -> M.Map String (List String)
+           -> M.Map String (List String)
+clashUnder g n m =
+  if n > 0 && isDigitAt g (n - 1)
+    then clashUnder
+        g
+        (n - 1)
+        (M.insert
+           compareString
+           (strSlice g 0 (n - 1))
+           (Cons
+              g
+              (fromMaybe Nil (M.lookup compareString (strSlice g 0 (n - 1)) m)))
+           m)
+  else m
+
+clashOne : M.Map String (List String) -> String -> M.Map String (List String)
+clashOne m g =
+  clashUnder
+    g
+    (strLength g)
+    (M.insert
+       compareString
+       g
+       (Cons g (fromMaybe Nil (M.lookup compareString g m)))
+       m)
+
+-- (each once, in order: through a map, not a list searched)
+sortedOnceJ : List String -> List String
+sortedOnceJ xs = List.map fst (M.toList (setFrom xs))
+
+jsProgramWith : M.Map String GInfo -> JsProgram
+jsProgramWith info =
+  { info = info
+  , names =
+      setFrom
+        (List.map (\(p : Pair String GInfo) -> (snd p).js) (M.toList info))
+  , clash =
+      List.foldl
+        clashOne
+        M.empty
+        (List.map (\(p : Pair String GInfo) -> (snd p).js) (M.toList info))
+  }
+
+-- | what the printer knows of a program of the definitions `keys`
+jsProgramOf : F.Facts -> List String -> JsProgram
+jsProgramOf facts keys = jsProgramWith (infoAll (shortsOf keys) facts keys)
+
+-- (the globals' names a body's locals may meet)
+clashesOf : JsProgram -> I.Expr -> List String
+clashesOf p b =
+  sortedOnceJ
+    (List.concatMap
+       (\base -> fromMaybe Nil (M.lookup compareString base p.clash))
+       (List.append
+          ownBases
+          (List.map (\x -> safe (I.baseOf x)) (bindersGo Nil (Cons b Nil)))))
+
+-- (what is known of a global)
+globalJsH : JsProgram -> String -> List Ir.HItem -> List Ir.HItem
+globalJsH p g rest = case M.lookup compareString g p.info of
+  Just i ->
+    Cons
+      (HS g)
+      (Cons
+         (HS i.js)
+         (Cons
+            (HN i.arity)
+            (Cons
+               (HN (if i.lazy then 1 else 0))
+               (Cons (HN (if i.bounce then 1 else 0)) rest))))
+  Nothing -> Cons (HS g) (Cons (HS "") rest)
+
+-- | what a definition's JavaScript is made of, hashed: its key, its body
+-- | (named again from 0), what is known of itself and of what it
+-- | mentions, the names its locals may meet
+jsVer : JsProgram -> String -> I.Expr -> String
+jsVer p key b =
+  Ir.hashOf
+    (Cons
+       (HS "js")
+       (Cons
+          (HS key)
+          (Cons
+             (HE b)
+             (List.foldr
+                (globalJsH p)
+                (Cons (HS (joinWith " " (clashesOf p b))) Nil)
+                (sortedOnceJ (Cons key (I.globalsIn b)))))))
+
+keptCode : String -> Mp.Def -> DefCode -> JsKept
+keptCode v d c =
+  { ver = v
+  , lines = c.lines
+  , params = c.params
+  , refs = valueRefs d
+  , prims = List.map fst (M.toList (List.foldl primUses M.empty (Mp.partsOf d)))
+  }
+
+-- | a definition printed
+keptOfDef : JsProgram -> String -> Mp.Def -> JsKept
+keptOfDef p v d = case M.lookup compareString (Mp.defKey d) p.info of
+  Just i ->
+    keptCode v d (defCodeOf p.info p.names (Mp.defKey d) (Mp.defBody d) i)
+  Nothing -> keptCode v d { lines = Nil, params = Nil }
+
+-- | the definitions' entries, last first, and those made here
+type JsAcc =
+  { entries : List (Pair String JsKept), fresh : List (Pair String JsKept) }
+
+keptAtVerJ : String -> Maybe JsKept -> Maybe JsKept
+keptAtVerJ v (Just k) = if strEq k.ver v then Just k else Nothing
+keptAtVerJ v Nothing = Nothing
+
+jsMade : JsAcc -> String -> JsKept -> JsAcc
+jsMade acc key k =
+  { entries = Cons (MkPair key k) acc.entries
+  , fresh = Cons (MkPair key k) acc.fresh
+  }
+
+jsAt : JsProgram
+     -> M.Map String JsKept
+     -> JsAcc
+     -> I.Def
+     -> Pair I.Expr Int
+     -> String
+     -> JsAcc
+jsAt p kept acc d own v = case keptAtVerJ
+    v
+    (M.lookup compareString d.key kept) of
+  Just k -> { entries = Cons (MkPair d.key k) acc.entries, fresh = acc.fresh }
+  Nothing -> jsMade acc d.key (keptOfDef p v (L.jsDef d own))
+
+jsWith : JsProgram
+       -> M.Map String JsKept
+       -> JsAcc
+       -> I.Def
+       -> Pair I.Expr Int
+       -> JsAcc
+jsWith p kept acc d own = jsAt p kept acc d own (jsVer p d.key (fst own))
+
+jsOne : JsProgram -> M.Map String JsKept -> JsAcc -> I.Def -> JsAcc
+jsOne p kept acc d = jsWith p kept acc d (I.freshen 0 d.body)
+
+-- (a definition's lines, and its curried form where it has one)
+entryLines : JsProgram -> M.Map String Unit -> Pair String JsKept -> List String
+entryLines p curried (MkPair key k) = case M.lookup compareString key p.info of
+  Just i -> List.append k.lines (wrapper curried key i k.params)
+  Nothing -> k.lines
+
+-- (the program: the definitions used as values -- by `roots` too --
+-- each with its curried form)
+assembled : JsProgram
+          -> List (Pair String JsKept)
+          -> M.Map String Unit
+          -> Emitted
+assembled p es curried =
+  emitLines
+    p.info
+    (List.concatMap (entryLines p curried) es)
+    (primHelpersOf
+       (setFrom
+          (List.concatMap (\(e : Pair String JsKept) -> (snd e).prims) es)))
+
+-- | the definitions printed, and those printed here, not taken from the
+-- | cache (`kept`)
+type EmittedKept = { emitted : Emitted, fresh : List (Pair String JsKept) }
+
+emittedOf : JsProgram -> List String -> JsAcc -> EmittedKept
+emittedOf p roots acc =
+  { emitted =
+      assembled
+        p
+        (List.reverse acc.entries)
+        (setFrom
+           (List.append
+              (List.concatMap
+                 (\(e : Pair String JsKept) -> (snd e).refs)
+                 acc.entries)
+              roots))
+  , fresh = acc.fresh
+  }
+
+emitKeptIn : JsProgram
+           -> List I.Def
+           -> List String
+           -> M.Map String JsKept
+           -> EmittedKept
+emitKeptIn p defs roots kept =
+  emittedOf
+    p
+    roots
+    (List.foldl (jsOne p kept) { entries = Nil, fresh = Nil } defs)
+
+-- | the definitions (as both backends are given them), each printed --
+-- | or taken as the cache keeps it, where it keeps it at its version --
+-- | `roots` the globals the program's host uses
+emitKept : F.Facts
+         -> List I.Def
+         -> List String
+         -> M.Map String JsKept
+         -> EmittedKept
+emitKept facts defs roots kept =
+  emitKeptIn
+    (jsProgramOf facts (List.map (\(d : I.Def) -> d.key) defs))
     defs
-    info
-    (List.concatMap (\d -> defLines info curried globalNames d) defs)
+    roots
+    kept
 
-infoAll : List String -> F.Facts -> List Mp.Def -> M.Map String GInfo
-infoAll shorts facts defs =
-  List.foldl (\acc d -> infoOne shorts facts acc (Mp.defKey d)) M.empty defs
-
-emitWithShorts : F.Facts -> List Mp.Def -> List String -> List String -> Emitted
-emitWithShorts facts defs roots shorts =
-  emitCode
-    defs
-    (infoAll shorts facts defs)
-    (setFrom (List.append (List.concatMap valueRefs defs) roots))
-    (setFrom (List.map (\d -> jsNameOf shorts (Mp.defKey d)) defs))
-
--- | >>> (emitDefs (F.factsOf [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) (Mp.impProgram 0 [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]).defs ["f"]).lines
+-- | >>> (emitDefs (F.factsOf [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))]) [I.mkDef "f" "f" (ELam ["x"] (EVar "x"))] ["f"]).lines
 -- | ["", "const f = (x) => x;"]
-emitDefs : F.Facts -> List Mp.Def -> List String -> Emitted
-emitDefs facts defs roots = emitWithShorts facts defs roots (shortsOf defs)
+emitDefs : F.Facts -> List I.Def -> List String -> Emitted
+emitDefs facts defs roots = (emitKept facts defs roots M.empty).emitted
 
 -- Runtime
 --------------------------------------------------------------------------------
@@ -1828,7 +2079,7 @@ compileLowered : String
                -> List Provider
                -> Ef.Effect
                -> String
-               -> L.LoweredImp
+               -> L.LoweredShared
                -> Output
 compileLowered host provs eff key l =
   { source =
@@ -1855,6 +2106,81 @@ compileProgram : String
 compileProgram host available g key eff =
   compileLowered host (provsFor available eff) eff key (L.lowerProgram g key)
 
+-- | a program `compileProgram` makes through the backend's cache
+-- | (heff.build.backcache), and what the cache is to keep anew
+type OutputKept =
+  { output : Output
+  , groups : List L.GroupOut
+  , copies : List Si.CopyDone
+  , jss : List (Pair String JsKept)
+  }
+
+keptEmitted : String
+            -> List Provider
+            -> Ef.Effect
+            -> String
+            -> L.SimplifiedKept
+            -> L.LoweredShared
+            -> EmittedKept
+            -> OutputKept
+keptEmitted host provs eff key sk l ek =
+  { output =
+      { source = runSource host provs eff key ek.emitted, errors = l.errors }
+  , groups = sk.groups
+  , copies = sk.copies
+  , jss = ek.fresh
+  }
+
+keptLowered : String
+            -> List Provider
+            -> Ef.Effect
+            -> String
+            -> M.Map String JsKept
+            -> L.SimplifiedKept
+            -> L.LoweredShared
+            -> OutputKept
+keptLowered host provs eff key kept sk l =
+  keptEmitted
+    host
+    provs
+    eff
+    key
+    sk
+    l
+    (emitKept l.facts l.defs (Cons L.entryKey Nil) kept)
+
+keptOutput : String
+           -> List Provider
+           -> Ef.Effect
+           -> String
+           -> M.Map String JsKept
+           -> L.SimplifiedKept
+           -> OutputKept
+keptOutput host provs eff key kept sk =
+  keptLowered host provs eff key kept sk (L.sharedKeptOf sk)
+
+-- | the program `compileProgram` makes, each definition of the core the
+-- | cache keeps at its version (`vers`, `ks`, heff.compile.lower) taken
+-- | as it keeps it, and each definition's JavaScript as it keeps it at
+-- | what it is made of (`kept`)
+compileProgramKept : String
+                   -> List Provider
+                   -> G.Globals
+                   -> String
+                   -> Ef.Effect
+                   -> M.Map String String
+                   -> L.Keeps
+                   -> M.Map String JsKept
+                   -> OutputKept
+compileProgramKept host available g key eff vers ks kept =
+  keptOutput
+    host
+    (provsFor available eff)
+    eff
+    key
+    kept
+    (L.lowerProgramKept g key vers ks)
+
 getterOf : M.Map String GInfo -> Export -> String
 getterOf gs o =
   "  get " ^ propName o.name ^ "() { return $ext(" ^ ref gs o.key ^ "); },"
@@ -1879,7 +2205,7 @@ jsSource exports m =
                       exports))
                 (Cons "};" (Cons "" Nil))))))
 
-compileExports : List Export -> L.LoweredImp -> Output
+compileExports : List Export -> L.LoweredShared -> Output
 compileExports exports l =
   { source =
       jsSource

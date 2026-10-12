@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // The backend's cache (.heff/bN/<module>.hb): a program compiled to C
-// (as parts) through it is the C compiled without it, byte for byte --
-// cold, warm, after an edit, and after a corrupt file; a warm run
-// rewrites none of its files; and a definition that is inlined into
-// another, or a copy made for it, changed, makes that other be made
-// again: the program runs as the edit says.
+// (as parts), or to JavaScript, through it is the program compiled
+// without it, byte for byte -- cold, warm, after an edit, and after a
+// corrupt file; a warm run rewrites none of its files, whichever backend
+// ran before; a definition that is inlined into another, or a copy made
+// for it, changed, makes that other be made again: the program runs as
+// the edit says; and a global newly named as a definition's local is,
+// that definition's JavaScript is made again, its local named past it.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -96,6 +98,56 @@ want(same(c1, h1), "corrupt files of the cache are compiled over");
 const h2 = compile("h2");
 want(same(c1, h2), "and kept again");
 
+// JavaScript, through the same files
+const compileJs = (out) => {
+  const r = heff("compile", "main.hf", out, "--name", "main", "--backend=node");
+  if (r.status !== 0) return { error: r.stderr.slice(0, 400) };
+  return { files: { js: readFileSync(join(dir, out), "utf8") } };
+};
+const coldJs = (out) => { for (const f of hbs()) rmSync(join(back(), f)); return compileJs(out); };
+const runsJs = (out) => spawnSync("node", [join(dir, out)], { encoding: "utf8" }).stdout.trim();
+const j1 = coldJs("j1.mjs");
+want(!j1.error, `cold JavaScript compile failed\n${j1.error}`);
+want(runsJs("j1.mjs") === "14", `the JavaScript runs\n${runsJs("j1.mjs")}`);
+const c2 = compile("c2");
+want(same(c1, c2), "C after JavaScript: the C a cold run made");
+const times2 = Object.fromEntries(hbs().map((f) => [f, statSync(join(back(), f)).mtimeMs]));
+const j2 = compileJs("j2.mjs");
+want(same(j1, j2), "a warm run makes the JavaScript a cold run made");
+const c3 = compile("c3");
+want(same(c1, c3), "and the C");
+want(hbs().every((f) => statSync(join(back(), f)).mtimeMs === times2[f]), "warm runs of both leave the cache's files alone");
+writeFileSync(join(dir, "a.hf"), a(2));
+const je = compileJs("je.mjs");
+want(!je.error && !same(j1, je), `an edit to an inlined definition changes the JavaScript\n${je.error ?? ""}`);
+want(runsJs("je.mjs") === "18", `an edit reaches the JavaScript\n${runsJs("je.mjs")}`);
+want(same(je, coldJs("je2.mjs")), "after an edit, the JavaScript is what a cold run makes");
+writeFileSync(join(dir, "a.hf"), a(1));
+for (const f of hbs()) writeFileSync(join(back(), f), readFileSync(join(back(), f), "utf8").slice(0, 100));
+want(same(j1, compileJs("jh.mjs")), "corrupt files of the cache are compiled over, the JavaScript too");
+
+// a global named as `count`'s local is, newly: `count` unchanged, its
+// local named past it, as a cold run names it
+const counting = (withX) => `import co
+import std.io
+${withX ? "\nx : Int\nx = 5\n" : ""}
+count : Int -> Int -> Int
+count x acc = if x <= 0 then acc else count (x - 1) (acc + x * x)
+
+program : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
+program = print (showInt (count 3 ${withX ? "x" : "0"}))
+
+main : Co stdio Unit
+main = program (io := \\p -> p)
+`;
+writeFileSync(join(dir, "main.hf"), counting(false));
+const k1 = compileJs("k1.mjs");
+want(!k1.error && runsJs("k1.mjs") === "14", `count runs\n${k1.error ?? runsJs("k1.mjs")}`);
+writeFileSync(join(dir, "main.hf"), counting(true));
+const k2 = compileJs("k2.mjs");
+want(!k2.error && runsJs("k2.mjs") === "19", `count runs past a global x\n${k2.error ?? runsJs("k2.mjs")}`);
+want(same(k2, coldJs("k3.mjs")), "a global newly met: the JavaScript a cold run makes");
+
 rmSync(dir, { recursive: true, force: true });
-console.log(`backcache: ${failed ? "NOT " : ""}the same C through the cache, kept and made again where what it inlines changed`);
+console.log(`backcache: ${failed ? "NOT " : ""}the same C and JavaScript through the cache, kept and made again where what it inlines changed`);
 process.exit(failed ? 1 : 0);
