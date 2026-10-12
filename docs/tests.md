@@ -55,7 +55,7 @@ watches after it (up to the next definition) in `heff test`'s report.
 A test is a top-level definition of type `Test` (`lib/check.hf`);
 `heff test` runs a file's tests after its doc tests and watches.  A
 unit test checks; a property draws values from generators
-(`lib/gen.hf`, imported `as G`) and checks them, a hundred runs:
+(`lib/gen.hf`, imported `as Gen`) and checks them, a hundred runs:
 
 ```haskell
 import check

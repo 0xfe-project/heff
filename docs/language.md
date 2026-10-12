@@ -220,7 +220,7 @@ twice : {a : Type} -> {{add : Addition a}} -> a -> a
 twice x = x + x   -- twice 21 is 42, twice 1.25 is 2.5
 
 step : Int64 -> Int64
-step x = x * 6364136223846793005 + 1442695040888963407   -- with `import int64 as I64`
+step x = x * 6364136223846793005 + 1442695040888963407   -- with `import int64 as Int64`
 ```
 
 ## Numbers
@@ -272,17 +272,17 @@ mask = 240
 ```
 
 Each fixed-width integer type has a module, imported by a name
-(`import int32 as I32`, as each has the same names): `add`, `sub`,
+(`import int32 as Int32`, as each has the same names): `add`, `sub`,
 `mul`, `div`, `rem`, `eq`, `lt`, `le`, `show`, `minBound` and
 `maxBound`, and `fromInt` and `toInt`, by way of which one type's value
-becomes another's (`I8.fromInt (I32.toInt x)`).  `float32`'s has the
+becomes another's (`Int8.fromInt (Int32.toInt x)`).  `float32`'s has the
 arithmetic, `eq`, `lt`, `le`, `isNaN` and `show`, `fromInt`,
 `fromFloat`, `toFloat`, `floor` and `sqrt`.  None of them has a name
 the prelude has for every type -- `neg`, `compare`, `min`, `max`, the
 bits' -- so that a module opened is in the way of none of them at
 another type: those are its instances'.  An `Int`'s bits are the
 prelude's `and`, `or`, `xor`, `complement`, `shiftL` and `shiftR`, by
-`int`'s instance, `bitwiseInt` (`import int as I`), as two's complement
+`int`'s instance, `bitwiseInt` (`import int as Int`), as two's complement
 has them with the sign extended for ever; a shift right rounds down,
 and one by a negative count is one the other way (`shiftL x -n` is
 `shiftR x n`), as a signed fixed-width type's is.  A fixed-width type's
@@ -322,7 +322,7 @@ code point.
 A `String` is bytes, as Go's is: UTF-8 as a literal writes it (`"é"`
 is two bytes), though any bytes may be in one -- what a file, a stream
 or a command gave, `fromByte 255` (a `UInt8`, the byte type, its
-argument: `fromByte (U8.fromInt n)` of an `Int`), or a string's own
+argument: `fromByte (UInt8.fromInt n)` of an `Int`), or a string's own
 escape `"\xff"`, a byte of two hexadecimal digits.  Its length
 (`strLength`), an index (`byteAt`, a byte from 0 to 255, -1 out of the
 string), a slice and its order (`strLt`: the bytes', which of UTF-8 is
@@ -343,7 +343,7 @@ initials : String -> String
 initials s = ofRunes (List.map Rune.toUpper (List.take 2 (runes s)))
 ```
 
-The module `rune` (`import rune as R`) has their comparisons (`eq`,
+The module `rune` (`import rune as Rune`) has their comparisons (`eq`,
 `compare`, and `==` to `>=` for a module that imports it as it is),
 `toInt` and `fromInt` (which wraps an integer around to 32 bits, as Go's
 `rune(n)` does: a rune may be no scalar value, `isValid` says, and is
