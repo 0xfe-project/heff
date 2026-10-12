@@ -15,7 +15,7 @@ import vm from "node:vm";
 import { heffBin, root } from "./heff.mjs";
 import { run } from "./pool.mjs";
 
-if (!existsSync(heffBin)) { console.log(`FAIL backcache: no ${heffBin} (run node scripts/build.mjs first)`); process.exit(1); }
+if (!existsSync(heffBin)) { console.log(`FAIL backcache: no ${heffBin} (run make build first)`); process.exit(1); }
 
 const dir = mkdtempSync(join(tmpdir(), "heff-backcache-"));
 mkdirSync(join(dir, "lib"), { recursive: true });

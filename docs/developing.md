@@ -20,63 +20,75 @@ with is `lib/` ([library.md](library.md)).
 
 ## Building
 
-With Node.js, [zig](https://ziglang.org/download/) and GNU make (3.81,
-macOS's, or newer).  `make` lists every target and the variables they
-take; each runs a script of `scripts/`, `test/`, `bench/` or
-`editors/`, and its line in the `Makefile` says which.
+With [zig](https://ziglang.org/download/) and GNU make (3.81, macOS's,
+or newer): building and bootstrapping need nothing else.  The tests,
+the benchmarks and the editors' targets need Node.js too.  `make`
+lists every target and the variables they take; each runs a step of
+`build.zig` or a script of `test/`, `bench/` or `editors/`, and its
+line in the `Makefile` says which.
 
 ```sh
 make build         # .heff/out/heff
 make install       # ~/.heff/bin/heff, with its library
 ```
 
-The build (`node scripts/build.mjs`) compiles the program to C with the
-heff built before (`.heff/out/heff`), and `zig cc` builds it into
-`.heff/out/heff`.  Where there is no heff yet, or only one of another
-seed, it starts from the seed, `boot/heff.tar.xz`: heff compiled by
-itself to C, which zig builds for whatever machine it is on.  `make
-build-seed` (`--seed`) always starts from the seed.
+The build (`zig build`, which runs `scripts/bootstrap.zig`) compiles
+the program to C with the heff built before (`.heff/out/heff`), and
+`zig cc` builds it into `.heff/out/heff`.  Where there is no heff yet,
+or only one of another seed, it starts from the seed,
+`boot/heff.tar.xz`: heff compiled by itself to C, which zig unpacks
+and builds for whatever machine it is on.  `make build-seed` (`zig
+build seed`) always starts from the seed.  zig keeps each C part's
+object in its cache, `.zig-cache/`, and builds again only the parts
+that changed, as many at once as there are cores; it knows a part by
+its path and its time, so a part written anew (as in a fresh checkout)
+is built again.  `.zig-cache/` only grows: remove it when it is too
+big.
 
 `make install` installs into `~/.heff` whatever `HEFF_HOME` says (to
 install elsewhere, `HEFF_HOME=DIR .heff/out/heff install`); `make
 install-all` installs the VS Code extension too (`make vsix`, then
 `code --install-extension`) and builds bat's cache again.
 
-`make boot` (`node scripts/boot.mjs`) replaces the seed with the
-current compiler's C, once it compiles itself to the same C.  This is
-needed only when a language change means the old seed can no longer
-compile the source.
+`make boot` (`zig build boot`) replaces the seed with the current
+compiler's C, once it compiles itself to the same C (`make
+test-fixpoint`, `zig build fixpoint`).  The seed is a tar of the C
+files by name, of no owner and of time 0, compressed by `xz` (which it
+needs), so the same C makes the same seed.  This is needed only when a
+language change means the old seed can no longer compile the source.
 
-`make native TARGETS="x86_64-linux-musl aarch64-macos"`
-(`scripts/native.mjs`) builds heff for other systems, as a release
+`make native TARGETS="x86_64-linux-musl aarch64-macos"` (`zig build
+native -Dtargets=...`) builds heff for other systems, as a release
 does, into `.heff/out/native/TARGET/`.
 
 `make clean` removes what the builds and the tests made under `.heff/`,
-keeping the caches (`vN/`, `bN/`, the parts zig built in `out/heff.o/`
-and those built under ASan in `ref/native-asan.o/`); it never touches
-the seed.
+keeping the caches (`vN/`, `bN/`, the parts built under ASan in
+`ref/native-asan.o/`, and zig's, `.zig-cache/`); it never touches the
+seed.
 
 ## Testing
 
 The tests run on the heff built (`make build` first), or on `HEFF`:
 
 ```sh
-make test                  # every group, all at once
+make test                  # every group, all at once, then the fixpoint
 make test GROUPS="compiler lsp"
 make test-lsp              # one group: test-compiler, test-lsp,
-                           # test-backends, test-fixpoint, test-asan
+                           # test-backends, test-asan
+make test-fixpoint         # heff compiles itself to the same C (by zig)
 make check                 # build-seed, test, fmt-check: all a change is held to
 ```
 
 `make test` is `node test/run.mjs [GROUP...]`, and the groups are
-`compiler`, `lsp`, `backends` (each backend held to the interpreter),
-`fixpoint` (heff compiles itself to the same C) and `asan` (heff under
-AddressSanitizer, by clang; `make test-asan JOBS=4 TIMEOUT=120` sets
+`compiler`, `lsp`, `backends` (each backend held to the interpreter)
+and `asan` (heff under AddressSanitizer, by clang; `make test-asan JOBS=4 TIMEOUT=120` sets
 `HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`).  The scripts run at once,
 and what they run shares one budget, as make's jobserver does: as many
 processes at once as there are cores, or `HEFF_TEST_JOBS` (a script
 run by itself has its own pools).  So there is no need for `make -j`,
-and the targets run one after another even with it.
+and the targets run one after another even with it.  With no group
+given, `make test` checks the fixpoint after them, as `make
+test-fixpoint` does, which needs no Node.js.
 
 `make sanitize` (`HEFF_SANITIZE=1 node test/backends.mjs`) builds the
 backends' C programs under AddressSanitizer, and `make tsan`
@@ -107,7 +119,7 @@ All that is made is under `.heff/`: the compiler built (`out/`), the
 cache of compiled modules (`vN/`), the backends' cache (`bN/`), the
 programs `heff build` makes (`bin/`, their C in `build/`), what `heff
 run` runs (`run/`), the example apps (`examples/`), and the tests' work
-directories (`ref/`).
+directories (`ref/`); and zig's cache, beside it, `.zig-cache/`.
 
 The backends' cache keeps, for each module (`bN/M.hb`), what the
 backends made of its definitions: each definition simplified, by the

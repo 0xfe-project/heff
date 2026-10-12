@@ -12,7 +12,7 @@ one; so is the repository's `.heff/out/heff`, made by the build, and the
 heff home's, which it installs:
 
 ```sh
-node scripts/build.mjs     # at the repository's root
+make build                 # at the repository's root
 .heff/out/heff install     # then: ~/.heff/bin/heff, with its lib/
 ```
 

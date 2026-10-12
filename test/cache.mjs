@@ -13,7 +13,7 @@ import { join, basename } from "node:path";
 import { heffBin, root } from "./heff.mjs";
 import { run } from "./pool.mjs";
 
-if (!existsSync(heffBin)) { console.log(`FAIL cache: no ${heffBin} (run node scripts/build.mjs first)`); process.exit(1); }
+if (!existsSync(heffBin)) { console.log(`FAIL cache: no ${heffBin} (run make build first)`); process.exit(1); }
 
 const dir = mkdtempSync(join(tmpdir(), "heff-cache-"));
 mkdirSync(join(dir, "lib"), { recursive: true });

@@ -1,5 +1,5 @@
 // The repository the tests are of, and the compiler they run: `HEFF`,
-// else the one built (scripts/build.mjs), .heff/out/heff.
+// else the one built (`make build`), .heff/out/heff.
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "./pool.mjs";

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // heff compiled through C, checked by AddressSanitizer: .heff/out/heff.d/
-// (scripts/build.mjs) built by the system's clang with
+// (`make build`) built by the system's clang with
 // `-fsanitize=address` (zig's has no ASan runtime) and no free lists
 // (`-DSMALL_MAX=0`, so that a use after the last reference is a use after
 // free), then made to check each program of test/programs in .heff/ref/native-asan,
