@@ -1,10 +1,12 @@
-# heff's development commands, each a name for a script that does the
-# work (scripts/, test/, bench/, editors/).  `make` lists them.
+# heff's development commands, each a name for what does the work: a
+# step of build.zig (the building, by zig alone), or a script of test/,
+# bench/, editors/.  `make` lists them.
 #
 # GNU make (3.81, macOS's, or newer).  Each script decides for itself
 # how much to run at once, so the targets run one after another, even
 # under `make -j`.
 
+ZIG ?= zig
 NODE ?= node
 # (the heff fmt runs, and the tests, as test/heff.mjs says: HEFF, given
 # on the command line or in the environment, else the one built)
@@ -30,6 +32,7 @@ BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 
 help: ## this list
 	@echo "make TARGET [VARIABLE=VALUE...]"
+	@echo "(zig and make build heff; Node.js runs the tests, the benchmarks and the editors' targets)"
 	@awk 'BEGIN { FS = ":.*## " } \
 	  /^##@ / { printf "\n%s\n", substr($$0, 5) } \
 	  /^[a-z][a-z-]*:.*## / { printf "  %-15s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -38,19 +41,19 @@ help: ## this list
 	@awk 'BEGIN { FS = " *\\?= *|## *" } \
 	  /^[A-Z]+ \?=.*##/ { printf "  %-15s %s%s\n", $$1, $$3, ($$2 == "" ? "" : " [" $$2 "]") }' $(MAKEFILE_LIST)
 
-##@ Building
+##@ Building (by zig alone)
 
 build: ## .heff/out/heff, built by the heff built before (from the seed, the first time)
-	$(NODE) scripts/build.mjs
+	$(ZIG) build
 
 build-seed: ## .heff/out/heff, built from the seed (boot/heff.tar.xz), always
-	$(NODE) scripts/build.mjs --seed
+	$(ZIG) build seed
 
-boot: ## renew the seed, boot/heff.tar.xz, once heff compiles itself to itself
-	$(NODE) scripts/boot.mjs
+boot: ## renew the seed, boot/heff.tar.xz, once heff compiles itself to itself (and xz)
+	$(ZIG) build boot
 
 native: ## heff for other systems, .heff/out/native/TARGET/ (TARGETS=...)
-	$(NODE) scripts/native.mjs $(TARGETS)
+	$(ZIG) build native -Dtargets="$(TARGETS)"
 
 ##@ Testing (on the heff built: make build first)
 
@@ -131,10 +134,9 @@ install-all: install vsix ## install, and the VS Code extension, and bat's cache
 
 ##@ Cleaning
 
-# (the parts zig built, .heff/out/heff.o/, and those built under ASan,
-# .heff/ref/native-asan.o/, each kept by what it is made of, are caches,
-# as .heff/vN/ and .heff/bN/ are, and are kept)
+# (the caches are kept: .heff/vN/, .heff/bN/, the parts built under
+# ASan, .heff/ref/native-asan.o/, each kept by what it is made of, and
+# zig's, .zig-cache/, with the parts zig built)
 clean: ## what the builds and tests made (not the caches, nor the seed)
-	rm -rf .heff/bin .heff/build .heff/run .heff/examples $(VSCODE)/heff-*.vsix
-	if [ -d .heff/out ]; then find .heff/out -mindepth 1 -maxdepth 1 ! -name heff.o -exec rm -rf {} +; fi
+	rm -rf .heff/bin .heff/build .heff/run .heff/examples .heff/out $(VSCODE)/heff-*.vsix
 	if [ -d .heff/ref ]; then find .heff/ref -mindepth 1 -maxdepth 1 ! -name native-asan.o -exec rm -rf {} +; fi
