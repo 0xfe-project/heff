@@ -291,6 +291,7 @@ if (process.platform !== "win32") checks.push((async () => {
     /^no host: curl: \(3\) /,
     `getText: ${"item 3\n".repeat(4)}`,
     "getText, refused: code 7",
+    "getText, 404: curl: (22) The requested URL returned error: 404",
     "get: GET",
   ];
   // (the lines, by `want`: a text may have lines of its own)

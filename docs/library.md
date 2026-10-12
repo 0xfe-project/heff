@@ -78,8 +78,8 @@ An effect's JavaScript side is in `M.provider.js` beside `M.hf`, its C
 side in `M.provider.c`: see [providers.md](providers.md).
 
 `std.http` is an HTTP client, on the C backend alone (a page fetches by
-`browser.dom`'s `fetchText`, the browser's `fetch`).  Import it by a name, `import std.http as Http`: a
-`Request` -- `{ url = u }`, or with its `method`, `headers` (a name and
+`browser.dom`'s `fetchText`, the browser's `fetch`).  Import it by a
+name, `import std.http as Http`: a `Request` -- `{ url = u }`, or with its `method`, `headers` (a name and
 a value each), `body` (`Bytes`), `timeout` (milliseconds in all, 0 for
 none) and `follow` (redirects, followed unless `False`) -- is sent by
 `Http.send`, and `Http.get u` and `Http.getText u` are a `GET`.  What
@@ -89,6 +89,9 @@ comes back is `Either HttpError Response`: a `Response`, its `status`,
 an `HttpError` where no response came -- the connection refused, the
 name not found, TLS, the time up -- with curl's `code` and its
 `message` (`Http.showError` writes it as curl's tool does).
+`Http.getText u` is the body as text where the status is 2xx, and an
+error where it is not, code 22, as `curl --fail` has it: `curl: (22)
+The requested URL returned error: 404`.
 
 ```haskell
 import std.http as Http
