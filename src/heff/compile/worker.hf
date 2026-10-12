@@ -17,7 +17,10 @@
 -- calls: from no workers, each function weighed again where one it calls
 -- has a new one, a parameter once unboxed staying so, until none changes
 -- (each round in the order of the keys, against the workers at its
--- start: what it comes to is the same whatever order the program is in).
+-- start: what it comes to is the same whatever order the program is in);
+-- then what it could not see, functions round a cycle of calls giving
+-- one another their numbers, from hopes that fall where they must ("Hopes
+-- on cycles of calls").
 --
 -- Only what a body says is evidence, never what a caller gives: a
 -- function called with an `Int64` at one call and a `Float64` at another
@@ -210,9 +213,9 @@ rounds : Facts.Facts
        -> Map.Map String (List String)
        -> Int
        -> Next
-       -> Repr.Sigs
+       -> Round
 rounds facts defs callers n nx =
-  if n <= 0 || List.null nx.dirty then nx.round.sigs
+  if n <= 0 || List.null nx.dirty then nx.round
   else rounds
       facts
       defs
@@ -328,6 +331,192 @@ meetAt js sg (MkPair k s) =
 meetCycles : Map.Map String (List String) -> Repr.Sigs -> Repr.Sigs
 meetCycles js sg = List.foldl (meetAt js) sg (Map.toList sg)
 
+-- Hopes on cycles of calls
+--------------------------------------------------------------------------------
+
+-- The rounds above start from no workers and only unboxing, so functions
+-- calling one another round a cycle, each giving back what the other
+-- gives (an accumulator: `evenOf`, `oddOf` of test/node/deep.hf), keep
+-- it a `V`: each sees the other give a `V`.  So the functions weighed
+-- are given each its hope (`Repr.hopeSig`: unboxed where its body's
+-- evidence says one type, whatever that costs), and weighed again
+-- against the hopes, each kept only where its body, given them, still
+-- says so (`Repr.proposeSig`), until none falls -- each never below what
+-- the rounds gave it.  What is left of a hope is a type its body says,
+-- as a worker's always is, so a worker is never wrong of what it takes.
+
+-- (whether a call of it may give back a bounce)
+bouncesIn : Facts.Facts -> String -> Bool
+bouncesIn facts k = Map.member compareString k facts.bounce
+
+-- (a hope, where it is more than it has)
+hopedTo : Repr.Sigs -> String -> Repr.Sig -> Repr.Sig -> Repr.Sigs
+hopedTo acc k old new =
+  if Repr.sigEq old new then acc else Map.insert compareString k new acc
+
+hopeOne : Facts.Facts
+        -> Repr.Sigs
+        -> Repr.Sigs
+        -> Pair String Imp.Def
+        -> Repr.Sigs
+hopeOne facts sg acc (MkPair k (MkDef _ _ (DefFun xs (MkBlock t)))) =
+  hopedTo
+    acc
+    k
+    (sigOr sg k (List.length xs))
+    (grown
+       (sigOr sg k (List.length xs))
+       (Repr.hopeSig sg (bouncesIn facts k) xs t))
+hopeOne facts sg acc p = acc
+
+-- | the functions weighed, each its hope where that is more than the
+-- | rounds gave it
+hopesOf : Facts.Facts -> Round -> Repr.Sigs
+hopesOf facts r =
+  List.foldl (hopeOne facts r.sigs) Map.empty (Map.toList r.imps)
+
+-- (a new signature, where it changed)
+fellTo : List (Pair String Repr.Sig)
+       -> String
+       -> Repr.Sig
+       -> Repr.Sig
+       -> List (Pair String Repr.Sig)
+fellTo acc k old new =
+  if Repr.sigEq old new then acc else Cons (MkPair k new) acc
+
+-- (a hope weighed against the signatures `sg`: kept where the body,
+-- given them, says so too, never below what the rounds gave it, `base`)
+fallImp : Facts.Facts
+        -> Repr.Sigs
+        -> Repr.Sigs
+        -> List (Pair String Repr.Sig)
+        -> String
+        -> Imp.Def
+        -> List (Pair String Repr.Sig)
+fallImp facts base sg acc k (MkDef _ _ (DefFun xs (MkBlock t))) =
+  fellTo
+    acc
+    k
+    (sigOr sg k (List.length xs))
+    (grown
+       (sigOr base k (List.length xs))
+       (meetSig
+          (sigOr sg k (List.length xs))
+          (Repr.proposeSig sg (bouncesIn facts k) xs t)))
+fallImp facts base sg acc k md = acc
+
+fallOne : Facts.Facts
+        -> Repr.Sigs
+        -> Map.Map String Imp.Def
+        -> Repr.Sigs
+        -> List (Pair String Repr.Sig)
+        -> String
+        -> List (Pair String Repr.Sig)
+fallOne facts base imps sg acc k = case Map.lookup compareString k imps of
+  Just md -> fallImp facts base sg acc k md
+  Nothing -> acc
+
+-- | what the falls go on with: the rounds' workers, their forms, the
+-- | functions hoped for and those that mention each
+type Fall =
+  { facts : Facts.Facts
+  , base : Repr.Sigs
+  , imps : Map.Map String Imp.Def
+  , hoped : Repr.Sigs
+  , callers : Map.Map String (List String)
+  }
+
+-- (those hoped for whose callees changed, and those changed themselves)
+fallDirty : Fall -> List (Pair String Repr.Sig) -> List String
+fallDirty fl cs =
+  List.filter
+    (\k -> Map.member compareString k fl.hoped)
+    (sortedOnce
+       (List.concatMap
+          (\p ->
+             Cons
+               (fst p)
+               (fromMaybe Nil (Map.lookup compareString (fst p) fl.callers)))
+          cs))
+
+-- (the hopes of `dirty` weighed against `sg`: those that fell)
+fallStep : Fall -> Repr.Sigs -> List String -> List (Pair String Repr.Sig)
+fallStep fl sg dirty =
+  List.foldl (fallOne fl.facts fl.base fl.imps sg) Nil dirty
+
+-- (the falls `cs`, then `n` more at most, until no signature falls)
+falls : Fall -> Int -> Repr.Sigs -> List (Pair String Repr.Sig) -> Repr.Sigs
+falls fl n sg cs =
+  if n <= 0 || List.null cs then sg
+  else falls
+      fl
+      (n - 1)
+      (withChanges sg cs)
+      (fallStep fl (withChanges sg cs) (fallDirty fl cs))
+
+-- (those that mention any hoped for, and those hoped for)
+fallDirtyAll : Fall -> List String
+fallDirtyAll fl =
+  sortedOnce
+    (List.concatMap
+       (\p ->
+          Cons
+            (fst p)
+            (fromMaybe Nil (Map.lookup compareString (fst p) fl.callers)))
+       (Map.toList fl.hoped))
+
+roundSigs : Round -> Repr.Sigs
+roundSigs r = r.sigs
+
+-- (only those with a worker)
+workersOnly : Repr.Sigs -> Repr.Sigs
+workersOnly sg =
+  List.foldl (\m p -> withSig m (fst p) (snd p)) sg (Map.toList sg)
+
+-- (the hopes, fallen as far as they fall)
+fallen : Fall -> Repr.Sigs
+fallen fl =
+  falls
+    fl
+    64
+    (withChanges fl.base (Map.toList fl.hoped))
+    (fallStep
+       fl
+       (withChanges fl.base (Map.toList fl.hoped))
+       (List.map fst (Map.toList fl.hoped)))
+
+hopingWith : Facts.Facts -> Map.Map String IR.Def -> Fall -> Repr.Sigs
+hopingWith facts defs fl =
+  if Map.size fl.hoped == 0 then fl.base
+  else roundSigs
+      (rounds
+         facts
+         defs
+         fl.callers
+         64
+         { round = { sigs = workersOnly (fallen fl), imps = fl.imps }
+         , dirty = fallDirtyAll fl
+         })
+
+-- | the rounds' workers, hoped for on cycles of calls: those hoped for
+-- | weighed against the hopes until none falls, then the rounds again
+-- | for what calls them
+hoping : Facts.Facts
+       -> Map.Map String IR.Def
+       -> Map.Map String (List String)
+       -> Round
+       -> Repr.Sigs
+hoping facts defs callers r =
+  hopingWith
+    facts
+    defs
+    { facts = facts
+    , base = r.sigs
+    , imps = r.imps
+    , hoped = hopesOf facts r
+    , callers = callers
+    }
+
 -- Workers
 --------------------------------------------------------------------------------
 
@@ -346,15 +535,21 @@ workers : Facts.Facts -> List IR.Def -> Repr.Sigs
 workers facts defs =
   meetCycles
     (jumpsAll facts.arity defs)
-    (rounds
+    (hoping
        facts
        (byKey defs)
        (callersOf defs)
-       64
-       { round = { sigs = Map.empty, imps = Map.empty }
-       , dirty =
-           sortedOnce
-             (List.map
-                (\(d : IR.Def) -> d.key)
-                (List.filter (\(d : IR.Def) -> isFunction d && numeric d) defs))
-       })
+       (rounds
+          facts
+          (byKey defs)
+          (callersOf defs)
+          64
+          { round = { sigs = Map.empty, imps = Map.empty }
+          , dirty =
+              sortedOnce
+                (List.map
+                   (\(d : IR.Def) -> d.key)
+                   (List.filter
+                      (\(d : IR.Def) -> isFunction d && numeric d)
+                      defs))
+          }))
