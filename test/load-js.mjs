@@ -46,6 +46,12 @@ const showString = (s) => {
   }
   return "\"" + out + JSON.stringify(text).slice(1, -1) + "\"";
 };
+// (bytes, a `Uint8Array`, as `bytes`'s `show` writes them, `b"..."`: a
+// byte of ASCII that is printed as it is, `"`, `\` and three controls
+// escaped, any other `\xff`)
+const escapes = { 0x22: "\\\"", 0x5c: "\\\\", 0x0a: "\\n", 0x0d: "\\r", 0x09: "\\t" };
+const showBytes = (b) => "b\"" + [...b].map((c) => escapes[c]
+  ?? (c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : "\\x" + c.toString(16).padStart(2, "0"))).join("") + "\"";
 // (a list as `[a, b]` writes it; a tag with arguments is parenthesized
 // where it is an argument)
 export const show = (v, arg = false) => {
@@ -56,6 +62,7 @@ export const show = (v, arg = false) => {
   // (a float as a literal writes it: `2.0`, not `2`)
   if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
   if (typeof v === "string") return showString(v);
+  if (v instanceof Uint8Array) return showBytes(v);
   if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {

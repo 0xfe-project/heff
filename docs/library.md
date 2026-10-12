@@ -35,7 +35,8 @@ are imported by their names:
 - the fixed-width numbers' `int8` to `int64`, `uint8` to `uint64` and
   `float32`, `int` with an `Int`'s bits, and `rune` with a `Rune`'s
   operations ([numbers](language.md#numbers),
-  [runes and strings](language.md#runes-and-strings)).
+  [runes and strings](language.md#runes-and-strings));
+- `bytes`, the operations of `Bytes` ([bytes](language.md#bytes)).
 
 ## The batteries
 

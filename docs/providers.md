@@ -25,6 +25,15 @@ the working directory, a command and its arguments -- and the hosts of
 text (the DOM, JSON) are text, what is not UTF-8 U+FFFD in and out; a
 path with a NUL in it is none, the operation failing.
 
+## Bytes
+
+`Bytes` (lib/bytes.hf) are given and taken as they are kept: in
+JavaScript a `Uint8Array`, which a provider makes and reads as it is
+(and never changes, nor one it was given); in C a buffer, which a
+provider makes by `heff_bytes_in` (`n` bytes copied) and reads by
+`heff_bytes_data` (where they are, and how many, for as long as it
+holds the value), and neither looks into nor changes otherwise.
+
 ## JSString
 
 `std.js` has JavaScript's text beside them: a `JSString`, which a

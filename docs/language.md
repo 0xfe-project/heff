@@ -150,7 +150,8 @@ y`: its instances are `Int`'s (`equalityInt`), `Float64`'s, `String`'s,
 `Maybe`, a `Pair` and an `Either` of types that have one
 (`equalityList`, `equalityMaybe`, `equalityPair`, `equalityEither`),
 and each fixed-width type's module has its own (`int8`'s
-`equalityInt8`) -- an instance named by its theory, then its type.  The
+`equalityInt8`), as `bytes` has `equalityBytes` -- an instance named
+by its theory, then its type.  The
 prelude's other operators are theories' too ([operators](#operators)).
 A search tries only the instances whose type could be the one wanted:
 `x == y` at `Int` tries `equalityInt`, not `equalityList`, whose
@@ -356,6 +357,35 @@ ASCII's classes and cases: `isDigit`, `isAlpha`, `isSpace`, `isUpper`,
 
 JavaScript's own text, UTF-16, is another type, `std.js`'s `JSString`:
 see [providers.md](providers.md#jsstring).
+
+### Bytes
+
+`Bytes` are bytes that are not text -- a body, what a socket reads, a
+file's content -- a type of their own, the prelude's, and no `String`;
+never changed once made.  The module `bytes`
+(`import bytes as Bytes`) has what is done with them: `length`,
+`index` (the byte at `i`, a `UInt8`, if there is one), `slice` (as a
+string's, `strSlice`: clamped, a negative index from the end),
+`append` and `concat`, `empty`, `fromList` and `toList` (of
+`UInt8`s), `fromString` (a string's bytes, as they are) and
+`toString` (their text, UTF-8, what is not UTF-8 U+FFFD, as `rune`'s
+`toValid` makes a string), `eq` and its instance, `equalityBytes`, and
+`show`, which writes them as `b"..."`: a byte of ASCII that is printed
+as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any other
+byte `\xff`.  No literal is of type `Bytes`; the tools show one as
+`show` does.
+
+```haskell
+import bytes as Bytes
+
+-- | >>> Bytes.show (greeting "hé")
+-- | "b\"hi h\\xc3\\xa9\""
+greeting : String -> Bytes
+greeting name = Bytes.append (Bytes.fromList [104, 105, 32]) (Bytes.fromString name)
+```
+
+A C program keeps them as a buffer of bytes, a JavaScript one as a
+`Uint8Array` ([providers.md](providers.md#bytes)).
 
 ## Effects
 

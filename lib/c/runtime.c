@@ -13,7 +13,9 @@
 // read as `heff_u8_decode` reads them, what is not UTF-8 U+FFFD -- as
 // the other backends have it; a provider gives one to the system, and
 // makes one of what the system gives, only through the runtime's
-// helpers ("What providers share" says which).
+// helpers ("What providers share" says which).  `Bytes` (lib/bytes.hf)
+// are kept as a string is, a `Str` of another kind (`K_BYT`), and cross
+// by helpers of their own.
 //
 // An object is counted (Perceus): each owner of it holds a reference,
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
@@ -122,7 +124,7 @@ enum {
   TAG_MkPair, TAG_InL, TAG_InR, TAG_KNOWN
 };
 
-enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG };
+enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT };
 
 typedef struct Obj {
   uint32_t rc;
@@ -143,6 +145,7 @@ typedef struct { Obj h; int32_t n; uint32_t flat; uint32_t *lbl; V f[]; } Rec;
 // value, or 0)
 typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V memo; V env[]; } Clo;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
+// (a string, or `Bytes` (`K_BYT`): its `len` bytes, room for `cap`)
 typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
 // (a string written in the program, static: its `n` bytes, as a C string
 // literal has them -- the NUL C ends it with, after them, no byte of it)
@@ -735,7 +738,7 @@ static size_t heff_size(V v) {
   case K_REC: return sizeof(Rec) + ((Rec *)v)->n * sizeof(V);
   case K_CLO: return sizeof(Clo) + ((Clo *)v)->nenv * sizeof(V);
   case K_PAP: return sizeof(Pap) + ((Pap *)v)->n * sizeof(V);
-  case K_STR: return sizeof(Str) + ((Str *)v)->cap;
+  case K_STR: case K_BYT: return sizeof(Str) + ((Str *)v)->cap;
   case K_FLT: return sizeof(Flt);
   case K_ARR: return sizeof(Arr) + ((Arr *)v)->n * sizeof(V);
   case K_BNC: return sizeof(Bnc) + ((Bnc *)v)->n * sizeof(V);
@@ -1831,8 +1834,9 @@ static V heff_str_valid(const void *c, int64_t n) {
 
 // (the first string, its last reference, grown in place, room made for
 // twice what it needs -- a string built a piece at a time copied a
-// logarithmic number of times, not once a piece)
-static V heff_strAppend(V a, V b) {
+// logarithmic number of times, not once a piece; `Bytes` too, a new one
+// of the kind `kind`)
+static V heff_buf_append(V a, V b, uint16_t kind) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len + y->len;
   if (x->h.rc == 1) {
@@ -1854,12 +1858,15 @@ static V heff_strAppend(V a, V b) {
     return (V)x;
   }
   Str *s = heff_str_new(n);
+  s->h.kind = kind;
   memcpy(s->s, x->s, (size_t)x->len);
   memcpy(s->s + x->len, y->s, (size_t)y->len);
   heff_drop(a);
   heff_drop(b);
   return (V)s;
 }
+
+static V heff_strAppend(V a, V b) { return heff_buf_append(a, b, K_STR); }
 
 static V heff_strLength(V a) {
   V n = MK_INT(((Str *)a)->len);
@@ -2477,6 +2484,79 @@ static V heff_arrayToList(V a) {
   return l;
 }
 
+// Bytes
+// ---------------------------------------------------------------------
+
+// (`Bytes` (lib/bytes.hf), never changed once made: a string's `Str`, of
+// the kind `K_BYT` -- dropped, copied for a thread and grown by an append
+// as a string is, and shown as `b"..."`.  Their length, slice and
+// equality are a string's; a byte is a `UInt8`, a word of its value)
+static Str *heff_bytes_new(int64_t len) {
+  Str *s = heff_str_new(len);
+  s->h.kind = K_BYT;
+  return s;
+}
+
+static V heff_bytesLength(V a) { return heff_strLength(a); }
+
+// (the byte at `i`; out of them, abandoned, as `bytes`'s `index` never
+// asks)
+static V heff_bytesAt(V a, V i) {
+  Str *x = (Str *)a;
+  int64_t k = INT_OF(i);
+  if (!IS_INT(i) || k < 0 || k >= x->len) return heff_abandon();
+  V r = MK_INT(x->s[k]);
+  heff_drop(a);
+  return r;
+}
+
+static V heff_bytesSlice(V a, V i, V j) {
+  V s = heff_strSlice(a, i, j);
+  OBJ(s)->kind = K_BYT;
+  return s;
+}
+
+static V heff_bytesAppend(V a, V b) { return heff_buf_append(a, b, K_BYT); }
+
+static V heff_bytesEq(V a, V b) { return heff_strEq(a, b); }
+
+static V heff_bytesFromList(V l) {
+  int64_t n = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n++;
+  Str *s = heff_bytes_new(n);
+  int64_t k = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) s->s[k++] = (uint8_t)INT_OF(heff_field(c, 0));
+  heff_drop(l);
+  return (V)s;
+}
+
+static V heff_bytesToList(V a) {
+  Str *x = (Str *)a;
+  V l = NTAG(TAG_Nil);
+  for (int64_t k = x->len - 1; k >= 0; k--) {
+    V f[2] = { MK_INT(x->s[k]), l };
+    l = heff_tag_n(TAG_Cons, 2, f);
+  }
+  heff_drop(a);
+  return l;
+}
+
+// (a string's bytes, as they are)
+static V heff_bytesFromString(V a) {
+  Str *x = (Str *)a, *s = heff_bytes_new(x->len);
+  if (x->len) memcpy(s->s, x->s, (size_t)x->len);
+  heff_drop(a);
+  return (V)s;
+}
+
+// (their text: what is not UTF-8 in them U+FFFD, as TextDecoder reads it)
+static V heff_bytesToString(V a) {
+  Str *x = (Str *)a;
+  V s = heff_str_valid(x->s, x->len);
+  heff_drop(a);
+  return s;
+}
+
 // What providers share
 // ---------------------------------------------------------------------
 
@@ -2574,6 +2654,22 @@ static char *heff_bytes(V v, size_t *n) {
 static void heff_put(FILE *f, V v) {
   Str *s = (Str *)v;
   if (s->len) fwrite(s->s, 1, (size_t)s->len, f);
+}
+
+// `Bytes` cross by these alone, as they are: in, `n` bytes copied, by
+// `heff_bytes_in`; out, read where they are kept, `*n` of them, by
+// `heff_bytes_data` (the value not consumed, its bytes there as long as
+// it is held, and never written to).
+static V heff_bytes_in(const void *c, int64_t n) {
+  Str *s = heff_bytes_new(n);
+  if (n) memcpy(s->s, c, (size_t)n);
+  return (V)s;
+}
+
+static const uint8_t *heff_bytes_data(V v, int64_t *n) {
+  Str *s = (Str *)v;
+  *n = s->len;
+  return s->s;
 }
 
 // (C strings' order, for qsort)
@@ -3013,6 +3109,26 @@ static int heff_is_list(V v) {
   return heff_tag_named(v, "Nil", 0, &f);
 }
 
+// (bytes as `bytes`'s `show` writes them, `b"..."`: a byte of ASCII that
+// is printed as it is, `"`, `\` and three controls escaped, any other
+// `\xff`)
+static void heff_show_bytes(Buf *b, V v) {
+  Str *s = (Str *)v;
+  buf_str(b, "b\"");
+  for (int64_t i = 0; i < s->len; i++) {
+    uint8_t c = s->s[i];
+    char tmp[8];
+    if (c == '"') buf_str(b, "\\\"");
+    else if (c == '\\') buf_str(b, "\\\\");
+    else if (c == '\n') buf_str(b, "\\n");
+    else if (c == '\r') buf_str(b, "\\r");
+    else if (c == '\t') buf_str(b, "\\t");
+    else if (c >= 0x20 && c < 0x7f) { char o = (char)c; buf_put(b, &o, 1); }
+    else { snprintf(tmp, sizeof tmp, "\\x%02x", c); buf_str(b, tmp); }
+  }
+  buf_str(b, "\"");
+}
+
 static void heff_show(Buf *b, V v, int arg) {
   char tmp[64];
   if (heff_is_list(v)) {
@@ -3047,6 +3163,7 @@ static void heff_show(Buf *b, V v, int arg) {
       return;
     }
     case K_STR: buf_json_string_as(b, v, 1); return;
+    case K_BYT: heff_show_bytes(b, v); return;
     case K_ARR: {
       Arr *r = (Arr *)v;
       buf_str(b, "[");

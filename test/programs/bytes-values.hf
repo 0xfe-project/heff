@@ -1,0 +1,173 @@
+-- `Bytes` (lib/bytes.hf), each backend held to the interpreter: made of
+-- a list, of a string and of nothing; read, sliced, put together,
+-- compared and shown; made text, what is not UTF-8 U+FFFD as `toValid`
+-- makes it; and held in a list, a record, a constructor's fields and a
+-- closure, taken again, some let go of unread (in C each a buffer of
+-- its own, a use after it is freed shown under AddressSanitizer).
+-- (Not `bytes.hf`: test/node/bytes.hf's work directory is `bytes-c`.)
+
+import bytes as Bytes
+import rune as Rune
+import uint8 as UInt8
+
+-- (each made as the program runs, not of a literal; no NUL in them, as a
+-- string with one is shown as each backend may -- `made` has one, in
+-- bytes)
+samples : Unit -> List String
+samples _ =
+  List.map
+    (\s -> "<" ^ s ^ ">")
+    [ ""
+    , "plain ASCII"
+    , "héllo, 中文"
+    , "😀 beyond U+FFFF"
+    , "\u{FEFF}a byte order mark"
+    , "\xC0\xAF overlong"
+    , "\xED\xA0\x80 a surrogate's bytes"
+    , "cut short \xF0\x9F\x98"
+    , "\xFF\x80 bytes of no rune"
+    , "\"quotes\", \\, \t\r\n"
+    ]
+
+hello : Bytes
+hello = Bytes.fromString "héllo"
+
+made : List Bytes
+made =
+  [ Bytes.empty
+  , hello
+  , Bytes.fromList [0, 1, 127, 128, 255]
+  , Bytes.fromString "\xff\"\\\n"
+  ]
+
+shown : List String
+shown = List.map Bytes.show made
+
+lengths : List Int
+lengths = List.map Bytes.length made
+
+-- (a byte shown as an `Int`, none as -1: JavaScript has a `UInt8` as a
+-- number, which is shown as a float)
+bytesOfHello : List Int
+bytesOfHello = List.map UInt8.toInt (Bytes.toList hello)
+
+indexed : List Int
+indexed =
+  List.map
+    (\i -> maybe -1 UInt8.toInt (Bytes.index hello i))
+    [0, 1, 5, 6, -1]
+
+-- (out of them, by the primitive itself: abandoned)
+pastTheEnd : UInt8
+pastTheEnd = bytesAt hello 6
+
+sliced : List Bytes
+sliced =
+  [ Bytes.slice hello 1 3
+  , Bytes.slice hello 0 0
+  , Bytes.slice hello 4 99
+  , Bytes.slice hello -3 6
+  , Bytes.slice hello 5 2
+  ]
+
+joined : Bytes
+joined = Bytes.append (Bytes.fromString "he") (Bytes.fromList [255, 0, 102])
+
+concatenated : Bytes
+concatenated = Bytes.concat (List.map Bytes.fromString (samples MkUnit))
+
+-- (an append at its last reference, grown in place in C, a byte at a time)
+grown : Bytes
+grown =
+  List.foldl
+    (\b i -> Bytes.append b (Bytes.fromList [UInt8.fromInt i]))
+    Bytes.empty
+    (List.range 0 299)
+
+grownBack : Bool
+grownBack =
+  List.map UInt8.toInt (Bytes.toList grown)
+  == List.map (\i -> i % 256) (List.range 0 299)
+
+equalities : List Bool
+equalities =
+  [ hello == Bytes.fromString "héllo"
+  , hello == Bytes.fromList [104, 195, 169, 108, 108, 111]
+  , hello /= Bytes.slice hello 0 5
+  , Bytes.empty == Bytes.fromList []
+  , Bytes.eq (Bytes.fromString "a") (Bytes.fromString "b")
+  ]
+
+-- (each made text: as `toValid` makes the string, and back where it is
+-- UTF-8)
+asText : List String
+asText = List.map (\s -> Bytes.toString (Bytes.fromString s)) (samples MkUnit)
+
+asValid : List Bool
+asValid =
+  List.map
+    (\s -> strEq (Bytes.toString (Bytes.fromString s)) (Rune.toValid s))
+    (samples MkUnit)
+
+whereValid : List Bool
+whereValid =
+  List.map
+    (\s ->
+       Rune.validString s
+       == (Bytes.fromString (Bytes.toString (Bytes.fromString s))
+         == Bytes.fromString s))
+    (samples MkUnit)
+
+-- Held, taken again, let go of
+--------------------------------------------------------------------------------
+
+data Held = Two Bytes Bytes | One Bytes | NoneHeld
+
+type Kept = { body : Bytes, n : Int, rest : List Bytes }
+
+bodies : Unit -> List Bytes
+bodies _ = List.map Bytes.fromString (samples MkUnit)
+
+-- (the first of two, the second let go of unread)
+firstOf : Held -> String
+firstOf (Two a _) = Bytes.show a
+firstOf (One a) = Bytes.show a
+firstOf NoneHeld = "none"
+
+-- (each in two, the second a copy of the one after it)
+pairs : List Bytes -> List Held
+pairs (Cons a (Cons b rest)) = Two a b :: pairs (Cons b rest)
+pairs (Cons a Nil) = [One a]
+pairs Nil = [NoneHeld]
+
+held : List String
+held = List.map firstOf (pairs (bodies MkUnit))
+
+heldAsIs : List Held
+heldAsIs = pairs (List.take 3 (bodies MkUnit))
+
+keep : Bytes -> Kept
+keep b = { body = b, n = List.length (bodies MkUnit), rest = bodies MkUnit }
+
+-- (each kept with the others, all but it let go of unread)
+kept : List String
+kept =
+  List.map
+    (\(k : Kept) -> Bytes.toString k.body ^ showInt k.n)
+    (List.map keep (bodies MkUnit))
+
+keptAsIs : Kept
+keptAsIs = keep hello
+
+-- (one held by a closure)
+holding : Bytes -> Unit -> Int
+holding b _ = Bytes.length b
+
+-- (each held by a closure, called)
+closed : List Int
+closed =
+  List.map (\(f : Unit -> Int) -> f MkUnit) (List.map holding (bodies MkUnit))
+
+-- (each held by a closure, never called)
+dropped : Int
+dropped = List.length (List.map holding (List.drop 3 (bodies MkUnit)))
