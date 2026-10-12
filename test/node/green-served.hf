@@ -1,0 +1,118 @@
+-- std.http.server's `serveConcurrently`, a green thread for each
+-- connection, scheduled by std.reactor: many clients held open at once,
+-- each answered in turn.  By C alone (test/backends.mjs).
+--
+--   main     n clients, each its connection kept: a first request each,
+--            all answered while every connection is held open -- which a
+--            server of one connection at a time never does -- then a
+--            second request each on the same connection
+
+import bytes as Bytes
+import co
+import green
+import std.http as Http
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.reactor as Reactor
+
+world : HFunctor
+world = stdio <+> (Net.net <+> Reactor.reactor)
+
+-- (the value of a `Right`; where there is none, the program abandoned:
+-- the test's own sockets, which do not fail)
+must : {a : Type} -> Either Net.NetError a -> a
+must (Right x) = x
+must (Left err) = abandon
+
+repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
+repeatG 0 c = pure MkUnit
+repeatG n c = bind c (\u -> repeatG (n - 1) c)
+
+-- (n values received on ch, added up)
+recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum ch 0 acc = pure acc
+recvSum ch n acc = do
+  x <- recv ch
+  recvSum ch (n - 1) (acc + x)
+
+-- (n bytes read, in as many reads as they take)
+readN : {e : HFunctor}
+      -> {{nt : Net.net <: e}}
+      -> Net.Connection
+      -> Int
+      -> Bytes
+      -> Co e Bytes
+readN c n acc =
+  if Bytes.length acc >= n then pure acc
+  else bind
+      (Net.read c (n - Bytes.length acc))
+      (\r -> readN c n (Bytes.append acc (must r)))
+
+-- (each request answered with its target)
+answer : {e : HFunctor} -> Server.Request -> Co e Http.Response
+answer r = pure (Server.plain 200 r.target)
+
+-- (a request for `target` sent on the connection, and its response read:
+-- 1 where it is the one wanted)
+asked : {e : HFunctor}
+      -> {{nt : Net.net <: e}}
+      -> Net.Connection
+      -> String
+      -> Co e Int
+asked c target = do
+  w <- Net.write c (Bytes.fromString ("GET " ^ target ^ " HTTP/1.1\r\nHost: x\r\n\r\n"))
+  let want = Server.responseBytes "" True (Server.plain 200 target)
+  got <- readN c (Bytes.length want) Bytes.empty
+  pure (if got == want then 1 else 0)
+
+-- | A client: a first request, its answer said on `back`; then, once
+-- | main says so on `go`, a second on the same connection.
+client : {e : HFunctor}
+       -> {{gr : green <: e}}
+       -> {{nt : Net.net <: e}}
+       -> Int
+       -> Int
+       -> Int
+       -> Int
+       -> Co e Unit
+client port back go i = do
+  c <- Net.connect "127.0.0.1" port
+  first <- asked (must c) ("/" ^ showInt i ^ "/first")
+  send back first
+  x <- recv go
+  second <- asked (must c) ("/" ^ showInt i ^ "/second")
+  Net.close (must c)
+  send back second
+
+program : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> Int
+        -> Co e Unit
+program n = do
+  l <- Net.listen "127.0.0.1" 0 128
+  at <- Net.local (must l)
+  spawn (bind (Server.serveConcurrently (must l) answer) (\err -> pure MkUnit))
+  back <- newChan
+  go <- newChan
+  repeatG n (bind newChan (\i -> spawn (client (must at).port back go i)))
+  first <- recvSum back n 0
+  print ("first requests answered, every connection held open: " ^ showInt first)
+  repeatG n (send go 1)
+  second <- recvSum back n 0
+  print ("second requests answered, on the same connections: " ^ showInt second)
+
+main : Co world Unit
+main = do
+  r <-
+    Reactor.scheduled
+      world
+      (rx := \p -> InR (InR p))
+      (program
+         (gr := \p -> InL p)
+         (io := \p -> InR (InL p))
+         (nt := \p -> InR (InR (InL p)))
+         40)
+  print (ev := \p -> InL p) (maybe "a deadlock" (\u -> "main done") r)

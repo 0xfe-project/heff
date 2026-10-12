@@ -216,11 +216,28 @@ HTTP/1.x's `400` or `505`, one too long `431` or `413`, and the
 connection is closed: after the response the server shuts its side
 down and reads what the client still sends, a mebibyte of it at most,
 and lets it go, so that a client still sending its body reads the
-response before the connection is closed, not a reset.  One connection is served at a time: a client
-that keeps its connection keeps the others waiting, until #43's green
-threads (std.thread's threads join where they spread: a thread for
-each connection, joined only when the server ends, would be one kept
-for each connection served).
+response before the connection is closed, not a reset.
+
+`serve` serves one connection at a time: a client that keeps its
+connection keeps the others waiting.  `Server.serveConcurrently
+listener handle` serves each by a green thread of its own
+([green threads](#green-threads); its world has `green`), many at once:
+run by `Reactor.scheduled`, each connection waits on its socket apart,
+the others served meanwhile, and `handle` may spawn threads of its own.
+It stops where a connection fails to be accepted, as `serve` does, the
+connections being served going on.  (std.thread's threads join where
+they spread: a thread of the system for each connection, joined only
+when the server ends, would be one kept for each connection served.)
+
+```haskell
+-- (`hello` served on the port, every connection at once)
+main : Co world Unit
+main = do
+  r <- Reactor.scheduled world (rx := \p -> InR (InR p)) (do
+    l <- Net.listen "127.0.0.1" 8080 128
+    either (\err -> pure err) (\ln -> Server.serveConcurrently ln hello) l)
+  ...
+```
 
 ## Green threads
 

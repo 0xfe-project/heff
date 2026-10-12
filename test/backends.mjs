@@ -414,6 +414,20 @@ if (process.platform !== "win32") checks.push((async () => {
   return msgs;
 })());
 
+// std.http.server's `serveConcurrently`, by C alone: a green thread a
+// connection, forty clients holding theirs open at once, each answered
+// (a server of one connection at a time never answers the second), then
+// asked again on the same connection
+if (process.platform !== "win32") checks.push((async () => {
+  const p = await programs.c("test/node/green-served.hf", "main");
+  if (p.error !== undefined) return [`FAIL green server (c): not compiled\n${p.error}`];
+  const r = await run(p.cmd, [], { timeout: 60000 });
+  const want = "first requests answered, every connection held open: 40\n"
+    + "second requests answered, on the same connections: 40\nmain done\n";
+  return r.status === 0 && !r.stderr && r.stdout === want ? []
+    : [`FAIL green server (c): status ${r.status}\n${r.stdout}${r.stderr}`];
+})());
+
 // an HTTP server over them, by C alone (std.http.server): asked by
 // std.http's client in the same program, a thread of its own; and by
 // the test's own -- node:http, its connection kept for each request,

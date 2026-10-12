@@ -1,5 +1,6 @@
 -- An HTTP/1.1 server, written over std.net's sockets: a listener's
--- connections accepted, one at a time, each one's requests read in
+-- connections accepted, one at a time or each by a green thread of its
+-- own (`serveConcurrently`), each one's requests read in
 -- turn -- the request line, the headers, and a body of the length its
 -- `Content-Length` says -- each given to a handler, and its response
 -- written with its length, the connection kept for the next request
@@ -18,6 +19,7 @@
 
 import bytes as Bytes
 import co
+import green
 import std.http as Http
 import std.net as Net
 import uint8 as UInt8
@@ -586,3 +588,32 @@ serve : {e : HFunctor}
       -> (Request -> Co e Http.Response)
       -> Co e Net.NetError
 serve l handle = bind (Net.accept l) (servedFor (\u -> serve l handle) handle)
+
+-- (a connection accepted, served by a thread of its own, and `again`;
+-- where accepting failed, why)
+spawnedFor : {e : HFunctor}
+           -> {{gr : green <: e}}
+           -> {{nt : Net.net <: e}}
+           -> (Unit -> Co e Net.NetError)
+           -> (Request -> Co e Http.Response)
+           -> Either Net.NetError Net.Connection
+           -> Co e Net.NetError
+spawnedFor again handle (Left err) = pure err
+spawnedFor again handle (Right c) = do
+  spawn (bind (serveConnection (\r -> False) handle c) (\stop -> pure MkUnit))
+  again MkUnit
+
+-- | The listener's connections served at once, each by a green thread
+-- | of its own (lib/green.hf, `serveConnection`), until one fails to be
+-- | accepted: why, the listener left as it is, the connections being
+-- | served going on.  Run by a scheduler: std.reactor's
+-- | (`Reactor.scheduled`) has each connection wait on its socket apart,
+-- | the others served meanwhile.
+serveConcurrently : {e : HFunctor}
+                  -> {{gr : green <: e}}
+                  -> {{nt : Net.net <: e}}
+                  -> Net.Listener
+                  -> (Request -> Co e Http.Response)
+                  -> Co e Net.NetError
+serveConcurrently l handle =
+  bind (Net.accept l) (spawnedFor (\u -> serveConcurrently l handle) handle)
