@@ -1,0 +1,1007 @@
+-- Fusion (#62): a function that takes a list apart, given what another
+-- builds, made one function that does both, so that the list between
+-- them is never built.
+--
+-- A consumer takes one of its parameters apart (a match on it, its
+-- whole body), and each arm with a rest -- its last field, a `Cons`'s
+-- tail -- calls itself on that rest once on every path and does nothing
+-- else with it (`map`, `filter`, `foldl`, `length`).  A producer ends,
+-- somewhere, in a tag whose last field is a call of itself (`range`,
+-- `map`, `filter`).  Both are told by their definitions, not by their
+-- names.  A call of a consumer on what a call of a producer gives,
+--
+--   foldl k z (map f xs)  ==>  foldl$f… k z f xs
+--
+-- is a call of a copy that is the producer with each place it ends at
+-- put through the consumer: a tag, the consumer's arm for it, its
+-- fields bound; the producer calling itself, the copy calling itself;
+-- anything else, the consumer called on it.  The copy is a consumer and
+-- a producer as its parts were, so `filter p (map f (range a b))` is one
+-- loop over the integers, building only what `filter` keeps.
+--
+-- Hippogriff is call-by-value: unfused, the producer runs to its end
+-- before the consumer starts; fused, they take turns.  So the consumer's
+-- work at each cell -- what its arm does but call itself, the
+-- parameters it hands on unchanged given what the call gives them (the
+-- `f` of `map f`) -- must be such that cannot fail (`workPure`), and it
+-- goes on to the end of the list (no arm stops early): only the
+-- producer's work can fail then, and it fails where it did.  The
+-- consumer's other arguments, computed before the producer's work now,
+-- must not fail either; and a list bound by a `let` and used once is
+-- fused where it is used only if what is computed between cannot fail.
+--
+-- This runs on what is simplified (heff.compile.simplify), for both
+-- backends (heff.compile.lower); the copies are made loops by
+-- heff.compile.trmc as the rest.
+
+import heff.compile.ir as I
+import heff.compile.simplify as Simplify
+import heff.compile.spec as Spec
+import map as M
+
+-- Lists
+--------------------------------------------------------------------------------
+
+elemF : String -> List String -> Bool
+elemF x Nil = False
+elemF x (Cons y ys) = strEq x y || elemF x ys
+
+nthF : {a : Type} -> Int -> List a -> Maybe a
+nthF i Nil = Nothing
+nthF i (Cons x xs) = if i == 0 then Just x else nthF (i - 1) xs
+
+-- | the list without its `i`th
+-- | >>> removeAt 1 [1, 2, 3]
+-- | [1, 3]
+removeAt : {a : Type} -> Int -> List a -> List a
+removeAt i Nil = Nil
+removeAt i (Cons x xs) = if i == 0 then xs else Cons x (removeAt (i - 1) xs)
+
+-- | the list, its `i`th `y`
+setAt : {a : Type} -> Int -> a -> List a -> List a
+setAt i y Nil = Nil
+setAt i y (Cons x xs) =
+  if i == 0 then Cons y xs else Cons x (setAt (i - 1) y xs)
+
+-- | the list, `y` put in before its `i`th
+-- | >>> insertAt 1 9 [1, 2, 3]
+-- | [1, 9, 2, 3]
+insertAt : {a : Type} -> Int -> a -> List a -> List a
+insertAt i y Nil = Cons y Nil
+insertAt i y (Cons x xs) =
+  if i == 0 then Cons y (Cons x xs) else Cons x (insertAt (i - 1) y xs)
+
+lastF : {a : Type} -> List a -> Maybe a
+lastF Nil = Nothing
+lastF (Cons x Nil) = Just x
+lastF (Cons x xs) = lastF xs
+
+initF : {a : Type} -> List a -> List a
+initF Nil = Nil
+initF (Cons x Nil) = Nil
+initF (Cons x xs) = Cons x (initF xs)
+
+posF : String -> List String -> Int -> Maybe Int
+posF x Nil i = Nothing
+posF x (Cons y ys) i = if strEq x y then Just i else posF x ys (i + 1)
+
+isJustF : {a : Type} -> Maybe a -> Bool
+isJustF (Just _) = True
+isJustF Nothing = False
+
+isVar : String -> I.Expr -> Bool
+isVar x (EVar y) = strEq x y
+isVar x _ = False
+
+-- (whether the `i`th is the variable `x`)
+varAt : Int -> String -> List I.Expr -> Bool
+varAt i x es = maybe False (isVar x) (nthF i es)
+
+occurs : String -> I.Expr -> Bool
+occurs x e = (I.occurrences x e).count > 0
+
+-- (once, and not under a lambda)
+onceIn : String -> I.Expr -> Bool
+onceIn x e = (I.occurrences x e).count == 1 && not (I.occurrences x e).underLam
+
+mentions : String -> I.Expr -> Bool
+mentions g e = elemF g (I.globalsIn e)
+
+-- | the arguments of a call of `g`, given its `n`
+callOf : String -> Int -> I.Expr -> Maybe (List I.Expr)
+callOf g n (EApp (EGlobal h) as) =
+  if strEq g h && List.length as == n then Just as else Nothing
+callOf g n (ECall h as) =
+  if strEq g h && List.length as == n then Just as else Nothing
+callOf g n _ = Nothing
+
+-- (a call of a global: its key and arguments)
+globalCall : I.Expr -> Maybe (Pair String (List I.Expr))
+globalCall (EApp (EGlobal g) as) = Just (MkPair g as)
+globalCall (ECall g as) = Just (MkPair g as)
+globalCall _ = Nothing
+
+-- What cannot fail
+--------------------------------------------------------------------------------
+
+-- (a match that matches whatever it is given: an `if`'s, both arms of a
+-- `Bool`)
+boolArms : List I.Arm -> Bool
+boolArms arms =
+  List.length arms == 2
+  && List.any (\a -> strEq (I.armTag a) "True") arms
+  && List.any (\a -> strEq (I.armTag a) "False") arms
+
+-- | evaluating it gives a value, at once: it can neither abandon nor go
+-- | on for ever -- `Simplify.pureIn`'s judgment, and through a lambda
+-- | applied, a `let` and an `if`
+-- | >>> workPure { safe = M.empty, total = M.empty } (EApp (ELam ["x"] (EPrimCall "intAdd" [EVar "x", EInt 1])) [EVar "y"])
+-- | True
+-- | >>> workPure { safe = M.empty, total = M.empty } (EApp (EVar "f") [EVar "y"])
+-- | False
+-- | >>> workPure { safe = M.empty, total = M.empty } (EMatch (EVar "b") [MkArm "True" [] (EInt 1), MkArm "False" [] EAbandon])
+-- | False
+workPure : Simplify.SG -> I.Expr -> Bool
+workPure sg (EVar _) = True
+workPure sg (EGlobal g) = M.member compareString g sg.safe
+workPure sg (ELam _ _) = True
+workPure sg (EPrim _) = True
+workPure sg (EInt _) = True
+workPure sg (EFloat _) = True
+workPure sg (EStr _) = True
+workPure sg (EFixed _ _) = True
+workPure sg (EFloat32 _) = True
+workPure sg (ETag _ as) = List.all (workPure sg) as
+workPure sg (ERecord fs _) = List.all (\p -> workPure sg (snd p)) fs
+workPure sg (EProj e _ _ _) = workPure sg e
+workPure sg (EPrimCall p as) =
+  not (Simplify.primFails p) && List.all (workPure sg) as
+workPure sg (ECall g as) = case M.lookup compareString g sg.total of
+  Just ar -> List.length as <= ar && List.all (workPure sg) as
+  Nothing -> False
+workPure sg (EApp (EGlobal g) as) = case M.lookup compareString g sg.total of
+  Just ar -> List.length as <= ar && List.all (workPure sg) as
+  Nothing -> False
+workPure sg (EApp (ELam xs b) as) =
+  List.length as <= List.length xs
+  && List.all (workPure sg) as
+  && (List.length as < List.length xs || workPure sg b)
+workPure sg (EApp (EApp f bs) as) = workPure sg (EApp f (List.append bs as))
+workPure sg (ELet _ a b) = workPure sg a && workPure sg b
+workPure sg (EMatch s arms) =
+  workPure sg s
+  && boolArms arms
+  && List.all (\a -> workPure sg (I.armBody a)) arms
+workPure sg _ = False
+
+-- Consumers
+--------------------------------------------------------------------------------
+
+-- | a function as it calls itself: its key, how many parameters it
+-- | takes, the one it takes apart, and the variable an arm binds the
+-- | rest to
+type Me = { key : String, arity : Int, at : Int, rest : String }
+
+-- (a call of itself on the rest)
+isSelf : Me -> String -> List I.Expr -> Bool
+isSelf me g as =
+  strEq g me.key && List.length as == me.arity && varAt me.at me.rest as
+
+addM : Maybe Int -> Maybe Int -> Maybe Int
+addM (Just a) (Just b) = Just (a + b)
+addM _ _ = Nothing
+
+sumM : List (Maybe Int) -> Maybe Int
+sumM ms = List.foldl addM (Just 0) ms
+
+sameGo : Maybe Int -> List (Maybe Int) -> Maybe Int
+sameGo m Nil = m
+sameGo (Just a) (Cons (Just b) rest) =
+  if a == b then sameGo (Just a) rest else Nothing
+sameGo _ _ = Nothing
+
+-- (each the same)
+sameM : List (Maybe Int) -> Maybe Int
+sameM Nil = Just 0
+sameM (Cons m rest) = sameGo m rest
+
+-- (a call of itself: on the rest, nothing of itself in its other
+-- arguments)
+selfCalls : Me -> String -> List I.Expr -> Maybe Int
+selfCalls me g as =
+  if isSelf me g as && not (List.any (mentions me.key) as) then Just 1
+  else Nothing
+
+-- | how many times it calls itself on every path through it, if as many
+-- | on each: none under a lambda, none on anything but the rest, and the
+-- | function not a value
+pathCalls : Me -> I.Expr -> Maybe Int
+pathCalls me (EApp (EGlobal g) as) =
+  if strEq g me.key then selfCalls me g as
+  else sumM (List.map (pathCalls me) as)
+pathCalls me (ECall g as) =
+  if strEq g me.key then selfCalls me g as
+  else sumM (List.map (pathCalls me) as)
+pathCalls me (EApp f as) = sumM (List.map (pathCalls me) (Cons f as))
+pathCalls me (EGlobal g) = if strEq g me.key then Nothing else Just 0
+pathCalls me (ELam _ b) =
+  if mentions me.key b || occurs me.rest b then Nothing else Just 0
+pathCalls me (ELet _ a b) = addM (pathCalls me a) (pathCalls me b)
+pathCalls me (EMatch s arms) =
+  addM
+    (pathCalls me s)
+    (sameM (List.map (\a -> pathCalls me (I.armBody a)) arms))
+pathCalls me (ETag _ as) = sumM (List.map (pathCalls me) as)
+pathCalls me (EPrimCall _ as) = sumM (List.map (pathCalls me) as)
+pathCalls me (ERecord fs _) = sumM (List.map (\p -> pathCalls me (snd p)) fs)
+pathCalls me (EProj e _ _ _) = pathCalls me e
+pathCalls me _ = Just 0
+
+-- (an arm's body, `f` done to it)
+armMap : (I.Expr -> I.Expr) -> I.Arm -> I.Arm
+armMap f (MkArm t vs b) = MkArm t vs (f b)
+
+-- | each call of itself on the rest as what it is given but the rest
+-- | (a tag, `$self`): what is left is the work done at a cell
+selfOut : Me -> I.Expr -> I.Expr
+selfOut me (EApp (EGlobal g) as) =
+  if isSelf me g as then ETag "$self" (removeAt me.at as)
+  else EApp (EGlobal g) (List.map (selfOut me) as)
+selfOut me (ECall g as) =
+  if isSelf me g as then ETag "$self" (removeAt me.at as)
+  else ECall g (List.map (selfOut me) as)
+selfOut me (ELam xs b) = ELam xs (selfOut me b)
+selfOut me (EApp f as) = EApp (selfOut me f) (List.map (selfOut me) as)
+selfOut me (ELet x a b) = ELet x (selfOut me a) (selfOut me b)
+selfOut me (ERecord fs ts) =
+  ERecord (List.map (\p -> MkPair (fst p) (selfOut me (snd p))) fs) ts
+selfOut me (EProj e l sh t) = EProj (selfOut me e) l sh t
+selfOut me (ETag t as) = ETag t (List.map (selfOut me) as)
+selfOut me (EMatch s arms) =
+  EMatch (selfOut me s) (List.map (armMap (selfOut me)) arms)
+selfOut me (EPrimCall p as) = EPrimCall p (List.map (selfOut me) as)
+selfOut me e = e
+
+-- | the arguments of each call of `g` (of `n`) in it
+selfArgs : String -> Int -> I.Expr -> List (List I.Expr)
+selfArgs g n (EApp (EGlobal h) as) =
+  if strEq g h && List.length as == n then Cons as Nil
+  else List.concatMap (selfArgs g n) as
+selfArgs g n (ECall h as) =
+  if strEq g h && List.length as == n then Cons as Nil
+  else List.concatMap (selfArgs g n) as
+selfArgs g n (ELam _ b) = selfArgs g n b
+selfArgs g n (EApp f as) = List.concatMap (selfArgs g n) (Cons f as)
+selfArgs g n (ELet _ a b) = List.append (selfArgs g n a) (selfArgs g n b)
+selfArgs g n (ERecord fs _) = List.concatMap (\p -> selfArgs g n (snd p)) fs
+selfArgs g n (EProj e _ _ _) = selfArgs g n e
+selfArgs g n (ETag _ as) = List.concatMap (selfArgs g n) as
+selfArgs g n (EMatch s arms) =
+  List.append
+    (selfArgs g n s)
+    (List.concatMap (\a -> selfArgs g n (I.armBody a)) arms)
+selfArgs g n (EPrimCall _ as) = List.concatMap (selfArgs g n) as
+selfArgs g n _ = Nil
+
+-- | a consumer: its parameters, the one it takes apart, the match's
+-- | arms, the tags of those that go on (calling themselves on the rest),
+-- | and which parameters it hands on to itself unchanged
+type Consumer =
+  { params : List String
+  , at : Int
+  , arms : List I.Arm
+  , goes : List String
+  , fixed : List Bool
+  }
+
+-- (as it calls itself in an arm whose rest is `r`)
+meOf : String -> Consumer -> String -> Me
+meOf key c r = { key = key, arity = List.length c.params, at = c.at, rest = r }
+
+-- (an arm: one that goes on (`Just True`), one that ends there,
+-- calling itself nowhere (`Just False`), or neither; `l`, the
+-- parameter taken apart, in neither)
+armKindR : Me -> I.Expr -> Maybe Bool
+armKindR me b = case pathCalls me b of
+  Just 1 -> if occurs me.rest (selfOut me b) then Nothing else Just True
+  _ -> Nothing
+
+armKind : String -> Int -> Int -> String -> I.Arm -> Maybe Bool
+armKind key n at l (MkArm t vs b) =
+  if occurs l b then Nothing
+  else if not (mentions key b) then Just False
+  else maybe
+      Nothing
+      (\r -> armKindR { key = key, arity = n, at = at, rest = r } b)
+      (lastF vs)
+
+-- (whether the `k`th parameter, `x`, is handed on unchanged)
+fixedGo : List (List I.Expr) -> Int -> List String -> List Bool
+fixedGo calls k Nil = Nil
+fixedGo calls k (Cons x xs) =
+  Cons (List.all (varAt k x) calls) (fixedGo calls (k + 1) xs)
+
+goesOf : List (Pair I.Arm (Maybe Bool)) -> List String
+goesOf Nil = Nil
+goesOf (Cons (MkPair a (Just True)) rest) = Cons (I.armTag a) (goesOf rest)
+goesOf (Cons _ rest) = goesOf rest
+
+consumerWith : String
+             -> List String
+             -> Int
+             -> List I.Arm
+             -> List (Maybe Bool)
+             -> Maybe Consumer
+consumerWith key ps at arms ks =
+  if List.all isJustF ks && List.any (\k -> maybe False (\b -> b) k) ks
+    then Just
+        { params = ps
+        , at = at
+        , arms = arms
+        , goes = goesOf (List.zip arms ks)
+        , fixed =
+            fixedGo
+              (List.concatMap
+                 (\a -> selfArgs key (List.length ps) (I.armBody a))
+                 arms)
+              0
+              ps
+        }
+  else Nothing
+
+consumerAt : String
+           -> List String
+           -> String
+           -> List I.Arm
+           -> Maybe Int
+           -> Maybe Consumer
+consumerAt key ps l arms (Just at) =
+  consumerWith
+    key
+    ps
+    at
+    arms
+    (List.map (armKind key (List.length ps) at l) arms)
+consumerAt key ps l arms Nothing = Nothing
+
+-- | what makes a definition a consumer, if it is one: the parameter it
+-- | takes apart, ...
+-- | >>> maybe (0 - 1) (\(c : Consumer) -> c.at) (consumerOf "len" (ELam ["n", "l"] (EMatch (EVar "l") [MkArm "Nil" [] (EVar "n"), MkArm "Cons" ["x", "xs"] (EApp (EGlobal "len") [EPrimCall "intAdd" [EVar "n", EInt 1], EVar "xs"])])))
+-- | 1
+-- | >>> isJustF (consumerOf "any" (ELam ["l"] (EMatch (EVar "l") [MkArm "Nil" [] (ETag "False" []), MkArm "Cons" ["x", "xs"] (EMatch (EVar "x") [MkArm "True" [] (ETag "True" []), MkArm "False" [] (EApp (EGlobal "any") [EVar "xs"])])])))
+-- | False
+consumerOf : String -> I.Expr -> Maybe Consumer
+consumerOf key (ELam ps (EMatch (EVar l) arms)) =
+  consumerAt key ps l arms (posF l ps 0)
+consumerOf key _ = Nothing
+
+-- Producers
+--------------------------------------------------------------------------------
+
+-- | a producer: its parameters, its body, and the tags it ends in
+type Producer = { params : List String, body : I.Expr, tags : List String }
+
+-- (the places it ends at)
+tailsOf : I.Expr -> List I.Expr
+tailsOf (ELet _ _ b) = tailsOf b
+tailsOf (EMatch _ arms) = List.concatMap (\a -> tailsOf (I.armBody a)) arms
+tailsOf e = Cons e Nil
+
+tagOf : I.Expr -> List String
+tagOf (ETag t _) = Cons t Nil
+tagOf _ = Nil
+
+-- (a tag whose last field is a call of itself)
+consRec : String -> Int -> I.Expr -> Bool
+consRec key n (ETag _ as) = case lastF as of
+  Just l -> isJustF (callOf key n l)
+  Nothing -> False
+consRec key n _ = False
+
+-- | what makes a definition a producer, if it is one
+producerOf : String -> I.Expr -> Maybe Producer
+producerOf key (ELam qs b) =
+  if List.any (consRec key (List.length qs)) (tailsOf b)
+    then Just { params = qs, body = b, tags = List.concatMap tagOf (tailsOf b) }
+  else Nothing
+producerOf key _ = Nothing
+
+-- The pass's state
+--------------------------------------------------------------------------------
+
+-- | where fresh names come from; the consumers and producers (those it
+-- | made among them); the copies made, by consumer and producer (`""`,
+-- | none); the definitions made, the last first; how many more it may
+-- | make
+type St =
+  { supply : Int
+  , consumers : M.Map String Consumer
+  , producers : M.Map String Producer
+  , made : M.Map String String
+  , fresh : List I.Def
+  , left : Int
+  }
+
+type F a = St -> Pair a St
+
+bindTake : {a b : Type} -> (a -> F b) -> Pair a St -> Pair b St
+bindTake f (MkPair x s) = f x s
+
+bind : {a b : Type} -> F a -> (a -> F b) -> F b
+bind m f = \s -> bindTake f (m s)
+
+pure : {a : Type} -> a -> F a
+pure x = \s -> MkPair x s
+
+get : F St
+get = \s -> MkPair s s
+
+traverseF : {a b : Type} -> (a -> F b) -> List a -> F (List b)
+traverseF f Nil = pure Nil
+traverseF f (Cons x xs) = do
+  y <- f x
+  ys <- traverseF f xs
+  pure (Cons y ys)
+
+withSupply : Int -> St -> St
+withSupply n s =
+  { supply = n
+  , consumers = s.consumers
+  , producers = s.producers
+  , made = s.made
+  , fresh = s.fresh
+  , left = s.left
+  }
+
+freshTake : St -> Pair I.Expr Int -> Pair I.Expr St
+freshTake s (MkPair e n) = MkPair e (withSupply n s)
+
+-- (a copy: every binder in it named afresh)
+freshF : I.Expr -> F I.Expr
+freshF e = \s -> freshTake s (I.freshen s.supply e)
+
+-- (a copy made, as `k` (of `c` and `p`), or none, `""`)
+withMade : String -> String -> Maybe I.Def -> St -> St
+withMade cp k (Just d) s =
+  { supply = s.supply
+  , consumers =
+      maybe
+        s.consumers
+        (\c -> M.insert compareString d.key c s.consumers)
+        (consumerOf d.key d.body)
+  , producers =
+      maybe
+        s.producers
+        (\p -> M.insert compareString d.key p s.producers)
+        (producerOf d.key d.body)
+  , made = M.insert compareString cp k s.made
+  , fresh = Cons d s.fresh
+  , left = s.left - 1
+  }
+withMade cp k Nothing s =
+  { supply = s.supply
+  , consumers = s.consumers
+  , producers = s.producers
+  , made = M.insert compareString cp k s.made
+  , fresh = s.fresh
+  , left = s.left
+  }
+
+noteMade : String -> Maybe I.Def -> F Unit
+noteMade cp d = \s ->
+    MkPair MkUnit (withMade cp (maybe "" (\(e : I.Def) -> e.key) d) d s)
+
+-- | each part of it, `f` done to
+kidsF : (I.Expr -> F I.Expr) -> I.Expr -> F I.Expr
+kidsF f (ELam xs b) = do
+  b' <- f b
+  pure (ELam xs b')
+kidsF f (EApp g as) = do
+  g' <- f g
+  as' <- traverseF f as
+  pure (EApp g' as')
+kidsF f (ELet x a b) = do
+  a' <- f a
+  b' <- f b
+  pure (ELet x a' b')
+kidsF f (ERecord fs ts) = do
+  vs <- traverseF f (List.map snd fs)
+  pure (ERecord (List.zipWith (\p v -> MkPair (fst p) v) fs vs) ts)
+kidsF f (EProj e l sh t) = do
+  e' <- f e
+  pure (EProj e' l sh t)
+kidsF f (ETag t as) = do
+  as' <- traverseF f as
+  pure (ETag t as')
+kidsF f (EMatch s arms) = do
+  s' <- f s
+  bs <- traverseF f (List.map I.armBody arms)
+  pure
+      (EMatch
+         s'
+         (List.zipWith (\a b -> MkArm (I.armTag a) (I.armVars a) b) arms bs))
+kidsF f (EPrimCall p as) = do
+  as' <- traverseF f as
+  pure (EPrimCall p as')
+kidsF f (ECall g as) = do
+  as' <- traverseF f as
+  pure (ECall g as')
+kidsF f (EFix x b) = do
+  b' <- f b
+  pure (EFix x b')
+kidsF f e = pure e
+
+-- Copies
+--------------------------------------------------------------------------------
+
+-- | a copy being made: of the consumer `c` (its `arity` parameters, the
+-- | `at`th taken apart, its arms, those that go on) and the producer `p`
+-- | (of `parity`), its key `cp`, and the consumer's parameters as the
+-- | copy has them (all but the `at`th)
+type Fuse =
+  { c : String
+  , arity : Int
+  , at : Int
+  , arms : List I.Arm
+  , goes : List String
+  , p : String
+  , parity : Int
+  , cp : String
+  , cvars : List I.Expr
+  }
+
+-- (the consumer, called on what the producer ends in)
+unfused : Fuse -> I.Expr -> I.Expr
+unfused fu e = EApp (EGlobal fu.c) (insertAt fu.at e fu.cvars)
+
+-- (where the consumer calls itself on the rest: the copy calling itself
+-- where the producer did (`h`, the field), else the consumer on it)
+recallAt : Fuse -> I.Expr -> List I.Expr -> F I.Expr
+recallAt fu h as = case callOf fu.p fu.parity h of
+  Just bs -> do
+    bs' <- traverseF freshF bs
+    pure (EApp (EGlobal fu.cp) (List.append (removeAt fu.at as) bs'))
+  Nothing -> do
+    h' <- freshF h
+    pure (EApp (EGlobal fu.c) (setAt fu.at h' as))
+
+recall : Fuse -> String -> I.Expr -> I.Expr -> F I.Expr
+recall fu r h (EApp (EGlobal g) as) =
+  if strEq g fu.c && List.length as == fu.arity && varAt fu.at r as
+    then recallAt fu h as
+  else do
+    as' <- traverseF (recall fu r h) as
+    pure (EApp (EGlobal g) as')
+recall fu r h (ECall g as) =
+  if strEq g fu.c && List.length as == fu.arity && varAt fu.at r as
+    then recallAt fu h as
+  else do
+    as' <- traverseF (recall fu r h) as
+    pure (ECall g as')
+recall fu r h e = kidsF (recall fu r h) e
+
+-- (what may be put in for a variable: computing it does nothing)
+literal : I.Expr -> Bool
+literal (EVar _) = True
+literal (EInt _) = True
+literal (EFloat _) = True
+literal (EStr _) = True
+literal (EFixed _ _) = True
+literal (EFloat32 _) = True
+literal _ = False
+
+-- (the arm's variables given the fields, in order: a variable or a
+-- literal put in, anything else bound)
+bindsOf : List String -> List I.Expr -> I.Expr -> I.Expr
+bindsOf (Cons v vs) (Cons h hs) b =
+  if literal h then I.subst (M.singleton v h) (bindsOf vs hs b)
+  else ELet v h (bindsOf vs hs b)
+bindsOf _ _ b = b
+
+-- (the consumer's arm `vs -> b`, a copy, for the tag `t hs`)
+armGiven : Fuse -> String -> List I.Expr -> I.Expr -> F I.Expr
+armGiven fu t hs (ELam vs b) =
+  if List.length vs /= List.length hs then pure (unfused fu (ETag t hs))
+  else if elemF t fu.goes
+    then do
+      b' <-
+        recall fu (fromMaybe "" (lastF vs)) (fromMaybe (EInt 0) (lastF hs)) b
+      pure (bindsOf (initF vs) (initF hs) b')
+  else pure (bindsOf vs hs b)
+armGiven fu t hs e = pure (unfused fu (ETag t hs))
+
+armCopy : Fuse -> String -> List I.Expr -> I.Arm -> F I.Expr
+armCopy fu t hs (MkArm _ vs b) = do
+  l <- freshF (ELam vs b)
+  armGiven fu t hs l
+
+findArm : String -> List I.Arm -> Maybe I.Arm
+findArm t Nil = Nothing
+findArm t (Cons a as) = if strEq (I.armTag a) t then Just a else findArm t as
+
+-- (a tag the producer ends in, put through the consumer's arm for it)
+tagEnd : Fuse -> String -> List I.Expr -> F I.Expr
+tagEnd fu t hs = case findArm t fu.arms of
+  Just a -> armCopy fu t hs a
+  Nothing -> pure (unfused fu (ETag t hs))
+
+-- (a place the producer ends at, put through the consumer)
+endAt : Fuse -> I.Expr -> F I.Expr
+endAt fu (ETag t hs) = tagEnd fu t hs
+endAt fu e = case callOf fu.p fu.parity e of
+  Just bs -> pure (EApp (EGlobal fu.cp) (List.append fu.cvars bs))
+  Nothing -> pure (unfused fu e)
+
+-- (at each place it ends at)
+atEnds : Fuse -> I.Expr -> F I.Expr
+atEnds fu (ELet x a b) = do
+  b' <- atEnds fu b
+  pure (ELet x a b')
+atEnds fu (EMatch s arms) = do
+  bs <- traverseF (atEnds fu) (List.map I.armBody arms)
+  pure
+      (EMatch
+         s
+         (List.zipWith (\a b -> MkArm (I.armTag a) (I.armVars a) b) arms bs))
+atEnds fu e = endAt fu e
+
+-- | the copy's key: by its consumer and producer, so the same in every
+-- | program
+fusedKey : String -> String -> String
+fusedKey c p = Spec.rootOf c ^ "$f" ^ Spec.hashText (c ^ " " ^ p)
+
+-- (the consumer's parameters and arms, `cl`, and the producer's, `pl`,
+-- each a copy)
+fusedOf : String
+        -> Consumer
+        -> String
+        -> Producer
+        -> I.Expr
+        -> I.Expr
+        -> F (Maybe I.Def)
+fusedOf c cs p ps (ELam xs (EMatch _ arms)) (ELam ys pb) = do
+  b <-
+    atEnds
+      { c = c
+      , arity = List.length xs
+      , at = cs.at
+      , arms = arms
+      , goes = cs.goes
+      , p = p
+      , parity = List.length ys
+      , cp = fusedKey c p
+      , cvars = List.map (\x -> EVar x) (removeAt cs.at xs)
+      }
+      pb
+  pure
+      (Just
+         (I.mkDef
+            (fusedKey c p)
+            (fusedKey c p)
+            (ELam (List.append (removeAt cs.at xs) ys) b)))
+fusedOf c cs p ps cl pl = pure Nothing
+
+-- (no bigger than its parts, but for a little)
+smallDef : Int -> Maybe I.Def -> Maybe I.Def
+smallDef lim (Just d) = if I.sizeAbove lim d.body then Nothing else Just d
+smallDef lim Nothing = Nothing
+
+-- | the copy of the consumer `c` and the producer `p`
+makeFused : String -> Consumer -> String -> Producer -> F (Maybe I.Def)
+makeFused c cs p ps = do
+  cl <-
+    freshF
+      (ELam
+         cs.params
+         (EMatch (EVar (fromMaybe "" (nthF cs.at cs.params))) cs.arms))
+  pl <- freshF (ELam ps.params ps.body)
+  d <- fusedOf c cs p ps cl pl
+  pure (smallDef (I.size cl + I.size pl + 64) d)
+
+-- Where to fuse
+--------------------------------------------------------------------------------
+
+-- (the consumer's parameters it hands on unchanged, each what the call
+-- gives it)
+fixedSubst : Consumer -> List I.Expr -> M.Map String I.Expr
+fixedSubst cs as =
+  M.fromList
+    compareString
+    (List.map
+       (\t -> MkPair (fst (fst t)) (snd t))
+       (List.filter
+          (\t -> snd (fst t))
+          (removeAt cs.at (List.zip (List.zip cs.params cs.fixed) as))))
+
+-- (the work an arm that goes on does at a cell, given the call's
+-- arguments, cannot fail)
+armWorks : Simplify.SG
+         -> String
+         -> Consumer
+         -> M.Map String I.Expr
+         -> I.Arm
+         -> Bool
+armWorks sg c cs m (MkArm t vs b) =
+  not (elemF t cs.goes)
+  || workPure sg (I.subst m (selfOut (meOf c cs (fromMaybe "" (lastF vs))) b))
+
+-- | whether the call of the consumer `c`, given `as`, may be fused with
+-- | the producer: what it is given but the list, and its work at each
+-- | cell, cannot fail, and it has an arm for each tag the producer ends
+-- | in
+mayFuse : Simplify.SG
+        -> String
+        -> Consumer
+        -> Producer
+        -> List I.Expr
+        -> List I.Expr
+        -> Bool
+mayFuse sg c cs ps as bs =
+  List.length as == List.length cs.params
+  && List.length bs == List.length ps.params
+  && List.all (workPure sg) (removeAt cs.at as)
+  && List.all (armWorks sg c cs (fixedSubst cs as)) cs.arms
+  && List.all (\t -> isJustF (findArm t cs.arms)) ps.tags
+
+fusedCall : Consumer -> List I.Expr -> List I.Expr -> String -> Maybe I.Expr
+fusedCall cs as bs k =
+  if strEq k "" then Nothing
+  else Just (EApp (EGlobal k) (List.append (removeAt cs.at as) bs))
+
+-- (made now, unless no more may be)
+fuseNew : String
+        -> Consumer
+        -> String
+        -> Producer
+        -> List I.Expr
+        -> List I.Expr
+        -> Int
+        -> F (Maybe I.Expr)
+fuseNew c cs p ps as bs left =
+  if left <= 0 then pure Nothing
+  else do
+    d <- makeFused c cs p ps
+    u <- noteMade (c ^ " " ^ p) d
+    pure (maybe Nothing (\(e : I.Def) -> fusedCall cs as bs e.key) d)
+
+fuseWith : String
+         -> Consumer
+         -> String
+         -> Producer
+         -> List I.Expr
+         -> List I.Expr
+         -> F (Maybe I.Expr)
+fuseWith c cs p ps as bs = do
+  s <- get
+  case M.lookup compareString (c ^ " " ^ p) s.made of
+    Just k -> pure (fusedCall cs as bs k)
+    Nothing -> fuseNew c cs p ps as bs s.left
+
+fuseKnown : Simplify.SG
+          -> String
+          -> List I.Expr
+          -> String
+          -> List I.Expr
+          -> Maybe Consumer
+          -> Maybe Producer
+          -> F (Maybe I.Expr)
+fuseKnown sg c as p bs (Just cs) (Just ps) =
+  if mayFuse sg c cs ps as bs then fuseWith c cs p ps as bs else pure Nothing
+fuseKnown sg c as p bs _ _ = pure Nothing
+
+-- | the call of `c`, given `as`, on what the call of `p`, given `bs`,
+-- | gives, as a call of their copy, if it may be
+fuseAt : Simplify.SG
+       -> String
+       -> List I.Expr
+       -> String
+       -> List I.Expr
+       -> F (Maybe I.Expr)
+fuseAt sg c as p bs = do
+  s <- get
+  fuseKnown
+      sg
+      c
+      as
+      p
+      bs
+      (M.lookup compareString c s.consumers)
+      (M.lookup compareString p s.producers)
+
+-- (a call of the consumer `c` on a call, if it is one)
+fuseOn : Simplify.SG
+       -> String
+       -> List I.Expr
+       -> Maybe I.Expr
+       -> F (Maybe I.Expr)
+fuseOn sg c as (Just e) = case globalCall e of
+  Just (MkPair p bs) -> fuseAt sg c as p bs
+  Nothing -> pure Nothing
+fuseOn sg c as Nothing = pure Nothing
+
+-- (a call of `c`: of a consumer on a call of a producer)
+callHere : Simplify.SG -> String -> List I.Expr -> F (Maybe I.Expr)
+callHere sg c as = do
+  s <- get
+  case M.lookup compareString c s.consumers of
+    Just cs -> fuseOn sg c as (nthF cs.at as)
+    Nothing -> pure Nothing
+
+-- A list bound by a `let` and used once: fused where it is used, if what
+-- is computed before that, from the `let` on, cannot fail
+
+-- | the list's variable, and the call of the producer it is bound to
+type Plug = { x : String, p : String, bs : List I.Expr }
+
+type PK = { go : Plug -> I.Expr -> F (Maybe I.Expr) }
+
+consMaybe : I.Expr -> Maybe (List I.Expr) -> Maybe (List I.Expr)
+consMaybe a (Just as) = Just (Cons a as)
+consMaybe a Nothing = Nothing
+
+-- (in the first of them that uses it, all before it pure)
+plugArgs : Simplify.SG -> PK -> Plug -> List I.Expr -> F (Maybe (List I.Expr))
+plugArgs sg k pl Nil = pure Nothing
+plugArgs sg k pl (Cons a rest) =
+  if occurs pl.x a
+    then do
+      r <- k.go pl a
+      pure (maybe Nothing (\a' -> Just (Cons a' rest)) r)
+  else if workPure sg a
+    then do
+      r <- plugArgs sg k pl rest
+      pure (consMaybe a r)
+  else pure Nothing
+
+plainCall : Simplify.SG
+          -> PK
+          -> Plug
+          -> String
+          -> List I.Expr
+          -> F (Maybe I.Expr)
+plainCall sg k pl g as = do
+  r <- plugArgs sg k pl as
+  pure (maybe Nothing (\as' -> Just (EApp (EGlobal g) as')) r)
+
+consumerCall : Simplify.SG
+             -> PK
+             -> Plug
+             -> String
+             -> List I.Expr
+             -> Maybe Consumer
+             -> F (Maybe I.Expr)
+consumerCall sg k pl g as (Just cs) =
+  if varAt cs.at pl.x as then fuseAt sg g as pl.p pl.bs
+  else plainCall sg k pl g as
+consumerCall sg k pl g as Nothing = plainCall sg k pl g as
+
+plugCall : Simplify.SG
+         -> PK
+         -> Plug
+         -> String
+         -> List I.Expr
+         -> F (Maybe I.Expr)
+plugCall sg k pl g as = do
+  s <- get
+  consumerCall sg k pl g as (M.lookup compareString g s.consumers)
+
+plugGo : Simplify.SG -> PK -> Plug -> I.Expr -> F (Maybe I.Expr)
+plugGo sg k pl (ELet y a b) =
+  if occurs pl.x a
+    then do
+      r <- k.go pl a
+      pure (maybe Nothing (\a' -> Just (ELet y a' b)) r)
+  else if workPure sg a
+    then do
+      r <- k.go pl b
+      pure (maybe Nothing (\b' -> Just (ELet y a b')) r)
+  else pure Nothing
+plugGo sg k pl (EApp (EGlobal g) as) = plugCall sg k pl g as
+plugGo sg k pl (ECall g as) = plugCall sg k pl g as
+plugGo sg k pl (ETag t as) = do
+  r <- plugArgs sg k pl as
+  pure (maybe Nothing (\as' -> Just (ETag t as')) r)
+plugGo sg k pl (EPrimCall q as) = do
+  r <- plugArgs sg k pl as
+  pure (maybe Nothing (\as' -> Just (EPrimCall q as')) r)
+plugGo sg k pl (EMatch s arms) =
+  if occurs pl.x s
+    then do
+      r <- k.go pl s
+      pure (maybe Nothing (\s' -> Just (EMatch s' arms)) r)
+  else pure Nothing
+plugGo sg k pl _ = pure Nothing
+
+plugK : Simplify.SG -> PK
+plugK sg = { go = \pl e -> plugGo sg (plugK sg) pl e }
+
+-- (`let x = p bs in b`, `p` a producer)
+letHere : Simplify.SG
+        -> String
+        -> I.Expr
+        -> Maybe (Pair String (List I.Expr))
+        -> F (Maybe I.Expr)
+letHere sg x b (Just (MkPair p bs)) = do
+  s <- get
+  if M.member compareString p s.producers && onceIn x b
+      then (plugK sg).go { x = x, p = p, bs = bs } b
+    else pure Nothing
+letHere sg x b Nothing = pure Nothing
+
+-- | what is fused where it is, if anything
+here : Simplify.SG -> I.Expr -> F (Maybe I.Expr)
+here sg (ELet x a b) = letHere sg x b (globalCall a)
+here sg (EApp (EGlobal c) as) = callHere sg c as
+here sg (ECall c as) = callHere sg c as
+here sg _ = pure Nothing
+
+-- (everything in it fused, its parts first)
+siteAgain : Simplify.SG
+          -> (I.Expr -> F I.Expr)
+          -> I.Expr
+          -> Maybe I.Expr
+          -> F I.Expr
+siteAgain sg go e (Just e2) = go e2
+siteAgain sg go e Nothing = pure e
+
+sites : Simplify.SG -> I.Expr -> F I.Expr
+sites sg e = do
+  e1 <- kidsF (sites sg) e
+  r <- here sg e1
+  siteAgain sg (sites sg) e1 r
+
+-- The pass
+--------------------------------------------------------------------------------
+
+-- | the definitions, the copies made last, and where fresh names go on
+-- | from
+type Fused = { defs : List I.Def, supply : Int }
+
+-- | how many copies a program may have made
+most : Int
+most = 2000
+
+startOf : Int -> List I.Def -> St
+startOf n defs =
+  { supply = n
+  , consumers =
+      List.foldl
+        (\m (d : I.Def) ->
+           maybe
+             m
+             (\c -> M.insert compareString d.key c m)
+             (consumerOf d.key d.body))
+        M.empty
+        defs
+  , producers =
+      List.foldl
+        (\m (d : I.Def) ->
+           maybe
+             m
+             (\p -> M.insert compareString d.key p m)
+             (producerOf d.key d.body))
+        M.empty
+        defs
+  , made = M.empty
+  , fresh = Nil
+  , left = most
+  }
+
+fuseDef : Simplify.SG -> I.Def -> F I.Def
+fuseDef sg d = do
+  b <- sites sg d.body
+  pure (I.mkDef d.key d.name b)
+
+fusedTake : List I.Def -> Pair (List I.Def) St -> Fused
+fusedTake defs (MkPair ds s) =
+  { defs = List.append ds (List.reverse s.fresh), supply = s.supply }
+
+-- | the definitions, each call of a consumer on what a producer gives
+-- | made a call of their copy, names drawn from `supply` on
+-- | >>> List.map (\(d : I.Def) -> d.body) (fuseProgram 100 [I.mkDef "up" "up" (ELam ["a", "b"] (EMatch (EPrimCall "intLt" [EVar "b", EVar "a"]) [MkArm "True" [] (ETag "Nil" []), MkArm "False" [] (ETag "Cons" [EVar "a", EApp (EGlobal "up") [EPrimCall "intAdd" [EVar "a", EInt 1], EVar "b"]])])), I.mkDef "len" "len" (ELam ["n", "l"] (EMatch (EVar "l") [MkArm "Nil" [] (EVar "n"), MkArm "Cons" ["x", "xs"] (EApp (EGlobal "len") [EPrimCall "intAdd" [EVar "n", EInt 1], EVar "xs"])])), I.mkDef "main" "main" (ELet "l" (EApp (EGlobal "up") [EInt 1, EInt 5]) (EApp (EGlobal "len") [EInt 0, EVar "l"]))]).defs
+-- | [ELam ["a", "b"] (EMatch (EPrimCall "intLt" [EVar "b", EVar "a"]) [MkArm "True" [] (ETag "Nil" []), MkArm "False" [] (ETag "Cons" [EVar "a", EApp (EGlobal "up") [EPrimCall "intAdd" [EVar "a", EInt 1], EVar "b"]])]), ELam ["n", "l"] (EMatch (EVar "l") [MkArm "Nil" [] (EVar "n"), MkArm "Cons" ["x", "xs"] (EApp (EGlobal "len") [EPrimCall "intAdd" [EVar "n", EInt 1], EVar "xs"])]), EApp (EGlobal "len$f1050738005x1892983796") [EInt 0, EInt 1, EInt 5], ELam ["n$100", "a$104", "b$105"] (EMatch (EPrimCall "intLt" [EVar "b$105", EVar "a$104"]) [MkArm "True" [] (EVar "n$100"), MkArm "False" [] (EApp (EGlobal "len$f1050738005x1892983796") [EPrimCall "intAdd" [EVar "n$100", EInt 1], EPrimCall "intAdd" [EVar "a$104", EInt 1], EVar "b$105"])])]
+fuseProgram : Int -> List I.Def -> Fused
+fuseProgram supply defs =
+  fusedTake
+    defs
+    (traverseF (fuseDef (Simplify.safeGlobals defs)) defs (startOf supply defs))
