@@ -293,19 +293,23 @@ copyTake s (MkPair e' n) = MkPair e' (withSupply n s)
 copy : I.Expr -> M I.Expr
 copy e = \s -> copyTake s (I.freshen s.supply e)
 
+-- (a body to inline: a copy of it, if the fuel lasts)
+fueled : Maybe I.Expr -> M (Maybe I.Expr)
+fueled (Just b) = do
+  s <- get
+  if s.fuel > 0
+      then do
+        u <- put (withFuel (s.fuel - 1) s)
+        e <- copy b
+        pure (Just e)
+    else pure Nothing
+fueled Nothing = pure Nothing
+
 -- | a definition's body, to inline (a copy), if it may be
 known : String -> M (Maybe I.Expr)
 known g = do
   s <- get
-  case M.lookup compareString g s.defs of
-    Just b ->
-      if s.fuel > 0
-        then do
-          u <- put (withFuel (s.fuel - 1) s)
-          e <- copy b
-          pure (Just e)
-      else pure Nothing
-    Nothing -> pure Nothing
+  fueled (M.lookup compareString g s.defs)
 
 -- | try an inlining: keep it if it is small enough (a copy asked for
 -- | in it is only named: it is made after the definition, if what it
@@ -362,6 +366,12 @@ pureIn safe total (ECall g as) = case M.lookup compareString g total of
   Nothing -> False
 pureIn safe total (EPrimCall p as) =
   not (primFails p) && I.allI (List.map (\a -> pureIn safe total a) as)
+-- (a match has an arm of every tag its scrutinee may have: the
+-- elaborator asks for one)
+pureIn safe total (EMatch sc arms) =
+  pureIn safe total sc
+  && not (List.null arms)
+  && I.allI (List.map (\b -> pureIn safe total (I.armBody b)) arms)
 pureIn safe total (EPrim _) = True
 pureIn safe total (EInt _) = True
 pureIn safe total (EFloat _) = True
@@ -774,6 +784,23 @@ tooBig g s = case M.lookup compareString g s.defs of
   Just b -> I.sizeAbove inlineMax b
   Nothing -> False
 
+-- | a copy (Specialisation, below), to inline: what it is known by --
+-- | simplified with what it was made for, a handler's `bind` and `malg`
+-- | known -- if it does not call itself and is no bigger than a
+-- | definition inlined may be.  (`op`, made for a handler, comes to a
+-- | match on the operation, each arm a few lines of the handler's
+-- | `malg`.)
+knownCopy : St -> String -> Maybe I.Expr
+knownCopy s g =
+  if M.member compareString g s.sp.recipes
+    then case M.lookup compareString g s.sp.all of
+      Just b ->
+        if not (I.sizeAbove inlineMax b) && not (elemStr g (I.globalsIn b))
+          then Just b
+        else Nothing
+      Nothing -> Nothing
+  else Nothing
+
 -- | a known definition, inlined if it may be, and the result simplified
 inlineCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
 inlineCall r f g as = do
@@ -844,11 +871,72 @@ plainCall r f g as = do
               pure (mkApp f as)
         Nothing -> pure (mkApp f as)
 
--- | a known definition called: inlined if it may be
+-- | an argument a body can compute with, more than with a variable: a
+-- | tag (an operation, `Catch c h`), a record.  (Not a lambda: a
+-- | continuation, in a `do`, had the simplifier simplify again what it
+-- | was given inside each copy inlined, the compiler compiling itself
+-- | 50% slower; nor a definition that is a record, a handler or an
+-- | effect's signature: 8% slower, for a handler of four effects at
+-- | once alone.)
+telling : I.Expr -> Bool
+telling (ETag _ _) = True
+telling (ERecord _ _) = True
+telling _ = False
+
+isVar : String -> I.Expr -> Bool
+isVar x (EVar y) = strEq x y
+isVar x _ = False
+
+-- (whether the variable is taken apart in the worklist: matched on,
+-- called, a field of it taken)
+apartW : String -> List I.Expr -> Bool
+apartW x Nil = False
+apartW x (Cons (EMatch sc arms) rest) =
+  isVar x sc || apartW x (Cons sc (I.pushArms arms rest))
+apartW x (Cons (EApp f as) rest) =
+  isVar x f || apartW x (Cons f (I.appendI as rest))
+apartW x (Cons (EProj e _ _ _) rest) = isVar x e || apartW x (Cons e rest)
+apartW x (Cons (ELam _ b) rest) = apartW x (Cons b rest)
+apartW x (Cons (ELet _ a b) rest) = apartW x (Cons a (Cons b rest))
+apartW x (Cons (ERecord fs _) rest) = apartW x (I.pushFields fs rest)
+apartW x (Cons (ETag _ as) rest) = apartW x (I.appendI as rest)
+apartW x (Cons (EPrimCall _ as) rest) = apartW x (I.appendI as rest)
+apartW x (Cons (ECall _ as) rest) = apartW x (I.appendI as rest)
+apartW x (Cons _ rest) = apartW x rest
+
+-- (an argument that tells, its parameter taken apart in the body)
+toldTo : I.Expr -> List String -> List I.Expr -> Bool
+toldTo b (Cons x xs) (Cons a as) =
+  (telling a && apartW x (Cons b Nil)) || toldTo b xs as
+toldTo b _ _ = False
+
+-- | a copy is inlined where it is given something to compute with: an
+-- | argument that tells, for a parameter it takes apart (`op`, made for
+-- | a handler, given `Catch c h`, matches on it)
+worthIt : List I.Expr -> Maybe I.Expr -> Maybe I.Expr
+worthIt as (Just (ELam xs b)) =
+  if toldTo b xs as then Just (ELam xs b) else Nothing
+worthIt as _ = Nothing
+
+-- (a copy called, its body inlined if it may be)
+copyInlined : SK -> I.Expr -> List I.Expr -> Maybe I.Expr -> M I.Expr
+copyInlined r f as (Just b) = attempt (mkApp f as) (r.applyTo b as)
+copyInlined r f as Nothing = pure (mkApp f as)
+
+-- | a copy called, given something to compute with: inlined, if it
+-- | may be (`knownCopy`) and that makes the code no bigger than a little
+copyCall : SK -> I.Expr -> String -> List I.Expr -> M I.Expr
+copyCall r f g as = do
+  s <- get
+  mb <- fueled (worthIt as (knownCopy s g))
+  copyInlined r f as mb
+
+-- | a known definition called: inlined if it may be -- or a copy
 callOf : SK -> I.Expr -> String -> List I.Expr -> Maybe I.Expr -> M I.Expr
 callOf r f g as (Just (ELam xs _)) =
   if allOpaque as && List.length xs == List.length as then plainCall r f g as
   else inlineCall r f g as
+callOf r f g as Nothing = copyCall r f g as
 callOf r f g as _ = inlineCall r f g as
 
 -- | a lambda applied: its parameters bound to the arguments (not
@@ -1076,39 +1164,78 @@ specBody g h marks sh lam1 = pure lam1
 -- computed again each time the function is given its first arguments
 -- and applied -- and nothing that may fail.
 
--- | computing it is little, and cannot fail
-cheap : M.Map String Unit -> I.Expr -> Bool
-cheap safe (EVar _) = True
-cheap safe (EGlobal g) = M.member compareString g safe
-cheap safe (ELam _ _) = True
-cheap safe (EPrim _) = True
-cheap safe (EInt _) = True
-cheap safe (EFloat _) = True
-cheap safe (EStr _) = True
-cheap safe (EBytes _) = True
-cheap safe (EFixed _ _) = True
-cheap safe (EFloat32 _) = True
-cheap safe (ETag _ as) = I.allI (List.map (cheap safe) as)
-cheap safe (ERecord fs _) = I.allI (List.map (cheap safe) (List.map snd fs))
-cheap safe (EProj e _ _ _) = cheap safe e
-cheap safe (ELet _ a b) = cheap safe a && cheap safe b
-cheap safe (EPrimCall p as) =
-  not (primFails p) && I.allI (List.map (cheap safe) as)
-cheap safe _ = False
+-- A way out may also be a known function given fewer arguments than it
+-- takes, `\n -> if n <= 0 then get else (\hd k -> b)` (`get` a copy
+-- for the evidence, taking `hd k`): it only builds a closure, and
+-- given the parameters it is a call.  And a match of what is at hand
+-- whose every arm is cheap is cheap too (an arm of every tag is there:
+-- the elaborator asks for one), `let c = if ... then op (Throw e) else
+-- (\hd k -> ...)` crossed as a binding.
+
+-- | how many parameters a known definition takes (0: not known)
+arityIn : M.Map String I.Expr -> String -> Int
+arityIn all g = case M.lookup compareString g all of
+  Just (ELam xs _) -> List.length xs
+  _ -> 0
+
+-- | how many more arguments than `as` the known function `g` takes
+moreThan : M.Map String I.Expr -> String -> List I.Expr -> Int
+moreThan all g as =
+  if arityIn all g > List.length as then arityIn all g - List.length as else 0
+
+-- | computing it is little, and cannot fail (`all`: the known
+-- | definitions, `Specs.all`)
+cheap : M.Map String Unit -> M.Map String I.Expr -> I.Expr -> Bool
+cheap safe all (EVar _) = True
+cheap safe all (EGlobal g) = M.member compareString g safe
+cheap safe all (ELam _ _) = True
+cheap safe all (EPrim _) = True
+cheap safe all (EInt _) = True
+cheap safe all (EFloat _) = True
+cheap safe all (EStr _) = True
+cheap safe all (EBytes _) = True
+cheap safe all (EFixed _ _) = True
+cheap safe all (EFloat32 _) = True
+cheap safe all (ETag _ as) = I.allI (List.map (cheap safe all) as)
+cheap safe all (ERecord fs _) =
+  I.allI (List.map (cheap safe all) (List.map snd fs))
+cheap safe all (EProj e _ _ _) = cheap safe all e
+cheap safe all (ELet _ a b) = cheap safe all a && cheap safe all b
+cheap safe all (EPrimCall p as) =
+  not (primFails p) && I.allI (List.map (cheap safe all) as)
+cheap safe all (EApp (EGlobal g) as) =
+  moreThan all g as > 0 && I.allI (List.map (cheap safe all) as)
+cheap safe all (EMatch sc arms) =
+  cheap safe all sc
+  && not (List.null arms)
+  && I.allI (List.map (cheap safe all) (List.map I.armBody arms))
+cheap safe all _ = False
 
 minL : List Int -> Int
 minL Nil = 0
 minL (Cons x xs) = List.foldl (\m y -> minI m y) x xs
 
+-- (a known function given fewer arguments than it takes, each cheap:
+-- how many more it takes)
+partialMore : M.Map String Unit
+            -> M.Map String I.Expr
+            -> String
+            -> List I.Expr
+            -> Int
+partialMore safe all g as =
+  if I.allI (List.map (cheap safe all) as) then moreThan all g as else 0
+
 -- | how many parameters every way out of it takes
-lamsOut : M.Map String Unit -> I.Expr -> Int
-lamsOut safe (ELam ys _) = List.length ys
-lamsOut safe (ELet _ a b) = if cheap safe a then lamsOut safe b else 0
-lamsOut safe (EMatch sc arms) =
-  if cheap safe sc && not (List.null arms)
-    then minL (List.map (lamsOut safe) (List.map I.armBody arms))
+lamsOut : M.Map String Unit -> M.Map String I.Expr -> I.Expr -> Int
+lamsOut safe all (ELam ys _) = List.length ys
+lamsOut safe all (ELet _ a b) =
+  if cheap safe all a then lamsOut safe all b else 0
+lamsOut safe all (EMatch sc arms) =
+  if cheap safe all sc && not (List.null arms)
+    then minL (List.map (lamsOut safe all) (List.map I.armBody arms))
   else 0
-lamsOut safe _ = 0
+lamsOut safe all (EApp (EGlobal g) as) = partialMore safe all g as
+lamsOut safe all _ = 0
 
 -- | each way out without its first lambdas, their parameters `zs`
 stripArm : (I.Expr -> I.Expr) -> I.Arm -> I.Arm
@@ -1123,6 +1250,9 @@ stripLams zs (ELam ys b) =
 stripLams zs (ELet x a b) = ELet x a (stripLams zs b)
 stripLams zs (EMatch sc arms) =
   EMatch sc (List.map (stripArm (stripLams zs)) arms)
+-- (a known function given fewer arguments: given the parameters too)
+stripLams zs (EApp (EGlobal g) as) =
+  EApp (EGlobal g) (appendL as (List.map (\z -> EVar z) zs))
 stripLams zs e = e
 
 raiseWith : List String -> I.Expr -> List String -> I.Expr
@@ -1137,15 +1267,15 @@ raiseWith xs b zs = ELam (appendL xs zs) (stripLams zs b)
 raise : I.Expr -> M I.Expr
 raise (ELam xs b) = do
   s <- get
-  if lamsOut s.safe b == 0 then pure (ELam xs b)
+  if lamsOut s.safe s.sp.all b == 0 then pure (ELam xs b)
     else do
-      zs <- freshParams (lamsOut s.safe b)
+      zs <- freshParams (lamsOut s.safe s.sp.all b)
       pure (raiseWith xs b zs)
 raise e = do
   s <- get
-  if lamsOut s.safe e == 0 then pure e
+  if lamsOut s.safe s.sp.all e == 0 then pure e
     else do
-      zs <- freshParams (lamsOut s.safe e)
+      zs <- freshParams (lamsOut s.safe s.sp.all e)
       pure (ELam zs (stripLams zs e))
 
 -- (the arguments a copy is made for)
