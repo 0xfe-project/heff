@@ -146,12 +146,11 @@ unification could not solve (E0350).
 
 The prelude's `Equality` is a type's equality, `equal x y` and `x ==
 y`: its instances are `Int`'s (`equalityInt`), `Float64`'s, `String`'s,
-`Rune`'s, `Bool`'s, `Unit`'s and `Ordering`'s, those of a `List`, a
-`Maybe`, a `Pair` and an `Either` of types that have one
+`Bytes`', `Rune`'s, `Bool`'s, `Unit`'s and `Ordering`'s, those of a
+`List`, a `Maybe`, a `Pair` and an `Either` of types that have one
 (`equalityList`, `equalityMaybe`, `equalityPair`, `equalityEither`),
 and each fixed-width type's module has its own (`int8`'s
-`equalityInt8`), as `bytes` has `equalityBytes` -- an instance named
-by its theory, then its type.  The
+`equalityInt8`) -- an instance named by its theory, then its type.  The
 prelude's other operators are theories' too ([operators](#operators)).
 A search tries only the instances whose type could be the one wanted:
 `x == y` at `Int` tries `equalityInt`, not `equalityList`, whose
@@ -369,7 +368,8 @@ string's, `strSlice`: clamped, a negative index from the end),
 `append` and `concat`, `empty`, `fromList` and `toList` (of
 `UInt8`s), `fromString` (a string's bytes, as they are) and
 `toString` (their text, UTF-8, what is not UTF-8 U+FFFD, as `rune`'s
-`toValid` makes a string), `eq` and its instance, `equalityBytes`, and
+`toValid` makes a string), `eq` (as `==`, whose instance,
+`equalityBytes`, is the prelude's: no import is needed for it), and
 `show`, which writes them as `b"..."`: a byte of ASCII that is printed
 as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any other
 byte `\xff`.
