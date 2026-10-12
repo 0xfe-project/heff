@@ -1,42 +1,57 @@
 #!/usr/bin/env node
-// The formatter (src/heff/syntax/format.hf): every .hf file of the repository
-// (that parses) is formatted (the formatter checks itself that the result
-// means the same and keeps the comments) and formatting it again changes
-// nothing; then cases of comments, blank lines, blocks, watches, doc
-// tests and definitions kept as written (`-- fmt: skip`), some with the
-// exact result.
+// The formatter (src/heff/syntax/format.hf), as `heff fmt` runs it: every
+// .hf file of the repository (that parses) is formatted (the formatter
+// checks itself that the result means the same and keeps the comments)
+// and formatting it again changes nothing; then cases of comments, blank
+// lines, blocks, watches, doc tests and definitions kept as written
+// (`-- fmt: skip`), some with the exact result.
+// (Each a file of its own, a copy, in a directory of the test's: the
+// cases are gathered, then formatted by a few runs of `heff fmt` at once,
+// each of many files; then what they made formatted again, the same way.)
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { heff, root } from "./heff.mjs";
-import { slot } from "./pool.mjs";
 
-// the formatter, compiled to a module of its own, its `format` called
-// directly: `Right` the text laid out, `Left` why not -- a heff String
-// as JavaScript has it, each of its bytes, UTF-8, a code unit
-// (called here, in this process: which takes a slot of the tests'
-// budget for it, as a process run does, until it ends)
-const module = join(root, ".heff", "out", "heff-format.mjs");
-const compiled = await heff(["compile", "src/heff/syntax/format.hf", module, "--backend=esm"]);
-if (compiled.status !== 0) { console.log(`FAIL format: the formatter not compiled\n${compiled.stdout}${compiled.stderr}`); process.exit(1); }
-await slot();
-const { format } = (await import(pathToFileURL(module))).default;
-const bytesOf = (text) => Buffer.from(text, "utf8").toString("latin1");
-const textOf = (bytes) => Buffer.from(bytes, "latin1").toString("utf8");
+const work = join(root, ".heff", "ref", "format");
+rmSync(work, { recursive: true, force: true });
 let checks = 0, failed = 0;
 const expect = (what, ok, got) => { checks++; if (!ok) { failed++; console.log(`FAIL ${what}:\n${got}`); } };
-const run = (src) => {
-  const r = format(bytesOf(src));
-  return r.$ === "Right" ? { ok: true, out: textOf(r.a[0]) } : { ok: false, why: textOf(r.a[0]) };
-};
+
+// the cases, each its text and what is to be held of what `heff fmt` made
+// of it, `{ ok, out }` or `{ ok: false, why }`
+const cases = [];
+const run = (src, then, path) => cases.push({ src, then, path: path ?? join("case", `${cases.length}.hf`) });
 // formatted, and formatting it again changes nothing
-const formats = (what, src, want) => {
-  const r = run(src);
+const formats = (what, src, want, path) => run(src, (r, again) => {
   if (!r.ok) return expect(what, false, "refused: " + r.why);
-  const again = run(r.out);
   expect(what + " (again)", again.ok && again.out === r.out, again.ok ? again.out : "refused: " + again.why);
   if (want !== undefined) expect(what, r.out === want, r.out);
+}, path);
+
+// (the files `heff fmt` is given, at `dir`, each case's text at its own
+// path -- the repository's files under theirs -- formatted by a few runs
+// at once: what each made of its case, or why it would not)
+const formatted = async (dir, texts) => {
+  const files = texts.map(({ path, text }) => {
+    const f = join(dir, path);
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, text);
+    return f;
+  });
+  const runs = 4, said = new Map();
+  await Promise.all(Array.from({ length: runs }, async (_, i) => {
+    const mine = files.filter((_, j) => j % runs === i);
+    if (!mine.length) return;
+    const r = await heff(["fmt", ...mine], { cwd: dir });
+    // (`heff: FILE not formatted: why`, a refusal; a file not said, formatted)
+    for (const m of r.stderr.split(/\n(?=heff: )/)) {
+      const at = /^heff: (.*?) not formatted: ([\s\S]*)$/.exec(m);
+      if (at) said.set(at[1], at[2]);
+    }
+    if (r.status !== 0 && ![...mine].some((f) => said.has(f))) for (const f of mine) said.set(f, `heff fmt: ${r.stderr}${r.error ?? ""}`);
+  }));
+  return files.map((f) => said.has(f) ? { ok: false, why: said.get(f) } : { ok: true, out: readFileSync(f, "utf8") });
 };
 
 // (but those that do not parse, or lex, on purpose, which are left)
@@ -46,8 +61,8 @@ const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "
   .filter((f) => existsSync(join(root, f)));
 for (const f of files) {
   const src = readFileSync(join(root, f), "utf8");
-  if (!unparsed.includes(f)) formats(f, src);
-  else { const r = run(src); expect(f + " is left", !r.ok && /does not (parse|lex)/.test(r.why), JSON.stringify(r)); }
+  if (!unparsed.includes(f)) formats(f, src, undefined, f);
+  else run(src, (r) => expect(f + " is left", !r.ok && /does not (parse|lex)/.test(r.why), JSON.stringify(r)), f);
 }
 
 formats("spacing", "data Bool = True | False\nnot : Bool -> Bool\nnot   True =    False\nnot False = True\n",
@@ -489,8 +504,7 @@ formats("a definition under `-- fmt: skip`, as written", [
 
 // (formatted, it is as it was: what `fmt --check` holds)
 const keptSrc = [...kept, "", ...pick, ""].join("\n");
-const again = run(keptSrc);
-expect("a definition as written is formatted", again.ok && again.out === keptSrc, JSON.stringify(again));
+run(keptSrc, (again) => expect("a definition as written is formatted", again.ok && again.out === keptSrc, JSON.stringify(again)));
 
 // (one definition: the next, of another name, laid out)
 formats("`-- fmt: skip` keeps one definition, not those after it", [
@@ -533,8 +547,8 @@ formats("`-- fmt: skip` elsewhere, a comment like another", [
   "",
 ].join("\n"));
 
-const badKept = run("-- fmt: skip\nx : Bool\nx = (\n");
-expect("a definition kept that does not parse is refused", !badKept.ok && badKept.why.includes("does not parse"), JSON.stringify(badKept));
+run("-- fmt: skip\nx : Bool\nx = (\n", (badKept) =>
+  expect("a definition kept that does not parse is refused", !badKept.ok && badKept.why.includes("does not parse"), JSON.stringify(badKept)));
 
 formats("an implicit argument's default: `:=`, the binder written close", [
   "f : {   x : Bool:=False } -> {a b : Type := Int} -> a -> b -> Bool",
@@ -582,6 +596,13 @@ formats("`instance`: kept before the signature, the equations after it", [
   "eqFloat  =  { equal = floatEq }",
   "",
 ].join("\n"));
+
+// each case formatted; what was, formatted again
+const first = await formatted(join(work, "first"), cases.map((c) => ({ path: c.path, text: c.src })));
+const made = cases.map((c, i) => ({ path: c.path, text: first[i].out, i })).filter((m) => first[m.i].ok);
+const second = await formatted(join(work, "again"), made);
+const again = new Map(made.map((m, j) => [m.i, second[j]]));
+cases.forEach((c, i) => c.then(first[i], again.get(i)));
 
 console.log(`format: ${checks - failed}/${checks} checks hold`);
 process.exit(failed ? 1 : 0);
