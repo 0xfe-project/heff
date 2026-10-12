@@ -182,6 +182,20 @@ Not safe, or not as one thread would do:
   instructions in threads mode, one thread working (queens, below).
 - Windows is not tested.
 
+## Green threads in threads
+
+std.reactor's reactor, where green threads' outside operations wait
+([providers.md](providers.md#outside-operations-done-later)), is each
+thread's own (`HEFF_TLS`): a scheduler's operations are pending in the
+thread it runs in, polled by it alone, and a thread of a spread may run
+a scheduler of its own.  A task of a pool is pure, and waits on
+nothing.  A spread in a green thread is not to be done: what a spread
+gives each thread, the rest of the program, is there only the rest of
+that thread's operation.
+A name std.net resolves under a scheduler is resolved by a thread of
+the system started for it, which touches nothing of heff's, in a
+program built for threads or not.
+
 ## Measured
 
 On a 14-core Apple M-series machine, `test/node/threads.hf`'s

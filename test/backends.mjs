@@ -14,8 +14,8 @@
 // built and run, held to what they are to do (the interpreter runs no
 // provider): what they write, their exit status, loops a million rounds
 // deep, a long loop of operations done at once, and time; an HTTP
-// client, TCP sockets and an HTTP server over them, processes forked,
-// and threads truly at once.
+// client, TCP sockets and an HTTP server over them, green threads
+// waiting on them apart, processes forked, and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawnSync } from "node:child_process";
 import { Agent, createServer, request } from "node:http";
@@ -366,6 +366,52 @@ if (process.platform !== "win32") checks.push((async () => {
     + "a name, localhost, a port picked: yes\na name, localhost: (::1|127\\.0\\.0\\.1)\n$");
   return r.status === 0 && !r.stderr && want.test(r.stdout) ? []
     : [`FAIL sockets (c): status ${r.status}\n${r.stdout}${r.stderr}`];
+})());
+
+// green threads (lib/green.hf) doing std.net's operations, scheduled by
+// std.reactor, by C alone: a thread blocked on a read lets another run,
+// whose write it then reads; fifty clients echoed at once, all holding
+// their connections, by a server of a thread a connection; a connection
+// refused, a name resolved by a thread of its own and one not, while
+// another thread counts; a read ended by the other side's close, one by
+// its own socket closed; and main done while a thread waits to accept.
+// HEFF_TSAN=1: built with ThreadSanitizer too (a name is resolved by a
+// thread of the system), and run again.
+if (process.platform !== "win32") checks.push((async () => {
+  const msgs = [];
+  const p = await programs.c("test/node/green-sockets.hf", "main");
+  if (p.error !== undefined) return [`FAIL green sockets (c): not compiled\n${p.error}`];
+  const bins = [p.cmd];
+  if (process.env.HEFF_TSAN) {
+    const tsan = `${p.cmd}-tsan`;
+    const b = await run("clang", ["-O1", "-g", "-fsanitize=thread", "-w", p.cmd.replace(/-c$/, ".c"), "-o", tsan, "-lm", "-lpthread"]);
+    if (b.status !== 0) msgs.push(`FAIL green sockets (tsan): not built\n${b.stderr}${b.error ?? ""}`);
+    else bins.push(tsan);
+  }
+  const want = [
+    "reader: reads",
+    "writer: runs while the reader waits",
+    "writer: wrote, ok",
+    'reader: read b"hello"',
+    "both done: 2",
+    "refused: ECONNREFUSED",
+    "a name, resolved: ok",
+    "a name not resolved: EAI_...",
+    "counted meanwhile: 1000",
+    'read, the other side closed: b""',
+    "read, its socket closed: EBADF",
+    "echoed, all held open at once: 50",
+    "closed: 50",
+    "main done",
+    "abandoned, main's answer: 7",
+  ].join("\n") + "\n";
+  const [refused] = await freePorts(1);
+  for (const bin of bins) {
+    const r = await run(bin, [String(refused)], { timeout: 60000 });
+    if (r.status !== 0 || r.stderr || r.stdout !== want)
+      msgs.push(`FAIL green sockets (${basename(bin)}): status ${r.status}\n${r.stdout}${r.stderr}`);
+  }
+  return msgs;
 })());
 
 // an HTTP server over them, by C alone (std.http.server): asked by

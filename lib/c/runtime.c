@@ -2996,6 +2996,386 @@ static int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
   return r;
 }
 
+// Outside operations done later: the reactor (#43)
+// ---------------------------------------------------------------------
+//
+// An outside operation that cannot be done without waiting -- a socket
+// not yet readable or writable, a name being resolved, an HTTP transfer
+// -- is a wait (`HeffWait`): what it waits for (a descriptor and its
+// events; or, its `fd` -1, a source's word, below), its next step, how
+// its answer is made of what it did, and how it is let go of undone.
+// Its provider takes its first step itself; where that does not finish
+// it, it hands the wait, the operation's function `f` and the world's
+// continuation `k` to `heff_outside`, which
+//
+// - where no group is being started in (`heff_group` 0: a program with
+//   no scheduler of std.reactor's), waits for it there, polling its
+//   descriptor and stepping it until it is done, the whole program
+//   waiting with it, and gives `f` of its answer to `k`, as the
+//   provider would have;
+// - in a group, keeps it among the pending and gives back
+//   `HEFF_PENDING`, not calling `k`: what comes back, by the calls last
+//   the world's continuations are, to the start (`heff_reactor_start`),
+//   which tells its scheduler that the operation is pending.
+//
+// std.reactor's provider (lib/std/reactor.provider.c) opens a group for
+// a scheduler, starts each of its threads' outside operations in it --
+// a computation run to its end, its value given back, or to a wait,
+// pending -- asks which are finished, and closes it, what is pending in
+// it let go of.  `heff_reactor_finished` polls the descriptors of every
+// pending wait and of every source, steps each that is ready, and for
+// each done, gives `f` of its answer to `k`, the rest of what was
+// started run, up to its end -- its value one of its group's finished
+// -- or to another wait, pending again.  A source (libcurl's, in
+// lib/std/http.provider.c) has descriptors of its own to poll and how
+// long at most to wait for them, and says which of its waits are done
+// (`heff_wait_done`).  Each thread of the system has a reactor of its
+// own (`HEFF_TLS`): its waits are its own, waited for by it alone.
+
+#include <errno.h>
+
+#define HEFF_STEP_DONE 0
+#define HEFF_STEP_WAIT 1
+
+// (what a provider gives back where its operation is pending: no value
+// of the program's)
+#ifdef HEFF_PART
+extern Obj heff_pending_obj;
+#else
+Obj heff_pending_obj = { IMMORTAL, K_STR, 0 };
+#endif
+#define HEFF_PENDING ((V)&heff_pending_obj)
+
+typedef struct HeffWait HeffWait;
+struct HeffWait {
+  int fd;                        // (what it waits for; -1, a source's word)
+  short events;                  // (POLLIN, POLLOUT)
+  int err;                       // (why waiting failed -- errno, poll's, or
+                                 //  EBADF, its socket closed -- its answer's to say)
+  int (*step)(HeffWait *);       // (its next step: HEFF_STEP_DONE, or HEFF_STEP_WAIT,
+                                 //  its `fd` and `events` again)
+  V (*answer)(HeffWait *);       // (its answer, made, the wait let go of)
+  void (*cancel)(HeffWait *);    // (the wait let go of, undone)
+  // (the reactor's)
+  V f, k;
+  int64_t group;
+  int done;
+  HeffWait *prev, *next;
+};
+
+#ifndef _WIN32
+typedef struct HeffSource HeffSource;
+struct HeffSource {
+  // (its descriptors to poll, at `p`, room for `room` of them: how many
+  // it has, which are written only where there is room; at `*ms`, how
+  // long at most to wait for them, -1 for ever)
+  int (*fds)(struct pollfd *p, int room, int *ms);
+  // (after the poll: its descriptors, `n` of them at `p`, as polled)
+  void (*ready)(struct pollfd *p, int n);
+  int on;
+  size_t at;                     // (the reactor's: where its descriptors are
+  int n;                         //  polled, and how many)
+  HeffSource *next;
+};
+#endif
+
+typedef struct { int64_t id, pending; } HeffGroup;
+typedef struct { int64_t group; V v; } HeffFinished;
+
+HEFF_VAR(HEFF_TLS int64_t heff_group);
+HEFF_VAR(HEFF_TLS int64_t heff_last_group);
+HEFF_VAR(HEFF_TLS HeffGroup *heff_groups_open);
+HEFF_VAR(HEFF_TLS size_t heff_ngroups);
+HEFF_VAR(HEFF_TLS size_t heff_capgroups);
+HEFF_VAR(HEFF_TLS HeffWait *heff_waits_first);
+HEFF_VAR(HEFF_TLS HeffWait *heff_waits_last);
+HEFF_VAR(HEFF_TLS HeffFinished *heff_finished);
+HEFF_VAR(HEFF_TLS size_t heff_nfinished);
+HEFF_VAR(HEFF_TLS size_t heff_capfinished);
+#ifndef _WIN32
+HEFF_VAR(HEFF_TLS HeffSource *heff_sources);
+HEFF_VAR(HEFF_TLS struct pollfd *heff_polled);
+HEFF_VAR(HEFF_TLS HeffWait **heff_polled_waits);
+HEFF_VAR(HEFF_TLS size_t heff_cappolled);
+#endif
+
+// (the group open of that number, or NULL)
+static HeffGroup *heff_group_of(int64_t g) {
+  for (size_t i = 0; i < heff_ngroups; i++)
+    if (heff_groups_open[i].id == g) return &heff_groups_open[i];
+  return NULL;
+}
+
+static void heff_wait_link(HeffWait *w) {
+  w->prev = heff_waits_last;
+  w->next = NULL;
+  if (heff_waits_last) heff_waits_last->next = w;
+  else heff_waits_first = w;
+  heff_waits_last = w;
+  HeffGroup *g = heff_group_of(w->group);
+  if (g) g->pending++;
+}
+
+static void heff_wait_unlink(HeffWait *w) {
+  if (w->prev) w->prev->next = w->next;
+  else heff_waits_first = w->next;
+  if (w->next) w->next->prev = w->prev;
+  else heff_waits_last = w->prev;
+  w->prev = w->next = NULL;
+  HeffGroup *g = heff_group_of(w->group);
+  if (g) g->pending--;
+}
+
+// (a wait done, as its source says: given its answer at the next turn)
+static void heff_wait_done(HeffWait *w) { w->done = 1; }
+
+// (the waits on the descriptor `fd`, which is being closed: done, their
+// answers that it was -- EBADF -- not a poll of a descriptor that may be
+// another's by then)
+static void heff_reactor_closing(int fd) {
+  for (HeffWait *w = heff_waits_first; w; w = w->next)
+    if (w->fd == fd && !w->done) {
+      w->err = EBADF;
+      w->done = 1;
+    }
+}
+
+#ifndef _WIN32
+// (a source of waits, polled with the others from now on, by this thread)
+static void heff_reactor_source(HeffSource *s) {
+  if (s->on) return;
+  s->on = 1;
+  s->next = heff_sources;
+  heff_sources = s;
+}
+#endif
+
+// (the operation of the wait `w` -- its first step taken, not done --
+// waited for here, or, in a group, pending: see above)
+static V heff_outside(HeffWait *w, V f, V k) {
+  if (heff_group) {
+    w->f = f;
+    w->k = k;
+    w->group = heff_group;
+    w->done = 0;
+    heff_wait_link(w);
+    return HEFF_PENDING;
+  }
+#ifndef _WIN32
+  for (;;) {
+    if (w->fd < 0) heff_fail("an outside operation waits for no descriptor, and no scheduler is there to wait for it");
+    struct pollfd p = { w->fd, w->events, 0 };
+    if (poll(&p, 1, -1) < 0) {
+      if (errno == EINTR) continue;
+      w->err = errno;
+      break;
+    }
+    if (w->step(w) == HEFF_STEP_DONE) break;
+  }
+#endif
+  V x = heff_answer(f, w->answer(w));
+  return heff_tail(k, 1, &x);
+}
+
+// (what was started in group `g` come to its value `v`: one of the
+// group's finished -- or, the group closed meanwhile, let go of)
+static void heff_finished_put(int64_t g, V v) {
+  if (!heff_group_of(g)) {
+    heff_drop(v);
+    return;
+  }
+  if (heff_nfinished == heff_capfinished) {
+    size_t cap = heff_capfinished ? heff_capfinished * 2 : 16;
+    HeffFinished *m = heff_alloc(cap * sizeof *m);
+    if (heff_nfinished) memcpy(m, heff_finished, heff_nfinished * sizeof *m);
+    free(heff_finished);
+    heff_finished = m;
+    heff_capfinished = cap;
+  }
+  heff_finished[heff_nfinished].group = g;
+  heff_finished[heff_nfinished].v = v;
+  heff_nfinished++;
+}
+
+// (a function given its argument, and nothing else: where what is
+// started comes to its end)
+static V heff_kept(V self, V *a) {
+  heff_drop(self);
+  return a[0];
+}
+
+// (what group `g` started, the rest of it run in the group, from `k`
+// given `x`: to its end, its value finished, or to a wait, pending)
+static void heff_reactor_run(int64_t g, V k, V x) {
+  int64_t up = heff_group;
+  heff_group = g;
+  V r = heff_tr(heff_app1(k, x));
+  heff_group = up;
+  if (r != HEFF_PENDING) heff_finished_put(g, r);
+}
+
+// | A group of its own, for a scheduler: its number.
+static int64_t heff_reactor_open(void) {
+  if (heff_ngroups == heff_capgroups) {
+    size_t cap = heff_capgroups ? heff_capgroups * 2 : 8;
+    HeffGroup *m = heff_alloc(cap * sizeof *m);
+    if (heff_ngroups) memcpy(m, heff_groups_open, heff_ngroups * sizeof *m);
+    free(heff_groups_open);
+    heff_groups_open = m;
+    heff_capgroups = cap;
+  }
+  int64_t g = ++heff_last_group;
+  heff_groups_open[heff_ngroups].id = g;
+  heff_groups_open[heff_ngroups].pending = 0;
+  heff_ngroups++;
+  return g;
+}
+
+// | `c`, a computation of the world (its handler's monad: a function of
+// | its continuation), started in group `g`: run to its end, its value;
+// | or to a wait, `HEFF_PENDING`, its value to be one of the group's
+// | finished.  `c` consumed.
+static V heff_reactor_start(int64_t g, V c) {
+  int64_t up = heff_group;
+  heff_group = g;
+  V r = heff_tr(heff_app1(c, heff_clo(heff_kept, 1, 0, NULL)));
+  heff_group = up;
+  return r;
+}
+
+// (the waits done -- stepped done, or said so -- taken out of the
+// pending, then each given its answer, the rest of what it was started
+// in run, in the order they were pending)
+static void heff_reactor_wake(void) {
+  HeffWait *first = NULL, *last = NULL;
+  for (HeffWait *w = heff_waits_first, *next; w; w = next) {
+    next = w->next;
+    if (!w->done) continue;
+    heff_wait_unlink(w);
+    if (last) last->next = w;
+    else first = w;
+    last = w;
+  }
+  for (HeffWait *w = first, *next; w; w = next) {
+    next = w->next;
+    V f = w->f, k = w->k;
+    int64_t g = w->group;
+    V x = heff_answer(f, w->answer(w));
+    heff_reactor_run(g, k, x);
+  }
+}
+
+#ifndef _WIN32
+// (room for `n` descriptors polled)
+static void heff_polled_room(size_t n) {
+  if (n <= heff_cappolled && heff_polled) return;
+  size_t cap = heff_cappolled ? heff_cappolled : 64;
+  while (cap < n) cap *= 2;
+  free(heff_polled);
+  free(heff_polled_waits);
+  heff_polled = heff_alloc(cap * sizeof *heff_polled);
+  heff_polled_waits = heff_alloc(cap * sizeof *heff_polled_waits);
+  heff_cappolled = cap;
+}
+
+// (one turn: every pending wait's descriptor and every source's polled
+// -- for as long as they say, where `wait`, else not waiting -- each
+// ready stepped, and those done woken)
+static void heff_reactor_turn(int wait) {
+  size_t n = 0;
+  int ms = wait ? -1 : 0;
+  for (HeffWait *w = heff_waits_first; w; w = w->next) {
+    if (w->done) ms = 0;
+    else if (w->fd >= 0) n++;
+  }
+  size_t mine = n;
+  for (HeffSource *s = heff_sources; s; s = s->next) {
+    int t = -1;
+    s->n = s->fds(NULL, 0, &t);
+    n += (size_t)s->n;
+  }
+  heff_polled_room(n);
+  n = 0;
+  for (HeffWait *w = heff_waits_first; w; w = w->next)
+    if (!w->done && w->fd >= 0) {
+      heff_polled[n].fd = w->fd;
+      heff_polled[n].events = w->events;
+      heff_polled[n].revents = 0;
+      heff_polled_waits[n] = w;
+      n++;
+    }
+  for (HeffSource *s = heff_sources; s; s = s->next) {
+    int t = -1;
+    s->at = n;
+    s->fds(heff_polled + n, s->n, &t);
+    for (int i = 0; i < s->n; i++) heff_polled[n + (size_t)i].revents = 0;
+    n += (size_t)s->n;
+    if (t >= 0 && (ms < 0 || t < ms)) ms = t;
+  }
+  if (n == 0 && ms < 0) heff_fail("the reactor waits, with nothing to wait for");
+  int r = poll(heff_polled, (nfds_t)n, ms);
+  if (r < 0 && errno != EINTR) heff_fail("the reactor's poll failed");
+  if (r < 0) for (size_t i = 0; i < n; i++) heff_polled[i].revents = 0;
+  for (size_t i = 0; i < mine; i++)
+    if (heff_polled[i].revents) {
+      HeffWait *w = heff_polled_waits[i];
+      if (!w->done && w->step(w) == HEFF_STEP_DONE) w->done = 1;
+    }
+  for (HeffSource *s = heff_sources; s; s = s->next) s->ready(heff_polled + s->at, s->n);
+  heff_reactor_wake();
+}
+#else
+static void heff_reactor_turn(int wait) { (void)wait; heff_reactor_wake(); }
+#endif
+
+// | Group `g`'s finished, since it was last asked, in the order they
+// | were: where `wait`, waiting for one at least while any of it is
+// | pending; none where none is.
+static V heff_reactor_finished(int64_t g, int wait) {
+  for (;;) {
+    int some = 0;
+    for (size_t i = 0; i < heff_nfinished && !some; i++) some = heff_finished[i].group == g;
+    HeffGroup *gr = heff_group_of(g);
+    if (some || !gr || gr->pending == 0) break;
+    heff_reactor_turn(wait);
+    if (!wait) break;
+  }
+  // (the group's taken, in order; the others' kept, in theirs)
+  V l = NTAG(TAG_Nil);
+  for (size_t i = heff_nfinished; i-- > 0;)
+    if (heff_finished[i].group == g) l = heff_cons(heff_finished[i].v, l);
+  size_t kept = 0;
+  for (size_t i = 0; i < heff_nfinished; i++)
+    if (heff_finished[i].group != g) heff_finished[kept++] = heff_finished[i];
+  heff_nfinished = kept;
+  return l;
+}
+
+// | Group `g` closed: what is pending in it let go of, undone, and what
+// | of it is finished and not asked for.
+static void heff_reactor_close(int64_t g) {
+  for (HeffWait *w = heff_waits_first, *next; w; w = next) {
+    next = w->next;
+    if (w->group != g) continue;
+    heff_wait_unlink(w);
+    V f = w->f, k = w->k;
+    w->cancel(w);
+    heff_drop(f);
+    heff_drop(k);
+  }
+  size_t kept = 0;
+  for (size_t i = 0; i < heff_nfinished; i++) {
+    if (heff_finished[i].group == g) heff_drop(heff_finished[i].v);
+    else heff_finished[kept++] = heff_finished[i];
+  }
+  heff_nfinished = kept;
+  for (size_t i = 0; i < heff_ngroups; i++)
+    if (heff_groups_open[i].id == g) {
+      heff_groups_open[i] = heff_groups_open[--heff_ngroups];
+      break;
+    }
+}
+
 // Running
 // ---------------------------------------------------------------------
 

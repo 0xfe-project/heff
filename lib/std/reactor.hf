@@ -1,0 +1,119 @@
+-- Outside operations begun now and finished later, as an effect
+-- (lib/co.hf): what lets green threads (lib/green.hf) go on while one
+-- of them waits on a socket, a name being resolved or an HTTP request.
+-- The C backend's alone (lib/std/reactor.provider.c, and the runtime's
+-- reactor, lib/c/runtime.c): a page's providers do not wait.  Import it
+-- by a name, `import std.reactor as Reactor`.
+--
+-- A group is opened for a scheduler; each of its threads' outside
+-- operations is started in it -- a computation of the world, run there
+-- until it is done or until an operation of std.net or std.http would
+-- wait, which is then pending, the rest of the computation kept with
+-- it -- and the group asked which of those pending are finished, each
+-- its computation's value, run to its end once its operation was done.
+-- Where no group is being started in, an operation waits where it is,
+-- the whole program with it.  `Reactor.scheduled` is green threads
+-- scheduled so: `lib/green.hf`'s scheduler, its `Outside` this one.
+
+import co
+import green
+
+-- | A group of computations started, each of which comes to a `t`.
+data Group t = MkGroup Int
+
+-- | A computation started, whatever it comes to: done, its value, or
+-- | pending, none, given to what comes after.
+type Begun (m : Type -> Type) x =
+  (r : Type) -> ((t : Type) -> m t -> (Maybe t -> x) -> r) -> r
+
+-- | What a group's finished are given to, whatever they are.
+type Finished x = (r : Type) -> ((t : Type) -> (List t -> x) -> r) -> r
+
+begunWith : {m : Type -> Type}
+          -> {t x : Type}
+          -> m t
+          -> (Maybe t -> x)
+          -> Begun m x
+begunWith c k = \r use -> use t c k
+
+finishedWith : {t x : Type} -> (List t -> x) -> Finished x
+finishedWith k = \r use -> use t k
+
+data ReactorF (m : Type -> Type) x
+  = Open (Int -> x)
+  | Start Int (Begun m x)
+  | Finish Int Bool (Finished x)
+  | Close Int x
+
+-- | Outside operations begun now and finished later, as an effect.
+reactor : HFunctor
+reactor =
+  { f = ReactorF
+  , hfmap = \m g p -> case p of
+      Open k -> Open (\i -> g (k i))
+      Start i b -> Start i (\r use -> b r (\t c k -> use t c (\v -> g (k v))))
+      Finish i w f -> Finish i w (\r use -> f r (\t k -> use t (\l -> g (k l))))
+      Close i x -> Close i (g x)
+  , hmap = \m n nt p -> case p of
+      Open k -> Open k
+      Start i b -> Start i (\r use -> b r (\t c k -> use t (nt c) k))
+      Finish i w f -> Finish i w f
+      Close i x -> Close i x
+  }
+
+-- | A group of its own.
+open : {e : HFunctor} -> {{rx : reactor <: e}} -> {t : Type} -> Co e (Group t)
+open = bind (op (rx (Open (\i -> i))) val) (\i -> pure (MkGroup i))
+
+-- | `c` started in the group: run until it is done, `Just` its value;
+-- | or until an operation of it would wait, `Nothing`, its value to be
+-- | one of the group's `finished`.
+start : {e : HFunctor}
+      -> {{rx : reactor <: e}}
+      -> {t : Type}
+      -> Group t
+      -> Co e t
+      -> Co e (Maybe t)
+start (MkGroup i) c = op (rx (Start i (begunWith c (\r -> r)))) val
+
+-- | The group's computations finished since it was last asked, in the
+-- | order they were: where `wait`, waiting for one at least, while any
+-- | of it is pending; none where none is.
+finished : {e : HFunctor}
+         -> {{rx : reactor <: e}}
+         -> {t : Type}
+         -> Group t
+         -> Bool
+         -> Co e (List t)
+finished (MkGroup i) wait = op (rx (Finish i wait (finishedWith (\l -> l)))) val
+
+-- | The group closed: what of it is pending let go of, undone -- a
+-- | socket being connected closed, a request let go of -- and what of it
+-- | is finished and not asked for.
+close : {e : HFunctor}
+      -> {{rx : reactor <: e}}
+      -> {t : Type}
+      -> Group t
+      -> Co e Unit
+close (MkGroup i) = op (rx (Close i MkUnit)) val
+
+-- | A scheduler's outside operations, begun, the other threads going on
+-- | while they are pending.
+outside : {e : HFunctor} -> {{rx : reactor <: e}} -> Outside e
+outside =
+  { Group = Group
+  , group = open
+  , start = \g c -> start g c
+  , finished = \g wait -> finished g wait
+  , close = \g -> close g
+  }
+
+-- | `c` and the threads it spawns, round robin (lib/green.hf), each
+-- | thread's outside operations pending while the others go on: main's
+-- | answer, or Nothing where every thread waits on a channel.
+scheduled : (e : HFunctor)
+          -> {{rx : reactor <: e}}
+          -> {a : Type}
+          -> Co (green <+> e) a
+          -> Co e (Maybe a)
+scheduled e c = scheduledWith e outside c

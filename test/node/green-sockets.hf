@@ -1,0 +1,285 @@
+-- Green threads (lib/green.hf) doing std.net's operations, scheduled by
+-- std.reactor (`Reactor.scheduled`): while one waits on a socket, the
+-- others go on.  By C alone (test/backends.mjs).
+--
+--   main     a thread blocked on a read lets another run, whose write
+--            it then reads; many clients echoed at once by a server of
+--            green threads, a thread a connection; a connection refused,
+--            a name resolved by a thread of its own and one not
+--            resolved, while another thread counts; a read ended by the
+--            other side closing, and one by its own socket closed; and
+--            main done while a thread still waits to accept, let go of
+--
+-- Each thread says what it does, in the order the schedule has it.
+
+import bytes as Bytes
+import co
+import green
+import std.io
+import std.net as Net
+import std.process
+import std.reactor as Reactor
+
+world : HFunctor
+world = stdio <+> (Net.net <+> (Reactor.reactor <+> process))
+
+-- (each scheduled: green threads first, then the world)
+gw : HFunctor
+gw = green <+> world
+
+-- (where a connection was not made, or a read failed: why)
+showFailed : {a : Type} -> Either Net.NetError a -> String
+showFailed (Left err) = err.name
+showFailed (Right _) = "ok"
+
+showRead : Either Net.NetError Bytes -> String
+showRead (Left err) = err.name
+showRead (Right b) = Bytes.show b
+
+-- (the value of a `Right`; where there is none, the program abandoned:
+-- the test's own sockets, which do not fail)
+must : {a : Type} -> Either Net.NetError a -> a
+must (Right x) = x
+must (Left err) = abandon
+
+repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
+repeatG 0 c = pure MkUnit
+repeatG n c = bind c (\u -> repeatG (n - 1) c)
+
+-- (n values received on ch, added up)
+recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum ch 0 acc = pure acc
+recvSum ch n acc = do
+  x <- recv ch
+  recvSum ch (n - 1) (acc + x)
+
+-- A read lets a write run
+--------------------------------------------------------------------------------
+
+-- | A thread reads a connection nothing has been written to yet: it
+-- | waits, and another thread runs meanwhile and writes to its other
+-- | side, which the first then reads.
+readThenWrite : {e : HFunctor}
+              -> {{gr : green <: e}}
+              -> {{io : stdio <: e}}
+              -> {{nt : Net.net <: e}}
+              -> Net.Listener
+              -> Int
+              -> Co e Unit
+readThenWrite l port = do
+  c <- Net.connect "127.0.0.1" port
+  s <- Net.accept l
+  done <- newChan
+  spawn (do
+    print "reader: reads"
+    got <- Net.read (must c) 100
+    print ("reader: read " ^ showRead got)
+    send done 1)
+  spawn (do
+    print "writer: runs while the reader waits"
+    w <- Net.write (must s) b"hello"
+    print ("writer: wrote, " ^ showFailed w)
+    send done 1)
+  n <- recvSum done 2 0
+  Net.close (must c)
+  Net.close (must s)
+  print ("both done: " ^ showInt n)
+
+-- Echo, many at once
+--------------------------------------------------------------------------------
+
+-- (a read's bytes written back, then `again`; at the end, closed)
+echoed : {e : HFunctor}
+       -> {{nt : Net.net <: e}}
+       -> (Unit -> Co e Unit)
+       -> Net.Connection
+       -> Either Net.NetError Bytes
+       -> Co e Unit
+echoed again c (Right b) =
+  if Bytes.length b == 0 then Net.close c
+  else bind (Net.write c b) (\w -> again MkUnit)
+echoed again c (Left err) = Net.close c
+
+-- (what is read written back, until the other side ends)
+echo : {e : HFunctor} -> {{nt : Net.net <: e}} -> Net.Connection -> Co e Unit
+echo c = bind (Net.read c 4096) (echoed (\u -> echo c) c)
+
+-- (each connection accepted, echoed by a thread of its own; for ever)
+echoServer : {e : HFunctor}
+           -> {{gr : green <: e}}
+           -> {{nt : Net.net <: e}}
+           -> Net.Listener
+           -> Co e Unit
+echoServer l = do
+  c <- Net.accept l
+  spawn (echo (must c))
+  echoServer l
+
+-- (n bytes read, in as many reads as they take)
+readN : {e : HFunctor}
+      -> {{nt : Net.net <: e}}
+      -> Net.Connection
+      -> Int
+      -> Bytes
+      -> Co e Bytes
+readN c n acc =
+  if Bytes.length acc >= n then pure acc
+  else bind (Net.read c (n - Bytes.length acc)) (\r -> readN c n (Bytes.append acc (must r)))
+
+-- | A client: its line written, echoed back; it holds its connection
+-- | until every client has had its echo (`all`, each of them sent one
+-- | on `back`, and main sends `go` once all have), then says it is done.
+client : {e : HFunctor}
+       -> {{gr : green <: e}}
+       -> {{nt : Net.net <: e}}
+       -> Int
+       -> Int
+       -> Int
+       -> Int
+       -> Co e Unit
+client port back go i = do
+  c <- Net.connect "127.0.0.1" port
+  let line = Bytes.fromString ("client " ^ showInt i ^ "\n")
+  w <- Net.write (must c) line
+  got <- readN (must c) (Bytes.length line) Bytes.empty
+  send back (if got == line then 1 else 0)
+  x <- recv go
+  Net.close (must c)
+  send back x
+
+-- | n clients, each its line echoed, all holding their connections at
+-- | once: a server serving one connection at a time would never echo the
+-- | second.
+echoes : {e : HFunctor}
+       -> {{gr : green <: e}}
+       -> {{io : stdio <: e}}
+       -> {{nt : Net.net <: e}}
+       -> Net.Listener
+       -> Int
+       -> Int
+       -> Co e Unit
+echoes l port n = do
+  spawn (echoServer l)
+  back <- newChan
+  go <- newChan
+  repeatG n (bind newChan (\i -> spawn (client port back go i)))
+  echoed <- recvSum back n 0
+  print ("echoed, all held open at once: " ^ showInt echoed)
+  repeatG n (send go 1)
+  closed <- recvSum back n 0
+  print ("closed: " ^ showInt closed)
+
+-- What fails, while others run
+--------------------------------------------------------------------------------
+
+-- (a thread counting to n, a yield at each)
+counting : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Unit
+counting ch n i =
+  if i >= n then send ch i
+  else bind yield (\u -> counting ch n (i + 1))
+
+-- | A connection refused, a name resolved (by a thread of its own) and
+-- | one not, each while another thread counts.
+failures : {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{io : stdio <: e}}
+         -> {{nt : Net.net <: e}}
+         -> Int
+         -> Co e Unit
+failures refused = do
+  counted <- newChan
+  spawn (counting counted 1000 0)
+  r <- Net.connect "127.0.0.1" refused
+  print ("refused: " ^ showFailed r)
+  l <- Net.listen "localhost" 0 4
+  at <- Net.local (must l)
+  c <- Net.connect "localhost" (must at).port
+  print ("a name, resolved: " ^ showFailed c)
+  bad <- Net.connect "no-such-host.invalid" 80
+  print ("a name not resolved: " ^ (if startsWith "EAI_" (showFailed bad) then "EAI_..." else showFailed bad))
+  n <- recv counted
+  print ("counted meanwhile: " ^ showInt n)
+  Net.close (must c)
+  Net.close (must l)
+
+-- | A read the other side ends by closing its connection, and a read
+-- | whose own connection another thread closes.
+closings : {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{io : stdio <: e}}
+         -> {{nt : Net.net <: e}}
+         -> Net.Listener
+         -> Int
+         -> Co e Unit
+closings l port = do
+  done <- newChan
+  c <- Net.connect "127.0.0.1" port
+  s <- Net.accept l
+  spawn (bind (Net.read (must c) 100) (\r -> bind (print ("read, the other side closed: " ^ showRead r)) (\u -> send done 1)))
+  spawn (Net.close (must s))
+  x <- recv done
+  d <- Net.connect "127.0.0.1" port
+  t <- Net.accept l
+  spawn (bind (Net.read (must d) 100) (\r -> bind (print ("read, its socket closed: " ^ showRead r)) (\u -> send done 1)))
+  spawn (Net.close (must d))
+  y <- recv done
+  Net.close (must t)
+
+-- | Main done while a thread waits to accept: the schedule ends, the
+-- | accept let go of.
+abandoned : {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> {{nt : Net.net <: e}}
+          -> Co e Int
+abandoned = do
+  l <- Net.listen "127.0.0.1" 0 4
+  spawn (bind (Net.accept (must l)) (\c -> pure MkUnit))
+  yield
+  pure 7
+
+-- The program
+--------------------------------------------------------------------------------
+
+program : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> Int
+        -> Co e Unit
+program refused = do
+  l <- Net.listen "127.0.0.1" 0 64
+  at <- Net.local (must l)
+  let port = (must at).port
+  readThenWrite (must l) port
+  failures refused
+  closings (must l) port
+  echoes (must l) port 50
+
+-- (the first argument, a number)
+firstInt : List String -> Int
+firstInt (a :: _) = fromMaybe 1 (parseInt a)
+firstInt Nil = 1
+
+-- (a port nothing listens on, the first argument)
+refusedPort : {e : HFunctor} -> {{sys : process <: e}} -> Co e Int
+refusedPort = bind args (\as -> pure (firstInt as))
+
+main : Co world Unit
+main = do
+  refused <- refusedPort (sys := \p -> InR (InR (InR p)))
+  r <-
+    Reactor.scheduled
+      world
+      (rx := \p -> InR (InR (InL p)))
+      (program
+         (gr := \p -> InL p)
+         (io := \p -> InR (InL p))
+         (nt := \p -> InR (InR (InL p)))
+         refused)
+  print (ev := \p -> InL p) (maybe "a deadlock" (\u -> "main done") r)
+  a <-
+    Reactor.scheduled
+      world
+      (rx := \p -> InR (InR (InL p)))
+      (abandoned (gr := \p -> InL p) (nt := \p -> InR (InR (InL p))))
+  print (ev := \p -> InL p) ("abandoned, main's answer: " ^ maybe "none" showInt a)

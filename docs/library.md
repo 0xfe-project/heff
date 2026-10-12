@@ -49,7 +49,9 @@ What is above, in `lib/`, is pure, the same on every backend.
   `std.http` (an HTTP client), `std.net` (TCP sockets), `std.progress`
   (what a program is doing, drawn on a terminal), `std.thread` (threads
   truly at once: a pool, spreads, and `Par` handled by them --
-  [threads.md](threads.md)): effects of the system, C's alone;
+  [threads.md](threads.md)), `std.reactor` (outside operations begun
+  now and finished later, for [green threads](#green-threads)):
+  effects of the system, C's alone;
 - `std.http.server`, an HTTP/1.1 server written over `std.net`, C's
   as `std.net` is;
 - `std.ref` (the world's cells) and `std.time`: effects needed on both
@@ -159,10 +161,11 @@ echo : {e : HFunctor} -> {{nt : Net.net <: e}} -> Net.Connection -> Co e Unit
 echo c = bind (Net.read c 65536) (echoed (\u -> echo c) c)
 ```
 
-An operation waits until it is done, the whole program with it: the
-green threads of a scheduler in the language do not go on while one of
-them reads (#43 is to change that, the heff side as it is).  Windows
-has no sockets yet: an operation there fails the program.
+An operation waits until it is done, the whole program with it --
+unless it is a green thread's, scheduled by `Reactor.scheduled`
+([green threads](#green-threads)): then the other threads go on while
+it waits, the heff side as it is.  Windows has no sockets yet: an
+operation there fails the program.
 
 `std.http.server` is an HTTP/1.1 server, a library in heff over
 `std.net`: import it by a name, `import std.http.server as Server`.
@@ -257,6 +260,44 @@ scheduler does not handle -- are done as its `Outside` says
 (`scheduledWith e o c`).  `scheduled`'s, `blocking e`, does each where
 it is started, every thread waiting with it: a pure world's, or a
 page's, whose providers do not wait.
+
+On the C backend, `std.reactor` (`import std.reactor as Reactor`, its
+effect `Reactor.reactor` in the world) has them wait apart:
+`Reactor.scheduled e c` is `scheduledWith e Reactor.outside c`, where
+a thread whose `Net.read`, `Net.accept`, `Net.connect` or `Net.write`
+would wait is pending while the other threads go on, and goes on with its answer once it is done --
+from the thread's own view the call returns its result, as it always
+did.  When no thread is ready, the scheduler waits for the first
+pending one to be done (the system's `poll`, of every socket waited
+on); while threads are ready, every 64 turns it puts among them those
+done meanwhile.  A name that is no address (`localhost`, a host's) is
+resolved by a thread of the system of its own, the others going on.
+When main is done, what the other threads have pending is let go of:
+a connection being made closed.
+
+```haskell
+import co
+import green
+import std.io
+import std.net as Net
+import std.process
+import std.reactor as Reactor
+
+world : HFunctor
+world = stdio <+> (Net.net <+> (Reactor.reactor <+> process))
+
+-- (`c` and its threads, each one's sockets waited on apart)
+main : Co world Unit
+main = do
+  r <- Reactor.scheduled world (rx := \p -> InR (InR (InL p))) program
+  ...
+```
+
+How it is done -- an operation begun, pending, and finished later -- is
+the providers' ([providers.md](providers.md#outside-operations-done-later)):
+std.net's are, others' wait where they are, every thread with them.  It is one reactor for each thread of the system: green
+threads in a thread of std.thread's are that thread's own
+([threads.md](threads.md#green-threads-in-threads)).
 
 ## Examples
 

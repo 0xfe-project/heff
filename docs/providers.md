@@ -16,7 +16,7 @@ library is split by backend ([library.md](library.md#the-batteries)):
 
 - `lib/std/`'s effects are the system's, with a provider in C:
   `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.http`,
-  `std.net`;
+  `std.net`, `std.thread`, `std.reactor`;
 - `std.ref` and `std.time` are needed on both sides: one module each,
   with a provider in C and one in JavaScript of no `$host`;
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
@@ -114,3 +114,48 @@ element), reads that field by `heff_tget_v` (as `heff_rget_v`), not by
 
 A provider is given a rune as a number in JavaScript, and in C as a
 word of its code point (`INT_OF`, `MK_INT`).
+
+## Outside operations done later
+
+An operation of the system that must wait -- a socket not yet
+readable, a name being resolved -- is done in steps, by the runtime's
+reactor (lib/c/runtime.c, "Outside operations done later"), so that
+green threads ([library.md](library.md#green-threads)) go on while it
+waits.  A provider's operation is a `HeffWait` (its first member, of a
+struct of the provider's own):
+
+- `fd` and `events` (`POLLIN`, `POLLOUT`): what it waits for; `fd` -1
+  where a source says when it is done (below);
+- `step(w)`: what can be done now, without waiting: `HEFF_STEP_DONE`,
+  or `HEFF_STEP_WAIT`, its `fd` and `events` set again;
+- `answer(w)`: its answer, a value of the program's, made of what it
+  did -- or, where `w->err` is set, of why waiting failed (poll's
+  errno, or `EBADF`: its descriptor closed meanwhile) -- the wait let
+  go of;
+- `cancel(w)`: the wait let go of undone (what it made closed).
+
+The provider takes the first step itself: done, it gives `f` of the
+answer to `k`, as any operation; not done, it returns `heff_outside(w,
+f, k)`, which either waits there, polling `fd` and stepping until it is
+done, the whole program waiting (no scheduler of std.reactor's is
+running: a program's operations are as they were), or, in a group of
+std.reactor's, keeps the wait pending and gives back `HEFF_PENDING`
+without calling `k`.  `HEFF_PENDING` comes back, by the calls last
+that the world's continuations are, to std.reactor's `Start`, which
+tells the scheduler; once the wait is done, the reactor gives `f` of
+its answer to `k`, the rest of the computation started run as it
+would have been.  Nothing of the heff side knows of it: an operation's
+answer is given to its function, now or later.
+
+A provider whose waits are done by something else -- libcurl's
+transfers, which have sockets of their own -- is a `HeffSource`
+(`heff_reactor_source`): `fds` says which descriptors it polls and how
+long at most to wait, `ready` is given them as polled, and it says
+which of its waits are done by `heff_wait_done(w)`.  A provider that
+closes a descriptor others may wait on says so first,
+`heff_reactor_closing(fd)`: what waits on it is done, `EBADF`.
+
+What has no descriptor to wait on is given one: a name is resolved by
+getaddrinfo in a thread of the system of its own, started for it
+(lib/std/net.provider.c), which writes a byte to a socket of a pair
+whose other end the wait polls; the thread touches nothing of heff's.
