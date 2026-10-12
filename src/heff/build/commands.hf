@@ -394,7 +394,7 @@ readProviders sources (Cons m rest) = do
     Just pr -> Cons pr ps
     Nothing -> ps)
 
--- (a provider without `$host` lives anywhere; `--backend=node`'s is "node")
+-- (a provider without `$host` lives anywhere)
 forHost : String -> Emit.Provider -> Bool
 forHost host p = case Emit.hostOf p.text of
   Nothing -> True
@@ -944,20 +944,19 @@ jsKeptWritten bi outPath id texts backs done out =
        done)
     out.output
 
--- (the program running `r` for `host`, simplified through the cache)
+-- (the page's script running `r`, simplified through the cache)
 jsKept : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{sys : process <: e}}
        -> {{disk : fs <: e}}
        -> BackIn
        -> String
-       -> String
        -> Co e Unit
        -> Driver.Checked
        -> List Emit.Provider
        -> Driver.Runnable
        -> Co e Unit
-jsKept bi host outPath done c available r = do
+jsKept bi outPath done c available r = do
   id <- selfHash bi.paths
   texts <-
     if strEq id "" then pure Nil else readBacks bi.paths (Cons "_" bi.modules)
@@ -969,7 +968,6 @@ jsKept bi host outPath done c available r = do
       (backsOf id texts)
       done
       (Emit.compileProgramKept
-         host
          available
          c.top.globals
          r.key
@@ -984,23 +982,22 @@ compileFound : {e : HFunctor}
              -> {{disk : fs <: e}}
              -> BackIn
              -> String
-             -> String
              -> Maybe String
              -> String
              -> Co e Unit
              -> Driver.Checked
              -> List Emit.Provider
              -> Co e Unit
-compileFound bi host file name outPath done c available = case Driver.findRunnable
+compileFound bi file name outPath done c available = case Driver.findRunnable
     (List.filter (\k -> providesLeaf available k) (Driver.candidateLeaves c))
     c
     name of
   Left why -> do
     printErr ("heff: " ^ file ^ ": " ^ why)
     exit 1
-  Right r -> jsKept bi host outPath done c available r
+  Right r -> jsKept bi outPath done c available r
 
--- (a computation whose effects all have providers for this host: each
+-- (a computation whose effects all have providers for a page: each
 -- world's algebra is bundled in from its module's M.provider.js)
 compileLast : {e : HFunctor}
             -> {{io : stdio <: e}}
@@ -1009,14 +1006,12 @@ compileLast : {e : HFunctor}
             -> BackIn
             -> List Driver.Source
             -> String
-            -> String
             -> Maybe String
             -> String
             -> Co e Unit
             -> List Driver.Checked
             -> Co e Unit
-compileLast bi sources host file name outPath done cs = case Driver.lastChecked
-    cs of
+compileLast bi sources file name outPath done cs = case Driver.lastChecked cs of
   Nothing -> do
     printErr "no files given"
     exit 1
@@ -1028,13 +1023,12 @@ compileLast bi sources host file name outPath done cs = case Driver.lastChecked
            (List.map (\k -> Effect.moduleOfKey k) (Driver.candidateLeaves c)))
     compileFound
         bi
-        host
         file
         name
         outPath
         done
         c
-        (List.filter (\p -> forHost host p) found)
+        (List.filter (\p -> forHost "page" p) found)
 
 compileDiags : {e : HFunctor}
              -> {{io : stdio <: e}}
@@ -1044,18 +1038,17 @@ compileDiags : {e : HFunctor}
              -> BackIn
              -> List Driver.Source
              -> String
-             -> String
              -> Maybe String
              -> String
              -> Co e Unit
              -> Bool
              -> List Driver.Checked
              -> Co e Unit
-compileDiags bi sources host file name outPath done badL checked = do
-  cs <- refusedChecked host sources checked
+compileDiags bi sources file name outPath done badL checked = do
+  cs <- refusedChecked "page" sources checked
   putFileDiags cs
   if badL || anyErrors cs then exit 1
-    else compileLast bi sources host file name outPath done cs
+    else compileLast bi sources file name outPath done cs
 
 -- (what the backend's cache is given, of a program loaded and checked)
 backInOf : Load.Loaded -> Session.CacheAcc -> BackIn
@@ -1065,27 +1058,25 @@ backInOf l acc =
   , modules = List.map (\(c : Driver.Checked) -> c.module) acc.done
   }
 
--- | compile the computation `name` of FILE to a program of `host`, then
--- | go on with `done`
+-- | compile the computation `name` of FILE to a page's script, then go
+-- | on with `done`
 compileThen : {e : HFunctor}
             -> {{io : stdio <: e}}
             -> {{sys : process <: e}}
             -> {{disk : fs <: e}}
             -> {{rep : Report.report <: e}}
-            -> String
             -> Maybe String
             -> String
             -> String
             -> Co e Unit
             -> Co e Unit
-compileThen host name outPath file done = do
+compileThen name outPath file done = do
   l <- load file
   badL <- printErrs "heff" l.errors 0
   acc <- Session.cachedAcc l
   compileDiags
       (backInOf l acc)
       l.sources
-      host
       file
       name
       outPath
@@ -1093,39 +1084,8 @@ compileThen host name outPath file done = do
       (badL > 0)
       acc.done
 
--- | compile the computation `name` of FILE to a program of `host`:
--- | FILE's import closure loaded with the compiler's own loader
-compileCmd : {e : HFunctor}
-           -> {{io : stdio <: e}}
-           -> {{sys : process <: e}}
-           -> {{disk : fs <: e}}
-           -> {{rep : Report.report <: e}}
-           -> String
-           -> Maybe String
-           -> String
-           -> String
-           -> String
-           -> Co e Unit
-compileCmd host name outPath how file =
-  compileThen host name outPath file (print ("wrote " ^ outPath ^ ": " ^ how))
-
-nodeCmd : {e : HFunctor}
-        -> {{io : stdio <: e}}
-        -> {{sys : process <: e}}
-        -> {{disk : fs <: e}}
-        -> {{rep : Report.report <: e}}
-        -> Maybe String
-        -> String
-        -> String
-        -> Co e Unit
-nodeCmd name outPath file =
-  compileCmd
-    "node"
-    name
-    outPath
-    ("run it with `node " ^ outPath ^ " ARGS...`")
-    file
-
+-- | `heff compile --backend=page`: FILE's computation `name`, a page's
+-- | script, its import closure loaded with the compiler's own loader
 appCmd : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{sys : process <: e}}
@@ -1136,49 +1096,14 @@ appCmd : {e : HFunctor}
        -> String
        -> Co e Unit
 appCmd name outPath file =
-  compileCmd
-    "page"
+  compileThen
     name
     outPath
-    "load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"
     file
-
-runDir : Load.Paths -> String
-runDir paths = Load.under paths paths.root ".heff/run"
-
--- (FILE's path, its separators underscores)
-runPath : Load.Paths -> String -> String
-runPath paths file =
-  Load.under
-    paths
-    (runDir paths)
-    (joinWith "_" (Path.components paths.style file) ^ ".mjs")
-
--- | run FILE's `main` with ARGS: compiled for Node.js to `.heff/run/`,
--- | which runs in heff's place
-runCmd : {e : HFunctor}
-       -> {{io : stdio <: e}}
-       -> {{sys : process <: e}}
-       -> {{disk : fs <: e}}
-       -> {{rep : Report.report <: e}}
-       -> String
-       -> List String
-       -> Co e Unit
-runCmd file progArgs = do
-  l <- load file
-  badL <- printErrs "heff" l.errors 0
-  acc <- Session.cachedAcc l
-  ok <- mkDir (runDir l.paths)
-  compileDiags
-      (backInOf l acc)
-      l.sources
-      "node"
-      file
-      (Just "main")
-      (runPath l.paths file)
-      (exec "node" (runPath l.paths file :: progArgs))
-      (badL > 0)
-      acc.done
+    (print
+       ("wrote "
+        ^ outPath
+        ^ ": load it in a page with <script src=\"...\"> (it imports nothing: it opens from file:// too)"))
 
 ownExport : Driver.Own -> Emit.Export
 ownExport o = Emit.mkExport o.name o.key
@@ -1360,11 +1285,30 @@ compileLastC bi sources file name outPath done cs = case Driver.lastChecked
              (List.map (\(o : Driver.Own) -> MkPair o.name o.key) c.own))
       Just _ -> compileFoundC bi file name outPath runtime done c found
 
--- | compile the computation `name` of FILE to one C file (with no
--- | `name`, one that shows each of FILE's definitions asked for, as the
--- | tests ask: test/compile-check-c.mjs)
--- | compile the computation `name` of FILE to one C file, then go on
--- | with `done`
+-- | compile the computation `name` of FILE, loaded (`l`), to C -- one
+-- | file, or, OUT a directory (`dir/`), a file a module -- then go on
+-- | with `done`; with no `name`, one file that shows each of FILE's
+-- | definitions asked for, as the tests ask (test/compile-check-c.mjs)
+cLoaded : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{rep : Report.report <: e}}
+        -> Load.Loaded
+        -> Maybe String
+        -> String
+        -> String
+        -> Co e Unit
+        -> Co e Unit
+cLoaded l name outPath file done = do
+  badL <- printErrs "heff" l.errors 0
+  acc <- Session.cachedAcc l
+  cs <- refusedChecked "c" l.sources acc.done
+  putFileDiags cs
+  if badL > 0 || anyErrors cs then exit 1
+    else compileLastC (backInOf l acc) l.sources file name outPath done cs
+
+-- | compile the computation `name` of FILE to C, as `cLoaded`
 cThen : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
@@ -1377,12 +1321,7 @@ cThen : {e : HFunctor}
       -> Co e Unit
 cThen name outPath file done = do
   l <- load file
-  badL <- printErrs "heff" l.errors 0
-  acc <- Session.cachedAcc l
-  cs <- refusedChecked "c" l.sources acc.done
-  putFileDiags cs
-  if badL > 0 || anyErrors cs then exit 1
-    else compileLastC (backInOf l acc) l.sources file name outPath done cs
+  cLoaded l name outPath file done
 
 cCmd : {e : HFunctor}
      -> {{io : stdio <: e}}
@@ -1576,10 +1515,46 @@ wrote t path next = do
   print (t.said ^ " " ^ path)
   next
 
--- (`.heff/build/X/`, a C file a module, by `zig cc` -- which builds
--- them at once, and again only those that changed -- is the program X,
--- `.heff/build/X/X`: a task under the program's, `p`, of as many items
--- as files and the link, what zig says of them under it)
+-- (the C files of `dir`, a file a module, by `zig cc` at `opt` --
+-- which builds them at once, and again only those that changed -- the
+-- program `out`: a task under `p` of as many items as files and the
+-- link, what zig says of them under it; else said, by `who`, and the
+-- end)
+zigBuild : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> String
+         -> Path.Style
+         -> String
+         -> Progress.Task
+         -> String
+         -> String
+         -> Co e Unit
+         -> Co e Unit
+zigBuild who st opt p dir out next = do
+  names <- readDir dir
+  files <-
+    pure
+      (List.map
+         (\n -> Path.join st dir n)
+         (List.filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+  z <- Progress.start p "zig cc" (List.length files + 1)
+  r <-
+    Progress.runUnder
+      z
+      "zig"
+      (List.append ["cc", opt, "-w"] (List.append files ["-o", out, "-lm"]))
+  Progress.end z
+  if ranStatus r == 0 then next
+    else do
+      writeErr (ranErr r)
+      printErr (who ^ ": `zig cc` could not build " ^ out)
+      exit 1
+
+-- (`.heff/build/X/` by `zig cc` at the target's level, the program X,
+-- `.heff/build/X/X`: a task under the program's, `p`)
 zigCc : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{sys : process <: e}}
@@ -1591,40 +1566,60 @@ zigCc : {e : HFunctor}
       -> String
       -> Co e Unit
       -> Co e Unit
-zigCc st t p x next = do
-  names <- readDir (partsDir st t x)
-  files <-
-    pure
-      (List.map
-         (\n -> Path.join st (partsDir st t x) n)
-         (List.filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
-  z <- Progress.start p "zig cc" (List.length files + 1)
-  r <-
-    Progress.runUnder
-      z
-      "zig"
-      (List.append
-         ["cc", t.opt, "-w"]
-         (List.append files ["-o", builtAt st t x x, "-lm"]))
-  Progress.end z
-  if ranStatus r == 0 then next
-    else do
-      writeErr (ranErr r)
-      printErr ("heff build: `zig cc` could not build " ^ builtAt st t x x)
-      exit 1
+zigCc st t p x next =
+  zigBuild "heff build" st t.opt p (partsDir st t x) (builtAt st t x x) next
 
--- (the program X, a Node.js program, made runnable)
-nodeDone : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> Path.Style
-         -> Target
-         -> String
-         -> Co e Unit
-         -> Co e Unit
-nodeDone st t x next = do
-  r <- run "chmod" ["+x", builtAt st t x x]
-  next
+-- (where `heff run` builds FILE: `.heff/run/F/`, F its path, its
+-- separators underscores)
+runDir : Load.Paths -> String -> String
+runDir paths file =
+  Load.under
+    paths
+    (Load.under paths paths.root ".heff/run")
+    (joinWith "_" (Path.components paths.style file))
+
+-- (a program's file, named `n`, as the system names one: `n.exe` on
+-- Windows)
+programFile : Path.Style -> String -> String
+programFile Windows n = n ^ ".exe"
+programFile Posix n = n
+
+-- (the program `heff run` builds of FILE, `.heff/run/F/main`)
+runProgram : Load.Paths -> String -> String
+runProgram paths file =
+  Load.under paths (runDir paths file) (programFile paths.style "main")
+
+-- | run FILE's `main` with ARGS: compiled to C in `.heff/run/F/` (a file
+-- | a module, through the backend's cache), built there by `zig cc` at
+-- | -O1 as `heff build` builds, and run in heff's place
+runCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> {{rep : Report.report <: e}}
+       -> {{prog : Progress.progress <: e}}
+       -> String
+       -> List String
+       -> Co e Unit
+runCmd file progArgs = do
+  l <- load file
+  p <- Progress.start Progress.root file 2
+  c <- Progress.start p "compiling to C" 0
+  cLoaded
+      l
+      (Just "main")
+      (runDir l.paths file ^ "/")
+      file
+      (ended
+         c
+         (zigBuild
+            "heff run"
+            l.paths.style
+            "-O1"
+            p
+            (runDir l.paths file)
+            (runProgram l.paths file)
+            (ended p (exec (runProgram l.paths file) progArgs))))
 
 -- (the program X, compiled as its build.hf says, in `.heff/build/X/`,
 -- then `next`: a task under `bp`, the programs', of its steps -- through
@@ -1653,24 +1648,12 @@ buildApp st t bp x a next =
           (partsDir st t x ^ "/")
           (appFile st t x "main.hf")
           (ended c (zigCc st t p x (ended p next)))
-  else if strEq a.backend "node"
-    then do
-      p <- Progress.start bp x 1
-      c <- Progress.start p "compiling for Node.js" 0
-      made <- mkDir (partsDir st t x)
-      compileThen
-          "node"
-          (Just a.run)
-          (builtAt st t x x)
-          (appFile st t x "main.hf")
-          (ended c (nodeDone st t x (ended p next)))
   else if t.pages
     then do
       p <- Progress.start bp x 1
       c <- Progress.start p "compiling for a page" 0
       made <- mkDir (partsDir st t x)
       compileThen
-          "page"
           (Just a.run)
           (builtAt st t x (x ^ ".js"))
           (appFile st t x "main.hf")
@@ -1807,7 +1790,7 @@ shipIn st t done progs (Just home) = do
 -- `t.pages`, a page's script)
 madeAs : Target -> App -> Maybe String
 madeAs t a =
-  if strEq a.build.backend "c" || strEq a.build.backend "node" then Just a.name
+  if strEq a.build.backend "c" then Just a.name
   else if t.pages then Just (a.name ^ ".js")
   else Nothing
 
@@ -2203,8 +2186,7 @@ compileTo : {e : HFunctor}
           -> CompileOpts
           -> Co e Unit
 compileTo o =
-  if strEq o.backend "node" then nodeCmd o.name o.outPath o.file
-  else if strEq o.backend "page" then appCmd o.name o.outPath o.file
+  if strEq o.backend "page" then appCmd o.name o.outPath o.file
   else if strEq o.backend "esm"
     then case o.name of
       Nothing -> compileJsCmd o.file o.outPath
@@ -2214,8 +2196,7 @@ compileTo o =
         exit 1
   else if strEq o.backend "c" then cCmd o.name o.outPath o.file
   else do
-    printErr
-        ("heff compile: no backend " ^ o.backend ^ ": esm, page, node or c")
+    printErr ("heff compile: no backend " ^ o.backend ^ ": esm, page or c")
     exit 1
 
 -- (each value printed; whether the evaluation of one met a bug of the
@@ -3072,8 +3053,8 @@ programText name =
   joinWith
     "\n"
     [ "-- The program " ^ name ^ ": `heff build` builds it to .heff/bin/, as"
-    , "-- build.hf says, and `heff install` into ~/.heff/bin/; run on Node.js,"
-    , "-- without a build, by `heff run app/" ^ name ^ "/main.hf`."
+    , "-- build.hf says, and `heff install` into ~/.heff/bin/; run, without"
+    , "-- a build, by `heff run app/" ^ name ^ "/main.hf`."
     , ""
     , "import co"
     , "import " ^ name ^ ".greeting"
@@ -3093,8 +3074,8 @@ buildText : String
 buildText =
   joinWith
     "\n"
-    [ "-- main.hf's `main`, compiled through C (by `zig cc`); `Node` makes a"
-    , "-- Node.js program of it.  A field `ships = [...]` would name files and"
+    [ "-- main.hf's `main`, compiled through C (by `zig cc`); `Page` makes a"
+    , "-- page's script of it.  A field `ships = [...]` would name files and"
     , "-- directories of the project's root for `heff install` to put in the"
     , "-- heff home with it."
     , ""

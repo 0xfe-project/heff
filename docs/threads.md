@@ -51,7 +51,7 @@ program = do
 
 There is no JavaScript side: the JavaScript backend is the browser's,
 and a program with `threads` in its world is compiled for C
-(`--backend=c`; for Node.js it is refused, the effect not provided).
+(`--backend=c`; a page's script refuses it, the effect not provided).
 
 ### What it costs
 

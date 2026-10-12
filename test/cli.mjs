@@ -212,8 +212,9 @@ for (const [args, says] of [
   [["check"], "heff check: expected FILE\nusage: heff check FILE\n"],
   [["fmt", "--chek", "x.hf"], "heff fmt: no flag --chek; --check?\nusage: heff fmt FILE... [--check]\n"],
   [["compile", "a.hf", "a.mjs"], "heff compile: --backend=MODE is wanted\n"],
-  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "heff compile: --backend is esm, page, node or c, not wasm\n"],
-  [["compile", "a.hf", "--backend=node"], "heff compile: expected OUT\n"],
+  [["compile", "a.hf", "a.mjs", "--backend=wasm"], "heff compile: --backend is esm, page or c, not wasm\n"],
+  [["compile", "a.hf", "a.mjs", "--backend=node"], "heff compile: --backend is esm, page or c, not node\n"],
+  [["compile", "a.hf", "--backend=c"], "heff compile: expected OUT\n"],
   [["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"], "heff compile: an ES module runs nothing: no --name with --backend=esm"],
   [["init", "a", "b"], "heff init: too many words: b\n"],
   [["build", "x"], "heff build: too many words: x\nusage: heff build\n"],
@@ -225,7 +226,7 @@ for (const args of [["help", "compile"], ["compile", "--help"], ["compile", "a.h
   const r = await heff(...args);
   expect(`help: ${args.join(" ")}`, r.status === 0 &&
     r.stdout.startsWith("usage: heff compile FILE OUT [--name NAME] --backend=MODE\n") &&
-    r.stdout.includes("\n  -b, --backend=MODE") && r.stdout.includes("(esm, page, node, c)"), r);
+    r.stdout.includes("\n  -b, --backend=MODE") && r.stdout.includes("(esm, page, c)"), r);
 }
 
 // version: the heff running, as the package.hf it came with says (the
@@ -250,10 +251,10 @@ expect("version, a package.hf that does not read", badPkg.status === 1 && badPkg
 // what a word completes to: the commands, a command's flags, a flag's
 // values, its files
 for (const [words, out] of [
-  [["co"], "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), c (a C program running NAME, for `zig cc`); node (a Node.js program running NAME) is for heff's own tests\ncompletions\ta completion script for SHELL\n"],
+  [["co"], "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), c (a C program running NAME, for `zig cc`)\ncompletions\ta completion script for SHELL\n"],
   [["compile", "a.hf", "--b"], "--backend\twhat it is compiled to\n"],
-  [["compile", "a.hf", "-b", ""], "esm\npage\nnode\nc\n"],
-  [["compile", "a.hf", "--backend=n"], "--backend=node\n"],
+  [["compile", "a.hf", "-b", ""], "esm\npage\nc\n"],
+  [["compile", "a.hf", "--backend=p"], "--backend=page\n"],
   [["fmt", "--check", ""], ":files .hf\n"],
   [["init", ""], ":dirs\n"],
   [["completions", ""], "fish\nbash\nzsh\n"],
@@ -278,9 +279,9 @@ const bashOffers = (line, words) => run("bash", ["-c",
 for (const [line, words, want] of [
   ["heff comp", ["heff", "comp"], ["compile", "completions"]],
   ["heff compile a.hf --b", ["heff", "compile", "a.hf", "--b"], ["--backend"]],
-  ["heff compile a.hf --backend ", ["heff", "compile", "a.hf", "--backend", ""], ["esm", "page", "node", "c"]],
-  ["heff compile a.hf --backend=n", ["heff", "compile", "a.hf", "--backend", "=", "n"], ["node"]],
-  ["heff compile a.hf --backend=", ["heff", "compile", "a.hf", "--backend", "="], ["=esm", "=page", "=node", "=c"]],
+  ["heff compile a.hf --backend ", ["heff", "compile", "a.hf", "--backend", ""], ["esm", "page", "c"]],
+  ["heff compile a.hf --backend=p", ["heff", "compile", "a.hf", "--backend", "=", "p"], ["page"]],
+  ["heff compile a.hf --backend=", ["heff", "compile", "a.hf", "--backend", "="], ["=esm", "=page", "=c"]],
   ["heff check cle", ["heff", "check", "cle"], ["clean.hf"]],
 ]) {
   const r = await bashOffers(line, words);
@@ -297,8 +298,8 @@ if (fishThere) {
   const fishOffers = (line) => run("fish", ["--no-config", "-c", `source comp.fish; complete -C ${JSON.stringify(line)}`], { cwd: work, env });
   for (const [line, want] of [
     ["heff comp", ["compile", "completions"]],
-    ["heff compile a.hf --backend=", ["--backend=esm", "--backend=page", "--backend=node", "--backend=c"]],
-    ["heff compile a.hf -b ", ["c", "esm", "node", "page"]],
+    ["heff compile a.hf --backend=", ["--backend=esm", "--backend=page", "--backend=c"]],
+    ["heff compile a.hf -b ", ["c", "esm", "page"]],
     ["heff check cle", ["clean.hf"]],
   ]) {
     const r = await fishOffers(line);

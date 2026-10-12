@@ -9,35 +9,28 @@ threads truly at once: see [threads.md](threads.md).
 
 ## Where each runs
 
-A JavaScript provider that lives in one host only says so, `export
-const $host = "page"` (a page's script, `--backend=page`) or `"node"`
-(Node.js, `--backend=node`); without it, both
+A JavaScript provider runs in a page's script (`--backend=page`); one
+that runs nowhere else says so, `export const $host = "page"`
 (`lib/browser/dom.provider.js` says the shape of a provider).  The
-library is split by it ([library.md](library.md#the-batteries)):
+library is split by backend ([library.md](library.md#the-batteries)):
 
 - `lib/std/`'s effects are the system's, with a provider in C:
   `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.http`,
   `std.net`;
 - `std.ref` and `std.time` are needed on both sides: one module each,
-  with a provider in C and one in JavaScript of no `$host`, which a
-  page's script runs as Node.js does;
+  with a provider in C and one in JavaScript of no `$host`;
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
   (`$host = "page"`) and `browser.js`, which has no effect, only its
   type.
 
-`std.io`, `std.filesystem`, `std.process` and `std.progress` keep a
-provider for Node.js (`$host = "node"`), for heff itself and its tests
-only, as each says at its top; no other module of `lib/std/` is given
-one.  `--backend=node` is there for them, not for programs.
-
 What a backend has no side of is refused where it is imported, before
 the program's effect is looked at: by `heff compile --backend=c` (and
 `heff build`'s C programs), an import of a module of `lib/browser/`
-(E0351); by `--backend=page` or `node`, an import of an effect of
-`lib/std/` with a provider in C and none in JavaScript for that host,
-or of a module of `lib/std/` that imports one, itself or by the modules
-it imports (E0352; one that imports only pure modules, as `std.path`
-and `std.handle` do, is not refused).  The library's own imports are
+(E0351); by `--backend=page`, an import of an effect of `lib/std/`
+with a provider in C and none in JavaScript, or of a module of
+`lib/std/` that imports one, itself or by the modules it imports
+(E0352; one that imports only pure modules, as `std.path` and
+`std.handle` do, is not refused).  The library's own imports are
 its own; a program's modules' are each said, at the import, naming the
 module and the backend, and in a note, for a module that reaches an
 effect by its imports, that effect and the imports by which it does.  An

@@ -56,7 +56,7 @@ heff, build it (`make build`) or install from it.
 
 A program is `app/NAME/main.hf`, with an `app/NAME/build.hf` beside it
 defining `build`, of type `Build`: the computation run, what it is
-compiled to (`C`, `Node`, `Page`), and the files and directories of the
+compiled to (`C`, `Page`), and the files and directories of the
 project's root it ships (`ships`, none where left out).  `heff build`
 builds every program to `.heff/bin/`; `heff install` builds them into
 the heff home's `bin/`, and puts what they ship beside it, in place of

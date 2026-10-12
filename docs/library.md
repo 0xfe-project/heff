@@ -73,10 +73,7 @@ script that imports an effect of `lib/std/` with no provider there, or
 a module of `lib/std/` that imports one, however far down
 (`std.http.server`, by `std.http` and `std.net`) (E0352), each naming
 the module and the backend -- and, for one that imports it, which
-effect it reaches -- before `main`'s effect is looked at.  (`std.io`, `std.filesystem`, `std.process` and
-`std.progress` have providers for Node.js too, kept for heff itself
-and its tests, `--backend=node`; no other module of `lib/std/` has
-one.)
+effect it reaches -- before `main`'s effect is looked at.
 
 An effect's JavaScript side is in `M.provider.js` beside `M.hf`, its C
 side in `M.provider.c`: see [providers.md](providers.md).

@@ -14,7 +14,7 @@ a typed language with a phase distinction.
 - **Self-hosting**: the compiler is written in heff, and builds from a
   seed of itself compiled to C.
 - **Two backends**: C (native programs, by `zig cc`) and JavaScript
-  (Node.js programs, web pages, ES modules).
+  (web pages, ES modules).
 - **Tools** in the one executable: a formatter, a language server, doc
   tests and property tests, and packages fetched by git.
 
@@ -73,7 +73,7 @@ heff init hello            # a new project: a module, a program, a test
 cd hello
 heff build                 # check src/, build each program to .heff/bin/
 heff test                  # the doc tests, watches and tests of test/
-heff run app/hello/main.hf # run a program on Node.js, without a build
+heff run app/hello/main.hf # run a program (C, by zig), without a build
 heff install               # build to run fastest, into ~/.heff/bin/
 heff fmt src/hello/*.hf    # format in place
 ```

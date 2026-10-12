@@ -4,7 +4,7 @@
 
 ```sh
 heff check FILE                # the file's interface, and its errors
-heff run FILE [ARGS...]        # run the file's `main` (on Node.js)
+heff run FILE [ARGS...]        # run the file's `main` (C, by zig -O1)
 heff test [--seed N] [FILE...] # check the doc tests' and watches' expectations
                                # (`-- | >>> e`, `-- >>> e`), and run the tests
                                # (lib/check.hf); no FILE: the project's test/
@@ -39,10 +39,14 @@ Flags go anywhere among the words, as getopt_long reads them (`-b c`,
 The backends are `page` and `esm`, JavaScript for the browser, and `c`,
 for everything else; a program imports the library's half that is its
 backend's, `lib/browser/` or `lib/std/` ([library.md](library.md#the-batteries)).
-`--backend=node`, a Node.js program running NAME, is heff's own, for
-its tests and itself (what `heff run` runs): the providers it has are
-those heff uses, `std.io`, `std.filesystem`, `std.process` and
-`std.progress` ([providers.md](providers.md#where-each-runs)).
+
+`heff run` compiles FILE's `main` to C in `.heff/run/F/` (F the file's
+path, its separators `_`), a C file a module, through the backend's
+cache, as `heff build` does; builds it there by `zig cc -O1`, which
+builds again only the files that changed; and runs it in heff's place,
+on its standard streams, with ARGS.  So it needs zig, as `heff build`
+does; run again with nothing changed, it costs a check of the cache and
+a link.
 
 What `heff test` and `heff promote` check is in [tests.md](tests.md);
 how a project and its programs are laid out for `heff build`, `heff
@@ -89,18 +93,18 @@ returns -- but for a call of itself put in a constructor's last field
 either backend, however long its list.  A C program (`c`) runs in a
 thread of its own, with a stack of 1 GiB (`-DHEFF_MAIN_STACK=BYTES` when
 its C is built, for another size; where it runs out, the program says
-`heff: the stack overflowed` and ends with 1), and a Node.js program (`node`, what `heff run` runs) in a worker
-thread, with one of 512 MB: recursion millions deep -- three million of
-`sumTo n = if n == 0 then 0 else n + sumTo (n - 1)`.  An ES module
-(`esm`) and a page's script (`page`) run on the stack of what loads
-them -- Node.js's own, a browser's -- which has room for some ten
-thousand such calls (on Node.js 26, 9765 of `sumTo`, fewer of one that
-calls a closure); a call deeper throws a `RangeError`.
+`heff: the stack overflowed` and ends with 1): recursion millions deep
+-- twenty million of `sumTo n = if n == 0 then 0 else n + sumTo (n -
+1)`.  An ES module (`esm`) and a page's script (`page`) run on the
+stack of what loads them -- Node.js's own, a browser's -- which has
+room for some ten thousand such calls (on Node.js 26, 9765 of `sumTo`,
+fewer of one that calls a closure); a call deeper throws a
+`RangeError`.
 
 heff does not take those calls off the stack: a trampoline, or
 continuations, would slow every call that is no tail call (twice as
 slow, `sumTo` measured), for a depth few modules need.  What must go
-deeper runs as a Node.js program, recurs by a tail call (`List.foldl`,
-not `List.foldr`), or is loaded on a larger stack: a `Worker`'s
-`resourceLimits.stackSizeMb`, as a Node.js program is, or
-`node --stack-size=N`, kept within what the system gives the thread.
+deeper runs as a C program, recurs by a tail call (`List.foldl`, not
+`List.foldr`), or is loaded on a larger stack: a `Worker`'s
+`resourceLimits.stackSizeMb`, or `node --stack-size=N`, kept within
+what the system gives the thread.
