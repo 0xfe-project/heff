@@ -127,17 +127,17 @@ so is more than one (E0342), whatever their values, so that an import
 may make an error of a search, never another answer.
 
 An instance's type may take implicit and instance arguments before what
-it is an instance of: `instance equalityList : {a : Type} -> {{eq :
-Equality a}} -> Equality (List a)` is an instance of each `Equality
-(List a)` there is an `Equality a` of.  A search unifies what it is an
-instance of with the type wanted, which solves its implicit arguments,
-and is decided on that alone -- `Equality (List a)`'s and `Equality
-(List Int)`'s are two for `Equality (List Int)` -- then finds its
-instance arguments as it found it, each a search of its own, whose
+it is an instance of: `instance instanceEqualityList : {a : Type} ->
+{{eq : Equality a}} -> Equality (List a)` is an instance of each
+`Equality (List a)` there is an `Equality a` of.  A search unifies what
+it is an instance of with the type wanted, which solves its implicit
+arguments, and is decided on that alone -- `Equality (List a)`'s and
+`Equality (List Int)`'s are two for `Equality (List Int)` -- then finds
+its instance arguments as it found it, each a search of its own, whose
 error says the instances that wanted it (`no instance for Equality
-Color in scope, wanted by equalityList for Equality (List Color)`); one
-whose type what the instance is an instance of leaves undetermined is
-E0340.
+Color in scope, wanted by instanceEqualityList for Equality (List
+Color)`); one whose type what the instance is an instance of leaves
+undetermined is E0340.
 Searches go 32 deep at most (E0349), as an instance that wants one of a
 type no smaller than its own may want them without end.  An explicit
 argument, which no search gives, is refused (E0348), and so is an
@@ -145,16 +145,18 @@ implicit one not in what the instance is an instance of, which the
 unification could not solve (E0350).
 
 The prelude's `Equality` is a type's equality, `equal x y` and `x ==
-y`: its instances are `Int`'s (`equalityInt`), `Float64`'s, `String`'s,
-`Bytes`', `Rune`'s, `Bool`'s, `Unit`'s and `Ordering`'s, those of a
-`List`, a `Maybe`, a `Pair` and an `Either` of types that have one
-(`equalityList`, `equalityMaybe`, `equalityPair`, `equalityEither`),
-and each fixed-width type's module has its own (`int8`'s
-`equalityInt8`) -- an instance named by its theory, then its type.  The
-prelude's other operators are theories' too ([operators](#operators)).
-A search tries only the instances whose type could be the one wanted:
-`x == y` at `Int` tries `equalityInt`, not `equalityList`, whose
-`Equality (List a)` no `Equality Int` is.
+y`: its instances are `Int`'s (`instanceEqualityInt`), `Float64`'s,
+`String`'s, `Bytes`', `Rune`'s, `Bool`'s, `Unit`'s and `Ordering`'s,
+those of a `List`, a `Maybe`, a `Pair` and an `Either` of types that
+have one (`instanceEqualityList`, `instanceEqualityMaybe`,
+`instanceEqualityPair`, `instanceEqualityEither`), and each fixed-width
+type's module has its own (`int8`'s `instanceEqualityInt8`) -- an
+instance named `instance`, then its theory, then its type: a name no
+one need call, as a search finds it.  The prelude's other operators are
+theories' too ([operators](#operators)).  A search tries only the
+instances whose type could be the one wanted: `x == y` at `Int` tries
+`instanceEqualityInt`, not `instanceEqualityList`, whose `Equality
+(List a)` no `Equality Int` is.
 
 ```haskell
 member : {a : Type} -> {{eq : Equality a}} -> a -> List a -> Bool
@@ -162,10 +164,12 @@ member x Nil = False
 member x (Cons y ys) = equal x y || member x ys
 
 found : Bool
-found = member 2 [1, 2] && member 2.5 [0.5]   -- equalityInt, then equalityFloat64
+-- instanceEqualityInt, then instanceEqualityFloat64
+found = member 2 [1, 2] && member 2.5 [0.5]
 
 same : List (Maybe Int) -> List (Maybe Int) -> Bool
-same xs ys = equal xs ys   -- equalityList, given equalityMaybe, given equalityInt
+-- instanceEqualityList, given instanceEqualityMaybe, given instanceEqualityInt
+same xs ys = equal xs ys
 ```
 
 The prelude has two theories of a value as a string, as Rust has
@@ -181,31 +185,35 @@ reader: a string itself (`toString "hi"` is `"hi"`), a rune its
 one-rune string (`toString 'a'` is `"a"`), bytes the UTF-8 text they
 are (`toString b"hi"` is `"hi"`, what is not UTF-8 U+FFFD).
 
-`Show`'s instances are `Int`'s (`showInt`), `Float64`'s, `String`'s,
-`Rune`'s (`showRune`), `Bytes`' (`showBytes`), `Bool`'s, `Unit`'s and
-`Ordering`'s, with no import, and those of a `List`, a `Maybe`, a `Pair`
-and an `Either` of types that have one (`showList`, `showMaybe`,
-`showPair`, `showEither`); `ToString`'s are `String`'s
-(`toStringString`), `Rune`'s, `Bytes`', and `Int`'s, `Float64`'s,
-`Bool`'s, `Unit`'s and `Ordering`'s, the same text as `show`'s -- but
-no list's, `Maybe`'s, pair's or `Either`'s, which have no one text.
-Each fixed-width type's module has both (`int8`'s `showInt8` and
-`toStringInt8`, each the number as a literal writes it), found where
-the module is imported.  A type of a program's own has one where the
-program declares it:
+`Show`'s instances are `Int`'s (`instanceShowInt`), `Float64`'s,
+`String`'s, `Rune`'s (`instanceShowRune`), `Bytes`'
+(`instanceShowBytes`), `Bool`'s, `Unit`'s and `Ordering`'s, with no
+import, and those of a `List`, a `Maybe`, a `Pair` and an `Either` of
+types that have one (`instanceShowList`, `instanceShowMaybe`,
+`instanceShowPair`, `instanceShowEither`); `Int`'s and `Float64`'s are
+the prelude's `showInt` and `showFloat`, functions of their own.
+`ToString`'s are `String`'s (`instanceToStringString`), `Rune`'s,
+`Bytes`', and `Int`'s, `Float64`'s, `Bool`'s, `Unit`'s and
+`Ordering`'s, the same text as `show`'s -- but no list's, `Maybe`'s,
+pair's or `Either`'s, which have no one text.  Each fixed-width type's
+module has both (`int8`'s `instanceShowInt8` and
+`instanceToStringInt8`, each the number as a literal writes it), found
+where the module is imported.  A type of a program's own has one where
+the program declares it:
 
 ```haskell
 data Color = Red | Green
 
-instance showColor : Show Color
-showColor = { show = written }
+instance instanceShowColor : Show Color
+instanceShowColor = { show = written }
   where
     written : Color -> String
     written Red = "Red"
     written Green = "Green"
 
 shown : String
-shown = show ([Red, Green] : List Color)   -- "[Red, Green]": showList, given showColor
+-- "[Red, Green]": instanceShowList, given instanceShowColor
+shown = show ([Red, Green] : List Color)
 ```
 
 A theory declared again is another type: a module's own `Equality` and
@@ -242,8 +250,8 @@ The prelude's operators are each a theory's operation, as Lean's are:
 `equal`, `<` and `<=` `Order`'s `lt` and `le` (`>` and `>=` the same,
 flipped), and `-x` `Negation`'s `neg` -- each an instance argument,
 found at the type it is used at: `n + 1` at `Int` is the prelude's
-`additionInt`'s, `x * c` at `Int64` `int64`'s `multiplicationInt64`'s,
-in one file, and a function of any type that has one asks for it.  A
+`instanceAdditionInt`'s, `x * c` at `Int64` `int64`'s
+`instanceMultiplicationInt64`'s, in one file, and a function of any type that has one asks for it.  A
 type has those it has: an integer type every one but `/.`, a float no
 `/` or `%` -- a float's division, IEEE's (by 0, an infinity), is `/.`,
 which binds as `*` does.  `Order`'s `compare`, `min` and `max` are the
@@ -321,8 +329,8 @@ the prelude has for every type -- `neg`, `compare`, `min`, `max`, the
 bits' -- so that a module opened is in the way of none of them at
 another type: those are its instances'.  An `Int`'s bits are the
 prelude's `and`, `or`, `xor`, `complement`, `shiftL` and `shiftR`, by
-`int`'s instance, `bitwiseInt` (`import int as Int`), as two's complement
-has them with the sign extended for ever; a shift right rounds down,
+`int`'s instance, `instanceBitwiseInt` (`import int as Int`), as two's
+complement has them with the sign extended for ever; a shift right rounds down,
 and one by a negative count is one the other way (`shiftL x -n` is
 `shiftR x n`), as a signed fixed-width type's is.  A fixed-width type's
 instances are its module's, found wherever it is imported, by a name
@@ -408,12 +416,12 @@ never changed once made.  The module `bytes`
 string's, `strSlice`: clamped, a negative index from the end),
 `append` and `concat`, `empty`, `fromList` and `toList` (of
 `UInt8`s), `fromString` (a string's bytes, as they are) and `eq` (as
-`==`, whose instance, `equalityBytes`, is the prelude's: no import is
-needed for it).  Their `show` and `toString` are the prelude's too:
-`show` writes them as `b"..."` (`showBytes`): a byte of ASCII that is
-printed as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any
-other byte `\xff`; `toString` is their text (`toStringBytes`), UTF-8,
-what is not UTF-8 U+FFFD, as `rune`'s `toValid` makes a string.
+`==`, whose instance, `instanceEqualityBytes`, is the prelude's: no
+import is needed for it).  Their `show` and `toString` are the
+prelude's too: `show` writes them as `b"..."` (`instanceShowBytes`): a
+byte of ASCII that is printed as it is (`"` and `\` escaped), `\n`,
+`\r` and `\t`, and any other byte `\xff`; `toString` is their text
+(`instanceToStringBytes`), UTF-8, what is not UTF-8 U+FFFD, as `rune`'s `toValid` makes a string.
 
 So a literal writes them: `b` right before a string, where a token
 starts (`b "x"` is a name and a string, and so is `ab"x"`), read as a
