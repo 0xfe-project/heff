@@ -255,27 +255,27 @@ if (process.platform !== "win32") checks.push((async () => {
   const shut = createServer(), refused = await listening(shut);
   shut.close();
   const at = `http://127.0.0.1:${port}`;
-  const item = 'b"item 3\\nitem 3\\nitem 3\\nitem 3\\n"';
+  const item = 'b["item 3", 10, "item 3", 10, "item 3", 10, "item 3", 10]';
   const echoed = (method, heff, type, length, body) =>
     `200 [X-Method: ${method}, X-Heff: ${heff}, X-Type: ${type}, X-Length: ${length}, X-Expect: none] ${body}`;
   const want = [
     `get: 200 [] ${item}`,
     `post: ${echoed("POST", "one two", "application/octet-stream", 512, `512 bytes, sum ${sum(every)}`)}`,
     `post, big: ${echoed("POST", "none", "none", 512 << 12, `${512 << 12} bytes, sum ${sum(every) << 12}`)}`,
-    `post, nothing: ${echoed("POST", "none", "none", 0, 'b""')}`,
-    `put: ${echoed("PUT", "none", "none", 3, 'b"put"')}`,
-    `delete: ${echoed("DELETE", "", "none", 0, 'b""')}`,
-    `head: ${echoed("HEAD", "none", "none", 0, 'b""')}`,
-    '404: 404 [] b"not here"',
-    '500: 500 [] b"broken"',
+    `post, nothing: ${echoed("POST", "none", "none", 0, 'b[]')}`,
+    `put: ${echoed("PUT", "none", "none", 3, 'b["put"]')}`,
+    `delete: ${echoed("DELETE", "", "none", 0, 'b[]')}`,
+    `head: ${echoed("HEAD", "none", "none", 0, 'b[]')}`,
+    '404: 404 [] b["not here"]',
+    '500: 500 [] b["broken"]',
     new RegExp(`^refused: curl: \\(7\\) Failed to connect to 127\\.0\\.0\\.1 port ${refused}`),
     `followed: 200 [] ${item}`,
-    'not followed: 302 [Location: /item] b"moving"',
+    'not followed: 302 [Location: /item] b["moving"]',
     /^redirects for ever: curl: \(47\) Maximum \(50\) redirects followed$/,
-    'in time: 200 [] b"late"',
+    'in time: 200 [] b["late"]',
     /^timed out: curl: \(28\) /,
     `big: 200 [] ${big.length} bytes, sum ${sum(big)}`,
-    'chunked: 200 [] b"one,two,three"',
+    'chunked: 200 [] b["one,two,three"]',
     /^cut short: curl: \(18\) /,
     /^no scheme: curl: \(1\) /,
     /^no host: curl: \(3\) /,
@@ -365,9 +365,9 @@ if (process.platform !== "win32") checks.push((async () => {
     "server read: 272 bytes, those sent: yes",
     "client read: 272 bytes, those sent: yes",
     "shut down: ok",
-    'server read at the end: b""',
-    'client read after its shutdown: b"still here"',
-    `client read, the server's side closed: b""`,
+    'server read at the end: b[]',
+    'client read after its shutdown: b["still here"]',
+    `client read, the server's side closed: b[]`,
     "listening again on the port: EADDRINUSE",
     "refused: ECONNREFUSED",
     "a port out of range: EINVAL",
@@ -404,13 +404,13 @@ if (process.platform !== "win32") checks.push((async () => {
     "reader: reads",
     "writer: runs while the reader waits",
     "writer: wrote, ok",
-    'reader: read b"hello"',
+    'reader: read b["hello"]',
     "both done: 2",
     "refused: ECONNREFUSED",
     "a name, resolved: ok",
     "a name not resolved: EAI_...",
     "counted meanwhile: 1000",
-    'read, the other side closed: b""',
+    'read, the other side closed: b[]',
     "read, its socket closed: EBADF",
     "echoed, all held open at once: 50",
     "closed: 50",
@@ -494,16 +494,16 @@ if (process.platform !== "win32") checks.push((async () => {
   else {
     const r = await run(self.cmd, [], { timeout: 60000 });
     const want = [
-      'get: 200 [- - 11] b"hello, GET\\n"',
+      'get: 200 [- - 11] b["hello, GET", 10]',
       `post: 200 [POST 127.0.0.1 512] 512 bytes, sum ${sum(bytesOf(2))}`,
       `post, big: 200 [POST 127.0.0.1 ${512 << 12}] ${512 << 12} bytes, sum ${sum(bytesOf(2)) << 12}`,
-      'put, nothing: 200 [PUT 127.0.0.1 0] b""',
-      'head: 200 [- - 12] b""',
-      '404: 404 [- - 14] b"no such thing\\n"',
+      'put, nothing: 200 [PUT 127.0.0.1 0] b[]',
+      'head: 200 [- - 12] b[]',
+      '404: 404 [- - 14] b["no such thing", 10]',
       `big: 200 [- - ${big.length}] ${big.length} bytes, sum ${sum(big)}`,
-      'closed after: 200 [- - 3] b"bye"',
-      'again: 200 [- - 11] b"hello, GET\\n"',
-      'stop: 200 [- - 9] b"stopping\\n"',
+      'closed after: 200 [- - 3] b["bye"]',
+      'again: 200 [- - 11] b["hello, GET", 10]',
+      'stop: 200 [- - 9] b["stopping", 10]',
     ].join("\n") + "\n";
     if (r.status !== 0 || r.stderr || r.stdout !== want)
       msgs.push(`FAIL http server, self (c): status ${r.status}\n${r.stdout}${r.stderr}`);
@@ -572,16 +572,16 @@ if (process.platform !== "win32") checks.push((async () => {
   const posted = Buffer.from(Array.from({ length: 300000 }, (_, i) => (i * 13) % 256));
   for (const [what, method, path, body, headers, shown, want, said] of [
     ["get", "GET", "/hello", undefined, {}, (r) => `${r.status} ${r.headers["content-length"]} ${r.body} ${r.reused}`,
-      "200 11 hello, GET\n false", 'GET /hello HTTP/1.1, b""'],
+      "200 11 hello, GET\n false", 'GET /hello HTTP/1.1, b[]'],
     ["post", "POST", "/echo", posted, { "X-Heff": "node" },
       (r) => `${r.status} ${r.headers["x-method"]} ${r.headers["x-version"]} ${r.headers["x-peer"]} ${r.headers["x-heff"]} ${r.body.equals(posted)} ${r.reused}`,
       "200 POST HTTP/1.1 127.0.0.1 node true true", `POST /echo HTTP/1.1, ${posted.length} bytes, sum ${sum(posted)}`],
     ["head", "HEAD", "/hello", undefined, {}, (r) => `${r.status} ${r.headers["content-length"]} ${r.body.length} ${r.reused}`,
-      "200 12 0 true", 'HEAD /hello HTTP/1.1, b""'],
+      "200 12 0 true", 'HEAD /hello HTTP/1.1, b[]'],
     ["404", "GET", "/nope", undefined, {}, (r) => `${r.status} ${r.body} ${r.reused}`,
-      "404 no such thing\n true", 'GET /nope HTTP/1.1, b""'],
+      "404 no such thing\n true", 'GET /nope HTTP/1.1, b[]'],
     ["big", "GET", "/big", undefined, {}, (r) => `${r.status} ${r.body.equals(big)} ${r.reused}`,
-      "200 true true", 'GET /big HTTP/1.1, b""'],
+      "200 true true", 'GET /big HTTP/1.1, b[]'],
   ]) {
     check(what, shown(await ask(method, path, body, headers)), want);
     log.push(said);
@@ -593,20 +593,20 @@ if (process.platform !== "win32") checks.push((async () => {
   for (const [what, parts, want, said] of [
     ["one after another, in one write",
       [[0, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"]],
-      `${hello}\r\nhello, GET\n${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.1, b""', 'GET /hello HTTP/1.1, b""']],
+      `${hello}\r\nhello, GET\n${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.1, b[]', 'GET /hello HTTP/1.1, b[]']],
     ["a head in parts",
       [[0, "GET /hel"], [50, "lo HTTP/1.1\r\nHost: x\r\nConnection: close\r"], [50, "\n\r\n"]],
-      `${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.1, b""']],
+      `${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.1, b[]']],
     ["HTTP/1.0", [[0, "GET /hello HTTP/1.0\r\n\r\n"]],
-      `${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.0, b""']],
+      `${hello}Connection: close\r\n\r\nhello, GET\n`, ['GET /hello HTTP/1.0, b[]']],
     ["HTTP/1.0, kept alive", [[0, "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET /hello HTTP/1.0\r\n\r\n"]],
       `${hello}Connection: keep-alive\r\n\r\nhello, GET\n${hello}Connection: close\r\n\r\nhello, GET\n`,
-      ['GET /hello HTTP/1.0, b""', 'GET /hello HTTP/1.0, b""']],
+      ['GET /hello HTTP/1.0, b[]', 'GET /hello HTTP/1.0, b[]']],
     ["Expect: 100-continue",
       [[0, "POST /echo HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"], ["100 Continue\r\n\r\n", "hello"]],
       "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nX-Method: POST\r\nX-Version: HTTP/1.1\r\nX-Peer: 127.0.0.1\r\nX-Heff: none\r\n"
         + "Content-Length: 5\r\nConnection: close\r\n\r\nhello",
-      ['POST /echo HTTP/1.1, b"hello"']],
+      ['POST /echo HTTP/1.1, b["hello"]']],
     ["a chunked body", [[0, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"]],
       "HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 16\r\nConnection: close\r\n\r\nNot Implemented\n", []],
     // (refused, the client sending on after the response: drained, not
@@ -628,11 +628,11 @@ if (process.platform !== "win32") checks.push((async () => {
     const r = await run("curl", ["-sS", "--http1.1", "-o", "/dev/null", "-o", "/dev/null", "-w", "%{http_code} %{num_connects} %{size_download}\n",
       `${at}/hello`, `${at}/big`], { timeout: 30000, slot: false });
     check("curl, two requests on one connection", `${r.stdout}${r.stderr}`, `200 1 11\n200 0 ${big.length}\n`);
-    log.push('GET /hello HTTP/1.1, b""', 'GET /big HTTP/1.1, b""');
+    log.push('GET /hello HTTP/1.1, b[]', 'GET /big HTTP/1.1, b[]');
   }
   const stop = await ask("GET", "/stop", undefined, {}, false);
   check("stop", `${stop.status} ${stop.body}`, "200 stopping\n");
-  log.push('GET /stop HTTP/1.1, b""');
+  log.push('GET /stop HTTP/1.1, b[]');
   const r = await served;
   if (r.status !== 0 || r.stderr) msgs.push(`FAIL http server (c): status ${r.status}\n${r.stderr}`);
   check("what the server said", r.stdout, log.map((l) => `${l}\n`).join(""));

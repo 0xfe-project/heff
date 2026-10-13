@@ -28,6 +28,42 @@ badPat p =
        (Params.spanOf p)
        "a pattern is a variable, a literal, a tag applied to patterns, or a record of patterns")
 
+-- | a segment of a binary pattern: what it holds (a name, `_`, a number
+-- | or a string), what it is, its size, its flags (lib/prelude.hf's
+-- | `bytesIntAt`'s)
+type BinSeg =
+  { value : Presyntax.Pat
+  , ty : Presyntax.SegmentType
+  , size : Presyntax.SegmentSize
+  , flags : Int
+  , span : Params.Span
+  }
+
+binSeg : Params.Spanned (Presyntax.Segment Presyntax.Pat) -> BinSeg
+binSeg (At (MkSegment v ty size little signed) sp) =
+  { value = v
+  , ty = ty
+  , size = size
+  , flags = Presyntax.segmentFlags little signed
+  , span = sp
+  }
+
+-- | the name a segment binds, if it binds one
+valueName : Presyntax.Pat -> Maybe String
+valueName (At (PatVar x) _) = if strEq x "_" then Nothing else Just x
+valueName _ = Nothing
+
+segName : BinSeg -> Maybe String
+segName s = valueName s.value
+
+-- | the name a segment's size is, if it is one
+sizeNameOf : Presyntax.SegmentSize -> Maybe String
+sizeNameOf (SizeName x _) = Just x
+sizeNameOf _ = Nothing
+
+sizeName : BinSeg -> Maybe String
+sizeName s = sizeNameOf s.size
+
 -- | a literal pattern is matched by the equality in scope for its kind
 -- | a record pattern names the fields it matches
 data MatchPat
@@ -37,6 +73,23 @@ data MatchPat
   | PRec (List (Pair String MatchPat)) Params.Span
   -- | `x@p`
   | PAs String MatchPat
+  -- | `b[...]`, a binary taken apart by its segments
+  | PBin (List BinSeg) Params.Span
+
+-- (a binary pattern of one segment: `b[x::binary]`, a name for them
+-- all, is that name)
+soleBin : BinSeg
+        -> Presyntax.Pat
+        -> Presyntax.SegmentType
+        -> Presyntax.SegmentSize
+        -> Params.Span
+        -> MatchPat
+soleBin s (At (PatVar x) _) SegmentBinary SizeDefault sp = PVar x
+soleBin s v ty size sp = PBin (Cons s Nil) sp
+
+binPat : List BinSeg -> Params.Span -> MatchPat
+binPat (Cons s Nil) sp = soleBin s s.value s.ty s.size sp
+binPat segs sp = PBin segs sp
 
 type Clause = { pats : List MatchPat, rhs : Presyntax.Checkable }
 
@@ -137,7 +190,7 @@ pat (At (PatTag t tsp ps) _) = do
   pure (PTag t qs tsp)
 pat p@(At (PatInt _) _) = Right (PLit p)
 pat p@(At (PatString _) _) = Right (PLit p)
-pat p@(At (PatBytes _) _) = Right (PLit p)
+pat (At (PatBinary segs) sp) = Right (binPat (List.map binSeg segs) sp)
 pat p@(At (PatRune _) _) = Right (PLit p)
 pat p@(At (PatFloat _) _) = Right (PLit p)
 pat p@(At (PatRecord fs) _) = do
@@ -152,7 +205,6 @@ pat p = badPat p
 -- | matches is not known
 equalityOf : Presyntax.Pat -> String
 equalityOf (At (PatString _) _) = "strEq"
-equalityOf (At (PatBytes _) _) = "bytesEq"
 equalityOf (At (PatRune _) _) = "runeEq"
 equalityOf (At (PatFloat _) _) = "floatEq"
 equalityOf _ = "intEq"
@@ -160,7 +212,6 @@ equalityOf _ = "intEq"
 sameLit : Presyntax.Pat -> Presyntax.Pat -> Bool
 sameLit (At (PatInt x) _) (At (PatInt y) _) = x == y
 sameLit (At (PatString x) _) (At (PatString y) _) = strEq x y
-sameLit (At (PatBytes x) _) (At (PatBytes y) _) = strEq x y
 sameLit (At (PatRune x) _) (At (PatRune y) _) = x == y
 sameLit (At (PatFloat x) _) (At (PatFloat y) _) = floatEq x y
 sameLit _ _ = False
@@ -169,7 +220,6 @@ sameLit _ _ = False
 litExpr : Presyntax.Pat -> Presyntax.Checkable
 litExpr (At (PatInt x) sp) = Presyntax.chkOf (At (IInt x) sp)
 litExpr (At (PatString x) sp) = Presyntax.chkOf (At (IString x) sp)
-litExpr (At (PatBytes x) sp) = Presyntax.chkOf (At (IBytes x) sp)
 litExpr (At (PatRune x) sp) = Presyntax.chkOf (At (IRune x) sp)
 litExpr (At (PatFloat x) sp) = Presyntax.chkOf (At (IFloat x) sp)
 litExpr (At _ sp) = At CAbandon sp
@@ -192,6 +242,11 @@ patVars (PTag _ ps _) = concatMapC (\p -> patVars p) ps
 patVars (PLit _) = Nil
 patVars (PRec fps _) = concatMapC (\fp -> patVars (snd fp)) fps
 patVars (PAs x p) = Cons x (patVars p)
+-- (and the names its sizes are: no name the match makes is one of them)
+patVars (PBin segs _) =
+  appendC
+    (catMaybesC (List.map segName segs))
+    (catMaybesC (List.map sizeName segs))
 
 -- Names written
 --------------------------------------------------------------------------------
@@ -221,6 +276,13 @@ patIdents (At (PatRecord fs) _) acc =
     (\f a -> case f of
      MkFieldPat x q -> Cons x (patIdents q a))
     fs
+    acc
+patIdents (At (PatBinary segs) _) acc =
+  namesOfAll
+    (\m a -> case m of
+     At (MkSegment v _ size _ _) _ ->
+       patIdents v (appendC (catMaybesC [sizeNameOf size]) a))
+    segs
     acc
 patIdents p acc = acc
 
@@ -401,6 +463,11 @@ patBinds (At (PatRecord fs) _) =
     (\f -> case f of
      MkFieldPat _ q -> patBinds q)
     fs
+patBinds (At (PatBinary segs) _) =
+  concatMapC
+    (\m -> case m of
+     At (MkSegment v _ _ _ _) _ -> patBinds v)
+    segs
 patBinds p = Nil
 
 binds : String -> Presyntax.Pat -> Bool
@@ -639,6 +706,10 @@ isLitP : MatchPat -> Bool
 isLitP (PLit _) = True
 isLitP _ = False
 
+isBinP : MatchPat -> Bool
+isBinP (PBin _ _) = True
+isBinP _ = False
+
 isRecP : MatchPat -> Bool
 isRecP (PRec _ _) = True
 isRecP _ = False
@@ -665,7 +736,8 @@ type CK =
 findTagLit : List MatchPat -> Int -> Maybe Int
 findTagLit Nil i = Nothing
 findTagLit (Cons p rest) i =
-  if isTagP p || isLitP p || isRecP p then Just i else findTagLit rest (i + 1)
+  if isTagP p || isLitP p || isRecP p || isBinP p then Just i
+  else findTagLit rest (i + 1)
 
 -- | (`bound`: every variable the match has bound so far, those taken
 -- | apart too -- an equation further down may still mean one of them,
@@ -766,6 +838,7 @@ tagColAt c v col r (PVar x) =
   anyStep c col (mkClause r.pats (bindVar v (PVar x) r.rhs))
 tagColAt c v col r (PLit l) = anyStep c col r
 tagColAt c v col r (PRec _ _) = col
+tagColAt c v col r (PBin _ _) = col
 -- (none: `compile` takes each `x@p` apart first)
 tagColAt c v col r (PAs _ _) = col
 
@@ -847,6 +920,7 @@ litYesOne c l v r acc = case patAt c r of
   PTag _ _ _ -> acc
   PRec _ _ -> acc
   PAs _ _ -> acc
+  PBin _ _ -> acc
 
 litYes : Int -> Presyntax.Pat -> String -> List Clause -> List Clause
 litYes c l v Nil = Nil
@@ -875,6 +949,11 @@ litChecks sp vars rows c l =
            (mkErr
               (Params.spanOf l)
               "a literal and a tag match the same argument")
+     else if anyC (\row -> isBinP (patAt c row)) rows
+       then Left
+           (mkErr
+              (Params.spanOf l)
+              "a literal and a binary match the same argument")
      else Right MkUnit)
     (\u1 ->
        if allC (\row -> isLitP (patAt c row)) rows
@@ -920,6 +999,7 @@ noLitHere sp c rows =
   forC rows (\row -> case patAt c row of
   PLit l ->
     Left (mkErr (Params.spanOf l) "a literal and a tag match the same argument")
+  PBin _ bsp -> Left (mkErr bsp "a binary and a tag match the same argument")
   _ -> Right MkUnit)
 
 clausePats : Clause -> List MatchPat
@@ -1004,6 +1084,8 @@ noRecMix rows c =
           (mkErr
              (Params.spanOf l)
              "a record and a literal match the same argument")
+      PBin _ bsp ->
+        Left (mkErr bsp "a record and a binary match the same argument")
       _ -> Right MkUnit)
   else Right MkUnit
 
@@ -1131,6 +1213,491 @@ tagsAt r used bound sp vars rows c col = do
   dflt <- defaultArm r used bound sp vars rows c
   pure (At (CMatch (At (IVar (varAt vars c)) sp) (appendC arms dflt)) sp)
 
+-- Binaries
+--------------------------------------------------------------------------------
+
+-- A column whose first row's pattern is a binary, `b[...]`: whether the
+-- value is one it matches (a test, of `Bool`), and if it is, the names
+-- its segments bind bound, each a column more (the first row's names in
+-- them), over the rows as they are -- another binary may match the value
+-- too, where the first row fails further on; if it is not, the rows
+-- after the first.  The test reads the value left to right, by the
+-- prelude's primitives: each segment there, a number or a string equal
+-- to its own, and the value all read but where the last takes what is
+-- left; a size a name, one an earlier segment binds (read in the test
+-- too) or one in scope.  Offsets and sizes are in bits.
+
+-- (the primitive or definition `p` applied)
+callOf : String
+       -> List Presyntax.Checkable
+       -> Params.Span
+       -> Presyntax.Inferable
+callOf p args sp =
+  At
+    (IApp (At (IPrim p) sp) (List.map (\c -> At (ArgExplicit c) sp) args))
+    sp
+
+callC : String -> List Presyntax.Checkable -> Params.Span -> Presyntax.Checkable
+callC p args sp = Presyntax.chkOf (callOf p args sp)
+
+intC : Int -> Params.Span -> Presyntax.Checkable
+intC n sp = Presyntax.chkOf (At (IInt n) sp)
+
+varC : String -> Params.Span -> Presyntax.Checkable
+varC x sp = Presyntax.chkOf (At (IVar x) sp)
+
+boolC : Bool -> Params.Span -> Presyntax.Checkable
+boolC b sp = At (CTag (if b then "True" else "False") sp Nil) sp
+
+-- (`c`, and then `rest`)
+andC : Presyntax.Inferable
+     -> Presyntax.Checkable
+     -> Params.Span
+     -> Presyntax.Checkable
+andC c rest sp =
+  At
+    (CMatch
+       c
+       [ Presyntax.alt (Presyntax.patTag "True" sp Nil) rest
+       , Presyntax.alt (Presyntax.patTag "False" sp Nil) (boolC False sp)
+       ])
+    sp
+
+letC : String
+     -> Presyntax.Inferable
+     -> Presyntax.Checkable
+     -> Params.Span
+     -> Presyntax.Checkable
+letC x rhs body sp = At (CLetIn rhs (Presyntax.alt (At (PatVar x) sp) body)) sp
+
+-- | an offset, or a width: bits known, and terms added to them
+type Off = { bits : Int, terms : List Presyntax.Checkable }
+
+offOf : Int -> Off
+offOf n = { bits = n, terms = Nil }
+
+offAdd : Off -> Off -> Off
+offAdd a b = { bits = a.bits + b.bits, terms = appendC a.terms b.terms }
+
+offC : Off -> Params.Span -> Presyntax.Checkable
+offC o sp =
+  List.foldl (\acc t -> callC "intAdd" [acc, t] sp) (intC o.bits sp) o.terms
+
+-- (in bytes: every offset is of whole bytes)
+offBytesC : Off -> Params.Span -> Presyntax.Checkable
+offBytesC o sp =
+  if List.null o.terms then intC (o.bits / 8) sp
+  else callC "intDiv" [offC o sp, intC 8 sp] sp
+
+-- | (the name an earlier segment binds `x` to, else `x`)
+resolve : List (Pair String String) -> String -> String
+resolve Nil x = x
+resolve (Cons (MkPair y t) rest) x = if strEq x y then t else resolve rest x
+
+-- | a segment's width (bytes that are left: none, they are last)
+widthBy : List (Pair String String)
+        -> Params.Span
+        -> Presyntax.SegmentType
+        -> Presyntax.SegmentSize
+        -> Presyntax.Pat
+        -> Off
+widthBy env sp SegmentInteger SizeDefault v = offOf 8
+widthBy env sp SegmentInteger (SizeNumber n) v = offOf n
+widthBy env sp SegmentInteger (SizeName x xsp) v =
+  { bits = 0, terms = [varC (resolve env x) xsp] }
+widthBy env sp SegmentBinary (SizeNumber n) v = offOf (8 * n)
+widthBy env sp SegmentBinary (SizeName x xsp) v =
+  { bits = 0
+  , terms = [callC "intMul" [varC (resolve env x) xsp, intC 8 sp] sp]
+  }
+widthBy env sp SegmentBinary SizeDefault (At (PatString str) _) =
+  offOf (8 * strLength str)
+widthBy env sp SegmentBinary SizeDefault v = offOf 0
+
+widthOf : List (Pair String String) -> BinSeg -> Off
+widthOf env s = widthBy env s.span s.ty s.size s.value
+
+-- | what the test of a column's binary knows: the value's name, the
+-- | name of its length in bits, the names some segment's size is, and
+-- | the names in use (none it makes is one of them)
+type BinCtx =
+  { v : String
+  , len : String
+  , sizes : List String
+  , used : List String
+  , bound : List String
+  , span : Params.Span
+  }
+
+-- (`n`, a size a name is, of a segment of the type: of 0 to 64 bits, a
+-- multiple of 8, an integer's; of 0 bytes or more, bytes')
+sizeOk : BinCtx
+       -> Presyntax.SegmentType
+       -> Presyntax.SegmentSize
+       -> Off
+       -> Presyntax.Checkable
+       -> Presyntax.Checkable
+sizeOk k SegmentInteger (SizeName _ _) w rest =
+  andC
+    (callOf "intLe" [intC 0 k.span, offC w k.span] k.span)
+    (andC
+       (callOf "intLe" [offC w k.span, intC 64 k.span] k.span)
+       (andC
+          (callOf
+             "intEq"
+             [ callC "intMod" [offC w k.span, intC 8 k.span] k.span
+             , intC 0 k.span
+             ]
+             k.span)
+          rest
+          k.span)
+       k.span)
+    k.span
+sizeOk k SegmentBinary (SizeName _ _) w rest =
+  andC (callOf "intLe" [intC 0 k.span, offC w k.span] k.span) rest k.span
+sizeOk k ty size w rest = rest
+
+-- (the segment there: its end within the value)
+fits : BinCtx -> Off -> Off -> Presyntax.Checkable -> Presyntax.Checkable
+fits k off w rest =
+  andC
+    (callOf "intLe" [offC (offAdd off w) k.span, varC k.len k.span] k.span)
+    rest
+    k.span
+
+-- | an integer's segment read
+intRead : BinCtx -> Off -> Off -> Int -> Presyntax.Inferable
+intRead k off w flags =
+  callOf
+    "bytesIntAt"
+    [varC k.v k.span, offC off k.span, offC w k.span, intC flags k.span]
+    k.span
+
+-- | the name the test reads the `i`th segment's size into, where a
+-- | later one's size is its name
+sizeTemp : BinCtx -> Int -> String
+sizeTemp k i = freshIn k.used k.bound (k.v ^ "Size" ^ show (i + 1))
+
+-- | the test of the segments from the `i`th, at `off` (`env`: the names
+-- | those before bind, as the test reads them)
+type BinTest =
+  { go :
+        List (Pair String String)
+        -> Int
+        -> Off
+        -> List BinSeg
+        -> Presyntax.Checkable
+  }
+
+-- (an integer's value: a number its own, a name a size is read)
+intTest : BinTest
+        -> BinCtx
+        -> List (Pair String String)
+        -> Int
+        -> Off
+        -> BinSeg
+        -> List BinSeg
+        -> Off
+        -> Presyntax.Pat
+        -> Presyntax.Checkable
+intTest t k env i off s rest w (At (PatInt n) _) =
+  andC
+    (callOf
+       "intEq"
+       [Presyntax.chkOf (intRead k off w s.flags), intC n k.span]
+       k.span)
+    (t.go env (i + 1) (offAdd off w) rest)
+    k.span
+intTest t k env i off s rest w (At (PatVar x) _) =
+  if List.elemBy strEq x k.sizes
+    then letC
+        (sizeTemp k i)
+        (intRead k off w s.flags)
+        (t.go (Cons (MkPair x (sizeTemp k i)) env) (i + 1) (offAdd off w) rest)
+        k.span
+  else t.go env (i + 1) (offAdd off w) rest
+intTest t k env i off s rest w v = t.go env (i + 1) (offAdd off w) rest
+
+segTest : BinTest
+        -> BinCtx
+        -> List (Pair String String)
+        -> Int
+        -> Off
+        -> BinSeg
+        -> List BinSeg
+        -> Off
+        -> Presyntax.SegmentType
+        -> Presyntax.SegmentSize
+        -> Presyntax.Pat
+        -> Presyntax.Checkable
+segTest t k env i off s rest w SegmentBinary SizeDefault (At (PatString str) vsp) =
+  andC
+    (callOf
+       "bytesHasAt"
+       [ varC k.v k.span
+       , offBytesC off k.span
+       , Presyntax.chkOf (At (IBytes str) vsp)
+       ]
+       k.span)
+    (t.go env (i + 1) (offAdd off w) rest)
+    k.span
+-- (the bytes that are left: the last, all of them)
+segTest t k env i off s rest w SegmentBinary SizeDefault v = boolC True k.span
+segTest t k env i off s rest w SegmentBinary size v =
+  sizeOk
+    k
+    SegmentBinary
+    size
+    w
+    (fits k off w (t.go env (i + 1) (offAdd off w) rest))
+segTest t k env i off s rest w SegmentInteger size v =
+  sizeOk
+    k
+    SegmentInteger
+    size
+    w
+    (fits k off w (intTest t k env i off s rest w v))
+
+binTestGo : BinTest
+          -> BinCtx
+          -> List (Pair String String)
+          -> Int
+          -> Off
+          -> List BinSeg
+          -> Presyntax.Checkable
+binTestGo t k env i off Nil =
+  Presyntax.chkOf (callOf "intEq" [offC off k.span, varC k.len k.span] k.span)
+binTestGo t k env i off (Cons s rest) =
+  segTest t k env i off s rest (widthOf env s) s.ty s.size s.value
+
+binTest : BinCtx -> BinTest
+binTest k = { go = \env i off segs -> binTestGo (binTest k) k env i off segs }
+
+-- (a segment's bytes, where it is written whole: a number of a size
+-- written, a string)
+wholeSeg : BinSeg
+         -> Presyntax.SegmentType
+         -> Presyntax.SegmentSize
+         -> Presyntax.Pat
+         -> Maybe String
+wholeSeg s SegmentInteger SizeDefault (At (PatInt n) _) =
+  Just (Presyntax.integerBytes 8 (s.flags % 2 == 1) n)
+wholeSeg s SegmentInteger (SizeNumber m) (At (PatInt n) _) =
+  Just (Presyntax.integerBytes m (s.flags % 2 == 1) n)
+wholeSeg s SegmentBinary SizeDefault (At (PatString str) _) = Just str
+wholeSeg s ty size v = Nothing
+
+-- | a binary's bytes, if each segment is written whole, after `acc`
+wholeBin : List BinSeg -> String -> Maybe String
+wholeBin Nil acc = Just acc
+wholeBin (Cons s rest) acc = case wholeSeg s s.ty s.size s.value of
+  Just b -> wholeBin rest (acc ^ b)
+  Nothing -> Nothing
+
+-- | the test, of `Bool`: the bytes, if the binary is written whole
+binTestOf : BinCtx -> List BinSeg -> Maybe String -> Presyntax.Checkable
+binTestOf k segs (Just b) =
+  callC
+    "bytesEq"
+    [varC k.v k.span, Presyntax.chkOf (At (IBytes b) k.span)]
+    k.span
+binTestOf k segs Nothing =
+  letC
+    k.len
+    (callOf
+       "intMul"
+       [callC "bytesLength" [varC k.v k.span] k.span, intC 8 k.span]
+       k.span)
+    ((binTest k).go Nil 0 (offOf 0) segs)
+    k.span
+
+-- | a segment's name bound to what it holds
+segRead : BinCtx
+        -> Off
+        -> Off
+        -> BinSeg
+        -> Presyntax.SegmentType
+        -> Presyntax.SegmentSize
+        -> Presyntax.Inferable
+segRead k off w s SegmentInteger size = intRead k off w s.flags
+segRead k off w s SegmentBinary SizeDefault =
+  callOf
+    "bytesSlice"
+    [ varC k.v k.span
+    , offBytesC off k.span
+    , callC "bytesLength" [varC k.v k.span] k.span
+    ]
+    k.span
+segRead k off w s SegmentBinary size =
+  callOf
+    "bytesSlice"
+    [varC k.v k.span, offBytesC off k.span, offBytesC (offAdd off w) k.span]
+    k.span
+
+-- | the names the segments bind, `ys` theirs, bound around `body`
+type BinBind =
+  { go :
+        List (Pair String String)
+        -> List String
+        -> Off
+        -> List BinSeg
+        -> Presyntax.Checkable
+        -> Presyntax.Checkable
+  }
+
+segBind : BinBind
+        -> BinCtx
+        -> List (Pair String String)
+        -> List String
+        -> Off
+        -> BinSeg
+        -> List BinSeg
+        -> Presyntax.Checkable
+        -> Off
+        -> Maybe String
+        -> Presyntax.Checkable
+segBind b k env ys off s rest body w Nothing =
+  b.go env ys (offAdd off w) rest body
+segBind b k env (Cons y ys) off s rest body w (Just x) =
+  letC
+    y
+    (segRead k off w s s.ty s.size)
+    (b.go (Cons (MkPair x y) env) ys (offAdd off w) rest body)
+    k.span
+segBind b k env Nil off s rest body w (Just x) = body
+
+binBindGo : BinBind
+          -> BinCtx
+          -> List (Pair String String)
+          -> List String
+          -> Off
+          -> List BinSeg
+          -> Presyntax.Checkable
+          -> Presyntax.Checkable
+binBindGo b k env ys off Nil body = body
+binBindGo b k env ys off (Cons s rest) body =
+  segBind b k env ys off s rest body (widthOf env s) (segName s)
+
+binBind : BinCtx -> BinBind
+binBind k =
+  { go = \env ys off segs body -> binBindGo (binBind k) k env ys off segs body }
+
+-- | a column of binaries matches no tag, literal or record, and a row
+-- | matches any value
+binChecks : List Clause -> Int -> Params.Span -> Either Err Unit
+binChecks rows c bsp =
+  if anyC (\row -> isTagP (patAt c row)) rows
+    then Left (mkErr bsp "a binary and a tag match the same argument")
+  else if anyC (\row -> isLitP (patAt c row)) rows
+    then Left (mkErr bsp "a literal and a binary match the same argument")
+  else if anyC (\row -> isRecP (patAt c row)) rows
+    then Left (mkErr bsp "a record and a binary match the same argument")
+  else if allC (\row -> isBinP (patAt c row)) rows
+    then Left
+        (mkErr
+           bsp
+           "binaries are matched here: one of them must match every other value (a variable, or `_`)")
+  else Right MkUnit
+
+-- | (`xs`: the names the first row's segments bind; `ys`: their columns)
+binaryWith : CK
+           -> List String
+           -> List String
+           -> Params.Span
+           -> List String
+           -> List Clause
+           -> Int
+           -> List BinSeg
+           -> Params.Span
+           -> List String
+           -> List String
+           -> Either Err Presyntax.Checkable
+binaryWith r used bound sp vars rows c segs bsp xs ys = do
+  binChecks rows c bsp
+  yesB <-
+    r.compile
+      used
+      (appendC ys bound)
+      sp
+      (appendC vars ys)
+      (mapWithIndexC
+         0
+         (\i (row : Clause) ->
+            if i == 0
+              then mkClause
+                  (appendC
+                     (spliceAt c [PVar "_"] row.pats)
+                     (List.map (\x -> PVar x) xs))
+                  row.rhs
+            else mkClause
+                (appendC row.pats (List.map (\(y : String) -> PVar "_") ys))
+                row.rhs)
+         rows)
+  noB <- r.compile used bound sp vars (dropC 1 rows)
+  pure
+      (At
+         (CMatch
+            (At
+               (IAnn
+                  (binTestOf
+                     { v = varAt vars c
+                     , len = freshIn used bound (varAt vars c ^ "Bits")
+                     , sizes = catMaybesC (List.map sizeName segs)
+                     , used = used
+                     , bound = bound
+                     , span = bsp
+                     }
+                     segs
+                     (wholeBin segs ""))
+                  (At (TInf (At (IPrim "builtin.Bool") bsp)) bsp))
+               bsp)
+            [ Presyntax.alt
+              (Presyntax.patTag "True" bsp Nil)
+              ((binBind
+                  { v = varAt vars c
+                  , len = ""
+                  , sizes = Nil
+                  , used = used
+                  , bound = bound
+                  , span = bsp
+                  }).go
+                 Nil
+                 ys
+                 (offOf 0)
+                 segs
+                 yesB)
+            , Presyntax.alt (Presyntax.patTag "False" bsp Nil) noB
+            ])
+         bsp)
+
+binaryOf : CK
+         -> List String
+         -> List String
+         -> Params.Span
+         -> List String
+         -> List Clause
+         -> Int
+         -> List BinSeg
+         -> Params.Span
+         -> Either Err Presyntax.Checkable
+binaryOf r used bound sp vars rows c segs bsp =
+  binaryWith
+    r
+    used
+    bound
+    sp
+    vars
+    rows
+    c
+    segs
+    bsp
+    (catMaybesC (List.map segName segs))
+    (mapWithIndexC
+       0
+       (\i (x : String) ->
+          freshIn used bound (varAt vars c ^ "Segment" ^ show (i + 1)))
+       (catMaybesC (List.map segName segs)))
+
 compileAt : CK
           -> List String
           -> List String
@@ -1145,6 +1712,8 @@ compileAt r used bound sp vars rows c (PLit l) = do
   literalOf r used bound sp vars rows c l
 compileAt r used bound sp vars rows c (PRec _ _) =
   recordOf r used bound sp vars rows c
+compileAt r used bound sp vars rows c (PBin segs bsp) =
+  binaryOf r used bound sp vars rows c segs bsp
 compileAt r used bound sp vars rows c p =
   tagsAt r used bound sp vars rows c (tagCol c (varAt vars c) rows)
 

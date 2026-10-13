@@ -46,12 +46,19 @@ const showString = (s) => {
   }
   return "\"" + out + JSON.stringify(text).slice(1, -1) + "\"";
 };
-// (bytes, a `Uint8Array`, as `bytes`'s `show` writes them, `b"..."`: a
-// byte of ASCII that is printed as it is, `"`, `\` and three controls
-// escaped, any other `\xff`)
-const escapes = { 0x22: "\\\"", 0x5c: "\\\\", 0x0a: "\\n", 0x0d: "\\r", 0x09: "\\t" };
-const showBytes = (b) => "b\"" + [...b].map((c) => escapes[c]
-  ?? (c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : "\\x" + c.toString(16).padStart(2, "0"))).join("") + "\"";
+// (bytes, a `Uint8Array`, as the prelude's `showBytes` writes them, a
+// binary: `b[...]`, each run of printable ASCII a string, `"` and `\`
+// escaped, any other byte its number)
+const showBytes = (b) => {
+  const pieces = [];
+  let run = "";
+  for (const c of b) {
+    if (c >= 0x20 && c < 0x7f) run += c === 0x22 ? "\\\"" : c === 0x5c ? "\\\\" : String.fromCharCode(c);
+    else { if (run) pieces.push("\"" + run + "\""); run = ""; pieces.push(String(c)); }
+  }
+  if (run) pieces.push("\"" + run + "\"");
+  return "b[" + pieces.join(", ") + "]";
+};
 // (a list as `[a, b]` writes it; a tag with arguments is parenthesized
 // where it is an argument)
 export const show = (v, arg = false) => {

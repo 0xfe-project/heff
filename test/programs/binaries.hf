@@ -1,0 +1,180 @@
+-- Binaries, `b[...]`, each backend held to the interpreter: made of
+-- segments of each type -- integers of each size, big- and
+-- little-endian, signed or not, bytes whole and their first so many,
+-- strings -- and taken apart by patterns: a header, a size read from an
+-- earlier segment, an equation that fails falling through to the next,
+-- binaries in a constructor, a record, a list and a `case`; and shown,
+-- as a binary writes them.
+
+import bytes as Bytes
+import uint8 as UInt8
+
+numbers : Bytes -> List Int
+numbers b = List.map UInt8.toInt (Bytes.toList b)
+
+-- Made
+--------------------------------------------------------------------------------
+
+-- (written whole: in C a static object)
+whole : List Bytes
+whole =
+  [ b[]
+  , b[1, 2, 255]
+  , b["GET ", 255, "\r\n"]
+  , b[258::16, 258::16-little, 258::24-big, -1::32, -2::16-little-signed]
+  , b[0x0102030405060708::64, 0x0102030405060708::64-little]
+  , b["", 0::8, "é", 0x7fffffffffffffff::64]
+  ]
+
+wholeNumbers : List (List Int)
+wholeNumbers = List.map numbers whole
+
+-- (made as the program runs, of what it is given)
+made : Int -> Bytes -> Bytes
+made n body =
+  b[ n
+   , n::16
+   , n::16-little
+   , n::32-big-signed
+   , n::64-little-unsigned
+   , body::binary
+   , "|"
+   , body::bytes-size(2)
+   , n * 2::integer-size(8)
+   ]
+
+madeNumbers : List (List Int)
+madeNumbers =
+  List.map
+    (\n -> numbers (made n b["abc"]))
+    [0, 1, 255, 256, -1, -129, 65535, 0x123456789abcdef0, -0x8000000000000000]
+
+-- (a segment's size, a name)
+sized : Int -> Int -> Bytes
+sized bits n = b[n::size(bits), 7]
+
+sizedNumbers : List (List Int)
+sizedNumbers = List.map (\bits -> numbers (sized bits 0x0102030405060708)) [8, 16, 40, 64]
+
+-- (the first so many of bytes: of fewer, abandoned)
+firstOf : Int -> Bytes -> Bytes
+firstOf n body = b[body::binary-size(n)]
+
+firstNumbers : List (List Int)
+firstNumbers = List.map (\n -> numbers (firstOf n b[1, 2, 3])) [0, 2, 3]
+
+-- Taken apart
+--------------------------------------------------------------------------------
+
+type Header = { tag : Int, body : Bytes, rest : Bytes }
+
+-- (a tag, a length of 16 bits, that many bytes, and what is left)
+header : Bytes -> Maybe Header
+header b[tag::8, len::16-big, body::binary-size(len), rest::binary] =
+  Just { tag = tag, body = body, rest = rest }
+header _ = Nothing
+
+headerOf : Bytes -> String
+headerOf b = case header b of
+  Just h -> show h.tag ^ " " ^ show h.body ^ " " ^ show h.rest
+  Nothing -> "none"
+
+headers : List String
+headers =
+  List.map
+    headerOf
+    [ b[7, 0, 2, "hi", "!!"]
+    , b[7, 0, 2, "hi"]
+    , b[7, 0, 3, "hi"]
+    , b[7, 0]
+    , b[]
+    , b[1, 0, 0]
+    ]
+
+-- (each equation in turn: a string first, numbers of each kind, a size
+-- read, what is left; one that fails further on falls through)
+method : Bytes -> Bool -> String
+method b["GET ", path::binary] True = "get " ^ toString path
+method b["GET ", path::binary] False = "get, not asked"
+method b[1, x::16-little-signed] _ = "one " ^ show x
+method b[2, n::8, xs::binary-size(n), 0] _ = "two " ^ show (numbers xs)
+method b[3, n::8, x::size(n)] _ = "three " ^ show x
+method b[255, _::8, _::binary] _ = "high"
+method b["GET"] _ = "bare"
+method _ _ = "other"
+
+methods : List String
+methods =
+  List.map
+    (\p -> method (fst p) (snd p))
+    [ MkPair b["GET /a"] True
+    , MkPair b["GET /a"] False
+    , MkPair b["GET"] False
+    , MkPair b[1, 255, 255] True
+    , MkPair b[1, 2] True
+    , MkPair b[2, 2, 9, 8, 0] True
+    , MkPair b[2, 2, 9, 8, 1] True
+    , MkPair b[3, 24, 1, 2, 3] True
+    , MkPair b[3, 12, 1, 2] True
+    , MkPair b[3, 72, 1] True
+    , MkPair b[255, 0] True
+    , MkPair b[255] True
+    , MkPair b[] True
+    ]
+
+type Part = { kind : Int, payload : Bytes }
+
+-- (in a constructor, a record and a list)
+nested : Maybe Bytes -> Part -> List Bytes -> String
+nested (Just b[a::16]) { kind = 1, payload = b[x::8, _::binary] } [b["z"], last] =
+  "all " ^ show a ^ " " ^ show x ^ " " ^ show last
+nested (Just b[a::16]) _ _ = "first " ^ show a
+nested _ { kind = k, payload = b[] } _ = "empty " ^ show k
+nested _ _ _ = "none"
+
+nesteds : List String
+nesteds =
+  [ nested (Just b[1, 2]) { kind = 1, payload = b[9, 9] } [b["z"], b["y"]]
+  , nested (Just b[1, 2]) { kind = 1, payload = b[9, 9] } [b["y"], b["y"]]
+  , nested (Just b[1]) { kind = 2, payload = b[] } []
+  , nested Nothing { kind = 3, payload = b[1] } []
+  ]
+
+-- (a `case`, a binary in each alternative)
+kindOf : Bytes -> String
+kindOf b = case b of
+  b[0x89, "PNG", _::binary] -> "png"
+  b["GIF8", v::8, "a", _::binary] -> "gif" ^ show (v - 48)
+  b[0xff, 0xd8, _::binary] -> "jpeg"
+  _ -> "unknown"
+
+kinds : List String
+kinds =
+  List.map
+    kindOf
+    [b[0x89, "PNG\r\n"], b["GIF89a..."], b["GIF8"], b[0xff, 0xd8, 0xff], b[]]
+
+-- Shown
+--------------------------------------------------------------------------------
+
+-- (each run of printable ASCII a string, any other byte its number: a
+-- binary that is what it shows)
+shown : List String
+shown =
+  List.map
+    show
+    [ b[]
+    , b["plain"]
+    , b["GET \xff\r\n"]
+    , b["\"quoted\" \\ back"]
+    , b[0, "a", 127, 128, "b"]
+    , b["é"]
+    ]
+
+roundTrip : List Bool
+roundTrip =
+  [ b["GET \xff\r\n"] == b["GET ", 255, 13, 10]
+  , b["\"quoted\" \\ back"] == b["\"quoted\" \\ back"]
+  , b[0, "a", 127, 128, "b"] == b[0, "a", 127, 128, "b"]
+  , b["é"] == b[195, 169]
+  ]

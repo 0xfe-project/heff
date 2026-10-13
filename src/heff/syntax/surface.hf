@@ -290,6 +290,7 @@ boundBy pv (PAtom t) =
 boundBy pv (PCon c args) = concatMapS (\q -> boundBy pv q) args
 boundBy pv (PParen o q c) = boundBy pv q
 boundBy pv (PList o ps commas c) = concatMapS (\q -> boundBy pv q) ps
+boundBy pv (PSeg q cc spec) = boundBy pv q
 boundBy pv (POp l op q) = appendS (boundBy pv l) (boundBy pv q)
 boundBy pv (PRec o fs commas c) = concatMapS (\q -> boundBy pv q) fs
 boundBy pv (PField x eq q) = boundBy pv q
@@ -1028,7 +1029,6 @@ atomTok t =
   else if strEq t.kind "int" then At (EInt (intOfText t.text)) (spanT t)
   else if strEq t.kind "float" then At (EFloat (floatOfText t.text)) (spanT t)
   else if strEq t.kind "str" then At (EString t.text) (spanT t)
-  else if strEq t.kind "bytes" then At (EBytes t.text) (spanT t)
   else if strEq t.kind "rune"
     then At (ERune (RuneUtil.codeAt t.text 0)) (spanT t)
   else if strEq t.kind "sym" then At (EVar t.text) (spanT t)
@@ -1041,7 +1041,6 @@ patTok t =
   else if strEq t.kind "int" then At (PatInt (intOfText t.text)) (spanT t)
   else if strEq t.kind "float" then At (PatFloat (floatOfText t.text)) (spanT t)
   else if strEq t.kind "str" then At (PatString t.text) (spanT t)
-  else if strEq t.kind "bytes" then At (PatBytes t.text) (spanT t)
   else if strEq t.kind "rune"
     then At (PatRune (RuneUtil.codeAt t.text 0)) (spanT t)
   else if strEq t.kind "sym" then At (PatVar t.text) (spanT t)
@@ -1437,6 +1436,319 @@ opL r a op b =
                (EInvalid "a specialisation sets fields: `T ~ { x = v }`")
                (Presyntax.spanning (Params.spanOf a') (Params.spanOf b')))
 
+-- Binaries
+
+-- A segment of a binary, `v::spec`: its spec is words, numbers and
+-- `size(n)` between `-`s -- what it is (`integer`, `binary` or `bytes`),
+-- its size (a number, or `size(n)`, `n` a number or a name), its
+-- endianness (`big`, `little`) and sign (`signed`, `unsigned`), each
+-- said at most once.  An integer's size is in bits, of 8 to 64 and a
+-- multiple of 8; bytes' in bytes.  A string is its bytes, all of them.
+
+-- | a spec, as read so far: each part, if it is said
+type Spec =
+  { ty : Maybe Presyntax.SegmentType
+  , size : Presyntax.SegmentSize
+  , little : Maybe Bool
+  , signed : Maybe Bool
+  }
+
+emptySpec : Spec
+emptySpec =
+  { ty = Nothing, size = SizeDefault, little = Nothing, signed = Nothing }
+
+-- | what a segment's value is, as the spec is checked against it
+data SegValue = StrValue | IntValue Int | OtherValue
+
+saidTwice : {a : Type} -> Params.Span -> String -> P a
+saidTwice sp what = throwP (diag sp ("a segment says its " ^ what ^ " once"))
+
+typeSaid : Params.Span
+         -> Presyntax.SegmentType
+         -> Maybe Presyntax.SegmentType
+         -> Spec
+         -> P Spec
+typeSaid sp ty Nothing s = pure { s | ty = Just ty }
+typeSaid sp ty (Just _) s = saidTwice sp "type"
+
+sizeSaid : Params.Span
+         -> Presyntax.SegmentSize
+         -> Presyntax.SegmentSize
+         -> Spec
+         -> P Spec
+sizeSaid sp n SizeDefault s = pure { s | size = n }
+sizeSaid sp n _ s = saidTwice sp "size"
+
+littleSaid : Params.Span -> Bool -> Maybe Bool -> Spec -> P Spec
+littleSaid sp b Nothing s = pure { s | little = Just b }
+littleSaid sp b (Just _) s = saidTwice sp "endianness"
+
+signedSaid : Params.Span -> Bool -> Maybe Bool -> Spec -> P Spec
+signedSaid sp b Nothing s = pure { s | signed = Just b }
+signedSaid sp b (Just _) s = saidTwice sp "sign"
+
+-- (a spec's tokens, the groups between `-`s; `cur`, the group read so
+-- far, the last first)
+specGroups : List CST.T -> List CST.T -> List (List CST.T) -> List (List CST.T)
+specGroups Nil cur acc = List.reverse (Cons (List.reverse cur) acc)
+specGroups (Cons t rest) cur acc =
+  if strEq t.text "-" then specGroups rest Nil (Cons (List.reverse cur) acc)
+  else specGroups rest (Cons t cur) acc
+
+notSpec : {a : Type} -> Params.Span -> P a
+notSpec sp =
+  throwP
+    (diag
+       sp
+       "a segment's spec is its type (`integer`, `binary`, `bytes`), size (`16`, `size(n)`), endianness (`big`, `little`) and sign (`signed`, `unsigned`), between `-`s: `x::16-little`")
+
+specWord : CST.T -> Spec -> P Spec
+specWord t s =
+  if strEq t.text "integer" then typeSaid (spanT t) SegmentInteger s.ty s
+  else if strEq t.text "binary" || strEq t.text "bytes"
+    then typeSaid (spanT t) SegmentBinary s.ty s
+  else if strEq t.text "big" then littleSaid (spanT t) False s.little s
+  else if strEq t.text "little" then littleSaid (spanT t) True s.little s
+  else if strEq t.text "signed" then signedSaid (spanT t) True s.signed s
+  else if strEq t.text "unsigned" then signedSaid (spanT t) False s.signed s
+  else notSpec (spanT t)
+
+-- (`n` in `size(n)`)
+sizeOf : CST.T -> Presyntax.SegmentSize
+sizeOf n =
+  if strEq n.kind "int" then SizeNumber (intOfText n.text)
+  else SizeName n.text (spanT n)
+
+-- (a group of a spec: a word, a number, `size(n)`)
+specGroup : Params.Span -> Spec -> List CST.T -> P Spec
+specGroup sp s (Cons t Nil) =
+  if strEq t.kind "int"
+    then sizeSaid (spanT t) (SizeNumber (intOfText t.text)) s.size s
+  else if strEq t.kind "var" then specWord t s
+  else notSpec (spanT t)
+specGroup sp s (Cons f (Cons o (Cons n (Cons c Nil)))) =
+  if strEq f.text "size"
+  && strEq o.text "("
+  && strEq c.text ")"
+  && (strEq n.kind "int" || strEq n.kind "var")
+    then sizeSaid (spanTT f c) (sizeOf n) s.size s
+  else notSpec (spanTT f c)
+specGroup sp s (Cons t rest) = notSpec (spanT t)
+specGroup sp s Nil = notSpec sp
+
+specGroupsOf : Params.Span -> Spec -> List (List CST.T) -> P Spec
+specGroupsOf sp s Nil = pure s
+specGroupsOf sp s (Cons g gs) = do
+  s' <- specGroup sp s g
+  specGroupsOf sp s' gs
+
+-- | the spec after `::` (`cc`, where an empty one is said)
+specOf : CST.T -> List CST.T -> P Spec
+specOf cc toks = specGroupsOf (spanT cc) emptySpec (specGroups toks Nil Nil)
+
+orFalse : Maybe Bool -> Bool
+orFalse (Just b) = b
+orFalse Nothing = False
+
+-- (a segment's type, as said, else a string's bytes and anything else an
+-- integer)
+typeOf : SegValue -> Maybe Presyntax.SegmentType -> Presyntax.SegmentType
+typeOf v (Just t) = t
+typeOf StrValue Nothing = SegmentBinary
+typeOf v Nothing = SegmentInteger
+
+-- | 2 to the `k`
+twoToS : Int -> Int
+twoToS k = if k <= 0 then 1 else 2 * twoToS (k - 1)
+
+-- (whether `v` is an integer of `n` bits: in a pattern, as the sign
+-- says it is read; written, either)
+fitsIn : Bool -> Bool -> Int -> Int -> Bool
+fitsIn True True n v = 0 - twoToS (n - 1) <= v && v < twoToS (n - 1)
+fitsIn True False n v = 0 <= v && v < twoToS n
+fitsIn False signed n v = 0 - twoToS (n - 1) <= v && v < twoToS n
+
+sizeBits : Presyntax.SegmentSize -> Maybe Int
+sizeBits SizeDefault = Just 8
+sizeBits (SizeNumber n) = Just n
+sizeBits (SizeName _ _) = Nothing
+
+-- (a number, in an integer's segment of `n` bits)
+integerFits : Bool -> Params.Span -> SegValue -> Spec -> Int -> P Unit
+integerFits inPat sp (IntValue v) s n =
+  if fitsIn inPat (orFalse s.signed) n v then pure MkUnit
+  else throwP
+      (diag
+         sp
+         (show v
+          ^ " does not fit in "
+          ^ show n
+          ^ " bits"
+          ^ (if not inPat then ""
+             else if orFalse s.signed then ", signed"
+             else ", unsigned")))
+integerFits inPat sp v s n = pure MkUnit
+
+-- (an integer's segment: its size, of 8 to 64 bits, a multiple of 8; a
+-- number, if it is, in it)
+integerChecks : Bool -> Params.Span -> SegValue -> Spec -> Maybe Int -> P Unit
+integerChecks inPat sp v s (Just n) =
+  if n < 8 || n > 64 || not (n % 8 == 0)
+    then throwP
+        (diag
+           sp
+           ("an integer's segment is of 8 to 64 bits, a multiple of 8, not "
+            ^ show n))
+  else integerFits inPat sp v s n
+integerChecks inPat sp v s Nothing = pure MkUnit
+
+checkInteger : Bool -> Params.Span -> SegValue -> Spec -> P Unit
+checkInteger inPat sp StrValue s =
+  throwP (diag sp "a string's segment is its bytes: `\"GET\"`, not an integer")
+checkInteger inPat sp v s = integerChecks inPat sp v s (sizeBits s.size)
+
+checkBinary : Params.Span -> SegValue -> Spec -> P Unit
+checkBinary sp (IntValue _) s =
+  throwP (diag sp "a number's segment is an integer: `1`, `258::16`")
+checkBinary sp StrValue { size = SizeDefault, little = Nothing, signed = Nothing } =
+  pure MkUnit
+checkBinary sp StrValue s =
+  throwP
+    (diag
+       sp
+       "a string's segment is its bytes, all of them, as they are: `\"GET\"`")
+checkBinary sp v { little = Nothing, signed = Nothing } = pure MkUnit
+checkBinary sp v s =
+  throwP
+    (diag
+       sp
+       "bytes are of no endianness nor sign: `x::binary`, `x::binary-size(4)`")
+
+checkSegment : Bool
+             -> Params.Span
+             -> SegValue
+             -> Spec
+             -> Presyntax.SegmentType
+             -> P Unit
+checkSegment inPat sp v s SegmentInteger = checkInteger inPat sp v s
+checkSegment inPat sp v s SegmentBinary = checkBinary sp v s
+
+-- | the segment `v::spec`, checked (`inPat`: in a pattern)
+segmentOf : {e : Type}
+          -> Bool
+          -> Params.Span
+          -> e
+          -> SegValue
+          -> Spec
+          -> P (Params.Spanned (Presyntax.Segment e))
+segmentOf inPat sp e v s = do
+  u <- checkSegment inPat sp v s (typeOf v s.ty)
+  pure
+      (At
+         (MkSegment
+            e
+            (typeOf v s.ty)
+            s.size
+            (orFalse s.little)
+            (orFalse s.signed))
+         sp)
+
+valueOfE : Presyntax.Expr -> SegValue
+valueOfE (At (EString _) _) = StrValue
+valueOfE (At (EInt v) _) = IntValue v
+valueOfE _ = OtherValue
+
+-- | a segment of a binary, written
+segmentL : Lw -> CST.E -> P (Params.Spanned (Presyntax.Segment Presyntax.Expr))
+segmentL r (Seg v cc spec) = do
+  v' <- r.e v
+  s <- specOf cc spec
+  segmentOf
+      False
+      (spanTE (CST.firstE v) (CST.lastE (Seg v cc spec)).end)
+      v'
+      (valueOfE v')
+      s
+segmentL r e = do
+  v' <- r.e e
+  segmentOf
+      False
+      (spanTE (CST.firstE e) (CST.lastE e).end)
+      v'
+      (valueOfE v')
+      emptySpec
+
+valueOfP : Presyntax.Pat -> SegValue
+valueOfP (At (PatString _) _) = StrValue
+valueOfP (At (PatInt v) _) = IntValue v
+valueOfP _ = OtherValue
+
+-- (what a pattern's segment holds: a name, `_`, a number or a string)
+segmentValue : CST.Pat -> Bool
+segmentValue (PAtom t) = List.elemBy strEq t.kind ["var", "int", "str"]
+segmentValue (PParen o p c) = segmentValue p
+segmentValue p = False
+
+-- (a pattern's segment that takes all the bytes left: bytes of no size
+-- said, but a string)
+takesRest : Presyntax.Segment Presyntax.Pat -> Bool
+takesRest (MkSegment (At (PatString _) _) _ _ _ _) = False
+takesRest (MkSegment _ SegmentBinary SizeDefault _ _) = True
+takesRest _ = False
+
+valueChecked : Params.Span -> Bool -> P Unit
+valueChecked sp True = pure MkUnit
+valueChecked sp False =
+  throwP
+    (diag
+       sp
+       "a segment of a binary pattern holds a name, `_`, a number or a string")
+
+segmentAt : {a : Type} -> Params.Spanned a -> a
+segmentAt (At x _) = x
+
+-- | a segment of a binary pattern (`last`: the last one)
+patSegmentWith : Lw
+               -> Bool
+               -> Params.Span
+               -> CST.Pat
+               -> Spec
+               -> P (Params.Spanned (Presyntax.Segment Presyntax.Pat))
+patSegmentWith r last sp p s = do
+  u <- valueChecked sp (segmentValue p)
+  p' <- r.pat p
+  seg <- segmentOf True sp p' (valueOfP p') s
+  if not last && takesRest (segmentAt seg)
+      then throwP
+          (diag
+             sp
+             "only the last segment takes the bytes that are left: say this one's size, `x::binary-size(n)`")
+    else pure seg
+
+patSegmentL : Lw
+            -> Bool
+            -> CST.Pat
+            -> P (Params.Spanned (Presyntax.Segment Presyntax.Pat))
+patSegmentL r last (PSeg p cc spec) = do
+  s <- specOf cc spec
+  patSegmentWith
+      r
+      last
+      (spanTE (CST.firstP p) (CST.lastP (PSeg p cc spec)).end)
+      p
+      s
+patSegmentL r last p =
+  patSegmentWith r last (spanTE (CST.firstP p) (CST.lastP p).end) p emptySpec
+
+patSegmentsL : Lw
+             -> List CST.Pat
+             -> P (List (Params.Spanned (Presyntax.Segment Presyntax.Pat)))
+patSegmentsL r Nil = pure Nil
+patSegmentsL r (Cons p rest) = do
+  x <- patSegmentL r (List.null rest) p
+  xs <- patSegmentsL r rest
+  pure (Cons x xs)
+
 -- | an argument: `(x := e)` names the parameter it is for
 argL : Lw -> CST.E -> P Presyntax.Expr
 argL r (Named o x k e c) = do
@@ -1472,7 +1784,11 @@ exprL r (Named o x k e c) = do
              ^ " := e)`"))
          (spanTT o c))
 exprL r (Tup o es commas c) =
-  if strEq o.text "["
+  if strEq o.text "b["
+    then do
+      segs <- traverseS (\m -> segmentL r m) es
+      pure (At (EBinary segs) (spanTT o c))
+  else if strEq o.text "["
     then do
       es' <- traverseS r.e es
       pure (listE (spanTT o c) es')
@@ -1571,9 +1887,14 @@ patL r (PCon c args) = do
   args' <- traverseS r.pat args
   pure (Presyntax.patTag c.text (spanT c) args')
 patL r (PParen o p c) = r.pat p
-patL r (PList o ps commas c) = do
-  ps' <- traverseS r.pat ps
-  pure (listP (spanTT o c) ps')
+patL r (PList o ps commas c) =
+  if strEq o.text "b["
+    then do
+      segs <- patSegmentsL r ps
+      pure (At (PatBinary segs) (spanTT o c))
+  else do
+    ps' <- traverseS r.pat ps
+    pure (listP (spanTT o c) ps')
 patL r (PRec o fs commas c) = do
   fs' <- traverseS (\f -> fieldPatL r f) fs
   pure (At (PatRecord fs') (spanTT o c))
@@ -1583,6 +1904,7 @@ patL r (POp l op q) = case pchainOf (POp l op q) of
     rest' <- traverseS (\m -> patOperandL r m) rest
     resolve applyPatOp h' rest'
 patL r (PField x eq p) = r.pat p
+patL r (PSeg p cc spec) = throwP (diag (spanT cc) "unexpected `::`")
 patL r (PAs x at p) = do
   p' <- r.pat p
   pure (At (PatAs x.text (spanT x) p') (spanTT x (CST.lastP p)))

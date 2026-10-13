@@ -45,13 +45,20 @@ data Pat
   | PField T T Pat
   -- | `x@p`, written close (no space on either side of the `@`)
   | PAs T T Pat
+  -- | `p::spec`, a segment of a binary pattern (`PList`, its bracket
+  -- | `b[`): the pattern, `::`, the spec's tokens
+  | PSeg Pat T (List T)
 
 data E
   = Atom T
   | EParen T E T
   | Named T T T E T
-  -- | `(a, b)`, or `[a, b]` (its brackets say which)
+  -- | `(a, b)`, or `[a, b]`, or a binary, `b[a, b]` (its brackets say
+  -- | which)
   | Tup T (List E) (List T) T
+  -- | `e::spec`, a segment of a binary: the value, `::`, the spec's
+  -- | tokens (words, numbers, `-`, `size(n)`'s)
+  | Seg E T (List T)
   | Braces T (List E) (List T) T
   -- | `{ e | x = v, y.z = w }`, a record with fields replaced: the
   -- | record, `|`, the settings (each `EUSet`)
@@ -375,7 +382,7 @@ startsAtom t =
   List.elemBy
     strEq
     t.kind
-    ["var", "con", "int", "float", "str", "bytes", "rune", "neg"]
+    ["var", "con", "int", "float", "str", "rune", "neg"]
   || (isKind t "kw"
       && (List.elemBy
             strEq
@@ -390,7 +397,8 @@ startsAtom t =
             , "abandon"
             ]
           || Fixed.isFixedName t.text))
-  || (isKind t "punct" && (isText t "(" || isText t "{" || isText t "["))
+  || (isKind t "punct"
+      && (isText t "(" || isText t "{" || isText t "[" || isText t "b["))
 
 startsItem : T -> Bool
 startsItem t =
@@ -709,12 +717,75 @@ parensF g = do
             c <- expectPunct ")"
             pure (EParen o e c))
 
+-- A binary, `b[...]`: its segments, each a value, perhaps `::` and a
+-- spec.  The first `::` outside brackets ends the value (cons, `::`, in
+-- one, is in parentheses); the spec is the words, numbers, `-`s and
+-- parentheses up to the next `,` or `]` (the lowering reads it).
+
+-- | a token of a spec: a word, a number, `-`, `(`, `)`
+isSpecTok : T -> Bool
+isSpecTok t =
+  isKind t "var"
+  || isKind t "int"
+  || (isKind t "punct" && (isText t "(" || isText t ")"))
+  || ((isKind t "sym" || isKind t "neg") && isText t "-")
+
+-- | a spec's tokens
+specToksGo : List T -> P (List T)
+specToksGo acc = do
+  t <- peek
+  if isSpecTok t
+      then do
+        x <- next
+        specToksGo (Cons x acc)
+    else pure (List.reverse acc)
+
+-- (an operand's operators up to a `::`)
+segOperandsF : Gram -> List E -> P (List E)
+segOperandsF g acc = do
+  t <- peek
+  if isOperator t && not (isText t "::")
+      then do
+        op <- next
+        u <- peek
+        if startsClosed u
+            then do
+              e <- g.expr
+              pure (List.reverse (Cons (OpRhs op e) acc))
+          else do
+            e <- g.app
+            segOperandsF g (Cons (OpRhs op e) acc)
+    else pure (List.reverse acc)
+
+-- | a segment's value: `a + b`, as written, or a lambda, `case`, `if`,
+-- | `do`
+segValueF : Gram -> P E
+segValueF g = do
+  t <- peek
+  if startsClosed t then g.expr
+    else do
+      e0 <- g.app
+      rest <- segOperandsF g Nil
+      pure (if List.null rest then e0 else Ops e0 rest)
+
+-- | a segment of a binary: `e`, or `e::spec`
+segmentF : Gram -> P E
+segmentF g = do
+  v <- segValueF g
+  t <- peek
+  if isKind t "sym" && isText t "::"
+      then do
+        cc <- next
+        spec <- specToksGo Nil
+        pure (Seg v cc spec)
+    else pure v
+
 atomBase : Gram -> T -> P E
 atomBase g t =
   if List.elemBy
     strEq
     t.kind
-    ["var", "con", "int", "float", "str", "bytes", "rune"]
+    ["var", "con", "int", "float", "str", "rune"]
   || (isKind t "kw"
       && (List.elemBy
             strEq
@@ -733,6 +804,7 @@ atomBase g t =
   else if isKind t "punct" && isText t "(" then parensF g
   else if isKind t "punct" && isText t "{" then bracesF g
   else if isKind t "punct" && isText t "[" then listOfF g.expr mkTup
+  else if isKind t "punct" && isText t "b[" then listOfF (segmentF g) mkTup
   else throwP (diag (spanOf t) ("expected an expression, not " ^ shown t))
 
 -- | the arguments of an application, with fields: `x`, `C`, `3`, `"s"`,
@@ -934,6 +1006,18 @@ patternF g = do
         pure (POp p op r)
     else pure p
 
+-- | a segment of a binary pattern: `p`, or `p::spec`
+patSegmentF : Gram -> P Pat
+patSegmentF g = do
+  p <- g.patAtom
+  t <- peek
+  if isKind t "sym" && isText t "::"
+      then do
+        cc <- next
+        spec <- specToksGo Nil
+        pure (PSeg p cc spec)
+    else pure p
+
 -- | `x`, `_`, `C` (with no arguments), a literal, `x@p`, `[...]`, `{...}`, `(p)`
 patAtomF : Gram -> P Pat
 patAtomF g = do
@@ -954,11 +1038,13 @@ patAtomF g = do
     else if List.elemBy
       strEq
       t.kind
-      ["var", "con", "int", "float", "str", "bytes", "rune"]
+      ["var", "con", "int", "float", "str", "rune"]
       then do
         x <- next
         pure (PAtom x)
     else if isKind t "punct" && isText t "[" then listOfF g.pattern mkPList
+    else if isKind t "punct" && isText t "b["
+      then listOfF (patSegmentF g) mkPList
     else if isKind t "punct" && isText t "{" then recordPatF g
     else if isKind t "punct" && isText t "("
       then do
@@ -1348,6 +1434,7 @@ firstP (PList o ps commas c) = o
 firstP (PRec o fs commas c) = o
 firstP (PField x eq p) = x
 firstP (PAs x at p) = x
+firstP (PSeg p cc spec) = firstP p
 
 lastP : Pat -> T
 lastP (POp l op r) = lastP r
@@ -1360,12 +1447,14 @@ lastP (PList o ps commas c) = c
 lastP (PRec o fs commas c) = c
 lastP (PField x eq p) = lastP p
 lastP (PAs x at p) = lastP p
+lastP (PSeg p cc spec) = fromMaybe cc (List.last spec)
 
 firstE : E -> T
 firstE (Atom t) = t
 firstE (EParen o e c) = o
 firstE (Named o x k e c) = o
 firstE (Tup o es commas c) = o
+firstE (Seg v cc spec) = firstE v
 firstE (Braces o fs commas c) = o
 firstE (InstB o o2 d c1 c) = o
 firstE (Update o r bar fs commas c) = o
@@ -1397,6 +1486,7 @@ lastE (Atom t) = t
 lastE (EParen o e c) = c
 lastE (Named o x k e c) = c
 lastE (Tup o es commas c) = c
+lastE (Seg v cc spec) = fromMaybe cc (List.last spec)
 lastE (Braces o fs commas c) = c
 lastE (InstB o o2 d c1 c) = c
 lastE (Update o r bar fs commas c) = c
@@ -1515,6 +1605,7 @@ tsP (PRec o fs commas c) =
   Cons o (List.append (interleaveT (List.map tsP fs) commas) (Cons c Nil))
 tsP (PField x eq p) = Cons x (Cons eq (tsP p))
 tsP (PAs x at p) = Cons x (Cons at (tsP p))
+tsP (PSeg p cc spec) = List.append (tsP p) (Cons cc spec)
 
 tsE : E -> List T
 tsE (Atom t) = Cons t Nil
@@ -1523,6 +1614,7 @@ tsE (Named o x k e c) =
   Cons o (Cons x (Cons k (List.append (tsE e) (Cons c Nil))))
 tsE (Tup o es commas c) =
   Cons o (List.append (interleaveT (List.map tsE es) commas) (Cons c Nil))
+tsE (Seg v cc spec) = List.append (tsE v) (Cons cc spec)
 tsE (Braces o fs commas c) =
   Cons o (List.append (interleaveT (List.map tsE fs) commas) (Cons c Nil))
 tsE (InstB o o2 d c1 c) =

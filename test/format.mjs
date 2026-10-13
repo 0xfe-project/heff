@@ -55,7 +55,7 @@ const formatted = async (dir, texts) => {
 };
 
 // (but those that do not parse, or lex, on purpose, which are left)
-const unparsed = ["test/errors/instance-where.hf", "test/errors/negation-pattern.hf", "test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf", "test/errors/bytes-literals.hf"];
+const unparsed = ["test/errors/instance-where.hf", "test/errors/negation-pattern.hf", "test/errors/recover.hf", "test/errors/rune-literals.hf", "test/errors/string-escapes.hf"];
 const files = execFileSync("git", ["ls-files", "*.hf"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean)
   // (the index may still list a file the working copy has removed)
   .filter((f) => existsSync(join(root, f)));
@@ -81,13 +81,16 @@ formats("rune literals, as written", "x : List Rune\nx = ['\\u{41}',   '😀', '
 formats("string escapes, as written", "x : String\nx =   \"\\u{41}\\u{1F600}\\u\\n\\\"\"\n",
   "x : String\nx = \"\\u{41}\\u{1F600}\\u\\n\\\"\"\n");
 
-formats("bytes literals, as written", "x : List Bytes\nx = [b\"\\u{41}\\xFF\",   b\"é\\n\\\"\",b\"\" ]\n",
-  "x : List Bytes\nx = [b\"\\u{41}\\xFF\", b\"é\\n\\\"\", b\"\"]\n");
-formats("a bytes literal pattern", "m : Bytes -> Int\nm   b\"GET\" = 1\nm _ = 0\n",
-  "m : Bytes -> Int\nm b\"GET\" = 1\nm _ = 0\n");
-// (a `b` apart from a string, or in a name, is a name's)
-formats("b and a string, apart", "x : Int\nx = f b   \"s\" ab\"t\"\n",
-  "x : Int\nx = f b \"s\" ab \"t\"\n");
+formats("binaries, as written", "x : List Bytes\nx = [b[ \"\\u{41}\\xFF\",  255 ,x::16-big],b[] ,b[y::binary-size( n ), z::binary]]\n",
+  "x : List Bytes\nx = [b[\"\\u{41}\\xFF\", 255, x::16-big], b[], b[y::binary-size(n), z::binary]]\n");
+formats("a binary pattern", "m : Bytes -> Int\nm   b[ \"GET\", n::8 ,  rest::binary ] = n\nm _ = 0\n",
+  "m : Bytes -> Int\nm b[\"GET\", n::8, rest::binary] = n\nm _ = 0\n");
+// (a segment's value, as an expression is; cons in it, in parentheses)
+formats("a segment's value", "x : Bytes\nx = b[a  +  1::32-little, (y :: ys)::binary]\n",
+  "x : Bytes\nx = b[a + 1::32-little, (y :: ys)::binary]\n");
+// (a `b` apart from a `[`, or in a name, is a name's)
+formats("b and a list, apart", "x : Int\nx = f b   [1] ab[2]\n",
+  "x : Int\nx = f b [1] ab [2]\n");
 
 formats("blank lines, at most one", "data Bool = True | False\n\n\n\nx : Bool\n\nx = True\n",
   "data Bool = True | False\n\nx : Bool\n\nx = True\n");

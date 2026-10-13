@@ -166,7 +166,8 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
 #define HEFF_STATIC_STR(name, kind, n, bytes) \
   static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n) + 1]; } name = {{0x80000000u, kind, 0}, n, n, bytes}
 #define HEFF_LIT(name, n, bytes) HEFF_STATIC_STR(name, K_STR, n, bytes)
-// (`Bytes` written in the program, `b"..."`, static as a string is)
+// (`Bytes` written in the program, a binary written whole, `b["hi", 255]`,
+// static as a string is)
 #define HEFF_BYTES(name, n, bytes) HEFF_STATIC_STR(name, K_BYT, n, bytes)
 typedef struct { Obj h; double d; } Flt;
 typedef struct { Obj h; int64_t n; V a[]; } Arr;
@@ -2622,7 +2623,7 @@ static V heff_arrayToList(V a) {
 
 // (`Bytes` (lib/bytes.hf), never changed once made: a string's `Str`, of
 // the kind `K_BYT` -- dropped, copied for a thread and grown by an append
-// as a string is, and shown as `b"..."`.  Their length, slice and
+// as a string is, and shown as a binary, `b[...]`.  Their length, slice and
 // equality are a string's; a byte is a `UInt8`, a word of its value)
 static Str *heff_bytes_new(int64_t len) {
   Str *s = heff_str_new(len);
@@ -3682,24 +3683,30 @@ static int heff_is_list(V v) {
   return heff_tag_named(v, "Nil", 0, &f);
 }
 
-// (bytes as `bytes`'s `show` writes them, `b"..."`: a byte of ASCII that
-// is printed as it is, `"`, `\` and three controls escaped, any other
-// `\xff`)
+// (bytes as the prelude's `showBytes` writes them, a binary: `b[...]`,
+// each run of printable ASCII a string, `"` and `\` escaped, any other
+// byte its number)
 static void heff_show_bytes(Buf *b, V v) {
   Str *s = (Str *)v;
-  buf_str(b, "b\"");
+  int run = 0, any = 0;
+  buf_str(b, "b[");
   for (int64_t i = 0; i < s->len; i++) {
     uint8_t c = s->s[i];
-    char tmp[8];
-    if (c == '"') buf_str(b, "\\\"");
-    else if (c == '\\') buf_str(b, "\\\\");
-    else if (c == '\n') buf_str(b, "\\n");
-    else if (c == '\r') buf_str(b, "\\r");
-    else if (c == '\t') buf_str(b, "\\t");
-    else if (c >= 0x20 && c < 0x7f) { char o = (char)c; buf_put(b, &o, 1); }
-    else { snprintf(tmp, sizeof tmp, "\\x%02x", c); buf_str(b, tmp); }
+    if (c >= 0x20 && c < 0x7f) {
+      if (!run) { buf_str(b, any ? ", \"" : "\""); run = any = 1; }
+      if (c == '"') buf_str(b, "\\\"");
+      else if (c == '\\') buf_str(b, "\\\\");
+      else { char o = (char)c; buf_put(b, &o, 1); }
+    } else {
+      char tmp[8];
+      if (run) { buf_str(b, "\""); run = 0; }
+      snprintf(tmp, sizeof tmp, "%s%u", any ? ", " : "", (unsigned)c);
+      buf_str(b, tmp);
+      any = 1;
+    }
   }
-  buf_str(b, "\"");
+  if (run) buf_str(b, "\"");
+  buf_str(b, "]");
 }
 
 static void heff_show(Buf *b, V v, int arg);
