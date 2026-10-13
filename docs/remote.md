@@ -110,7 +110,7 @@ refuses.
 
 The server's handler is the effect's real one, as `through` takes one:
 each operation, done in the server's world (the notes in a cell of
-`std.ref`).  `std.remote` (`import std.remote as RemoteHttp`) answers a
+`std.reference`).  `std.remote` (`import std.remote as RemoteHttp`) answers a
 `POST` of a call's frame with the answer's frame, `RemoteHttp.routed
 "/api" api handler other` the requests of `/api` so, any other by
 `other` (the page and its script); over std.http.server, each
@@ -118,8 +118,8 @@ connection a green thread of its own:
 
 ```haskell
 kept : {e : HFunctor}
-     -> {{cell : ref (List Note) <: e}}
-     -> Ref (List Note)
+     -> {{cell : reference (List Note) <: e}}
+     -> Reference (List Note)
      -> {a : Type}
      -> NotesF (Co e) a
      -> Co e a

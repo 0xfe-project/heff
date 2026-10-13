@@ -101,7 +101,7 @@ counted by it alone, and what is shared is immortal, counted by none.
   another computing it meanwhile has the same value and lets its own
   go.  A big integer written in the program likewise.
 - **The world's table** of handles (`heff_hold`, `heff_held`,
-  `heff_release`) is locked, and so are `std.ref`'s cells, whose values
+  `heff_release`) is locked, and so are `std.reference`'s cells, whose values
   go in and out as copies.
 
 Why a definition's value is computed once and frozen, not computed by
@@ -147,9 +147,9 @@ holds it.
 
 Safe, in threads at once: pure code, all of it -- a task, a side of a
 `Parallel`, a spread's thread -- and the definitions it reads; `std.io`
-(a write is one `fwrite`, whole: C locks the stream); `std.ref`'s cells (locked,
-a value going in and out a copy); the world's table of handles
-(locked).  A task of a pool is pure: it has no effects to run.
+(a write is one `fwrite`, whole: C locks the stream); `std.reference`'s
+cells (locked, a value going in and out a copy); the world's table of
+handles (locked).  A task of a pool is pure: it has no effects to run.
 
 Not safe, or not as one thread would do:
 
@@ -169,9 +169,9 @@ Not safe, or not as one thread would do:
   what the computing thread held of it besides.
 - A copy is as big as what it copies, and takes as long: a large value
   handed to many threads is copied for each (or frozen once, and kept).
-  `std.ref` copies a value each time it is read or written.
+  `std.reference` copies a value each time it is read or written.
 - Other providers' tables are their own to lock.  The library's:
-  `std.ref` and the world's table are locked; `std.progress` locks its
+  `std.reference` and the world's table are locked; `std.progress` locks its
   own; `std.io`, `std.filesystem`, `std.http`, `std.net`, `std.time`
   and `std.process` keep no tables (`exit` in a thread ends the
   process; `std.net`'s sockets are the world's).

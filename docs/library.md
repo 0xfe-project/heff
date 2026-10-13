@@ -130,7 +130,7 @@ What is above, in `lib/`, is pure, the same on every backend.
 - `std.http.server`, an HTTP/1.1 server written over `std.net`, C's
   as `std.net` is, and `std.remote`, an API's server over it and its
   client by `std.http` ([a client and its server](remote.md));
-- `std.ref` (the world's cells) and `std.time`: effects needed on both
+- `std.reference` (the world's cells) and `std.time`: effects needed on both
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
 - `std.handle` (the world's things, which one effect hands out and
@@ -325,11 +325,11 @@ main = do
 ```
 
 `std.filesystem` is files.  Whole ones: `readFile` (a file's text,
-`Maybe String`), `writeFile`, `readDirectory`, `makeDirectory` (a directory and those
-it is in: whether a directory is there -- a file there is none),
-`remove`, `copy`, `move`, `replace`, and `readOnly` and `writable` (a
-file, or a directory and all it holds, made read-only, and writable by
-its owner again), each answering whether it was done.
+`Maybe String`), `writeFile`, `readDirectory`, `makeDirectory` (a
+directory and those it is in: whether a directory is there -- a file
+there is none), `remove`, `copy`, `move`, `replace`, and `readOnly` and
+`writable` (a file, or a directory and all it holds, made read-only, and
+writable by its owner again), each answering whether it was done.
 
 What a path is: `pathStatus path`, links followed, and `linkStatus path`, a
 link itself, are `Either FileError Status`, a `Status` its `kind`
