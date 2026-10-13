@@ -1,7 +1,8 @@
 -- A language server (the Language Server Protocol, over stdio) for `.hf`
 -- files: diagnostics, hover, go to definition, completion, formatting,
--- an outline; and, over the whole project, references and renaming, and
--- the symbols of every file.
+-- an outline, splitting a variable into cases (src/heff/lsp/split.hf);
+-- and, over the whole project, references and renaming, and the symbols
+-- of every file.
 --
 -- A document is elaborated with what it imports, from its text in the
 -- editor; an import open in the editor is read from there too, else from
@@ -23,6 +24,7 @@ import heff.elab.params as Params
 import heff.build.query as Query
 import heff.lsp.render as Render
 import heff.lsp.rpc as Rpc
+import heff.lsp.split as Split
 import heff.build.session as Session
 import map as Map
 import rune as Rune
@@ -508,6 +510,10 @@ capabilities =
          , kv "renameProvider" (obj [kv "prepareProvider" jtrue])
          , kv "documentSymbolProvider" jtrue
          , kv "workspaceSymbolProvider" jtrue
+         -- (splitting a variable into cases)
+         , kv
+           "codeActionProvider"
+           (obj [kv "codeActionKinds" (JArray [jstr "refactor.rewrite"])])
          ])
     , kv "serverInfo" (obj [kv "name" (jstr "heff")])
     ]
@@ -1077,6 +1083,130 @@ formatted st id p = do
         l <- Load.loadProgramWith (\q -> readOpen st q) st.lib f
         formattedIn st id d (Driver.fixitiesIn l.sources)
 
+-- Splitting a variable into cases
+--------------------------------------------------------------------------------
+
+-- | the type of a variable of an equation that does not use it: the
+-- | document elaborated again, after what it imports as elaborated
+-- | already, with the equation's body the variable alone
+probedType : {e : HFunctor}
+           -> {{disk : fs <: e}}
+           -> St
+           -> String
+           -> List Driver.Checked
+           -> Driver.Checked
+           -> Split.Spot
+           -> Co e (Maybe String)
+probedType st f program c s = do
+  l <-
+    Load.loadProgramWith
+      (\q ->
+         if strEq q f then pure (Just (Split.probeText c.source s))
+         else readOpen st q)
+      st.lib
+      f
+  pure (case List.last l.sources of
+    Just source ->
+      Split.typeUsedAt
+        (Driver.elabNext (dropLast program) source Nothing)
+        s.name
+        (Split.probeAt s)
+    Nothing -> Nothing)
+
+splitType : {e : HFunctor}
+          -> {{disk : fs <: e}}
+          -> St
+          -> String
+          -> List Driver.Checked
+          -> Driver.Checked
+          -> Split.Spot
+          -> Co e (Maybe String)
+splitType st f program c s = case Split.usedType c s of
+  Just t -> pure (Just t)
+  Nothing -> probedType st f program c s
+
+splitAction : String -> String -> Split.Split -> Json
+splitAction uri src x =
+  obj
+    [ kv "title" (jstr x.title)
+    , kv "kind" (jstr "refactor.rewrite")
+    , kv
+      "edit"
+      (obj
+         [ kv
+           "changes"
+           (JObject
+              [ MkPair
+                uri
+                (JArray
+                   [ obj
+                     [ kv "range" (range src (Query.mkSpan x.start x.end))
+                     , kv "newText" (jstr x.text)
+                     ]
+                   ])
+              ])
+         ])
+    ]
+
+splitIn : {e : HFunctor}
+        -> {{disk : fs <: e}}
+        -> St
+        -> String
+        -> String
+        -> List Driver.Checked
+        -> Driver.Checked
+        -> Int
+        -> Co e (List Json)
+splitIn st f uri program c off = case Split.spotAt c off of
+  Nothing -> pure Nil
+  Just s -> do
+    ty <- splitType st f program c s
+    pure (case ty of
+      Just t -> case Split.split program c s t of
+        Just x -> [splitAction uri c.source x]
+        Nothing -> Nil
+      Nothing -> Nil)
+
+-- (a kind of code action asked for that a rewrite is of)
+rewriteKind : Json -> Bool
+rewriteKind (JString k) = startsWith k "refactor.rewrite"
+rewriteKind _ = False
+
+-- | whether a request for code actions takes a rewrite: it names no
+-- | kinds, or one a rewrite is of
+wantsRewrite : Json -> Bool
+wantsRewrite p = case arr ["context", "only"] p of
+  Just ks -> List.any rewriteKind ks
+  Nothing -> True
+
+-- | the code actions at the start of a request's range: splitting the
+-- | pattern variable there into cases
+codeActions : {e : HFunctor}
+            -> {{disk : fs <: e}}
+            -> {{wire : Rpc.rpc <: e}}
+            -> Asked
+            -> Json
+            -> Co e (List Json)
+codeActions a p = do
+  mf <- docPath p
+  case mf of
+    Just f -> case List.last a.program of
+      Just c ->
+        if wantsRewrite p && strEq c.source a.text
+          then splitIn
+              a.st
+              f
+              (fromMaybe "" (str ["textDocument", "uri"] p))
+              a.program
+              c
+              (offsetOf
+                 a.text
+                 (fromMaybe 0 (int ["range", "start", "line"] p))
+                 (fromMaybe 0 (int ["range", "start", "character"] p)))
+        else pure Nil
+      Nothing -> pure Nil
+    Nothing -> pure Nil
+
 request : {e : HFunctor}
         -> {{disk : fs <: e}}
         -> {{wire : Rpc.rpc <: e}}
@@ -1175,6 +1305,12 @@ request st m id p =
       tg <- withTarget st p
       renamed id (fromMaybe "" (str ["newName"] p)) tg
   else if strEq m "textDocument/formatting" then formatted st id p
+  else if strEq m "textDocument/codeAction"
+    then do
+      a <- withProgram st p
+      js <- codeActions a p
+      reply id (JArray js)
+      pure a.st
   else do
     replyError id (0 - 32601) ("no method " ^ m)
     pure st

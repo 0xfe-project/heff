@@ -104,6 +104,29 @@ corners =
   ]
 ```
 
+## The language server
+
+`heff lsp` speaks the Language Server Protocol on its standard streams:
+diagnostics as the text is typed, hover, go to definition, completion,
+formatting, an outline, references, renaming and symbols across the
+project, and one code action, splitting a variable into cases.  On a
+variable of an equation's patterns, of a `data` type or a record type,
+it writes the equation again for each of the type's tags (once, a
+record's fields named), the variable replaced by the tag applied to
+names the equation has none of; the other patterns and the body are
+kept as they are.
+
+```haskell
+len : List Int -> Int
+len xs = 0
+-- split `xs`:
+len Nil = 0
+len (x :: xs1) = 0
+```
+
+A variable of another type, a lambda's, or one a `case` matches is not
+split: what a split makes is equations.
+
 ## Progress
 
 On a terminal, `heff build`, `install`, `test` and `get` draw what

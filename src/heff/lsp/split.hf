@@ -1,0 +1,525 @@
+-- Splitting a variable into cases, as Agda's C-c C-c does: a pattern
+-- variable of a top-level equation, of a `data` type or a record type,
+-- and the equation written again once for each of the type's tags (a
+-- record's, once, its fields named), the variable replaced by the tag
+-- applied to fresh variables.  Each equation keeps the body as it was:
+-- heff has no holes to leave in its place.
+--
+-- The variable's type is the elaborator's: a use of it has its type
+-- (`Query.infoAt`).  The language server finds one in the equation's
+-- body, else elaborates the document again with the body the variable
+-- alone (`probeText`; src/heff/lsp/lsp.hf).
+
+import heff.build.driver as Driver
+import heff.elab.globals as Globals
+import heff.elab.locals as Locals
+import heff.elab.params as Params
+import heff.syntax.presyntax as Presyntax
+import heff.build.query as Query
+import heff.syntax.surface as Surface
+import uint8 as UInt8
+
+-- Small things
+--------------------------------------------------------------------------------
+
+firstJust : {a : Type} -> List (Maybe a) -> Maybe a
+firstJust Nil = Nothing
+firstJust (Cons (Just x) _) = Just x
+firstJust (Cons Nothing rest) = firstJust rest
+
+catMaybesS : {a : Type} -> List (Maybe a) -> List a
+catMaybesS Nil = Nil
+catMaybesS (Cons (Just x) rest) = Cons x (catMaybesS rest)
+catMaybesS (Cons Nothing rest) = catMaybesS rest
+
+within : Int -> Params.Span -> Bool
+within off sp = sp.start <= off && off <= sp.end
+
+isLetter : Int -> Bool
+isLetter c = 97 <= c && c <= 122 || 65 <= c && c <= 90
+
+isUpper : Int -> Bool
+isUpper c = 65 <= c && c <= 90
+
+isBlank : Int -> Bool
+isBlank c = c == 32 || c == 9
+
+-- (the end of the name that starts at `i`: its characters, a qualified
+-- one's dots among them)
+nameEnd : String -> Int -> Int
+nameEnd s i =
+  if i < strLength s && (Query.isNameChar (byteAt s i) || byteAt s i == 46)
+    then nameEnd s (i + 1)
+  else i
+
+-- | a module's declarations: as elaborated, else read again from its
+-- | text (a module thawed from the cache keeps none)
+declsOf : Driver.Checked -> List Presyntax.Decl
+declsOf c =
+  if List.null c.decls
+    then (Surface.readProgramWith
+            { known = Surface.noKnown, fixities = c.fixities, lenient = True }
+            c.source).decls
+  else c.decls
+
+-- Lines
+--------------------------------------------------------------------------------
+
+lineEnd : String -> Int -> Int
+lineEnd src i = fromMaybe (strLength src) (indexFrom "\n" src i)
+
+lineStart : String -> Int -> Int
+lineStart src i =
+  if i <= 0 then 0
+  else if byteAt src (i - 1) == 10 then i
+  else lineStart src (i - 1)
+
+-- (the first byte from `i` on that is no space or tab)
+indentEnd : String -> Int -> Int
+indentEnd src i =
+  if i < strLength src && isBlank (byteAt src i) then indentEnd src (i + 1)
+  else i
+
+-- (the start of the first line from `i` on with something on it)
+nextContent : String -> Int -> Maybe Int
+nextContent src i =
+  if indentEnd src i >= strLength src then Nothing
+  else if byteAt src (indentEnd src i) == 10
+    then nextContent src (indentEnd src i + 1)
+  else Just i
+
+-- | the end of an equation's last line, from `i`, the end of one of its
+-- | lines: a line after it indented past the equation's column `col` is
+-- | the equation's too, as layout reads it.  (A body's span ends with
+-- | its last term, before a closing parenthesis.)
+-- | >>> extentEnd "f x =\n  (g\n\n    x)\ny = 1\n" 0 5
+-- | 18
+extentEnd : String -> Int -> Int -> Int
+extentEnd src col i = case nextContent src (i + 1) of
+  Just s ->
+    if indentEnd src s - s > col then extentEnd src col (lineEnd src s) else i
+  Nothing -> i
+
+-- The variable at an offset
+--------------------------------------------------------------------------------
+
+-- | a variable a pattern binds: its name, where it is
+type Named = { name : String, span : Params.Span }
+
+-- (a name a variable is written as: not `_`, nor an operator)
+splittable : String -> Bool
+splittable x = strLength x > 0 && isLetter (byteAt x 0)
+
+fieldPattern : Presyntax.FieldPat Presyntax.Pat -> Presyntax.Pat
+fieldPattern (MkFieldPat _ p) = p
+
+-- | the variable a pattern binds at an offset
+varIn : Int -> Presyntax.Pat -> Maybe Named
+varIn off (At (PatVar x) sp) =
+  if within off sp && splittable x then Just { name = x, span = sp }
+  else Nothing
+varIn off (At (PatTag _ _ ps) _) = firstJust (List.map (\p -> varIn off p) ps)
+varIn off (At (PatOp _ _ ps) _) = firstJust (List.map (\p -> varIn off p) ps)
+varIn off (At (PatRecord fs) _) =
+  firstJust (List.map (\f -> varIn off (fieldPattern f)) fs)
+varIn off (At (PatAs _ _ p) _) = varIn off p
+varIn off _ = Nothing
+
+-- | a pattern variable of a top-level equation: its name and where it
+-- | is; where the equation starts, where its body does (after its `=`),
+-- | and where its last line ends
+type Spot =
+  { name : String, span : Params.Span, start : Int, equals : Int, end : Int }
+
+lastEnd : List Presyntax.Pat -> Int -> Int
+lastEnd ps i =
+  List.foldl (\n (p : Presyntax.Pat) -> max n (Params.spanOf p).end) i ps
+
+spotOf : String -> Named -> Params.Span -> List Presyntax.Pat -> Maybe Spot
+spotOf src v sp ps = case indexFrom "=" src (lastEnd ps sp.start) of
+  Just eq ->
+    Just
+      { name = v.name
+      , span = v.span
+      , start = sp.start
+      , equals = eq + 1
+      , end =
+          extentEnd src (sp.start - lineStart src sp.start) (lineEnd src sp.end)
+      }
+  Nothing -> Nothing
+
+spotInEquation : String
+               -> Int
+               -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+               -> Maybe Spot
+spotInEquation src off (At (MkEquation _ _ ps _) sp) = case firstJust
+    (List.map (\p -> varIn off p) ps) of
+  Just v -> spotOf src v sp ps
+  Nothing -> Nothing
+
+spotInDecl : String -> Int -> Presyntax.Decl -> Maybe Spot
+spotInDecl src off (At (DeclEquations _ _ _ _ eqs) _) =
+  firstJust (List.map (\e -> spotInEquation src off e) eqs)
+spotInDecl src off _ = Nothing
+
+-- | the pattern variable of a top-level equation at an offset
+spotAt : Driver.Checked -> Int -> Maybe Spot
+spotAt c off = firstJust (List.map (\d -> spotInDecl c.source off d) c.decls)
+
+-- Its type
+--------------------------------------------------------------------------------
+
+-- (a name with no key: a local)
+isLocal : Maybe String -> Bool
+isLocal (Just _) = False
+isLocal Nothing = True
+
+-- | the type of the local `x` used at `off`, as elaborated
+typeUsedAt : Driver.Checked -> String -> Int -> Maybe String
+typeUsedAt c x off = case Query.infoAt c off of
+  Just i ->
+    if strEq i.name x && isLocal i.key then Just (i.ty MkUnit) else Nothing
+  Nothing -> Nothing
+
+-- | the variable's type, where its equation's body uses it
+usedType : Driver.Checked -> Spot -> Maybe String
+usedType c s = case List.find
+    (\(l : Locals.Local) -> Query.sameSpan l.binder s.span)
+    (Locals.locals c.decls).locals of
+  Just l -> case List.head l.uses of
+    Just u -> typeUsedAt c s.name u.start
+    Nothing -> Nothing
+  Nothing -> Nothing
+
+-- | the document's text with the equation's body the variable alone,
+-- | which says its type where it is used (at `probeAt`)
+probeText : String -> Spot -> String
+probeText src s =
+  strSlice src 0 s.equals ^ " " ^ s.name ^ strSlice src s.end (strLength src)
+
+probeAt : Spot -> Int
+probeAt s = s.equals + 1
+
+-- (whether `->` is in `s` from `i` on, `d` brackets deep, outside them)
+arrowOutside : String -> Int -> Int -> Bool
+arrowOutside s i d =
+  if i + 1 >= strLength s then False
+  else if byteAt s i == 40 || byteAt s i == 91 || byteAt s i == 123
+    then arrowOutside s (i + 1) (d + 1)
+  else if byteAt s i == 41 || byteAt s i == 93 || byteAt s i == 125
+    then arrowOutside s (i + 1) (d - 1)
+  else if d == 0 && byteAt s i == 45 && byteAt s (i + 1) == 62 then True
+  else arrowOutside s (i + 1) d
+
+-- | the name a type is headed by, as printed: none for a function's
+-- | type, a type variable, an unknown
+-- | >>> List.map typeHead ["List Int", "Map.Map String Int", "Int -> Int", "a", "?3", "Maybe (Int -> Int)"]
+-- | [Just "List", Just "Map.Map", Nothing, Nothing, Nothing, Just "Maybe"]
+typeHead : String -> Maybe String
+typeHead t =
+  if strLength t > 0 && isUpper (byteAt t 0) && not (arrowOutside t 0 0)
+    then Just (strSlice t 0 (nameEnd t 0))
+  else Nothing
+
+-- What makes a value of it
+--------------------------------------------------------------------------------
+
+-- | a tag, and the types of its arguments
+type Tag = { name : String, args : List Presyntax.Expr }
+
+-- | what makes a value of a type: one of its tags (the type's parameters
+-- | named, what an argument's type may be), or a record of its fields
+data Made = ByTags (List String) (List Tag) | ByFields (List String)
+
+paramName : Params.Spanned (Presyntax.Param Presyntax.Expr) -> String
+paramName (At (ExplicitParam x _ _) _) = x
+paramName (At (ImplicitParam x _ _) _) = x
+
+tagOf : Params.Spanned (Presyntax.Variant Presyntax.Expr) -> Maybe Tag
+tagOf (At (TagVariant t _ args) _) = Just { name = t, args = args }
+tagOf (At (BadVariant _) _) = Nothing
+
+fieldName : Params.Spanned (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)
+          -> Maybe String
+fieldName (At (DeclareField x _ _ _) _) = Just x
+fieldName (At (BadFieldDecl _) _) = Nothing
+
+-- (a type with no tags, or no fields, has nothing to split into)
+madeOf : List String -> Presyntax.Expr -> Maybe Made
+madeOf ps (At (ESum vs) _) =
+  if List.null vs then Nothing
+  else Just (ByTags ps (catMaybesS (List.map tagOf vs)))
+madeOf ps (At (ESig fs) _) =
+  if List.null fs then Nothing
+  else Just (ByFields (catMaybesS (List.map fieldName fs)))
+madeOf ps _ = Nothing
+
+madeByDecl : Presyntax.Decl -> Maybe Made
+madeByDecl (At (DeclDefine _ _ ps _ body) _) =
+  madeOf (List.map paramName ps) body
+madeByDecl _ = Nothing
+
+defines : String -> Presyntax.Decl -> Bool
+defines x d = case Presyntax.declName d of
+  Just y -> strEq x y
+  Nothing -> False
+
+-- (the declaration `c` has of the key `k`)
+declIn : String -> Driver.Checked -> Maybe Presyntax.Decl
+declIn k c = case List.find (\(o : Driver.Own) -> strEq o.key k) c.own of
+  Just o -> List.find (\d -> defines o.name d) (declsOf c)
+  Nothing -> Nothing
+
+-- | what makes a value of the type named `x` in `c`, in its program
+madeBy : List Driver.Checked -> Driver.Checked -> String -> Maybe Made
+madeBy program c x = case Globals.lookupKey c.top.globals x of
+  Just (MkPair k _) -> case firstJust (List.map (\c2 -> declIn k c2) program) of
+    Just d -> madeByDecl d
+    Nothing -> Nothing
+  Nothing -> Nothing
+
+-- The operator a tag is written as
+--------------------------------------------------------------------------------
+
+patName : Presyntax.Pat -> Maybe String
+patName (At (PatVar x) _) = Just x
+patName _ = Nothing
+
+exprName : Presyntax.Expr -> Maybe String
+exprName (At (EVar x) _) = Just x
+exprName (At (ETag x) _) = Just x
+exprName _ = Nothing
+
+twoNames : List (Maybe String) -> Maybe (Pair String String)
+twoNames (Cons (Just a) (Cons (Just b) Nil)) = Just (MkPair a b)
+twoNames _ = Nothing
+
+-- (`T`, of `(op) a b = T a b`)
+aliasedTag : List Presyntax.Pat -> Presyntax.Expr -> Maybe String
+aliasedTag ps (At (EApp f args) _) = case twoNames (List.map patName ps) of
+  Just (MkPair a b) -> case twoNames (List.map exprName args) of
+    Just (MkPair a2 b2) ->
+      if strEq a a2 && strEq b b2 then exprName f else Nothing
+    Nothing -> Nothing
+  Nothing -> Nothing
+aliasedTag ps _ = Nothing
+
+equationTag : Params.Spanned (Presyntax.Equation Presyntax.Expr) -> Maybe String
+equationTag (At (MkEquation _ _ ps body) _) = aliasedTag ps body
+
+isOperator : String -> Bool
+isOperator x = strLength x > 0 && not (Query.isNameChar (byteAt x 0))
+
+-- (whether `x`, as `g` has it, is `c`'s)
+inScopeAs : Globals.Globals -> Driver.Checked -> String -> Bool
+inScopeAs g c x = case Query.keyOf c x of
+  Just k -> case Globals.lookupKey g x of
+    Just (MkPair k2 _) -> strEq k k2
+    Nothing -> False
+  Nothing -> False
+
+-- (the tag an operator `c` defines is another name for, and the
+-- operator, if `g` has it in scope)
+operatorOf : Globals.Globals
+           -> Driver.Checked
+           -> Presyntax.Decl
+           -> Maybe (Pair String String)
+operatorOf g c (At (DeclEquations op _ _ _ (Cons e Nil)) _) =
+  if isOperator op && inScopeAs g c op
+    then case equationTag e of
+      Just t -> Just (MkPair t op)
+      Nothing -> Nothing
+  else Nothing
+operatorOf g c _ = Nothing
+
+-- (whether `c` defines an operator `g` has in scope)
+hasOperator : Globals.Globals -> Driver.Checked -> Bool
+hasOperator g c =
+  List.any
+    (\(o : Driver.Own) -> isOperator o.name && inScopeAs g c o.name)
+    c.own
+
+operatorsIn : Globals.Globals -> Driver.Checked -> List (Pair String String)
+operatorsIn g c =
+  if hasOperator g c
+    then catMaybesS (List.map (\d -> operatorOf g c d) (declsOf c))
+  else Nil
+
+-- | the operators in scope in `c` that are other names for tags, as `::`
+-- | is for `Cons`: each tag, and its operator
+operators : List Driver.Checked -> Driver.Checked -> List (Pair String String)
+operators program c =
+  List.concatMap (\c2 -> operatorsIn c.top.globals c2) program
+
+-- Fresh names
+--------------------------------------------------------------------------------
+
+lowerInitial : String -> String
+lowerInitial x =
+  if strLength x > 0 && isUpper (byteAt x 0)
+    then fromByte (UInt8.fromInt (byteAt x 0 + 32))
+  else strSlice x 0 1
+
+-- (what follows the last dot of `x` from `i`, `from` where it starts)
+lastPart : String -> Int -> Int -> String
+lastPart x i from =
+  if i >= strLength x then strSlice x from (strLength x)
+  else if byteAt x i == 46 then lastPart x (i + 1) (i + 1)
+  else lastPart x (i + 1) from
+
+-- (a type named `x`: `x` its parameter's -- `ps` -- or a type's name)
+nameHint : List String -> String -> String
+nameHint ps x =
+  if List.elemBy strEq x ps then "x"
+  else if strEq x "List" then "xs"
+  else lowerInitial (lastPart x 0 0)
+
+wordHint : Presyntax.SyntaxWord -> String
+wordHint IntWord = "n"
+wordHint StringWord = "s"
+wordHint RuneWord = "c"
+wordHint (FixedWord _) = "n"
+wordHint _ = "x"
+
+-- | the name an argument of a type is given, by its type: a list's
+-- | `xs`, a number's `n`, a function's `f`, a type's its initial (`b` of
+-- | `Bool`), a parameter's `x`
+hintOf : List String -> Presyntax.Expr -> String
+hintOf ps (At (EVar x) _) = nameHint ps x
+hintOf ps (At (EApp f _) _) = hintOf ps f
+hintOf ps (At (EWord w) _) = wordHint w
+hintOf ps (At (EPi _ _) _) = "f"
+hintOf ps _ = "x"
+
+-- (the names a hint is given as, before it is numbered)
+alternatives : String -> List String
+alternatives "x" = ["x", "y", "z"]
+alternatives "n" = ["n", "m", "k"]
+alternatives b = [b]
+
+numbered : List String -> String -> Int -> String
+numbered taken b i =
+  if List.elemBy strEq (b ^ showInt i) taken then numbered taken b (i + 1)
+  else b ^ showInt i
+
+-- | a name for a hint none of `taken` is: the hint, else another of its
+-- | alternatives, else it numbered
+-- | >>> List.map (fresh ["x", "xs", "n"]) ["x", "xs", "n", "s"]
+-- | ["y", "xs1", "m", "s"]
+fresh : List String -> String -> String
+fresh taken b = case List.find
+    (\x -> not (List.elemBy strEq x taken))
+    (alternatives b) of
+  Just x -> x
+  Nothing -> numbered taken b 1
+
+freshNames : List String -> List String -> List String
+freshNames taken Nil = Nil
+freshNames taken (Cons b bs) =
+  let x = fresh taken b in Cons x (freshNames (Cons x taken) bs)
+
+-- (the names written from `i` to `e`, `acc` more)
+wordsIn : String -> Int -> Int -> List String -> List String
+wordsIn src i e acc =
+  if i >= e then acc
+  else if Query.isNameChar (byteAt src i)
+    then wordsIn
+        src
+        (nameEnd src i)
+        e
+        (Cons (strSlice src i (nameEnd src i)) acc)
+  else wordsIn src (i + 1) e acc
+
+-- The equations
+--------------------------------------------------------------------------------
+
+-- | what splitting a variable makes: the action's title, and the
+-- | equations that replace the one from `start` to `end`
+type Split = { title : String, start : Int, end : Int, text : String }
+
+-- (the variable is in parentheses alone: none are needed around it)
+bare : String -> Spot -> Bool
+bare src s =
+  s.span.start > 0
+  && byteAt src (s.span.start - 1) == 40
+  && byteAt src s.span.end == 41
+
+parenthesized : Bool -> String -> String
+parenthesized True p = p
+parenthesized False p = "(" ^ p ^ ")"
+
+applied : Maybe String -> String -> List String -> String
+applied (Just op) t (Cons a (Cons b Nil)) = a ^ " " ^ op ^ " " ^ b
+applied _ t xs = t ^ " " ^ joinWith " " xs
+
+-- | a tag applied to variables, as a pattern: by the operator that is
+-- | another name for it, if there is one
+tagPattern : Maybe String -> Bool -> String -> List String -> String
+tagPattern op inParens t xs =
+  if List.null xs then t else parenthesized inParens (applied op t xs)
+
+recordPattern : List String -> List String -> String
+recordPattern fs xs =
+  "{ " ^ joinWith ", " (List.zipWith (\f x -> f ^ " = " ^ x) fs xs) ^ " }"
+
+-- (the patterns of tags, `ops` the operators that are other names for
+-- them)
+tagPatterns : List (Pair String String)
+            -> String
+            -> Spot
+            -> List String
+            -> List String
+            -> List Tag
+            -> List String
+tagPatterns ops src s taken ps tags =
+  List.map
+    (\(t : Tag) ->
+       tagPattern
+         (List.lookupBy strEq t.name ops)
+         (bare src s)
+         t.name
+         (freshNames taken (List.map (\a -> hintOf ps a) t.args)))
+    tags
+
+patternsOf : List Driver.Checked
+           -> Driver.Checked
+           -> Spot
+           -> List String
+           -> Made
+           -> List String
+patternsOf program c s taken (ByTags ps tags) =
+  tagPatterns (operators program c) c.source s taken ps tags
+patternsOf program c s taken (ByFields fs) =
+  [recordPattern fs (freshNames taken fs)]
+
+-- (the equation written again, its variable replaced by `p`)
+equationWith : String -> Spot -> String -> String
+equationWith src s p =
+  strSlice src s.start s.span.start ^ p ^ strSlice src s.span.end s.end
+
+-- | The equation of `s` split by its variable, of the type `ty`: once
+-- | for each of the type's tags, applied to names that none written in
+-- | the equation is (its variable's among them), or once for a record,
+-- | its fields named as they are; nothing for another type.
+split : List Driver.Checked -> Driver.Checked -> Spot -> String -> Maybe Split
+split program c s ty = case typeHead ty of
+  Just h -> case madeBy program c h of
+    Just m ->
+      Just
+        { title = "Split `" ^ s.name ^ "` into cases"
+        , start = s.start
+        , end = s.end
+        , text =
+            joinWith
+              ("\n" ^ strSlice c.source (lineStart c.source s.start) s.start)
+              (List.map
+                 (\p -> equationWith c.source s p)
+                 (patternsOf
+                    program
+                    c
+                    s
+                    (wordsIn c.source s.start s.end Nil)
+                    m))
+        }
+    Nothing -> Nothing
+  Nothing -> Nothing

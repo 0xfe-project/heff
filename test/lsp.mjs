@@ -4,7 +4,7 @@
 // as the command line goes), files changed on disk, hover and go to
 // definition (across modules, past non-ASCII text), completion, an outline,
 // references and renaming across the project, doc tests (their errors,
-// shown in a hover), formatting, shutdown.
+// shown in a hover), splitting a variable into cases, formatting, shutdown.
 import { spawn } from "node:child_process";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -70,7 +70,8 @@ try {
   const init = await request("initialize", { processId: process.pid, rootUri: pathToFileURL(root).href, capabilities: { workspace: { didChangeWatchedFiles: { dynamicRegistration: true } } } });
   const caps = init.result.capabilities;
   expect("capabilities", caps.hoverProvider && caps.definitionProvider && caps.documentFormattingProvider && caps.textDocumentSync.change === 1 &&
-    caps.referencesProvider && caps.renameProvider.prepareProvider && caps.documentSymbolProvider && caps.workspaceSymbolProvider, caps);
+    caps.referencesProvider && caps.renameProvider.prepareProvider && caps.documentSymbolProvider && caps.workspaceSymbolProvider &&
+    caps.codeActionProvider.codeActionKinds.includes("refactor.rewrite"), caps);
   notify("initialized", {});
   // (asked to be told of the files changed on disk)
   const registration = await note((m) => m.method === "client/registerCapability", "client/registerCapability");
@@ -511,6 +512,63 @@ try {
   notify("workspace/didChangeWatchedFiles", { changes: [{ uri: uri(watched), type: 3 }] });
   expect("a file deleted on disk", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
   notify("textDocument/didClose", { textDocument: { uri: uri("test/modules/src/a.hf") } });
+
+  // splitting a pattern variable into cases: its equation once for each
+  // tag of its type (a list's `Cons` by `::`, as the prelude writes it), or
+  // once for a record, with names none in the equation is; the other
+  // patterns and the body kept; nothing for a type that is no data, a
+  // lambda's binder, or a request for another kind of action
+  const splitSrc = [
+    "data Shape = Circle Int | Rect Int Int", "", "type Point = { x : Int, y : Int }", "",
+    "len : List Int -> Int", "len xs = 0", "",
+    "size : Maybe Bool -> Int -> Int", "size m n = n", "",
+    "area : Shape -> Int", "area s = 0", "",
+    "px : Point -> Int", "px p = 1", "",
+    "sum2 : List Int -> Int -> Int", "sum2 xs x = x", "",
+    "inner : List Int -> Int", "inner (Cons y ys) = y", "inner _ = 0", "",
+    "flag : Bool -> Pair Int Int -> Int", "flag b p = 0", "",
+    "wrap : Maybe Int -> List Int", "wrap m =", "  Cons 1 (Cons 2", "    Nil)", "",
+    "apply : (Int -> Int) -> Int", "apply f = 0", "",
+    "lam : Bool -> Bool", "lam = \\c -> c", "",
+  ].join("\n");
+  const splitU = uri("test/surface/lsp-split.hf");
+  open("test/surface/lsp-split.hf", splitSrc);
+  ds = await diagnosticsOf(splitU);
+  expect("a file to split in", ds.length === 0, ds);
+  const splitAt = async (at, only) => {
+    const p = pos(splitSrc, at.text, 0);
+    const start = { line: p.line, character: p.character + at.offset };
+    const r = await request("textDocument/codeAction", { textDocument: { uri: splitU }, range: { start, end: start }, context: { diagnostics: [], ...(only ? { only } : {}) } });
+    return r.result;
+  };
+  const splitTo = async (what, at, title, expected) => {
+    const acts = await splitAt(at);
+    const edit = acts && acts.length === 1 && acts[0].edit.changes[splitU];
+    const line = pos(splitSrc, at.text).line;
+    expect(what, acts && acts.length === 1 && acts[0].title === title && acts[0].kind === "refactor.rewrite" && edit && edit.length === 1 &&
+      edit[0].range.start.line === line && edit[0].range.start.character === 0 && edit[0].newText === expected, acts);
+    return edit;
+  };
+  await splitTo("split a list", { text: "len xs", offset: 5 }, "Split `xs` into cases", "len Nil = 0\nlen (x :: xs1) = 0");
+  await splitTo("split a Maybe, the other pattern kept", { text: "size m n", offset: 5 }, "Split `m` into cases", "size Nothing n = n\nsize (Just x) n = n");
+  await splitTo("split a data type of one's own", { text: "area s", offset: 5 }, "Split `s` into cases", "area (Circle n) = 0\narea (Rect n m) = 0");
+  await splitTo("split a record", { text: "px p", offset: 3 }, "Split `p` into cases", "px { x = x, y = y } = 1");
+  await splitTo("split with names taken", { text: "sum2 xs", offset: 5 }, "Split `xs` into cases", "sum2 Nil x = x\nsum2 (y :: xs1) x = x");
+  await splitTo("split a variable in a pattern", { text: "inner (Cons y ys)", offset: 14 }, "Split `ys` into cases", "inner (Cons y Nil) = y\ninner (Cons y (x :: xs)) = y");
+  await splitTo("split a Bool", { text: "flag b", offset: 5 }, "Split `b` into cases", "flag True p = 0\nflag False p = 0");
+  await splitTo("split a Pair", { text: "flag b p", offset: 7 }, "Split `p` into cases", "flag b (MkPair x y) = 0");
+  const wrapped = await splitTo("split an equation of lines", { text: "wrap m", offset: 5 }, "Split `m` into cases",
+    "wrap Nothing =\n  Cons 1 (Cons 2\n    Nil)\nwrap (Just x) =\n  Cons 1 (Cons 2\n    Nil)");
+  expect("an equation of lines replaced to its end", wrapped && wrapped[0].range.end.line === pos(splitSrc, "    Nil)").line && wrapped[0].range.end.character === 8, wrapped);
+  for (const [what, at] of [["an Int, used", { text: "size m n", offset: 7 }], ["a function", { text: "apply f", offset: 6 }], ["a lambda's binder", { text: "\\c", offset: 1 }], ["no variable", { text: "len : ", offset: 1 }]]) {
+    const acts = await splitAt(at);
+    expect("no split: " + what, Array.isArray(acts) && acts.length === 0, acts);
+  }
+  const quick = await splitAt({ text: "len xs", offset: 5 }, ["quickfix"]);
+  expect("no split where only another kind is asked for", Array.isArray(quick) && quick.length === 0, quick);
+  const refactors = await splitAt({ text: "len xs", offset: 5 }, ["refactor"]);
+  expect("a split where refactors are asked for", Array.isArray(refactors) && refactors.length === 1, refactors);
+  notify("textDocument/didClose", { textDocument: { uri: splitU } });
 
   // formatting: one edit, the whole text, a definition under `-- fmt: skip`
   // as written; what does not parse is left, and nothing said of it (no
