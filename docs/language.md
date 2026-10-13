@@ -168,6 +168,36 @@ same : List (Maybe Int) -> List (Maybe Int) -> Bool
 same xs ys = equal xs ys   -- equalityList, given equalityMaybe, given equalityInt
 ```
 
+The prelude's `ToString` is a type's values as strings, `toString x`,
+written as the source writes them: a string quoted (`toString "hi"` is
+`"\"hi\""`, its `"`, `\` and line feeds escaped), a list `[1, 2]`, a
+`Maybe` `Just (1)` or `Nothing`.  It is what a test shows a value as,
+and compares two by (`check`'s `assertEqual`, [tests.md](tests.md)), so
+two values that differ are not written the same -- not a value's text,
+which `rune`'s and `bytes`' own `toString` are (a rune's string, bytes
+read as UTF-8; each module is imported by a name, so neither is in the
+way of the prelude's).  Its instances are `Int`'s (`toStringInt`),
+`Float64`'s, `String`'s, `Bool`'s, `Unit`'s and `Ordering`'s, those of
+a `List`, a `Maybe`, a `Pair` and an `Either` of types that have one;
+`Rune`'s, `Bytes`' and each fixed-width type's are their modules', each
+its `show` (`rune`'s `toStringRune` writes `'a'`, `bytes`'
+`toStringBytes` `b"hi"`), found where the module is imported.  A type
+of a program's own has one where the program declares it:
+
+```haskell
+data Color = Red | Green
+
+instance toStringColor : ToString Color
+toStringColor = { toString = written }
+  where
+    written : Color -> String
+    written Red = "Red"
+    written Green = "Green"
+
+shown : String
+shown = toString ([Red, Green] : List Color)   -- "[Red, Green]": toStringList, given toStringColor
+```
+
 A theory declared again is another type: a module's own `Equality` and
 its instances are none of the prelude's.
 
@@ -290,7 +320,7 @@ instances are its module's, found wherever it is imported, by a name
 or not: the prelude's operators at its type, `x * c + d` at `Int64`
 beside `n + 1` at `Int`, `-x`, `min x y` and `and x y`; `float32`'s has
 all but `Division`, `Remainder`, `Bitwise` and `IsZero`, and
-`FloatDivision` too, its `/.`.  How each number is kept by each
+`FloatDivision` too, its `/.`; each has a `ToString`, its `show`.  How each number is kept by each
 backend, and given to a provider, is in
 [providers.md](providers.md#numbers-and-runes).
 
@@ -347,8 +377,9 @@ The module `rune` (`import rune as Rune`) has their comparisons (`eq`,
 `compare`, and `==` to `>=` for a module that imports it as it is),
 `toInt` and `fromInt` (which wraps an integer around to 32 bits, as Go's
 `rune(n)` does: a rune may be no scalar value, `isValid` says, and is
-U+FFFD, `replacement`, in a string made of it), `toString`, `show`
-(`"'a'"`), a rune in a string -- `width` (its bytes), `count` (a
+U+FFFD, `replacement`, in a string made of it), `toString` (its string,
+`"a"`), `show` (`"'a'"`, as a literal writes it, and so as the
+prelude's `toString` does, by the module's instance, `toStringRune`), a rune in a string -- `width` (its bytes), `count` (a
 string's runes), `foldl` (each rune with where it starts),
 `validString` and `toValid` (what is not UTF-8 made U+FFFD) -- and
 ASCII's classes and cases: `isDigit`, `isAlpha`, `isSpace`, `isUpper`,
@@ -372,7 +403,8 @@ string's, `strSlice`: clamped, a negative index from the end),
 `equalityBytes`, is the prelude's: no import is needed for it), and
 `show`, which writes them as `b"..."`: a byte of ASCII that is printed
 as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any other
-byte `\xff`.
+byte `\xff` -- what the prelude's `toString` writes too, by the
+module's instance, `toStringBytes`.
 
 So a literal writes them: `b` right before a string, where a token
 starts (`b "x"` is a name and a string, and so is `ab"x"`), read as a

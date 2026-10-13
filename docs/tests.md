@@ -64,11 +64,11 @@ import gen as Gen
 
 lists : Test
 lists = group "lists"
-  [ unit "append" (assertEqual (showList showInt) ([1] ++ [2]) [1, 2])
+  [ unit "append" (assertEqual ([1] ++ [2]) [1, 2])
   , property "reversed twice" (do
-      xs <- forAll (showList showInt) (Gen.list 0 20 (Gen.int 0 99))
+      xs <- forAll (Gen.list 0 20 (Gen.int 0 99))
       label (if List.null xs then "empty" else "not empty")
-      assertEqual (showList showInt) (List.reverse (List.reverse xs)) xs)
+      assertEqual (List.reverse (List.reverse xs)) xs)
   ]
 ```
 
@@ -86,8 +86,12 @@ of it, with nothing written for it; the runner then says the
 counterexample and the seed to run it again (`--seed N`; the default
 seed is always the same, so a run of the tests is always the same run).
 A label counts the runs it is given, so that a property that holds only
-of trivial values shows.  There are no type classes, so a value is
-shown, and compared by `assertEqual`, by a function given, and a generator is
+of trivial values shows.  A value is shown, for a counterexample
+(`forAll`) or for what differs, and compared by `assertEqual`, as its
+type's `ToString` writes it ([language.md](language.md#implicit-arguments)):
+the prelude's of numbers, strings and the like, and of lists, `Maybe`s,
+pairs and `Either`s of them; a type of the test's own is given one by an
+`instance`, as `test/check/map.hf` gives its commands.  A generator is
 given by hand.  `agree` runs a program of commands on a system and on a
 model of it and compares what they observe; drawn by a property, the
 program shrinks to a short one that tells them apart
