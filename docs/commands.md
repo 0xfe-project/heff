@@ -79,6 +79,20 @@ type ElabCtx =
   }
 ```
 
+An equation's `where` goes on a line of its own, under the equation,
+and its local definitions at the column of the `where`, not past it; a
+theory's fields, one to a line, past the `theory`.
+
+```haskell
+nested n = outer n
+  where
+  outer : Int -> Int
+  outer m = inner m
+    where
+    inner : Int -> Int
+    inner k = k * n
+```
+
 ```haskell
 -- | the corners: x, y, then r, g, b
 -- fmt: skip
