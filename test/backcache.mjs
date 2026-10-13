@@ -36,7 +36,7 @@ import co
 import std.io
 
 program : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
-program = print (showInt (loop step 3 (step 10)))
+program = print (show (loop step 3 (step 10)))
 
 main : Co stdio Unit
 main = program (io := \\p -> p)
@@ -49,7 +49,7 @@ ${defs}
 program : {{page : dom <: dom}} -> Co dom Unit
 program = do
   out <- select "#out"
-  found out (\\o -> text o (showInt (${shown})))
+  found out (\\o -> text o (show (${shown})))
 
 main : Co dom Unit
 main = program (page := here dom)

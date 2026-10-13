@@ -152,12 +152,12 @@ try {
 
   // completion: the names in scope that start as the one being typed; after
   // `A.`, the definitions of the module imported as `A`
-  const typing = "x : String\nx = showI";
+  const typing = "x : Float64\nx = toFlo";
   open("test/surface/lsp-complete.hf", typing);
   await diagnosticsOf(uri("test/surface/lsp-complete.hf"));
   const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 1, character: 9 } });
-  const lengthItem = comp.result && comp.result.find((i) => i.label === "showInt");
-  expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("Int -> String") && !comp.result.some((i) => i.label === "showFloat"), comp.result && comp.result.map((i) => i.label));
+  const lengthItem = comp.result && comp.result.find((i) => i.label === "toFloat");
+  expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("Int -> Float64") && !comp.result.some((i) => i.label === "toString"), comp.result && comp.result.map((i) => i.label));
   // a primitive the library declares (named by no alias: its key is its name)
   const typingPrim = "x : Int\nx = intAd";
   open("test/surface/lsp-complete-prim.hf", typingPrim);
@@ -167,13 +167,13 @@ try {
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-complete-prim.hf") } });
   // the prelude, which no file writes an import of: its names in scope,
   // completed and hovered
-  const unwritten = "b : Bool\nb = not True\n\nn : String\nn = showI";
+  const unwritten = "b : Bool\nb = not True\n\nn : Float64\nn = toFlo";
   open("test/surface/lsp-unwritten.hf", unwritten);
   await diagnosticsOf(uri("test/surface/lsp-unwritten.hf"));
   const uHover = await request("textDocument/hover", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "not") });
   expect("hover on a prelude name, not imported", uHover.result && uHover.result.contents.value.includes("not : Bool -> Bool") && uHover.result.contents.value.includes("(global)"), uHover.result);
   const uComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: { line: 4, character: 9 } });
-  expect("completion of a prelude name, not imported", uComp.result && uComp.result.some((i) => i.label === "showInt" && i.detail.includes("Int -> String")), uComp.result && uComp.result.map((i) => i.label));
+  expect("completion of a prelude name, not imported", uComp.result && uComp.result.some((i) => i.label === "toFloat" && i.detail.includes("Int -> Float64")), uComp.result && uComp.result.map((i) => i.label));
   const uDef = await request("textDocument/definition", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") }, position: pos(unwritten, "not") });
   expect("definition of a prelude name, not imported", uDef.result && uDef.result.uri === uri("lib/prelude.hf") && uDef.result.range.start.line === pos(disk("lib/prelude.hf"), "not :").line, uDef.result);
   notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-unwritten.hf") } });

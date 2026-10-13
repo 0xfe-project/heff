@@ -20,7 +20,7 @@ program : {{io : stdio <: world}} -> {{th : threads <: world}} -> Co world Unit
 program = do
   n <- cores
   counts <- parFor n 1000 (primesInBlock 5000000)
-  print (showInt (List.sum counts))
+  print (show (List.sum counts))
   names <- parMap 4 (\s -> s ^ "!") ["a", "b", "c"]
   r <- handle (inThreads Int Int world) (fibPar 3 30)
   ...

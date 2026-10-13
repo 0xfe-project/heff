@@ -168,35 +168,44 @@ same : List (Maybe Int) -> List (Maybe Int) -> Bool
 same xs ys = equal xs ys   -- equalityList, given equalityMaybe, given equalityInt
 ```
 
-The prelude's `ToString` is a type's values as strings, `toString x`,
-written as the source writes them: a string quoted (`toString "hi"` is
-`"\"hi\""`, its `"`, `\` and line feeds escaped), a list `[1, 2]`, a
-`Maybe` `Just (1)` or `Nothing`.  It is what a test shows a value as,
-and compares two by (`check`'s `assertEqual`, [tests.md](tests.md)), so
-two values that differ are not written the same -- not a value's text,
-which `rune`'s and `bytes`' own `toString` are (a rune's string, bytes
-read as UTF-8; each module is imported by a name, so neither is in the
-way of the prelude's).  Its instances are `Int`'s (`toStringInt`),
-`Float64`'s, `String`'s, `Rune`'s (`toStringRune`, `toString 'a'` is
-`"'a'"`), `Bytes`' (`toStringBytes`, `toString b"hi"` is
-`"b\"hi\""`), `Bool`'s, `Unit`'s and `Ordering`'s, with no import, and
-those of a `List`, a `Maybe`, a `Pair` and an `Either` of types that
-have one; each fixed-width type's is its module's, its `show`, found
-where the module is imported.  A type of a program's own has one where
-the program declares it:
+The prelude has two theories of a value as a string, as Rust has
+`Debug` and `Display` and Python `repr` and `str`.  `Show` is a value
+as the source writes it, `show x`: a string quoted (`show "hi"` is
+`"\"hi\""`, its `"`, `\` and line feeds escaped), a rune quoted
+(`show 'a'` is `"'a'"`), bytes a literal (`show b"hi"` is
+`"b\"hi\""`), a list `[1, 2]`, a `Maybe` `Just (1)` or `Nothing`.  It is
+what a test shows a value as, and compares two by (`check`'s
+`assertEqual`, [tests.md](tests.md)), so two values that differ are not
+written the same.  `ToString` is a value as text, `toString x`, for a
+reader: a string itself (`toString "hi"` is `"hi"`), a rune its
+one-rune string (`toString 'a'` is `"a"`), bytes the UTF-8 text they
+are (`toString b"hi"` is `"hi"`, what is not UTF-8 U+FFFD).
+
+`Show`'s instances are `Int`'s (`showInt`), `Float64`'s, `String`'s,
+`Rune`'s (`showRune`), `Bytes`' (`showBytes`), `Bool`'s, `Unit`'s and
+`Ordering`'s, with no import, and those of a `List`, a `Maybe`, a `Pair`
+and an `Either` of types that have one (`showList`, `showMaybe`,
+`showPair`, `showEither`); `ToString`'s are `String`'s
+(`toStringString`), `Rune`'s, `Bytes`', and `Int`'s, `Float64`'s,
+`Bool`'s, `Unit`'s and `Ordering`'s, the same text as `show`'s -- but
+no list's, `Maybe`'s, pair's or `Either`'s, which have no one text.
+Each fixed-width type's module has both (`int8`'s `showInt8` and
+`toStringInt8`, each the number as a literal writes it), found where
+the module is imported.  A type of a program's own has one where the
+program declares it:
 
 ```haskell
 data Color = Red | Green
 
-instance toStringColor : ToString Color
-toStringColor = { toString = written }
+instance showColor : Show Color
+showColor = { show = written }
   where
     written : Color -> String
     written Red = "Red"
     written Green = "Green"
 
 shown : String
-shown = toString ([Red, Green] : List Color)   -- "[Red, Green]": toStringList, given toStringColor
+shown = show ([Red, Green] : List Color)   -- "[Red, Green]": showList, given showColor
 ```
 
 A theory declared again is another type: a module's own `Equality` and
@@ -212,7 +221,7 @@ Binding tighter goes along a chain of them; two operators no chain
 relates are refused side by side, parentheses saying which is first
 (the prelude's `^` and `+`, `a + b ^ c`).  `below` alone is below all,
 any module's operators too.  The prelude's `$` is: `f $ x` is `f x`, to
-the right, so `f $ g $ h x` is `f (g (h x))` and `showInt $ a + b * c`
+the right, so `f $ g $ h x` is `f (g (h x))` and `show $ a + b * c`
 shows the sum; it is inlined, a call of `f` itself.  `$` is the bottom:
 nothing is declared below it, or below any operator declared `below`
 alone, and two such, side by side, take parentheses.
@@ -220,7 +229,7 @@ alone, and two such, side by side, take parentheses.
 ```haskell
 infixl .+. below +
 
--- | >>> showInt $ 1 .+. 2 + 3
+-- | >>> show $ 1 .+. 2 + 3
 -- | "15"
 (.+.) : Int -> Int -> Int
 (.+.) a b = a * 10 + b
@@ -296,7 +305,7 @@ others).
 ```haskell
 import uint8 as UInt8
 
--- | >>> UInt8.show (UInt8.add mask 255)
+-- | >>> show (UInt8.add mask 255)
 -- | "239"
 mask : UInt8
 mask = 240
@@ -304,10 +313,9 @@ mask = 240
 
 Each fixed-width integer type has a module, imported by a name
 (`import int32 as Int32`, as each has the same names): `add`, `sub`,
-`mul`, `div`, `rem`, `eq`, `lt`, `le`, `show`, `minBound` and
-`maxBound`, and `fromInt` and `toInt`, by way of which one type's value
+`mul`, `div`, `rem`, `eq`, `lt`, `le`, `minBound` and `maxBound`, and `fromInt` and `toInt`, by way of which one type's value
 becomes another's (`Int8.fromInt (Int32.toInt x)`).  `float32`'s has the
-arithmetic, `eq`, `lt`, `le`, `isNaN` and `show`, `fromInt`,
+arithmetic, `eq`, `lt`, `le`, `isNaN`, `fromInt`,
 `fromFloat`, `toFloat`, `floor` and `sqrt`.  None of them has a name
 the prelude has for every type -- `neg`, `compare`, `min`, `max`, the
 bits' -- so that a module opened is in the way of none of them at
@@ -321,7 +329,8 @@ instances are its module's, found wherever it is imported, by a name
 or not: the prelude's operators at its type, `x * c + d` at `Int64`
 beside `n + 1` at `Int`, `-x`, `min x y` and `and x y`; `float32`'s has
 all but `Division`, `Remainder`, `Bitwise` and `IsZero`, and
-`FloatDivision` too, its `/.`; each has a `ToString`, its `show`.  How each number is kept by each
+`FloatDivision` too, its `/.`; and each its `Show` and its `ToString`,
+the number as a literal writes it (`show (7 : Int8)` is `"7"`).  How each number is kept by each
 backend, and given to a provider, is in
 [providers.md](providers.md#numbers-and-runes).
 
@@ -378,13 +387,13 @@ The module `rune` (`import rune as Rune`) has their comparisons (`eq`,
 `compare`, and `==` to `>=` for a module that imports it as it is),
 `toInt` and `fromInt` (which wraps an integer around to 32 bits, as Go's
 `rune(n)` does: a rune may be no scalar value, `isValid` says, and is
-U+FFFD, `replacement`, in a string made of it), `toString` (its string,
-`"a"`), `show` (`"'a'"`, as a literal writes it: the prelude's
-`showRune`, which its `toString` writes a rune by, with no import), a
-rune in a string -- `width` (its bytes), `count` (a string's runes), `foldl` (each rune with where it starts),
+U+FFFD, `replacement`, in a string made of it), a rune in a string -- `width` (its bytes), `count` (a string's runes), `foldl` (each rune with where it starts),
 `validString` and `toValid` (what is not UTF-8 made U+FFFD) -- and
 ASCII's classes and cases: `isDigit`, `isAlpha`, `isSpace`, `isUpper`,
-`toUpper` and the like (`isAlpha 'é'` is `False`).
+`toUpper` and the like (`isAlpha 'é'` is `False`).  A rune's `show`
+and `toString` are the prelude's, with no import: `show 'a'` is
+`"'a'"`, as a literal writes it (a control character an escape,
+`"'\\n'"`), and `toString 'a'` is `"a"`, its string.
 
 JavaScript's own text, UTF-16, is another type, `browser.js`'s `JSString`:
 see [providers.md](providers.md#jsstring).
@@ -398,14 +407,13 @@ never changed once made.  The module `bytes`
 `index` (the byte at `i`, a `UInt8`, if there is one), `slice` (as a
 string's, `strSlice`: clamped, a negative index from the end),
 `append` and `concat`, `empty`, `fromList` and `toList` (of
-`UInt8`s), `fromString` (a string's bytes, as they are) and
-`toString` (their text, UTF-8, what is not UTF-8 U+FFFD, as `rune`'s
-`toValid` makes a string), `eq` (as `==`, whose instance,
-`equalityBytes`, is the prelude's: no import is needed for it), and
-`show`, which writes them as `b"..."`: a byte of ASCII that is printed
-as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any other
-byte `\xff` -- the prelude's `showBytes`, which its `toString` writes
-bytes by, with no import.
+`UInt8`s), `fromString` (a string's bytes, as they are) and `eq` (as
+`==`, whose instance, `equalityBytes`, is the prelude's: no import is
+needed for it).  Their `show` and `toString` are the prelude's too:
+`show` writes them as `b"..."` (`showBytes`): a byte of ASCII that is
+printed as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any
+other byte `\xff`; `toString` is their text (`toStringBytes`), UTF-8,
+what is not UTF-8 U+FFFD, as `rune`'s `toValid` makes a string.
 
 So a literal writes them: `b` right before a string, where a token
 starts (`b "x"` is a name and a string, and so is `ab"x"`), read as a
@@ -422,7 +430,7 @@ static object, as it has a string literal; a JavaScript one makes a
 ```haskell
 import bytes as Bytes
 
--- | >>> Bytes.show (greeting "hé")
+-- | >>> show (greeting "hé")
 -- | "b\"hi h\\xc3\\xa9\""
 -- | >>> greeting "hé" == b"hi h\u{e9}"
 -- | True

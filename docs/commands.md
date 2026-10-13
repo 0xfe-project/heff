@@ -141,7 +141,7 @@ nothing more (`std.progress`).
 A call that is no tail call holds its place on the stack until it
 returns -- but for a call of itself put in a constructor's last field
 (`map f (x :: xs) = f x :: map f xs`) or right of a string append
-(`showInt x ^ "," ^ showAll xs`): such a function is made a loop, on
+(`show x ^ "," ^ showAll xs`): such a function is made a loop, on
 either backend, however long its list.  A C program (`c`) runs in a
 thread of its own, with a stack of 1 GiB (`-DHEFF_MAIN_STACK=BYTES` when
 its C is built, for another size; where it runs out, the program says

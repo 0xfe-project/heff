@@ -78,7 +78,7 @@ writeFileSync(join(hello, "src", "hello", "big.hf"),
   `${defs.join("\n")}\ntotal : Int\ntotal = ${Array.from({ length: n }, (_, i) => `f${i} 1`).join(" + ")}\n`);
 writeFileSync(join(hello, "app", "hello", "main.hf"), [
   "import co", "import hello.big", "import hello.greeting", "import std.io", "",
-  "program : {{io : stdio <: stdio}} -> Co stdio Unit", "program = print (greeting (showInt total))", "",
+  "program : {{io : stdio <: stdio}} -> Co stdio Unit", "program = print (greeting (show total))", "",
   "main : Co stdio Unit", "main = program (io := here stdio)", "",
 ].join("\n"));
 

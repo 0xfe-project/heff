@@ -758,7 +758,7 @@ if (!process.env.HEFF_SANITIZE) checks.push((async () => {
     "main : Co stdio Unit",
     "main = do",
     "  print (ev := here stdio) \"before\"",
-    "  print (ev := here stdio) (showInt (sumTo 100000000))", "",
+    "  print (ev := here stdio) (show (sumTo 100000000))", "",
   ].join("\n"));
   const p = await program(deeper, "main", ["-DHEFF_MAIN_STACK=8388608"]);
   if (p.error !== undefined) return [`FAIL a stack overflow (c): not compiled\n${p.error}`];
@@ -776,7 +776,7 @@ writeFileSync(loop, [
   "eff : HFunctor",
   "eff = stdio <+> process", "",
   "loop : {{io : stdio <: eff}} -> {{sys : process <: eff}} -> Int -> Int -> Co eff Unit",
-  "loop n acc = if n == 0 then print (showInt acc) else do",
+  "loop n acc = if n == 0 then print (show acc) else do",
   "  v <- getEnv \"X\"",
   "  loop (n - 1) (acc + 1)", "",
   "main : Co eff Unit",

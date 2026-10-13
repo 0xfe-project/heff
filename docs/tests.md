@@ -88,9 +88,12 @@ seed is always the same, so a run of the tests is always the same run).
 A label counts the runs it is given, so that a property that holds only
 of trivial values shows.  A value is shown, for a counterexample
 (`forAll`) or for what differs, and compared by `assertEqual`, as its
-type's `ToString` writes it ([language.md](language.md#implicit-arguments)):
-the prelude's of numbers, strings and the like, and of lists, `Maybe`s,
-pairs and `Either`s of them; a type of the test's own is given one by an
+type's `Show` writes it ([language.md](language.md#implicit-arguments)):
+as the source writes it, a string quoted and a rune too, as Rust's
+`Debug` writes a value -- not its text, `ToString`'s, its `Display`, by
+which `"1"` and `1` would be shown the same.  The prelude has one of
+numbers, strings and the like, and of lists, `Maybe`s, pairs and
+`Either`s of them; a type of the test's own is given one by an
 `instance`, as `test/check/map.hf` gives its commands.  A generator is
 given by hand.  `agree` runs a program of commands on a system and on a
 model of it and compares what they observe; drawn by a property, the
