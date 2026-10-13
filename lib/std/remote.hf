@@ -1,0 +1,85 @@
+-- An API (lib/remote.hf) over HTTP, the C backend's side: a server's
+-- requests answered by the API's real handler, over std.http.server,
+-- and a client's transport by std.http.  Each call is a `POST` of its
+-- frame, answered `200` with the answer's frame; a page's client is
+-- browser.remote's.  Import it by a name beside lib/remote.hf's,
+-- `import std.remote as RemoteHttp` (as browser.remote is, in a page).
+
+import bytes as Bytes
+import co
+import remote as Remote
+import std.http as Http
+import std.http.server as Server
+
+-- | What a frame is sent as, its `Content-Type`.
+contentType : String
+contentType = "application/x-heff-wire"
+
+-- (a frame, the response's body)
+framed : Bytes -> Http.Response
+framed b =
+  { status = 200, headers = [MkPair "Content-Type" contentType], body = b }
+
+-- | A request answered: a `POST` of a call's frame, by `Remote.respond`
+-- | (the operation done by `alg`, the effect's real handler, as
+-- | `through` takes one), the answer's frame its body; any other method
+-- | `405`.
+respond : {h e : HFunctor}
+        -> Remote.Api h
+        -> ({a : Type} -> h.f (Co e) a -> Co e a)
+        -> Server.Request
+        -> Co e Http.Response
+respond api alg r =
+  if r.method == "POST"
+    then bind (Remote.respond api alg r.body) (\b -> pure (framed b))
+  else pure (Server.plain 405 "a call of the API is a POST\n")
+
+-- | A request's path: its target up to a `?`, if it has one.
+-- | >>> List.map pathOf ["/api", "/api?x=1", "/"]
+-- | ["/api", "/api", "/"]
+pathOf : String -> String
+pathOf target = maybe target (\i -> strSlice target 0 i) (indexOf "?" target)
+
+-- | A server's requests: those whose path is `at` (`"/api"`) answered
+-- | as `respond` answers them, any other by `other` (the page and its
+-- | script, say).
+routed : {h e : HFunctor}
+       -> String
+       -> Remote.Api h
+       -> ({a : Type} -> h.f (Co e) a -> Co e a)
+       -> (Server.Request -> Co e Http.Response)
+       -> Server.Request
+       -> Co e Http.Response
+routed at api alg other r =
+  if pathOf r.target == at then respond api alg r else other r
+
+-- (what came back: the answer's frame, or why none did)
+exchanged : Either Http.HttpError Http.Response
+          -> Either Remote.RemoteError Bytes
+exchanged (Left err) = Left (Unreachable (Http.showError err))
+exchanged (Right res) =
+  if res.status == 200 then Right res.body
+  else Left
+      (Unreachable ("status " ^ show res.status ^ ": " ^ toString res.body))
+
+-- | A client's transport: each frame a `POST` to the URL, by std.http,
+-- | the answer the response's body; where no response came, or one of a
+-- | status that is no 200, `Unreachable` (a `timeout`, in milliseconds,
+-- | 0 for none).
+posted : {e : HFunctor}
+       -> {{web : Http.http <: e}}
+       -> {timeout : Int := 0}
+       -> String
+       -> Remote.Transport e
+posted url =
+  { exchange = \frame ->
+        bind
+          (Http.send
+             { url = url
+             , method = "POST"
+             , headers = [MkPair "Content-Type" contentType]
+             , body = frame
+             , timeout = timeout
+             })
+          (\r -> pure (exchanged r))
+  }
