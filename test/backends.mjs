@@ -17,10 +17,11 @@
 // client, TCP sockets and an HTTP server over them, green threads
 // waiting on them apart, processes forked, and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { Agent, createServer, request } from "node:http";
 import { connect } from "node:net";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { setSeed, genProgram } from "./gen.mjs";
@@ -345,6 +346,125 @@ const freePorts = async (n) => {
   await Promise.all(held.map((s) => new Promise((ok) => s.close(ok))));
   return ports;
 };
+
+// files open, read and written a piece at a time (std.filesystem), by C
+// alone: round trips, a large file in chunks and copied, lines (`\r\n`, none at the
+// end, one longer than a buffer), seek and tell, what the system says of
+// a file, a directory and a link, modes, temporary files, the standard
+// output as a file between what std.io writes, and what fails, as values
+// (ENOENT, EISDIR, EACCES -- not for root, whom no mode stops -- EEXIST,
+// EBADF); and a file used after it is closed, failing the program
+const filesWant = (denied) => [
+  "written: ok ok ok",
+  'read back: Just ("hello, world\\n")',
+  'appended: Just ("hello, world\\nagain\\n")',
+  "in chunks of 4096: 3000004 bytes, sum 157500426, 733 chunks",
+  "in chunks of 1000000: 3000004 bytes, sum 157500426, 4 chunks",
+  "copied: 3000004 bytes, the same True",
+  'lines: ["one", "two", "", "three", "four"]',
+  "long lines: [200000, 3]",
+  "no lines: []",
+  "sought to 7, read world, now at 12",
+  'from the end 20: Just ("line"); back 12: Just ("second line")',
+  'written after a read: Just ("heXYo, world\\nsecond line\\n")',
+  "stat: regular of 25 bytes; directory",
+  "a link: link, to a regular, resolved: target.txt",
+  "an open file's: regular of 25 bytes",
+  "modified: untouched the same True, written not earlier True, since the epoch True",
+  "what a path is: True True False False nothing",
+  "modes: 644, executable 755",
+  "read-only 555, writable again 700, written in True",
+  "temporary directories: True, empty Just ([]), each new True, named True",
+  "a temporary file: for a while, there True",
+  "removed: True",
+  `failed: ENOENT EISDIR EISDIR ${denied} EEXIST`,
+  "failed too: EBADF ENOENT ENOENT ENOENT, a directory made where a file is False",
+  "said so: ENOENT: No such file or directory",
+  "std.io before",
+  "the standard output, a file",
+  "std.io after, the same handle True",
+].join("\n") + "\n";
+if (process.platform !== "win32") checks.push((async () => {
+  const dir = join(work, "files");
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir);
+  writeFileSync(join(dir, "target.txt"), "target\n");
+  symlinkSync("target.txt", join(dir, "link"));
+  const denied = process.getuid?.() === 0 ? "ok" : "EACCES";
+  const msgs = await ran("files", "test/node/files.hf", "main", [dir], { out: filesWant(denied), err: "", status: 0 });
+  msgs.push(...await ran("files, one used after it is closed", "test/node/files.hf", "closed", [dir],
+    { out: "closed\n", err: "heff: the world holds nothing numbered 0\n", status: 1 },
+    { env: { ...process.env, ASAN_OPTIONS: "detect_leaks=0" } }));
+  return msgs;
+})());
+
+// (`cmd` run, `fed(child, out)` told of what it has written so far, each
+// time it writes: `{ status, out, err }` once it ends)
+const streamed = (cmd, args, fed) => new Promise((resolve) => {
+  const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let out = "", err = "";
+  const timer = setTimeout(() => child.kill("SIGKILL"), 120000);
+  child.stdin.on("error", () => {});
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (d) => { out += d; fed(child, out); });
+  child.stderr.on("data", (d) => { err += d; });
+  child.on("close", (status) => { clearTimeout(timer); resolve({ status, out, err }); });
+  fed(child, out);
+});
+
+// (how much of the memory a process has is in RAM, in KiB: by /proc where
+// there is one, else ps; 0 where neither says)
+const residentKiB = (pid) => {
+  try { return Number(/VmRSS:\s*(\d+)/.exec(readFileSync(`/proc/${pid}/status`, "utf8"))[1]); } catch {}
+  const r = spawnSync("ps", ["-o", "rss=", "-p", String(pid)]);
+  return r.status === 0 ? Number(String(r.stdout).trim()) || 0 : 0;
+};
+
+// the standard input a line at a time (std.filesystem's `stdin`), by C
+// alone: the answer to its first line written before the rest of it is
+// (the test writes none until it is), then 64 MiB of lines, through a
+// pipe, the program holding a few MiB at most meanwhile (not under a
+// sanitizer, which keeps what is freed a while)
+if (process.platform !== "win32") checks.push((async () => {
+  const p = await program("test/node/files.hf", "linesMain");
+  if (p.error !== undefined) return [`FAIL stdin a line at a time (c): not compiled\n${p.error}`];
+  const line = "x".repeat(63) + "\n", block = line.repeat(16384), blocks = 64;
+  let pinged = false, fed = false, kib = 0;
+  const feed = async (child) => {
+    for (let i = 0; i < blocks; i++) if (!child.stdin.write(block)) await once(child.stdin, "drain");
+    kib = residentKiB(child.pid);
+    child.stdin.end();
+  };
+  const r = await streamed(p.cmd, [], (child, out) => {
+    if (!pinged) { pinged = true; child.stdin.write("ping\n"); }
+    else if (!fed && out === "pong\n") { fed = true; feed(child); }
+  });
+  const want = `pong\nlines ${1 + blocks * 16384} bytes ${4 + blocks * 16384 * 63}\n`;
+  const msgs = [];
+  if (r.status !== 0 || r.err || r.out !== want) msgs.push(`FAIL stdin a line at a time (c): status ${r.status}\n${r.out}${r.err}`);
+  if (!process.env.HEFF_SANITIZE && kib > 16384) msgs.push(`FAIL stdin a line at a time (c): ${kib} KiB held, ${blocks} MiB in`);
+  return msgs;
+})());
+
+// green threads (lib/green.hf), scheduled by std.reactor, by C alone: one
+// reads the standard input, a pipe, a line at a time, while another
+// counts -- the count written before any input comes, as the test writes
+// none until it is (a read that held up the whole program would never
+// let it be)
+if (process.platform !== "win32") checks.push((async () => {
+  const p = await program("test/node/files.hf", "greenMain");
+  if (p.error !== undefined) return [`FAIL green stdin (c): not compiled\n${p.error}`];
+  let written = false;
+  const r = await streamed(p.cmd, [], (child, out) => {
+    if (!written && out.includes("counted while the reader waits: 1000\n")) {
+      written = true;
+      child.stdin.end("one\ntwo\nthree\n");
+    }
+  });
+  const want = "counted while the reader waits: 1000\nread: 3 lines\nmain done\n";
+  return r.status === 0 && !r.err && r.out === want ? [] : [`FAIL green stdin (c): status ${r.status}\n${r.out}${r.err}`];
+})());
 
 // TCP sockets, by C alone (std.net): a connection to a listener of the
 // program's own at the port the test picked, each side echoing the
