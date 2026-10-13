@@ -260,7 +260,7 @@ for (const [words, out] of [
   [["fmt", "--check", ""], ":files .hf\n"],
   [["init", ""], ":dirs\n"],
   [["completions", ""], "fish\nbash\nzsh\n"],
-  [["dev", "--p"], "--port\twhere the pages are served: http://127.0.0.1:PORT/ (8000)\n"],
+  [["dev", "--po"], "--port\twhere the pages are served: http://127.0.0.1:PORT/ (8000)\n"],
   [["de"], "dev\tthe project built as `heff build` builds it, its C programs (the APPs, else all) run and its pages served, then built and run again at each change of its files\n"],
   [["run", "main.hf", "--"], ""],
 ]) {

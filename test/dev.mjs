@@ -4,11 +4,13 @@
 // run -- the program's output heff's -- and the page served, with what
 // reloads it; a source changed, built again and the program run anew; a
 // change that does not build said and waited past, the program kept; and
-// heff dev ended by SIGTERM, what it started ended with it.
+// heff dev ended by SIGTERM, what it started ended with it.  What is not
+// a page's is sent on to a server (`--proxy`), here one of the test's.
 //
 //   node test/dev.mjs
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer as createHttp } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,8 +45,17 @@ writeFileSync(join(proj, "app", "page", "style.css"), "p { color: teal; }\n");
 // (a port no one listens at, for the pages)
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 
+// (where what is not a page's is sent: a server of the test's own, which
+// says what it was sent)
+const backend = createHttp((q, a) => {
+  let body = "";
+  q.on("data", (d) => { body += d; });
+  q.on("end", () => { a.writeHead(201, { "Content-Type": "text/plain", "X-Seen": "yes" }); a.end(`${q.method} ${q.url} ${body}`); });
+});
+const backendPort = await new Promise((r) => backend.listen(0, "127.0.0.1", () => r(backend.address().port)));
+
 const free = await slot();
-const dev = spawn(heffBin, ["dev", "--port", String(port)], { cwd: proj, stdio: ["ignore", "pipe", "pipe"] });
+const dev = spawn(heffBin, ["dev", "--port", String(port), "--proxy", `http://127.0.0.1:${backendPort}`], { cwd: proj, stdio: ["ignore", "pipe", "pipe"] });
 let said = "";
 dev.stdout.on("data", (d) => { said += d; });
 dev.stderr.on("data", (d) => { said += d; });
@@ -67,8 +78,10 @@ try {
     js.text === readFileSync(join(proj, ".heff", "bin", "page.js"), "utf8"), { status: js.status, type: js.type });
   expect("a file of the program's", css.status === 200 && css.type.startsWith("text/css") && css.text === "p { color: teal; }\n", css);
   expect("built, said to the page", (await get("/.heff/built")).text === "1", await get("/.heff/built"));
+  const sent = await fetch(`http://127.0.0.1:${port}/api/x?y=1`, { method: "POST", body: "hello" });
+  expect("what is not a page's, sent on", sent.status === 201 && sent.headers.get("x-seen") === "yes" && await sent.text() === "POST /api/x?y=1 hello", sent.status);
   expect("a name without its slash", (await get("/page")).status === 301, await get("/page"));
-  expect("no page of no program", (await get("/nothing/")).status === 404, await get("/nothing/"));
+  expect("no file the program has not", (await get("/page/missing.css")).status === 404, await get("/page/missing.css"));
   expect("nothing outside the program's", (await get("/page/..%2f..%2fpackage.hf")).status === 404 && (await get("/page/../package.hf")).status !== 200, null);
 
   // a change: built again, the program run anew
@@ -91,6 +104,7 @@ try {
   expect("ended, with what it started", end !== null && end.signal === "SIGTERM", end);
   if (end === null) dev.kill("SIGKILL");
   free();
+  backend.close();
 }
 
 console.log(failed ? `dev: ${failed}/${checks} checks FAILED` : `dev: ${checks} checks`);

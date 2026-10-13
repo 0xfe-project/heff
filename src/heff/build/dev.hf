@@ -25,6 +25,7 @@ import std.net as Net
 import std.path as Path
 import std.process
 import std.progress as Progress
+import rune as Rune
 import std.reactor as Reactor
 import std.time as Time
 
@@ -83,7 +84,8 @@ type Running = { name : String, child : Child }
 -- | where `heff dev` is: the project's files as last built, its programs
 -- | running, the pages' server (once there are pages), how many builds
 -- | there have been, the programs to run (all, where none is named), and
--- | the port the pages are served at
+-- | the port the pages are served at, and where what is not theirs is
+-- | sent (`--proxy`)
 type Dev =
   { stamp : String
   , running : List Running
@@ -91,6 +93,7 @@ type Dev =
   , builds : Int
   , wanted : List String
   , port : String
+  , proxy : Maybe String
   }
 
 -- | where a build that went well is said to have been made, for the
@@ -161,7 +164,7 @@ pagesFor d False = pure d.pages
 pagesFor { pages = Just c } True = pure (Just c)
 pagesFor d True = do
   self <- programPath
-  launch self ["dev-pages", d.port]
+  launch self ("dev-pages" :: d.port :: maybe Nil (\u -> [u]) d.proxy)
 
 -- (the programs, read from their build.hf: none where one cannot be)
 appsNow : {e : HFunctor}
@@ -230,6 +233,7 @@ builtWell st d stamp = do
       , builds = d.builds + 1
       , wanted = d.wanted
       , port = d.port
+      , proxy = d.proxy
       }
 
 -- | the project built, as `heff build` builds it (heff run so, its
@@ -291,7 +295,7 @@ watching st d = do
       next <- rebuilt st { d | running = running } stamp
       watching st next
 
--- | `heff dev [APP...] [--port N]`, at the project's root
+-- | `heff dev [APP...] [--port N] [--proxy URL]`, at the project's root
 devCmd : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{sys : process <: e}}
@@ -300,8 +304,9 @@ devCmd : {e : HFunctor}
        -> {{clock : Time.time <: e}}
        -> List String
        -> Maybe String
+       -> Maybe String
        -> Co e Unit
-devCmd wanted port = do
+devCmd wanted port proxy = do
   text <- readFile "package.hf"
   st <- Commands.styleNow
   case text of
@@ -319,6 +324,7 @@ devCmd wanted port = do
           , builds = 0
           , wanted = wanted
           , port = fromMaybe "8000" port
+          , proxy = proxy
           }
           stamp
       watching st first
@@ -483,17 +489,100 @@ answer st (name :: rest) =
     pure (fileAnswer (joinWith "/" rest) text)
 answer st Nil = pure (Server.plain 404 "no such file\n")
 
--- | the pages served at the port, as `heff dev` has them served, until
--- | the program is ended (`heff dev-pages PORT`)
+-- (the first part of a path)
+firstPart : List String -> String
+firstPart (x :: _) = x
+firstPart Nil = ""
+
+-- (a path the pages' server answers itself, whatever is sent elsewhere)
+ownPath : List String -> Bool
+ownPath (".heff" :: "built" :: Nil) = True
+ownPath ("" :: Nil) = True
+ownPath ps = False
+
+-- (a header's name, its case not minded)
+lowered : String -> String
+lowered s = ofRunes (List.map Rune.toLower (runes s))
+
+-- | the headers passed on, from a client to where it is sent and back:
+-- | not the connection's own, which each side writes for itself
+-- | >>> passed [MkPair "Host" "x", MkPair "Content-Type" "a", MkPair "content-length" "3"]
+-- | [MkPair "Content-Type" "a"]
+passed : List (Pair String String) -> List (Pair String String)
+passed hs =
+  List.filter
+    (\h ->
+       not
+         (List.elemBy
+            strEq
+            (lowered (fst h))
+            [ "host"
+            , "content-length"
+            , "connection"
+            , "transfer-encoding"
+            , "keep-alive"
+            ]))
+    hs
+
+-- (what came back from where a request was sent: passed on, or why
+-- nothing came, 502)
+relayed : String -> Either Http.HttpError Http.Response -> Http.Response
+relayed to (Right res) = { res | headers = passed res.headers }
+relayed to (Left err) =
+  Server.plain
+    502
+    ("heff dev: nothing from " ^ to ^ ": " ^ Http.showError err ^ "\n")
+
+-- | a request sent on to `to` (`http://127.0.0.1:8080`, say), as it came,
+-- | and its response given back
+forwarded : {e : HFunctor}
+          -> {{web : Http.http <: e}}
+          -> String
+          -> Server.Request
+          -> Co e Http.Response
+forwarded to req = do
+  r <-
+    Http.send
+      { url = to ^ req.target
+      , method = req.method
+      , headers = passed req.headers
+      , body = req.body
+      , follow = False
+      }
+  pure (relayed to r)
+
+-- | a request to the pages' server: its own (the built count, the index,
+-- | a program's page and files), or, where there is somewhere to send
+-- | what is not, sent there
+served : {e : HFunctor}
+       -> {{disk : fs <: e}}
+       -> {{web : Http.http <: e}}
+       -> Path.Style
+       -> Maybe String
+       -> Server.Request
+       -> Co e Http.Response
+served st Nothing req = answer st (partsOf (pathOf req.target))
+served st (Just to) req = do
+  mine <-
+    isDirectory (Path.join st "app" (firstPart (partsOf (pathOf req.target))))
+  if mine || ownPath (partsOf (pathOf req.target))
+      then answer st (partsOf (pathOf req.target))
+    else forwarded to req
+
+-- | the pages served at the port, as `heff dev` has them served, what is
+-- | not theirs sent to `proxy` where it is given, until the program is
+-- | ended (`heff dev-pages PORT [PROXY]`)
 pagesCmd : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> {{disk : fs <: e}}
          -> {{nt : Net.net <: e}}
          -> {{rx : Reactor.reactor <: e}}
+         -> {{web : Http.http <: e}}
          -> String
+         -> Maybe String
          -> Co e Unit
-pagesCmd port = do
+pagesCmd port proxy = do
   st <- Commands.styleNow
   l <- Net.listen "127.0.0.1" (fromMaybe 8000 (parseInt port)) 64
   case l of
@@ -505,7 +594,11 @@ pagesCmd port = do
            ^ Net.showError err)
       exit 1
     Right listener -> do
-      printErr ("heff dev: the pages at http://127.0.0.1:" ^ port ^ "/")
+      printErr
+          ("heff dev: the pages at http://127.0.0.1:"
+           ^ port
+           ^ "/"
+           ^ maybe "" (\to -> ", the rest sent to " ^ to) proxy)
       r <-
         Reactor.scheduled
           e
@@ -513,9 +606,9 @@ pagesCmd port = do
              (gr := \p -> InL p)
              (nt := \p -> InR (nt p))
              listener
-             (\req ->
-                answer
-                  (disk := \p -> InR (disk p))
-                  st
-                  (partsOf (pathOf req.target))))
+             (served
+                (disk := \p -> InR (disk p))
+                (web := \p -> InR (web p))
+                st
+                proxy))
       pure MkUnit
