@@ -822,8 +822,12 @@ wordLiteral (EInt i) = i < 4611686018427387904 && i >= 0 - 4611686018427387904
 wordLiteral e = False
 
 -- (a global that is such a number, the number: a loop's bound, `pi`,
--- read where it is used, not asked of the global each round)
+-- read where it is used, not asked of the global each round.  And one
+-- that is another name for a global, that global: `W3 = plus (state
+-- Int) (exn Int)`, a copy of `plus` for them, a record a copy may be
+-- made for)
 globalLiteral : String -> Maybe IR.Expr -> IR.Expr
+globalLiteral g (Just (EGlobal h)) = EGlobal h
 globalLiteral g (Just b) = if wordLiteral b then b else EGlobal g
 globalLiteral g Nothing = EGlobal g
 
@@ -2258,6 +2262,125 @@ madeBody : String -> IR.Expr -> Maybe IR.Expr -> M IR.Expr
 madeBody h b0 (Just b) = pure b
 madeBody h b0 Nothing = makeFresh h b0
 
+-- Settling: a copy is known by what it is as asked for (`knowing`, no
+-- copy asked for in it), and made with the copies it asks for -- so it
+-- may be made to take more than it was known to: `loop`'s copy for an
+-- operation's evidence, `\i acc -> ... (\hd k -> ...)` as known, `\i acc
+-- hd k -> ...` as made, the evidence's copy of `step` then a function
+-- of `hd k` too.  A caller that gives it all of them (`handle hd (loop 0
+-- 0)`) only sees that once it is made: so the made copy is what it is
+-- known by from then on, and what calls it is simplified again, which
+-- may make a copy for what it is given now (the handler).
+
+-- | how many more rounds of that a definition or a copy is given
+settleRounds : Int
+settleRounds = 5
+
+-- (the arity each global is known by)
+aritiesOf : St -> List String -> List Int
+aritiesOf s hs = List.map (arityIn s.sp.all) hs
+
+-- (a copy among them now known to take more than it was)
+grew : List Int -> List Int -> Bool
+grew (Cons a as) (Cons b bs) = b > a || grew as bs
+grew _ _ = False
+
+-- (a global `b` calls known to take more in `s1` than in `s0`)
+grewIn : St -> St -> IR.Expr -> Bool
+grewIn s0 s1 b =
+  s1.supply /= s0.supply
+  && grew (aritiesOf s0 (IR.globalsIn b)) (aritiesOf s1 (IR.globalsIn b))
+
+-- | the copy `h` made to `b`: what it is known by, if that takes more
+-- | arguments than what it was known by
+knownMade : String -> IR.Expr -> M Unit
+knownMade h b = \s ->
+    MkPair
+      MkUnit
+      (if arityIn s.sp.all h < arityIn (singletonM h b) h
+       && not (IR.sizeAbove specBodySize b)
+         then recordAll h b s
+       else s)
+
+-- (a copy made here, simplified again: the copies it asks for so kept
+-- with those it asked for before)
+makeAgain : String -> IR.Expr -> M IR.Expr
+makeAgain h b = do
+  outer <- getTouched
+  s <- get
+  u0 <-
+    keepWith
+      (touchedTo (fromMaybe Nil (Map.lookup compareString h s.kp.madeFresh)))
+  u2 <- ownSt
+  b1 <- sk.simp b
+  b2 <- raise b1
+  t <- getTouched
+  u3 <- keepWith (\k -> madeFreshTo h t (touchedTo outer k))
+  pure b2
+
+-- (a copy made here, the copies it calls for made, `n` rounds left:
+-- simplified again while a copy it calls was made to take more)
+settleCopy : (List String -> M (List IR.Def))
+           -> Int
+           -> String
+           -> IR.Expr
+           -> M (Pair IR.Expr (List IR.Def))
+settleCopy more n h b = do
+  s0 <- get
+  deps <- more (IR.globalsIn b)
+  s1 <- get
+  if n > 0 && grewIn s0 s1 b
+      then do
+        b2 <- makeAgain h b
+        rest <- settleCopy more (n - 1) h b2
+        pure (MkPair (fst rest) (appendL deps (snd rest)))
+    else pure (MkPair b deps)
+
+-- (the copies among `hs` asked for, in front of `t`)
+copiesIn : St -> List String -> List String -> List String
+copiesIn s hs t =
+  List.foldl
+    (\acc h ->
+       if Map.member compareString h s.sp.recipes then Cons h acc else acc)
+    t
+    hs
+
+-- | the copies a definition's body calls, as asked for by it: a body
+-- | settled calls copies of what it inlined, which the cache asks for
+-- | where it keeps it
+refsTouched : IR.Expr -> M Unit
+refsTouched b = \s ->
+    MkPair
+      MkUnit
+      (withKp (touchedTo (copiesIn s (IR.globalsIn b) s.kp.touched) s.kp) s)
+
+-- | ... and a copy's made here
+refsMade : Maybe IR.Expr -> String -> IR.Expr -> M Unit
+refsMade (Just _) h b = pure MkUnit
+refsMade Nothing h b = \s ->
+    MkPair
+      MkUnit
+      (withKp
+         (madeFreshTo
+            h
+            (copiesIn
+               s
+               (IR.globalsIn b)
+               (fromMaybe Nil (Map.lookup compareString h s.kp.madeFresh)))
+            s.kp)
+         s)
+
+-- (as the cache keeps it: made as it was)
+settleKept : (List String -> M (List IR.Def))
+           -> Maybe IR.Expr
+           -> String
+           -> IR.Expr
+           -> M (Pair IR.Expr (List IR.Def))
+settleKept more (Just _) h b = do
+  deps <- more (IR.globalsIn b)
+  pure (MkPair b deps)
+settleKept more Nothing h b = settleCopy more settleRounds h b
+
 -- | a copy made -- as the cache keeps it, or here -- then the copies it
 -- | calls for (`more`), before it
 makeOne : (List String -> M (List IR.Def))
@@ -2268,8 +2391,10 @@ makeOne more h b0 = do
   u <- madeOne h
   kb <- keptMade h
   b3 <- madeBody h b0 kb
-  deps <- more (IR.globalsIn b3)
-  pure (appendL deps (Cons (IR.mkDef h h b3) Nil))
+  done <- settleKept more kb h b3
+  u1 <- refsMade kb h (fst done)
+  u2 <- knownMade h (fst done)
+  pure (appendL (snd done) (Cons (IR.mkDef h h (fst done)) Nil))
 
 makeIf : (List String -> M (List IR.Def))
        -> String
@@ -2323,6 +2448,25 @@ doneOf s d b t =
 
 -- | a definition simplified, after the copies it calls for; and what the
 -- | cache is to keep of it
+-- (a definition simplified, recorded, and the copies it calls for made,
+-- `n` rounds left: simplified again while a copy it calls was made to
+-- take more -- see Settling)
+settleDef : Int -> String -> IR.Expr -> M (Pair IR.Expr (List IR.Def))
+settleDef n key b = do
+  u2 <- recordDef key b
+  u3 <- markSafe key b
+  s0 <- get
+  made <- makeEach (IR.globalsIn b)
+  s1 <- get
+  if n > 0 && grewIn s0 s1 b
+      then do
+        u <- ownSt
+        b1 <- sk.simp b
+        b2 <- raise b1
+        rest <- settleDef (n - 1) key b2
+        pure (MkPair (fst rest) (appendL made (snd rest)))
+    else pure (MkPair b made)
+
 oneDef : IR.Def -> M (Pair (List IR.Def) (List Done))
 oneDef d = do
   u <- ownSt
@@ -2330,16 +2474,15 @@ oneDef d = do
   -- (twice: what the first pass exposes, the second reduces)
   b1 <- sk.simp d.body
   b2 <- sk.simp b1
-  b <- raise b2
+  b3 <- raise b2
+  done <- settleDef settleRounds d.key b3
+  u1 <- refsTouched (fst done)
   t <- getTouched
-  u2 <- recordDef d.key b
-  u3 <- markSafe d.key b
   s <- get
-  made <- makeEach (IR.globalsIn b)
   pure
       (MkPair
-         (appendL made (Cons (IR.mkDef d.key d.name b) Nil))
-         (Cons (doneOf s d b t) Nil))
+         (appendL (snd done) (Cons (IR.mkDef d.key d.name (fst done)) Nil))
+         (Cons (doneOf s d (fst done) t) Nil))
 
 -- | a definition as the cache keeps it, simplified: what it came to
 -- | (read when wanted), whether it is safe, the copies it asked for (by
