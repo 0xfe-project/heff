@@ -117,5 +117,7 @@ How the source is laid out, the seed and the test groups are in
 ## References
 
 - Lynch & Staton, *Hippogriff*, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728):
-  the core theory heff uses, and the implementation heff refers to.
-- Yang & Wu, POPL 2026: the idea behind `lib/co.hf`.
+  the core theory heff uses, and [its implementation](https://tangled.org/owenlynch.tngl.sh/hippogriff/),
+  which heff refers to.
+- Yang & Wu, POPL 2026, [arXiv:2511.05739](https://arxiv.org/abs/2511.05739):
+  the idea behind `lib/co.hf`.
