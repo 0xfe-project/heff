@@ -65,11 +65,28 @@ extern char **environ;
 
 // (the runtime's state: defined once, in the program's first file; a
 // program split into parts (`HEFF_PART`, `heff build`) declares it in the
-// others, each of which has its own copy of the runtime's functions)
+// others)
 #ifdef HEFF_PART
 #define HEFF_VAR(decl) extern decl
 #else
 #define HEFF_VAR(decl) decl
+#endif
+
+// (the runtime's functions, but the `static inline` ones: in a program
+// split into parts by an emitter that says so (`HEFF_SPLIT`, which it
+// puts first), defined once too, in the first part, and in the others
+// C's `inline` alone, which makes no function of a definition, and
+// `noinline`, which keeps it from being copied into its callers: each a
+// call to the first part's -- not a copy of each in each part, 2.6 MB
+// of heff's own 15 MB of code, which ran no slower for it (#69); in a
+// program of one file, or of an emitter from before, each the file's
+// own)
+#if defined(HEFF_SPLIT) && defined(HEFF_PART)
+#define HEFF_FN inline __attribute__((noinline))
+#elif defined(HEFF_SPLIT)
+#define HEFF_FN
+#else
+#define HEFF_FN static
 #endif
 
 // Threads (#36).  A program runs in one thread of its own, unless a
@@ -124,7 +141,7 @@ typedef struct { V f[4]; } HeffT4;
 // and is long, its operation on big ones, a call, out of the way, so
 // that what is inlined stays short)
 #define HEFF_FAST static inline __attribute__((always_inline))
-#define HEFF_SLOW static __attribute__((noinline, cold))
+#define HEFF_SLOW HEFF_FN __attribute__((noinline, cold))
 #define HEFF_LIKELY(c) __builtin_expect(!!(c), 1)
 
 // the tags the runtime knows; a program's own are numbered after them
@@ -224,12 +241,12 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint32_t d[]; } Big;
 // (an object's count but its marks)
 #define HEFF_COUNT(rc) ((rc) & ~(IMMORTAL | SHARED))
 
-static void heff_free(V v);
+HEFF_FN void heff_free(V v);
 
 #ifdef HEFF_THREADS
 // (a shared object counted, out of line: the fast paths below test both
 // marks at once, where one thread tests `IMMORTAL` alone)
-static __attribute__((noinline)) void heff_dup_shared(Obj *o) {
+HEFF_FN __attribute__((noinline)) void heff_dup_shared(Obj *o) {
   if (!(heff_rc(o) & IMMORTAL)) __atomic_fetch_add(&o->rc, 1, __ATOMIC_RELAXED);
 }
 
@@ -237,7 +254,7 @@ static __attribute__((noinline)) void heff_dup_shared(Obj *o) {
 // thread then frees -- acquiring what every other thread did with it
 // before it let it go.  One made immortal meanwhile (`heff_freeze`, of
 // a static thunk's value) is never its last: what made it so holds it)
-static __attribute__((noinline)) int heff_down_shared(Obj *o) {
+HEFF_FN __attribute__((noinline)) int heff_down_shared(Obj *o) {
   if (heff_rc(o) & IMMORTAL) return 0;
   uint32_t was = __atomic_fetch_sub(&o->rc, 1, __ATOMIC_ACQ_REL);
   return !(was & IMMORTAL) && HEFF_COUNT(was) == 1;
@@ -293,23 +310,23 @@ static inline int heff_unique(V v) { return heff_rc(OBJ(v)) == 1; }
 HEFF_VAR(HEFF_TLS jmp_buf *heff_catch);
 HEFF_VAR(HEFF_TLS const char *heff_caught);
 
-static void heff_fail(const char *why) {
+HEFF_FN void heff_fail(const char *why) {
   if (heff_catch) { heff_caught = why; longjmp(*heff_catch, 1); }
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
   exit(1);
 }
 
-static V heff_abandon(void) {
+HEFF_FN V heff_abandon(void) {
   if (heff_catch) { heff_caught = "heff:abandon"; longjmp(*heff_catch, 1); }
   fflush(stdout);
   fprintf(stderr, "heff:abandon\n");
   exit(1);
 }
 
-static V heff_nomatch(V s);
+HEFF_FN V heff_nomatch(V s);
 
-static void *heff_alloc(size_t n) {
+HEFF_FN void *heff_alloc(size_t n) {
   void *p = malloc(n);
   if (!p) heff_fail("out of memory");
   return p;
@@ -369,7 +386,7 @@ typedef struct HeffPage {
 HEFF_VAR(HeffPage *heff_page_at[SMALL_MAX / 8 + 1]);
 HEFF_VAR(HeffPage *heff_page_room[SMALL_MAX / 8 + 1]);
 
-static void *heff_page_alloc(size_t c);
+HEFF_FN void *heff_page_alloc(size_t c);
 
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
@@ -400,7 +417,7 @@ static inline void heff_obj_free(void *p, size_t n) {
 #if !(defined(HEFF_THREADS) || SMALL_MAX == 0)
 // (the page made in last full: another of the size with room, else a
 // new one)
-static __attribute__((noinline)) void *heff_page_alloc(size_t c) {
+HEFF_FN __attribute__((noinline)) void *heff_page_alloc(size_t c) {
   HeffPage *pg = heff_page_room[c];
   if (pg) {
     heff_page_room[c] = pg->next;
@@ -437,7 +454,7 @@ static inline int heff_tag_of(V v) {
 // (C's condition as a Bool)
 #define heff_bool(b) ((b) ? NTAG(TAG_True) : NTAG(TAG_False))
 
-static V heff_tag(int id, int64_t n, V *f) {
+HEFF_FN V heff_tag(int id, int64_t n, V *f) {
   if (n == 0) return NTAG(id);
   Tag *t = heff_obj_alloc(sizeof(Tag) + n * sizeof(V));
   t->h.rc = 1; t->h.kind = K_TAG; t->h.tag = (uint16_t)id; heff_tag_head(t, n, 0);
@@ -474,11 +491,11 @@ static inline uint32_t heff_flat_lows(int64_t n) {
 #define heff_flat_all(flat, lows) ((((flat) | ((flat) >> 1)) & (lows)) == (lows))
 
 // (a flat field's bits, of the kind `k`, as a `V`: (below))
-static V heff_flat_box(V w, unsigned k);
+HEFF_FN V heff_flat_box(V w, unsigned k);
 
 // (the labels, in the order the record was written, are the program's:
 // one array for each)
-static V heff_rec(int64_t n, uint32_t *lbl, V *f) {
+HEFF_FN V heff_rec(int64_t n, uint32_t *lbl, V *f) {
   Rec *r = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
   r->h.rc = 1; r->h.kind = K_REC; r->h.tag = 0; r->n = (int32_t)n; r->flat = 0; r->lbl = lbl;
   memcpy(r->f, f, n * sizeof(V));
@@ -492,7 +509,7 @@ static inline V heff_rec_dup_field(Rec *r, int64_t i) {
 }
 
 // (a field, the record consumed)
-static V heff_get(V v, uint32_t l) {
+HEFF_FN V heff_get(V v, uint32_t l) {
   Rec *r = (Rec *)v;
   for (int64_t i = 0; i < r->n; i++)
     if (r->lbl[i] == l) {
@@ -557,7 +574,7 @@ static inline V heff_take_reuse(V v, uint64_t keep) {
 #endif
 
 // (the fields of a tag not in `keep` dropped, its flat ones (#64) none)
-static __attribute__((noinline)) void heff_tag_unset(Tag *t, uint64_t keep, int64_t n) {
+HEFF_FN __attribute__((noinline)) void heff_tag_unset(Tag *t, uint64_t keep, int64_t n) {
   for (int64_t i = 0; i < n; i++)
     if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
 }
@@ -666,7 +683,7 @@ static inline V heff_tag_at(V r, int id, int64_t n, V *f) {
   return r;
 }
 
-static V heff_clo(Fn fn, int arity, int nenv, V *env) {
+HEFF_FN V heff_clo(Fn fn, int arity, int nenv, V *env) {
   Clo *c = heff_obj_alloc(sizeof(Clo) + nenv * sizeof(V));
   c->h.rc = 1; c->h.kind = K_CLO; c->h.tag = 0;
   c->fn = fn; c->arity = arity; c->nenv = nenv; c->memo = 0;
@@ -778,7 +795,7 @@ HEFF_KNOWN V heff_clo_n(Fn fn, int arity, int64_t n, V *env) {
 #ifndef HEFF_FEW_FIELDS
 #define HEFF_FEW_FIELDS 2
 #endif
-static __attribute__((noinline)) void heff_rec_give(V v, int64_t i) {
+HEFF_FN __attribute__((noinline)) void heff_rec_give(V v, int64_t i) {
   Rec *r = (Rec *)v;
   for (int64_t j = 0; j < r->n; j++)
     if (j != i) heff_drop(r->f[j]);
@@ -787,7 +804,7 @@ static __attribute__((noinline)) void heff_rec_give(V v, int64_t i) {
 
 // (`heff_get_n` of a record with flat fields: the field as a `V`, the
 // record dropped)
-static __attribute__((noinline)) V heff_get_flat(V v, int64_t i) {
+HEFF_FN __attribute__((noinline)) V heff_get_flat(V v, int64_t i) {
   V x = heff_rec_dup_field((Rec *)v, i);
   heff_drop(v);
   return x;
@@ -839,7 +856,7 @@ HEFF_KNOWN V heff_take_field(V v, int64_t i) {
 // Its flat fields (#39) are as `v`'s are where they are kept -- `kept`,
 // the bits of those of them that may be flat, 3 each -- and as `flat`
 // says where they are stored (`heff_rec_reuse_nf`).
-static __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *lbl, uint32_t kept, uint32_t flat) {
+HEFF_FN __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
   int64_t n = r->n;
   uint32_t was = r->flat;
@@ -855,7 +872,7 @@ static __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *l
 
 // (a record with flat fields, built in its cell: the fields not kept
 // dropped, as they were)
-static __attribute__((noinline)) void heff_rec_unset(Rec *r, uint64_t keep) {
+HEFF_FN __attribute__((noinline)) void heff_rec_unset(Rec *r, uint64_t keep) {
   for (int64_t i = 0; i < r->n; i++)
     if (!((keep >> i) & 1) && !heff_flat_kind(r->flat, i)) heff_drop(r->f[i]);
 }
@@ -927,7 +944,7 @@ static inline __attribute__((always_inline)) void heff_clo_take(V self, int64_t 
 }
 
 // (an object's size, from what it is)
-static size_t heff_size(V v) {
+HEFF_FN size_t heff_size(V v) {
   Obj *o = OBJ(v);
   switch (o->kind) {
   case K_TAG: case K_TAGF: return sizeof(Tag) + ((Tag *)v)->n * sizeof(V);
@@ -946,7 +963,7 @@ static size_t heff_size(V v) {
 // (a record or a tag whose last reference is gone, its flat fields (#39,
 // #64) made words that drop as nothing, as its other fields are given
 // back)
-static __attribute__((noinline)) void heff_flat_clear(V *f, int64_t n, uint32_t flat) {
+HEFF_FN __attribute__((noinline)) void heff_flat_clear(V *f, int64_t n, uint32_t flat) {
   for (int64_t i = 0; i < n && i < HEFF_FLAT_FIELDS; i++)
     if (heff_flat_kind(flat, i)) f[i] = MK_INT(0);
 }
@@ -979,7 +996,7 @@ static inline void heff_dead_push(V v) {
 // each whose last reference that was is given back after it -- the last
 // of them next, at once, the others from the stack: a list's cells one
 // after another, its spine never on the stack)
-__attribute__((noinline)) static void heff_free(V v) {
+__attribute__((noinline)) HEFF_FN void heff_free(V v) {
   size_t base = heff_ndead;
   for (;;) {
     Obj *o = OBJ(v);
@@ -1057,7 +1074,7 @@ HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
 // (a tag's or a record's fields, an array's elements: `*n` of them --
 // a closure's, a partial application's and a bounce's are said by
 // `HEFF_EACH_SLOT`; a string, a float and a big integer hold none)
-static V *heff_slots(V v, int64_t *n) {
+HEFF_FN V *heff_slots(V v, int64_t *n) {
   Obj *o = OBJ(v);
   switch (o->kind) {
   case K_TAG: case K_TAGF: *n = ((Tag *)v)->n; return ((Tag *)v)->f;
@@ -1071,7 +1088,7 @@ static V *heff_slots(V v, int64_t *n) {
 // list's spine never on the C stack)
 typedef struct { V *v; size_t n, cap; } HeffStack;
 
-static void heff_stack_push(HeffStack *s, V v) {
+HEFF_FN void heff_stack_push(HeffStack *s, V v) {
   if (s->n == s->cap) {
     s->cap = s->cap ? s->cap * 2 : 256;
     s->v = realloc(s->v, s->cap * sizeof(V));
@@ -1106,7 +1123,7 @@ static void heff_stack_push(HeffStack *s, V v) {
     }                                                                   \
   } while (0)
 
-static void heff_freeze_one(HeffStack *s, V *at) {
+HEFF_FN void heff_freeze_one(HeffStack *s, V *at) {
 #ifdef HEFF_THREADS
   // (a shared thunk's `memo` another thread may put a value in meanwhile)
   V v = __atomic_load_n(at, __ATOMIC_ACQUIRE);
@@ -1130,7 +1147,7 @@ static void heff_freeze_one(HeffStack *s, V *at) {
 // on, each counting it never, and never freed -- what holds it now
 // leaks it.  What of `v` is mortal is this thread's, no other's yet;
 // what is shared another thread may hold too, and counts no more)
-static void heff_freeze(V v) {
+HEFF_FN void heff_freeze(V v) {
   HeffStack s = {0};
   heff_freeze_one(&s, &v);
   while (s.n) {
@@ -1141,7 +1158,7 @@ static void heff_freeze(V v) {
 }
 
 #ifdef HEFF_THREADS
-static void heff_share_one(HeffStack *s, V *at) {
+HEFF_FN void heff_share_one(HeffStack *s, V *at) {
   V v = *at;
   if (!IS_OBJ(v) || !v) return;
   uint32_t rc = heff_rc(OBJ(v));
@@ -1158,7 +1175,7 @@ static void heff_share_one(HeffStack *s, V *at) {
 // it is new.  `v` not consumed, nothing copied: another thread holds it
 // by one more count (`heff_dup`).  What of `v` is mortal is this
 // thread's: no other changes it meanwhile)
-static V heff_share(V v) {
+HEFF_FN V heff_share(V v) {
   if (!IS_OBJ(v) || !v || (heff_rc(OBJ(v)) & (IMMORTAL | SHARED))) return v;
   HeffStack s = {0};
   heff_share_one(&s, &v);
@@ -1187,7 +1204,7 @@ HEFF_VAR(HEFF_TLS long heff_dep);
 #define HEFF_ROOM 4
 HEFF_VAR(HEFF_TLS V heff_room[HEFF_ROOM]);
 
-static V heff_apply(V f, int n, V *a);
+HEFF_FN V heff_apply(V f, int n, V *a);
 
 // (a call's `n` arguments copied, `n` known only where it is run and
 // most often a few: stored one by one, not given to `memcpy`, a call that
@@ -1209,7 +1226,7 @@ static inline void heff_copy(V *to, const V *from, int64_t n) {
 // comes to its bounce, not ever deeper on the C stack.  A bounce's
 // arguments are in an array of the loop's step, not `alloca`'s, which
 // would keep each step's until the end.)
-static V heff_trs(V r) {
+HEFF_FN V heff_trs(V r) {
   long outer = heff_dep;
   do {
     Bnc *b = (Bnc *)r;
@@ -1229,7 +1246,7 @@ static inline V heff_tr(V r) {
   return (!IS_INT(r) && !IS_NTAG(r) && OBJ(r)->kind == K_BNC) ? heff_trs(r) : r;
 }
 
-static V heff_bounce(V f, int n, V *a) {
+HEFF_FN V heff_bounce(V f, int n, V *a) {
   Bnc *b = heff_obj_alloc(sizeof(Bnc) + n * sizeof(V));
   b->h.rc = 1; b->h.kind = K_BNC; b->h.tag = 0; b->fun = f; b->n = n;
   heff_copy(b->a, a, n);
@@ -1254,7 +1271,7 @@ static inline V heff_tail(V f, int n, V *a) {
 // after as nothing, the memo holding it.  A shared thunk's value is
 // counted as any shared object is, freed when the thunk and all that
 // hold it let it go)
-static __attribute__((noinline)) V heff_force_shared(V f, V *a) {
+HEFF_FN __attribute__((noinline)) V heff_force_shared(V f, V *a) {
   Clo *c = (Clo *)f;
   V m = __atomic_load_n(&c->memo, __ATOMIC_ACQUIRE);
   if (!m) {
@@ -1275,7 +1292,7 @@ static __attribute__((noinline)) V heff_force_shared(V f, V *a) {
 }
 #endif
 
-static V heff_apply(V f, int n, V *a) {
+HEFF_FN V heff_apply(V f, int n, V *a) {
   for (;;) {
     Obj *o = OBJ(f);
     if (o->kind == K_PAP) {
@@ -1394,7 +1411,7 @@ HEFF_VAR(HEFF_TLS HEFF_ONCE **heff_open);
 HEFF_VAR(HEFF_TLS size_t heff_nopen);
 HEFF_VAR(HEFF_TLS size_t heff_capopen);
 
-static __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
+HEFF_FN __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
   uintptr_t me = (uintptr_t)&heff_me;
   pthread_mutex_lock(&heff_once_mu);
   for (;;) {
@@ -1425,7 +1442,7 @@ static __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(
 
 // (what this thread was computing when a failure was caught, from the
 // `base`th on, to be computed again: the threads waiting for it woken)
-static void heff_reopen(size_t base) {
+HEFF_FN void heff_reopen(size_t base) {
   if (heff_nopen <= base) return;
   pthread_mutex_lock(&heff_once_mu);
   while (heff_nopen > base) __atomic_store_n(heff_open[--heff_nopen], 0, __ATOMIC_RELAXED);
@@ -1436,7 +1453,7 @@ static void heff_reopen(size_t base) {
 #define HEFF_ONCE int
 #define HEFF_DONE(st) HEFF_LIKELY((st) == 2)
 
-static __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
+HEFF_FN __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
   if (*st == 1) heff_fail("defined by itself");
   *st = 1;
   *val = heff_tr(init());
@@ -1455,7 +1472,7 @@ static __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(
 // (an integer's sign and digits, to compute with: a word's in `buf`)
 typedef struct { int neg; int n; const uint32_t *d; uint32_t buf[2]; } Num;
 
-static void num_of(V v, Num *x) {
+HEFF_FN void num_of(V v, Num *x) {
   if (IS_INT(v)) {
     int64_t i = INT_OF(v);
     uint64_t m = i < 0 ? (uint64_t)0 - (uint64_t)i : (uint64_t)i;
@@ -1471,7 +1488,7 @@ static void num_of(V v, Num *x) {
 }
 
 // (digits as an integer: a word if they fit)
-static V big_make(int neg, const uint32_t *d, int n) {
+HEFF_FN V big_make(int neg, const uint32_t *d, int n) {
   while (n > 0 && d[n - 1] == 0) n--;
   if (n <= 2) {
     uint64_t m = n == 0 ? 0 : n == 1 ? d[0] : ((uint64_t)d[1] << 32) | d[0];
@@ -1495,7 +1512,7 @@ HEFF_FAST V heff_int(int64_t i) {
   return heff_int_big(i);
 }
 
-static int mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn) {
+HEFF_FN int mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn) {
   if (an != bn) return an < bn ? -1 : 1;
   for (int i = an - 1; i >= 0; i--)
     if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
@@ -1503,7 +1520,7 @@ static int mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn) {
 }
 
 // (`o` has room for max(an, bn) + 1 digits)
-static int mag_add(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o) {
+HEFF_FN int mag_add(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o) {
   if (an < bn) { const uint32_t *t = a; a = b; b = t; int tn = an; an = bn; bn = tn; }
   uint64_t c = 0;
   for (int i = 0; i < an; i++) {
@@ -1516,7 +1533,7 @@ static int mag_add(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_
 }
 
 // (a - b, a's magnitude not below b's)
-static int mag_sub(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o) {
+HEFF_FN int mag_sub(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o) {
   int64_t c = 0;
   for (int i = 0; i < an; i++) {
     c += (int64_t)a[i] - (i < bn ? b[i] : 0);
@@ -1527,7 +1544,7 @@ static int mag_sub(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_
 }
 
 // (a + b, signed)
-static V num_add(const Num *a, int bneg, const Num *b) {
+HEFF_FN V num_add(const Num *a, int bneg, const Num *b) {
   int n = (a->n > b->n ? a->n : b->n) + 1;
   uint32_t *o = alloca(n * sizeof(uint32_t));
   if (a->neg == bneg) return big_make(a->neg, o, mag_add(a->d, a->n, b->d, b->n, o));
@@ -1537,7 +1554,7 @@ static V num_add(const Num *a, int bneg, const Num *b) {
 
 // (u divided by v, v's top digit not 0, as Knuth's algorithm D:
 // q gets m - n + 1 digits, r n)
-static void mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint32_t *q, uint32_t *r) {
+HEFF_FN void mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint32_t *q, uint32_t *r) {
   if (m < n) {
     memcpy(r, u, m * sizeof(uint32_t));
     memset(r + m, 0, (n - m) * sizeof(uint32_t));
@@ -1594,7 +1611,7 @@ static void mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint3
 
 // (a divided by b, rounded down, as the other backends round: the
 // quotient, or the remainder (b's sign))
-static V num_divmod(const Num *a, const Num *b, int want_mod) {
+HEFF_FN V num_divmod(const Num *a, const Num *b, int want_mod) {
   int qn = a->n - b->n + 1 > 0 ? a->n - b->n + 1 : 1;
   uint32_t *q = alloca((qn + 1) * sizeof(uint32_t)), *r = alloca((b->n + 1) * sizeof(uint32_t));
   memset(q, 0, (qn + 1) * sizeof(uint32_t));
@@ -1612,7 +1629,7 @@ static V num_divmod(const Num *a, const Num *b, int want_mod) {
   return big_make(1, o, mag_add(q, qn, &one, 1, o));
 }
 
-static V num_mul(const Num *a, const Num *b) {
+HEFF_FN V num_mul(const Num *a, const Num *b) {
   int n = a->n + b->n;
   uint32_t *o = alloca((n + 1) * sizeof(uint32_t));
   memset(o, 0, (n + 1) * sizeof(uint32_t));
@@ -1628,7 +1645,7 @@ static V num_mul(const Num *a, const Num *b) {
   return big_make(a->neg != b->neg, o, n);
 }
 
-static int num_cmp(const Num *a, const Num *b) {
+HEFF_FN int num_cmp(const Num *a, const Num *b) {
   if (a->neg != b->neg) return a->neg ? -1 : 1;
   int c = mag_cmp(a->d, a->n, b->d, b->n);
   return a->neg ? -c : c;
@@ -1725,7 +1742,7 @@ INT_CMP(heff_intLe, <=, <= 0)
 // sign.
 
 // (`x` as `n` words of two's complement, the least first)
-static void num_twos(const Num *x, uint32_t *t, int n) {
+HEFF_FN void num_twos(const Num *x, uint32_t *t, int n) {
   uint64_t carry = 1;
   for (int i = 0; i < n; i++) {
     uint32_t w = i < x->n ? x->d[i] : 0;
@@ -1738,7 +1755,7 @@ static void num_twos(const Num *x, uint32_t *t, int n) {
 }
 
 // (`n` words of two's complement as an integer; `t` is overwritten)
-static V twos_make(uint32_t *t, int n) {
+HEFF_FN V twos_make(uint32_t *t, int n) {
   int neg = (int)(t[n - 1] >> 31);
   if (neg) {
     uint64_t carry = 1;
@@ -1752,7 +1769,7 @@ static V twos_make(uint32_t *t, int n) {
 }
 
 #define INT_BITS(name, op)                                                  \
-  static V name(V a, V b) {                                                 \
+  HEFF_FN V name(V a, V b) {                                                 \
     if (IS_INT(a) && IS_INT(b)) return MK_INT(INT_OF(a) op INT_OF(b));      \
     Num x, y;                                                               \
     num_of(a, &x);                                                          \
@@ -1772,13 +1789,13 @@ INT_BITS(heff_intAnd, &)
 INT_BITS(heff_intOr, |)
 INT_BITS(heff_intXor, ^)
 
-static int heff_int_neg(V v) { return IS_INT(v) ? INT_OF(v) < 0 : ((Big *)v)->neg; }
+HEFF_FN int heff_int_neg(V v) { return IS_INT(v) ? INT_OF(v) < 0 : ((Big *)v)->neg; }
 
-static V heff_intShr(V a, V b);
+HEFF_FN V heff_intShr(V a, V b);
 
 // (`a` times 2^`b`; by a negative count, a shift right by its size; one
 // beyond memory fails)
-static V heff_intShl(V a, V b) {
+HEFF_FN V heff_intShl(V a, V b) {
   if (heff_int_neg(b)) return heff_intShr(a, heff_intSub(MK_INT(0), b));
   int bbig = !IS_INT(b);
   heff_drop(b);
@@ -1807,7 +1824,7 @@ static V heff_intShl(V a, V b) {
 
 // (`a` divided by 2^`b`, rounding down: its bits shifted out, the sign
 // shifted in; by a negative count, a shift left by its size)
-static V heff_intShr(V a, V b) {
+HEFF_FN V heff_intShr(V a, V b) {
   if (heff_int_neg(b)) return heff_intShl(a, heff_intSub(MK_INT(0), b));
   int bbig = !IS_INT(b);
   heff_drop(b);
@@ -1844,7 +1861,7 @@ static V heff_intShr(V a, V b) {
 }
 
 // (an integer's decimal digits, a '-' before a negative one: malloc'd)
-static char *heff_int_cstr(V v) {
+HEFF_FN char *heff_int_cstr(V v) {
   Num x;
   num_of(v, &x);
   uint32_t *m = alloca((x.n + 1) * sizeof(uint32_t));
@@ -1872,7 +1889,7 @@ static char *heff_int_cstr(V v) {
 }
 
 // (an integer written in the program, beyond a word: made once, kept)
-static V heff_big_lit(const char *s) {
+HEFF_FN V heff_big_lit(const char *s) {
   int neg = *s == '-';
   if (neg) s++;
   size_t len = strlen(s);
@@ -1914,7 +1931,7 @@ static V heff_big_lit(const char *s) {
 #endif
 
 // (a float's integer part, beyond a word if it must be)
-static V heff_int_of_double(double f) {
+HEFF_FN V heff_int_of_double(double f) {
   if (f < (double)INT_LIM && f >= -(double)INT_LIM) return MK_INT((int64_t)f);
   int e;
   double fr = frexp(fabs(f), &e);
@@ -1930,7 +1947,7 @@ static V heff_int_of_double(double f) {
   return big_make(f < 0, d, n);
 }
 
-static double heff_double_of_int(V v) {
+HEFF_FN double heff_double_of_int(V v) {
   if (IS_INT(v)) return (double)INT_OF(v);
   char *c = heff_int_cstr(v);
   double d = strtod(c, NULL);
@@ -1941,13 +1958,13 @@ static double heff_double_of_int(V v) {
 // Strings
 // ---------------------------------------------------------------------
 
-static Str *heff_str_new(int64_t len) {
+HEFF_FN Str *heff_str_new(int64_t len) {
   Str *s = heff_obj_alloc(sizeof(Str) + len);
   s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = len;
   return s;
 }
 
-static V heff_str_ascii(const char *c) {
+HEFF_FN V heff_str_ascii(const char *c) {
   int64_t n = (int64_t)strlen(c);
   Str *s = heff_str_new(n);
   if (n) memcpy(s->s, c, (size_t)n);
@@ -1956,7 +1973,7 @@ static V heff_str_ascii(const char *c) {
 
 // (`n` bytes, as they are.  The runtime's own: a provider builds a
 // string by what it crosses as, "What providers share")
-static V heff_str_of(const void *c, int64_t n) {
+HEFF_FN V heff_str_of(const void *c, int64_t n) {
   Str *s = heff_str_new(n);
   if (n) memcpy(s->s, c, (size_t)n);
   return (V)s;
@@ -1970,7 +1987,7 @@ static V heff_str_of(const void *c, int64_t n) {
 // on as its (a second byte of E0, ED, F0 and F4 in their own ranges,
 // Unicode's table 3-7) makes one U+FFFD of the k before it; a byte that
 // starts none is one)
-static int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out) {
+HEFF_FN int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out) {
   uint8_t b = p[0];
   if (b < 0x80) { *out = b; return 1; }
   int w; uint32_t u, lo = 0x80, hi = 0xBF;
@@ -1989,7 +2006,7 @@ static int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out) {
 }
 
 // (a scalar value's UTF-8 bytes, at `o`: how many)
-static int heff_u8_encode(uint8_t *o, uint32_t u) {
+HEFF_FN int heff_u8_encode(uint8_t *o, uint32_t u) {
   if (u < 0x80) { o[0] = (uint8_t)u; return 1; }
   if (u < 0x800) { o[0] = (uint8_t)(0xC0 | (u >> 6)); o[1] = (uint8_t)(0x80 | (u & 0x3F)); return 2; }
   if (u < 0x10000) { o[0] = (uint8_t)(0xE0 | (u >> 12)); o[1] = (uint8_t)(0x80 | ((u >> 6) & 0x3F)); o[2] = (uint8_t)(0x80 | (u & 0x3F)); return 3; }
@@ -2005,7 +2022,7 @@ static inline int heff_u8_own(const uint8_t *p, uint32_t u, int w) {
 
 // (how many bytes `n` bytes are, made text, what is not UTF-8 in them
 // U+FFFD; as many, where they are UTF-8)
-static int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own) {
+HEFF_FN int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own) {
   int64_t m = 0;
   *own = 1;
   for (int64_t i = 0; i < n;) {
@@ -2019,7 +2036,7 @@ static int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own) {
 
 // (`n` bytes, made text: what is not UTF-8 in them U+FFFD, as
 // TextDecoder reads them -- as they are, where they are UTF-8)
-static V heff_str_valid(const void *c, int64_t n) {
+HEFF_FN V heff_str_valid(const void *c, int64_t n) {
   const uint8_t *p = c;
   int own;
   int64_t m = heff_u8_valid_len(p, n, &own);
@@ -2040,7 +2057,7 @@ static V heff_str_valid(const void *c, int64_t n) {
 // twice what it needs -- a string built a piece at a time copied a
 // logarithmic number of times, not once a piece; `Bytes` too, a new one
 // of the kind `kind`)
-static V heff_buf_append(V a, V b, uint16_t kind) {
+HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len + y->len;
   if (heff_rc(&x->h) == 1) {
@@ -2070,7 +2087,7 @@ static V heff_buf_append(V a, V b, uint16_t kind) {
   return (V)s;
 }
 
-static V heff_strAppend(V a, V b) { return heff_buf_append(a, b, K_STR); }
+HEFF_FN V heff_strAppend(V a, V b) { return heff_buf_append(a, b, K_STR); }
 
 // Lent strings: a primitive that only reads its strings has a `_lent`
 // form, given besides its operands a mask, `give`, of those given it
@@ -2088,10 +2105,10 @@ HEFF_FAST V heff_strLength_lent(V a, int give) {
   HEFF_GIVEN(give, 0, a);
   return n;
 }
-static V heff_strLength(V a) { return heff_strLength_lent(a, 1); }
+HEFF_FN V heff_strLength(V a) { return heff_strLength_lent(a, 1); }
 
 // (as JavaScript's `slice`: out of range is clamped, negative from the end)
-static V heff_strSlice_lent(V a, V i, V j, int give) {
+HEFF_FN V heff_strSlice_lent(V a, V i, V j, int give) {
   Str *x = (Str *)a;
   int64_t n = x->len, b = INT_OF(i), e = INT_OF(j);
   if (b < 0) b = b + n < 0 ? 0 : b + n;
@@ -2104,7 +2121,7 @@ static V heff_strSlice_lent(V a, V i, V j, int give) {
   HEFF_GIVEN(give, 0, a);
   return (V)s;
 }
-static V heff_strSlice(V a, V i, V j) { return heff_strSlice_lent(a, i, j, 1); }
+HEFF_FN V heff_strSlice(V a, V i, V j) { return heff_strSlice_lent(a, i, j, 1); }
 
 // (the 8 bytes at `p` as a number in their order: the first the highest)
 static inline uint64_t heff_str_word(const uint8_t *p) {
@@ -2138,11 +2155,11 @@ HEFF_FAST V heff_strCompare_lent(V a, V b, int give) {
   HEFF_GIVEN(give, 1, b);
   return MK_INT(c);
 }
-static V heff_strCompare(V a, V b) { return heff_strCompare_lent(a, b, 3); }
+HEFF_FN V heff_strCompare(V a, V b) { return heff_strCompare_lent(a, b, 3); }
 
 // (where `needle` is first in `s` from `i` on (from 0, `i` below it), or
 // -1: its first byte looked for by memchr, the rest compared there)
-static V heff_strFind_lent(V needle, V s, V i, int give) {
+HEFF_FN V heff_strFind_lent(V needle, V s, V i, int give) {
   Str *p = (Str *)needle, *x = (Str *)s;
   int64_t k = INT_OF(i), m = p->len, r = -1;
   if (k < 0) k = 0;
@@ -2160,7 +2177,7 @@ static V heff_strFind_lent(V needle, V s, V i, int give) {
   HEFF_GIVEN(give, 1, s);
   return MK_INT(r);
 }
-static V heff_strFind(V needle, V s, V i) { return heff_strFind_lent(needle, s, i, 3); }
+HEFF_FN V heff_strFind(V needle, V s, V i) { return heff_strFind_lent(needle, s, i, 3); }
 
 // Hashes (lib/hashmap.hf): a string's is FxHash's step (Firefox's and
 // rustc's, `rotl(h, 5) ^ w` times its constant) over its bytes 8 at a
@@ -2208,9 +2225,9 @@ HEFF_FAST V heff_strHash_lent(V a, int give) {
   HEFF_GIVEN(give, 0, a);
   return r;
 }
-static V heff_strHash(V a) { return heff_strHash_lent(a, 1); }
+HEFF_FN V heff_strHash(V a) { return heff_strHash_lent(a, 1); }
 
-static V heff_intHash(V a) {
+HEFF_FN V heff_intHash(V a) {
   uint64_t u;
   if (IS_INT(a)) u = (uint64_t)INT_OF(a);
   else {
@@ -2250,7 +2267,7 @@ HEFF_FAST int heff_strEq_c_lent(V a, V b, int give) {
   HEFF_GIVEN(give, 1, b);
   return c;
 }
-static int heff_strEq_c(V a, V b) { return heff_strEq_c_lent(a, b, 3); }
+HEFF_FN int heff_strEq_c(V a, V b) { return heff_strEq_c_lent(a, b, 3); }
 static inline V heff_strEq(V a, V b) { return heff_bool(heff_strEq_c(a, b)); }
 HEFF_FAST V heff_strEq_lent(V a, V b, int give) { return heff_bool(heff_strEq_c_lent(a, b, give)); }
 
@@ -2260,7 +2277,7 @@ HEFF_FAST int heff_strLt_c_lent(V a, V b, int give) {
   HEFF_GIVEN(give, 1, b);
   return c < 0;
 }
-static int heff_strLt_c(V a, V b) { return heff_strLt_c_lent(a, b, 3); }
+HEFF_FN int heff_strLt_c(V a, V b) { return heff_strLt_c_lent(a, b, 3); }
 static inline V heff_strLt(V a, V b) { return heff_bool(heff_strLt_c(a, b)); }
 HEFF_FAST V heff_strLt_lent(V a, V b, int give) { return heff_bool(heff_strLt_c_lent(a, b, give)); }
 
@@ -2272,17 +2289,17 @@ HEFF_FAST V heff_strByteAt_lent(V a, V i, int give) {
   HEFF_GIVEN(give, 0, a);
   return r;
 }
-static V heff_strByteAt(V a, V i) { return heff_strByteAt_lent(a, i, 1); }
+HEFF_FN V heff_strByteAt(V a, V i) { return heff_strByteAt_lent(a, i, 1); }
 
 // (the string of one byte, a `UInt8`: a word of its value, 0 to 255)
-static V heff_strFromByte(V c) {
+HEFF_FN V heff_strFromByte(V c) {
   int64_t k = INT_OF(c);
   Str *s = heff_str_new(1);
   s->s[0] = (uint8_t)k;
   return (V)s;
 }
 
-static V heff_intShow(V a) {
+HEFF_FN V heff_intShow(V a) {
   char *c = heff_int_cstr(a);
   heff_drop(a);
   V s = heff_str_ascii(c);
@@ -2293,7 +2310,7 @@ static V heff_intShow(V a) {
 // Floats
 // ---------------------------------------------------------------------
 
-static V heff_flt(double d) {
+HEFF_FN V heff_flt(double d) {
   Flt *f = heff_obj_alloc(sizeof(Flt));
   f->h.rc = 1; f->h.kind = K_FLT; f->h.tag = 0; f->d = d;
   return (V)f;
@@ -2303,7 +2320,7 @@ static V heff_flt(double d) {
 
 // (two floats' operation, both consumed)
 #define FLT2(name, expr) \
-  static V name(V a, V b) { double x = FLT_OF(a), y = FLT_OF(b); heff_drop(a); heff_drop(b); return expr; }
+  HEFF_FN V name(V a, V b) { double x = FLT_OF(a), y = FLT_OF(b); heff_drop(a); heff_drop(b); return expr; }
 FLT2(heff_floatAdd, heff_flt(x + y))
 FLT2(heff_floatSub, heff_flt(x - y))
 FLT2(heff_floatMul, heff_flt(x * y))
@@ -2316,12 +2333,12 @@ FLT2(heff_floatDiv, heff_flt(x / y))
 FLT_CMP(heff_floatEq, ==)
 FLT_CMP(heff_floatLt, <)
 FLT_CMP(heff_floatLe, <=)
-static V heff_floatFromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_flt(d); }
-static V heff_floatSqrt(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(sqrt(x)); }
+HEFF_FN V heff_floatFromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_flt(d); }
+HEFF_FN V heff_floatSqrt(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(sqrt(x)); }
 
 // (std.math's: libm's, as JavaScript's `Math` has them)
 #define FLT1(name, f) \
-  static V name(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(f(x)); }
+  HEFF_FN V name(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(f(x)); }
 FLT1(heff_floatSin, sin)
 FLT1(heff_floatCos, cos)
 FLT1(heff_floatTan, tan)
@@ -2334,7 +2351,7 @@ FLT2(heff_floatAtan2, heff_flt(atan2(x, y)))
 FLT2(heff_floatPow, heff_flt(pow(x, y)))
 
 // (of what is not finite, 0)
-static V heff_floatFloor(V a) {
+HEFF_FN V heff_floatFloor(V a) {
   double d = FLT_OF(a);
   heff_drop(a);
   if (!isfinite(d)) return MK_INT(0);
@@ -2345,7 +2362,7 @@ static V heff_floatFloor(V a) {
 // (as JavaScript writes a number: the fewest digits that read back the
 // same, in plain or exponent form by its rules (ECMAScript
 // Number::toString); then ".0" where that is a whole number)
-static void heff_js_number(double d, char *out) {
+HEFF_FN void heff_js_number(double d, char *out) {
   if (isnan(d)) { strcpy(out, "NaN"); return; }
   if (isinf(d)) { strcpy(out, d < 0 ? "-Infinity" : "Infinity"); return; }
   if (d == 0) { strcpy(out, "0"); return; }
@@ -2383,7 +2400,7 @@ static void heff_js_number(double d, char *out) {
   *o = 0;
 }
 
-static V heff_floatShow(V a) {
+HEFF_FN V heff_floatShow(V a) {
   char buf[64];
   heff_js_number(FLT_OF(a), buf);
   heff_drop(a);
@@ -2419,7 +2436,7 @@ static inline float heff_f32_of(V v) {
 // each operation rounded, as JavaScript's `Math.fround` rounds.
 
 // (an integer's lowest 64 bits, as two's complement has them; borrowed)
-static uint64_t heff_int_low64(V v) {
+HEFF_FN uint64_t heff_int_low64(V v) {
   if (IS_INT(v)) return (uint64_t)INT_OF(v);
   Big *b = (Big *)v;
   uint64_t m = b->n > 0 ? b->d[0] : 0;
@@ -2427,7 +2444,7 @@ static uint64_t heff_int_low64(V v) {
   return b->neg ? (uint64_t)0 - m : m;
 }
 
-static V heff_int_u64(uint64_t m) {
+HEFF_FN V heff_int_u64(uint64_t m) {
   if (m < (uint64_t)INT_LIM) return MK_INT((int64_t)m);
   uint32_t d[2] = { (uint32_t)m, (uint32_t)(m >> 32) };
   return big_make(0, d, 2);
@@ -2543,14 +2560,14 @@ F32_2(Div, heff_f32(x / y))
 F32_CMP(Eq, ==)
 F32_CMP(Lt, <)
 F32_CMP(Le, <=)
-static V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
+HEFF_FN V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
 
 // (the fewest digits that read back as the same `Float32`, read as a float
 // reads them (through a double), written as a float is: for each count of
 // digits, the number of that many nearest it (of two as near, the one
 // whose last digit is even, as printf rounds), if it reads back so; nine
 // always do)
-static V heff_float32Show(V a) {
+HEFF_FN V heff_float32Show(V a) {
   float f = heff_f32_of(a);
   double d = f;
   char buf[64];
@@ -2565,10 +2582,10 @@ static V heff_float32Show(V a) {
   return heff_str_ascii(buf);
 }
 
-static V heff_float32FromFloat(V a) { float f = (float)FLT_OF(a); heff_drop(a); return heff_f32(f); }
-static V heff_float32ToFloat(V a) { return heff_flt((double)heff_f32_of(a)); }
-static V heff_float32FromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_f32((float)d); }
-static V heff_float32Floor(V a) {
+HEFF_FN V heff_float32FromFloat(V a) { float f = (float)FLT_OF(a); heff_drop(a); return heff_f32(f); }
+HEFF_FN V heff_float32ToFloat(V a) { return heff_flt((double)heff_f32_of(a)); }
+HEFF_FN V heff_float32FromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_f32((float)d); }
+HEFF_FN V heff_float32Floor(V a) {
   double d = heff_f32_of(a);
   if (!isfinite(d)) return MK_INT(0);
   return heff_int_of_double(floor(d));
@@ -2637,7 +2654,7 @@ static inline V heff_word_i64(int64_t x) { return (V)(uint64_t)x; }
 static inline V heff_word_u64(uint64_t x) { return (V)x; }
 static inline double heff_f64_of_word(V w) { double d; memcpy(&d, &w, sizeof d); return d; }
 
-static V heff_flat_box(V w, unsigned k) {
+HEFF_FN V heff_flat_box(V w, unsigned k) {
   if (k == HEFF_FLAT_F64) return heff_flt(heff_f64_of_word(w));
   if (k == HEFF_FLAT_I64) return heff_int((int64_t)w);
   return heff_int_u64((uint64_t)w);
@@ -2719,11 +2736,11 @@ HEFF_FAST V heff_tget_v(V v, int64_t i) {
 }
 
 // (of what is not finite, 0)
-static V heff_floor_f64(double d) {
+HEFF_FN V heff_floor_f64(double d) {
   if (!isfinite(d)) return MK_INT(0);
   return heff_int_of_double(floor(d));
 }
-static V heff_floor_f32(float f) { return heff_floor_f64((double)f); }
+HEFF_FN V heff_floor_f32(float f) { return heff_floor_f64((double)f); }
 
 // Runes
 // ---------------------------------------------------------------------
@@ -2739,11 +2756,11 @@ static inline int heff_runeLe_c(V a, V b) { return INT_OF(a) <= INT_OF(b); }
 static inline V heff_runeEq(V a, V b) { return heff_bool(heff_runeEq_c(a, b)); }
 static inline V heff_runeLt(V a, V b) { return heff_bool(heff_runeLt_c(a, b)); }
 static inline V heff_runeLe(V a, V b) { return heff_bool(heff_runeLe_c(a, b)); }
-static V heff_runeToInt(V a) { return a; }
-static V heff_runeFromInt(V a) { return heff_int32FromInt(a); }
+HEFF_FN V heff_runeToInt(V a) { return a; }
+HEFF_FN V heff_runeFromInt(V a) { return heff_int32FromInt(a); }
 
 // (a string's runes: read, then put in a list from the last)
-static V heff_strRunes(V a) {
+HEFF_FN V heff_strRunes(V a) {
   Str *x = (Str *)a;
   uint32_t *rs = heff_alloc((size_t)(x->len + 1) * sizeof(uint32_t));
   int64_t m = 0;
@@ -2763,7 +2780,7 @@ static inline int heff_rune_scalar(int64_t r) {
 }
 
 // (the runes' string: each its UTF-8 bytes)
-static V heff_strOfRunes(V l) {
+HEFF_FN V heff_strOfRunes(V l) {
   int64_t n = 0;
   uint8_t tmp[4];
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
@@ -2782,7 +2799,7 @@ static V heff_strOfRunes(V l) {
 
 // (the rune at `i`, and how many bytes it takes, `*w`; out of the
 // string, U+FFFD of none)
-static uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
+HEFF_FN uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
   if (i < 0 || i >= x->len) { *w = 0; return 0xFFFD; }
   uint32_t u;
   *w = heff_u8_decode(x->s + i, x->len - i, &u);
@@ -2795,7 +2812,7 @@ HEFF_FAST V heff_strRuneAt_lent(V a, V i, int give) {
   HEFF_GIVEN(give, 0, a);
   return MK_INT((int64_t)r);
 }
-static V heff_strRuneAt(V a, V i) { return heff_strRuneAt_lent(a, i, 1); }
+HEFF_FN V heff_strRuneAt(V a, V i) { return heff_strRuneAt_lent(a, i, 1); }
 
 HEFF_FAST V heff_strRuneWidth_lent(V a, V i, int give) {
   int64_t w;
@@ -2803,9 +2820,9 @@ HEFF_FAST V heff_strRuneWidth_lent(V a, V i, int give) {
   HEFF_GIVEN(give, 0, a);
   return MK_INT(w);
 }
-static V heff_strRuneWidth(V a, V i) { return heff_strRuneWidth_lent(a, i, 1); }
+HEFF_FN V heff_strRuneWidth(V a, V i) { return heff_strRuneWidth_lent(a, i, 1); }
 
-static V heff_strRuneCount(V a) {
+HEFF_FN V heff_strRuneCount(V a) {
   Str *x = (Str *)a;
   int64_t n = 0;
   uint32_t u;
@@ -2840,20 +2857,20 @@ static V heff_strRuneCount(V a) {
 // string's), so that a read of an array set after is not a count up and
 // down of it.
 
-static Arr *heff_arr_alloc(int64_t n, unsigned kind) {
+HEFF_FN Arr *heff_arr_alloc(int64_t n, unsigned kind) {
   Arr *r = heff_obj_alloc(sizeof(Arr) + (size_t)n * heff_arr_width[kind]);
   r->h.rc = 1; r->h.kind = K_ARR; r->h.tag = (uint16_t)kind; r->n = n;
   return r;
 }
 
-static Arr *heff_arr_new(int64_t n) { return heff_arr_alloc(n, HEFF_ARR_V); }
+HEFF_FN Arr *heff_arr_new(int64_t n) { return heff_arr_alloc(n, HEFF_ARR_V); }
 
 // (an array's elements, as C's array of `T`)
 #define HEFF_ARR_AT(r, T) ((T *)(void *)(r)->a)
 
 // (an array's length, of how many it is asked for: none for less, and no
 // more than memory holds)
-static int64_t heff_arr_count(V n) {
+HEFF_FN int64_t heff_arr_count(V n) {
   if (IS_INT(n)) return INT_OF(n) > 0 ? INT_OF(n) : 0;
   if (((Big *)n)->neg) return 0;
   heff_fail("out of memory");
@@ -2861,7 +2878,7 @@ static int64_t heff_arr_count(V n) {
 }
 
 // (out of range, abandoned)
-static __attribute__((noinline, cold)) void heff_arr_out(void) { heff_abandon(); }
+HEFF_FN __attribute__((noinline, cold)) void heff_arr_out(void) { heff_abandon(); }
 
 // (whether an index is in range)
 #define heff_arr_in(r, i) (IS_INT(i) && (uint64_t)INT_OF(i) < (uint64_t)(r)->n)
@@ -2880,7 +2897,7 @@ static inline int heff_arr_mine(Arr *r, unsigned kind) {
 }
 
 // (element `k` as a `V` counted: a flat one boxed)
-static V heff_arr_get(Arr *r, int64_t k) {
+HEFF_FN V heff_arr_get(Arr *r, int64_t k) {
   switch (r->h.tag) {
   case HEFF_ARR_F64: return heff_box_f64(HEFF_ARR_AT(r, double)[k]);
   case HEFF_ARR_I64: return heff_box_i64(HEFF_ARR_AT(r, int64_t)[k]);
@@ -2898,7 +2915,7 @@ static V heff_arr_get(Arr *r, int64_t k) {
 
 // (`x`, consumed, stored at `k` as the array keeps it: what was there
 // not dropped)
-static void heff_arr_put(Arr *r, int64_t k, V x) {
+HEFF_FN void heff_arr_put(Arr *r, int64_t k, V x) {
   switch (r->h.tag) {
   case HEFF_ARR_F64: HEFF_ARR_AT(r, double)[k] = heff_unbox_f64(x); return;
   case HEFF_ARR_I64: HEFF_ARR_AT(r, int64_t)[k] = heff_unbox_i64(x); return;
@@ -2916,13 +2933,13 @@ static void heff_arr_put(Arr *r, int64_t k, V x) {
 
 // (how an array built of `V`s keeps them, by one of them: flat if it is
 // a `Float64`'s box)
-static unsigned heff_arr_kind_of(V x) {
+HEFF_FN unsigned heff_arr_kind_of(V x) {
   return IS_OBJ(x) && OBJ(x)->kind == K_FLT ? HEFF_ARR_F64 : HEFF_ARR_V;
 }
 
 // (`r`'s elements from `from`, `n` of them, put at `at` of `s`, each
 // counted: as `s` keeps them, if it keeps them otherwise)
-static void heff_arr_move(Arr *s, int64_t at, Arr *r, int64_t from, int64_t n) {
+HEFF_FN void heff_arr_move(Arr *s, int64_t at, Arr *r, int64_t from, int64_t n) {
   if (s->h.tag == r->h.tag) {
     if (r->h.tag == HEFF_ARR_V)
       for (int64_t j = 0; j < n; j++) s->a[at + j] = heff_dup(r->a[from + j]);
@@ -2934,7 +2951,7 @@ static void heff_arr_move(Arr *s, int64_t at, Arr *r, int64_t from, int64_t n) {
 }
 
 // (a copy of the array `a`, held elsewhere too: `a` counted down)
-static __attribute__((noinline)) Arr *heff_arr_copy(V a) {
+HEFF_FN __attribute__((noinline)) Arr *heff_arr_copy(V a) {
   Arr *r = (Arr *)a;
   Arr *s = heff_arr_alloc(r->n, r->h.tag);
   heff_arr_move(s, 0, r, 0, r->n);
@@ -2947,7 +2964,7 @@ HEFF_FAST V heff_arrayLength_lent(V a, int give) {
   HEFF_GIVEN(give, 0, a);
   return n;
 }
-static V heff_arrayLength(V a) { return heff_arrayLength_lent(a, 1); }
+HEFF_FN V heff_arrayLength(V a) { return heff_arrayLength_lent(a, 1); }
 
 // (the element at `i`, a `V`; out of range, abandoned)
 HEFF_FAST V heff_arrayIndex_lent(V a, V i, int give) {
@@ -2958,7 +2975,7 @@ HEFF_FAST V heff_arrayIndex_lent(V a, V i, int give) {
   HEFF_GIVEN(give, 0, a);
   return x;
 }
-static V heff_arrayIndex(V a, V i) { return heff_arrayIndex_lent(a, i, 3); }
+HEFF_FN V heff_arrayIndex(V a, V i) { return heff_arrayIndex_lent(a, i, 3); }
 
 // (... read as a number, where the program knows it is one: the
 // element as the array keeps it, flat or a `V` -- an array of `Float64`s
@@ -2995,7 +3012,7 @@ HEFF_ARR_INDEX(f32, float, HEFF_ARR_F32)
 // (`set` but where the array is held only here and keeps `x` as it is:
 // out of range, the array as it is; held elsewhere too, a copy, `x` at
 // `i` in it)
-static __attribute__((noinline)) V heff_arr_set_slow(V a, V i, V x) {
+HEFF_FN __attribute__((noinline)) V heff_arr_set_slow(V a, V i, V x) {
   Arr *r = (Arr *)a;
   if (!heff_arr_in(r, i)) {
     heff_drop(i);
@@ -3045,7 +3062,7 @@ HEFF_ARR_SET(f32, float, HEFF_ARR_F32)
 
 // (`n` elements, each `x`: of `V`s, counted once for each -- flat if
 // `x` is a `Float64`)
-static V heff_arrayReplicate(V n, V x) {
+HEFF_FN V heff_arrayReplicate(V n, V x) {
   int64_t m = heff_arr_count(n);
   if (m == 0) {
     heff_drop(x);
@@ -3087,7 +3104,7 @@ HEFF_ARR_REPLICATE(i8, int8_t, HEFF_ARR_I8)
 HEFF_ARR_REPLICATE(u8, uint8_t, HEFF_ARR_U8)
 HEFF_ARR_REPLICATE(f32, float, HEFF_ARR_F32)
 
-static V heff_arrayGenerate(V n, V f) {
+HEFF_FN V heff_arrayGenerate(V n, V f) {
   int64_t m = heff_arr_count(n);
   if (m == 0) {
     heff_drop(f);
@@ -3102,7 +3119,7 @@ static V heff_arrayGenerate(V n, V f) {
 }
 
 // (a list's cell's element, a `V` counted: a flat one (#64) boxed)
-static V heff_arrayFromList(V l) {
+HEFF_FN V heff_arrayFromList(V l) {
   int64_t n = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n++;
   if (n == 0) {
@@ -3119,7 +3136,7 @@ static V heff_arrayFromList(V l) {
   return (V)r;
 }
 
-static V heff_arrayToList(V a) {
+HEFF_FN V heff_arrayToList(V a) {
   Arr *r = (Arr *)a;
   V l = NTAG(TAG_Nil);
   for (int64_t k = r->n - 1; k >= 0; k--) {
@@ -3132,7 +3149,7 @@ static V heff_arrayToList(V a) {
 
 // (the elements from `i` up to `j`, as a string's slice (`strSlice`):
 // each clamped to them, a negative one counted from the end)
-static V heff_arraySlice(V a, V i, V j) {
+HEFF_FN V heff_arraySlice(V a, V i, V j) {
   Arr *r = (Arr *)a;
   int64_t n = r->n, b = INT_OF(i), e = INT_OF(j);
   if (!IS_INT(i)) b = ((Big *)i)->neg ? 0 : n;
@@ -3153,7 +3170,7 @@ static V heff_arraySlice(V a, V i, V j) {
 
 // (one array's elements, then another's: kept as theirs are, or -- one
 // flat and the other of `V`s -- flat, the other's put so)
-static V heff_arrayAppend(V a, V b) {
+HEFF_FN V heff_arrayAppend(V a, V b) {
   Arr *r = (Arr *)a, *t = (Arr *)b;
   if (t->n == 0) { heff_drop(b); return a; }
   if (r->n == 0) { heff_drop(a); return b; }
@@ -3172,17 +3189,17 @@ static V heff_arrayAppend(V a, V b) {
 // the kind `K_BYT` -- dropped, shared with a thread and grown by an append
 // as a string is, and shown as a binary, `b[...]`.  Their length, slice and
 // equality are a string's; a byte is a `UInt8`, a word of its value)
-static Str *heff_bytes_new(int64_t len) {
+HEFF_FN Str *heff_bytes_new(int64_t len) {
   Str *s = heff_str_new(len);
   s->h.kind = K_BYT;
   return s;
 }
 
-static V heff_bytesLength(V a) { return heff_strLength(a); }
+HEFF_FN V heff_bytesLength(V a) { return heff_strLength(a); }
 
 // (the byte at `i`; out of them, abandoned, as `bytes`'s `index` never
 // asks)
-static V heff_bytesAt(V a, V i) {
+HEFF_FN V heff_bytesAt(V a, V i) {
   Str *x = (Str *)a;
   int64_t k = INT_OF(i);
   if (!IS_INT(i) || k < 0 || k >= x->len) return heff_abandon();
@@ -3191,17 +3208,17 @@ static V heff_bytesAt(V a, V i) {
   return r;
 }
 
-static V heff_bytesSlice(V a, V i, V j) {
+HEFF_FN V heff_bytesSlice(V a, V i, V j) {
   V s = heff_strSlice(a, i, j);
   OBJ(s)->kind = K_BYT;
   return s;
 }
 
-static V heff_bytesAppend(V a, V b) { return heff_buf_append(a, b, K_BYT); }
+HEFF_FN V heff_bytesAppend(V a, V b) { return heff_buf_append(a, b, K_BYT); }
 
 // (a list's bytes, one after another: their length added up first, so
 // that they are made once, each copied once)
-static V heff_bytesConcat(V l) {
+HEFF_FN V heff_bytesConcat(V l) {
   int64_t n = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n += ((Str *)heff_field(c, 0))->len;
   Str *s = heff_bytes_new(n);
@@ -3215,9 +3232,9 @@ static V heff_bytesConcat(V l) {
   return (V)s;
 }
 
-static V heff_bytesEq(V a, V b) { return heff_strEq(a, b); }
+HEFF_FN V heff_bytesEq(V a, V b) { return heff_strEq(a, b); }
 
-static V heff_bytesFromList(V l) {
+HEFF_FN V heff_bytesFromList(V l) {
   int64_t n = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n++;
   Str *s = heff_bytes_new(n);
@@ -3227,7 +3244,7 @@ static V heff_bytesFromList(V l) {
   return (V)s;
 }
 
-static V heff_bytesToList(V a) {
+HEFF_FN V heff_bytesToList(V a) {
   Str *x = (Str *)a;
   V l = NTAG(TAG_Nil);
   for (int64_t k = x->len - 1; k >= 0; k--) {
@@ -3239,7 +3256,7 @@ static V heff_bytesToList(V a) {
 }
 
 // (a string's bytes, as they are)
-static V heff_bytesFromString(V a) {
+HEFF_FN V heff_bytesFromString(V a) {
   Str *x = (Str *)a, *s = heff_bytes_new(x->len);
   if (x->len) memcpy(s->s, x->s, (size_t)x->len);
   heff_drop(a);
@@ -3247,7 +3264,7 @@ static V heff_bytesFromString(V a) {
 }
 
 // (a string of them, as they are: `bytesFromString` undone)
-static V heff_bytesAsString(V a) {
+HEFF_FN V heff_bytesAsString(V a) {
   Str *x = (Str *)a;
   V s = heff_str_of(x->s, x->len);
   heff_drop(a);
@@ -3255,7 +3272,7 @@ static V heff_bytesAsString(V a) {
 }
 
 // (their text: what is not UTF-8 in them U+FFFD, as TextDecoder reads it)
-static V heff_bytesToString(V a) {
+HEFF_FN V heff_bytesToString(V a) {
   Str *x = (Str *)a;
   V s = heff_str_valid(x->s, x->len);
   heff_drop(a);
@@ -3269,7 +3286,7 @@ static V heff_bytesToString(V a) {
 // 8` bits left, the most significant -- read as signed where `f` has 2.
 // `heff_bits_read` and `heff_bits_write` have them in the order they are
 // written, `heff_bits_little` turns the one into the other.)
-static uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n) {
+HEFF_FN uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n) {
   uint64_t u = 0;
   if ((at & 7) == 0 && (n & 7) == 0) {
     const uint8_t *p = s + (at >> 3);
@@ -3282,7 +3299,7 @@ static uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n) {
 
 // (the `n` bits of `w`, the most significant first, put at bit `at` of
 // `s`, whose bits there are 0)
-static void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n) {
+HEFF_FN void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n) {
   if ((at & 7) == 0 && (n & 7) == 0) {
     uint8_t *p = s + (at >> 3);
     for (int64_t i = 0; i < (n >> 3); i++) p[i] = (uint8_t)(w >> (n - 8 * (i + 1)));
@@ -3294,7 +3311,7 @@ static void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n) {
 
 // (an integer of `n` bits, little-endian: its bits as they are written,
 // from the integer (`out`), or the integer, from them)
-static uint64_t heff_bits_little(uint64_t u, int64_t n, int out) {
+HEFF_FN uint64_t heff_bits_little(uint64_t u, int64_t n, int out) {
   int64_t k = n >> 3, r = n & 7;
   uint64_t w = 0;
   if (out) {
@@ -3308,7 +3325,7 @@ static uint64_t heff_bits_little(uint64_t u, int64_t n, int out) {
 }
 
 // (the integer of `n` bits at bit `at` of `s`, as the flags `f` say)
-static V heff_bits_int(const uint8_t *s, int64_t at, int64_t n, int64_t flags) {
+HEFF_FN V heff_bits_int(const uint8_t *s, int64_t at, int64_t n, int64_t flags) {
   uint64_t u = heff_bits_read(s, at, n);
   if (flags & 1) u = heff_bits_little(u, n, 0);
   if ((flags & 2) && n > 0 && n < 64 && (u >> (n - 1)) & 1) return heff_int((int64_t)(u | (~(uint64_t)0 << n)));
@@ -3317,14 +3334,14 @@ static V heff_bits_int(const uint8_t *s, int64_t at, int64_t n, int64_t flags) {
 }
 
 // (the integer `v`'s low `n` bits, as they are written)
-static uint64_t heff_bits_of_int(V v, int64_t n, int64_t flags) {
+HEFF_FN uint64_t heff_bits_of_int(V v, int64_t n, int64_t flags) {
   uint64_t u = heff_int_low64(v);
   if (n < 64) u &= ((uint64_t)1 << n) - 1;
   return (flags & 1) ? heff_bits_little(u, n, 1) : u;
 }
 
 // (`heff.elab.clauses` checks that it is there before it is read)
-static V heff_bytesIntAt(V a, V o, V n, V f) {
+HEFF_FN V heff_bytesIntAt(V a, V o, V n, V f) {
   Str *x = (Str *)a;
   int64_t at = INT_OF(o), bits = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > x->len * 8) return heff_abandon();
@@ -3335,7 +3352,7 @@ static V heff_bytesIntAt(V a, V o, V n, V f) {
 
 // (the integer `v`, its low `n` bits (a multiple of 8, up to 64), as
 // bytes)
-static V heff_bytesOfInt(V n, V f, V v) {
+HEFF_FN V heff_bytesOfInt(V n, V f, V v) {
   int64_t bits = INT_OF(n);
   if (!IS_INT(n) || bits < 0 || bits > 64 || (bits & 7)) return heff_abandon();
   uint64_t w = heff_bits_of_int(v, bits, INT_OF(f));
@@ -3346,7 +3363,7 @@ static V heff_bytesOfInt(V n, V f, V v) {
 }
 
 // (whether the bytes `b` are those of `a` at `o`)
-static V heff_bytesHasAt(V a, V o, V b) {
+HEFF_FN V heff_bytesHasAt(V a, V o, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t at = INT_OF(o);
   int r = IS_INT(o) && at >= 0 && at <= x->len - y->len && (y->len == 0 || memcmp(x->s + at, y->s, (size_t)y->len) == 0);
@@ -3366,7 +3383,7 @@ static V heff_bytesHasAt(V a, V o, V b) {
 // a string is, and shown as a binary, `b[...]`)
 #define HEFF_BITS_LEN(x) ((x)->len * 8 - (int64_t)(x)->h.tag)
 
-static Str *heff_bits_new(int64_t n) {
+HEFF_FN Str *heff_bits_new(int64_t n) {
   int64_t len = (n + 7) >> 3;
   Str *s = heff_str_new(len);
   s->h.kind = K_BIT;
@@ -3377,7 +3394,7 @@ static Str *heff_bits_new(int64_t n) {
 
 // (the `n` bits of `src` from bit `from`, put at bit `at` of `dst`,
 // whose bits there are 0)
-static void heff_bits_copy(uint8_t *dst, int64_t at, const uint8_t *src, int64_t from, int64_t n) {
+HEFF_FN void heff_bits_copy(uint8_t *dst, int64_t at, const uint8_t *src, int64_t from, int64_t n) {
   if ((at & 7) == 0 && (from & 7) == 0) {
     int64_t k = n >> 3;
     if (k) memcpy(dst + (at >> 3), src + (from >> 3), (size_t)k);
@@ -3389,13 +3406,13 @@ static void heff_bits_copy(uint8_t *dst, int64_t at, const uint8_t *src, int64_t
   if (i < n) heff_bits_write(dst, at + i, heff_bits_read(src, from + i, n - i), n - i);
 }
 
-static V heff_bitsLength(V a) {
+HEFF_FN V heff_bitsLength(V a) {
   int64_t n = HEFF_BITS_LEN((Str *)a);
   heff_drop(a);
   return MK_INT(n);
 }
 
-static V heff_bitsIntAt(V a, V o, V n, V f) {
+HEFF_FN V heff_bitsIntAt(V a, V o, V n, V f) {
   Str *x = (Str *)a;
   int64_t at = INT_OF(o), bits = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > HEFF_BITS_LEN(x)) return heff_abandon();
@@ -3405,7 +3422,7 @@ static V heff_bitsIntAt(V a, V o, V n, V f) {
 }
 
 // (the integer `v`, its low `n` bits, 0 to 64, as bits)
-static V heff_bitsOfInt(V n, V f, V v) {
+HEFF_FN V heff_bitsOfInt(V n, V f, V v) {
   int64_t bits = INT_OF(n);
   if (!IS_INT(n) || bits < 0 || bits > 64) return heff_abandon();
   uint64_t w = heff_bits_of_int(v, bits, INT_OF(f));
@@ -3416,7 +3433,7 @@ static V heff_bitsOfInt(V n, V f, V v) {
 }
 
 // (a list's bits, one after another, made at once)
-static V heff_bitsConcat(V l) {
+HEFF_FN V heff_bitsConcat(V l) {
   int64_t n = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n += HEFF_BITS_LEN((Str *)heff_field(c, 0));
   Str *s = heff_bits_new(n);
@@ -3431,7 +3448,7 @@ static V heff_bitsConcat(V l) {
 }
 
 // (the `n` bits from bit `o`; out of them, abandoned)
-static V heff_bitsSlice(V a, V o, V n) {
+HEFF_FN V heff_bitsSlice(V a, V o, V n) {
   Str *x = (Str *)a;
   int64_t at = INT_OF(o), m = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || m < 0 || at + m > HEFF_BITS_LEN(x)) return heff_abandon();
@@ -3443,7 +3460,7 @@ static V heff_bitsSlice(V a, V o, V n) {
 
 // (bytes as bits, and bits that are whole bytes as bytes (others,
 // abandoned): the same buffer where it is the last reference)
-static V heff_bitsOfBytes(V a) {
+HEFF_FN V heff_bitsOfBytes(V a) {
   Str *x = (Str *)a;
   if (heff_rc(&x->h) == 1) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
   Str *s = heff_bits_new(x->len * 8);
@@ -3452,7 +3469,7 @@ static V heff_bitsOfBytes(V a) {
   return (V)s;
 }
 
-static V heff_bitsBytes(V a) {
+HEFF_FN V heff_bitsBytes(V a) {
   Str *x = (Str *)a;
   if (x->h.tag) return heff_abandon();
   if (heff_rc(&x->h) == 1) { x->h.kind = K_BYT; return a; }
@@ -3462,7 +3479,7 @@ static V heff_bitsBytes(V a) {
   return (V)s;
 }
 
-static V heff_bitsEq(V a, V b) {
+HEFF_FN V heff_bitsEq(V a, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
   int r = x->len == y->len && x->h.tag == y->h.tag && (x->len == 0 || memcmp(x->s, y->s, (size_t)x->len) == 0);
   heff_drop(a);
@@ -3473,7 +3490,7 @@ static V heff_bitsEq(V a, V b) {
 // (a `Float64`'s bits, IEEE's: of 64 bits, or of 32, rounded to a
 // `float` first; a NaN, the quiet one, its sign 0, as every backend has
 // it)
-static V heff_floatBits(V n, V x) {
+HEFF_FN V heff_floatBits(V n, V x) {
   int64_t bits = INT_OF(n);
   double d = FLT_OF(x);
   heff_drop(x);
@@ -3492,7 +3509,7 @@ static V heff_floatBits(V n, V x) {
 }
 
 // (the `Float64` whose bits, of 64 or of 32, are those of `v`)
-static V heff_floatOfBits(V n, V v) {
+HEFF_FN V heff_floatOfBits(V n, V v) {
   int64_t bits = INT_OF(n);
   uint64_t u = heff_int_low64(v);
   heff_drop(v);
@@ -3504,10 +3521,10 @@ static V heff_floatOfBits(V n, V v) {
 // What providers share
 // ---------------------------------------------------------------------
 
-static V heff_just(V x) { return heff_tag_n(TAG_Just, 1, &x); }
+HEFF_FN V heff_just(V x) { return heff_tag_n(TAG_Just, 1, &x); }
 #define heff_nothing NTAG(TAG_Nothing)
 
-static V heff_cons(V x, V rest) {
+HEFF_FN V heff_cons(V x, V rest) {
   V f[2] = { x, rest };
   return heff_tag_n(TAG_Cons, 2, f);
 }
@@ -3534,30 +3551,30 @@ static V heff_cons(V x, V rest) {
 // text is made valid, what is not UTF-8 in it U+FFFD, both in and out.
 
 // (content in, `n` bytes, as a string)
-static V heff_str_bytes(const void *c, int64_t n) { return heff_str_of(c, n); }
+HEFF_FN V heff_str_bytes(const void *c, int64_t n) { return heff_str_of(c, n); }
 
 // (text in, `n` bytes of it, as a string)
-static V heff_str_text_n(const void *c, int64_t n) { return heff_str_valid(c, n); }
+HEFF_FN V heff_str_text_n(const void *c, int64_t n) { return heff_str_valid(c, n); }
 
 // (a C string of text in, as a string: a name)
-static V heff_str_text(const char *c) { return heff_str_text_n(c, (int64_t)strlen(c)); }
+HEFF_FN V heff_str_text(const char *c) { return heff_str_text_n(c, (int64_t)strlen(c)); }
 
 // (C strings, a directory's names, as a list of strings)
-static V heff_strs_bytes(char **xs, int64_t n) {
+HEFF_FN V heff_strs_bytes(char **xs, int64_t n) {
   V l = NTAG(TAG_Nil);
   for (int64_t i = n - 1; i >= 0; i--) l = heff_cons(heff_str_bytes(xs[i], (int64_t)strlen(xs[i])), l);
   return l;
 }
 
 // (C strings of text, names, as a list of strings)
-static V heff_strs_text(char **xs, int64_t n) {
+HEFF_FN V heff_strs_text(char **xs, int64_t n) {
   V l = NTAG(TAG_Nil);
   for (int64_t i = n - 1; i >= 0; i--) l = heff_cons(heff_str_text(xs[i]), l);
   return l;
 }
 
 // (a path, as a C string to give the system: malloc'd, or NULL)
-static char *heff_cstr(V v) {
+HEFF_FN char *heff_cstr(V v) {
   Str *s = (Str *)v;
   if (s->len && memchr(s->s, 0, (size_t)s->len)) return NULL;
   char *c = heff_alloc((size_t)s->len + 1);
@@ -3567,7 +3584,7 @@ static char *heff_cstr(V v) {
 }
 
 // (a name or text, as a C string to give the system: malloc'd, or NULL)
-static char *heff_cstr_text(V v) {
+HEFF_FN char *heff_cstr_text(V v) {
   Str *s = (Str *)v;
   if (s->len && memchr(s->s, 0, (size_t)s->len)) return NULL;
   int own;
@@ -3580,7 +3597,7 @@ static char *heff_cstr_text(V v) {
 }
 
 // (content out, malloc'd, `*n` bytes, a NUL after them)
-static char *heff_bytes(V v, size_t *n) {
+HEFF_FN char *heff_bytes(V v, size_t *n) {
   Str *s = (Str *)v;
   char *c = heff_alloc((size_t)s->len + 1);
   if (s->len) memcpy(c, s->s, (size_t)s->len);
@@ -3590,7 +3607,7 @@ static char *heff_bytes(V v, size_t *n) {
 }
 
 // (content written out to `f`)
-static void heff_put(FILE *f, V v) {
+HEFF_FN void heff_put(FILE *f, V v) {
   Str *s = (Str *)v;
   if (s->len) fwrite(s->s, 1, (size_t)s->len, f);
 }
@@ -3599,25 +3616,25 @@ static void heff_put(FILE *f, V v) {
 // `heff_bytes_in`; out, read where they are kept, `*n` of them, by
 // `heff_bytes_data` (the value not consumed, its bytes there as long as
 // it is held, and never written to).
-static V heff_bytes_in(const void *c, int64_t n) {
+HEFF_FN V heff_bytes_in(const void *c, int64_t n) {
   Str *s = heff_bytes_new(n);
   if (n) memcpy(s->s, c, (size_t)n);
   return (V)s;
 }
 
-static const uint8_t *heff_bytes_data(V v, int64_t *n) {
+HEFF_FN const uint8_t *heff_bytes_data(V v, int64_t *n) {
   Str *s = (Str *)v;
   *n = s->len;
   return s->s;
 }
 
 // (C strings' order, for qsort)
-static int heff_cmp_cstr(const void *a, const void *b) {
+HEFF_FN int heff_cmp_cstr(const void *a, const void *b) {
   return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
 // (a path joined to a name in it, malloc'd)
-static char *heff_join(const char *dir, const char *name) {
+HEFF_FN char *heff_join(const char *dir, const char *name) {
   size_t a = strlen(dir), b = strlen(name);
   char *p = heff_alloc(a + b + 2);
   memcpy(p, dir, a);
@@ -3631,7 +3648,7 @@ static char *heff_join(const char *dir, const char *name) {
 }
 
 // (an answer, for an operation's function: given it, its value asked for)
-static V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
+HEFF_FN V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 
 // The world: the things the providers hand out, held in one table for
 // them all, so that one effect's provider takes what another's handed
@@ -3652,7 +3669,7 @@ HEFF_VAR(int64_t heff_capnumbers);
 HEFF_VAR(int64_t heff_usednumbers);
 
 // (the slot of `x`'s number, or the empty slot it would be in)
-static int64_t heff_number_slot(void *x) {
+HEFF_FN int64_t heff_number_slot(void *x) {
   uint64_t h = (uint64_t)(uintptr_t)x;
   h ^= h >> 33;
   h *= 0xff51afd7ed558ccdULL;
@@ -3663,7 +3680,7 @@ static int64_t heff_number_slot(void *x) {
 }
 
 // (the things held, numbered again: in four times as many slots, and more)
-static void heff_renumber(void) {
+HEFF_FN void heff_renumber(void) {
   int64_t live = 0;
   for (int64_t n = 0; n < heff_nthings; n++) live += heff_things[n].x != NULL;
   int64_t cap = 16;
@@ -3693,7 +3710,7 @@ pthread_mutex_t heff_world_mu = PTHREAD_MUTEX_INITIALIZER;
 #define HEFF_WORLD_UNLOCK() ((void)0)
 #endif
 
-static int64_t heff_hold(void *x, void (*let_go)(void *)) {
+HEFF_FN int64_t heff_hold(void *x, void (*let_go)(void *)) {
   if (!x) heff_fail("the world holds nothing at NULL");
   HEFF_WORLD_LOCK();
   if (heff_usednumbers * 2 >= heff_capnumbers) heff_renumber();
@@ -3716,13 +3733,13 @@ static int64_t heff_hold(void *x, void (*let_go)(void *)) {
   return n;
 }
 
-static void heff_held_none(int64_t i) {
+HEFF_FN void heff_held_none(int64_t i) {
   static HEFF_TLS char why[64];
   snprintf(why, sizeof why, "the world holds nothing numbered %lld", (long long)i);
   heff_fail(why);
 }
 
-static void *heff_held(int64_t i) {
+HEFF_FN void *heff_held(int64_t i) {
   HEFF_WORLD_LOCK();
   void *x = i < 0 || i >= heff_nthings ? NULL : heff_things[i].x;
   HEFF_WORLD_UNLOCK();
@@ -3730,7 +3747,7 @@ static void *heff_held(int64_t i) {
   return x;
 }
 
-static void heff_release(int64_t i) {
+HEFF_FN void heff_release(int64_t i) {
   HEFF_WORLD_LOCK();
   void *x = i < 0 || i >= heff_nthings ? NULL : heff_things[i].x;
   void (*let_go)(void *) = x ? heff_things[i].free : NULL;
@@ -3753,7 +3770,7 @@ static void heff_release(int64_t i) {
 // why it failed -- "heff:abandon" where it abandoned (`heff_abandon`),
 // the thread's own string otherwise, to be copied before the thread
 // ends.  What was made before the failure is leaked, not given back)
-static const char *heff_try(V f, V x, V *out) {
+HEFF_FN const char *heff_try(V f, V x, V *out) {
   jmp_buf here;
   jmp_buf *volatile up = heff_catch;
 #ifdef HEFF_THREADS
@@ -3774,14 +3791,14 @@ static const char *heff_try(V f, V x, V *out) {
 
 // (a failure handed back, as the thread it was caught in would have
 // failed: `why` from `heff_try`, copied)
-static void heff_fail_again(const char *why) {
+HEFF_FN void heff_fail_again(const char *why) {
   if (strcmp(why, "heff:abandon") == 0) heff_abandon();
   heff_fail(why);
 }
 
 // (this thread's free lists and what else the runtime keeps for it given
 // back to the system, as it ends)
-static void heff_thread_end(void) {
+HEFF_FN void heff_thread_end(void) {
 #if defined(HEFF_THREADS) || SMALL_MAX == 0
   for (size_t c = 0; c <= SMALL_MAX / 8; c++) {
     void *p = heff_free_list[c];
@@ -3808,7 +3825,7 @@ static void heff_thread_end(void) {
 #ifndef HEFF_THREAD_STACK
 #define HEFF_THREAD_STACK ((size_t)1 << 28)
 #endif
-static int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
+HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, HEFF_THREAD_STACK);
@@ -3921,13 +3938,13 @@ HEFF_VAR(HEFF_TLS size_t heff_cappolled);
 #endif
 
 // (the group open of that number, or NULL)
-static HeffGroup *heff_group_of(int64_t g) {
+HEFF_FN HeffGroup *heff_group_of(int64_t g) {
   for (size_t i = 0; i < heff_ngroups; i++)
     if (heff_groups_open[i].id == g) return &heff_groups_open[i];
   return NULL;
 }
 
-static void heff_wait_link(HeffWait *w) {
+HEFF_FN void heff_wait_link(HeffWait *w) {
   w->prev = heff_waits_last;
   w->next = NULL;
   if (heff_waits_last) heff_waits_last->next = w;
@@ -3937,7 +3954,7 @@ static void heff_wait_link(HeffWait *w) {
   if (g) g->pending++;
 }
 
-static void heff_wait_unlink(HeffWait *w) {
+HEFF_FN void heff_wait_unlink(HeffWait *w) {
   if (w->prev) w->prev->next = w->next;
   else heff_waits_first = w->next;
   if (w->next) w->next->prev = w->prev;
@@ -3948,12 +3965,12 @@ static void heff_wait_unlink(HeffWait *w) {
 }
 
 // (a wait done, as its source says: given its answer at the next turn)
-static void heff_wait_done(HeffWait *w) { w->done = 1; }
+HEFF_FN void heff_wait_done(HeffWait *w) { w->done = 1; }
 
 // (the waits on the descriptor `fd`, which is being closed: done, their
 // answers that it was -- EBADF -- not a poll of a descriptor that may be
 // another's by then)
-static void heff_reactor_closing(int fd) {
+HEFF_FN void heff_reactor_closing(int fd) {
   for (HeffWait *w = heff_waits_first; w; w = w->next)
     if (w->fd == fd && !w->done) {
       w->err = EBADF;
@@ -3963,7 +3980,7 @@ static void heff_reactor_closing(int fd) {
 
 #ifndef _WIN32
 // (a source of waits, polled with the others from now on, by this thread)
-static void heff_reactor_source(HeffSource *s) {
+HEFF_FN void heff_reactor_source(HeffSource *s) {
   if (s->on) return;
   s->on = 1;
   s->next = heff_sources;
@@ -3973,7 +3990,7 @@ static void heff_reactor_source(HeffSource *s) {
 
 // (the operation of the wait `w` -- its first step taken, not done --
 // waited for here, or, in a group, pending: see above)
-static V heff_outside(HeffWait *w, V f, V k) {
+HEFF_FN V heff_outside(HeffWait *w, V f, V k) {
   if (heff_group) {
     w->f = f;
     w->k = k;
@@ -4000,7 +4017,7 @@ static V heff_outside(HeffWait *w, V f, V k) {
 
 // (what was started in group `g` come to its value `v`: one of the
 // group's finished -- or, the group closed meanwhile, let go of)
-static void heff_finished_put(int64_t g, V v) {
+HEFF_FN void heff_finished_put(int64_t g, V v) {
   if (!heff_group_of(g)) {
     heff_drop(v);
     return;
@@ -4020,14 +4037,14 @@ static void heff_finished_put(int64_t g, V v) {
 
 // (a function given its argument, and nothing else: where what is
 // started comes to its end)
-static V heff_kept(V self, V *a) {
+HEFF_FN V heff_kept(V self, V *a) {
   heff_drop(self);
   return a[0];
 }
 
 // (what group `g` started, the rest of it run in the group, from `k`
 // given `x`: to its end, its value finished, or to a wait, pending)
-static void heff_reactor_run(int64_t g, V k, V x) {
+HEFF_FN void heff_reactor_run(int64_t g, V k, V x) {
   int64_t up = heff_group;
   heff_group = g;
   V r = heff_tr(heff_app1(k, x));
@@ -4036,7 +4053,7 @@ static void heff_reactor_run(int64_t g, V k, V x) {
 }
 
 // | A group of its own, for a scheduler: its number.
-static int64_t heff_reactor_open(void) {
+HEFF_FN int64_t heff_reactor_open(void) {
   if (heff_ngroups == heff_capgroups) {
     size_t cap = heff_capgroups ? heff_capgroups * 2 : 8;
     HeffGroup *m = heff_alloc(cap * sizeof *m);
@@ -4056,7 +4073,7 @@ static int64_t heff_reactor_open(void) {
 // | its continuation), started in group `g`: run to its end, its value;
 // | or to a wait, `HEFF_PENDING`, its value to be one of the group's
 // | finished.  `c` consumed.
-static V heff_reactor_start(int64_t g, V c) {
+HEFF_FN V heff_reactor_start(int64_t g, V c) {
   int64_t up = heff_group;
   heff_group = g;
   V r = heff_tr(heff_app1(c, heff_clo(heff_kept, 1, 0, NULL)));
@@ -4067,7 +4084,7 @@ static V heff_reactor_start(int64_t g, V c) {
 // (the waits done -- stepped done, or said so -- taken out of the
 // pending, then each given its answer, the rest of what it was started
 // in run, in the order they were pending)
-static void heff_reactor_wake(void) {
+HEFF_FN void heff_reactor_wake(void) {
   HeffWait *first = NULL, *last = NULL;
   for (HeffWait *w = heff_waits_first, *next; w; w = next) {
     next = w->next;
@@ -4088,7 +4105,7 @@ static void heff_reactor_wake(void) {
 
 #ifndef _WIN32
 // (room for `n` descriptors polled)
-static void heff_polled_room(size_t n) {
+HEFF_FN void heff_polled_room(size_t n) {
   if (n <= heff_cappolled && heff_polled) return;
   size_t cap = heff_cappolled ? heff_cappolled : 64;
   while (cap < n) cap *= 2;
@@ -4102,7 +4119,7 @@ static void heff_polled_room(size_t n) {
 // (one turn: every pending wait's descriptor and every source's polled
 // -- for as long as they say, where `wait`, else not waiting -- each
 // ready stepped, and those done woken)
-static void heff_reactor_turn(int wait) {
+HEFF_FN void heff_reactor_turn(int wait) {
   size_t n = 0;
   int ms = wait ? -1 : 0;
   for (HeffWait *w = heff_waits_first; w; w = w->next) {
@@ -4146,13 +4163,13 @@ static void heff_reactor_turn(int wait) {
   heff_reactor_wake();
 }
 #else
-static void heff_reactor_turn(int wait) { (void)wait; heff_reactor_wake(); }
+HEFF_FN void heff_reactor_turn(int wait) { (void)wait; heff_reactor_wake(); }
 #endif
 
 // | Group `g`'s finished, since it was last asked, in the order they
 // | were: where `wait`, waiting for one at least while any of it is
 // | pending; none where none is.
-static V heff_reactor_finished(int64_t g, int wait) {
+HEFF_FN V heff_reactor_finished(int64_t g, int wait) {
   for (;;) {
     int some = 0;
     for (size_t i = 0; i < heff_nfinished && !some; i++) some = heff_finished[i].group == g;
@@ -4174,7 +4191,7 @@ static V heff_reactor_finished(int64_t g, int wait) {
 
 // | Group `g` closed: what is pending in it let go of, undone, and what
 // | of it is finished and not asked for.
-static void heff_reactor_close(int64_t g) {
+HEFF_FN void heff_reactor_close(int64_t g) {
   for (HeffWait *w = heff_waits_first, *next; w; w = next) {
     next = w->next;
     if (w->group != g) continue;
@@ -4200,7 +4217,7 @@ static void heff_reactor_close(int64_t g) {
 // Running
 // ---------------------------------------------------------------------
 
-static V heff_nomatch(V s) {
+HEFF_FN V heff_nomatch(V s) {
   (void)s;
   heff_fail("no case for a tag");
   return 0;
@@ -4218,14 +4235,14 @@ HEFF_VAR(int heff_ntag_names);
 HEFF_VAR(const HeffName *heff_lbl_names);
 HEFF_VAR(int heff_nlbl_names);
 
-static const char *heff_name_of(const HeffName *t, int n, uint32_t id) {
+HEFF_FN const char *heff_name_of(const HeffName *t, int n, uint32_t id) {
   for (int i = 0; i < n; i++) if (t[i].id == id) return t[i].name;
   return "?";
 }
 
 typedef struct { char *s; size_t n, cap; } Buf;
 
-static void buf_put(Buf *b, const char *c, size_t n) {
+HEFF_FN void buf_put(Buf *b, const char *c, size_t n) {
   if (b->n + n + 1 > b->cap) {
     size_t cap = (b->cap ? b->cap * 2 : 256);
     while (cap < b->n + n + 1) cap *= 2;
@@ -4239,7 +4256,7 @@ static void buf_put(Buf *b, const char *c, size_t n) {
   b->s[b->n] = 0;
 }
 
-static void buf_str(Buf *b, const char *c) { buf_put(b, c, strlen(c)); }
+HEFF_FN void buf_str(Buf *b, const char *c) { buf_put(b, c, strlen(c)); }
 
 // Commands
 // ---------------------------------------------------------------------
@@ -4247,7 +4264,7 @@ static void buf_str(Buf *b, const char *c) { buf_put(b, c, strlen(c)); }
 #ifdef _WIN32
 // (a command line of `as`, each quoted as the C runtime's parser reads it
 // back: malloc'd)
-static char *heff_command_line(char **as) {
+HEFF_FN char *heff_command_line(char **as) {
   Buf b = {0};
   for (char **a = as; *a; a++) {
     if (a != as) buf_put(&b, " ", 1);
@@ -4274,7 +4291,7 @@ static char *heff_command_line(char **as) {
 typedef struct { HANDLE h; Buf *b; } HeffDrain;
 
 // (all a pipe gives, until it is closed)
-static DWORD WINAPI heff_drain(LPVOID u) {
+HEFF_FN DWORD WINAPI heff_drain(LPVOID u) {
   HeffDrain *d = u;
   char chunk[65536];
   DWORD got;
@@ -4284,7 +4301,7 @@ static DWORD WINAPI heff_drain(LPVOID u) {
 
 // (a command started, its stdin this program's, its stdout and stderr
 // `out` and `err`, or 0 if it cannot be)
-static HANDLE heff_spawn(char **as, HANDLE out, HANDLE err) {
+HEFF_FN HANDLE heff_spawn(char **as, HANDLE out, HANDLE err) {
   char *line = heff_command_line(as);
   STARTUPINFOA si;
   memset(&si, 0, sizeof si);
@@ -4302,7 +4319,7 @@ static HANDLE heff_spawn(char **as, HANDLE out, HANDLE err) {
 }
 
 // (a command's exit code once it has ended)
-static int64_t heff_wait(HANDLE h) {
+HEFF_FN int64_t heff_wait(HANDLE h) {
   DWORD code = (DWORD)-1;
   WaitForSingleObject(h, INFINITE);
   GetExitCodeProcess(h, &code);
@@ -4312,7 +4329,7 @@ static int64_t heff_wait(HANDLE h) {
 #else
 // (what a command writes, both streams read together, so that neither
 // fills its pipe while the other is waited for)
-static void heff_read_both(int out, int err, Buf *bo, Buf *be) {
+HEFF_FN void heff_read_both(int out, int err, Buf *bo, Buf *be) {
   struct pollfd fds[2] = { { out, POLLIN, 0 }, { err, POLLIN, 0 } };
   int open = 2;
   char chunk[65536];
@@ -4333,7 +4350,7 @@ static void heff_read_both(int out, int err, Buf *bo, Buf *be) {
 // PATH) run, its stdin this program's, what it writes to stdout and
 // stderr gathered in `bo` and `be`: its exit status, -1 if it could not
 // be run)
-static int64_t heff_capture(char **as, Buf *bo, Buf *be) {
+HEFF_FN int64_t heff_capture(char **as, Buf *bo, Buf *be) {
   int64_t status = -1;
 #ifdef _WIN32
   SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
@@ -4380,7 +4397,7 @@ static int64_t heff_capture(char **as, Buf *bo, Buf *be) {
 // (a string as JSON writes one: in quotes, `"` `\` and controls escaped;
 // what is not UTF-8 in it U+FFFD -- or, `shown`, each of its bytes
 // `\xnn`, as a string literal writes it, test/load-js.mjs's `show`)
-static void buf_json_string_as(Buf *b, V v, int shown) {
+HEFF_FN void buf_json_string_as(Buf *b, V v, int shown) {
   Str *s = (Str *)v;
   buf_str(b, "\"");
   for (int64_t i = 0; i < s->len; i++) {
@@ -4406,10 +4423,10 @@ static void buf_json_string_as(Buf *b, V v, int shown) {
   buf_str(b, "\"");
 }
 
-static void buf_json_string(Buf *b, V v) { buf_json_string_as(b, v, 0); }
+HEFF_FN void buf_json_string(Buf *b, V v) { buf_json_string_as(b, v, 0); }
 
 // (a tag of that name and that many arguments, its arguments `*fs`)
-static int heff_tag_named(V v, const char *name, int n, V **fs) {
+HEFF_FN int heff_tag_named(V v, const char *name, int n, V **fs) {
   int tag, m = 0;
   V *f = NULL;
   if (IS_NTAG(v)) tag = (int)(v >> 2);
@@ -4422,7 +4439,7 @@ static int heff_tag_named(V v, const char *name, int n, V **fs) {
 
 // (a list, `Cons a (Cons b Nil)`: whether it is one, a chain that ends
 // in `Nil`)
-static int heff_is_list(V v) {
+HEFF_FN int heff_is_list(V v) {
   V *f;
   while (heff_tag_named(v, "Cons", 2, &f)) v = f[1];
   return heff_tag_named(v, "Nil", 0, &f);
@@ -4431,7 +4448,7 @@ static int heff_is_list(V v) {
 // (the `len` bytes at `p` as the prelude's `showBytes` writes them in a
 // binary, `b[...]`: each run of printable ASCII a string, `"` and `\`
 // escaped, any other byte its number; whether any is written)
-static int heff_show_byte_pieces(Buf *b, const uint8_t *p, int64_t len) {
+HEFF_FN int heff_show_byte_pieces(Buf *b, const uint8_t *p, int64_t len) {
   int run = 0, any = 0;
   for (int64_t i = 0; i < len; i++) {
     uint8_t c = p[i];
@@ -4452,7 +4469,7 @@ static int heff_show_byte_pieces(Buf *b, const uint8_t *p, int64_t len) {
   return any;
 }
 
-static void heff_show_bytes(Buf *b, V v) {
+HEFF_FN void heff_show_bytes(Buf *b, V v) {
   Str *s = (Str *)v;
   buf_str(b, "b[");
   heff_show_byte_pieces(b, s->s, s->len);
@@ -4461,7 +4478,7 @@ static void heff_show_bytes(Buf *b, V v) {
 
 // (bits as the prelude's `showBits` writes them: their whole bytes as
 // bytes are, then the bits left, `v::k`, or, none left, `b[]::bits`)
-static void heff_show_bits(Buf *b, V v) {
+HEFF_FN void heff_show_bits(Buf *b, V v) {
   Str *s = (Str *)v;
   int64_t k = (8 - (int64_t)s->h.tag) & 7, whole = k ? s->len - 1 : s->len;
   char tmp[32];
@@ -4473,16 +4490,16 @@ static void heff_show_bits(Buf *b, V v) {
   buf_str(b, "]");
 }
 
-static void heff_show(Buf *b, V v, int arg);
+HEFF_FN void heff_show(Buf *b, V v, int arg);
 
 // (field `i` of the tag `v` shown, as a `V`: boxed, if it is flat, #64)
-static void heff_show_field(Buf *b, V v, int i, int arg) {
+HEFF_FN void heff_show_field(Buf *b, V v, int i, int arg) {
   V x = heff_tget_v(v, i);
   heff_show(b, x, arg);
   heff_drop(x);
 }
 
-static void heff_show(Buf *b, V v, int arg) {
+HEFF_FN void heff_show(Buf *b, V v, int arg) {
   char tmp[64];
   if (heff_is_list(v)) {
     V *f;
@@ -4558,7 +4575,7 @@ static void heff_show(Buf *b, V v, int arg) {
 // asked for, the thing it is shown, or why it failed)
 typedef struct { const char *name; V (*get)(void); } Global;
 
-static void heff_check_one(Buf *out, const Global *g) {
+HEFF_FN void heff_check_one(Buf *out, const Global *g) {
   jmp_buf here;
   heff_catch = &here;
   Buf b = {0};
