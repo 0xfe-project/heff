@@ -27,10 +27,10 @@ are imported by their names:
 - `co` ([effects](language.md#effects)), and effects made with it:
   `state`, `exn` (with `exnDiv` and `exnMod`, a division that throws by
   zero), `parallel` and `green` ([green threads](#green-threads));
-- `array`, `map` and `set` (a map's `insertWith` and `alter` change
-  what a key is bound to in one walk down the tree, where a `lookup`
-  and an `insert` take two: `Map.insertWith compareString (\new old ->
-  new + old) word 1 counts` counts a word);
+- `array` ([arrays](#arrays)), `map` and `set` (a map's `insertWith`
+  and `alter` change what a key is bound to in one walk down the tree,
+  where a `lookup` and an `insert` take two: `Map.insertWith
+  compareString (\new old -> new + old) word 1 counts` counts a word);
 - `hashmap` (as `HashMap`), maps by the keys' hashes, a hash array
   mapped trie as Clojure's and unordered-containers' are: each level 5
   bits of the hash, a node's children in an array as long as how many
@@ -67,6 +67,45 @@ are imported by their names:
   length that is a multiple of 8) and `ofBytes`, `ofInt` (the low `n`
   bits of an integer), `slice` (from bit `i` up to `j`, clamped),
   `append`, `concat`, `empty` and `eq`.
+
+## Arrays
+
+`array` (as `Array`) is arrays: a fixed number of elements, each
+reached at once by its index.  An array is a value, never changed: `set
+xs i x` is another array, with `x` at `i`, and `xs` is as it was.  So
+`set` writes in place where nothing else holds `xs` -- its reference
+count is 1, the array given to `set` its last use -- and copies it, all
+of it, where something does.  An array threaded through a loop, each
+round's array given to the next, is so changed in place, as a mutable
+one is, and a sieve is a sieve:
+
+```haskell
+cross : Int -> Int -> Int -> Array UInt8 -> Array UInt8
+cross n p j xs =
+  if j >= n then xs else cross n p (j + p) (Array.set xs j 0)
+```
+
+An array read after it is set, or kept elsewhere, is copied at that
+`set`, once: the copy is the array's, written in place from then on.
+`modify`, `swap`, `fill` and `reverse` are `set`s, in place as it is.
+Besides them, `length`, `index` (`Maybe` an element), `generate`,
+`replicate` (`n` elements, each `x`), `fromList`, `toList`, `empty`,
+`map`, `slice` (from `i` up to `j`, clamped, a negative one from the
+end, as a string's), `append`, `foldl`, `foldr` and `sortBy` (stable,
+as a list's).
+
+An array of a number's type is kept flat by the C backend, as C's array
+of it, not as a boxed value for each element: `Array Float64` is
+`double`s, `Array Int64` `int64_t`s, `Array UInt8` bytes, and so on for
+each fixed-width type.  It is flat where it is built knowing that the
+element is a number -- `replicate` of a number's literal, or of a
+number the compiler keeps unboxed there -- and an array of `Float64`s
+always, however it is built.  Another built where its type is not known
+(`generate` of a function, `fromList`, `map`) holds boxed values.  A read
+where the type is known reads the number as it is kept; one where it is
+not boxes it; a `set` of a number writes it as the array keeps it.  The
+JavaScript backend keeps an array of JavaScript's numbers as a
+`Float64Array`.
 
 ## The batteries
 
