@@ -854,6 +854,79 @@ updateText x shape keep flats n vs changed =
        changed)
   ^ "rr_; })"
 
+-- Lent strings
+--------------------------------------------------------------------------------
+
+-- | the primitives that only read their strings, each with a `_lent`
+-- | form in lib/c/runtime.c: given a mask of the operands given it, the
+-- | others lent
+lendingPrims : List String
+lendingPrims =
+  [ "strLength"
+  , "strSlice"
+  , "strEq"
+  , "strLt"
+  , "strCompare"
+  , "strFind"
+  , "strByteAt"
+  , "strRuneAt"
+  , "strRuneWidth"
+  ]
+
+-- (an operand that takes nothing another is given: a variable, a
+-- reference taken of one, a literal)
+plainOperand : RefCount.Value -> Bool
+plainOperand (RLocal _) = True
+plainOperand (RDup _) = True
+plainOperand (RInt _) = True
+plainOperand (RStr _) = True
+plainOperand (RNTag _) = True
+plainOperand _ = False
+
+givesUp : String -> RefCount.Value -> Bool
+givesUp x (RLocal y) = strEq x y
+givesUp x _ = False
+
+-- (an operand lent: a reference taken of a variable, which the variable
+-- holds through the call, as no operand gives it up)
+lentOperand : List RefCount.Value -> RefCount.Value -> Bool
+lentOperand es (RDup x) = not (List.any (givesUp x) es)
+lentOperand es _ = False
+
+-- | whether a primitive's call lends an operand: one of `lendingPrims`,
+-- | its operands plain (none computed, which might give up what is lent
+-- | before it is read), one of them lent
+lends : String -> List RefCount.Value -> Bool
+lends p es =
+  elemS p lendingPrims
+  && List.all plainOperand es
+  && List.any (lentOperand es) es
+
+-- (the mask of the operands given, from the one of `bit` on)
+givenMask : List RefCount.Value -> List RefCount.Value -> Int -> Int
+givenMask es Nil bit = 0
+givenMask es (Cons e rest) bit =
+  (if lentOperand es e then 0 else bit) + givenMask es rest (bit * 2)
+
+-- (an operand as the `_lent` form takes it: lent, the variable itself)
+asLent : List RefCount.Value -> RefCount.Value -> RefCount.Value
+asLent es (RDup x) = if lentOperand es (RDup x) then RLocal x else RDup x
+asLent es e = e
+
+-- | a call of a primitive's `_lent` form (`suffix` after its name: `_c`
+-- | for a condition's)
+lentPrimC : CK -> String -> String -> List RefCount.Value -> C String
+lentPrimC k p suffix es = do
+  vs <- traverseC k.exp (List.map (asLent es) es)
+  pure
+      (primName p
+       ^ suffix
+       ^ "_lent("
+       ^ joinWith ", " vs
+       ^ ", "
+       ^ show (givenMask es es 1)
+       ^ ")")
+
 -- | a condition, as C's (an `int`): a comparison, the runtime's of it
 -- | (`heff_intLt_c`); a test of tests, `&&`, `||` or `?:`; a name bound
 -- | in it, dropped once it is decided
@@ -861,9 +934,10 @@ testC : CK -> RefCount.Test -> C String
 testC k CondTrue = pure "1"
 testC k CondFalse = pure "0"
 testC k (CondRel p es) =
-  bind
-    (traverseC k.exp es)
-    (\vs -> pure (primName p ^ "_c(" ^ joinWith ", " vs ^ ")"))
+  if lends p es then lentPrimC k p "_c" es
+  else bind
+      (traverseC k.exp es)
+      (\vs -> pure (primName p ^ "_c(" ^ joinWith ", " vs ^ ")"))
 testC k (CondRelU p es) = bind (traverseC k.exp es) (\vs -> pure (relU p vs))
 testC k (CondBool e) =
   bind (k.exp e) (\v -> pure ("(" ^ v ^ " == NTAG(TAG_True))"))
@@ -977,9 +1051,11 @@ expF k (RTakeField x i) =
   pure ("heff_take_field(" ^ cLocal x ^ ", " ^ show i ^ ")")
 expF k (RGetLabel e l) = wrapC k "heff_get(" (", " ^ lblName l ^ ")") e
 expF k (RPrimFn p) = primLit p
-expF k (RPrim p es) = do
-  vs <- traverseC k.exp es
-  pure (primName p ^ "(" ^ joinWith ", " vs ^ ")")
+expF k (RPrim p es) =
+  if lends p es then lentPrimC k p "" es
+  else bind
+      (traverseC k.exp es)
+      (\vs -> pure (primName p ^ "(" ^ joinWith ", " vs ^ ")"))
 expF k (RLam xs fv held (MkCode body)) = lamC k xs fv held body
 expF k (RCall g tr w args) = callC k g tr w args
 expF k (RApply f es) = do
