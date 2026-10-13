@@ -1,0 +1,521 @@
+-- `heff dev`: the project built as `heff build` builds it, its C
+-- programs run, and its pages' scripts served -- then, at each change of
+-- its files (package.hf, src/, app/), built again, and what runs started
+-- again.  heff is run as `heff build` for each build, so that a build
+-- that fails says why and is waited past, not the end of `heff dev`; the
+-- programs it builds run beside it, their output the terminal's, until
+-- a build after a change has made them anew (`Process.launch`).  A page
+-- is served by `heff dev-pages`, beside it too (std.http.server, by
+-- green threads): `/NAME/` the program NAME's page -- its
+-- app/NAME/index.html, or one made for it -- `/NAME/NAME.js` its script
+-- as built, and the rest of app/NAME/ as it is; a page asks every half
+-- second whether it has been built again (`/.heff/built`), and loads
+-- itself again where it has.
+
+import bytes as Bytes
+import co
+import green
+import heff.build.commands as Commands
+import heff.build.project as Project
+import std.filesystem
+import std.http as Http
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.path as Path
+import std.process
+import std.progress as Progress
+import std.reactor as Reactor
+import std.time as Time
+
+-- Watching
+--------------------------------------------------------------------------------
+
+-- | what `heff dev` watches: the project's manifest and its sources
+watched : List String
+watched = ["package.hf", "src", "app"]
+
+-- (a file as watched: its path, when it was changed, its size)
+stampOf : String -> Status -> String
+stampOf p s = p ^ " " ^ show s.modified ^ " " ^ show s.size
+
+-- (the names of a directory, as paths under it -- those starting with
+-- `.` passed over)
+under : Path.Style -> String -> Maybe (List String) -> List String
+under st dir Nothing = Nil
+under st dir (Just names) =
+  List.map
+    (\n -> Path.join st dir n)
+    (List.filter (\n -> not (startsWith (prefix := ".") n)) names)
+
+-- | the stamps of the files under the paths, the directories walked:
+-- | what a change of any of them changes
+stamps : {e : HFunctor}
+       -> {{disk : fs <: e}}
+       -> Path.Style
+       -> List String
+       -> List String
+       -> Co e (List String)
+stamps st acc Nil = pure acc
+stamps st acc (p :: rest) = do
+  found <- stat p
+  case found of
+    Left err -> stamps st acc rest
+    Right s ->
+      if isDirectoryKind s.kind
+        then do
+          names <- readDir p
+          stamps st acc (List.append (under st p names) rest)
+      else stamps st (stampOf p s :: acc) rest
+
+-- (the project's files, stamped, as one text)
+stamped : {e : HFunctor} -> {{disk : fs <: e}} -> Path.Style -> Co e String
+stamped st = do
+  ss <- stamps st Nil watched
+  pure (unlines ss)
+
+-- Running
+--------------------------------------------------------------------------------
+
+-- | a program of the project's, running
+type Running = { name : String, child : Child }
+
+-- | where `heff dev` is: the project's files as last built, its programs
+-- | running, the pages' server (once there are pages), how many builds
+-- | there have been, the programs to run (all, where none is named), and
+-- | the port the pages are served at
+type Dev =
+  { stamp : String
+  , running : List Running
+  , pages : Maybe Child
+  , builds : Int
+  , wanted : List String
+  , port : String
+  }
+
+-- | where a build that went well is said to have been made, for the
+-- | pages to see: `.heff/dev/built`, the number of the build
+builtFile : Path.Style -> String
+builtFile st = Path.join st (Path.join st ".heff" "dev") "built"
+
+-- (the program, to be run: one of C's, among those wanted)
+isRun : List String -> Commands.App -> Bool
+isRun wanted a =
+  strEq a.build.backend "c"
+  && (List.null wanted || List.elemBy strEq a.name wanted)
+
+-- (a page's program)
+isPage : Commands.App -> Bool
+isPage a = strEq a.build.backend "page"
+
+-- (the programs running, each ended)
+stopAll : {e : HFunctor}
+        -> {{sys : process <: e}}
+        -> List Running
+        -> Co e Unit
+stopAll Nil = pure MkUnit
+stopAll (r :: rest) = do
+  _ <- terminate r.child
+  stopAll rest
+
+-- (the program, started from where `heff build` put it: running, or why
+-- it is not said)
+started : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> Path.Style
+        -> List Running
+        -> Commands.App
+        -> Co e (List Running)
+started st acc a = do
+  c <-
+    launch
+      (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
+      Nil
+  case c of
+    Just child -> pure (List.append acc [{ name = a.name, child = child }])
+    Nothing -> do
+      printErr ("heff dev: cannot run " ^ a.name)
+      pure acc
+
+startAll : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> Path.Style
+         -> List Running
+         -> List Commands.App
+         -> Co e (List Running)
+startAll st acc Nil = pure acc
+startAll st acc (a :: rest) = do
+  now <- started st acc a
+  startAll st now rest
+
+-- (the pages' server started, where there are pages and it is not)
+pagesFor : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> Dev
+         -> Bool
+         -> Co e (Maybe Child)
+pagesFor d False = pure d.pages
+pagesFor { pages = Just c } True = pure (Just c)
+pagesFor d True = do
+  self <- programPath
+  launch self ["dev-pages", d.port]
+
+-- (the programs, read from their build.hf: none where one cannot be)
+appsNow : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{disk : fs <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> Path.Style
+        -> Co e (List Commands.App)
+appsNow st = do
+  found <- readDir "app"
+  rd <-
+    Progress.start
+      Progress.root
+      "reading the programs' build.hf"
+      (List.length (fromMaybe Nil found))
+  read <-
+    Commands.appsIn
+      st
+      (Commands.buildTarget st ".")
+      rd
+      { apps = Nil, bad = 0 }
+      (fromMaybe Nil found)
+  Progress.end rd
+  pure (if read.bad > 0 then Nil else read.apps)
+
+-- (what a build said, where it failed: its output, then why it is
+-- waited past)
+failedSaid : {e : HFunctor} -> {{io : stdio <: e}} -> Ran -> Co e Unit
+failedSaid r = do
+  write r.out
+  writeErr r.err
+  printErr "heff dev: not built; built again at the next change"
+
+-- (the names of the programs, said)
+namesSaid : List Commands.App -> String
+namesSaid Nil = "nothing to run"
+namesSaid as = joinWith ", " (List.map (\(a : Commands.App) -> a.name) as)
+
+-- (a build that went well: what ran ended, what is to run started anew,
+-- the pages' server started once there are pages, the build counted)
+builtWell : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : fs <: e}}
+          -> {{prog : Progress.progress <: e}}
+          -> Path.Style
+          -> Dev
+          -> String
+          -> Co e Dev
+builtWell st d stamp = do
+  apps <- appsNow st
+  stopAll d.running
+  _ <- mkDir (Path.join st ".heff" "dev")
+  _ <- writeFile (builtFile st) (show (d.builds + 1))
+  printErr
+      ("heff dev: built ("
+       ^ show (d.builds + 1)
+       ^ "); running "
+       ^ namesSaid (List.filter (isRun d.wanted) apps))
+  running <- startAll st Nil (List.filter (isRun d.wanted) apps)
+  pages <- pagesFor d (List.any isPage apps)
+  pure
+      { stamp = stamp
+      , running = running
+      , pages = pages
+      , builds = d.builds + 1
+      , wanted = d.wanted
+      , port = d.port
+      }
+
+-- | the project built, as `heff build` builds it (heff run so, its
+-- | output kept: said where it fails), and, where it went well, what is
+-- | to run started anew
+rebuilt : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> Path.Style
+        -> Dev
+        -> String
+        -> Co e Dev
+rebuilt st d stamp = do
+  self <- programPath
+  task <- Progress.start Progress.root "building" 0
+  r <- Progress.runUnder task self ["build"]
+  Progress.end task
+  if r.status == 0 then builtWell st d stamp
+    else do
+      failedSaid r
+      pure { d | stamp = stamp }
+
+-- (the programs that have ended by themselves said, and let go of)
+stillRunning : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> List Running
+             -> List Running
+             -> Co e (List Running)
+stillRunning acc Nil = pure acc
+stillRunning acc (r :: rest) = do
+  s <- exited r.child
+  case s of
+    Nothing -> stillRunning (List.append acc [r]) rest
+    Just code -> do
+      _ <- terminate r.child
+      printErr ("heff dev: " ^ r.name ^ " ended (" ^ show code ^ ")")
+      stillRunning acc rest
+
+-- | watched: every quarter of a second, what ran that has ended said,
+-- | and the project's files looked at; changed, built again
+watching : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> {{clock : Time.time <: e}}
+         -> Path.Style
+         -> Dev
+         -> Co e Unit
+watching st d = do
+  Time.sleep 250
+  running <- stillRunning Nil d.running
+  stamp <- stamped st
+  if strEq stamp d.stamp then watching st { d | running = running }
+    else do
+      next <- rebuilt st { d | running = running } stamp
+      watching st next
+
+-- | `heff dev [APP...] [--port N]`, at the project's root
+devCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : fs <: e}}
+       -> {{prog : Progress.progress <: e}}
+       -> {{clock : Time.time <: e}}
+       -> List String
+       -> Maybe String
+       -> Co e Unit
+devCmd wanted port = do
+  text <- readFile "package.hf"
+  st <- Commands.styleNow
+  case text of
+    Nothing -> do
+      printErr "heff dev: no package.hf here: run it at the project's root"
+      exit 1
+    Just _ -> do
+      stamp <- stamped st
+      first <-
+        rebuilt
+          st
+          { stamp = ""
+          , running = Nil
+          , pages = Nothing
+          , builds = 0
+          , wanted = wanted
+          , port = fromMaybe "8000" port
+          }
+          stamp
+      watching st first
+
+-- The pages
+--------------------------------------------------------------------------------
+
+-- | what a page loads, to load itself again when the project is built
+-- | again: it asks every half second
+reloadScript : String
+reloadScript =
+  unlines
+    [ "<script>"
+    , "(function () {"
+    , "  var seen = null;"
+    , "  setInterval(function () {"
+    , "    fetch(\"/.heff/built\", { cache: \"no-store\" })"
+    , "      .then(function (r) { return r.text(); })"
+    , "      .then(function (t) { if (seen === null) seen = t; else if (t !== seen) location.reload(); })"
+    , "      .catch(function () {});"
+    , "  }, 500);"
+    , "})();"
+    , "</script>"
+    ]
+
+-- | a page's HTML, the script that reloads it put before its `</body>`
+-- | (at its end, where it has none)
+-- | >>> withReload "<body>x</body>" == "<body>x" ^ reloadScript ^ "</body>"
+-- | True
+withReload : String -> String
+withReload html = case indexOf "</body>" html of
+  Just i -> strSlice html 0 i ^ reloadScript ^ strSlice html i (strLength html)
+  Nothing -> html ^ reloadScript
+
+-- | the page made for the program NAME, where it has no index.html: an
+-- | element `#NAME` for it, and its script
+madePage : String -> String
+madePage name =
+  unlines
+    [ "<!doctype html>"
+    , "<html lang=\"en\">"
+    , "<head><meta charset=\"utf-8\"><title>" ^ name ^ "</title></head>"
+    , "<body>"
+    , "<div id=\"" ^ name ^ "\"></div>"
+    , "<script src=\"" ^ name ^ ".js\"></script>"
+    , "</body>"
+    , "</html>"
+    ]
+
+-- | a file's type, by its extension
+-- | >>> List.map typeOf ["a.html", "a.js", "a.css", "a.bin"]
+-- | ["text/html; charset=utf-8", "text/javascript; charset=utf-8", "text/css; charset=utf-8", "application/octet-stream"]
+typeOf : String -> String
+typeOf p =
+  if endsWith ".html" p then "text/html; charset=utf-8"
+  else if endsWith ".js" p || endsWith ".mjs" p
+    then "text/javascript; charset=utf-8"
+  else if endsWith ".css" p then "text/css; charset=utf-8"
+  else if endsWith ".json" p then "application/json"
+  else if endsWith ".svg" p then "image/svg+xml"
+  else if endsWith ".png" p then "image/png"
+  else if endsWith ".jpg" p || endsWith ".jpeg" p then "image/jpeg"
+  else if endsWith ".wasm" p then "application/wasm"
+  else if endsWith ".txt" p then "text/plain; charset=utf-8"
+  else "application/octet-stream"
+
+-- (a response of the text, of the type, never kept by the browser)
+fresh : Int -> String -> String -> Http.Response
+fresh status kind text =
+  { status = status
+  , headers = [MkPair "Content-Type" kind, MkPair "Cache-Control" "no-store"]
+  , body = Bytes.fromString text
+  }
+
+-- (a file's response, of its type, or 404)
+fileAnswer : String -> Maybe String -> Http.Response
+fileAnswer p (Just text) = fresh 200 (typeOf p) text
+fileAnswer p Nothing = Server.plain 404 ("no " ^ p ^ "\n")
+
+-- (a page's response: its HTML with the script that reloads it -- one
+-- made for it, where it has none and its script is built; else 404)
+pageAnswer : String -> Bool -> Maybe String -> Http.Response
+pageAnswer name built (Just html) = fresh 200 (typeOf ".html") (withReload html)
+pageAnswer name True Nothing =
+  fresh 200 (typeOf ".html") (withReload (madePage name))
+pageAnswer name False Nothing = Server.plain 404 ("no page " ^ name ^ "\n")
+
+-- (the index: the pages built, each linked)
+indexAnswer : Maybe (List String) -> Http.Response
+indexAnswer found =
+  fresh
+    200
+    (typeOf ".html")
+    (unlines
+       (List.append
+          [ "<!doctype html>"
+          , "<title>heff dev</title>"
+          , "<h1>the pages</h1>"
+          , "<ul>"
+          ]
+          (List.append
+             (List.map
+                (\js ->
+                   "<li><a href=\"/"
+                   ^ strSlice js 0 (strLength js - 3)
+                   ^ "/\">"
+                   ^ strSlice js 0 (strLength js - 3)
+                   ^ "</a></li>")
+                (List.filter
+                   (\n ->
+                      endsWith ".js" n && not (startsWith (prefix := ".") n))
+                   (fromMaybe Nil found)))
+             ["</ul>", reloadScript])))
+
+-- (a request's path, its query left out)
+pathOf : String -> String
+pathOf target = case indexOf "?" target of
+  Just i -> strSlice target 0 i
+  Nothing -> target
+
+-- (a path's parts, from its first `/` on)
+partsOf : String -> List String
+partsOf path = split "/" (strSlice path 1 (strLength path))
+
+-- (a part that goes nowhere it should not: no `..`, nothing empty)
+safePart : String -> Bool
+safePart p = not (strEq p "..") && not (strEq p "") && not (strEq p ".")
+
+-- | what is asked for, answered: the pages' server
+answer : {e : HFunctor}
+       -> {{disk : fs <: e}}
+       -> Path.Style
+       -> List String
+       -> Co e Http.Response
+answer st (".heff" :: "built" :: Nil) = do
+  n <- readFile (builtFile st)
+  pure (fresh 200 (typeOf ".txt") (fromMaybe "0" n))
+answer st ("" :: Nil) = do
+  found <- readDir (Commands.binDir st)
+  pure (indexAnswer found)
+answer st (name :: Nil) =
+  pure
+    { status = 301
+    , headers = [MkPair "Location" ("/" ^ name ^ "/")]
+    , body = Bytes.fromString ""
+    }
+answer st (name :: "" :: Nil) = do
+  html <- readFile (Path.join st (Path.join st "app" name) "index.html")
+  built <- isFile (Path.join st (Commands.binDir st) (name ^ ".js"))
+  pure (pageAnswer name built html)
+answer st (name :: rest) =
+  if not (List.all safePart (name :: rest))
+    then pure (Server.plain 404 "no such file\n")
+  else if strEq (joinWith "/" rest) (name ^ ".js")
+    then do
+      js <- readFile (Path.join st (Commands.binDir st) (name ^ ".js"))
+      pure (fileAnswer (name ^ ".js") js)
+  else do
+    text <-
+      readFile
+        (List.foldl (\p x -> Path.join st p x) (Path.join st "app" name) rest)
+    pure (fileAnswer (joinWith "/" rest) text)
+answer st Nil = pure (Server.plain 404 "no such file\n")
+
+-- | the pages served at the port, as `heff dev` has them served, until
+-- | the program is ended (`heff dev-pages PORT`)
+pagesCmd : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> String
+         -> Co e Unit
+pagesCmd port = do
+  st <- Commands.styleNow
+  l <- Net.listen "127.0.0.1" (fromMaybe 8000 (parseInt port)) 64
+  case l of
+    Left err -> do
+      printErr
+          ("heff dev: cannot serve the pages at port "
+           ^ port
+           ^ ": "
+           ^ Net.showError err)
+      exit 1
+    Right listener -> do
+      printErr ("heff dev: the pages at http://127.0.0.1:" ^ port ^ "/")
+      r <-
+        Reactor.scheduled
+          e
+          (Server.serveConcurrently
+             (gr := \p -> InL p)
+             (nt := \p -> InR (nt p))
+             listener
+             (\req ->
+                answer
+                  (disk := \p -> InR (disk p))
+                  st
+                  (partsOf (pathOf req.target))))
+      pure MkUnit

@@ -10,18 +10,33 @@
 
 import co
 import heff.build.commands
+import heff.build.dev as Dev
 import heff.lsp.lsp as Lsp
 import heff.lsp.report as Report
 import heff.lsp.rpc as Rpc
 import std.cli as Cli
+import std.cli.interactive as Interactive
 import std.filesystem
 import std.io
+import std.net as Net
 import std.process
 import std.progress as Progress
+import std.reactor as Reactor
+import std.terminal as Terminal
+import std.time as Time
 
 world : HFunctor
 world =
-  stdio <+> process <+> fs <+> Report.report <+> Rpc.rpc <+> Progress.terminal
+  stdio
+  <+> process
+  <+> fs
+  <+> Report.report
+  <+> Rpc.rpc
+  <+> Progress.terminal
+  <+> Terminal.console
+  <+> Time.time
+  <+> Net.net
+  <+> Reactor.reactor
 
 -- each computation of the program asks for the effects it has, in any
 -- world they are in; their evidence is given once, by `main`, below --
@@ -81,6 +96,7 @@ type Project (r : Type) =
   , build : r
   , install : Maybe String -> r
   , publish : String -> r
+  , dev : List String -> Maybe String -> r
   }
 
 -- | the language server, which heff this is, and the compiler's own
@@ -90,6 +106,7 @@ type Tool (r : Type) =
   , version : r
   , dumpCore : List String -> r
   , dumpEval : String -> r
+  , devPages : String -> r
   }
 
 type Commands (r : Type) =
@@ -185,6 +202,20 @@ projectCommands c =
     "publish"
     "check the project, then tag it vVERSION and push the tag"
     (\s -> Cli.with1 s c.publish (Cli.arg s "VERSION" None))
+  , Cli.command
+    "dev"
+    "the project built as `heff build` builds it, its C programs (the APPs, else all) run and its pages served, then built and run again at each change of its files"
+    (\s ->
+       Cli.with2
+         s
+         c.dev
+         (Cli.many s "APP" None)
+         (Cli.option
+            s
+            "port"
+            "p"
+            "PORT"
+            "where the pages are served: http://127.0.0.1:PORT/ (8000)"))
   ]
 
 toolCommands : {r : Type} -> Tool r -> List (Cli.Command r)
@@ -199,6 +230,9 @@ toolCommands c =
     (\s -> s.give c.version)
   , Cli.hidden "dump-core" (\s -> Cli.with1 s c.dumpCore (Cli.many s "FILE" hf))
   , Cli.hidden "dump-eval" (\s -> Cli.with1 s c.dumpEval (Cli.arg s "FILE" hf))
+  , Cli.hidden
+    "dev-pages"
+    (\s -> Cli.with1 s c.devPages (Cli.arg s "PORT" None))
   ]
 
 commands : {r : Type} -> Commands r -> List (Cli.Command r)
@@ -233,6 +267,7 @@ project : {e : HFunctor}
         -> {{disk : fs <: e}}
         -> {{rep : Report.report <: e}}
         -> {{prog : Progress.progress <: e}}
+        -> {{clock : Time.time <: e}}
         -> Project (Co e Unit)
 project =
   { init = \dir -> initCmd (fromMaybe "." dir)
@@ -240,6 +275,7 @@ project =
   , build = buildCmd
   , install = \dir -> installCmd (fromMaybe "." dir)
   , publish = publishCmd
+  , dev = Dev.devCmd
   }
 
 tool : {e : HFunctor}
@@ -248,12 +284,15 @@ tool : {e : HFunctor}
      -> {{disk : fs <: e}}
      -> {{rep : Report.report <: e}}
      -> {{wire : Rpc.rpc <: e}}
+     -> {{nt : Net.net <: e}}
+     -> {{rx : Reactor.reactor <: e}}
      -> Tool (Co e Unit)
 tool =
   { lsp = lspCmd
   , version = versionCmd
   , dumpCore = selfcheck
   , dumpEval = evalCmd
+  , devPages = Dev.pagesCmd
   }
 
 -- (what a command line is read as, said: for the watches)
@@ -296,14 +335,87 @@ said =
       , build = "build"
       , install = \d -> "install " ^ fromMaybe "." d
       , publish = \v -> "publish " ^ v
+      , dev = \as p -> "dev " ^ joinWith "," as ^ " " ^ fromMaybe "-" p
       }
   , tool =
       { lsp = \fs -> "lsp " ^ joinWith "," fs
       , version = "version"
       , dumpCore = \fs -> "dump-core " ^ joinWith "," fs
       , dumpEval = \f -> "dump-eval " ^ f
+      , devPages = \p -> "dev-pages " ^ p
       }
   }
+
+-- | the words given heff, read by its commands and run: what they are
+-- | to do done, or what is wrong with them said
+dispatch : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{rep : Report.report <: e}}
+         -> {{wire : Rpc.rpc <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> {{clock : Time.time <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> List String
+         -> Co e Unit
+dispatch as = case Cli.readLine
+    "heff"
+    (commands { build = build, project = project, tool = tool })
+    as of
+  Run act -> act
+  Out text -> write text
+  Fail text -> do
+    writeErr text
+    exit 1
+
+-- (what the commands' app came to: a command line, said as a shell
+-- would be given it, then run; or nothing, the app left)
+explored : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : fs <: e}}
+         -> {{rep : Report.report <: e}}
+         -> {{wire : Rpc.rpc <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> {{clock : Time.time <: e}}
+         -> {{nt : Net.net <: e}}
+         -> {{rx : Reactor.reactor <: e}}
+         -> Maybe (Maybe (List String))
+         -> Co e Unit
+explored (Just (Just ws)) = do
+  printErr ("$ " ^ unwords ("heff" :: List.map Interactive.quoted ws))
+  dispatch ws
+explored chosen = pure MkUnit
+
+-- | heff with no words, on a terminal: its commands, to pick one of and
+-- | fill in (std.cli.interactive), the command line made then run --
+-- | so that what each takes is learned by using it; elsewhere, its usage
+explore : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{rep : Report.report <: e}}
+        -> {{wire : Rpc.rpc <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> {{con : Terminal.console <: e}}
+        -> {{clock : Time.time <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{rx : Reactor.reactor <: e}}
+        -> Bool
+        -> Co e Unit
+explore False = dispatch Nil
+explore True = do
+  chosen <-
+    Terminal.interact
+      (Interactive.app
+         "heff"
+         (Interactive.entries
+            (commands
+               (r := Co e Unit)
+               { build = build, project = project, tool = tool })))
+  explored chosen
 
 -- | heff: its commands, given what they are to run with
 program : {e : HFunctor}
@@ -313,30 +425,35 @@ program : {e : HFunctor}
         -> {{rep : Report.report <: e}}
         -> {{wire : Rpc.rpc <: e}}
         -> {{prog : Progress.progress <: e}}
+        -> {{con : Terminal.console <: e}}
+        -> {{clock : Time.time <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{rx : Reactor.reactor <: e}}
         -> Co e Unit
 program = do
   as <- args
-  case Cli.readLine
-      "heff"
-      (commands { build = build, project = project, tool = tool })
-      as of
-    Run act -> act
-    Out text -> write text
-    Fail text -> do
-      writeErr text
-      exit 1
+  if List.null as
+      then do
+        tty <- Terminal.interactive
+        explore tty
+    else dispatch as
 
 -- | where the world is: each sub-effect's evidence, given -- the
 -- | program's progress drawn on the terminal, or nowhere (`Progress.shown`)
 main : Co world Unit
 main =
   Progress.shown
-    (sys := \p -> InL (InL (InL (InL (InR p)))))
-    (term := \p -> InR p)
+    (sys := \p -> InL (InL (InL (InL (InL (InL (InL (InL (InR p)))))))))
+    (term := \p -> InL (InL (InL (InL (InR p)))))
     (program
-       (io := \p -> InR (InL (InL (InL (InL (InL p))))))
-       (sys := \p -> InR (InL (InL (InL (InL (InR p))))))
-       (disk := \p -> InR (InL (InL (InL (InR p)))))
-       (rep := \p -> InR (InL (InL (InR p))))
-       (wire := \p -> InR (InL (InR p)))
-       (prog := \p -> InL p))
+       (io := \p -> InR (InL (InL (InL (InL (InL (InL (InL (InL (InL p))))))))))
+       (sys := \p ->
+         InR (InL (InL (InL (InL (InL (InL (InL (InL (InR p))))))))))
+       (disk := \p -> InR (InL (InL (InL (InL (InL (InL (InL (InR p)))))))))
+       (rep := \p -> InR (InL (InL (InL (InL (InL (InL (InR p))))))))
+       (wire := \p -> InR (InL (InL (InL (InL (InL (InR p)))))))
+       (prog := \p -> InL p)
+       (con := \p -> InR (InL (InL (InL (InR p)))))
+       (clock := \p -> InR (InL (InL (InR p))))
+       (nt := \p -> InR (InL (InR p)))
+       (rx := \p -> InR (InR p)))
