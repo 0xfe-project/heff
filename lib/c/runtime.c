@@ -126,7 +126,7 @@ enum {
 
 // (`K_TAGF`, a tag with flat fields (#64): one without is given back as
 // ever, nothing looked for in it)
-enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT, K_TAGF };
+enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT, K_TAGF, K_BIT };
 
 typedef struct Obj {
   uint32_t rc;
@@ -845,7 +845,7 @@ static size_t heff_size(V v) {
   case K_REC: return sizeof(Rec) + ((Rec *)v)->n * sizeof(V);
   case K_CLO: return sizeof(Clo) + ((Clo *)v)->nenv * sizeof(V);
   case K_PAP: return sizeof(Pap) + ((Pap *)v)->n * sizeof(V);
-  case K_STR: case K_BYT: return sizeof(Str) + ((Str *)v)->cap;
+  case K_STR: case K_BYT: case K_BIT: return sizeof(Str) + ((Str *)v)->cap;
   case K_FLT: return sizeof(Flt);
   case K_ARR: return sizeof(Arr) + ((Arr *)v)->n * sizeof(V);
   case K_BNC: return sizeof(Bnc) + ((Bnc *)v)->n * sizeof(V);
@@ -2799,42 +2799,86 @@ static V heff_bytesToString(V a) {
   return s;
 }
 
-// (what a binary's segment reads and writes, `b[x::16-little]`: an
-// integer of `n` bits, 0 to 64, its two's complement, the most
-// significant bit first -- or its bytes the least first, where the flags
-// `f` have 1 (`little`, `n` a multiple of 8) -- read as signed where `f`
-// has 2.  heff.elab.clauses checks that it is there before it is read.)
-static V heff_bytesIntAt(V a, V o, V n, V f) {
-  Str *x = (Str *)a;
-  int64_t at = INT_OF(o), bits = INT_OF(n), flags = INT_OF(f);
-  if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > x->len * 8) return heff_abandon();
+// (what a binary's segment reads and writes, `b[x::16-little]`, as
+// Erlang's do: an integer of `n` bits, 0 to 64, its two's complement,
+// the most significant bit first -- or, little-endian (where the flags
+// `f` have 1), its bytes the least significant first and then the `n %
+// 8` bits left, the most significant -- read as signed where `f` has 2.
+// `heff_bits_read` and `heff_bits_write` have them in the order they are
+// written, `heff_bits_little` turns the one into the other.)
+static uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n) {
   uint64_t u = 0;
-  if ((at & 7) == 0 && (bits & 7) == 0) {
-    const uint8_t *p = x->s + (at >> 3);
-    int64_t k = bits >> 3;
-    for (int64_t i = 0; i < k; i++)
-      u = (u << 8) | p[(flags & 1) ? k - 1 - i : i];
+  if ((at & 7) == 0 && (n & 7) == 0) {
+    const uint8_t *p = s + (at >> 3);
+    for (int64_t i = 0; i < (n >> 3); i++) u = (u << 8) | p[i];
   } else {
-    for (int64_t i = at; i < at + bits; i++)
-      u = (u << 1) | ((x->s[i >> 3] >> (7 - (i & 7))) & 1);
+    for (int64_t i = at; i < at + n; i++) u = (u << 1) | ((s[i >> 3] >> (7 - (i & 7))) & 1);
   }
-  heff_drop(a);
-  if ((flags & 2) && bits > 0 && bits < 64 && (u >> (bits - 1)) & 1) return heff_int((int64_t)(u | (~(uint64_t)0 << bits)));
-  if ((flags & 2) && bits == 64) return heff_int((int64_t)u);
+  return u;
+}
+
+// (the `n` bits of `w`, the most significant first, put at bit `at` of
+// `s`, whose bits there are 0)
+static void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n) {
+  if ((at & 7) == 0 && (n & 7) == 0) {
+    uint8_t *p = s + (at >> 3);
+    for (int64_t i = 0; i < (n >> 3); i++) p[i] = (uint8_t)(w >> (n - 8 * (i + 1)));
+  } else {
+    for (int64_t i = 0; i < n; i++)
+      if ((w >> (n - 1 - i)) & 1) s[(at + i) >> 3] |= (uint8_t)(0x80 >> ((at + i) & 7));
+  }
+}
+
+// (an integer of `n` bits, little-endian: its bits as they are written,
+// from the integer (`out`), or the integer, from them)
+static uint64_t heff_bits_little(uint64_t u, int64_t n, int out) {
+  int64_t k = n >> 3, r = n & 7;
+  uint64_t w = 0;
+  if (out) {
+    for (int64_t i = 0; i < k; i++) w = (w << 8) | ((u >> (8 * i)) & 255);
+    if (r) w = (w << r) | ((u >> (8 * k)) & ((1u << r) - 1));
+  } else {
+    if (r) w = (u & ((1u << r) - 1)) << (8 * k);
+    for (int64_t i = 0; i < k; i++) w |= ((u >> (n - 8 * (i + 1))) & 255) << (8 * i);
+  }
+  return w;
+}
+
+// (the integer of `n` bits at bit `at` of `s`, as the flags `f` say)
+static V heff_bits_int(const uint8_t *s, int64_t at, int64_t n, int64_t flags) {
+  uint64_t u = heff_bits_read(s, at, n);
+  if (flags & 1) u = heff_bits_little(u, n, 0);
+  if ((flags & 2) && n > 0 && n < 64 && (u >> (n - 1)) & 1) return heff_int((int64_t)(u | (~(uint64_t)0 << n)));
+  if ((flags & 2) && n == 64) return heff_int((int64_t)u);
   return heff_int_u64(u);
 }
 
-// (the integer `v`, its low `n` bits (a multiple of 8, up to 64), as
-// bytes: the most significant first, or the least where `f` has 1)
-static V heff_bytesOfInt(V n, V f, V v) {
-  int64_t bits = INT_OF(n), flags = INT_OF(f);
-  if (!IS_INT(n) || bits < 0 || bits > 64 || (bits & 7)) return heff_abandon();
+// (the integer `v`'s low `n` bits, as they are written)
+static uint64_t heff_bits_of_int(V v, int64_t n, int64_t flags) {
   uint64_t u = heff_int_low64(v);
+  if (n < 64) u &= ((uint64_t)1 << n) - 1;
+  return (flags & 1) ? heff_bits_little(u, n, 1) : u;
+}
+
+// (`heff.elab.clauses` checks that it is there before it is read)
+static V heff_bytesIntAt(V a, V o, V n, V f) {
+  Str *x = (Str *)a;
+  int64_t at = INT_OF(o), bits = INT_OF(n);
+  if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > x->len * 8) return heff_abandon();
+  V r = heff_bits_int(x->s, at, bits, INT_OF(f));
+  heff_drop(a);
+  return r;
+}
+
+// (the integer `v`, its low `n` bits (a multiple of 8, up to 64), as
+// bytes)
+static V heff_bytesOfInt(V n, V f, V v) {
+  int64_t bits = INT_OF(n);
+  if (!IS_INT(n) || bits < 0 || bits > 64 || (bits & 7)) return heff_abandon();
+  uint64_t w = heff_bits_of_int(v, bits, INT_OF(f));
   heff_drop(v);
-  int64_t k = bits >> 3;
-  Str *s = heff_bytes_new(k);
-  for (int64_t i = 0; i < k; i++)
-    s->s[(flags & 1) ? i : k - 1 - i] = (uint8_t)(u >> (8 * i));
+  Str *s = heff_bytes_new(bits >> 3);
+  heff_bits_write(s->s, 0, w, bits);
   return (V)s;
 }
 
@@ -2846,6 +2890,152 @@ static V heff_bytesHasAt(V a, V o, V b) {
   heff_drop(a);
   heff_drop(b);
   return heff_bool(r);
+}
+
+// Bits
+// ---------------------------------------------------------------------
+
+// (`Bits` (lib/bits.hf), a bitstring, never changed once made: a
+// string's `Str`, of the kind `K_BIT`, its `len` bytes holding its bits
+// the first the most significant of the first byte; `h.tag` says how
+// many bits of the last byte are none of them, each 0 -- so that two of
+// the same bits are the same bytes.  Dropped and copied for a thread as
+// a string is, and shown as a binary, `b[...]`)
+#define HEFF_BITS_LEN(x) ((x)->len * 8 - (int64_t)(x)->h.tag)
+
+static Str *heff_bits_new(int64_t n) {
+  int64_t len = (n + 7) >> 3;
+  Str *s = heff_str_new(len);
+  s->h.kind = K_BIT;
+  s->h.tag = (uint16_t)((8 - (n & 7)) & 7);
+  if (len) memset(s->s, 0, (size_t)len);
+  return s;
+}
+
+// (the `n` bits of `src` from bit `from`, put at bit `at` of `dst`,
+// whose bits there are 0)
+static void heff_bits_copy(uint8_t *dst, int64_t at, const uint8_t *src, int64_t from, int64_t n) {
+  if ((at & 7) == 0 && (from & 7) == 0) {
+    int64_t k = n >> 3;
+    if (k) memcpy(dst + (at >> 3), src + (from >> 3), (size_t)k);
+    if (n & 7) dst[(at >> 3) + k] |= (uint8_t)(src[(from >> 3) + k] & (0xff00 >> (n & 7)));
+    return;
+  }
+  int64_t i = 0;
+  for (; i + 8 <= n; i += 8) heff_bits_write(dst, at + i, heff_bits_read(src, from + i, 8), 8);
+  if (i < n) heff_bits_write(dst, at + i, heff_bits_read(src, from + i, n - i), n - i);
+}
+
+static V heff_bitsLength(V a) {
+  int64_t n = HEFF_BITS_LEN((Str *)a);
+  heff_drop(a);
+  return MK_INT(n);
+}
+
+static V heff_bitsIntAt(V a, V o, V n, V f) {
+  Str *x = (Str *)a;
+  int64_t at = INT_OF(o), bits = INT_OF(n);
+  if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > HEFF_BITS_LEN(x)) return heff_abandon();
+  V r = heff_bits_int(x->s, at, bits, INT_OF(f));
+  heff_drop(a);
+  return r;
+}
+
+// (the integer `v`, its low `n` bits, 0 to 64, as bits)
+static V heff_bitsOfInt(V n, V f, V v) {
+  int64_t bits = INT_OF(n);
+  if (!IS_INT(n) || bits < 0 || bits > 64) return heff_abandon();
+  uint64_t w = heff_bits_of_int(v, bits, INT_OF(f));
+  heff_drop(v);
+  Str *s = heff_bits_new(bits);
+  heff_bits_write(s->s, 0, w, bits);
+  return (V)s;
+}
+
+// (a list's bits, one after another, made at once)
+static V heff_bitsConcat(V l) {
+  int64_t n = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n += HEFF_BITS_LEN((Str *)heff_field(c, 0));
+  Str *s = heff_bits_new(n);
+  int64_t k = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
+    Str *x = (Str *)heff_field(c, 0);
+    heff_bits_copy(s->s, k, x->s, 0, HEFF_BITS_LEN(x));
+    k += HEFF_BITS_LEN(x);
+  }
+  heff_drop(l);
+  return (V)s;
+}
+
+// (the `n` bits from bit `o`; out of them, abandoned)
+static V heff_bitsSlice(V a, V o, V n) {
+  Str *x = (Str *)a;
+  int64_t at = INT_OF(o), m = INT_OF(n);
+  if (!IS_INT(o) || !IS_INT(n) || at < 0 || m < 0 || at + m > HEFF_BITS_LEN(x)) return heff_abandon();
+  Str *s = heff_bits_new(m);
+  heff_bits_copy(s->s, 0, x->s, at, m);
+  heff_drop(a);
+  return (V)s;
+}
+
+// (bytes as bits, and bits that are whole bytes as bytes (others,
+// abandoned): the same buffer where it is the last reference)
+static V heff_bitsOfBytes(V a) {
+  Str *x = (Str *)a;
+  if (x->h.rc == 1) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
+  Str *s = heff_bits_new(x->len * 8);
+  if (x->len) memcpy(s->s, x->s, (size_t)x->len);
+  heff_drop(a);
+  return (V)s;
+}
+
+static V heff_bitsBytes(V a) {
+  Str *x = (Str *)a;
+  if (x->h.tag) return heff_abandon();
+  if (x->h.rc == 1) { x->h.kind = K_BYT; return a; }
+  Str *s = heff_bytes_new(x->len);
+  if (x->len) memcpy(s->s, x->s, (size_t)x->len);
+  heff_drop(a);
+  return (V)s;
+}
+
+static V heff_bitsEq(V a, V b) {
+  Str *x = (Str *)a, *y = (Str *)b;
+  int r = x->len == y->len && x->h.tag == y->h.tag && (x->len == 0 || memcmp(x->s, y->s, (size_t)x->len) == 0);
+  heff_drop(a);
+  heff_drop(b);
+  return heff_bool(r);
+}
+
+// (a `Float64`'s bits, IEEE's: of 64 bits, or of 32, rounded to a
+// `float` first; a NaN, the quiet one, its sign 0, as every backend has
+// it)
+static V heff_floatBits(V n, V x) {
+  int64_t bits = INT_OF(n);
+  double d = FLT_OF(x);
+  heff_drop(x);
+  if (bits == 64) {
+    uint64_t u;
+    if (d != d) u = 0x7ff8000000000000ull; else memcpy(&u, &d, 8);
+    return heff_int_u64(u);
+  }
+  if (bits == 32) {
+    float g = (float)d;
+    uint32_t u;
+    if (g != g) u = 0x7fc00000u; else memcpy(&u, &g, 4);
+    return heff_int_u64(u);
+  }
+  return heff_abandon();
+}
+
+// (the `Float64` whose bits, of 64 or of 32, are those of `v`)
+static V heff_floatOfBits(V n, V v) {
+  int64_t bits = INT_OF(n);
+  uint64_t u = heff_int_low64(v);
+  heff_drop(v);
+  if (bits == 64) { double d; memcpy(&d, &u, 8); return heff_flt(d); }
+  if (bits == 32) { uint32_t w = (uint32_t)u; float g; memcpy(&g, &w, 4); return heff_flt((double)g); }
+  return heff_abandon();
 }
 
 // What providers share
@@ -3775,15 +3965,13 @@ static int heff_is_list(V v) {
   return heff_tag_named(v, "Nil", 0, &f);
 }
 
-// (bytes as the prelude's `showBytes` writes them, a binary: `b[...]`,
-// each run of printable ASCII a string, `"` and `\` escaped, any other
-// byte its number)
-static void heff_show_bytes(Buf *b, V v) {
-  Str *s = (Str *)v;
+// (the `len` bytes at `p` as the prelude's `showBytes` writes them in a
+// binary, `b[...]`: each run of printable ASCII a string, `"` and `\`
+// escaped, any other byte its number; whether any is written)
+static int heff_show_byte_pieces(Buf *b, const uint8_t *p, int64_t len) {
   int run = 0, any = 0;
-  buf_str(b, "b[");
-  for (int64_t i = 0; i < s->len; i++) {
-    uint8_t c = s->s[i];
+  for (int64_t i = 0; i < len; i++) {
+    uint8_t c = p[i];
     if (c >= 0x20 && c < 0x7f) {
       if (!run) { buf_str(b, any ? ", \"" : "\""); run = any = 1; }
       if (c == '"') buf_str(b, "\\\"");
@@ -3798,6 +3986,27 @@ static void heff_show_bytes(Buf *b, V v) {
     }
   }
   if (run) buf_str(b, "\"");
+  return any;
+}
+
+static void heff_show_bytes(Buf *b, V v) {
+  Str *s = (Str *)v;
+  buf_str(b, "b[");
+  heff_show_byte_pieces(b, s->s, s->len);
+  buf_str(b, "]");
+}
+
+// (bits as the prelude's `showBits` writes them: their whole bytes as
+// bytes are, then the bits left, `v::k`, or, none left, `b[]::bits`)
+static void heff_show_bits(Buf *b, V v) {
+  Str *s = (Str *)v;
+  int64_t k = (8 - (int64_t)s->h.tag) & 7, whole = k ? s->len - 1 : s->len;
+  char tmp[32];
+  buf_str(b, "b[");
+  int any = heff_show_byte_pieces(b, s->s, whole);
+  if (k) snprintf(tmp, sizeof tmp, "%s%u::%d", any ? ", " : "", (unsigned)(s->s[whole] >> (8 - k)), (int)k);
+  else snprintf(tmp, sizeof tmp, "%sb[]::bits", any ? ", " : "");
+  buf_str(b, tmp);
   buf_str(b, "]");
 }
 
@@ -3845,6 +4054,7 @@ static void heff_show(Buf *b, V v, int arg) {
     }
     case K_STR: buf_json_string_as(b, v, 1); return;
     case K_BYT: heff_show_bytes(b, v); return;
+    case K_BIT: heff_show_bits(b, v); return;
     case K_ARR: {
       Arr *r = (Arr *)v;
       buf_str(b, "[");

@@ -73,6 +73,27 @@ bytePrims =
   , MkPair "strFromJS" (mkPrim 1 "(t) => $fromJs(t)")
   ]
 
+-- (what the primitives of a binary's segments share, lib/c/runtime.c's
+-- as JavaScript has them: `rd`, the `n` bits at bit `at`, the most
+-- significant first; `le`, an integer of `n` bits little-endian (its
+-- bytes the least significant first, then the bits left, the most
+-- significant), as written (`out`) or read; `int`, an integer read as the
+-- flags `f` say (1 little-endian, 2 signed); `word`, one as it is
+-- written; `wr`, bits put where they are 0; `mk`, `Bits` of `n` bits (a
+-- `Uint8Array`, its `bits` the length); `cp`, bits copied)
+bitsJs : String
+bitsJs =
+  joinWith
+    " "
+    [ "const rd = (a, at, n) => { let u = 0n; if (at % 8 === 0 && n % 8 === 0) { for (let i = at / 8; i < (at + n) / 8; i++) u = (u << 8n) | BigInt(a[i]); } else { for (let i = at; i < at + n; i++) u = (u << 1n) | BigInt((a[i >> 3] >> (7 - (i & 7))) & 1); } return u; };"
+    , "const le = (u, n, out) => { const k = n >> 3, r = n & 7; let w = 0n; if (out) { for (let i = 0; i < k; i++) w = (w << 8n) | ((u >> BigInt(8 * i)) & 255n); if (r) w = (w << BigInt(r)) | ((u >> BigInt(8 * k)) & BigInt((1 << r) - 1)); } else { if (r) w = (u & BigInt((1 << r) - 1)) << BigInt(8 * k); for (let i = 0; i < k; i++) w |= ((u >> BigInt(n - 8 * (i + 1))) & 255n) << BigInt(8 * i); } return w; };"
+    , "const int = (a, at, n, f) => { let u = rd(a, at, n); if (f & 1n) u = le(u, n, false); return (f & 2n) ? BigInt.asIntN(n, u) : u; };"
+    , "const word = (v, n, f) => { const u = BigInt.asUintN(n, v); return (f & 1n) ? le(u, n, true) : u; };"
+    , "const wr = (a, at, w, n) => { for (let i = 0; i < n; i++) if ((w >> BigInt(n - 1 - i)) & 1n) a[(at + i) >> 3] |= 0x80 >> ((at + i) & 7); };"
+    , "const mk = (n) => { const r = new Uint8Array((n + 7) >> 3); r.bits = n; return r; };"
+    , "const cp = (d, at, s, from, n) => { let i = 0; if (at % 8 === 0 && from % 8 === 0) { d.set(s.subarray(from / 8, from / 8 + (n >> 3)), at / 8); i = n - (n & 7); } for (; i < n; i++) if ((s[(from + i) >> 3] >> (7 - ((from + i) & 7))) & 1) d[(at + i) >> 3] |= 0x80 >> ((at + i) & 7); };"
+    ]
+
 -- (`bytes`'s: a `Bytes` is a `Uint8Array`, never changed once made, a
 -- byte a number; one made of a string, a byte of each code unit, and a
 -- string made of one its text, UTF-8, as `TextDecoder` reads it (what is
@@ -129,17 +150,83 @@ bytesPrims =
     "bytesIntAt"
     (mkPrim
        4
-       "(a) => (o) => (n) => (f) => { const at = Number(o), bits = Number(n); if (!(at >= 0 && bits >= 0 && bits <= 64 && at + bits <= a.length * 8)) return $abandon(); let u = 0n; if (at % 8 === 0 && bits % 8 === 0) { const p = at / 8, k = bits / 8; for (let i = 0; i < k; i++) u = (u << 8n) | BigInt(a[p + ((f & 1n) ? k - 1 - i : i)]); } else { for (let i = at; i < at + bits; i++) u = (u << 1n) | BigInt((a[i >> 3] >> (7 - (i & 7))) & 1); } return (f & 2n) ? BigInt.asIntN(bits, u) : u; }")
+       ("(a) => (o) => (n) => (f) => { "
+        ^ bitsJs
+        ^ " const at = Number(o), m = Number(n); if (!(at >= 0 && m >= 0 && m <= 64 && at + m <= a.length * 8)) return $abandon(); return int(a, at, m, f); }"))
   , MkPair
     "bytesOfInt"
     (mkPrim
        3
-       "(n) => (f) => (v) => { const bits = Number(n); if (!(bits >= 0 && bits <= 64 && bits % 8 === 0)) return $abandon(); let u = BigInt.asUintN(bits, v); const k = bits / 8, r = new Uint8Array(k); for (let i = 0; i < k; i++) { r[(f & 1n) ? i : k - 1 - i] = Number(u & 255n); u >>= 8n; } return r; }")
+       ("(n) => (f) => (v) => { "
+        ^ bitsJs
+        ^ " const m = Number(n); if (!(m >= 0 && m <= 64 && m % 8 === 0)) return $abandon(); const r = new Uint8Array(m / 8); wr(r, 0, word(v, m, f), m); return r; }"))
   , MkPair
     "bytesHasAt"
     (mkPrim
        3
        "(a) => (o) => (b) => { const at = Number(o); if (!(at >= 0 && at <= a.length - b.length)) return $F; for (let i = 0; i < b.length; i++) if (a[at + i] !== b[i]) return $F; return $T; }")
+  ]
+
+-- (`bits`'s: `Bits` are a `Uint8Array` whose `bits` is their length,
+-- the bits past it 0, never changed once made; of bytes, and as bytes,
+-- the same buffer; a `Float64`'s bits, IEEE's, of 64 or of 32, a NaN the
+-- quiet one, its sign 0, as lib/c/runtime.c has them)
+bitsPrims : List (Pair String PrimImpl)
+bitsPrims =
+  [ MkPair "bitsLength" (mkPrim 1 "(a) => BigInt(a.bits)")
+  , MkPair
+    "bitsIntAt"
+    (mkPrim
+       4
+       ("(a) => (o) => (n) => (f) => { "
+        ^ bitsJs
+        ^ " const at = Number(o), m = Number(n); if (!(at >= 0 && m >= 0 && m <= 64 && at + m <= a.bits)) return $abandon(); return int(a, at, m, f); }"))
+  , MkPair
+    "bitsOfInt"
+    (mkPrim
+       3
+       ("(n) => (f) => (v) => { "
+        ^ bitsJs
+        ^ " const m = Number(n); if (!(m >= 0 && m <= 64)) return $abandon(); const r = mk(m); wr(r, 0, word(v, m, f), m); return r; }"))
+  , MkPair
+    "bitsConcat"
+    (mkPrim
+       1
+       ("(l) => { "
+        ^ bitsJs
+        ^ " let n = 0; for (let c = l; c.$ === \"Cons\"; c = c.a[1]) n += c.a[0].bits; const r = mk(n); for (let k = 0; l.$ === \"Cons\"; l = l.a[1]) { cp(r, k, l.a[0], 0, l.a[0].bits); k += l.a[0].bits; } return r; }"))
+  , MkPair
+    "bitsSlice"
+    (mkPrim
+       3
+       ("(a) => (o) => (n) => { "
+        ^ bitsJs
+        ^ " const at = Number(o), m = Number(n); if (!(at >= 0 && m >= 0 && at + m <= a.bits)) return $abandon(); const r = mk(m); cp(r, 0, a, at, m); return r; }"))
+  , MkPair
+    "bitsOfBytes"
+    (mkPrim
+       1
+       "(a) => { const r = new Uint8Array(a.buffer, a.byteOffset, a.length); r.bits = a.length * 8; return r; }")
+  , MkPair
+    "bitsBytes"
+    (mkPrim
+       1
+       "(a) => a.bits % 8 !== 0 ? $abandon() : new Uint8Array(a.buffer, a.byteOffset, a.length)")
+  , MkPair
+    "bitsEq"
+    (mkPrim
+       2
+       "(a) => (b) => { if (a.bits !== b.bits) return $F; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return $F; return $T; }")
+  , MkPair
+    "floatBits"
+    (mkPrim
+       2
+       "(n) => (x) => { const v = new DataView(new ArrayBuffer(8)); if (n === 64n) { if (x !== x) return 0x7ff8000000000000n; v.setFloat64(0, x); return v.getBigUint64(0); } if (n === 32n) { if (x !== x) return 0x7fc00000n; v.setFloat32(0, x); return BigInt(v.getUint32(0)); } return $abandon(); }")
+  , MkPair
+    "floatOfBits"
+    (mkPrim
+       2
+       "(n) => (u) => { const v = new DataView(new ArrayBuffer(8)); if (n === 64n) { v.setBigUint64(0, BigInt.asUintN(64, u)); return v.getFloat64(0); } if (n === 32n) { v.setUint32(0, Number(BigInt.asUintN(32, u))); return v.getFloat32(0); } return $abandon(); }")
   ]
 
 -- (std.math's, `floatSin` to `floatPow`: JavaScript's `Math`, as C's libm
@@ -405,7 +492,9 @@ prims =
     basicPrims
     (List.append
        bytePrims
-       (List.append bytesPrims (List.map fixedImpl Fixed.fixedPrims)))
+       (List.append
+          bytesPrims
+          (List.append bitsPrims (List.map fixedImpl Fixed.fixedPrims))))
 
 -- | the primitives the compiler writes, which no program names: an
 -- | operation of a program's world handed to the world (only the

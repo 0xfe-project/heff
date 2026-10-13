@@ -49,7 +49,7 @@ const showString = (s) => {
 // (bytes, a `Uint8Array`, as the prelude's `showBytes` writes them, a
 // binary: `b[...]`, each run of printable ASCII a string, `"` and `\`
 // escaped, any other byte its number)
-const showBytes = (b) => {
+const bytePieces = (b) => {
   const pieces = [];
   let run = "";
   for (const c of b) {
@@ -57,6 +57,16 @@ const showBytes = (b) => {
     else { if (run) pieces.push("\"" + run + "\""); run = ""; pieces.push(String(c)); }
   }
   if (run) pieces.push("\"" + run + "\"");
+  return pieces;
+};
+const showBytes = (b) => "b[" + bytePieces(b).join(", ") + "]";
+// (bits, a `Uint8Array` whose `bits` is their length, as the prelude's
+// `showBits` writes them: their whole bytes as bytes are, then the bits
+// left, `v::k`, or, none left, `b[]::bits`)
+const showBits = (b) => {
+  const k = b.bits % 8, whole = (b.bits - k) / 8;
+  const pieces = bytePieces(b.subarray(0, whole));
+  pieces.push(k ? `${b[whole] >> (8 - k)}::${k}` : "b[]::bits");
   return "b[" + pieces.join(", ") + "]";
 };
 // (a list as `[a, b]` writes it; a tag with arguments is parenthesized
@@ -69,7 +79,7 @@ export const show = (v, arg = false) => {
   // (a float as a literal writes it: `2.0`, not `2`)
   if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
   if (typeof v === "string") return showString(v);
-  if (v instanceof Uint8Array) return showBytes(v);
+  if (v instanceof Uint8Array) return v.bits === undefined ? showBytes(v) : showBits(v);
   if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {
