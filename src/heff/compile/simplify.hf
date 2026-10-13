@@ -685,6 +685,74 @@ letSplit r x a b = do
   b' <- r.simp b
   pure (ELet x a b')
 
+-- Sums built to be taken apart: `let e = (if c then Left y else Right f)
+-- in ... case e of ...` -- a tag chosen by a match, then only matched on
+-- -- is what follows given each tag where it is built, `if c then (...
+-- case Left y of ...) else (... case Right f of ...)`: each match then
+-- chooses at once, and no tag is built.  What follows is copied into
+-- each way out, so only when it is small.
+
+isVar : String -> IR.Expr -> Bool
+isVar x (EVar y) = strEq x y
+isVar x _ = False
+
+-- | how big what follows may be, times the tags but one
+sumBudget : Int
+sumBudget = 100
+
+-- (the tags it comes to, through the bindings and matches of its arms
+-- -- an arm abandoned none -- and anything else very many)
+tagLeaves : IR.Expr -> Int
+tagLeaves (ETag _ _ _) = 1
+tagLeaves (ELet _ _ b) = tagLeaves b
+tagLeaves (EMatch _ arms) =
+  IR.sumI (List.map (\a -> tagLeaves (IR.armBody a)) arms)
+tagLeaves EAbandon = 0
+tagLeaves e = 1000000
+
+-- (how many matches on `x` there are in the worklist)
+scrutW : String -> Int -> List IR.Expr -> Int
+scrutW x n Nil = n
+scrutW x n (Cons (EMatch sc arms) rest) =
+  scrutW x (if isVar x sc then n + 1 else n) (Cons sc (IR.pushArms arms rest))
+scrutW x n (Cons (EApp f as) rest) = scrutW x n (Cons f (IR.appendI as rest))
+scrutW x n (Cons (EProj e _ _ _) rest) = scrutW x n (Cons e rest)
+scrutW x n (Cons (ELam _ b) rest) = scrutW x n (Cons b rest)
+scrutW x n (Cons (ELet _ a b) rest) = scrutW x n (Cons a (Cons b rest))
+scrutW x n (Cons (ERecord fs _) rest) = scrutW x n (IR.pushFields fs rest)
+scrutW x n (Cons (ETag _ as _) rest) = scrutW x n (IR.appendI as rest)
+scrutW x n (Cons (EPrimCall _ as) rest) = scrutW x n (IR.appendI as rest)
+scrutW x n (Cons (ECall _ as) rest) = scrutW x n (IR.appendI as rest)
+scrutW x n (Cons _ rest) = scrutW x n rest
+
+-- | `x`, bound to a match coming to tags, is only matched on in `b`,
+-- | which is small enough to be copied to each
+sumTakenApart : String -> IR.Expr -> IR.Expr -> Bool
+sumTakenApart x (EMatch s arms) b =
+  tagLeaves (EMatch s arms) >= 2
+  && tagLeaves (EMatch s arms) < 1000000
+  && not (IR.sizeAbove (sumBudget / (tagLeaves (EMatch s arms) - 1)) b)
+  && scrutW x 0 (Cons b Nil) > 0
+  && scrutW x 0 (Cons b Nil) == occCountOf x b
+sumTakenApart x a b = False
+
+-- (each way out of `a` given what follows, `x` bound to its tag there:
+-- the tag's fields bound first, so that it is a value put where it is
+-- matched on)
+sumPushed : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
+sumPushed r x b (ETag t es ts) = do
+  bound <- bindArgs es
+  b2 <- copy b
+  e <- r.simp (ELet x (ETag t (snd bound) ts) b2)
+  pure (letsOf (fst bound) e)
+sumPushed r x b (ELet y a c) = do
+  c2 <- sumPushed r x b c
+  pure (ELet y a c2)
+sumPushed r x b (EMatch s arms) = do
+  arms2 <- armsS (\a -> sumPushed r x b a) arms
+  pure (EMatch s arms2)
+sumPushed r x b e = pure e
+
 -- | a binding, its value simplified: what could fail is computed where
 -- | it was, used or not.  A known function given fewer arguments than it
 -- | takes, some computing (`c = lPing (intOr 100000 rest)`), has those
@@ -695,7 +763,8 @@ letIn : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
 letIn r x a b = do
   p <- isPure a
   s <- get
-  if p then letPure r x a b (occCountOf x b)
+  if sumTakenApart x a b then sumPushed r x b a
+    else if p then letPure r x a b (occCountOf x b)
     else if partialApp s a then letSplit r x a b
     else do
       b' <- r.simp b
@@ -929,10 +998,6 @@ telling : IR.Expr -> Bool
 telling (ETag _ _ _) = True
 telling (ERecord _ _) = True
 telling _ = False
-
-isVar : String -> IR.Expr -> Bool
-isVar x (EVar y) = strEq x y
-isVar x _ = False
 
 -- (whether the variable is taken apart in the worklist: matched on,
 -- called, a field of it taken)
