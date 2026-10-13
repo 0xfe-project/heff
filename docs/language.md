@@ -283,9 +283,9 @@ each operation of a `Float32` is rounded to one.  An `Int` divides
 rounding down, its remainder of the divisor's sign.  An integer's
 division is total, as Lean's and Coq's are: by zero it is 0, and its
 remainder the dividend, so that `(x / y) * y + x % y` is `x` whatever
-`y` is -- for a program that would hear of a zero divisor, `exn`'s
-`exnDiv` and `exnMod` throw `MkDivByZero` instead (of a type with an
-`IsZero`).
+`y` is -- for a program that would hear of a zero divisor,
+`exception`'s `divOrThrow` and `modOrThrow` throw `MkDivByZero` instead
+(of a type with an `IsZero`).
 
 A number literal is of the type it is used at: an integer literal of any
 number type, a fractional one (`2.5`) of a float type.  An integer

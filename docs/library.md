@@ -25,9 +25,9 @@ writing them ([how names are found](language.md#modules)).  The others
 are imported by their names:
 
 - `co` ([effects](language.md#effects)), and effects made with it:
-  `state`, `exn` (with `exnDiv` and `exnMod`, a division that throws by
-  zero, and `attempt`, a handler of it: what was thrown and heard by
-  no `catch`, `Left`), `parallel` and `green` ([green
+  `state`, `exception` (with `divOrThrow` and `modOrThrow`, a division
+  that throws by zero, and `attempt`, a handler of it: what was thrown
+  and heard by no `catch`, `Left`), `parallel` and `green` ([green
   threads](#green-threads));
 - `array` ([arrays](#arrays)), `map` and `set` (a map's `insertWith`
   and `alter` change what a key is bound to in one walk down the tree,

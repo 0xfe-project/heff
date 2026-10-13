@@ -191,7 +191,7 @@ want(same(s1, await compileJs("s2.js")), "a ticking page: a warm run makes the J
 writeFileSync(join(dir, "main.hf"), `import co
 import std.io
 import state
-import exn
+import exception
 
 data AskF (m : Type -> Type) x = Ask (Int -> x)
 
@@ -218,7 +218,7 @@ writer =
 -- the world the stack handles, nested to the right: globals built by
 -- \`plus\`, known to the simplifier as the records they come to
 W3 : HFunctor
-W3 = plus (state Int) (exn Int)
+W3 = plus (state Int) (exception Int)
 
 W2 : HFunctor
 W2 = plus writer W3
@@ -234,7 +234,7 @@ step : {e : HFunctor}
      -> {{rd : reader <: e}}
      -> {{wr : writer <: e}}
      -> {{st : state Int <: e}}
-     -> {{ex : exn Int <: e}}
+     -> {{ex : exception Int <: e}}
      -> Int
      -> Co e Int
 step i = do
@@ -252,7 +252,7 @@ loop : {e : HFunctor}
      -> {{rd : reader <: e}}
      -> {{wr : writer <: e}}
      -> {{st : state Int <: e}}
-     -> {{ex : exn Int <: e}}
+     -> {{ex : exception Int <: e}}
      -> Int
      -> Int
      -> Int
@@ -267,7 +267,7 @@ loop n i acc =
 -- | at most
 escaping : {e : HFunctor}
          -> {{st : state Int <: e}}
-         -> {{ex : exn Int <: e}}
+         -> {{ex : exception Int <: e}}
          -> Int
          -> Int
          -> Co e Int
@@ -319,7 +319,7 @@ passing h e alg =
 
 data Res a = Failed Int | Ok a
 
-failing : Handler (exn Int)
+failing : Handler (exception Int)
 failing =
   { M = \\a -> Res a
   , ret = \\x -> Ok x
@@ -356,7 +356,7 @@ stacked n =
       0
   in let c3 =
     handle
-      (passing (state Int) (exn Int) (\\t s -> case t of
+      (passing (state Int) (exception Int) (\\t s -> case t of
        Get k -> val (MkOut (k s) s)
        Put st x -> val (MkOut x st)))
       c2

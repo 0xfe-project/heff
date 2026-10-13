@@ -148,7 +148,7 @@ main = do
       page
       (Remote.remotely
          notes
-         (exn Remote.RemoteError <+> page)
+         (exception Remote.RemoteError <+> page)
          (failed := \p -> InL p)
          notesApi
          (RemoteHttp.posted (web := \p -> InR (InR p)) "/api")
@@ -165,7 +165,7 @@ the same way, by `std.remote`'s `posted`, std.http's.
 
 ## When no answer comes
 
-A call that comes to no answer throws: `exn RemoteError`, in the
+A call that comes to no answer throws: `exception RemoteError`, in the
 world under the API's, so the client's world has it.  Why is one of
 `Unreachable` (the transport's: no connection, a status that is no
 200), `Mismatched` (the server's API is of another build, or its wire
@@ -176,7 +176,7 @@ program would go on -- the page says why, and is as it was:
 
 ```haskell
 guarded : {e : HFunctor}
-        -> {{failed : exn Remote.RemoteError <: e}}
+        -> {{failed : exception Remote.RemoteError <: e}}
         -> {{ui : dom <: e}}
         -> Node
         -> Co e Unit
@@ -188,7 +188,7 @@ guarded status c =
        Remote.RemoteError -> Co e Unit)
 ```
 
-and `attempt` (lib/exn.hf) handles the rest at the top, `Left` what no
+and `attempt` (lib/exception.hf) handles the rest at the top, `Left` what no
 `catch` heard.  An event's run (browser.dom's `on`) is its own: a
 throw in it that no `catch` of its own hears abandons that run, not
 the page.
