@@ -1,0 +1,141 @@
+-- A GPU as an effect (lib/co.hf): a device opened, buffers on it made,
+-- written, read and let go of, a kernel loaded from its code, and a
+-- kernel dispatched over a grid of workgroups with buffers bound.  Each
+-- operation's answer goes to its continuation, as std.filesystem's do,
+-- since a GPU finishes later: a dispatch's continuation is called when
+-- the GPU is done with it.  Import it by a name, `import gpu as Gpu`.
+--
+-- The first provider is WebGPU's (gpu.provider.js, a page's): a kernel
+-- is WGSL, its buffers bound at `@group(0)`, the first at `@binding(0)`,
+-- the next at `@binding(1)`.  Native ones (Vulkan, Metal, CUDA's driver
+-- API) are to come with the C backend.
+--
+-- A device, a buffer and a pipeline are handles (lib/std/handle.hf),
+-- the world's numbers for them: a buffer is held until `freeBuffer` lets
+-- it go.  What fails is a value, an `Either GpuError a`, with what the
+-- host says of it: no GPU here, a buffer too large, a kernel's code
+-- that does not compile (its messages, each with its line).
+
+import co
+import std.handle
+
+-- | (`Handle GpuDevice`, std.handle: a GPU opened; no value has it.)
+data GpuDevice
+
+-- | (`Handle GpuBuffer`: a buffer on a GPU.)
+data GpuBuffer
+
+-- | (`Handle GpuPipeline`: a kernel loaded, ready to be dispatched.)
+data GpuPipeline
+
+-- | A GPU opened.
+type Device = Handle GpuDevice
+
+-- | A buffer of bytes on a GPU, a kernel's storage.
+type Buffer = Handle GpuBuffer
+
+-- | A kernel loaded on a GPU.
+type Pipeline = Handle GpuPipeline
+
+-- | Why an operation failed, as the host says it.
+type GpuError = { message : String }
+
+data GpuF (m : Type -> Type) x
+  = Open (Either GpuError Device -> x)
+  | NewBuffer Device Int (Either GpuError Buffer -> x)
+  | WriteBuffer Device Buffer Int Bytes (Either GpuError Unit -> x)
+  | ReadBuffer Device Buffer Int Int (Either GpuError Bytes -> x)
+  | Load Device String String (Either GpuError Pipeline -> x)
+  | Dispatch Device Pipeline (List Buffer) Int Int Int (Either GpuError Unit
+                                                        -> x)
+  | FreeBuffer Buffer (Unit -> x)
+
+-- | A GPU as an effect.
+gpu : HFunctor
+gpu =
+  { f = GpuF
+  , hfmap = \m g p -> case p of
+      Open k -> Open (\r -> g (k r))
+      NewBuffer d n k -> NewBuffer d n (\r -> g (k r))
+      WriteBuffer d b at bs k -> WriteBuffer d b at bs (\r -> g (k r))
+      ReadBuffer d b at n k -> ReadBuffer d b at n (\r -> g (k r))
+      Load d code entry k -> Load d code entry (\r -> g (k r))
+      Dispatch d pl bs x y z k -> Dispatch d pl bs x y z (\r -> g (k r))
+      FreeBuffer b k -> FreeBuffer b (\u -> g (k u))
+  , hmap = \m n nt p -> case p of
+      Open k -> Open k
+      NewBuffer d size k -> NewBuffer d size k
+      WriteBuffer d b at bs k -> WriteBuffer d b at bs k
+      ReadBuffer d b at size k -> ReadBuffer d b at size k
+      Load d code entry k -> Load d code entry k
+      Dispatch d pl bs x y z k -> Dispatch d pl bs x y z k
+      FreeBuffer b k -> FreeBuffer b k
+  }
+
+-- | The GPU opened, or why there is none.
+open : {e : HFunctor} -> {{ev : gpu <: e}} -> Co e (Either GpuError Device)
+open = op (ev (Open (\r -> r))) val
+
+-- | A buffer of `n` bytes on the device, 0 each, which a kernel reads
+-- | and writes and which is written and read from the program.
+newBuffer : {e : HFunctor}
+          -> {{ev : gpu <: e}}
+          -> Device
+          -> Int
+          -> Co e (Either GpuError Buffer)
+newBuffer d n = op (ev (NewBuffer d n (\r -> r))) val
+
+-- | The bytes written into the buffer from its byte `at` (a multiple of
+-- | 4, as their length is).
+writeBuffer : {e : HFunctor}
+            -> {{ev : gpu <: e}}
+            -> Device
+            -> Buffer
+            -> Int
+            -> Bytes
+            -> Co e (Either GpuError Unit)
+writeBuffer d b at bs = op (ev (WriteBuffer d b at bs (\r -> r))) val
+
+-- | The buffer's `n` bytes from its byte `at` (multiples of 4), read
+-- | once what the GPU was given to do before is done.
+readBuffer : {e : HFunctor}
+           -> {{ev : gpu <: e}}
+           -> Device
+           -> Buffer
+           -> Int
+           -> Int
+           -> Co e (Either GpuError Bytes)
+readBuffer d b at n = op (ev (ReadBuffer d b at n (\r -> r))) val
+
+-- | A kernel loaded from its code (WGSL, for WebGPU) and the name of
+-- | its entry point, or what the compiler said of the code.
+load : {e : HFunctor}
+     -> {{ev : gpu <: e}}
+     -> Device
+     -> String
+     -> String
+     -> Co e (Either GpuError Pipeline)
+load d code entry = op (ev (Load d code entry (\r -> r))) val
+
+-- | The kernel run over `x` by `y` by `z` workgroups, the buffers bound
+-- | in order (the first at `@binding(0)`): done when the GPU is.
+dispatch : {e : HFunctor}
+         -> {{ev : gpu <: e}}
+         -> Device
+         -> Pipeline
+         -> List Buffer
+         -> Int
+         -> Int
+         -> Int
+         -> Co e (Either GpuError Unit)
+dispatch d pl bs x y z = op (ev (Dispatch d pl bs x y z (\r -> r))) val
+
+-- | The buffer let go of: given to no operation after.
+freeBuffer : {e : HFunctor} -> {{ev : gpu <: e}} -> Buffer -> Co e Unit
+freeBuffer b = op (ev (FreeBuffer b (\u -> u))) val
+
+-- | As the host says it.
+-- | >>> showError { message = "WebGPU is not here" }
+-- | "gpu: WebGPU is not here"
+showError : GpuError -> String
+showError err = "gpu: " ^ err.message

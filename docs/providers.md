@@ -22,6 +22,11 @@ library is split by backend ([library.md](library.md#the-batteries)):
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
   and `browser.http` (`$host = "page"`), and `browser.js`, which has no
   effect, only its type.
+- `gpu` (lib/gpu.hf), a GPU's effect, has one provider so far,
+  WebGPU's, in JavaScript (`$host = "page"`): a kernel is WGSL, its
+  buffers bound in order at `@group(0)`; where the browser has no
+  `navigator.gpu`, `open` is `Left`, "WebGPU is not here".  Native
+  ones (Vulkan, Metal, CUDA's driver API) are to come in C.
 
 What a backend has no side of is refused where it is imported, before
 the program's effect is looked at: by `heff compile --backend=c` (and
