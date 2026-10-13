@@ -158,6 +158,13 @@ try {
   const comp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete.hf") }, position: { line: 1, character: 9 } });
   const lengthItem = comp.result && comp.result.find((i) => i.label === "toFloat");
   expect("completion of a prelude name", lengthItem && lengthItem.detail.includes("Int -> Float64") && !comp.result.some((i) => i.label === "toString"), comp.result && comp.result.map((i) => i.label));
+  // `abandon`, a hole while writing a definition (#95)
+  const typingHole = "x : Int\nx = aban";
+  open("test/surface/lsp-complete-hole.hf", typingHole);
+  await diagnosticsOf(uri("test/surface/lsp-complete-hole.hf"));
+  const hComp = await request("textDocument/completion", { textDocument: { uri: uri("test/surface/lsp-complete-hole.hf") }, position: { line: 1, character: 8 } });
+  expect("completion of abandon", hComp.result && hComp.result.some((i) => i.label === "abandon"), hComp.result && hComp.result.map((i) => i.label));
+  notify("textDocument/didClose", { textDocument: { uri: uri("test/surface/lsp-complete-hole.hf") } });
   // a primitive the library declares (named by no alias: its key is its name)
   const typingPrim = "x : Int\nx = intAd";
   open("test/surface/lsp-complete-prim.hf", typingPrim);
