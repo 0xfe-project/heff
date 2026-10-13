@@ -531,7 +531,7 @@ const Bootstrap = struct {
 
     /// What an archive for `target` holds, as `heff install` lays it out
     /// in the heff home: bin/heff, and what it ships (app/heff/build.hf's
-    /// `ships`), with the README, the docs and the licenses; each
+    /// `ships`), with the license, the README and the docs; each
     /// directory with a "/" after it, sorted by path.
     fn contentsFor(b: *const Bootstrap, target: []const u8) []const Entry {
         var entries: std.ArrayList(Entry) = .empty;
@@ -694,8 +694,8 @@ const releaseDir = out ++ "/release";
 
 /// What an archive has beside bin/: what heff ships, as `heff install`
 /// puts it in the heff home (app/heff/build.hf's `ships`: lib/,
-/// package.hf), and the README, the docs and the licenses.
-const shipped = [_][]const u8{ "README.md", "docs", "lib", "licenses", "package.hf" };
+/// package.hf), and the license, the README and the docs.
+const shipped = [_][]const u8{ "LICENSE", "README.md", "docs", "lib", "package.hf" };
 
 /// A file or a directory (its path ending in "/", or "", the archive's
 /// own) of an archive.

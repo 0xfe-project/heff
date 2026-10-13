@@ -80,7 +80,7 @@ Linux's are linked statically, by musl.  Each archive is one directory,
 `heff-VERSION-PLATFORM/`, laid out as `make install` lays out the heff
 home, so the heff in it finds its library and its version beside its
 `bin/`: `bin/heff` (`bin/heff.exe`), `lib/` and `package.hf` (what
-`app/heff/build.hf` ships), with `README.md`, `docs/` and `licenses/`.
+`app/heff/build.hf` ships), with `LICENSE`, `README.md` and `docs/`.
 The same source, by the same zig, makes the same archives, byte for
 byte: the entries
 sorted by path, of no owner, of time 0 (1980-01-01 in a zip, its
