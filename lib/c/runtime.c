@@ -78,16 +78,16 @@ extern char **environ;
 // before the runtime too (`-DHEFF_THREADS` does the same).  Then each
 // thread has the runtime's per-run state for itself (`HEFF_TLS`: its
 // free lists, its stack of what is given back, its count of calls and
-// its room, where a failure of it is caught), and a mortal object is
-// only ever one thread's, its count changed by that thread alone --
-// counts are not atomic.  What is immortal, static or made so
-// (`heff_freeze`), is shared: a definition's value is computed once,
-// under a lock, and made immortal (`heff_global`), as is a static
-// thunk's value (`heff_force_shared`).  What a provider gives another
-// thread it copies for it (`heff_copy_for_thread`), and runs there
-// under `heff_try`, ending the thread by `heff_thread_end`.  Without
-// `HEFF_THREADS`, all of this is as one thread has it: `HEFF_TLS` is
-// nothing, and nothing is locked.  (docs/threads.md)
+// its room, where a failure of it is caught).  An object is one thread's,
+// counted by it alone, not atomically; or shared (`SHARED`, #66),
+// counted atomically by every thread that holds it; or immortal,
+// counted by none.  What a provider gives another thread it shares
+// (`heff_share`), and runs there under `heff_try`, ending the thread by
+// `heff_thread_end`.  A definition's value is computed once, under a
+// lock, and made immortal (`heff_global`, `heff_freeze`), as is a static
+// thunk's (`heff_force_shared`).  Without `HEFF_THREADS`, all of this is
+// as one thread has it: `HEFF_TLS` is nothing, no object is shared
+// (`SHARED` is 0), and nothing is locked.  (docs/threads.md)
 #ifdef HEFF_THREADS
 #define HEFF_TLS _Thread_local
 #else
@@ -206,18 +206,86 @@ typedef struct { Obj h; int32_t neg; int32_t n; uint32_t d[]; } Big;
 #define IS_OBJ(v) (((v) & 3) == 0)
 #define IMMORTAL 0x80000000u
 
+// (an object shared between threads (#66, `heff_share`): counted by
+// them all, atomically, and freed by the one that lets it go last.
+// What a shared object holds is shared or immortal; a thread's own
+// object may hold a shared one, not the other way.  Without
+// `HEFF_THREADS`, no object is: `SHARED` is 0, and a count is read and
+// changed as it always was.  Threads: a count is read atomically too,
+// relaxed -- a plain load, to the processor -- since another thread may
+// change a shared one meanwhile)
+#ifdef HEFF_THREADS
+#define SHARED 0x40000000u
+#define heff_rc(o) __atomic_load_n(&(o)->rc, __ATOMIC_RELAXED)
+#else
+#define SHARED 0u
+#define heff_rc(o) ((o)->rc)
+#endif
+// (an object's count but its marks)
+#define HEFF_COUNT(rc) ((rc) & ~(IMMORTAL | SHARED))
+
 static void heff_free(V v);
 
+#ifdef HEFF_THREADS
+// (a shared object counted, out of line: the fast paths below test both
+// marks at once, where one thread tests `IMMORTAL` alone)
+static __attribute__((noinline)) void heff_dup_shared(Obj *o) {
+  if (!(heff_rc(o) & IMMORTAL)) __atomic_fetch_add(&o->rc, 1, __ATOMIC_RELAXED);
+}
+
+// (... counted down: whether that was its last reference, which this
+// thread then frees -- acquiring what every other thread did with it
+// before it let it go.  One made immortal meanwhile (`heff_freeze`, of
+// a static thunk's value) is never its last: what made it so holds it)
+static __attribute__((noinline)) int heff_down_shared(Obj *o) {
+  if (heff_rc(o) & IMMORTAL) return 0;
+  uint32_t was = __atomic_fetch_sub(&o->rc, 1, __ATOMIC_ACQ_REL);
+  return !(was & IMMORTAL) && HEFF_COUNT(was) == 1;
+}
+
+static inline V heff_dup(V v) {
+  if (IS_OBJ(v)) {
+    uint32_t rc = heff_rc(OBJ(v));
+    if (HEFF_LIKELY(!(rc & (IMMORTAL | SHARED)))) OBJ(v)->rc = rc + 1;
+    else heff_dup_shared(OBJ(v));
+  }
+  return v;
+}
+
+// (a count taken down: whether that was its last reference -- never of
+// an immortal object)
+static inline int heff_down(Obj *o) {
+  uint32_t rc = heff_rc(o);
+  if (HEFF_LIKELY(!(rc & (IMMORTAL | SHARED)))) return (o->rc = rc - 1) == 0;
+  return heff_down_shared(o);
+}
+
+// (a count taken down where it is not the last unless the object is
+// shared -- the caller knows it held more than once, or immortal: the
+// last of a shared one frees it)
+static inline void heff_unref(V v) {
+  if (heff_down(OBJ(v))) heff_free(v);
+}
+#else
 static inline V heff_dup(V v) {
   if (IS_OBJ(v) && !(OBJ(v)->rc & IMMORTAL)) OBJ(v)->rc++;
   return v;
 }
 
-static inline void heff_drop(V v) {
-  if (IS_OBJ(v) && !(OBJ(v)->rc & IMMORTAL) && --OBJ(v)->rc == 0) heff_free(v);
+static inline int heff_down(Obj *o) {
+  return !(o->rc & IMMORTAL) && --o->rc == 0;
 }
 
-static inline int heff_unique(V v) { return OBJ(v)->rc == 1; }
+static inline void heff_unref(V v) {
+  if (!(OBJ(v)->rc & IMMORTAL)) OBJ(v)->rc--;
+}
+#endif
+
+static inline void heff_drop(V v) {
+  if (IS_OBJ(v) && heff_down(OBJ(v))) heff_free(v);
+}
+
+static inline int heff_unique(V v) { return heff_rc(OBJ(v)) == 1; }
 
 // (where a value is asked for that may fail -- `heff compile` without
 // `--name`, each definition printed -- a failure is caught there, and
@@ -259,7 +327,7 @@ static void *heff_alloc(size_t n) {
 
 #if defined(HEFF_THREADS) || SMALL_MAX == 0
 // (with threads, an object one thread made may be given back by another
-// (`heff_copy_for_thread`): each its own, from the system, kept on a list
+// (a shared one, `heff_share`): each its own, from the system, kept on a list
 // of its size of the thread that gives it back)
 HEFF_VAR(HEFF_TLS void *heff_free_list[SMALL_MAX / 8 + 1]);
 
@@ -442,14 +510,14 @@ static V heff_get(V v, uint32_t l) {
 static inline void heff_take(V v, uint64_t keep) {
   if (!IS_OBJ(v)) return;
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) {
+  if (heff_rc(&t->h) == 1) {
     for (int64_t i = 0; i < t->n; i++)
       if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + t->n * sizeof(V));
   } else {
     for (int64_t i = 0; i < t->n; i++)
       if ((keep >> i) & 1) heff_dup(t->f[i]);
-    if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+    heff_unref((V)t);
   }
 }
 
@@ -458,7 +526,7 @@ static inline void heff_take(V v, uint64_t keep) {
 // taken or dropped and blanked; otherwise none, 0)
 static inline V heff_take_reuse(V v, uint64_t keep) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) {
+  if (heff_rc(&t->h) == 1) {
     for (int64_t i = 0; i < t->n; i++) {
       if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
       t->f[i] = MK_INT(0);
@@ -468,7 +536,7 @@ static inline V heff_take_reuse(V v, uint64_t keep) {
   }
   for (int64_t i = 0; i < t->n; i++)
     if ((keep >> i) & 1) heff_dup(t->f[i]);
-  if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  heff_unref((V)t);
   return MK_INT(0);
 }
 
@@ -497,14 +565,14 @@ static __attribute__((noinline)) void heff_tag_unset(Tag *t, uint64_t keep, int6
 // (`heff_take`, of a tag of `n` fields)
 HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) {
+  if (heff_rc(&t->h) == 1) {
     for (int64_t i = 0; i < n; i++)
       if (!((keep >> i) & 1)) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
   } else {
     for (int64_t i = 0; i < n; i++)
       if ((keep >> i) & 1) heff_dup(t->f[i]);
-    if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+    heff_unref((V)t);
   }
 }
 
@@ -513,7 +581,7 @@ HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
 // is a `V`)
 HEFF_KNOWN void heff_take_nf(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1 && t->flat) {
+  if (heff_rc(&t->h) == 1 && t->flat) {
     heff_tag_unset(t, keep, n);
     heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
   } else heff_take_n(v, keep, n);
@@ -524,14 +592,14 @@ HEFF_KNOWN void heff_take_nf(V v, uint64_t keep, int64_t n) {
 // freed as the cell it is (`heff_drop_cell`), never looked into)
 HEFF_KNOWN V heff_take_reuse_n(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) {
+  if (heff_rc(&t->h) == 1) {
     for (int64_t i = 0; i < n; i++)
       if (!((keep >> i) & 1)) heff_drop(t->f[i]);
     return v;
   }
   for (int64_t i = 0; i < n; i++)
     if ((keep >> i) & 1) heff_dup(t->f[i]);
-  if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  heff_unref((V)t);
   return MK_INT(0);
 }
 
@@ -540,7 +608,7 @@ HEFF_KNOWN V heff_take_reuse_n(V v, uint64_t keep, int64_t n) {
 // says its flat fields anew)
 HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1 && t->flat) {
+  if (heff_rc(&t->h) == 1 && t->flat) {
     heff_tag_unset(t, keep, n);
     t->flat = 0; t->h.kind = K_TAG;
     return v;
@@ -553,17 +621,17 @@ HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
 // dropped, nothing looked for)
 HEFF_KNOWN void heff_take_na(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
+  if (heff_rc(&t->h) == 1) heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
   else {
     for (int64_t i = 0; i < n; i++)
       if ((keep >> i) & 1) heff_dup(t->f[i]);
-    if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+    heff_unref((V)t);
   }
 }
 
 HEFF_KNOWN V heff_take_reuse_na(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) {
+  if (heff_rc(&t->h) == 1) {
     t->flat = 0; t->h.kind = K_TAG;
     return v;
   }
@@ -574,12 +642,12 @@ HEFF_KNOWN V heff_take_reuse_na(V v, uint64_t keep, int64_t n) {
 // and its cell freed at once; otherwise counted down)
 HEFF_KNOWN void heff_drop_tag(V v, int64_t n) {
   Tag *t = (Tag *)v;
-  if (t->h.rc == 1) {
+  if (heff_rc(&t->h) == 1) {
     if (t->flat) heff_tag_unset(t, 0, n);
     else
       for (int64_t i = 0; i < n; i++) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
-  } else if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  } else heff_unref((V)t);
 }
 
 // (a cell kept for a tag of `n` fields (`heff_take_reuse_n`) and not
@@ -732,7 +800,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
   Rec *r = (Rec *)v;
   if (r->flat) return heff_get_flat(v, i);
   V x = r->f[i];
-  if (r->h.rc == 1) {
+  if (heff_rc(&r->h) == 1) {
     if (n > HEFF_FEW_FIELDS) heff_rec_give(v, i);
     else {
       for (int64_t j = 0; j < n; j++)
@@ -741,7 +809,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
     }
   } else {
     heff_dup(x);
-    if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+    heff_unref((V)r);
   }
   return x;
 }
@@ -754,7 +822,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
 HEFF_KNOWN V heff_take_field(V v, int64_t i) {
   Rec *r = (Rec *)v;
   V x = r->f[i];
-  if (r->h.rc == 1) r->f[i] = MK_INT(0);
+  if (heff_rc(&r->h) == 1) r->f[i] = MK_INT(0);
   else heff_dup(x);
   return x;
 }
@@ -781,7 +849,7 @@ static __attribute__((noinline)) V heff_rec_copy(V v, uint64_t keep, uint32_t *l
   for (int64_t i = 0; i < n; i++)
     c->f[i] = !((keep >> i) & 1) ? MK_INT(0)
             : heff_flat_kind(was, i) ? r->f[i] : heff_dup(r->f[i]);
-  if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+  heff_unref((V)r);
   return (V)c;
 }
 
@@ -794,13 +862,13 @@ static __attribute__((noinline)) void heff_rec_unset(Rec *r, uint64_t keep) {
 
 HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
-  if (r->h.rc != 1) {
+  if (heff_rc(&r->h) != 1) {
     if (n > HEFF_FEW_FIELDS || r->flat) return heff_rec_copy(v, keep, lbl, kept, flat);
     Rec *c = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
     c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = (int32_t)n; c->flat = flat; c->lbl = lbl;
     for (int64_t i = 0; i < n; i++)
       if ((keep >> i) & 1) c->f[i] = heff_dup(r->f[i]);
-    if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+    heff_unref((V)r);
     return (V)c;
   }
   uint32_t was = r->flat;
@@ -824,7 +892,7 @@ HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uin
 // record's last reference, none dropped, nothing looked for)
 HEFF_KNOWN V heff_rec_reuse_na(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
-  if (r->h.rc == 1) {
+  if (heff_rc(&r->h) == 1) {
     r->flat = (r->flat & kept) | flat;
     r->lbl = lbl;
     return v;
@@ -849,12 +917,12 @@ HEFF_KNOWN V heff_rec_reuse_n(V v, uint64_t keep, int64_t n, uint32_t *lbl) {
 // otherwise each counted.  `n` is a constant where it is called)
 static inline __attribute__((always_inline)) void heff_clo_take(V self, int64_t n) {
   Clo *c = (Clo *)self;
-  if (c->h.rc == 1) {
+  if (heff_rc(&c->h) == 1) {
     if (c->memo) heff_drop(c->memo);
     heff_obj_free(c, sizeof(Clo) + n * sizeof(V));
   } else {
     for (int64_t i = 0; i < n; i++) heff_dup(c->env[i]);
-    if (!(c->h.rc & IMMORTAL)) c->h.rc--;
+    heff_unref((V)c);
   }
 }
 
@@ -902,7 +970,7 @@ static inline void heff_dead_put(V v) {
 
 // (a value counted down: put on the stack if that was its last reference)
 static inline void heff_dead_push(V v) {
-  if (!IS_OBJ(v) || (OBJ(v)->rc & IMMORTAL) || --OBJ(v)->rc != 0) return;
+  if (!IS_OBJ(v) || !heff_down(OBJ(v))) return;
   heff_dead_put(v);
 }
 
@@ -942,7 +1010,7 @@ __attribute__((noinline)) static void heff_free(V v) {
     }
     for (int64_t i = 0; i < n; i++) {
       V x = f[i];
-      if (!IS_OBJ(x) || (OBJ(x)->rc & IMMORTAL) || --OBJ(x)->rc != 0) continue;
+      if (!IS_OBJ(x) || !heff_down(OBJ(x))) continue;
       if (next) heff_dead_put(next);
       next = x;
     }
@@ -958,7 +1026,7 @@ __attribute__((noinline)) static void heff_free(V v) {
 // fields, by the walk; otherwise counted down)
 HEFF_KNOWN void heff_drop_rec(V v, int64_t n) {
   Rec *r = (Rec *)v;
-  if (r->h.rc == 1) {
+  if (heff_rc(&r->h) == 1) {
     // (a record of numbers, all flat: its cell, nothing in it)
     if (r->flat && n <= HEFF_FLAT_FIELDS && heff_flat_all(r->flat, heff_flat_lows(n)))
       heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
@@ -967,20 +1035,20 @@ HEFF_KNOWN void heff_drop_rec(V v, int64_t n) {
       for (int64_t i = 0; i < n; i++) heff_drop(r->f[i]);
       heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
     }
-  } else if (!(r->h.rc & IMMORTAL)) r->h.rc--;
+  } else heff_unref((V)r);
 }
 
 // (a closure holding `n` dropped, as `heff_drop_rec` a record)
 HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
   Clo *c = (Clo *)v;
-  if (c->h.rc == 1) {
+  if (heff_rc(&c->h) == 1) {
     if (n > HEFF_FEW_FIELDS) heff_free(v);
     else {
       if (c->memo) heff_drop(c->memo);
       for (int64_t i = 0; i < n; i++) heff_drop(c->env[i]);
       heff_obj_free(c, sizeof(Clo) + n * sizeof(V));
     }
-  } else if (!(c->h.rc & IMMORTAL)) c->h.rc--;
+  } else heff_unref((V)c);
 }
 
 // Values between threads (#36)
@@ -1039,15 +1107,29 @@ static void heff_stack_push(HeffStack *s, V v) {
   } while (0)
 
 static void heff_freeze_one(HeffStack *s, V *at) {
+#ifdef HEFF_THREADS
+  // (a shared thunk's `memo` another thread may put a value in meanwhile)
+  V v = __atomic_load_n(at, __ATOMIC_ACQUIRE);
+#else
   V v = *at;
-  if (!IS_OBJ(v) || !v || (OBJ(v)->rc & IMMORTAL)) return;
-  OBJ(v)->rc = IMMORTAL;
+#endif
+  if (!IS_OBJ(v) || !v) return;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (rc & IMMORTAL) return;
+#ifdef HEFF_THREADS
+  // (a shared object, other threads counting it meanwhile: the mark set
+  // over its count, which they leave as it is from then on)
+  if (rc & SHARED) __atomic_fetch_or(&OBJ(v)->rc, IMMORTAL, __ATOMIC_RELAXED);
+  else
+#endif
+    OBJ(v)->rc = IMMORTAL;
   heff_stack_push(s, v);
 }
 
 // (`v` made immortal, and all it holds: shared between threads from now
 // on, each counting it never, and never freed -- what holds it now
-// leaks it.  `v` is this thread's, and no other's yet)
+// leaks it.  What of `v` is mortal is this thread's, no other's yet;
+// what is shared another thread may hold too, and counts no more)
 static void heff_freeze(V v) {
   HeffStack s = {0};
   heff_freeze_one(&s, &v);
@@ -1058,78 +1140,39 @@ static void heff_freeze(V v) {
   free(s.v);
 }
 
-// (what a copy has made: each object copied, by the object it is a copy
-// of -- open addressing, by address)
-typedef struct { V *from, *to; size_t cap, n; HeffStack todo; } HeffCopies;
-
-static size_t heff_addr_hash(V v) {
-  uint64_t x = (uint64_t)v;
-  x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
-  return (size_t)x;
-}
-
-static void heff_copies_put(HeffCopies *m, V from, V to);
-
-static void heff_copies_grow(HeffCopies *m) {
-  V *from = m->from, *to = m->to;
-  size_t cap = m->cap;
-  m->cap = cap ? cap * 2 : 64;
-  m->n = 0;
-  m->from = calloc(m->cap, sizeof(V));
-  m->to = calloc(m->cap, sizeof(V));
-  if (!m->from || !m->to) heff_fail("out of memory");
-  for (size_t i = 0; i < cap; i++) if (from[i]) heff_copies_put(m, from[i], to[i]);
-  free(from); free(to);
-}
-
-static void heff_copies_put(HeffCopies *m, V from, V to) {
-  if (2 * (m->n + 1) > m->cap) heff_copies_grow(m);
-  size_t i = heff_addr_hash(from) & (m->cap - 1);
-  while (m->from[i]) i = (i + 1) & (m->cap - 1);
-  m->from[i] = from; m->to[i] = to; m->n++;
-}
-
-static V heff_copies_get(HeffCopies *m, V from) {
-  if (!m->cap) return 0;
-  size_t i = heff_addr_hash(from) & (m->cap - 1);
-  for (; m->from[i]; i = (i + 1) & (m->cap - 1))
-    if (m->from[i] == from) return m->to[i];
-  return 0;
-}
-
-// (the value at `at` made its copy's: what is immortal as it is, an
-// object copied before that copy counted once more, any other copied --
-// its shell, what it holds copied after (`todo`))
-static void heff_copy_one(HeffCopies *m, V *at) {
+#ifdef HEFF_THREADS
+static void heff_share_one(HeffStack *s, V *at) {
   V v = *at;
-  if (!IS_OBJ(v) || !v || (OBJ(v)->rc & IMMORTAL)) return;
-  V done = heff_copies_get(m, v);
-  if (done) { OBJ(done)->rc++; *at = done; return; }
-  size_t sz = heff_size(v);
-  if (sz == SMALL_MAX + 1) heff_fail("an object of a kind not known, copied for a thread");
-  Obj *o = heff_obj_alloc(sz);
-  memcpy(o, OBJ(v), sz);
-  o->rc = 1;
-  heff_copies_put(m, v, (V)o);
-  heff_stack_push(&m->todo, (V)o);
-  *at = (V)o;
+  if (!IS_OBJ(v) || !v) return;
+  uint32_t rc = heff_rc(OBJ(v));
+  if (rc & (IMMORTAL | SHARED)) return;
+  OBJ(v)->rc = rc | SHARED;
+  heff_stack_push(s, v);
 }
 
-// (a copy of `v` for another thread, `v` not consumed: what is immortal
-// shared, every other object made again, what is shared in `v` shared in
-// the copy -- so that no object is counted by two threads.  Made of this
-// thread's memory, it is the other's from then on, and given back to
-// its free lists.  `v` is this thread's: no other changes it meanwhile)
-static V heff_copy_for_thread(V v) {
-  HeffCopies m = {0};
-  heff_copy_one(&m, &v);
-  while (m.todo.n) {
-    V o = m.todo.v[--m.todo.n];
-    HEFF_EACH_SLOT(o, heff_copy_one, &m);
+// (`v` shared (#66), to hand to other threads: each mortal object of it
+// marked `SHARED`, counted atomically from then on, by every thread that
+// holds it, and freed by the one that lets it go last.  The walk stops
+// at what is shared already or immortal -- what a shared object holds
+// is shared or immortal -- so a value shared again is walked only where
+// it is new.  `v` not consumed, nothing copied: another thread holds it
+// by one more count (`heff_dup`).  What of `v` is mortal is this
+// thread's: no other changes it meanwhile)
+static V heff_share(V v) {
+  if (!IS_OBJ(v) || !v || (heff_rc(OBJ(v)) & (IMMORTAL | SHARED))) return v;
+  HeffStack s = {0};
+  heff_share_one(&s, &v);
+  while (s.n) {
+    V o = s.v[--s.n];
+    HEFF_EACH_SLOT(o, heff_share_one, &s);
   }
-  free(m.from); free(m.to); free(m.todo.v);
+  free(s.v);
   return v;
 }
+#else
+// (one thread: nothing is shared, nothing to do)
+static inline V heff_share(V v) { return v; }
+#endif
 
 // Calls of what is not known
 // ---------------------------------------------------------------------
@@ -1200,19 +1243,35 @@ static inline V heff_tail(V f, int n, V *a) {
 }
 
 #ifdef HEFF_THREADS
-// (an immortal thunk forced, threads at once: its memo shared by them
-// all, so its value made immortal too, and kept by the first to have it
-// -- another computing it meanwhile, the language pure, has the same
-// value, and lets its own go, leaking it)
+// (a thunk forced, threads at once: a shared or immortal one, whose
+// memo other threads may read and write meanwhile.  Its value is shared
+// (`heff_share`) and then put in the memo, by the first to have it;
+// another computing it meanwhile, the language pure, has the same
+// value, takes the memo's and lets its own go, freed.  A static thunk is
+// immortal, its memo kept for good: the first freezes the value once it
+// is there (`heff_freeze`), so that no thread counts it, atomically or
+// at all -- a thread that counted it up before then counts it down
+// after as nothing, the memo holding it.  A shared thunk's value is
+// counted as any shared object is, freed when the thunk and all that
+// hold it let it go)
 static __attribute__((noinline)) V heff_force_shared(V f, V *a) {
   Clo *c = (Clo *)f;
   V m = __atomic_load_n(&c->memo, __ATOMIC_ACQUIRE);
-  if (m) return m;
-  V r = heff_tr(c->fn(f, a));
-  heff_freeze(r);
-  V none = 0;
-  if (__atomic_compare_exchange_n(&c->memo, &none, r, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return r;
-  return none;
+  if (!m) {
+    heff_dup(f);
+    V r = heff_share(heff_tr(c->fn(f, a)));
+    heff_dup(r);
+    if (__atomic_compare_exchange_n(&c->memo, &m, r, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      if (heff_rc(&c->h) & IMMORTAL) heff_freeze(r);
+      heff_drop(f);
+      return r;
+    }
+    heff_drop(r);
+    heff_drop(r);
+  }
+  heff_dup(m);
+  heff_drop(f);
+  return m;
 }
 #endif
 
@@ -1246,7 +1305,7 @@ static V heff_apply(V f, int n, V *a) {
     // value every time -- as the JavaScript backend's `$force` keeps it)
     if (n == 1 && c->arity == 1 && a[0] == NTAG(TAG_MkUnit)) {
 #ifdef HEFF_THREADS
-      if (c->h.rc & IMMORTAL) return heff_force_shared(f, a);
+      if (heff_rc(&c->h) & (IMMORTAL | SHARED)) return heff_force_shared(f, a);
 #endif
       if (c->memo) {
         V r = heff_dup(c->memo);
@@ -1836,7 +1895,7 @@ static V heff_big_lit(const char *s) {
 }
 #ifdef HEFF_THREADS
 // (threads at once: made by the first to have it, kept; another making
-// it meanwhile lets its own go, leaking it)
+// it meanwhile lets its own go, freed -- no other has seen it)
 #define HEFF_BIG(s) ({                                                      \
   static V heff_lit_;                                                       \
   V l_ = __atomic_load_n(&heff_lit_, __ATOMIC_ACQUIRE);                     \
@@ -1844,8 +1903,10 @@ static V heff_big_lit(const char *s) {
     V none_ = 0;                                                            \
     l_ = heff_big_lit(s);                                                   \
     if (!__atomic_compare_exchange_n(&heff_lit_, &none_, l_, 0,             \
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))   \
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { \
+      if (IS_OBJ(l_)) heff_obj_free((void *)l_, heff_size(l_));             \
       l_ = none_;                                                           \
+    }                                                                       \
   }                                                                         \
   l_; })
 #else
@@ -1982,7 +2043,7 @@ static V heff_str_valid(const void *c, int64_t n) {
 static V heff_buf_append(V a, V b, uint16_t kind) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len + y->len;
-  if (x->h.rc == 1) {
+  if (heff_rc(&x->h) == 1) {
     if (n > x->cap) {
       int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
       size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
@@ -2806,14 +2867,15 @@ static __attribute__((noinline, cold)) void heff_arr_out(void) { heff_abandon();
 #define heff_arr_in(r, i) (IS_INT(i) && (uint64_t)INT_OF(i) < (uint64_t)(r)->n)
 
 // (whether the array is held only here and keeps its elements as `kind`
-// says: its header, one word, all of it looked at at once)
+// says: its header, one word, all of it looked at at once -- but in
+// threads, where its count is read atomically, `heff_rc`)
 static inline int heff_arr_mine(Arr *r, unsigned kind) {
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && !defined(HEFF_THREADS)
   uint64_t h;
   memcpy(&h, &r->h, sizeof h);
   return h == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48);
 #else
-  return r->h.rc == 1 && r->h.tag == kind;
+  return heff_rc(&r->h) == 1 && r->h.tag == kind;
 #endif
 }
 
@@ -2996,7 +3058,13 @@ static V heff_arrayReplicate(V n, V x) {
     return (V)r;
   }
   for (int64_t k = 0; k < m; k++) r->a[k] = x;
-  if (IS_OBJ(x) && !(OBJ(x)->rc & IMMORTAL)) OBJ(x)->rc += (uint32_t)(m - 1);
+  if (IS_OBJ(x)) {
+    uint32_t rc = heff_rc(OBJ(x));
+    if (!(rc & (IMMORTAL | SHARED))) OBJ(x)->rc = rc + (uint32_t)(m - 1);
+#ifdef HEFF_THREADS
+    else if (!(rc & IMMORTAL)) __atomic_fetch_add(&OBJ(x)->rc, (uint32_t)(m - 1), __ATOMIC_RELAXED);
+#endif
+  }
   return (V)r;
 }
 
@@ -3101,7 +3169,7 @@ static V heff_arrayAppend(V a, V b) {
 // ---------------------------------------------------------------------
 
 // (`Bytes` (lib/bytes.hf), never changed once made: a string's `Str`, of
-// the kind `K_BYT` -- dropped, copied for a thread and grown by an append
+// the kind `K_BYT` -- dropped, shared with a thread and grown by an append
 // as a string is, and shown as a binary, `b[...]`.  Their length, slice and
 // equality are a string's; a byte is a `UInt8`, a word of its value)
 static Str *heff_bytes_new(int64_t len) {
@@ -3294,7 +3362,7 @@ static V heff_bytesHasAt(V a, V o, V b) {
 // string's `Str`, of the kind `K_BIT`, its `len` bytes holding its bits
 // the first the most significant of the first byte; `h.tag` says how
 // many bits of the last byte are none of them, each 0 -- so that two of
-// the same bits are the same bytes.  Dropped and copied for a thread as
+// the same bits are the same bytes.  Dropped and shared with a thread as
 // a string is, and shown as a binary, `b[...]`)
 #define HEFF_BITS_LEN(x) ((x)->len * 8 - (int64_t)(x)->h.tag)
 
@@ -3377,7 +3445,7 @@ static V heff_bitsSlice(V a, V o, V n) {
 // abandoned): the same buffer where it is the last reference)
 static V heff_bitsOfBytes(V a) {
   Str *x = (Str *)a;
-  if (x->h.rc == 1) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
+  if (heff_rc(&x->h) == 1) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
   Str *s = heff_bits_new(x->len * 8);
   if (x->len) memcpy(s->s, x->s, (size_t)x->len);
   heff_drop(a);
@@ -3387,7 +3455,7 @@ static V heff_bitsOfBytes(V a) {
 static V heff_bitsBytes(V a) {
   Str *x = (Str *)a;
   if (x->h.tag) return heff_abandon();
-  if (x->h.rc == 1) { x->h.kind = K_BYT; return a; }
+  if (heff_rc(&x->h) == 1) { x->h.kind = K_BYT; return a; }
   Str *s = heff_bytes_new(x->len);
   if (x->len) memcpy(s->s, x->s, (size_t)x->len);
   heff_drop(a);
@@ -3676,7 +3744,7 @@ static void heff_release(int64_t i) {
 }
 
 // Threads a provider starts (#36; docs/threads.md): each runs what it
-// is given -- a copy of it, `heff_copy_for_thread` -- by `heff_try`, so
+// is given -- shared, `heff_share` -- by `heff_try`, so
 // that a failure there is the thread's to hand back, not the end of the
 // process; and ends by `heff_thread_end`.
 // ---------------------------------------------------------------------

@@ -32,10 +32,10 @@ program = do
   tasks` each `Unit -> a` of a list run.  What a task takes and gives
   may be of any type -- a string, a list, a record -- and one `threads`
   in the world serves them all: an operation keeps its types to itself.
-  One thread, or one value, runs in the caller, nothing copied.
+  One thread, or one value, runs in the caller, nothing shared.
 - `cores`: how many threads the machine runs at once.
-- `spread n`: the rest of the program given to each of `n` threads, a
-  copy each, its index its answer; `gather v`: in thread 0, every
+- `spread n`: the rest of the program given to each of `n` threads,
+  shared by them, its index its answer; `gather v`: in thread 0, every
   thread's `v`, in order, every other thread ending there.  Spreads
   nest: a gather joins its own spread's threads.
 - `inThreads a b e`: `Parallel` handled into `Co e`, each side a thread (a
@@ -55,15 +55,19 @@ and a program with `threads` in its world is compiled for C
 
 ### What it costs
 
-- `f` is copied once for each thread, and each value once, for the
-  thread that takes it; an answer is handed back as it is, not copied.
-  A task of `parAll` is copied whole, and what it holds with it: tasks
-  that each hold the same large value copy it each, where `parMap` of
-  a function holding it copies it once a thread.  A definition is not
-  copied at all (below): a large table every task reads is best one.
-- A spread copies the rest of the program for each thread, all it
-  holds: what was made before the spread, and is used after it, is
-  copied, as a process's memory is when it forks.
+- Nothing is copied.  `f` and each value are shared (below): walked
+  once, each object of them marked, and then held by each thread that
+  takes them by one more count.  An answer is handed back as it is.
+  A large value every task reads -- held by `f`, or by each task of
+  `parAll` -- is in memory once, however many threads read it.
+- A spread shares the rest of the program with each thread: what was
+  made before the spread, and is used after it, is held by them all,
+  not copied.
+- What is shared is counted atomically by every thread that holds it,
+  thread 0 too, from then on, and is never updated in place: an update
+  of it copies it, as one counted twice is copied in one thread.  A
+  task that builds on what it was given builds its own, and that is
+  counted as before.
 
 ## Turning it on
 
@@ -81,9 +85,26 @@ as fast as before: nothing below is in it.
 
 ## What the runtime does
 
-Counts are not atomic.  So a mortal object is only ever one thread's,
-counted by it alone, and what is shared is immortal, counted by none.
+An object is one of three (#66).  A thread's own: counted by it alone,
+not atomically -- whatever a thread makes is its own.  Shared
+(`SHARED`, a bit of its count beside `IMMORTAL`): counted atomically by
+every thread that holds it, and freed by the one that lets it go last.
+Or immortal: counted by none, never freed.  What a shared or an
+immortal object holds is shared or immortal; a thread's own object may
+hold a shared one, not the other way.
 
+- **`heff_dup` and `heff_drop`** test `rc & (IMMORTAL | SHARED)` where
+  one thread tests `rc & IMMORTAL`: the same branch, another constant.
+  Under it, out of line: immortal, nothing; shared, `__atomic_fetch_add`
+  or `__atomic_fetch_sub` on the count, the one that takes it to 0
+  freeing it.  So is every other place that counts an object down (a
+  match giving up its scrutinee, a field taken from a record, the
+  frees' walk).  A count is read atomically too, relaxed -- a plain
+  load, to the processor.  Without `HEFF_THREADS`, `SHARED` is 0 and
+  the program is what it was.
+- **Reuse:** an object is updated in place where its count is 1
+  (`heff_unique`), which a shared one's never is: a shared object is
+  copied where it is updated.
 - **Per-run state is per thread** (`HEFF_TLS`, `_Thread_local` in
   threads mode, nothing otherwise): the free lists, the stack of what is
   given back, the count of calls before a bounce, the room for a jump's
@@ -95,34 +116,42 @@ counted by it alone, and what is shared is immortal, counted by none.
   asking for what it is itself computing is told it is defined by
   itself.  Definitions are in order, none using one after it, so a
   thread waits only for one before the one it computes: no deadlock.
-- **A static thunk's value** (an immortal closure of one parameter,
-  forced by `MkUnit`, whose `memo` all threads share) is made immortal
-  too, and kept by the first thread to have it (`heff_force_shared`);
-  another computing it meanwhile has the same value and lets its own
-  go.  A big integer written in the program likewise.
+- **A shared or immortal thunk forced** (`heff_force_shared`, a closure
+  of one parameter forced by `MkUnit`, whose `memo` other threads may
+  read and write): its value is shared, then put in the `memo` by a
+  compare-and-swap; a thread that computed it meanwhile and lost takes
+  the `memo`'s and drops its own, which is freed.  A shared thunk's
+  value is counted as any shared object is.  A static thunk is
+  immortal, its `memo` holds the value for good, so the first freezes
+  it once it is there: shared to publish, frozen once published, no
+  thread counting it after.  A big integer written in the program is
+  made once likewise, another thread's made meanwhile freed.
 - **The world's table** of handles (`heff_hold`, `heff_held`,
-  `heff_release`) is locked, and so are `std.reference`'s cells, whose values
-  go in and out as copies.
+  `heff_release`) is locked, and so are `std.reference`'s cells: a cell
+  holds a shared value, a read is one more count of it, a write shares
+  the new value and swaps it in under the lock.
 
-Why a definition's value is computed once and frozen, not computed by
-each thread for itself: the language says a definition is one value;
-it is computed once, not once per thread (a big table, or one that takes
-long); it is in memory once; and frozen, no thread counts it, where a
-value shared and counted would be counted by two threads at once.  What
-it costs: the value is walked once, when it is made, and is never freed
--- as a definition's value never was.
+Why a definition's value is computed once and frozen, not shared and
+counted: the language says a definition is one value; it is computed
+once, not once per thread (a big table, or one that takes long); it is
+in memory once; and frozen, no thread counts it at all, where a shared
+value is counted atomically each time it is used.  What it costs: the
+value is walked once, when it is made, and is never freed -- as a
+definition's value never was.
 
 ## What a provider does
 
 `lib/std/thread.provider.c` is a provider that runs heff in threads;
-another may do the same.  What a provider hands another thread, it copies, and it runs it there
-under a catch:
+another may do the same.  What a provider hands another thread, it
+shares, and it runs it there under a catch:
 
-- `V heff_copy_for_thread(V v)` -- a copy of `v` for another thread, `v`
-  not consumed: what is immortal is shared, every other object is made
-  again, and what `v` shares the copy shares.  The provider no longer
-  knows how objects are laid out.  To copy two values that share
-  objects, copy them as one (a pair, say), so the copy shares them too.
+- `V heff_share(V v)` -- `v` shared, and given back, not consumed: each
+  of its objects marked `SHARED`, the walk stopping at what is shared
+  already or immortal.  Then each thread it is handed to holds it by
+  one more count (`heff_dup`), and lets it go by `heff_drop`.  Handing
+  one value to n threads walks it once; shared again, only what is new
+  since is walked.  `v` is this thread's: no other changes it
+  meanwhile.
 - `const char *heff_try(V f, V x, V *out)` -- `f x`, its failure
   caught: `NULL` and the value at `*out`, or why it failed
   (`"heff:abandon"` where it abandoned).  Copy the reason before the
@@ -134,22 +163,22 @@ under a catch:
 - `heff_thread_start(&t, run, arg)` -- a pthread with a large stack
   (`HEFF_THREAD_STACK`, 256 MB reserved): heff's recursion is the C
   stack's.
-- `heff_freeze(v)` -- `v` made immortal, to share without copying, for
-  good: it is never freed.
+- `heff_freeze(v)` -- `v` made immortal, for good: it is never freed,
+  and no thread counts it.
 - `HEFF_TLS` -- for a provider's own per-thread state (the spreads a
   thread has open, say).
 
 What a thread gives back (its answer) is its own; once the thread is
 joined it is the joiner's, and nothing more is needed: no other thread
-holds it.
+holds what of it is not shared.
 
 ## What is safe, and what is not
 
 Safe, in threads at once: pure code, all of it -- a task, a side of a
 `Parallel`, a spread's thread -- and the definitions it reads; `std.io`
 (a write is one `fwrite`, whole: C locks the stream); `std.reference`'s
-cells (locked, a value going in and out a copy); the world's table of
-handles (locked).  A task of a pool is pure: it has no effects to run.
+cells (locked, a value in them shared); the world's table of handles
+(locked).  A task of a pool is pure: it has no effects to run.
 
 Not safe, or not as one thread would do:
 
@@ -164,12 +193,17 @@ Not safe, or not as one thread would do:
 - A thread that ends without `heff_thread_end` (by `pthread_exit`, say)
   leaks its free lists.  An object made by one thread and given back by
   another goes to the second's free lists, so where one thread makes
-  and another drops, the second's lists grow.
+  and another drops -- a shared value, its last holder another thread
+  -- the second's lists grow.  Threads mode keeps no pages: each object
+  is the system's, on a list of its size.
 - A frozen value is never freed: a definition's, a static thunk's, and
-  what the computing thread held of it besides.
-- A copy is as big as what it copies, and takes as long: a large value
-  handed to many threads is copied for each (or frozen once, and kept).
-  `std.reference` copies a value each time it is read or written.
+  what of it was shared besides, though another thread held it too.
+- A shared value is counted atomically each time it is used, by every
+  thread, its maker too: a value read much after it is handed over
+  costs more to read than one never shared.  A shared value updated is
+  copied, never updated in place.
+- A count is 30 bits in threads mode (31 otherwise): an object held
+  more than a billion times at once is not counted right.
 - Other providers' tables are their own to lock.  The library's:
   `std.reference` and the world's table are locked; `std.progress` locks its
   own; `std.io`, `std.filesystem`, `std.http`, `std.net`, `std.time`
@@ -200,13 +234,28 @@ program built for threads or not.
 
 On a 14-core Apple M-series machine, `test/node/threads.hf`'s
 `cpu WORK N W` (threads mode, `zig cc -O2`) against the same work in a
-program not built for threads:
+program not built for threads (W = 8 and 14 as measured before #66,
+the rest after it, the machine busy with other builds; sharing moved
+none of them):
 
 | work | one thread | W=1 | W=2 | W=4 | W=8 | W=14 |
 |---|---|---|---|---|---|---|
-| primes below 5,000,000 | 989 ms | 1032 ms | 503 ms | 250 ms | 133 ms | 103 ms (9.6x) |
-| queens 12 | 199 ms | 215 ms | 117 ms | 68 ms | 41 ms | 30 ms (6.6x) |
-| fib 38 | 128 ms | 126 ms | 66 ms | 37 ms | 20 ms | 15 ms (8.5x) |
+| primes below 5,000,000 | 997 ms | 933 ms | 470 ms | 243 ms | 133 ms | 103 ms (9.6x) |
+| queens 12 | 204 ms | 200 ms | 105 ms | 57 ms | 41 ms | 30 ms (6.6x) |
+| fib 38 | 126 ms | 120 ms | 62 ms | 35 ms | 20 ms | 15 ms (8.5x) |
+
+One large value handed to W threads, each reading it all (`parFor W W`
+of a function holding it), copied for each thread before #66 and
+shared since -- the time of the whole program, and its peak memory:
+
+| value | W=1 | W=2, copied | W=2, shared | W=4, copied | W=4, shared |
+|---|---|---|---|---|---|
+| a list of 10^6 integers | 12 ms, 33 MB | 57 ms, 127 MB | 17 ms, 33 MB | 140 ms, 193 MB | 17 ms, 33 MB |
+| 200,000 records of two strings | 25 ms, 37 MB | 63 ms, 134 MB | 29 ms, 37 MB | 137 ms, 201 MB | 29 ms, 37 MB |
+
+A `std.reference` cell holding a list of 1000, read and written back
+100,000 times in threads mode: 4.0 s copied each way, 100 ms shared (95
+ms in a program not built for threads).
 
 ## Testing
 

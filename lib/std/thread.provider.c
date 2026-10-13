@@ -3,19 +3,20 @@
 // heff in threads truly at once -- so it says so, and the runtime is
 // built for threads (docs/threads.md):
 #define HEFF_THREADS 1
-// What a thread is given is a copy (`heff_copy_for_thread`), which it
-// runs by `heff_try`, ending by `heff_thread_end`; what a thread gives
-// back is its own, no other's, and after the join its parent's.  A
+// What a thread is given is shared (`heff_share`, #66), held by it and
+// whoever else holds it, counted by them atomically, never copied; it
+// runs it by `heff_try`, ending by `heff_thread_end`.  What a thread
+// gives back is its own, no other's, and after the join its parent's.  A
 // failure in a thread is handed back, and is its parent's when it joins
 // it (`heff_fail_again`).
 //
 // `Pool n work`: the work's `f` of each of its `xs`, by n threads, each
-// taking the next as it ends one, thread 0 the caller; `f` copied for
-// each thread, each value for the thread that takes it.  `Spread n`
-// starts n-1 threads, each with a copy of the rest of the program, its
-// index its answer; `Gather`, in one of them, leaves its value and ends
-// it, and in thread 0 joins them all and goes on with every one's
-// value.  The spreads open are a stack, each thread's own (`th_top`), so
+// taking the next as it ends one, thread 0 the caller; `f` shared by
+// every thread, each value by the caller and the thread that takes it.
+// `Spread n` starts n-1 threads, each holding the rest of the program,
+// shared, its index its answer; `Gather`, in one of them, leaves its
+// value and ends it, and in thread 0 joins them all and goes on with
+// every one's value.  The spreads open are a stack, each thread's own (`th_top`), so
 // that a spread inside a spread joins its own first.
 //
 // A `Work` and a `Joined` are each a function given what to do with
@@ -91,8 +92,8 @@ static void *th_spread_thread(void *u) {
   return NULL;
 }
 
-// (n-1 threads, each with a copy of `f` and `k`, the continuation: the
-// two copied at once, so that what they share they share in the copy)
+// (n-1 threads, each holding `f` and `k`, the continuation, shared:
+// walked once, each thread then counting them, this one too)
 static void th_spread(int n, V f, V k) {
   if (n < 1) n = 1;
   ThSpread *sp = heff_alloc(sizeof(ThSpread));
@@ -103,16 +104,13 @@ static void th_spread(int n, V f, V k) {
   ThOpen *o = heff_alloc(sizeof(ThOpen));
   o->sp = sp; o->self = 0; o->up = th_top;
   th_top = o;
-  V both[2] = { heff_dup(f), heff_dup(k) };
-  V pair = heff_tag_n(TAG_MkPair, 2, both);
+  heff_share(f);
+  heff_share(k);
   for (int i = 1; i < n; i++) {
-    V c = heff_copy_for_thread(pair);
     ThStart *s = heff_alloc(sizeof(ThStart));
-    s->f = heff_dup(heff_field(c, 0)); s->k = heff_dup(heff_field(c, 1)); s->i = i; s->sp = sp;
-    heff_drop(c);
+    s->f = heff_dup(f); s->k = heff_dup(k); s->i = i; s->sp = sp;
     if (heff_thread_start(&sp->tid[i], th_spread_thread, s) != 0) heff_fail("threads: cannot start a thread");
   }
-  heff_drop(pair);
 }
 
 // (`x` gathered: every thread's, in thread 0; another thread ends here)
@@ -140,7 +138,7 @@ static V th_gather(V x) {
 
 typedef struct {
   V *fs;        // each thread's f
-  V *xs;        // each task's value, a copy for whoever takes it
+  V *xs;        // each task's value, shared, for whoever takes it
   V *got;       // each task's answer
   int64_t n;
   _Atomic int64_t next;
@@ -175,8 +173,9 @@ static void *th_work_thread(void *u) {
 }
 
 // (`f` of each of the list `l`, by `w` threads -- the caller one of them:
-// the answers, in order, as a list; `f` and `l` consumed.  One thread,
-// or one value, is the caller alone, nothing copied)
+// the answers, in order, as a list; `f` and `l` consumed, `f` and each
+// value shared.  One thread, or one value, is the caller alone, nothing
+// shared)
 static V th_pool(int64_t w, V f, V l) {
   int64_t n = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) n++;
@@ -198,14 +197,12 @@ static V th_pool(int64_t w, V f, V l) {
   int64_t i = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     // (an element of a list of anything: one kept flat (#64) boxed)
-    V x = heff_tget_v(c, 0);
-    j.xs[i++] = heff_copy_for_thread(x);
-    heff_drop(x);
+    j.xs[i++] = heff_share(heff_tget_v(c, 0));
   }
   heff_drop(l);
   j.fs = heff_alloc(sizeof(V) * (size_t)w);
-  j.fs[0] = f;
-  for (i = 1; i < w; i++) j.fs[i] = heff_copy_for_thread(f);
+  j.fs[0] = heff_share(f);
+  for (i = 1; i < w; i++) j.fs[i] = heff_dup(f);
   j.got = calloc((size_t)n, sizeof(V));
   atomic_init(&j.next, 0);
   j.failed = heff_alloc(sizeof(int64_t) * (size_t)w);
