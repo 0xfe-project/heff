@@ -155,7 +155,10 @@ withLbls ls (MkPair ts ls2) = MkPair ts (List.append ls ls2)
 withTags : List String
          -> Pair (List String) (List String)
          -> Pair (List String) (List String)
-withTags ts (MkPair ts2 ls) = MkPair (List.append ts ts2) ls
+withTags ts (MkPair ts2 ls) =
+  MkPair
+    (List.append (List.filter (\t -> not (IR.isTupleTag t)) ts) ts2)
+    ls
 
 tagsLbls : IR.Expr -> Pair (List String) (List String)
 tagsLbls (ELam _ b) = tagsLbls b
@@ -430,12 +433,35 @@ addLam proto def = \s ->
 --------------------------------------------------------------------------------
 
 -- | the printer's judgments, knotted: an expression, statements; and
--- | the C type of each variable (heff.compile.repr's)
+-- | the C type of each variable (heff.compile.repr's); the workers that
+-- | give back a tuple, each by how many values (heff.compile.cpr), and
+-- | how many the code printed gives back (0: a `V` or a number); the
+-- | printer of a lambda's body in it
 type CK =
   { exp : RefCount.Value -> C String
   , stmts : List RefCount.Statement -> C (List String)
   , ctype : String -> String
+  , tuples : Map.Map String Int
+  , ret : Int
+  , inLam : Unit -> CK
   }
+
+-- Tuples (#80): what a worker of heff.compile.cpr gives back, a struct of
+-- words (lib/c/runtime.c's `HeffT2` and the others), each a `V` or a
+-- number's bits as a flat field's (#39), as the tuple's tag says
+--------------------------------------------------------------------------------
+
+-- | the C type of a tuple of `n` values
+tupleType : Int -> String
+tupleType n = "HeffT" ^ show n
+
+-- (how many values a known call of `g` gives back, if a tuple)
+tupleOfCall : Map.Map String Int -> String -> Int
+tupleOfCall tu g = fromMaybe 0 (Map.lookup compareString g tu)
+
+-- (how a tuple's place `i` is kept, of how each is)
+tupleKind : List Repr.Repr -> Int -> Repr.Repr
+tupleKind kinds i = fromMaybe RepV (List.head (List.drop i kinds))
 
 -- Unboxed numbers (#39): each fixed-width type its C type, `Float64` a
 -- `double`, by a suffix in the runtime's names (`heff_box_i64`)
@@ -707,12 +733,12 @@ callHead g tr w =
 -- order, since a lent one computed first would run before the operands
 -- left of it, which may still want what it consumes; the lent dropped
 -- after)
-callBound : String -> Bool -> Maybe Repr.Repr -> List Bound -> String
-callBound g tr w bs =
+callBound : String -> String -> Bool -> Maybe Repr.Repr -> List Bound -> String
+callBound ty g tr w bs =
   "({ "
   ^ joinWith " " (List.concatMap (\(b : Bound) -> b.pre) bs)
   ^ " "
-  ^ cType (givenOf w)
+  ^ ty
   ^ " r_ = "
   ^ callHead g tr w
   ^ joinWith ", " (List.map (\(b : Bound) -> b.arg) bs)
@@ -734,7 +760,14 @@ callLent k g tr w args = do
          (\a i -> MkPair a i)
          args
          (List.range 0 (List.length args - 1)))
-  pure (callBound g tr w bs)
+  pure
+      (callBound
+         (if tupleOfCall k.tuples g > 0 then tupleType (tupleOfCall k.tuples g)
+          else cType (givenOf w))
+         g
+         tr
+         w
+         bs)
 
 -- | a call of `g` (its worker, if `w`), through any bounces if `tr`
 callC : CK
@@ -801,7 +834,7 @@ lamC : CK
      -> C String
 lamC k xs fv held body = do
   name <- newLam
-  ls <- k.stmts body
+  ls <- (k.inLam MkUnit).stmts body
   u <-
     addLam
       (lamProto name (List.length xs) fv)
@@ -998,13 +1031,19 @@ expF k (RNTag t) = pure ("NTAG(" ^ tagName t ^ ")")
 expF k (RTag t flat es) = do
   vs <- traverseC k.exp es
   pure
-      ((if flat == 0 then "heff_tag_n(" else "heff_tag_nf(")
-       ^ tagName t
-       ^ ", "
-       ^ show (List.length es)
-       ^ (if flat == 0 then ", " else ", " ^ show flat ^ "u, ")
-       ^ argsArr vs
-       ^ ")")
+      (if IR.isTupleTag t
+         then "(("
+           ^ tupleType (List.length es)
+           ^ "){{"
+           ^ joinWith ", " vs
+           ^ "}})"
+       else (if flat == 0 then "heff_tag_n(" else "heff_tag_nf(")
+         ^ tagName t
+         ^ ", "
+         ^ show (List.length es)
+         ^ (if flat == 0 then ", " else ", " ^ show flat ^ "u, ")
+         ^ argsArr vs
+         ^ ")")
 expF k (RTagIn ru t flat es) = do
   vs <- traverseC k.exp (Cons ru es)
   pure
@@ -1258,9 +1297,90 @@ armF k sv (MkCArm t fields flats sure plain take body leaves) = do
                   (if leaves then Cons "  break;" Nil else Nil)
                   (Cons "}" Nil)))))
 
-nomatchLine : Bool -> String -> String
-nomatchLine True sv = "default: return heff_nomatch(" ^ sv ^ ");"
-nomatchLine False sv = "default: heff_nomatch(" ^ sv ^ ");"
+-- (... in code that gives back a tuple, of `n` values: one of it, which
+-- is never given, `heff_nomatch` not coming back)
+nomatchLine : Int -> Bool -> String -> String
+nomatchLine n True sv =
+  if n > 0
+    then "default: return ((" ^ tupleType n ^ "){{heff_nomatch(" ^ sv ^ ")}});"
+  else "default: return heff_nomatch(" ^ sv ^ ");"
+nomatchLine n False sv = "default: heff_nomatch(" ^ sv ^ ");"
+
+-- (a value of a tuple's place, kept as `k`, of its word `w`)
+wordAs : Repr.Repr -> String -> String
+wordAs RepF64 w = "heff_f64_of_word(" ^ w ^ ")"
+wordAs (RepFix w) x = "((" ^ fixedType w ^ ")" ^ x ^ ")"
+wordAs RepV w = w
+
+-- (a field of a tuple an arm wants, of a place kept as `kind`: as its
+-- variable is kept, `r` -- the number, or a `V` of it, boxed)
+tupleRead : CK
+          -> String
+          -> List Repr.Repr
+          -> Pair String (Pair Int Repr.Repr)
+          -> String
+tupleRead k sv kinds (MkPair v (MkPair i r)) =
+  "  "
+  ^ k.ctype v
+  ^ " "
+  ^ cLocal v
+  ^ " = "
+  ^ (if Repr.isBoxed r && not (Repr.isBoxed (tupleKind kinds i))
+       then "heff_box_"
+         ^ reprSuffix (tupleKind kinds i)
+         ^ "("
+         ^ wordAs (tupleKind kinds i) (sv ^ ".f[" ^ show i ^ "]")
+         ^ ")"
+     else wordAs (tupleKind kinds i) (sv ^ ".f[" ^ show i ^ "]"))
+  ^ ";"
+
+-- (the fields of a tuple the arm does not want, given up: its `V`s
+-- dropped)
+tupleTake : String -> List Repr.Repr -> RefCount.Take -> List String
+tupleTake sv kinds (TakeN _ mask n) =
+  List.map
+    (\i -> "heff_drop(" ^ sv ^ ".f[" ^ show i ^ "]);")
+    (List.filter
+       (\i -> not (RefCount.inMask mask i) && Repr.isBoxed (tupleKind kinds i))
+       (List.range 0 (n - 1)))
+tupleTake sv kinds t = Nil
+
+-- (a match on what a worker gave back: its one arm, the tuple's fields
+-- read, no tag looked at)
+tupleArm : CK -> String -> RefCount.CaseArm -> C (List String)
+tupleArm k sv (MkCArm t fields flats sure plain take body leaves) = do
+  ls <- k.stmts body
+  pure
+      (List.append
+         (Cons "{" Nil)
+         (List.append
+            (List.append
+               (List.map
+                  (\(p : Pair String Int) ->
+                     "  V "
+                     ^ cLocal (fst p)
+                     ^ " = "
+                     ^ (if plain then sv ^ ".f[" ^ show (snd p) ^ "]"
+                        else "heff_dup(" ^ sv ^ ".f[" ^ show (snd p) ^ "])")
+                     ^ ";")
+                  fields)
+               (List.map (tupleRead k sv (Repr.tupleReprs t)) flats))
+            (List.append
+               (indented
+                  (List.append (tupleTake sv (Repr.tupleReprs t) take) ls))
+               (Cons "}" Nil))))
+
+isTupleArm : List RefCount.CaseArm -> Bool
+isTupleArm (Cons (MkCArm t _ _ _ _ _ _ _) Nil) = IR.isTupleTag t
+isTupleArm arms = False
+
+-- (the C type of a variable bound: a tuple's, bound to a call of a
+-- worker giving one back)
+letType : CK -> String -> RefCount.Value -> String
+letType k x (RCall g _ _ _) =
+  if tupleOfCall k.tuples g > 0 then tupleType (tupleOfCall k.tuples g)
+  else k.ctype x
+letType k x e = k.ctype x
 
 -- (a statement of one line, of an expression)
 lineC : CK -> String -> String -> RefCount.Value -> C (List String)
@@ -1268,7 +1388,7 @@ lineC k pre post e = bind (k.exp e) (\v -> pure (Cons (pre ^ v ^ post) Nil))
 
 stmtF : CK -> RefCount.Statement -> C (List String)
 stmtF k (CDrop d) = pure (Cons (dropLine d) Nil)
-stmtF k (CLet x e) = lineC k (k.ctype x ^ " " ^ cLocal x ^ " = ") ";" e
+stmtF k (CLet x e) = lineC k (letType k x e ^ " " ^ cLocal x ^ " = ") ";" e
 stmtF k (CDecl x) = pure (Cons (k.ctype x ^ " " ^ cLocal x ^ ";") Nil)
 stmtF k (CSet x e) = lineC k (cLocal x ^ " = ") ";" e
 stmtF k CAbandon = pure (Cons "heff_abandon();" Nil)
@@ -1284,13 +1404,24 @@ stmtF k (CIf c yes no) = do
             (Cons "} else {" (List.append (indented ns) (Cons "}" Nil)))))
 stmtF k (CSwitch e arms returns) = do
   sv <- k.exp e
-  as <- traverseC (armF k sv) arms
+  as <-
+    traverseC
+      (\a -> if isTupleArm arms then tupleArm k sv a else armF k sv a)
+      arms
   pure
-      (List.append
-         (Cons ("switch (heff_tag_of(" ^ sv ^ ")) {") Nil)
-         (List.append
-            (List.concatMap (\x -> x) as)
-            (Cons (nomatchLine returns sv) (Cons "}" Nil))))
+      (if isTupleArm arms then List.concatMap (\x -> x) as
+       else List.append
+           (Cons ("switch (heff_tag_of(" ^ sv ^ ")) {") Nil)
+           (List.append
+              (List.concatMap (\x -> x) as)
+              (Cons (nomatchLine k.ret returns sv) (Cons "}" Nil))))
+stmtF k (CReturn RAbandon) =
+  pure
+    (Cons
+       (if k.ret > 0
+          then "return ((" ^ tupleType k.ret ^ "){{heff_abandon()}});"
+        else "return heff_abandon();")
+       Nil)
 stmtF k (CReturn e) = lineC k "return " ";" e
 stmtF k (CInPlace f es) =
   bind (traverseC k.exp (Cons f es)) (\vs -> pure (inPlace vs))
@@ -1321,13 +1452,21 @@ stmtsF : CK -> List RefCount.Statement -> C (List String)
 stmtsF k ss =
   bind (traverseC (stmtF k) ss) (\ls -> pure (List.concatMap (\x -> x) ls))
 
--- | the printer, of a definition whose variables are kept as `rs` says
-ckOf : Repr.Reprs -> CK
-ckOf rs =
-  { exp = \e -> expF (ckOf rs) e
-  , stmts = \ss -> stmtsF (ckOf rs) ss
+-- | the printer, of a definition whose variables are kept as `rs` says,
+-- | the workers giving back tuples `tu`, giving back `ret` values
+ckOf : Repr.Reprs -> Map.Map String Int -> Int -> CK
+ckOf rs tu ret =
+  { exp = \e -> expF (ckOf rs tu ret) e
+  , stmts = \ss -> stmtsF (ckOf rs tu ret) ss
   , ctype = \x -> cType (Repr.reprOf rs x)
+  , tuples = tu
+  , ret = ret
+  , inLam = \u -> ckOf rs tu 0
   }
+
+-- (... of a definition's parameters alone)
+paramsK : Repr.Reprs -> CK
+paramsK rs = ckOf rs Map.empty 0
 
 -- Definitions
 --------------------------------------------------------------------------------
@@ -1379,41 +1518,84 @@ hasWrapper (Just _) = True
 hasWrapper Nothing = False
 
 -- (a function's C function's head: the function's, or its worker's)
-funHead : String -> List String -> Repr.Reprs -> Repr.Repr -> Bool -> String
+funHead : String -> List String -> Repr.Reprs -> String -> Bool -> String
 funHead key xs rs ret w =
   "static "
-  ^ cType ret
+  ^ ret
   ^ " "
   ^ calleeName key w
   ^ "("
-  ^ paramList (ckOf rs) xs
+  ^ paramList (paramsK rs) xs
   ^ ")"
 
 -- (a function with a worker: its wrapper, of `V`s, a function of the
 -- function's own name -- what its closure's entry calls)
 wrapperProto : String -> Repr.Reprs -> Maybe RefCount.Wrapper -> List String
 wrapperProto key rs (Just (MkWrapper ws _)) =
-  Cons ("static V " ^ cGlobal key ^ "(" ^ paramList (ckOf rs) ws ^ ");") Nil
+  Cons ("static V " ^ cGlobal key ^ "(" ^ paramList (paramsK rs) ws ^ ");") Nil
 wrapperProto key rs Nothing = Nil
 
-wrapperCode : String -> Repr.Reprs -> Maybe RefCount.Wrapper -> C (List String)
-wrapperCode key rs (Just (MkWrapper ws body)) = do
-  ls <- (ckOf rs).stmts body
+wrapperCode : Map.Map String Int
+            -> String
+            -> Repr.Reprs
+            -> Maybe RefCount.Wrapper
+            -> C (List String)
+wrapperCode tu key rs (Just (MkWrapper ws body)) = do
+  ls <- (ckOf rs tu 0).stmts body
   pure
       (Cons
-         ("static V " ^ cGlobal key ^ "(" ^ paramList (ckOf rs) ws ^ ") {")
+         ("static V " ^ cGlobal key ^ "(" ^ paramList (paramsK rs) ws ^ ") {")
          (List.append (indented ls) (Cons "}" Nil)))
-wrapperCode key rs Nothing = pure Nil
+wrapperCode tu key rs Nothing = pure Nil
 
-funDef : RefCount.Fun -> C Emitted1
-funDef f = do
-  es <- (ckOf f.reprs).stmts f.entry
-  ls <- (ckOf f.reprs).stmts f.body
-  wl <- wrapperCode f.key f.reprs f.wrapper
+-- (a worker giving back a tuple of `n` values (heff.compile.cpr): only
+-- known calls call it, so it has no wrapper, entry or closure)
+tupleFunDef : Map.Map String Int -> Int -> RefCount.Fun -> C Emitted1
+tupleFunDef tu n f = do
+  es <- (ckOf f.reprs tu n).stmts f.entry
+  ls <- (ckOf f.reprs tu n).stmts f.body
   pure
       { protos =
           Cons
-            (funHead f.key f.params f.reprs f.ret (hasWrapper f.wrapper) ^ ";")
+            (funHead
+               f.key
+               f.params
+               f.reprs
+               (tupleType n)
+               (hasWrapper f.wrapper)
+             ^ ";")
+            Nil
+      , code =
+          List.append
+            (Cons
+               ""
+               (Cons
+                  (funHead
+                     f.key
+                     f.params
+                     f.reprs
+                     (tupleType n)
+                     (hasWrapper f.wrapper)
+                   ^ " {")
+                  (List.append (indented es) (Cons "top: ;" Nil))))
+            (List.append (indented ls) (Cons "}" Nil))
+      }
+
+funDef : Map.Map String Int -> RefCount.Fun -> C Emitted1
+funDef tu f = do
+  es <- (ckOf f.reprs tu 0).stmts f.entry
+  ls <- (ckOf f.reprs tu 0).stmts f.body
+  wl <- wrapperCode tu f.key f.reprs f.wrapper
+  pure
+      { protos =
+          Cons
+            (funHead
+               f.key
+               f.params
+               f.reprs
+               (cType f.ret)
+               (hasWrapper f.wrapper)
+             ^ ";")
             (List.append
                (wrapperProto f.key f.reprs f.wrapper)
                [ "static V " ^ cGlobal f.key ^ "_entry(V self, V *a);"
@@ -1430,7 +1612,12 @@ funDef f = do
             (Cons
                ""
                (Cons
-                  (funHead f.key f.params f.reprs f.ret (hasWrapper f.wrapper)
+                  (funHead
+                     f.key
+                     f.params
+                     f.reprs
+                     (cType f.ret)
+                     (hasWrapper f.wrapper)
                    ^ " {")
                   (List.append (indented es) (Cons "top: ;" Nil))))
             (List.append
@@ -1446,9 +1633,13 @@ funDef f = do
                      ])))
       }
 
-valDef : String -> List RefCount.Statement -> Repr.Reprs -> C Emitted1
-valDef key body rs = do
-  ls <- (ckOf rs).stmts body
+valDef : Map.Map String Int
+       -> String
+       -> List RefCount.Statement
+       -> Repr.Reprs
+       -> C Emitted1
+valDef tu key body rs = do
+  ls <- (ckOf rs tu 0).stmts body
   pure
       { protos = Cons ("static V " ^ cGlobal key ^ "_get(void);") Nil
       , code =
@@ -1478,9 +1669,11 @@ valDef key body rs = do
                ])
       }
 
-defC : RefCount.Def -> C Emitted1
-defC (DFun f) = funDef f
-defC (DVal key body rs) = valDef key body rs
+defC : Map.Map String Int -> RefCount.Def -> C Emitted1
+defC tu (DFun f) =
+  if tupleOfCall tu f.key > 0 then tupleFunDef tu (tupleOfCall tu f.key) f
+  else funDef tu f
+defC tu (DVal key body rs) = valDef tu key body rs
 
 -- The world's algebra
 --------------------------------------------------------------------------------
@@ -1592,7 +1785,7 @@ ownDef o = \s ->
 defOwn : CE -> IR.Def -> C Emitted1
 defOwn ce d = do
   u <- ownDef (cGlobal d.key)
-  defC (Lower.cDef ce.facts d (IR.freshen 0 d.body))
+  defC ce.facts.tuples (Lower.cDef ce.facts d (IR.freshen 0 d.body))
 
 defsC : CE -> List IR.Def -> C (List Emitted1)
 defsC ce defs = traverseC (defOwn ce) defs
@@ -1891,10 +2084,11 @@ unboxedCTypes =
   , "uint64_t"
   ]
 
--- (a worker's head: its C type, then its name)
+-- (a worker's head: its C type, then its name -- a tuple's too, #80)
 isWorkerLine : String -> Bool
 isWorkerLine l =
   List.any (\t -> startsWith ("static " ^ t ^ " g_") l) unboxedCTypes
+  || startsWith "static HeffT" l
 
 pubLine : String -> String
 pubLine l =
@@ -1958,6 +2152,44 @@ workerDecl k (Just sg) =
     Nil
 workerDecl k Nothing = Nil
 
+-- (a worker giving back a tuple of `t` values (#80), declared: its code
+-- alone, or its worker's)
+tupleDecl : String -> Int -> Maybe Repr.Sig -> Int -> List String
+tupleDecl k n (Just sg) t =
+  Cons
+    (tupleType t
+     ^ " "
+     ^ calleeName k True
+     ^ "("
+     ^ (if List.null sg.params then "void"
+        else joinWith ", " (List.map cType sg.params))
+     ^ ");")
+    Nil
+tupleDecl k n Nothing t =
+  Cons
+    (tupleType t
+     ^ " "
+     ^ cGlobal k
+     ^ "("
+     ^ (if n == 0 then "void" else joinWith ", " (List.replicate n "V"))
+     ^ ");")
+    Nil
+
+-- (a function of `n` parameters, declared: its code, its worker's,
+-- entry and closure)
+funDecl : CE -> String -> Int -> List String
+funDecl ce k n =
+  List.append
+    (workerDecl k (Repr.sigIn ce.facts.workers k))
+    [ "V "
+    ^ cGlobal k
+    ^ "("
+    ^ (if n == 0 then "void" else joinWith ", " (List.replicate n "V"))
+    ^ ");"
+    , "V " ^ cGlobal k ^ "_entry(V self, V *a);"
+    , "extern Clo " ^ cGlobal k ^ "_clo;"
+    ]
+
 -- (a definition, declared to a part that uses it: a function's code,
 -- its worker's, entry and closure, a value's getter -- by its arity and
 -- its worker's signature, not by its parameters' names, so that a part
@@ -1965,16 +2197,13 @@ workerDecl k Nothing = Nil
 declOf : CE -> String -> List String
 declOf ce k = case Map.lookup compareString k ce.facts.arity of
   Just n ->
-    List.append
-      (workerDecl k (Repr.sigIn ce.facts.workers k))
-      [ "V "
-      ^ cGlobal k
-      ^ "("
-      ^ (if n == 0 then "void" else joinWith ", " (List.replicate n "V"))
-      ^ ");"
-      , "V " ^ cGlobal k ^ "_entry(V self, V *a);"
-      , "extern Clo " ^ cGlobal k ^ "_clo;"
-      ]
+    if tupleOfCall ce.facts.tuples k > 0
+      then tupleDecl
+          k
+          n
+          (Repr.sigIn ce.facts.workers k)
+          (tupleOfCall ce.facts.tuples k)
+    else funDecl ce k n
   Nothing -> ["V " ^ cGlobal k ^ "_get(void);"]
 
 -- (what was made for each definition -- its strings, its lambdas --
@@ -2275,7 +2504,7 @@ globalH ce g rest =
                    (List.map show (Borrow.borOf ce.facts.lent g))))
              (Cons
                 (HS (maybe "" Repr.sigName (Repr.sigIn ce.facts.workers g)))
-                rest))))
+                (Cons (HN (tupleOfCall ce.facts.tuples g)) rest)))))
 
 -- (what is known of a tag: its fields that may be flat, #64, and those
 -- that are)
@@ -2441,7 +2670,10 @@ emitAt ce kept acc d own v = case keptAtVer
       acc
       d.key
       v
-      (defC (Lower.cDef ce.facts d own) (ownStart (cGlobal d.key)))
+      (defC
+         ce.facts.tuples
+         (Lower.cDef ce.facts d own)
+         (ownStart (cGlobal d.key)))
 
 emitWith : CE
          -> Map.Map String EmitKept

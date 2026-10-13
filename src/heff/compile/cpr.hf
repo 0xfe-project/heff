@@ -1,0 +1,854 @@
+-- Constructed results (#80, GHC's "constructed product result"): a
+-- function that gives back a tag or a record it builds where it ends --
+-- nbody's `pull`, `MkPair b rest`; a `Just x` -- is given a worker
+-- (`f$cpr`) that gives back the fields instead, unbuilt: a tuple
+-- (`Repr.tupleTag`), the tag's number first where it may give back more
+-- than one tag, then the fields, each in a place of its kind (a `V`, or a
+-- number's bits: `Repr.flatOf`), the places shared by the tags -- so a
+-- `Maybe Float64` is two words, an `Either Int64 Float64` three.  The
+-- function itself is its wrapper, which calls the worker and builds the
+-- tag of what it gives back: what a closure, or a call whose value goes
+-- on as it is, calls.
+--
+-- A call taking what it gives apart at once -- `case f x of MkPair a b
+-- -> ...`, or a binding of it only matched on, or only read fields of --
+-- calls the worker and is given the fields: no tag is built.  A match on
+-- it chooses its arm by the tuple's number.  heff.compile.emitc gives a
+-- tuple back as a struct of words, in registers; the JavaScript backend
+-- builds it as any tag.
+--
+-- A function has a worker only where every way out of it builds the tag
+-- (or the record) there, abandons, or calls last a function with a
+-- worker: what it gives back is seen by nothing before.  Such a call is a
+-- call last of the other's worker, so a call of itself is still the loop
+-- it was.  The functions calling one another last are given one layout,
+-- of at most `maxWords` words and `maxTags` tags, and only where some
+-- call takes what one of them gives apart (else the wrapper would only
+-- cost a call more).
+--
+-- This runs on what is lowered (heff.compile.lower), each call at its
+-- arity, for both backends, after heff.compile.trmc (a cell built to be
+-- filled is not given back).
+
+import heff.compile.ir as IR
+import heff.compile.repr as Repr
+import heff.elab.fixed as Fixed
+import map as Map
+
+-- | computations drawing fresh names
+type S a = Int -> Pair a Int
+
+bindTake : {a b : Type} -> (a -> S b) -> Pair a Int -> Pair b Int
+bindTake f (MkPair x n) = f x n
+
+-- `do` is this
+bind : {a b : Type} -> S a -> (a -> S b) -> S b
+bind m f = \n -> bindTake f (m n)
+
+pure : {a : Type} -> a -> S a
+pure x = \n -> MkPair x n
+
+traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
+traverseS f Nil = pure Nil
+traverseS f (Cons x xs) = do
+  y <- f x
+  ys <- traverseS f xs
+  pure (Cons y ys)
+
+freshS : String -> S String
+freshS base = \n -> IR.fresh base n
+
+sameLabels : List String -> List String -> Bool
+sameLabels Nil Nil = True
+sameLabels (Cons a as) (Cons b bs) = strEq a b && sameLabels as bs
+sameLabels _ _ = False
+
+isVar : String -> IR.Expr -> Bool
+isVar x (EVar y) = strEq x y
+isVar x _ = False
+
+-- | how many words a tuple may be
+maxWords : Int
+maxWords = 4
+
+-- | how many tags a function with a worker may give back
+maxTags : Int
+maxTags = 4
+
+-- | a function's worker
+workerKey : String -> String
+workerKey g = g ^ "$cpr"
+
+-- Ways out
+--------------------------------------------------------------------------------
+
+-- | a way out of a function: a tag built, of its fields' types; a
+-- | record built, of its labels and their types; a call last; anything
+-- | else (`abandon` is none)
+data Out
+  = OutTag String (List IR.FieldTy)
+  | OutRecord (List String) (List IR.FieldTy)
+  | OutCall String
+  | OutOther
+
+-- (each field's type, as many as there are fields)
+tysOf : List IR.Expr -> List IR.FieldTy -> List IR.FieldTy
+tysOf as ts =
+  List.map (\i -> Repr.tyIn i ts) (List.range 0 (List.length as - 1))
+
+-- (the ways out of the worklist, onto `acc`: through bindings and
+-- matches)
+outsW : List Out -> List IR.Expr -> List Out
+outsW acc Nil = acc
+outsW acc (Cons (ELet _ _ b) rest) = outsW acc (Cons b rest)
+outsW acc (Cons (EMatch _ arms) rest) = outsW acc (IR.pushArms arms rest)
+outsW acc (Cons (ETag t as ts) rest) =
+  outsW (Cons (OutTag t (tysOf as ts)) acc) rest
+outsW acc (Cons (ERecord fs ts) rest) =
+  outsW
+    (Cons (OutRecord (List.map fst fs) (tysOf (List.map snd fs) ts)) acc)
+    rest
+outsW acc (Cons (ECall g _) rest) = outsW (Cons (OutCall g) acc) rest
+outsW acc (Cons EAbandon rest) = outsW acc rest
+outsW acc (Cons _ rest) = outsW (Cons OutOther acc) rest
+
+isOther : Out -> Bool
+isOther OutOther = True
+isOther o = False
+
+calleeOf : Out -> List String
+calleeOf (OutCall g) = Cons g Nil
+calleeOf o = Nil
+
+-- (a function whose ways out are all tags, records and calls, by its
+-- key, with them)
+candWith : Map.Map String (List Out)
+         -> String
+         -> List Out
+         -> Map.Map String (List Out)
+candWith m k os =
+  if List.any isOther os then m else Map.insert compareString k os m
+
+candOne : Map.Map String (List Out) -> IR.Def -> Map.Map String (List Out)
+candOne m d@{ body = ELam _ b } = candWith m d.key (outsW Nil (Cons b Nil))
+candOne m d = m
+
+-- (those whose calls last are each of one of them)
+dropCalling : Map.Map String (List Out) -> Map.Map String (List Out)
+dropCalling m =
+  Map.fromList
+    compareString
+    (List.filter
+       (\p ->
+          List.all
+            (\g -> Map.member compareString g m)
+            (List.concatMap calleeOf (snd p)))
+       (Map.toList m))
+
+-- (... until none is dropped: `m2`, `m` with those dropped)
+keptGo : Map.Map String (List Out)
+       -> Map.Map String (List Out)
+       -> Map.Map String (List Out)
+keptGo m m2 =
+  if Map.size m2 == Map.size m then m else keptGo m2 (dropCalling m2)
+
+keptFrom : Map.Map String (List Out) -> Map.Map String (List Out)
+keptFrom m = keptGo m (dropCalling m)
+
+-- | the functions that may have a worker: those whose ways out are all
+-- | tags, records and calls of such functions
+candidates : List IR.Def -> Map.Map String (List Out)
+candidates defs = keptFrom (List.foldl candOne Map.empty defs)
+
+-- (the functions calling one another last, a class each: by
+-- `Repr.rootOf`)
+classesOf : Map.Map String (List Out) -> Map.Map String String
+classesOf m =
+  List.foldl
+    (\acc p ->
+       List.foldl
+         (\a g -> Repr.unite a (fst p) g)
+         acc
+         (List.concatMap calleeOf (snd p)))
+    Map.empty
+    (Map.toList m)
+
+-- What a class gives back
+--------------------------------------------------------------------------------
+
+-- | what the ways out of a class build: nothing yet; records of the
+-- | labels; tags, each with its fields' types; things of more than one
+-- | shape
+data Shape
+  = NoShape
+  | RecordShape (List String) (List IR.FieldTy)
+  | TagShape (Map.Map String (List IR.FieldTy))
+  | BadShape
+
+-- (two types of a field, one way out's and another's, as one: the same,
+-- else of any other type)
+mergeTy : IR.FieldTy -> IR.FieldTy -> IR.FieldTy
+mergeTy a b = if strEq (IR.fieldTyName a) (IR.fieldTyName b) then a else FtOther
+
+mergeTys : List IR.FieldTy -> List IR.FieldTy -> List IR.FieldTy
+mergeTys as bs = List.zipWith mergeTy as bs
+
+-- (a tag's fields' types, with those of it seen before)
+taggedWith : Map.Map String (List IR.FieldTy)
+           -> String
+           -> List IR.FieldTy
+           -> Maybe (List IR.FieldTy)
+           -> Shape
+taggedWith m t ts (Just ts0) =
+  if List.length ts0 == List.length ts
+    then TagShape (Map.insert compareString t (mergeTys ts0 ts) m)
+  else BadShape
+taggedWith m t ts Nothing = TagShape (Map.insert compareString t ts m)
+
+recordWith : List String
+           -> List IR.FieldTy
+           -> List String
+           -> List IR.FieldTy
+           -> Shape
+recordWith ls ts ls2 ts2 =
+  if sameLabels ls ls2 then RecordShape ls (mergeTys ts ts2) else BadShape
+
+addOut : Shape -> Out -> Shape
+addOut s (OutCall _) = s
+addOut NoShape (OutTag t ts) =
+  TagShape (Map.insert compareString t ts Map.empty)
+addOut NoShape (OutRecord ls ts) = RecordShape ls ts
+addOut (TagShape m) (OutTag t ts) =
+  taggedWith m t ts (Map.lookup compareString t m)
+addOut (RecordShape ls ts) (OutRecord ls2 ts2) = recordWith ls ts ls2 ts2
+addOut s o = BadShape
+
+shapeAt : Map.Map String Shape -> String -> List Out -> Map.Map String Shape
+shapeAt acc root os =
+  Map.insert
+    compareString
+    root
+    (List.foldl
+       addOut
+       (fromMaybe NoShape (Map.lookup compareString root acc))
+       os)
+    acc
+
+-- | what each class's ways out build, by its root
+shapesOf : Map.Map String String
+         -> Map.Map String (List Out)
+         -> Map.Map String Shape
+shapesOf parent m =
+  List.foldl
+    (\acc p -> shapeAt acc (Repr.rootOf parent (fst p)) (snd p))
+    Map.empty
+    (Map.toList m)
+
+-- Layouts
+--------------------------------------------------------------------------------
+
+-- | a tag a tuple may hold the fields of: its name (a record's: ""), its
+-- | number, its fields' types, and each field's place among the
+-- | tuple's (after its number)
+type Con =
+  { tag : String, index : Int, tys : List IR.FieldTy, places : List Int }
+
+-- | how a worker gives back what its function built: the tuple's tag (a
+-- | tuple of these is one kind of value); whether its first value is the
+-- | tag's number; how each place after it is kept; whether it is of a
+-- | record, and its labels; its tags (a record: one, of no name); the
+-- | class it is of
+type Layout =
+  { tuple : String
+  , numbered : Bool
+  , kinds : List Repr.Repr
+  , record : Bool
+  , labels : List String
+  , cons : List Con
+  , group : String
+  }
+
+-- (the tuple's values' reprs: the number's, then the places')
+tupleReprsOf : Layout -> List Repr.Repr
+tupleReprsOf lay =
+  if lay.numbered then Cons (RepFix I64) lay.kinds else lay.kinds
+
+-- | how many words a tuple of the layout is
+wordsOf : Layout -> Int
+wordsOf lay = List.length (tupleReprsOf lay)
+
+-- (a place's kind, as a field's type: what the tuple's tag says of it)
+kindTy : Repr.Repr -> IR.FieldTy
+kindTy RepF64 = FtFloat
+kindTy (RepFix w) = FtFixed w
+kindTy RepV = FtOther
+
+tupleTys : Layout -> List IR.FieldTy
+tupleTys lay = List.map kindTy (tupleReprsOf lay)
+
+-- (the first place of the kind no field of the tag before is in)
+freeAt : Repr.Repr -> List Int -> Int -> List Repr.Repr -> Maybe Int
+freeAt k used i Nil = Nothing
+freeAt k used i (Cons k2 ks) =
+  if Repr.reprEq k k2 && not (List.any (\j -> j == i) used) then Just i
+  else freeAt k used (i + 1) ks
+
+-- (the places so far, and those of a tag's fields)
+type Placed = { kinds : List Repr.Repr, places : List Int }
+
+placedAt : Placed -> Repr.Repr -> Maybe Int -> Placed
+placedAt p k (Just i) =
+  { kinds = p.kinds, places = List.append p.places (Cons i Nil) }
+placedAt p k Nothing =
+  { kinds = List.append p.kinds (Cons k Nil)
+  , places = List.append p.places (Cons (List.length p.kinds) Nil)
+  }
+
+placeOne : Placed -> IR.FieldTy -> Placed
+placeOne p t =
+  placedAt p (Repr.flatOf t) (freeAt (Repr.flatOf t) p.places 0 p.kinds)
+
+-- (the places so far, and the tags placed)
+type Laid = { kinds : List Repr.Repr, cons : List Con }
+
+laidWith : Laid -> String -> List IR.FieldTy -> Placed -> Laid
+laidWith acc t ts p =
+  { kinds = p.kinds
+  , cons =
+      List.append
+        acc.cons
+        (Cons
+           { tag = t
+           , index = List.length acc.cons
+           , tys = ts
+           , places = p.places
+           }
+           Nil)
+  }
+
+-- (a tag's fields placed, each in the first place of its kind free)
+layTag : Laid -> Pair String (List IR.FieldTy) -> Laid
+layTag acc (MkPair t ts) =
+  laidWith acc t ts (List.foldl placeOne { kinds = acc.kinds, places = Nil } ts)
+
+-- (a layout, where it is worth a worker -- some field is built -- and
+-- small enough)
+fitting : Layout -> Maybe Layout
+fitting lay =
+  if List.length lay.cons <= maxTags
+  && wordsOf lay <= maxWords
+  && not (List.null lay.kinds)
+    then Just lay
+  else Nothing
+
+tagLayout : String -> Bool -> Laid -> Maybe Layout
+tagLayout root numbered l =
+  fitting
+    { tuple =
+        Repr.tupleTag (if numbered then Cons (RepFix I64) l.kinds else l.kinds)
+    , numbered = numbered
+    , kinds = l.kinds
+    , record = False
+    , labels = Nil
+    , cons = l.cons
+    , group = root
+    }
+
+recordLayout : String -> List String -> List IR.FieldTy -> Maybe Layout
+recordLayout root ls ts =
+  fitting
+    { tuple = Repr.tupleTag (List.map Repr.flatOf ts)
+    , numbered = False
+    , kinds = List.map Repr.flatOf ts
+    , record = True
+    , labels = ls
+    , cons =
+        Cons
+          { tag = ""
+          , index = 0
+          , tys = ts
+          , places = List.range 0 (List.length ts - 1)
+          }
+          Nil
+    , group = root
+    }
+
+-- | a class's layout, of what its ways out build (`root` its root)
+layoutOf : String -> Shape -> Maybe Layout
+layoutOf root (TagShape m) =
+  tagLayout
+    root
+    (Map.size m > 1)
+    (List.foldl layTag { kinds = Nil, cons = Nil } (Map.toList m))
+layoutOf root (RecordShape ls ts) = recordLayout root ls ts
+layoutOf root s = Nothing
+
+-- | the functions with a worker, each its layout
+type Know = Map.Map String Layout
+
+layoutInto : Map.Map String Layout
+           -> String
+           -> Maybe Layout
+           -> Map.Map String Layout
+layoutInto acc k (Just lay) = Map.insert compareString k lay acc
+layoutInto acc k Nothing = acc
+
+-- (each class's layout, by its root, where it has one)
+layoutsOf : Map.Map String Shape -> Map.Map String Layout
+layoutsOf shapes =
+  List.foldl
+    (\acc p -> layoutInto acc (fst p) (layoutOf (fst p) (snd p)))
+    Map.empty
+    (Map.toList shapes)
+
+-- (each candidate, the layout of its class, where it has one)
+layoutsAt : Map.Map String String
+          -> Map.Map String Layout
+          -> Map.Map String (List Out)
+          -> Know
+layoutsAt parent ls m =
+  List.foldl
+    (\acc p ->
+       layoutInto
+         acc
+         (fst p)
+         (Map.lookup compareString (Repr.rootOf parent (fst p)) ls))
+    Map.empty
+    (Map.toList m)
+
+laid : Map.Map String (List Out) -> Know
+laid m = layoutsAt (classesOf m) (layoutsOf (shapesOf (classesOf m) m)) m
+
+-- What is taken apart
+--------------------------------------------------------------------------------
+
+-- (a tag's arm, if there is one)
+armOf : String -> List IR.Arm -> Maybe IR.Arm
+armOf t Nil = Nothing
+armOf t (Cons a as) = if strEq (IR.armTag a) t then Just a else armOf t as
+
+hasArm : Maybe IR.Arm -> Bool
+hasArm (Just _) = True
+hasArm Nothing = False
+
+-- | whether a match's arms take apart what a function of the layout
+-- | gives back: an arm for each tag it may give
+covers : Layout -> List IR.Arm -> Bool
+covers lay arms =
+  not lay.record
+  && List.all (\(c : Con) -> hasArm (armOf c.tag arms)) lay.cons
+
+-- (how many times the worklist takes `x` apart -- a match on it that
+-- covers, a field of it read -- onto `n`)
+apartW : Layout -> String -> Int -> List IR.Expr -> Int
+apartW lay x n Nil = n
+apartW lay x n (Cons (EMatch s arms) rest) =
+  apartW
+    lay
+    x
+    (if isVar x s && covers lay arms then n + 1 else n)
+    (Cons s (IR.pushArms arms rest))
+apartW lay x n (Cons (EProj e _ _ _) rest) =
+  apartW lay x (if isVar x e && lay.record then n + 1 else n) (Cons e rest)
+apartW lay x n (Cons (ELam _ b) rest) = apartW lay x n (Cons b rest)
+apartW lay x n (Cons (EApp f as) rest) =
+  apartW lay x n (Cons f (IR.appendI as rest))
+apartW lay x n (Cons (ELet _ a b) rest) = apartW lay x n (Cons a (Cons b rest))
+apartW lay x n (Cons (ERecord fs _) rest) =
+  apartW lay x n (IR.pushFields fs rest)
+apartW lay x n (Cons (ETag _ as _) rest) = apartW lay x n (IR.appendI as rest)
+apartW lay x n (Cons (EPrimCall _ as) rest) =
+  apartW lay x n (IR.appendI as rest)
+apartW lay x n (Cons (ECall _ as) rest) = apartW lay x n (IR.appendI as rest)
+apartW lay x n (Cons _ rest) = apartW lay x n rest
+
+-- | `x`, bound to what a function of the layout gives back, is only
+-- | taken apart in `b`
+takenApart : Layout -> String -> IR.Expr -> Bool
+takenApart lay x b =
+  apartW lay x 0 (Cons b Nil) > 0
+  && apartW lay x 0 (Cons b Nil) == IR.countW x 0 (Cons b Nil)
+
+-- (the class of `g`, if a binding of its call is taken apart)
+siteLetIn : List String -> String -> IR.Expr -> Maybe Layout -> List String
+siteLetIn acc x b (Just lay) =
+  if takenApart lay x b then Cons lay.group acc else acc
+siteLetIn acc x b Nothing = acc
+
+siteLet : Know -> List String -> String -> IR.Expr -> IR.Expr -> List String
+siteLet k acc x (ECall g _) b = siteLetIn acc x b (Map.lookup compareString g k)
+siteLet k acc x a b = acc
+
+siteMatchIn : List String -> List IR.Arm -> Maybe Layout -> List String
+siteMatchIn acc arms (Just lay) =
+  if covers lay arms then Cons lay.group acc else acc
+siteMatchIn acc arms Nothing = acc
+
+siteMatch : Know -> List String -> IR.Expr -> List IR.Arm -> List String
+siteMatch k acc (ECall g _) arms =
+  siteMatchIn acc arms (Map.lookup compareString g k)
+siteMatch k acc s arms = acc
+
+-- (the classes of what the worklist takes apart, onto `acc`)
+sitesW : Know -> List String -> List IR.Expr -> List String
+sitesW k acc Nil = acc
+sitesW k acc (Cons (ELet x a b) rest) =
+  sitesW k (siteLet k acc x a b) (Cons a (Cons b rest))
+sitesW k acc (Cons (EMatch s arms) rest) =
+  sitesW k (siteMatch k acc s arms) (Cons s (IR.pushArms arms rest))
+sitesW k acc (Cons (ELam _ b) rest) = sitesW k acc (Cons b rest)
+sitesW k acc (Cons (EApp f as) rest) =
+  sitesW k acc (Cons f (IR.appendI as rest))
+sitesW k acc (Cons (ERecord fs _) rest) = sitesW k acc (IR.pushFields fs rest)
+sitesW k acc (Cons (EProj e _ _ _) rest) = sitesW k acc (Cons e rest)
+sitesW k acc (Cons (ETag _ as _) rest) = sitesW k acc (IR.appendI as rest)
+sitesW k acc (Cons (EPrimCall _ as) rest) = sitesW k acc (IR.appendI as rest)
+sitesW k acc (Cons (ECall _ as) rest) = sitesW k acc (IR.appendI as rest)
+sitesW k acc (Cons _ rest) = sitesW k acc rest
+
+sitedIn : Map.Map String Unit -> Know -> Know
+sitedIn groups k =
+  Map.fromList
+    compareString
+    (List.filter
+       (\(p : Pair String Layout) ->
+          Map.member compareString (snd p).group groups)
+       (Map.toList k))
+
+-- | ... those of a class of which something is taken apart
+sited : List IR.Def -> Know -> Know
+sited defs k =
+  sitedIn
+    (List.foldl
+       (\m g -> Map.insert compareString g MkUnit m)
+       Map.empty
+       (sitesW k Nil (List.map (\(d : IR.Def) -> d.body) defs)))
+    k
+
+-- Taken apart
+--------------------------------------------------------------------------------
+
+-- (the variable of a place of the tuple, its values' `vs`)
+placeVar : Layout -> List String -> Int -> String
+placeVar lay vs i =
+  fromMaybe "" (List.head (List.drop (if lay.numbered then i + 1 else i) vs))
+
+-- (a label's place)
+labelAt : String -> Int -> List String -> Int
+labelAt l i Nil = 0
+labelAt l i (Cons k ks) = if strEq l k then i else labelAt l (i + 1) ks
+
+-- (an arm's body, its variables bound to those of its tag's fields'
+-- places: its own, not the places' -- a place is of another tag's field
+-- on another way, or nothing, and what one way knows of a variable, a
+-- record read at its shape, heff.compile.refcount knows of it on all)
+armBodyAs : Layout -> List String -> Con -> Maybe IR.Arm -> IR.Expr
+armBodyAs lay vs c (Just (MkArm _ ws b)) =
+  List.foldr
+    (\p acc -> ELet (fst p) (EVar (placeVar lay vs (snd p))) acc)
+    b
+    (List.zip ws c.places)
+armBodyAs lay vs c Nothing = EAbandon
+
+-- (whether the tuple's number is the tag's)
+numberIs : List String -> Con -> IR.Expr -> IR.Expr -> IR.Expr
+numberIs vs c yes no =
+  EMatch
+    (EPrimCall
+       "int64Eq"
+       [EVar (fromMaybe "" (List.head vs)), EFixed I64 c.index])
+    [MkArm "True" Nil yes, MkArm "False" Nil no]
+
+-- | a way for each tag, chosen by the tuple's number: each tag's in turn,
+-- | the last's not tested
+chosen : List String -> (Con -> IR.Expr) -> List Con -> IR.Expr
+chosen vs way Nil = EAbandon
+chosen vs way (Cons c Nil) = way c
+chosen vs way (Cons c cs) = numberIs vs c (way c) (chosen vs way cs)
+
+-- (a match's arms on what a worker gave back, `vs`: chosen by its number)
+dispatch : Layout -> List String -> List IR.Arm -> IR.Expr
+dispatch lay vs arms =
+  chosen vs (\c -> armBodyAs lay vs c (armOf c.tag arms)) lay.cons
+
+apartArm : (IR.Expr -> IR.Expr) -> IR.Arm -> IR.Arm
+apartArm go (MkArm t ws b) = MkArm t ws (go b)
+
+-- | `x`, what a worker gave back (`vs`), taken apart in what follows: a
+-- | match on it chooses by the tuple's number, a field of it read is the
+-- | variable of its place
+apart : Layout -> String -> List String -> IR.Expr -> IR.Expr
+apart lay x vs (EMatch s arms) =
+  if isVar x s then dispatch lay vs (List.map (apartArm (apart lay x vs)) arms)
+  else EMatch (apart lay x vs s) (List.map (apartArm (apart lay x vs)) arms)
+apart lay x vs (EProj e l sh t) =
+  if isVar x e then EVar (placeVar lay vs (labelAt l 0 lay.labels))
+  else EProj (apart lay x vs e) l sh t
+apart lay x vs (ELam ys b) = ELam ys (apart lay x vs b)
+apart lay x vs (EApp f as) =
+  EApp (apart lay x vs f) (List.map (apart lay x vs) as)
+apart lay x vs (ELet y a b) = ELet y (apart lay x vs a) (apart lay x vs b)
+apart lay x vs (ERecord fs ts) =
+  ERecord
+    (List.map
+       (\(p : Pair String IR.Expr) -> MkPair (fst p) (apart lay x vs (snd p)))
+       fs)
+    ts
+apart lay x vs (ETag t as ts) = ETag t (List.map (apart lay x vs) as) ts
+apart lay x vs (EPrimCall p as) = EPrimCall p (List.map (apart lay x vs) as)
+apart lay x vs (ECall g as) = ECall g (List.map (apart lay x vs) as)
+apart lay x vs e = e
+
+-- Calls of workers
+--------------------------------------------------------------------------------
+
+-- (fresh names for a tuple's values)
+tupleVars : Layout -> S (List String)
+tupleVars lay =
+  traverseS
+    (\i -> freshS (if lay.numbered && i == 0 then "tag" else "field"))
+    (List.range 0 (wordsOf lay - 1))
+
+-- (a call of `g`'s worker, its values bound, given to `k`)
+calledApart : Layout
+            -> String
+            -> List IR.Expr
+            -> (List String -> IR.Expr)
+            -> S IR.Expr
+calledApart lay g as k = do
+  vs <- tupleVars lay
+  pure (EMatch (ECall (workerKey g) as) (Cons (MkArm lay.tuple vs (k vs)) Nil))
+
+letCallIn : String
+          -> String
+          -> List IR.Expr
+          -> IR.Expr
+          -> Maybe Layout
+          -> S IR.Expr
+letCallIn x g as b (Just lay) =
+  if takenApart lay x b then calledApart lay g as (\vs -> apart lay x vs b)
+  else pure (ELet x (ECall g as) b)
+letCallIn x g as b Nothing = pure (ELet x (ECall g as) b)
+
+-- (a binding: of a call taken apart, of its worker)
+letRw : Know -> String -> IR.Expr -> IR.Expr -> S IR.Expr
+letRw k x (ECall g as) b = letCallIn x g as b (Map.lookup compareString g k)
+letRw k x a b = pure (ELet x a b)
+
+matchCallIn : String -> List IR.Expr -> List IR.Arm -> Maybe Layout -> S IR.Expr
+matchCallIn g as arms (Just lay) =
+  if covers lay arms then calledApart lay g as (\vs -> dispatch lay vs arms)
+  else pure (EMatch (ECall g as) arms)
+matchCallIn g as arms Nothing = pure (EMatch (ECall g as) arms)
+
+-- (a match: on a call that covers, of its worker)
+matchRw : Know -> IR.Expr -> List IR.Arm -> S IR.Expr
+matchRw k (ECall g as) arms =
+  matchCallIn g as arms (Map.lookup compareString g k)
+matchRw k s arms = pure (EMatch s arms)
+
+armS : (IR.Expr -> S IR.Expr) -> IR.Arm -> S IR.Arm
+armS go (MkArm t ws b) = do
+  b2 <- go b
+  pure (MkArm t ws b2)
+
+fieldS : (IR.Expr -> S IR.Expr)
+       -> Pair String IR.Expr
+       -> S (Pair String IR.Expr)
+fieldS go (MkPair l e) = do
+  e2 <- go e
+  pure (MkPair l e2)
+
+-- | an expression, each call whose value is taken apart at once calling
+-- | the worker
+rw : Know -> IR.Expr -> S IR.Expr
+rw k (ELam xs b) = do
+  b2 <- rw k b
+  pure (ELam xs b2)
+rw k (EApp f as) = do
+  f2 <- rw k f
+  as2 <- traverseS (rw k) as
+  pure (EApp f2 as2)
+rw k (ELet x a b) = do
+  a2 <- rw k a
+  b2 <- rw k b
+  letRw k x a2 b2
+rw k (EMatch s arms) = do
+  s2 <- rw k s
+  arms2 <- traverseS (armS (rw k)) arms
+  matchRw k s2 arms2
+rw k (ERecord fs ts) = do
+  fs2 <- traverseS (fieldS (rw k)) fs
+  pure (ERecord fs2 ts)
+rw k (EProj e l sh t) = do
+  e2 <- rw k e
+  pure (EProj e2 l sh t)
+rw k (ETag t as ts) = do
+  as2 <- traverseS (rw k) as
+  pure (ETag t as2 ts)
+rw k (EPrimCall p as) = do
+  as2 <- traverseS (rw k) as
+  pure (EPrimCall p as2)
+rw k (ECall g as) = do
+  as2 <- traverseS (rw k) as
+  pure (ECall g as2)
+rw k e = pure e
+
+-- Workers and wrappers
+--------------------------------------------------------------------------------
+
+-- (nothing, of a place's kind: what a tag without a field there leaves
+-- in it)
+noneOf : Repr.Repr -> IR.Expr
+noneOf RepF64 = EFloat 0.0
+noneOf (RepFix w) = EFixed w 0
+noneOf RepV = EInt 0
+
+-- (the field in place `i`, of the tag's fields `es`)
+fieldAt : Int -> List Int -> List IR.Expr -> Maybe IR.Expr
+fieldAt i (Cons p ps) (Cons e es) = if p == i then Just e else fieldAt i ps es
+fieldAt i ps es = Nothing
+
+-- | the tuple of a tag's fields, `es`: its number, if the layout has
+-- | one, then each place's field, or nothing
+tupleOfCon : Layout -> Con -> List IR.Expr -> IR.Expr
+tupleOfCon lay c es =
+  ETag
+    lay.tuple
+    (List.append
+       (if lay.numbered then Cons (EFixed I64 c.index) Nil else Nil)
+       (List.zipWith
+          (\i k -> fromMaybe (noneOf k) (fieldAt i c.places es))
+          (List.range 0 (List.length lay.kinds - 1))
+          lay.kinds))
+    (tupleTys lay)
+
+-- (the fields, each that is not a value bound first, in order: so they
+-- are computed in their order, whatever their places)
+type Bound = { lets : List (Pair String IR.Expr), vals : List IR.Expr }
+
+boundOne : Bound -> IR.Expr -> S Bound
+boundOne b e =
+  if IR.isValue e
+    then pure { lets = b.lets, vals = List.append b.vals (Cons e Nil) }
+  else do
+    x <- freshS "f"
+    pure
+        { lets = List.append b.lets (Cons (MkPair x e) Nil)
+        , vals = List.append b.vals (Cons (EVar x) Nil)
+        }
+
+boundAll : Bound -> List IR.Expr -> S Bound
+boundAll b Nil = pure b
+boundAll b (Cons e es) = do
+  b2 <- boundOne b e
+  boundAll b2 es
+
+letsAround : List (Pair String IR.Expr) -> IR.Expr -> IR.Expr
+letsAround ls e = List.foldr (\p acc -> ELet (fst p) (snd p) acc) e ls
+
+conOf : Layout -> String -> Con
+conOf lay t =
+  fromMaybe
+    { tag = t, index = 0, tys = Nil, places = Nil }
+    (List.find (\(c : Con) -> strEq c.tag t) lay.cons)
+
+-- (a tag or a record built at a way out, of `es`: its tuple)
+builtOut : Layout -> Con -> List IR.Expr -> S IR.Expr
+builtOut lay c es = do
+  b <- boundAll { lets = Nil, vals = Nil } es
+  pure (letsAround b.lets (tupleOfCon lay c b.vals))
+
+-- | a worker's way out: a tag or a record built, its tuple; a call last,
+-- | of the other's worker
+outRw : Layout -> IR.Expr -> S IR.Expr
+outRw lay (ELet x a b) = do
+  b2 <- outRw lay b
+  pure (ELet x a b2)
+outRw lay (EMatch s arms) = do
+  arms2 <- traverseS (armS (outRw lay)) arms
+  pure (EMatch s arms2)
+outRw lay (ETag t as _) = builtOut lay (conOf lay t) as
+outRw lay (ERecord fs _) = builtOut lay (conOf lay "") (List.map snd fs)
+outRw lay (ECall g as) = pure (ECall (workerKey g) as)
+outRw lay e = pure e
+
+-- (a tag, or a record, of the fields in its places)
+builtOf : Layout -> List String -> Con -> IR.Expr
+builtOf lay vs c =
+  if lay.record
+    then ERecord
+        (List.zipWith
+           (\l i -> MkPair l (EVar (placeVar lay vs i)))
+           lay.labels
+           c.places)
+        c.tys
+  else ETag c.tag (List.map (\i -> EVar (placeVar lay vs i)) c.places) c.tys
+
+-- | a function with a worker: the wrapper, which calls the worker and
+-- | builds the tag of what it gives back
+wrapperOf : Layout -> IR.Def -> List String -> S IR.Def
+wrapperOf lay d xs = do
+  ys <- traverseS (\x -> freshS (IR.baseOf x)) xs
+  vs <- tupleVars lay
+  pure
+      (IR.mkDef
+         d.key
+         d.name
+         (ELam
+            ys
+            (EMatch
+               (ECall (workerKey d.key) (List.map (\y -> EVar y) ys))
+               (Cons
+                  (MkArm lay.tuple vs (chosen vs (builtOf lay vs) lay.cons))
+                  Nil))))
+
+mentions : Know -> IR.Expr -> Bool
+mentions k e = List.any (\g -> Map.member compareString g k) (IR.globalsIn e)
+
+-- (a definition: given a worker, the worker and its wrapper; else its
+-- calls taken apart calling workers)
+defWith : Know -> IR.Def -> Maybe Layout -> S (List IR.Def)
+defWith k d@{ body = ELam xs b } (Just lay) = do
+  b2 <- rw k b
+  b3 <- outRw lay b2
+  w <- wrapperOf lay d xs
+  pure (Cons (IR.mkDef (workerKey d.key) d.name (ELam xs b3)) (Cons w Nil))
+defWith k d m =
+  if mentions k d.body
+    then do
+      b2 <- rw k d.body
+      pure (Cons (IR.mkDef d.key d.name b2) Nil)
+  else pure (Cons d Nil)
+
+defRw : Know -> IR.Def -> S (List IR.Def)
+defRw k d = defWith k d (Map.lookup compareString d.key k)
+
+-- | a program given its workers: its definitions, where fresh names go
+-- | on from, and the workers that give back a tuple, each by how many
+-- | values (heff.compile.facts's `tuples`)
+type Cprd = { defs : List IR.Def, supply : Int, tuples : Map.Map String Int }
+
+cprWith : Int -> List IR.Def -> Know -> Cprd
+cprWith supply defs k =
+  if Map.size k == 0 then { defs = defs, supply = supply, tuples = Map.empty }
+  else case traverseS (defRw k) defs supply of
+    MkPair dss n ->
+      { defs = List.concatMap (\ds -> ds) dss
+      , supply = n
+      , tuples =
+          Map.fromList
+            compareString
+            (List.map
+               (\p -> MkPair (workerKey (fst p)) (wordsOf (snd p)))
+               (Map.toList k))
+      }
+
+-- | the program's functions that give back what they build given
+-- | workers, and the calls that take it apart at once calling them;
+-- | fresh names from `supply` on
+-- | >>> Map.toList (cprProgram 0 [IR.mkDef "f" "f" (ELam ["x"] (ETag "MkPair" [EVar "x", EVar "x"] [FtOther, FtOther])), IR.mkDef "g" "g" (ELam ["y"] (EMatch (ECall "f" [EVar "y"]) [MkArm "MkPair" ["a", "b"] (EVar "a")]))]).tuples
+-- | [MkPair "f$cpr" 2]
+cprProgram : Int -> List IR.Def -> Cprd
+cprProgram supply defs =
+  cprWith supply defs (sited defs (laid (candidates defs)))

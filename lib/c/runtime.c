@@ -96,6 +96,15 @@ extern char **environ;
 
 typedef uintptr_t V;
 
+// (a tuple (#80, src/heff/compile/cpr.hf): what a worker gives back of a
+// tag or a record it built, not built -- each value a `V`, or a flat
+// number's bits as a flat field's; given back in registers where the C
+// ABI lets it, else in its caller's frame, never allocated)
+typedef struct { V f[1]; } HeffT1;
+typedef struct { V f[2]; } HeffT2;
+typedef struct { V f[3]; } HeffT3;
+typedef struct { V f[4]; } HeffT4;
+
 // (a call last whose callee takes what its caller takes -- the same
 // parameters, the same result -- made a jump, the caller's frame let go
 // of: clang's `musttail`, on the processors it always does it for

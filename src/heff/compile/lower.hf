@@ -2,7 +2,8 @@
 -- same for both backends (#40):
 --
 --   core ─[Erase]→ IR ─[Lift]→ ─[Shake]→ ─[Simplify]→ ─[Shake]→
---        ─[Fuse]→ ─[Shake]→ ─[Call arity]→ ─[Arity]→ ─[TRMC]→ ─[Early]→ IR
+--        ─[Fuse]→ ─[Shake]→ ─[Call arity]→ ─[Arity]→ ─[TRMC]→ ─[Early]→
+--        ─[CPR]→ ─[Shake]→ IR
 --
 -- then, for the JavaScript backend, for each definition ─[Monadic]→
 -- ─[Imp]→ (`jsDef`, heff.compile.imperative); for the C backend, ─[Monadic]→
@@ -15,6 +16,7 @@
 
 import heff.compile.arity as Arity
 import heff.compile.borrow as Borrow
+import heff.compile.cpr as Cpr
 import heff.compile.callarity as CallArity
 import heff.compile.early as Early
 import heff.compile.erase as Erase
@@ -53,14 +55,25 @@ readEarly (MkPair defs n) = { defs = defs, supply = n }
 earlyShared : TRMC.Trmced -> TRMC.Trmced
 earlyShared t = readEarly (Early.earlyProgram t.supply t.defs)
 
+shakenCprd : List String -> Cpr.Cprd -> Cpr.Cprd
+shakenCprd roots c =
+  { defs = Shake.shake roots c.defs, supply = c.supply, tuples = c.tuples }
+
+-- (... a function giving back what it builds given a worker giving it
+-- back taken apart, what is reached from `roots` of that)
+cprShared : List String -> TRMC.Trmced -> Cpr.Cprd
+cprShared roots t = shakenCprd roots (Cpr.cprProgram t.supply t.defs)
+
 -- | what both backends are given: each call at the arity it is made at,
 -- | and each at its function's (heff.compile.arity), a call of itself
 -- | built around made a loop (heff.compile.trmc), the numbers of a
--- | record read after a call read before it (heff.compile.early); where
--- | fresh names go on from
-shared : Int -> List IR.Def -> TRMC.Trmced
-shared supply kept =
-  earlyShared (calledShared (CallArity.callArity supply kept))
+-- | record read after a call read before it (heff.compile.early), a
+-- | function giving back a tag it builds given a worker giving back its
+-- | fields (heff.compile.cpr); where fresh names go on from, and the
+-- | workers giving back tuples
+shared : List String -> Int -> List IR.Def -> Cpr.Cprd
+shared roots supply kept =
+  cprShared roots (earlyShared (calledShared (CallArity.callArity supply kept)))
 
 -- | the definitions as both backends are given them (`shared`), what is
 -- | known of them, and what could not be lowered, said by key: the
@@ -68,9 +81,12 @@ shared supply kept =
 type LoweredShared =
   { defs : List IR.Def, facts : Facts.Facts, errors : List String }
 
-sharedLowered : List String -> TRMC.Trmced -> LoweredShared
+sharedLowered : List String -> Cpr.Cprd -> LoweredShared
 sharedLowered errors t =
-  { defs = t.defs, facts = Facts.factsOf t.defs, errors = errors }
+  { defs = t.defs
+  , facts = Facts.withTuples t.tuples (Facts.factsOf t.defs)
+  , errors = errors
+  }
 
 -- | a definition as the JavaScript backend prints it, from its body named
 -- | again from 0 (`IR.freshen`: so that it is the same whatever is
@@ -83,8 +99,9 @@ jsDef d (MkPair b0 n) = case Monadic.monadicFrom
   MkPair (Cons m _) n2 -> Imperative.impDef True n2 m
   MkPair Nil n2 -> Imperative.impDef True n2 (IR.mkDef d.key d.name b0)
 
-lowerKept : Int -> List IR.Def -> List String -> LoweredShared
-lowerKept supply kept errors = sharedLowered errors (shared supply kept)
+lowerKept : List String -> Int -> List IR.Def -> List String -> LoweredShared
+lowerKept roots supply kept errors =
+  sharedLowered errors (shared roots supply kept)
 
 -- (what is reached, fused (heff.compile.fuse), and what is reached of
 -- that: what a consumer was called on, made by a producer, gone)
@@ -92,7 +109,8 @@ fusedOf : List String -> Simplify.Simplified -> Fuse.Fused
 fusedOf roots si = Fuse.fuseProgram si.supply (Shake.shake roots si.defs)
 
 lowerFused : List String -> List String -> Fuse.Fused -> LoweredShared
-lowerFused roots errors f = lowerKept f.supply (Shake.shake roots f.defs) errors
+lowerFused roots errors f =
+  lowerKept roots f.supply (Shake.shake roots f.defs) errors
 
 lowerSimplified : List String
                 -> List String
@@ -199,24 +217,29 @@ cFacts defs facts =
        (Facts.sureRecords defs)
        (Facts.withFlat (Facts.flatTags defs) (Facts.sureTags defs) facts))
 
-cLowered : List String -> List IR.Def -> Lowered
-cLowered errors defs =
+cLowered : List String -> Map.Map String Int -> List IR.Def -> Lowered
+cLowered errors tuples defs =
   { defs = defs
   , facts =
-      cFacts defs (Facts.withLent (Borrow.borrowing defs) (Facts.factsOf defs))
+      cFacts
+        defs
+        (Facts.withTuples
+           tuples
+           (Facts.withLent (Borrow.borrowing defs) (Facts.factsOf defs)))
   , errors = errors
   }
 
-cShared : List String -> TRMC.Trmced -> Lowered
-cShared errors t = cLowered errors (Monadic.monadicProgram t.supply t.defs)
+cShared : List String -> Cpr.Cprd -> Lowered
+cShared errors t =
+  cLowered errors t.tuples (Monadic.monadicProgram t.supply t.defs)
 
 -- (as both backends have it, in monadic form: names from where the
 -- simplifier's ended)
-cKept : Int -> List IR.Def -> List String -> Lowered
-cKept supply kept errors = cShared errors (shared supply kept)
+cKept : List String -> Int -> List IR.Def -> List String -> Lowered
+cKept roots supply kept errors = cShared errors (shared roots supply kept)
 
 cFused : List String -> List String -> Fuse.Fused -> Lowered
-cFused roots errors f = cKept f.supply (Shake.shake roots f.defs) errors
+cFused roots errors f = cKept roots f.supply (Shake.shake roots f.defs) errors
 
 cSimplified : List String -> List String -> Simplify.Simplified -> Lowered
 cSimplified roots errors si = cFused roots errors (fusedOf roots si)

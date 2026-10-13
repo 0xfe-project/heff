@@ -101,7 +101,11 @@ a function that takes such a number as a number, or gives one back, is
 called, where the call is known, by a C function of its own taking and
 giving it unboxed (its worker, `g_K_w`, src/heff/compile/worker.hf),
 and from a closure or a provider as any other, through a function of
-`V`s that unboxes and boxes (its wrapper, `g_K`).
+`V`s that unboxes and boxes (its wrapper, `g_K`).  So too a function
+giving back a tag or a record it builds: a call taking it apart at once
+calls a worker giving back the fields unbuilt, a struct of words
+(`g_K_24cpr`, src/heff/compile/cpr.hf), and anything else -- a closure,
+a provider -- calls `g_K`, which builds it.
 A record's `Float64`, `Int64` and `UInt64` fields (of its first 16),
 built where their type is known, are kept flat, their bits in the
 record: a provider given a record reads a field by `heff_rget_v` (the
