@@ -1,0 +1,530 @@
+-- Values as bytes, and bytes as values again: what two programs say to
+-- each other, a C program and a page's script among them (lib/remote.hf
+-- sends an effect's operations so).  One theory, `Wire`, says both ways
+-- for a type: what a value is written as (`encode`), how it is read
+-- back (`decode`), and the type's `shape`, a name of how it is written,
+-- of which an API's fingerprint is made.  The same value is the same
+-- bytes on every backend: what a C program writes, a page's script
+-- reads, and the other way.  Pure, for any backend.  Import it by a
+-- name, `import wire as Wire`: its `encode` and `decode` are common
+-- names.
+--
+-- How each type is written (a natural -- a length, a count -- is
+-- LEB128: 7 bits a byte, the least significant first, each byte but the
+-- last with its high bit set):
+--
+--   Int               zigzag (0, -1, 1, -2 as 0, 1, 2, 3), then a natural:
+--                     an integer of any size
+--   Int8 .. Int64,    its bits, big-endian, two's complement
+--   UInt8 .. UInt64
+--   Float64, Float32  IEEE's 64 or 32 bits, big-endian (a NaN the quiet one)
+--   Rune              its code point, 32 bits
+--   Bool              a byte, 0 or 1
+--   Unit              nothing
+--   String, Bytes     its length, then its bytes, as they are
+--   Bits              its length in bits, then its bits, the last byte's
+--                     left over 0
+--   List, Array       its length, then each element
+--   Maybe             a byte: 0, Nothing; 1, Just, then the value
+--   Either            a byte: 0, Left; 1, Right; then the value
+--   Pair              the first, then the second
+--   Map, HashMap      its size, then each key and its value, in the order
+--                     of its `toList` (HashMap's the same on every backend)
+--
+-- A type of a program's own is written as another type is, by `via` (a
+-- record as pairs, a type of more than one constructor as `Either`s), or
+-- by an instance of its own, read by `andThen` and `succeed`.
+
+import array as Array
+import bits as Bits
+import bytes as Bytes
+import float32 as Float32
+import hashmap as HashMap
+import int16 as Int16
+import int32 as Int32
+import int64 as Int64
+import int8 as Int8
+import map as Map
+import rune as Rune
+import uint16 as UInt16
+import uint32 as UInt32
+import uint64 as UInt64
+import uint8 as UInt8
+
+-- | A reader: of the bytes, from the byte `at`, a value and where it
+-- | ends; `Nothing` where they are none of its.
+type Decoder a = Bytes -> Int -> Maybe (Pair a Int)
+
+-- | A type on the wire: its shape (`"List Int"`), a value written, and a
+-- | value read from where it starts.
+theory Wire (a : Type) where
+  shape : String
+  encode : a -> Bytes
+  decode : Bytes -> Int -> Maybe (Pair a Int)
+
+-- | The value written.
+encode : {a : Type} -> {{wire : Wire a}} -> a -> Bytes
+encode = wire.encode
+
+-- | A value read, from the byte `at`: it, and where it ends.
+decode : {a : Type} -> {{wire : Wire a}} -> Bytes -> Int -> Maybe (Pair a Int)
+decode = wire.decode
+
+-- (a value read, and all of the bytes read)
+whole : {a : Type} -> Bytes -> Maybe (Pair a Int) -> Maybe a
+whole b Nothing = Nothing
+whole b (Just (MkPair x at)) = if at == Bytes.length b then Just x else Nothing
+
+-- | The value the bytes are, all of them: `Nothing` where they are none,
+-- | or more.
+decodeAll : {a : Type} -> {{wire : Wire a}} -> Bytes -> Maybe a
+decodeAll b = whole b (wire.decode b 0)
+
+-- | A type's shape, as its instance says it.
+shapeOf : (a : Type) -> {{wire : Wire a}} -> String
+shapeOf a = wire.shape
+
+-- Readers
+--------------------------------------------------------------------------------
+
+-- | Nothing read: `x`.
+succeed : {a : Type} -> a -> Decoder a
+succeed x = \b at -> Just (MkPair x at)
+
+-- | None of its: no value.
+failure : {a : Type} -> Decoder a
+failure = \b at -> Nothing
+
+-- (what was read, given to the next reader)
+onward : {a c : Type}
+       -> (a -> Decoder c)
+       -> Bytes
+       -> Maybe (Pair a Int)
+       -> Maybe (Pair c Int)
+onward k b Nothing = Nothing
+onward k b (Just (MkPair x at)) = k x b at
+
+-- | A value read, then the reader of what comes after it, by it.
+andThen : {a c : Type} -> Decoder a -> (a -> Decoder c) -> Decoder c
+andThen d k = \b at -> onward k b (d b at)
+
+-- (what was read, made another)
+mapped : {a c : Type} -> (a -> c) -> Maybe (Pair a Int) -> Maybe (Pair c Int)
+mapped f Nothing = Nothing
+mapped f (Just (MkPair x at)) = Just (MkPair (f x) at)
+
+-- | A value read, made another.
+converted : {a c : Type} -> (a -> c) -> Decoder a -> Decoder c
+converted f d = \b at -> mapped f (d b at)
+
+-- (read, where it ends)
+ending : {a : Type} -> Int -> Maybe a -> Maybe (Pair a Int)
+ending at Nothing = Nothing
+ending at (Just x) = Just (MkPair x at)
+
+-- | `n` bytes, read by `read`.
+fixed : {a : Type} -> Int -> (Bytes -> Maybe a) -> Decoder a
+fixed n read = \b at ->
+    if at < 0 || at + n > Bytes.length b then Nothing
+    else ending (at + n) (read (Bytes.slice b at (at + n)))
+
+-- Naturals
+--------------------------------------------------------------------------------
+
+-- (a natural's bytes, the last first)
+naturalBytes : Int -> List Bytes -> List Bytes
+naturalBytes n acc =
+  if n < 128 then b[n] :: acc
+  else naturalBytes (n / 128) (b[n % 128 + 128] :: acc)
+
+-- | A natural, 0 or more, as LEB128 writes it: 7 bits a byte, the least
+-- | significant first, each byte but the last with its high bit set (a
+-- | length, a count, a tag of a type of one's own).
+-- | >>> List.map natural [0, 127, 128, 300]
+-- | [b[0], b[127], b[128, 1], b[172, 2]]
+natural : Int -> Bytes
+natural n = Bytes.concat (List.reverse (naturalBytes n Nil))
+
+-- (the natural's rest, from `at`: what it is so far, `acc`, its next
+-- byte worth `scale` times its bits)
+naturalFrom : Bytes -> Int -> Int -> Int -> Maybe (Pair Int Int)
+naturalFrom b at scale acc =
+  if at < 0 || at >= Bytes.length b then Nothing
+  else let x = bytesIntAt b (8 * at) 8 0
+       in if x < 128 then Just (MkPair (acc + x * scale) (at + 1))
+       else naturalFrom b (at + 1) (scale * 128) (acc + (x - 128) * scale)
+
+-- | A natural read.
+-- | >>> readNatural b[172, 2, 9] 0
+-- | Just (MkPair (300) (2))
+readNatural : Decoder Int
+readNatural = \b at -> naturalFrom b at 1 0
+
+-- (the `n` bytes after the natural, `n`)
+sliced : Int -> Decoder Bytes
+sliced n = \b at ->
+    if at + n > Bytes.length b then Nothing
+    else Just (MkPair (Bytes.slice b at (at + n)) (at + n))
+
+-- (bytes, their length first)
+counted : Bytes -> Bytes
+counted x = Bytes.append (natural (Bytes.length x)) x
+
+-- (bytes read, their length first)
+readCounted : Decoder Bytes
+readCounted = andThen readNatural sliced
+
+-- (an integer as a natural: 0, -1, 1, -2 as 0, 1, 2, 3)
+zigzag : Int -> Int
+zigzag n = if n >= 0 then 2 * n else -2 * n - 1
+
+-- (a natural as the integer `zigzag` made it of)
+unzigzag : Int -> Int
+unzigzag z = if z % 2 == 0 then z / 2 else -((z + 1) / 2)
+
+-- (a shape in parentheses where it is more than a word)
+wrapped : String -> String
+wrapped s = if contains " " s then "(" ^ s ^ ")" else s
+
+-- Numbers
+--------------------------------------------------------------------------------
+
+-- | >>> List.map encode ([0, -1, 1, 64, -65] : List Int)
+-- | [b[0], b[1], b[2], b[128, 1], b[129, 1]]
+-- | >>> (decodeAll (encode (-300 : Int)) : Maybe Int)
+-- | Just (-300)
+instance instanceWireInt : Wire Int
+instanceWireInt =
+  { shape = "Int"
+  , encode = \n -> natural (zigzag n)
+  , decode = converted unzigzag readNatural
+  }
+
+int8Of : Bytes -> Maybe Int8
+int8Of b[n::8-signed] = Just (Int8.fromInt n)
+int8Of _ = Nothing
+
+instance instanceWireInt8 : Wire Int8
+instanceWireInt8 =
+  { shape = "Int8"
+  , encode = \x -> b[(Int8.toInt x)::8]
+  , decode = fixed 1 int8Of
+  }
+
+int16Of : Bytes -> Maybe Int16
+int16Of b[n::16-signed] = Just (Int16.fromInt n)
+int16Of _ = Nothing
+
+instance instanceWireInt16 : Wire Int16
+instanceWireInt16 =
+  { shape = "Int16"
+  , encode = \x -> b[(Int16.toInt x)::16]
+  , decode = fixed 2 int16Of
+  }
+
+int32Of : Bytes -> Maybe Int32
+int32Of b[n::32-signed] = Just (Int32.fromInt n)
+int32Of _ = Nothing
+
+instance instanceWireInt32 : Wire Int32
+instanceWireInt32 =
+  { shape = "Int32"
+  , encode = \x -> b[(Int32.toInt x)::32]
+  , decode = fixed 4 int32Of
+  }
+
+int64Of : Bytes -> Maybe Int64
+int64Of b[n::64-signed] = Just (Int64.fromInt n)
+int64Of _ = Nothing
+
+-- | >>> encode (-2 : Int64)
+-- | b[255, 255, 255, 255, 255, 255, 255, 254]
+instance instanceWireInt64 : Wire Int64
+instanceWireInt64 =
+  { shape = "Int64"
+  , encode = \x -> b[(Int64.toInt x)::64]
+  , decode = fixed 8 int64Of
+  }
+
+uint8Of : Bytes -> Maybe UInt8
+uint8Of b[n::8] = Just (UInt8.fromInt n)
+uint8Of _ = Nothing
+
+instance instanceWireUInt8 : Wire UInt8
+instanceWireUInt8 =
+  { shape = "UInt8"
+  , encode = \x -> b[(UInt8.toInt x)::8]
+  , decode = fixed 1 uint8Of
+  }
+
+uint16Of : Bytes -> Maybe UInt16
+uint16Of b[n::16] = Just (UInt16.fromInt n)
+uint16Of _ = Nothing
+
+instance instanceWireUInt16 : Wire UInt16
+instanceWireUInt16 =
+  { shape = "UInt16"
+  , encode = \x -> b[(UInt16.toInt x)::16]
+  , decode = fixed 2 uint16Of
+  }
+
+uint32Of : Bytes -> Maybe UInt32
+uint32Of b[n::32] = Just (UInt32.fromInt n)
+uint32Of _ = Nothing
+
+instance instanceWireUInt32 : Wire UInt32
+instanceWireUInt32 =
+  { shape = "UInt32"
+  , encode = \x -> b[(UInt32.toInt x)::32]
+  , decode = fixed 4 uint32Of
+  }
+
+uint64Of : Bytes -> Maybe UInt64
+uint64Of b[n::64] = Just (UInt64.fromInt n)
+uint64Of _ = Nothing
+
+instance instanceWireUInt64 : Wire UInt64
+instanceWireUInt64 =
+  { shape = "UInt64"
+  , encode = \x -> b[(UInt64.toInt x)::64]
+  , decode = fixed 8 uint64Of
+  }
+
+float64Of : Bytes -> Maybe Float64
+float64Of b[x::float] = Just x
+float64Of _ = Nothing
+
+-- | >>> encode 1.5
+-- | b["?", 248, 0, 0, 0, 0, 0, 0]
+instance instanceWireFloat64 : Wire Float64
+instanceWireFloat64 =
+  { shape = "Float64", encode = \x -> b[x::float], decode = fixed 8 float64Of }
+
+float32Of : Bytes -> Maybe Float32
+float32Of b[x::float-32] = Just (Float32.fromFloat x)
+float32Of _ = Nothing
+
+instance instanceWireFloat32 : Wire Float32
+instanceWireFloat32 =
+  { shape = "Float32"
+  , encode = \x -> b[(Float32.toFloat x)::float-32]
+  , decode = fixed 4 float32Of
+  }
+
+-- Text, bytes and the rest of the prelude's
+--------------------------------------------------------------------------------
+
+runeOf : Bytes -> Maybe Rune
+runeOf b[n::32] = Just (Rune.fromInt n)
+runeOf _ = Nothing
+
+instance instanceWireRune : Wire Rune
+instanceWireRune =
+  { shape = "Rune"
+  , encode = \r -> b[(Rune.toInt r)::32]
+  , decode = fixed 4 runeOf
+  }
+
+-- | >>> encode "hé"
+-- | b[3, "h", 195, 169]
+instance instanceWireString : Wire String
+instanceWireString =
+  { shape = "String"
+  , encode = \s -> counted (Bytes.fromString s)
+  , decode = converted Bytes.asString readCounted
+  }
+
+instance instanceWireBytes : Wire Bytes
+instanceWireBytes = { shape = "Bytes", encode = counted, decode = readCounted }
+
+boolOf : Bytes -> Maybe Bool
+boolOf b[0] = Just False
+boolOf b[1] = Just True
+boolOf _ = Nothing
+
+-- | >>> (decodeAll b[1, 2] : Maybe Bool)
+-- | Nothing
+instance instanceWireBool : Wire Bool
+instanceWireBool =
+  { shape = "Bool"
+  , encode = \x -> if x then b[1] else b[0]
+  , decode = fixed 1 boolOf
+  }
+
+instance instanceWireUnit : Wire Unit
+instanceWireUnit =
+  { shape = "Unit", encode = \u -> Bytes.empty, decode = succeed MkUnit }
+
+-- (bits, a whole number of bytes: 0s after them)
+paddedBits : Bits -> Bytes
+paddedBits x =
+  fromMaybe
+    Bytes.empty
+    (Bits.toBytes (Bits.append x (Bits.ofInt ((8 - Bits.length x % 8) % 8) 0)))
+
+-- (the first `n` bits of the bytes that hold them)
+bitsOf : Int -> Bytes -> Maybe Bits
+bitsOf n b = Just (Bits.slice (Bits.ofBytes b) 0 n)
+
+-- (`n` bits, in as many bytes as hold them)
+readBits : Int -> Decoder Bits
+readBits n = fixed ((n + 7) / 8) (bitsOf n)
+
+-- | >>> encode b[5::3, 1::6]
+-- | b[9, 160, 128]
+instance instanceWireBits : Wire Bits
+instanceWireBits =
+  { shape = "Bits"
+  , encode = \x -> Bytes.append (natural (Bits.length x)) (paddedBits x)
+  , decode = andThen readNatural readBits
+  }
+
+-- Containers
+--------------------------------------------------------------------------------
+
+-- (`n` more elements read, after those of `acc`, the last first)
+elements : {a : Type}
+         -> Decoder a
+         -> Int
+         -> List a
+         -> Bytes
+         -> Int
+         -> Maybe (Pair (List a) Int)
+elements d n acc b at =
+  if n == 0 then Just (MkPair (List.reverse acc) at)
+  else case d b at of
+    Nothing -> Nothing
+    Just (MkPair x next) -> elements d (n - 1) (x :: acc) b next
+
+-- (a list read: its length, then each element)
+readList : {a : Type} -> Decoder a -> Decoder (List a)
+readList d = andThen readNatural (\n b at -> elements d n Nil b at)
+
+-- (a list written: its length, then each element)
+writeList : {a : Type} -> (a -> Bytes) -> List a -> Bytes
+writeList f xs = Bytes.concat (natural (List.length xs) :: List.map f xs)
+
+-- | >>> encode ([1, -1] : List Int)
+-- | b[2, 2, 1]
+-- | >>> shapeOf (List (List Int))
+-- | "List (List Int)"
+instance instanceWireList : {a : Type} -> {{wire : Wire a}} -> Wire (List a)
+instanceWireList =
+  { shape = "List " ^ wrapped wire.shape
+  , encode = writeList wire.encode
+  , decode = readList wire.decode
+  }
+
+instance instanceWireArray : {a : Type} -> {{wire : Wire a}} -> Wire (Array a)
+instanceWireArray =
+  { shape = "Array " ^ wrapped wire.shape
+  , encode = \xs -> writeList wire.encode (Array.toList xs)
+  , decode = converted Array.fromList (readList wire.decode)
+  }
+
+-- (a tag's byte read, 0 or 1, as a `Bool`: 1 is `True`)
+readTag : Decoder Bool
+readTag = fixed 1 boolOf
+
+-- (a `Maybe`, by its tag)
+justOr : {a : Type} -> Decoder a -> Bool -> Decoder (Maybe a)
+justOr d False = succeed Nothing
+justOr d True = converted (\x -> Just x) d
+
+-- | >>> List.map encode ([Nothing, Just True] : List (Maybe Bool))
+-- | [b[0], b[1, 1]]
+instance instanceWireMaybe : {a : Type} -> {{wire : Wire a}} -> Wire (Maybe a)
+instanceWireMaybe =
+  { shape = "Maybe " ^ wrapped wire.shape
+  , encode = written
+  , decode = andThen readTag (justOr wire.decode)
+  }
+  where
+  written : Maybe a -> Bytes
+  written Nothing = b[0]
+  written (Just x) = Bytes.append b[1] (wire.encode x)
+
+instance instanceWirePair : {a b : Type}
+                          -> {{wireA : Wire a}}
+                          -> {{wireB : Wire b}}
+                          -> Wire (Pair a b)
+instanceWirePair =
+  { shape = "Pair " ^ wrapped wireA.shape ^ " " ^ wrapped wireB.shape
+  , encode = \p -> Bytes.append (wireA.encode (fst p)) (wireB.encode (snd p))
+  , decode =
+      andThen
+        wireA.decode
+        (\x -> converted (\y -> (MkPair x y : Pair a b)) wireB.decode)
+  }
+
+-- (an `Either`, by its tag)
+sideOf : {a b : Type} -> Decoder a -> Decoder b -> Bool -> Decoder (Either a b)
+sideOf da db False = converted (\x -> Left x) da
+sideOf da db True = converted (\y -> Right y) db
+
+instance instanceWireEither : {a b : Type}
+                            -> {{wireA : Wire a}}
+                            -> {{wireB : Wire b}}
+                            -> Wire (Either a b)
+instanceWireEither =
+  { shape = "Either " ^ wrapped wireA.shape ^ " " ^ wrapped wireB.shape
+  , encode = written
+  , decode = andThen readTag (sideOf wireA.decode wireB.decode)
+  }
+  where
+  written : Either a b -> Bytes
+  written (Left x) = Bytes.append b[0] (wireA.encode x)
+  written (Right y) = Bytes.append b[1] (wireB.encode y)
+
+-- | A map, by its keys' order (`Order`): its size, then each key and its
+-- | value, the least key first.
+instance instanceWireMap : {k v : Type}
+                         -> {{order : Order k}}
+                         -> {{wireK : Wire k}}
+                         -> {{wireV : Wire v}}
+                         -> Wire (Map.Map k v)
+instanceWireMap =
+  { shape = "Map " ^ wrapped wireK.shape ^ " " ^ wrapped wireV.shape
+  , encode = \m -> encode (Map.toList m)
+  , decode =
+      converted
+        (\ps -> Map.fromList order.compare ps)
+        (readList
+           (andThen
+              wireK.decode
+              (\x -> converted (\y -> (MkPair x y : Pair k v)) wireV.decode)))
+  }
+
+-- | A hash map, by its keys' `Hash` and `Equality`: its size, then each
+-- | key and its value, in the order of its `toList`, the same on every
+-- | backend.
+instance instanceWireHashMap : {k v : Type}
+                             -> {{hashing : HashMap.Hash k}}
+                             -> {{equality : Equality k}}
+                             -> {{wireK : Wire k}}
+                             -> {{wireV : Wire v}}
+                             -> Wire (HashMap.HashMap k v)
+instanceWireHashMap =
+  { shape = "HashMap " ^ wrapped wireK.shape ^ " " ^ wrapped wireV.shape
+  , encode = \m -> encode (HashMap.toList m)
+  , decode =
+      converted
+        (\ps -> HashMap.fromList ps)
+        (readList
+           (andThen
+              wireK.decode
+              (\x -> converted (\y -> (MkPair x y : Pair k v)) wireV.decode)))
+  }
+
+-- A type of one's own
+--------------------------------------------------------------------------------
+
+-- | A type written as another is: `to` what it is written as, `from` what
+-- | that is read as -- a record as pairs, a type of two constructors as an
+-- | `Either`.  Its shape is the other's.
+via : {a b : Type} -> {{wire : Wire b}} -> (a -> b) -> (b -> a) -> Wire a
+via to from =
+  { shape = wire.shape
+  , encode = \x -> wire.encode (to x)
+  , decode = converted from wire.decode
+  }
