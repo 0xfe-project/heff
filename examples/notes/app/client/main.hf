@@ -1,0 +1,132 @@
+-- The notes' page: its script, which `heff build` makes
+-- (.heff/bin/client.js) and app/client/index.html loads, both served by
+-- the server (app/server).  The notes are the server's: each operation
+-- of the API (notes.api) is sent to it, a `POST` of `/api`, and the page
+-- goes on with its answer.  A call that comes to no answer throws
+-- (`exn RemoteError`): the page says why, and is as it was.
+
+import browser.dom
+import browser.http as Http
+import browser.remote as RemoteHttp
+import co
+import exn
+import notes.api
+import remote as Remote
+
+page : HFunctor
+page = dom <+> Http.http
+
+-- (a note as a line: whether it is done, and its text)
+line : Note -> String
+line n = (if n.done then "[x] " else "[ ] ") ^ n.text
+
+-- (`c`, where a call of it comes to no answer, said in `status`)
+guarded : {e : HFunctor}
+        -> {{failed : exn Remote.RemoteError <: e}}
+        -> {{ui : dom <: e}}
+        -> Node
+        -> Co e Unit
+        -> Co e Unit
+guarded status c =
+  catch
+    c
+    ((\err -> text status (Remote.showRemoteError err)) :
+       Remote.RemoteError -> Co e Unit)
+
+-- (the note of the number toggled, and the notes shown `again`)
+toggling : {e : HFunctor}
+         -> {{api : notes <: e}}
+         -> {{failed : exn Remote.RemoteError <: e}}
+         -> {{ui : dom <: e}}
+         -> (Unit -> Co e Unit)
+         -> Node
+         -> Int
+         -> Co e Unit
+toggling again status i =
+  guarded status (bind (toggleNote i) (\ok -> again MkUnit))
+
+-- (each note a line of the list, with a button that toggles it and
+-- shows them `again`)
+shown : {e : HFunctor}
+      -> {{api : notes <: e}}
+      -> {{failed : exn Remote.RemoteError <: e}}
+      -> {{ui : dom <: e}}
+      -> (Unit -> Co e Unit)
+      -> Node
+      -> Node
+      -> List Note
+      -> Co e Unit
+shown again list status Nil = pure MkUnit
+shown again list status (n :: rest) = do
+  item <- textIn list "li" (line n)
+  b <- textIn item "button" "toggle"
+  on b "click" (\_ -> toggling again status n.id)
+  shown again list status rest
+
+-- (the notes, as the server has them, shown)
+refresh : {e : HFunctor}
+        -> {{api : notes <: e}}
+        -> {{failed : exn Remote.RemoteError <: e}}
+        -> {{ui : dom <: e}}
+        -> Node
+        -> Node
+        -> Co e Unit
+refresh list status = do
+  ns <- everyNote
+  clear list
+  shown (\u -> refresh list status) list status ns
+  text status (show (List.length ns) ^ " notes")
+
+-- (a note of the input's text added, and the notes shown)
+adding : {e : HFunctor}
+       -> {{api : notes <: e}}
+       -> {{failed : exn Remote.RemoteError <: e}}
+       -> {{ui : dom <: e}}
+       -> Node
+       -> Node
+       -> Node
+       -> Co e Unit
+adding input list status = do
+  t <- value input
+  n <- addNote t
+  refresh list status
+
+-- | The page: an input, a button that adds a note of its text, the
+-- | notes, and a line of what happened, in `#notes`.
+program : {e : HFunctor}
+        -> {{api : notes <: e}}
+        -> {{failed : exn Remote.RemoteError <: e}}
+        -> {{ui : dom <: e}}
+        -> Co e Unit
+program = do
+  box <- select "#notes"
+  found box (\root -> do
+    input <- create "input"
+    attr input "id" "text"
+    append root input
+    add <- textIn root "button" "add"
+    list <- create "ul"
+    append root list
+    status <- textIn root "p" ""
+    on add "click" (\_ -> guarded status (adding input list status))
+    guarded status (refresh list status))
+
+-- | The page's world handles what is not its own: the notes, sent to the
+-- | server at `/api`, and what no `catch` heard of them.
+main : Co page Unit
+main = do
+  r <-
+    attempt
+      Remote.RemoteError
+      page
+      (Remote.remotely
+         notes
+         (exn Remote.RemoteError <+> page)
+         (failed := \p -> InL p)
+         notesApi
+         (RemoteHttp.posted (web := \p -> InR (InR p)) "/api")
+         (program
+            (api := \p -> InL p)
+            (failed := \p -> InR (InL p))
+            (ui := \p -> InR (InR (InL p)))))
+  pure MkUnit

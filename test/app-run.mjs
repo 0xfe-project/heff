@@ -2,10 +2,13 @@
 // The example apps, compiled (`heff compile --backend=page`) and run on a pretend page: a DOM of
 // plain objects, events fired by hand, and time that passes when told to.  Each app is loaded
 // as `<script src>` loads it, a classic script (not a module) in the page's window.
+import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
+import { connect, createServer } from "node:net";
 import { join } from "node:path";
 import vm from "node:vm";
 import { heff, root } from "./heff.mjs";
+import { slot } from "./pool.mjs";
 
 const work = join(root, ".heff", "ref", "app-run");
 mkdirSync(work, { recursive: true });
@@ -33,8 +36,8 @@ const tick = () => { const ts = timers; timers = []; for (const f of ts) f(); };
 // The page's window: its global scope, which a classic script's top-level definitions would
 // be part of, with a browser's text codecs.  `top` is the window's own and cannot be declared again (as a browser's
 // `window.top`); `name`, `status`, `self` and `parent` are the window's too.
-const pageWindow = (page) => {
-  const win = vm.createContext({ document: pretendDocument(page), setTimeout: (f, ms) => { timers.push(f); }, TextDecoder, TextEncoder });
+const pageWindow = (page, more = {}) => {
+  const win = vm.createContext({ document: pretendDocument(page), setTimeout: (f, ms) => { timers.push(f); }, TextDecoder, TextEncoder, ...more });
   vm.runInContext(`Object.defineProperty(globalThis, "top", { get: () => globalThis, configurable: false });
 Object.assign(globalThis, { self: globalThis, parent: globalThis, name: "", status: "" });`, win);
   return win;
@@ -142,5 +145,90 @@ if (counter && clock && load(win, join(work, "counter.js")) && load(win, join(wo
   check("two apps: the counter", label.text, "count: 1");
   check("two apps: the clock", ticks.text, "1 ticks");
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, texts, names and greet run, and counter and clock on one page"}`);
+// A page and its server, one project (examples/notes): `heff build`
+// makes the server, through C, and the page's script; the server runs,
+// and the script, on a pretend page whose `fetch` is Node's, asks it
+// for the notes (browser.remote, std.remote) -- each call's frame POSTed
+// to it, its answer read back.  Each step waits for the page to say
+// what came back; the server gone, a call's failure is said on the page.
+const notes = join(root, "examples", "notes");
+const until = async (what, ok, ms = 20000) => {
+  for (const t0 = Date.now(); !ok();) {
+    if (Date.now() - t0 > ms) { failed++; console.log(`FAIL ${what}: not in ${ms} ms`); return false; }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return true;
+};
+const strayRejections = [];
+process.on("unhandledRejection", (e) => strayRejections.push(String(e && e.stack || e)));
+// (its API's test first: the calls through the wire, with no network)
+const tested = await heff(["test"], { cwd: notes });
+if (tested.status !== 0) { failed++; console.log(`FAIL heff test examples/notes\n${tested.stdout}${tested.stderr}`); }
+const built = await heff(["build"], { cwd: notes, timeout: 600000 });
+if (built.status !== 0) { failed++; console.log(`FAIL heff build examples/notes\n${built.stdout}${built.stderr}`); }
+else {
+  const port = await new Promise((ok) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => ok(p)); }); });
+  const base = `http://127.0.0.1:${port}`;
+  const done = await slot();
+  const server = spawn(join(notes, ".heff", "bin", "server"), [String(port)], { cwd: notes, stdio: ["ignore", "pipe", "pipe"] });
+  let said = "";
+  server.stdout.on("data", (d) => { said += d; });
+  server.stderr.on("data", (d) => { said += d; });
+  const up = async () => {
+    for (let i = 0; i < 400; i++) {
+      if (await new Promise((ok) => { const c = connect({ host: "127.0.0.1", port }); c.on("connect", () => { c.destroy(); ok(true); }); c.on("error", () => ok(false)); })) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return false;
+  };
+  // (a page of the notes, its script the server's, its `fetch` Node's
+  // of the server's URLs)
+  const notesPage = async () => {
+    const page = new Node("body");
+    withBox("notes")(page);
+    const script = await fetch(`${base}/client.js`).then((r) => r.text());
+    const win = pageWindow(page, { fetch: (u, o) => fetch(new URL(u, base), o), AbortController });
+    try { vm.runInContext(script, win, { filename: "client.js" }); } catch (e) { failed++; console.log(`FAIL loading the notes' client: ${e}`); return null; }
+    return page.children[0];
+  };
+  if (!(await up())) { failed++; console.log(`FAIL the notes' server: not listening\n${said}`); }
+  else {
+    const html = await fetch(`${base}/`).then((r) => r.text());
+    check("the notes' page, served", /<script src="client.js">/.test(html), true);
+    const box = await notesPage();
+    if (box) {
+      const [input, add, list, status] = box.children;
+      const lines = () => list.children.map((li) => li.textContent).join("|");
+      await until("the notes, at first", () => status.text === "0 notes");
+      input.value = "milk"; add.fire("click");
+      await until("a note added", () => status.text === "1 notes");
+      input.value = "bread"; add.fire("click");
+      await until("another", () => status.text === "2 notes");
+      check("the notes, as the server has them", lines(), "[ ] milk|[ ] bread");
+      list.children[0].children[0].fire("click");
+      await until("a note toggled", () => lines() === "[x] milk|[ ] bread");
+      // (another page: the same notes, the server's)
+      const other = await notesPage();
+      if (other) {
+        await until("the notes, on another page", () => other.children[3].text === "2 notes");
+        check("the notes, on another page", other.children[2].children.map((li) => li.textContent).join("|"), "[x] milk|[ ] bread");
+      }
+      // (a call of another build of the API: refused, and why)
+      const frame = Buffer.from([0x68, 0x77, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+      const answer = Buffer.from(await fetch(`${base}/api`, { method: "POST", body: frame }).then((r) => r.arrayBuffer()));
+      check("a call of another build: a failure (kind 2), another API (1)", `${answer.subarray(0, 2).toString("latin1")} ${answer[2]} ${answer[3]} ${answer[9]}`, "hw 1 2 1");
+      check("why, said", /^the server's API is notes #[0-9a-f]{8}, the call's #00000000$/.test(answer.subarray(15).toString("latin1")), true);
+      // (the server gone: a call comes to no answer, and the page says so)
+      server.kill();
+      await new Promise((r) => server.once("exit", r));
+      input.value = "tea"; add.fire("click");
+      await until("a call to no server", () => status.text.startsWith("unreachable: fetch: "));
+      check("the notes, as they were", lines(), "[x] milk|[ ] bread");
+    }
+  }
+  server.kill();
+  done();
+  if (strayRejections.length) { failed++; console.log(`FAIL the notes' page: ${strayRejections.join("\n")}`); }
+}
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, texts, names and greet run, and counter and clock on one page; the notes' page and server, each call over the wire"}`);
 process.exit(failed ? 1 : 0);

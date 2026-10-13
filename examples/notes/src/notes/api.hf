@@ -1,0 +1,104 @@
+-- The notes' API: what the server (app/server, C) offers the page
+-- (app/client), as an effect both import (lib/remote.hf).  The page's
+-- handler of it sends each operation to the server; the server's does
+-- it, the notes in a cell of its own; a test's does both, with no
+-- network (test/api.hf).
+
+import co
+import remote as Remote
+import wire as Wire
+
+-- | A note: its number, its text, and whether it is done.
+type Note = { id : Int, text : String, done : Bool }
+
+-- | A note on the wire: as its fields, in pairs.
+instance instanceWireNote : Wire.Wire Note
+instanceWireNote =
+  Wire.via
+    (\(n : Note) -> MkPair n.id (MkPair n.text n.done))
+    (\p -> { id = fst p, text = fst (snd p), done = snd (snd p) })
+
+-- | The operations: a note added (its text: the note made), one done or
+-- | undone (its number: whether there is such a note), and all of them.
+data NotesF (m : Type -> Type) x
+  = Add String (Note -> x)
+  | Toggle Int (Bool -> x)
+  | Every (List Note -> x)
+
+-- | The notes as an effect.
+notes : HFunctor
+notes =
+  { f = NotesF
+  , hfmap = \m g p -> case p of
+      Add t k -> Add t (\n -> g (k n))
+      Toggle i k -> Toggle i (\b -> g (k b))
+      Every k -> Every (\ns -> g (k ns))
+  , hmap = \m n nt p -> case p of
+      Add t k -> Add t k
+      Toggle i k -> Toggle i k
+      Every k -> Every k
+  }
+
+addNote : {e : HFunctor} -> {{api : notes <: e}} -> String -> Co e Note
+addNote t = op (api (Add t (\n -> n))) val
+
+toggleNote : {e : HFunctor} -> {{api : notes <: e}} -> Int -> Co e Bool
+toggleNote i = op (api (Toggle i (\b -> b))) val
+
+everyNote : {e : HFunctor} -> {{api : notes <: e}} -> Co e (List Note)
+everyNote = op (api (Every (\ns -> ns))) val
+
+-- The API on the wire: each operation's index, name and types, once
+--------------------------------------------------------------------------------
+
+addOp : Remote.Operation String Note
+addOp = Remote.operation 0 "add"
+
+toggleOp : Remote.Operation Int Bool
+toggleOp = Remote.operation 1 "toggle"
+
+everyOp : Remote.Operation Unit (List Note)
+everyOp = Remote.operation 2 "every"
+
+-- (each operation, called)
+called : {m : Type -> Type} -> {x : Type} -> NotesF m x -> Remote.Call x
+called (Add t k) = Remote.call addOp t k
+called (Toggle i k) = Remote.call toggleOp i k
+called (Every k) = Remote.call everyOp MkUnit k
+
+-- (each operation, served)
+served : {m : Type -> Type} -> List (Remote.Served (NotesF m Bytes))
+served =
+  [ Remote.serve addOp (\t k -> Add t k)
+  , Remote.serve toggleOp (\i k -> Toggle i k)
+  , Remote.serve everyOp (\u k -> Every k)
+  ]
+
+-- | The API, its fingerprint of its name and its operations.
+notesApi : Remote.Api notes
+notesApi = Remote.api notes "notes" called served
+
+-- What the server does, of the notes it keeps
+--------------------------------------------------------------------------------
+
+-- (the number after the greatest)
+nextId : List Note -> Int
+nextId ns = 1 + List.foldl (\m (n : Note) -> max m n.id) 0 ns
+
+-- | A note added to those kept: it, and them.
+-- | >>> (fst (added "milk" [{ id = 4, text = "tea", done = True }])).id
+-- | 5
+added : String -> List Note -> Pair Note (List Note)
+added t ns =
+  let n = ({ id = nextId ns, text = t, done = False } : Note)
+  in MkPair n (List.append ns [n])
+
+-- (a note, done if it was not, if it is the one)
+flipped : Int -> Note -> Note
+flipped i n = if n.id == i then { n | done = not n.done } else n
+
+-- | The note of the number done, or undone: whether there is one, and
+-- | the notes.
+toggled : Int -> List Note -> Pair Bool (List Note)
+toggled i ns =
+  MkPair (List.any (\(n : Note) -> n.id == i) ns) (List.map (flipped i) ns)

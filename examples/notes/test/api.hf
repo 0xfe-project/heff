@@ -1,0 +1,99 @@
+-- The notes' API with no network: each call written, answered by a
+-- handler of the notes kept in a state, and read back, as the page and
+-- the server would (`Remote.locally`).  `heff test` runs it.
+
+import co
+import exn
+import notes.api
+import remote as Remote
+import state
+
+-- (the notes kept, read)
+notesKept : {e : HFunctor}
+          -> {{st : state (List Note) <: e}}
+          -> Co e (List Note)
+notesKept = get
+
+-- (the notes kept, changed by `f`: what it says of them)
+changed : {e : HFunctor}
+        -> {{st : state (List Note) <: e}}
+        -> {b : Type}
+        -> (List Note -> Pair b (List Note))
+        -> Co e b
+changed f = do
+  ns <- notesKept
+  let p = f ns
+  put (snd p)
+  pure (fst p)
+
+-- (a handler of the API, as the server's is, the notes in a state)
+kept : {e : HFunctor}
+     -> {{st : state (List Note) <: e}}
+     -> {a : Type}
+     -> NotesF (Co e) a
+     -> Co e a
+kept (Add t k) = bind (changed (added t)) (\n -> pure (k n))
+kept (Toggle i k) = bind (changed (toggled i)) (\ok -> pure (k ok))
+kept (Every k) = bind notesKept (\ns -> pure (k ns))
+
+-- (the notes kept, as a function of them)
+stateHandler : Handler (state (List Note))
+stateHandler =
+  { M = \x -> List Note -> Pair x (List Note)
+  , ret = \x st -> MkPair x st
+  , bind = \m k st -> case m st of
+      MkPair x st2 -> k x st2
+  , malg = \p st -> case p of
+      Get k -> MkPair (k st) st
+      Put st2 x -> MkPair x st2
+  }
+
+under : HFunctor
+under = exn Remote.RemoteError <+> state (List Note)
+
+-- (a client's program, through the wire: what it said, or why it failed)
+ran : Co (notes <+> under) String -> String
+ran c =
+  fst
+    (handle
+       stateHandler
+       (bind
+          (attempt
+             Remote.RemoteError
+             (state (List Note))
+             (Remote.locally
+                notes
+                under
+                (failed := \p -> InL p)
+                notesApi
+                (kept (st := \p -> InR p))
+                c))
+          (\r -> pure (either Remote.showRemoteError (\s -> s) r)))
+       Nil)
+
+-- (the notes, as lines)
+lines : List Note -> String
+lines ns =
+  joinWith
+    ", "
+    (List.map
+       (\(n : Note) ->
+          show n.id ^ (if n.done then " [x] " else " [ ] ") ^ n.text)
+       ns)
+
+-- (some notes added, one toggled, all of them)
+session : {e : HFunctor} -> {{api : notes <: e}} -> Co e String
+session = do
+  a <- addNote "milk"
+  b <- addNote "bread"
+  found <- toggleNote a.id
+  none <- toggleNote 9
+  ns <- everyNote
+  pure (lines ns ^ "; " ^ show found ^ " " ^ show none)
+
+-- >>> ran (session (api := \p -> InL p))
+-- "1 [x] milk, 2 [ ] bread; True False"
+
+-- | the operations, as the fingerprint is made of them
+-- >>> Remote.signatures notesApi
+-- ["0 add : String -> Pair Int (Pair String Bool)", "1 toggle : Int -> Bool", "2 every : Unit -> List (Pair Int (Pair String Bool))"]

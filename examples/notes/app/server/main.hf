@@ -1,0 +1,146 @@
+-- The notes' server: the API (notes.api) answered at `/api`, by its real
+-- handler, the notes in a cell of the world; the page
+-- (app/client/index.html) at `/`, and its script at `/client.js`, as
+-- `heff build` makes it (.heff/bin/client.js).  Each connection is a
+-- green thread of its own.  Run from the project's root:
+--
+--   .heff/bin/server [PORT]      (8080 where none is given)
+
+import bytes as Bytes
+import co
+import green
+import notes.api
+import std.filesystem
+import std.http as Http
+import std.http.server as Server
+import std.io
+import std.net as Net
+import std.process
+import std.reactor as Reactor
+import std.ref
+import std.remote as RemoteHttp
+
+world : HFunctor
+world =
+  stdio
+  <+> (Net.net <+> (Reactor.reactor <+> (process <+> (fs <+> ref (List Note)))))
+
+-- (the notes kept, read)
+notesIn : {e : HFunctor}
+        -> {{cell : ref (List Note) <: e}}
+        -> Ref (List Note)
+        -> Co e (List Note)
+notesIn r = readRef r
+
+-- (the notes kept, changed by `f`: what it says of them)
+changed : {e : HFunctor}
+        -> {{cell : ref (List Note) <: e}}
+        -> {b : Type}
+        -> Ref (List Note)
+        -> (List Note -> Pair b (List Note))
+        -> Co e b
+changed r f = do
+  ns <- notesIn r
+  let p = f ns
+  writeRef r (snd p)
+  pure (fst p)
+
+-- | The API's real handler: the notes in the cell.
+kept : {e : HFunctor}
+     -> {{cell : ref (List Note) <: e}}
+     -> Ref (List Note)
+     -> {a : Type}
+     -> NotesF (Co e) a
+     -> Co e a
+kept r (Add t k) = bind (changed r (added t)) (\n -> pure (k n))
+kept r (Toggle i k) = bind (changed r (toggled i)) (\ok -> pure (k ok))
+kept r (Every k) = bind (notesIn r) (\ns -> pure (k ns))
+
+-- (a file of the project's, of a kind: 404 where there is none)
+file : {e : HFunctor}
+     -> {{disk : fs <: e}}
+     -> String
+     -> String
+     -> Co e Http.Response
+file path kind = do
+  got <- readFile path
+  pure
+      (maybe
+         (Server.plain 404 ("no " ^ path ^ ": build the client first\n"))
+         (\body ->
+            { status = 200
+            , headers = [MkPair "Content-Type" kind]
+            , body = Bytes.fromString body
+            })
+         got)
+
+-- (the page, and its script, by their paths)
+pageAt : {e : HFunctor} -> {{disk : fs <: e}} -> String -> Co e Http.Response
+pageAt "/" = file "app/client/index.html" "text/html; charset=utf-8"
+pageAt "/client.js" =
+  file ".heff/bin/client.js" "text/javascript; charset=utf-8"
+pageAt _ = pure (Server.plain 404 "no such page\n")
+
+-- (what is not the API's: the page)
+page : {e : HFunctor}
+     -> {{disk : fs <: e}}
+     -> Server.Request
+     -> Co e Http.Response
+page r = pageAt (RemoteHttp.pathOf r.target)
+
+-- (the listener's connections served, each a thread of its own)
+listening : {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> {{io : stdio <: e}}
+          -> {{nt : Net.net <: e}}
+          -> {{disk : fs <: e}}
+          -> {{cell : ref (List Note) <: e}}
+          -> Ref (List Note)
+          -> Net.Listener
+          -> Co e Unit
+listening r l = do
+  at <- Net.local l
+  print
+      ("listening on http://127.0.0.1:"
+       ^ either (\err -> "?") (\(a : Net.Address) -> show a.port) at)
+  err <-
+    Server.serveConcurrently l (RemoteHttp.routed "/api" notesApi (kept r) page)
+  printErr ("server: " ^ Net.showError err)
+
+-- (the port the arguments say, 8080 where they say none)
+portOf : List String -> Int
+portOf (p :: rest) = fromMaybe 8080 (parseInt p)
+portOf Nil = 8080
+
+program : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : fs <: e}}
+        -> {{cell : ref (List Note) <: e}}
+        -> Co e Unit
+program = do
+  as <- args
+  let port = portOf as
+  r <- newRef (Nil : List Note)
+  l <- Net.listen "127.0.0.1" port 128
+  either
+      (\err -> printErr ("server: cannot listen: " ^ Net.showError err))
+      (listening r)
+      l
+
+main : Co world Unit
+main = do
+  done <-
+    Reactor.scheduled
+      world
+      (rx := \p -> InR (InR (InL p)))
+      (program
+         (gr := \p -> InL p)
+         (io := \p -> InR (InL p))
+         (nt := \p -> InR (InR (InL p)))
+         (sys := \p -> InR (InR (InR (InR (InL p)))))
+         (disk := \p -> InR (InR (InR (InR (InR (InL p))))))
+         (cell := \p -> InR (InR (InR (InR (InR (InR p)))))))
+  pure MkUnit
