@@ -1,16 +1,14 @@
 # heff
 
-heff is a functional language with a Haskell-like syntax, based on
-Hippogriff (Lynch & Staton, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728)),
-a typed language with a phase distinction.
+heff is a functional language with a Haskell-like syntax and a phase
+distinction: types are computed with at compile time, data at run time.
 
 - **Types at compile time.** Types, functions of types and records of
   them (theories) are values the type checker computes with -- a
   function takes its types as arguments, `{a : Type} -> ...` -- while
   run-time data (numbers, strings, data types) never reaches a type.
-- **Algebraic effects**, as a library (`lib/co.hf`, after Yang and Wu,
-  POPL 2026): a computation names the effects it needs as instance
-  arguments, and is given them where it runs.
+- **Algebraic effects** as a library: a computation names the effects it
+  needs as instance arguments, and is given them where it runs.
 - **Self-hosting**: the compiler is written in heff, and builds from a
   seed of itself compiled to C.
 - **Two backends**: C (native programs, by `zig cc`) and JavaScript
@@ -115,3 +113,9 @@ make         # every target
 
 How the source is laid out, the seed and the test groups are in
 [docs/developing.md](docs/developing.md).
+
+## References
+
+- Lynch & Staton, *Hippogriff*, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728):
+  the typed language with a phase distinction heff is based on.
+- Yang & Wu, POPL 2026: the algebraic effects of `lib/co.hf`.
