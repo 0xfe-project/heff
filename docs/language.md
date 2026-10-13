@@ -33,6 +33,13 @@ from its signature, which they are right under, no other definition
 between them (a watch may be).  A tag is no definition: two types may
 have the same.
 
+A tag has no type of its own either: it is checked at the type it is
+wanted at.  At a function type it is the function that applies it to
+the arguments the type takes -- `MkBox` at `Int -> Box` is `\x -> MkBox
+x`, `MkP 1` at `Int -> P` is `\y -> MkP 1 y` -- so `List.map MkBox [1,
+2]` needs no lambda written; whether the tag is the last codomain's, and
+with how many fields, is said as of the tag applied by hand.
+
 `import m as M` imports `m` qualified only: its definitions are `M.x`.
 At `M.x` the alias comes first, before a type or a constructor of the
 same name -- a type has no fields -- so a module may be imported under
