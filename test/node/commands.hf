@@ -1,8 +1,11 @@
 -- Commands run to their end (test/backends.mjs): each option of
 -- std.process's `Invocation` -- a directory, an environment, an input,
--- a time limit, a bound on what is kept -- and each way a command ends.
+-- a time limit, a bound on what is kept -- and each way a command ends;
+-- commands started and waited for later; commands spoken to, as an
+-- editor speaks to a language server.
 -- (POSIX: the commands are sh's.)
 
+import bytes as Bytes
 import co
 import std.handle
 import std.io
@@ -118,6 +121,148 @@ startedOnes = do
   missing <- start { command = "heff-no-such-command" }
   print ("not started: " ^ maybe "nothing" (\p -> "a subprocess") missing)
 
+-- (what a read was given, said)
+receivedSaid : Received -> String
+receivedSaid (Got b) = "got " ^ show (Bytes.asString b)
+receivedSaid Timeout = "timeout"
+receivedSaid Closed = "closed"
+
+-- (a read, said on a line)
+readSaid : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> String
+         -> Subprocess
+         -> Portion
+         -> Int
+         -> Co e Unit
+readSaid what p n ms = do
+  r <- readOutput p n ms
+  print (what ^ ": " ^ receivedSaid r)
+
+-- (a write, said on a line)
+writeSaid : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> String
+          -> Subprocess
+          -> String
+          -> Co e Unit
+writeSaid what p text = do
+  ok <- writeInput p (Bytes.fromString text)
+  print (what ^ ": " ^ (if ok then "written" else "not written"))
+
+-- (a message framed as the language server protocol frames one: how
+-- many bytes it is, a blank line, and it)
+framed : String -> Bytes
+framed body =
+  Bytes.append
+    (Bytes.fromString
+       ("Content-Length: "
+        ^ show (Bytes.length (Bytes.fromString body))
+        ^ "\r\n\r\n"))
+    (Bytes.fromString body)
+
+-- (a header's line, as its name and its value: the length it says, if it
+-- is `Content-Length`)
+lengthField : List String -> Maybe Int
+lengthField (name :: value :: Nil) =
+  if strEq name "Content-Length" then parseInt (trim value) else Nothing
+lengthField _ = Nothing
+
+firstJust : List (Maybe Int) -> Maybe Int
+firstJust Nil = Nothing
+firstJust (Just n :: rest) = Just n
+firstJust (Nothing :: rest) = firstJust rest
+
+-- (the length the headers say)
+contentLength : String -> Maybe Int
+contentLength headers =
+  firstJust (List.map (\l -> lengthField (split ": " l)) (split "\r\n" headers))
+
+-- (the message the headers frame, read: as many bytes as they say)
+bodyOf : {e : HFunctor}
+       -> {{sys : process <: e}}
+       -> Subprocess
+       -> Maybe Int
+       -> Co e String
+bodyOf p Nothing = pure "no length"
+bodyOf p (Just n) = do
+  body <- readOutput p (Exactly n) 5000
+  pure (show n ^ " bytes, " ^ receivedSaid body)
+
+bodyAfter : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> Subprocess
+          -> Received
+          -> Co e String
+bodyAfter p (Got headers) = bodyOf p (contentLength (Bytes.asString headers))
+bodyAfter p r = pure ("headers " ^ receivedSaid r)
+
+-- (a message read as the protocol frames it: its headers, up to their
+-- blank line, then its body)
+readFramed : {e : HFunctor}
+           -> {{sys : process <: e}}
+           -> Subprocess
+           -> Co e String
+readFramed p = do
+  headers <- readOutput p (Through "\r\n\r\n") 5000
+  bodyAfter p headers
+
+-- (commands spoken to: written to and read from as they go)
+spokenTo : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> Co e Unit
+spokenTo = do
+  cat <- mustStart { command = "cat", input = Piped, output = Piped }
+  readSaid "nothing yet" cat Available 100
+  writeSaid "one" cat "one\n"
+  readSaid "a line" cat (Through "\n") 5000
+  writeSaid "two, three" cat "two\nthree\n"
+  readSaid "a line" cat (Through "\n") 5000
+  readSaid "four bytes" cat (Exactly 4) 5000
+  readSaid "more than there is" cat (Exactly 100) 100
+  writeSaid "the rest" cat "\n"
+  closeInput cat
+  readSaid "at its end" cat (Exactly 100) 5000
+  readSaid "after its end" cat Available 5000
+  writeSaid "after its end" cat "lost\n"
+  catRan <- wait cat
+  print (ranSaid "cat" catRan)
+  server <- mustStart { command = "cat", input = Piped, output = Piped }
+  writeSaid
+      "two messages"
+      server
+      (Bytes.asString
+         (Bytes.append
+            (framed "{\"id\":1,\"name\":\"caf\u{e9}\"}")
+            (framed "{\"id\":2}")))
+  first <- readFramed server
+  print ("first: " ^ first)
+  second <- readFramed server
+  print ("second: " ^ second)
+  none <- readFramed server
+  print ("none yet: " ^ none)
+  serverRan <- wait server
+  print (ranSaid "server" serverRan)
+  lines <-
+    mustStart
+      { (sh "echo one; echo two; echo oops >&2")
+      | output = Piped
+      , errors = Piped
+      }
+  readSaid "its output" lines (Through "\n") 5000
+  err <- readErrors lines (Through "\n") 5000
+  print ("its errors: " ^ receivedSaid err)
+  rest <- wait lines
+  print (ranSaid "unread" rest)
+  given <- mustStart { command = "cat", input = Given "given\n" }
+  writeSaid "to a given input" given "more\n"
+  readSaid "a collected output" given Available 100
+  givenRan <- wait given
+  print (ranSaid "given" givenRan)
+
 -- (`n` bytes)
 bytesOf : Int -> String
 bytesOf n = joinWith "" (List.replicate (n / 10) "0123456789")
@@ -153,6 +298,7 @@ program = do
   said "written forever" { command = "yes", timeout = 300, keep = 6 }
   said "not there" { command = "heff-no-such-command" }
   startedOnes
+  spokenTo
 
 main : Co world Unit
 main = program (io := \p -> InL p) (sys := \p -> InR p)

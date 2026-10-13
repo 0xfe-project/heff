@@ -209,9 +209,10 @@ checks.push((async () => {
 
 // (commands run to their end, std.process's `run`: each option of an
 // `Invocation` and each way a command ends; then commands started and
-// waited for later, `start`, `waitAny`, `kill` -- the commands sh's, so
-// not on Windows; given an input of its own, which the commands run
-// with none must not see)
+// waited for later, `start`, `waitAny`, `kill`; then commands spoken
+// to, `writeInput` and `readOutput`, a Content-Length framed exchange
+// among them -- the commands sh's, so not on Windows; given an input of
+// its own, which the commands run with none must not see)
 if (process.platform !== "win32") checks.push(ran("commands", "test/node/commands.hf", "main", [], {
   out: [
     'plain: exited 0, out "out\\n", err "err\\n"',
@@ -242,6 +243,29 @@ if (process.platform !== "win32") checks.push(ran("commands", "test/node/command
     "shown",
     'inherited: exited 0, out "", err "shown too\\n"',
     "not started: nothing",
+    "nothing yet: timeout",
+    "one: written",
+    'a line: got "one\\n"',
+    "two, three: written",
+    'a line: got "two\\n"',
+    'four bytes: got "thre"',
+    "more than there is: timeout",
+    "the rest: written",
+    'at its end: got "e\\n\\n"',
+    "after its end: closed",
+    "after its end: not written",
+    'cat: exited 0, out "", err ""',
+    "two messages: written",
+    'first: 23 bytes, got "{\\"id\\":1,\\"name\\":\\"café\\"}"',
+    'second: 8 bytes, got "{\\"id\\":2}"',
+    "none yet: headers timeout",
+    'server: exited 0, out "", err ""',
+    'its output: got "one\\n"',
+    'its errors: got "oops\\n"',
+    'unread: exited 0, out "two\\n", err ""',
+    "to a given input: not written",
+    "a collected output: closed",
+    'given: exited 0, out "given\\n", err ""',
     "",
   ].join("\n"),
   err: "", status: 0,

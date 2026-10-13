@@ -437,13 +437,15 @@ t <- run { command = "heff", args = ["test"], env = [MkPair "HEFF_TTY" "0"],
 - `env` (none), environment variables set for it over the program's
   own, which it has too (the environment is never cleared);
 - `input` (`NoInput`), its standard input: `Given` a string, written
-  to it through a pipe and then closed; `Inherited`, the program's
-  own; `NoInput` is no input at all -- the null device (`/dev/null`,
-  `NUL`), not the program's standard input nor a closed descriptor,
-  which the command's next open would take;
+  to it through a pipe and then closed; `Piped`, a pipe the program
+  writes to as it goes (a started command's, below); `Inherited`, the
+  program's own; `NoInput` is no input at all -- the null device
+  (`/dev/null`, `NUL`), not the program's standard input nor a closed
+  descriptor, which the command's next open would take;
 - `output` and `errors` (`Collected`), its output and its error stream:
-  `Collected`, read as they come and kept for its `Ran`; `Inherited`,
-  the program's own, written there as they come;
+  `Collected`, read as they come and kept for its `Ran`; `Piped`, a
+  pipe the program reads as it goes (below); `Inherited`, the program's
+  own, written there as they come;
 - `timeout` (0, as long as it takes), milliseconds, after which it is
   killed (SIGKILL; on Windows, TerminateProcess) and not waited for
   further, not even for what its own children still write;
@@ -499,6 +501,54 @@ terminated at the program's end, and where a signal (SIGINT, SIGTERM,
 SIGHUP) ends it.  (`heff dev` runs a project's programs so, their
 streams `Inherited`.)  How many there are to run at once, a pool's
 size, is std.thread's `cores`, the machine's cores.
+
+A started command is spoken to where its streams are `Piped`: as an
+editor speaks to a language server, writing a request and reading the
+answers as they come.  `writeInput p b` writes the `Bytes` to its
+input, all of them, waiting while its pipe is full (what it writes is
+read meanwhile, so that it never waits on the program while the program
+waits on it): `False` where they could not be written, the input not
+`Piped`, closed, or no more read.  `closeInput p` closes it, and the
+command reads its end (`wait` closes it too; `waitAny` does not).
+`readOutput p portion ms` is of what it has written to its output and
+the program has not yet read, a `Portion`, waited for up to `ms`
+milliseconds (0: as long as it takes): `Available`, whatever there is,
+waiting for some; `Exactly n`, so many bytes; `Through d`, all up to
+and with the first `d` (`"\n"`, a line; `"\r\n\r\n"`, the headers of
+HTTP and of LSP).  It is `Received`: `Got` the bytes; `Timeout`, with
+what there is left for the next read; `Closed`, the stream at its end,
+or not `Piped`.  At the end a read takes what is left, fewer bytes than
+asked or no `d`, and the next is `Closed`.  `readErrors` is the same of
+its error stream, `Piped`; left `Collected` or `Inherited`, the error
+stream is as `run` has it.  What a `Piped` stream has written and the
+program has not read is its `Ran`'s.  Reads are in bytes, as the
+framing counts them: `Bytes.asString` reads them as text where they
+are.
+
+```haskell
+-- (a message framed as the language server protocol frames one)
+framed : String -> Bytes
+framed body =
+  Bytes.append
+    (Bytes.fromString ("Content-Length: " ^ show (length (Bytes.fromString body)) ^ "\r\n\r\n"))
+    (Bytes.fromString body)
+
+-- (the message the headers frame, read: as many bytes as they say)
+bodyOf : {e : HFunctor} -> {{sys : process <: e}} -> Subprocess -> Received -> Co e Received
+bodyOf p (Got headers) = case contentLength (Bytes.asString headers) of
+  Just n -> readOutput p (Exactly n) 5000
+  Nothing -> pure Closed
+bodyOf p r = pure r
+
+-- (a request to the server, and the next message from it)
+asked : {e : HFunctor} -> {{sys : process <: e}} -> Subprocess -> String -> Co e Received
+asked server request = do
+  _ <- writeInput server (framed request)
+  headers <- readOutput server (Through "\r\n\r\n") 5000
+  bodyOf server headers
+```
+
+(`contentLength` parses the headers; test/node/commands.hf has one.)
 
 ## The terminal
 

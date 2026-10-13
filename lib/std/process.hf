@@ -1,7 +1,7 @@
 -- The process as an effect (lib/co.hf): its arguments, its environment,
 -- where its program is and where it runs, the commands it runs -- to
--- their end, or started beside it and waited for later -- and how it ends
--- (process.provider.c).
+-- their end, or started beside it, spoken to and waited for later -- and
+-- how it ends (process.provider.c).
 
 import co
 import std.handle
@@ -15,13 +15,28 @@ data Ended = Exited Int | Signalled Int | TimedOut | NotRun
 
 -- | What a command's standard input is: none, the null device (not the
 -- | program's, nor a closed descriptor, which its next open would take);
--- | a string, written to it and then closed; or the program's own.
-data Input = NoInput | Given String | Inherited
+-- | a string, written to it and then closed; a pipe the program writes
+-- | to as it goes, `writeInput`, until `closeInput`; or the program's
+-- | own.
+data Input = NoInput | Given String | Piped | Inherited
 
 -- | What a command's output, or its error stream, is: read as it comes
--- | and kept for its `Ran`; or the program's own, written there as it
--- | comes, its `Ran` given none of it.
-data Output = Collected | Inherited
+-- | and kept for its `Ran`; a pipe the program reads as it goes,
+-- | `readOutput`, `readErrors`, what it has not read its `Ran`'s; or the
+-- | program's own, written there as it comes, its `Ran` given none of it.
+data Output = Collected | Piped | Inherited
+
+-- | How much a read takes of what a command has written and the program
+-- | has not yet read: whatever there is, waiting for some; so many bytes;
+-- | or all up to and with the first of a string (`"\n"`: a line;
+-- | `"\r\n\r\n"`: HTTP's and LSP's headers).
+data Portion = Available | Exactly Int | Through String
+
+-- | What a read was given: bytes; nothing within its time limit, the
+-- | bytes there are left for the next read; or nothing, as the stream
+-- | has ended (or is not `Piped`).  At the end, a read takes what is
+-- | left, fewer bytes than asked or no string, and the next is `Closed`.
+data Received = Got Bytes | Timeout | Closed
 
 -- | A command to run: its name (found on the PATH), its arguments, and
 -- | how it is run.  Each field but the name has a default, so a record
@@ -89,6 +104,10 @@ data ProcessF (m : Type -> Type) x
   | TryWait Subprocess (Maybe Ran -> x)
   | Kill Subprocess x
   | Terminate Subprocess (Ran -> x)
+  | WriteInput Subprocess Bytes (Bool -> x)
+  | CloseInput Subprocess x
+  | ReadOutput Subprocess Portion Int (Received -> x)
+  | ReadErrors Subprocess Portion Int (Received -> x)
 
 -- | The process as an effect.
 process : HFunctor
@@ -109,6 +128,10 @@ process =
       TryWait s k -> TryWait s (\r -> g (k r))
       Kill s x -> Kill s (g x)
       Terminate s k -> Terminate s (\r -> g (k r))
+      WriteInput s b k -> WriteInput s b (\r -> g (k r))
+      CloseInput s x -> CloseInput s (g x)
+      ReadOutput s n ms k -> ReadOutput s n ms (\r -> g (k r))
+      ReadErrors s n ms k -> ReadErrors s n ms (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       Args k -> Args k
       GetEnv name k -> GetEnv name k
@@ -124,6 +147,10 @@ process =
       TryWait s k -> TryWait s k
       Kill s x -> Kill s x
       Terminate s k -> Terminate s k
+      WriteInput s b k -> WriteInput s b k
+      CloseInput s x -> CloseInput s x
+      ReadOutput s n ms k -> ReadOutput s n ms k
+      ReadErrors s n ms k -> ReadErrors s n ms k
   }
 
 -- | The program's arguments (not Node's, nor the program's own path):
@@ -184,14 +211,16 @@ start : {e : HFunctor}
       -> Co e (Maybe Subprocess)
 start c = op (ev (Start c (\s -> s))) val
 
--- | The command waited for, to its end: its `Ran`, and its handle let
--- | go of (an operation given it after that fails the program).
+-- | The command waited for, to its end -- its input closed first, where
+-- | it is `Piped` -- its `Ran`, and its handle let go of (an operation
+-- | given it after that fails the program).
 wait : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Ran
 wait s = op (ev (Wait s (\r -> r))) val
 
 -- | Whichever of the commands ends first, waited for: it and its `Ran`,
 -- | its handle let go of, the others running still (`Nothing`: there
--- | are none).
+-- | are none).  An input `Piped` is left open: a command that reads it
+-- | to its end does not end until it is closed.
 waitAny : {e : HFunctor}
         -> {{ev : process <: e}}
         -> List Subprocess
@@ -216,3 +245,41 @@ kill s = op (ev (Kill s MkUnit)) val
 -- | `Ran`, and its handle let go of.
 terminate : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Ran
 terminate s = op (ev (Terminate s (\r -> r))) val
+
+-- | The bytes written to the command's input, `Piped`, all of them,
+-- | waiting while its pipe is full (what it writes read meanwhile, so
+-- | that it never waits on the program): `False` where they could not
+-- | be, the input not `Piped`, closed, or no more read.
+writeInput : {e : HFunctor}
+           -> {{ev : process <: e}}
+           -> Subprocess
+           -> Bytes
+           -> Co e Bool
+writeInput s b = op (ev (WriteInput s b (\r -> r))) val
+
+-- | The command's input, `Piped`, closed: it reads its end.
+closeInput : {e : HFunctor}
+           -> {{ev : process <: e}}
+           -> Subprocess
+           -> Co e Unit
+closeInput s = op (ev (CloseInput s MkUnit)) val
+
+-- | Of what the command has written to its output, `Piped`, and the
+-- | program not yet read, the portion, waited for up to `ms`
+-- | milliseconds (0: as long as it takes).
+readOutput : {e : HFunctor}
+           -> {{ev : process <: e}}
+           -> Subprocess
+           -> Portion
+           -> Int
+           -> Co e Received
+readOutput s n ms = op (ev (ReadOutput s n ms (\r -> r))) val
+
+-- | `readOutput`, of its error stream.
+readErrors : {e : HFunctor}
+           -> {{ev : process <: e}}
+           -> Subprocess
+           -> Portion
+           -> Int
+           -> Co e Received
+readErrors s n ms = op (ev (ReadErrors s n ms (\r -> r))) val
