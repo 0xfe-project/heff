@@ -3178,6 +3178,14 @@ static V heff_bytesFromString(V a) {
   return (V)s;
 }
 
+// (a string of them, as they are: `bytesFromString` undone)
+static V heff_bytesAsString(V a) {
+  Str *x = (Str *)a;
+  V s = heff_str_of(x->s, x->len);
+  heff_drop(a);
+  return s;
+}
+
 // (their text: what is not UTF-8 in them U+FFFD, as TextDecoder reads it)
 static V heff_bytesToString(V a) {
   Str *x = (Str *)a;
