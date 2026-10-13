@@ -8,7 +8,7 @@
 
 ZIG ?= zig
 NODE ?= node
-# (the heff fmt runs, and the tests, as test/heff.mjs says: HEFF, given
+# (the heff fmt runs, and the tests: HEFF, given
 # on the command line or in the environment, else the one built)
 HEFF ?= .heff/out/heff
 # (the .hf files laid out by `heff fmt`: the tests' are left as they are,

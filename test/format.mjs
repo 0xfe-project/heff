@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The formatter (src/heff/syntax/format.hf), as `heff fmt` runs it: every
+// The formatter, as `heff fmt` runs it: every
 // .hf file of the repository (that parses) is formatted (the formatter
 // checks itself that the result means the same and keeps the comments)
 // and formatting it again changes nothing; then cases of comments, blank

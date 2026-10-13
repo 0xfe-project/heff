@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `heff dev` (src/heff/build/dev.hf): a project of a C program that runs
+// `heff dev`: a project of a C program that runs
 // until it is ended (a server's shape) and a page's program, built and
 // run -- the program's output heff's -- and the page served, with what
 // reloads it; a source changed, built again and the program run anew; a

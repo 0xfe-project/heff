@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // The command line: `promote` writes each watch's and doc test's value
-// under it, `test` runs the tests (lib/check.hf) and shrinks what fails,
+// under it, `test` runs the tests and shrinks what fails,
 // `fmt` lays files out in place (with `--check`, only names them),
 // `version` says which heff runs, and the usage, the completions and an
 // unknown command say what they should, on the right stream, with the
@@ -199,7 +199,7 @@ expect("fmt by imported fixities", cut.status === 0 && readFileSync(join(work, "
 // failing; a command's own help, asked for; its words wrong, what is wrong
 // and how it is called, on stderr
 // (with no words, not on a terminal: the usage, as `help` says it --
-// on one, its commands' app, test/terminal.mjs's)
+// on one, its commands' app)
 const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "build", "install", "publish", "dev", "lsp", "version", "help", "completions"];
 for (const args of [[], ["help"], ["--help"]]) {
   const r = await heff(...args);

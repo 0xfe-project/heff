@@ -18,7 +18,7 @@ const disk = (f) => readFileSync(join(root, f), "utf8");
 // (as vscode-languageclient starts it, with `--stdio`)
 // (with a bounded heap: what it keeps must fit, on any machine; told it
 // is on a terminal, which it says nothing to in colour all the same)
-// (a slot of the tests' budget taken for it, as test/pool.mjs takes one
+// (a slot of the tests' budget taken for it, as the pool takes one
 // for a process run, and held while it runs -- idle mostly, but deep in
 // elaborating at times -- its waits counted only once it has one)
 await slot();

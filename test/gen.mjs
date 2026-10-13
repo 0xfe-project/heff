@@ -1,5 +1,4 @@
 // Random Hippogriff programs: type-directed, so most of them are well typed.
-// For the compiler's test (test/backends.mjs).
 // --- deterministic random ---------------------------------------------------
 let seed = 1;
 export const setSeed = (s) => { seed = Number(s) >>> 0 || 1; };

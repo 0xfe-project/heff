@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Projects (src/heff/build/project.hf, src/heff/build/load.hf): `heff init` makes one
+// Projects: `heff init` makes one
 // that builds, its watches and tests holding; a project's modules are
 // under src/, a file outside it (a test) may import the project's
 // modules and helpers beside it, what is in src/ may not import those; a
@@ -498,10 +498,10 @@ expect("install heff: the heff home says the repository is heff's own", existsSy
   selfInstalled.stdout.includes(`installed ${join(heffHome, "source")}\n`) &&
   selfOwn.status === 0 && !/E03(3[56]|47)/.test(selfOwn.stderr), [existsSync(join(heffHome, "source")) && readFileSync(join(heffHome, "source"), "utf8"), selfOwn]);
 
-// a manifest's fields with a default in lib/manifest.hf (`require`,
+// a manifest's fields with a default in the manifest's types (`require`,
 // `replace`, a build.hf's `ships`: empty lists) left out, or written: heff
 // reading package.hf and build.hf (without elaborating them, `heff
-// build`) and elaborating them (`heff check`, against lib/manifest.hf)
+// build`) and elaborating them (`heff check`, against the manifest's types)
 // agree on each, and on a field without one left out, or the fields out
 // of order -- saying the same fields, and which may be left out
 const packageFields = "the fields are module, heff, require, replace, in this order (require and replace may be left out)";

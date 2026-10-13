@@ -3,8 +3,8 @@
 //
 //   node test/backends.mjs [N] [SEED]
 //
-// Values: the programs of test/programs and N generated ones (test/gen.mjs,
-// from SEED) compiled by each backend -- JavaScript (`--backend=esm`, its
+// Values: the programs of test/programs and N generated ones (from
+// SEED) compiled by each backend -- JavaScript (`--backend=esm`, its
 // definitions shown by test/load-js.mjs) and C (`--backend=c` without
 // `--name`: the program shows the definitions it is asked for), built by
 // `zig cc` (`cc` where there is no zig) -- and each definition the
@@ -512,7 +512,7 @@ if (process.platform !== "win32") checks.push((async () => {
   return msgs;
 })());
 
-// green threads (lib/green.hf), scheduled by std.reactor, by C alone: one
+// green threads, scheduled by std.reactor, by C alone: one
 // reads the standard input, a pipe, a line at a time, while another
 // counts -- the count written before any input comes, as the test writes
 // none until it is (a read that held up the whole program would never
@@ -565,7 +565,7 @@ if (process.platform !== "win32") checks.push((async () => {
     : [`FAIL sockets (c): status ${r.status}\n${r.stdout}${r.stderr}`];
 })());
 
-// green threads (lib/green.hf) doing std.net's operations, scheduled by
+// green threads doing std.net's operations, scheduled by
 // std.reactor, by C alone: a thread blocked on a read lets another run,
 // whose write it then reads; fifty clients echoed at once, all holding
 // their connections, by a server of a thread a connection; a connection
@@ -875,9 +875,9 @@ checks.push(ran("state peeled in-language", "test/node/counted.hf", "main", [], 
 checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
   { out: "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n", status: 0 }));
 
-// processes (test/node/fork.provider.c forks): the rest of the program run
+// processes (forked): the rest of the program run
 // by each of them, each on its own copy, their strings gathered in
-// order, and lib/parallel.hf's `Parallel` each side a process -- what was
+// order, and `Parallel` each side a process -- what was
 // written before a spread written once
 if (process.platform !== "win32") checks.push((async () => {
   const p = await program("test/node/fork.hf", "main");
@@ -888,15 +888,15 @@ if (process.platform !== "win32") checks.push((async () => {
   return r.status === 0 && r.stdout === want ? [] : [`FAIL processes (c): status ${r.status}\n${r.stdout}${r.stderr}`];
 })());
 
-// threads truly at once (std.thread, whose provider,
-// lib/std/thread.provider.c, says `#define HEFF_THREADS 1`: the runtime
-// built for threads, docs/threads.md): the rest of the program run by
+// threads truly at once (std.thread, whose provider
+// says `#define HEFF_THREADS 1`: the runtime
+// built for threads): the rest of the program run by
 // each thread, shared by them (#66), their answers gathered in order; a
 // definition every thread asks for, computed once; tasks taken by
 // threads as they end one; a static thunk, and a shared one, forced by
 // threads at once;
 // functions whose C workers take their numbers unboxed (#39) called in
-// each; lib/parallel.hf's `Parallel` each side a thread; answers of any type
+// each; `Parallel` each side a thread; answers of any type
 // (strings, lists, pairs) mapped, gathered and each side of a `Parallel`; and
 // a thread abandoning, a spread's or a pool's task, the program
 // abandoning when it is joined.  HEFF_TSAN=1: built with ThreadSanitizer
@@ -941,9 +941,9 @@ if (process.platform !== "win32") checks.push((async () => {
 
 // loops, compiled as loops: a million rounds, and the stack does not
 // overflow -- in C, a stack of 8 MiB, which a million calls not made
-// loops would (a call of itself put in a tag, src/heff/compile/trmc.hf;
-// functions calling one another last, round a cycle, workers among them:
-// src/heff/compile/worker.hf, of other arities too: cycles.hf, #78).  No
+// loops would (a call of itself put in a tag;
+// functions calling one another last, round a cycle, workers among them,
+// of other arities too, #78).  No
 // call made a jump by the C compiler but those it must make (`musttail`),
 // and none of those either (`HEFF_NO_JUMPS`, as where there is no
 // `musttail`): a loop all the same

@@ -9,7 +9,7 @@ export const heffBin = process.env.HEFF
   ? resolve(process.env.HEFF)
   : join(root, ".heff", "out", process.platform === "win32" ? "heff.exe" : "heff");
 
-// (heff run with `args`, as test/pool.mjs runs a process -- once it has
+// (heff run with `args`, as the pool runs a process -- once it has
 // its slot -- `opts` as its; a run that does not end in two minutes a
 // failure, not a wait)
 export const heff = (args, opts = {}) => run(heffBin, args, { timeout: 120000, ...opts });

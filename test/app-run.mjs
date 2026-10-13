@@ -119,7 +119,7 @@ if (texts) check("JSString given as it is", texts.children[0].children.map((c) =
 // an app whose definitions have the names of the window's own
 const names = await run("test/apps/names.hf", "names", withOut);
 if (names) check("the window's names, the app's", names.children[0].text, "top name status self parent");
-// the page's own input and paragraph (examples/greet/index.html)
+// the page's own input and paragraph
 const greetPage = (page) => {
   const input = new Node("input"); input.setAttribute("id", "name"); input.value = "";
   const p = new Node("p"); p.setAttribute("id", "greeting");
@@ -159,7 +159,7 @@ const until = async (what, ok, ms = 20000) => {
   }
   return true;
 };
-// A GPU (lib/gpu.provider.js, WebGPU's) on the pretend page: where it
+// A GPU (WebGPU's) on the pretend page: where it
 // has no `navigator.gpu`, the page says so; given a pretend device, the
 // provider's wiring -- buffers made and written, bound in order, the
 // kernel dispatched, the sum copied to a buffer mapped and read back,

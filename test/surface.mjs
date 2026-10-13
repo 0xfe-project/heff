@@ -1,10 +1,6 @@
 #!/usr/bin/env node
 // The `.hf` programs: the library, the examples and the tests elaborate and
 // their expectations hold; one that does not is reported.
-// (The apps are run by test/app-run.mjs; what `heff check` says of each
-// file of the library and the tests -- among them the errors of
-// test/errors/ and the module rules' of test/modules/ -- is held by
-// test/golden.mjs, byte for byte.)
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -79,7 +75,7 @@ if (w.status === 0 || !report.includes("[-onn-]{+on+}") || !report.includes("…
 // declare, neither made of the other, where they meet, at the import that
 // brings in the second -- and in no module made of that one; each place
 // said.  One the runtime has not is refused.  (A module of a program
-// declares none: test/errors/primitive.hf.)
+// declares none.)
 {
   const dir = mkdtempSync(join(tmpdir(), "heff-primitives-"));
   const lib = join(dir, "lib");

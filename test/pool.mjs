@@ -3,11 +3,11 @@
 // cache (.heff/vN/*.hc) is shared among heff runs --
 // concurrent writers of one module write the same bytes, and a torn
 // file does not decode, so it is elaborated over.
-// Under test/run.mjs, which runs the scripts all at once, each process
+// Under the runner, which runs the scripts all at once, each process
 // takes a slot of its budget first (`HEFF_TEST_JOBSERVER`, where it is
 // served) and gives it back when it ends: so many at once among all the
 // scripts, whatever each one's pool, on a machine of two cores as on one
-// of fourteen.  A slot is held by a connection to test/run.mjs, and given
+// of fourteen.  A slot is held by a connection to the runner, and given
 // back when it is closed -- by a script that crashes too -- and a process
 // is given its time once it has its slot, not while it waits for one.
 // (What only looks around -- `git`, `ls`, a `--version` -- is run as it

@@ -1,13 +1,11 @@
 #!/usr/bin/env node
-// heff with no words, on a terminal: its commands' app (lib/std/terminal.hf,
-// lib/std/cli/interactive.hf), driven by keys typed at a pseudo-terminal
+// heff with no words, on a terminal: its commands' app, driven by keys typed at a pseudo-terminal
 // of 100 columns by 30 rows (test/pty.c, built here by zig cc): the list
 // drawn on the alternate screen, filtered, a command's form filled in
 // and its command line run once the app has put the terminal back as it
 // was; Esc and `q` leaving it, with nothing run; Ctrl-C ending heff with
 // the terminal put back.  On a terminal that is `dumb`, or not on one,
-// heff says its usage, as before.  (The app's states, key by key, are
-// test/programs/terminal.hf's, held to every backend.)
+// heff says its usage, as before.
 //
 //   node test/terminal.mjs
 import { spawn, spawnSync } from "node:child_process";

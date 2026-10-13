@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Progress (lib/std/progress.hf): on a terminal -- the standard error a
+// Progress: on a terminal -- the standard error a
 // terminal, `TERM` not `dumb` -- `heff build` draws what it is doing
 // below what it writes, zig's own progress among it (`zig cc`, through
 // `ZIG_PROGRESS`), and clears it: what is left on the screen is what it

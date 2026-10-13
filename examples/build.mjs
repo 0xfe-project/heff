@@ -3,7 +3,7 @@
 // index.html); this writes its app, NAME.js, with
 // `heff compile --backend=page`, to .heff/examples/NAME/, beside a copy of
 // its index.html, which opens there as it is.  (The apps are built, not
-// kept: test/app-run.mjs runs them.)
+// kept.)
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";

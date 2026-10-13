@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 // The tests, by group: each GROUP given (all without one), each of its
-// tests a script of test/, on heff as test/heff.mjs says (`HEFF`, else
+// tests a script of test/, on heff (`HEFF`, else
 // .heff/out/heff, built by `make build`).  CI runs them all but asan in
 // one job, on a runner of two cores.  (That heff compiles itself to
 // itself is `make test-fixpoint`'s, by zig: `zig build fixpoint`.)
 // (The scripts run all at once -- each makes what it makes in a
-// directory of its own, the cache shared as test/pool.mjs says -- what
+// directory of its own, the cache shared -- what
 // each says kept, and shown whole when it is done.  What they run, they
 // run within one budget, as make's jobserver keeps one: so many
 // processes at once among them all, as many as there are cores, each
-// taking a slot of it as test/pool.mjs says; or they would run some
+// taking a slot of it; or they would run some
 // dozens at once, each the slower for it, and the nearer its timeout.)
 //
 //   node test/run.mjs [GROUP...]

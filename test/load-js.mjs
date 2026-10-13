@@ -14,7 +14,7 @@ const items = (v) => {
 // (the rune at `i` of a string, bytes each a code unit, and how many
 // bytes it takes: what is not UTF-8 U+FFFD, of the longest start of a
 // rune's bytes there, or of a byte that starts none -- as TextDecoder
-// and lib/c/runtime.c's heff_u8_decode read it)
+// and the runtime's heff_u8_decode read it)
 const runeAt = (s, i) => {
   const b = s.charCodeAt(i);
   if (b < 0x80) return [b, 1];

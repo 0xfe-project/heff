@@ -5,7 +5,7 @@
 // and what it draws written to this program's standard output, as it
 // comes.  It ends when the command does, with its status (128 and the
 // signal, where a signal ended it).  POSIX alone (posix_openpt), so
-// that it builds where zig does, with nothing else: test/terminal.mjs
+// that it builds where zig does, with nothing else: the test
 // builds and runs it (`script`, which BSD's and util-linux's have, takes
 // no input that is not a terminal on macOS).
 #define _XOPEN_SOURCE 600
