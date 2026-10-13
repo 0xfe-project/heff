@@ -2648,6 +2648,16 @@ refsMade Nothing h b = \s ->
             s.kp)
          s)
 
+-- | ... and again, a copy made here that `h` was put in (Tying the
+-- | knot): the copies `h` calls it calls now, which the cache asks for
+-- | where it keeps it
+refsRetied : String -> IR.Expr -> M Unit
+refsRetied k b = \s ->
+    MkPair
+      MkUnit (case Map.lookup compareString k s.kp.madeFresh of
+    Just t -> withKp (madeFreshTo k (copiesIn s (IR.globalsIn b) t) s.kp) s
+    Nothing -> s)
+
 -- (as the cache keeps it: made as it was)
 settleKept : (List String -> M (List IR.Def))
            -> Maybe IR.Expr
@@ -2726,6 +2736,7 @@ tieOne h calls hb d =
   if elemStr d.key calls && elemStr h (IR.globalsIn d.body)
     then do
       b2 <- tieGo h hb d.body
+      u <- refsRetied d.key b2
       pure (IR.mkDef d.key d.name b2)
   else pure d
 
@@ -2806,6 +2817,85 @@ doneOf s d b t =
 
 -- | a definition simplified, after the copies it calls for; and what the
 -- | cache is to keep of it
+-- In order: a definition settled made copies as it was in each round,
+-- some of them for what it no longer comes to.  Where the cache keeps it,
+-- its copies are made from what it came to alone, each after the copies
+-- it calls (`makeEach`): so the copies made here are put in that order,
+-- and those it does not reach are taken as not made -- known by what they
+-- were asked for as, to be made again where something reaches them --
+-- that the program be the same through the cache, byte for byte.
+
+type Canon =
+  { pool : Map.Map String IR.Def
+  , placed : Map.Map String Unit
+  , out : List IR.Def
+  }
+
+withOut : IR.Def -> Canon -> Canon
+withOut d c = { pool = c.pool, placed = c.placed, out = Cons d c.out }
+
+-- (the copy `h`, if it was made here, after those it calls)
+canonVisit : Canon -> String -> Canon
+canonVisit c h = case Map.lookup compareString h c.pool of
+  Just d ->
+    if Map.member compareString h c.placed then c
+    else withOut
+        d
+        (List.foldl
+           canonVisit
+           { pool = c.pool
+           , placed = Map.insert compareString h MkUnit c.placed
+           , out = c.out
+           }
+           (IR.globalsIn d.body))
+  Nothing -> c
+
+-- | the copy `h` not made after all: known by what it was asked for as
+unmade : String -> M Unit
+unmade h = \s ->
+    MkPair
+      MkUnit
+      (withSp
+         { all = case Map.lookup compareString h s.sp.recipes of
+             Just r ->
+               if IR.sizeAbove specBodySize r
+                 then Map.delete compareString h s.sp.all
+               else Map.insert compareString h r s.sp.all
+             Nothing -> s.sp.all
+         , kinds = s.sp.kinds
+         , recipes = s.sp.recipes
+         , depths = s.sp.depths
+         , made = Map.delete compareString h s.sp.made
+         , count = s.sp.count
+         , off = s.sp.off
+         }
+         s)
+
+-- | the copies made for a body, as `makeEach` makes them from it: those
+-- | it reaches, in order; the others not made
+inOrder : IR.Expr -> List IR.Def -> M (List IR.Def)
+inOrder b made = do
+  c <-
+    pure
+      (List.foldl
+         canonVisit
+         { pool =
+             List.foldl
+               (\m (d : IR.Def) -> Map.insert compareString d.key d m)
+               Map.empty
+               made
+         , placed = Map.empty
+         , out = Nil
+         }
+         (IR.globalsIn b))
+  u <-
+    traverseS
+      (\(d : IR.Def) ->
+         if Map.member compareString d.key c.placed then pure MkUnit
+         else unmade d.key)
+      made
+  pure (List.reverse c.out)
+
 -- (a definition simplified, recorded, and the copies it calls for made,
 -- `n` rounds left: simplified again while a copy it calls was made to
 -- take more -- see Settling)
@@ -2835,11 +2925,12 @@ oneDef d = do
   b3 <- raise b2
   done <- settleDef settleRounds d.key b3
   u1 <- refsTouched (fst done)
+  made <- inOrder (fst done) (snd done)
   t <- getTouched
   s <- get
   pure
       (MkPair
-         (appendL (snd done) (Cons (IR.mkDef d.key d.name (fst done)) Nil))
+         (appendL made (Cons (IR.mkDef d.key d.name (fst done)) Nil))
          (Cons (doneOf s d (fst done) t) Nil))
 
 -- | a definition as the cache keeps it, simplified: what it came to
@@ -2871,7 +2962,8 @@ replayBody k b0 = do
   b <- copy b0
   u <- recordDef k.key b
   u2 <- safeAs k.safe k.key
-  made <- makeEach (IR.globalsIn b)
+  made0 <- makeEach (IR.globalsIn b)
+  made <- inOrder b made0
   pure (appendL made (Cons (IR.mkDef k.key k.name b) Nil))
 
 replayed : KeptDef -> Maybe IR.Expr -> M (Maybe (List IR.Def))
