@@ -179,6 +179,27 @@ same : List (Maybe Int) -> List (Maybe Int) -> Bool
 same xs ys = equal xs ys
 ```
 
+An implicit argument that is a function of types, as a theory over a
+type constructor wants, is inferred from its application too.  `m Int`
+met with `Maybe Int` is outside what unification solves -- `m` could be
+`Maybe` or `\_ -> Maybe Int` -- so when the definition is done and
+nothing else has decided it, it is solved to the first order, as Lean
+does: `m Int` and `Maybe Int`'s last arguments are matched, so `m` is
+`Maybe`.  This is done only where the other side is a type declared
+(by `data`, `theory`, or `type` as a record or a sum -- not an alias,
+nor a function written with equations, which may compute) applied to
+as many arguments at least, and `m`'s type is that of what is left:
+not with a local's application (`f Int`), nor with `Int`, which has no
+argument for `m`'s.  A program that wants `\_ -> Maybe Int` gives it, `(m := ...)`.
+
+```haskell
+twice : {m : Type -> Type} -> {{mo : Monad m}} -> m Int -> m Int
+twice c = mo.bind c (\x -> mo.bind c (\y -> mo.pure (x + y)))
+
+r : Maybe Int
+r = twice (Just 2 : Maybe Int)    -- m is Maybe: Monad Maybe's instance
+```
+
 The prelude has two theories of a value as a string, as Rust has
 `Debug` and `Display` and Python `repr` and `str`.  `Show` is a value
 as the source writes it, `show x`: a string quoted (`show "hi"` is

@@ -1296,6 +1296,199 @@ uEl : {w : HFunctor}
     -> Co w Unit
 uEl g cs a b = (uk : UK w).uel g cs a b
 
+-- First-order approximation
+--------------------------------------------------------------------------------
+
+-- `?m a₁…aₖ =?= C b₁…bₙ` is outside the pattern fragment when an `aᵢ` is
+-- no variable, and it has no one solution (`?m := C`, `?m := \_ -> C
+-- b₁`, ...).  When a definition settles and the problem is still stuck,
+-- it is approximated as Lean does, to the first: `?m := C b₁…bₙ₋ₖ`, and
+-- `aᵢ =?= bₙ₋ₖ₊ᵢ` -- only where `C` is a type declared (#88).
+
+absBody : {a : Type} -> Syntax.Abs a -> a
+absBody (MkAbs x b) = b
+absBody (AbsConst b) = b
+
+declaredCode : Syntax.Ty -> Bool
+declaredCode (SSum _) = True
+declaredCode (SRecord _ _ _) = True
+declaredCode _ = False
+
+-- | a body that is, under its arguments, a sum or a record: of a type
+-- | declared (`Globals.isDeclared`), one that computes no further (no
+-- | alias, `type T a = Maybe a`)
+declaredBody : Syntax.Tm -> Bool
+declaredBody (SLam _ b) = declaredBody (absBody b)
+declaredBody (SCode t) = declaredCode t
+declaredBody _ = False
+
+declaredEntry : Maybe Globals.Entry -> Bool
+declaredEntry (Just e) = declaredBody e.syntax
+declaredEntry Nothing = False
+
+nominalOf : Globals.Globals
+          -> Value.Head
+          -> Value.Spine Value.V
+          -> Maybe (Pair String (Value.Spine Value.V))
+nominalOf g (HGlobal k) sp =
+  if Globals.isDeclared g k && declaredEntry (Globals.lookupEntry g k)
+    then Just (MkPair k sp)
+  else Nothing
+nominalOf g h sp = Nothing
+
+-- | a neutral headed by the name of a type declared: the name, the spine
+-- | (a local, a function, a metavariable are none)
+nominalHead : Globals.Globals
+            -> Value.V
+            -> Maybe (Pair String (Value.Spine Value.V))
+nominalHead g (VNeu h sp ty expansion desc) = nominalOf g h sp
+nominalHead g v = Nothing
+
+consArg : Value.V -> Maybe (List Value.V) -> Maybe (List Value.V)
+consArg a (Just as) = Just (Cons a as)
+consArg a Nothing = Nothing
+
+-- | the arguments of a spine of applications only, the last applied first
+appsRev : Value.Spine Value.V -> Maybe (List Value.V)
+appsRev SpId = Just Nil
+appsRev (SpApp s a) = consArg a (appsRev s)
+appsRev _ = Nothing
+
+-- | the spine of arguments listed the last applied first
+spineRev : List Value.V -> Value.Spine Value.V
+spineRev Nil = SpId
+spineRev (Cons a rest) = SpApp (spineRev rest) a
+
+-- | what an approximation does: `?meta prefix := rhs`, then each pair
+type Approx =
+  { meta : Int
+  , prefix : Value.Spine Value.V
+  , rhs : Value.V
+  , pairs : List (Pair Value.V Value.V)
+  }
+
+-- (`k` arguments past the meta's arity, matched with the last `k` of
+-- `C`'s; fewer than `k` of `C`'s, or none past the arity: no approximation)
+approxWith : Globals.Globals
+           -> Int
+           -> Int
+           -> List Value.V
+           -> String
+           -> List Value.V
+           -> Maybe Approx
+approxWith g m k metaArgs key rigidArgs =
+  if k < 1 || List.length rigidArgs < k then Nothing
+  else Just
+      { meta = m
+      , prefix = spineRev (List.drop k metaArgs)
+      , rhs =
+          Value.replay
+            (Globals.elemAt g key).value
+            (spineRev (List.drop k rigidArgs))
+      , pairs = zipL (List.take k metaArgs) (List.take k rigidArgs)
+      }
+
+approxRigid : Globals.Globals
+            -> Int
+            -> Int
+            -> List Value.V
+            -> Maybe (Pair String (Value.Spine Value.V))
+            -> Maybe Approx
+approxRigid g m arity metaArgs (Just (MkPair key sp)) = case appsRev sp of
+  Just rigidArgs ->
+    approxWith g m (List.length metaArgs - arity) metaArgs key rigidArgs
+  Nothing -> Nothing
+approxRigid g m arity metaArgs Nothing = Nothing
+
+approxEntry : Globals.Globals
+            -> Int
+            -> Maybe Value.MetaEntry
+            -> Maybe (List Value.V)
+            -> Value.V
+            -> Maybe Approx
+approxEntry g m (Just e) (Just metaArgs) rigid =
+  approxRigid g m e.arity metaArgs (nominalHead g rigid)
+approxEntry g m _ _ rigid = Nothing
+
+-- | the approximation of `flex =?= rigid`, if it is one: `flex` an
+-- | unsolved metavariable applied past its arity, `rigid` a type
+-- | declared applied to as many arguments at least
+approxOf : Globals.Globals
+         -> Value.MetaCtx
+         -> Value.V
+         -> Maybe (Pair Int (Value.Spine Value.V))
+         -> Maybe Approx
+approxOf g mc rigid (Just (MkPair m sp)) =
+  approxEntry g m (Map.lookup compareInt m mc) (appsRev sp) rigid
+approxOf g mc rigid Nothing = Nothing
+
+neuTy : Value.V -> Maybe Value.Ty
+neuTy (VNeu h sp ty expansion desc) = Just (Params.forceTh ty)
+neuTy v = Nothing
+
+isSolved : Value.MetaCtx -> Int -> Bool
+isSolved mc m = case Value.solutionOf mc m of
+  Just _ -> True
+  Nothing -> False
+
+-- | the approximation done: the metavariable's type (closed) must be
+-- | `C b₁…bₙ₋ₖ`'s, and it solved; whatever does not hold is a failure
+approxRun : {w : HFunctor}
+          -> {{ms : State.state Environment.StCore <: w}}
+          -> {{uf : Exception.exception Conversion.EqErr <: w}}
+          -> Globals.Globals
+          -> Params.CtxShape
+          -> Value.V
+          -> Approx
+          -> Co w Unit
+approxRun g cs self a = do
+  entry <- metaEntry a.meta
+  tyStx <-
+    (uk : UK w).renTy
+      g
+      a.meta
+      { dom = entry.arity, cod = 0, ren = Map.empty }
+      entry.ty
+  rhsTy <- case neuTy a.rhs of
+    Just t -> val t
+    Nothing -> scopeError
+  (uk : UK w).uty g cs (Value.nom (Eval.evalTy g N tyStx LNil)) rhsTy
+  (uk : UK w).solve g cs a.meta a.prefix a.rhs self
+  solved <- uGets (\c -> isSolved c.metas a.meta)
+  if solved
+      then forU
+          a.pairs
+          (\p -> (uk : UK w).uel g cs (fst p) (snd p))
+    else scopeError
+
+approxMaybe : {w : HFunctor}
+            -> {{ms : State.state Environment.StCore <: w}}
+            -> {{uf : Exception.exception Conversion.EqErr <: w}}
+            -> Globals.Globals
+            -> Params.CtxShape
+            -> Value.V
+            -> Maybe Approx
+            -> Co w Bool
+approxMaybe g cs self (Just a) = bind (approxRun g cs self a) (\u -> val True)
+approxMaybe g cs self Nothing = val False
+
+-- | A problem still stuck, `left =?= right` (the flexible side left, as
+-- | postponed), approximated to the first order: whether it was one to
+-- | approximate.  It fails as a unification does; run it in an attempt.
+approximate : {w : HFunctor}
+            -> {{ms : State.state Environment.StCore <: w}}
+            -> {{uf : Exception.exception Conversion.EqErr <: w}}
+            -> Globals.Globals
+            -> Params.CtxShape
+            -> Value.V
+            -> Value.V
+            -> Co w Bool
+approximate g cs left right = do
+  l <- forceU left
+  r <- forceU right
+  mc <- uGets (\c -> c.metas)
+  approxMaybe g cs l (approxOf g mc r (flexOf l))
+
 -- A unification by itself
 --------------------------------------------------------------------------------
 
