@@ -29,6 +29,11 @@
 -- beyond 62 bits), against an unbox where a `V` comes in.  A field a
 -- match binds stays a `V` (`Pinned`), and is unboxed where it is used.
 --
+-- An `Int` known to fit a word (heff.compile.ranges, #79) is kept as its
+-- `int64_t` (`RepInt`): its evidence is an operation on words, a
+-- literal, a parameter every call gives a word (`BoxedWord`); a class
+-- given any other `V` (`Boxed`, which may be a big integer) is never one.
+--
 -- A record's field is told by its type (heff.compile.erase's
 -- `IR.FieldTy`): one whose `V` would be allocated -- a `Float64`, an
 -- `Int64`, a `UInt64` -- is kept flat in the record, its bits, where the
@@ -39,16 +44,18 @@
 
 import heff.compile.imperative as Imperative
 import heff.compile.ir as IR
+import heff.compile.ranges as Ranges
 import heff.elab.fixed as Fixed
 import map as Map
 
 -- | how a variable is kept: as a `V`; as a fixed-width type's C type;
--- | as a `double`
-data Repr = RepV | RepFix Fixed.Fixed | RepF64
+-- | as a `double`; an `Int` known to fit a word, as an `int64_t`
+data Repr = RepV | RepFix Fixed.Fixed | RepF64 | RepInt
 
 reprEq : Repr -> Repr -> Bool
 reprEq RepV RepV = True
 reprEq RepF64 RepF64 = True
+reprEq RepInt RepInt = True
 reprEq (RepFix a) (RepFix b) = Fixed.eqFixed a b
 reprEq a b = False
 
@@ -81,6 +88,7 @@ type Sigs = Map.Map String Sig
 reprName : Repr -> String
 reprName RepV = "_"
 reprName RepF64 = "Float64"
+reprName RepInt = "Int"
 reprName (RepFix w) = Fixed.fixedName w
 
 -- | a signature, as a key or the backend's cache has it
@@ -203,13 +211,25 @@ shapeOf : String -> Maybe Fixed.FixedPrim -> Maybe Shape
 shapeOf p (Just fp) = opShape (RepFix fp.fixed) fp.op
 shapeOf p Nothing = floatShape p
 
+-- (an operation on words, heff.compile.ranges's: of two, a comparison,
+-- a `Float64` made)
+wordShape : String -> Maybe Shape
+wordShape p =
+  if Ranges.isWordRel p then relationOf RepInt
+  else if strEq p "wordToFloat" then fromTo RepInt RepF64
+  else binaryOf RepInt
+
 -- | how a primitive is done unboxed, if it is
 -- | >>> maybe False (\(s : Shape) -> isBoxed s.result) (primShape "int64Lt")
 -- | True
 -- | >>> maybe 0 (\(s : Shape) -> List.length s.args) (primShape "int64Show")
 -- | 0
+-- | >>> maybe "" (\(s : Shape) -> reprName s.result) (primShape "wordAdd")
+-- | "Int"
 primShape : String -> Maybe Shape
-primShape p = shapeOf p (Fixed.fixedPrimOf p)
+primShape p =
+  if Ranges.isWordPrim p then wordShape p
+  else shapeOf p (Fixed.fixedPrimOf p)
 
 argsOf : {a : Type} -> Maybe Shape -> List a -> List Repr
 argsOf (Just s) as = s.args
@@ -383,13 +403,17 @@ noKnow = { sigs = Map.empty, flat = Map.empty }
 -- What gives and what uses
 --------------------------------------------------------------------------------
 
--- | what is seen of a variable: two kept alike; given a `V`; given an
--- | unboxed value; given a literal; used where the repr is wanted (a
--- | `V` by a uniform use); bound; a field a match binds; kept as the
--- | repr, whatever else is seen (a worker's parameter, given so)
+-- | what is seen of a variable: two kept alike; given a `V`; given a
+-- | `V` known a word (#79); given an array's element, as it comes, which
+-- | may be a big integer; given an unboxed value; given a literal;
+-- | used where the repr is wanted (a `V` by a uniform use); bound; a
+-- | field a match binds; kept as the repr, whatever else is seen (a
+-- | worker's parameter, given so)
 data Event
   = Merge String String
   | Boxed String
+  | BoxedWord String
+  | Element String
   | Unboxed String Repr
   | Literal String Repr
   | Wants String Repr
@@ -453,7 +477,8 @@ pushPrim p vs rest = pushElement (elementAt p) (argReprs p vs) vs rest
 -- (a name given what a step not simple computes: a `V`, but an array's
 -- element, as it comes)
 stepGives : String -> Imperative.Comp -> List Event -> List Event
-stepGives x (OPrim p _) acc = if readsElement p then acc else Cons (Boxed x) acc
+stepGives x (OPrim p _) acc =
+  if readsElement p then Cons (Element x) acc else Cons (Boxed x) acc
 stepGives x o acc = Cons (Boxed x) acc
 
 -- (a label's place among a shape's labels)
@@ -469,6 +494,8 @@ givenAs x r = Unboxed x r
 -- (a name given a value, not a variable: what it is)
 sourceOf : String -> Imperative.Val -> Event
 sourceOf x (SFixed w _) = Literal x (RepFix w)
+sourceOf x (SInt n) =
+  if Ranges.isWord (Ranges.point n) then Literal x RepInt else Boxed x
 sourceOf x (SFloat _) = Literal x RepF64
 sourceOf x (SFloat32 _) = Literal x (RepFix F32)
 sourceOf x (SPrim p _) =
@@ -676,6 +703,31 @@ defEvents sg (MkDef key _ (DefFun xs (MkBlock t))) =
 defEvents sg (MkDef _ _ (DefVal (MkBlock t))) =
   walk sg Nil (Cons (ITl Nil (RetAs RepV) t) Nil)
 
+-- (a `V` given a parameter every call gives a word, `ws`: known one)
+asWord : Map.Map String Unit -> Event -> Event
+asWord ws (Boxed x) =
+  if Map.member compareString x ws then BoxedWord x else Boxed x
+asWord ws e = e
+
+-- (the parameters at the places `is`, by name)
+wordParams : List Int -> Imperative.Def -> Map.Map String Unit
+wordParams is (MkDef _ _ (DefFun xs _)) =
+  List.foldl
+    (\m p ->
+       if List.any (\i -> i == snd p) is
+         then Map.insert compareString (fst p) MkUnit m
+       else m)
+    Map.empty
+    (List.zip xs (List.range 0 (List.length xs - 1)))
+wordParams is d = Map.empty
+
+-- | the events of a definition (`defEvents`), the parameters at the
+-- | places `is` given words by every call (heff.compile.ranges): what
+-- | they are given, which is all they are, known words
+wordEvents : Know -> List Int -> Imperative.Def -> List Event
+wordEvents sg Nil d = defEvents sg d
+wordEvents sg is d = List.map (asWord (wordParams is d)) (defEvents sg d)
+
 -- | the events of a function's body as heff.compile.worker weighs its
 -- | worker: its parameters given `V`s, as a call of it today gives them;
 -- | what it returns given to `retName`, which its caller wants a `V` of
@@ -733,7 +785,8 @@ classesOf evs = List.foldl classOne Map.empty evs
 
 -- | what is seen of a class: the reprs its evidence says, how many `V`s
 -- | and unboxed values it is given, how many uses want a `V` and how many
--- | an unboxed value, whether it holds a field a match binds
+-- | an unboxed value, whether it holds a field a match binds, whether it
+-- | is given a `V` that may be a big integer (`Boxed`, not `BoxedWord`)
 type Stats =
   { reprs : List Repr
   , boxedIn : Int
@@ -742,6 +795,7 @@ type Stats =
   , unboxedOut : Int
   , pinned : Bool
   , kept : Maybe Repr
+  , big : Bool
   }
 
 noStats : Stats
@@ -753,6 +807,7 @@ noStats =
   , unboxedOut = 0
   , pinned = False
   , kept = Nothing
+  , big = False
   }
 
 withRepr : Repr -> List Repr -> List Repr
@@ -769,6 +824,7 @@ statsWith r bi ui bo uo pin s =
   , unboxedOut = s.unboxedOut + uo
   , pinned = s.pinned || pin
   , kept = s.kept
+  , big = s.big
   }
 
 -- (kept as `r`, whatever else is seen)
@@ -781,10 +837,26 @@ keptTo r s =
   , unboxedOut = s.unboxedOut
   , pinned = s.pinned
   , kept = Just r
+  , big = s.big
+  }
+
+-- (given a `V` that may be a big integer)
+bigTo : Stats -> Stats
+bigTo s =
+  { reprs = s.reprs
+  , boxedIn = s.boxedIn
+  , unboxedIn = s.unboxedIn
+  , boxedOut = s.boxedOut
+  , unboxedOut = s.unboxedOut
+  , pinned = s.pinned
+  , kept = s.kept
+  , big = True
   }
 
 seen : Event -> Stats -> Stats
-seen (Boxed _) s = statsWith RepV 1 0 0 0 False s
+seen (Boxed _) s = bigTo (statsWith RepV 1 0 0 0 False s)
+seen (BoxedWord _) s = statsWith RepInt 1 0 0 0 False s
+seen (Element _) s = bigTo s
 seen (Unboxed _ r) s = statsWith r 0 1 0 0 False s
 seen (Literal _ r) s = statsWith r 0 0 0 0 False s
 seen (Wants _ RepV) s = statsWith RepV 0 0 1 0 False s
@@ -795,6 +867,8 @@ seen e s = s
 
 eventName : Event -> String
 eventName (Boxed x) = x
+eventName (BoxedWord x) = x
+eventName (Element x) = x
 eventName (Unboxed x _) = x
 eventName (Literal x _) = x
 eventName (Wants x _) = x
@@ -822,6 +896,7 @@ statsOf parent evs =
 boxCost : Repr -> Int
 boxCost RepF64 = 3
 boxCost (RepFix w) = if Fixed.fixedBits w == 64 then 2 else 1
+boxCost RepInt = 1
 boxCost RepV = 0
 
 unboxCost : Repr -> Int
@@ -840,9 +915,15 @@ decideOf s (Cons r Nil) =
   else RepV
 decideOf s rs = RepV
 
+-- (an `Int` kept as a word only where no `V` it is given may be a big
+-- one)
+wordSafe : Stats -> Repr -> Repr
+wordSafe s RepInt = if s.big then RepV else RepInt
+wordSafe s r = r
+
 decideAs : Stats -> Maybe Repr -> Repr
 decideAs s (Just r) = r
-decideAs s Nothing = if s.pinned then RepV else decideOf s s.reprs
+decideAs s Nothing = if s.pinned then RepV else wordSafe s (decideOf s s.reprs)
 
 -- | ... and a class with a worker's parameter in it, as the worker takes
 -- | that
@@ -858,7 +939,7 @@ hopeOf rs = RepV
 
 hopeAs : Stats -> Maybe Repr -> Repr
 hopeAs s (Just r) = r
-hopeAs s Nothing = if s.pinned then RepV else hopeOf s.reprs
+hopeAs s Nothing = if s.pinned then RepV else wordSafe s (hopeOf s.reprs)
 
 hope : Stats -> Repr
 hope s = hopeAs s s.kept
@@ -896,6 +977,15 @@ eventsOf evs = unpinned (pinnedIn evs) evs
 -- | [MkPair "x" (RepFix I64)]
 reprsWith : Know -> Imperative.Def -> Reprs
 reprsWith sg d = reprsFrom (eventsOf (defEvents sg d))
+
+-- | ... the parameters at the places `is` given words by every call
+-- | (heff.compile.ranges)
+-- | >>> Map.toList (reprsWords noKnow [0] (MkDef "f" "f" (DefFun ["i"] (MkBlock (TIf (PRel "wordLt" (SVar "i") (SInt 9)) (TLoop [SPrim "wordAdd" [SVar "i", SInt 1]]) (TReturn (OSimple (SVar "i"))))))))
+-- | [MkPair "i" RepInt]
+-- | >>> Map.toList (reprsWith noKnow (MkDef "f" "f" (DefFun ["i"] (MkBlock (TIf (PRel "wordLt" (SVar "i") (SInt 9)) (TLoop [SPrim "wordAdd" [SVar "i", SInt 1]]) (TReturn (OSimple (SVar "i"))))))))
+-- | []
+reprsWords : Know -> List Int -> Imperative.Def -> Reprs
+reprsWords sg is d = reprsFrom (eventsOf (wordEvents sg is d))
 
 -- What a worker is proposed to be (heff.compile.worker)
 --------------------------------------------------------------------------------

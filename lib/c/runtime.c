@@ -2549,6 +2549,22 @@ static inline double heff_peek_f64(V v) { return FLT_OF(v); }
 static inline double heff_from_int_f64(V v) {
   double d = heff_double_of_int(v); heff_drop(v); return d; }
 
+// An `Int` known to fit a word (src/heff/compile/ranges.hf, #79), kept
+// as its `int64_t`: its `V` is a word, nothing to count, so unboxed or
+// looked at alike.  A division and a remainder of two, by one not 0,
+// rounded down as `heff_intDiv` and `heff_intMod` round.
+static inline V heff_box_word(int64_t x) { return MK_INT(x); }
+static inline int64_t heff_unbox_word(V v) { return INT_OF(v); }
+static inline int64_t heff_peek_word(V v) { return INT_OF(v); }
+static inline int64_t heff_word_div(int64_t x, int64_t y) {
+  int64_t q = x / y, r = x % y;
+  return r != 0 && ((r < 0) != (y < 0)) ? q - 1 : q;
+}
+static inline int64_t heff_word_mod(int64_t x, int64_t y) {
+  int64_t r = x % y;
+  return r != 0 && ((r < 0) != (y < 0)) ? r + y : r;
+}
+
 // A record's flat fields (#39, "Flat fields" above): a number's bits, the
 // field so made (`heff_word_S`), and the field read as a number,
 // whichever it is, flat or a `V` (`heff_rget_S`); the record consumed

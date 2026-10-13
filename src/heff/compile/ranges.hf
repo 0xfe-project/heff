@@ -1,0 +1,1607 @@
+-- Ranges, for the C backend (#79): where an `Int` is known to fit a
+-- word, worked out over the program in monadic form (heff.compile.lower),
+-- so that what is computed of it is a machine's arithmetic, with no test
+-- of a big integer, nothing counted, no call.
+--
+-- An `Int` is a word in C while it is from -2^62 up to 2^62 (lib/c/runtime.c,
+-- `MK_INT`); beyond, a big one.  Each value an `Int` may be is bounded
+-- here by a range, an interval (`Within`, a bound missing where there is
+-- none), worked out as an abstract interpretation does:
+--
+-- - a literal is itself; a sum, a difference, a product, a quotient and
+--   a remainder are what the operands' ranges give (`x % m`, of `m`
+--   positive, is from 0 below `m`), a length from 0, a byte from -1 to
+--   255; anything else, a call, a field, any `Int`;
+-- - a match on a comparison bounds its operands in each arm (`i < n`:
+--   `i` below `n` where it holds, from `n` where it does not; `d * d <= k`
+--   bounds `d` by the root of `k`);
+-- - a function's parameter is what all its calls give it -- each call
+--   known, the function never a value (`escaping`, else any `Int`) --
+--   worked out on the calls as a fixpoint: from nothing, each function
+--   walked again where what it is given grows, a bound that grows again
+--   widened, to the next of the constants it is compared with in the
+--   function (so that a counter up to `i == n` stops at `n`), and then to
+--   none; then walked once more, as each is given, to narrow the bounds
+--   widened past what is given (`d + 1` while `d * d <= k`).
+--
+-- Where the operands of an `Int`'s operation, and what it gives, are
+-- known words, it is done as one (`wordAdd` for `intAdd`, and the others
+-- of `wordPrims`): heff.compile.repr keeps such a value as an `int64_t`
+-- (`RepInt`), and a parameter every call gives a word (`Ranged.words`)
+-- may be.  What is not known stays as it was: checked, a big one where it
+-- grows past a word.
+
+import heff.compile.ir as IR
+import map as Map
+
+-- Words
+--------------------------------------------------------------------------------
+
+-- | the operations on words, each with the `Int` primitive it is done
+-- | for: of two words, giving a word (`wordQuot` and `wordRem` of a
+-- | dividend from 0 and a divisor above it, as C's `/` and `%`); a
+-- | comparison of two; a word made a `Float64`
+wordPrims : List (Pair String String)
+wordPrims =
+  [ MkPair "wordAdd" "intAdd"
+  , MkPair "wordSub" "intSub"
+  , MkPair "wordMul" "intMul"
+  , MkPair "wordDiv" "intDiv"
+  , MkPair "wordMod" "intMod"
+  , MkPair "wordQuot" "intDiv"
+  , MkPair "wordRem" "intMod"
+  , MkPair "wordEq" "intEq"
+  , MkPair "wordLt" "intLt"
+  , MkPair "wordLe" "intLe"
+  , MkPair "wordToFloat" "floatFromInt"
+  ]
+
+-- (whether it starts with "word", as each of `wordPrims` does: tested
+-- first, the list only then)
+wordPrefix : String -> Bool
+wordPrefix p = strLength p > 4 && strEq (strSlice p 0 4) "word"
+
+-- | whether it is an operation on words
+-- | >>> ([isWordPrim "wordAdd", isWordPrim "intAdd", isWordPrim "words"] : List Bool)
+-- | [True, False, False]
+isWordPrim : String -> Bool
+isWordPrim p = wordPrefix p && List.any (\q -> strEq (fst q) p) wordPrims
+
+-- | whether it is a comparison of words
+isWordRel : String -> Bool
+isWordRel p = strEq p "wordEq" || strEq p "wordLt" || strEq p "wordLe"
+
+-- Ranges
+--------------------------------------------------------------------------------
+
+-- | what an `Int` may be: nothing (where nothing reaches); from a bound
+-- | to a bound, each missing where there is none
+data Range = Unreached | Within (Maybe Int) (Maybe Int)
+
+anyRange : Range
+anyRange = Within Nothing Nothing
+
+point : Int -> Range
+point n = Within (Just n) (Just n)
+
+isAny : Range -> Bool
+isAny (Within Nothing Nothing) = True
+isAny r = False
+
+allAny : List Range -> Bool
+allAny rs = List.all isAny rs
+
+boundEq : Maybe Int -> Maybe Int -> Bool
+boundEq (Just a) (Just b) = a == b
+boundEq Nothing Nothing = True
+boundEq a b = False
+
+rangeEq : Range -> Range -> Bool
+rangeEq Unreached Unreached = True
+rangeEq (Within a b) (Within c d) = boundEq a c && boundEq b d
+rangeEq r s = False
+
+lowOf : Range -> Maybe Int
+lowOf (Within lo _) = lo
+lowOf Unreached = Nothing
+
+highOf : Range -> Maybe Int
+highOf (Within _ hi) = hi
+highOf Unreached = Nothing
+
+minI : Int -> Int -> Int
+minI a b = if a < b then a else b
+
+maxI : Int -> Int -> Int
+maxI a b = if a < b then b else a
+
+-- (the lower of two lower bounds, none the lowest; the higher of two
+-- upper ones, none the highest)
+lowJoin : Maybe Int -> Maybe Int -> Maybe Int
+lowJoin (Just a) (Just b) = Just (minI a b)
+lowJoin a b = Nothing
+
+highJoin : Maybe Int -> Maybe Int -> Maybe Int
+highJoin (Just a) (Just b) = Just (maxI a b)
+highJoin a b = Nothing
+
+-- (the higher of two lower bounds; the lower of two upper ones)
+lowMeet : Maybe Int -> Maybe Int -> Maybe Int
+lowMeet (Just a) (Just b) = Just (maxI a b)
+lowMeet (Just a) Nothing = Just a
+lowMeet Nothing b = b
+
+highMeet : Maybe Int -> Maybe Int -> Maybe Int
+highMeet (Just a) (Just b) = Just (minI a b)
+highMeet (Just a) Nothing = Just a
+highMeet Nothing b = b
+
+-- | what either may be
+join : Range -> Range -> Range
+join (Within a b) (Within c d) = Within (lowJoin a c) (highJoin b d)
+join Unreached r = r
+join r s = r
+
+-- (nothing, where the bounds cross)
+within : Maybe Int -> Maybe Int -> Range
+within (Just lo) (Just hi) =
+  if hi < lo then Unreached else Within (Just lo) (Just hi)
+within lo hi = Within lo hi
+
+-- | what both may be
+meet : Range -> Range -> Range
+meet (Within a b) (Within c d) = within (lowMeet a c) (highMeet b d)
+meet r s = Unreached
+
+-- | the least a word may be, and the most (lib/c/runtime.c's `INT_LIM`)
+wordLow : Int
+wordLow = 0 - 4611686018427387904
+
+wordHigh : Int
+wordHigh = 4611686018427387903
+
+-- | whether all it may be is a word
+-- | >>> ([isWord (point 3), isWord (Within (Just 0) Nothing), isWord (point 4611686018427387904)] : List Bool)
+-- | [True, False, False]
+isWord : Range -> Bool
+isWord (Within (Just lo) (Just hi)) = lo >= wordLow && hi <= wordHigh
+isWord r = False
+
+-- Arithmetic
+--------------------------------------------------------------------------------
+
+plusB : Maybe Int -> Maybe Int -> Maybe Int
+plusB (Just a) (Just b) = Just (a + b)
+plusB a b = Nothing
+
+minusB : Maybe Int -> Maybe Int -> Maybe Int
+minusB (Just a) (Just b) = Just (a - b)
+minusB a b = Nothing
+
+shiftB : Int -> Maybe Int -> Maybe Int
+shiftB k (Just a) = Just (a + k)
+shiftB k Nothing = Nothing
+
+addR : Range -> Range -> Range
+addR (Within a b) (Within c d) = Within (plusB a c) (plusB b d)
+addR r s = Unreached
+
+subR : Range -> Range -> Range
+subR (Within a b) (Within c d) = Within (minusB a d) (minusB b c)
+subR r s = Unreached
+
+-- (from 0: its lower bound not below it)
+fromZero : Maybe Int -> Bool
+fromZero (Just a) = a >= 0
+fromZero Nothing = False
+
+-- (above 0)
+aboveZero : Maybe Int -> Bool
+aboveZero (Just a) = a > 0
+aboveZero Nothing = False
+
+-- (below 0)
+belowZero : Maybe Int -> Bool
+belowZero (Just a) = a < 0
+belowZero Nothing = False
+
+-- (the least and the most of the four)
+corners : Int -> Int -> Int -> Int -> Range
+corners a b c d =
+  Within (Just (minI (minI a b) (minI c d))) (Just (maxI (maxI a b) (maxI c d)))
+
+timesB : Maybe Int -> Maybe Int -> Maybe Int
+timesB (Just a) (Just b) = Just (a * b)
+timesB a b = Nothing
+
+-- (of two ranges each from 0: from their lows' product, up to their
+-- highs')
+mulFromZero : Range -> Range -> Range
+mulFromZero (Within a b) (Within c d) = Within (timesB a c) (timesB b d)
+mulFromZero r s = anyRange
+
+mulR : Range -> Range -> Range
+mulR (Within (Just a) (Just b)) (Within (Just c) (Just d)) =
+  corners (a * c) (a * d) (b * c) (b * d)
+mulR (Within a b) (Within c d) =
+  if fromZero a && fromZero c then mulFromZero (Within a b) (Within c d)
+  else anyRange
+mulR r s = Unreached
+
+-- (`x / m`, rounded down, of `m` from `lb` up to `hb`, above 0: lower
+-- for a lower `x`; of an `x` from 0 at the greatest `m` -- 0 where there
+-- is none -- of one below it at the least)
+quotLow : Int -> Maybe Int -> Int -> Int
+quotLow lb (Just hb) x = if x >= 0 then x / hb else x / lb
+quotLow lb Nothing x = if x >= 0 then 0 else x / lb
+
+quotHigh : Int -> Maybe Int -> Int -> Int
+quotHigh lb (Just hb) y = if y >= 0 then y / lb else y / hb
+quotHigh lb Nothing y = if y >= 0 then y / lb else 0 - 1
+
+divPositive : Int -> Maybe Int -> Range -> Range
+divPositive lb hb (Within (Just x) (Just y)) =
+  Within (Just (quotLow lb hb x)) (Just (quotHigh lb hb y))
+divPositive lb hb r = anyRange
+
+-- (rounded down; by a divisor above 0 alone)
+divR : Range -> Range -> Range
+divR a (Within (Just lb) hb) = if lb > 0 then divPositive lb hb a else anyRange
+divR a b = anyRange
+
+-- (`x % m`, of `m` above 0 up to `hb`: from 0 below `hb`, and not above
+-- `x` where `x` is from 0)
+modHigh : Range -> Maybe Int -> Maybe Int
+modHigh a hb =
+  highMeet
+    (shiftB (0 - 1) hb)
+    (if fromZero (lowOf a) then highOf a else Nothing)
+
+-- (of the divisor's sign, nearer 0 than it: by one above 0, from 0;
+-- by one below, up to 0)
+modR : Range -> Range -> Range
+modR a (Within lb hb) =
+  if aboveZero lb then Within (Just 0) (modHigh a hb)
+  else if belowZero hb then Within (shiftB 1 lb) (Just 0)
+  else anyRange
+modR a b = anyRange
+
+-- (a bitwise and: of one from 0, from 0 up to it)
+andR : Range -> Range -> Range
+andR a b =
+  if fromZero (lowOf a) && fromZero (lowOf b) then meet a b
+  else if fromZero (lowOf a) then Within (Just 0) (highOf a)
+  else if fromZero (lowOf b) then Within (Just 0) (highOf b)
+  else anyRange
+
+nthR : Int -> List Range -> Range
+nthR i rs = fromMaybe anyRange (List.head (List.drop i rs))
+
+-- | what a primitive gives, of what its operands may be (any `Int`, if
+-- | it gives one it is not told of, or none at all)
+primRange : String -> List Range -> Range
+primRange "intAdd" rs = addR (nthR 0 rs) (nthR 1 rs)
+primRange "intSub" rs = subR (nthR 0 rs) (nthR 1 rs)
+primRange "intMul" rs = mulR (nthR 0 rs) (nthR 1 rs)
+primRange "intDiv" rs = divR (nthR 0 rs) (nthR 1 rs)
+primRange "intMod" rs = modR (nthR 0 rs) (nthR 1 rs)
+primRange "intAnd" rs = andR (nthR 0 rs) (nthR 1 rs)
+primRange "wordAdd" rs = addR (nthR 0 rs) (nthR 1 rs)
+primRange "wordSub" rs = subR (nthR 0 rs) (nthR 1 rs)
+primRange "wordMul" rs = mulR (nthR 0 rs) (nthR 1 rs)
+primRange "wordDiv" rs = divR (nthR 0 rs) (nthR 1 rs)
+primRange "wordQuot" rs = divR (nthR 0 rs) (nthR 1 rs)
+primRange "wordMod" rs = modR (nthR 0 rs) (nthR 1 rs)
+primRange "wordRem" rs = modR (nthR 0 rs) (nthR 1 rs)
+primRange "strLength" rs = Within (Just 0) (Just wordHigh)
+primRange "bytesLength" rs = Within (Just 0) (Just wordHigh)
+primRange "arrayLength" rs = Within (Just 0) (Just wordHigh)
+primRange "strByteAt" rs = Within (Just (0 - 1)) (Just 255)
+primRange p rs = anyRange
+
+-- (never 0)
+nonZero : Range -> Bool
+nonZero r = aboveZero (lowOf r) || belowZero (highOf r)
+
+-- (a dividend from 0, a divisor above it)
+natural : List Range -> Bool
+natural rs = fromZero (lowOf (nthR 0 rs)) && aboveZero (lowOf (nthR 1 rs))
+
+-- | the operation on words a primitive is done as, its operands' ranges
+-- | `rs` and what it gives `r`, where it may be
+wordOf : String -> List Range -> Range -> Maybe String
+wordOf "intAdd" rs r =
+  if List.all isWord rs && isWord r then Just "wordAdd" else Nothing
+wordOf "intSub" rs r =
+  if List.all isWord rs && isWord r then Just "wordSub" else Nothing
+wordOf "intMul" rs r =
+  if List.all isWord rs && isWord r then Just "wordMul" else Nothing
+wordOf "intDiv" rs r =
+  if List.all isWord rs && isWord r && nonZero (nthR 1 rs)
+    then Just (if natural rs then "wordQuot" else "wordDiv")
+  else Nothing
+wordOf "intMod" rs r =
+  if List.all isWord rs && isWord r && nonZero (nthR 1 rs)
+    then Just (if natural rs then "wordRem" else "wordMod")
+  else Nothing
+wordOf "intEq" rs r = if List.all isWord rs then Just "wordEq" else Nothing
+wordOf "intLt" rs r = if List.all isWord rs then Just "wordLt" else Nothing
+wordOf "intLe" rs r = if List.all isWord rs then Just "wordLe" else Nothing
+wordOf "floatFromInt" rs r =
+  if List.all isWord rs then Just "wordToFloat" else Nothing
+wordOf p rs r = Nothing
+
+-- Comparisons
+--------------------------------------------------------------------------------
+
+-- | a comparison a name is bound to: its primitive, its operands
+data Test = MkTest String IR.Expr IR.Expr
+
+-- (the `Int` comparison it is, of words or not)
+relBase : String -> String
+relBase "wordEq" = "intEq"
+relBase "wordLt" = "intLt"
+relBase "wordLe" = "intLe"
+relBase p = p
+
+isComparison : String -> Bool
+isComparison p =
+  strEq (relBase p) "intEq"
+  || strEq (relBase p) "intLt"
+  || strEq (relBase p) "intLe"
+
+-- (a range, its bound `v` left out where it is one)
+trimLow : Int -> Range -> Range
+trimLow v (Within (Just lo) hi) =
+  if lo == v then within (Just (v + 1)) hi else Within (Just lo) hi
+trimLow v r = r
+
+trimHigh : Int -> Range -> Range
+trimHigh v (Within lo (Just hi)) =
+  if hi == v then within lo (Just (v - 1)) else Within lo (Just hi)
+trimHigh v r = r
+
+-- (`r`, not the one value `s` is)
+apart : Range -> Range -> Range
+apart r (Within (Just v) (Just w)) =
+  if v == w then trimHigh v (trimLow v r) else r
+apart r s = r
+
+below : Maybe Int -> Range
+below hi = Within Nothing hi
+
+above : Maybe Int -> Range
+above lo = Within lo Nothing
+
+-- | the operands' ranges, `a p b` holding (`yes`) or not
+held : String -> Bool -> Range -> Range -> Pair Range Range
+held "intLt" True ra rb =
+  MkPair
+    (meet ra (below (shiftB (0 - 1) (highOf rb))))
+    (meet rb (above (shiftB 1 (lowOf ra))))
+held "intLt" False ra rb =
+  MkPair (meet ra (above (lowOf rb))) (meet rb (below (highOf ra)))
+held "intLe" True ra rb =
+  MkPair (meet ra (below (highOf rb))) (meet rb (above (lowOf ra)))
+held "intLe" False ra rb =
+  MkPair
+    (meet ra (above (shiftB 1 (lowOf rb))))
+    (meet rb (below (shiftB (0 - 1) (highOf ra))))
+held "intEq" True ra rb = MkPair (meet ra rb) (meet ra rb)
+held "intEq" False ra rb = MkPair (apart ra rb) (apart rb ra)
+held p yes ra rb = MkPair ra rb
+
+-- (the greatest from `lo` up to `hi` whose square is not above `n`)
+rootGo : Int -> Int -> Int -> Int
+rootGo n lo hi =
+  if lo >= hi then lo
+  else if ((lo + hi + 1) / 2) * ((lo + hi + 1) / 2) <= n
+    then rootGo n ((lo + hi + 1) / 2) hi
+  else rootGo n lo ((lo + hi + 1) / 2 - 1)
+
+-- | the integer square root of a number from 0
+-- | >>> ([root 0, root 15, root 16, root 5000000] : List Int)
+-- | [0, 3, 4, 2236]
+root : Int -> Int
+root n = rootGo n 0 (if n < 2 then n else n / 2 + 1)
+
+-- The walk
+--------------------------------------------------------------------------------
+
+-- | what a walk knows where it is: each variable's range (not kept
+-- | where it is any `Int`), and each name bound to a comparison
+type Env = { ranges : Map.Map String Range, tests : Map.Map String Test }
+
+emptyEnv : Env
+emptyEnv = { ranges = Map.empty, tests = Map.empty }
+
+-- | what a walk is told: each function's parameters' ranges (of one it
+-- | is not told of, any `Int`), the definitions that are a literal, and
+-- | whether to mark the constants compared with
+type Ctx =
+  { params : Map.Map String (List Range)
+  , consts : Map.Map String Int
+  , marking : Bool
+  }
+
+-- | what a walk gathers: what each function is called with (each
+-- | parameter's range, of all its calls walked), and the bounds of what
+-- | is compared (`marks`)
+type St = { calls : Map.Map String (List Range), marks : Map.Map Int Unit }
+
+emptySt : St
+emptySt = { calls = Map.empty, marks = Map.empty }
+
+rangeOfVar : Env -> String -> Range
+rangeOfVar env x = fromMaybe anyRange (Map.lookup compareString x env.ranges)
+
+constRange : Ctx -> String -> Range
+constRange c g = maybe anyRange point (Map.lookup compareString g c.consts)
+
+-- | the range of an operand, as it is (a name, a literal, a primitive of
+-- | them)
+operandRange : Ctx -> Env -> IR.Expr -> Range
+operandRange c env (EVar x) = rangeOfVar env x
+operandRange c env (EInt n) = point n
+operandRange c env (EGlobal g) = constRange c g
+operandRange c env (EPrimCall p as) =
+  primRange p (List.map (operandRange c env) as)
+operandRange c env e = anyRange
+
+withRange : Env -> String -> Range -> Env
+withRange env x r =
+  if isAny r then env
+  else { ranges = Map.insert compareString x r env.ranges, tests = env.tests }
+
+withTest : Env -> String -> IR.Expr -> Env
+withTest env x (EPrimCall p (Cons a (Cons b Nil))) =
+  if isComparison p
+    then { ranges = env.ranges
+         , tests = Map.insert compareString x (MkTest p a b) env.tests
+         }
+  else env
+withTest env x e = env
+
+-- (a name bound to what `a` computes, of the range `r`)
+bindVar : Env -> String -> Range -> IR.Expr -> Env
+bindVar env x r a = withTest (withRange env x r) x a
+
+-- (a square's operand, bounded by the root of what bounds the square)
+rootTo : Env -> String -> Maybe Int -> Env
+rootTo env x (Just h) =
+  if h >= 0
+    then withRange
+        env
+        x
+        (meet (rangeOfVar env x) (Within (Just (0 - root h)) (Just (root h))))
+  else env
+rootTo env x Nothing = env
+
+isSquare : String -> String -> String -> Bool
+isSquare p x y = (strEq p "intMul" || strEq p "wordMul") && strEq x y
+
+-- | an operand known to be of the range: a name's, or a square's
+-- | operand's
+narrowTo : Env -> IR.Expr -> Range -> Env
+narrowTo env (EVar x) r = withRange env x r
+narrowTo env (EPrimCall p (Cons (EVar x) (Cons (EVar y) Nil))) r =
+  if isSquare p x y then rootTo env x (highOf r) else env
+narrowTo env e r = env
+
+narrowBoth : Env -> IR.Expr -> IR.Expr -> Pair Range Range -> Env
+narrowBoth env a b (MkPair ra rb) = narrowTo (narrowTo env a ra) b rb
+
+-- | what is known where the comparison holds (`yes`), or does not
+refine : Ctx -> Env -> Test -> Bool -> Env
+refine c env (MkTest p a b) yes =
+  narrowBoth
+    env
+    a
+    b
+    (held (relBase p) yes (operandRange c env a) (operandRange c env b))
+
+-- (a bound, and those either side of it, marked)
+markBound : Map.Map Int Unit -> Maybe Int -> Map.Map Int Unit
+markBound ms (Just v) =
+  Map.insert
+    compareInt
+    (v - 1)
+    MkUnit
+    (Map.insert compareInt v MkUnit (Map.insert compareInt (v + 1) MkUnit ms))
+markBound ms Nothing = ms
+
+-- (one value: a constant, not a bound of what grows)
+markRange : Map.Map Int Unit -> Range -> Map.Map Int Unit
+markRange ms (Within (Just lo) (Just hi)) =
+  if lo == hi then markBound ms (Just lo) else ms
+markRange ms r = ms
+
+-- (the constants a comparison compares with, marked, where the walk
+-- marks them: of a function whose parameters are worked out, as the
+-- rounds walk it)
+marked : Ctx -> Env -> Maybe Test -> St -> St
+marked c env (Just (MkTest p a b)) st =
+  if not c.marking then st
+  else { calls = st.calls
+       , marks =
+           markRange
+             (markRange st.marks (operandRange c env a))
+             (operandRange c env b)
+       }
+marked c env Nothing st = st
+
+-- (what a match looks at, if it is a comparison)
+testOf : Env -> IR.Expr -> Maybe Test
+testOf env (EVar x) = Map.lookup compareString x env.tests
+testOf env (EPrimCall p (Cons a (Cons b Nil))) =
+  if isComparison p then Just (MkTest p a b) else Nothing
+testOf env e = Nothing
+
+-- (what is known in an arm of a match on a comparison)
+armEnv : Ctx -> Env -> Maybe Test -> String -> Env
+armEnv c env (Just t) "True" = refine c env t True
+armEnv c env (Just t) "False" = refine c env t False
+armEnv c env t tag = env
+
+joinAll : List Range -> List Range -> List Range
+joinAll as bs = List.zipWith join as bs
+
+-- (a call of `g`, given those ranges, gathered)
+called : String -> List Range -> St -> St
+called g rs st =
+  { calls =
+      Map.insert
+        compareString
+        g
+        (maybe rs (joinAll rs) (Map.lookup compareString g st.calls))
+        st.calls
+  , marks = st.marks
+  }
+
+-- (... of a function whose parameters are worked out: those `c` has)
+-- (... none, once they are any `Int`: they grow no more, and are not
+-- narrowed)
+calledIn : Ctx -> String -> List Range -> St -> St
+calledIn c g rs st = case Map.lookup compareString g c.params of
+  Just ps -> if allAny ps then st else called g rs st
+  Nothing -> st
+
+-- (a primitive given its operands made: on words, where it may be)
+primOn : String -> List Range -> List IR.Expr -> IR.Expr
+primOn p rs as = EPrimCall (fromMaybe p (wordOf p rs (primRange p rs))) as
+
+fieldsOf : List (Pair String IR.Expr) -> List IR.Expr
+fieldsOf fs = List.map snd fs
+
+relabel : List (Pair String IR.Expr)
+        -> List IR.Expr
+        -> List (Pair String IR.Expr)
+relabel fs es = List.zipWith (\f e -> MkPair (fst f) e) fs es
+
+-- (the head of an application walked, and its operands)
+applied : IR.Expr -> List IR.Expr -> IR.Expr
+applied f (Cons g as) = EApp g as
+applied f Nil = f
+
+-- (each parameter of the function `key`, of its range)
+paramEnv : Ctx -> String -> List String -> Env
+paramEnv c key xs = case Map.lookup compareString key c.params of
+  Just rs ->
+    List.foldl
+      (\env p -> withRange env (fst p) (snd p))
+      emptyEnv
+      (List.zip xs rs)
+  Nothing -> emptyEnv
+
+-- The walk for the calls alone
+--------------------------------------------------------------------------------
+
+-- As the walk above, giving back no expression: what the rounds and the
+-- narrowing walk, only for the calls (`St`).
+
+-- | what is walked: its range, and what is gathered
+data Seen = MkSeen Range St
+
+data Seens = MkSeens (List Range) St
+
+thenSeen : Seen -> (Range -> St -> Seen) -> Seen
+thenSeen (MkSeen r st) k = k r st
+
+thenSeens : Seens -> (List Range -> St -> Seen) -> Seen
+thenSeens (MkSeens rs st) k = k rs st
+
+seenSt : Seen -> St
+seenSt (MkSeen _ st) = st
+
+consSeen : Range -> Seens -> Seens
+consSeen r (MkSeens rs st) = MkSeens (Cons r rs) st
+
+seensAfter : Seen -> (St -> Seens) -> Seens
+seensAfter (MkSeen r st) k = consSeen r (k st)
+
+gatherMany : (Env -> St -> IR.Expr -> Seen)
+           -> Env
+           -> St
+           -> List IR.Expr
+           -> Seens
+gatherMany go env st Nil = MkSeens Nil st
+gatherMany go env st (Cons e es) =
+  seensAfter (go env st e) (\st1 -> gatherMany go env st1 es)
+
+joinSeen : Range -> Seen -> Seen
+joinSeen r (MkSeen rr st) = MkSeen (join r rr) st
+
+gatherArms : Ctx
+           -> (Env -> St -> IR.Expr -> Seen)
+           -> Env
+           -> Maybe Test
+           -> St
+           -> List IR.Arm
+           -> Seen
+gatherArms c go env t st Nil = MkSeen Unreached st
+gatherArms c go env t st (Cons (MkArm tag vs b) rest) =
+  thenSeen
+    (go (armEnv c env t tag) st b)
+    (\r st1 -> joinSeen r (gatherArms c go env t st1 rest))
+
+-- | what an expression may be, where `env` is known, and what it calls
+-- | with what (`walkGo`'s, its expression not given back)
+gatherGo : Ctx -> Env -> St -> IR.Expr -> Seen
+gatherGo c env st (EVar x) = MkSeen (rangeOfVar env x) st
+gatherGo c env st (EInt n) = MkSeen (point n) st
+gatherGo c env st (EGlobal g) = MkSeen (constRange c g) st
+gatherGo c env st (ELam xs b) =
+  thenSeen (gatherGo c env st b) (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st (ELet x a b) =
+  thenSeen
+    (gatherGo c env st a)
+    (\ra st1 -> gatherGo c (bindVar env x ra a) st1 b)
+gatherGo c env st (EMatch s arms) =
+  thenSeen
+    (gatherGo c env st s)
+    (\_ st1 ->
+       gatherArms
+         c
+         (gatherGo c)
+         env
+         (testOf env s)
+         (marked c env (testOf env s) st1)
+         arms)
+gatherGo c env st (EPrimCall p as) =
+  thenSeens
+    (gatherMany (gatherGo c) env st as)
+    (\rs st1 -> MkSeen (primRange p rs) st1)
+gatherGo c env st (ECall g as) =
+  thenSeens
+    (gatherMany (gatherGo c) env st as)
+    (\rs st1 -> MkSeen anyRange (calledIn c g rs st1))
+gatherGo c env st (EApp f as) =
+  thenSeens
+    (gatherMany (gatherGo c) env st (Cons f as))
+    (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st (ERecord fs ts) =
+  thenSeens
+    (gatherMany (gatherGo c) env st (fieldsOf fs))
+    (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st (EProj a l sh t) =
+  thenSeen (gatherGo c env st a) (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st (ETag t as ts) =
+  thenSeens
+    (gatherMany (gatherGo c) env st as)
+    (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st e = MkSeen anyRange st
+
+-- | what a definition calls with what, its parameters of the ranges `c`
+-- | says
+gatherDef : Ctx -> IR.Def -> St
+gatherDef c d@{ body = ELam xs b } =
+  seenSt (gatherGo c (paramEnv c d.key xs) emptySt b)
+gatherDef c d = seenSt (gatherGo c emptyEnv emptySt d.body)
+
+-- The walk that rewrites
+--------------------------------------------------------------------------------
+
+-- | what is walked: its range, and itself with its operations on words
+data Res = MkRes Range IR.Expr
+
+data Many = MkMany (List Range) (List IR.Expr)
+
+data Arms = MkArms Range (List IR.Arm)
+
+thenRes : Res -> (Range -> IR.Expr -> Res) -> Res
+thenRes (MkRes r e) k = k r e
+
+thenMany : Many -> (List Range -> List IR.Expr -> Res) -> Res
+thenMany (MkMany rs es) k = k rs es
+
+thenArms : Arms -> (Range -> List IR.Arm -> Res) -> Res
+thenArms (MkArms r arms) k = k r arms
+
+resExpr : Res -> IR.Expr
+resExpr (MkRes _ e) = e
+
+consMany : Res -> Many -> Many
+consMany (MkRes r e) (MkMany rs es) = MkMany (Cons r rs) (Cons e es)
+
+walkMany : (Env -> IR.Expr -> Res) -> Env -> List IR.Expr -> Many
+walkMany go env Nil = MkMany Nil Nil
+walkMany go env (Cons e es) = consMany (go env e) (walkMany go env es)
+
+consArm : String -> List String -> Res -> Arms -> Arms
+consArm tag vs (MkRes r b) (MkArms rr arms) =
+  MkArms (join r rr) (Cons (MkArm tag vs b) arms)
+
+walkArms : Ctx
+         -> (Env -> IR.Expr -> Res)
+         -> Env
+         -> Maybe Test
+         -> List IR.Arm
+         -> Arms
+walkArms c go env t Nil = MkArms Unreached Nil
+walkArms c go env t (Cons (MkArm tag vs b) rest) =
+  consArm tag vs (go (armEnv c env t tag) b) (walkArms c go env t rest)
+
+-- | what an expression may be, where `env` is known, and the expression
+-- | with its operations on words (`gatherGo`'s ranges)
+walkGo : Ctx -> Env -> IR.Expr -> Res
+walkGo c env (EVar x) = MkRes (rangeOfVar env x) (EVar x)
+walkGo c env (EInt n) = MkRes (point n) (EInt n)
+walkGo c env (EGlobal g) = MkRes (constRange c g) (EGlobal g)
+walkGo c env (ELam xs b) =
+  thenRes (walkGo c env b) (\_ b1 -> MkRes anyRange (ELam xs b1))
+walkGo c env (ELet x a b) =
+  thenRes
+    (walkGo c env a)
+    (\ra a1 ->
+       thenRes
+         (walkGo c (bindVar env x ra a) b)
+         (\rb b1 -> MkRes rb (ELet x a1 b1)))
+walkGo c env (EMatch s arms) =
+  thenRes
+    (walkGo c env s)
+    (\_ s1 ->
+       thenArms
+         (walkArms c (walkGo c) env (testOf env s) arms)
+         (\r arms1 -> MkRes r (EMatch s1 arms1)))
+walkGo c env (EPrimCall p as) =
+  thenMany
+    (walkMany (walkGo c) env as)
+    (\rs as1 -> MkRes (primRange p rs) (primOn p rs as1))
+walkGo c env (ECall g as) =
+  thenMany
+    (walkMany (walkGo c) env as)
+    (\rs as1 -> MkRes anyRange (ECall g as1))
+walkGo c env (EApp f as) =
+  thenMany
+    (walkMany (walkGo c) env (Cons f as))
+    (\_ es1 -> MkRes anyRange (applied f es1))
+walkGo c env (ERecord fs ts) =
+  thenMany
+    (walkMany (walkGo c) env (fieldsOf fs))
+    (\_ es1 -> MkRes anyRange (ERecord (relabel fs es1) ts))
+walkGo c env (EProj a l sh t) =
+  thenRes (walkGo c env a) (\_ a1 -> MkRes anyRange (EProj a1 l sh t))
+walkGo c env (ETag t as ts) =
+  thenMany
+    (walkMany (walkGo c) env as)
+    (\_ as1 -> MkRes anyRange (ETag t as1 ts))
+walkGo c env e = MkRes anyRange e
+
+-- | a definition with its operations on words, its parameters of the
+-- | ranges `c` says
+walkDef : Ctx -> IR.Def -> IR.Expr
+walkDef c d@{ body = ELam xs b } =
+  ELam xs (resExpr (walkGo c (paramEnv c d.key xs) b))
+walkDef c d = resExpr (walkGo c emptyEnv d.body)
+
+-- Arities and constants
+--------------------------------------------------------------------------------
+
+arityIs : Int -> Maybe Int -> Bool
+arityIs n (Just m) = n == m
+arityIs n Nothing = False
+
+arityOne : Map.Map String Int -> IR.Def -> Map.Map String Int
+arityOne m d@{ body = ELam xs _ } =
+  Map.insert compareString d.key (List.length xs) m
+arityOne m d = m
+
+constOne : Map.Map String Int -> IR.Def -> Map.Map String Int
+constOne m d@{ body = EInt n } = Map.insert compareString d.key n m
+constOne m d = m
+
+-- The fixpoint
+--------------------------------------------------------------------------------
+
+-- | what the rounds go on with: each function's parameters' ranges (of
+-- | one that escapes, any `Int`; of one no call was walked of, nothing),
+-- | how often each grew, and the bounds compared in each
+type Fix =
+  { params : Map.Map String (List Range)
+  , grown : Map.Map String (List Int)
+  , marks : Map.Map String (Map.Map Int Unit)
+  }
+
+-- (the least mark from `d`, the greatest up to `c`)
+markAbove : Map.Map Int Unit -> Int -> Maybe Int
+markAbove ms d =
+  List.foldl
+    (\acc p -> if fst p >= d then highMeet acc (Just (fst p)) else acc)
+    Nothing
+    (Map.toList ms)
+
+markBelow : Map.Map Int Unit -> Int -> Maybe Int
+markBelow ms c =
+  List.foldl
+    (\acc p -> if fst p <= c then lowMeet acc (Just (fst p)) else acc)
+    Nothing
+    (Map.toList ms)
+
+-- (whether the lower bound went down, or the upper one up)
+lowGrew : Maybe Int -> Maybe Int -> Bool
+lowGrew (Just a) (Just c) = c < a
+lowGrew (Just a) Nothing = True
+lowGrew Nothing c = False
+
+highGrew : Maybe Int -> Maybe Int -> Bool
+highGrew (Just b) (Just d) = d > b
+highGrew (Just b) Nothing = True
+highGrew Nothing d = False
+
+widenLow : Maybe (Map.Map Int Unit) -> Maybe Int -> Maybe Int -> Maybe Int
+widenLow (Just ms) a (Just c) =
+  if lowGrew a (Just c) then markBelow ms c else Just c
+widenLow ms a c = if lowGrew a c then Nothing else c
+
+widenHigh : Maybe (Map.Map Int Unit) -> Maybe Int -> Maybe Int -> Maybe Int
+widenHigh (Just ms) b (Just d) =
+  if highGrew b (Just d) then markAbove ms d else Just d
+widenHigh ms b d = if highGrew b d then Nothing else d
+
+-- | a range grown from `o` to `n`, widened: each bound that grew to the
+-- | next mark past it, if marks are given, else to none
+widen : Maybe (Map.Map Int Unit) -> Range -> Range -> Range
+widen ms (Within a b) (Within c d) = Within (widenLow ms a c) (widenHigh ms b d)
+widen ms o n = n
+
+-- (how a parameter grown `k` times grows again: as it is, once; to the
+-- marks `ms`, twice more; then to no bound)
+grownOne : Map.Map Int Unit -> Int -> Range -> Range -> Range
+grownOne ms k old new =
+  if k < 1 then new
+  else if k < 3 then widen (Just ms) old new
+  else widen Nothing old new
+
+-- (how often a parameter grew, growing from `old` to `new` -- not
+-- counted from nothing, its first call)
+countOne : Int -> Range -> Range -> Int
+countOne k Unreached new = k
+countOne k old new = if rangeEq old new then k else k + 1
+
+countsOf : Fix -> String -> List Range -> List Int
+countsOf fx g old =
+  fromMaybe (List.map (\_ -> 0) old) (Map.lookup compareString g fx.grown)
+
+grownTo : Fix -> String -> List Range -> List Range -> List Range
+grownTo fx g old new =
+  List.zipWith
+    (\kr n ->
+       grownOne
+         (fromMaybe Map.empty (Map.lookup compareString g fx.marks))
+         (fst kr)
+         (snd kr)
+         n)
+    (List.zip (countsOf fx g old) old)
+    new
+
+countedTo : Fix -> String -> List Range -> List Range -> List Int
+countedTo fx g old new =
+  List.zipWith
+    (\kr n -> countOne (fst kr) (snd kr) n)
+    (List.zip (countsOf fx g old) old)
+    new
+
+rangesEq : List Range -> List Range -> Bool
+rangesEq (Cons a as) (Cons b bs) = rangeEq a b && rangesEq as bs
+rangesEq Nil Nil = True
+rangesEq as bs = False
+
+-- | what the next round walks, how things are, and what the last walk of
+-- | each definition gathered
+type Step =
+  { fix : Fix
+  , dirty : Map.Map String Unit
+  , gathered : Map.Map String (Map.Map String (List Range))
+  }
+
+-- (a call of `g` with `rs` gathered: `g` grown, and walked again)
+absorbOne : Step -> Pair String (List Range) -> Step
+absorbOne s (MkPair g rs) = case Map.lookup compareString g s.fix.params of
+  Just old ->
+    if rangesEq old (joinAll old rs) then s
+    else { fix =
+             { params =
+                 Map.insert
+                   compareString
+                   g
+                   (grownTo s.fix g old (joinAll old rs))
+                   s.fix.params
+             , grown =
+                 Map.insert
+                   compareString
+                   g
+                   (countedTo s.fix g old (joinAll old rs))
+                   s.fix.grown
+             , marks = s.fix.marks
+             }
+         , dirty = Map.insert compareString g MkUnit s.dirty
+         , gathered = s.gathered
+         }
+  Nothing -> s
+
+-- (the marks of `key`, with those `more`)
+marksWith : String
+          -> Map.Map String (Map.Map Int Unit)
+          -> Map.Map Int Unit
+          -> Map.Map String (Map.Map Int Unit)
+marksWith key ms more =
+  if Map.height more == 0 then ms
+  else Map.insert
+      compareString
+      key
+      (Map.union
+         compareInt
+         more
+         (fromMaybe Map.empty (Map.lookup compareString key ms)))
+      ms
+
+-- (what the walk of `key` gathered: its marks kept, its calls absorbed;
+-- it walked, not to be walked again for what grew before)
+absorb : String -> Step -> St -> Step
+absorb key s st =
+  List.foldl
+    absorbOne
+    { fix =
+        { params = s.fix.params
+        , grown = s.fix.grown
+        , marks = marksWith key s.fix.marks st.marks
+        }
+    , dirty = Map.delete compareString key s.dirty
+    , gathered = Map.insert compareString key st.calls s.gathered
+    }
+    (Map.toList st.calls)
+
+ctxOf : Map.Map String Int -> Map.Map String (List Range) -> Bool -> Ctx
+ctxOf consts params mark = { params = params, consts = consts, marking = mark }
+
+-- What matters
+--------------------------------------------------------------------------------
+
+-- Most of a program's parameters are no `Int`'s, or no operation is done
+-- on them: only a function's parameters that matter are worked out --
+-- those an `Int` operation is done on, or given to one of another's that
+-- matters -- and only the definitions that call such a function are
+-- walked for the calls, only those doing an `Int` operation given back
+-- with their operations on words.
+
+-- | the `Int` operations a range is worked out for (`primRange`,
+-- | `wordOf`, the comparisons)
+intOps : List String
+intOps =
+  [ "intAdd"
+  , "intSub"
+  , "intMul"
+  , "intDiv"
+  , "intMod"
+  , "intAnd"
+  , "intEq"
+  , "intLt"
+  , "intLe"
+  , "floatFromInt"
+  ]
+
+isIntOp : String -> Bool
+isIntOp p = List.any (\q -> strEq q p) intOps
+
+-- (the names in the operands of a primitive)
+namesW : Map.Map String Unit -> List IR.Expr -> Map.Map String Unit
+namesW m Nil = m
+namesW m (Cons (EVar x) rest) =
+  namesW (Map.insert compareString x MkUnit m) rest
+namesW m (Cons (EPrimCall _ as) rest) = namesW m (IR.appendI as rest)
+namesW m (Cons (EProj e _ _ _) rest) = namesW m (Cons e rest)
+namesW m (Cons _ rest) = namesW m rest
+
+-- | what a definition is seen to do: the names an `Int` operation is
+-- | done on; each name given to a function's parameter (the function's
+-- | key and the place, and the name); the functions it calls; whether it
+-- | does an `Int` operation; the functions it may call unknown -- named
+-- | as a value, or called with other than their arity (`escapes`)
+type Scan =
+  { numeric : Map.Map String Unit
+  , given : List (Pair (Pair String Int) String)
+  , calls : List String
+  , ints : Bool
+  , escapes : Map.Map String Unit
+  }
+
+emptyScan : Scan
+emptyScan =
+  { numeric = Map.empty
+  , given = Nil
+  , calls = Nil
+  , ints = False
+  , escapes = Map.empty
+  }
+
+scanOp : Scan -> List IR.Expr -> Scan
+scanOp s as =
+  { numeric = namesW s.numeric as
+  , given = s.given
+  , calls = s.calls
+  , ints = True
+  , escapes = s.escapes
+  }
+
+scanGlobal : Scan -> String -> Scan
+scanGlobal s g =
+  { numeric = s.numeric
+  , given = s.given
+  , calls = s.calls
+  , ints = s.ints
+  , escapes = Map.insert compareString g MkUnit s.escapes
+  }
+
+-- (each name given to `g`, from the place `i` on)
+givenFrom : String
+          -> Int
+          -> List (Pair (Pair String Int) String)
+          -> List IR.Expr
+          -> List (Pair (Pair String Int) String)
+givenFrom g i acc Nil = acc
+givenFrom g i acc (Cons (EVar x) as) =
+  givenFrom g (i + 1) (Cons (MkPair (MkPair g i) x) acc) as
+givenFrom g i acc (Cons a as) = givenFrom g (i + 1) acc as
+
+scanCall : Map.Map String Int -> Scan -> String -> List IR.Expr -> Scan
+scanCall ar s g as =
+  { numeric = s.numeric
+  , given = givenFrom g 0 s.given as
+  , calls = Cons g s.calls
+  , ints = s.ints
+  , escapes =
+      if arityIs (List.length as) (Map.lookup compareString g ar) then s.escapes
+      else Map.insert compareString g MkUnit s.escapes
+  }
+
+scanW : Map.Map String Int -> Scan -> List IR.Expr -> Scan
+scanW ar s Nil = s
+scanW ar s (Cons (EGlobal g) rest) = scanW ar (scanGlobal s g) rest
+scanW ar s (Cons (EPrimCall p as) rest) =
+  scanW ar (if isIntOp p then scanOp s as else s) (IR.appendI as rest)
+scanW ar s (Cons (ECall g as) rest) =
+  scanW ar (scanCall ar s g as) (IR.appendI as rest)
+scanW ar s (Cons (ELam _ b) rest) = scanW ar s (Cons b rest)
+scanW ar s (Cons (EApp f as) rest) = scanW ar s (Cons f (IR.appendI as rest))
+scanW ar s (Cons (ELet _ a b) rest) = scanW ar s (Cons a (Cons b rest))
+scanW ar s (Cons (ERecord fs _) rest) = scanW ar s (IR.pushFields fs rest)
+scanW ar s (Cons (EProj e _ _ _) rest) = scanW ar s (Cons e rest)
+scanW ar s (Cons (ETag _ as _) rest) = scanW ar s (IR.appendI as rest)
+scanW ar s (Cons (EMatch e arms) rest) =
+  scanW ar s (Cons e (IR.pushArms arms rest))
+scanW ar s (Cons (EFix _ b) rest) = scanW ar s (Cons b rest)
+scanW ar s (Cons _ rest) = scanW ar s rest
+
+scanOf : Map.Map String Int -> IR.Def -> Scan
+scanOf ar d = scanW ar emptyScan (Cons d.body Nil)
+
+placeOf : String -> Int -> List String -> Maybe Int
+placeOf x i Nil = Nothing
+placeOf x i (Cons y ys) = if strEq x y then Just i else placeOf x (i + 1) ys
+
+memberI : Int -> List Int -> Bool
+memberI i js = List.any (\j -> j == i) js
+
+withPlace : List Int -> Maybe Int -> List Int
+withPlace is (Just j) = if memberI j is then is else Cons j is
+withPlace is Nothing = is
+
+-- | a function that does not escape: its parameters; those an `Int`
+-- | operation is done on (by place); and each of them given to a
+-- | function's parameter -- that function's key and the place, and its
+-- | own place
+type Fn =
+  { params : List String
+  , numeric : List Int
+  , forwards : List (Pair (Pair String Int) Int)
+  }
+
+scanIn : Map.Map String Scan -> String -> Scan
+scanIn scans k = fromMaybe emptyScan (Map.lookup compareString k scans)
+
+forwardOne : List String
+           -> List (Pair (Pair String Int) Int)
+           -> Pair (Pair String Int) String
+           -> List (Pair (Pair String Int) Int)
+forwardOne xs acc p = case placeOf (snd p) 0 xs of
+  Just j -> Cons (MkPair (fst p) j) acc
+  Nothing -> acc
+
+fnOf : List String -> Scan -> Fn
+fnOf xs s =
+  { params = xs
+  , numeric =
+      List.foldl
+        (\is x -> withPlace is (placeOf x 0 xs))
+        Nil
+        (List.filter (\x -> Map.member compareString x s.numeric) xs)
+  , forwards = List.foldl (forwardOne xs) Nil s.given
+  }
+
+fnOne : Map.Map String Unit
+      -> Map.Map String Scan
+      -> Map.Map String Fn
+      -> IR.Def
+      -> Map.Map String Fn
+fnOne esc scans m d@{ body = ELam xs _ } =
+  if Map.member compareString d.key esc then m
+  else Map.insert compareString d.key (fnOf xs (scanIn scans d.key)) m
+fnOne esc scans m d = m
+
+-- (... and those given to one that matters, of `m`)
+matterOne : Map.Map String (List Int) -> Fn -> List Int -> List Int
+matterOne m fn is =
+  List.foldl
+    (\acc p ->
+       if memberI
+         (snd (fst p))
+         (fromMaybe Nil (Map.lookup compareString (fst (fst p)) m))
+         then withPlace acc (Just (snd p))
+       else acc)
+    is
+    fn.forwards
+
+-- (each of the functions `fws`, those giving their parameters on, once)
+matterStep : List (Pair String Fn)
+           -> Map.Map String (List Int)
+           -> Map.Map String (List Int)
+matterStep fws m =
+  List.foldl
+    (\acc p ->
+       Map.insert
+         compareString
+         (fst p)
+         (matterOne
+            m
+            (snd p)
+            (fromMaybe Nil (Map.lookup compareString (fst p) m)))
+         acc)
+    m
+    fws
+
+placesSize : Map.Map String (List Int) -> Int
+placesSize m = List.foldl (\n p -> n + List.length (snd p)) 0 (Map.toList m)
+
+-- (the places, where none was added; else on with them)
+untilGrown : Map.Map String (List Int)
+           -> Map.Map String (List Int)
+           -> (Map.Map String (List Int) -> Map.Map String (List Int))
+           -> Map.Map String (List Int)
+untilGrown m next k = if placesSize next == placesSize m then next else k next
+
+-- (again, `n` more at most, until none is added)
+mattering : List (Pair String Fn)
+          -> Int
+          -> Map.Map String (List Int)
+          -> Map.Map String (List Int)
+mattering fws n m =
+  if n <= 0 then m
+  else untilGrown m (matterStep fws m) (\next -> mattering fws (n - 1) next)
+
+fnForwards : Fn -> List (Pair (Pair String Int) Int)
+fnForwards fn = fn.forwards
+
+-- | of each function that does not escape, the parameters that matter
+matters : Map.Map String Fn -> Map.Map String (List Int)
+matters fns =
+  mattering
+    (List.filter
+       (\(p : Pair String Fn) -> not (List.null (fnForwards (snd p))))
+       (Map.toList fns))
+    64
+    (Map.mapValues (\(fn : Fn) -> fn.numeric) fns)
+
+-- | what is walked: the definitions by key; those that call a function
+-- | worked out, with the functions they call so (`callers`), and of each
+-- | function, those that call it (`callersOf`); those that do an `Int`
+-- | operation (`ints`)
+type Scope =
+  { byKey : Map.Map String IR.Def
+  , callers : Map.Map String (List String)
+  , callersOf : Map.Map String (List String)
+  , ints : Map.Map String Unit
+  }
+
+-- (each function whose parameters matter: its parameters, of nothing
+-- until a call is walked)
+startOne : Map.Map String Fn
+         -> Map.Map String (List Range)
+         -> Pair String (List Int)
+         -> Map.Map String (List Range)
+startOne fns acc (MkPair k Nil) = acc
+startOne fns acc (MkPair k is) = case Map.lookup compareString k fns of
+  Just fn ->
+    Map.insert compareString k (List.map (\_ -> Unreached) fn.params) acc
+  Nothing -> acc
+
+startParams : Map.Map String Fn
+            -> Map.Map String (List Int)
+            -> Map.Map String (List Range)
+startParams fns ms = List.foldl (startOne fns) Map.empty (Map.toList ms)
+
+-- (the functions worked out it calls)
+calledOf : Map.Map String (List Range) -> Scan -> List String
+calledOf params s =
+  List.map
+    fst
+    (Map.toList
+       (List.foldl
+          (\m g ->
+             if Map.member compareString g params
+               then Map.insert compareString g (MkUnit : Unit) m
+             else m)
+          Map.empty
+          s.calls))
+
+addCaller : String
+          -> Map.Map String (List String)
+          -> String
+          -> Map.Map String (List String)
+addCaller k m g =
+  Map.insert
+    compareString
+    g
+    (Cons k (fromMaybe Nil (Map.lookup compareString g m)))
+    m
+
+-- (a definition, calling the functions `gs` worked out, in the scope)
+scopeWith : Scope -> IR.Def -> Bool -> List String -> Scope
+scopeWith sc d ints Nil =
+  { byKey = Map.insert compareString d.key d sc.byKey
+  , callers = sc.callers
+  , callersOf = sc.callersOf
+  , ints =
+      if ints then Map.insert compareString d.key MkUnit sc.ints else sc.ints
+  }
+scopeWith sc d ints gs =
+  { byKey = Map.insert compareString d.key d sc.byKey
+  , callers = Map.insert compareString d.key gs sc.callers
+  , callersOf = List.foldl (addCaller d.key) sc.callersOf gs
+  , ints =
+      if ints then Map.insert compareString d.key MkUnit sc.ints else sc.ints
+  }
+
+scopeOne : Map.Map String (List Range) -> Scope -> IR.Def -> Scan -> Scope
+scopeOne params sc d s = scopeWith sc d s.ints (calledOf params s)
+
+scopeOf : Map.Map String (List Range)
+        -> Map.Map String Scan
+        -> List IR.Def
+        -> Scope
+scopeOf params scans defs =
+  List.foldl
+    (\sc (d : IR.Def) -> scopeOne params sc d (scanIn scans d.key))
+    { byKey = Map.empty
+    , callers = Map.empty
+    , callersOf = Map.empty
+    , ints = Map.empty
+    }
+    defs
+
+-- (the definitions `keys` that call a function worked out walked, each
+-- against the ranges as they are when it is: the round after `s`)
+roundOf : Map.Map String Int -> Scope -> Step -> List String -> Step
+roundOf consts sc s0 keys =
+  List.foldl
+    (\(s : Step) k -> case Map.lookup compareString k sc.byKey of
+     Just d ->
+       if Map.member compareString k sc.callers
+         then absorb
+             k
+             s
+             (gatherDef
+                (ctxOf
+                   consts
+                   s.fix.params
+                   (Map.member compareString k s.fix.params))
+                d)
+       else s
+     Nothing -> s)
+    { fix = s0.fix, dirty = Map.empty, gathered = s0.gathered }
+    keys
+
+-- (rounds, `n` more at most, until nothing grows: where they settle,
+-- the last; else nothing)
+rounds : Map.Map String Int -> Scope -> Int -> Step -> Maybe Step
+rounds consts sc n s =
+  if Map.height s.dirty == 0 then Just s
+  else if n <= 0 then Nothing
+  else rounds
+      consts
+      sc
+      (n - 1)
+      (roundOf consts sc s (List.map fst (Map.toList s.dirty)))
+
+nothings : List Range -> List Range
+nothings rs = List.map (\_ -> Unreached) rs
+
+-- Narrowing
+--------------------------------------------------------------------------------
+
+-- The ranges the rounds settle on are what every call gives within them;
+-- what every call gives, walked against them, is so too, and tighter
+-- (`d + 1` while `d * d <= k`, `d` widened past what it is given): each
+-- function's parameters are given that, and again, as long as one
+-- changes -- only the definitions given changed ranges walked again, and
+-- only the functions they call joined again.
+
+-- | what the narrowing goes on with: the ranges; what the walk of each
+-- | definition that calls a function worked out gathered; the functions
+-- | whose ranges changed
+type Narrow =
+  { params : Map.Map String (List Range)
+  , gathered : Map.Map String (Map.Map String (List Range))
+  , changed : List String
+  }
+
+-- (the definitions `keys` walked, what they gather kept)
+gatherFrom : Ctx
+           -> Scope
+           -> Map.Map String (Map.Map String (List Range))
+           -> List String
+           -> Map.Map String (Map.Map String (List Range))
+gatherFrom c sc g keys =
+  List.foldl
+    (\m k -> case Map.lookup compareString k sc.byKey of
+     Just d -> Map.insert compareString k (gatherDef c d).calls m
+     Nothing -> m)
+    g
+    keys
+
+-- (what all the calls of `g` gathered give it: `old`'s length of nothing,
+-- where there are none)
+joinedFor : Scope
+          -> Map.Map String (Map.Map String (List Range))
+          -> List Range
+          -> String
+          -> List Range
+joinedFor sc gathered old g =
+  List.foldl
+    (\acc k -> case Map.lookup compareString k gathered of
+     Just calls -> case Map.lookup compareString g calls of
+       Just rs -> joinAll acc rs
+       Nothing -> acc
+     Nothing -> acc)
+    (nothings old)
+    (fromMaybe Nil (Map.lookup compareString g sc.callersOf))
+
+-- (the functions the definitions `keys` call, each once)
+affectedBy : Scope -> List String -> List String
+affectedBy sc keys =
+  List.map
+    fst
+    (Map.toList
+       (List.foldl
+          (\m k ->
+             List.foldl
+               (\acc g -> Map.insert compareString g (MkUnit : Unit) acc)
+               m
+               (fromMaybe Nil (Map.lookup compareString k sc.callers)))
+          Map.empty
+          keys))
+
+-- (the functions `gs` joined again)
+narrowWith : Scope
+           -> Narrow
+           -> Map.Map String (Map.Map String (List Range))
+           -> List String
+           -> Narrow
+narrowWith sc nw gathered gs =
+  List.foldl
+    (\(acc : Narrow) g -> case Map.lookup compareString g acc.params of
+     Just old ->
+       if allAny old || rangesEq old (joinedFor sc gathered old g) then acc
+       else { params =
+                Map.insert
+                  compareString
+                  g
+                  (joinedFor sc gathered old g)
+                  acc.params
+            , gathered = acc.gathered
+            , changed = Cons g acc.changed
+            }
+     Nothing -> acc)
+    { params = nw.params, gathered = gathered, changed = Nil }
+    gs
+
+-- (the definitions `keys` walked again, the functions they call joined)
+narrowOnce : Map.Map String Int -> Scope -> Narrow -> List String -> Narrow
+narrowOnce consts sc nw keys =
+  narrowWith
+    sc
+    nw
+    (gatherFrom (ctxOf consts nw.params False) sc nw.gathered keys)
+    (affectedBy sc keys)
+
+-- (those of `ks` that call a function worked out)
+callersIn : Scope -> List String -> List String
+callersIn sc ks = List.filter (\k -> Map.member compareString k sc.callers) ks
+
+-- | the ranges settled, narrowed `n` times more at most
+narrowing : Map.Map String Int
+          -> Scope
+          -> Int
+          -> Narrow
+          -> Map.Map String (List Range)
+narrowing consts sc n nw =
+  if n <= 0 || List.null (callersIn sc nw.changed) then nw.params
+  else narrowing
+      consts
+      sc
+      (n - 1)
+      (narrowOnce consts sc nw (callersIn sc nw.changed))
+
+-- | the ranges the rounds settled on (`params`), narrowed: every
+-- | definition that calls a function worked out walked once, then those
+-- | given changed ranges, three times at most
+narrowed : Map.Map String Int -> Scope -> Step -> Map.Map String (List Range)
+narrowed consts sc s =
+  narrowing
+    consts
+    sc
+    3
+    (narrowWith
+       sc
+       { params = s.fix.params, gathered = s.gathered, changed = Nil }
+       s.gathered
+       (List.map fst (Map.toList s.fix.params)))
+
+-- Ranges of a program
+--------------------------------------------------------------------------------
+
+-- | the definitions with their operations on words, and of each
+-- | function, the parameters every call gives a word (by index)
+type Ranged = { defs : List IR.Def, words : Map.Map String (List Int) }
+
+wordIndices : List Range -> List Int
+wordIndices rs =
+  List.map
+    fst
+    (List.filter
+       (\p -> isWord (snd p))
+       (List.zip (List.range 0 (List.length rs - 1)) rs))
+
+wordsOf : Map.Map String (List Range) -> Map.Map String (List Int)
+wordsOf params =
+  List.foldl
+    (\m p ->
+       if List.null (wordIndices (snd p)) then m
+       else Map.insert compareString (fst p) (wordIndices (snd p)) m)
+    Map.empty
+    (Map.toList params)
+
+-- (one that does an `Int` operation, with its operations on words)
+rewritten : Ctx -> Scope -> IR.Def -> IR.Def
+rewritten c sc d =
+  if Map.member compareString d.key sc.ints
+    then IR.mkDef d.key d.name (walkDef c d)
+  else d
+
+-- (the ranges settled: the definitions walked against them)
+rangedWith : Map.Map String Int
+           -> Scope
+           -> List IR.Def
+           -> Map.Map String (List Range)
+           -> Ranged
+rangedWith consts sc defs params =
+  { defs = List.map (rewritten (ctxOf consts params False) sc) defs
+  , words = wordsOf params
+  }
+
+settled : Map.Map String Int -> Scope -> List IR.Def -> Maybe Step -> Ranged
+settled consts sc defs (Just s) =
+  rangedWith consts sc defs (narrowed consts sc s)
+settled consts sc defs Nothing = { defs = defs, words = Map.empty }
+
+rangedIn : Map.Map String Int
+         -> List IR.Def
+         -> Map.Map String (List Range)
+         -> Scope
+         -> Ranged
+rangedIn consts defs params sc =
+  settled
+    consts
+    sc
+    defs
+    (rounds
+       consts
+       sc
+       64
+       (roundOf
+          consts
+          sc
+          { fix = { params = params, grown = Map.empty, marks = Map.empty }
+          , dirty = Map.empty
+          , gathered = Map.empty
+          }
+          (List.filter
+             (\k -> not (Map.member compareString k params))
+             (List.map (\(d : IR.Def) -> d.key) defs))))
+
+rangedFns : Map.Map String Int
+          -> List IR.Def
+          -> Map.Map String Scan
+          -> Map.Map String (List Range)
+          -> Ranged
+rangedFns consts defs scans params =
+  rangedIn consts defs params (scopeOf params scans defs)
+
+rangedOf : Map.Map String Int
+         -> List IR.Def
+         -> Map.Map String Scan
+         -> Map.Map String Fn
+         -> Ranged
+rangedOf consts defs scans fns =
+  rangedFns consts defs scans (startParams fns (matters fns))
+
+rangedEsc : Map.Map String Int
+          -> Map.Map String Unit
+          -> List IR.Def
+          -> Map.Map String Scan
+          -> Ranged
+rangedEsc consts esc defs scans =
+  rangedOf consts defs scans (List.foldl (fnOne esc scans) Map.empty defs)
+
+scansOf : Map.Map String Int -> List IR.Def -> Map.Map String Scan
+scansOf ar defs =
+  List.foldl
+    (\m (d : IR.Def) -> Map.insert compareString d.key (scanOf ar d) m)
+    Map.empty
+    defs
+
+scanEscapes : Scan -> Map.Map String Unit
+scanEscapes s = s.escapes
+
+-- (the functions any definition may call unknown)
+escapesOf : Map.Map String Scan -> Map.Map String Unit
+escapesOf scans =
+  List.foldl
+    (\m (p : Pair String Scan) ->
+       Map.union compareString (scanEscapes (snd p)) m)
+    Map.empty
+    (Map.toList scans)
+
+rangedScans : Map.Map String Int -> List IR.Def -> Map.Map String Scan -> Ranged
+rangedScans consts defs scans = rangedEsc consts (escapesOf scans) defs scans
+
+-- | the program's definitions (in monadic form) with their operations
+-- | on `Int`s known words done on words, and the parameters every call
+-- | gives a word; where the ranges do not settle, as they are
+-- | >>> List.map (\(d : IR.Def) -> d.body) (rangeProgram [IR.mkDef "f" "f" (ELam ["i"] (EMatch (EPrimCall "intLt" [EVar "i", EInt 10]) [MkArm "True" [] (ECall "f" [EPrimCall "intAdd" [EVar "i", EInt 1]]), MkArm "False" [] (EVar "i")])), IR.mkDef "main" "main" (ECall "f" [EInt 0])]).defs
+-- | [ELam ["i"] (EMatch (EPrimCall "wordLt" [EVar "i", EInt 10]) [MkArm "True" [] (ECall "f" [EPrimCall "wordAdd" [EVar "i", EInt 1]]), MkArm "False" [] (EVar "i")]), ECall "f" [EInt 0]]
+-- | >>> Map.toList (rangeProgram [IR.mkDef "f" "f" (ELam ["i"] (EMatch (EPrimCall "intEq" [EVar "i", EInt 50000000]) [MkArm "True" [] (EVar "i"), MkArm "False" [] (ECall "f" [EPrimCall "intAdd" [EVar "i", EInt 1]])])), IR.mkDef "main" "main" (ECall "f" [EInt 0])]).words
+-- | [MkPair "f" [0]]
+-- | >>> Map.toList (rangeProgram [IR.mkDef "f" "f" (ELam ["i"] (EMatch (EPrimCall "intLt" [EVar "i", EInt 0]) [MkArm "True" [] (EVar "i"), MkArm "False" [] (ECall "f" [EPrimCall "intAdd" [EVar "i", EInt 1]])])), IR.mkDef "main" "main" (ECall "f" [EInt 0])]).words
+-- | []
+-- | >>> Map.toList (rangeProgram [IR.mkDef "f" "f" (ELam ["i"] (EMatch (EPrimCall "intEq" [EVar "i", EInt 9]) [MkArm "True" [] (EVar "i"), MkArm "False" [] (ECall "f" [EPrimCall "intAdd" [EVar "i", EInt 1]])])), IR.mkDef "main" "main" (ETag "Pair" [ECall "f" [EInt 0], EGlobal "f"] [])]).words
+-- | []
+-- | >>> Map.toList (rangeProgram [IR.mkDef "f" "f" (ELam ["k", "d"] (EMatch (EPrimCall "intLt" [EVar "k", EPrimCall "intMul" [EVar "d", EVar "d"]]) [MkArm "True" [] (ETag "True" [] []), MkArm "False" [] (EMatch (EPrimCall "intEq" [EPrimCall "intMod" [EVar "k", EVar "d"], EInt 0]) [MkArm "True" [] (ETag "False" [] []), MkArm "False" [] (ECall "f" [EVar "k", EPrimCall "intAdd" [EVar "d", EInt 1]])])])), IR.mkDef "main" "main" (ECall "f" [EInt 5000000, EInt 2])]).words
+-- | [MkPair "f" [0, 1]]
+-- | >>> List.map (\(d : IR.Def) -> d.body) (rangeProgram [IR.mkDef "g" "g" (ELam ["x"] (EPrimCall "intEq" [EPrimCall "intMod" [EVar "x", EInt 7], EInt 0]))]).defs
+-- | [ELam ["x"] (EPrimCall "wordEq" [EPrimCall "intMod" [EVar "x", EInt 7], EInt 0])]
+rangeProgram : List IR.Def -> Ranged
+rangeProgram defs =
+  rangedScans
+    (List.foldl constOne Map.empty defs)
+    defs
+    (scansOf (List.foldl arityOne Map.empty defs) defs)

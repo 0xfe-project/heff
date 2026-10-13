@@ -45,6 +45,7 @@ import heff.compile.ir as IR
 import heff.compile.irtext as IRText
 import heff.compile.lower as Lower
 import heff.compile.prims as Prims
+import heff.compile.ranges as Ranges
 import heff.compile.refcount as RefCount
 import heff.compile.repr as Repr
 import heff.compile.simplify as Simplify
@@ -477,6 +478,7 @@ fixedSuffix w =
 reprSuffix : Repr.Repr -> String
 reprSuffix (RepFix w) = fixedSuffix w
 reprSuffix RepF64 = "f64"
+reprSuffix RepInt = "word"
 reprSuffix RepV = "v"
 
 fixedType : Fixed.Fixed -> String
@@ -490,6 +492,7 @@ fixedType w =
 cType : Repr.Repr -> String
 cType (RepFix w) = fixedType w
 cType RepF64 = "double"
+cType RepInt = "int64_t"
 cType RepV = "V"
 
 -- (an integer of the type, a C constant: its value modulo 2^64, as an
@@ -627,9 +630,38 @@ primUOf : String -> Maybe Fixed.FixedPrim -> List String -> String
 primUOf p (Just fp) vs = fixedU fp vs
 primUOf p Nothing vs = float64U p vs
 
+-- (an operation on words, heff.compile.ranges's, as C's operator: of
+-- `int64_t`s that neither overflow nor divide by 0, it is known)
+wordSymbols : List (Pair String String)
+wordSymbols =
+  [ MkPair "wordAdd" "+"
+  , MkPair "wordSub" "-"
+  , MkPair "wordMul" "*"
+  , MkPair "wordQuot" "/"
+  , MkPair "wordRem" "%"
+  , MkPair "wordEq" "=="
+  , MkPair "wordLt" "<"
+  , MkPair "wordLe" "<="
+  ]
+
+wordSymbol : String -> String
+wordSymbol p = fromMaybe "" (List.lookupBy strEq p wordSymbols)
+
+-- | ... as C has it: an operator; a division or a remainder rounded
+-- | down, the runtime's; a `Float64` made
+wordU : String -> List String -> String
+wordU "wordDiv" vs = callOf "heff_word_div" vs
+wordU "wordMod" vs = callOf "heff_word_mod" vs
+wordU "wordToFloat" vs = "((double)" ^ arg0 vs ^ ")"
+wordU p vs =
+  if Ranges.isWordRel p then "heff_bool(" ^ infixC (wordSymbol p) vs ^ ")"
+  else infixC (wordSymbol p) vs
+
 -- | a primitive done on unboxed operands (heff.compile.repr's `primShape`)
 primU : String -> List String -> String
-primU p vs = primUOf p (Fixed.fixedPrimOf p) vs
+primU p vs =
+  if Ranges.isWordPrim p then wordU p vs
+  else primUOf p (Fixed.fixedPrimOf p) vs
 
 relSymbol : String -> Maybe Fixed.FixedPrim -> String
 relSymbol p (Just fp) = opSymbol fp.op
@@ -637,7 +669,9 @@ relSymbol p Nothing = floatSymbol p
 
 -- | a comparison of unboxed operands, as C's condition
 relU : String -> List String -> String
-relU p vs = infixC (relSymbol p (Fixed.fixedPrimOf p)) vs
+relU p vs =
+  if Ranges.isWordRel p then infixC (wordSymbol p) vs
+  else infixC (relSymbol p (Fixed.fixedPrimOf p)) vs
 
 argsArr : List String -> String
 argsArr vs = if List.null vs then "NULL" else "(V[]){" ^ joinWith ", " vs ^ "}"
@@ -915,14 +949,23 @@ lendingPrims =
   , "arrayIndex"
   ]
 
+-- (computed of words alone -- variables, literals, operations on words
+-- (#79) -- so taking nothing)
+wordOnly : RefCount.Value -> Bool
+wordOnly (RLocal _) = True
+wordOnly (RFixU _ _) = True
+wordOnly (RPrimU p es) = Ranges.isWordPrim p && List.all wordOnly es
+wordOnly _ = False
+
 -- (an operand that takes nothing another is given: a variable, a
--- reference taken of one, a literal)
+-- reference taken of one, a literal, a word boxed)
 plainOperand : RefCount.Value -> Bool
 plainOperand (RLocal _) = True
 plainOperand (RDup _) = True
 plainOperand (RInt _) = True
 plainOperand (RStr _) = True
 plainOperand (RNTag _) = True
+plainOperand (RBox RepInt e) = wordOnly e
 plainOperand _ = False
 
 givesUp : String -> RefCount.Value -> Bool
@@ -1320,6 +1363,7 @@ wordAs : Repr.Repr -> String -> String
 wordAs RepF64 w = "heff_f64_of_word(" ^ w ^ ")"
 wordAs (RepFix w) x = "((" ^ fixedType w ^ ")" ^ x ^ ")"
 wordAs RepV w = w
+wordAs RepInt w = "INT_OF(" ^ w ^ ")"
 
 -- (a field of a tuple an arm wants, of a place kept as `kind`: as its
 -- variable is kept, `r` -- the number, or a `V` of it, boxed)
@@ -2502,7 +2546,8 @@ type EmitKept =
   , prims : List String
   }
 
--- (what is known of a global)
+-- (what is known of a global: its arity, whether it bounces, what it is
+-- lent, its worker, the parameters every call gives a word)
 globalH : CE -> String -> List IRText.HItem -> List IRText.HItem
 globalH ce g rest =
   Cons
@@ -2518,7 +2563,14 @@ globalH ce g rest =
                    (List.map show (Borrow.borOf ce.facts.lent g))))
              (Cons
                 (HS (maybe "" Repr.sigName (Repr.sigIn ce.facts.workers g)))
-                (Cons (HN (tupleOfCall ce.facts.tuples g)) rest)))))
+                (Cons
+                   (HN (tupleOfCall ce.facts.tuples g))
+                   (Cons
+                      (HS
+                         (joinWith
+                            ","
+                            (List.map show (Facts.wordsOf ce.facts g))))
+                      rest))))))
 
 -- (what is known of a tag: its fields that may be flat, #64, and those
 -- that are)
