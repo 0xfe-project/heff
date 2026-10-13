@@ -412,8 +412,39 @@ waits for its other end, the whole program with it.  On Windows, links
 are not seen, a mode is only whether the owner may write, and every
 operation waits where it is.
 
-`std.process` runs a command to its end (`run`, what it wrote kept),
-in the program's place (`exec`), or beside it: `launch cmd args` starts
+`std.process` runs a command to its end (`run`), in the program's place
+(`exec`), or beside it (`launch`).  `run` takes an `Invocation`, a
+record whose fields but `command` have defaults, so that a call gives
+only what it changes:
+
+```haskell
+r <- run { command = "git", args = ["rev-parse", "HEAD"], dir = repo }
+t <- run { command = "heff", args = ["test"], env = [MkPair "HEFF_TTY" "0"],
+           input = Just "...", timeout = 120000, keep = 65536 }
+```
+
+- `args` (none), its arguments;
+- `dir` (`""`, the program's), the directory it runs in;
+- `env` (none), environment variables set for it over the program's
+  own, which it has too (the environment is never cleared);
+- `input` (`Nothing`), its standard input: a string, written to it
+  through a pipe and then closed; `Nothing` is no input at all -- the
+  null device (`/dev/null`, `NUL`), not the program's standard input
+  nor a closed descriptor, which the command's next open would take;
+- `timeout` (0, as long as it takes), milliseconds, after which it is
+  killed (SIGKILL; on Windows, TerminateProcess) and not waited for
+  further, not even for what its own children still write;
+- `keep` (0, all of it), how many bytes of each of its output and its
+  error stream are kept: the first, the rest read and let go, so a
+  command that writes forever until its time limit is not held whole.
+
+Its `Ran` is what it wrote, `out` and `err`, and how it ended, `ended`:
+`Exited` with its status, `Signalled` with the signal's number (never
+on Windows), `TimedOut`, or `NotRun` -- not found, not a program, its
+directory not there, or a NUL in its name or an argument.  `succeeded
+r` is whether it exited with 0.
+
+`launch cmd args` starts
 one with the program's standard streams, in its process group (Ctrl-C
 ends both), `Maybe` a `Child` (a handle); `exited c` is `Just` its
 status once it has ended (128 and the signal, where a signal ended it),

@@ -6,9 +6,53 @@
 import co
 import std.handle
 
--- | a command run to its end: its status, and what it wrote to its
+-- | How a command run ended: by itself, with its exit status (0: it
+-- | went well); by a signal, its number (never on Windows); killed at
+-- | its time limit; or not at all, as it could not be run (not found,
+-- | not a program, a NUL in its name or an argument, its directory not
+-- | there).
+data Ended = Exited Int | Signalled Int | TimedOut | NotRun
+
+-- | A command to run: its name (found on the PATH), its arguments, and
+-- | how it is run.  Each field but the name has a default, so a record
+-- | gives only what it changes:
+-- | `{ command = "make", args = ["all"], dir = d, timeout = 60000 }`.
+-- |
+-- | - `dir`: the directory it runs in (`""`: the program's);
+-- | - `env`: environment variables set for it, each a name and a value,
+-- |   over the program's own, which it has too;
+-- | - `input`: its standard input, written to it and then closed
+-- |   (`Nothing`: it has none -- the null device, not the program's);
+-- | - `timeout`: how many milliseconds it is given, after which it is
+-- |   killed (SIGKILL) and has `TimedOut` (0: as long as it takes);
+-- | - `keep`: how many bytes of each of its output and its error stream
+-- |   are kept, the first, the rest read and let go (0: all of them).
+type Invocation =
+  { command : String
+  , args : List String = Nil
+  , dir : String = ""
+  , env : List (Pair String String) = Nil
+  , input : Maybe String = Nothing
+  , timeout : Int = 0
+  , keep : Int = 0
+  }
+
+-- | a command run to its end: how it ended, and what it wrote to its
 -- | output and its error stream
-type Ran = { status : Int, out : String, err : String }
+type Ran = { ended : Ended, out : String, err : String }
+
+-- (it ended by itself, with the status 0)
+endedWell : Ended -> Bool
+endedWell (Exited n) = n == 0
+endedWell _ = False
+
+-- | It ended by itself, with the status 0.
+-- | >>> succeeded { ended = Exited 0, out = "", err = "" }
+-- | True
+-- | >>> succeeded { ended = Signalled 9, out = "", err = "" }
+-- | False
+succeeded : Ran -> Bool
+succeeded r = endedWell r.ended
 
 -- | (`Handle Started`, std.handle: a command started beside the program,
 -- | `launch`'s; no value has it.)
@@ -25,9 +69,9 @@ data ProcessF (m : Type -> Type) x
   | Platform (String -> x)
   | Exit Int x
   | Exec String (List String) x
-  | Run String (List String) (Ran -> x)
+  | Run Invocation (Ran -> x)
   | Launch String (List String) (Maybe Child -> x)
-  | Exited Child (Maybe Int -> x)
+  | Poll Child (Maybe Int -> x)
   | Terminate Child (Int -> x)
 
 -- | The process as an effect.
@@ -42,9 +86,9 @@ process =
       Platform k -> Platform (\s -> g (k s))
       Exit code x -> Exit code (g x)
       Exec cmd as x -> Exec cmd as (g x)
-      Run cmd as k -> Run cmd as (\r -> g (k r))
+      Run c k -> Run c (\r -> g (k r))
       Launch cmd as k -> Launch cmd as (\c -> g (k c))
-      Exited c k -> Exited c (\s -> g (k s))
+      Poll c k -> Poll c (\s -> g (k s))
       Terminate c k -> Terminate c (\s -> g (k s))
   , hmap = \m n nt p -> case p of
       Args k -> Args k
@@ -54,9 +98,9 @@ process =
       Platform k -> Platform k
       Exit code x -> Exit code x
       Exec cmd as x -> Exec cmd as x
-      Run cmd as k -> Run cmd as k
+      Run c k -> Run c k
       Launch cmd as k -> Launch cmd as k
-      Exited c k -> Exited c k
+      Poll c k -> Poll c k
       Terminate c k -> Terminate c k
   }
 
@@ -99,14 +143,10 @@ exec : {e : HFunctor}
      -> Co e Unit
 exec cmd as = op (ev (Exec cmd as MkUnit)) val
 
--- | Run the command with the arguments, to its end, and go on: what it
--- | wrote, and its status (-1 if it could not be run).
-run : {e : HFunctor}
-    -> {{ev : process <: e}}
-    -> String
-    -> List String
-    -> Co e Ran
-run cmd as = op (ev (Run cmd as (\r -> r))) val
+-- | Run the command, to its end, and go on: how it ended, and what it
+-- | wrote -- `run { command = "ls", args = ["-l"], dir = "/tmp" }`.
+run : {e : HFunctor} -> {{ev : process <: e}} -> Invocation -> Co e Ran
+run c = op (ev (Run c (\r -> r))) val
 
 -- | Start the command with the arguments, beside the program, and go on:
 -- | its standard streams the program's, in the program's process group
@@ -123,7 +163,7 @@ launch cmd as = op (ev (Launch cmd as (\c -> c))) val
 -- | Whether the command has ended, not waiting: `Just` its status (128
 -- | and the signal, where a signal ended it), else `Nothing`.
 exited : {e : HFunctor} -> {{ev : process <: e}} -> Child -> Co e (Maybe Int)
-exited c = op (ev (Exited c (\s -> s))) val
+exited c = op (ev (Poll c (\s -> s))) val
 
 -- | The command ended, if it has not: asked to (SIGTERM), then made to
 -- | (SIGKILL) where it has not within two seconds; its status, and its

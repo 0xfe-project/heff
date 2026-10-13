@@ -20,11 +20,15 @@
 // bytes, ended by a 0 if shorter); and the index of each one's parent,
 // a byte each (255: none) -- and the newest tree is given to the
 // program's function, whose lines are drawn.  (On Windows, where zig's
-// is a handle, the command is run as std.process's `run` runs it.)
+// is a handle, the command is run without it, by runtime.c's
+// heff_capture, its input the program's.)  Elsewhere it has no input,
+// as std.process's `run` gives none.
 
 #ifndef _WIN32
 #include <sys/ioctl.h>
 #endif
+#include <errno.h>
+#include <fcntl.h>
 #include <time.h>
 
 // (`heff_lines(1)`: what is drawn cleared, and nothing drawn, until
@@ -277,7 +281,16 @@ static void heff_st_show(V l) {
   heff_st_unlock();
 }
 
-static uint32_t heff_st_ran_shape[3] = { LBL_status, LBL_out, LBL_err };
+static uint32_t heff_st_ran_shape[3] = { LBL_ended, LBL_out, LBL_err };
+
+// (how a command ended, as std.process's `Ended`: `how` 0 by itself,
+// its status `code`; 1 by the signal `code`; 3 not run)
+static V heff_st_ended(int how, int64_t code) {
+  V x = MK_INT(code);
+  if (how == 0) return heff_tag_n(TAG_Exited, 1, &x);
+  if (how == 1) return heff_tag_n(TAG_Signalled, 1, &x);
+  return NTAG(TAG_NotRun);
+}
 
 #ifndef _WIN32
 // (a packet of zig's, the tasks of its tree, as a list of `MkKid`s)
@@ -317,61 +330,70 @@ static void heff_st_packets(Buf *pb, V f) {
 }
 
 extern char **environ;
-
-// (the command `as` run as runtime.c's heff_capture runs it, with
-// `ZIG_PROGRESS`, its progress drawn by `f` as it comes)
-static int64_t heff_st_capture(char **as, Buf *bo, Buf *be, V f) {
-  int64_t status = -1;
-  int po[2], pe[2], pp[2];
-  if (pipe(po) != 0) return -1;
-  if (pipe(pe) != 0) { close(po[0]); close(po[1]); return -1; }
-  if (pipe(pp) != 0) { close(po[0]); close(po[1]); close(pe[0]); close(pe[1]); return -1; }
+// (the command `as` run as std.process's `run` runs it, no input given
+// it, with `ZIG_PROGRESS` where `f` is given, its progress drawn by `f`
+// as it comes: how it ended, as heff_ended says, its status or signal
+// `*code`)
+static int heff_st_capture(char **as, Buf *bo, Buf *be, V f, int64_t *code) {
+  int po[2], pe[2], pp[2] = { -1, -1 };
+  if (pipe(po) != 0) return 3;
+  if (pipe(pe) != 0) { close(po[0]); close(po[1]); return 3; }
+  if (f && pipe(pp) != 0) { close(po[0]); close(po[1]); close(pe[0]); close(pe[1]); return 3; }
   // (the environment, its ZIG_PROGRESS the pipe's end)
   int ne = 0;
   while (environ[ne]) ne++;
   char **env = heff_alloc((size_t)(ne + 2) * sizeof(char *));
   int k = 0;
   for (int i = 0; i < ne; i++)
-    if (strncmp(environ[i], "ZIG_PROGRESS=", 13) != 0) env[k++] = environ[i];
+    if (!f || strncmp(environ[i], "ZIG_PROGRESS=", 13) != 0) env[k++] = environ[i];
   char zp[32];
   snprintf(zp, sizeof zp, "ZIG_PROGRESS=%d", pp[1]);
-  env[k++] = zp;
+  if (f) env[k++] = zp;
   env[k] = NULL;
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
   posix_spawn_file_actions_adddup2(&fa, po[1], 1);
   posix_spawn_file_actions_adddup2(&fa, pe[1], 2);
   posix_spawn_file_actions_addclose(&fa, po[0]);
   posix_spawn_file_actions_addclose(&fa, pe[0]);
-  posix_spawn_file_actions_addclose(&fa, pp[0]);
+  if (f) posix_spawn_file_actions_addclose(&fa, pp[0]);
   pid_t pid;
   int ok = posix_spawnp(&pid, as[0], &fa, NULL, as, env) == 0;
   posix_spawn_file_actions_destroy(&fa);
   free(env);
   close(po[1]);
   close(pe[1]);
-  close(pp[1]);
+  if (f) close(pp[1]);
   // (its streams and its progress read together, until all are closed)
   struct pollfd fds[3] = { { po[0], POLLIN, 0 }, { pe[0], POLLIN, 0 }, { pp[0], POLLIN, 0 } };
   Buf pb = {0};
-  int open = 3;
+  int open = f ? 3 : 2;
   char chunk[65536];
   while (open > 0) {
-    if (poll(fds, 3, -1) < 0) break;
+    if (poll(fds, 3, -1) < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
     for (int i = 0; i < 3; i++) {
-      if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP))) continue;
+      if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
       ssize_t got = read(fds[i].fd, chunk, sizeof chunk);
+      if (got < 0 && errno == EINTR) continue;
       if (got <= 0) { close(fds[i].fd); fds[i].fd = -1; open--; }
       else if (i == 2) { buf_put(&pb, chunk, (size_t)got); heff_st_packets(&pb, f); }
       else buf_put(i == 0 ? bo : be, chunk, (size_t)got);
     }
   }
+  for (int i = 0; i < 3; i++) if (fds[i].fd >= 0) close(fds[i].fd);
   free(pb.s);
-  if (ok) {
-    int st;
-    if (waitpid(pid, &st, 0) >= 0 && WIFEXITED(st)) status = WEXITSTATUS(st);
-  }
-  return status;
+  if (!ok) return 3;
+  int st;
+  pid_t w;
+  while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
+  if (w != pid) return 3;
+  if (WIFEXITED(st)) { *code = WEXITSTATUS(st); return 0; }
+  if (WIFSIGNALED(st)) { *code = WTERMSIG(st); return 1; }
+  return 3;
 }
 #endif
 
@@ -390,8 +412,8 @@ static V heff_provider_terminal(V p, V k) {
     return heff_tail(k, 1, &x);
   }
   case TAG_ShowRun: {
-    // (a command with a NUL in its name or an argument is not run: -1
-    // its status, as where it cannot be)
+    // (a command with a NUL in its name or an argument is not run, as
+    // where it cannot be)
     char *c = heff_cstr_text(heff_field(p, 0));
     int ok = c != NULL;
     int64_t n = 0;
@@ -408,16 +430,19 @@ static V heff_provider_terminal(V p, V k) {
     V f = heff_dup(heff_field(p, 2)), r = heff_dup(heff_field(p, 3));
     heff_drop(p);
     Buf bo = {0}, be = {0};
+    int64_t code = 0;
 #ifdef _WIN32
-    int64_t status = ok ? heff_capture(as, &bo, &be) : -1;
+    // (no signals there: -1 its exit code where it could not be run)
+    code = ok ? heff_capture(as, &bo, &be) : -1;
+    int how = code == -1 ? 3 : 0;
 #else
-    int64_t status = !ok ? -1 : heff_st_terminal() && !heff_st_over ? heff_st_capture(as, &bo, &be, f) : heff_capture(as, &bo, &be);
+    int how = !ok ? 3 : heff_st_capture(as, &bo, &be, heff_st_terminal() && !heff_st_over ? f : 0, &code);
 #endif
     heff_drop(f);
     for (int64_t j = 0; j < i; j++) free(as[j]);
     free(as);
     V fs[3] = {
-      MK_INT(status),
+      heff_st_ended(how, code),
       heff_str_bytes(bo.s ? bo.s : "", (int64_t)bo.n),
       heff_str_bytes(be.s ? be.s : "", (int64_t)be.n),
     };

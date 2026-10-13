@@ -207,6 +207,35 @@ checks.push((async () => {
   return r.status !== 3 || r.stderr !== "to stderr\n" ? [`FAIL heff run: status ${r.status}, stderr ${JSON.stringify(r.stderr)}`] : [];
 })());
 
+// (commands run to their end, std.process's `run`: each option of an
+// `Invocation` and each way a command ends -- the commands sh's, so not
+// on Windows; given an input of its own, which the commands run with
+// none must not see)
+if (process.platform !== "win32") checks.push(ran("commands", "test/node/commands.hf", "main", [], {
+  out: [
+    'plain: exited 0, out "out\\n", err "err\\n"',
+    'status: exited 3, out "", err ""',
+    'directory: exited 0, out "/\\n", err ""',
+    'directory not there: not run, out "", err ""',
+    'environment: exited 0, out "new path\\n", err ""',
+    'environment as it is: exited 0, out "old\\n", err ""',
+    'input: exited 0, out "fed\\n", err ""',
+    'no input: exited 0, out "", err ""',
+    'input, much: exited 0, out "200000\\n", err ""',
+    'input, not read: exited 0, out "", err ""',
+    'a signal: signal 9, out "", err ""',
+    'a signal, another: signal 15, out "", err ""',
+    'a loop: timed out, out "", err ""',
+    'a sleep: timed out, out "before\\n", err ""',
+    'within its time: exited 0, out "quick\\n", err ""',
+    'kept: exited 0, out "0123", err "abcd"',
+    'written forever: timed out, out "y\\ny\\ny\\n", err ""',
+    'not there: not run, out "", err ""',
+    "",
+  ].join("\n"),
+  err: "", status: 0,
+}, { input: "the test's own\n", env: { ...process.env, GREETING: "old" } }));
+
 // time: done later, the rest going on then
 checks.push(ran("sleep", "test/node/timed.hf", "timed", [], { out: "slept\n", status: 0 }));
 
