@@ -1,0 +1,568 @@
+-- What a program shows on a terminal, and what is typed at it, as
+-- values: the keys a terminal's input is read as (`decode`), the rows a
+-- screen is drawn as (`Frame`) and the text that draws them (`paint`),
+-- and a few widgets -- a list to pick from (`Menu`), a field to type in
+-- (`Field`), a choice among values (`Choice`) and a status line --
+-- each a value and what a key makes of it.  An app (`App`) is a state,
+-- what a key makes of it, and how it is shown: std.terminal runs one on
+-- the terminal, and `replay` on keys given, for its tests.  Pure, the
+-- same on every backend: import it by a name, `import
+-- std.terminal.widget as Widget`.
+
+import rune as Rune
+
+-- Keys
+--------------------------------------------------------------------------------
+
+-- | A key typed: a rune, or a key of its own, or a control key (`Control
+-- | 'a'`, Ctrl-A); an escape sequence not known is `Sequence`, as it came.
+data Key
+  = Char Rune
+  | Enter
+  | Escape
+  | Tab
+  | BackTab
+  | Backspace
+  | Delete
+  | ArrowUp
+  | ArrowDown
+  | ArrowLeft
+  | ArrowRight
+  | Home
+  | End
+  | PageUp
+  | PageDown
+  | Control Rune
+  | Sequence String
+
+-- (a key, and where the next one starts)
+type Decoded = { key : Key, next : Int }
+
+-- (the byte at `j` and on that ends a CSI sequence -- one of `@` to `~`
+-- -- or -1 where none does)
+csiEnd : String -> Int -> Int
+csiEnd s j =
+  if j >= strLength s then 0 - 1
+  else if byteAt s j >= 64 && byteAt s j <= 126 then j
+  else csiEnd s (j + 1)
+
+-- (`ESC [ n ~`: the key of its number)
+tildeKey : String -> Int -> Key
+tildeKey seq 1 = Home
+tildeKey seq 7 = Home
+tildeKey seq 4 = End
+tildeKey seq 8 = End
+tildeKey seq 3 = Delete
+tildeKey seq 5 = PageUp
+tildeKey seq 6 = PageDown
+tildeKey seq n = Sequence seq
+
+-- (the first of a sequence's parameters, 0 where it has none)
+firstNumber : List String -> Int
+firstNumber Nil = 0
+firstNumber (x :: _) = fromMaybe 0 (parseInt x)
+
+-- (a CSI or SS3 sequence's key, by its final byte; `params` what is
+-- between, the first number of which says which `~` key it is)
+finalKey : String -> String -> Int -> Key
+finalKey seq params 65 = ArrowUp
+finalKey seq params 66 = ArrowDown
+finalKey seq params 67 = ArrowRight
+finalKey seq params 68 = ArrowLeft
+finalKey seq params 72 = Home
+finalKey seq params 70 = End
+finalKey seq params 90 = BackTab
+finalKey seq params 126 = tildeKey seq (firstNumber (split ";" params))
+finalKey seq params b = Sequence seq
+
+-- (`ESC [ ...` at `i`: the sequence to its final byte)
+csiAt : String -> Int -> Decoded
+csiAt s i =
+  if csiEnd s (i + 2) < 0
+    then { key = Sequence (strSlice s i (strLength s)), next = strLength s }
+  else { key =
+           finalKey
+             (strSlice s i (csiEnd s (i + 2) + 1))
+             (strSlice s (i + 2) (csiEnd s (i + 2)))
+             (byteAt s (csiEnd s (i + 2)))
+       , next = csiEnd s (i + 2) + 1
+       }
+
+-- (`ESC O x` at `i`, as terminals send the arrows in their application
+-- mode)
+ss3At : String -> Int -> Decoded
+ss3At s i =
+  if i + 2 >= strLength s then { key = Escape, next = i + 1 }
+  else { key = finalKey (strSlice s i (i + 3)) "" (byteAt s (i + 2))
+       , next = i + 3
+       }
+
+-- (`ESC` at `i`: a sequence, or the key Escape alone -- what follows it
+-- then the next key, as Alt-x is Escape and x)
+escapeAt : String -> Int -> Decoded
+escapeAt s i =
+  if byteAt s (i + 1) == 91 then csiAt s i
+  else if byteAt s (i + 1) == 79 then ss3At s i
+  else { key = Escape, next = i + 1 }
+
+-- (a control byte's key)
+controlKey : Int -> Key
+controlKey 13 = Enter
+controlKey 10 = Enter
+controlKey 9 = Tab
+controlKey 8 = Backspace
+controlKey 127 = Backspace
+controlKey b =
+  if b >= 1 && b <= 26 then Control (Rune.fromInt (b + 96))
+  else Control (Rune.fromInt (b + 64))
+
+-- (the key at `i`)
+keyAt : String -> Int -> Decoded
+keyAt s i =
+  if byteAt s i == 27 then escapeAt s i
+  else if byteAt s i < 32 || byteAt s i == 127
+    then { key = controlKey (byteAt s i), next = i + 1 }
+  else { key = Char (runeAt s i).rune, next = i + (runeAt s i).width }
+
+-- (the keys from `i` on)
+decodeFrom : String -> Int -> List Key
+decodeFrom s i =
+  if i >= strLength s then Nil
+  else (keyAt s i).key :: decodeFrom s (keyAt s i).next
+
+-- | The keys a terminal's input is: its runes, UTF-8, and its control
+-- | bytes and escape sequences (xterm's, VT100's) as the keys they are.
+-- | >>> decode "j\r\u{1b}[A\u{1b}[3~\u{1b}OB\t\u{1b}[Z\u{7f}\u{1}é"
+-- | [Char 'j', Enter, ArrowUp, Delete, ArrowDown, Tab, BackTab, Backspace, Control 'a', Char 'é']
+-- | >>> decode "\u{1b}\u{1b}[1;5C\u{1b}[200~"
+-- | [Escape, ArrowRight, Sequence "\u{1b}[200~"]
+decode : String -> List Key
+decode s = decodeFrom s 0
+
+-- Columns
+--------------------------------------------------------------------------------
+
+-- | How many columns a rune takes on a terminal: two, an East Asian wide
+-- | one's or an emoji's, else one.
+-- | >>> List.map columns ['a', 'é', '中', '😀']
+-- | [1, 1, 2, 2]
+columns : Rune -> Int
+columns c =
+  if Rune.within '\u{1100}' '\u{115F}' c
+  || Rune.within '\u{2E80}' '\u{A4CF}' c
+  || Rune.within '\u{AC00}' '\u{D7A3}' c
+  || Rune.within '\u{F900}' '\u{FAFF}' c
+  || Rune.within '\u{FE30}' '\u{FE4F}' c
+  || Rune.within '\u{FF00}' '\u{FF60}' c
+  || Rune.within '\u{FFE0}' '\u{FFE6}' c
+  || Rune.within '\u{1F300}' '\u{1F64F}' c
+  || Rune.within '\u{1F900}' '\u{1F9FF}' c
+  || Rune.within '\u{20000}' '\u{3FFFD}' c
+    then 2
+  else 1
+
+-- | How many columns a text takes.
+width : String -> Int
+width s = List.sum (List.map columns (runes s))
+
+cutRunes : Int -> List Rune -> List Rune
+cutRunes w Nil = Nil
+cutRunes w (c :: cs) =
+  if columns c > w then Nil else c :: cutRunes (w - columns c) cs
+
+-- | As much of a text as fits in `w` columns.
+-- | >>> cut 3 "中文字"
+-- | "中"
+cut : Int -> String -> String
+cut w s = ofRunes (cutRunes w (runes s))
+
+-- | A text cut to `w` columns, and spaces after it up to them.
+-- | >>> pad 5 "ab"
+-- | "ab   "
+pad : Int -> String -> String
+pad w s = cut w s ^ joinWith "" (List.replicate (w - width (cut w s)) " ")
+
+-- (the words, put on lines of `w` columns at most, a word longer than
+-- that on a line of its own; `line` the one being filled)
+wrapGo : Int -> String -> List String -> List String
+wrapGo w line Nil = if strEq line "" then Nil else [line]
+wrapGo w line (x :: xs) =
+  if strEq line "" then wrapGo w x xs
+  else if width line + 1 + width x <= w then wrapGo w (line ^ " " ^ x) xs
+  else line :: wrapGo w x xs
+
+-- | A text's words, put on lines of `w` columns at most.
+-- | >>> wrap 10 "the words of a text, wrapped"
+-- | ["the words", "of a text,", "wrapped"]
+wrap : Int -> String -> List String
+wrap w s = wrapGo w "" (words s)
+
+-- Rows
+--------------------------------------------------------------------------------
+
+-- | How a span of text is drawn.
+data Style = Plain | Bold | Dim | Inverse | Underline
+
+-- | A span of a row: its text, and how it is drawn.
+type Span = { text : String, style : Style }
+
+-- | A row of the screen: its spans, left to right.
+type Row = List Span
+
+-- | A screen: its rows, from the top, and where the cursor is shown, a
+-- | column and a row from 0 (none: hidden).
+type Frame = { rows : List Row, cursor : Maybe (Pair Int Int) }
+
+-- | The size of a terminal, in columns and rows.
+type Size = { columns : Int, rows : Int }
+
+-- | A span drawn plainly, and the others.
+plain : String -> Span
+plain s = { text = s, style = Plain }
+
+bold : String -> Span
+bold s = { text = s, style = Bold }
+
+dim : String -> Span
+dim s = { text = s, style = Dim }
+
+inverse : String -> Span
+inverse s = { text = s, style = Inverse }
+
+-- | A row's text, its styles left out.
+rowText : Row -> String
+rowText r = joinWith "" (List.map (\(sp : Span) -> sp.text) r)
+
+-- | A screen's rows' texts: what it shows, its styles left out (for a
+-- | test).
+texts : Frame -> List String
+texts f = List.map rowText f.rows
+
+-- | The rows, as many as `h`: those given, and empty ones after them.
+fill : Int -> List Row -> List Row
+fill h rs = List.take h (List.append rs (List.replicate h Nil))
+
+-- | A row of the width, inverse: a status line.
+-- | >>> rowText (status 6 "ok")
+-- | "ok    "
+status : Int -> String -> Row
+status w s = [inverse (pad w s)]
+
+-- (how a style is set: SGR, every other attribute reset)
+styleCode : Style -> String
+styleCode Plain = "\u{1b}[0m"
+styleCode Bold = "\u{1b}[0;1m"
+styleCode Dim = "\u{1b}[0;2m"
+styleCode Inverse = "\u{1b}[0;7m"
+styleCode Underline = "\u{1b}[0;4m"
+
+-- (the spans, in `w` columns at most)
+paintSpans : Int -> Row -> String
+paintSpans w Nil = ""
+paintSpans w (sp :: rest) =
+  styleCode sp.style
+  ^ cut w sp.text
+  ^ paintSpans (w - width (cut w sp.text)) rest
+
+-- (a row, the rest of its line cleared)
+paintRow : Int -> Row -> String
+paintRow w r = paintSpans w r ^ "\u{1b}[0m\u{1b}[K"
+
+-- (the cursor put where it is shown, and shown; else left hidden)
+cursorCode : Maybe (Pair Int Int) -> String
+cursorCode Nothing = ""
+cursorCode (Just (MkPair c r)) =
+  "\u{1b}[" ^ show (r + 1) ^ ";" ^ show (c + 1) ^ "H\u{1b}[?25h"
+
+-- | What draws the screen on a terminal of the size, in place of what was
+-- | there: from its top left, each row cut to its width and the rest of
+-- | its line cleared, as many rows as it has, what is below cleared, and
+-- | the cursor put where it is shown (else hidden) -- as one update, the
+-- | terminal told to show it whole (`?2026`).
+-- | >>> paint { columns = 4, rows = 2 } { rows = [[bold "hello"], [plain "a"], [plain "b"]], cursor = Just (MkPair 1 1) }
+-- | "\u{1b}[?2026h\u{1b}[?25l\u{1b}[H\u{1b}[0;1mhell\u{1b}[0m\u{1b}[K\r\n\u{1b}[0ma\u{1b}[0m\u{1b}[K\u{1b}[0m\u{1b}[J\u{1b}[2;2H\u{1b}[?25h\u{1b}[?2026l"
+paint : Size -> Frame -> String
+paint size f =
+  "\u{1b}[?2026h\u{1b}[?25l\u{1b}[H"
+  ^ joinWith
+    "\r\n"
+    (List.map (paintRow size.columns) (List.take size.rows f.rows))
+  ^ "\u{1b}[0m\u{1b}[J"
+  ^ cursorCode f.cursor
+  ^ "\u{1b}[?2026l"
+
+-- A list to pick from
+--------------------------------------------------------------------------------
+
+-- | A list's selection: which of its items is picked, from 0.
+type Menu = { at : Int }
+
+-- | Nothing moved yet: the first.
+menu : Menu
+menu = { at = 0 }
+
+-- (`i` among the `n` items, the first where there are none)
+among : Int -> Int -> Int
+among n i = if i >= n then max 0 (n - 1) else if i < 0 then 0 else i
+
+-- | The selection moved by `d` among `n` items, no further than the ends.
+moveBy : Int -> Int -> Menu -> Menu
+moveBy n d m = { at = among n (m.at + d) }
+
+-- (a control key's move: Ctrl-N and Ctrl-P, as Emacs has them)
+controlMove : Int -> Rune -> Menu -> Menu
+controlMove n c m =
+  if c == 'n' then moveBy n 1 m else if c == 'p' then moveBy n (0 - 1) m else m
+
+-- | The selection, after a key, among `n` items: up and down, a page (10)
+-- | up and down, to the first and the last; another key moves nothing.
+-- | >>> (menuKey 5 End (menuKey 5 ArrowDown menu)).at
+-- | 4
+-- | >>> (menuKey 5 PageDown { at = 1 }).at
+-- | 4
+menuKey : Int -> Key -> Menu -> Menu
+menuKey n ArrowUp m = moveBy n (0 - 1) m
+menuKey n ArrowDown m = moveBy n 1 m
+menuKey n PageUp m = moveBy n (0 - 10) m
+menuKey n PageDown m = moveBy n 10 m
+menuKey n Home m = { at = 0 }
+menuKey n End m = { at = among n (n - 1) }
+menuKey n (Control c) m = controlMove n c m
+menuKey n k m = m
+
+-- (the item, picked or not: marked and inverse, or not)
+menuRow : Bool -> Row -> Row
+menuRow True r = inverse "> " :: List.map (\(sp : Span) -> inverse sp.text) r
+menuRow False r = plain "  " :: r
+
+-- (the items from the `i`th, each marked if it is picked)
+menuFrom : Int -> Int -> List Row -> List Row
+menuFrom at i Nil = Nil
+menuFrom at i (r :: rs) = menuRow (i == at) r :: menuFrom at (i + 1) rs
+
+-- | The items shown in `h` rows, the picked one marked and inverse,
+-- | scrolled so that it is among them.
+-- | >>> List.map rowText (menuRows 2 { at = 2 } [[plain "a"], [plain "b"], [plain "c"]])
+-- | ["  b", "> c"]
+menuRows : Int -> Menu -> List Row -> List Row
+menuRows h m items =
+  List.take
+    h
+    (List.drop
+       (if m.at < h then 0 else m.at - h + 1)
+       (menuFrom m.at 0 items))
+
+-- A field to type in
+--------------------------------------------------------------------------------
+
+-- | A field's text, as runes, and where its cursor is among them.
+type Field = { text : List Rune, at : Int }
+
+-- | A field of the text, its cursor at its end.
+field : String -> Field
+field s = { text = runes s, at = List.length (runes s) }
+
+-- | A field's text.
+fieldText : Field -> String
+fieldText f = ofRunes f.text
+
+-- | The column the cursor is at, from the field's start.
+fieldCursor : Field -> Int
+fieldCursor f = List.sum (List.map columns (List.take f.at f.text))
+
+-- (the text with `c` put at the cursor)
+inserted : Rune -> Field -> Field
+inserted c f =
+  { text = List.append (List.take f.at f.text) (c :: List.drop f.at f.text)
+  , at = f.at + 1
+  }
+
+-- (the rune before the cursor taken away)
+backspaced : Field -> Field
+backspaced f =
+  if f.at == 0 then f
+  else { text =
+           List.append (List.take (f.at - 1) f.text) (List.drop f.at f.text)
+       , at = f.at - 1
+       }
+
+-- (the rune at the cursor taken away)
+deleted : Field -> Field
+deleted f =
+  { text = List.append (List.take f.at f.text) (List.drop (f.at + 1) f.text)
+  , at = f.at
+  }
+
+-- (the cursor put at `i`, within the text)
+cursorAt : Int -> Field -> Field
+cursorAt i f = { text = f.text, at = max 0 (min (List.length f.text) i) }
+
+-- (the rune before `i` is a space)
+spaceBefore : List Rune -> Int -> Bool
+spaceBefore rs i =
+  Rune.isSpace (fromMaybe ' ' (List.head (List.drop (i - 1) rs)))
+
+-- (where the word ending at `i` starts: the runes before it that are no
+-- spaces passed)
+wordFrom : List Rune -> Int -> Int
+wordFrom rs i =
+  if i > 0 && not (spaceBefore rs i) then wordFrom rs (i - 1) else i
+
+-- (where the word before `i` starts: the spaces before `i` passed, then
+-- the word)
+wordStart : List Rune -> Int -> Int
+wordStart rs i =
+  if i > 0 && spaceBefore rs i then wordStart rs (i - 1) else wordFrom rs i
+
+-- (a control key's edit, as a shell's line has them: Ctrl-A and Ctrl-E
+-- to the start and the end, Ctrl-B and Ctrl-F back and forth, Ctrl-H a
+-- backspace, Ctrl-D a delete, Ctrl-U all before the cursor gone, Ctrl-K
+-- all after it, Ctrl-W the word before it)
+controlEdit : Rune -> Field -> Field
+controlEdit c f =
+  if c == 'a' then cursorAt 0 f
+  else if c == 'e' then cursorAt (List.length f.text) f
+  else if c == 'b' then cursorAt (f.at - 1) f
+  else if c == 'f' then cursorAt (f.at + 1) f
+  else if c == 'h' then backspaced f
+  else if c == 'd' then deleted f
+  else if c == 'u' then { text = List.drop f.at f.text, at = 0 }
+  else if c == 'k' then { text = List.take f.at f.text, at = f.at }
+  else if c == 'w'
+    then { text =
+             List.append
+               (List.take (wordStart f.text f.at) f.text)
+               (List.drop f.at f.text)
+         , at = wordStart f.text f.at
+         }
+  else f
+
+-- | The field, after a key: a rune typed at the cursor, a backspace, a
+-- | delete, the cursor moved (left, right, to the start, to the end), or
+-- | a control key's edit; another key changes nothing.
+-- | >>> fieldText (List.foldl (\f k -> fieldKey k f) (field "") (decode "ac\u{1b}[Db\u{1b}[F!"))
+-- | "abc!"
+-- | >>> fieldText (List.foldl (\f k -> fieldKey k f) (field "one two") (decode "\u{17}x"))
+-- | "one x"
+fieldKey : Key -> Field -> Field
+fieldKey (Char c) f = inserted c f
+fieldKey Backspace f = backspaced f
+fieldKey Delete f = deleted f
+fieldKey ArrowLeft f = cursorAt (f.at - 1) f
+fieldKey ArrowRight f = cursorAt (f.at + 1) f
+fieldKey Home f = cursorAt 0 f
+fieldKey End f = cursorAt (List.length f.text) f
+fieldKey (Control c) f = controlEdit c f
+fieldKey k f = f
+
+-- A choice among values
+--------------------------------------------------------------------------------
+
+-- | A choice: the values, and which of them is chosen, from 0.
+type Choice = { options : List String, at : Int }
+
+-- | A choice of the values, the first chosen.
+choice : List String -> Choice
+choice os = { options = os, at = 0 }
+
+-- | The value chosen ("" where there is none).
+chosen : Choice -> String
+chosen c = fromMaybe "" (List.head (List.drop c.at c.options))
+
+-- (the next value, or the one before, round)
+turned : Int -> Choice -> Choice
+turned d c =
+  { options = c.options
+  , at =
+      if List.null c.options then 0
+      else (c.at + d + List.length c.options) % List.length c.options
+  }
+
+-- | The choice, after a key: the next value (right, space, `l`), the
+-- | one before (left, `h`), round; another key changes nothing.
+-- | >>> chosen (choiceKey ArrowLeft (choice ["esm", "page", "c"]))
+-- | "c"
+choiceKey : Key -> Choice -> Choice
+choiceKey ArrowRight c = turned 1 c
+choiceKey ArrowLeft c = turned (0 - 1) c
+choiceKey (Char x) c =
+  if x == ' ' || x == 'l' then turned 1 c
+  else if x == 'h' then turned (0 - 1) c
+  else c
+choiceKey k c = c
+
+-- (the values from the `i`th, the chosen one drawn as `mark` draws it;
+-- `shown` how each is written)
+choiceFrom : (String -> Span)
+           -> (String -> String)
+           -> Int
+           -> Int
+           -> List String
+           -> Row
+choiceFrom mark shown at i Nil = Nil
+choiceFrom mark shown at i (o :: os) =
+  (if i == at then mark (shown o) else plain (shown o))
+  :: (if List.null os then Nil else [plain "  "])
+  ++ choiceFrom mark shown at (i + 1) os
+
+-- | The values side by side, each as `shown` writes it, the chosen one
+-- | inverse where the choice is the one being set (`focused`), else
+-- | bold.
+-- | >>> rowText (choiceRow True (\o -> o) (choice ["a", "b"]))
+-- | "a  b"
+choiceRow : Bool -> (String -> String) -> Choice -> Row
+choiceRow focused shown c =
+  choiceFrom (if focused then inverse else bold) shown c.at 0 c.options
+
+-- Apps
+--------------------------------------------------------------------------------
+
+-- | What a key makes of an app: its state, to go on with, or what it
+-- | came to, `r`, where it is done.
+data Step s r = Continue s | Done r
+
+-- | An app: its state at the start, what a key makes of a state, and
+-- | how a state is shown on a terminal of a size.
+type App s r =
+  { start : s, step : Key -> s -> Step s r, view : Size -> s -> Frame }
+
+-- | Each key stepped, in turn, until one is done.
+stepAll : {s r : Type}
+        -> (Key -> s -> Step s r)
+        -> Step s r
+        -> List Key
+        -> Step s r
+stepAll f (Done r) ks = Done r
+stepAll f (Continue st) Nil = Continue st
+stepAll f (Continue st) (k :: ks) = stepAll f (f k st) ks
+
+-- (what the keys were stepped to: what it came to, `Just`, or nothing,
+-- the input ended)
+stepped : {s r : Type} -> Step s r -> Step s (Maybe r)
+stepped (Done r) = Done (Just r)
+stepped (Continue st) = Continue st
+
+-- | What is read from a terminal, stepped: each of its keys in turn,
+-- | until one is done; at the end of the input (`Nothing`), done, with
+-- | nothing.
+advance : {s r : Type}
+        -> (Key -> s -> Step s r)
+        -> s
+        -> Maybe String
+        -> Step s (Maybe r)
+advance f st Nothing = Done Nothing
+advance f st (Just input) = stepped (stepAll f (Continue st) (decode input))
+
+-- | The app, run on the keys: what it came to (`Right`), or the state
+-- | it is in after them (`Left`).
+replay : {s r : Type} -> App s r -> List Key -> Either s r
+replay app ks = case stepAll app.step (Continue app.start) ks of
+  Done r -> Right r
+  Continue st -> Left st
+
+-- | What the app shows after the keys (none, where it is done), its
+-- | rows' texts.
+shownAfter : {s r : Type} -> App s r -> Size -> List Key -> List String
+shownAfter app size ks = case replay app ks of
+  Left st -> texts (app.view size st)
+  Right r -> Nil

@@ -1,0 +1,111 @@
+-- The terminal the program runs on, as an effect (lib/co.hf): whether it
+-- has one, its size, the keys typed at it one at a time (not a line at a
+-- time, nor shown as they are typed: raw), and a screen drawn on it.
+-- The C backend's alone (terminal.provider.c); what is drawn and what
+-- the keys are is std.terminal.widget's, pure.  Import it by a name,
+-- `import std.terminal as Terminal`.
+--
+-- `interact` runs an app of std.terminal.widget's there: the terminal
+-- made raw, the app drawn on a screen of its own (the alternate one,
+-- which a terminal keeps apart from what was written before), each key
+-- stepped and the app drawn again, until it is done -- then the terminal
+-- as it was, what was written before shown again.  The terminal is put
+-- back as it was however the program ends: at its end, at a failure,
+-- and where it is ended by a signal (Ctrl-C's, SIGTERM, SIGHUP); Ctrl-Z
+-- puts it back while the program is stopped, and raw again, and the app
+-- drawn again, when it goes on, as a change of the terminal's size does.
+
+import co
+import std.terminal.widget as Widget
+
+data ConsoleF (m : Type -> Type) x
+  = Interactive (Bool -> x)
+  | Begin (Bool -> x)
+  | Finish x
+  | Measure (Widget.Size -> x)
+  | ReadInput (Maybe String -> x)
+  | Draw String x
+
+-- | The terminal, as an effect.
+console : HFunctor
+console =
+  { f = ConsoleF
+  , hfmap = \m g p -> case p of
+      Interactive k -> Interactive (\b -> g (k b))
+      Begin k -> Begin (\b -> g (k b))
+      Finish x -> Finish (g x)
+      Measure k -> Measure (\s -> g (k s))
+      ReadInput k -> ReadInput (\s -> g (k s))
+      Draw s x -> Draw s (g x)
+  , hmap = \m n nt p -> case p of
+      Interactive k -> Interactive k
+      Begin k -> Begin k
+      Finish x -> Finish x
+      Measure k -> Measure k
+      ReadInput k -> ReadInput k
+      Draw s x -> Draw s x
+  }
+
+-- | The program's standard input and output are a terminal, one an app
+-- | may be drawn on: `TERM` is not `dumb` (on Windows, never yet).
+interactive : {e : HFunctor} -> {{ev : console <: e}} -> Co e Bool
+interactive = op (ev (Interactive (\b -> b))) val
+
+-- | The terminal made raw -- each key read as it is typed, not shown --
+-- | and a screen of its own shown, empty: whether it could be.
+begin : {e : HFunctor} -> {{ev : console <: e}} -> Co e Bool
+begin = op (ev (Begin (\b -> b))) val
+
+-- | The terminal as it was before `begin`, what was written before shown
+-- | again.
+finish : {e : HFunctor} -> {{ev : console <: e}} -> Co e Unit
+finish = op (ev (Finish MkUnit)) val
+
+-- | The terminal's size, in columns and rows (80 by 24 where it does
+-- | not say).
+measure : {e : HFunctor} -> {{ev : console <: e}} -> Co e Widget.Size
+measure = op (ev (Measure (\s -> s))) val
+
+-- | What is typed next, as it comes, waited for: a key, or a few typed
+-- | at once (`Widget.decode` reads them); `Just ""` where the terminal
+-- | changed its size, or the program went on after it was stopped, so
+-- | that what is shown is drawn again; `Nothing` at the end of the input.
+readInput : {e : HFunctor} -> {{ev : console <: e}} -> Co e (Maybe String)
+readInput = op (ev (ReadInput (\s -> s))) val
+
+-- | Text written to the terminal as it is: what draws a screen
+-- | (`Widget.paint`).
+draw : {e : HFunctor} -> {{ev : console <: e}} -> String -> Co e Unit
+draw s = op (ev (Draw s MkUnit)) val
+
+-- (the app shown as it is, then stepped by what is typed next, until it
+-- is done)
+loop : {e : HFunctor}
+     -> {{ev : console <: e}}
+     -> {s r : Type}
+     -> Widget.App s r
+     -> s
+     -> Co e (Maybe r)
+loop app st = do
+  size <- measure
+  draw (Widget.paint size (app.view size st))
+  input <- readInput
+  case Widget.advance app.step st input of
+    Continue next -> loop app next
+    Done r -> pure r
+
+-- | The app run on the terminal, as above: what it came to; `Nothing`
+-- | where there is no terminal to run it on, or its input ended first.
+interact : {e : HFunctor}
+         -> {{ev : console <: e}}
+         -> {s r : Type}
+         -> Widget.App s r
+         -> Co e (Maybe r)
+interact app = do
+  ok <- begin
+  if ok
+      then do
+        r <- loop app app.start
+        finish
+        pure r
+    else pure Nothing
