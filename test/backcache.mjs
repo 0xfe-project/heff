@@ -162,6 +162,224 @@ const k2 = await compileJs("k2.js");
 want(!k2.error && (await runsJs("k2.js")) === "19", `count runs past a global x\n${k2.error ?? await runsJs("k2.js")}`);
 want(same(k2, await coldJs("k3.js")), "a global newly met: the JavaScript a cold run makes");
 
+// copies settled (heff.compile.simplify, Settling): callers simplified
+// again once the copies they call are made, copies not reached taken as
+// not made, a loop's copies tied into one -- a clock's `tick` in a page,
+// sleeping each round; four handlers stacked, in C
+writeFileSync(join(dir, "page.hf"), `import co
+import browser.dom
+
+tick : {{page : dom <: dom}} -> Node -> Int -> Co dom Unit
+tick label n = do
+  sleep 100
+  text label (show n ^ " ticks")
+  tick label (n + 1)
+
+program : {{page : dom <: dom}} -> Co dom Unit
+program = do
+  place <- select "#out"
+  found place (\\r -> do
+    label <- textIn r "p" "0 ticks"
+    tick label 1)
+
+main : Co dom Unit
+main = program (page := here dom)
+`);
+const s1 = await coldJs("s1.js");
+want(!s1.error, `a ticking page compiles\n${s1.error}`);
+want(same(s1, await compileJs("s2.js")), "a ticking page: a warm run makes the JavaScript a cold run made");
+writeFileSync(join(dir, "main.hf"), `import co
+import std.io
+import state
+import exn
+
+data AskF (m : Type -> Type) x = Ask (Int -> x)
+
+reader : HFunctor
+reader =
+  { f = AskF
+  , hfmap = \\m g p -> case p of
+      Ask k -> Ask (\\v -> g (k v))
+  , hmap = \\m n nt p -> case p of
+      Ask k -> Ask k
+  }
+
+data TellF (m : Type -> Type) x = Tell Int x
+
+writer : HFunctor
+writer =
+  { f = TellF
+  , hfmap = \\m g p -> case p of
+      Tell v x -> Tell v (g x)
+  , hmap = \\m n nt p -> case p of
+      Tell v x -> Tell v x
+  }
+
+-- the world the stack handles, nested to the right: globals built by
+-- \`plus\`, known to the simplifier as the records they come to
+W3 : HFunctor
+W3 = plus (state Int) (exn Int)
+
+W2 : HFunctor
+W2 = plus writer W3
+
+ask : {e : HFunctor} -> {{rd : reader <: e}} -> Co e Int
+ask = op (rd (Ask (\\v -> v))) val
+
+tell : {e : HFunctor} -> {{wr : writer <: e}} -> Int -> Co e Unit
+tell v = op (wr (Tell v MkUnit)) val
+
+-- | a round: each operation once, a throw caught some rounds
+step : {e : HFunctor}
+     -> {{rd : reader <: e}}
+     -> {{wr : writer <: e}}
+     -> {{st : state Int <: e}}
+     -> {{ex : exn Int <: e}}
+     -> Int
+     -> Co e Int
+step i = do
+  k <- ask
+  s <- get
+  let s2 = (s * k + i) % 1000003
+  put s2
+  if s2 % 10 == 0 then tell s2 else pure MkUnit
+  catch
+      (if s2 % 13 == 0 then throw s2 else pure 1)
+      (\\err -> pure (0 - err % 5))
+
+-- | \`n\` rounds, what they give summed
+loop : {e : HFunctor}
+     -> {{rd : reader <: e}}
+     -> {{wr : writer <: e}}
+     -> {{st : state Int <: e}}
+     -> {{ex : exn Int <: e}}
+     -> Int
+     -> Int
+     -> Int
+     -> Co e Int
+loop n i acc =
+  if i >= n then pure acc
+  else do
+    r <- step i
+    loop n (i + 1) (acc + r)
+
+-- | ... and a throw not caught, the round it is thrown in: \`n\` rounds
+-- | at most
+escaping : {e : HFunctor}
+         -> {{st : state Int <: e}}
+         -> {{ex : exn Int <: e}}
+         -> Int
+         -> Int
+         -> Co e Int
+escaping n i =
+  if i >= n then get
+  else do
+    s <- get
+    if s % 97 == 0 then throw i else put ((s * 7 + i) % 1000003)
+    escaping n (i + 1)
+
+data Out a = MkOut a Int
+
+outValue : {a : Type} -> Out a -> a
+outValue (MkOut x _) = x
+
+passingF : (e : HFunctor) -> RawFunctor
+passingF e =
+  { f = \\a -> Int -> Co e (Out a)
+  , fmap = \\g m s ->
+        bind (m s) (\\o -> case o of
+        MkOut x s2 -> val (MkOut (g x) s2))
+  }
+
+-- | a layer that keeps an Int as it handles \`h\`, into \`Co e\` of the
+-- | rest: an operation of the rest is an operation again
+passing : (h e : HFunctor)
+        -> ({a : Type}
+            -> h.f (\\x -> Int -> Co e (Out x)) a
+            -> Int
+            -> Co e (Out a))
+        -> Handler (plus h e)
+passing h e alg =
+  { M = \\a -> Int -> Co e (Out a)
+  , ret = \\x s -> val (MkOut x s)
+  , bind = \\m k s ->
+        bind (m s) (\\o -> case o of
+        MkOut x s2 -> k x s2)
+  , malg = \\p s -> case p of
+      InL t -> alg t s
+      InR q ->
+        op
+          (e.hmap
+             (passingF e)
+             (coFunctor e)
+             (\\c -> bind (c s) (\\o -> val (outValue o)))
+             q)
+          (\\x -> val (MkOut x s))
+  }
+
+data Res a = Failed Int | Ok a
+
+failing : Handler (exn Int)
+failing =
+  { M = \\a -> Res a
+  , ret = \\x -> Ok x
+  , bind = \\m k -> case m of
+      Failed e -> Failed e
+      Ok x -> k x
+  , malg = \\p -> case p of
+      Throw e -> Failed e
+      Catch c h -> case c of
+        Failed e -> h e
+        Ok x -> Ok x
+  }
+
+-- | \`n\` rounds of the four, stacked
+stacked : Int -> Res (Out (Out Int))
+stacked n =
+  let c1 =
+    handle
+      (through reader W2 (\\t -> case t of
+       Ask k -> val (k 7)))
+      (loop
+         (rd := \\p -> InL p)
+         (wr := \\p -> InR (InL p))
+         (st := \\p -> InR (InR (InL p)))
+         (ex := \\p -> InR (InR (InR p)))
+         n
+         0
+         0)
+  in let c2 =
+    handle
+      (passing writer W3 (\\t s -> case t of
+       Tell v x -> val (MkOut x (s + v))))
+      c1
+      0
+  in let c3 =
+    handle
+      (passing (state Int) (exn Int) (\\t s -> case t of
+       Get k -> val (MkOut (k s) s)
+       Put st x -> val (MkOut x st)))
+      c2
+      1
+  in handle failing c3
+
+
+shown : Res (Out (Out Int)) -> String
+shown (Failed e) = "failed " ^ show e
+shown (Ok (MkOut (MkOut acc told) st)) = show acc ^ " " ^ show told ^ " " ^ show st
+
+program : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit
+program = print (shown (stacked 300))
+
+main : Co stdio Unit
+main = program (io := \\p -> p)
+`);
+const s3 = await cold("s3");
+want(!s3.error, `four handlers stacked compile\n${s3.error}`);
+const s4 = await compile("s4");
+want(same(s3, s4), "four handlers stacked: a warm run makes the C a cold run made");
+want((await runs("s4")) === (await runs("s3")), "and it runs as it did");
+
 rmSync(dir, { recursive: true, force: true });
 console.log(`backcache: ${failed ? "NOT " : ""}the same C and JavaScript through the cache, kept and made again where what it inlines changed`);
 process.exit(failed ? 1 : 0);
