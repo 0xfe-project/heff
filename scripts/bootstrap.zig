@@ -10,7 +10,8 @@
 //! of one not known, is not built with.  Where there is no heff of the
 //! seed, or it cannot make the first stage, the seed: boot/heff.tar.xz,
 //! heff compiled by itself to C, unpacked to .heff/out/heff-seed.d/ and
-//! built by zig for this machine.
+//! built by zig for this machine.  zig builds each part of C apart, and
+//! the objects are kept by what they are made of, in .heff/out/heff.o/.
 //!
 //!   bootstrap ZIG build            the compiler, from the heff there is
 //!   bootstrap ZIG seed             the compiler, from the seed, always
@@ -31,6 +32,8 @@ const out = ".heff/out";
 const seed = "boot/heff.tar.xz";
 const heff = out ++ "/heff" ++ exe;
 const parts = out ++ "/heff.d";
+const kept = out ++ "/heff.o";
+const nativeKept = out ++ "/native.o";
 const seedOf = out ++ "/heff.seed";
 
 // (for any machine of this kind, not only this one: zig's default is this
@@ -46,6 +49,11 @@ const Bootstrap = struct {
     arena: Allocator,
     io: Io,
     zig: []const u8,
+    /// zig's version and the machine it builds for, as `zig env` says
+    /// them: what an object is made by.
+    zigIs: []const u8,
+    /// The objects, by name, the parts of this build are.
+    used: *std.StringHashMapUnmanaged(void),
     environment: *std.process.Environ.Map,
     progress: std.Progress.Node,
     root: Dir,
@@ -158,57 +166,123 @@ const Bootstrap = struct {
         return true;
     }
 
-    /// The parts in `directory` built by `zig cc` into `to`: zig keeps
-    /// each part's object in its cache, .zig-cache/, and builds again only
-    /// a part changed, as many at once as there are cores.  (A part is
-    /// known by its path, its time and its inode: heff writes again only
-    /// the parts whose C changed, and the seed is unpacked so too.)
-    fn cc(b: *const Bootstrap, who: []const u8, directory: []const u8, to: []const u8, target: []const []const u8) bool {
+    /// The parts in `directory` built by zig into `to`: each part an
+    /// object, kept in `into` and named by what it is made of -- the zig
+    /// and the machine it builds for, the flags, heff.h and the part -- so
+    /// that a part as it was is not built again, wherever it is and
+    /// whichever stage it is of; as many at once as there are cores, then
+    /// the objects linked.  (zig's own cache knows a C file by its path,
+    /// time and inode, not by what is in it, so it builds again a part
+    /// written again, as every part is in a CI's checkout or its cache
+    /// restored.)
+    fn cc(b: *const Bootstrap, who: []const u8, into: []const u8, directory: []const u8, to: []const u8, compile: []const []const u8, link: []const []const u8) bool {
         const files = b.filesOf(directory, &.{".c"}) orelse return false;
-        var argv: std.ArrayList([]const u8) = .empty;
-        argv.appendSlice(b.arena, &.{ b.zig, "cc" }) catch return false;
-        argv.appendSlice(b.arena, target) catch return false;
-        for (files) |file| argv.append(b.arena, b.concat(&.{ directory, "/", file })) catch return false;
-        argv.appendSlice(b.arena, &.{ "-o", to, "-lm" }) catch return false;
-        const name = if (target.ptr == &flags) std.fs.path.basename(to) else to;
-        const node = b.progress.start(b.concat(&.{ "zig builds ", name }), 0);
+        b.root.createDirPath(b.io, into) catch return false;
+        var madeOf = std.crypto.hash.sha2.Sha256.init(.{});
+        madeOf.update(b.zigIs);
+        madeOf.update(std.mem.join(b.arena, " ", compile) catch return false);
+        madeOf.update(b.read(b.concat(&.{ directory, "/heff.h" })) orelse "");
+        const objects = b.arena.alloc([]const u8, files.len) catch return false;
+        var anew: std.ArrayList(usize) = .empty;
+        for (files, 0..) |file, k| {
+            const bytes = b.read(b.concat(&.{ directory, "/", file })) orelse return false;
+            var part = madeOf;
+            part.update(bytes);
+            var digest: [32]u8 = undefined;
+            part.final(&digest);
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            const name = b.concat(&.{ file[0 .. file.len - 2], "-", hex[0..16], ".o" });
+            b.used.put(b.arena, name, {}) catch return false;
+            objects[k] = b.concat(&.{ into, "/", name });
+            if (b.modified(objects[k]) == null) anew.append(b.arena, k) catch return false;
+        }
+
+        const name = if (std.mem.eql(u8, who, "heff build")) std.fs.path.basename(to) else to;
+        const node = b.progress.start(b.concat(&.{ "zig builds ", name }), anew.items.len);
         defer node.end();
         const start = Io.Timestamp.now(b.io, .awake);
+        if (!b.compileParts(compile, directory, files, objects, anew.items, node)) return false;
+        var argv: std.ArrayList([]const u8) = .empty;
+        argv.appendSlice(b.arena, &.{ b.zig, "cc" }) catch return false;
+        argv.appendSlice(b.arena, link) catch return false;
+        argv.appendSlice(b.arena, objects) catch return false;
+        argv.appendSlice(b.arena, &.{ "-o", to, "-lm" }) catch return false;
         if (!b.run(argv.items, node)) return false;
-        b.say("{s}: zig built {s} from its {d} parts in {d:.1} s", .{ who, name, files.len, b.seconds(start) });
+        b.say("{s}: zig built {s} ({d} of its {d} parts anew) in {d:.1} s", .{ who, name, anew.items.len, files.len, b.seconds(start) });
         return true;
     }
 
-    /// The seed, unpacked into `into`: a part written only where it is
-    /// not there as it is, so that zig builds again only those changed,
-    /// and a part the seed has not let go.
+    /// The parts `anew` of `files`, to compile each to its object.
+    const Work = struct {
+        b: *const Bootstrap,
+        compile: []const []const u8,
+        directory: []const u8,
+        files: []const []const u8,
+        objects: []const []const u8,
+        anew: []const usize,
+        node: std.Progress.Node,
+        next: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        /// One worker: the next part not taken, while there is one and
+        /// none failed, compiled to OBJECT.part, renamed once it is whole,
+        /// so that an object there is is never half made.
+        fn work(w: *Work) void {
+            const b = w.b;
+            while (!w.failed.load(.monotonic)) {
+                const at = w.next.fetchAdd(1, .monotonic);
+                if (at >= w.anew.len) return;
+                const k = w.anew[at];
+                const part = b.concat(&.{ w.objects[k], ".part" });
+                var argv: std.ArrayList([]const u8) = .empty;
+                argv.appendSlice(b.arena, &.{ b.zig, "cc" }) catch return w.failed.store(true, .monotonic);
+                argv.appendSlice(b.arena, w.compile) catch return w.failed.store(true, .monotonic);
+                argv.appendSlice(b.arena, &.{ "-c", b.concat(&.{ w.directory, "/", w.files[k] }), "-o", part }) catch
+                    return w.failed.store(true, .monotonic);
+                if (!b.run(argv.items, .none)) return w.failed.store(true, .monotonic);
+                Dir.rename(b.root, part, b.root, w.objects[k], b.io) catch return w.failed.store(true, .monotonic);
+                w.node.completeOne();
+            }
+        }
+    };
+
+    /// The parts `anew` of `files` compiled each to its object, as many
+    /// at once as there are cores.
+    fn compileParts(b: *const Bootstrap, compile: []const []const u8, directory: []const u8, files: []const []const u8, objects: []const []const u8, anew: []const usize, node: std.Progress.Node) bool {
+        var w: Work = .{ .b = b, .compile = compile, .directory = directory, .files = files, .objects = objects, .anew = anew, .node = node };
+        const jobs = @min(std.Thread.getCpuCount() catch 4, anew.len);
+        const workers = b.arena.alloc(std.Thread, jobs) catch return false;
+        var started: usize = 0;
+        for (workers) |*worker| {
+            worker.* = std.Thread.spawn(.{}, Work.work, .{&w}) catch break;
+            started += 1;
+        }
+        if (started == 0 and jobs > 0) w.work();
+        for (workers[0..started]) |worker| worker.join();
+        return !w.failed.load(.monotonic);
+    }
+
+    /// The objects in `into` no part of this build is made of, let go.
+    fn prune(b: *const Bootstrap, into: []const u8) void {
+        var directory = b.root.openDir(b.io, into, .{ .iterate = true }) catch return;
+        defer directory.close(b.io);
+        var gone: std.ArrayList([]const u8) = .empty;
+        var iterator = directory.iterate();
+        while (iterator.next(b.io) catch return) |entry|
+            if (!b.used.contains(entry.name)) gone.append(b.arena, b.arena.dupe(u8, entry.name) catch return) catch return;
+        for (gone.items) |name| directory.deleteFile(b.io, name) catch {};
+    }
+
+    /// The seed, unpacked into `into`, anew.
     fn unpack(b: *const Bootstrap, into: []const u8) !void {
         const compressed = b.read(seed) orelse return error.NoSeed;
         var input: Io.Reader = .fixed(compressed);
         var xz = try std.compress.xz.Decompress.init(&input, b.arena, &.{});
-        var nameBuffer: [Dir.max_path_bytes]u8 = undefined;
-        var linkBuffer: [Dir.max_path_bytes]u8 = undefined;
-        var tar: std.tar.Iterator = .init(&xz.reader, .{ .file_name_buffer = &nameBuffer, .link_name_buffer = &linkBuffer });
+        try b.root.deleteTree(b.io, into);
         try b.root.createDirPath(b.io, into);
-        var directory = try b.root.openDir(b.io, into, .{ .iterate = true });
+        var directory = try b.root.openDir(b.io, into, .{});
         defer directory.close(b.io);
-        var names: std.StringHashMapUnmanaged(void) = .empty;
-        while (try tar.next()) |file| {
-            if (file.kind != .file) continue;
-            const name = try b.arena.dupe(u8, std.fs.path.basename(file.name));
-            const bytes = try b.arena.alloc(u8, @intCast(file.size));
-            var writer: Io.Writer = .fixed(bytes);
-            try tar.streamRemaining(file, &writer);
-            try names.put(b.arena, name, {});
-            const was = directory.readFileAlloc(b.io, name, b.arena, .unlimited) catch null;
-            if (was == null or !std.mem.eql(u8, was.?, bytes))
-                try directory.writeFile(b.io, .{ .sub_path = name, .data = bytes });
-        }
-        var gone: std.ArrayList([]const u8) = .empty;
-        var iterator = directory.iterate();
-        while (try iterator.next(b.io)) |entry|
-            if (entry.kind == .file and !names.contains(entry.name)) try gone.append(b.arena, try b.arena.dupe(u8, entry.name));
-        for (gone.items) |name| try directory.deleteFile(b.io, name);
+        try std.tar.extract(b.io, directory, &xz.reader, .{});
     }
 
     fn seedHash(b: *const Bootstrap) [64]u8 {
@@ -230,13 +304,8 @@ const Bootstrap = struct {
 
         b.root.createDirPath(b.io, out) catch |err| b.fail("heff build: {s}: {t}", .{ out, err });
         const stage0 = out ++ "/heff-stage0" ++ exe;
-        // (the first stage, and its C, apart by what made it -- the heff
-        // there is, or the seed -- so that each is the same files, which
-        // zig need not build again, however the builds take turns)
         const stage1 = out ++ "/heff-stage1" ++ exe;
         const stage1C = out ++ "/heff-stage1.d";
-        const seedStage1 = out ++ "/heff-seed-stage1" ++ exe;
-        const seedStage1C = out ++ "/heff-seed-stage1.d";
         var first = false;
         if (!fromSeed and built != null) {
             if (!ofThisSeed) {
@@ -245,7 +314,7 @@ const Bootstrap = struct {
                 // (the heff there is, set apart: the build writes over it)
                 if (!b.toC(stage0, stage1C))
                     b.complain("heff build: the heff there is cannot compile the source; from the seed", .{})
-                else if (!b.cc("heff build", stage1C, stage1, &flags))
+                else if (!b.cc("heff build", kept, stage1C, stage1, &flags, &flags))
                     b.complain("heff build: the heff there is compiles the source to C zig cannot build; from the seed", .{})
                 else
                     first = true;
@@ -257,12 +326,13 @@ const Bootstrap = struct {
             const start = Io.Timestamp.now(b.io, .awake);
             b.unpack(seedC) catch |err| b.fail("heff build: unpacking the seed failed: {t}", .{err});
             b.say("heff build: the seed unpacked in {d:.1} s", .{b.seconds(start)});
-            if (!b.cc("heff build", seedC, seedExe, &flags)) b.fail("heff build: zig cc failed", .{});
-            if (!b.toC(seedExe, seedStage1C)) b.fail("heff build: the seed compiling app/heff/main.hf failed", .{});
-            if (!b.cc("heff build", seedStage1C, seedStage1, &flags)) b.fail("heff build: zig cc failed", .{});
+            if (!b.cc("heff build", kept, seedC, seedExe, &flags, &flags)) b.fail("heff build: zig cc failed", .{});
+            if (!b.toC(seedExe, stage1C)) b.fail("heff build: the seed compiling app/heff/main.hf failed", .{});
+            if (!b.cc("heff build", kept, stage1C, stage1, &flags, &flags)) b.fail("heff build: zig cc failed", .{});
         }
-        if (!b.toC(if (first) stage1 else seedStage1, parts)) b.fail("heff build: the first stage could not compile itself", .{});
-        if (!b.cc("heff build", parts, heff, &flags)) b.fail("heff build: zig cc failed", .{});
+        if (!b.toC(stage1, parts)) b.fail("heff build: the first stage could not compile itself", .{});
+        if (!b.cc("heff build", kept, parts, heff, &flags, &flags)) b.fail("heff build: zig cc failed", .{});
+        b.prune(kept);
         // (the heff built comes of the seed there is: built from it, or with
         // a heff of it)
         b.root.writeFile(b.io, .{ .sub_path = seedOf, .data = b.concat(&.{ &hash, "\n" }) }) catch |err|
@@ -374,16 +444,36 @@ const Bootstrap = struct {
     /// heff for other systems: .heff/out/heff.d/ built by `zig cc` for
     /// each target (as `zig targets` names them) to
     /// .heff/out/native/TARGET/heff (heff.exe for Windows): stripped, and
-    /// Linux's linked statically by musl, so it runs anywhere.
+    /// Linux's linked statically by musl, so it runs anywhere; the
+    /// objects kept in .heff/out/native.o/, apart from the build's, which
+    /// lets go of those of no part of it.
     fn native(b: *const Bootstrap, targets: []const []const u8) void {
         for (targets) |target| {
             const directory = b.concat(&.{ out, "/native/", target });
             b.root.createDirPath(b.io, directory) catch |err| b.fail("heff native: {s}: {t}", .{ directory, err });
             const program = b.concat(&.{ directory, if (std.mem.indexOf(u8, target, "windows") != null) "/heff.exe" else "/heff" });
-            if (!b.cc("heff native", parts, program, &.{ "-target", target, "-O2", "-s", "-w" })) b.fail("heff native: {s} failed", .{target});
+            const compile = [_][]const u8{ "-target", target, "-O2", "-w" };
+            const link = [_][]const u8{ "-target", target, "-O2", "-s", "-w" };
+            if (!b.cc("heff native", nativeKept, parts, program, &compile, &link)) b.fail("heff native: {s} failed", .{target});
         }
+        b.prune(nativeKept);
     }
 };
+
+/// What `zig env` says of `field`: `.field = "VALUE"`.
+fn zon(said: []const u8, field: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, said, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " ");
+        if (trimmed.len < field.len + 6 or trimmed[0] != '.' or !std.mem.startsWith(u8, trimmed[1..], field)) continue;
+        const rest = trimmed[1 + field.len ..];
+        if (!std.mem.startsWith(u8, rest, " = \"")) continue;
+        const value = rest[4..];
+        const end = std.mem.indexOfScalar(u8, value, '"') orelse continue;
+        return value[0..end];
+    }
+    return null;
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -401,10 +491,27 @@ pub fn main(init: std.process.Init) !void {
         try init.environ_map.put("HEFF_LIB", try std.fs.path.join(arena, &.{ here, "lib" }));
     }
     const command = arguments[2];
+    const zig = arguments[1];
+    const said = std.process.run(arena, io, .{ .argv = &.{ zig, "env" } }) catch |err| {
+        try Io.File.stderr().writeStreamingAll(io, "heff build: zig env failed (https://ziglang.org/download/)\n");
+        return err;
+    };
+    // (zig keeps what it makes of each part too, in its cache: the one it
+    // keeps for all, not the build's, .zig-cache/, where zig run here
+    // would keep it, beside build.zig)
+    if (init.environ_map.get("ZIG_LOCAL_CACHE_DIR") == null) {
+        if (zon(said.stdout, "global_cache_dir")) |global| try init.environ_map.put("ZIG_LOCAL_CACHE_DIR", global);
+    }
+    var used: std.StringHashMapUnmanaged(void) = .empty;
     const b: Bootstrap = .{
         .arena = arena,
         .io = io,
-        .zig = arguments[1],
+        .zig = zig,
+        .zigIs = if (zon(said.stdout, "version")) |version|
+            if (zon(said.stdout, "target")) |target| try std.mem.concat(arena, u8, &.{ version, " ", target }) else said.stdout
+        else
+            said.stdout,
+        .used = &used,
         .environment = init.environ_map,
         .progress = std.Progress.start(io, .{ .root_name = command }),
         .root = root,

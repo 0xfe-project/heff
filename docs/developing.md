@@ -38,12 +38,13 @@ the program to C with the heff built before (`.heff/out/heff`), and
 or only one of another seed, it starts from the seed,
 `boot/heff.tar.xz`: heff compiled by itself to C, which zig unpacks
 and builds for whatever machine it is on.  `make build-seed` (`zig
-build seed`) always starts from the seed.  zig keeps each C part's
-object in its cache, `.zig-cache/`, and builds again only the parts
-that changed, as many at once as there are cores; it knows a part by
-its path and its time, so a part written anew (as in a fresh checkout)
-is built again.  `.zig-cache/` only grows: remove it when it is too
-big.
+build seed`) always starts from the seed.  zig builds each C part
+to an object apart, as many at once as there are cores, and links
+them; each object is kept in `.heff/out/heff.o/`, named by what it is
+made of (the zig and the machine it builds for, the flags, `heff.h`
+and the part), so a part as it was is not built again, whichever stage
+it is of, and one no stage of the build is made of is let go.  (zig's
+own cache, `.zig-cache/`, holds `scripts/bootstrap.zig` built.)
 
 `make install` installs into `~/.heff` whatever `HEFF_HOME` says (to
 install elsewhere, `HEFF_HOME=DIR .heff/out/heff install`); `make
@@ -62,9 +63,9 @@ native -Dtargets=...`) builds heff for other systems, as a release
 does, into `.heff/out/native/TARGET/`.
 
 `make clean` removes what the builds and the tests made under `.heff/`,
-keeping the caches (`vN/`, `bN/`, the parts built under ASan in
-`ref/native-asan.o/`, and zig's, `.zig-cache/`); it never touches the
-seed.
+keeping the caches (`vN/`, `bN/`, the parts zig built in `out/heff.o/`
+and `out/native.o/`, and those built under ASan in
+`ref/native-asan.o/`); it never touches the seed.
 
 ## Testing
 
@@ -119,7 +120,8 @@ All that is made is under `.heff/`: the compiler built (`out/`), the
 cache of compiled modules (`vN/`), the backends' cache (`bN/`), the
 programs `heff build` makes (`bin/`, their C in `build/`), what `heff
 run` runs (`run/`), the example apps (`examples/`), and the tests' work
-directories (`ref/`); and zig's cache, beside it, `.zig-cache/`.
+directories (`ref/`); and zig's cache, beside it, `.zig-cache/`, of
+the build's own program.
 
 The backends' cache keeps, for each module (`bN/M.hb`), what the
 backends made of its definitions: each definition simplified, by the

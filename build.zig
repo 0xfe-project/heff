@@ -1,8 +1,9 @@
 //! heff's build, by zig alone: scripts/bootstrap.zig, built for this
 //! machine, runs each stage -- from the heff built before, or from the
-//! seed, boot/heff.tar.xz -- and zig builds the C of each, keeping each
-//! part's object in its cache (.zig-cache/).  The Makefile's build, boot
-//! and native are these steps.
+//! seed, boot/heff.tar.xz -- and zig builds the C of each, a part an
+//! object, kept by what it is made of in .heff/out/heff.o/.  (zig's own
+//! cache, .zig-cache/, keeps bootstrap.)  The Makefile's build, boot and
+//! native are these steps.
 //!
 //!   zig build                      .heff/out/heff
 //!   zig build seed                 .heff/out/heff, from the seed, always

@@ -135,9 +135,10 @@ install-all: install vsix ## install, and the VS Code extension, and bat's cache
 
 ##@ Cleaning
 
-# (the caches are kept: .heff/vN/, .heff/bN/, the parts built under
-# ASan, .heff/ref/native-asan.o/, each kept by what it is made of, and
-# zig's, .zig-cache/, with the parts zig built)
+# (the parts zig built, .heff/out/heff.o/ and .heff/out/native.o/, and
+# those built under ASan, .heff/ref/native-asan.o/, each kept by what it
+# is made of, are caches, as .heff/vN/ and .heff/bN/ are, and are kept)
 clean: ## what the builds and tests made (not the caches, nor the seed)
-	rm -rf .heff/bin .heff/build .heff/run .heff/examples .heff/out $(VSCODE)/heff-*.vsix
+	rm -rf .heff/bin .heff/build .heff/run .heff/examples $(VSCODE)/heff-*.vsix
+	if [ -d .heff/out ]; then find .heff/out -mindepth 1 -maxdepth 1 ! -name heff.o ! -name native.o -exec rm -rf {} +; fi
 	if [ -d .heff/ref ]; then find .heff/ref -mindepth 1 -maxdepth 1 ! -name native-asan.o -exec rm -rf {} +; fi
