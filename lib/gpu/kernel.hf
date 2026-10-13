@@ -1,0 +1,470 @@
+-- A GPU kernel written in heff, by combinators: an expression of the
+-- kernel is an `Exp a`, of a `Float32`, an `Int32`, a `UInt32` or a
+-- `Bool`, built by the prelude's operators (`x + y`, `x * y`, `-x`, `x
+-- /. y` of floats, `x / y` and `x % y` of integers) and this module's
+-- functions (`lessThan`, `load`, `length`); a statement is an operation
+-- of the effect `stmt` (lib/co.hf), so that a kernel's body is a `Co
+-- stmt Unit` written with `do`: `define`, `store`, `when`, `ifElse`,
+-- `for`, `globalId`.  A kernel takes its buffers, each an `Input a`
+-- (read) or an `Output a` (read and written), and is made by `kernel1`
+-- to `kernel3`.  Import it by a name, `import gpu.kernel as Kernel`.
+-- gpu.wgsl prints a kernel as WGSL; gpu.run loads and dispatches it.
+--
+-- The kernel language has no functions, no recursion and nothing
+-- allocated: what heff computes as the body is built -- a heff function
+-- called, a heff recursion, a `List.map` -- is done then, at build time,
+-- and what is left is the kernel's straight code, its loops and
+-- branches.  The types hold what WGSL would refuse: an `Exp Float32`
+-- added to an `Exp Int32`, a `Bool` added or kept in a buffer, an
+-- integer divided by `/.`, a `UInt32` negated, an `Input` stored into.
+-- They hold it only through these combinators: heff has no module
+-- privacy, and the constructors under them, named `Unsafe...`
+-- (`UnsafeExp`, `UnsafeBuf`, `UnsafeKernel3`), and the untyped `Expr`
+-- make anything.
+--
+-- Arithmetic is WGSL's, not heff's: an integer divided by zero is the
+-- dividend (heff's is 0), and its remainder by zero 0.
+
+import co
+import float32 as Float32
+import int32 as Int32
+import uint32 as UInt32
+
+-- Expressions
+--------------------------------------------------------------------------------
+
+-- | An operator of two operands, as WGSL writes it.
+data BinaryOp
+  = Plus
+  | Minus
+  | Times
+  | Quotient
+  | Modulo
+  | Less
+  | AtMost
+  | Greater
+  | AtLeast
+  | EqualTo
+  | NotEqualTo
+  | AndAlso
+  | OrElse
+
+-- | An expression of a kernel, untyped: a literal as WGSL writes it, a
+-- | name, an operator's application, a buffer's element (its name and
+-- | the index), a buffer's length, a value converted to a type (its
+-- | WGSL name).
+data Expr
+  = Literal String
+  | Var String
+  | Binary BinaryOp Expr Expr
+  | Negated Expr
+  | Inverted Expr
+  | Index String Expr
+  | Length String
+  | Convert String Expr
+
+-- | An expression of a value of the type `t`: of the combinators only.
+-- | `UnsafeExp` makes one of any `Expr`, of any type.
+data Exp (t : Type) = UnsafeExp Expr
+
+-- | The untyped expression.
+exprOf : {t : Type} -> Exp t -> Expr
+exprOf (UnsafeExp e) = e
+
+-- | A type a kernel has values of: its WGSL name, and a value of it as a
+-- | WGSL literal.  `Float32`'s, `Int32`'s, `UInt32`'s and `Bool`'s.
+theory Scalar (a : Type) where
+  typeName : String
+  literal : a -> String
+
+-- | A number type of a kernel, which a buffer holds, of `bytes` each:
+-- | `Float32`'s, `Int32`'s and `UInt32`'s -- not `Bool`'s.
+theory Numeric (a : Type) where
+  bytes : Int
+
+-- | A number type with a sign, negated by `-x`: `Float32`'s and
+-- | `Int32`'s (WGSL has no `-` of a `u32`).
+theory Signed (a : Type) where
+  signedName : String
+
+-- | An integer type, divided by `/` and `%`: `Int32`'s and `UInt32`'s.
+theory Integral (a : Type) where
+  integralName : String
+
+-- (a literal written, in parentheses where it has a sign)
+signedLiteral : String -> String
+signedLiteral s = if startsWith "-" s then "(" ^ s ^ ")" else s
+
+-- (a float's literal; WGSL has none of an infinity or of what is not a
+-- number, so those are their bits)
+floatLiteral : String -> String
+floatLiteral "Infinity" = "bitcast<f32>(0x7f800000u)"
+floatLiteral "-Infinity" = "bitcast<f32>(0xff800000u)"
+floatLiteral "NaN" = "bitcast<f32>(0x7fc00000u)"
+floatLiteral s = signedLiteral (s ^ "f")
+
+-- (WGSL has no literal of the least `i32`: 2147483648i is too great)
+int32Literal : Int32 -> String
+int32Literal x =
+  if x == Int32.minBound
+    then "(-2147483647i - 1i)"
+  else signedLiteral (show x ^ "i")
+
+-- | >>> instanceScalarFloat32.literal 1.5
+-- | "1.5f"
+-- | >>> instanceScalarFloat32.literal (-2.0)
+-- | "(-2.0f)"
+instance instanceScalarFloat32 : Scalar Float32
+instanceScalarFloat32 =
+  { typeName = "f32", literal = \x -> floatLiteral (show x) }
+
+-- | >>> instanceScalarInt32.literal (-3)
+-- | "(-3i)"
+instance instanceScalarInt32 : Scalar Int32
+instanceScalarInt32 = { typeName = "i32", literal = int32Literal }
+
+-- | >>> instanceScalarUInt32.literal 7
+-- | "7u"
+instance instanceScalarUInt32 : Scalar UInt32
+instanceScalarUInt32 = { typeName = "u32", literal = \x -> show x ^ "u" }
+
+instance instanceScalarBool : Scalar Bool
+instanceScalarBool =
+  { typeName = "bool", literal = \b -> if b then "true" else "false" }
+
+instance instanceNumericFloat32 : Numeric Float32
+instanceNumericFloat32 = { bytes = 4 }
+
+instance instanceNumericInt32 : Numeric Int32
+instanceNumericInt32 = { bytes = 4 }
+
+instance instanceNumericUInt32 : Numeric UInt32
+instanceNumericUInt32 = { bytes = 4 }
+
+instance instanceSignedFloat32 : Signed Float32
+instanceSignedFloat32 = { signedName = "f32" }
+
+instance instanceSignedInt32 : Signed Int32
+instanceSignedInt32 = { signedName = "i32" }
+
+instance instanceIntegralInt32 : Integral Int32
+instanceIntegralInt32 = { integralName = "i32" }
+
+instance instanceIntegralUInt32 : Integral UInt32
+instanceIntegralUInt32 = { integralName = "u32" }
+
+-- | The value, as a literal of the kernel.
+-- | >>> exprOf (lit (2 : UInt32))
+-- | Literal "2u"
+lit : {a : Type} -> {{scalar : Scalar a}} -> a -> Exp a
+lit x = UnsafeExp (Literal (scalar.literal x))
+
+-- (two expressions under an operator)
+binary : {a b : Type} -> BinaryOp -> Exp a -> Exp a -> Exp b
+binary o x y = UnsafeExp (Binary o (exprOf x) (exprOf y))
+
+-- | `x + y` of a kernel's numbers.
+instance instanceAdditionExp : {a : Type}
+                             -> {{numeric : Numeric a}}
+                             -> Addition (Exp a)
+instanceAdditionExp = { add = binary Plus }
+
+instance instanceSubtractionExp : {a : Type}
+                                -> {{numeric : Numeric a}}
+                                -> Subtraction (Exp a)
+instanceSubtractionExp = { sub = binary Minus }
+
+instance instanceMultiplicationExp : {a : Type}
+                                   -> {{numeric : Numeric a}}
+                                   -> Multiplication (Exp a)
+instanceMultiplicationExp = { mul = binary Times }
+
+-- | `x / y` of a kernel's integers: WGSL's, by zero the dividend.
+instance instanceDivisionExp : {a : Type}
+                             -> {{integral : Integral a}}
+                             -> Division (Exp a)
+instanceDivisionExp = { div = binary Quotient }
+
+-- | `x % y` of a kernel's integers: WGSL's, by zero 0.
+instance instanceRemainderExp : {a : Type}
+                              -> {{integral : Integral a}}
+                              -> Remainder (Exp a)
+instanceRemainderExp = { mod = binary Modulo }
+
+-- | `x /. y` of a kernel's floats.
+instance instanceFloatDivisionExpFloat32 : FloatDivision (Exp Float32)
+instanceFloatDivisionExpFloat32 = { divide = binary Quotient }
+
+-- | `-x` of a kernel's signed numbers.
+instance instanceNegationExp : {a : Type}
+                             -> {{signed : Signed a}}
+                             -> Negation (Exp a)
+instanceNegationExp = { neg = \x -> UnsafeExp (Negated (exprOf x)) }
+
+-- | Whether the first is less than the second (`<`: the prelude's is a
+-- | `Bool`'s, not an `Exp Bool`'s).
+lessThan : {a : Type} -> {{numeric : Numeric a}} -> Exp a -> Exp a -> Exp Bool
+lessThan = binary Less
+
+-- | `<=`.
+atMost : {a : Type} -> {{numeric : Numeric a}} -> Exp a -> Exp a -> Exp Bool
+atMost = binary AtMost
+
+-- | `>`.
+greaterThan : {a : Type}
+            -> {{numeric : Numeric a}}
+            -> Exp a
+            -> Exp a
+            -> Exp Bool
+greaterThan = binary Greater
+
+-- | `>=`.
+atLeast : {a : Type} -> {{numeric : Numeric a}} -> Exp a -> Exp a -> Exp Bool
+atLeast = binary AtLeast
+
+-- | `==`.
+equalTo : {a : Type} -> {{scalar : Scalar a}} -> Exp a -> Exp a -> Exp Bool
+equalTo = binary EqualTo
+
+-- | `!=`.
+notEqualTo : {a : Type} -> {{scalar : Scalar a}} -> Exp a -> Exp a -> Exp Bool
+notEqualTo = binary NotEqualTo
+
+-- | `&&`.
+both : Exp Bool -> Exp Bool -> Exp Bool
+both = binary AndAlso
+
+-- | `||`.
+either : Exp Bool -> Exp Bool -> Exp Bool
+either = binary OrElse
+
+-- | `!`.
+negation : Exp Bool -> Exp Bool
+negation x = UnsafeExp (Inverted (exprOf x))
+
+-- | The value as another type's: `f32(x)`.
+convert : {a b : Type} -> {{to : Scalar b}} -> Exp a -> Exp b
+convert x = UnsafeExp (Convert to.typeName (exprOf x))
+
+-- Buffers
+--------------------------------------------------------------------------------
+
+-- | (A buffer the kernel reads: `var<storage, read>`.)
+data Read
+
+-- | (A buffer the kernel reads and writes: `var<storage, read_write>`.)
+data Write
+
+-- | A buffer of the kernel's, of `a`s, `m` how it is used: its name in
+-- | the kernel.  Of the combinators only (`kernel1` to `kernel3` name
+-- | them); `UnsafeBuf` makes one of any name.
+data Buf (m : Type) (a : Type) = UnsafeBuf String
+
+-- | A buffer read.
+type Input a = Buf Read a
+
+-- | A buffer read and written.
+type Output a = Buf Write a
+
+-- | How a buffer is used, as WGSL says it.
+theory Mode (m : Type) where
+  access : String
+
+instance instanceModeRead : Mode Read
+instanceModeRead = { access = "read" }
+
+instance instanceModeWrite : Mode Write
+instanceModeWrite = { access = "read_write" }
+
+-- | The buffer's name in the kernel.
+nameOf : {m a : Type} -> Buf m a -> String
+nameOf (UnsafeBuf name) = name
+
+-- | The buffer's element at the index.
+load : {m a : Type} -> Buf m a -> Exp UInt32 -> Exp a
+load buffer i = UnsafeExp (Index (nameOf buffer) (exprOf i))
+
+-- | How many elements the buffer has.
+length : {m a : Type} -> Buf m a -> Exp UInt32
+length buffer = UnsafeExp (Length (nameOf buffer))
+
+-- Statements
+--------------------------------------------------------------------------------
+
+-- | A statement of a kernel, untyped: a value named (the name to the
+-- | rest), an element of a buffer written (the buffer's name, the
+-- | index, the value), a branch (each side's statements), a loop from
+-- | the first up to the second (its body given the counter), and the
+-- | invocation's index in the grid (named, to the rest).
+data StmtF (m : Type -> Type) x
+  = Let Expr (Expr -> x)
+  | Store String Expr Expr (Unit -> x)
+  | If Expr (m Unit) (m Unit) (Unit -> x)
+  | For Expr Expr (Expr -> m Unit) (Unit -> x)
+  | GlobalId (Expr -> x)
+
+-- (`stmt`'s action on functions)
+stmtMap : {m : Type -> Type}
+        -> {a b : Type}
+        -> (a -> b)
+        -> StmtF m a
+        -> StmtF m b
+stmtMap g (Let e k) = Let e (\v -> g (k v))
+stmtMap g (Store b i x k) = Store b i x (\u -> g (k u))
+stmtMap g (If c yes no k) = If c yes no (\u -> g (k u))
+stmtMap g (For lo hi body k) = For lo hi body (\u -> g (k u))
+stmtMap g (GlobalId k) = GlobalId (\v -> g (k v))
+
+-- (`stmt`'s action on the transformations: the branches' and the
+-- loop's statements, transformed)
+stmtThrough : {m n : Type -> Type}
+            -> ({x : Type} -> m x -> n x)
+            -> {a : Type}
+            -> StmtF m a
+            -> StmtF n a
+stmtThrough nt (Let e k) = Let e k
+stmtThrough nt (Store b i x k) = Store b i x k
+stmtThrough nt (If c yes no k) = If c (nt yes) (nt no) k
+stmtThrough nt (For lo hi body k) = For lo hi (\i -> nt (body i)) k
+stmtThrough nt (GlobalId k) = GlobalId k
+
+-- | A kernel's statements as an effect.
+stmt : HFunctor
+stmt =
+  { f = StmtF
+  , hfmap = \m g p -> stmtMap g p
+  , hmap = \m n nt p -> stmtThrough nt p
+  }
+
+-- | The value named, once: the name, to use it again where it is
+-- | computed once (`let v0 = ...;`).
+define : {a : Type} -> Exp a -> Co stmt (Exp a)
+define x = op (Let (exprOf x) (\v -> UnsafeExp v)) val
+
+-- | The buffer's element at the index written: only a buffer the kernel
+-- | writes, an `Output`.
+store : {a : Type} -> Buf Write a -> Exp UInt32 -> Exp a -> Co stmt Unit
+store buffer i x =
+  op (Store (nameOf buffer) (exprOf i) (exprOf x) (\u -> u)) val
+
+-- | The first statements where the condition holds, else the second.
+ifElse : Exp Bool -> Co stmt Unit -> Co stmt Unit -> Co stmt Unit
+ifElse c yes no = op (If (exprOf c) yes no (\u -> u)) val
+
+-- | The statements where the condition holds.
+when : Exp Bool -> Co stmt Unit -> Co stmt Unit
+when c yes = ifElse c yes (val MkUnit)
+
+-- | The body for each integer from the first up to the second, not it.
+for : {a : Type}
+    -> {{integral : Integral a}}
+    -> Exp a
+    -> Exp a
+    -> (Exp a -> Co stmt Unit)
+    -> Co stmt Unit
+for lo hi body =
+  op
+    (For (exprOf lo) (exprOf hi) (\i -> body (UnsafeExp i)) (\u -> u))
+    val
+
+-- | The invocation's index in the grid, along its first axis: from 0 to
+-- | the workgroups dispatched times the workgroup's size, less one.
+globalId : Co stmt (Exp UInt32)
+globalId = op (GlobalId (\v -> UnsafeExp v)) val
+
+-- Kernels
+--------------------------------------------------------------------------------
+
+-- | A buffer of a kernel, as WGSL declares it: its name, how it is used
+-- | (`read`, `read_write`), the type of its elements.
+type Param = { name : String, access : String, element : String }
+
+-- | A kernel, untyped: the name of its entry point, its workgroup's size,
+-- | its buffers in the order they are bound, its body.
+type Kernel =
+  { entry : String, workgroup : Int, params : List Param, body : Co stmt Unit }
+
+-- | What a kernel takes: a buffer, of numbers, read or written.
+theory Parameter (p : Type) where
+  declared : String -> Param
+  named : String -> p
+
+instance instanceParameterBuf : {m a : Type}
+                              -> {{mode : Mode m}}
+                              -> {{scalar : Scalar a}}
+                              -> {{numeric : Numeric a}}
+                              -> Parameter (Buf m a)
+instanceParameterBuf =
+  { declared = \name ->
+        { name = name, access = mode.access, element = scalar.typeName }
+  , named = \name -> UnsafeBuf name
+  }
+
+-- | A kernel of one buffer, an `Input a` or an `Output a`.  Of
+-- | `kernel1` only; `UnsafeKernel1` makes one of any `Kernel`.
+data Kernel1 (a : Type) = UnsafeKernel1 Kernel
+
+-- | ... of two.
+data Kernel2 (a : Type) (b : Type) = UnsafeKernel2 Kernel
+
+-- | ... of three.
+data Kernel3 (a : Type) (b : Type) (c : Type) = UnsafeKernel3 Kernel
+
+-- | A kernel of the entry point's name and the workgroup's size, its body
+-- | given its buffer (named `a`).
+kernel1 : {a : Type}
+        -> {{pa : Parameter a}}
+        -> String
+        -> Int
+        -> (a -> Co stmt Unit)
+        -> Kernel1 a
+kernel1 entry size body =
+  UnsafeKernel1
+    { entry = entry
+    , workgroup = size
+    , params = [pa.declared "a"]
+    , body = body (pa.named "a")
+    }
+
+-- | ... its body given its two buffers (`a`, `b`, bound in that order).
+kernel2 : {a b : Type}
+        -> {{pa : Parameter a}}
+        -> {{pb : Parameter b}}
+        -> String
+        -> Int
+        -> (a -> b -> Co stmt Unit)
+        -> Kernel2 a b
+kernel2 entry size body =
+  UnsafeKernel2
+    { entry = entry
+    , workgroup = size
+    , params = [pa.declared "a", pb.declared "b"]
+    , body = body (pa.named "a") (pb.named "b")
+    }
+
+-- | ... its body given its three buffers (`a`, `b`, `c`).
+kernel3 : {a b c : Type}
+        -> {{pa : Parameter a}}
+        -> {{pb : Parameter b}}
+        -> {{pc : Parameter c}}
+        -> String
+        -> Int
+        -> (a -> b -> c -> Co stmt Unit)
+        -> Kernel3 a b c
+kernel3 entry size body =
+  UnsafeKernel3
+    { entry = entry
+    , workgroup = size
+    , params = [pa.declared "a", pb.declared "b", pc.declared "c"]
+    , body = body (pa.named "a") (pb.named "b") (pc.named "c")
+    }
+
+-- | The kernel, untyped.
+kernelOf1 : {a : Type} -> Kernel1 a -> Kernel
+kernelOf1 (UnsafeKernel1 k) = k
+
+kernelOf2 : {a b : Type} -> Kernel2 a b -> Kernel
+kernelOf2 (UnsafeKernel2 k) = k
+
+kernelOf3 : {a b c : Type} -> Kernel3 a b c -> Kernel
+kernelOf3 (UnsafeKernel3 k) = k
