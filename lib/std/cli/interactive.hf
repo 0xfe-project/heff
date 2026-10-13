@@ -1,0 +1,550 @@
+-- A program's commands, as std.cli says them, learned by using them: a
+-- list of the commands with what each does, filtered by what is typed;
+-- a command picked is a form of its positionals and its flags -- each
+-- with what it is, its values, whether it is wanted -- and the command
+-- line the form makes, shown as it is filled in, with what is wrong with
+-- it yet.  Done, it is the words of that command line, for the program
+-- to run as if they had been given it (`Cli.readLine`).  An app of
+-- std.terminal.widget's, pure: std.terminal runs it on the terminal
+-- (`Terminal.interact (Interactive.app "heff" (Interactive.entries
+-- cs))`).  Import it by a name, `import std.cli.interactive as
+-- Interactive`.
+--
+-- Keys: on the list, up and down (or `j` and `k`, Ctrl-N and Ctrl-P) to
+-- move, a page, Home and End; anything typed filters it by the
+-- commands' names (`/` first to type a `j`, `k` or `q`); Enter or Tab
+-- opens the command; Esc clears the filter, or ends, as `q` does.  On a
+-- form, Tab and down to the next field, Shift-Tab and up to the one
+-- before; a field of words is typed in as a shell's line is, a choice
+-- turned by left and right (or space); Enter ends, with the command
+-- line, once nothing is wrong with it; Esc goes back to the list (and
+-- `q`, on a choice).
+
+import rune as Rune
+import std.cli as Cli
+import std.terminal.widget as Widget
+
+-- The commands
+--------------------------------------------------------------------------------
+
+-- | A command, as the list and its form show it: its name, what it
+-- | does, and the words it takes.
+type Entry = { name : String, doc : String, shape : Cli.Shape }
+
+entryOf : {r : Type} -> Cli.Command r -> Entry
+entryOf k = { name = k.name, doc = k.doc, shape = Cli.shapeOfCommand k }
+
+-- | The commands the usage shows, as entries.
+entries : {r : Type} -> List (Cli.Command r) -> List Entry
+entries cs = List.map entryOf (List.filter (\(k : Cli.Command r) -> k.shown) cs)
+
+-- The form
+--------------------------------------------------------------------------------
+
+-- | What a field of a form is for: a positional, or a flag.
+data Part = Positional Cli.Pos | Flagged Cli.Flag
+
+-- | What a field holds: words typed, or a value chosen.
+data Input = Typed Widget.Field | Picked Widget.Choice
+
+-- | A field of a form.
+type Slot = { part : Part, input : Input }
+
+-- (a switch's values)
+switchOptions : List String
+switchOptions = ["off", "on"]
+
+posSlot : Cli.Pos -> Slot
+posSlot p = { part = Positional p, input = Typed (Widget.field "") }
+
+-- (a flag's field: a switch, off or on; one of its values, none first
+-- where it may be left out; else words typed)
+flagSlot : Cli.Flag -> Slot
+flagSlot f =
+  { part = Flagged f
+  , input =
+      if strEq f.meta "" then Picked (Widget.choice switchOptions)
+      else if List.null f.values then Typed (Widget.field "")
+      else if f.required then Picked (Widget.choice f.values)
+      else Picked (Widget.choice ("" :: f.values))
+  }
+
+-- | A command's form: the command, its fields -- its positionals, then
+-- | its flags -- and the one being filled in.
+type Form = { entry : Entry, slots : List Slot, at : Int }
+
+-- | The command's form, empty.
+formOf : Entry -> Form
+formOf e =
+  { entry = e
+  , slots =
+      List.append
+        (List.map posSlot e.shape.pos)
+        (List.map flagSlot e.shape.flags)
+  , at = 0
+  }
+
+-- (a positional's words, by how many it takes: one, as typed, or none
+-- where nothing is; else the words typed, split at spaces)
+posWords : Cli.Arity -> String -> List String
+posWords One t = if strEq (trim t) "" then Nil else [trim t]
+posWords Optional t = if strEq (trim t) "" then Nil else [trim t]
+posWords a t = words t
+
+-- (a flag's words: a switch's name where it is on; `--long=value` where
+-- a value is given)
+flagWord : Cli.Flag -> String -> List String
+flagWord f v =
+  if strEq f.meta "" then (if strEq v "on" then ["--" ^ f.long] else Nil)
+  else if strEq v "" then Nil
+  else ["--" ^ f.long ^ "=" ^ v]
+
+-- (what a field puts on the command line)
+partWords : Part -> Input -> List String
+partWords (Positional p) (Typed t) = posWords p.arity (Widget.fieldText t)
+partWords (Positional p) (Picked c) = posWords p.arity (Widget.chosen c)
+partWords (Flagged f) (Typed t) = flagWord f (trim (Widget.fieldText t))
+partWords (Flagged f) (Picked c) = flagWord f (Widget.chosen c)
+
+slotWords : Slot -> List String
+slotWords s = partWords s.part s.input
+
+isPositional : Slot -> Bool
+isPositional { part = Positional _ } = True
+isPositional s = False
+
+-- (a word that would be read as a flag)
+flagLike : String -> Bool
+flagLike w = strLength w >= 2 && byteAt w 0 == 45
+
+isRest : Cli.Pos -> Bool
+isRest { arity = Rest } = True
+isRest p = False
+
+hasRest : Cli.Shape -> Bool
+hasRest sh = List.any isRest sh.pos
+
+-- (the positionals' words and the flags', put together: the positionals
+-- first, as a usage writes them -- but the flags first where a rest
+-- would take them as its words, or where a positional's word would be
+-- read as a flag, and `--` before the positionals then)
+arranged : Bool -> List String -> List String -> List String
+arranged rest ps fs =
+  if List.any flagLike ps then List.append fs ("--" :: ps)
+  else if rest then List.append fs ps
+  else List.append ps fs
+
+-- | The words of the command line the form makes, after the command's
+-- | name.
+formWords : Form -> List String
+formWords fm =
+  arranged
+    (hasRest fm.entry.shape)
+    (List.concatMap slotWords (List.filter isPositional fm.slots))
+    (List.concatMap
+       slotWords
+       (List.filter (\s -> not (isPositional s)) fm.slots))
+
+-- | What is wrong with the command line the form makes, if anything.
+formProblem : Form -> Maybe Cli.Problem
+formProblem fm = Cli.problemOf fm.entry.shape (formWords fm)
+
+-- (a byte a shell takes as it is)
+plainByte : Int -> Bool
+plainByte b =
+  (b >= 48 && b <= 57)
+  || (b >= 65 && b <= 90)
+  || (b >= 97 && b <= 122)
+  || List.elemBy (\x y -> x == y) b [45, 95, 46, 47, 61, 58, 44, 64, 37, 43]
+
+plainFrom : String -> Int -> Bool
+plainFrom w i =
+  if i >= strLength w then True
+  else plainByte (byteAt w i) && plainFrom w (i + 1)
+
+-- | A word as a shell is to be given it: as it is, or in single quotes.
+-- | >>> List.map quoted ["a.hf", "two words", "it's", ""]
+-- | ["a.hf", "'two words'", "'it'\\''s'", "''"]
+quoted : String -> String
+quoted w =
+  if not (strEq w "") && plainFrom w 0 then w
+  else "'" ^ joinWith "'\\''" (split "'" w) ^ "'"
+
+-- | The command line: the program, the command, its words, as a shell
+-- | is to be given them.
+commandLine : String -> String -> List String -> String
+commandLine prog name ws = unwords (prog :: name :: List.map quoted ws)
+
+-- The app
+--------------------------------------------------------------------------------
+
+-- | Where the app is: the program's name, its commands, the filter
+-- | typed and whether it is being typed (`j`, `k` and `q` are then
+-- | letters of it), which of the commands it lets through is picked,
+-- | and the form open, if one is.
+type Model =
+  { prog : String
+  , entries : List Entry
+  , filter : Widget.Field
+  , typing : Bool
+  , menu : Widget.Menu
+  , form : Maybe Form
+  }
+
+-- | The list of the commands, nothing typed.
+start : String -> List Entry -> Model
+start prog es =
+  { prog = prog
+  , entries = es
+  , filter = Widget.field ""
+  , typing = False
+  , menu = Widget.menu
+  , form = Nothing
+  }
+
+-- | The commands the filter lets through: those whose names have it.
+matching : Model -> List Entry
+matching m =
+  List.filter
+    (\(e : Entry) -> contains (Widget.fieldText m.filter) e.name)
+    m.entries
+
+-- | The command picked, if the filter lets any through.
+picked : Model -> Maybe Entry
+picked m = List.head (List.drop m.menu.at (matching m))
+
+type Result = Maybe (List String)
+
+-- (the filter after an edit: being typed if anything is in it, the first
+-- of what it lets through picked)
+refiltered : Model -> Widget.Field -> Widget.Step Model Result
+refiltered m f =
+  Continue
+    { m
+    | filter = f
+    , typing = m.typing || not (List.null f.text)
+    , menu = Widget.menu
+    }
+
+-- (the filter edited by a key)
+edited : Widget.Key -> Model -> Widget.Step Model Result
+edited k m = refiltered m (Widget.fieldKey k m.filter)
+
+-- (the selection moved by a key)
+moved : Widget.Key -> Model -> Widget.Step Model Result
+moved k m =
+  Continue
+    { m | menu = Widget.menuKey (List.length (matching m)) k m.menu }
+
+-- (the form of the command picked opened, if one is)
+opened : Model -> Maybe Entry -> Widget.Step Model Result
+opened m (Just e) = Continue { m | form = Just (formOf e) }
+opened m Nothing = Continue m
+
+-- (a rune typed on the list: `j`, `k`, `q` and `/` keys where the filter
+-- is not being typed, else a letter of it)
+typedOnList : Rune -> Model -> Widget.Step Model Result
+typedOnList c m =
+  if m.typing then edited (Char c) m
+  else if c == 'q' then Done Nothing
+  else if c == 'j' then moved ArrowDown m
+  else if c == 'k' then moved ArrowUp m
+  else if c == '/' then Continue { m | typing = True }
+  else edited (Char c) m
+
+-- (a control key on the list: Ctrl-N and Ctrl-P move, the others edit
+-- the filter)
+controlOnList : Rune -> Model -> Widget.Step Model Result
+controlOnList c m =
+  if c == 'n' || c == 'p' then moved (Control c) m
+  else edited (Control c) m
+
+-- (Esc on the list: the filter cleared, or the end)
+escapedList : Model -> Widget.Step Model Result
+escapedList m =
+  if m.typing then refiltered { m | typing = False } (Widget.field "")
+  else Done Nothing
+
+-- (a key on the list)
+listStep : Widget.Key -> Model -> Widget.Step Model Result
+listStep Escape m = escapedList m
+listStep Enter m = opened m (picked m)
+listStep Tab m = opened m (picked m)
+listStep (Char c) m = typedOnList c m
+listStep (Control c) m = controlOnList c m
+listStep Backspace m = edited Backspace m
+listStep Delete m = edited Delete m
+listStep ArrowLeft m = edited ArrowLeft m
+listStep ArrowRight m = edited ArrowRight m
+listStep k m = moved k m
+
+-- (the `i`th of the list changed by `g`)
+updateAt : {a : Type} -> Int -> (a -> a) -> List a -> List a
+updateAt i g Nil = Nil
+updateAt i g (x :: xs) =
+  if i == 0 then g x :: xs else x :: updateAt (i - 1) g xs
+
+-- (a field's input after a key)
+inputKey : Widget.Key -> Input -> Input
+inputKey k (Typed f) = Typed (Widget.fieldKey k f)
+inputKey k (Picked c) = Picked (Widget.choiceKey k c)
+
+slotKey : Widget.Key -> Slot -> Slot
+slotKey k s = { s | input = inputKey k s.input }
+
+-- (the field being filled in)
+focused : Form -> Maybe Slot
+focused fm = List.head (List.drop fm.at fm.slots)
+
+-- (the field is a choice)
+isPicked : Maybe Slot -> Bool
+isPicked (Just { input = Picked _ }) = True
+isPicked s = False
+
+-- (the form, the next field, or the one before, filled in)
+nextSlot : Int -> Form -> Form
+nextSlot d fm =
+  { fm
+  | at =
+      if List.null fm.slots then 0
+      else (fm.at + d + List.length fm.slots) % List.length fm.slots
+  }
+
+-- (the model with its form)
+withForm : Model -> Form -> Widget.Step Model Result
+withForm m fm = Continue { m | form = Just fm }
+
+-- (Enter on a form: its words, the command's name first, once nothing is
+-- wrong with them)
+entered : Model -> Form -> Maybe Cli.Problem -> Widget.Step Model Result
+entered m fm Nothing = Done (Just (fm.entry.name :: formWords fm))
+entered m fm (Just p) = Continue m
+
+-- (a key given the field being filled in -- but on a choice, `q` goes
+-- back and `j` and `k` move, as nothing is typed there)
+slotStep : Widget.Key -> Model -> Form -> Widget.Step Model Result
+slotStep (Char c) m fm =
+  if isPicked (focused fm) && c == 'q' then Continue { m | form = Nothing }
+  else if isPicked (focused fm) && c == 'j' then withForm m (nextSlot 1 fm)
+  else if isPicked (focused fm) && c == 'k'
+    then withForm m (nextSlot (0 - 1) fm)
+  else withForm m { fm | slots = updateAt fm.at (slotKey (Char c)) fm.slots }
+slotStep (Control c) m fm =
+  if c == 'n' then withForm m (nextSlot 1 fm)
+  else if c == 'p' then withForm m (nextSlot (0 - 1) fm)
+  else withForm m { fm | slots = updateAt fm.at (slotKey (Control c)) fm.slots }
+slotStep k m fm =
+  withForm m { fm | slots = updateAt fm.at (slotKey k) fm.slots }
+
+-- (a key on a form)
+formStep : Widget.Key -> Model -> Form -> Widget.Step Model Result
+formStep Escape m fm = Continue { m | form = Nothing }
+formStep Enter m fm = entered m fm (formProblem fm)
+formStep Tab m fm = withForm m (nextSlot 1 fm)
+formStep ArrowDown m fm = withForm m (nextSlot 1 fm)
+formStep BackTab m fm = withForm m (nextSlot (0 - 1) fm)
+formStep ArrowUp m fm = withForm m (nextSlot (0 - 1) fm)
+formStep k m fm = slotStep k m fm
+
+-- | What a key makes of the app: on the list, or on the form open.
+step : Widget.Key -> Model -> Widget.Step Model Result
+step k m@{ form = Just fm } = formStep k m fm
+step k m = listStep k m
+
+-- Shown
+--------------------------------------------------------------------------------
+
+-- (a command's row on the list: its name, in a column as wide as the
+-- longest, and what it does)
+entryRow : Int -> Entry -> Widget.Row
+entryRow w e =
+  [Widget.bold (Widget.pad w e.name), Widget.plain "  ", Widget.dim e.doc]
+
+-- (how the picked command is called, or why none is)
+calledAs : Model -> Maybe Entry -> String
+calledAs m (Just e) =
+  m.prog
+  ^ " "
+  ^ e.name
+  ^ (if List.null e.shape.pos && List.null e.shape.flags then ""
+     else " " ^ Cli.synopsis e.shape)
+calledAs m Nothing =
+  "no command's name has `" ^ Widget.fieldText m.filter ^ "` in it"
+
+-- (the filter's row, and the cursor in it, where it is being typed)
+filterRow : Model -> Widget.Row
+filterRow m =
+  if m.typing
+    then [Widget.plain "filter: ", Widget.plain (Widget.fieldText m.filter)]
+  else [ Widget.dim
+         "type to filter, ↑ ↓ or j k to move, Enter to fill one in, q to quit"
+       ]
+
+filterCursor : Model -> Maybe (Pair Int Int)
+filterCursor m =
+  if m.typing then Just (MkPair (8 + Widget.fieldCursor m.filter) 1)
+  else Nothing
+
+-- (the list of the commands, on a terminal of the size)
+listView : Widget.Size -> Model -> Widget.Frame
+listView size m =
+  { rows =
+      List.append
+        (Widget.fill
+           (size.rows - 1)
+           ([Widget.bold m.prog, Widget.plain ": its commands"]
+            :: filterRow m
+            :: Nil
+            :: Widget.menuRows
+              (size.rows - 4)
+              m.menu
+              (List.map
+                 (entryRow
+                    (List.foldl
+                       (\n (e : Entry) -> max n (Widget.width e.name))
+                       0
+                       (matching m)))
+                 (matching m))))
+        [Widget.status size.columns (calledAs m (picked m))]
+  , cursor = filterCursor m
+  }
+
+-- (a field's label: a positional as a usage writes it, a flag its names
+-- and the value it takes)
+partLabel : Part -> String
+partLabel (Positional p) = Cli.posWord p
+partLabel (Flagged f) =
+  (if strEq f.short "" then "" else "-" ^ f.short ^ ", ")
+  ^ "--"
+  ^ f.long
+  ^ (if strEq f.meta "" then "" else "=" ^ f.meta)
+
+-- (a value of a choice as shown: none, where it is left out)
+optionShown : String -> String
+optionShown v = if strEq v "" then "(none)" else v
+
+-- (what a field takes, as its usage names it)
+partHint : Part -> String
+partHint (Positional p) = p.meta
+partHint (Flagged f) = f.meta
+
+-- (a field's input, as shown; an empty one not being filled in, what it
+-- takes, dim)
+inputRow : Bool -> Part -> Input -> Widget.Row
+inputRow on part (Picked c) = Widget.choiceRow on optionShown c
+inputRow on part (Typed t) =
+  if not on && List.null t.text then [Widget.dim (partHint part)]
+  else [Widget.plain (Widget.fieldText t)]
+
+-- (a field's row: marked where it is being filled in)
+slotRow : Int -> Bool -> Slot -> Widget.Row
+slotRow w on s =
+  (if on then Widget.bold "> " else Widget.plain "  ")
+  :: Widget.plain (Widget.pad w (partLabel s.part))
+  :: Widget.plain "  "
+  :: inputRow on s.part s.input
+
+slotRows : Int -> Int -> Int -> List Slot -> List Widget.Row
+slotRows w at i Nil = Nil
+slotRows w at i (s :: ss) = slotRow w (i == at) s :: slotRows w at (i + 1) ss
+
+-- (what a file or a word completes to, said)
+completeSaid : Cli.Complete -> String
+completeSaid (Files sfx) =
+  if strEq sfx "" then "; a file" else "; a " ^ sfx ^ " file"
+completeSaid Dirs = "; a directory"
+completeSaid (Among ws) = "; one of " ^ joinWith ", " ws
+completeSaid None = ""
+
+-- (how many words a positional takes, said)
+aritySaid : Cli.Arity -> String
+aritySaid One = "one word, wanted"
+aritySaid Optional = "one word, or none: the command's default"
+aritySaid Many = "any number of words, split at spaces"
+aritySaid Some = "one word or more, split at spaces"
+aritySaid Rest = "the rest of the words, as they are, split at spaces"
+
+-- (what a field takes, said)
+partSaid : Part -> String
+partSaid (Positional p) =
+  p.meta ^ ": " ^ aritySaid p.arity ^ completeSaid p.complete
+partSaid (Flagged f) =
+  "--"
+  ^ f.long
+  ^ ": "
+  ^ (if strEq f.doc "" then "" else f.doc ^ "; ")
+  ^ (if strEq f.meta "" then "a switch, off or on (← → or space)"
+     else if List.null f.values then "a value, typed; left empty, not given"
+     else "one of " ^ joinWith ", " f.values ^ " (← → or space)")
+  ^ (if f.required then "; wanted" else "")
+
+-- (what the field being filled in takes, on lines of the width)
+helpRows : Int -> Maybe Slot -> List Widget.Row
+helpRows w (Just s) =
+  List.map (\l -> [Widget.dim l]) (Widget.wrap w (partSaid s.part))
+helpRows w Nothing = Nil
+
+-- (what the form's status line says: what is wrong yet, or the keys)
+formStatus : Maybe Cli.Problem -> String
+formStatus (Just p) = "not yet: " ^ Cli.problemSaid p ^ "  (Esc: back)"
+formStatus Nothing = "Enter: run it  ·  Tab ↑ ↓: another field  ·  Esc: back"
+
+-- (where the cursor is shown: in the field being filled in, if words are
+-- typed there)
+formCursor : Int -> Int -> Form -> Maybe Slot -> Maybe (Pair Int Int)
+formCursor top w fm (Just { input = Typed t }) =
+  Just (MkPair (2 + w + 2 + Widget.fieldCursor t) (top + fm.at))
+formCursor top w fm s = Nothing
+
+-- (how wide the form's labels are: as its widest)
+formLabels : Form -> Int
+formLabels f =
+  List.foldl
+    (\n (s : Slot) -> max n (Widget.width (partLabel s.part)))
+    0
+    f.slots
+
+-- (a form, on a terminal of the size)
+formView : Widget.Size -> Model -> Form -> Widget.Frame
+formView size m fm =
+  { rows =
+      List.append
+        (Widget.fill
+           (size.rows - 1)
+           (List.append
+              ([Widget.bold (m.prog ^ " " ^ fm.entry.name)]
+               :: List.map
+                 (\l -> [Widget.plain l])
+                 (Widget.wrap size.columns fm.entry.doc))
+              (Nil
+               :: List.append
+                 (slotRows (formLabels fm) fm.at 0 fm.slots)
+                 (Nil
+                  :: List.append
+                    (helpRows size.columns (focused fm))
+                    [ Nil
+                    , [ Widget.plain "$ "
+                      , Widget.bold
+                        (commandLine m.prog fm.entry.name (formWords fm))
+                      ]
+                    ]))))
+        [Widget.status size.columns (formStatus (formProblem fm))]
+  , cursor =
+      formCursor
+        (List.length (Widget.wrap size.columns fm.entry.doc) + 2)
+        (formLabels fm)
+        fm
+        (focused fm)
+  }
+
+-- | How the app is shown on a terminal of the size: the list, or the
+-- | form open.
+view : Widget.Size -> Model -> Widget.Frame
+view size m@{ form = Just fm } = formView size m fm
+view size m = listView size m
+
+-- | The app: the commands of the program `prog`, to pick one of and fill
+-- | in; what it comes to is the words of the command line made (the
+-- | command's name first), or nothing, where it was left.
+app : String -> List Entry -> Widget.App Model Result
+app prog es = { start = start prog es, step = step, view = view }
