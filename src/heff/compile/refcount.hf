@@ -165,6 +165,9 @@ data Exp b
   | RUnbox Repr.Repr (Exp b)
   | RPeek Repr.Repr (Exp b)
   | RPrimU String (List (Exp b))
+  -- | an array's primitive at a number's repr (#61, `Repr.elementAt`):
+  -- | its element read as one (`arrayIndex`), or given as one
+  | RPrimAt String Repr.Repr (List (Exp b))
   | RFixU Fixed.Fixed Int
   | RF32U Float64
   | RF64U Float64
@@ -1270,6 +1273,58 @@ recordVal r ce live fs ts Nothing =
        (List.map (slotAt ts) (List.range 0 (List.length fs - 1)))
        (List.map snd fs))
 
+-- (the repr an array's element comes as: a variable as it is kept, a
+-- primitive done unboxed as it gives, a number's literal as its number)
+elementRepr : CE -> Imperative.Val -> Repr.Repr
+elementRepr ce (SFixed w _) = RepFix w
+elementRepr ce (SFloat _) = RepF64
+elementRepr ce (SFloat32 _) = RepFix F32
+elementRepr ce (SVar x) = Repr.reprOf ce.reprs x
+elementRepr ce (SPrim p _) = Repr.resultRepr p
+elementRepr ce v = RepV
+
+-- (the element, at `e`, as `rp`; the others `V`s)
+elementReprs : Int -> Repr.Repr -> List Imperative.Val -> List Repr.Repr
+elementReprs e rp vs =
+  List.map
+    (\i -> if i == e then rp else RepV)
+    (List.range 0 (List.length vs - 1))
+
+-- | an array's primitive given an element (#61): at its number's repr,
+-- | where it comes unboxed
+elementVal : RcK
+           -> CE
+           -> List String
+           -> String
+           -> List Imperative.Val
+           -> Int
+           -> Repr.Repr
+           -> Value
+elementVal r ce live p as e rp =
+  if Repr.isBoxed rp then RPrim p (operandsF r ce live as)
+  else RPrimAt p rp (operandsAs r ce live (elementReprs e rp as) as)
+
+-- | a primitive, given all its arguments
+primVal : RcK
+        -> CE
+        -> List String
+        -> String
+        -> List Imperative.Val
+        -> Maybe Int
+        -> Value
+primVal r ce live p as (Just e) =
+  elementVal
+    r
+    ce
+    live
+    p
+    as
+    e
+    (elementRepr ce (fromMaybe (SInt 0) (List.head (List.drop e as))))
+primVal r ce live p as Nothing =
+  if strEq p reusePrim then reuseVal r ce live as
+  else RPrim p (operandsF r ce live as)
+
 valF : RcK -> CE -> List String -> Imperative.Val -> Value
 valF r ce live (SVar x) = varUse ce live x
 valF r ce live (SGlobal g) =
@@ -1287,9 +1342,7 @@ valF r ce live (SRec fs ts) =
 valF r ce live (SProj e l sh t) =
   projAt r ce live e l t (List.length sh) (indexIn l 0 sh)
 valF r ce live (SPrimFn p) = RPrimFn p
-valF r ce live (SPrim p as) =
-  if strEq p reusePrim then reuseVal r ce live as
-  else RPrim p (operandsF r ce live as)
+valF r ce live (SPrim p as) = primVal r ce live p as (Repr.elementAt p)
 valF r ce live (SLam xs (MkBlock t)) = lamVal r ce live xs t
 
 -- Boxes (#39): a value is made as it comes -- a variable as it is kept,
@@ -1438,6 +1491,10 @@ compF : RcK -> CE -> List String -> Repr.Repr -> Imperative.Comp -> Value
 compF r ce live want (OSimple v) = r.valAs ce live want v
 compF r ce live want (OCall g as) =
   coerce (Repr.resultIn ce.sigs g) want (compV r ce live (OCall g as))
+compF r ce live want (OPrim p as) =
+  if Repr.readsElement p && not (Repr.isBoxed want)
+    then RPrimAt p want (operandsF r ce live as)
+  else coerce RepV want (compV r ce live (OPrim p as))
 compF r ce live want o = coerce RepV want (compV r ce live o)
 
 -- Statements and what is last

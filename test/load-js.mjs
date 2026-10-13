@@ -80,7 +80,8 @@ export const show = (v, arg = false) => {
   if (typeof v === "number") { const s = String(v); return isNaN(s + ".0") ? s : s + ".0"; }
   if (typeof v === "string") return showString(v);
   if (v instanceof Uint8Array) return v.bits === undefined ? showBytes(v) : showBits(v);
-  if (Array.isArray(v)) return "[" + v.map((x) => show(x)).join(", ") + "]";
+  // (an array, of numbers a `Float64Array`)
+  if (Array.isArray(v) || v instanceof Float64Array) return "[" + Array.from(v, (x) => show(x)).join(", ") + "]";
   if (v && typeof v === "object") {
     if ("$" in v && Array.isArray(v.a)) {
       const xs = items(v);
