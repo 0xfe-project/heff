@@ -14,8 +14,9 @@
 // built and run, held to what they are to do (the interpreter runs no
 // provider): what they write, their exit status, loops a million rounds
 // deep, a long loop of operations done at once, and time; an HTTP
-// client, TCP sockets and an HTTP server over them, green threads
-// waiting on them apart, processes forked, and threads truly at once.
+// client, TCP sockets and an HTTP server over them, an API over HTTP
+// (std.remote), green threads waiting on them apart, processes forked,
+// and threads truly at once.
 // (Each program apart from the others, as many at once as there are cores.)
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
@@ -593,6 +594,21 @@ if (process.platform !== "win32") checks.push((async () => {
 if (process.platform !== "win32") checks.push(ran("green server", "test/node/green-served.hf", "main", [],
   { out: "first requests answered, every connection held open: 40\n"
     + "second requests answered, on the same connections: 40\nmain done\n", status: 0 }));
+
+// an API over HTTP, both sides of std.remote, by C alone: its server
+// over std.http.server, its client by std.http, green threads of one
+// program -- calls answered, the server's count kept between them; a
+// client of another build refused; no server there; a GET, no call
+if (process.platform !== "win32") checks.push((async () => {
+  const [refused] = await freePorts(1);
+  return ran("remote", "test/node/remote.hf", "main", [String(refused)],
+    { out: "answered: 2 42, shouted, its bytes as they were: True\n"
+      + "again, the count kept: 44 84, shouted, its bytes as they were: True\n"
+      + "another build: mismatched: the server's API is tally #d783e7b7, the call's #0f45894d\n"
+      + "no server: unreachable: curl: (7)\n"
+      + "a GET: 405 a call of the API is a POST\n\n"
+      + "main done\n", status: 0 });
+})());
 
 // an HTTP server over them, by C alone (std.http.server): asked by
 // std.http's client in the same program, a thread of its own; and by
