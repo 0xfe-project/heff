@@ -597,9 +597,9 @@ import std.filesystem
 import std.io
 
 world : HFunctor
-world = stdio <+> fs
+world = stdio <+> filesystem
 
-program : {e : HFunctor} -> {{io : stdio <: e}} -> {{disk : fs <: e}} -> Co e Unit
+program : {e : HFunctor} -> {{io : stdio <: e}} -> {{disk : filesystem <: e}} -> Co e Unit
 program = do
   ok <- writeFile "hello.txt" "hello"
   print (if ok then "written" else "not written")

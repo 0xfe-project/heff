@@ -210,7 +210,7 @@ static V heff_fs_failed(V p) {
   int at = tag == TAG_WriteFile || tag == TAG_Copy || tag == TAG_Move || tag == TAG_Replace ? 2 : 1;
   V f = heff_dup(heff_field(p, at));
   heff_drop(p);
-  return heff_answer(f, tag == TAG_ReadFile || tag == TAG_ReadDir ? heff_nothing : heff_bool(0));
+  return heff_answer(f, tag == TAG_ReadFile || tag == TAG_ReadDirectory ? heff_nothing : heff_bool(0));
 }
 
 // (an operation of whole files and paths: answered by a `Bool` or a
@@ -236,13 +236,13 @@ static V heff_fs_whole(V p, V k) {
     x = heff_answer(f, heff_bool(ok));
     break;
   }
-  case TAG_MkDir: {
+  case TAG_MakeDirectory: {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
     x = heff_answer(f, heff_bool(heff_mkdir_p(path)));
     break;
   }
-  case TAG_ReadDir: {
+  case TAG_ReadDirectory: {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
     x = heff_answer(f, heff_read_dir(path));
@@ -301,7 +301,7 @@ static V heff_fs_whole(V p, V k) {
     break;
   }
   default:
-    heff_fail("not an operation of fs");
+    heff_fail("not an operation of filesystem");
     return 0;
   }
   free(path);
@@ -950,9 +950,9 @@ static V fs_answered(V p, int at, V x, V k) {
   return heff_tail(k, 1, &y);
 }
 
-static V heff_provider_fs(V p, V k) {
+static V heff_provider_filesystem(V p, V k) {
   switch (heff_tag_of(p)) {
-  case TAG_Stat: {
+  case TAG_PathStatus: {
     char *path = heff_cstr(heff_field(p, 0));
     int follow = heff_field(p, 1) == NTAG(TAG_True);
     V r;
@@ -978,9 +978,9 @@ static V heff_provider_fs(V p, V k) {
     free(path);
     return fs_answered(p, 1, r, k);
   }
-  case TAG_TempDirectory:
+  case TAG_TemporaryDirectory:
     return fs_answered(p, 1, fs_temp(heff_field(p, 0), 0), k);
-  case TAG_TempFile:
+  case TAG_TemporaryFile:
     return fs_answered(p, 1, fs_temp(heff_field(p, 0), 1), k);
   case TAG_OpenPath: {
     char *path = heff_cstr(heff_field(p, 0));
@@ -1058,7 +1058,7 @@ static V heff_provider_fs(V p, V k) {
     }
     return fs_answered(p, 3, r, k);
   }
-  case TAG_StatHandle: {
+  case TAG_HandleStatus: {
     FsFile *h = fs_file(heff_field(p, 0));
     struct stat st;
     int s = fstat(h->fd, &st);

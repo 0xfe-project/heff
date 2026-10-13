@@ -325,13 +325,13 @@ main = do
 ```
 
 `std.filesystem` is files.  Whole ones: `readFile` (a file's text,
-`Maybe String`), `writeFile`, `readDir`, `mkDir` (a directory and those
+`Maybe String`), `writeFile`, `readDirectory`, `makeDirectory` (a directory and those
 it is in: whether a directory is there -- a file there is none),
 `remove`, `copy`, `move`, `replace`, and `readOnly` and `writable` (a
 file, or a directory and all it holds, made read-only, and writable by
 its owner again), each answering whether it was done.
 
-What a path is: `stat path`, links followed, and `linkStat path`, a
+What a path is: `pathStatus path`, links followed, and `linkStatus path`, a
 link itself, are `Either FileError Status`, a `Status` its `kind`
 (`Regular`, `Directory`, `Link` or `Other`), its `size`, when it was
 `modified` (nanoseconds since the epoch, an `Int`, as precise as the
@@ -341,10 +341,10 @@ and `exists`, `isFile` and `isDirectory` say so.  `setMode path mode` is
 chmod, and `makeExecutable path` `chmod +x` (an execute bit where there
 is a read bit); `realPath path` is the path with its links resolved
 (macOS's temporary directory is under one, `/var` to `/private/var`).
-`tempDirectory prefix` makes a directory of the program's own where
+`temporaryDirectory prefix` makes a directory of the program's own where
 the system keeps temporary ones (`TMPDIR`, else `/tmp`), named the
 prefix and six letters, and made only where nothing is, so that
-programs run at once never share one: its path; `tempFile prefix` a
+programs run at once never share one: its path; `temporaryFile prefix` a
 file so, open, `Pair` its path and it.  Both are the program's to
 remove.  Paths are put together and taken apart by `std.path`, which
 is pure.
@@ -363,7 +363,7 @@ one too where no newline ends it -- a string, which holds any bytes, as
 a file's are, UTF-8 or not; `writeBytes h b` and `writeString h s`
 write them all; `seek h from n` (`FromStart`, `FromCurrent`, `FromEnd`)
 and `tell h` are where it is read and written next, from its start;
-`statHandle h` is its `Status`; and `closeFile h` closes it and lets its
+`handleStatus h` is its `Status`; and `closeFile h` closes it and lets its
 handle go (an operation given it after that fails the program, as
 std.net's do).  A file reads ahead, a buffer at a time, and gives back
 what it read ahead before it is written, so that a file opened
@@ -392,7 +392,7 @@ countWords : {e : HFunctor} -> Int -> String -> Co e Int
 countWords n line = pure (n + List.length (words line))
 
 -- (the words of the standard input, read a line at a time)
-wordsIn : {e : HFunctor} -> {{disk : fs <: e}} -> Co e (Either FileError Int)
+wordsIn : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e (Either FileError Int)
 wordsIn = bind stdin (\i -> foldLines i 0 countWords)
 ```
 
