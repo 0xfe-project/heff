@@ -1089,14 +1089,21 @@ fieldLine sv plain (MkPair v i) =
   ^ ";"
 
 -- (a field that may be flat (#64), read as its variable is kept: a
--- number, flat or not; a `V` of its own, boxed if it is flat)
-flatLine : CK -> String -> Pair String (Pair Int Repr.Repr) -> String
-flatLine k sv (MkPair v (MkPair i r)) =
+-- number, flat or not, or -- flat in every tag of it (`sure`) -- as it
+-- is; a `V` of its own, boxed if it is flat)
+flatLine : CK
+         -> String
+         -> List Int
+         -> Pair String (Pair Int Repr.Repr)
+         -> String
+flatLine k sv sure (MkPair v (MkPair i r)) =
   "  "
   ^ k.ctype v
   ^ " "
   ^ cLocal v
-  ^ " = heff_tget_"
+  ^ (if List.any (\j -> j == i) sure && not (Repr.isBoxed r)
+       then " = heff_tflat_"
+     else " = heff_tget_")
   ^ reprSuffix r
   ^ "("
   ^ sv
@@ -1104,10 +1111,12 @@ flatLine k sv (MkPair v (MkPair i r)) =
   ^ showInt i
   ^ ");"
 
--- (... of a tag that may have flat fields (#64), which look)
-flatSuffix : Bool -> String
-flatSuffix True = "f"
-flatSuffix False = ""
+-- (... of a tag that may have flat fields (#64), which look; whose fields
+-- given up are all flat, which drop none)
+flatSuffix : RefCount.Flatness -> String
+flatSuffix FlatNone = ""
+flatSuffix FlatSome = "f"
+flatSuffix FlatAll = "a"
 
 -- (the scrutinee given up at once (`heff_take_n`): its shell freed and
 -- the fields not wanted dropped; or its cell kept (`heff_take_reuse_n`))
@@ -1141,7 +1150,7 @@ takeLines sv (TakeKeep fl ru mask n) =
     Nil
 
 armF : CK -> String -> RefCount.CaseArm -> C (List String)
-armF k sv (MkCArm t fields flats plain take body leaves) = do
+armF k sv (MkCArm t fields flats sure plain take body leaves) = do
   ls <- k.stmts body
   pure
       (List.append
@@ -1149,7 +1158,7 @@ armF k sv (MkCArm t fields flats plain take body leaves) = do
          (List.append
             (List.append
                (List.map (fieldLine sv plain) fields)
-               (List.map (flatLine k sv) flats))
+               (List.map (flatLine k sv sure) flats))
             (List.append
                (indented (List.append (takeLines sv take) ls))
                (List.append
@@ -1671,6 +1680,15 @@ sortedOnce xs =
           xs))
 
 -- (what the emitter knows of the whole program)
+-- (the tags' fields flat in every tag of them the program builds, of the
+-- tags only the program builds: not the runtime's (`knownTags`), nor
+-- those a provider names -- either may build one, its fields `V`s)
+builtOnlyHere : List String -> Repr.FlatTags -> Repr.FlatTags
+builtOnlyHere others sure =
+  Map.fromList
+    compareString
+    (List.filter (\p -> not (elemS (fst p) others)) (Map.toList sure))
+
 ceOf : List Emit.Provider
      -> Facts.Facts
      -> Pair (List String) (List String)
@@ -1702,7 +1720,17 @@ ceOf provs facts names =
                  provs)))
         Map.empty
         Map.empty
-  , facts = facts
+  , facts =
+      Facts.withFlat
+        facts.flat
+        (builtOnlyHere
+           (List.append
+              knownTags
+              (List.concatMap
+                 (\(p : Emit.Provider) -> namesInGo "TAG_" p.text 0 Nil)
+                 provs))
+           facts.sure)
+        facts
   }
 
 programWith : String
@@ -2135,7 +2163,8 @@ globalH ce g rest =
                 (HS (maybe "" Repr.sigName (Repr.sigIn ce.facts.workers g)))
                 rest))))
 
--- (what is known of a tag: its fields that may be flat, #64)
+-- (what is known of a tag: its fields that may be flat, #64, and those
+-- that are)
 tagH : CE -> String -> List IRText.HItem -> List IRText.HItem
 tagH ce t rest =
   Cons
@@ -2147,7 +2176,14 @@ tagH ce t rest =
              (List.map
                 showInt
                 (fromMaybe Nil (Map.lookup compareString t ce.facts.flat)))))
-       rest)
+       (Cons
+          (HS
+             (joinWith
+                ","
+                (List.map
+                   showInt
+                   (fromMaybe Nil (Map.lookup compareString t ce.facts.sure)))))
+          rest))
 
 -- | what a definition's C is made of, hashed: its key, its body (named
 -- | again from 0), and what is known of itself, of what it mentions and

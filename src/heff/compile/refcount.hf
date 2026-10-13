@@ -167,11 +167,15 @@ data Exp b
   | RF32U Float64
   | RF64U Float64
 
+-- | what is known of a tag's fields that are not kept, where it is given
+-- | up: none flat; some may be (#64); all flat, nothing to drop
+data Flatness = FlatNone | FlatSome | FlatAll
+
 -- | what a match's arm does with what it matched, given up: nothing (it
 -- | wants it, or it is lent); given up at once, the fields of the mask
 -- | kept; its cell kept for a tag of its size, `ru` -- each knowing
--- | whether the tag may have flat fields (#64)
-data Take = TakeNone | TakeN Bool Int Int | TakeKeep Bool String Int Int
+-- | which of the others may be flat
+data Take = TakeNone | TakeN Flatness Int Int | TakeKeep Flatness String Int Int
 
 -- | a field that may be flat (#64), as an arm reads it: its variable,
 -- | its place, the repr it is read as
@@ -179,11 +183,13 @@ type FlatRead = Pair String (Pair Int Repr.Repr)
 
 -- | an arm: its tag, the fields it wants (each its place), those of them
 -- | that may be flat (#64), each read as the repr (a number, or a `V`
--- | counted, boxed if it is flat), whether the others are taken over or
--- | lent (not counted), what it does with what it matched, its body, and
--- | whether it leaves the `switch`
+-- | counted, boxed if it is flat), the places of those that are flat in
+-- | every tag of it (read as they are, `Facts.sure`), whether the others
+-- | are taken over or lent (not counted), what it does with what it
+-- | matched, its body, and whether it leaves the `switch`
 data Arm a
-  = MkCArm String (List (Pair String Int)) (List FlatRead) Bool Take a Bool
+  = MkCArm String (List (Pair String Int)) (List FlatRead) (List
+                                                              Int) Bool Take a Bool
 
 -- | a statement, or what is last
 data Stmt b
@@ -263,7 +269,8 @@ type Self = { key : String, params : List String }
 -- lambda's body, how many parameters it takes, else 0 -- see `CInPlace`;
 -- `takes`: the fields, by their records and labels, that the operands
 -- being made take out of their records -- see `takesFor`; `sigs`: the
--- workers; `flat`: the tags' fields that may be flat (#64); `ret`: what
+-- workers; `flat`: the tags' fields that may be flat (#64), `sure`: those
+-- that are (heff.compile.facts); `ret`: what
 -- the code being made returns, as its worker gives it, a `V` in a lambda)
 type CE =
   { funs : Map.Map String Int
@@ -279,6 +286,7 @@ type CE =
   , reprs : Repr.Reprs
   , sigs : Repr.Sigs
   , flat : Repr.FlatTags
+  , sure : Repr.FlatTags
   , ret : Repr.Repr
   }
 
@@ -303,6 +311,7 @@ withFrame s n ce =
   , reprs = ce.reprs
   , sigs = ce.sigs
   , flat = ce.flat
+  , sure = ce.sure
   , ret = retOf ce.sigs s
   }
 
@@ -321,6 +330,7 @@ withPath owned after ce =
   , reprs = ce.reprs
   , sigs = ce.sigs
   , flat = ce.flat
+  , sure = ce.sure
   , ret = ce.ret
   }
 
@@ -340,6 +350,7 @@ withBorrowed bs ce =
   , reprs = ce.reprs
   , sigs = ce.sigs
   , flat = ce.flat
+  , sure = ce.sure
   , ret = ce.ret
   }
 
@@ -358,6 +369,7 @@ withKnown x k ce =
   , reprs = ce.reprs
   , sigs = ce.sigs
   , flat = ce.flat
+  , sure = ce.sure
   , ret = ce.ret
   }
 
@@ -376,6 +388,7 @@ withTakes ts ce =
   , reprs = ce.reprs
   , sigs = ce.sigs
   , flat = ce.flat
+  , sure = ce.sure
   , ret = ce.ret
   }
 
@@ -396,6 +409,7 @@ ceOfFacts facts reprs =
   , reprs = reprs
   , sigs = facts.workers
   , flat = facts.flat
+  , sure = facts.sure
   , ret = RepV
   }
 
@@ -1534,6 +1548,7 @@ type Reads =
   , names : List String
   , counted : List String
   , flat : Bool
+  , sure : List Int
   }
 
 -- (those of the wanted `ws` that may be flat, of the places `ps`)
@@ -1543,24 +1558,40 @@ flatOnes ce ps ws =
     (\p -> MkPair (fst p) (MkPair (snd p) (Repr.reprOf ce.reprs (fst p))))
     (List.filter (\p -> elemI (snd p) ps) ws)
 
-readsFrom : List (Pair String Int) -> List FlatRead -> Reads
-readsFrom ws fs =
+readsFrom : List Int -> List (Pair String Int) -> List FlatRead -> Reads
+readsFrom su ws fs =
   { plain =
       List.filter (\p -> not (List.any (\q -> strEq (fst q) (fst p)) fs)) ws
   , flats = fs
   , names = List.map fst fs
   , counted = List.map fst (List.filter (\q -> Repr.isBoxed (snd (snd q))) fs)
   , flat = True
+  , sure = su
   }
 
-readsWith : CE -> List (Pair String Int) -> Maybe (List Int) -> Reads
-readsWith ce ws (Just ps) = readsFrom ws (flatOnes ce ps ws)
-readsWith ce ws Nothing =
-  { plain = ws, flats = Nil, names = Nil, counted = Nil, flat = False }
+readsWith : CE
+          -> List Int
+          -> List (Pair String Int)
+          -> Maybe (List Int)
+          -> Reads
+readsWith ce su ws (Just ps) = readsFrom su ws (flatOnes ce ps ws)
+readsWith ce su ws Nothing =
+  { plain = ws
+  , flats = Nil
+  , names = Nil
+  , counted = Nil
+  , flat = False
+  , sure = Nil
+  }
 
 -- | how an arm of the tag `t` reads the fields it wants
 readsOf : CE -> String -> List (Pair String Int) -> Reads
-readsOf ce t ws = readsWith ce ws (Map.lookup compareString t ce.flat)
+readsOf ce t ws =
+  readsWith
+    ce
+    (fromMaybe Nil (Map.lookup compareString t ce.sure))
+    ws
+    (Map.lookup compareString t ce.flat)
 
 -- (the fields an arm holds a reference to: those it wants, unless lent;
 -- those of them read counted, always)
@@ -1568,19 +1599,42 @@ heldOf : Bool -> List String -> List String -> List String -> List String
 heldOf True vs fb counted = counted
 heldOf False vs fb counted = fieldsHeld False vs fb
 
+-- (whether place `i` is in the mask)
+inMask : Int -> Int -> Bool
+inMask mask i = (mask / pow2 i) % 2 == 1
+
+-- (what is known of the fields not in the mask, of `n`: whether the tag
+-- may have flat fields, the places of those it surely has)
+flatnessOf : Bool -> List Int -> Int -> Int -> Flatness
+flatnessOf False su mask n = FlatNone
+flatnessOf True su mask n =
+  if List.all
+    (\i -> inMask mask i || List.any (\j -> j == i) su)
+    (List.range 0 (n - 1))
+    then FlatAll
+  else FlatSome
+
 -- (what an arm does with the scrutinee it gives up (`taken`): its cell
 -- kept (`ru`), or given up at once; the fields it wants kept)
 takeOf : Bool
+       -> List Int
        -> Maybe String
        -> Maybe String
        -> List String
        -> List String
        -> Take
-takeOf fl (Just ru) taken vs used =
-  TakeKeep fl ru (fieldMask used 0 vs) (List.length vs)
-takeOf fl Nothing (Just _) vs used =
-  TakeN fl (fieldMask used 0 vs) (List.length vs)
-takeOf fl Nothing Nothing vs used = TakeNone
+takeOf fl su (Just ru) taken vs used =
+  TakeKeep
+    (flatnessOf fl su (fieldMask used 0 vs) (List.length vs))
+    ru
+    (fieldMask used 0 vs)
+    (List.length vs)
+takeOf fl su Nothing (Just _) vs used =
+  TakeN
+    (flatnessOf fl su (fieldMask used 0 vs) (List.length vs))
+    (fieldMask used 0 vs)
+    (List.length vs)
+takeOf fl su Nothing Nothing vs used = TakeNone
 
 -- Cells kept
 --------------------------------------------------------------------------------
@@ -1808,8 +1862,9 @@ armRead r ce taken lent t vs fb leaves rd (MkPair ru b2) =
     t
     rd.plain
     rd.flats
+    rd.sure
     (lent || isJustS taken)
-    (takeOf rd.flat ru taken vs (minusS fb rd.names))
+    (takeOf rd.flat rd.sure ru taken vs (minusS fb rd.names))
     (List.append
        (dropsIn
           ce

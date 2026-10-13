@@ -526,6 +526,28 @@ HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
   return heff_take_reuse_n(v, keep, n);
 }
 
+// (... of a tag whose fields not in `keep` are all flat, in every tag of
+// it the program builds (src/heff/compile/facts.hf, `sure`): none
+// dropped, nothing looked for)
+HEFF_KNOWN void heff_take_na(V v, uint64_t keep, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
+  else {
+    for (int64_t i = 0; i < n; i++)
+      if ((keep >> i) & 1) heff_dup(t->f[i]);
+    if (!(t->h.rc & IMMORTAL)) t->h.rc--;
+  }
+}
+
+HEFF_KNOWN V heff_take_reuse_na(V v, uint64_t keep, int64_t n) {
+  Tag *t = (Tag *)v;
+  if (t->h.rc == 1) {
+    t->flat = 0; t->h.kind = K_TAG;
+    return v;
+  }
+  return heff_take_reuse_n(v, keep, n);
+}
+
 // (a tag of `n` fields dropped: its last reference, its fields dropped
 // and its cell freed at once; otherwise counted down)
 HEFF_KNOWN void heff_drop_tag(V v, int64_t n) {
@@ -2408,6 +2430,10 @@ HEFF_FAST uint64_t heff_tget_u64(V v, int64_t i) {
   V w = t->f[i];
   return heff_flat_kind(t->flat, i) ? (uint64_t)w : heff_int_low64(w);
 }
+// (... one flat in every tag of it the program builds, as it is)
+HEFF_FAST double heff_tflat_f64(V v, int64_t i) { return heff_f64_of_word(((Tag *)v)->f[i]); }
+HEFF_FAST int64_t heff_tflat_i64(V v, int64_t i) { return (int64_t)((Tag *)v)->f[i]; }
+HEFF_FAST uint64_t heff_tflat_u64(V v, int64_t i) { return (uint64_t)((Tag *)v)->f[i]; }
 #define HEFF_TGET_PEEK(S, T)                                                \
   HEFF_FAST T heff_tget_##S(V v, int64_t i) { return heff_peek_##S(((Tag *)v)->f[i]); }
 HEFF_TGET_PEEK(i8, int8_t)

@@ -18,6 +18,9 @@
 -- - `flat`: of each tag, the fields any of its tags is built with flat
 --   (a `Float64`'s or a 64-bit integer's bits, #64): those a match reads
 --   as the tag says -- the C backend's, none until it is told.
+-- - `sure`: of each tag, the fields every tag of it is built with flat:
+--   those a match reads as they are, nothing looked at -- the C
+--   backend's, none until it is told.
 
 import heff.compile.ir as IR
 import heff.compile.repr as Repr
@@ -30,6 +33,7 @@ type Facts =
   , lent : Map.Map String (List Int)
   , workers : Repr.Sigs
   , flat : Repr.FlatTags
+  , sure : Repr.FlatTags
   }
 
 -- Arities
@@ -174,6 +178,55 @@ flatTags : List IR.Def -> Repr.FlatTags
 flatTags defs =
   List.foldl (\m (d : IR.Def) -> flatW m (Cons d.body Nil)) Map.empty defs
 
+-- (the places at which each tag is built flat: of a tag built so, those
+-- of its fields, of any other, none)
+sureMeet : Map.Map String (List Int)
+         -> String
+         -> List Int
+         -> Map.Map String (List Int)
+sureMeet m t is = case Map.lookup compareString t m of
+  Just js ->
+    Map.insert
+      compareString
+      t
+      (List.filter (\j -> List.any (\i -> i == j) is) js)
+      m
+  Nothing -> Map.insert compareString t is m
+
+sureW : Map.Map String (List Int) -> List IR.Expr -> Map.Map String (List Int)
+sureW m Nil = m
+sureW m (Cons (ETag t as ts) rest) =
+  sureW
+    (sureMeet m t (flatPlaces (Repr.tagSlots ts (List.length as))))
+    (IR.appendI as rest)
+sureW m (Cons (ELam _ b) rest) = sureW m (Cons b rest)
+sureW m (Cons (EApp f as) rest) = sureW m (Cons f (IR.appendI as rest))
+sureW m (Cons (ELet _ a b) rest) = sureW m (Cons a (Cons b rest))
+sureW m (Cons (ERecord fs _) rest) = sureW m (IR.pushFields fs rest)
+sureW m (Cons (EProj e _ _ _) rest) = sureW m (Cons e rest)
+sureW m (Cons (EMatch s arms) rest) = sureW m (Cons s (IR.pushArms arms rest))
+sureW m (Cons (EPrimCall _ as) rest) = sureW m (IR.appendI as rest)
+sureW m (Cons (ECall _ as) rest) = sureW m (IR.appendI as rest)
+sureW m (Cons (EFix _ b) rest) = sureW m (Cons b rest)
+sureW m (Cons _ rest) = sureW m rest
+
+-- | of each tag, the fields every tag of it in the program is built with
+-- | flat: read as they are, where only the program builds the tag (a
+-- | backend knows what else does: its runtime, a provider)
+-- | >>> Map.toList (sureTags [IR.mkDef "f" "f" (ELam ["x"] (ETag "Circle" [EVar "x"] [FtFloat])), IR.mkDef "g" "g" (ELam ["y"] (ETag "Just" [EVar "y"] [FtFloat])), IR.mkDef "h" "h" (ETag "Just" [EInt 1] [FtAny])])
+-- | [MkPair "Circle" [0]]
+sureTags : List IR.Def -> Repr.FlatTags
+sureTags defs =
+  Map.fromList
+    compareString
+    (List.filter
+       (\p -> not (List.null (snd p)))
+       (Map.toList
+          (List.foldl
+             (\m (d : IR.Def) -> sureW m (Cons d.body Nil))
+             Map.empty
+             defs)))
+
 -- Facts
 --------------------------------------------------------------------------------
 
@@ -188,6 +241,7 @@ factsOf defs =
   , lent = Map.empty
   , workers = Map.empty
   , flat = Map.empty
+  , sure = Map.empty
   }
 
 -- | ... and the parameters lent
@@ -199,6 +253,7 @@ withLent lent f =
   , lent = lent
   , workers = f.workers
   , flat = f.flat
+  , sure = f.sure
   }
 
 -- | ... and the workers
@@ -210,17 +265,19 @@ withWorkers ws f =
   , lent = f.lent
   , workers = ws
   , flat = f.flat
+  , sure = f.sure
   }
 
--- | ... and the tags' fields that may be flat
-withFlat : Repr.FlatTags -> Facts -> Facts
-withFlat fl f =
+-- | ... and the tags' fields that may be flat, and those that are
+withFlat : Repr.FlatTags -> Repr.FlatTags -> Facts -> Facts
+withFlat fl su f =
   { arity = f.arity
   , bounce = f.bounce
   , lazy = f.lazy
   , lent = f.lent
   , workers = f.workers
   , flat = fl
+  , sure = su
   }
 
 -- | what the walk knows of the program (heff.compile.repr)
