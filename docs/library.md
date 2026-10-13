@@ -66,6 +66,8 @@ are imported by their names:
 - `wire` ([the wire](#the-wire)), values as bytes and back, the same
   bytes on every backend, and `remote`, an effect's operations sent
   over it to another program ([a client and its server](remote.md));
+- `json` ([JSON](#json)), JSON's values, read from their text and
+  written back, in heff, with no provider;
 - `bits`, the operations of `Bits`, a bitstring of any length
   ([bits](language.md#bits)): `length` (in bits), `index` (a bit, as a
   `Bool`), `toList` and `fromList`, `toBytes` (`Just` the bytes, of a
@@ -631,6 +633,52 @@ instanceWireNote =
 
 An instance is in scope where its module is imported, not further: a
 module that uses one of `wire`'s imports `wire` itself.
+
+## JSON
+
+`json` (`import json as Json`) is JSON (RFC 8259) in heff, with no
+provider, the same on every backend; the language server reads each
+message by it.  A value is
+
+```haskell
+data Json
+  = JNull | JBool Bool | JInt Int | JFloat Float64 | JString String
+  | JArray (List Json) | JObject (List (Pair String Json))
+```
+
+-- an object's fields a list, in their order, a key twice kept twice.
+`Json.parse s` is `Right` the value the text is, white space around it,
+or `Left (Expected i what)`, a `ParseError`: the byte at which the text
+is not JSON and what was expected there (`Json.describe` says it, `at
+byte 3: expected a value`).  It reads as it goes, a value inside
+another kept on a list, not the stack, so a text however deep is read.
+A number without a fraction or an exponent is a `JInt`, of any size as
+an `Int` is (`123456789012345678901234567890` is one); one with either
+is a `JFloat`, rounded correctly where its digits are fewer than 16 and
+its exponent within 22 of 0 (as a C library's `strtod`'s fast path is),
+within an ulp or so elsewhere, and beyond a float's range an infinity
+or 0.  A string's `\u` escapes are runes, a surrogate pair one, a
+surrogate not in a pair U+FFFD; a control character in a string, a
+leading zero, a `+` or a trailing comma is no JSON.
+
+`Json.stringify j` is the text, as JavaScript's `JSON.stringify` writes
+it: no space, a string's `"`, `\` and control characters escaped, what
+is not UTF-8 in it U+FFFD.  A value's `Show` is as the source writes
+it, `JArray [JInt 1]`, its `ToString` its text.  To read into one:
+`Json.field k j` (a field of an object), `Json.at path j` (the value at
+a path of fields), and `Json.str`, `Json.int` (a float's rounded down),
+`Json.bool` and `Json.arr` at a path, each `Nothing` where it is not
+there or is of another kind; `Json.obj`, `Json.kv`, `Json.num` and
+`Json.jstr` make one.
+
+```haskell
+import json as Json
+
+uri : String -> Maybe String
+uri body =
+  either (\e -> Nothing) (\j -> Json.str ["params", "textDocument", "uri"] j)
+    (Json.parse body)
+```
 
 ## Examples
 

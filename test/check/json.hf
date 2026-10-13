@@ -1,0 +1,260 @@
+-- lib/json.hf: what its parser reads of a text, and where it says a text
+-- is not JSON; and that what `stringify` writes is read back as it was.
+
+import check
+import co
+import generator as Generator
+import json as Json
+
+-- (the parse of a text: a value, or where it is not one)
+parsed : String -> Either Json.ParseError Json.Json
+parsed s = Json.parse s
+
+-- (what is expected at a byte)
+expected : Int -> String -> Either Json.ParseError Json.Json
+expected i what = Left (Expected i what)
+
+-- (a value, read)
+value : Json.Json -> Either Json.ParseError Json.Json
+value j = Right j
+
+escapes : Test
+escapes =
+  group
+    "escapes"
+    [ unit
+      "each of JSON's"
+      (assertEqual
+         (parsed "\"\\\" \\\\ \\/ \\b \\f \\n \\r \\t\"")
+         (value (JString "\" \\ / \x08 \x0c \n \r \t")))
+    , unit
+      "\\u, of each width of UTF-8"
+      (assertEqual
+         (parsed "\"\\u0041\\u00e9\\u4E2D\"")
+         (value (JString "Aé中")))
+    , unit
+      "a surrogate pair is one rune"
+      (assertEqual
+         (parsed "\"\\ud83d\\ude00!\"")
+         (value (JString "😀!")))
+    , unit
+      "a surrogate not in a pair is U+FFFD"
+      (assertEqual
+         (parsed "[\"\\ud83d\", \"\\ude00\", \"\\ud83dx\", \"\\ud83d\\u0041\"]")
+         (value
+            (JArray
+               [ JString "\u{FFFD}"
+               , JString "\u{FFFD}"
+               , JString "\u{FFFD}x"
+               , JString "\u{FFFD}A"
+               ])))
+    , unit
+      "a rune not ASCII's is as it is"
+      (assertEqual (parsed "\"é😀\"") (value (JString "é😀")))
+    ]
+
+numbers : Test
+numbers =
+  group
+    "numbers"
+    [ unit
+      "integers, of any size"
+      (assertEqual
+         (parsed "[0, -0, 7, -12, 123456789012345678901234567890]")
+         (value
+            (JArray
+               [ JInt 0
+               , JInt 0
+               , JInt 7
+               , JInt -12
+               , JInt 123456789012345678901234567890
+               ])))
+    , unit
+      "a fraction or an exponent makes a float"
+      (assertEqual
+         (parsed "[1.5, -0.25, 1e3, 1E-2, -2.5e+1, 2.0, 0.1]")
+         (value
+            (JArray
+               [ JFloat 1.5
+               , JFloat -0.25
+               , JFloat 1000.0
+               , JFloat 0.01
+               , JFloat -25.0
+               , JFloat 2.0
+               , JFloat 0.1
+               ])))
+    , unit
+      "an exponent beyond a float's"
+      (assertEqual
+         (parsed "[1e400, 1e-400, 12345678901234567890e-10]")
+         (value
+            (JArray
+               [ JFloat (1.0e308 * 10.0)
+               , JFloat 0.0
+               , JFloat 1234567890.1234567
+               ])))
+    , unit
+      "an integer read as one, a float rounded down"
+      (assertEqual
+         (List.map
+            (\(s : String) ->
+               either (\e -> Nothing) (\j -> Json.int Nil j) (parsed s))
+            ["42", "-3.5", "\"4\""])
+         [Just 42, Just -4, Nothing])
+    ]
+
+-- (`n` arrays, each inside the one before)
+deep : Int -> String
+deep n = joinWith "" (List.replicate n "[") ^ joinWith "" (List.replicate n "]")
+
+nested : Test
+nested =
+  group
+    "nested values"
+    [ unit
+      "objects and arrays, white space around"
+      (assertEqual
+         (parsed
+            " { \"a\" : [ 1 , { \"b\" : null } , [ ] ] ,\n\t\"c\" : { } , \"d\" : [ true , false ] } ")
+         (value
+            (JObject
+               [ MkPair
+                 "a"
+                 (JArray [JInt 1, JObject [MkPair "b" JNull], JArray Nil])
+               , MkPair "c" (JObject Nil)
+               , MkPair "d" (JArray [JBool True, JBool False])
+               ])))
+    , unit
+      "fields in their order, a key twice kept twice"
+      (assertEqual
+         (parsed "{\"b\":1,\"a\":2,\"b\":3}")
+         (value
+            (JObject
+               [ MkPair "b" (JInt 1)
+               , MkPair "a" (JInt 2)
+               , MkPair "b" (JInt 3)
+               ])))
+    , unit
+      "deep, not on the stack"
+      (assertEqual
+         (either
+            (\e -> 0 - 1)
+            (\j -> 1)
+            (parsed (deep 100000)))
+         1)
+    , unit
+      "read by a path"
+      (assertEqual
+         (either
+            (\e -> Nothing)
+            (\j -> Json.str ["params", "textDocument", "uri"] j)
+            (parsed
+               "{\"params\":{\"textDocument\":{\"uri\":\"file:///a.hf\"}}}"))
+         (Just "file:///a.hf"))
+    ]
+
+errors : Test
+errors =
+  group
+    "errors"
+    [ unit "nothing" (assertEqual (parsed "  ") (expected 2 "a value"))
+    , unit
+      "a comma too many"
+      (assertEqual (parsed "[1,]") (expected 3 "a value"))
+    , unit
+      "an array not closed"
+      (assertEqual (parsed "[1 2]") (expected 3 "',' or ']'"))
+    , unit
+      "a key not a string"
+      (assertEqual (parsed "{a:1}") (expected 1 "a string"))
+    , unit "no colon" (assertEqual (parsed "{\"a\" 1}") (expected 5 "':'"))
+    , unit
+      "an object not closed"
+      (assertEqual (parsed "{\"a\":1") (expected 6 "',' or '}'"))
+    , unit "a leading zero" (assertEqual (parsed "01") (expected 1 "the end"))
+    , unit
+      "a point, no digit"
+      (assertEqual (parsed "1.") (expected 2 "a digit"))
+    , unit
+      "an exponent, no digit"
+      (assertEqual (parsed "1e+") (expected 3 "a digit"))
+    , unit "a sign alone" (assertEqual (parsed "-") (expected 1 "a digit"))
+    , unit "a plus sign" (assertEqual (parsed "+1") (expected 0 "a value"))
+    , unit
+      "a word cut short"
+      (assertEqual (parsed "tru") (expected 0 "a value"))
+    , unit
+      "a string not closed"
+      (assertEqual (parsed "\"abc") (expected 4 "'\"'"))
+    , unit
+      "an escape not JSON's"
+      (assertEqual (parsed "\"\\x\"") (expected 2 "an escape"))
+    , unit
+      "a \\u not of four hexadecimal digits"
+      (assertEqual
+         (parsed "\"\\u12G4\"")
+         (expected 3 "four hexadecimal digits"))
+    , unit
+      "a control character in a string"
+      (assertEqual
+         (parsed "\"a\nb\"")
+         (expected 2 "a character, or an escape of it"))
+    , unit
+      "what is after the value"
+      (assertEqual (parsed "null x") (expected 5 "the end"))
+    , unit
+      "as said"
+      (assertEqual
+         (either (\e -> Json.describe e) (\j -> "") (parsed "[1,]"))
+         "at byte 3: expected a value")
+    ]
+
+-- (a key or a string: what needs escaping among it)
+text : Generator.Generator String
+text =
+  Generator.string
+    0
+    6
+    (MkNonEmptyList 'a' ['"', '\\', '/', '\n', '\t', '\u{1}', ' ', 'é', '😀'])
+
+-- (a value with no array or object in it, nor a float, whose text
+-- `show` may write otherwise than JavaScript does)
+leaf : Generator.Generator Json.Json
+leaf =
+  Generator.frequency
+    (MkNonEmptyList
+       (MkPair
+          2
+          (Generator.map (\i -> JInt i) (Generator.int -1000000 1000000)))
+       [ MkPair 2 (Generator.map (\s -> JString s) text)
+       , MkPair 1 (Generator.map (\b -> JBool b) Generator.bool)
+       , MkPair 1 (Generator.constant JNull)
+       ])
+
+-- (a value, `depth` levels at most)
+json : Int -> Generator.Generator Json.Json
+json depth =
+  if depth <= 0 then leaf
+  else Generator.frequency
+      (MkNonEmptyList
+         (MkPair 2 leaf)
+         [ MkPair
+           1
+           (Generator.map
+              (\xs -> JArray xs)
+              (Generator.list 0 4 (json (depth - 1))))
+         , MkPair
+           1
+           (Generator.map
+              (\fs -> JObject fs)
+              (Generator.list 0 4 (Generator.pair text (json (depth - 1)))))
+         ])
+
+roundTrip : Test
+roundTrip =
+  group
+    "round trip"
+    [ property "what stringify writes is read back" (do
+    j <- forAll (json 3)
+    assertEqual (parsed (Json.stringify j)) (value j))
+    ]

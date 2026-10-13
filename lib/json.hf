@@ -1,0 +1,450 @@
+-- JSON (RFC 8259): a value, read from its text (`parse`), written back
+-- (`stringify`), and read into (`field`, `at`, `str`, ...).  Import it by
+-- a name, `import json as Json`, as its `at`, `int` and `str` are short.
+-- A number without a fraction or an exponent is a `JInt`, of any size,
+-- as an `Int` is; one with either, a `JFloat`.  A string is text: an
+-- escape of a surrogate not in a pair is U+FFFD, as what is not UTF-8 is
+-- in a string heff reads.
+
+import rune as Rune
+
+data Json
+  = JNull
+  | JBool Bool
+  | JInt Int
+  | JFloat Float64
+  | JString String
+  | JArray (List Json)
+  | JObject (List (Pair String Json))
+
+-- Writing
+--------------------------------------------------------------------------------
+
+hexDigit : Int -> String
+hexDigit d = strSlice "0123456789abcdef" d (d + 1)
+
+hex2 : Int -> String
+hex2 c = hexDigit (c / 16) ^ hexDigit (c % 16)
+
+-- (an ASCII character of a string, as JSON writes it)
+escapeAt : String -> Int -> String
+escapeAt s i =
+  if byteAt s i == 34 then "\\\""
+  else if byteAt s i == 92 then "\\\\"
+  else if byteAt s i == 10 then "\\n"
+  else if byteAt s i == 13 then "\\r"
+  else if byteAt s i == 9 then "\\t"
+  else if byteAt s i == 8 then "\\b"
+  else if byteAt s i == 12 then "\\f"
+  else if byteAt s i < 32 then "\\u00" ^ hex2 (byteAt s i)
+  else strSlice s i (i + 1)
+
+-- (a rune not ASCII's, of a string, at `i`: its bytes, as they are;
+-- where they are not UTF-8, U+FFFD, so that what is written is text)
+runeText : String -> Int -> RuneAt -> String
+runeText s i r =
+  if Rune.toInt r.rune == Rune.toInt Rune.replacement
+    then ofRunes [Rune.replacement]
+  else strSlice s i (i + r.width)
+
+escapeGo : String -> Int -> String -> String
+escapeGo s i acc =
+  if i >= strLength s then acc
+  else if byteAt s i < 128 then escapeGo s (i + 1) (acc ^ escapeAt s i)
+  else (let r = runeAt s i in escapeGo s (i + r.width) (acc ^ runeText s i r))
+
+quoted : String -> String
+quoted s = "\"" ^ escapeGo s 0 "" ^ "\""
+
+-- | The text of a value, as JavaScript's `JSON.stringify` writes it: no
+-- | space, an object's fields in their order.
+-- | >>> stringify (JObject [MkPair "a" (JInt 1), MkPair "b" (JArray [JString "x\n", JNull, JBool True])])
+-- | "{\"a\":1,\"b\":[\"x\\n\",null,true]}"
+-- |
+-- | (a string's text: what is not UTF-8 in it, U+FFFD)
+-- | >>> stringify (JString ("é😀" ^ strSlice "😀" 0 1 ^ "\t"))
+-- | "\"é😀\u{FFFD}\\t\""
+stringify : Json -> String
+stringify JNull = "null"
+stringify (JBool b) = if b then "true" else "false"
+stringify (JInt i) = show i
+stringify (JFloat x) = show x
+stringify (JString s) = quoted s
+stringify (JArray xs) = "[" ^ joinWith "," (List.map stringify xs) ^ "]"
+stringify (JObject fs) =
+  "{"
+  ^ joinWith "," (List.map (\p -> quoted (fst p) ^ ":" ^ stringify (snd p)) fs)
+  ^ "}"
+
+-- (as the source writes it)
+reprField : (Json -> String) -> Pair String Json -> String
+reprField repr (MkPair k v) = "MkPair " ^ show k ^ " (" ^ repr v ^ ")"
+
+repr : Json -> String
+repr JNull = "JNull"
+repr (JBool b) = "JBool " ^ show b
+repr (JInt i) = "JInt " ^ (if i < 0 then "(" ^ show i ^ ")" else show i)
+repr (JFloat x) = "JFloat " ^ (if x < 0.0 then "(" ^ show x ^ ")" else show x)
+repr (JString s) = "JString " ^ show s
+repr (JArray xs) = "JArray [" ^ joinWith ", " (List.map repr xs) ^ "]"
+repr (JObject fs) =
+  "JObject [" ^ joinWith ", " (List.map (reprField repr) fs) ^ "]"
+
+-- | A value as the source writes it.
+-- | >>> show (JArray [JInt -1, JString "a", JObject [MkPair "b" JNull]] : Json)
+-- | "JArray [JInt (-1), JString \"a\", JObject [MkPair \"b\" (JNull)]]"
+instance instanceShowJson : Show Json
+instanceShowJson = { show = repr }
+
+-- | A value as JSON writes it, `stringify`.
+instance instanceToStringJson : ToString Json
+instanceToStringJson = { toString = stringify }
+
+-- Parsing
+--------------------------------------------------------------------------------
+
+-- | Where the text is not JSON: the byte at which it is not, and what
+-- | was expected there.
+data ParseError = Expected Int String
+
+showParseError : ParseError -> String
+showParseError (Expected i what) = "Expected " ^ show i ^ " " ^ show what
+
+-- | >>> show (Expected 3 "a value" : ParseError)
+-- | "Expected 3 \"a value\""
+instance instanceShowParseError : Show ParseError
+instanceShowParseError = { show = showParseError }
+
+-- | What a parse error says: `at byte 3: expected a value`.
+describe : ParseError -> String
+describe (Expected i what) = "at byte " ^ show i ^ ": expected " ^ what
+
+isSpaceByte : Int -> Bool
+isSpaceByte c = c == 32 || c == 10 || c == 13 || c == 9
+
+-- (the first byte from `i` on that is not white space)
+skipSpace : String -> Int -> Int
+skipSpace s i = if isSpaceByte (byteAt s i) then skipSpace s (i + 1) else i
+
+isDigitByte : Int -> Bool
+isDigitByte c = 48 <= c && c <= 57
+
+-- (the end of the digits from `i` on)
+digitsEnd : String -> Int -> Int
+digitsEnd s i = if isDigitByte (byteAt s i) then digitsEnd s (i + 1) else i
+
+-- (the integer of the digits from `i` up to `j`, after `acc`)
+digitsValue : String -> Int -> Int -> Int -> Int
+digitsValue s i j acc =
+  if i >= j then acc else digitsValue s (i + 1) j (acc * 10 + byteAt s i - 48)
+
+square : Float64 -> Float64
+square x = x * x
+
+-- (10 to the power `k`, `k` at least 0: exact up to 10^22)
+pow10 : Int -> Float64
+pow10 k =
+  if k == 0 then 1.0
+  else if k % 2 == 1 then 10.0 * pow10 (k - 1)
+  else square (pow10 (k / 2))
+
+-- (`m` times 10 to the power `e`: correctly rounded where `m` is below
+-- 2^53 and `e` within 22 of 0, as the fast path of a C library's
+-- `strtod` is, and within an ulp or so elsewhere)
+scaled : Int -> Int -> Float64
+scaled m e =
+  if e >= 0 then floatFromInt m * pow10 (if e > 400 then 400 else e)
+  else if e < 0 - 300
+    then floatFromInt m
+      /. pow10 300
+      /. pow10 (if e < 0 - 700 then 400 else 0 - e - 300)
+  else floatFromInt m /. pow10 (0 - e)
+
+-- (the exponent's part of a number from `i`, `e` or `E` there: its end,
+-- and its value, or -1 where it has no digits)
+exponentEnd : String -> Int -> Int
+exponentEnd s i =
+  if byteAt s i == 43 || byteAt s i == 45 then digitsEnd s (i + 1)
+  else digitsEnd s i
+
+exponentValue : String -> Int -> Int -> Int
+exponentValue s i j =
+  if byteAt s i == 45 then 0 - digitsValue s (i + 1) j 0
+  else if byteAt s i == 43 then digitsValue s (i + 1) j 0
+  else digitsValue s i j 0
+
+-- (a number's text from `start`, its digits from `d` up to `p` -- the
+-- point, or where the fraction would be -- its fraction's up to `f`, and
+-- its exponent from `f` up to `end`; a float)
+floatOf : String -> Int -> Int -> Int -> Int -> Int -> Float64
+floatOf s start d p f end =
+  let whole : Int = digitsValue s d p 0
+  in let fraction : Int = if f > p then digitsValue s (p + 1) f whole else whole
+  in let m : Int = if byteAt s start == 45 then 0 - fraction else fraction
+  in let places : Int = if f > p then f - p - 1 else 0
+  in let e : Int = if end > f then exponentValue s (f + 1) end else 0
+  in scaled m (e - places)
+
+-- (a number's text, from `start`, its integer's digits from `d` up to
+-- `p`, then perhaps a fraction and an exponent)
+numberAfterDigits : String
+                  -> Int
+                  -> Int
+                  -> Int
+                  -> Either ParseError (Pair Json Int)
+numberAfterDigits s start d p =
+  let f : Int = if byteAt s p == 46 then digitsEnd s (p + 1) else p
+  in let hasExponent : Bool = byteAt s f == 101 || byteAt s f == 69
+  in let end : Int = if hasExponent then exponentEnd s (f + 1) else f
+  in if f == p + 1 then Left (Expected f "a digit")
+  else if hasExponent && not (isDigitByte (byteAt s (end - 1)))
+    then Left (Expected end "a digit")
+  else if f == p && not hasExponent
+    then (let n : Int = digitsValue s d p 0
+          in Right
+            (MkPair (JInt (if byteAt s start == 45 then 0 - n else n)) end))
+  else Right (MkPair (JFloat (floatOf s start d p f end)) end)
+
+-- (a number at `i`, and where it ends)
+numberAt : String -> Int -> Either ParseError (Pair Json Int)
+numberAt s i =
+  let d : Int = if byteAt s i == 45 then i + 1 else i
+  in if byteAt s d == 48 then numberAfterDigits s i d (d + 1)
+  else if isDigitByte (byteAt s d) then numberAfterDigits s i d (digitsEnd s d)
+  else Left (Expected d (if d == i then "a value" else "a digit"))
+
+hexValue : Int -> Int
+hexValue c =
+  if 48 <= c && c <= 57 then c - 48
+  else if 97 <= c && c <= 102 then c - 87
+  else if 65 <= c && c <= 70 then c - 55
+  else 0 - 65536
+
+-- (the four hexadecimal digits at `i`: their value, or below 0)
+hex4 : String -> Int -> Int
+hex4 s i =
+  hexValue (byteAt s i) * 4096
+  + hexValue (byteAt s (i + 1)) * 256
+  + hexValue (byteAt s (i + 2)) * 16
+  + hexValue (byteAt s (i + 3))
+
+-- (a `\u` escape's text, the escape's `u` at `i`: a surrogate pair's
+-- rune, the second's escape right after the first; one not in a pair,
+-- U+FFFD)
+unicodeEscape : String -> Int -> Either ParseError (Pair String Int)
+unicodeEscape s i =
+  let c : Int = hex4 s (i + 1)
+  in let lo : Int = hex4 s (i + 7)
+  in if c < 0 then Left (Expected (i + 1) "four hexadecimal digits")
+  else if 55296 <= c
+  && c < 56320
+  && byteAt s (i + 5) == 92
+  && byteAt s (i + 6) == 117
+  && 56320 <= lo
+  && lo < 57344
+    then Right
+        (MkPair
+           (ofRunes [Rune.fromInt (65536 + (c - 55296) * 1024 + (lo - 56320))])
+           (i + 11))
+  else Right (MkPair (ofRunes [Rune.fromInt c]) (i + 5))
+
+-- (an escape's text, its letter at `i`, and where it ends)
+escapeText : String -> Int -> Either ParseError (Pair String Int)
+escapeText s i =
+  let c : Int = byteAt s i
+  in if c == 34 then Right (MkPair "\"" (i + 1))
+  else if c == 92 then Right (MkPair "\\" (i + 1))
+  else if c == 47 then Right (MkPair "/" (i + 1))
+  else if c == 110 then Right (MkPair "\n" (i + 1))
+  else if c == 116 then Right (MkPair "\t" (i + 1))
+  else if c == 114 then Right (MkPair "\r" (i + 1))
+  else if c == 98 then Right (MkPair "\x08" (i + 1))
+  else if c == 102 then Right (MkPair "\x0c" (i + 1))
+  else if c == 117 then unicodeEscape s i
+  else Left (Expected i "an escape")
+
+-- (a string's text, read from `i` on: what is read so far `acc`, then
+-- the bytes from `start` up to `i`)
+stringFrom : String
+           -> Int
+           -> Int
+           -> String
+           -> Either ParseError (Pair String Int)
+stringFrom s start i acc =
+  let c : Int = byteAt s i
+  in if c == 34 then Right (MkPair (acc ^ strSlice s start i) (i + 1))
+  else if c == 92
+    then (case escapeText s (i + 1) of
+          Right (MkPair t j) -> stringFrom s j j (acc ^ strSlice s start i ^ t)
+          Left e -> Left e)
+  else if c < 0 then Left (Expected i "'\"'")
+  else if c < 32 then Left (Expected i "a character, or an escape of it")
+  else stringFrom s start (i + 1) acc
+
+-- (a string, its `"` at `i`, and where it ends)
+stringAt : String -> Int -> Either ParseError (Pair String Int)
+stringAt s i =
+  if byteAt s i == 34 then stringFrom s (i + 1) (i + 1) ""
+  else Left (Expected i "a string")
+
+-- What is being read: an array, its elements so far (the last first), or
+-- an object, its fields so far and the key of the one being read
+data Frame
+  = InArray (List Json)
+  | InObject (List (Pair String Json)) String
+
+-- A step of the parse: a value to read at a byte, inside the frames; a
+-- value read, up to a byte; or the end
+data Step
+  = Value Int (List Frame)
+  | Got Json Int (List Frame)
+  | Finished Json
+  | Failed ParseError
+
+-- (after a field's key, `k`, read up to `j`: its `:`, then its value
+-- inside the object, its fields so far `fs`)
+colonThen : String
+          -> List (Pair String Json)
+          -> List Frame
+          -> Either ParseError (Pair String Int)
+          -> Step
+colonThen s fs frames (Right (MkPair k j)) =
+  let c : Int = skipSpace s j
+  in if byteAt s c == 58 then Value (c + 1) (Cons (InObject fs k) frames)
+  else Failed (Expected c "':'")
+colonThen s fs frames (Left e) = Failed e
+
+-- (a field's key from `i`, its `:`, then its value)
+keyThen : String -> Int -> List (Pair String Json) -> List Frame -> Step
+keyThen s i fs frames =
+  if byteAt s i == 34 then colonThen s fs frames (stringAt s i)
+  else Failed (Expected i "a string")
+
+-- (a word, `null`, `true` or `false`, at `i`)
+word : String -> Int -> String -> Json -> List Frame -> Step
+word s i w v frames =
+  if strEq (strSlice s i (i + strLength w)) w
+    then Got v (i + strLength w) frames
+  else Failed (Expected i "a value")
+
+-- (what a reading of a number or a string makes)
+read : {a : Type}
+     -> (a -> Json)
+     -> List Frame
+     -> Either ParseError (Pair a Int)
+     -> Step
+read make frames (Right (MkPair x j)) = Got (make x) j frames
+read make frames (Left e) = Failed e
+
+-- (a value, at `i`)
+valueAt : String -> Int -> List Frame -> Step
+valueAt s i frames =
+  let c : Int = byteAt s i
+  in if c == 34 then read (\(x : String) -> JString x) frames (stringAt s i)
+  else if c == 123
+    then (let j : Int = skipSpace s (i + 1)
+          in if byteAt s j == 125 then Got (JObject Nil) (j + 1) frames
+          else keyThen s j Nil frames)
+  else if c == 91
+    then (let j : Int = skipSpace s (i + 1)
+          in if byteAt s j == 93 then Got (JArray Nil) (j + 1) frames
+          else Value j (Cons (InArray Nil) frames))
+  else if c == 110 then word s i "null" JNull frames
+  else if c == 116 then word s i "true" (JBool True) frames
+  else if c == 102 then word s i "false" (JBool False) frames
+  else read (\(v : Json) -> v) frames (numberAt s i)
+
+-- (a value read, `v`, up to `i`, inside a frame)
+gotIn : String -> Json -> Int -> Frame -> List Frame -> Step
+gotIn s v i (InArray xs) frames =
+  if byteAt s i == 44 then Value (i + 1) (Cons (InArray (Cons v xs)) frames)
+  else if byteAt s i == 93
+    then Got (JArray (List.reverse (Cons v xs))) (i + 1) frames
+  else Failed (Expected i "',' or ']'")
+gotIn s v i (InObject fs k) frames =
+  if byteAt s i == 44
+    then keyThen s (skipSpace s (i + 1)) (Cons (MkPair k v) fs) frames
+  else if byteAt s i == 125
+    then Got (JObject (List.reverse (Cons (MkPair k v) fs))) (i + 1) frames
+  else Failed (Expected i "',' or '}'")
+
+-- (a value read, `v`, up to `i`)
+gotAt : String -> Json -> Int -> List Frame -> Step
+gotAt s v i Nil =
+  if i >= strLength s then Finished v else Failed (Expected i "the end")
+gotAt s v i (Cons f frames) = gotIn s v i f frames
+
+steps : String -> Step -> Either ParseError Json
+steps s (Value i frames) = steps s (valueAt s (skipSpace s i) frames)
+steps s (Got v i frames) = steps s (gotAt s v (skipSpace s i) frames)
+steps s (Finished v) = Right v
+steps s (Failed e) = Left e
+
+-- | The value a text is, white space around it; or where it is not one.
+-- | It reads as it goes, a value inside another kept on a list, not on
+-- | the stack, so that however deep the text it does not overflow.
+-- | >>> parse " {\"a\": [1, -2.5e1, \"\\u00e9\\ud83d\\ude00\"], \"b\": null} "
+-- | Right (JObject [MkPair "a" (JArray [JInt 1, JFloat (-25.0), JString "é😀"]), MkPair "b" (JNull)])
+-- | >>> parse "[1, 2"
+-- | Left (Expected 5 "',' or ']'")
+parse : String -> Either ParseError Json
+parse s = steps s (Value 0 Nil)
+
+-- Reading
+--------------------------------------------------------------------------------
+
+-- | A field of an object.
+field : String -> Json -> Maybe Json
+field k (JObject fs) = case List.find
+    (\(p : Pair String Json) -> strEq (fst p) k)
+    fs of
+  Just p -> Just (snd p)
+  Nothing -> Nothing
+field k _ = Nothing
+
+-- | The value at a path of fields.
+-- | >>> at ["a", "b"] (JObject [MkPair "a" (JObject [MkPair "b" (JInt 1)])])
+-- | Just (JInt 1)
+at : List String -> Json -> Maybe Json
+at Nil j = Just j
+at (Cons k ks) j = case field k j of
+  Just v -> at ks v
+  Nothing -> Nothing
+
+str : List String -> Json -> Maybe String
+str ks j = case at ks j of
+  Just (JString s) -> Just s
+  _ -> Nothing
+
+-- | An integer at a path: a float's, rounded down.
+int : List String -> Json -> Maybe Int
+int ks j = case at ks j of
+  Just (JInt i) -> Just i
+  Just (JFloat x) -> Just (floor x)
+  _ -> Nothing
+
+bool : List String -> Json -> Maybe Bool
+bool ks j = case at ks j of
+  Just (JBool b) -> Just b
+  _ -> Nothing
+
+arr : List String -> Json -> Maybe (List Json)
+arr ks j = case at ks j of
+  Just (JArray xs) -> Just xs
+  _ -> Nothing
+
+-- Making
+--------------------------------------------------------------------------------
+
+-- | An object, of its fields in order.
+obj : List (Pair String Json) -> Json
+obj fs = JObject fs
+
+kv : String -> Json -> Pair String Json
+kv k v = MkPair k v
+
+num : Int -> Json
+num i = JInt i
+
+jstr : String -> Json
+jstr s = JString s

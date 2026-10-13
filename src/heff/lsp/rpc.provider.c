@@ -3,10 +3,12 @@
 // `Content-Length: n` header, a blank line, then n bytes of JSON; stdout
 // carries only the messages, logs go to stderr -- and what of the host a
 // language server asks for (the shape of a provider is said in
-// lib/std/io.provider.c).  Its strings are text, a host of text's --
-// JSON's, and the paths and URIs a client names, or that are made of
-// them (`heff_str_text`, `heff_cstr_text`) -- but for what it sends and
-// logs, which is written out as it is (`heff_bytes`, `heff_put`).
+// lib/std/io.provider.c).  A message is given as its body, its JSON
+// read in heff (lib/json.hf).  Its strings are text, a host of text's --
+// a message's body, and the paths and URIs a client names, or that are
+// made of them (`heff_str_text`, `heff_cstr_text`) -- but for what it
+// sends and logs, which is written out as it is (`heff_bytes`,
+// `heff_put`).
 
 #include <dirent.h>
 #ifndef _WIN32
@@ -19,172 +21,6 @@
 #ifdef _WIN32
 #define lstat stat
 #endif
-
-// A message's JSON, as src/heff/util/json.hf's `Json`
-// ---------------------------------------------------------------------
-
-typedef struct { const char *s, *end; } Json;
-
-static void json_ws(Json *j) {
-  while (j->s < j->end && (*j->s == ' ' || *j->s == '\t' || *j->s == '\n' || *j->s == '\r')) j->s++;
-}
-
-static int json_lit(Json *j, const char *w) {
-  size_t n = strlen(w);
-  if ((size_t)(j->end - j->s) < n || memcmp(j->s, w, n) != 0) return 0;
-  j->s += n;
-  return 1;
-}
-
-static void json_utf8(Buf *b, uint32_t u) {
-  char c[4];
-  size_t n;
-  if (u < 0x80) { c[0] = (char)u; n = 1; }
-  else if (u < 0x800) { c[0] = (char)(0xC0 | (u >> 6)); c[1] = (char)(0x80 | (u & 0x3F)); n = 2; }
-  else if (u < 0x10000) { c[0] = (char)(0xE0 | (u >> 12)); c[1] = (char)(0x80 | ((u >> 6) & 0x3F)); c[2] = (char)(0x80 | (u & 0x3F)); n = 3; }
-  else { c[0] = (char)(0xF0 | (u >> 18)); c[1] = (char)(0x80 | ((u >> 12) & 0x3F)); c[2] = (char)(0x80 | ((u >> 6) & 0x3F)); c[3] = (char)(0x80 | (u & 0x3F)); n = 4; }
-  buf_put(b, c, n);
-}
-
-static int json_hex4(Json *j, uint32_t *u) {
-  if (j->end - j->s < 4) return 0;
-  *u = 0;
-  for (int i = 0; i < 4; i++) {
-    char c = *j->s++;
-    *u <<= 4;
-    if (c >= '0' && c <= '9') *u |= (uint32_t)(c - '0');
-    else if (c >= 'a' && c <= 'f') *u |= (uint32_t)(c - 'a' + 10);
-    else if (c >= 'A' && c <= 'F') *u |= (uint32_t)(c - 'A' + 10);
-    else return 0;
-  }
-  return 1;
-}
-
-// (a string's text, its escapes undone: 0 if it is not one)
-static V json_string(Json *j) {
-  if (j->s >= j->end || *j->s != '"') return 0;
-  j->s++;
-  Buf b = {0};
-  for (;;) {
-    if (j->s >= j->end) { free(b.s); return 0; }
-    char c = *j->s++;
-    if (c == '"') break;
-    if (c != '\\') { buf_put(&b, &c, 1); continue; }
-    if (j->s >= j->end) { free(b.s); return 0; }
-    char e = *j->s++;
-    uint32_t u;
-    switch (e) {
-    case '"': case '\\': case '/': buf_put(&b, &e, 1); break;
-    case 'b': buf_put(&b, "\b", 1); break;
-    case 'f': buf_put(&b, "\f", 1); break;
-    case 'n': buf_put(&b, "\n", 1); break;
-    case 'r': buf_put(&b, "\r", 1); break;
-    case 't': buf_put(&b, "\t", 1); break;
-    case 'u':
-      if (!json_hex4(j, &u)) { free(b.s); return 0; }
-      if (u >= 0xD800 && u < 0xDC00 && j->end - j->s >= 6 && j->s[0] == '\\' && j->s[1] == 'u') {
-        Json save = *j;
-        uint32_t lo;
-        j->s += 2;
-        if (json_hex4(j, &lo) && lo >= 0xDC00 && lo < 0xE000) u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
-        else *j = save;
-      }
-      // (a surrogate not in a pair, U+FFFD, as JavaScript's string has
-      // it, made UTF-8)
-      if (u >= 0xD800 && u < 0xE000) u = 0xFFFD;
-      json_utf8(&b, u);
-      break;
-    default: free(b.s); return 0;
-    }
-  }
-  V s = heff_str_text_n(b.s ? b.s : "", (int64_t)b.n);
-  free(b.s);
-  return s;
-}
-
-static V json_value(Json *j);
-
-// (a list of what `item` reads, between `open` and `close`)
-static V json_items(Json *j, char close, V (*item)(Json *)) {
-  j->s++;
-  int64_t n = 0, cap = 8;
-  V *xs = heff_alloc(cap * sizeof(V));
-  json_ws(j);
-  if (j->s < j->end && *j->s == close) j->s++;
-  else
-    for (;;) {
-      V x = item(j);
-      if (!x) goto bad;
-      if (n == cap) {
-        V *x2 = heff_alloc(cap * 2 * sizeof(V));
-        memcpy(x2, xs, n * sizeof(V));
-        free(xs);
-        xs = x2;
-        cap *= 2;
-      }
-      xs[n++] = x;
-      json_ws(j);
-      if (j->s < j->end && *j->s == ',') { j->s++; continue; }
-      if (j->s < j->end && *j->s == close) { j->s++; break; }
-      goto bad;
-    }
-  V l = NTAG(TAG_Nil);
-  for (int64_t i = n - 1; i >= 0; i--) l = heff_cons(xs[i], l);
-  free(xs);
-  return l;
-bad:
-  for (int64_t i = 0; i < n; i++) heff_drop(xs[i]);
-  free(xs);
-  return 0;
-}
-
-static V json_member(Json *j) {
-  json_ws(j);
-  V k = json_string(j);
-  if (!k) return 0;
-  json_ws(j);
-  if (j->s >= j->end || *j->s != ':') { heff_drop(k); return 0; }
-  j->s++;
-  V v = json_value(j);
-  if (!v) { heff_drop(k); return 0; }
-  V f[2] = { k, v };
-  return heff_tag(TAG_MkPair, 2, f);
-}
-
-static V json_one(int tag, V x) { return x ? heff_tag(tag, 1, &x) : 0; }
-
-// (a number: an integer an Int, as JavaScript's Number.isInteger says)
-static V json_number(Json *j) {
-  char *e;
-  double d = strtod(j->s, &e);
-  if (e == j->s || e > j->end) return 0;
-  j->s = e;
-  if (d == floor(d) && fabs(d) < 2305843009213693952.0) return json_one(TAG_JInt, MK_INT((int64_t)d));
-  return json_one(TAG_JFloat, heff_flt(d));
-}
-
-static V json_value(Json *j) {
-  json_ws(j);
-  if (j->s >= j->end) return 0;
-  switch (*j->s) {
-  case 'n': return json_lit(j, "null") ? NTAG(TAG_JNull) : 0;
-  case 't': return json_lit(j, "true") ? json_one(TAG_JBool, NTAG(TAG_True)) : 0;
-  case 'f': return json_lit(j, "false") ? json_one(TAG_JBool, NTAG(TAG_False)) : 0;
-  case '"': return json_one(TAG_JString, json_string(j));
-  case '[': return json_one(TAG_JArray, json_items(j, ']', json_value));
-  case '{': return json_one(TAG_JObject, json_items(j, '}', json_member));
-  default: return json_number(j);
-  }
-}
-
-// (a body as JSON: 0 if it is not)
-static V json_parse(const char *s, size_t n) {
-  Json j = { s, s + n };
-  V v = json_value(&j);
-  json_ws(&j);
-  if (v && j.s != j.end) { heff_drop(v); return 0; }
-  return v;
-}
 
 // The messages, read from stdin
 // ---------------------------------------------------------------------
@@ -253,29 +89,28 @@ static int rpc_ready(int wait) {
 #endif
 }
 
-// (the next event: a message, the time waited for, `ms`, passing first
-// (none, below 0), or the client gone)
+// (the next event: a message's body (its JSON is read by rpc.hf), the
+// time waited for, `ms`, passing first (none, below 0), or the client
+// gone)
 static V rpc_await(int64_t ms) {
   int64_t until = rpc_now() + ms;
   for (;;) {
     size_t n;
     char *body = rpc_take(&n);
     if (body) {
-      V v = json_parse(body, n);
+      V v = heff_str_text_n(body, (int64_t)n);
       free(body);
-      if (v) return heff_tag(TAG_Message, 1, &v);
-      fputs("heff lsp: not JSON\n", stderr);
-      continue;
+      return heff_tag(TAG_Arrived, 1, &v);
     }
-    if (rpc_closed) return NTAG(TAG_Closed);
+    if (rpc_closed) return NTAG(TAG_Gone);
     int wait = -1;
     if (ms >= 0) {
       int64_t left = until - rpc_now();
-      if (left <= 0) return NTAG(TAG_Timeout);
+      if (left <= 0) return NTAG(TAG_Waited);
       wait = left > 0x7fffffff ? 0x7fffffff : (int)left;
     }
     int r = rpc_ready(wait);
-    if (r == 0) return NTAG(TAG_Timeout);
+    if (r == 0) return NTAG(TAG_Waited);
     if (r < 0) continue;
     char chunk[65536];
     ssize_t got = read(0, chunk, sizeof chunk);
