@@ -69,6 +69,11 @@ build : Build
 build = { backend = C, run = "main" }
 ```
 
+A project may have programs of both: `app/server/` through `C`, and
+`app/client/` a `Page` whose script the server serves, the API between
+them an effect in a module of `src/` both import -- see [a client and
+its server](remote.md), and `examples/notes/`.
+
 heff itself is such a program: `app/heff/build.hf` ships `lib` and
 `package.hf`, so that `heff install` lays the heff home out as a
 release is -- `bin/heff`, and beside it what heff finds there, its

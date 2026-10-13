@@ -415,7 +415,9 @@ never changed once made.  The module `bytes`
 `index` (the byte at `i`, a `UInt8`, if there is one), `slice` (as a
 string's, `strSlice`: clamped, a negative index from the end),
 `append` and `concat`, `empty`, `fromList` and `toList` (of
-`UInt8`s), `fromString` (a string's bytes, as they are) and `eq` (as
+`UInt8`s), `fromString` (a string's bytes, as they are), `asString`
+(the bytes as a string, as they are, UTF-8 or not: `fromString` undone)
+and `eq` (as
 `==`, whose instance, `instanceEqualityBytes`, is the prelude's: no
 import is needed for it).  Their `show` and `toString` are the
 prelude's too: `show` writes them as a binary does

@@ -20,8 +20,8 @@ library is split by backend ([library.md](library.md#the-batteries)):
 - `std.ref` and `std.time` are needed on both sides: one module each,
   with a provider in C and one in JavaScript of no `$host`;
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
-  (`$host = "page"`) and `browser.js`, which has no effect, only its
-  type.
+  and `browser.http` (`$host = "page"`), and `browser.js`, which has no
+  effect, only its type.
 
 What a backend has no side of is refused where it is imported, before
 the program's effect is looked at: by `heff compile --backend=c` (and

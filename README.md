@@ -95,6 +95,8 @@ heff fmt src/hello/*.hf    # format in place
 - [The library](docs/library.md): `lib/`, the batteries of `lib/std/`,
   the examples
 - [Projects](docs/projects.md): `package.hf`, packages, programs
+- [A client and its server](docs/remote.md): a page and a C program of
+  one project, an effect's operations over the wire
 - [Commands](docs/commands.md): every command, the formatter
 - [Tests](docs/tests.md): doc tests, watches, unit tests and properties
 - [Providers](docs/providers.md): an effect's JavaScript and C sides,

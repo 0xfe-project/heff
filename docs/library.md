@@ -26,7 +26,9 @@ are imported by their names:
 
 - `co` ([effects](language.md#effects)), and effects made with it:
   `state`, `exn` (with `exnDiv` and `exnMod`, a division that throws by
-  zero), `parallel` and `green` ([green threads](#green-threads));
+  zero, and `attempt`, a handler of it: what was thrown and heard by
+  no `catch`, `Left`), `parallel` and `green` ([green
+  threads](#green-threads));
 - `array` ([arrays](#arrays)), `map` and `set` (a map's `insertWith`
   and `alter` change what a key is bound to in one walk down the tree,
   where a `lookup` and an `insert` take two: `Map.insertWith
@@ -61,6 +63,9 @@ are imported by their names:
 - `bytes`, the operations of `Bytes` ([bytes](language.md#bytes)),
   which a binary, `b[...]`, writes and takes apart
   ([binaries](language.md#binaries));
+- `wire` ([the wire](#the-wire)), values as bytes and back, the same
+  bytes on every backend, and `remote`, an effect's operations sent
+  over it to another program ([a client and its server](remote.md));
 - `bits`, the operations of `Bits`, a bitstring of any length
   ([bits](language.md#bits)): `length` (in bits), `index` (a bit, as a
   `Bool`), `toList` and `fromList`, `toBytes` (`Just` the bytes, of a
@@ -122,7 +127,8 @@ What is above, in `lib/`, is pure, the same on every backend.
   now and finished later, for [green threads](#green-threads)):
   effects of the system, C's alone;
 - `std.http.server`, an HTTP/1.1 server written over `std.net`, C's
-  as `std.net` is;
+  as `std.net` is, and `std.remote`, an API's server over it and its
+  client by `std.http` ([a client and its server](remote.md));
 - `std.ref` (the world's cells) and `std.time`: effects needed on both
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
@@ -136,6 +142,9 @@ What is above, in `lib/`, is pure, the same on every backend.
 `esm`):
 
 - `browser.dom` (web pages);
+- `browser.http` (`fetch`, an HTTP client of `Bytes` bodies, as
+  `std.http`'s shapes are) and `browser.remote`, an API's client by it
+  ([a client and its server](remote.md));
 - `browser.js` (JavaScript's strings, `JSString`).
 
 A program imports only its own half: a C program that imports a module
@@ -150,7 +159,8 @@ An effect's JavaScript side is in `M.provider.js` beside `M.hf`, its C
 side in `M.provider.c`: see [providers.md](providers.md).
 
 `std.http` is an HTTP client, on the C backend alone (a page fetches by
-`browser.dom`'s `fetchText`, the browser's `fetch`).  Import it by a
+`browser.http`'s `send`, or `browser.dom`'s `fetchText`, the browser's
+`fetch`).  Import it by a
 name, `import std.http as Http`: a `Request` -- `{ url = u }`, or with its `method`, `headers` (a name and
 a value each), `body` (`Bytes`), `timeout` (milliseconds in all, 0 for
 none) and `follow` (redirects, followed unless `False`) -- is sent by
@@ -477,10 +487,74 @@ socket are, others' wait where they are, every thread with them.  It is one reac
 threads in a thread of std.thread's are that thread's own
 ([threads.md](threads.md#green-threads-in-threads)).
 
+## The wire
+
+`wire` (`import wire as Wire`) is values as bytes and bytes as values
+again: one theory, `Wire`, for both ways --
+
+```haskell
+theory Wire (a : Type) where
+  shape : String
+  encode : a -> Bytes
+  decode : Bytes -> Int -> Maybe (Pair a Int)
+```
+
+-- `encode` a value's bytes, `decode` a value read from the byte `at`
+and where it ends, `shape` a name of how the type is written
+(`"List (Pair String Int)"`), of which lib/remote.hf makes an API's
+fingerprint.  `Wire.encode x`, `Wire.decode b at`, `Wire.decodeAll b`
+(the value all the bytes are, `Nothing` where they are none, or more)
+and `Wire.shapeOf T` find the instance; the readers' `succeed`,
+`failure`, `andThen` and `converted` put one of a type of one's own
+together, `fixed n read` reads `n` bytes by a binary's pattern,
+`natural` and `readNatural` write and read a length.
+
+The same value is the same bytes on every backend, the contract
+between a C program and a page's script (test/programs/wire.hf holds
+both to the interpreter):
+
+| Type | Bytes |
+| --- | --- |
+| `Int` | zigzag (0, -1, 1, -2 as 0, 1, 2, 3), then LEB128: of any size |
+| `Int8` .. `Int64`, `UInt8` .. `UInt64` | its bits, big-endian, two's complement |
+| `Float64`, `Float32` | IEEE's 64 or 32 bits, big-endian, a NaN the quiet one |
+| `Rune` | its code point, 32 bits |
+| `Bool` | a byte, 0 or 1 |
+| `Unit` | none |
+| `String`, `Bytes` | its length (LEB128), then its bytes, as they are |
+| `Bits` | its length in bits, then its bits, the last byte's left over 0 |
+| `List`, `Array` | its length, then each element |
+| `Maybe` | a byte, 0 `Nothing` or 1 `Just`, then the value |
+| `Either` | a byte, 0 `Left` or 1 `Right`, then the value |
+| `Pair` | the first, then the second |
+| `Map`, `HashMap` | its size, then each key and value, in its `toList`'s order |
+
+A map's instance wants its keys' `Order` (`Int`'s, a fixed-width
+type's), a hash map's their `Hash` and `Equality`.  A type of one's own
+is written as another, by `via`: a record as pairs, a type of more
+constructors as `Either`s, its shape theirs.
+
+```haskell
+import wire as Wire
+
+type Note = { id : Int, text : String, done : Bool }
+
+instance instanceWireNote : Wire.Wire Note
+instanceWireNote =
+  Wire.via
+    (\(n : Note) -> MkPair n.id (MkPair n.text n.done))
+    (\p -> { id = fst p, text = fst (snd p), done = snd (snd p) })
+```
+
+An instance is in scope where its module is imported, not further: a
+module that uses one of `wire`'s imports `wire` itself.
+
 ## Examples
 
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.
-`examples/testbridge/` is a project of another kind, built by `heff
+`examples/notes/` is a page and its server, one project built by `heff
+build` there ([a client and its server](remote.md)); test/app-run.mjs
+runs both.  `examples/testbridge/` is a project of another kind, built by `heff
 build` there: a Linux program, through C, that makes a bridge and a
 veth pair by rtnetlink, its socket's calls a provider of its own.
