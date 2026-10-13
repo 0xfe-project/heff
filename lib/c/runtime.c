@@ -2706,6 +2706,55 @@ static V heff_bytesToString(V a) {
   return s;
 }
 
+// (what a binary's segment reads and writes, `b[x::16-little]`: an
+// integer of `n` bits, 0 to 64, its two's complement, the most
+// significant bit first -- or its bytes the least first, where the flags
+// `f` have 1 (`little`, `n` a multiple of 8) -- read as signed where `f`
+// has 2.  heff.elab.clauses checks that it is there before it is read.)
+static V heff_bytesIntAt(V a, V o, V n, V f) {
+  Str *x = (Str *)a;
+  int64_t at = INT_OF(o), bits = INT_OF(n), flags = INT_OF(f);
+  if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > x->len * 8) return heff_abandon();
+  uint64_t u = 0;
+  if ((at & 7) == 0 && (bits & 7) == 0) {
+    const uint8_t *p = x->s + (at >> 3);
+    int64_t k = bits >> 3;
+    for (int64_t i = 0; i < k; i++)
+      u = (u << 8) | p[(flags & 1) ? k - 1 - i : i];
+  } else {
+    for (int64_t i = at; i < at + bits; i++)
+      u = (u << 1) | ((x->s[i >> 3] >> (7 - (i & 7))) & 1);
+  }
+  heff_drop(a);
+  if ((flags & 2) && bits > 0 && bits < 64 && (u >> (bits - 1)) & 1) return heff_int((int64_t)(u | (~(uint64_t)0 << bits)));
+  if ((flags & 2) && bits == 64) return heff_int((int64_t)u);
+  return heff_int_u64(u);
+}
+
+// (the integer `v`, its low `n` bits (a multiple of 8, up to 64), as
+// bytes: the most significant first, or the least where `f` has 1)
+static V heff_bytesOfInt(V n, V f, V v) {
+  int64_t bits = INT_OF(n), flags = INT_OF(f);
+  if (!IS_INT(n) || bits < 0 || bits > 64 || (bits & 7)) return heff_abandon();
+  uint64_t u = heff_int_low64(v);
+  heff_drop(v);
+  int64_t k = bits >> 3;
+  Str *s = heff_bytes_new(k);
+  for (int64_t i = 0; i < k; i++)
+    s->s[(flags & 1) ? i : k - 1 - i] = (uint8_t)(u >> (8 * i));
+  return (V)s;
+}
+
+// (whether the bytes `b` are those of `a` at `o`)
+static V heff_bytesHasAt(V a, V o, V b) {
+  Str *x = (Str *)a, *y = (Str *)b;
+  int64_t at = INT_OF(o);
+  int r = IS_INT(o) && at >= 0 && at <= x->len - y->len && (y->len == 0 || memcmp(x->s + at, y->s, (size_t)y->len) == 0);
+  heff_drop(a);
+  heff_drop(b);
+  return heff_bool(r);
+}
+
 // What providers share
 // ---------------------------------------------------------------------
 
