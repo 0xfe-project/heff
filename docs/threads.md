@@ -1,6 +1,6 @@
 # Threads
 
-`lib/parallel.hf`'s `Par` says what may run at once; a handler says how
+`lib/parallel.hf`'s `Parallel` says what may run at once; a handler says how
 it runs.  In C, a provider may run heff in threads of its own, truly at
 once (#36).  The library's is `std.thread` (`lib/std/thread.hf`, its
 provider `thread.provider.c`); `test/node/threads.hf` uses all of it.
@@ -38,11 +38,11 @@ program = do
   copy each, its index its answer; `gather v`: in thread 0, every
   thread's `v`, in order, every other thread ending there.  Spreads
   nest: a gather joins its own spread's threads.
-- `inThreads a b e`: `Par` handled into `Co e`, each side a thread (a
+- `inThreads a b e`: `Parallel` handled into `Co e`, each side a thread (a
   spread into two, joined again); `threaded` is its algebra, for a
   handler of one's own.  As with any handler into `Co e`, a side's pure
   work is done where it is handled, before the spread, unless it comes
-  after an operation or after `later`: `parIn (later (\u -> fib n))
+  after an operation or after `later`: `parallelIn (later (\u -> fib n))
   ...`.
 - A task that fails (`abandon`, say) stops the others taking more, and
   the caller fails as the first that failed, in the list's order, would
@@ -146,7 +146,7 @@ holds it.
 ## What is safe, and what is not
 
 Safe, in threads at once: pure code, all of it -- a task, a side of a
-`Par`, a spread's thread -- and the definitions it reads; `std.io`
+`Parallel`, a spread's thread -- and the definitions it reads; `std.io`
 (a write is one `fwrite`, whole: C locks the stream); `std.ref`'s cells (locked,
 a value going in and out a copy); the world's table of handles
 (locked).  A task of a pool is pure: it has no effects to run.

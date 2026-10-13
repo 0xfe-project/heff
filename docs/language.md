@@ -614,9 +614,9 @@ runs where it is reached, by value: an argument where the computation
 is built (`pure (fib n)` computes `fib n` there), a step after a `bind`
 as the computation is handled.  Only what comes after an operation is
 left to the handler's monad, so a handler into `Co e` that puts a part
-elsewhere -- `lib/parallel.hf`'s `Par`, a side in a process of its own
+elsewhere -- `lib/parallel.hf`'s `Parallel`, a side in a process of its own
 -- finds its pure work done already, unless it comes after `later`:
-`parIn (later (\u -> fib n)) (later (\u -> fib m))`.
+`parallelIn (later (\u -> fib n)) (later (\u -> fib m))`.
 
 An effect the world has is carried out by a provider, its JavaScript
 and C sides beside its module: see [providers.md](providers.md).

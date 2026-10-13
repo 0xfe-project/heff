@@ -122,7 +122,7 @@ What is above, in `lib/`, is pure, the same on every backend.
 - `std.io` (the standard streams), `std.filesystem`, `std.process`,
   `std.http` (an HTTP client), `std.net` (TCP sockets), `std.progress`
   (what a program is doing, drawn on a terminal), `std.thread` (threads
-  truly at once: a pool, spreads, and `Par` handled by them --
+  truly at once: a pool, spreads, and `Parallel` handled by them --
   [threads.md](threads.md)), `std.reactor` (outside operations begun
   now and finished later, for [green threads](#green-threads)),
   `std.terminal` (keys typed, a screen drawn: [the terminal](#the-terminal)):

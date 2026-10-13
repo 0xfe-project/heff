@@ -813,14 +813,14 @@ checks.push(ran("handles shared", "test/node/tally.hf", "main", [],
 
 // processes (test/node/fork.provider.c forks): the rest of the program run
 // by each of them, each on its own copy, their strings gathered in
-// order, and lib/parallel.hf's `Par` each side a process -- what was
+// order, and lib/parallel.hf's `Parallel` each side a process -- what was
 // written before a spread written once
 if (process.platform !== "win32") checks.push((async () => {
   const p = await program("test/node/fork.hf", "main");
   if (p.error !== undefined) return [`FAIL processes (c): not compiled\n${p.error}`];
   const r = await run(p.cmd, [], { timeout: 60000 });
   const want = "said before the spread, once\nsquares: 0 1 4 9\nnested: 0.0,0.1,0.2 1.0,1.1,1.2\n"
-    + "each its own: 0 15 30; the parent's: 15\nfib 15, each Par forked: 610\n";
+    + "each its own: 0 15 30; the parent's: 15\nfib 15, each Parallel forked: 610\n";
   return r.status === 0 && r.stdout === want ? [] : [`FAIL processes (c): status ${r.status}\n${r.stdout}${r.stderr}`];
 })());
 
@@ -831,8 +831,8 @@ if (process.platform !== "win32") checks.push((async () => {
 // definition every thread asks for, computed once; tasks taken by
 // threads as they end one; a static thunk forced by threads at once;
 // functions whose C workers take their numbers unboxed (#39) called in
-// each; lib/parallel.hf's `Par` each side a thread; answers of any type
-// (strings, lists, pairs) mapped, gathered and each side of a `Par`; and
+// each; lib/parallel.hf's `Parallel` each side a thread; answers of any type
+// (strings, lists, pairs) mapped, gathered and each side of a `Parallel`; and
 // a thread abandoning, a spread's or a pool's task, the program
 // abandoning when it is joined.  HEFF_TSAN=1: built with ThreadSanitizer
 // too, by the system's clang, and run again, what it says a failure.
@@ -840,10 +840,10 @@ const threadsWant = "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 3
   + "a definition, shared: 333833500 333833501 333833502 333833503\n"
   + "flat fields, shared and copied: 2528 2529 2530\nworkers: 82810 92940 102988\n"
   + "primes below 100000, by 4: 9592\n"
-  + "forced at once: 6765 6765 6765 6765\nfib 20, each Par a thread: 6765\n";
+  + "forced at once: 6765 6765 6765 6765\nfib 20, each Parallel a thread: 6765\n";
 const genericWant = "strings, by 3: a! bb! ccc! dddd! eeeee!\nlists, by 4: [] [1] [1,2] [1,2,3] [1,2,3,4]\n"
   + "a list of the caller's, in each: 0 3 165 15150 15150\npairs: one=55 two=89\nof none: []\n"
-  + "gathered: ,ab,abab\na Par of two types: fib 15 is 610; [1,1,2,3,5,8,13,21]\ncores: at least one\n";
+  + "gathered: ,ab,abab\na Parallel of two types: fib 15 is 610; [1,1,2,3,5,8,13,21]\ncores: at least one\n";
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
   for (const [name, args, want] of [
