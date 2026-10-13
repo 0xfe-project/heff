@@ -8,13 +8,13 @@
 --
 --   import check
 --   import co
---   import gen as Gen
+--   import generator as Generator
 --
 --   arithmetic : Test
 --   arithmetic = group "arithmetic"
 --     [ unit "one and one" (assertEqual (1 + 1) 2)
 --     , property "reversed twice" (do
---         xs <- forAll (Gen.list 0 20 (Gen.int 0 99))
+--         xs <- forAll (Generator.list 0 20 (Generator.int 0 99))
 --         label (if null xs then "empty" else "not empty")
 --         assertEqual (reverse (reverse xs)) xs)
 --     ]
@@ -23,7 +23,7 @@
 -- which: a unit test only checks (`check`), a property also draws random
 -- values (`random`).  Neither can do anything else.  The runner handles
 -- both, and gives the randomness from a seed, so that a run is replayed
--- by its seed.  It handles them in a generator's monad (lib/gen.hf), so
+-- by its seed.  It handles them in a generator's monad (lib/generator.hf), so
 -- a property is itself a generator, of runs: a run that fails shrinks
 -- as all of its draws do, each made again from the shrinks of those
 -- before it, with no shrinking written for it.
@@ -43,14 +43,14 @@
 -- list).
 
 import co
-import gen as Gen
+import generator as Generator
 import map as Map
 
 -- Effects
 --------------------------------------------------------------------------------
 
 -- | Randomness: a value drawn from a generator.
-data RandomF (m : Type -> Type) x = Draw (Gen.Gen x)
+data RandomF (m : Type -> Type) x = Draw (Generator.Generator x)
 
 -- | Randomness as an effect: what a property is given, and a unit test
 -- | is not.
@@ -58,7 +58,7 @@ random : HFunctor
 random =
   { f = RandomF
   , hfmap = \m g p -> case p of
-      Draw d -> Draw (Gen.map g d)
+      Draw d -> Draw (Generator.map g d)
   , hmap = \m n nt p -> case p of
       Draw d -> Draw d
   }
@@ -105,7 +105,7 @@ forAll : {a : Type}
        -> {{rnd : random <: e}}
        -> {{chk : check <: e}}
        -> {{shows : Show a}}
-       -> Gen.Gen a
+       -> Generator.Generator a
        -> Co e a
 forAll g = do
   x <- op (rnd (Draw g)) val
@@ -178,27 +178,37 @@ after t (Failed t2 f) = Failed (andThen t t2) f
 after t Discarded = Discarded
 
 -- (a run, then what comes of its value)
-continue : {a b : Type} -> (a -> Gen.Gen (Run b)) -> Run a -> Gen.Gen (Run b)
-continue k (Going t x) = Gen.map (\r -> after t r) (k x)
-continue k (Failed t f) = Gen.constant (Failed t f)
-continue k Discarded = Gen.constant Discarded
+continue : {a b : Type}
+         -> (a -> Generator.Generator (Run b))
+         -> Run a
+         -> Generator.Generator (Run b)
+continue k (Going t x) = Generator.map (\r -> after t r) (k x)
+continue k (Failed t f) = Generator.constant (Failed t f)
+continue k Discarded = Generator.constant Discarded
 
-drawAlg : {m : Type -> Type} -> {a : Type} -> RandomF m a -> Gen.Gen (Run a)
-drawAlg (Draw g) = Gen.map (\x -> Going noTrace x) g
+drawAlg : {m : Type -> Type}
+        -> {a : Type}
+        -> RandomF m a
+        -> Generator.Generator (Run a)
+drawAlg (Draw g) = Generator.map (\x -> Going noTrace x) g
 
-checkAlg : {m : Type -> Type} -> {a : Type} -> CheckF m a -> Gen.Gen (Run a)
-checkAlg (Fail f) = Gen.constant (Failed noTrace f)
-checkAlg Discard = Gen.constant Discarded
-checkAlg (Label l x) = Gen.constant (Going { notes = Nil, labels = [l] } x)
-checkAlg (Note s x) = Gen.constant (Going { notes = [s], labels = Nil } x)
+checkAlg : {m : Type -> Type}
+         -> {a : Type}
+         -> CheckF m a
+         -> Generator.Generator (Run a)
+checkAlg (Fail f) = Generator.constant (Failed noTrace f)
+checkAlg Discard = Generator.constant Discarded
+checkAlg (Label l x) =
+  Generator.constant (Going { notes = Nil, labels = [l] } x)
+checkAlg (Note s x) = Generator.constant (Going { notes = [s], labels = Nil } x)
 
 -- | The runner's handler: a test is a generator of runs, so a draw is a
--- | generator's value, and a run's draws shrink together (lib/gen.hf).
+-- | generator's value, and a run's draws shrink together (lib/generator.hf).
 runner : Handler world
 runner =
-  { M = \a -> Gen.Gen (Run a)
-  , ret = \x -> Gen.constant (Going noTrace x)
-  , bind = \m k -> Gen.bind m (\r -> continue k r)
+  { M = \a -> Generator.Generator (Run a)
+  , ret = \x -> Generator.constant (Going noTrace x)
+  , bind = \m k -> Generator.bind m (\r -> continue k r)
   , malg = \p -> case p of
       InL d -> drawAlg d
       InR c -> checkAlg c
@@ -328,7 +338,7 @@ type Outcome =
 hashName : String -> Int
 hashName s =
   List.foldl
-    (\h i -> (h * 31 + byteAt s i) % Gen.modulus)
+    (\h i -> (h * 31 + byteAt s i) % Generator.modulus)
     7
     (List.range 0 (strLength s - 1))
 
@@ -392,29 +402,30 @@ isFailed (Failed _ _) = True
 isFailed _ = False
 
 -- (the first of these shrinks that fails too)
-firstFailing : List (Unit -> Gen.Tree (Run Unit)) -> Maybe (Gen.Tree (Run Unit))
+firstFailing : List (Unit -> Generator.Tree (Run Unit))
+             -> Maybe (Generator.Tree (Run Unit))
 firstFailing Nil = Nothing
 firstFailing (Cons c rest) = keepIfFailed (c MkUnit) (firstFailing rest)
   where
-  keepIfFailed : Gen.Tree (Run Unit)
-               -> Maybe (Gen.Tree (Run Unit))
-               -> Maybe (Gen.Tree (Run Unit))
-  keepIfFailed t later = if isFailed (Gen.root t) then Just t else later
+  keepIfFailed : Generator.Tree (Run Unit)
+               -> Maybe (Generator.Tree (Run Unit))
+               -> Maybe (Generator.Tree (Run Unit))
+  keepIfFailed t later = if isFailed (Generator.root t) then Just t else later
 
-type Shrunk = { tree : Gen.Tree (Run Unit), shrinks : Int }
+type Shrunk = { tree : Generator.Tree (Run Unit), shrinks : Int }
 
 -- | A failing run made smaller: its first shrink that fails too, then
 -- | that one's, as long as there is one (and `limit` is not reached).
-shrink : Int -> Int -> Gen.Tree (Run Unit) -> Shrunk
+shrink : Int -> Int -> Generator.Tree (Run Unit) -> Shrunk
 shrink limit n t =
   if n >= limit then { tree = t, shrinks = n }
-  else case firstFailing (Gen.children t) of
+  else case firstFailing (Generator.children t) of
     Just t2 -> shrink limit (n + 1) t2
     Nothing -> { tree = t, shrinks = n }
 
 -- (a failing run, shrunk, as an outcome)
 failedRun : String -> Bool -> Int -> Tally -> Shrunk -> Outcome
-failedRun name prop seed t sh = case Gen.root sh.tree of
+failedRun name prop seed t sh = case Generator.root sh.tree of
   Failed tr f -> failedWith name prop seed t sh.shrinks tr f
   _ ->
     failedWith name prop seed t sh.shrinks noTrace (Because "lost the failure")
@@ -422,8 +433,8 @@ failedRun name prop seed t sh = case Gen.root sh.tree of
 -- | After a run: the tally with it, or the outcome it made.
 data Next = Again Tally | Done Outcome
 
-judge : String -> Config -> Int -> Tally -> Gen.Tree (Run Unit) -> Next
-judge name cfg seed t tree = case Gen.root tree of
+judge : String -> Config -> Int -> Tally -> Generator.Tree (Run Unit) -> Next
+judge name cfg seed t tree = case Generator.root tree of
   Going tr _ ->
     Again
       { runs = t.runs + 1
@@ -439,8 +450,8 @@ judge name cfg seed t tree = case Gen.root tree of
 loop : String
      -> Config
      -> Int
-     -> Gen.Gen (Run Unit)
-     -> Gen.Seed
+     -> Generator.Generator (Run Unit)
+     -> Generator.Seed
      -> Tally
      -> Outcome
 loop name cfg seed g s t =
@@ -454,13 +465,13 @@ loop name cfg seed g s t =
         0
         noTrace
         (Because ("gave up after " ^ show t.discarded ^ " runs given up on"))
-  else case Gen.split s of
+  else case Generator.split s of
     MkPair s1 s2 -> case judge
         name
         cfg
         seed
         t
-        (Gen.run g s1 (t.runs * 100 / cfg.runs)) of
+        (Generator.run g s1 (t.runs * 100 / cfg.runs)) of
       Again t2 -> loop name cfg seed g s2 t2
       Done o -> o
 
@@ -469,8 +480,8 @@ noTally = { runs = 0, discarded = 0, labels = Map.empty }
 
 -- (a unit test: one run)
 runUnit : String -> Int -> Co world Unit -> Outcome
-runUnit name seed c = case Gen.root
-    (Gen.run (handle runner c) (Gen.seed seed) 0) of
+runUnit name seed c = case Generator.root
+    (Generator.run (handle runner c) (Generator.seed seed) 0) of
   Going _ _ ->
     passed name False seed { runs = 1, discarded = 0, labels = Map.empty }
   Failed tr f -> failedWith name False seed noTally 0 tr f
@@ -496,7 +507,7 @@ runUnder seed prefix (PropTest name cfg c) =
     cfg
     seed
     (handle runner c)
-    (Gen.seed (seed + hashName (under prefix name)))
+    (Generator.seed (seed + hashName (under prefix name)))
     noTally
   ]
 runUnder seed prefix (Group name ts) =
