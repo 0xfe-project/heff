@@ -1,8 +1,80 @@
 -- Files as an effect (lib/co.hf): reading one, writing one, listing a
 -- directory, removing one, making one read-only, copying one, moving
--- one, putting one in place of another (filesystem.provider.c).
+-- one, putting one in place of another; what a path is, its status
+-- and its mode; a temporary directory or file; and files open, read
+-- and written a piece at a time (filesystem.provider.c).
+--
+-- An open file is a handle (lib/std/handle.hf), the world's number for
+-- it, held until it is closed (an operation given it after that fails
+-- the program).  What fails is a value, an `Either FileError a`: the
+-- system's errno, its name and what it says of it.  The standard
+-- streams are open files too (`stdin`, `stdout`, `stderr`), so that a
+-- program reads its input a line at a time, in as little memory as a
+-- line takes.
+--
+-- A regular file is read and written there and then: the system has
+-- it ready at once, as far as poll can tell, so even where green
+-- threads (lib/green.hf) are scheduled by std.reactor, a read of a
+-- file waits for the disk, the other threads with it.  A pipe, a
+-- terminal or a socket -- the standard streams, most often -- waits in
+-- std.reactor's reactor, as std.net's sockets do: the other threads go
+-- on while it waits.
 
 import co
+import int as Int
+import std.handle
+
+-- | (`Handle OpenFile`, std.handle: a file open; no value has it.)
+data OpenFile
+
+-- | A file open: read, written, sought in, closed.
+type File = Handle OpenFile
+
+-- | Why an operation failed: the system's errno, its name (`ENOENT`,
+-- | `EACCES`; the same on every system, where the number is not), and
+-- | what the system says of it.
+type FileError = { code : Int, name : String, message : String }
+
+-- | What a path is: a regular file, a directory, a link (where links
+-- | are not followed), or something else -- a pipe, a device, a socket.
+data Kind = Regular | Directory | Link | Other
+
+-- | What the system says of a file: its kind, its size in bytes, when it
+-- | was last modified (nanoseconds since the epoch, as precise as the
+-- | system keeps it), and its mode (its permission bits, `0x1ed` for
+-- | `rwxr-xr-x`; on Windows, `0x16d` read-only or `0x1b6` not).
+type Status = { kind : Kind, size : Int, modified : Int, mode : Int }
+
+-- | What a file is opened for: reading, writing (from its start),
+-- | appending (each write at its end), or both reading and writing.
+data Access = Read | Write | Append | ReadWrite
+
+-- | Where a seek counts from.
+data From = FromStart | FromCurrent | FromEnd
+
+-- (whether a file opened so is made where there is none, by default)
+creates : Access -> Bool
+creates Read = False
+creates ReadWrite = False
+creates _ = True
+
+-- (whether a file opened so is emptied first, by default)
+truncates : Access -> Bool
+truncates Write = True
+truncates _ = False
+
+-- | How a file is opened: for what; whether it is made where there is
+-- | none (by default, for writing and appending), and with what mode
+-- | (`0x1a4`, `rw-r--r--`, by default, less the umask); whether it is
+-- | emptied first (by default, for writing); whether it must be new
+-- | (`exclusive`: where a file is there, `EEXIST`).
+type OpenOptions =
+  { access : Access
+  , create : Bool = creates access
+  , truncate : Bool = truncates access
+  , exclusive : Bool = False
+  , mode : Int = 0x1a4
+  }
 
 data FsF (m : Type -> Type) x
   = ReadFile String (Maybe String -> x)
@@ -14,6 +86,21 @@ data FsF (m : Type -> Type) x
   | Copy String String (Bool -> x)
   | Move String String (Bool -> x)
   | Replace String String (Bool -> x)
+  | Writable String (Bool -> x)
+  | Stat String Bool (Either FileError Status -> x)
+  | SetMode String Int (Either FileError Unit -> x)
+  | RealPath String (Either FileError String -> x)
+  | TempDirectory String (Either FileError String -> x)
+  | TempFile String (Either FileError (Pair String File) -> x)
+  | OpenPath String Int Bool Bool Bool Int (Either FileError File -> x)
+  | Standard Int (File -> x)
+  | ReadChunk File Int (Either FileError Bytes -> x)
+  | ReadLine File (Either FileError (Maybe String) -> x)
+  | WriteBytes File Bytes (Either FileError Unit -> x)
+  | WriteString File String (Either FileError Unit -> x)
+  | Seek File Int Int (Either FileError Int -> x)
+  | StatHandle File (Either FileError Status -> x)
+  | CloseFile File (Either FileError Unit -> x)
 
 -- | Files as an effect.
 fs : HFunctor
@@ -29,6 +116,21 @@ fs =
       Copy path to k -> Copy path to (\ok -> g (k ok))
       Move path to k -> Move path to (\ok -> g (k ok))
       Replace path to k -> Replace path to (\ok -> g (k ok))
+      Writable path k -> Writable path (\ok -> g (k ok))
+      Stat path follow k -> Stat path follow (\r -> g (k r))
+      SetMode path mode k -> SetMode path mode (\r -> g (k r))
+      RealPath path k -> RealPath path (\r -> g (k r))
+      TempDirectory prefix k -> TempDirectory prefix (\r -> g (k r))
+      TempFile prefix k -> TempFile prefix (\r -> g (k r))
+      OpenPath path a c t x mode k -> OpenPath path a c t x mode (\r -> g (k r))
+      Standard i k -> Standard i (\h -> g (k h))
+      ReadChunk h n k -> ReadChunk h n (\r -> g (k r))
+      ReadLine h k -> ReadLine h (\r -> g (k r))
+      WriteBytes h b k -> WriteBytes h b (\r -> g (k r))
+      WriteString h s k -> WriteString h s (\r -> g (k r))
+      Seek h from n k -> Seek h from n (\r -> g (k r))
+      StatHandle h k -> StatHandle h (\r -> g (k r))
+      CloseFile h k -> CloseFile h (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       ReadFile path k -> ReadFile path k
       WriteFile path str k -> WriteFile path str k
@@ -39,7 +141,25 @@ fs =
       Copy path to k -> Copy path to k
       Move path to k -> Move path to k
       Replace path to k -> Replace path to k
+      Writable path k -> Writable path k
+      Stat path follow k -> Stat path follow k
+      SetMode path mode k -> SetMode path mode k
+      RealPath path k -> RealPath path k
+      TempDirectory prefix k -> TempDirectory prefix k
+      TempFile prefix k -> TempFile prefix k
+      OpenPath path a c t x mode k -> OpenPath path a c t x mode k
+      Standard i k -> Standard i k
+      ReadChunk h n k -> ReadChunk h n k
+      ReadLine h k -> ReadLine h k
+      WriteBytes h b k -> WriteBytes h b k
+      WriteString h s k -> WriteString h s k
+      Seek h from n k -> Seek h from n k
+      StatHandle h k -> StatHandle h k
+      CloseFile h k -> CloseFile h k
   }
+
+-- Whole files
+--------------------------------------------------------------------------------
 
 -- | A file's text, if it could be read: in any effect the files are in,
 -- | by the evidence.
@@ -50,7 +170,8 @@ readFile path = op (ev (ReadFile path (\t -> t))) val
 writeFile : {e : HFunctor} -> {{ev : fs <: e}} -> String -> String -> Co e Bool
 writeFile path str = op (ev (WriteFile path str (\ok -> ok))) val
 
--- | Make a directory (and the ones above it): whether it is there.
+-- | Make a directory (and the ones above it): whether a directory is
+-- | there (a file there is none).
 mkDir : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
 mkDir path = op (ev (MkDir path (\ok -> ok))) val
 
@@ -71,6 +192,11 @@ remove path = op (ev (Remove path (\ok -> ok))) val
 readOnly : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
 readOnly path = op (ev (ReadOnly path (\ok -> ok))) val
 
+-- | Make a file, or a directory and all it holds, writable by its owner
+-- | again (`readOnly` undone): whether it was made so.
+writable : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
+writable path = op (ev (Writable path (\ok -> ok))) val
+
 -- | Copy a file, or a directory and all it holds, to `to`, where nothing
 -- | is (links followed, modes kept): whether it was copied.
 copy : {e : HFunctor} -> {{ev : fs <: e}} -> String -> String -> Co e Bool
@@ -88,3 +214,317 @@ move path to = op (ev (Move path to (\ok -> ok))) val
 -- | was moved.
 replace : {e : HFunctor} -> {{ev : fs <: e}} -> String -> String -> Co e Bool
 replace path to = op (ev (Replace path to (\ok -> ok))) val
+
+-- What a path is
+--------------------------------------------------------------------------------
+
+-- | What the system says of the file at a path, links followed.
+stat : {e : HFunctor}
+     -> {{ev : fs <: e}}
+     -> String
+     -> Co e (Either FileError Status)
+stat path = op (ev (Stat path True (\r -> r))) val
+
+-- | What the system says of the file at a path, a link itself where
+-- | there is one (its kind `Link`), not what it links to.
+linkStat : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> String
+         -> Co e (Either FileError Status)
+linkStat path = op (ev (Stat path False (\r -> r))) val
+
+-- (a status's kind, where there is one)
+kindOf : Either FileError Status -> Maybe Kind
+kindOf (Right s) = Just s.kind
+kindOf (Left _) = Nothing
+
+-- | What is at a path, links followed: `Nothing` where nothing is (or a
+-- | link to nothing).
+kindAt : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e (Maybe Kind)
+kindAt path = bind (stat path) (\r -> pure (kindOf r))
+
+-- (whether a kind is there, and is what `want` says)
+kindIs : (Kind -> Bool) -> Maybe Kind -> Bool
+kindIs want (Just k) = want k
+kindIs want Nothing = False
+
+-- (a regular file's kind)
+isRegular : Kind -> Bool
+isRegular Regular = True
+isRegular _ = False
+
+-- (a directory's kind)
+isDirectoryKind : Kind -> Bool
+isDirectoryKind Directory = True
+isDirectoryKind _ = False
+
+-- | Whether something is at a path, links followed.
+exists : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
+exists path = bind (kindAt path) (\k -> pure (kindIs (\_ -> True) k))
+
+-- | Whether a regular file is at a path, links followed.
+isFile : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
+isFile path = bind (kindAt path) (\k -> pure (kindIs isRegular k))
+
+-- | Whether a directory is at a path, links followed.
+isDirectory : {e : HFunctor} -> {{ev : fs <: e}} -> String -> Co e Bool
+isDirectory path = bind (kindAt path) (\k -> pure (kindIs isDirectoryKind k))
+
+-- | The mode of the file at a path set (chmod): its permission bits,
+-- | `0x1ed` for `rwxr-xr-x` (on Windows, only whether the owner may
+-- | write it is kept).
+setMode : {e : HFunctor}
+        -> {{ev : fs <: e}}
+        -> String
+        -> Int
+        -> Co e (Either FileError Unit)
+setMode path mode = op (ev (SetMode path mode (\r -> r))) val
+
+-- (a mode with the execute bits on where the read bits are)
+executableMode : Int -> Int
+executableMode mode = or mode (shiftR (and mode 0x124) 2)
+
+-- (the mode set from the status, where there is one)
+executableFrom : {e : HFunctor}
+               -> {{ev : fs <: e}}
+               -> String
+               -> Either FileError Status
+               -> Co e (Either FileError Unit)
+executableFrom path (Right s) = setMode path (executableMode s.mode)
+executableFrom path (Left err) = pure (Left err)
+
+-- | A file made executable by whoever may read it (`chmod +x`, as the
+-- | umask has it: `rw-r--r--` becomes `rwxr-xr-x`).
+makeExecutable : {e : HFunctor}
+               -> {{ev : fs <: e}}
+               -> String
+               -> Co e (Either FileError Unit)
+makeExecutable path = bind (stat path) (executableFrom path)
+
+-- | A path with its links resolved, and `.` and `..` gone: absolute, of
+-- | something that is there.
+realPath : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> String
+         -> Co e (Either FileError String)
+realPath path = op (ev (RealPath path (\r -> r))) val
+
+-- | A directory of its own, new and empty, where the system keeps
+-- | temporary ones (`TMPDIR`, else `/tmp`; on Windows `GetTempPath`), its
+-- | name `prefix` and six letters: its path.  It is the program's to
+-- | remove.
+tempDirectory : {e : HFunctor}
+              -> {{ev : fs <: e}}
+              -> String
+              -> Co e (Either FileError String)
+tempDirectory prefix = op (ev (TempDirectory prefix (\r -> r))) val
+
+-- | A file of its own, new and empty, where the system keeps temporary
+-- | ones, its name `prefix` and six letters: its path, and it open for
+-- | reading and writing.  It is the program's to close and to remove.
+tempFile : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> String
+         -> Co e (Either FileError (Pair String File))
+tempFile prefix = op (ev (TempFile prefix (\r -> r))) val
+
+-- Open files
+--------------------------------------------------------------------------------
+
+-- (an access as the provider has it)
+accessCode : Access -> Int
+accessCode Read = 0
+accessCode Write = 1
+accessCode Append = 2
+accessCode ReadWrite = 3
+
+-- | A file opened, as `options` say: `openFile p { access = Read }`.
+openFile : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> String
+         -> OpenOptions
+         -> Co e (Either FileError File)
+openFile path o =
+  op
+    (ev
+       (OpenPath
+          path
+          (accessCode o.access)
+          o.create
+          o.truncate
+          o.exclusive
+          o.mode
+          (\r -> r)))
+    val
+
+-- | The standard input, as an open file.  (Read it so, or by std.io's
+-- | `readStdin`, not both: what one has read ahead the other does not
+-- | see.)  Closed, its handle is let go of, and the stream left open.
+stdin : {e : HFunctor} -> {{ev : fs <: e}} -> Co e File
+stdin = op (ev (Standard 0 (\h -> h))) val
+
+-- | The standard output, as an open file (what std.io wrote before is
+-- | written out first).
+stdout : {e : HFunctor} -> {{ev : fs <: e}} -> Co e File
+stdout = op (ev (Standard 1 (\h -> h))) val
+
+-- | The standard error, as an open file.
+stderr : {e : HFunctor} -> {{ev : fs <: e}} -> Co e File
+stderr = op (ev (Standard 2 (\h -> h))) val
+
+-- | Up to `n` bytes of the file, from where it is: as many as there are,
+-- | waiting for one at least (from a pipe or a terminal, as many as have
+-- | come); none at its end.  At most 16 mebibytes at a time.
+readChunk : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> File
+          -> Int
+          -> Co e (Either FileError Bytes)
+readChunk h n = op (ev (ReadChunk h n (\r -> r))) val
+
+-- | The next line of the file, without its `\n` (or `\r\n`); the last
+-- | one too where no `\n` ends it; `Nothing` at its end.  Its bytes as
+-- | they are, UTF-8 or not.
+readLine : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> File
+         -> Co e (Either FileError (Maybe String))
+readLine h = op (ev (ReadLine h (\r -> r))) val
+
+-- | All the bytes written, where the file is (at its end, appending),
+-- | waiting until the system has taken them.
+writeBytes : {e : HFunctor}
+           -> {{ev : fs <: e}}
+           -> File
+           -> Bytes
+           -> Co e (Either FileError Unit)
+writeBytes h b = op (ev (WriteBytes h b (\r -> r))) val
+
+-- | A string's bytes written, as they are.
+writeString : {e : HFunctor}
+            -> {{ev : fs <: e}}
+            -> File
+            -> String
+            -> Co e (Either FileError Unit)
+writeString h s = op (ev (WriteString h s (\r -> r))) val
+
+-- (where a seek counts from, as the provider has it)
+fromCode : From -> Int
+fromCode FromStart = 0
+fromCode FromCurrent = 1
+fromCode FromEnd = 2
+
+-- | Where the file is read and written next, moved by `n` bytes from its
+-- | start, from where it is, or from its end: where it is now, from its
+-- | start.  (A pipe or a terminal cannot be sought in: `ESPIPE`.)
+seek : {e : HFunctor}
+     -> {{ev : fs <: e}}
+     -> File
+     -> From
+     -> Int
+     -> Co e (Either FileError Int)
+seek h from n = op (ev (Seek h (fromCode from) n (\r -> r))) val
+
+-- | Where the file is read and written next, from its start.
+tell : {e : HFunctor} -> {{ev : fs <: e}} -> File -> Co e (Either FileError Int)
+tell h = seek h FromCurrent 0
+
+-- | What the system says of an open file.
+statHandle : {e : HFunctor}
+           -> {{ev : fs <: e}}
+           -> File
+           -> Co e (Either FileError Status)
+statHandle h = op (ev (StatHandle h (\r -> r))) val
+
+-- | The file closed, and the handle let go of: the world holds nothing
+-- | of that number after it (an operation given it fails the program,
+-- | as std.handle says).  Why closing failed, where it did (a write the
+-- | disk did not take).
+closeFile : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> File
+          -> Co e (Either FileError Unit)
+closeFile h = op (ev (CloseFile h (\r -> r))) val
+
+-- Streams
+--------------------------------------------------------------------------------
+
+-- (the next line given to `step`, then `again`, or the fold's end)
+foldLinesNext : {e : HFunctor}
+              -> {a : Type}
+              -> (a -> Co e (Either FileError a))
+              -> (a -> String -> Co e a)
+              -> a
+              -> Either FileError (Maybe String)
+              -> Co e (Either FileError a)
+foldLinesNext again step acc (Right (Just line)) = bind (step acc line) again
+foldLinesNext again step acc (Right Nothing) = pure (Right acc)
+foldLinesNext again step acc (Left err) = pure (Left err)
+
+-- | Each line of the file, from where it is to its end, given to
+-- | `step` with what the lines before it came to: what they all come
+-- | to.  One line at a time is held, however long the file.
+foldLines : {e : HFunctor}
+          -> {{ev : fs <: e}}
+          -> {a : Type}
+          -> File
+          -> a
+          -> (a -> String -> Co e a)
+          -> Co e (Either FileError a)
+foldLines h acc step =
+  bind (readLine h) (foldLinesNext (\next -> foldLines h next step) step acc)
+
+-- (how much a copy reads at a time)
+chunkSize : Int
+chunkSize = 65536
+
+-- (after a write: `again`, `n` bytes written so far; or why it failed)
+copyWritten : {e : HFunctor}
+            -> (Int -> Co e (Either FileError Int))
+            -> Int
+            -> Either FileError Unit
+            -> Co e (Either FileError Int)
+copyWritten again n (Right _) = again n
+copyWritten again n (Left err) = pure (Left err)
+
+-- (a chunk read written, then `again` with how many bytes were; at the
+-- end, how many were in all)
+copyNext : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> (Int -> Co e (Either FileError Int))
+         -> File
+         -> Int
+         -> Either FileError Bytes
+         -> Co e (Either FileError Int)
+copyNext again to n (Right b) =
+  if bytesLength b == 0 then pure (Right n)
+  else bind (writeBytes to b) (copyWritten again (n + bytesLength b))
+copyNext again to n (Left err) = pure (Left err)
+
+-- (what is left of `from` written to `to`, after `n` bytes)
+copyFrom : {e : HFunctor}
+         -> {{ev : fs <: e}}
+         -> File
+         -> File
+         -> Int
+         -> Co e (Either FileError Int)
+copyFrom from to n =
+  bind (readChunk from chunkSize) (copyNext (\m -> copyFrom from to m) to n)
+
+-- | What is left of one open file written to another, a chunk at a time:
+-- | how many bytes.
+copyHandle : {e : HFunctor}
+           -> {{ev : fs <: e}}
+           -> File
+           -> File
+           -> Co e (Either FileError Int)
+copyHandle from to = copyFrom from to 0
+
+-- Errors
+--------------------------------------------------------------------------------
+
+-- | As a system's tools say it: its name, and what it is.
+-- | >>> showFileError { code = 2, name = "ENOENT", message = "No such file or directory" }
+-- | "ENOENT: No such file or directory"
+showFileError : FileError -> String
+showFileError err = err.name ^ ": " ^ err.message
