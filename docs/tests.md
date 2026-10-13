@@ -98,7 +98,7 @@ numbers, strings and the like, and of lists, `Maybe`s, pairs and
 given by hand.  `agree` runs a program of commands on a system and on a
 model of it and compares what they observe; drawn by a property, the
 program shrinks to a short one that tells them apart
-(`test/check/map.hf` holds `lib/map.hf` to a list of pairs).
+(`test/check/map.hf` holds `lib/std/map.hf` to a list of pairs).
 
 ## Files that expect errors
 

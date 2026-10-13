@@ -29,23 +29,26 @@ are imported by their names:
   that throws by zero, and `attempt`, a handler of it: what was thrown
   and heard by no `catch`, `Left`), `parallel` and `green` ([green
   threads](#green-threads));
-- `array` ([arrays](#arrays)), `map` and `set`, by the keys' `Order`,
-  found as an instance argument is (a map's `insertWith` and `alter`
-  change what a key is bound to in one walk down the tree, where a
-  `lookup` and an `insert` take two: `Map.insertWith (\new old -> new +
-  old) word 1 counts` counts a word);
-- `hashmap` (as `HashMap`), maps by the keys' hashes, a hash array
+- `array` ([arrays](#arrays)), `std.map` and `std.set`, by the keys'
+  `Order`, found as an instance argument is, the map first:
+  `Map.insert m k v`, `Map.lookup m k`, `Map.member m k`, `Map.delete
+  m k` (a map's `update` and `alter` change what a key is bound to
+  in one walk down the tree, where a `lookup` and an `insert` take two:
+  `Map.update counts word 1 (\new old -> new + old)` counts a
+  word);
+- `std.hashmap` (as `HashMap`), maps by the keys' hashes, a hash array
   mapped trie as Clojure's and unordered-containers' are: each level 5
   bits of the hash, a node's children in an array as long as how many
   there are, found by a bitmap of which there are -- 4 levels for a
   million keys, a key compared once, at the end of its walk.  A node
-  nothing else holds is changed in place, so `HashMap.insertWith (\new
-  old -> new + old) word 1 counts` builds nothing for a word counted
+  nothing else holds is changed in place, so `HashMap.update counts
+  word 1 (\new old -> new + old)` builds nothing for a word counted
   already.  Its keys' type has a `Hash` (`theory Hash (a : Type) where
   hash : a -> Int`: `String`'s, `Int`'s, `Rune`'s, `Bool`'s, and a
   `Pair`'s, a `List`'s and a `Maybe`'s of types that have one --
   `instanceHashString` and the others) and an `Equality`, each found
-  as an instance argument is.  It has `empty`, `insert`, `insertWith`,
+  as an instance argument is.  The map comes first, as a `std.map`'s
+  does.  It has `empty`, `insert`, `update`,
   `alter`, `lookup`, `delete`, `size` (each key counted), `toList`,
   `fromList` and `foldl`; the order of `toList` and `foldl` is the
   trie's, by the hashes, not the keys', but the same on every backend.
