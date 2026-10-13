@@ -2080,6 +2080,86 @@ static V heff_strFind_lent(V needle, V s, V i, int give) {
 }
 static V heff_strFind(V needle, V s, V i) { return heff_strFind_lent(needle, s, i, 3); }
 
+// Hashes (lib/hashmap.hf): a string's is FxHash's step (Firefox's and
+// rustc's, `rotl(h, 5) ^ w` times its constant) over its bytes 8 at a
+// time, little-endian, the last word filled with zeros, from its length;
+// then murmur3's finish (`fmix64`), which FxHash lacks, so that the low
+// bits a trie looks at first are as mixed as the high.  An integer's is
+// that finish of its low 64 bits (two's complement).  Each is shifted
+// right by 2, a word's integer, never negative; JavaScript's and the
+// interpreter's are the same numbers (src/heff/compile/prims.hf,
+// src/heff/compile/interp.hf), so that a map's order is one everywhere.
+#define HEFF_FX_K 0x517cc1b727220a95ULL
+
+static inline uint64_t heff_fmix64(uint64_t h) {
+  h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+  return h ^ (h >> 33);
+}
+
+static inline uint64_t heff_fx_step(uint64_t h, uint64_t w) {
+  return (((h << 5) | (h >> 59)) ^ w) * HEFF_FX_K;
+}
+
+static inline uint64_t heff_hash_bytes(const uint8_t *p, int64_t n) {
+  uint64_t h = (uint64_t)n;
+  int64_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t w;
+    memcpy(&w, p + i, sizeof w);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    w = __builtin_bswap64(w);
+#endif
+    h = heff_fx_step(h, w);
+  }
+  if (i < n) {
+    uint64_t w = 0;
+    for (int64_t k = n - 1; k >= i; k--) w = (w << 8) | p[k];
+    h = heff_fx_step(h, w);
+  }
+  return heff_fmix64(h);
+}
+
+HEFF_FAST V heff_strHash_lent(V a, int give) {
+  Str *x = (Str *)a;
+  V r = MK_INT((int64_t)(heff_hash_bytes(x->s, x->len) >> 2));
+  HEFF_GIVEN(give, 0, a);
+  return r;
+}
+static V heff_strHash(V a) { return heff_strHash_lent(a, 1); }
+
+static V heff_intHash(V a) {
+  uint64_t u;
+  if (IS_INT(a)) u = (uint64_t)INT_OF(a);
+  else {
+    Big *b = (Big *)a;
+    u = (uint64_t)b->d[0] | (b->n > 1 ? (uint64_t)b->d[1] << 32 : 0);
+    if (b->neg) u = ~u + 1;
+    heff_drop(a);
+  }
+  return MK_INT((int64_t)(heff_fmix64(u) >> 2));
+}
+
+// (a trie's step: the 5 bits of the hash `h` from bit `s` on choose one of
+// 32 children, and the node's bitmap `bm` says which it has -- where the
+// one chosen is among them, the bits set below its counted, or, where it
+// is not, -1 less that.  The bits are two's complement's, as `shiftR` and
+// `and` have them)
+HEFF_SLOW int64_t heff_trie_frag_big(V h, V s) {
+  return INT_OF(heff_intAnd(heff_intShr(h, s), MK_INT(31)));
+}
+
+HEFF_FAST V heff_trieSlot(V bm, V h, V s) {
+  int64_t frag;
+  if (HEFF_LIKELY(IS_INT(h) && IS_INT(s) && INT_OF(s) >= 0)) {
+    int64_t k = INT_OF(s);
+    frag = (INT_OF(h) >> (k < 63 ? k : 63)) & 31;
+  } else frag = heff_trie_frag_big(h, s);
+  uint64_t b = (uint64_t)INT_OF(bm), bit = (uint64_t)1 << frag;
+  int64_t i = __builtin_popcountll(b & (bit - 1));
+  return MK_INT(b & bit ? i : -1 - i);
+}
+
 // (as C's condition, and as a Bool: see `INT_CMP`)
 HEFF_FAST int heff_strEq_c_lent(V a, V b, int give) {
   Str *x = (Str *)a, *y = (Str *)b;

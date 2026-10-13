@@ -504,6 +504,72 @@ intShift f back a b =
   if b < 0 then Ok (VInt (back a (Fixed.twoTo (0 - b))))
   else Ok (VInt (f a (Fixed.twoTo b)))
 
+-- The hashes, as the runtime computes them (lib/c/runtime.c, "Hashes"):
+-- FxHash's step over a string's bytes 8 at a time, then murmur3's
+-- finish -- here on integers from 0 up to 2^64, each wrapped there
+
+word64 : Int
+word64 = Fixed.twoTo 64
+
+-- (`a` xor `b`, both from 0)
+xor64 : Int -> Int -> Int
+xor64 a b = intBits (\x y -> (x + y) % 2) a b
+
+-- (`h` xor `h` shifted right by 33)
+fold33 : Int -> Int
+fold33 h = xor64 h (h / Fixed.twoTo 33)
+
+fmix64 : Int -> Int
+fmix64 h =
+  fold33
+    ((fold33 ((fold33 h * 0xff51afd7ed558ccd) % word64) * 0xc4ceb9fe1a85ec53)
+     % word64)
+
+fxStep : Int -> Int -> Int
+fxStep h w =
+  (xor64 ((h * 32) % word64 + h / Fixed.twoTo 59) w * 0x517cc1b727220a95)
+  % word64
+
+-- (the bytes of `s` from `i` up to `k` taken, before them `w`: the first
+-- the lowest)
+wordFrom : String -> Int -> Int -> Int -> Int
+wordFrom s i k w =
+  if k < i then w else wordFrom s i (k - 1) (w * 256 + byteAt s k)
+
+hashFrom : String -> Int -> Int -> Int
+hashFrom s i h =
+  if i + 8 <= strLength s
+    then hashFrom s (i + 8) (fxStep h (wordFrom s i (i + 7) 0))
+  else if i < strLength s then fxStep h (wordFrom s i (strLength s - 1) 0)
+  else h
+
+-- | a string's hash, the runtime's `strHash`
+-- | >>> List.map strHashOf ["", "a", "hello, world"]
+-- | Cons 0 (Cons 3104196977409597011 (Cons 3649460775222196455 Nil))
+strHashOf : String -> Int
+strHashOf s = fmix64 (hashFrom s 0 (strLength s)) / 4
+
+-- | an integer's hash, the runtime's `intHash`: of its low 64 bits
+-- | >>> List.map intHashOf [1, -1, 1180591620717411303429]
+-- | Cons 3248695391556776651 (Cons 1814207941853616072 (Cons 3862599526612407645 Nil))
+intHashOf : Int -> Int
+intHashOf a = fmix64 ((a % word64 + word64) % word64) / 4
+
+-- (how many bits of `m`, from 0, are set)
+bitsSet : Int -> Int
+bitsSet m = if m <= 0 then 0 else m % 2 + bitsSet (m / 2)
+
+-- | a trie's step, the runtime's `trieSlot`: where the child the 5 bits
+-- | of `h` from bit `s` on choose is among those of the bitmap `bm`, the
+-- | bits set below its, or, where it is not one of them, -1 less that
+-- | >>> List.map (\h -> trieSlotOf 37 h 0) [0, 2, 5, 3]
+-- | Cons 0 (Cons 1 (Cons 2 (Cons (-3) Nil)))
+trieSlotOf : Int -> Int -> Int -> Int
+trieSlotOf bm h s =
+  if (bm / Fixed.twoTo ((h / Fixed.twoTo s) % 32)) % 2 == 1
+    then bitsSet (bm % Fixed.twoTo ((h / Fixed.twoTo s) % 32))
+  else -1 - bitsSet (bm % Fixed.twoTo ((h / Fixed.twoTo s) % 32))
+
 -- The fixed-width integers (heff.elab.fixed): each an integer of its type's
 -- range, computed with as one and wrapped around to the type
 
@@ -741,6 +807,12 @@ prim p =
     then str2
         (\a b ->
            Ok (VInt (if strLt a b then -1 else if strEq a b then 0 else 1)))
+  else if strEq p "strHash" then str1 (\a -> Ok (VInt (strHashOf a)))
+  else if strEq p "intHash" then int1 (\a -> Ok (VInt (intHashOf a)))
+  else if strEq p "trieSlot"
+    then int1
+        (\bm ->
+           Ok (int1 (\h -> Ok (int1 (\s -> Ok (VInt (trieSlotOf bm h s)))))))
   else if strEq p "strFind"
     then str2
         (\n a ->

@@ -1,0 +1,433 @@
+-- Maps from keys to values by the keys' hashes: a hash array mapped trie
+-- (HAMT), as Clojure's, Scala's and Haskell's unordered-containers' maps
+-- are.  Each level of the trie takes 5 bits of a key's hash, so a node
+-- has up to 32 children, kept in an array as long as how many there are
+-- and found by a bitmap of which there are (the bits below a child's,
+-- counted, are where it is); 3572 keys are 3 levels deep, a million 4.
+-- A key is compared once, where its hash has led, with the one there.
+-- Where nothing else holds a node, it is changed in place: a value
+-- changed (`insertWith`) builds nothing.
+--
+-- The keys' type has a `Hash` (strings, integers, runes, booleans, and
+-- pairs, lists and `Maybe`s of them) and an `Equality`, each found as an
+-- instance argument is.  The order of `toList` and `foldl` is the
+-- trie's, by the hashes: not the keys', but the same on every backend.
+-- Import it by a name, `import hashmap as HashMap` (`HashMap.insert`),
+-- as `map`'s names are its names too.
+
+import array as Array
+import int as Int
+
+-- (a string's hash and an integer's: lib/c/runtime.c's "Hashes" says
+-- how, FxHash's step over the bytes 8 at a time and murmur3's finish;
+-- a word's integer, from 0 up to 2^62)
+primitive strHash : String -> Int
+primitive intHash : Int -> Int
+
+-- (a trie's step: where the child the 5 bits of a hash from a bit on
+-- choose is among those a node's bitmap says it has -- the bits set below
+-- its, counted at once -- or, where it is not one of them, -1 less that)
+primitive trieSlot : Int -> Int -> Int -> Int
+
+-- | A type's hash: two values `equal` have the same one.
+theory Hash (a : Type) where
+  hash : a -> Int
+
+hash : {a : Type} -> {{hashing : Hash a}} -> a -> Int
+hash = hashing.hash
+
+-- | >>> hash "hello, world" == hash ("hello" ^ ", world")
+-- | True
+-- | >>> hash "a" == hash "b"
+-- | False
+instance instanceHashString : Hash String
+instanceHashString = { hash = strHash }
+
+-- | >>> List.map (\(i : Int) -> hash i == hash (i + 1)) [0, 1180591620717411303424]
+-- | Cons False (Cons False Nil)
+instance instanceHashInt : Hash Int
+instanceHashInt = { hash = intHash }
+
+instance instanceHashRune : Hash Rune
+instanceHashRune = { hash = \r -> intHash (runeToInt r) }
+
+instance instanceHashBool : Hash Bool
+instanceHashBool = { hash = \b -> if b then intHash 1 else intHash 0 }
+
+-- | the hash of what is hashed `h` so far, then of `x`'s hash: in order,
+-- | so that `MkPair a b` and `MkPair b a` differ
+combine : Int -> Int -> Int
+combine h x = intHash (xor (intHash h) x)
+
+-- | >>> hash (MkPair 1 2 : Pair Int Int) == hash (MkPair 2 1 : Pair Int Int)
+-- | False
+instance instanceHashPair : {a b : Type}
+                          -> {{hashA : Hash a}}
+                          -> {{hashB : Hash b}}
+                          -> Hash (Pair a b)
+instanceHashPair = { hash = \p -> combine (hash (fst p)) (hash (snd p)) }
+
+instance instanceHashMaybe : {a : Type}
+                           -> {{hashing : Hash a}}
+                           -> Hash (Maybe a)
+instanceHashMaybe = { hash = hashed }
+  where
+  hashed : Maybe a -> Int
+  hashed Nothing = intHash 0
+  hashed (Just x) = combine 1 (hash x)
+
+-- | >>> hash (["a", "b"] : List String) == hash (["b", "a"] : List String)
+-- | False
+instance instanceHashList : {a : Type} -> {{hashing : Hash a}} -> Hash (List a)
+instanceHashList =
+  { hash = \xs -> List.foldl (\h x -> combine h (hash x)) 0 xs }
+
+-- | A map, as a trie: nothing (only the whole map, never a child); a
+-- | key, its hash and its value; keys of one hash, each with its value;
+-- | or a node of children, a bitmap of which of the 32 there are.
+data HashMap k v
+  = Vacant
+  | Leaf Int k v
+  | Collision Int (List (Pair k v))
+  | Branch Int (Array (HashMap k v))
+
+empty : {k v : Type} -> HashMap k v
+empty = Vacant
+
+-- (the bit of the child the hash `h` is led to at the level `s` bits down)
+bitAt : Int -> Int -> Int
+bitAt h s = shiftL 1 (and (shiftR h s) 31)
+
+-- (the children, `x` put at `i`)
+insertedAt : {a : Type} -> Int -> a -> Array a -> Array a
+insertedAt i x xs =
+  arrayGenerate
+    (arrayLength xs + 1)
+    (\j ->
+       if j < i then arrayIndex xs j
+       else if j == i then x
+       else arrayIndex xs (j - 1))
+
+-- (the children, the one at `i` taken out)
+removedAt : {a : Type} -> Int -> Array a -> Array a
+removedAt i xs =
+  arrayGenerate
+    (arrayLength xs - 1)
+    (\j -> if j < i then arrayIndex xs j else arrayIndex xs (j + 1))
+
+-- (two nodes of hashes `h1` and `h2`, which differ, under one node at
+-- the level `s` bits down: further down while their bits there agree)
+joined : {k v : Type}
+       -> Int
+       -> Int
+       -> HashMap k v
+       -> Int
+       -> HashMap k v
+       -> HashMap k v
+joined s h1 n1 h2 n2 =
+  if bitAt h1 s == bitAt h2 s
+    then Branch (bitAt h1 s) (arrayFromList [joined (s + 5) h1 n1 h2 n2])
+  else if bitAt h1 s < bitAt h2 s
+    then Branch (or (bitAt h1 s) (bitAt h2 s)) (arrayFromList [n1, n2])
+  else Branch (or (bitAt h1 s) (bitAt h2 s)) (arrayFromList [n2, n1])
+
+-- (the pairs of one hash, `key` bound to `value` or to `f value old`)
+pairsWith : {k v : Type}
+          -> (k -> k -> Bool)
+          -> (v -> v -> v)
+          -> k
+          -> v
+          -> List (Pair k v)
+          -> List (Pair k v)
+pairsWith eq f key value Nil = [MkPair key value]
+pairsWith eq f key value (Cons (MkPair k2 v2) rest) =
+  if eq key k2 then Cons (MkPair k2 (f value v2)) rest
+  else Cons (MkPair k2 v2) (pairsWith eq f key value rest)
+
+-- (`insertWith` at a node `s` bits down, the key's hash `h`.  A child
+-- changed is taken out of its array first, `Vacant` put there, so that
+-- nothing but this walk holds it, and it is changed in place)
+insertAt : {k v : Type}
+         -> (k -> k -> Bool)
+         -> (v -> v -> v)
+         -> Int
+         -> Int
+         -> k
+         -> v
+         -> HashMap k v
+         -> HashMap k v
+insertAt eq f h s key value Vacant = Leaf h key value
+insertAt eq f h s key value (Leaf h2 k2 v2) =
+  if h /= h2 then joined s h (Leaf h key value) h2 (Leaf h2 k2 v2)
+  else if eq key k2 then Leaf h2 k2 (f value v2)
+  else Collision h2 [MkPair key value, MkPair k2 v2]
+insertAt eq f h s key value (Collision h2 ps) =
+  if h /= h2 then joined s h (Leaf h key value) h2 (Collision h2 ps)
+  else Collision h2 (pairsWith eq f key value ps)
+insertAt eq f h s key value (Branch bm children) =
+  let i = trieSlot bm h s
+  in if i < 0
+    then Branch
+        (or bm (bitAt h s))
+        (insertedAt (-1 - i) (Leaf h key value) children)
+  else (let child = arrayIndex children i
+        in let holed = arraySet children i Vacant
+        in Branch
+          bm
+          (arraySet holed i (insertAt eq f h (s + 5) key value child)))
+
+-- | The map with `k` bound to `v`, or, where it is bound, to `f v old`
+-- | (Haskell's `insertWith`): a value changed in one walk down the trie.
+insertWith : {k v : Type}
+           -> {{hashing : Hash k}}
+           -> {{equality : Equality k}}
+           -> (v -> v -> v)
+           -> k
+           -> v
+           -> HashMap k v
+           -> HashMap k v
+insertWith f key value m = insertAt equal f (hash key) 0 key value m
+
+-- | The map with `k` bound to `v` (instead of what it was, if it was).
+insert : {k v : Type}
+       -> {{hashing : Hash k}}
+       -> {{equality : Equality k}}
+       -> k
+       -> v
+       -> HashMap k v
+       -> HashMap k v
+insert key value m = insertAt equal (\new old -> new) (hash key) 0 key value m
+
+-- (the value of `key` among the pairs of one hash)
+pairsLookup : {k v : Type}
+            -> (k -> k -> Bool)
+            -> k
+            -> List (Pair k v)
+            -> Maybe v
+pairsLookup eq key Nil = Nothing
+pairsLookup eq key (Cons (MkPair k2 v2) rest) =
+  if eq key k2 then Just v2 else pairsLookup eq key rest
+
+lookupAt : {k v : Type}
+         -> (k -> k -> Bool)
+         -> Int
+         -> Int
+         -> k
+         -> HashMap k v
+         -> Maybe v
+lookupAt eq h s key Vacant = Nothing
+lookupAt eq h s key (Leaf h2 k2 v2) =
+  if h == h2 && eq key k2 then Just v2 else Nothing
+lookupAt eq h s key (Collision h2 ps) =
+  if h == h2 then pairsLookup eq key ps else Nothing
+lookupAt eq h s key (Branch bm children) =
+  let i = trieSlot bm h s
+  in if i < 0 then Nothing
+  else lookupAt eq h (s + 5) key (arrayIndex children i)
+
+-- | What `k` is bound to, if it is.
+lookup : {k v : Type}
+       -> {{hashing : Hash k}}
+       -> {{equality : Equality k}}
+       -> k
+       -> HashMap k v
+       -> Maybe v
+lookup key m = lookupAt equal (hash key) 0 key m
+
+-- (pairs of one hash, as a node: none, one a leaf)
+collisionOf : {k v : Type} -> Int -> List (Pair k v) -> HashMap k v
+collisionOf h Nil = Vacant
+collisionOf h (Cons (MkPair k v) Nil) = Leaf h k v
+collisionOf h ps = Collision h ps
+
+-- (the one child of a node: a leaf or keys of one hash, which may stand
+-- for the node, at any level; or a node, which may not, its bits being
+-- of its own level)
+lone : {k v : Type} -> HashMap k v -> HashMap k v -> HashMap k v
+lone (Branch bm children) node = node
+lone child node = child
+
+-- (a node of fewer children: none, nothing; one, it if it may stand
+-- for the node)
+shrunk : {k v : Type} -> Int -> Array (HashMap k v) -> HashMap k v
+shrunk 0 children = Vacant
+shrunk bm children =
+  if arrayLength children == 1
+    then lone (arrayIndex children 0) (Branch bm children)
+  else Branch bm children
+
+-- (a node whose child at `i`, of the bit `bit`, is now `child`, `Vacant`
+-- where it was: the child gone where it is `Vacant`)
+rebranched : {k v : Type}
+           -> Int
+           -> Int
+           -> Int
+           -> Array (HashMap k v)
+           -> HashMap k v
+           -> HashMap k v
+rebranched bm bit i children Vacant = shrunk (xor bm bit) (removedAt i children)
+rebranched bm bit i children child = Branch bm (arraySet children i child)
+
+-- (the pairs of one hash, `key`'s gone)
+pairsWithout : {k v : Type}
+             -> (k -> k -> Bool)
+             -> k
+             -> List (Pair k v)
+             -> List (Pair k v)
+pairsWithout eq key Nil = Nil
+pairsWithout eq key (Cons (MkPair k2 v2) rest) =
+  if eq key k2 then rest else Cons (MkPair k2 v2) (pairsWithout eq key rest)
+
+deleteAt : {k v : Type}
+         -> (k -> k -> Bool)
+         -> Int
+         -> Int
+         -> k
+         -> HashMap k v
+         -> HashMap k v
+deleteAt eq h s key Vacant = Vacant
+deleteAt eq h s key (Leaf h2 k2 v2) =
+  if h == h2 && eq key k2 then Vacant else Leaf h2 k2 v2
+deleteAt eq h s key (Collision h2 ps) =
+  if h == h2 then collisionOf h2 (pairsWithout eq key ps) else Collision h2 ps
+deleteAt eq h s key (Branch bm children) =
+  let i = trieSlot bm h s
+  in if i < 0 then Branch bm children
+  else (let child = arrayIndex children i
+        in let holed = arraySet children i Vacant
+        in rebranched bm (bitAt h s) i holed (deleteAt eq h (s + 5) key child))
+
+-- | The map without `k` (as it was, if `k` was not in it).
+delete : {k v : Type}
+       -> {{hashing : Hash k}}
+       -> {{equality : Equality k}}
+       -> k
+       -> HashMap k v
+       -> HashMap k v
+delete key m = deleteAt equal (hash key) 0 key m
+
+-- (the pairs of one hash, `key` bound as `f` says, given what it was
+-- bound to)
+pairsAltered : {k v : Type}
+             -> (k -> k -> Bool)
+             -> (Maybe v -> Maybe v)
+             -> k
+             -> List (Pair k v)
+             -> List (Pair k v)
+pairsAltered eq f key Nil = maybe Nil (\v -> [MkPair key v]) (f Nothing)
+pairsAltered eq f key (Cons (MkPair k2 v2) rest) =
+  if eq key k2 then maybe rest (\v -> Cons (MkPair k2 v) rest) (f (Just v2))
+  else Cons (MkPair k2 v2) (pairsAltered eq f key rest)
+
+-- (a node of another hash than `key`'s, `h2`, and `key` bound as `f`
+-- said, given nothing: beside it, or not at all)
+sprouted : {k v : Type}
+         -> Int
+         -> Int
+         -> k
+         -> Maybe v
+         -> Int
+         -> HashMap k v
+         -> HashMap k v
+sprouted s h key Nothing h2 node = node
+sprouted s h key (Just v) h2 node = joined s h (Leaf h key v) h2 node
+
+-- (a node without the bit `bit`, and `key` bound as `f` said, given
+-- nothing: a leaf of its own at `i`, or not at all)
+budded : {k v : Type}
+       -> Int
+       -> Int
+       -> Int
+       -> k
+       -> Maybe v
+       -> Int
+       -> Array (HashMap k v)
+       -> HashMap k v
+budded h bit i key Nothing bm children = Branch bm children
+budded h bit i key (Just v) bm children =
+  Branch (or bm bit) (insertedAt i (Leaf h key v) children)
+
+alterAt : {k v : Type}
+        -> (k -> k -> Bool)
+        -> (Maybe v -> Maybe v)
+        -> Int
+        -> Int
+        -> k
+        -> HashMap k v
+        -> HashMap k v
+alterAt eq f h s key Vacant = collisionOf h (pairsAltered eq f key Nil)
+alterAt eq f h s key (Leaf h2 k2 v2) =
+  if h /= h2 then sprouted s h key (f Nothing) h2 (Leaf h2 k2 v2)
+  else collisionOf h2 (pairsAltered eq f key [MkPair k2 v2])
+alterAt eq f h s key (Collision h2 ps) =
+  if h /= h2 then sprouted s h key (f Nothing) h2 (Collision h2 ps)
+  else collisionOf h2 (pairsAltered eq f key ps)
+alterAt eq f h s key (Branch bm children) =
+  let i = trieSlot bm h s
+  in if i < 0 then budded h (bitAt h s) (-1 - i) key (f Nothing) bm children
+  else (let child = arrayIndex children i
+        in let holed = arraySet children i Vacant
+        in rebranched bm (bitAt h s) i holed (alterAt eq f h (s + 5) key child))
+
+-- | The map with `k` bound as `f` says, given what it is bound to, if it
+-- | is: to `f`'s value, or (`Nothing`) to none (Haskell's `alter`), in
+-- | one walk down the trie.
+alter : {k v : Type}
+      -> {{hashing : Hash k}}
+      -> {{equality : Equality k}}
+      -> (Maybe v -> Maybe v)
+      -> k
+      -> HashMap k v
+      -> HashMap k v
+alter f key m = alterAt equal f (hash key) 0 key m
+
+-- | Each key and its value, from `z`, in the trie's order (the hashes').
+foldl : {k v b : Type} -> (b -> k -> v -> b) -> b -> HashMap k v -> b
+foldl f z Vacant = z
+foldl f z (Leaf h k v) = f z k v
+foldl f z (Collision h ps) = List.foldl (\acc p -> f acc (fst p) (snd p)) z ps
+foldl f z (Branch bm children) =
+  Array.foldl (\acc c -> foldl f acc c) z children
+
+-- | How many keys are bound: each counted.
+size : {k v : Type} -> HashMap k v -> Int
+size m = foldl (\n k v -> n + 1) 0 m
+
+-- | The keys and their values, in the trie's order (the hashes', not the
+-- | keys'): sort them for another.
+toList : {k v : Type} -> HashMap k v -> List (Pair k v)
+toList m = foldl (\acc k v -> Cons (MkPair k v) acc) Nil m
+
+-- | The map of the pairs, a later one's value for a key twice.
+-- | >>> lookup "b" (fromList [MkPair "a" 1, MkPair "b" 2])
+-- | Just 2
+-- | >>> lookup "c" (fromList [MkPair "a" 1, MkPair "b" 2])
+-- | Nothing
+-- | >>> lookup 2 (insert 2 "two" (fromList [MkPair 2 "deux"]))
+-- | Just "two"
+-- | >>> size (fromList [MkPair "a" 1, MkPair "b" 2, MkPair "a" 3])
+-- | 2
+-- | >>> foldl (\n k v -> n + k * v) 0 (fromList [MkPair 2 3, MkPair 4 5])
+-- | 26
+-- | >>> List.sortBy (\a b -> compareString (fst a) (fst b) /= GT) (toList (fromList [MkPair "b" 2, MkPair "a" 1]))
+-- | Cons (MkPair "a" 1) (Cons (MkPair "b" 2) Nil)
+-- | >>> toList (insertWith (\new old -> new + old) "a" 1 (fromList [MkPair "a" 2]))
+-- | Cons (MkPair "a" 3) Nil
+-- | >>> lookup "b" (insertWith (\new old -> new + old) "b" 5 (fromList [MkPair "a" 2]))
+-- | Just 5
+-- | >>> toList (delete "a" (fromList [MkPair "a" 1, MkPair "b" 2]))
+-- | Cons (MkPair "b" 2) Nil
+-- | >>> size (delete 7 (fromList [MkPair 1 "one"]))
+-- | 1
+-- | >>> toList (alter (\old -> Just (maybe 1 (\n -> n + 1) old)) "a" (fromList [MkPair "a" 2]))
+-- | Cons (MkPair "a" 3) Nil
+-- | >>> toList (alter (\old -> Nothing) 1 (fromList [MkPair 1 "one"]))
+-- | Nil
+-- | >>> lookup 3 (alter (\old -> Just "three") 3 (fromList [MkPair 1 "one"]))
+-- | Just "three"
+fromList : {k v : Type}
+         -> {{hashing : Hash k}}
+         -> {{equality : Equality k}}
+         -> List (Pair k v)
+         -> HashMap k v
+fromList ps = List.foldl (\m p -> insert (fst p) (snd p) m) Vacant ps
