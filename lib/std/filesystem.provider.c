@@ -320,9 +320,13 @@ static V heff_fs_whole(V p, V k) {
 #define POLLIN 1
 #define POLLOUT 4
 #endif
+#ifndef O_CLOEXEC
 #define O_CLOEXEC 0
+#endif
 #else
+#ifndef O_BINARY
 #define O_BINARY 0
+#endif
 #endif
 
 // (an errno's name, the same on every system where its number is not)
