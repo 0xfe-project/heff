@@ -198,11 +198,13 @@ expect("fmt by imported fixities", cut.status === 0 && readFileSync(join(work, "
 // the usage: asked for, on stdout; for what is no command, on stderr,
 // failing; a command's own help, asked for; its words wrong, what is wrong
 // and how it is called, on stderr
-const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "build", "install", "publish", "lsp", "version", "help", "completions"];
+// (with no words, not on a terminal: the usage, as `help` says it --
+// on one, its commands' app, test/terminal.mjs's)
+const commands = ["check", "run", "test", "promote", "compile", "explain", "type-at", "fmt", "init", "get", "build", "install", "publish", "dev", "lsp", "version", "help", "completions"];
 for (const args of [[], ["help"], ["--help"]]) {
   const r = await heff(...args);
   expect(`usage (${args.join(" ") || "no arguments"})`, r.status === 0 && r.stdout.startsWith("usage: heff COMMAND ...\n") &&
-    commands.every((c) => r.stdout.includes(`\n  ${c}`)) && !r.stdout.includes("dump-core"), r);
+    commands.every((c) => r.stdout.includes(`\n  ${c}`)) && !r.stdout.includes("dump-core") && !r.stdout.includes("dev-pages"), r);
 }
 const noSuch = await heff("no-such-command");
 expect("refused: no-such-command", noSuch.status === 1 && noSuch.stdout === "" &&
@@ -258,6 +260,8 @@ for (const [words, out] of [
   [["fmt", "--check", ""], ":files .hf\n"],
   [["init", ""], ":dirs\n"],
   [["completions", ""], "fish\nbash\nzsh\n"],
+  [["dev", "--p"], "--port\twhere the pages are served: http://127.0.0.1:PORT/ (8000)\n"],
+  [["de"], "dev\tthe project built as `heff build` builds it, its C programs (the APPs, else all) run and its pages served, then built and run again at each change of its files\n"],
   [["run", "main.hf", "--"], ""],
 ]) {
   const r = await heff("complete", ...words);
