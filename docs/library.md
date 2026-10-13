@@ -36,7 +36,9 @@ are imported by their names:
   `float32`, `int` with an `Int`'s bits, and `rune` with a `Rune`'s
   operations ([numbers](language.md#numbers),
   [runes and strings](language.md#runes-and-strings));
-- `bytes`, the operations of `Bytes` ([bytes](language.md#bytes)).
+- `bytes`, the operations of `Bytes` ([bytes](language.md#bytes)),
+  which a binary, `b[...]`, writes and takes apart
+  ([binaries](language.md#binaries)).
 
 ## The batteries
 

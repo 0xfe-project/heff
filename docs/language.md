@@ -176,14 +176,14 @@ The prelude has two theories of a value as a string, as Rust has
 `Debug` and `Display` and Python `repr` and `str`.  `Show` is a value
 as the source writes it, `show x`: a string quoted (`show "hi"` is
 `"\"hi\""`, its `"`, `\` and line feeds escaped), a rune quoted
-(`show 'a'` is `"'a'"`), bytes a literal (`show b"hi"` is
-`"b\"hi\""`), a list `[1, 2]`, a `Maybe` `Just (1)` or `Nothing`.  It is
+(`show 'a'` is `"'a'"`), bytes a binary (`show b["hi"]` is
+`"b[\"hi\"]"`), a list `[1, 2]`, a `Maybe` `Just (1)` or `Nothing`.  It is
 what a test shows a value as, and compares two by (`check`'s
 `assertEqual`, [tests.md](tests.md)), so two values that differ are not
 written the same.  `ToString` is a value as text, `toString x`, for a
 reader: a string itself (`toString "hi"` is `"hi"`), a rune its
 one-rune string (`toString 'a'` is `"a"`), bytes the UTF-8 text they
-are (`toString b"hi"` is `"hi"`, what is not UTF-8 U+FFFD).
+are (`toString b["hi"]` is `"hi"`, what is not UTF-8 U+FFFD).
 
 `Show`'s instances are `Int`'s (`instanceShowInt`), `Float64`'s,
 `String`'s, `Rune`'s (`instanceShowRune`), `Bytes`'
@@ -418,43 +418,95 @@ string's, `strSlice`: clamped, a negative index from the end),
 `UInt8`s), `fromString` (a string's bytes, as they are) and `eq` (as
 `==`, whose instance, `instanceEqualityBytes`, is the prelude's: no
 import is needed for it).  Their `show` and `toString` are the
-prelude's too: `show` writes them as `b"..."` (`instanceShowBytes`): a
-byte of ASCII that is printed as it is (`"` and `\` escaped), `\n`,
-`\r` and `\t`, and any other byte `\xff`; `toString` is their text
-(`instanceToStringBytes`), UTF-8, what is not UTF-8 U+FFFD, as `rune`'s `toValid` makes a string.
-
-So a literal writes them: `b` right before a string, where a token
-starts (`b "x"` is a name and a string, and so is `ab"x"`), read as a
-string is, its escapes alike -- `b"GET \xff\r\n"`.  A character as it
-is written is its UTF-8 bytes, as in a string (`b"é"` is two), `\xff`
-a byte, any, and `\u{...}` its code point's UTF-8 bytes too (`b"\u{e9}"`
-is `b"\xc3\xa9"`), a Unicode scalar value as a string's is.  What
-`show` writes is a literal of the same bytes, and the tools show a
-`Bytes` as `show` does.  A literal is a `Bytes` whatever it is checked
-at, and a pattern too, compared by bytes.  A C program has it as a
-static object, as it has a string literal; a JavaScript one makes a
-`Uint8Array` of its bytes.
-
-```haskell
-import bytes as Bytes
-
--- | >>> show (greeting "hé")
--- | "b\"hi h\\xc3\\xa9\""
--- | >>> greeting "hé" == b"hi h\u{e9}"
--- | True
-greeting : String -> Bytes
-greeting name = Bytes.append b"hi " (Bytes.fromString name)
-
--- | >>> List.map method [b"GET", Bytes.fromString "PUT"]
--- | [Just "get", Nothing]
-method : Bytes -> Maybe String
-method b"GET" = Just "get"
-method b"POST" = Just "post"
-method _ = Nothing
-```
+prelude's too: `show` writes them as a binary does
+(`instanceShowBytes`, below); `toString` is their text
+(`instanceToStringBytes`), UTF-8, what is not UTF-8 U+FFFD, as
+`rune`'s `toValid` makes a string.  A binary, `b[...]`, writes them and
+takes them apart.
 
 A C program keeps them as a buffer of bytes, a JavaScript one as a
 `Uint8Array` ([providers.md](providers.md#bytes)).
+
+### Binaries
+
+A binary, `b[...]`, is `Bytes` written as segments, one after another,
+as Erlang's and Elixir's `<<...>>` are: `b[1, 2, 255]`, `b["GET ",
+path::binary, "\r\n"]`, `b[tag::8, len::16-big, body::binary]`.  It
+opens with `b[`, a `b` where a token starts, right before the `[` (`b
+[x]` is `b` applied to a list, and `ab[x]` a name and a list), and
+each of its segments is a value, perhaps with a spec after `::`.  The
+first `::` outside parentheses ends the value, so cons in one is in
+parentheses: `(x :: xs)` (heff's types are written with `:`).  A spec
+is these, between `-`s, each at most once:
+
+- what the segment is: `integer`, an `Int` (where nothing says, a
+  segment is one, but a string), or `binary` (or `bytes`), a `Bytes`;
+- its size: a number, or `size(n)`, `n` a number or a name: an
+  integer's in bits, 8 to 64 and a multiple of 8 (8 where none is
+  said), bytes' in bytes (all of them where none is said);
+- an integer's endianness, `big` (where none is said) or `little`, and
+  its sign, `unsigned` (where none is said) or `signed`, for reading.
+
+A string written is a segment of its bytes, UTF-8, its escapes as a
+string's (`b["é"]` is two bytes, `b["\xff"]` one), and takes no spec but
+`binary`.  So `b[258::16, 258::16-little, -1::32]` is `b[1, 2, 2, 1,
+255, 255, 255, 255]`.  Made, an integer is written as its low bits, two's
+complement (`b[-1]` is `b[255]`, `b[256]` is not: a number written
+must fit, as a signed or an unsigned integer of its size), and
+`x::binary-size(n)` writes the first `n` bytes of `x` (of fewer,
+abandoned).  A binary each of whose segments is a number of a size
+written, or a string, is its bytes whole, as a literal: a C program
+has it as a static object, as it has a string literal, a JavaScript one
+makes a `Uint8Array` of them.  Otherwise its segments are made one by
+one and put together, by the prelude's primitives (`bytesOfInt`,
+`bytesConcat`).
+
+A binary in a pattern takes `Bytes` apart, the same segments, read
+left to right: a segment is a name, `_`, a number or a string (one
+that must be there), and a size may be a name an earlier segment of
+the same binary binds -- so a length read is the length of what
+follows.  Only the last segment may be bytes of no size, all that are
+left; else the binary matches bytes all read.  A binary of one such
+segment, `b[x::binary]`, matches any bytes, as `x` does.  A value a
+binary does not match goes on to the next equation, as one a literal
+does not, and a binary is matched where a row matches any value (a
+variable or `_`) after it.
+
+```haskell
+type Packet = { tag : Int, body : Bytes, rest : Bytes }
+
+-- | >>> maybe b[] (\(p : Packet) -> p.body) (packet b[7, 0, 2, "hi", "!"])
+-- | b["hi"]
+-- | >>> packet b[7, 0, 9, "hi"]
+-- | Nothing
+packet : Bytes -> Maybe Packet
+packet b[tag::8, len::16-big, body::binary-size(len), rest::binary] =
+  Just { tag = tag, body = body, rest = rest }
+packet _ = Nothing
+
+-- | >>> List.map method [b["GET /"], b[1, 255, 255], Bytes.fromString "PUT"]
+-- | ["get /", "-1", "other"]
+method : Bytes -> String
+method b["GET ", path::binary] = "get " ^ toString path
+method b[1, n::16-little-signed] = show n
+method _ = "other"
+```
+
+`show` writes bytes as a binary of them (`instanceShowBytes`, the tools as it
+does): each run of printable ASCII, a byte from 32 up to 126, a string
+(`"` and `\` escaped), and every other byte its number -- `show b["GET
+\xff\r\n"]` is `"b[\"GET \", 255, 13, 10]"`, and `b[]` is none.  What
+it writes is a binary of the same bytes.
+
+A binary is taken apart where it is elaborated, the same for every
+backend: a pattern is a test, of `Bool`, that reads the value by the
+prelude's primitives (`bytesLength`, `bytesIntAt`, `bytesHasAt`; a
+binary written whole compared by `bytesEq`), and then the names its
+segments bind, each read again (`bytesIntAt`, `bytesSlice`), the
+equation's rows matched on with them; offsets and sizes are in bits.
+A binary is whole bytes, `Bytes`: a bitstring of a length that is no
+multiple of 8 (Elixir's `bits`, a segment of 3 bits) is not one, and
+heff has none yet.
 
 ## Effects
 
