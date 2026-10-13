@@ -1,0 +1,437 @@
+-- An effect whose operations another program does: an API, shared by a
+-- client and a server, each of them a handler of the same effect.  The
+-- client's sends each operation, written (lib/wire.hf), through a
+-- transport, and goes on with the answer read; the server's reads it,
+-- does it by the effect's real handler and writes the answer; a test's
+-- does both in one program, the bytes as they would go.  Pure, for any
+-- backend: the transports are `std.remote`'s (C: an HTTP server, and a
+-- client by std.http) and `browser.remote`'s (a page's `fetch`).  Import
+-- it by a name, `import remote as Remote`.
+--
+-- An API is written once, in a module both programs import: its effect,
+-- each operation's index, name and types (`operation`), and two
+-- functions of its constructors -- what each called is (`call`) and how
+-- each is served (`serve`) -- which `api` puts together with the API's
+-- name.  Its fingerprint is a hash of the name and of every operation's
+-- index, name and types, as their `Wire`s' shapes say them: a client
+-- and a server of different builds of it are told apart.
+--
+-- A frame is what goes each way, a header and what it carries:
+--
+--   b["hw", 1::8, kind::8, fingerprint::32, index::16, n::32, payload::binary-size(n)]
+--
+-- the wire's version (1), what the frame is (0 a call, 1 its answer, 2
+-- a failure), the API's fingerprint, the operation's index (of a
+-- failure, why: 1 another API, 2 no such operation, 3 its argument not
+-- read, 4 no frame), and the payload: the argument, the answer, or what
+-- the server says of the failure, a `String` as the wire writes it.
+
+import bytes as Bytes
+import co
+import exn
+import int as Int
+import uint8 as UInt8
+import wire as Wire
+
+-- Operations
+--------------------------------------------------------------------------------
+
+-- | An operation of an API, as the wire names it: its index among the
+-- | API's operations and its name; what it takes, `a`, and what it gives
+-- | back, `b` (a constructor of no argument takes a `Unit`).
+data Operation a b = MkOperation Int String
+
+operation : {a b : Type} -> Int -> String -> Operation a b
+operation i name = MkOperation i name
+
+-- | An operation called: its index, its argument written, and its
+-- | answer read and given to what the operation gives it to.
+type Call x = { index : Int, argument : Bytes, answer : Bytes -> Maybe x }
+
+-- (an answer read, given on)
+givenTo : {b x : Type} -> (b -> x) -> Maybe b -> Maybe x
+givenTo k Nothing = Nothing
+givenTo k (Just y) = Just (k y)
+
+-- | The operation `o` called with `arg`, its answer given to `k` (the
+-- | constructor's continuation).
+call : {a b x : Type}
+     -> {{takes : Wire.Wire a}}
+     -> {{gives : Wire.Wire b}}
+     -> Operation a b
+     -> a
+     -> (b -> x)
+     -> Call x
+call (MkOperation i name) arg k =
+  { index = i
+  , argument = takes.encode arg
+  , answer = \bytes -> givenTo k (Wire.decodeAll bytes)
+  }
+
+-- | An operation served: its index, its signature (of which the API's
+-- | fingerprint is made), and its argument read and made the operation,
+-- | the answer written.
+type Served x = { index : Int, signature : String, run : Bytes -> Maybe x }
+
+-- (the operation made of the argument read, its answer written)
+madeOf : {a b x : Type}
+       -> (a -> (b -> Bytes) -> x)
+       -> (b -> Bytes)
+       -> Maybe a
+       -> Maybe x
+madeOf make written Nothing = Nothing
+madeOf make written (Just arg) = Just (make arg written)
+
+-- | The operation `o` served: `make` is its constructor, given the
+-- | argument read and what its answer is written by.
+serve : {a b x : Type}
+      -> {{takes : Wire.Wire a}}
+      -> {{gives : Wire.Wire b}}
+      -> Operation a b
+      -> (a -> (b -> Bytes) -> x)
+      -> Served x
+serve (MkOperation i name) make =
+  { index = i
+  , signature = show i ^ " " ^ name ^ " : " ^ takes.shape ^ " -> " ^ gives.shape
+  , run = \bytes -> madeOf make gives.encode (Wire.decodeAll bytes)
+  }
+
+-- APIs
+--------------------------------------------------------------------------------
+
+-- | An API: the effect `h`, its name, its fingerprint, each operation as
+-- | it is called, and each as it is served, whatever computations the
+-- | effect's functor holds (none of an API's operation is sent).
+theory Api (h : HFunctor) where
+  name : String
+  fingerprint : Int
+  calls : {m : Type -> Type} -> {x : Type} -> h.f m x -> Call x
+  serves : {m : Type -> Type} -> List (Served (h.f m Bytes))
+
+-- (FNV-1a's 32 bits of a byte, after those before it)
+hashStep : Int -> UInt8 -> Int
+hashStep h byte = (xor h (UInt8.toInt byte) * 16777619) % 4294967296
+
+-- | A text's FNV-1a hash, 32 bits.
+-- | >>> fnv ""
+-- | 2166136261
+-- | >>> fnv "a"
+-- | 3826002220
+fnv : String -> Int
+fnv s = List.foldl hashStep 2166136261 (Bytes.toList (Bytes.fromString s))
+
+-- | An API's fingerprint: its name and every operation's signature, one
+-- | a line, hashed.
+fingerprintOf : String -> List String -> Int
+fingerprintOf name signatures = fnv (joinWith "\n" (name :: signatures))
+
+-- | The API of `h`, named: `calls` says what each operation called is
+-- | (`call`), `serves` how each is served (`serve`).
+api : (h : HFunctor)
+    -> String
+    -> ({m : Type -> Type} -> {x : Type} -> h.f m x -> Call x)
+    -> ({m : Type -> Type} -> List (Served (h.f m Bytes)))
+    -> Api h
+api h name calls serves =
+  { name = name
+  , fingerprint =
+      fingerprintOf
+        name
+        (List.map
+           (\(s : Served (h.f Maybe Bytes)) -> s.signature)
+           (serves (m := Maybe)))
+  , calls = calls
+  , serves = serves
+  }
+
+-- | The API's operations' signatures, as its fingerprint is made of them.
+signatures : {h : HFunctor} -> Api h -> List String
+signatures api =
+  List.map
+    (\(s : Served (h.f Maybe Bytes)) -> s.signature)
+    (api.serves (m := Maybe))
+
+-- Frames
+--------------------------------------------------------------------------------
+
+-- | The wire's version, in each frame: a frame of another is refused.
+version : Int
+version = 1
+
+-- | What a frame is: a call, its answer, or a failure.
+data Kind = Asked | Answered | Failed
+
+kindNumber : Kind -> Int
+kindNumber Asked = 0
+kindNumber Answered = 1
+kindNumber Failed = 2
+
+kindOf : Int -> Maybe Kind
+kindOf 0 = Just Asked
+kindOf 1 = Just Answered
+kindOf 2 = Just Failed
+kindOf _ = Nothing
+
+-- | A frame read: what it is, the API's fingerprint, the operation's
+-- | index (of a failure, why), and its payload.
+type Frame = { kind : Kind, fingerprint : Int, index : Int, payload : Bytes }
+
+-- | A frame written.
+-- | >>> frame Asked 1 2 b["x"]
+-- | b["hw", 1, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 1, "x"]
+frame : Kind -> Int -> Int -> Bytes -> Bytes
+frame kind fingerprint index payload =
+  b[ "hw"
+  , version::8
+  , (kindNumber kind)::8
+  , fingerprint::32
+  , index::16
+  , (Bytes.length payload)::32
+  , payload::binary
+  ]
+
+-- (a frame, of what it is)
+framed : Int -> Int -> Bytes -> Maybe Kind -> Either String Frame
+framed fingerprint index payload Nothing =
+  Left "a frame of no kind the wire has"
+framed fingerprint index payload (Just k) =
+  Right
+    { kind = k, fingerprint = fingerprint, index = index, payload = payload }
+
+-- | A frame read: what it is, or why it is none.
+-- | >>> either (\why -> why) (\(f : Frame) -> toString f.payload) (readFrame (frame Answered 7 0 b["ok"]))
+-- | "ok"
+-- | >>> either (\why -> why) (\(f : Frame) -> "a frame") (readFrame b["hw", 2, 0])
+-- | "a frame of the wire's version 2, not 1"
+readFrame : Bytes -> Either String Frame
+readFrame b["hw", 1, kind::8, fingerprint::32, index::16, n::32, payload::binary] =
+  if Bytes.length payload == n
+    then framed fingerprint index payload (kindOf kind)
+  else Left
+      ("a frame of "
+       ^ show n
+       ^ " bytes, "
+       ^ show (Bytes.length payload)
+       ^ " there")
+readFrame b["hw", v::8, _::binary] =
+  Left ("a frame of the wire's version " ^ show v ^ ", not " ^ show version)
+readFrame _ = Left "no frame of the wire"
+
+-- Failures
+--------------------------------------------------------------------------------
+
+-- | Why a call came to no answer: no answer came (the transport's:
+-- | no connection, a status that is no 200); the server is of another
+-- | build of the API, or of the wire; it could not read the call (no
+-- | such operation, its argument); or the answer could not be read.
+data RemoteError
+  = Unreachable String
+  | Mismatched String
+  | Refused String
+  | Malformed String
+
+-- | Why, as a line.
+showRemoteError : RemoteError -> String
+showRemoteError (Unreachable why) = "unreachable: " ^ why
+showRemoteError (Mismatched why) = "mismatched: " ^ why
+showRemoteError (Refused why) = "refused: " ^ why
+showRemoteError (Malformed why) = "malformed: " ^ why
+
+-- (the fingerprint as eight hexadecimal digits)
+hexDigits : Int -> Int -> String -> String
+hexDigits 0 n acc = acc
+hexDigits k n acc =
+  hexDigits
+    (k - 1)
+    (n / 16)
+    (strSlice "0123456789abcdef" (n % 16) (n % 16 + 1) ^ acc)
+
+-- | An API's name and fingerprint, as a failure says them.
+named : String -> Int -> String
+named name fingerprint = name ^ " #" ^ hexDigits 8 fingerprint ""
+
+-- (why the server failed, by its number, as the client says it)
+failureOf : Int -> String -> RemoteError
+failureOf 1 why = Mismatched why
+failureOf 4 why = Mismatched why
+failureOf _ why = Refused why
+
+-- (what a failure's payload says)
+saidIn : Bytes -> String
+saidIn payload = fromMaybe "(unread)" (Wire.decodeAll payload)
+
+-- (the answer of the call, by what the frame that came back is)
+answerIn : {x : Type} -> Int -> Call x -> Kind -> Frame -> Either RemoteError x
+answerIn fp c Failed f = Left (failureOf f.index (saidIn f.payload))
+answerIn fp c Answered f =
+  if f.fingerprint /= fp || f.index /= c.index
+    then Left
+        (Malformed
+           ("the answer of operation "
+            ^ show f.index
+            ^ ", not "
+            ^ show c.index))
+  else maybe
+      (Left
+         (Malformed ("the answer of operation " ^ show c.index ^ " not read")))
+      (\x -> Right x)
+      (c.answer f.payload)
+answerIn fp c Asked f = Left (Malformed "a call, not an answer")
+
+-- (the answer of the call, from the frame that came back)
+answerOf : {x : Type}
+         -> Int
+         -> Call x
+         -> Either String Frame
+         -> Either RemoteError x
+answerOf fp c (Left why) = Left (Malformed why)
+answerOf fp c (Right f) = answerIn fp c f.kind f
+
+-- Clients
+--------------------------------------------------------------------------------
+
+-- (the answer that came back, or why none did)
+answerFrom : {x : Type}
+           -> Int
+           -> Call x
+           -> Either RemoteError Bytes
+           -> Either RemoteError x
+answerFrom fp c (Left err) = Left err
+answerFrom fp c (Right bytes) = answerOf fp c (readFrame bytes)
+
+-- | A transport: a frame sent, and the frame that answers it, or why
+-- | none came (`Unreachable`).  HTTP's POST is `std.remote`'s and
+-- | `browser.remote`'s; `loopback` is a server in the same program.
+type Transport (e : HFunctor) =
+  { exchange : Bytes -> Co e (Either RemoteError Bytes) }
+
+-- (an answer, or a throw)
+thrownOr : {e : HFunctor}
+         -> {{failed : exn RemoteError <: e}}
+         -> {x : Type}
+         -> Either RemoteError x
+         -> Co e x
+thrownOr (Left err) = throw err
+thrownOr (Right x) = pure x
+
+-- | An operation of the API sent by the transport, its answer read; where
+-- | none came, or it could not be read, a throw of `exn RemoteError`.
+sent : {h e : HFunctor}
+     -> {{failed : exn RemoteError <: e}}
+     -> Api h
+     -> Transport e
+     -> {a : Type}
+     -> h.f (Co e) a
+     -> Co e a
+sent api t p =
+  let c = api.calls p
+  in bind
+    (t.exchange (frame Asked api.fingerprint c.index c.argument))
+    (\r -> thrownOr (answerFrom api.fingerprint c r))
+
+-- | The client: `h`'s operations, each sent by the transport, the rest
+-- | of the world done as it is.  A call that came to no answer throws
+-- | `RemoteError` (`exn`, in `e`): `catch` hears it, and `attempt`
+-- | (lib/exn.hf) makes one no `catch` heard `Left`.
+remotely : (h e : HFunctor)
+         -> {{failed : exn RemoteError <: e}}
+         -> Api h
+         -> Transport e
+         -> {a : Type}
+         -> Co (plus h e) a
+         -> Co e a
+remotely h e api t c = handle (through h e (\p -> sent api t p)) c
+
+-- Servers
+--------------------------------------------------------------------------------
+
+-- (a failure, why by its number, and what the server says of it)
+failure : {h : HFunctor} -> Api h -> Int -> String -> Bytes
+failure api why said = frame Failed api.fingerprint why (Wire.encode said)
+
+-- (the operation of an index, among those served)
+servedAt : {x : Type} -> Int -> List (Served x) -> Maybe (Served x)
+servedAt i Nil = Nothing
+servedAt i (s :: rest) = if s.index == i then Just s else servedAt i rest
+
+-- (the operation made of the call, done, its answer a frame)
+done : {h e : HFunctor}
+     -> Api h
+     -> ({a : Type} -> h.f (Co e) a -> Co e a)
+     -> Int
+     -> Maybe (h.f (Co e) Bytes)
+     -> Co e Bytes
+done api alg i Nothing =
+  pure (failure api 3 ("the argument of operation " ^ show i ^ " not read"))
+done api alg i (Just p) =
+  bind (alg p) (\answer -> pure (frame Answered api.fingerprint i answer))
+
+-- (the operation called, if the server has it)
+servedFor : {h e : HFunctor}
+          -> Api h
+          -> ({a : Type} -> h.f (Co e) a -> Co e a)
+          -> Frame
+          -> Maybe (Served (h.f (Co e) Bytes))
+          -> Co e Bytes
+servedFor api alg f Nothing =
+  pure
+    (failure
+       api
+       2
+       ("no operation "
+        ^ show f.index
+        ^ " in "
+        ^ named api.name api.fingerprint))
+servedFor api alg f (Just s) = done api alg f.index (s.run f.payload)
+
+-- (a call, if it is one of this API's)
+respondTo : {h e : HFunctor}
+          -> Api h
+          -> ({a : Type} -> h.f (Co e) a -> Co e a)
+          -> Either String Frame
+          -> Co e Bytes
+respondTo api alg (Left why) = pure (failure api 4 why)
+respondTo api alg (Right f) =
+  if f.fingerprint /= api.fingerprint
+    then pure
+        (failure
+           api
+           1
+           ("the server's API is "
+            ^ named api.name api.fingerprint
+            ^ ", the call's #"
+            ^ hexDigits 8 f.fingerprint ""))
+  else servedFor api alg f (servedAt f.index (api.serves (m := Co e)))
+
+-- | The server: a call's frame answered, the operation done by `alg`,
+-- | the effect's real handler (as `through` takes one); a frame that is
+-- | no call of this API's answered by a failure, which the client
+-- | throws.
+respond : {h e : HFunctor}
+        -> Api h
+        -> ({a : Type} -> h.f (Co e) a -> Co e a)
+        -> Bytes
+        -> Co e Bytes
+respond api alg request = respondTo api alg (readFrame request)
+
+-- | A transport to a server in the same program: each frame answered by
+-- | `respond`, as a server would.  (No network: a test's.)
+loopback : {h e : HFunctor}
+         -> Api h
+         -> ({a : Type} -> h.f (Co e) a -> Co e a)
+         -> Transport e
+loopback api alg =
+  { exchange = \request -> bind (respond api alg request) (\r -> pure (Right r))
+  }
+
+-- | `h`'s operations done by `alg`, each through the wire as `remotely`
+-- | sends one and `respond` answers it: what a test of a client runs,
+-- | with no server.
+locally : (h e : HFunctor)
+        -> {{failed : exn RemoteError <: e}}
+        -> Api h
+        -> ({a : Type} -> h.f (Co e) a -> Co e a)
+        -> {a : Type}
+        -> Co (plus h e) a
+        -> Co e a
+locally h e api alg c = remotely h e api (loopback api alg) c
