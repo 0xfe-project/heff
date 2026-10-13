@@ -722,6 +722,22 @@ patAt c r = case nthC r.pats c of
   Just p -> p
   Nothing -> PVar "_"
 
+isName : String -> Maybe String -> Bool
+isName x (Just y) = strEq x y
+isName x Nothing = False
+
+-- | whether `x` may name the column `c` of `rows`: each row binds it
+-- | there, or has no name `x` at all -- so that, a row's variable there
+-- | renamed `x`, no other `x` of the row, another column's variable or
+-- | a name from outside, is taken for the column
+nameFits : String -> Int -> List Clause -> Bool
+nameFits x c rows =
+  allC
+    (\row ->
+       isName x (varOf (patAt c row))
+       || not (List.elemBy strEq x (rowNames row Nil)))
+    rows
+
 -- | the match compiler, knotted with its arms
 type CK =
   { compile :
@@ -742,26 +758,46 @@ findTagLit (Cons p rest) i =
 -- | (`bound`: every variable the match has bound so far, those taken
 -- | apart too -- an equation further down may still mean one of them,
 -- | so no field takes its name)
+-- | (`rows`: the arm's, its `i`th field the column `c + i`)
 armSubName : List String
            -> List String
+           -> List Clause
+           -> Int
            -> String
            -> Int
            -> Maybe String
            -> String
-armSubName used bound v i (Just x) =
-  if not (strEq x "_") && not (List.elemBy strEq x bound) then x
+armSubName used bound rows c v i (Just x) =
+  if not (strEq x "_")
+  && not (List.elemBy strEq x bound)
+  && nameFits x (c + i) rows
+    then x
   else freshIn used bound (v ^ show (i + 1))
-armSubName used bound v i Nothing = freshIn used bound (v ^ show (i + 1))
+armSubName used bound rows c v i Nothing = freshIn used bound (v ^ show (i + 1))
 
--- | the fields' names: those the first equation of the tag uses
-armSub : List String -> List String -> TagRow -> String -> Int -> String
-armSub used bound t v i = case nthC t.pats i of
-  Just p -> armSubName used bound v i (varOf p)
+-- | the fields' names: those the first equation of the tag uses, where
+-- | they fit
+armSub : List String
+       -> List String
+       -> List Clause
+       -> Int
+       -> TagRow
+       -> String
+       -> Int
+       -> String
+armSub used bound rows c t v i = case nthC t.pats i of
+  Just p -> armSubName used bound rows c v i (varOf p)
   Nothing -> freshIn used bound (v ^ show (i + 1))
 
-armFields : List String -> List String -> TagRow -> String -> List String
-armFields used bound t v =
-  List.map (\i -> armSub used bound t v i) (upTo t.arity)
+armFields : List String
+          -> List String
+          -> List Clause
+          -> Int
+          -> TagRow
+          -> String
+          -> List String
+armFields used bound rows c t v =
+  List.map (\i -> armSub used bound rows c t v i) (upTo t.arity)
 
 -- | a tag of a column, as its first row has it; whether a row has it
 -- | with another number of arguments; the rows of its arm, the last first
@@ -905,7 +941,7 @@ armOf : CK
       -> TagArm
       -> Either Err (Params.Spanned (Presyntax.Alt Presyntax.Checkable))
 armOf r used bound sp vars c v arm =
-  armWith r used bound sp vars c arm (armFields used bound arm.row v)
+  armWith r used bound sp vars c arm (armFields used bound arm.rows c arm.row v)
 
 litYesOne : Int
           -> Presyntax.Pat
@@ -1104,19 +1140,23 @@ recFieldVar c rows f = case catMaybesC
   Cons p _ -> varOf p
   Nil -> Nothing
 
--- | the name of field `f`'s column: that variable, unless it is `_` or
--- | bound already, else (a fresh) `f`
-recSubName : List String -> List String -> Maybe String -> String -> String
-recSubName used bound (Just x) f =
-  if not (strEq x "_") && not (List.elemBy strEq x bound) then x
+-- | the name of field `f`'s column, `c` of the rows taken apart
+-- | (`rows`): that variable, unless it is `_`, bound already or does
+-- | not fit, else (a fresh) `f`
+recSubName : List String
+           -> List String
+           -> List Clause
+           -> Int
+           -> Maybe String
+           -> String
+           -> String
+recSubName used bound rows c (Just x) f =
+  if not (strEq x "_")
+  && not (List.elemBy strEq x bound)
+  && nameFits x c rows
+    then x
   else freshIn used bound f
-recSubName used bound Nothing f = freshIn used bound f
-
-recSubs : List String -> List String -> Int -> List Clause -> List String
-recSubs used bound c rows =
-  List.map
-    (\f -> recSubName used bound (recFieldVar c rows f) f)
-    (recFieldNames c rows)
+recSubName used bound rows c Nothing f = freshIn used bound f
 
 orWildcard : Maybe MatchPat -> MatchPat
 orWildcard (Just p) = p
@@ -1134,6 +1174,20 @@ recSpecialize c fs v r = case patAt c r of
       (spliceAt c (List.map (\(f : String) -> PVar "_") fs) r.pats)
       (bindVar v (patAt c r) r.rhs)
 
+-- | (`fs`: the fields named, `rows`: the rows taken apart by them)
+recSubs : List String
+        -> List String
+        -> Int
+        -> List Clause
+        -> List String
+        -> List Clause
+        -> List String
+recSubs used bound c rows fs specialized =
+  mapWithIndexC
+    0
+    (\i f -> recSubName used bound specialized (c + i) (recFieldVar c rows f) f)
+    fs
+
 -- | `let y = v.f in e`, each field's column bound to its projection
 letFields : Params.Span
           -> String
@@ -1150,7 +1204,8 @@ letFields sp v (Cons (MkPair f y) rest) body =
 
 -- | a column of records: a column for each field named, bound to its
 -- | projection
--- | (`fs`: the fields named, `ys`: their columns' names)
+-- | (`fs`: the fields named, `ys`: their columns' names, `specialized`:
+-- | the rows, the column `c` of each its fields)
 recordWith : CK
            -> List String
            -> List String
@@ -1160,17 +1215,56 @@ recordWith : CK
            -> Int
            -> List String
            -> List String
+           -> List Clause
            -> Either Err Presyntax.Checkable
-recordWith r used bound sp vars rows c fs ys = do
+recordWith r used bound sp vars rows c fs ys specialized = do
   noRecMix rows c
-  body <-
-    r.compile
-      used
-      (appendC ys bound)
-      sp
-      (spliceAt c ys vars)
-      (List.map (\row -> recSpecialize c fs (varAt vars c) row) rows)
+  body <- r.compile used (appendC ys bound) sp (spliceAt c ys vars) specialized
   pure (letFields sp (varAt vars c) (zipC fs ys) body)
+
+recordFields : CK
+             -> List String
+             -> List String
+             -> Params.Span
+             -> List String
+             -> List Clause
+             -> Int
+             -> List String
+             -> List Clause
+             -> Either Err Presyntax.Checkable
+recordFields r used bound sp vars rows c fs specialized =
+  recordWith
+    r
+    used
+    bound
+    sp
+    vars
+    rows
+    c
+    fs
+    (recSubs used bound c rows fs specialized)
+    specialized
+
+recordNamed : CK
+            -> List String
+            -> List String
+            -> Params.Span
+            -> List String
+            -> List Clause
+            -> Int
+            -> List String
+            -> Either Err Presyntax.Checkable
+recordNamed r used bound sp vars rows c fs =
+  recordFields
+    r
+    used
+    bound
+    sp
+    vars
+    rows
+    c
+    fs
+    (List.map (\row -> recSpecialize c fs (varAt vars c) row) rows)
 
 recordOf : CK
          -> List String
@@ -1181,16 +1275,7 @@ recordOf : CK
          -> Int
          -> Either Err Presyntax.Checkable
 recordOf r used bound sp vars rows c =
-  recordWith
-    r
-    used
-    bound
-    sp
-    vars
-    rows
-    c
-    (recFieldNames c rows)
-    (recSubs used bound c rows)
+  recordNamed r used bound sp vars rows c (recFieldNames c rows)
 
 -- | a column of tags: an arm for each, in the order they first come,
 -- | and one for the rest if a row matches any value
@@ -2066,21 +2151,54 @@ rowVar r i = case nthC r.pats i of
   Just p -> varOf p
   Nothing -> Nothing
 
-colPick : List String -> Int -> List String -> String
-colPick used i (Cons x Nil) =
-  if strEq x "_" then fresh used ("x" ^ show (i + 1)) else x
-colPick used i xs = fresh used ("x" ^ show (i + 1))
+-- | (`taken`: the earlier columns' names)
+colPick : List String
+        -> List String
+        -> List Clause
+        -> Int
+        -> List String
+        -> String
+colPick used taken rows i (Cons x Nil) =
+  if not (strEq x "_")
+  && not (List.elemBy strEq x taken)
+  && nameFits x i rows
+    then x
+  else freshIn used taken ("x" ^ show (i + 1))
+colPick used taken rows i xs = freshIn used taken ("x" ^ show (i + 1))
 
-colFrom : List String -> List Clause -> Int -> String
-colFrom used rows i =
-  colPick used i (nubStr (catMaybesC (List.map (\r -> rowVar r i) rows)))
+colFrom : List String -> List String -> List Clause -> Int -> String
+colFrom used taken rows i =
+  colPick
+    used
+    taken
+    rows
+    i
+    (nubStr (catMaybesC (List.map (\r -> rowVar r i) rows)))
 
 -- | the name of a column: the parameter's, else the one its equations
--- | use, else a fresh one
-colName : List String -> List String -> List Clause -> Int -> String
-colName used params rows i = case nthC params i of
+-- | use where it fits, else a fresh one
+colName : List String
+        -> List String
+        -> List String
+        -> List Clause
+        -> Int
+        -> String
+colName used params taken rows i = case nthC params i of
   Just p -> p
-  Nothing -> colFrom used rows i
+  Nothing -> colFrom used taken rows i
+
+-- | the columns' names, from the `i`th of `n`
+colNames : List String
+         -> List String
+         -> List Clause
+         -> Int
+         -> Int
+         -> List String
+         -> List String
+colNames used params rows i n taken =
+  if i >= n then Nil
+  else let x = colName used params taken rows i
+       in Cons x (colNames used params rows (i + 1) n (Cons x taken))
 
 foldr2 : {a b : Type} -> (a -> b -> b) -> b -> List a -> b
 foldr2 f z Nil = z
@@ -2114,7 +2232,7 @@ desugarBody f params sp rows arity used =
     sp
     rows
     used
-    (List.map (\i -> colName used params rows i) (upTo arity))
+    (colNames used params rows 0 arity Nil)
 
 -- | the body of `f` from its equations: `params` are the parameters
 -- | named in the head of the definition
