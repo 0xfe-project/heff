@@ -819,11 +819,13 @@ lamC k xs fv held body = do
          ^ argsArr vs
          ^ ")")
 
--- (a record built in `x`'s cell (`heff_rec_reuse_nf`, lib/c/runtime.c):
--- the fields not kept computed first, `vs` at their places `changed`,
--- then stored in it; `flats`, the bits of its flat fields kept and of
--- those stored, as rc says them)
+-- (a record built in `x`'s cell (`heff_rec_reuse_nf`, lib/c/runtime.c;
+-- `heff_rec_reuse_na`, `suffix` "a", where those stored anew are flat in
+-- every record of its shape): the fields not kept computed first, `vs`
+-- at their places `changed`, then stored in it; `flats`, the bits of its
+-- flat fields kept and of those stored, as rc says them)
 updateText : String
+           -> String
            -> String
            -> Int
            -> String
@@ -831,12 +833,14 @@ updateText : String
            -> List String
            -> List Int
            -> String
-updateText x shape keep flats n vs changed =
+updateText suffix x shape keep flats n vs changed =
   "({ "
   ^ joinWith
     ""
     (List.zipWith (\v i -> "V rv_" ^ show i ^ " = " ^ v ^ "; ") vs changed)
-  ^ "V rr_ = heff_rec_reuse_nf("
+  ^ "V rr_ = heff_rec_reuse_n"
+  ^ suffix
+  ^ "("
   ^ cLocal x
   ^ ", "
   ^ show keep
@@ -1021,11 +1025,12 @@ expF k (RRec ls flat es) = do
        ^ (if flat == 0 then ", " else ", " ^ show flat ^ "u, ")
        ^ argsArr vs
        ^ ")")
-expF k (RRecIn x keep kept flat n ls changed) = do
+expF k (RRecIn x keep kept flat n ls changed su) = do
   vs <- traverseC k.exp (List.map snd changed)
   shape <- shapeLit ls
   pure
       (updateText
+         (if su then "a" else "f")
          x
          shape
          keep
@@ -1038,12 +1043,16 @@ expF k (RDupE e) = wrapC k "heff_dup(" ")" e
 expF k (RFieldV e i) = wrapC k "heff_rget_v(" (", " ^ show i ^ ")") e
 expF k (RGetN e i n) =
   wrapC k "heff_get_n(" (", " ^ show i ^ ", " ^ show n ^ ")") e
-expF k (RFieldU r e i) =
-  wrapC k ("heff_rget_" ^ reprSuffix r ^ "(") (", " ^ show i ^ ")") e
-expF k (RGetNU r e i n) =
+expF k (RFieldU r su e i) =
   wrapC
     k
-    ("heff_get_n_" ^ reprSuffix r ^ "(")
+    ((if su then "heff_rflat_" else "heff_rget_") ^ reprSuffix r ^ "(")
+    (", " ^ show i ^ ")")
+    e
+expF k (RGetNU r su e i n) =
+  wrapC
+    k
+    ((if su then "heff_get_nflat_" else "heff_get_n_") ^ reprSuffix r ^ "(")
     (", " ^ show i ^ ", " ^ show n ^ ")")
     e
 expF k (RWord r e) = wrapC k ("heff_word_" ^ reprSuffix r ^ "(") ")" e
@@ -1764,6 +1773,21 @@ builtOnlyHere others sure =
     compareString
     (List.filter (\p -> not (elemS (fst p) others)) (Map.toList sure))
 
+-- (the shapes' fields flat in every record of them the program builds,
+-- of the shapes no provider names a label of -- it may build one, its
+-- fields `V`s)
+shapesOnlyHere : List String -> Repr.FlatTags -> Repr.FlatTags
+shapesOnlyHere lbls sure =
+  Map.fromList
+    compareString
+    (List.filter
+       (\p ->
+          not
+            (List.any
+               (\l -> contains ("," ^ l ^ ",") ("," ^ fst p ^ ","))
+               lbls))
+       (Map.toList sure))
+
 ceOf : List Emit.Provider
      -> Facts.Facts
      -> Pair (List String) (List String)
@@ -1796,16 +1820,22 @@ ceOf provs facts names =
         Map.empty
         Map.empty
   , facts =
-      Facts.withFlat
-        facts.flat
-        (builtOnlyHere
-           (List.append
-              knownTags
-              (List.concatMap
-                 (\(p : Emit.Provider) -> namesInGo "TAG_" p.text 0 Nil)
-                 provs))
-           facts.sure)
-        facts
+      Facts.withSureRecs
+        (shapesOnlyHere
+           (List.concatMap
+              (\(p : Emit.Provider) -> namesInGo "LBL_" p.text 0 Nil)
+              provs)
+           facts.sureRecs)
+        (Facts.withFlat
+           facts.flat
+           (builtOnlyHere
+              (List.append
+                 knownTags
+                 (List.concatMap
+                    (\(p : Emit.Provider) -> namesInGo "TAG_" p.text 0 Nil)
+                    provs))
+              facts.sure)
+           facts)
   }
 
 programWith : String
@@ -2260,9 +2290,45 @@ tagH ce t rest =
                    (fromMaybe Nil (Map.lookup compareString t ce.facts.sure)))))
           rest))
 
+-- (the shapes of the records the worklist reads a field of, onto `acc`)
+projShapesW : List String -> List IR.Expr -> List String
+projShapesW acc Nil = acc
+projShapesW acc (Cons (EProj e _ sh _) rest) =
+  projShapesW (Cons (Repr.shapeKey sh) acc) (Cons e rest)
+projShapesW acc (Cons (ELam _ b) rest) = projShapesW acc (Cons b rest)
+projShapesW acc (Cons (EApp f as) rest) =
+  projShapesW acc (Cons f (IR.appendI as rest))
+projShapesW acc (Cons (ELet _ a b) rest) =
+  projShapesW acc (Cons a (Cons b rest))
+projShapesW acc (Cons (ERecord fs _) rest) =
+  projShapesW acc (IR.pushFields fs rest)
+projShapesW acc (Cons (ETag _ as _) rest) = projShapesW acc (IR.appendI as rest)
+projShapesW acc (Cons (EMatch s arms) rest) =
+  projShapesW acc (Cons s (IR.pushArms arms rest))
+projShapesW acc (Cons (EPrimCall _ as) rest) =
+  projShapesW acc (IR.appendI as rest)
+projShapesW acc (Cons (ECall _ as) rest) = projShapesW acc (IR.appendI as rest)
+projShapesW acc (Cons _ rest) = projShapesW acc rest
+
+-- (what is known of a record's shape: its fields that are flat)
+shapeH : CE -> String -> List IRText.HItem -> List IRText.HItem
+shapeH ce sh rest =
+  Cons
+    (HS sh)
+    (Cons
+       (HS
+          (joinWith
+             ","
+             (List.map
+                show
+                (fromMaybe
+                   Nil
+                   (Map.lookup compareString sh ce.facts.sureRecs)))))
+       rest)
+
 -- | what a definition's C is made of, hashed: its key, its body (named
--- | again from 0), and what is known of itself, of what it mentions and
--- | of the tags it matches
+-- | again from 0), and what is known of itself, of what it mentions, of
+-- | the tags it matches and of the records it reads
 emitVer : CE -> String -> IR.Expr -> String
 emitVer ce key b =
   IRText.hashOf
@@ -2274,7 +2340,7 @@ emitVer ce key b =
              (globalH ce)
              (List.foldr
                 (tagH ce)
-                Nil
+                (List.foldr (shapeH ce) Nil (sortedOnce (projShapesW Nil [b])))
                 (List.filter
                    (\t -> Map.member compareString t ce.facts.flat)
                    (sortedOnce (fst (tagsLbls b)))))

@@ -123,8 +123,9 @@ data Exp b
   -- | a record built in the cell of `x`, of `n` fields, the bits of
   -- | those kept, the bits of its flat fields kept as they are
   -- | (`Repr.keptBits`) and of those stored flat: its labels, the others
-  -- | each at its place
-  | RRecIn String Int Int Int Int (List String) (List (Pair Int (Exp b)))
+  -- | each at its place; whether each of those is flat in every record of
+  -- | its shape (`Facts.sureRecs`), so none is dropped
+  | RRecIn String Int Int Int Int (List String) (List (Pair Int (Exp b))) Bool
   -- | field `i` of a record, not counted
   | RField (Exp b) Int
   | RDupE (Exp b)
@@ -132,10 +133,11 @@ data Exp b
   | RFieldV (Exp b) Int
   -- | field `i` of a record of `n` fields, the record consumed
   | RGetN (Exp b) Int Int
-  -- | field `i` of a record, a number of the repr, flat or not: the
+  -- | field `i` of a record, a number of the repr, flat or not -- or
+  -- | flat in every record of its shape (`True`), read as it is: the
   -- | record lent (`RFieldU`), or of `n` fields and consumed (`RGetNU`)
-  | RFieldU Repr.Repr (Exp b) Int
-  | RGetNU Repr.Repr (Exp b) Int Int
+  | RFieldU Repr.Repr Bool (Exp b) Int
+  | RGetNU Repr.Repr Bool (Exp b) Int Int
   -- | an unboxed value, the bits of a flat field
   | RWord Repr.Repr (Exp b)
   -- | field `i` taken out of the record `x`
@@ -287,6 +289,7 @@ type CE =
   , sigs : Repr.Sigs
   , flat : Repr.FlatTags
   , sure : Repr.FlatTags
+  , sureRecs : Repr.FlatTags
   , ret : Repr.Repr
   }
 
@@ -312,6 +315,7 @@ withFrame s n ce =
   , sigs = ce.sigs
   , flat = ce.flat
   , sure = ce.sure
+  , sureRecs = ce.sureRecs
   , ret = retOf ce.sigs s
   }
 
@@ -331,6 +335,7 @@ withPath owned after ce =
   , sigs = ce.sigs
   , flat = ce.flat
   , sure = ce.sure
+  , sureRecs = ce.sureRecs
   , ret = ce.ret
   }
 
@@ -351,6 +356,7 @@ withBorrowed bs ce =
   , sigs = ce.sigs
   , flat = ce.flat
   , sure = ce.sure
+  , sureRecs = ce.sureRecs
   , ret = ce.ret
   }
 
@@ -370,6 +376,7 @@ withKnown x k ce =
   , sigs = ce.sigs
   , flat = ce.flat
   , sure = ce.sure
+  , sureRecs = ce.sureRecs
   , ret = ce.ret
   }
 
@@ -389,6 +396,7 @@ withTakes ts ce =
   , sigs = ce.sigs
   , flat = ce.flat
   , sure = ce.sure
+  , sureRecs = ce.sureRecs
   , ret = ce.ret
   }
 
@@ -410,6 +418,7 @@ ceOfFacts facts reprs =
   , sigs = facts.workers
   , flat = facts.flat
   , sure = facts.sure
+  , sureRecs = facts.sureRecs
   , ret = RepV
   }
 
@@ -1011,16 +1020,27 @@ fieldNum : RcK
          -> List String
          -> Imperative.Val
          -> Repr.Repr
+         -> Bool
          -> Int
          -> Int
          -> Maybe String
          -> Maybe String
          -> Value
-fieldNum r ce live e rp i n (Just x) g =
-  if elemS x live || elemS x ce.borrowed then RFieldU rp (RLocal x) i
-  else RGetNU rp (RLocal x) i n
-fieldNum r ce live e rp i n Nothing (Just g) = RFieldU rp (RGetRaw g) i
-fieldNum r ce live e rp i n Nothing Nothing = RGetNU rp (r.val ce live e) i n
+fieldNum r ce live e rp su i n (Just x) g =
+  if elemS x live || elemS x ce.borrowed then RFieldU rp su (RLocal x) i
+  else RGetNU rp su (RLocal x) i n
+fieldNum r ce live e rp su i n Nothing (Just g) = RFieldU rp su (RGetRaw g) i
+fieldNum r ce live e rp su i n Nothing Nothing =
+  RGetNU rp su (r.val ce live e) i n
+
+-- (field `i` of a record of the shape `sh` flat in every record of it:
+-- see `Facts.sureRecs`)
+sureField : CE -> List String -> Maybe Int -> Bool
+sureField ce sh (Just i) =
+  elemI
+    i
+    (fromMaybe Nil (Map.lookup compareString (Repr.shapeKey sh) ce.sureRecs))
+sureField ce sh Nothing = False
 
 -- (the field taken out of its record, if this operand takes it and the
 -- record is wanted after it: see `takesFor`)
@@ -1222,6 +1242,9 @@ updateVal r ce live fs ts x changed =
           (Cons x live)
           (List.map (\p -> slotAt ts (fst p)) changed)
           (List.map snd changed)))
+    (List.all
+       (\p -> sureField ce (List.map fst fs) (Just (fst p)))
+       changed)
 
 -- | a record built: in the cell of the one it is updated from, if any
 recordVal : RcK
@@ -1321,15 +1344,19 @@ projAs : RcK
        -> Repr.Repr
        -> Imperative.Val
        -> Imperative.Val
+       -> Bool
        -> Int
        -> Maybe Int
        -> Repr.Repr
        -> Value
-projAs r ce live want v e n (Just i) rp =
+projAs r ce live want v e su n (Just i) rp =
   if Repr.isBoxed rp || Repr.isBoxed want
     then coerce RepV want (valF r ce live v)
-  else coerce rp want (fieldNum r ce live e rp i n (varOfV e) (globalOfV e))
-projAs r ce live want v e n Nothing rp = coerce RepV want (valF r ce live v)
+  else coerce
+      rp
+      want
+      (fieldNum r ce live e rp su i n (varOfV e) (globalOfV e))
+projAs r ce live want v e su n Nothing rp = coerce RepV want (valF r ce live v)
 
 -- | a value, as the repr `want`
 valAsF : RcK -> CE -> List String -> Repr.Repr -> Imperative.Val -> Value
@@ -1349,6 +1376,7 @@ valAsF r ce live want (SProj e l sh t) =
     want
     (SProj e l sh t)
     e
+    (sureField ce sh (indexIn l 0 sh))
     (List.length sh)
     (indexIn l 0 sh)
     (Repr.readRepr (indexIn l 0 sh) t)

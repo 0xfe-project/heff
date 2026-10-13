@@ -798,6 +798,19 @@ HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uin
   return v;
 }
 
+// (... where the fields stored anew are flat in every record of its
+// shape the program builds (src/heff/compile/facts.hf, `sureRecs`): the
+// record's last reference, none dropped, nothing looked for)
+HEFF_KNOWN V heff_rec_reuse_na(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
+  Rec *r = (Rec *)v;
+  if (r->h.rc == 1) {
+    r->flat = (r->flat & kept) | flat;
+    r->lbl = lbl;
+    return v;
+  }
+  return heff_rec_reuse_nf(v, keep, n, lbl, kept, flat);
+}
+
 // (... of a compiler from before #39, which keeps no field flat)
 static inline uint32_t heff_kept_bits(uint64_t keep) {
   uint32_t kept = 0;
@@ -2475,6 +2488,18 @@ HEFF_FAST V heff_rget_v(V v, int64_t i) { return heff_rec_dup_field((Rec *)v, i)
 HEFF_GET_N_FLAT(f64, double)
 HEFF_GET_N_FLAT(i64, int64_t)
 HEFF_GET_N_FLAT(u64, uint64_t)
+
+// (... a field flat in every record of its shape the program builds
+// (src/heff/compile/facts.hf, `sureRecs`), read as it is)
+HEFF_FAST double heff_rflat_f64(V v, int64_t i) { return heff_f64_of_word(((Rec *)v)->f[i]); }
+HEFF_FAST int64_t heff_rflat_i64(V v, int64_t i) { return (int64_t)((Rec *)v)->f[i]; }
+HEFF_FAST uint64_t heff_rflat_u64(V v, int64_t i) { return (uint64_t)((Rec *)v)->f[i]; }
+#define HEFF_GET_NFLAT(S, T)                                                \
+  HEFF_KNOWN T heff_get_nflat_##S(V v, int64_t i, int64_t n) {              \
+    T x = heff_rflat_##S(v, i); heff_drop_rec(v, n); return x; }
+HEFF_GET_NFLAT(f64, double)
+HEFF_GET_NFLAT(i64, int64_t)
+HEFF_GET_NFLAT(u64, uint64_t)
 
 // A tag's fields that may be flat (#64), read where a match binds one:
 // as a number, whichever the tag holds (`heff_tget_S`, the tag looked at;
