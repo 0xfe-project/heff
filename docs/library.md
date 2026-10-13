@@ -161,6 +161,33 @@ over a grid of workgroups with buffers bound, the first at
 `Either GpuError a`.  Its provider is WebGPU's, a page's, so a kernel
 is WGSL; examples/vecadd adds two vectors of Float32s by one.
 
+A kernel is written in heff, by `gpu.kernel`'s combinators (`import
+gpu.kernel as Kernel`), not quoted: an expression of the kernel is an
+`Exp a`, `a` a `Float32`, an `Int32`, a `UInt32` or a `Bool` (the
+theory `Scalar`), built by the prelude's operators at `Exp a` -- `x +
+y`, `x * y`, `-x`, `x /. y` of floats, `x / y` and `x % y` of integers
+(instances asking `Numeric`, `Signed`, `Integral`) -- and `lit`,
+`lessThan` and the other comparisons, `both`, `either`, `negation`,
+`convert`; a buffer is an `Input a` (read) or an `Output a` (read and
+written), `load`ed at an index and asked its `length`, and `store`
+writes an `Output` alone.  A statement is an operation of the effect
+`stmt` (`define`, `store`, `when`, `ifElse`, `for`, `globalId`), so
+that a body is a `Co stmt Unit` written with `do`; `kernel1` to
+`kernel3` make a `Kernel1 a` to `Kernel3 a b c` of an entry point's
+name, a workgroup's size and the body over its buffers.  The kernel
+language has no functions, recursion or allocation: a heff function or
+recursion in a body runs as the kernel is built (staging) and leaves
+its straight code.  The types hold what WGSL would refuse only through
+the combinators -- the constructors under them are named `Unsafe...`,
+as heff has no module privacy.  `gpu.wgsl` (`import gpu.wgsl as Wgsl`)
+prints a kernel as WGSL (`source3 k`), its body by a handler of `stmt`
+whose state is a fresh-name counter and the lines; `gpu.run` (`import
+gpu.run as Run`) runs one: a `Typed a` is a buffer of `count` `a`s
+(`newTyped`, `writeTyped`, `readTyped`, `freeTyped`), and `run3 d k n
+x y z` loads `k` and dispatches it over `n` invocations, as many
+workgroups as they take.  examples/vecadd's `vecAdd` is one; test/gpu/
+pins each statement's WGSL.
+
 A program imports only its own half: a C program that imports a module
 of `lib/browser/` is refused at the import (E0351), and so is a page's
 script that imports an effect of `lib/std/` with no provider there, or

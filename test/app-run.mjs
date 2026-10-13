@@ -164,14 +164,15 @@ const until = async (what, ok, ms = 20000) => {
 // provider's wiring -- buffers made and written, bound in order, the
 // kernel dispatched, the sum copied to a buffer mapped and read back,
 // the buffers let go of.  The device runs no WGSL: its kernel adds the
-// first two buffers bound into the third, as Float32s.  (A real GPU is
-// checked by hand, in a browser with WebGPU.)
+// first two buffers bound into the third, as Float32s; the WGSL it was
+// given (gpu.wgsl's, of the example's `vecAdd`) is held to what is
+// expected.  (A real GPU is checked by hand, in a browser with WebGPU.)
 const vecadd = await run("examples/vecadd/vecadd.hf", "vecadd", withBox("vecadd"));
 if (vecadd) check("vecadd, no WebGPU", vecadd.children[0].children[0].text, "gpu: WebGPU is not here");
 // (a device of plain objects: a buffer its bytes, a command its steps,
 // done when submitted)
 const pretendGpu = () => {
-  const made = [], said = [];
+  const made = [], said = [], codes = [];
   class Buffer {
     constructor(size, usage) { this.bytes = new Uint8Array(size); this.usage = usage; this.mapped = false; made.push(this); }
     destroy() { this.destroyed = true; }
@@ -188,7 +189,7 @@ const pretendGpu = () => {
       onSubmittedWorkDone: () => Promise.resolve(),
     },
     createBuffer: ({ size, usage }) => new Buffer(size, usage),
-    createShaderModule: ({ code }) => ({ code, getCompilationInfo: () => Promise.resolve({ messages: [] }) }),
+    createShaderModule: ({ code }) => (codes.push(code), { code, getCompilationInfo: () => Promise.resolve({ messages: [] }) }),
     createComputePipelineAsync: ({ compute }) => Promise.resolve({ entry: compute.entryPoint, getBindGroupLayout: (i) => ({ group: i }) }),
     createBindGroup: ({ layout, entries }) => ({ layout, buffers: entries.map((e, i) => e.binding === i ? e.resource.buffer : null) }),
     createCommandEncoder: () => {
@@ -211,7 +212,7 @@ const pretendGpu = () => {
       };
     },
   };
-  return { made, said, gpu: { requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }) } };
+  return { made, said, codes, gpu: { requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }) } };
 };
 if (vecadd) {
   const pretend = pretendGpu(), page = new Node("body");
@@ -221,6 +222,18 @@ if (vecadd) {
     await until("vecadd, on a pretend GPU", () => { tick(); return label() !== "adding"; });
     check("vecadd, on a pretend GPU", label(), "ok");
     check("its dispatch: the entry point, the workgroups", pretend.said.join(), "add 16 1 1");
+    check("its kernel, as WGSL", pretend.codes.join("\n----\n"), [
+      "@group(0) @binding(0) var<storage, read> a : array<f32>;",
+      "@group(0) @binding(1) var<storage, read> b : array<f32>;",
+      "@group(0) @binding(2) var<storage, read_write> c : array<f32>;",
+      "@compute @workgroup_size(64)",
+      "fn add(@builtin(global_invocation_id) id : vec3<u32>) {",
+      "  let v0 = id.x;",
+      "  if (v0 < arrayLength(&c)) {",
+      "    c[v0] = a[v0] + b[v0];",
+      "  }",
+      "}",
+    ].join("\n"));
     check("its buffers and the staging one, let go of", pretend.made.map((b) => !!b.destroyed).join(), "true,true,true,true");
   }
 }
