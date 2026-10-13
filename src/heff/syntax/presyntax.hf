@@ -33,16 +33,27 @@ data SyntaxWord
 -- Binaries
 --------------------------------------------------------------------------------
 
--- | what a segment of a binary, `b[...]`, is: an integer (an `Int`, its
--- | size in bits), or bytes (`binary`, `bytes`: a `Bytes`, its size in
--- | bytes)
-data SegmentType = SegmentInteger | SegmentBinary
+-- | what a segment of a binary, `b[...]`, is: an integer (an `Int`),
+-- | bytes (`binary`, `bytes`: a `Bytes`), bits (`bits`, `bitstring`: a
+-- | `Bits`), a float (`float`: a `Float64`, IEEE's, of 64 or 32 bits),
+-- | or a code point as UTF-8, UTF-16 or UTF-32 (`utf8`, `utf16`, `utf32`:
+-- | written of an `Int` or a `Rune`, read as a `Rune`)
+data SegmentType
+  = SegmentInteger
+  | SegmentBinary
+  | SegmentBits
+  | SegmentFloat
+  | SegmentUtf Int
 
--- | a segment's size, as written: none (an integer's is 8 bits; bytes
--- | are all there are -- in a pattern, all that are left), a number, or
--- | a name (in a pattern, one an earlier segment binds, else one in
--- | scope)
-data SegmentSize = SizeDefault | SizeNumber Int | SizeName String Params.Span
+-- | a segment's size, in bits, its unit taken in: none (an integer's is
+-- | 8 bits, a float's 64; bytes and bits are all there are -- in a
+-- | pattern, all that are left; a code point's, its own), a number, or a
+-- | name (in a pattern, one an earlier segment binds, else one in scope)
+-- | times its unit
+data SegmentSize
+  = SizeDefault
+  | SizeNumber Int
+  | SizeName String Params.Span Int
 
 -- | `v::spec`, a segment of a binary: its value (a string written is its
 -- | UTF-8 bytes), what it is, its size, whether it is little-endian and
@@ -54,6 +65,52 @@ data Segment e = MkSegment e SegmentType SegmentSize Bool Bool
 segmentFlags : Bool -> Bool -> Int
 segmentFlags little signed =
   (if little then 1 else 0) + (if signed then 2 else 0)
+
+-- A binary is `Bits` where one of its segments is `bits`, or where its
+-- segments' bits past whole bytes add up to no multiple of 8 -- or to
+-- what is not known where it is elaborated: a size a name, of a unit
+-- that is no multiple of 8, or bits all that are left; otherwise it is
+-- `Bytes`.
+
+-- | how many of a segment's bits are past whole bytes, where it is
+-- | known
+segmentOdd : SegmentType -> SegmentSize -> Maybe Int
+segmentOdd SegmentBits SizeDefault = Nothing
+segmentOdd ty SizeDefault = Just 0
+segmentOdd ty (SizeNumber n) = Just (n % 8)
+segmentOdd ty (SizeName _ _ unit) = if unit % 8 == 0 then Just 0 else Nothing
+
+isBitsSegment : SegmentType -> Bool
+isBitsSegment SegmentBits = True
+isBitsSegment _ = False
+
+segOdd : {e : Type} -> Params.Spanned (Segment e) -> Maybe Int
+segOdd (At (MkSegment _ ty size _ _) _) = segmentOdd ty size
+
+segBits : {e : Type} -> Params.Spanned (Segment e) -> Bool
+segBits (At (MkSegment _ ty _ _ _) _) = isBitsSegment ty
+
+-- (bits past whole bytes added up, after `acc`, where each is known)
+oddSum : List (Maybe Int) -> Int -> Maybe Int
+oddSum Nil acc = Just (acc % 8)
+oddSum (Cons Nothing _) acc = Nothing
+oddSum (Cons (Just n) rest) acc = oddSum rest (acc + n)
+
+oddIsZero : Maybe Int -> Bool
+oddIsZero (Just n) = n == 0
+oddIsZero Nothing = False
+
+-- | whether a binary of the segments is `Bits` (else it is `Bytes`)
+isBitsBinary : {e : Type} -> List (Params.Spanned (Segment e)) -> Bool
+isBitsBinary segs =
+  List.any segBits segs || not (oddIsZero (oddSum (List.map segOdd segs) 0))
+
+-- | whether each segment is whole bytes, and none `bits`: a binary that
+-- | is read and written as bytes, never as bits
+wholeByteSegments : {e : Type} -> List (Params.Spanned (Segment e)) -> Bool
+wholeByteSegments segs =
+  not (List.any segBits segs)
+  && List.all (\m -> oddIsZero (segOdd m)) segs
 
 -- (the `k` bytes of `u`, not negative, the most significant first,
 -- after `acc`)
@@ -89,6 +146,33 @@ integerBytes bits little v =
   inOrder
     little
     (natBytes (bits / 8) ((v % twoTo bits + twoTo bits) % twoTo bits) "")
+
+-- | the code point `c`, a scalar value, as UTF-8, as `c::utf8` writes it
+-- | >>> List.map (\c -> strLength (utf8Of c)) [65, 233, 8364, 128512]
+-- | [1, 2, 3, 4]
+utf8Of : Int -> String
+utf8Of c =
+  if c < 128 then natBytes 1 c ""
+  else if c < 2048 then natBytes 2 ((192 + c / 64) * 256 + 128 + c % 64) ""
+  else if c < 65536
+    then natBytes
+        3
+        (((224 + c / 4096) * 256 + 128 + c / 64 % 64) * 256 + 128 + c % 64)
+        ""
+  else natBytes
+      4
+      ((((240 + c / 262144) * 256 + 128 + c / 4096 % 64) * 256
+        + 128
+        + c / 64 % 64)
+       * 256
+       + 128
+       + c % 64)
+      ""
+
+-- | whether `c` is a Unicode scalar value, as a code point a segment
+-- | writes is
+isScalarValue : Int -> Bool
+isScalarValue c = 0 <= c && c <= 1114111 && not (55296 <= c && c <= 57343)
 
 -- Patterns
 --------------------------------------------------------------------------------
@@ -645,23 +729,34 @@ annLamOf : String
 annLamOf x xsp t (IsInferable b) sp = IsInferable (At (IAnnLam x xsp t b) sp)
 annLamOf x xsp t b sp = IsCheckable (At (CAnnLam x xsp t (toCheckable b)) sp)
 
--- A binary, `b[...]`, is `Bytes`: those written whole, if each segment
--- is (a number of a size written, or a string), else its segments' bytes
--- put together -- those written whole together, each other an integer
--- written as bytes (`bytesOfInt`), or `Bytes` (the first so many, where
--- its size is said: `bytesSized`), by the prelude's primitives.
+-- A binary, `b[...]`, written: `Bytes` or `Bits`, as `isBitsBinary`
+-- says.  Of segments each whole bytes, its bytes: those written whole,
+-- if each segment is (a number of a size written, a string, a code point
+-- written in UTF-8), else its segments' bytes put together
+-- (`bytesConcat`) -- those written whole together, each other an
+-- integer written as bytes (`bytesOfInt`), bytes (the first so many,
+-- where its size is said: `bytesSized`), a float's bits (`floatBits`)
+-- or a code point (`utf8Bytes`, `utf16Bytes`, `utf32Bytes`), by the
+-- prelude's primitives and definitions.  Otherwise each segment is made
+-- bits (`bitsOfInt`, `bitsSized`, the others' bytes `bitsOfBytes`), they
+-- are put together (`bitsConcat`), and, the binary `Bytes`, made bytes
+-- again (`bitsBytes`).  A `bits` segment whose value is a binary written
+-- there, `b[1, 2]::bits`, is that binary made bits, whatever it is.
 
 -- (a segment's bytes, where it is written whole)
 wholeInteger : SegmentSize -> Bool -> Int -> Maybe String
 wholeInteger SizeDefault little v = Just (integerBytes 8 little v)
-wholeInteger (SizeNumber n) little v = Just (integerBytes n little v)
-wholeInteger (SizeName _ _) little v = Nothing
+wholeInteger (SizeNumber n) little v =
+  if n % 8 == 0 then Just (integerBytes n little v) else Nothing
+wholeInteger (SizeName _ _ _) little v = Nothing
 
 wholeSegment : Segment Expr -> Maybe String
 wholeSegment (MkSegment (At (EInt v) _) SegmentInteger size little _) =
   wholeInteger size little v
 wholeSegment (MkSegment (At (EString s) _) SegmentBinary SizeDefault _ _) =
   Just s
+wholeSegment (MkSegment (At (EInt c) _) (SegmentUtf 8) _ _ _) = Just (utf8Of c)
+wholeSegment (MkSegment (At (ERune c) _) (SegmentUtf 8) _ _ _) = Just (utf8Of c)
 wholeSegment _ = Nothing
 
 -- (each segment's bytes, if each is written whole, after `acc`)
@@ -672,38 +767,124 @@ wholeBinary (Cons (At seg _) rest) acc = case wholeSegment seg of
   Nothing -> Nothing
 
 -- (the primitive or definition `p` applied to `args`)
+primApp : String -> List Checkable -> Params.Span -> Inferable
+primApp p args sp =
+  At (IApp (At (IPrim p) sp) (List.map (\c -> At (ArgExplicit c) sp) args)) sp
+
 primCall : String -> List Checkable -> Params.Span -> Checkable
-primCall p args sp =
-  chkOf
-    (At
-       (IApp (At (IPrim p) sp) (List.map (\c -> At (ArgExplicit c) sp) args))
-       sp)
+primCall p args sp = chkOf (primApp p args sp)
 
-segmentSize : SegmentSize -> Int -> Params.Span -> Checkable
-segmentSize SizeDefault n sp = chkOf (At (IInt n) sp)
-segmentSize (SizeNumber n) _ sp = chkOf (At (IInt n) sp)
-segmentSize (SizeName x xsp) _ sp = chkOf (At (IVar x) xsp)
+intTerm : Int -> Params.Span -> Checkable
+intTerm n sp = chkOf (At (IInt n) sp)
 
--- (a segment not written whole, as `Bytes`)
-segmentPart : Classifier -> Params.Spanned (Segment Expr) -> Checkable
-segmentPart r (At (MkSegment v SegmentInteger size little signed) sp) =
+-- (a size in bits: `n` where none is said)
+sizeTerm : SegmentSize -> Int -> Params.Span -> Checkable
+sizeTerm SizeDefault n sp = intTerm n sp
+sizeTerm (SizeNumber m) _ sp = intTerm m sp
+sizeTerm (SizeName x xsp 1) _ sp = chkOf (At (IVar x) xsp)
+sizeTerm (SizeName x xsp unit) _ sp =
+  primCall "intMul" [chkOf (At (IVar x) xsp), intTerm unit sp] sp
+
+-- (a size in bytes, of a size that is whole bytes)
+bytesTerm : SegmentSize -> Params.Span -> Checkable
+bytesTerm (SizeName x xsp 8) sp = chkOf (At (IVar x) xsp)
+bytesTerm (SizeName x xsp unit) sp =
+  primCall "intMul" [chkOf (At (IVar x) xsp), intTerm (unit / 8) sp] sp
+bytesTerm (SizeNumber n) sp = intTerm (n / 8) sp
+bytesTerm SizeDefault sp = intTerm 0 sp
+
+-- (a code point's, of an `Int` or a `Rune`)
+codePointTerm : Classifier -> Expr -> Params.Span -> Checkable
+codePointTerm r v sp = primCall "prelude.codePointOf" [checkable r v] sp
+
+-- (a segment that is whole bytes, not written whole, as `Bytes`)
+bytesPart : Classifier -> Params.Spanned (Segment Expr) -> Checkable
+bytesPart r (At (MkSegment v SegmentInteger size little signed) sp) =
   primCall
     "bytesOfInt"
-    [ segmentSize size 8 sp
-    , chkOf (At (IInt (segmentFlags little signed)) sp)
+    [ sizeTerm size 8 sp
+    , intTerm (segmentFlags little signed) sp
     , checkable r v
     ]
     sp
-segmentPart r (At (MkSegment v SegmentBinary SizeDefault _ _) sp) =
-  checkable r v
-segmentPart r (At (MkSegment v SegmentBinary size _ _) sp) =
-  primCall "prelude.bytesSized" [segmentSize size 0 sp, checkable r v] sp
+bytesPart r (At (MkSegment v SegmentBinary SizeDefault _ _) sp) = checkable r v
+bytesPart r (At (MkSegment v SegmentBinary size _ _) sp) =
+  primCall "prelude.bytesSized" [bytesTerm size sp, checkable r v] sp
+bytesPart r (At (MkSegment v SegmentFloat size little _) sp) =
+  primCall
+    "bytesOfInt"
+    [ sizeTerm size 64 sp
+    , intTerm (segmentFlags little False) sp
+    , primCall "floatBits" [sizeTerm size 64 sp, checkable r v] sp
+    ]
+    sp
+bytesPart r (At (MkSegment v (SegmentUtf 8) _ _ _) sp) =
+  primCall "prelude.utf8Bytes" [codePointTerm r v sp] sp
+bytesPart r (At (MkSegment v (SegmentUtf 16) _ little _) sp) =
+  primCall
+    "prelude.utf16Bytes"
+    [intTerm (segmentFlags little False) sp, codePointTerm r v sp]
+    sp
+bytesPart r (At (MkSegment v (SegmentUtf _) _ little _) sp) =
+  primCall
+    "prelude.utf32Bytes"
+    [intTerm (segmentFlags little False) sp, codePointTerm r v sp]
+    sp
+-- (none: a binary of `bits` is made of bits)
+bytesPart r (At (MkSegment v SegmentBits _ _ _) sp) =
+  primCall "bitsBytes" [checkable r v] sp
+
+-- | how a binary of bits made inside another is made: `b[1, 2]::bits`
+type Nest =
+  { bits : List (Params.Spanned (Segment Expr)) -> Params.Span -> Checkable }
+
+-- (the value of a `bits` segment: a binary written there, made bits)
+-- (a binary's segments, of a binary written)
+binarySegments : ExprF -> Maybe (List (Params.Spanned (Segment Expr)))
+binarySegments (EBinary segs) = Just segs
+binarySegments _ = Nothing
+
+bitsValueOf : Nest
+            -> Classifier
+            -> Expr
+            -> Maybe (List (Params.Spanned (Segment Expr)))
+            -> Checkable
+bitsValueOf k r v (Just segs) = k.bits segs (Params.spanOf v)
+bitsValueOf k r v Nothing = checkable r v
+
+bitsValue : Nest -> Classifier -> Expr -> Checkable
+bitsValue k r (At e sp) = bitsValueOf k r (At e sp) (binarySegments e)
+
+-- (a segment, not written whole, as `Bits`)
+bitsPart : Nest -> Classifier -> Params.Spanned (Segment Expr) -> Checkable
+bitsPart k r (At (MkSegment v SegmentInteger size little signed) sp) =
+  primCall
+    "bitsOfInt"
+    [ sizeTerm size 8 sp
+    , intTerm (segmentFlags little signed) sp
+    , checkable r v
+    ]
+    sp
+bitsPart k r (At (MkSegment v SegmentBits SizeDefault _ _) sp) = bitsValue k r v
+bitsPart k r (At (MkSegment v SegmentBits size _ _) sp) =
+  primCall "prelude.bitsSized" [sizeTerm size 0 sp, bitsValue k r v] sp
+bitsPart k r seg = primCall "bitsOfBytes" [bytesPart r seg] (Params.spanOf seg)
+
+-- | how the parts of a binary are made: a segment not written whole, and
+-- | bytes that are
+type Maker =
+  { part : Params.Spanned (Segment Expr) -> Checkable
+  , run : String -> Params.Span -> Checkable
+  }
 
 -- (the bytes written whole so far, `run`, among the parts, the last
 -- first)
-partsWith : Maybe (Pair String Params.Span) -> List Checkable -> List Checkable
-partsWith Nothing acc = acc
-partsWith (Just (MkPair s sp)) acc = Cons (chkOf (At (IBytes s) sp)) acc
+partsWith : Maker
+          -> Maybe (Pair String Params.Span)
+          -> List Checkable
+          -> List Checkable
+partsWith m Nothing acc = acc
+partsWith m (Just (MkPair s sp)) acc = Cons (m.run s sp) acc
 
 runWith : Maybe (Pair String Params.Span)
         -> String
@@ -714,49 +895,94 @@ runWith (Just (MkPair s0 sp0)) s sp = Just (MkPair (s0 ^ s) (spanning sp0 sp))
 
 -- (the parts of the segments, the last first: those written whole one
 -- after another together, `run` those so far)
-binaryParts : Classifier
+binaryParts : Maker
             -> List (Params.Spanned (Segment Expr))
             -> Maybe (Pair String Params.Span)
             -> List Checkable
             -> List Checkable
-binaryParts r Nil run acc = partsWith run acc
-binaryParts r (Cons (At seg sp) rest) run acc = case wholeSegment seg of
-  Just s -> binaryParts r rest (runWith run s sp) acc
+binaryParts m Nil run acc = partsWith m run acc
+binaryParts m (Cons (At seg sp) rest) run acc = case wholeSegment seg of
+  Just s -> binaryParts m rest (runWith run s sp) acc
   Nothing ->
-    binaryParts
-      r
-      rest
-      Nothing
-      (Cons (segmentPart r (At seg sp)) (partsWith run acc))
+    binaryParts m rest Nothing (Cons (m.part (At seg sp)) (partsWith m run acc))
 
 -- (a list of them, as its tags make it)
 listOfChk : List Checkable -> Params.Span -> Checkable
 listOfChk Nil sp = At (CTag "Nil" sp Nil) sp
 listOfChk (Cons x xs) sp = At (CTag "Cons" sp [x, listOfChk xs sp]) sp
 
-binaryWith : Classifier
+-- (the parts put together by `p`)
+concatOf : String
+         -> Maker
+         -> List (Params.Spanned (Segment Expr))
+         -> Params.Span
+         -> Inferable
+concatOf p m segs sp =
+  primApp p [listOfChk (List.reverse (binaryParts m segs Nothing Nil)) sp] sp
+
+bytesMaker : Classifier -> Maker
+bytesMaker r = { part = bytesPart r, run = \s sp -> chkOf (At (IBytes s) sp) }
+
+bitsMaker : Nest -> Classifier -> Maker
+bitsMaker k r =
+  { part = bitsPart k r
+  , run = \s sp -> primCall "bitsOfBytes" [chkOf (At (IBytes s) sp)] sp
+  }
+
+-- (bytes, written whole where they are)
+bytesBinary : Classifier
+            -> List (Params.Spanned (Segment Expr))
+            -> Params.Span
+            -> Maybe String
+            -> Classified
+bytesBinary r segs sp (Just s) = IsInferable (At (IBytes s) sp)
+bytesBinary r segs sp Nothing =
+  IsInferable (concatOf "bytesConcat" (bytesMaker r) segs sp)
+
+-- (made of bits: `Bits`, or, `bytes`, made bytes again)
+bitsBinary : Nest
+           -> Classifier
            -> List (Params.Spanned (Segment Expr))
            -> Params.Span
-           -> Maybe String
+           -> Bool
            -> Classified
-binaryWith r segs sp (Just s) = IsInferable (At (IBytes s) sp)
-binaryWith r segs sp Nothing =
+bitsBinary k r segs sp False =
+  IsInferable (concatOf "bitsConcat" (bitsMaker k r) segs sp)
+bitsBinary k r segs sp True =
   IsInferable
-    (At
-       (IApp
-          (At (IPrim "bytesConcat") sp)
-          [ At
-            (ArgExplicit
-               (listOfChk (List.reverse (binaryParts r segs Nothing Nil)) sp))
-            sp
-          ])
+    (primApp
+       "bitsBytes"
+       [chkOf (concatOf "bitsConcat" (bitsMaker k r) segs sp)]
        sp)
+
+-- | a binary, written (`asBits`: made bits, whatever it is)
+binaryIn : Classifier
+         -> Bool
+         -> List (Params.Spanned (Segment Expr))
+         -> Params.Span
+         -> Classified
+binaryIn r asBits segs sp =
+  if asBits || isBitsBinary segs
+    then bitsBinary
+        { bits = \s sp2 -> toCheckable (binaryIn r True s sp2) }
+        r
+        segs
+        sp
+        False
+  else if wholeByteSegments segs
+    then bytesBinary r segs sp (wholeBinary segs "")
+  else bitsBinary
+      { bits = \s sp2 -> toCheckable (binaryIn r True s sp2) }
+      r
+      segs
+      sp
+      True
 
 binaryOf : Classifier
          -> List (Params.Spanned (Segment Expr))
          -> Params.Span
          -> Classified
-binaryOf r segs sp = binaryWith r segs sp (wholeBinary segs "")
+binaryOf r segs sp = binaryIn r False segs sp
 
 classifyTermF : Classifier -> Expr -> Classified
 classifyTermF r (At (EVar x) sp) = IsInferable (At (IVar x) sp)

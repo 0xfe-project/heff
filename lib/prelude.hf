@@ -21,6 +21,14 @@ data Either a b = Left a | Right b
 -- | `instanceShowBytes`, and its `ToString`, `instanceToStringBytes`
 data Bytes
 
+-- | Bits, a bitstring of any length, not changed once made: a type of
+-- | its own beside `Bytes` (which are whole bytes), written `b[...]`
+-- | where its segments are not whole bytes (`b[5::3]`), whose operations
+-- | are `bits`'s (`import bits as Bits`), but its equality,
+-- | `instanceEqualityBits`, its `Show`, `instanceShowBits`, and its
+-- | `ToString`, `instanceToStringBits`
+data Bits
+
 -- | `x :: xs` is `Cons x xs`; a pattern too, as it only names the tag
 (::) : {a : Type} -> a -> List a -> List a
 (::) x xs = Cons x xs
@@ -958,6 +966,276 @@ instanceToStringUnit = { toString = show }
 -- | "True MkUnit GT"
 instance instanceToStringOrdering : ToString Ordering
 instanceToStringOrdering = { toString = show }
+
+-- Binaries
+--------------------------------------------------------------------------------
+
+-- What a binary, `b[...]`, is made and taken apart by, beside the
+-- bytes' above: `Bits`' primitives -- their length, an integer of `n`
+-- bits at bit `o` (the flags `f` 1 for little-endian, 2 for signed), one
+-- written as bits, many put together, the `n` from bit `o`, bytes as
+-- bits and bits that are whole bytes as bytes (others, abandoned) -- a
+-- float's IEEE bits (of 64 or 32) and the float of them, and a segment's
+-- `utf8`, `utf16` and `utf32`, read and written.
+
+primitive bitsEq : Bits -> Bits -> Bool
+primitive bitsLength : Bits -> Int
+primitive bitsIntAt : Bits -> Int -> Int -> Int -> Int
+primitive bitsOfInt : Int -> Int -> Int -> Bits
+primitive bitsConcat : List Bits -> Bits
+primitive bitsSlice : Bits -> Int -> Int -> Bits
+primitive bitsOfBytes : Bytes -> Bits
+primitive bitsBytes : Bits -> Bytes
+primitive floatBits : Int -> Float64 -> Int
+primitive floatOfBits : Int -> Int -> Float64
+primitive runeFromInt : Int -> Rune
+
+-- | The first `n` bits of `b`, as a segment `x::bits-size(n)` writes
+-- | them: of fewer, abandoned.
+bitsSized : Int -> Bits -> Bits
+bitsSized n b = if 0 <= n && n <= bitsLength b then bitsSlice b 0 n else abandon
+
+-- | Whether the bytes `s` are those of `b` at bit `o`.
+-- | >>> bitsHasBytesAt (bitsConcat [bitsOfInt 4 0 1, bitsOfBytes b["hi"]]) 4 b["hi"]
+-- | True
+bitsHasBytesAt : Bits -> Int -> Bytes -> Bool
+bitsHasBytesAt b o s =
+  if 0 <= o && o + 8 * bytesLength s <= bitsLength b
+    then bitsEq (bitsSlice b o (8 * bytesLength s)) (bitsOfBytes s)
+  else False
+
+-- | What a segment of `utf8`, `utf16` or `utf32` writes: a code point,
+-- | an `Int`'s or a `Rune`'s.
+theory CodePoint (a : Type) where
+  codePoint : a -> Int
+
+instance instanceCodePointInt : CodePoint Int
+instanceCodePointInt = { codePoint = \n -> n }
+
+instance instanceCodePointRune : CodePoint Rune
+instanceCodePointRune = { codePoint = runeToInt }
+
+-- | The code point of a value of `CodePoint`.
+codePointOf : {a : Type} -> {{point : CodePoint a}} -> a -> Int
+codePointOf = point.codePoint
+
+-- | Whether `c` is a Unicode scalar value: from 0 up to U+10FFFF, but
+-- | the surrogates.
+isScalarValue : Int -> Bool
+isScalarValue c = 0 <= c && c <= 1114111 && not (55296 <= c && c <= 57343)
+
+-- | The code point `c` as UTF-8, as a segment `c::utf8` writes it: what
+-- | is no scalar value, abandoned.
+-- | >>> bytesToList (bytesConcat [utf8Bytes 65, utf8Bytes 233, utf8Bytes 8364, utf8Bytes 128512])
+-- | [65, 195, 169, 226, 130, 172, 240, 159, 152, 128]
+utf8Bytes : Int -> Bytes
+utf8Bytes c =
+  if not (isScalarValue c) then abandon
+  else if c < 128 then bytesOfInt 8 0 c
+  else if c < 2048 then bytesOfInt 16 0 ((192 + c / 64) * 256 + 128 + c % 64)
+  else if c < 65536
+    then bytesOfInt
+        24
+        0
+        (((224 + c / 4096) * 256 + 128 + c / 64 % 64) * 256 + 128 + c % 64)
+  else bytesOfInt
+      32
+      0
+      ((((240 + c / 262144) * 256 + 128 + c / 4096 % 64) * 256
+        + 128
+        + c / 64 % 64)
+       * 256
+       + 128
+       + c % 64)
+
+-- | The code point `c` as UTF-16, as a segment `c::utf16` writes it,
+-- | its units as the flags `f` say (1 little-endian): what is no scalar
+-- | value, abandoned.
+utf16Bytes : Int -> Int -> Bytes
+utf16Bytes f c =
+  if not (isScalarValue c) then abandon
+  else if c < 65536 then bytesOfInt 16 f c
+  else bytesConcat
+      [ bytesOfInt 16 f (55296 + (c - 65536) / 1024)
+      , bytesOfInt 16 f (56320 + (c - 65536) % 1024)
+      ]
+
+-- | The code point `c` as UTF-32: what is no scalar value, abandoned.
+utf32Bytes : Int -> Int -> Bytes
+utf32Bytes f c = if isScalarValue c then bytesOfInt 32 f c else abandon
+
+-- (how many bytes UTF-8 whose first byte is `c` has: of no first byte,
+-- 0)
+utf8Count : Int -> Int
+utf8Count c =
+  if c < 0 then 0
+  else if c < 128 then 1
+  else if c < 194 then 0
+  else if c < 224 then 2
+  else if c < 240 then 3
+  else if c < 245 then 4
+  else 0
+
+-- (what the first byte of `w` has above its code point's bits)
+utf8Lead : Int -> Int
+utf8Lead 2 = 192
+utf8Lead 3 = 224
+utf8Lead 4 = 240
+utf8Lead _ = 0
+
+-- (the least code point of `w` bytes: one of fewer is overlong)
+utf8Least : Int -> Int
+utf8Least 2 = 128
+utf8Least 3 = 2048
+utf8Least 4 = 65536
+utf8Least _ = 0
+
+-- (the code point of the bytes `byte` reads, the `i`th on, `w` of them,
+-- after `acc`: of a byte that is no continuation, -1)
+utf8Rest : (Int -> Int) -> Int -> Int -> Int -> Int
+utf8Rest byte w i acc =
+  if i >= w then acc
+  else if 128 <= byte i && byte i < 192
+    then utf8Rest byte w (i + 1) (acc * 64 + byte i - 128)
+  else 0 - 1
+
+-- (the code point of the UTF-8 whose bytes `byte` reads (the `i`th, -1
+-- past them), of `w` bytes)
+utf8CodeBy : (Int -> Int) -> Int -> Int
+utf8CodeBy byte w = utf8Rest byte w 1 (byte 0 - utf8Lead w)
+
+-- (its width in bits: of what is no code point, or one written longer
+-- than it is, 0)
+utf8WidthOf : Int -> Int -> Int
+utf8WidthOf w c =
+  if w > 0 && isScalarValue c && utf8Least w <= c then 8 * w else 0
+
+utf8WidthBy : (Int -> Int) -> Int
+utf8WidthBy byte =
+  utf8WidthOf (utf8Count (byte 0)) (utf8CodeBy byte (utf8Count (byte 0)))
+
+-- (the `i`th byte at bit `o`: of none, -1)
+bytesByteAt : Bytes -> Int -> Int -> Int
+bytesByteAt b o i =
+  if o + 8 * i + 8 <= 8 * bytesLength b then bytesIntAt b (o + 8 * i) 8 0
+  else 0 - 1
+
+bitsByteAt : Bits -> Int -> Int -> Int
+bitsByteAt b o i =
+  if o + 8 * i + 8 <= bitsLength b then bitsIntAt b (o + 8 * i) 8 0
+  else 0 - 1
+
+-- | How many bits the UTF-8 code point at bit `o` of `b` is, as a
+-- | segment `c::utf8` reads it: where there is none (a byte that is no
+-- | continuation, too few, a surrogate, one written longer than it is),
+-- | 0.
+-- | >>> ([bytesUtf8Width b["a", 0xc3, 0xa9] 0, bytesUtf8Width b["a", 0xc3, 0xa9] 8, bytesUtf8Width b[0xc3, 0x28] 0, bytesUtf8Width b[0xed, 0xa0, 0x80] 0, bytesUtf8Width b[0xc0, 0x80] 0, bytesUtf8Width b[0xc3] 0] : List Int)
+-- | [8, 16, 0, 0, 0, 0]
+bytesUtf8Width : Bytes -> Int -> Int
+bytesUtf8Width b o = utf8WidthBy (bytesByteAt b o)
+
+bitsUtf8Width : Bits -> Int -> Int
+bitsUtf8Width b o = utf8WidthBy (bitsByteAt b o)
+
+-- | The UTF-8 code point at bit `o` of `b`, there.
+bytesUtf8At : Bytes -> Int -> Rune
+bytesUtf8At b o =
+  runeFromInt (utf8CodeBy (bytesByteAt b o) (utf8Count (bytesByteAt b o 0)))
+
+bitsUtf8At : Bits -> Int -> Rune
+bitsUtf8At b o =
+  runeFromInt (utf8CodeBy (bitsByteAt b o) (utf8Count (bitsByteAt b o 0)))
+
+-- (the UTF-16 whose units `unit` reads (the `i`th, -1 past them): how
+-- many bits, of none 0, and its code point)
+utf16WidthBy : (Int -> Int) -> Int
+utf16WidthBy unit =
+  if unit 0 < 0 then 0
+  else if 55296 <= unit 0 && unit 0 < 56320
+    then (if 56320 <= unit 1 && unit 1 < 57344 then 32 else 0)
+  else if 56320 <= unit 0 && unit 0 < 57344 then 0
+  else 16
+
+utf16CodeBy : (Int -> Int) -> Int
+utf16CodeBy unit =
+  if 55296 <= unit 0 && unit 0 < 56320
+    then 65536 + (unit 0 - 55296) * 1024 + unit 1 - 56320
+  else unit 0
+
+-- (the `i`th unit of 16 bits at bit `o`, as the flags `f` say: of none,
+-- -1)
+bytesUnitAt : Bytes -> Int -> Int -> Int -> Int
+bytesUnitAt b o f i =
+  if o + 16 * i + 16 <= 8 * bytesLength b
+    then bytesIntAt b (o + 16 * i) 16 f
+  else 0 - 1
+
+bitsUnitAt : Bits -> Int -> Int -> Int -> Int
+bitsUnitAt b o f i =
+  if o + 16 * i + 16 <= bitsLength b then bitsIntAt b (o + 16 * i) 16 f
+  else 0 - 1
+
+-- | How many bits the UTF-16 code point at bit `o` of `b` is, its units
+-- | as the flags `f` say: where there is none, 0.
+bytesUtf16Width : Bytes -> Int -> Int -> Int
+bytesUtf16Width b o f = utf16WidthBy (bytesUnitAt b o f)
+
+bitsUtf16Width : Bits -> Int -> Int -> Int
+bitsUtf16Width b o f = utf16WidthBy (bitsUnitAt b o f)
+
+-- | The UTF-16 code point at bit `o` of `b`, there.
+bytesUtf16At : Bytes -> Int -> Int -> Rune
+bytesUtf16At b o f = runeFromInt (utf16CodeBy (bytesUnitAt b o f))
+
+bitsUtf16At : Bits -> Int -> Int -> Rune
+bitsUtf16At b o f = runeFromInt (utf16CodeBy (bitsUnitAt b o f))
+
+-- | `Bits`' (their other operations are `bits`'s): the same bits.
+-- | >>> bitsOfInt 3 0 5 == bitsConcat [bitsOfInt 1 0 1, bitsOfInt 2 0 1]
+-- | True
+-- | >>> bitsOfBytes b[1, 2] == bitsOfInt 16 0 258
+-- | True
+instance instanceEqualityBits : Equality Bits
+instanceEqualityBits = { equal = bitsEq }
+
+-- | Bits as a binary writes them: their whole bytes as bytes are
+-- | (`instanceShowBytes`), then the bits left, `v::k` -- or, none left,
+-- | `b[]::bits`, so that what is written is `Bits` again.
+-- | >>> show (bitsConcat [bitsOfBytes b["GET"], bitsOfInt 3 0 5])
+-- | "b[\"GET\", 5::3]"
+-- | >>> show (bitsOfBytes b[1, 2]) ^ " " ^ show (bitsOfBytes b[]) ^ " " ^ show (bitsOfInt 1 0 1)
+-- | "b[1, 2, b[]::bits] b[b[]::bits] b[1::1]"
+instance instanceShowBits : Show Bits
+instanceShowBits = { show = written }
+  where
+  -- (the bits left, after the whole bytes, `k` of them)
+  tail : Bits -> Int -> String
+  tail b 0 = "b[]::bits"
+  tail b k = intShow (bitsIntAt b (bitsLength b - k) k 0) ^ "::" ^ intShow k
+
+  -- (a binary written, its `]` left off)
+  unclosed : String -> String
+  unclosed s = strSlice s 0 (strLength s - 1)
+
+  written : Bits -> String
+  written b =
+    unclosed
+      (instanceShowBytes.show
+         (bitsBytes (bitsSlice b 0 (bitsLength b / 8 * 8))))
+    ^ (if bitsLength b < 8 then "" else ", ")
+    ^ tail b (bitsLength b % 8)
+    ^ "]"
+
+-- | Their bits, each `0` or `1`.
+-- | >>> toString (bitsOfInt 5 0 21)
+-- | "10101"
+instance instanceToStringBits : ToString Bits
+instanceToStringBits = { toString = \b -> digits b 0 "" }
+  where
+  digits : Bits -> Int -> String -> String
+  digits b i acc =
+    if i >= bitsLength b then acc
+    else digits b (i + 1) (acc ^ intShow (bitsIntAt b i 1 0))
 
 -- Nat
 --------------------------------------------------------------------------------

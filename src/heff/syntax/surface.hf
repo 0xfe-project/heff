@@ -1438,27 +1438,38 @@ opL r a op b =
 
 -- Binaries
 
--- A segment of a binary, `v::spec`: its spec is words, numbers and
--- `size(n)` between `-`s -- what it is (`integer`, `binary` or `bytes`),
--- its size (a number, or `size(n)`, `n` a number or a name), its
--- endianness (`big`, `little`) and sign (`signed`, `unsigned`), each
--- said at most once.  An integer's size is in bits, of 8 to 64 and a
--- multiple of 8; bytes' in bytes.  A string is its bytes, all of them.
+-- A segment of a binary, `v::spec`: its spec is words, numbers,
+-- `size(n)` and `unit(n)` between `-`s -- what it is (`integer`,
+-- `binary` or `bytes`, `bits` or `bitstring`, `float`, `utf8`, `utf16`,
+-- `utf32`), its size (a number, or `size(n)`, `n` a number or a name),
+-- its unit (`unit(n)`, what the size counts: bits, 1 for an integer,
+-- bits and a float, 8 for bytes), its endianness (`big`, `little`) and
+-- sign (`signed`, `unsigned`), each said at most once.  An integer is of
+-- 1 to 64 bits, a float of 32 or 64; a code point says no size.  A
+-- string is its bytes, all of them.  Where no type is said, a string is
+-- bytes, a float a `float`, a rune `utf8`, anything else an integer.
 
--- | a spec, as read so far: each part, if it is said
+-- | a spec, as read so far: each part, if it is said (its size, a number
+-- | or a name, of units)
 type Spec =
   { ty : Maybe Presyntax.SegmentType
   , size : Presyntax.SegmentSize
+  , unit : Maybe Int
   , little : Maybe Bool
   , signed : Maybe Bool
   }
 
 emptySpec : Spec
 emptySpec =
-  { ty = Nothing, size = SizeDefault, little = Nothing, signed = Nothing }
+  { ty = Nothing
+  , size = SizeDefault
+  , unit = Nothing
+  , little = Nothing
+  , signed = Nothing
+  }
 
 -- | what a segment's value is, as the spec is checked against it
-data SegValue = StrValue | IntValue Int | OtherValue
+data SegValue = StrValue | IntValue Int | FloatValue | RuneValue | OtherValue
 
 saidTwice : {a : Type} -> Params.Span -> String -> P a
 saidTwice sp what = throwP (diag sp ("a segment says its " ^ what ^ " once"))
@@ -1478,6 +1489,10 @@ sizeSaid : Params.Span
          -> P Spec
 sizeSaid sp n SizeDefault s = pure { s | size = n }
 sizeSaid sp n _ s = saidTwice sp "size"
+
+unitSaid : Params.Span -> Int -> Maybe Int -> Spec -> P Spec
+unitSaid sp n Nothing s = pure { s | unit = Just n }
+unitSaid sp n (Just _) s = saidTwice sp "unit"
 
 littleSaid : Params.Span -> Bool -> Maybe Bool -> Spec -> P Spec
 littleSaid sp b Nothing s = pure { s | little = Just b }
@@ -1500,26 +1515,40 @@ notSpec sp =
   throwP
     (diag
        sp
-       "a segment's spec is its type (`integer`, `binary`, `bytes`), size (`16`, `size(n)`), endianness (`big`, `little`) and sign (`signed`, `unsigned`), between `-`s: `x::16-little`")
+       "a segment's spec is its type (`integer`, `binary`, `bits`, `float`, `utf8`, `utf16`, `utf32`), size (`16`, `size(n)`), unit (`unit(8)`), endianness (`big`, `little`) and sign (`signed`, `unsigned`), between `-`s: `x::16-little`")
 
+-- (a word of a spec: a type, an endianness, a sign)
 specWord : CST.T -> Spec -> P Spec
 specWord t s =
   if strEq t.text "integer" then typeSaid (spanT t) SegmentInteger s.ty s
   else if strEq t.text "binary" || strEq t.text "bytes"
     then typeSaid (spanT t) SegmentBinary s.ty s
+  else if strEq t.text "bits" || strEq t.text "bitstring"
+    then typeSaid (spanT t) SegmentBits s.ty s
+  else if strEq t.text "float" then typeSaid (spanT t) SegmentFloat s.ty s
+  else if strEq t.text "utf8" then typeSaid (spanT t) (SegmentUtf 8) s.ty s
+  else if strEq t.text "utf16" then typeSaid (spanT t) (SegmentUtf 16) s.ty s
+  else if strEq t.text "utf32" then typeSaid (spanT t) (SegmentUtf 32) s.ty s
   else if strEq t.text "big" then littleSaid (spanT t) False s.little s
   else if strEq t.text "little" then littleSaid (spanT t) True s.little s
   else if strEq t.text "signed" then signedSaid (spanT t) True s.signed s
   else if strEq t.text "unsigned" then signedSaid (spanT t) False s.signed s
   else notSpec (spanT t)
 
--- (`n` in `size(n)`)
+-- (`n` in `size(n)`, of units)
 sizeOf : CST.T -> Presyntax.SegmentSize
 sizeOf n =
   if strEq n.kind "int" then SizeNumber (intOfText n.text)
-  else SizeName n.text (spanT n)
+  else SizeName n.text (spanT n) 1
 
--- (a group of a spec: a word, a number, `size(n)`)
+-- (`unit(n)`: of 1 to 256 bits)
+unitOf : Params.Span -> CST.T -> Spec -> P Spec
+unitOf sp n s =
+  if strEq n.kind "int" && 1 <= intOfText n.text && intOfText n.text <= 256
+    then unitSaid sp (intOfText n.text) s.unit s
+  else throwP (diag sp "a unit is a number of bits, 1 to 256: `unit(8)`")
+
+-- (a group of a spec: a word, a number, `size(n)`, `unit(n)`)
 specGroup : Params.Span -> Spec -> List CST.T -> P Spec
 specGroup sp s (Cons t Nil) =
   if strEq t.kind "int"
@@ -1532,6 +1561,8 @@ specGroup sp s (Cons f (Cons o (Cons n (Cons c Nil)))) =
   && strEq c.text ")"
   && (strEq n.kind "int" || strEq n.kind "var")
     then sizeSaid (spanTT f c) (sizeOf n) s.size s
+  else if strEq f.text "unit" && strEq o.text "(" && strEq c.text ")"
+    then unitOf (spanTT f c) n s
   else notSpec (spanTT f c)
 specGroup sp s (Cons t rest) = notSpec (spanT t)
 specGroup sp s Nil = notSpec sp
@@ -1550,12 +1581,26 @@ orFalse : Maybe Bool -> Bool
 orFalse (Just b) = b
 orFalse Nothing = False
 
--- (a segment's type, as said, else a string's bytes and anything else an
--- integer)
+-- (a segment's type, as said, else a string's bytes, a float's a float,
+-- a rune's UTF-8 and anything else an integer)
 typeOf : SegValue -> Maybe Presyntax.SegmentType -> Presyntax.SegmentType
 typeOf v (Just t) = t
 typeOf StrValue Nothing = SegmentBinary
+typeOf FloatValue Nothing = SegmentFloat
+typeOf RuneValue Nothing = SegmentUtf 8
 typeOf v Nothing = SegmentInteger
+
+-- (what a size counts, as said, else bytes' 8 bits and the others' 1)
+unitIn : Presyntax.SegmentType -> Maybe Int -> Int
+unitIn ty (Just u) = u
+unitIn SegmentBinary Nothing = 8
+unitIn ty Nothing = 1
+
+-- (a size, of units, in bits)
+sizeIn : Int -> Presyntax.SegmentSize -> Presyntax.SegmentSize
+sizeIn unit SizeDefault = SizeDefault
+sizeIn unit (SizeNumber n) = SizeNumber (n * unit)
+sizeIn unit (SizeName x xsp _) = SizeName x xsp unit
 
 -- | 2 to the `k`
 twoToS : Int -> Int
@@ -1571,7 +1616,7 @@ fitsIn False signed n v = 0 - twoToS (n - 1) <= v && v < twoToS n
 sizeBits : Presyntax.SegmentSize -> Maybe Int
 sizeBits SizeDefault = Just 8
 sizeBits (SizeNumber n) = Just n
-sizeBits (SizeName _ _) = Nothing
+sizeBits (SizeName _ _ _) = Nothing
 
 -- (a number, in an integer's segment of `n` bits)
 integerFits : Bool -> Params.Span -> SegValue -> Spec -> Int -> P Unit
@@ -1589,51 +1634,107 @@ integerFits inPat sp (IntValue v) s n =
              else ", unsigned")))
 integerFits inPat sp v s n = pure MkUnit
 
--- (an integer's segment: its size, of 8 to 64 bits, a multiple of 8; a
--- number, if it is, in it)
+-- (an integer's segment: its size, of 1 to 64 bits; a number, if it
+-- is, in it)
 integerChecks : Bool -> Params.Span -> SegValue -> Spec -> Maybe Int -> P Unit
 integerChecks inPat sp v s (Just n) =
-  if n < 8 || n > 64 || not (n % 8 == 0)
+  if n < 1 || n > 64
     then throwP
-        (diag
-           sp
-           ("an integer's segment is of 8 to 64 bits, a multiple of 8, not "
-            ^ show n))
+        (diag sp ("an integer's segment is of 1 to 64 bits, not " ^ show n))
   else integerFits inPat sp v s n
 integerChecks inPat sp v s Nothing = pure MkUnit
 
-checkInteger : Bool -> Params.Span -> SegValue -> Spec -> P Unit
-checkInteger inPat sp StrValue s =
-  throwP (diag sp "a string's segment is its bytes: `\"GET\"`, not an integer")
-checkInteger inPat sp v s = integerChecks inPat sp v s (sizeBits s.size)
+segFails : Params.Span -> String -> P Unit
+segFails sp what = throwP (diag sp what)
 
-checkBinary : Params.Span -> SegValue -> Spec -> P Unit
-checkBinary sp (IntValue _) s =
-  throwP (diag sp "a number's segment is an integer: `1`, `258::16`")
-checkBinary sp StrValue { size = SizeDefault, little = Nothing, signed = Nothing } =
+-- (a value written, of the kind of its segment's type: a string bytes, a
+-- float a float, a rune and a number a code point, a number an integer)
+valueKind : Params.Span -> SegValue -> Presyntax.SegmentType -> P Unit
+valueKind sp StrValue SegmentBinary = pure MkUnit
+valueKind sp StrValue ty =
+  segFails sp "a string's segment is its bytes, as they are: `\"GET\"`"
+valueKind sp FloatValue SegmentFloat = pure MkUnit
+valueKind sp FloatValue ty =
+  segFails sp "a float's segment is a float: `1.5::float`"
+valueKind sp RuneValue (SegmentUtf _) = pure MkUnit
+valueKind sp RuneValue ty =
+  segFails sp "a rune's segment is a code point: `'é'::utf8`"
+valueKind sp (IntValue c) (SegmentUtf _) =
+  if Presyntax.isScalarValue c then pure MkUnit
+  else segFails sp (show c ^ " is no Unicode scalar value")
+valueKind sp (IntValue _) SegmentInteger = pure MkUnit
+valueKind sp (IntValue _) ty =
+  segFails sp "a number's segment is an integer: `1`, `258::16`"
+valueKind sp v ty = pure MkUnit
+
+-- (a unit said, of a size said)
+unitChecks : Params.Span -> Spec -> P Unit
+unitChecks sp { size = SizeDefault, unit = Just _ } =
+  segFails sp "a unit is what a size counts: say the size, `x::size(4)-unit(8)`"
+unitChecks sp s = pure MkUnit
+
+-- (a segment of no endianness nor sign said)
+flagsNone : Params.Span -> Spec -> String -> P Unit
+flagsNone sp { little = Nothing, signed = Nothing } what = pure MkUnit
+flagsNone sp s what = segFails sp what
+
+-- (a segment's own, by its type: of its size, endianness and sign)
+typeChecks : Bool
+           -> Params.Span
+           -> SegValue
+           -> Spec
+           -> Presyntax.SegmentType
+           -> Presyntax.SegmentSize
+           -> P Unit
+typeChecks inPat sp v s SegmentInteger size =
+  integerChecks inPat sp v s (sizeBits size)
+typeChecks inPat sp StrValue { size = SizeDefault, little = Nothing, signed = Nothing } SegmentBinary _ =
   pure MkUnit
-checkBinary sp StrValue s =
-  throwP
-    (diag
-       sp
-       "a string's segment is its bytes, all of them, as they are: `\"GET\"`")
-checkBinary sp v { little = Nothing, signed = Nothing } = pure MkUnit
-checkBinary sp v s =
-  throwP
-    (diag
-       sp
-       "bytes are of no endianness nor sign: `x::binary`, `x::binary-size(4)`")
+typeChecks inPat sp StrValue s SegmentBinary _ =
+  segFails
+    sp
+    "a string's segment is its bytes, all of them, as they are: `\"GET\"`"
+typeChecks inPat sp v s SegmentBinary _ =
+  if not (unitIn SegmentBinary s.unit % 8 == 0)
+    then segFails
+        sp
+        "bytes are whole bytes: their unit is a multiple of 8, `x::binary-size(2)-unit(16)`"
+  else flagsNone
+      sp
+      s
+      "bytes are of no endianness nor sign: `x::binary`, `x::binary-size(4)`"
+typeChecks inPat sp v s SegmentBits _ =
+  flagsNone
+    sp
+    s
+    "bits are of no endianness nor sign: `x::bits`, `x::bits-size(3)`"
+typeChecks inPat sp v { signed = Just _ } SegmentFloat _ =
+  segFails sp "a float is of no sign: `x::float`, `x::float-32-little`"
+typeChecks inPat sp v s SegmentFloat SizeDefault = pure MkUnit
+typeChecks inPat sp v s SegmentFloat (SizeNumber 64) = pure MkUnit
+typeChecks inPat sp v s SegmentFloat (SizeNumber 32) = pure MkUnit
+typeChecks inPat sp v s SegmentFloat (SizeNumber n) =
+  segFails sp ("a float's segment is of 32 or 64 bits, not " ^ show n)
+typeChecks inPat sp v s SegmentFloat _ =
+  segFails sp "a float's size is a number, 32 or 64: `x::float-32`"
+typeChecks inPat sp v { size = SizeDefault, unit = Nothing, signed = Nothing, little = Nothing } (SegmentUtf w) _ =
+  pure MkUnit
+typeChecks inPat sp v { size = SizeDefault, unit = Nothing, signed = Nothing } (SegmentUtf w) _ =
+  if w == 8 then segFails sp "UTF-8 is of no endianness: `c::utf8`"
+  else pure MkUnit
+typeChecks inPat sp v { signed = Just _ } (SegmentUtf w) _ =
+  segFails sp ("a code point is of no sign: `c::utf" ^ show w ^ "`")
+typeChecks inPat sp v s (SegmentUtf w) _ =
+  segFails
+    sp
+    ("a `utf"
+     ^ show w
+     ^ "` segment is as long as its code point: it says no size, `c::utf"
+     ^ show w
+     ^ "`")
 
-checkSegment : Bool
-             -> Params.Span
-             -> SegValue
-             -> Spec
-             -> Presyntax.SegmentType
-             -> P Unit
-checkSegment inPat sp v s SegmentInteger = checkInteger inPat sp v s
-checkSegment inPat sp v s SegmentBinary = checkBinary sp v s
-
--- | the segment `v::spec`, checked (`inPat`: in a pattern)
+-- | the segment `v::spec`, checked (`inPat`: in a pattern), its size in
+-- | bits
 segmentOf : {e : Type}
           -> Bool
           -> Params.Span
@@ -1642,13 +1743,22 @@ segmentOf : {e : Type}
           -> Spec
           -> P (Params.Spanned (Presyntax.Segment e))
 segmentOf inPat sp e v s = do
-  u <- checkSegment inPat sp v s (typeOf v s.ty)
+  u1 <- valueKind sp v (typeOf v s.ty)
+  u2 <- unitChecks sp s
+  u3 <-
+    typeChecks
+      inPat
+      sp
+      v
+      s
+      (typeOf v s.ty)
+      (sizeIn (unitIn (typeOf v s.ty) s.unit) s.size)
   pure
       (At
          (MkSegment
             e
             (typeOf v s.ty)
-            s.size
+            (sizeIn (unitIn (typeOf v s.ty) s.unit) s.size)
             (orFalse s.little)
             (orFalse s.signed))
          sp)
@@ -1656,6 +1766,8 @@ segmentOf inPat sp e v s = do
 valueOfE : Presyntax.Expr -> SegValue
 valueOfE (At (EString _) _) = StrValue
 valueOfE (At (EInt v) _) = IntValue v
+valueOfE (At (EFloat _) _) = FloatValue
+valueOfE (At (ERune _) _) = RuneValue
 valueOfE _ = OtherValue
 
 -- | a segment of a binary, written
@@ -1681,19 +1793,24 @@ segmentL r e = do
 valueOfP : Presyntax.Pat -> SegValue
 valueOfP (At (PatString _) _) = StrValue
 valueOfP (At (PatInt v) _) = IntValue v
+valueOfP (At (PatFloat _) _) = FloatValue
+valueOfP (At (PatRune _) _) = RuneValue
 valueOfP _ = OtherValue
 
--- (what a pattern's segment holds: a name, `_`, a number or a string)
+-- (what a pattern's segment holds: a name, `_`, a number, a string or a
+-- rune)
 segmentValue : CST.Pat -> Bool
-segmentValue (PAtom t) = List.elemBy strEq t.kind ["var", "int", "str"]
+segmentValue (PAtom t) =
+  List.elemBy strEq t.kind ["var", "int", "float", "str", "rune"]
 segmentValue (PParen o p c) = segmentValue p
 segmentValue p = False
 
--- (a pattern's segment that takes all the bytes left: bytes of no size
--- said, but a string)
+-- (a pattern's segment that takes all that is left: bytes or bits of no
+-- size said, but a string)
 takesRest : Presyntax.Segment Presyntax.Pat -> Bool
 takesRest (MkSegment (At (PatString _) _) _ _ _ _) = False
 takesRest (MkSegment _ SegmentBinary SizeDefault _ _) = True
+takesRest (MkSegment _ SegmentBits SizeDefault _ _) = True
 takesRest _ = False
 
 valueChecked : Params.Span -> Bool -> P Unit
@@ -1702,7 +1819,7 @@ valueChecked sp False =
   throwP
     (diag
        sp
-       "a segment of a binary pattern holds a name, `_`, a number or a string")
+       "a segment of a binary pattern holds a name, `_`, a number, a string or a rune")
 
 segmentAt : {a : Type} -> Params.Spanned a -> a
 segmentAt (At x _) = x
@@ -1722,7 +1839,7 @@ patSegmentWith r last sp p s = do
       then throwP
           (diag
              sp
-             "only the last segment takes the bytes that are left: say this one's size, `x::binary-size(n)`")
+             "only the last segment takes what is left: say this one's size, `x::binary-size(n)`, `x::bits-size(n)`")
     else pure seg
 
 patSegmentL : Lw
