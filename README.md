@@ -76,6 +76,7 @@ heff test                  # the doc tests, watches and tests of test/
 heff run app/hello/main.hf # run a program (C, by zig), without a build
 heff install               # build to run fastest, into ~/.heff/bin/
 heff fmt src/hello/*.hf    # format in place
+heff dev                   # build, run and serve; again at each change
 ```
 
 `heff help` lists every command, and `heff help COMMAND` its flags.

@@ -124,7 +124,8 @@ What is above, in `lib/`, is pure, the same on every backend.
   (what a program is doing, drawn on a terminal), `std.thread` (threads
   truly at once: a pool, spreads, and `Par` handled by them --
   [threads.md](threads.md)), `std.reactor` (outside operations begun
-  now and finished later, for [green threads](#green-threads)):
+  now and finished later, for [green threads](#green-threads)),
+  `std.terminal` (keys typed, a screen drawn: [the terminal](#the-terminal)):
   effects of the system, C's alone;
 - `std.http.server`, an HTTP/1.1 server written over `std.net`, C's
   as `std.net` is, and `std.remote`, an API's server over it and its
@@ -133,10 +134,12 @@ What is above, in `lib/`, is pure, the same on every backend.
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
 - `std.handle` (the world's things, which one effect hands out and
-  another takes), `std.path`, `std.cli` (command lines), `std.doc`
-  (documents laid out) and `std.math` (a float's functions: `sin`,
-  `atan2`, `exp`, `log`, `pow`, `round`, `pi`, `e` and the like): pure,
-  for any backend.
+  another takes), `std.path`, `std.cli` (command lines) and
+  `std.cli.interactive` (a program's commands as an app, to learn them
+  by), `std.terminal.widget` (keys, screens and widgets, as values),
+  `std.doc` (documents laid out) and `std.math` (a float's functions:
+  `sin`, `atan2`, `exp`, `log`, `pow`, `round`, `pi`, `e` and the
+  like): pure, for any backend.
 
 `lib/browser/` is the browser's, for JavaScript (`--backend=page`, and
 `esm`):
@@ -406,6 +409,86 @@ bytes at a time (PIPE_BUF) once it says there is room.  Opening a FIFO
 waits for its other end, the whole program with it.  On Windows, links
 are not seen, a mode is only whether the owner may write, and every
 operation waits where it is.
+
+`std.process` runs a command to its end (`run`, what it wrote kept),
+in the program's place (`exec`), or beside it: `launch cmd args` starts
+one with the program's standard streams, in its process group (Ctrl-C
+ends both), `Maybe` a `Child` (a handle); `exited c` is `Just` its
+status once it has ended (128 and the signal, where a signal ended it),
+without waiting; `terminate c` ends it -- SIGTERM, then SIGKILL two
+seconds later -- and lets its handle go, its status.  What a program
+started and has not ended is ended at the program's end, and where a
+signal (SIGINT, SIGTERM, SIGHUP) ends it.  (`heff dev` runs a
+project's programs so.)
+
+## The terminal
+
+`std.terminal` (`import std.terminal as Terminal`, its effect
+`Terminal.console`) is the terminal a program runs on, C's alone:
+`interactive` (its standard input and output are a terminal, `TERM` not
+`dumb`; never yet on Windows), `begin` (the terminal made raw -- each key
+read as it is typed, not shown -- and the alternate screen shown, which
+keeps what was written before apart), `finish` (both as they were),
+`measure` (its columns and rows, a `Widget.Size`), `readInput` (what is
+typed next, waited for: `Just ""` where its size changed or the program
+went on after Ctrl-Z, to draw again; `Nothing` at the end of the input)
+and `draw` (text written as it is).  The terminal is put back as it was
+however the program ends -- at its end, at a failure, and at a signal
+that ends it (Ctrl-C is SIGINT still) -- and while Ctrl-Z has stopped
+it.
+
+`Terminal.interact app` runs an app there, as Elm runs one: begun, the
+app drawn, each key stepped and the app drawn again until it is done,
+then finished -- `Maybe` what it came to (`Nothing`: no terminal, or the
+input ended).  The app and all it draws are `std.terminal.widget`'s
+(`import std.terminal.widget as Widget`), pure:
+
+- `Key`, what is typed: `Char` a rune, `Enter`, `Escape`, `Tab`,
+  `BackTab`, `Backspace`, `Delete`, the arrows (`ArrowUp` ...),
+  `Home`, `End`, `PageUp`, `PageDown`, `Control` a letter (Ctrl-A), and
+  a `Sequence` not known; `decode` reads a terminal's input as keys,
+  its escape sequences xterm's and VT100's;
+- a `Frame` is `rows`, each a list of `Span`s (a text and its `Style`:
+  `Plain`, `Bold`, `Dim`, `Inverse`, `Underline`), and where the
+  `cursor` is shown; `paint size frame` is what draws it, in place of
+  what was, as one update; `width`, `cut`, `pad` and `wrap` measure and
+  lay text out by columns (an East Asian wide rune two);
+- the widgets, each a value and what a key makes of it: a `Menu` (the
+  item picked among a list's, `menuKey`, `menuRows` scrolled to it), a
+  `Field` (text typed, `fieldKey`: runes at the cursor, the arrows,
+  Home and End, a shell line's Ctrl-A, -E, -U, -K, -W), a `Choice`
+  (one of some values, `choiceKey`: left and right, space, round) and a
+  `status` line;
+- `App s r` is a state at the `start`, a `step` (a key and a state: to
+  `Continue` with, or `Done` with an `r`) and a `view` of a state on a
+  terminal of a size; `replay app keys` and `shownAfter app size keys`
+  run one on keys given, for its tests.
+
+`std.cli.interactive` (`import std.cli.interactive as Interactive`) is
+such an app of a program's commands, as std.cli has them:
+`Interactive.app "prog" (Interactive.entries commands)` lists them,
+filtered by what is typed, and a command picked is a form of its
+positionals and flags -- each with what it takes, its values and
+whether it is wanted -- with the command line it makes, and what is
+wrong with it yet (`Cli.problemOf`); it comes to the command line's
+words, for `Cli.readLine` to run.  `heff` with no words is it
+([commands.md](commands.md#the-commands-app)).
+
+```haskell
+import co
+import std.cli as Cli
+import std.cli.interactive as Interactive
+import std.terminal as Terminal
+
+-- (the program's commands, picked and filled in on the terminal: the
+-- words of the command line made, or none)
+picked : {e : HFunctor}
+       -> {{con : Terminal.console <: e}}
+       -> {r : Type}
+       -> List (Cli.Command r)
+       -> Co e (Maybe (Maybe (List String)))
+picked cs = Terminal.interact (Interactive.app "prog" (Interactive.entries cs))
+```
 
 ## Green threads
 

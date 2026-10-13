@@ -1,6 +1,8 @@
 # Commands
 
 `heff help` lists them, and `heff help COMMAND` says a command's flags.
+`heff` with no words, on a terminal, is an app of them to learn them by
+([below](#the-commands-app)).
 
 ```sh
 heff check FILE                # the file's interface, and its errors
@@ -27,6 +29,9 @@ heff install [DIR]             # the project at DIR built (C by zig -O2: to run
 heff init [DIR]                # a new project: a module, a program, a test
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
+heff dev [APP...] [--port N] [--proxy URL]
+                               # the project built, its C programs run and its
+                               # pages served, again at each change of its files
 heff lsp                       # the language server, on stdio
 heff version                   # which heff this is
 heff help [COMMAND]            # the commands, or a command's flags
@@ -51,6 +56,70 @@ a link.
 What `heff test` and `heff promote` check is in [tests.md](tests.md);
 how a project and its programs are laid out for `heff build`, `heff
 install` and `heff get`, in [projects.md](projects.md).
+
+## The commands' app
+
+`heff` with no words, its standard input and output a terminal (and
+`TERM` not `dumb`), shows its commands, each with what it does, on a
+screen of its own; elsewhere -- a pipe, a file -- it says its usage, as
+`heff help` does.  Typing filters the list by the commands' names; up
+and down (or `j` and `k`, Ctrl-N and Ctrl-P), Page Up and Down, Home and
+End move in it; the status line says how the command picked is called.
+Enter (or Tab) opens its form: a field for each of its positionals and
+flags, what the one being filled in takes said under them (what it is
+for, one word or more, a file of which kind, its values, whether it is
+wanted), and the command line the form makes, as it is filled in.  Tab
+and down go to the next field, Shift-Tab and up to the one before; a
+field of words is typed in as a shell's line is (the arrows, Home, End,
+Ctrl-A, -E, -U, -K, -W), a choice -- a switch's off and on, a flag's
+values -- turned by left and right or space.  The status line says what
+is wrong with the command line yet (`expected FILE`), or that Enter runs
+it: the screen put back, the command line written to the standard
+error, `$ heff fmt a.hf --check`, and run, as if it had been given.  Esc
+goes back to the list (and `q`, on a choice), and on the list clears the
+filter, then leaves, as `q` does; to type a `j`, `k` or `q` into the
+filter, type `/` first.  Ctrl-C ends heff, the terminal put back.
+
+The app is std.cli.interactive's, of the commands std.cli reads -- the
+same definitions the usage, the help and the completions are written
+from -- run by std.terminal ([library.md](library.md#the-terminal)).
+
+## heff dev
+
+`heff dev`, at a project's root, builds it as `heff build` does (heff
+run as `heff build`, so that a build that fails says why and is waited
+past), runs its C programs from `.heff/bin/` -- the APPs named, else
+all -- and serves its pages, then looks at the project's files
+(`package.hf`, `src/`, `app/`) every quarter of a second: at a change,
+it builds again and, where that went well, ends what runs and runs it
+anew.  What it says is a line for each build (`heff dev: built (2);
+running server`), what a build that failed said, and a line where a
+program ends by itself; the programs' own output is theirs, on the same
+terminal; a build is drawn as it goes, as `heff build` draws one
+([progress](#progress)).  A program writes its standard output a line
+at a time on a terminal, but a buffer at a time into a pipe: what it
+says reaches a pipe late, where it does not write to its standard
+error.
+
+A page (a program of `backend = Page`) is served at
+`http://127.0.0.1:PORT/` (`--port`, 8000): `/NAME/` is the program
+NAME's page -- its `app/NAME/index.html`, else one made for it, an
+element `#NAME` and its script -- `/NAME/NAME.js` its script as built,
+and `/NAME/...` the rest of `app/NAME/` as it is.  A page so served asks
+every half second whether the project has been built again
+(`/.heff/built`), and loads itself again where it has.  With `--proxy
+URL` (`http://127.0.0.1:8080`, a C program's server), a request that is
+none of a page's -- the API a page calls, `POST /api` -- is sent there,
+and its response given back, so that a page and its server
+([remote.md](remote.md)) are developed together:
+
+```sh
+cd examples/notes
+heff dev --proxy http://127.0.0.1:8080   # the server run, the page at
+                                         # http://127.0.0.1:8000/client/
+```
+
+Ctrl-C ends heff dev and what it runs; so does a signal that ends it.
 
 ## Formatting
 

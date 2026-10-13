@@ -16,7 +16,7 @@ library is split by backend ([library.md](library.md#the-batteries)):
 
 - `lib/std/`'s effects are the system's, with a provider in C:
   `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.http`,
-  `std.net`, `std.thread`, `std.reactor`;
+  `std.net`, `std.thread`, `std.reactor`, `std.terminal`;
 - `std.ref` and `std.time` are needed on both sides: one module each,
   with a provider in C and one in JavaScript of no `$host`;
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
