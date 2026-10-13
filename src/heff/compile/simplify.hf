@@ -314,11 +314,11 @@ known g = do
 -- | try an inlining: keep it if it is small enough (a copy asked for
 -- | in it is only named: it is made after the definition, if what it
 -- | comes to calls it)
-attempt : IR.Expr -> M IR.Expr -> M IR.Expr
-attempt orig m = do
+attemptBy : Int -> IR.Expr -> M IR.Expr -> M IR.Expr
+attemptBy more orig m = do
   saved <- get
   e <- m
-  if not (IR.sizeAbove (IR.size orig + budget) e) then pure e
+  if not (IR.sizeAbove (IR.size orig + more) e) then pure e
     else do
       -- (the names drawn stay drawn: no name is ever given out twice.
       -- And the fuel burnt stays burnt: a speculation that did not pay
@@ -328,6 +328,9 @@ attempt orig m = do
       st <- get
       u <- put (restore saved st)
       pure orig
+
+attempt : IR.Expr -> M IR.Expr -> M IR.Expr
+attempt orig m = attemptBy budget orig m
 
 type SG = { safe : Map.Map String Unit, total : Map.Map String Int }
 
@@ -440,8 +443,20 @@ partialIn : St -> IR.Expr -> Bool
 partialIn s (EApp f as) = partialHead s as f
 partialIn s _ = False
 
+-- (... or a match, a binding or a tag of such: `if c then tell x else
+-- pure MkUnit`, an operation's copy given the operation; `Catch c h` of
+-- it)
+pureOrPartial : St -> IR.Expr -> Bool
+pureOrPartial s (EMatch sc arms) =
+  pureIn s.safe s.total sc
+  && not (List.null arms)
+  && IR.allI (List.map (\b -> pureOrPartial s (IR.armBody b)) arms)
+pureOrPartial s (ELet _ a b) = pureOrPartial s a && pureOrPartial s b
+pureOrPartial s (ETag _ as _) = IR.allI (List.map (pureOrPartial s) as)
+pureOrPartial s e = pureIn s.safe s.total e || partialIn s e
+
 isPure : IR.Expr -> M Bool
-isPure e = \s -> MkPair (pureIn s.safe s.total e || partialIn s e) s
+isPure e = \s -> MkPair (pureOrPartial s e) s
 
 atomic : IR.Expr -> Bool
 atomic (EVar _) = True
@@ -598,28 +613,110 @@ closedKnown (ERecord fs ts) =
   && Spec.closedIn Nil (ERecord fs ts)
 closedKnown _ = False
 
+-- (every field a lambda)
+lamField : Pair String IR.Expr -> Bool
+lamField (MkPair _ (ELam _ _)) = True
+lamField _ = False
+
+-- | a record of functions -- a handler, an effect's signature -- no
+-- | bigger than a copy may be made for, whatever it captures: the copy
+-- | is given what it captures (`Spec.shapeOf`).  (A handler made for a
+-- | literal, `ask`'s answer, is one, the literal a variable in it)
+handlerLike : IR.Expr -> Bool
+handlerLike (ERecord fs ts) =
+  not (List.null fs)
+  && IR.allI (List.map lamField fs)
+  && not (IR.sizeAbove specArgSize (ERecord fs ts))
+handlerLike _ = False
+
+-- (the field, if it is a closed function)
+closedField : IR.Expr -> Maybe IR.Expr -> IR.Expr
+closedField e (Just v) = if closedKnown v then v else e
+closedField e Nothing = e
+
+isVar : String -> IR.Expr -> Bool
+isVar x (EVar y) = strEq x y
+isVar x _ = False
+
+-- (an argument that is a handler, or an effect's signature: a global
+-- record, or a record of functions)
+handlerArg : Map.Map String Unit -> IR.Expr -> Bool
+handlerArg kinds (EGlobal g) = Map.member compareString g kinds
+handlerArg kinds e = handlerLike e
+
+-- (how many calls of `x` in the worklist are given a handler)
+handedW : String -> Map.Map String Unit -> Int -> List IR.Expr -> Int
+handedW x kinds n Nil = n
+handedW x kinds n (Cons (EApp f as) rest) =
+  handedW
+    x
+    kinds
+    (if isVar x f && List.any (handlerArg kinds) as then n + 1 else n)
+    (Cons f (IR.appendI as rest))
+handedW x kinds n (Cons (EMatch sc arms) rest) =
+  handedW x kinds n (Cons sc (IR.pushArms arms rest))
+handedW x kinds n (Cons (EProj e _ _ _) rest) = handedW x kinds n (Cons e rest)
+handedW x kinds n (Cons (ELam _ b) rest) = handedW x kinds n (Cons b rest)
+handedW x kinds n (Cons (ELet _ a b) rest) =
+  handedW x kinds n (Cons a (Cons b rest))
+handedW x kinds n (Cons (ERecord fs _) rest) =
+  handedW x kinds n (IR.pushFields fs rest)
+handedW x kinds n (Cons (ETag _ as _) rest) =
+  handedW x kinds n (IR.appendI as rest)
+handedW x kinds n (Cons (EPrimCall _ as) rest) =
+  handedW x kinds n (IR.appendI as rest)
+handedW x kinds n (Cons (ECall _ as) rest) =
+  handedW x kinds n (IR.appendI as rest)
+handedW x kinds n (Cons _ rest) = handedW x kinds n rest
+
+-- | how big a function bound may be that is put where it is called, a
+-- | copy each time, each call given a handler
+handedSize : Int
+handedSize = 160
+
+-- | a function bound and called twice, each time given a handler: what
+-- | comes after a choice of operations, `if c then tell x else pure
+-- | MkUnit` -- each way given it, and so the handler, which a variable
+-- | would hide from it
+handedOn : Map.Map String Unit -> String -> IR.Expr -> IR.Expr -> Int -> Bool
+handedOn kinds x (ELam ys body) b o =
+  o <= 2
+  && not (IR.sizeAbove handedSize (ELam ys body))
+  && handedW x kinds 0 (Cons b Nil) == o
+handedOn kinds x a b o = False
+
 -- | how many uses of a closed value bound may each be given a copy of it
 closedUses : Int
 closedUses = 4
+
+-- | ... of a record of functions (a handler, `hd.bind (hd.malg p)` and
+-- | `hd.ret` in an operation's arguments)
+handlerUses : Int
+handlerUses = 8
 
 -- (a value bound and used more than once is put where it is used, a
 -- copy each time, if it is small -- or, used a few times, if it is
 -- closed and a copy may be made for it: a handler, `{ ret = ..., bind =
 -- ..., malg = ... }`, bound once and handed to two calls -- Co's `bind`
 -- hands its `hd` on twice -- is known to both, which a variable would
--- hide from them)
+-- hide from them.  So is a record of functions, whatever it captures,
+-- and a function called twice, each time given a handler)
 letPure : SK -> String -> IR.Expr -> IR.Expr -> Int -> M IR.Expr
-letPure r x a b o =
+letPure r x a b o = do
+  s <- get
   if o == 0 then r.simp b
-  else if atomic a || o == 1 then r.simp (IR.subst (singletonM x a) b)
-  else if IR.isValue a
-  && (not (IR.sizeAbove 12 a) || (o <= closedUses && closedKnown a))
-    then do
-      b' <- substCopies x a b
-      r.simp b'
-  else do
-    b' <- r.simp b
-    pure (ELet x a b')
+    else if atomic a || o == 1 then r.simp (IR.subst (singletonM x a) b)
+    else if IR.isValue a
+    && (not (IR.sizeAbove 12 a)
+        || (o <= closedUses && closedKnown a)
+        || (o <= handlerUses && handlerLike a)
+        || handedOn s.sp.kinds x a b o)
+      then do
+        b' <- substCopies x a b
+        r.simp b'
+    else do
+      b' <- r.simp b
+      pure (ELet x a b')
 
 -- (a name of its own)
 freshName : String -> M String
@@ -692,10 +789,6 @@ letSplit r x a b = do
 -- chooses at once, and no tag is built.  What follows is copied into
 -- each way out, so only when it is small.
 
-isVar : String -> IR.Expr -> Bool
-isVar x (EVar y) = strEq x y
-isVar x _ = False
-
 -- | how big what follows may be, times the tags but one
 sumBudget : Int
 sumBudget = 100
@@ -753,6 +846,54 @@ sumPushed r x b (EMatch s arms) = do
   pure (EMatch s arms2)
 sumPushed r x b e = pure e
 
+-- Tags taken apart, their fields computing: `let p = InR (InR (Catch
+-- (nt c) h)) in case p of ...` (an operation, its evidence applied,
+-- given a handler's `malg`) -- the fields that compute bound first, in
+-- order, and the tags in it kept: the tag is a value then, put where it
+-- is matched on, which chooses at once.
+
+type Fielded = Pair (List (Pair String IR.Expr)) IR.Expr
+
+consFielded : Fielded
+            -> Pair (List (Pair String IR.Expr)) (List IR.Expr)
+            -> Pair (List (Pair String IR.Expr)) (List IR.Expr)
+consFielded (MkPair bs e) (MkPair rest es) =
+  MkPair (appendL bs rest) (Cons e es)
+
+-- (a field: a value as it is; a tag, its fields so; a binding, bound
+-- first; anything else bound to a name of its own)
+fieldBound : (IR.Expr -> M Fielded) -> IR.Expr -> M Fielded
+fieldBound tag (ETag t as ts) = tag (ETag t as ts)
+fieldBound tag (ELet y e c) = do
+  rest <- fieldBound tag c
+  pure (MkPair (Cons (MkPair y e) (fst rest)) (snd rest))
+fieldBound tag a =
+  if IR.isValue a then pure (MkPair Nil a)
+  else do
+    t <- freshName "t"
+    pure (MkPair (Cons (MkPair t a) Nil) (EVar t))
+
+fieldsBound : (IR.Expr -> M Fielded)
+            -> List IR.Expr
+            -> M (Pair (List (Pair String IR.Expr)) (List IR.Expr))
+fieldsBound tag Nil = pure (MkPair Nil Nil)
+fieldsBound tag (Cons a as) = do
+  one <- fieldBound tag a
+  rest <- fieldsBound tag as
+  pure (consFielded one rest)
+
+tagBound : IR.Expr -> M Fielded
+tagBound (ETag t as ts) = do
+  fs <- fieldsBound tagBound as
+  pure (MkPair (fst fs) (ETag t (snd fs) ts))
+tagBound e = pure (MkPair Nil e)
+
+-- (a tag not a value, matched on)
+tagApart : String -> IR.Expr -> IR.Expr -> Bool
+tagApart x (ETag t as ts) b =
+  not (IR.isValue (ETag t as ts)) && scrutW x 0 (Cons b Nil) > 0
+tagApart x a b = False
+
 -- | a binding, its value simplified: what could fail is computed where
 -- | it was, used or not.  A known function given fewer arguments than it
 -- | takes, some computing (`c = lPing (intOr 100000 rest)`), has those
@@ -764,6 +905,11 @@ letIn r x a b = do
   p <- isPure a
   s <- get
   if sumTakenApart x a b then sumPushed r x b a
+    else if tagApart x a b
+      then do
+        bound <- tagBound a
+        e <- letIn r x (snd bound) b
+        pure (letsOf (fst bound) e)
     else if p then letPure r x a b (occCountOf x b)
     else if partialApp s a then letSplit r x a b
     else do
@@ -904,18 +1050,48 @@ tooBig g s = case Map.lookup compareString g s.defs of
   Just b -> IR.sizeAbove inlineMax b
   Nothing -> False
 
+-- (a tag, an operation)
+tagged : IR.Expr -> Bool
+tagged (ETag _ _ _) = True
+tagged _ = False
+
+-- (a copy given, past its parameters, a handler: what it comes to is a
+-- computation, `\hd k -> ...`, run by that handler at once -- an
+-- operation's copy that computes before it is given it, `handle hd c`)
+handedPast : Map.Map String Unit -> IR.Expr -> List IR.Expr -> Bool
+handedPast kinds (ELam xs _) as =
+  List.length as > List.length xs
+  && List.any (handlerArg kinds) (dropL (List.length xs) as)
+handedPast kinds b as = False
+
+-- (how big such a copy may be)
+copyMax : Map.Map String Unit -> IR.Expr -> List IR.Expr -> Int
+copyMax kinds b as = if handedPast kinds b as then handedSize else inlineMax
+
+-- (how much bigger a handler's clause, given an operation, may make the
+-- code: the clause chosen is all that is left of it)
+clauseBudget : List IR.Expr -> Int
+clauseBudget as = if List.any tagged as then handedSize else budget
+
+-- (how much bigger inlining it may make the code)
+copyBudget : Map.Map String Unit -> Maybe IR.Expr -> List IR.Expr -> Int
+copyBudget kinds (Just b) as =
+  if handedPast kinds b as then handedSize else budget
+copyBudget kinds Nothing as = budget
+
 -- | a copy (Specialisation, below), to inline: what it is known by --
 -- | simplified with what it was made for, a handler's `bind` and `malg`
 -- | known -- if it does not call itself and is no bigger than a
 -- | definition inlined may be.  (`op`, made for a handler, comes to a
 -- | match on the operation, each arm a few lines of the handler's
 -- | `malg`.)
-knownCopy : St -> String -> Maybe IR.Expr
-knownCopy s g =
+knownCopy : St -> String -> List IR.Expr -> Maybe IR.Expr
+knownCopy s g as =
   if Map.member compareString g s.sp.recipes
     then case Map.lookup compareString g s.sp.all of
       Just b ->
-        if not (IR.sizeAbove inlineMax b) && not (elemStr g (IR.globalsIn b))
+        if not (IR.sizeAbove (copyMax s.sp.kinds b as) b)
+        && not (elemStr g (IR.globalsIn b))
           then Just b
         else Nothing
       Nothing -> Nothing
@@ -1029,23 +1205,24 @@ toldTo b _ _ = False
 -- | a copy is inlined where it is given something to compute with: an
 -- | argument that tells, for a parameter it takes apart (`op`, made for
 -- | a handler, given `Catch c h`, matches on it)
-worthIt : List IR.Expr -> Maybe IR.Expr -> Maybe IR.Expr
-worthIt as (Just (ELam xs b)) =
-  if toldTo b xs as then Just (ELam xs b) else Nothing
-worthIt as _ = Nothing
+worthIt : Map.Map String Unit -> List IR.Expr -> Maybe IR.Expr -> Maybe IR.Expr
+worthIt kinds as (Just (ELam xs b)) =
+  if toldTo b xs as || handedPast kinds (ELam xs b) as then Just (ELam xs b)
+  else Nothing
+worthIt kinds as _ = Nothing
 
 -- (a copy called, its body inlined if it may be)
-copyInlined : SK -> IR.Expr -> List IR.Expr -> Maybe IR.Expr -> M IR.Expr
-copyInlined r f as (Just b) = attempt (mkApp f as) (r.applyTo b as)
-copyInlined r f as Nothing = pure (mkApp f as)
+copyInlined : SK -> Int -> IR.Expr -> List IR.Expr -> Maybe IR.Expr -> M IR.Expr
+copyInlined r more f as (Just b) = attemptBy more (mkApp f as) (r.applyTo b as)
+copyInlined r more f as Nothing = pure (mkApp f as)
 
 -- | a copy called, given something to compute with: inlined, if it
 -- | may be (`knownCopy`) and that makes the code no bigger than a little
 copyCall : SK -> IR.Expr -> String -> List IR.Expr -> M IR.Expr
 copyCall r f g as = do
   s <- get
-  mb <- fueled (worthIt as (knownCopy s g))
-  copyInlined r f as mb
+  mb <- fueled (worthIt s.sp.kinds as (knownCopy s g as))
+  copyInlined r (copyBudget s.sp.kinds mb as) f as mb
 
 -- | a known definition called: inlined if it may be -- or a copy
 callOf : SK -> IR.Expr -> String -> List IR.Expr -> Maybe IR.Expr -> M IR.Expr
@@ -1122,7 +1299,7 @@ specDepth = 16
 -- | an argument a copy may be made for
 knownArg : Map.Map String Unit -> IR.Expr -> Bool
 knownArg kinds (EGlobal g) = Map.member compareString g kinds
-knownArg kinds e = closedKnown e
+knownArg kinds e = closedKnown e || handlerLike e
 
 -- | ... and, given to a loop (a definition calling itself, `loops`), a
 -- | lambda capturing variables that calls nothing (`Sp.callsNothing`):
@@ -1136,8 +1313,44 @@ capturing _ = False
 loops : String -> IR.Expr -> Bool
 loops g b = elemStr g (IR.globalsIn b)
 
-knownIn : Bool -> Map.Map String Unit -> IR.Expr -> Bool
-knownIn loop kinds e = knownArg kinds e || (loop && capturing e)
+-- Continuations back into a loop: `loop i acc = do r <- step i; loop
+-- (i + 1) (acc + r)` hands `step` a continuation calling `loop`, through
+-- which alone `loop` calls itself, so that what `loop` hands on
+-- unchanged -- a handler, given it as an argument -- is not seen to be
+-- (`Spec.statics`).  `step`'s copy made for that continuation calls
+-- `loop` itself, given what the continuation captures: the two are one
+-- loop then, and a copy of `loop` for a handler a copy of `step` for it,
+-- which calls that copy of `loop` again -- each layer of handlers, peeled
+-- off by a copy of its own, an argument of that loop.
+
+-- (a global whose known body calls `g`, or a copy of what `g` is a copy
+-- of)
+callsBack : Map.Map String IR.Expr -> String -> String -> Bool
+callsBack all g h = case Map.lookup compareString h all of
+  Just b ->
+    List.any
+      (\k -> strEq (Spec.rootOf k) (Spec.rootOf g))
+      (IR.globalsIn b)
+  Nothing -> False
+
+-- | a continuation given to `g` that calls back into a loop calling `g`:
+-- | a lambda that is a call of such a global, its arguments computing
+-- | without calling anything
+loopBack : Map.Map String IR.Expr -> String -> IR.Expr -> Bool
+loopBack all g (ELam xs (EApp (EGlobal h) as)) =
+  IR.allI (List.map Spec.callsNothing as)
+  && not (IR.sizeAbove specArgSize (ELam xs (EApp (EGlobal h) as)))
+  && callsBack all g h
+loopBack all g _ = False
+
+-- (... where `g` is given a handler too: a copy for both)
+backFor : St -> List IR.Expr -> String -> IR.Expr -> Bool
+backFor s as g =
+  if List.any (handlerArg s.sp.kinds) as then loopBack s.sp.all g
+  else \e -> False
+
+knownIn : Bool -> Map.Map String Unit -> (IR.Expr -> Bool) -> IR.Expr -> Bool
+knownIn loop kinds back e = knownArg kinds e || (loop && capturing e) || back e
 
 nthE : Int -> List IR.Expr -> Maybe IR.Expr
 nthE i Nil = Nothing
@@ -1145,27 +1358,30 @@ nthE i (Cons x xs) = if i == 0 then Just x else nthE (i - 1) xs
 
 markGo : Bool
        -> Map.Map String Unit
+       -> (IR.Expr -> Bool)
        -> List IR.Expr
        -> List Bool
        -> Int
        -> List Bool
-markGo loop all as Nil i = Nil
-markGo loop all as (Cons st rest) i =
+markGo loop all back as Nil i = Nil
+markGo loop all back as (Cons st rest) i =
   Cons
-    (st && maybe False (\a -> knownIn loop all a) (nthE i as))
-    (markGo loop all as rest (i + 1))
+    (st && maybe False (\a -> knownIn loop all back a) (nthE i as))
+    (markGo loop all back as rest (i + 1))
 
 marksIn : Bool
         -> Map.Map String Unit
+        -> (IR.Expr -> Bool)
         -> String
         -> List String
         -> IR.Expr
         -> List IR.Expr
         -> List Bool
-marksIn loop all g xs b as =
+marksIn loop all back g xs b as =
   markGo
     loop
     all
+    back
     as
     (if loop then Spec.statics g xs b else List.map (\x -> True) xs)
     0
@@ -1173,17 +1389,24 @@ marksIn loop all g xs b as =
 -- | the parameters a copy is made for: known there, and handed on as
 -- | they are if `g` calls itself
 marksOf : Map.Map String Unit
+        -> (IR.Expr -> Bool)
         -> String
         -> List String
         -> IR.Expr
         -> List IR.Expr
         -> List Bool
-marksOf all g xs b as = marksIn (loops g b) all g xs b as
+marksOf all back g xs b as = marksIn (loops g b) all back g xs b as
 
 -- | whether a copy may be made for any of the arguments
-anyKnown : Map.Map String Unit -> String -> IR.Expr -> List IR.Expr -> Bool
-anyKnown kinds g b as =
-  List.any (\a -> knownArg kinds a) as || (List.any capturing as && loops g b)
+anyKnown : Map.Map String Unit
+         -> (IR.Expr -> Bool)
+         -> String
+         -> IR.Expr
+         -> List IR.Expr
+         -> Bool
+anyKnown kinds back g b as =
+  List.any (\a -> knownArg kinds a || back a) as
+  || (List.any capturing as && loops g b)
 
 specKey : String -> List Bool -> List String -> List IR.Expr -> String
 specKey g marks vars as =
@@ -1802,9 +2025,16 @@ specKnown : SK
           -> M IR.Expr
 specKnown r g xs b as made = do
   s <- get
-  if not (anyKnown s.sp.kinds g b as || List.any (\m -> m) made)
+  if not
+      (anyKnown s.sp.kinds (backFor s as g) g b as || List.any (\m -> m) made)
       then pure (mkApp (EGlobal g) as)
-    else specMarked r g xs b as (orMarks (marksOf s.sp.kinds g xs b as) made)
+    else specMarked
+        r
+        g
+        xs
+        b
+        as
+        (orMarks (marksOf s.sp.kinds (backFor s as g) g xs b as) made)
 
 -- Partial applications given to a loop: a known function given fewer
 -- arguments than it takes, `scale f`, handed to a loop at a parameter it
@@ -2028,7 +2258,7 @@ knownField g l = do
 
 -- (an argument that may go into every arm of a match it is given to)
 pushable : IR.Expr -> Bool
-pushable a = atomic a || (IR.isValue a && closedKnown a)
+pushable a = atomic a || (IR.isValue a && (closedKnown a || handlerLike a))
 
 -- | how big the copies the arms of a match are given may be, all told
 pushBudget : Int
@@ -2050,6 +2280,51 @@ applyArm : SK -> IR.Expr -> List IR.Expr -> M IR.Expr
 applyArm r b as = do
   as2 <- traverseS (\a -> if atomic a then pure a else copy a) as
   r.applyTo b as2
+
+-- (a handler among values given to a match -- an operation or `pure`,
+-- `if c then tell x else pure MkUnit`, given its handler and what
+-- follows -- that may go into every arm, the others bound first)
+handlerPushed : List IR.Arm -> List IR.Expr -> Bool
+handlerPushed arms as =
+  IR.allI (List.map IR.isValue as)
+  && List.any handlerLike as
+  && pushInto arms (List.filter pushable as)
+
+bindPushable : List IR.Expr -> M Bound
+bindPushable Nil = pure (MkPair Nil Nil)
+bindPushable (Cons a as) = do
+  one <- splitOne (pushable a) a
+  rest <- bindPushable as
+  pure (consBound one rest)
+
+-- (... the values that may not go into every arm bound before it: values,
+-- so computed as they were)
+pushBound : SK -> IR.Expr -> List IR.Arm -> List IR.Expr -> M IR.Expr
+pushBound r s arms as = do
+  bound <- bindPushable as
+  arms' <- armsS (\b -> applyArm r b (snd bound)) arms
+  pure (letsOf (fst bound) (EMatch s arms'))
+
+-- (a field of a copy that is a record -- a handler made for its algebra,
+-- `passing writer W3 alg` -- handed on with a handler: `handle hd c`'s
+-- `hd.ret`, a closed function a copy may be made for)
+handedField : St -> IR.Expr -> M IR.Expr
+handedField s (EProj (EGlobal g) l sh t) =
+  if Map.member compareString g s.defs then pure (EProj (EGlobal g) l sh t)
+  else do
+    mv <- knownField g l
+    pure (closedField (EProj (EGlobal g) l sh t) mv)
+handedField s a = pure a
+
+copyField : IR.Expr -> Bool
+copyField (EProj (EGlobal _) _ _ _) = True
+copyField _ = False
+
+handedFields : St -> List IR.Expr -> M (List IR.Expr)
+handedFields s as =
+  if List.any copyField as && List.any (handlerArg s.sp.kinds) as
+    then traverseS (handedField s) as
+  else pure as
 
 -- | an application of simplified parts
 applyToF : SK -> IR.Expr -> List IR.Expr -> M IR.Expr
@@ -2078,11 +2353,14 @@ applyToF r f as =
         then do
           arms' <- armsS (\b -> applyArm r b as) arms
           pure (EMatch s arms')
+      else if handlerPushed arms as
+        then pushBound r s arms as
       else pure (mkApp (EMatch s arms) as)
     EGlobal g -> do
       s <- get
-      e1 <- callOf r f g as (Map.lookup compareString g s.defs)
-      specAfter r g as e1
+      as1 <- handedFields s as
+      e1 <- callOf r f g as1 (Map.lookup compareString g s.defs)
+      specAfter r g as1 e1
     -- (a field of a known record, applied: judged by what the
     -- application comes to, not by the size of the field)
     EProj (EGlobal g) l sh t -> do
@@ -2095,7 +2373,7 @@ applyToF r f as =
         Nothing -> do
           mv <- knownField g l
           case mv of
-            Just v -> attempt (mkApp f as) (r.applyTo v as)
+            Just v -> attemptBy (clauseBudget as) (mkApp f as) (r.applyTo v as)
             Nothing -> pure (mkApp f as)
     _ -> pure (mkApp f as)
 
@@ -2381,6 +2659,85 @@ settleKept more (Just _) h b = do
   pure (MkPair b deps)
 settleKept more Nothing h b = settleCopy more settleRounds h b
 
+-- Tying the knot: a loop's copy for a continuation back into it
+-- (Continuations back into a loop) is the loop's copy and a copy of what
+-- it calls, each calling the other last -- `loop'` deciding whether to go
+-- on, `step'` a round of it.  Two functions calling each other last are
+-- a loop only if each is a jump to the other, which C has only between
+-- functions of as many parameters: so the small one, made, is put where
+-- the other calls it, which then calls itself.
+
+-- (a lambda's body, its parameters bound to the arguments)
+unLam : IR.Expr -> List IR.Expr -> IR.Expr
+unLam (ELam ys b) as = letsOf (zipL ys as) b
+unLam e as = mkApp e as
+
+-- (a call of `h`, `\xs -> b`: a copy of `b`, the arguments bound to its
+-- parameters)
+inlinedCall : String -> IR.Expr -> List IR.Expr -> M IR.Expr
+inlinedCall h (ELam xs b) as =
+  if List.length as == List.length xs
+    then do
+      e <- copy (ELam xs b)
+      pure (unLam e as)
+  else pure (EApp (EGlobal h) as)
+inlinedCall h lam1 as = pure (EApp (EGlobal h) as)
+
+tieGo : String -> IR.Expr -> IR.Expr -> M IR.Expr
+tieGo h lam1 (EApp (EGlobal g) as) = do
+  as2 <- traverseS (tieGo h lam1) as
+  if strEq g h then inlinedCall h lam1 as2 else pure (EApp (EGlobal g) as2)
+tieGo h lam1 (EApp f as) = do
+  f2 <- tieGo h lam1 f
+  as2 <- traverseS (tieGo h lam1) as
+  pure (EApp f2 as2)
+tieGo h lam1 (ELam xs b) = do
+  b2 <- tieGo h lam1 b
+  pure (ELam xs b2)
+tieGo h lam1 (ELet x a b) = do
+  a2 <- tieGo h lam1 a
+  b2 <- tieGo h lam1 b
+  pure (ELet x a2 b2)
+tieGo h lam1 (ERecord fs ts) = do
+  fs2 <- fieldsS (tieGo h lam1) fs
+  pure (ERecord fs2 ts)
+tieGo h lam1 (EProj e l sh t) = do
+  e2 <- tieGo h lam1 e
+  pure (EProj e2 l sh t)
+tieGo h lam1 (ETag t as ts) = do
+  as2 <- traverseS (tieGo h lam1) as
+  pure (ETag t as2 ts)
+tieGo h lam1 (EMatch sc arms) = do
+  sc2 <- tieGo h lam1 sc
+  arms2 <- armsS (tieGo h lam1) arms
+  pure (EMatch sc2 arms2)
+tieGo h lam1 (EPrimCall p as) = do
+  as2 <- traverseS (tieGo h lam1) as
+  pure (EPrimCall p as2)
+tieGo h lam1 (ECall g as) = do
+  as2 <- traverseS (tieGo h lam1) as
+  pure (ECall g as2)
+tieGo h lam1 e = pure e
+
+-- (the copy `h`, made to `hb`, small and not calling itself, put where a
+-- copy it calls calls it back)
+tieOne : String -> List String -> IR.Expr -> IR.Def -> M IR.Def
+tieOne h calls hb d =
+  if elemStr d.key calls && elemStr h (IR.globalsIn d.body)
+    then do
+      b2 <- tieGo h hb d.body
+      pure (IR.mkDef d.key d.name b2)
+  else pure d
+
+tieDeps : String -> IR.Expr -> List IR.Def -> M (List IR.Def)
+tieDeps h (ELam xs b) deps =
+  if not (List.null deps)
+  && not (IR.sizeAbove inlineMax (ELam xs b))
+  && not (elemStr h (IR.globalsIn b))
+    then traverseS (tieOne h (IR.globalsIn b) (ELam xs b)) deps
+  else pure deps
+tieDeps h hb deps = pure deps
+
 -- | a copy made -- as the cache keeps it, or here -- then the copies it
 -- | calls for (`more`), before it
 makeOne : (List String -> M (List IR.Def))
@@ -2394,7 +2751,8 @@ makeOne more h b0 = do
   done <- settleKept more kb h b3
   u1 <- refsMade kb h (fst done)
   u2 <- knownMade h (fst done)
-  pure (appendL (snd done) (Cons (IR.mkDef h h (fst done)) Nil))
+  deps <- tieDeps h (fst done) (snd done)
+  pure (appendL deps (Cons (IR.mkDef h h (fst done)) Nil))
 
 makeIf : (List String -> M (List IR.Def))
        -> String
