@@ -120,4 +120,4 @@ How the source is laid out, the seed and the test groups are in
   the core theory heff uses, and [its implementation](https://tangled.org/owenlynch.tngl.sh/hippogriff/),
   which heff refers to.
 - Yang & Wu, POPL 2026, [arXiv:2511.05739](https://arxiv.org/abs/2511.05739):
-  the idea behind `lib/co.hf`.
+  the idea behind heff's effects library, `co`.
