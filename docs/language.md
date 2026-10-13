@@ -284,7 +284,10 @@ found at the type it is used at: `n + 1` at `Int` is the prelude's
 type has those it has: an integer type every one but `/.`, a float no
 `/` or `%` -- a float's division, IEEE's (by 0, an infinity), is `/.`,
 which binds as `*` does.  `Order`'s `compare`, `min` and `max` are the
-prelude's too, and `Bitwise`', an integer type's bits: `and`, `or`,
+prelude's too (an `Order` of `Int`, `Float64`, `String`, `Rune`,
+`Bool`, `Unit` and `Ordering`, and of a `List`, a `Maybe` and a `Pair`
+of types that have one, lexically: what a map's keys and `List.sort`
+ask for), and `Bitwise`', an integer type's bits: `and`, `or`,
 `xor`, `complement`, `shiftL` and `shiftR`; `IsZero`'s `isZero` says
 whether an integer is its type's zero.  A theory is named by a whole
 noun, so that the short names are a program's own to give: `data Op =

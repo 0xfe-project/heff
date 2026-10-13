@@ -29,10 +29,11 @@ are imported by their names:
   that throws by zero, and `attempt`, a handler of it: what was thrown
   and heard by no `catch`, `Left`), `parallel` and `green` ([green
   threads](#green-threads));
-- `array` ([arrays](#arrays)), `map` and `set` (a map's `insertWith`
-  and `alter` change what a key is bound to in one walk down the tree,
-  where a `lookup` and an `insert` take two: `Map.insertWith
-  compareString (\new old -> new + old) word 1 counts` counts a word);
+- `array` ([arrays](#arrays)), `map` and `set`, by the keys' `Order`,
+  found as an instance argument is (a map's `insertWith` and `alter`
+  change what a key is bound to in one walk down the tree, where a
+  `lookup` and an `insert` take two: `Map.insertWith (\new old -> new +
+  old) word 1 counts` counts a word);
 - `hashmap` (as `HashMap`), maps by the keys' hashes, a hash array
   mapped trie as Clojure's and unordered-containers' are: each level 5
   bits of the hash, a node's children in an array as long as how many
@@ -768,8 +769,8 @@ both to the interpreter):
 | `Pair` | the first, then the second |
 | `Map`, `HashMap` | its size, then each key and value, in its `toList`'s order |
 
-A map's instance wants its keys' `Order` (`Int`'s, a fixed-width
-type's), a hash map's their `Hash` and `Equality`.  A type of one's own
+A map's instance wants its keys' `Order` (`Int`'s, `String`'s, a
+fixed-width type's, ...), a hash map's their `Hash` and `Equality`.  A type of one's own
 is written as another, by `via`: a record as pairs, a type of more
 constructors as `Either`s, its shape theirs.
 
