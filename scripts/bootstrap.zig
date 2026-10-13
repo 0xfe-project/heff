@@ -42,7 +42,18 @@ const zigCache = ".heff/zig-cache";
 
 // (for any machine of this kind, not only this one: zig's default is this
 // machine's processor, whose instructions another may not have)
-const flags = [_][]const u8{ "-mcpu=baseline", "-O2", "-w" };
+const flags = [_][]const u8{ "-mcpu=baseline", "-O2", "-w" } ++ noUnwind[0..unwound(builtin.os.tag == .windows)].*;
+
+/// No unwind tables (#69): heff's C throws nothing through them -- a
+/// failure is a longjmp, which needs none -- and they were 1.4 MB of
+/// heff's 17.5; Windows's are kept, its longjmp unwinding by them.
+const noUnwind = [_][]const u8{ "-fno-asynchronous-unwind-tables", "-fno-unwind-tables" };
+fn unwound(windows: bool) usize {
+    return if (windows) 0 else noUnwind.len;
+}
+fn unwind(windows: bool) []const []const u8 {
+    return noUnwind[0..unwound(windows)];
+}
 
 // (what the sources of the compiler are: a heff newer than every one of
 // them, and than the seed, is up to date)
@@ -456,9 +467,10 @@ const Bootstrap = struct {
             const directory = b.concat(&.{ out, "/native/", target });
             b.root.createDirPath(b.io, directory) catch |err| b.fail("heff native: {s}: {t}", .{ directory, err });
             const program = b.concat(&.{ directory, "/", programName(target) });
-            const compile = [_][]const u8{ "-target", target, "-O2", "-w" };
+            const compile = std.mem.concat(b.arena, []const u8, &.{ &.{ "-target", target, "-O2", "-w" }, unwind(isWindows(target)) }) catch
+                b.fail("heff native: out of memory", .{});
             const link = [_][]const u8{ "-target", target, "-O2", "-s", "-w" };
-            if (!b.cc("heff native", nativeKept, parts, program, &compile, &link)) b.fail("heff native: {s} failed", .{target});
+            if (!b.cc("heff native", nativeKept, parts, program, compile, &link)) b.fail("heff native: {s} failed", .{target});
         }
         b.prune(nativeKept);
     }
