@@ -894,6 +894,58 @@ tagApart x (ETag t as ts) b =
   not (IR.isValue (ETag t as ts)) && scrutW x 0 (Cons b Nil) > 0
 tagApart x a b = False
 
+-- Records built to be taken apart: `let r = { rune = strRuneAt s i, width
+-- = strRuneWidth s i } in ... r.rune ... r.width` -- a record whose
+-- fields compute, then only projected -- has its fields bound first, in
+-- order, and the record of them is a value put where each field is
+-- taken: `r.rune` is the field's variable, and no record is built.
+
+-- (how many fields of `x` are taken in the worklist)
+projW : String -> Int -> List IR.Expr -> Int
+projW x n Nil = n
+projW x n (Cons (EProj e _ _ _) rest) =
+  if isVar x e then projW x (n + 1) rest else projW x n (Cons e rest)
+projW x n (Cons (EMatch sc arms) rest) =
+  projW x n (Cons sc (IR.pushArms arms rest))
+projW x n (Cons (EApp f as) rest) = projW x n (Cons f (IR.appendI as rest))
+projW x n (Cons (ELam _ b) rest) = projW x n (Cons b rest)
+projW x n (Cons (ELet _ a b) rest) = projW x n (Cons a (Cons b rest))
+projW x n (Cons (ERecord fs _) rest) = projW x n (IR.pushFields fs rest)
+projW x n (Cons (ETag _ as _) rest) = projW x n (IR.appendI as rest)
+projW x n (Cons (EPrimCall _ as) rest) = projW x n (IR.appendI as rest)
+projW x n (Cons (ECall _ as) rest) = projW x n (IR.appendI as rest)
+projW x n (Cons _ rest) = projW x n rest
+
+-- | `x`, bound to a record some of whose fields compute, is used more
+-- | than once in `b`, each time a field of it taken
+recordTakenApart : String -> IR.Expr -> IR.Expr -> Bool
+recordTakenApart x (ERecord fs ts) b =
+  not (IR.isValue (ERecord fs ts))
+  && occCountOf x b >= 2
+  && projW x 0 (Cons b Nil) == occCountOf x b
+recordTakenApart x a b = False
+
+-- (the record's fields bound to names of their own, in order, and `x`
+-- bound to the record of them, a value)
+recordSplit : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
+recordSplit r x (ERecord fs ts) b = do
+  bound <- bindArgs (List.map (\(f : Pair String IR.Expr) -> snd f) fs)
+  e <-
+    r.simp
+      (ELet
+         x
+         (ERecord
+            (List.zipWith
+               (\(f : Pair String IR.Expr) a -> MkPair (fst f) a)
+               fs
+               (snd bound))
+            ts)
+         b)
+  pure (letsOf (fst bound) e)
+recordSplit r x a b = do
+  b' <- r.simp b
+  pure (ELet x a b')
+
 -- | a binding, its value simplified: what could fail is computed where
 -- | it was, used or not.  A known function given fewer arguments than it
 -- | takes, some computing (`c = lPing (intOr 100000 rest)`), has those
@@ -910,6 +962,7 @@ letIn r x a b = do
         bound <- tagBound a
         e <- letIn r x (snd bound) b
         pure (letsOf (fst bound) e)
+    else if recordTakenApart x a b then recordSplit r x a b
     else if p then letPure r x a b (occCountOf x b)
     else if partialApp s a then letSplit r x a b
     else do
