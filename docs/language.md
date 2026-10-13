@@ -185,10 +185,11 @@ met with `Maybe Int` is outside what unification solves -- `m` could be
 `Maybe` or `\_ -> Maybe Int` -- so when the definition is done and
 nothing else has decided it, it is solved to the first order, as Lean
 does: `m Int` and `Maybe Int`'s last arguments are matched, so `m` is
-`Maybe`.  This is done only where the other side is a type declared
-(by `data`, `theory`, or `type` as a record or a sum -- not an alias,
-nor a function written with equations, which may compute) applied to
-as many arguments at least, and `m`'s type is that of what is left:
+`Maybe`.  This is done only where the other side is a name whose
+definition is, under its arguments, a sum or a record -- however it is
+written, `data`, `theory`, `type` or an equation `Box a = { item : a }`;
+not an alias to another application, which computes further --
+applied to as many arguments at least, and `m`'s type is that of what is left:
 not with a local's application (`f Int`), nor with `Int`, which has no
 argument for `m`'s.  A program that wants `\_ -> Maybe Int` gives it, `(m := ...)`.
 
