@@ -4,7 +4,7 @@
 -- again.  heff is run as `heff build` for each build, so that a build
 -- that fails says why and is waited past, not the end of `heff dev`; the
 -- programs it builds run beside it, their output the terminal's, until
--- a build after a change has made them anew (`Process.launch`).  A page
+-- a build after a change has made them anew (`start`, std.process).  A page
 -- is served by `heff dev-pages`, beside it too (std.http.server, by
 -- green threads): `/NAME/` the program NAME's page -- its
 -- app/NAME/index.html, or one made for it -- `/NAME/NAME.js` its script
@@ -82,7 +82,7 @@ stamped st = do
 --------------------------------------------------------------------------------
 
 -- | a program of the project's, running
-type Running = { name : String, child : Child }
+type Running = { name : String, child : Subprocess }
 
 -- | where `heff dev` is: the project's files as last built, its programs
 -- | running, the pages' server (once there are pages), how many builds
@@ -92,7 +92,7 @@ type Running = { name : String, child : Child }
 type Dev =
   { stamp : String
   , running : List Running
-  , pages : Maybe Child
+  , pages : Maybe Subprocess
   , builds : Int
   , wanted : List String
   , port : String
@@ -124,6 +124,17 @@ stopAll (r :: rest) = do
   _ <- terminate r.child
   stopAll rest
 
+-- (the command, to be started beside `heff dev`: its standard streams
+-- `heff dev`'s)
+beside : String -> List String -> Invocation
+beside cmd as =
+  { command = cmd
+  , args = as
+  , input = Inherited
+  , output = Inherited
+  , errors = Inherited
+  }
+
 -- (the program, started from where `heff build` put it: running, or why
 -- it is not said)
 started : {e : HFunctor}
@@ -135,9 +146,10 @@ started : {e : HFunctor}
         -> Co e (List Running)
 started st acc a = do
   c <-
-    launch
-      (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
-      Nil
+    start
+      (beside
+         (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
+         Nil)
   case c of
     Just child -> pure (List.append acc [{ name = a.name, child = child }])
     Nothing -> do
@@ -162,12 +174,12 @@ pagesFor : {e : HFunctor}
          -> {{sys : process <: e}}
          -> Dev
          -> Bool
-         -> Co e (Maybe Child)
+         -> Co e (Maybe Subprocess)
 pagesFor d False = pure d.pages
 pagesFor { pages = Just c } True = pure (Just c)
 pagesFor d True = do
   self <- programPath
-  launch self ("dev-pages" :: d.port :: maybe Nil (\u -> [u]) d.proxy)
+  start (beside self ("dev-pages" :: d.port :: maybe Nil (\u -> [u]) d.proxy))
 
 -- (the programs, read from their build.hf: none where one cannot be)
 appsNow : {e : HFunctor}
@@ -261,6 +273,13 @@ rebuilt st d stamp = do
       failedSaid r
       pure { d | stamp = stamp }
 
+-- (how a program ended, said)
+endedSaid : Ended -> String
+endedSaid (Exited n) = "status " ^ show n
+endedSaid (Signalled n) = "signal " ^ show n
+endedSaid TimedOut = "timed out"
+endedSaid NotRun = "not run"
+
 -- (the programs that have ended by themselves said, and let go of)
 stillRunning : {e : HFunctor}
              -> {{io : stdio <: e}}
@@ -270,12 +289,11 @@ stillRunning : {e : HFunctor}
              -> Co e (List Running)
 stillRunning acc Nil = pure acc
 stillRunning acc (r :: rest) = do
-  s <- exited r.child
+  s <- tryWait r.child
   case s of
     Nothing -> stillRunning (List.append acc [r]) rest
-    Just code -> do
-      _ <- terminate r.child
-      printErr ("heff dev: " ^ r.name ^ " ended (" ^ show code ^ ")")
+    Just ran -> do
+      printErr ("heff dev: " ^ r.name ^ " ended (" ^ endedSaid ran.ended ^ ")")
       stillRunning acc rest
 
 -- | watched: every quarter of a second, what ran that has ended said,

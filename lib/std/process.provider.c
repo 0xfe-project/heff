@@ -1,9 +1,10 @@
 // The process's side of lib/std/process.hf, for the C backend: an effect
 // provider (the shape of one is said in lib/std/io.provider.c).
 // `Exit` ends the program there; `Exec` runs the command in its place.
-// A command `Launch`ed runs beside it, held by the world (a `Child`)
-// until it is terminated; those not ended at the program's end are
-// terminated then (atexit), and asked to end where a signal ends it.
+// A command `Start`ed runs beside it, held by the world (a
+// `Subprocess`) until it is waited for; those not waited for at the
+// program's end are terminated then (atexit), and asked to end where a
+// signal ends it.
 
 #ifdef _WIN32
 #include <direct.h>
@@ -65,154 +66,9 @@ static char **heff_argv_of(const char *first, V l) {
 // `Exit` clears them as the program ends -- lib/std/progress.provider.c)
 static void (*heff_lines)(int);
 
-// (a command started beside the program: while `on`, not yet waited
-// for; its status once it has ended; among the others started, for the
-// program's end)
-typedef struct HeffChild HeffChild;
-struct HeffChild {
-#ifdef _WIN32
-  HANDLE h;
-#else
-  pid_t pid;
-#endif
-  int on;
-  int status;
-  HeffChild *next;
-};
-
-static HeffChild *heff_children = NULL;
-
-// (whether it has ended, not waiting: its status set, `on` no more)
-static int heff_child_ended(HeffChild *c) {
-  if (!c->on) return 1;
-#ifdef _WIN32
-  if (WaitForSingleObject(c->h, 0) != WAIT_OBJECT_0) return 0;
-  DWORD code = (DWORD)-1;
-  GetExitCodeProcess(c->h, &code);
-  CloseHandle(c->h);
-  c->status = (int)code;
-#else
-  int st;
-  pid_t r = waitpid(c->pid, &st, WNOHANG);
-  if (r == 0) return 0;
-  c->status = r < 0 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
-#endif
-  c->on = 0;
-  return 1;
-}
-
-// (it ended, if it has not: asked, then made to, two seconds after)
-static void heff_child_end(HeffChild *c) {
-  if (heff_child_ended(c)) return;
-#ifdef _WIN32
-  TerminateProcess(c->h, 1);
-  WaitForSingleObject(c->h, INFINITE);
-#else
-  kill(c->pid, SIGTERM);
-  for (int i = 0; i < 100 && !heff_child_ended(c); i++) {
-    struct timespec t = { 0, 20000000L };
-    nanosleep(&t, NULL);
-  }
-  if (c->on) kill(c->pid, SIGKILL);
-#endif
-  if (c->on) {
-#ifdef _WIN32
-    heff_child_ended(c);
-#else
-    int st;
-    waitpid(c->pid, &st, 0);
-    c->status = WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
-    c->on = 0;
-#endif
-  }
-}
-
-static void heff_children_atexit(void) {
-  for (HeffChild *c = heff_children; c; c = c->next) heff_child_end(c);
-}
-
-#ifndef _WIN32
-// (the program ended by a signal -- SIGINT, SIGTERM, SIGHUP, where
-// nothing else was to be done at it -- what it started and has not
-// ended asked to end too, then the signal as it was: ended as it would
-// have been)
-static void heff_children_signal(int sig) {
-  for (HeffChild *c = heff_children; c; c = c->next)
-    if (c->on) kill(c->pid, SIGTERM);
-  signal(sig, SIG_DFL);
-  raise(sig);
-}
-
-static void heff_children_watch(void) {
-  static const int sigs[3] = { SIGINT, SIGTERM, SIGHUP };
-  for (int i = 0; i < 3; i++) {
-    struct sigaction before;
-    if (sigaction(sigs[i], NULL, &before) != 0 || before.sa_handler != SIG_DFL) continue;
-    struct sigaction a;
-    memset(&a, 0, sizeof a);
-    a.sa_handler = heff_children_signal;
-    sigemptyset(&a.sa_mask);
-    a.sa_flags = SA_RESTART;
-    sigaction(sigs[i], &a, NULL);
-  }
-}
-#endif
-
-// (let go of: ended first, taken out of those started)
-static void heff_child_let_go(void *x) {
-  HeffChild *c = x;
-  heff_child_end(c);
-  for (HeffChild **at = &heff_children; *at; at = &(*at)->next)
-    if (*at == c) { *at = c->next; break; }
-  free(c);
-}
-
-static HeffChild *heff_child_of(V h) {
-  return heff_held(INT_OF(heff_field(h, 0)));
-}
-
 #ifndef _WIN32
 extern char **environ;
 #endif
-
-// (the command started beside the program: Just its handle, or Nothing)
-static V heff_launch(V cmd, V args) {
-  char *c = heff_cstr_text(cmd);
-  char **as = c ? heff_argv_of(c, args) : NULL;
-  if (!as) {
-    free(c);
-    return heff_nothing;
-  }
-  fflush(stdout);
-  fflush(stderr);
-  HeffChild *ch = heff_alloc(sizeof *ch);
-  memset(ch, 0, sizeof *ch);
-#ifdef _WIN32
-  ch->h = heff_spawn(as, GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
-  int ok = ch->h != 0;
-#else
-  int ok = posix_spawnp(&ch->pid, c, NULL, NULL, as, environ) == 0;
-#endif
-  for (int64_t j = 0; as[j]; j++) free(as[j]);
-  free(as);
-  if (!ok) {
-    free(ch);
-    return heff_nothing;
-  }
-  static int registered = 0;
-  if (!registered) {
-    registered = 1;
-    atexit(heff_children_atexit);
-#ifndef _WIN32
-    heff_children_watch();
-#endif
-  }
-  ch->on = 1;
-  ch->next = heff_children;
-  heff_children = ch;
-  V i = MK_INT(heff_hold(ch, heff_child_let_go));
-  return heff_just(heff_tag_n(TAG_MkHandle, 1, &i));
-}
 
 // A command run to its end (`Run`, an `Invocation`): its standard input
 // the input given, written through a pipe and then closed, or none, the
@@ -221,13 +77,23 @@ static V heff_launch(V cmd, V args) {
 // together, each kept up to `keep` bytes; killed (SIGKILL) at its time
 // limit.  How it ended is an `Ended`.
 
+// (what a command's input is: none, the null device; a string given,
+// written to it; the program's)
+enum { HEFF_IN_NONE, HEFF_IN_GIVEN, HEFF_IN_INHERITED };
+
+// (what its output or its error stream is: collected, read and kept; the
+// program's)
+enum { HEFF_OUT_COLLECTED, HEFF_OUT_INHERITED };
+
 // (an invocation, as the system is to be given it)
 typedef struct {
   char **as;     // its name, then its arguments: NULL if one has a NUL
   char *dir;     // where it runs: NULL, the program's
   char **env;    // its environment: NULL, the program's
-  char *in;      // its input: NULL, none
+  int in_mode;   // HEFF_IN_*: its input
+  char *in;      // the input `Given`: NULL, none
   size_t nin;
+  int out_mode, err_mode;  // HEFF_OUT_*: its output, its error stream
   int64_t timeout, keep;  // milliseconds, bytes: 0, no limit
 } HeffInvocation;
 
@@ -273,14 +139,20 @@ static char **heff_env_with(char **sets, int64_t n) {
   return env;
 }
 
+// (an `Output` as a mode)
+static int heff_output_mode(V o) {
+  return heff_tag_of(o) == TAG_Inherited ? HEFF_OUT_INHERITED : HEFF_OUT_COLLECTED;
+}
+
 // (the invocation `v`, an `Invocation` (its fields in its type's order:
-// command, args, dir, env, input, timeout, keep), as the system is to be
-// given it: 0 where a string of it has a NUL in it)
+// command, args, dir, env, input, output, errors, timeout, keep), as the
+// system is to be given it: 0 where a string of it has a NUL in it)
 static int heff_invocation(V v, HeffInvocation *r) {
   memset(r, 0, sizeof *r);
   V cmd = heff_rget_v(v, 0), args = heff_rget_v(v, 1), dir = heff_rget_v(v, 2);
   V env = heff_rget_v(v, 3), in = heff_rget_v(v, 4);
-  V timeout = heff_rget_v(v, 5), keep = heff_rget_v(v, 6);
+  V out = heff_rget_v(v, 5), err = heff_rget_v(v, 6);
+  V timeout = heff_rget_v(v, 7), keep = heff_rget_v(v, 8);
   int ok = 1;
   char *c = heff_cstr_text(cmd);
   r->as = c ? heff_argv_of(c, args) : NULL;
@@ -311,7 +183,16 @@ static int heff_invocation(V v, HeffInvocation *r) {
     r->env = heff_env_with(sets, i);
     free(sets);
   }
-  if (heff_tag_of(in) == TAG_Just) r->in = heff_bytes(heff_field(in, 0), &r->nin);
+  switch (heff_tag_of(in)) {
+  case TAG_Given:
+    r->in_mode = HEFF_IN_GIVEN;
+    r->in = heff_bytes(heff_field(in, 0), &r->nin);
+    break;
+  case TAG_Inherited: r->in_mode = HEFF_IN_INHERITED; break;
+  default: r->in_mode = HEFF_IN_NONE;
+  }
+  r->out_mode = heff_output_mode(out);
+  r->err_mode = heff_output_mode(err);
   r->timeout = IS_INT(timeout) && INT_OF(timeout) > 0 ? INT_OF(timeout) : 0;
   r->keep = IS_INT(keep) && INT_OF(keep) > 0 ? INT_OF(keep) : 0;
   heff_drop(cmd);
@@ -319,6 +200,8 @@ static int heff_invocation(V v, HeffInvocation *r) {
   heff_drop(dir);
   heff_drop(env);
   heff_drop(in);
+  heff_drop(out);
+  heff_drop(err);
   heff_drop(timeout);
   heff_drop(keep);
   return ok;
@@ -359,31 +242,94 @@ static V heff_ended(int how, int64_t code) {
   }
 }
 
+// Commands started (`Start`; `Run` is one started and waited for at
+// once): each a `HeffSub`, held by the world (a `Subprocess`) until it
+// is waited for.  What it writes to a pipe is read into its buffers,
+// what it is given written to its input, and its time limit kept,
+// whenever the program waits on it -- `heff_round`, over those waited
+// on.  (On Windows, a thread reads each of its pipes, and one writes its
+// input.)  It has ended once it has exited and its pipes are closed,
+// read to their end -- or once its time limit has passed: then killed,
+// and its pipes closed, not even what its own children still write
+// waited for.
+
+typedef struct HeffSub HeffSub;
+
+// (an output stream of a command's: what it is, its pipe while open,
+// what has come of it)
+typedef struct {
+  int mode;  // HEFF_OUT_*
 #ifdef _WIN32
-typedef struct { HANDLE h; Buf *b; int64_t keep; } HeffKeepDrain;
+  HANDLE h, thread;  // its pipe, and the thread reading it: 0, none
+  volatile LONG closed;
+  HeffSub *owner;
+#else
+  int fd;  // -1: closed, or none
+#endif
+  Buf b;
+} HeffStream;
+
+struct HeffSub {
+#ifdef _WIN32
+  HANDLE h;        // the process
+  HANDLE feedh;    // the pipe its `Given` input is written to, by `feeder`
+  HANDLE feeder;
+  CRITICAL_SECTION lock;  // its streams' buffers, the threads writing them
+  int exited;
+  DWORD code;
+#else
+  pid_t pid;
+  int reaped;      // 0: not yet; 1: reaped, `st` its status; 2: lost
+  int st;
+  int fin;         // its input's pipe, while open: -1, none
+  size_t at;       // how much of `given` is written
+#endif
+  char *given;     // its input, `Given`: NULL, none
+  size_t ngiven;
+  HeffStream out, err;
+  int64_t keep, deadline;  // bytes, the time it is killed at: 0, none
+  int timed;
+  HeffSub *next;   // among those started, to be ended at the program's end
+};
+
+// (`n` bytes come on the stream: kept, as its mode says)
+static void heff_stream_put(HeffStream *st, const char *c, size_t n, int64_t keep) {
+  heff_keep_put(&st->b, c, n, keep);
+}
+
+#ifdef _WIN32
+static SRWLOCK heff_subs_lock = SRWLOCK_INIT;
+#define HEFF_SUBS_LOCK() AcquireSRWLockExclusive(&heff_subs_lock)
+#define HEFF_SUBS_UNLOCK() ReleaseSRWLockExclusive(&heff_subs_lock)
+
+static int64_t heff_now_ms(void) { return (int64_t)GetTickCount64(); }
 
 // (all a pipe gives, until it is closed, or the read cancelled)
-static DWORD WINAPI heff_keep_drain(LPVOID u) {
-  HeffKeepDrain *d = u;
+static DWORD WINAPI heff_stream_drain(LPVOID u) {
+  HeffStream *st = u;
+  HeffSub *s = st->owner;
   char chunk[65536];
   DWORD got;
-  while (ReadFile(d->h, chunk, sizeof chunk, &got, NULL) && got > 0) heff_keep_put(d->b, chunk, got, d->keep);
+  while (ReadFile(st->h, chunk, sizeof chunk, &got, NULL) && got > 0) {
+    EnterCriticalSection(&s->lock);
+    heff_stream_put(st, chunk, got, s->keep);
+    LeaveCriticalSection(&s->lock);
+  }
+  InterlockedExchange(&st->closed, 1);
   return 0;
 }
 
-typedef struct { HANDLE h; const char *s; size_t n; } HeffFeed;
-
-// (the input written to the pipe, then the pipe closed)
-static DWORD WINAPI heff_feed(LPVOID u) {
-  HeffFeed *f = u;
+// (its input written to the pipe, then the pipe closed)
+static DWORD WINAPI heff_sub_feeder(LPVOID u) {
+  HeffSub *s = u;
   size_t at = 0;
   DWORD put;
-  while (at < f->n) {
-    DWORD want = f->n - at > 65536 ? 65536 : (DWORD)(f->n - at);
-    if (!WriteFile(f->h, f->s + at, want, &put, NULL)) break;
+  while (at < s->ngiven) {
+    DWORD want = s->ngiven - at > 65536 ? 65536 : (DWORD)(s->ngiven - at);
+    if (!WriteFile(s->feedh, s->given + at, want, &put, NULL)) break;
     at += put;
   }
-  CloseHandle(f->h);
+  CloseHandle(s->feedh);
   return 0;
 }
 
@@ -394,11 +340,72 @@ static HANDLE heff_thread_or_here(LPTHREAD_START_ROUTINE fn, void *u) {
   return t;
 }
 
-static void heff_thread_join(HANDLE t, int cancel) {
-  if (!t) return;
-  if (cancel) CancelSynchronousIo(t);
-  WaitForSingleObject(t, INFINITE);
-  CloseHandle(t);
+// (the thread ended: waited for, its read or write cancelled first
+// where `cancel` says, again until it has ended)
+static void heff_thread_join(HANDLE *t, int cancel) {
+  if (!*t) return;
+  if (cancel)
+    do CancelSynchronousIo(*t);
+    while (WaitForSingleObject(*t, 50) == WAIT_TIMEOUT);
+  WaitForSingleObject(*t, INFINITE);
+  CloseHandle(*t);
+  *t = 0;
+}
+
+static int heff_stream_closed(HeffStream *st) {
+  return !st->thread || st->closed;
+}
+
+// (whether it has ended: exited, its pipes read to their end)
+static int heff_sub_done(HeffSub *s) {
+  if (!s->exited) {
+    if (WaitForSingleObject(s->h, 0) != WAIT_OBJECT_0) return 0;
+    GetExitCodeProcess(s->h, &s->code);
+    s->exited = 1;
+  }
+  return heff_stream_closed(&s->out) && heff_stream_closed(&s->err);
+}
+
+// (ended now: killed, if it has not exited, and its pipes no more read)
+static void heff_sub_cut(HeffSub *s) {
+  if (!s->exited) {
+    TerminateProcess(s->h, 1);
+    WaitForSingleObject(s->h, INFINITE);
+    GetExitCodeProcess(s->h, &s->code);
+    s->exited = 1;
+  }
+  heff_thread_join(&s->out.thread, 1);
+  heff_thread_join(&s->err.thread, 1);
+  heff_thread_join(&s->feeder, 1);
+}
+
+// (past its time limit, and not ended: cut short)
+static void heff_sub_expire(HeffSub *s, int64_t now) {
+  if (!s->deadline || now < s->deadline || heff_sub_done(s)) return;
+  heff_sub_cut(s);
+  s->timed = 1;
+}
+
+// (one round over the commands `ss`: waited for up to `ms` (-1: as long
+// as it takes) for one to exit, those past their time limit cut short)
+static void heff_round(HeffSub **ss, int n, int64_t ms) {
+  HANDLE hs[MAXIMUM_WAIT_OBJECTS];
+  DWORD k = 0;
+  int64_t now = heff_now_ms();
+  for (int i = 0; i < n; i++) {
+    HeffSub *s = ss[i];
+    if (heff_sub_done(s)) { ms = 0; continue; }
+    if (!s->exited && k < MAXIMUM_WAIT_OBJECTS) hs[k++] = s->h;
+    else if (ms < 0 || ms > 5) ms = 5;
+    if (s->deadline) {
+      int64_t left = s->deadline > now ? s->deadline - now : 0;
+      if (ms < 0 || left < ms) ms = left;
+    }
+  }
+  if (k) WaitForMultipleObjects(k, hs, FALSE, ms < 0 ? INFINITE : (DWORD)ms);
+  else if (ms != 0) Sleep(ms < 0 ? 5 : (DWORD)ms);
+  now = heff_now_ms();
+  for (int i = 0; i < n; i++) heff_sub_expire(ss[i], now);
 }
 
 // (the environment as CreateProcess takes it: each `NAME=VALUE` ended by
@@ -410,71 +417,113 @@ static char *heff_env_block(char **env) {
   return b.s;
 }
 
-// (the command run, as heff_spawn starts one, but with what `v` says)
-static int heff_run_with(HeffInvocation *v, Buf *bo, Buf *be, int64_t *code) {
+// (an output stream's pipe made, where it has one: its read end the
+// stream's, its write end the command's; else the program's own `std`)
+static int heff_stream_pipe(HeffStream *st, SECURITY_ATTRIBUTES *sa, HANDLE *w, DWORD std) {
+  if (st->mode == HEFF_OUT_INHERITED) {
+    *w = GetStdHandle(std);
+    return 1;
+  }
+  if (!CreatePipe(&st->h, w, sa, 0)) return 0;
+  SetHandleInformation(st->h, HANDLE_FLAG_INHERIT, 0);
+  return 1;
+}
+
+static void heff_sub_free(HeffSub *s) {
+  heff_thread_join(&s->out.thread, 0);
+  heff_thread_join(&s->err.thread, 0);
+  heff_thread_join(&s->feeder, 0);
+  if (s->out.h) CloseHandle(s->out.h);
+  if (s->err.h) CloseHandle(s->err.h);
+  if (s->h) CloseHandle(s->h);
+  DeleteCriticalSection(&s->lock);
+  free(s->out.b.s);
+  free(s->err.b.s);
+  free(s->given);
+  free(s);
+}
+
+// (the command started, as `v` says: NULL where it could not be)
+static HeffSub *heff_sub_spawn(HeffInvocation *v) {
   SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
-  HANDLE or_ = 0, ow = 0, er = 0, ew = 0, ir = 0, iw = 0;
-  int how = 3;
-  if (!CreatePipe(&or_, &ow, &sa, 0)) return 3;
-  if (!CreatePipe(&er, &ew, &sa, 0)) { CloseHandle(or_); CloseHandle(ow); return 3; }
-  int piped = v->in != NULL;
-  if (piped ? !CreatePipe(&ir, &iw, &sa, 0)
-            : (ir = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL)) == INVALID_HANDLE_VALUE) {
-    CloseHandle(or_); CloseHandle(ow); CloseHandle(er); CloseHandle(ew);
-    return 3;
+  HeffSub *s = heff_alloc(sizeof *s);
+  memset(s, 0, sizeof *s);
+  InitializeCriticalSection(&s->lock);
+  s->out.owner = s->err.owner = s;
+  s->out.mode = v->out_mode;
+  s->err.mode = v->err_mode;
+  HANDLE ow = 0, ew = 0, ir = 0, iw = 0;
+  int ok = heff_stream_pipe(&s->out, &sa, &ow, STD_OUTPUT_HANDLE)
+           && heff_stream_pipe(&s->err, &sa, &ew, STD_ERROR_HANDLE);
+  if (ok && v->in_mode == HEFF_IN_GIVEN) {
+    ok = CreatePipe(&ir, &iw, &sa, 0);
+    if (ok) SetHandleInformation(iw, HANDLE_FLAG_INHERIT, 0);
+  } else if (ok && v->in_mode == HEFF_IN_NONE) {
+    ir = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    ok = ir != INVALID_HANDLE_VALUE;
+    if (!ok) ir = 0;
   }
-  SetHandleInformation(or_, HANDLE_FLAG_INHERIT, 0);
-  SetHandleInformation(er, HANDLE_FLAG_INHERIT, 0);
-  if (piped) SetHandleInformation(iw, HANDLE_FLAG_INHERIT, 0);
-  char *line = heff_command_line(v->as);
-  char *block = v->env ? heff_env_block(v->env) : NULL;
-  STARTUPINFOA si;
-  memset(&si, 0, sizeof si);
-  si.cb = sizeof si;
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdInput = ir;
-  si.hStdOutput = ow;
-  si.hStdError = ew;
   PROCESS_INFORMATION pi;
-  int ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, block, v->dir, &si, &pi);
-  free(line);
-  free(block);
-  CloseHandle(ow);
-  CloseHandle(ew);
-  CloseHandle(ir);
-  HeffFeed feed = { iw, v->in, v->nin };
-  HANDLE tf = 0;
-  if (piped) {
-    if (ok) tf = heff_thread_or_here(heff_feed, &feed);
-    else CloseHandle(iw);
-  }
-  HeffKeepDrain dout = { or_, bo, v->keep }, derr = { er, be, v->keep };
-  HANDLE to = heff_thread_or_here(heff_keep_drain, &dout);
-  HANDLE te = heff_thread_or_here(heff_keep_drain, &derr);
-  int timed = 0;
   if (ok) {
-    CloseHandle(pi.hThread);
-    if (WaitForSingleObject(pi.hProcess, v->timeout > 0 ? (DWORD)v->timeout : INFINITE) == WAIT_TIMEOUT) {
-      TerminateProcess(pi.hProcess, 1);
-      WaitForSingleObject(pi.hProcess, INFINITE);
-      timed = 1;
-    }
-    DWORD c = (DWORD)-1;
-    GetExitCodeProcess(pi.hProcess, &c);
-    CloseHandle(pi.hProcess);
-    how = timed ? 2 : 0;
-    *code = (int64_t)c;
+    char *line = heff_command_line(v->as);
+    char *block = v->env ? heff_env_block(v->env) : NULL;
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = v->in_mode == HEFF_IN_INHERITED ? GetStdHandle(STD_INPUT_HANDLE) : ir;
+    si.hStdOutput = ow;
+    si.hStdError = ew;
+    fflush(stdout);
+    fflush(stderr);
+    ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, block, v->dir, &si, &pi);
+    free(line);
+    free(block);
   }
-  // (what still holds the pipes, the command's own children, not waited
-  // for past its time limit)
-  heff_thread_join(tf, timed);
-  heff_thread_join(to, timed);
-  heff_thread_join(te, timed);
-  CloseHandle(or_);
-  CloseHandle(er);
-  return how;
+  // (the command's ends of its pipes, its now)
+  if (s->out.h && ow) CloseHandle(ow);
+  if (s->err.h && ew) CloseHandle(ew);
+  if (ir) CloseHandle(ir);
+  if (!ok) {
+    if (iw) CloseHandle(iw);
+    heff_sub_free(s);
+    return NULL;
+  }
+  CloseHandle(pi.hThread);
+  s->h = pi.hProcess;
+  s->keep = v->keep;
+  s->deadline = v->timeout > 0 ? heff_now_ms() + v->timeout : 0;
+  if (s->out.h) s->out.thread = heff_thread_or_here(heff_stream_drain, &s->out);
+  if (s->err.h) s->err.thread = heff_thread_or_here(heff_stream_drain, &s->err);
+  if (iw) {
+    s->given = v->in;
+    s->ngiven = v->nin;
+    v->in = NULL;
+    s->feedh = iw;
+    s->feeder = heff_thread_or_here(heff_sub_feeder, s);
+  }
+  return s;
+}
+
+// (how it ended: `how` as heff_ended takes it, its status `code`)
+static int heff_sub_how(HeffSub *s, int64_t *code) {
+  *code = (int64_t)s->code;
+  return s->timed ? 2 : 0;
+}
+
+static void heff_sub_kill(HeffSub *s) {
+  if (!heff_sub_done(s) && !s->exited) TerminateProcess(s->h, 1);
+}
+
+// (it ended, if it has not: made to at once, as Windows has no asking)
+static void heff_sub_end(HeffSub *s) {
+  if (!heff_sub_done(s)) heff_sub_cut(s);
 }
 #else
+static pthread_mutex_t heff_subs_mu = PTHREAD_MUTEX_INITIALIZER;
+#define HEFF_SUBS_LOCK() pthread_mutex_lock(&heff_subs_mu)
+#define HEFF_SUBS_UNLOCK() pthread_mutex_unlock(&heff_subs_mu)
+
 // (a descriptor not given to the commands run: those of another
 // command's pipes, run at once by another thread, would keep them open)
 static int heff_cloexec(int fd) {
@@ -487,6 +536,11 @@ static int heff_pipe(int p[2]) {
   heff_cloexec(p[0]);
   heff_cloexec(p[1]);
   return 1;
+}
+
+static void heff_close(int *fd) {
+  if (*fd >= 0) close(*fd);
+  *fd = -1;
 }
 
 static int64_t heff_now_ms(void) {
@@ -502,143 +556,413 @@ static int heff_ended_how(int st, int64_t *code) {
   return 3;
 }
 
-// (the command run, forked and exec'd -- in its directory, with its
-// environment, its input `in` -- its streams read: how it ended)
-static int heff_run_with(HeffInvocation *v, Buf *bo, Buf *be, int64_t *code) {
-  int po[2], pe[2], pi[2] = { -1, -1 }, px[2];
-  if (!heff_pipe(po)) return 3;
-  if (!heff_pipe(pe)) { close(po[0]); close(po[1]); return 3; }
-  if (!heff_pipe(px)) { close(po[0]); close(po[1]); close(pe[0]); close(pe[1]); return 3; }
-  int piped = v->in != NULL;
-  if (piped ? !heff_pipe(pi) : (pi[0] = heff_cloexec(open("/dev/null", O_RDONLY))) < 0) {
-    close(po[0]); close(po[1]); close(pe[0]); close(pe[1]); close(px[0]); close(px[1]);
-    return 3;
-  }
-  fflush(stdout);
-  fflush(stderr);
-  pid_t pid = fork();
-  if (pid == 0) {
-    // (the child: nothing but what is safe after a fork)
-    int e;
-    if (v->dir && chdir(v->dir) != 0) goto failed;
-    if (dup2(pi[0], 0) < 0 || dup2(po[1], 1) < 0 || dup2(pe[1], 2) < 0) goto failed;
-    if (v->env) environ = v->env;
-    execvp(v->as[0], v->as);
-  failed:
-    e = errno;
-    (void)!write(px[1], &e, sizeof e);
-    _exit(127);
-  }
-  close(po[1]);
-  close(pe[1]);
-  close(px[1]);
-  close(pi[0]);
-  int how = 3;
-  if (pid < 0) {
-    close(po[0]); close(pe[0]); close(px[0]);
-    if (piped) close(pi[1]);
-    return 3;
-  }
-  // (the command's name found and run, or why not, said by the child)
-  int e;
-  ssize_t said;
-  do said = read(px[0], &e, sizeof e); while (said < 0 && errno == EINTR);
-  close(px[0]);
-  if (said == (ssize_t)sizeof e) {
-    close(po[0]); close(pe[0]);
-    if (piped) close(pi[1]);
-    int st;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    return 3;
-  }
-  // (a write to an input it does not read fails, not the program by
-  // SIGPIPE: held off in this thread, and taken back if it came)
-  sigset_t sp, before;
+// (a write to an input not read fails, not the program by SIGPIPE: held
+// off in this thread while it is written to, and taken back if it came)
+static void heff_nopipe(sigset_t *before) {
+  sigset_t sp;
   sigemptyset(&sp);
   sigaddset(&sp, SIGPIPE);
-  pthread_sigmask(SIG_BLOCK, &sp, &before);
-  if (piped) fcntl(pi[1], F_SETFL, fcntl(pi[1], F_GETFL) | O_NONBLOCK);
-  size_t at = 0;
-  if (piped && v->nin == 0) { close(pi[1]); piped = 0; }
-  int64_t deadline = v->timeout > 0 ? heff_now_ms() + v->timeout : 0;
-  int timed = 0, streams = 2;
-  struct pollfd fds[3] = { { po[0], POLLIN, 0 }, { pe[0], POLLIN, 0 }, { piped ? pi[1] : -1, POLLOUT, 0 } };
-  char chunk[65536];
-  while (streams > 0 || fds[2].fd >= 0) {
-    int wait = -1;
-    if (deadline) {
-      int64_t left = deadline - heff_now_ms();
-      if (left <= 0) { timed = 1; break; }
-      wait = left > 1000000 ? 1000000 : (int)left;
-    }
-    int r = poll(fds, 3, wait);
-    if (r < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    for (int i = 0; i < 2; i++) {
-      if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-      ssize_t got = read(fds[i].fd, chunk, sizeof chunk);
-      if (got < 0 && errno == EINTR) continue;
-      if (got <= 0) { close(fds[i].fd); fds[i].fd = -1; streams--; }
-      else heff_keep_put(i == 0 ? bo : be, chunk, (size_t)got, v->keep);
-    }
-    if (fds[2].fd >= 0 && fds[2].revents) {
-      ssize_t put = (fds[2].revents & POLLOUT) ? write(fds[2].fd, v->in + at, v->nin - at) : -1;
-      if (put > 0) at += (size_t)put;
-      if ((put < 0 && errno != EAGAIN && errno != EINTR) || at >= v->nin) {
-        close(fds[2].fd);
-        fds[2].fd = -1;
-      }
-    }
-  }
-  for (int i = 0; i < 3; i++) if (fds[i].fd >= 0) close(fds[i].fd);
-  sigset_t pending;
+  pthread_sigmask(SIG_BLOCK, &sp, before);
+}
+
+static void heff_nopipe_end(const sigset_t *before) {
+  sigset_t pending, sp;
+  sigemptyset(&sp);
+  sigaddset(&sp, SIGPIPE);
   sigpending(&pending);
-  if (sigismember(&pending, SIGPIPE) && !sigismember(&before, SIGPIPE)) {
+  if (sigismember(&pending, SIGPIPE) && !sigismember(before, SIGPIPE)) {
     int s;
     sigwait(&sp, &s);
   }
-  pthread_sigmask(SIG_SETMASK, &before, NULL);
-  // (its streams closed, it ended -- waited for up to its time limit)
-  int st = 0, waited = 0;
-  while (!timed && deadline) {
-    pid_t w = waitpid(pid, &st, WNOHANG);
-    if (w == pid || (w < 0 && errno != EINTR)) { waited = w == pid; break; }
-    if (heff_now_ms() >= deadline) timed = 1;
-    else {
-      struct timespec t = { 0, 5000000L };
-      nanosleep(&t, NULL);
+  pthread_sigmask(SIG_SETMASK, before, NULL);
+}
+
+// (as much of its input as its pipe takes now, written: the pipe closed
+// once all of it is, or where it is read no more)
+static void heff_sub_feed(HeffSub *s) {
+  while (s->fin >= 0 && s->at < s->ngiven) {
+    ssize_t put = write(s->fin, s->given + s->at, s->ngiven - s->at);
+    if (put > 0) s->at += (size_t)put;
+    else if (put < 0 && errno == EINTR) continue;
+    else if (put < 0 && errno == EAGAIN) return;
+    else break;
+  }
+  heff_close(&s->fin);
+}
+
+// (what has come on the stream, read: closed at its end)
+static void heff_stream_read(HeffSub *s, HeffStream *st) {
+  char chunk[65536];
+  ssize_t got = read(st->fd, chunk, sizeof chunk);
+  if (got < 0 && (errno == EINTR || errno == EAGAIN)) return;
+  if (got <= 0) heff_close(&st->fd);
+  else heff_stream_put(st, chunk, (size_t)got, s->keep);
+}
+
+// (whether it has exited, reaped where it has: waiting, where `block`)
+static void heff_sub_reap(HeffSub *s, int block) {
+  if (s->reaped) return;
+  int st;
+  pid_t w;
+  while ((w = waitpid(s->pid, &st, block ? 0 : WNOHANG)) < 0 && errno == EINTR) {}
+  if (w == s->pid) {
+    s->reaped = 1;
+    s->st = st;
+  } else if (w < 0) s->reaped = 2;
+}
+
+// (whether it has ended: exited, its pipes read to their end)
+static int heff_sub_done(HeffSub *s) {
+  return s->reaped && s->out.fd < 0 && s->err.fd < 0;
+}
+
+// (ended now: killed, if it has not exited, and its pipes closed)
+static void heff_sub_cut(HeffSub *s) {
+  if (!s->reaped) {
+    kill(s->pid, SIGKILL);
+    heff_sub_reap(s, 1);
+  }
+  heff_close(&s->out.fd);
+  heff_close(&s->err.fd);
+  heff_close(&s->fin);
+}
+
+// (past its time limit, and not ended: cut short)
+static void heff_sub_expire(HeffSub *s, int64_t now) {
+  if (!s->deadline || now < s->deadline || heff_sub_done(s)) return;
+  heff_sub_cut(s);
+  s->timed = 1;
+}
+
+// (one round over the commands `ss`: what they wrote read, what they are
+// given written, each that has exited reaped, each past its time limit
+// cut short -- waiting up to `ms` (-1: as long as it takes) for any of
+// it.  One with no pipe left to read is looked at every 5 ms.)
+static void heff_round(HeffSub **ss, int n, int64_t ms) {
+  struct pollfd *fds = heff_alloc((size_t)(3 * n + 1) * sizeof *fds);
+  HeffSub **who = heff_alloc((size_t)(3 * n + 1) * sizeof *who);
+  HeffStream **which = heff_alloc((size_t)(3 * n + 1) * sizeof *which);
+  int k = 0;
+  int64_t now = heff_now_ms();
+  for (int i = 0; i < n; i++) {
+    HeffSub *s = ss[i];
+    if (heff_sub_done(s)) { ms = 0; continue; }
+    HeffStream *sts[2] = { &s->out, &s->err };
+    for (int j = 0; j < 2; j++)
+      if (sts[j]->fd >= 0) {
+        fds[k] = (struct pollfd){ sts[j]->fd, POLLIN, 0 };
+        who[k] = s;
+        which[k++] = sts[j];
+      }
+    if (s->fin >= 0 && s->at < s->ngiven) {
+      fds[k] = (struct pollfd){ s->fin, POLLOUT, 0 };
+      who[k] = s;
+      which[k++] = NULL;
+    }
+    if (!s->reaped && s->out.fd < 0 && s->err.fd < 0 && (ms < 0 || ms > 5)) ms = 5;
+    if (s->deadline) {
+      int64_t left = s->deadline > now ? s->deadline - now : 0;
+      if (ms < 0 || left < ms) ms = left;
     }
   }
-  if (timed) kill(pid, SIGKILL);
-  if (!waited) {
-    pid_t w;
-    while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
-    if (w != pid) return 3;
+  if (ms > 1000000) ms = 1000000;
+  if (poll(fds, (nfds_t)k, (int)ms) > 0) {
+    sigset_t before;
+    heff_nopipe(&before);
+    for (int j = 0; j < k; j++) {
+      if (!fds[j].revents) continue;
+      if (!which[j]) heff_sub_feed(who[j]);
+      else if (which[j]->fd >= 0) heff_stream_read(who[j], which[j]);
+    }
+    heff_nopipe_end(&before);
   }
-  how = timed ? 2 : heff_ended_how(st, code);
-  return how;
+  free(fds);
+  free(who);
+  free(which);
+  now = heff_now_ms();
+  for (int i = 0; i < n; i++) {
+    heff_sub_reap(ss[i], 0);
+    heff_sub_expire(ss[i], now);
+  }
+}
+
+static void heff_sub_free(HeffSub *s) {
+  heff_close(&s->out.fd);
+  heff_close(&s->err.fd);
+  heff_close(&s->fin);
+  free(s->out.b.s);
+  free(s->err.b.s);
+  free(s->given);
+  free(s);
+}
+
+// (the command started, forked and exec'd as `v` says -- in its
+// directory, with its environment, its input -- or NULL where it could
+// not be: not found, not a program, its directory not there, as the
+// child says through a pipe of its own)
+static HeffSub *heff_sub_spawn(HeffInvocation *v) {
+  HeffSub *s = heff_alloc(sizeof *s);
+  memset(s, 0, sizeof *s);
+  s->out.fd = s->err.fd = s->fin = -1;
+  s->out.mode = v->out_mode;
+  s->err.mode = v->err_mode;
+  int po[2] = { -1, -1 }, pe[2] = { -1, -1 }, pi[2] = { -1, -1 }, px[2] = { -1, -1 };
+  int ok = heff_pipe(px);
+  if (ok && v->out_mode != HEFF_OUT_INHERITED) ok = heff_pipe(po);
+  if (ok && v->err_mode != HEFF_OUT_INHERITED) ok = heff_pipe(pe);
+  if (ok && v->in_mode == HEFF_IN_GIVEN) ok = heff_pipe(pi);
+  else if (ok && v->in_mode == HEFF_IN_NONE) ok = (pi[0] = heff_cloexec(open("/dev/null", O_RDONLY))) >= 0;
+  pid_t pid = -1;
+  if (ok) {
+    fflush(stdout);
+    fflush(stderr);
+    pid = fork();
+    if (pid == 0) {
+      // (the child: nothing but what is safe after a fork)
+      int e;
+      if (v->dir && chdir(v->dir) != 0) goto failed;
+      if ((pi[0] >= 0 && dup2(pi[0], 0) < 0) || (po[1] >= 0 && dup2(po[1], 1) < 0)
+          || (pe[1] >= 0 && dup2(pe[1], 2) < 0))
+        goto failed;
+      if (v->env) environ = v->env;
+      execvp(v->as[0], v->as);
+    failed:
+      e = errno;
+      (void)!write(px[1], &e, sizeof e);
+      _exit(127);
+    }
+  }
+  heff_close(&pi[0]);
+  heff_close(&po[1]);
+  heff_close(&pe[1]);
+  heff_close(&px[1]);
+  if (pid > 0) {
+    // (the command's name found and run, or why not, said by the child)
+    int e;
+    ssize_t said;
+    do said = read(px[0], &e, sizeof e); while (said < 0 && errno == EINTR);
+    if (said == (ssize_t)sizeof e) {
+      int st;
+      while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+      pid = -1;
+    }
+  }
+  heff_close(&px[0]);
+  if (pid <= 0) {
+    heff_close(&po[0]);
+    heff_close(&pe[0]);
+    heff_close(&pi[1]);
+    heff_sub_free(s);
+    return NULL;
+  }
+  s->pid = pid;
+  s->out.fd = po[0];
+  s->err.fd = pe[0];
+  s->fin = pi[1];
+  s->keep = v->keep;
+  s->deadline = v->timeout > 0 ? heff_now_ms() + v->timeout : 0;
+  if (s->fin >= 0) {
+    fcntl(s->fin, F_SETFL, fcntl(s->fin, F_GETFL) | O_NONBLOCK);
+#ifdef F_SETNOSIGPIPE
+    // (macOS: SIGPIPE is the process's, not the thread's, there -- not
+    // held off by a thread's mask: none sent for this pipe at all)
+    fcntl(s->fin, F_SETNOSIGPIPE, 1);
+#endif
+    s->given = v->in;
+    s->ngiven = v->nin;
+    v->in = NULL;
+    // (what its pipe takes now, written at once: a short input is all
+    // given before it is waited on)
+    sigset_t before;
+    heff_nopipe(&before);
+    heff_sub_feed(s);
+    heff_nopipe_end(&before);
+  }
+  return s;
+}
+
+// (how it ended: `how` as heff_ended takes it, its status or signal
+// `code`)
+static int heff_sub_how(HeffSub *s, int64_t *code) {
+  if (s->timed) return 2;
+  return s->reaped == 1 ? heff_ended_how(s->st, code) : 3;
+}
+
+static void heff_sub_kill(HeffSub *s) {
+  if (!s->reaped) kill(s->pid, SIGKILL);
+}
+#endif
+
+// (the first of the commands `ss` to end, waited for up to `ms`
+// milliseconds (-1: as long as it takes; 0: not at all): its index, or
+// -1 where none has ended)
+static int heff_await(HeffSub **ss, int n, int64_t ms) {
+  int64_t until = ms > 0 ? heff_now_ms() + ms : 0;
+  for (int first = 1;; first = 0) {
+    for (int i = 0; i < n; i++)
+      if (heff_sub_done(ss[i])) return i;
+    if (n == 0 || (ms == 0 && !first)) return -1;
+    int64_t wait = ms == 0 ? 0 : -1;
+    if (until) {
+      wait = until - heff_now_ms();
+      if (wait <= 0) return -1;
+    }
+    heff_round(ss, n, wait);
+  }
+}
+
+#ifndef _WIN32
+// (it ended, if it has not: its input closed, asked to end (SIGTERM),
+// then made to, two seconds after)
+static void heff_sub_end(HeffSub *s) {
+  if (heff_sub_done(s)) return;
+  heff_close(&s->fin);
+  if (!s->reaped) kill(s->pid, SIGTERM);
+  if (heff_await(&s, 1, 2000) < 0) heff_sub_cut(s);
 }
 #endif
 
 static uint32_t heff_run_shape[3] = { LBL_ended, LBL_out, LBL_err };
 
-// (a command run, as an `Invocation` says: a `Ran`)
-static V heff_run(V inv) {
-  HeffInvocation v;
-  Buf bo = {0}, be = {0};
+// (an ended command's `Ran`: how it ended, what it wrote)
+static V heff_sub_ran(HeffSub *s) {
   int64_t code = 0;
-  int how = heff_invocation(inv, &v) ? heff_run_with(&v, &bo, &be, &code) : 3;
-  heff_invocation_free(&v);
+  int how = heff_sub_how(s, &code);
   V f[3] = {
     heff_ended(how, code),
-    heff_str_bytes(bo.s ? bo.s : "", (int64_t)bo.n),
-    heff_str_bytes(be.s ? be.s : "", (int64_t)be.n),
+    heff_str_bytes(s->out.b.s ? s->out.b.s : "", (int64_t)s->out.b.n),
+    heff_str_bytes(s->err.b.s ? s->err.b.s : "", (int64_t)s->err.b.n),
   };
-  free(bo.s);
-  free(be.s);
   return heff_rec(3, heff_run_shape, f);
+}
+
+// (a command not run: its `Ran`)
+static V heff_not_ran(void) {
+  V f[3] = { heff_ended(3, 0), heff_str_bytes("", 0), heff_str_bytes("", 0) };
+  return heff_rec(3, heff_run_shape, f);
+}
+
+// (a command run, as an `Invocation` says, to its end: a `Ran`)
+static V heff_run(V inv) {
+  HeffInvocation v;
+  HeffSub *s = heff_invocation(inv, &v) ? heff_sub_spawn(&v) : NULL;
+  heff_invocation_free(&v);
+  if (!s) return heff_not_ran();
+  heff_await(&s, 1, -1);
+  V r = heff_sub_ran(s);
+  heff_sub_free(s);
+  return r;
+}
+
+// Those started and not yet waited for: ended at the program's end, and
+// asked to end where a signal ends it.
+
+static HeffSub *heff_subs = NULL;
+
+static void heff_subs_atexit(void) {
+  for (HeffSub *s = heff_subs; s; s = s->next) heff_sub_end(s);
+}
+
+#ifndef _WIN32
+// (the program ended by a signal -- SIGINT, SIGTERM, SIGHUP, where
+// nothing else was to be done at it -- what it started and has not
+// ended asked to end too, then the signal as it was: ended as it would
+// have been)
+static void heff_subs_signal(int sig) {
+  for (HeffSub *s = heff_subs; s; s = s->next)
+    if (!s->reaped) kill(s->pid, SIGTERM);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+static void heff_subs_watch(void) {
+  static const int sigs[3] = { SIGINT, SIGTERM, SIGHUP };
+  for (int i = 0; i < 3; i++) {
+    struct sigaction before;
+    if (sigaction(sigs[i], NULL, &before) != 0 || before.sa_handler != SIG_DFL) continue;
+    struct sigaction a;
+    memset(&a, 0, sizeof a);
+    a.sa_handler = heff_subs_signal;
+    sigemptyset(&a.sa_mask);
+    a.sa_flags = SA_RESTART;
+    sigaction(sigs[i], &a, NULL);
+  }
+}
+#endif
+
+// (let go of: ended first, taken out of those started)
+static void heff_sub_let_go(void *x) {
+  HeffSub *s = x;
+  heff_sub_end(s);
+  HEFF_SUBS_LOCK();
+  for (HeffSub **at = &heff_subs; *at; at = &(*at)->next)
+    if (*at == s) { *at = s->next; break; }
+  HEFF_SUBS_UNLOCK();
+  heff_sub_free(s);
+}
+
+// (the command started, as an `Invocation` says: Just its handle, or
+// Nothing)
+static V heff_start(V inv) {
+  HeffInvocation v;
+  HeffSub *s = heff_invocation(inv, &v) ? heff_sub_spawn(&v) : NULL;
+  heff_invocation_free(&v);
+  if (!s) return heff_nothing;
+  HEFF_SUBS_LOCK();
+  static int registered = 0;
+  if (!registered) {
+    registered = 1;
+    atexit(heff_subs_atexit);
+#ifndef _WIN32
+    heff_subs_watch();
+#endif
+  }
+  s->next = heff_subs;
+  heff_subs = s;
+  HEFF_SUBS_UNLOCK();
+  V i = MK_INT(heff_hold(s, heff_sub_let_go));
+  return heff_just(heff_tag_n(TAG_MkHandle, 1, &i));
+}
+
+// (the world's number of a `Subprocess`)
+static int64_t heff_sub_number(V h) {
+  return INT_OF(heff_field(h, 0));
+}
+
+// (the commands of a list of `Subprocess`es, `*n` of them, and their
+// numbers; malloc'd)
+static HeffSub **heff_subs_of(V l, int64_t **ids, int *n) {
+  int k = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) k++;
+  HeffSub **ss = heff_alloc((size_t)(k + 1) * sizeof *ss);
+  *ids = heff_alloc((size_t)(k + 1) * sizeof **ids);
+  int i = 0;
+  for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1), i++) {
+    (*ids)[i] = heff_sub_number(heff_field(c, 0));
+    ss[i] = heff_held((*ids)[i]);
+  }
+  *n = k;
+  return ss;
+}
+
+// (the first of a list of `Subprocess`es to end, waited for: Just it and
+// its `Ran`, let go of; Nothing where there are none)
+static V heff_wait_any(V l) {
+  int64_t *ids;
+  int n;
+  HeffSub **ss = heff_subs_of(l, &ids, &n);
+  int i = heff_await(ss, n, -1);
+  V r = heff_nothing;
+  if (i >= 0) {
+    V c = l;
+    for (int j = 0; j < i; j++) c = heff_field(c, 1);
+    V pair[2] = { heff_dup(heff_field(c, 0)), heff_sub_ran(ss[i]) };
+    heff_release(ids[i]);
+    r = heff_just(heff_tag_n(TAG_MkPair, 2, pair));
+  }
+  free(ss);
+  free(ids);
+  return r;
 }
 
 static V heff_provider_process(V p, V k) {
@@ -704,32 +1028,61 @@ static V heff_provider_process(V p, V k) {
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
-  case TAG_Launch: {
-    V cmd = heff_dup(heff_field(p, 0)), args = heff_dup(heff_field(p, 1));
-    V f = heff_dup(heff_field(p, 2));
+  case TAG_Start: {
+    V inv = heff_dup(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    V r = heff_launch(cmd, args);
-    heff_drop(cmd);
-    heff_drop(args);
+    V r = heff_start(inv);
+    heff_drop(inv);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
-  case TAG_Poll: {
-    HeffChild *c = heff_child_of(heff_field(p, 0));
+  case TAG_Wait: {
+    int64_t i = heff_sub_number(heff_field(p, 0));
+    HeffSub *s = heff_held(i);
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    V x = heff_answer(f, heff_child_ended(c) ? heff_just(MK_INT(c->status)) : heff_nothing);
+    heff_await(&s, 1, -1);
+    V r = heff_sub_ran(s);
+    heff_release(i);
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_WaitAny: {
+    V r = heff_wait_any(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_TryWait: {
+    int64_t i = heff_sub_number(heff_field(p, 0));
+    HeffSub *s = heff_held(i);
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    V r = heff_nothing;
+    if (heff_await(&s, 1, 0) == 0) {
+      r = heff_just(heff_sub_ran(s));
+      heff_release(i);
+    }
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Kill: {
+    heff_sub_kill(heff_held(heff_sub_number(heff_field(p, 0))));
+    V x = heff_dup(heff_field(p, 1));
+    heff_drop(p);
     return heff_tail(k, 1, &x);
   }
   case TAG_Terminate: {
-    int64_t i = INT_OF(heff_field(heff_field(p, 0), 0));
-    HeffChild *c = heff_held(i);
+    int64_t i = heff_sub_number(heff_field(p, 0));
+    HeffSub *s = heff_held(i);
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    heff_child_end(c);
-    int status = c->status;
+    heff_sub_end(s);
+    V r = heff_sub_ran(s);
     heff_release(i);
-    V x = heff_answer(f, MK_INT(status));
+    V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
   case TAG_Exec: {

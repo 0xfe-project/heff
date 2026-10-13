@@ -208,9 +208,10 @@ checks.push((async () => {
 })());
 
 // (commands run to their end, std.process's `run`: each option of an
-// `Invocation` and each way a command ends -- the commands sh's, so not
-// on Windows; given an input of its own, which the commands run with
-// none must not see)
+// `Invocation` and each way a command ends; then commands started and
+// waited for later, `start`, `waitAny`, `kill` -- the commands sh's, so
+// not on Windows; given an input of its own, which the commands run
+// with none must not see)
 if (process.platform !== "win32") checks.push(ran("commands", "test/node/commands.hf", "main", [], {
   out: [
     'plain: exited 0, out "out\\n", err "err\\n"',
@@ -231,6 +232,16 @@ if (process.platform !== "win32") checks.push(ran("commands", "test/node/command
     'kept: exited 0, out "0123", err "abcd"',
     'written forever: timed out, out "y\\ny\\ny\\n", err ""',
     'not there: not run, out "", err ""',
+    'first, quick: exited 0, out "quick\\n", err ""',
+    'second, slow: exited 0, out "slow\\n", err ""',
+    "of none: none",
+    "tried: running still",
+    'killed: signal 9, out "", err ""',
+    'started, its time up: timed out, out "before\\n", err ""',
+    'terminated: signal 15, out "", err ""',
+    "shown",
+    'inherited: exited 0, out "", err "shown too\\n"',
+    "not started: nothing",
     "",
   ].join("\n"),
   err: "", status: 0,

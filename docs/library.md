@@ -422,24 +422,28 @@ are not seen, a mode is only whether the owner may write, and every
 operation waits where it is.
 
 `std.process` runs a command to its end (`run`), in the program's place
-(`exec`), or beside it (`launch`).  `run` takes an `Invocation`, a
-record whose fields but `command` have defaults, so that a call gives
-only what it changes:
+(`exec`), or beside it, started and waited for later (`start`).  `run`
+takes an `Invocation`, a record whose fields but `command` have
+defaults, so that a call gives only what it changes:
 
 ```haskell
 r <- run { command = "git", args = ["rev-parse", "HEAD"], dir = repo }
 t <- run { command = "heff", args = ["test"], env = [MkPair "HEFF_TTY" "0"],
-           input = Just "...", timeout = 120000, keep = 65536 }
+           input = Given "...", timeout = 120000, keep = 65536 }
 ```
 
 - `args` (none), its arguments;
 - `dir` (`""`, the program's), the directory it runs in;
 - `env` (none), environment variables set for it over the program's
   own, which it has too (the environment is never cleared);
-- `input` (`Nothing`), its standard input: a string, written to it
-  through a pipe and then closed; `Nothing` is no input at all -- the
-  null device (`/dev/null`, `NUL`), not the program's standard input
-  nor a closed descriptor, which the command's next open would take;
+- `input` (`NoInput`), its standard input: `Given` a string, written
+  to it through a pipe and then closed; `Inherited`, the program's
+  own; `NoInput` is no input at all -- the null device (`/dev/null`,
+  `NUL`), not the program's standard input nor a closed descriptor,
+  which the command's next open would take;
+- `output` and `errors` (`Collected`), its output and its error stream:
+  `Collected`, read as they come and kept for its `Ran`; `Inherited`,
+  the program's own, written there as they come;
 - `timeout` (0, as long as it takes), milliseconds, after which it is
   killed (SIGKILL; on Windows, TerminateProcess) and not waited for
   further, not even for what its own children still write;
@@ -447,21 +451,54 @@ t <- run { command = "heff", args = ["test"], env = [MkPair "HEFF_TTY" "0"],
   error stream are kept: the first, the rest read and let go, so a
   command that writes forever until its time limit is not held whole.
 
-Its `Ran` is what it wrote, `out` and `err`, and how it ended, `ended`:
-`Exited` with its status, `Signalled` with the signal's number (never
-on Windows), `TimedOut`, or `NotRun` -- not found, not a program, its
-directory not there, or a NUL in its name or an argument.  `succeeded
-r` is whether it exited with 0.
+Its `Ran` is what it wrote, `out` and `err` (those `Collected`), and
+how it ended, `ended`: `Exited` with its status, `Signalled` with the
+signal's number (never on Windows), `TimedOut`, or `NotRun` -- not
+found, not a program, its directory not there, or a NUL in its name or
+an argument.  `succeeded r` is whether it exited with 0.
 
-`launch cmd args` starts
-one with the program's standard streams, in its process group (Ctrl-C
-ends both), `Maybe` a `Child` (a handle); `exited c` is `Just` its
-status once it has ended (128 and the signal, where a signal ended it),
-without waiting; `terminate c` ends it -- SIGTERM, then SIGKILL two
-seconds later -- and lets its handle go, its status.  What a program
-started and has not ended is ended at the program's end, and where a
-signal (SIGINT, SIGTERM, SIGHUP) ends it.  (`heff dev` runs a
-project's programs so.)
+`start` takes the same `Invocation` and goes on beside the command:
+`Just` a `Subprocess` (a handle, std.handle's), or `Nothing` where it
+could not be run (where `run` says `NotRun`).  `wait p` waits for it to
+end, its `Ran`; `waitAny ps` waits for whichever of several ends
+first, `Just` it and its `Ran` (`Nothing` for none), the others running
+still -- a pool starts the next as soon as one ends; `tryWait p` is
+`Just` its `Ran` if it has ended, without waiting; `kill p` kills it
+(SIGKILL; on Windows, TerminateProcess, and it exited with 1), not
+waiting; `terminate p` ends it -- SIGTERM, then SIGKILL two seconds
+later (on Windows, at once) -- and waits for it, its `Ran`.  Once its
+`Ran` is given, its handle is let go of: an operation given it after
+that fails the program.
+
+```haskell
+-- (two commands at once: the first to end said, then the other)
+race : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{sys : process <: e}}
+     -> Subprocess
+     -> Subprocess
+     -> Co e Unit
+race a b = do
+  first <- waitAny [a, b]
+  case first of
+    Just (MkPair p r) -> do
+      print ((if sameHandle p a then "a: " else "b: ") ^ r.out)
+      rest <- wait (if sameHandle p a then b else a)
+      print ("then: " ^ rest.out)
+    Nothing -> pure MkUnit
+```
+
+What a started command writes is read, its input written and its time
+limit kept, while the program waits on it -- by `wait`, `waitAny`,
+`tryWait`, `terminate` -- and not between: one that writes more than a
+pipe holds (64 KiB, most often) waits until then, and one past its time
+limit is killed at the next.  A wait blocks where it is, every green
+thread with it, as `run` does.  It runs in the program's process group
+(Ctrl-C ends both); what a program started and has not waited for is
+terminated at the program's end, and where a signal (SIGINT, SIGTERM,
+SIGHUP) ends it.  (`heff dev` runs a project's programs so, their
+streams `Inherited`.)  How many there are to run at once, a pool's
+size, is std.thread's `cores`, the machine's cores.
 
 ## The terminal
 

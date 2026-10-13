@@ -1,6 +1,6 @@
 -- The process as an effect (lib/co.hf): its arguments, its environment,
 -- where its program is and where it runs, the commands it runs -- to
--- their end, or started beside it -- and how it ends
+-- their end, or started beside it and waited for later -- and how it ends
 -- (process.provider.c).
 
 import co
@@ -13,6 +13,16 @@ import std.handle
 -- | there).
 data Ended = Exited Int | Signalled Int | TimedOut | NotRun
 
+-- | What a command's standard input is: none, the null device (not the
+-- | program's, nor a closed descriptor, which its next open would take);
+-- | a string, written to it and then closed; or the program's own.
+data Input = NoInput | Given String | Inherited
+
+-- | What a command's output, or its error stream, is: read as it comes
+-- | and kept for its `Ran`; or the program's own, written there as it
+-- | comes, its `Ran` given none of it.
+data Output = Collected | Inherited
+
 -- | A command to run: its name (found on the PATH), its arguments, and
 -- | how it is run.  Each field but the name has a default, so a record
 -- | gives only what it changes:
@@ -21,8 +31,8 @@ data Ended = Exited Int | Signalled Int | TimedOut | NotRun
 -- | - `dir`: the directory it runs in (`""`: the program's);
 -- | - `env`: environment variables set for it, each a name and a value,
 -- |   over the program's own, which it has too;
--- | - `input`: its standard input, written to it and then closed
--- |   (`Nothing`: it has none -- the null device, not the program's);
+-- | - `input`: its standard input (`NoInput`: none);
+-- | - `output`, `errors`: its output and its error stream (`Collected`);
 -- | - `timeout`: how many milliseconds it is given, after which it is
 -- |   killed (SIGKILL) and has `TimedOut` (0: as long as it takes);
 -- | - `keep`: how many bytes of each of its output and its error stream
@@ -32,13 +42,15 @@ type Invocation =
   , args : List String = Nil
   , dir : String = ""
   , env : List (Pair String String) = Nil
-  , input : Maybe String = Nothing
+  , input : Input = NoInput
+  , output : Output = Collected
+  , errors : Output = Collected
   , timeout : Int = 0
   , keep : Int = 0
   }
 
 -- | a command run to its end: how it ended, and what it wrote to its
--- | output and its error stream
+-- | output and its error stream (those `Collected`)
 type Ran = { ended : Ended, out : String, err : String }
 
 -- (it ended by itself, with the status 0)
@@ -55,11 +67,12 @@ succeeded : Ran -> Bool
 succeeded r = endedWell r.ended
 
 -- | (`Handle Started`, std.handle: a command started beside the program,
--- | `launch`'s; no value has it.)
+-- | `start`'s; no value has it.)
 data Started
 
--- | A command started beside the program.
-type Child = Handle Started
+-- | A command started beside the program, running until it is waited
+-- | for: `start`'s.
+type Subprocess = Handle Started
 
 data ProcessF (m : Type -> Type) x
   = Args (List String -> x)
@@ -70,9 +83,12 @@ data ProcessF (m : Type -> Type) x
   | Exit Int x
   | Exec String (List String) x
   | Run Invocation (Ran -> x)
-  | Launch String (List String) (Maybe Child -> x)
-  | Poll Child (Maybe Int -> x)
-  | Terminate Child (Int -> x)
+  | Start Invocation (Maybe Subprocess -> x)
+  | Wait Subprocess (Ran -> x)
+  | WaitAny (List Subprocess) (Maybe (Pair Subprocess Ran) -> x)
+  | TryWait Subprocess (Maybe Ran -> x)
+  | Kill Subprocess x
+  | Terminate Subprocess (Ran -> x)
 
 -- | The process as an effect.
 process : HFunctor
@@ -87,9 +103,12 @@ process =
       Exit code x -> Exit code (g x)
       Exec cmd as x -> Exec cmd as (g x)
       Run c k -> Run c (\r -> g (k r))
-      Launch cmd as k -> Launch cmd as (\c -> g (k c))
-      Poll c k -> Poll c (\s -> g (k s))
-      Terminate c k -> Terminate c (\s -> g (k s))
+      Start c k -> Start c (\s -> g (k s))
+      Wait s k -> Wait s (\r -> g (k r))
+      WaitAny ss k -> WaitAny ss (\r -> g (k r))
+      TryWait s k -> TryWait s (\r -> g (k r))
+      Kill s x -> Kill s (g x)
+      Terminate s k -> Terminate s (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       Args k -> Args k
       GetEnv name k -> GetEnv name k
@@ -99,9 +118,12 @@ process =
       Exit code x -> Exit code x
       Exec cmd as x -> Exec cmd as x
       Run c k -> Run c k
-      Launch cmd as k -> Launch cmd as k
-      Poll c k -> Poll c k
-      Terminate c k -> Terminate c k
+      Start c k -> Start c k
+      Wait s k -> Wait s k
+      WaitAny ss k -> WaitAny ss k
+      TryWait s k -> TryWait s k
+      Kill s x -> Kill s x
+      Terminate s k -> Terminate s k
   }
 
 -- | The program's arguments (not Node's, nor the program's own path):
@@ -148,26 +170,49 @@ exec cmd as = op (ev (Exec cmd as MkUnit)) val
 run : {e : HFunctor} -> {{ev : process <: e}} -> Invocation -> Co e Ran
 run c = op (ev (Run c (\r -> r))) val
 
--- | Start the command with the arguments, beside the program, and go on:
--- | its standard streams the program's, in the program's process group
--- | (so that Ctrl-C ends both) -- the command, or `Nothing` where it
--- | could not be started.  At the program's end, a command it started
--- | that has not ended is terminated.
-launch : {e : HFunctor}
-       -> {{ev : process <: e}}
-       -> String
-       -> List String
-       -> Co e (Maybe Child)
-launch cmd as = op (ev (Launch cmd as (\c -> c))) val
+-- | Start the command, as `run` would run it, and go on beside it: the
+-- | command, to wait for, or `Nothing` where it could not be run (its
+-- | `run` `NotRun`).  What it writes is read, and its time limit kept,
+-- | while the program waits for it (`wait`, `waitAny`, `tryWait`); a
+-- | command writing more than a pipe holds (64 KiB, most often) waits
+-- | until then.  It runs in the program's process group (Ctrl-C ends
+-- | both); at the program's end, and where a signal ends it, a command
+-- | started and not waited for is terminated.
+start : {e : HFunctor}
+      -> {{ev : process <: e}}
+      -> Invocation
+      -> Co e (Maybe Subprocess)
+start c = op (ev (Start c (\s -> s))) val
 
--- | Whether the command has ended, not waiting: `Just` its status (128
--- | and the signal, where a signal ended it), else `Nothing`.
-exited : {e : HFunctor} -> {{ev : process <: e}} -> Child -> Co e (Maybe Int)
-exited c = op (ev (Poll c (\s -> s))) val
+-- | The command waited for, to its end: its `Ran`, and its handle let
+-- | go of (an operation given it after that fails the program).
+wait : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Ran
+wait s = op (ev (Wait s (\r -> r))) val
+
+-- | Whichever of the commands ends first, waited for: it and its `Ran`,
+-- | its handle let go of, the others running still (`Nothing`: there
+-- | are none).
+waitAny : {e : HFunctor}
+        -> {{ev : process <: e}}
+        -> List Subprocess
+        -> Co e (Maybe (Pair Subprocess Ran))
+waitAny ss = op (ev (WaitAny ss (\r -> r))) val
+
+-- | The command's `Ran` if it has ended, its handle let go of, not
+-- | waiting; else `Nothing`, and it runs still.
+tryWait : {e : HFunctor}
+        -> {{ev : process <: e}}
+        -> Subprocess
+        -> Co e (Maybe Ran)
+tryWait s = op (ev (TryWait s (\r -> r))) val
+
+-- | The command killed (SIGKILL; on Windows, TerminateProcess), if it
+-- | has not ended, not waited for: its `wait` says `Signalled 9`.
+kill : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Unit
+kill s = op (ev (Kill s MkUnit)) val
 
 -- | The command ended, if it has not: asked to (SIGTERM), then made to
--- | (SIGKILL) where it has not within two seconds; its status, and its
--- | handle let go of (an operation given it after that fails the
--- | program).
-terminate : {e : HFunctor} -> {{ev : process <: e}} -> Child -> Co e Int
-terminate c = op (ev (Terminate c (\s -> s))) val
+-- | (SIGKILL) where it has not within two seconds; waited for, its
+-- | `Ran`, and its handle let go of.
+terminate : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Ran
+terminate s = op (ev (Terminate s (\r -> r))) val

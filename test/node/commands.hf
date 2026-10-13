@@ -4,6 +4,7 @@
 -- (POSIX: the commands are sh's.)
 
 import co
+import std.handle
 import std.io
 import std.process
 
@@ -39,6 +40,84 @@ said what c = do
 sh : String -> Invocation
 sh script = { command = "sh", args = ["-c", script] }
 
+-- (a `Ran` said on a line)
+ranSaid : String -> Ran -> String
+ranSaid what r =
+  what
+  ^ ": "
+  ^ endedSaid r.ended
+  ^ ", out "
+  ^ show r.out
+  ^ ", err "
+  ^ show r.err
+
+-- (`start`, where `Nothing` fails the test: its commands are all there)
+mustStart : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> Invocation
+          -> Co e Subprocess
+mustStart c = do
+  s <- start c
+  case s of
+    Just p -> pure p
+    Nothing -> do
+      printErr "a command not started"
+      exit 1
+      mustStart c
+
+-- (which of the two it is, said)
+whichSaid : Subprocess -> Subprocess -> Subprocess -> String
+whichSaid slow quick p =
+  if sameHandle p quick then "quick"
+  else if sameHandle p slow then "slow"
+  else "neither"
+
+-- (the first to end of those `waitAny` is given, said)
+firstSaid : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> String
+          -> (Subprocess -> String)
+          -> Maybe (Pair Subprocess Ran)
+          -> Co e Unit
+firstSaid what name Nothing = print (what ^ ": none")
+firstSaid what name (Just (MkPair p r)) =
+  print (ranSaid (what ^ ", " ^ name p) r)
+
+-- (commands started and waited for later: two at once, whichever ends
+-- first; one killed, one past its time limit, one asked to end)
+startedOnes : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> Co e Unit
+startedOnes = do
+  slow <- mustStart (sh "sleep 1; echo slow")
+  quick <- mustStart (sh "sleep 0.1; echo quick")
+  first <- waitAny [slow, quick]
+  firstSaid "first" (whichSaid slow quick) first
+  second <- waitAny [slow]
+  firstSaid "second" (whichSaid slow quick) second
+  none <- waitAny Nil
+  firstSaid "of none" (whichSaid slow quick) none
+  sleeper <- mustStart (sh "sleep 5")
+  running <- tryWait sleeper
+  print ("tried: " ^ maybe "running still" (\r -> "ended too soon") running)
+  kill sleeper
+  killed <- wait sleeper
+  print (ranSaid "killed" killed)
+  late <- mustStart { (sh "echo before; sleep 5") | timeout = 200 }
+  timed <- wait late
+  print (ranSaid "started, its time up" timed)
+  asked <- mustStart (sh "sleep 5")
+  ended <- terminate asked
+  print (ranSaid "terminated" ended)
+  shown <-
+    mustStart { (sh "echo shown; echo shown too >&2") | output = Inherited }
+  inherited <- wait shown
+  print (ranSaid "inherited" inherited)
+  missing <- start { command = "heff-no-such-command" }
+  print ("not started: " ^ maybe "nothing" (\p -> "a subprocess") missing)
+
 -- (`n` bytes)
 bytesOf : Int -> String
 bytesOf n = joinWith "" (List.replicate (n / 10) "0123456789")
@@ -59,12 +138,12 @@ program = do
       , env = [MkPair "GREETING" "new"]
       }
   said "environment as it is" (sh "echo \"$GREETING\"")
-  said "input" { command = "cat", input = Just "fed\n" }
+  said "input" { command = "cat", input = Given "fed\n" }
   said "no input" { command = "cat" }
   said
       "input, much"
-      { (sh "wc -c | tr -d \" \"") | input = Just (bytesOf 200000) }
-  said "input, not read" { command = "true", input = Just (bytesOf 200000) }
+      { (sh "wc -c | tr -d \" \"") | input = Given (bytesOf 200000) }
+  said "input, not read" { command = "true", input = Given (bytesOf 200000) }
   said "a signal" (sh "kill -9 $$")
   said "a signal, another" (sh "kill -TERM $$")
   said "a loop" { (sh "while :; do :; done") | timeout = 200 }
@@ -73,6 +152,7 @@ program = do
   said "kept" { (sh "echo 0123456789; echo abcdefghij >&2") | keep = 4 }
   said "written forever" { command = "yes", timeout = 300, keep = 6 }
   said "not there" { command = "heff-no-such-command" }
+  startedOnes
 
 main : Co world Unit
 main = program (io := \p -> InL p) (sys := \p -> InR p)
