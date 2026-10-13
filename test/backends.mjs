@@ -427,16 +427,20 @@ if (process.platform !== "win32") checks.push((async () => {
 })());
 
 // std.http's requests from green threads, by C alone: ten at once, to a
-// server that takes half a second over each, all done in about the time
-// of one (one after another, five seconds), and one refused while they
-// wait; and ten asked of the program's own server, std.net's sockets
-// and libcurl's waited on together
+// server that takes half a second over each -- at once as the server
+// sees it, more than one of them in hand together (one after another,
+// never more than one), which no load on the machine makes untrue, as a
+// time taken would -- and one refused while they wait; and ten asked of
+// the program's own server, std.net's sockets and libcurl's waited on
+// together
 if (process.platform !== "win32") checks.push((async () => {
   const msgs = [];
   const delay = 500, n = 10;
+  let inHand = 0, most = 0;
   const server = createServer((q, r) => {
     const i = q.url.replace(/^\/item\//, "");
-    setTimeout(() => { r.writeHead(200, { "Content-Type": "text/plain" }); r.end(`item ${i}\n`); }, delay);
+    most = Math.max(most, ++inHand);
+    setTimeout(() => { inHand--; r.writeHead(200, { "Content-Type": "text/plain" }); r.end(`item ${i}\n`); }, delay);
   });
   const listening = (s) => new Promise((ok) => s.listen(0, "127.0.0.1", () => ok(s.address().port)));
   const port = await listening(server);
@@ -444,14 +448,12 @@ if (process.platform !== "win32") checks.push((async () => {
   const p = await program("test/node/green-http.hf", "main");
   if (p.error !== undefined) msgs.push(`FAIL green http (c): not compiled\n${p.error}`);
   else {
-    const t = Date.now();
     const r = await run(p.cmd, [`http://127.0.0.1:${port}`, String(n), String(refused)], { timeout: 60000 });
-    const took = Date.now() - t;
     const want = `refused, while the others wait: code 7\nitems fetched at once: ${n}\nmain done\n`;
     if (r.status !== 0 || r.stderr || r.stdout !== want)
       msgs.push(`FAIL green http (c): status ${r.status}\n${r.stdout}${r.stderr}`);
-    else if (took > (n * delay) / 2)
-      msgs.push(`FAIL green http (c): ${n} requests of ${delay} ms each took ${took} ms, not at once`);
+    else if (most < 2)
+      msgs.push(`FAIL green http (c): ${n} requests, never more than ${most} in the server's hands at once`);
   }
   server.close();
   const self = await program("test/node/green-http.hf", "self");
