@@ -134,8 +134,8 @@ const values = pool(cases, async (c) => {
 // (the program `name` of `file`, compiled to C and built: what runs it;
 // its files named by its file and its name; `cflags`, the C compiler's
 // more)
-const program = async (file, name, cflags = []) => {
-  const c = join(work, `${basename(file, ".hf")}-${name}.c`), bin = join(work, `${basename(file, ".hf")}-${name}-c`);
+const program = async (file, name, cflags = [], tag = "") => {
+  const c = join(work, `${basename(file, ".hf")}-${name}${tag}.c`), bin = join(work, `${basename(file, ".hf")}-${name}${tag}-c`);
   const r = await heff(["compile", file, c, "--name", name, "--backend=c"], { cwd: root });
   if (r.status !== 0) return { error: r.stderr };
   const b = await buildC(c, bin, cflags);
@@ -144,8 +144,8 @@ const program = async (file, name, cflags = []) => {
 
 // (the program `name` of `file` run with `args`, what it wrote and its
 // status held to `want`; what fails, said)
-const ran = async (what, file, name, args, want, { cflags, ...opts } = {}) => {
-  const p = await program(file, name, cflags);
+const ran = async (what, file, name, args, want, { cflags, tag, ...opts } = {}) => {
+  const p = await program(file, name, cflags, tag);
   if (p.error !== undefined) return [`FAIL ${what}: not compiled\n${p.error}`];
   const r = await run(p.cmd, args, { timeout: 60000, ...opts });
   const got = { out: r.stdout, err: r.stderr, status: r.status };
@@ -861,10 +861,15 @@ if (process.platform !== "win32") checks.push((async () => {
 // overflow -- in C, a stack of 8 MiB, which a million calls not made
 // loops would (a call of itself put in a tag, src/heff/compile/trmc.hf;
 // functions calling one another last, round a cycle, workers among them:
-// src/heff/compile/worker.hf)
-checks.push(ran("deep loops", "test/node/deep.hf", "deep", [], { out: "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n"
-  + "4079499309867987239\n17319587194678911062\n", status: 0 },
-  { cflags: ["-DHEFF_MAIN_STACK=8388608"] }));
+// src/heff/compile/worker.hf, of other arities too: cycles.hf, #78).  No
+// call made a jump by the C compiler but those it must make (`musttail`),
+// and none of those either (`HEFF_NO_JUMPS`, as where there is no
+// `musttail`): a loop all the same
+const deepWant = "1000000\n1000000\n1000000\n500000\n1000000\n6,4,2\n1,2,3\n"
+  + "4079499309867987239\n17319587194678911062\n0\n1\n";
+for (const [what, tag, flags] of [["deep loops", "", []], ["deep loops, no jumps", "-nojumps", ["-DHEFF_NO_JUMPS"]]])
+  checks.push(ran(what, "test/node/deep.hf", "deep", [], { out: deepWant, status: 0 },
+    { cflags: ["-DHEFF_MAIN_STACK=8388608", "-fno-optimize-sibling-calls", ...flags], tag }));
 
 // (a recursion deeper than the stack, in C: said, what was written before
 // it written, not a signal's silent end -- not where a sanitizer handles

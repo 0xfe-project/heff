@@ -217,6 +217,10 @@ data Stmt b
   | CTail (Exp b) (List (Exp b))
   -- | the loop again: its parameters, the arguments
   | CLoop (List String) (List (Exp b))
+  -- | ... going to the arm of the tag at once (see "Loops to an arm"),
+  -- | and where that arm starts
+  | CLoopTo String (List String) (List (Exp b))
+  | CLabel String
   -- | a known definition of the same parameters called last: a jump, to
   -- | its worker or to the function itself
   | CJump String Bool (List (Exp b))
@@ -1411,6 +1415,16 @@ projAs r ce live want v e su n (Just i) rp =
       (fieldNum r ce live e rp su i n (varOfV e) (globalOfV e))
 projAs r ce live want v e su n Nothing rp = coerce RepV want (valF r ce live v)
 
+-- | a string literal, as the repr `want`: where a number is wanted
+-- | unboxed -- in a program checked, only by a parameter never read,
+-- | given one (heff.compile.cycles's `pads`) -- a number of the type
+-- | wanted, naught
+strAs : Repr.Repr -> String -> Value
+strAs RepV s = RStr s
+strAs RepF64 s = RF64U 0.0
+strAs (RepFix F32) s = RF32U 0.0
+strAs (RepFix w) s = RFixU w 0
+
 -- | a value, as the repr `want`
 valAsF : RcK -> CE -> List String -> Repr.Repr -> Imperative.Val -> Value
 valAsF r ce live want (SFixed w n) =
@@ -1433,6 +1447,7 @@ valAsF r ce live want (SProj e l sh t) =
     (List.length sh)
     (indexIn l 0 sh)
     (Repr.readRepr (indexIn l 0 sh) t)
+valAsF r ce live want (SStr s) = strAs want s
 valAsF r ce live want v = coerce (naturalOf ce v) want (valF r ce live v)
 
 -- (a condition's code: what is held lent to it -- see `Cond`)
@@ -2612,6 +2627,114 @@ wrapperOf ce key bi sg xs =
                    (List.zipWith (wrapArg ce) sg.params xs))))
           Nil))
 
+-- Loops to an arm (#78)
+--------------------------------------------------------------------------------
+
+-- A function whose body is a `switch` on a parameter's tag -- one made of
+-- functions calling one another last (heff.compile.cycles) -- and whose
+-- loop gives that parameter a tag of no fields it has an arm of, goes
+-- round to that arm at once (`CLoopTo`), its parameters given their
+-- values as the loop gives them: what the `switch` would do with the tag,
+-- done where the tag is known, as a jump from one function to another
+-- was.
+
+-- (the parameter a loop to an arm gives a tag: its place, and the tags
+-- of the arms that may be gone to -- of no fields, nothing taken)
+type Thread = { at : Int, tags : List String }
+
+-- (the tag of an arm that may be gone to so)
+plainTagOf : List String -> CaseArm -> List String
+plainTagOf acc (MkCArm t Nil Nil _ _ TakeNone _ _) = Cons t acc
+plainTagOf acc a = acc
+
+caseArmBody : CaseArm -> List Statement
+caseArmBody (MkCArm _ _ _ _ _ _ body _) = body
+
+nthValue : Int -> List Value -> Maybe Value
+nthValue i Nil = Nothing
+nthValue i (Cons v vs) = if i <= 0 then Just v else nthValue (i - 1) vs
+
+-- (the tag a loop gives the parameter, if it has a plain arm)
+tagGiven : List String -> Maybe Value -> Maybe String
+tagGiven ts (Just (RNTag t)) = if elemS t ts then Just t else Nothing
+tagGiven ts v = Nothing
+
+loopTo : List String -> List Value -> Maybe String -> Statement
+loopTo ps vs (Just t) = CLoopTo t ps vs
+loopTo ps vs Nothing = CLoop ps vs
+
+armThrough : (List Statement -> List Statement) -> CaseArm -> CaseArm
+armThrough go (MkCArm t fs fl su pl tk body lv) =
+  MkCArm t fs fl su pl tk (go body) lv
+
+threadSt : Thread
+         -> (List Statement -> List Statement)
+         -> Statement
+         -> Statement
+threadSt th go (CIf c a b) = CIf c (go a) (go b)
+threadSt th go (CSwitch e arms r) = CSwitch e (List.map (armThrough go) arms) r
+threadSt th go (CLoop ps vs) =
+  loopTo ps vs (tagGiven th.tags (nthValue th.at vs))
+threadSt th go s = s
+
+-- (the loops among statements, those giving the parameter a tag of a
+-- plain arm made loops to it)
+threadSts : Thread -> List Statement -> List Statement
+threadSts th ss = List.map (threadSt th (threadSts th)) ss
+
+-- (the tags a statement's loops go to the arms of, in front of `acc`)
+goneOne : (List String -> List Statement -> List String)
+        -> List String
+        -> Statement
+        -> List String
+goneOne go acc (CIf _ a b) = go (go acc a) b
+goneOne go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (caseArmBody arm)) acc arms
+goneOne go acc (CLoopTo t _ _) = Cons t acc
+goneOne go acc s = acc
+
+goneTo : List String -> List Statement -> List String
+goneTo acc ss = List.foldl (goneOne goneTo) acc ss
+
+-- (an arm gone to: where it starts, labelled)
+labelledIf : List String -> CaseArm -> CaseArm
+labelledIf ts (MkCArm t fs fl su pl tk body lv) =
+  MkCArm
+    t
+    fs
+    fl
+    su
+    pl
+    tk
+    (if elemS t ts then Cons (CLabel t) body else body)
+    lv
+
+threadedArms : Thread -> List CaseArm -> List CaseArm
+threadedArms th arms =
+  let gone = List.map (armThrough (threadSts th)) arms
+  in List.map
+    (labelledIf (goneTo Nil (List.concatMap caseArmBody gone)))
+    gone
+
+threadedAt : Maybe Int -> String -> List CaseArm -> Bool -> List Statement
+threadedAt (Just i) p arms r =
+  Cons
+    (CSwitch
+       (RLocal p)
+       (threadedArms
+          { at = i, tags = List.foldl plainTagOf Nil arms }
+          arms)
+       r)
+    Nil
+threadedAt Nothing p arms r = Cons (CSwitch (RLocal p) arms r) Nil
+
+-- | a function's body, of the parameters `xs`: its loops to an arm, where
+-- | it is a `switch` on a parameter's tag
+threaded : List String -> List Statement -> List Statement
+threaded xs (Cons (CSwitch (RLocal p) arms r) Nil) =
+  threadedAt (indexIn p 0 xs) p arms r
+threaded xs ss = ss
+
 funWith : CE
         -> String
         -> List String
@@ -2627,20 +2750,24 @@ funWith ce key xs b bi rps sg =
     , lent = bi
     , entry = unboxParams ce bi rps xs
     , body =
-        List.append
-          (plainDrops
-             (boxedOnly ce (deadIn (Borrow.paramsAt False bi xs) (fvTl b))))
-          (rcK.tail
-             (withPath
-                (boxedOnly ce (deadKept (Borrow.paramsAt False bi xs) (fvTl b)))
-                Nil
-                (withBorrowed
-                   (Borrow.paramsAt True bi xs)
-                   (withFrame
-                      (Just { key = key, params = xs })
-                      0
-                      (knowingShapes b ce))))
-             b)
+        threaded
+          xs
+          (List.append
+             (plainDrops
+                (boxedOnly ce (deadIn (Borrow.paramsAt False bi xs) (fvTl b))))
+             (rcK.tail
+                (withPath
+                   (boxedOnly
+                      ce
+                      (deadKept (Borrow.paramsAt False bi xs) (fvTl b)))
+                   Nil
+                   (withBorrowed
+                      (Borrow.paramsAt True bi xs)
+                      (withFrame
+                         (Just { key = key, params = xs })
+                         0
+                         (knowingShapes b ce))))
+                b))
     , reprs = ce.reprs
     , ret = Repr.resultIn ce.sigs key
     , wrapper =

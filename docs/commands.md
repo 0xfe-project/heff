@@ -138,6 +138,10 @@ nothing more (`std.progress`).
 
 ## How deep a program goes
 
+A tail call holds no place on the stack: of a function of itself, or of
+functions calling one another last round a cycle -- of whatever
+arities, made one loop, on either backend and whatever C compiler
+builds it -- a loop; of a closure, the stack let go of every so often.
 A call that is no tail call holds its place on the stack until it
 returns -- but for a call of itself put in a constructor's last field
 (`map f (x :: xs) = f x :: map f xs`) or right of a string append

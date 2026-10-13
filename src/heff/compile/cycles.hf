@@ -1,0 +1,409 @@
+-- Functions calling one another last, round a cycle, made one loop
+-- (#78).  A call of itself last is a loop in either backend, and C jumps
+-- from a function to another only where the two take and give the same
+-- (`HEFF_LAST`, clang's `musttail`, on the processors it always does it
+-- for): two functions of other arities calling each other last, or any
+-- two where there is no such jump (gcc, `HEFF_NO_JUMPS`), grow the stack
+-- as deep as the cycle goes round; JavaScript has no jump at all.
+--
+-- So the functions calling one another last round a cycle -- a strongly
+-- connected component of the calls last, of two or more -- are made one
+-- function (`f$cycle`), given which of them it is to be (a tag of no
+-- fields) and the parameters of each, its body chosen by the tag:
+--
+--   walk n = ... step (n - 1) k    walk$cycle t n m k = case t of
+--   step m k = ... walk (m - 1)      Walk -> ... walk$cycle Step _ (n - 1) k
+--                                    Step -> ... walk$cycle Walk (m - 1) _ _
+--                                  walk n = walk$cycle Walk n _ _
+--                                  step m k = walk$cycle Step _ m k
+--
+-- a call last of one of them a call of itself, a loop; each of them a
+-- wrapper calling it, where it is called from elsewhere or is a value.
+-- A parameter of another of them (`_`) is given what is never read
+-- (`pads`).  Each of them is named afresh in it, so that no two have a
+-- name in common.
+--
+-- This runs on what is lowered (heff.compile.lower), each call at its
+-- arity, for both backends.
+
+import heff.compile.ir as IR
+import map as Map
+
+-- The calls last
+--------------------------------------------------------------------------------
+
+-- (the functions a body calls last, where it ends: none in a lambda)
+lastCalls : List String -> IR.Expr -> List String
+lastCalls acc (ELet _ _ b) = lastCalls acc b
+lastCalls acc (EMatch _ arms) =
+  List.foldl (\a arm -> lastCalls a (IR.armBody arm)) acc arms
+lastCalls acc (ECall g _) = Cons g acc
+lastCalls acc e = acc
+
+-- (a function's parameters, if it is one)
+paramsOf : IR.Expr -> Maybe (List String)
+paramsOf (ELam xs _) = Just xs
+paramsOf e = Nothing
+
+bodyOf : IR.Expr -> IR.Expr
+bodyOf (ELam _ b) = b
+bodyOf e = e
+
+insertParams : Map.Map String (List String)
+             -> String
+             -> Maybe (List String)
+             -> Map.Map String (List String)
+insertParams m k (Just xs) = Map.insert compareString k xs m
+insertParams m k Nothing = m
+
+-- | the functions among the definitions, by key, with their parameters
+functions : List IR.Def -> Map.Map String (List String)
+functions defs =
+  List.foldl
+    (\m (d : IR.Def) -> insertParams m d.key (paramsOf d.body))
+    Map.empty
+    defs
+
+-- | each function, by the functions it calls last
+callsLast : Map.Map String (List String)
+          -> List IR.Def
+          -> Map.Map String (List String)
+callsLast funs defs =
+  List.foldl
+    (\m (d : IR.Def) ->
+       if Map.member compareString d.key funs
+         then Map.insert
+             compareString
+             d.key
+             (List.filter
+                (\g -> Map.member compareString g funs)
+                (List.reverse (lastCalls Nil (bodyOf d.body))))
+             m
+       else m)
+    Map.empty
+    defs
+
+-- The cycles (Tarjan's strongly connected components)
+--------------------------------------------------------------------------------
+
+-- (the walk so far: the next number, each function's and the lowest it
+-- reaches, those on the stack, the components found)
+type Walk =
+  { next : Int
+  , index : Map.Map String Int
+  , low : Map.Map String Int
+  , stack : List String
+  , onStack : Map.Map String Unit
+  , found : List (List String)
+  }
+
+numberOf : Map.Map String Int -> String -> Int
+numberOf m k = fromMaybe 0 (Map.lookup compareString k m)
+
+minI : Int -> Int -> Int
+minI a b = if a < b then a else b
+
+-- (`v` entered: numbered, on the stack)
+enter : String -> Walk -> Walk
+enter v w =
+  { next = w.next + 1
+  , index = Map.insert compareString v w.next w.index
+  , low = Map.insert compareString v w.next w.low
+  , stack = Cons v w.stack
+  , onStack = Map.insert compareString v MkUnit w.onStack
+  , found = w.found
+  }
+
+-- (`v` reaching as low as `n`)
+lowered : String -> Int -> Walk -> Walk
+lowered v n w =
+  { next = w.next
+  , index = w.index
+  , low = Map.insert compareString v (minI n (numberOf w.low v)) w.low
+  , stack = w.stack
+  , onStack = w.onStack
+  , found = w.found
+  }
+
+-- (the stack down to `v`, and what is under it)
+popTo : String
+      -> List String
+      -> List String
+      -> Pair (List String) (List String)
+popTo v acc Nil = MkPair acc Nil
+popTo v acc (Cons x xs) =
+  if strEq x v then MkPair (Cons x acc) xs else popTo v (Cons x acc) xs
+
+popped : Walk -> Pair (List String) (List String) -> Walk
+popped w (MkPair comp rest) =
+  { next = w.next
+  , index = w.index
+  , low = w.low
+  , stack = rest
+  , onStack = List.foldl (\m x -> Map.delete compareString x m) w.onStack comp
+  , found = Cons comp w.found
+  }
+
+-- (`v` left: the root of a component, which is popped)
+leave : String -> Walk -> Walk
+leave v w =
+  if numberOf w.low v == numberOf w.index v then popped w (popTo v Nil w.stack)
+  else w
+
+-- (`v`, having walked `g`, reaching as low as it does)
+walked : String -> String -> Walk -> Walk
+walked v g w = lowered v (numberOf w.low g) w
+
+-- (`v` and what it calls last, walked)
+strong : Map.Map String (List String) -> Walk -> String -> Walk
+strong calls w v =
+  leave
+    v
+    (List.foldl
+       (\(w1 : Walk) g ->
+          if not (Map.member compareString g w1.index)
+            then walked v g (strong calls w1 g)
+          else if Map.member compareString g w1.onStack
+            then lowered v (numberOf w1.index g) w1
+          else w1)
+       (enter v w)
+       (fromMaybe Nil (Map.lookup compareString v calls)))
+
+startWalk : Walk
+startWalk =
+  { next = 0
+  , index = Map.empty
+  , low = Map.empty
+  , stack = Nil
+  , onStack = Map.empty
+  , found = Nil
+  }
+
+foundOf : Walk -> List (List String)
+foundOf w = w.found
+
+-- | the cycles of calls last: the components of two functions or more
+cycles : Map.Map String (List String) -> List IR.Def -> List (List String)
+cycles calls defs =
+  List.filter
+    (\c -> List.length c >= 2)
+    (foundOf
+       (List.foldl
+          (\(w : Walk) (d : IR.Def) ->
+             if Map.member compareString d.key calls
+             && not (Map.member compareString d.key w.index)
+               then strong calls w d.key
+             else w)
+          startWalk
+          defs))
+
+-- One function of a cycle
+--------------------------------------------------------------------------------
+
+-- | a function of a cycle: its key, its parameters as it is defined, and
+-- | as the cycle's function has them, with its body there -- named
+-- | afresh, so that no two of them have a name in common
+type Member =
+  { key : String, outer : List String, params : List String, body : IR.Expr }
+
+-- | a cycle made one function: its key, the parameter its tag is, its
+-- | functions in the program's order
+type Cycle = { key : String, tag : String, members : List Member }
+
+-- | the tag the cycle's function is given to be the function `g`
+tagOf : String -> String
+tagOf g = "Enter$" ^ g
+
+-- (what a parameter of a function not called is given: a static object,
+-- which is not counted -- the C backend may drop it as what the
+-- parameter holds is, a record of its shape -- or, where a number is
+-- wanted unboxed, naught)
+pads : List String -> List IR.Expr
+pads xs = List.map (\_ -> EStr "") xs
+
+-- (the arguments of the cycle's function, for a call of `g`)
+argsFor : Cycle -> String -> List IR.Expr -> List IR.Expr
+argsFor c g as =
+  Cons
+    (ETag (tagOf g) Nil Nil)
+    (List.concatMap
+       (\(m : Member) -> if strEq m.key g then as else pads m.params)
+       c.members)
+
+-- (whether `g` is a member, called with as many arguments as it takes)
+calledMember : Cycle -> String -> List IR.Expr -> Bool
+calledMember c g as =
+  List.any
+    (\(m : Member) -> strEq m.key g && List.length m.params == List.length as)
+    c.members
+
+-- (a body's calls last of the cycle's functions, made calls of the
+-- cycle's function: of itself)
+retail : Cycle -> IR.Expr -> IR.Expr
+retail c (ELet x a b) = ELet x a (retail c b)
+retail c (EMatch s arms) =
+  EMatch
+    s
+    (List.map
+       (\arm ->
+          MkArm (IR.armTag arm) (IR.armVars arm) (retail c (IR.armBody arm)))
+       arms)
+retail c (ECall g as) =
+  if calledMember c g as then ECall c.key (argsFor c g as) else ECall g as
+retail c e = e
+
+-- (the cycle's function: its tag looked at, each member's body there)
+cycleDef : Cycle -> IR.Def
+cycleDef c =
+  IR.mkDef
+    c.key
+    c.key
+    (ELam
+       (Cons c.tag (List.concatMap (\(m : Member) -> m.params) c.members))
+       (EMatch
+          (EVar c.tag)
+          (List.map
+             (\(m : Member) -> MkArm (tagOf m.key) Nil (retail c m.body))
+             c.members)))
+
+-- (a member, called from elsewhere or a value: its parameters given to the
+-- cycle's function)
+wrapper : Cycle -> IR.Def -> Member -> IR.Def
+wrapper c d m =
+  IR.mkDef
+    d.key
+    d.name
+    (ELam
+       m.outer
+       (ECall c.key (argsFor c m.key (List.map (\x -> EVar x) m.outer))))
+
+-- The program
+--------------------------------------------------------------------------------
+
+-- | the program's cycles, by each member's key; where fresh names go on
+-- | from
+type Cycles = { byMember : Map.Map String Cycle, supply : IR.Supply }
+
+-- (a member, its function named afresh)
+freshMember : String -> List String -> Pair IR.Expr IR.Supply -> Member
+freshMember k xs (MkPair (ELam ys b) n) =
+  { key = k, outer = xs, params = ys, body = b }
+freshMember k xs (MkPair e n) = { key = k, outer = xs, params = Nil, body = e }
+
+supplyAfter : Pair IR.Expr IR.Supply -> IR.Supply
+supplyAfter (MkPair _ n) = n
+
+-- (the members so far, in reverse, and where fresh names go on from)
+type Members = { members : List Member, supply : IR.Supply }
+
+memberOf : Map.Map String IR.Expr -> Members -> String -> Members
+memberOf bodies acc k =
+  let b = fromMaybe EAbandon (Map.lookup compareString k bodies)
+  in let named = IR.freshen acc.supply b
+  in { members =
+         Cons (freshMember k (fromMaybe Nil (paramsOf b)) named) acc.members
+     , supply = supplyAfter named
+     }
+
+-- (each definition's place in the program)
+placesOf : List IR.Def -> Map.Map String Int
+placesOf defs =
+  snd
+    (List.foldl
+       (\acc (d : IR.Def) ->
+          MkPair
+            (fst acc + 1)
+            (Map.insert compareString d.key (fst acc) (snd acc)))
+       (MkPair 0 Map.empty)
+       defs)
+
+-- (a cycle's members in the program's order)
+inOrder : Map.Map String Int -> List String -> List String
+inOrder places ks =
+  Map.values
+    (List.foldl
+       (\m k -> Map.insert compareInt (numberOf places k) k m)
+       Map.empty
+       ks)
+
+withCycle : Cycles -> Cycle -> IR.Supply -> Cycles
+withCycle cs c n =
+  { byMember =
+      List.foldl
+        (\m (k : Member) -> Map.insert compareString k.key c m)
+        cs.byMember
+        c.members
+  , supply = n
+  }
+
+cycleOf : Map.Map String IR.Expr
+        -> Map.Map String Int
+        -> Cycles
+        -> List String
+        -> Cycles
+cycleOf bodies places cs ks =
+  let ordered = inOrder places ks
+  in let t = IR.fresh "tag" cs.supply
+  in let ms =
+    List.foldl (memberOf bodies) { members = Nil, supply = snd t } ordered
+  in withCycle
+    cs
+    { key = fromMaybe "" (List.head ordered) ^ "$cycle"
+    , tag = fst t
+    , members = List.reverse ms.members
+    }
+    ms.supply
+
+-- (a member of `c`: its wrapper, after the cycle's function if it is the
+-- first)
+memberOut : Cycle -> List IR.Def -> IR.Def -> Member -> List IR.Def
+memberOut c acc d first =
+  Cons
+    (wrapper
+       c
+       d
+       (fromMaybe
+          first
+          (List.find (\(m : Member) -> strEq m.key d.key) c.members)))
+    (if strEq first.key d.key then Cons (cycleDef c) acc else acc)
+
+firstOut : Cycle -> List IR.Def -> IR.Def -> Maybe Member -> List IR.Def
+firstOut c acc d (Just first) = memberOut c acc d first
+firstOut c acc d Nothing = Cons d acc
+
+-- (a definition, as it is, or a member's wrapper; in front of the others
+-- so far, in reverse)
+defOut : List IR.Def -> IR.Def -> Maybe Cycle -> List IR.Def
+defOut acc d (Just c) = firstOut c acc d (List.head c.members)
+defOut acc d Nothing = Cons d acc
+
+bodiesOf : List IR.Def -> Map.Map String IR.Expr
+bodiesOf defs =
+  List.foldl
+    (\m (d : IR.Def) -> Map.insert compareString d.key d.body m)
+    Map.empty
+    defs
+
+-- (the program, its cycles made one function each)
+madeOne : List IR.Def -> Cycles -> Pair (List IR.Def) IR.Supply
+madeOne defs cs =
+  MkPair
+    (List.reverse
+       (List.foldl
+          (\acc (d : IR.Def) ->
+             defOut acc d (Map.lookup compareString d.key cs.byMember))
+          Nil
+          defs))
+    cs.supply
+
+-- | the program, each cycle of calls last made one function; where fresh
+-- | names go on from
+cyclesProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+cyclesProgram n defs =
+  let funs = functions defs
+  in let cs =
+    List.foldl
+      (cycleOf (bodiesOf defs) (placesOf defs))
+      { byMember = Map.empty, supply = n }
+      (cycles (callsLast funs defs) defs)
+  in if Map.size cs.byMember == 0 then MkPair defs n else madeOne defs cs
