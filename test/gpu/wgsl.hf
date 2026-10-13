@@ -1,0 +1,135 @@
+-- Kernels of gpu.kernel, printed by gpu.wgsl: each statement and
+-- expression as WGSL has it.  (examples/vecadd's `vecAdd` is pinned
+-- there, and run on a pretend device in test/app-run.mjs, which runs
+-- no WGSL.)
+
+import co
+import float32 as Float32
+import gpu.kernel as Kernel
+import gpu.wgsl as Wgsl
+import uint32 as UInt32
+
+-- What follows has each statement and expression once, and is of no
+-- use but that: a row of `m` (4 wide) summed into `sums` by a loop, the
+-- squares of its first two into `norms` by a heff recursion; a negative
+-- sum halved and negated, but row 0's, else the row's index modulo 3
+-- into `norms`.
+
+-- (a heff function, called as the kernel is built: its code inlined)
+squared : Kernel.Exp Float32 -> Kernel.Exp Float32
+squared x = x * x
+
+-- (a heff recursion, unrolled as the kernel is built)
+unrolled : Int -> (Int -> Co Kernel.stmt Unit) -> Co Kernel.stmt Unit
+unrolled 0 body = pure MkUnit
+unrolled n body = do
+  unrolled (n - 1) body
+  body (n - 1)
+
+offset : Int -> Kernel.Exp UInt32
+offset k = Kernel.lit (UInt32.fromInt k)
+
+lastly : Kernel.Output Float32
+       -> Kernel.Output Float32
+       -> Kernel.Exp UInt32
+       -> Co Kernel.stmt Unit
+lastly sums norms row =
+  Kernel.ifElse
+    (Kernel.both
+       (Kernel.lessThan (Kernel.load sums row) (Kernel.lit 0.0))
+       (Kernel.negation (Kernel.equalTo row (Kernel.lit 0))))
+    (Kernel.store sums row (-(Kernel.load sums row) /. Kernel.lit 2.0))
+    (Kernel.store norms row (Kernel.convert (row % Kernel.lit 3)))
+
+inRow : Kernel.Input Float32
+      -> Kernel.Output Float32
+      -> Kernel.Output Float32
+      -> Kernel.Exp UInt32
+      -> Co Kernel.stmt Unit
+inRow m sums norms row = do
+  start <- Kernel.define (row * Kernel.lit 4)
+  Kernel.store sums row (Kernel.lit 0.0)
+  Kernel.for
+      (Kernel.lit 0)
+      (Kernel.lit 4)
+      (\j ->
+         Kernel.store
+           sums
+           row
+           (Kernel.load sums row + Kernel.load m (start + j)))
+  unrolled
+      2
+      (\k ->
+         Kernel.store
+           norms
+           (row + offset k)
+           (squared (Kernel.load m (start + offset k))))
+  lastly sums norms row
+
+perRow : Kernel.Input Float32
+       -> Kernel.Output Float32
+       -> Kernel.Output Float32
+       -> Co Kernel.stmt Unit
+perRow m sums norms = do
+  row <- Kernel.globalId
+  Kernel.ifElse
+      (Kernel.atLeast row (Kernel.length sums))
+      (pure MkUnit)
+      (inRow m sums norms row)
+
+rows : Kernel.Kernel3
+       (Kernel.Input Float32)
+       (Kernel.Output Float32)
+       (Kernel.Output Float32)
+rows = Kernel.kernel3 "rows" 32 perRow
+
+-- >>> lines (Wgsl.source3 rows)
+-- [ "@group(0) @binding(0) var<storage, read> a : array<f32>;"
+-- , "@group(0) @binding(1) var<storage, read_write> b : array<f32>;"
+-- , "@group(0) @binding(2) var<storage, read_write> c : array<f32>;"
+-- , "@compute @workgroup_size(32)"
+-- , "fn rows(@builtin(global_invocation_id) id : vec3<u32>) {"
+-- , "  let v0 = id.x;"
+-- , "  if (v0 >= arrayLength(&b)) {"
+-- , "  } else {"
+-- , "    let v1 = v0 * 4u;"
+-- , "    b[v0] = 0.0f;"
+-- , "    for (var v2 = 0u; v2 < 4u; v2++) {"
+-- , "      b[v0] = b[v0] + a[v1 + v2];"
+-- , "    }"
+-- , "    c[v0 + 0u] = a[v1 + 0u] * a[v1 + 0u];"
+-- , "    c[v0 + 1u] = a[v1 + 1u] * a[v1 + 1u];"
+-- , "    if ((b[v0] < 0.0f) && (!(v0 == 0u))) {"
+-- , "      b[v0] = (-b[v0]) / 2.0f;"
+-- , "    } else {"
+-- , "      c[v0] = f32(v0 % 3u);"
+-- , "    }"
+-- , "  }"
+-- , "}"
+-- ]
+
+-- a kernel of one buffer, and literals of each type: signed ones in
+-- parentheses, the least `Int32` as a difference, an infinity by its
+-- bits
+fill : Kernel.Output Int32 -> Co Kernel.stmt Unit
+fill a = do
+  i <- Kernel.globalId
+  Kernel.when
+      (Kernel.either (Kernel.lit True) (Kernel.lit False))
+      (Kernel.store a i (Kernel.lit (-5) - Kernel.lit -2147483648))
+  Kernel.store
+      a
+      i
+      (Kernel.convert (Kernel.lit (Float32.div 1.0 0.0) /. Kernel.lit (-0.5)))
+
+-- >>> lines (Wgsl.source1 (Kernel.kernel1 "fill" 1 fill))
+-- [ "@group(0) @binding(0) var<storage, read_write> a : array<i32>;"
+-- , "@compute @workgroup_size(1)"
+-- , "fn fill(@builtin(global_invocation_id) id : vec3<u32>) {"
+-- , "  let v0 = id.x;"
+-- , "  if (true || false) {"
+-- , "    a[v0] = (-5i) - (-2147483647i - 1i);"
+-- , "  }"
+-- , "  a[v0] = i32(bitcast<f32>(0x7f800000u) / (-0.5f));"
+-- , "}"
+-- ]

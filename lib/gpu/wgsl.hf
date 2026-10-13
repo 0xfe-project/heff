@@ -1,0 +1,204 @@
+-- A kernel of gpu.kernel printed as WGSL, WebGPU's: its buffers bound
+-- at `@group(0)`, in order, then the entry point, its body printed by a
+-- handler of `stmt` (lib/co.hf's `Handler`) whose state is the next
+-- fresh name and the lines printed.  An expression is printed by pure
+-- functions, an operator's operands in parentheses.  Import it by a
+-- name, `import gpu.wgsl as Wgsl`.
+--
+-- The names a kernel has are its buffers' (`a`, `b`, `c`), the
+-- invocation's (`id`) and those named in its body (`v0`, `v1`, ...):
+-- an entry point is to be named none of them.
+
+import co
+import gpu.kernel as Kernel
+
+-- Expressions
+--------------------------------------------------------------------------------
+
+-- (an operator as WGSL writes it)
+symbol : Kernel.BinaryOp -> String
+symbol Plus = "+"
+symbol Minus = "-"
+symbol Times = "*"
+symbol Quotient = "/"
+symbol Modulo = "%"
+symbol Less = "<"
+symbol AtMost = "<="
+symbol Greater = ">"
+symbol AtLeast = ">="
+symbol EqualTo = "=="
+symbol NotEqualTo = "!="
+symbol AndAlso = "&&"
+symbol OrElse = "||"
+
+-- | Where an expression is: an operand of an operator, or the whole of
+-- | what is printed (a statement's, an index, an argument).
+data Place = Inside | Outside
+
+-- (an operator's application, in parentheses as an operand)
+enclosed : Place -> String -> String
+enclosed Inside s = "(" ^ s ^ ")"
+enclosed Outside s = s
+
+-- | The expression as WGSL writes it.
+-- | >>> written Outside (Kernel.exprOf (Kernel.lit (1 : UInt32) + Kernel.lit 2 * Kernel.lit 3))
+-- | "1u + (2u * 3u)"
+written : Place -> Kernel.Expr -> String
+written p (Literal s) = s
+written p (Var name) = name
+written p (Binary o x y) =
+  enclosed p (written Inside x ^ " " ^ symbol o ^ " " ^ written Inside y)
+written p (Negated x) = enclosed p ("-" ^ written Inside x)
+written p (Inverted x) = enclosed p ("!" ^ written Inside x)
+written p (Index buffer i) = buffer ^ "[" ^ written Outside i ^ "]"
+written p (Length buffer) = "arrayLength(&" ^ buffer ^ ")"
+written p (Convert t x) = t ^ "(" ^ written Outside x ^ ")"
+
+-- (the whole of what is printed)
+whole : Kernel.Expr -> String
+whole e = written Outside e
+
+-- Statements
+--------------------------------------------------------------------------------
+
+-- | What is printed so far: the next fresh name's number, how deep in
+-- | blocks the statements are, the lines (the last first).
+type Printing = { fresh : Int, depth : Int, lines : List String }
+
+-- | The printer's monad: a state.
+type Printer a = Printing -> Pair Printing a
+
+-- (a line, at the depth)
+emitted : String -> Printing -> Printing
+emitted line s =
+  { s
+  | lines = Cons (joinWith "" (List.replicate s.depth "  ") ^ line) s.lines
+  }
+
+-- (the next fresh name)
+freshName : Printing -> String
+freshName s = "v" ^ show s.fresh
+
+-- (the next fresh name taken)
+taken : Printing -> Printing
+taken s = { s | fresh = s.fresh + 1 }
+
+-- (the lines a block printed, the last first, and the names it took)
+block : Printer Unit -> Printing -> Printing
+block m s = fst (m { fresh = s.fresh, depth = s.depth + 1, lines = Nil })
+
+-- (a block's lines after the printed ones)
+spliced : Printing -> Printing -> Printing
+spliced inner s =
+  { fresh = inner.fresh
+  , depth = s.depth
+  , lines = List.append inner.lines s.lines
+  }
+
+-- (an `if`'s end: an `else` where it has statements)
+otherwise : Printer Unit -> Printing -> Printing
+otherwise no s = closed (block no s) s
+  where
+  closed : Printing -> Printing -> Printing
+  closed inner t =
+    if List.null inner.lines
+      then emitted "}" { t | fresh = inner.fresh }
+    else emitted "}" (spliced inner (emitted "} else {" t))
+
+-- (an operation printed: its line, or its block's)
+printed : {a : Type} -> Kernel.StmtF (\x -> Printer x) a -> Printer a
+printed (Let e k) s =
+  MkPair
+    (taken (emitted ("let " ^ freshName s ^ " = " ^ whole e ^ ";") s))
+    (k (Var (freshName s)))
+printed (Store buffer i x k) s =
+  MkPair
+    (emitted (buffer ^ "[" ^ whole i ^ "] = " ^ whole x ^ ";") s)
+    (k MkUnit)
+printed (If c yes no k) s =
+  let opened = emitted ("if (" ^ whole c ^ ") {") s
+  in MkPair (otherwise no (spliced (block yes opened) opened)) (k MkUnit)
+printed (For lo hi body k) s =
+  let v = freshName s
+  in let opened =
+    taken
+      (emitted
+         ("for (var "
+          ^ v
+          ^ " = "
+          ^ whole lo
+          ^ "; "
+          ^ v
+          ^ " < "
+          ^ whole hi
+          ^ "; "
+          ^ v
+          ^ "++) {")
+         s)
+  in MkPair
+    (emitted "}" (spliced (block (body (Var v)) opened) opened))
+    (k MkUnit)
+printed (GlobalId k) s =
+  MkPair
+    (taken (emitted ("let " ^ freshName s ^ " = id.x;") s))
+    (k (Var (freshName s)))
+
+-- (what comes after a step)
+after : {a b : Type} -> Pair Printing a -> (a -> Printer b) -> Pair Printing b
+after (MkPair s x) k = k x s
+
+-- | The printer, as a handler of a kernel's statements.
+printer : Handler Kernel.stmt
+printer =
+  { M = \a -> Printer a
+  , ret = \x s -> MkPair s x
+  , bind = \m k s -> after (m s) k
+  , malg = \p s -> printed p s
+  }
+
+-- Kernels
+--------------------------------------------------------------------------------
+
+-- (a buffer declared, at its binding)
+declaration : Int -> Kernel.Param -> String
+declaration i p =
+  "@group(0) @binding("
+  ^ show i
+  ^ ") var<storage, "
+  ^ p.access
+  ^ "> "
+  ^ p.name
+  ^ " : array<"
+  ^ p.element
+  ^ ">;"
+
+-- | The kernel as WGSL.
+source : Kernel.Kernel -> String
+source k =
+  let body = fst (handle printer k.body { fresh = 0, depth = 1, lines = Nil })
+  in joinWith
+    "\n"
+    (List.append
+       (List.zipWith
+          declaration
+          (List.range 0 (List.length k.params - 1))
+          k.params)
+       (List.append
+          [ "@compute @workgroup_size(" ^ show k.workgroup ^ ")"
+          , "fn "
+          ^ k.entry
+          ^ "(@builtin(global_invocation_id) id : vec3<u32>) {"
+          ]
+          (List.append (List.reverse body.lines) ["}"])))
+
+-- | A kernel of one buffer as WGSL.
+source1 : {a : Type} -> Kernel.Kernel1 a -> String
+source1 k = source (Kernel.kernelOf1 k)
+
+-- | ... of two.
+source2 : {a b : Type} -> Kernel.Kernel2 a b -> String
+source2 k = source (Kernel.kernelOf2 k)
+
+-- | ... of three.
+source3 : {a b c : Type} -> Kernel.Kernel3 a b c -> String
+source3 k = source (Kernel.kernelOf3 k)
