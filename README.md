@@ -1,7 +1,7 @@
 # heff
 
 heff is a functional language with a Haskell-like syntax and a phase
-distinction: types are computed with at compile time, data at run time.
+distinction: types are computed at compile time, data at run time.
 
 - **Types at compile time.** Types, functions of types and records of
   them (theories) are values the type checker computes with -- a
@@ -117,5 +117,5 @@ How the source is laid out, the seed and the test groups are in
 ## References
 
 - Lynch & Staton, *Hippogriff*, [arXiv:2608.19728](https://arxiv.org/abs/2608.19728):
-  the typed language with a phase distinction heff is based on.
-- Yang & Wu, POPL 2026: the algebraic effects of `lib/co.hf`.
+  the core theory heff uses, and the implementation heff refers to.
+- Yang & Wu, POPL 2026: the idea behind `lib/co.hf`.
