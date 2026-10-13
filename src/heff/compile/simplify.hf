@@ -1782,11 +1782,25 @@ specMarked r g xs b as marks =
     sh <- shapesOf marks as
     specShaped r g xs b as marks sh
 
-specKnown : SK -> String -> List String -> IR.Expr -> List IR.Expr -> M IR.Expr
-specKnown r g xs b as = do
+-- (the marks, and those of the arguments made lambdas, as many as the
+-- marks)
+orMarks : List Bool -> List Bool -> List Bool
+orMarks (Cons m ms) (Cons n ns) = Cons (m || n) (orMarks ms ns)
+orMarks ms _ = ms
+
+-- (... the arguments `made` lambdas of partial applications known too)
+specKnown : SK
+          -> String
+          -> List String
+          -> IR.Expr
+          -> List IR.Expr
+          -> List Bool
+          -> M IR.Expr
+specKnown r g xs b as made = do
   s <- get
-  if not (anyKnown s.sp.kinds g b as) then pure (mkApp (EGlobal g) as)
-    else specMarked r g xs b as (marksOf s.sp.kinds g xs b as)
+  if not (anyKnown s.sp.kinds g b as || List.any (\m -> m) made)
+      then pure (mkApp (EGlobal g) as)
+    else specMarked r g xs b as (orMarks (marksOf s.sp.kinds g xs b as) made)
 
 -- Partial applications given to a loop: a known function given fewer
 -- arguments than it takes, `scale f`, handed to a loop at a parameter it
@@ -1794,8 +1808,9 @@ specKnown r g xs b as = do
 -- comes to, `\x -> scale t x` with `scale` inlined, its arguments that
 -- compute bound first (`t = factor p`): a lambda capturing `t` that the
 -- loop may be given a copy for (`capturing`), which computes it at each
--- round, no closure called.  Only where every argument cannot fail, so
--- that what is bound first is computed as it was.
+-- round, no closure called.  Only where every argument before those
+-- bound first cannot fail, so that what is bound first is computed as it
+-- was.
 
 -- | how many more arguments than it is given a known function takes,
 -- | where it is one not inlined because it is given too few
@@ -1805,11 +1820,21 @@ missingOf s e = 0
 
 type Eta = Maybe (Pair (List (Pair String IR.Expr)) IR.Expr)
 
+-- | a lambda a partial application comes to that a copy may be made
+-- | for: one that calls nothing (`capturing`), or the function once
+-- | (`\x -> scale t x`, `Spec.callsOnce`), which costs what calling the
+-- | closure of the partial application would, the call made at once
+etaCapturing : IR.Expr -> Bool
+etaCapturing (ELam xs b) =
+  capturing (ELam xs b)
+  || (not (IR.sizeAbove specArgSize (ELam xs b)) && Spec.callsOnce (ELam xs b))
+etaCapturing _ = False
+
 -- (... kept if it comes to a lambda a copy may be made for)
 etaKept : St -> Bound -> IR.Expr -> M Eta
 etaKept saved (MkPair bds _) lam1 = do
   st <- get
-  if capturing lam1 then pure (Just (MkPair bds lam1))
+  if etaCapturing lam1 then pure (Just (MkPair bds lam1))
     else do
       u <- put (restore saved st)
       pure Nothing
@@ -1908,18 +1933,46 @@ etaLoop r g xs b as True =
   if loops g b then etaArgs r (Spec.statics g xs b) as else pure (MkPair Nil as)
 etaLoop r g xs b as False = pure (MkPair Nil as)
 
+-- (an argument whose bindings may be computed first)
+movesFirst : St -> IR.Expr -> Bool
+movesFirst s (ELet _ _ _) = True
+movesFirst s a = etaWanted s a
+
+-- (the arguments before the last whose bindings may be computed first:
+-- those they are put before)
+beforeMoved : St -> List IR.Expr -> List IR.Expr
+beforeMoved s Nil = Nil
+beforeMoved s (Cons a as) =
+  if List.any (movesFirst s) as then Cons a (beforeMoved s as) else Nil
+
 etaFor : SK -> String -> List String -> IR.Expr -> List IR.Expr -> M Bound
 etaFor r g xs b as = do
   s <- get
   if List.any (etaWanted s) as
       then do
-        p <- allPure as
+        p <- allPure (beforeMoved s as)
         etaLoop r g xs b as p
     else pure (MkPair Nil as)
 
-specBound : SK -> String -> List String -> IR.Expr -> Bound -> M IR.Expr
-specBound r g xs b (MkPair bds as) = do
-  e <- specKnown r g xs b as
+isLambda : IR.Expr -> Bool
+isLambda (ELam _ _) = True
+isLambda _ = False
+
+-- (an argument made a lambda (`etaFor`): it was not one, under its
+-- bindings)
+etaMade : IR.Expr -> IR.Expr -> Bool
+etaMade a (ELam _ _) = not (isLambda (snd (letsOut a)))
+etaMade a e = False
+
+specBound : SK
+          -> String
+          -> List String
+          -> IR.Expr
+          -> List IR.Expr
+          -> Bound
+          -> M IR.Expr
+specBound r g xs b as0 (MkPair bds as) = do
+  e <- specKnown r g xs b as (List.zipWith etaMade as0 as)
   pure (letsOf bds e)
 
 specLam : SK -> String -> List String -> IR.Expr -> List IR.Expr -> M IR.Expr
@@ -1928,7 +1981,7 @@ specLam r g xs b as = do
   if s.sp.off || s.sp.count >= specLimit then pure (mkApp (EGlobal g) as)
     else do
       bound <- etaFor r g xs b as
-      specBound r g xs b bound
+      specBound r g xs b as bound
 
 -- | a call of a definition not inlined: of a copy of it, if one may be
 -- | made
