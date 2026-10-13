@@ -272,6 +272,92 @@ main = do
   ...
 ```
 
+`std.filesystem` is files.  Whole ones: `readFile` (a file's text,
+`Maybe String`), `writeFile`, `readDir`, `mkDir` (a directory and those
+it is in: whether a directory is there -- a file there is none),
+`remove`, `copy`, `move`, `replace`, and `readOnly` and `writable` (a
+file, or a directory and all it holds, made read-only, and writable by
+its owner again), each answering whether it was done.
+
+What a path is: `stat path`, links followed, and `linkStat path`, a
+link itself, are `Either FileError Status`, a `Status` its `kind`
+(`Regular`, `Directory`, `Link` or `Other`), its `size`, when it was
+`modified` (nanoseconds since the epoch, an `Int`, as precise as the
+system keeps it) and its `mode` (its permission bits, `0x1ed` for
+`rwxr-xr-x`); `kindAt path` is its kind, `Nothing` where nothing is,
+and `exists`, `isFile` and `isDirectory` say so.  `setMode path mode` is
+chmod, and `makeExecutable path` `chmod +x` (an execute bit where there
+is a read bit); `realPath path` is the path with its links resolved
+(macOS's temporary directory is under one, `/var` to `/private/var`).
+`tempDirectory prefix` makes a directory of the program's own where
+the system keeps temporary ones (`TMPDIR`, else `/tmp`), named the
+prefix and six letters, and made only where nothing is, so that
+programs run at once never share one: its path; `tempFile prefix` a
+file so, open, `Pair` its path and it.  Both are the program's to
+remove.  Paths are put together and taken apart by `std.path`, which
+is pure.
+
+An open file is a `File`, a handle (`Handle OpenFile`, std.handle).
+`openFile path { access = Read }` opens one for `Read`, `Write` (from
+its start), `Append` (each write at its end) or `ReadWrite`; the other
+fields of `OpenOptions` are as the access has them by default: whether
+the file is made where there is none (`create`, for writing and
+appending), with what `mode` (`0x1a4`, less the umask), whether it is
+emptied (`truncate`, for writing), and whether it must be new
+(`exclusive`, `False`).  `readChunk h n` is up to `n` bytes, `Bytes`
+(16 MiB at most), none at its end; `readLine h` the next line, `Maybe
+String`, `Nothing` at the end, without its `\n` or `\r\n`, and the last
+one too where no newline ends it -- a string, which holds any bytes, as
+a file's are, UTF-8 or not; `writeBytes h b` and `writeString h s`
+write them all; `seek h from n` (`FromStart`, `FromCurrent`, `FromEnd`)
+and `tell h` are where it is read and written next, from its start;
+`statHandle h` is its `Status`; and `closeFile h` closes it and lets its
+handle go (an operation given it after that fails the program, as
+std.net's do).  A file reads ahead, a buffer at a time, and gives back
+what it read ahead before it is written, so that a file opened
+`ReadWrite` is written where the program has read up to; what is
+written is not held back, each write the system's.  What may fail gives
+`Either FileError a`: the system's `code`, errno, its `name`, the same
+on every system (`ENOENT`, `EACCES`, `EISDIR`), and its `message`
+(`showFileError`).
+
+`foldLines h acc step` folds `step` over the lines of an open file,
+from where it is to its end, one line held at a time, and `copyHandle
+from to` writes what is left of one to another, a chunk at a time.
+`stdin`, `stdout` and `stderr` are the standard streams as open files,
+the same handle each time: a program reads its input a line at a time,
+in as little memory as a line takes.  (std.io's `readStdin` reads it
+all, to its end: read it one way or the other, not both, as neither
+sees what the other read ahead.)  What std.io wrote is written out
+before a write of `stdout` or `stderr`; a standard stream's handle
+closed is let go of, and the stream left open.
+
+```haskell
+import std.filesystem
+
+-- (a line's words, added to the count)
+countWords : {e : HFunctor} -> Int -> String -> Co e Int
+countWords n line = pure (n + List.length (words line))
+
+-- (the words of the standard input, read a line at a time)
+wordsIn : {e : HFunctor} -> {{disk : fs <: e}} -> Co e (Either FileError Int)
+wordsIn = bind stdin (\i -> foldLines i 0 countWords)
+```
+
+A regular file is read and written there and then, the whole program
+waiting for the disk -- a green thread's too: poll says such a file is
+always ready, so only a thread of the system could wait for it apart,
+and a disk's wait is short beside a socket's.  A pipe, a terminal or a
+socket -- the standard streams, most often -- waits, under
+`Reactor.scheduled`, in the reactor, as std.net's sockets do, the
+other green threads going on; its descriptor is left as it is, never
+made non-blocking (a standard stream's is its parent's too): a read is
+done once poll says there is something to read, a write a few hundred
+bytes at a time (PIPE_BUF) once it says there is room.  Opening a FIFO
+waits for its other end, the whole program with it.  On Windows, links
+are not seen, a mode is only whether the owner may write, and every
+operation waits where it is.
+
 ## Green threads
 
 `green` is green threads, an effect and a scheduler that is a handler
@@ -315,8 +401,9 @@ On the C backend, `std.reactor` (`import std.reactor as Reactor`, its
 effect `Reactor.reactor` in the world) has them wait apart:
 `Reactor.scheduled e c` is `scheduledWith e Reactor.outside c`, where
 a thread whose `Net.read`, `Net.accept`, `Net.connect` or `Net.write`
-would wait, or whose `Http.send` (`Http.get`, `Http.getText`) is
-under way, is pending while the other threads go on, and goes on with its answer once it is done --
+would wait, whose read or write of a pipe, a terminal or a socket
+(std.filesystem's `readLine`, `readChunk`, `writeBytes`, `writeString`)
+would, or whose `Http.send` (`Http.get`, `Http.getText`) is under way, is pending while the other threads go on, and goes on with its answer once it is done --
 from the thread's own view the call returns its result, as it always
 did.  When no thread is ready, the scheduler waits for the first
 pending one to be done (the system's `poll`, of every socket waited
@@ -346,8 +433,8 @@ main = do
 
 How it is done -- an operation begun, pending, and finished later -- is
 the providers' ([providers.md](providers.md#outside-operations-done-later)):
-std.net's and std.http's are, others' wait where they are, every thread
-with them.  It is one reactor for each thread of the system: green
+std.net's, std.http's and std.filesystem's of a pipe, a terminal or a
+socket are, others' wait where they are, every thread with them.  It is one reactor for each thread of the system: green
 threads in a thread of std.thread's are that thread's own
 ([threads.md](threads.md#green-threads-in-threads)).
 

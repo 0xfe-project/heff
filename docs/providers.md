@@ -160,3 +160,10 @@ What has no descriptor to wait on is given one: a name is resolved by
 getaddrinfo in a thread of the system of its own, started for it
 (lib/std/net.provider.c), which writes a byte to a socket of a pair
 whose other end the wait polls; the thread touches nothing of heff's.
+
+A descriptor that is not the provider's own to make non-blocking -- a
+standard stream, whose flags its parent shares -- is stepped as it is
+(lib/std/filesystem.provider.c): polled first, not waiting, and read
+only once there is something to read, or written no more than PIPE_BUF
+bytes at a time once there is room, which never waits.  A regular file
+poll says is always ready: it is read and written there and then.
