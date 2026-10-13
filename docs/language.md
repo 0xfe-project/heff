@@ -427,50 +427,102 @@ takes them apart.
 A C program keeps them as a buffer of bytes, a JavaScript one as a
 `Uint8Array` ([providers.md](providers.md#bytes)).
 
+### Bits
+
+`Bits` are a bitstring, of any length in bits, never changed once made:
+another type of the prelude's, beside `Bytes`, which are the whole
+bytes' case kept apart -- the type of most binaries, and the one the
+system reads and writes.  The module `bits` (`import bits as Bits`)
+has what is done with them: `length` (in bits), `index` (the bit at
+`i`, as a `Bool`), `toList` and `fromList` (of `Bool`s), `toBytes`
+(`Just` their bytes, where their length is a multiple of 8, else
+`Nothing`) and `ofBytes`, `ofInt` (an integer's low `n` bits),
+`slice`, `append`, `concat`, `empty` and `eq` (as `==`, whose instance,
+`instanceEqualityBits`, is the prelude's).  Their `show` writes them as
+a binary does (`instanceShowBits`, below), and their `toString` is
+each bit, `0` or `1` (`instanceToStringBits`): `toString b[5::3]` is
+`"101"`.  A C program keeps them as a buffer of bytes and how many of
+its bits they are, a JavaScript one as a `Uint8Array` whose `bits` is
+their length; the bits past them are 0.
+
 ### Binaries
 
-A binary, `b[...]`, is `Bytes` written as segments, one after another,
-as Erlang's and Elixir's `<<...>>` are: `b[1, 2, 255]`, `b["GET ",
-path::binary, "\r\n"]`, `b[tag::8, len::16-big, body::binary]`.  It
-opens with `b[`, a `b` where a token starts, right before the `[` (`b
-[x]` is `b` applied to a list, and `ab[x]` a name and a list), and
-each of its segments is a value, perhaps with a spec after `::`.  The
-first `::` outside parentheses ends the value, so cons in one is in
-parentheses: `(x :: xs)` (heff's types are written with `:`).  A spec
-is these, between `-`s, each at most once:
+A binary, `b[...]`, is `Bytes`, or `Bits`, written as segments, one
+after another, as Erlang's and Elixir's `<<...>>` are: `b[1, 2, 255]`,
+`b["GET ", path::binary, "\r\n"]`, `b[tag::8, len::16-big,
+body::binary]`, `b[flag::1, kind::3, n::12-little]`.  It opens with
+`b[`, a `b` where a token starts, right before the `[` (`b [x]` is `b`
+applied to a list, and `ab[x]` a name and a list), and each of its
+segments is a value, perhaps with a spec after `::`.  The first `::`
+outside parentheses ends the value, so cons in one is in parentheses:
+`(x :: xs)` (heff's types are written with `:`).  A spec is these,
+between `-`s, each at most once:
 
-- what the segment is: `integer`, an `Int` (where nothing says, a
-  segment is one, but a string), or `binary` (or `bytes`), a `Bytes`;
-- its size: a number, or `size(n)`, `n` a number or a name: an
-  integer's in bits, 8 to 64 and a multiple of 8 (8 where none is
-  said), bytes' in bytes (all of them where none is said);
-- an integer's endianness, `big` (where none is said) or `little`, and
-  its sign, `unsigned` (where none is said) or `signed`, for reading.
+- what the segment is: `integer`, an `Int`; `binary` (or `bytes`), a
+  `Bytes`; `bits` (or `bitstring`), a `Bits`; `float`, a `Float64`,
+  IEEE's; or `utf8`, `utf16`, `utf32`, a code point in that encoding,
+  written of an `Int` or a `Rune` and read as a `Rune`.  Where nothing
+  says, a string is `binary`, a float literal `float`, a rune literal
+  `utf8`, and anything else `integer`;
+- its size: a number, or `size(n)`, `n` a number or a name, counted in
+  its unit: an integer's of 1 to 64 bits (8 where none is said), a
+  float's 64 or 32 (64 where none is said), bytes' and bits' all of
+  them where none is said (in a pattern, all that are left); a code
+  point says none, it is as long as its encoding;
+- its unit, `unit(n)`, 1 to 256 bits, what its size counts, as
+  Erlang's: an integer's, a float's and bits' 1 where none is said,
+  bytes' 8 (and always a multiple of 8) -- `x::size(2)-unit(8)` is an
+  integer of 16 bits, `x::binary-size(4)` 4 bytes, and
+  `x::binary-size(2)-unit(16)` 4 bytes too.  A unit is said with a
+  size;
+- an integer's, a float's, UTF-16's and UTF-32's endianness, `big`
+  (where none is said) or `little`, and an integer's sign, `unsigned`
+  (where none is said) or `signed`, for reading.  Little-endian, an
+  integer whose size is no multiple of 8 is Erlang's: its bytes, the
+  least significant first, then the bits left, its most significant --
+  `b[0x123::12-little]` is `b[0x23, 1::4]`.
 
 A string written is a segment of its bytes, UTF-8, its escapes as a
-string's (`b["é"]` is two bytes, `b["\xff"]` one), and takes no spec but
-`binary`.  So `b[258::16, 258::16-little, -1::32]` is `b[1, 2, 2, 1,
-255, 255, 255, 255]`.  Made, an integer is written as its low bits, two's
-complement (`b[-1]` is `b[255]`, `b[256]` is not: a number written
-must fit, as a signed or an unsigned integer of its size), and
-`x::binary-size(n)` writes the first `n` bytes of `x` (of fewer,
-abandoned).  A binary each of whose segments is a number of a size
-written, or a string, is its bytes whole, as a literal: a C program
-has it as a static object, as it has a string literal, a JavaScript one
-makes a `Uint8Array` of them.  Otherwise its segments are made one by
-one and put together, by the prelude's primitives (`bytesOfInt`,
-`bytesConcat`).
+string's (`b["é"]` is two bytes, `b["\xff"]` one), and takes no spec
+but `binary`.  So `b[258::16, 258::16-little, -1::32]` is `b[1, 2, 2,
+1, 255, 255, 255, 255]`, and `b['é', 0x1F600::utf8]` is `b[195, 169,
+240, 159, 152, 128]`.  Made, an integer is written as its low bits,
+two's complement (`b[-1]` is `b[255]`, `b[256]` is not: a number
+written must fit, as a signed or an unsigned integer of its size), a
+code point that is no Unicode scalar value is abandoned (one written
+there is refused), `x::binary-size(n)` writes the first `n` bytes of
+`x` and `x::bits-size(n)` the first `n` bits (of fewer, abandoned).
+A float of 32 bits is the `Float64` rounded to one, as `float32`'s
+`fromFloat` rounds it, and read, made a `Float64` again; a NaN is
+written as the quiet one, its sign 0, on every backend.
 
-A binary in a pattern takes `Bytes` apart, the same segments, read
-left to right: a segment is a name, `_`, a number or a string (one
-that must be there), and a size may be a name an earlier segment of
-the same binary binds -- so a length read is the length of what
-follows.  Only the last segment may be bytes of no size, all that are
-left; else the binary matches bytes all read.  A binary of one such
-segment, `b[x::binary]`, matches any bytes, as `x` does.  A value a
-binary does not match goes on to the next equation, as one a literal
-does not, and a binary is matched where a row matches any value (a
-variable or `_`) after it.
+Which a binary is, `Bytes` or `Bits`, is said where it is elaborated,
+of its segments alone, as written: it is `Bits` where one of its
+segments is `bits`, or where its segments' sizes, past whole bytes,
+add up to no multiple of 8 -- or to what is not known there: a size
+that is a name, of a unit that is no multiple of 8 (`x::size(n)`, an
+integer of `n` bits), or bits all that are left.  Otherwise it is
+`Bytes`.  So `b[5::3]` and `b[x::size(n)]` are `Bits`, and `b[1::4, 2::4]`
+and `b[x::size(n)-unit(8)]` are `Bytes`.  Bits whose length is a multiple of 8 are
+written with a `bits` segment of nothing, `b[1, 2, b[]::bits]`: a
+`bits` segment whose value is a binary written there is that binary
+made bits.  A value of the other type is made one by `bits`'s
+`ofBytes` and `toBytes`.
+
+A binary in a pattern takes `Bytes`, or `Bits`, apart, by the same
+segments and the same rule, read left to right: a segment is a name,
+`_`, a number, a string, a float or a rune (one that must be there),
+and a size may be a name an earlier segment of the same binary binds --
+so a length read is the length of what follows.  Only the last segment
+may be bytes or bits of no size, all that are left (bytes, of whole
+bytes); else the binary matches what is all read.  A code point is read
+where it is well formed: UTF-8 neither overlong, nor a surrogate, nor
+past U+10FFFF, nor cut short, UTF-16 a surrogate only of a pair -- else
+the binary does not match.  A binary of one segment of bytes,
+`b[x::binary]`, matches any bytes, as `x` does.  A value a binary does
+not match goes on to the next equation, as one a literal does not, and
+a binary is matched where a row matches any value (a variable or `_`)
+after it.
 
 ```haskell
 type Packet = { tag : Int, body : Bytes, rest : Bytes }
@@ -490,23 +542,46 @@ method : Bytes -> String
 method b["GET ", path::binary] = "get " ^ toString path
 method b[1, n::16-little-signed] = show n
 method _ = "other"
+
+-- | the runes of UTF-8, an ill-formed byte as U+FFFD
+-- | >>> runesOf b["h", 0xff, "é"]
+-- | ['h', '\u{FFFD}', 'é']
+runesOf : Bytes -> List Rune
+runesOf b[c::utf8, rest::binary] = c :: runesOf rest
+runesOf b[_::8, rest::binary] = '\u{FFFD}' :: runesOf rest
+runesOf _ = []
+
+-- | a header of 4 bits, its length, then that many bits
+-- | >>> field b[3::4, 5::3, 1::2]
+-- | Just (5)
+field : Bits -> Maybe Int
+field b[n::4, x::size(n), _::bits] = Just x
+field _ = Nothing
 ```
 
 `show` writes bytes as a binary of them (`instanceShowBytes`, the tools as it
 does): each run of printable ASCII, a byte from 32 up to 126, a string
 (`"` and `\` escaped), and every other byte its number -- `show b["GET
-\xff\r\n"]` is `"b[\"GET \", 255, 13, 10]"`, and `b[]` is none.  What
-it writes is a binary of the same bytes.
+\xff\r\n"]` is `"b[\"GET \", 255, 13, 10]"`, and `b[]` is none.  Bits
+are written the same, their whole bytes as bytes are, then the bits
+left, `v::k` (`b["GET", 5::3]`), or, where none are left, `b[]::bits`
+(`b[1, 2, b[]::bits]`, and of no bits `b[b[]::bits]`), so that what is
+written is `Bits` again (`instanceShowBits`).  What `show` writes is a
+binary of the same bytes, or bits.
 
-A binary is taken apart where it is elaborated, the same for every
-backend: a pattern is a test, of `Bool`, that reads the value by the
-prelude's primitives (`bytesLength`, `bytesIntAt`, `bytesHasAt`; a
-binary written whole compared by `bytesEq`), and then the names its
-segments bind, each read again (`bytesIntAt`, `bytesSlice`), the
-equation's rows matched on with them; offsets and sizes are in bits.
-A binary is whole bytes, `Bytes`: a bitstring of a length that is no
-multiple of 8 (Elixir's `bits`, a segment of 3 bits) is not one, and
-heff has none yet.
+A binary is made and taken apart where it is elaborated, the same for
+every backend.  Of whole bytes, its segments' bytes are put together
+(`bytesConcat`, `bytesOfInt`); otherwise its segments are made bits and
+put together (`bitsConcat`, `bitsOfInt`, `bitsOfBytes`), and, where
+the binary is `Bytes`, made bytes again (`bitsBytes`).  A pattern is a
+test, of `Bool`, that reads the value by the prelude's primitives
+(`bytesLength`, `bytesIntAt`, `bytesHasAt`; `bitsLength`,
+`bitsIntAt`, `bitsSlice`, where it is `Bits` or its segments are not
+whole bytes -- a `Bytes` made bits first; a binary written whole
+compared by `bytesEq`; a float's bits read by `floatOfBits`, a code
+point's by the prelude's `bytesUtf8At` and the like), and then the
+names its segments bind, each read again, the equation's rows matched
+on with them; offsets and sizes are in bits.
 
 ## Effects
 

@@ -41,7 +41,13 @@ are imported by their names:
   [runes and strings](language.md#runes-and-strings));
 - `bytes`, the operations of `Bytes` ([bytes](language.md#bytes)),
   which a binary, `b[...]`, writes and takes apart
-  ([binaries](language.md#binaries)).
+  ([binaries](language.md#binaries));
+- `bits`, the operations of `Bits`, a bitstring of any length
+  ([bits](language.md#bits)): `length` (in bits), `index` (a bit, as a
+  `Bool`), `toList` and `fromList`, `toBytes` (`Just` the bytes, of a
+  length that is a multiple of 8) and `ofBytes`, `ofInt` (the low `n`
+  bits of an integer), `slice` (from bit `i` up to `j`, clamped),
+  `append`, `concat`, `empty` and `eq`.
 
 ## The batteries
 
