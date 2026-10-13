@@ -1596,6 +1596,14 @@ argDone : List Imperative.Val
         -> Pair Bool (List Imperative.Val)
 argDone done (MkPair b e) = MkPair b (List.append done (Cons e Nil))
 
+-- | the tag a kept cell is wanted for: of `n` fields, and its own tag
+-- | (`tag`), or any (`""`)
+type Want = { n : Int, tag : String }
+
+-- (a tag built that may be built in the kept cell)
+fits : Want -> String -> List Imperative.Val -> Bool
+fits w t as = List.length as == w.n && (strEq w.tag "" || strEq w.tag t)
+
 -- (operands, the first that builds a tag of `n` fields in the kept cell)
 reuseArgs : (Imperative.Val -> Pair Bool Imperative.Val)
           -> List Imperative.Val
@@ -1615,9 +1623,9 @@ withTag : String
 withTag t ts (MkPair b as) = MkPair b (STag t as ts)
 
 -- (a tag of `n` fields, built in the cell; or one of its operands)
-reuseV : String -> Int -> Imperative.Val -> Pair Bool Imperative.Val
+reuseV : String -> Want -> Imperative.Val -> Pair Bool Imperative.Val
 reuseV ru n (STag t as ts) =
-  if List.length as == n
+  if fits n t as
     then MkPair
         True
         (SPrim reusePrim (Cons (SVar ru) (Cons (STag t as ts) Nil)))
@@ -1625,12 +1633,12 @@ reuseV ru n (STag t as ts) =
 reuseV ru n v = MkPair False v
 
 reuseVals : String
-          -> Int
+          -> Want
           -> List Imperative.Val
           -> Pair Bool (List Imperative.Val)
 reuseVals ru n vs = reuseArgs (\v -> reuseV ru n v) vs
 
-reuseOp : String -> Int -> Imperative.Comp -> Pair Bool Imperative.Comp
+reuseOp : String -> Want -> Imperative.Comp -> Pair Bool Imperative.Comp
 reuseOp ru n (OSimple v) = case reuseV ru n v of
   MkPair b v2 -> MkPair b (OSimple v2)
 reuseOp ru n (OCall g as) = case reuseVals ru n as of
@@ -1640,8 +1648,8 @@ reuseOp ru n o = MkPair False o
 -- | the walk, knotted: statements (each path's first, then what follows
 -- | where none was), what is last
 type ReuseK =
-  { sts : String -> Int -> List Imperative.St -> Pair Bool (List Imperative.St)
-  , tl : String -> Int -> Imperative.Tl -> Pair Bool Imperative.Tl
+  { sts : String -> Want -> List Imperative.St -> Pair Bool (List Imperative.St)
+  , tl : String -> Want -> Imperative.Tl -> Pair Bool Imperative.Tl
   }
 
 consSt : Imperative.St
@@ -1652,7 +1660,7 @@ consSt st (MkPair b ss) = MkPair b (Cons st ss)
 -- (each arm, apart)
 stArms : ReuseK
        -> String
-       -> Int
+       -> Want
        -> List (Imperative.Arm (List Imperative.St))
        -> Pair Bool (List (Imperative.Arm (List Imperative.St)))
 stArms r ru n arms =
@@ -1668,7 +1676,7 @@ stArms r ru n arms =
 
 tlArms : ReuseK
        -> String
-       -> Int
+       -> Want
        -> List (Imperative.Arm Imperative.Tl)
        -> Pair Bool (List (Imperative.Arm Imperative.Tl))
 tlArms r ru n arms =
@@ -1686,7 +1694,7 @@ tlArms r ru n arms =
 -- statement and what follows searched)
 stThen : ReuseK
        -> String
-       -> Int
+       -> Want
        -> List Imperative.St
        -> Pair Bool Imperative.St
        -> Pair Bool (List Imperative.St)
@@ -1695,7 +1703,7 @@ stThen r ru n rest (MkPair False st) = consSt st (r.sts ru n rest)
 
 reuseSts : ReuseK
          -> String
-         -> Int
+         -> Want
          -> List Imperative.St
          -> Pair Bool (List Imperative.St)
 reuseSts r ru n Nil = MkPair False Nil
@@ -1714,7 +1722,7 @@ reuseSts r ru n (Cons (SIf c ts fs) rest) =
     MkPair bf fs2 -> MkPair (bt || bf) (SIf c ts2 fs2))
 reuseSts r ru n (Cons st rest) = consSt st (r.sts ru n rest)
 
-reuseTl : ReuseK -> String -> Int -> Imperative.Tl -> Pair Bool Imperative.Tl
+reuseTl : ReuseK -> String -> Want -> Imperative.Tl -> Pair Bool Imperative.Tl
 reuseTl r ru n (TSeq ss t) = case r.sts ru n ss of
   MkPair True ss2 -> MkPair True (TSeq ss2 t)
   MkPair False _ -> case r.tl ru n t of
@@ -1735,26 +1743,40 @@ reuseK =
   , tl = \ru n t -> reuseTl reuseK ru n t
   }
 
-reuseArm : String -> Int -> ArmBody -> Pair Bool ArmBody
+reuseArm : String -> Want -> ArmBody -> Pair Bool ArmBody
 reuseArm ru n (ATail t) = case reuseK.tl ru n t of
   MkPair b t2 -> MkPair b (ATail t2)
 reuseArm ru n (ASts ss) = case reuseK.sts ru n ss of
   MkPair b ss2 -> MkPair b (ASts ss2)
 
+-- (... else where it builds any tag of its size)
+reusedAny : String
+          -> Int
+          -> ArmBody
+          -> Pair Bool ArmBody
+          -> Pair (Maybe String) ArmBody
+reusedAny ru n b (MkPair True b1) = MkPair (Just ru) b1
+reusedAny ru n b (MkPair False _) = case reuseArm ru { n = n, tag = "" } b of
+  MkPair True b2 -> MkPair (Just ru) b2
+  MkPair False _ -> MkPair Nothing b
+
 -- (an arm whose scrutinee is given up: its cell kept, `ru`, where the
--- arm builds a tag of its size -- the body, so built)
+-- arm builds a tag of its own tag -- a list's cell for the cell it
+-- rebuilds, not for another tag of its size built before it, in a
+-- match whose arms each rebuild their own -- else, if it builds none, of
+-- its size: the body, so built)
 reusing : Maybe String
         -> String
         -> List String
         -> ArmBody
         -> Pair (Maybe String) ArmBody
 reusing Nothing t vs b = MkPair Nothing b
-reusing (Just x) t vs b = case reuseArm
+reusing (Just x) t vs b =
+  reusedAny
     ("ru$" ^ x ^ "$" ^ t)
     (List.length vs)
-    b of
-  MkPair True b2 -> MkPair (Just ("ru$" ^ x ^ "$" ^ t)) b2
-  MkPair False _ -> MkPair Nothing b
+    b
+    (reuseArm ("ru$" ^ x ^ "$" ^ t) { n = List.length vs, tag = t } b)
 
 -- Matches
 --------------------------------------------------------------------------------
