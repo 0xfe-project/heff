@@ -177,12 +177,13 @@ two values that differ are not written the same -- not a value's text,
 which `rune`'s and `bytes`' own `toString` are (a rune's string, bytes
 read as UTF-8; each module is imported by a name, so neither is in the
 way of the prelude's).  Its instances are `Int`'s (`toStringInt`),
-`Float64`'s, `String`'s, `Bool`'s, `Unit`'s and `Ordering`'s, those of
-a `List`, a `Maybe`, a `Pair` and an `Either` of types that have one;
-`Rune`'s, `Bytes`' and each fixed-width type's are their modules', each
-its `show` (`rune`'s `toStringRune` writes `'a'`, `bytes`'
-`toStringBytes` `b"hi"`), found where the module is imported.  A type
-of a program's own has one where the program declares it:
+`Float64`'s, `String`'s, `Rune`'s (`toStringRune`, `toString 'a'` is
+`"'a'"`), `Bytes`' (`toStringBytes`, `toString b"hi"` is
+`"b\"hi\""`), `Bool`'s, `Unit`'s and `Ordering`'s, with no import, and
+those of a `List`, a `Maybe`, a `Pair` and an `Either` of types that
+have one; each fixed-width type's is its module's, its `show`, found
+where the module is imported.  A type of a program's own has one where
+the program declares it:
 
 ```haskell
 data Color = Red | Green
@@ -378,9 +379,9 @@ The module `rune` (`import rune as Rune`) has their comparisons (`eq`,
 `toInt` and `fromInt` (which wraps an integer around to 32 bits, as Go's
 `rune(n)` does: a rune may be no scalar value, `isValid` says, and is
 U+FFFD, `replacement`, in a string made of it), `toString` (its string,
-`"a"`), `show` (`"'a'"`, as a literal writes it, and so as the
-prelude's `toString` does, by the module's instance, `toStringRune`), a rune in a string -- `width` (its bytes), `count` (a
-string's runes), `foldl` (each rune with where it starts),
+`"a"`), `show` (`"'a'"`, as a literal writes it: the prelude's
+`showRune`, which its `toString` writes a rune by, with no import), a
+rune in a string -- `width` (its bytes), `count` (a string's runes), `foldl` (each rune with where it starts),
 `validString` and `toValid` (what is not UTF-8 made U+FFFD) -- and
 ASCII's classes and cases: `isDigit`, `isAlpha`, `isSpace`, `isUpper`,
 `toUpper` and the like (`isAlpha 'é'` is `False`).
@@ -403,8 +404,8 @@ string's, `strSlice`: clamped, a negative index from the end),
 `equalityBytes`, is the prelude's: no import is needed for it), and
 `show`, which writes them as `b"..."`: a byte of ASCII that is printed
 as it is (`"` and `\` escaped), `\n`, `\r` and `\t`, and any other
-byte `\xff` -- what the prelude's `toString` writes too, by the
-module's instance, `toStringBytes`.
+byte `\xff` -- the prelude's `showBytes`, which its `toString` writes
+bytes by, with no import.
 
 So a literal writes them: `b` right before a string, where a token
 starts (`b "x"` is a name and a string, and so is `ab"x"`), read as a
