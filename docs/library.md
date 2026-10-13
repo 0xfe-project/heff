@@ -27,7 +27,10 @@ are imported by their names:
 - `co` ([effects](language.md#effects)), and effects made with it:
   `state`, `exn` (with `exnDiv` and `exnMod`, a division that throws by
   zero), `parallel` and `green` ([green threads](#green-threads));
-- `array`, `map` and `set`;
+- `array`, `map` and `set` (a map's `insertWith` and `alter` change
+  what a key is bound to in one walk down the tree, where a `lookup`
+  and an `insert` take two: `Map.insertWith compareString (\new old ->
+  new + old) word 1 counts` counts a word);
 - `check` and `gen`, the tests and their generators
   ([tests.md](tests.md#unit-tests-and-properties));
 - `manifest`, the types of `package.hf` and `build.hf`

@@ -1977,14 +1977,26 @@ static V heff_buf_append(V a, V b, uint16_t kind) {
 
 static V heff_strAppend(V a, V b) { return heff_buf_append(a, b, K_STR); }
 
-static V heff_strLength(V a) {
+// Lent strings: a primitive that only reads its strings has a `_lent`
+// form, given besides its operands a mask, `give`, of those given it
+// (bit `k` the `k`-th operand's): the others are lent, held by the caller
+// through the call, neither counted up for it nor down by it.  The C
+// backend calls it where an operand is a variable wanted after the call
+// (src/heff/compile/emitc.hf, `lendingPrims`), and so saves a count up
+// and down of its string each time -- a byte read in a loop, or a key
+// compared at each node of a map.  (`give` is a constant there: what is
+// not given is not looked at.)
+#define HEFF_GIVEN(give, k, v) do { if ((give) >> (k) & 1) heff_drop(v); } while (0)
+
+HEFF_FAST V heff_strLength_lent(V a, int give) {
   V n = MK_INT(((Str *)a)->len);
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return n;
 }
+static V heff_strLength(V a) { return heff_strLength_lent(a, 1); }
 
 // (as JavaScript's `slice`: out of range is clamped, negative from the end)
-static V heff_strSlice(V a, V i, V j) {
+static V heff_strSlice_lent(V a, V i, V j, int give) {
   Str *x = (Str *)a;
   int64_t n = x->len, b = INT_OF(i), e = INT_OF(j);
   if (b < 0) b = b + n < 0 ? 0 : b + n;
@@ -1994,45 +2006,98 @@ static V heff_strSlice(V a, V i, V j) {
   if (e < b) e = b;
   Str *s = heff_str_new(e - b);
   memcpy(s->s, x->s + b, (size_t)(e - b));
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return (V)s;
 }
+static V heff_strSlice(V a, V i, V j) { return heff_strSlice_lent(a, i, j, 1); }
 
-// (the bytes' order: of UTF-8, its runes')
-static int heff_str_cmp(V a, V b) {
+// (the 8 bytes at `p` as a number in their order: the first the highest)
+static inline uint64_t heff_str_word(const uint8_t *p) {
+  uint64_t w;
+  memcpy(&w, p, sizeof w);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  w = __builtin_bswap64(w);
+#endif
+  return w;
+}
+
+// (the bytes' order: of UTF-8, its runes'.  Words, mostly short, are
+// compared 8 bytes at a time, in place: no call to memcmp)
+static inline int heff_str_cmp(V a, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
-  int64_t n = x->len < y->len ? x->len : y->len;
-  int c = n ? memcmp(x->s, y->s, (size_t)n) : 0;
-  if (c) return c < 0 ? -1 : 1;
+  if (x == y) return 0;
+  int64_t n = x->len < y->len ? x->len : y->len, i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t u = heff_str_word(x->s + i), v = heff_str_word(y->s + i);
+    if (u != v) return u < v ? -1 : 1;
+  }
+  for (; i < n; i++)
+    if (x->s[i] != y->s[i]) return x->s[i] < y->s[i] ? -1 : 1;
   return x->len == y->len ? 0 : x->len < y->len ? -1 : 1;
 }
 
+// (the order of two strings at once: -1, 0 or 1)
+HEFF_FAST V heff_strCompare_lent(V a, V b, int give) {
+  int c = heff_str_cmp(a, b);
+  HEFF_GIVEN(give, 0, a);
+  HEFF_GIVEN(give, 1, b);
+  return MK_INT(c);
+}
+static V heff_strCompare(V a, V b) { return heff_strCompare_lent(a, b, 3); }
+
+// (where `needle` is first in `s` from `i` on (from 0, `i` below it), or
+// -1: its first byte looked for by memchr, the rest compared there)
+static V heff_strFind_lent(V needle, V s, V i, int give) {
+  Str *p = (Str *)needle, *x = (Str *)s;
+  int64_t k = INT_OF(i), m = p->len, r = -1;
+  if (k < 0) k = 0;
+  if (k + m <= x->len) {
+    if (m == 0) r = k;
+    else {
+      const uint8_t *at = x->s + k, *end = x->s + x->len - m + 1;
+      while (at < end && (at = memchr(at, p->s[0], (size_t)(end - at)))) {
+        if (memcmp(at + 1, p->s + 1, (size_t)(m - 1)) == 0) { r = at - x->s; break; }
+        at++;
+      }
+    }
+  }
+  HEFF_GIVEN(give, 0, needle);
+  HEFF_GIVEN(give, 1, s);
+  return MK_INT(r);
+}
+static V heff_strFind(V needle, V s, V i) { return heff_strFind_lent(needle, s, i, 3); }
+
 // (as C's condition, and as a Bool: see `INT_CMP`)
-static int heff_strEq_c(V a, V b) {
+HEFF_FAST int heff_strEq_c_lent(V a, V b, int give) {
   Str *x = (Str *)a, *y = (Str *)b;
   int c = x == y || (x->len == y->len && memcmp(x->s, y->s, (size_t)x->len) == 0);
-  heff_drop(a);
-  heff_drop(b);
+  HEFF_GIVEN(give, 0, a);
+  HEFF_GIVEN(give, 1, b);
   return c;
 }
+static int heff_strEq_c(V a, V b) { return heff_strEq_c_lent(a, b, 3); }
 static inline V heff_strEq(V a, V b) { return heff_bool(heff_strEq_c(a, b)); }
+HEFF_FAST V heff_strEq_lent(V a, V b, int give) { return heff_bool(heff_strEq_c_lent(a, b, give)); }
 
-static int heff_strLt_c(V a, V b) {
+HEFF_FAST int heff_strLt_c_lent(V a, V b, int give) {
   int c = heff_str_cmp(a, b);
-  heff_drop(a);
-  heff_drop(b);
+  HEFF_GIVEN(give, 0, a);
+  HEFF_GIVEN(give, 1, b);
   return c < 0;
 }
+static int heff_strLt_c(V a, V b) { return heff_strLt_c_lent(a, b, 3); }
 static inline V heff_strLt(V a, V b) { return heff_bool(heff_strLt_c(a, b)); }
+HEFF_FAST V heff_strLt_lent(V a, V b, int give) { return heff_bool(heff_strLt_c_lent(a, b, give)); }
 
 // (the byte at `i`; out of the string, -1)
-static V heff_strByteAt(V a, V i) {
+HEFF_FAST V heff_strByteAt_lent(V a, V i, int give) {
   Str *x = (Str *)a;
   int64_t k = INT_OF(i);
   V r = k >= 0 && k < x->len ? MK_INT(x->s[k]) : MK_INT(-1);
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return r;
 }
+static V heff_strByteAt(V a, V i) { return heff_strByteAt_lent(a, i, 1); }
 
 // (the string of one byte, a `UInt8`: a word of its value, 0 to 255)
 static V heff_strFromByte(V c) {
@@ -2521,19 +2586,21 @@ static uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
   return u;
 }
 
-static V heff_strRuneAt(V a, V i) {
+HEFF_FAST V heff_strRuneAt_lent(V a, V i, int give) {
   int64_t w;
   uint32_t r = heff_str_rune_at((Str *)a, INT_OF(i), &w);
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return MK_INT((int64_t)r);
 }
+static V heff_strRuneAt(V a, V i) { return heff_strRuneAt_lent(a, i, 1); }
 
-static V heff_strRuneWidth(V a, V i) {
+HEFF_FAST V heff_strRuneWidth_lent(V a, V i, int give) {
   int64_t w;
   heff_str_rune_at((Str *)a, INT_OF(i), &w);
-  heff_drop(a);
+  HEFF_GIVEN(give, 0, a);
   return MK_INT(w);
 }
+static V heff_strRuneWidth(V a, V i) { return heff_strRuneWidth_lent(a, i, 1); }
 
 static V heff_strRuneCount(V a) {
   Str *x = (Str *)a;

@@ -47,13 +47,33 @@ balance k v l r =
                     node mk mv (node k v l ml) (node rk rv mr rr)))
   else node k v l r
 
+-- (the height of a node over subtrees `a` and `b` high, if they are
+-- balanced, else 0)
+heightOver : Int -> Int -> Int
+heightOver a b = if a > b + 1 || b > a + 1 then 0 else 1 + max a b
+
+-- (a node over `l` and `r` of height `h`, or, where `h` is 0, rotated by
+-- `balance`.  Where a subtree has changed, by one in height at most,
+-- `nodeOf (heightOver (height l) (height r)) k v l r` is written out
+-- where the node was taken apart (not a function of its own, which is
+-- too big to be inlined): so it is built in the cell of the node it
+-- replaces, if nothing else holds that, and a path changed down the
+-- tree is changed in place)
+nodeOf : {k v : Type} -> Int -> k -> v -> Map k v -> Map k v -> Map k v
+nodeOf 0 k v l r = balance k v l r
+nodeOf h k v l r = Bin h k v l r
+
 -- | The map with `k` bound to `v` (instead of what it was, if it was).
 insert : {k v : Type} -> (k -> k -> Ordering) -> k -> v -> Map k v -> Map k v
-insert cmp k v Tip = singleton k v
-insert cmp k v (Bin h k' v' l r) = case cmp k k' of
-  LT -> balance k' v' (insert cmp k v l) r
-  GT -> balance k' v' l (insert cmp k v r)
-  EQ -> Bin h k v l r
+insert cmp key value Tip = singleton key value
+insert cmp key value (Bin h k' v' l r) = case cmp key k' of
+  LT ->
+    (let l2 : Map k v = insert cmp key value l
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : Map k v = insert cmp key value r
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> Bin h key value l r
 
 lookup : {k v : Type} -> (k -> k -> Ordering) -> k -> Map k v -> Maybe v
 lookup cmp k Tip = Nothing
@@ -84,10 +104,14 @@ glue l r = case findMin r of
 
 -- | The map without `k` (as it was, if `k` was not in it).
 delete : {k v : Type} -> (k -> k -> Ordering) -> k -> Map k v -> Map k v
-delete cmp k Tip = Tip
-delete cmp k (Bin _ k' v' l r) = case cmp k k' of
-  LT -> balance k' v' (delete cmp k l) r
-  GT -> balance k' v' l (delete cmp k r)
+delete cmp key Tip = Tip
+delete cmp key (Bin _ k' v' l r) = case cmp key k' of
+  LT ->
+    (let l2 : Map k v = delete cmp key l
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : Map k v = delete cmp key r
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
   EQ -> glue l r
 
 -- (the pairs of `m`, in order, before `acc`)
@@ -110,6 +134,65 @@ insertAll cmp m ps = List.foldl (\acc p -> insert cmp (fst p) (snd p) acc) m ps
 
 fromList : {k v : Type} -> (k -> k -> Ordering) -> List (Pair k v) -> Map k v
 fromList cmp ps = insertAll cmp Tip ps
+
+-- | The map with `k` bound to `v`, or, where it is bound, to `f v old`
+-- | (Haskell's `insertWith`): a value changed in one walk down the tree,
+-- | where a `lookup` and an `insert` take two.
+-- | >>> toList (insertWith compareString (\new old -> new + old) "a" 1 (fromList compareString [MkPair "a" 2, MkPair "b" 5]))
+-- | Cons (MkPair "a" 3) (Cons (MkPair "b" 5) Nil)
+-- | >>> toList (insertWith compareInt (\new old -> new + old) 7 1 empty)
+-- | Cons (MkPair 7 1) Nil
+insertWith : {k v : Type}
+           -> (k -> k -> Ordering)
+           -> (v -> v -> v)
+           -> k
+           -> v
+           -> Map k v
+           -> Map k v
+insertWith cmp f key value Tip = singleton key value
+insertWith cmp f key value (Bin h k' v' l r) = case cmp key k' of
+  LT ->
+    (let l2 : Map k v = insertWith cmp f key value l
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : Map k v = insertWith cmp f key value r
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> Bin h k' (f value v') l r
+
+-- (where `f` said a key's new value: the tree with it, or without it)
+planted : {k v : Type} -> k -> Maybe v -> Map k v
+planted k Nothing = Tip
+planted k (Just v) = singleton k v
+
+-- (a node of height `h` over `l` and `r`, its key `k` now bound as `f`
+-- said: to its new value, or the node gone)
+replanted : {k v : Type} -> Int -> k -> Maybe v -> Map k v -> Map k v -> Map k v
+replanted h k Nothing l r = glue l r
+replanted h k (Just v) l r = Bin h k v l r
+
+-- | The map with `k` bound as `f` says, given what it is bound to, if it
+-- | is: to `f`'s value, or (`Nothing`) to none (Haskell's `alter`).
+-- | >>> toList (alter compareString (\old -> Just (maybe 1 (\n -> n + 1) old)) "a" (fromList compareString [MkPair "a" 2]))
+-- | Cons (MkPair "a" 3) Nil
+-- | >>> toList (alter compareInt (\old -> Nothing) 1 (fromList compareInt [MkPair 1 "one", MkPair 2 "two"]))
+-- | Cons (MkPair 2 "two") Nil
+-- | >>> toList (alter compareInt (\old -> Just "three") 3 (fromList compareInt [MkPair 1 "one"]))
+-- | Cons (MkPair 1 "one") (Cons (MkPair 3 "three") Nil)
+alter : {k v : Type}
+      -> (k -> k -> Ordering)
+      -> (Maybe v -> Maybe v)
+      -> k
+      -> Map k v
+      -> Map k v
+alter cmp f key Tip = planted key (f Nothing)
+alter cmp f key (Bin h k' v' l r) = case cmp key k' of
+  LT ->
+    (let l2 : Map k v = alter cmp f key l
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : Map k v = alter cmp f key r
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> replanted h k' (f (Just v')) l r
 
 keys : {k v : Type} -> Map k v -> List k
 keys m = List.map (\p -> fst p) (toList m)
