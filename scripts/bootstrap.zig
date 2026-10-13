@@ -36,6 +36,9 @@ const parts = out ++ "/heff.d";
 const kept = out ++ "/heff.o";
 const nativeKept = out ++ "/native.o";
 const seedOf = out ++ "/heff.seed";
+// (zig's own cache, of the parts it builds for this checkout: `zig cc`'s
+// ZIG_LOCAL_CACHE_DIR, begun afresh each run)
+const zigCache = ".heff/zig-cache";
 
 // (for any machine of this kind, not only this one: zig's default is this
 // machine's processor, whose instructions another may not have)
@@ -773,10 +776,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
     const root = Dir.cwd();
+    const here = try root.realPathFileAlloc(io, ".", arena);
     // (the library each stage compiles with: the repository's, wherever
     // the stage is)
     if (init.environ_map.get("HEFF_LIB") == null) {
-        const here = try root.realPathFileAlloc(io, ".", arena);
         try init.environ_map.put("HEFF_LIB", try std.fs.path.join(arena, &.{ here, "lib" }));
     }
     const command = arguments[2];
@@ -785,11 +788,15 @@ pub fn main(init: std.process.Init) !void {
         try Io.File.stderr().writeStreamingAll(io, "heff build: zig env failed (https://ziglang.org/download/)\n");
         return err;
     };
-    // (zig keeps what it makes of each part too, in its cache: the one it
-    // keeps for all, not the build's, .zig-cache/, where zig run here
-    // would keep it, beside build.zig)
+    // (zig keeps what it makes of each part too, in its cache: not the
+    // build's, .zig-cache/, where zig run here would keep it, beside
+    // build.zig, nor the one it keeps for all, which builds in two
+    // checkouts at once would share, and whose tmp/ grows without end
+    // (#87), but this checkout's, begun afresh each run: the objects
+    // worth keeping are kept here, in .heff/out/heff.o/)
     if (init.environ_map.get("ZIG_LOCAL_CACHE_DIR") == null) {
-        if (zon(said.stdout, "global_cache_dir")) |global| try init.environ_map.put("ZIG_LOCAL_CACHE_DIR", global);
+        root.deleteTree(io, zigCache) catch {};
+        try init.environ_map.put("ZIG_LOCAL_CACHE_DIR", try std.fs.path.join(arena, &.{ here, zigCache }));
     }
     var used: std.StringHashMapUnmanaged(void) = .empty;
     const b: Bootstrap = .{
