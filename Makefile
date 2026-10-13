@@ -26,7 +26,7 @@ TARGETS ?=##     native: zig targets, e.g. "x86_64-linux-musl aarch64-macos"
 BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 
 .NOTPARALLEL:
-.PHONY: help build build-seed boot native test test-compiler test-lsp \
+.PHONY: help build build-seed boot native release test test-compiler test-lsp \
   test-backends test-fixpoint test-asan check golden sanitize tsan fmt \
   fmt-check aliases aliases-check bat bat-check vsix install install-all bench clean
 
@@ -54,6 +54,9 @@ boot: ## renew the seed, boot/heff.tar.xz, once heff compiles itself to itself (
 
 native: ## heff for other systems, .heff/out/native/TARGET/ (TARGETS=...)
 	$(ZIG) build native -Dtargets="$(TARGETS)"
+
+release: ## an archive of heff for each platform, and SHA256SUMS, .heff/out/release/
+	$(ZIG) build release
 
 ##@ Testing (on the heff built: make build first; Node.js but test-fixpoint)
 

@@ -62,6 +62,33 @@ language change means the old seed can no longer compile the source.
 native -Dtargets=...`) builds heff for other systems, as a release
 does, into `.heff/out/native/TARGET/`.
 
+`make release` (`zig build release`) makes a release, into
+`.heff/out/release/` anew, by zig alone (no Node.js, no system tar or
+zip): heff built for each platform, as `make native` builds it, and
+packed as `heff-VERSION-PLATFORM.tar.gz` (`.zip` for Windows), the
+version `package.hf`'s, with `SHA256SUMS` of them.
+
+| Platform      | zig target           | Archive                           |
+| ------------- | -------------------- | --------------------------------- |
+| `linux-arm64` | `aarch64-linux-musl` | `heff-VERSION-linux-arm64.tar.gz` |
+| `linux-x64`   | `x86_64-linux-musl`  | `heff-VERSION-linux-x64.tar.gz`   |
+| `macos-arm64` | `aarch64-macos`      | `heff-VERSION-macos-arm64.tar.gz` |
+| `macos-x64`   | `x86_64-macos`       | `heff-VERSION-macos-x64.tar.gz`   |
+| `windows-x64` | `x86_64-windows-gnu` | `heff-VERSION-windows-x64.zip`    |
+
+Linux's are linked statically, by musl.  Each archive is one directory,
+`heff-VERSION-PLATFORM/`, laid out as `make install` lays out the heff
+home, so the heff in it finds its library and its version beside its
+`bin/`: `bin/heff` (`bin/heff.exe`), `lib/` and `package.hf` (what
+`app/heff/build.hf` ships), with `README.md`, `docs/` and `licenses/`.
+The same source, by the same zig, makes the same archives, byte for
+byte: the entries
+sorted by path, of no owner, of time 0 (1980-01-01 in a zip, its
+first) and of mode 755 or 644.  A tag `vX.Y.Z` pushed to GitHub runs
+`.github/workflows/release.yml`, which checks that the tag is the
+version, makes the release and the VS Code extension, tries each
+archive where there is a runner for it, and publishes them.
+
 `make clean` removes what the builds and the tests made under `.heff/`,
 keeping the caches (`vN/`, `bN/`, the parts zig built in `out/heff.o/`
 and `out/native.o/`, and those built under ASan in

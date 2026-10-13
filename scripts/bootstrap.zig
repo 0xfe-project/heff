@@ -18,6 +18,7 @@
 //!   bootstrap ZIG fixpoint         heff compiles itself to the same C
 //!   bootstrap ZIG boot             the seed renewed, once it does
 //!   bootstrap ZIG native TARGET... heff for other systems
+//!   bootstrap ZIG release          the release archives, .heff/out/release/
 //!
 //! (ZIG, the zig that runs the build, builds the C too.)
 
@@ -451,14 +452,302 @@ const Bootstrap = struct {
         for (targets) |target| {
             const directory = b.concat(&.{ out, "/native/", target });
             b.root.createDirPath(b.io, directory) catch |err| b.fail("heff native: {s}: {t}", .{ directory, err });
-            const program = b.concat(&.{ directory, if (std.mem.indexOf(u8, target, "windows") != null) "/heff.exe" else "/heff" });
+            const program = b.concat(&.{ directory, "/", programName(target) });
             const compile = [_][]const u8{ "-target", target, "-O2", "-w" };
             const link = [_][]const u8{ "-target", target, "-O2", "-s", "-w" };
             if (!b.cc("heff native", nativeKept, parts, program, &compile, &link)) b.fail("heff native: {s} failed", .{target});
         }
         b.prune(nativeKept);
     }
+
+    /// The release, in .heff/out/release/ anew: heff built for each of
+    /// the platforms, as `native` builds it, and packed with what it
+    /// ships as heff-VERSION-PLATFORM.tar.gz (.zip for Windows), the
+    /// version package.hf's; and SHA256SUMS, of each archive.
+    fn release(b: *const Bootstrap) void {
+        const version = versionOf(b.read("package.hf") orelse b.fail("heff release: no package.hf", .{})) orelse
+            b.fail("heff release: package.hf says no version (heff = \"X.Y.Z\")", .{});
+        var targets: [platforms.len][]const u8 = undefined;
+        for (platforms, &targets) |platform, *target| target.* = platform.target;
+        b.native(&targets);
+
+        b.root.deleteTree(b.io, releaseDir) catch |err| b.fail("heff release: {s}: {t}", .{ releaseDir, err });
+        b.root.createDirPath(b.io, releaseDir) catch |err| b.fail("heff release: {s}: {t}", .{ releaseDir, err });
+        // (zig's deflate is slow in bootstrap's build, which is not
+        // optimized: the archives are packed at once, a thread each)
+        const start = Io.Timestamp.now(b.io, .awake);
+        var packs: [platforms.len]Pack = undefined;
+        var threads: [platforms.len]?std.Thread = undefined;
+        for (platforms, &packs, &threads) |platform, *pack, *thread| {
+            pack.* = .{ .b = b, .version = version, .platform = platform };
+            thread.* = std.Thread.spawn(.{}, Pack.pack, .{pack}) catch null;
+            if (thread.* == null) pack.pack();
+        }
+        for (threads) |thread| if (thread) |started| started.join();
+        var sums: std.ArrayList(u8) = .empty;
+        for (&packs) |*pack| {
+            defer pack.arena.deinit();
+            sums.appendSlice(b.arena, b.concat(&.{ &pack.digest, "  ", pack.file, "\n" })) catch b.fail("heff release: out of memory", .{});
+            b.say("heff release: {s}/{s}, {d} files, {d} bytes", .{ releaseDir, pack.file, pack.files, pack.size });
+        }
+        const summed = releaseDir ++ "/SHA256SUMS";
+        b.root.writeFile(b.io, .{ .sub_path = summed, .data = sums.items }) catch |err| b.fail("heff release: {s}: {t}", .{ summed, err });
+        b.say("heff release: {s}, the archives packed in {d:.1} s", .{ summed, b.seconds(start) });
+    }
+
+    /// The archive of a platform, packed by a thread of its own, in an
+    /// arena of its own: its file's name, how many files it has, its
+    /// size and its SHA-256.
+    const Pack = struct {
+        b: *const Bootstrap,
+        version: []const u8,
+        platform: Platform,
+        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        file: []const u8 = "",
+        files: usize = 0,
+        size: usize = 0,
+        digest: [64]u8 = undefined,
+
+        fn pack(p: *Pack) void {
+            var each = p.b.*;
+            each.arena = p.arena.allocator();
+            const name = each.concat(&.{ "heff-", p.version, "-", p.platform.name });
+            const windows = isWindows(p.platform.target);
+            const contents = each.contentsFor(p.platform.target);
+            const archive = if (windows) each.zip(name, contents) else each.gzip(each.tarball(name, contents));
+            p.file = each.concat(&.{ name, if (windows) ".zip" else ".tar.gz" });
+            const path = each.concat(&.{ releaseDir, "/", p.file });
+            each.root.writeFile(each.io, .{ .sub_path = path, .data = archive }) catch |err| each.fail("heff release: {s}: {t}", .{ path, err });
+            for (contents) |entry| p.files += @intFromBool(!entry.isDirectory());
+            p.size = archive.len;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(archive, &digest, .{});
+            p.digest = std.fmt.bytesToHex(digest, .lower);
+        }
+    };
+
+    /// What an archive for `target` holds, as `heff install` lays it out
+    /// in the heff home: bin/heff, and what it ships (app/heff/build.hf's
+    /// `ships`), with the README, the docs and the licenses; each
+    /// directory with a "/" after it, sorted by path.
+    fn contentsFor(b: *const Bootstrap, target: []const u8) []const Entry {
+        var entries: std.ArrayList(Entry) = .empty;
+        const program = b.concat(&.{ out, "/native/", target, "/", programName(target) });
+        b.add(&entries, .{ .path = "bin/", .bytes = "", .mode = 0o755 });
+        b.add(&entries, .{
+            .path = b.concat(&.{ "bin/", programName(target) }),
+            .bytes = b.read(program) orelse b.fail("heff release: no {s}", .{program}),
+            .mode = 0o755,
+        });
+        for (shipped) |path| {
+            if (b.read(path)) |bytes| {
+                b.add(&entries, .{ .path = path, .bytes = bytes, .mode = 0o644 });
+                continue;
+            }
+            var directory = b.root.openDir(b.io, path, .{ .iterate = true }) catch b.fail("heff release: no {s}", .{path});
+            defer directory.close(b.io);
+            b.add(&entries, .{ .path = b.concat(&.{ path, "/" }), .bytes = "", .mode = 0o755 });
+            var walker = directory.walk(b.arena) catch b.fail("heff release: out of memory", .{});
+            defer walker.deinit();
+            while (walker.next(b.io) catch |err| b.fail("heff release: {s}: {t}", .{ path, err })) |entry| {
+                const inside = b.arena.dupe(u8, entry.path) catch b.fail("heff release: out of memory", .{});
+                std.mem.replaceScalar(u8, inside, '\\', '/');
+                if (hidden(inside)) continue;
+                const whole = b.concat(&.{ path, "/", inside });
+                switch (entry.kind) {
+                    .directory => b.add(&entries, .{ .path = b.concat(&.{ whole, "/" }), .bytes = "", .mode = 0o755 }),
+                    .file => b.add(&entries, .{
+                        .path = whole,
+                        .bytes = b.read(whole) orelse b.fail("heff release: {s} could not be read", .{whole}),
+                        .mode = 0o644,
+                    }),
+                    else => {},
+                }
+            }
+        }
+        std.mem.sort(Entry, entries.items, {}, Entry.lessThan);
+        return entries.items;
+    }
+
+    fn add(b: *const Bootstrap, entries: *std.ArrayList(Entry), entry: Entry) void {
+        entries.append(b.arena, entry) catch b.fail("heff release: out of memory", .{});
+    }
+
+    /// `entries` as a tar, each in the directory `name`: of no owner
+    /// and of time 0, so that the same files make the same archive.
+    fn tarball(b: *const Bootstrap, name: []const u8, entries: []const Entry) []const u8 {
+        var tarred: Io.Writer.Allocating = .init(b.arena);
+        var writer: std.tar.Writer = .{ .underlying_writer = &tarred.writer };
+        writer.writeDir(b.concat(&.{ name, "/" }), .{ .mode = 0o755, .mtime = 0 }) catch |err| b.fail("heff release: {t}", .{err});
+        for (entries) |entry| {
+            const path = b.concat(&.{ name, "/", entry.path });
+            const options: std.tar.Writer.Options = .{ .mode = entry.mode, .mtime = 0 };
+            const written = if (entry.isDirectory())
+                writer.writeDir(path, options)
+            else
+                writer.writeFileBytes(path, entry.bytes, options);
+            written catch |err| b.fail("heff release: {s}: {t}", .{ entry.path, err });
+        }
+        writer.finishPedantically() catch |err| b.fail("heff release: {t}", .{err});
+        return tarred.written();
+    }
+
+    /// `bytes` compressed by deflate in `container`: gzip's of no name
+    /// and of time 0, or raw, as a zip's.
+    fn deflate(b: *const Bootstrap, bytes: []const u8, container: std.compress.flate.Container) []const u8 {
+        var compressed = Io.Writer.Allocating.initCapacity(b.arena, bytes.len / 2 + 64) catch b.fail("heff release: out of memory", .{});
+        const window = b.arena.alloc(u8, std.compress.flate.max_window_len) catch b.fail("heff release: out of memory", .{});
+        var compress = std.compress.flate.Compress.init(&compressed.writer, window, container, .default) catch |err|
+            b.fail("heff release: deflate: {t}", .{err});
+        compress.writer.writeAll(bytes) catch |err| b.fail("heff release: deflate: {t}", .{err});
+        compress.finish() catch |err| b.fail("heff release: deflate: {t}", .{err});
+        return compressed.written();
+    }
+
+    fn gzip(b: *const Bootstrap, bytes: []const u8) []const u8 {
+        return b.deflate(bytes, .gzip);
+    }
+
+    /// `entries` as a zip, each in the directory `name`: each file
+    /// deflated, of time 1980-01-01 00:00 (a zip's first) and of its
+    /// Unix mode, so that the same files make the same archive.
+    fn zip(b: *const Bootstrap, name: []const u8, entries: []const Entry) []const u8 {
+        var archive: Io.Writer.Allocating = .init(b.arena);
+        var central: Io.Writer.Allocating = .init(b.arena);
+        const top: Entry = .{ .path = "", .bytes = "", .mode = 0o755 };
+        b.zipEntry(&archive, &central, name, top) catch |err| b.fail("heff release: {t}", .{err});
+        for (entries) |entry| b.zipEntry(&archive, &central, name, entry) catch |err|
+            b.fail("heff release: {s}: {t}", .{ entry.path, err });
+        const offset: u32 = @intCast(archive.written().len);
+        const size: u32 = @intCast(central.written().len);
+        const count: u16 = @intCast(entries.len + 1);
+        zipEnd(&archive.writer, central.written(), count, size, offset) catch b.fail("heff release: out of memory", .{});
+        return archive.written();
+    }
+
+    /// An entry of a zip: its local header and its data to `archive`,
+    /// its header in the central directory to `central`.
+    fn zipEntry(b: *const Bootstrap, archive: *Io.Writer.Allocating, central: *Io.Writer.Allocating, name: []const u8, entry: Entry) Io.Writer.Error!void {
+        const path = b.concat(&.{ name, "/", entry.path });
+        const directory = entry.isDirectory();
+        const method: u16 = if (directory) 0 else 8;
+        const data = if (directory) "" else b.deflate(entry.bytes, .raw);
+        const crc = std.hash.Crc32.hash(entry.bytes);
+        const offset: u32 = @intCast(archive.written().len);
+        // (Unix's file type and mode, above MS-DOS's attributes)
+        const unix: u32 = (if (directory) @as(u32, 0o040000) else 0o100000) | entry.mode;
+        const attributes: u32 = (unix << 16) | (if (directory) @as(u32, 0x10) else 0);
+        const date: u16 = (0 << 9) | (1 << 5) | 1;
+
+        const l = &archive.writer;
+        try l.writeAll(&std.zip.local_file_header_sig);
+        try l.writeInt(u16, 20, .little); // version needed: 2.0
+        try l.writeInt(u16, 0, .little); // flags
+        try l.writeInt(u16, method, .little);
+        try l.writeInt(u16, 0, .little); // time
+        try l.writeInt(u16, date, .little);
+        try l.writeInt(u32, crc, .little);
+        try l.writeInt(u32, @intCast(data.len), .little);
+        try l.writeInt(u32, @intCast(entry.bytes.len), .little);
+        try l.writeInt(u16, @intCast(path.len), .little);
+        try l.writeInt(u16, 0, .little); // no extra field
+        try l.writeAll(path);
+        try l.writeAll(data);
+
+        const c = &central.writer;
+        try c.writeAll(&std.zip.central_file_header_sig);
+        try c.writeInt(u16, (3 << 8) | 20, .little); // made by Unix, 2.0
+        try c.writeInt(u16, 20, .little);
+        try c.writeInt(u16, 0, .little);
+        try c.writeInt(u16, method, .little);
+        try c.writeInt(u16, 0, .little);
+        try c.writeInt(u16, date, .little);
+        try c.writeInt(u32, crc, .little);
+        try c.writeInt(u32, @intCast(data.len), .little);
+        try c.writeInt(u32, @intCast(entry.bytes.len), .little);
+        try c.writeInt(u16, @intCast(path.len), .little);
+        try c.writeInt(u16, 0, .little); // no extra field
+        try c.writeInt(u16, 0, .little); // no comment
+        try c.writeInt(u16, 0, .little); // disk
+        try c.writeInt(u16, 0, .little); // internal attributes
+        try c.writeInt(u32, attributes, .little);
+        try c.writeInt(u32, offset, .little);
+        try c.writeAll(path);
+    }
 };
+
+/// The platforms a release is for: each by its name in the archive's,
+/// and the zig target heff is built for (Linux's linked statically, by
+/// musl), sorted by name.
+const Platform = struct { name: []const u8, target: []const u8 };
+const platforms = [_]Platform{
+    .{ .name = "linux-arm64", .target = "aarch64-linux-musl" },
+    .{ .name = "linux-x64", .target = "x86_64-linux-musl" },
+    .{ .name = "macos-arm64", .target = "aarch64-macos" },
+    .{ .name = "macos-x64", .target = "x86_64-macos" },
+    .{ .name = "windows-x64", .target = "x86_64-windows-gnu" },
+};
+const releaseDir = out ++ "/release";
+
+/// What an archive has beside bin/: what heff ships, as `heff install`
+/// puts it in the heff home (app/heff/build.hf's `ships`: lib/,
+/// package.hf), and the README, the docs and the licenses.
+const shipped = [_][]const u8{ "README.md", "docs", "lib", "licenses", "package.hf" };
+
+/// A file or a directory (its path ending in "/", or "", the archive's
+/// own) of an archive.
+const Entry = struct {
+    path: []const u8,
+    bytes: []const u8,
+    mode: u32,
+
+    fn isDirectory(entry: Entry) bool {
+        return entry.path.len == 0 or std.mem.endsWith(u8, entry.path, "/");
+    }
+
+    fn lessThan(_: void, x: Entry, y: Entry) bool {
+        return std.mem.lessThan(u8, x.path, y.path);
+    }
+};
+
+/// A zip's central directory, and its end record: how many entries,
+/// how long the central directory is and where it starts.
+fn zipEnd(w: *Io.Writer, central: []const u8, count: u16, size: u32, offset: u32) Io.Writer.Error!void {
+    try w.writeAll(central);
+    try w.writeAll(&std.zip.end_record_sig);
+    try w.writeInt(u16, 0, .little); // this disk
+    try w.writeInt(u16, 0, .little); // the central directory's disk
+    try w.writeInt(u16, count, .little);
+    try w.writeInt(u16, count, .little);
+    try w.writeInt(u32, size, .little);
+    try w.writeInt(u32, offset, .little);
+    try w.writeInt(u16, 0, .little); // no comment
+}
+
+fn isWindows(target: []const u8) bool {
+    return std.mem.indexOf(u8, target, "windows") != null;
+}
+
+/// The name of heff built for `target`.
+fn programName(target: []const u8) []const u8 {
+    return if (isWindows(target)) "heff.exe" else "heff";
+}
+
+/// A path any part of which is hidden (.git, .heff, .DS_Store).
+fn hidden(path: []const u8) bool {
+    var pieces = std.mem.splitScalar(u8, path, '/');
+    while (pieces.next()) |part| if (part.len > 0 and part[0] == '.') return true;
+    return false;
+}
+
+/// The version package.hf says: `heff = "X.Y.Z"`.
+fn versionOf(text: []const u8) ?[]const u8 {
+    const key = "heff = \"";
+    const at = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return rest[0..end];
+}
 
 /// What `zig env` says of `field`: `.field = "VALUE"`.
 fn zon(said: []const u8, field: []const u8) ?[]const u8 {
@@ -480,7 +769,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arguments = try init.minimal.args.toSlice(arena);
     if (arguments.len < 3) {
-        try Io.File.stderr().writeStreamingAll(io, "bootstrap ZIG (build | seed | fixpoint | boot | native TARGET...)\n");
+        try Io.File.stderr().writeStreamingAll(io, "bootstrap ZIG (build | seed | fixpoint | boot | native TARGET... | release)\n");
         std.process.exit(2);
     }
     const root = Dir.cwd();
@@ -525,6 +814,9 @@ pub fn main(init: std.process.Init) !void {
         if (!b.fixpoint()) std.process.exit(1);
     } else if (std.mem.eql(u8, command, "boot")) {
         b.boot();
+    } else if (std.mem.eql(u8, command, "release")) {
+        if (b.modified(parts) == null) b.fail("heff release: no {s} (make build first)", .{parts});
+        b.release();
     } else if (std.mem.eql(u8, command, "native")) {
         if (b.modified(parts) == null) b.fail("heff native: no {s} (make build first)", .{parts});
         b.native(arguments[3..]);
