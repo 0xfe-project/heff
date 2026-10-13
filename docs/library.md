@@ -159,7 +159,7 @@ a kernel loaded from its code and its entry point (`load`), and run
 over a grid of workgroups with buffers bound, the first at
 `@binding(0)` (`dispatch`), each answered when the GPU is done, an
 `Either GpuError a`.  Its provider is WebGPU's, a page's, so a kernel
-is WGSL.
+is WGSL; examples/vecadd adds two vectors of Float32s by one.
 
 A program imports only its own half: a C program that imports a module
 of `lib/browser/` is refused at the import (E0351), and so is a page's

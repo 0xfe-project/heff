@@ -1,0 +1,166 @@
+-- Vector addition on the GPU, in the page's `#vecadd`: two vectors of
+-- floats written to buffers as Float32s, added by a WGSL kernel, the sum
+-- read back and checked against the one computed here -- `ok`, or the
+-- first index where they differ.  Where the browser has no WebGPU, the
+-- page says so.  `node examples/build.mjs` builds it to
+-- .heff/examples/vecadd/: open its index.html there, in a browser with
+-- WebGPU.
+
+import co
+import browser.dom
+import bytes as Bytes
+import gpu as Gpu
+
+world : HFunctor
+world = dom <+> Gpu.gpu
+
+-- the kernel: each element of `c` the sum of `a`'s and `b`'s, 64 to a
+-- workgroup
+kernel : String
+kernel =
+  joinWith
+    "\n"
+    [ "@group(0) @binding(0) var<storage, read> a : array<f32>;"
+    , "@group(0) @binding(1) var<storage, read> b : array<f32>;"
+    , "@group(0) @binding(2) var<storage, read_write> c : array<f32>;"
+    , "@compute @workgroup_size(64)"
+    , "fn add(@builtin(global_invocation_id) id : vec3<u32>) {"
+    , "  let i = id.x;"
+    , "  if (i < arrayLength(&c)) { c[i] = a[i] + b[i]; }"
+    , "}"
+    ]
+
+-- how many elements: no multiple of 64, so that the last workgroup
+-- has some past the end
+size : Int
+size = 1000
+
+xs : List Float64
+xs = List.map toFloat (List.range 0 (size - 1))
+
+ys : List Float64
+ys = List.map (\i -> toFloat (2 * i) + 0.25) (List.range 0 (size - 1))
+
+-- (each exactly a Float32, so the GPU's sum is the same)
+want : List Float64
+want = List.zipWith (\x y -> x + y) xs ys
+
+-- floats as the GPU has them: Float32s, little-endian, one after another
+packFloats : List Float64 -> Bytes
+packFloats fs = Bytes.concat (List.map (\x -> b[x::float-32-little]) fs)
+
+unpackFloats : Bytes -> List Float64
+unpackFloats b[x::float-32-little, rest::binary] = Cons x (unpackFloats rest)
+unpackFloats _ = Nil
+
+-- (the next step, where the one before did not fail)
+next : {e : HFunctor}
+     -> {a c : Type}
+     -> Either Gpu.GpuError a
+     -> (a -> Co e (Either Gpu.GpuError c))
+     -> Co e (Either Gpu.GpuError c)
+next (Left err) _ = pure (Left err)
+next (Right x) f = f x
+
+andThen : {e : HFunctor}
+        -> {a c : Type}
+        -> Co e (Either Gpu.GpuError a)
+        -> (a -> Co e (Either Gpu.GpuError c))
+        -> Co e (Either Gpu.GpuError c)
+andThen m f = bind m (\r -> next r f)
+
+-- (a buffer of the floats, on the device)
+upload : {e : HFunctor}
+       -> {{card : Gpu.gpu <: e}}
+       -> Gpu.Device
+       -> List Float64
+       -> Co e (Either Gpu.GpuError Gpu.Buffer)
+upload d fs =
+  andThen
+    (Gpu.newBuffer d (4 * List.length fs))
+    (\buffer ->
+       andThen
+         (Gpu.writeBuffer d buffer 0 (packFloats fs))
+         (\_ -> pure (Right buffer)))
+
+freeBuffers : {e : HFunctor}
+            -> {{card : Gpu.gpu <: e}}
+            -> List Gpu.Buffer
+            -> Co e Unit
+freeBuffers Nil = pure MkUnit
+freeBuffers (Cons buffer rest) = do
+  Gpu.freeBuffer buffer
+  freeBuffers rest
+
+-- (the sums read, the buffers let go of)
+finish : {e : HFunctor}
+       -> {{card : Gpu.gpu <: e}}
+       -> List Gpu.Buffer
+       -> Bytes
+       -> Co e (Either Gpu.GpuError (List Float64))
+finish buffers out = do
+  freeBuffers buffers
+  pure (Right (unpackFloats out))
+
+-- (the sums, read back once the kernel is done)
+readSums : {e : HFunctor}
+         -> {{card : Gpu.gpu <: e}}
+         -> Gpu.Device
+         -> Gpu.Pipeline
+         -> Gpu.Buffer
+         -> Gpu.Buffer
+         -> Gpu.Buffer
+         -> Co e (Either Gpu.GpuError (List Float64))
+readSums d pipeline a b c =
+  andThen
+    (Gpu.dispatch d pipeline [a, b, c] ((size + 63) / 64) 1 1)
+    (\_ -> andThen (Gpu.readBuffer d c 0 (4 * size)) (finish [a, b, c]))
+
+-- the sums, computed on the device
+sums : {e : HFunctor}
+     -> {{card : Gpu.gpu <: e}}
+     -> Gpu.Device
+     -> Co e (Either Gpu.GpuError (List Float64))
+sums d =
+  andThen
+    (upload d xs)
+    (\a ->
+       andThen
+         (upload d ys)
+         (\b ->
+            andThen
+              (Gpu.newBuffer d (4 * size))
+              (\c ->
+                 andThen
+                   (Gpu.load d kernel "add")
+                   (\pipeline -> readSums d pipeline a b c))))
+
+-- (the first index, from `i`, where the two differ)
+firstMismatch : Int -> List Float64 -> List Float64 -> Maybe Int
+firstMismatch i (Cons x more) (Cons y others) =
+  if x == y then firstMismatch (i + 1) more others else Just i
+firstMismatch _ Nil Nil = Nothing
+firstMismatch i _ _ = Just i
+
+verdict : Maybe Int -> String
+verdict Nothing = "ok"
+verdict (Just i) = "mismatch at " ^ show i
+
+verdictOf : Either Gpu.GpuError (List Float64) -> String
+verdictOf (Left err) = Gpu.showError err
+verdictOf (Right got) = verdict (firstMismatch 0 got want)
+
+program : {e : HFunctor}
+        -> {{page : dom <: e}}
+        -> {{card : Gpu.gpu <: e}}
+        -> Co e Unit
+program = do
+  place <- select "#vecadd"
+  found place (\r -> do
+    label <- textIn r "p" "adding"
+    result <- andThen Gpu.open sums
+    text label (verdictOf result))
+
+-- where the world is: each sub-effect's evidence, given
+vecadd : Co world Unit
+vecadd = program (page := inl dom Gpu.gpu) (card := inr dom Gpu.gpu)

@@ -159,6 +159,71 @@ const until = async (what, ok, ms = 20000) => {
   }
   return true;
 };
+// A GPU (lib/gpu.provider.js, WebGPU's) on the pretend page: where it
+// has no `navigator.gpu`, the page says so; given a pretend device, the
+// provider's wiring -- buffers made and written, bound in order, the
+// kernel dispatched, the sum copied to a buffer mapped and read back,
+// the buffers let go of.  The device runs no WGSL: its kernel adds the
+// first two buffers bound into the third, as Float32s.  (A real GPU is
+// checked by hand, in a browser with WebGPU.)
+const vecadd = await run("examples/vecadd/vecadd.hf", "vecadd", withBox("vecadd"));
+if (vecadd) check("vecadd, no WebGPU", vecadd.children[0].children[0].text, "gpu: WebGPU is not here");
+// (a device of plain objects: a buffer its bytes, a command its steps,
+// done when submitted)
+const pretendGpu = () => {
+  const made = [], said = [];
+  class Buffer {
+    constructor(size, usage) { this.bytes = new Uint8Array(size); this.usage = usage; this.mapped = false; made.push(this); }
+    destroy() { this.destroyed = true; }
+    mapAsync(mode) { return new Promise((ok) => timers.push(() => { this.mapped = mode === 1; ok(); })); }
+    getMappedRange() { if (!this.mapped) throw new Error("not mapped"); return this.bytes.buffer; }
+    unmap() { this.mapped = false; }
+  }
+  const floats = (b) => new Float32Array(b.bytes.buffer, 0, b.bytes.length / 4);
+  const device = {
+    pushErrorScope() {}, popErrorScope: () => Promise.resolve(null),
+    queue: {
+      writeBuffer: (b, at, data) => b.bytes.set(data, at),
+      submit: (commands) => { for (const c of commands) c(); },
+      onSubmittedWorkDone: () => Promise.resolve(),
+    },
+    createBuffer: ({ size, usage }) => new Buffer(size, usage),
+    createShaderModule: ({ code }) => ({ code, getCompilationInfo: () => Promise.resolve({ messages: [] }) }),
+    createComputePipelineAsync: ({ compute }) => Promise.resolve({ entry: compute.entryPoint, getBindGroupLayout: (i) => ({ group: i }) }),
+    createBindGroup: ({ layout, entries }) => ({ layout, buffers: entries.map((e, i) => e.binding === i ? e.resource.buffer : null) }),
+    createCommandEncoder: () => {
+      const steps = [];
+      return {
+        copyBufferToBuffer: (from, at, to, to0, n) => steps.push(() => to.bytes.set(from.bytes.subarray(at, at + n), to0)),
+        beginComputePass: () => {
+          let pipeline = null, group = null;
+          return {
+            setPipeline: (p) => { pipeline = p; }, setBindGroup: (i, g) => { if (i === 0) group = g; },
+            dispatchWorkgroups: (x, y, z) => steps.push(() => {
+              said.push(`${pipeline.entry} ${x} ${y} ${z}`);
+              const [a, b, c] = group.buffers.map(floats);
+              for (let i = 0; i < c.length; i++) c[i] = a[i] + b[i];
+            }),
+            end() {},
+          };
+        },
+        finish: () => () => { for (const s of steps) s(); },
+      };
+    },
+  };
+  return { made, said, gpu: { requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }) } };
+};
+if (vecadd) {
+  const pretend = pretendGpu(), page = new Node("body");
+  withBox("vecadd")(page);
+  if (load(pageWindow(page, { navigator: { gpu: pretend.gpu } }), join(work, "vecadd.js"))) {
+    const label = () => page.children[0].children[0].text;
+    await until("vecadd, on a pretend GPU", () => { tick(); return label() !== "adding"; });
+    check("vecadd, on a pretend GPU", label(), "ok");
+    check("its dispatch: the entry point, the workgroups", pretend.said.join(), "add 16 1 1");
+    check("its buffers and the staging one, let go of", pretend.made.map((b) => !!b.destroyed).join(), "true,true,true,true");
+  }
+}
 const strayRejections = [];
 process.on("unhandledRejection", (e) => strayRejections.push(String(e && e.stack || e)));
 // (its API's test first: the calls through the wire, with no network)
@@ -230,5 +295,5 @@ else {
   done();
   if (strayRejections.length) { failed++; console.log(`FAIL the notes' page: ${strayRejections.join("\n")}`); }
 }
-console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, texts, names and greet run, and counter and clock on one page; the notes' page and server, each call over the wire"}`);
+console.log(`apps: ${failed ? "FAILED" : "counter, clock, finder, aliased, slept, painted, texts, names and greet run, and counter and clock on one page; vecadd with no WebGPU and on a pretend GPU; the notes' page and server, each call over the wire"}`);
 process.exit(failed ? 1 : 0);
