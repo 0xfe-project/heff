@@ -177,6 +177,45 @@ isFSet (EFSet x eq e) = True
 isFSet (EFDefault d eq e) = strEq eq.text "="
 isFSet e = False
 
+-- Line breaks as written.  A bracketed group, an application, a chain
+-- of operators, `if`, `let` written over several lines stays broken,
+-- even if it would fit on one; written on one line, it is put on one if
+-- it fits (as ormolu and elm-format do).  What is laid out broken is
+-- written broken, so a file formatted again stays as it is.
+
+-- (a line break in `s` from `a` to before `b`)
+newlineIn : String -> Int -> Int -> Bool
+newlineIn s a b =
+  if a >= b then False
+  else if byteAt s a == 10 then True
+  else newlineIn s (a + 1) b
+
+-- | the brackets `o` and `c` were written on lines apart
+linesApart : Tokens.Env -> T -> T -> Bool
+linesApart env o c = newlineIn env.src o.end c.start
+
+-- | `d`, or a hard line break if the group was written broken there: one
+-- | no group around it can flatten, so the group breaks at each of its
+-- | lines
+breakIf : Bool -> Doc -> Doc
+breakIf True d = hardline
+breakIf False d = d
+
+-- | `e` was written at the start of a line
+startsLine : CST.E -> Bool
+startsLine e = (CST.firstE e).first
+
+-- | a chain was written broken at the operator: before it, or after it
+brokenAt : CST.E -> Bool
+brokenAt (OpRhs op e) = op.first || startsLine e
+brokenAt e = False
+
+-- | the arguments, each after a line break, a hard one where an argument
+-- | was written at the start of a line
+argLines : (CST.E -> Doc) -> List CST.E -> Doc
+argLines one args =
+  foldDocs (List.map (\a -> breakIf (startsLine a) line <> one a) args)
+
 -- | `a -> b -> c` (or `~`, `*`) as its operands
 data Chain = MkChain CST.E (List CST.E)
 
@@ -333,7 +372,7 @@ lay =
                       (\comma e -> linebreak <> tok env comma <+> lay.pE env e)
                       commas
                       more)
-                 <> linebreak
+                 <> breakIf (linesApart env o c) linebreak
                  <> tok env c)))
       InstB o o2 d c1 c ->
         tok env o <> tok env o2 <> lay.pE env d <> tok env c1 <> tok env c
@@ -351,7 +390,7 @@ lay =
                          <> tok env comma <+> nest 4 (lay.rhsField env f))
                       commas
                       more)
-                 <> line
+                 <> breakIf (linesApart env o c) line
                  <> tok env c)))
       -- (`{ r | x = v, y = w }`, or broken: `|` under the brace, the
       -- settings after it a line each)
@@ -371,7 +410,7 @@ lay =
                          <> tok env comma <+> nest 4 (lay.rhsField env f))
                       commas
                       more)
-                 <> line
+                 <> breakIf (linesApart env o c) line
                  <> tok env c)))
       EUSet x eq e -> lay.pE env x <+> tok env eq <> lay.rhsOf env e
       EFSet x eq e -> tok env x <+> tok env eq <> lay.rhsOf env e
@@ -386,7 +425,9 @@ lay =
                 (tok env o <+> lay.pE env a1
                  <> foldDocs
                    (List.zipWith
-                      (\bar a -> line <> tok env bar <+> lay.pE env a)
+                      (\bar a ->
+                         breakIf (linesApart env o c) line
+                         <> tok env bar <+> lay.pE env a)
                       bars
                       more)
                  <+> tok env c)))
@@ -401,7 +442,9 @@ lay =
            group
              (lay.chainOperand env rest first
               <> foldDocs
-                (List.map (\r -> line <> lay.opRhsDoc env rest r) rest)))
+                (List.map
+                   (\r -> breakIf (brokenAt r) line <> lay.opRhsDoc env rest r)
+                   rest)))
       Ops a rest -> lay.opsChainDoc env a rest
       OpRhs op e -> tok env op <+> lay.pE env e
       Ann e cc ty ->
@@ -440,7 +483,7 @@ lay =
         <> lay.rhsOf env e
   , letLink = \env kw p ann eq e i b ->
         nest 2 (lay.letHead env kw p ann eq e)
-        <> line
+        <> breakIf (i.first || startsLine b) line
         <> tok env i
         <+> (case b of
              ELet kw2 p2 ann2 eq2 e2 (Just (MkPair i2 b2)) ->
@@ -451,11 +494,18 @@ lay =
   , ifLink = \env kw c th a ->
         group
           (tok env kw <+> lay.pE env c
-           <> nest 2 (line <> tok env th <+> nest 2 (lay.pE env a)))
+           <> nest
+             2
+             (breakIf (th.first || startsLine a) line
+              <> tok env th <+> nest 2 (lay.pE env a)))
   , elseOf = \env el b -> case b of
       If kw c th a el2 b2 ->
-        line <> tok env el <+> lay.ifLink env kw c th a <> lay.elseOf env el2 b2
-      _ -> line <> tok env el <+> nest 2 (lay.pE env b)
+        breakIf (el.first || startsLine b) line
+        <> tok env el <+> lay.ifLink env kw c th a
+        <> lay.elseOf env el2 b2
+      _ ->
+        breakIf (el.first || startsLine b) line
+        <> tok env el <+> nest 2 (lay.pE env b)
   -- (a block last, `f x (\y -> do`, stays on the line, and its items are
   -- indented from the line, not from the parenthesis)
   , appDoc = \env h args -> case unsnocE args of
@@ -470,7 +520,7 @@ lay =
                     (lay.pE env h
                      <> nest
                        2
-                       (foldDocs (List.map (\a -> line <> lay.pE env a) init2)))
+                       (argLines (lay.pE env) init2))
                   <+> tok env o
                   <> lay.pE env e
                   <> tok env c
@@ -478,20 +528,20 @@ lay =
                   (lay.pE env h
                    <> nest
                      2
-                     (foldDocs (List.map (\a -> line <> lay.pE env a) args)))
+                     (argLines (lay.pE env) args))
             _ ->
               if hangs lastA
                 then group
                     (lay.pE env h
                      <> nest
                        2
-                       (foldDocs (List.map (\a -> line <> lay.pE env a) init2)))
+                       (argLines (lay.pE env) init2))
                   <+> lay.pE env lastA
               else group
                   (lay.pE env h
                    <> nest
                      2
-                     (foldDocs (List.map (\a -> line <> lay.pE env a) args)))))
+                     (argLines (lay.pE env) args))))
   -- (`{x :: A} -> B`: an implicit binder, written close)
   , chainOperand = \env rest e -> case e of
       Braces o fs commas c ->
@@ -524,12 +574,18 @@ lay =
         if List.all (isSameIn env.fix m) rest
           then group
               (lay.pE env first
-               <> foldDocs (List.map (\r -> line <> lay.opsRhsDoc env r) rest))
+               <> foldDocs
+                 (List.map
+                    (\r -> breakIf (brokenAt r) line <> lay.opsRhsDoc env r)
+                    rest))
         else group (lay.opsCut env m first Nil rest)
       Nothing ->
         group
           (lay.pE env first
-           <> foldDocs (List.map (\r -> line <> lay.opsRhsDoc env r) rest))
+           <> foldDocs
+             (List.map
+                (\r -> breakIf (brokenAt r) line <> lay.opsRhsDoc env r)
+                rest))
   , opsCut = \env m f acc rs -> case rs of
       Nil -> lay.opsChainDoc env f (List.reverse acc)
       r :: rest2 ->
@@ -537,7 +593,7 @@ lay =
          OpRhs op e ->
            if sameAs env.fix m op.text
              then lay.opsChainDoc env f (List.reverse acc)
-               <> line
+               <> breakIf (brokenAt r) line
                <> tok env op <+> lay.opsCut env m e Nil rest2
            else lay.opsCut env m f (r :: acc) rest2
          _ -> lay.opsCut env m f (r :: acc) rest2)

@@ -64,6 +64,21 @@ with the equations of its name after it, or any other declaration.
 What is around it is laid out.  Anywhere else, the line is a comment
 like any other.
 
+Where a line breaks is the writer's to choose, as with ormolu and
+elm-format: a record, a record type or update, a list, a tuple or a
+`data { .. }` written over several lines stays one item a line, commas
+first, even if it would fit on one; an application, a chain of
+operators (a signature's arrows among them), `if`'s `then` and `else`,
+and `let`'s `in` written broken stay broken.  Written on one line,
+each is put on one if it fits, and broken if it does not.
+
+```haskell
+type ElabCtx =
+  { type_context : List VType
+  , env : List Value
+  }
+```
+
 ```haskell
 -- | the corners: x, y, then r, g, b
 -- fmt: skip

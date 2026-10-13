@@ -597,6 +597,141 @@ formats("`instance`: kept before the signature, the equations after it", [
   "",
 ].join("\n"));
 
+// Line breaks as written (#75): a construct written over several lines
+// stays broken though it would fit; written on one line, it stays on one.
+const asWritten = (what, broken, flat) => {
+  formats(what + ", written broken, stays broken", broken, broken);
+  formats(what + ", written on one line, stays on one", flat, flat);
+};
+asWritten("a record type", [
+  "type ElabCtx =",
+  "  { type_context : List VType",
+  "  , env : List Value",
+  "  , metas : List Value",
+  "  }",
+  "",
+].join("\n"), "type ElabCtx = { type_context : List VType, env : List Value }\n");
+asWritten("a record", [
+  "r : R",
+  "r =",
+  "  { a = 1",
+  "  , b = 2",
+  "  }",
+  "",
+].join("\n"), "r : R\nr = { a = 1, b = 2 }\n");
+formats("a record broken anywhere breaks at each comma", [
+  "r : R",
+  "r = { a = 1,",
+  "      b = 2 }",
+  "",
+].join("\n"), [
+  "r : R",
+  "r =",
+  "  { a = 1",
+  "  , b = 2",
+  "  }",
+  "",
+].join("\n"));
+asWritten("a record update", [
+  "u : R -> R",
+  "u s =",
+  "  { s",
+  "  | a = 1",
+  "  , b = 2",
+  "  }",
+  "",
+].join("\n"), "u : R -> R\nu s = { s | a = 1, b = 2 }\n");
+asWritten("a list", [
+  "xs : List Int",
+  "xs =",
+  "  [ 1",
+  "  , 2",
+  "  , 3",
+  "  ]",
+  "",
+].join("\n"), "xs : List Int\nxs = [1, 2, 3]\n");
+asWritten("a tuple", [
+  "p : Pair Int Int",
+  "p =",
+  "  ( 1",
+  "  , 2",
+  "  )",
+  "",
+].join("\n"), "p : Pair Int Int\np = (1, 2)\n");
+asWritten("an anonymous sum", [
+  "T : Type",
+  "T =",
+  "  data { A Int",
+  "       | B }",
+  "",
+].join("\n"), "T : Type\nT = data { A Int | B }\n");
+asWritten("an application", [
+  "x : Int",
+  "x =",
+  "  f",
+  "    1",
+  "    2",
+  "",
+].join("\n"), "x : Int\nx = f 1 2\n");
+asWritten("if, then, else", [
+  "f : Bool -> Int",
+  "f b =",
+  "  if b",
+  "    then 1",
+  "  else 2",
+  "",
+].join("\n"), "f : Bool -> Int\nf b = if b then 1 else 2\n");
+asWritten("else, on a line of its own", [
+  "f : Bool -> Int",
+  "f b =",
+  "  if b then 1",
+  "  else 2",
+  "",
+].join("\n"), "f : Bool -> Int\nf b = if b then 1 else 2\n");
+asWritten("a signature's arrows", [
+  "f : Int",
+  "  -> Int",
+  "  -> Int",
+  "f a b = a",
+  "",
+].join("\n"), "f : Int -> Int -> Int\nf a b = a\n");
+asWritten("a chain of operators", [
+  "infixl + -",
+  "x : Int",
+  "x =",
+  "  1",
+  "  + 2",
+  "  - 3",
+  "",
+].join("\n"), "infixl + -\nx : Int\nx = 1 + 2 - 3\n");
+asWritten("a chain cut at its loosest", [
+  "infixl + -",
+  "infixl * above + -",
+  "x : Int",
+  "x =",
+  "  1 * 2",
+  "  + 3 * 4",
+  "",
+].join("\n"), "infixl + -\ninfixl * above + -\nx : Int\nx = 1 * 2 + 3 * 4\n");
+formats("a chain broken after an operator, broken before it", [
+  "f : Int ->",
+  "  Int",
+  "f a = a",
+  "",
+].join("\n"), [
+  "f : Int",
+  "  -> Int",
+  "f a = a",
+  "",
+].join("\n"));
+asWritten("let, in", [
+  "x : Int",
+  "x =",
+  "  let a = 1",
+  "  in a",
+  "",
+].join("\n"), "x : Int\nx = let a = 1 in a\n");
+
 // each case formatted; what was, formatted again
 const first = await formatted(join(work, "first"), cases.map((c) => ({ path: c.path, text: c.src })));
 const made = cases.map((c, i) => ({ path: c.path, text: first[i].out, i })).filter((m) => first[m.i].ok);
