@@ -1,12 +1,21 @@
 -- The process as an effect (lib/co.hf): its arguments, its environment,
--- where its program is and where it runs, the commands it runs, and how
--- it ends (process.provider.c).
+-- where its program is and where it runs, the commands it runs -- to
+-- their end, or started beside it -- and how it ends
+-- (process.provider.c).
 
 import co
+import std.handle
 
 -- | a command run to its end: its status, and what it wrote to its
 -- | output and its error stream
 type Ran = { status : Int, out : String, err : String }
+
+-- | (`Handle Started`, std.handle: a command started beside the program,
+-- | `launch`'s; no value has it.)
+data Started
+
+-- | A command started beside the program.
+type Child = Handle Started
 
 data ProcessF (m : Type -> Type) x
   = Args (List String -> x)
@@ -17,6 +26,9 @@ data ProcessF (m : Type -> Type) x
   | Exit Int x
   | Exec String (List String) x
   | Run String (List String) (Ran -> x)
+  | Launch String (List String) (Maybe Child -> x)
+  | Exited Child (Maybe Int -> x)
+  | Terminate Child (Int -> x)
 
 -- | The process as an effect.
 process : HFunctor
@@ -31,6 +43,9 @@ process =
       Exit code x -> Exit code (g x)
       Exec cmd as x -> Exec cmd as (g x)
       Run cmd as k -> Run cmd as (\r -> g (k r))
+      Launch cmd as k -> Launch cmd as (\c -> g (k c))
+      Exited c k -> Exited c (\s -> g (k s))
+      Terminate c k -> Terminate c (\s -> g (k s))
   , hmap = \m n nt p -> case p of
       Args k -> Args k
       GetEnv name k -> GetEnv name k
@@ -40,6 +55,9 @@ process =
       Exit code x -> Exit code x
       Exec cmd as x -> Exec cmd as x
       Run cmd as k -> Run cmd as k
+      Launch cmd as k -> Launch cmd as k
+      Exited c k -> Exited c k
+      Terminate c k -> Terminate c k
   }
 
 -- | The program's arguments (not Node's, nor the program's own path):
@@ -89,3 +107,27 @@ run : {e : HFunctor}
     -> List String
     -> Co e Ran
 run cmd as = op (ev (Run cmd as (\r -> r))) val
+
+-- | Start the command with the arguments, beside the program, and go on:
+-- | its standard streams the program's, in the program's process group
+-- | (so that Ctrl-C ends both) -- the command, or `Nothing` where it
+-- | could not be started.  At the program's end, a command it started
+-- | that has not ended is terminated.
+launch : {e : HFunctor}
+       -> {{ev : process <: e}}
+       -> String
+       -> List String
+       -> Co e (Maybe Child)
+launch cmd as = op (ev (Launch cmd as (\c -> c))) val
+
+-- | Whether the command has ended, not waiting: `Just` its status (128
+-- | and the signal, where a signal ended it), else `Nothing`.
+exited : {e : HFunctor} -> {{ev : process <: e}} -> Child -> Co e (Maybe Int)
+exited c = op (ev (Exited c (\s -> s))) val
+
+-- | The command ended, if it has not: asked to (SIGTERM), then made to
+-- | (SIGKILL) where it has not within two seconds; its status, and its
+-- | handle let go of (an operation given it after that fails the
+-- | program).
+terminate : {e : HFunctor} -> {{ev : process <: e}} -> Child -> Co e Int
+terminate c = op (ev (Terminate c (\s -> s))) val

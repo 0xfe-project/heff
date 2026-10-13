@@ -1,10 +1,14 @@
 // The process's side of lib/std/process.hf, for the C backend: an effect
 // provider (the shape of one is said in lib/std/io.provider.c).
 // `Exit` ends the program there; `Exec` runs the command in its place.
+// A command `Launch`ed runs beside it, held by the world (a `Child`)
+// until it is terminated; those not ended at the program's end are
+// terminated then (atexit), and asked to end where a signal ends it.
 
 #ifdef _WIN32
 #include <direct.h>
 #else
+#include <time.h>
 #include <unistd.h>
 #endif
 #ifdef __APPLE__
@@ -58,6 +62,155 @@ static char **heff_argv_of(const char *first, V l) {
 // cleared for good where a command runs in the program's place: an
 // `Exit` clears them as the program ends -- lib/std/progress.provider.c)
 static void (*heff_lines)(int);
+
+// (a command started beside the program: while `on`, not yet waited
+// for; its status once it has ended; among the others started, for the
+// program's end)
+typedef struct HeffChild HeffChild;
+struct HeffChild {
+#ifdef _WIN32
+  HANDLE h;
+#else
+  pid_t pid;
+#endif
+  int on;
+  int status;
+  HeffChild *next;
+};
+
+static HeffChild *heff_children = NULL;
+
+// (whether it has ended, not waiting: its status set, `on` no more)
+static int heff_child_ended(HeffChild *c) {
+  if (!c->on) return 1;
+#ifdef _WIN32
+  if (WaitForSingleObject(c->h, 0) != WAIT_OBJECT_0) return 0;
+  DWORD code = (DWORD)-1;
+  GetExitCodeProcess(c->h, &code);
+  CloseHandle(c->h);
+  c->status = (int)code;
+#else
+  int st;
+  pid_t r = waitpid(c->pid, &st, WNOHANG);
+  if (r == 0) return 0;
+  c->status = r < 0 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+#endif
+  c->on = 0;
+  return 1;
+}
+
+// (it ended, if it has not: asked, then made to, two seconds after)
+static void heff_child_end(HeffChild *c) {
+  if (heff_child_ended(c)) return;
+#ifdef _WIN32
+  TerminateProcess(c->h, 1);
+  WaitForSingleObject(c->h, INFINITE);
+#else
+  kill(c->pid, SIGTERM);
+  for (int i = 0; i < 100 && !heff_child_ended(c); i++) {
+    struct timespec t = { 0, 20000000L };
+    nanosleep(&t, NULL);
+  }
+  if (c->on) kill(c->pid, SIGKILL);
+#endif
+  if (c->on) {
+#ifdef _WIN32
+    heff_child_ended(c);
+#else
+    int st;
+    waitpid(c->pid, &st, 0);
+    c->status = WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+    c->on = 0;
+#endif
+  }
+}
+
+static void heff_children_atexit(void) {
+  for (HeffChild *c = heff_children; c; c = c->next) heff_child_end(c);
+}
+
+#ifndef _WIN32
+// (the program ended by a signal -- SIGINT, SIGTERM, SIGHUP, where
+// nothing else was to be done at it -- what it started and has not
+// ended asked to end too, then the signal as it was: ended as it would
+// have been)
+static void heff_children_signal(int sig) {
+  for (HeffChild *c = heff_children; c; c = c->next)
+    if (c->on) kill(c->pid, SIGTERM);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+static void heff_children_watch(void) {
+  static const int sigs[3] = { SIGINT, SIGTERM, SIGHUP };
+  for (int i = 0; i < 3; i++) {
+    struct sigaction before;
+    if (sigaction(sigs[i], NULL, &before) != 0 || before.sa_handler != SIG_DFL) continue;
+    struct sigaction a;
+    memset(&a, 0, sizeof a);
+    a.sa_handler = heff_children_signal;
+    sigemptyset(&a.sa_mask);
+    a.sa_flags = SA_RESTART;
+    sigaction(sigs[i], &a, NULL);
+  }
+}
+#endif
+
+// (let go of: ended first, taken out of those started)
+static void heff_child_let_go(void *x) {
+  HeffChild *c = x;
+  heff_child_end(c);
+  for (HeffChild **at = &heff_children; *at; at = &(*at)->next)
+    if (*at == c) { *at = c->next; break; }
+  free(c);
+}
+
+static HeffChild *heff_child_of(V h) {
+  return heff_held(INT_OF(heff_field(h, 0)));
+}
+
+#ifndef _WIN32
+extern char **environ;
+#endif
+
+// (the command started beside the program: Just its handle, or Nothing)
+static V heff_launch(V cmd, V args) {
+  char *c = heff_cstr_text(cmd);
+  char **as = c ? heff_argv_of(c, args) : NULL;
+  if (!as) {
+    free(c);
+    return heff_nothing;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  HeffChild *ch = heff_alloc(sizeof *ch);
+  memset(ch, 0, sizeof *ch);
+#ifdef _WIN32
+  ch->h = heff_spawn(as, GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
+  int ok = ch->h != 0;
+#else
+  int ok = posix_spawnp(&ch->pid, c, NULL, NULL, as, environ) == 0;
+#endif
+  for (int64_t j = 0; as[j]; j++) free(as[j]);
+  free(as);
+  if (!ok) {
+    free(ch);
+    return heff_nothing;
+  }
+  static int registered = 0;
+  if (!registered) {
+    registered = 1;
+    atexit(heff_children_atexit);
+#ifndef _WIN32
+    heff_children_watch();
+#endif
+  }
+  ch->on = 1;
+  ch->next = heff_children;
+  heff_children = ch;
+  V i = MK_INT(heff_hold(ch, heff_child_let_go));
+  return heff_just(heff_tag_n(TAG_MkHandle, 1, &i));
+}
 
 static uint32_t heff_run_shape[3] = { LBL_status, LBL_out, LBL_err };
 
@@ -140,6 +293,34 @@ static V heff_provider_process(V p, V k) {
     heff_drop(cmd);
     heff_drop(args);
     V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Launch: {
+    V cmd = heff_dup(heff_field(p, 0)), args = heff_dup(heff_field(p, 1));
+    V f = heff_dup(heff_field(p, 2));
+    heff_drop(p);
+    V r = heff_launch(cmd, args);
+    heff_drop(cmd);
+    heff_drop(args);
+    V x = heff_answer(f, r);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Exited: {
+    HeffChild *c = heff_child_of(heff_field(p, 0));
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    V x = heff_answer(f, heff_child_ended(c) ? heff_just(MK_INT(c->status)) : heff_nothing);
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Terminate: {
+    int64_t i = INT_OF(heff_field(heff_field(p, 0), 0));
+    HeffChild *c = heff_held(i);
+    V f = heff_dup(heff_field(p, 1));
+    heff_drop(p);
+    heff_child_end(c);
+    int status = c->status;
+    heff_release(i);
+    V x = heff_answer(f, MK_INT(status));
     return heff_tail(k, 1, &x);
   }
   case TAG_Exec: {
