@@ -57,8 +57,8 @@ tar xzf heff-0.3.0-linux-x64.tar.gz
 heff-0.3.0-linux-x64/bin/heff help
 ```
 
-From the repository, with Node.js, [zig](https://ziglang.org/download/)
-and make:
+From the repository, with [zig](https://ziglang.org/download/) and
+make (Node.js only for the tests):
 
 ```sh
 make install               # build .heff/out/heff, then install it into ~/.heff/bin/
