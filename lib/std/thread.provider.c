@@ -1,7 +1,7 @@
-// Threads' side of lib/std/thread.hf, for the C backend: an effect
-// provider (the shape of one is said in lib/std/io.provider.c) that runs
+// Threads' side of std.thread, for the C backend: an effect
+// provider that runs
 // heff in threads truly at once -- so it says so, and the runtime is
-// built for threads (docs/threads.md):
+// built for threads:
 #define HEFF_THREADS 1
 // What a thread is given is shared (`heff_share`, #66), held by it and
 // whoever else holds it, counted by them atomically, never copied; it

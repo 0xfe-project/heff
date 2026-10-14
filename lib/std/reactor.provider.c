@@ -1,12 +1,11 @@
-// std.reactor's side, for the C backend: an effect provider (the shape
-// of one is said in lib/std/io.provider.c) over the runtime's reactor
-// (lib/c/runtime.c, "Outside operations done later"), whose groups it
+// std.reactor's side, for the C backend: an effect provider
+// over the runtime's reactor, whose groups it
 // opens, starts computations in, asks for what is finished and closes.
 //
 // A `Begun` and a `Finished` are each a function given what to do with
 // what they hold, their types erased: `rx_open` takes it -- a begun's
 // computation `c` and its function `k`, a finished's function `k` -- so
-// that the provider has each apart, as lib/std/thread.provider.c takes
+// that the provider has each apart, as std.thread's provider takes
 // a work.  A computation `c` is the world's: a function of its
 // continuation, which the reactor runs.
 

@@ -1,5 +1,5 @@
-// The process's side of lib/std/process.hf, for the C backend: an effect
-// provider (the shape of one is said in lib/std/io.provider.c).
+// The process's side of std.process, for the C backend: an effect
+// provider.
 // `Exit` ends the program there; `Exec` runs the command in its place.
 // A command `Start`ed runs beside it, held by the world (a
 // `Subprocess`) until it is waited for; those not waited for at the
@@ -63,7 +63,7 @@ static char **heff_argv_of(const char *first, V l) {
 
 // (the lines std.progress draws on the terminal, once there are any,
 // cleared for good where a command runs in the program's place: an
-// `Exit` clears them as the program ends -- lib/std/progress.provider.c)
+// `Exit` clears them as the program ends)
 static void (*heff_lines)(int);
 
 #ifndef _WIN32

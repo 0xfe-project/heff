@@ -1,5 +1,5 @@
-// The HTTP client's side of lib/std/http.hf, for the C backend: an
-// effect provider (the shape of one is said in lib/std/io.provider.c).
+// The HTTP client's side of std.http, for the C backend: an
+// effect provider.
 // libcurl sends a request, in the process, its connection kept for the
 // next -- or, where there is no libcurl, `curl` (on the PATH of every
 // system heff runs on), spawned for each, given what libcurl is given,
@@ -321,8 +321,7 @@ static void http_spawned(HttpReq *q, HttpGot *g) {
 // program, Windows -- by the spawned curl.  Whatever of it is not
 // there, or fails before a request is made, the spawned curl does that
 // request (and, libcurl not loaded, every one).  `-DHEFF_HTTP_SPAWN`:
-// always the spawned curl (test/backends.mjs holds the two to each
-// other).
+// always the spawned curl.
 //
 // Each thread keeps an easy handle of its own, made at its first
 // request, whose connections libcurl keeps open for the next: what makes
@@ -636,7 +635,7 @@ static int http_curl(HttpReq *q, HttpGot *g) {
 // Green threads: libcurl's multi interface
 // ---------------------------------------------------------------------
 //
-// Where a scheduler of std.reactor's runs (lib/c/runtime.c's reactor, a
+// Where a scheduler of std.reactor's runs (the runtime's reactor, a
 // group being started in), a request is a transfer of this thread's
 // multi handle, pending while the other green threads go on: its easy
 // handle added to the multi, the request's wait done when libcurl says

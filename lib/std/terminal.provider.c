@@ -1,5 +1,5 @@
-// The terminal's side of lib/std/terminal.hf, for the C backend: an
-// effect provider (the shape of one is said in lib/std/io.provider.c).
+// The terminal's side of std.terminal, for the C backend: an
+// effect provider.
 //
 // `Begin` makes the terminal raw -- the standard input read a byte at a
 // time as it is typed, not echoed, not a line at a time; its signals

@@ -1,6 +1,5 @@
-// test/node/boxes.hf's world, for the C backend: an effect provider (the
-// shape of one is said in lib/std/io.provider.c).  A box is an int64_t
-// of its own, held by the world (lib/std/handle.hf), freed and counted
+// boxes.hf's world, for the C backend: an effect provider.  A box is an int64_t
+// of its own, held by the world, freed and counted
 // when the world lets it go -- whichever provider asked it to.
 
 static int64_t heff_boxes_freed = 0;

@@ -1,5 +1,4 @@
-// Time's side of lib/std/time.hf, for the C backend: an effect provider
-// (the shape of one is said in lib/std/io.provider.c).  A program runs
+// Time's side of std.time, for the C backend: an effect provider.  A program runs
 // one thing at a time, so a sleep is the whole program's.
 
 #include <time.h>

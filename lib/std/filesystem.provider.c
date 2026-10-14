@@ -1,16 +1,16 @@
-// The disk's side of lib/std/filesystem.hf, for the C backend: an effect
-// provider (the shape of one is said in lib/std/io.provider.c).
+// The disk's side of std.filesystem, for the C backend: an effect
+// provider.
 //
 // Whole files, directories and paths are done there and then.  An open
-// file is a `FsFile` the world holds (lib/std/handle.hf), let go of --
+// file is a `FsFile` the world holds, let go of --
 // closed -- by `CloseFile`; the program has its number.  It reads ahead
 // into a buffer of its own, from which lines and chunks are taken.
 //
 // A read or a write of an open file is a `FsOp`, done in steps as
-// std.net's are (lib/std/net.provider.c): where a scheduler of
+// std.net's are: where a scheduler of
 // std.reactor's runs, a pipe, a terminal or a socket -- what poll can
 // say is ready -- is polled first, and the op waits in the runtime's
-// reactor (lib/c/runtime.c, "Outside operations done later") until it
+// reactor until it
 // is, the other green threads going on.  The descriptor is left as it
 // is, never made non-blocking (a standard stream's flags are its
 // parent's too): a read is done once poll says there is something to
@@ -783,7 +783,7 @@ static V fs_answer(HeffWait *w) {
 static void fs_cancel(HeffWait *w) { fs_op_free((FsOp *)w); }
 
 // (the op, its first step taken: done, its answer given to `k`; or
-// waited for by the reactor -- lib/c/runtime.c's `heff_outside`)
+// waited for by the reactor -- `heff_outside`)
 static V fs_go(FsOp *o, int (*step)(HeffWait *), V f, V k) {
   o->w.step = step;
   o->w.answer = fs_answer;

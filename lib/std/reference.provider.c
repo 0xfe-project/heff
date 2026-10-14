@@ -1,8 +1,8 @@
-// The world's cells, lib/std/reference.hf's, for the C backend: an effect
-// provider (the shape of one is said in lib/std/io.provider.c).  A cell
+// The world's cells, std.reference's, for the C backend: an effect
+// provider.  A cell
 // is `MkReference i`, its value the provider's `i`th, as in
 // reference.provider.js (each cell holding a reference to it).  Threads
-// at once (`HEFF_THREADS`, docs/threads.md): the cells theirs, each
+// at once (`HEFF_THREADS`): the cells theirs, each
 // holding them while it looks at them; a value going in is shared
 // (`heff_share`, #66), and a cell holds it so, read by one more count
 // (`heff_dup`) and written by a swap, the old value let go of after the

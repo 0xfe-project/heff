@@ -1,7 +1,6 @@
-// test/node/tally.hf's world, for the C backend: an effect provider (the
-// shape of one is said in lib/std/io.provider.c).  It acts on the boxes
-// boxes.hf's provider hands out, by the world's numbers for them
-// (lib/std/handle.hf): a box is that provider's int64_t.
+// tally.hf's world, for the C backend: an effect provider.  It acts on the boxes
+// boxes.hf's provider hands out, by the world's numbers for them:
+// a box is that provider's int64_t.
 
 static V heff_provider_tally(V p, V k) {
   switch (heff_tag_of(p)) {

@@ -1,5 +1,5 @@
-// The socket calls' side of src/testbridge/sys.hf, for the C backend: an
-// effect provider (the shape of one is said in lib/std/io.provider.c).
+// The socket calls' side of testbridge.sys, for the C backend: an
+// effect provider.
 // Each operation is the POSIX call, as it is: its numbers given to it as
 // the program gave them -- the program has the constants (AF_NETLINK,
 // SOCK_RAW, ...), so no Linux header is here, and this compiles on any

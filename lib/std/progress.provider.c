@@ -1,5 +1,5 @@
-// The terminal's side of lib/std/progress.hf, for the C backend: an
-// effect provider (the shape of one is said in lib/std/io.provider.c).
+// The terminal's side of std.progress, for the C backend: an
+// effect provider.
 //
 // The lines are drawn on the standard error by a thread of their own,
 // as zig draws its progress (std.Progress): every 80 ms, the newest
@@ -8,7 +8,7 @@
 // nothing -- each cut to the terminal's width, as many as leave two of
 // its rows.  The cursor is left where the first line starts: what the
 // program writes there clears them first (`heff_lines`, which
-// lib/std/io.provider.c calls around each write), and they come back
+// std.io's provider calls around each write), and they come back
 // below it.  At the program's end, or where it runs a command in its
 // place, they are cleared for good.
 //

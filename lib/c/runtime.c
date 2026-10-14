@@ -1,4 +1,4 @@
-// heff's runtime for the C backend (src/heff/compile/emitc.hf), bundled whole
+// heff's runtime for the C backend, bundled whole
 // into each program it compiles, before the program's own code and its
 // worlds' providers (`M.provider.c` beside `M.hf`).
 //
@@ -13,7 +13,7 @@
 // read as `heff_u8_decode` reads them, what is not UTF-8 U+FFFD -- as
 // the other backends have it; a provider gives one to the system, and
 // makes one of what the system gives, only through the runtime's
-// helpers ("What providers share" says which).  `Bytes` (lib/bytes.hf)
+// helpers ("What providers share" says which).  `Bytes`
 // are kept as a string is, a `Str` of another kind (`K_BYT`), and cross
 // by helpers of their own.
 //
@@ -21,14 +21,14 @@
 // `heff_dup` takes one more and `heff_drop` gives one back, the last
 // freeing it.  What a function is given it owns: it consumes it (gives
 // it to what it calls, keeps it in what it builds) or drops it -- the
-// compiler says where (src/heff/compile/refcount.hf, "Reference counts"); every
+// compiler says where; every
 // primitive and the runtime's calls consume their arguments too.  What
 // is static (a string written in the program, a definition's closure) is
 // immortal, its count never changed.  A program runs in a thread of its
 // own with a large stack.  A call last of an unknown
 // function counts itself and every so often gives back a bounce (`K_BNC`),
 // let go of where the value is asked for (`heff_tr`), as the JavaScript
-// backend does (src/heff/compile/emit.hf, "Tail calls") -- unless it is a jump
+// backend does -- unless it is a jump
 // (`HEFF_LAST`), from a lambda to a closure of as many parameters, its
 // arguments put where the lambda's were or, more than those, in
 // `heff_room`.  A call not last of a closure of as many parameters is
@@ -104,7 +104,7 @@ extern char **environ;
 // lock, and made immortal (`heff_global`, `heff_freeze`), as is a static
 // thunk's (`heff_force_shared`).  Without `HEFF_THREADS`, all of this is
 // as one thread has it: `HEFF_TLS` is nothing, no object is shared
-// (`SHARED` is 0), and nothing is locked.  (docs/threads.md)
+// (`SHARED` is 0), and nothing is locked.
 #ifdef HEFF_THREADS
 #define HEFF_TLS _Thread_local
 #else
@@ -113,7 +113,7 @@ extern char **environ;
 
 typedef uintptr_t V;
 
-// (a tuple (#80, src/heff/compile/cpr.hf): what a worker gives back of a
+// (a tuple (#80): what a worker gives back of a
 // tag or a record it built, not built -- each value a `V`, or a flat
 // number's bits as a flat field's; given back in registers where the C
 // ABI lets it, else in its caller's frame, never allocated)
@@ -467,7 +467,7 @@ static inline V heff_field(V v, int i) { return ((Tag *)v)->f[i]; }
 // Flat fields (#39): a record's field of a type of 64 bits a `V` would
 // allocate for -- `Float64`, `Int64`, `UInt64` -- is kept as its bits
 // where the code building the record knows the type
-// (src/heff/compile/repr.hf, `flatOf`), and the record says so, 2 bits a
+// (the compiler's `flatOf`), and the record says so, 2 bits a
 // field (`Rec`'s `flat`), so that what walks it -- a drop, a copy, a
 // field looked for by its label, a value shown -- does not take the bits
 // for a `V`, and a read where the type is not known boxes them.  Only the
@@ -634,7 +634,7 @@ HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
 }
 
 // (... of a tag whose fields not in `keep` are all flat, in every tag of
-// it the program builds (src/heff/compile/facts.hf, `sure`): none
+// it the program builds (the compiler's `sure`): none
 // dropped, nothing looked for)
 HEFF_KNOWN void heff_take_na(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
@@ -746,7 +746,7 @@ HEFF_KNOWN V heff_tag_at_nf(V r, int id, int64_t n, uint32_t flat, V *f) {
 // (what a tag's field waits as, a hole: no object, nothing to drop; and
 // field `i` of the cell `d`, made with a hole there that nothing has
 // seen yet, set to `v`: what a call of itself gives put where a tag waits
-// for it -- src/heff/compile/trmc.hf's destination; `d` consumed)
+// for it -- a destination; `d` consumed)
 static inline V heff_hole(void) { return MK_INT(0); }
 
 static inline V heff_setField(V d, V i, V v) {
@@ -783,7 +783,7 @@ HEFF_KNOWN V heff_clo_n(Fn fn, int arity, int64_t n, V *env) {
 
 // Fields at their known place (#34): a record's fields are those of its
 // type that are not types, in the order the type has them (its shape),
-// so where the emitter knows the type -- src/heff/compile/erase.hf gives each
+// so where the emitter knows the type -- erasure gives each
 // projection its record's shape -- it reads a field at its place, not
 // looking for its label (`heff_get`).
 
@@ -832,7 +832,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
 }
 
 // (field `i` of a record wanted after, which after it is only read other
-// fields of, then updated or dropped (src/heff/compile/refcount.hf, `takesFor`):
+// fields of, then updated or dropped (the compiler's `takesFor`):
 // its last reference, the field taken out of it -- moved, not counted, a
 // hole left that drops as nothing; otherwise the field counted.  Never a
 // field that may be flat: one that is is read where it is)
@@ -905,7 +905,7 @@ HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uin
 }
 
 // (... where the fields stored anew are flat in every record of its
-// shape the program builds (src/heff/compile/facts.hf, `sureRecs`): the
+// shape the program builds (the compiler's `sureRecs`): the
 // record's last reference, none dropped, nothing looked for)
 HEFF_KNOWN V heff_rec_reuse_na(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
@@ -1199,8 +1199,8 @@ HEFF_VAR(HEFF_TLS long heff_dep);
 // (where a lambda's call last of more arguments than it took is put, up
 // to `HEFF_ROOM` of them, to be made a jump: its own are where its
 // caller put them, room for only as many as it takes -- and what is
-// called reads them at once, before it calls anything -- see `roomed`
-// in src/heff/compile/emitc.hf)
+// called reads them at once, before it calls anything -- see the C
+// emitter's `roomed`)
 #define HEFF_ROOM 4
 HEFF_VAR(HEFF_TLS V heff_room[HEFF_ROOM]);
 
@@ -1371,7 +1371,7 @@ HEFF_FAST V heff_call(V f, int n, V *a) {
 // (whether `f`, given the `n` arguments at `a`, is a closure taking
 // exactly them and not a thunk forced -- what `heff_apply` would call at
 // once, as it is -- and a call last of it a jump: a lambda's call last
-// of it is then not counted (src/heff/compile/emitc.hf, `inPlace`))
+// of it is then not counted (the emitter's `inPlace`))
 static inline int heff_exact(V f, int n, V *a) {
   return HEFF_JUMPS && IS_OBJ(f) && OBJ(f)->kind == K_CLO
       && ((Clo *)f)->arity == n && !(n == 1 && a[0] == NTAG(TAG_MkUnit));
@@ -1380,7 +1380,7 @@ static inline int heff_exact(V f, int n, V *a) {
 // Definitions' values
 // ---------------------------------------------------------------------
 // A definition that is no function is computed when it is first asked
-// for, and kept (src/heff/compile/emitc.hf, `valDef`): its value
+// for, and kept (the emitter's `valDef`): its value
 // `g_X_val`, its state `g_X_st` (`HEFF_ONCE`), asked for by `g_X_get`,
 // which has it at once where it is computed (`HEFF_DONE`), and otherwise
 // asks `heff_global` to compute it by `g_X_init`.  One thread: the state
@@ -2094,7 +2094,7 @@ HEFF_FN V heff_strAppend(V a, V b) { return heff_buf_append(a, b, K_STR); }
 // (bit `k` the `k`-th operand's): the others are lent, held by the caller
 // through the call, neither counted up for it nor down by it.  The C
 // backend calls it where an operand is a variable wanted after the call
-// (src/heff/compile/emitc.hf, `lendingPrims`), and so saves a count up
+// (the emitter's `lendingPrims`), and so saves a count up
 // and down of its string each time -- a byte read in a loop, or a key
 // compared at each node of a map.  (`give` is a constant there: what is
 // not given is not looked at.)
@@ -2179,15 +2179,14 @@ HEFF_FN V heff_strFind_lent(V needle, V s, V i, int give) {
 }
 HEFF_FN V heff_strFind(V needle, V s, V i) { return heff_strFind_lent(needle, s, i, 3); }
 
-// Hashes (lib/hashmap.hf): a string's is FxHash's step (Firefox's and
+// Hashes: a string's is FxHash's step (Firefox's and
 // rustc's, `rotl(h, 5) ^ w` times its constant) over its bytes 8 at a
 // time, little-endian, the last word filled with zeros, from its length;
 // then murmur3's finish (`fmix64`), which FxHash lacks, so that the low
 // bits a trie looks at first are as mixed as the high.  An integer's is
 // that finish of its low 64 bits (two's complement).  Each is shifted
 // right by 2, a word's integer, never negative; JavaScript's and the
-// interpreter's are the same numbers (src/heff/compile/prims.hf,
-// src/heff/compile/interp.hf), so that a map's order is one everywhere.
+// interpreter's are the same numbers, so that a map's order is one everywhere.
 #define HEFF_FX_K 0x517cc1b727220a95ULL
 
 static inline uint64_t heff_fmix64(uint64_t h) {
@@ -2594,7 +2593,7 @@ HEFF_FN V heff_float32Floor(V a) {
 // Unboxed numbers (#39)
 // ---------------------------------------------------------------------
 // Where a program computes with a fixed-width number or a `Float64`, it
-// keeps it as its C type (src/heff/compile/repr.hf), and makes it a `V`
+// keeps it as its C type, and makes it a `V`
 // only where one is wanted: `heff_box_S` (`S` the type's suffix, `i64`,
 // `f32`, ...), the `V` made of it; `heff_unbox_S`, the number of a `V`,
 // consumed; `heff_peek_S`, looked at.  `heff_from_int_S` is the type's
@@ -2627,7 +2626,7 @@ static inline double heff_peek_f64(V v) { return FLT_OF(v); }
 static inline double heff_from_int_f64(V v) {
   double d = heff_double_of_int(v); heff_drop(v); return d; }
 
-// An `Int` known to fit a word (src/heff/compile/ranges.hf, #79), kept
+// An `Int` known to fit a word (#79), kept
 // as its `int64_t`: its `V` is a word, nothing to count, so unboxed or
 // looked at alike.  A division and a remainder of two, by one not 0,
 // rounded down as `heff_intDiv` and `heff_intMod` round.
@@ -2685,7 +2684,7 @@ HEFF_GET_N_FLAT(i64, int64_t)
 HEFF_GET_N_FLAT(u64, uint64_t)
 
 // (... a field flat in every record of its shape the program builds
-// (src/heff/compile/facts.hf, `sureRecs`), read as it is)
+// (the compiler's `sureRecs`), read as it is)
 HEFF_FAST double heff_rflat_f64(V v, int64_t i) { return heff_f64_of_word(((Rec *)v)->f[i]); }
 HEFF_FAST int64_t heff_rflat_i64(V v, int64_t i) { return (int64_t)((Rec *)v)->f[i]; }
 HEFF_FAST uint64_t heff_rflat_u64(V v, int64_t i) { return (uint64_t)((Rec *)v)->f[i]; }
@@ -2838,7 +2837,7 @@ HEFF_FN V heff_strRuneCount(V a) {
 // (`HEFF_ARR_F64` and the others), so that nothing is allocated for an
 // element, nor counted, and the elements are as near one another as C's
 // are.  An array is built flat where the element it is built of is
-// known to be a number (src/heff/compile/repr.hf: the element's repr),
+// known to be a number (the element's repr),
 // `heff_arrayReplicate_u8` and the others; built of `V`s, it is flat
 // only where they are `Float64`s, each a box of its own (`K_FLT`) -- so
 // an array of `Float64`s, if it has an element, is always flat, and read
@@ -3185,7 +3184,7 @@ HEFF_FN V heff_arrayAppend(V a, V b) {
 // Bytes
 // ---------------------------------------------------------------------
 
-// (`Bytes` (lib/bytes.hf), never changed once made: a string's `Str`, of
+// (`Bytes`, never changed once made: a string's `Str`, of
 // the kind `K_BYT` -- dropped, shared with a thread and grown by an append
 // as a string is, and shown as a binary, `b[...]`.  Their length, slice and
 // equality are a string's; a byte is a `UInt8`, a word of its value)
@@ -3375,7 +3374,7 @@ HEFF_FN V heff_bytesHasAt(V a, V o, V b) {
 // Bits
 // ---------------------------------------------------------------------
 
-// (`Bits` (lib/bits.hf), a bitstring, never changed once made: a
+// (`Bits`, a bitstring, never changed once made: a
 // string's `Str`, of the kind `K_BIT`, its `len` bytes holding its bits
 // the first the most significant of the first byte; `h.tag` says how
 // many bits of the last byte are none of them, each 0 -- so that two of
@@ -3652,8 +3651,8 @@ HEFF_FN V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 
 // The world: the things the providers hand out, held in one table for
 // them all, so that one effect's provider takes what another's handed
-// out (lib/std/handle.hf: a `Handle` is `MkHandle i`, made and taken
-// apart by the provider), as src/heff/compile/emit.hf's `$world` holds them.
+// out (a `Handle` is `MkHandle i`, made and taken
+// apart by the provider), as the JavaScript backend's `$world` holds them.
 // `heff_hold(x, free)` is the number of `x`, the same while it is held;
 // `heff_held(i)` the thing numbered `i`; `heff_release(i)` lets it go
 // -- `free(x)`, if its holder gave a `free` -- and its number is no
@@ -3760,7 +3759,7 @@ HEFF_FN void heff_release(int64_t i) {
   if (let_go) let_go(x);
 }
 
-// Threads a provider starts (#36; docs/threads.md): each runs what it
+// Threads a provider starts (#36): each runs what it
 // is given -- shared, `heff_share` -- by `heff_try`, so
 // that a failure there is the thread's to hand back, not the end of the
 // process; and ends by `heff_thread_end`.
@@ -3856,7 +3855,7 @@ HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
 //   the world's continuations are, to the start (`heff_reactor_start`),
 //   which tells its scheduler that the operation is pending.
 //
-// std.reactor's provider (lib/std/reactor.provider.c) opens a group for
+// std.reactor's provider opens a group for
 // a scheduler, starts each of its threads' outside operations in it --
 // a computation run to its end, its value given back, or to a wait,
 // pending -- asks which are finished, and closes it, what is pending in
@@ -3865,7 +3864,7 @@ HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
 // each done, gives `f` of its answer to `k`, the rest of what was
 // started run, up to its end -- its value one of its group's finished
 // -- or to another wait, pending again.  A source (libcurl's, in
-// lib/std/http.provider.c) has descriptors of its own to poll and how
+// std.http's provider) has descriptors of its own to poll and how
 // long at most to wait for them, and says which of its waits are done
 // (`heff_wait_done`).  Each thread of the system has a reactor of its
 // own (`HEFF_TLS`): its waits are its own, waited for by it alone.
@@ -4224,11 +4223,11 @@ HEFF_FN V heff_nomatch(V s) {
 }
 
 // Values, shown (`heff compile` without `--name`: each definition of
-// the file printed as the tests print JavaScript's, test/load-js.mjs)
+// the file printed as the tests print JavaScript's)
 // ---------------------------------------------------------------------
 
 // (the names of the tags and labels, each by its number: a tag's and a
-// label's number is a hash of its name, src/heff/compile/emitc.hf)
+// label's number is a hash of its name)
 typedef struct { uint32_t id; const char *name; } HeffName;
 HEFF_VAR(const HeffName *heff_tag_names);
 HEFF_VAR(int heff_ntag_names);
@@ -4396,7 +4395,7 @@ HEFF_FN int64_t heff_capture(char **as, Buf *bo, Buf *be) {
 
 // (a string as JSON writes one: in quotes, `"` `\` and controls escaped;
 // what is not UTF-8 in it U+FFFD -- or, `shown`, each of its bytes
-// `\xnn`, as a string literal writes it, test/load-js.mjs's `show`)
+// `\xnn`, as a string literal writes it)
 HEFF_FN void buf_json_string_as(Buf *b, V v, int shown) {
   Str *s = (Str *)v;
   buf_str(b, "\"");
@@ -4605,7 +4604,7 @@ HEFF_VAR(int heff_status);
 #ifndef HEFF_PART
 
 // (the program's stack, which heff's recursion is: a call last a jump,
-// and a call of itself put in a tag a loop (src/heff/compile/trmc.hf),
+// and a call of itself put in a tag a loop,
 // but what is left is as deep as it goes -- `-DHEFF_MAIN_STACK=BYTES`
 // for another size)
 #ifndef HEFF_MAIN_STACK

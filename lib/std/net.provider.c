@@ -1,6 +1,6 @@
-// TCP sockets' side of lib/std/net.hf, for the C backend: an effect
-// provider (the shape of one is said in lib/std/io.provider.c).  A
-// socket is a `NetSock` the world holds (lib/std/handle.hf), let go of
+// TCP sockets' side of std.net, for the C backend: an effect
+// provider.  A
+// socket is a `NetSock` the world holds, let go of
 // -- closed -- by `Close`; the program has its number.
 //
 // Each operation is a `NetOp`, done in steps: its wait's `step` does
@@ -8,8 +8,7 @@
 // (HEFF_STEP_DONE, its answer or its errno in the op) or what it waits for
 // (HEFF_STEP_WAIT: `fd` readable or writable, `events`), to be stepped again
 // once it is.  So every socket is non-blocking, and an operation waits
-// only in the runtime's reactor (lib/c/runtime.c, "Outside operations
-// done later"): where no scheduler runs, there and then, the whole
+// only in the runtime's reactor: where no scheduler runs, there and then, the whole
 // program waiting with it; where std.reactor's green threads run, the
 // op pending, the other threads going on, and its own once it is done.
 // The heff side is the same either way: each operation gives its
@@ -519,7 +518,7 @@ static void net_cancel(HeffWait *w) {
 }
 
 // (the op, its first step taken: done, its answer given to `k`; or
-// waited for, here or by the reactor -- lib/c/runtime.c's `heff_outside`)
+// waited for, here or by the reactor -- `heff_outside`)
 static V net_go(NetOp *o, V f, V k) {
   o->w.answer = net_answer;
   o->w.cancel = net_cancel;

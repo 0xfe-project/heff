@@ -1,5 +1,5 @@
-// The terminal's side of src/heff/lsp/report.hf, for the C backend: an
-// effect provider (the shape of one is said in lib/std/io.provider.c).
+// The terminal's side of heff.lsp.report, for the C backend: an
+// effect provider.
 
 #include <unistd.h>
 

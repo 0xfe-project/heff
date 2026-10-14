@@ -1,10 +1,9 @@
-// The client's side of src/heff/lsp/rpc.hf, for the C backend: JSON-RPC over
+// The client's side of heff.lsp.rpc, for the C backend: JSON-RPC over
 // stdio, as the Language Server Protocol frames it -- each message a
 // `Content-Length: n` header, a blank line, then n bytes of JSON; stdout
 // carries only the messages, logs go to stderr -- and what of the host a
-// language server asks for (the shape of a provider is said in
-// lib/std/io.provider.c).  A message is given as its body, its JSON
-// read in heff (lib/json.hf).  Its strings are text, a host of text's --
+// language server asks for.  A message is given as its body, its JSON
+// read in heff.  Its strings are text, a host of text's --
 // a message's body, and the paths and URIs a client names, or that are
 // made of them (`heff_str_text`, `heff_cstr_text`) -- but for what it
 // sends and logs, which is written out as it is (`heff_bytes`,

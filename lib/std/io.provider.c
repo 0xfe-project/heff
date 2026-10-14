@@ -1,4 +1,4 @@
-// The standard streams' side of lib/std/io.hf, for the C backend: an
+// The standard streams' side of std.io, for the C backend: an
 // effect provider.  A provider of the C backend defines, for each
 // effect definition X of its module, `static V heff_provider_X(V p, V
 // k)`: the operation `p` (a tag, `heff_tag_of`, its fields
@@ -6,25 +6,24 @@
 // last (`heff_tail`), as the JavaScript providers do (`k(a[1])`).  A
 // function of the operation's (`ReadStdin`'s) is asked for its value
 // through `heff_tr`.  It owns `p` and `k` (reference counts, as
-// lib/c/runtime.c says): it takes what it keeps of `p` (`heff_dup`),
+// the runtime says): it takes what it keeps of `p` (`heff_dup`),
 // drops `p`, and gives `k` away.  A number is as the runtime keeps it: an
 // Int a word (`INT_OF`, `MK_INT`) or big, an Int64 and a UInt64 as an Int
 // is, an integer of a fixed-width type of up to 32 bits a word of its
 // value, a Float32 a word of its bits (`heff_f32_of`, `heff_f32`), a Float64
 // boxed (`FLT_OF`, `heff_flt`); a Rune is a word of its code point.  It
-// is bundled after lib/c/runtime.c, whose functions it uses -- among
+// is bundled after the runtime, whose functions it uses -- among
 // them the world's, which hold what every provider hands out
-// (`heff_hold`, `heff_held`, `heff_release`: lib/std/handle.hf says how).
+// (`heff_hold`, `heff_held`, `heff_release`).
 // A string it is given, or gives, crosses to the system and back only
 // through the runtime's helpers, by what it is there -- content, a path,
 // a name or text: `heff_str_bytes`, `heff_put`, `heff_cstr`,
 // `heff_str_text`, `heff_cstr_text` and the like ("What providers share"
-// in lib/c/runtime.c says which is which) -- never by its units, so that
+// in the runtime says which is which) -- never by its units, so that
 // how the runtime keeps a string is the runtime's alone.
 
 // (the lines std.progress draws on the terminal, once there are any:
-// what is written clears them first, and they come back below it --
-// lib/std/progress.provider.c says how)
+// what is written clears them first, and they come back below it)
 static void (*heff_lines)(int);
 
 static V heff_provider_stdio(V p, V k) {

@@ -1,6 +1,6 @@
-// test/node/fork.hf's world, for the C backend (heff_parallel's
-// fork.provider.c): an effect provider (the shape of one is said in
-// lib/std/io.provider.c).  `Spread n` forks n-1 children and gives the
+// fork.hf's world, for the C backend (heff_parallel's
+// fork.provider.c): an effect provider.
+// `Spread n` forks n-1 children and gives the
 // continuation to each, its index its answer; `Gather s`, in a child,
 // writes `s` down its pipe and ends the child, and in the parent reads
 // every child's string and goes on with them all.  The spreads open are
