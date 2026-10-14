@@ -82,14 +82,16 @@ data Failure = Because String | Differ String String
 
 -- | Checking: a failure, a run given up on (its assumptions do not hold),
 -- | a label of the run (counted over the runs), a note (shown if the
--- | run fails; made only then), and a golden text (a name, and the text,
--- | held by `heff test` to the one kept under that name).
+-- | run fails; made only then), a golden text (a name, and the text,
+-- | held by `heff test` to the one kept under that name), and a subtest
+-- | (its name, and what it does).
 data CheckF (m : Type -> Type) x
   = Fail Failure
   | Discard
   | Label String x
   | Note (Unit -> String) x
   | Golden String String x
+  | Sub String (m Unit) x
 
 -- | Checking as an effect.
 check : HFunctor
@@ -101,12 +103,14 @@ check =
       Label l x -> Label l (g x)
       Note s x -> Note s (g x)
       Golden n t x -> Golden n t (g x)
+      Sub s c x -> Sub s c (g x)
   , hmap = \m n nt p -> case p of
       Fail f -> Fail f
       Discard -> Discard
       Label l x -> Label l x
       Note s x -> Note s x
       Golden n t x -> Golden n t x
+      Sub s c x -> Sub s (nt c) x
   }
 
 -- | The effects a test is run in.
@@ -179,19 +183,42 @@ note s = op (chk (Note (\u -> s) MkUnit)) val
 golden : {e : HFunctor} -> {{chk : check <: e}} -> String -> String -> Co e Unit
 golden name text = op (chk (Golden name text MkUnit)) val
 
+-- | A test of its own within an integration test, as Go's `t.Run`: it
+-- | is said on a line of its own, `test / name`, holds or fails by
+-- | itself and keeps its own golden texts, and `--run` selects it at its
+-- | level.  `heff test` runs it in a program of its own, as many at once
+-- | as its jobs: the test's program, asked for the subtest by its names,
+-- | does the test again, doing only the subtests on the way to it.  So a
+-- | test does the same each time up to its subtests, and names each once
+-- | (no `/` in a name).  What the test does after a subtest is done as
+-- | if the subtest held.
+-- |
+-- |   each : List String -> Co e Unit
+-- |   each Nil = pure MkUnit
+-- |   each (Cons n rest) = do
+-- |     subtest n (do ...)
+-- |     each rest
+subtest : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> String
+        -> Co e Unit
+        -> Co e Unit
+subtest name body = op (chk (Sub name body MkUnit)) val
+
 -- Running
 --------------------------------------------------------------------------------
 
--- | What a run has said so far, backwards: its notes, labels and golden
--- | texts.
+-- | What a run has said so far, backwards: its notes, labels, golden
+-- | texts and the subtests it named.
 type Trace =
   { notes : List (Unit -> String)
   , labels : List String
   , goldens : List (Pair String String)
+  , subtests : List String
   }
 
 noTrace : Trace
-noTrace = { notes = Nil, labels = Nil, goldens = Nil }
+noTrace = { notes = Nil, labels = Nil, goldens = Nil, subtests = Nil }
 
 -- (one trace, then another)
 andThen : Trace -> Trace -> Trace
@@ -199,16 +226,23 @@ andThen a b =
   { notes = List.append b.notes a.notes
   , labels = List.append b.labels a.labels
   , goldens = List.append b.goldens a.goldens
+  , subtests = List.append b.subtests a.subtests
   }
 
--- | A run of a test, so far: going on, failed, or given up on.
-data Run a = Going Trace a | Failed Trace Failure | Discarded
+-- | A run of a test, so far: going on, failed, given up on, or come to
+-- | the subtest it was run for, and what came of that.
+data Run a
+  = Going Trace a
+  | Failed Trace Failure
+  | Discarded
+  | Reached (Run Unit)
 
 -- (the rest of a run, after a run of `t`)
 after : {a : Type} -> Trace -> Run a -> Run a
 after t (Going t2 x) = Going (andThen t t2) x
 after t (Failed t2 f) = Failed (andThen t t2) f
 after t Discarded = Discarded
+after t (Reached r) = Reached r
 
 -- (a run, then what comes of its value)
 continue : {a b : Type}
@@ -218,6 +252,7 @@ continue : {a b : Type}
 continue k (Going t x) = Generator.map (\r -> after t r) (k x)
 continue k (Failed t f) = Generator.constant (Failed t f)
 continue k Discarded = Generator.constant Discarded
+continue k (Reached r) = Generator.constant (Reached r)
 
 drawAlg : {m : Type -> Type}
         -> {a : Type}
@@ -229,10 +264,14 @@ drawAlg (Draw g) = Generator.map (\x -> Going noTrace x) g
 checkRun : {m : Type -> Type} -> {a : Type} -> CheckF m a -> Run a
 checkRun (Fail f) = Failed noTrace f
 checkRun Discard = Discarded
-checkRun (Label l x) = Going { notes = Nil, labels = [l], goldens = Nil } x
-checkRun (Note s x) = Going { notes = [s], labels = Nil, goldens = Nil } x
+checkRun (Label l x) =
+  Going { notes = Nil, labels = [l], goldens = Nil, subtests = Nil } x
+checkRun (Note s x) =
+  Going { notes = [s], labels = Nil, goldens = Nil, subtests = Nil } x
 checkRun (Golden n t x) =
-  Going { notes = Nil, labels = Nil, goldens = [MkPair n t] } x
+  Going { notes = Nil, labels = Nil, goldens = [MkPair n t], subtests = Nil } x
+checkRun (Sub n c x) =
+  Failed noTrace (Because "a subtest is an integration test's")
 
 checkAlg : {m : Type -> Type}
          -> {a : Type}
@@ -404,8 +443,9 @@ agree mc cmds = agreeFrom mc 0 mc.system mc.model cmds
 -- | how many runs held and how many were given up on, how many shrinks
 -- | made the counterexample, how many runs had each label, the
 -- | counterexample's notes (what was drawn, in order), why it failed,
--- | the seed it was run from, and the golden texts it kept (each a name
--- | and a text, in order), for `heff test` to hold to theirs.
+-- | the seed it was run from, the golden texts it kept (each a name
+-- | and a text, in order), for `heff test` to hold to theirs, and the
+-- | subtests it named, in order, for `heff test` to run.
 type Outcome =
   { name : String
   , ok : Bool
@@ -418,6 +458,7 @@ type Outcome =
   , failure : Maybe Failure
   , seed : Int
   , goldens : List (Pair String String)
+  , subtests : List String
   }
 
 -- (a number from a name, so that each test has a seed of its own, which
@@ -461,6 +502,7 @@ passed name prop seed t goldens =
   , failure = Nothing
   , seed = seed
   , goldens = goldens
+  , subtests = Nil
   }
 
 failedWith : String
@@ -483,6 +525,7 @@ failedWith name prop seed t n tr f =
   , failure = Just f
   , seed = seed
   , goldens = Nil
+  , subtests = List.reverse tr.subtests
   }
 
 isFailed : {a : Type} -> Run a -> Bool
@@ -542,6 +585,7 @@ judge name cfg seed t tree = case Generator.root tree of
   Discarded ->
     Again { runs = t.runs, discarded = t.discarded + 1, labels = t.labels }
   Failed _ _ -> Done (failedRun name True seed t (shrink cfg.shrinks 0 tree))
+  Reached _ -> Done (failedRun name True seed t (shrink cfg.shrinks 0 tree))
 
 -- | The property's runs: each from a seed of its own, at a size growing
 -- | to 100.
@@ -588,7 +632,7 @@ runUnit name seed c = case Generator.root
       { runs = 1, discarded = 0, labels = Map.empty }
       (List.reverse tr.goldens)
   Failed tr f -> failedWith name False seed noTally 0 tr f
-  Discarded ->
+  _ ->
     failedWith
       name
       False
@@ -692,12 +736,17 @@ mapRun : {a b : Type} -> (a -> b) -> Run a -> Run b
 mapRun g (Going t x) = Going t (g x)
 mapRun g (Failed t f) = Failed t f
 mapRun g Discarded = Discarded
+mapRun g (Reached r) = Reached r
+
+-- | A run outside: given the names of the subtest it is run for, those
+-- | not yet come to (none: the test itself).
+type Outside a = List String -> Co outside (Run a)
 
 -- (a run outside, as a functor)
 runOutside : RawFunctor
 runOutside =
-  { f = \x -> Co outside (Run x)
-  , fmap = \g m -> bind m (\r -> val (mapRun g r))
+  { f = \x -> Outside x
+  , fmap = \g m path -> bind (m path) (\r -> val (mapRun g r))
   }
 
 -- (what an operation outside holds of a run: never a run, as the
@@ -714,22 +763,50 @@ continueOutside : {a b : Type}
 continueOutside k (Going t x) = bind (k x) (\r -> val (after t r))
 continueOutside k (Failed t f) = val (Failed t f)
 continueOutside k Discarded = val Discarded
+continueOutside k (Reached r) = val (Reached r)
+
+-- (a subtest's run, done for the names after its own: come to, if it is
+-- the one run for, or one under it is; else the test goes on)
+cameTo : {a : Type} -> List String -> a -> Run Unit -> Run a
+cameTo Nil x r = Reached r
+cameTo path x (Reached r) = Reached r
+cameTo path x r = Going noTrace x
+
+-- | A subtest come to, run for these names: the test itself names it
+-- | (none left), and does no more of it; on the way to the one run for,
+-- | it is done, the names after its own given it; else passed over.
+subtestRun : {a : Type}
+           -> String
+           -> Outside Unit
+           -> a
+           -> List String
+           -> Co outside (Run a)
+subtestRun name c x Nil =
+  val (Going { notes = Nil, labels = Nil, goldens = Nil, subtests = [name] } x)
+subtestRun name c x (Cons n rest) =
+  if strEq n name then bind (c rest) (\r -> val (cameTo rest x r))
+  else val (Going noTrace x)
+
+-- (an operation of checking, run outside)
+checkOutside : {a : Type} -> CheckF Outside a -> Outside a
+checkOutside (Sub name c x) path = subtestRun name c x path
+checkOutside c path = val (checkRun c)
 
 -- | The runner of an integration test: checking handled, the world
 -- | outside's operations done as they are.
 outsideRunner : Handler integrated
 outsideRunner =
-  { M = \a -> Co outside (Run a)
-  , ret = \x -> val (Going noTrace x)
-  , bind = \m k -> bind m (\r -> continueOutside k r)
-  , malg = \p -> case p of
-      InL c -> val (checkRun c)
+  { M = \a -> Outside a
+  , ret = \x path -> val (Going noTrace x)
+  , bind = \m k path -> bind (m path) (\r -> continueOutside (\x -> k x path) r)
+  , malg = \p path -> case p of
+      InL c -> checkOutside c path
       InR q ->
         op
           (outside.hmap
              runOutside
              (coFunctor outside)
-             (\m -> bind m valueOfRun)
+             (\m -> bind (m path) valueOfRun)
              q)
           (\x -> val (Going noTrace x))
   }
@@ -737,21 +814,78 @@ outsideRunner =
 -- (what came of an integration test's run)
 integrationOutcome : String -> Run Unit -> Outcome
 integrationOutcome name (Going tr _) =
-  passed
-    name
-    False
-    0
-    { runs = 1, discarded = 0, labels = Map.empty }
-    (List.reverse tr.goldens)
+  { passed
+      name
+      False
+      0
+      { runs = 1, discarded = 0, labels = Map.empty }
+      (List.reverse tr.goldens)
+  | subtests = List.reverse tr.subtests
+  }
 integrationOutcome name (Failed tr f) = failedWith name False 0 noTally 0 tr f
 integrationOutcome name Discarded =
   failedWith name False 0 noTally 0 noTrace (Because "a test gave itself up")
+integrationOutcome name (Reached r) = integrationOutcome name r
 
--- (the integration test of this name run, what came of it)
+-- (each name once, else the first named twice)
+twice : List String -> Maybe String
+twice Nil = Nothing
+twice (Cons n rest) =
+  if List.any (\m -> strEq m n) rest then Just n else twice rest
+
+-- (a name a subtest cannot have)
+badName : String -> Bool
+badName n =
+  strEq n ""
+  || List.any (\i -> byteAt n i == 47) (List.range 0 (strLength n - 1))
+
+-- | what came of a test, its subtests' names held to being names: each
+-- | once, and none with a `/`, which `--run` takes for a level's end
+namesHeld : Outcome -> Outcome
+namesHeld o = case twice o.subtests of
+  Just n ->
+    failedWith
+      o.name
+      False
+      0
+      noTally
+      0
+      noTrace
+      (Because ("two subtests are named " ^ show n))
+  Nothing -> case List.find badName o.subtests of
+    Just n ->
+      failedWith
+        o.name
+        False
+        0
+        noTally
+        0
+        noTrace
+        (Because ("a subtest's name has a `/` or is empty: " ^ show n))
+    Nothing -> o
+
+-- (what came of the subtest run for, the names after the test's own: if
+-- it was not come to, there is none of that name)
+subtestOutcome : String -> List String -> Run Unit -> Outcome
+subtestOutcome name Nil r = namesHeld (integrationOutcome name r)
+subtestOutcome name path (Reached r) = namesHeld (integrationOutcome name r)
+subtestOutcome name path r =
+  failedWith
+    name
+    False
+    0
+    noTally
+    0
+    noTrace
+    (Because ("no subtest " ^ joinWith " / " path))
+
+-- (the integration test of this name run, or its subtest of these names,
+-- what came of it)
 integrationRun : String
+               -> List String
                -> Maybe (Pair String (Co integrated Unit))
                -> Co outside Outcome
-integrationRun name Nothing =
+integrationRun name path Nothing =
   val
     (failedWith
        name
@@ -761,8 +895,10 @@ integrationRun name Nothing =
        0
        noTrace
        (Because ("no integration test " ^ name)))
-integrationRun name (Just t) =
-  bind (handle outsideRunner (snd t)) (\r -> val (integrationOutcome name r))
+integrationRun name path (Just t) =
+  bind
+    (handle outsideRunner (snd t) path)
+    (\r -> val (subtestOutcome name path r))
 
 failureJson : Maybe Failure -> Json.Json
 failureJson Nothing = JNull
@@ -772,7 +908,8 @@ failureJson (Just (Differ expected got)) =
     [Json.kv "differ" (JArray [Json.jstr expected, Json.jstr got])]
 
 -- | An outcome of an integration test as its program writes it, JSON:
--- | whether it held, its notes, why it failed, its golden texts.
+-- | whether it held, its notes, why it failed, its golden texts, its
+-- | subtests' names.
 outcomeJson : Outcome -> Json.Json
 outcomeJson o =
   Json.obj
@@ -786,6 +923,7 @@ outcomeJson o =
             (\(g : Pair String String) ->
                JArray [Json.jstr (fst g), Json.jstr (snd g)])
             o.goldens))
+    , Json.kv "subtests" (JArray (List.map Json.jstr o.subtests))
     ]
 
 -- | What an integration test's program writes before its outcome, on a
@@ -797,7 +935,8 @@ outcomeMarker = "-- heff test: the outcome --"
 type Integrations = Co outside Unit
 
 -- | The program `heff test` builds of a file's tests: it runs the
--- | integration test its first argument names, where it is run (in the
+-- | integration test its first argument names (its subtest, the
+-- | arguments after it naming it a level each), where it is run (in the
 -- | directory `heff test` gives it), and writes what came of it to its
 -- | output, after `outcomeMarker`.
 integrationMain : List Test -> Integrations
@@ -806,6 +945,7 @@ integrationMain ts = do
   o <-
     integrationRun
       (fromMaybe "" (List.head as))
+      (List.drop 1 as)
       (List.find
          (\(t : Pair String (Co integrated Unit)) ->
             strEq (fst t) (fromMaybe "" (List.head as)))
@@ -853,4 +993,6 @@ instanceShowOutcome = { show = written }
     ^ show o.seed
     ^ ", goldens = "
     ^ show o.goldens
+    ^ ", subtests = "
+    ^ show o.subtests
     ^ " }"

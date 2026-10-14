@@ -140,6 +140,45 @@ the path of the heff that runs it, and `HEFF_TEST_ROOT`, the project's
 root: a test of heff runs the heff tested, not one on the PATH, on the
 project's files (`run { command = heff, args = ..., dir = root }`).
 
+## Subtests
+
+An integration test may make tests of its own as it runs, as Go's
+`t.Run` does: `subtest NAME body`.  Each is said on a line of its own,
+under its test's name (`files / a.txt`), holds or fails by itself and
+keeps its own golden texts; subtests may have subtests.  So the tests
+can be what is there when they run, a subtest a file of a directory,
+with no list of them written.
+
+```haskell
+-- (a subtest each file, its text held to its golden one)
+each : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{disk : filesystem <: e}}
+     -> List String
+     -> Co e Unit
+each Nil = pure MkUnit
+each (Cons n rest) = do
+  subtest n (do
+    text <- readFile ("inputs/" ^ n)
+    golden n (fromMaybe "" text))
+  each rest
+
+inputs : Test
+inputs = integration "files" (do
+  names <- readDirectory "inputs"
+  each (List.sort (fromMaybe Nil names)))
+```
+
+Each subtest runs in a process of its own, as many at once as the
+integration tests: the test's program, asked for a subtest by its
+names, does the test again from its start, doing only the subtests on
+the way to the one asked for and passing over the others; the test
+itself, run, names its subtests and does none.  So a test must do the
+same each time up to its subtests and name them alike (a directory's
+names sorted, as above), each name once and with no `/`; what it does
+after a subtest is done as if the subtest held.  A subtest is an
+integration test's: a unit test that makes one fails.
+
 ## Selecting tests
 
 `heff test --run REGEXP` runs only the tests whose names the pattern
@@ -150,7 +189,11 @@ A test whose names are fewer than the levels is matched by those it
 has, and one deeper than the pattern by its groups.  `--run '^lsp/hover'`
 runs the tests of the groups named `lsp...` whose names have `hover`;
 `--run /hover` the tests named `...hover...` of any group, and every
-test of no group.  A file none of whose tests is selected is passed
+test of no group.  Subtests are selected so too, a level each, as
+their tests name them: their test runs to name them, and those the
+pattern does not match are not run.  A file none of whose tests is
+selected (a test run only on the way to subtests the pattern does not
+match counts as none) is passed
 over, its watches and doc tests too, and not listed; where no test of
 any file is, `heff test` says `no tests match 'PATTERN'` and fails.
 

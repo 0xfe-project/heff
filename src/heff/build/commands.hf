@@ -3007,6 +3007,12 @@ lastLines : Int -> String -> String
 lastLines n t =
   joinWith "\n" (List.reverse (List.take n (List.reverse (split "\n" t))))
 
+-- (what an integration test's program wrote after its last
+-- `outcomeMarker`)
+writtenAfter : Ran -> String
+writtenAfter r =
+  fromMaybe "" (List.last (split ("\n" ^ outcomeMarker ^ "\n") r.out))
+
 -- | what came of an integration test, its program run: what it wrote
 -- | after its last `outcomeMarker`, else how it ended and what it said
 -- | on its error stream
@@ -3024,23 +3030,68 @@ ranOutcome name limit r = case r.ended of
          ^ endedSaid r.ended
          ^ ", and said nothing of how it went"
          ^ (if strEq r.err "" then "" else ":\n" ^ lastLines 20 r.err))
-    Just _ -> case Json.parse
-        (fromMaybe
-           ""
-           (List.last (split ("\n" ^ outcomeMarker ^ "\n") r.out))) of
+    Just _ -> case Json.parse (writtenAfter r) of
       Left why ->
         brokenTest name "what it said of how it went could not be read"
       Right j -> outcomeOfJson name j
 
--- | an integration test to run: its place among the file's, its name and
--- | time limit
-type Job = { index : Int, name : String, limit : Int }
+subtestsOfJson : Either Json.ParseError Json.Json -> List String
+subtestsOfJson (Right j) =
+  List.map jsonText (fromMaybe Nil (Json.arr ["subtests"] j))
+subtestsOfJson (Left why) = Nil
+
+-- | the subtests an integration test named, its program run, in order:
+-- | none, if it did not say how it went
+ranSubtests : Ran -> List String
+ranSubtests r = case indexOf ("\n" ^ outcomeMarker ^ "\n") r.out of
+  Nothing -> Nil
+  Just _ -> subtestsOfJson (Json.parse (writtenAfter r))
+
+-- | an integration test to run: its place among the file's (a subtest's,
+-- | its test's place and its own among the test's subtests), the name
+-- | of the test it is or is under, the names of the subtests down to it,
+-- | and its time limit
+type Job = { place : List Int, top : String, path : List String, limit : Int }
+
+-- | an integration test's name: its test's, and the subtests' down to it
+jobName : Job -> String
+jobName j = joinWith " / " (Cons j.top j.path)
+
+-- | a test's names a level each, as `--run` selects them: its groups', its
+-- | own and its subtests'
+jobLevels : Job -> List String
+jobLevels j = List.append (split " / " j.top) j.path
+
+-- | is a test of these names, a level each, selected by the levels of
+-- | `--run`'s pattern: each name matched by the level of its depth, those
+-- | deeper than the pattern by any
+levelsSelected : List Regex.Regex -> List String -> Bool
+levelsSelected Nil names = True
+levelsSelected (Cons r rs) Nil = True
+levelsSelected (Cons r rs) (Cons n ns) =
+  Regex.matches r n && levelsSelected rs ns
+
+-- | the subtests of a test that ran, those the pattern selects, to run
+-- | next: each at its place under the test's
+subtestJobs : List Regex.Regex -> Job -> Int -> List String -> List Job
+subtestJobs sel j k Nil = Nil
+subtestJobs sel j k (Cons n rest) =
+  if levelsSelected sel (List.append (jobLevels j) [n])
+  then Cons
+      { place = List.append j.place [k]
+      , top = j.top
+      , path = List.append j.path [n]
+      , limit = j.limit
+      }
+      (subtestJobs sel j (k + 1) rest)
+  else subtestJobs sel j (k + 1) rest
 
 -- | an integration test running: its program, and its directory
 type Running = { job : Job, proc : Subprocess, dir : String }
 
--- (what came of a test, at its place)
-type Finished = { index : Int, outcome : Driver.TestOutcome }
+-- (what came of a test, at its place, and its subtests to run next)
+type Finished =
+  { place : List Int, outcome : Driver.TestOutcome, next : List Job }
 
 -- | what runs the integration tests: their program, and what is set in
 -- | its environment -- `HEFF`, the heff that runs them, and
@@ -3062,14 +3113,16 @@ startJob launch j = do
     Left err ->
       pure
         (Left
-           { index = j.index
-           , outcome = brokenTest j.name ("no directory for it: " ^ err.message)
+           { place = j.place
+           , outcome =
+               brokenTest (jobName j) ("no directory for it: " ^ err.message)
+           , next = Nil
            })
     Right dir -> do
       started <-
         start
           { command = launch.program
-          , args = [j.name]
+          , args = Cons j.top j.path
           , dir = dir
           , env = launch.env
           , timeout = j.limit
@@ -3079,8 +3132,10 @@ startJob launch j = do
           gone <- remove dir
           pure
               (Left
-                 { index = j.index
-                 , outcome = brokenTest j.name "its program could not be run"
+                 { place = j.place
+                 , outcome =
+                     brokenTest (jobName j) "its program could not be run"
+                 , next = Nil
                  })
         Just proc -> pure (Right { job = j, proc = proc, dir = dir })
 
@@ -3092,22 +3147,25 @@ finishedWith : Either Finished Running -> List Finished -> List Finished
 finishedWith (Left f) fs = Cons f fs
 finishedWith (Right r) fs = fs
 
--- (the test whose program ended, its directory removed: what came of it)
+-- (the test whose program ended, its directory removed: what came of it,
+-- and its subtests selected, to run next)
 endedJob : {e : HFunctor}
          -> {{disk : filesystem <: e}}
+         -> List Regex.Regex
          -> List Running
          -> Maybe (Pair Subprocess Ran)
          -> Co e (List Finished)
-endedJob rs Nothing = pure Nil
-endedJob rs (Just (MkPair proc ran)) = case List.find
+endedJob sel rs Nothing = pure Nil
+endedJob sel rs (Just (MkPair proc ran)) = case List.find
     (\(r : Running) -> sameHandle r.proc proc)
     rs of
   Nothing -> pure Nil
   Just r -> do
     gone <- remove r.dir
     pure
-        [ { index = r.job.index
-          , outcome = ranOutcome r.job.name r.job.limit ran
+        [ { place = r.job.place
+          , outcome = ranOutcome (jobName r.job) r.job.limit ran
+          , next = subtestJobs sel r.job 0 (ranSubtests ran)
           }
         ]
 
@@ -3116,34 +3174,47 @@ stillRunning rs Nothing = Nil
 stillRunning rs (Just (MkPair proc ran)) =
   List.filter (\(r : Running) -> not (sameHandle r.proc proc)) rs
 
+-- (the subtests the tests that ended named, to run next)
+nextJobs : List Finished -> List Job
+nextJobs fs = List.concatMap (\(f : Finished) -> f.next) fs
+
 -- | the integration tests run, `jobs` at most at once, each its program
--- | in a directory of its own: as one ends, the next starts
+-- | in a directory of its own: as one ends, the next starts, and the
+-- | subtests it named, those `sel` selects, wait after the others
 runJobs : {e : HFunctor}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
         -> Launch
+        -> List Regex.Regex
         -> Int
         -> List Job
         -> List Running
         -> List Finished
         -> Co e (List Finished)
-runJobs launch jobs Nil Nil done = pure done
-runJobs launch jobs Nil running done = do
+runJobs launch sel jobs Nil Nil done = pure done
+runJobs launch sel jobs Nil running done = do
   w <- waitAny (List.map (\(r : Running) -> r.proc) running)
-  ended <- endedJob running w
-  runJobs launch jobs Nil (stillRunning running w) (List.append ended done)
-runJobs launch jobs (Cons j rest) running done =
+  ended <- endedJob sel running w
+  runJobs
+      launch
+      sel
+      jobs
+      (nextJobs ended)
+      (stillRunning running w)
+      (List.append ended done)
+runJobs launch sel jobs (Cons j rest) running done =
   if List.length running < jobs
   then do
     s <- startJob launch j
-    runJobs launch jobs rest (runningWith s running) (finishedWith s done)
+    runJobs launch sel jobs rest (runningWith s running) (finishedWith s done)
   else do
     w <- waitAny (List.map (\(r : Running) -> r.proc) running)
-    ended <- endedJob running w
+    ended <- endedJob sel running w
     runJobs
         launch
+        sel
         jobs
-        (Cons j rest)
+        (List.append (Cons j rest) (nextJobs ended))
         (stillRunning running w)
         (List.append ended done)
 
@@ -3151,7 +3222,26 @@ runJobs launch jobs (Cons j rest) running done =
 jobsOf : Int -> List (Pair String Int) -> List Job
 jobsOf i Nil = Nil
 jobsOf i (Cons (MkPair name limit) rest) =
-  Cons { index = i, name = name, limit = limit } (jobsOf (i + 1) rest)
+  Cons
+    { place = [i], top = name, path = Nil, limit = limit }
+    (jobsOf (i + 1) rest)
+
+-- | is one place before another: a test's before its subtests', and
+-- | those of a test in their order
+placeBefore : List Int -> List Int -> Bool
+placeBefore Nil bs = True
+placeBefore (Cons a as) Nil = False
+placeBefore (Cons a as) (Cons b bs) =
+  if a == b then placeBefore as bs else a < b
+
+-- | the levels of `--run`'s pattern (none, all selected, for none or one
+-- | that is not read)
+patternLevels : String -> List Regex.Regex
+patternLevels p =
+  if strEq p "" then Nil
+  else case Regex.compileLevels p of
+    Left why -> Nil
+    Right sel -> sel
 
 -- (a path made real, else the one given)
 pathOr : String -> Either FileError String -> String
@@ -3224,6 +3314,7 @@ runIntegrations opts p k = case integrationLoaded p of
                     , MkPair "HEFF_TEST_ROOT" (pathOr l.paths.root root)
                     ]
                 }
+                (patternLevels opts.pattern)
                 opts.jobs
                 (jobsOf 0 p.integrations)
                 Nil
@@ -3233,7 +3324,8 @@ runIntegrations opts p k = case integrationLoaded p of
                 (List.map
                    (\(f : Finished) -> f.outcome)
                    (List.sortBy
-                      (\(a : Finished) (b : Finished) -> a.index <= b.index)
+                      (\(a : Finished) (b : Finished) ->
+                         placeBefore a.place b.place)
                       done)))))
 
 -- (a file tested to its end here, its integration tests not run: its
@@ -3249,6 +3341,33 @@ testedHere (Settled r) = pure r
 testedHere (Pend p) = do
   os <- withGoldens False p.file p.outcomes
   testReport p.file p.wrong p.reports os
+
+-- (does a test's name reach as deep as these levels of `--run`: one the
+-- pattern selects, not one run on the way to its subtests)
+reaches : List Regex.Regex -> Driver.TestOutcome -> Bool
+reaches sel o = List.length (split " / " o.name) >= List.length sel
+
+-- | a file's outcomes, `--run` given, all held and none as deep as the
+-- | pattern (its tests run only on the way to subtests it does not
+-- | name): the file passed over, as one whose tests it selects none of
+passedOver : TestOpts -> List Driver.TestOutcome -> Bool
+passedOver opts os =
+  not (strEq opts.pattern "")
+  && List.null (badOutcomes os)
+  && not (List.any (reaches (patternLevels opts.pattern)) os)
+
+-- (a file's outcomes, their golden texts held: its line said, else it is
+-- passed over)
+reported : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{rep : Report.report <: e}}
+         -> TestOpts
+         -> Pending
+         -> List Driver.TestOutcome
+         -> Co e TestRes
+reported opts p os =
+  if passedOver opts os then pure noRes
+  else testReport p.file p.wrong p.reports os
 
 -- (a file tested to its end: its integration tests run, if it has some,
 -- its golden texts held, and its line said; then `k` of what it came to)
@@ -3267,13 +3386,13 @@ finishTested opts (Pend p) k =
   if List.null p.integrations
   then do
     os <- withGoldens opts.update p.file p.outcomes
-    r <- testReport p.file p.wrong p.reports os
+    r <- reported opts p os
     k r
   else runIntegrations
       opts
       p (\more -> do
     os <- withGoldens opts.update p.file (List.append p.outcomes more)
-    r <- testReport p.file p.wrong p.reports os
+    r <- reported opts p os
     k r)
 
 -- (the tests' part of the last line: said only if there were some)
