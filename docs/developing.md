@@ -180,9 +180,9 @@ the table.
 All that is made is under `.heff/`: the compiler built (`out/`), the
 cache of compiled modules (`vN/`), the backends' cache (`bN/`), the
 programs `heff build` makes (`bin/`, their C in `build/`), what `heff
-run` runs (`run/`), the example apps (`examples/`), the tests' work
-directories (`ref/`), and zig's own cache of the parts it builds
-(`zig-cache/`, this checkout's alone, begun afresh each build); and
+run` runs (`run/`), the tests' work directories (`ref/`), and zig's
+own cache of the parts it builds (`zig-cache/`, this checkout's alone,
+begun afresh each build); and
 zig's cache, beside it, `.zig-cache/`, of the build's own program.
 
 The backends' cache keeps, for each module (`bN/M.hb`), what the

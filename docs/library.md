@@ -167,7 +167,8 @@ a kernel loaded from its code and its entry point (`load`), and run
 over a grid of workgroups with buffers bound, the first at
 `@binding(0)` (`dispatch`), each answered when the GPU is done, an
 `Either GpuError a`.  Its provider is WebGPU's, a page's, so a kernel
-is WGSL; examples/vecadd adds two vectors of Float32s by one.
+is WGSL; the example page vecadd (`examples/pages/`) adds two vectors
+of Float32s by one.
 
 A kernel is written in heff, by `gpu.kernel`'s combinators (`import
 gpu.kernel as Kernel`), not quoted: an expression of the kernel is an
@@ -193,7 +194,7 @@ whose state is a fresh-name counter and the lines; `gpu.run` (`import
 gpu.run as Run`) runs one: a `Typed a` is a buffer of `count` `a`s
 (`newTyped`, `writeTyped`, `readTyped`, `freeTyped`), and `run3 d k n
 x y z` loads `k` and dispatches it over `n` invocations, as many
-workgroups as they take.  examples/vecadd's `vecAdd` is one; test/gpu/
+workgroups as they take.  The vecadd page's `vecAdd` is one; test/gpu/
 pins each statement's WGSL.
 
 A program imports only its own half: a C program that imports a module
@@ -847,10 +848,13 @@ uri body =
 
 ## Examples
 
-`examples/` has apps for the browser: `node examples/build.mjs` builds
-each to `.heff/examples/NAME/`, where its `index.html` opens.
-`examples/notes/` is a page and its server, one project built by `heff
-build` there ([a client and its server](remote.md)); the apps' tests
-(`heff test test/apps.hf`) run both.  `examples/testbridge/` is a project of another kind, built by `heff
-build` there: a Linux program, through C, that makes a bridge and a
+Each directory of `examples/` is a project ([projects](projects.md)):
+`heff build` there builds it, and `heff dev` serves its pages.
+`examples/pages/` is four pages, each a program of its own (`app/NAME/`,
+its `index.html` beside it): a counter, a clock, a greeting written into
+the page, and a sum of vectors on the GPU; `heff dev` there serves each
+at `/NAME/`.  `examples/notes/` is a page and its server, one project
+([a client and its server](remote.md)).  The apps' tests (`heff test
+test/apps.hf`) run them all.  `examples/testbridge/` is a project of
+another kind: a Linux program, through C, that makes a bridge and a
 veth pair by rtnetlink, its socket's calls a provider of its own.
