@@ -110,7 +110,9 @@ make check                 # build-seed, test, fmt-check: all a change is held t
 `make test` is `node test/run.mjs [GROUP...]`, and the groups are
 `compiler`, `lsp`, `backends` (each backend held to the interpreter)
 and `asan` (heff under AddressSanitizer, by clang; `make test-asan JOBS=4 TIMEOUT=120` sets
-`HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`).  The scripts run at once,
+`HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`; `heff test --run asan/check/wire.hf
+test/asan.hf` checks one program; where there is no clang with ASan's
+runtime, it holds having checked nothing).  The scripts run at once,
 and what they run shares one budget, as make's jobserver does: as many
 processes at once as there are cores, or `HEFF_TEST_JOBS` (a script
 run by itself has its own pools).  So there is no need for `make -j`,

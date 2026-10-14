@@ -77,7 +77,7 @@ test-fixpoint: ## heff compiles itself to the same C (by zig, as make boot check
 	$(ZIG) build fixpoint
 
 test-asan: ## heff under AddressSanitizer, by clang (JOBS=..., TIMEOUT=...)
-	$(if $(JOBS),HEFF_ASAN_JOBS=$(JOBS) )$(if $(TIMEOUT),HEFF_ASAN_TIMEOUT=$(TIMEOUT) )$(NODE) test/native-asan.mjs
+	$(if $(JOBS),HEFF_ASAN_JOBS=$(JOBS) )$(if $(TIMEOUT),HEFF_ASAN_TIMEOUT=$(TIMEOUT) )$(HEFF) test test/asan.hf
 
 check: build-seed test fmt-check ## all a change is held to: from the seed, every test, the layout
 
