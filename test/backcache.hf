@@ -1,0 +1,530 @@
+-- The backend's cache (`.heff/bN/MODULE.hb`): a program compiled to C
+-- (as parts), or to a page's script, through it is the program compiled
+-- without it, byte for byte -- cold, warm, after an edit, and after a
+-- corrupt file; a warm run of a program rewrites none of its files; C
+-- after a page's script is the C made before; a definition that is
+-- inlined into another, or a copy made for it, changed, makes that other
+-- be made again: the program runs as the edit says; and a global newly
+-- named as a definition's local is, not mentioned by it, leaves its
+-- JavaScript as a cold run makes it.  Each test in a directory of its
+-- own, the project's library copied into its `lib/`, run by the heff
+-- that runs the tests (`HEFF`); the C built by zig (else `cc`), a page's
+-- script run by Node.js on a pretend page.  The programs of
+-- `backcache/` are two compiled whole:
+--
+--   heff test --run backcache/javascript test/backcache.hf
+
+import check
+import co
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (files written, each a path and its text; else the test fails)
+writeAll : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List (Pair String String)
+         -> Co e Unit
+writeAll Nil = pure MkUnit
+writeAll (Cons (MkPair path text) rest) = do
+  ok <- writeFile path text
+  if ok then writeAll rest else failure ("could not write " ^ path)
+
+-- (these files of the project's library copied into `lib/`)
+copied : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> List String
+       -> Co e Unit
+copied from Nil = pure MkUnit
+copied from (Cons n rest) = do
+  ok <- copy (from ^ "/" ^ n) ("lib/" ^ n)
+  if ok then copied from rest else failure ("could not copy " ^ n)
+
+-- (a program of `backcache/`, its text)
+programText : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> String
+            -> Co e String
+programText name = do
+  root <- given "HEFF_TEST_ROOT"
+  text <- readFile (root ^ "/test/backcache/" ^ name)
+  pure (fromMaybe "" text)
+
+-- The programs
+--------------------------------------------------------------------------------
+
+-- | `step`, small: inlined where it is called; `loop`, calling itself: a
+-- | copy of it made for `step`, `step` inlined in the copy
+stepping : Int -> String
+stepping n =
+  "step : Int -> Int\nstep x = x + "
+  ^ show n
+  ^ "\n\nloop : (Int -> Int) -> Int -> Int -> Int\nloop f n acc = if n <= 0 then acc else loop f (n - 1) (f acc)\n"
+
+-- | a program printing `loop step 3 (step 10)`
+printing : String
+printing =
+  "import a\nimport co\nimport std.io\n\nprogram : {e : HFunctor} -> {{io : stdio <: e}} -> Co e Unit\nprogram = print (show (loop step 3 (step 10)))\n\nmain : Co stdio Unit\nmain = program (io := \\p -> p)\n"
+
+-- | the program for a page: these imports and definitions, and what it
+-- | shows written in its `#out`
+pageOf : String -> String -> String -> String
+pageOf imports defs shown =
+  "import co\nimport browser.dom\n"
+  ^ imports
+  ^ "\n"
+  ^ defs
+  ^ "\nprogram : {{page : dom <: dom}} -> Co dom Unit\nprogram = do\n  out <- select \"#out\"\n  found out (\\o -> text o (show ("
+  ^ shown
+  ^ ")))\n\nmain : Co dom Unit\nmain = program (page := here dom)\n"
+
+-- | a page counting, `x` a global of its own or not, as `count`'s local
+-- | is named
+counting : Bool -> String
+counting withX =
+  pageOf
+    ""
+    ((if withX then "\nx : Int\nx = 5\n" else "")
+     ^ "\ncount : Int -> Int -> Int\ncount x acc = if x <= 0 then acc else count (x - 1) (acc + x * x)\n")
+    (if withX then "count 3 x" else "count 3 0")
+
+-- | a script that runs a page's script on a pretend page, and says what
+-- | it wrote in `#out`
+pretend : String
+pretend =
+  "import { readFileSync } from \"node:fs\";\nimport vm from \"node:vm\";\nconst shown = { textContent: \"\" };\ntry { vm.runInNewContext(readFileSync(process.argv[2], \"utf8\"), { document: { querySelector: () => shown } }); }\ncatch (e) { shown.textContent = \"(threw \" + e + \")\"; }\nprocess.stdout.write(shown.textContent);\n"
+
+-- | the project's library, its `.hf` files, in `lib/` of the test's
+-- | directory, and `a`, `main` and `page` beside it
+project : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+project = do
+  root <- given "HEFF_TEST_ROOT"
+  names <- readDirectory (root ^ "/lib")
+  made <- makeDirectory "lib"
+  copied
+      (root ^ "/lib")
+      (List.filter (\n -> endsWith ".hf" n) (fromMaybe Nil names))
+  writeAll
+      [ MkPair "a.hf" (stepping 1)
+      , MkPair "main.hf" printing
+      , MkPair "page.hf" (pageOf "import a" "" "loop step 3 (step 10)")
+      , MkPair "pretend.mjs" pretend
+      ]
+
+-- The cache
+--------------------------------------------------------------------------------
+
+-- (a name of `.heff/` that is the backend's directory, `b` and digits)
+versioned : String -> Bool
+versioned n =
+  startsWith "b" n
+  && strLength n > 1
+  && List.all
+    (\i -> byteAt n i >= 48 && byteAt n i <= 57)
+    (List.range 1 (strLength n - 1))
+
+-- | the backend's cache directory (`.heff/bN/`)
+backDir : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e String
+backDir = do
+  names <- readDirectory ".heff"
+  pure
+      (".heff/"
+       ^ fromMaybe "b?" (List.find versioned (fromMaybe Nil names)))
+
+-- | the cache's files, each a path, sorted
+cacheFiles : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> Co e (List String)
+cacheFiles = do
+  dir <- backDir
+  names <- readDirectory dir
+  pure
+      (List.map
+         (\n -> dir ^ "/" ^ n)
+         (List.sort
+            (List.filter (\n -> endsWith ".hb" n) (fromMaybe Nil names))))
+
+-- (whether the cache has a module's file)
+kept : {e : HFunctor} -> {{disk : filesystem <: e}} -> String -> Co e Bool
+kept m = do
+  files <- cacheFiles
+  pure (List.any (\f -> endsWith ("/" ^ m ^ ".hb") f) files)
+
+-- (when each of these files was last written)
+modifiedAll : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> List String
+            -> Co e (List Int)
+modifiedAll Nil = pure Nil
+modifiedAll (Cons f rest) = do
+  status <- pathStatus f
+  others <- modifiedAll rest
+  pure (Cons (either (\_ -> 0 - 1) (\(s : Status) -> s.modified) status) others)
+
+-- (the cache's files removed)
+removedAll : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> List String
+           -> Co e Unit
+removedAll Nil = pure MkUnit
+removedAll (Cons f rest) = do
+  gone <- remove f
+  removedAll rest
+
+-- (the cache's files each cut to its first hundred bytes)
+corrupted : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{disk : filesystem <: e}}
+          -> List String
+          -> Co e Unit
+corrupted Nil = pure MkUnit
+corrupted (Cons f rest) = do
+  text <- readFile f
+  writeAll [MkPair f (strSlice (fromMaybe "" text) 0 100)]
+  corrupted rest
+
+-- (a run of the cache leaves its files alone: when each was written, the
+-- same)
+leftAlone : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> List String
+          -> List Int
+          -> Co e Unit
+leftAlone what files times = do
+  after <- modifiedAll files
+  assert what (List.all (\p -> fst p == snd p) (List.zip after times))
+
+-- Compiled
+--------------------------------------------------------------------------------
+
+-- | what a compile made: what heff said, and its files, each a name and
+-- | its text
+type Made = { ran : Ran, files : List (Pair String String) }
+
+-- (these files of a directory read, each a name and its text)
+readAll : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> List String
+        -> Co e (List (Pair String String))
+readAll dir Nil = pure Nil
+readAll dir (Cons n rest) = do
+  text <- readFile (dir ^ "/" ^ n)
+  others <- readAll dir rest
+  pure (Cons (MkPair n (fromMaybe "" text)) others)
+
+-- (heff run in the test's directory)
+heffIn : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> List String
+       -> Co e Ran
+heffIn arguments = do
+  heff <- given "HEFF"
+  run { command = heff, args = arguments }
+
+-- | the program compiled to C, as parts in `out/`, through the cache
+compiled : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> Co e Made
+compiled out = do
+  r <- heffIn ["compile", "main.hf", out ^ "/", "--name", "main", "--backend=c"]
+  names <- readDirectory out
+  files <- readAll out (List.sort (fromMaybe Nil names))
+  pure { ran = r, files = files }
+
+-- | the page's script compiled to `out`, through the cache
+compiledJs : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> Co e Made
+compiledJs out = do
+  r <- heffIn ["compile", "page.hf", out, "--name", "main", "--backend=page"]
+  text <- readFile out
+  pure { ran = r, files = [MkPair "js" (fromMaybe "" text)] }
+
+-- | compiled cold: the cache's files removed first
+cold : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> (String -> Co e Made)
+     -> String
+     -> Co e Made
+cold compile out = do
+  files <- cacheFiles
+  removedAll files
+  compile out
+
+-- (compiled, else the test fails, saying what heff said)
+madeWell : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> String
+         -> Made
+         -> Co e Unit
+madeWell what m =
+  if succeeded m.ran then pure MkUnit else failure (what ^ "\n" ^ said m.ran)
+
+-- (two lists of files the same, name for name and byte for byte)
+sameFiles : List (Pair String String) -> List (Pair String String) -> Bool
+sameFiles Nil Nil = True
+sameFiles (Cons (MkPair n t) xs) (Cons (MkPair m u) ys) =
+  strEq n m && strEq t u && sameFiles xs ys
+sameFiles _ _ = False
+
+-- | both compiled, and to the same files
+same : Made -> Made -> Bool
+same x y = succeeded x.ran && succeeded y.ran && sameFiles x.files y.files
+
+-- (the C of `out/` built and run: what it printed, trimmed)
+runs : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> String
+     -> Co e String
+runs out = do
+  names <- readDirectory out
+  zig <- run { command = "zig", args = ["version"] }
+  sources <-
+    pure
+      (List.map
+         (\n -> out ^ "/" ^ n)
+         (List.filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+  flags <-
+    pure
+      (List.append
+         (Cons "-O0" (Cons "-w" sources))
+         ["-o", out ^ "/prog", "-lm", "-lpthread"])
+  built <-
+    if succeeded zig then run { command = "zig", args = Cons "cc" flags }
+    else run { command = "cc", args = flags }
+  if succeeded built
+    then do
+      r <- run { command = out ^ "/prog" }
+      pure (trim r.out)
+    else pure ("(not built: " ^ strSlice built.err 0 200 ^ ")")
+
+-- (the page's script of `out` run on a pretend page: what it wrote)
+runsJs : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> Co e String
+runsJs out = do
+  r <- run { command = "node", args = ["pretend.mjs", out] }
+  pure (if succeeded r then r.out else "(not run: " ^ r.err ^ ")")
+
+-- (it printed what is wanted, else the test fails, saying what it did)
+printed : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> String
+        -> String
+        -> String
+        -> Co e Unit
+printed what wanted got =
+  if strEq wanted got then pure MkUnit
+  else failure (what ^ ": wanted " ^ wanted ^ ", printed " ^ got)
+
+-- The tests
+--------------------------------------------------------------------------------
+
+-- | C through the cache: cold and warm the same, a warm run writing
+-- | none of the cache's files; an edit to `step`, inlined into `main` and
+-- | into the copy of `loop`, reaching both, the C as a cold run makes
+-- | it; undone, the C as it was; the cache's files corrupt, compiled over
+-- | and kept again
+viaC : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> Co e Unit
+viaC = do
+  project
+  c1 <- compiled "c1"
+  madeWell "a cold compile" c1
+  a <- kept "a"
+  main <- kept "main"
+  assert "a cold run keeps a and main" (a && main)
+  files <- cacheFiles
+  times <- modifiedAll files
+  w1 <- compiled "w1"
+  assert "a warm run makes the C a cold run made" (same c1 w1)
+  leftAlone "a warm run leaves the cache's files alone" files times
+  ran <- runs "w1"
+  printed "the program runs" "14" ran
+  writeAll [MkPair "a.hf" (stepping 2)]
+  e1 <- compiled "e1"
+  madeWell "an edit to an inlined definition compiles" e1
+  assert "an edit to an inlined definition changes the C" (not (same c1 e1))
+  edited <- runs "e1"
+  printed "an edit to an inlined definition reaches what inlines it" "18" edited
+  e2 <- cold compiled "e2"
+  assert "after an edit, the C is what a cold run makes" (same e1 e2)
+  writeAll [MkPair "a.hf" (stepping 1)]
+  b1 <- compiled "b1"
+  assert "an edit undone: the C as it was" (same c1 b1)
+  corrupt <- cacheFiles
+  corrupted corrupt
+  h1 <- compiled "h1"
+  assert "corrupt files of the cache are compiled over" (same c1 h1)
+  h2 <- compiled "h2"
+  assert "and kept again" (same c1 h2)
+
+-- | a page's script through the same files: cold and warm the same, a
+-- | warm run writing none of the cache's files; C after it the C a cold
+-- | run made; an edit reaching the script, as a cold run makes it; the
+-- | cache's files corrupt, compiled over
+javascript : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Co e Unit
+javascript = do
+  project
+  c1 <- compiled "c1"
+  madeWell "a cold compile" c1
+  j1 <- cold compiledJs "j1.js"
+  madeWell "a cold JavaScript compile" j1
+  shown <- runsJs "j1.js"
+  printed "the JavaScript runs" "14" shown
+  files <- cacheFiles
+  times <- modifiedAll files
+  j2 <- compiledJs "j2.js"
+  assert "a warm run makes the JavaScript a cold run made" (same j1 j2)
+  leftAlone
+      "a warm run of the page's leaves the cache's files alone"
+      files
+      times
+  c2 <- compiled "c2"
+  assert "C after JavaScript: the C a cold run made" (same c1 c2)
+  c3 <- compiled "c3"
+  assert "and again" (same c1 c3)
+  writeAll [MkPair "a.hf" (stepping 2)]
+  je <- compiledJs "je.js"
+  madeWell "an edit to an inlined definition compiles" je
+  assert
+      "an edit to an inlined definition changes the JavaScript"
+      (not (same j1 je))
+  edited <- runsJs "je.js"
+  printed "an edit reaches the JavaScript" "18" edited
+  je2 <- cold compiledJs "je2.js"
+  assert "after an edit, the JavaScript is what a cold run makes" (same je je2)
+  writeAll [MkPair "a.hf" (stepping 1)]
+  corrupt <- cacheFiles
+  corrupted corrupt
+  jh <- compiledJs "jh.js"
+  assert
+      "corrupt files of the cache are compiled over, the JavaScript too"
+      (same j1 jh)
+
+-- | a global named as `count`'s local is, newly: `count` unchanged, its
+-- | local as a cold run names it
+newGlobal : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit
+newGlobal = do
+  project
+  writeAll [MkPair "page.hf" (counting False)]
+  k1 <- compiledJs "k1.js"
+  madeWell "count compiles" k1
+  shown <- runsJs "k1.js"
+  printed "count runs" "14" shown
+  writeAll [MkPair "page.hf" (counting True)]
+  k2 <- compiledJs "k2.js"
+  madeWell "count compiles past a global x" k2
+  past <- runsJs "k2.js"
+  printed "count runs past a global x" "19" past
+  k3 <- cold compiledJs "k3.js"
+  assert "a global newly met: the JavaScript a cold run makes" (same k2 k3)
+
+-- | copies settled (callers simplified again once the copies they call
+-- | are made, copies not reached taken as not made, a loop's copies tied
+-- | into one): a clock's `tick` in a page, sleeping each round
+ticking : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+ticking = do
+  project
+  page <- programText "ticking.hf"
+  writeAll [MkPair "page.hf" page]
+  s1 <- cold compiledJs "s1.js"
+  madeWell "a ticking page compiles" s1
+  s2 <- compiledJs "s2.js"
+  assert
+      "a ticking page: a warm run makes the JavaScript a cold run made"
+      (same s1 s2)
+
+-- | ... and four handlers stacked, in C
+stacked : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+stacked = do
+  project
+  main <- programText "stacked.hf"
+  writeAll [MkPair "main.hf" main]
+  s3 <- cold compiled "s3"
+  madeWell "four handlers stacked compile" s3
+  s4 <- compiled "s4"
+  assert
+      "four handlers stacked: a warm run makes the C a cold run made"
+      (same s3 s4)
+  before <- runs "s3"
+  after <- runs "s4"
+  printed "and it runs as it did" before after
+
+-- | the backend's cache: the same C and JavaScript through it, kept, and
+-- | made again where what it inlines changed
+backcache : Test
+backcache =
+  group
+    "backcache"
+    [ integration "c" viaC
+    , integration "javascript" javascript
+    , integration "new-global" newGlobal
+    , integration "ticking" ticking
+    , integration "stacked" stacked
+    ]

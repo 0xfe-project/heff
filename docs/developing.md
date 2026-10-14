@@ -134,7 +134,9 @@ The format tests format each `.hf` file of the repository, and the
 cases of `test/format/`, each held to its golden text (`heff test
 test/format.hf`, `--run format/cases/spacing` for one;
 `heff test --update --run format/cases test/format.hf` after an
-intended change).
+intended change).  The cache tests hold the compiler's cache and the
+backend's, each scenario in a directory of its own (`heff test
+test/cache.hf test/backcache.hf`, `--run cache/instances` for one).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.
@@ -168,7 +170,7 @@ to a definition that is inlined elsewhere makes those again); the
 copies the simplifier made of them, by what each was made of; and each
 definition's C and its JavaScript, by a hash of what it was made from.
 A program compiled through it is the program compiled without it, byte
-for byte (`test/backcache.mjs`).  Its files are of the compiler that wrote them:
+for byte (`heff test test/backcache.hf`).  Its files are of the compiler that wrote them:
 another compiler (a heff built anew) makes them again, so nothing is to
 be bumped when the backend changes.  `bN/compiler` is a copy of that
 compiler, by which it knows itself without hashing itself each time.

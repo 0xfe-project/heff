@@ -31,7 +31,7 @@ export const groups = {
   // what heff says of programs: elaborating, formatting, its cache, its
   // command line, projects, what it draws on a terminal, its commands'
   // app, `heff dev`, and the texts it said before
-  compiler: [["backcache.mjs"], ["cli.mjs"], ["project.mjs"], ["progress.mjs"], ["terminal.mjs"], ["dev.mjs"], ["heff", "test", "test/golden.hf", "test/surface.hf", "test/format.hf", "test/cache.hf"]],
+  compiler: [["cli.mjs"], ["project.mjs"], ["progress.mjs"], ["terminal.mjs"], ["dev.mjs"], ["heff", "test", "test/golden.hf", "test/surface.hf", "test/format.hf", "test/cache.hf", "test/backcache.hf"]],
   lsp: [["lsp.mjs"]],
   // programs compiled by each backend and run, held to the interpreter
   backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],
