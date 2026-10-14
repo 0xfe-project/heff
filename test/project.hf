@@ -1,0 +1,1597 @@
+-- Projects: `heff init` makes one that builds, its watches and tests
+-- holding; a project's modules are under src/, a file outside it (a
+-- test) may import the project's modules and helpers beside it, what is
+-- in src/ may not import those; a module found twice, a package.hf that
+-- does not read and one for another heff are errors.  Packages: given
+-- by directories, fetched by `heff get` (git, MVS, heff.sum), published
+-- by `heff publish`.  Programs: built by `heff build`, installed by
+-- `heff install` -- heff itself too.  The heff run is the one that runs
+-- the tests (`HEFF`), each test in a directory of its own, with its own
+-- package cache; the project's files (`HEFF_TEST_ROOT`) are read, never
+-- written, but by heff installing itself from them.
+--
+--   heff test --run project/get test/project.hf
+--   heff test --run 'project/manifest fields' test/project.hf
+
+import check
+import co
+import regex as Regex
+import std.filesystem
+import std.handle
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (did it exit with this status)
+exitedWith : Int -> Ran -> Bool
+exitedWith n r = case r.ended of
+  Exited k -> k == n
+  _ -> False
+
+-- (the test fails, saying what does not hold and what was said, unless
+-- it holds)
+holds : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> String
+      -> Bool
+      -> List Ran
+      -> Co e Unit
+holds what True rs = pure MkUnit
+holds what False rs =
+  failure (what ^ " does not hold:\n" ^ joinWith "\n" (List.map said rs))
+
+-- (the test fails, saying what does not hold and the text, unless it
+-- holds)
+holdsOf : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> String
+        -> Bool
+        -> String
+        -> Co e Unit
+holdsOf what True text = pure MkUnit
+holdsOf what False text = failure (what ^ " does not hold:\n" ^ text)
+
+-- (where the last `/` of `s` is, at or before `i`; -1 where none is)
+lastSlash : String -> Int -> Int
+lastSlash s i =
+  if i < 0 then i else if byteAt s i == 47 then i else lastSlash s (i - 1)
+
+-- (a file written, the directories above it made; else the test fails)
+write : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{disk : filesystem <: e}}
+      -> String
+      -> String
+      -> Co e Unit
+write path text = do
+  made <-
+    if lastSlash path (strLength path - 1) > 0
+    then makeDirectory (strSlice path 0 (lastSlash path (strLength path - 1)))
+    else pure True
+  ok <- writeFile path text
+  if ok then pure MkUnit else failure ("could not write " ^ path)
+
+-- (a file's text; "" where there is none)
+textOf : {e : HFunctor} -> {{disk : filesystem <: e}} -> String -> Co e String
+textOf path = do
+  t <- readFile path
+  pure (fromMaybe "" t)
+
+-- (gone, or the test fails)
+removed : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> Co e Unit
+removed path = do
+  gone <- remove path
+  if gone then pure MkUnit else failure ("could not remove " ^ path)
+
+-- (`s`, up to the first `post`, after the first `pre`; "" where `pre`
+-- is not there)
+between : String -> String -> String -> String
+between pre post s = case indexOf pre s of
+  Just i ->
+    let rest = strSlice s (i + strLength pre) (strLength s)
+    in strSlice rest 0 (fromMaybe (strLength rest) (indexOf post rest))
+  Nothing -> ""
+
+-- (`s`, each `old` in it `new`)
+replaced : String -> String -> String -> String
+replaced old new s = joinWith new (split old s)
+
+-- (does the pattern match somewhere in the text)
+matchedBy : Either String Regex.Regex -> String -> Bool
+matchedBy (Right r) text = Regex.matches r text
+matchedBy (Left e) text = False
+
+matching : String -> String -> Bool
+matching pattern text = matchedBy (Regex.compile pattern) text
+
+-- (a bit of a file's mode, `k` its value, set)
+hasBit : Int -> Int -> Bool
+hasBit k mode = (mode / k) % 2 == 1
+
+-- (a file's mode, -1 where there is none)
+modeOf : {e : HFunctor} -> {{disk : filesystem <: e}} -> String -> Co e Int
+modeOf path = do
+  st <- pathStatus path
+  pure (case st of
+    Right s -> s.mode
+    Left err -> 0 - 1)
+
+-- (the names in a directory, sorted, one text)
+listing : {e : HFunctor} -> {{disk : filesystem <: e}} -> String -> Co e String
+listing path = do
+  names <- readDirectory path
+  pure (joinWith "," (List.sort (fromMaybe Nil names)))
+
+-- What heff is run with
+--------------------------------------------------------------------------------
+
+-- | what each command run is given: the test's own package cache, git's
+-- | names for its commits, and `https://` fetched from the test's
+-- | `remotes/` (by git's `insteadOf`)
+envHere : String -> List (Pair String String)
+envHere here =
+  [ MkPair "HEFF_MODCACHE" (here ^ "/mod")
+  , MkPair "GIT_AUTHOR_NAME" "t"
+  , MkPair "GIT_AUTHOR_EMAIL" "t@t"
+  , MkPair "GIT_COMMITTER_NAME" "t"
+  , MkPair "GIT_COMMITTER_EMAIL" "t@t"
+  , MkPair "GIT_CONFIG_COUNT" "1"
+  , MkPair "GIT_CONFIG_KEY_0" ("url.file://" ^ here ^ "/remotes/.insteadOf")
+  , MkPair "GIT_CONFIG_VALUE_0" "https://"
+  ]
+
+-- (a command run in the directory, with these variables besides)
+runIn : {e : HFunctor}
+      -> {{sys : process <: e}}
+      -> String
+      -> List (Pair String String)
+      -> String
+      -> List String
+      -> Co e Ran
+runIn dir more command arguments = do
+  here <- workingDir
+  run
+      { command = command
+      , args = arguments
+      , dir = dir
+      , env = List.append (envHere here) more
+      }
+
+-- (heff run in the directory, with these variables besides)
+heffWithIn : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> String
+           -> List (Pair String String)
+           -> List String
+           -> Co e Ran
+heffWithIn dir more arguments = do
+  heff <- given "HEFF"
+  runIn dir more heff arguments
+
+-- (heff run in the directory)
+heffIn : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> List String
+       -> Co e Ran
+heffIn dir arguments = heffWithIn dir Nil arguments
+
+-- (heff run in the test's directory)
+heffSays : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List String
+         -> Co e Ran
+heffSays arguments = heffIn "" arguments
+
+-- (git run in the directory)
+git : {e : HFunctor}
+    -> {{sys : process <: e}}
+    -> String
+    -> List String
+    -> Co e Ran
+git dir arguments = runIn dir Nil "git" arguments
+
+-- (a program run, what it says)
+ranSays : {e : HFunctor} -> {{sys : process <: e}} -> String -> Co e String
+ranSays path = do
+  r <- run { command = path }
+  pure r.out
+
+-- | the version of the heff tested, as the project's package.hf says
+heffVersion : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> Co e String
+heffVersion = do
+  root <- given "HEFF_TEST_ROOT"
+  pkg <- textOf (root ^ "/package.hf")
+  pure (between "heff = \"" "\"" pkg)
+
+-- Manifests
+--------------------------------------------------------------------------------
+
+-- | a package required: by its name, its path, and the directory it is
+-- | given by (`""`: none, it is fetched)
+type Required = { name : String, path : String, dir : String }
+
+required : String -> String -> String -> Required
+required n p d = { name = n, path = p, dir = d }
+
+-- (a list field of a manifest: left out where it is empty, its default)
+listField : String -> List String -> String
+listField x Nil = ""
+listField x items = ", " ^ x ^ " = [" ^ joinWith ", " items ^ "]"
+
+-- (each requirement, as a manifest writes it)
+requireOf : String -> Required -> String
+requireOf v r =
+  "{ name = \""
+  ^ r.name
+  ^ "\", path = \""
+  ^ r.path
+  ^ "\", version = \""
+  ^ v
+  ^ "\" }"
+
+replaceOf : Required -> String
+replaceOf r = "{ name = \"" ^ r.name ^ "\", dir = \"" ^ r.dir ^ "\" }"
+
+-- | a package.hf of a project for heff `v`, of the path, requiring
+-- | these, each at 1.0.0
+manifestFor : String -> String -> List Required -> String
+manifestFor v path requires =
+  "package = { module = \""
+  ^ path
+  ^ "\", heff = \""
+  ^ v
+  ^ "\""
+  ^ listField "require" (List.map (requireOf "1.0.0") requires)
+  ^ listField
+    "replace"
+    (List.map
+       replaceOf
+       (List.filter (\(r : Required) -> not (strEq r.dir "")) requires))
+  ^ " }\n"
+
+-- | a package.hf of a type, `Package`, requiring each at its version
+typed : String -> String -> List (Pair Required String) -> String
+typed v path requires =
+  "import manifest\n\npackage : Package\npackage = { module = \""
+  ^ path
+  ^ "\", heff = \""
+  ^ v
+  ^ "\""
+  ^ listField
+    "require"
+    (List.map
+       (\(p : Pair Required String) -> requireOf (snd p) (fst p))
+       requires)
+  ^ " }\n"
+
+-- | a program's build.hf: its backend, and what it ships
+buildOf : String -> List String -> String
+buildOf backend ships =
+  "import manifest\n\nbuild : Build\nbuild = { backend = "
+  ^ backend
+  ^ ", run = \"main\""
+  ^ listField "ships" (List.map (\s -> "\"" ^ s ^ "\"") ships)
+  ^ " }\n"
+
+-- `heff init`
+--------------------------------------------------------------------------------
+
+-- | the files `heff init` makes, but `.gitignore`
+inited : List String
+inited =
+  [ "package.hf"
+  , "src/hello/greeting.hf"
+  , "app/hello/main.hf"
+  , "app/hello/build.hf"
+  , "test/greeting.hf"
+  ]
+
+-- (are they all there)
+allThere : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> List String
+         -> Co e Bool
+allThere Nil = pure True
+allThere (Cons p rest) = do
+  there <- exists p
+  others <- allThere rest
+  pure (there && others)
+
+-- (a file that does not parse)
+unparsed : String
+unparsed = "x : Int\nx = \n"
+
+-- | init: package.hf (for this heff), .gitignore, a module whose watch
+-- | holds, the program hello using it, built, and a test of it that
+-- | holds; again, nothing is written.  `heff test` with no file: the
+-- | project's test/, run where it is; a file in a directory starting
+-- | with `.` or in a project of its own passed over; nothing outside
+-- | test/, and no test/, nothing to test
+initialized : String -> Test
+initialized name =
+  integration name (do
+  v <- heffVersion
+  made <- heffSays ["init", "hello"]
+  pkg <- textOf "hello/package.hf"
+  ignored <- textOf "hello/.gitignore"
+  there <- allThere (List.map (\f -> "hello/" ^ f) inited)
+  holds
+      "init"
+      (succeeded made
+       && contains ("heff = \"" ^ v ^ "\"") pkg
+       && contains "module = \"hello\"" pkg
+       && strEq ignored ".heff/\n"
+       && there)
+      [made]
+  laid <-
+    heffSays
+      (Cons "fmt" (Cons "--check" (List.map (\f -> "hello/" ^ f) inited)))
+  holds "init's files are laid out" (succeeded laid) [laid]
+  tested <- heffSays ["test", "hello/src/hello/greeting.hf"]
+  holds
+      "init's module"
+      (succeeded tested && contains "1/1 expectations hold" tested.out)
+      [tested]
+  initTests <- heffIn "hello" ["test"]
+  holds
+      "init's test"
+      (succeeded initTests && contains "1/1 tests hold" initTests.out)
+      [initTests]
+  initBuilt <- heffIn "hello" ["build"]
+  hello <- ranSays "hello/.heff/bin/hello"
+  holds
+      "init's program, built"
+      (succeeded initBuilt
+       && contains "wrote .heff/bin/hello" initBuilt.out
+       && strEq hello "Hello, world!\n")
+      [initBuilt]
+  write
+      "hello/test/watch.hf"
+      "import hello.greeting\n\n-- >>> greeting \"watch\"\n-- \"Hello, watch!\"\n"
+  write "hello/test/.hidden/no.hf" unparsed
+  write
+      "hello/test/vendor/other/package.hf"
+      "import manifest\n\npackage : Package\npackage = { module = \"other\", heff = \"0.0.1\", require = [], replace = [] }\n"
+  write "hello/test/vendor/other/no.hf" unparsed
+  write "hello/elsewhere/no.hf" unparsed
+  inHello <- heffIn "hello" ["test"]
+  holds
+      "test with no file: the project's test/"
+      (succeeded inHello
+       && contains "test/greeting.hf" inHello.out
+       && contains "test/watch.hf" inHello.out
+       && not (contains "src/hello/greeting.hf" inHello.out)
+       && not (contains "no.hf" inHello.out)
+       && contains "1/1 expectations hold, 1/1 tests hold" inHello.out)
+      [inHello]
+  removed "hello/test"
+  removed "hello/elsewhere"
+  noTests <- heffIn "hello" ["test"]
+  holds
+      "test with no file and no test/"
+      (exitedWith 1 noTests && contains "no test/ here" noTests.err)
+      [noTests]
+  checked <- heffSays ["check", "hello/package.hf"]
+  holds
+      "package.hf is heff, of type Package"
+      (succeeded checked && contains "package : Package" checked.out)
+      [checked]
+  again <- heffSays ["init", "hello"]
+  holds
+      "init over a project"
+      (exitedWith 1 again && contains "already; nothing written" again.err)
+      [again]
+  badName <- heffSays ["init", "hello-world"]
+  holds
+      "init of a name that is no name"
+      (exitedWith 1 badName && contains "cannot name a package" badName.err)
+      [badName])
+
+-- A project's modules
+--------------------------------------------------------------------------------
+
+-- (two names that differ only in case, where the file system tells them
+-- apart)
+twoCases : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> Bool
+         -> Co e Unit
+twoCases True = pure MkUnit
+twoCases False = do
+  write "hello/src/hello/shout.hf" "x : Int\nx = 1\n"
+  both <- heffSays ["check", "hello/src/hello/useshout.hf"]
+  holds
+      "two names that differ only in case"
+      (exitedWith 1 both
+       && contains
+         "hello/src/hello holds Shout.hf, shout.hf: names that differ only in case"
+         both.err)
+      [both]
+  removed "hello/src/hello/shout.hf"
+
+-- (what is said of a name in another case: where the file system finds
+-- it all the same, `blind`, and where it does not)
+inCase : Bool -> String -> String -> String
+inCase True blind seeing = blind
+inCase False blind seeing = seeing
+
+-- | a project's module imports another, by its name under src/; a test
+-- | imports the project's modules, and a helper beside it, named from
+-- | the root; a module of src/ cannot import the helper.  A module whose
+-- | import is written in another case than its file (or a directory on
+-- | its path) is named: an error where the file system finds it all the
+-- | same; two names that differ only in case, where it does not.  A
+-- | module of the project with a library module's name is an error,
+-- | loaded from neither, the file to rename said: what is used of it,
+-- | `List.length`, is no error of its own -- in a project, and in a
+-- | program of no project, beside its `main.hf`
+modules : String -> Test
+modules name =
+  integration name (do
+  made <- heffSays ["init", "hello"]
+  write "hello/src/hello/words.hf" "word : String\nword = \"hi\"\n"
+  write
+      "hello/src/hello/greet.hf"
+      "import hello.words\n\ngreet : String\ngreet = word ^ \"!\"\n"
+  greet <- heffSays ["check", "hello/src/hello/greet.hf"]
+  holds
+      "a module of the project"
+      (succeeded greet && contains "greet : String" greet.out)
+      [greet]
+  write
+      "hello/test/helper.hf"
+      "shout : String -> String\nshout s = s ^ \"!!\"\n"
+  write
+      "hello/test/use.hf"
+      "import hello.greet\nimport test.helper\n\nloud : String\nloud = shout greet\n"
+  use <- heffSays ["check", "hello/test/use.hf"]
+  holds
+      "a test, with a helper"
+      (succeeded use && contains "loud : String" use.out)
+      [use]
+  write
+      "hello/src/hello/reach.hf"
+      "import test.helper\n\nx : String -> String\nx = shout\n"
+  reach <- heffSays ["check", "hello/src/hello/reach.hf"]
+  holds
+      "src/ does not import what is outside it"
+      (exitedWith 1 reach
+       && contains
+         "no module test.helper (looked for hello/src/test/helper.hf, "
+         reach.err)
+      [reach]
+  write "hello/src/hello/Shout.hf" "up : String\nup = \"HI\"\n"
+  write
+      "hello/src/hello/useshout.hf"
+      "import hello.shout\n\nu : String\nu = up\n"
+  blind <- exists "hello/src/hello/shout.hf"
+  shout <- heffSays ["check", "hello/src/hello/useshout.hf"]
+  holds
+      "a module found by a case-different name"
+      (exitedWith 1 shout
+       && contains
+         (inCase
+            blind
+            "importing hello.shout: hello/src/hello/shout.hf is named Shout.hf on the disk: a file system that tells case apart finds no shout.hf"
+            "no module hello.shout")
+         shout.err)
+      [shout]
+  write
+      "hello/src/hello/useshout.hf"
+      "import Hello.Shout\n\nu : String\nu = up\n"
+  shoutDir <- heffSays ["check", "hello/src/hello/useshout.hf"]
+  holds
+      "a directory found by a case-different name"
+      (exitedWith 1 shoutDir
+       && contains
+         (inCase
+            blind
+            "hello/src/Hello is named hello on the disk"
+            "no module Hello.Shout")
+         shoutDir.err)
+      [shoutDir]
+  write
+      "hello/src/hello/useshout.hf"
+      "import hello.Shout\n\nu : String\nu = up\n"
+  shoutOk <- heffSays ["check", "hello/src/hello/useshout.hf"]
+  holds
+      "a module named as on the disk"
+      (succeeded shoutOk && contains "u : String" shoutOk.out)
+      [shoutOk]
+  twoCases blind
+  removed "hello/src/hello/Shout.hf"
+  removed "hello/src/hello/useshout.hf"
+  write "hello/src/prelude.hf" "x : Int\nx = 1\n"
+  clash <- heffSays ["check", "hello/src/hello/words.hf"]
+  holds
+      "a module twice"
+      (exitedWith 1 clash
+       && contains
+         "module prelude is more than one file: hello/src/prelude.hf and "
+         clash.err)
+      [clash]
+  removed "hello/src/prelude.hf"
+  write "hello/src/list.hf" "x : Int\nx = 1\n"
+  write "hello/src/hello/len.hf" "n : Int\nn = List.length [1, 2]\n"
+  listClash <- heffSays ["check", "hello/src/hello/len.hf"]
+  holds
+      "a module of the library's name, in a project"
+      (exitedWith 1 listClash
+       && contains
+         "module list is more than one file: hello/src/list.hf and "
+         listClash.err
+       && contains
+         ", so it is loaded from neither: rename hello/src/list.hf, and the imports of it, so that the name is one file's"
+         listClash.err
+       && not (contains "error[" listClash.err))
+      [listClash]
+  write "loose/list.hf" "x : Int\nx = 1\n"
+  write "loose/main.hf" "n : Int\nn = List.length [1, 2]\n"
+  looseClash <- heffSays ["check", "loose/main.hf"]
+  holds
+      "a module of the library's name, beside a program"
+      (exitedWith 1 looseClash
+       && contains
+         "module list is more than one file: loose/list.hf and "
+         looseClash.err
+       && contains "rename loose/list.hf" looseClash.err
+       && not (contains "error[" looseClash.err))
+      [looseClash])
+
+-- (a package.hf of these fields, laid out a line each)
+fieldsOf : String -> String -> String
+fieldsOf name v =
+  "package =\n  { module = \""
+  ^ name
+  ^ "\"\n  , heff = \""
+  ^ v
+  ^ "\"\n  , require = []\n  , replace = []\n  }\n"
+
+-- | a package.hf that does not read; one for another heff
+manifests : String -> Test
+manifests name =
+  integration name (do
+  v <- heffVersion
+  write "bad/package.hf" (fieldsOf "bad" "0.1")
+  write "bad/src/bad/m.hf" "x : Int\nx = 1\n"
+  bad <- heffSays ["check", "bad/src/bad/m.hf"]
+  holds
+      "a package.hf that does not read"
+      (exitedWith 1 bad
+       && contains
+         "bad/package.hf:3:12: `0.1` is no version: write `a.b.c`, three numbers"
+         bad.err)
+      [bad]
+  write "old/package.hf" (fieldsOf "old" "0.99.0")
+  write "old/src/old/m.hf" "x : Int\nx = 1\n"
+  old <- heffSays ["check", "old/src/old/m.hf"]
+  holds
+      "a project for another heff"
+      (exitedWith 1 old
+       && contains
+         ("package.hf: the project is for heff 0.99.0 (the same 0.x), and this heff is "
+          ^ v)
+         old.err)
+      [old])
+
+-- Packages
+--------------------------------------------------------------------------------
+
+-- (the packages `x.org/json` and `y.org/json`, both of the name `json`)
+jsons : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{disk : filesystem <: e}}
+      -> String
+      -> Co e Unit
+jsons v = do
+  write "json/package.hf" (manifestFor v "x.org/json" Nil)
+  write
+      "json/src/json/util.hf"
+      "quoted : String -> String\nquoted s = \"<\" ^ s ^ \">\"\n"
+  write
+      "json/src/json/encode.hf"
+      "import json.util\n\nencode : String -> String\nencode s = quoted s\n"
+  write "jsony/package.hf" (manifestFor v "y.org/json" Nil)
+  write "jsony/src/json/encode.hf" "encode : String -> Int\nencode s = 1\n"
+
+-- | packages: a required package given by a directory (`replace`), its
+-- | modules imported by the name the project requires it by, its own
+-- | imports by its own package.hf
+directories : String -> Test
+directories name =
+  integration name (do
+  v <- heffVersion
+  jsons v
+  write
+      "app/package.hf"
+      (manifestFor v "x.org/app" [required "json" "x.org/json" "../json"])
+  write
+      "app/src/app/main.hf"
+      "import json.encode\n\nout : String\nout = encode \"hi\"\n\n-- >>> out\n-- \"<hi>\"\n"
+  app <- heffSays ["test", "app/src/app/main.hf"]
+  holds
+      "a package from a directory"
+      (succeeded app && contains "1/1 expectations hold" app.out)
+      [app]
+  write
+      "renamed/package.hf"
+      (manifestFor v "x.org/renamed" [required "js" "x.org/json" "../json"])
+  write
+      "renamed/src/renamed/main.hf"
+      "import js.encode\n\nout : String\nout = encode \"hi\"\n"
+  renamed <- heffSays ["check", "renamed/src/renamed/main.hf"]
+  holds
+      "a package imported by another name"
+      (succeeded renamed && contains "out : String" renamed.out)
+      [renamed]
+  write
+      "both/package.hf"
+      (manifestFor
+         v
+         "x.org/both"
+         [ required "json" "x.org/json" "../json"
+         , required "json2" "y.org/json" "../jsony"
+         ])
+  write
+      "both/src/both/main.hf"
+      "import json.encode as X\nimport json2.encode as Y\n\nout : String\nout = X.encode \"hi\"\n\nn : Int\nn = Y.encode \"hi\"\n"
+  both <- heffSays ["check", "both/src/both/main.hf"]
+  holds
+      "two packages of one name, required by two"
+      (succeeded both
+       && contains "out : String" both.out
+       && contains "n : Int" both.out)
+      [both]
+  write
+      "clash/package.hf"
+      (manifestFor v "x.org/clash" [required "json" "x.org/json" "../json"])
+  write "clash/src/json/encode.hf" "x : Int\nx = 1\n"
+  write "clash/src/clash/main.hf" "import json.encode\n\ny : Int\ny = 1\n"
+  clash <- heffSays ["check", "clash/src/clash/main.hf"]
+  holds
+      "a package and the project's module of one name"
+      (exitedWith 1 clash
+       && contains
+         "module json.encode is more than one file: clash/src/json/encode.hf and json/src/json/encode.hf"
+         clash.err)
+      [clash]
+  write
+      "unfetched/package.hf"
+      (manifestFor v "x.org/unfetched" [required "json" "x.org/json" ""])
+  write "unfetched/src/unfetched/main.hf" "x : Int\nx = 1\n"
+  unfetched <- heffSays ["check", "unfetched/src/unfetched/main.hf"]
+  holds
+      "a package not fetched"
+      (exitedWith 1 unfetched
+       && contains
+         "x.org/unfetched requires x.org/json 1.0.0, which is not fetched: run `heff get`"
+         unfetched.err)
+      [unfetched]
+  write
+      "wrong/package.hf"
+      (manifestFor v "x.org/wrong" [required "json" "x.org/json" "../jsony"])
+  write "wrong/src/wrong/m.hf" "x : Int\nx = 1\n"
+  wrong <- heffSays ["check", "wrong/src/wrong/m.hf"]
+  holds
+      "a directory of another package"
+      (exitedWith 1 wrong
+       && contains
+         "jsony/package.hf is the package y.org/json, not x.org/json"
+         wrong.err)
+      [wrong])
+
+-- | heff's own package, `heff`, is the compiler's: a project elsewhere
+-- | naming itself so is refused (and its lib/ is no library), and none
+-- | requires it or replaces it, nor gets it, nor is made by that name
+heffsOwn : String -> Test
+heffsOwn name =
+  integration name (do
+  v <- heffVersion
+  write "fakeheff/package.hf" (manifestFor v "heff" Nil)
+  write "fakeheff/src/x/m.hf" "x : Int\nx = 1\n"
+  write "fakeheff/lib/sin.hf" "primitive floatSin : Float64 -> Float64\n"
+  claimed <- heffSays ["check", "fakeheff/src/x/m.hf"]
+  holds
+      "a project naming itself heff"
+      (exitedWith 1 claimed
+       && contains
+         "fakeheff/package.hf:1:22: error[E0347]: the package `heff` is heff's own, and this is not the checkout heff is built in or was installed from"
+         claimed.err)
+      [claimed]
+  claimedLib <- heffSays ["check", "fakeheff/lib/sin.hf"]
+  holds
+      "a project naming itself heff: its lib/"
+      (exitedWith 1 claimedLib
+       && contains "error[E0347]" claimedLib.err
+       && contains "error[E0335]" claimedLib.err)
+      [claimedLib]
+  write
+      "reqheff/package.hf"
+      (manifestFor v "x.org/reqheff" [required "h" "heff" ""])
+  write "reqheff/src/reqheff/m.hf" "x : Int\nx = 1\n"
+  reqHeff <- heffSays ["check", "reqheff/src/reqheff/m.hf"]
+  holds
+      "a project requiring heff"
+      (exitedWith 1 reqHeff
+       && contains "reqheff/package.hf:1:" reqHeff.err
+       && contains
+         ": error[E0347]: the package `heff` is heff's own, which comes with heff: it is not required"
+         reqHeff.err)
+      [reqHeff]
+  write
+      "repheff/package.hf"
+      (manifestFor v "x.org/repheff" [required "h" "heff" "../fakeheff"])
+  write "repheff/src/repheff/m.hf" "x : Int\nx = 1\n"
+  repHeff <- heffSays ["check", "repheff/src/repheff/m.hf"]
+  holds
+      "a project replacing heff"
+      (exitedWith 1 repHeff
+       && contains
+         "error[E0347]: `h` is the package `heff`, heff's own, which comes with heff: it is not replaced"
+         repHeff.err)
+      [repHeff]
+  write "getheff/package.hf" (manifestFor v "x.org/getheff" Nil)
+  getHeff <- heffIn "getheff" ["get", "heff"]
+  getheffPkg <- textOf "getheff/package.hf"
+  holds
+      "get heff"
+      (exitedWith 1 getHeff
+       && contains
+         "heff get: error[E0347]: the package `heff` is heff's own"
+         getHeff.err
+       && strEq getheffPkg (manifestFor v "x.org/getheff" Nil))
+      [getHeff]
+  initHeff <- heffSays ["init", "heff"]
+  made <- exists "heff"
+  holds
+      "init heff"
+      (exitedWith 1 initHeff
+       && contains "`heff` is heff's own package" initHeff.err
+       && not made)
+      [initHeff])
+
+-- | a package whose src/ holds two directories; packages that require
+-- | one another; a package for another heff
+packageErrors : String -> Test
+packageErrors name =
+  integration name (do
+  v <- heffVersion
+  write "two/package.hf" (manifestFor v "x.org/two" Nil)
+  write "two/src/a/a.hf" "x : Int\nx = 1\n"
+  write "two/src/b/b.hf" "x : Int\nx = 1\n"
+  write
+      "usetwo/package.hf"
+      (manifestFor v "x.org/usetwo" [required "two" "x.org/two" "../two"])
+  write "usetwo/src/usetwo/main.hf" "x : Int\nx = 1\n"
+  usetwo <- heffSays ["check", "usetwo/src/usetwo/main.hf"]
+  holds
+      "a package whose src/ holds two directories"
+      (exitedWith 1 usetwo
+       && contains
+         "two/src holds a, b: a package's src/ holds one directory, named as the package"
+         usetwo.err)
+      [usetwo]
+  write
+      "loop/package.hf"
+      (manifestFor v "x.org/loop" [required "back" "x.org/back" "../back"])
+  write "loop/src/loop/main.hf" "x : Int\nx = 1\n"
+  write
+      "back/package.hf"
+      (manifestFor v "x.org/back" [required "loop" "x.org/loop" ""])
+  write "back/src/back/b.hf" "x : Int\nx = 1\n"
+  loop <- heffSays ["check", "loop/src/loop/main.hf"]
+  holds
+      "packages that require one another"
+      (exitedWith 1 loop
+       && contains
+         "packages require one another: x.org/loop -> x.org/back -> x.org/loop"
+         loop.err)
+      [loop]
+  write "olddep/package.hf" (manifestFor "0.99.0" "x.org/olddep" Nil)
+  write "olddep/src/olddep/m.hf" "x : Int\nx = 1\n"
+  write
+      "useold/package.hf"
+      (manifestFor
+         v
+         "x.org/useold"
+         [required "olddep" "x.org/olddep" "../olddep"])
+  write "useold/src/useold/main.hf" "x : Int\nx = 1\n"
+  useold <- heffSays ["check", "useold/src/useold/main.hf"]
+  holds
+      "a package for another heff"
+      (exitedWith 1 useold
+       && contains
+         ("the package x.org/olddep is for heff 0.99.0 (the same 0.x), and this heff is "
+          ^ v)
+         useold.err)
+      [useold])
+
+-- Publishing and getting
+--------------------------------------------------------------------------------
+
+-- | publish: checked, tagged vVERSION, the tag pushed; refused for a
+-- | version that is no a.b.c, a path whose /vN is not the major, what is
+-- | not committed, a watch that does not hold, a tag already there
+publishing : String -> Test
+publishing name =
+  integration name (do
+  v <- heffVersion
+  here <- workingDir
+  bare <- git "" ["init", "-q", "--bare", here ^ "/origin.git"]
+  write
+      "pub/package.hf"
+      ("import manifest\n\npackage : Package\n" ^ manifestFor v "x.org/pub" Nil)
+  write "pub/src/pub/m.hf" "x : Int\nx = 1\n\n-- >>> x + 1\n-- 2\n"
+  write "pub/.gitignore" ".heff/\n"
+  initGit <- git "pub" ["init", "-q"]
+  added <- git "pub" ["add", "-A"]
+  committed <- git "pub" ["commit", "-q", "-m", "one"]
+  remote <- git "pub" ["remote", "add", "origin", here ^ "/origin.git"]
+  write "untyped/package.hf" (manifestFor v "x.org/untyped" Nil)
+  write "untyped/src/untyped/m.hf" "x : Int\nx = 1\n"
+  untyped <- heffIn "untyped" ["publish", "1.0.0"]
+  holds
+      "publish, a package.hf of no type"
+      (exitedWith 1 untyped
+       && contains "package.hf is no Package (lib/manifest.hf)" untyped.err)
+      [untyped]
+  noVersion <- heffIn "pub" ["publish", "1.0"]
+  holds
+      "publish, no a.b.c"
+      (exitedWith 1 noVersion
+       && contains "`1.0` is no version: a.b.c" noVersion.err)
+      [noVersion]
+  major <- heffIn "pub" ["publish", "2.0.0"]
+  holds
+      "publish, a major without its /vN"
+      (exitedWith 1 major
+       && contains
+         "version 2.0.0 is fetched from a path ending in /v2"
+         major.err)
+      [major]
+  published <- heffIn "pub" ["publish", "1.0.0"]
+  tags <- git "pub" ["ls-remote", "--tags", "origin"]
+  holds
+      "publish"
+      (succeeded published
+       && contains "heff publish: x.org/pub 1.0.0, tag v1.0.0" published.out
+       && contains "refs/tags/v1.0.0" tags.out)
+      [published, tags]
+  twice <- heffIn "pub" ["publish", "1.0.0"]
+  holds
+      "publish, a version already tagged"
+      (exitedWith 1 twice && contains "v1.0.0 is tagged already" twice.err)
+      [twice]
+  write "pub/src/pub/m.hf" "x : Int\nx = 1\n\n-- >>> x + 1\n-- 3\n"
+  dirty <- heffIn "pub" ["publish", "1.0.1"]
+  holds
+      "publish, not committed"
+      (exitedWith 1 dirty && contains "commit first" dirty.err)
+      [dirty]
+  wrongOne <- git "pub" ["commit", "-q", "-am", "wrong"]
+  failing <- heffIn "pub" ["publish", "1.0.1"]
+  tagged <- git "pub" ["tag"]
+  holds
+      "publish, a watch that does not hold"
+      (exitedWith 1 failing
+       && contains "1 of 1 expectations do not hold" failing.err
+       && not (contains "v1.0.1" tagged.out))
+      [failing, tagged])
+
+-- (each file written, a path and its text)
+writeAll : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> List (Pair String String)
+         -> Co e Unit
+writeAll dir Nil = pure MkUnit
+writeAll dir (Cons (MkPair path text) rest) = do
+  write (dir ^ "/" ^ path) text
+  writeAll dir rest
+
+-- | a package fetched from git, `https://PATH`: these files written to
+-- | its repository under `remotes/`, committed and tagged
+remote : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> List (Pair String String)
+       -> String
+       -> Co e Unit
+remote path files tag = do
+  let dir = "remotes/" ^ path
+  writeAll dir files
+  there <- exists (dir ^ "/.git")
+  made <- if there then git dir ["status", "-s"] else git dir ["init", "-q"]
+  added <- git dir ["add", "-A"]
+  committed <- git dir ["commit", "-q", "-m", tag]
+  tagged <- git dir ["tag", tag]
+  holds
+      ("the remote " ^ path ^ " " ^ tag)
+      (succeeded tagged)
+      [made, committed, tagged]
+
+-- (a module of `encode`, between these)
+encodeAs : String -> String -> String
+encodeAs l r =
+  "encode : String -> String\nencode s = \"" ^ l ^ "\" ^ s ^ \"" ^ r ^ "\"\n"
+
+-- (a requirement of a fetched package, at a version)
+fetched : String -> String -> String -> Pair Required String
+fetched n p version = MkPair (required n p "") version
+
+-- (heff.sum's line of the package, its tree another)
+tampered : String -> String -> String
+tampered line sum =
+  joinWith
+    "\n"
+    (List.map
+       (\l -> if startsWith line l then line ^ "0000" else l)
+       (split "\n" sum))
+
+-- (the lines heff.sum has, after `get`)
+sumPattern : String
+sumPattern =
+  "^x\\.org/lib 1\\.0\\.0 tree:[0-9a-f]+\nx\\.org/lib 1\\.1\\.0 tree:[0-9a-f]+\nx\\.org/mid 1\\.0\\.0 tree:[0-9a-f]+\n$"
+
+-- | get: every version reached fetched from git (`https://PATH`, here a
+-- | directory by git's `insteadOf`), the newest of each package
+-- | selected, heff.sum written; a tag moved since is an error, as is a
+-- | cache that is not what heff.sum says
+getting : String -> Test
+getting name =
+  integration name (do
+  v <- heffVersion
+  remote
+      "x.org/lib"
+      [ MkPair "package.hf" (typed v "x.org/lib" Nil)
+      , MkPair "src/lib/encode.hf" (encodeAs "<" ">")
+      ]
+      "v1.0.0"
+  remote "x.org/lib" [MkPair "src/lib/encode.hf" (encodeAs "[" "]")] "v1.1.0"
+  remote
+      "x.org/lib"
+      [ MkPair "package.hf" (typed v "x.org/lib/v2" Nil)
+      , MkPair "src/lib/encode.hf" (encodeAs "{" "}")
+      ]
+      "v2.0.0"
+  remote
+      "x.org/mid"
+      [ MkPair
+        "package.hf"
+        (typed v "x.org/mid" [fetched "lib" "x.org/lib" "1.1.0"])
+      , MkPair
+        "src/mid/m.hf"
+        "import lib.encode\n\ntwice : String -> String\ntwice s = encode (encode s)\n"
+      ]
+      "v1.0.0"
+  write
+      "user/package.hf"
+      (typed
+         v
+         "x.org/user"
+         [fetched "lib" "x.org/lib" "1.0.0", fetched "mid" "x.org/mid" "1.0.0"])
+  write
+      "user/src/user/main.hf"
+      "import lib.encode\nimport mid.m\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n\n-- >>> twice \"hi\"\n-- \"[[hi]]\"\n"
+  notYet <- heffIn "user" ["test", "src/user/main.hf"]
+  holds
+      "get: not fetched yet"
+      (exitedWith 1 notYet
+       && contains
+         "x.org/user requires x.org/lib 1.0.0, which is not fetched: run `heff get`"
+         notYet.err)
+      [notYet]
+  got <- heffIn "user" ["get"]
+  sum <- textOf "user/heff.sum"
+  holdsOf
+      "get"
+      (succeeded got
+       && contains "heff get: 2 packages, heff.sum written" got.out
+       && matching sumPattern sum)
+      (said got ^ sum)
+  let cached = "mod/x.org/lib@1.1.0"
+  encodeThere <- exists (cached ^ "/src/lib/encode.hf")
+  gitThere <- exists (cached ^ "/.git")
+  mode <- modeOf (cached ^ "/src/lib/encode.hf")
+  holdsOf
+      "get: the cache, read-only, without .git"
+      (encodeThere
+       && not gitThere
+       && mode >= 0
+       && not (hasBit 2 mode || hasBit 16 mode || hasBit 128 mode))
+      (cached ^ " mode " ^ show mode)
+  selected <- heffIn "user" ["test", "src/user/main.hf"]
+  holds
+      "get: the newest version reached is the one in the program"
+      (succeeded selected && contains "2/2 expectations hold" selected.out)
+      [selected]
+  again <- heffIn "user" ["get"]
+  holds
+      "get, again: nothing fetched"
+      (succeeded again && not (contains "fetched" again.out))
+      [again]
+  clashV2 <- heffIn "user" ["get", "x.org/lib/v2"]
+  holds
+      "get PATH: a name required already"
+      (exitedWith 1 clashV2
+       && contains
+         "`lib` is required already: add x.org/lib/v2 to package.hf by another name"
+         clashV2.err)
+      [clashV2]
+  write "fresh/package.hf" ("-- mine\n" ^ typed v "x.org/fresh" Nil)
+  write
+      "fresh/src/fresh/main.hf"
+      "import lib.encode\n\n-- >>> encode \"hi\"\n-- \"[hi]\"\n"
+  getNewest <- heffIn "fresh" ["get", "x.org/lib"]
+  freshPkg <- textOf "fresh/package.hf"
+  freshTested <- heffIn "fresh" ["test", "src/fresh/main.hf"]
+  holdsOf
+      "get PATH: its newest version of the path's major, by its own name"
+      (succeeded getNewest
+       && contains "package.hf requires x.org/lib 1.1.0" getNewest.out
+       && startsWith "-- mine\n" freshPkg
+       && contains
+         "{ name = \"lib\", path = \"x.org/lib\", version = \"1.1.0\" }"
+         freshPkg
+       && succeeded freshTested)
+      (said getNewest ^ freshPkg ^ said freshTested)
+  freshLaid <- heffIn "fresh" ["fmt", "--check", "package.hf"]
+  holds "get PATH: package.hf laid out" (succeeded freshLaid) [freshLaid]
+  getOld <- heffIn "fresh" ["get", "x.org/lib@1.0.0"]
+  oldPkg <- textOf "fresh/package.hf"
+  holds
+      "get PATH@VERSION"
+      (succeeded getOld && contains "version = \"1.0.0\"" oldPkg)
+      [getOld]
+  getNone <- heffIn "fresh" ["get", "x.org/lib@1.7.0"]
+  holds
+      "get PATH@VERSION, no such tag"
+      (exitedWith 1 getNone
+       && contains
+         "cannot fetch x.org/lib 1.7.0 (tag v1.7.0 of https://x.org/lib)"
+         getNone.err)
+      [getNone]
+  write "user/heff.sum" (tampered "x.org/mid 1.0.0 tree:" sum)
+  wrongSum <- heffIn "user" ["check", "src/user/main.hf"]
+  holds
+      "a cache that is not what heff.sum says"
+      (exitedWith 1 wrongSum
+       && contains "and heff.sum says tree:0000" wrongSum.err)
+      [wrongSum]
+  write "user/heff.sum" sum
+  back <- git "remotes/x.org/lib" ["checkout", "-q", "v1.0.0"]
+  remote "x.org/lib" [MkPair "src/lib/encode.hf" (encodeAs "(" ")")] "moved"
+  retagged <- git "remotes/x.org/lib" ["tag", "-f", "v1.0.0"]
+  removed "mod"
+  moved <- heffIn "user" ["get"]
+  holds
+      "get: a tag moved"
+      (exitedWith 1 moved
+       && contains "x.org/lib 1.0.0 is tree:" moved.err
+       && contains "its tag has been moved" moved.err)
+      [moved])
+
+-- Building and installing
+--------------------------------------------------------------------------------
+
+-- (a program saying what `says` is)
+programSaying : String -> String
+programSaying says =
+  "import co\nimport std.io\nimport tool.greet\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print "
+  ^ says
+  ^ "\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n"
+
+-- (`heff install tool`, into the heff home `home/`, the PATH this)
+installTool : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> String
+            -> Co e Ran
+installTool path = do
+  here <- workingDir
+  heffWithIn
+      ""
+      [MkPair "HEFF_HOME" (here ^ "/home"), MkPair "PATH" path]
+      ["install", "tool"]
+
+-- (neither program there)
+neither : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> Co e Bool
+neither dir = do
+  tool <- exists (dir ^ "/tool")
+  again <- exists (dir ^ "/again")
+  pure (not tool && not again)
+
+-- | build: the whole project, every module of src/ checked and every
+-- | program's build.hf read, then, if nothing is wrong, every program of
+-- | app/ built to .heff/bin/; install: the programs built into the heff
+-- | home's bin/ (`HEFF_HOME`), and said if it is not on the PATH.  What a
+-- | program ships (its build.hf's `ships`), files and directories of the
+-- | project's root, put in the heff home beside bin/ (modes kept), in
+-- | place of what was there: nothing of that left, nor of the copy made
+-- | beside it; one the project does not have, nothing built
+building : String -> Test
+building name =
+  integration name (do
+  v <- heffVersion
+  here <- workingDir
+  path <- getEnv "PATH"
+  let pathNow = fromMaybe "" path
+  let home = here ^ "/home"
+  write "tool/package.hf" (manifestFor v "tool" Nil)
+  write
+      "tool/src/tool/greet.hf"
+      "greeting : String\ngreeting = \"hi from tool\"\n"
+  write "tool/app/tool/build.hf" (buildOf "C" Nil)
+  write "tool/app/tool/main.hf" (programSaying "greeting")
+  write "tool/app/again/build.hf" (buildOf "C" Nil)
+  write "tool/app/again/main.hf" (programSaying "(greeting ^ \", again\")")
+  built <- heffIn "tool" ["build"]
+  toolSays <- ranSays "tool/.heff/bin/tool"
+  againSays <- ranSays "tool/.heff/bin/again"
+  holds
+      "build: the modules checked, every program built"
+      (succeeded built
+       && contains "heff build: 1 module checked" built.out
+       && contains "wrote .heff/bin/tool" built.out
+       && contains "wrote .heff/bin/again" built.out
+       && strEq toolSays "hi from tool\n"
+       && strEq againSays "hi from tool, again\n")
+      [built]
+  write "tool/src/tool/broken.hf" "x : Int\nx = True\n"
+  removed "tool/.heff/bin"
+  broken <- heffIn "tool" ["build"]
+  noneBroken <- neither "tool/.heff/bin"
+  holds
+      "build: a module that does not check, nothing built"
+      (exitedWith 1 broken
+       && contains "src/tool/broken.hf" broken.err
+       && noneBroken)
+      [broken]
+  removed "tool/src/tool/broken.hf"
+  write "tool/app/unread/build.hf" (buildOf "Rust" Nil)
+  write "tool/app/unread/main.hf" (programSaying "greeting")
+  unread <- heffIn "tool" ["build"]
+  noneUnread <- neither "tool/.heff/bin"
+  holds
+      "build: a build.hf that cannot be read, nothing built"
+      (exitedWith 1 unread
+       && contains "app/unread/build.hf" unread.err
+       && contains "no backend Rust" unread.err
+       && contains "nothing built" unread.err
+       && noneUnread)
+      [unread]
+  unreadInstall <- installTool pathNow
+  noneInstalled <- neither (home ^ "/bin")
+  holds
+      "install: a build.hf that cannot be read, nothing installed"
+      (exitedWith 1 unreadInstall
+       && contains "app/unread/build.hf" unreadInstall.err
+       && noneInstalled)
+      [unreadInstall]
+  removed "tool/app/unread"
+  installed <- installTool pathNow
+  installedSays <- ranSays (home ^ "/bin/tool")
+  holds
+      "install: the programs, in the heff home's bin/"
+      (succeeded installed
+       && contains ("installed " ^ home ^ "/bin/tool") installed.out
+       && contains ("installed " ^ home ^ "/bin/again") installed.out
+       && contains (home ^ "/bin is not on the PATH") installed.out
+       && strEq installedSays "hi from tool\n")
+      [installed]
+  onPath <- installTool (home ^ "/bin:" ^ pathNow)
+  holds
+      "install: its bin/ on the PATH"
+      (succeeded onPath && not (contains "not on the PATH" onPath.out))
+      [onPath]
+  write "tool/share/greeting.txt" "hello\n"
+  write "tool/share/old.txt" "old\n"
+  write "tool/share/run.sh" "#!/bin/sh\necho run\n"
+  runnable <- makeExecutable "tool/share/run.sh"
+  write "tool/NOTICE" "notice 1\n"
+  write "tool/app/tool/build.hf" (buildOf "C" ["share", "NOTICE"])
+  write "tool/app/again/build.hf" (buildOf "C" ["share"])
+  shipped <- installTool pathNow
+  greeting <- textOf (home ^ "/share/greeting.txt")
+  notice <- textOf (home ^ "/NOTICE")
+  runMode <- modeOf (home ^ "/share/run.sh")
+  holds
+      "install: what a program ships, beside bin/"
+      (succeeded shipped
+       && contains ("installed " ^ home ^ "/share\n") shipped.out
+       && contains ("installed " ^ home ^ "/NOTICE\n") shipped.out
+       && List.length (split ("installed " ^ home ^ "/share\n") shipped.out)
+       == 2
+       && strEq greeting "hello\n"
+       && strEq notice "notice 1\n"
+       && runMode >= 0
+       && (hasBit 64 runMode || hasBit 8 runMode || hasBit 1 runMode))
+      [shipped]
+  removed "tool/share/old.txt"
+  write "tool/share/greeting.txt" "hello again\n"
+  write "tool/NOTICE" "notice 2\n"
+  reshipped <- installTool pathNow
+  greetingAgain <- textOf (home ^ "/share/greeting.txt")
+  oldThere <- exists (home ^ "/share/old.txt")
+  noticeAgain <- textOf (home ^ "/NOTICE")
+  inHome <- listing home
+  holdsOf
+      "install again: what is shipped, in place of what was there"
+      (succeeded reshipped
+       && strEq greetingAgain "hello again\n"
+       && not oldThere
+       && strEq noticeAgain "notice 2\n"
+       && strEq inHome "NOTICE,bin,share")
+      (said reshipped ^ inHome)
+  write "tool/app/tool/build.hf" (buildOf "C" ["share", "nowhere"])
+  removed (home ^ "/bin")
+  unshipped <- installTool pathNow
+  binThere <- exists (home ^ "/bin")
+  holds
+      "install: a program shipping what the project does not have, nothing installed"
+      (exitedWith 1 unshipped
+       && contains
+         "tool/app/tool/build.hf: it ships `nowhere`, which the project does not have"
+         unshipped.err
+       && contains "nothing built" unshipped.err
+       && not binThere)
+      [unshipped]
+  write "lib-only/package.hf" (manifestFor v "libonly" Nil)
+  write "lib-only/src/libonly/m.hf" "x : Int\nx = 1\n"
+  nothing <- heffWithIn "" [MkPair "HEFF_HOME" home] ["install", "lib-only"]
+  holds
+      "install: no programs"
+      (exitedWith 1 nothing && contains "no programs" nothing.err)
+      [nothing])
+
+-- Installing a program that is running
+--------------------------------------------------------------------------------
+
+-- | what came of running the program over and over while it was
+-- | installed again: the install's `Ran`, how many runs, and what each
+-- | run that went wrong said
+type Busy = { installed : Ran, runs : Int, bad : List String }
+
+-- (did a run of the program go as it should: as it was, or as it is)
+ranWell : Ran -> Bool
+ranWell r =
+  succeeded r
+  && (strEq r.out "Hello, world!\n" || strEq r.out "Hello, again!\n")
+
+-- (a run that went wrong, kept)
+keptIfBad : Ran -> List String -> List String
+keptIfBad r bad = if ranWell r then bad else Cons (said r) bad
+
+-- (the install waited for, the program run again each time it ends,
+-- until the install ends; the run then going waited for too)
+busyLoop : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> String
+         -> Subprocess
+         -> Subprocess
+         -> Int
+         -> List String
+         -> Co e Busy
+busyLoop bin installer runner runs bad = do
+  ended <- waitAny [installer, runner]
+  case ended of
+    Nothing -> failure "the install and the program, both gone"
+    Just (MkPair s r) ->
+      if sameHandle s runner
+      then (do
+            next <- start { command = bin }
+            case next of
+              Nothing -> do
+                last <- wait installer
+                pure
+                    { installed = last
+                    , runs = runs + 1
+                    , bad = Cons "not run" (keptIfBad r bad)
+                    }
+              Just n -> busyLoop bin installer n (runs + 1) (keptIfBad r bad))
+      else (do
+            last <- wait runner
+            pure { installed = r, runs = runs + 1, bad = keptIfBad last bad })
+
+-- (the installer started; else the test fails)
+started : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> String
+        -> Maybe Subprocess
+        -> Co e Subprocess
+started what (Just s) = pure s
+started what Nothing = failure (what ^ " could not be started")
+
+-- | install again, the program run over and over meanwhile: each run is
+-- | of the program as it was or as it is, never of one half written (it
+-- | is put in place by a rename, at once); an install that fails leaves
+-- | it as it was, and nothing beside it in bin/
+running : String -> Test
+running name =
+  integration name (do
+  here <- workingDir
+  heff <- given "HEFF"
+  made <- heffSays ["init", "busy"]
+  let busyHome = here ^ "/busy-home"
+  let busyBin = busyHome ^ "/bin/busy"
+  let busyEnv : List (Pair String String) = [MkPair "HEFF_HOME" busyHome]
+  first <- heffWithIn "" busyEnv ["install", "busy"]
+  main <- textOf "busy/app/busy/main.hf"
+  write
+      "busy/app/busy/main.hf"
+      (replaced "greeting \"world\"" "greeting \"again\"" main)
+  ready <- run { command = busyBin }
+  installer <-
+    start
+      { command = heff
+      , args = ["install", "busy"]
+      , env = List.append (envHere here) busyEnv
+      }
+  installing <- started "the install" installer
+  runner <- start { command = busyBin }
+  firstRun <- started "the program" runner
+  busy <- busyLoop busyBin installing firstRun 0 Nil
+  after <- ranSays busyBin
+  inBin <- listing (busyHome ^ "/bin")
+  holdsOf
+      "install again, the program running meanwhile: never run half written"
+      (succeeded first
+       && ranWell ready
+       && succeeded busy.installed
+       && busy.runs > 0
+       && List.null busy.bad
+       && strEq after "Hello, again!\n"
+       && strEq inBin "busy")
+      (said first
+       ^ said busy.installed
+       ^ show busy.runs
+       ^ " runs\n"
+       ^ joinWith "\n" (List.take 5 busy.bad)
+       ^ inBin)
+  write
+      "busy/app/busy/main.hf"
+      (replaced "greeting \"world\"" "greeting 1" main)
+  broken <- heffWithIn "" busyEnv ["install", "busy"]
+  kept <- ranSays busyBin
+  keptBin <- listing (busyHome ^ "/bin")
+  holdsOf
+      "install that fails: the program installed before kept"
+      (exitedWith 1 broken
+       && strEq kept "Hello, again!\n"
+       && strEq keptBin "busy")
+      (said broken ^ kept ^ keptBin))
+
+-- heff, installed
+--------------------------------------------------------------------------------
+
+-- (heff run in the test's directory, with no `HEFF_LIB`: as a release
+-- is, the library beside its bin/)
+unlibraried : {e : HFunctor}
+            -> {{sys : process <: e}}
+            -> String
+            -> String
+            -> List String
+            -> Co e Ran
+unlibraried dir bin arguments = do
+  here <- workingDir
+  run
+      { command = "env"
+      , args =
+          List.append
+            ["-u", "HEFF_LIB", "HEFF_HOME=" ^ here ^ "/heff-home", bin]
+            arguments
+      , dir = dir
+      , env = envHere here
+      }
+
+-- | heff itself, installed: it ships its lib/ and its package.hf, so the
+-- | heff in the heff home finds its library and its version beside bin/,
+-- | as a release's does (no `HEFF_LIB` to find it by); the heff home
+-- | says the repository is heff's own (the repository installed from:
+-- | its lib/ the library's source to the heff installed, as to the
+-- | editor's)
+installHeff : String -> Test
+installHeff name =
+  within
+    600000
+    (integration name (do
+     v <- heffVersion
+     root <- given "HEFF_TEST_ROOT"
+     heff <- given "HEFF"
+     here <- workingDir
+     let home = here ^ "/heff-home"
+     installed <- unlibraried root heff ["install"]
+     let installedHeff = home ^ "/bin/heff"
+     write
+         "uses-prelude.hf"
+         "xs : List Int\nxs = List.map (\\x -> x + 1) [1, 2]\n"
+     selfChecked <- unlibraried "" installedHeff ["check", "uses-prelude.hf"]
+     selfInit <- unlibraried "" installedHeff ["init", "fromhome"]
+     fromHome <- textOf "fromhome/package.hf"
+     selfVersion <- unlibraried "" installedHeff ["version"]
+     holds
+         "install heff: the heff in the heff home, with its library and its version"
+         (succeeded installed
+          && contains ("installed " ^ home ^ "/lib\n") installed.out
+          && contains ("installed " ^ home ^ "/package.hf\n") installed.out
+          && succeeded selfChecked
+          && contains "xs : List Int" selfChecked.out
+          && succeeded selfInit
+          && contains ("heff = \"" ^ v ^ "\"") fromHome
+          && succeeded selfVersion
+          && strEq selfVersion.out ("heff " ^ v ^ "\n"))
+         [installed, selfChecked, selfInit, selfVersion]
+     source <- exists (home ^ "/source")
+     selfOwn <- unlibraried "" installedHeff ["check", root ^ "/lib/float32.hf"]
+     holds
+         "install heff: the heff home says the repository is heff's own"
+         (source
+          && contains ("installed " ^ home ^ "/source\n") installed.out
+          && succeeded selfOwn
+          && not
+            (List.any
+               (\c -> contains c selfOwn.err)
+               ["E0335", "E0336", "E0347"]))
+         [installed, selfOwn]))
+
+-- Manifests' fields
+--------------------------------------------------------------------------------
+
+-- (the fields said of a package.hf, and of a build.hf)
+packageFields : String
+packageFields =
+  "the fields are module, heff, require, replace, in this order (require and replace may be left out)"
+
+buildFields : String
+buildFields =
+  "the fields are backend, run, ships, in this order (ships may be left out)"
+
+-- | a manifest's fields with a default in the manifest's types
+-- | (`require`, `replace`, a build.hf's `ships`: empty lists) left out,
+-- | or written: heff reading package.hf and build.hf (without
+-- | elaborating them, `heff build`) and elaborating them (`heff check`,
+-- | against the manifest's types) agree on each, and on a field without
+-- | one left out, or the fields out of order -- saying the same fields,
+-- | and which may be left out.  Each: the file, its head, its record,
+-- | and what is said of it (`""`: it reads)
+agreeing : String -> List (Pair (Pair String String) (Pair String String))
+agreeing v =
+  [ MkPair
+    (MkPair "package.hf" "package : Package\npackage")
+    (MkPair ("{ module = \"agree\", heff = \"" ^ v ^ "\" }") "")
+  , MkPair
+    (MkPair "package.hf" "package : Package\npackage")
+    (MkPair
+       ("{ module = \"agree\", heff = \""
+        ^ v
+        ^ "\", require = [], replace = [] }")
+       "")
+  , MkPair
+    (MkPair "package.hf" "package : Package\npackage")
+    (MkPair ("{ module = \"agree\", heff = \"" ^ v ^ "\", replace = [] }") "")
+  , MkPair
+    (MkPair "package.hf" "package : Package\npackage")
+    (MkPair "{ module = \"agree\" }" packageFields)
+  , MkPair
+    (MkPair "package.hf" "package : Package\npackage")
+    (MkPair
+       ("{ module = \"agree\", heff = \""
+        ^ v
+        ^ "\", replace = [], require = [] }")
+       packageFields)
+  , MkPair
+    (MkPair "app/agree/build.hf" "build : Build\nbuild")
+    (MkPair "{ backend = Page, run = \"main\" }" "")
+  , MkPair
+    (MkPair "app/agree/build.hf" "build : Build\nbuild")
+    (MkPair "{ backend = Page, run = \"main\", ships = [] }" "")
+  , MkPair
+    (MkPair "app/agree/build.hf" "build : Build\nbuild")
+    (MkPair "{ backend = Page }" buildFields)
+  , MkPair
+    (MkPair "app/agree/build.hf" "build : Build\nbuild")
+    (MkPair "{ backend = Page, ships = [], run = \"main\" }" buildFields)
+  ]
+
+-- (read and elaborated alike: both well, or both saying the fields)
+alike : String -> Ran -> Ran -> Bool
+alike fields read checked =
+  if strEq fields "" then succeeded read && succeeded checked
+  else exitedWith 1 read
+    && exitedWith 1 checked
+    && contains fields read.err
+    && contains fields checked.err
+
+-- (each, a subtest)
+eachAgreeing : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> String
+             -> List (Pair (Pair String String) (Pair String String))
+             -> Co e Unit
+eachAgreeing v Nil = pure MkUnit
+eachAgreeing v (Cons (MkPair (MkPair file head) (MkPair literal fields)) rest) = do
+  subtest (replaced "/" "." file ^ " " ^ literal) (do
+    write "agree/package.hf" (manifestFor v "agree" Nil)
+    write "agree/app/agree/build.hf" (buildOf "Page" Nil)
+    write
+        ("agree/" ^ file)
+        ("import manifest\n\n" ^ head ^ " = " ^ literal ^ "\n")
+    read <- heffIn "agree" ["build"]
+    checked <- heffIn "agree" ["check", file]
+    holds
+        (file ^ ", " ^ literal ^ ": read and elaborated alike")
+        (alike fields read checked)
+        [read, checked])
+  eachAgreeing v rest
+
+manifestFields : String -> Test
+manifestFields name =
+  integration name (do
+  v <- heffVersion
+  write "agree/src/agree/m.hf" "x : Int\nx = 1\n"
+  write
+      "agree/app/agree/main.hf"
+      "import co\nimport browser.dom\n\nmain : Co dom Unit\nmain = pure MkUnit\n"
+  eachAgreeing v (agreeing v))
+
+-- | projects' and packages' tests
+project : Test
+project =
+  group
+    "project"
+    [ initialized "init"
+    , modules "modules"
+    , manifests "package.hf"
+    , directories "packages from directories"
+    , heffsOwn "heff's own package"
+    , packageErrors "packages that are wrong"
+    , publishing "publish"
+    , getting "get"
+    , building "build and install"
+    , running "install, the program running meanwhile"
+    , installHeff "install heff"
+    , manifestFields "manifest fields"
+    ]

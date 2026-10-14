@@ -17,7 +17,7 @@ HF_FILES = $(shell git ls-files '*.hf' ':!test/')
 # (the tests written in heff, run by `heff test` alone, no Node.js: a
 # script of test/run.mjs ported to heff (#55) is listed here instead)
 HEFF_TESTS = test/golden.hf test/surface.hf test/format.hf test/cache.hf \
-  test/backcache.hf test/cli.hf
+  test/backcache.hf test/cli.hf test/project.hf
 # (are they run by `make test`: all the groups, or compiler among them)
 HEFF_TESTED = $(if $(GROUPS),$(filter compiler,$(GROUPS)),all)
 VSCODE = editors/vscode
