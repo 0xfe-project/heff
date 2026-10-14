@@ -17,7 +17,8 @@ HF_FILES = $(shell git ls-files '*.hf' ':!test/')
 # (the tests written in heff, run by `heff test` alone, no Node.js: a
 # script of test/run.mjs ported to heff (#55) is listed here instead)
 HEFF_TESTS = test/golden.hf test/surface.hf test/format.hf test/cache.hf \
-  test/backcache.hf test/cli.hf test/project.hf
+  test/backcache.hf test/cli.hf test/project.hf test/progress.hf \
+  test/terminal.hf test/dev.hf
 # (are they run by `make test`: all the groups, or compiler among them)
 HEFF_TESTED = $(if $(GROUPS),$(filter compiler,$(GROUPS)),all)
 VSCODE = editors/vscode
@@ -71,7 +72,7 @@ test: ## the test groups, all at once (GROUPS=..., all and the fixpoint by defau
 	$(if $(HEFF_TESTED),$(HEFF) test $(HEFF_TESTS))
 	$(if $(GROUPS),,$(ZIG) build fixpoint)
 
-test-heff: ## the tests written in heff, by `heff test` alone: the goldens, the surface, formatting, the caches
+test-heff: ## the tests written in heff, by `heff test` alone: the goldens, the surface, formatting, the caches, the terminal, heff dev
 	$(HEFF) test $(HEFF_TESTS)
 
 test-compiler: ## elaborating, formatting, the cache, the command line, the goldens

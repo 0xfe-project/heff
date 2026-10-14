@@ -29,10 +29,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export const groups = {
   // what heff says of programs: elaborating, formatting, its cache, its
-  // command line, projects, what it draws on a terminal, its commands'
-  // app, `heff dev` (the texts it said before, formatting, the caches:
-  // `make test-heff`)
-  compiler: [["progress.mjs"], ["terminal.mjs"], ["dev.mjs"]],
+  // command line, projects, what it draws on a terminal, `heff dev`
+  // (all of them now heff's own tests: `make test-heff`)
+  compiler: [],
   lsp: [["heff", "test", "test/lsp.hf"]],
   // programs compiled by each backend and run, held to the interpreter
   backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],

@@ -1,0 +1,484 @@
+-- `heff dev`: a project of a C program that runs until it is ended (a
+-- server's shape) and a page's program, built and run -- the program's
+-- output heff's -- and the page served, with what reloads it; a source
+-- changed, built again and the program run anew; a change that does not
+-- build said and waited past, the program kept; and heff dev ended by
+-- SIGTERM, what it started ended with it (else its output would be held
+-- open by them).  What is not a page's is sent on to a server
+-- (`--proxy`), here the tests' (`echo.c`, built here by zig, else `cc`,
+-- which says what it was sent); the pages asked for by curl.  Each test
+-- a project and a heff dev of its own, run by the heff that runs the
+-- tests (`HEFF`); not on Windows, which the server is not written for:
+--
+--   heff test --run dev/pages test/dev.hf
+
+import bytes as Bytes
+import check
+import co
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (files written, each a path and its text; else the test fails)
+writeAll : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List (Pair String String)
+         -> Co e Unit
+writeAll Nil = pure MkUnit
+writeAll (Cons (MkPair path text) rest) = do
+  ok <- writeFile path text
+  if ok then writeAll rest else failure ("could not write " ^ path)
+
+-- (the test fails, saying what was there, unless it holds)
+holds : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> String
+      -> Bool
+      -> String
+      -> Co e Unit
+holds what True there = pure MkUnit
+holds what False there = failure (what ^ "\n" ^ there)
+
+-- | the tests' C program `NAME.c` built, in the test's directory: its path
+builtC : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> Co e String
+builtC name = do
+  root <- given "HEFF_TEST_ROOT"
+  here <- workingDir
+  zig <- run { command = "zig", args = ["version"] }
+  flags <-
+    pure ["-O1", "-w", root ^ "/test/" ^ name ^ ".c", "-o", here ^ "/" ^ name]
+  built <-
+    if succeeded zig then run { command = "zig", args = Cons "cc" flags }
+    else run { command = "cc", args = flags }
+  if succeeded built then pure (here ^ "/" ^ name)
+    else failure (name ^ ".c not built: " ^ built.err)
+
+-- The project
+--------------------------------------------------------------------------------
+
+-- | the program: greets, on its error stream, then sleeps forever
+serving : String
+serving =
+  unlines
+    [ "import co"
+    , "import proj.greeting"
+    , "import std.io"
+    , "import std.time as Time"
+    , ""
+    , "world : HFunctor"
+    , "world = stdio <+> Time.time"
+    , ""
+    , "forever : {e : HFunctor} -> {{clock : Time.time <: e}} -> Co e Unit"
+    , "forever = do"
+    , "  Time.sleep 1000"
+    , "  forever"
+    , ""
+    , "program : {e : HFunctor} -> {{io : stdio <: e}} -> {{clock : Time.time <: e}} -> Co e Unit"
+    , "program = do"
+    , "  printErr (greeting \"server\")"
+    , "  forever"
+    , ""
+    , "main : Co world Unit"
+    , "main = program (io := \\p -> InL p) (clock := \\p -> InR p)"
+    , ""
+    ]
+
+-- | the page's program: greets in its `p`
+paging : String
+paging =
+  unlines
+    [ "import co"
+    , "import browser.dom"
+    , "import proj.greeting"
+    , ""
+    , "program : {{page : dom <: dom}} -> Co dom Unit"
+    , "program = bind (select \"#page\") (\\p -> found p (\\r -> bind (textIn r \"p\" (greeting \"page\")) (\\x -> pure MkUnit)))"
+    , ""
+    , "main : Co dom Unit"
+    , "main = program (page := here dom)"
+    , ""
+    ]
+
+-- | the project `proj`, its program and its page's
+project : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+project = do
+  heff <- given "HEFF"
+  made <- run { command = heff, args = ["init", "proj"] }
+  holds "heff init" (succeeded made) made.err
+  page <- makeDirectory "proj/app/page"
+  writeAll
+      [ MkPair "proj/app/proj/main.hf" serving
+      , MkPair
+        "proj/app/page/build.hf"
+        "import manifest\n\nbuild : Build\nbuild = { backend = Page, run = \"main\" }\n"
+      , MkPair "proj/app/page/main.hf" paging
+      , MkPair "proj/app/page/style.css" "p { color: teal; }\n"
+      ]
+
+-- heff dev
+--------------------------------------------------------------------------------
+
+-- | heff dev, running: its process, its process's number, the port of
+-- | its pages
+type Dev = { process : Subprocess, pid : String, port : String }
+
+-- | what is read of its output (and errors), after `said`, until `ok`
+-- | holds of it all or `ms` milliseconds have gone by waiting: all read,
+-- | and whether the output ended
+readUntil : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> Subprocess
+          -> (String -> Bool)
+          -> Int
+          -> String
+          -> Co e (Pair String Bool)
+readUntil p ok ms said =
+  if ok said || ms <= 0 then pure (MkPair said False)
+  else do
+    r <- readOutput p Available 20
+    case r of
+      Got b -> readUntil p ok ms (said ^ Bytes.asString b)
+      Timeout -> readUntil p ok (ms - 20) said
+      Closed -> pure (MkPair said True)
+
+-- | what it has said, once it has said something `ok` holds of (a minute
+-- | at most)
+saidOnce : {e : HFunctor}
+         -> {{sys : process <: e}}
+         -> Dev
+         -> (String -> Bool)
+         -> String
+         -> Co e String
+saidOnce d ok said = do
+  r <- readUntil d.process ok 60000 said
+  pure (fst r)
+
+-- (the first line of a text)
+firstLine : String -> String
+firstLine s = fromMaybe "" (List.head (lines s))
+
+-- | the server the tests send to, started: it and its port
+echoing : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> Co e (Pair Subprocess String)
+echoing = do
+  echo <- builtC "echo"
+  s <- start { command = echo, output = Piped, group = True }
+  case s of
+    Nothing -> failure "echo not run"
+    Just p -> do
+      line <- readOutput p (Through "\n") 10000
+      case line of
+        Got b -> pure (MkPair p (trim (Bytes.asString b)))
+        _ -> failure "echo said no port"
+
+-- | heff dev started in the project, its pages at a port no one listens
+-- | at, the rest sent on to `proxy`; its output and its errors one
+dev : {e : HFunctor}
+    -> {{chk : check <: e}}
+    -> {{sys : process <: e}}
+    -> {{disk : filesystem <: e}}
+    -> String
+    -> Co e Dev
+dev proxy = do
+  echo <- builtC "echo"
+  free <- run { command = echo, args = ["port"] }
+  port <- pure (trim free.out)
+  heff <- given "HEFF"
+  project
+  s <-
+    start
+      { command = "sh"
+      , args =
+          [ "-c"
+          , "echo $$; exec \"$0\" \"$@\" 2>&1"
+          , heff
+          , "dev"
+          , "--port"
+          , port
+          , "--proxy"
+          , "http://127.0.0.1:" ^ proxy
+          ]
+      , dir = "proj"
+      , output = Piped
+      }
+  case s of
+    Nothing -> failure "heff dev not run"
+    Just p -> do
+      line <- readOutput p (Through "\n") 10000
+      case line of
+        Got b ->
+          pure { process = p, pid = trim (Bytes.asString b), port = port }
+        _ -> failure "heff dev not started"
+
+-- | built, and run, the pages served: what it said by then
+started : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> Dev
+        -> Co e String
+started d = do
+  said <-
+    saidOnce
+      d
+      (\s ->
+         contains "built (1); running proj\n" s
+         && contains "Hello, server!\n" s
+         && contains "the pages at http://127.0.0.1:" s)
+      ""
+  holds
+      "built, and run"
+      (contains "built (1); running proj\n" said
+       && contains "Hello, server!\n" said
+       && contains "the pages at http://127.0.0.1:" said)
+      said
+  pure said
+
+-- | ended by SIGTERM: what it started ended too (else its output would
+-- | be held open by them, and it would not be seen to end)
+ended : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> Dev
+      -> String
+      -> Co e Unit
+ended d said = do
+  signalled <- run { command = "kill", args = ["-TERM", d.pid] }
+  r <- readUntil d.process (\s -> False) 10000 said
+  case r of
+    MkPair all True -> do
+      ran <- wait d.process
+      holds
+          "ended, with what it started"
+          (case ran.ended of
+           Signalled n -> n == 15
+           _ -> False)
+          (all ^ ran.out)
+    MkPair all False -> do
+      ran <- terminate d.process
+      failure ("not ended, with what it started, in 10 seconds\n" ^ all)
+
+-- The pages
+--------------------------------------------------------------------------------
+
+-- | an answer: its status, its content type, its body
+type Answer = { status : Int, kind : String, text : String }
+
+-- | what curl was answered, asking for the path of the pages (as it is,
+-- | `..` too), its body kept in `answer`: its status (0 where none came)
+-- | and its body
+asked : {e : HFunctor}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Dev
+      -> List String
+      -> String
+      -> Co e Answer
+asked d options path = do
+  r <-
+    run
+      { command = "curl"
+      , args =
+          List.append
+            options
+            [ "-s"
+            , "--path-as-is"
+            , "--max-time"
+            , "10"
+            , "-o"
+            , "answer"
+            , "-w"
+            , "%{http_code}\n%{content_type}"
+            , "http://127.0.0.1:" ^ d.port ^ path
+            ]
+      }
+  body <- readFile "answer"
+  pure
+      { status = fromMaybe 0 (parseInt (firstLine r.out))
+      , kind = fromMaybe "" (List.head (List.drop 1 (lines r.out)))
+      , text = fromMaybe "" body
+      }
+
+-- (asked for the path, plainly)
+get : {e : HFunctor}
+    -> {{sys : process <: e}}
+    -> {{disk : filesystem <: e}}
+    -> Dev
+    -> String
+    -> Co e Answer
+get d path = asked d Nil path
+
+-- (an answer, said)
+answered : Answer -> String
+answered a = show a.status ^ " " ^ a.kind ^ "\n" ^ a.text
+
+-- The tests
+--------------------------------------------------------------------------------
+
+-- | built and run, the pages served, what is not theirs sent on
+pages : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Co e Unit
+pages = do
+  echo <- echoing
+  d <- dev (snd echo)
+  said <- started d
+  index <- get d "/"
+  holds
+      "the pages' index"
+      (index.status == 200 && contains "<a href=\"/page/\">page</a>" index.text)
+      (answered index)
+  page <- get d "/page/"
+  holds
+      "a page made for the program"
+      (page.status == 200
+       && contains "<div id=\"page\"></div>" page.text
+       && contains "<script src=\"page.js\"></script>" page.text
+       && contains "fetch(\"/.heff/built\"" page.text)
+      (answered page)
+  js <- get d "/page/page.js"
+  script <- readFile "proj/.heff/bin/page.js"
+  holds
+      "its script, as built"
+      (js.status == 200
+       && startsWith "text/javascript" js.kind
+       && strEq js.text (fromMaybe "(none)" script))
+      (show js.status ^ " " ^ js.kind)
+  css <- get d "/page/style.css"
+  holds
+      "a file of the program's"
+      (css.status == 200
+       && startsWith "text/css" css.kind
+       && strEq css.text "p { color: teal; }\n")
+      (answered css)
+  built <- get d "/.heff/built"
+  holds "built, said to the page" (strEq built.text "1") (answered built)
+  sent <- asked d ["-X", "POST", "--data", "hello", "-D", "head"] "/api/x?y=1"
+  head <- readFile "head"
+  holds
+      "what is not a page's, sent on"
+      (sent.status == 201
+       && List.any
+         (\h -> contains h (fromMaybe "" head))
+         ["X-Seen: yes", "x-seen: yes"]
+       && strEq sent.text "POST /api/x?y=1 hello")
+      (fromMaybe "" head ^ answered sent)
+  bare <- get d "/page"
+  holds "a name without its slash" (bare.status == 301) (answered bare)
+  missing <- get d "/page/missing.css"
+  holds "no file the program has not" (missing.status == 404) (answered missing)
+  escaped <- get d "/page/..%2f..%2fpackage.hf"
+  dotted <- get d "/page/../package.hf"
+  holds
+      "nothing outside the program's"
+      (escaped.status == 404 && dotted.status /= 200)
+      (answered escaped ^ "\n" ^ answered dotted)
+  ended d said
+  stopped <- terminate (fst echo)
+  pure MkUnit
+
+-- | a change: built again, the program run anew; a change that does not
+-- | build: said, waited past, the program kept; mended, built again
+changes : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+changes = do
+  echo <- echoing
+  d <- dev (snd echo)
+  said <- started d
+  g <- pure "proj/src/proj/greeting.hf"
+  original <- readFile g
+  text <- pure (fromMaybe "" original)
+  writeAll [MkPair g (joinWith "\"Howdy, \"" (split "\"Hello, \"" text))]
+  again <-
+    saidOnce
+      d
+      (\s ->
+         contains "built (2); running proj\n" s
+         && contains "Howdy, server!\n" s)
+      said
+  holds
+      "a change, built and run again"
+      (contains "built (2); running proj\n" again
+       && contains "Howdy, server!\n" again)
+      again
+  built <- get d "/.heff/built"
+  holds "built again, said to the page" (strEq built.text "2") (answered built)
+  writeAll [MkPair g (joinWith "\"Hello, \" ^ 1" (split "\"Hello, \"" text))]
+  notBuilt <- pure "heff dev: not built; built again at the next change\n"
+  wrong <-
+    saidOnce
+      d
+      (\s ->
+         contains notBuilt (fromMaybe "" (List.last (split "error[E0311]" s)))
+         && contains "error[E0311]" s)
+      again
+  holds
+      "a change that does not build"
+      (contains "error[E0311]" wrong
+       && contains
+         notBuilt
+         (fromMaybe "" (List.last (split "error[E0311]" wrong))))
+      wrong
+  still <- get d "/.heff/built"
+  holds
+      "the program kept"
+      (not (contains "proj ended" wrong) && strEq still.text "2")
+      (wrong ^ answered still)
+  writeAll [MkPair g text]
+  mended <- saidOnce d (\s -> contains "built (3); running proj\n" s) wrong
+  holds
+      "mended, built again"
+      (contains "built (3); running proj\n" mended)
+      mended
+  ended d mended
+  stopped <- terminate (fst echo)
+  pure MkUnit
+
+-- (each test passed over on Windows)
+posix : ({e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> Co e Unit)
+      -> ({e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit)
+posix body = do
+  p <- platform
+  if strEq p "win32" then pure MkUnit else body
+
+-- | heff dev: its pages, and its program built again as its sources
+-- | change
+devTests : Test
+devTests =
+  group
+    "dev"
+    [integration "pages" (posix pages), integration "changes" (posix changes)]
