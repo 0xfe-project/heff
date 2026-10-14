@@ -125,7 +125,11 @@ backends' C programs under AddressSanitizer, and `make tsan`
 output of `check`, `explain`, `eval` and `type-at` on the library and
 test files (`heff test test/golden.hf`, `--run golden/nbe` for those
 of `test/nbe`); after an intended change, update them with `make golden`
-(`heff test --update test/golden.hf`, `RUN=golden/nbe` for some).
+(`heff test --update test/golden.hf`, `RUN=golden/nbe` for some).  The
+surface tests run `heff test` on each `.hf` file of the library, the
+compiler, the examples and the tests' directories, a subtest each,
+and hold what heff says of a few libraries of their own (`heff test
+test/surface.hf`, `--run surface/lib.std` for the files of `lib/std`).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.

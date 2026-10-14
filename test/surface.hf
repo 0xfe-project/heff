@@ -1,0 +1,423 @@
+-- The `.hf` programs: the library, the compiler, the examples and the
+-- tests elaborate and their expectations hold, each file `heff test`
+-- run on it; and what `heff test` and `heff check` say of a few things
+-- made for them: an expectation that does not hold, the prelude no
+-- module imports, a primitive declared twice.  The heff run is the one
+-- that runs the tests (`HEFF`), on the project's files
+-- (`HEFF_TEST_ROOT`), both set by `heff test`.
+--
+-- The files are those in the roots' directories, and in each directory
+-- under them, when the test runs, each listing sorted: only the roots
+-- are written here.  A file's subtest is named by its directory, its
+-- `/`s dots, then the file:
+--
+--   heff test --run surface/lib.std test/surface.hf          a directory
+--   heff test --run surface/^lib$/list.hf test/surface.hf    a file
+--   heff test --run primitives test/surface.hf
+
+import check
+import co
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (did it exit with this status)
+exitedWith : Int -> Ran -> Bool
+exitedWith n r = case r.ended of
+  Exited k -> k == n
+  _ -> False
+
+-- (how many errors it said)
+errorCount : Ran -> Int
+errorCount r = List.length (split "error[" r.err) - 1
+
+-- The files
+--------------------------------------------------------------------------------
+
+-- | the directories whose `.hf` files, and those of each directory under
+-- | them, are tested
+roots : List String
+roots =
+  [ "lib"
+  , "src"
+  , "app"
+  , "examples"
+  , "test/surface"
+  , "test/check"
+  , "test/gpu"
+  , "test/modules"
+  , "test/programs"
+  ]
+
+-- | a directory tested: its path and its `.hf` files, sorted
+type Held = { dir : String, files : List String }
+
+-- (the names of a directory, sorted, those starting with `.` passed over:
+-- so that each run names its subtests alike)
+listed : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> Co e (List String)
+listed path = do
+  names <- readDirectory path
+  pure
+      (List.sort
+         (List.filter (\n -> not (startsWith "." n)) (fromMaybe Nil names)))
+
+-- (the directories among these names of `dir`, each a path)
+directoriesAmong : {e : HFunctor}
+                 -> {{disk : filesystem <: e}}
+                 -> String
+                 -> String
+                 -> List String
+                 -> Co e (List String)
+directoriesAmong root dir Nil = pure Nil
+directoriesAmong root dir (Cons n rest) = do
+  isDir <- isDirectory (root ^ "/" ^ dir ^ "/" ^ n)
+  others <- directoriesAmong root dir rest
+  pure (if isDir then Cons (dir ^ "/" ^ n) others else others)
+
+-- | the directories tested from these: each, then those under it, in the
+-- | order of their names
+heldUnder : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> List String
+          -> Co e (List Held)
+heldUnder root Nil = pure Nil
+heldUnder root (Cons dir rest) = do
+  names <- listed (root ^ "/" ^ dir)
+  below <- directoriesAmong root dir names
+  more <- heldUnder root (List.append below rest)
+  pure
+      (Cons
+         { dir = dir, files = List.filter (\n -> endsWith ".hf" n) names }
+         more)
+
+-- | a directory's name as a subtest's, one level: its `/`s dots
+-- | >>> dotted "lib/std/http"
+-- | "lib.std.http"
+dotted : String -> String
+dotted dir = joinWith "." (split "/" dir)
+
+-- (`heff test` on the file, at the project's root: its integration
+-- tests, if it has some, one at a time)
+tested : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> Co e Unit
+tested path = do
+  heff <- given "HEFF"
+  root <- given "HEFF_TEST_ROOT"
+  r <- run { command = heff, args = ["test", path, "--jobs", "1"], dir = root }
+  if succeeded r then pure MkUnit else failure (said r)
+
+-- (each file of the directory, a subtest)
+eachFile : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> String
+         -> List String
+         -> Co e Unit
+eachFile dir Nil = pure MkUnit
+eachFile dir (Cons f rest) = do
+  subtest f (tested (dir ^ "/" ^ f))
+  eachFile dir rest
+
+-- (each directory that has files, a subtest)
+eachDirectory : {e : HFunctor}
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> List Held
+              -> Co e Unit
+eachDirectory Nil = pure MkUnit
+eachDirectory (Cons d rest) = do
+  if List.null d.files then pure MkUnit
+    else subtest (dotted d.dir) (eachFile d.dir d.files)
+  eachDirectory rest
+
+-- | each file of the roots' directories elaborates, and its expectations
+-- | and tests hold: a subtest a directory and a file, as they are when
+-- | it runs
+surface : Test
+surface =
+  integration "surface" (do
+  root <- given "HEFF_TEST_ROOT"
+  held <- heldUnder root roots
+  eachDirectory held)
+
+-- (files written, each a path and its text; else the test fails)
+writeAll : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List (Pair String String)
+         -> Co e Unit
+writeAll Nil = pure MkUnit
+writeAll (Cons (MkPair path text) rest) = do
+  ok <- writeFile path text
+  if ok then writeAll rest else failure ("could not write " ^ path)
+
+-- What is said of an expectation that does not hold
+--------------------------------------------------------------------------------
+
+-- (sixty `x`s)
+xs : String
+xs = joinWith "" (List.replicate 60 "x")
+
+-- (what is said from the first `  expected` on)
+fromExpected : String -> String
+fromExpected s =
+  if strFind "  expected" s 0 >= 0
+  then strSlice s (strFind "  expected" s 0) (strLength s)
+  else ""
+
+-- | an expectation that does not hold: what differs is shown, cut to it
+report : Test
+report =
+  integration "the report of an expectation that does not hold" (do
+  heff <- given "HEFF"
+  writeAll
+      [ MkPair
+        "wrong.hf"
+        ("-- >>> \"" ^ xs ^ " on click\"\n-- \"" ^ xs ^ " onn click\"\n")
+      ]
+  r <- run { command = heff, args = ["test", "wrong.hf"] }
+  if not (succeeded r)
+     && contains "[-onn-]{+on+}" (fromExpected r.out)
+     && contains "…" (fromExpected r.out)
+     && not (contains xs (fromExpected r.out))
+    then pure MkUnit
+    else failure (said r))
+
+-- A library of its own
+--------------------------------------------------------------------------------
+
+-- | a library of its own in the test's directory, `lib/`: the project's
+-- | `builtin`, and these modules, each a name and its text
+library : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> List (Pair String String)
+        -> Co e Unit
+library modules = do
+  root <- given "HEFF_TEST_ROOT"
+  builtin <- readFile (root ^ "/lib/builtin.hf")
+  made <- makeDirectory "lib"
+  writeAll
+      (Cons
+         (MkPair "lib/builtin.hf" (fromMaybe "" builtin))
+         (List.map
+            (\(m : Pair String String) ->
+               MkPair ("lib/" ^ fst m ^ ".hf") (snd m))
+            modules))
+
+-- (heff run in the test's directory, on its own library)
+inLibrary : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> List String
+          -> Co e Ran
+inLibrary arguments = do
+  heff <- given "HEFF"
+  here <- workingDir
+  run
+      { command = heff
+      , args = arguments
+      , env = [MkPair "HEFF_LIB" (here ^ "/lib")]
+      }
+
+-- (the test fails, saying these, unless it holds)
+holdsOf : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> Bool
+        -> List Ran
+        -> Co e Unit
+holdsOf True rs = pure MkUnit
+holdsOf False rs = failure (joinWith "\n" (List.map said rs))
+
+-- (a library whose prelude imports `core`)
+preludeLibrary : List (Pair String String)
+preludeLibrary =
+  [ MkPair "core" "yes : Bool\nyes = True\n"
+  , MkPair
+    "prelude"
+    "import core\n\nno : Bool\nno = False\n\nboth : List Bool\nboth = [yes, no]\n"
+  , MkPair "other" "noes : List Bool\nnoes = [no, no]\n"
+  , MkPair "list" "none : List Bool\nnone = []\n"
+  ]
+
+-- | the prelude, imported by every module without being written -- but
+-- | by those it is made of, found from the modules it imports: a library
+-- | whose prelude imports `core`, which then cannot import the prelude
+-- | (`core` is what the prelude is made of: the prelude's names are not
+-- | in its scope)
+prelude : Test
+prelude =
+  group
+    "the prelude without an import"
+    [ integration "and what it is made of" (do
+    library preludeLibrary
+    writeAll
+        [ MkPair
+          "use.hf"
+          "import other\n\n-- >>> both\n-- Cons True (Cons False Nil)\n\n-- >>> noes\n-- Cons False (Cons False Nil)\n\n-- >>> List.none\n-- Nil\n"
+        ]
+    used <- inLibrary ["test", "use.hf"]
+    core <- inLibrary ["check", "lib/core.hf"]
+    made <- inLibrary ["check", "lib/prelude.hf"]
+    holdsOf
+        (succeeded used
+         && succeeded core
+         && strEq core.out "yes : Bool\n"
+         && succeeded made)
+        [used, core, made])
+    , integration "not in what it is made of" (do
+    library
+        (Cons
+           (MkPair "core" "yes : Bool\nyes = no\n")
+           (List.drop 1 preludeLibrary))
+    core <- inLibrary ["check", "lib/core.hf"]
+    holdsOf
+        (not (succeeded core)
+         && contains "no such variable no in scope" core.err)
+        [core])
+    ]
+
+-- A primitive declared twice
+--------------------------------------------------------------------------------
+
+-- (a library declaring primitives)
+primitiveLibrary : List (Pair String String)
+primitiveLibrary =
+  [ MkPair "prelude" "primitive intAdd : Int -> Int -> Int\n"
+  , MkPair "list" "none : List Bool\nnone = []\n"
+  , MkPair "again" "-- the prelude's\nprimitive intAdd : Int -> Int -> Int\n"
+  , MkPair
+    "twice"
+    "primitive floatCos : Float64 -> Float64\nprimitive floatCos : Float64 -> Float64\n"
+  , MkPair "sines" "primitive floatSin : Float64 -> Float64\n"
+  , MkPair "sinus" "\nprimitive floatSin : Float64 -> Float64\n"
+  , MkPair "unknown" "primitive intPlusPlus : Int -> Int -> Int\n"
+  ]
+
+-- | the error of a primitive `k` declared by `a`, and by `b`
+twice : String -> String -> String -> String
+twice k a b =
+  "error[E0336]: the primitive `"
+  ^ k
+  ^ "` is declared by "
+  ^ a
+  ^ ", and by "
+  ^ b
+  ^ "\n"
+
+-- (`heff check` of the file, in the primitives' library, held to `holds`)
+checked : String -> String -> (Ran -> Bool) -> Test
+checked what file holds =
+  integration what (do
+  library primitiveLibrary
+  writeAll
+      [ MkPair "both.hf" "import sines\nimport sinus\n"
+      , MkPair "both2.hf" "import both\n"
+      , MkPair "again2.hf" "import again\n"
+      ]
+  r <- inLibrary ["check", file]
+  holdsOf (holds r) [r])
+
+-- | a primitive is the library's to declare, and once: one a module of
+-- | the library declares again -- that a module it is made of declares,
+-- | or that it declared above -- is an error there; one two of its
+-- | modules declare, neither made of the other, where they meet, at the
+-- | import that brings in the second -- and in no module made of that
+-- | one; each place said.  One the runtime has not is refused.
+primitives : Test
+primitives =
+  group
+    "primitives"
+    [ checked
+      "one the prelude declares"
+      "lib/again.hf"
+      (\r ->
+         contains
+           ("again.hf:2:1\n"
+            ^ twice
+              "intAdd"
+              "prelude, at lib/prelude.hf:1"
+              "again, at lib/again.hf:2")
+           r.err
+         && errorCount r == 1)
+    , checked
+      "one declared above"
+      "lib/twice.hf"
+      (\r ->
+         contains
+           ("twice.hf:2:1\n"
+            ^ twice
+              "floatCos"
+              "twice, at lib/twice.hf:1"
+              "twice, at lib/twice.hf:2")
+           r.err
+         && errorCount r == 1)
+    , checked
+      "two modules' where they meet"
+      "both.hf"
+      (\r ->
+         contains
+           ("both.hf:2:1\n"
+            ^ twice
+              "floatSin"
+              "sines, at lib/sines.hf:1"
+              "sinus, at lib/sinus.hf:2"
+            ^ "2 | import sinus\n")
+           r.err
+         && errorCount r == 1)
+    , checked
+      "two modules', not again in what is made of where they meet"
+      "both2.hf"
+      (\r ->
+         exitedWith 1 r
+         && errorCount r == 1
+         && not (contains "both2.hf:" r.err))
+    , checked
+      "one declared again, not again in what is made of it"
+      "again2.hf"
+      (\r ->
+         exitedWith 1 r
+         && errorCount r == 1
+         && not (contains "again2.hf:" r.err))
+    , checked
+      "one the runtime has not"
+      "lib/unknown.hf"
+      (\r ->
+         exitedWith 1 r
+         && contains
+           "error[E0329]: there is no primitive called `intPlusPlus`"
+           r.err)
+    , checked
+      "one declared once"
+      "lib/sines.hf"
+      (\r -> succeeded r && strEq r.out "floatSin : Float64 -> Float64\n")
+    ]
