@@ -1,0 +1,86 @@
+-- Files held by a `with`: `withFile path { access = Read } (\f ->
+-- body)` opens a file, runs the body with it, a `With s OpenFile` in a
+-- region `s` of its own, and closes it when the body ends.  The body is
+-- polymorphic in `s`, and what it comes to is of a type bound outside
+-- it, so the file is not kept past it (as Haskell's `ST`).  `With` is
+-- exposed without its tag: no program but this module makes one or
+-- takes the file out of one, so the file is had only by the operations
+-- here, in the body.  Its effect is std.filesystem's.
+
+module (With, withFile, readLineOf, writeStringTo)
+
+import co
+import std.filesystem
+
+-- | A host's thing (an open file), held in the region `s` by a `with`
+-- | (`withFile`): its tag is this module's, which gives the thing to
+-- | the operations of std.filesystem.
+data With (s : Type) a = MkWith a
+
+-- (what the body came to, or why the file did not close)
+closedWith : {a : Type} -> a -> Either FileError Unit -> Either FileError a
+closedWith x (Right _) = Right x
+closedWith x (Left err) = Left err
+
+-- (the body run with the file, then the file closed; or why it was not
+-- opened)
+heldBy : {e : HFunctor}
+       -> {a : Type}
+       -> {{ev : filesystem <: e}}
+       -> ({s : Type} -> With s OpenFile -> Co e a)
+       -> Either FileError OpenFile
+       -> Co e (Either FileError a)
+heldBy body (Left err) = pure (Left err)
+heldBy body (Right f) =
+  bind
+    (body (s := OpenFile) (MkWith f))
+    (\x ->
+       bind
+         (op (ev (ReleaseHeld f (\r -> r))) val)
+         (\r -> pure (closedWith x r)))
+
+-- | `path` opened as `o` says, held by `body` in a region of its own --
+-- | the file is not kept past it -- and closed when `body` ends: what it
+-- | came to, or why the file did not open or close.  Should `body` be
+-- | left otherwise -- a throw heard outside it, a handler between that
+-- | drops the continuation -- the file is closed where the program
+-- | drops its last reference to it: at once, in C, as it is counted.
+withFile : {e : HFunctor}
+         -> {a : Type}
+         -> {{ev : filesystem <: e}}
+         -> String
+         -> OpenOptions
+         -> ({s : Type} -> With s OpenFile -> Co e a)
+         -> Co e (Either FileError a)
+withFile path o body =
+  bind
+    (op
+       (ev
+          (OpenHeld
+             path
+             (accessCode o.access)
+             o.create
+             o.truncate
+             o.exclusive
+             o.mode
+             (\r -> r)))
+       val)
+    (\r -> heldBy body r)
+
+-- | The next line of a file held by a `with`, as `readLine`'s; after the
+-- | `with` closed it, `EBADF`.
+readLineOf : {e : HFunctor}
+           -> {s : Type}
+           -> {{ev : filesystem <: e}}
+           -> With s OpenFile
+           -> Co e (Either FileError (Maybe String))
+readLineOf (MkWith f) = op (ev (ReadLineHeld f (\r -> r))) val
+
+-- | A string written to a file held by a `with`, as `writeString`'s.
+writeStringTo : {e : HFunctor}
+              -> {s : Type}
+              -> {{ev : filesystem <: e}}
+              -> With s OpenFile
+              -> String
+              -> Co e (Either FileError Unit)
+writeStringTo (MkWith f) str = op (ev (WriteHeld f str (\r -> r))) val

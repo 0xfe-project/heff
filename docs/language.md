@@ -1,8 +1,8 @@
 # The language
 
 What heff's programs are made of, beyond its Haskell-like core:
-modules, records, implicit arguments, operators, numbers, runes and
-strings, and effects.  How a project is laid out is in
+modules (and what they expose), records, implicit arguments, operators,
+numbers, runes and strings, and effects.  How a project is laid out is in
 [projects.md](projects.md), what the library has in
 [library.md](library.md), doc tests and tests in [tests.md](tests.md).
 
@@ -53,6 +53,35 @@ import rune as Rune
 
 code : Rune -> Int
 code r = Rune.toInt r   -- the module's `toInt`; `Rune` in the signature, the type
+```
+
+A module may say what an importer sees of it by a header, first, before
+its imports: `module (x, T, U(..), (<+>))` lists some of its own
+definitions, each once (E0155), over as many lines as it takes.  With
+no header, a module exposes all it defines.  A name it does not list is
+its own: an importer neither names it, as `x` or `M.x` (E0353, saying
+which module keeps it), nor finds it as an instance (an instance is
+found by the names in scope).  A data type listed bare, `T`, is seen
+without its tags: an importer has the type, and what the module exposes
+to make and take apart its values, but writes none of its tags, to
+build a `T` or to match one (E0353); `T(..)` exposes its tags too.  An
+alias (`type`), a record type or a theory is seen whole -- a field is
+the type's, no name of the module's -- so `(..)` is only of a data type
+(E0155).  An operator is listed in parentheses.
+
+```haskell
+module (Counter, counter, bump, count)
+
+data Counter = MkCounter Int   -- `MkCounter` is the module's alone
+
+counter : Counter
+counter = MkCounter 0
+
+bump : Counter -> Counter
+bump (MkCounter n) = MkCounter (n + 1)
+
+count : Counter -> Int
+count (MkCounter n) = n
 ```
 
 ## Records
@@ -715,7 +744,7 @@ loadAll names = do
   began.
 - What is let go of however it is left is no part of `try`: a resource
   is held in a `with` of its own effect, its provider's to release
-  (std.filesystem's `withFile`, [the batteries](library.md#the-batteries)).
+  (std.filesystem.held's `withFile`, [the batteries](library.md#the-batteries)).
 
 Pure code is written as statements by `run do ...`: `run : Id a -> a`,
 of the identity monad (`type Id a = a`), whose `do` is taken apart by

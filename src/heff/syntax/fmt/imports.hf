@@ -1,16 +1,21 @@
--- The header of a file: the `import m` lines before its first
--- declaration.  The imports are read off, and the text is returned with
--- the import lines blanked out (spaces, so every offset stays where it
--- was); the formatter then puts an `import` pseudo-token at each one's
--- place.
+-- The header of a file: what it exposes (`module (x, T(..))`) and the
+-- `import m` lines, before its first declaration.  They are read off,
+-- and the text is returned with them blanked out (spaces, so every
+-- offset stays where it was); the formatter then puts an `import`
+-- pseudo-token at each one's place, the module header's laid out.
 
 import heff.syntax.fmt.lex as Lex
+import heff.syntax.import as Import
 
 type Span = { start : Int, end : Int }
 
 type Import = { name : String, alias : Maybe String, span : Span }
 
-type Header = { imports : List Import, text : String }
+type Header =
+  { imports : List Import
+  , exposing : Maybe Import.Header
+  , text : String
+  }
 
 lineEndFrom : String -> Int -> Int
 lineEndFrom s i =
@@ -89,12 +94,29 @@ readGo src i acc =
         Nothing -> List.reverse acc)
   else List.reverse acc
 
-mkHeader : String -> List Import -> Header
-mkHeader src imps = { imports = imps, text = List.foldl blankOne src imps }
+mkHeader : Maybe Import.Header -> String -> List Import -> Header
+mkHeader hdr src imps =
+  { imports = imps, exposing = hdr, text = List.foldl blankOne src imps }
 
--- | The imports of a file, and its text with the import lines blanked out.
+-- (the text with the module header blanked out)
+blankExposing : Maybe Import.Header -> String -> String
+blankExposing (Just h) s =
+  strSlice s 0 h.span.start
+  ^ spacesOf (h.span.end - h.span.start)
+  ^ strSlice s h.span.end (strLength s)
+blankExposing Nothing s = s
+
+-- (the imports of the text, its module header blanked out)
+readBlanked : Maybe Import.Header -> String -> Header
+readBlanked hdr t = mkHeader hdr t (readGo t 0 Nil)
+
+-- | The imports of a file, and its text with the header and the import
+-- | lines blanked out.
 readImports : String -> Header
-readImports src = mkHeader src (readGo src 0 Nil)
+readImports src =
+  readBlanked
+    (Import.readImports src).header
+    (blankExposing (Import.readImports src).header src)
 
 -- (an `import` pseudo-token at each import's place, among the tokens)
 importTok : Import -> Lex.Tok
@@ -111,10 +133,51 @@ importTok imp =
 tokLe : Lex.Tok -> Lex.Tok -> Bool
 tokLe a b = a.start <= b.start
 
--- | The tokens with the imports' pseudo-tokens in place, in source order.
-withImports : List Import -> List Lex.Tok -> List Lex.Tok
-withImports imps toks =
-  List.sortBy tokLe (List.append (List.map importTok imps) toks)
+-- (an entry as a header writes it: an operator in parentheses)
+entryText : Import.Exposed -> String
+entryText e =
+  (if Import.isIdent e.name then e.name else "(" ^ e.name ^ ")")
+  ^ (if e.tags then "(..)" else "")
+
+-- | the module header as it is laid out: on a line where it fits, else
+-- | an entry a line
+exposingText : List String -> String
+exposingText es =
+  if strLength ("module (" ^ joinWith ", " es ^ ")") <= 80
+  then "module (" ^ joinWith ", " es ^ ")"
+  else "module\n  ( " ^ joinWith "\n  , " es ^ "\n  )"
+
+-- (what the module header's pseudo-token says: laid out, unless what it
+-- says is wrong -- then as it is written)
+exposingSaid : Import.Header -> String
+exposingSaid h = case h.error of
+  Just _ -> ""
+  Nothing -> exposingText (List.map entryText h.exposes)
+
+exposingToks : Maybe Import.Header -> List Lex.Tok
+exposingToks (Just h) =
+  [ { kind = "import"
+    , text = exposingSaid h
+    , start = h.span.start
+    , end = h.span.end
+    , line = 0
+    , col = 0
+    , first = True
+    }
+  ]
+exposingToks Nothing = Nil
+
+-- | The tokens with the header's pseudo-tokens in place, in source
+-- | order.
+withImports : Header -> List Lex.Tok -> List Lex.Tok
+withImports hdr toks =
+  List.sortBy
+    tokLe
+    (List.append
+       (List.append
+          (exposingToks hdr.exposing)
+          (List.map importTok hdr.imports))
+       toks)
 
 importName : Import -> String
 importName imp = imp.name
@@ -138,3 +201,9 @@ test headers
 
 -- >>> importNames (readImports "f = 1\nimport a")
 -- Nil
+
+-- >>> importNames (readImports "-- c\nmodule (x, T(..))\n\nimport a\nf = 1")
+-- Cons "a" Nil
+
+-- >>> exposingText ["With", "withFile"]
+-- "module (With, withFile)"

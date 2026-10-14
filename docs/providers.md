@@ -211,10 +211,13 @@ runtime or the library; C cannot be trusted to say a function is pure.
 ## Resources held by a `with`
 
 A host's thing that must be let go of -- an open file -- is handed out
-by a `with` of the effect's own (std.filesystem's `withFile path
-options body`), which gives the body it as a `With s a` (co's),
-the body polymorphic in the region `s` so that what it comes to cannot
-hold it; what uses it needs no effect but the thing's own.  Its
+by a `with` of the effect's own (std.filesystem.held's `withFile path
+options body`), which gives the body it as a `With s a`, the body
+polymorphic in the region `s` so that what it comes to cannot hold it.
+The module that has the `with` exposes `With` without its tag (see [the
+language's modules](language.md#modules)): only it makes one or takes
+the thing out of one, for the effect's operations.  What uses it needs
+no effect but the thing's own.  Its
 provider makes sure it is let go of, in two parts:
 
 - the operation that acquires it gives a foreign value whose function

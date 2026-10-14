@@ -56,7 +56,8 @@ mkOwn name key = { name = name, key = key }
 type AliasQ = { module : String, alias : String }
 
 -- | a module elaborated (`opens`, `aliases`: what the imports it writes
--- | open, and by which names it has the modules it imports as `M`)
+-- | open, and by which names it has the modules it imports as `M`;
+-- | `exposes`, what its header lists, all it defines where it has none)
 type Checked =
   { module : String
   , path : String
@@ -71,6 +72,7 @@ type Checked =
   , aliases : List AliasQ
   , fixities : Fixity.Fixities
   , cached : Bool
+  , exposes : Maybe (List Import.Exposed)
   }
 
 appendD : {a : Type} -> List a -> List a -> List a
@@ -167,6 +169,71 @@ anyD : {a : Type} -> (a -> Bool) -> List a -> Bool
 anyD p Nil = False
 anyD p (Cons x xs) = p x || anyD p xs
 
+-- Exposing: a module's header lists what an importer sees of it -- with
+-- none, all it defines.  A data type listed bare is seen without its
+-- tags, `T(..)` with them.
+
+-- (whether the header lists the name `x`)
+listsName : List Import.Exposed -> String -> Bool
+listsName es x = anyD (\(e : Import.Exposed) -> strEq e.name x) es
+
+-- (whether the header lists the name `x` with its tags, `x(..)`)
+listsTags : List Import.Exposed -> String -> Bool
+listsTags es x = anyD (\(e : Import.Exposed) -> strEq e.name x && e.tags) es
+
+-- | of the definitions `own`, those a header exposes
+exposedIn : Maybe (List Import.Exposed) -> List Own -> List Own
+exposedIn (Just es) own = List.filter (\(o : Own) -> listsName es o.name) own
+exposedIn Nothing own = own
+
+-- | of the definitions `own`, those a header hides
+hiddenIn : Maybe (List Import.Exposed) -> List Own -> List Own
+hiddenIn (Just es) own =
+  List.filter (\(o : Own) -> not (listsName es o.name)) own
+hiddenIn Nothing own = Nil
+
+-- | of the definitions `own`, those whose tags (a data type's) a header
+-- | hides
+sealedIn : Maybe (List Import.Exposed) -> List Own -> List Own
+sealedIn (Just es) own =
+  List.filter (\(o : Own) -> not (listsTags es o.name)) own
+sealedIn Nothing own = Nil
+
+-- (whether a header exposes the name `x`)
+exposesIn : Maybe (List Import.Exposed) -> String -> Bool
+exposesIn (Just es) x = listsName es x
+exposesIn Nothing x = True
+
+-- | what an importer sees of the module
+exposedOwn : Checked -> List Own
+exposedOwn c = exposedIn c.exposes c.own
+
+-- | what the module's header hides
+hiddenOwn : Checked -> List Own
+hiddenOwn c = hiddenIn c.exposes c.own
+
+-- | the names a header lists, if the file has one
+exposesOf : Import.Imports -> Maybe (List Import.Exposed)
+exposesOf imps = case imps.header of
+  Just h -> Just h.exposes
+  Nothing -> Nothing
+
+-- (the keys the module's header hides, and the data types whose tags it
+-- does, `T(..)`, each said hidden by it)
+withHiddenOne : Globals.Globals -> Checked -> Globals.Globals
+withHiddenOne g c =
+  List.foldl
+    (\g2 (o : Own) -> Globals.addHidden (o.key ^ "(..)") c.module g2)
+    (List.foldl
+       (\g2 (o : Own) -> Globals.addHidden o.key c.module g2)
+       g
+       (hiddenOwn c))
+    (sealedIn c.exposes c.own)
+
+-- | what the headers of the modules a file is made of hide
+withHidden : List Checked -> Globals.Globals -> Globals.Globals
+withHidden needed g = List.foldl withHiddenOne g needed
+
 -- | (a name of a module imported without being written (`unwritten`)
 -- | gives way to the same name of a module that is: they do not clash)
 givesWay : List String -> List Imported -> Imported -> Bool
@@ -186,7 +253,9 @@ importedOf unwritten direct =
     unwritten
     (concatMapD
        (\(c : Checked) ->
-          List.map (\(o : Own) -> mkImported o.name o.key c.module) c.own)
+          List.map
+            (\(o : Own) -> mkImported o.name o.key c.module)
+            (exposedOwn c))
        direct)
 
 brokenName : Checked -> String -> Maybe Imported
@@ -199,10 +268,14 @@ brokenName c k =
          c.module)
   else Nothing
 
--- | what did not elaborate in a module imported, by its name there
+-- | what did not elaborate in a module imported, by its name there, if
+-- | the module exposes it
 brokenIn : Checked -> List Imported
 brokenIn c =
-  catMaybesD (List.map (\k -> brokenName c k) (Map.keys c.top.globals.broken))
+  List.filter
+    (\(o : Imported) -> exposesIn c.exposes o.name)
+    (catMaybesD
+       (List.map (\k -> brokenName c k) (Map.keys c.top.globals.broken)))
 
 nubByName : List Imported -> List Imported
 nubByName Nil = Nil
@@ -304,7 +377,9 @@ aliasQOne done g q = case findChecked done q.module of
       (\g2 (o : Imported) -> Globals.addAlias (q.alias ^ "." ^ o.name) o.key g2)
       (aliasModule g q)
       (appendD
-         (List.map (\(o : Own) -> mkImported o.name o.key c.module) c.own)
+         (List.map
+            (\(o : Own) -> mkImported o.name o.key c.module)
+            (exposedOwn c))
          (brokenIn c))
   -- (a module that did not load, its load's error said: what is used of
   -- it, `M.x`, is not an error of its own)
@@ -319,6 +394,39 @@ aliasQualified done g Nil = g
 aliasQualified done g (Cons q rest) =
   aliasQualified done (aliasQOne done g q) rest
 
+-- (the names the open import of `c` would bring that its header hides)
+withUnexposedOpen : Globals.Globals -> Checked -> Globals.Globals
+withUnexposedOpen g c =
+  List.foldl
+    (\g2 (o : Own) -> Globals.addUnexposed o.name c.module g2)
+    g
+    (hiddenOwn c)
+
+-- (the names `M.x` the import of `m` as `M` would bring that its header
+-- hides)
+withUnexposedQ : List Checked -> Globals.Globals -> AliasQ -> Globals.Globals
+withUnexposedQ done g q = case findChecked done q.module of
+  Just c ->
+    List.foldl
+      (\g2 (o : Own) ->
+         Globals.addUnexposed (q.alias ^ "." ^ o.name) c.module g2)
+      g
+      (hiddenOwn c)
+  Nothing -> g
+
+-- | the names the imports would bring that their headers hide, each with
+-- | the module that hides it: a use of one is said to be of that
+withUnexposed : List Checked
+              -> List Checked
+              -> List AliasQ
+              -> Globals.Globals
+              -> Globals.Globals
+withUnexposed done direct qs g =
+  List.foldl
+    (withUnexposedQ done)
+    (List.foldl withUnexposedOpen g direct)
+    qs
+
 -- | the instances a module declares, by key, in the order declared
 ownInstances : Checked -> List String
 ownInstances c =
@@ -328,8 +436,16 @@ ownInstances c =
        (\(i : Globals.Instance) -> strEq i.module c.module)
        (Globals.instancesOf c.top.globals))
 
+-- | the instances a module declares and exposes, by key
+exposedInstances : Checked -> List String
+exposedInstances c =
+  List.filter
+    (\k -> anyD (\(o : Own) -> strEq o.key k) (exposedOwn c))
+    (ownInstances c)
+
 -- | the instances of the modules a file imports, by name or by alias --
--- | not those of what they import -- in scope for its instance searches
+-- | not those of what they import, nor those they do not expose -- in
+-- | scope for its instance searches
 withImportedInstances : List Checked
                       -> List String
                       -> Globals.Globals
@@ -341,17 +457,21 @@ withImportedInstances done modules g =
        List.foldl
          (\g3 k -> Globals.addInstance k c.module g3)
          g2
-         (ownInstances c)
+         (exposedInstances c)
      Nothing -> g2)
     g
     modules
 
+-- | (a name an import has but does not expose is known: a use of it is
+-- | said to be of that, not read as a tag)
 knownIn : Globals.Globals -> String -> Bool
 knownIn g x = case Globals.lookupName g x of
   Just _ -> True
   Nothing -> case Globals.ambiguousIn g x of
     Just _ -> True
-    Nothing -> Globals.underBroken g x
+    Nothing -> case Globals.unexposedBy g x of
+      Just _ -> True
+      Nothing -> Globals.underBroken g x
 
 -- | what does not parse: a use of it is not an error of its own
 withParseBroken : (String -> String)
@@ -388,8 +508,9 @@ mkChecked : String
           -> List AliasQ
           -> Fixity.Fixities
           -> Bool
+          -> Maybe (List Import.Exposed)
           -> Checked
-mkChecked m path shown source decls top diags own deps opens aliases fixities cached =
+mkChecked m path shown source decls top diags own deps opens aliases fixities cached exposes =
   { module = m
   , path = path
   , shown = shown
@@ -403,6 +524,7 @@ mkChecked m path shown source decls top diags own deps opens aliases fixities ca
   , aliases = aliases
   , fixities = fixities
   , cached = cached
+  , exposes = exposes
   }
 
 importNames : List Import.Import -> List String
@@ -698,7 +820,10 @@ thawedChecked s imps th t =
     s.shown
     s.source
     Nil
-    (withStruct s.module (ownOf s.module t.keys) t)
+    (withStruct
+       s.module
+       (exposedIn (exposesOf imps) (ownOf s.module t.keys))
+       t)
     Nil
     (ownOf s.module t.keys)
     (importNames imps.imports)
@@ -706,6 +831,7 @@ thawedChecked s imps th t =
     (aliasPairs (Import.written imps))
     th.fixities
     True
+    (exposesOf imps)
 
 elabThawed : Source -> Import.Imports -> Thawed -> Globals.Globals -> Checked
 elabThawed s imps th g0 =
@@ -746,6 +872,83 @@ againGo implicit had (Cons i rest) =
 againDiags : Import.Imports -> List Diag
 againDiags imps = againGo imps.implicit imps.implicit (Import.written imps)
 
+-- The header's diagnostics: what it says wrong, a name it lists that the
+-- module does not define or that it lists twice, and `T(..)` of what has
+-- no tags.
+
+headerDiag : Int -> Params.Span -> String -> Diag
+headerDiag code sp msg =
+  { code = code, severity = SError, msg = msg, span = sp, note = Nothing }
+
+-- (a name as a header lists it: an operator in parentheses)
+listedName : String -> String
+listedName x = if Import.isIdent x then x else "(" ^ x ^ ")"
+
+-- (whether the definition under the key `k` is a data type)
+isDataKey : Globals.Globals -> String -> Bool
+isDataKey g k = case Globals.lookupEntry g k of
+  Just e -> SurfacePrint.isData e.tySyntax e.syntax
+  Nothing -> False
+
+ownKeyOf : List Own -> String -> Maybe String
+ownKeyOf Nil x = Nothing
+ownKeyOf (Cons o rest) x =
+  if strEq o.name x then Just o.key else ownKeyOf rest x
+
+-- (an entry of the header, after those `before`; a definition that did
+-- not elaborate is no error of the header's)
+exposedDiag : Globals.Globals
+            -> List Own
+            -> List Import.Exposed
+            -> Import.Exposed
+            -> List Diag
+exposedDiag g own before x =
+  if listsName before x.name
+  then [headerDiag 155 x.span ("`" ^ listedName x.name ^ "` is listed twice")]
+  else case ownKeyOf own x.name of
+    Nothing ->
+      if Globals.isBroken g x.name then Nil
+      else [ headerDiag
+             155
+             x.span
+             ("the module defines no `"
+              ^ listedName x.name
+              ^ "`: a header lists its own definitions")
+           ]
+    Just k ->
+      if x.tags && not (isDataKey g k)
+      then [ headerDiag
+             155
+             x.span
+             ("`"
+              ^ listedName x.name
+              ^ "` has no tags to expose: list it bare, `"
+              ^ listedName x.name
+              ^ "`")
+           ]
+      else Nil
+
+exposedDiagsGo : Globals.Globals
+               -> List Own
+               -> List Import.Exposed
+               -> List Import.Exposed
+               -> List Diag
+exposedDiagsGo g own before Nil = Nil
+exposedDiagsGo g own before (Cons x rest) =
+  appendD
+    (exposedDiag g own before x)
+    (exposedDiagsGo g own (Cons x before) rest)
+
+headerErrorDiags : Maybe Import.HeaderError -> List Diag
+headerErrorDiags (Just err) = [headerDiag 154 err.span err.msg]
+headerErrorDiags Nothing = Nil
+
+-- | what is wrong with a module's header
+headerDiags : Globals.Globals -> List Own -> Maybe Import.Header -> List Diag
+headerDiags g own (Just h) =
+  appendD (headerErrorDiags h.error) (exposedDiagsGo g own Nil h.exposes)
+headerDiags g own Nothing = Nil
+
 elabTop : Source
         -> Import.Imports
         -> List Checked
@@ -759,14 +962,22 @@ elabTop s imps direct r t =
     s.shown
     s.source
     r.decls
-    (withStruct s.module (ownOf s.module t.keys) t)
-    (appendD (againDiags imps) (List.map hint (appendD r.diags t.diags)))
+    (withStruct
+       s.module
+       (exposedIn (exposesOf imps) (ownOf s.module t.keys))
+       t)
+    (appendD
+       (againDiags imps)
+       (appendD
+          (headerDiags t.globals (ownOf s.module t.keys) imps.header)
+          (List.map hint (appendD r.diags t.diags))))
     (ownOf s.module t.keys)
     (importNames imps.imports)
     (openNames (Import.written imps))
     (aliasPairs (Import.written imps))
     r.fixities
     False
+    (exposesOf imps)
 
 -- (the declarations elaborated, of those read)
 elabDecls : List Checked
@@ -890,14 +1101,22 @@ elabClashed done s imps thaw direct needed imported clashes =
     (withImportedInstances
        done
        (importNames imps.imports)
-       (aliasQualified
+       (withUnexposed
           done
-          (aliasOpen
+          direct
+          (aliasPairs imps.imports)
+          (aliasQualified
              done
-             clashes
-             (aliasOpen done clashes (envOf done needed) imported)
-             (concatMapD (\(c : Checked) -> brokenIn c) direct))
-          (aliasPairs imps.imports)))
+             (aliasOpen
+                done
+                clashes
+                (aliasOpen
+                   done
+                   clashes
+                   (withHidden needed (envOf done needed))
+                   imported)
+                (concatMapD (\(c : Checked) -> brokenIn c) direct))
+             (aliasPairs imps.imports))))
 
 -- (what is imported, and which of it clashes, reckoned once)
 elabAliased : List Checked
@@ -1020,6 +1239,7 @@ withDiags c ds =
     c.aliases
     c.fixities
     c.cached
+    c.exposes
 
 -- | a module checked, the primitives declared twice that meet in it
 -- | said: among those it is made of (`needed`) and its own
@@ -1119,6 +1339,7 @@ lean c =
     c.aliases
     c.fixities
     c.cached
+    c.exposes
 
 -- | ... without its trace alone (a language server never shows it)
 traceless : Checked -> Checked
@@ -1146,6 +1367,7 @@ traceless c =
     c.aliases
     c.fixities
     c.cached
+    c.exposes
 
 -- | ... each made lean as soon as it is checked
 checkProgramLean : List Source -> List Checked
@@ -1967,7 +2189,15 @@ sigEntry : Checked -> (String -> String) -> Own -> Maybe String
 sigEntry c ln o = case Globals.lookupEntry c.top.globals o.key of
   Just e ->
     Just
-      (if Globals.isInstance c.top.globals o.key
+      (if not (List.null (sealedIn c.exposes [o]))
+          && SurfacePrint.isData e.tySyntax e.syntax
+       then fromMaybe
+           ""
+           (SurfacePrint.printAbstract
+              o.name
+              (Rename.renameTy ln e.tySyntax)
+              (Rename.renameEl ln e.syntax))
+       else if Globals.isInstance c.top.globals o.key
        then SurfacePrint.printInstanceSig
            SurfacePrint.plainImplicits
            (SurfacePrint.named o.name)
@@ -1989,16 +2219,32 @@ importLines c =
        (\(a : AliasQ) -> "import " ^ a.module ^ " as " ^ a.alias ^ "\n")
        c.aliases)
 
--- | a file's interface: its imports and fixity declarations, its types
--- | in full (`data`, `type`, `theory` -- an importer sees through
--- | them), its values as signatures.  What `heff check` prints.
+-- (the header, as the file's interface lists it)
+headerLine : Maybe (List Import.Exposed) -> String
+headerLine (Just es) =
+  "module ("
+  ^ joinWith
+    ", "
+    (List.map
+       (\(e : Import.Exposed) ->
+          listedName e.name ^ (if e.tags then "(..)" else ""))
+       es)
+  ^ ")\n"
+headerLine Nothing = ""
+
+-- | a file's interface, what an importer sees: its header, imports and
+-- | fixity declarations, its types in full (`data`, `type`, `theory` --
+-- | an importer sees through them; a data type whose tags are not
+-- | exposed, its head alone), its values as signatures.  What `heff
+-- | check` prints.
 interface : Checked -> String
 interface c =
   joinWith
     "\n"
     (List.filter
        (\s -> not (strEq s ""))
-       [ importLines c
+       [ headerLine c.exposes
+       , importLines c
        , fixityLines c.fixities 0 c.fixities.groups
        , (List.foldl
             glueOne
@@ -2006,7 +2252,7 @@ interface c =
             (catMaybesD
                (List.map
                   (\o -> sigEntry c (localNameIn (localNames c.top.globals)) o)
-                  c.own))).out
+                  (exposedOwn c)))).out
        ])
 
 -- Running

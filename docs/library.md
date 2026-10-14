@@ -130,7 +130,8 @@ What is above, in `lib/`, is pure, the same on every backend.
 
 `lib/std/` is the system's, for the C backend (`--backend=c`):
 
-- `std.io` (the standard streams), `std.filesystem`, `std.process`,
+- `std.io` (the standard streams), `std.filesystem` (and
+  `std.filesystem.held`, files held by a `with`), `std.process`,
   `std.http` (an HTTP client), `std.net` (TCP sockets), `std.progress`
   (what a program is doing, drawn on a terminal), `std.thread` (threads
   truly at once: a pool, spreads, and `Parallel` handled by them --
@@ -447,14 +448,17 @@ wordsIn = bind stdin (\i -> foldLines i 0 countWords)
 ```
 
 A file may instead be held by a `with`, closed however the program is
-done with it: `withFile path { access = Read } body` opens it and runs
-`body` with it, a `With s OpenFile` (co's) in a region `s` of its own,
-read by `readLineOf f` and written by `writeStringTo f s`; the body
+done with it: std.filesystem.held's `withFile path { access = Read }
+body` opens it and runs `body` with it, a `With s OpenFile` in a region
+`s` of its own -- exposed without its tag, so the file is had only by
+the module's operations -- read by `readLineOf f` and written by
+`writeStringTo f s`; the body
 ended, it closes it, and is what the body came to, `Either FileError
 a` (`Left` where the file did not open or close).  The body is
 polymorphic in `s` and what it comes to is of a type bound outside it,
 so the file cannot be kept past it: `withFile path o (\f -> pure f)`
-does not type-check.  Should the body be left otherwise -- a throw
+does not type-check (a function that holds it can be: an operation on
+it after the body is `EBADF`).  Should the body be left otherwise -- a throw
 heard by a `catch` outside it, a handler between that drops the
 continuation -- the file is closed where the program drops its last
 reference to it, at once (the count of it, in C, comes to naught before

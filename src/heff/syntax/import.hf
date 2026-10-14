@@ -1,5 +1,6 @@
--- The header of a file: the `import m` lines before its first
--- declaration.  The text comes back with the import lines blanked, so
+-- The header of a file: what it exposes (`module (x, T, U(..))`, first,
+-- if it says) and the `import m` lines, before its first declaration.
+-- The text comes back with the header and the import lines blanked, so
 -- every offset stays where it was.
 
 import heff.elab.params as Params
@@ -9,9 +10,28 @@ type Import = { name : String, alias : Maybe String, span : Params.Span }
 mkImport : String -> Maybe String -> Params.Span -> Import
 mkImport name alias span = { name = name, alias = alias, span = span }
 
+-- | a name a module exposes, as its header lists it -- `x`, `(<+>)`,
+-- | `T`, or `T(..)` (`tags`: a data type's tags too) -- and where
+type Exposed = { name : String, tags : Bool, span : Params.Span }
+
+-- | what is wrong with a header, and where
+type HeaderError = { span : Params.Span, msg : String }
+
+-- | what a module exposes, its header says: the names listed (with no
+-- | header, all it defines), where the header is, and what is wrong
+-- | with it
+type Header =
+  { exposes : List Exposed, span : Params.Span, error : Maybe HeaderError }
+
 -- | the imports of a file: those it writes, after those it has without
--- | writing them (`implicit`); its text with the import lines blanked
-type Imports = { imports : List Import, implicit : List Import, text : String }
+-- | writing them (`implicit`); its header; its text with the header and
+-- | the import lines blanked
+type Imports =
+  { imports : List Import
+  , implicit : List Import
+  , header : Maybe Header
+  , text : String
+  }
 
 nameChar : Int -> Bool
 nameChar c =
@@ -101,18 +121,208 @@ withI x k = k x
 withS : {a : Type} -> String -> (String -> a) -> a
 withS x k = k x
 
-doneI : String -> List Import -> Imports
-doneI src acc =
+-- The module header: `module (x, T, U(..), (<+>))`, the names an
+-- importer sees, over as many lines as it takes
+--------------------------------------------------------------------------------
+
+-- (a character of a name a header lists)
+identChar : Int -> Bool
+identChar c =
+  c == 95
+  || c == 39
+  || (97 <= c && c <= 122)
+  || (65 <= c && c <= 90)
+  || (48 <= c && c <= 57)
+
+isIdent : String -> Bool
+isIdent x =
+  strLength x > 0
+  && not (48 <= byteAt x 0 && byteAt x 0 <= 57)
+  && allChars x 0 identChar
+
+isWhite : Int -> Bool
+isWhite c = c == 32 || c == 10 || c == 13 || c == 9
+
+-- (from `i` on, past the whitespace, up to `end`)
+skipWhite : String -> Int -> Int -> Int
+skipWhite s i end =
+  if i < end && isWhite (byteAt s i) then skipWhite s (i + 1) end else i
+
+-- (back from `j`, past the whitespace, down to `start`)
+skipWhiteBack : String -> Int -> Int -> Int
+skipWhiteBack s start j =
+  if j > start && isWhite (byteAt s (j - 1)) then skipWhiteBack s start (j - 1)
+  else j
+
+-- (the `)` closing the `(` at or after `i`, parentheses nesting)
+closeOf : String -> Int -> Int -> Maybe Int
+closeOf s i depth =
+  if i >= strLength s then Nothing
+  else if byteAt s i == 40 then closeOf s (i + 1) (depth + 1)
+  else if byteAt s i == 41
+  then (if depth == 1 then Just i else closeOf s (i + 1) (depth - 1))
+  else closeOf s (i + 1) depth
+
+-- (`a`, past the whitespace, to `b` without the whitespace before it)
+spanFrom : String -> Int -> Int -> Params.Span
+spanFrom s a b = { start = a, end = skipWhiteBack s a b }
+
+-- (`a` to `b` without the whitespace around)
+trimmedSpan : String -> Int -> Int -> Params.Span
+trimmedSpan s a b = spanFrom s (skipWhite s a b) b
+
+-- (the entries from `from` to `b`, split at the commas outside
+-- parentheses, each trimmed)
+piecesGo : String
+         -> Int
+         -> Int
+         -> Int
+         -> Int
+         -> List Params.Span
+         -> List Params.Span
+piecesGo s from i b depth acc =
+  if i >= b then List.reverse (Cons (trimmedSpan s from b) acc)
+  else if byteAt s i == 40 then piecesGo s from (i + 1) b (depth + 1) acc
+  else if byteAt s i == 41 then piecesGo s from (i + 1) b (depth - 1) acc
+  else if byteAt s i == 44 && depth == 0
+  then piecesGo s (i + 1) (i + 1) b depth (Cons (trimmedSpan s from i) acc)
+  else piecesGo s from (i + 1) b depth acc
+
+-- (an operator, in parentheses: `(<+>)`)
+operatorIn : String -> Maybe String
+operatorIn t =
+  if strLength t > 2
+     && byteAt t 0 == 40
+     && byteAt t (strLength t - 1) == 41
+  then withS
+      (trim (strSlice t 1 (strLength t - 1)))
+      (\op ->
+         if strEq op "" || strEq op ".." || contains " " op || isIdent op
+         then Nothing
+         else Just op)
+  else Nothing
+
+headerSays : String
+headerSays = "a header lists names: `x`, `T`, `T(..)`, `(<+>)`"
+
+nameEntry : String -> Params.Span -> Bool -> Either HeaderError Exposed
+nameEntry s sp tags =
+  withS
+    (strSlice s sp.start sp.end)
+    (\t ->
+       if isIdent t then Right { name = t, tags = tags, span = sp }
+       else case operatorIn t of
+         Just op -> Right { name = op, tags = tags, span = sp }
+         Nothing -> Left { span = sp, msg = headerSays })
+
+-- (`T(..)`, or `T (..)`: `T`, its tags too)
+entryOf : String -> Params.Span -> Either HeaderError Exposed
+entryOf s sp =
+  if sp.end - sp.start > 4 && endsWith "(..)" (strSlice s sp.start sp.end)
+  then nameEntry
+      s
+      { start = sp.start, end = skipWhiteBack s sp.start (sp.end - 4) }
+      True
+  else if sp.end == sp.start
+  then Left { span = sp, msg = "an empty entry: " ^ headerSays }
+  else nameEntry s sp False
+
+entriesGo : String
+          -> List Params.Span
+          -> List Exposed
+          -> Pair (List Exposed) (Maybe HeaderError)
+entriesGo s Nil acc = MkPair (List.reverse acc) Nothing
+entriesGo s (Cons sp rest) acc = case entryOf s sp of
+  Right x -> entriesGo s rest (Cons x acc)
+  Left err -> MkPair (List.reverse acc) (Just err)
+
+-- (the entries between the parentheses at `open` and `close`)
+entriesIn : String -> Int -> Int -> Pair (List Exposed) (Maybe HeaderError)
+entriesIn s open close =
+  if skipWhite s (open + 1) close == close then MkPair Nil Nothing
+  else entriesGo s (piecesGo s (open + 1) (open + 1) close 0 Nil) Nil
+
+-- (a header from `i`, where a line starts `module`: up to the `)` that
+-- closes its list, nothing after it on that line -- else no header, the
+-- declarations' to read)
+headerAt : String -> Int -> Maybe Header
+headerAt src i =
+  if strLength src > i + 6
+     && strEq (strSlice src i (i + 6)) "module"
+     && not (identChar (byteAt src (i + 6)))
+  then withI
+      (skipWhite src (i + 6) (strLength src))
+      (\open ->
+         if open < strLength src && byteAt src open == 40
+         then case closeOf src open 0 of
+           Just close ->
+             if strEq
+                  (trim (strSlice src (close + 1) (lineEndAt src (close + 1))))
+                  ""
+             then case entriesIn src open close of
+               MkPair es err ->
+                 Just
+                   { exposes = es
+                   , span = { start = i, end = close + 1 }
+                   , error = err
+                   }
+             else Nothing
+           Nothing -> Nothing
+         else Nothing)
+  else Nothing
+
+-- (the header, but later than the first thing the file says)
+headerLate : Header -> Header
+headerLate h =
+  { exposes = h.exposes
+  , span = h.span
+  , error =
+      Just
+        { span = h.span
+        , msg = "a module's header comes first, before its imports"
+        }
+  }
+
+-- (the header blanked as an import is)
+blankSpan : String -> Params.Span -> String
+blankSpan s sp =
+  strSlice s 0 sp.start
+  ^ spaces (sp.end - sp.start)
+  ^ strSlice s sp.end (strLength s)
+
+blankHeader : Maybe Header -> String -> String
+blankHeader (Just h) s = blankSpan s h.span
+blankHeader Nothing s = s
+
+doneI : String -> Maybe Header -> List Import -> Imports
+doneI src hdr acc =
   { imports = List.reverse acc
   , implicit = Nil
-  , text = List.foldl blankOne src (List.reverse acc)
+  , header = hdr
+  , text = blankHeader hdr (List.foldl blankOne src (List.reverse acc))
   }
+
+-- (a header read at `i`, first or late, and the lines after it read on
+-- by `again`; a second ends the header, the declarations' to read)
+headerThen : String
+           -> Int
+           -> Maybe Header
+           -> List Import
+           -> (Maybe Header -> Int -> Imports)
+           -> Imports
+headerThen src i hdr@(Just _) acc again = doneI src hdr acc
+headerThen src i Nothing acc again = case headerAt src i of
+  Just h ->
+    again
+      (Just (if List.null acc then h else headerLate h))
+      (lineEndAt src h.span.end + 1)
+  Nothing -> doneI src Nothing acc
 
 -- (the `import` prefix is of the line as written: an indented one ends
 -- the header)
-importsGo : String -> Int -> List Import -> Imports
-importsGo src i acc =
-  if i >= strLength src then doneI src acc
+importsGo : String -> Int -> Maybe Header -> List Import -> Imports
+importsGo src i hdr acc =
+  if i >= strLength src then doneI src hdr acc
   else withI
       (lineEndAt src i)
       (\e ->
@@ -123,21 +333,58 @@ importsGo src i acc =
                 (trim line)
                 (\trimmed ->
                    if strEq trimmed "" || strEq (strSlice trimmed 0 2) "--"
-                   then importsGo src (e + 1) acc
+                   then importsGo src (e + 1) hdr acc
                    else if startsWith "import " line
                    then case importOf
                        i
                        e
                        (words (trim (strSlice line 7 (strLength line)))) of
-                     Just imp -> importsGo src (e + 1) (Cons imp acc)
-                     Nothing -> doneI src acc
-                   else doneI src acc)))
+                     Just imp -> importsGo src (e + 1) hdr (Cons imp acc)
+                     Nothing -> doneI src hdr acc
+                   else if startsWith "module" line
+                   then headerThen src i hdr acc (\h j -> importsGo src j h acc)
+                   else doneI src hdr acc)))
 
 -- | the imports of a file, and its text with the import lines blanked
 -- | >>> List.map (\(i : Import) -> i.name) (readImports "import prelude\nimport map as M\n\nx : Int\nx = 1\n").imports
 -- | ["prelude", "map"]
 readImports : String -> Imports
-readImports src = importsGo src 0 Nil
+readImports src = importsGo src 0 Nothing Nil
+
+-- (what is wrong with the header, said)
+errorSaid : Maybe HeaderError -> String
+errorSaid (Just err) = err.msg
+errorSaid Nothing = ""
+
+-- | the names the header lists, if there is one
+-- | >>> headerNames (readImports "module (With, withFile, T (..), (<+>))\n\nimport co\n\nx : Int\nx = 1\n")
+-- | Just ["With", "withFile", "T", "<+>"]
+-- | >>> headerNames (readImports "-- a module\nmodule\n  ( a\n  , B(..)\n  )\nimport co\n")
+-- | Just ["a", "B"]
+-- | >>> headerNames (readImports "module ()\n")
+-- | Just []
+-- | >>> headerNames (readImports "module = 1\n")
+-- | Nothing
+-- | >>> headerNames (readImports "module (x) = 1\n")
+-- | Nothing
+-- | >>> (readImports "module (a)\nimport co\nx = 1\n").text
+-- | "          \n         \nx = 1\n"
+headerNames : Imports -> Maybe (List String)
+headerNames imps = case imps.header of
+  Just h -> Just (List.map (\(x : Exposed) -> x.name) h.exposes)
+  Nothing -> Nothing
+
+-- | what is wrong with the header, if anything
+-- | >>> headerError (readImports "module (a, , b)\n")
+-- | "an empty entry: a header lists names: `x`, `T`, `T(..)`, `(<+>)`"
+-- | >>> headerError (readImports "import co\nmodule (a)\n")
+-- | "a module's header comes first, before its imports"
+-- | >>> headerError (readImports "module (a.b)\n")
+-- | "a header lists names: `x`, `T`, `T(..)`, `(<+>)`"
+headerError : Imports -> String
+headerError imps = case imps.header of
+  Just h -> errorSaid h.error
+  Nothing -> ""
 
 -- | the imports every module has without writing them, in order: the
 -- | types the language answers with itself (a comparison's `Bool`,
@@ -177,6 +424,7 @@ withImplicit : List String -> Imports -> Imports
 withImplicit ms r =
   { imports = List.append (List.concatMap implicitImportOf ms) r.imports
   , implicit = List.concatMap implicitImportOf ms
+  , header = r.header
   , text = r.text
   }
 
@@ -213,5 +461,6 @@ renamed rs imps =
       List.map
         (\(i : Import) -> mkImport (renameTo rs i.name) i.alias i.span)
         imps.implicit
+  , header = imps.header
   , text = imps.text
   }

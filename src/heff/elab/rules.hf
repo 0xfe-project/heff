@@ -414,6 +414,8 @@ prettyEqErr g (UnequalNeus cs h sp h2 sp2) =
   ^ eqBareStr g cs h2 sp2
   ^ " are not equal "
 prettyEqErr g MentionsError = "a solution would mention what did not elaborate"
+prettyEqErr g (Escapes l) =
+  "a solution would mention a variable outside where it is bound"
 
 tyStrZ : ElabEnv -> Value.Ty -> Elab String
 tyStrZ e t = do
@@ -923,8 +925,15 @@ resolveWanted : ElabEnv
               -> Elab Bool
 resolveWanted e sp search hm holeVal goal final = do
   mc <- gets (\c -> c.metas)
+  -- (an error already said leaves what it would have solved unsolved:
+  -- an instance argument it leaves undetermined is no error of its own)
+  earlier <- gets (\c -> not (List.null c.recovered))
   if not (List.null (metasLeft e mc goal))
-    then if final
+    then if final && earlier
+      then failElsewhere
+          sp
+          "an instance argument's type is left undetermined by an error before"
+      else if final
       then failWithNote
           (a := Bool)
           sp
@@ -1639,6 +1648,141 @@ specialized e v (VDecode h sp u described el) a' err =
   specializedGo e v a' h sp u described el Nil err
 specialized e v a a' err = pure err
 
+-- A type that would name a variable outside where it is bound: as a rule
+-- the region of a `with`'s resource, what the body comes to holding it
+
+-- (the name of the local of level `l`, the names newest first)
+nameAtGo : List String -> Int -> String
+nameAtGo (Cons x xs) i = if i <= 0 then x else nameAtGo xs (i - 1)
+nameAtGo Nil i = "?"
+
+levelName : Scope -> Int -> String
+levelName sc l = nameAtGo sc.names (sc.len - 1 - l)
+
+-- (whether an argument is the local of level `l`)
+isLocalAt : Int -> Value.V -> Bool
+isLocalAt l (VNeu (HLocal l2) SpId _ _ _) = l2 == l
+isLocalAt l v = False
+
+spineHasLocal : Int -> Value.Spine Value.V -> Bool
+spineHasLocal l (SpApp sp v) = isLocalAt l v || spineHasLocal l sp
+spineHasLocal l (SpProj sp _) = spineHasLocal l sp
+spineHasLocal l (SpSpec sp _ _) = spineHasLocal l sp
+spineHasLocal l SpId = False
+
+-- (a `with`'s resource in the region of the local `l`: `With s a`, `s`
+-- that local)
+heldIn : Int -> Value.Ty -> Bool
+heldIn l (VDecode (HGlobal k) sp _ _ _) =
+  (strEq k "With" || endsWith ".With" k) && spineHasLocal l sp
+heldIn l t = False
+
+-- (the newest local held in the region of the local `l`: its name and
+-- type)
+heldLocal : Int -> List String -> Ctx -> Maybe (Pair String Value.Ty)
+heldLocal l names (CUndelay c) = heldLocal l names c
+heldLocal l (Cons x xs) (CBind c bm t) =
+  if heldIn l t then Just (MkPair x t) else heldLocal l xs c
+heldLocal l _ _ = Nothing
+
+-- | `x`, of the type `t`, a `with`'s resource, in what the body at `sp`
+-- | comes to
+resourceEscapes : {a : Type}
+                -> ElabEnv
+                -> Params.Span
+                -> String
+                -> String
+                -> Value.Ty
+                -> Elab a
+resourceEscapes e sp s x t = do
+  shown <- tyStrZ e t
+  failWithNote
+      sp
+      11
+      ("`" ^ x ^ "`, a resource of a `with`, cannot leave its body")
+      ("`"
+       ^ x
+       ^ "` is of type `"
+       ^ shown
+       ^ "`, in the region `"
+       ^ s
+       ^ "` of the body alone: use it inside the body and return what it gives (a line, a count), not `"
+       ^ x
+       ^ "` or anything holding it")
+
+-- (a head bound outside the region the local `l` is: before it, or a
+-- global)
+outsideOf : Int -> Value.Head -> Bool
+outsideOf l (HLocal l2) = l2 < l
+outsideOf l (HGlobal _) = True
+outsideOf l h = False
+
+-- (the local `h1`, met by `h2`, bound outside it)
+localOutside : Value.Head -> Value.Head -> Maybe Int
+localOutside (HLocal l) h2 = if outsideOf l h2 then Just l else Nothing
+localOutside h1 h2 = Nothing
+
+firstOf : {a : Type} -> Maybe a -> Maybe a -> Maybe a
+firstOf (Just x) y = Just x
+firstOf Nothing y = y
+
+-- | a local whose region what is outside it would have to be: named
+-- | outside where it is bound, or equated with a type from outside
+escapeLevel : Conversion.EqErr -> Maybe Int
+escapeLevel (Escapes l) = Just l
+escapeLevel (UnequalNeus _ h1 _ h2 _) =
+  firstOf (localOutside h1 h2) (localOutside h2 h1)
+escapeLevel err = Nothing
+
+plainMismatch : {r : Type}
+              -> ElabEnv
+              -> Params.Span
+              -> Value.Ty
+              -> Value.Ty
+              -> String
+              -> Elab r
+plainMismatch e sp a a' why = do
+  want <- tyStrZ e a
+  got <- tyStrZ e a'
+  failWithNote sp 11 ("expected type " ^ want ^ ", but got type " ^ got) why
+
+-- (the local `l` met outside its region: a `with`'s resource leaving its
+-- body where one is held in it)
+escapeAt : {r : Type}
+         -> ElabEnv
+         -> Params.Span
+         -> Value.Ty
+         -> Value.Ty
+         -> Conversion.EqErr
+         -> Int
+         -> Maybe (Pair String Value.Ty)
+         -> Elab r
+escapeAt e sp a a' err l (Just (MkPair x t)) =
+  resourceEscapes e sp (levelName e.scope l) x t
+escapeAt e sp a a' (Escapes _) l Nothing =
+  plainMismatch
+    e
+    sp
+    a
+    a'
+    ("the type names `" ^ levelName e.scope l ^ "` outside where it is bound")
+escapeAt e sp a a' err l Nothing =
+  plainMismatch e sp a a' (prettyEqErr e.globals err)
+
+-- | the type expected, `a`, and the one given, `a'`, not unified: what
+-- | was expected and what was given, and why -- or, a `with`'s resource
+-- | leaving its body, said as that
+mismatch : {r : Type}
+         -> ElabEnv
+         -> Params.Span
+         -> Value.Ty
+         -> Value.Ty
+         -> Conversion.EqErr
+         -> Elab r
+mismatch e sp a a' err = case escapeLevel err of
+  Just l -> escapeAt e sp a a' err l (heldLocal l e.scope.names e.scope.ctx)
+  Nothing -> plainMismatch e sp a a' (prettyEqErr e.globals err)
+
 applyGo : Params.Span
         -> ElabEnv
         -> Value.Ty
@@ -1664,14 +1808,7 @@ applyGo sp e a (MkPair m a') = do
     Right _ -> do
       Meta.runDelayed False
       pure m
-    Left err -> do
-      want <- tyStrZ e a
-      got <- tyStrZ e a'
-      failWithNote
-          sp
-          11
-          ("expected type " ^ want ^ ", but got type " ^ got)
-          (prettyEqErr e.globals err)
+    Left err -> mismatch e sp a a' err
 
 apply : Params.Span -> Syn -> Chk
 apply sp syn =
@@ -2702,22 +2839,69 @@ tagArgsGo e (Cons c cs) (Cons t ts) = do
   pure (Cons m ms)
 tagArgsGo e _ _ = pure Nil
 
+-- Exposing: a data type an import's header lists bare is seen without
+-- its tags -- no value of it is built or taken apart by them here
+
+-- | the module whose header hides the tags of the data type `a` is (or
+-- | that an alias of it stands for), if one does
+sealedOf : Globals.Globals -> Value.Ty -> Maybe String
+sealedOf g (VDecode (HGlobal k) _ _ described _) = case Globals.sealedBy g k of
+  Just m -> Just m
+  Nothing -> case Params.forceTh described of
+    Just t -> sealedOf g t
+    Nothing -> Nothing
+sealedOf g t = Nothing
+
+-- (the tag `x`, of a type whose tags the module `m` does not expose)
+tagHidden : {a : Type} -> Params.Span -> String -> String -> Elab a
+tagHidden sp x m =
+  failWithNote
+    sp
+    53
+    ("`" ^ x ^ "` is not exposed by " ^ m)
+    (m
+     ^ " exposes its type without its tags: what else it exposes makes and takes apart its values")
+
+-- | the tag `x`, written at `sp`, of the type `a`: refused where an
+-- | import's header hides that type's tags
+tagExposed : ElabEnv -> Params.Span -> String -> Value.Ty -> Elab Unit
+tagExposed e sp x a = case sealedOf e.globals a of
+  Just m -> tagHidden sp x m
+  Nothing -> pure MkUnit
+
+-- (each tag the cases write, of the type `a`)
+tagsExposed : ElabEnv
+            -> Value.Ty
+            -> Params.Variants (Params.Th Value.Ty)
+            -> List (Pair String Params.Span)
+            -> Elab Unit
+tagsExposed e a vs Nil = pure MkUnit
+tagsExposed e a vs (Cons (MkPair x tsp) rest) = do
+  case Dict.lookup vs x of
+    Just _ -> tagExposed e tsp x a
+    Nothing -> pure MkUnit
+  tagsExposed e a vs rest
+
 sumIntroNow : Params.Span -> Params.Span -> String -> List Chk -> Chk
 sumIntroNow sp tsp x cs =
   MkChk (\e a0 -> do
   a <- Meta.forceT a0
   case Value.behavior a of
     LikeSum vs -> case Dict.lookup vs x of
-      Just ts ->
+      Just ts -> do
+        tagExposed e tsp x a
         if Array.length ts == List.length cs
-        then do
-          recordName e a x tsp a
-          args <- tagArgsGo e cs (Array.toList ts)
-          pure (Memoed.tag x (Array.fromList args))
-        else failWith
-            sp
-            16
-            ("wrong number of arguments for tag " ^ x ^ " in type " ^ tyStr e a)
+          then do
+            recordName e a x tsp a
+            args <- tagArgsGo e cs (Array.toList ts)
+            pure (Memoed.tag x (Array.fromList args))
+          else failWith
+              sp
+              16
+              ("wrong number of arguments for tag "
+               ^ x
+               ^ " in type "
+               ^ tyStr e a)
       Nothing -> failWith sp 15 ("no such tag " ^ x ^ " in type " ^ tyStr e a)
     _ ->
       if Unify.isFlexTy a
@@ -2856,6 +3040,7 @@ casesAt : Params.Span
         -> Elab Memoed.El
 casesAt sp e b scrut a vs tags casesChk = do
   recordTags e a vs tags
+  tagsExposed e a vs tags
   cases <-
     traverseE
       (\p -> case p of
@@ -3395,7 +3580,9 @@ find sp x =
         -- (not an error of its own: that of the definition is reported)
         if Globals.isBroken e.globals x
         then failElsewhere sp ("uses " ^ x ^ ", which does not elaborate")
-        else failWith sp 8 ("no such variable " ^ x ^ " in scope"))
+        else case Globals.unexposedBy e.globals x of
+          Just m -> failWith sp 53 ("`" ^ x ^ "` is not exposed by " ^ m)
+          Nothing -> failWith sp 8 ("no such variable " ^ x ^ " in scope"))
 
 -- Literal patterns
 --------------------------------------------------------------------------------
