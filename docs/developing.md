@@ -121,10 +121,11 @@ test-fixpoint` does, which needs no Node.js.
 `make sanitize` (`HEFF_SANITIZE=1 node test/backends.mjs`) builds the
 backends' C programs under AddressSanitizer, and `make tsan`
 (`HEFF_TSAN=1`) runs the threads test under ThreadSanitizer too
-([threads.md](threads.md)).  Among the tests, `test/golden/` holds the
+([threads.md](threads.md)).  Among the tests, the golden ones hold the
 output of `check`, `explain`, `eval` and `type-at` on the library and
-test files; after an intended change, update it with `make golden`
-(`node test/golden.mjs --update`).
+test files (`heff test test/golden.hf`, `--run golden/nbe` for those
+of `test/nbe`); after an intended change, update them with `make golden`
+(`heff test --update test/golden.hf`, `RUN=golden/nbe` for some).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.

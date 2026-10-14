@@ -239,7 +239,8 @@ a = a
 `heff test` then holds it to having errors, and says nothing of them:
 it passes if it has some, and fails if it checks.  The line counts only
 as the file's first; anywhere else it is a comment like another.  (What
-the errors say is held by `test/golden.mjs`, against `test/golden/`.)
+the errors say is held by heff's golden tests, `heff test
+test/golden.hf`.)
 
 ## The report
 

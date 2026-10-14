@@ -509,7 +509,7 @@ try {
   // a file changed on disk, not in the editor: told of, the project is
   // elaborated again
   const refsOfNot = async () => (await request("textDocument/references", { textDocument: { uri: uri("test/modules/src/a.hf") }, position: pos(a, "inv :"), context: { includeDeclaration: false } })).result || [];
-  // (in app/, where test/golden.mjs, run at the same time, looks for no file)
+  // (in app/, where the golden tests, run at the same time, look for no file)
   const watched = "test/modules/app/lsp-watched.hf";
   expect("before a file is made", !(await refsOfNot()).some((r) => r.uri === uri(watched)), "");
   writeFileSync(join(root, watched), "import a\n\ny : Bool\ny = inv True\n");

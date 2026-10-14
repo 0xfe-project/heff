@@ -1,0 +1,533 @@
+-- What heff says of the repository's files, held to what it said: for
+-- each file of the library and of some of the tests, `check` (its
+-- interface and its diagnostics), `explain` (the elaboration's trace),
+-- `eval` (each definition's value, `dump-eval`), `type-at` (at some
+-- names) and, of a file whose first comment names a backend
+-- (`--backend=B`), `compile` for it -- each a subtest, its text held to
+-- the golden one kept for it, byte for byte.  A change of them is a
+-- change of heff, to be looked at, and kept with `heff test --update`.
+-- The heff run is the one that runs the tests (`HEFF`), on the
+-- project's files (`HEFF_TEST_ROOT`), both set by `heff test`.
+--
+-- The files are those in the directories when the test runs, each
+-- directory's listing sorted: only the roots below, and what is asked
+-- of their files, are written here.  A subtest is named by the
+-- directory, its `/`s dots, then the file, then what is asked of it:
+--
+--   heff test --run golden/test.nbe test/golden.hf          a directory
+--   heff test --run golden/test.nbe/data.hf test/golden.hf  a file
+--   heff test --run 'golden///eval' test/golden.hf          the values
+--   heff test --update --run 'golden/^lib$/list' test/golden.hf
+--
+-- (The compiler's own files are held by the fixpoint instead: their
+-- words change with every change of the compiler.)
+
+import check
+import co
+import std.filesystem
+import std.process
+
+-- | what heff is asked of a file: each a command, and a golden text
+data Kind = Check | Explain | Eval | TypeAt | Compile
+
+kindName : Kind -> String
+kindName Check = "check"
+kindName Explain = "explain"
+kindName Eval = "eval"
+kindName TypeAt = "type-at"
+kindName Compile = "compile"
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (heff run at the project's root, on these arguments)
+heffSaid : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List String
+         -> Co e Ran
+heffSaid arguments = do
+  heff <- given "HEFF"
+  root <- given "HEFF_TEST_ROOT"
+  run { command = heff, args = arguments, dir = root }
+
+-- Where type-at is asked
+--------------------------------------------------------------------------------
+
+-- (a byte of a name, after its first)
+nameByte : Int -> Bool
+nameByte c =
+  (c >= 48 && c <= 57)
+  || (c >= 65 && c <= 90)
+  || (c >= 97 && c <= 122)
+  || c == 95
+  || c == 39
+
+-- (a name's first byte)
+nameStart : Int -> Bool
+nameStart c = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+
+-- (a byte of a word, as a regular expression's `\b` has it)
+wordByte : Int -> Bool
+wordByte c = nameByte c && c /= 39
+
+-- (the byte at `i`, or none, -1, past the ends)
+at : String -> Int -> Int
+at s i = if i < 0 || i >= strLength s then 0 - 1 else byteAt s i
+
+-- (`n` spaces)
+spaces : Int -> String
+spaces n = joinWith "" (List.replicate n " ")
+
+-- (the end of a string literal from `j`, within it: after its closing
+-- quote, if it closes on its line)
+stringEnd : String -> Int -> Maybe Int
+stringEnd s j =
+  if at s j == 34 then Just (j + 1)
+  else if at s j < 0 || at s j == 10 then Nothing
+  else if at s j == 92
+  then (if at s (j + 1) < 0 || at s (j + 1) == 10 then Nothing
+        else stringEnd s (j + 2))
+  else stringEnd s (j + 1)
+
+-- (after the continuation bytes of a rune from `j`)
+continued : String -> Int -> Int
+continued s j = if at s j >= 128 && at s j < 192 then continued s (j + 1) else j
+
+-- (after the hexadecimal digits from `j`)
+hexEnd : String -> Int -> Int
+hexEnd s j =
+  if (at s j >= 48 && at s j <= 57)
+     || (at s j >= 65 && at s j <= 70)
+     || (at s j >= 97 && at s j <= 102)
+  then hexEnd s (j + 1)
+  else j
+
+-- (the end of a rune literal whose rune is from `j` to `k`: after its
+-- closing quote)
+closedAt : String -> Int -> Maybe Int
+closedAt s k = if at s k == 39 then Just (k + 1) else Nothing
+
+-- (a rune literal's `\u{...}` from `j`, its backslash: its end)
+unicodeEnd : String -> Int -> Maybe Int
+unicodeEnd s j =
+  if at s (j + 1) == 117
+     && at s (j + 2) == 123
+     && hexEnd s (j + 3) > j + 3
+     && at s (hexEnd s (j + 3)) == 125
+  then closedAt s (hexEnd s (j + 3) + 1)
+  else Nothing
+
+-- (the end of a rune literal from `j`, after its opening quote: a byte
+-- of its own, the first byte of a rune and those that go on, `\u{...}`
+-- or a byte escaped)
+runeEnd : String -> Int -> Maybe Int
+runeEnd s j =
+  if at s j < 0
+     || at s j == 39
+     || at s j == 10
+     || (at s j >= 128 && at s j < 192)
+  then Nothing
+  else if at s j >= 192
+  then (if continued s (j + 1) > j + 1 then closedAt s (continued s (j + 1))
+        else Nothing)
+  else if at s j == 92
+  then (case unicodeEnd s j of
+        Just k -> Just k
+        Nothing ->
+          if at s (j + 1) < 0 || at s (j + 1) == 10 || at s (j + 1) == 13
+          then Nothing
+          else closedAt s (j + 2))
+  else closedAt s (j + 1)
+
+-- (the literal begun at `i`, if one is: where it ends)
+type Blanking = String -> Int -> Maybe Int
+
+-- (the text from `i` on, each literal `ends` finds blanked, its length
+-- kept; what is done so far in `pieces`, last first, from `from`)
+blankedFrom : Blanking -> String -> Int -> Int -> List String -> String
+blankedFrom ends s from i pieces =
+  if i >= strLength s
+  then joinWith "" (List.reverse (Cons (strSlice s from i) pieces))
+  else case ends s i of
+    Just e ->
+      blankedFrom
+        ends
+        s
+        e
+        e
+        (Cons (spaces (e - i)) (Cons (strSlice s from i) pieces))
+    Nothing -> blankedFrom ends s from (i + 1) pieces
+
+-- (a string literal from `i`)
+stringAt : String -> Int -> Maybe Int
+stringAt s i = if at s i == 34 then stringEnd s (i + 1) else Nothing
+
+-- (a rune literal from `i`, not a name's `'`)
+runeAt : String -> Int -> Maybe Int
+runeAt s i =
+  if at s i == 39 && not (nameByte (at s (i - 1))) then runeEnd s (i + 1)
+  else Nothing
+
+-- (the end of the name from `i`)
+nameEnd : String -> Int -> Int
+nameEnd s i = if nameByte (at s i) then nameEnd s (i + 1) else i
+
+-- (after the spaces from `i`)
+spacesEnd : String -> Int -> Int
+spacesEnd s i = if isSpaceCode (at s i) then spacesEnd s (i + 1) else i
+
+-- (does the line, from `i` to `j`, begin with the word `w`)
+beginsWith : String -> String -> Int -> Int -> Bool
+beginsWith w s i j =
+  strEq (strSlice s i (i + strLength w)) w
+  && i + strLength w <= j
+  && (i + strLength w == j || not (wordByte (at s (i + strLength w))))
+
+-- | is the name at `i` of the text one type-at is asked of: not a
+-- | keyword, and not in a comment or an import (the line, up to it,
+-- | begun by `--` or `import`; the line begun at `line`)
+asked : List String -> String -> Int -> Int -> Bool
+asked keywords s line i =
+  not (List.any (\k -> strEq k (strSlice s i (nameEnd s i))) keywords)
+  && not
+    (strEq (strSlice s (spacesEnd s line) (spacesEnd s line + 2)) "--"
+     && spacesEnd s line + 2 <= i)
+  && not (beginsWith "import" s (spacesEnd s line) i)
+
+-- (the starts of the names asked of, from `i` on, the line begun at
+-- `line`, last first)
+namesFrom : List String -> String -> Int -> Int -> List Int -> List Int
+namesFrom keywords s line i acc =
+  if i >= strLength s then List.reverse acc
+  else if at s i == 10 then namesFrom keywords s (i + 1) (i + 1) acc
+  else if nameStart (at s i) && not (nameByte (at s (i - 1)))
+  then namesFrom
+      keywords
+      s
+      line
+      (nameEnd s i)
+      (if asked keywords s line i then Cons i acc else acc)
+  else namesFrom keywords s line (i + 1) acc
+
+-- (every `stride`th of them, from the first)
+everyOf : Int -> Int -> List Int -> List Int
+everyOf stride k Nil = Nil
+everyOf stride k (Cons x xs) =
+  if k - k / stride * stride == 0 then Cons x (everyOf stride (k + 1) xs)
+  else everyOf stride (k + 1) xs
+
+-- | where type-at is asked of a file: the starts of some of its names
+-- | (every one of a stride, eight at most; not in a comment, a string or
+-- | an import), the file's start, and an offset that is no number.
+-- | (A string's words are no names, nor a rune literal's: blanked, their
+-- | lengths kept, as an offset is of bytes.)
+offsetsIn : List String -> String -> List String
+offsetsIn keywords src =
+  List.append
+    (List.map
+       (\o -> show (o + 1))
+       (List.take
+          8
+          (everyOf
+             (if List.length starts / 8 < 1 then 1
+              else List.length starts / 8)
+             0
+             starts)))
+    ["0", "nope"]
+  where
+  starts : List Int
+  starts =
+    namesFrom
+      keywords
+      (blankedFrom runeAt (blankedFrom stringAt src 0 0 Nil) 0 0 Nil)
+      0
+      0
+      Nil
+
+-- (the first, third, ... of them)
+everyOther : List String -> List String
+everyOther (Cons w (Cons _ ws)) = Cons w (everyOther ws)
+everyOther ws = ws
+
+-- (the quoted words of the lines from these on, as long as they are a
+-- list's, indented)
+quotedIn : List String -> List String
+quotedIn Nil = Nil
+quotedIn (Cons l rest) =
+  if startsWith "  " l
+  then List.append
+      (List.filter
+         (\w -> not (strEq w ""))
+         (everyOther (List.drop 1 (split "\"" l))))
+      (quotedIn rest)
+  else Nil
+
+-- (the lexer's text cut at its list of keywords: the words of the list)
+keywordsAfter : List String -> List String
+keywordsAfter (Cons before (Cons rest _)) = quotedIn (lines rest)
+keywordsAfter _ = Nil
+
+-- | the lexer's keywords, `Int` and `Type` among them, read from its
+-- | list: no names
+keywordsOf : String -> List String
+keywordsOf lexer = keywordsAfter (split "\nkeywords =\n" lexer)
+
+-- (the lines of what type-at said: each offset's answer under it, then
+-- the rest)
+answered : List String -> List String -> String
+answered offsets ls =
+  joinWith
+    ""
+    (List.zipWith
+       (\o l -> "@" ^ o ^ "\n" ^ l ^ "\n")
+       offsets
+       (List.append ls (List.replicate (List.length offsets) "")))
+  ^ joinWith "\n" (List.drop (List.length offsets) ls)
+
+-- | what type-at says at the offsets of the file, in one run, a line
+-- | each, its answers each under its offset
+typeAtSaid : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> Co e String
+typeAtSaid path = do
+  root <- given "HEFF_TEST_ROOT"
+  lexer <- readFile (root ^ "/src/heff/syntax/fmt/lex.hf")
+  src <- readFile (root ^ "/" ^ path)
+  offsets <-
+    pure (offsetsIn (keywordsOf (fromMaybe "" lexer)) (fromMaybe "" src))
+  r <- heffSaid (Cons "type-at" (Cons path offsets))
+  pure
+      (said
+         { ended = r.ended
+         , out = answered offsets (split "\n" r.out)
+         , err = r.err
+         })
+
+-- The tests
+--------------------------------------------------------------------------------
+
+-- | the directories whose files are held, and what is asked of each
+-- | file: one walked `deep` has each directory under it held too
+type Root = { dir : String, kinds : List Kind, deep : Bool }
+
+roots : List Root
+roots =
+  [ { dir = "lib", kinds = [Check, Explain, Eval, TypeAt], deep = True }
+  , { dir = "test/nbe", kinds = [Check, Explain, Eval, TypeAt], deep = False }
+  , { dir = "test/surface", kinds = [Check, Explain, TypeAt], deep = False }
+  , { dir = "test/errors", kinds = [Check, Explain, Compile], deep = False }
+  , { dir = "test/modules", kinds = [Check], deep = False }
+  , { dir = "test/modules/src", kinds = [Check], deep = False }
+  ]
+
+-- | a directory held: its path, what is asked of its files, and its
+-- | `.hf` files, sorted
+type Held = { dir : String, kinds : List Kind, files : List String }
+
+-- | the backend a file's first comment names (`--backend=B`), to compile
+-- | it for: the lines up to the first that is no comment
+backendOf : String -> Maybe String
+backendOf src = named (List.take 1 ls ++ commented (List.drop 1 ls))
+  where
+  ls : List String
+  ls = split "\n" src
+  commented : List String -> List String
+  commented (Cons l rest) =
+    if startsWith "--" l then Cons l (commented rest) else Nil
+  commented Nil = Nil
+  word : String -> String
+  word w = strSlice w 0 (nameEnd w 0)
+  named : List String -> Maybe String
+  named (Cons l rest) =
+    if startsWith "--" l
+       && List.length (split "--backend=" (strSlice l 2 (strLength l))) > 1
+       && not
+         (strEq (word (fromMaybe "" (List.last (split "--backend=" l)))) "")
+    then Just (word (fromMaybe "" (List.last (split "--backend=" l))))
+    else named rest
+  named Nil = Nothing
+
+-- | what heff says of the file, asked this (`Compile`: for this backend)
+saidOf : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> String
+       -> Kind
+       -> Co e String
+saidOf path backend Check = do
+  r <- heffSaid ["check", path]
+  pure (said r)
+saidOf path backend Explain = do
+  r <- heffSaid ["explain", path]
+  pure (said r)
+saidOf path backend Eval = do
+  r <- heffSaid ["dump-eval", path]
+  pure (said r)
+saidOf path backend TypeAt = typeAtSaid path
+saidOf path backend Compile = do
+  here <- workingDir
+  r <- heffSaid ["compile", path, here ^ "/out", "--backend=" ^ backend]
+  pure (said r)
+
+-- (is it asked of a file that names this backend, if one)
+askedOf : Maybe String -> Kind -> Bool
+askedOf Nothing Compile = False
+askedOf backend _ = True
+
+-- (a subtest of the file each kind, its golden text)
+eachKind : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> String
+         -> List Kind
+         -> Co e Unit
+eachKind path backend Nil = pure MkUnit
+eachKind path backend (Cons k rest) = do
+  subtest (kindName k) (do
+    text <- saidOf path backend k
+    golden (kindName k ^ "/" ^ path ^ ".txt") text)
+  eachKind path backend rest
+
+-- | what is asked of a file: each kind a subtest, `compile` only if its
+-- | first comment names a backend
+fileTests : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> List Kind
+          -> Co e Unit
+fileTests path kinds = do
+  root <- given "HEFF_TEST_ROOT"
+  src <- readFile (root ^ "/" ^ path)
+  backend <- pure (backendOf (fromMaybe "" src))
+  eachKind
+      path
+      (fromMaybe "" backend)
+      (List.filter (askedOf backend) kinds)
+
+-- (each file of the directory, a subtest)
+eachFile : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> Held
+         -> List String
+         -> Co e Unit
+eachFile d Nil = pure MkUnit
+eachFile d (Cons f rest) = do
+  subtest f (fileTests (d.dir ^ "/" ^ f) d.kinds)
+  eachFile d rest
+
+-- | a directory's name as a subtest's, one level: its `/`s dots
+-- | >>> dotted "lib/std/http"
+-- | "lib.std.http"
+dotted : String -> String
+dotted dir = joinWith "." (split "/" dir)
+
+-- (each directory held that has files, a subtest)
+eachDirectory : {e : HFunctor}
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> List Held
+              -> Co e Unit
+eachDirectory Nil = pure MkUnit
+eachDirectory (Cons d rest) = do
+  if List.null d.files then pure MkUnit
+    else subtest (dotted d.dir) (eachFile d d.files)
+  eachDirectory rest
+
+-- (the names of a directory, sorted, those starting with `.` passed over:
+-- so that each run names its subtests alike)
+listed : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> Co e (List String)
+listed path = do
+  names <- readDirectory path
+  pure
+      (List.sort
+         (List.filter (\n -> not (startsWith "." n)) (fromMaybe Nil names)))
+
+-- (the directories among these names of `dir`, each a path)
+directoriesAmong : {e : HFunctor}
+                 -> {{disk : filesystem <: e}}
+                 -> String
+                 -> String
+                 -> List String
+                 -> Co e (List String)
+directoriesAmong root dir Nil = pure Nil
+directoriesAmong root dir (Cons n rest) = do
+  isDir <- isDirectory (root ^ "/" ^ dir ^ "/" ^ n)
+  others <- directoriesAmong root dir rest
+  pure (if isDir then Cons (dir ^ "/" ^ n) others else others)
+
+-- | the directories of a root held: it, and if it is walked deep, each
+-- | under it, after the one it is in, in the order of their names
+heldUnder : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> Root
+          -> List String
+          -> Co e (List Held)
+heldUnder root r Nil = pure Nil
+heldUnder root r (Cons dir rest) = do
+  names <- listed (root ^ "/" ^ dir)
+  below <- if r.deep then directoriesAmong root dir names else pure Nil
+  more <- heldUnder root r (List.append below rest)
+  pure
+      (Cons
+         { dir = dir
+         , kinds = r.kinds
+         , files = List.filter (\n -> endsWith ".hf" n) names
+         }
+         more)
+
+-- (the directories of each root held, in the roots' order)
+heldOf : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> List Root
+       -> Co e (List Held)
+heldOf root Nil = pure Nil
+heldOf root (Cons r rest) = do
+  these <- heldUnder root r [r.dir]
+  others <- heldOf root rest
+  pure (List.append these others)
+
+-- | what heff says of each file of the roots' directories: a subtest a
+-- | directory, a file and what is asked of it, as they are when it runs
+golden : Test
+golden =
+  integration "golden" (do
+  root <- given "HEFF_TEST_ROOT"
+  held <- heldOf root roots
+  eachDirectory held)

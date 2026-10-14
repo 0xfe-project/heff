@@ -21,7 +21,7 @@ GROUPS ?=##      test: the groups of test/run.mjs (all when empty)
 JOBS ?=##        test-asan: how many at once (HEFF_ASAN_JOBS)
 TIMEOUT ?=##     test-asan: seconds each check is given (HEFF_ASAN_TIMEOUT)
 GEN ?= 60 1##    sanitize, tsan: test/backends.mjs N SEED, programs generated and their random seed
-KINDS ?=##       golden: the kinds updated (check explain eval type-at; all when empty)
+RUN ?=##         golden: the goldens updated, heff test's --run (all when empty)
 TARGETS ?=##     native: zig targets, e.g. "x86_64-linux-musl aarch64-macos"
 BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 
@@ -81,8 +81,8 @@ test-asan: ## heff under AddressSanitizer, by clang (JOBS=..., TIMEOUT=...)
 
 check: build-seed test fmt-check ## all a change is held to: from the seed, every test, the layout
 
-golden: ## write test/golden/ anew, after an intended change (KINDS=...)
-	$(NODE) test/golden.mjs --update $(KINDS)
+golden: ## write the golden texts anew, after an intended change (RUN=...)
+	$(HEFF) test --update $(if $(RUN),--run '$(RUN)' )test/golden.hf
 
 sanitize: ## the backends' C programs under AddressSanitizer and UBSan (GEN=...)
 	HEFF_SANITIZE=1 $(NODE) test/backends.mjs $(GEN)

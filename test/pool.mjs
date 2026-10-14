@@ -1,4 +1,4 @@
-// Child processes, as many at once as there are cores: the goldens' heff
+// Child processes, as many at once as there are cores: heff
 // runs, the backends' programs, the parts of heff built under ASan.  The
 // cache (.heff/vN/*.hc) is shared among heff runs --
 // concurrent writers of one module write the same bytes, and a torn
