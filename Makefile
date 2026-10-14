@@ -20,7 +20,7 @@ VSIX = $(VSCODE)/heff-$(shell $(NODE) -p "require('./$(VSCODE)/package.json').ve
 GROUPS ?=##      test: the groups of test/run.mjs (all when empty)
 JOBS ?=##        test-asan: how many at once (HEFF_ASAN_JOBS)
 TIMEOUT ?=##     test-asan: seconds each check is given (HEFF_ASAN_TIMEOUT)
-GEN ?= 60 1##    sanitize, tsan: test/backends.mjs N SEED, programs generated and their random seed
+GEN ?= 60 1##    sanitize, tsan: HEFF_GEN of test/backends.hf, N SEED: programs generated and their random seed
 RUN ?=##         golden: the goldens updated, heff test's --run (all when empty)
 TARGETS ?=##     native: zig targets, e.g. "x86_64-linux-musl aarch64-macos"
 BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
@@ -85,10 +85,10 @@ golden: ## write the golden texts anew, after an intended change (RUN=...)
 	$(HEFF) test --update $(if $(RUN),--run '$(RUN)' )test/golden.hf
 
 sanitize: ## the backends' C programs under AddressSanitizer and UBSan (GEN=...)
-	HEFF_SANITIZE=1 $(NODE) test/backends.mjs $(GEN)
+	HEFF_SANITIZE=1 HEFF_GEN="$(GEN)" $(HEFF) test test/backends.hf
 
 tsan: ## the backends, the threads test under ThreadSanitizer too (GEN=...)
-	HEFF_TSAN=1 $(NODE) test/backends.mjs $(GEN)
+	HEFF_TSAN=1 HEFF_GEN="$(GEN)" $(HEFF) test test/backends.hf
 
 bench: ## the benchmarks, timed (BENCH=...)
 	$(NODE) bench/run.mjs $(BENCH)

@@ -259,7 +259,7 @@ ms in a program not built for threads).
 
 ## Testing
 
-`test/backends.mjs` runs `test/node/threads.hf` (its `main`, `generic`,
+`heff test test/backends.hf` runs `test/node/threads.hf` (its `main`, `generic`,
 `failing`, `failingTask` and `cpu`); with `HEFF_SANITIZE=1` under
 AddressSanitizer (`make sanitize`), and with `HEFF_TSAN=1` again under
 ThreadSanitizer (`make tsan`), built by the system's clang.

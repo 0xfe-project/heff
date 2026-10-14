@@ -118,7 +118,10 @@ and the targets run one after another even with it.  With no group
 given, `make test` checks the fixpoint after them, as `make
 test-fixpoint` does, which needs no Node.js.
 
-`make sanitize` (`HEFF_SANITIZE=1 node test/backends.mjs`) builds the
+The backends' tests are `heff test test/backends.hf`, a subtest a
+program and a backend (`--run backends/programs/dollar.hf/c`,
+`--run backends/c/threads`); `HEFF_GEN="N SEED"` generates other
+programs.  `make sanitize` (`HEFF_SANITIZE=1 heff test test/backends.hf`) builds the
 backends' C programs under AddressSanitizer, and `make tsan`
 (`HEFF_TSAN=1`) runs the threads test under ThreadSanitizer too
 ([threads.md](threads.md)).  Among the tests, the golden ones hold the
