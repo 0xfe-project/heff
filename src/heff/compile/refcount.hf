@@ -27,7 +27,8 @@
 --   and a closure of known size.
 --
 -- And besides: a function's parameter lent, not given (heff.compile.borrow,
--- `lent`); a tag built in the cell of the one a match took apart, where
+-- `lent`), and an `Int` read of an array lent, lent too ("Elements
+-- lent"); a tag built in the cell of the one a match took apart, where
 -- that was its last reference (`RTagIn`); a record built of the same shape
 -- as one it reads fields of, in that one's cell (`RRecIn`); a field taken
 -- out of its record (`RTakeField`); and how each call last is made -- the
@@ -2415,6 +2416,153 @@ bindThen r ce x fa binding known takes rest after =
     after
     (unionS (fvRest rest after) ce.after)
 
+-- Elements lent: `let x = arrayIndex a i`, `a` lent to this code, is
+-- held by what lent it through all of the code, and so is each of its
+-- elements -- `x` is lent too, as the fields a match on what is lent
+-- binds are: read not counted (`peekPrim`), a reference taken only where
+-- it is given, never dropped.  Only of an `Int` (an operand of one of
+-- `intPrims`, somewhere): an array keeps another number flat, its
+-- element made anew where it is read.
+
+-- | the primitives each of whose operands is an `Int`
+intPrims : List String
+intPrims =
+  [ "intAdd"
+  , "intSub"
+  , "intMul"
+  , "intDiv"
+  , "intMod"
+  , "intEq"
+  , "intLt"
+  , "intLe"
+  , "intAnd"
+  , "intOr"
+  , "intXor"
+  , "intShl"
+  , "intShr"
+  , "intShow"
+  , "intHash"
+  ]
+
+-- | an array's element read, not counted
+peekPrim : String
+peekPrim = "arrayPeek"
+
+-- (whether `x` is one of the operands of `p`, one of `intPrims`)
+intOperand : String -> String -> List Imperative.Val -> Bool
+intOperand x p as = elemS p intPrims && List.any (varIs x) as
+
+-- (whether `x`, in the worklist, is somewhere an operand of one of
+-- `intPrims`)
+intW : String -> List Item -> Bool
+intW x Nil = False
+intW x (Cons (IVal (SPrim p as)) rest) =
+  intOperand x p as || intW x (pushVals as rest)
+intW x (Cons (IVal (STag _ as _)) rest) = intW x (pushVals as rest)
+intW x (Cons (IVal (SRec fs _)) rest) = intW x (pushVals (List.map snd fs) rest)
+intW x (Cons (IVal (SProj e _ _ _)) rest) = intW x (Cons (IVal e) rest)
+intW x (Cons (IVal (SLam _ (MkBlock t))) rest) = intW x (Cons (ITl t) rest)
+intW x (Cons (IVal _) rest) = intW x rest
+intW x (Cons (IOp (OSimple v)) rest) = intW x (Cons (IVal v) rest)
+intW x (Cons (IOp (OCall _ as)) rest) = intW x (pushVals as rest)
+intW x (Cons (IOp (OApply f as)) rest) = intW x (pushVals (Cons f as) rest)
+intW x (Cons (IOp (OPrim p as)) rest) =
+  intOperand x p as || intW x (pushVals as rest)
+intW x (Cons (IOp (OBool c)) rest) = intW x (Cons (ICond c) rest)
+intW x (Cons (IOp _) rest) = intW x rest
+intW x (Cons (ICond (PRel p a b)) rest) =
+  intOperand x p [a, b] || intW x (Cons (IVal a) (Cons (IVal b) rest))
+intW x (Cons (ICond (PBool v)) rest) = intW x (Cons (IVal v) rest)
+intW x (Cons (ICond (PNot c)) rest) = intW x (Cons (ICond c) rest)
+intW x (Cons (ICond (PIf a b c)) rest) =
+  intW x (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
+intW x (Cons (ICond (PLet _ o c)) rest) =
+  intW x (Cons (IOp o) (Cons (ICond c) rest))
+intW x (Cons (ICond _) rest) = intW x rest
+intW x (Cons (ISts Nil) rest) = intW x rest
+intW x (Cons (ISts (Cons (SLet _ o) ss)) rest) =
+  intW x (Cons (IOp o) (Cons (ISts ss) rest))
+intW x (Cons (ISts (Cons (SDecl _) ss)) rest) = intW x (Cons (ISts ss) rest)
+intW x (Cons (ISts (Cons (SSet _ o) ss)) rest) =
+  intW x (Cons (IOp o) (Cons (ISts ss) rest))
+intW x (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
+  intW
+    x
+    (Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest))))
+intW x (Cons (ISts (Cons (SCase v arms) ss)) rest) =
+  intW x (Cons (IVal v) (pushStArms arms (Cons (ISts ss) rest)))
+intW x (Cons (ITl (TSeq ss t)) rest) =
+  intW x (Cons (ISts ss) (Cons (ITl t) rest))
+intW x (Cons (ITl (TReturn o)) rest) = intW x (Cons (IOp o) rest)
+intW x (Cons (ITl (TLoop vs)) rest) = intW x (pushVals vs rest)
+intW x (Cons (ITl (TIf c t e)) rest) =
+  intW x (Cons (ICond c) (Cons (ITl t) (Cons (ITl e) rest)))
+intW x (Cons (ITl (TCase v arms)) rest) =
+  intW x (Cons (IVal v) (pushTlArms arms rest))
+
+-- (an element read of an array lent, `x` an `Int` kept as a `V`: the
+-- array and the index)
+peekArgs : CE
+         -> String
+         -> List Imperative.Val
+         -> List Item
+         -> Maybe (Pair String Imperative.Val)
+peekArgs ce x (Cons (SVar a) (Cons i Nil)) rest =
+  if elemS a ce.borrowed
+     && Repr.isBoxed (Repr.reprOf ce.reprs x)
+     && intW x rest
+  then Just (MkPair a i)
+  else Nothing
+peekArgs ce x as rest = Nothing
+
+-- | the array, lent, and the index of the element `let x = o` reads, if
+-- | `x` is lent too (`rest` what follows the binding)
+peekOf : CE
+       -> String
+       -> Imperative.Comp
+       -> List Item
+       -> Maybe (Pair String Imperative.Val)
+peekOf ce x (OPrim p as) rest =
+  if strEq p "arrayIndex" then peekArgs ce x as rest else Nothing
+peekOf ce x (OSimple (SPrim p as)) rest =
+  if strEq p "arrayIndex" then peekArgs ce x as rest else Nothing
+peekOf ce x o rest = Nothing
+
+-- (`let x = arrayIndex a i`, `x` lent: what is held and wanted neither by
+-- the index nor after it dropped first; then the element read, not
+-- counted, and `x` lent to what follows -- `wb` what that and what comes
+-- after want)
+bindPeek : RcK
+         -> CE
+         -> String
+         -> String
+         -> Imperative.Val
+         -> List Imperative.St
+         -> Maybe Imperative.Tl
+         -> List String
+         -> List Statement
+bindPeek r ce x a i rest after wb =
+  List.append
+    (dropsIn ce (deadIn ce.owned (unionS (fvVal i) wb)))
+    (Cons
+       (CLet
+          x
+          (RPrim
+             peekPrim
+             [ RLocal a
+             , r.val
+               (withPath (deadKept ce.owned (unionS (fvVal i) wb)) wb ce)
+               wb
+               i
+             ]))
+       (r.stmts
+          (withPath
+             (deadKept ce.owned wb)
+             ce.after
+             (withBorrowed (Cons x ce.borrowed) ce))
+          rest
+          after))
+
 -- (a statement that sets `x`: a match, a condition)
 setting : RcK -> CE -> Imperative.St -> List Statement
 setting r ce (SCase v arms) = Cons (matchOf r ce False v (stArmsOf arms)) Nil
@@ -2422,14 +2570,19 @@ setting r ce (SIf (PRel p a b) ts fs) = condOf r ce p [a, b] (ASts ts) (ASts fs)
 setting r ce (SIf c ts fs) = condTest r ce c (ASts ts) (ASts fs)
 setting r ce st = Cons CAbandon Nil
 
-stmtsF : RcK
-       -> CE
-       -> List Imperative.St
-       -> Maybe Imperative.Tl
-       -> List Statement
-stmtsF r ce Nil (Just t) = r.tail ce t
-stmtsF r ce Nil Nothing = Nil
-stmtsF r ce (Cons (SLet x o) rest) after =
+-- (`let x = o` and what follows: `x` lent, where it is an element of an
+-- array lent (see "Elements lent"); else held)
+letOf : RcK
+      -> CE
+      -> String
+      -> Imperative.Comp
+      -> List Imperative.St
+      -> Maybe Imperative.Tl
+      -> Maybe (Pair String Imperative.Val)
+      -> List Statement
+letOf r ce x o rest after (Just (MkPair a i)) =
+  bindPeek r ce x a i rest after (unionS (fvRest rest after) ce.after)
+letOf r ce x o rest after Nothing =
   bindThen
     r
     ce
@@ -2443,6 +2596,16 @@ stmtsF r ce (Cons (SLet x o) rest) after =
     (takesFor ce o (restItems rest after))
     rest
     after
+
+stmtsF : RcK
+       -> CE
+       -> List Imperative.St
+       -> Maybe Imperative.Tl
+       -> List Statement
+stmtsF r ce Nil (Just t) = r.tail ce t
+stmtsF r ce Nil Nothing = Nil
+stmtsF r ce (Cons (SLet x o) rest) after =
+  letOf r ce x o rest after (peekOf ce x o (restItems rest after))
 stmtsF r ce (Cons (SDecl x) (Cons st rest)) after =
   bindThen
     r

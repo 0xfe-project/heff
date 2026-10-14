@@ -1930,7 +1930,9 @@ HEFF_FAST V heff_intMod(V a, V b) {
 }
 
 // A comparison, as C's condition (`heff_intLt_c`, what the emitter
-// tests where its Bool is only looked at) and as its Bool.  Words are
+// tests where its Bool is only looked at) and as its Bool, each also
+// given a mask of the operands given it, the others lent (`_lent`, as a
+// string's comparison is).  Words are
 // in the order of their integers, and equal as they are; a word and a
 // big one are never equal.
 #define INT_CMP(name, op, cmp)                                          \
@@ -1939,7 +1941,15 @@ HEFF_FAST V heff_intMod(V a, V b) {
     if (BOTH_INT(a, b)) return (int64_t)a op (int64_t)b;                \
     return name##_c_big(a, b);                                          \
   }                                                                     \
-  HEFF_FAST V name(V a, V b) { return heff_bool(name##_c(a, b)); }
+  HEFF_FAST V name(V a, V b) { return heff_bool(name##_c(a, b)); }     \
+  HEFF_FAST int name##_c_lent(V a, V b, int give) {                     \
+    if (BOTH_INT(a, b)) return (int64_t)a op (int64_t)b;                \
+    return name##_c_big(give & 1 ? a : heff_dup(a),                     \
+                        give & 2 ? b : heff_dup(b));                    \
+  }                                                                     \
+  HEFF_FAST V name##_lent(V a, V b, int give) {                         \
+    return heff_bool(name##_c_lent(a, b, give));                        \
+  }
 INT_CMP(heff_intEq, ==, == 0)
 INT_CMP(heff_intLt, <, < 0)
 INT_CMP(heff_intLe, <=, <= 0)
@@ -3183,6 +3193,14 @@ HEFF_FAST V heff_arrayIndex_lent(V a, V i, int give) {
   return x;
 }
 HEFF_FN V heff_arrayIndex(V a, V i) { return heff_arrayIndex_lent(a, i, 3); }
+
+// (... not counted, of an array of `V`s -- an `Int`'s never flat: the
+// element lent where the array is, which holds it)
+HEFF_FAST V heff_arrayPeek(V a, V i) {
+  Arr *r = (Arr *)a;
+  if (!heff_arr_in(r, i)) heff_arr_out();
+  return r->a[INT_OF(i)];
+}
 
 // (... read as a number, where the program knows it is one: the
 // element as the array keeps it, flat or a `V` -- an array of `Float64`s
