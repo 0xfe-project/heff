@@ -1,0 +1,274 @@
+-- The formatter, as `heff fmt` runs it.  Each `.hf` file of the
+-- repository is formatted (the formatter checks itself that the result
+-- means the same and keeps the comments) and formatting it again changes
+-- nothing; a file that expects errors may instead be refused for not
+-- parsing or lexing.  Then the cases of `format/`, each a text (`NAME.in`)
+-- of comments, blank lines, blocks, watches, doc tests, definitions kept
+-- as written (`-- fmt: skip`) and line breaks as written: formatted, it
+-- is its golden text (`NAME.out`, or what heff said refusing it), and
+-- formatted again it is the same.  The heff run is the one that runs the
+-- tests (`HEFF`), on the project's files (`HEFF_TEST_ROOT`), both set by
+-- `heff test`.
+--
+-- The files are those of the repository's directories when the test
+-- runs, each listing sorted, those hidden and the few passed over below
+-- left out; the cases those of `format/`.  A file's subtest is named by
+-- its directory (`.` the root's), its `/`s dots, then the file; a case's
+-- by its name:
+--
+--   heff test --run format/repository/lib.std test/format.hf
+--   heff test --run format/cases/spacing test/format.hf
+--   heff test --update --run format/cases test/format.hf
+
+import check
+import co
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (the first line where two texts differ, both shown)
+differ : Int -> List String -> List String -> String
+differ n (Cons a xs) (Cons b ys) =
+  if strEq a b then differ (n + 1) xs ys
+  else "line " ^ show n ^ ": " ^ show a ^ ", then " ^ show b
+differ n (Cons a _) Nil = "line " ^ show n ^ ": " ^ show a ^ ", then nothing"
+differ n Nil (Cons b _) = "line " ^ show n ^ ": nothing, then " ^ show b
+differ n Nil Nil = "the same"
+
+-- (`heff fmt` on `file.hf` of the test's directory, this text written
+-- there first: what it said, and what the file is after it)
+formatted : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> Co e (Pair Ran String)
+formatted text = do
+  heff <- given "HEFF"
+  ok <- writeFile "file.hf" text
+  assert "could write file.hf" ok
+  r <- run { command = heff, args = ["fmt", "file.hf"] }
+  out <- readFile "file.hf"
+  pure (MkPair r (fromMaybe "" out))
+
+-- (what was formatted, formatted again, is the same)
+again : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> String
+      -> Co e Unit
+again once = do
+  second <- formatted once
+  if not (succeeded (fst second))
+    then failure
+        ("formatted again, refused:\n" ^ said (fst second))
+    else if strEq once (snd second) then pure MkUnit
+    else failure
+        ("formatted again, it changed: "
+         ^ differ 1 (lines once) (lines (snd second)))
+
+-- The repository's files
+--------------------------------------------------------------------------------
+
+-- | names of the root's directories not walked, besides those hidden:
+-- | what is installed or built there
+passedOver : List String
+passedOver = ["node_modules", "zig-out"]
+
+-- | a directory walked: its path (`.` the root) and its `.hf` files,
+-- | sorted
+type Held = { dir : String, files : List String }
+
+-- (a name under a directory, as a path from the root)
+under : String -> String -> String
+under "." n = n
+under dir n = dir ^ "/" ^ n
+
+-- (the names of a directory, sorted, those starting with `.` and those
+-- passed over left out: so that each run names its subtests alike)
+listed : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> Co e (List String)
+listed path = do
+  names <- readDirectory path
+  pure
+      (List.sort
+         (List.filter
+            (\n ->
+               not (startsWith "." n)
+               && not (List.any (\m -> strEq m n) passedOver))
+            (fromMaybe Nil names)))
+
+-- (the directories among these names of `dir`, each a path)
+directoriesAmong : {e : HFunctor}
+                 -> {{disk : filesystem <: e}}
+                 -> String
+                 -> String
+                 -> List String
+                 -> Co e (List String)
+directoriesAmong root dir Nil = pure Nil
+directoriesAmong root dir (Cons n rest) = do
+  isDir <- isDirectory (root ^ "/" ^ under dir n)
+  others <- directoriesAmong root dir rest
+  pure (if isDir then Cons (under dir n) others else others)
+
+-- | the directories walked from these: each, then those under it, in
+-- | the order of their names
+heldUnder : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> List String
+          -> Co e (List Held)
+heldUnder root Nil = pure Nil
+heldUnder root (Cons dir rest) = do
+  names <- listed (root ^ "/" ^ dir)
+  below <- directoriesAmong root dir names
+  more <- heldUnder root (List.append below rest)
+  pure
+      (Cons
+         { dir = dir, files = List.filter (\n -> endsWith ".hf" n) names }
+         more)
+
+-- | a directory's name as a subtest's, one level: its `/`s dots
+-- | >>> dotted "lib/std/http"
+-- | "lib.std.http"
+dotted : String -> String
+dotted dir = joinWith "." (split "/" dir)
+
+-- (a refusal for not parsing or lexing)
+unparsed : Ran -> Bool
+unparsed r = contains "does not parse" r.err || contains "does not lex" r.err
+
+-- (the file formatted and formatted again, or, if it expects errors,
+-- refused for not parsing)
+formatsAgain : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> String
+             -> Co e Unit
+formatsAgain path = do
+  root <- given "HEFF_TEST_ROOT"
+  src <- readFile (root ^ "/" ^ path)
+  first <- formatted (fromMaybe "" src)
+  if succeeded (fst first) then again (snd first)
+    else if startsWith "-- test: expect errors\n" (fromMaybe "" src)
+            && unparsed (fst first)
+    then pure MkUnit
+    else failure (said (fst first))
+
+-- (each file of the directory, a subtest)
+eachFile : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> List String
+         -> Co e Unit
+eachFile dir Nil = pure MkUnit
+eachFile dir (Cons f rest) = do
+  subtest f (formatsAgain (under dir f))
+  eachFile dir rest
+
+-- (each directory that has files, a subtest)
+eachDirectory : {e : HFunctor}
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> List Held
+              -> Co e Unit
+eachDirectory Nil = pure MkUnit
+eachDirectory (Cons d rest) = do
+  if List.null d.files then pure MkUnit
+    else subtest (dotted d.dir) (eachFile d.dir d.files)
+  eachDirectory rest
+
+-- | each `.hf` file of the repository formatted, and formatted again the
+-- | same: a subtest a directory and a file, as they are when it runs
+repository : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Co e Unit
+repository = do
+  root <- given "HEFF_TEST_ROOT"
+  held <- heldUnder root ["."]
+  eachDirectory held
+
+-- The cases
+--------------------------------------------------------------------------------
+
+-- (a case formatted: its golden text what it made, formatted again the
+-- same; or, refused, what heff said)
+formatsCase : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> String
+            -> Co e Unit
+formatsCase name = do
+  root <- given "HEFF_TEST_ROOT"
+  src <- readFile (root ^ "/test/format/" ^ name ^ ".in")
+  first <- formatted (fromMaybe "" src)
+  if succeeded (fst first)
+    then do
+      again (snd first)
+      golden (name ^ ".out") (snd first)
+    else golden (name ^ ".out") (fst first).err
+
+-- (each case, a subtest)
+eachCase : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List String
+         -> Co e Unit
+eachCase Nil = pure MkUnit
+eachCase (Cons n rest) = do
+  subtest n (formatsCase n)
+  eachCase rest
+
+-- | each case of `format/` formatted as its golden text says, and
+-- | formatted again the same: a subtest each, as they are when it runs
+cases : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Co e Unit
+cases = do
+  root <- given "HEFF_TEST_ROOT"
+  names <- listed (root ^ "/test/format")
+  eachCase
+      (List.map
+         (\n -> strSlice n 0 (strLength n - 3))
+         (List.filter (\n -> endsWith ".in" n) names))
+
+-- | the formatter, on the repository's files and on its cases
+format : Test
+format =
+  group
+    "format"
+    [integration "repository" repository, integration "cases" cases]

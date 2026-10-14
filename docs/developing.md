@@ -130,6 +130,11 @@ surface tests run `heff test` on each `.hf` file of the library, the
 compiler, the examples and the tests' directories, a subtest each,
 and hold what heff says of a few libraries of their own (`heff test
 test/surface.hf`, `--run surface/lib.std` for the files of `lib/std`).
+The format tests format each `.hf` file of the repository, and the
+cases of `test/format/`, each held to its golden text (`heff test
+test/format.hf`, `--run format/cases/spacing` for one;
+`heff test --update --run format/cases test/format.hf` after an
+intended change).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.
