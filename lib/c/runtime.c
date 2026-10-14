@@ -94,7 +94,7 @@ extern char **environ;
 // `#define HEFF_THREADS 1`, a line of its own, which the emitter puts
 // before the runtime too (`-DHEFF_THREADS` does the same).  Then each
 // thread has the runtime's per-run state for itself (`HEFF_TLS`: its
-// free lists, its stack of what is given back, its count of calls and
+// pages, its stack of what is given back, its count of calls and
 // its room, where a failure of it is caught).  An object is one thread's,
 // counted by it alone, not atomically; or shared (`SHARED`, #66),
 // counted atomically by every thread that holds it; or immortal,
@@ -342,10 +342,8 @@ HEFF_FN void *heff_alloc(size_t n) {
 #define SMALL_MAX 128
 #endif
 
-#if defined(HEFF_THREADS) || SMALL_MAX == 0
-// (with threads, an object one thread made may be given back by another
-// (a shared one, `heff_share`): each its own, from the system, kept on a list
-// of its size of the thread that gives it back)
+#if SMALL_MAX == 0
+// (none kept: each object the system's, given back to it)
 HEFF_VAR(HEFF_TLS void *heff_free_list[SMALL_MAX / 8 + 1]);
 
 static inline void *heff_obj_alloc(size_t n) {
@@ -376,22 +374,59 @@ static inline void heff_obj_free(void *p, size_t n) {
 // would hand cells out in the order they came back -- after a list is
 // filtered, every third far from the one before it -- and a long list
 // read through the cache misses at each cell)
+//
+// (with threads, #66: a page is the thread's that made it, its owner --
+// its pages are its heap, `heff_heap`, each thread's own.  What the owner
+// gives back goes on the page's list, as in one thread, nothing atomic.
+// What another thread gives back -- a shared object, its last holder
+// another thread -- goes on the page's second list, `remote`, by a
+// compare-and-swap, nothing else of the page touched; the owner takes
+// that list over whole, by one exchange, where it finds no room (the
+// slow path, `heff_page_alloc`).  A thread that ends gives back its pages
+// that hold nothing, and leaves the others, abandoned, to whichever
+// thread next finds no room in a page of their size: it adopts them)
 #define HEFF_PAGE ((size_t)1 << 16)
 typedef struct HeffPage {
   void *free;               // what was given back here
   char *bump, *end;         // what was never used yet
   struct HeffPage *next;    // the next of its size with room
   uint32_t c, listed;       // its size, in words; on that list
+#ifdef HEFF_THREADS
+  struct HeffHeap *owner;   // the thread's whose page it is, else none
+  void *remote;             // what other threads gave back here
+  struct HeffPage *all;     // the owner's next page of its size
+#endif
 } HeffPage;
+#define HEFF_PAGE_OF(p) ((HeffPage *)((uintptr_t)(p) & ~(uintptr_t)(HEFF_PAGE - 1)))
+#define HEFF_PAGE_FIRST(pg) ((char *)(pg) + (sizeof(HeffPage) + 15) / 16 * 16)
+
+#ifdef HEFF_THREADS
+typedef struct HeffHeap {
+  HeffPage *at[SMALL_MAX / 8 + 1];       // the page made in last, each size
+  HeffPage *room[SMALL_MAX / 8 + 1];     // pages with room, each size
+  HeffPage *all[SMALL_MAX / 8 + 1];      // all its pages, each size
+  unsigned long news[SMALL_MAX / 8 + 1]; // `heff_remote_news`, as last looked
+} HeffHeap;
+HEFF_VAR(HEFF_TLS HeffHeap heff_heap);
+HEFF_FN void heff_page_remote(HeffPage *pg, void *p);
+#define HEFF_HEAP HeffHeap *h = &heff_heap
+#define HEFF_AT h->at
+#define HEFF_WITH_ROOM h->room
+#else
 HEFF_VAR(HeffPage *heff_page_at[SMALL_MAX / 8 + 1]);
 HEFF_VAR(HeffPage *heff_page_room[SMALL_MAX / 8 + 1]);
+#define HEFF_HEAP
+#define HEFF_AT heff_page_at
+#define HEFF_WITH_ROOM heff_page_room
+#endif
 
 HEFF_FN void *heff_page_alloc(size_t c);
 
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
   if (c > SMALL_MAX / 8) return heff_alloc(c * 8);
-  HeffPage *pg = heff_page_at[c];
+  HEFF_HEAP;
+  HeffPage *pg = HEFF_AT[c];
   if (pg) {
     void *p = pg->free;
     if (p) { pg->free = *(void **)p; return p; }
@@ -403,18 +438,43 @@ static inline void *heff_obj_alloc(size_t n) {
 static inline void heff_obj_free(void *p, size_t n) {
   size_t c = (n + 7) / 8;
   if (c > SMALL_MAX / 8) { free(p); return; }
-  HeffPage *pg = (HeffPage *)((uintptr_t)p & ~(uintptr_t)(HEFF_PAGE - 1));
+  HeffPage *pg = HEFF_PAGE_OF(p);
+  HEFF_HEAP;
+#ifdef HEFF_THREADS
+  if (__builtin_expect(__atomic_load_n(&pg->owner, __ATOMIC_RELAXED) != h, 0)) {
+    heff_page_remote(pg, p);
+    return;
+  }
+#endif
   *(void **)p = pg->free;
   pg->free = p;
-  if (!pg->listed && pg != heff_page_at[pg->c]) {
+  if (!pg->listed && pg != HEFF_AT[pg->c]) {
     pg->listed = 1;
-    pg->next = heff_page_room[pg->c];
-    heff_page_room[pg->c] = pg;
+    pg->next = HEFF_WITH_ROOM[pg->c];
+    HEFF_WITH_ROOM[pg->c] = pg;
   }
 }
-#endif
 
-#if !(defined(HEFF_THREADS) || SMALL_MAX == 0)
+// (a new page, of objects of `c` words)
+HEFF_FN HeffPage *heff_page_new(size_t c) {
+  void *m = NULL;
+#ifdef _WIN32
+  m = _aligned_malloc(HEFF_PAGE, HEFF_PAGE);
+#else
+  if (posix_memalign(&m, HEFF_PAGE, HEFF_PAGE) != 0) m = NULL;
+#endif
+  if (!m) heff_fail("out of memory");
+  HeffPage *pg = m;
+  pg->free = NULL;
+  pg->bump = HEFF_PAGE_FIRST(pg);
+  pg->end = (char *)m + HEFF_PAGE;
+  pg->next = NULL;
+  pg->c = (uint32_t)c;
+  pg->listed = 0;
+  return pg;
+}
+
+#ifndef HEFF_THREADS
 // (the page made in last full: another of the size with room, else a
 // new one)
 HEFF_FN __attribute__((noinline)) void *heff_page_alloc(size_t c) {
@@ -423,20 +483,7 @@ HEFF_FN __attribute__((noinline)) void *heff_page_alloc(size_t c) {
     heff_page_room[c] = pg->next;
     pg->listed = 0;
   } else {
-    void *m = NULL;
-#ifdef _WIN32
-    m = _aligned_malloc(HEFF_PAGE, HEFF_PAGE);
-#else
-    if (posix_memalign(&m, HEFF_PAGE, HEFF_PAGE) != 0) m = NULL;
-#endif
-    if (!m) heff_fail("out of memory");
-    pg = m;
-    pg->free = NULL;
-    pg->bump = (char *)m + (sizeof(HeffPage) + 15) / 16 * 16;
-    pg->end = (char *)m + HEFF_PAGE;
-    pg->next = NULL;
-    pg->c = (uint32_t)c;
-    pg->listed = 0;
+    pg = heff_page_new(c);
   }
   heff_page_at[c] = pg;
   void *p = pg->free;
@@ -445,6 +492,143 @@ HEFF_FN __attribute__((noinline)) void *heff_page_alloc(size_t c) {
   pg->bump += c * 8;
   return p;
 }
+#else
+// (how many times a page's `remote` has had something put on it when it
+// had nothing -- an owner that finds no room looks through its pages for
+// what other threads gave back only where this has moved since it last
+// looked; and the pages each size abandoned by threads that ended)
+#ifdef HEFF_PART
+extern unsigned long heff_remote_news;
+extern HeffPage *heff_abandoned[SMALL_MAX / 8 + 1];
+extern pthread_mutex_t heff_abandoned_mu;
+#else
+unsigned long heff_remote_news;
+HeffPage *heff_abandoned[SMALL_MAX / 8 + 1];
+pthread_mutex_t heff_abandoned_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+// (`p`, of a page another thread owns or none does, given back: on the
+// page's `remote`)
+HEFF_FN __attribute__((noinline)) void heff_page_remote(HeffPage *pg, void *p) {
+  void *old = __atomic_load_n(&pg->remote, __ATOMIC_RELAXED);
+  do *(void **)p = old;
+  while (!__atomic_compare_exchange_n(&pg->remote, &old, p, 1, __ATOMIC_RELEASE,
+                                      __ATOMIC_RELAXED));
+  if (!old) __atomic_fetch_add(&heff_remote_news, 1, __ATOMIC_RELEASE);
+}
+
+// (what other threads gave back to `pg` taken over by its owner, onto its
+// own list: whether there was any)
+HEFF_FN int heff_page_take(HeffPage *pg) {
+  if (!__atomic_load_n(&pg->remote, __ATOMIC_RELAXED)) return 0;
+  void *r = __atomic_exchange_n(&pg->remote, NULL, __ATOMIC_ACQUIRE);
+  if (!r) return 0;
+  if (pg->free) {
+    void *t = r;
+    while (*(void **)t) t = *(void **)t;
+    *(void **)t = pg->free;
+  }
+  pg->free = r;
+  return 1;
+}
+
+// (`pg`, if it has room and is not the page made in last, on the list of
+// those with room)
+HEFF_FN void heff_page_list(HeffHeap *h, HeffPage *pg) {
+  if (pg->listed || pg == h->at[pg->c]) return;
+  if (!pg->free && pg->bump + pg->c * 8 > pg->end) return;
+  pg->listed = 1;
+  pg->next = h->room[pg->c];
+  h->room[pg->c] = pg;
+}
+
+// (the page made in last full: what other threads gave back to it; else
+// another of the size with room; else, if other threads gave back to any
+// page since the thread last looked, what they gave to its own; else the
+// pages of the size abandoned, adopted; else a new one)
+HEFF_FN __attribute__((noinline)) void *heff_page_alloc(size_t c) {
+  HeffHeap *h = &heff_heap;
+  HeffPage *pg = h->at[c];
+  if (!(pg && heff_page_take(pg))) {
+    if (!h->room[c]) {
+      unsigned long news = __atomic_load_n(&heff_remote_news, __ATOMIC_ACQUIRE);
+      if (news != h->news[c]) {
+        h->news[c] = news;
+        for (HeffPage *q = h->all[c]; q; q = q->all)
+          if (heff_page_take(q)) heff_page_list(h, q);
+      }
+    }
+    if (!h->room[c] && __atomic_load_n(&heff_abandoned[c], __ATOMIC_RELAXED)) {
+      pthread_mutex_lock(&heff_abandoned_mu);
+      HeffPage *q = heff_abandoned[c];
+      __atomic_store_n(&heff_abandoned[c], NULL, __ATOMIC_RELAXED);
+      pthread_mutex_unlock(&heff_abandoned_mu);
+      while (q) {
+        HeffPage *next = q->all;
+        __atomic_store_n(&q->owner, h, __ATOMIC_RELAXED);
+        q->listed = 0;
+        q->all = h->all[c];
+        h->all[c] = q;
+        heff_page_take(q);
+        heff_page_list(h, q);
+        q = next;
+      }
+    }
+    pg = h->room[c];
+    if (pg) {
+      h->room[c] = pg->next;
+      pg->listed = 0;
+    } else {
+      pg = heff_page_new(c);
+      pg->remote = NULL;
+      __atomic_store_n(&pg->owner, h, __ATOMIC_RELAXED);
+      pg->all = h->all[c];
+      h->all[c] = pg;
+    }
+    h->at[c] = pg;
+  }
+  void *p = pg->free;
+  if (p) { pg->free = *(void **)p; return p; }
+  p = pg->bump;
+  pg->bump += c * 8;
+  return p;
+}
+
+// (as a thread ends: its pages that hold nothing given back to the
+// system, the others abandoned, for another thread to adopt)
+HEFF_FN void heff_heap_end(void) {
+  HeffHeap *h = &heff_heap;
+  for (size_t c = 1; c <= SMALL_MAX / 8; c++) {
+    HeffPage *left = NULL, *last = NULL;
+    for (HeffPage *pg = h->all[c], *next; pg; pg = next) {
+      next = pg->all;
+      heff_page_take(pg);
+      size_t made = (size_t)(pg->bump - HEFF_PAGE_FIRST(pg)) / (c * 8), back = 0;
+      for (void *p = pg->free; p; p = *(void **)p) back++;
+      if (back == made) {
+#ifdef _WIN32
+        _aligned_free(pg);
+#else
+        free(pg);
+#endif
+        continue;
+      }
+      __atomic_store_n(&pg->owner, NULL, __ATOMIC_RELAXED);
+      pg->listed = 0;
+      pg->all = left;
+      if (!left) last = pg;
+      left = pg;
+    }
+    if (left) {
+      pthread_mutex_lock(&heff_abandoned_mu);
+      last->all = heff_abandoned[c];
+      __atomic_store_n(&heff_abandoned[c], left, __ATOMIC_RELAXED);
+      pthread_mutex_unlock(&heff_abandoned_mu);
+    }
+  }
+  memset(h, 0, sizeof *h);
+}
+#endif
 #endif
 
 static inline int heff_tag_of(V v) {
@@ -3795,10 +3979,11 @@ HEFF_FN void heff_fail_again(const char *why) {
   heff_fail(why);
 }
 
-// (this thread's free lists and what else the runtime keeps for it given
-// back to the system, as it ends)
+// (this thread's pages and what else the runtime keeps for it given
+// back to the system, as it ends -- its pages that still hold something
+// abandoned, for another thread to adopt)
 HEFF_FN void heff_thread_end(void) {
-#if defined(HEFF_THREADS) || SMALL_MAX == 0
+#if SMALL_MAX == 0
   for (size_t c = 0; c <= SMALL_MAX / 8; c++) {
     void *p = heff_free_list[c];
     while (p) {
@@ -3808,6 +3993,8 @@ HEFF_FN void heff_thread_end(void) {
     }
     heff_free_list[c] = NULL;
   }
+#elif defined(HEFF_THREADS)
+  heff_heap_end();
 #endif
   free(heff_dead);
   heff_dead = NULL;

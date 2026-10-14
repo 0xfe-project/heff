@@ -105,9 +105,24 @@ hold a shared one, not the other way.
   (`heff_unique`), which a shared one's never is: a shared object is
   copied where it is updated.
 - **Per-run state is per thread** (`HEFF_TLS`, `_Thread_local` in
-  threads mode, nothing otherwise): the free lists, the stack of what is
+  threads mode, nothing otherwise): its pages, the stack of what is
   given back, the count of calls before a bounce, the room for a jump's
   arguments, and where a failure is caught (`heff_catch`).
+- **A page is the thread's that made it** (its owner): objects of up
+  to 128 bytes are made in pages of 64 KB, each of one size, as in one
+  thread, and each thread has pages of its own (`heff_heap`).  What the
+  owner gives back goes on the page's list, nothing atomic -- whatever
+  was not shared.  What another thread gives back (a shared object, its
+  last holder another thread) goes on the page's second list,
+  `remote`, by a compare-and-swap, nothing else of the page touched.
+  The owner takes that list over whole, by one exchange, where it finds
+  no room in the page it makes in (`heff_page_alloc`, the slow path),
+  before it looks to another page; and looks through its other pages
+  for what other threads gave them only when something was given so
+  since it last looked.  A thread that ends (`heff_thread_end`) gives
+  back to the system its pages that hold nothing, and leaves the others,
+  abandoned, to the next thread that finds no room in a page of their
+  size: it adopts them, their owner from then on.
 - **A definition's value is computed once**, by the first thread to ask
   for it, under a lock (`heff_global`); a thread asking meanwhile waits
   for it.  It is then made immortal (`heff_freeze`), it and all it holds,
@@ -157,8 +172,10 @@ shares, and it runs it there under a catch:
   thread ends: it may be the thread's own.
 - `heff_fail_again(why)` -- in the thread that joins, fails as the
   thread did: the program fails as it would have, one thread doing all.
-- `heff_thread_end()` -- as a thread ends: its free lists, and what
-  else the runtime kept for it, given back to the system.
+- `heff_thread_end()` -- as a thread ends: its pages that hold
+  nothing, and what else the runtime kept for it, given back to the
+  system; its pages that still hold something left for another thread
+  to adopt.
 - `heff_thread_start(&t, run, arg)` -- a pthread with a large stack
   (`HEFF_THREAD_STACK`, 256 MB reserved): heff's recursion is the C
   stack's.
@@ -190,11 +207,14 @@ Not safe, or not as one thread would do:
   is left to be computed again, and a thread waiting for it is woken.
   What was made before the failure is leaked.
 - A thread that ends without `heff_thread_end` (by `pthread_exit`, say)
-  leaks its free lists.  An object made by one thread and given back by
-  another goes to the second's free lists, so where one thread makes
-  and another drops -- a shared value, its last holder another thread
-  -- the second's lists grow.  Threads mode keeps no pages: each object
-  is the system's, on a list of its size.
+  leaks its pages: none adopts them, and what is given back to them
+  stays on their `remote`.
+- A page another thread gave back to is reused once its owner finds no
+  room elsewhere of that size: where one thread makes and others give
+  back, the maker holds what they gave back until it next makes that
+  size.  A thread that never ends (the program's own) keeps its pages,
+  and abandoned pages nothing of their size is made in again stay
+  abandoned.
 - A frozen value is never freed: a definition's, a static thunk's, and
   what of it was shared besides, though another thread held it too.
 - A shared value is counted atomically each time it is used, by every
@@ -233,15 +253,35 @@ program built for threads or not.
 
 On a 14-core Apple M-series machine, `test/node/threads.hf`'s
 `cpu WORK N W` (threads mode, `zig cc -O2`) against the same work in a
-program not built for threads (W = 8 and 14 as measured before #66,
-the rest after it, the machine busy with other builds; sharing moved
-none of them):
+program not built for threads, each the fastest of 7 runs, the machine
+busy with other builds -- with pages each thread's own (#66), and in
+parentheses before, when threads mode kept no pages:
 
 | work | one thread | W=1 | W=2 | W=4 | W=8 | W=14 |
 |---|---|---|---|---|---|---|
-| primes below 5,000,000 | 997 ms | 933 ms | 470 ms | 243 ms | 133 ms | 103 ms (9.6x) |
-| queens 12 | 204 ms | 200 ms | 105 ms | 57 ms | 41 ms | 30 ms (6.6x) |
-| fib 38 | 126 ms | 120 ms | 62 ms | 35 ms | 20 ms | 15 ms (8.5x) |
+| primes below 5,000,000 | 938 ms | 905 ms | 465 ms | 233 ms | 122 ms | 104 ms (9.0x) |
+| queens 12 | 197 ms | 206 ms (201) | 107 ms (106) | 56 ms (63) | 31 ms (35) | 24 ms (28) (8.2x) |
+| fib 38 | 109 ms | 124 ms | 65 ms | 34 ms | 19 ms | 15 ms (7.3x) |
+
+Primes and fib make almost nothing, and pages moved neither; nor the
+one-thread rows, built as before.  Queens makes a list cell at each
+step: with pages, each thread's cells near one another, it runs 10 to
+15% faster at 4 threads and more, and some 2% slower at one.
+
+Made in one thread and given back in another (`handOver R 4`: each
+round, 4 lists of 100,000 made by the tasks' threads and summed and
+given back by the caller), the peak memory of the whole program:
+
+| rounds | 10 | 100 | 400 | 2000 |
+|---|---|---|---|---|
+| threads mode keeping no pages | 97 MB | 924 MB | 3.7 GB | |
+| pages each thread's own | 37 MB | 33 MB | 41 MB | 51 MB |
+
+Keeping no pages, each object the system's, a cell given back by the
+caller went on the caller's free list and was made again by nothing
+but the caller: the lists grew by the cells of 3 lists a round.  With
+pages, the cells go back to their pages, which the next round's
+threads adopt.
 
 One large value handed to W threads, each reading it all (`parFor W W`
 of a function holding it), copied for each thread before #66 and
@@ -259,6 +299,6 @@ ms in a program not built for threads).
 ## Testing
 
 `heff test test/backends.hf` runs `test/node/threads.hf` (its `main`, `generic`,
-`failing`, `failingTask` and `cpu`); with `HEFF_SANITIZE=1` under
+`failing`, `failingTask`, `cpu` and `handOver`); with `HEFF_SANITIZE=1` under
 AddressSanitizer (`make sanitize`), and with `HEFF_TSAN=1` again under
 ThreadSanitizer (`make tsan`), built by the system's clang.
