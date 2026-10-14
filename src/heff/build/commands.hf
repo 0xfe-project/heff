@@ -2556,6 +2556,16 @@ pendingOf opts f wrong l c run =
   , checked = c
   }
 
+-- | a file checked, its tests run: passed over, nothing said of it, where
+-- | `--run` gives a pattern that selects none of its tests
+selectedOf : TestOpts -> Pending -> Tested
+selectedOf opts p =
+  if not (strEq opts.pattern "")
+     && List.null p.outcomes
+     && List.null p.integrations
+  then Settled noRes
+  else Pend p
+
 testOneC : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{rep : Report.report <: e}}
@@ -2572,16 +2582,18 @@ testOneC opts f l cs = do
       pure (Settled (uncheckedRes (firstWrong f l.errors cs)))
     Just c ->
       pure
-        (Pend
-           (if List.null l.errors && bad == 0
-            then pendingOf
+        (if List.null l.errors && bad == 0
+         then selectedOf
+             opts
+             (pendingOf
                 opts
                 f
                 Nil
                 l
                 c
-                (Driver.runTests opts.pattern opts.seed c)
-            else pendingOf
+                (Driver.runTests opts.pattern opts.seed c))
+         else Pend
+             (pendingOf
                 opts
                 f
                 [firstWrong f l.errors cs]
@@ -2617,7 +2629,8 @@ testExpecting f False = do
   print ("FAIL  " ^ f ^ "  checks, but expects errors")
   pure (uncheckedRes (f ^ ": checks, but its first line expects errors"))
 
--- (a file loaded, tested: one that expects errors held to having some)
+-- (a file loaded, tested: one that expects errors held to having some,
+-- or passed over where `--run` selects tests, as it has none)
 testLoaded : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
@@ -2628,10 +2641,12 @@ testLoaded : {e : HFunctor}
            -> Bool
            -> Load.Loaded
            -> Co e Tested
-testLoaded opts f True l = do
-  cs <- Session.cachedProgram l
-  r <- testExpecting f (not (List.null l.errors) || anyErrors cs)
-  pure (Settled r)
+testLoaded opts f True l =
+  if not (strEq opts.pattern "") then pure (Settled noRes)
+  else do
+    cs <- Session.cachedProgram l
+    r <- testExpecting f (not (List.null l.errors) || anyErrors cs)
+    pure (Settled r)
 testLoaded opts f False l = do
   badL <- printErrs "heff" l.errors 0
   cs <- Session.cachedProgram l
@@ -3283,6 +3298,10 @@ testFiles Nil = do
       pure Nil
 testFiles given = testFilesGo (List.map (\f -> MkPair True f) given) Nil
 
+-- | did `--run` give a pattern that selects no test of any file
+noneSelected : TestOpts -> TestRes -> Bool
+noneSelected opts acc = not (strEq opts.pattern "") && acc.tests == 0
+
 -- | check the watches' and doc tests' expectations of every file
 -- | given, and run its tests (each property from `seed`), each file a
 -- | task under `tk` as it is tested
@@ -3300,6 +3319,11 @@ testCmd : {e : HFunctor}
 testCmd tk opts Nil acc = do
   Progress.end tk
   printUnchecked acc.unchecked
+  if noneSelected opts acc
+    then do
+      printErr ("heff test: no tests match '" ^ opts.pattern ^ "'")
+      exit 1
+    else pure MkUnit
   print
       (show (acc.total - acc.failed)
        ^ "/"

@@ -135,6 +135,10 @@ expect("test, integration tests", outside.status === 1 &&
   outside.stdout.endsWith("1/1 files check as they should\n") && outside.stdout.includes("tests 2/4\n"), outside);
 const selected = await heff("test", "--run", "^a/y$", "outside.hf");
 expect("test --run", selected.status === 0 && selected.stdout === "  ok    a / y\nok    outside.hf  0/0, tests 1/1\n0/0 expectations hold, 1/1 tests hold, 1/1 files check as they should\n", selected);
+const others = await heff("test", "--run", "^a/y$", "outside.hf", "props.hf");
+expect("test --run, a file with none selected not listed", others.stdout === selected.stdout, others);
+const none = await heff("test", "--run", "nothing", "outside.hf", "props.hf");
+expect("test --run, no tests match", none.status === 1 && none.stdout === "" && none.stderr === "heff test: no tests match 'nothing'\n", none);
 const nested = await heff("test", "-r", "a/lsp", "-j", "1", "outside.hf");
 expect("test --run, a level each", nested.status === 1 && nested.stdout.includes("  FAIL  a / lsp / hover\n") && nested.stdout.includes("tests 0/1\n"), nested);
 const unread = await heff("test", "--run", "a(", "outside.hf");

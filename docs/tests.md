@@ -147,8 +147,9 @@ A test whose names are fewer than the levels is matched by those it
 has, and one deeper than the pattern by its groups.  `--run '^lsp/hover'`
 runs the tests of the groups named `lsp...` whose names have `hover`;
 `--run /hover` the tests named `...hover...` of any group, and every
-test of no group.  The watches and doc tests of the files are checked
-all the same.
+test of no group.  A file none of whose tests is selected is passed
+over, its watches and doc tests too, and not listed; where no test of
+any file is, `heff test` says `no tests match 'PATTERN'` and fails.
 
 The pattern is a regular expression, of a small part of RE2's syntax
 (the `regex` module): a byte for itself, `.`, a class `[a-z0-9_]` or
