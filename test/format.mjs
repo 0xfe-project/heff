@@ -239,7 +239,8 @@ formats("a case in `then`, and `else` after it", [
 ].join("\n"));
 
 // (a broken `if`: `then` under `if`, as `else` is, a block in a branch
-// two columns in from it; on one line while it fits)
+// two columns in from it, a broken condition under its first token, in
+// a definition, an `else if` or a do block; on one line while it fits)
 formats("then and else line up", [
   "data Bool = True | False",
   "data Maybe (a : Type) = Nothing | Just a",
@@ -265,6 +266,21 @@ formats("then and else line up", [
   "  Nothing -> if c then c else c",
   "k : Bool -> Bool",
   "k a = if a then False else True",
+  "p : Bool -> Bool -> Bool -> Bool",
+  "p a b c =",
+  "  if a",
+  "  && b",
+  "  then a",
+  "  else if (b",
+  "    || c) && a",
+  "  then b",
+  "  else c",
+  "q : Bool -> Bool -> Unit",
+  "q a b = do",
+  "  if a",
+  "     || b",
+  "    then pure MkUnit",
+  "    else pure MkUnit",
   "",
 ].join("\n"), [
   "data Bool = True | False",
@@ -292,6 +308,22 @@ formats("then and else line up", [
   "  Nothing -> if c then c else c",
   "k : Bool -> Bool",
   "k a = if a then False else True",
+  "p : Bool -> Bool -> Bool -> Bool",
+  "p a b c =",
+  "  if a",
+  "     && b",
+  "  then a",
+  "  else if (b",
+  "           || c)",
+  "          && a",
+  "  then b",
+  "  else c",
+  "q : Bool -> Bool -> Unit",
+  "q a b = do",
+  "  if a",
+  "     || b",
+  "    then pure MkUnit",
+  "    else pure MkUnit",
   "",
 ].join("\n"));
 
