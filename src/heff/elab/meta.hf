@@ -219,29 +219,62 @@ wakeS all = \st ->
               st))
         (\u -> wakeS all)
 
-resolveListS : Bool
+-- (a search as it is: its failure is the elaboration's)
+asItIs : Step Bool -> Step Bool
+asItIs s = s
+
+-- (a search tried before the definition settles: where it fails, what
+-- it did is undone and it waits on, so that it fails where it would
+-- have, when the definition settles)
+untilSettled : Step Bool -> Step Bool
+untilSettled s = \st -> case s st of
+  MkPair (Left d) st2 -> MkPair (Right False) st
+  r -> r
+
+resolveListS : (Step Bool -> Step Bool)
+             -> Bool
              -> List (Wanted ElabSt)
              -> Step (List (Pair Bool (Wanted ElabSt)))
-resolveListS final Nil = \st -> MkPair (Right Nil) st
-resolveListS final (Cons (MkWanted sp f) rest) = \st ->
+resolveListS tried final Nil = \st -> MkPair (Right Nil) st
+resolveListS tried final (Cons (MkWanted sp f) rest) = \st ->
     bindStep
-      (f final st)
+      (tried (f final) st)
       (\done st2 ->
          bindStep
-           (resolveListS final rest st2)
+           (resolveListS tried final rest st2)
            (\rs st3 ->
               MkPair (Right (Cons (MkPair done (MkWanted sp f)) rs)) st3))
 
--- | each wanted instance tried; those found dropped
-resolveS : Bool -> Step Bool
-resolveS final = \st ->
+-- | each wanted instance tried (as `tried` says); those found dropped
+resolveByS : (Step Bool -> Step Bool) -> Bool -> Step Bool
+resolveByS tried final = \st ->
     if List.null (wantedOf st) then MkPair (Right False) st
     else bindStep
-        (resolveListS final (wantedOf st) (withWanted (\w -> Nil) st))
+        (resolveListS tried final (wantedOf st) (withWanted (\w -> Nil) st))
         (\rs st2 ->
            MkPair
              (Right (resolveAny rs))
              (withWanted (\w -> List.append w (resolveKept rs)) st2))
+
+resolveS : Bool -> Step Bool
+resolveS final = resolveByS asItIs final
+
+-- | the delayed checks whose types are known run, and the instance
+-- | arguments whose goals are found -- as soon as they are, not once the
+-- | definition settles, so that what a found instance says (its type
+-- | members) is known to what follows; one not found yet waits on --
+-- | until neither moves.  With `all`, every delayed check, and no search.
+wakeResolveS : Bool -> Step Unit
+wakeResolveS all = \st ->
+    bindStep
+      (wakeS all st)
+      (\u st2 ->
+         if all then MkPair (Right MkUnit) st2
+         else bindStep
+             (resolveByS untilSettled False st2)
+             (\found st3 ->
+                if found then wakeResolveS all st3
+                else MkPair (Right MkUnit) st3))
 
 stateAlg : {a : Type} -> State.StateF StCore Step a -> Step a
 stateAlg (Get k) = \st -> MkPair (Right (k (core st))) st
@@ -259,7 +292,7 @@ deferAlg (Want sp f x) = \st ->
       (Right x)
       (withWanted (\ws -> List.append ws (Cons (MkWanted sp f) Nil)) st)
 deferAlg (Wake all x) = \st ->
-    bindStep (wakeS all st) (\u st2 -> MkPair (Right x) st2)
+    bindStep (wakeResolveS all st) (\u st2 -> MkPair (Right x) st2)
 deferAlg (Resolve final k) = \st ->
     bindStep (resolveS final st) (\b st2 -> MkPair (Right (k b)) st2)
 deferAlg (Pending k) = \st ->
@@ -307,7 +340,8 @@ runE : {a : Type} -> Elab a -> Step a
 runE m = handle elabH m
 
 -- | Run the delayed checks whose types are now known (and those they
--- | delay in turn); with `all`, every one, known or not.
+-- | delay in turn), and find the instance arguments whose goals are;
+-- | with `all`, every delayed check, known or not.
 runDelayed : Bool -> Elab Unit
 runDelayed all = wake all
 
