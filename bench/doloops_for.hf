@@ -1,0 +1,99 @@
+-- `for x in xs` with `continue`, `break` and an early `return`, in
+-- `Co`, desugared by hand as #86 decides: a cursor-shaped `Iterate`, the
+-- loop a local tail-recursive function through `bind` carrying the
+-- cursor and the mutable variables, and the body giving a step.
+--
+--   sumEvens xs = do
+--     let mut total = 0
+--     for x in xs do
+--       if x % 2 /= 0 then continue
+--       if x > 1000000000 then break
+--       if x < 0 then return (0 - 1)
+--       total := total + x
+--     print ("total " ^ show total)
+--     return total
+--
+-- over a list and over an array, of the same numbers.
+
+import co
+import std.io
+import array
+
+theory Iterate (c : Type) (a : Type) where
+  Cursor : Type
+  start : c -> Cursor
+  next : Cursor -> Maybe (Pair a Cursor)
+
+instance instanceIterateList : {a : Type} -> Iterate (List a) a
+instanceIterateList = { Cursor = List a, start = begin, next = step }
+  where
+  begin : List a -> List a
+  begin xs = xs
+  step : List a -> Maybe (Pair a (List a))
+  step Nil = Nothing
+  step (Cons x xs) = Just (MkPair x xs)
+
+-- | An array's cursor is its index (with the array).
+instance instanceIterateArray : {a : Type} -> Iterate (Array a) a
+instanceIterateArray = { Cursor = Pair (Array a) Int, start = begin, next = step }
+  where
+  begin : Array a -> Pair (Array a) Int
+  begin arr = MkPair arr 0
+  step : Pair (Array a) Int -> Maybe (Pair a (Pair (Array a) Int))
+  step (MkPair arr i) =
+    if i < arrayLength arr then Just (MkPair (arrayIndex arr i) (MkPair arr (i + 1)))
+    else Nothing
+
+-- | What a turn of a loop's body gives: go on with the variables, stop
+-- | the loop with them, or end the whole `do`.
+data Step v r = Continue v | Break v | Return r
+
+sumEvensList : {e : HFunctor} -> {{io : stdio <: e}} -> List Int -> Co e Int
+sumEvensList xs = loop (it.start xs) 0
+  where
+  it : Iterate (List Int) Int
+  it = instanceIterateList
+  after : Int -> Co e Int
+  after total = bind (print ("total " ^ show total)) (\u -> pure total)
+  loop : it.Cursor -> Int -> Co e Int
+  loop cur total = case it.next cur of
+    Nothing -> after total
+    Just (MkPair x rest) -> bind
+      (if x % 2 /= 0 then pure (Continue total)
+       else if x > 1000000000 then pure (Break total)
+       else if x < 0 then pure (Return (0 - 1))
+       else pure (Continue (total + x)) : Co e (Step Int Int))
+      (\s -> case s of
+      Continue total2 -> loop rest total2
+      Break total2 -> after total2
+      Return r -> pure r)
+
+sumEvensArray : {e : HFunctor} -> {{io : stdio <: e}} -> Array Int -> Co e Int
+sumEvensArray xs = loop (it.start xs) 0
+  where
+  it : Iterate (Array Int) Int
+  it = instanceIterateArray
+  after : Int -> Co e Int
+  after total = bind (print ("total " ^ show total)) (\u -> pure total)
+  loop : it.Cursor -> Int -> Co e Int
+  loop cur total = case it.next cur of
+    Nothing -> after total
+    Just (MkPair x rest) -> bind
+      (if x % 2 /= 0 then pure (Continue total)
+       else if x > 1000000000 then pure (Break total)
+       else if x < 0 then pure (Return (0 - 1))
+       else pure (Continue (total + x)) : Co e (Step Int Int))
+      (\s -> case s of
+      Continue total2 -> loop rest total2
+      Break total2 -> after total2
+      Return r -> pure r)
+
+numbers : Int -> List Int -> List Int
+numbers n acc = if n <= 0 then acc else numbers (n - 1) (Cons n acc)
+
+main : Co stdio Unit
+main = do
+  xs <- pure (numbers 10000000 Nil)
+  a <- sumEvensList (io := here stdio) xs
+  b <- sumEvensArray (io := here stdio) (arrayFromList xs)
+  print (ev := here stdio) (show (a == b))
