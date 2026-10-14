@@ -50,6 +50,7 @@
 #include <unistd.h>
 extern char **environ;
 #endif
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -152,7 +153,9 @@ enum {
 
 // (`K_TAGF`, a tag with flat fields (#64): one without is given back as
 // ever, nothing looked for in it)
-enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT, K_TAGF, K_BIT };
+// (`K_FGN`, a foreign value: the host's thing, a pointer, and what lets
+// it go ("Foreign values", below))
+enum { K_TAG, K_REC, K_CLO, K_PAP, K_STR, K_FLT, K_ARR, K_BNC, K_CELL, K_BIG, K_BYT, K_TAGF, K_BIT, K_FGN };
 
 typedef struct Obj {
   uint32_t rc;
@@ -196,6 +199,9 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
 // static as a string is)
 #define HEFF_BYTES(name, n, bytes) HEFF_STATIC_STR(name, K_BYT, n, bytes)
 typedef struct { Obj h; double d; } Flt;
+// (a foreign value: a pointer of the host's, and the function that
+// lets it go, called when the program drops the last reference)
+typedef struct { Obj h; void *p; void (*let_go)(void *); } Fgn;
 // (an array: its elements, `n` of them, `V`s or flat -- a number's C
 // type, as its header's `tag` says, `HEFF_ARR_V` or another of these
 // ("Arrays", below))
@@ -1153,6 +1159,7 @@ HEFF_FN size_t heff_size(V v) {
   case K_ARR: return heff_arr_bytes((Arr *)v);
   case K_BNC: return sizeof(Bnc) + ((Bnc *)v)->n * sizeof(V);
   case K_BIG: return sizeof(Big) + ((Big *)v)->n * sizeof(uint32_t);
+  case K_FGN: return sizeof(Fgn);
   default: return SMALL_MAX + 1;
   }
 }
@@ -1220,6 +1227,8 @@ __attribute__((noinline)) HEFF_FN void heff_free(V v) {
     case K_PAP: { Pap *p = (Pap *)v; heff_dead_push(p->fun); n = p->n; f = p->a; size = sizeof(Pap) + n * sizeof(V); break; }
     case K_ARR: { Arr *r = (Arr *)v; n = heff_arr_slots(r); f = r->a; size = heff_arr_bytes(r); break; }
     case K_BNC: { Bnc *b = (Bnc *)v; heff_dead_push(b->fun); n = b->n; f = b->a; size = sizeof(Bnc) + n * sizeof(V); break; }
+    // (a foreign value's last reference gone: the host's thing let go of)
+    case K_FGN: { Fgn *g = (Fgn *)v; if (g->let_go) g->let_go(g->p); size = sizeof(Fgn); break; }
     default: size = heff_size(v); break;
     }
     for (int64_t i = 0; i < n; i++) {
@@ -3875,6 +3884,71 @@ HEFF_FN char *heff_join(const char *dir, const char *name) {
 // (an answer, for an operation's function: given it, its value asked for)
 HEFF_FN V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 
+// Foreign values: a thing of the host's that the program holds as a
+// value -- a `FILE *`, a library's handle -- made by a provider of a
+// pointer and what lets it go (`heff_foreign`), the pointer read back
+// where an operation is given the value (`heff_foreign_ptr`); the
+// program drops the last reference, and the thing is let go of then, at
+// once (Perceus: never while it is referenced).  Its type in the program
+// is whatever the operation says it is -- a `data` of no constructors --
+// and the provider vouches for it at the boundary; the compiler's
+// generated glue makes and reads them as an effect's module describes
+// its operations in C (the `ffi` module).
+HEFF_FN V heff_foreign(void *p, void (*let_go)(void *)) {
+  Fgn *g = heff_obj_alloc(sizeof(Fgn));
+  g->h.rc = 1; g->h.kind = K_FGN; g->h.tag = 0; g->p = p; g->let_go = let_go;
+  return (V)g;
+}
+
+HEFF_FN void *heff_foreign_ptr(V v) {
+  if (!IS_OBJ(v) || OBJ(v)->kind != K_FGN) heff_fail("not a foreign value");
+  return ((Fgn *)v)->p;
+}
+
+// (an errno's name, the same on every system where its number is not)
+HEFF_FN const char *heff_errno_name(int e) {
+  switch (e) {
+#define HEFF_E(x) case x: return #x;
+  HEFF_E(EACCES) HEFF_E(EAGAIN) HEFF_E(EBADF) HEFF_E(EBUSY) HEFF_E(EEXIST) HEFF_E(EFBIG)
+  HEFF_E(EINTR) HEFF_E(EINVAL) HEFF_E(EIO) HEFF_E(EISDIR) HEFF_E(EMFILE)
+  HEFF_E(ENAMETOOLONG) HEFF_E(ENFILE) HEFF_E(ENODEV) HEFF_E(ENOENT) HEFF_E(ENOMEM)
+  HEFF_E(ENOSPC) HEFF_E(ENOSYS) HEFF_E(ENOTDIR) HEFF_E(ENOTEMPTY) HEFF_E(ENXIO)
+  HEFF_E(EPERM) HEFF_E(EPIPE) HEFF_E(EROFS) HEFF_E(ESPIPE) HEFF_E(EXDEV)
+#ifdef ELOOP
+  HEFF_E(ELOOP)
+#endif
+#ifdef ETXTBSY
+  HEFF_E(ETXTBSY)
+#endif
+#ifdef EOVERFLOW
+  HEFF_E(EOVERFLOW)
+#endif
+#ifdef EDQUOT
+  HEFF_E(EDQUOT)
+#endif
+#if EWOULDBLOCK != EAGAIN
+  HEFF_E(EWOULDBLOCK)
+#endif
+#undef HEFF_E
+  default: return "E?";
+  }
+}
+
+// (why a call of the system failed, as the program has it: a record of
+// the errno `err`, its name and what the system says of it -- its labels
+// `code`, `name`, `message`, in `shape`, the caller's, as the emitter
+// numbers them)
+HEFF_FN V heff_errno(int err, uint32_t *shape) {
+  const char *name = heff_errno_name(err);
+  char other[24];
+  if (name[1] == '?') {
+    snprintf(other, sizeof other, "errno %d", err);
+    name = other;
+  }
+  V f[3] = { heff_int(err), heff_str_text(name), heff_str_text(strerror(err)) };
+  return heff_rec(3, shape, f);
+}
+
 // The world: the things the providers hand out, held in one table for
 // them all, so that one effect's provider takes what another's handed
 // out (a `Handle` is `MkHandle i`, made and taken
@@ -4763,6 +4837,7 @@ HEFF_FN void heff_show(Buf *b, V v, int arg) {
     case K_STR: buf_json_string_as(b, v, 1); return;
     case K_BYT: heff_show_bytes(b, v); return;
     case K_BIT: heff_show_bits(b, v); return;
+    case K_FGN: buf_str(b, "#foreign"); return;
     case K_ARR: {
       Arr *r = (Arr *)v;
       buf_str(b, "[");

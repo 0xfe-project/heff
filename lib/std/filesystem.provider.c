@@ -329,49 +329,12 @@ static V heff_fs_whole(V p, V k) {
 #endif
 #endif
 
-// (an errno's name, the same on every system where its number is not)
-static const char *fs_errno_name(int e) {
-  switch (e) {
-#define FS_E(x) case x: return #x;
-  FS_E(EACCES) FS_E(EAGAIN) FS_E(EBADF) FS_E(EBUSY) FS_E(EEXIST) FS_E(EFBIG)
-  FS_E(EINTR) FS_E(EINVAL) FS_E(EIO) FS_E(EISDIR) FS_E(EMFILE)
-  FS_E(ENAMETOOLONG) FS_E(ENFILE) FS_E(ENODEV) FS_E(ENOENT) FS_E(ENOMEM)
-  FS_E(ENOSPC) FS_E(ENOSYS) FS_E(ENOTDIR) FS_E(ENOTEMPTY) FS_E(ENXIO)
-  FS_E(EPERM) FS_E(EPIPE) FS_E(EROFS) FS_E(ESPIPE) FS_E(EXDEV)
-#ifdef ELOOP
-  FS_E(ELOOP)
-#endif
-#ifdef ETXTBSY
-  FS_E(ETXTBSY)
-#endif
-#ifdef EOVERFLOW
-  FS_E(EOVERFLOW)
-#endif
-#ifdef EDQUOT
-  FS_E(EDQUOT)
-#endif
-#if EWOULDBLOCK != EAGAIN
-  FS_E(EWOULDBLOCK)
-#endif
-#undef FS_E
-  default: return "E?";
-  }
-}
-
 static uint32_t fs_error_shape[3] = { LBL_code, LBL_name, LBL_message };
 static uint32_t fs_status_shape[4] = { LBL_kind, LBL_size, LBL_modified, LBL_mode };
 
-// (a `FileError` of errno `err`)
-static V fs_error(int err) {
-  const char *name = fs_errno_name(err);
-  char other[24];
-  if (name[1] == '?') {
-    snprintf(other, sizeof other, "errno %d", err);
-    name = other;
-  }
-  V f[3] = { heff_int(err), heff_str_text(name), heff_str_text(strerror(err)) };
-  return heff_rec(3, fs_error_shape, f);
-}
+// (a `FileError` of errno `err`: the runtime's errno record, whose shape
+// a `FileError` is)
+static V fs_error(int err) { return heff_errno(err, fs_error_shape); }
 
 static V fs_left(int err) {
   V x = fs_error(err);
