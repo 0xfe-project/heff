@@ -2342,6 +2342,7 @@ type TestRes =
   , unchecked : List String
   , tests : Int
   , testsFailed : Int
+  , testsSkipped : Int
   }
 
 -- | nothing tested yet
@@ -2354,6 +2355,7 @@ noRes =
   , unchecked = Nil
   , tests = 0
   , testsFailed = 0
+  , testsSkipped = 0
   }
 
 -- | what two runs came to, together
@@ -2366,6 +2368,7 @@ addRes a b =
   , unchecked = List.append a.unchecked b.unchecked
   , tests = a.tests + b.tests
   , testsFailed = a.testsFailed + b.testsFailed
+  , testsSkipped = a.testsSkipped + b.testsSkipped
   }
 
 -- (a file that does not check as it should, `why`)
@@ -2378,6 +2381,7 @@ uncheckedRes why =
   , unchecked = [why]
   , tests = 0
   , testsFailed = 0
+  , testsSkipped = 0
   }
 
 -- (a file that expects errors, and has them)
@@ -2390,6 +2394,7 @@ expectedRes =
   , unchecked = Nil
   , tests = 0
   , testsFailed = 0
+  , testsSkipped = 0
   }
 
 -- | how `heff test` runs the tests: the seed of the properties, the
@@ -2478,11 +2483,9 @@ shrunk 0 = "not shrunk"
 shrunk 1 = "shrunk once"
 shrunk n = "shrunk " ^ show n ^ " times"
 
--- | a test's line: whether it held, its name, and for a property its
--- | statistic -- and if it failed, how far its counterexample was
--- | shrunk and the seed that runs it again
-outcomeLine : Driver.TestOutcome -> String
-outcomeLine o =
+-- (a test's line, of one that ran)
+ranLine : Driver.TestOutcome -> String
+ranLine o =
   (if o.ok then "  ok    " else "  FAIL  ")
   ^ o.name
   ^ (if not o.property then ""
@@ -2497,6 +2500,14 @@ outcomeLine o =
        ^ "; again: --seed "
        ^ show o.seed
        ^ ")")
+
+-- | a test's line: whether it held, its name, and for a property its
+-- | statistic -- and if it failed, how far its counterexample was
+-- | shrunk and the seed that runs it again; a test skipped, why
+outcomeLine : Driver.TestOutcome -> String
+outcomeLine o = case o.skipped of
+  Just why -> "  skip  " ^ o.name ^ "  (" ^ why ^ ")"
+  Nothing -> ranLine o
 
 mismatchLines : Report.Mismatch -> List String
 mismatchLines m =
@@ -2536,14 +2547,30 @@ printOutcomes color (Cons o rest) = do
 badOutcomes : List Driver.TestOutcome -> List Driver.TestOutcome
 badOutcomes os = List.filter (\(o : Driver.TestOutcome) -> not o.ok) os
 
--- (how many tests held, of how many: said only of a file that has some)
+skippedOutcomes : List Driver.TestOutcome -> List Driver.TestOutcome
+skippedOutcomes os =
+  List.filter
+    (\(o : Driver.TestOutcome) -> maybe False (\why -> True) o.skipped)
+    os
+
+-- (how many were skipped: said only if some were)
+skippedSaid : Int -> String
+skippedSaid 0 = ""
+skippedSaid n = ", " ^ show n ^ " skipped"
+
+-- (how many tests held, of how many, and how many were skipped: said
+-- only of a file that has some)
 testsSaid : List Driver.TestOutcome -> String
 testsSaid Nil = ""
 testsSaid os =
   ", tests "
-  ^ show (List.length os - List.length (badOutcomes os))
+  ^ show
+    (List.length os
+     - List.length (badOutcomes os)
+     - List.length (skippedOutcomes os))
   ^ "/"
   ^ show (List.length os)
+  ^ skippedSaid (List.length (skippedOutcomes os))
 
 testReport : {e : HFunctor}
            -> {{io : stdio <: e}}
@@ -2577,6 +2604,7 @@ testReport f wrong ts os = do
       , unchecked = wrong
       , tests = List.length os
       , testsFailed = List.length (badOutcomes os)
+      , testsSkipped = List.length (skippedOutcomes os)
       }
 
 -- | the first thing wrong with a file, its line in `heff test`'s list of
@@ -2849,6 +2877,7 @@ outcomeFailed : Driver.TestOutcome
 outcomeFailed o note why =
   { name = o.name
   , ok = False
+  , skipped = Nothing
   , property = o.property
   , runs = o.runs
   , discarded = o.discarded
@@ -2994,6 +3023,7 @@ brokenTest : String -> String -> Driver.TestOutcome
 brokenTest name why =
   { name = name
   , ok = False
+  , skipped = Nothing
   , property = False
   , runs = 0
   , discarded = 0
@@ -3026,6 +3056,7 @@ outcomeOfJson : String -> Json.Json -> Driver.TestOutcome
 outcomeOfJson name j =
   { name = name
   , ok = fromMaybe False (Json.bool ["ok"] j)
+  , skipped = Json.str ["skipped"] j
   , property = False
   , runs = 1
   , discarded = 0
@@ -3559,10 +3590,15 @@ runReady opts ready acc = do
   reportReady opts done ready acc
 
 -- (the tests' part of the last line: said only if there were some)
-testsHeld : Int -> Int -> String
-testsHeld tests failed =
+testsHeld : Int -> Int -> Int -> String
+testsHeld tests failed skipped =
   if tests == 0 then ""
-  else ", " ^ show (tests - failed) ^ "/" ^ show tests ^ " tests hold"
+  else ", "
+    ^ show (tests - failed - skipped)
+    ^ "/"
+    ^ show tests
+    ^ " tests hold"
+    ^ skippedSaid skipped
 
 -- (the files' part of the last line: how many check as they should --
 -- those that expect errors by having some -- of how many)
@@ -3659,7 +3695,7 @@ testSummary opts acc = do
        ^ "/"
        ^ show acc.total
        ^ " expectations hold"
-       ^ testsHeld acc.tests acc.testsFailed
+       ^ testsHeld acc.tests acc.testsFailed acc.testsSkipped
        ^ filesSaid acc)
   if acc.failed > 0 || acc.testsFailed > 0 || not (List.null acc.unchecked)
     then exit 1

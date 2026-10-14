@@ -103,6 +103,11 @@ model of it and compares what they observe; drawn by a property, the
 program shrinks to a short one that tells them apart
 (`test/check/map.hf` holds `lib/std/map.hf` to a list of pairs).
 
+A test that needs what is not there -- a tool not installed, a system it
+is not of -- says so with `skip WHY`, rather than holding having checked
+nothing: `heff test` writes `skip` and the reason on its line, and
+counts it apart, neither held nor failed (`tests 3/5, 2 skipped`).
+
 ## Integration tests
 
 A test that needs the world outside the program -- commands run, files
