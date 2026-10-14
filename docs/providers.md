@@ -124,6 +124,90 @@ element), reads that field by `heff_tget_v` (as `heff_rget_v`), not by
 A provider is given a rune as a number in JavaScript, and in C as a
 word of its code point (`INT_OF`, `MK_INT`).
 
+## Operations described in C
+
+An operation a C function does -- the fields given to it, its result
+the answer -- need not be written in the provider at all: the effect's
+module describes it, and the compiler makes that part of the provider,
+its dispatch and conversions, where it compiles a program for C.  The
+description is a definition of type `Described` (lib/ffi.hf) in the
+effect's module, C's types as values, composed as Racket's `ffi` has
+them:
+
+```
+import ffi as Ffi
+
+-- (std.thread: `Cores` is the provider's `th_cores()`)
+threadsInC : Ffi.Described
+threadsInC =
+  Ffi.describe
+    Nil
+    [Ffi.operation "Cores" (Ffi.fun "th_cores" Nil (Ffi.gives Ffi.int64))]
+```
+
+Each operation is a constructor's name and a function: its name, as
+the header the description names declares it (`Ffi.describe
+["<stdio.h>"] [...]`), or as the module's `M.provider.c` defines it
+(a wrapper of the system's call, `static`, behind an `#ifdef` where
+systems differ); its arguments, the operation's fields but the last,
+in order, each a `CType` -- `Ffi.int`, `Ffi.int64`, `Ffi.integer
+"mode_t"` (an integer type by its C name, of an `Int`), `Ffi.double`
+(a `Float64`), `Ffi.bool`, `Ffi.string` (`const char *`, a string's
+bytes with a NUL after them; `Ffi.text` the same made valid), and
+`Ffi.pointer "FILE" "fclose"` (a `FILE *`, a foreign value); and its
+result -- `Ffi.gives t` (the answer; `Ffi.void` gives `MkUnit`, or the
+operation's `x` itself where that is its last field),
+`Ffi.givesOrErrno t` (an `Either Errno a`: `-1`, or `NULL`, with
+`errno` set is `Left` of it, as `Ffi.Errno` has it, the shape of
+std.filesystem's `FileError`), `Ffi.doneOrErrno` (an `int`, 0 or `-1`
+with `errno`: `Either Errno Unit`); `Ffi.ownedString` is a result
+`char *` C malloc'd, copied and freed.  A string argument with a NUL in
+it fails the operation `EINVAL`, where it can fail, else the program.
+
+A foreign value is a pointer the program holds (`heff_foreign(p,
+let_go)` makes one, `heff_foreign_ptr(v)` reads it back), of whatever
+type the operation says it is -- a `data` of no constructors, `data
+Stream` -- the provider vouching for it at the boundary; the program
+drops its last reference, and the named function lets the thing go
+then, at once (Perceus: never while it is referenced).  In JavaScript
+a foreign value is to be the object itself, with a
+`FinalizationRegistry`; a description means nothing there yet: the
+module's `M.provider.js` is the whole of the effect.
+
+The compiler holds the description to the effect: a constructor that
+is none of the module's effects' operations, a field too many or too
+few, a field of a type that cannot cross as described, each an error
+of the compile.  What it cannot see, the C side, the C compiler
+checks: the glue is built against the header's own declaration, each
+function held to the type described (`_Static_assert` of
+`__builtin_types_compatible_p(__typeof__(f), ...)`), so a mismatch --
+an `int` for a `size_t`, a `void *` for a `FILE *` -- fails the build,
+saying what the module described.  (A function that is a macro cannot
+be held so: describe a wrapper.)
+
+The glue is `heff_described_X`, after the provider's own text.  A
+provider written by hand hands it the operations it does not do
+itself, declaring it first:
+
+```c
+static V heff_described_threads(V p, V k);
+
+static V heff_provider_threads(V p, V k) {
+  switch (heff_tag_of(p)) {
+  case TAG_Pool: ...
+  default:
+    return heff_described_threads(p, k);
+  }
+}
+```
+
+Operations done in steps, by the reactor (below), stay written by
+hand.  A module all of whose operations are described needs no
+`M.provider.c`: the glue is the provider (test/node/cstdio.hf, C's
+streams as an effect, no C written for it).  Functions of no effect
+(libm's, a hash) are not described: they are primitives of the
+runtime or the library; C cannot be trusted to say a function is pure.
+
 ## Outside operations done later
 
 An operation of the system that must wait -- a socket not yet

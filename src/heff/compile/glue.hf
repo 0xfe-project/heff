@@ -1,0 +1,540 @@
+-- An effect's operations that C functions do, as the effect's module
+-- describes them (the library's `ffi` module: a definition of type
+-- `Described`, the operations each a constructor's name and a function
+-- with its C type as values): read where a program is compiled for C,
+-- and decided here -- which operation calls which function, how each
+-- field crosses, what the result is made into -- as glue for the
+-- emitter to print, in place of the provider's own dispatch and
+-- conversions.  The description is a value of the program's: it is
+-- evaluated (heff.compile.interp), and held to the operations as the
+-- effect declares them -- a constructor named that is none, a field too
+-- many or too few, a field of a type that cannot cross as described --
+-- each an error of the compile.  What heff cannot see, the C side's
+-- types, the C compiler is given to check, by what the emitter prints
+-- with the glue.
+
+import array as Array
+import heff.util.dict as Dict
+import heff.elab.effect as Effect
+import heff.elab.globals as Globals
+import heff.elab.params as Params
+import heff.compile.interp as Interp
+import std.map as Map
+import heff.elab.syntax as Syntax
+
+-- | A C type, as the `ffi` module has it.
+data CType
+  = CInteger String
+  | CDouble
+  | CBool
+  | CString
+  | CText
+  | COwnedString
+  | CPointer String String
+  | CVoid
+
+-- | What a function's result is made into, as the `ffi` module has it.
+data CResult = Gives CType | GivesOrErrno CType | DoneOrErrno
+
+-- | An operation's glue: its constructor, the function called with the
+-- | fields but the last, each as its C type; the result as it is made
+-- | into the answer; and whether the last field is a function the answer
+-- | is given to (`answered`), or the operation's `x` itself.
+type Binding =
+  { tag : String
+  , fun : String
+  , args : List CType
+  , result : CResult
+  , answered : Bool
+  }
+
+-- | An effect leaf's glue: its module and name, the headers to include,
+-- | its operations' bindings; `entry`, whether the glue is the whole
+-- | provider -- no provider written by hand defines `heff_provider_X` --
+-- | and so defines it.
+type Glue =
+  { module : String
+  , leaf : String
+  , includes : List String
+  , ops : List Binding
+  , entry : Bool
+  }
+
+appendF : {a : Type} -> List a -> List a -> List a
+appendF Nil ys = ys
+appendF (Cons x xs) ys = Cons x (appendF xs ys)
+
+-- Reading the values
+--------------------------------------------------------------------------------
+
+-- | a list's items, `Cons a (Cons b Nil)`
+listOf : Interp.Val -> Maybe (List Interp.Val)
+listOf (VTag "Nil" Nil) = Just Nil
+listOf (VTag "Cons" (Cons x (Cons rest Nil))) = case (listOf rest :
+                                                        Maybe
+                                                          (List Interp.Val)) of
+  Just xs -> Just (Cons x xs)
+  Nothing -> Nothing
+listOf _ = Nothing
+
+strOf : Interp.Val -> Maybe String
+strOf (VStr s) = Just s
+strOf _ = Nothing
+
+fieldOf : Interp.Val -> String -> Maybe Interp.Val
+fieldOf (VCons fs) x = Dict.lookup fs x
+fieldOf _ x = Nothing
+
+-- (each of them, or the first that is not)
+eachOf : {a : Type}
+       -> (Interp.Val -> Maybe a)
+       -> List Interp.Val
+       -> Maybe (List a)
+eachOf f Nil = Just Nil
+eachOf f (Cons v rest) = case f v of
+  Just x -> case (eachOf f rest : Maybe (List a)) of
+    Just xs -> Just (Cons x xs)
+    Nothing -> Nothing
+  Nothing -> Nothing
+
+cTypeOf : Interp.Val -> Maybe CType
+cTypeOf (VTag "CInteger" (Cons (VStr t) Nil)) = Just (CInteger t)
+cTypeOf (VTag "CDouble" Nil) = Just CDouble
+cTypeOf (VTag "CBool" Nil) = Just CBool
+cTypeOf (VTag "CString" Nil) = Just CString
+cTypeOf (VTag "CText" Nil) = Just CText
+cTypeOf (VTag "COwnedString" Nil) = Just COwnedString
+cTypeOf (VTag "CPointer" (Cons (VStr t) (Cons (VStr r) Nil))) =
+  Just (CPointer t r)
+cTypeOf (VTag "CVoid" Nil) = Just CVoid
+cTypeOf _ = Nothing
+
+cResultOf : Interp.Val -> Maybe CResult
+cResultOf (VTag "Gives" (Cons t Nil)) = case cTypeOf t of
+  Just c -> Just (Gives c)
+  Nothing -> Nothing
+cResultOf (VTag "GivesOrErrno" (Cons t Nil)) = case cTypeOf t of
+  Just c -> Just (GivesOrErrno c)
+  Nothing -> Nothing
+cResultOf (VTag "DoneOrErrno" Nil) = Just DoneOrErrno
+cResultOf _ = Nothing
+
+-- | a described operation, read: its constructor, and its function's
+-- | name, arguments and result (`answered` is decided against the
+-- | constructor, later)
+type Read = { tag : String, fun : String, args : List CType, result : CResult }
+
+maybe4 : {a b c d e : Type}
+       -> Maybe a
+       -> Maybe b
+       -> Maybe c
+       -> Maybe d
+       -> (a -> b -> c -> d -> e)
+       -> Maybe e
+maybe4 (Just a) (Just b) (Just c) (Just d) f = Just (f a b c d)
+maybe4 _ _ _ _ f = Nothing
+
+andThen : {a b : Type} -> Maybe a -> (a -> Maybe b) -> Maybe b
+andThen (Just x) f = f x
+andThen Nothing f = Nothing
+
+readOp : Interp.Val -> Maybe Read
+readOp v =
+  maybe4
+    (andThen (fieldOf v "op") strOf)
+    (andThen (fieldOf v "fun") (\f -> andThen (fieldOf f "name") strOf))
+    (andThen
+       (fieldOf v "fun")
+       (\f ->
+          andThen
+            (fieldOf f "args")
+            (\a -> andThen (listOf a) (eachOf cTypeOf))))
+    (andThen (fieldOf v "fun") (\f -> andThen (fieldOf f "result") cResultOf))
+    (\tag fun args result ->
+       ({ tag = tag, fun = fun, args = args, result = result } : Read))
+
+-- | a `Described` value read: the headers, and the operations
+readDescribed : Interp.Val -> Maybe (Pair (List String) (List Read))
+readDescribed (VTag "Describe" (Cons incs (Cons ops Nil))) = case andThen
+    (listOf incs)
+    (eachOf strOf) of
+  Just is -> case andThen (listOf ops) (eachOf readOp) of
+    Just os -> Just (MkPair is os)
+    Nothing -> Nothing
+  Nothing -> Nothing
+readDescribed _ = Nothing
+
+-- The module's definitions
+--------------------------------------------------------------------------------
+
+-- | whether a type is the global `k`, as a type
+isGlobalTy : String -> Syntax.Ty -> Bool
+isGlobalTy k (SDecode (SGlobal g)) = strEq g k
+isGlobalTy k (SDecode (SIs e)) = isGlobalTy k (SDecode e)
+isGlobalTy k _ = False
+
+-- | the module's definitions of type `t` (a global), by key, in order
+ofType : Globals.Globals -> String -> String -> List String
+ofType g m t =
+  List.map
+    fst
+    (List.filter
+       (\(p : Pair String Globals.Entry) ->
+          strEq (Effect.moduleOfKey (fst p)) m
+          && isGlobalTy t (snd p).tySyntax)
+       (Globals.globalsList g))
+
+-- | the operations of a sum, through what wraps it: the data type's
+-- | definition is a function of its parameters to the code of the sum
+sumOf : Syntax.Tm -> Maybe (Params.Variants Syntax.Ty)
+sumOf (SLam _ (MkAbs _ body)) = sumOf body
+sumOf (SLam _ (AbsConst body)) = sumOf body
+sumOf (SIs e) = sumOf e
+sumOf (SCode (SSum vs)) = Just vs
+sumOf _ = Nothing
+
+-- | the operations of an effect leaf, by its key: its `f`, the data
+-- | type whose constructors they are
+operationsOf : Globals.Globals -> String -> Maybe (Params.Variants Syntax.Ty)
+operationsOf g k = case Globals.lookupEntry g k of
+  Just entry -> case entry.syntax of
+    SCons fs -> case Dict.lookup fs "f" of
+      Just (SGlobal fk) -> case Globals.lookupEntry g fk of
+        Just fentry -> sumOf fentry.syntax
+        Nothing -> Nothing
+      Just (SIs (SGlobal fk)) -> case Globals.lookupEntry g fk of
+        Just fentry -> sumOf fentry.syntax
+        Nothing -> Nothing
+      _ -> Nothing
+    _ -> Nothing
+  Nothing -> Nothing
+
+-- Each field held to its C type
+--------------------------------------------------------------------------------
+
+-- (a type seen through what wraps it)
+tyOf : Syntax.Ty -> Syntax.Ty
+tyOf (SIsTy t) = tyOf t
+tyOf (SDecode (SIs e)) = tyOf (SDecode e)
+tyOf (SDecode (SCode t)) = tyOf t
+tyOf t = t
+
+-- | whether a field of this type crosses as the C type says: what heff
+-- | can see of it -- a field whose type it does not know the shape of
+-- | (an alias, a parameter) is taken as it is described, the C compiler
+-- | checking the other side
+fits : CType -> Syntax.Ty -> Bool
+fits (CInteger _) t = case tyOf t of
+  SPrimInt -> True
+  SPrimString -> False
+  SPrimFloat -> False
+  SPrimRune -> False
+  SDecode (SGlobal g) -> not (strEq g "builtin.Bool")
+  _ -> True
+fits CDouble t = case tyOf t of
+  SPrimFloat -> True
+  SPrimInt -> False
+  SPrimString -> False
+  SPrimRune -> False
+  SDecode (SGlobal g) -> not (strEq g "builtin.Bool")
+  _ -> True
+fits CBool t = case tyOf t of
+  SDecode (SGlobal g) -> strEq g "builtin.Bool"
+  SPrimInt -> False
+  SPrimString -> False
+  SPrimFloat -> False
+  SPrimRune -> False
+  _ -> True
+fits CString t = case tyOf t of
+  SPrimString -> True
+  SPrimInt -> False
+  SPrimFloat -> False
+  SPrimRune -> False
+  SDecode (SGlobal g) -> not (strEq g "builtin.Bool")
+  _ -> True
+fits CText t = fits CString t
+fits COwnedString t = fits CString t
+fits (CPointer _ _) t = case tyOf t of
+  SPrimString -> False
+  SPrimInt -> False
+  SPrimFloat -> False
+  SPrimRune -> False
+  SDecode (SGlobal g) -> not (strEq g "builtin.Bool")
+  _ -> True
+fits CVoid t = case tyOf t of
+  SDecode (SGlobal g) -> strEq g "builtin.Unit"
+  SPrimInt -> False
+  SPrimString -> False
+  SPrimFloat -> False
+  SPrimRune -> False
+  _ -> True
+
+-- | `Either l r`'s `r`, where the type is seen to be one (its arguments
+-- | are elements, a type each decoded)
+rightOf : Syntax.Ty -> Maybe Syntax.Ty
+rightOf t = case tyOf t of
+  SDecode (SApp (SApp (SGlobal e) _) r) ->
+    if strEq e "prelude.Either" then Just (SDecode r) else Nothing
+  _ -> Nothing
+
+-- | what a C type is called, for the messages
+showCType : CType -> String
+showCType (CInteger t) = t
+showCType CDouble = "double"
+showCType CBool = "bool"
+showCType CString = "const char *"
+showCType CText = "const char * (text)"
+showCType COwnedString = "char * (malloc'd)"
+showCType (CPointer t _) = t ^ " *"
+showCType CVoid = "void"
+
+-- | whether a C type can be given to a function: a result's alone cannot
+argOk : CType -> Bool
+argOk COwnedString = False
+argOk CVoid = False
+argOk _ = True
+
+-- | whether a result can fail the system's way, `-1` or `NULL`
+failsOk : CType -> Bool
+failsOk (CInteger _) = True
+failsOk CString = True
+failsOk CText = True
+failsOk COwnedString = True
+failsOk (CPointer _ _) = True
+failsOk _ = False
+
+-- (the first message of these, or none)
+firstBad : List (Maybe String) -> Maybe String
+firstBad Nil = Nothing
+firstBad (Cons (Just m) rest) = Just m
+firstBad (Cons Nothing rest) = firstBad rest
+
+-- | the argument `i` (its field) held to its C type
+argBad : String -> Int -> CType -> Syntax.Ty -> Maybe String
+argBad tag i c t =
+  if not (argOk c)
+  then Just
+      ("`"
+       ^ tag
+       ^ "`'s argument "
+       ^ show (i + 1)
+       ^ " is described as `"
+       ^ showCType c
+       ^ "`, a result's type")
+  else if fits c t then Nothing
+  else Just
+      ("`"
+       ^ tag
+       ^ "`'s field "
+       ^ show (i + 1)
+       ^ " cannot be given to C as `"
+       ^ showCType c
+       ^ "`")
+
+argsBad : String -> Int -> List CType -> List Syntax.Ty -> Maybe String
+argsBad tag i (Cons c cs) (Cons t ts) = case argBad tag i c t of
+  Just m -> Just m
+  Nothing -> argsBad tag (i + 1) cs ts
+argsBad tag i _ _ = Nothing
+
+-- | the answer, as the result is described, held to the last field: a
+-- | function, given it; or the operation's `x`, of a function giving
+-- | `void`
+resultBad : String -> CResult -> Syntax.Ty -> Maybe String
+resultBad tag (Gives c) (SFunction _ dom _ _ _) =
+  if fits c dom then Nothing
+  else Just ("`" ^ tag ^ "`'s answer cannot be made of a `" ^ showCType c ^ "`")
+resultBad tag (Gives CVoid) t = Nothing
+resultBad tag (Gives c) t =
+  Just
+    ("`"
+     ^ tag
+     ^ "` answers with its last field as it is: its function gives `void`, not `"
+     ^ showCType c
+     ^ "`")
+resultBad tag (GivesOrErrno c) (SFunction _ dom _ _ _) =
+  if not (failsOk c)
+  then Just
+      ("`"
+       ^ tag
+       ^ "`'s result, `"
+       ^ showCType c
+       ^ "`, cannot fail as `-1` or `NULL`")
+  else case rightOf dom of
+    Just r ->
+      if fits c r then Nothing
+      else Just
+          ("`" ^ tag ^ "`'s `Right` cannot be made of a `" ^ showCType c ^ "`")
+    Nothing ->
+      Just
+        ("`"
+         ^ tag
+         ^ "`'s answer is not an `Either Errno a`, as its result is described")
+resultBad tag (GivesOrErrno c) t =
+  Just
+    ("`"
+     ^ tag
+     ^ "` answers with its last field as it is: no `Either Errno a` to give")
+resultBad tag DoneOrErrno (SFunction _ dom _ _ _) = case rightOf dom of
+  Just r -> Nothing
+  Nothing ->
+    Just
+      ("`"
+       ^ tag
+       ^ "`'s answer is not an `Either Errno Unit`, as its result is described")
+resultBad tag DoneOrErrno t =
+  Just
+    ("`"
+     ^ tag
+     ^ "` answers with its last field as it is: no `Either Errno Unit` to give")
+
+isFunctionTy : Syntax.Ty -> Bool
+isFunctionTy (SFunction _ _ _ _ _) = True
+isFunctionTy _ = False
+
+lastOf : {a : Type} -> List a -> Maybe a
+lastOf Nil = Nothing
+lastOf (Cons x Nil) = Just x
+lastOf (Cons x rest) = lastOf rest
+
+-- | the binding of a read operation, held to the constructor's fields:
+-- | all but the last the arguments, in order, the last the answer
+bindingOf : Read -> Array Syntax.Ty -> Either String Binding
+bindingOf r fields =
+  if Array.length fields == 0
+  then Left ("`" ^ r.tag ^ "` has no field: no answer to give")
+  else if List.length r.args /= Array.length fields - 1
+  then Left
+      ("`"
+       ^ r.tag
+       ^ "` has "
+       ^ show (Array.length fields - 1)
+       ^ " arguments and its answer, but "
+       ^ show (List.length r.args)
+       ^ " are described")
+  else case lastOf (Array.toList fields) of
+    Nothing -> Left ("`" ^ r.tag ^ "` has no field: no answer to give")
+    Just last -> case firstBad
+        [ argsBad r.tag 0 r.args (Array.toList fields)
+        , resultBad r.tag r.result last
+        ] of
+      Just m -> Left m
+      Nothing ->
+        Right
+          { tag = r.tag
+          , fun = r.fun
+          , args = r.args
+          , result = r.result
+          , answered = isFunctionTy last
+          }
+
+-- The glue
+--------------------------------------------------------------------------------
+
+-- | a module's descriptions, read: the headers and the operations of
+-- | them all, or what is wrong with one
+describedIn : Globals.Globals
+            -> String
+            -> Either String (Pair (List String) (List Read))
+describedIn g m = case ofType g m "ffi.Described" of
+  Nil -> Right (MkPair Nil Nil)
+  keys ->
+    List.foldl
+      (\acc (p : Pair String Interp.EvalResult) -> case acc of
+       Left why -> Left why
+       Right (MkPair incs ops) -> case snd p of
+         RSucceeded v -> case readDescribed v of
+           Just (MkPair is os) ->
+             Right (MkPair (appendF incs is) (appendF ops os))
+           Nothing ->
+             Left
+               ("`"
+                ^ Effect.nameOfKey (fst p)
+                ^ "` is not a description heff can read")
+         _ ->
+           Left ("`" ^ Effect.nameOfKey (fst p) ^ "` could not be evaluated"))
+      (Right (MkPair Nil Nil))
+      (Interp.evalReached g keys)
+
+-- | whether a constructor is of one of the module's effects' operations
+anyLeafHas : Globals.Globals -> String -> String -> Bool
+anyLeafHas g m tag =
+  List.any
+    (\k -> case operationsOf g k of
+     Just vs -> Dict.contains vs tag
+     Nothing -> False)
+    (ofType g m "co.HFunctor")
+
+eithers : {a : Type} -> List (Either String a) -> Either String (List a)
+eithers Nil = Right Nil
+eithers (Cons (Left why) rest) = Left why
+eithers (Cons (Right x) rest) = case (eithers rest : Either String (List a)) of
+  Left why -> Left why
+  Right xs -> Right (Cons x xs)
+
+-- | the bindings of the leaf `k`'s operations among those read: each
+-- | held to its constructor; one that is no constructor of the module's
+-- | effects is an error
+bindingsOf : Globals.Globals
+           -> String
+           -> List Read
+           -> Either String (List Binding)
+bindingsOf g k ops = case operationsOf g k of
+  Nothing ->
+    Left
+      ("the operations of `"
+       ^ Effect.nameOfKey k
+       ^ "` cannot be read: not an effect of a data type")
+  Just vs ->
+    eithers
+      (List.concatMap
+         (\(r : Read) -> case Dict.lookup vs r.tag of
+          Just fields -> Cons (bindingOf r fields) Nil
+          Nothing ->
+            if anyLeafHas g (Effect.moduleOfKey k) r.tag then Nil
+            else Cons
+                (Left
+                   ("`"
+                    ^ r.tag
+                    ^ "` is not an operation of an effect of "
+                    ^ Effect.moduleOfKey k))
+                Nil)
+         ops)
+
+-- | a leaf's glue, where its module describes operations of it: `handWritten`
+-- | says whether a provider written by hand defines its `heff_provider_X`
+glueOf : Globals.Globals
+       -> (String -> Bool)
+       -> String
+       -> Either String (Maybe Glue)
+glueOf g handWritten k = case describedIn g (Effect.moduleOfKey k) of
+  Left why -> Left (Effect.moduleOfKey k ^ ": " ^ why)
+  Right (MkPair incs Nil) -> Right Nothing
+  Right (MkPair incs ops) -> case bindingsOf g k ops of
+    Left why -> Left (Effect.moduleOfKey k ^ ": " ^ why)
+    Right Nil -> Right Nothing
+    Right bs ->
+      Right
+        (Just
+           { module = Effect.moduleOfKey k
+           , leaf = Effect.nameOfKey k
+           , includes = incs
+           , ops = bs
+           , entry = not (handWritten k)
+           })
+
+justs : {a : Type} -> List (Maybe a) -> List a
+justs Nil = Nil
+justs (Cons (Just x) rest) = Cons x (justs rest)
+justs (Cons Nothing rest) = justs rest
+
+-- | the glue of each leaf whose module describes operations of it, or
+-- | what is wrong with a description
+gluesOf : Globals.Globals
+        -> (String -> Bool)
+        -> List String
+        -> Either String (List Glue)
+gluesOf g handWritten leaves = case eithers
+    (List.map (glueOf g handWritten) leaves) of
+  Left why -> Left why
+  Right ms -> Right (justs ms)

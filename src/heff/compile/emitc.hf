@@ -39,6 +39,7 @@ import heff.elab.effect as Effect
 import heff.compile.borrow as Borrow
 import heff.compile.emit as Emit
 import heff.compile.facts as Facts
+import heff.compile.glue as Glue
 import heff.elab.fixed as Fixed
 import heff.elab.globals as Globals
 import heff.compile.ir as IR
@@ -1769,6 +1770,394 @@ performCode eff =
   List.append
     (fst (performNodes eff 0))
     ["static V heff_perform(V p, V k) { return heff_perform_0(p, k); }"]
+
+-- Glue: an effect's operations C functions do, as its module describes
+-- them (heff.compile.glue, which decides it): printed as a provider's
+-- side of them -- `heff_described_X`, the dispatch, each field crossing
+-- as its C type, the result made into the answer -- with what the C
+-- compiler is to check: each function held to the type described, the
+-- header's own (`__typeof__`), an error of the build where they differ
+--------------------------------------------------------------------------------
+
+-- (a C type, as C spells it)
+cTypeName : Glue.CType -> String
+cTypeName (CInteger t) = t
+cTypeName CDouble = "double"
+cTypeName CBool = "bool"
+cTypeName CString = "const char *"
+cTypeName CText = "const char *"
+cTypeName COwnedString = "char *"
+cTypeName (CPointer t _) = t ^ " *"
+cTypeName CVoid = "void"
+
+resultTypeName : Glue.CResult -> String
+resultTypeName (Gives t) = cTypeName t
+resultTypeName (GivesOrErrno t) = cTypeName t
+resultTypeName DoneOrErrno = "int"
+
+-- (the function's type as described, `int (const char *, mode_t)`)
+funTypeName : Glue.Binding -> String
+funTypeName b =
+  resultTypeName b.result
+  ^ " ("
+  ^ (if List.null b.args then "void"
+     else joinWith ", " (List.map cTypeName b.args))
+  ^ ")"
+
+glueName : String -> String -> String
+glueName leaf what = "heff_ffi_" ^ leaf ^ "_" ^ what
+
+-- (the pointer types released, each once, in order: a let-go function each)
+pointersGo : List (Pair String String)
+           -> List Glue.CType
+           -> List (Pair String String)
+pointersGo acc Nil = List.reverse acc
+pointersGo acc (Cons (CPointer t r) rest) =
+  if List.any
+       (\(q : Pair String String) -> strEq (fst q) t && strEq (snd q) r)
+       acc
+  then pointersGo acc rest
+  else pointersGo (Cons (MkPair t r) acc) rest
+pointersGo acc (Cons _ rest) = pointersGo acc rest
+
+resultCType : Glue.CResult -> List Glue.CType
+resultCType (Gives t) = Cons t Nil
+resultCType (GivesOrErrno t) = Cons t Nil
+resultCType DoneOrErrno = Nil
+
+typesOf : List Glue.Binding -> List Glue.CType
+typesOf bs =
+  List.concatMap
+    (\(b : Glue.Binding) -> List.append b.args (resultCType b.result))
+    bs
+
+pointersOf : List Glue.Binding -> List (Pair String String)
+pointersOf bs = pointersGo Nil (typesOf bs)
+
+letGoIndexGo : Int -> List (Pair String String) -> String -> String -> Int
+letGoIndexGo i Nil t r = 0
+letGoIndexGo i (Cons (MkPair t2 r2) rest) t r =
+  if strEq t t2 && strEq r r2 then i else letGoIndexGo (i + 1) rest t r
+
+-- (the let-go function of a pointer type)
+letGoOf : String -> List (Pair String String) -> String -> String -> String
+letGoOf leaf ptrs t r =
+  glueName leaf ("let_go_" ^ show (letGoIndexGo 0 ptrs t r))
+
+failsErrno : Glue.CResult -> Bool
+failsErrno (Gives _) = False
+failsErrno (GivesOrErrno _) = True
+failsErrno DoneOrErrno = True
+
+isOwned : Glue.CType -> Bool
+isOwned COwnedString = True
+isOwned _ = False
+
+isBoolC : Glue.CType -> Bool
+isBoolC CBool = True
+isBoolC _ = False
+
+isStringArg : Glue.CType -> Bool
+isStringArg CString = True
+isStringArg CText = True
+isStringArg _ = False
+
+-- (the argument `i` of a field, as its C type, `a<i>`)
+argLine : Int -> Glue.CType -> String
+argLine i (CInteger t) =
+  "    "
+  ^ t
+  ^ " a"
+  ^ show i
+  ^ " = ("
+  ^ t
+  ^ ")heff_int_low64(heff_field(p, "
+  ^ show i
+  ^ "));"
+argLine i CDouble =
+  "    V t"
+  ^ show i
+  ^ " = heff_tget_v(p, "
+  ^ show i
+  ^ "); double a"
+  ^ show i
+  ^ " = FLT_OF(t"
+  ^ show i
+  ^ "); heff_drop(t"
+  ^ show i
+  ^ ");"
+argLine i CBool =
+  "    bool a" ^ show i ^ " = heff_field(p, " ^ show i ^ ") == NTAG(TAG_True);"
+argLine i CString =
+  "    char *a" ^ show i ^ " = heff_cstr(heff_field(p, " ^ show i ^ "));"
+argLine i CText =
+  "    char *a" ^ show i ^ " = heff_cstr_text(heff_field(p, " ^ show i ^ "));"
+argLine i (CPointer t _) =
+  "    "
+  ^ t
+  ^ " *a"
+  ^ show i
+  ^ " = heff_foreign_ptr(heff_field(p, "
+  ^ show i
+  ^ "));"
+argLine i _ = ""
+
+argLines : Int -> List Glue.CType -> List String
+argLines i Nil = Nil
+argLines i (Cons t rest) = Cons (argLine i t) (argLines (i + 1) rest)
+
+-- (the strings among the arguments: checked for a NUL, freed after)
+stringArgsGo : Int -> List Glue.CType -> List Int
+stringArgsGo i Nil = Nil
+stringArgsGo i (Cons t rest) =
+  if isStringArg t then Cons i (stringArgsGo (i + 1) rest)
+  else stringArgsGo (i + 1) rest
+
+glueCallOf : Glue.Binding -> String
+glueCallOf b =
+  b.fun
+  ^ "("
+  ^ joinWith
+    ", "
+    (List.map (\i -> "a" ^ show i) (List.range 0 (List.length b.args - 1)))
+  ^ ")"
+
+-- (whether a result of this type is NULL where there is none)
+nullable : Glue.CType -> Bool
+nullable CString = True
+nullable CText = True
+nullable COwnedString = True
+nullable (CPointer _ _) = True
+nullable _ = False
+
+-- (the result `c` as the answer's value)
+convOf : String -> List (Pair String String) -> Glue.CType -> String
+convOf leaf ptrs (CInteger _) = "heff_int((int64_t)c)"
+convOf leaf ptrs CDouble = "heff_flt((double)c)"
+convOf leaf ptrs CBool = "NTAG(c ? TAG_True : TAG_False)"
+convOf leaf ptrs CString = "heff_str_bytes(c, (int64_t)strlen(c))"
+convOf leaf ptrs CText = "heff_str_text(c)"
+convOf leaf ptrs COwnedString = glueName leaf "owned" ^ "(c)"
+convOf leaf ptrs (CPointer t r) =
+  "heff_foreign(c, " ^ letGoOf leaf ptrs t r ^ ")"
+convOf leaf ptrs CVoid = "NTAG(TAG_MkUnit)"
+
+-- (the call, and `r` of its result, as the result is described)
+resultLines : String
+            -> String
+            -> List (Pair String String)
+            -> Glue.Binding
+            -> List String
+resultLines md leaf ptrs b = case b.result of
+  Gives CVoid -> ["      " ^ glueCallOf b ^ ";", "      r = NTAG(TAG_MkUnit);"]
+  Gives t ->
+    List.append
+      ["      " ^ cTypeName t ^ " c = " ^ glueCallOf b ^ ";"]
+      (List.append
+         (if nullable t
+          then [ "      if (!c) heff_fail(\""
+               ^ md
+               ^ ": `"
+               ^ b.tag
+               ^ "`: C gave NULL\");"
+               ]
+          else Nil)
+         ["      r = " ^ convOf leaf ptrs t ^ ";"])
+  GivesOrErrno t ->
+    [ "      " ^ cTypeName t ^ " c = " ^ glueCallOf b ^ ";"
+    , "      r = "
+    ^ (if nullable t then "!c" else "c == -1")
+    ^ " ? "
+    ^ glueName leaf "left"
+    ^ "(errno) : "
+    ^ glueName leaf "right"
+    ^ "("
+    ^ convOf leaf ptrs t
+    ^ ");"
+    ]
+  DoneOrErrno ->
+    [ "      int c = " ^ glueCallOf b ^ ";"
+    , "      r = c == 0 ? "
+    ^ glueName leaf "right"
+    ^ "(NTAG(TAG_MkUnit)) : "
+    ^ glueName leaf "left"
+    ^ "(errno);"
+    ]
+
+-- (where a string given has a NUL in it: the operation fails the
+-- system's way, `EINVAL`, where it can; else the program)
+nulLines : String -> String -> Glue.Binding -> List String
+nulLines md leaf b =
+  if failsErrno b.result
+  then ["      r = " ^ glueName leaf "left" ^ "(EINVAL);"]
+  else [ "      heff_fail(\""
+       ^ md
+       ^ ": `"
+       ^ b.tag
+       ^ "`: a string with a NUL in it, given to C\");"
+       , "      r = 0;"
+       ]
+
+-- (the answer given: to the last field, a function, or the last field
+-- itself)
+answerLines : Glue.Binding -> List String
+answerLines b =
+  if b.answered
+  then [ "    V f = heff_dup(heff_field(p, " ^ show (List.length b.args) ^ "));"
+       , "    heff_drop(p);"
+       , "    V x = heff_answer(f, r);"
+       , "    return heff_tail(k, 1, &x);"
+       ]
+  else [ "    V x = heff_dup(heff_field(p, " ^ show (List.length b.args) ^ "));"
+       , "    heff_drop(p);"
+       , "    (void)r;"
+       , "    return heff_tail(k, 1, &x);"
+       ]
+
+-- (an operation's case: the fields as C, the call, the strings freed, the answer)
+caseLines : String
+          -> String
+          -> List (Pair String String)
+          -> Glue.Binding
+          -> List String
+caseLines md leaf ptrs b =
+  List.append
+    (Cons ("  case TAG_" ^ mangle b.tag ^ ": {") (argLines 0 b.args))
+    (List.append
+       (Cons "    V r;" Nil)
+       (List.append
+          (case stringArgsGo 0 b.args of
+           Nil ->
+             List.map
+               (\l -> strSlice l 2 (strLength l))
+               (resultLines md leaf ptrs b)
+           is ->
+             List.append
+               (Cons
+                  ("    if ("
+                   ^ joinWith " || " (List.map (\i -> "!a" ^ show i) is)
+                   ^ ") {")
+                  (nulLines md leaf b))
+               (List.append
+                  (Cons "    } else {" (resultLines md leaf ptrs b))
+                  (Cons
+                     "    }"
+                     (List.map (\i -> "    free(a" ^ show i ^ ");") is))))
+          (List.append (answerLines b) (Cons "  }" Nil))))
+
+-- (what the C compiler checks: the function's type as the header has it,
+-- against the type described)
+assertLine : String -> Glue.Binding -> String
+assertLine md b =
+  "_Static_assert(__builtin_types_compatible_p(__typeof__("
+  ^ b.fun
+  ^ "), "
+  ^ funTypeName b
+  ^ "), \""
+  ^ md
+  ^ " describes `"
+  ^ b.fun
+  ^ "` as `"
+  ^ funTypeName b
+  ^ "`, which it is not\");"
+
+letGoLines : String -> Int -> List (Pair String String) -> List String
+letGoLines leaf i Nil = Nil
+letGoLines leaf i (Cons (MkPair t r) rest) =
+  Cons
+    ("static void "
+     ^ glueName leaf ("let_go_" ^ show i)
+     ^ "(void *q) { "
+     ^ r
+     ^ "(("
+     ^ t
+     ^ " *)q); }")
+    (letGoLines leaf (i + 1) rest)
+
+-- (the glue's own helpers, those it uses: the errno record's shape and
+-- `Left`/`Right` of it, a malloc'd string taken, each pointer type's
+-- let-go function)
+helperLines : Glue.Glue -> List (Pair String String) -> List String
+helperLines gl ptrs =
+  List.append
+    (if List.any (\(b : Glue.Binding) -> failsErrno b.result) gl.ops
+     then [ "static uint32_t "
+          ^ glueName gl.leaf "errno"
+          ^ "[3] = { LBL_code, LBL_name, LBL_message };"
+          , "static V "
+          ^ glueName gl.leaf "left"
+          ^ "(int err) { V e = heff_errno(err, "
+          ^ glueName gl.leaf "errno"
+          ^ "); return heff_tag(TAG_Left, 1, &e); }"
+          , "static V "
+          ^ glueName gl.leaf "right"
+          ^ "(V x) { return heff_tag(TAG_Right, 1, &x); }"
+          ]
+     else Nil)
+    (List.append
+       (if List.any isOwned (typesOf gl.ops)
+        then [ "static V "
+             ^ glueName gl.leaf "owned"
+             ^ "(char *c) { V s = heff_str_bytes(c, (int64_t)strlen(c)); free(c); return s; }"
+             ]
+        else Nil)
+       (letGoLines gl.leaf 0 ptrs))
+
+-- | a leaf's glue, as a provider's text: its module's description made C
+glueProvider : Glue.Glue -> Emit.Provider
+glueProvider gl =
+  { module = gl.module
+  , text =
+      joinWith
+        "\n"
+        (List.append
+           [ "// "
+           ^ gl.module
+           ^ "'s `"
+           ^ gl.leaf
+           ^ "` in C, as the module describes it: made by the compiler."
+           ]
+           (List.append
+              (List.map (\h -> "#include " ^ h) gl.includes)
+              (List.append
+                 (if List.any isBoolC (typesOf gl.ops)
+                  then ["#include <stdbool.h>"]
+                  else Nil)
+                 (List.append
+                    (List.map (assertLine gl.module) gl.ops)
+                    (List.append
+                       (helperLines gl (pointersOf gl.ops))
+                       (List.append
+                          (Cons
+                             ("static V heff_described_"
+                              ^ gl.leaf
+                              ^ "(V p, V k) {")
+                             (Cons
+                                "  switch (heff_tag_of(p)) {"
+                                (List.concatMap
+                                   (caseLines
+                                      gl.module
+                                      gl.leaf
+                                      (pointersOf gl.ops))
+                                   gl.ops)))
+                          (List.append
+                             [ "  default:"
+                             , "    heff_fail(\"not an operation of "
+                             ^ gl.leaf
+                             ^ " that C does\");"
+                             , "    return 0;"
+                             , "  }"
+                             , "}"
+                             ]
+                             (if gl.entry
+                              then [ "static V heff_provider_"
+                                   ^ gl.leaf
+                                   ^ "(V p, V k) { return heff_described_"
+                                   ^ gl.leaf
+                                   ^ "(p, k); }"
+                                   ]
+                              else Nil))))))))
+  }
 
 -- The program
 --------------------------------------------------------------------------------
