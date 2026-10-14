@@ -145,6 +145,17 @@ typedef struct { V f[4]; } HeffT4;
 #define HEFF_SLOW HEFF_FN __attribute__((noinline, cold))
 #define HEFF_LIKELY(c) __builtin_expect(!!(c), 1)
 
+// The runtime's part in Zig: built by zig into an object of its own and
+// linked with the program, each function by the C ABI, given C's plain
+// types and leaving allocating and counting to the C here; called, never
+// inlined into the program's code.
+// (UTF-8: a rune read, the maximal subpart of what is not UTF-8 read as
+// U+FFFD, as WHATWG's decoder reads it; a code point's bytes written;
+// how long bytes are made text)
+int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out);
+int heff_u8_encode(uint8_t *o, uint32_t u);
+int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own);
+
 // the tags the runtime knows; a program's own are numbered after them
 enum {
   TAG_True, TAG_False, TAG_Nil, TAG_Cons, TAG_MkUnit, TAG_Just, TAG_Nothing,
@@ -2223,59 +2234,10 @@ HEFF_FN V heff_str_of(const void *c, int64_t n) {
   return (V)s;
 }
 
-// (the rune whose bytes start at `p`, `n` bytes there: how many bytes
-// it takes, the rune `*out`.  What is not UTF-8 is U+FFFD, of as many
-// bytes as start a rune's and go on as one's would, at least one -- the
-// "maximal subpart" WHATWG's decoder takes, as TextDecoder does: after
-// a first byte that starts a rune (C2 to F4), the k-th that does not go
-// on as its (a second byte of E0, ED, F0 and F4 in their own ranges,
-// Unicode's table 3-7) makes one U+FFFD of the k before it; a byte that
-// starts none is one)
-HEFF_FN int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out) {
-  uint8_t b = p[0];
-  if (b < 0x80) { *out = b; return 1; }
-  int w; uint32_t u, lo = 0x80, hi = 0xBF;
-  if (b >= 0xC2 && b <= 0xDF) { w = 2; u = b & 0x1F; }
-  else if (b >= 0xE0 && b <= 0xEF) { w = 3; u = b & 0x0F; if (b == 0xE0) lo = 0xA0; else if (b == 0xED) hi = 0x9F; }
-  else if (b >= 0xF0 && b <= 0xF4) { w = 4; u = b & 0x07; if (b == 0xF0) lo = 0x90; else if (b == 0xF4) hi = 0x8F; }
-  else { *out = 0xFFFD; return 1; }
-  for (int k = 1; k < w; k++) {
-    if (k >= n) { *out = 0xFFFD; return k; }
-    uint8_t c = p[k];
-    if (c < (k == 1 ? lo : 0x80) || c > (k == 1 ? hi : 0xBF)) { *out = 0xFFFD; return k; }
-    u = (u << 6) | (c & 0x3F);
-  }
-  *out = u;
-  return w;
-}
-
-// (a scalar value's UTF-8 bytes, at `o`: how many)
-HEFF_FN int heff_u8_encode(uint8_t *o, uint32_t u) {
-  if (u < 0x80) { o[0] = (uint8_t)u; return 1; }
-  if (u < 0x800) { o[0] = (uint8_t)(0xC0 | (u >> 6)); o[1] = (uint8_t)(0x80 | (u & 0x3F)); return 2; }
-  if (u < 0x10000) { o[0] = (uint8_t)(0xE0 | (u >> 12)); o[1] = (uint8_t)(0x80 | ((u >> 6) & 0x3F)); o[2] = (uint8_t)(0x80 | (u & 0x3F)); return 3; }
-  o[0] = (uint8_t)(0xF0 | (u >> 18)); o[1] = (uint8_t)(0x80 | ((u >> 12) & 0x3F)); o[2] = (uint8_t)(0x80 | ((u >> 6) & 0x3F)); o[3] = (uint8_t)(0x80 | (u & 0x3F));
-  return 4;
-}
-
 // (whether the `w` bytes from `p`, read as `u`, are a rune's: not U+FFFD
 // read for what is not UTF-8)
 static inline int heff_u8_own(const uint8_t *p, uint32_t u, int w) {
   return u != 0xFFFD || (w == 3 && p[0] == 0xEF && p[1] == 0xBF && p[2] == 0xBD);
-}
-
-// (how many bytes `n` bytes are, made text, what is not UTF-8 in them
-// U+FFFD; as many, where they are UTF-8)
-HEFF_FN int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own) {
-  int64_t m = 0;
-  *own = 1;
-  for (int64_t i = 0; i < n;) {
-    uint32_t u;
-    int w = heff_u8_decode(p + i, n - i, &u);
-    if (heff_u8_own(p + i, u, w)) m += w; else { *own = 0; m += 3; }
-    i += w;
-  }
-  return m;
 }
 
 // (`n` bytes, made text: what is not UTF-8 in them U+FFFD, as
