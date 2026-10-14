@@ -139,7 +139,9 @@ backend's, each scenario in a directory of its own (`heff test
 test/cache.hf test/backcache.hf`, `--run cache/instances` for one).
 The progress tests draw `heff build` on a pseudo-terminal of the tests'
 (a small C program, built by the test) and hold what is left on the
-screen to what it says without one (`heff test test/progress.hf`).
+screen to what it says without one (`heff test test/progress.hf`); the
+terminal tests type keys at its commands' app there (`heff test
+test/terminal.hf`).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.
