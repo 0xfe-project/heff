@@ -47,25 +47,14 @@ checks the doc test of `map`.
 
 ## Installing
 
-A [release](https://github.com/dannypsnl/heff/releases) has heff for
-Linux, macOS and Windows, a program needing nothing installed:
-
-```sh
-tar xzf heff-0.3.0-linux-x64.tar.gz
-heff-0.3.0-linux-x64/bin/heff help
-```
-
-From the repository, with [zig](https://ziglang.org/download/) and
-make (Node.js only for some of the tests):
+With [zig](https://ziglang.org/download/) and make (Node.js only for
+some of the tests):
 
 ```sh
 make install               # build .heff/out/heff, then install it into ~/.heff/bin/
 ```
 
 Put `~/.heff/bin` on your `PATH`.
-
-With Nix, `nix run github:dannypsnl/heff` runs heff, `nix profile
-install github:dannypsnl/heff` installs it.
 
 ## Using it
 
