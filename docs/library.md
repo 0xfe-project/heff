@@ -61,6 +61,9 @@ are imported by their names:
   benchmarks ([benchmarks.md](benchmarks.md));
 - `manifest`, the types of `package.hf` and `build.hf`
   ([projects.md](projects.md));
+- `ffi`, C's types as values, by which an effect's module says which
+  of its operations C functions do, the compiler making that side of
+  the provider ([providers.md](providers.md#operations-described-in-c));
 - the fixed-width numbers' `int8` to `int64`, `uint8` to `uint64` and
   `float32`, `int` with an `Int`'s bits, and `rune` with a `Rune`'s
   operations ([numbers](language.md#numbers),
