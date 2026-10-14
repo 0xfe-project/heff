@@ -1,0 +1,224 @@
+-- Regular expressions, a small part of RE2's (Go's) syntax, matched
+-- anywhere in a string as Go's `MatchString` matches: what `heff test
+-- --run` selects tests by.  A pattern is read once (`compile`), and
+-- what it does not have is an error, not a literal, so that a pattern
+-- means the same once more of the syntax is read.
+--
+-- - a byte stands for itself; `.` for any byte;
+-- - `[abc]`, `[a-z0-9]`: one byte of the class; `[^...]`: one not of it;
+-- - `\` before a byte that is not a letter or a digit: that byte
+--   (`\.`, `\[`, `\\`);
+-- - after an atom, `*` (any number of it), `+` (one or more), `?` (one
+--   or none);
+-- - `^` first: at the start only; `$` last: at the end only;
+-- - `a|b`: either, the whole pattern's (there are no groups).
+--
+-- It is read by bytes: `.` and a class match one byte, not one rune of
+-- UTF-8.  Groups `(...)`, counts `{n}`, `\d` and its kind are not read.
+
+-- | What one byte is held to: any, one, or one of (or, `True`, not of)
+-- | ranges of bytes.
+data Atom = AnyByte | Byte Int | Class Bool (List (Pair Int Int))
+
+-- | An atom, once, once or not, any number of times, or one or more.
+data Piece = Once Atom | Optional Atom | Many Atom | Some Atom
+
+-- | One alternative: whether it is held to the start, its pieces, and
+-- | whether it is held to the end.
+type Branch = { start : Bool, pieces : List Piece, end : Bool }
+
+-- | A pattern read: its alternatives.
+data Regex = MkRegex (List Branch)
+
+-- Reading
+--------------------------------------------------------------------------------
+
+isLetterOrDigit : Int -> Bool
+isLetterOrDigit c =
+  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+
+-- (the byte at `i`, written as itself)
+byteText : String -> Int -> String
+byteText s i = strSlice s i (i + 1)
+
+-- (the string cut at each `sep` that is not escaped nor in a class)
+splitGo : Int -> String -> Int -> Int -> Bool -> List String -> List String
+splitGo sep s from i inClass acc =
+  if i >= strLength s then List.reverse (Cons (strSlice s from i) acc)
+  else if byteAt s i == 92 then splitGo sep s from (i + 2) inClass acc
+  else if inClass then splitGo sep s from (i + 1) (byteAt s i /= 93) acc
+  else if byteAt s i == 91 then splitGo sep s from (i + 1) True acc
+  else if byteAt s i == sep
+  then splitGo sep s (i + 1) (i + 1) False (Cons (strSlice s from i) acc)
+  else splitGo sep s from (i + 1) False acc
+
+-- | The pattern cut at each byte `sep` that is not escaped (`\`) nor in
+-- | a class (`[...]`).
+-- | >>> splitOutside 124 "a|b[|]|c\\|d"
+-- | ["a", "b[|]", "c\\|d"]
+splitOutside : Int -> String -> List String
+splitOutside sep s = splitGo sep s 0 0 False Nil
+
+-- (a byte of a class at `i`, escaped or not, and where it ends)
+classByte : String -> Int -> Either String (Pair Int Int)
+classByte s i =
+  if i >= strLength s then Left "a `[` with no `]`"
+  else if byteAt s i /= 92 then Right (MkPair (byteAt s i) (i + 1))
+  else if i + 1 >= strLength s then Left "a `\\` at the end"
+  else if isLetterOrDigit (byteAt s (i + 1))
+  then Left
+      ("`\\"
+       ^ byteText s (i + 1)
+       ^ "` is not read: escape only what is not a letter or a digit")
+  else Right (MkPair (byteAt s (i + 1)) (i + 2))
+
+-- (a class's ranges from `i` to its `]`, backwards, and where it ends)
+classFrom : String
+          -> Int
+          -> List (Pair Int Int)
+          -> Either String (Pair (List (Pair Int Int)) Int)
+classFrom s i acc =
+  if i >= strLength s then Left "a `[` with no `]`"
+  else if byteAt s i == 93
+  then (if List.null acc then Left "an empty class, `[]`"
+        else Right (MkPair acc (i + 1)))
+  else case classByte s i of
+    Left why -> Left why
+    Right (MkPair lo j) ->
+      if j + 1 < strLength s && byteAt s j == 45 && byteAt s (j + 1) /= 93
+      then (case classByte s (j + 1) of
+            Left why -> Left why
+            Right (MkPair hi k) ->
+              if hi < lo then Left "a range of a class backwards"
+              else classFrom s k (Cons (MkPair lo hi) acc))
+      else classFrom s j (Cons (MkPair lo lo) acc)
+
+-- (a class, `i` just after its `[`)
+classAt : String -> Int -> Either String (Pair Atom Int)
+classAt s i =
+  if i < strLength s && byteAt s i == 94
+  then (case classFrom s (i + 1) Nil of
+        Left why -> Left why
+        Right (MkPair rs j) -> Right (MkPair (Class True rs) j))
+  else case classFrom s i Nil of
+    Left why -> Left why
+    Right (MkPair rs j) -> Right (MkPair (Class False rs) j)
+
+-- (the atom at `i`, and where it ends)
+atomAt : String -> Int -> Either String (Pair Atom Int)
+atomAt s i =
+  if byteAt s i == 46 then Right (MkPair AnyByte (i + 1))
+  else if byteAt s i == 91 then classAt s (i + 1)
+  else if byteAt s i == 92
+  then (case classByte s i of
+        Left why -> Left why
+        Right (MkPair b j) -> Right (MkPair (Byte b) j))
+  else if byteAt s i == 40 || byteAt s i == 41
+  then Left "groups, `(...)`, are not read"
+  else if byteAt s i == 123 || byteAt s i == 125
+  then Left "counts, `{n}`, are not read"
+  else if byteAt s i == 42 || byteAt s i == 43 || byteAt s i == 63
+  then Left ("a `" ^ byteText s i ^ "` with nothing before it to repeat")
+  else if byteAt s i == 94 then Left "a `^` not at the start"
+  else if byteAt s i == 36 then Left "a `$` not at the end"
+  else Right (MkPair (Byte (byteAt s i)) (i + 1))
+
+-- (the atom, repeated as the byte after it says, and where it ends)
+repeated : String -> Atom -> Int -> Pair Piece Int
+repeated s a i =
+  if i >= strLength s then MkPair (Once a) i
+  else if byteAt s i == 42 then MkPair (Many a) (i + 1)
+  else if byteAt s i == 43 then MkPair (Some a) (i + 1)
+  else if byteAt s i == 63 then MkPair (Optional a) (i + 1)
+  else MkPair (Once a) i
+
+-- (the pieces of a branch from `i`, backwards; and whether a `$` ends it)
+piecesFrom : String
+           -> Int
+           -> List Piece
+           -> Either String (Pair (List Piece) Bool)
+piecesFrom s i acc =
+  if i >= strLength s then Right (MkPair acc False)
+  else if byteAt s i == 36 && i + 1 == strLength s then Right (MkPair acc True)
+  else case atomAt s i of
+    Left why -> Left why
+    Right (MkPair a j) -> case repeated s a j of
+      MkPair p k -> piecesFrom s k (Cons p acc)
+
+branchOf : String -> Either String Branch
+branchOf b =
+  if startsWith "^" b
+  then (case piecesFrom b 1 Nil of
+        Left why -> Left why
+        Right (MkPair ps end) ->
+          Right { start = True, pieces = List.reverse ps, end = end })
+  else case piecesFrom b 0 Nil of
+    Left why -> Left why
+    Right (MkPair ps end) ->
+      Right { start = False, pieces = List.reverse ps, end = end }
+
+consRead : {a : Type} -> a -> Either String (List a) -> Either String (List a)
+consRead x (Left why) = Left why
+consRead x (Right xs) = Right (Cons x xs)
+
+-- (each read, or the first that could not be)
+allRead : {a : Type} -> List (Either String a) -> Either String (List a)
+allRead Nil = Right Nil
+allRead (Cons (Left why) rest) = Left why
+allRead (Cons (Right x) rest) = consRead x (allRead rest)
+
+-- | The pattern read, or what is wrong with it.
+-- | >>> List.map (\p -> either (\why -> why) (\r -> "read") (compile p)) ["a.c", "[a-", "x(y)", "*", "a**"]
+-- | ["read", "a `[` with no `]`", "groups, `(...)`, are not read", "a `*` with nothing before it to repeat", "a `*` with nothing before it to repeat"]
+compile : String -> Either String Regex
+compile p = case allRead (List.map branchOf (splitOutside 124 p)) of
+  Left why -> Left why
+  Right bs -> Right (MkRegex bs)
+
+-- | The pattern read in levels, cut at each `/` that is not escaped nor
+-- | in a class (Go's `-run A/B`, a level a pattern): each level read, or
+-- | what is wrong with the first that is not.
+compileLevels : String -> Either String (List Regex)
+compileLevels p = allRead (List.map compile (splitOutside 47 p))
+
+-- Matching
+--------------------------------------------------------------------------------
+
+inRanges : Int -> List (Pair Int Int) -> Bool
+inRanges c rs = List.any (\(r : Pair Int Int) -> c >= fst r && c <= snd r) rs
+
+atomMatches : Atom -> Int -> Bool
+atomMatches AnyByte c = True
+atomMatches (Byte b) c = b == c
+atomMatches (Class True rs) c = not (inRanges c rs)
+atomMatches (Class False rs) c = inRanges c rs
+
+-- (the atom holds of the byte at `i`, there being one)
+atomOn : Atom -> String -> Int -> Bool
+atomOn a s i = i < strLength s && atomMatches a (byteAt s i)
+
+-- (the pieces match from `i` on, up to the end if `end`)
+matchAt : String -> Bool -> List Piece -> Int -> Bool
+matchAt s end Nil i = not end || i == strLength s
+matchAt s end (Cons (Once a) rest) i =
+  atomOn a s i && matchAt s end rest (i + 1)
+matchAt s end (Cons (Optional a) rest) i =
+  (atomOn a s i && matchAt s end rest (i + 1)) || matchAt s end rest i
+matchAt s end (Cons (Many a) rest) i =
+  matchAt s end rest i
+  || (atomOn a s i && matchAt s end (Cons (Many a) rest) (i + 1))
+matchAt s end (Cons (Some a) rest) i =
+  atomOn a s i && matchAt s end (Cons (Many a) rest) (i + 1)
+
+-- (the branch matches from some place of the string, the start only if
+-- it is held to it)
+branchMatches : String -> Branch -> Bool
+branchMatches s b =
+  if b.start then matchAt s b.end b.pieces 0
+  else List.any (\i -> matchAt s b.end b.pieces i) (List.range 0 (strLength s))
+
+-- | Whether the pattern matches somewhere in the string.
+-- | >>> List.map (\(p : Pair String String) -> either (\why -> False) (\r -> matches r (snd p)) (compile (fst p))) [MkPair "^lsp" "lsp hover", MkPair "^lsp" "the lsp", MkPair "hover$" "lsp hover", MkPair "a.c" "xabcx", MkPair "^a[0-9]+b$" "a12b", MkPair "^a[0-9]+b$" "ab", MkPair "x|^y" "y", MkPair "" "anything", MkPair "[^a-z]" "abc", MkPair "a\\.b" "axb"]
+-- | [True, False, True, True, True, False, True, True, False, False]
+matches : Regex -> String -> Bool
+matches (MkRegex bs) s = List.any (\b -> branchMatches s b) bs

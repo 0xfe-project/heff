@@ -1203,6 +1203,22 @@ static V heff_provider_process(V p, V k) {
     V x = heff_answer(f, heff_str_text(pl));
     return heff_tail(k, 1, &x);
   }
+  case TAG_Processors: {
+    V f = heff_dup(heff_field(p, 0));
+    heff_drop(p);
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int64_t n = si.dwNumberOfProcessors > 0 ? (int64_t)si.dwNumberOfProcessors : 1;
+#elif defined(_SC_NPROCESSORS_ONLN)
+    long c = sysconf(_SC_NPROCESSORS_ONLN);
+    int64_t n = c > 0 ? (int64_t)c : 1;
+#else
+    int64_t n = 1;
+#endif
+    V x = heff_answer(f, MK_INT(n));
+    return heff_tail(k, 1, &x);
+  }
   case TAG_Exit: {
     int code = (int)INT_OF(heff_field(p, 0));
     fflush(stdout);
