@@ -132,10 +132,12 @@ in it, a process of its own.  Each is run in a new, empty directory of
 its own (where the system keeps temporary ones), its working directory,
 removed after it; and each has a time limit, a minute unless `within MS`
 says otherwise, at which its process is killed and the test fails.
-Integration tests run at once, as many as `--jobs N` says, else
-`HEFF_TEST_JOBS`, else half the machine's cores (at least one), so that
-a run of the tests does not take all of it.  Their lines come after
-those of the file's other tests.  Each has, in its environment, `HEFF`,
+Integration tests run at once, those of all the files given in one
+pool, as many as `--jobs N` says, else `HEFF_TEST_JOBS`, else half the
+machine's cores (at least one), so that a run of the tests does not
+take all of it.  Their lines come after those of the file's other
+tests, and a file that has some is reported after the files that have
+none, in their order.  Each has, in its environment, `HEFF`,
 the path of the heff that runs it, and `HEFF_TEST_ROOT`, the project's
 root: a test of heff runs the heff tested, not one on the PATH, on the
 project's files (`run { command = heff, args = ..., dir = root }`).

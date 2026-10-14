@@ -3047,11 +3047,25 @@ ranSubtests r = case indexOf ("\n" ^ outcomeMarker ^ "\n") r.out of
   Nothing -> Nil
   Just _ -> subtestsOfJson (Json.parse (writtenAfter r))
 
--- | an integration test to run: its place among the file's (a subtest's,
--- | its test's place and its own among the test's subtests), the name
--- | of the test it is or is under, the names of the subtests down to it,
--- | and its time limit
-type Job = { place : List Int, top : String, path : List String, limit : Int }
+-- | what runs the integration tests: their program, and what is set in
+-- | its environment -- `HEFF`, the heff that runs them, and
+-- | `HEFF_TEST_ROOT`, the project's root, so that a test of heff runs
+-- | the heff tested, on the project's files
+type Launch = { program : String, env : List (Pair String String) }
+
+-- | an integration test to run: the file it is of (its place among those
+-- | run), what runs it, its place among the file's (a subtest's, its
+-- | test's place and its own among the test's subtests), the name of the
+-- | test it is or is under, the names of the subtests down to it, and its
+-- | time limit
+type Job =
+  { owner : Int
+  , launch : Launch
+  , place : List Int
+  , top : String
+  , path : List String
+  , limit : Int
+  }
 
 -- | an integration test's name: its test's, and the subtests' down to it
 jobName : Job -> String
@@ -3078,7 +3092,9 @@ subtestJobs sel j k Nil = Nil
 subtestJobs sel j k (Cons n rest) =
   if levelsSelected sel (List.append (jobLevels j) [n])
   then Cons
-      { place = List.append j.place [k]
+      { owner = j.owner
+      , launch = j.launch
+      , place = List.append j.place [k]
       , top = j.top
       , path = List.append j.path [n]
       , limit = j.limit
@@ -3089,31 +3105,30 @@ subtestJobs sel j k (Cons n rest) =
 -- | an integration test running: its program, and its directory
 type Running = { job : Job, proc : Subprocess, dir : String }
 
--- (what came of a test, at its place, and its subtests to run next)
+-- (what came of a test, of its file, at its place, and its subtests to
+-- run next)
 type Finished =
-  { place : List Int, outcome : Driver.TestOutcome, next : List Job }
-
--- | what runs the integration tests: their program, and what is set in
--- | its environment -- `HEFF`, the heff that runs them, and
--- | `HEFF_TEST_ROOT`, the project's root, so that a test of heff runs
--- | the heff tested, on the project's files
-type Launch = { program : String, env : List (Pair String String) }
+  { owner : Int
+  , place : List Int
+  , outcome : Driver.TestOutcome
+  , next : List Job
+  }
 
 -- (the test's program started, in a new directory of its own, given its
 -- time limit; else what came of it)
 startJob : {e : HFunctor}
          -> {{sys : process <: e}}
          -> {{disk : filesystem <: e}}
-         -> Launch
          -> Job
          -> Co e (Either Finished Running)
-startJob launch j = do
+startJob j = do
   made <- temporaryDirectory "heff-test-"
   case made of
     Left err ->
       pure
         (Left
-           { place = j.place
+           { owner = j.owner
+           , place = j.place
            , outcome =
                brokenTest (jobName j) ("no directory for it: " ^ err.message)
            , next = Nil
@@ -3121,10 +3136,10 @@ startJob launch j = do
     Right dir -> do
       started <-
         start
-          { command = launch.program
+          { command = j.launch.program
           , args = Cons j.top j.path
           , dir = dir
-          , env = launch.env
+          , env = j.launch.env
           , timeout = j.limit
           }
       case started of
@@ -3132,7 +3147,8 @@ startJob launch j = do
           gone <- remove dir
           pure
               (Left
-                 { place = j.place
+                 { owner = j.owner
+                 , place = j.place
                  , outcome =
                      brokenTest (jobName j) "its program could not be run"
                  , next = Nil
@@ -3163,7 +3179,8 @@ endedJob sel rs (Just (MkPair proc ran)) = case List.find
   Just r -> do
     gone <- remove r.dir
     pure
-        [ { place = r.job.place
+        [ { owner = r.job.owner
+          , place = r.job.place
           , outcome = ranOutcome (jobName r.job) r.job.limit ran
           , next = subtestJobs sel r.job 0 (ranSubtests ran)
           }
@@ -3178,53 +3195,57 @@ stillRunning rs (Just (MkPair proc ran)) =
 nextJobs : List Finished -> List Job
 nextJobs fs = List.concatMap (\(f : Finished) -> f.next) fs
 
--- | the integration tests run, `jobs` at most at once, each its program
--- | in a directory of its own: as one ends, the next starts, and the
--- | subtests it named, those `sel` selects, wait after the others
+-- | the integration tests run, of all the files, `jobs` at most at once,
+-- | each its program in a directory of its own: as one ends, the next
+-- | starts, and the subtests it named, those `sel` selects, wait after
+-- | the others
 runJobs : {e : HFunctor}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
-        -> Launch
         -> List Regex.Regex
         -> Int
         -> List Job
         -> List Running
         -> List Finished
         -> Co e (List Finished)
-runJobs launch sel jobs Nil Nil done = pure done
-runJobs launch sel jobs Nil running done = do
+runJobs sel jobs Nil Nil done = pure done
+runJobs sel jobs Nil running done = do
   w <- waitAny (List.map (\(r : Running) -> r.proc) running)
   ended <- endedJob sel running w
   runJobs
-      launch
       sel
       jobs
       (nextJobs ended)
       (stillRunning running w)
       (List.append ended done)
-runJobs launch sel jobs (Cons j rest) running done =
+runJobs sel jobs (Cons j rest) running done =
   if List.length running < jobs
   then do
-    s <- startJob launch j
-    runJobs launch sel jobs rest (runningWith s running) (finishedWith s done)
+    s <- startJob j
+    runJobs sel jobs rest (runningWith s running) (finishedWith s done)
   else do
     w <- waitAny (List.map (\(r : Running) -> r.proc) running)
     ended <- endedJob sel running w
     runJobs
-        launch
         sel
         jobs
         (List.append (Cons j rest) (nextJobs ended))
         (stillRunning running w)
         (List.append ended done)
 
--- (the tests to run, each at its place)
-jobsOf : Int -> List (Pair String Int) -> List Job
-jobsOf i Nil = Nil
-jobsOf i (Cons (MkPair name limit) rest) =
+-- (the tests of a file to run, the `owner`th, each at its place)
+jobsOf : Int -> Launch -> Int -> List (Pair String Int) -> List Job
+jobsOf owner launch i Nil = Nil
+jobsOf owner launch i (Cons (MkPair name limit) rest) =
   Cons
-    { place = [i], top = name, path = Nil, limit = limit }
-    (jobsOf (i + 1) rest)
+    { owner = owner
+    , launch = launch
+    , place = [i]
+    , top = name
+    , path = Nil
+    , limit = limit
+    }
+    (jobsOf owner launch (i + 1) rest)
 
 -- | is one place before another: a test's before its subtests', and
 -- | those of a test in their order
@@ -3256,77 +3277,6 @@ testDir paths file =
     paths
     (Load.under paths paths.root ".heff/test")
     (joinWith "_" (Path.components paths.style file))
-
--- | the file's integration tests: built, as `heff run` builds, into a
--- | program of the file's (check's `integrationMain` of its tests), each
--- | run by it, `opts.jobs` at once; what came of them given to `k`, in
--- | the file's order
-runIntegrations : {e : HFunctor}
-                -> {{io : stdio <: e}}
-                -> {{sys : process <: e}}
-                -> {{disk : filesystem <: e}}
-                -> {{rep : Report.report <: e}}
-                -> {{prog : Progress.progress <: e}}
-                -> TestOpts
-                -> Pending
-                -> (List Driver.TestOutcome -> Co e Unit)
-                -> Co e Unit
-runIntegrations opts p k = case integrationLoaded p of
-  Left why ->
-    k
-      (List.map
-         (\(i : Pair String Int) -> brokenTest (fst i) why)
-         p.integrations)
-  Right l -> do
-    task <- Progress.start Progress.root (p.file ^ ": integration tests") 2
-    c <- Progress.start task "compiling to C" 0
-    cLoaded
-        l
-        (Just integrationMainName)
-        (testDir l.paths p.file ^ "/")
-        p.file
-        (ended
-           c
-           (zigBuild
-              "heff test"
-              l.paths.style
-              "-O1"
-              task
-              (testDir l.paths p.file)
-              (Load.under
-                 l.paths
-                 (testDir l.paths p.file)
-                 (programFile l.paths.style "main")) (do
-            real <-
-              realPath
-                (Load.under
-                   l.paths
-                   (testDir l.paths p.file)
-                   (programFile l.paths.style "main"))
-            self <- programPath
-            heff <- realPath self
-            root <- realPath l.paths.root
-            done <-
-              runJobs
-                { program = pathOr "" real
-                , env =
-                    [ MkPair "HEFF" (pathOr self heff)
-                    , MkPair "HEFF_TEST_ROOT" (pathOr l.paths.root root)
-                    ]
-                }
-                (patternLevels opts.pattern)
-                opts.jobs
-                (jobsOf 0 p.integrations)
-                Nil
-                Nil
-            Progress.end task
-            k
-                (List.map
-                   (\(f : Finished) -> f.outcome)
-                   (List.sortBy
-                      (\(a : Finished) (b : Finished) ->
-                         placeBefore a.place b.place)
-                      done)))))
 
 -- (a file tested to its end here, its integration tests not run: its
 -- golden texts held, and its line said)
@@ -3369,31 +3319,169 @@ reported opts p os =
   if passedOver opts os then pure noRes
   else testReport p.file p.wrong p.reports os
 
--- (a file tested to its end: its integration tests run, if it has some,
--- its golden texts held, and its line said; then `k` of what it came to)
-finishTested : {e : HFunctor}
+-- | a file whose integration tests are built, to run with the others':
+-- | its place among those run, what came of it here, and what runs them
+type Ready = { at : Int, pending : Pending, launch : Launch }
+
+-- | a file tested: done with, its line said, or its integration tests
+-- | built, to run with all the files'
+data Prepared = Done TestRes | Later Ready
+
+-- (a file's outcomes and those of its integration tests, their golden
+-- texts held, its line said)
+reportedWith : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
              -> {{disk : filesystem <: e}}
              -> {{rep : Report.report <: e}}
-             -> {{prog : Progress.progress <: e}}
              -> TestOpts
-             -> Tested
-             -> (TestRes -> Co e Unit)
-             -> Co e Unit
-finishTested opts (Settled r) k = k r
-finishTested opts (Pend p) k =
+             -> Pending
+             -> List Driver.TestOutcome
+             -> Co e TestRes
+reportedWith opts p more = do
+  os <- withGoldens opts.update p.file (List.append p.outcomes more)
+  reported opts p os
+
+-- | the file's integration tests built, as `heff run` builds, into a
+-- | program of the file's (check's `integrationMain` of its tests), to
+-- | run with the others': its `Ready` given to `k`
+buildIntegrations : {e : HFunctor}
+                  -> {{io : stdio <: e}}
+                  -> {{sys : process <: e}}
+                  -> {{disk : filesystem <: e}}
+                  -> {{rep : Report.report <: e}}
+                  -> {{prog : Progress.progress <: e}}
+                  -> TestOpts
+                  -> Int
+                  -> Pending
+                  -> (Prepared -> Co e Unit)
+                  -> Co e Unit
+buildIntegrations opts at p k = case integrationLoaded p of
+  Left why -> do
+    r <-
+      reportedWith
+        opts
+        p
+        (List.map
+           (\(i : Pair String Int) -> brokenTest (fst i) why)
+           p.integrations)
+    k (Done r)
+  Right l -> do
+    task <- Progress.start Progress.root (p.file ^ ": integration tests") 2
+    c <- Progress.start task "compiling to C" 0
+    cLoaded
+        l
+        (Just integrationMainName)
+        (testDir l.paths p.file ^ "/")
+        p.file
+        (ended
+           c
+           (zigBuild
+              "heff test"
+              l.paths.style
+              "-O1"
+              task
+              (testDir l.paths p.file)
+              (Load.under
+                 l.paths
+                 (testDir l.paths p.file)
+                 (programFile l.paths.style "main")) (do
+            real <-
+              realPath
+                (Load.under
+                   l.paths
+                   (testDir l.paths p.file)
+                   (programFile l.paths.style "main"))
+            self <- programPath
+            heff <- realPath self
+            root <- realPath l.paths.root
+            Progress.end task
+            k
+                (Later
+                   { at = at
+                   , pending = p
+                   , launch =
+                       { program = pathOr "" real
+                       , env =
+                           [ MkPair "HEFF" (pathOr self heff)
+                           , MkPair "HEFF_TEST_ROOT" (pathOr l.paths.root root)
+                           ]
+                       }
+                   }))))
+
+-- (a file tested here, its line said, else its integration tests built:
+-- then `k` of it)
+prepare : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{rep : Report.report <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> TestOpts
+        -> Int
+        -> Tested
+        -> (Prepared -> Co e Unit)
+        -> Co e Unit
+prepare opts at (Settled r) k = k (Done r)
+prepare opts at (Pend p) k =
   if List.null p.integrations
   then do
-    os <- withGoldens opts.update p.file p.outcomes
-    r <- reported opts p os
-    k r
-  else runIntegrations
-      opts
-      p (\more -> do
-    os <- withGoldens opts.update p.file (List.append p.outcomes more)
-    r <- reported opts p os
-    k r)
+    r <- reportedWith opts p Nil
+    k (Done r)
+  else buildIntegrations opts at p k
+
+-- (the integration tests of the files ready, each file's)
+readyJobs : List Ready -> List Job
+readyJobs rs =
+  List.concatMap
+    (\(r : Ready) -> jobsOf r.at r.launch 0 r.pending.integrations)
+    rs
+
+-- (what came of the integration tests of the file at `at`, in its order)
+outcomesOf : Int -> List Finished -> List Driver.TestOutcome
+outcomesOf at fs =
+  List.map
+    (\(f : Finished) -> f.outcome)
+    (List.sortBy
+       (\(a : Finished) (b : Finished) -> placeBefore a.place b.place)
+       (List.filter (\(f : Finished) -> f.owner == at) fs))
+
+-- (the files ready, each its line said in turn, what came of their tests
+-- added to `acc`)
+reportReady : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> {{rep : Report.report <: e}}
+            -> TestOpts
+            -> List Finished
+            -> List Ready
+            -> TestRes
+            -> Co e TestRes
+reportReady opts done Nil acc = pure acc
+reportReady opts done (Cons r rest) acc = do
+  res <- reportedWith opts r.pending (outcomesOf r.at done)
+  reportReady opts done rest (addRes acc res)
+
+-- | the integration tests of all the files ready run, `opts.jobs` at
+-- | once among them all, then each file's line said, in the files' order
+runReady : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{rep : Report.report <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> TestOpts
+         -> List Ready
+         -> TestRes
+         -> Co e TestRes
+runReady opts Nil acc = pure acc
+runReady opts ready acc = do
+  task <- Progress.start Progress.root "integration tests" 0
+  done <-
+    runJobs (patternLevels opts.pattern) opts.jobs (readyJobs ready) Nil Nil
+  Progress.end task
+  reportReady opts done ready acc
 
 -- (the tests' part of the last line: said only if there were some)
 testsHeld : Int -> Int -> String
@@ -3476,22 +3564,15 @@ testFiles given = testFilesGo (List.map (\f -> MkPair True f) given) Nil
 noneSelected : TestOpts -> TestRes -> Bool
 noneSelected opts acc = not (strEq opts.pattern "") && acc.tests == 0
 
--- | check the watches' and doc tests' expectations of every file
--- | given, and run its tests (each property from `seed`), each file a
--- | task under `tk` as it is tested
-testCmd : {e : HFunctor}
-        -> {{io : stdio <: e}}
-        -> {{sys : process <: e}}
-        -> {{disk : filesystem <: e}}
-        -> {{rep : Report.report <: e}}
-        -> {{prog : Progress.progress <: e}}
-        -> Progress.Task
-        -> TestOpts
-        -> List String
-        -> TestRes
-        -> Co e Unit
-testCmd tk opts Nil acc = do
-  Progress.end tk
+-- (the last of `heff test`: the files that do not check listed, the
+-- line that adds it up, and its status)
+testSummary : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> TestOpts
+            -> TestRes
+            -> Co e Unit
+testSummary opts acc = do
   printUnchecked acc.unchecked
   if noneSelected opts acc
     then do
@@ -3508,14 +3589,37 @@ testCmd tk opts Nil acc = do
   if acc.failed > 0 || acc.testsFailed > 0 || not (List.null acc.unchecked)
     then exit 1
     else pure MkUnit
-testCmd tk opts (Cons f rest) acc = do
+
+-- | check the watches' and doc tests' expectations of every file
+-- | given, and run its tests (each property from `seed`), each file a
+-- | task under `tk` as it is tested
+testCmd : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{rep : Report.report <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> Progress.Task
+        -> TestOpts
+        -> List String
+        -> TestRes
+        -> List Ready
+        -> Co e Unit
+testCmd tk opts Nil acc ready = do
+  Progress.end tk
+  res <- runReady opts ready acc
+  testSummary opts res
+testCmd tk opts (Cons f rest) acc ready = do
   ft <- Progress.start tk f 0
   t <- testOneF opts f
-  finishTested
+  prepare
       opts
-      t (\r -> do
+      (List.length ready)
+      t (\pr -> do
     Progress.end ft
-    testCmd tk opts rest (addRes acc r))
+    case pr of
+      Done r -> testCmd tk opts rest (addRes acc r) ready
+      Later r -> testCmd tk opts rest acc (List.append ready [r]))
 
 -- | `heff test`: the watches' expectations of the files checked, and
 -- | their tests run (each property from `seed`), a task meanwhile, each
@@ -3531,7 +3635,7 @@ testsCmd : {e : HFunctor}
          -> Co e Unit
 testsCmd opts files = do
   tk <- Progress.start Progress.root "testing" (List.length files)
-  testCmd tk opts files noRes
+  testCmd tk opts files noRes Nil
 
 -- | the seed the properties are run from, unless `--seed` gives one:
 -- | always the same, so that a run of the tests is a run of the same
