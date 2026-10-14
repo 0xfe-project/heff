@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
 /// up to date.
 fn command(b: *std.Build, bootstrap: *std.Build.Step.Compile, arguments: []const []const u8) *std.Build.Step {
     const run = b.addRunArtifact(bootstrap);
-    run.addArg(b.graph.zig_exe);
+    run.addFileArg2(.zig_exe, .{ .make_absolute = true });
     run.addArgs(arguments);
     run.setCwd(b.path("."));
     run.stdio = .inherit;
