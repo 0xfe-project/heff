@@ -145,6 +145,14 @@ typedef struct { V f[4]; } HeffT4;
 #define HEFF_SLOW HEFF_FN __attribute__((noinline, cold))
 #define HEFF_LIKELY(c) __builtin_expect(!!(c), 1)
 
+// The runtime's part in Zig: built by zig into an object of its own and
+// linked with the program, each function by the C ABI, given C's plain
+// types and leaving allocating and counting to the C here; called, never
+// inlined into the program's code.
+// (a float as JavaScript writes a number, at `out`, room for 32 bytes)
+void heff_js_number(double d, char *out);
+void heff_js_number32(float f, char *out);
+
 // the tags the runtime knows; a program's own are numbered after them
 enum {
   TAG_True, TAG_False, TAG_Nil, TAG_Cons, TAG_MkUnit, TAG_Just, TAG_Nothing,
@@ -2644,47 +2652,6 @@ HEFF_FN V heff_floatFloor(V a) {
   return heff_int_of_double(f);
 }
 
-// (as JavaScript writes a number: the fewest digits that read back the
-// same, in plain or exponent form by its rules (ECMAScript
-// Number::toString); then ".0" where that is a whole number)
-HEFF_FN void heff_js_number(double d, char *out) {
-  if (isnan(d)) { strcpy(out, "NaN"); return; }
-  if (isinf(d)) { strcpy(out, d < 0 ? "-Infinity" : "Infinity"); return; }
-  if (d == 0) { strcpy(out, "0"); return; }
-  char *o = out;
-  if (d < 0) { *o++ = '-'; d = -d; }
-  char buf[40];
-  int p;
-  for (p = 1; p <= 17; p++) {
-    snprintf(buf, sizeof buf, "%.*e", p - 1, d);
-    if (strtod(buf, NULL) == d) break;
-  }
-  // digits and exponent: d = 0.digits * 10^n, k digits
-  char digits[20];
-  int k = 0;
-  char *c = buf;
-  for (; *c && *c != 'e'; c++) if (*c >= '0' && *c <= '9') digits[k++] = *c;
-  while (k > 1 && digits[k - 1] == '0') k--;
-  int e = atoi(c + 1);
-  int n = e + 1;
-  if (k <= n && n <= 21) {
-    memcpy(o, digits, k); o += k;
-    for (int i = k; i < n; i++) *o++ = '0';
-  } else if (0 < n && n <= 21) {
-    memcpy(o, digits, n); o += n; *o++ = '.';
-    memcpy(o, digits + n, k - n); o += k - n;
-  } else if (-6 < n && n <= 0) {
-    *o++ = '0'; *o++ = '.';
-    for (int i = 0; i < -n; i++) *o++ = '0';
-    memcpy(o, digits, k); o += k;
-  } else {
-    *o++ = digits[0];
-    if (k > 1) { *o++ = '.'; memcpy(o, digits + 1, k - 1); o += k - 1; }
-    o += sprintf(o, "e%c%d", n - 1 < 0 ? '-' : '+', abs(n - 1));
-  }
-  *o = 0;
-}
-
 HEFF_FN V heff_floatShow(V a) {
   char buf[64];
   heff_js_number(FLT_OF(a), buf);
@@ -2853,16 +2820,8 @@ HEFF_FN V heff_float32Sqrt(V a) { return heff_f32(sqrtf(heff_f32_of(a))); }
 // whose last digit is even, as printf rounds), if it reads back so; nine
 // always do)
 HEFF_FN V heff_float32Show(V a) {
-  float f = heff_f32_of(a);
-  double d = f;
   char buf[64];
-  if (isfinite(d) && d != 0)
-    for (int p = 1; p <= 9; p++) {
-      snprintf(buf, sizeof buf, "%.*e", p - 1, d);
-      double t = strtod(buf, NULL);
-      if ((float)t == f) { d = t; break; }
-    }
-  heff_js_number(d, buf);
+  heff_js_number32(heff_f32_of(a), buf);
   if (!strpbrk(buf, ".eNI")) strcat(buf, ".0");
   return heff_str_ascii(buf);
 }
