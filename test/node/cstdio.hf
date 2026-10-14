@@ -1,0 +1,158 @@
+-- C's streams as an effect of the test's own, done by C's own functions
+-- alone: no provider written by hand -- the module describes each
+-- operation's function (ffi), and the compiler makes the provider of
+-- it.  A stream is a foreign value, a `FILE *`, closed when the
+-- program drops its last reference: what was written to it and never
+-- flushed is in the file once it is.
+
+import co
+import ffi as Ffi
+import rune as Rune
+import std.io
+
+-- | A C stream, open: a foreign value; no value of the program has it.
+data Stream
+
+data CStdioF (m : Type -> Type) x
+  = Open String String (Either Ffi.Errno Stream -> x)
+  | Getc Stream (Int -> x)
+  | Puts String Stream (Int -> x)
+  | Flush Stream (Either Ffi.Errno Unit -> x)
+  | Remove String (Either Ffi.Errno Unit -> x)
+  | Clear Stream x
+
+cstdio : HFunctor
+cstdio =
+  { f = CStdioF
+  , hfmap = \m g p -> case p of
+      Open path mode k -> Open path mode (\r -> g (k r))
+      Getc s k -> Getc s (\c -> g (k c))
+      Puts str s k -> Puts str s (\n -> g (k n))
+      Flush s k -> Flush s (\r -> g (k r))
+      Remove path k -> Remove path (\r -> g (k r))
+      Clear s x -> Clear s (g x)
+  , hmap = \m n nt p -> case p of
+      Open path mode k -> Open path mode k
+      Getc s k -> Getc s k
+      Puts str s k -> Puts str s k
+      Flush s k -> Flush s k
+      Remove path k -> Remove path k
+      Clear s x -> Clear s x
+  }
+
+-- (a stream, as C has it: a `FILE *`, `fclose` letting it go)
+stream : Ffi.CType
+stream = Ffi.pointer "FILE" "fclose"
+
+-- | The operations, each C's function of the same name.
+cstdioInC : Ffi.Described
+cstdioInC =
+  Ffi.describe
+    ["<stdio.h>"]
+    [ Ffi.operation
+        "Open"
+        (Ffi.fun "fopen" [Ffi.string, Ffi.string] (Ffi.givesOrErrno stream))
+    , Ffi.operation "Getc" (Ffi.fun "fgetc" [stream] (Ffi.gives Ffi.int))
+    , Ffi.operation "Puts" (Ffi.fun "fputs" [Ffi.string, stream] (Ffi.gives Ffi.int))
+    , Ffi.operation "Flush" (Ffi.fun "fflush" [stream] Ffi.doneOrErrno)
+    , Ffi.operation "Remove" (Ffi.fun "remove" [Ffi.string] Ffi.doneOrErrno)
+    , Ffi.operation "Clear" (Ffi.fun "clearerr" [stream] (Ffi.gives Ffi.void))
+    ]
+
+open : {e : HFunctor}
+     -> {{ev : cstdio <: e}}
+     -> String
+     -> String
+     -> Co e (Either Ffi.Errno Stream)
+open path mode = op (ev (Open path mode (\r -> r))) val
+
+getc : {e : HFunctor} -> {{ev : cstdio <: e}} -> Stream -> Co e Int
+getc s = op (ev (Getc s (\c -> c))) val
+
+puts : {e : HFunctor} -> {{ev : cstdio <: e}} -> String -> Stream -> Co e Int
+puts str s = op (ev (Puts str s (\n -> n))) val
+
+flush : {e : HFunctor}
+      -> {{ev : cstdio <: e}}
+      -> Stream
+      -> Co e (Either Ffi.Errno Unit)
+flush s = op (ev (Flush s (\r -> r))) val
+
+remove : {e : HFunctor}
+       -> {{ev : cstdio <: e}}
+       -> String
+       -> Co e (Either Ffi.Errno Unit)
+remove path = op (ev (Remove path (\r -> r))) val
+
+clear : {e : HFunctor} -> {{ev : cstdio <: e}} -> Stream -> Co e Unit
+clear s = op (ev (Clear s MkUnit)) val
+
+world : HFunctor
+world = cstdio <+> stdio
+
+-- (the stream's characters to its end, after those read so far)
+readAll : {e : HFunctor}
+        -> {{cs : cstdio <: e}}
+        -> Stream
+        -> List Rune
+        -> Co e String
+readAll s acc = do
+  c <- getc s
+  if c < 0 then pure (strOfRunes (List.reverse acc))
+    else readAll s (Cons (Rune.fromInt c) acc)
+
+-- (a write, and the stream dropped: closed by C, what was written in the file)
+written : {e : HFunctor}
+        -> {{cs : cstdio <: e}}
+        -> {{io : stdio <: e}}
+        -> String
+        -> Either Ffi.Errno Stream
+        -> Co e Unit
+written str (Right s) = do
+  n <- puts str s
+  clear s
+  print ("wrote: " ^ (if n >= 0 then "yes" else "no"))
+written str (Left err) = print ("cannot write: " ^ Ffi.showErrno err)
+
+-- (what the file holds, read to its end; the stream dropped after)
+read : {e : HFunctor}
+     -> {{cs : cstdio <: e}}
+     -> {{io : stdio <: e}}
+     -> Either Ffi.Errno Stream
+     -> Co e Unit
+read (Right s) = do
+  text <- readAll s Nil
+  r <- flush s
+  print ("read: " ^ show text ^ (case r of
+    Right _ -> ""
+    Left err -> " (flush: " ^ err.name ^ ")"))
+read (Left err) = print ("cannot read: " ^ Ffi.showErrno err)
+
+-- (why a stream could not be opened)
+failed : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> Either Ffi.Errno Stream
+       -> Co e Unit
+failed (Right s) = print "opened what is not there"
+failed (Left err) = print ("not opened: " ^ err.name ^ " " ^ show err.code)
+
+-- (whether a file was removed)
+removed : {e : HFunctor} -> {{io : stdio <: e}} -> Either Ffi.Errno Unit -> Co e Unit
+removed (Right _) = print "removed"
+removed (Left err) = print ("not removed: " ^ err.name)
+
+program : {e : HFunctor} -> {{cs : cstdio <: e}} -> {{io : stdio <: e}} -> Co e Unit
+program = do
+  w <- open "cstdio-test.txt" "w"
+  written "hello, C\n" w
+  r <- open "cstdio-test.txt" "r"
+  read r
+  missing <- open "cstdio-missing.txt" "r"
+  failed missing
+  gone <- remove "cstdio-test.txt"
+  removed gone
+  again <- remove "cstdio-test.txt"
+  removed again
+
+main : Co world Unit
+main = program (cs := \p -> InL p) (io := \p -> InR p)
