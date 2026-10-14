@@ -141,6 +141,9 @@ none, in their order.  Each has, in its environment, `HEFF`,
 the path of the heff that runs it, and `HEFF_TEST_ROOT`, the project's
 root: a test of heff runs the heff tested, not one on the PATH, on the
 project's files (`run { command = heff, args = ..., dir = root }`).
+It has `HEFF_TEST_JOBS=1` too, so that a `heff test` it runs (with no
+`--jobs`) runs a test at a time, in the slot of the test that runs it,
+and nested runs do not multiply the tests run at once.
 
 ## Subtests
 
