@@ -1,159 +1,15 @@
--- Vector addition on the GPU, in the page's `#vecadd`: two vectors of
--- floats written to buffers as Float32s, added by a kernel written in
--- heff (gpu.kernel) and printed as WGSL (gpu.wgsl), the sum read back
--- and checked against the one computed here -- `ok`, or the first index
--- where they differ.  Where the browser has no WebGPU, the page says
--- so.
+-- Vector addition on the GPU (pages.vecadd), in the page's `#vecadd`:
+-- the sums computed and checked, the verdict shown -- `ok`, or the first
+-- index where they differ.  Where the browser has no WebGPU, the page
+-- says so.
 
 import co
 import browser.dom
-import bytes as Bytes
 import gpu as Gpu
-import gpu.kernel as Kernel
-import gpu.run as Run
-import gpu.wgsl as Wgsl
+import pages.vecadd as VecAdd
 
 world : HFunctor
 world = dom <+> Gpu.gpu
-
--- (each element of `c` the sum of `a`'s and `b`'s, where `c` has one)
-addInto : Kernel.Input Float32
-        -> Kernel.Input Float32
-        -> Kernel.Output Float32
-        -> Co Kernel.stmt Unit
-addInto a b c = do
-  i <- Kernel.globalId
-  Kernel.when
-      (Kernel.lessThan i (Kernel.length c))
-      (Kernel.store c i (Kernel.load a i + Kernel.load b i))
-
--- | The kernel, 64 invocations to a workgroup: the WGSL it is.
--- | >>> lines (Wgsl.source3 vecAdd)
--- | [ "@group(0) @binding(0) var<storage, read> a : array<f32>;"
--- | , "@group(0) @binding(1) var<storage, read> b : array<f32>;"
--- | , "@group(0) @binding(2) var<storage, read_write> c : array<f32>;"
--- | , "@compute @workgroup_size(64)"
--- | , "fn add(@builtin(global_invocation_id) id : vec3<u32>) {"
--- | , "  let v0 = id.x;"
--- | , "  if (v0 < arrayLength(&c)) {"
--- | , "    c[v0] = a[v0] + b[v0];"
--- | , "  }"
--- | , "}"
--- | ]
-vecAdd : Kernel.Kernel3
-         (Kernel.Input Float32)
-         (Kernel.Input Float32)
-         (Kernel.Output Float32)
-vecAdd = Kernel.kernel3 "add" 64 addInto
-
--- how many elements: no multiple of 64, so that the last workgroup
--- has some past the end
-size : Int
-size = 1000
-
-xs : List Float64
-xs = List.map toFloat (List.range 0 (size - 1))
-
-ys : List Float64
-ys = List.map (\i -> toFloat (2 * i) + 0.25) (List.range 0 (size - 1))
-
--- (each exactly a Float32, so the GPU's sum is the same)
-want : List Float64
-want = List.zipWith (\x y -> x + y) xs ys
-
--- floats as the GPU has them: Float32s, little-endian, one after another
-packFloats : List Float64 -> Bytes
-packFloats fs = Bytes.concat (List.map (\x -> b[x::float-32-little]) fs)
-
-unpackFloats : Bytes -> List Float64
-unpackFloats b[x::float-32-little, rest::binary] = Cons x (unpackFloats rest)
-unpackFloats _ = Nil
-
--- (the next step, where the one before did not fail)
-next : {e : HFunctor}
-     -> {a c : Type}
-     -> Either Gpu.GpuError a
-     -> (a -> Co e (Either Gpu.GpuError c))
-     -> Co e (Either Gpu.GpuError c)
-next (Left err) _ = pure (Left err)
-next (Right x) f = f x
-
-andThen : {e : HFunctor}
-        -> {a c : Type}
-        -> Co e (Either Gpu.GpuError a)
-        -> (a -> Co e (Either Gpu.GpuError c))
-        -> Co e (Either Gpu.GpuError c)
-andThen m f = bind m (\r -> next r f)
-
--- (a buffer of the floats, on the device)
-upload : {e : HFunctor}
-       -> {{card : Gpu.gpu <: e}}
-       -> Gpu.Device
-       -> List Float64
-       -> Co e (Either Gpu.GpuError (Run.Typed Float32))
-upload d fs =
-  andThen
-    (Run.newTyped d (List.length fs))
-    (\buffer ->
-       andThen
-         (Run.writeTyped d buffer (packFloats fs))
-         (\_ -> pure (Right buffer)))
-
--- (the sums read, the buffers let go of)
-finish : {e : HFunctor}
-       -> {{card : Gpu.gpu <: e}}
-       -> List (Run.Typed Float32)
-       -> Bytes
-       -> Co e (Either Gpu.GpuError (List Float64))
-finish buffers out = do
-  for buffer in buffers do
-    Run.freeTyped buffer
-  pure (Right (unpackFloats out))
-
--- (the sums, read back once the kernel is done: one invocation for
--- each element)
-readSums : {e : HFunctor}
-         -> {{card : Gpu.gpu <: e}}
-         -> Gpu.Device
-         -> Run.Typed Float32
-         -> Run.Typed Float32
-         -> Run.Typed Float32
-         -> Co e (Either Gpu.GpuError (List Float64))
-readSums d a b c =
-  andThen
-    (Run.run3 d vecAdd size a b c)
-    (\_ ->
-       andThen
-         (Run.readTyped d c)
-         (finish [a, b, c]))
-
--- the sums, computed on the device
-sums : {e : HFunctor}
-     -> {{card : Gpu.gpu <: e}}
-     -> Gpu.Device
-     -> Co e (Either Gpu.GpuError (List Float64))
-sums d =
-  andThen
-    (upload d xs)
-    (\a ->
-       andThen
-         (upload d ys)
-         (\b -> andThen (Run.newTyped d size) (\c -> readSums d a b c)))
-
--- (the first index, from `i`, where the two differ)
-firstMismatch : Int -> List Float64 -> List Float64 -> Maybe Int
-firstMismatch i (Cons x more) (Cons y others) =
-  if x == y then firstMismatch (i + 1) more others else Just i
-firstMismatch _ Nil Nil = Nothing
-firstMismatch i _ _ = Just i
-
-verdict : Maybe Int -> String
-verdict Nothing = "ok"
-verdict (Just i) = "mismatch at " ^ show i
-
-verdictOf : Either Gpu.GpuError (List Float64) -> String
-verdictOf (Left err) = Gpu.showError err
-verdictOf (Right got) = verdict (firstMismatch 0 got want)
 
 program : {e : HFunctor}
         -> {{page : dom <: e}}
@@ -163,8 +19,8 @@ program = do
   place <- select "#vecadd"
   found place (\r -> do
     label <- textIn r "p" "adding"
-    result <- andThen Gpu.open sums
-    text label (verdictOf result))
+    result <- VecAdd.sums
+    text label (VecAdd.verdictOf result))
 
 -- where the world is: each sub-effect's evidence, given
 main : Co world Unit

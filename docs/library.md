@@ -194,8 +194,10 @@ whose state is a fresh-name counter and the lines; `gpu.run` (`import
 gpu.run as Run`) runs one: a `Typed a` is a buffer of `count` `a`s
 (`newTyped`, `writeTyped`, `readTyped`, `freeTyped`), and `run3 d k n
 x y z` loads `k` and dispatches it over `n` invocations, as many
-workgroups as they take.  The vecadd page's `vecAdd` is one; test/gpu/
-pins each statement's WGSL.
+workgroups as they take.  The vecadd page's `vecAdd` is one, and its
+module's `do` runs the steps on the GPU, each an `Either GpuError`, by
+a `bind` of its own that stops at the first error; test/gpu/ pins each
+statement's WGSL.
 
 A program imports only its own half: a C program that imports a module
 of `lib/browser/` is refused at the import (E0351), and so is a page's
