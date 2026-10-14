@@ -1,0 +1,352 @@
+-- The example apps, compiled for the page (`heff compile --backend=page`)
+-- and used on a pretend page, as a person would -- clicked, typed in,
+-- time passed -- each a subtest holding what the page then shows to what
+-- it should.  The page is Node.js's (an app is JavaScript), the tests'
+-- pretend page; what is done and what is wanted are here.  And a page
+-- and its server, one project: `heff build` makes the server, through C,
+-- and the page's script; the server runs, and the page asks it for the
+-- notes, each call over the wire, until it is gone.
+--
+--   heff test test/apps.hf
+--   heff test --run apps/notes test/apps.hf
+
+import bytes as Bytes
+import check
+import co
+import json as Json
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = "status " ^ show n
+statusOf (Signalled n) = "signal " ^ show n
+statusOf TimedOut = "timed out"
+statusOf NotRun = "not run"
+
+-- | how a command ended, and what it said
+said : Ran -> String
+said r = statusOf r.ended ^ "\n" ^ r.out ^ r.err
+
+-- | what the page said, each what was looked at and what it showed
+shown : String -> List (Pair String String)
+shown out =
+  List.map
+    (\l -> case Json.parse l of
+     Right j ->
+       MkPair
+         (fromMaybe "" (Json.str ["what"] j))
+         (fromMaybe "" (Json.str ["got"] j))
+     Left err -> MkPair "said" l)
+    (List.filter (\l -> not (strEq (trim l) "")) (lines out))
+
+-- | how what the page showed is not what was wanted
+-- | >>> unlike [MkPair "a" "1"] [MkPair "a" "2"]
+-- | ["a: \"2\", wanted \"1\""]
+unlike : List (Pair String String) -> List (Pair String String) -> List String
+unlike want got =
+  List.append
+    (List.concatMap
+       (\w -> case List.find (\g -> strEq (fst g) (fst w)) got of
+        Just g ->
+          if strEq (snd g) (snd w) then Nil
+          else [fst w ^ ": " ^ show (snd g) ^ ", wanted " ^ show (snd w)]
+        Nothing -> [fst w ^ ": not shown"])
+       want)
+    (List.concatMap
+       (\g ->
+          if List.any (\w -> strEq (fst w) (fst g)) want then Nil
+          else [fst g ^ ": " ^ show (snd g) ^ ", not wanted"])
+       got)
+
+-- (the test fails, saying each of these, unless there are none)
+failingWith : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> List String
+            -> Co e Unit
+failingWith Nil = pure MkUnit
+failingWith msgs = failure (joinWith "\n" msgs)
+
+-- | an app compiled for the page, named: its script, in the working
+-- | directory
+compiled : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> Pair String String
+         -> Co e String
+compiled app = do
+  heff <- given "HEFF"
+  root <- given "HEFF_TEST_ROOT"
+  here <- workingDir
+  out <- pure (here ^ "/" ^ snd app ^ ".js")
+  r <-
+    run
+      { command = heff
+      , args = ["compile", fst app, out, "--name", snd app, "--backend=page"]
+      , dir = root
+      , timeout = 120000
+      }
+  if succeeded r then pure out else failure ("not compiled: " ^ said r)
+
+-- (each compiled)
+allCompiled : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> List (Pair String String)
+            -> Co e (List String)
+allCompiled Nil = pure Nil
+allCompiled (Cons a rest) = do
+  s <- compiled a
+  ss <- allCompiled rest
+  pure (Cons s ss)
+
+-- | apps, each its source and its name, on the pretend page as `scene`
+-- | says, what it shows held to what is wanted
+onPage : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> List (Pair String String)
+       -> List (Pair String String)
+       -> Co e Unit
+onPage scene apps want = do
+  root <- given "HEFF_TEST_ROOT"
+  scripts <- allCompiled apps
+  r <-
+    run
+      { command = "node"
+      , args = Cons (root ^ "/test/page.mjs") (Cons scene scripts)
+      , timeout = 60000
+      }
+  if succeeded r then failingWith (unlike want (shown r.out))
+    else failure (said r)
+
+-- (the counter and the clock, their sources and names)
+counter : Pair String String
+counter = MkPair "examples/counter/counter.hf" "counter"
+
+clock : Pair String String
+clock = MkPair "examples/clock/clock.hf" "clock"
+
+-- (the kernel `vecAdd` is, as WGSL)
+kernel : String
+kernel =
+  joinWith
+    "\n"
+    [ "@group(0) @binding(0) var<storage, read> a : array<f32>;"
+    , "@group(0) @binding(1) var<storage, read> b : array<f32>;"
+    , "@group(0) @binding(2) var<storage, read_write> c : array<f32>;"
+    , "@compute @workgroup_size(64)"
+    , "fn add(@builtin(global_invocation_id) id : vec3<u32>) {"
+    , "  let v0 = id.x;"
+    , "  if (v0 < arrayLength(&c)) {"
+    , "    c[v0] = a[v0] + b[v0];"
+    , "  }"
+    , "}"
+    ]
+
+-- | each app on its page, a subtest each
+pages : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Co e Unit
+pages = do
+  subtest
+      "counter"
+      (onPage
+         "counter"
+         [counter]
+         [ MkPair "at first" "count: 0"
+         , MkPair "after 3 clicks" "count: 3"
+         , MkPair "after -1" "count: 2"
+         ])
+  subtest
+      "clock"
+      (onPage
+         "clock"
+         [clock]
+         [MkPair "at first" "0 ticks", MkPair "after 5 ticks" "5 ticks"])
+  -- (elements already on the page, found by a CSS selector and an XPath)
+  subtest
+      "finder"
+      (onPage
+         "finder"
+         [MkPair "test/apps/select.hf" "finder"]
+         [ MkPair "by css" "found by css"
+         , MkPair "by xpath" "found by xpath"
+         , MkPair "elements" "2"
+         ])
+  -- (an app whose effect is a definition, `page = dom <+> (state Int)`)
+  subtest
+      "aliased"
+      (onPage
+         "aliased"
+         [MkPair "test/apps/aliased.hf" "aliased"]
+         [MkPair "out" "42"])
+  -- (std.time beside the page's world, its provider the page's too)
+  subtest
+      "slept"
+      (onPage
+         "slept"
+         [MkPair "test/apps/slept.hf" "slept"]
+         [ MkPair "before the time has passed" "sleeping"
+         , MkPair "after" "slept"
+         ])
+  -- (a world of the test's own beside the page's, each acting on what
+  -- the other's provider handed out: the world holds them for both)
+  subtest
+      "painted"
+      (onPage
+         "painted"
+         [MkPair "test/apps/paint.hf" "painted"]
+         [ MkPair "class" "red"
+         , MkPair "its stamp" "mark: stamped"
+         , MkPair "found again" "yes"
+         ])
+  -- (a `JSString` field of an operation: a JavaScript string to the
+  -- provider, its length its text's UTF-16 code units, not its bytes)
+  subtest
+      "texts"
+      (onPage
+         "texts"
+         [MkPair "test/apps/jstext.hf" "texts"]
+         [ MkPair
+           "out"
+           "5 bytes, 5 code units: plain\n7 bytes, 4 code units: é😀a\n3 bytes, 3 code units: x\u{FFFD}y"
+         ])
+  -- (an app whose definitions have the names of the window's own)
+  subtest
+      "names"
+      (onPage
+         "names"
+         [MkPair "test/apps/names.hf" "names"]
+         [MkPair "out" "top name status self parent"])
+  subtest
+      "greet"
+      (onPage
+         "greet"
+         [MkPair "examples/greet/greet.hf" "greet"]
+         [ MkPair "at first" "Hello, whoever you are."
+         , MkPair "after typing" "Hello, Ada!"
+         ])
+  -- (two apps on one page, each keeping what it defines to itself)
+  subtest
+      "two apps"
+      (onPage
+         "two"
+         [counter, clock]
+         [MkPair "the counter" "count: 1", MkPair "the clock" "1 ticks"])
+  -- (a GPU, WebGPU's: where there is none, the page says so; on a
+  -- pretend one, the provider's wiring, its kernel the example's
+  -- `vecAdd` as WGSL; a real GPU is checked by hand)
+  subtest
+      "vecadd"
+      (onPage
+         "vecadd"
+         [MkPair "examples/vecadd/vecadd.hf" "vecadd"]
+         [ MkPair "no WebGPU" "gpu: WebGPU is not here"
+         , MkPair "on a pretend GPU" "ok"
+         , MkPair "its dispatch" "add 16 1 1"
+         , MkPair "its kernel" kernel
+         , MkPair "its buffers let go of" "true,true,true,true"
+         ])
+
+-- (lines read from the page until it says to lose the server)
+readUntilLost : {e : HFunctor}
+              -> {{sys : process <: e}}
+              -> Subprocess
+              -> String
+              -> Co e String
+readUntilLost p sofar = do
+  l <- readOutput p (Through "\n") 60000
+  case l of
+    Got b ->
+      if contains "lose the server" (Bytes.asString b)
+      then pure (sofar ^ Bytes.asString b)
+      else readUntilLost p (sofar ^ Bytes.asString b)
+    _ -> pure sofar
+
+-- | the notes, a page and its server: its API's test first, the calls
+-- | through the wire with no network; then built, the server run, and
+-- | its page asking it, on two pages; a call of another build of the
+-- | API refused, and why; the server gone, a call's failure said on the
+-- | page
+notes : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Co e Unit
+notes = do
+  heff <- given "HEFF"
+  root <- given "HEFF_TEST_ROOT"
+  dir <- pure (root ^ "/examples/notes")
+  tested <- run { command = heff, args = ["test"], dir = dir, timeout = 300000 }
+  built <- run { command = heff, args = ["build"], dir = dir, timeout = 600000 }
+  ports <-
+    run
+      { command = "node"
+      , args = [root ^ "/test/peers.mjs", "ports", "1"]
+      , timeout = 30000
+      }
+  port <- pure (trim ports.out)
+  if not (succeeded tested) then failure ("heff test: " ^ said tested)
+    else if not (succeeded built) then failure ("heff build: " ^ said built)
+    else do
+      server <-
+        start
+          { command = dir ^ "/.heff/bin/server"
+          , args = [port]
+          , dir = dir
+          , timeout = 120000
+          }
+      page <-
+        start
+          { command = "node"
+          , args =
+              [root ^ "/test/page.mjs", "notes", "http://127.0.0.1:" ^ port]
+          , input = Piped
+          , output = Piped
+          , timeout = 120000
+          }
+      case page of
+        Nothing -> failure "node: not run"
+        Just p -> do
+          before <- readUntilLost p ""
+          gone <- case server of
+            Just s -> terminate s
+            Nothing -> pure { ended = NotRun, out = "", err = "" }
+          ok <- writeInput p (Bytes.fromString "\n")
+          r <- wait p
+          failingWith
+              (unlike
+                 [ MkPair "served" "true"
+                 , MkPair "as the server has them" "[ ] milk|[ ] bread"
+                 , MkPair "on another page" "[x] milk|[ ] bread"
+                 , MkPair "another build" "hw 1 2 1"
+                 , MkPair "why" "true"
+                 , MkPair "lose the server" ""
+                 , MkPair "a call to no server" "true"
+                 , MkPair "as they were" "[x] milk|[ ] bread"
+                 , MkPair "stray rejections" ""
+                 ]
+                 (shown (before ^ r.out)))
+
+-- | the example apps, on a pretend page, and the notes' page and server
+apps : Test
+apps =
+  group
+    "apps"
+    [integration "pages" pages, within 600000 (integration "notes" notes)]

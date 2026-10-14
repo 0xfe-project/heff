@@ -846,7 +846,7 @@ uri body =
 `examples/` has apps for the browser: `node examples/build.mjs` builds
 each to `.heff/examples/NAME/`, where its `index.html` opens.
 `examples/notes/` is a page and its server, one project built by `heff
-build` there ([a client and its server](remote.md)); test/app-run.mjs
-runs both.  `examples/testbridge/` is a project of another kind, built by `heff
+build` there ([a client and its server](remote.md)); the apps' tests
+(`heff test test/apps.hf`) run both.  `examples/testbridge/` is a project of another kind, built by `heff
 build` there: a Linux program, through C, that makes a bridge and a
 veth pair by rtnetlink, its socket's calls a provider of its own.

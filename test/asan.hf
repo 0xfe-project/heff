@@ -1,0 +1,349 @@
+-- heff compiled through C, checked by AddressSanitizer: the parts `make
+-- build` leaves beside heff built by the system's clang with
+-- `-fsanitize=address` (zig's has no ASan runtime) and no free lists
+-- (`-DSMALL_MAX=0`, so that a use after the last reference is a use
+-- after free), then made to check each test program, in a project laid
+-- out as the repository is, with no cache but its own; and a program of
+-- them compiled to C by it, built under ASan the same way, and run.  A
+-- check is a subtest, given a minute (`HEFF_ASAN_TIMEOUT`, in seconds,
+-- says otherwise): under ASan a check takes seconds at most, so one that
+-- has not ended will not.
+--
+-- The parts are built as many at once as `HEFF_ASAN_JOBS` says (four,
+-- else: a part takes clang up to some 750MB), each object kept by what
+-- it is made of -- the clang, the flags, the runtime's header and the
+-- part -- in the repository's `.heff/ref/native-asan.o/`, so that a
+-- part as it was is not built again.  Where there is no clang, or none
+-- with ASan's runtime, the test holds having checked nothing.
+--
+--   heff test test/asan.hf
+--   heff test --run asan/check/wire.hf test/asan.hf
+
+import check
+import co
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = "status " ^ show n
+statusOf (Signalled n) = "killed by signal " ^ show n
+statusOf TimedOut = "not ended in its time, killed"
+statusOf NotRun = "not run"
+
+-- | how a command ended, and the first lines of what it said
+said : Ran -> String
+said r =
+  statusOf r.ended
+  ^ "\n"
+  ^ r.out
+  ^ joinWith "\n" (List.take 40 (lines r.err))
+
+-- (a number of the environment, else this one)
+numberOr : {e : HFunctor} -> {{sys : process <: e}} -> String -> Int -> Co e Int
+numberOr name dflt = do
+  v <- getEnv name
+  pure (fromMaybe dflt (parseInt (fromMaybe "" v)))
+
+-- | clang's flags: ASan's, and no free lists
+flags : List String
+flags =
+  [ "-O1"
+  , "-g"
+  , "-w"
+  , "-fsanitize=address"
+  , "-fno-omit-frame-pointer"
+  , "-DSMALL_MAX=0"
+  ]
+
+-- | whether there is a clang with ASan's runtime: a program of nothing,
+-- | built by it
+sanitizing : {e : HFunctor}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Co e Bool
+sanitizing = do
+  here <- workingDir
+  ok <- writeFile (here ^ "/none.c") "int main(void) { return 0; }\n"
+  r <-
+    run
+      { command = "clang"
+      , args = ["-fsanitize=address", here ^ "/none.c", "-o", here ^ "/none"]
+      , timeout = 60000
+      }
+  pure (succeeded r)
+
+-- | `cksum`'s lines, each a file's: its check and its size, a name
+-- | >>> checked "1 2 a.c\n3 4 b.c\n"
+-- | [MkPair "a.c" "1-2", MkPair "b.c" "3-4"]
+checked : String -> List (Pair String String)
+checked out =
+  List.concatMap
+    (\l -> case words l of
+     Cons c (Cons n (Cons f Nil)) ->
+       [MkPair (fromMaybe f (List.last (split "/" f))) (c ^ "-" ^ n)]
+     _ -> Nil)
+    (lines out)
+
+-- (each `x`, in `s`, `y`)
+replaced : String -> String -> String -> String
+replaced x y s = joinWith y (split x s)
+
+-- | each part, its object: named by the part and by what it is made of
+objects : String
+        -> String
+        -> List (Pair String String)
+        -> List (Pair String String)
+objects kept common parts =
+  List.map
+    (\p ->
+       MkPair
+         (fst p)
+         (kept
+          ^ "/"
+          ^ strSlice (fst p) 0 (strLength (fst p) - 2)
+          ^ "-"
+          ^ snd p
+          ^ "-"
+          ^ common
+          ^ ".o"))
+    parts
+
+-- (those of the objects not made yet, each a part and its object)
+missing : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> List (Pair String String)
+        -> Co e (List (Pair String String))
+missing Nil = pure Nil
+missing (Cons p rest) = do
+  there <- exists (snd p)
+  others <- missing rest
+  pure (if there then others else Cons p others)
+
+-- (the files of the directory not among these, removed)
+removedBut : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> List String
+           -> List String
+           -> Co e Unit
+removedBut dir keep Nil = pure MkUnit
+removedBut dir keep (Cons n rest) = do
+  gone <-
+    if List.any (\k -> strEq k (dir ^ "/" ^ n)) keep then pure True
+    else remove (dir ^ "/" ^ n)
+  removedBut dir keep rest
+
+-- | heff, built under ASan in `bin/` of the working directory, beside
+-- | its library and version, as a release lays it out, in a project as
+-- | the repository is: the objects not kept built first, as many at
+-- | once as `jobs`
+built : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Co e String
+built = do
+  root <- given "HEFF_TEST_ROOT"
+  here <- workingDir
+  jobs <- numberOr "HEFF_ASAN_JOBS" 4
+  dir <- pure (root ^ "/.heff/out/heff.d")
+  kept <- pure (root ^ "/.heff/ref/native-asan.o")
+  made <-
+    run
+      { command = "mkdir", args = ["-p", kept, here ^ "/bin", here ^ "/test"] }
+  laid <-
+    run
+      { command = "cp"
+      , args = ["-R", root ^ "/lib", root ^ "/package.hf", here]
+      }
+  programs <-
+    run
+      { command = "cp", args = ["-R", root ^ "/test/programs", here ^ "/test"] }
+  clang <- run { command = "clang", args = ["--version"] }
+  ok <- writeFile (here ^ "/made-of") (clang.out ^ joinWith " " flags)
+  common <-
+    run
+      { command = "sh"
+      , args =
+          [ "-c"
+          , "cat \"$0\" \"$1\" | cksum"
+          , here ^ "/made-of"
+          , dir ^ "/heff.h"
+          ]
+      }
+  names <- readDirectory dir
+  parts <-
+    pure (List.sort (List.filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+  sums <- run { command = "cksum", args = List.map (\n -> dir ^ "/" ^ n) parts }
+  objs <-
+    pure (objects kept (replaced " " "-" (trim common.out)) (checked sums.out))
+  needed <- missing objs
+  ok <-
+    writeFile
+      (here ^ "/parts")
+      (joinWith
+         ""
+         (List.map (\p -> dir ^ "/" ^ fst p ^ "\n" ^ snd p ^ "\n") needed))
+  -- (each part an object, so many at once -- clang given them all builds
+  -- them one after another -- each written whole or not at all)
+  b <-
+    run
+      { command = "sh"
+      , args =
+          [ "-c"
+          , "xargs -P \"$0\" -n 2 sh -c 'clang "
+          ^ joinWith " " flags
+          ^ " -c \"$0\" -o \"$1.part\" && mv \"$1.part\" \"$1\"' < \"$1\""
+          , show jobs
+          , here ^ "/parts"
+          ]
+      , timeout = 1800000
+      }
+  if not (succeeded b) then failure ("building it failed:\n" ^ said b)
+    else do
+      -- (an object no part is made of now let go)
+      inKept <- readDirectory kept
+      removedBut kept (List.map (\p -> snd p) objs) (fromMaybe Nil inKept)
+      linked <-
+        run
+          { command = "clang"
+          , args =
+              List.append
+                flags
+                (List.append
+                   (List.map (\p -> snd p) objs)
+                   ["-o", here ^ "/bin/heff", "-lm", "-lpthread"])
+          , timeout = 300000
+          }
+      if succeeded linked then pure (here ^ "/bin/heff")
+        else failure ("linking it failed:\n" ^ said linked)
+
+-- (what it leaves at its end is no fault: a program's last objects are
+-- the system's to take back)
+quiet : List (Pair String String)
+quiet = [MkPair "ASAN_OPTIONS" "detect_leaks=0"]
+
+-- (each program checked, a subtest)
+eachChecked : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> String
+            -> Int
+            -> List String
+            -> Co e Unit
+eachChecked heff limit Nil = pure MkUnit
+eachChecked heff limit (Cons f rest) = do
+  subtest f (do
+    here <- workingDir
+    -- (of what it says, the first MB: what ASan says of a fault is less)
+    r <-
+      run
+        { command = heff
+        , args = ["check", "test/programs/" ^ f]
+        , dir = here
+        , env = quiet
+        , timeout = limit * 1000
+        , keep = 1048576
+        }
+    if succeeded r then pure MkUnit else failure (said r))
+  eachChecked heff limit rest
+
+-- (the names a file defines at the start of a line, `name :`)
+defined : String -> List String
+defined src =
+  List.concatMap
+    (\l -> case words l of
+     Cons n (Cons ":" more) ->
+       if strLength n > 0 && byteAt n 0 >= 97 && byteAt n 0 <= 122 then [n]
+       else Nil
+     _ -> Nil)
+    (lines src)
+
+-- | a test program compiled to C by it, built under ASan as it is, each
+-- | of its definitions shown: `bytes-values`, whose Bytes are strings'
+-- | objects of their own kind in C, held in lists, records, constructors
+-- | and closures, grown in place and let go of
+compiledByIt : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> String
+             -> Int
+             -> String
+             -> Co e Unit
+compiledByIt heff limit f = do
+  here <- workingDir
+  src <- readFile (here ^ "/test/programs/" ^ f)
+  c <-
+    run
+      { command = heff
+      , args =
+          ["compile", "test/programs/" ^ f, here ^ "/program.c", "--backend=c"]
+      , dir = here
+      , env = quiet
+      , timeout = limit * 1000
+      }
+  b <-
+    if succeeded c
+    then run
+        { command = "clang"
+        , args =
+            List.append
+              flags
+              [here ^ "/program.c", "-o", here ^ "/program", "-lm", "-lpthread"]
+        , timeout = 300000
+        }
+    else pure c
+  out <-
+    if succeeded b
+    then run
+        { command = here ^ "/program"
+        , args = defined (fromMaybe "" src)
+        , env = quiet
+        , timeout = limit * 1000
+        , keep = 1048576
+        }
+    else pure b
+  if succeeded out then pure MkUnit else failure (said out)
+
+-- | heff under AddressSanitizer: built, each test program checked by it,
+-- | and one compiled to C by it and run, a subtest each
+asan : Test
+asan =
+  within
+    3600000
+    (integration "asan" (do
+     root <- given "HEFF_TEST_ROOT"
+     there <- sanitizing
+     if not there then pure MkUnit
+       else do
+         heff <- built
+         limit <- numberOr "HEFF_ASAN_TIMEOUT" 60
+         names <- readDirectory (root ^ "/test/programs")
+         subtest
+             "check"
+             (eachChecked
+                heff
+                limit
+                (List.sort
+                   (List.filter
+                      (\n -> endsWith ".hf" n)
+                      (fromMaybe Nil names))))
+         subtest
+             "compiled"
+             (subtest
+                "bytes-values.hf"
+                (compiledByIt heff limit "bytes-values.hf"))))

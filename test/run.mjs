@@ -34,9 +34,9 @@ export const groups = {
   compiler: [],
   lsp: [["heff", "test", "test/lsp.hf"]],
   // programs compiled by each backend and run, held to the interpreter
-  backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],
+  backends: [["heff", "test", "test/backends.hf", "test/apps.hf"]],
   // heff through C, under AddressSanitizer
-  asan: [["native-asan.mjs"]],
+  asan: [["heff", "test", "test/asan.hf"]],
 };
 
 const wanted = process.argv.slice(2);
