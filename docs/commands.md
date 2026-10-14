@@ -15,6 +15,10 @@ heff test [--seed N] [--run REGEXP] [--jobs N] [--update] [--watch] [FILE...]
                                # --jobs: integration tests at once; --update:
                                # write the golden texts; --watch: test again
                                # at each change, until ended
+heff bench [--run REGEXP] [--time D] [--count N] [--json] [FILE...]
+                               # run the benchmarks (bench's), built through C
+                               # (zig -O2), each until a run takes the time (1s),
+                               # a line each, as Go's; no FILE: the project's bench/
 heff promote FILE              # write each doc test's and watch's value as
                                # its expectation
 heff fmt [--check] FILE...     # format in place
@@ -60,6 +64,7 @@ does; run again with nothing changed, it costs a check of the cache and
 a link.
 
 What `heff test` and `heff promote` check is in [tests.md](tests.md);
+what `heff bench` runs, and how, in [benchmarks.md](benchmarks.md);
 how a project and its programs are laid out for `heff build`, `heff
 install` and `heff get`, in [projects.md](projects.md).
 

@@ -1,0 +1,725 @@
+-- `heff bench`: the benchmarks of files (bench's), as Go's `go test
+-- -bench` runs them.  A file's are built into a program through C, at
+-- `heff install`'s level, its objects counted as they are made, and
+-- each benchmark is run in it, a program of its own each time -- one
+-- that fails, abandons or ends otherwise ends no other -- and said a
+-- line each, in Go's format, so that runs are compared as Go's are.
+
+import co
+import heff.build.commands
+import heff.build.driver as Driver
+import heff.build.load as Load
+import heff.build.session as Session
+import heff.lsp.report as Report
+import heff.syntax.import as Import
+import json as Json
+import regex as Regex
+import std.filesystem
+import std.io
+import std.path as Path
+import std.process
+import std.progress as Progress
+
+-- The bench time
+--------------------------------------------------------------------------------
+
+-- | how long each benchmark is run: until a run takes these nanoseconds,
+-- | its count grown; or once, of this count
+data BenchTime = Nanos Int | Times Int
+
+-- (each byte a decimal digit, and some)
+allDigits : String -> Bool
+allDigits s =
+  strLength s > 0
+  && List.all
+    (\i -> byteAt s i >= 48 && byteAt s i <= 57)
+    (List.range 0 (strLength s - 1))
+
+-- (a number of decimal digits)
+digitsOf : String -> Maybe Int
+digitsOf s = if allDigits s then parseInt s else Nothing
+
+-- (ten to the `k`)
+tenTo : Int -> Int
+tenTo k = if k <= 0 then 1 else 10 * tenTo (k - 1)
+
+-- (a decimal's whole part and its fraction, each digits, of so many
+-- nanoseconds: how many nanoseconds it is)
+decimalOf : Int -> Maybe Int -> Maybe Int -> Int -> Maybe Int
+decimalOf unit (Just w) (Just f) places =
+  Just (w * unit + f * unit / tenTo places)
+decimalOf unit _ _ places = Nothing
+
+-- (a decimal, `1` or `1.5`, its parts cut at the `.`, of so many
+-- nanoseconds)
+decimalParts : Int -> List String -> Maybe Int
+decimalParts unit (Cons w Nil) = decimalOf unit (digitsOf w) (Just 0) 0
+decimalParts unit (Cons w (Cons f Nil)) =
+  decimalOf unit (digitsOf w) (digitsOf f) (strLength f)
+decimalParts unit _ = Nothing
+
+-- (a duration's units, each its nanoseconds: those that end as another
+-- does first, `ms` before `s`)
+units : List (Pair String Int)
+units =
+  [ MkPair "ns" 1
+  , MkPair "us" 1000
+  , MkPair "\u{b5}s" 1000
+  , MkPair "ms" 1000000
+  , MkPair "s" 1000000000
+  , MkPair "m" 60000000000
+  , MkPair "h" 3600000000000
+  ]
+
+-- (a duration, in its unit: its nanoseconds, if it is one, above 0)
+durationOf : String -> Maybe (Pair String Int) -> Maybe BenchTime
+durationOf s Nothing = Nothing
+durationOf s (Just (MkPair u unit)) = case decimalParts
+    unit
+    (split "." (strSlice s 0 (strLength s - strLength u))) of
+  Just n -> if n > 0 then Just (Nanos n) else Nothing
+  Nothing -> Nothing
+
+-- (a count, `100x`: one above 0)
+countTime : Maybe Int -> Maybe BenchTime
+countTime (Just n) = if n > 0 then Just (Times n) else Nothing
+countTime Nothing = Nothing
+
+-- | a bench time read, as Go's `-benchtime` reads one: a duration, a
+-- | decimal and its unit (`1s`, `1.5s`, `500ms`, `2m`; `ns`, `us`, `ms`,
+-- | `s`, `m`, `h`), or a count (`100x`), run once
+-- | >>> List.map benchTime ["1s", "1.5s", "500ms", "2m", "100x", "250us", "7ns"]
+-- | [Just (Nanos 1000000000), Just (Nanos 1500000000), Just (Nanos 500000000), Just (Nanos 120000000000), Just (Times 100), Just (Nanos 250000), Just (Nanos 7)]
+-- | >>> List.map benchTime ["s", "x", "0s", "0x", "-1s", "1.2.3s", "1", "1d", ""]
+-- | [Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing]
+benchTime : String -> Maybe BenchTime
+benchTime s =
+  if endsWith "x" s then countTime (digitsOf (strSlice s 0 (strLength s - 1)))
+  else durationOf
+      s
+      (List.find (\(u : Pair String Int) -> endsWith (fst u) s) units)
+
+-- | the bench time unless `--time` says: a second, as Go's
+defaultTime : BenchTime
+defaultTime = Nanos 1000000000
+
+-- Go's format
+--------------------------------------------------------------------------------
+
+-- (spaces, `n` of them)
+spaces : Int -> String
+spaces n = if n <= 0 then "" else " " ^ spaces (n - 1)
+
+-- (a text, spaces before it to `n` bytes, as Go's `%8d`)
+padLeft : Int -> String -> String
+padLeft n s = spaces (n - strLength s) ^ s
+
+-- (a text, spaces after it to `n` bytes, as Go's `%-*s`)
+padRight : Int -> String -> String
+padRight n s = s ^ spaces (n - strLength s)
+
+-- (a name's first byte capital, if it is a small letter)
+capital : String -> String
+capital s =
+  if strLength s > 0 && byteAt s 0 >= 97 && byteAt s 0 <= 122
+  then strSlice
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+      (byteAt s 0 - 97)
+      (byteAt s 0 - 96)
+    ^ strSlice s 1 (strLength s)
+  else s
+
+-- (a name, its spaces underscores, as Go writes a subbenchmark's)
+spaced : String -> String
+spaced s = joinWith "_" (split " " (joinWith "_" (split "\t" s)))
+
+-- | a benchmark's name as Go says one: `Benchmark`, then its names, its
+-- | groups' and its own, between `/`s, each's spaces underscores, the
+-- | first a capital
+-- | >>> goName ["fib", "20"]
+-- | "BenchmarkFib/20"
+-- | >>> goName ["sum to a million"]
+-- | "BenchmarkSum_to_a_million"
+goName : List String -> String
+goName Nil = "Benchmark"
+goName (Cons n rest) =
+  "Benchmark" ^ joinWith "/" (Cons (capital (spaced n)) (List.map spaced rest))
+
+-- (digits, zeros before them to `n`)
+zeroPadded : Int -> String -> String
+zeroPadded n s = if strLength s >= n then s else zeroPadded n ("0" ^ s)
+
+-- (a number of so many decimal places, scaled by ten to them: its
+-- digits, the point before the last `places`)
+pointed : Int -> Int -> String
+pointed 0 scaled = show scaled
+pointed places scaled =
+  show (scaled / tenTo places)
+  ^ "."
+  ^ zeroPadded places (show (scaled % tenTo places))
+
+-- (how many places Go gives `total / n`: fewer the larger it is, about
+-- five figures, none from 999.95 on)
+placesOf : Int -> Int -> Int -> Int
+placesOf total n k =
+  if k >= 7 || total * tenTo (k + 2) >= 99995 * n then k
+  else placesOf total n (k + 1)
+
+-- | nanoseconds per op as Go says them, `prettyPrint`'s: what took
+-- | `total` nanoseconds of `n` ops, to about five figures, in a column
+-- | 10 wide before the point
+-- | >>> List.map (\(p : Pair Int Int) -> perOp (fst p) (snd p)) [MkPair 41653000 1000, MkPair 1234567 1000, MkPair 123456 1000, MkPair 12345 1000, MkPair 1234 1000, MkPair 771 1000, MkPair 1 3, MkPair 0 5]
+-- | ["     41653", "      1235", "       123.5", "        12.35", "         1.234", "         0.7710", "         0.3333", "         0"]
+perOp : Int -> Int -> String
+perOp total n =
+  if total == 0 then padLeft 10 "0"
+  else padLeft
+      (10 + placesOf total n 0 + (if placesOf total n 0 > 0 then 1 else 0))
+      (pointed
+         (placesOf total n 0)
+         ((2 * total * tenTo (placesOf total n 0) + n) / (2 * n)))
+
+-- | what a benchmark's run came to: its count, nanoseconds, objects and
+-- | their bytes; or why it failed, or was skipped
+data Outcome
+  = Measured Int Int Int Int
+  | FailedWith String
+  | SkippedWith String
+
+-- | a benchmark's line, as Go's: its name (padded to `width`), its
+-- | count, its nanoseconds, bytes and objects per op
+-- | >>> resultLine 16 ["fib", "20"] 30000 1249590000 0 0
+-- | "BenchmarkFib/20 \t   30000\t     41653 ns/op\t       0 B/op\t       0 allocs/op"
+resultLine : Int -> List String -> Int -> Int -> Int -> Int -> String
+resultLine width names n ns allocs bytes =
+  padRight width (goName names)
+  ^ "\t"
+  ^ padLeft 8 (show n)
+  ^ "\t"
+  ^ perOp ns n
+  ^ " ns/op\t"
+  ^ padLeft 8 (show (bytes / n))
+  ^ " B/op\t"
+  ^ padLeft 8 (show (allocs / n))
+  ^ " allocs/op"
+
+-- (a text's lines, each indented, as Go says a failure's)
+indented : String -> String
+indented t = joinWith "\n" (List.map (\l -> "    " ^ l) (split "\n" t))
+
+-- | what came of a run, as Go says it: its line; or `--- FAIL: NAME`, and
+-- | why under it; or `--- SKIP: NAME`, and why
+outcomeText : Int -> List String -> Outcome -> String
+outcomeText width names (Measured n ns allocs bytes) =
+  resultLine width names n ns allocs bytes
+outcomeText width names (FailedWith why) =
+  "--- FAIL: " ^ goName names ^ "\n" ^ indented why
+outcomeText width names (SkippedWith why) =
+  "--- SKIP: " ^ goName names ^ "\n" ^ indented why
+
+-- (a text, as JSON)
+jstrs : List String -> Json.Json
+jstrs ss = JArray (List.map Json.jstr ss)
+
+-- (what came of a run, its fields in JSON)
+outcomeFields : Outcome -> List (Pair String Json.Json)
+outcomeFields (Measured n ns allocs bytes) =
+  [ Json.kv "n" (JInt n)
+  , Json.kv "ns" (JInt ns)
+  , Json.kv "allocs" (JInt allocs)
+  , Json.kv "bytes" (JInt bytes)
+  , Json.kv "ns_per_op" (JFloat (toFloat ns /. toFloat n))
+  , Json.kv "bytes_per_op" (JInt (bytes / n))
+  , Json.kv "allocs_per_op" (JInt (allocs / n))
+  ]
+outcomeFields (FailedWith why) = [Json.kv "failed" (Json.jstr why)]
+outcomeFields (SkippedWith why) = [Json.kv "skipped" (Json.jstr why)]
+
+-- | what came of a run as `--json` says it, a line: the file, the name
+-- | as Go says it and its names, then its count, nanoseconds, objects
+-- | and bytes, and those per op; or why it failed, or was skipped
+outcomeJson : String -> List String -> Outcome -> String
+outcomeJson f names o =
+  Json.stringify
+    (Json.obj
+       (Cons
+          (Json.kv "file" (Json.jstr f))
+          (Cons
+             (Json.kv "name" (Json.jstr (goName names)))
+             (Cons (Json.kv "names" (jstrs names)) (outcomeFields o)))))
+
+-- Running
+--------------------------------------------------------------------------------
+
+-- | how `heff bench` runs the benchmarks: the pattern of those run
+-- | (`--run`; `""`: all), how long each is run, how many times each
+-- | (`--count`), and whether each is said as JSON
+type BenchOpts =
+  { pattern : String, time : BenchTime, count : Int, json : Bool }
+
+-- | what came of the files benchmarked so far: how many benchmarks were
+-- | run, and how many failed (a file that does not build, one)
+type BenchRes = { ran : Int, failed : Int }
+
+addBench : BenchRes -> BenchRes -> BenchRes
+addBench a b = { ran = a.ran + b.ran, failed = a.failed + b.failed }
+
+-- | what `heff bench` names the program it adds to a file to run its
+-- | benchmarks (bench's `benchMain` of them)
+benchMainName : String
+benchMainName = "heffBenchMain"
+
+-- (how a file names what bench defines, if it imports it)
+benchQualifier : List Import.Import -> Maybe String
+benchQualifier Nil = Nothing
+benchQualifier (Cons i rest) =
+  if strEq i.name "bench" then Just (prefixOf i.alias) else benchQualifier rest
+
+-- (the program added to the file's text: bench's `benchMain` of its
+-- benchmarks)
+benchText : String -> List Driver.Own -> String
+benchText q bs =
+  "\n\n"
+  ^ benchMainName
+  ^ " : "
+  ^ q
+  ^ "Benchmarks\n"
+  ^ benchMainName
+  ^ " = "
+  ^ q
+  ^ "benchMain ["
+  ^ joinWith ", " (List.map (\(o : Driver.Own) -> o.name) bs)
+  ^ "]\n"
+
+-- (the file's source, how it names bench: the program added to it)
+benchAdded : Load.Loaded
+           -> Driver.Checked
+           -> Driver.Source
+           -> Either String Load.Loaded
+benchAdded l c src = case benchQualifier
+    (writtenImports (Driver.importsOfSource src)) of
+  Nothing -> Left "it does not import bench, which runs its benchmarks"
+  Just q ->
+    Right
+      (loadedWith
+         l
+         (sourcesWith c.module (benchText q (Driver.benchesOf c)) l.sources))
+
+-- (the file loaded, its source with the program added: else why it
+-- cannot be)
+benchLoaded : Load.Loaded -> Driver.Checked -> Either String Load.Loaded
+benchLoaded l c = case List.find
+    (\(src : Driver.Source) -> strEq src.module c.module)
+    l.sources of
+  Nothing -> Left "its file is not among those loaded"
+  Just src -> benchAdded l c src
+
+-- (where `heff bench` builds a file's benchmarks: `.heff/bench/F/`, F
+-- its path, its separators underscores)
+benchDir : Load.Paths -> String -> String
+benchDir paths file =
+  Load.under
+    paths
+    (Load.under paths paths.root ".heff/bench")
+    (joinWith "_" (Path.components paths.style file))
+
+-- (the program built of the file's benchmarks)
+benchProgram : Load.Paths -> String -> String
+benchProgram paths file =
+  Load.under paths (benchDir paths file) (programFile paths.style "main")
+
+-- (the last line of what a program wrote, but the empty one after it)
+lastLine : String -> String
+lastLine t =
+  fromMaybe "" (List.last (List.filter (\l -> not (strEq l "")) (split "\n" t)))
+
+-- (why a program came to nothing it said)
+endedWhy : Ran -> String
+endedWhy r =
+  if contains "heff:abandon" r.err then "it abandoned"
+  else "it "
+    ^ endedSaid r.ended
+    ^ (if strEq r.err "" then "" else ":\n" ^ lastLines 20 r.err)
+
+-- (a benchmark's run, as its program said it: JSON)
+outcomeOfLine : Json.Json -> Outcome
+outcomeOfLine j = case Json.int ["n"] j of
+  Just n ->
+    Measured
+      n
+      (fromMaybe 0 (Json.int ["ns"] j))
+      (fromMaybe 0 (Json.int ["allocs"] j))
+      (fromMaybe 0 (Json.int ["bytes"] j))
+  Nothing -> case Json.str ["skipped"] j of
+    Just why -> SkippedWith why
+    Nothing ->
+      FailedWith
+        (fromMaybe "it said nothing of how it went" (Json.str ["failed"] j))
+
+-- | what came of a benchmark's run, its program run: what it said, a line
+-- | of JSON, else how it ended (abandoned, say) and what it said on its
+-- | error stream
+outcomeOfRan : Ran -> Outcome
+outcomeOfRan r =
+  if not (succeeded r) then FailedWith (endedWhy r)
+  else case Json.parse (lastLine r.out) of
+    Left why -> FailedWith "what it said of how it went could not be read"
+    Right j -> outcomeOfLine j
+
+-- (the names of a level each, as the program lists them, JSON)
+namesOfJson : Json.Json -> List String
+namesOfJson (JArray ns) = List.map (\n -> fromMaybe "" (Json.str Nil n)) ns
+namesOfJson _ = Nil
+
+-- | the benchmarks a file's program lists, those selected, each by its
+-- | names: else why it could not say them
+listedOf : Ran -> Either String (List (List String))
+listedOf r =
+  if not (succeeded r) then Left (endedWhy r)
+  else case Json.parse (lastLine r.out) of
+    Right (JArray bs) -> Right (List.map namesOfJson bs)
+    _ -> Left "what it listed could not be read"
+
+-- (the arguments of a run of the benchmark of these names: the
+-- nanoseconds it is run for, and a count, 0 where it is not given)
+runArgs : BenchTime -> List String -> List String
+runArgs (Nanos ns) names = Cons "run" (Cons (show ns) (Cons "0" names))
+runArgs (Times n) names = Cons "run" (Cons "0" (Cons (show n) names))
+
+-- (what came of a run said: Go's line, or JSON)
+saidRun : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> BenchOpts
+        -> String
+        -> Int
+        -> List String
+        -> Outcome
+        -> Co e Unit
+saidRun opts f width names o =
+  if opts.json then print (outcomeJson f names o)
+  else print (outcomeText width names o)
+
+-- (was it measured)
+isMeasured : Outcome -> Bool
+isMeasured (Measured _ _ _ _) = True
+isMeasured _ = False
+
+isFailed : Outcome -> Bool
+isFailed (FailedWith _) = True
+isFailed _ = False
+
+-- | the benchmark of these names run `left` more times, each in a program
+-- | of its own, what came of each said; one that fails, or is skipped,
+-- | not again
+runTimes : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> BenchOpts
+         -> String
+         -> String
+         -> Int
+         -> List String
+         -> Int
+         -> BenchRes
+         -> Co e BenchRes
+runTimes opts f prog width names left acc =
+  if left <= 0 then pure acc
+  else do
+    r <- run { command = prog, args = runArgs opts.time names }
+    o <- pure (outcomeOfRan r)
+    saidRun opts f width names o
+    if isMeasured o
+      then runTimes
+          opts
+          f
+          prog
+          width
+          names
+          (left - 1)
+          { ran = acc.ran + 1, failed = acc.failed }
+      else pure
+          { ran = acc.ran + 1
+          , failed = acc.failed + (if isFailed o then 1 else 0)
+          }
+
+-- (each benchmark of these names run, `--count` times each)
+runEach : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> BenchOpts
+        -> String
+        -> String
+        -> Int
+        -> List (List String)
+        -> BenchRes
+        -> Co e BenchRes
+runEach opts f prog width Nil acc = pure acc
+runEach opts f prog width (Cons names rest) acc = do
+  res <- runTimes opts f prog width names opts.count acc
+  runEach opts f prog width rest res
+
+-- (a file that cannot be benchmarked: why, said, and counted one that
+-- failed)
+notBenched : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> BenchOpts
+           -> String
+           -> String
+           -> Co e BenchRes
+notBenched opts f why = do
+  if opts.json
+    then print
+        (Json.stringify
+           (Json.obj
+              [Json.kv "file" (Json.jstr f), Json.kv "failed" (Json.jstr why)]))
+    else print ("FAIL  " ^ f ^ "\n" ^ indented why)
+  pure { ran = 0, failed = 1 }
+
+-- (the longest of the names, as Go says them: what each is padded to)
+widthOf : List (List String) -> Int
+widthOf bs = List.foldl (\w names -> max w (strLength (goName names))) 0 bs
+
+-- (the benchmarks the program lists, run, the file's line said around
+-- them: `pkg: FILE` before, as Go's, and `ok` or `FAIL` after)
+runListed : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> BenchOpts
+          -> String
+          -> String
+          -> List (List String)
+          -> Co e BenchRes
+runListed opts f prog Nil = pure { ran = 0, failed = 0 }
+runListed opts f prog bs = do
+  if opts.json then pure MkUnit else print ("pkg: " ^ f)
+  res <- runEach opts f prog (widthOf bs) bs { ran = 0, failed = 0 }
+  if opts.json then pure MkUnit
+    else print ((if res.failed > 0 then "FAIL  " else "ok    ") ^ f)
+  pure res
+
+-- | the file's benchmarks run in its program: those the pattern selects,
+-- | as the program lists them, each run as many times as `--count` says
+runBuilt : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> BenchOpts
+         -> String
+         -> String
+         -> Co e BenchRes
+runBuilt opts f prog = do
+  r <- run { command = prog, args = ["list", opts.pattern] }
+  case listedOf r of
+    Left why -> notBenched opts f ("its benchmarks could not be listed: " ^ why)
+    Right bs -> runListed opts f prog bs
+
+-- | the file's benchmarks built, into a program of the file's (bench's
+-- | `benchMain` of them), through C at `heff install`'s level, `-O2`,
+-- | its objects counted as they are made; then run, what came of them
+-- | given to `k`
+buildBenches : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> {{rep : Report.report <: e}}
+             -> {{prog : Progress.progress <: e}}
+             -> BenchOpts
+             -> String
+             -> Load.Loaded
+             -> Driver.Checked
+             -> (BenchRes -> Co e Unit)
+             -> Co e Unit
+buildBenches opts f l c k = case benchLoaded l c of
+  Left why -> do
+    res <- notBenched opts f why
+    k res
+  Right withMain -> do
+    task <- Progress.start Progress.root (f ^ ": benchmarks") 2
+    cc <- Progress.start task "compiling to C" 0
+    cLoadedOr
+        (\why -> do
+         Progress.end cc
+         Progress.end task
+         res <- notBenched opts f why
+         k res)
+        withMain
+        (Just benchMainName)
+        (benchDir l.paths f ^ "/")
+        f
+        (ended
+           cc
+           (zigBuildFlagsOr
+              (\why -> do
+               Progress.end task
+               res <- notBenched opts f why
+               k res)
+              "heff bench"
+              l.paths.style
+              ["-O2", "-DHEFF_COUNT_ALLOCS"]
+              task
+              (benchDir l.paths f)
+              (benchProgram l.paths f) (do
+            Progress.end task
+            real <- realPath (benchProgram l.paths f)
+            res <- runBuilt opts f (pathOr (benchProgram l.paths f) real)
+            k res)))
+
+-- | a file benchmarked: checked, and its benchmarks, if it has some,
+-- | built and run (one with none is passed over, nothing said of it);
+-- | what came of them given to `k`
+benchFile : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{rep : Report.report <: e}}
+          -> {{prog : Progress.progress <: e}}
+          -> BenchOpts
+          -> String
+          -> (BenchRes -> Co e Unit)
+          -> Co e Unit
+benchFile opts f k = do
+  l <- load f
+  cs <- Session.cachedProgram l
+  case Driver.lastChecked cs of
+    Just c ->
+      if List.null l.errors && not (anyErrors cs)
+      then (if List.null (Driver.benchesOf c) then k { ran = 0, failed = 0 }
+            else buildBenches opts f l c k)
+      else do
+        badL <- printErrs "heff" l.errors 0
+        bad <- diagCount cs
+        res <- notBenched opts f (firstWrong f l.errors cs)
+        k res
+    Nothing -> do
+      badL <- printErrs "heff" l.errors 0
+      res <- notBenched opts f (firstWrong f l.errors cs)
+      k res
+
+-- (the last of `heff bench`: where no benchmark ran, said so, and its
+-- status)
+benchSummary : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> BenchOpts
+             -> BenchRes
+             -> Co e Unit
+benchSummary opts acc =
+  if acc.ran == 0 && acc.failed == 0
+  then do
+    printErr
+        (if strEq opts.pattern "" then "heff bench: no benchmarks"
+         else "heff bench: no benchmarks match '" ^ opts.pattern ^ "'")
+    exit 1
+  else if acc.failed > 0
+  then exit 1
+  else pure MkUnit
+
+-- | each file given benchmarked, in turn, then the last said
+benchEach : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{rep : Report.report <: e}}
+          -> {{prog : Progress.progress <: e}}
+          -> BenchOpts
+          -> List String
+          -> BenchRes
+          -> Co e Unit
+benchEach opts Nil acc = benchSummary opts acc
+benchEach opts (Cons f rest) acc =
+  benchFile opts f (\res -> benchEach opts rest (addBench acc res))
+
+-- | the files `heff bench` runs the benchmarks of: those given, a
+-- | directory's `.hf` files for it; none given, the project's
+-- | benchmarks here (the `.hf` files under `bench/`)
+benchFiles : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> List String
+           -> Co e (List String)
+benchFiles Nil = do
+  names <- readDirectory "bench"
+  case names of
+    Just _ -> testFilesGo [MkPair True "bench"] Nil
+    Nothing -> do
+      printErr
+          "heff bench: no bench/ here: bench at the project's root, or give FILEs"
+      exit 1
+      pure Nil
+benchFiles given = testFilesGo (List.map (\f -> MkPair True f) given) Nil
+
+-- (a count given, one above 0: else said, and the end)
+countGiven : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> Maybe String
+           -> Co e Int
+countGiven Nothing = pure 1
+countGiven (Just s) = case digitsOf s of
+  Just n ->
+    if n > 0 then pure n
+    else do
+      printErr ("heff bench: --count " ^ s ^ ": not a count above 0")
+      exit 2
+      pure 1
+  Nothing -> do
+    printErr ("heff bench: --count " ^ s ^ ": not a count above 0")
+    exit 2
+    pure 1
+
+-- (a bench time given: else said, and the end)
+timeGiven : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> Maybe String
+          -> Co e BenchTime
+timeGiven Nothing = pure defaultTime
+timeGiven (Just s) = case benchTime s of
+  Just t -> pure t
+  Nothing -> do
+    printErr
+        ("heff bench: --time "
+         ^ s
+         ^ ": not a duration (1s, 1.5s, 500ms, 2m) nor a count (100x)")
+    exit 2
+    pure defaultTime
+
+-- | `heff bench`'s options read: the pattern (read here, one that is not
+-- | ends the run), the bench time, the count, and whether it says JSON
+benchOptions : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> Maybe String
+             -> Maybe String
+             -> Maybe String
+             -> Bool
+             -> Co e BenchOpts
+benchOptions pattern time count json = do
+  case Regex.compileLevels (fromMaybe "" pattern) of
+    Left why -> do
+      printErr ("heff bench: --run " ^ fromMaybe "" pattern ^ ": " ^ why)
+      exit 2
+    Right _ -> pure MkUnit
+  t <- timeGiven time
+  n <- countGiven count
+  pure { pattern = fromMaybe "" pattern, time = t, count = n, json = json }
+
+-- | `heff bench`: the benchmarks of the files given (else of bench/),
+-- | those `--run` selects, each run for the bench time, as many times as
+-- | `--count` says, and said a line each
+benchCmd : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{rep : Report.report <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> Maybe String
+         -> Maybe String
+         -> Maybe String
+         -> Bool
+         -> List String
+         -> Co e Unit
+benchCmd pattern time count json given = do
+  opts <- benchOptions pattern time count json
+  files <- benchFiles given
+  benchEach opts files { ran = 0, failed = 0 }

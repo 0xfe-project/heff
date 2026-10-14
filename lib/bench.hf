@@ -1,0 +1,384 @@
+-- Benchmarks, run by `heff bench`, as Go's `testing.B` runs them.
+--
+-- A benchmark is a top-level definition of type `Bench`, found by its
+-- type as a test is, and named by its groups' names and its own.  Its
+-- body is given a count, `n`, and does the work measured `n` times;
+-- `heff bench` runs it with 1, then with a count predicted from the run
+-- before, until a run takes the bench time (a second, `--time`), and
+-- says the last run: its count, and per time it did the work, its
+-- nanoseconds, the bytes it made and how many objects.
+--
+--   import bench as Bench
+--
+--   fib : Int -> Int
+--   fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)
+--
+--   fibs : Bench.Bench
+--   fibs = Bench.group "fib"
+--     [ Bench.bench "10" (\n -> Bench.times n (\i -> fib (Bench.keep 10)))
+--     , Bench.bench "20" (\n -> Bench.times n (\i -> fib (Bench.keep 20)))
+--     ]
+--
+-- The work's result is kept (`times` keeps each, `keep` one): the
+-- compiler drops what is computed and never used, and computes once
+-- what is made of what it knows -- `fib 20` is the same each time, but
+-- `fib (keep 20)` is computed each time, as `keep 20` is not known.
+-- What a body does before its `\n ->` is done once, when the benchmark
+-- is made, not measured.  A body may check what it computed (check's
+-- `assert`, `failure`, `skip`): a run that fails ends the benchmark,
+-- which `heff bench` says failed.
+--
+-- `heff bench` builds a file's benchmarks into a program through C, at
+-- `heff install`'s level (`benchMain`), its objects counted as they are
+-- made, and runs each benchmark in it.
+
+import check as Check
+import co
+import json as Json
+import regex as Regex
+import std.io
+import std.process as Process
+
+-- The black hole
+--------------------------------------------------------------------------------
+
+-- | The value, as it is; but no pass of the compiler, nor the C compiler
+-- | after it, knows what it is, nor drops it, its result unused: what
+-- | a benchmark's work is kept by, which the compiler would otherwise
+-- | drop, its result unused, or compute once, what it is made of known.
+-- | `times` keeps each result; `keep` the work's arguments too (`fib
+-- | (keep 20)`, not computed once).  It costs nothing: no instruction.
+-- | >>> keep 20 + 1
+-- | 21
+primitive keep : {a : Type} -> a -> a
+
+-- The timer
+--------------------------------------------------------------------------------
+
+-- | What came of a run of a benchmark: it went through, it failed (why),
+-- | or it was skipped (why: what it needs is not there).
+data Ran = RanThrough | RanFailed Check.Failure | RanSkipped String
+
+-- | What a run took: its nanoseconds, and the objects it made and their
+-- | bytes (0 where they are not counted, not built by `heff bench`).
+data Sample = MkSample Int Int Int
+
+-- | The timer, the world's (its provider's, in C): started with the run's
+-- | count, which it gives back, so that the work made of it comes after;
+-- | stopped with what came of the run, so that the work comes before --
+-- | what the run took.
+data TimerF (m : Type -> Type) x
+  = StartTimer Int (Int -> x)
+  | StopTimer Ran (Sample -> x)
+
+-- | The timer as an effect.
+timer : HFunctor
+timer =
+  { f = TimerF
+  , hfmap = \m g p -> case p of
+      StartTimer c k -> StartTimer c (\i -> g (k i))
+      StopTimer r k -> StopTimer r (\s -> g (k s))
+  , hmap = \m n nt p -> case p of
+      StartTimer c k -> StartTimer c k
+      StopTimer r k -> StopTimer r k
+  }
+
+-- | The timer started, for a run of this count: the count, given back.
+startTimer : {e : HFunctor} -> {{tm : timer <: e}} -> Int -> Co e Int
+startTimer c = op (tm (StartTimer c (\i -> i))) val
+
+-- | The timer stopped, the run come to this: what it took.
+stopTimer : {e : HFunctor} -> {{tm : timer <: e}} -> Ran -> Co e Sample
+stopTimer r = op (tm (StopTimer r (\s -> s))) val
+
+-- Benchmarks
+--------------------------------------------------------------------------------
+
+-- | A benchmark: its body, given the count, in checking's effect; or
+-- | benchmarks under a name.
+data Bench
+  = Benchmark String (Int -> Co Check.check Unit)
+  | Group String (List Bench)
+
+-- | A benchmark: its body does the work as many times as it is given,
+-- | and may check what it computed.  What it does before its `\n ->` is
+-- | done once, when the benchmark is made.
+bench : String
+      -> ({e : HFunctor} -> {{chk : Check.check <: e}} -> Int -> Co e Unit)
+      -> Bench
+bench name body = Benchmark name (body (chk := here Check.check))
+
+-- | Benchmarks under a name.
+group : String -> List Bench -> Bench
+group name bs = Group name bs
+
+-- (the work from `i` on to `n`, each result kept)
+timesFrom : {a : Type} -> Int -> Int -> (Int -> a) -> Unit
+timesFrom i n f =
+  if i >= n then MkUnit
+  else let kept = keep (f i) in timesFrom (i + 1) n f
+
+-- | The work done `n` times, `f 0` to `f (n - 1)`, each result kept: a
+-- | benchmark's body, as Go's `for i := 0; i < b.N; i++`.
+times : {a : Type} -> {e : HFunctor} -> Int -> (Int -> a) -> Co e Unit
+times n f = pure (timesFrom 0 n f)
+
+-- Running
+--------------------------------------------------------------------------------
+
+-- | A run, as far as it went: going on, or ended (failed, skipped).
+data Step a = Goes a | Ends Ran
+
+-- | Checking, as a benchmark is run: a failure ends the run, as a skip
+-- | does; a label and a note are passed over.
+checker : Handler Check.check
+checker =
+  { M = \a -> Step a
+  , ret = \x -> Goes x
+  , bind = \m k -> case m of
+      Goes x -> k x
+      Ends r -> Ends r
+  , malg = \p -> case p of
+      Fail f -> Ends (RanFailed f)
+      Discard -> Ends (RanFailed (Because "a benchmark gives up no run"))
+      Skip why -> Ends (RanSkipped why)
+      Label l x -> Goes x
+      Note s x -> Goes x
+      Golden n t x ->
+        Ends (RanFailed (Because "a benchmark keeps no golden text"))
+      Sub s c x ->
+        Ends (RanFailed (Because "a subtest is an integration test's"))
+  }
+
+ranOf : Step Unit -> Ran
+ranOf (Goes u) = RanThrough
+ranOf (Ends r) = r
+
+-- | A run of the body, of this count, timed: the timer started, the
+-- | body run on the count it gives back, and stopped with what came of
+-- | it.
+runOnce : {e : HFunctor}
+        -> {{tm : timer <: e}}
+        -> (Int -> Co Check.check Unit)
+        -> Int
+        -> Co e (Pair Ran Sample)
+runOnce body c = do
+  given <- startTimer c
+  r <- pure (ranOf (handle checker (body given)))
+  s <- stopTimer r
+  pure (MkPair r s)
+
+-- | How long a benchmark is run: until a run takes these nanoseconds, its
+-- | count grown; or once, of this count (Go's `-benchtime 100x`).
+data Goal = ForNanos Int | ForCount Int
+
+-- | What came of a benchmark: its last run's count and what it took, or
+-- | a run that did not go through.
+data Measured = MeasuredAt Int Sample | Unmeasured Ran
+
+-- | the most a run counts: a billion, as Go's
+maxCount : Int
+maxCount = 1000000000
+
+-- (a count predicted, a fifth more, held between one more than the
+-- last and a hundred times it)
+grownTo : Int -> Int -> Int
+grownTo last p = min (max (min (p + p / 5) (100 * last)) (last + 1)) maxCount
+
+-- | The count of the next run, as Go predicts it: the goal over what the
+-- | last took per time, a fifth more -- but a hundred times the last at
+-- | most, one more at least, and a billion at most.
+-- | >>> nextCount 1000000000 1 1000
+-- | 100
+-- | >>> nextCount 1000000000 100 1000000
+-- | 10000
+-- | >>> nextCount 1000000000 10000 50000000
+-- | 240000
+-- | >>> nextCount 1000000000 500000000 900000000
+-- | 666666666
+-- | >>> nextCount 1000000000 7 0
+-- | 700
+nextCount : Int -> Int -> Int -> Int
+nextCount goal last ns = grownTo last (goal * last / max ns 1)
+
+-- (runs grown from the last, of count `c`, until one takes the goal)
+grow : {e : HFunctor}
+     -> {{tm : timer <: e}}
+     -> Int
+     -> (Int -> Co Check.check Unit)
+     -> Int
+     -> Pair Ran Sample
+     -> Co e Measured
+grow goal body c (MkPair RanThrough (MkSample ns a b)) =
+  if ns >= goal || c >= maxCount then pure (MeasuredAt c (MkSample ns a b))
+  else do
+    next <- runOnce body (nextCount goal c ns)
+    grow goal body (nextCount goal c ns) next
+grow goal body c (MkPair r s) = pure (Unmeasured r)
+
+-- (a run of this count, what it came to)
+measuredOf : Int -> Pair Ran Sample -> Measured
+measuredOf c (MkPair RanThrough s) = MeasuredAt c s
+measuredOf c (MkPair r s) = Unmeasured r
+
+-- | A benchmark measured, as Go measures one: run once, then again, its
+-- | count grown, until a run takes the goal (or of the count given).
+measure : {e : HFunctor}
+        -> {{tm : timer <: e}}
+        -> Goal
+        -> (Int -> Co Check.check Unit)
+        -> Co e Measured
+measure (ForNanos goal) body = do
+  first <- runOnce body 1
+  grow goal body 1 first
+measure (ForCount c) body = do
+  r <- runOnce body c
+  pure (measuredOf c r)
+
+-- The program
+--------------------------------------------------------------------------------
+
+-- | Each benchmark under these groups, by its names, its groups' and its
+-- | own, and its body.
+benchmarksUnder : List String
+                -> Bench
+                -> List (Pair (List String) (Int -> Co Check.check Unit))
+benchmarksUnder path (Benchmark name body) =
+  [MkPair (List.append path [name]) body]
+benchmarksUnder path (Group name bs) =
+  List.concatMap (\b -> benchmarksUnder (List.append path [name]) b) bs
+
+-- (each benchmark of these, by its names)
+benchmarksOf : List Bench
+             -> List (Pair (List String) (Int -> Co Check.check Unit))
+benchmarksOf bs = List.concatMap (\b -> benchmarksUnder Nil b) bs
+
+-- | The names of each benchmark the levels of a pattern select, as
+-- | `heff test --run` selects tests (check's `selectedBy`).
+selectedNames : List Regex.Regex -> List Bench -> List (List String)
+selectedNames sel bs =
+  List.filter
+    (\names -> Check.selectedBy sel names)
+    (List.map fst (benchmarksOf bs))
+
+-- (the same names, a level each)
+sameNames : List String -> List String -> Bool
+sameNames Nil Nil = True
+sameNames (Cons a as) (Cons b bs) = strEq a b && sameNames as bs
+sameNames _ _ = False
+
+-- | the benchmark of these names
+benchmarkNamed : List String
+               -> List Bench
+               -> Maybe (Int -> Co Check.check Unit)
+benchmarkNamed names bs =
+  maybe
+    Nothing
+    (\(p : Pair (List String) (Int -> Co Check.check Unit)) -> Just (snd p))
+    (List.find
+       (\(p : Pair (List String) (Int -> Co Check.check Unit)) ->
+          sameNames (fst p) names)
+       (benchmarksOf bs))
+
+-- (why a run failed, in words)
+failureText : Check.Failure -> String
+failureText (Because why) = why
+failureText (Differ expected got) = "expected " ^ expected ^ "\nbut got  " ^ got
+
+-- | What came of a benchmark, as its program says it: JSON, its count,
+-- | nanoseconds, objects and bytes; or why it failed, or was skipped.
+measuredJson : Measured -> Json.Json
+measuredJson (MeasuredAt c (MkSample ns a b)) =
+  Json.obj
+    [ Json.kv "n" (JInt c)
+    , Json.kv "ns" (JInt ns)
+    , Json.kv "allocs" (JInt a)
+    , Json.kv "bytes" (JInt b)
+    ]
+measuredJson (Unmeasured (RanFailed f)) =
+  Json.obj [Json.kv "failed" (Json.jstr (failureText f))]
+measuredJson (Unmeasured (RanSkipped why)) =
+  Json.obj [Json.kv "skipped" (Json.jstr why)]
+measuredJson (Unmeasured RanThrough) =
+  Json.obj [Json.kv "failed" (Json.jstr "it was not measured")]
+
+-- (the goal a run is given: a count, if it is one above 0, else these
+-- nanoseconds)
+goalOf : Int -> Int -> Goal
+goalOf nanos c = if c > 0 then ForCount c else ForNanos nanos
+
+-- (the benchmark of these names measured, and said)
+measuredSaid : {e : HFunctor}
+             -> {{tm : timer <: e}}
+             -> {{sys : Process.process <: e}}
+             -> {{io : stdio <: e}}
+             -> Goal
+             -> Maybe (Int -> Co Check.check Unit)
+             -> Co e Unit
+measuredSaid goal Nothing = do
+  printErr "heff bench: no such benchmark"
+  Process.exit 2
+measuredSaid goal (Just body) = do
+  m <- measure goal body
+  print (Json.stringify (measuredJson m))
+
+-- (what the program is asked, by its arguments: `list PATTERN`, the
+-- names of the benchmarks selected, a JSON list of their levels; `run
+-- NANOS COUNT NAME...`, the benchmark of those names measured)
+asked : {e : HFunctor}
+      -> {{tm : timer <: e}}
+      -> {{sys : Process.process <: e}}
+      -> {{io : stdio <: e}}
+      -> List Bench
+      -> List String
+      -> Co e Unit
+asked bs (Cons cmd (Cons pattern Nil)) =
+  if strEq cmd "list"
+  then case Regex.compileLevels pattern of
+    Left why -> do
+      printErr ("heff bench: " ^ pattern ^ ": " ^ why)
+      Process.exit 2
+    Right sel ->
+      print
+        (Json.stringify
+           (JArray
+              (List.map
+                 (\names -> JArray (List.map Json.jstr names))
+                 (selectedNames sel bs))))
+  else do
+    printErr "heff bench: asked for nothing it does"
+    Process.exit 2
+asked bs (Cons cmd (Cons nanos (Cons c names))) =
+  if strEq cmd "run"
+  then measuredSaid
+      (goalOf (fromMaybe 0 (parseInt nanos)) (fromMaybe 0 (parseInt c)))
+      (benchmarkNamed names bs)
+  else do
+    printErr "heff bench: asked for nothing it does"
+    Process.exit 2
+asked bs _ = do
+  printErr "heff bench: asked for nothing it does"
+  Process.exit 2
+
+-- | The effects a file's benchmarks are run in: the timer, the
+-- | program's arguments and its output.
+measured : HFunctor
+measured = timer <+> Process.process <+> stdio
+
+-- | What a file's benchmarks are run by: `benchMain`'s.
+type Benchmarks = Co measured Unit
+
+-- | The program `heff bench` builds of a file's benchmarks: asked for
+-- | them by its arguments, it says the names of those a pattern selects
+-- | (`list PATTERN`), or measures the one its names name (`run NANOS
+-- | COUNT NAME...`, a count above 0 run once, else until a run takes
+-- | the nanoseconds) and says what came of it, a line of JSON.
+benchMain : List Bench -> Benchmarks
+benchMain bs = do
+  as <- Process.args (ev := \p -> InL (InR p))
+  asked
+      (tm := \p -> InL (InL p))
+      (sys := \p -> InL (InR p))
+      (io := \p -> InR p)
+      bs
+      as

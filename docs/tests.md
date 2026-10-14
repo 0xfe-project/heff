@@ -3,7 +3,8 @@
 Three kinds of check, all run by `heff test` (on the files given, else
 the project's `test/`): doc tests, watches and tests.  `heff promote
 FILE` writes the value of each doc test and watch of a file under it as
-its expectation.
+its expectation.  Benchmarks are `heff bench`'s
+([benchmarks.md](benchmarks.md)).
 
 ## Doc tests
 

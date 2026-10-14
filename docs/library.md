@@ -57,7 +57,8 @@ are imported by their names:
   which FxHash lacks, so that the low bits a trie looks at first are
   mixed; an integer's is that finish of its low 64 bits;
 - `check` and `gen`, the tests and their generators
-  ([tests.md](tests.md#unit-tests-and-properties));
+  ([tests.md](tests.md#unit-tests-and-properties)), and `bench`, the
+  benchmarks ([benchmarks.md](benchmarks.md));
 - `manifest`, the types of `package.hf` and `build.hf`
   ([projects.md](projects.md));
 - the fixed-width numbers' `int8` to `int64`, `uint8` to `uint64` and
