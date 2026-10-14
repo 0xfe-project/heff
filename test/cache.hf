@@ -1,0 +1,596 @@
+-- The compiler's cache (`.heff/vN/MODULE.hc`): a second run thaws what
+-- the first elaborated (the dependency's cache file is not rewritten),
+-- corruption heals over, a cache file with a field changed is
+-- elaborated over, a new name in a dependency re-elaborates the
+-- importer, and a comment-only change does not -- the invalidation is at
+-- the definitions used, not at whole imports -- and an instance gained
+-- or lost does, for the searches it may answer, as an instance's
+-- instance arguments changed do.  Each test in a directory of its own,
+-- the project's library copied into its `lib/`, run by the heff that
+-- runs the tests (`HEFF`):
+--
+--   heff test --run cache/instances test/cache.hf
+--   heff test --run cache/fields/version test/cache.hf
+
+import check
+import co
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (did it exit with this status)
+exitedWith : Int -> Ran -> Bool
+exitedWith n r = case r.ended of
+  Exited k -> k == n
+  _ -> False
+
+-- (the test fails, saying what was wanted and what heff said, unless it
+-- holds)
+want : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> String
+     -> Bool
+     -> Ran
+     -> Co e Unit
+want what True r = pure MkUnit
+want what False r = failure (what ^ "\n" ^ said r)
+
+-- (files written, each a path and its text; else the test fails)
+writeAll : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List (Pair String String)
+         -> Co e Unit
+writeAll Nil = pure MkUnit
+writeAll (Cons (MkPair path text) rest) = do
+  ok <- writeFile path text
+  if ok then writeAll rest else failure ("could not write " ^ path)
+
+-- (these files of the project's library copied into `lib/`)
+copied : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> List String
+       -> Co e Unit
+copied from Nil = pure MkUnit
+copied from (Cons n rest) = do
+  ok <- copy (from ^ "/" ^ n) ("lib/" ^ n)
+  if ok then copied from rest else failure ("could not copy " ^ n)
+
+-- | the project's library, its `.hf` files, in `lib/` of the test's
+-- | directory, and these files beside it
+project : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> List (Pair String String)
+        -> Co e Unit
+project files = do
+  root <- given "HEFF_TEST_ROOT"
+  names <- readDirectory (root ^ "/lib")
+  made <- makeDirectory "lib"
+  copied
+      (root ^ "/lib")
+      (List.filter (\n -> endsWith ".hf" n) (fromMaybe Nil names))
+  writeAll files
+
+-- (heff run in the test's directory)
+heffIn : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> List String
+       -> Co e Ran
+heffIn arguments = do
+  heff <- given "HEFF"
+  run { command = heff, args = arguments }
+
+-- (a name of `.heff/` that is a version's directory, `v` and digits)
+versioned : String -> Bool
+versioned n =
+  startsWith "v" n
+  && strLength n > 1
+  && List.all
+    (\i -> byteAt n i >= 48 && byteAt n i <= 57)
+    (List.range 1 (strLength n - 1))
+
+-- | the cache file of a module, in the directory of this heff's version
+-- | (`.heff/vN/`, among what else is kept in `.heff/`)
+cacheFile : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> Co e String
+cacheFile m = do
+  names <- readDirectory ".heff"
+  pure
+      (".heff/"
+       ^ fromMaybe "v?" (List.find versioned (fromMaybe Nil names))
+       ^ "/"
+       ^ m
+       ^ ".hc")
+
+-- (when a module's cache file was last written, -1 where there is none)
+modified : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> Co e Int
+modified m = do
+  path <- cacheFile m
+  status <- pathStatus path
+  pure (either (\_ -> 0 - 1) (\(s : Status) -> s.modified) status)
+
+-- (when each module's cache file was last written)
+modifiedAll : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> List String
+            -> Co e (List Int)
+modifiedAll Nil = pure Nil
+modifiedAll (Cons m rest) = do
+  t <- modified m
+  others <- modifiedAll rest
+  pure (Cons t others)
+
+-- (whether a module has a cache file)
+frozen : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> String
+       -> Co e Bool
+frozen m = do
+  path <- cacheFile m
+  exists path
+
+-- (a module's cache file, its text)
+cacheText : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> Co e String
+cacheText m = do
+  path <- cacheFile m
+  text <- readFile path
+  pure (fromMaybe "" text)
+
+-- (a module's cache file written)
+writeCache : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> String
+           -> Co e Unit
+writeCache m text = do
+  path <- cacheFile m
+  writeAll [MkPair path text]
+
+-- (it holds 1/1 expectations)
+holdsOne : Ran -> Bool
+holdsOne r = succeeded r && contains "1/1 expectations hold" r.out
+
+-- Thawed, healed
+--------------------------------------------------------------------------------
+
+-- | `a`, used by `b`, used by `c`'s watch
+chain : List (Pair String String)
+chain =
+  [ MkPair "a.hf" "nine : Int\nnine = 9\n\nunused : Int\nunused = 1\n"
+  , MkPair "b.hf" "import a\n\nten : Int\nten = nine + 1\n"
+  , MkPair "c.hf" "import b\n\n-- >>> ten\n-- 10\n"
+  ]
+
+-- (the chain checked cold: elaborated, frozen; what it said)
+cold : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> Co e Ran
+cold = do
+  project chain
+  r <- heffIn ["check", "c.hf"]
+  want "a cold check" (succeeded r) r
+  pure r
+
+-- (a run that says what the cold one said)
+saysAs : Ran -> Ran -> Bool
+saysAs before r =
+  succeeded r && strEq r.out before.out && strEq r.err before.err
+
+-- | a warm run says what the cold one said, the dependencies' files
+-- | untouched (thawed, not frozen again)
+thawed : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> Co e Unit
+thawed = do
+  first <- cold
+  a <- frozen "a"
+  prelude <- frozen "prelude"
+  b <- frozen "b"
+  assert "a cold run froze a, prelude and b" (a && prelude && b)
+  times <- modifiedAll ["a", "prelude", "b"]
+  warm <- heffIn ["check", "c.hf"]
+  want "a warm check says what the cold one said" (saysAs first warm) warm
+  after <- modifiedAll ["a", "prelude", "b"]
+  assert
+      "a warm run left the dependencies' cache files alone"
+      (List.all (\p -> fst p == snd p) (List.zip after times))
+
+-- | a corrupt cache file is elaborated over, and frozen again
+healed : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> Co e Unit
+healed = do
+  first <- cold
+  writeCache "a" "garbage"
+  r <- heffIn ["check", "c.hf"]
+  want "a corrupt cache file is elaborated over" (saysAs first r) r
+  text <- cacheText "a"
+  assert "and frozen again" (not (strEq text "garbage"))
+
+-- A field changed
+--------------------------------------------------------------------------------
+
+-- (the digits from `i`, how many)
+digitsAt : String -> Int -> Int
+digitsAt t i =
+  if i < strLength t && byteAt t i >= 48 && byteAt t i <= 57
+  then 1 + digitsAt t (i + 1)
+  else 0
+
+-- (where the token at `i` ends: a length-prefixed string `3:abc` whole,
+-- or a word)
+tokenEnd : String -> Int -> Int
+tokenEnd t i =
+  let d = digitsAt t i
+  in if d > 0 && d < 12 && i + d < strLength t && byteAt t (i + d) == 58
+  then i + d + 1 + fromMaybe 0 (parseInt (strSlice t i (i + d)))
+  else fromMaybe (strLength t) (indexFrom " " t i)
+
+-- | a cache file's tokens, from `i`
+-- | >>> tokensFrom "1 3:a b 2 x" 0
+-- | ["1", "3:a b", "2", "x"]
+tokensFrom : String -> Int -> List String
+tokensFrom t i =
+  if i >= strLength t then Nil
+  else Cons (strSlice t i (tokenEnd t i)) (tokensFrom t (tokenEnd t i + 1))
+
+-- (a token, its last byte changed)
+altered : String -> String
+altered tok =
+  strSlice tok 0 (strLength tok - 1) ^ (if endsWith "x" tok then "y" else "x")
+
+-- (the `k`th token altered)
+alteredAt : Int -> List String -> List String
+alteredAt k Nil = Nil
+alteredAt k (Cons t rest) =
+  if k == 0 then Cons (altered t) rest else Cons t (alteredAt (k - 1) rest)
+
+-- (the `k`th token, "" past the end)
+nth : Int -> List String -> String
+nth k ts = fromMaybe "" (List.head (List.drop k ts))
+
+-- (a token as a number, 0 if it is not one)
+number : String -> Int
+number tok = fromMaybe 0 (parseInt tok)
+
+-- | `b` declares no fixities: its cache file's tokens are its version,
+-- | its module, its source's hash, no groups, no edges, how many imports
+-- | (those it has without writing them too), each and its namespace's
+-- | hash, how many outside definitions it needs, each and its hash, ...
+-- | Each a field changed, by a name and how.
+mismatches : List (Pair String (List String -> List String))
+mismatches =
+  [ MkPair "version" (alteredAt 0)
+  , MkPair "module" (alteredAt 1)
+  , MkPair "source-hash" (alteredAt 2)
+  , MkPair "namespace-hash" (alteredAt 7)
+  , MkPair
+    "import-left-out"
+    (\ts ->
+       List.append
+         (List.take 5 ts)
+         (Cons (show (number (nth 5 ts) - 1)) (List.drop 8 ts)))
+  , MkPair
+    "needed-hash"
+    (\ts -> alteredAt (6 + 2 * number (nth 5 ts) + 2) ts)
+  ]
+
+-- (a subtest each field changed: checked as before, elaborated over)
+eachMismatch : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> Ran
+             -> String
+             -> List (Pair String (List String -> List String))
+             -> Co e Unit
+eachMismatch first text Nil = pure MkUnit
+eachMismatch first text (Cons (MkPair what change) rest) = do
+  subtest what (do
+    writeCache "b" (joinWith " " (change (tokensFrom text 0)))
+    r <- heffIn ["check", "c.hf"]
+    want
+        ("a cache file with its " ^ what ^ " changed: checked as before")
+        (saysAs first r)
+        r
+    again <- cacheText "b"
+    assert
+        ("a cache file with its " ^ what ^ " changed is elaborated over")
+        (strEq again text))
+  eachMismatch first text rest
+
+-- | each field a cache file is believed by, changed, is elaborated
+-- | over: the file is frozen again as it was
+fields : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> Co e Unit
+fields = do
+  first <- cold
+  text <- cacheText "b"
+  ts <- pure (tokensFrom text 0)
+  imports <- pure (number (nth 5 ts))
+  assert
+      ("b's cache file reads as expected\n" ^ strSlice text 0 160)
+      (strEq (joinWith " " ts) text
+       && strEq (nth 3 ts) "0"
+       && strEq (nth 4 ts) "0"
+       && List.any
+         (\t -> strEq t "1:a")
+         (List.take (2 * imports) (List.drop 6 ts))
+       && number (nth (6 + 2 * imports) ts) > 0)
+  eachMismatch first text mismatches
+
+-- Changed dependencies
+--------------------------------------------------------------------------------
+
+-- | a comment-only change deep down: the importer between still thaws
+-- | (the entry file is always fresh; `b` is the one to watch)
+commentOnly : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> Co e Unit
+commentOnly = do
+  first <- cold
+  before <- modified "b"
+  writeAll
+      [ MkPair
+        "a.hf"
+        "-- a comment\n\nnine : Int\nnine = 9\n\nunused : Int\nunused = 1\n"
+      ]
+  r <- heffIn ["test", "c.hf"]
+  want "the watch still holds after a comment-only change" (holdsOne r) r
+  after <- modified "b"
+  assert
+      "a comment-only change in a dependency invalidates no importer"
+      (after == before)
+
+-- | a new name in the dependency re-elaborates the importer (its parse
+-- | may read differently)
+newName : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+newName = do
+  first <- cold
+  before <- modified "b"
+  writeAll
+      [ MkPair
+        "a.hf"
+        "nine : Int\nnine = 9\n\nunused : Int\nunused = 1\n\nmore : Int\nmore = 2\n"
+      ]
+  r <- heffIn ["check", "c.hf"]
+  want "check after a new name in the dependency" (succeeded r) r
+  after <- modified "b"
+  assert
+      "a new name in a dependency re-elaborates the importer"
+      (after > before)
+
+-- | a changed definition the importer uses: the answer changes with it
+changedDefinition : {e : HFunctor}
+                  -> {{chk : check <: e}}
+                  -> {{sys : process <: e}}
+                  -> {{disk : filesystem <: e}}
+                  -> Co e Unit
+changedDefinition = do
+  first <- cold
+  writeAll [MkPair "a.hf" "nine : Int\nnine = 90\n\nunused : Int\nunused = 1\n"]
+  r <- heffIn ["test", "c.hf"]
+  want
+      "a changed definition reaches the importer"
+      (exitedWith 1 r && contains "91" r.out)
+      r
+
+-- (a record type with a default size, and a function of it)
+options : Int -> String
+options size =
+  "type Opts = { name : String, size : Int = "
+  ^ show size
+  ^ " }\n\nsizeOf : Opts -> Int\nsizeOf o = o.size\n"
+
+-- | a record type's default changed: a record that leaves the field
+-- | out, in an importer that names only a function of the type, is given
+-- | the new one (the importer holds the default it was given)
+recordDefault : {e : HFunctor}
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> Co e Unit
+recordDefault = do
+  project
+      [ MkPair "d.hf" (options 1)
+      , MkPair
+        "e.hf"
+        "import d\n\nsized : Int\nsized = sizeOf { name = \"e\" }\n"
+      , MkPair "f.hf" "import e\n\n-- >>> sized\n-- 1\n"
+      ]
+  r <- heffIn ["test", "f.hf"]
+  want "a default given" (holdsOne r) r
+  writeAll [MkPair "d.hf" (options 2)]
+  changed <- heffIn ["test", "f.hf"]
+  want
+      "a changed default reaches the importer"
+      (exitedWith 1 changed && contains " 2" changed.out)
+      changed
+
+-- Instances
+--------------------------------------------------------------------------------
+
+-- (a theory of equality, a search of it, and two instances of it, each
+-- declared one or not)
+equalities : Bool -> Bool -> String
+equalities loose exact =
+  joinWith
+    "\n"
+    [ "theory Eq (a : Type) where"
+    , "  equal : a -> a -> Bool"
+    , ""
+    , "member : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool"
+    , "member x Nil = False"
+    , "member x (Cons y ys) = eq.equal x y || member x ys"
+    , ""
+    , (if exact then "instance " else "") ^ "eqInt : Eq Int"
+    , "eqInt = { equal = intEq }"
+    , ""
+    , (if loose then "instance " else "") ^ "eqLoose : Eq Int"
+    , "eqLoose = { equal = \\a b -> True }"
+    , ""
+    ]
+
+-- | an instance gained or lost by a module imported, no name new and no
+-- | definition changed: the importer's searches are made again -- one
+-- | that found one instance finds two, then none
+instances : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit
+instances = do
+  project
+      [ MkPair "g.hf" (equalities False True)
+      , MkPair "h.hf" "import g\n\nfound : Bool\nfound = member 1 [2]\n"
+      , MkPair "i.hf" "import h\n\n-- >>> found\n-- False\n"
+      ]
+  found <- heffIn ["test", "i.hf"]
+  want "an imported instance found" (holdsOne found) found
+  h <- frozen "h"
+  assert "the importer frozen" h
+  writeAll [MkPair "g.hf" (equalities True True)]
+  gained <- heffIn ["check", "i.hf"]
+  want
+      "an instance gained makes the importer's search ambiguous"
+      (exitedWith 1 gained
+       && contains "E0342" gained.err
+       && contains "h.hf" gained.err)
+      gained
+  writeAll [MkPair "g.hf" (equalities False False)]
+  lost <- heffIn ["check", "i.hf"]
+  want
+      "an instance lost leaves the importer's search none"
+      (exitedWith 1 lost
+       && contains "E0341" lost.err
+       && contains "h.hf" lost.err)
+      lost
+  writeAll [MkPair "g.hf" (equalities False True)]
+  back <- heffIn ["test", "i.hf"]
+  want "the instance back, found again" (holdsOne back) back
+
+-- (two theories, a search of the first, and an instance of it for lists
+-- that wants one of `wants` for their elements)
+sames : String -> String
+sames wants =
+  joinWith
+    "\n"
+    [ "theory Same (a : Type) where"
+    , "  same : a -> a -> Bool"
+    , ""
+    , "theory Like (a : Type) where"
+    , "  like : a -> a -> Bool"
+    , ""
+    , "isSame : {a : Type} -> {{s : Same a}} -> a -> a -> Bool"
+    , "isSame x y = s.same x y"
+    , ""
+    , "instance sameInt : Same Int"
+    , "sameInt = { same = intEq }"
+    , ""
+    , "instance sameList : {a : Type} -> {{s : "
+    ^ wants
+    ^ " a}} -> Same (List a)"
+    , "sameList = { same = \\xs ys -> True }"
+    , ""
+    ]
+
+-- | an instance's instance argument changed to one of another theory, of
+-- | which there is none for the importer's search: its search is made
+-- | again, and its error says what the instance wants; changed back,
+-- | found
+instanceArgument : {e : HFunctor}
+                 -> {{chk : check <: e}}
+                 -> {{sys : process <: e}}
+                 -> {{disk : filesystem <: e}}
+                 -> Co e Unit
+instanceArgument = do
+  project
+      [ MkPair "j.hf" (sames "Same")
+      , MkPair
+        "k.hf"
+        "import j\n\nfound : List Int -> Bool\nfound xs = isSame xs xs\n"
+      , MkPair "l.hf" "import k\n\n-- >>> found [1]\n-- True\n"
+      ]
+  found <- heffIn ["test", "l.hf"]
+  want "an instance found by finding another" (holdsOne found) found
+  k <- frozen "k"
+  assert "the importer frozen" k
+  writeAll [MkPair "j.hf" (sames "Like")]
+  none <- heffIn ["check", "l.hf"]
+  want
+      "an instance that wants another now leaves the importer's search none"
+      (exitedWith 1 none
+       && contains "E0341" none.err
+       && contains "wanted by sameList" none.err
+       && contains "k.hf" none.err)
+      none
+  writeAll [MkPair "j.hf" (sames "Same")]
+  back <- heffIn ["test", "l.hf"]
+  want "the instance's argument back, found again" (holdsOne back) back
+
+-- | the compiler's cache: thawed, healed and invalidated at the
+-- | definitions used
+cache : Test
+cache =
+  group
+    "cache"
+    [ integration "thawed" thawed
+    , integration "healed" healed
+    , integration "fields" fields
+    , integration "comment-only" commentOnly
+    , integration "new-name" newName
+    , integration "changed-definition" changedDefinition
+    , integration "record-default" recordDefault
+    , integration "instances" instances
+    , integration "instance-argument" instanceArgument
+    ]
