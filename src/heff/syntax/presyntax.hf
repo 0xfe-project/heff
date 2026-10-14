@@ -239,9 +239,9 @@ type Stmts e = List (Params.Spanned (Stmt e))
 -- | statements
 data CatchArm e = MkCatchArm (LamBinder e) (Stmts e)
 
--- | `try ... catch x -> ... finally ...`: the type of the throws it hears
--- | if given (`try (err := T)`), the statements tried, the `catch` arm
--- | and the `finally` block, either perhaps not there
+-- | `try ... catch x -> ... finally ...`: the type of the throws its
+-- | `catch` arm hears if given (`try (err := T)`), the statements tried,
+-- | the `catch` arm and the `finally` block, either perhaps not there
 data TryF e = MkTry (Maybe e) (Stmts e) (Maybe (CatchArm e)) (Maybe (Stmts e))
 
 -- | `x : A` in a record type, and `x : A = d`, `d` its default (the
@@ -618,8 +618,9 @@ chkOf i = At (CInf i) (Params.spanOf i)
 --   (which the lambda holds the value of);
 -- - `if let p = e then a else b` is a `case` of `e`, `p` and `_`, as a
 --   statement too (with no `else`, its arm is none);
--- - `try` is a scope (the exception module's `scoped`, or `recover` with
---   no `finally`): its statements are one scope further in, and their
+-- - `try` is a scope (the scope module's `scoped`, around the exception
+--   module's `recover` where there is a `catch` arm; with no `finally`,
+--   the `recover` alone): its statements are one scope further in, and their
 --   answer is what to do once it is left, which follows it (`leaveScope`).
 --   Their end is `pure` of the call of what follows the `try` (a join
 --   point), and a jump out of `k` scopes `pure` of what to do once the
@@ -1584,21 +1585,32 @@ finallyT t cx ss =
        , depth = 0
        })
 
--- (`try`'s type given, `(err := T)`, as an argument)
+-- (the type of what the `catch` arm hears given, `(err := T)`, as an
+-- argument)
 errArgs : Params.Span -> Maybe Expr -> List Expr
 errArgs sp Nothing = Nil
 errArgs sp (Just ty) = [At (ENamed "err" ty) (Params.spanOf ty)]
 
--- (the handler, if there is a `catch` arm, as `scoped` takes it)
-handlerArg : DoT -> DoCx -> Params.Span -> End -> Maybe (CatchArm Expr) -> Expr
-handlerArg t cx sp end Nothing = At (ETag "Nothing") sp
-handlerArg t cx sp end (Just h) =
-  app (At (ETag "Just") sp) [catchT t cx sp end h]
+-- | the statements tried, heard by the `catch` arm if there is one (the
+-- | exception module's `recover`)
+heardT : DoT
+       -> DoCx
+       -> Params.Span
+       -> End
+       -> Maybe Expr
+       -> Expr
+       -> Maybe (CatchArm Expr)
+       -> Expr
+heardT t cx sp end err tried Nothing = tried
+heardT t cx sp end err tried (Just h) =
+  app
+    (At (EVar "recover") sp)
+    (List.append (errArgs sp err) [tried, catchT t cx sp end h])
 
 -- | what a `try` runs, one scope in, each part up to `end`: the
--- | statements tried, heard by the `catch` arm (the exception module's
--- | `recover`), released by the `finally` block (its `scoped`, acquiring
--- | nothing) -- its answer, what to do once it is left
+-- | statements tried, heard by the `catch` arm, released by the `finally`
+-- | block (the scope module's `scoped`, acquiring nothing) -- its answer,
+-- | what to do once it is left
 tryHeard : DoT
          -> DoCx
          -> Params.Span
@@ -1610,27 +1622,21 @@ tryHeard : DoT
          -> Expr
 tryHeard t cx sp end err tried Nothing Nothing =
   badE sp "a `try` has a `catch` arm, a `finally` block, or both"
-tryHeard t cx sp end err tried (Just h) Nothing =
-  app
-    (At (EVar "recover") sp)
-    (List.append (errArgs sp err) [tried, catchT t cx sp end h])
-tryHeard t cx sp end Nothing tried Nothing (Just fs) =
+tryHeard t cx sp end (Just ty) tried Nothing (Just fs) =
   badE
-    sp
-    "a `try` with no `catch` arm names the type of the throws its `finally` block hears, as `try (err := T)`: no throw says which it is"
+    (Params.spanOf ty)
+    "a `try` with no `catch` arm hears no throw: `(err := T)` names the type of what its `catch` arm hears"
+tryHeard t cx sp end err tried h Nothing = heardT t cx sp end err tried h
 tryHeard t cx sp end err tried h (Just fs) =
   app
     (At (EVar "scoped") sp)
-    (List.append
-       (errArgs sp err)
-       [ pureOf cx sp (At (ETag "MkUnit") sp)
-       , thunkOf sp (finallyT t cx fs)
-       , thunkOf sp tried
-       , handlerArg t cx sp end h
-       ])
+    [ pureOf cx sp (At (ETag "MkUnit") sp)
+    , thunkOf sp (finallyT t cx fs)
+    , thunkOf sp (heardT t cx sp end err tried h)
+    ]
 
 -- | a `try`'s scope, its statements up to `end`, then what its answer
--- | says to do, by the exception module's `leaveScope`: go on after it
+-- | says to do, by co's `leaveScope`: go on after it
 -- | (`end`), or jump further out
 tryScope : DoT -> DoCx -> Params.Span -> TryF Expr -> End -> Expr
 tryScope t cx sp (MkTry err body h fin) end =

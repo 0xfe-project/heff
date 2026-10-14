@@ -25,12 +25,15 @@ writing them ([how names are found](language.md#modules)).  The others
 are imported by their names:
 
 - `co` ([effects](language.md#effects)), and effects made with it:
-  `state`, `exception` (`throw` and `recover`; `scoped`, a scope
-  released however it is left, which a `do` block's `try` is
-  ([`do`](language.md#do)); `divOrThrow` and `modOrThrow`, a division
-  that throws by zero; and `attempt`, a handler of it: what was thrown
-  and heard by no `recover`, `Left`), `parallel` and `green` ([green
-  threads](#green-threads));
+  `state`, `exception` (`throw` and `recover`; `divOrThrow` and
+  `modOrThrow`, a division that throws by zero; and `attempt`, a
+  handler of it: what was thrown and heard by no `recover`, `Left`),
+  `scope` (`scoped`, a scope released however it is left -- at its
+  end, by a throw of any type, or by a handler that did not go on --
+  which a `do` block's `try ... finally` is ([`do`](language.md#do));
+  an effect of the world, with a provider in C and in JavaScript, and
+  `endScopes`, a handler of it in the language), `parallel` and
+  `green` ([green threads](#green-threads));
 - `array` ([arrays](#arrays)), `std.map` and `std.set`, by the keys'
   `Order`, found as an instance argument is, the map first:
   `Map.insert m k v`, `Map.lookup m k`, `Map.member m k`, `Map.delete

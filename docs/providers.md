@@ -18,7 +18,10 @@ library is split by backend ([library.md](library.md#the-batteries)):
   `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.http`,
   `std.net`, `std.thread`, `std.reactor`, `std.terminal`;
 - `std.reference` and `std.time` are needed on both sides: one module each,
-  with a provider in C and one in JavaScript of no `$host`;
+  with a provider in C and one in JavaScript of no `$host`; so is
+  `scope` (lib/scope.hf), a `do` block's `finally`, whose C provider
+  arms a scope's token as a foreign value, its release run by the
+  runtime where the token's last reference goes armed;
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
   and `browser.http` (`$host = "page"`), and `browser.js`, which has no
   effect, only its type.

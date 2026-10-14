@@ -1202,6 +1202,16 @@ static inline void heff_dead_push(V v) {
   heff_dead_put(v);
 }
 
+// (scopes a dropped continuation leaves: their releases, put by as the
+// last references to their tokens go, run once what was dropped is all
+// given back -- "Scopes left by a dropped continuation", below)
+typedef struct { uint64_t seq; V release; } HeffUnwound;
+HEFF_VAR(HEFF_TLS HeffUnwound *heff_unwound);
+HEFF_VAR(HEFF_TLS size_t heff_nunwound);
+HEFF_VAR(HEFF_TLS size_t heff_capunwound);
+HEFF_VAR(HEFF_TLS int heff_unwinding);
+HEFF_FN void heff_unwind(void);
+
 // (an object whose last reference is gone: what it holds counted down,
 // its size reckoned as it is looked at, and it freed; of what it holds,
 // each whose last reference that was is given back after it -- the last
@@ -1253,7 +1263,10 @@ __attribute__((noinline)) HEFF_FN void heff_free(V v) {
     heff_obj_free(o, size);
     if (next) v = next;
     else if (heff_ndead > base) v = heff_dead[--heff_ndead];
-    else return;
+    else {
+      if (heff_nunwound && !heff_unwinding) heff_unwind();
+      return;
+    }
   }
 }
 
@@ -4174,6 +4187,9 @@ HEFF_FN void heff_thread_end(void) {
   free(heff_dead);
   heff_dead = NULL;
   heff_ndead = heff_cdead = 0;
+  free(heff_unwound);
+  heff_unwound = NULL;
+  heff_nunwound = heff_capunwound = 0;
 #ifdef HEFF_THREADS
   free(heff_open);
   heff_open = NULL;
@@ -4401,6 +4417,58 @@ HEFF_FN void heff_finished_put(int64_t g, V v) {
 HEFF_FN V heff_kept(V self, V *a) {
   heff_drop(self);
   return a[0];
+}
+
+// Scopes left by a dropped continuation (the scope module's)
+// ---------------------------------------------------------------------
+//
+// A scope's token is a foreign value armed with its release, a
+// computation of the world (its handler's monad: a function of its
+// continuation); the scope left, it is disarmed.  Where its last
+// reference goes while it is armed -- the continuation that would have
+// left the scope dropped, by a handler that does not go on (a throw's,
+// one that discards it), or a thread never resumed -- its release is put
+// by (`heff_unwound_put`), and once what was dropped is all given back,
+// the releases put by are run (`heff_unwind`), the scope entered last
+// first, each to its end, in no group of the reactor's (an outside
+// operation of one waited for there).  Perceus makes it so at once, not
+// at a collection: where the handler drops the continuation.
+
+HEFF_FN void heff_unwound_put(uint64_t seq, V release) {
+  if (heff_nunwound == heff_capunwound) {
+    heff_capunwound = heff_capunwound ? heff_capunwound * 2 : 16;
+    heff_unwound = realloc(heff_unwound, heff_capunwound * sizeof *heff_unwound);
+    if (!heff_unwound) heff_fail("out of memory");
+  }
+  heff_unwound[heff_nunwound].seq = seq;
+  heff_unwound[heff_nunwound].release = release;
+  heff_nunwound++;
+}
+
+HEFF_FN void heff_unwind(void) {
+  // (run where a value was dropped, in the midst of what the program was
+  // doing: what it keeps for its next call -- the arguments put in
+  // `heff_room`, the count of calls last -- kept apart, and put back)
+  V room[HEFF_ROOM];
+  heff_copy(room, heff_room, HEFF_ROOM);
+  long dep = heff_dep;
+  int64_t up = heff_group;
+  heff_unwinding = 1;
+  heff_dep = 0;
+  heff_group = 0;
+  while (heff_nunwound) {
+    // (the newest of those put by: a release run may put more by)
+    size_t at = 0;
+    for (size_t i = 1; i < heff_nunwound; i++)
+      if (heff_unwound[i].seq > heff_unwound[at].seq) at = i;
+    V release = heff_unwound[at].release;
+    heff_unwound[at] = heff_unwound[--heff_nunwound];
+    heff_drop(heff_tr(heff_app1(release, heff_clo(heff_kept, 1, 0, NULL))));
+  }
+  heff_group = up;
+  heff_unwinding = 0;
+  heff_dep = dep;
+  heff_copy(heff_room, room, HEFF_ROOM);
 }
 
 // (what group `g` started, the rest of it run in the group, from `k`
