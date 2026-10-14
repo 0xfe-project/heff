@@ -73,8 +73,8 @@ const scope = (s) => /^[A-Za-z][\w.-]*( [A-Za-z][\w.-]*)*$/.test(s) ? s : quote(
 const out = [
   "%YAML 1.2",
   "---",
-  "# Made by editors/bat/build.mjs from editors/vscode/syntaxes/heff.tmLanguage.json:",
-  "# change that, and run it again.",
+  "# Made from the VS Code extension's grammar: change that, and make",
+  "# this again (make bat).",
   `name: ${scope(tm.name)}`,
   `scope: ${scope(tm.scopeName)}`,
   "file_extensions:",
