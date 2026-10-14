@@ -145,6 +145,15 @@ typedef struct { V f[4]; } HeffT4;
 #define HEFF_SLOW HEFF_FN __attribute__((noinline, cold))
 #define HEFF_LIKELY(c) __builtin_expect(!!(c), 1)
 
+// The runtime's part in Zig: built by zig into an object of its own and
+// linked with the program, each function by the C ABI, given C's plain
+// types and leaving allocating and counting to the C here; called, never
+// inlined into the program's code.
+// (hashes: of bytes, and of an integer, a word's or a big one's, both
+// as "Hashes" below says)
+uint64_t heff_hash_bytes(const uint8_t *p, int64_t n);
+uint64_t heff_int_hash(uintptr_t a);
+
 // the tags the runtime knows; a program's own are numbered after them
 enum {
   TAG_True, TAG_False, TAG_Nil, TAG_Cons, TAG_MkUnit, TAG_Just, TAG_Nothing,
@@ -2465,45 +2474,10 @@ HEFF_FN V heff_strFind_lent(V needle, V s, V i, int give) {
 }
 HEFF_FN V heff_strFind(V needle, V s, V i) { return heff_strFind_lent(needle, s, i, 3); }
 
-// Hashes: a string's is FxHash's step (Firefox's and
-// rustc's, `rotl(h, 5) ^ w` times its constant) over its bytes 8 at a
-// time, little-endian, the last word filled with zeros, from its length;
-// then murmur3's finish (`fmix64`), which FxHash lacks, so that the low
-// bits a trie looks at first are as mixed as the high.  An integer's is
-// that finish of its low 64 bits (two's complement).  Each is shifted
-// right by 2, a word's integer, never negative; JavaScript's and the
-// interpreter's are the same numbers, so that a map's order is one everywhere.
-#define HEFF_FX_K 0x517cc1b727220a95ULL
-
-static inline uint64_t heff_fmix64(uint64_t h) {
-  h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
-  h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
-  return h ^ (h >> 33);
-}
-
-static inline uint64_t heff_fx_step(uint64_t h, uint64_t w) {
-  return (((h << 5) | (h >> 59)) ^ w) * HEFF_FX_K;
-}
-
-static inline uint64_t heff_hash_bytes(const uint8_t *p, int64_t n) {
-  uint64_t h = (uint64_t)n;
-  int64_t i = 0;
-  for (; i + 8 <= n; i += 8) {
-    uint64_t w;
-    memcpy(&w, p + i, sizeof w);
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    w = __builtin_bswap64(w);
-#endif
-    h = heff_fx_step(h, w);
-  }
-  if (i < n) {
-    uint64_t w = 0;
-    for (int64_t k = n - 1; k >= i; k--) w = (w << 8) | p[k];
-    h = heff_fx_step(h, w);
-  }
-  return heff_fmix64(h);
-}
-
+// Hashes: a string's and an integer's, the runtime's Zig's -- the same
+// numbers as JavaScript's and the interpreter's, so that a map's order
+// is one everywhere -- each shifted right by 2, a word's integer, never
+// negative.
 HEFF_FAST V heff_strHash_lent(V a, int give) {
   Str *x = (Str *)a;
   V r = MK_INT((int64_t)(heff_hash_bytes(x->p, x->len) >> 2));
@@ -2513,15 +2487,9 @@ HEFF_FAST V heff_strHash_lent(V a, int give) {
 HEFF_FN V heff_strHash(V a) { return heff_strHash_lent(a, 1); }
 
 HEFF_FN V heff_intHash(V a) {
-  uint64_t u;
-  if (IS_INT(a)) u = (uint64_t)INT_OF(a);
-  else {
-    Big *b = (Big *)a;
-    u = (uint64_t)b->d[0] | (b->n > 1 ? (uint64_t)b->d[1] << 32 : 0);
-    if (b->neg) u = ~u + 1;
-    heff_drop(a);
-  }
-  return MK_INT((int64_t)(heff_fmix64(u) >> 2));
+  uint64_t h = heff_int_hash(a);
+  if (!IS_INT(a)) heff_drop(a);
+  return MK_INT((int64_t)(h >> 2));
 }
 
 // (a trie's step: the 5 bits of the hash `h` from bit `s` on choose one of
@@ -5049,8 +5017,26 @@ static void heff_watch_stack(void) {
 static void heff_watch_stack(void) {}
 #endif
 
+// (the layout the runtime's Zig reads values by, held to the one here
+// where the program is not optimised: each offset and size it says)
+#ifndef __OPTIMIZE__
+extern const uint16_t heff_zig_layout[6];
+static void heff_layout_held(void) {
+  static const uint16_t here[] = {
+    sizeof(Obj), __builtin_offsetof(Obj, kind), __builtin_offsetof(Obj, tag),
+    sizeof(Big), __builtin_offsetof(Big, neg), __builtin_offsetof(Big, n) };
+  if (memcmp(here, heff_zig_layout, sizeof here)) {
+    fprintf(stderr, "heff: the runtime's Zig lays values out otherwise than its C\n");
+    abort();
+  }
+}
+#else
+static void heff_layout_held(void) {}
+#endif
+
 static void *heff_thread(void *u) {
   (void)u;
+  heff_layout_held();
   heff_watch_stack();
   heff_tr(heff_entry());
   return NULL;
