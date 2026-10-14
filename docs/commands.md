@@ -31,7 +31,8 @@ heff build                     # the whole project: every module of src/
 heff install [DIR]             # the project at DIR built (C by zig -O2: to run
                                # fastest), its programs put in ~/.heff/bin/
                                # (HEFF_HOME/bin/), what they ship beside it
-heff init [DIR]                # a new project: a module, a program, a test
+heff init [DIR]                # a new project: a module, a program, a test,
+                               # named as DIR (the working directory)
 heff get [PATH[@VERSION]]      # fetch the packages required, writing heff.sum
 heff publish VERSION           # check the project, tag it vVERSION, push the tag
 heff dev [APP...] [--port N] [--proxy URL]

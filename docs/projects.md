@@ -30,6 +30,15 @@ package =
   }
 ```
 
+A package's name is the first part of its modules' names: a lowercase
+letter, then lowercase letters, digits and `_` (a capitalised name is a
+tag).  It is never `test`: a project's tests, under its `test/`, are the
+modules `test.X`.  The one directory of `src/`, each `name` required or
+replaced, and the project `heff init` makes are named so.  `heff init
+DIR` names the project as DIR's last part, and `heff init` as the
+working directory's; a directory named otherwise (`MyApp`, `my-app`) is
+refused, with a name that would do (`heff init myapp`).
+
 ## heff's own package
 
 The package `heff` is heff's: the compiler and its library, which come

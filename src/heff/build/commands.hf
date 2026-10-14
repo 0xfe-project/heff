@@ -4204,10 +4204,90 @@ publishCmd v = case Project.version v of
             then publishFails "package.hf is no Package (lib/manifest.hf)"
             else publishChecked v l pk
 
--- | the project's name: DIR's, or (DIR being `.`) the working directory's
-projectName : Path.Style -> String -> Maybe String -> String
-projectName st "." (Just pwd) = Path.basename st pwd
+-- | the project's name: DIR's, or (DIR being `.`) that of the working
+-- | directory, CWD
+projectName : Path.Style -> String -> String -> String
+projectName st "." cwd = Path.basename st cwd
 projectName st dir _ = Path.basename st dir
+
+-- (the directory a project's name is of: DIR, or the working directory)
+nameSource : String -> String -> String
+nameSource "." cwd = cwd
+nameSource dir _ = dir
+
+-- (byte `i` of a directory's name as a package's name might have it: a
+-- capital lowercased, a byte no name has `_`)
+nameByteOf : String -> Int -> String
+nameByteOf s i =
+  if 65 <= byteAt s i && byteAt s i <= 90
+  then strSlice "abcdefghijklmnopqrstuvwxyz" (byteAt s i - 65) (byteAt s i - 64)
+  else if Project.isNameByte (byteAt s i)
+  then strSlice s i (i + 1)
+  else "_"
+
+-- (a name, its leading digit put after a letter)
+letterFirst : String -> String
+letterFirst "" = "app"
+letterFirst x = if 48 <= byteAt x 0 && byteAt x 0 <= 57 then "pkg_" ^ x else x
+
+-- (a name, unless it is one no package may have)
+unreserved : String -> String
+unreserved x =
+  if Project.isName x && not (strEq x Project.heffModule) then x
+  else x ^ "_app"
+
+-- | a package's name like a directory's, to suggest for it: lowercase,
+-- | each run of other bytes `_`
+-- | >>> nameLike "MyApp"
+-- | "myapp"
+-- | >>> nameLike "my-app"
+-- | "my_app"
+-- | >>> nameLike "2048 game"
+-- | "pkg_2048_game"
+-- | >>> nameLike "test"
+-- | "test_app"
+nameLike : String -> String
+nameLike x =
+  unreserved
+    (letterFirst
+       (joinWith
+          "_"
+          (List.filter
+             (\(p : String) -> strLength p > 0)
+             (split
+                "_"
+                (joinWith
+                   ""
+                   (List.map
+                      (nameByteOf x)
+                      (Project.rangeFrom 0 (strLength x))))))))
+
+-- (what is wrong with a directory's name, NAME, as a new project's: why
+-- it is no package's name, or that it is heff's own)
+nameProblem : String -> Maybe String -> Maybe String
+nameProblem name (Just why) =
+  Just
+    ("heff: the directory `"
+     ^ name
+     ^ "` cannot name a package ("
+     ^ why
+     ^ "): name it otherwise, as `heff init "
+     ^ nameLike name
+     ^ "`")
+nameProblem name Nothing =
+  if strEq name Project.heffModule
+  then Just "heff: `heff` is heff's own package: name the project otherwise"
+  else Nothing
+
+-- | what is wrong with NAME, of the directory SHOWN, as a new project's
+-- | name, if anything: no name at all said so, never taken as one
+initProblem : String -> String -> Maybe String
+initProblem shown "" =
+  Just
+    ("heff: the directory "
+     ^ shown
+     ^ " has no name to name a package by: say the project's directory, as `heff init DIR`")
+initProblem shown name = nameProblem name (Project.whyNoName name)
 
 -- (a new project's package.hf: the package NAME, for heff VERSION)
 packageText : String -> String -> String
@@ -4360,25 +4440,17 @@ initCmd : {e : HFunctor}
         -> String
         -> Co e Unit
 initCmd dir = do
-  pwd <- getEnv "PWD"
+  cwd <- workingDir
   v <- ownVersion
   st <- styleNow
-  name <- pure (projectName st dir pwd)
+  name <- pure (projectName st dir cwd)
   files <- pure (projectFiles name (fromMaybe "0.1.0" v))
   there <- existing dir files
-  if not (Project.isName name)
-    then do
-      printErr
-          ("heff: `"
-           ^ name
-           ^ "` cannot name a package: a lowercase letter, then letters, digits and `_`")
+  case initProblem (nameSource dir cwd) name of
+    Just why -> do
+      printErr why
       exit 1
-    else if strEq name Project.heffModule
-    then do
-      printErr
-          "heff: `heff` is heff's own package: name the project otherwise"
-      exit 1
-    else case there of
+    Nothing -> case there of
       Cons _ _ -> do
         printErr
             ("heff: "
