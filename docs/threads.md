@@ -28,9 +28,8 @@ program = do
 
 - `parMap n f xs`: `f` of each of `xs`, by `n` threads (the caller one
   of them), each taking the next value as it ends one; the answers, in
-  order.  `parFor n count f` is `f 0 .. f (count - 1)`, and `parAll n
-  tasks` each `Unit -> a` of a list run.  What a task takes and gives
-  may be of any type -- a string, a list, a record -- and one `threads`
+  order.  `parFor n count f` is `f 0 .. f (count - 1)`.  What a task
+  takes and gives may be of any type -- a string, a list, a record -- and one `threads`
   in the world serves them all: an operation keeps its types to itself.
   One thread, or one value, runs in the caller, nothing shared.
 - `cores`: how many threads the machine runs at once.
@@ -58,8 +57,8 @@ and a program with `threads` in its world is compiled for C
 - Nothing is copied.  `f` and each value are shared (below): walked
   once, each object of them marked, and then held by each thread that
   takes them by one more count.  An answer is handed back as it is.
-  A large value every task reads -- held by `f`, or by each task of
-  `parAll` -- is in memory once, however many threads read it.
+  A large value every task reads -- held by `f` -- is in memory once,
+  however many threads read it.
 - A spread shares the rest of the program with each thread: what was
   made before the spread, and is used after it, is held by them all,
   not copied.
