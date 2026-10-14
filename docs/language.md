@@ -687,14 +687,12 @@ sumEvens xs = do
   Among the statements it may have no `else`, and its arms are
   statements, as an `if`'s are.
 
-`try` runs its statements, hearing their throws by a `catch` arm (the
-`exception` effect: its module imported, as its names are taken by
-name, as `bind` is) and released by a `finally` block (the `scope`
-effect, the world's: the `scope` module imported):
+`try` runs its statements over the `exception` effect (the `exception`
+module imported, as its names are taken by name, as `bind` is):
 
 ```haskell
-loadAll : {e : HFunctor} -> {{ex : exception String <: e}} -> {{sc : scope <: e}}
-        -> {{io : stdio <: e}} -> List String -> Co e Int
+loadAll : {e : HFunctor} -> {{ex : exception String <: e}} -> {{io : stdio <: e}}
+        -> List String -> Co e Int
 loadAll names = do
   let mut loaded = 0
   for name in names do
@@ -704,42 +702,20 @@ loadAll names = do
       loaded := loaded + 1
     catch (why : String) ->
       print ("not loaded: " ^ why)
-    finally
-      print ("tried " ^ name)
   return loaded
 ```
 
 - A throw of its statements is heard by its `catch` arm, `catch x ->`
   (or `catch (x : T) ->`), which runs in their place.  Which type of
   throws it hears is found from the arm, as `recover`'s handler says it,
-  or given, `try (err := T)`.
-- The `finally` block runs however the `try` is left: at its end; by a
-  throw of any type (heard by the `catch` arm first, if any; one it does
-  not hear, or one it makes, goes on once the block has run); by a
-  handler between that does not go on (it dropped the continuation that
-  would have left the `try`); or by `return`, `break` or `continue` --
-  and each `try` it is in after it, the innermost first.  A `try` has a
-  `catch` arm, a `finally` block, or both, each under `try`.
+  or given, `try (err := T)`.  A `try` has its `catch` arm, under it.
 - Its statements and its `catch` arm's are the block's: they set its
   variables, jump and `return`.  A throw abandons what it is thrown in,
   so the `catch` arm sees the variables as they were where the `try`
-  began.  The `finally` block is a computation of its own made where the
-  `try` begins: it sees the variables so and cannot set them, and is
-  left at its end only -- `return`, `break` and `continue` out of it are
-  refused.
-- Left at its end or by a jump, the `finally` block runs as the
-  program's own: a throw of it goes on as any.  Left otherwise, the
-  world runs it where the continuation is dropped: the C backend at
-  once (the count of the scope's token comes to naught), JavaScript
-  when the collector finds the token, and a world handled in the
-  language (the scope module's `endScopes`) when it ends.  It runs then
-  as a computation an operation of the world holds does: a throw of it
-  that nothing in it hears abandons, and a handler between handles its
-  effects as it was where the `try` began.
-- `abandon` is no effect: it ends the program, and no `finally` block
-  runs.  A `finally` block runs once each time its `try` is left: a
-  continuation taken in a `try` and resumed more than once runs it more
-  than once, and the world runs it once, should all of them be dropped.
+  began.
+- What is let go of however it is left is no part of `try`: a resource
+  is held in a `with` of its own effect, its provider's to release
+  (std.filesystem's `withFile`, [the batteries](library.md#the-batteries)).
 
 Pure code is written as statements by `run do ...`: `run : Id a -> a`,
 of the identity monad (`type Id a = a`), whose `do` is taken apart by
@@ -756,27 +732,13 @@ Pure code so compiles to plain tail recursion, a loop in `Co` to a loop
 that goes round its turns without a handler between them, and neither
 grows the stack.
 
-A `try` with a `finally` block is a scope, the scope module's `scoped`,
-acquiring nothing and released by the block (around the `catch` arm's
-`recover`, if any; with no `finally`, the `recover` alone): its
-statements, one scope further in, give as their answer what to do once
-it is left -- at their end the call of what follows it, a join point; a
-jump out of `k` scopes, `pure` of what to do once the next is left, `k`
-deep -- and once it is released, that is called, a tail call.  A loop
-whose turns each go through a `try` leaves each before the next, so it
-does not grow the stack either.  (A scoped resource, acquired and
-released by its own, is `scoped` the same.)
-
-The world sees no throw of a handler between, nor a continuation it
-drops: the handler's monad still goes on to the world's continuation (a
-throw's `Left`), and a computation an operation of the world holds is
-forwarded to it by a natural transformation, which has nothing for a
-throw but `abandon`.  So the scope is two operations of the world: it
-is entered, `Enter release`, a token armed with the release given back,
-which the scope's continuation holds; and left, `Leave`, the token
-disarmed, the release run then by the program.  A continuation dropped
-drops the token, and the world runs the release of a token dropped
-armed.
+A `try` is a scope, the exception module's `recover`, its `catch` arm
+the handler: its statements, one scope further in, give as their answer
+what to do once it is left -- at their end the call of what follows it,
+a join point; a jump out of `k` scopes, `pure` of what to do once the
+next is left, `k` deep -- and once it is left, that is called, a tail
+call.  A loop whose turns each go through a `try` leaves each before
+the next, so it does not grow the stack either.
 
 ## Effects
 

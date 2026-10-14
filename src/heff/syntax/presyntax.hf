@@ -239,10 +239,9 @@ type Stmts e = List (Params.Spanned (Stmt e))
 -- | statements
 data CatchArm e = MkCatchArm (LamBinder e) (Stmts e)
 
--- | `try ... catch x -> ... finally ...`: the type of the throws its
--- | `catch` arm hears if given (`try (err := T)`), the statements tried,
--- | the `catch` arm and the `finally` block, either perhaps not there
-data TryF e = MkTry (Maybe e) (Stmts e) (Maybe (CatchArm e)) (Maybe (Stmts e))
+-- | `try ... catch x -> ...`: the type of the throws it hears if given
+-- | (`try (err := T)`), the statements tried, and the `catch` arm
+data TryF e = MkTry (Maybe e) (Stmts e) (CatchArm e)
 
 -- | `x : A` in a record type, and `x : A = d`, `d` its default (the
 -- | types `t`, the default a term `c`)
@@ -618,16 +617,13 @@ chkOf i = At (CInf i) (Params.spanOf i)
 --   (which the lambda holds the value of);
 -- - `if let p = e then a else b` is a `case` of `e`, `p` and `_`, as a
 --   statement too (with no `else`, its arm is none);
--- - `try` is a scope (the scope module's `scoped`, around the exception
---   module's `recover` where there is a `catch` arm; with no `finally`,
---   the `recover` alone): its statements are one scope further in, and their
+-- - `try` is a scope (the exception module's `recover`, its `catch` arm
+--   the handler): its statements are one scope further in, and their
 --   answer is what to do once it is left, which follows it (`leaveScope`).
 --   Their end is `pure` of the call of what follows the `try` (a join
 --   point), and a jump out of `k` scopes `pure` of what to do once the
---   next is left, `k` deep (`leaving`): each scope is released on the way
---   out, the innermost first, and the call made after, a tail call.  The
---   `finally` block is a computation of its own, of the variables as the
---   `try` began, which nothing leaves but its end.
+--   next is left, `k` deep (`leaving`): each scope is left on the way
+--   out, the innermost first, and the call made after, a tail call.
 --
 -- A function's parameters are of its variables' types, `typeOf x`, and
 -- what it gives is left to be found, `inferred MkUnit` (both the
@@ -653,17 +649,13 @@ type Jump = { head : Expr, vars : List String, unit : Bool, depth : Int }
 
 -- | where the statements are: the names, the variables (`let mut`) in
 -- | scope, the innermost loop's `continue` and `break`, the block's span,
--- | how many scopes (`try`) they are in, whether they are a `finally`
--- | block's (which nothing leaves but its end), and the variables of the
--- | block around such a block, which it sees and cannot set
+-- | and how many scopes (`try`) they are in
 type DoCx =
   { names : DoNames
   , muts : List String
   , loop : Maybe (Pair Jump Jump)
   , sp : Params.Span
   , depth : Int
-  , final : Bool
-  , sealed : List String
   }
 
 -- | what follows the statements' end: the last one's value is the
@@ -786,11 +778,6 @@ patNames _ = Nil
 isMut : DoCx -> String -> Bool
 isMut cx x = List.any (\y -> strEq x y) cx.muts
 
--- | a variable of the block, or of the block around a `finally` block
--- | (which no name bound in it may be either)
-isSealed : DoCx -> String -> Bool
-isSealed cx x = isMut cx x || List.any (\y -> strEq x y) cx.sealed
-
 -- | a name bound again that is a variable of the block: refused (what
 -- | `continue` passes on would not be the variable)
 mutClash : String -> String
@@ -803,7 +790,7 @@ mutClash x =
 
 -- (the first of the names that is a variable of the block)
 firstMut : DoCx -> List String -> Maybe String
-firstMut cx xs = List.find (\x -> isSealed cx x) xs
+firstMut cx xs = List.find (\x -> isMut cx x) xs
 
 -- The expressions a statement holds, gone through in the order they are
 -- written (and run), a state threaded through them
@@ -895,16 +882,11 @@ tryAcc : {s : Type}
        -> s
        -> TryF Expr
        -> Pair s (TryF Expr)
-tryAcc f st (MkTry err body c fin) =
+tryAcc f st (MkTry err body c) =
   pairK
     (accList (stmtAcc f) st body)
     (\st1 body' ->
-       pairK
-         (maybeAcc (catchAcc f) st1 c)
-         (\st2 c' ->
-            pairK
-              (maybeAcc (accList (stmtAcc f)) st2 fin)
-              (\st3 fin' -> MkPair st3 (MkTry err body' c' fin'))))
+       pairK (catchAcc f st1 c) (\st2 c' -> MkPair st2 (MkTry err body' c')))
 
 -- | the expressions an expression holds, by `f`, in the order they are
 -- | written (a lambda's body, its own; a type, none)
@@ -1224,8 +1206,6 @@ withMut cx x =
   , loop = cx.loop
   , sp = cx.sp
   , depth = cx.depth
-  , final = cx.final
-  , sealed = cx.sealed
   }
 
 withLoop : DoCx -> Jump -> Jump -> DoCx
@@ -1235,8 +1215,6 @@ withLoop cx cont brk =
   , loop = Just (MkPair cont brk)
   , sp = cx.sp
   , depth = cx.depth
-  , final = cx.final
-  , sealed = cx.sealed
   }
 
 -- | the statements of a scope (`try`), one further in
@@ -1247,29 +1225,7 @@ inScope cx =
   , loop = cx.loop
   , sp = cx.sp
   , depth = cx.depth + 1
-  , final = cx.final
-  , sealed = cx.sealed
   }
-
--- | a `finally` block's statements: a computation of their own, no
--- | variables of their own yet, the block's seen and not set, nothing to
--- | jump to
-finalCx : DoCx -> DoCx
-finalCx cx =
-  { names = cx.names
-  , muts = Nil
-  , loop = Nothing
-  , sp = cx.sp
-  , depth = 0
-  , final = True
-  , sealed = List.append cx.muts cx.sealed
-  }
-
--- | what leaves a `finally` block, refused
-leavesFinally : String -> String
-leavesFinally what =
-  what
-  ^ " is in a `finally` block: it runs as the `try` is left, however that is, and goes on to where that was going -- it is left at its end only"
 
 -- | `break` or `continue`: the call it is, the last of its statements
 jumpTo : DoCx
@@ -1284,10 +1240,7 @@ jumpTo cx sp (Cons s _) j what =
     ("nothing after " ^ what ^ " runs: it is the last statement")
 jumpTo cx sp Nil (Just j) what = jumpCall cx sp j
 jumpTo cx sp Nil Nothing what =
-  if cx.final then badE sp (leavesFinally what)
-  else badE
-      sp
-      (what ^ " is in a loop only: `while c do ...`, `for x in e do ...`")
+  badE sp (what ^ " is in a loop only: `while c do ...`, `for x in e do ...`")
 
 continueOf : Maybe (Pair Jump Jump) -> Maybe Jump
 continueOf (Just (MkPair c b)) = Just c
@@ -1309,9 +1262,8 @@ armT t cx end (MkPair p ss) = case firstMut cx (patNames p) of
   Nothing -> alt p (t.stmts cx ss end)
 
 -- (a `catch` arm's statements, if there is one)
-catchStmts : Maybe (CatchArm Expr) -> List (Params.Spanned (Stmt Expr))
-catchStmts Nothing = Nil
-catchStmts (Just (MkCatchArm _ ss)) = ss
+catchStmts : CatchArm Expr -> List (Params.Spanned (Stmt Expr))
+catchStmts (MkCatchArm _ ss) = ss
 
 -- | whether statements may reach their end: not if the last is a jump,
 -- | `return`, an `if` or a `case` of statements none of whose arms does
@@ -1330,8 +1282,7 @@ stmtsFall ss = case List.last ss of
     not (isControl (At (EMatch s alts) sp))
     || List.any (\a -> stmtsFall (snd (altStmts a))) alts
   exprFalls (At (EIfLet p s a (Just b)) sp) = exprFalls (ifLetOf sp p s a b)
-  exprFalls (At (ETry (MkTry _ body Nothing _)) _) = stmtsFall body
-  exprFalls (At (ETry (MkTry _ body c _)) _) =
+  exprFalls (At (ETry (MkTry _ body c)) _) =
     stmtsFall body || stmtsFall (catchStmts c)
   exprFalls _ = True
 
@@ -1558,91 +1509,36 @@ catchT t cx sp end (MkCatchArm b ss) = At (ELam b (t.stmts cx ss end)) sp
 
 -- | what is wrong with a `catch` arm's binder, if anything: an implicit
 -- | one, or one that names a variable of the block
-catchWrong : DoCx -> Maybe (CatchArm Expr) -> Maybe Expr
-catchWrong cx Nothing = Nothing
-catchWrong cx (Just (MkCatchArm (LamImplicit x xsp) _)) =
+catchWrong : DoCx -> CatchArm Expr -> Maybe Expr
+catchWrong cx (MkCatchArm (LamImplicit x xsp) _) =
   Just
     (badE
        xsp
        "what a `catch` arm hears is its argument: `catch x -> ...`, or `catch (x : T) -> ...`")
-catchWrong cx (Just (MkCatchArm b _)) =
+catchWrong cx (MkCatchArm b _) =
   maybe
     Nothing
     (\x -> Just (badE (binderSpan b) (mutClash x)))
     (firstMut cx (binderNames b))
 
--- | a `finally` block: the scope's release, its statements, then `pure
--- | MkUnit`
-finallyT : DoT -> DoCx -> List (Params.Spanned (Stmt Expr)) -> Expr
-finallyT t cx ss =
-  t.stmts
-    (finalCx cx)
-    ss
-    (EndJump
-       { head = At (EVar cx.names.pure) cx.sp
-       , vars = Nil
-       , unit = True
-       , depth = 0
-       })
-
--- (the type of what the `catch` arm hears given, `(err := T)`, as an
--- argument)
+-- (`try`'s type given, `(err := T)`, as an argument)
 errArgs : Params.Span -> Maybe Expr -> List Expr
 errArgs sp Nothing = Nil
 errArgs sp (Just ty) = [At (ENamed "err" ty) (Params.spanOf ty)]
 
--- | the statements tried, heard by the `catch` arm if there is one (the
--- | exception module's `recover`)
-heardT : DoT
-       -> DoCx
-       -> Params.Span
-       -> End
-       -> Maybe Expr
-       -> Expr
-       -> Maybe (CatchArm Expr)
-       -> Expr
-heardT t cx sp end err tried Nothing = tried
-heardT t cx sp end err tried (Just h) =
-  app
-    (At (EVar "recover") sp)
-    (List.append (errArgs sp err) [tried, catchT t cx sp end h])
-
--- | what a `try` runs, one scope in, each part up to `end`: the
--- | statements tried, heard by the `catch` arm, released by the `finally`
--- | block (the scope module's `scoped`, acquiring nothing) -- its answer,
--- | what to do once it is left
-tryHeard : DoT
-         -> DoCx
-         -> Params.Span
-         -> End
-         -> Maybe Expr
-         -> Expr
-         -> Maybe (CatchArm Expr)
-         -> Maybe (List (Params.Spanned (Stmt Expr)))
-         -> Expr
-tryHeard t cx sp end err tried Nothing Nothing =
-  badE sp "a `try` has a `catch` arm, a `finally` block, or both"
-tryHeard t cx sp end (Just ty) tried Nothing (Just fs) =
-  badE
-    (Params.spanOf ty)
-    "a `try` with no `catch` arm hears no throw: `(err := T)` names the type of what its `catch` arm hears"
-tryHeard t cx sp end err tried h Nothing = heardT t cx sp end err tried h
-tryHeard t cx sp end err tried h (Just fs) =
-  app
-    (At (EVar "scoped") sp)
-    [ pureOf cx sp (At (ETag "MkUnit") sp)
-    , thunkOf sp (finallyT t cx fs)
-    , thunkOf sp (heardT t cx sp end err tried h)
-    ]
-
--- | a `try`'s scope, its statements up to `end`, then what its answer
--- | says to do, by co's `leaveScope`: go on after it
--- | (`end`), or jump further out
+-- | a `try`'s scope, its statements up to `end` heard by its `catch` arm
+-- | (the exception module's `recover`), then what its answer says to do,
+-- | by the exception module's `leaveScope`: go on after it (`end`), or
+-- | jump further out
 tryScope : DoT -> DoCx -> Params.Span -> TryF Expr -> End -> Expr
-tryScope t cx sp (MkTry err body h fin) end =
+tryScope t cx sp (MkTry err body h) end =
   app
     (At (EVar cx.names.bind) cx.sp)
-    [ tryHeard t (inScope cx) sp end err (t.stmts (inScope cx) body end) h fin
+    [ app
+      (At (EVar "recover") sp)
+      (List.append
+         (errArgs sp err)
+         [t.stmts (inScope cx) body end, catchT t (inScope cx) sp end h])
     , At (EVar "leaveScope") sp
     ]
 
@@ -1730,12 +1626,6 @@ controlT t cx (At (EAssign x xsp v) sp) rest end =
            xsp
            (At (EAnn v' (typeOfE xsp x)) (Params.spanOf v'))
            (t.stmts cx rest end))
-  else if isSealed cx x
-  then badE
-      xsp
-      ("`"
-       ^ x
-       ^ "` is a `let mut` variable of the block around a `finally` block: the block runs as the `try` is left, seeing the variables as they were where the `try` began, and cannot set them")
   else badE
       xsp
       ("`"
@@ -1750,8 +1640,7 @@ controlT t cx (At EContinue sp) rest end =
 controlT t cx (At (EReturn v) sp) (Cons s _) end =
   badE (Params.spanOf s) "nothing after `return` runs: it is the last statement"
 controlT t cx (At (EReturn v) sp) Nil end =
-  if cx.final then badE sp (leavesFinally "`return`")
-  else hoist cx v (\v' -> leaving cx sp cx.depth (pureOf cx sp v'))
+  hoist cx v (\v' -> leaving cx sp cx.depth (pureOf cx sp v'))
 controlT t cx (At (EWhile c body) sp) rest end = whileT t cx sp c body rest end
 controlT t cx (At (EFor p c body) sp) rest end = forT t cx sp p c body rest end
 controlT t cx (At (EIfThen c a) sp) rest end =
@@ -1783,8 +1672,8 @@ controlT t cx (At (EIfLet p s a b) sp) rest end =
     [MkPair p (armStmts a), MkPair (At (PatVar "_") sp) (elseStmts b)]
     rest
     end
-controlT t cx (At (ETry (MkTry err body h fin)) sp) rest end =
-  tryOr t cx sp (MkTry err body h fin) rest end (catchWrong cx h)
+controlT t cx (At (ETry (MkTry err body h)) sp) rest end =
+  tryOr t cx sp (MkTry err body h) rest end (catchWrong cx h)
 controlT t cx e rest end =
   hoist cx e (\e' -> doBind cx e' "_" cx.sp (t.stmts cx rest end))
 
@@ -1869,8 +1758,6 @@ doBlock names sp stmts =
          , loop = Nothing
          , sp = sp
          , depth = 0
-         , final = False
-         , sealed = Nil
          }
          stmts
          EndValue)

@@ -18,10 +18,7 @@ library is split by backend ([library.md](library.md#the-batteries)):
   `std.io`, `std.filesystem`, `std.process`, `std.progress`, `std.http`,
   `std.net`, `std.thread`, `std.reactor`, `std.terminal`;
 - `std.reference` and `std.time` are needed on both sides: one module each,
-  with a provider in C and one in JavaScript of no `$host`; so is
-  `scope` (lib/scope.hf), a `do` block's `finally`, whose C provider
-  arms a scope's token as a foreign value, its release run by the
-  runtime where the token's last reference goes armed;
+  with a provider in C and one in JavaScript of no `$host`;
 - `lib/browser/`'s are the browser's, in JavaScript alone: `browser.dom`
   and `browser.http` (`$host = "page"`), and `browser.js`, which has no
   effect, only its type.
@@ -210,6 +207,37 @@ hand.  A module all of whose operations are described needs no
 streams as an effect, no C written for it).  Functions of no effect
 (libm's, a hash) are not described: they are primitives of the
 runtime or the library; C cannot be trusted to say a function is pure.
+
+## Resources held by a `with`
+
+A host's thing that must be let go of -- an open file -- is handed out
+by a `with` of the effect's own (std.filesystem's `withFile path
+options body`), which gives the body it as a `With s a` (co's),
+the body polymorphic in the region `s` so that what it comes to cannot
+hold it; what uses it needs no effect but the thing's own.  Its
+provider makes sure it is let go of, in two parts:
+
+- the operation that acquires it gives a foreign value whose function
+  letting it go is its release (`heff_foreign(p, let_go)`).  Where the
+  program drops its last reference -- the body left by a throw heard
+  outside it, or by a handler between dropping the continuation that
+  holds it -- the thing is let go of then: in C at once, by the count,
+  before the handler that dropped it goes on; in JavaScript, by a
+  `FinalizationRegistry`, when the collector finds it, if it does.  A
+  drop lets go of what it held as it frees it, in no order promised;
+- the body ended, the `with` releases it by an operation of the
+  effect's own (std.filesystem's `ReleaseHeld`), which marks it
+  released: done once, its function letting go of it then frees only
+  what holds it, and an operation given it after fails as the host does
+  (`EBADF`).
+
+An operation of it that waits keeps the operation, so the thing, until
+it is done, so that it is not let go of under it.  The `with` is a
+function of the module's over these operations, not an operation
+holding the body: a computation an operation of the world holds is
+forwarded to it, by each handler between, by a natural transformation,
+which has nothing for a throw but `abandon` -- a throw out of such a
+body, heard outside it, would end the program.
 
 ## Outside operations done later
 

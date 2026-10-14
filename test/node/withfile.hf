@@ -1,0 +1,198 @@
+-- A file held by std.filesystem's `withFile`, by C alone: closed where
+-- its body ends, where a throw leaves the body for a `catch` outside it,
+-- and where a handler between drops the continuation (one of the test's
+-- own) -- each before what follows runs; written in one `with` and read
+-- back in another; and ten thousand bodies left by a throw, none of their
+-- files left open.  What is open is counted: the process's descriptors,
+-- `/dev/fd`.
+
+import co
+import exception
+import std.filesystem
+import std.io
+
+-- (a handler that gives up: `stop` drops the continuation, the answer
+-- `Nothing`)
+data StopF (m : Type -> Type) x = Stop
+
+stopping : HFunctor
+stopping =
+  { f = StopF
+  , hfmap = \m g p -> case p of
+      Stop -> Stop
+  , hmap = \m n nt p -> case p of
+      Stop -> Stop
+  }
+
+stop : {e : HFunctor} -> {{ev : stopping <: e}} -> {a : Type} -> Co e a
+stop = op (ev Stop) val
+
+justOr : {e : HFunctor} -> {a : Type} -> Maybe a -> Co e a
+justOr (Just x) = val x
+justOr Nothing = abandon
+
+maybeFunctor : (e : HFunctor) -> RawFunctor
+maybeFunctor e =
+  { f = \x -> Co e (Maybe x)
+  , fmap = \g m -> bind m (\r -> val (maybe Nothing (\x -> Just (g x)) r))
+  }
+
+stopped : (e : HFunctor) -> {a : Type} -> Co (stopping <+> e) a -> Co e (Maybe a)
+stopped e c =
+  handle
+    { M = \x -> Co e (Maybe x)
+    , ret = \x -> val (Just x)
+    , bind = \m k -> bind m (\r -> maybe (val Nothing) k r)
+    , malg = \p -> case p of
+        InL t -> val Nothing
+        InR q ->
+          op
+            (e.hmap (maybeFunctor e) (coFunctor e) (\m -> bind m (\r -> justOr r)) q)
+            (\x -> val (Just x))
+    }
+    c
+
+world : HFunctor
+world = stdio <+> filesystem
+
+-- (the descriptors the process has open)
+descriptors : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e Int
+descriptors = do
+  names <- readDirectory "/dev/fd"
+  pure (maybe 0 List.length names)
+
+-- (... more than `base`)
+openMore : {e : HFunctor} -> {{disk : filesystem <: e}} -> Int -> Co e Int
+openMore base = do
+  n <- descriptors
+  pure (n - base)
+
+-- (what a `with` came to, or why it did not open or close)
+shownWith : Either FileError String -> String
+shownWith (Left err) = showFileError err
+shownWith (Right s) = s
+
+-- (a line read, as the test says it)
+shownLine : Either FileError (Maybe String) -> String
+shownLine (Right (Just l)) = l
+shownLine (Right Nothing) = "(the end)"
+shownLine (Left err) = showFileError err
+
+-- (written in one `with`, read back in another)
+roundTrip : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Int
+          -> String
+          -> Co e Unit
+roundTrip base path = do
+  w <- withFile path { access = Write } (\f -> do
+    _ <- writeStringTo f "one\ntwo\n"
+    n <- openMore base
+    pure ("open in the body: " ^ show n))
+  print (shownWith w)
+  print ("open after it: " ^ show (<- openMore base))
+  r <- withFile path { access = Read } (\f -> do
+    a <- readLineOf f
+    b <- readLineOf f
+    c <- readLineOf f
+    pure (shownLine a ^ ", " ^ shownLine b ^ ", " ^ shownLine c))
+  print (shownWith r)
+
+-- (a throw out of the body, heard by a `catch` outside it: the file
+-- closed before the `catch` arm runs)
+caughtOutside : {e : HFunctor}
+              -> {{io : stdio <: e}}
+              -> {{disk : filesystem <: e}}
+              -> {{ex : exception String <: e}}
+              -> Int
+              -> String
+              -> Co e Unit
+caughtOutside base path = do
+  try
+    r <- withFile path { access = Read } (\f -> do
+      l <- readLineOf f
+      print ("read " ^ shownLine l ^ ", open: " ^ show (<- openMore base))
+      (throw "boom" : Co e Unit))
+    print "never here"
+  catch (why : String) ->
+    print ("caught " ^ why ^ ", open: " ^ show (<- openMore base))
+
+-- (a handler between that drops the continuation)
+gaveUp : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{st : stopping <: e}}
+       -> Int
+       -> String
+       -> Co e Unit
+gaveUp base path = do
+  r <- withFile path { access = Read } (\f -> do
+    print ("stopping, open: " ^ show (<- openMore base))
+    (stop : Co e Unit))
+  print "never here"
+
+-- (`n` bodies, each left by a throw heard outside it)
+thrownTimes : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> {{ex : exception String <: e}}
+            -> String
+            -> Int
+            -> Co e Int
+thrownTimes path n = do
+  let mut i = 0
+  let mut caught = 0
+  while i < n do
+    i := i + 1
+    try
+      withFile path { access = Read } (\f -> (throw "again" : Co e Unit))
+    catch (why : String) ->
+      caught := caught + 1
+  return caught
+
+-- (the temporary directory's path, or the program abandoned)
+dirOf : {e : HFunctor} -> Either FileError String -> Co e String
+dirOf (Right dir) = pure dir
+dirOf (Left err) = abandon
+
+program : {e : HFunctor} -> {{io : stdio <: e}} -> {{disk : filesystem <: e}} -> Co e Unit
+program = do
+  base <- descriptors
+  dir <- dirOf (<- temporaryDirectory "heff-with-")
+  let path = dir ^ "/held.txt"
+  roundTrip base path
+  r <-
+    attempt
+      String
+      e
+      (caughtOutside
+         (io := \p -> InR (io p))
+         (disk := \p -> InR (disk p))
+         (ex := \p -> InL p)
+         base
+         path)
+  s <-
+    stopped
+      e
+      (gaveUp
+         (io := \p -> InR (io p))
+         (disk := \p -> InR (disk p))
+         (st := \p -> InL p)
+         base
+         path)
+  print ("stopped, open: " ^ show (<- openMore base))
+  n <-
+    attempt
+      String
+      e
+      (thrownTimes (disk := \p -> InR (disk p)) (ex := \p -> InL p) path 10000)
+  print
+    ("thrown "
+     ^ either (\why -> why) (\c -> show c) n
+     ^ " times, open: "
+     ^ show (<- openMore base))
+  gone <- remove dir
+  print (if gone then "removed" else "not removed")
+
+main : Co world Unit
+main = program (io := \p -> InL p) (disk := \p -> InR p)

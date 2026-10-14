@@ -25,15 +25,11 @@ writing them ([how names are found](language.md#modules)).  The others
 are imported by their names:
 
 - `co` ([effects](language.md#effects)), and effects made with it:
-  `state`, `exception` (`throw` and `recover`; `divOrThrow` and
-  `modOrThrow`, a division that throws by zero; and `attempt`, a
-  handler of it: what was thrown and heard by no `recover`, `Left`),
-  `scope` (`scoped`, a scope released however it is left -- at its
-  end, by a throw of any type, or by a handler that did not go on --
-  which a `do` block's `try ... finally` is ([`do`](language.md#do));
-  an effect of the world, with a provider in C and in JavaScript, and
-  `endScopes`, a handler of it in the language), `parallel` and
-  `green` ([green threads](#green-threads));
+  `state`, `exception` (`throw` and `recover`, which a `do` block's
+  `try` is ([`do`](language.md#do)); `divOrThrow` and `modOrThrow`, a division
+  that throws by zero; and `attempt`, a handler of it: what was thrown
+  and heard by no `recover`, `Left`), `parallel` and `green` ([green
+  threads](#green-threads));
 - `array` ([arrays](#arrays)), `std.map` and `std.set`, by the keys'
   `Order`, found as an instance argument is, the map first:
   `Map.insert m k v`, `Map.lookup m k`, `Map.member m k`, `Map.delete
@@ -448,6 +444,27 @@ countWords n line = pure (n + List.length (words line))
 -- (the words of the standard input, read a line at a time)
 wordsIn : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e (Either FileError Int)
 wordsIn = bind stdin (\i -> foldLines i 0 countWords)
+```
+
+A file may instead be held by a `with`, closed however the program is
+done with it: `withFile path { access = Read } body` opens it and runs
+`body` with it, a `With s OpenFile` (co's) in a region `s` of its own,
+read by `readLineOf f` and written by `writeStringTo f s`; the body
+ended, it closes it, and is what the body came to, `Either FileError
+a` (`Left` where the file did not open or close).  The body is
+polymorphic in `s` and what it comes to is of a type bound outside it,
+so the file cannot be kept past it: `withFile path o (\f -> pure f)`
+does not type-check.  Should the body be left otherwise -- a throw
+heard by a `catch` outside it, a handler between that drops the
+continuation -- the file is closed where the program drops its last
+reference to it, at once (the count of it, in C, comes to naught before
+the `catch` arm runs).  What uses it needs only `filesystem`: no effect
+of scopes, nor `exception`.
+
+```haskell
+firstLine : {e : HFunctor} -> {{disk : filesystem <: e}} -> String
+          -> Co e (Either FileError (Either FileError (Maybe String)))
+firstLine path = withFile path { access = Read } (\f -> readLineOf f)
 ```
 
 A regular file is read and written there and then, the whole program

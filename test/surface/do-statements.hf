@@ -3,15 +3,12 @@
 -- `continue`, `return`, an `if` without `else` and an `if`'s or a
 -- `case`'s arms that are statements, `(<- c)` (hoisted to the start of
 -- the arm it is in), a closure holding a variable's value, and `run do`
--- for pure code.  And (#100) `if let`, and `try ... catch ... finally`:
--- the `catch` arm over the `exception` effect, the `finally` block over
--- the world's scopes (here handled in the language, outermost but for the
--- log: a scope a throw left released as the computation ends).
+-- for pure code.  And (#100) `if let`, and `try ... catch` over the
+-- `exception` effect.
 
 import array
 import co
 import exception
-import scope
 import state
 
 -- | `while`, its variables set in the body; the loop's `if` an `else`
@@ -215,43 +212,39 @@ justs ms = run do
       else missing := missing + 1
   return (MkPair total missing)
 
--- `try`, `catch`, `finally`
+-- `try`, `catch`
 --------------------------------------------------------------------------------
 
--- (a world that throws a `String`, has scopes and keeps a log; a throw
--- keeps what was logged before it)
+-- (a world that throws a `String` and keeps a log; a throw keeps what was
+-- logged before it)
 world : HFunctor
-world = exception String <+> (scope <+> state (List String))
+world = exception String <+> state (List String)
 
 -- (the log, its latest first, and the answer or what no `catch` heard)
 data Logged = Thrown String (List String) | Done Int (List String)
 
-logging : Handler (state (List String))
-logging =
-  { M = \a -> List String -> Pair a (List String)
-  , ret = \x l -> MkPair x l
+logged : Handler world
+logged =
+  { M = \a -> List String -> Pair (Either String a) (List String)
+  , ret = \x l -> MkPair (Right x) l
   , bind = \m k l -> case m l of
-      MkPair x l2 -> k x l2
+      MkPair (Left s) l2 -> MkPair (Left s) l2
+      MkPair (Right x) l2 -> k x l2
   , malg = \p l -> case p of
-      Get k -> MkPair (k l) l
-      Put l2 x -> MkPair x l2
+      InL t -> case t of
+        Throw s -> MkPair (Left s) l
+        Catch c h -> case c l of
+          MkPair (Left s) l2 -> h s l2
+          MkPair (Right x) l2 -> MkPair (Right x) l2
+      InR t -> case t of
+        Get k -> MkPair (Right (k l)) l
+        Put l2 x -> MkPair (Right x) l2
   }
 
--- (the throws heard at last, the scopes handled in the language around
--- them -- those a throw left released as the computation ends -- and the
--- log kept outermost)
 runLogged : Co world Int -> Logged
-runLogged c =
-  case
-    handle
-      logging
-      (endScopes
-         (state (List String))
-         (attempt String (scope <+> state (List String)) c))
-      Nil
-  of
-    MkPair (Left s) l -> Thrown s l
-    MkPair (Right x) l -> Done x l
+runLogged c = case handle logged c Nil of
+  MkPair (Left s) l -> Thrown s l
+  MkPair (Right x) l -> Done x l
 
 note : {e : HFunctor} -> {{st : state (List String) <: e}} -> String -> Co e Unit
 note s = do
@@ -259,22 +252,18 @@ note s = do
   put (Cons s l : List String)
 
 onEx : exception String <: world
-onEx = \p -> InL p
-
-onScope : scope <: world
-onScope = \p -> InR (InL p)
+onEx = inl (exception String) (state (List String))
 
 onLog : state (List String) <: world
-onLog = \p -> InR (InR p)
+onLog = inr (exception String) (state (List String))
 
 -- | a throw caught, the `catch` arm setting the block's variable (which
 -- | it sees as it was where the `try` began: what the throw abandoned is
--- | gone); the `finally` block after it
--- | >>> runLogged (caught (ex := onEx) (sc := onScope) (st := onLog))
--- | Done 11 ["finally", "caught boom", "tried"]
+-- | gone)
+-- | >>> runLogged (caught (ex := onEx) (st := onLog))
+-- | Done 11 ["caught boom", "tried"]
 caught : {e : HFunctor}
        -> {{ex : exception String <: e}}
-       -> {{sc : scope <: e}}
        -> {{st : state (List String) <: e}}
        -> Co e Int
 caught = do
@@ -286,19 +275,16 @@ caught = do
   catch (msg : String) ->
     note ("caught " ^ msg)
     n := n + 10
-  finally
-    note "finally"
   return n
 
--- | `finally` on the normal way out, the `try` the block's last statement
--- | (its value the block's), and on a throw no `catch` hears
--- | >>> runLogged (fine (ex := onEx) (sc := onScope) (st := onLog) False)
--- | Done 7 ["finally"]
--- | >>> runLogged (fine (ex := onEx) (sc := onScope) (st := onLog) True)
--- | Thrown "out" ["finally"]
+-- | the `try` the block's last statement (its value the block's), and a
+-- | throw its `catch` arm throws on
+-- | >>> runLogged (fine (ex := onEx) (st := onLog) False)
+-- | Done 7 []
+-- | >>> runLogged (fine (ex := onEx) (st := onLog) True)
+-- | Thrown "out" ["passing out"]
 fine : {e : HFunctor}
      -> {{ex : exception String <: e}}
-     -> {{sc : scope <: e}}
      -> {{st : state (List String) <: e}}
      -> Bool
      -> Co e Int
@@ -306,10 +292,11 @@ fine b = do
   try
     if b then (throw "out" : Co e Unit)
     pure 7
-  finally
-    note "finally"
+  catch (s : String) ->
+    note ("passing " ^ s)
+    throw s
 
--- | a `catch` with no `finally`, its binder's type found from its use
+-- | a `catch` arm's binder, its type found from its use
 -- | >>> runLogged (heard (ex := onEx) (st := onLog))
 -- | Done 3 ["heard no"]
 heard : {e : HFunctor}
@@ -326,12 +313,12 @@ heard = do
     n := 3
   return n
 
--- | `continue` and `break` crossing a `finally`, which runs each time
--- | >>> runLogged (loops (ex := onEx) (sc := onScope) (st := onLog))
--- | Done 12 ["f6", "f5", "f4", "f3", "f2", "f1"]
+-- | `continue` and `break` crossing a `try`, a throw heard on a turn
+-- | between
+-- | >>> runLogged (loops (ex := onEx) (st := onLog))
+-- | Done 8 ["four"]
 loops : {e : HFunctor}
       -> {{ex : exception String <: e}}
-      -> {{sc : scope <: e}}
       -> {{st : state (List String) <: e}}
       -> Co e Int
 loops = do
@@ -342,34 +329,34 @@ loops = do
     try
       if i == 3 then continue
       if i == 6 then break
+      if i == 4 then (throw "four" : Co e Unit)
       total := total + i
-    finally
-      note ("f" ^ show i)
+    catch (s : String) ->
+      note s
   return total
 
--- | `return` crossing two: the inner `finally` first
--- | >>> runLogged (nested (ex := onEx) (sc := onScope) (st := onLog))
--- | Done 5 ["outer", "inner"]
+-- | `return` crossing two
+-- | >>> runLogged (nested (ex := onEx) (st := onLog))
+-- | Done 5 []
 nested : {e : HFunctor}
        -> {{ex : exception String <: e}}
-       -> {{sc : scope <: e}}
        -> {{st : state (List String) <: e}}
        -> Co e Int
 nested = do
   try
     try
       return 5
-    finally
+    catch (s : String) ->
       note "inner"
-  finally
+  catch (s : String) ->
     note "outer"
+  return 0
 
--- | the `catch` in a loop, `continue` from it, the `finally` after it
--- | >>> runLogged (retried (ex := onEx) (sc := onScope) (st := onLog))
--- | Done 2 ["f3", "f2", "f1", "retry 1"]
+-- | the `catch` in a loop, `continue` from it
+-- | >>> runLogged (retried (ex := onEx) (st := onLog))
+-- | Done 2 ["retry 1"]
 retried : {e : HFunctor}
         -> {{ex : exception String <: e}}
-        -> {{sc : scope <: e}}
         -> {{st : state (List String) <: e}}
         -> Co e Int
 retried = do
@@ -383,6 +370,4 @@ retried = do
     catch (s : String) ->
       note ("retry " ^ show i)
       continue
-    finally
-      note ("f" ^ show i)
   return ok

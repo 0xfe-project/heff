@@ -6,7 +6,10 @@
 --
 -- An open file is a handle, the world's number for
 -- it, held until it is closed (an operation given it after that fails
--- the program).  What fails is a value, an `Either FileError a`: the
+-- the program) -- or a file held by a `with` (`withFile`), the host's
+-- own thing, closed when the body ends and, should the body be left
+-- otherwise (a throw heard outside it, a continuation dropped), when
+-- the program drops its last reference to it.  What fails is a value, an `Either FileError a`: the
 -- system's errno, its name and what it says of it.  The standard
 -- streams are open files too (`stdin`, `stdout`, `stderr`), so that a
 -- program reads its input a line at a time, in as little memory as a
@@ -24,7 +27,9 @@ import co
 import int as Int
 import std.handle
 
--- | (`Handle OpenFile`, std.handle: a file open; no value has it.)
+-- | A file open: `Handle OpenFile`, std.handle's number for it, or, held
+-- | by a `with`, `With s OpenFile`, the host's own (a foreign value; no
+-- | value of the program has it).
 data OpenFile
 
 -- | A file open: read, written, sought in, closed.
@@ -101,6 +106,10 @@ data FilesystemF (m : Type -> Type) x
   | Seek File Int Int (Either FileError Int -> x)
   | HandleStatus File (Either FileError Status -> x)
   | CloseFile File (Either FileError Unit -> x)
+  | OpenHeld String Int Bool Bool Bool Int (Either FileError OpenFile -> x)
+  | ReadLineHeld OpenFile (Either FileError (Maybe String) -> x)
+  | WriteHeld OpenFile String (Either FileError Unit -> x)
+  | ReleaseHeld OpenFile (Either FileError Unit -> x)
 
 -- | Files as an effect.
 filesystem : HFunctor
@@ -131,6 +140,10 @@ filesystem =
       Seek h from n k -> Seek h from n (\r -> g (k r))
       HandleStatus h k -> HandleStatus h (\r -> g (k r))
       CloseFile h k -> CloseFile h (\r -> g (k r))
+      OpenHeld path a c t x mode k -> OpenHeld path a c t x mode (\r -> g (k r))
+      ReadLineHeld f k -> ReadLineHeld f (\r -> g (k r))
+      WriteHeld f s k -> WriteHeld f s (\r -> g (k r))
+      ReleaseHeld f k -> ReleaseHeld f (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       ReadFile path k -> ReadFile path k
       WriteFile path str k -> WriteFile path str k
@@ -156,6 +169,10 @@ filesystem =
       Seek h from n k -> Seek h from n k
       HandleStatus h k -> HandleStatus h k
       CloseFile h k -> CloseFile h k
+      OpenHeld path a c t x mode k -> OpenHeld path a c t x mode k
+      ReadLineHeld f k -> ReadLineHeld f k
+      WriteHeld f s k -> WriteHeld f s k
+      ReleaseHeld f k -> ReleaseHeld f k
   }
 
 -- Whole files
@@ -473,6 +490,77 @@ closeFile : {e : HFunctor}
           -> File
           -> Co e (Either FileError Unit)
 closeFile h = op (ev (CloseFile h (\r -> r))) val
+
+-- Files held by a `with`
+--------------------------------------------------------------------------------
+
+-- (what the body came to, or why the file did not close)
+closedWith : {a : Type} -> a -> Either FileError Unit -> Either FileError a
+closedWith x (Right _) = Right x
+closedWith x (Left err) = Left err
+
+-- (the body run with the file, then the file closed; or why it was not
+-- opened)
+heldBy : {e : HFunctor}
+       -> {a : Type}
+       -> {{ev : filesystem <: e}}
+       -> ({s : Type} -> With s OpenFile -> Co e a)
+       -> Either FileError OpenFile
+       -> Co e (Either FileError a)
+heldBy body (Left err) = pure (Left err)
+heldBy body (Right f) =
+  bind
+    (body (s := OpenFile) (MkWith f))
+    (\x ->
+       bind
+         (op (ev (ReleaseHeld f (\r -> r))) val)
+         (\r -> pure (closedWith x r)))
+
+-- | `path` opened as `o` says, held by `body` in a region of its own --
+-- | the file is not kept past it -- and closed when `body` ends: what it
+-- | came to, or why the file did not open or close.  Should `body` be
+-- | left otherwise -- a throw heard outside it, a handler between that
+-- | drops the continuation -- the file is closed where the program
+-- | drops its last reference to it: at once, in C, as it is counted.
+withFile : {e : HFunctor}
+         -> {a : Type}
+         -> {{ev : filesystem <: e}}
+         -> String
+         -> OpenOptions
+         -> ({s : Type} -> With s OpenFile -> Co e a)
+         -> Co e (Either FileError a)
+withFile path o body =
+  bind
+    (op
+       (ev
+          (OpenHeld
+             path
+             (accessCode o.access)
+             o.create
+             o.truncate
+             o.exclusive
+             o.mode
+             (\r -> r)))
+       val)
+    (\r -> heldBy body r)
+
+-- | The next line of a file held by a `with`, as `readLine`'s; after the
+-- | `with` closed it, `EBADF`.
+readLineOf : {e : HFunctor}
+           -> {s : Type}
+           -> {{ev : filesystem <: e}}
+           -> With s OpenFile
+           -> Co e (Either FileError (Maybe String))
+readLineOf (MkWith f) = op (ev (ReadLineHeld f (\r -> r))) val
+
+-- | A string written to a file held by a `with`, as `writeString`'s.
+writeStringTo : {e : HFunctor}
+              -> {s : Type}
+              -> {{ev : filesystem <: e}}
+              -> With s OpenFile
+              -> String
+              -> Co e (Either FileError Unit)
+writeStringTo (MkWith f) str = op (ev (WriteHeld f str (\r -> r))) val
 
 -- Streams
 --------------------------------------------------------------------------------
