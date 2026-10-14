@@ -47,6 +47,10 @@ and the part), so a part as it was is not built again, whichever stage
 it is of, and one no stage of the build is made of is let go.  (zig's
 own cache, `.zig-cache/`, holds `scripts/bootstrap.zig` built.)
 
+With Nix, `nix develop` gives a shell with zig 0.17, make and Node.js,
+and `nix build` builds heff from the seed into `result/`, laid out as a
+release is (its zig, for `heff build`, after any on the `PATH`).
+
 `make install` installs into `~/.heff` whatever `HEFF_HOME` says (to
 install elsewhere, `HEFF_HOME=DIR .heff/out/heff install`); `make
 install-all` installs the VS Code extension too (`make vsix`, then

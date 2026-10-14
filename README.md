@@ -64,6 +64,9 @@ make install               # build .heff/out/heff, then install it into ~/.heff/
 
 Put `~/.heff/bin` on your `PATH`.
 
+With Nix, `nix run github:dannypsnl/heff` runs heff, `nix profile
+install github:dannypsnl/heff` installs it.
+
 ## Using it
 
 ```sh
