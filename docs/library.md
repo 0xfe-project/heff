@@ -850,11 +850,16 @@ uri body =
 
 Each directory of `examples/` is a project ([projects](projects.md)):
 `heff build` there builds it, and `heff dev` serves its pages.
-`examples/pages/` is four pages, each a program of its own (`app/NAME/`,
-its `index.html` beside it): a counter, a clock, a greeting written into
-the page, and a sum of vectors on the GPU; `heff dev` there serves each
-at `/NAME/`.  `examples/notes/` is a page and its server, one project
-([a client and its server](remote.md)).  The apps' tests (`heff test
-test/apps.hf`) run them all.  `examples/testbridge/` is a project of
-another kind: a Linux program, through C, that makes a bridge and a
-veth pair by rtnetlink, its socket's calls a provider of its own.
+`examples/collatz/` is a first program, through C, to start from: an
+effect of its own, a logger, handled two ways -- printed by the program,
+kept by its tests -- the statements of [`do`](language.md#do) (`let
+mut`, `while`, `for`, `return`), and [tests](tests.md), unit tests and a
+property, run by `heff test` there.  `examples/pages/` is four pages,
+each a program of its own (`app/NAME/`, its `index.html` beside it): a
+counter, a clock, a greeting written into the page, and a sum of vectors
+on the GPU; `heff dev` there serves each at `/NAME/`.  `examples/notes/`
+is a page and its server, one project ([a client and its
+server](remote.md)).  The apps' tests (`heff test test/apps.hf`) run
+them all.  `examples/testbridge/` is a project of another kind: a Linux
+program, through C, that makes a bridge and a veth pair by rtnetlink,
+its socket's calls a provider of its own.
