@@ -1,0 +1,440 @@
+-- Progress: on a terminal -- the standard error a terminal, `TERM` not
+-- `dumb` -- `heff build` draws what it is doing below what it writes,
+-- zig's own progress among it (`zig cc`, through `ZIG_PROGRESS`), and
+-- clears it: what is left on the screen is what it writes, as it writes
+-- it without one.  Elsewhere -- a pipe, `TERM=dumb` -- it writes not a
+-- byte more.  The terminal is the tests' pseudo-terminal (`pty.c`, built
+-- here by zig, else `cc`), what is drawn on it played back on a screen
+-- kept here.  Each test a project of its own, a module of a few hundred
+-- definitions in it, long enough to build to be drawn; run by the heff
+-- that runs the tests (`HEFF`).  Not on Windows, which has no such
+-- terminal:
+--
+--   heff test --run progress/terminal test/progress.hf
+
+import check
+import co
+import rune as Rune
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (did it exit with this status)
+exitedWith : Int -> Ran -> Bool
+exitedWith n r = case r.ended of
+  Exited k -> k == n
+  _ -> False
+
+-- (files written, each a path and its text; else the test fails)
+writeAll : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List (Pair String String)
+         -> Co e Unit
+writeAll Nil = pure MkUnit
+writeAll (Cons (MkPair path text) rest) = do
+  ok <- writeFile path text
+  if ok then writeAll rest else failure ("could not write " ^ path)
+
+-- The terminal
+--------------------------------------------------------------------------------
+
+-- | the pseudo-terminal built, `pty` in the test's directory: its path
+ptyBuilt : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> Co e String
+ptyBuilt = do
+  root <- given "HEFF_TEST_ROOT"
+  here <- workingDir
+  zig <- run { command = "zig", args = ["version"] }
+  flags <- pure ["-O1", "-w", root ^ "/test/pty.c", "-o", here ^ "/pty"]
+  built <-
+    if succeeded zig then run { command = "zig", args = Cons "cc" flags }
+    else run { command = "cc", args = flags }
+  if succeeded built then pure (here ^ "/pty")
+    else failure ("the pseudo-terminal not built: " ^ built.err)
+
+-- | heff run in `dir` on a terminal of 100 columns by 30 rows, `TERM` as
+-- | given: all it put there, and how it ended
+onTerminal : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> String
+           -> String
+           -> String
+           -> List String
+           -> Co e Ran
+onTerminal pty dir term arguments = do
+  heff <- given "HEFF"
+  run
+      { command = pty
+      , args = Cons "100" (Cons "30" (Cons heff arguments))
+      , dir = dir
+      , env = [MkPair "TERM" term]
+      }
+
+-- | heff run in `dir` into pipes, `TERM` a terminal's
+plain : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> List String
+      -> Co e Ran
+plain dir arguments = do
+  heff <- given "HEFF"
+  run
+      { command = heff
+      , args = arguments
+      , dir = dir
+      , env = [MkPair "TERM" "xterm-256color"]
+      }
+
+-- The screen
+--------------------------------------------------------------------------------
+
+-- | a screen: its rows, each its characters (code points; a space where
+-- | none was written), and the cursor's row and column
+data Screen = MkScreen (List (List Int)) Int Int
+
+-- (the list, its `i`th element `x`, made long enough with `fill`)
+putAt : Int -> Int -> Int -> List Int -> List Int
+putAt fill i x Nil =
+  if i == 0 then [x] else Cons fill (putAt fill (i - 1) x Nil)
+putAt fill i x (Cons y ys) =
+  if i == 0 then Cons x ys else Cons y (putAt fill (i - 1) x ys)
+
+-- (the rows, the `i`th changed by `f`, made long enough)
+rowAt : Int
+      -> (List Int -> List Int)
+      -> List (List Int)
+      -> List (List Int)
+rowAt i f Nil = if i == 0 then [f Nil] else Cons Nil (rowAt (i - 1) f Nil)
+rowAt i f (Cons y ys) =
+  if i == 0 then Cons (f y) ys else Cons y (rowAt (i - 1) f ys)
+
+-- (a character written at the cursor, the cursor moved past it)
+written : Screen -> Int -> Screen
+written (MkScreen rows r c) ch =
+  MkScreen (rowAt r (putAt 32 c ch) rows) r (c + 1)
+
+-- (a byte of a control sequence's parameters, `?`, a digit or `;`)
+parameter : Int -> Bool
+parameter b = b == 63 || b == 59 || (b >= 48 && b <= 57)
+
+-- (a letter, a control sequence's last byte)
+letter : Int -> Bool
+letter b = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+
+-- (a control sequence's letter, what follows it: its parameters passed
+-- over, at most 29 of them)
+sequenceEnd : Int -> List Int -> Maybe (Pair Int (List Int))
+sequenceEnd n Nil = Nothing
+sequenceEnd n (Cons b rest) =
+  if letter b then Just (MkPair b rest)
+  else if parameter b && n < 29 then sequenceEnd (n + 1) rest
+  else Nothing
+
+-- (a control sequence done: `J` cleared below the cursor, `K` the rest
+-- of its line, others nothing)
+controlled : Screen -> Int -> Screen
+controlled (MkScreen rows r c) b =
+  if b == 74 then MkScreen (List.take (r + 1) (rowAt r (List.take c) rows)) r c
+  else if b == 75 then MkScreen (rowAt r (List.take c) rows) r c
+  else MkScreen rows r c
+
+-- (a control character done: `\r`, `\n`, `\b`; others, and what is
+-- below a space, nothing)
+moved : Screen -> Int -> Screen
+moved (MkScreen rows r c) ch =
+  if ch == 13 then MkScreen rows r 0
+  else if ch == 10 then MkScreen (rowAt (r + 1) (\l -> l) rows) (r + 1) c
+  else if ch == 8 then MkScreen rows r (max 0 (c - 1))
+  else if ch >= 32 then written (MkScreen rows r c) ch
+  else MkScreen rows r c
+
+-- (up a line: `ESC M`)
+up : Screen -> Screen
+up (MkScreen rows r c) = MkScreen rows (if r > 0 then r - 1 else r) c
+
+-- (an escape done, what follows it: `ESC [ ...` a control sequence,
+-- `ESC M` up a line, `ESC ( X` a character set (nothing), another passed
+-- over with the character after it)
+escaped : Screen -> List Int -> Pair Screen (List Int)
+escaped s Nil = MkPair s Nil
+escaped s (Cons b rest) =
+  if b == 91
+  then case sequenceEnd 0 rest of
+    Just (MkPair l after) -> MkPair (controlled s l) after
+    Nothing -> MkPair s rest
+  else if b == 77 then MkPair (up s) rest
+  else if b == 40 then MkPair s (List.drop 1 rest)
+  else MkPair s rest
+
+-- | the screen, once it has been given these characters
+drawn : Screen -> List Int -> Screen
+drawn s Nil = s
+drawn s (Cons ch rest) =
+  if ch == 27
+  then case escaped s rest of
+    MkPair t after -> drawn t after
+  else drawn (moved s ch) rest
+
+-- (the string, the spaces and `\r`s at its end left out)
+trimEnd : String -> String
+trimEnd s =
+  if strLength s > 0
+     && (byteAt s (strLength s - 1) == 32 || byteAt s (strLength s - 1) == 13)
+  then trimEnd (strSlice s 0 (strLength s - 1))
+  else s
+
+-- | what a terminal shows once it has been given `raw`: its lines, as far
+-- | as the cursor went, those empty (and `^D`) left out
+screen : String -> List String
+screen raw = case drawn
+    (MkScreen [Nil] 0 0)
+    (List.map Rune.toInt (runes raw)) of
+  MkScreen rows r c ->
+    List.filter
+      (\l -> not (strEq l "") && not (strEq l "^D"))
+      (List.map (\row -> trimEnd (ofRunes (List.map Rune.fromInt row))) rows)
+
+-- | what a command said, out and errors, its lines, each trimmed, those
+-- | empty left out
+saidLines : Ran -> List String
+saidLines r =
+  List.filter
+    (\l -> not (strEq l ""))
+    (List.map trimEnd (lines (r.out ^ r.err)))
+
+-- (two lists of lines the same)
+sameLines : List String -> List String -> Bool
+sameLines Nil Nil = True
+sameLines (Cons a xs) (Cons b ys) = strEq a b && sameLines xs ys
+sameLines _ _ = False
+
+-- (the test fails, saying what was wanted and what was shown, unless
+-- the two are the same)
+shows : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> String
+      -> List String
+      -> List String
+      -> Co e Unit
+shows what wanted shown =
+  if sameLines wanted shown then pure MkUnit
+  else failure
+      (what ^ ": wanted\n" ^ unlines wanted ^ "\nshown\n" ^ unlines shown)
+
+-- The project
+--------------------------------------------------------------------------------
+
+-- (definitions, numbered from `i`, `n` of them)
+definitions : Int -> Int -> List String
+definitions i n =
+  List.map
+    (\k ->
+       "f"
+       ^ show k
+       ^ " : Int -> Int\nf"
+       ^ show k
+       ^ " x = if x > "
+       ^ show k
+       ^ " then x * "
+       ^ show (k % 7 + 2)
+       ^ " + "
+       ^ show k
+       ^ " else f"
+       ^ show k
+       ^ " (x + 1)\n")
+    (List.range i (n - 1))
+
+-- | a module big enough to take its time: six hundred definitions, and
+-- | their sum
+big : String
+big =
+  joinWith "\n" (definitions 0 600)
+  ^ "\ntotal : Int\ntotal = "
+  ^ joinWith " + " (List.map (\k -> "f" ^ show k ^ " 1") (List.range 0 599))
+  ^ "\n"
+
+-- | the program, greeting with the sum
+greets : String
+greets =
+  "import co\nimport hello.big\nimport hello.greeting\nimport std.io\n\nprogram : {{io : stdio <: stdio}} -> Co stdio Unit\nprogram = print (greeting (show total))\n\nmain : Co stdio Unit\nmain = program (io := here stdio)\n"
+
+-- | a project `hello`, its program big enough to be drawn as it is built
+project : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+project = do
+  heff <- given "HEFF"
+  made <- run { command = heff, args = ["init", "hello"] }
+  assert ("heff init: " ^ made.err) (succeeded made)
+  writeAll
+      [ MkPair "hello/src/hello/big.hf" big
+      , MkPair "hello/app/hello/main.hf" greets
+      ]
+
+-- | what `heff build` says, built
+builtSaid : List String
+builtSaid = ["heff build: 2 modules checked", "wrote .heff/bin/hello"]
+
+-- The tests
+--------------------------------------------------------------------------------
+
+-- | built on a terminal: drawn as it goes -- the modules checked, the
+-- | program compiled, zig's tasks under `zig cc` -- then cleared, the
+-- | screen left with what heff wrote; the program built
+onATerminal : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> Co e Unit
+onATerminal = do
+  pty <- ptyBuilt
+  project
+  t <- onTerminal pty "hello" "xterm-256color" ["build"]
+  assert ("it built\n" ^ t.out) (exitedWith 0 t)
+  shows "the screen" builtSaid (screen t.out)
+  assert
+      ("its progress drawn\n" ^ strSlice t.out 0 2000)
+      (contains "\u{1b}[J" t.out
+       && (contains "/2] checking modules" t.out
+           || contains "building programs" t.out)
+       && (contains "compiling to C" t.out || contains "zig cc" t.out))
+  assert
+      ("zig's tasks under `zig cc`\n" ^ t.out)
+      (List.any
+         (\s -> contains s t.out)
+         [ "zig cc\n      ├─ "
+         , "zig cc\r\n      ├─ "
+         , "zig cc\n      └─ "
+         , "zig cc\r\n      └─ "
+         ])
+  hello <- run { command = "hello/.heff/bin/hello" }
+  assert ("the program runs\n" ^ hello.out) (startsWith "Hello, " hello.out)
+
+-- | not on a terminal: not a byte more than it says
+intoPipes : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit
+intoPipes = do
+  project
+  p <- plain "hello" ["build"]
+  assert
+      ("into pipes\n" ^ p.out ^ "--stderr--\n" ^ p.err)
+      (exitedWith 0 p
+       && strEq p.out (unlines builtSaid ^ "\n")
+       && strEq p.err "")
+
+-- | `TERM=dumb`: a terminal, nothing drawn
+dumb : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> Co e Unit
+dumb = do
+  pty <- ptyBuilt
+  project
+  t <- onTerminal pty "hello" "dumb" ["build"]
+  assert
+      ("nothing drawn\n" ^ t.out)
+      (exitedWith 0 t && not (contains "\u{1b}" t.out))
+  shows "the screen" builtSaid (screen t.out)
+
+-- | a command on a terminal, then without one: the screen left with
+-- | what it says without one (`HEFF_HOME` the test's own)
+asWithout : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> Co e Unit
+asWithout command = do
+  pty <- ptyBuilt
+  project
+  here <- workingDir
+  heff <- given "HEFF"
+  home <- pure [MkPair "HEFF_HOME" (here ^ "/home")]
+  t <-
+    run
+      { command = pty
+      , args = ["100", "30", heff, command]
+      , dir = "hello"
+      , env = Cons (MkPair "TERM" "xterm-256color") home
+      }
+  p <-
+    run
+      { command = heff
+      , args = [command]
+      , dir = "hello"
+      , env = Cons (MkPair "TERM" "xterm-256color") home
+      }
+  assert
+      ("both went well\n" ^ t.out ^ p.out ^ p.err)
+      (exitedWith 0 t && exitedWith 0 p)
+  shows "the screen" (saidLines p) (screen t.out)
+
+-- | what is written while it is drawn is not garbled: a module with an
+-- | error, said as it is found, the progress cleared before it and after
+-- | it, the screen what it says without a terminal
+anError : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+anError = do
+  pty <- ptyBuilt
+  project
+  writeAll [MkPair "hello/src/hello/wrong.hf" "wrong : Int\nwrong = \"no\"\n"]
+  t <- onTerminal pty "hello" "xterm-256color" ["build"]
+  p <- plain "hello" ["build"]
+  assert
+      ("both failed\n" ^ t.out ^ p.out ^ p.err)
+      (exitedWith 1 t && exitedWith 1 p)
+  shows "the screen" (saidLines p) (screen t.out)
+
+-- (each test passed over where there is no such terminal, on Windows)
+posix : ({e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> Co e Unit)
+      -> ({e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit)
+posix body = do
+  p <- platform
+  if strEq p "win32" then pure MkUnit else body
+
+-- | heff's progress, drawn on a terminal and cleared; nothing more
+-- | elsewhere
+progress : Test
+progress =
+  group
+    "progress"
+    [ integration "terminal" (posix onATerminal)
+    , integration "pipes" intoPipes
+    , integration "dumb" (posix dumb)
+    , integration "install" (posix (asWithout "install"))
+    , integration "test" (posix (asWithout "test"))
+    , integration "error" (posix anError)
+    ]
