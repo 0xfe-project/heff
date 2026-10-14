@@ -95,6 +95,7 @@ typedef struct {
   size_t nin;
   int out_mode, err_mode;  // HEFF_OUT_*: its output, its error stream
   int64_t timeout, keep;  // milliseconds, bytes: 0, no limit
+  int group;     // started in a process group of its own, ended with it
 } HeffInvocation;
 
 // (the environment, `NAME=VALUE`s: the program's but those `sets` names,
@@ -149,7 +150,7 @@ static int heff_output_mode(V o) {
 }
 
 // (the invocation `v`, an `Invocation` (its fields in its type's order:
-// command, args, dir, env, input, output, errors, timeout, keep), as the
+// command, args, dir, env, input, output, errors, timeout, keep, group), as the
 // system is to be given it: 0 where a string of it has a NUL in it)
 static int heff_invocation(V v, HeffInvocation *r) {
   memset(r, 0, sizeof *r);
@@ -157,6 +158,7 @@ static int heff_invocation(V v, HeffInvocation *r) {
   V env = heff_rget_v(v, 3), in = heff_rget_v(v, 4);
   V out = heff_rget_v(v, 5), err = heff_rget_v(v, 6);
   V timeout = heff_rget_v(v, 7), keep = heff_rget_v(v, 8);
+  V group = heff_rget_v(v, 9);
   int ok = 1;
   char *c = heff_cstr_text(cmd);
   r->as = c ? heff_argv_of(c, args) : NULL;
@@ -200,6 +202,7 @@ static int heff_invocation(V v, HeffInvocation *r) {
   r->err_mode = heff_output_mode(err);
   r->timeout = IS_INT(timeout) && INT_OF(timeout) > 0 ? INT_OF(timeout) : 0;
   r->keep = IS_INT(keep) && INT_OF(keep) > 0 ? INT_OF(keep) : 0;
+  r->group = group == NTAG(TAG_True);
   heff_drop(cmd);
   heff_drop(args);
   heff_drop(dir);
@@ -209,6 +212,7 @@ static int heff_invocation(V v, HeffInvocation *r) {
   heff_drop(err);
   heff_drop(timeout);
   heff_drop(keep);
+  heff_drop(group);
   return ok;
 }
 
@@ -287,6 +291,7 @@ struct HeffSub {
   DWORD code;
 #else
   pid_t pid;
+  int group;       // the leader of a process group of its own, `pid`
   int reaped;      // 0: not yet; 1: reaped, `st` its status; 2: lost
   int st;
   int fin;         // its input's pipe, while open: -1, none
@@ -638,8 +643,16 @@ static int heff_sub_done(HeffSub *s) {
   return s->reaped && s->out.fd < 0 && s->err.fd < 0;
 }
 
-// (ended now: killed, if it has not exited, and its pipes closed)
+// (the signal sent to it -- to its process group, the group's own --
+// if it has not been reaped)
+static void heff_sub_signal(HeffSub *s, int sig) {
+  if (!s->reaped) kill(s->group ? -s->pid : s->pid, sig);
+}
+
+// (ended now: killed, if it has not exited, and its pipes closed; of a
+// group's own, what is left of the group killed too)
 static void heff_sub_cut(HeffSub *s) {
+  if (s->group) kill(-s->pid, SIGKILL);
   if (!s->reaped) {
     kill(s->pid, SIGKILL);
     heff_sub_reap(s, 1);
@@ -743,6 +756,7 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v) {
     if (pid == 0) {
       // (the child: nothing but what is safe after a fork)
       int e;
+      if (v->group) setpgid(0, 0);
       if (v->dir && chdir(v->dir) != 0) goto failed;
       if ((pi[0] >= 0 && dup2(pi[0], 0) < 0) || (po[1] >= 0 && dup2(po[1], 1) < 0)
           || (pe[1] >= 0 && dup2(pe[1], 2) < 0))
@@ -755,6 +769,8 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v) {
       _exit(127);
     }
   }
+  // (its group made here too, so that it is there before it is killed)
+  if (pid > 0 && v->group) setpgid(pid, pid);
   heff_close(&pi[0]);
   heff_close(&po[1]);
   heff_close(&pe[1]);
@@ -779,6 +795,7 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v) {
     return NULL;
   }
   s->pid = pid;
+  s->group = v->group;
   s->out.fd = po[0];
   s->err.fd = pe[0];
   s->fin = pi[1];
@@ -814,7 +831,7 @@ static int heff_sub_how(HeffSub *s, int64_t *code) {
 }
 
 static void heff_sub_kill(HeffSub *s) {
-  if (!s->reaped) kill(s->pid, SIGKILL);
+  heff_sub_signal(s, SIGKILL);
 }
 #endif
 
@@ -842,7 +859,7 @@ static int heff_await(HeffSub **ss, int n, int64_t ms) {
 static void heff_sub_end(HeffSub *s) {
   if (heff_sub_done(s)) return;
   heff_close(&s->fin);
-  if (!s->reaped) kill(s->pid, SIGTERM);
+  heff_sub_signal(s, SIGTERM);
   if (heff_await(&s, 1, 2000) < 0) heff_sub_cut(s);
 }
 #endif
@@ -895,7 +912,7 @@ static void heff_subs_atexit(void) {
 // have been)
 static void heff_subs_signal(int sig) {
   for (HeffSub *s = heff_subs; s; s = s->next)
-    if (!s->reaped) kill(s->pid, SIGTERM);
+    heff_sub_signal(s, SIGTERM);
   signal(sig, SIG_DFL);
   raise(sig);
 }

@@ -132,6 +132,9 @@ in it, a process of its own.  Each is run in a new, empty directory of
 its own (where the system keeps temporary ones), its working directory,
 removed after it; and each has a time limit, a minute unless `within MS`
 says otherwise, at which its process is killed and the test fails.
+It runs in a process group of its own, killed whole: what it started
+(a `sleep`, a `heff test`) goes with it -- not on Windows yet, where
+only its own process is (std.process's `group`).
 Integration tests run at once, those of all the files given in one
 pool, as many as `--jobs N` says, else `HEFF_TEST_JOBS`, else half the
 machine's cores (at least one), so that a run of the tests does not

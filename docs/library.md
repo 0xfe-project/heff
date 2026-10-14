@@ -482,7 +482,10 @@ t <- run { command = "heff", args = ["test"], env = [MkPair "HEFF_TTY" "0"],
   further, not even for what its own children still write;
 - `keep` (0, all of it), how many bytes of each of its output and its
   error stream are kept: the first, the rest read and let go, so a
-  command that writes forever until its time limit is not held whole.
+  command that writes forever until its time limit is not held whole;
+- `group` (`False`), started in a process group of its own, so that
+  killing it -- its time limit, `kill`, `terminate`, the program's end
+  -- kills what it started too (not on Windows: there only it).
 
 Its `Ran` is what it wrote, `out` and `err` (those `Collected`), and
 how it ended, `ended`: `Exited` with its status, `Signalled` with the
