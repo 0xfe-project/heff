@@ -53,7 +53,10 @@ watches after it (up to the next definition) in `heff test`'s report.
 ## Unit tests and properties
 
 A test is a top-level definition of type `Test` (check's);
-`heff test` runs a file's tests after its doc tests and watches.  A
+`heff test` runs a file's tests after its doc tests and watches, each
+once, from its root: a test another of the file's tests uses (directly,
+or through the file's other definitions, as in a list of them) runs
+under that one, by the name its groups give it, not by itself too.  A
 unit test checks; a property draws values from generators
 (`lib/generator.hf`, imported `as Generator`) and checks them, a hundred runs:
 
