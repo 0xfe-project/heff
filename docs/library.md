@@ -176,7 +176,7 @@ y`, `x * y`, `-x`, `x /. y` of floats, `x / y` and `x % y` of integers
 `convert`; a buffer is an `Input a` (read) or an `Output a` (read and
 written), `load`ed at an index and asked its `length`, and `store`
 writes an `Output` alone.  A statement is an operation of the effect
-`stmt` (`define`, `store`, `when`, `ifElse`, `for`, `globalId`), so
+`stmt` (`define`, `store`, `when`, `ifElse`, `forRange`, `globalId`), so
 that a body is a `Co stmt Unit` written with `do`; `kernel1` to
 `kernel3` make a `Kernel1 a` to `Kernel3 a b c` of an entry point's
 name, a workgroup's size and the body over its buffers.  The kernel
