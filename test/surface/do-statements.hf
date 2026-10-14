@@ -3,10 +3,12 @@
 -- `continue`, `return`, an `if` without `else` and an `if`'s or a
 -- `case`'s arms that are statements, `(<- c)` (hoisted to the start of
 -- the arm it is in), a closure holding a variable's value, and `run do`
--- for pure code.
+-- for pure code.  And (#100) `if let`, and `try ... catch ... finally`
+-- over the `exception` effect.
 
 import array
 import co
+import exception
 import state
 
 -- | `while`, its variables set in the body; the loop's `if` an `else`
@@ -176,3 +178,196 @@ countdown = do
 -- | MkPair MkUnit 0
 counteddown : Pair Unit Int
 counteddown = handle intState (countdown (st := here (state Int))) 7
+
+-- `if let`
+--------------------------------------------------------------------------------
+
+-- | as a value, both arms
+-- | >>> orZero (Just 4)
+-- | 4
+-- | >>> orZero Nothing
+-- | 0
+orZero : Maybe Int -> Int
+orZero m = if let Just x = m then x else 0
+
+-- | as a statement without `else`, its variables bound in its arm
+-- | >>> firstPositive [Nothing, Just (-1), Just 3, Just 4]
+-- | 3
+firstPositive : List (Maybe Int) -> Int
+firstPositive ms = run do
+  for m in ms do
+    if let Just x = m then if x > 0 then return x
+  return 0
+
+-- | with both arms, each setting the block's variable
+-- | >>> justs [Just 1, Nothing, Just 5, Nothing]
+-- | MkPair 6 2
+justs : List (Maybe Int) -> Pair Int Int
+justs ms = run do
+  let mut total = 0
+  let mut missing = 0
+  for m in ms do
+    if let Just x = m
+      then total := total + x
+      else missing := missing + 1
+  return (MkPair total missing)
+
+-- `try`, `catch`, `finally`
+--------------------------------------------------------------------------------
+
+-- (a world that throws a `String` and keeps a log; a throw keeps what was
+-- logged before it)
+world : HFunctor
+world = exception String <+> state (List String)
+
+-- (the log, its latest first, and the answer or what no `catch` heard)
+data Logged = Thrown String (List String) | Done Int (List String)
+
+logged : Handler world
+logged =
+  { M = \a -> List String -> Pair (Either String a) (List String)
+  , ret = \x l -> MkPair (Right x) l
+  , bind = \m k l -> case m l of
+      MkPair (Left s) l2 -> MkPair (Left s) l2
+      MkPair (Right x) l2 -> k x l2
+  , malg = \p l -> case p of
+      InL t -> case t of
+        Throw s -> MkPair (Left s) l
+        Catch c h -> case c l of
+          MkPair (Left s) l2 -> h s l2
+          MkPair (Right x) l2 -> MkPair (Right x) l2
+      InR t -> case t of
+        Get k -> MkPair (Right (k l)) l
+        Put l2 x -> MkPair (Right x) l2
+  }
+
+runLogged : Co world Int -> Logged
+runLogged c = case handle logged c Nil of
+  MkPair (Left s) l -> Thrown s l
+  MkPair (Right x) l -> Done x l
+
+note : {e : HFunctor} -> {{st : state (List String) <: e}} -> String -> Co e Unit
+note s = do
+  l <- get
+  put (Cons s l : List String)
+
+onEx : exception String <: world
+onEx = inl (exception String) (state (List String))
+
+onLog : state (List String) <: world
+onLog = inr (exception String) (state (List String))
+
+-- | a throw caught, the `catch` arm setting the block's variable (which
+-- | it sees as it was where the `try` began: what the throw abandoned is
+-- | gone); the `finally` block after it
+-- | >>> runLogged (caught (ex := onEx) (st := onLog))
+-- | Done 11 ["finally", "caught boom", "tried"]
+caught : {e : HFunctor}
+       -> {{ex : exception String <: e}}
+       -> {{st : state (List String) <: e}}
+       -> Co e Int
+caught = do
+  let mut n = 1
+  try
+    n := 2
+    note "tried"
+    (throw "boom" : Co e Unit)
+  catch (msg : String) ->
+    note ("caught " ^ msg)
+    n := n + 10
+  finally
+    note "finally"
+  return n
+
+-- | `finally` on the normal way out, the `try` the block's last statement
+-- | (its value the block's), and on a throw no `catch` hears
+-- | >>> runLogged (fine (ex := onEx) (st := onLog) False)
+-- | Done 7 ["finally"]
+-- | >>> runLogged (fine (ex := onEx) (st := onLog) True)
+-- | Thrown "out" ["finally"]
+fine : {e : HFunctor}
+     -> {{ex : exception String <: e}}
+     -> {{st : state (List String) <: e}}
+     -> Bool
+     -> Co e Int
+fine b = do
+  try (err := String)
+    if b then (throw "out" : Co e Unit)
+    pure 7
+  finally
+    note "finally"
+
+-- | a `catch` with no `finally`, its binder's type found from its use
+-- | >>> runLogged (heard (ex := onEx) (st := onLog))
+-- | Done 3 ["heard no"]
+heard : {e : HFunctor}
+      -> {{ex : exception String <: e}}
+      -> {{st : state (List String) <: e}}
+      -> Co e Int
+heard = do
+  let mut n = 0
+  try
+    n := 1
+    (throw "no" : Co e Unit)
+  catch e ->
+    note ("heard " ^ e)
+    n := 3
+  return n
+
+-- | `continue` and `break` crossing a `finally`, which runs each time
+-- | >>> runLogged (loops (ex := onEx) (st := onLog))
+-- | Done 12 ["f6", "f5", "f4", "f3", "f2", "f1"]
+loops : {e : HFunctor}
+      -> {{ex : exception String <: e}}
+      -> {{st : state (List String) <: e}}
+      -> Co e Int
+loops = do
+  let mut i = 0
+  let mut total = 0
+  while i < 10 do
+    i := i + 1
+    try (err := String)
+      if i == 3 then continue
+      if i == 6 then break
+      total := total + i
+    finally
+      note ("f" ^ show i)
+  return total
+
+-- | `return` crossing two: the inner `finally` first
+-- | >>> runLogged (nested (ex := onEx) (st := onLog))
+-- | Done 5 ["outer", "inner"]
+nested : {e : HFunctor}
+       -> {{ex : exception String <: e}}
+       -> {{st : state (List String) <: e}}
+       -> Co e Int
+nested = do
+  try (err := String)
+    try (err := String)
+      return 5
+    finally
+      note "inner"
+  finally
+    note "outer"
+
+-- | the `catch` in a loop, `continue` from it, the `finally` after it
+-- | >>> runLogged (retried (ex := onEx) (st := onLog))
+-- | Done 2 ["f3", "f2", "f1", "retry 1"]
+retried : {e : HFunctor}
+        -> {{ex : exception String <: e}}
+        -> {{st : state (List String) <: e}}
+        -> Co e Int
+retried = do
+  let mut i = 0
+  let mut ok = 0
+  while i < 3 do
+    i := i + 1
+    try
+      if i == 1 then (throw "again" : Co e Unit)
+      ok := ok + 1
+    catch (s : String) ->
+      note ("retry " ^ show i)
+      continue
+    finally
+      note ("f" ^ show i)
+  return ok

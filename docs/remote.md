@@ -171,7 +171,7 @@ world under the API's, so the client's world has it.  Why is one of
 200), `Mismatched` (the server's API is of another build, or its wire
 of another version), `Refused` (the server could not read the call:
 no such operation, its argument) and `Malformed` (the answer could not
-be read); `Remote.showRemoteError` says it.  `catch` hears it where a
+be read); `Remote.showRemoteError` says it.  `recover` hears it where a
 program would go on -- the page says why, and is as it was:
 
 ```haskell
@@ -182,15 +182,15 @@ guarded : {e : HFunctor}
         -> Co e Unit
         -> Co e Unit
 guarded status c =
-  catch
+  recover
     c
     ((\err -> text status (Remote.showRemoteError err)) :
        Remote.RemoteError -> Co e Unit)
 ```
 
 and `attempt` (lib/exception.hf) handles the rest at the top, `Left` what no
-`catch` heard.  An event's run (browser.dom's `on`) is its own: a
-throw in it that no `catch` of its own hears abandons that run, not
+`recover` heard.  An event's run (browser.dom's `on`) is its own: a
+throw in it that no `recover` of its own hears abandons that run, not
 the page.
 
 ## A test, with no network

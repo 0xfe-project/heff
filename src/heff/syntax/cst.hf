@@ -112,6 +112,17 @@ data E
   | ENest T T E T
   -- | `if c then s`, a statement with no `else`
   | IfThen T E T E
+  -- | `let p = e`, an `if`'s condition: `let`, the pattern, `=`, the
+  -- | expression
+  | ELetCond T Pat T E
+  -- | `try` (and `(err := T)`, the type of what it hears) and its
+  -- | statements, then its `catch` arm and its `finally` block (each an
+  -- | `ECatch`, an `EFinally`), either perhaps not there
+  | ETry T (Maybe E) (List E) (Maybe E) (Maybe E)
+  -- | `catch x ->` and its statements
+  | ECatch T E T (List E)
+  -- | `finally` and its statements
+  | EFinally T (List E)
 
 -- | a theory's field, `x : A`, and its default, `= d`, if it has one
 data TF = MkTF T T E (Maybe (Pair T E))
@@ -311,6 +322,11 @@ isText t x = strEq t.text x
 
 isKw : T -> String -> Bool
 isKw t x = isKind t "kw" && isText t x
+
+-- (what is there, none or one)
+maybeList : {a : Type} -> Maybe a -> List a
+maybeList Nothing = Nil
+maybeList (Just x) = Cons x Nil
 
 stackTop : List Int -> Int
 stackTop s = fromMaybe 0 (List.head s)
@@ -940,10 +956,24 @@ caseExprF g = do
   alts <- block (alternativeF g)
   pure (Case kw scrut o alts)
 
+-- | an `if`'s condition: an expression, or `let p = e`, which holds when
+-- | `e` matches `p`
+condF : Gram -> P E
+condF g = do
+  t <- peek
+  if isKw t "let"
+    then do
+      kw <- next
+      p <- g.pattern
+      eq <- expectSym "="
+      e <- g.expr
+      pure (ELetCond kw p eq e)
+    else g.expr
+
 ifExprF : Gram -> P E
 ifExprF g = do
   kw <- next
-  c <- g.expr
+  c <- condF g
   th <- expectKw "then"
   a <- g.expr
   el <- expectKw "else"
@@ -1023,7 +1053,7 @@ assignF g = do
 ifStmtF : Gram -> P E
 ifStmtF g = do
   kw <- next
-  c <- g.expr
+  c <- condF g
   th <- expectKw "then"
   a <- g.arm
   t <- peek
@@ -1069,6 +1099,69 @@ forF g = do
   body <- block g.stmt
   pure (EFor kw p i c d body)
 
+-- | `catch x ->` (or `(x : T)`) and its statements
+catchF : Gram -> P E
+catchF g = do
+  kw <- next
+  b <- lamBinderF g
+  arrow <- expectSym "->"
+  body <- block g.stmt
+  pure (ECatch kw b arrow body)
+
+-- | `finally` and its statements
+finallyF : Gram -> P E
+finallyF g = do
+  kw <- next
+  body <- block g.stmt
+  pure (EFinally kw body)
+
+-- | a `try`'s `catch` or `finally` (by `word`), if it is next: on the
+-- | line, or starting one at the column of the block the `try` is in or
+-- | further (a `try`'s alone, as no statement starts with it)
+tryPartF : String -> P E -> P (Maybe E)
+tryPartF word part = do
+  t <- peek
+  col <- pGets (\s -> stackTop s.stack)
+  if isKw t word && (not t.first || t.col >= col)
+    then do
+      e <- part
+      pure (Just e)
+    else pure Nothing
+
+-- | `(err := T)` after `try`, if it is there
+tryTypeF : Gram -> P (Maybe E)
+tryTypeF g = do
+  t <- peek
+  t2 <- peekAt 1
+  t3 <- peekAt 2
+  if isKind t "punct"
+     && isText t "("
+     && isKind t2 "var"
+     && isKind t3 "sym"
+     && isText t3 ":="
+    then do
+      e <- g.atom
+      pure (Just e)
+    else pure Nothing
+
+-- | `try` and its statements, then `catch x ->` and its statements,
+-- | `finally` and its statements, either or both
+tryF : Gram -> P E
+tryF g = do
+  kw <- next
+  ty <- tryTypeF g
+  body <- block g.stmt
+  c <- tryPartF "catch" (catchF g)
+  f <- tryPartF "finally" (finallyF g)
+  t <- peek
+  if List.null (List.append (maybeList c) (maybeList f))
+    then throwP
+        (diag
+           (spanOf t)
+           ("a `try` has a `catch` arm, a `finally` block, or both, not "
+            ^ shown t))
+    else pure (ETry kw ty body c f)
+
 -- | an arm of a statement's `if` or `case`: a statement that binds
 -- | nothing (`x := e`, an `if` or `case` of such arms, `break`, `return
 -- | e`, a `do` block of statements, an action)
@@ -1078,6 +1171,7 @@ armF g = do
   t2 <- peekAt 1
   if isKw t "if" then ifStmtF g
     else if isKw t "case" then caseStmtF g
+    else if isKw t "try" then tryF g
     else if isKind t "var" && isKind t2 "sym" && isText t2 ":=" then assignF g
     else g.expr
 
@@ -1656,6 +1750,10 @@ firstE (EJump kw) = kw
 firstE (EReturn kw e) = kw
 firstE (ENest o arrow e c) = o
 firstE (IfThen kw c th a) = kw
+firstE (ELetCond kw p eq e) = kw
+firstE (ETry kw ty body c f) = kw
+firstE (ECatch kw b arrow body) = kw
+firstE (EFinally kw body) = kw
 
 lastE : E -> T
 lastE (Atom t) = t
@@ -1720,6 +1818,21 @@ lastE (EJump kw) = kw
 lastE (EReturn kw e) = lastE e
 lastE (ENest o arrow e c) = c
 lastE (IfThen kw c th a) = lastE a
+lastE (ELetCond kw p eq e) = lastE e
+lastE (ETry kw ty body (Just c) Nothing) = lastE c
+lastE (ETry kw ty body c (Just f)) = lastE f
+lastE (ETry kw ty body Nothing Nothing) =
+  (case List.last body of
+   Just e -> lastE e
+   Nothing -> kw)
+lastE (ECatch kw b arrow body) =
+  (case List.last body of
+   Just e -> lastE e
+   Nothing -> arrow)
+lastE (EFinally kw body) =
+  (case List.last body of
+   Just e -> lastE e
+   Nothing -> kw)
 
 -- (`lastE` of the element, if there is one; the fallback otherwise)
 lastEOr : T -> Maybe E -> T
@@ -1887,6 +2000,18 @@ tsE (EJump kw) = Cons kw Nil
 tsE (EReturn kw e) = Cons kw (tsE e)
 tsE (ENest o arrow e c) = Cons o (Cons arrow (List.append (tsE e) (Cons c Nil)))
 tsE (IfThen kw c th a) = Cons kw (List.append (tsE c) (Cons th (tsE a)))
+tsE (ELetCond kw p eq e) = Cons kw (List.append (tsP p) (Cons eq (tsE e)))
+tsE (ETry kw ty body c f) =
+  Cons
+    kw
+    (List.append
+       (List.concatMap tsE (maybeList ty))
+       (List.append
+          (List.concatMap tsE body)
+          (List.concatMap tsE (List.append (maybeList c) (maybeList f)))))
+tsE (ECatch kw b arrow body) =
+  Cons kw (List.append (tsE b) (Cons arrow (List.concatMap tsE body)))
+tsE (EFinally kw body) = Cons kw (List.concatMap tsE body)
 
 tsTF : TF -> List T
 tsTF (MkTF x cc ty Nothing) = Cons x (Cons cc (tsE ty))

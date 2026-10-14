@@ -682,6 +682,51 @@ sumEvens xs = do
   else pure "x"); print v`), and so are `&&` and `||`.
 - In a lambda in the block, `(<- c)`, `return`, `break` and `continue`
   are refused: its body runs later, not as the block's statement.
+- `if let p = e then a else b` is `a` where `e` matches `p`, its
+  variables bound there, else `b`: a `case` of `e`, `p` and any other.
+  Among the statements it may have no `else`, and its arms are
+  statements, as an `if`'s are.
+
+`try` runs its statements over the `exception` effect (the `exception`
+module imported, as its names are taken by name, as `bind` is):
+
+```haskell
+loadAll : {e : HFunctor} -> {{ex : exception String <: e}} -> {{io : stdio <: e}}
+        -> List String -> Co e Int
+loadAll names = do
+  let mut loaded = 0
+  for name in names do
+    try
+      if name == "" then continue
+      load name
+      loaded := loaded + 1
+    catch (why : String) ->
+      print ("not loaded: " ^ why)
+    finally
+      print ("tried " ^ name)
+  return loaded
+```
+
+- A throw of its statements is heard by its `catch` arm, `catch x ->`
+  (or `catch (x : T) ->`), which runs in their place.  Which type of
+  throws it hears is found from the arm, as `recover`'s handler says it.
+  The `finally` block runs however the `try` is left -- at its end, by a
+  throw (heard by the `catch` arm first, if any; one it does not hear,
+  or one it makes, goes on once the block has run), or by `return`,
+  `break` or `continue` -- and each `try` it is in after it, the
+  innermost first.  A `try` has a `catch` arm, a `finally` block, or
+  both, each under `try`; one with no `catch` arm names the type of the
+  throws its `finally` block hears, `try (err := String)`.
+- Its statements and its `catch` arm's are the block's: they set its
+  variables, jump and `return`.  A throw abandons what it is thrown in,
+  so the `catch` arm sees the variables as they were where the `try`
+  began.  The `finally` block is a computation of its own made where the
+  `try` begins: it sees the variables so and cannot set them, and is
+  left at its end only -- `return`, `break` and `continue` out of it are
+  refused.
+- `abandon` is no effect: it ends the program, and no `finally` block
+  runs.  A `finally` block runs once: a continuation taken in a `try`
+  and resumed more than once is not supported.
 
 Pure code is written as statements by `run do ...`: `run : Id a -> a`,
 of the identity monad (`type Id a = a`), whose `do` is taken apart by
@@ -697,6 +742,16 @@ point (where only one arm goes on, what follows is that arm's own).
 Pure code so compiles to plain tail recursion, a loop in `Co` to a loop
 that goes round its turns without a handler between them, and neither
 grows the stack.
+
+A `try` is a scope, the exception module's `scoped`, acquiring nothing
+and released by the `finally` block (with no `finally`, its `recover`):
+its statements, one scope further in, give as their answer what to do
+once it is left -- at their end the call of what follows it, a join
+point; a jump out of `k` scopes, `pure` of what to do once the next is
+left, `k` deep -- and once it is released, that is called, a tail
+call.  A loop whose turns each go through a `try` leaves each before
+the next, so it does not grow the stack either.  (A scoped resource,
+acquired and released by its own, is `scoped` the same.)
 
 ## Effects
 

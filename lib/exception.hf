@@ -1,6 +1,6 @@
 -- Failure as an effect: `throw` abandons the rest of the
 -- computation with a word of why (an `err`: a message, a diagnostic),
--- and `catch` hears it.  `Catch` holds computations, so it is made where
+-- and `recover` hears it.  `Catch` holds computations, so it is made where
 -- it is, not lifted (parallel.hf says the same): both operations take
 -- the evidence `exception err <: e`.  What happens to the world a throw
 -- abandons -- kept, or rolled back -- is nowhere in here: it is each
@@ -32,19 +32,69 @@ throw : {err : Type}
       -> Co e a
 throw = \{err} {e} {a} s -> op (ev ((Throw s : ExceptionF err (Co e) a))) val
 
--- | `catch c h` is `c`; if `c` throws, it is `h` of what was thrown.
--- | (Which `err` that is is found from `h`'s type: a handler that does
--- | not look at it says it, `(h : String -> Co e a)`, there being no
--- | search for evidence.)
-catch : {err : Type}
-      -> {e : HFunctor}
-      -> {a : Type}
-      -> {{ev : exception err <: e}}
-      -> Co e a
-      -> (err -> Co e a)
-      -> Co e a
-catch = \{err} {e} {a} c h ->
+-- | `recover c h` is `c`; if `c` throws, it is `h` of what was thrown
+-- | (a `do` block's `try ... catch` is this).  (Which `err` that is is
+-- | found from `h`'s type: a handler that does not look at it says it,
+-- | `(h : String -> Co e a)`, there being no search for evidence.)
+recover : {err : Type}
+        -> {e : HFunctor}
+        -> {a : Type}
+        -> {{ev : exception err <: e}}
+        -> Co e a
+        -> (err -> Co e a)
+        -> Co e a
+recover = \{err} {e} {a} c h ->
     op (ev ((Catch c h : ExceptionF err (Co e) a))) val
+
+-- A scope
+--------------------------------------------------------------------------------
+
+-- (`c`, heard by the handler if there is one)
+heardBy : {err : Type}
+        -> {e : HFunctor}
+        -> {a : Type}
+        -> {{ev : exception err <: e}}
+        -> Co e a
+        -> Maybe (err -> Co e a)
+        -> Co e a
+heardBy c Nothing = c
+heardBy c (Just h) = recover c h
+
+-- | What a scope's answer says to do once it is left, done: a `do`
+-- | block's `try` goes on so, to what follows it or further out.
+leaveScope : {a : Type} -> (Unit -> a) -> a
+leaveScope k = k MkUnit
+
+-- | A scope: `acquire`, then `use` of what it gave, then `release` of
+-- | that, however `use` ends -- with its answer, or with a throw, which
+-- | goes on once it is released.  A throw of `use` is heard by `handler`
+-- | first, if there is one, inside the scope (so it is released after).
+-- | Exits are by nesting, the innermost first; an `abandon` ends the
+-- | program, and no release runs.  A `do` block's `try ... finally f` is
+-- | this, acquiring nothing and released by `f`; its jumps (`return`,
+-- | `break`, `continue`) leave it as the scope's answer, what to do once
+-- | it is left, so each scope between is released on the way, a tail call
+-- | each.  A scoped resource is the same, acquired and released by its
+-- | own.  (Which `err` is heard is said as `recover`'s is: by the
+-- | handler's type, or given, `(err := T)`.)
+scoped : {err : Type}
+       -> {e : HFunctor}
+       -> {r a : Type}
+       -> {{ev : exception err <: e}}
+       -> Co e r
+       -> (r -> Co e Unit)
+       -> (r -> Co e a)
+       -> Maybe (err -> Co e a)
+       -> Co e a
+scoped acquire release use handler =
+  bind
+    acquire
+    (\x ->
+       bind
+         (recover
+            (heardBy (use x) handler)
+            (\(s : err) -> bind (release x) (\_ -> throw s)))
+         (\v -> bind (release x) (\_ -> pure v)))
 
 -- Division that throws
 --------------------------------------------------------------------------------
@@ -91,10 +141,10 @@ triedFunctor err e =
   }
 
 -- | A handler of `exception err` into the rest of the world, `e`: a throw no
--- | `catch` hears ends the computation, `Left` what was thrown.  An
+-- | `recover` hears ends the computation, `Left` what was thrown.  An
 -- | operation of `e`'s is done as it is; one that holds a computation
 -- | of its own, run apart (browser.dom's `on`, an event's), has none of
--- | its throws heard here -- one no `catch` of its own hears abandons
+-- | its throws heard here -- one no `recover` of its own hears abandons
 -- | that run.
 attempted : (err : Type) -> (e : HFunctor) -> Handler (plus (exception err) e)
 attempted err e =
@@ -116,7 +166,7 @@ attempted err e =
   }
 
 -- | `c`, its throws heard: `Right` what it comes to, or `Left` what was
--- | thrown and heard by no `catch` (remote's calls that came to
+-- | thrown and heard by no `recover` (remote's calls that came to
 -- | no answer, for one).
 attempt : (err : Type)
         -> (e : HFunctor)
