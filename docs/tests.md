@@ -254,7 +254,8 @@ it passes if it has some, and fails if it checks.  The line counts only
 as the file's first; anywhere else it is a comment like another.  (What
 the errors say is held by heff's golden tests, `heff test
 test/golden.hf`; that each file of the repository checks or has its
-errors as it says, by its surface tests, `heff test test/surface.hf`.)
+errors as it says, by its surface tests, `heff test test/surface.hf`;
+`make test-heff` runs heff's tests written so, with no Node.js.)
 
 ## The report
 

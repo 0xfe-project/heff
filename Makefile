@@ -14,6 +14,12 @@ HEFF ?= .heff/out/heff
 # (the .hf files laid out by `heff fmt`: the tests' are left as they are,
 # their offsets and broken ones the tests', as .pre-commit-config.yaml)
 HF_FILES = $(shell git ls-files '*.hf' ':!test/')
+# (the tests written in heff, run by `heff test` alone, no Node.js: a
+# script of test/run.mjs ported to heff (#55) is listed here instead)
+HEFF_TESTS = test/golden.hf test/surface.hf test/format.hf test/cache.hf \
+  test/backcache.hf
+# (are they run by `make test`: all the groups, or compiler among them)
+HEFF_TESTED = $(if $(GROUPS),$(filter compiler,$(GROUPS)),all)
 VSCODE = editors/vscode
 VSIX = $(VSCODE)/heff-$(shell $(NODE) -p "require('./$(VSCODE)/package.json').version").vsix
 
@@ -26,7 +32,7 @@ TARGETS ?=##     native: zig targets, e.g. "x86_64-linux-musl aarch64-macos"
 BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 
 .NOTPARALLEL:
-.PHONY: help build build-seed boot native release test test-compiler test-lsp \
+.PHONY: help build build-seed boot native release test test-heff test-compiler test-lsp \
   test-backends test-fixpoint test-asan check golden sanitize tsan fmt \
   fmt-check aliases aliases-check bat bat-check vsix install install-all bench clean
 
@@ -58,14 +64,19 @@ native: ## heff for other systems, .heff/out/native/TARGET/ (TARGETS=...)
 release: ## an archive of heff for each platform, and SHA256SUMS, .heff/out/release/
 	$(ZIG) build release
 
-##@ Testing (on the heff built: make build first; Node.js but test-fixpoint)
+##@ Testing (on the heff built: make build first; Node.js but test-heff and test-fixpoint)
 
-test: ## the test groups, all at once (GROUPS=..., all and the fixpoint by default)
+test: ## the test groups, all at once (GROUPS=..., all and the fixpoint by default), then test-heff
 	$(NODE) test/run.mjs $(GROUPS)
+	$(if $(HEFF_TESTED),$(HEFF) test $(HEFF_TESTS))
 	$(if $(GROUPS),,$(ZIG) build fixpoint)
+
+test-heff: ## the tests written in heff, by `heff test` alone: the goldens, the surface, formatting, the caches
+	$(HEFF) test $(HEFF_TESTS)
 
 test-compiler: ## elaborating, formatting, the cache, the command line, the goldens
 	$(NODE) test/run.mjs compiler
+	$(HEFF) test $(HEFF_TESTS)
 
 test-lsp: ## the language server
 	$(NODE) test/run.mjs lsp
