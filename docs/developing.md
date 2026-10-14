@@ -139,7 +139,9 @@ backend's, each scenario in a directory of its own (`heff test
 test/cache.hf test/backcache.hf`, `--run cache/instances` for one).
 The command line's tests are `heff test test/cli.hf` (`--run
 cli/usage` for the usage's), and projects' and packages' `heff test
-test/project.hf` (`--run project/get` for `heff get`'s).
+test/project.hf` (`--run project/get` for `heff get`'s); the
+language server's, `heff test test/lsp.hf`, a session with the server
+each (`--run lsp/modules`).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.

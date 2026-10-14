@@ -1,0 +1,2137 @@
+-- The language server (`heff lsp`), spoken to as an editor would:
+-- diagnostics (of the editor's text, and of an import's unsaved text, of
+-- a file as deep as the command line goes), files changed on disk, hover
+-- and go to definition (across modules, past non-ASCII text),
+-- completion, an outline, references and renaming across the project,
+-- doc tests (their errors, shown in a hover), splitting a variable into
+-- cases, formatting, shutdown.  The heff run is the one that runs the
+-- tests (`HEFF`), a server for each test: one on the project's files
+-- (`HEFF_TEST_ROOT`), their texts given it unsaved, as an editor's, and
+-- never written; one on a copy of the modules' project, in the test's
+-- directory, where files are made and deleted on disk.  Each test is
+-- the server's session, a list of steps -- what is said to it, and what
+-- its answers are held to -- run in order: a check that does not hold
+-- is said, and the session goes on.
+--
+--   heff test --run lsp/modules test/lsp.hf
+
+import bytes as Bytes
+import check
+import co
+import json as Json
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- Positions
+--------------------------------------------------------------------------------
+
+-- | a position in a text, as LSP has it: its line, and UTF-16 code
+-- | units into it
+type Pos = { line : Int, character : Int }
+
+-- (how many UTF-16 units the text is, from `i`: a rune beyond U+FFFF two)
+utf16From : String -> Int -> Int -> Int
+utf16From s i n =
+  if i >= strLength s then n
+  else utf16From
+      s
+      (i + strRuneWidth s i)
+      (n + (if runeToInt (strRuneAt s i) >= 65536 then 2 else 1))
+
+-- (where the `n`th `s` of the text is, from 0, looked for from `from`)
+nthFrom : String -> String -> Int -> Int -> Int
+nthFrom text s n from =
+  if n == 0 then strFind s text from
+  else nthFrom text s (n - 1) (strFind s text from + 1)
+
+-- | the position of the `n`th `s` (from 0) in the text
+-- | >>> posOf "ab\n😀 cd cd" "cd" 1
+-- | { line = 1, character = 6 }
+posOf : String -> String -> Int -> Pos
+posOf text s n =
+  let before = split "\n" (strSlice text 0 (nthFrom text s n 0))
+  in { line = List.length before - 1
+     , character = utf16From (fromMaybe "" (List.last before)) 0 0
+     }
+
+-- | the position of the first `s` in the text
+pos : String -> String -> Pos
+pos text s = posOf text s 0
+
+-- (so many units further on its line)
+past : Int -> Pos -> Pos
+past k p = { line = p.line, character = p.character + k }
+
+-- (a position at a line and a character)
+at : Int -> Int -> Pos
+at l c = { line = l, character = c }
+
+posJson : Pos -> Json.Json
+posJson p =
+  Json.obj
+    [ Json.kv "line" (Json.num p.line)
+    , Json.kv "character" (Json.num p.character)
+    ]
+
+-- Reading what the server says
+--------------------------------------------------------------------------------
+
+-- (a value: the text it is, "" where it is not there)
+textAt : List String -> Json.Json -> String
+textAt path j = fromMaybe "" (Json.str path j)
+
+-- (a number: -99 where it is not there)
+intAt : List String -> Json.Json -> Int
+intAt path j = fromMaybe (0 - 99) (Json.int path j)
+
+-- (an array: none where it is not there)
+itemsAt : List String -> Json.Json -> List Json.Json
+itemsAt path j = fromMaybe Nil (Json.arr path j)
+
+-- (the value written, "" where it is not there)
+writtenAt : List String -> Json.Json -> String
+writtenAt path j = case Json.at path j of
+  Just v -> Json.stringify v
+  Nothing -> ""
+
+-- (is it `null`)
+nullAt : List String -> Json.Json -> Bool
+nullAt path j = strEq (writtenAt path j) "null"
+
+-- (is it there, and neither `null` nor `false`)
+truthyAt : List String -> Json.Json -> Bool
+truthyAt path j =
+  not
+    (strEq (writtenAt path j) ""
+     || strEq (writtenAt path j) "null"
+     || strEq (writtenAt path j) "false")
+
+-- (the fields' values of an object)
+valuesOf : Maybe Json.Json -> List Json.Json
+valuesOf (Just (JObject fs)) = List.map snd fs
+valuesOf _ = Nil
+
+-- (a result's text, its contents' value: a hover's)
+hovered : Json.Json -> String
+hovered m = textAt ["result", "contents", "value"] m
+
+-- (a hover that says each of these)
+hoverSays : List String -> Json.Json -> Bool
+hoverSays says m =
+  not (nullAt ["result"] m) && List.all (\s -> contains s (hovered m)) says
+
+-- (where a range starts, and where it ends)
+startOf : Json.Json -> Pos
+startOf j =
+  at
+    (intAt ["range", "start", "line"] j)
+    (intAt ["range", "start", "character"] j)
+
+endOf : Json.Json -> Pos
+endOf j =
+  at (intAt ["range", "end", "line"] j) (intAt ["range", "end", "character"] j)
+
+samePos : Pos -> Pos -> Bool
+samePos p q = p.line == q.line && p.character == q.character
+
+-- (the line a location starts on)
+lineOf : Json.Json -> Int
+lineOf j = intAt ["range", "start", "line"] j
+
+-- (the result, an array)
+results : Json.Json -> List Json.Json
+results m = itemsAt ["result"] m
+
+-- (the diagnostics of a notification)
+diagnostics : Json.Json -> List Json.Json
+diagnostics m = itemsAt ["params", "diagnostics"] m
+
+-- (the one with this code)
+withCode : String -> List Json.Json -> Maybe Json.Json
+withCode code ds = List.find (\d -> strEq (textAt ["code"] d) code) ds
+
+-- (does `p` hold of it, if it is there)
+holdsOfSome : {a : Type} -> (a -> Bool) -> Maybe a -> Bool
+holdsOfSome p (Just x) = p x
+holdsOfSome p Nothing = False
+
+-- (the labels of the items completed)
+labels : Json.Json -> List String
+labels m = List.map (\i -> textAt ["label"] i) (results m)
+
+-- (is there an item of this label whose detail `ok` holds of)
+completes : String -> (String -> Bool) -> Json.Json -> Bool
+completes label ok m =
+  List.any
+    (\i -> strEq (textAt ["label"] i) label && ok (textAt ["detail"] i))
+    (results m)
+
+-- (no diagnostics)
+clean : Json.Json -> Bool
+clean m = List.null (diagnostics m)
+
+-- (how many of these are `x`)
+countOf : Int -> List Int -> Int
+countOf x xs = List.length (List.filter (\y -> y == x) xs)
+
+-- (the lines joined, to compare)
+linesSaid : List Int -> String
+linesSaid ls = joinWith "," (List.map show ls)
+
+-- (a definition's location: at the file `u`, starting at `p`)
+definedAt : String -> Pos -> Json.Json -> Bool
+definedAt u p m =
+  strEq (textAt ["result", "uri"] m) u
+  && samePos (startOf (fromMaybe JNull (Json.at ["result"] m))) p
+
+-- (a definition's location: starting at the line of `p`)
+definedOn : String -> Int -> Json.Json -> Bool
+definedOn u line m =
+  strEq (textAt ["result", "uri"] m) u
+  && intAt ["result", "range", "start", "line"] m == line
+
+-- (the result, itself)
+resultOf : Json.Json -> Json.Json
+resultOf m = fromMaybe JNull (Json.at ["result"] m)
+
+-- Speaking to the server
+--------------------------------------------------------------------------------
+
+-- | the session: the server, the notes it said that were not yet waited
+-- | for, the next request's id, how many checks were made, and what was
+-- | said of each that did not hold
+type Lsp =
+  { server : Subprocess
+  , notes : List Json.Json
+  , next : Int
+  , checks : Int
+  , failed : List String
+  }
+
+-- (what was answered, and the session after it)
+type Answer = { lsp : Lsp, msg : Json.Json }
+
+-- (how long a message is waited for)
+waitLimit : Int
+waitLimit = 60000
+
+-- (what is said of the session, when it ends)
+report : Lsp -> String
+report l =
+  joinWith "\n" (List.reverse l.failed)
+  ^ "\nlsp: "
+  ^ show (l.checks - List.length l.failed)
+  ^ "/"
+  ^ show l.checks
+  ^ " checks hold"
+
+-- (a message, framed as LSP's are, said to the server)
+send : {e : HFunctor} -> {{sys : process <: e}} -> Lsp -> Json.Json -> Co e Unit
+send l msg = do
+  let body = Json.stringify msg
+  written <-
+    writeInput
+      l.server
+      (Bytes.fromString
+         ("Content-Length: " ^ show (strLength body) ^ "\r\n\r\n" ^ body))
+  pure MkUnit
+
+-- (a notification, and a request)
+notification : String -> Json.Json -> Json.Json
+notification method params =
+  Json.obj
+    [ Json.kv "jsonrpc" (Json.jstr "2.0")
+    , Json.kv "method" (Json.jstr method)
+    , Json.kv "params" params
+    ]
+
+request : Int -> String -> Json.Json -> Json.Json
+request id method params =
+  Json.obj
+    [ Json.kv "jsonrpc" (Json.jstr "2.0")
+    , Json.kv "id" (Json.num id)
+    , Json.kv "method" (Json.jstr method)
+    , Json.kv "params" params
+    ]
+
+-- (the number a header says, its digits from `i`)
+digitsAt : String -> Int -> Int -> Int
+digitsAt s i n =
+  if i < strLength s && byteAt s i >= 48 && byteAt s i <= 57
+  then digitsAt s (i + 1) (n * 10 + byteAt s i - 48)
+  else n
+
+lengthOf : String -> Int
+lengthOf header = case indexOf "Content-Length: " header of
+  Just i -> digitsAt header (i + 16) 0
+  Nothing -> 0
+
+-- (what was read, as text; else the session ends, failing)
+readText : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> Lsp
+         -> String
+         -> Received
+         -> Co e String
+readText l what (Got b) = pure (Bytes.asString b)
+readText l what Timeout =
+  failure (report l ^ "\nFAIL timed out waiting for " ^ what)
+readText l what Closed =
+  failure (report l ^ "\nFAIL the server ended, waiting for " ^ what)
+
+-- (a message read; else the session ends, failing)
+readJson : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> Lsp
+         -> String
+         -> Either Json.ParseError Json.Json
+         -> Co e Json.Json
+readJson l what (Right j) = pure j
+readJson l what (Left err) =
+  failure
+    (report l ^ "\nFAIL " ^ what ^ ": not JSON: " ^ Json.showParseError err)
+
+-- (the next message the server says, waited for)
+receive : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> Lsp
+        -> String
+        -> Co e Json.Json
+receive l what = do
+  header <- readOutput l.server (Through "\r\n\r\n") waitLimit
+  h <- readText l what header
+  body <- readOutput l.server (Exactly (lengthOf h)) waitLimit
+  b <- readText l what body
+  readJson l what (Json.parse b)
+
+-- (is it the response to the request `id`)
+isResponse : Int -> Json.Json -> Bool
+isResponse id m = intAt ["id"] m == id && strEq (writtenAt ["method"] m) ""
+
+-- (the response to the request `id`, the notes said meanwhile kept)
+response : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> Lsp
+         -> Int
+         -> String
+         -> Co e Answer
+response l id what = do
+  m <- receive l what
+  if isResponse id m then pure { lsp = l, msg = m }
+    else response
+        { server = l.server
+        , notes = List.append l.notes [m]
+        , next = l.next
+        , checks = l.checks
+        , failed = l.failed
+        }
+        id
+        what
+
+-- (the notes, but the first that `p` holds of)
+withoutFirst : (Json.Json -> Bool) -> List Json.Json -> List Json.Json
+withoutFirst p Nil = Nil
+withoutFirst p (Cons m ms) = if p m then ms else Cons m (withoutFirst p ms)
+
+-- (the session, its notes these)
+withNotes : Lsp -> List Json.Json -> Lsp
+withNotes l ns =
+  { server = l.server
+  , notes = ns
+  , next = l.next
+  , checks = l.checks
+  , failed = l.failed
+  }
+
+-- (the next note that `p` holds of, waited for, the others kept)
+awaitNote : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> Lsp
+          -> (Json.Json -> Bool)
+          -> String
+          -> Co e Answer
+awaitNote l p what = do
+  m <- receive l what
+  if p m then pure { lsp = l, msg = m }
+    else awaitNote (withNotes l (List.append l.notes [m])) p what
+
+-- (the first note that `p` holds of: one kept, else the next)
+noted : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> Lsp
+      -> (Json.Json -> Bool)
+      -> String
+      -> Co e Answer
+noted l p what = case List.find p l.notes of
+  Just m -> pure { lsp = withNotes l (withoutFirst p l.notes), msg = m }
+  Nothing -> awaitNote l p what
+
+-- (a note of this method)
+isNote : String -> Json.Json -> Bool
+isNote method m = strEq (textAt ["method"] m) method
+
+-- (the diagnostics of the file `u`)
+isDiagnosticsOf : String -> Json.Json -> Bool
+isDiagnosticsOf u m =
+  isNote "textDocument/publishDiagnostics" m
+  && strEq (textAt ["params", "uri"] m) u
+
+-- Checking
+--------------------------------------------------------------------------------
+
+-- | a check: its name, and what it holds of what the server said
+type Check = Pair String (Json.Json -> Bool)
+
+-- (one check made)
+judgedOne : Lsp -> String -> Bool -> String -> Lsp
+judgedOne l name ok got =
+  { server = l.server
+  , notes = l.notes
+  , next = l.next
+  , checks = l.checks + 1
+  , failed =
+      if ok then l.failed else Cons ("FAIL " ^ name ^ ": got " ^ got) l.failed
+  }
+
+-- (each check made of the message)
+judged : Lsp -> Json.Json -> List Check -> Lsp
+judged l m Nil = l
+judged l m (Cons (MkPair name p) rest) =
+  judged (judgedOne l name (p m) (Json.stringify m)) m rest
+
+-- | a step of a session: a document opened, changed, closed; a
+-- | notification; the diagnostics of a file, waited for and checked; a
+-- | request, its response checked (quietly: and nothing shown the user
+-- | so far); the server's registration of what it watches, checked and
+-- | answered; a file written or deleted on disk; the server shut down,
+-- | and its exit, checked
+data Step
+  = Open String String
+  | Change String String
+  | Close String
+  | Notify String Json.Json
+  | Diagnostics String (List Check)
+  | Ask String Json.Json (List Check)
+  | AskQuietly String Json.Json (List Check)
+  | Registered (List Check)
+  | Put String String
+  | Delete String
+  | Exits String
+
+-- (a document, by its URI)
+document : String -> Json.Json
+document u = Json.obj [Json.kv "uri" (Json.jstr u)]
+
+-- (the notes shown the user, with the response: what a quiet request
+-- is held to)
+quietly : List Json.Json -> Json.Json -> Json.Json
+quietly notes m =
+  Json.obj
+    [ Json.kv "response" m
+    , Json.kv
+      "shown"
+      (JArray (List.filter (isNote "window/showMessage") notes))
+    ]
+
+-- (the session after the step)
+stepOf : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> Lsp
+       -> Step
+       -> Co e Lsp
+stepOf l (Open u text) = do
+  send
+      l
+      (notification
+         "textDocument/didOpen"
+         (Json.obj
+            [ Json.kv
+              "textDocument"
+              (Json.obj
+                 [ Json.kv "uri" (Json.jstr u)
+                 , Json.kv "languageId" (Json.jstr "heff")
+                 , Json.kv "version" (Json.num 1)
+                 , Json.kv "text" (Json.jstr text)
+                 ])
+            ]))
+  pure l
+stepOf l (Change u text) = do
+  send
+      l
+      (notification
+         "textDocument/didChange"
+         (Json.obj
+            [ Json.kv
+              "textDocument"
+              (Json.obj
+                 [Json.kv "uri" (Json.jstr u), Json.kv "version" (Json.num 2)])
+            , Json.kv
+              "contentChanges"
+              (JArray [Json.obj [Json.kv "text" (Json.jstr text)]])
+            ]))
+  pure l
+stepOf l (Close u) = do
+  send
+      l
+      (notification
+         "textDocument/didClose"
+         (Json.obj [Json.kv "textDocument" (document u)]))
+  pure l
+stepOf l (Notify method params) = do
+  send l (notification method params)
+  pure l
+stepOf l (Diagnostics u checks) = do
+  a <- noted l (isDiagnosticsOf u) ("diagnostics of " ^ u)
+  pure (judged a.lsp a.msg checks)
+stepOf l (Ask method params checks) = do
+  send l (request l.next method params)
+  a <-
+    response
+      { server = l.server
+      , notes = l.notes
+      , next = l.next + 1
+      , checks = l.checks
+      , failed = l.failed
+      }
+      l.next
+      method
+  pure (judged a.lsp a.msg checks)
+stepOf l (AskQuietly method params checks) = do
+  send l (request l.next method params)
+  a <-
+    response
+      { server = l.server
+      , notes = l.notes
+      , next = l.next + 1
+      , checks = l.checks
+      , failed = l.failed
+      }
+      l.next
+      method
+  pure (judged a.lsp (quietly a.lsp.notes a.msg) checks)
+stepOf l (Registered checks) = do
+  a <- noted l (isNote "client/registerCapability") "client/registerCapability"
+  send
+      l
+      (Json.obj
+         [ Json.kv "jsonrpc" (Json.jstr "2.0")
+         , Json.kv "id" (fromMaybe JNull (Json.at ["id"] a.msg))
+         , Json.kv "result" JNull
+         ])
+  pure (judged a.lsp a.msg checks)
+stepOf l (Put path text) = do
+  ok <- writeFile path text
+  pure (judgedOne l ("writing " ^ path) ok "")
+stepOf l (Delete path) = do
+  ok <- remove path
+  pure (judgedOne l ("deleting " ^ path) ok "")
+stepOf l (Exits name) = do
+  send l (notification "exit" JNull)
+  r <- wait l.server
+  pure
+      (judgedOne
+         l
+         name
+         (case r.ended of
+          Exited n -> n == 0
+          _ -> False)
+         r.err)
+
+-- (the steps taken, in order)
+steps : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> Lsp
+      -> List Step
+      -> Co e Lsp
+steps l Nil = pure l
+steps l (Cons s rest) = do
+  next <- stepOf l s
+  steps next rest
+
+-- (the server, started; else the test fails)
+startedOr : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> Maybe Subprocess
+          -> Co e Subprocess
+startedOr (Just s) = pure s
+startedOr Nothing = failure "heff lsp could not be started"
+
+-- | a session: the server started (as vscode-languageclient starts it,
+-- | with `--stdio`; with a bounded heap: what it keeps must fit, on any
+-- | machine; told it is on a terminal, which it says nothing to in
+-- | colour all the same), the steps taken, and the test failing, saying
+-- | each check that did not hold, unless they all held
+session : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> List Step
+        -> Co e Unit
+session ss = do
+  heff <- given "HEFF"
+  root <- given "HEFF_TEST_ROOT"
+  started <-
+    start
+      { command = heff
+      , args = ["lsp", "--stdio"]
+      , dir = root
+      , env = [MkPair "HEFF_HEAP_MB" "1024", MkPair "HEFF_TTY" "1"]
+      , input = Piped
+      , output = Piped
+      , errors = Inherited
+      }
+  server <- startedOr started
+  l <-
+    steps
+      { server = server, notes = Nil, next = 1, checks = 0, failed = Nil }
+      ss
+  if List.null l.failed then pure MkUnit else failure (report l)
+
+-- Requests
+--------------------------------------------------------------------------------
+
+-- (at a position of a document)
+positioned : String -> Pos -> Json.Json
+positioned u p =
+  Json.obj [Json.kv "textDocument" (document u), Json.kv "position" (posJson p)]
+
+-- (a request at a position of a document)
+asked : String -> String -> Pos -> List Check -> Step
+asked method u p checks = Ask method (positioned u p) checks
+
+hover : String -> Pos -> List Check -> Step
+hover u p checks = asked "textDocument/hover" u p checks
+
+definition : String -> Pos -> List Check -> Step
+definition u p checks = asked "textDocument/definition" u p checks
+
+completion : String -> Pos -> List Check -> Step
+completion u p checks = asked "textDocument/completion" u p checks
+
+prepareRename : String -> Pos -> List Check -> Step
+prepareRename u p checks = asked "textDocument/prepareRename" u p checks
+
+-- (the references of what is at a position, its declaration with them
+-- or not)
+references : String -> Pos -> Bool -> List Check -> Step
+references u p withDeclaration checks =
+  Ask
+    "textDocument/references"
+    (Json.obj
+       [ Json.kv "textDocument" (document u)
+       , Json.kv "position" (posJson p)
+       , Json.kv
+         "context"
+         (Json.obj [Json.kv "includeDeclaration" (JBool withDeclaration)])
+       ])
+    checks
+
+rename : String -> Pos -> String -> List Check -> Step
+rename u p name checks =
+  Ask
+    "textDocument/rename"
+    (Json.obj
+       [ Json.kv "textDocument" (document u)
+       , Json.kv "position" (posJson p)
+       , Json.kv "newName" (Json.jstr name)
+       ])
+    checks
+
+outline : String -> List Check -> Step
+outline u checks =
+  Ask
+    "textDocument/documentSymbol"
+    (Json.obj [Json.kv "textDocument" (document u)])
+    checks
+
+-- (a document opened, its diagnostics waited for)
+opened : String -> String -> List Step
+opened u text = [Open u text, Diagnostics u Nil]
+
+-- (one check)
+check1 : String -> (Json.Json -> Bool) -> List Check
+check1 name p = [MkPair name p]
+
+-- (the edits of a rename, of the file `u`)
+editsOf : String -> Json.Json -> List Json.Json
+editsOf u m = itemsAt ["result", "changes", u] m
+
+-- (the start of a session: the server's capabilities, and its asking to
+-- be told of the files changed on disk, answered)
+initialized : String -> List Step
+initialized rootUri =
+  [ Ask
+    "initialize"
+    (Json.obj
+       [ Json.kv "processId" JNull
+       , Json.kv "rootUri" (Json.jstr rootUri)
+       , Json.kv
+         "capabilities"
+         (Json.obj
+            [ Json.kv
+              "workspace"
+              (Json.obj
+                 [ Json.kv
+                   "didChangeWatchedFiles"
+                   (Json.obj [Json.kv "dynamicRegistration" (JBool True)])
+                 ])
+            ])
+       ])
+    (check1
+       "capabilities"
+       (\m ->
+          truthyAt ["result", "capabilities", "hoverProvider"] m
+          && truthyAt ["result", "capabilities", "definitionProvider"] m
+          && truthyAt ["result", "capabilities", "documentFormattingProvider"] m
+          && intAt ["result", "capabilities", "textDocumentSync", "change"] m
+          == 1
+          && truthyAt ["result", "capabilities", "referencesProvider"] m
+          && truthyAt
+            ["result", "capabilities", "renameProvider", "prepareProvider"]
+            m
+          && truthyAt ["result", "capabilities", "documentSymbolProvider"] m
+          && truthyAt ["result", "capabilities", "workspaceSymbolProvider"] m
+          && List.any
+            (\k -> strEq (Json.stringify k) "\"refactor.rewrite\"")
+            (itemsAt
+               [ "result"
+               , "capabilities"
+               , "codeActionProvider"
+               , "codeActionKinds"
+               ]
+               m)))
+  , Notify "initialized" (Json.obj Nil)
+  , Registered
+    (check1
+       "watching files"
+       (\m ->
+          holdsOfSome
+            (\r ->
+               strEq (textAt ["method"] r) "workspace/didChangeWatchedFiles"
+               && holdsOfSome
+                 (\w -> strEq (textAt ["globPattern"] w) "**/*.hf")
+                 (List.head (itemsAt ["registerOptions", "watchers"] r)))
+            (List.head (itemsAt ["params", "registrations"] m))))
+  ]
+
+-- (the end of a session: shut down, and exited)
+shutDown : List Step
+shutDown =
+  [ Ask "shutdown" JNull (check1 "shutdown" (\m -> nullAt ["result"] m))
+  , Exits "exit after shutdown"
+  ]
+
+-- The modules' project
+--------------------------------------------------------------------------------
+
+-- (texts of the modules' project)
+badB : String
+badB = "import a\n\ntwice : Bool -> Bool\ntwice b = inv (inv \"x\")\n"
+
+goodB : String
+goodB = "import a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} inv (inv b)\n"
+
+dotted : String
+dotted = "import a as A\n\nx : A.Bool\nx = A."
+
+-- (a location written short: its file's name, line, start and end)
+whereIs : Json.Json -> String
+whereIs r =
+  let u = textAt ["uri"] r
+  in fromMaybe u (List.last (split "/" u))
+  ^ ":"
+  ^ show (lineOf r)
+  ^ ":"
+  ^ show (startOf r).character
+  ^ "-"
+  ^ show (endOf r).character
+
+-- (a file's URI, in the directory)
+uriIn : String -> String -> String
+uriIn dir f = "file://" ^ dir ^ "/" ^ f
+
+-- (the uses of `inv`, of the module `a` (its URI and text): is the file
+-- `watched` among them, held to `ok`)
+refsOf : String -> String -> String -> String -> (Bool -> Bool) -> Step
+refsOf a diskA watched name ok =
+  references
+    a
+    (pos diskA "inv :")
+    False
+    (check1
+       name
+       (\m ->
+          ok (List.any (\r -> strEq (textAt ["uri"] r) watched) (results m))))
+
+-- | the session in the modules' project: diagnostics of the editor's
+-- | text, hovers and definitions across modules, an import's unsaved
+-- | text, references and renaming across modules, files changed on disk
+modulesSteps : String -> (String -> String) -> List Step
+modulesSteps dir disk =
+  let u = uriIn dir
+  in let b = u "src/b.hf"
+  in let a = u "src/a.hf"
+  in let q = u "qualified.hf"
+  in let watched = u "app/lsp-watched.hf"
+  in let diskA = disk "src/a.hf"
+  in let qualified = disk "qualified.hf"
+  in let notAt = pos diskA "inv"
+  in let invAt = posOf goodB "inv" 1
+  in List.concatMap
+    (\x -> x)
+    [ initialized ("file://" ^ dir)
+    , [ Open b badB
+      , Diagnostics
+        b
+        (check1
+           "a type error's diagnostic"
+           (\m ->
+              List.length (diagnostics m) == 1
+              && holdsOfSome
+                (\d ->
+                   strEq (textAt ["code"] d) "E0311"
+                   && intAt ["severity"] d == 1
+                   && samePos (startOf d) (pos badB "\"x\"")
+                   && (endOf d).character == (pos badB "\"x\"").character + 3
+                   && contains
+                     "expected type Bool, but got type String"
+                     (textAt ["message"] d)
+                   && not (contains "\u{1b}" (textAt ["message"] d)))
+                (List.head (diagnostics m))))
+      , Change b goodB
+      , Diagnostics b (check1 "no diagnostics once fixed" clean)
+      , hover
+        b
+        invAt
+        (check1
+           "hover past non-ASCII text"
+           (hoverSays ["inv : Bool -> Bool", "(global)"]))
+      , hover
+        b
+        (pos goodB "b)")
+        (check1 "hover on a local" (hoverSays ["b : Bool", "(local)"]))
+      , hover b (at 1 0) (check1 "hover on nothing" (\m -> nullAt ["result"] m))
+      , definition
+        b
+        invAt
+        (check1
+           "definition in another module"
+           (\m ->
+              definedAt a notAt m
+              && intAt ["result", "range", "end", "character"] m
+              == notAt.character + 3))
+      ]
+    , opened q qualified
+    , [ definition
+        q
+        (pos qualified "inv")
+        (check1 "definition of a qualified name" (definedOn a notAt.line))
+      , hover
+        q
+        (pos qualified "inv")
+        (check1
+           "hover on a qualified name"
+           (hoverSays ["A.inv : A.Bool -> A.Bool"]))
+      ]
+    , opened (u "lsp-dot.hf") dotted
+    , [ completion
+        (u "lsp-dot.hf")
+        (at 3 6)
+        (check1
+           "completion after `A.`"
+           (\m ->
+              List.any (\l -> strEq l "inv") (labels m)
+              && List.all (\l -> not (contains "." l)) (labels m)))
+      , Open a "data Bool = True | False\n"
+      , Diagnostics a Nil
+      , Diagnostics
+        b
+        (check1
+           "an import's unsaved text"
+           (\m ->
+              List.any
+                (\d -> contains "no such variable inv" (textAt ["message"] d))
+                (diagnostics m)))
+      , Close a
+      ]
+    , opened a diskA
+    , [ references
+        a
+        (pos diskA "inv :")
+        True
+        (check1
+           "references across modules"
+           (\m ->
+              List.any
+                (\s ->
+                   strEq
+                     s
+                     ("b.hf:"
+                      ^ show invAt.line
+                      ^ ":"
+                      ^ show invAt.character
+                      ^ "-"
+                      ^ show (invAt.character + 3)))
+                (List.map whereIs (results m))
+              && List.any
+                (\s ->
+                   strEq
+                     s
+                     ("qualified.hf:"
+                      ^ show (pos qualified "A.inv").line
+                      ^ ":"
+                      ^ show ((pos qualified "A.inv").character + 2)
+                      ^ "-"
+                      ^ show ((pos qualified "A.inv").character + 5)))
+                (List.map whereIs (results m))
+              && List.length
+                (List.filter
+                   (\s -> startsWith "a.hf" s)
+                   (List.map whereIs (results m)))
+              == 3))
+      , prepareRename
+        a
+        (pos diskA "inv True")
+        (check1
+           "prepare a rename"
+           (\m ->
+              strEq (textAt ["result", "placeholder"] m) "inv"
+              && intAt ["result", "range", "start", "line"] m
+              == (pos diskA "inv True").line))
+      , rename
+        a
+        (pos diskA "inv :")
+        "neg"
+        (check1
+           "a rename"
+           (\m ->
+              List.length (editsOf a m) == 3
+              && List.length (editsOf b m) == 2
+              && List.length (editsOf q m) == 2
+              && List.all
+                (\e ->
+                   strEq (textAt ["newText"] e) "neg"
+                   && (endOf e).character - (startOf e).character == 3)
+                (List.concatMap
+                   (\f -> fromMaybe Nil (Json.arr Nil f))
+                   (valuesOf (Json.at ["result", "changes"] m)))))
+      , rename
+        a
+        (pos diskA "inv :")
+        "Not"
+        (check1 "no rename to another kind of name" (truthyAt ["error"]))
+      , rename
+        a
+        (pos diskA "inv :")
+        "twice"
+        (check1
+           "no rename to a name already there"
+           (\m -> contains "twice" (textAt ["error", "message"] m)))
+      , refsOf a diskA watched "before a file is made" not
+      , Put (dir ^ "/app/lsp-watched.hf") "import a\n\ny : Bool\ny = inv True\n"
+      , Notify
+        "workspace/didChangeWatchedFiles"
+        (Json.obj
+           [ Json.kv
+             "changes"
+             (JArray
+                [ Json.obj
+                  [ Json.kv "uri" (Json.jstr watched)
+                  , Json.kv "type" (Json.num 1)
+                  ]
+                ])
+           ])
+      , refsOf a diskA watched "a file made on disk" (\x -> x)
+      , Delete (dir ^ "/app/lsp-watched.hf")
+      , Notify
+        "workspace/didChangeWatchedFiles"
+        (Json.obj
+           [ Json.kv
+             "changes"
+             (JArray
+                [ Json.obj
+                  [ Json.kv "uri" (Json.jstr watched)
+                  , Json.kv "type" (Json.num 3)
+                  ]
+                ])
+           ])
+      , refsOf a diskA watched "a file deleted on disk" not
+      , Close a
+      , Ask
+        "textDocument/codeLens"
+        (Json.obj [Json.kv "textDocument" (document b)])
+        (check1
+           "an unknown request"
+           (\m -> intAt ["error", "code"] m == 0 - 32601))
+      ]
+    , shutDown
+    ]
+
+-- (the files of a directory, and of each under it, copied; else the test
+-- fails)
+copiedFrom : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> String
+           -> Co e Unit
+copiedFrom from to = do
+  ok <- copy from to
+  if ok then pure MkUnit else failure ("could not copy " ^ from)
+
+-- (each file's text, read, with its path)
+readAll : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> List String
+        -> Co e (List (Pair String String))
+readAll dir Nil = pure Nil
+readAll dir (Cons f rest) = do
+  text <- readFile (dir ^ "/" ^ f)
+  others <- readAll dir rest
+  pure (Cons (MkPair f (fromMaybe "" text)) others)
+
+-- (the text read of a file)
+textIn : List (Pair String String) -> String -> String
+textIn texts f =
+  fromMaybe
+    ""
+    (List.lookupBy strEq f texts)
+
+-- | the session in a copy of the modules' project, in the test's
+-- | directory: where a file is made and deleted
+modules : String -> Test
+modules name =
+  within
+    300000
+    (integration name (do
+     root <- given "HEFF_TEST_ROOT"
+     here <- workingDir
+     copiedFrom (root ^ "/test/modules") "modules"
+     let dir = here ^ "/modules"
+     texts <- readAll dir ["src/a.hf", "qualified.hf"]
+     session (modulesSteps dir (textIn texts))))
+
+-- Files not saved
+--------------------------------------------------------------------------------
+
+-- (a file as deep as the elaborator must go deep for)
+deepText : String
+deepText =
+  "xs : List Int\nxs = ["
+  ^ joinWith ", " (List.map show (List.range 0 20000))
+  ^ "]\n"
+
+astralText : String
+astralText =
+  "s : Int\ns = {- 😀 -} \"😀\"\n\nt : Int\nt = 1 😀 2\n\nu : Int\nu = {- 😀 -} t\n"
+
+twiceText : String
+twiceText = "one : Int\none = 1\n\none : Int\none = 2\n"
+
+-- | a file as deep as the elaborator must go deep for: the server's
+-- | stack is the command line's.  A position is UTF-16 code units into
+-- | its line: a rune beyond U+FFFF two of them, before a span and in it;
+-- | a character no token starts with whole, its message text.  A name
+-- | defined twice: at the second, saying where the first is
+deepSteps : String -> List Step
+deepSteps root =
+  let deep = uriIn root "test/surface/lsp-deep.hf"
+  in let astral = uriIn root "test/surface/lsp-astral.hf"
+  in let twice = uriIn root "test/surface/lsp-twice.hf"
+  in let strAt = pos astralText "\"😀\""
+  in let runeAt = posOf astralText "😀" 2
+  in [ Open deep deepText
+     , Diagnostics deep (check1 "a deep file" clean)
+     , Close deep
+     , Open astral astralText
+     , Diagnostics
+       astral
+       [ MkPair
+         "a diagnostic past a rune beyond U+FFFF"
+         (\m ->
+            holdsOfSome
+              (\d ->
+                 samePos (startOf d) strAt
+                 && (endOf d).character == strAt.character + 4)
+              (withCode "E0311" (diagnostics m)))
+       , MkPair
+         "a character no token starts with, beyond U+FFFF"
+         (\m ->
+            holdsOfSome
+              (\d ->
+                 contains "unexpected character 😀" (textAt ["message"] d)
+                 && samePos (startOf d) runeAt
+                 && (endOf d).character == runeAt.character + 2)
+              (withCode "E0150" (diagnostics m)))
+       ]
+     , hover
+       astral
+       (past 3 (pos astralText "-} t"))
+       (check1 "hover past a rune beyond U+FFFF" (hoverSays ["t : Int"]))
+     , Close astral
+     , Open twice twiceText
+     , Diagnostics
+       twice
+       (check1
+          "a name defined twice"
+          (\m ->
+             List.length (diagnostics m) == 1
+             && holdsOfSome
+               (\d ->
+                  strEq (textAt ["code"] d) "E0153"
+                  && intAt ["severity"] d == 1
+                  && samePos (startOf d) (at (posOf twiceText "one :" 1).line 0)
+                  && (endOf d).character == 3
+                  && contains "`one` is defined twice" (textAt ["message"] d)
+                  && contains "lsp-twice.hf:1:1" (textAt ["message"] d))
+               (List.head (diagnostics m))))
+     , Close twice
+     ]
+
+-- (texts typed so far)
+typing : String
+typing = "x : Float64\nx = toFlo"
+
+unwritten : String
+unwritten = "b : Bool\nb = not True\n\nn : Float64\nn = toFlo"
+
+listed : String
+listed =
+  "xs : List Int\nxs = List.map (\\x -> x + 1) [1]\n\nn : Int\nn = List.len"
+
+runed : String
+runed = "import rune as Rune\n\nx : Int\nx = Rune.toInt (Rune.fromInt 65)\n"
+
+instanced : String
+instanced =
+  "theory Eq (a : Type) where\n  equal : a -> a -> Bool\n\ninstance eqInt : Eq Int\neqInt = { equal = intEq }\n\nmember : {a : Type} -> {{eq : Eq a}} -> a -> List a -> Bool\nmember x Nil = False\nmember x (Cons y ys) = eq.equal x y || member x ys\n\nfound : Bool\nfound = member 1 [1] && member (eq := eqInt) 2 [2]\n"
+
+-- | completion: the names in scope that start as the one being typed;
+-- | `abandon`, a hole while writing a definition; a primitive the
+-- | library declares (named by no alias: its key is its name).  The
+-- | prelude, which no file writes an import of: its names in scope,
+-- | completed, hovered and gone to; the operations of lists, by the name
+-- | `List`, written by no import; a module imported under a built-in
+-- | type's name: `Rune.toInt` the module's.  An instance, `instance x :
+-- | T`: found where an instance argument is wanted; in the outline from
+-- | `instance`, hovered and gone to as any definition is
+completionSteps : String -> (String -> String) -> List Step
+completionSteps root disk =
+  let complete = uriIn root "test/surface/lsp-complete.hf"
+  in let hole = uriIn root "test/surface/lsp-complete-hole.hf"
+  in let prim = uriIn root "test/surface/lsp-complete-prim.hf"
+  in let unwrittenU = uriIn root "test/surface/lsp-unwritten.hf"
+  in let listU = uriIn root "test/surface/lsp-list.hf"
+  in let runeU = uriIn root "test/surface/lsp-rune.hf"
+  in let instU = uriIn root "test/surface/lsp-instance.hf"
+  in let iAt = pos instanced "eqInt :"
+  in List.concatMap
+    (\x -> x)
+    [ opened complete typing
+    , [ completion
+        complete
+        (at 1 9)
+        (check1
+           "completion of a prelude name"
+           (\m ->
+              completes "toFloat" (contains "Int -> Float64") m
+              && not (List.any (\l -> strEq l "toString") (labels m))))
+      ]
+    , opened hole "x : Int\nx = aban"
+    , [ completion
+        hole
+        (at 1 8)
+        (check1
+           "completion of abandon"
+           (\m -> List.any (\l -> strEq l "abandon") (labels m)))
+      , Close hole
+      ]
+    , opened prim "x : Int\nx = intAd"
+    , [ completion
+        prim
+        (at 1 9)
+        (check1
+           "completion of a primitive"
+           (completes "intAdd" (\d -> strEq d "Int -> Int -> Int")))
+      , Close prim
+      ]
+    , opened unwrittenU unwritten
+    , [ hover
+        unwrittenU
+        (pos unwritten "not")
+        (check1
+           "hover on a prelude name, not imported"
+           (hoverSays ["not : Bool -> Bool", "(global)"]))
+      , completion
+        unwrittenU
+        (at 4 9)
+        (check1
+           "completion of a prelude name, not imported"
+           (completes "toFloat" (contains "Int -> Float64")))
+      , definition
+        unwrittenU
+        (pos unwritten "not")
+        (check1
+           "definition of a prelude name, not imported"
+           (definedOn
+              (uriIn root "lib/prelude.hf")
+              (pos (disk "lib/prelude.hf") "not :").line))
+      , Close unwrittenU
+      ]
+    , opened listU listed
+    , [ completion
+        listU
+        (at 4 12)
+        (check1
+           "completion after `List.`"
+           (\m ->
+              completes "length" (contains "List a -> Int") m
+              && List.all (\l -> not (contains "." l)) (labels m)))
+      , hover
+        listU
+        (pos listed "map")
+        (check1
+           "hover on `List.map`"
+           (hoverSays ["map : {a b : Type} -> (a -> b) -> List a -> List b"]))
+      , definition
+        listU
+        (pos listed "map")
+        (check1
+           "definition of `List.map`"
+           (definedOn
+              (uriIn root "lib/list.hf")
+              (pos (disk "lib/list.hf") "map :").line))
+      , Close listU
+      , Open runeU runed
+      , Diagnostics runeU (check1 "an alias over a type checks" clean)
+      , hover
+        runeU
+        (pos runed "toInt")
+        (check1 "hover on `Rune.toInt`" (hoverSays ["toInt : Rune -> Int"]))
+      , definition
+        runeU
+        (pos runed "toInt")
+        (check1
+           "definition of `Rune.toInt`"
+           (definedOn
+              (uriIn root "lib/rune.hf")
+              (pos (disk "lib/rune.hf") "toInt :").line))
+      , Close runeU
+      , Open instU instanced
+      , Diagnostics instU (check1 "an instance found" clean)
+      , outline
+        instU
+        (check1
+           "an instance in the outline"
+           (\m ->
+              holdsOfSome
+                (\y ->
+                   intAt ["kind"] y == 12
+                   && samePos (startOf y) (at iAt.line 0)
+                   && (endOf y).line == (pos instanced "eqInt =").line
+                   && samePos
+                     (at
+                        (intAt ["selectionRange", "start", "line"] y)
+                        (intAt ["selectionRange", "start", "character"] y))
+                     iAt)
+                (List.find
+                   (\y -> strEq (textAt ["name"] y) "eqInt")
+                   (results m))))
+      , hover
+        instU
+        (pos instanced "eqInt)")
+        (check1
+           "hover on an instance"
+           (hoverSays ["eqInt : Eq Int", "(global)"]))
+      , definition
+        instU
+        (pos instanced "eqInt)")
+        (check1 "definition of an instance" (definedAt instU iAt))
+      , Close instU
+      ]
+    ]
+
+-- (texts of files not saved)
+withOps : String
+withOps = "x : Int\nx = 1 + 2 * 3\n"
+
+expecting : String
+expecting =
+  "name : String\nname = \"name\"\n\ntype R = { name : String, n : Int }\n\ny : R\ny = { name = name, n = 1 }\n\n-- >>> y\n-- { name = \"name\", n = 1 }\n\n-- >>> y.name\n-- name\n"
+
+documented : String
+documented =
+  joinWith
+    "\n"
+    [ "name : String"
+    , "name = \"name\""
+    , ""
+    , "type R = { name : String, n : Int }"
+    , ""
+    , "-- | a record of a name"
+    , "-- | >>> y"
+    , "-- | { name = \"name\", n = 1 }"
+    , "-- | >>> y.name"
+    , "-- | name"
+    , "y : R"
+    , "y = { name = name, n = 1 }"
+    , ""
+    , "-- | >>> twice y.name"
+    , "-- | \"namename\""
+    , "-- | >>> twice x"
+    , "twice : String -> String"
+    , "twice s = s ^ s"
+    , ""
+    , "-- | >>> twice \"stray\""
+    , ""
+    , "x : String"
+    , "x = \"x\""
+    , ""
+    ]
+
+-- (the lines of the references in the file `u`)
+linesIn : String -> Json.Json -> String
+linesIn u m =
+  linesSaid
+    (List.map
+       lineOf
+       (List.filter (\r -> strEq (textAt ["uri"] r) u) (results m)))
+
+-- (the one diagnostic on the line)
+onLine : Int -> Json.Json -> Maybe Json.Json
+onLine l m = List.find (\d -> lineOf d == l) (diagnostics m)
+
+-- | an unsaved file importing the library; an operator of the prelude.
+-- | A watch's expectation: a name written there is a reference, but not
+-- | a string's text, nor a record's label.  Doc tests: checked after
+-- | their definition, an error on the doc test's line (a name defined
+-- | below), a warning on one of no definition's; shown in the
+-- | definition's hover; a name in an expectation a reference as in a
+-- | watch's
+expectationSteps : String -> (String -> String) -> List Step
+expectationSteps root disk =
+  let libU = uriIn root "test/surface/lsp-lib.hf"
+  in let opsU = uriIn root "test/surface/lsp-ops.hf"
+  in let expectU = uriIn root "test/surface/lsp-expect.hf"
+  in let docU = uriIn root "test/surface/lsp-doctest.hf"
+  in let boolAt = pos (disk "lib/builtin.hf") "data Bool"
+  in [ Open libU "x : Bool\nx = True\n"
+     , Diagnostics libU (check1 "an unsaved file importing the library" clean)
+     , definition
+       libU
+       (pos "x : Bool\nx = True\n" "Bool")
+       (check1
+          "definition in lib/"
+          (definedAt (uriIn root "lib/builtin.hf") (past 5 boolAt)))
+     , Open opsU withOps
+     , Diagnostics opsU (check1 "operators of the prelude" clean)
+     , hover
+       opsU
+       (pos withOps "+")
+       (check1
+          "hover on an operator"
+          (hoverSays
+             ["(+) : {a : Type} -> {{add : Addition a}} -> a -> a -> a"]))
+     , definition
+       opsU
+       (pos withOps "+")
+       (check1
+          "definition of an operator"
+          (definedOn
+             (uriIn root "lib/prelude.hf")
+             (pos (disk "lib/prelude.hf") "(+) :").line))
+     , Open expectU expecting
+     , Diagnostics expectU Nil
+     , references
+       expectU
+       (at 0 0)
+       True
+       (check1
+          "references in a watch's expectation"
+          (\m -> strEq (linesSaid (List.map lineOf (results m))) "0,1,6,12"))
+     , Close expectU
+     , Open docU documented
+     , Diagnostics
+       docU
+       (check1
+          "diagnostics on doc tests' lines"
+          (\m ->
+             List.length (diagnostics m) == 2
+             && holdsOfSome
+               (\d ->
+                  contains "x" (textAt ["message"] d)
+                  && intAt ["severity"] d == 1)
+               (onLine 15 m)
+             && holdsOfSome
+               (\d ->
+                  contains "doc test" (textAt ["message"] d)
+                  && intAt ["severity"] d == 2
+                  && strEq (textAt ["code"] d) "W0151")
+               (onLine 19 m)))
+     , hover
+       docU
+       (pos documented "y\n")
+       (check1
+          "hover: the doc comment, its doc tests as heff"
+          (hoverSays
+             [ "y : R"
+             , "a record of a name\n```heff\n>>> y\n{ name = \"name\", n = 1 }\n>>> y.name\nname\n```"
+             ]))
+     , references
+       docU
+       (at 0 0)
+       True
+       (check1
+          "references in a doc test's expectation"
+          (\m -> strEq (linesIn docU m) "0,1,9,11"))
+     , Close docU
+     ]
+
+splitSrc : String
+splitSrc =
+  joinWith
+    "\n"
+    [ "data Shape = Circle Int | Rect Int Int"
+    , ""
+    , "type Point = { x : Int, y : Int }"
+    , ""
+    , "len : List Int -> Int"
+    , "len xs = 0"
+    , ""
+    , "size : Maybe Bool -> Int -> Int"
+    , "size m n = n"
+    , ""
+    , "area : Shape -> Int"
+    , "area s = 0"
+    , ""
+    , "px : Point -> Int"
+    , "px p = 1"
+    , ""
+    , "sum2 : List Int -> Int -> Int"
+    , "sum2 xs x = x"
+    , ""
+    , "inner : List Int -> Int"
+    , "inner (Cons y ys) = y"
+    , "inner _ = 0"
+    , ""
+    , "flag : Bool -> Pair Int Int -> Int"
+    , "flag b p = 0"
+    , ""
+    , "wrap : Maybe Int -> List Int"
+    , "wrap m ="
+    , "  Cons 1 (Cons 2"
+    , "    Nil)"
+    , ""
+    , "apply : (Int -> Int) -> Int"
+    , "apply f = 0"
+    , ""
+    , "lam : Bool -> Bool"
+    , "lam = \\c -> c"
+    , ""
+    ]
+
+-- (the code actions asked for at so many units into the first `text`,
+-- of these kinds only, if any are given)
+splitAt : String -> String -> Int -> List String -> List Check -> Step
+splitAt u text offset only checks =
+  let p = past offset (pos splitSrc text)
+  in Ask
+    "textDocument/codeAction"
+    (Json.obj
+       [ Json.kv "textDocument" (document u)
+       , Json.kv
+         "range"
+         (Json.obj [Json.kv "start" (posJson p), Json.kv "end" (posJson p)])
+       , Json.kv
+         "context"
+         (Json.obj
+            (Cons
+               (Json.kv "diagnostics" (JArray Nil))
+               (if List.null only then Nil
+                else [Json.kv "only" (JArray (List.map Json.jstr only))])))
+       ])
+    checks
+
+-- (the one edit of the one action, of the file `u`)
+splitEdit : String -> Json.Json -> Maybe Json.Json
+splitEdit u m =
+  if List.length (results m) == 1
+  then (case List.head (results m) of
+        Just act ->
+          (if List.length (itemsAt ["edit", "changes", u] act) == 1
+           then List.head (itemsAt ["edit", "changes", u] act)
+           else Nothing)
+        Nothing -> Nothing)
+  else Nothing
+
+-- (split so: one action, of its title, its one edit the equation's,
+-- replaced by the text)
+splitTo : String -> String -> Int -> String -> String -> List Check -> Step
+splitTo u text offset what expected more =
+  splitAt
+    u
+    text
+    offset
+    Nil
+    (Cons
+       (MkPair
+          what
+          (\m ->
+             holdsOfSome
+               (\act ->
+                  strEq
+                    (textAt ["title"] act)
+                    ("Split `" ^ what ^ "` into cases")
+                  && strEq (textAt ["kind"] act) "refactor.rewrite")
+               (List.head (results m))
+             && holdsOfSome
+               (\e ->
+                  samePos (startOf e) (at (pos splitSrc text).line 0)
+                  && strEq (textAt ["newText"] e) expected)
+               (splitEdit u m)))
+       more)
+
+-- (how many actions)
+actions : Int -> Json.Json -> Bool
+actions n m = not (nullAt ["result"] m) && List.length (results m) == n
+
+-- | splitting a pattern variable into cases: its equation once for each
+-- | tag of its type (a list's `Cons` by `::`, as the prelude writes it),
+-- | or once for a record, with names none in the equation is; the other
+-- | patterns and the body kept; nothing for a type that is no data, a
+-- | lambda's binder, or a request for another kind of action.
+-- | Formatting: one edit, the whole text, a definition under `-- fmt:
+-- | skip` as written; what does not parse is left, and nothing said of
+-- | it (no message on each save of a file half written)
+splitSteps : String -> List Step
+splitSteps root =
+  let u = uriIn root "test/surface/lsp-split.hf"
+  in let fmtU = uriIn root "test/surface/lsp-fmt.hf"
+  in let badU = uriIn root "test/surface/lsp-bad.hf"
+  in let kept = "-- fmt: skip\nsame  :  Bool -> Bool\nsame   b  =  b\n"
+  in let messy =
+    "data Bool = True | False\n\nnot :  Bool -> Bool\nnot   True =    False -- c\nnot False = True\n\n"
+    ^ kept
+  in let options =
+    Json.obj
+      [Json.kv "tabSize" (Json.num 2), Json.kv "insertSpaces" (JBool True)]
+  in [ Open u splitSrc
+     , Diagnostics u (check1 "a file to split in" clean)
+     , splitTo u "len xs" 5 "xs" "len Nil = 0\nlen (x :: xs1) = 0" Nil
+     , splitTo u "size m n" 5 "m" "size Nothing n = n\nsize (Just x) n = n" Nil
+     , splitTo u "area s" 5 "s" "area (Circle n) = 0\narea (Rect n m) = 0" Nil
+     , splitTo u "px p" 3 "p" "px { x = x, y = y } = 1" Nil
+     , splitTo u "sum2 xs" 5 "xs" "sum2 Nil x = x\nsum2 (y :: xs1) x = x" Nil
+     , splitTo
+       u
+       "inner (Cons y ys)"
+       14
+       "ys"
+       "inner (Cons y Nil) = y\ninner (Cons y (x :: xs)) = y"
+       Nil
+     , splitTo u "flag b" 5 "b" "flag True p = 0\nflag False p = 0" Nil
+     , splitTo u "flag b p" 7 "p" "flag b (MkPair x y) = 0" Nil
+     , splitTo
+       u
+       "wrap m"
+       5
+       "m"
+       "wrap Nothing =\n  Cons 1 (Cons 2\n    Nil)\nwrap (Just x) =\n  Cons 1 (Cons 2\n    Nil)"
+       (check1
+          "an equation of lines replaced to its end"
+          (\m ->
+             holdsOfSome
+               (\e -> samePos (endOf e) (at (pos splitSrc "    Nil)").line 8))
+               (splitEdit u m)))
+     , splitAt u "size m n" 7 Nil (check1 "no split: an Int, used" (actions 0))
+     , splitAt u "apply f" 6 Nil (check1 "no split: a function" (actions 0))
+     , splitAt u "\\c" 1 Nil (check1 "no split: a lambda's binder" (actions 0))
+     , splitAt u "len : " 1 Nil (check1 "no split: no variable" (actions 0))
+     , splitAt
+       u
+       "len xs"
+       5
+       ["quickfix"]
+       (check1 "no split where only another kind is asked for" (actions 0))
+     , splitAt
+       u
+       "len xs"
+       5
+       ["refactor"]
+       (check1 "a split where refactors are asked for" (actions 1))
+     , Close u
+     , Open fmtU messy
+     , Diagnostics fmtU Nil
+     , Ask
+       "textDocument/formatting"
+       (Json.obj
+          [Json.kv "textDocument" (document fmtU), Json.kv "options" options])
+       (check1
+          "formatting"
+          (\m ->
+             List.length (results m) == 1
+             && holdsOfSome
+               (\e ->
+                  strEq
+                    (textAt ["newText"] e)
+                    ("data Bool = True | False\n\nnot : Bool -> Bool\nnot True = False -- c\nnot False = True\n\n"
+                     ^ kept))
+               (List.head (results m))))
+     , Open badU "x : Bool\nx = (\n"
+     , Diagnostics badU Nil
+     , AskQuietly
+       "textDocument/formatting"
+       (Json.obj
+          [Json.kv "textDocument" (document badU), Json.kv "options" options])
+       (check1
+          "formatting refused, quietly"
+          (\m ->
+             strEq (writtenAt ["response", "result"] m) "[]"
+             && List.null (itemsAt ["shown"] m)))
+     ]
+
+-- | the session of files not saved, in the project's directories: their
+-- | texts given the server, as an editor's
+unsaved : String -> Test
+unsaved name =
+  within
+    300000
+    (integration name (do
+     root <- given "HEFF_TEST_ROOT"
+     texts <-
+       readAll
+         root
+         ["lib/prelude.hf", "lib/list.hf", "lib/rune.hf", "lib/builtin.hf"]
+     session
+         (List.concatMap
+            (\x -> x)
+            [ initialized ("file://" ^ root)
+            , deepSteps root
+            , completionSteps root (textIn texts)
+            , expectationSteps root (textIn texts)
+            , splitSteps root
+            , shutDown
+            ])))
+
+-- The repository's files
+--------------------------------------------------------------------------------
+
+-- (a definition at the line and the character of `p`)
+definedAtLine : Pos -> Json.Json -> Bool
+definedAtLine p m = samePos (startOf (resultOf m)) p
+
+-- | a global of the file itself, and the standard library's; in a `do`
+-- | block, the name hovered, not the `bind` it is read into (and a name
+-- | bound there: nothing is recorded of it, and `bind` is not there); a
+-- | constructor, in an expression and in a pattern: where its type
+-- | declares it; a field, set in a record and projected: where its
+-- | theory declares it
+definitionSteps : String -> (String -> String) -> List Step
+definitionSteps root disk =
+  let basicsU = uriIn root "test/surface/basics.hf"
+  in let basics = disk "test/surface/basics.hf"
+  in let counterU = uriIn root "examples/counter/counter.hf"
+  in let counter = disk "examples/counter/counter.hf"
+  in let coU = uriIn root "lib/co.hf"
+  in let co = disk "lib/co.hf"
+  in let consAt = pos basics "Cons a (List a)"
+  in let hmapAt = pos co "hmap :"
+  in List.concatMap
+    (\x -> x)
+    [ [ Open basicsU basics
+      , Diagnostics basicsU (check1 "basics.hf elaborates" clean)
+      , definition
+        basicsU
+        (pos basics "not (not b)")
+        (check1
+           "definition in the same file"
+           (definedAt basicsU (at (pos basics "not :").line 0)))
+      , definition
+        basicsU
+        (pos basics "ys)")
+        (check1 "no definition for a local" (\m -> nullAt ["result"] m))
+      ]
+    , opened counterU counter
+    , [ hover
+        counterU
+        (pos counter "showCount 0")
+        (check1 "hover in a do block" (hoverSays ["showCount : Int -> String"]))
+      , definition
+        counterU
+        (pos counter "showCount 0")
+        (check1
+           "definition in a do block"
+           (\m -> lineOf (resultOf m) == (pos counter "showCount :").line))
+      , hover
+        counterU
+        (pos counter "label <-")
+        (check1
+           "hover on a do binder is not bind's"
+           (\m -> nullAt ["result"] m || not (contains "bind :" (hovered m))))
+      , definition
+        basicsU
+        (pos basics "Cons (f y)")
+        (check1
+           "definition of a constructor in an expression"
+           (definedAtLine consAt))
+      , definition
+        basicsU
+        (pos basics "Cons y ys) = Cons")
+        (check1
+           "definition of a constructor in a pattern"
+           (definedAtLine consAt))
+      ]
+    , opened coU co
+    , [ definition
+        coU
+        (pos co "hmap = ")
+        (check1 "definition of a field set in a record" (definedAtLine hmapAt))
+      , definition
+        coU
+        (pos co "hmap m n nt x")
+        (check1 "definition of a field projected" (definedAtLine hmapAt))
+      ]
+    ]
+
+-- | a record type's defaults: a name in a default, a field set where
+-- | the others are left out, and a theory's field that has a default; an
+-- | implicit argument's default: the definition it names; a default
+-- | naming a field before it: that field, a local there.  A record
+-- | updated, `{ r | x = v }`: a field it sets, and a field of one,
+-- | `pos.py`, as fields set are; a field's references and rename take in
+-- | where an update sets it
+recordSteps : String -> (String -> String) -> List Step
+recordSteps root disk =
+  let du = uriIn root "test/surface/record-defaults.hf"
+  in let defaults = disk "test/surface/record-defaults.hf"
+  in let iu = uriIn root "test/surface/implicit-defaults.hf"
+  in let implicits = disk "test/surface/implicit-defaults.hf"
+  in let uu = uriIn root "test/surface/record-update.hf"
+  in let upd = disk "test/surface/record-update.hf"
+  in [ Open du defaults
+     , Diagnostics du (check1 "a record type's defaults: no diagnostics" clean)
+     , hover
+       du
+       (pos defaults "greeting\n")
+       (check1 "hover in a default" (hoverSays ["greeting : String"]))
+     , hover
+       du
+       (pos defaults "name = \"bare\"")
+       (check1
+          "hover on a field set, the others left out"
+          (hoverSays ["name : String"]))
+     , definition
+       du
+       (pos defaults "name = \"strings\"")
+       (check1
+          "definition of a theory's field that has a default"
+          (definedAtLine (pos defaults "name : String = ")))
+     , Open iu implicits
+     , Diagnostics
+       iu
+       (check1 "an implicit argument's default: no diagnostics" clean)
+     , hover
+       iu
+       (pos implicits "quietly}")
+       (check1
+          "hover in an implicit argument's default"
+          (hoverSays ["quietly : Opts"]))
+     , hover
+       iu
+       (pos implicits "run 1")
+       (check1
+          "hover on a function with an implicit argument's default"
+          (hoverSays ["{opts : Opts := quietly} -> Int -> Bool"]))
+     , hover
+       du
+       (pos defaults "lo\n  , width")
+       (check1
+          "hover on a field a default names"
+          (hoverSays ["lo : Int", "(local)"]))
+     , Open uu upd
+     , Diagnostics uu (check1 "an update: no diagnostics" clean)
+     , hover
+       uu
+       (pos upd "x = b.x")
+       (check1 "hover on a field set in an update" (hoverSays ["x : Float64"]))
+     , hover
+       uu
+       (pos upd "pos.py")
+       (check1
+          "hover on a field whose field is set in an update"
+          (hoverSays ["pos : Pos"]))
+     , hover
+       uu
+       (pos upd "py = 20")
+       (check1
+          "hover on a field of a field in an update"
+          (hoverSays ["py : Int"]))
+     , references
+       uu
+       (pos upd "py = 2 }")
+       True
+       (check1
+          "references of a field take in an update's"
+          (\m ->
+             List.any
+               (\r -> lineOf r == (pos upd "pos.py = 20").line)
+               (results m)))
+     , rename
+       uu
+       (pos upd "unit : t")
+       "one"
+       (check1
+          "a rename of a field takes in an update's"
+          (\m ->
+             List.any
+               (\e ->
+                  lineOf e == (pos upd "unit = 1").line
+                  && strEq (textAt ["newText"] e) "one")
+               (editsOf uu m)))
+     , Close uu
+     ]
+
+-- (the symbol of this name, of an outline)
+symbol : String -> Json.Json -> Maybe Json.Json
+symbol n m = List.find (\y -> strEq (textAt ["name"] y) n) (results m)
+
+-- (its children's names)
+childrenOf : Json.Json -> String
+childrenOf y =
+  joinWith "," (List.map (\c -> textAt ["name"] c) (itemsAt ["children"] y))
+
+-- (the lines of the references, each)
+refLines : Json.Json -> List Int
+refLines m = List.map lineOf (results m)
+
+-- (each of the positions' lines among them)
+allLinesOf : List Pos -> List Int -> Bool
+allLinesOf ps ls = List.all (\(p : Pos) -> List.any (\l -> l == p.line) ls) ps
+
+-- | an outline: each definition, a data's tags and a theory's fields
+-- | under it (a definition is its signature and its equations; a
+-- | `data`, to its last `)`); what does not elaborate is in the outline
+-- | too, where it is.  The project's symbols; a recursive call is the
+-- | global it calls; references: the signature, each equation, each
+-- | use, a watch
+outlineSteps : String -> (String -> String) -> List Step
+outlineSteps root disk =
+  let basicsU = uriIn root "test/surface/basics.hf"
+  in let basics = disk "test/surface/basics.hf"
+  in let recoverU = uriIn root "test/errors/recover.hf"
+  in let listEnd = pos basics "Cons a (List a)"
+  in List.concatMap
+    (\x -> x)
+    [ [ outline
+        basicsU
+        [ MkPair
+          "an outline"
+          (\m ->
+             holdsOfSome
+               (\y ->
+                  intAt ["kind"] y == 10 && strEq (childrenOf y) "True,False")
+               (symbol "Bool" m)
+             && holdsOfSome
+               (\y -> intAt ["kind"] y == 11 && strEq (childrenOf y) "t,m")
+               (symbol "Monoid" m)
+             && holdsOfSome
+               (\y ->
+                  intAt ["kind"] y == 12
+                  && intAt ["selectionRange", "start", "line"] y
+                  == (pos basics "not :").line)
+               (symbol "not" m))
+        , MkPair
+          "an outline's ranges"
+          (\m ->
+             holdsOfSome
+               (\y -> (endOf y).line == (pos basics "not False").line)
+               (symbol "not" m)
+             && holdsOfSome
+               (\y ->
+                  samePos
+                    (endOf y)
+                    (past (strLength "Cons a (List a)") listEnd))
+               (symbol "List" m))
+        ]
+      ]
+    , opened recoverU (disk "test/errors/recover.hf")
+    , [ outline
+        recoverU
+        (check1
+           "an outline of what does not elaborate"
+           (\m ->
+              strEq
+                (joinWith "," (List.map (\y -> textAt ["name"] y) (results m)))
+                "Bool,f,g,h,k,bad,m,not,n"))
+      , Close recoverU
+      ]
+    , opened (uriIn root "test/surface/where.hf") (disk "test/surface/where.hf")
+    , opened (uriIn root "test/surface/amb.hf") (disk "test/surface/amb.hf")
+    , opened
+      (uriIn root "test/surface/binder-ann.hf")
+      (disk "test/surface/binder-ann.hf")
+    , [ Ask
+        "workspace/symbol"
+        (Json.obj [Json.kv "query" (Json.jstr "twic")])
+        (check1
+           "the project's symbols"
+           (\m ->
+              List.any
+                (\s ->
+                   strEq (textAt ["name"] s) "twice"
+                   && strEq (textAt ["location", "uri"] s) basicsU)
+                (results m)))
+      , definition
+        basicsU
+        (pos basics "map f ys")
+        (check1
+           "definition of a recursive call"
+           (\m -> lineOf (resultOf m) == (pos basics "map :").line))
+      , references
+        basicsU
+        (pos basics "not (not b)")
+        True
+        (check1
+           "references in a file"
+           (\m ->
+              allLinesOf
+                [ pos basics "not :"
+                , pos basics "not True"
+                , pos basics "not False"
+                , pos basics "not (not"
+                , pos basics ">>> not"
+                ]
+                (List.map
+                   lineOf
+                   (List.filter
+                      (\r -> strEq (textAt ["uri"] r) basicsU)
+                      (results m)))
+              && List.length
+                (List.filter
+                   (\r -> strEq (textAt ["uri"] r) basicsU)
+                   (results m))
+              == 6))
+      , references
+        basicsU
+        (pos basics "not (not b)")
+        False
+        (check1
+           "references without the definition"
+           (\m -> not (nullAt ["result"] m) && List.length (results m) == 3))
+      ]
+    ]
+
+-- | a local: its binder and its uses, in its equation only (`f` is bound
+-- | by each equation of `map`); renamed there, unless the new name would
+-- | be captured, or capture a name used there; a primitive is not
+-- | renamed.  A local definition of a `where`: under its parent in the
+-- | outline; its signature, the head of each of its equations and each
+-- | use are it, renamed together; an operator in a pattern is a tag's
+-- | other name, no local: `::` after `=` is the prelude's, and so is the
+-- | one in the pattern.  An instance argument, `{{ev : pick <: e}}`:
+-- | bound in the equations; a lambda's annotated binder, `\(r : R) ->
+-- | ...`: its uses are its; a theory's field, used by the fields after
+-- | it and projected
+localSteps : String -> (String -> String) -> List Step
+localSteps root disk =
+  let basicsU = uriIn root "test/surface/basics.hf"
+  in let basics = disk "test/surface/basics.hf"
+  in let whereU = uriIn root "test/surface/where.hf"
+  in let whereSrc = disk "test/surface/where.hf"
+  in let ambU = uriIn root "test/surface/amb.hf"
+  in let amb = disk "test/surface/amb.hf"
+  in let annU = uriIn root "test/surface/binder-ann.hf"
+  in let ann = disk "test/surface/binder-ann.hf"
+  in let eq2 = (pos basics "map f (Cons").line
+  in let annLine = (pos ann "r.a + r.b").line
+  in [ references
+       basicsU
+       (pos basics "f y")
+       True
+       (check1
+          "references of a local"
+          (\m ->
+             List.length (results m) == 3
+             && List.all (\r -> lineOf r == eq2) (results m)))
+     , prepareRename
+       basicsU
+       (pos basics "ys)")
+       (check1
+          "prepare a rename of a local"
+          (\m -> strEq (textAt ["result", "placeholder"] m) "ys"))
+     , prepareRename
+       basicsU
+       (pos basics "intAdd")
+       (check1
+          "no rename of a primitive"
+          (\m -> contains "primitive" (textAt ["error", "message"] m)))
+     , rename
+       basicsU
+       (pos basics "y ys) = Cons")
+       "z"
+       (check1
+          "a rename of a local"
+          (\m ->
+             List.length (editsOf basicsU m) == 2
+             && List.all
+               (\e -> lineOf e == eq2 && strEq (textAt ["newText"] e) "z")
+               (editsOf basicsU m)))
+     , rename
+       basicsU
+       (pos basics "y ys) = Cons")
+       "ys"
+       (check1
+          "no rename of a local to a name it would be captured by"
+          (truthyAt ["error"]))
+     , rename
+       basicsU
+       (pos basics "y ys) = Cons")
+       "map"
+       (check1
+          "no rename of a local to a name used under it"
+          (truthyAt ["error"]))
+     , outline
+       whereU
+       (check1
+          "local definitions in the outline"
+          (\m ->
+             holdsOfSome
+               (\y -> strEq (childrenOf y) "times,go")
+               (symbol "scaled" m)
+             && holdsOfSome
+               (\y -> strEq (childrenOf y) "outer,inner")
+               (symbol "nested" m)))
+     , references
+       whereU
+       (pos whereSrc "go xs")
+       True
+       (check1
+          "references of a local definition"
+          (\m ->
+             List.length (results m) == 5
+             && allLinesOf
+               [ pos whereSrc "go xs"
+               , pos whereSrc "go : List Int"
+               , pos whereSrc "go Nil = Nil"
+               , pos whereSrc "go (y :: ys) = times"
+               , pos whereSrc "go ys\n"
+               ]
+               (refLines m)))
+     , rename
+       whereU
+       (pos whereSrc "go : List Int")
+       "loop"
+       (check1
+          "a rename of a local definition"
+          (\m ->
+             List.length (editsOf whereU m) == 5
+             && List.all
+               (\e -> strEq (textAt ["newText"] e) "loop")
+               (editsOf whereU m)))
+     , references
+       whereU
+       (pos whereSrc ":: go ys")
+       True
+       (check1
+          "an operator in a pattern binds nothing"
+          (\m ->
+             List.any
+               (\r -> strEq (textAt ["uri"] r) (uriIn root "lib/prelude.hf"))
+               (results m)))
+     , references
+       ambU
+       (pos amb "ev (Flip")
+       True
+       (check1
+          "references of an instance argument"
+          (\m ->
+             List.length (results m) == 2
+             && allLinesOf
+               [pos amb "{{ev : pick <: e}} -> Co e Bool", pos amb "ev (Flip"]
+               (refLines m)))
+     , references
+       annU
+       (pos ann "r.a + r.b")
+       True
+       (check1
+          "references of an annotated binder"
+          (\m ->
+             List.length (results m) == 3
+             && List.all (\r -> lineOf r == annLine) (results m)))
+     , references
+       basicsU
+       (pos basics "t -> t -> t")
+       True
+       (check1
+          "references of a field"
+          (\m ->
+             allLinesOf [pos basics "t : Type", pos basics "r.t"] (refLines m)
+             && countOf (pos basics "m : t").line (refLines m) == 3))
+     , Close whereU
+     , Close ambU
+     , Close annU
+     ]
+
+-- | the session of the repository's own files: their texts given the
+-- | server as on disk
+repository : String -> Test
+repository name =
+  within
+    300000
+    (integration name (do
+     root <- given "HEFF_TEST_ROOT"
+     texts <-
+       readAll
+         root
+         [ "test/surface/basics.hf"
+         , "examples/counter/counter.hf"
+         , "lib/co.hf"
+         , "test/surface/record-defaults.hf"
+         , "test/surface/implicit-defaults.hf"
+         , "test/surface/record-update.hf"
+         , "test/errors/recover.hf"
+         , "test/surface/where.hf"
+         , "test/surface/amb.hf"
+         , "test/surface/binder-ann.hf"
+         ]
+     session
+         (List.concatMap
+            (\x -> x)
+            [ initialized ("file://" ^ root)
+            , definitionSteps root (textIn texts)
+            , recordSteps root (textIn texts)
+            , outlineSteps root (textIn texts)
+            , localSteps root (textIn texts)
+            , shutDown
+            ])))
+
+-- | the language server's tests, a session each
+lsp : Test
+lsp =
+  group
+    "lsp"
+    [ modules "modules"
+    , unsaved "files not saved"
+    , repository "the repository's files"
+    ]

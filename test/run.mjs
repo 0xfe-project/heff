@@ -33,7 +33,7 @@ export const groups = {
   // app, `heff dev` (the texts it said before, formatting, the caches:
   // `make test-heff`)
   compiler: [["progress.mjs"], ["terminal.mjs"], ["dev.mjs"]],
-  lsp: [["lsp.mjs"]],
+  lsp: [["heff", "test", "test/lsp.hf"]],
   // programs compiled by each backend and run, held to the interpreter
   backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],
   // heff through C, under AddressSanitizer
