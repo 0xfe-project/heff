@@ -128,7 +128,10 @@ tool = group "tool"
 `heff test` cannot run such a test in itself, as it runs the others: it
 builds the file's tests into a program through C (in `.heff/test/`, by
 zig, as `heff run` builds), and runs each integration test the file has
-in it, a process of its own.  Each is run in a new, empty directory of
+in it, a process of its own.  (Where that program cannot be built,
+each of the file's integration tests fails, saying the first error, the
+others on the standard error; the other files go on.)  Each is run in
+a new, empty directory of
 its own (where the system keeps temporary ones), its working directory,
 removed after it; and each has a time limit, a minute unless `within MS`
 says otherwise, at which its process is killed and the test fails.

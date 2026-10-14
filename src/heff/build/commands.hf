@@ -618,6 +618,13 @@ anyErrors : List Driver.Checked -> Bool
 anyErrors cs =
   List.any (\(c : Driver.Checked) -> not (List.null (Driver.errorsIn c))) cs
 
+-- (the first error of the modules checked, where it is)
+firstErrorOf : List Driver.Checked -> Maybe String
+firstErrorOf Nil = Nothing
+firstErrorOf (Cons c rest) = case Driver.firstError c of
+  Just why -> Just why
+  Nothing -> firstErrorOf rest
+
 -- (`done`: what follows the written program)
 writeOut : {e : HFunctor}
          -> {{io : stdio <: e}}
@@ -1207,17 +1214,18 @@ compileFoundC : {e : HFunctor}
               -> Maybe String
               -> String
               -> String
+              -> (String -> Co e Unit)
               -> Co e Unit
               -> Driver.Checked
               -> List Emit.Provider
               -> Co e Unit
-compileFoundC bi file name outPath runtime done c available = case Driver.findRunnable
+compileFoundC bi file name outPath runtime failed done c available = case Driver.findRunnable
     (List.filter (\k -> providesLeafC available k) (Driver.candidateLeaves c))
     c
     name of
   Left why -> do
     printErr ("heff: " ^ file ^ ": " ^ why)
-    exit 1
+    failed ("heff: " ^ file ^ ": " ^ why)
   Right r ->
     -- (a directory, `OUT/`: the program as parts, a file for each module)
     if endsWith "/" outPath
@@ -1262,10 +1270,11 @@ compileLastC : {e : HFunctor}
              -> String
              -> Maybe String
              -> String
+             -> (String -> Co e Unit)
              -> Co e Unit
              -> List Driver.Checked
              -> Co e Unit
-compileLastC bi sources file name outPath done cs = case Driver.lastChecked
+compileLastC bi sources file name outPath failed done cs = case Driver.lastChecked
     cs of
   Nothing -> do
     printErr "no files given"
@@ -1287,12 +1296,46 @@ compileLastC bi sources file name outPath done cs = case Driver.lastChecked
              runtime
              c.top.globals
              (List.map (\(o : Driver.Own) -> MkPair o.name o.key) c.own))
-      Just _ -> compileFoundC bi file name outPath runtime done c found
+      Just _ -> compileFoundC bi file name outPath runtime failed done c found
 
 -- | compile the computation `name` of FILE, loaded (`l`), to C -- one
 -- | file, or, OUT a directory (`dir/`), a file a module -- then go on
 -- | with `done`; with no `name`, one file that shows each of FILE's
 -- | definitions asked for, as the tests ask
+-- | as `cLoaded`, but where it cannot be compiled -- it has errors, said
+-- | on the error stream -- `failed` of why, its first error, not the end
+cLoadedOr : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{rep : Report.report <: e}}
+          -> (String -> Co e Unit)
+          -> Load.Loaded
+          -> Maybe String
+          -> String
+          -> String
+          -> Co e Unit
+          -> Co e Unit
+cLoadedOr failed l name outPath file done = do
+  badL <- printErrs "heff" l.errors 0
+  acc <- Session.cachedAcc l
+  cs <- refusedChecked "c" l.sources acc.done
+  putFileDiags cs
+  if badL > 0 || anyErrors cs
+    then failed
+        (fromMaybe
+           (file ^ ": it does not check")
+           (firstErrorOf cs))
+    else compileLastC
+        (backInOf l acc)
+        l.sources
+        file
+        name
+        outPath
+        failed
+        done
+        cs
+
 cLoaded : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
@@ -1304,13 +1347,8 @@ cLoaded : {e : HFunctor}
         -> String
         -> Co e Unit
         -> Co e Unit
-cLoaded l name outPath file done = do
-  badL <- printErrs "heff" l.errors 0
-  acc <- Session.cachedAcc l
-  cs <- refusedChecked "c" l.sources acc.done
-  putFileDiags cs
-  if badL > 0 || anyErrors cs then exit 1
-    else compileLastC (backInOf l acc) l.sources file name outPath done cs
+cLoaded l name outPath file done =
+  cLoadedOr (\why -> exit 1) l name outPath file done
 
 -- | compile the computation `name` of FILE to C, as `cLoaded`
 cThen : {e : HFunctor}
@@ -1521,20 +1559,21 @@ wrote t path next = do
 -- program `out`: a task under `p` of as many items as files and the
 -- link, what zig says of them under it; else said, by `who`, and the
 -- end)
-zigBuild : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> {{disk : filesystem <: e}}
-         -> {{prog : Progress.progress <: e}}
-         -> String
-         -> Path.Style
-         -> String
-         -> Progress.Task
-         -> String
-         -> String
-         -> Co e Unit
-         -> Co e Unit
-zigBuild who st opt p dir out next = do
+zigBuildOr : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> (String -> Co e Unit)
+           -> String
+           -> Path.Style
+           -> String
+           -> Progress.Task
+           -> String
+           -> String
+           -> Co e Unit
+           -> Co e Unit
+zigBuildOr failed who st opt p dir out next = do
   names <- readDirectory dir
   files <-
     pure
@@ -1552,7 +1591,24 @@ zigBuild who st opt p dir out next = do
     else do
       writeErr (ranErr r)
       printErr (who ^ ": `zig cc` could not build " ^ out)
-      exit 1
+      failed (who ^ ": `zig cc` could not build " ^ out)
+
+-- (as `zigBuildOr`, the end where it cannot build)
+zigBuild : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> String
+         -> Path.Style
+         -> String
+         -> Progress.Task
+         -> String
+         -> String
+         -> Co e Unit
+         -> Co e Unit
+zigBuild who st opt p dir out next =
+  zigBuildOr (\why -> exit 1) who st opt p dir out next
 
 -- (`.heff/build/X/` by `zig cc` at the target's level, the program X,
 -- `.heff/build/X/X`: a task under the program's, `p`)
@@ -2523,13 +2579,6 @@ testReport f wrong ts os = do
       , testsFailed = List.length (badOutcomes os)
       }
 
--- (the first error of the modules checked, where it is)
-firstErrorOf : List Driver.Checked -> Maybe String
-firstErrorOf Nil = Nothing
-firstErrorOf (Cons c rest) = case Driver.firstError c of
-  Just why -> Just why
-  Nothing -> firstErrorOf rest
-
 -- | the first thing wrong with a file, its line in `heff test`'s list of
 -- | the files that do not check: a module not loaded, else the first
 -- | error, `path:line:col: error[E…]: what`
@@ -3345,6 +3394,29 @@ reportedWith opts p more = do
   os <- withGoldens opts.update p.file (List.append p.outcomes more)
   reported opts p os
 
+-- (a file whose integration tests cannot be built: each fails, saying
+-- why, and the file is done with)
+unbuilt : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{rep : Report.report <: e}}
+        -> TestOpts
+        -> Pending
+        -> String
+        -> (Prepared -> Co e Unit)
+        -> Co e Unit
+unbuilt opts p why k = do
+  r <-
+    reportedWith
+      opts
+      p
+      (List.map
+         (\(i : Pair String Int) ->
+            brokenTest (fst i) ("its program could not be built: " ^ why))
+         p.integrations)
+  k (Done r)
+
 -- | the file's integration tests built, as `heff run` builds, into a
 -- | program of the file's (check's `integrationMain` of its tests), to
 -- | run with the others': its `Ready` given to `k`
@@ -3360,26 +3432,25 @@ buildIntegrations : {e : HFunctor}
                   -> (Prepared -> Co e Unit)
                   -> Co e Unit
 buildIntegrations opts at p k = case integrationLoaded p of
-  Left why -> do
-    r <-
-      reportedWith
-        opts
-        p
-        (List.map
-           (\(i : Pair String Int) -> brokenTest (fst i) why)
-           p.integrations)
-    k (Done r)
+  Left why -> unbuilt opts p why k
   Right l -> do
     task <- Progress.start Progress.root (p.file ^ ": integration tests") 2
     c <- Progress.start task "compiling to C" 0
-    cLoaded
+    cLoadedOr
+        (\why -> do
+         Progress.end c
+         Progress.end task
+         unbuilt opts p why k)
         l
         (Just integrationMainName)
         (testDir l.paths p.file ^ "/")
         p.file
         (ended
            c
-           (zigBuild
+           (zigBuildOr
+              (\why -> do
+               Progress.end task
+               unbuilt opts p why k)
               "heff test"
               l.paths.style
               "-O1"
