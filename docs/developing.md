@@ -40,10 +40,12 @@ or only one of another seed, it starts from the seed,
 `boot/heff.tar.xz`: heff compiled by itself to C, which zig unpacks
 and builds for whatever machine it is on.  `make build-seed` (`zig
 build seed`) always starts from the seed.  zig builds each C part
-to an object apart, as many at once as there are cores, and links
-them; each object is kept in `.heff/out/heff.o/`, named by what it is
-made of (the zig and the machine it builds for, the flags, `heff.h`
-and the part), so a part as it was is not built again, whichever stage
+to an object apart -- and the runtime's part in Zig, `heff.zig`, which
+the compiler writes beside the C as it bundles the runtime's C into
+`heff.h`, by `zig build-obj` -- as many at once as there are cores,
+and links them; each object is kept in `.heff/out/heff.o/`, named by
+what it is made of (the zig and the machine it builds for, the flags,
+`heff.h` and the part), so a part as it was is not built again, whichever stage
 it is of, and one no stage of the build is made of is let go.  (zig's
 own cache, `.zig-cache/`, holds `scripts/bootstrap.zig` built.)
 
