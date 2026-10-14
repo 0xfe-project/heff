@@ -223,8 +223,14 @@ data PiBinder t c
 -- | `p -> e`
 data Alt e = MkAlt Pat e
 
--- | a statement of a `do` block: `x <- e`, `let p = e`, `e`
-data Stmt e = StmtBind String Params.Span e | StmtLet Pat e | StmtExpr e
+-- | a statement of a `do` block: `x <- e`, `let p = e`, `e`, and `let
+-- | mut x = e` (the name, where it is, what it is first; `let mut x : T =
+-- | e` holds `(e : T)`)
+data Stmt e
+  = StmtBind String Params.Span e
+  | StmtLet Pat e
+  | StmtExpr e
+  | StmtLetMut String Params.Span e
 
 -- | `x : A` in a record type, and `x : A = d`, `d` its default (the
 -- | types `t`, the default a term `c`)
@@ -319,6 +325,23 @@ data ExprF
                                            (Params.Spanned ExprF)
                                            (Params.Spanned ExprF))))
   | EInvalid String
+  -- A `do` block's statements (and its statements' arms, an `if`'s or a
+  -- `case`'s), each nothing anywhere else: `x := e` (the variable, where
+  -- it is, the value); `while c do ...`; `for p in e do ...`; `if c then
+  -- s`, with no `else`; `break`; `continue`; `return e`.  And `(<- c)`,
+  -- the value of an action where it is used, in a `do` block only.
+  | EAssign String Params.Span (Params.Spanned ExprF)
+  | EWhile (Params.Spanned ExprF) (List
+                                     (Params.Spanned
+                                        (Stmt (Params.Spanned ExprF))))
+  | EFor Pat (Params.Spanned ExprF) (List
+                                       (Params.Spanned
+                                          (Stmt (Params.Spanned ExprF))))
+  | EIfThen (Params.Spanned ExprF) (Params.Spanned ExprF)
+  | EBreak
+  | EContinue
+  | EReturn (Params.Spanned ExprF)
+  | ENest (Params.Spanned ExprF)
 
 type Expr = Params.Spanned ExprF
 
@@ -540,35 +563,926 @@ chkOf i = At (CInf i) (Params.spanOf i)
 -- Classifying
 --------------------------------------------------------------------------------
 
--- | a `do` block, taken apart: `x <- e` and `e` are `bind e (\x -> ...)`
--- | (whichever `bind` is in scope), `let p = e` a `let` over the
--- | statements after it; it ends with an expression
-doBind : Params.Span -> Expr -> String -> Params.Span -> Expr -> Expr
-doBind sp e x xsp rest = app (At (EVar "bind") sp) [e, lamName x xsp rest]
+-- A `do` block, taken apart
+--------------------------------------------------------------------------------
 
-doStep : Params.Span -> Params.Spanned (Stmt Expr) -> Expr -> Expr
-doStep sp (At (StmtBind x xsp e) _) rest = doBind sp e x xsp rest
-doStep sp (At (StmtLet p rhs) lsp) rest =
+-- A `do` block is taken apart through the `bind` and `pure` in scope,
+-- by name (`run do`'s through the identity monad's, `idBind` and
+-- `idPure`): `x <- e` and `e` are `bind e (\x -> ...)`, `let p = e` a
+-- `let` over the statements after it; it ends with an expression.
+--
+-- Its imperative statements are taken apart into tail calls, so a loop
+-- in any monad is a local tail-recursive function:
+--
+-- - a `let mut x` is a variable bound again at each `x := e` (`let x =
+--   e in ...`), and a parameter of each function below;
+-- - `while c do body` is a local function of the variables, `loop`,
+--   whose body is `if c then body else after`, `after` a local function
+--   of them too, of what follows the loop (a join point); `for p in e do
+--   body` is the same, over the cursor of `e`'s `Iterate` (`iterateOf`,
+--   the instance itself where each use is, so that its `Elem` is the
+--   type it says), `loop` taking the cursor first and matching its `next`;
+-- - in a loop's body, `continue` is the call of the next turn, `break`
+--   the call of `after`, and the body's end the next turn; `return e`
+--   is `pure e`, anywhere: every function above is in tail position, so
+--   its answer is the block's;
+-- - an `if` or a `case` among the statements, whose arms are
+--   statements too (an arm's `do` block one of this block's statements),
+--   calls a join point of the variables, what follows it, at each arm's
+--   end -- where an arm does anything above, or has an action's value,
+--   `(<- c)`; else it is an action, as any;
+-- - `(<- c)` in a statement is a name bound by `bind c` before the
+--   statement; in an `if` or a `case` used as a value (and `&&`, `||`,
+--   which are `if`), the arm it is in is an action of its own, its
+--   `(<- c)` bound at its start, the others `pure`, and the whole is the
+--   statement's `(<- ...)`.  In a lambda it is an error: its body runs
+--   later, so is `return`, `break`, and setting the block's variable
+--   (which the lambda holds the value of).
+--
+-- A function's parameters are of its variables' types, `typeOf x`, and
+-- what it gives is left to be found, `inferred MkUnit` (both the
+-- prelude's, which the type they are of decides); the functions'
+-- names, and the names bound for the values, are none the text can
+-- write (`loop#12`, by the offset of what they are of).
+
+-- | the names a `do` block is taken apart through
+type DoNames = { bind : String, pure : String }
+
+coNames : DoNames
+coNames = { bind = "bind", pure = "pure" }
+
+idNames : DoNames
+idNames = { bind = "idBind", pure = "idPure" }
+
+-- | a call of a local function above (a loop's next turn, what follows a
+-- | loop, a join point), with the variables' values: the function (and
+-- | the arguments before them), the variables, and whether the function
+-- | takes a `Unit` where there are none
+type Jump = { head : Expr, vars : List String, unit : Bool }
+
+-- | where the statements are: the names, the variables (`let mut`) in
+-- | scope, the innermost loop's `continue` and `break`, the block's span
+type DoCx =
+  { names : DoNames
+  , muts : List String
+  , loop : Maybe (Pair Jump Jump)
+  , sp : Params.Span
+  }
+
+-- | what follows the statements' end: the last one's value is the
+-- | block's (`EndValue`), or a call (`EndJump`)
+data End = EndValue | EndJump Jump
+
+-- (the variables' values passed, or a `Unit` for none)
+varArgs : Params.Span -> Bool -> List String -> List Expr
+varArgs sp True Nil = [At (ETag "MkUnit") sp]
+varArgs sp unit vars = List.map (\x -> At (EVar x) sp) vars
+
+callJump : Params.Span -> Jump -> Expr
+callJump sp j = app j.head (varArgs sp j.unit j.vars)
+
+-- | a type to be found: the prelude's `inferred MkUnit`, whose implicit
+-- | argument, the type, is left to the uses to solve
+holeE : Params.Span -> Expr
+holeE sp = app (At (EVar "inferred") sp) [At (ETag "MkUnit") sp]
+
+-- | the type of the variable `x` in scope: the prelude's `typeOf x`
+typeOfE : Params.Span -> String -> Expr
+typeOfE sp x = app (At (EVar "typeOf") sp) [At (EVar x) sp]
+
+-- (the variables as parameters, each of its variable's type where the
+-- function is defined, or a `Unit`)
+varParams : Params.Span -> Bool -> List String -> List (Pair Pat Expr)
+varParams sp True Nil = [MkPair (At (PatVar "_") sp) (At (EVar "Unit") sp)]
+varParams sp unit vars =
+  List.map (\x -> MkPair (At (PatVar x) sp) (typeOfE sp x)) vars
+
+-- | `f ps = body`, a local definition, its type to be found but for the
+-- | number of its parameters
+localFun : String -> Params.Span -> List (Pair Pat Expr) -> Expr -> Decl
+localFun f sp ps body =
   At
-    (ELetIn rhs (alt p rest))
-    { start = lsp.start, end = (Params.spanOf rest).end }
-doStep sp (At (StmtExpr e) _) rest = doBind sp e "_" sp rest
+    (DeclEquations
+       f
+       sp
+       AsDefinition
+       (List.foldr (\p t -> At (EPi (PiAnon (snd p)) t) sp) (holeE sp) ps)
+       [At (MkEquation f sp (List.map fst ps) body) sp])
+    sp
 
-doFrom : Params.Span -> List (Params.Spanned (Stmt Expr)) -> Expr -> Expr
-doFrom sp Nil e = e
-doFrom sp (Cons s rest) e = doStep sp s (doFrom sp rest e)
+-- | `let x = v in body`
+letVar : String -> Params.Span -> Expr -> Expr -> Expr
+letVar x xsp v body =
+  At
+    (ELetIn v (alt (At (PatVar x) xsp) body))
+    (spanning xsp (Params.spanOf body))
 
-doLast : Params.Span
+-- | `(e : _)`: checked at a type to be found (a tag, a record, as well
+-- | as what infers its type)
+annHole : Expr -> Expr
+annHole e = At (EAnn e (holeE (Params.spanOf e))) (Params.spanOf e)
+
+matchOf : Params.Span -> Expr -> List (Params.Spanned (Alt Expr)) -> Expr
+matchOf sp s alts = At (EMatch s alts) sp
+
+ifOf : Params.Span -> Expr -> Expr -> Expr -> Expr
+ifOf sp c a b =
+  matchOf sp c [alt (patTag "True" sp Nil) a, alt (patTag "False" sp Nil) b]
+
+pureOf : DoCx -> Params.Span -> Expr -> Expr
+pureOf cx sp v = app (At (EVar cx.names.pure) sp) [v]
+
+doBind : DoCx -> Expr -> String -> Params.Span -> Expr -> Expr
+doBind cx e x xsp rest =
+  app (At (EVar cx.names.bind) cx.sp) [e, lamName x xsp rest]
+
+badE : Params.Span -> String -> Expr
+badE sp why = At (EInvalid why) sp
+
+-- (a name of what is made at `sp`)
+madeName : String -> Params.Span -> String
+madeName what sp = what ^ "#" ^ show sp.start
+
+-- | the variables a pattern binds
+patNames : Pat -> List String
+patNames (At (PatVar x) _) = if strEq x "_" then Nil else [x]
+patNames (At (PatTag _ _ ps) _) = List.concatMap patNames ps
+patNames (At (PatOp _ _ ps) _) = List.concatMap patNames ps
+patNames (At (PatAs x _ q) _) = Cons x (patNames q)
+patNames (At (PatRecord fs) _) =
+  List.concatMap
+    (\f -> case f of
+     MkFieldPat _ q -> patNames q)
+    fs
+patNames _ = Nil
+
+isMut : DoCx -> String -> Bool
+isMut cx x = List.any (\y -> strEq x y) cx.muts
+
+-- | a name bound again that is a variable of the block: refused (what
+-- | `continue` passes on would not be the variable)
+mutClash : String -> String
+mutClash x =
+  "`"
+  ^ x
+  ^ "` is a `let mut` variable here: name what is bound another name (or set the variable, `"
+  ^ x
+  ^ " := e`)"
+
+-- (the first of the names that is a variable of the block)
+firstMut : DoCx -> List String -> Maybe String
+firstMut cx xs = List.find (\x -> isMut cx x) xs
+
+-- The expressions a statement holds, gone through in the order they are
+-- written (and run), a state threaded through them
+
+pairK : {a b c : Type} -> Pair a b -> (a -> b -> c) -> c
+pairK (MkPair x y) k = k x y
+
+-- (`y` before what `k` makes of the state)
+consAfter : {s a : Type}
+          -> Pair s a
+          -> (s -> Pair s (List a))
+          -> Pair s (List a)
+consAfter (MkPair st y) k = pairK (k st) (\st2 ys -> MkPair st2 (Cons y ys))
+
+accList : {s a : Type} -> (s -> a -> Pair s a) -> s -> List a -> Pair s (List a)
+accList f st Nil = MkPair st Nil
+accList f st (Cons x xs) = consAfter (f st x) (\st1 -> accList f st1 xs)
+
+-- | each expression held at the top of a statement, by `f`
+stmtAcc : {s : Type}
+        -> (s -> Expr -> Pair s Expr)
+        -> s
+        -> Params.Spanned (Stmt Expr)
+        -> Pair s (Params.Spanned (Stmt Expr))
+stmtAcc f st (At (StmtBind x xsp e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (StmtBind x xsp e') sp))
+stmtAcc f st (At (StmtLet p e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (StmtLet p e') sp))
+stmtAcc f st (At (StmtExpr e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (StmtExpr e') sp))
+stmtAcc f st (At (StmtLetMut x xsp e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (StmtLetMut x xsp e') sp))
+
+altAcc : {s : Type}
+       -> (s -> Expr -> Pair s Expr)
+       -> s
+       -> Params.Spanned (Alt Expr)
+       -> Pair s (Params.Spanned (Alt Expr))
+altAcc f st (At (MkAlt p e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (MkAlt p e') sp))
+
+fieldSetAcc : {s : Type}
+            -> (s -> Expr -> Pair s Expr)
+            -> s
+            -> Params.Spanned (FieldSet Expr)
+            -> Pair s (Params.Spanned (FieldSet Expr))
+fieldSetAcc f st (At (SetField x xsp e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (SetField x xsp e') sp))
+fieldSetAcc f st (At (BadFieldSet e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (BadFieldSet e') sp))
+
+updateSetAcc : {s : Type}
+             -> (s -> Expr -> Pair s Expr)
+             -> s
+             -> Params.Spanned (UpdateSet Expr)
+             -> Pair s (Params.Spanned (UpdateSet Expr))
+updateSetAcc f st (At (SetPath path e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (SetPath path e') sp))
+
+segmentAcc : {s : Type}
+           -> (s -> Expr -> Pair s Expr)
+           -> s
+           -> Params.Spanned (Segment Expr)
+           -> Pair s (Params.Spanned (Segment Expr))
+segmentAcc f st (At (MkSegment v ty size little signed) sp) =
+  pairK
+    (f st v)
+    (\st1 v' -> MkPair st1 (At (MkSegment v' ty size little signed) sp))
+
+-- | the expressions an expression holds, by `f`, in the order they are
+-- | written (a lambda's body, its own; a type, none)
+childrenAcc : {s : Type}
+            -> (s -> Expr -> Pair s Expr)
+            -> s
+            -> Expr
+            -> Pair s Expr
+childrenAcc f st (At (EApp h args) sp) =
+  pairK
+    (f st h)
+    (\st1 h' ->
+       pairK
+         (accList f st1 args)
+         (\st2 args' -> MkPair st2 (At (EApp h' args') sp)))
+childrenAcc f st (At (ENamed x e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (ENamed x e') sp))
+childrenAcc f st (At (ELam b body) sp) =
+  pairK (f st body) (\st1 body' -> MkPair st1 (At (ELam b body') sp))
+childrenAcc f st (At (EAnn e t) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (EAnn e' t) sp))
+childrenAcc f st (At (ESpec a x xsp v) sp) =
+  pairK
+    (f st a)
+    (\st1 a' ->
+       pairK (f st1 v) (\st2 v' -> MkPair st2 (At (ESpec a' x xsp v') sp)))
+childrenAcc f st (At (EStruct fs) sp) =
+  pairK
+    (accList (fieldSetAcc f) st fs)
+    (\st1 fs' -> MkPair st1 (At (EStruct fs') sp))
+childrenAcc f st (At (EUpdate a fs) sp) =
+  pairK
+    (f st a)
+    (\st1 a' ->
+       pairK
+         (accList (updateSetAcc f) st1 fs)
+         (\st2 fs' -> MkPair st2 (At (EUpdate a' fs') sp)))
+childrenAcc f st (At (EBinary segs) sp) =
+  pairK
+    (accList (segmentAcc f) st segs)
+    (\st1 segs' -> MkPair st1 (At (EBinary segs') sp))
+childrenAcc f st (At (EMatch s alts) sp) =
+  pairK
+    (f st s)
+    (\st1 s' ->
+       pairK
+         (accList (altAcc f) st1 alts)
+         (\st2 alts' -> MkPair st2 (At (EMatch s' alts') sp)))
+childrenAcc f st (At (ELetIn rhs a) sp) =
+  pairK
+    (f st rhs)
+    (\st1 rhs' ->
+       pairK (altAcc f st1 a) (\st2 a' -> MkPair st2 (At (ELetIn rhs' a') sp)))
+childrenAcc f st (At (EDo ss) sp) =
+  pairK (accList (stmtAcc f) st ss) (\st1 ss' -> MkPair st1 (At (EDo ss') sp))
+childrenAcc f st (At (EAssign x xsp e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (EAssign x xsp e') sp))
+childrenAcc f st (At (EWhile c body) sp) =
+  pairK
+    (f st c)
+    (\st1 c' ->
+       pairK
+         (accList (stmtAcc f) st1 body)
+         (\st2 body' -> MkPair st2 (At (EWhile c' body') sp)))
+childrenAcc f st (At (EFor p c body) sp) =
+  pairK
+    (f st c)
+    (\st1 c' ->
+       pairK
+         (accList (stmtAcc f) st1 body)
+         (\st2 body' -> MkPair st2 (At (EFor p c' body') sp)))
+childrenAcc f st (At (EIfThen c a) sp) =
+  pairK
+    (f st c)
+    (\st1 c' -> pairK (f st1 a) (\st2 a' -> MkPair st2 (At (EIfThen c' a') sp)))
+childrenAcc f st (At (EReturn e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (EReturn e') sp))
+childrenAcc f st (At (ENest e) sp) =
+  pairK (f st e) (\st1 e' -> MkPair st1 (At (ENest e') sp))
+childrenAcc f st e = MkPair st e
+
+-- | the expressions an expression holds, each by `f`
+mapChildren : (Expr -> Expr) -> Expr -> Expr
+mapChildren f e = snd (childrenAcc (\u c -> MkPair u (f c)) (MkUnit : Unit) e)
+
+-- | whether an expression holds `(<- c)` to bind before it (not in a
+-- | lambda or a `do` block of its own)
+hasNest : Expr -> Bool
+hasNest (At (ENest _) _) = True
+hasNest (At (ELam _ _) _) = False
+hasNest (At (EDo _) _) = False
+hasNest e = fst (childrenAcc (\b c -> MkPair (b || hasNest c) c) False e)
+
+-- What a closure may not do: in a lambda's body, `(<- c)`, `return`,
+-- `break` and `continue` (not of a `do` block of its own); in a lambda,
+-- or in a `do` block of its own, set a variable of the block around
+
+-- | the variables of the blocks around, and whether in a lambda
+type Guard = { muts : List String, inLam : Bool }
+
+-- (the variables a block declares, `let mut`)
+declaredMuts : List (Params.Spanned (Stmt Expr)) -> List String
+declaredMuts Nil = Nil
+declaredMuts (Cons (At (StmtLetMut x _ _) _) rest) = Cons x (declaredMuts rest)
+declaredMuts (Cons _ rest) = declaredMuts rest
+
+guardE : Guard -> Expr -> Expr
+guardE g (At (ENest c) sp) =
+  if g.inLam
+  then badE
+      sp
+      "`(<- c)` is in a lambda, whose body runs later, not where the statement does: bind the action's value before, `x <- c`"
+  else At (ENest (guardE g c)) sp
+guardE g (At (EReturn v) sp) =
+  if g.inLam
+  then badE
+      sp
+      "`return` is in a lambda: it ends the `do` block it is a statement of, and a lambda's body is no statement"
+  else At (EReturn (guardE g v)) sp
+guardE g (At EBreak sp) =
+  if g.inLam
+  then badE
+      sp
+      "`break` is in a lambda: a loop's statements are its body's, and a lambda's body is none of them"
+  else At EBreak sp
+guardE g (At EContinue sp) =
+  if g.inLam
+  then badE
+      sp
+      "`continue` is in a lambda: a loop's statements are its body's, and a lambda's body is none of them"
+  else At EContinue sp
+guardE g (At (EAssign x xsp v) sp) =
+  if List.any (\y -> strEq x y) g.muts
+  then badE
+      xsp
+      ("`"
+       ^ x
+       ^ "` is a `let mut` variable of the `do` block around: a closure (a lambda, or a `do` block of its own) holds its value, and cannot set it")
+  else At (EAssign x xsp (guardE g v)) sp
+guardE g (At (ELam b body) sp) =
+  At (ELam b (guardE { muts = g.muts, inLam = True } body)) sp
+guardE g (At (EDo ss) sp) =
+  mapChildren
+    (guardE
+       { muts =
+           List.filter
+             (\x -> not (List.any (\y -> strEq x y) (declaredMuts ss)))
+             g.muts
+       , inLam = False
+       })
+    (At (EDo ss) sp)
+guardE g e = mapChildren (guardE g) e
+
+-- The values of actions, `(<- c)`, bound before what holds them: a
+-- statement's are bound before it, in the order they are written (each
+-- a name and the action, the last first)
+
+type Bound = List (Pair String Expr)
+
+-- | `binds`, each around the next, `inner` innermost
+wrapBinds : DoCx -> Bound -> Expr -> Expr
+wrapBinds cx binds inner =
+  List.foldl
+    (\acc b -> doBind cx (snd b) (fst b) (Params.spanOf (snd b)) acc)
+    inner
+    binds
+
+-- | an arm as an action of its own: its `(<- c)` bound at its start
+-- | (by `lift`), then `pure` of it
+asAction : (Bound -> Expr -> Pair Bound Expr) -> DoCx -> Expr -> Expr
+asAction lift cx b =
+  pairK
+    (lift Nil b)
+    (\bs b' -> wrapBinds cx bs (pureOf cx (Params.spanOf b') b'))
+
+altHasNest : Params.Spanned (Alt Expr) -> Bool
+altHasNest (At (MkAlt _ b) _) = hasNest b
+
+-- (an arm made by `f`)
+altBy : (Expr -> Expr) -> Params.Spanned (Alt Expr) -> Params.Spanned (Alt Expr)
+altBy f (At (MkAlt p b) sp) = At (MkAlt p (f b)) sp
+
+-- | an expression's `(<- c)` lifted out of it, the guard said for its
+-- | lambdas and `do` blocks of their own: what to bind before it, and it
+type Lift = { cx : DoCx, guard : Guard }
+
+liftE : Lift -> Bound -> Expr -> Pair Bound Expr
+liftE l acc (At (ENest c) sp) =
+  pairK
+    (liftE l acc c)
+    (\acc1 c' ->
+       MkPair
+         (Cons (MkPair (madeName "v" sp) c') acc1)
+         (At (EVar (madeName "v" sp)) sp))
+liftE l acc (At (ELam b body) sp) =
+  MkPair acc (guardE l.guard (At (ELam b body) sp))
+liftE l acc (At (EDo ss) sp) = MkPair acc (guardE l.guard (At (EDo ss) sp))
+-- (an arm that holds one is an action of its own, `pure` the others':
+-- the whole, the statement's `(<- ...)`)
+liftE l acc (At (EMatch s alts) sp) =
+  pairK
+    (liftE l acc s)
+    (\acc1 s' ->
+       if List.any altHasNest alts
+       then MkPair
+           (Cons
+              (MkPair
+                 (madeName "v" sp)
+                 (At
+                    (EMatch
+                       s'
+                       (List.map (altBy (asAction (liftE l) l.cx)) alts))
+                    sp))
+              acc1)
+           (At (EVar (madeName "v" sp)) sp)
+       else pairK
+           (accList (altAcc (liftE l)) acc1 alts)
+           (\acc2 alts' -> MkPair acc2 (At (EMatch s' alts') sp)))
+liftE l acc (At (ELetIn rhs (At (MkAlt p body) asp)) sp) =
+  pairK
+    (liftE l acc rhs)
+    (\acc1 rhs' ->
+       if hasNest body
+       then MkPair
+           (Cons
+              (MkPair
+                 (madeName "v" sp)
+                 (At
+                    (ELetIn
+                       rhs'
+                       (At (MkAlt p (asAction (liftE l) l.cx body)) asp))
+                    sp))
+              acc1)
+           (At (EVar (madeName "v" sp)) sp)
+       else pairK
+           (liftE l acc1 body)
+           (\acc2 body' ->
+              MkPair acc2 (At (ELetIn rhs' (At (MkAlt p body') asp)) sp)))
+liftE l acc e = childrenAcc (liftE l) acc e
+
+-- | `k` of the expression, its `(<- c)` bound before
+hoist : DoCx -> Expr -> (Expr -> Expr) -> Expr
+hoist cx e k =
+  pairK
+    (liftE { cx = cx, guard = { muts = cx.muts, inLam = False } } Nil e)
+    (\bs e' -> wrapBinds cx bs (k e'))
+
+-- Statements
+
+-- | an arm's statements: a `do` block's, or the one
+armStmts : Expr -> List (Params.Spanned (Stmt Expr))
+armStmts (At (EDo ss) _) = ss
+armStmts e = [At (StmtExpr e) (Params.spanOf e)]
+
+-- (whether a statement of an arm does what an action cannot: `ctl`,
+-- `isControl`)
+stmtNeeds : (Expr -> Bool) -> Params.Spanned (Stmt Expr) -> Bool
+stmtNeeds ctl (At (StmtExpr e) _) = ctl e || hasNest e
+stmtNeeds ctl (At (StmtBind _ _ e) _) = hasNest e
+stmtNeeds ctl (At (StmtLet _ e) _) = hasNest e
+stmtNeeds ctl (At (StmtLetMut _ _ _) _) = True
+
+armNeeds : (Expr -> Bool) -> Params.Spanned (Alt Expr) -> Bool
+armNeeds ctl (At (MkAlt _ b) _) = List.any (stmtNeeds ctl) (armStmts b)
+
+-- | whether a statement is one of the block's own (not an action): `x :=
+-- | e`, a loop, a jump, `return`, an `if` without `else`, an `if` or a
+-- | `case` whose arms are
+isControl : Expr -> Bool
+isControl (At (EAssign _ _ _) _) = True
+isControl (At (EWhile _ _) _) = True
+isControl (At (EFor _ _ _) _) = True
+isControl (At (EIfThen _ _) _) = True
+isControl (At EBreak _) = True
+isControl (At EContinue _) = True
+isControl (At (EReturn _) _) = True
+isControl (At (EMatch _ alts) _) = List.any (armNeeds isControl) alts
+isControl _ = False
+
+-- | an arm of an `if` or a `case` of statements: its pattern, its
+-- | statements
+altStmts : Params.Spanned (Alt Expr)
+         -> Pair Pat (List (Params.Spanned (Stmt Expr)))
+altStmts (At (MkAlt p b) _) = MkPair p (armStmts b)
+
+-- | the statements, taken apart, knotted
+type DoT = { stmts : DoCx -> List (Params.Spanned (Stmt Expr)) -> End -> Expr }
+
+-- | what the statements' end leads to
+endOf : DoCx -> Params.Span -> End -> Expr
+endOf cx sp EndValue = pureOf cx sp (At (ETag "MkUnit") sp)
+endOf cx sp (EndJump j) = callJump sp j
+
+withMut : DoCx -> String -> DoCx
+withMut cx x =
+  { names = cx.names
+  , muts = List.append cx.muts [x]
+  , loop = cx.loop
+  , sp = cx.sp
+  }
+
+withLoop : DoCx -> Jump -> Jump -> DoCx
+withLoop cx cont brk =
+  { names = cx.names
+  , muts = cx.muts
+  , loop = Just (MkPair cont brk)
+  , sp = cx.sp
+  }
+
+-- | `break` or `continue`: the call it is, the last of its statements
+jumpTo : Params.Span
        -> List (Params.Spanned (Stmt Expr))
-       -> Params.Spanned (Stmt Expr)
-       -> Maybe Expr
-doLast sp init (At (StmtExpr e) _) = Just (doFrom sp init e)
-doLast sp init _ = Nothing
+       -> Maybe Jump
+       -> String
+       -> Expr
+jumpTo sp (Cons s _) j what =
+  badE
+    (Params.spanOf s)
+    ("nothing after " ^ what ^ " runs: it is the last statement")
+jumpTo sp Nil (Just j) what = callJump sp j
+jumpTo sp Nil Nothing what =
+  badE sp (what ^ " is in a loop only: `while c do ...`, `for x in e do ...`")
 
-doBlock : Params.Span -> List (Params.Spanned (Stmt Expr)) -> Maybe Expr
-doBlock sp stmts = case List.reverse stmts of
-  Nil -> Nothing
-  Cons last init -> doLast sp (List.reverse init) last
+continueOf : Maybe (Pair Jump Jump) -> Maybe Jump
+continueOf (Just (MkPair c b)) = Just c
+continueOf Nothing = Nothing
+
+breakOf : Maybe (Pair Jump Jump) -> Maybe Jump
+breakOf (Just (MkPair c b)) = Just b
+breakOf Nothing = Nothing
+
+-- | an arm of an `if` or a `case` of statements: its pattern, and its
+-- | statements up to `end`
+armT : DoT
+     -> DoCx
+     -> End
+     -> Pair Pat (List (Params.Spanned (Stmt Expr)))
+     -> Params.Spanned (Alt Expr)
+armT t cx end (MkPair p ss) = case firstMut cx (patNames p) of
+  Just x -> alt p (badE (Params.spanOf p) (mutClash x))
+  Nothing -> alt p (t.stmts cx ss end)
+
+-- | whether statements may reach their end: not if the last is a jump,
+-- | `return`, or an `if` or a `case` of statements none of whose arms
+-- | does (`isControl`'s)
+stmtsFall : List (Params.Spanned (Stmt Expr)) -> Bool
+stmtsFall ss = case List.last ss of
+  Just (At (StmtExpr e) _) -> exprFalls e
+  _ -> True
+  where
+  exprFalls : Expr -> Bool
+  exprFalls (At EBreak _) = False
+  exprFalls (At EContinue _) = False
+  exprFalls (At (EReturn _) _) = False
+  exprFalls (At (EMatch s alts) sp) =
+    not (isControl (At (EMatch s alts) sp))
+    || List.any (\a -> stmtsFall (snd (altStmts a))) alts
+  exprFalls _ = True
+
+-- (an arm that reaches its end and binds nothing the statements after
+-- it could see: they may go on in it)
+bindsNothing : Pair Pat (List (Params.Spanned (Stmt Expr))) -> Bool
+bindsNothing (MkPair p ss) =
+  List.null (patNames p)
+  && List.all
+    (\s -> case s of
+     At (StmtExpr _) _ -> True
+     _ -> False)
+    ss
+
+-- (one arm reaches its end, and binds nothing)
+oneFalls : List (Pair Pat (List (Params.Spanned (Stmt Expr)))) -> Bool
+oneFalls (Cons a Nil) = bindsNothing a
+oneFalls _ = False
+
+-- (the arm `rest` goes on in, or another)
+armOn : DoT
+      -> DoCx
+      -> List (Params.Spanned (Stmt Expr))
+      -> End
+      -> Pair Pat (List (Params.Spanned (Stmt Expr)))
+      -> Params.Spanned (Alt Expr)
+armOn t cx rest end (MkPair p ss) =
+  if stmtsFall ss then armT t cx end (MkPair p (List.append ss rest))
+  else armT t cx end (MkPair p ss)
+
+-- | an `if` or a `case` of statements: each arm up to what follows it, a
+-- | join point of the variables, called at the end of each arm that
+-- | reaches it -- but where one arm alone does, and binds nothing,
+-- | what follows goes on in it (`if c then continue` is an `else`)
+condT : DoT
+      -> DoCx
+      -> Params.Span
+      -> Expr
+      -> List (Pair Pat (List (Params.Spanned (Stmt Expr))))
+      -> List (Params.Spanned (Stmt Expr))
+      -> End
+      -> Expr
+condT t cx sp s arms Nil end =
+  hoist cx s (\s' -> matchOf sp s' (List.map (armT t cx end) arms))
+condT t cx sp s arms rest end =
+  if oneFalls (List.filter (\a -> stmtsFall (snd a)) arms)
+  then hoist cx s (\s' -> matchOf sp s' (List.map (armOn t cx rest end) arms))
+  else hoist
+      cx
+      s
+      (\s' ->
+         At
+           (ELocal
+              (matchOf
+                 sp
+                 s'
+                 (List.map
+                    (armT
+                       t
+                       cx
+                       (EndJump
+                          { head = At (EVar (madeName "join" sp)) sp
+                          , vars = cx.muts
+                          , unit = True
+                          }))
+                    arms))
+              [ localFun
+                (madeName "join" sp)
+                sp
+                (varParams sp True cx.muts)
+                (t.stmts cx rest end)
+              ])
+           sp)
+
+-- | `while c do body`: `loop`, the next turn, and `after`, what follows
+whileT : DoT
+       -> DoCx
+       -> Params.Span
+       -> Expr
+       -> List (Params.Spanned (Stmt Expr))
+       -> List (Params.Spanned (Stmt Expr))
+       -> End
+       -> Expr
+whileT t cx sp c body rest end =
+  At
+    (ELocal
+       (callJump sp loopJ)
+       [ localFun
+         (madeName "after" sp)
+         sp
+         (varParams sp True cx.muts)
+         (t.stmts cx rest end)
+       , localFun
+         (madeName "loop" sp)
+         sp
+         (varParams sp True cx.muts)
+         (hoist
+            cx
+            c
+            (\c' ->
+               ifOf
+                 sp
+                 c'
+                 (t.stmts (withLoop cx loopJ afterJ) body (EndJump loopJ))
+                 (callJump sp afterJ)))
+       ])
+    sp
+  where
+  loopJ : Jump
+  loopJ =
+    { head = At (EVar (madeName "loop" sp)) sp, vars = cx.muts, unit = True }
+  afterJ : Jump
+  afterJ =
+    { head = At (EVar (madeName "after" sp)) sp, vars = cx.muts, unit = True }
+
+-- | `for p in e do body`: `e` bound once, its `Iterate` found for it,
+-- | `loop` of the cursor and the variables, `after` of the variables
+forT : DoT
+     -> DoCx
+     -> Params.Span
+     -> Pat
+     -> Expr
+     -> List (Params.Spanned (Stmt Expr))
+     -> List (Params.Spanned (Stmt Expr))
+     -> End
+     -> Expr
+forT t cx sp p coll body rest end =
+  hoist
+    cx
+    coll
+    (\c' ->
+       letVar
+         (madeName "coll" sp)
+         sp
+         (annHole c')
+         (letVar
+            (madeName "next" sp)
+            sp
+            (app it [At (EProject "next") sp])
+            (At
+               (ELocal
+                  (app
+                     (var "loop")
+                     (Cons
+                        (app it [At (EProject "start") sp, var "coll"])
+                        (varArgs sp False cx.muts)))
+                  [ localFun
+                    (madeName "after" sp)
+                    sp
+                    (varParams sp True cx.muts)
+                    (t.stmts cx rest end)
+                  , localFun
+                    (madeName "loop" sp)
+                    sp
+                    (Cons
+                       (MkPair
+                          (At (PatVar (madeName "cursor" sp)) sp)
+                          (app it [At (EProject "Cursor") sp]))
+                       (varParams sp False cx.muts))
+                    (matchOf
+                       sp
+                       (app (var "next") [var "cursor"])
+                       [ alt (patTag "Nothing" sp Nil) (callJump sp afterJ)
+                       , alt
+                             (patTag
+                                "Just"
+                                sp
+                                [ patTag
+                                  "MkPair"
+                                  sp
+                                  [p, At (PatVar (madeName "rest" sp)) sp]
+                                ]) (case firstMut cx (patNames p) of
+                           Just x -> badE (Params.spanOf p) (mutClash x)
+                           Nothing ->
+                             t.stmts
+                               (withLoop cx nextJ afterJ)
+                               body
+                               (EndJump nextJ))
+                       ])
+                  ])
+               sp)))
+  where
+  var : String -> Expr
+  var what = At (EVar (madeName what sp)) sp
+  -- (the collection's `Iterate`, found where each use is: the instance
+  -- itself, so that its `Elem` is the type it says; its `next` is bound
+  -- once, outside the loop, which then holds no collection)
+  it : Expr
+  it = app (At (EVar "iterateOf") sp) [var "coll"]
+  afterJ : Jump
+  afterJ = { head = var "after", vars = cx.muts, unit = True }
+  nextJ : Jump
+  nextJ = { head = app (var "loop") [var "rest"], vars = cx.muts, unit = False }
+
+-- | a statement of the block's own (`isControl`), and the statements
+-- | after it
+controlT : DoT
+         -> DoCx
+         -> Expr
+         -> List (Params.Spanned (Stmt Expr))
+         -> End
+         -> Expr
+controlT t cx (At (EAssign x xsp v) sp) rest end =
+  if isMut cx x
+  then hoist
+      cx
+      v
+      (\v' ->
+         letVar
+           x
+           xsp
+           (At (EAnn v' (typeOfE xsp x)) (Params.spanOf v'))
+           (t.stmts cx rest end))
+  else badE
+      xsp
+      ("`"
+       ^ x
+       ^ "` is not a `let mut` variable: only one is set, `let mut "
+       ^ x
+       ^ " = e`")
+controlT t cx (At EBreak sp) rest end =
+  jumpTo sp rest (breakOf cx.loop) "`break`"
+controlT t cx (At EContinue sp) rest end =
+  jumpTo sp rest (continueOf cx.loop) "`continue`"
+controlT t cx (At (EReturn v) sp) (Cons s _) end =
+  badE (Params.spanOf s) "nothing after `return` runs: it is the last statement"
+controlT t cx (At (EReturn v) sp) Nil end = hoist cx v (\v' -> pureOf cx sp v')
+controlT t cx (At (EWhile c body) sp) rest end = whileT t cx sp c body rest end
+controlT t cx (At (EFor p c body) sp) rest end = forT t cx sp p c body rest end
+controlT t cx (At (EIfThen c a) sp) rest end =
+  condT
+    t
+    cx
+    sp
+    c
+    [ MkPair (patTag "True" sp Nil) (armStmts a)
+    , MkPair (patTag "False" sp Nil) Nil
+    ]
+    rest
+    end
+controlT t cx (At (EMatch s alts) sp) rest end =
+  condT
+    t
+    cx
+    sp
+    s
+    (List.map altStmts alts)
+    rest
+    end
+controlT t cx e rest end =
+  hoist cx e (\e' -> doBind cx e' "_" cx.sp (t.stmts cx rest end))
+
+-- | the last statement, whose value is the block's
+lastT : DoT -> DoCx -> Params.Spanned (Stmt Expr) -> Expr
+lastT t cx (At (StmtExpr e) sp) =
+  if isControl e then controlT t cx e Nil EndValue else hoist cx e (\e' -> e')
+lastT t cx (At _ sp) = badE sp "a `do` block ends with an expression"
+
+-- | `let p = e` and the statements after it, `body`
+letStmt : Params.Span -> Expr -> Pat -> Expr -> Expr
+letStmt lsp e p body =
+  At
+    (ELetIn e (alt p body))
+    { start = lsp.start, end = (Params.spanOf body).end }
+
+-- | a statement, and the statements after it
+stmtT : DoT
+      -> DoCx
+      -> Params.Spanned (Stmt Expr)
+      -> List (Params.Spanned (Stmt Expr))
+      -> End
+      -> Expr
+stmtT t cx (At (StmtBind x xsp e) sp) rest end =
+  if isMut cx x then badE xsp (mutClash x)
+  else hoist cx e (\e' -> doBind cx e' x xsp (t.stmts cx rest end))
+stmtT t cx (At (StmtLet p e) lsp) rest end = case firstMut cx (patNames p) of
+  Just x -> badE (Params.spanOf p) (mutClash x)
+  Nothing -> hoist cx e (\e' -> letStmt lsp e' p (t.stmts cx rest end))
+stmtT t cx (At (StmtLetMut x xsp e) sp) rest end =
+  if isMut cx x then badE xsp (mutClash x)
+  else hoist
+      cx
+      e
+      (\e' -> letVar x xsp (annHole e') (t.stmts (withMut cx x) rest end))
+stmtT t cx (At (StmtExpr e) sp) rest end =
+  if isControl e then controlT t cx e rest end
+  else hoist cx e (\e' -> doBind cx e' "_" cx.sp (t.stmts cx rest end))
+
+stmtsF : DoT -> DoCx -> List (Params.Spanned (Stmt Expr)) -> End -> Expr
+stmtsF t cx Nil end = endOf cx cx.sp end
+stmtsF t cx (Cons s Nil) EndValue = lastT t cx s
+stmtsF t cx (Cons s rest) end = stmtT t cx s rest end
+
+doT : DoT
+doT = { stmts = \cx ss end -> stmtsF doT cx ss end }
+
+-- (a block ends with an expression)
+endsWell : List (Params.Spanned (Stmt Expr)) -> Bool
+endsWell ss = case List.last ss of
+  Just (At (StmtExpr _) _) -> True
+  _ -> False
+
+-- | a `do` block, taken apart through `names`; nothing, if it does not
+-- | end with an expression
+doBlock : DoNames
+        -> Params.Span
+        -> List (Params.Spanned (Stmt Expr))
+        -> Maybe Expr
+doBlock names sp stmts =
+  if endsWell stmts
+  then Just
+      (doT.stmts
+         { names = names, muts = Nil, loop = Nothing, sp = sp }
+         stmts
+         EndValue)
+  else Nothing
+
+-- | `run do ...`: the block through the identity monad's names
+runArgs : Expr -> List Expr -> List Expr
+runArgs (At (EVar f) _) (Cons (At (EDo ss) dsp) Nil) =
+  if strEq f "run"
+  then [ fromMaybe
+         (badE dsp "a `do` block ends with an expression")
+         (doBlock idNames dsp ss)
+       ]
+  else [At (EDo ss) dsp]
+runArgs h args = args
 
 -- | a term in the judgment it is elaborated by
 data Classified
@@ -994,7 +1908,7 @@ classifyTermF r (At (EString x) sp) = IsInferable (At (IString x) sp)
 classifyTermF r (At (EBinary segs) sp) = binaryOf r segs sp
 classifyTermF r (At (ERune c) sp) = IsInferable (At (IRune c) sp)
 classifyTermF r (At (EWord w) sp) = wordOf w sp
-classifyTermF r (At (EApp h args) sp) = appOf r h args sp
+classifyTermF r (At (EApp h args) sp) = appOf r h (runArgs h args) sp
 classifyTermF r (At (EPi b cod) sp) =
   IsType (At (TPi (piBinderOf r b) (typeForm r cod)) sp)
 classifyTermF r (At (ELam (LamName x xsp) body) sp) =
@@ -1019,12 +1933,54 @@ classifyTermF r (At (EMatch s alts) sp) =
   IsCheckable (At (CMatch (inferable r s) (List.map (altOf r) alts)) sp)
 classifyTermF r (At (ELetIn rhs a) sp) =
   IsCheckable (At (CLetIn (inferable r rhs) (altOf r a)) sp)
-classifyTermF r (At (EDo stmts) sp) = case doBlock sp stmts of
+classifyTermF r (At (EDo stmts) sp) = case doBlock coNames sp stmts of
   Just e' -> r.e e'
   Nothing -> IsInferable (invalid 12 "a `do` block ends with an expression" sp)
 classifyTermF r (At (ELocal body ds) sp) =
   IsCheckable (At (CLocal (checkable r body) (List.map r.decl ds)) sp)
 classifyTermF r (At (EInvalid why) sp) = IsInferable (invalid 3 why sp)
+classifyTermF r (At (EAssign x _ _) sp) =
+  IsInferable
+    (invalid
+       3
+       ("`"
+        ^ x
+        ^ " := e` sets a `let mut` variable: it is a statement of a `do` block")
+       sp)
+classifyTermF r (At (EWhile _ _) sp) =
+  IsInferable (invalid 3 "a `while` loop is a statement of a `do` block" sp)
+classifyTermF r (At (EFor _ _ _) sp) =
+  IsInferable (invalid 3 "a `for` loop is a statement of a `do` block" sp)
+classifyTermF r (At (EIfThen _ _) sp) =
+  IsInferable
+    (invalid
+       3
+       "an `if` without `else` is a statement of a `do` block: a value's has an `else`"
+       sp)
+classifyTermF r (At EBreak sp) =
+  IsInferable
+    (invalid
+       3
+       "`break` is a statement of a loop's body: `while c do ...`, `for x in e do ...`"
+       sp)
+classifyTermF r (At EContinue sp) =
+  IsInferable
+    (invalid
+       3
+       "`continue` is a statement of a loop's body: `while c do ...`, `for x in e do ...`"
+       sp)
+classifyTermF r (At (EReturn _) sp) =
+  IsInferable
+    (invalid
+       3
+       "`return e` ends a `do` block as one of its statements (or an arm of its `if` or `case`), not as a value"
+       sp)
+classifyTermF r (At (ENest _) sp) =
+  IsInferable
+    (invalid
+       3
+       "`(<- c)`, the value of an action, is in a statement of a `do` block"
+       sp)
 classifyTermF r (At _ sp) = IsInferable (invalid 3 "unexpected notation" sp)
 
 paramOf : Classifier

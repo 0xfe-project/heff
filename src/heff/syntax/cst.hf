@@ -95,6 +95,23 @@ data E
   -- | `let p : T = e in e'`, the annotation and the body each perhaps
   -- | not there (a `do` block's `let p = e` has no body)
   | ELet T Pat (Maybe (Pair T E)) T E (Maybe (Pair T E))
+  -- | `let mut x = e`, a `do` block's variable: `let`, `mut`, the name,
+  -- | the annotation if any, `=`, what it is first
+  | ELetMut T T T (Maybe (Pair T E)) T E
+  -- | `x := e`, a `let mut` variable set
+  | EAssign T T E
+  -- | `while c do` and its statements
+  | EWhile T E T (List E)
+  -- | `for p in e do` and its statements
+  | EFor T Pat T E T (List E)
+  -- | `break`, `continue`
+  | EJump T
+  -- | `return e`
+  | EReturn T E
+  -- | `(<- c)`: the value of an action, where it is used
+  | ENest T T E T
+  -- | `if c then s`, a statement with no `else`
+  | IfThen T E T E
 
 -- | a theory's field, `x : A`, and its default, `= d`, if it has one
 data TF = MkTF T T E (Maybe (Pair T E))
@@ -489,6 +506,16 @@ type Gram =
   , ifE : P E
   , doE : P E
   , letE : P E
+  -- | an expression a block does not follow as an argument (what a loop
+  -- | goes on while, or through, before its `do`)
+  , head : P E
+  -- | a statement of a `do` block, and an arm of a statement's `if` or
+  -- | `case` (a statement that binds nothing)
+  , stmt : P E
+  , arm : P E
+  -- | whether a `do` block may be an application's last argument, `run
+  -- | do ...` (not in a loop's head: its `do` is the loop's)
+  , blockArg : Bool
   }
 
 exprHead : Gram -> T -> P E
@@ -498,6 +525,15 @@ exprHead g t =
   else if isKw t "if" then g.ifE
   else if isKw t "do" then g.doE
   else if isKw t "let" then g.letE
+  else if isKw t "break" || isKw t "continue"
+  then do
+    kw <- next
+    pure (EJump kw)
+  else if isKw t "return"
+  then do
+    kw <- next
+    e <- g.expr
+    pure (EReturn kw e)
   else g.opExpr 0
 
 exprF : Gram -> P E
@@ -561,12 +597,19 @@ userOpsF g = do
   rest <- operandsF g Nil
   pure (if List.null rest then e0 else Ops e0 rest)
 
--- | application: a head and its arguments
+-- | application: a head and its arguments, the last perhaps a `do`
+-- | block (`run do ...`)
 appF : Gram -> P E
 appF g = do
   h <- g.atom
   args <- many g.atom
-  pure (if List.null args then h else App h args)
+  t <- peek
+  b <- atBoundary
+  if g.blockArg && isKw t "do" && not b
+    then do
+      d <- g.doE
+      pure (App h (List.append args (Cons d Nil)))
+    else pure (if List.null args then h else App h args)
 
 fieldsGo : E -> P E
 fieldsGo e = do
@@ -696,6 +739,12 @@ parensF g = do
         op <- next
         c <- next
         pure (EParen o (Atom op) c)
+      else if isKind t "sym" && isText t "<-"
+      then do
+        arrow <- next
+        e <- g.expr
+        c <- expectPunct ")"
+        pure (ENest o arrow e c)
       else if (isKind t "var" || isKind t "con")
               && isKind t2 "sym"
               && isText t2 ":="
@@ -944,24 +993,117 @@ letStmtF g = do
   t <- peek
   if isKw t "in" then letBodyF g kw h else pure (letOf kw h Nothing)
 
--- | `x <- e`, `let p = e`, or `e`
-statementF : Gram -> P E
-statementF g = do
+-- | `let mut x = e` in a `do` block
+letMutF : Gram -> P E
+letMutF g = do
+  kw <- next
+  m <- next
+  x <- expectKind "var" "a variable's name"
+  t <- peek
+  ann <-
+    if isKind t "sym" && isAnnText t.text
+    then do
+      cc <- next
+      ty <- g.expr
+      pure (Just (MkPair cc ty))
+    else pure Nothing
+  eq <- expectSym "="
+  e <- g.expr
+  pure (ELetMut kw m x ann eq e)
+
+-- | `x := e`
+assignF : Gram -> P E
+assignF g = do
+  x <- next
+  k <- next
+  e <- g.expr
+  pure (EAssign x k e)
+
+-- | `if c then s`, and `else s'` if there is one
+ifStmtF : Gram -> P E
+ifStmtF g = do
+  kw <- next
+  c <- g.expr
+  th <- expectKw "then"
+  a <- g.arm
+  t <- peek
+  b <- atBoundary
+  if isKw t "else" && not b
+    then do
+      el <- next
+      e <- g.arm
+      pure (If kw c th a el e)
+    else pure (IfThen kw c th a)
+
+-- | `case e of` and its alternatives, each a statement's arm
+caseStmtF : Gram -> P E
+caseStmtF g = do
+  kw <- next
+  scrut <- g.expr
+  o <- expectKw "of"
+  alts <-
+    block (do
+    p <- g.pattern
+    arrow <- expectSym "->"
+    e <- g.arm
+    pure (EAlt p arrow e))
+  pure (Case kw scrut o alts)
+
+-- | `while c do` and its statements
+whileF : Gram -> P E
+whileF g = do
+  kw <- next
+  c <- g.head
+  d <- expectKw "do"
+  body <- block g.stmt
+  pure (EWhile kw c d body)
+
+-- | `for p in e do` and its statements
+forF : Gram -> P E
+forF g = do
+  kw <- next
+  p <- g.pattern
+  i <- expectKw "in"
+  c <- g.head
+  d <- expectKw "do"
+  body <- block g.stmt
+  pure (EFor kw p i c d body)
+
+-- | an arm of a statement's `if` or `case`: a statement that binds
+-- | nothing (`x := e`, an `if` or `case` of such arms, `break`, `return
+-- | e`, a `do` block of statements, an action)
+armF : Gram -> P E
+armF g = do
   t <- peek
   t2 <- peekAt 1
-  if isKw t "let" then letStmtF g
+  if isKw t "if" then ifStmtF g
+    else if isKw t "case" then caseStmtF g
+    else if isKind t "var" && isKind t2 "sym" && isText t2 ":=" then assignF g
+    else g.expr
+
+-- | a statement of a `do` block: `x <- e`, `let p = e`, `let mut x = e`,
+-- | a loop, or an arm's (`x := e`, `if` and `case` of statements' arms,
+-- | `break`, `continue`, `return e`, an action)
+stmtF : Gram -> P E
+stmtF g = do
+  t <- peek
+  t2 <- peekAt 1
+  if isKw t "let" && isKw t2 "mut" then letMutF g
+    else if isKw t "let" then letStmtF g
+    else if isKw t "while" then whileF g
+    else if isKw t "for" then forF g
     else if isKind t "var" && isText t2 "<-"
     then do
       x <- next
       arrow <- next
       e <- g.expr
       pure (ESBind x arrow e)
-    else g.expr
+    else armF g
 
 doExprF : Gram -> P E
 doExprF g = do
   kw <- next
-  stmts <- block (statementF g)
+  stmts <- block g.stmt
   pure (Do kw stmts)
 
 -- | `x = p` in a record pattern
@@ -1058,6 +1200,28 @@ patAtomF g = do
         (diag (spanOf t) "a pattern negates only a number, its sign: `-1`")
     else throwP (diag (spanOf t) ("expected a pattern, not " ^ shown t))
 
+-- (a loop's head: no `do` block an argument in it)
+headGram : Gram
+headGram =
+  { expr = \st -> exprF headGram st
+  , opExpr = \minPrec st -> opExprF headGram minPrec st
+  , userOps = \st -> userOpsF headGram st
+  , app = \st -> appF headGram st
+  , atom = \st -> atomF headGram st
+  , pattern = \st -> patternF headGram st
+  , patHead = \st -> patHeadF headGram st
+  , patAtom = \st -> patAtomF headGram st
+  , lambda = \st -> lambdaF headGram st
+  , caseE = \st -> caseExprF headGram st
+  , ifE = \st -> ifExprF headGram st
+  , doE = \st -> doExprF headGram st
+  , letE = \st -> letExprF headGram st
+  , head = \st -> exprF headGram st
+  , stmt = \st -> stmtF headGram st
+  , arm = \st -> armF headGram st
+  , blockArg = False
+  }
+
 gram : Gram
 gram =
   { expr = \st -> exprF gram st
@@ -1073,6 +1237,10 @@ gram =
   , ifE = \st -> ifExprF gram st
   , doE = \st -> doExprF gram st
   , letE = \st -> letExprF gram st
+  , head = \st -> exprF headGram st
+  , stmt = \st -> stmtF gram st
+  , arm = \st -> armF gram st
+  , blockArg = True
   }
 
 -- The declarations
@@ -1480,6 +1648,14 @@ firstE (If kw c th a el b) = kw
 firstE (Do kw stmts) = kw
 firstE (ESBind x arrow e) = x
 firstE (ELet kw p ann eq e body) = kw
+firstE (ELetMut kw m x ann eq e) = kw
+firstE (EAssign x k e) = x
+firstE (EWhile kw c d body) = kw
+firstE (EFor kw p i c d body) = kw
+firstE (EJump kw) = kw
+firstE (EReturn kw e) = kw
+firstE (ENest o arrow e c) = o
+firstE (IfThen kw c th a) = kw
 
 lastE : E -> T
 lastE (Atom t) = t
@@ -1530,6 +1706,20 @@ lastE (ELet kw p ann eq e body) =
   (case body of
    Just (MkPair i b) -> lastE b
    Nothing -> lastE e)
+lastE (ELetMut kw m x ann eq e) = lastE e
+lastE (EAssign x k e) = lastE e
+lastE (EWhile kw c d body) =
+  (case List.last body of
+   Just e -> lastE e
+   Nothing -> d)
+lastE (EFor kw p i c d body) =
+  (case List.last body of
+   Just e -> lastE e
+   Nothing -> d)
+lastE (EJump kw) = kw
+lastE (EReturn kw e) = lastE e
+lastE (ENest o arrow e c) = c
+lastE (IfThen kw c th a) = lastE a
 
 -- (`lastE` of the element, if there is one; the fallback otherwise)
 lastEOr : T -> Maybe E -> T
@@ -1671,6 +1861,32 @@ tsE (ELet kw p ann eq e body) =
              (List.append (tsE e) (case body of
               Just (MkPair i b) -> Cons i (tsE b)
               Nothing -> Nil)))))
+
+tsE (ELetMut kw m x ann eq e) =
+  Cons
+    kw
+    (Cons
+       m
+       (Cons
+          x
+          (List.append
+             (case ann of
+              Just (MkPair cc ty) -> Cons cc (tsE ty)
+              Nothing -> Nil)
+             (Cons eq (tsE e)))))
+tsE (EAssign x k e) = Cons x (Cons k (tsE e))
+tsE (EWhile kw c d body) =
+  Cons kw (List.append (tsE c) (Cons d (List.concatMap tsE body)))
+tsE (EFor kw p i c d body) =
+  Cons
+    kw
+    (List.append
+       (tsP p)
+       (Cons i (List.append (tsE c) (Cons d (List.concatMap tsE body)))))
+tsE (EJump kw) = Cons kw Nil
+tsE (EReturn kw e) = Cons kw (tsE e)
+tsE (ENest o arrow e c) = Cons o (Cons arrow (List.append (tsE e) (Cons c Nil)))
+tsE (IfThen kw c th a) = Cons kw (List.append (tsE c) (Cons th (tsE a)))
 
 tsTF : TF -> List T
 tsTF (MkTF x cc ty Nothing) = Cons x (Cons cc (tsE ty))

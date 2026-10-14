@@ -131,7 +131,11 @@ its name or by an alias, the prelude in every module -- but not in
 those that import them.  Of the instances in scope, exactly one must be
 of the type an instance argument wants: none is an error (E0341), and
 so is more than one (E0342), whatever their values, so that an import
-may make an error of a search, never another answer.
+may make an error of a search, never another answer.  A type wanted
+that is not known whole waits until it is, and is searched for as soon
+as it is, so that what the instance found says (its type members: a
+`for x in xs` over a `List Int` finds `Iterate (List Int)`, whose `Elem`
+is `Int`) is known to what follows; one never known is E0340.
 
 An instance's type may take implicit and instance arguments before what
 it is an instance of: `instance instanceEqualityList : {a : Type} ->
@@ -616,6 +620,76 @@ compared by `bytesEq`; a float's bits read by `floatOfBits`, a code
 point's by the prelude's `bytesUtf8At` and the like), and then the
 names its segments bind, each read again, the equation's rows matched
 on with them; offsets and sizes are in bits.
+
+## `do`
+
+A `do` block is a computation written as statements, taken apart
+through the `bind` and `pure` in scope, by name (no theory of monads is
+asked for): `x <- e` is `bind e (\x -> ...)`, a statement `e` is `bind
+e (\_ -> ...)`, `let p = e` binds `p` in the statements after it, and
+the last statement, an expression, is the block's value.
+
+Its statements may be imperative too:
+
+```haskell
+sumEvens : {e : HFunctor} -> {{io : stdio <: e}} -> List Int -> Co e Int
+sumEvens xs = do
+  let mut total = 0
+  for x in xs do
+    if x % 2 /= 0 then continue
+    if x > 1000000 then break
+    if x < 0 then return (0 - 1)
+    total := total + x
+  print ("total " ^ show total)
+  return total
+```
+
+- `let mut x = e` declares a variable of the block (`let mut x : T =
+  e`, given its type), and `x := e` sets it.  Another binding of its
+  name in the block is refused.  A closure -- a lambda, or a `do`
+  block that is not a statement's arm -- holds the value the variable
+  has where it is made, and cannot set it.
+- `while c do ...` runs its statements while `c` holds; `for p in e
+  do ...` runs them for each element of `e`, matched by `p`.  What a
+  `for` goes through is `e`'s instance of the prelude's `Iterate`, a
+  cursor: `start` gives the first, `next` the element (an `Elem`) and
+  the cursor after it, or `Nothing` at the end.  The prelude has a
+  list's, a string's (each `Rune`), and a range's, `range a b`, the
+  integers from `a` to `b`, both in; `array`
+  has an array's (its cursor its index), `std.map` a map's and
+  `std.hashmap` a hash map's (each key and its value, a `Pair`).
+- `break` leaves the innermost loop, `continue` goes on to its next
+  turn, each the last of its statements; `return e` ends the whole
+  block with `e` (as `pure e` does last, which it is there).  A
+  `while` or `for` last is the block's `MkUnit`.
+- An `if` among the statements may have no `else`, and the arms of an
+  `if` or a `case` among them are statements too: `x := e`, a jump,
+  `return e`, another such `if` or `case`, or a `do` block of
+  statements, which are the block's own (its `x := e` sets the block's
+  variable).
+- `(<- c)` is the value of the action `c` where it is used: it runs
+  before the statement it is in, in the order written.  In an arm of an
+  `if` or a `case` it runs at the start of that arm, only if the arm is
+  taken: where the `if` is a value, it is made an action, the other
+  arms `pure` (`print (if b then (<- c) else "x")` is `v <- (if b then c
+  else pure "x"); print v`), and so are `&&` and `||`.
+- In a lambda in the block, `(<- c)`, `return`, `break` and `continue`
+  are refused: its body runs later, not as the block's statement.
+
+Pure code is written as statements by `run do ...`: `run : Id a -> a`,
+of the identity monad (`type Id a = a`), whose `do` is taken apart by
+its own `idBind` and `idPure`.
+
+The statements are taken apart into tail calls, through `bind`, never
+into a value to be matched later: a loop is a local tail-recursive
+function of the block's variables (each a parameter), a jump the call
+it leads to -- `continue` the next turn, `break` the function of what
+follows the loop, `return e` the block's answer, `pure e` -- and an
+`if` whose arms go on to what follows it a function of that too, a join
+point (where only one arm goes on, what follows is that arm's own).
+Pure code so compiles to plain tail recursion, a loop in `Co` to a loop
+that goes round its turns without a handler between them, and neither
+grows the stack.
 
 ## Effects
 
