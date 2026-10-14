@@ -2678,15 +2678,21 @@ goldenByte c =
   || c == 95
   || c == 46
 
--- | is it a golden text's name: letters, digits, `-`, `_` and `.`, not
--- | first, so that it names a file of the directory and nothing else
--- | >>> List.map goldenName ["parse-error.txt", "", ".hidden", "a/b", "a b"]
--- | [True, False, False, False, False]
-goldenName : String -> Bool
-goldenName n =
+-- (a part of a golden text's name, between its `/`s: letters, digits,
+-- `-`, `_` and `.`, not first)
+goldenPart : String -> Bool
+goldenPart n =
   strLength n > 0
   && byteAt n 0 /= 46
   && List.all (\i -> goldenByte (byteAt n i)) (List.range 0 (strLength n - 1))
+
+-- | is it a golden text's name: parts of letters, digits, `-`, `_` and
+-- | `.`, not first, between `/`s, so that it names a file under the
+-- | directory and nothing else
+-- | >>> List.map goldenName ["parse-error.txt", "eval/lib/list.hf.txt", "", ".hidden", "a/../b", "/a", "a/", "a b"]
+-- | [True, True, False, False, False, False, False, False]
+goldenName : String -> Bool
+goldenName n = List.all goldenPart (split "/" n)
 
 -- | where the golden text `name` of the test file `f` is kept: in the
 -- | directory beside it named as it, without its `.hf`, with `.golden`
@@ -2705,6 +2711,30 @@ goldenPath st f name =
 -- | it, and why)
 data GoldenSaid = Holds | Wrote String | Wrong String Driver.TestFailure
 
+-- (a line of a text, or none past its end)
+lineOr : List String -> String
+lineOr Nil = ""
+lineOr (Cons l _) = l
+
+-- | where two texts, cut into lines, first differ: the line's number,
+-- | counted from `n`, and what each has there
+firstDiffering : Int
+               -> List String
+               -> List String
+               -> Pair Int (Pair String String)
+firstDiffering n (Cons a as) (Cons b bs) =
+  if strEq a b then firstDiffering (n + 1) as bs
+  else MkPair n (MkPair a b)
+firstDiffering n as bs = MkPair n (MkPair (lineOr as) (lineOr bs))
+
+-- (a golden text that is not the one kept: the first line where they
+-- differ, as a long text's whole would be too much to see)
+differsAt : String -> Pair Int (Pair String String) -> GoldenSaid
+differsAt path (MkPair n (MkPair kept text)) =
+  Wrong
+    ("golden " ^ path ^ ", line " ^ show n)
+    (FailDiffer (show kept) (show text))
+
 -- (the text, held to the one kept, or written there)
 goldenAgainst : {e : HFunctor}
               -> {{disk : filesystem <: e}}
@@ -2722,7 +2752,8 @@ goldenAgainst update dir path text (Just kept) =
     pure
         (if ok then Wrote path
          else Wrong ("golden " ^ path) (FailBecause "could not be written"))
-  else pure (Wrong ("golden " ^ path) (FailDiffer (show kept) (show text)))
+  else pure
+      (differsAt path (firstDiffering 1 (split "\n" kept) (split "\n" text)))
 goldenAgainst update dir path text Nothing =
   if update
   then do
@@ -2750,7 +2781,7 @@ goldenSaid update f (MkPair name text) =
       (Wrong
          ("golden " ^ show name)
          (FailBecause
-            "a golden text's name is a file's: letters, digits, `-`, `_` and `.`, not first"))
+            "a golden text's name is a file's under the directory: letters, digits, `-`, `_` and `.`, not first, between `/`s"))
   else do
     st <- styleNow
     kept <- readFile (goldenPath st f name)
@@ -3011,15 +3042,21 @@ type Running = { job : Job, proc : Subprocess, dir : String }
 -- (what came of a test, at its place)
 type Finished = { index : Int, outcome : Driver.TestOutcome }
 
+-- | what runs the integration tests: their program, and what is set in
+-- | its environment -- `HEFF`, the heff that runs them, and
+-- | `HEFF_TEST_ROOT`, the project's root, so that a test of heff runs
+-- | the heff tested, on the project's files
+type Launch = { program : String, env : List (Pair String String) }
+
 -- (the test's program started, in a new directory of its own, given its
 -- time limit; else what came of it)
 startJob : {e : HFunctor}
          -> {{sys : process <: e}}
          -> {{disk : filesystem <: e}}
-         -> String
+         -> Launch
          -> Job
          -> Co e (Either Finished Running)
-startJob program j = do
+startJob launch j = do
   made <- temporaryDirectory "heff-test-"
   case made of
     Left err ->
@@ -3031,7 +3068,12 @@ startJob program j = do
     Right dir -> do
       started <-
         start
-          { command = program, args = [j.name], dir = dir, timeout = j.limit }
+          { command = launch.program
+          , args = [j.name]
+          , dir = dir
+          , env = launch.env
+          , timeout = j.limit
+          }
       case started of
         Nothing -> do
           gone <- remove dir
@@ -3079,27 +3121,27 @@ stillRunning rs (Just (MkPair proc ran)) =
 runJobs : {e : HFunctor}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
-        -> String
+        -> Launch
         -> Int
         -> List Job
         -> List Running
         -> List Finished
         -> Co e (List Finished)
-runJobs program jobs Nil Nil done = pure done
-runJobs program jobs Nil running done = do
+runJobs launch jobs Nil Nil done = pure done
+runJobs launch jobs Nil running done = do
   w <- waitAny (List.map (\(r : Running) -> r.proc) running)
   ended <- endedJob running w
-  runJobs program jobs Nil (stillRunning running w) (List.append ended done)
-runJobs program jobs (Cons j rest) running done =
+  runJobs launch jobs Nil (stillRunning running w) (List.append ended done)
+runJobs launch jobs (Cons j rest) running done =
   if List.length running < jobs
   then do
-    s <- startJob program j
-    runJobs program jobs rest (runningWith s running) (finishedWith s done)
+    s <- startJob launch j
+    runJobs launch jobs rest (runningWith s running) (finishedWith s done)
   else do
     w <- waitAny (List.map (\(r : Running) -> r.proc) running)
     ended <- endedJob running w
     runJobs
-        program
+        launch
         jobs
         (Cons j rest)
         (stillRunning running w)
@@ -3110,6 +3152,11 @@ jobsOf : Int -> List (Pair String Int) -> List Job
 jobsOf i Nil = Nil
 jobsOf i (Cons (MkPair name limit) rest) =
   Cons { index = i, name = name, limit = limit } (jobsOf (i + 1) rest)
+
+-- (a path made real, else the one given)
+pathOr : String -> Either FileError String -> String
+pathOr given (Left err) = given
+pathOr given (Right real) = real
 
 -- (where `heff test` builds a file's integration tests: `.heff/test/F/`,
 -- F its path, its separators underscores)
@@ -3166,9 +3213,17 @@ runIntegrations opts p k = case integrationLoaded p of
                    l.paths
                    (testDir l.paths p.file)
                    (programFile l.paths.style "main"))
+            self <- programPath
+            heff <- realPath self
+            root <- realPath l.paths.root
             done <-
               runJobs
-                (either (\(err : FileError) -> "") (\x -> x) real)
+                { program = pathOr "" real
+                , env =
+                    [ MkPair "HEFF" (pathOr self heff)
+                    , MkPair "HEFF_TEST_ROOT" (pathOr l.paths.root root)
+                    ]
+                }
                 opts.jobs
                 (jobsOf 0 p.integrations)
                 Nil

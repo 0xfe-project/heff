@@ -150,7 +150,7 @@ expect("test, a golden text held", (await heff("test", "--run", "a/lsp", "outsid
 writeFileSync(join(work, "outside.golden", "hover.txt"), "another hover\n");
 const differs = await heff("test", "--run", "a/lsp", "outside.hf");
 expect("test, a golden text that differs", differs.status === 1 &&
-  differs.stdout.includes("        golden outside.golden/hover.txt\n        expected \"another hover\\n\"\n        but got  \"a hover\\n\"\n"), differs);
+  differs.stdout.includes("        golden outside.golden/hover.txt, line 1\n        expected \"another hover\"\n        but got  \"a hover\"\n"), differs);
 
 // test: a file that does not check fails the run, though every
 // expectation counted holds: it is named in a list above the last line,

@@ -135,7 +135,10 @@ says otherwise, at which its process is killed and the test fails.
 Integration tests run at once, as many as `--jobs N` says, else
 `HEFF_TEST_JOBS`, else half the machine's cores (at least one), so that
 a run of the tests does not take all of it.  Their lines come after
-those of the file's other tests.
+those of the file's other tests.  Each has, in its environment, `HEFF`,
+the path of the heff that runs it, and `HEFF_TEST_ROOT`, the project's
+root: a test of heff runs the heff tested, not one on the PATH, on the
+project's files (`run { command = heff, args = ..., dir = root }`).
 
 ## Selecting tests
 
@@ -164,8 +167,10 @@ A unit test or an integration test may hold a text to one kept in a
 file, its golden text: `golden NAME text`.  The file is `NAME` in the
 directory beside the test's file, named as it with `.golden` for `.hf`
 (`parser.golden/NAME`, of `parser.hf`); a name has letters, digits,
-`-`, `_` and `.`, not first.  `heff test` fails the test where the
-text is not the one kept (and says what differs) or none is kept;
+`-`, `_` and `.`, not first, and may have directories, between `/`s
+(`eval/lib/list.hf.txt`).  `heff test` fails the test where the text is
+not the one kept (and says the first line where they differ) or none is
+kept;
 `heff test --update` writes the text there instead, and says so.  A
 test that fails otherwise is not held to its golden texts, nor are they
 written.
