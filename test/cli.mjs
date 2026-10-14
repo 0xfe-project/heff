@@ -107,6 +107,47 @@ expect("test --seed", seeded.status === 1 && seeded.stdout.includes("again: --se
   runsOf(seeded) !== undefined && runsOf(seeded) !== runsOf(props), { seeded, props });
 expect("test --seed, again", (await heff("test", "props.hf", "-s", "99")).stdout === seeded.stdout, seeded);
 
+// test: an integration test runs outside, a program of its own in a
+// directory of its own, killed at its time limit; `--run` selects tests
+// by their names, a level each between `/`s, as Go's `-run`; `--update`
+// writes the golden texts the tests keep, which are then held to them
+writeFileSync(join(work, "outside.hf"), [
+  "import check", "import co", "import std.filesystem", "import std.process", "",
+  "slow : Test",
+  "slow = within 300 (integration \"sleeps\" (do",
+  "  r <- run { command = \"sleep\", args = [\"5\"] }",
+  "  pure MkUnit))", "",
+  "named : Test",
+  "named = group \"a\"",
+  "  [ unit \"x\" (assertEqual 1 1)",
+  "  , integration \"y\" (do",
+  "      here <- workingDir",
+  "      names <- readDirectory here",
+  "      assertEqual names (Just Nil))",
+  "  , group \"lsp\" [unit \"hover\" (golden \"hover.txt\" \"a hover\\n\")]",
+  "  ]", "",
+].join("\n"));
+const outside = await heff("test", "outside.hf");
+expect("test, integration tests", outside.status === 1 &&
+  outside.stdout.includes("  ok    a / x\n") && outside.stdout.includes("  ok    a / y\n") &&
+  outside.stdout.includes("  FAIL  sleeps\n        took longer than its time limit, 300 ms: killed\n") &&
+  outside.stdout.includes("  FAIL  a / lsp / hover\n        golden outside.golden/hover.txt\n        not kept yet: `heff test --update` writes it\n") &&
+  outside.stdout.endsWith("1/1 files check as they should\n") && outside.stdout.includes("tests 2/4\n"), outside);
+const selected = await heff("test", "--run", "^a/y$", "outside.hf");
+expect("test --run", selected.status === 0 && selected.stdout === "  ok    a / y\nok    outside.hf  0/0, tests 1/1\n0/0 expectations hold, 1/1 tests hold, 1/1 files check as they should\n", selected);
+const nested = await heff("test", "-r", "a/lsp", "-j", "1", "outside.hf");
+expect("test --run, a level each", nested.status === 1 && nested.stdout.includes("  FAIL  a / lsp / hover\n") && nested.stdout.includes("tests 0/1\n"), nested);
+const unread = await heff("test", "--run", "a(", "outside.hf");
+expect("test --run, a pattern not read", unread.status === 2 && unread.stderr === "heff test: --run a(: groups, `(...)`, are not read\n", unread);
+const updated = await heff("test", "--update", "--run", "a/lsp", "outside.hf");
+expect("test --update", updated.status === 0 && updated.stdout.startsWith("wrote outside.golden/hover.txt\n") &&
+  readFileSync(join(work, "outside.golden", "hover.txt"), "utf8") === "a hover\n", updated);
+expect("test, a golden text held", (await heff("test", "--run", "a/lsp", "outside.hf")).status === 0, null);
+writeFileSync(join(work, "outside.golden", "hover.txt"), "another hover\n");
+const differs = await heff("test", "--run", "a/lsp", "outside.hf");
+expect("test, a golden text that differs", differs.status === 1 &&
+  differs.stdout.includes("        golden outside.golden/hover.txt\n        expected \"another hover\\n\"\n        but got  \"a hover\\n\"\n"), differs);
+
 // test: a file that does not check fails the run, though every
 // expectation counted holds: it is named in a list above the last line,
 // a line each, where its first error is -- one with a type error, its

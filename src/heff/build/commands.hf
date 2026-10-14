@@ -20,7 +20,11 @@ import heff.build.query as Query
 import heff.lsp.render as Render
 import heff.lsp.report as Report
 import heff.build.session as Session
+import heff.syntax.import as Import
+import json as Json
+import regex as Regex
 import std.filesystem
+import std.handle
 import std.io
 import std.path as Path
 import std.process
@@ -2330,6 +2334,29 @@ expectedRes =
   , testsFailed = 0
   }
 
+-- | how `heff test` runs the tests: the seed of the properties, the
+-- | pattern of the tests run (`--run`; `""`: all), how many integration
+-- | tests at once, and whether golden texts are written, not held to
+type TestOpts = { seed : Int, pattern : String, jobs : Int, update : Bool }
+
+-- | a file checked, its expectations held and its unit tests and
+-- | properties run, its integration tests not yet: its name, where it
+-- | went wrong, its expectations, what came of its tests, the
+-- | integration tests (each name and time limit), and the file loaded
+-- | and checked, to build them of
+type Pending =
+  { file : String
+  , wrong : List String
+  , reports : List Driver.TestReport
+  , outcomes : List Driver.TestOutcome
+  , integrations : List (Pair String Int)
+  , loaded : Load.Loaded
+  , checked : Driver.Checked
+  }
+
+-- | a file tested: done with, or its integration tests to run yet
+data Tested = Settled TestRes | Pend Pending
+
 failLine : String -> Driver.TestReport -> Report.Mismatch -> String
 failLine f r m =
   "FAIL "
@@ -2508,27 +2535,57 @@ firstWrong : String -> List String -> List Driver.Checked -> String
 firstWrong f (Cons why _) cs = why
 firstWrong f Nil cs = fromMaybe (f ^ ": not checked") (firstErrorOf cs)
 
+-- (a file checked: its expectations, and what came of its tests run
+-- here, those selected; its integration tests to run yet)
+pendingOf : TestOpts
+          -> String
+          -> List String
+          -> Load.Loaded
+          -> Driver.Checked
+          -> Driver.TestsRun
+          -> Pending
+pendingOf opts f wrong l c run =
+  { file = f
+  , wrong = wrong
+  , reports = Driver.testFile c
+  , outcomes = run.outcomes
+  , integrations = run.integrations
+  , loaded = l
+  , checked = c
+  }
+
 testOneC : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{rep : Report.report <: e}}
-         -> Int
+         -> TestOpts
          -> String
-         -> List String
+         -> Load.Loaded
          -> List Driver.Checked
-         -> Co e TestRes
-testOneC seed f loadErrs cs = do
+         -> Co e Tested
+testOneC opts f l cs = do
   bad <- diagCount cs
   case Driver.lastChecked cs of
     Nothing -> do
       print ("FAIL  " ^ f ^ "  0/0")
-      pure (uncheckedRes (firstWrong f loadErrs cs))
+      pure (Settled (uncheckedRes (firstWrong f l.errors cs)))
     Just c ->
-      testReport
-        f
-        (if List.null loadErrs && bad == 0 then Nil
-         else [firstWrong f loadErrs cs])
-        (Driver.testFile c)
-        (if List.null loadErrs && bad == 0 then Driver.runTests seed c else Nil)
+      pure
+        (Pend
+           (if List.null l.errors && bad == 0
+            then pendingOf
+                opts
+                f
+                Nil
+                l
+                c
+                (Driver.runTests opts.pattern opts.seed c)
+            else pendingOf
+                opts
+                f
+                [firstWrong f l.errors cs]
+                l
+                c
+                { outcomes = Nil, integrations = Nil }))
 
 -- | the line that, the first of a file, says that the file is to report
 -- | errors (a test of them): `heff test` passes it if it does, fails it
@@ -2564,31 +2621,588 @@ testLoaded : {e : HFunctor}
            -> {{sys : process <: e}}
            -> {{disk : filesystem <: e}}
            -> {{rep : Report.report <: e}}
-           -> Int
+           -> TestOpts
            -> String
            -> Bool
            -> Load.Loaded
-           -> Co e TestRes
-testLoaded seed f True l = do
+           -> Co e Tested
+testLoaded opts f True l = do
   cs <- Session.cachedProgram l
-  testExpecting f (not (List.null l.errors) || anyErrors cs)
-testLoaded seed f False l = do
+  r <- testExpecting f (not (List.null l.errors) || anyErrors cs)
+  pure (Settled r)
+testLoaded opts f False l = do
   badL <- printErrs "heff" l.errors 0
   cs <- Session.cachedProgram l
-  testOneC seed f l.errors cs
+  testOneC opts f l cs
 
 testOneF : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> {{disk : filesystem <: e}}
          -> {{rep : Report.report <: e}}
-         -> Int
+         -> TestOpts
          -> String
-         -> Co e TestRes
-testOneF seed f = do
+         -> Co e Tested
+testOneF opts f = do
   src <- readFile f
   l <- load f
-  testLoaded seed f (expectsErrors (fromMaybe "" src)) l
+  testLoaded opts f (expectsErrors (fromMaybe "" src)) l
+
+-- Golden texts
+--------------------------------------------------------------------------------
+
+-- (a byte a golden text's name may have)
+goldenByte : Int -> Bool
+goldenByte c =
+  (c >= 48 && c <= 57)
+  || (c >= 65 && c <= 90)
+  || (c >= 97 && c <= 122)
+  || c == 45
+  || c == 95
+  || c == 46
+
+-- | is it a golden text's name: letters, digits, `-`, `_` and `.`, not
+-- | first, so that it names a file of the directory and nothing else
+-- | >>> List.map goldenName ["parse-error.txt", "", ".hidden", "a/b", "a b"]
+-- | [True, False, False, False, False]
+goldenName : String -> Bool
+goldenName n =
+  strLength n > 0
+  && byteAt n 0 /= 46
+  && List.all (\i -> goldenByte (byteAt n i)) (List.range 0 (strLength n - 1))
+
+-- | where the golden text `name` of the test file `f` is kept: in the
+-- | directory beside it named as it, without its `.hf`, with `.golden`
+-- | >>> goldenPath Posix "test/check/golden.hf" "hello"
+-- | "test/check/golden.golden/hello"
+goldenPath : Path.Style -> String -> String -> String
+goldenPath st f name =
+  Path.join
+    st
+    ((if endsWith ".hf" f then strSlice f 0 (strLength f - 3) else f)
+     ^ ".golden")
+    name
+
+-- | what came of holding a golden text to the one kept: it holds, it was
+-- | written there (`--update`), or it does not hold (what is noted of
+-- | it, and why)
+data GoldenSaid = Holds | Wrote String | Wrong String Driver.TestFailure
+
+-- (the text, held to the one kept, or written there)
+goldenAgainst : {e : HFunctor}
+              -> {{disk : filesystem <: e}}
+              -> Bool
+              -> String
+              -> String
+              -> String
+              -> Maybe String
+              -> Co e GoldenSaid
+goldenAgainst update dir path text (Just kept) =
+  if strEq kept text then pure Holds
+  else if update
+  then do
+    ok <- writeFile path text
+    pure
+        (if ok then Wrote path
+         else Wrong ("golden " ^ path) (FailBecause "could not be written"))
+  else pure (Wrong ("golden " ^ path) (FailDiffer (show kept) (show text)))
+goldenAgainst update dir path text Nothing =
+  if update
+  then do
+    made <- makeDirectory dir
+    ok <- writeFile path text
+    pure
+        (if ok then Wrote path
+         else Wrong ("golden " ^ path) (FailBecause "could not be written"))
+  else pure
+      (Wrong
+         ("golden " ^ path)
+         (FailBecause "not kept yet: `heff test --update` writes it"))
+
+-- (a golden text of the test file `f`, held or written)
+goldenSaid : {e : HFunctor}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Bool
+           -> String
+           -> Pair String String
+           -> Co e GoldenSaid
+goldenSaid update f (MkPair name text) =
+  if not (goldenName name)
+  then pure
+      (Wrong
+         ("golden " ^ show name)
+         (FailBecause
+            "a golden text's name is a file's: letters, digits, `-`, `_` and `.`, not first"))
+  else do
+    st <- styleNow
+    kept <- readFile (goldenPath st f name)
+    goldenAgainst
+        update
+        (Path.dirname st (goldenPath st f name))
+        (goldenPath st f name)
+        text
+        kept
+
+-- (the outcome, failed: what was noted, and why)
+outcomeFailed : Driver.TestOutcome
+              -> String
+              -> Driver.TestFailure
+              -> Driver.TestOutcome
+outcomeFailed o note why =
+  { name = o.name
+  , ok = False
+  , property = o.property
+  , runs = o.runs
+  , discarded = o.discarded
+  , shrinks = o.shrinks
+  , labels = o.labels
+  , notes = List.append o.notes [note]
+  , failure = Just why
+  , seed = o.seed
+  , goldens = o.goldens
+  }
+
+-- (the outcome's golden texts from these on, each held or written: the
+-- outcome, failed at the first that does not hold)
+goldensGo : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Bool
+          -> String
+          -> Driver.TestOutcome
+          -> List (Pair String String)
+          -> Co e Driver.TestOutcome
+goldensGo update f o Nil = pure o
+goldensGo update f o (Cons g rest) = do
+  said <- goldenSaid update f g
+  case said of
+    Holds -> goldensGo update f o rest
+    Wrote path -> do
+      print ("wrote " ^ path)
+      goldensGo update f o rest
+    Wrong note why -> pure (outcomeFailed o note why)
+
+-- | each outcome that held, its golden texts held to those kept beside
+-- | the file (or written there, `update`): one that does not hold fails
+-- | it.  A test that failed is not held to them, nor are they written.
+withGoldens : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> Bool
+            -> String
+            -> List Driver.TestOutcome
+            -> Co e (List Driver.TestOutcome)
+withGoldens update f Nil = pure Nil
+withGoldens update f (Cons o rest) = do
+  held <- if o.ok then goldensGo update f o o.goldens else pure o
+  others <- withGoldens update f rest
+  pure (Cons held others)
+
+-- Integration tests
+--------------------------------------------------------------------------------
+
+-- | what `heff test` names the program it adds to a file to run its
+-- | integration tests (check's `integrationMain` of them)
+integrationMainName : String
+integrationMainName = "heffTestIntegrations"
+
+-- (how a file names what check defines: `Alias.`, or nothing where it
+-- imports it with no name)
+prefixOf : Maybe String -> String
+prefixOf (Just alias) = alias ^ "."
+prefixOf Nothing = ""
+
+qualifierOf : List Import.Import -> Maybe String
+qualifierOf Nil = Nothing
+qualifierOf (Cons i rest) =
+  if strEq i.name "check" then Just (prefixOf i.alias) else qualifierOf rest
+
+-- (the program added to the file's text: check's `integrationMain` of
+-- its tests)
+integrationText : String -> List Driver.Own -> String
+integrationText q ts =
+  "\n\n"
+  ^ integrationMainName
+  ^ " : "
+  ^ q
+  ^ "Integrations\n"
+  ^ integrationMainName
+  ^ " = "
+  ^ q
+  ^ "integrationMain ["
+  ^ joinWith ", " (List.map (\(o : Driver.Own) -> o.name) ts)
+  ^ "]\n"
+
+-- (the file's source, the program added to it)
+withProgram : String -> Driver.Source -> Driver.Source
+withProgram text s =
+  { module = s.module
+  , path = s.path
+  , shown = s.shown
+  , source = s.source ^ text
+  , renames = s.renames
+  , implicit = s.implicit
+  , library = s.library
+  }
+
+-- (the imports a file writes)
+writtenImports : Import.Imports -> List Import.Import
+writtenImports imps = imps.imports
+
+-- (the sources, the file's with the program added)
+sourcesWith : String -> String -> List Driver.Source -> List Driver.Source
+sourcesWith m text sources =
+  List.map
+    (\(o : Driver.Source) -> if strEq o.module m then withProgram text o else o)
+    sources
+
+-- (what was loaded, its sources these)
+loadedWith : Load.Loaded -> List Driver.Source -> Load.Loaded
+loadedWith l sources =
+  { sources = sources
+  , errors = l.errors
+  , paths = l.paths
+  , package = l.package
+  , packages = l.packages
+  }
+
+-- (the file's source, how it names check: the program added to it)
+programAdded : Pending -> Driver.Source -> Either String Load.Loaded
+programAdded p src = case qualifierOf
+    (writtenImports (Driver.importsOfSource src)) of
+  Nothing -> Left "its file does not import check, which runs it"
+  Just q ->
+    Right
+      (loadedWith
+         p.loaded
+         (sourcesWith
+            p.checked.module
+            (integrationText q (Driver.testsOf p.checked))
+            p.loaded.sources))
+
+-- (the file loaded, its source with the program added: else why it
+-- cannot be, as it imports no check)
+integrationLoaded : Pending -> Either String Load.Loaded
+integrationLoaded p = case List.find
+    (\(src : Driver.Source) -> strEq src.module p.checked.module)
+    p.loaded.sources of
+  Nothing -> Left "its file is not among those loaded"
+  Just src -> programAdded p src
+
+-- (an integration test that came to no outcome, and why)
+brokenTest : String -> String -> Driver.TestOutcome
+brokenTest name why =
+  { name = name
+  , ok = False
+  , property = False
+  , runs = 0
+  , discarded = 0
+  , shrinks = 0
+  , labels = Nil
+  , notes = Nil
+  , failure = Just (FailBecause why)
+  , seed = 0
+  , goldens = Nil
+  }
+
+jsonText : Json.Json -> String
+jsonText (JString t) = t
+jsonText _ = ""
+
+jsonGolden : Json.Json -> Pair String String
+jsonGolden (JArray (Cons n (Cons t _))) = MkPair (jsonText n) (jsonText t)
+jsonGolden _ = MkPair "" ""
+
+jsonFailure : Json.Json -> Maybe Driver.TestFailure
+jsonFailure j = case Json.str ["because"] j of
+  Just why -> Just (FailBecause why)
+  Nothing -> case Json.arr ["differ"] j of
+    Just (Cons expected (Cons got _)) ->
+      Just (FailDiffer (jsonText expected) (jsonText got))
+    _ -> Nothing
+
+-- (an outcome as an integration test's program writes it)
+outcomeOfJson : String -> Json.Json -> Driver.TestOutcome
+outcomeOfJson name j =
+  { name = name
+  , ok = fromMaybe False (Json.bool ["ok"] j)
+  , property = False
+  , runs = 1
+  , discarded = 0
+  , shrinks = 0
+  , labels = Nil
+  , notes = List.map jsonText (fromMaybe Nil (Json.arr ["notes"] j))
+  , failure = case Json.at ["failure"] j of
+      Just f -> jsonFailure f
+      Nothing -> Nothing
+  , seed = 0
+  , goldens = List.map jsonGolden (fromMaybe Nil (Json.arr ["goldens"] j))
+  }
+
+-- | what an integration test's program writes before its outcome, on a
+-- | line of its own: check's `outcomeMarker`
+outcomeMarker : String
+outcomeMarker = "-- heff test: the outcome --"
+
+-- (how a command ended, said)
+endedSaid : Ended -> String
+endedSaid (Exited n) = "exited with " ^ show n
+endedSaid (Signalled n) = "ended by the signal " ^ show n
+endedSaid TimedOut = "killed at its time limit"
+endedSaid NotRun = "not run"
+
+-- (the last lines of a text, for a failure to show)
+lastLines : Int -> String -> String
+lastLines n t =
+  joinWith "\n" (List.reverse (List.take n (List.reverse (split "\n" t))))
+
+-- | what came of an integration test, its program run: what it wrote
+-- | after its last `outcomeMarker`, else how it ended and what it said
+-- | on its error stream
+ranOutcome : String -> Int -> Ran -> Driver.TestOutcome
+ranOutcome name limit r = case r.ended of
+  TimedOut ->
+    brokenTest
+      name
+      ("took longer than its time limit, " ^ show limit ^ " ms: killed")
+  _ -> case indexOf ("\n" ^ outcomeMarker ^ "\n") r.out of
+    Nothing ->
+      brokenTest
+        name
+        ("it "
+         ^ endedSaid r.ended
+         ^ ", and said nothing of how it went"
+         ^ (if strEq r.err "" then "" else ":\n" ^ lastLines 20 r.err))
+    Just _ -> case Json.parse
+        (fromMaybe
+           ""
+           (List.last (split ("\n" ^ outcomeMarker ^ "\n") r.out))) of
+      Left why ->
+        brokenTest name "what it said of how it went could not be read"
+      Right j -> outcomeOfJson name j
+
+-- | an integration test to run: its place among the file's, its name and
+-- | time limit
+type Job = { index : Int, name : String, limit : Int }
+
+-- | an integration test running: its program, and its directory
+type Running = { job : Job, proc : Subprocess, dir : String }
+
+-- (what came of a test, at its place)
+type Finished = { index : Int, outcome : Driver.TestOutcome }
+
+-- (the test's program started, in a new directory of its own, given its
+-- time limit; else what came of it)
+startJob : {e : HFunctor}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> Job
+         -> Co e (Either Finished Running)
+startJob program j = do
+  made <- temporaryDirectory "heff-test-"
+  case made of
+    Left err ->
+      pure
+        (Left
+           { index = j.index
+           , outcome = brokenTest j.name ("no directory for it: " ^ err.message)
+           })
+    Right dir -> do
+      started <-
+        start
+          { command = program, args = [j.name], dir = dir, timeout = j.limit }
+      case started of
+        Nothing -> do
+          gone <- remove dir
+          pure
+              (Left
+                 { index = j.index
+                 , outcome = brokenTest j.name "its program could not be run"
+                 })
+        Just proc -> pure (Right { job = j, proc = proc, dir = dir })
+
+runningWith : Either Finished Running -> List Running -> List Running
+runningWith (Right r) rs = Cons r rs
+runningWith (Left f) rs = rs
+
+finishedWith : Either Finished Running -> List Finished -> List Finished
+finishedWith (Left f) fs = Cons f fs
+finishedWith (Right r) fs = fs
+
+-- (the test whose program ended, its directory removed: what came of it)
+endedJob : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> List Running
+         -> Maybe (Pair Subprocess Ran)
+         -> Co e (List Finished)
+endedJob rs Nothing = pure Nil
+endedJob rs (Just (MkPair proc ran)) = case List.find
+    (\(r : Running) -> sameHandle r.proc proc)
+    rs of
+  Nothing -> pure Nil
+  Just r -> do
+    gone <- remove r.dir
+    pure
+        [ { index = r.job.index
+          , outcome = ranOutcome r.job.name r.job.limit ran
+          }
+        ]
+
+stillRunning : List Running -> Maybe (Pair Subprocess Ran) -> List Running
+stillRunning rs Nothing = Nil
+stillRunning rs (Just (MkPair proc ran)) =
+  List.filter (\(r : Running) -> not (sameHandle r.proc proc)) rs
+
+-- | the integration tests run, `jobs` at most at once, each its program
+-- | in a directory of its own: as one ends, the next starts
+runJobs : {e : HFunctor}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> String
+        -> Int
+        -> List Job
+        -> List Running
+        -> List Finished
+        -> Co e (List Finished)
+runJobs program jobs Nil Nil done = pure done
+runJobs program jobs Nil running done = do
+  w <- waitAny (List.map (\(r : Running) -> r.proc) running)
+  ended <- endedJob running w
+  runJobs program jobs Nil (stillRunning running w) (List.append ended done)
+runJobs program jobs (Cons j rest) running done =
+  if List.length running < jobs
+  then do
+    s <- startJob program j
+    runJobs program jobs rest (runningWith s running) (finishedWith s done)
+  else do
+    w <- waitAny (List.map (\(r : Running) -> r.proc) running)
+    ended <- endedJob running w
+    runJobs
+        program
+        jobs
+        (Cons j rest)
+        (stillRunning running w)
+        (List.append ended done)
+
+-- (the tests to run, each at its place)
+jobsOf : Int -> List (Pair String Int) -> List Job
+jobsOf i Nil = Nil
+jobsOf i (Cons (MkPair name limit) rest) =
+  Cons { index = i, name = name, limit = limit } (jobsOf (i + 1) rest)
+
+-- (where `heff test` builds a file's integration tests: `.heff/test/F/`,
+-- F its path, its separators underscores)
+testDir : Load.Paths -> String -> String
+testDir paths file =
+  Load.under
+    paths
+    (Load.under paths paths.root ".heff/test")
+    (joinWith "_" (Path.components paths.style file))
+
+-- | the file's integration tests: built, as `heff run` builds, into a
+-- | program of the file's (check's `integrationMain` of its tests), each
+-- | run by it, `opts.jobs` at once; what came of them given to `k`, in
+-- | the file's order
+runIntegrations : {e : HFunctor}
+                -> {{io : stdio <: e}}
+                -> {{sys : process <: e}}
+                -> {{disk : filesystem <: e}}
+                -> {{rep : Report.report <: e}}
+                -> {{prog : Progress.progress <: e}}
+                -> TestOpts
+                -> Pending
+                -> (List Driver.TestOutcome -> Co e Unit)
+                -> Co e Unit
+runIntegrations opts p k = case integrationLoaded p of
+  Left why ->
+    k
+      (List.map
+         (\(i : Pair String Int) -> brokenTest (fst i) why)
+         p.integrations)
+  Right l -> do
+    task <- Progress.start Progress.root (p.file ^ ": integration tests") 2
+    c <- Progress.start task "compiling to C" 0
+    cLoaded
+        l
+        (Just integrationMainName)
+        (testDir l.paths p.file ^ "/")
+        p.file
+        (ended
+           c
+           (zigBuild
+              "heff test"
+              l.paths.style
+              "-O1"
+              task
+              (testDir l.paths p.file)
+              (Load.under
+                 l.paths
+                 (testDir l.paths p.file)
+                 (programFile l.paths.style "main")) (do
+            real <-
+              realPath
+                (Load.under
+                   l.paths
+                   (testDir l.paths p.file)
+                   (programFile l.paths.style "main"))
+            done <-
+              runJobs
+                (either (\(err : FileError) -> "") (\x -> x) real)
+                opts.jobs
+                (jobsOf 0 p.integrations)
+                Nil
+                Nil
+            Progress.end task
+            k
+                (List.map
+                   (\(f : Finished) -> f.outcome)
+                   (List.sortBy
+                      (\(a : Finished) (b : Finished) -> a.index <= b.index)
+                      done)))))
+
+-- (a file tested to its end here, its integration tests not run: its
+-- golden texts held, and its line said)
+testedHere : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{rep : Report.report <: e}}
+           -> Tested
+           -> Co e TestRes
+testedHere (Settled r) = pure r
+testedHere (Pend p) = do
+  os <- withGoldens False p.file p.outcomes
+  testReport p.file p.wrong p.reports os
+
+-- (a file tested to its end: its integration tests run, if it has some,
+-- its golden texts held, and its line said; then `k` of what it came to)
+finishTested : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> {{rep : Report.report <: e}}
+             -> {{prog : Progress.progress <: e}}
+             -> TestOpts
+             -> Tested
+             -> (TestRes -> Co e Unit)
+             -> Co e Unit
+finishTested opts (Settled r) k = k r
+finishTested opts (Pend p) k =
+  if List.null p.integrations
+  then do
+    os <- withGoldens opts.update p.file p.outcomes
+    r <- testReport p.file p.wrong p.reports os
+    k r
+  else runIntegrations
+      opts
+      p (\more -> do
+    os <- withGoldens opts.update p.file (List.append p.outcomes more)
+    r <- testReport p.file p.wrong p.reports os
+    k r)
 
 -- (the tests' part of the last line: said only if there were some)
 testsHeld : Int -> Int -> String
@@ -2677,11 +3291,11 @@ testCmd : {e : HFunctor}
         -> {{rep : Report.report <: e}}
         -> {{prog : Progress.progress <: e}}
         -> Progress.Task
-        -> Int
+        -> TestOpts
         -> List String
         -> TestRes
         -> Co e Unit
-testCmd tk seed Nil acc = do
+testCmd tk opts Nil acc = do
   Progress.end tk
   printUnchecked acc.unchecked
   print
@@ -2694,11 +3308,14 @@ testCmd tk seed Nil acc = do
   if acc.failed > 0 || acc.testsFailed > 0 || not (List.null acc.unchecked)
     then exit 1
     else pure MkUnit
-testCmd tk seed (Cons f rest) acc = do
+testCmd tk opts (Cons f rest) acc = do
   ft <- Progress.start tk f 0
-  r <- testOneF seed f
-  Progress.end ft
-  testCmd tk seed rest (addRes acc r)
+  t <- testOneF opts f
+  finishTested
+      opts
+      t (\r -> do
+    Progress.end ft
+    testCmd tk opts rest (addRes acc r))
 
 -- | `heff test`: the watches' expectations of the files checked, and
 -- | their tests run (each property from `seed`), a task meanwhile, each
@@ -2709,12 +3326,12 @@ testsCmd : {e : HFunctor}
          -> {{disk : filesystem <: e}}
          -> {{rep : Report.report <: e}}
          -> {{prog : Progress.progress <: e}}
-         -> Int
+         -> TestOpts
          -> List String
          -> Co e Unit
-testsCmd seed files = do
+testsCmd opts files = do
   tk <- Progress.start Progress.root "testing" (List.length files)
-  testCmd tk seed files noRes
+  testCmd tk opts files noRes
 
 -- | the seed the properties are run from, unless `--seed` gives one:
 -- | always the same, so that a run of the tests is a run of the same
@@ -2725,6 +3342,48 @@ defaultSeed = 2026
 seedOf : Maybe String -> Int
 seedOf Nothing = defaultSeed
 seedOf (Just s) = fromMaybe defaultSeed (parseInt s)
+
+-- | how many integration tests run at once, unless `--jobs` or
+-- | HEFF_TEST_JOBS says: half the machine's cores, at least one, so that
+-- | a run of the tests does not take all of it
+-- | >>> List.map defaultJobs [1, 2, 3, 8, 14]
+-- | [1, 1, 1, 4, 7]
+defaultJobs : Int -> Int
+defaultJobs cores = if cores / 2 < 1 then 1 else cores / 2
+
+-- (how many at once: as given, if it is a number above 0)
+countOf : Int -> Maybe String -> Int
+countOf fallback Nothing = fallback
+countOf fallback (Just n) = case parseInt n of
+  Just k -> if k > 0 then k else fallback
+  Nothing -> fallback
+
+-- | `heff test`'s options read: the seed, the pattern (read here, a
+-- | pattern that is not ends the run), how many integration tests at
+-- | once (`--jobs`, else HEFF_TEST_JOBS, else `defaultJobs`), and
+-- | whether golden texts are written
+testOptions : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> Maybe String
+            -> Maybe String
+            -> Maybe String
+            -> Bool
+            -> Co e TestOpts
+testOptions seed pattern jobs update = do
+  case Regex.compileLevels (fromMaybe "" pattern) of
+    Left why -> do
+      printErr ("heff test: --run " ^ fromMaybe "" pattern ^ ": " ^ why)
+      exit 2
+    Right _ -> pure MkUnit
+  cores <- processors
+  env <- getEnv "HEFF_TEST_JOBS"
+  pure
+      { seed = seedOf seed
+      , pattern = fromMaybe "" pattern
+      , jobs = countOf (countOf (defaultJobs cores) env) jobs
+      , update = update
+      }
 
 checkLast : {e : HFunctor}
           -> {{io : stdio <: e}}
@@ -2876,7 +3535,11 @@ testAll : {e : HFunctor}
         -> Co e TestRes
 testAll Nil acc = pure acc
 testAll (Cons f rest) acc = do
-  r <- testOneF defaultSeed f
+  t <-
+    testOneF
+      { seed = defaultSeed, pattern = "", jobs = 1, update = False }
+      f
+  r <- testedHere t
   testAll rest (addRes acc r)
 
 publishFails : {e : HFunctor}

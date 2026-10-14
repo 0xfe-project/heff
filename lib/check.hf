@@ -28,6 +28,15 @@
 -- as all of its draws do, each made again from the shrinks of those
 -- before it, with no shrinking written for it.
 --
+-- An integration test (`integration`) also has the world outside: the
+-- process (commands run, std.process) and the filesystem.  `heff test`
+-- cannot run it in itself; it builds the file's tests into a program
+-- through C (`integrationMain`), and runs each integration test in it,
+-- in a new directory of its own, killed at its time limit (`within`).
+-- A unit test or an integration test may keep golden texts (`golden`),
+-- held to the files kept beside the test's, or written there by `heff
+-- test --update`.
+--
 -- What a value is shown as, for a counterexample or for what differs, is
 -- its type's `Show` (the prelude's: as the source writes it, a string
 -- quoted, not its `ToString` text), an instance argument: a type of the
@@ -44,7 +53,11 @@
 
 import co
 import generator as Generator
+import json as Json
+import regex as Regex
+import std.filesystem as Filesystem
 import std.map as Map
+import std.process as Process
 
 -- Effects
 --------------------------------------------------------------------------------
@@ -68,13 +81,15 @@ random =
 data Failure = Because String | Differ String String
 
 -- | Checking: a failure, a run given up on (its assumptions do not hold),
--- | a label of the run (counted over the runs), and a note (shown if the
--- | run fails; made only then).
+-- | a label of the run (counted over the runs), a note (shown if the
+-- | run fails; made only then), and a golden text (a name, and the text,
+-- | held by `heff test` to the one kept under that name).
 data CheckF (m : Type -> Type) x
   = Fail Failure
   | Discard
   | Label String x
   | Note (Unit -> String) x
+  | Golden String String x
 
 -- | Checking as an effect.
 check : HFunctor
@@ -85,11 +100,13 @@ check =
       Discard -> Discard
       Label l x -> Label l (g x)
       Note s x -> Note s (g x)
+      Golden n t x -> Golden n t (g x)
   , hmap = \m n nt p -> case p of
       Fail f -> Fail f
       Discard -> Discard
       Label l x -> Label l x
       Note s x -> Note s x
+      Golden n t x -> Golden n t x
   }
 
 -- | The effects a test is run in.
@@ -152,20 +169,36 @@ label l = op (chk (Label l MkUnit)) val
 note : {e : HFunctor} -> {{chk : check <: e}} -> String -> Co e Unit
 note s = op (chk (Note (\u -> s) MkUnit)) val
 
+-- | The text, held to the golden one kept under `name`: `heff test`
+-- | keeps it in a file beside the test's own, in the directory named as
+-- | the file without its `.hf` and with `.golden` (`NAME` in
+-- | `parser.golden/`, of `parser.hf`), and fails the test where the two
+-- | differ; `heff test --update` writes the text there instead.  The
+-- | name is a file's: letters, digits, `-`, `_` and `.`, not first.  A
+-- | unit test or an integration test keeps goldens, not a property.
+golden : {e : HFunctor} -> {{chk : check <: e}} -> String -> String -> Co e Unit
+golden name text = op (chk (Golden name text MkUnit)) val
+
 -- Running
 --------------------------------------------------------------------------------
 
--- | What a run has said so far, backwards: its notes and labels.
-type Trace = { notes : List (Unit -> String), labels : List String }
+-- | What a run has said so far, backwards: its notes, labels and golden
+-- | texts.
+type Trace =
+  { notes : List (Unit -> String)
+  , labels : List String
+  , goldens : List (Pair String String)
+  }
 
 noTrace : Trace
-noTrace = { notes = Nil, labels = Nil }
+noTrace = { notes = Nil, labels = Nil, goldens = Nil }
 
 -- (one trace, then another)
 andThen : Trace -> Trace -> Trace
 andThen a b =
   { notes = List.append b.notes a.notes
   , labels = List.append b.labels a.labels
+  , goldens = List.append b.goldens a.goldens
   }
 
 -- | A run of a test, so far: going on, failed, or given up on.
@@ -192,15 +225,20 @@ drawAlg : {m : Type -> Type}
         -> Generator.Generator (Run a)
 drawAlg (Draw g) = Generator.map (\x -> Going noTrace x) g
 
+-- (what an operation of checking makes of a run)
+checkRun : {m : Type -> Type} -> {a : Type} -> CheckF m a -> Run a
+checkRun (Fail f) = Failed noTrace f
+checkRun Discard = Discarded
+checkRun (Label l x) = Going { notes = Nil, labels = [l], goldens = Nil } x
+checkRun (Note s x) = Going { notes = [s], labels = Nil, goldens = Nil } x
+checkRun (Golden n t x) =
+  Going { notes = Nil, labels = Nil, goldens = [MkPair n t] } x
+
 checkAlg : {m : Type -> Type}
          -> {a : Type}
          -> CheckF m a
          -> Generator.Generator (Run a)
-checkAlg (Fail f) = Generator.constant (Failed noTrace f)
-checkAlg Discard = Generator.constant Discarded
-checkAlg (Label l x) =
-  Generator.constant (Going { notes = Nil, labels = [l] } x)
-checkAlg (Note s x) = Generator.constant (Going { notes = [s], labels = Nil } x)
+checkAlg c = Generator.constant (checkRun c)
 
 -- | The runner's handler: a test is a generator of runs, so a draw is a
 -- | generator's value, and a run's draws shrink together.
@@ -224,11 +262,28 @@ type Config = { runs : Int, discards : Int, shrinks : Int }
 defaults : Config
 defaults = { runs = 100, discards = 1000, shrinks = 1000 }
 
--- | A test: a unit test, a property, or tests under a name.  (Each is
--- | kept in the runner's world, its effects given.)
+-- | The world outside the program: the process (commands run) and the
+-- | filesystem.
+outside : HFunctor
+outside = Process.process <+> Filesystem.filesystem
+
+-- | The effects an integration test is run in: checking, and the world
+-- | outside.
+integrated : HFunctor
+integrated = check <+> outside
+
+-- | How long an integration test is given, unless `within` says: a
+-- | minute.
+defaultLimit : Int
+defaultLimit = 60000
+
+-- | A test: a unit test, a property, an integration test (its time
+-- | limit, in milliseconds), or tests under a name.  (Each is kept in
+-- | the runner's world, its effects given.)
 data Test
   = UnitTest String (Co world Unit)
   | PropTest String Config (Co world Unit)
+  | IntegrationTest String Int (Co integrated Unit)
   | Group String (List Test)
 
 -- | A unit test: it only checks.
@@ -249,6 +304,27 @@ property name body =
     defaults
     (body (rnd := inl random check) (chk := inr random check))
 
+-- | An integration test: it checks, runs commands and reads and writes
+-- | files.  `heff test` runs it in a program of its own, built through
+-- | C, in a new directory of its own as its working directory (removed
+-- | after it), and kills it at its time limit (a minute; `within` says
+-- | otherwise).
+integration : String
+            -> ({e : HFunctor}
+                -> {{chk : check <: e}}
+                -> {{sys : Process.process <: e}}
+                -> {{disk : Filesystem.filesystem <: e}}
+                -> Co e Unit)
+            -> Test
+integration name body =
+  IntegrationTest
+    name
+    defaultLimit
+    (body
+       (chk := \p -> InL p)
+       (sys := \p -> InR (InL p))
+       (disk := \p -> InR (InR p)))
+
 -- | Tests under a name.
 group : String -> List Test -> Test
 group name ts = Group name ts
@@ -258,7 +334,16 @@ runs : Int -> Test -> Test
 runs n (UnitTest name c) = UnitTest name c
 runs n (PropTest name cfg c) =
   PropTest name { runs = n, discards = cfg.discards, shrinks = cfg.shrinks } c
+runs n (IntegrationTest name limit c) = IntegrationTest name limit c
 runs n (Group name ts) = Group name (List.map (\t -> runs n t) ts)
+
+-- | The integration test given `ms` milliseconds, not a minute (each
+-- | integration test of the group).
+within : Int -> Test -> Test
+within ms (UnitTest name c) = UnitTest name c
+within ms (PropTest name cfg c) = PropTest name cfg c
+within ms (IntegrationTest name limit c) = IntegrationTest name ms c
+within ms (Group name ts) = Group name (List.map (\t -> within ms t) ts)
 
 -- Models
 --------------------------------------------------------------------------------
@@ -319,7 +404,8 @@ agree mc cmds = agreeFrom mc 0 mc.system mc.model cmds
 -- | how many runs held and how many were given up on, how many shrinks
 -- | made the counterexample, how many runs had each label, the
 -- | counterexample's notes (what was drawn, in order), why it failed,
--- | and the seed it was run from.
+-- | the seed it was run from, and the golden texts it kept (each a name
+-- | and a text, in order), for `heff test` to hold to theirs.
 type Outcome =
   { name : String
   , ok : Bool
@@ -331,6 +417,7 @@ type Outcome =
   , notes : List String
   , failure : Maybe Failure
   , seed : Int
+  , goldens : List (Pair String String)
   }
 
 -- (a number from a name, so that each test has a seed of its own, which
@@ -361,8 +448,8 @@ countLabels m ls =
 
 type Tally = { runs : Int, discarded : Int, labels : Map.Map String Int }
 
-passed : String -> Bool -> Int -> Tally -> Outcome
-passed name prop seed t =
+passed : String -> Bool -> Int -> Tally -> List (Pair String String) -> Outcome
+passed name prop seed t goldens =
   { name = name
   , ok = True
   , property = prop
@@ -373,6 +460,7 @@ passed name prop seed t =
   , notes = Nil
   , failure = Nothing
   , seed = seed
+  , goldens = goldens
   }
 
 failedWith : String
@@ -394,6 +482,7 @@ failedWith name prop seed t n tr f =
   , notes = List.reverse (List.map (\(s : Unit -> String) -> s MkUnit) tr.notes)
   , failure = Just f
   , seed = seed
+  , goldens = Nil
   }
 
 isFailed : {a : Type} -> Run a -> Bool
@@ -435,11 +524,21 @@ data Next = Again Tally | Done Outcome
 judge : String -> Config -> Int -> Tally -> Generator.Tree (Run Unit) -> Next
 judge name cfg seed t tree = case Generator.root tree of
   Going tr _ ->
-    Again
-      { runs = t.runs + 1
-      , discarded = t.discarded
-      , labels = countLabels t.labels tr.labels
-      }
+    if List.null tr.goldens
+    then Again
+        { runs = t.runs + 1
+        , discarded = t.discarded
+        , labels = countLabels t.labels tr.labels
+        }
+    else Done
+        (failedWith
+           name
+           True
+           seed
+           t
+           0
+           tr
+           (Because "a property keeps no golden text: a unit test does"))
   Discarded ->
     Again { runs = t.runs, discarded = t.discarded + 1, labels = t.labels }
   Failed _ _ -> Done (failedRun name True seed t (shrink cfg.shrinks 0 tree))
@@ -454,7 +553,7 @@ loop : String
      -> Tally
      -> Outcome
 loop name cfg seed g s t =
-  if t.runs >= cfg.runs then passed name True seed t
+  if t.runs >= cfg.runs then passed name True seed t Nil
   else if t.discarded > cfg.discards
   then failedWith
       name
@@ -481,8 +580,13 @@ noTally = { runs = 0, discarded = 0, labels = Map.empty }
 runUnit : String -> Int -> Co world Unit -> Outcome
 runUnit name seed c = case Generator.root
     (Generator.run (handle runner c) (Generator.seed seed) 0) of
-  Going _ _ ->
-    passed name False seed { runs = 1, discarded = 0, labels = Map.empty }
+  Going tr _ ->
+    passed
+      name
+      False
+      seed
+      { runs = 1, discarded = 0, labels = Map.empty }
+      (List.reverse tr.goldens)
   Failed tr f -> failedWith name False seed noTally 0 tr f
   Discarded ->
     failedWith
@@ -494,28 +598,225 @@ runUnit name seed c = case Generator.root
       noTrace
       (Because "a unit test gave itself up")
 
--- (a name under its group's)
-under : String -> String -> String
-under prefix name = if strEq prefix "" then name else prefix ^ " / " ^ name
+-- (a test's name, its groups' and its own: `group / name`)
+nameOf : List String -> String
+nameOf path = joinWith " / " path
 
-runUnder : Int -> String -> Test -> List Outcome
-runUnder seed prefix (UnitTest name c) = [runUnit (under prefix name) seed c]
-runUnder seed prefix (PropTest name cfg c) =
-  [ loop
-    (under prefix name)
-    cfg
-    seed
-    (handle runner c)
-    (Generator.seed (seed + hashName (under prefix name)))
-    noTally
-  ]
-runUnder seed prefix (Group name ts) =
-  List.concatMap (\t -> runUnder seed (under prefix name) t) ts
+-- | Whether a test of these names, its groups' and then its own, is
+-- | selected by the levels of a pattern (`heff test --run`): each name
+-- | matched by the level of its depth, those deeper than the pattern by
+-- | any, as Go's `-run A/B` selects.
+selectedBy : List Regex.Regex -> List String -> Bool
+selectedBy Nil names = True
+selectedBy (Cons r rs) Nil = True
+selectedBy (Cons r rs) (Cons n ns) = Regex.matches r n && selectedBy rs ns
 
--- | Each test, run from the seed: what `heff test` runs of each test
--- | it finds (`--seed N` gives the seed; the same seed runs the same).
+-- (the tests under these groups, those selected, run; an integration
+-- test is run outside)
+runUnder : Int -> List Regex.Regex -> List String -> Test -> List Outcome
+runUnder seed sel path (UnitTest name c) =
+  if selectedBy sel (List.append path [name])
+  then [runUnit (nameOf (List.append path [name])) seed c]
+  else Nil
+runUnder seed sel path (PropTest name cfg c) =
+  if selectedBy sel (List.append path [name])
+  then [ loop
+         (nameOf (List.append path [name]))
+         cfg
+         seed
+         (handle runner c)
+         (Generator.seed (seed + hashName (nameOf (List.append path [name]))))
+         noTally
+       ]
+  else Nil
+runUnder seed sel path (IntegrationTest name limit c) = Nil
+runUnder seed sel path (Group name ts) =
+  if selectedBy sel (List.append path [name])
+  then List.concatMap
+      (\t -> runUnder seed sel (List.append path [name]) t)
+      ts
+  else Nil
+
+-- | Each test, run from the seed: its unit tests and properties (`--seed
+-- | N` gives the seed; the same seed runs the same).
 runTest : Int -> Test -> List Outcome
-runTest seed t = runUnder seed "" t
+runTest seed t = runUnder seed Nil Nil t
+
+-- | Each test the pattern selects (`selectedBy`), run from the seed: what
+-- | `heff test` runs in itself of each test it finds.  A pattern that
+-- | is not read selects none (`heff test` reads it first).
+runSelected : String -> Int -> Test -> List Outcome
+runSelected pattern seed t = case Regex.compileLevels pattern of
+  Left why -> Nil
+  Right sel -> runUnder seed sel Nil t
+
+-- Integration tests
+--------------------------------------------------------------------------------
+
+-- (the integration tests under these groups, those selected: each name
+-- and time limit)
+integrationsUnder : List Regex.Regex
+                  -> List String
+                  -> Test
+                  -> List (Pair String Int)
+integrationsUnder sel path (UnitTest name c) = Nil
+integrationsUnder sel path (PropTest name cfg c) = Nil
+integrationsUnder sel path (IntegrationTest name limit c) =
+  if selectedBy sel (List.append path [name])
+  then [MkPair (nameOf (List.append path [name])) limit]
+  else Nil
+integrationsUnder sel path (Group name ts) =
+  if selectedBy sel (List.append path [name])
+  then List.concatMap
+      (\t -> integrationsUnder sel (List.append path [name]) t)
+      ts
+  else Nil
+
+-- | The integration tests the pattern selects, each name and time limit:
+-- | what `heff test` runs outside itself, a program each.
+integrationsSelected : String -> Test -> List (Pair String Int)
+integrationsSelected pattern t = case Regex.compileLevels pattern of
+  Left why -> Nil
+  Right sel -> integrationsUnder sel Nil t
+
+-- (each integration test under these groups, by its name)
+integrationsIn : List String -> Test -> List (Pair String (Co integrated Unit))
+integrationsIn path (UnitTest name c) = Nil
+integrationsIn path (PropTest name cfg c) = Nil
+integrationsIn path (IntegrationTest name limit c) =
+  [MkPair (nameOf (List.append path [name])) c]
+integrationsIn path (Group name ts) =
+  List.concatMap (\t -> integrationsIn (List.append path [name]) t) ts
+
+mapRun : {a b : Type} -> (a -> b) -> Run a -> Run b
+mapRun g (Going t x) = Going t (g x)
+mapRun g (Failed t f) = Failed t f
+mapRun g Discarded = Discarded
+
+-- (a run outside, as a functor)
+runOutside : RawFunctor
+runOutside =
+  { f = \x -> Co outside (Run x)
+  , fmap = \g m -> bind m (\r -> val (mapRun g r))
+  }
+
+-- (what an operation outside holds of a run: never a run, as the
+-- process's and the filesystem's operations hold no computation)
+valueOfRun : {a : Type} -> Run a -> Co outside a
+valueOfRun (Going t x) = val x
+valueOfRun _ = abandon
+
+-- (a run outside, then what comes of its value)
+continueOutside : {a b : Type}
+                -> (a -> Co outside (Run b))
+                -> Run a
+                -> Co outside (Run b)
+continueOutside k (Going t x) = bind (k x) (\r -> val (after t r))
+continueOutside k (Failed t f) = val (Failed t f)
+continueOutside k Discarded = val Discarded
+
+-- | The runner of an integration test: checking handled, the world
+-- | outside's operations done as they are.
+outsideRunner : Handler integrated
+outsideRunner =
+  { M = \a -> Co outside (Run a)
+  , ret = \x -> val (Going noTrace x)
+  , bind = \m k -> bind m (\r -> continueOutside k r)
+  , malg = \p -> case p of
+      InL c -> val (checkRun c)
+      InR q ->
+        op
+          (outside.hmap
+             runOutside
+             (coFunctor outside)
+             (\m -> bind m valueOfRun)
+             q)
+          (\x -> val (Going noTrace x))
+  }
+
+-- (what came of an integration test's run)
+integrationOutcome : String -> Run Unit -> Outcome
+integrationOutcome name (Going tr _) =
+  passed
+    name
+    False
+    0
+    { runs = 1, discarded = 0, labels = Map.empty }
+    (List.reverse tr.goldens)
+integrationOutcome name (Failed tr f) = failedWith name False 0 noTally 0 tr f
+integrationOutcome name Discarded =
+  failedWith name False 0 noTally 0 noTrace (Because "a test gave itself up")
+
+-- (the integration test of this name run, what came of it)
+integrationRun : String
+               -> Maybe (Pair String (Co integrated Unit))
+               -> Co outside Outcome
+integrationRun name Nothing =
+  val
+    (failedWith
+       name
+       False
+       0
+       noTally
+       0
+       noTrace
+       (Because ("no integration test " ^ name)))
+integrationRun name (Just t) =
+  bind (handle outsideRunner (snd t)) (\r -> val (integrationOutcome name r))
+
+failureJson : Maybe Failure -> Json.Json
+failureJson Nothing = JNull
+failureJson (Just (Because why)) = Json.obj [Json.kv "because" (Json.jstr why)]
+failureJson (Just (Differ expected got)) =
+  Json.obj
+    [Json.kv "differ" (JArray [Json.jstr expected, Json.jstr got])]
+
+-- | An outcome of an integration test as its program writes it, JSON:
+-- | whether it held, its notes, why it failed, its golden texts.
+outcomeJson : Outcome -> Json.Json
+outcomeJson o =
+  Json.obj
+    [ Json.kv "ok" (JBool o.ok)
+    , Json.kv "notes" (JArray (List.map Json.jstr o.notes))
+    , Json.kv "failure" (failureJson o.failure)
+    , Json.kv
+      "goldens"
+      (JArray
+         (List.map
+            (\(g : Pair String String) ->
+               JArray [Json.jstr (fst g), Json.jstr (snd g)])
+            o.goldens))
+    ]
+
+-- | What an integration test's program writes before its outcome, on a
+-- | line of its own: `heff test` reads what is after the last one.
+outcomeMarker : String
+outcomeMarker = "-- heff test: the outcome --"
+
+-- | What a file's integration tests are run by: `integrationMain`'s.
+type Integrations = Co outside Unit
+
+-- | The program `heff test` builds of a file's tests: it runs the
+-- | integration test its first argument names, where it is run (in the
+-- | directory `heff test` gives it), and writes what came of it to its
+-- | output, after `outcomeMarker`.
+integrationMain : List Test -> Integrations
+integrationMain ts = do
+  as <- Process.args (ev := \p -> InL p)
+  o <-
+    integrationRun
+      (fromMaybe "" (List.head as))
+      (List.find
+         (\(t : Pair String (Co integrated Unit)) ->
+            strEq (fst t) (fromMaybe "" (List.head as)))
+         (List.concatMap (\t -> integrationsIn Nil t) ts))
+  out <- Filesystem.stdout (ev := \p -> InR p)
+  written <-
+    Filesystem.writeString
+      (ev := \p -> InR p)
+      out
+      ("\n" ^ outcomeMarker ^ "\n" ^ Json.stringify (outcomeJson o) ^ "\n")
+  pure MkUnit
 
 instance instanceShowFailure : Show Failure
 instanceShowFailure = { show = written }
@@ -550,4 +851,6 @@ instanceShowOutcome = { show = written }
     ^ show o.failure
     ^ ", seed = "
     ^ show o.seed
+    ^ ", goldens = "
+    ^ show o.goldens
     ^ " }"

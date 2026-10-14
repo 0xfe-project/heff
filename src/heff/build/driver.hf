@@ -1595,6 +1595,7 @@ type TestOutcome =
   , notes : List String
   , failure : Maybe TestFailure
   , seed : Int
+  , goldens : List (Pair String String)
   }
 
 -- (a type that is check's `Test`: a test is found by its type)
@@ -1648,6 +1649,9 @@ listOfV v =
 labelOfV : Interp.Val -> Pair String Int
 labelOfV v = MkPair (strOfV (argV v 0)) (intOfV (argV v 1))
 
+goldenOfV : Interp.Val -> Pair String String
+goldenOfV v = MkPair (strOfV (argV v 0)) (strOfV (argV v 1))
+
 failureOfV : Interp.Val -> Maybe TestFailure
 failureOfV v =
   if strEq (tagOfV v) "Just"
@@ -1671,6 +1675,7 @@ outcomeOfV v =
   , notes = List.map strOfV (listOfV (fieldV v "notes"))
   , failure = failureOfV (fieldV v "failure")
   , seed = intOfV (fieldV v "seed")
+  , goldens = List.map goldenOfV (listOfV (fieldV v "goldens"))
   }
 
 -- (a test that came to no outcome: it abandoned, went too deep, or met a
@@ -1687,6 +1692,7 @@ brokenOutcome name seed why =
   , notes = Nil
   , failure = Just (FailBecause why)
   , seed = seed
+  , goldens = Nil
   }
 
 outcomesOf : Own -> Int -> Interp.EvalResult -> List TestOutcome
@@ -1694,27 +1700,52 @@ outcomesOf o seed (RSucceeded v) = List.map outcomeOfV (listOfV v)
 outcomesOf o seed r =
   [brokenOutcome (SurfacePrint.named o.name) seed (Interp.showResult r)]
 
--- (`check.runTest seed t`, as a global of its own)
-testEntry : Int -> Own -> Globals.Entry
-testEntry seed o =
-  { syntax =
-      SApp (SApp (SGlobal "check.runTest") (SLitInt seed)) (SGlobal o.key)
-  , tySyntax = SPrimInt
-  , value = VOpaque
-  , type_ = VPrimInt
-  }
+-- (an entry of the interpreter's, of this syntax: evaluated, not typed)
+evalEntry : Syntax.Tm -> Globals.Entry
+evalEntry tm =
+  { syntax = tm, tySyntax = SPrimInt, value = VOpaque, type_ = VPrimInt }
+
+-- (`check.runSelected pattern seed t`, as a global of its own)
+testEntry : String -> Int -> Own -> Globals.Entry
+testEntry pattern seed o =
+  evalEntry
+    (SApp
+       (SApp
+          (SApp (SGlobal "check.runSelected") (SLitString pattern))
+          (SLitInt seed))
+       (SGlobal o.key))
+
+-- (`check.integrationsSelected pattern t`, as a global of its own)
+integrationsEntry : String -> Own -> Globals.Entry
+integrationsEntry pattern o =
+  evalEntry
+    (SApp
+       (SApp (SGlobal "check.integrationsSelected") (SLitString pattern))
+       (SGlobal o.key))
 
 testName : Int -> String
 testName i = "> test " ^ show i
 
-addTests : Int -> Int -> List Own -> Globals.Globals -> Globals.Globals
-addTests seed i Nil g = g
-addTests seed i (Cons o rest) g =
+integrationsName : Int -> String
+integrationsName i = "> test integrations " ^ show i
+
+addTests : String
+         -> Int
+         -> Int
+         -> List Own
+         -> Globals.Globals
+         -> Globals.Globals
+addTests pattern seed i Nil g = g
+addTests pattern seed i (Cons o rest) g =
   addTests
+    pattern
     seed
     (i + 1)
     rest
-    (Globals.addEntry (testName i) (testEntry seed o) g)
+    (Globals.addEntry
+       (integrationsName i)
+       (integrationsEntry pattern o)
+       (Globals.addEntry (testName i) (testEntry pattern seed o) g))
 
 pickOutcomes : Int
              -> List (Pair String Interp.EvalResult)
@@ -1729,18 +1760,53 @@ pickOutcomes seed rs i (Cons o rest) =
      Nothing -> Nil)
     (pickOutcomes seed rs (i + 1) rest)
 
--- | each test of the file run from the seed (by the interpreter, as a
--- | watch is evaluated), what came of it
-runTests : Int -> Checked -> List TestOutcome
-runTests seed c =
-  if List.null (testsOf c) then Nil
-  else pickOutcomes
+-- (an integration test's name and time limit)
+integrationOfV : Interp.Val -> Pair String Int
+integrationOfV v = MkPair (strOfV (argV v 0)) (intOfV (argV v 1))
+
+integrationsOfResult : Interp.EvalResult -> List (Pair String Int)
+integrationsOfResult (RSucceeded v) = List.map integrationOfV (listOfV v)
+integrationsOfResult _ = Nil
+
+pickIntegrations : List (Pair String Interp.EvalResult)
+                 -> Int
+                 -> List Own
+                 -> List (Pair String Int)
+pickIntegrations rs i Nil = Nil
+pickIntegrations rs i (Cons o rest) =
+  List.append
+    (case List.lookupBy strEq (integrationsName i) rs of
+     Just r -> integrationsOfResult r
+     Nothing -> Nil)
+    (pickIntegrations rs (i + 1) rest)
+
+-- | what a file's tests came to in the interpreter: what came of each
+-- | unit test and property, and the integration tests to run outside,
+-- | each name and time limit
+type TestsRun =
+  { outcomes : List TestOutcome, integrations : List (Pair String Int) }
+
+testsRunOf : Int
+           -> List Own
+           -> List (Pair String Interp.EvalResult)
+           -> TestsRun
+testsRunOf seed ts rs =
+  { outcomes = pickOutcomes seed rs 0 ts
+  , integrations = pickIntegrations rs 0 ts
+  }
+
+-- | each test of the file the pattern selects (`check.runSelected`), run
+-- | from the seed by the interpreter, as a watch is evaluated: what came
+-- | of each, and the integration tests, which it cannot run
+runTests : String -> Int -> Checked -> TestsRun
+runTests pattern seed c =
+  if List.null (testsOf c) then { outcomes = Nil, integrations = Nil }
+  else testsRunOf
       seed
+      (testsOf c)
       (Interp.evalGlobalsWhere
          (\k -> startsWith "> test " k)
-         (addTests seed 0 (testsOf c) c.top.globals))
-      0
-      (testsOf c)
+         (addTests pattern seed 0 (testsOf c) c.top.globals))
 
 -- The interface, and the diagnostics as files report them
 --------------------------------------------------------------------------------
