@@ -6,12 +6,15 @@
 // kept.)
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { heffBin } from "../test/heff.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
+// (the heff that builds them: `HEFF`, else the one built)
+const heffBin = process.env.HEFF
+  ? resolve(process.env.HEFF)
+  : join(root, ".heff", "out", process.platform === "win32" ? "heff.exe" : "heff");
 let failed = 0;
 for (const name of readdirSync(here).sort()) {
   const dir = join(here, name), src = join(dir, `${name}.hf`), to = join(root, ".heff", "examples", name);

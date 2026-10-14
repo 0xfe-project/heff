@@ -56,7 +56,7 @@ heff-0.3.0-linux-x64/bin/heff help
 ```
 
 From the repository, with [zig](https://ziglang.org/download/) and
-make (Node.js only for the tests):
+make (Node.js only for some of the tests):
 
 ```sh
 make install               # build .heff/out/heff, then install it into ~/.heff/bin/

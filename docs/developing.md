@@ -21,11 +21,12 @@ with is `lib/` ([library.md](library.md)).
 ## Building
 
 With [zig](https://ziglang.org/download/) and GNU make (3.81, macOS's,
-or newer): building and bootstrapping need nothing else.  The tests,
-the benchmarks and the editors' targets need Node.js too.  `make`
-lists every target and the variables they take; each runs a step of
-`build.zig` or a script of `test/`, `bench/` or `editors/`, and its
-line in the `Makefile` says which.
+or newer): building and bootstrapping need nothing else; the tests are
+heff's own, run by `heff test`.  Node.js runs the JavaScript some of
+the tests check, the benchmarks and the editors' targets.  `make` lists
+every target and the variables they take; each runs a step of
+`build.zig`, `heff test` on files of `test/`, or a script of `bench/`
+or `editors/`, and its line in the `Makefile` says which.
 
 ```sh
 make build         # .heff/out/heff
@@ -99,26 +100,26 @@ and `out/native.o/`, and those built under ASan in
 The tests run on the heff built (`make build` first), or on `HEFF`:
 
 ```sh
-make test                  # every group, all at once, then the fixpoint
-make test GROUPS="compiler lsp"
-make test-lsp              # one group: test-compiler, test-lsp,
+make test                  # every test, all at once, then the fixpoint
+make test RUN=cli/usage    # the tests --run selects, of every file
+make test-lsp              # a part: test-compiler, test-lsp,
                            # test-backends, test-asan
 make test-fixpoint         # heff compiles itself to the same C (by zig)
 make check                 # build-seed, test, fmt-check: all a change is held to
 ```
 
-`make test` is `node test/run.mjs [GROUP...]`, and the groups are
-`compiler`, `lsp`, `backends` (each backend held to the interpreter)
-and `asan` (heff under AddressSanitizer, by clang; `make test-asan JOBS=4 TIMEOUT=120` sets
-`HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`; `heff test --run asan/check/wire.hf
-test/asan.hf` checks one program; where there is no clang with ASan's
-runtime, it holds having checked nothing).  The scripts run at once,
-and what they run shares one budget, as make's jobserver does: as many
-processes at once as there are cores, or `HEFF_TEST_JOBS` (a script
-run by itself has its own pools).  So there is no need for `make -j`,
-and the targets run one after another even with it.  With no group
-given, `make test` checks the fixpoint after them, as `make
-test-fixpoint` does, which needs no Node.js.
+`make test` is `heff test` on every file of `test/` (`test/*.hf`),
+and the parts are the language server's (`test/lsp.hf`), the
+backends' (each backend held to the interpreter, and the example apps),
+heff under AddressSanitizer (by clang; `make test-asan JOBS=4
+TIMEOUT=120` sets `HEFF_ASAN_JOBS` and `HEFF_ASAN_TIMEOUT`; `heff test
+--run asan/check/wire.hf test/asan.hf` checks one program; where there
+is no clang with ASan's runtime, it is skipped), and the compiler's,
+every other file.  `heff test` runs the integration tests of all the
+files it is given in one pool, as many at once as `HEFF_TEST_JOBS`
+says, else half the cores; so there is no need for `make -j`, and the
+targets run one after another even with it.  Without `RUN`, `make
+test` checks the fixpoint after them, as `make test-fixpoint` does.
 
 The backends' tests are `heff test test/backends.hf`, a subtest a
 program and a backend (`--run backends/programs/dollar.hf/c`,

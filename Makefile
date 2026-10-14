@@ -1,6 +1,6 @@
 # heff's development commands, each a name for what does the work: a
-# step of build.zig (the building, by zig alone), or a script of test/,
-# bench/, editors/.  `make` lists them.
+# step of build.zig (the building, by zig alone), `heff test` on the
+# files of test/, or a script of bench/, editors/.  `make` lists them.
 #
 # GNU make (3.81, macOS's, or newer).  Each script decides for itself
 # how much to run at once, so the targets run one after another, even
@@ -14,32 +14,32 @@ HEFF ?= .heff/out/heff
 # (the .hf files laid out by `heff fmt`: the tests' are left as they are,
 # their offsets and broken ones the tests', as .pre-commit-config.yaml)
 HF_FILES = $(shell git ls-files '*.hf' ':!test/')
-# (the tests written in heff, run by `heff test` alone, no Node.js: a
-# script of test/run.mjs ported to heff (#55) is listed here instead)
-HEFF_TESTS = test/golden.hf test/surface.hf test/format.hf test/cache.hf \
-  test/backcache.hf test/cli.hf test/project.hf test/progress.hf \
-  test/terminal.hf test/dev.hf
-# (are they run by `make test`: all the groups, or compiler among them)
-HEFF_TESTED = $(if $(GROUPS),$(filter compiler,$(GROUPS)),all)
+# (the tests, each file of test/ a part of them, run by `heff test`: the
+# language server's, the backends', heff under ASan, and the compiler's,
+# all the others)
+HEFF_TESTS = $(sort $(wildcard test/*.hf))
+LSP_TESTS = test/lsp.hf
+BACKEND_TESTS = test/backends.hf test/apps.hf
+ASAN_TESTS = test/asan.hf
+COMPILER_TESTS = $(filter-out $(LSP_TESTS) $(BACKEND_TESTS) $(ASAN_TESTS),$(HEFF_TESTS))
 VSCODE = editors/vscode
 VSIX = $(VSCODE)/heff-$(shell $(NODE) -p "require('./$(VSCODE)/package.json').version").vsix
 
-GROUPS ?=##      test: the groups of test/run.mjs (all when empty)
 JOBS ?=##        test-asan: how many at once (HEFF_ASAN_JOBS)
 TIMEOUT ?=##     test-asan: seconds each check is given (HEFF_ASAN_TIMEOUT)
 GEN ?= 60 1##    sanitize, tsan: HEFF_GEN of test/backends.hf, N SEED: programs generated and their random seed
-RUN ?=##         golden: the goldens updated, heff test's --run (all when empty)
+RUN ?=##         test, golden: heff test's --run, the tests run (all when empty)
 TARGETS ?=##     native: zig targets, e.g. "x86_64-linux-musl aarch64-macos"
 BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 
 .NOTPARALLEL:
-.PHONY: help build build-seed boot native release test test-heff test-compiler test-lsp \
+.PHONY: help build build-seed boot native release test test-compiler test-lsp \
   test-backends test-fixpoint test-asan check golden sanitize tsan fmt \
   fmt-check aliases aliases-check bat bat-check vsix install install-all bench clean
 
 help: ## this list
 	@echo "make TARGET [VARIABLE=VALUE...]"
-	@echo "(zig and make build heff; Node.js runs the tests, the benchmarks and the editors' targets)"
+	@echo "(zig and make build heff, which runs its tests; Node.js runs the JavaScript some tests check, the benchmarks and the editors' targets)"
 	@awk 'BEGIN { FS = ":.*## " } \
 	  /^##@ / { printf "\n%s\n", substr($$0, 5) } \
 	  /^[a-z][a-z-]*:.*## / { printf "  %-15s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -65,31 +65,26 @@ native: ## heff for other systems, .heff/out/native/TARGET/ (TARGETS=...)
 release: ## an archive of heff for each platform, and SHA256SUMS, .heff/out/release/
 	$(ZIG) build release
 
-##@ Testing (on the heff built: make build first; Node.js but test-heff and test-fixpoint)
+##@ Testing (on the heff built: make build first, by `heff test`)
 
-test: ## the test groups, all at once (GROUPS=..., all and the fixpoint by default), then test-heff
-	$(NODE) test/run.mjs $(GROUPS)
-	$(if $(HEFF_TESTED),$(HEFF) test $(HEFF_TESTS))
-	$(if $(GROUPS),,$(ZIG) build fixpoint)
+test: ## every test, all at once (RUN=...), then the fixpoint (unless RUN is given)
+	$(HEFF) test $(if $(RUN),--run '$(RUN)' )$(HEFF_TESTS)
+	$(if $(RUN),,$(ZIG) build fixpoint)
 
-test-heff: ## the tests written in heff, by `heff test` alone: the goldens, the surface, formatting, the caches, the terminal, heff dev
-	$(HEFF) test $(HEFF_TESTS)
-
-test-compiler: ## elaborating, formatting, the cache, the command line, the goldens
-	$(NODE) test/run.mjs compiler
-	$(HEFF) test $(HEFF_TESTS)
+test-compiler: ## elaborating, formatting, the caches, the command line, projects, the goldens, the terminal, heff dev
+	$(HEFF) test $(COMPILER_TESTS)
 
 test-lsp: ## the language server
-	$(NODE) test/run.mjs lsp
+	$(HEFF) test $(LSP_TESTS)
 
 test-backends: ## each backend held to the interpreter, the example apps
-	$(NODE) test/run.mjs backends
+	$(HEFF) test $(BACKEND_TESTS)
 
 test-fixpoint: ## heff compiles itself to the same C (by zig, as make boot checks)
 	$(ZIG) build fixpoint
 
 test-asan: ## heff under AddressSanitizer, by clang (JOBS=..., TIMEOUT=...)
-	$(if $(JOBS),HEFF_ASAN_JOBS=$(JOBS) )$(if $(TIMEOUT),HEFF_ASAN_TIMEOUT=$(TIMEOUT) )$(HEFF) test test/asan.hf
+	$(if $(JOBS),HEFF_ASAN_JOBS=$(JOBS) )$(if $(TIMEOUT),HEFF_ASAN_TIMEOUT=$(TIMEOUT) )$(HEFF) test $(ASAN_TESTS)
 
 check: build-seed test fmt-check ## all a change is held to: from the seed, every test, the layout
 
