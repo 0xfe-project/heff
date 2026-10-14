@@ -4,7 +4,9 @@
 -- changed, built again and the program run anew; a change that does not
 -- build said and waited past, the program kept; and heff dev ended by
 -- SIGTERM, what it started ended with it (else its output would be held
--- open by them).  What is not a page's is sent on to a server
+-- open by them).  `heff test --watch`, which watches as heff dev does:
+-- the project's tests run, then run again as a source changes, until
+-- ended by SIGTERM.  What is not a page's is sent on to a server
 -- (`--proxy`), here the tests' (`echo.c`, built here by zig, else `cc`,
 -- which says what it was sent); the pages asked for by curl.  Each test
 -- a project and a heff dev of its own, run by the heff that runs the
@@ -460,6 +462,70 @@ changes = do
   stopped <- terminate (fst echo)
   pure MkUnit
 
+-- | heff test --watch: the tests run, a source changed and they run
+-- | again (and fail), then ended by SIGTERM
+watched : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> Co e Unit
+watched = do
+  heff <- given "HEFF"
+  made <- run { command = heff, args = ["init", "proj"] }
+  holds "heff init" (succeeded made) made.err
+  s <-
+    start
+      { command = "sh"
+      , args =
+          [ "-c"
+          , "echo $$; exec \"$0\" \"$@\" 2>&1"
+          , heff
+          , "test"
+          , "--watch"
+          ]
+      , dir = "proj"
+      , output = Piped
+      }
+  case s of
+    Nothing -> failure "heff test --watch not run"
+    Just p -> do
+      line <- readOutput p (Through "\n") 10000
+      pid <- case line of
+        Got b -> pure (trim (Bytes.asString b))
+        _ -> failure "heff test --watch not started"
+      d <- pure { process = p, pid = pid, port = "" }
+      first <-
+        saidOnce
+          d
+          (\t -> contains "heff test: tested (1), all held" t)
+          ""
+      holds
+          "the tests run"
+          (contains "1/1 tests hold" first
+           && contains "heff test: tested (1), all held" first)
+          first
+      g <- pure "proj/src/proj/greeting.hf"
+      original <- readFile g
+      writeAll
+          [ MkPair
+            g
+            (joinWith
+               "\"Howdy there, \""
+               (split "\"Hello, \"" (fromMaybe "" original)))
+          ]
+      again <-
+        saidOnce
+          d
+          (\t -> contains "heff test: tested (2), not all held" t)
+          first
+      holds
+          "a change, tested again"
+          (contains "heff test: a change; tested again" again
+           && contains "0/1 tests hold" again
+           && contains "heff test: tested (2), not all held" again)
+          again
+      ended d again
+
 -- (each test skipped on Windows)
 posix : ({e : HFunctor}
          -> {{chk : check <: e}}
@@ -476,9 +542,12 @@ posix body = do
   if strEq p "win32" then skip "not on Windows" else body
 
 -- | heff dev: its pages, and its program built again as its sources
--- | change
+-- | change; heff test --watch, which watches as it does
 devTests : Test
 devTests =
   group
     "dev"
-    [integration "pages" (posix pages), integration "changes" (posix changes)]
+    [ integration "pages" (posix pages)
+    , integration "changes" (posix changes)
+    , integration "test-watch" (posix watched)
+    ]

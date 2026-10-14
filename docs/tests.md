@@ -225,6 +225,21 @@ The pattern is a regular expression, of a small part of RE2's syntax
 alternatives.  What it does not read -- groups, counts `{n}`, `\d` -- is an
 error, not a literal, so that a pattern means the same once more is read.
 
+## Testing again at each change
+
+`heff test --watch` runs the tests as `heff test` would (the same FILEs,
+`--seed`, `--run`, `--jobs`), then looks at what they test every quarter
+of a second, as `heff dev` looks at a project: the files tested (those
+given, else `test/`), the project's (`package.hf`, `src/`, `app/`) and
+`lib/` -- what the files import is among them.  At a change it runs
+them again, until it is ended (Ctrl-C).  Each run is `heff test`'s
+own output, and after it a line, `heff test: tested (2), all held; tested
+again at the next change` (`not all held` where something failed); a
+run after a change starts after an empty line and `heff test: a change;
+tested again`.  It is not given with `--update`, which writes golden
+texts -- a change, to be tested again without end: `heff test` says so
+and exits 2.
+
 ## Golden texts
 
 A unit test or an integration test may hold a text to one kept in a

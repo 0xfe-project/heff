@@ -17,6 +17,7 @@ import co
 import green
 import heff.build.commands as Commands
 import heff.build.project as Project
+import heff.build.watch as Watch
 import std.filesystem
 import std.http as Http
 import std.http.server as Server
@@ -29,69 +30,18 @@ import rune as Rune
 import std.reactor as Reactor
 import std.time as Time
 
--- Watching
---------------------------------------------------------------------------------
-
--- | what `heff dev` watches: the project's manifest and its sources
-watched : List String
-watched = ["package.hf", "src", "app"]
-
--- (a file as watched: its path, when it was changed, its size)
-stampOf : String -> Status -> String
-stampOf p s = p ^ " " ^ show s.modified ^ " " ^ show s.size
-
--- (the names of a directory, as paths under it -- those starting with
--- `.` passed over)
-under : Path.Style -> String -> Maybe (List String) -> List String
-under st dir Nothing = Nil
-under st dir (Just names) =
-  List.map
-    (\n -> Path.join st dir n)
-    (List.filter (\n -> not (startsWith (prefix := ".") n)) names)
-
--- | the stamps of the files under the paths, the directories walked:
--- | what a change of any of them changes
-stamps : {e : HFunctor}
-       -> {{disk : filesystem <: e}}
-       -> Path.Style
-       -> List String
-       -> List String
-       -> Co e (List String)
-stamps st acc Nil = pure acc
-stamps st acc (p :: rest) = do
-  found <- pathStatus p
-  case found of
-    Left err -> stamps st acc rest
-    Right s ->
-      if isDirectoryKind s.kind
-      then do
-        names <- readDirectory p
-        stamps st acc (List.append (under st p names) rest)
-      else stamps st (stampOf p s :: acc) rest
-
--- (the project's files, stamped, as one text)
-stamped : {e : HFunctor}
-        -> {{disk : filesystem <: e}}
-        -> Path.Style
-        -> Co e String
-stamped st = do
-  ss <- stamps st Nil watched
-  pure (unlines ss)
-
 -- Running
 --------------------------------------------------------------------------------
 
 -- | a program of the project's, running
 type Running = { name : String, child : Subprocess }
 
--- | where `heff dev` is: the project's files as last built, its programs
--- | running, the pages' server (once there are pages), how many builds
--- | there have been, the programs to run (all, where none is named), and
--- | the port the pages are served at, and where what is not theirs is
--- | sent (`--proxy`)
+-- | where `heff dev` is: its programs running, the pages' server (once
+-- | there are pages), how many builds there have been, the programs to
+-- | run (all, where none is named), and the port the pages are served
+-- | at, and where what is not theirs is sent (`--proxy`)
 type Dev =
-  { stamp : String
-  , running : List Running
+  { running : List Running
   , pages : Maybe Subprocess
   , builds : Int
   , wanted : List String
@@ -227,9 +177,8 @@ builtWell : {e : HFunctor}
           -> {{prog : Progress.progress <: e}}
           -> Path.Style
           -> Dev
-          -> String
           -> Co e Dev
-builtWell st d stamp = do
+builtWell st d = do
   apps <- appsNow st
   stopAll d.running
   _ <- makeDirectory (Path.join st ".heff" "dev")
@@ -242,8 +191,7 @@ builtWell st d stamp = do
   running <- startAll st Nil (List.filter (isRun d.wanted) apps)
   pages <- pagesFor d (List.any isPage apps)
   pure
-      { stamp = stamp
-      , running = running
+      { running = running
       , pages = pages
       , builds = d.builds + 1
       , wanted = d.wanted
@@ -261,17 +209,16 @@ rebuilt : {e : HFunctor}
         -> {{prog : Progress.progress <: e}}
         -> Path.Style
         -> Dev
-        -> String
         -> Co e Dev
-rebuilt st d stamp = do
+rebuilt st d = do
   self <- programPath
   task <- Progress.start Progress.root "building" 0
   r <- Progress.runUnder task self ["build"]
   Progress.end task
-  if succeeded r then builtWell st d stamp
+  if succeeded r then builtWell st d
     else do
       failedSaid r
-      pure { d | stamp = stamp }
+      pure d
 
 -- (how a program ended, said)
 endedSaid : Ended -> String
@@ -296,25 +243,16 @@ stillRunning acc (r :: rest) = do
       printErr ("heff dev: " ^ r.name ^ " ended (" ^ endedSaid ran.ended ^ ")")
       stillRunning acc rest
 
--- | watched: every quarter of a second, what ran that has ended said,
--- | and the project's files looked at; changed, built again
-watching : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> {{disk : filesystem <: e}}
-         -> {{prog : Progress.progress <: e}}
-         -> {{clock : Time.time <: e}}
-         -> Path.Style
-         -> Dev
-         -> Co e Unit
-watching st d = do
-  Time.sleep 250
+-- (what ran that has ended said, and let go of: done at each look at
+-- the project's files)
+ticked : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> Dev
+       -> Co e Dev
+ticked d = do
   running <- stillRunning Nil d.running
-  stamp <- stamped st
-  if strEq stamp d.stamp then watching st { d | running = running }
-    else do
-      next <- rebuilt st { d | running = running } stamp
-      watching st next
+  pure { d | running = running }
 
 -- | `heff dev [APP...] [--port N] [--proxy URL]`, at the project's root
 devCmd : {e : HFunctor}
@@ -335,20 +273,18 @@ devCmd wanted port proxy = do
       printErr "heff dev: no package.hf here: run it at the project's root"
       exit 1
     Just _ -> do
-      stamp <- stamped st
+      stamp <- Watch.stamped st Watch.project
       first <-
         rebuilt
           st
-          { stamp = ""
-          , running = Nil
+          { running = Nil
           , pages = Nothing
           , builds = 0
           , wanted = wanted
           , port = fromMaybe "8000" port
           , proxy = proxy
           }
-          stamp
-      watching st first
+      Watch.watchOver st Watch.project ticked (rebuilt st) stamp first
 
 -- The pages
 --------------------------------------------------------------------------------

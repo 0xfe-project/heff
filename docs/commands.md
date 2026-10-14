@@ -7,13 +7,14 @@
 ```sh
 heff check FILE                # the file's interface, and its errors
 heff run FILE [ARGS...]        # run the file's `main` (C, by zig -O1)
-heff test [--seed N] [--run REGEXP] [--jobs N] [--update] [FILE...]
+heff test [--seed N] [--run REGEXP] [--jobs N] [--update] [--watch] [FILE...]
                                # check the doc tests' and watches' expectations
                                # (`-- | >>> e`, `-- >>> e`), and run the tests
                                # (check's); no FILE: the project's test/;
                                # --run: only the tests whose names it matches;
                                # --jobs: integration tests at once; --update:
-                               # write the golden texts
+                               # write the golden texts; --watch: test again
+                               # at each change, until ended
 heff promote FILE              # write each doc test's and watch's value as
                                # its expectation
 heff fmt [--check] FILE...     # format in place

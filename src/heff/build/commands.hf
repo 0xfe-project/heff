@@ -20,6 +20,7 @@ import heff.build.query as Query
 import heff.lsp.render as Render
 import heff.lsp.report as Report
 import heff.build.session as Session
+import heff.build.watch as Watch
 import heff.syntax.import as Import
 import json as Json
 import regex as Regex
@@ -29,6 +30,7 @@ import std.io
 import std.path as Path
 import std.process
 import std.progress as Progress
+import std.time as Time
 import std.map as Map
 
 -- | the style of the paths of the platform heff runs on
@@ -3799,6 +3801,118 @@ testOptions seed pattern jobs update = do
       , jobs = countOf (countOf (defaultJobs cores) env) jobs
       , update = update
       }
+
+-- `heff test --watch`
+--------------------------------------------------------------------------------
+
+-- | what `heff test --watch` watches: the files tested (those given,
+-- | else `test/`), the project's, and the library's source (`lib/`,
+-- | where the project is heff's own) -- what the files import is among
+-- | them
+-- | >>> testWatched Nil
+-- | ["test", "lib", "package.hf", "src", "app"]
+-- | >>> testWatched ["a.hf"]
+-- | ["a.hf", "lib", "package.hf", "src", "app"]
+testWatched : List String -> List String
+testWatched Nil = "test" :: "lib" :: Watch.project
+testWatched given = List.append given ("lib" :: Watch.project)
+
+-- (an option given again, as it was given)
+flagged : String -> Maybe String -> List String
+flagged name Nothing = Nil
+flagged name (Just v) = [name, v]
+
+-- | the command line each run of `heff test --watch` is: `heff test` as
+-- | it was given, without `--watch`
+-- | >>> testArgs (Just "7") Nothing (Just "2") ["a.hf"]
+-- | ["test", "--seed", "7", "--jobs", "2", "a.hf"]
+testArgs : Maybe String
+         -> Maybe String
+         -> Maybe String
+         -> List String
+         -> List String
+testArgs seed pattern jobs given =
+  "test"
+  :: List.append
+    (flagged "--seed" seed)
+    (List.append
+       (flagged "--run" pattern)
+       (List.append (flagged "--jobs" jobs) given))
+
+-- (how a run of the tests went, said)
+heldSaid : Ran -> String
+heldSaid r = if succeeded r then "all held" else "not all held"
+
+-- (the line between a run and the one before it: a change)
+changedSaid : {e : HFunctor} -> {{io : stdio <: e}} -> Int -> Co e Unit
+changedSaid 0 = pure MkUnit
+changedSaid n = printErr "\nheff test: a change; tested again\n"
+
+-- | a run of the tests, the `n`th before it: `heff test` run beside, its
+-- | output the terminal's, waited for, and how it went said -- each
+-- | run's output between such lines
+testedAgain : {e : HFunctor}
+            -> {{io : stdio <: e}}
+            -> {{sys : process <: e}}
+            -> List String
+            -> Int
+            -> Co e Int
+testedAgain as n = do
+  changedSaid n
+  self <- programPath
+  c <-
+    start
+      { command = self
+      , args = as
+      , input = Inherited
+      , output = Inherited
+      , errors = Inherited
+      }
+  case c of
+    Nothing -> do
+      printErr "heff test: cannot run heff; tested again at the next change"
+      pure (n + 1)
+    Just child -> do
+      r <- wait child
+      printErr
+          ("heff test: tested ("
+           ^ show (n + 1)
+           ^ "), "
+           ^ heldSaid r
+           ^ "; tested again at the next change")
+      pure (n + 1)
+
+-- | `heff test --watch`: the tests run as `heff test` runs them, then
+-- | again at each change of what they test (`testWatched`), until the
+-- | program is ended.  Not with `--update`: the golden texts it writes
+-- | would be a change, tested again, without end
+testsWatched : {e : HFunctor}
+             -> {{io : stdio <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> {{clock : Time.time <: e}}
+             -> Maybe String
+             -> Maybe String
+             -> Maybe String
+             -> Bool
+             -> List String
+             -> Co e Unit
+testsWatched seed pattern jobs True given = do
+  printErr "heff test: --watch is not given with --update"
+  exit 2
+testsWatched seed pattern jobs False given = do
+  _ <- testOptions seed pattern jobs False
+  _ <- testFiles given
+  st <- styleNow
+  stamp <- Watch.stamped st (testWatched given)
+  first <- testedAgain (testArgs seed pattern jobs given) 0
+  Watch.watchOver
+      st
+      (testWatched given)
+      (\n -> pure n)
+      (testedAgain (testArgs seed pattern jobs given))
+      stamp
+      first
 
 checkLast : {e : HFunctor}
           -> {{io : stdio <: e}}

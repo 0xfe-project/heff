@@ -1,0 +1,81 @@
+-- Watching files: what `heff dev` and `heff test --watch` both do -- the
+-- files under some paths looked at every quarter of a second, each
+-- stamped by when it was changed and its size, and something done each
+-- time a stamp is not as it was (a file changed, made, or removed).
+
+import co
+import std.filesystem
+import std.path as Path
+import std.time as Time
+
+-- | the project's files, as watched: its manifest and its sources
+project : List String
+project = ["package.hf", "src", "app"]
+
+-- (a file as watched: its path, when it was changed, its size)
+stampOf : String -> Status -> String
+stampOf p s = p ^ " " ^ show s.modified ^ " " ^ show s.size
+
+-- (the names of a directory, as paths under it -- those starting with
+-- `.` passed over)
+under : Path.Style -> String -> Maybe (List String) -> List String
+under st dir Nothing = Nil
+under st dir (Just names) =
+  List.map
+    (\n -> Path.join st dir n)
+    (List.filter (\n -> not (startsWith (prefix := ".") n)) names)
+
+-- | the stamps of the files under the paths, the directories walked:
+-- | what a change of any of them changes
+stamps : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> Path.Style
+       -> List String
+       -> List String
+       -> Co e (List String)
+stamps st acc Nil = pure acc
+stamps st acc (p :: rest) = do
+  found <- pathStatus p
+  case found of
+    Left err -> stamps st acc rest
+    Right s ->
+      if isDirectoryKind s.kind
+      then do
+        names <- readDirectory p
+        stamps st acc (List.append (under st p names) rest)
+      else stamps st (stampOf p s :: acc) rest
+
+-- | the files under the paths, stamped, as one text: the same text as
+-- | long as none of them changes
+stamped : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> Path.Style
+        -> List String
+        -> Co e String
+stamped st paths = do
+  ss <- stamps st Nil paths
+  pure (unlines ss)
+
+-- | the paths watched, from `s` and the stamp they had: every quarter of
+-- | a second `tick` done, and the files looked at; where they have
+-- | changed, `changed` done, and watched on from what it came to --
+-- | until the program is ended
+watchOver : {e : HFunctor}
+          -> {s : Type}
+          -> {{disk : filesystem <: e}}
+          -> {{clock : Time.time <: e}}
+          -> Path.Style
+          -> List String
+          -> (s -> Co e s)
+          -> (s -> Co e s)
+          -> String
+          -> s
+          -> Co e Unit
+watchOver st paths tick changed stamp now = do
+  Time.sleep 250
+  ticked <- tick now
+  again <- stamped st paths
+  if strEq again stamp then watchOver st paths tick changed stamp ticked
+    else do
+      next <- changed ticked
+      watchOver st paths tick changed again next
