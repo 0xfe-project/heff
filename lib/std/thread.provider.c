@@ -253,6 +253,8 @@ static int64_t th_cores(void) {
 #endif
 }
 
+static V heff_described_threads(V p, V k);
+
 static V heff_provider_threads(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Pool: {
@@ -280,14 +282,9 @@ static V heff_provider_threads(V p, V k) {
     V r = heff_answer(g, th_gather(v));
     return heff_tail(k, 1, &r);
   }
-  case TAG_Cores: {
-    V f = heff_dup(heff_field(p, 0));
-    heff_drop(p);
-    V x = heff_answer(f, MK_INT(th_cores()));
-    return heff_tail(k, 1, &x);
-  }
+  // (`Cores`, and whatever else std.thread describes in C: the glue the
+  // compiler made of the description)
   default:
-    heff_fail("not an operation of threads");
-    return 0;
+    return heff_described_threads(p, k);
   }
 }
