@@ -342,12 +342,24 @@ HEFF_FN void *heff_alloc(size_t n) {
 #define SMALL_MAX 128
 #endif
 
+// (each object made counted, with its bytes, where a benchmark is built
+// (`-DHEFF_COUNT_ALLOCS`, as `heff bench` builds one): what its allocs/op
+// and B/op are of.  Elsewhere nothing, not a counter kept)
+#ifdef HEFF_COUNT_ALLOCS
+HEFF_VAR(HEFF_TLS uint64_t heff_allocs);
+HEFF_VAR(HEFF_TLS uint64_t heff_alloc_bytes);
+#define HEFF_COUNTED(c) (heff_allocs++, heff_alloc_bytes += (uint64_t)(c) * 8)
+#else
+#define HEFF_COUNTED(c) ((void)0)
+#endif
+
 #if SMALL_MAX == 0
 // (none kept: each object the system's, given back to it)
 HEFF_VAR(HEFF_TLS void *heff_free_list[SMALL_MAX / 8 + 1]);
 
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
+  HEFF_COUNTED(c);
   if (c <= SMALL_MAX / 8 && heff_free_list[c]) {
     void *p = heff_free_list[c];
     heff_free_list[c] = *(void **)p;
@@ -424,6 +436,7 @@ HEFF_FN void *heff_page_alloc(size_t c);
 
 static inline void *heff_obj_alloc(size_t n) {
   size_t c = (n + 7) / 8;
+  HEFF_COUNTED(c);
   if (c > SMALL_MAX / 8) return heff_alloc(c * 8);
   HEFF_HEAP;
   HeffPage *pg = HEFF_AT[c];
@@ -1833,6 +1846,17 @@ HEFF_FN int num_cmp(const Num *a, const Num *b) {
   if (a->neg != b->neg) return a->neg ? -1 : 1;
   int c = mag_cmp(a->d, a->n, b->d, b->n);
   return a->neg ? -c : c;
+}
+
+// (bench's `keep`: the value as it is, but what it is hidden from the C
+// compiler -- an empty instruction it must keep, and that it must take
+// to read the value and the memory it points to, and may have changed
+// the value -- so that neither the work it is the result of is dropped
+// nor that made of it computed once, out of a loop: no instruction at
+// all, as Rust's `black_box`)
+static inline V heff_keep(V x) {
+  __asm__ volatile("" : "+r"(x) : : "memory");
+  return x;
 }
 
 // An integer's operation (`heff_intAdd` and the others) is inlined
