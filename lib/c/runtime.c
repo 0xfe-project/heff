@@ -188,12 +188,19 @@ typedef struct { Obj h; int32_t n; uint32_t flat; uint32_t *lbl; V f[]; } Rec;
 // value, or 0)
 typedef struct { Obj h; Fn fn; int32_t arity; int32_t nenv; V memo; V env[]; } Clo;
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Pap;
-// (a string, or `Bytes` (`K_BYT`): its `len` bytes, room for `cap`)
-typedef struct { Obj h; int64_t len; int64_t cap; uint8_t s[]; } Str;
+// (a string, `Bytes` (`K_BYT`) or `Bits` (`K_BIT`): its `len` bytes, at
+// `p`, which every read of them goes by.  Its own bytes are after it,
+// `s`, room for `cap` of them, and `p` is `s`; unless it is a view, `p`
+// in another's bytes -- its root's, never a view itself -- and that root
+// held where its own bytes would be, `cap` the room it takes ("Slices").
+// A view's bytes are its root's: never written, nor grown in place)
+typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[]; } Str;
+#define HEFF_STR_VIEW(x) ((x)->p != (x)->s)
+#define HEFF_STR_ROOT(x) ((V *)(x)->s)
 // (a string written in the program, static: its `n` bytes, as a C string
 // literal has them -- the NUL C ends it with, after them, no byte of it)
 #define HEFF_STATIC_STR(name, kind, n, bytes) \
-  static struct { Obj h; int64_t len; int64_t cap; uint8_t s[(n) + 1]; } name = {{0x80000000u, kind, 0}, n, n, bytes}
+  static struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[(n) + 1]; } name = {{0x80000000u, kind, 0}, n, n, name.s, bytes}
 #define HEFF_LIT(name, n, bytes) HEFF_STATIC_STR(name, K_STR, n, bytes)
 // (`Bytes` written in the program, a binary written whole, `b["hi", 255]`,
 // static as a string is)
@@ -1229,6 +1236,12 @@ __attribute__((noinline)) HEFF_FN void heff_free(V v) {
     case K_BNC: { Bnc *b = (Bnc *)v; heff_dead_push(b->fun); n = b->n; f = b->a; size = sizeof(Bnc) + n * sizeof(V); break; }
     // (a foreign value's last reference gone: the host's thing let go of)
     case K_FGN: { Fgn *g = (Fgn *)v; if (g->let_go) g->let_go(g->p); size = sizeof(Fgn); break; }
+    // (a view: its root counted down)
+    case K_STR: case K_BYT: case K_BIT: {
+      Str *x = (Str *)v; size = sizeof(Str) + x->cap;
+      if (HEFF_STR_VIEW(x)) { n = 1; f = HEFF_STR_ROOT(x); }
+      break;
+    }
     default: size = heff_size(v); break;
     }
     for (int64_t i = 0; i < n; i++) {
@@ -1277,15 +1290,18 @@ HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
 // Values between threads (#36)
 // ---------------------------------------------------------------------
 
-// (a tag's or a record's fields, an array's elements: `*n` of them --
-// a closure's, a partial application's and a bounce's are said by
-// `HEFF_EACH_SLOT`; a string, a float and a big integer hold none)
+// (a tag's or a record's fields, an array's elements, a string view's
+// root: `*n` of them -- a closure's, a partial application's and a
+// bounce's are said by `HEFF_EACH_SLOT`; another string, a float and a
+// big integer hold none)
 HEFF_FN V *heff_slots(V v, int64_t *n) {
   Obj *o = OBJ(v);
   switch (o->kind) {
   case K_TAG: case K_TAGF: *n = ((Tag *)v)->n; return ((Tag *)v)->f;
   case K_REC: *n = ((Rec *)v)->n; return ((Rec *)v)->f;
   case K_ARR: *n = heff_arr_slots((Arr *)v); return ((Arr *)v)->a;
+  case K_STR: case K_BYT: case K_BIT:
+    *n = HEFF_STR_VIEW((Str *)v); return HEFF_STR_ROOT((Str *)v);
   default: *n = 0; return NULL;
   }
 }
@@ -2188,6 +2204,7 @@ HEFF_FN double heff_double_of_int(V v) {
 HEFF_FN Str *heff_str_new(int64_t len) {
   Str *s = heff_obj_alloc(sizeof(Str) + len);
   s->h.rc = 1; s->h.kind = K_STR; s->h.tag = 0; s->len = len; s->cap = len;
+  s->p = s->s;
   return s;
 }
 
@@ -2280,14 +2297,16 @@ HEFF_FN V heff_str_valid(const void *c, int64_t n) {
   return (V)s;
 }
 
-// (the first string, its last reference, grown in place, room made for
-// twice what it needs -- a string built a piece at a time copied a
-// logarithmic number of times, not once a piece; `Bytes` too, a new one
-// of the kind `kind`)
+// (the first string, its last reference and not a view, grown in place,
+// room made for twice what it needs -- a string built a piece at a time
+// copied a logarithmic number of times, not once a piece; `Bytes` too, a
+// new one of the kind `kind`)
 HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t n = x->len + y->len;
-  if (heff_rc(&x->h) == 1) {
+  // (a view has no room: its `len` is more than its `cap`, so that where
+  // there is room it is no view, and that is not looked at)
+  if (heff_rc(&x->h) == 1 && (n <= x->cap || !HEFF_STR_VIEW(x))) {
     if (n > x->cap) {
       int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
       size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
@@ -2298,17 +2317,18 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
       memcpy(g, x, sizeof(Str) + x->len);
       heff_obj_free(x, was);
       g->cap = cap;
+      g->p = g->s;
       x = g;
     }
-    memcpy(x->s + x->len, y->s, (size_t)y->len);
+    memcpy(x->s + x->len, y->p, (size_t)y->len);
     x->len = n;
     heff_drop(b);
     return (V)x;
   }
   Str *s = heff_str_new(n);
   s->h.kind = kind;
-  memcpy(s->s, x->s, (size_t)x->len);
-  memcpy(s->s + x->len, y->s, (size_t)y->len);
+  memcpy(s->s, x->p, (size_t)x->len);
+  memcpy(s->s + x->len, y->p, (size_t)y->len);
   heff_drop(a);
   heff_drop(b);
   return (V)s;
@@ -2334,7 +2354,41 @@ HEFF_FAST V heff_strLength_lent(V a, int give) {
 }
 HEFF_FN V heff_strLength(V a) { return heff_strLength_lent(a, 1); }
 
-// (as JavaScript's `slice`: out of range is clamped, negative from the end)
+// Slices.  A slice of a string is a view of it, taking no copy, where it
+// is long -- `HEFF_VIEW_MIN` bytes or more -- and at least a
+// `HEFF_VIEW_SHARE`-th of its root: a view of a view is one of the root,
+// so that a string whose tail is taken again and again is a view each
+// time, until it is a short part of its root, then a copy, a root of its
+// own.  A shorter slice is copied: it costs no more than a view, and
+// holds no parent; and a view holds its root, so the bytes kept for it
+// are at most `HEFF_VIEW_SHARE` times its own.  `Bytes` are sliced so
+// too: a view is of any kind
+#ifndef HEFF_VIEW_MIN
+#define HEFF_VIEW_MIN 64
+#endif
+#ifndef HEFF_VIEW_SHARE
+#define HEFF_VIEW_SHARE 4
+#endif
+_Static_assert(HEFF_VIEW_MIN > sizeof(V), "a view's length is more than its room");
+
+// (`m` bytes of `x` from `b`, a view if they are enough of its root)
+HEFF_FAST Str *heff_str_slice_long(Str *x, int64_t b, int64_t m) {
+  Str *r = HEFF_STR_VIEW(x) ? (Str *)*HEFF_STR_ROOT(x) : x;
+  if (m * HEFF_VIEW_SHARE >= r->len) {
+    Str *w = heff_obj_alloc(sizeof(Str) + sizeof(V));
+    w->h.rc = 1; w->h.kind = K_STR; w->h.tag = 0; w->len = m; w->cap = sizeof(V);
+    w->p = x->p + b;
+    heff_dup((V)r);
+    *HEFF_STR_ROOT(w) = (V)r;
+    return w;
+  }
+  Str *s = heff_str_new(m);
+  memcpy(s->s, x->p + b, (size_t)m);
+  return s;
+}
+
+// (as JavaScript's `slice`: out of range is clamped, negative from the
+// end; a short one copied here, a long one by `heff_str_slice_long`)
 HEFF_FN V heff_strSlice_lent(V a, V i, V j, int give) {
   Str *x = (Str *)a;
   int64_t n = x->len, b = INT_OF(i), e = INT_OF(j);
@@ -2343,8 +2397,13 @@ HEFF_FN V heff_strSlice_lent(V a, V i, V j, int give) {
   if (b > n) b = n;
   if (e > n) e = n;
   if (e < b) e = b;
+  if (!HEFF_LIKELY(e - b < HEFF_VIEW_MIN)) {
+    Str *s = heff_str_slice_long(x, b, e - b);
+    HEFF_GIVEN(give, 0, a);
+    return (V)s;
+  }
   Str *s = heff_str_new(e - b);
-  memcpy(s->s, x->s + b, (size_t)(e - b));
+  memcpy(s->s, x->p + b, (size_t)(e - b));
   HEFF_GIVEN(give, 0, a);
   return (V)s;
 }
@@ -2367,11 +2426,11 @@ static inline int heff_str_cmp(V a, V b) {
   if (x == y) return 0;
   int64_t n = x->len < y->len ? x->len : y->len, i = 0;
   for (; i + 8 <= n; i += 8) {
-    uint64_t u = heff_str_word(x->s + i), v = heff_str_word(y->s + i);
+    uint64_t u = heff_str_word(x->p + i), v = heff_str_word(y->p + i);
     if (u != v) return u < v ? -1 : 1;
   }
   for (; i < n; i++)
-    if (x->s[i] != y->s[i]) return x->s[i] < y->s[i] ? -1 : 1;
+    if (x->p[i] != y->p[i]) return x->p[i] < y->p[i] ? -1 : 1;
   return x->len == y->len ? 0 : x->len < y->len ? -1 : 1;
 }
 
@@ -2393,9 +2452,9 @@ HEFF_FN V heff_strFind_lent(V needle, V s, V i, int give) {
   if (k + m <= x->len) {
     if (m == 0) r = k;
     else {
-      const uint8_t *at = x->s + k, *end = x->s + x->len - m + 1;
-      while (at < end && (at = memchr(at, p->s[0], (size_t)(end - at)))) {
-        if (memcmp(at + 1, p->s + 1, (size_t)(m - 1)) == 0) { r = at - x->s; break; }
+      const uint8_t *at = x->p + k, *end = x->p + x->len - m + 1;
+      while (at < end && (at = memchr(at, p->p[0], (size_t)(end - at)))) {
+        if (memcmp(at + 1, p->p + 1, (size_t)(m - 1)) == 0) { r = at - x->p; break; }
         at++;
       }
     }
@@ -2447,7 +2506,7 @@ static inline uint64_t heff_hash_bytes(const uint8_t *p, int64_t n) {
 
 HEFF_FAST V heff_strHash_lent(V a, int give) {
   Str *x = (Str *)a;
-  V r = MK_INT((int64_t)(heff_hash_bytes(x->s, x->len) >> 2));
+  V r = MK_INT((int64_t)(heff_hash_bytes(x->p, x->len) >> 2));
   HEFF_GIVEN(give, 0, a);
   return r;
 }
@@ -2488,7 +2547,7 @@ HEFF_FAST V heff_trieSlot(V bm, V h, V s) {
 // (as C's condition, and as a Bool: see `INT_CMP`)
 HEFF_FAST int heff_strEq_c_lent(V a, V b, int give) {
   Str *x = (Str *)a, *y = (Str *)b;
-  int c = x == y || (x->len == y->len && memcmp(x->s, y->s, (size_t)x->len) == 0);
+  int c = x == y || (x->len == y->len && memcmp(x->p, y->p, (size_t)x->len) == 0);
   HEFF_GIVEN(give, 0, a);
   HEFF_GIVEN(give, 1, b);
   return c;
@@ -2511,7 +2570,7 @@ HEFF_FAST V heff_strLt_lent(V a, V b, int give) { return heff_bool(heff_strLt_c_
 HEFF_FAST V heff_strByteAt_lent(V a, V i, int give) {
   Str *x = (Str *)a;
   int64_t k = INT_OF(i);
-  V r = k >= 0 && k < x->len ? MK_INT(x->s[k]) : MK_INT(-1);
+  V r = k >= 0 && k < x->len ? MK_INT(x->p[k]) : MK_INT(-1);
   HEFF_GIVEN(give, 0, a);
   return r;
 }
@@ -2990,7 +3049,7 @@ HEFF_FN V heff_strRunes(V a) {
   Str *x = (Str *)a;
   uint32_t *rs = heff_alloc((size_t)(x->len + 1) * sizeof(uint32_t));
   int64_t m = 0;
-  for (int64_t i = 0; i < x->len; m++) i += heff_u8_decode(x->s + i, x->len - i, &rs[m]);
+  for (int64_t i = 0; i < x->len; m++) i += heff_u8_decode(x->p + i, x->len - i, &rs[m]);
   V l = NTAG(TAG_Nil);
   for (int64_t k = m - 1; k >= 0; k--) {
     V f[2] = { MK_INT((int64_t)rs[k]), l };
@@ -3028,7 +3087,7 @@ HEFF_FN V heff_strOfRunes(V l) {
 HEFF_FN uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
   if (i < 0 || i >= x->len) { *w = 0; return 0xFFFD; }
   uint32_t u;
-  *w = heff_u8_decode(x->s + i, x->len - i, &u);
+  *w = heff_u8_decode(x->p + i, x->len - i, &u);
   return u;
 }
 
@@ -3052,7 +3111,7 @@ HEFF_FN V heff_strRuneCount(V a) {
   Str *x = (Str *)a;
   int64_t n = 0;
   uint32_t u;
-  for (int64_t i = 0; i < x->len; n++) i += heff_u8_decode(x->s + i, x->len - i, &u);
+  for (int64_t i = 0; i < x->len; n++) i += heff_u8_decode(x->p + i, x->len - i, &u);
   heff_drop(a);
   return MK_INT(n);
 }
@@ -3437,7 +3496,7 @@ HEFF_FN V heff_bytesAt(V a, V i) {
   Str *x = (Str *)a;
   int64_t k = INT_OF(i);
   if (!IS_INT(i) || k < 0 || k >= x->len) return heff_abandon();
-  V r = MK_INT(x->s[k]);
+  V r = MK_INT(x->p[k]);
   heff_drop(a);
   return r;
 }
@@ -3459,7 +3518,7 @@ HEFF_FN V heff_bytesConcat(V l) {
   int64_t k = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     Str *x = (Str *)heff_field(c, 0);
-    if (x->len) memcpy(s->s + k, x->s, (size_t)x->len);
+    if (x->len) memcpy(s->s + k, x->p, (size_t)x->len);
     k += x->len;
   }
   heff_drop(l);
@@ -3482,7 +3541,7 @@ HEFF_FN V heff_bytesToList(V a) {
   Str *x = (Str *)a;
   V l = NTAG(TAG_Nil);
   for (int64_t k = x->len - 1; k >= 0; k--) {
-    V f[2] = { MK_INT(x->s[k]), l };
+    V f[2] = { MK_INT(x->p[k]), l };
     l = heff_tag_n(TAG_Cons, 2, f);
   }
   heff_drop(a);
@@ -3492,7 +3551,7 @@ HEFF_FN V heff_bytesToList(V a) {
 // (a string's bytes, as they are)
 HEFF_FN V heff_bytesFromString(V a) {
   Str *x = (Str *)a, *s = heff_bytes_new(x->len);
-  if (x->len) memcpy(s->s, x->s, (size_t)x->len);
+  if (x->len) memcpy(s->s, x->p, (size_t)x->len);
   heff_drop(a);
   return (V)s;
 }
@@ -3500,7 +3559,7 @@ HEFF_FN V heff_bytesFromString(V a) {
 // (a string of them, as they are: `bytesFromString` undone)
 HEFF_FN V heff_bytesAsString(V a) {
   Str *x = (Str *)a;
-  V s = heff_str_of(x->s, x->len);
+  V s = heff_str_of(x->p, x->len);
   heff_drop(a);
   return s;
 }
@@ -3508,7 +3567,7 @@ HEFF_FN V heff_bytesAsString(V a) {
 // (their text: what is not UTF-8 in them U+FFFD, as TextDecoder reads it)
 HEFF_FN V heff_bytesToString(V a) {
   Str *x = (Str *)a;
-  V s = heff_str_valid(x->s, x->len);
+  V s = heff_str_valid(x->p, x->len);
   heff_drop(a);
   return s;
 }
@@ -3579,7 +3638,7 @@ HEFF_FN V heff_bytesIntAt(V a, V o, V n, V f) {
   Str *x = (Str *)a;
   int64_t at = INT_OF(o), bits = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > x->len * 8) return heff_abandon();
-  V r = heff_bits_int(x->s, at, bits, INT_OF(f));
+  V r = heff_bits_int(x->p, at, bits, INT_OF(f));
   heff_drop(a);
   return r;
 }
@@ -3600,7 +3659,7 @@ HEFF_FN V heff_bytesOfInt(V n, V f, V v) {
 HEFF_FN V heff_bytesHasAt(V a, V o, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
   int64_t at = INT_OF(o);
-  int r = IS_INT(o) && at >= 0 && at <= x->len - y->len && (y->len == 0 || memcmp(x->s + at, y->s, (size_t)y->len) == 0);
+  int r = IS_INT(o) && at >= 0 && at <= x->len - y->len && (y->len == 0 || memcmp(x->p + at, y->p, (size_t)y->len) == 0);
   heff_drop(a);
   heff_drop(b);
   return heff_bool(r);
@@ -3650,7 +3709,7 @@ HEFF_FN V heff_bitsIntAt(V a, V o, V n, V f) {
   Str *x = (Str *)a;
   int64_t at = INT_OF(o), bits = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || bits < 0 || bits > 64 || at + bits > HEFF_BITS_LEN(x)) return heff_abandon();
-  V r = heff_bits_int(x->s, at, bits, INT_OF(f));
+  V r = heff_bits_int(x->p, at, bits, INT_OF(f));
   heff_drop(a);
   return r;
 }
@@ -3674,7 +3733,7 @@ HEFF_FN V heff_bitsConcat(V l) {
   int64_t k = 0;
   for (V c = l; heff_tag_of(c) == TAG_Cons; c = heff_field(c, 1)) {
     Str *x = (Str *)heff_field(c, 0);
-    heff_bits_copy(s->s, k, x->s, 0, HEFF_BITS_LEN(x));
+    heff_bits_copy(s->s, k, x->p, 0, HEFF_BITS_LEN(x));
     k += HEFF_BITS_LEN(x);
   }
   heff_drop(l);
@@ -3687,7 +3746,7 @@ HEFF_FN V heff_bitsSlice(V a, V o, V n) {
   int64_t at = INT_OF(o), m = INT_OF(n);
   if (!IS_INT(o) || !IS_INT(n) || at < 0 || m < 0 || at + m > HEFF_BITS_LEN(x)) return heff_abandon();
   Str *s = heff_bits_new(m);
-  heff_bits_copy(s->s, 0, x->s, at, m);
+  heff_bits_copy(s->s, 0, x->p, at, m);
   heff_drop(a);
   return (V)s;
 }
@@ -3698,7 +3757,7 @@ HEFF_FN V heff_bitsOfBytes(V a) {
   Str *x = (Str *)a;
   if (heff_rc(&x->h) == 1) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
   Str *s = heff_bits_new(x->len * 8);
-  if (x->len) memcpy(s->s, x->s, (size_t)x->len);
+  if (x->len) memcpy(s->s, x->p, (size_t)x->len);
   heff_drop(a);
   return (V)s;
 }
@@ -3708,14 +3767,14 @@ HEFF_FN V heff_bitsBytes(V a) {
   if (x->h.tag) return heff_abandon();
   if (heff_rc(&x->h) == 1) { x->h.kind = K_BYT; return a; }
   Str *s = heff_bytes_new(x->len);
-  if (x->len) memcpy(s->s, x->s, (size_t)x->len);
+  if (x->len) memcpy(s->s, x->p, (size_t)x->len);
   heff_drop(a);
   return (V)s;
 }
 
 HEFF_FN V heff_bitsEq(V a, V b) {
   Str *x = (Str *)a, *y = (Str *)b;
-  int r = x->len == y->len && x->h.tag == y->h.tag && (x->len == 0 || memcmp(x->s, y->s, (size_t)x->len) == 0);
+  int r = x->len == y->len && x->h.tag == y->h.tag && (x->len == 0 || memcmp(x->p, y->p, (size_t)x->len) == 0);
   heff_drop(a);
   heff_drop(b);
   return heff_bool(r);
@@ -3810,9 +3869,9 @@ HEFF_FN V heff_strs_text(char **xs, int64_t n) {
 // (a path, as a C string to give the system: malloc'd, or NULL)
 HEFF_FN char *heff_cstr(V v) {
   Str *s = (Str *)v;
-  if (s->len && memchr(s->s, 0, (size_t)s->len)) return NULL;
+  if (s->len && memchr(s->p, 0, (size_t)s->len)) return NULL;
   char *c = heff_alloc((size_t)s->len + 1);
-  if (s->len) memcpy(c, s->s, (size_t)s->len);
+  if (s->len) memcpy(c, s->p, (size_t)s->len);
   c[s->len] = 0;
   return c;
 }
@@ -3820,11 +3879,11 @@ HEFF_FN char *heff_cstr(V v) {
 // (a name or text, as a C string to give the system: malloc'd, or NULL)
 HEFF_FN char *heff_cstr_text(V v) {
   Str *s = (Str *)v;
-  if (s->len && memchr(s->s, 0, (size_t)s->len)) return NULL;
+  if (s->len && memchr(s->p, 0, (size_t)s->len)) return NULL;
   int own;
-  heff_u8_valid_len(s->s, s->len, &own);
+  heff_u8_valid_len(s->p, s->len, &own);
   if (own) return heff_cstr(v);
-  Str *t = (Str *)heff_str_valid(s->s, s->len);
+  Str *t = (Str *)heff_str_valid(s->p, s->len);
   char *c = heff_cstr((V)t);
   heff_drop((V)t);
   return c;
@@ -3834,7 +3893,7 @@ HEFF_FN char *heff_cstr_text(V v) {
 HEFF_FN char *heff_bytes(V v, size_t *n) {
   Str *s = (Str *)v;
   char *c = heff_alloc((size_t)s->len + 1);
-  if (s->len) memcpy(c, s->s, (size_t)s->len);
+  if (s->len) memcpy(c, s->p, (size_t)s->len);
   c[s->len] = 0;
   *n = (size_t)s->len;
   return c;
@@ -3843,7 +3902,7 @@ HEFF_FN char *heff_bytes(V v, size_t *n) {
 // (content written out to `f`)
 HEFF_FN void heff_put(FILE *f, V v) {
   Str *s = (Str *)v;
-  if (s->len) fwrite(s->s, 1, (size_t)s->len, f);
+  if (s->len) fwrite(s->p, 1, (size_t)s->len, f);
 }
 
 // `Bytes` cross by these alone, as they are: in, `n` bytes copied, by
@@ -3859,7 +3918,7 @@ HEFF_FN V heff_bytes_in(const void *c, int64_t n) {
 HEFF_FN const uint8_t *heff_bytes_data(V v, int64_t *n) {
   Str *s = (Str *)v;
   *n = s->len;
-  return s->s;
+  return s->p;
 }
 
 // (C strings' order, for qsort)
@@ -4703,13 +4762,13 @@ HEFF_FN void buf_json_string_as(Buf *b, V v, int shown) {
   Str *s = (Str *)v;
   buf_str(b, "\"");
   for (int64_t i = 0; i < s->len; i++) {
-    uint32_t u = s->s[i];
+    uint32_t u = s->p[i];
     char tmp[16];
     if (u >= 0x80) {
-      int w = heff_u8_decode(s->s + i, s->len - i, &u);
-      if (heff_u8_own(s->s + i, u, w)) buf_put(b, (const char *)s->s + i, (size_t)w);
+      int w = heff_u8_decode(s->p + i, s->len - i, &u);
+      if (heff_u8_own(s->p + i, u, w)) buf_put(b, (const char *)s->p + i, (size_t)w);
       else if (!shown) buf_str(b, "\xEF\xBF\xBD");
-      else for (int k = 0; k < w; k++) { snprintf(tmp, sizeof tmp, "\\x%02x", s->s[i + k]); buf_str(b, tmp); }
+      else for (int k = 0; k < w; k++) { snprintf(tmp, sizeof tmp, "\\x%02x", s->p[i + k]); buf_str(b, tmp); }
       i += w - 1;
     }
     else if (u == '"') buf_str(b, "\\\"");
@@ -4774,7 +4833,7 @@ HEFF_FN int heff_show_byte_pieces(Buf *b, const uint8_t *p, int64_t len) {
 HEFF_FN void heff_show_bytes(Buf *b, V v) {
   Str *s = (Str *)v;
   buf_str(b, "b[");
-  heff_show_byte_pieces(b, s->s, s->len);
+  heff_show_byte_pieces(b, s->p, s->len);
   buf_str(b, "]");
 }
 
@@ -4785,8 +4844,8 @@ HEFF_FN void heff_show_bits(Buf *b, V v) {
   int64_t k = (8 - (int64_t)s->h.tag) & 7, whole = k ? s->len - 1 : s->len;
   char tmp[32];
   buf_str(b, "b[");
-  int any = heff_show_byte_pieces(b, s->s, whole);
-  if (k) snprintf(tmp, sizeof tmp, "%s%u::%d", any ? ", " : "", (unsigned)(s->s[whole] >> (8 - k)), (int)k);
+  int any = heff_show_byte_pieces(b, s->p, whole);
+  if (k) snprintf(tmp, sizeof tmp, "%s%u::%d", any ? ", " : "", (unsigned)(s->p[whole] >> (8 - k)), (int)k);
   else snprintf(tmp, sizeof tmp, "%sb[]::bits", any ? ", " : "");
   buf_str(b, tmp);
   buf_str(b, "]");

@@ -418,6 +418,13 @@ UTF-8 is read as U+FFFD, one for each longest start of a rune's bytes,
 or a byte that starts none (as `TextDecoder` reads it), and shown a
 byte at a time, `"a\xff"`, as it is written back.
 
+On the C backend a slice of 64 bytes or more, and at least a quarter
+of the string it is cut from, shares its bytes, as Go's does (a view,
+taken at once: a string walked by its tail, `strSlice s 1 (strLength
+s)`, is not copied at each step, until what is left is a small part of
+it); a shorter one is a copy, so that a small slice never holds a
+large string.  `Bytes` are sliced so too.
+
 ```haskell
 import rune as Rune
 
