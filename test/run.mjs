@@ -34,7 +34,7 @@ export const groups = {
   compiler: [["cli.mjs"], ["project.mjs"], ["progress.mjs"], ["terminal.mjs"], ["dev.mjs"], ["heff", "test", "test/golden.hf", "test/surface.hf", "test/format.hf", "test/cache.hf", "test/backcache.hf"]],
   lsp: [["lsp.mjs"]],
   // programs compiled by each backend and run, held to the interpreter
-  backends: [["heff", "test", "test/backends.hf"], ["app-run.mjs"]],
+  backends: [["heff", "test", "test/backends.hf", "test/apps.hf"]],
   // heff through C, under AddressSanitizer
   asan: [["heff", "test", "test/asan.hf"]],
 };
