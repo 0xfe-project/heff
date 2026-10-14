@@ -137,6 +137,8 @@ test/format.hf`, `--run format/cases/spacing` for one;
 intended change).  The cache tests hold the compiler's cache and the
 backend's, each scenario in a directory of its own (`heff test
 test/cache.hf test/backcache.hf`, `--run cache/instances` for one).
+The command line's tests are `heff test test/cli.hf` (`--run
+cli/usage` for the usage's).
 
 `make bench` (`node bench/run.mjs`, `BENCH="--runs 5 pure"` for its
 arguments) times the benchmarks of `bench/`.

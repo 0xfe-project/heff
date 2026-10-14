@@ -32,7 +32,7 @@ export const groups = {
   // command line, projects, what it draws on a terminal, its commands'
   // app, `heff dev` (the texts it said before, formatting, the caches:
   // `make test-heff`)
-  compiler: [["cli.mjs"], ["project.mjs"], ["progress.mjs"], ["terminal.mjs"], ["dev.mjs"]],
+  compiler: [["project.mjs"], ["progress.mjs"], ["terminal.mjs"], ["dev.mjs"]],
   lsp: [["lsp.mjs"]],
   // programs compiled by each backend and run, held to the interpreter
   backends: [["backends.mjs", "60", "1"], ["app-run.mjs"]],

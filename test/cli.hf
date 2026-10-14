@@ -1,0 +1,1295 @@
+-- The command line: `promote` writes each watch's and doc test's value
+-- under it, `test` runs the tests and shrinks what fails, `fmt` lays
+-- files out in place (with `--check`, only names them), `version` says
+-- which heff runs, and the usage, the completions and an unknown command
+-- say what they should, on the right stream, with the right exit status.
+-- The heff run is the one that runs the tests (`HEFF`), each test in a
+-- directory of its own; the project's files (`HEFF_TEST_ROOT`) are read,
+-- and copied, never written.
+--
+--   heff test --run cli/promote test/cli.hf
+--   heff test --run 'cli/usage/refused' test/cli.hf
+
+import check
+import co
+import regex as Regex
+import std.filesystem
+import std.process
+
+-- (what the tests run by is given, else the test fails)
+given : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{sys : process <: e}}
+      -> String
+      -> Co e String
+given name = do
+  v <- getEnv name
+  case v of
+    Just s -> pure s
+    Nothing -> failure (name ^ " is not set: `heff test` sets it")
+
+-- (its status, if it exited)
+statusOf : Ended -> String
+statusOf (Exited n) = show n
+statusOf _ = "null"
+
+-- | what a command said: its output, its error stream and its status,
+-- | one text
+said : Ran -> String
+said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
+
+-- (did it exit with this status)
+exitedWith : Int -> Ran -> Bool
+exitedWith n r = case r.ended of
+  Exited k -> k == n
+  _ -> False
+
+-- (the test fails, saying what does not hold and what was said, unless
+-- it holds)
+holds : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> String
+      -> Bool
+      -> List Ran
+      -> Co e Unit
+holds what True rs = pure MkUnit
+holds what False rs =
+  failure (what ^ " does not hold:\n" ^ joinWith "\n" (List.map said rs))
+
+-- (the test fails, saying what does not hold and the text, unless it
+-- holds)
+holdsOf : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> String
+        -> Bool
+        -> String
+        -> Co e Unit
+holdsOf what True text = pure MkUnit
+holdsOf what False text = failure (what ^ " does not hold:\n" ^ text)
+
+-- (the lines, one text)
+lined : List String -> String
+lined ls = joinWith "\n" ls
+
+-- (where the last `/` of `s` is, at or before `i`; -1 where none is)
+lastSlash : String -> Int -> Int
+lastSlash s i =
+  if i < 0 then i else if byteAt s i == 47 then i else lastSlash s (i - 1)
+
+-- (a file written, the directories above it made; else the test fails)
+write : {e : HFunctor}
+      -> {{chk : check <: e}}
+      -> {{disk : filesystem <: e}}
+      -> String
+      -> String
+      -> Co e Unit
+write path text = do
+  made <-
+    if lastSlash path (strLength path - 1) > 0
+    then makeDirectory (strSlice path 0 (lastSlash path (strLength path - 1)))
+    else pure True
+  ok <- writeFile path text
+  if ok then pure MkUnit else failure ("could not write " ^ path)
+
+-- (a file's text; "" where there is none)
+textOf : {e : HFunctor} -> {{disk : filesystem <: e}} -> String -> Co e String
+textOf path = do
+  t <- readFile path
+  pure (fromMaybe "" t)
+
+-- (heff run in the test's directory, with these environment variables)
+heffWith : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List (Pair String String)
+         -> List String
+         -> Co e Ran
+heffWith env arguments = do
+  heff <- given "HEFF"
+  run { command = heff, args = arguments, env = env }
+
+-- (heff run in the test's directory)
+heffSays : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List String
+         -> Co e Ran
+heffSays arguments = heffWith Nil arguments
+
+-- (`s`, up to the first `post`, after the first `pre`; "" where `pre`
+-- is not there)
+between : String -> String -> String -> String
+between pre post s = case indexOf pre s of
+  Just i ->
+    let rest = strSlice s (i + strLength pre) (strLength s)
+    in strSlice rest 0 (fromMaybe (strLength rest) (indexOf post rest))
+  Nothing -> ""
+
+-- (`s`, each `old` in it `new`)
+replaced : String -> String -> String -> String
+replaced old new s = joinWith new (split old s)
+
+-- (does the pattern match somewhere in the text)
+matchedBy : Either String Regex.Regex -> String -> Bool
+matchedBy (Right r) text = Regex.matches r text
+matchedBy (Left e) text = False
+
+matching : String -> String -> Bool
+matching pattern text = matchedBy (Regex.compile pattern) text
+
+-- (heff's version, as the project's package.hf says it)
+versionOf : String -> String
+versionOf pkg = between "heff = \"" "\"" pkg
+
+-- Promote, and the tests
+--------------------------------------------------------------------------------
+
+-- (a file of watches, promoted)
+promotedText : String
+promotedText =
+  lined
+    [ "-- >>> 1 + 2"
+    , "-- 3"
+    , ""
+    , "-- >>> (Cons 1 Nil : List Int)"
+    , "-- [1]"
+    , ""
+    , "-- >>> not True"
+    , "-- False"
+    , ""
+    ]
+
+-- | promote: an expectation written where there was none, a wrong one
+-- | replaced, a right one kept; then `test` holds
+promote : String -> Test
+promote name =
+  integration name (do
+  write
+      "p.hf"
+      (lined
+         [ "-- >>> 1 + 2"
+         , ""
+         , "-- >>> (Cons 1 Nil : List Int)"
+         , "-- wrong"
+         , ""
+         , "-- >>> not True"
+         , "-- False"
+         , ""
+         ])
+  promoted <- heffSays ["promote", "p.hf"]
+  text <- textOf "p.hf"
+  holds
+      "promote"
+      (succeeded promoted
+       && contains "-- >>> 1 + 2\n-- 3\n" text
+       && contains "-- >>> (Cons 1 Nil : List Int)\n-- [1]\n" text
+       && contains "-- >>> not True\n-- False\n" text
+       && not (contains "wrong" text))
+      [promoted]
+  tested <- heffSays ["test", "p.hf"]
+  holds
+      "test after promote"
+      (succeeded tested && contains "3/3 expectations hold" tested.out)
+      [tested])
+
+-- (a definition with two doc tests, its doc going on after them)
+documented : List String -> String
+documented tests =
+  lined
+    (List.append
+       (Cons "-- | a number, twice" tests)
+       [ "-- |"
+       , "-- | the doc goes on"
+       , "twice : Int -> Int"
+       , "twice x = x + x"
+       , ""
+       ])
+
+-- | doc tests: one that does not hold named by its line and its
+-- | definition; promoted, each expectation in the doc comment, the rest
+-- | of it kept
+docTests : String -> Test
+docTests name =
+  integration name (do
+  write
+      "d.hf"
+      (documented ["-- | >>> twice 2", "-- | >>> twice 3", "-- | 5"])
+  failed <- heffSays ["test", "d.hf"]
+  holds
+      "a doc test that does not hold"
+      (exitedWith 1 failed
+       && contains "FAIL d.hf:3 (twice): twice 3\n" failed.out
+       && contains "0/1 expectations hold" failed.out)
+      [failed]
+  promoted <- heffSays ["promote", "d.hf"]
+  text <- textOf "d.hf"
+  holdsOf
+      "promote, doc tests"
+      (succeeded promoted
+       && strEq
+         text
+         (documented
+            ["-- | >>> twice 2", "-- | 4", "-- | >>> twice 3", "-- | 6"]))
+      (said promoted ^ text)
+  tested <- heffSays ["test", "d.hf"]
+  holds
+      "test after promote, doc tests"
+      (succeeded tested && contains "2/2 expectations hold" tested.out)
+      [tested])
+
+-- | a diagnostic's code is written as `check` and the language server
+-- | write it, by `test` too: a doc test of no definition warned of, W0151
+warningCode : String -> Test
+warningCode name =
+  integration name (do
+  write "w.hf" "-- | >>> 1 + 1\n-- | 2\n"
+  tested <- heffSays ["test", "w.hf"]
+  checked <- heffSays ["check", "w.hf"]
+  holds
+      "test, a warning's code"
+      (succeeded tested
+       && contains
+         "warning[W0151]: a doc test is of the definition"
+         (tested.out ^ tested.err)
+       && contains
+         "warning[W0151]: a doc test is of the definition"
+         checked.err)
+      [tested, checked])
+
+-- (a group of tests, two of them failing, one a property)
+propsText : String
+propsText =
+  lined
+    [ "import check"
+    , "import co"
+    , "import generator as Generator"
+    , ""
+    , "small : Test"
+    , "small = group \"small\""
+    , "  [ unit \"two\" (assertEqual (1 + 1) 2)"
+    , "  , unit \"three\" (assertEqual (1 + 1) 3)"
+    , "  , property \"all below 50\" (do"
+    , "      xs <- forAll (Generator.list 0 20 (Generator.int 0 99))"
+    , "      assert \"all below 50\" (List.all (\\x -> x < 50) xs))"
+    , "  , property \"reversed twice\" (do"
+    , "      xs <- forAll (Generator.list 0 20 (Generator.int 0 99))"
+    , "      label (if List.null xs then \"empty\" else \"not empty\")"
+    , "      assertEqual (List.reverse (List.reverse xs)) xs)"
+    , "  ]"
+    , ""
+    ]
+
+-- (how many runs held before the property failed)
+runsOf : Ran -> String
+runsOf r = between "all below 50  (failed after " " runs held" r.out
+
+-- (the property that fails, shrunk so: `once`, or `N times`)
+shrunkSo : String -> String
+shrunkSo times =
+  "  FAIL  small / all below 50  \\(failed after [0-9]+ runs held; shrunk "
+  ^ times
+  ^ "; again: --seed 2026\\)\n        \\[50\\]\n        all below 50\n"
+
+-- | test: the definitions of type `Test` run too.  A property that fails
+-- | on purpose is shrunk to its smallest counterexample, says the seed
+-- | that runs it again, and fails the run; the same seed runs the same
+-- | runs, another seed others, to the same counterexample
+properties : String -> Test
+properties name =
+  integration name (do
+  write "props.hf" propsText
+  props <- heffSays ["test", "props.hf"]
+  holds
+      "test runs the tests"
+      (exitedWith 1 props
+       && contains "  ok    small / two\n" props.out
+       && contains
+         "  FAIL  small / three\n        expected 3\n        but got  2\n"
+         props.out
+       && (matching (shrunkSo "once") props.out
+           || matching (shrunkSo "[0-9]+ times") props.out)
+       && matching
+         "  ok    small / reversed twice  \\(100 runs, [0-9]+% empty, [0-9]+% not empty\\)\n"
+         props.out
+       && contains "FAIL  props.hf  0/0, tests 2/4\n" props.out
+       && endsWith
+         "0/0 expectations hold, 2/4 tests hold, 1/1 files check as they should\n"
+         props.out)
+      [props]
+  seeded <- heffSays ["test", "--seed", "99", "props.hf"]
+  holds
+      "test --seed"
+      (exitedWith 1 seeded
+       && contains "again: --seed 99)\n        [50]\n" seeded.out
+       && not (strEq (runsOf seeded) "")
+       && not (strEq (runsOf seeded) (runsOf props)))
+      [seeded, props]
+  again <- heffSays ["test", "props.hf", "-s", "99"]
+  holds "test --seed, again" (strEq again.out seeded.out) [again, seeded])
+
+-- (tests run outside: one past its time limit, one in a directory of
+-- its own, one keeping a golden text)
+outsideText : String
+outsideText =
+  lined
+    [ "import check"
+    , "import co"
+    , "import std.filesystem"
+    , "import std.process"
+    , ""
+    , "slow : Test"
+    , "slow = within 300 (integration \"sleeps\" (do"
+    , "  r <- run { command = \"sleep\", args = [\"5\"] }"
+    , "  pure MkUnit))"
+    , ""
+    , "named : Test"
+    , "named = group \"a\""
+    , "  [ unit \"x\" (assertEqual 1 1)"
+    , "  , integration \"y\" (do"
+    , "      here <- workingDir"
+    , "      names <- readDirectory here"
+    , "      assertEqual names (Just Nil))"
+    , "  , group \"lsp\" [unit \"hover\" (golden \"hover.txt\" \"a hover\\n\")]"
+    , "  ]"
+    , ""
+    ]
+
+-- (what `--run '^a/y$'` says)
+selectedSaid : String
+selectedSaid =
+  "  ok    a / y\nok    outside.hf  0/0, tests 1/1\n0/0 expectations hold, 1/1 tests hold, 1/1 files check as they should\n"
+
+-- | test: an integration test runs outside, a program of its own in a
+-- | directory of its own, killed at its time limit; `--run` selects
+-- | tests by their names, a level each between `/`s, as Go's `-run`;
+-- | `--update` writes the golden texts the tests keep, which are then
+-- | held to them
+outside : String -> Test
+outside name =
+  integration name (do
+  write "outside.hf" outsideText
+  write "props.hf" propsText
+  ran <- heffSays ["test", "outside.hf"]
+  holds
+      "test, integration tests"
+      (exitedWith 1 ran
+       && contains "  ok    a / x\n" ran.out
+       && contains "  ok    a / y\n" ran.out
+       && contains
+         "  FAIL  sleeps\n        took longer than its time limit, 300 ms: killed\n"
+         ran.out
+       && contains
+         "  FAIL  a / lsp / hover\n        golden outside.golden/hover.txt\n        not kept yet: `heff test --update` writes it\n"
+         ran.out
+       && endsWith "1/1 files check as they should\n" ran.out
+       && contains "tests 2/4\n" ran.out)
+      [ran]
+  selected <- heffSays ["test", "--run", "^a/y$", "outside.hf"]
+  holds
+      "test --run"
+      (succeeded selected && strEq selected.out selectedSaid)
+      [selected]
+  others <- heffSays ["test", "--run", "^a/y$", "outside.hf", "props.hf"]
+  holds
+      "test --run, a file with none selected not listed"
+      (strEq others.out selected.out)
+      [others]
+  none <- heffSays ["test", "--run", "nothing", "outside.hf", "props.hf"]
+  holds
+      "test --run, no tests match"
+      (exitedWith 1 none
+       && strEq none.out ""
+       && strEq none.err "heff test: no tests match 'nothing'\n")
+      [none]
+  nested <- heffSays ["test", "-r", "a/lsp", "-j", "1", "outside.hf"]
+  holds
+      "test --run, a level each"
+      (exitedWith 1 nested
+       && contains "  FAIL  a / lsp / hover\n" nested.out
+       && contains "tests 0/1\n" nested.out)
+      [nested]
+  unread <- heffSays ["test", "--run", "a(", "outside.hf"]
+  holds
+      "test --run, a pattern not read"
+      (exitedWith 2 unread
+       && strEq
+         unread.err
+         "heff test: --run a(: groups, `(...)`, are not read\n")
+      [unread]
+  updated <- heffSays ["test", "--update", "--run", "a/lsp", "outside.hf"]
+  hover <- textOf "outside.golden/hover.txt"
+  holds
+      "test --update"
+      (succeeded updated
+       && startsWith "wrote outside.golden/hover.txt\n" updated.out
+       && strEq hover "a hover\n")
+      [updated]
+  kept <- heffSays ["test", "--run", "a/lsp", "outside.hf"]
+  holds "test, a golden text held" (succeeded kept) [kept]
+  write "outside.golden/hover.txt" "another hover\n"
+  differs <- heffSays ["test", "--run", "a/lsp", "outside.hf"]
+  holds
+      "test, a golden text that differs"
+      (exitedWith 1 differs
+       && contains
+         "        golden outside.golden/hover.txt, line 1\n        expected \"another hover\"\n        but got  \"a hover\"\n"
+         differs.out)
+      [differs])
+
+-- (the line of a type error, `oops = True`, said)
+mistypedAt : String -> String
+mistypedAt file =
+  "  " ^ file ^ ":5:8: error[E0314]: expected type Int, but got the tag True\n"
+
+-- | test: a file that does not check fails the run, though every
+-- | expectation counted holds: it is named in a list above the last
+-- | line, a line each, where its first error is -- one with a type error,
+-- | its watch evaluated still, and one that does not parse
+unchecked : String -> Test
+unchecked name =
+  integration name (do
+  write "p.hf" promotedText
+  write
+      "mistyped.hf"
+      (lined ["-- >>> 1 + 1", "-- 2", "", "oops : Int", "oops = True", ""])
+  write "unparsed.hf" (lined ["x : Int", "x = (1 +", ""])
+  mistyped <- heffSays ["test", "p.hf", "mistyped.hf"]
+  holds
+      "test, a file that does not check"
+      (exitedWith 1 mistyped
+       && contains "FAIL  mistyped.hf  1/1\n" mistyped.out
+       && endsWith
+         ("files that do not check as they should:\n"
+          ^ mistypedAt "mistyped.hf"
+          ^ "4/4 expectations hold, 1/2 files check as they should\n")
+         mistyped.out)
+      [mistyped]
+  both <- heffSays ["test", "p.hf", "mistyped.hf", "unparsed.hf"]
+  holds
+      "test, files that do not check"
+      (exitedWith 1 both
+       && contains "FAIL  unparsed.hf  0/0\n" both.out
+       && endsWith
+         ("files that do not check as they should:\n"
+          ^ mistypedAt "mistyped.hf"
+          ^ "  unparsed.hf:2:9: error[E0150]: expected an expression, not the end of the declaration\n"
+          ^ "4/4 expectations hold, 1/3 files check as they should\n")
+         both.out)
+      [both])
+
+-- | test: a file whose first line is `-- test: expect errors` (a test of
+-- | the errors said) passes by having errors, not said; it fails if it
+-- | checks; the line anywhere else is a comment like another
+expectErrors : String -> Test
+expectErrors name =
+  integration name (do
+  write "p.hf" promotedText
+  write
+      "wants.hf"
+      (lined ["-- test: expect errors", "oops : Int", "oops = True", ""])
+  write
+      "checks.hf"
+      (lined ["-- test: expect errors", "fine : Int", "fine = 1", ""])
+  write
+      "below.hf"
+      (lined ["", "-- test: expect errors", "oops : Int", "oops = True", ""])
+  wanted <- heffSays ["test", "p.hf", "wants.hf"]
+  holds
+      "test, a file that expects errors and has them"
+      (succeeded wanted
+       && contains "ok    wants.hf  errors, as expected\n" wanted.out
+       && not (contains "E0314" (wanted.out ^ wanted.err))
+       && endsWith
+         "\n3/3 expectations hold, 2/2 files check as they should (1 with expected errors)\n"
+         wanted.out)
+      [wanted]
+  unwanted <- heffSays ["test", "wants.hf", "checks.hf"]
+  holds
+      "test, a file that expects errors but checks"
+      (exitedWith 1 unwanted
+       && contains "FAIL  checks.hf  checks, but expects errors\n" unwanted.out
+       && endsWith
+         ("files that do not check as they should:\n"
+          ^ "  checks.hf: checks, but its first line expects errors\n"
+          ^ "0/0 expectations hold, 1/2 files check as they should (1 with expected errors)\n")
+         unwanted.out)
+      [unwanted]
+  below <- heffSays ["test", "below.hf"]
+  holds
+      "test, `-- test: expect errors` not the first line"
+      (exitedWith 1 below
+       && endsWith
+         ("  below.hf:4:8: error[E0314]: expected type Int, but got the tag True\n"
+          ^ "0/0 expectations hold, 0/1 files check as they should\n")
+         below.out)
+      [below])
+
+-- Formatting
+--------------------------------------------------------------------------------
+
+-- (a definition under `-- fmt: skip`)
+keptText : String
+keptText = "-- fmt: skip\nm : List Int\nm = [ 1, 0,\n      0, 1 ]\n"
+
+-- | fmt: --check names what is not laid out (and fails), leaves it;
+-- | without it, lays it out; a file that does not parse is refused,
+-- | untouched.  A definition under `-- fmt: skip` is as it is written,
+-- | for `--check` too, and left so; what is around it is laid out
+formatting : String -> Test
+formatting name =
+  integration name (do
+  write "messy.hf" "f :  Int -> Int\nf x   =  x + 1\n"
+  write "clean.hf" "f : Int\nf = 1\n"
+  write "broken.hf" "f : Int ->\n"
+  checked <- heffSays ["fmt", "--check", "messy.hf", "clean.hf"]
+  untouched <- textOf "messy.hf"
+  holds
+      "fmt --check"
+      (exitedWith 1 checked
+       && strEq checked.out "messy.hf\n"
+       && strEq untouched "f :  Int -> Int\nf x   =  x + 1\n")
+      [checked]
+  laid <- heffSays ["fmt", "messy.hf", "clean.hf"]
+  messy <- textOf "messy.hf"
+  clean <- textOf "clean.hf"
+  holds
+      "fmt"
+      (succeeded laid
+       && strEq messy "f : Int -> Int\nf x = x + 1\n"
+       && strEq clean "f : Int\nf = 1\n")
+      [laid]
+  refused <- heffSays ["fmt", "broken.hf"]
+  broken <- textOf "broken.hf"
+  holds
+      "fmt of what does not parse"
+      (exitedWith 1 refused
+       && contains
+         "broken.hf not formatted: the file does not parse"
+         refused.err
+       && strEq broken "f : Int ->\n")
+      [refused]
+  write "kept.hf" keptText
+  write "around.hf" (keptText ^ "n  =  1\n")
+  keptCheck <- heffSays ["fmt", "--check", "kept.hf", "around.hf"]
+  holds
+      "fmt --check of a definition kept"
+      (exitedWith 1 keptCheck && strEq keptCheck.out "around.hf\n")
+      [keptCheck]
+  keptLaid <- heffSays ["fmt", "kept.hf", "around.hf"]
+  kept <- textOf "kept.hf"
+  around <- textOf "around.hf"
+  holds
+      "fmt of a definition kept"
+      (succeeded keptLaid
+       && strEq kept keptText
+       && strEq around (keptText ^ "n = 1\n"))
+      [keptLaid])
+
+-- | fmt: a chain of operators breaks at its loosest, as the fixities of
+-- | what the file imports say
+fixities : String -> Test
+fixities name =
+  integration name (do
+  write
+      "ops.hf"
+      (lined
+         [ "infixl <+"
+         , "infixl <* above <+"
+         , ""
+         , "(<+) : Int -> Int -> Int"
+         , "(<+) a b = a + b"
+         , ""
+         , "(<*) : Int -> Int -> Int"
+         , "(<*) a b = a * b"
+         , ""
+         ])
+  write
+      "uses.hf"
+      (lined
+         [ "import ops"
+         , ""
+         , "long : Int"
+         , "long = aaaaaaaaaaaaaaaaaaaa <+ bbbbbbbbbbbbbbbbbbbbbbbbb <* cccccccccccccccccccccc <+ dddddddddddddddd"
+         , ""
+         ])
+  cut <- heffSays ["fmt", "uses.hf"]
+  text <- textOf "uses.hf"
+  holdsOf
+      "fmt by imported fixities"
+      (succeeded cut
+       && strEq
+         text
+         (lined
+            [ "import ops"
+            , ""
+            , "long : Int"
+            , "long ="
+            , "  aaaaaaaaaaaaaaaaaaaa"
+            , "  <+ bbbbbbbbbbbbbbbbbbbbbbbbb <* cccccccccccccccccccccc"
+            , "  <+ dddddddddddddddd"
+            , ""
+            ]))
+      (said cut ^ text))
+
+-- The usage
+--------------------------------------------------------------------------------
+
+-- | the commands the usage lists
+commands : List String
+commands =
+  [ "check"
+  , "run"
+  , "test"
+  , "promote"
+  , "compile"
+  , "explain"
+  , "type-at"
+  , "fmt"
+  , "init"
+  , "get"
+  , "build"
+  , "install"
+  , "publish"
+  , "dev"
+  , "lsp"
+  , "version"
+  , "help"
+  , "completions"
+  ]
+
+-- | words heff refuses, each with the start of what it says
+refusals : List (Pair (List String) String)
+refusals =
+  [ MkPair
+    ["fmt"]
+    "heff fmt: expected FILE...\nusage: heff fmt FILE... [--check]\n"
+  , MkPair ["check"] "heff check: expected FILE\nusage: heff check FILE\n"
+  , MkPair
+    ["fmt", "--chek", "x.hf"]
+    "heff fmt: no flag --chek; --check?\nusage: heff fmt FILE... [--check]\n"
+  , MkPair
+    ["compile", "a.hf", "a.mjs"]
+    "heff compile: --backend=MODE is wanted\n"
+  , MkPair
+    ["compile", "a.hf", "a.mjs", "--backend=wasm"]
+    "heff compile: --backend is esm, page or c, not wasm\n"
+  , MkPair
+    ["compile", "a.hf", "a.mjs", "--backend=node"]
+    "heff compile: --backend is esm, page or c, not node\n"
+  , MkPair ["compile", "a.hf", "--backend=c"] "heff compile: expected OUT\n"
+  , MkPair
+    ["compile", "a.hf", "a.mjs", "--backend=esm", "--name", "x"]
+    "heff compile: an ES module runs nothing: no --name with --backend=esm"
+  , MkPair ["init", "a", "b"] "heff init: too many words: b\n"
+  , MkPair ["build", "x"] "heff build: too many words: x\nusage: heff build\n"
+  ]
+
+-- (a subtest each, the words given heff, held to `ok`)
+eachRun : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> {{sys : process <: e}}
+        -> String
+        -> (List String -> Ran -> Bool)
+        -> List (List String)
+        -> Co e Unit
+eachRun what ok Nil = pure MkUnit
+eachRun what ok (Cons words rest) = do
+  subtest (what ^ " " ^ show words) (do
+    r <- heffSays words
+    holds (what ^ " " ^ show words) (ok words r) [r])
+  eachRun what ok rest
+
+-- (what is refused, said so)
+eachRefused : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> List (Pair (List String) String)
+            -> Co e Unit
+eachRefused Nil = pure MkUnit
+eachRefused (Cons (MkPair words says) rest) = do
+  subtest ("refused " ^ show words) (do
+    r <- heffSays words
+    holds
+        ("refused: " ^ joinWith " " words)
+        (exitedWith 1 r && strEq r.out "" && startsWith says r.err)
+        [r])
+  eachRefused rest
+
+-- | the usage: asked for, on stdout; for what is no command, on stderr,
+-- | failing; a command's own help, asked for; its words wrong, what is
+-- | wrong and how it is called, on stderr.  (With no words, not on a
+-- | terminal: the usage, as `help` says it -- on one, its commands' app.)
+usage : String -> Test
+usage name =
+  integration name (do
+  eachRun
+      "usage"
+      (\words r ->
+         succeeded r
+         && startsWith "usage: heff COMMAND ...\n" r.out
+         && List.all (\c -> contains ("\n  " ^ c) r.out) commands
+         && not (contains "dump-core" r.out)
+         && not (contains "dev-pages" r.out))
+      [Nil, ["help"], ["--help"]]
+  subtest "refused no-such-command" (do
+    r <- heffSays ["no-such-command"]
+    holds
+        "refused: no-such-command"
+        (exitedWith 1 r
+         && strEq r.out ""
+         && startsWith
+           "heff: no command no-such-command\nusage: heff COMMAND ..."
+           r.err)
+        [r])
+  eachRefused refusals
+  eachRun
+      "help"
+      (\words r ->
+         succeeded r
+         && startsWith
+           "usage: heff compile FILE OUT [--name NAME] --backend=MODE\n"
+           r.out
+         && contains "\n  -b, --backend=MODE" r.out
+         && contains "(esm, page, c)" r.out)
+      [["help", "compile"], ["compile", "--help"], ["compile", "a.hf", "-h"]])
+
+-- The version
+--------------------------------------------------------------------------------
+
+-- (the path, where there is one)
+pathOr : String -> Either FileError String -> String
+pathOr d (Right p) = p
+pathOr d (Left e) = d
+
+-- | version: the heff running, as the package.hf it came with says (the
+-- | repository's, or one beside its bin/); with none there, or one that
+-- | does not read, not known, and where it looked said
+version : String -> Test
+version name =
+  integration name (do
+  root <- given "HEFF_TEST_ROOT"
+  heff <- given "HEFF"
+  pkg <- textOf (root ^ "/package.hf")
+  versionSaid <- heffSays ["version"]
+  holds
+      "version"
+      (succeeded versionSaid
+       && strEq versionSaid.out ("heff " ^ versionOf pkg ^ "\n"))
+      [versionSaid]
+  here <- workingDir
+  made <- makeDirectory "lone/bin"
+  copied <- copy heff "lone/bin/heff"
+  lone <- realPath "lone"
+  let lonePkg = pathOr (here ^ "/lone") lone ^ "/package.hf"
+  noPkg <- run { command = here ^ "/lone/bin/heff", args = ["version"] }
+  holds
+      "version, no package.hf"
+      (exitedWith 1 noPkg
+       && strEq noPkg.out ""
+       && strEq
+         noPkg.err
+         ("heff version: not known: there is no " ^ lonePkg ^ "\n"))
+      [noPkg]
+  write "lone/package.hf" "package = 1\n"
+  badPkg <- run { command = here ^ "/lone/bin/heff", args = ["version"] }
+  holds
+      "version, a package.hf that does not read"
+      (exitedWith 1 badPkg
+       && strEq badPkg.out ""
+       && startsWith
+         ("heff version: not known: " ^ lonePkg ^ ":1:11: ")
+         badPkg.err)
+      [badPkg])
+
+-- Completions
+--------------------------------------------------------------------------------
+
+-- | words, and what they complete to: the commands, a command's flags,
+-- | a flag's values, its files
+completed : List (Pair (List String) String)
+completed =
+  [ MkPair
+    ["co"]
+    "compile\tFILE compiled, by MODE: esm (an ES module), page (a script running the app NAME in a page), c (a C program running NAME, for `zig cc`)\ncompletions\ta completion script for SHELL\n"
+  , MkPair ["compile", "a.hf", "--b"] "--backend\twhat it is compiled to\n"
+  , MkPair ["compile", "a.hf", "-b", ""] "esm\npage\nc\n"
+  , MkPair ["compile", "a.hf", "--backend=p"] "--backend=page\n"
+  , MkPair ["fmt", "--check", ""] ":files .hf\n"
+  , MkPair ["init", ""] ":dirs\n"
+  , MkPair ["completions", ""] "fish\nbash\nzsh\n"
+  , MkPair
+    ["dev", "--po"]
+    "--port\twhere the pages are served: http://127.0.0.1:PORT/ (8000)\n"
+  , MkPair
+    ["de"]
+    "dev\tthe project built as `heff build` builds it, its C programs (the APPs, else all) run and its pages served, then built and run again at each change of its files\n"
+  , MkPair ["run", "main.hf", "--"] ""
+  ]
+
+-- (each, a subtest)
+eachCompleted : {e : HFunctor}
+              -> {{chk : check <: e}}
+              -> {{sys : process <: e}}
+              -> List (Pair (List String) String)
+              -> Co e Unit
+eachCompleted Nil = pure MkUnit
+eachCompleted (Cons (MkPair words out) rest) = do
+  subtest (show words) (do
+    r <- heffSays (Cons "complete" words)
+    holds ("complete " ^ show words) (succeeded r && strEq r.out out) [r])
+  eachCompleted rest
+
+-- | what a word completes to
+completes : String -> Test
+completes name = integration name (eachCompleted completed)
+
+-- (in double quotes, as a shell reads it)
+quotedForShell : String -> String
+quotedForShell s = "\"" ^ s ^ "\""
+
+-- (the lines said, those not empty)
+offered : String -> List String
+offered out = List.filter (\l -> not (strEq l "")) (lines (trim out))
+
+-- (two lists of lines alike)
+alike : List String -> List String -> Bool
+alike xs ys = strEq (joinWith "\n" xs) (joinWith "\n" ys)
+
+-- | lines typed so far, each with its words as bash splits them (at `=`
+-- | too), and what bash offers
+bashCases : List (Pair String (Pair (List String) (List String)))
+bashCases =
+  [ MkPair "heff comp" (MkPair ["heff", "comp"] ["compile", "completions"])
+  , MkPair
+    "heff compile a.hf --b"
+    (MkPair ["heff", "compile", "a.hf", "--b"] ["--backend"])
+  , MkPair
+    "heff compile a.hf --backend "
+    (MkPair ["heff", "compile", "a.hf", "--backend", ""] ["esm", "page", "c"])
+  , MkPair
+    "heff compile a.hf --backend=p"
+    (MkPair ["heff", "compile", "a.hf", "--backend", "=", "p"] ["page"])
+  , MkPair
+    "heff compile a.hf --backend="
+    (MkPair
+       ["heff", "compile", "a.hf", "--backend", "="]
+       ["=esm", "=page", "=c"])
+  , MkPair "heff check cle" (MkPair ["heff", "check", "cle"] ["clean.hf"])
+  ]
+
+-- | lines typed so far, and what fish offers
+fishCases : List (Pair String (List String))
+fishCases =
+  [ MkPair "heff comp" ["compile", "completions"]
+  , MkPair
+    "heff compile a.hf --backend="
+    ["--backend=esm", "--backend=page", "--backend=c"]
+  , MkPair "heff compile a.hf -b " ["c", "esm", "page"]
+  , MkPair "heff check cle" ["clean.hf"]
+  ]
+
+-- (a shell's script run, with `heff` on the PATH)
+shellRun : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> String
+         -> List String
+         -> Co e Ran
+shellRun shell arguments = do
+  here <- workingDir
+  path <- getEnv "PATH"
+  run
+      { command = shell
+      , args = arguments
+      , env = [MkPair "PATH" (here ^ "/bin:" ^ fromMaybe "" path)]
+      }
+
+-- (bash's offers, each a subtest)
+eachBash : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List (Pair String (Pair (List String) (List String)))
+         -> Co e Unit
+eachBash Nil = pure MkUnit
+eachBash (Cons (MkPair line (MkPair words want)) rest) = do
+  subtest ("bash " ^ show line) (do
+    r <-
+      shellRun
+        "bash"
+        [ "-c"
+        , "source comp.bash; COMP_LINE="
+        ^ quotedForShell line
+        ^ "; COMP_POINT=${#COMP_LINE}; COMP_WORDS=("
+        ^ joinWith " " (List.map quotedForShell words)
+        ^ "); COMP_CWORD="
+        ^ show (List.length words - 1)
+        ^ "; _heff; printf '%s\\n' \"${COMPREPLY[@]}\""
+        ]
+    holds
+        ("bash completes " ^ show line)
+        (succeeded r && alike (offered r.out) want)
+        [r])
+  eachBash rest
+
+-- (what fish offers: each offer's word, before its tab)
+fishWord : String -> String
+fishWord l = fromMaybe l (List.head (split "\t" l))
+
+-- (fish's offers, each a subtest; fish sorts what it offers)
+eachFish : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List (Pair String (List String))
+         -> Co e Unit
+eachFish Nil = pure MkUnit
+eachFish (Cons (MkPair line want) rest) = do
+  subtest ("fish " ^ show line) (do
+    r <-
+      shellRun
+        "fish"
+        [ "--no-config"
+        , "-c"
+        , "source comp.fish; complete -C " ^ quotedForShell line
+        ]
+    holds
+        ("fish completes " ^ show line)
+        (succeeded r
+         && alike
+           (List.sort (List.map fishWord (offered r.out)))
+           (List.sort want))
+        [r])
+  eachFish rest
+
+-- (was it there to run)
+wasRun : Ran -> Bool
+wasRun r = case r.ended of
+  NotRun -> False
+  _ -> True
+
+-- (fish's offers, where fish is)
+fishes : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> Bool
+       -> Co e Unit
+fishes False = pure MkUnit
+fishes True = do
+  fish <- heffSays ["completions", "fish"]
+  write "comp.fish" fish.out
+  eachFish fishCases
+
+-- | the scripts, run by their shells, with `heff` on the path: a line
+-- | typed so far, and what the shell offers.  (fish and zsh, where they
+-- | are.  fish reads no one's configuration (`--no-config`): a
+-- | config.fish, or its universal variables, put another heff on the
+-- | PATH before this one.)
+shells : String -> Test
+shells name =
+  integration name (do
+  heff <- given "HEFF"
+  write "bin/heff" ("#!/bin/sh\nexec \"" ^ heff ^ "\" \"$@\"\n")
+  executable <- makeExecutable "bin/heff"
+  write "clean.hf" "f : Int\nf = 1\n"
+  bash <- heffSays ["completions", "bash"]
+  write "comp.bash" bash.out
+  eachBash bashCases
+  fishThere <- run { command = "fish", args = ["--version"] }
+  fishes (wasRun fishThere)
+  subtest "zsh" (do
+    zsh <- heffSays ["completions", "zsh"]
+    parsed <- run { command = "zsh", args = ["-n"], input = Given zsh.out }
+    holds
+        "completions zsh"
+        (succeeded zsh
+         && startsWith "#compdef heff\n" zsh.out
+         && contains "heff complete" zsh.out
+         && (not (wasRun parsed) || succeeded parsed))
+        [zsh, parsed])
+  subtest "no shell" (do
+    noShell <- heffSays ["completions", "tcsh"]
+    holds
+        "completions of no shell"
+        (exitedWith 1 noShell
+         && startsWith
+           "heff completions: a shell is fish, bash or zsh, not tcsh"
+           noShell.err)
+        [noShell]))
+
+-- Diagnostics
+--------------------------------------------------------------------------------
+
+-- (the escape character)
+esc : String
+esc = "\u{1b}"
+
+-- (the text, from `i` on, its colours, `ESC[...m`, taken out)
+uncolouredFrom : String -> Int -> List String -> String
+uncolouredFrom s i acc =
+  if i >= strLength s then joinWith "" (List.reverse acc)
+  else if byteAt s i == 27
+  then uncolouredFrom
+      s
+      (fromMaybe (strLength s - 1) (indexFrom "m" s i) + 1)
+      acc
+  else uncolouredFrom s (i + 1) (Cons (strSlice s i (i + 1)) acc)
+
+uncoloured : String -> String
+uncoloured s = uncolouredFrom s 0 Nil
+
+-- (`heff check` of the file: on a terminal or not, `NO_COLOR` or not --
+-- either unset where it is empty)
+checkedWith : {e : HFunctor}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> String
+            -> String
+            -> String
+            -> Co e Ran
+checkedWith tty noColor file =
+  heffWith [MkPair "HEFF_TTY" tty, MkPair "NO_COLOR" noColor] ["check", file]
+
+-- | a diagnostic: in colour where heff is told the standard error is a
+-- | terminal (`HEFF_TTY=1`), not where `NO_COLOR` is set or it is not
+-- | one; a span over lines marked once, in a margin
+colour : String -> Test
+colour name =
+  integration name (do
+  write
+      "diag.hf"
+      (lined
+         [ "data C = R | G | B"
+         , ""
+         , "name : C -> String"
+         , "name c = case c of"
+         , "  R -> \"red\""
+         , "  G -> \"green\""
+         , ""
+         ])
+  plain <- checkedWith "" "" "diag.hf"
+  holds
+      "a diagnostic, not on a terminal"
+      (exitedWith 1 plain
+       && not (contains esc plain.err)
+       && contains
+         (lined
+            [ "error[E0317]: no case provided for tag B"
+            , "4 |   name c = case c of"
+            , "  |  __________^"
+            , "5 | |   R -> \"red\""
+            , "6 | |   G -> \"green\""
+            , "  | |______________^"
+            ])
+         plain.err)
+      [plain]
+  tty <- checkedWith "1" "" "diag.hf"
+  holds
+      "a diagnostic, on a terminal"
+      (exitedWith 1 tty
+       && contains
+         (esc ^ "[1;31merror[E0317]" ^ esc ^ "[0m: no case provided")
+         tty.err
+       && contains (esc ^ "[2m6 |" ^ esc ^ "[0m") tty.err
+       && contains (esc ^ "[1;31m|______________^" ^ esc ^ "[0m") tty.err
+       && strEq (uncoloured tty.err) plain.err)
+      [tty, plain]
+  noColor <- checkedWith "1" "1" "diag.hf"
+  holds
+      "a diagnostic, NO_COLOR"
+      (exitedWith 1 noColor && strEq noColor.err plain.err)
+      [noColor, plain])
+
+-- | a diagnostic's column is of runes, and so are its marks: one beyond
+-- | U+FFFF is one column, whatever units it takes; a character no token
+-- | starts with is whole
+astral : String -> Test
+astral name =
+  integration name (do
+  write "astral.hf" "s : Int\ns = {- 😀 -} \"😀\"\n\nt : Int\nt = 1 😀 2\n"
+  r <- checkedWith "" "" "astral.hf"
+  holds
+      "a diagnostic past a rune beyond U+FFFF"
+      (exitedWith 1 r
+       && contains
+         "astral.hf:2:13\nerror[E0311]: expected type Int, but got type String\n2 | s = {- 😀 -} \"😀\"\n2 |             ^^^\n"
+         r.err
+       && contains
+         "astral.hf:5:7\nerror[E0150]: unexpected character 😀\n5 | t = 1 😀 2\n5 |       ^\n"
+         r.err
+       && contains
+         "astral.hf:5:5\nerror[E0302]: tried to apply a value as a function, where its type is not known\n5 | t = 1 😀 2\n5 |     ^^^^^\n"
+         r.err
+       && not (contains "\u{FFFD}" r.err))
+      [r])
+
+-- heff's own library
+--------------------------------------------------------------------------------
+
+-- (a variable set, as `env` is told it)
+assigned : Pair String String -> String
+assigned (MkPair k v) = k ^ "=" ^ v
+
+-- (heff, the one given, run in the test's directory with no `HEFF_LIB`
+-- but where these say, and its heff home `HEFF_HOME` -- the one these
+-- say, else one with nothing in it)
+ownRun : {e : HFunctor}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> List (Pair String String)
+       -> List String
+       -> Co e Ran
+ownRun bin env arguments = do
+  here <- workingDir
+  run
+      { command = "env"
+      , args =
+          List.append
+            (Cons
+               "-u"
+               (Cons
+                  "HEFF_LIB"
+                  (Cons
+                     ("HEFF_HOME=" ^ here ^ "/no-home")
+                     (List.map assigned env))))
+            (Cons bin arguments)
+      }
+
+-- (did it say one of these codes)
+saysAny : List String -> Ran -> Bool
+saysAny codes r = List.any (\c -> contains c r.err) codes
+
+-- (a primitive the library declares at a type the runtime does not have
+-- it at)
+wrongText : String
+wrongText =
+  lined
+    [ "import check"
+    , ""
+    , "primitive floatSin : Int -> Int"
+    , ""
+    , "-- >>> floatSin 4"
+    , "-- <compiler bug: a primitive given what is not a `Float64`>"
+    , ""
+    , "-- >>> floatSin 5"
+    , ""
+    , "root : Int"
+    , "root = floatSin 4"
+    , ""
+    , "bugged : Test"
+    , "bugged = unit \"met a bug\" (assert \"never\" (floatSin 4 == 2))"
+    , ""
+    ]
+
+-- (what the interpreter says of a bug of the compiler it met)
+bug : String
+bug = "<compiler bug: a primitive given what is not a `Float64`>"
+
+-- (the project's package.hf, its module named so)
+renamedPackage : String -> String -> String
+renamedPackage name pkg =
+  replaced
+    ("module = \"" ^ between "module = \"" "\"" pkg ^ "\"")
+    ("module = \"" ^ name ^ "\"")
+    pkg
+
+-- | heff's own lib/ is the library, whatever library the heff running
+-- | has (`HEFF_LIB` elsewhere, as an installed heff's is): its
+-- | primitives its own, declared once; the lib/ of a project that is not
+-- | heff is none.  A primitive the library declares at a type the
+-- | runtime does not have it at is what type checking cannot see: the
+-- | interpreter, given a value of the wrong shape, says it met a bug of
+-- | the compiler -- a watch that meets one fails, whatever its
+-- | expectation, as a test does, and so does `dump-eval`, saying where.
+-- | A heff not built in the repository (installed, another checkout's):
+-- | the repository is heff's own where its heff home says it was
+-- | installed from it (`source`), and nowhere else.
+ownLibrary : String -> Test
+ownLibrary name =
+  integration name (do
+  root <- given "HEFF_TEST_ROOT"
+  heff <- given "HEFF"
+  here <- workingDir
+  made <- makeDirectory "no-home"
+  madeElsewhere <- makeDirectory "elsewhere"
+  copiedLib <- copy (root ^ "/lib") "elsewhere/lib"
+  let elsewhere = here ^ "/elsewhere/lib"
+  let inElsewhere : List (Pair String String) = [MkPair "HEFF_LIB" elsewhere]
+  own <- ownRun heff inElsewhere ["check", root ^ "/lib/float32.hf"]
+  holds
+      "heff's own lib/, the library elsewhere"
+      (succeeded own && not (saysAny ["E0335", "E0336"] own))
+      [own]
+  write "elsewhere/lib/wrong.hf" wrongText
+  bugTested <- ownRun heff inElsewhere ["test", elsewhere ^ "/wrong.hf"]
+  holds
+      "a compiler bug met, by a watch and a test"
+      (exitedWith 1 bugTested
+       && contains ("but got  " ^ bug ^ "\n") bugTested.out
+       && contains ("FAIL  bugged\n        " ^ bug ^ "\n") bugTested.out
+       && contains "0/2 expectations hold, 0/1 tests hold" bugTested.out)
+      [bugTested]
+  bugEvaluated <- ownRun heff inElsewhere ["dump-eval", elsewhere ^ "/wrong.hf"]
+  holds
+      "a compiler bug met, evaluated"
+      (exitedWith 1 bugEvaluated
+       && contains ("root = " ^ bug ^ "\n") bugEvaluated.out)
+      [bugEvaluated]
+  pkg <- textOf (root ^ "/package.hf")
+  write "other/package.hf" (renamedPackage "example.com/other" pkg)
+  write "other/lib/sin.hf" "primitive floatSin : Float64 -> Float64\n"
+  notHeff <- ownRun heff inElsewhere ["check", here ^ "/other/lib/sin.hf"]
+  holds
+      "another project's lib/"
+      (exitedWith 1 notHeff && contains "error[E0335]" notHeff.err)
+      [notHeff]
+  madeHome <- makeDirectory "home/bin"
+  copiedHeff <- copy heff "home/bin/heff"
+  copiedHomeLib <- copy (root ^ "/lib") "home/lib"
+  copiedPkg <- copy (root ^ "/package.hf") "home/package.hf"
+  let installed = here ^ "/home/bin/heff"
+  let inHome : List (Pair String String) = [MkPair "HEFF_HOME" (here ^ "/home")]
+  unsaid <- ownRun installed inHome ["check", root ^ "/lib/float32.hf"]
+  holds
+      "heff's own lib/, the heff home not installed from it"
+      (exitedWith 1 unsaid
+       && contains "error[E0347]: the package `heff` is heff's own" unsaid.err)
+      [unsaid]
+  write "home/source" (root ^ "\n")
+  saidOwn <- ownRun installed inHome ["check", root ^ "/lib/float32.hf"]
+  holds
+      "heff's own lib/, the heff home installed from it"
+      (succeeded saidOwn && not (saysAny ["E0335", "E0336", "E0347"] saidOwn))
+      [saidOwn]
+  ofHome <-
+    ownRun
+      heff
+      [MkPair "HEFF_LIB" (here ^ "/home/lib")]
+      ["check", here ^ "/home/lib/float32.hf"]
+  holds
+      "the heff home's lib/, the library"
+      (succeeded ofHome && not (saysAny ["E0335", "E0336", "E0347"] ofHome))
+      [ofHome])
+
+-- | the command line's tests
+cli : Test
+cli =
+  group
+    "cli"
+    [ promote "promote"
+    , docTests "doc tests"
+    , warningCode "a warning's code"
+    , properties "properties"
+    , outside "integration tests"
+    , unchecked "files that do not check"
+    , expectErrors "files that expect errors"
+    , formatting "fmt"
+    , fixities "fmt by imported fixities"
+    , usage "usage"
+    , version "version"
+    , completes "complete"
+    , shells "completion scripts"
+    , colour "diagnostics in colour"
+    , astral "a diagnostic past a rune beyond U+FFFF"
+    , ownLibrary "heff's own library"
+    ]
