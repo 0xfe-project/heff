@@ -1,0 +1,110 @@
+-- The working directory is each place's own (#97): a place starts in
+-- its starter's, moves by `setWorkingDir` without moving any other's,
+-- and every relative path it gives std.filesystem or std.process is
+-- under it -- a command started there runs there.
+--
+--   main     two directories, a file `name` in each saying which; the
+--            main place moves into the first and a place into the
+--            second, each reading `name`; a place started after starts
+--            where its starter is; a command run in a place runs in the
+--            place's directory, one given a relative `dir` under it; a
+--            relative path written is under it too.
+
+import co
+import std.filesystem
+import std.io
+import std.place
+import std.process
+
+world : HFunctor
+world = stdio <+> (process <+> (filesystem <+> places))
+
+-- (the file `name` here, as it reads)
+nameHere : {{disk : filesystem <: world}} -> Co world String
+nameHere = do
+  t <- readFile "name"
+  pure (fromMaybe "no name here" t)
+
+-- (`name` read in `dir`, this place moved into it: and whether it is
+-- there)
+movedInto : {{sys : process <: world}}
+          -> {{disk : filesystem <: world}}
+          -> String
+          -> Co world String
+movedInto dir = do
+  moved <- setWorkingDir dir
+  here <- workingDir
+  t <- nameHere
+  pure (t ^ (if moved && strEq here dir then "" else " (not moved)"))
+
+-- (`name` read where this place starts: and whether that is `dir`)
+startedIn : {{sys : process <: world}}
+          -> {{disk : filesystem <: world}}
+          -> String
+          -> Co world String
+startedIn dir = do
+  here <- workingDir
+  t <- nameHere
+  pure
+      (t ^ (if strEq here dir then ", where its starter is" else ", elsewhere"))
+
+-- (what `cat name` writes, run by this place moved into `dir`)
+commandIn : {{sys : process <: world}} -> String -> Co world String
+commandIn dir = do
+  moved <- setWorkingDir dir
+  r <- run { command = "cat", args = ["name"] }
+  pure (if moved then r.out else "not moved")
+
+-- (the path an operation came to, or nothing)
+pathOf : Either FileError String -> String
+pathOf (Left _) = ""
+pathOf (Right p) = p
+
+-- (a temporary directory, as the system names it)
+rootDir : {{disk : filesystem <: world}} -> Co world String
+rootDir = do
+  made <- temporaryDirectory "heff-place-dir-"
+  real <- realPath (pathOf made)
+  pure (pathOf real)
+
+program : {{io : stdio <: world}}
+        -> {{sys : process <: world}}
+        -> {{disk : filesystem <: world}}
+        -> {{pl : places <: world}}
+        -> Co world Unit
+program = do
+  root <- rootDir
+  a <- pure (root ^ "/a")
+  b <- pure (root ^ "/b")
+  madeA <- makeDirectory a
+  madeB <- makeDirectory b
+  wroteA <- writeFile (a ^ "/name") "in a"
+  wroteB <- writeFile (b ^ "/name") "in b"
+  p <- spawnPlace (movedInto b)
+  here <- movedInto a
+  there <- joinPlace p
+  print ("main: " ^ here)
+  print ("a place: " ^ there)
+  q <- spawnPlace (startedIn a)
+  started <- joinPlace q
+  print ("a place started after: " ^ started)
+  r <- spawnPlace (commandIn b)
+  said <- joinPlace r
+  print ("a command in a place: " ^ said)
+  ran <- run { command = "cat", args = ["name"], dir = "../b" }
+  print ("a command in ../b: " ^ ran.out)
+  wrote <- writeFile "made" "under it"
+  under <- readFile (a ^ "/made")
+  print ("a relative path: " ^ fromMaybe "elsewhere" under)
+  still <- workingDir
+  print (if strEq still a then "main still in a" else "main moved")
+  removed <- remove root
+  print (if removed then "removed" else "not removed")
+
+main : Co world Unit
+main =
+  program
+    (io := \p -> InL p)
+    (sys := \p -> InR (InL p))
+    (disk := \p -> InR (InR (InL p)))
+    (pl := \p -> InR (InR (InR p)))
