@@ -84,6 +84,33 @@ count : Counter -> Int
 count (MkCounter n) = n
 ```
 
+## Mutual definitions
+
+Definitions are in order: each names only those above it (and itself),
+so `no such variable` is said of a name defined further down.  Two or
+more that name one another are written under `mutual`, each with its
+signature, indented under it: the signatures are in scope in every body
+of the block, the bodies are checked in order, and after the block the
+names are the module's as any other.
+
+```haskell
+mutual
+  even : Int -> Bool
+  even 0 = True
+  even n = odd (n - 1)
+
+  odd : Int -> Bool
+  odd 0 = False
+  odd n = even (n - 1)
+```
+
+The block is a record of its definitions, built once before any of them
+runs, each called through it: so every definition of a block takes an
+argument, its signature a function's past its implicit and instance
+arguments (`ones : List Int` is refused), and a definition without a
+signature is an error.  A watch in the block is checked after the
+definitions above it; a doc test is of the definition under it.
+
 ## Records
 
 A record type names its fields, and a record gives each, in the type's
