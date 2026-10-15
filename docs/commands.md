@@ -25,7 +25,8 @@ heff fmt [--check] FILE...     # format in place
 heff compile FILE OUT --backend=MODE [--name NAME]
                                # page: a script running the app NAME in a web page
                                # esm: an ES module
-                               # c: a C program running NAME, for `zig cc`
+                               # c: a C program running NAME, for `zig cc`,
+                               #    its runtime's Zig beside it, for `zig build-obj`
 heff explain FILE              # the elaboration's trace
 heff type-at FILE OFFSET...    # what the name at each offset resolved to, and its type
 heff build                     # the whole project: every module of src/
@@ -57,8 +58,9 @@ backend's, `lib/browser/` or `lib/std/` ([library.md](library.md#the-batteries))
 
 `heff run` compiles FILE's `main` to C in `.heff/run/F/` (F the file's
 path, its separators `_`), a C file a module, through the backend's
-cache, as `heff build` does; builds it there by `zig cc -O1`, which
-builds again only the files that changed; and runs it in heff's place,
+cache, as `heff build` does, with the runtime's Zig beside it; builds it
+there by `zig build-obj` and `zig cc -O1`, which builds again only the
+files that changed; and runs it in heff's place,
 on its standard streams, with ARGS.  So it needs zig, as `heff build`
 does; run again with nothing changed, it costs a check of the cache and
 a link.

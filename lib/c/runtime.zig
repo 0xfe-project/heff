@@ -194,3 +194,85 @@ export fn heff_u8_valid_len(p: [*]const u8, n: i64, own: *c_int) i64 {
 fn isOwn(p: [*]const u8, u: u32, w: c_int) bool {
     return u != replacement or (w == 3 and p[0] == 0xEF and p[1] == 0xBF and p[2] == 0xBD);
 }
+
+// Floats
+// ---------------------------------------------------------------------
+
+/// The room a number written as JavaScript writes it takes, its NUL
+/// too: at most a sign, "0.000000" and 17 digits.
+const numberRoom = 32;
+
+/// A `Float64` as JavaScript writes a number (ECMAScript's
+/// Number::toString), at `out`, which has room for 32 bytes, a NUL
+/// after it: the fewest digits that read back as the same float -- of
+/// those, the nearest -- plain from 1e-7 up to 1e21, else as a digit,
+/// the others after a point, and an exponent; "NaN", "Infinity",
+/// "-Infinity", and "0", of either zero.
+export fn heff_js_number(d: f64, out: [*]u8) void {
+    jsNumber(f64, d, out[0..numberRoom]);
+}
+
+/// A `Float32` so: the fewest digits that read back as the same
+/// `Float32`, written as JavaScript writes a number.
+export fn heff_js_number32(f: f32, out: [*]u8) void {
+    jsNumber(f32, f, out[0..numberRoom]);
+}
+
+fn jsNumber(comptime T: type, x: T, out: *[numberRoom]u8) void {
+    var w: std.Io.Writer = .fixed(out[0 .. numberRoom - 1]);
+    writeNumber(T, x, &w) catch unreachable;
+    out[w.end] = 0;
+}
+
+fn writeNumber(comptime T: type, x: T, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (std.math.isNan(x)) return w.writeAll("NaN");
+    if (std.math.isInf(x)) return w.writeAll(if (x < 0) "-Infinity" else "Infinity");
+    if (x == 0) return w.writeAll("0");
+    const shortest = decimalOf(T, x);
+    if (shortest.sign) try w.writeByte('-');
+    // (its digits, `k` of them, none of them a last 0, and where the
+    // point is among them: `x` is 0.digits times 10 to the `n`)
+    var mantissa = shortest.mantissa;
+    var exponent = shortest.exponent;
+    while (mantissa % 10 == 0) {
+        mantissa /= 10;
+        exponent += 1;
+    }
+    var room: [20]u8 = undefined;
+    const digits = room[0..std.fmt.printInt(&room, mantissa, 10, .lower, .{})];
+    const k: i32 = @intCast(digits.len);
+    const n = exponent + k;
+    if (k <= n and n <= 21) {
+        try w.writeAll(digits);
+        try w.splatByteAll('0', @intCast(n - k));
+    } else if (0 < n and n <= 21) {
+        try w.writeAll(digits[0..@intCast(n)]);
+        try w.writeByte('.');
+        try w.writeAll(digits[@intCast(n)..]);
+    } else if (-6 < n and n <= 0) {
+        try w.writeAll("0.");
+        try w.splatByteAll('0', @intCast(-n));
+        try w.writeAll(digits);
+    } else {
+        try w.writeByte(digits[0]);
+        if (k > 1) {
+            try w.writeByte('.');
+            try w.writeAll(digits[1..]);
+        }
+        try w.print("e{c}{d}", .{ @as(u8, if (n - 1 < 0) '-' else '+'), @abs(n - 1) });
+    }
+}
+
+/// A finite float's shortest decimal, by Ryū (zig's own): the fewest
+/// digits that read back as it, of those the nearest.
+fn decimalOf(comptime T: type, x: T) std.fmt.float.FloatDecimal(u64) {
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
+    return std.fmt.float.binaryToDecimal(
+        u64,
+        @as(Bits, @bitCast(x)),
+        std.math.floatMantissaBits(T),
+        std.math.floatExponentBits(T),
+        false,
+        &std.fmt.float.Backend64_TablesFull,
+    );
+}
