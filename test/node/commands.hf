@@ -1,15 +1,16 @@
 -- Commands run to their end: each option of
 -- std.process's `Invocation` -- a directory, an environment, an input,
 -- a time limit, a bound on what is kept -- and each way a command ends;
--- commands started and waited for later; commands spoken to, as an
--- editor speaks to a language server.
+-- commands started beside the program, each held by a `with`, and
+-- waited for later; commands spoken to, as an editor speaks to a
+-- language server.
 -- (POSIX: the commands are sh's.)
 
 import bytes as Bytes
 import co
-import std.handle
 import std.io
 import std.process
+import with
 
 world : HFunctor
 world = stdio <+> process
@@ -54,72 +55,66 @@ ranSaid what r =
   ^ ", err "
   ^ show r.err
 
--- (`start`, where `Nothing` fails the test: its commands are all there)
+-- (a `with` ended, or its command not started, which fails the test:
+-- its commands are all there)
 mustStart : {e : HFunctor}
           -> {{io : stdio <: e}}
           -> {{sys : process <: e}}
-          -> Invocation
-          -> Co e Subprocess
-mustStart c = do
-  s <- start c
-  case s of
-    Just p -> pure p
-    Nothing -> do
-      printErr "a command not started"
-      exit 1
-      mustStart c
-
--- (which of the two it is, said)
-whichSaid : Subprocess -> Subprocess -> Subprocess -> String
-whichSaid slow quick p =
-  if sameHandle p quick then "quick"
-  else if sameHandle p slow then "slow"
-  else "neither"
-
--- (the first to end of those `waitAny` is given, said)
-firstSaid : {e : HFunctor}
-          -> {{io : stdio <: e}}
-          -> String
-          -> (Subprocess -> String)
-          -> Maybe (Pair Subprocess Ran)
+          -> Either ProcessError Unit
           -> Co e Unit
-firstSaid what name Nothing = print (what ^ ": none")
-firstSaid what name (Just (MkPair p r)) =
-  print (ranSaid (what ^ ", " ^ name p) r)
+mustStart (Right u) = pure MkUnit
+mustStart (Left err) = do
+  printErr ("a command not started: " ^ err.name)
+  exit 1
 
--- (commands started and waited for later: two at once, whichever ends
--- first; one killed, one past its time limit, one asked to end)
+-- (`withProcess`, where the command not starting fails the test)
+held : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{sys : process <: e}}
+     -> Invocation
+     -> ({s : Type} -> With s Started -> Co e Unit)
+     -> Co e Unit
+held c body = bind (withProcess c body) mustStart
+
+-- (why a command was not started, or that it was)
+notStartedSaid : Either ProcessError Unit -> String
+notStartedSaid (Left err) = err.name
+notStartedSaid (Right u) = "started"
+
+-- (commands started and waited for later: two at once, each in a `with`
+-- of its own, the quick one waited for first; one killed, one past its
+-- time limit, one asked to end; one not started)
 startedOnes : {e : HFunctor}
             -> {{io : stdio <: e}}
             -> {{sys : process <: e}}
             -> Co e Unit
 startedOnes = do
-  slow <- mustStart (sh "sleep 1; echo slow")
-  quick <- mustStart (sh "sleep 0.1; echo quick")
-  first <- waitAny [slow, quick]
-  firstSaid "first" (whichSaid slow quick) first
-  second <- waitAny [slow]
-  firstSaid "second" (whichSaid slow quick) second
-  none <- waitAny Nil
-  firstSaid "of none" (whichSaid slow quick) none
-  sleeper <- mustStart (sh "sleep 5")
-  running <- tryWait sleeper
-  print ("tried: " ^ maybe "running still" (\r -> "ended too soon") running)
-  kill sleeper
-  killed <- wait sleeper
-  print (ranSaid "killed" killed)
-  late <- mustStart { (sh "echo before; sleep 5") | timeout = 200 }
-  timed <- wait late
-  print (ranSaid "started, its time up" timed)
-  asked <- mustStart (sh "sleep 5")
-  ended <- terminate asked
-  print (ranSaid "terminated" ended)
-  shown <-
-    mustStart { (sh "echo shown; echo shown too >&2") | output = Inherited }
-  inherited <- wait shown
-  print (ranSaid "inherited" inherited)
-  missing <- start { command = "heff-no-such-command" }
-  print ("not started: " ^ maybe "nothing" (\p -> "a subprocess") missing)
+  held (sh "sleep 1; echo slow") (\slow ->
+    held (sh "sleep 0.1; echo quick") (\quick -> do
+      first <- wait quick
+      print (ranSaid "quick" first)
+      second <- wait slow
+      print (ranSaid "slow" second)))
+  held (sh "sleep 5") (\sleeper -> do
+    running <- tryWait sleeper
+    print ("tried: " ^ maybe "running still" (\r -> "ended too soon") running)
+    kill sleeper
+    killed <- wait sleeper
+    print (ranSaid "killed" killed))
+  held { (sh "echo before; sleep 5") | timeout = 200 } (\late -> do
+    timed <- wait late
+    print (ranSaid "started, its time up" timed))
+  held (sh "sleep 5") (\asked -> do
+    ended <- terminate asked
+    print (ranSaid "terminated" ended))
+  held
+    { (sh "echo shown; echo shown too >&2") | output = Inherited }
+    (\shown -> do
+      inherited <- wait shown
+      print (ranSaid "inherited" inherited))
+  missing <-
+    withProcess { command = "heff-no-such-command" } (\p -> pure MkUnit)
+  print ("not started: " ^ notStartedSaid missing)
 
 -- (what a read was given, said)
 receivedSaid : Received -> String
@@ -129,10 +124,11 @@ receivedSaid Closed = "closed"
 
 -- (a read, said on a line)
 readSaid : {e : HFunctor}
+         -> {s : Type}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> String
-         -> Subprocess
+         -> With s Started
          -> Portion
          -> Int
          -> Co e Unit
@@ -142,10 +138,11 @@ readSaid what p n ms = do
 
 -- (a write, said on a line)
 writeSaid : {e : HFunctor}
+          -> {s : Type}
           -> {{io : stdio <: e}}
           -> {{sys : process <: e}}
           -> String
-          -> Subprocess
+          -> With s Started
           -> String
           -> Co e Unit
 writeSaid what p text = do
@@ -182,8 +179,9 @@ contentLength headers =
 
 -- (the message the headers frame, read: as many bytes as they say)
 bodyOf : {e : HFunctor}
+       -> {s : Type}
        -> {{sys : process <: e}}
-       -> Subprocess
+       -> With s Started
        -> Maybe Int
        -> Co e String
 bodyOf p Nothing = pure "no length"
@@ -192,8 +190,9 @@ bodyOf p (Just n) = do
   pure (show n ^ " bytes, " ^ receivedSaid body)
 
 bodyAfter : {e : HFunctor}
+          -> {s : Type}
           -> {{sys : process <: e}}
-          -> Subprocess
+          -> With s Started
           -> Received
           -> Co e String
 bodyAfter p (Got headers) = bodyOf p (contentLength (Bytes.asString headers))
@@ -202,66 +201,68 @@ bodyAfter p r = pure ("headers " ^ receivedSaid r)
 -- (a message read as the protocol frames it: its headers, up to their
 -- blank line, then its body)
 readFramed : {e : HFunctor}
+           -> {s : Type}
            -> {{sys : process <: e}}
-           -> Subprocess
+           -> With s Started
            -> Co e String
 readFramed p = do
   headers <- readOutput p (Through "\r\n\r\n") 5000
   bodyAfter p headers
 
--- (commands spoken to: written to and read from as they go)
+-- (commands spoken to: written to and read from as they go, each held
+-- by a `with`)
 spokenTo : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
          -> Co e Unit
 spokenTo = do
-  cat <- mustStart { command = "cat", input = Piped, output = Piped }
-  readSaid "nothing yet" cat Available 100
-  writeSaid "one" cat "one\n"
-  readSaid "a line" cat (Through "\n") 5000
-  writeSaid "two, three" cat "two\nthree\n"
-  readSaid "a line" cat (Through "\n") 5000
-  readSaid "four bytes" cat (Exactly 4) 5000
-  readSaid "more than there is" cat (Exactly 100) 100
-  writeSaid "the rest" cat "\n"
-  closeInput cat
-  readSaid "at its end" cat (Exactly 100) 5000
-  readSaid "after its end" cat Available 5000
-  writeSaid "after its end" cat "lost\n"
-  catRan <- wait cat
-  print (ranSaid "cat" catRan)
-  server <- mustStart { command = "cat", input = Piped, output = Piped }
-  writeSaid
-      "two messages"
-      server
-      (Bytes.asString
-         (Bytes.append
-            (framed "{\"id\":1,\"name\":\"caf\u{e9}\"}")
-            (framed "{\"id\":2}")))
-  first <- readFramed server
-  print ("first: " ^ first)
-  second <- readFramed server
-  print ("second: " ^ second)
-  none <- readFramed server
-  print ("none yet: " ^ none)
-  serverRan <- wait server
-  print (ranSaid "server" serverRan)
-  lines <-
-    mustStart
-      { (sh "echo one; echo two; echo oops >&2")
-      | output = Piped
-      , errors = Piped
-      }
-  readSaid "its output" lines (Through "\n") 5000
-  err <- readErrors lines (Through "\n") 5000
-  print ("its errors: " ^ receivedSaid err)
-  rest <- wait lines
-  print (ranSaid "unread" rest)
-  given <- mustStart { command = "cat", input = Given "given\n" }
-  writeSaid "to a given input" given "more\n"
-  readSaid "a collected output" given Available 100
-  givenRan <- wait given
-  print (ranSaid "given" givenRan)
+  held { command = "cat", input = Piped, output = Piped } (\cat -> do
+    readSaid "nothing yet" cat Available 100
+    writeSaid "one" cat "one\n"
+    readSaid "a line" cat (Through "\n") 5000
+    writeSaid "two, three" cat "two\nthree\n"
+    readSaid "a line" cat (Through "\n") 5000
+    readSaid "four bytes" cat (Exactly 4) 5000
+    readSaid "more than there is" cat (Exactly 100) 100
+    writeSaid "the rest" cat "\n"
+    closeInput cat
+    readSaid "at its end" cat (Exactly 100) 5000
+    readSaid "after its end" cat Available 5000
+    writeSaid "after its end" cat "lost\n"
+    catRan <- wait cat
+    print (ranSaid "cat" catRan))
+  held { command = "cat", input = Piped, output = Piped } (\server -> do
+    writeSaid
+        "two messages"
+        server
+        (Bytes.asString
+           (Bytes.append
+              (framed "{\"id\":1,\"name\":\"caf\u{e9}\"}")
+              (framed "{\"id\":2}")))
+    first <- readFramed server
+    print ("first: " ^ first)
+    second <- readFramed server
+    print ("second: " ^ second)
+    none <- readFramed server
+    print ("none yet: " ^ none)
+    serverRan <- wait server
+    print (ranSaid "server" serverRan))
+  held
+    { (sh "echo one; echo two; echo oops >&2")
+    | output = Piped
+    , errors = Piped
+    }
+    (\lines -> do
+      readSaid "its output" lines (Through "\n") 5000
+      err <- readErrors lines (Through "\n") 5000
+      print ("its errors: " ^ receivedSaid err)
+      rest <- wait lines
+      print (ranSaid "unread" rest))
+  held { command = "cat", input = Given "given\n" } (\given -> do
+    writeSaid "to a given input" given "more\n"
+    readSaid "a collected output" given Available 100
+    givenRan <- wait given
+    print (ranSaid "given" givenRan))
 
 -- (`n` bytes)
 bytesOf : Int -> String

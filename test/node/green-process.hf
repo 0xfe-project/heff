@@ -1,0 +1,61 @@
+-- Commands held by green threads, scheduled by std.reactor
+-- (`Reactor.scheduled`): each thread a `withProcess` of its own, a
+-- sleep of a second, waited for -- the wait pending while the other
+-- threads go on, so that three sleeps are waited for in about a second,
+-- not three.  By C alone.
+--
+--   main     three sleeps started at once, each waited for by its own
+--            thread, which then says so on a channel; main counts them
+
+import co
+import green
+import std.io
+import std.process
+import std.reactor as Reactor
+
+world : HFunctor
+world = stdio <+> (Reactor.reactor <+> process)
+
+-- (a command of a second, held by this thread and waited for; then
+-- `done` told)
+sleeper : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{sys : process <: e}}
+        -> Int
+        -> Co e Unit
+sleeper done = do
+  r <- withProcess { command = "sleep", args = ["1"] } (\p -> wait p)
+  send done 1
+
+repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
+repeatG 0 c = pure MkUnit
+repeatG n c = bind c (\u -> repeatG (n - 1) c)
+
+-- (n values received on ch, added up)
+recvSum : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Int -> Co e Int
+recvSum ch 0 acc = pure acc
+recvSum ch n acc = do
+  x <- recv ch
+  recvSum ch (n - 1) (acc + x)
+
+-- (n sleeps, a thread each, waited for at once: how many were)
+program : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{sys : process <: e}}
+        -> Int
+        -> Co e Int
+program n = do
+  done <- newChan
+  repeatG n (spawn (sleeper done))
+  recvSum done n 0
+
+main : Co world Unit
+main = do
+  r <-
+    Reactor.scheduled
+      world
+      (rx := \p -> InR (InL p))
+      (program (gr := \p -> InL p) (sys := \p -> InR (InR (InR p))) 3)
+  print
+    (ev := \p -> InL p)
+    (maybe "a deadlock" (\n -> show n ^ " sleeps waited for at once") r)
