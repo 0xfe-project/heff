@@ -1,7 +1,10 @@
 // TCP sockets' side of std.net, for the C backend: an effect
-// provider.  A
-// socket is a `NetSock` the world holds, let go of
-// -- closed -- by `Close`; the program has its number.
+// provider.  A socket is a `NetSock`, the host's own: a foreign value
+// the program's `with` holds, closed by its `Release` when the body
+// ends, or where the program drops its last reference to it -- a body
+// left by a throw or a dropped continuation -- as the value's function
+// letting it go.  An operation that waits keeps its operation, and so
+// the socket, until it is done; one given a socket closed is `EBADF`.
 //
 // Each operation is a `NetOp`, done in steps: its wait's `step` does
 // what can be done now, without waiting, and says it is done
@@ -36,30 +39,39 @@ static V heff_provider_net(V p, V k) {
 #include <sys/socket.h>
 #include <sys/types.h>
 
-// (the world's sockets, told from what other providers hand out)
+// (this provider's sockets, told from what other providers hand out)
 #define NET_MAGIC 0x6e657473u
 
 typedef struct {
   uint32_t magic;
-  int fd;
+  int fd;              // (-1 once it is closed)
 } NetSock;
 
+// (the socket closed, once: what waits on it told so, not polled
+// closed; 0, or -1 with errno)
+static int net_close(NetSock *s) {
+  if (s->fd < 0) return 0;
+  heff_reactor_closing(s->fd);
+  int r = close(s->fd);
+  s->fd = -1;
+  return r;
+}
+
+// (the program letting go of its last reference: closed, unless the
+// `with` closed it)
 static void net_let_go(void *x) {
   NetSock *s = x;
-  close(s->fd);
+  net_close(s);
   s->magic = 0;
   free(s);
 }
 
-// (the socket numbered `i`, or the program failed: it is none)
-static NetSock *net_sock(int64_t i) {
-  NetSock *s = heff_held(i);
-  if (s->magic != NET_MAGIC) heff_fail("std.net: the handle is no socket");
+// (the socket a foreign value is, or the program failed: it is none)
+static NetSock *net_sock(V v) {
+  NetSock *s = heff_foreign_ptr(v);
+  if (s->magic != NET_MAGIC) heff_fail("std.net: no socket");
   return s;
 }
-
-// (a handle's number: `MkHandle i`)
-static int64_t net_number(V h) { return INT_OF(heff_field(h, 0)); }
 
 // (a descriptor made non-blocking, not to be given to a program run;
 // 0, or -1 with errno)
@@ -150,13 +162,13 @@ static V net_left(int err, int gai) {
 
 static V net_right(V x) { return heff_tag_n(TAG_Right, 1, &x); }
 
-// (a socket held by the world: `Right (MkHandle i)`)
-static V net_handle(int fd) {
+// (a socket made, the host's own: `Right` a foreign value, closed where
+// the program lets go of it)
+static V net_value(int fd) {
   NetSock *s = heff_alloc(sizeof *s);
   s->magic = NET_MAGIC;
   s->fd = fd;
-  V i = MK_INT(heff_hold(s, net_let_go));
-  return net_right(heff_tag_n(TAG_MkHandle, 1, &i));
+  return net_right(heff_foreign(s, net_let_go));
 }
 
 // An operation, in steps
@@ -182,7 +194,9 @@ struct NetOp {
   uint8_t *buf;
   const uint8_t *data;
   int64_t n, done;
-  V held;              // (what the op holds: a write's operation, its bytes)
+  V held;              // (what the op holds: its operation, and so the socket
+                       //  it is given -- not let go of under it -- and a
+                       //  write's bytes)
 };
 
 static NetOp *net_op(int what) {
@@ -493,11 +507,11 @@ static V net_answer(HeffWait *w) {
       w->fd = -1;
     }
     if (o->gai && !w->err) r = net_left(err, o->gai);
-    else if (w->fd >= 0) r = net_handle(w->fd);
+    else if (w->fd >= 0) r = net_value(w->fd);
     else r = net_left(err ? err : EADDRNOTAVAIL, 0);
     break;
   case NET_ACCEPT:
-    r = !w->err && o->n >= 0 ? net_handle((int)o->n) : net_left(err, 0);
+    r = !w->err && o->n >= 0 ? net_value((int)o->n) : net_left(err, 0);
     break;
   case NET_READ:
     r = err ? net_left(err, 0) : net_right(heff_bytes_in(o->buf, o->done));
@@ -552,6 +566,13 @@ static V net_made(NetOp *o, V host, int64_t port, int passive, int (*step)(HeffW
 // (a number given as an `Int`: -1 where it is beyond a word's)
 static int64_t net_int(V v) { return IS_INT(v) ? INT_OF(v) : -1; }
 
+// (an operation given a socket its `with` closed: `EBADF`)
+static V net_closed(V p, V f, V k) {
+  heff_drop(p);
+  V x = heff_answer(f, net_left(EBADF, 0));
+  return heff_tail(k, 1, &x);
+}
+
 static V heff_provider_net(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Connect: {
@@ -576,34 +597,40 @@ static V heff_provider_net(V p, V k) {
     heff_drop(host);
     return r;
   }
+  // (an operation given a socket: `p` is kept while it waits, and so the
+  // socket; one closed is `EBADF`)
   case TAG_Accept: {
-    NetSock *s = net_sock(net_number(heff_field(p, 0)));
+    NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
+    if (s->fd < 0) return net_closed(p, f, k);
     NetOp *o = net_op(NET_ACCEPT);
+    o->held = p;
     o->w.fd = s->fd;
     o->w.step = net_accept_step;
     return net_go(o, f, k);
   }
   case TAG_Read: {
-    NetSock *s = net_sock(net_number(heff_field(p, 0)));
+    NetSock *s = net_sock(heff_field(p, 0));
     int64_t n = net_int(heff_field(p, 1));
     V f = heff_dup(heff_field(p, 2));
-    heff_drop(p);
+    if (s->fd < 0) return net_closed(p, f, k);
     if (n <= 0) {
+      heff_drop(p);
       V x = heff_answer(f, net_right(heff_bytes_in("", 0)));
       return heff_tail(k, 1, &x);
     }
     NetOp *o = net_op(NET_READ);
     o->n = n > NET_READ_MAX ? NET_READ_MAX : n;
     o->buf = heff_alloc((size_t)o->n);
+    o->held = p;
     o->w.fd = s->fd;
     o->w.step = net_read_step;
     return net_go(o, f, k);
   }
   case TAG_Write: {
-    NetSock *s = net_sock(net_number(heff_field(p, 0)));
+    NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 2));
+    if (s->fd < 0) return net_closed(p, f, k);
     NetOp *o = net_op(NET_WRITE);
     // (the bytes are `p`'s, held until they are written)
     o->data = heff_bytes_data(heff_field(p, 1), &o->n);
@@ -613,34 +640,36 @@ static V heff_provider_net(V p, V k) {
     return net_go(o, f, k);
   }
   case TAG_Shutdown: {
-    NetSock *s = net_sock(net_number(heff_field(p, 0)));
+    NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
+    if (s->fd < 0) return net_closed(p, f, k);
     V r = shutdown(s->fd, SHUT_WR) < 0 ? net_left(errno, 0) : net_right(NTAG(TAG_MkUnit));
+    heff_drop(p);
     V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
-  case TAG_Close: {
-    int64_t i = net_int(heff_field(p, 0));
-    V x = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    // (what waits on it told so, not polled closed)
-    heff_reactor_closing(net_sock(i)->fd);
-    heff_release(i);
-    return heff_tail(k, 1, &x);
-  }
-  case TAG_Peer: {
-    NetSock *s = net_sock(net_number(heff_field(p, 0)));
+  // (the `with`'s release: a connection's writing ended -- its other
+  // side reads to the end -- and it closed; a listener closed)
+  case TAG_Release:
+  case TAG_ReleaseListener: {
+    NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
+    if (s->fd < 0) return net_closed(p, f, k);
+    if (heff_tag_of(p) == TAG_Release) shutdown(s->fd, SHUT_WR);
+    V r = net_close(s) < 0 ? net_left(errno, 0) : net_right(NTAG(TAG_MkUnit));
     heff_drop(p);
-    V x = heff_answer(f, net_where(s->fd, 1));
+    V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
+  case TAG_Peer:
+  case TAG_ThisSide:
   case TAG_Local: {
-    NetSock *s = net_sock(net_int(heff_field(p, 0)));
+    NetSock *s = net_sock(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
+    if (s->fd < 0) return net_closed(p, f, k);
+    V r = net_where(s->fd, heff_tag_of(p) == TAG_Peer);
     heff_drop(p);
-    V x = heff_answer(f, net_where(s->fd, 0));
+    V x = heff_answer(f, r);
     return heff_tail(k, 1, &x);
   }
   default:

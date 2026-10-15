@@ -19,6 +19,7 @@ import std.io
 import std.net as Net
 import std.process
 import std.reactor as Reactor
+import with
 
 world : HFunctor
 world = stdio <+> (Http.http <+> (Net.net <+> (Reactor.reactor <+> process)))
@@ -110,7 +111,29 @@ must (Left err) = abandon
 
 -- (each item answered as the server of the test's answers it)
 item : {e : HFunctor} -> Server.Request -> Co e Http.Response
-item r = pure (Server.plain 200 ("item " ^ strSlice r.target 6 (strLength r.target) ^ "\n"))
+item r =
+  pure
+    (Server.plain
+       200
+       ("item " ^ strSlice r.target 6 (strLength r.target) ^ "\n"))
+
+-- (the listener served by a thread of its own, and asked of by ten)
+askedOn : {e : HFunctor}
+        -> {s : Type}
+        -> {{gr : green <: e}}
+        -> {{io : stdio <: e}}
+        -> {{web : Http.http <: e}}
+        -> {{nt : Net.net <: e}}
+        -> With s Net.TcpListener
+        -> Co e Unit
+askedOn l = do
+  at <- Net.local l
+  spawn (Server.serveConcurrently l item)
+  back <- newChan
+  let base = "http://127.0.0.1:" ^ show (must at).port
+  repeatG 10 (bind newChan (\i -> spawn (fetcher base back i)))
+  got <- recvSum back 10 0
+  print ("asked of its own server, at once: " ^ show got)
 
 asked : {e : HFunctor}
       -> {{gr : green <: e}}
@@ -119,14 +142,8 @@ asked : {e : HFunctor}
       -> {{nt : Net.net <: e}}
       -> Co e Unit
 asked = do
-  l <- Net.listen "127.0.0.1" 0 64
-  at <- Net.local (must l)
-  spawn (bind (Server.serveConcurrently (must l) item) (\err -> pure MkUnit))
-  back <- newChan
-  let base = "http://127.0.0.1:" ^ show (must at).port
-  repeatG 10 (bind newChan (\i -> spawn (fetcher base back i)))
-  got <- recvSum back 10 0
-  print ("asked of its own server, at once: " ^ show got)
+  r <- Net.withListener { host = "127.0.0.1", port = 0 } 64 (\l -> askedOn l)
+  pure MkUnit
 
 self : Co world Unit
 self = do

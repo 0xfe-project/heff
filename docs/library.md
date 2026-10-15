@@ -258,46 +258,82 @@ method where it is not empty, with no `Content-Type` but the request's
 own.
 
 `std.net` is TCP's sockets, on the C backend alone.  Import it by a
-name, `import std.net as Net`.  A `Net.Connection` (a `Handle
-TcpStream`) is made by `Net.connect host port`, or accepted by
-`Net.accept` from a `Net.Listener` (a `Handle TcpListener`), which
-`Net.listen address port backlog` makes -- the address `""` for all of
-the host's, the port 0 for one the system picks, which `Net.local`
-says.  A host or an address is a name the system resolves
+name, `import std.net as Net`.  A connection and a listener are the
+host's own, had by a `with` ([a thing held by a
+`with`](#a-thing-held-by-a-with)).  `Net.withConnection address body`
+connects to the `Address` -- its `host` a name the system resolves
 (getaddrinfo), to IPv4 and IPv6 addresses, each tried in turn, or one
-written as it is (`127.0.0.1`, `::1`).  `Net.read c n` is up to `n`
-bytes (a mebibyte at most) of what has come, `Bytes`, waiting for one,
-and none at the end, where the other side has closed or shut down its
-side; `Net.write c b` writes them all; `Net.shutdown c` ends this
-side's writing; `Net.peer c` and `Net.local s` are where each side is,
-an `Address`, its `host` numeric and its `port`; `Net.close s` closes a
-connection or a listener and lets its handle go (an operation given it
-after that fails the program, as one given a handle that is no
-socket).  What may fail gives `Either NetError a`: the system's `code`
-(errno, or getaddrinfo's where a name was not resolved), its `name`,
-the same on every system (`ECONNREFUSED`, `EADDRINUSE`, `EAI_NONAME`),
-and its `message`, as the system says it (`Net.showError`).  A read at
-the end is no error, but no bytes.
+written as it is (`127.0.0.1`, `::1`); its `port` -- and runs `body`
+with the connection, a `With s Net.TcpStream` in a region `s` of its
+own, shut down and closed when `body` ends: what the body came to, or
+why the connection was not made.  `Net.withListener address backlog
+body` has `body` a `With s Net.TcpListener` listening there -- the
+host `""` for all of this host's, the port 0 for one the system picks,
+which `Net.local l` says -- closed when `body` ends; and `Net.accept l
+body` has `body` the next connection made to it, a `With s2
+Net.TcpStream` of its own, closed when that body ends.  `Net.read c n`
+is up to `n` bytes (a mebibyte at most) of what has come, `Bytes`,
+waiting for one, and none at the end, where the other side has closed
+or shut down its side; `Net.write c b` writes them all; `Net.shutdown
+c` ends this side's writing; `Net.peer c` and `Net.thisSide c` are
+where each side is, an `Address`, its `host` numeric and its `port`.
+An operation given a connection whose `with` has ended -- by another
+thread, say -- is `EBADF`.  What may fail gives `Either NetError a`:
+the system's `code` (errno, or getaddrinfo's where a name was not
+resolved), its `name`, the same on every system (`ECONNREFUSED`,
+`EADDRINUSE`, `EAI_NONAME`), and its `message`, as the system says it
+(`Net.showError`).  A read at the end is no error, but no bytes.
+
+A server of many connections at once accepts each in a green thread of
+its own ([green threads](#green-threads)), its `with` inside that
+thread: the body of one `accept` spawns the thread accepting the next,
+then serves its connection, which is closed as the body ends.  So one
+thread is always waiting to accept, no table of connections is kept,
+and the threads talk over channels.
 
 ```haskell
 import bytes as Bytes
+import green
 import std.net as Net
+import with
 
--- (what was read, written back, and `again`; at the end, closed)
+-- (what was read, written back, and `again`; at the end, done: the
+-- connection is closed as its `with` ends)
 echoed : {e : HFunctor}
+       -> {s : Type}
        -> {{nt : Net.net <: e}}
        -> (Unit -> Co e Unit)
-       -> Net.Connection
+       -> With s Net.TcpStream
        -> Either Net.NetError Bytes
        -> Co e Unit
-echoed again c (Left err) = Net.close c
+echoed again c (Left err) = pure MkUnit
 echoed again c (Right b) =
-  if Bytes.length b == 0 then Net.close c
+  if Bytes.length b == 0 then pure MkUnit
   else bind (Net.write c b) (\w -> again MkUnit)
 
 -- (what the other side writes, written back to it until it ends)
-echo : {e : HFunctor} -> {{nt : Net.net <: e}} -> Net.Connection -> Co e Unit
+echo : {e : HFunctor} -> {s : Type} -> {{nt : Net.net <: e}} -> With s Net.TcpStream -> Co e Unit
 echo c = bind (Net.read c 65536) (echoed (\u -> echo c) c)
+
+-- (the next connection accepted: a thread spawned to accept the one
+-- after, and this one echoed here, had by this thread's `with`; until
+-- none is accepted)
+echoServer : {e : HFunctor}
+           -> {s : Type}
+           -> {{gr : green <: e}}
+           -> {{nt : Net.net <: e}}
+           -> With s Net.TcpListener
+           -> Co e Unit
+echoServer l = do
+  r <- Net.accept l (\c -> do
+    spawn (echoServer l)
+    echo c)
+  pure MkUnit
+
+-- (every connection to the port echoed at once, under `Reactor.scheduled`;
+-- or why the port could not be listened on)
+echoAt : {e : HFunctor} -> {{gr : green <: e}} -> {{nt : Net.net <: e}} -> Int -> Co e (Either Net.NetError Unit)
+echoAt port = Net.withListener { host = "127.0.0.1", port = port } 128 (\l -> echoServer l)
 ```
 
 An operation waits until it is done, the whole program with it --
@@ -308,10 +344,10 @@ operation there fails the program.
 
 `std.http.server` is an HTTP/1.1 server, a library in heff over
 `std.net`: import it by a name, `import std.http.server as Server`.
-`Server.serve listener handle` accepts the listener's connections, one
-at a time, and answers each request of each by `handle :
-Server.Request -> Co e Http.Response` -- std.http's `Response`, its
-status, headers and body.  A `Server.Request` is the server's, not
+`Server.serve listener handle` accepts the listener's connections (a
+`With s Net.TcpListener`, `Net.withListener`'s), one at a time, and
+answers each request of each by `handle : Server.Request -> Co e
+Http.Response` -- std.http's `Response`, its status, headers and body.  A `Server.Request` is the server's, not
 std.http's (which is a client's, its URL, its time and redirects): its
 `method`, its `target` as the request line has it (`/items?id=3`), its
 `version`, its `headers` (`Server.header` finds one), its `body`
@@ -322,8 +358,9 @@ descriptors, `EMFILE` -- both stop there and give back the `NetError`
 (`serve`'s result is `Co e Net.NetError`, `serveUntil`'s `Co e (Either
 Net.NetError Unit)`), the listener left open: whether to wait and serve
 again is the caller's to say, not the library's.
-`Server.serveConnection` serves one connection accepted already; and
-`Server.plain status text` is a response of text.
+`Server.serveConnection` serves one connection had by a `with`
+(`Net.accept`'s body), closed by it after; and `Server.plain status
+text` is a response of text.
 
 ```haskell
 import std.http as Http
@@ -334,11 +371,10 @@ hello : {e : HFunctor} -> Server.Request -> Co e Http.Response
 hello r = pure (Server.plain 200 ("hello, " ^ r.target ^ "\n"))
 
 -- (`hello` served on the port, until a connection fails to be accepted:
--- why, or why it could not listen)
-helloAt : {e : HFunctor} -> {{nt : Net.net <: e}} -> Int -> Co e Net.NetError
-helloAt port = do
-  l <- Net.listen "127.0.0.1" port 64
-  either (\err -> pure err) (\ln -> Server.serve ln hello) l
+-- why; or why it could not listen)
+helloAt : {e : HFunctor} -> {{nt : Net.net <: e}} -> Int -> Co e (Either Net.NetError Net.NetError)
+helloAt port =
+  Net.withListener { host = "127.0.0.1", port = port } 64 (\l -> Server.serve l hello)
 ```
 
 Each request's head is read -- its line and headers, 64 KiB at most --
@@ -361,6 +397,8 @@ response before the connection is closed, not a reset.
 connection keeps the others waiting.  `Server.serveConcurrently
 listener handle` serves each by a green thread of its own
 ([green threads](#green-threads); its world has `green`), many at once:
+each connection is had by `Net.accept`'s body in its thread, which
+spawns the thread accepting the next, so that one is always waiting;
 run by `Reactor.scheduled`, each connection waits on its socket apart,
 the others served meanwhile, and `handle` may spawn threads of its own.
 It stops where a connection fails to be accepted, as `serve` does, the
@@ -372,9 +410,9 @@ when the server ends, would be one kept for each connection served.)
 -- (`hello` served on the port, every connection at once)
 main : Co world Unit
 main = do
-  r <- Reactor.scheduled world (rx := \p -> InR (InR p)) (do
-    l <- Net.listen "127.0.0.1" 8080 128
-    either (\err -> pure err) (\ln -> Server.serveConcurrently ln hello) l)
+  r <- Reactor.scheduled world (rx := \p -> InR (InR p))
+    (Net.withListener { host = "127.0.0.1", port = 8080 } 128 (\l ->
+      Server.serveConcurrently l hello))
   ...
 ```
 
@@ -768,8 +806,8 @@ page's, whose providers do not wait.
 On the C backend, `std.reactor` (`import std.reactor as Reactor`, its
 effect `Reactor.reactor` in the world) has them wait apart:
 `Reactor.scheduled e c` is `scheduledWith e Reactor.outside c`, where
-a thread whose `Net.read`, `Net.accept`, `Net.connect` or `Net.write`
-would wait, whose read or write of a pipe, a terminal or a socket
+a thread whose `Net.read`, `Net.accept`, `Net.withConnection` or
+`Net.write` would wait, whose read or write of a pipe, a terminal or a socket
 (std.filesystem's `readLine`, `readChunk`, `writeBytes`, `writeString`)
 would, or whose `Http.send` (`Http.get`, `Http.getText`) is under way, is pending while the other threads go on, and goes on with its answer once it is done --
 from the thread's own view the call returns its result, as it always
