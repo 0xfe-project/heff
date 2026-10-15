@@ -1,0 +1,127 @@
+-- Pixels drawn on the GPU and shown on a `<canvas>`, in the page's
+-- `#pixels`: a kernel stores each pixel of a gradient as a `UInt32`
+-- into a buffer, and the buffer is shown on a canvas the DOM made --
+-- where the two effects meet: the canvas is an element of the page's,
+-- given by value to the GPU's canvas effect, inside the `with`s that
+-- hold the document, the device and the buffer.  Where the browser has
+-- no WebGPU, the page says so.
+
+import co
+import browser.dom
+import gpu as Gpu
+import gpu.canvas as Canvas
+import gpu.kernel as Kernel
+import gpu.run as Run
+import gpu.wgsl as Wgsl
+import uint32 as UInt32
+import with
+
+world : HFunctor
+world = dom <+> (Gpu.gpu <+> Canvas.canvas)
+
+-- the picture: 64 wide (a row of 256 bytes, as the canvas wants), 64 high
+width : Int
+width = 64
+
+height : Int
+height = 64
+
+-- (a number of the kernel's, unsigned)
+u : Int -> Kernel.Exp UInt32
+u n = Kernel.lit (UInt32.fromInt n)
+
+-- (each pixel, red by its column, green by its row, opaque: a `UInt32`,
+-- red its lowest byte)
+shade : Kernel.Output UInt32 -> Co Kernel.stmt Unit
+shade px = do
+  i <- Kernel.globalId
+  Kernel.when
+      (Kernel.lessThan i (Kernel.length px)) (do
+    x <- Kernel.define (i % u width)
+    y <- Kernel.define (i / u width)
+    Kernel.store
+        px
+        i
+        (x * u 255 / u width
+         + (y * u 255 / u height) * u 256
+         + u 4278190080))
+
+-- | The kernel, 64 invocations to a workgroup: the WGSL it is.
+-- | >>> lines (Wgsl.source1 gradient)
+-- | [ "@group(0) @binding(0) var<storage, read_write> a : array<u32>;"
+-- | , "@compute @workgroup_size(64)"
+-- | , "fn shade(@builtin(global_invocation_id) id : vec3<u32>) {"
+-- | , "  let v0 = id.x;"
+-- | , "  if (v0 < arrayLength(&a)) {"
+-- | , "    let v1 = v0 % 64u;"
+-- | , "    let v2 = v0 / 64u;"
+-- | , "    a[v0] = (((v1 * 255u) / 64u) + (((v2 * 255u) / 64u) * 256u)) + 4278190080u;"
+-- | , "  }"
+-- | , "}"
+-- | ]
+gradient : Kernel.Kernel1 (Kernel.Output UInt32)
+gradient = Kernel.kernel1 "shade" 64 shade
+
+-- (what a `with` whose body is a step came to: the body's error, or the
+-- `with`'s own)
+flattened : {a : Type}
+          -> Either Gpu.GpuError (Either Gpu.GpuError a)
+          -> Either Gpu.GpuError a
+flattened (Left err) = Left err
+flattened (Right r) = r
+
+-- (the kernel run, then the buffer shown on the canvas)
+shown : {e : HFunctor}
+      -> {{card : Gpu.gpu <: e}}
+      -> {{screen : Canvas.canvas <: e}}
+      -> {s t : Type}
+      -> With s Gpu.Device
+      -> Element
+      -> Run.Typed t UInt32
+      -> Co e (Either Gpu.GpuError Unit)
+shown d canvas px = do
+  ran <- Run.run1 d gradient (width * height) px
+  case ran of
+    Left err -> pure (Left err)
+    Right _ -> Canvas.present d canvas px.buffer width height
+
+-- (a buffer of the pixels held, drawn and shown)
+drawn : {e : HFunctor}
+      -> {{card : Gpu.gpu <: e}}
+      -> {{screen : Canvas.canvas <: e}}
+      -> {s : Type}
+      -> With s Gpu.Device
+      -> Element
+      -> Co e (Either Gpu.GpuError Unit)
+drawn d canvas = do
+  r <- Run.withTyped d (width * height) (\px -> shown d canvas px)
+  pure (flattened r)
+
+verdict : Either Gpu.GpuError Unit -> String
+verdict (Left err) = Gpu.showError err
+verdict (Right _) = "drawn"
+
+program : {e : HFunctor}
+        -> {{page : dom <: e}}
+        -> {{card : Gpu.gpu <: e}}
+        -> {{screen : Canvas.canvas <: e}}
+        -> Co e Unit
+program = do
+  _ <-
+    withDocument (\doc -> do
+    place <- select doc "#pixels"
+    found place (\box -> do
+      canvas <- create doc "canvas"
+      append box canvas
+      label <- textIn doc box "p" "drawing"
+      r <- Gpu.withDevice (\d -> drawn d canvas)
+      text label (verdict (flattened r))))
+  pure MkUnit
+
+-- where the world is: each sub-effect's evidence, given
+main : Co world Unit
+main =
+  program
+    (page := \p -> InL p)
+    (card := \p -> InR (InL p))
+    (screen := \p -> InR (InR p))

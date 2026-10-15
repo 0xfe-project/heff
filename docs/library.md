@@ -159,7 +159,16 @@ What is above, in `lib/`, is pure, the same on every backend.
 `lib/browser/` is the browser's, for JavaScript (`--backend=page`, and
 `esm`):
 
-- `browser.dom` (web pages);
+- `browser.dom` (web pages): the page's document is had at the top of
+  the program by `withDocument body`, its body given a `With s
+  Document` ([a thing held by a `with`](#a-thing-held-by-a-with)), and
+  what finds and makes elements takes it -- `select doc "#out"`, `xpath
+  doc "//p"`, `create doc "li"`, `textIn doc parent "p" "hi"`; an
+  `Element` is the page's own, a foreign value passed by value, to the
+  operations on it (`text`, `attr`, `append`, `clear`, `value`, `on`,
+  `same`) and to another effect's -- a `<canvas>` found here, drawn on
+  by `gpu.canvas`'s `present` inside the same `with`s.  The page owns
+  its elements: there is nothing to let go of;
 - `browser.http` (`fetch`, an HTTP client of `Bytes` bodies, as
   `std.http`'s shapes are) and `browser.remote`, an API's client by it
   ([a client and its server](remote.md));
@@ -180,7 +189,13 @@ GPU is done, an `Either GpuError a` ([a thing held by a
 are the host's own things, foreign values, and no `With` leaves its
 body: a buffer is let go of at its `with`'s end, never used after.
 Its provider is WebGPU's, a page's, so a kernel is WGSL; the example
-page vecadd adds two vectors of Float32s by one.
+page vecadd adds two vectors of Float32s by one.  `gpu.canvas` (`import
+gpu.canvas as Canvas`) is where the GPU meets the page: `present d
+canvas px w h` shows a buffer's bytes on a `<canvas>` browser.dom found
+or made, as RGBA pixels `w` wide (a multiple of 64) and `h` high -- the
+element given by value, the device and the buffer by their `With`s, all
+three in scope inside the same `with`s; the example page pixels draws a
+gradient so.
 
 A kernel is written in heff, by `gpu.kernel`'s combinators (`import
 gpu.kernel as Kernel`), not quoted: an expression of the kernel is an

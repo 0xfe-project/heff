@@ -10,7 +10,7 @@
 //   node test/page.mjs APP SCRIPT...   counter, clock, finder, aliased,
 //                                      slept, painted, texts, names,
 //                                      greet, two (counter's and
-//                                      clock's), vecadd
+//                                      clock's), vecadd, pixels
 //   node test/page.mjs notes URL       the notes' page, of its server at
 //                                      URL; it says `lose the server`
 //                                      and waits for a line before the
@@ -28,6 +28,12 @@ class Node {
   replaceChildren() { this.children = []; }
   addEventListener(e, h) { (this.listeners[e] ??= []).push(h); }
   fire(e) { for (const h of this.listeners[e] ?? []) h({ target: this }); }
+  // (a pretend canvas: its WebGPU context keeps what was configured and
+  // the texture the GPU copies into)
+  getContext(kind) {
+    if (this.tag !== "canvas" || kind !== "webgpu") return null;
+    return this.context ??= { configure: (o) => { this.format = o.format; }, texture: { bytes: null }, getCurrentTexture() { return this.texture; } };
+  }
   get text() { return this.textContent + this.children.map((c) => c.text).join(""); }
   // (the elements under this one, this one first)
   *all() { yield this; for (const c of this.children) yield* c.all(); }
@@ -73,7 +79,8 @@ const until = async (what, ok, ms = 20000) => {
 };
 // (a device of plain objects: a buffer its bytes, a command its steps,
 // done when submitted; its kernel adds the first two buffers bound into
-// the third, as Float32s)
+// the third, as Float32s, or, of one buffer, numbers its elements, as
+// UInt32s)
 const pretendGpu = () => {
   const made = [], ran = [], codes = [];
   class Buffer {
@@ -99,12 +106,18 @@ const pretendGpu = () => {
       const steps = [];
       return {
         copyBufferToBuffer: (from, at, to, to0, n) => steps.push(() => to.bytes.set(from.bytes.subarray(at, at + n), to0)),
+        copyBufferToTexture: ({ buffer }, { texture }, [w, h]) => steps.push(() => { texture.bytes = buffer.bytes.slice(0, w * h * 4); }),
         beginComputePass: () => {
           let pipeline = null, group = null;
           return {
             setPipeline: (p) => { pipeline = p; }, setBindGroup: (i, g) => { if (i === 0) group = g; },
             dispatchWorkgroups: (x, y, z) => steps.push(() => {
               ran.push(`${pipeline.entry} ${x} ${y} ${z}`);
+              if (group.buffers.length === 1) {
+                const px = new Uint32Array(group.buffers[0].bytes.buffer);
+                for (let i = 0; i < px.length; i++) px[i] = i;
+                return;
+              }
               const [a, b, c] = group.buffers.map(floats);
               for (let i = 0; i < c.length; i++) c[i] = a[i] + b[i];
             }),
@@ -207,6 +220,25 @@ const apps = {
     said("on a pretend GPU", label());
     said("its dispatch", pretend.ran.join());
     said("its kernel", pretend.codes.join("\n----\n"));
+    said("its buffers let go of", pretend.made.map((b) => !!b.destroyed).join());
+  },
+  // a canvas the DOM made, given to the GPU's canvas effect: with no
+  // `navigator.gpu`, the page says so; on a pretend device, the kernel
+  // dispatched over the buffer, and the buffer copied into the canvas's
+  // texture, the canvas configured for the device
+  pixels: async () => {
+    const plain = loaded(files[0], withBox("pixels"));
+    if (plain) said("no WebGPU", plain.children[0].children[1].text);
+    const pretend = pretendGpu();
+    const page = loaded(files[0], withBox("pixels"), { navigator: { gpu: pretend.gpu } });
+    if (!page) return;
+    const [canvas, label] = page.children[0].children;
+    await until("drawn", () => { tick(); return label.text !== "drawing"; });
+    said("drawn", label.text);
+    said("its dispatch", pretend.ran.join());
+    said("its kernel", pretend.codes.join("\n----\n"));
+    const shown = canvas.context && canvas.context.texture.bytes;
+    said("on the canvas", `${canvas.tag} ${canvas.width}x${canvas.height} ${canvas.format}, ${shown ? shown.length : "no"} bytes, pixel 1: ${shown ? shown.subarray(4, 8).join() : "-"}`);
     said("its buffers let go of", pretend.made.map((b) => !!b.destroyed).join());
   },
   // the notes' page, its script the server's, its `fetch` Node's of the
