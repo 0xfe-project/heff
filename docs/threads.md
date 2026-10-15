@@ -303,6 +303,16 @@ program = do
   something is sent.  A join is the same: blocking, or pending until
   the place has ended.
 
+The working directory is each place's own, not the process's: a
+place starts in its starter's directory (the main place, in the
+process's), `setWorkingDir` moves that place alone, `workingDir` says
+where it is, and every relative path a place gives `std.filesystem`
+or `std.process` is taken from there -- a command it starts runs
+there, its `dir` under there.  The runtime keeps the directory for
+each place and joins each relative path to it before the system sees
+it; the process's own working directory is never changed, except in a
+command started, between its fork and its exec.
+
 ### Green threads in a place
 
 The reactor is each thread's own, so each place has one, the main
@@ -391,8 +401,8 @@ What a channel costs the program: it is held by the world for the
 program's life (there is no closing it yet).  A place's `exit` ends
 the process, as a thread's does.  Definitions' values are computed
 once and frozen, as in threads mode, so a place reading one copies
-nothing.  `std.reference`'s cells and the working directory are still
-the process's, not the place's.
+nothing.  `std.reference`'s cells are still the process's, not the
+place's.
 
 ### Measured
 
