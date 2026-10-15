@@ -933,25 +933,90 @@ skipped : Tokens.Env -> Bool -> CST.D -> Bool
 skipped env above d =
   above && attached env (CST.firstD d) || skipsAt env (CST.firstD d)
 
+-- A watch ending a `mutual` block: its expectation, the `-- v` lines
+-- under it, is among the comments before what follows the block, and
+-- would be laid out there, at the column of the block's keyword.  It is
+-- laid out under the watch instead, at its column.
+
+-- | a line of a watch's expectation (`doc`: a doc test's): a comment
+-- | `-- v` right under it, not a doc comment's line (a doc test's, a doc
+-- | comment's line `-- | v`), neither blank nor after a blank line
+expectLine : Bool -> Tokens.Cmt -> Bool
+expectLine doc c =
+  not c.blank
+  && strEq (strSlice c.text 0 2) "--"
+  && (if doc
+      then strEq (strSlice c.text 0 4) "-- |"
+        && not (strEq (trim (strSlice c.text 4 (strLength c.text))) "")
+      else not (strEq (strSlice c.text 0 4) "-- |")
+        && not (strEq (trim (strSlice c.text 2 (strLength c.text))) ""))
+
+-- (the expectation among the comments before a token: its first lines)
+expectLines : Bool -> List Tokens.Cmt -> List Tokens.Cmt
+expectLines doc Nil = Nil
+expectLines doc (Cons c cs) =
+  if expectLine doc c then Cons c (expectLines doc cs) else Nil
+
+-- | the expectation of a watch ending a `mutual` block: the lines under
+-- | it, among the comments before the token after the block
+blockExpect : Tokens.Env -> CST.D -> List Tokens.Cmt
+blockExpect env (DMutual kw ds) = case List.last ds of
+  Just (DWatch w e) ->
+    expectLines
+      (strEq w.kind "doctest")
+      (fromMaybe Nil (Map.lookup env.lead (tokIx2 (CST.lastE e) + 1)))
+  _ -> Nil
+blockExpect env d = Nil
+
+-- (the comments before the token `ix`, the first `n` of them laid out
+-- already)
+leadLaid : Tokens.Env -> Int -> Int -> Tokens.Env
+leadLaid env ix n =
+  if n == 0 then env
+  else { src = env.src
+       , lead =
+           Map.insert
+             env.lead
+             ix
+             (List.drop n (fromMaybe Nil (Map.lookup env.lead ix)))
+       , inline = env.inline
+       , trail = env.trail
+       , noLead = env.noLead
+       , noTrail = env.noTrail
+       , fix = env.fix
+       }
+
+-- | the expectation's lines under the watch, indented as the block's
+-- | definitions are
+expectDocs : List Tokens.Cmt -> Doc
+expectDocs cs = nest 2 (foldDocs (List.map cmtLead cs))
+
 -- | the declarations, each laid out, or kept as written under
 -- | `-- fmt: skip` with the equations of its name after it (`above`: a
--- | `-- fmt: skip` above the doc tests just laid out)
-topLevelGo : Tokens.Env -> Int -> Bool -> List CST.D -> Doc
-topLevelGo env i above Nil = emptyDoc
-topLevelGo env i above (Cons d ds) =
+-- | `-- fmt: skip` above the doc tests just laid out); then the comments
+-- | at the end of the file
+topLevelGo : Tokens.Env -> Int -> Bool -> T -> List CST.D -> Doc
+topLevelGo env i above eof Nil = eofLeadDocs env (leadOf env eof)
+topLevelGo env i above eof (Cons d ds) =
   declSep env i d
   <> (if isDocTest d
       then item env (CST.firstD d) (CST.lastD d) (\e -> pD e d)
-        <> topLevelGo env (i + 1) (skipped env above d) ds
+        <> topLevelGo env (i + 1) (skipped env above d) eof ds
       else if skipped env above d
       then asWritten env (CST.firstD d) (CST.lastD (defLast (defName d) d ds))
-        <> topLevelGo env (i + 1) False (afterDef (defName d) ds)
-      else item env (CST.firstD d) (CST.lastD d) (\e -> pD e d)
-        <> topLevelGo env (i + 1) False ds)
+        <> topLevelGo env (i + 1) False eof (afterDef (defName d) ds)
+      else let expect = blockExpect env d
+           in item env (CST.firstD d) (CST.lastD d) (\e -> pD e d)
+           <> expectDocs expect
+           <> topLevelGo
+             (leadLaid env (tokIx2 (CST.lastD d) + 1) (List.length expect))
+             (i + 1)
+             False
+             eof
+             ds)
 
 topLevel : Tokens.Env -> List CST.D -> T -> Doc
-topLevel env ds eof =
-  topLevelGo env 0 False ds <> eofLeadDocs env (leadOf env eof)
+topLevel env ds eof = topLevelGo env 0 False eof ds
 
 -- Rendering
 
