@@ -1788,6 +1788,7 @@ cTypeName CString = "const char *"
 cTypeName CText = "const char *"
 cTypeName COwnedString = "char *"
 cTypeName (CPointer t _) = t ^ " *"
+cTypeName (CSharedPointer t _ _) = t ^ " *"
 cTypeName CVoid = "void"
 
 resultTypeName : Glue.CResult -> String
@@ -1807,18 +1808,37 @@ funTypeName b =
 glueName : String -> String -> String
 glueName leaf what = "heff_ffi_" ^ leaf ^ "_" ^ what
 
+-- (a pointer type's function -- what lets it go, what holds it once
+-- more -- among those seen, once)
+withFn : List (Pair String String)
+       -> String
+       -> String
+       -> List (Pair String String)
+withFn acc t r =
+  if List.any
+       (\(q : Pair String String) -> strEq (fst q) t && strEq (snd q) r)
+       acc
+  then acc
+  else Cons (MkPair t r) acc
+
 -- (the pointer types released, each once, in order: a let-go function each)
 pointersGo : List (Pair String String)
            -> List Glue.CType
            -> List (Pair String String)
 pointersGo acc Nil = List.reverse acc
-pointersGo acc (Cons (CPointer t r) rest) =
-  if List.any
-       (\(q : Pair String String) -> strEq (fst q) t && strEq (snd q) r)
-       acc
-  then pointersGo acc rest
-  else pointersGo (Cons (MkPair t r) acc) rest
+pointersGo acc (Cons (CPointer t r) rest) = pointersGo (withFn acc t r) rest
+pointersGo acc (Cons (CSharedPointer t r _) rest) =
+  pointersGo (withFn acc t r) rest
 pointersGo acc (Cons _ rest) = pointersGo acc rest
+
+-- (the pointer types that cross places, each once, in order: a share
+-- function each)
+sharesGo : List (Pair String String)
+         -> List Glue.CType
+         -> List (Pair String String)
+sharesGo acc Nil = List.reverse acc
+sharesGo acc (Cons (CSharedPointer t _ s) rest) = sharesGo (withFn acc t s) rest
+sharesGo acc (Cons _ rest) = sharesGo acc rest
 
 resultCType : Glue.CResult -> List Glue.CType
 resultCType (Gives t) = Cons t Nil
@@ -1834,6 +1854,9 @@ typesOf bs =
 pointersOf : List Glue.Binding -> List (Pair String String)
 pointersOf bs = pointersGo Nil (typesOf bs)
 
+sharesOf : List Glue.Binding -> List (Pair String String)
+sharesOf bs = sharesGo Nil (typesOf bs)
+
 letGoIndexGo : Int -> List (Pair String String) -> String -> String -> Int
 letGoIndexGo i Nil t r = 0
 letGoIndexGo i (Cons (MkPair t2 r2) rest) t r =
@@ -1843,6 +1866,11 @@ letGoIndexGo i (Cons (MkPair t2 r2) rest) t r =
 letGoOf : String -> List (Pair String String) -> String -> String -> String
 letGoOf leaf ptrs t r =
   glueName leaf ("let_go_" ^ show (letGoIndexGo 0 ptrs t r))
+
+-- (the share function of a pointer type that crosses places)
+shareOf : String -> List (Pair String String) -> String -> String -> String
+shareOf leaf shares t s =
+  glueName leaf ("share_" ^ show (letGoIndexGo 0 shares t s))
 
 failsErrno : Glue.CResult -> Bool
 failsErrno (Gives _) = False
@@ -1900,6 +1928,7 @@ argLine i (CPointer t _) =
   ^ " = heff_foreign_ptr(heff_field(p, "
   ^ show i
   ^ "));"
+argLine i (CSharedPointer t r _) = argLine i (CPointer t r)
 argLine i _ = ""
 
 argLines : Int -> List Glue.CType -> List String
@@ -1928,27 +1957,41 @@ nullable CString = True
 nullable CText = True
 nullable COwnedString = True
 nullable (CPointer _ _) = True
+nullable (CSharedPointer _ _ _) = True
 nullable _ = False
 
--- (the result `c` as the answer's value)
-convOf : String -> List (Pair String String) -> Glue.CType -> String
-convOf leaf ptrs (CInteger _) = "heff_int((int64_t)c)"
-convOf leaf ptrs CDouble = "heff_flt((double)c)"
-convOf leaf ptrs CBool = "NTAG(c ? TAG_True : TAG_False)"
-convOf leaf ptrs CString = "heff_str_bytes(c, (int64_t)strlen(c))"
-convOf leaf ptrs CText = "heff_str_text(c)"
-convOf leaf ptrs COwnedString = glueName leaf "owned" ^ "(c)"
-convOf leaf ptrs (CPointer t r) =
+-- (the result `c` as the answer's value: a pointer a foreign value, let
+-- go of by its function; one that crosses places, shared, held once
+-- more by its other)
+convOf : String
+       -> List (Pair String String)
+       -> List (Pair String String)
+       -> Glue.CType
+       -> String
+convOf leaf ptrs shares (CInteger _) = "heff_int((int64_t)c)"
+convOf leaf ptrs shares CDouble = "heff_flt((double)c)"
+convOf leaf ptrs shares CBool = "NTAG(c ? TAG_True : TAG_False)"
+convOf leaf ptrs shares CString = "heff_str_bytes(c, (int64_t)strlen(c))"
+convOf leaf ptrs shares CText = "heff_str_text(c)"
+convOf leaf ptrs shares COwnedString = glueName leaf "owned" ^ "(c)"
+convOf leaf ptrs shares (CPointer t r) =
   "heff_foreign(c, " ^ letGoOf leaf ptrs t r ^ ")"
-convOf leaf ptrs CVoid = "NTAG(TAG_MkUnit)"
+convOf leaf ptrs shares (CSharedPointer t r s) =
+  "heff_foreign_shared(c, "
+  ^ letGoOf leaf ptrs t r
+  ^ ", "
+  ^ shareOf leaf shares t s
+  ^ ")"
+convOf leaf ptrs shares CVoid = "NTAG(TAG_MkUnit)"
 
 -- (the call, and `r` of its result, as the result is described)
 resultLines : String
             -> String
             -> List (Pair String String)
+            -> List (Pair String String)
             -> Glue.Binding
             -> List String
-resultLines md leaf ptrs b = case b.result of
+resultLines md leaf ptrs shares b = case b.result of
   Gives CVoid -> ["      " ^ glueCallOf b ^ ";", "      r = NTAG(TAG_MkUnit);"]
   Gives t ->
     List.append
@@ -1962,7 +2005,7 @@ resultLines md leaf ptrs b = case b.result of
                ^ "`: C gave NULL\");"
                ]
           else Nil)
-         ["      r = " ^ convOf leaf ptrs t ^ ";"])
+         ["      r = " ^ convOf leaf ptrs shares t ^ ";"])
   GivesOrErrno t ->
     [ "      " ^ cTypeName t ^ " c = " ^ glueCallOf b ^ ";"
     , "      r = "
@@ -1972,7 +2015,7 @@ resultLines md leaf ptrs b = case b.result of
     ^ "(errno) : "
     ^ glueName leaf "right"
     ^ "("
-    ^ convOf leaf ptrs t
+    ^ convOf leaf ptrs shares t
     ^ ");"
     ]
   DoneOrErrno ->
@@ -2018,9 +2061,10 @@ answerLines b =
 caseLines : String
           -> String
           -> List (Pair String String)
+          -> List (Pair String String)
           -> Glue.Binding
           -> List String
-caseLines md leaf ptrs b =
+caseLines md leaf ptrs shares b =
   List.append
     (Cons ("  case TAG_" ^ mangle b.tag ^ ": {") (argLines 0 b.args))
     (List.append
@@ -2030,7 +2074,7 @@ caseLines md leaf ptrs b =
            Nil ->
              List.map
                (\l -> strSlice l 2 (strLength l))
-               (resultLines md leaf ptrs b)
+               (resultLines md leaf ptrs shares b)
            is ->
              List.append
                (Cons
@@ -2039,7 +2083,7 @@ caseLines md leaf ptrs b =
                    ^ ") {")
                   (nulLines md leaf b))
                (List.append
-                  (Cons "    } else {" (resultLines md leaf ptrs b))
+                  (Cons "    } else {" (resultLines md leaf ptrs shares b))
                   (Cons
                      "    }"
                      (List.map (\i -> "    free(a" ^ show i ^ ");") is))))
@@ -2061,24 +2105,33 @@ assertLine md b =
   ^ funTypeName b
   ^ "`, which it is not\");"
 
-letGoLines : String -> Int -> List (Pair String String) -> List String
-letGoLines leaf i Nil = Nil
-letGoLines leaf i (Cons (MkPair t r) rest) =
+-- (a pointer type's functions, each as a function of `void *`, named
+-- `what` and numbered)
+pointerFnLines : String
+               -> String
+               -> Int
+               -> List (Pair String String)
+               -> List String
+pointerFnLines leaf what i Nil = Nil
+pointerFnLines leaf what i (Cons (MkPair t r) rest) =
   Cons
     ("static void "
-     ^ glueName leaf ("let_go_" ^ show i)
+     ^ glueName leaf (what ^ show i)
      ^ "(void *q) { "
      ^ r
      ^ "(("
      ^ t
      ^ " *)q); }")
-    (letGoLines leaf (i + 1) rest)
+    (pointerFnLines leaf what (i + 1) rest)
 
 -- (the glue's own helpers, those it uses: the errno record's shape and
 -- `Left`/`Right` of it, a malloc'd string taken, each pointer type's
--- let-go function)
-helperLines : Glue.Glue -> List (Pair String String) -> List String
-helperLines gl ptrs =
+-- let-go function, and the share function of each that crosses places)
+helperLines : Glue.Glue
+            -> List (Pair String String)
+            -> List (Pair String String)
+            -> List String
+helperLines gl ptrs shares =
   List.append
     (if List.any (\(b : Glue.Binding) -> failsErrno b.result) gl.ops
      then [ "static uint32_t "
@@ -2101,7 +2154,9 @@ helperLines gl ptrs =
              ^ "(char *c) { V s = heff_str_bytes(c, (int64_t)strlen(c)); free(c); return s; }"
              ]
         else Nil)
-       (letGoLines gl.leaf 0 ptrs))
+       (List.append
+          (pointerFnLines gl.leaf "let_go_" 0 ptrs)
+          (pointerFnLines gl.leaf "share_" 0 shares)))
 
 -- | a leaf's glue, as a provider's text: its module's description made C
 glueProvider : Glue.Glue -> Emit.Provider
@@ -2126,7 +2181,7 @@ glueProvider gl =
                  (List.append
                     (List.map (assertLine gl.module) gl.ops)
                     (List.append
-                       (helperLines gl (pointersOf gl.ops))
+                       (helperLines gl (pointersOf gl.ops) (sharesOf gl.ops))
                        (List.append
                           (Cons
                              ("static V heff_described_"
@@ -2138,7 +2193,8 @@ glueProvider gl =
                                    (caseLines
                                       gl.module
                                       gl.leaf
-                                      (pointersOf gl.ops))
+                                      (pointersOf gl.ops)
+                                      (sharesOf gl.ops))
                                    gl.ops)))
                           (List.append
                              [ "  default:"

@@ -154,8 +154,10 @@ in order, each a `CType` -- `Ffi.int`, `Ffi.int64`, `Ffi.integer
 "mode_t"` (an integer type by its C name, of an `Int`), `Ffi.double`
 (a `Float64`), `Ffi.bool`, `Ffi.string` (`const char *`, a string's
 bytes with a NUL after them; `Ffi.text` the same made valid), and
-`Ffi.pointer "FILE" "fclose"` (a `FILE *`, a foreign value); and its
-result -- `Ffi.gives t` (the answer; `Ffi.void` gives `MkUnit`, or the
+`Ffi.pointer "FILE" "fclose"` (a `FILE *`, a foreign value), and
+`Ffi.sharedPointer "HeffChan" "heff_chan_drop" "heff_chan_hold"` (the
+same, for a thing that crosses places: what holds it once more as it
+does, [host types](#host-types)); and its result -- `Ffi.gives t` (the answer; `Ffi.void` gives `MkUnit`, or the
 operation's `x` itself where that is its last field),
 `Ffi.givesOrErrno t` (an `Either Errno a`: `-1`, or `NULL`, with
 `errno` set is `Left` of it, as `Ffi.Errno` has it, the shape of
@@ -233,7 +235,11 @@ the receiver has a foreign value of its own, each place letting it go
 as it drops its last reference, the thing freed by the provider when
 every place has; any other foreign value does not cross (sending one
 fails).  Operations described in C ([above](#operations-described-in-c))
-get all this from `Ffi.pointer`.
+get all this from `Ffi.pointer`, and from `Ffi.sharedPointer` where the
+thing is to cross places: a provider needs it for a thing the program
+may hand to a place -- a channel, a handle whose host counts its
+holders -- and none other, as std.place describes its `NewChannel`
+and writes the rest by hand.
 
 In JavaScript a foreign value is the host's object itself, given to the
 program as it is and taken back as it is (`k(a[1](element))`), by this

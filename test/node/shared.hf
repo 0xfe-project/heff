@@ -1,0 +1,120 @@
+-- A host's thing that crosses places (with std.place): a token, a
+-- foreign value the module describes as a pointer shared between
+-- places (ffi's `sharedPointer`) -- no provider written by hand, the
+-- compiler making the glue of the description.  Sent to a place, the
+-- token is held once more there; each place lets it go as it drops its
+-- last reference, and the last to do so frees it, which its provider
+-- counts.
+
+import co
+import ffi as Ffi
+import std.io
+import std.place
+
+-- | A token as the host has it: a foreign value; no value of the
+-- | program has it.
+data Token
+
+data TokensF (m : Type -> Type) x
+  = NewToken (Token -> x)
+  | Holders Token (Int -> x)
+  | Held (Int -> x)
+  | Freed (Int -> x)
+
+tokens : HFunctor
+tokens =
+  { f = TokensF
+  , hfmap = \m g p -> case p of
+      NewToken k -> NewToken (\t -> g (k t))
+      Holders t k -> Holders t (\n -> g (k n))
+      Held k -> Held (\n -> g (k n))
+      Freed k -> Freed (\n -> g (k n))
+  , hmap = \m n nt p -> case p of
+      NewToken k -> NewToken k
+      Holders t k -> Holders t k
+      Held k -> Held k
+      Freed k -> Freed k
+  }
+
+-- (a token, as C has it: a pointer that crosses places, `heff_token_drop`
+-- letting it go, `heff_token_hold` holding it once more)
+token : Ffi.CType
+token = Ffi.sharedPointer "HeffToken" "heff_token_drop" "heff_token_hold"
+
+-- | The operations, each a function of the provider's.
+tokensInC : Ffi.Described
+tokensInC =
+  Ffi.describe
+    Nil
+    [ Ffi.operation "NewToken" (Ffi.fun "heff_token_new" Nil (Ffi.gives token))
+    , Ffi.operation
+      "Holders"
+      (Ffi.fun "heff_token_holders" [token] (Ffi.gives Ffi.int64))
+    , Ffi.operation
+      "Held"
+      (Ffi.fun "heff_tokens_held" Nil (Ffi.gives Ffi.int64))
+    , Ffi.operation
+      "Freed"
+      (Ffi.fun "heff_tokens_freed" Nil (Ffi.gives Ffi.int64))
+    ]
+
+newToken : {e : HFunctor} -> {{ev : tokens <: e}} -> Co e Token
+newToken = op (ev (NewToken (\t -> t))) val
+
+-- | how many places hold the token
+holders : {e : HFunctor} -> {{ev : tokens <: e}} -> Token -> Co e Int
+holders t = op (ev (Holders t (\n -> n))) val
+
+-- | how many times a token was held once more, crossing to a place
+held : {e : HFunctor} -> {{ev : tokens <: e}} -> Co e Int
+held = op (ev (Held (\n -> n))) val
+
+-- | how many tokens have been freed
+freed : {e : HFunctor} -> {{ev : tokens <: e}} -> Co e Int
+freed = op (ev (Freed (\n -> n))) val
+
+world : HFunctor
+world = stdio <+> (places <+> tokens)
+
+-- (a place given a token: how many hold it while the place does)
+taking : {{pl : places <: world}}
+       -> {{tk : tokens <: world}}
+       -> PlaceChannel Token
+       -> Co world Int
+taking ch = do
+  t <- recvPlace ch
+  holders t
+
+-- (a token sent to a place and held here until the place has let it
+-- go: how many held it there, and how many hold it after)
+crossing : {{io : stdio <: world}}
+         -> {{pl : places <: world}}
+         -> {{tk : tokens <: world}}
+         -> Co world Unit
+crossing = do
+  t <- newToken
+  ch <- newPlaceChannel
+  p <- spawnPlace (taking ch)
+  sendPlace ch t
+  there <- joinPlace p
+  print ("in the place: held by " ^ show there)
+  here <- holders t
+  print ("after the place let go: held by " ^ show here)
+
+program : {{io : stdio <: world}}
+        -> {{pl : places <: world}}
+        -> {{tk : tokens <: world}}
+        -> Co world Unit
+program = do
+  crossing
+  n <- held
+  print ("held once more: " ^ show n)
+  f <- freed
+  print ("freed: " ^ show f)
+
+main : Co world Unit
+main =
+  program
+    (io := \p -> InL p)
+    (pl := \p -> InR (InL p))
+    (tk := \p -> InR (InR p))
