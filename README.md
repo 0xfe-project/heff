@@ -83,17 +83,15 @@ heff dev                   # build, run and serve; again at each change
 
 ## Documentation
 
-- [The language](docs/reference/language.md): modules, records, implicit
-  arguments, operators, numbers, runes and strings, effects
-- [The library](docs/reference/library.md): `lib/`, the batteries of `lib/std/`,
+- [The tutorial](docs/tutorial/first-program.md): heff, learned by
+  writing a program
+- [The language](docs/reference/language/modules.md): modules, data,
+  arguments, operators, numbers, text, `do`, effects
+- [The library](docs/reference/library/index.md): what `lib/` has, and
   the examples
-- [Projects](docs/reference/projects.md): `package.hf`, packages, programs
-- [Commands](docs/reference/commands.md): every command, the formatter
-- [Tests](docs/reference/tests.md): doc tests, watches, unit tests and properties
-- [Providers](docs/reference/providers.md): an effect's JavaScript and C sides,
-  strings and numbers at the host, `JSString`
-- [Developing heff](DEVELOPING.md): the source, the seed, the
-  tests
+- [Projects](docs/reference/projects.md), [Commands](docs/reference/commands.md),
+  [Tests](docs/reference/tests.md), [Providers](docs/reference/providers.md)
+- [Developing heff](DEVELOPING.md): the source, the seed, the tests
 
 ## Developing
 

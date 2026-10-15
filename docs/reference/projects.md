@@ -2,24 +2,22 @@
 title: Projects
 ---
 
-How a project is laid out: its manifest, the packages it requires, and
-its programs.  `heff init` makes one -- a module, a program and a test
--- and the [commands](commands.md) build, test and install it.
+## Layout
 
-## The package
+```
+hello/
+  package.hf          the package
+  src/hello/*.hf      its modules
+  app/NAME/main.hf    a program
+  app/NAME/build.hf   how the program is built
+  test/*.hf           tests
+  bench/*.hf          benchmarks
+  .heff/              what heff makes: builds, caches
+```
 
-A project is a directory with a `package.hf`: a heff file defining
-`package`, of type `Package` (`lib/manifest.hf`), read without being
-run.  Its modules are the files under its `src/`, named by their paths
-there (see [the language's modules](language.md#modules)).  Compiled
-modules are cached in `.heff/`, where all heff makes is kept.
+`heff init NAME` makes a project with a module, a program and a test.
 
-A package required is fetched by git from its path (`heff get`), the
-version chosen as Go's minimal version selection does, into
-`~/.cache/heff/mod`; `heff.sum` holds the tree of each version.  What a
-project requires (`require`) and the packages it takes from directories
-instead (`replace`) are none where left out, as their defaults in
-`lib/manifest.hf` say.
+## package.hf
 
 ```haskell
 import manifest
@@ -27,51 +25,50 @@ import manifest
 package : Package
 package =
   { module = "github.com/someone/hello"
-  , heff = "0.1.0"
-  , require = [{ name = "json", path = "github.com/someone/json", version = "1.2.0" }]
+  , heff = "0.4.0"
+  , require =
+      [{ name = "json", path = "github.com/someone/json", version = "1.2.0" }]
+  , replace = [{ name = "json", dir = "../json" }]
   }
 ```
 
-A package's name is the first part of its modules' names: a lowercase
-letter, then lowercase letters, digits and `_` (a capitalised name is a
-tag).  It is never `test`: a project's tests, under its `test/`, are the
-modules `test.X`.  The one directory of `src/`, each `name` required or
-replaced, and the project `heff init` makes are named so.  `heff init
-DIR` names the project as DIR's last part, and `heff init` as the
-working directory's; a directory named otherwise (`MyApp`, `my-app`) is
-refused, with a name that would do (`heff init myapp`).
+`package.hf` defines `package`, of type `Package` (`lib/manifest.hf`).
+It is read as data, never run.
 
-## heff's own package
+| Field | Meaning |
+|---|---|
+| `module` | where the package lives; its last part is the package's name |
+| `heff` | the heff version it is for |
+| `require` | the packages it uses: the name it imports them by, where they live, and the version |
+| `replace` | packages taken from a directory instead, while you work on them |
 
-The package `heff` is heff's: the compiler and its library, which come
-with heff.  The compiler keeps the name, as Go keeps `std`: no package
-requires `heff`, replaces it, or gets it (`heff get heff`), and `heff
-init` makes no project of that name -- each an error, E0347.
+`require` and `replace` default to `[]`.
 
-A project's `package.hf` names `heff` only where heff is from, and there
-its `lib/` is the library (see [the library](library.md)):
+### Names
 
-- the directory the heff running came with -- the checkout it is built
-  in (`.heff/out/heff`), or the heff home it is installed in;
-- the checkout it was installed from: `heff install` of heff's own
-  package writes it to the heff home's `source` (`~/.heff/source`),
-  read from the heff home heff came with and from `HEFF_HOME`'s;
-- a directory whose `lib/` is the library heff has already (`HEFF_LIB`,
-  a release's), which so gains nothing.
+A package's name is the first part of its modules' names: `hello` for
+`hello.greeting`. It starts with a lowercase letter, then lowercase
+letters, digits and `_`.
 
-Anywhere else, naming `heff` is an error: where heff is from is said by
-heff and its heff home, never by the project.  To work on a checkout of
-heff, build it (`make build`) or install from it.
+- It is never `test`, which names a project's tests.
+- It is never `heff`: that package is the compiler and its library,
+  which come with heff, and no project requires, replaces or gets it
+  (E0347).
+- `heff init DIR` names the project after DIR, and refuses a name that
+  does not fit, suggesting one that does.
+
+### Packages required
+
+- `heff get` fetches each required package by git, from its path, into
+  `~/.cache/heff/mod`, and records each version's git tree in
+  `heff.sum`.
+- Versions are `a.b.c`. When several versions of a package are
+  required, heff picks as Go's minimal version selection does.
+- `heff get PATH[@VERSION]` adds a requirement and fetches it.
+- A replaced package is read from its directory. Its own `package.hf`
+  must have the `module` its `require` names.
 
 ## Programs
-
-A program is `app/NAME/main.hf`, with an `app/NAME/build.hf` beside it
-defining `build`, of type `Build`: the computation run, what it is
-compiled to (`C`, `Page`), and the files and directories of the
-project's root it ships (`ships`, none where left out).  `heff build`
-builds every program to `.heff/bin/`; `heff install` builds them into
-the heff home's `bin/`, and puts what they ship beside it, in place of
-what was there.
 
 ```haskell
 import manifest
@@ -80,12 +77,18 @@ build : Build
 build = { backend = C, run = "main" }
 ```
 
-A project may have programs of both: `app/server/` through `C`, and
-`app/client/` a `Page` whose script the server serves, the API between
-them an effect in a module of `src/` both import -- see
-`examples/notes/`.
+A program is `app/NAME/main.hf`, with `app/NAME/build.hf` beside it
+defining `build`, of type `Build`:
 
-heff itself is such a program: `app/heff/build.hf` ships `lib` and
-`package.hf`, so that `heff install` lays the heff home out as a
-release is -- `bin/heff`, and beside it what heff finds there, its
-library and its version -- and `source`, the checkout it came from.
+| Field | Meaning |
+|---|---|
+| `backend` | `C` for a native program, `Page` for a web page's script |
+| `run` | the definition run, usually `main` |
+| `ships` | files and directories of the project that `heff install` puts beside the program; default `[]` |
+
+`heff build` builds every program into `.heff/bin/`. `heff install`
+builds them to run fastest, into `~/.heff/bin/`, with what they ship.
+
+A project can have programs of both backends, such as a server through
+`C` and a page it serves, sharing an effect from `src/`: see
+`examples/notes/`.

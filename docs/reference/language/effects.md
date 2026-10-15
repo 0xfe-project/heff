@@ -1,0 +1,155 @@
+---
+title: Effects
+---
+
+Effects are a library, `lib/co.hf`, after Yang and Wu's "Handling
+Higher-Order Effectful Operations with Judgemental Monadic Laws" (POPL
+2026). `import co` to use them.
+
+## Computations
+
+```haskell
+import co
+import std.filesystem
+import std.io
+
+save : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{disk : filesystem <: e}}
+     -> Co e Unit
+save = do
+  ok <- writeFile "hello.txt" "hello"
+  print (if ok then "written" else "not written")
+
+main : Co (stdio <+> filesystem) Unit
+main =
+  save
+    (io := inl stdio filesystem)
+    (disk := inr stdio filesystem)
+```
+
+- `Co e a` is a computation in the world `e` that gives back an `a`.
+- A world is an `HFunctor`: one effect, such as `stdio`, or several
+  joined by `<+>`.
+- `h <: e` says the effect `h` is part of the world `e`. A computation
+  asks for each effect it uses as an instance argument, and can use
+  nothing else.
+- Write computations for any world `e`, asking only for what they use.
+  Only `main` names a world.
+
+### Giving the evidence
+
+A value of `h <: e` shows where `h` is in `e`:
+
+| Evidence | Shows |
+|---|---|
+| `here h` | `h <: h` |
+| `inl h k` | `h <: h <+> k` |
+| `inr h k` | `k <: h <+> k` |
+| `\p -> InR (InL p)` | the second of three, `k <: h <+> (k <+> j)` |
+
+Evidence is a function, so deeper places are written with `InL` and
+`InR` directly. `<+>` groups to the left.
+
+## Defining an effect
+
+```haskell
+data TickF (m : Type -> Type) x = Tick x
+
+tick : HFunctor
+tick =
+  { f = TickF
+  , hfmap = \m g p -> case p of
+      Tick x -> Tick (g x)
+  , hmap = \m n nt p -> case p of
+      Tick x -> Tick x
+  }
+
+tickOnce : {e : HFunctor} -> {{ev : tick <: e}} -> Co e Unit
+tickOnce = op (ev (Tick MkUnit)) val
+```
+
+1. A data type lists the operations. Its last parameter, `x`, is what
+   comes after the operation: an operation that gives back a value takes
+   a function to `x`, `Get (s -> x)`; one that gives back nothing takes
+   an `x`.
+2. An `HFunctor` record gives the type, `f`, and its two maps. For an
+   effect whose operations hold no computations, `hfmap` applies `g` to
+   each `x`, and `hmap` returns each operation unchanged.
+3. Each operation is `op (ev (Tag ...)) val`, with `MkUnit` for an `x`,
+   and the identity, `\t -> t`, for a function to `x`.
+
+## Handlers
+
+```haskell
+-- | counts the ticks
+counted : Handler tick
+counted =
+  { M = \x -> Int -> Pair x Int
+  , ret = \x n -> MkPair x n
+  , bind = \m k n -> case m n of
+      MkPair x n2 -> k x n2
+  , malg = \p n -> case p of
+      Tick x -> MkPair x (n + 1)
+  }
+
+thrice : {e : HFunctor} -> {{ev : tick <: e}} -> Co e Unit
+thrice = do
+  tickOnce
+  tickOnce
+  tickOnce
+
+-- | >>> ticks
+-- | 3
+ticks : Int
+ticks = snd (handle counted (thrice (ev := here tick)) 0)
+```
+
+A `Handler h` is a monad, `M`, `ret` and `bind`, and `malg`, which says
+what each operation does in it. No monad laws are asked of it.
+`handle hd c` runs `c` with it.
+
+### Handling one effect of many
+
+```haskell
+-- | each tick printed
+printed : {e : HFunctor}
+        -> {a : Type}
+        -> {{io : stdio <: e}}
+        -> Co (tick <+> e) a
+        -> Co e a
+printed c = handle (through tick e said) c
+  where
+  said : {x : Type} -> TickF (Co e) x -> Co e x
+  said (Tick x) = do
+    print "tick"
+    pure x
+```
+
+`through h e alg` handles `h` by turning each of its operations into a
+computation of the rest of the world, `Co e`, and leaves the rest
+untouched. The handler can ask for effects of `e` as instance arguments,
+as `printed` asks for stdio.
+
+The library has handlers ready:
+
+- `state`'s `runState s c` runs `c` from the state `s`, and gives back
+  its result and the final state;
+- `exception`'s `attempt err e c` gives `Left` what was thrown, or
+  `Right` the result.
+
+## When work happens
+
+Pure work runs where it is reached: an argument when the computation is
+built (`pure (fib n)` computes `fib n` there), a step after `bind` as
+the computation is handled. Only what comes after an operation waits for
+the handler's monad.
+
+`later (\u -> e)` delays `e` until the handler's monad runs it. This
+matters for handlers that run part of a computation elsewhere, such as
+`parallel`'s.
+
+## Effects of the outside world
+
+An effect of the world, such as `stdio`, is carried out by a provider:
+JavaScript and C code beside its module. See [Providers](../providers.md).

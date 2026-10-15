@@ -2,66 +2,41 @@
 title: Tests
 ---
 
-Three kinds of check, all run by `heff test` (on the files given, else
-the project's `src/` and `test/`): doc tests, watches and tests.  `heff promote
-FILE` writes the value of each doc test and watch of a file under it as
-its expectation.  Benchmarks are `heff bench`'s
-([benchmarks.md](benchmarks.md)).
+`heff test` checks three kinds of thing: doc tests, watches and tests.
+Given no files, it checks the project's `src/` and `test/`.
 
 ## Doc tests
 
-A doc test is an example in a definition's documentation: a line
-`-- | >>> e` of the doc comment right above the definition, with the
-value expected on the `-- | ...` lines under it.  It belongs to the
-definition, and is checked after it, as a watch written under it
-would be: the definition and what is above it are in scope.  The
-language server shows it in the definition's hover, and `heff test`
-names the definition when it does not hold.
-
 ```haskell
--- | the list, its elements the other way round
--- | >>> reverse [1, 2, 3]
+-- | the list the other way round
+-- | >>> List.reverse [1, 2, 3]
 -- | [3, 2, 1]
--- | >>> reverse (Cons "a" Nil)
--- | ["a"]
 -- |
 -- | It takes as many steps as there are elements.
-reverse : {a : Type} -> List a -> List a
+backwards : List Int -> List Int
+backwards xs = List.reverse xs
 ```
 
-The expectation is the `-- | ...` lines up to the next doc test, a
-blank line of the doc comment (`-- |`), or its end: it may go on over
-more than one line (read as one expression), and the comment goes on
-after a blank one.  It is compared by value, so `Cons 3 (Cons 2 Nil)`
-holds of `[3, 2]`.  A value is shown as the compiled code has it: a
-function as `#fun`, a type as `#erased`, and a value that takes types
-first -- erased where it is compiled -- given them: `Nil` of
-`{a : Type} -> List a` is `[]`.  A doc test with no expectation is
-checked only to elaborate; `heff promote` writes the value of each doc
-test and watch under it as its expectation (replacing what was there).
-A doc test is in the comment right above a definition -- its
-signature, or a `data`, `type`, `theory` or `primitive` -- with nothing
-but comments between, no blank line.  One that is not (a blank line
-under it, a `test`, a watch or an import, the end of the file) is
-checked where it is, as a watch, and warned of: write it as a watch, or
-move it into the doc comment right above its definition.
+A doc test is a `-- | >>> e` line in the comment right above a
+definition. The lines under it, up to a blank `-- |` line or the next
+`>>>`, are the value expected, compared by value: `Cons 3 Nil` holds of
+`[3]`.
+
+- The definition and everything above it are in scope.
+- A function is shown as `#fun`, and a type as `#erased`.
+- A doc test with no expected value is only type checked.
+- `heff promote FILE` writes each doc test's value as its expected value.
+- A doc test that is not right above a definition is checked where it is,
+  as a watch, with a warning.
+- The language server shows doc tests when you hover the definition.
 
 ## Watches
 
-A watch, `-- >>> e` with the value expected on the `-- ...` lines under
-it, is such a check of no one definition, written where it is: of what
-the file defines above it, or what it imports.  A `test NAME` names the
-watches after it (up to the next definition) in `heff test`'s report.
+A watch, `-- >>> e` with the expected value on the `-- ...` lines under
+it, checks something of no one definition, where it is written.
+`test NAME` names the watches after it in the report.
 
 ## Unit tests and properties
-
-A test is a top-level definition of type `Test` (check's);
-`heff test` runs a file's tests after its doc tests and watches, each
-once, from its root: a test another of the file's tests uses (directly,
-or through the file's other definitions, as in a list of them) runs
-under that one, by the name its groups give it, not by itself too.  A
-unit test checks; a property draws values from generators
-(`lib/generator.hf`, imported `as Generator`) and checks them, a hundred runs:
 
 ```haskell
 import check
@@ -69,239 +44,154 @@ import co
 import generator as Generator
 
 lists : Test
-lists = group "lists"
-  [ unit "append" (assertEqual ([1] ++ [2]) [1, 2])
-  , property "reversed twice" (do
-      xs <- forAll (Generator.list 0 20 (Generator.int 0 99))
-      label (if List.null xs then "empty" else "not empty")
-      assertEqual (List.reverse (List.reverse xs)) xs)
-  ]
+lists =
+  group
+    "lists"
+    [ unit "append" (assertEqual ([1] ++ [2] : List Int) [1, 2])
+    , property "reversed twice" (do
+        xs <- forAll (Generator.list 0 20 (Generator.int 0 99))
+        label (if List.null xs then "empty" else "not empty")
+        assertEqual (List.reverse (List.reverse xs)) xs)
+    ]
 ```
 
 ```
   ok    lists / append
   ok    lists / reversed twice  (100 runs, 17% empty, 83% not empty)
-ok    lists.hf  0/0, tests 2/2
 ```
 
-Randomness and checking are effects: a unit test's type grants it only
-`check`, a property also `random`, and the runner gives both.  A
-generator makes each value with the smaller ones to try instead
-(Hedgehog's rose trees), so a property that fails is shrunk, every draw
-of it, with nothing written for it; the runner then says the
-counterexample and the seed to run it again (`--seed N`; the default
-seed is always the same, so a run of the tests is always the same run).
-A label counts the runs it is given, so that a property that holds only
-of trivial values shows.  A value is shown, for a counterexample
-(`forAll`) or for what differs, and compared by `assertEqual`, as its
-type's `Show` writes it ([language.md](language.md#implicit-arguments)):
-as the source writes it, a string quoted and a rune too, as Rust's
-`Debug` writes a value -- not its text, `ToString`'s, its `Display`, by
-which `"1"` and `1` would be shown the same.  The prelude has one of
-numbers, strings and the like, and of lists, `Maybe`s, pairs and
-`Either`s of them; a type of the test's own is given one by an
-`instance`, as `test/check/map.hf` gives its commands.  A generator is
-given by hand.  `agree` runs a program of commands on a system and on a
-model of it and compares what they observe; drawn by a property, the
-program shrinks to a short one that tells them apart
-(`test/check/map.hf` holds `lib/std/map.hf` to a list of pairs).
+A test is a top-level definition of type `Test`, from `import check`.
 
-A test that needs what is not there -- a tool not installed, a system it
-is not of -- says so with `skip WHY`, rather than holding having checked
-nothing: `heff test` writes `skip` and the reason on its line, and
-counts it apart, neither held nor failed (`tests 3/5, 2 skipped`).
+- `unit NAME body` runs `body` once.
+- `property NAME body` runs `body` a hundred times. `forAll` draws a
+  value from a generator (`import generator as Generator`).
+- `group NAME tests` puts tests under a name.
+- `assertEqual`, `assert` and `failure` check; `label` counts the runs it
+  is in; `skip WHY` says a test cannot run here, and is counted apart.
+
+A property that fails is shrunk to a small counterexample, which is
+printed with the seed to run it again (`--seed N`). The default seed is
+fixed, so every run is the same.
+
+Values are compared and printed by their `Show`. A type of your own needs
+an instance: see [Implicit and instance arguments](language/arguments.md#declaring-an-instance).
+
+`agree` runs a program of commands on a system and on a model of it, and
+compares them. `test/check/map.hf` holds `std.map` to a list of pairs
+this way.
 
 ## Integration tests
 
-A test that needs the world outside the program -- commands run, files
-read and written -- is an integration test: its body is given the
-process (std.process) and the filesystem (std.filesystem) besides
-`check`.
-
 ```haskell
-import check
-import co
 import std.filesystem
 import std.process
 
 tool : Test
-tool = group "tool"
-  [ integration "writes its output where it is run" (do
-      r <- run { command = "sh", args = ["-c", "echo hi > out.txt"] }
-      out <- readFile "out.txt"
-      assertEqual out (Just "hi\n"))
-  , within 5000 (integration "answers quickly" (do
-      r <- run { command = "true" }
-      assert "it ended well" (succeeded r)))
-  ]
+tool =
+  group
+    "tool"
+    [ integration "writes its output where it is run" (do
+        r <- run { command = "sh", args = ["-c", "echo hi > out.txt"] }
+        out <- readFile "out.txt"
+        assertEqual out (Just "hi\n"))
+    , within 5000 (integration "answers quickly" (do
+        r <- run { command = "true" }
+        assert "it ended well" (succeeded r)))
+    ]
 ```
 
-`heff test` cannot run such a test in itself, as it runs the others: it
-builds the file's tests into a program through C (in `.heff/test/`, by
-zig, as `heff run` builds), and runs each integration test the file has
-in it, a process of its own, which writes how the test went to a file
-`heff test` names (`HEFF_TEST_OUTCOME`), not to its output, where what
-the test runs may write too.  (Where that program cannot be built,
-each of the file's integration tests fails, saying the first error, the
-others on the standard error; the other files go on.)  Each is run in
-a new, empty directory of
-its own (where the system keeps temporary ones), its working directory,
-removed after it; and each has a time limit, a minute unless `within MS`
-says otherwise, at which its process is killed and the test fails.
-It runs in a process group of its own, killed whole: what it started
-(a `sleep`, a `heff test`) goes with it -- not on Windows yet, where
-only its own process is (std.process's `group`).
-Integration tests run at once, those of all the files given in one
-pool, as many as `--jobs N` says, else `HEFF_TEST_JOBS`, else half the
-machine's cores (at least one), so that a run of the tests does not
-take all of it.  Their lines come after those of the file's other
-tests, and a file that has some is reported after the files that have
-none, in their order.  Each has, in its environment, `HEFF`,
-the path of the heff that runs it, and `HEFF_TEST_ROOT`, the project's
-root: a test of heff runs the heff tested, not one on the PATH, on the
-project's files (`run { command = heff, args = ..., dir = root }`).
-It has `HEFF_TEST_JOBS=1` too, so that a `heff test` it runs (with no
-`--jobs`) runs a test at a time, in the slot of the test that runs it,
-and nested runs do not multiply the tests run at once.
+An integration test can also run commands and use files: it gets
+`std.process` and `std.filesystem` besides `check`.
 
-## Subtests
+- `heff test` builds the file's tests into a C program, and runs each
+  integration test in a process of its own.
+- Each runs in a new, empty directory, removed afterwards.
+- Each has a time limit, a minute unless `within MS` says otherwise. At
+  the limit, it and every process it started are killed.
+- They run at once, up to `--jobs N`, else `HEFF_TEST_JOBS`, else half
+  the machine's cores.
+- Its environment has `HEFF`, the heff running it, and `HEFF_TEST_ROOT`,
+  the project's root.
 
-An integration test may make tests of its own as it runs, as Go's
-`t.Run` does: `subtest NAME body`.  Each is said on a line of its own,
-under its test's name (`files / a.txt`), holds or fails by itself and
-keeps its own golden texts; subtests may have subtests.  So the tests
-can be what is there when they run, a subtest a file of a directory,
-with no list of them written.
+### Subtests
 
 ```haskell
--- (a subtest each file, its text held to its golden one)
+-- (a subtest for each file, its text held to its golden text)
 each : {e : HFunctor}
      -> {{chk : check <: e}}
      -> {{disk : filesystem <: e}}
      -> List String
      -> Co e Unit
-each Nil = pure MkUnit
-each (Cons n rest) = do
+each [] = pure MkUnit
+each (n :: rest) = do
   subtest n (do
     text <- readFile ("inputs/" ^ n)
     golden n (fromMaybe "" text))
   each rest
 
 inputs : Test
-inputs = integration "files" (do
-  names <- readDirectory "inputs"
-  each (List.sort (fromMaybe Nil names)))
+inputs =
+  integration "files" (do
+    names <- readDirectory "inputs"
+    each (List.sort (fromMaybe [] names)))
 ```
 
-Each subtest runs in a process of its own, as many at once as the
-integration tests: the test's program, asked for a subtest by its
-names, does the test again from its start, doing only the subtests on
-the way to the one asked for and passing over the others; the test
-itself, run, names its subtests and does none.  So a test must do the
-same each time up to its subtests and name them alike (a directory's
-names sorted, as above), each name once and with no `/`; what it does
-after a subtest is done as if the subtest held.  A subtest is an
-integration test's: a unit test that makes one fails.
+`subtest NAME body`, as Go's `t.Run`, makes a test while an integration
+test runs, so tests can come from what is there, such as the files of a
+directory.
 
-## Selecting tests
-
-`heff test --run REGEXP` runs only the tests whose names the pattern
-matches, as Go's `go test -run` does: the pattern is cut at each `/`,
-a level each, and a test is run when each of its names -- its groups',
-then its own -- is matched (anywhere in it) by the level of its depth.
-A test whose names are fewer than the levels is matched by those it
-has, and one deeper than the pattern by its groups.  `--run '^lsp/hover'`
-runs the tests of the groups named `lsp...` whose names have `hover`;
-`--run /hover` the tests named `...hover...` of any group, and every
-test of no group.  Subtests are selected so too, a level each, as
-their tests name them: their test runs to name them, and those the
-pattern does not match are not run.  A file none of whose tests is
-selected (a test run only on the way to subtests the pattern does not
-match counts as none) is passed
-over, its watches and doc tests too, and not listed; where no test of
-any file is, `heff test` says `no tests match 'PATTERN'` and fails.
-
-The pattern is a regular expression, of a small part of RE2's syntax
-(the `regex` module): a byte for itself, `.`, a class `[a-z0-9_]` or
-`[^...]`, `\` before a byte that is not a letter or a digit, `*`, `+` and
-`?` after one of those, `^` first and `$` last, and `|` between
-alternatives.  What it does not read -- groups, counts `{n}`, `\d` -- is an
-error, not a literal, so that a pattern means the same once more is read.
-
-## Testing again at each change
-
-`heff test --watch` runs the tests as `heff test` would (the same FILEs,
-`--seed`, `--run`, `--jobs`), then looks at what they test every quarter
-of a second, as `heff dev` looks at a project: the files tested (those
-given, else `src/` and `test/`), the project's (`package.hf`, `src/`, `app/`) and
-`lib/` -- what the files import is among them.  At a change it runs
-them again, until it is ended (Ctrl-C).  Each run is `heff test`'s
-own output, and after it a line, `heff test: tested (2), all held; tested
-again at the next change` (`not all held` where something failed); a
-run after a change starts after an empty line and `heff test: a change;
-tested again`.  It is not given with `--update`, which writes golden
-texts -- a change, to be tested again without end: `heff test` says so
-and exits 2.
+Each subtest runs in a process of its own: the test runs again from the
+start, doing only the subtests on the way. So a test must do the same
+each time up to its subtests, and name them the same way, each name once,
+with no `/`.
 
 ## Golden texts
 
-A unit test or an integration test may hold a text to one kept in a
-file, its golden text: `golden NAME text`.  The file is `NAME` in the
-directory beside the test's file, named as it with `.golden` for `.hf`
-(`parser.golden/NAME`, of `parser.hf`); a name has letters, digits,
-`-`, `_` and `.`, not first, and may have directories, between `/`s
-(`eval/lib/list.hf.txt`).  `heff test` fails the test where the text is
-not the one kept (and says the first line where they differ) or none is
-kept;
-`heff test --update` writes the text there instead, and says so.  A
-test that fails otherwise is not held to its golden texts, nor are they
-written.
-
 ```haskell
 pretty : Test
-pretty = unit "a module, laid out" (golden "module.txt" (layout example))
+pretty = unit "laid out" (golden "list.txt" (show ([1, 2] : List Int)))
 ```
 
-## Files that expect errors
+`golden NAME text` holds `text` to the file `NAME` in the directory
+beside the test's file, named like it with `.golden` for `.hf`:
+`parser.golden/NAME` for `parser.hf`. `heff test --update` writes the
+text there instead.
 
-A file written to be wrong -- a test of what heff says of an error,
-as those of `test/errors/` are -- says so on its first line:
+## Choosing tests
+
+`heff test --run REGEXP` runs only the tests whose names match, as Go's
+`-run` does. The pattern is split at each `/`, one part for each level
+of groups: `--run '^lsp/hover'` runs the tests with `hover` in their
+names, in groups starting with `lsp`.
+
+The pattern is a small part of RE2: a byte, `.`, `[a-z]`, `[^...]`, `\`
+before a symbol, `*`, `+`, `?`, `^`, `$` and `|`. Anything else is an
+error.
+
+`heff test --watch` tests again at each change of the files tested, or
+of `package.hf`, `src/` or `app/`.
+
+## Files that expect errors
 
 ```haskell
 -- test: expect errors
 -- a type defined as itself
-
-a : Type
-a = a
 ```
 
-`heff test` then holds it to having errors, and says nothing of them:
-it passes if it has some, and fails if it checks.  The line counts only
-as the file's first; anywhere else it is a comment like another.  (What
-the errors say is held by heff's golden tests, `heff test
-test/golden.hf`; that each file of the repository checks or has its
-errors as it says, by its surface tests, `heff test test/surface.hf`.)
+A file whose first line is `-- test: expect errors` passes when it has
+errors, and fails when it checks.
 
 ## The report
-
-`heff test` says a line for each file, `ok` or `FAIL`, with how many of
-its expectations hold (and of its tests, if it has some, and how many
-were skipped), or `errors, as
-expected` for a file that expects them; each expectation or test that
-fails is shown above its file's line, and each error of a file that does
-not check is said on the standard error.  Then, if some files do not
-check as they should, it lists them, a line each, where each first went
-wrong -- its first error, as `path:line:col: error[E…]: what it says`,
-a module it imports that is not there, or that it checks though it
-expects errors.  The last line adds it up:
 
 ```
 ok    test/errors/rec.hf  errors, as expected
 FAIL  test/surface/oops.hf  0/0
 files that do not check as they should:
   test/surface/oops.hf:5:8: error[E0314]: expected type Int, but got the tag True
-485/485 expectations hold, 24/24 tests hold, 194/195 files check as they should (50 with expected errors)
+485/485 expectations hold, 24/24 tests hold, 194/195 files check as they should
 ```
 
-It exits 1 if an expectation does not hold, a test fails, or a file does
-not check as it should.
+One line for each file, `ok` or `FAIL`, with how many of its
+expectations and tests hold. Failures are shown above their file's line,
+and files that do not check are listed at the end. `heff test` exits 1
+if anything fails.

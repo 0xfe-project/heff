@@ -16,7 +16,7 @@ compiler as a library, in a directory each by what they are for:
 
 The program `heff` is `app/heff/main.hf`, which reads the command line
 and gives the commands the world they run in.  The library it ships
-with is `lib/` ([library.md](docs/reference/library.md)).
+with is `lib/` ([library.md](docs/reference/library/index.md)).
 
 ## Building
 
