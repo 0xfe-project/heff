@@ -1,4 +1,6 @@
-# Providers
+---
+title: Providers
+---
 
 An effect of the world is carried out by its provider: an effect's
 JavaScript side is in `M.provider.js` beside `M.hf`, its C side in

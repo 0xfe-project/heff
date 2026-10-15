@@ -1,4 +1,6 @@
-# The language
+---
+title: The language
+---
 
 What heff's programs are made of, beyond its Haskell-like core:
 modules (and what they expose), records, implicit arguments, operators,

@@ -628,6 +628,8 @@ const Bootstrap = struct {
                 const inside = b.arena.dupe(u8, entry.path) catch b.fail("heff release: out of memory", .{});
                 std.mem.replaceScalar(u8, inside, '\\', '/');
                 if (hidden(inside)) continue;
+                // of docs/, its pages only: not the site made of them
+                if (std.mem.eql(u8, path, "docs") and site(inside, entry.kind == .file)) continue;
                 const whole = b.concat(&.{ path, "/", inside });
                 switch (entry.kind) {
                     .directory => b.add(&entries, .{ .path = b.concat(&.{ whole, "/" }), .bytes = "", .mode = 0o755 }),
@@ -766,7 +768,7 @@ const releaseDir = out ++ "/release";
 
 /// What an archive has beside bin/: what heff ships, as `heff install`
 /// puts it in the heff home (app/heff/build.hf's `ships`: lib/,
-/// package.hf), and the license, the README and the docs.
+/// package.hf), and the license, the README and the docs' pages.
 const shipped = [_][]const u8{ "LICENSE", "README.md", "docs", "lib", "package.hf" };
 
 /// A file or a directory (its path ending in "/", or "", the archive's
@@ -806,6 +808,15 @@ fn isWindows(target: []const u8) bool {
 /// The name of heff built for `target`.
 fn programName(target: []const u8) []const u8 {
     return if (isWindows(target)) "heff.exe" else "heff";
+}
+
+/// Of docs/, what is not its pages but the site made of them: its source
+/// (src/), its packages (node_modules/), what it makes (dist/), and any
+/// file not a .md one.
+fn site(inside: []const u8, file: bool) bool {
+    const first = inside[0 .. std.mem.indexOfScalar(u8, inside, '/') orelse inside.len];
+    for ([_][]const u8{ "src", "node_modules", "dist" }) |part| if (std.mem.eql(u8, first, part)) return true;
+    return file and !std.mem.endsWith(u8, inside, ".md");
 }
 
 /// A path any part of which is hidden (.git, .heff, .DS_Store).

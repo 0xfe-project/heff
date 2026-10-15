@@ -1,4 +1,6 @@
-# Benchmarks
+---
+title: Benchmarks
+---
 
 `heff bench` runs benchmarks as Go's `go test -bench` does (on the files
 given, else the project's `bench/`), and says them in Go's lines, so

@@ -16,7 +16,7 @@ compiler as a library, in a directory each by what they are for:
 
 The program `heff` is `app/heff/main.hf`, which reads the command line
 and gives the commands the world they run in.  The library it ships
-with is `lib/` ([library.md](library.md)).
+with is `lib/` ([library.md](docs/reference/library.md)).
 
 ## Building
 
@@ -133,7 +133,7 @@ program and a backend (`--run backends/programs/dollar.hf/c`,
 programs.  `make sanitize` (`HEFF_SANITIZE=1 heff test test/backends.hf`) builds the
 backends' C programs under AddressSanitizer, and `make tsan`
 (`HEFF_TSAN=1`) runs the threads test under ThreadSanitizer too
-([threads.md](threads.md)).  Among the tests, the golden ones hold the
+([threads.md](docs/reference/threads.md)).  Among the tests, the golden ones hold the
 output of `check`, `explain`, `eval` and `type-at` on the library and
 test files (`heff test test/golden.hf`, `--run golden/nbe` for those
 of `test/nbe`); after an intended change, update them with `make golden`
@@ -202,8 +202,8 @@ compiler, by which it knows itself without hashing itself each time.
 ## The editors
 
 `editors/vscode` is a VS Code extension for the language server
-([its README](../editors/vscode/README.md) says how to run it from the
+([its README](editors/vscode/README.md) says how to run it from the
 repository); `make vsix` packages it.  `editors/bat` is its grammar for
-bat, made from the VS Code grammar ([its README](../editors/bat/README.md)):
+bat, made from the VS Code grammar ([its README](editors/bat/README.md)):
 `make bat` makes it again, and `make bat-check` fails where it is not
 made from the grammar as it is.

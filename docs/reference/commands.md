@@ -1,4 +1,6 @@
-# Commands
+---
+title: Commands
+---
 
 `heff help` lists them, and `heff help COMMAND` says a command's flags.
 `heff` with no words, on a terminal, is an app of them to learn them by
@@ -124,7 +126,7 @@ every half second whether the project has been built again
 URL` (`http://127.0.0.1:8080`, a C program's server), a request that is
 none of a page's -- the API a page calls, `POST /api` -- is sent there,
 and its response given back, so that a page and its server
-([remote.md](remote.md)) are developed together:
+(`examples/notes/`) are developed together:
 
 ```sh
 cd examples/notes

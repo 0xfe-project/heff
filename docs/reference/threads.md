@@ -1,4 +1,6 @@
-# Threads
+---
+title: Threads
+---
 
 `lib/parallel.hf`'s `Parallel` says what may run at once; a handler says how
 it runs.  In C, a provider may run heff in threads of its own, truly at

@@ -1,7 +1,9 @@
-# Tests
+---
+title: Tests
+---
 
 Three kinds of check, all run by `heff test` (on the files given, else
-the project's `test/`): doc tests, watches and tests.  `heff promote
+the project's `src/` and `test/`): doc tests, watches and tests.  `heff promote
 FILE` writes the value of each doc test and watch of a file under it as
 its expectation.  Benchmarks are `heff bench`'s
 ([benchmarks.md](benchmarks.md)).
@@ -231,7 +233,7 @@ error, not a literal, so that a pattern means the same once more is read.
 `heff test --watch` runs the tests as `heff test` would (the same FILEs,
 `--seed`, `--run`, `--jobs`), then looks at what they test every quarter
 of a second, as `heff dev` looks at a project: the files tested (those
-given, else `test/`), the project's (`package.hf`, `src/`, `app/`) and
+given, else `src/` and `test/`), the project's (`package.hf`, `src/`, `app/`) and
 `lib/` -- what the files import is among them.  At a change it runs
 them again, until it is ended (Ctrl-C).  Each run is `heff test`'s
 own output, and after it a line, `heff test: tested (2), all held; tested

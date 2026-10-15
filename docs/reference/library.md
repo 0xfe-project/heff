@@ -1,4 +1,6 @@
-# The library
+---
+title: The library
+---
 
 `lib/` goes with the compiler, its version the compiler's; `HEFF_LIB`
 says where it is, else it is the `lib/` the compiler came with: the
@@ -74,7 +76,7 @@ are imported by their names:
   ([binaries](language.md#binaries));
 - `wire` ([the wire](#the-wire)), values as bytes and back, the same
   bytes on every backend, and `remote`, an effect's operations sent
-  over it to another program ([a client and its server](remote.md));
+  over it to another program;
 - `json` ([JSON](#json)), JSON's values, read from their text and
   written back, in heff, with no provider;
 - `with` ([a thing held by a `with`](#a-thing-held-by-a-with)), the
@@ -143,7 +145,7 @@ What is above, in `lib/`, is pure, the same on every backend.
   effects of the system, C's alone;
 - `std.http.server`, an HTTP/1.1 server written over `std.net`, C's
   as `std.net` is, and `std.remote`, an API's server over it and its
-  client by `std.http` ([a client and its server](remote.md));
+  client by `std.http`;
 - `std.reference` (the world's cells) and `std.time`: effects needed on both
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
@@ -168,8 +170,7 @@ What is above, in `lib/`, is pure, the same on every backend.
   by `gpu.canvas`'s `present` inside the same `with`s.  The page owns
   its elements: there is nothing to let go of;
 - `browser.http` (`fetch`, an HTTP client of `Bytes` bodies, as
-  `std.http`'s shapes are) and `browser.remote`, an API's client by it
-  ([a client and its server](remote.md));
+  `std.http`'s shapes are) and `browser.remote`, an API's client by it;
 - `browser.js` (JavaScript's strings, `JSString`).
 
 `gpu` is a GPU as an effect, `import gpu as Gpu`: a device held by a
@@ -1026,8 +1027,7 @@ property, run by `heff test` there.  `examples/pages/` is four pages,
 each a program of its own (`app/NAME/`, its `index.html` beside it): a
 counter, a clock, a greeting written into the page, and a sum of vectors
 on the GPU; `heff dev` there serves each at `/NAME/`.  `examples/notes/`
-is a page and its server, one project ([a client and its
-server](remote.md)).  The apps' tests (`heff test test/apps.hf`) run
+is a page and its server, one project.  The apps' tests (`heff test test/apps.hf`) run
 them all.  `examples/testbridge/` is a project of another kind: a Linux
 program, through C, that makes a bridge and a veth pair by rtnetlink,
 its socket's calls a provider of its own.

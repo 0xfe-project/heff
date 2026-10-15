@@ -51,7 +51,8 @@
               runHook preInstall
               mkdir -p $out/bin
               cp .heff/out/heff $out/bin/heff
-              cp -r LICENSE README.md docs lib package.hf $out/
+              cp -r LICENSE README.md lib package.hf $out/
+              (cd docs && find . -name '*.md' -not -path './node_modules/*' -exec install -Dm644 {} $out/docs/{} \;)
               wrapProgram $out/bin/heff --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.zig_0_17 ]}
               runHook postInstall
             '';

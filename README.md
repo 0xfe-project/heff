@@ -62,7 +62,7 @@ Put `~/.heff/bin` on your `PATH`.
 heff init hello            # a new project: a module, a program, a test
 cd hello
 heff build                 # check src/, build each program to .heff/bin/
-heff test                  # the doc tests, watches and tests of test/
+heff test                  # the doc tests, watches and tests of src/ and test/
 heff run app/hello/main.hf # run a program (C, by zig), without a build
 heff install               # build to run fastest, into ~/.heff/bin/
 heff fmt src/hello/*.hf    # format in place
@@ -81,18 +81,16 @@ heff dev                   # build, run and serve; again at each change
 
 ## Documentation
 
-- [The language](docs/language.md): modules, records, implicit
+- [The language](docs/reference/language.md): modules, records, implicit
   arguments, operators, numbers, runes and strings, effects
-- [The library](docs/library.md): `lib/`, the batteries of `lib/std/`,
+- [The library](docs/reference/library.md): `lib/`, the batteries of `lib/std/`,
   the examples
-- [Projects](docs/projects.md): `package.hf`, packages, programs
-- [A client and its server](docs/remote.md): a page and a C program of
-  one project, an effect's operations over the wire
-- [Commands](docs/commands.md): every command, the formatter
-- [Tests](docs/tests.md): doc tests, watches, unit tests and properties
-- [Providers](docs/providers.md): an effect's JavaScript and C sides,
+- [Projects](docs/reference/projects.md): `package.hf`, packages, programs
+- [Commands](docs/reference/commands.md): every command, the formatter
+- [Tests](docs/reference/tests.md): doc tests, watches, unit tests and properties
+- [Providers](docs/reference/providers.md): an effect's JavaScript and C sides,
   strings and numbers at the host, `JSString`
-- [Developing heff](docs/developing.md): the source, the seed, the
+- [Developing heff](DEVELOPING.md): the source, the seed, the
   tests
 
 ## Developing
@@ -104,7 +102,7 @@ make         # every target
 ```
 
 How the source is laid out, the seed and the test groups are in
-[docs/developing.md](docs/developing.md).
+[DEVELOPING.md](DEVELOPING.md).
 
 ## References
 
