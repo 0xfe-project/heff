@@ -1,0 +1,136 @@
+-- Places as an effect: like Racket's, a place is a thread with a heap
+-- of its own that shares nothing, by C alone (its provider, which
+-- builds the runtime for threads).  A place runs a computation of the
+-- world given to it (`spawnPlace`), and is joined for its value
+-- (`joinPlace`); places talk over place channels (`newPlaceChannel`,
+-- `sendPlace`, `recvPlace`), a value sent being copied into the
+-- receiver -- or moved, where the sender held it alone and it is the
+-- system's, not a page's -- never shared: nothing of a place's is
+-- counted atomically, and no object is held by two places.  A channel
+-- is typed, `PlaceChannel a`, what crosses it any type; a place's
+-- computation holds whatever it holds, channels among it, copied as it
+-- is given to the place.  A failure in a place is the joiner's when the
+-- place is joined, as a thread's is (std.thread).  Receiving blocks
+-- the place until something is sent; in a group of std.reactor's, it is
+-- pending, the other green threads of the place going on.
+-- There is no JavaScript side: a program with this effect is compiled
+-- for C, `--backend=c`.
+
+import co
+import ffi as Ffi
+
+-- | A place started, of whatever it comes to: the world's number for it.
+data Place a = MkPlace Int
+
+-- | A channel between places, carrying values of `a`: the world's
+-- | number for it.
+data PlaceChannel a = MkPlaceChannel Int
+
+-- | A place's computation, and what is done with the place: the type it
+-- | comes to the operation's own, erased, so that one effect starts
+-- | places of every type.
+type Started (m : Type -> Type) x =
+  (r : Type) -> ((a : Type) -> m a -> (Place a -> x) -> r) -> r
+
+-- | A value joined or received, and what is done with it, of any type.
+type Got x = (r : Type) -> ((a : Type) -> (a -> x) -> r) -> r
+
+-- | A value sent, of any type, and what comes after.
+type Sent x = (r : Type) -> ((a : Type) -> a -> x -> r) -> r
+
+data PlacesF (m : Type -> Type) x
+  = Spawn (Started m x)
+  | Join Int (Got x)
+  | NewChannel (Int -> x)
+  | Send Int (Sent x)
+  | Recv Int (Got x)
+
+started : {m : Type -> Type}
+        -> {a x : Type}
+        -> m a
+        -> (Place a -> x)
+        -> Started m x
+started c k = \r use -> use a c k
+
+got : {a x : Type} -> (a -> x) -> Got x
+got k = \r use -> use a k
+
+sent : {a x : Type} -> a -> x -> Sent x
+sent v x = \r use -> use a v x
+
+gotThen : {x y : Type} -> (x -> y) -> Got x -> Got y
+gotThen g j = \r use -> j r (\a k -> use a (\v -> g (k v)))
+
+-- | Places as an effect.
+places : HFunctor
+places =
+  { f = PlacesF
+  , hfmap = \m g p -> case p of
+      Spawn s -> Spawn (\r use -> s r (\a c k -> use a c (\pl -> g (k pl))))
+      Join i j -> Join i (gotThen g j)
+      NewChannel k -> NewChannel (\i -> g (k i))
+      Send i s -> Send i (\r use -> s r (\a v x -> use a v (g x)))
+      Recv i j -> Recv i (gotThen g j)
+  , hmap = \m n nt p -> case p of
+      Spawn s -> Spawn (\r use -> s r (\a c k -> use a (nt c) k))
+      Join i j -> Join i j
+      NewChannel k -> NewChannel k
+      Send i s -> Send i s
+      Recv i j -> Recv i j
+  }
+
+-- | `c` run in a place of its own, from now: the place.  What `c` holds
+-- | is copied into the place; what it comes to is the joiner's.
+spawnPlace : {e : HFunctor}
+           -> {{pl : places <: e}}
+           -> {a : Type}
+           -> Co e a
+           -> Co e (Place a)
+spawnPlace c = op (pl (Spawn (started c (\p -> p)))) val
+
+-- | The place's value, waited for and copied here; its failure, failing
+-- | here.  A place is joined once.
+joinPlace : {e : HFunctor}
+          -> {{pl : places <: e}}
+          -> {a : Type}
+          -> Place a
+          -> Co e a
+joinPlace (MkPlace i) = op (pl (Join i (got (\v -> v)))) val
+
+-- | A channel of its own, for values of `a`.
+newPlaceChannel : {e : HFunctor}
+                -> {{pl : places <: e}}
+                -> {a : Type}
+                -> Co e (PlaceChannel a)
+newPlaceChannel =
+  bind (op (pl (NewChannel (\i -> i))) val) (\i -> pure (MkPlaceChannel i))
+
+-- | `v` sent on the channel: copied (or moved) into a message the
+-- | channel holds until it is received; the sender goes on at once.
+sendPlace : {e : HFunctor}
+          -> {{pl : places <: e}}
+          -> {a : Type}
+          -> PlaceChannel a
+          -> a
+          -> Co e Unit
+sendPlace (MkPlaceChannel i) v = op (pl (Send i (sent v MkUnit))) val
+
+-- | The next value sent on the channel, waited for, made the receiver's
+-- | own.
+recvPlace : {e : HFunctor}
+          -> {{pl : places <: e}}
+          -> {a : Type}
+          -> PlaceChannel a
+          -> Co e a
+recvPlace (MkPlaceChannel i) = op (pl (Recv i (got (\v -> v)))) val
+
+-- | What C does of these by a function of the provider's, the compiler
+-- | making the glue (ffi): `NewChannel` is `pl_channel()`.
+placesInC : Ffi.Described
+placesInC =
+  Ffi.describe
+    Nil
+    [ Ffi.operation
+      "NewChannel"
+      (Ffi.fun "pl_channel" Nil (Ffi.gives Ffi.int64))
+    ]

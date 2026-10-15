@@ -1,0 +1,582 @@
+-- Places: threads with heaps of their own that share nothing, by
+-- std.place (its C provider building the runtime for threads).
+-- `spawnPlace c` runs `c` in a place, `joinPlace` waits for its value,
+-- copied back; channels carry values of any type between places, copied
+-- -- or moved, where the sender held them alone and they are the
+-- system's -- never shared.  A failure in a place fails the joiner.  A
+-- receive in a group of std.reactor's is pending, the other green
+-- threads of the place going on.
+
+import co
+import green
+import int64 as Int64
+import std.io
+import std.place
+import std.process
+import std.reactor as Reactor
+import uint64 as UInt64
+
+world : HFunctor
+world = stdio <+> (process <+> (Reactor.reactor <+> places))
+
+-- The work: pure --------------------------------------------------------------------
+
+fib : Int -> Int
+fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)
+
+safe : Int -> Int -> List Int -> Bool
+safe c d Nil = True
+safe c d (q :: qs) = c /= q && c - q /= d && q - c /= d && safe c (d + 1) qs
+
+place : Int -> Int -> List Int -> Int
+place n row qs =
+  if row == n then 1
+  else List.foldl
+      (\acc c -> if safe c 1 qs then acc + place n (row + 1) (c :: qs) else acc)
+      0
+      (List.range 0 (n - 1))
+
+-- | the `n` queens' solutions whose first two queens are in the columns
+-- | `t / n` and `t % n`
+queensAt : Int -> Int -> Int
+queensAt n t = if safe (t % n) 1 [t / n] then place n 2 [t % n, t / n] else 0
+
+noDivisor : Int -> Int -> Bool
+noDivisor n d =
+  if d * d > n then True else if n % d == 0 then False else noDivisor n (d + 1)
+
+isPrime : Int -> Bool
+isPrime n = n >= 2 && noDivisor n 2
+
+countIn : Int -> Int -> Int -> Int
+countIn acc i hi =
+  if i >= hi then acc
+  else countIn (if isPrime i then acc + 1 else acc) (i + 1) hi
+
+-- | the primes below `n` in block `b` of 4096
+primesIn : Int -> Int -> Int
+primesIn n b = countIn 0 (b * 4096) (min n (b * 4096 + 4096))
+
+-- (a definition every place asks for: computed once, immortal, crossing
+-- as it is)
+squares : List Int
+squares = List.map (\x -> x * x) (List.range 1 1000)
+
+-- (a record whose numbers the C backend keeps flat, and a list of floats,
+-- whose cells keep theirs flat: copied as words)
+type Mass = { m : Float64, k : Int64, u : UInt64, tag : String }
+
+showMass : Mass -> String
+showMass x =
+  show x.m
+  ^ " "
+  ^ show (Int64.toInt x.k)
+  ^ " "
+  ^ show (UInt64.toInt x.u)
+  ^ " "
+  ^ x.tag
+
+-- | A value of each kind that crosses a channel.
+data Thing
+  = AnInt Int
+  | AStr String
+  | AList (List Int)
+  | AMass Mass
+  | AFloats (List Float64)
+  | ABig Int
+  | APair (Pair (List Int) (List Int))
+  | AFun (Int -> Int)
+  | AThunk (Unit -> Int)
+  | Done
+
+showInts : List Int -> String
+showInts xs = unwords (List.map show xs)
+
+showThing : Thing -> String
+showThing (AnInt n) = "int " ^ show n
+showThing (AStr s) = "string " ^ s
+showThing (AList xs) = "list " ^ showInts xs
+showThing (AMass x) = "mass " ^ showMass x
+showThing (AFloats fs) = "floats " ^ unwords (List.map show fs)
+showThing (ABig n) = "big " ^ show n
+showThing (APair p) =
+  "pair " ^ show (List.sum (fst p)) ^ " " ^ show (List.sum (snd p))
+showThing (AFun f) = "function " ^ show (f 10)
+showThing (AThunk t) = "thunk " ^ show (t MkUnit)
+showThing Done = "done"
+
+-- Spawning and joining ----------------------------------------------------------------
+
+nested : {{pl : places <: world}} -> Co world Int
+nested = do
+  p <- spawnPlace (pure (List.range 1 10))
+  xs <- joinPlace p
+  pure (List.sum xs)
+
+saying : {{io : stdio <: world}} -> Co world String
+saying = do
+  print "said in a place"
+  pure "a string made there"
+
+-- (what one place sends: every kind, then `Done`)
+sendAll : {{pl : places <: world}} -> PlaceChannel Thing -> Int -> Co world Unit
+sendAll ch k = do
+  sendPlace ch (AnInt (fib 15))
+  sendPlace ch (AStr ("made in a place, " ^ show k))
+  sendPlace ch (AList (List.range k (k + 5)))
+  sendPlace
+      ch
+      (AMass
+         { m = 2.5
+         , k = 9223372036854775807
+         , u = 18446744073709551615
+         , tag = "own"
+         })
+  sendPlace ch (AFloats [0.5, 1.25, 2.0])
+  sendPlace ch (ABig (1180591620717411303424 + k))
+  xs <- pure (List.map (\x -> x * k) (List.range 1 100))
+  sendPlace ch (APair (MkPair xs xs))
+  sendPlace ch (AFun (\x -> x * k))
+  t <- pure ((\(u : Unit) -> List.sum squares + k) : Unit -> Int)
+  n <- pure (t MkUnit)
+  sendPlace ch (AThunk t)
+  sendPlace ch (AnInt n)
+  sendPlace ch Done
+
+recvAll : {{io : stdio <: world}}
+        -> {{pl : places <: world}}
+        -> PlaceChannel Thing
+        -> Co world Unit
+recvAll ch = do
+  t <- recvPlace ch
+  print (showThing t)
+  case t of
+    Done -> pure MkUnit
+    _ -> recvAll ch
+
+program : {{io : stdio <: world}} -> {{pl : places <: world}} -> Co world Unit
+program = do
+  p <- spawnPlace (pure (fib 20))
+  n <- joinPlace p
+  print ("joined: " ^ show n)
+  q <- spawnPlace saying
+  s <- joinPlace q
+  print ("joined a string: " ^ s)
+  r <- spawnPlace nested
+  m <- joinPlace r
+  print ("nested: " ^ show m)
+  d <- spawnPlace (pure (List.sum squares))
+  ds <- joinPlace d
+  print ("a definition: " ^ show ds)
+  ch <- newPlaceChannel
+  w <- spawnPlace (sendAll ch 3)
+  recvAll ch
+  joinPlace w
+  print "all received"
+
+main : Co world Unit
+main = program (io := \p -> InL p) (pl := \p -> InR (InR (InR p)))
+
+-- Channels both ways --------------------------------------------------------------------
+
+-- (a place doubling what it is sent, until it is sent a negative number)
+doubler : {{pl : places <: world}}
+        -> PlaceChannel Int
+        -> PlaceChannel Int
+        -> Co world Int
+doubler in_ out = do
+  n <- recvPlace in_
+  if n < 0 then pure 0
+    else do
+      sendPlace out (n * 2)
+      r <- doubler in_ out
+      pure (r + 1)
+
+pingPong : {{io : stdio <: world}}
+         -> {{pl : places <: world}}
+         -> Int
+         -> PlaceChannel Int
+         -> PlaceChannel Int
+         -> Co world Unit
+pingPong 0 to from = pure MkUnit
+pingPong n to from = do
+  sendPlace to n
+  d <- recvPlace from
+  print ("doubled " ^ show n ^ " to " ^ show d)
+  pingPong (n - 1) to from
+
+-- (a pool over channels: `w` places each taking a task's number as
+-- they end one, giving its answer back; -1 ends a place)
+worker : {{pl : places <: world}}
+       -> (Int -> Int)
+       -> PlaceChannel Int
+       -> PlaceChannel Int
+       -> Co world Unit
+worker f tasks results = do
+  i <- recvPlace tasks
+  if i < 0 then pure MkUnit
+    else do
+      sendPlace results (f i)
+      worker f tasks results
+
+sendEach : {{pl : places <: world}}
+         -> PlaceChannel Int
+         -> List Int
+         -> Co world Unit
+sendEach ch Nil = pure MkUnit
+sendEach ch (x :: xs) = do
+  sendPlace ch x
+  sendEach ch xs
+
+recvSum : {{pl : places <: world}}
+        -> PlaceChannel Int
+        -> Int
+        -> Int
+        -> Co world Int
+recvSum ch 0 acc = pure acc
+recvSum ch n acc = do
+  x <- recvPlace ch
+  recvSum ch (n - 1) (acc + x)
+
+spawnEach : {{pl : places <: world}}
+          -> Int
+          -> Co world Unit
+          -> Co world (List (Place Unit))
+spawnEach 0 c = pure Nil
+spawnEach n c = do
+  p <- spawnPlace c
+  ps <- spawnEach (n - 1) c
+  pure (p :: ps)
+
+joinEach : {{pl : places <: world}} -> List (Place Unit) -> Co world Unit
+joinEach Nil = pure MkUnit
+joinEach (p :: ps) = do
+  joinPlace p
+  joinEach ps
+
+-- | `f 0 .. f (n - 1)`, by `w` places taking the next task as they end
+-- | one: the sum of the answers
+pool : {{pl : places <: world}} -> Int -> Int -> (Int -> Int) -> Co world Int
+pool w n f = do
+  tasks <- newPlaceChannel
+  results <- newPlaceChannel
+  ps <- spawnEach w (worker f tasks results)
+  sendEach tasks (List.range 0 (n - 1))
+  sendEach tasks (List.replicate w (0 - 1))
+  s <- recvSum results n 0
+  joinEach ps
+  pure s
+
+channelled : {{io : stdio <: world}}
+           -> {{pl : places <: world}}
+           -> Co world Unit
+channelled = do
+  to <- newPlaceChannel
+  from <- newPlaceChannel
+  p <- spawnPlace (doubler to from)
+  pingPong 3 to from
+  sendPlace to (0 - 1)
+  rounds <- joinPlace p
+  print ("rounds: " ^ show rounds)
+  s <- pool 3 20 fib
+  print ("a pool of 3, fib 0..19: " ^ show s)
+  ps <- pool 4 (100000 / 4096 + 1) (primesIn 100000)
+  print ("primes below 100000, by 4 places: " ^ show ps)
+
+channels : Co world Unit
+channels = channelled (io := \p -> InL p) (pl := \p -> InR (InR (InR p)))
+
+-- Copied against moved -------------------------------------------------------------------
+
+-- (a long string is the system's, not a page's: sent held alone, it is
+-- moved; sent while the sender keeps it, copied; a view of it, copied
+-- as its bytes)
+longString : Int -> String
+longString k = joinWith "" (List.replicate 100 (show k ^ "-"))
+
+sendStrings : {{pl : places <: world}} -> PlaceChannel String -> Co world String
+sendStrings ch = do
+  sendPlace ch (longString 7)
+  kept <- pure (longString 8)
+  sendPlace ch kept
+  sendPlace ch (strSlice kept 3 40)
+  sendPlace ch (joinWith "" (List.replicate 2000 "x"))
+  pure (strSlice kept 0 12)
+
+recvStrings : {{io : stdio <: world}}
+            -> {{pl : places <: world}}
+            -> PlaceChannel String
+            -> Int
+            -> Co world Unit
+recvStrings ch 0 = pure MkUnit
+recvStrings ch n = do
+  s <- recvPlace ch
+  print (show (strLength s) ^ ": " ^ strSlice s 0 8)
+  recvStrings ch (n - 1)
+
+moving : {{io : stdio <: world}} -> {{pl : places <: world}} -> Co world Unit
+moving = do
+  ch <- newPlaceChannel
+  p <- spawnPlace (sendStrings ch)
+  recvStrings ch 4
+  kept <- joinPlace p
+  print ("the sender kept: " ^ kept)
+
+moved : Co world Unit
+moved = moving (io := \p -> InL p) (pl := \p -> InR (InR (InR p)))
+
+-- Failing ------------------------------------------------------------------------------
+
+abandoning : {{io : stdio <: world}}
+           -> {{pl : places <: world}}
+           -> Co world Unit
+abandoning = do
+  p <- spawnPlace (later (\u -> if fib 10 > 0 then abandon else 0))
+  print "said before the join"
+  n <- joinPlace p
+  print ("not said: " ^ show n)
+
+failing : Co world Unit
+failing = abandoning (io := \p -> InL p) (pl := \p -> InR (InR (InR p)))
+
+-- A receive pending, in green threads -------------------------------------------------------
+
+gw : HFunctor
+gw = green <+> world
+
+-- (a place answering what it is asked, once)
+answering : {{pl : places <: world}}
+          -> PlaceChannel Int
+          -> PlaceChannel Int
+          -> Co world Unit
+answering asks answers = do
+  n <- recvPlace asks
+  sendPlace answers (n * 2)
+
+-- (two green threads: one waits for the answer before the other has
+-- asked -- a receive that blocked the place would wait for ever; main
+-- waits for both, on a channel of green's)
+greenThreads : {{io : stdio <: gw}}
+             -> {{pl : places <: gw}}
+             -> {{gr : green <: gw}}
+             -> PlaceChannel Int
+             -> PlaceChannel Int
+             -> Co gw Unit
+greenThreads asks answers = do
+  done <- newChan
+  spawn (do
+    print "waiting for the answer"
+    n <- recvPlace answers
+    print ("the answer: " ^ show n)
+    send done 1)
+  spawn (do
+    print "asking meanwhile"
+    sendPlace asks 21
+    send done 2)
+  recv done
+  recv done
+  pure MkUnit
+
+greened : {{io : stdio <: world}}
+        -> {{pl : places <: world}}
+        -> {{rx : Reactor.reactor <: world}}
+        -> Co world Unit
+greened = do
+  asks <- newPlaceChannel
+  answers <- newPlaceChannel
+  p <- spawnPlace (answering asks answers)
+  r <-
+    Reactor.scheduled
+      world
+      (greenThreads
+         (io := \q -> InR (io q))
+         (pl := \q -> InR (pl q))
+         (gr := \q -> InL q)
+         asks
+         answers)
+  joinPlace p
+  print (case r of
+    Just u -> "scheduled to the end"
+    Nothing -> "every thread waited")
+
+green_ : Co world Unit
+green_ =
+  greened
+    (io := \p -> InL p)
+    (pl := \p -> InR (InR (InR p)))
+    (rx := \p -> InR (InR (InL p)))
+
+-- Measured: a pool of places, and lists made here and sent there ------------------------------
+
+-- (`cpu WORK N W`: WORK -- primes, queens or fib -- of N, by W places)
+leaves : Int -> Int -> List Int
+leaves d n =
+  if d == 0 || n < 2 then [n]
+  else List.append (leaves (d - 1) (n - 1)) (leaves (d - 1) (n - 2))
+
+nthOr : Int -> List Int -> Int
+nthOr i Nil = 0
+nthOr i (x :: xs) = if i == 0 then x else nthOr (i - 1) xs
+
+fibAt : Int -> Int -> Int
+fibAt n i = fib (nthOr i (leaves 7 n))
+
+tasks : String -> Int -> Pair Int (Int -> Int)
+tasks w n =
+  if strEq w "queens" then MkPair (n * n) (queensAt n)
+  else if strEq w "fib" then MkPair (List.length (leaves 7 n)) (fibAt n)
+  else MkPair (n / 4096 + 1) (primesIn n)
+
+cpuArgs : {{io : stdio <: world}}
+        -> {{pl : places <: world}}
+        -> List String
+        -> Co world Unit
+cpuArgs (w :: n :: ws :: _) = do
+  s <-
+    pool
+      (fromMaybe 1 (parseInt ws))
+      (fst (tasks w (fromMaybe 0 (parseInt n))))
+      (snd (tasks w (fromMaybe 0 (parseInt n))))
+  print (w ^ ": answer " ^ show s)
+cpuArgs _ = print "cpu primes|queens|fib N W"
+
+cpu : Co world Unit
+cpu = do
+  as <- args (ev := \p -> InR (InL p))
+  cpuArgs (io := \p -> InL p) (pl := \p -> InR (InR (InR p))) as
+
+-- (`handOver R W`: R rounds, each W lists of 100,000 made by W places
+-- and sent to this one, which sums them -- a round at a time, each place
+-- told to go, as the pool of std.thread hands over round by round)
+madeThere : Int -> List Int
+madeThere i = List.range i (i + 99999)
+
+sender : {{pl : places <: world}}
+       -> PlaceChannel Int
+       -> PlaceChannel (List Int)
+       -> Int
+       -> Co world Unit
+sender go ch i = do
+  r <- recvPlace go
+  if r == 0 then pure MkUnit
+    else do
+      sendPlace ch (madeThere i)
+      sender go ch i
+
+senders : {{pl : places <: world}}
+        -> PlaceChannel Int
+        -> PlaceChannel (List Int)
+        -> Int
+        -> Co world (List (Place Unit))
+senders go ch 0 = pure Nil
+senders go ch w = do
+  p <- spawnPlace (sender go ch (w - 1))
+  ps <- senders go ch (w - 1)
+  pure (p :: ps)
+
+recvLists : {{pl : places <: world}}
+          -> PlaceChannel (List Int)
+          -> Int
+          -> Int
+          -> Co world Int
+recvLists ch 0 acc = pure acc
+recvLists ch n acc = do
+  xs <- recvPlace ch
+  recvLists ch (n - 1) (acc + List.sum xs)
+
+rounds : {{pl : places <: world}}
+       -> PlaceChannel Int
+       -> PlaceChannel (List Int)
+       -> Int
+       -> Int
+       -> Int
+       -> Co world Int
+rounds go ch w 0 acc = pure acc
+rounds go ch w r acc = do
+  sendEach go (List.replicate w r)
+  s <- recvLists ch w 0
+  rounds go ch w (r - 1) (acc + s)
+
+handArgs : {{io : stdio <: world}}
+         -> {{pl : places <: world}}
+         -> List String
+         -> Co world Unit
+handArgs (r :: w :: _) = do
+  go <- newPlaceChannel
+  ch <- newPlaceChannel
+  width <- pure (fromMaybe 2 (parseInt w))
+  ps <- senders go ch width
+  s <- rounds go ch width (fromMaybe 0 (parseInt r)) 0
+  sendEach go (List.replicate width 0)
+  joinEach ps
+  print ("handed over: " ^ show s)
+handArgs _ = print "handOver ROUNDS W"
+
+handOver : Co world Unit
+handOver = do
+  as <- args (ev := \p -> InR (InL p))
+  handArgs (io := \p -> InL p) (pl := \p -> InR (InR (InR p))) as
+
+-- (`worker WORK N I W`: the tasks of WORK of N numbered I, I+W, ...,
+-- done here, their sum said -- one process a worker, for comparison)
+every : Int -> Int -> Int -> List Int
+every i n w = if i >= n then Nil else i :: every (i + w) n w
+
+workerArgs : {{io : stdio <: world}} -> List String -> Co world Unit
+workerArgs (w :: n :: i :: ws :: _) = do
+  t <- pure (tasks w (fromMaybe 0 (parseInt n)))
+  print
+      (show
+         (List.sum
+            (List.map
+               (snd t)
+               (every
+                  (fromMaybe 0 (parseInt i))
+                  (fst t)
+                  (fromMaybe 1 (parseInt ws))))))
+workerArgs _ = print "worker primes|queens|fib N I W"
+
+workerMain : Co world Unit
+workerMain = do
+  as <- args (ev := \p -> InR (InL p))
+  workerArgs (io := \p -> InL p) as
+
+-- (`processes WORKER WORK N W`: W processes of the worker program (built
+-- apart, `worker`), started at once and waited for, their sums added)
+startEach : {{sys : process <: world}}
+          -> String
+          -> List (List String)
+          -> Co world (List Subprocess)
+startEach me Nil = pure Nil
+startEach me (as :: rest) = do
+  s <- start { command = me, args = as }
+  ss <- startEach me rest
+  pure (case s of
+    Just sp -> sp :: ss
+    Nothing -> ss)
+
+waitEach : {{sys : process <: world}} -> List Subprocess -> Co world Int
+waitEach Nil = pure 0
+waitEach (s :: ss) = do
+  r <- wait s
+  n <- waitEach ss
+  pure (n + fromMaybe 0 (parseInt (trim r.out)))
+
+procArgs : {{io : stdio <: world}}
+         -> {{sys : process <: world}}
+         -> List String
+         -> Co world Unit
+procArgs (bin :: w :: n :: ws :: _) = do
+  width <- pure (fromMaybe 1 (parseInt ws))
+  ss <-
+    startEach
+      bin
+      (List.map (\i -> [w, n, show i, ws]) (List.range 0 (width - 1)))
+  s <- waitEach ss
+  print (w ^ ": answer " ^ show s)
+procArgs _ = print "processes WORKER primes|queens|fib N W"
+
+processes : Co world Unit
+processes = do
+  as <- args (ev := \p -> InR (InL p))
+  procArgs (io := \p -> InL p) (sys := \p -> InR (InL p)) as
