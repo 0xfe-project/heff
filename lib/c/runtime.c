@@ -162,6 +162,17 @@ int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own);
 // (a float as JavaScript writes a number, at `out`, room for 32 bytes)
 void heff_js_number(double d, char *out);
 void heff_js_number32(float f, char *out);
+// (integers beyond a word, their magnitudes compared, added, subtracted,
+// multiplied and divided, as "Integers" below says; and bits read and
+// written as Erlang's bit syntax has them, as "Bits" says)
+int heff_mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn);
+int heff_mag_add(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o);
+int heff_mag_sub(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o);
+void heff_mag_mul(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o);
+void heff_mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint32_t *q, uint32_t *r, uint32_t *vn, uint32_t *un);
+uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n);
+void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n);
+uint64_t heff_bits_little(uint64_t u, int64_t n, int out);
 
 // the tags the runtime knows; a program's own are numbered after them
 enum {
@@ -1752,101 +1763,16 @@ HEFF_FAST V heff_int(int64_t i) {
   return heff_int_big(i);
 }
 
-HEFF_FN int mag_cmp(const uint32_t *a, int an, const uint32_t *b, int bn) {
-  if (an != bn) return an < bn ? -1 : 1;
-  for (int i = an - 1; i >= 0; i--)
-    if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
-  return 0;
-}
-
-// (`o` has room for max(an, bn) + 1 digits)
-HEFF_FN int mag_add(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o) {
-  if (an < bn) { const uint32_t *t = a; a = b; b = t; int tn = an; an = bn; bn = tn; }
-  uint64_t c = 0;
-  for (int i = 0; i < an; i++) {
-    c += (uint64_t)a[i] + (i < bn ? b[i] : 0);
-    o[i] = (uint32_t)c;
-    c >>= 32;
-  }
-  o[an] = (uint32_t)c;
-  return an + 1;
-}
-
-// (a - b, a's magnitude not below b's)
-HEFF_FN int mag_sub(const uint32_t *a, int an, const uint32_t *b, int bn, uint32_t *o) {
-  int64_t c = 0;
-  for (int i = 0; i < an; i++) {
-    c += (int64_t)a[i] - (i < bn ? b[i] : 0);
-    o[i] = (uint32_t)c;
-    c = c < 0 ? -1 : 0;
-  }
-  return an;
-}
-
+// (magnitudes compared, added, subtracted, multiplied and divided by
+// the runtime's Zig, `heff_mag_*`: each result's room, and the integer
+// made of it, here)
 // (a + b, signed)
 HEFF_FN V num_add(const Num *a, int bneg, const Num *b) {
   int n = (a->n > b->n ? a->n : b->n) + 1;
   uint32_t *o = alloca(n * sizeof(uint32_t));
-  if (a->neg == bneg) return big_make(a->neg, o, mag_add(a->d, a->n, b->d, b->n, o));
-  if (mag_cmp(a->d, a->n, b->d, b->n) >= 0) return big_make(a->neg, o, mag_sub(a->d, a->n, b->d, b->n, o));
-  return big_make(bneg, o, mag_sub(b->d, b->n, a->d, a->n, o));
-}
-
-// (u divided by v, v's top digit not 0, as Knuth's algorithm D:
-// q gets m - n + 1 digits, r n)
-HEFF_FN void mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint32_t *q, uint32_t *r) {
-  if (m < n) {
-    memcpy(r, u, m * sizeof(uint32_t));
-    memset(r + m, 0, (n - m) * sizeof(uint32_t));
-    return;
-  }
-  if (n == 1) {
-    uint64_t k = 0;
-    for (int j = m - 1; j >= 0; j--) {
-      uint64_t t = (k << 32) | u[j];
-      q[j] = (uint32_t)(t / v[0]);
-      k = t - (uint64_t)q[j] * v[0];
-    }
-    r[0] = (uint32_t)k;
-    return;
-  }
-  int s = __builtin_clz(v[n - 1]);
-  uint32_t *vn = alloca(n * sizeof(uint32_t)), *un = alloca((m + 1) * sizeof(uint32_t));
-  for (int i = n - 1; i > 0; i--) vn[i] = (v[i] << s) | (s ? v[i - 1] >> (32 - s) : 0);
-  vn[0] = v[0] << s;
-  un[m] = s ? u[m - 1] >> (32 - s) : 0;
-  for (int i = m - 1; i > 0; i--) un[i] = (u[i] << s) | (s ? u[i - 1] >> (32 - s) : 0);
-  un[0] = u[0] << s;
-  for (int j = m - n; j >= 0; j--) {
-    uint64_t num = ((uint64_t)un[j + n] << 32) | un[j + n - 1];
-    uint64_t qhat = num / vn[n - 1], rhat = num - qhat * vn[n - 1];
-    while (qhat >> 32 || qhat * vn[n - 2] > ((rhat << 32) | un[j + n - 2])) {
-      qhat--;
-      rhat += vn[n - 1];
-      if (rhat >> 32) break;
-    }
-    int64_t k = 0, t;
-    for (int i = 0; i < n; i++) {
-      uint64_t p = qhat * vn[i];
-      t = (int64_t)un[i + j] - k - (int64_t)(p & 0xFFFFFFFFu);
-      un[i + j] = (uint32_t)t;
-      k = (int64_t)(p >> 32) - (t >> 32);
-    }
-    t = (int64_t)un[j + n] - k;
-    un[j + n] = (uint32_t)t;
-    q[j] = (uint32_t)qhat;
-    if (t < 0) {
-      q[j]--;
-      k = 0;
-      for (int i = 0; i < n; i++) {
-        t = (int64_t)un[i + j] + vn[i] + k;
-        un[i + j] = (uint32_t)t;
-        k = t >> 32;
-      }
-      un[j + n] += (uint32_t)k;
-    }
-  }
-  for (int i = 0; i < n; i++) r[i] = (un[i] >> s) | (s ? un[i + 1] << (32 - s) : 0);
+  if (a->neg == bneg) return big_make(a->neg, o, heff_mag_add(a->d, a->n, b->d, b->n, o));
+  if (heff_mag_cmp(a->d, a->n, b->d, b->n) >= 0) return big_make(a->neg, o, heff_mag_sub(a->d, a->n, b->d, b->n, o));
+  return big_make(bneg, o, heff_mag_sub(b->d, b->n, a->d, a->n, o));
 }
 
 // (a divided by b, rounded down, as the other backends round: the
@@ -1854,40 +1780,32 @@ HEFF_FN void mag_divmod(const uint32_t *u, int m, const uint32_t *v, int n, uint
 HEFF_FN V num_divmod(const Num *a, const Num *b, int want_mod) {
   int qn = a->n - b->n + 1 > 0 ? a->n - b->n + 1 : 1;
   uint32_t *q = alloca((qn + 1) * sizeof(uint32_t)), *r = alloca((b->n + 1) * sizeof(uint32_t));
+  uint32_t *vn = alloca(b->n * sizeof(uint32_t)), *un = alloca((a->n + 1) * sizeof(uint32_t));
   memset(q, 0, (qn + 1) * sizeof(uint32_t));
-  mag_divmod(a->d, a->n, b->d, b->n, q, r);
+  heff_mag_divmod(a->d, a->n, b->d, b->n, q, r, vn, un);
   int rn = b->n;
   while (rn > 0 && r[rn - 1] == 0) rn--;
   int down = rn > 0 && a->neg != b->neg;
   if (want_mod) {
     if (!down) return big_make(a->neg, r, rn);
     uint32_t *o = alloca((b->n + 1) * sizeof(uint32_t));
-    return big_make(b->neg, o, mag_sub(b->d, b->n, r, rn, o));
+    return big_make(b->neg, o, heff_mag_sub(b->d, b->n, r, rn, o));
   }
   if (!down) return big_make(a->neg != b->neg, q, qn);
   uint32_t one = 1, *o = alloca((qn + 2) * sizeof(uint32_t));
-  return big_make(1, o, mag_add(q, qn, &one, 1, o));
+  return big_make(1, o, heff_mag_add(q, qn, &one, 1, o));
 }
 
 HEFF_FN V num_mul(const Num *a, const Num *b) {
   int n = a->n + b->n;
-  uint32_t *o = alloca((n + 1) * sizeof(uint32_t));
-  memset(o, 0, (n + 1) * sizeof(uint32_t));
-  for (int i = 0; i < a->n; i++) {
-    uint64_t c = 0;
-    for (int j = 0; j < b->n; j++) {
-      c += (uint64_t)a->d[i] * b->d[j] + o[i + j];
-      o[i + j] = (uint32_t)c;
-      c >>= 32;
-    }
-    o[i + b->n] = (uint32_t)c;
-  }
+  uint32_t *o = alloca(n * sizeof(uint32_t));
+  heff_mag_mul(a->d, a->n, b->d, b->n, o);
   return big_make(a->neg != b->neg, o, n);
 }
 
 HEFF_FN int num_cmp(const Num *a, const Num *b) {
   if (a->neg != b->neg) return a->neg ? -1 : 1;
-  int c = mag_cmp(a->d, a->n, b->d, b->n);
+  int c = heff_mag_cmp(a->d, a->n, b->d, b->n);
   return a->neg ? -c : c;
 }
 
@@ -3457,44 +3375,8 @@ HEFF_FN V heff_bytesToString(V a) {
 // `f` have 1), its bytes the least significant first and then the `n %
 // 8` bits left, the most significant -- read as signed where `f` has 2.
 // `heff_bits_read` and `heff_bits_write` have them in the order they are
-// written, `heff_bits_little` turns the one into the other.)
-HEFF_FN uint64_t heff_bits_read(const uint8_t *s, int64_t at, int64_t n) {
-  uint64_t u = 0;
-  if ((at & 7) == 0 && (n & 7) == 0) {
-    const uint8_t *p = s + (at >> 3);
-    for (int64_t i = 0; i < (n >> 3); i++) u = (u << 8) | p[i];
-  } else {
-    for (int64_t i = at; i < at + n; i++) u = (u << 1) | ((s[i >> 3] >> (7 - (i & 7))) & 1);
-  }
-  return u;
-}
-
-// (the `n` bits of `w`, the most significant first, put at bit `at` of
-// `s`, whose bits there are 0)
-HEFF_FN void heff_bits_write(uint8_t *s, int64_t at, uint64_t w, int64_t n) {
-  if ((at & 7) == 0 && (n & 7) == 0) {
-    uint8_t *p = s + (at >> 3);
-    for (int64_t i = 0; i < (n >> 3); i++) p[i] = (uint8_t)(w >> (n - 8 * (i + 1)));
-  } else {
-    for (int64_t i = 0; i < n; i++)
-      if ((w >> (n - 1 - i)) & 1) s[(at + i) >> 3] |= (uint8_t)(0x80 >> ((at + i) & 7));
-  }
-}
-
-// (an integer of `n` bits, little-endian: its bits as they are written,
-// from the integer (`out`), or the integer, from them)
-HEFF_FN uint64_t heff_bits_little(uint64_t u, int64_t n, int out) {
-  int64_t k = n >> 3, r = n & 7;
-  uint64_t w = 0;
-  if (out) {
-    for (int64_t i = 0; i < k; i++) w = (w << 8) | ((u >> (8 * i)) & 255);
-    if (r) w = (w << r) | ((u >> (8 * k)) & ((1u << r) - 1));
-  } else {
-    if (r) w = (u & ((1u << r) - 1)) << (8 * k);
-    for (int64_t i = 0; i < k; i++) w |= ((u >> (n - 8 * (i + 1))) & 255) << (8 * i);
-  }
-  return w;
-}
+// written, `heff_bits_little` turns the one into the other: the three
+// are the runtime's Zig's, declared above.)
 
 // (the integer of `n` bits at bit `at` of `s`, as the flags `f` say)
 HEFF_FN V heff_bits_int(const uint8_t *s, int64_t at, int64_t n, int64_t flags) {

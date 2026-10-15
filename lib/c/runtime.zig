@@ -276,3 +276,194 @@ fn decimalOf(comptime T: type, x: T) std.fmt.float.FloatDecimal(u64) {
         &std.fmt.float.Backend64_TablesFull,
     );
 }
+
+// Integers beyond a word: their magnitudes
+// ---------------------------------------------------------------------
+// A magnitude is its 32-bit digits, the least first, as `Big` holds
+// them; the C half gives each result room, and makes an integer of it.
+
+/// `a` against `b`, as magnitudes of `an` and `bn` digits, no top digit
+/// 0: -1, 0 or 1.
+export fn heff_mag_cmp(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int) c_int {
+    if (an != bn) return if (an < bn) -1 else 1;
+    var i: usize = @intCast(an);
+    while (i > 0) {
+        i -= 1;
+        if (a[i] != b[i]) return if (a[i] < b[i]) -1 else 1;
+    }
+    return 0;
+}
+
+/// `a` plus `b`, into `o`, which has room for max(an, bn) + 1 digits:
+/// how many digits it has.
+export fn heff_mag_add(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int, o: [*]u32) c_int {
+    if (an < bn) return heff_mag_add(b, bn, a, an, o);
+    const x = a[0..@intCast(an)];
+    const y = b[0..@intCast(bn)];
+    var carry: u64 = 0;
+    for (x, 0..) |d, i| {
+        carry += @as(u64, d) + if (i < y.len) y[i] else 0;
+        o[i] = @truncate(carry);
+        carry >>= 32;
+    }
+    o[x.len] = @truncate(carry);
+    return an + 1;
+}
+
+/// `a` minus `b`, `a` not below `b`, into `o`, which has room for `an`
+/// digits: how many digits it has, `an`.
+export fn heff_mag_sub(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int, o: [*]u32) c_int {
+    const x = a[0..@intCast(an)];
+    const y = b[0..@intCast(bn)];
+    var borrow: i64 = 0;
+    for (x, 0..) |d, i| {
+        borrow += @as(i64, d) - if (i < y.len) y[i] else 0;
+        o[i] = @truncate(@as(u64, @bitCast(borrow)));
+        borrow = if (borrow < 0) -1 else 0;
+    }
+    return an;
+}
+
+/// `a` times `b`, into `o`, which has room for an + bn digits, all of
+/// them written.
+export fn heff_mag_mul(a: [*]const u32, an: c_int, b: [*]const u32, bn: c_int, o: [*]u32) void {
+    const x = a[0..@intCast(an)];
+    const y = b[0..@intCast(bn)];
+    @memset(o[0 .. x.len + y.len], 0);
+    for (x, 0..) |d, i| {
+        var carry: u64 = 0;
+        for (y, 0..) |e, j| {
+            carry += @as(u64, d) * e + o[i + j];
+            o[i + j] = @truncate(carry);
+            carry >>= 32;
+        }
+        o[i + y.len] = @truncate(carry);
+    }
+}
+
+/// `u`, `m` digits, divided by `v`, `n` digits whose top is not 0, as
+/// Knuth's algorithm D: the quotient `q` gets max(m - n + 1, 1) digits,
+/// the remainder `r` gets `n`; `vn` and `un` are room for `n` and `m +
+/// 1` digits, the normalised divisor and dividend.
+export fn heff_mag_divmod(u: [*]const u32, m: c_int, v: [*]const u32, n: c_int, q: [*]u32, r: [*]u32, vn: [*]u32, un: [*]u32) void {
+    const mu: usize = @intCast(m);
+    const nv: usize = @intCast(n);
+    if (mu < nv) {
+        @memcpy(r[0..mu], u[0..mu]);
+        @memset(r[mu..nv], 0);
+        return;
+    }
+    if (nv == 1) {
+        var k: u64 = 0;
+        var j = mu;
+        while (j > 0) {
+            j -= 1;
+            const t = (k << 32) | u[j];
+            q[j] = @truncate(t / v[0]);
+            k = t - @as(u64, q[j]) * v[0];
+        }
+        r[0] = @truncate(k);
+        return;
+    }
+    // (the divisor's top digit made to have its top bit set, and the
+    // dividend shifted as much, so that each guess of a quotient digit
+    // is at most 2 too big)
+    const s: u5 = @intCast(@clz(v[nv - 1]));
+    const back: u5 = @truncate(32 - @as(u6, s));
+    var i = nv - 1;
+    while (i > 0) : (i -= 1) vn[i] = (v[i] << s) | (if (s != 0) v[i - 1] >> back else 0);
+    vn[0] = v[0] << s;
+    un[mu] = if (s != 0) u[mu - 1] >> back else 0;
+    i = mu - 1;
+    while (i > 0) : (i -= 1) un[i] = (u[i] << s) | (if (s != 0) u[i - 1] >> back else 0);
+    un[0] = u[0] << s;
+    var j = mu - nv + 1;
+    while (j > 0) {
+        j -= 1;
+        const num = (@as(u64, un[j + nv]) << 32) | un[j + nv - 1];
+        var qhat = num / vn[nv - 1];
+        var rhat = num - qhat * vn[nv - 1];
+        while (qhat >> 32 != 0 or qhat * vn[nv - 2] > ((rhat << 32) | un[j + nv - 2])) {
+            qhat -= 1;
+            rhat += vn[nv - 1];
+            if (rhat >> 32 != 0) break;
+        }
+        var k: i64 = 0;
+        var t: i64 = 0;
+        for (0..nv) |l| {
+            const p = qhat * vn[l];
+            t = @as(i64, un[l + j]) - k - @as(i64, @intCast(p & 0xFFFFFFFF));
+            un[l + j] = @truncate(@as(u64, @bitCast(t)));
+            k = @as(i64, @intCast(p >> 32)) - (t >> 32);
+        }
+        t = @as(i64, un[j + nv]) - k;
+        un[j + nv] = @truncate(@as(u64, @bitCast(t)));
+        q[j] = @truncate(qhat);
+        if (t < 0) {
+            // (the guess was one too big: a digit less, and the divisor
+            // added back)
+            q[j] -%= 1;
+            k = 0;
+            for (0..nv) |l| {
+                t = @as(i64, un[l + j]) + vn[l] + k;
+                un[l + j] = @truncate(@as(u64, @bitCast(t)));
+                k = t >> 32;
+            }
+            un[j + nv] +%= @truncate(@as(u64, @bitCast(k)));
+        }
+    }
+    for (0..nv) |l| r[l] = (un[l] >> s) | (if (s != 0) un[l + 1] << back else 0);
+}
+
+// Bits
+// ---------------------------------------------------------------------
+// An integer of `n` bits, 0 to 64, as Erlang's bit syntax has it: its
+// two's complement, the most significant bit first -- or, little-endian,
+// its bytes the least significant first and then the `n % 8` bits left,
+// the most significant.  `heff_bits_read` and `heff_bits_write` have
+// them in the order they are written; `heff_bits_little` turns the one
+// into the other.
+
+/// The `n` bits at bit `at` of `s`, the most significant first.
+export fn heff_bits_read(s: [*]const u8, at: i64, n: i64) u64 {
+    var u: u64 = 0;
+    const from: usize = @intCast(at);
+    const count: usize = @intCast(n);
+    if (from & 7 == 0 and count & 7 == 0) {
+        for (s[from >> 3 ..][0 .. count >> 3]) |byte| u = (u << 8) | byte;
+    } else {
+        for (from..from + count) |i| u = (u << 1) | ((s[i >> 3] >> @intCast(7 - (i & 7))) & 1);
+    }
+    return u;
+}
+
+/// The `n` bits of `w`, the most significant first, put at bit `at` of
+/// `s`, whose bits there are 0.
+export fn heff_bits_write(s: [*]u8, at: i64, w: u64, n: i64) void {
+    const from: usize = @intCast(at);
+    const count: usize = @intCast(n);
+    if (from & 7 == 0 and count & 7 == 0) {
+        for (s[from >> 3 ..][0 .. count >> 3], 0..) |*byte, i| byte.* = @truncate(w >> @intCast(count - 8 * (i + 1)));
+    } else {
+        for (0..count) |i| {
+            if ((w >> @intCast(count - 1 - i)) & 1 != 0) s[(from + i) >> 3] |= @as(u8, 0x80) >> @intCast((from + i) & 7);
+        }
+    }
+}
+
+/// An integer of `n` bits, little-endian: its bits as they are written,
+/// from the integer (`out` not 0), or the integer, from them.
+export fn heff_bits_little(u: u64, n: i64, out: c_int) u64 {
+    const count: usize = @intCast(n);
+    const k = count >> 3;
+    const r = count & 7;
+    var w: u64 = 0;
+    if (out != 0) {
+        for (0..k) |i| w = (w << 8) | ((u >> @intCast(8 * i)) & 255);
+        if (r != 0) w = (w << @intCast(r)) | ((u >> @intCast(8 * k)) & ((@as(u64, 1) << @intCast(r)) - 1));
+    } else {
+        if (r != 0) w = (u & ((@as(u64, 1) << @intCast(r)) - 1)) << @intCast(8 * k);
+        for (0..k) |i| w |= ((u >> @intCast(count - 8 * (i + 1))) & 255) << @intCast(8 * i);
+    }
+    return w;
+}

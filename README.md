@@ -11,8 +11,8 @@ distinction: types are computed at compile time, data at run time.
   needs as instance arguments, and is given them where it runs.
 - **Self-hosting**: the compiler is written in heff, and builds from a
   seed of itself compiled to C.
-- **Two backends**: C (native programs, by `zig cc`) and JavaScript
-  (web pages, ES modules).
+- **Two backends**: C (native programs, built by zig; the runtime is
+  part C, part Zig) and JavaScript (web pages, ES modules).
 - **Tools** in the one executable: a formatter, a language server, doc
   tests and property tests, and packages fetched by git.
 
