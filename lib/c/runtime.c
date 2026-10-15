@@ -51,6 +51,7 @@
 extern char **environ;
 #endif
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -4565,10 +4566,33 @@ HEFF_FN V heff_place_join(int64_t i) {
 // -- or to another wait, pending again.  A source (libcurl's, in
 // std.http's provider) has descriptors of its own to poll and how
 // long at most to wait for them, and says which of its waits are done
-// (`heff_wait_done`).  Each thread of the system has a reactor of its
-// own (`HEFF_TLS`): its waits are its own, waited for by it alone.
+// (`heff_wait_done`).  A wait may have a deadline instead of, or as
+// well as, a descriptor (`until`, by `heff_now_ms`): a sleep of
+// std.time's is one with no descriptor, done when its time has passed,
+// the reactor waiting no longer than the nearest deadline.
+//
+// Each thread of the system has a reactor of its own (`HEFF_TLS`): its
+// waits are its own, waited for by it alone.  So each place has one
+// (#97), driven by the scheduler running in it: a green thread of a
+// place that waits -- on a channel, a command, a socket, a sleep, a
+// place it joins -- is pending in that place's reactor, the other
+// green threads of the place going on, and nothing of one place's
+// reactor is touched by another.
 
 #include <errno.h>
+#include <time.h>
+
+// (now, in milliseconds of a clock that only goes forward: for
+// deadlines, not for the time of day)
+#ifdef _WIN32
+HEFF_FN int64_t heff_now_ms(void) { return (int64_t)GetTickCount64(); }
+#else
+HEFF_FN int64_t heff_now_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+#endif
 
 #define HEFF_STEP_DONE 0
 #define HEFF_STEP_WAIT 1
@@ -4584,8 +4608,11 @@ Obj heff_pending_obj = { IMMORTAL, K_STR, 0 };
 
 typedef struct HeffWait HeffWait;
 struct HeffWait {
-  int fd;                        // (what it waits for; -1, a source's word)
+  int fd;                        // (what it waits for; -1, a source's word,
+                                 //  or its deadline alone)
   short events;                  // (POLLIN, POLLOUT)
+  int64_t until;                 // (when it is done regardless, by
+                                 //  `heff_now_ms`; 0, never)
   int err;                       // (why waiting failed -- errno, poll's, or
                                  //  EBADF, its socket closed -- its answer's to say)
   int (*step)(HeffWait *);       // (its next step: HEFF_STEP_DONE, or HEFF_STEP_WAIT,
@@ -4699,14 +4726,29 @@ HEFF_FN V heff_outside(HeffWait *w, V f, V k) {
   }
 #ifndef _WIN32
   for (;;) {
-    if (w->fd < 0) heff_fail("an outside operation waits for no descriptor, and no scheduler is there to wait for it");
+    if (w->fd < 0 && !w->until) heff_fail("an outside operation waits for no descriptor, and no scheduler is there to wait for it");
+    int ms = -1;
+    if (w->until) {
+      int64_t left = w->until - heff_now_ms();
+      ms = left <= 0 ? 0 : left > INT_MAX ? INT_MAX : (int)left;
+    }
     struct pollfd p = { w->fd, w->events, 0 };
-    if (poll(&p, 1, -1) < 0) {
+    int r = poll(&p, w->fd >= 0 ? 1 : 0, ms);
+    if (r < 0) {
       if (errno == EINTR) continue;
       w->err = errno;
       break;
     }
+    if (r == 0) {
+      if (w->until && heff_now_ms() >= w->until) break;
+      continue;
+    }
     if (w->step(w) == HEFF_STEP_DONE) break;
+  }
+#else
+  if (w->fd < 0 && w->until) {
+    int64_t left = w->until - heff_now_ms();
+    if (left > 0) Sleep((DWORD)left);
   }
 #endif
   V x = heff_answer(f, w->answer(w));
@@ -4801,6 +4843,13 @@ HEFF_FN void heff_reactor_wake(void) {
   }
 }
 
+// (the waits whose deadline has passed: done)
+HEFF_FN void heff_reactor_expire(void) {
+  int64_t now = heff_now_ms();
+  for (HeffWait *w = heff_waits_first; w; w = w->next)
+    if (!w->done && w->until && now >= w->until) w->done = 1;
+}
+
 #ifndef _WIN32
 // (room for `n` descriptors polled)
 HEFF_FN void heff_polled_room(size_t n) {
@@ -4820,9 +4869,16 @@ HEFF_FN void heff_polled_room(size_t n) {
 HEFF_FN void heff_reactor_turn(int wait) {
   size_t n = 0;
   int ms = wait ? -1 : 0;
+  int64_t now = heff_now_ms();
   for (HeffWait *w = heff_waits_first; w; w = w->next) {
     if (w->done) ms = 0;
-    else if (w->fd >= 0) n++;
+    else {
+      if (w->fd >= 0) n++;
+      if (w->until) {
+        int64_t left = w->until > now ? w->until - now : 0;
+        if (ms < 0 || left < ms) ms = left > INT_MAX ? INT_MAX : (int)left;
+      }
+    }
   }
   size_t mine = n;
   for (HeffSource *s = heff_sources; s; s = s->next) {
@@ -4858,10 +4914,25 @@ HEFF_FN void heff_reactor_turn(int wait) {
       if (!w->done && w->step(w) == HEFF_STEP_DONE) w->done = 1;
     }
   for (HeffSource *s = heff_sources; s; s = s->next) s->ready(heff_polled + s->at, s->n);
+  heff_reactor_expire();
   heff_reactor_wake();
 }
 #else
-HEFF_FN void heff_reactor_turn(int wait) { (void)wait; heff_reactor_wake(); }
+// (no descriptor is polled: the deadlines alone are waited for)
+HEFF_FN void heff_reactor_turn(int wait) {
+  int64_t now = heff_now_ms(), ms = wait ? -1 : 0;
+  for (HeffWait *w = heff_waits_first; w; w = w->next) {
+    if (w->done) ms = 0;
+    else if (w->until) {
+      int64_t left = w->until > now ? w->until - now : 0;
+      if (ms < 0 || left < ms) ms = left;
+    }
+  }
+  if (ms < 0) heff_fail("the reactor waits, with nothing to wait for");
+  if (ms > 0) Sleep((DWORD)ms);
+  heff_reactor_expire();
+  heff_reactor_wake();
+}
 #endif
 
 // | Group `g`'s finished, since it was last asked, in the order they

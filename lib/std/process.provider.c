@@ -334,8 +334,6 @@ static SRWLOCK heff_subs_lock = SRWLOCK_INIT;
 #define HEFF_SUBS_LOCK() AcquireSRWLockExclusive(&heff_subs_lock)
 #define HEFF_SUBS_UNLOCK() ReleaseSRWLockExclusive(&heff_subs_lock)
 
-static int64_t heff_now_ms(void) { return (int64_t)GetTickCount64(); }
-
 // (all a pipe gives, until it is closed, or the read cancelled)
 static DWORD WINAPI heff_stream_drain(LPVOID u) {
   HeffStream *st = u;
@@ -588,12 +586,6 @@ static void heff_close(int *fd) {
 static int heff_nonblock(int fd) {
   if (fd >= 0) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
   return fd;
-}
-
-static int64_t heff_now_ms(void) {
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
 // (how a command ended, by waitpid's status)

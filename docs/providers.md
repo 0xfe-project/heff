@@ -255,7 +255,13 @@ waits.  A provider's operation is a `HeffWait` (its first member, of a
 struct of the provider's own):
 
 - `fd` and `events` (`POLLIN`, `POLLOUT`): what it waits for; `fd` -1
-  where a source says when it is done (below);
+  where a source says when it is done (below), or where it waits for
+  its deadline alone;
+- `until`: when it is done regardless, in milliseconds of the
+  runtime's clock (`heff_now_ms`), or 0; the reactor polls no longer
+  than the nearest deadline, and a wait past its own is done, its
+  `answer` asked for -- std.time's sleep is a wait of a deadline and no
+  descriptor;
 - `step(w)`: what can be done now, without waiting: `HEFF_STEP_DONE`,
   or `HEFF_STEP_WAIT`, its `fd` and `events` set again;
 - `answer(w)`: its answer, a value of the program's, made of what it
