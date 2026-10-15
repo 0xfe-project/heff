@@ -20,8 +20,10 @@
 -- a call last of one of them a call of itself, a loop; each of them a
 -- wrapper calling it, where it is called from elsewhere or is a value.
 -- A parameter of another of them (`_`) is given what is never read
--- (`pads`).  Each of them is named afresh in it, so that no two have a
--- name in common.
+-- (`pads`) where the cycle is entered, and given on as it is round the
+-- cycle: so it is never dropped, nor given anew, as the cycle goes
+-- round (only let go where it ends).  Each of them is named afresh in
+-- it, so that no two have a name in common.
 --
 -- This runs on what is lowered (heff.compile.lower), each call at its
 -- arity, for both backends.
@@ -213,20 +215,33 @@ type Cycle = { key : String, tag : String, members : List Member }
 tagOf : String -> String
 tagOf g = "Enter$" ^ g
 
--- (what a parameter of a function not called is given: a static object,
--- which is not counted -- the C backend may drop it as what the
--- parameter holds is, a record of its shape -- or, where a number is
--- wanted unboxed, naught)
+-- (what a parameter of a function not called is given where the cycle
+-- is entered: a static object, which is not counted -- the C backend
+-- may drop it as what the parameter holds is, a record of its shape,
+-- which a word could not be -- or, where a number is wanted unboxed,
+-- naught)
 pads : List String -> List IR.Expr
 pads xs = List.map (\_ -> EStr "") xs
 
--- (the arguments of the cycle's function, for a call of `g`)
-argsFor : Cycle -> String -> List IR.Expr -> List IR.Expr
-argsFor c g as =
+-- (whether a member's parameters are held where a call is: in the body
+-- of another member, `at`)
+heldAt : Maybe String -> Member -> Bool
+heldAt at m = maybe False (\k -> not (strEq k m.key)) at
+
+-- (the arguments of the cycle's function, for a call of `g`, in the body
+-- of the member `at` -- or of a wrapper, from without.  A parameter of
+-- a member not called: in the body of another member, it holds a pad,
+-- given on; of `at` itself, whose own are let go here, or from without,
+-- a pad)
+argsFor : Cycle -> Maybe String -> String -> List IR.Expr -> List IR.Expr
+argsFor c at g as =
   Cons
     (ETag (tagOf g) Nil Nil)
     (List.concatMap
-       (\(m : Member) -> if strEq m.key g then as else pads m.params)
+       (\(m : Member) ->
+          if strEq m.key g then as
+          else if heldAt at m then List.map (\x -> EVar x) m.params
+          else pads m.params)
        c.members)
 
 -- (whether `g` is a member, called with as many arguments as it takes)
@@ -236,20 +251,24 @@ calledMember c g as =
     (\(m : Member) -> strEq m.key g && List.length m.params == List.length as)
     c.members
 
--- (a body's calls last of the cycle's functions, made calls of the
--- cycle's function: of itself)
-retail : Cycle -> IR.Expr -> IR.Expr
-retail c (ELet x a b) = ELet x a (retail c b)
-retail c (EMatch s arms) =
+-- (the member `at`'s body's calls last of the cycle's functions, made
+-- calls of the cycle's function: of itself)
+retail : Cycle -> String -> IR.Expr -> IR.Expr
+retail c at (ELet x a b) = ELet x a (retail c at b)
+retail c at (EMatch s arms) =
   EMatch
     s
     (List.map
        (\arm ->
-          MkArm (IR.armTag arm) (IR.armVars arm) (retail c (IR.armBody arm)))
+          MkArm
+            (IR.armTag arm)
+            (IR.armVars arm)
+            (retail c at (IR.armBody arm)))
        arms)
-retail c (ECall g as) =
-  if calledMember c g as then ECall c.key (argsFor c g as) else ECall g as
-retail c e = e
+retail c at (ECall g as) =
+  if calledMember c g as then ECall c.key (argsFor c (Just at) g as)
+  else ECall g as
+retail c at e = e
 
 -- (the cycle's function: its tag looked at, each member's body there)
 cycleDef : Cycle -> IR.Def
@@ -262,7 +281,7 @@ cycleDef c =
        (EMatch
           (EVar c.tag)
           (List.map
-             (\(m : Member) -> MkArm (tagOf m.key) Nil (retail c m.body))
+             (\(m : Member) -> MkArm (tagOf m.key) Nil (retail c m.key m.body))
              c.members)))
 
 -- (a member, called from elsewhere or a value: its parameters given to the
@@ -274,7 +293,9 @@ wrapper c d m =
     d.name
     (ELam
        m.outer
-       (ECall c.key (argsFor c m.key (List.map (\x -> EVar x) m.outer))))
+       (ECall
+          c.key
+          (argsFor c Nothing m.key (List.map (\x -> EVar x) m.outer))))
 
 -- The program
 --------------------------------------------------------------------------------
