@@ -30,7 +30,7 @@ export default defineConfig({
     starlight({
       title: 'heff',
       sidebar: [
-        { label: 'Tutorial', items: ['tutorial/first-program', 'tutorial/data', 'tutorial/effects'] },
+        { label: 'Tutorial', items: ['tutorial/first-program', 'tutorial/data', 'tutorial/effects', 'tutorial/own-effects', 'tutorial/terminal', 'tutorial/packages', 'tutorial/tests'] },
         {
           label: 'Reference',
           items: [

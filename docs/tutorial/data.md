@@ -4,7 +4,11 @@ title: Values, functions and data
 
 Chapter 1's program greets the world. From here on, you build something
 more useful: a todo list. Create `src/hello/todo.hf`, and add each
-definition in this chapter to it, in order.
+definition in this chapter to it, in order, after its name:
+
+```haskell
+module hello.todo
+```
 
 ## Data types
 

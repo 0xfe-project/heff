@@ -50,6 +50,8 @@ Hello, world!
 Open `src/hello/greeting.hf`:
 
 ```haskell
+module hello.greeting
+
 -- | a greeting, of `name`
 -- | >>> greeting "heff"
 -- | "Hello, heff!"
@@ -57,8 +59,9 @@ greeting : String -> String
 greeting name = "Hello, " ^ name ^ "!"
 ```
 
-A definition is a type signature, `greeting : String -> String`,
-followed by its equations. `^` joins strings.
+The first line names the module. A definition is a type signature,
+`greeting : String -> String`, followed by its equations. `^` joins
+strings.
 
 The `-- |` lines above it are its documentation, and they are also a
 test. The line after `>>>` is an expression, and the line after that is
@@ -69,6 +72,8 @@ the value it should have. `heff test` checks it.
 Open `app/hello/main.hf`:
 
 ```haskell
+module app.hello.main
+
 import co
 import hello.greeting
 import std.io
@@ -85,8 +90,9 @@ its path under `src/`.
 
 `program`'s type says what it does: it is a computation (`Co e Unit`)
 that needs the standard streams (`stdio`), and nothing else. `main` runs
-it and gives it those streams. Chapter 3 explains how this works. For
-now, read `{{io : stdio <: e}}` as "to run this, you need stdio".
+it and gives it those streams. [Chapter 3](effects.md#printing-the-todos)
+explains how this works. For now, read `{{io : stdio <: e}}` as "to run
+this, you need stdio".
 
 ## Testing it
 
