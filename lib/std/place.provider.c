@@ -6,10 +6,12 @@
 // (`heff_place_start`, the place a foreign value), and is joined for
 // its value, crossed back (`heff_place_join`): copied, or moved where
 // the sender held it alone and it is the system's; a failure in it is
-// the joiner's at the join.  A channel (`heff_chan_new`) holds the
-// messages sent on it, and is a foreign value the places that are given
-// it share, each holding it once (`heff_chan_hold`) and letting it go
-// (`heff_chan_drop`) as it drops its last reference; a receive takes
+// the joiner's at the join.  A channel holds the messages sent on it,
+// and is a foreign value the places that are given it share, each
+// holding it once (`heff_chan_hold`) and letting it go
+// (`heff_chan_drop`) as it drops its last reference -- made by
+// `heff_chan_new`, which the module describes, the glue the compiler
+// makes of that being its `NewChannel`; a receive takes
 // the first message, waiting for one, the whole place with it -- or, in
 // a group of std.reactor's, pending: a wait of the reactor's on the
 // descriptor the channel keeps readable while it holds something, the
@@ -34,13 +36,6 @@ static V pl_open_fn(V self, V *a) {
 // at `pl_held`; `w` consumed)
 static void pl_open(V w, int n) {
   heff_drop(heff_answer(w, heff_clo(pl_open_fn, n, 0, NULL)));
-}
-
-// (a channel of its own, as the program holds it: a foreign value that
-// crosses to other places, each holding the channel once more and
-// letting it go as it drops its last reference)
-static V pl_channel(void) {
-  return heff_foreign_shared(heff_chan_new(), heff_chan_drop, heff_chan_hold);
 }
 
 // (a join pending in a group of the reactor's: the place, held until
@@ -133,6 +128,8 @@ static V pl_recv(HeffChan *ch, V p, V f, V k) {
   return heff_tail(k, 1, &x);
 }
 
+static V heff_described_places(V p, V k);
+
 static V heff_provider_places(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_Spawn: {
@@ -150,12 +147,6 @@ static V heff_provider_places(V p, V k) {
     heff_drop(p);
     pl_open(j, 1);
     return pl_join(spot, pl_held[0], k);
-  }
-  case TAG_NewChannel: {
-    V f = heff_dup(heff_field(p, 0));
-    heff_drop(p);
-    V x = heff_answer(f, pl_channel());
-    return heff_tail(k, 1, &x);
   }
   // (a send or a receive keeps `p`, and so the channel, while it is
   // under way)
@@ -175,8 +166,8 @@ static V heff_provider_places(V p, V k) {
     V f = pl_held[0];
     return pl_recv(ch, p, f, k);
   }
+  // (`NewChannel`: the glue the compiler made of the description)
   default:
-    heff_fail("not an operation of places");
-    return 0;
+    return heff_described_places(p, k);
   }
 }
