@@ -1027,7 +1027,9 @@ property, run by `heff test` there.  `examples/pages/` is four pages,
 each a program of its own (`app/NAME/`, its `index.html` beside it): a
 counter, a clock, a greeting written into the page, and a sum of vectors
 on the GPU; `heff dev` there serves each at `/NAME/`.  `examples/notes/`
-is a page and its server, one project.  The apps' tests (`heff test test/apps.hf`) run
+is a page and its server, one project.  `examples/todos/` is a terminal
+app: a tree of todos walked by an effect of its own, a cursor, handled
+on a zipper.  The apps' tests (`heff test test/apps.hf`) run
 them all.  `examples/testbridge/` is a project of another kind: a Linux
 program, through C, that makes a bridge and a veth pair by rtnetlink,
 its socket's calls a provider of its own.
