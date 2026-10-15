@@ -140,10 +140,11 @@ hold a shared one, not the other way.
   it once it is there: shared to publish, frozen once published, no
   thread counting it after.  A big integer written in the program is
   made once likewise, another thread's made meanwhile freed.
-- **The world's table** of handles (`heff_hold`, `heff_held`,
-  `heff_release`) is locked, and so are `std.reference`'s cells: a cell
-  holds a shared value, a read is one more count of it, a write shares
-  the new value and swaps it in under the lock.
+- **`std.reference`'s cells** are locked: a cell holds a shared value,
+  a read is one more count of it, a write shares the new value and
+  swaps it in under the lock.  A foreign value (a host's thing, a file
+  open) shared between threads is let go of once, by the last to drop
+  it; the thing itself is its provider's to guard.
 
 Why a definition's value is computed once and frozen, not shared and
 counted: the language says a definition is one value; it is computed
@@ -193,8 +194,8 @@ holds what of it is not shared.
 Safe, in threads at once: pure code, all of it -- a task, a side of a
 `Parallel`, a spread's thread -- and the definitions it reads; `std.io`
 (a write is one `fwrite`, whole: C locks the stream); `std.reference`'s
-cells (locked, a value in them shared); the world's table of handles
-(locked).  A task of a pool is pure: it has no effects to run.
+cells (locked, a value in them shared).  A task of a pool is pure: it
+has no effects to run.
 
 Not safe, or not as one thread would do:
 
@@ -224,12 +225,11 @@ Not safe, or not as one thread would do:
 - A count is 30 bits in threads mode (31 otherwise): an object held
   more than a billion times at once is not counted right.
 - Other providers' tables are their own to lock.  The library's:
-  `std.reference` and the world's table are locked; `std.progress` locks its
-  own; `std.io`, `std.filesystem`, `std.http`, `std.net`, `std.time`
-  and `std.process` keep no tables (`exit` in a thread ends the
-  process; `std.net`'s sockets are the world's).
-  `heff_held(i)` is a pointer: a thing let go of by one thread while
-  another uses it is the providers' to prevent.
+  `std.reference`'s cells are locked; `std.progress` locks its own;
+  `std.io`, `std.filesystem`, `std.http`, `std.net`, `std.time` and
+  `std.process` keep no tables (`exit` in a thread ends the process).
+  A foreign value's pointer is the host's thing itself: one let go of
+  by one thread while another uses it is the providers' to prevent.
 - Per-thread state costs: on macOS a `_Thread_local` is reached through
   a call, so a program that allocates much runs some 5% more
   instructions in threads mode, one thread working (queens, below).
@@ -289,7 +289,13 @@ program = do
   waiting for one.  A channel is typed, and may carry any type -- a
   record, a list, a function, a channel -- one effect for them all.
   What a place is to hold (a channel, a table to look things up in) it
-  holds through the computation given to it, copied with it.
+  holds through the computation given to it, copied with it.  A place
+  and a channel are the host's own things (foreign values, `Place a`
+  and `PlaceChannel a`): a channel crosses to each place that is given
+  it, which holds it as its own, and is freed, with what was sent on it
+  and not received, when no place holds it; a place dropped before it
+  is joined is joined where the program drops its last reference to it,
+  what it came to left unread.
 - A receive blocks the whole place, unless it is in a group of
   std.reactor's (green threads scheduled by `Reactor.scheduled`): then
   it is pending, a wait of the reactor's, the other green threads of
@@ -312,7 +318,9 @@ places, none is counted atomically, and no page holds another place's
 object.  What a value holds twice -- an object of count more than one
 -- is numbered in the message and made once in the receiver too, so
 that a copy is no bigger than its original.  A foreign value (a `FILE
-*` held by the world) does not cross: sending one fails.
+*` the program holds) does not cross -- sending one fails -- unless its
+provider made it shared, as a channel is: then the thing is held once
+more, and the receiver has a foreign value of its own for it.
 
 Copy against move: an object the sender holds alone -- its count 1,
 and so every object's above it in the value -- that is the system's,
