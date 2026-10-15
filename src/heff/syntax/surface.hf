@@ -30,7 +30,8 @@ mkBinders f names implicits = { f = f, names = names, implicits = implicits }
 -- | `patVars`: those of the equation being lowered; `fix`: the fixities
 -- | in scope; `lenient`: unrelated operators bind as one left-associative
 -- | group (the formatter's reading); `at`: where an offset is, said
--- | `path:line:col`
+-- | `path:line:col`; `knot`: the names of the `mutual` block being
+-- | lowered, each to the name of the record that knots them
 type St =
   { toks : Array CST.T
   , scope : List String
@@ -40,6 +41,7 @@ type St =
   , fix : Fixity.Fixities
   , lenient : Bool
   , at : Int -> String
+  , knot : Map.Map String String
   }
 
 type P a = St -> Pair (Either Diag a) St
@@ -78,8 +80,9 @@ mkSt : Array CST.T
      -> Fixity.Fixities
      -> Bool
      -> (Int -> String)
+     -> Map.Map String String
      -> St
-mkSt toks scope known binders patVars fix lenient at =
+mkSt toks scope known binders patVars fix lenient at knot =
   { toks = toks
   , scope = scope
   , known = known
@@ -88,16 +91,24 @@ mkSt toks scope known binders patVars fix lenient at =
   , fix = fix
   , lenient = lenient
   , at = at
+  , knot = knot
   }
 
 setScope : List String -> St -> St
-setScope sc s = mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient s.at
+setScope sc s =
+  mkSt s.toks sc s.known s.binders s.patVars s.fix s.lenient s.at s.knot
 
 setBinders : Map.Map String (List Binders) -> St -> St
-setBinders b s = mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient s.at
+setBinders b s =
+  mkSt s.toks s.scope s.known b s.patVars s.fix s.lenient s.at s.knot
 
 setPatVars : List String -> St -> St
-setPatVars pv s = mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient s.at
+setPatVars pv s =
+  mkSt s.toks s.scope s.known s.binders pv s.fix s.lenient s.at s.knot
+
+setKnot : Map.Map String String -> St -> St
+setKnot k s =
+  mkSt s.toks s.scope s.known s.binders s.patVars s.fix s.lenient s.at k
 
 -- Tokens and spans
 --------------------------------------------------------------------------------
@@ -873,10 +884,11 @@ twiceDiags at items =
 lineEndS : String -> Int -> Int
 lineEndS src i = fromMaybe (strLength src) (indexFrom "\n" src i)
 
--- (each line from the one at `i` up to `to` a `--` comment)
+-- (each line from the one at `i` up to the line `to` is on a `--`
+-- comment)
 commentLinesFrom : String -> Int -> Int -> Bool
 commentLinesFrom src i to =
-  if i >= to then True
+  if lineEndS src i >= to then True
   else if startsWith "--" (trim (strSlice src i (lineEndS src i)))
   then commentLinesFrom src (lineEndS src i + 1) to
   else False
@@ -1931,14 +1943,33 @@ argL r (Named o x k e c) = do
   pure (At (ENamed x.text e') (spanTT o c))
 argL r e = r.e e
 
+-- | a name, a variable or a definition: one of the `mutual` block being
+-- | lowered, not shadowed, is its field of the block's knot (the knot is
+-- | no name written: its span is wider than its name, so that the tools
+-- | show the field, not it)
+varAtom : CST.T -> List CST.T -> P Presyntax.Expr
+varAtom t fs = do
+  local <- pGets (\s -> List.elemBy strEq t.text s.scope)
+  knot <- pGets (\s -> Map.lookup s.knot t.text)
+  pure (case knot of
+    Just k ->
+      if local then withFields (atomTok t) fs
+      else withFields
+          (At (EVar k) (mkSpan t.start (t.start + strLength k + 2)))
+          (Cons t fs)
+    Nothing -> withFields (atomTok t) fs)
+
 -- | an expression
 exprL : Lw -> CST.E -> P Presyntax.Expr
 exprL r (Atom t) =
-  if strEq t.kind "con" then conAtom t Nil else pure (atomTok t)
+  if strEq t.kind "con" then conAtom t Nil
+  else if strEq t.kind "var" then varAtom t Nil
+  else pure (atomTok t)
 exprL r (EField e f) = case fieldsOf (EField e f) Nil of
   MkFields (Atom t) fs ->
     if strEq t.kind "con" then conAtom t fs
     else if strEq t.kind "kw" then kwAtom t fs
+    else if strEq t.kind "var" then varAtom t fs
     else pure (withFields (atomTok t) fs)
   MkFields b fs -> do
     b' <- r.e b
@@ -2380,6 +2411,255 @@ primitiveL r kw x ty = do
 watchItem : CST.T -> Presyntax.Decl -> Item
 watchItem w d = if strEq w.kind "doctest" then Doc d else Whole d
 
+-- Mutual definitions, knotted through a record
+--------------------------------------------------------------------------------
+
+-- A `mutual` block's definitions, `f1 : T1` ... `fn : Tn`, are the
+-- fields of a record type made for them, and each is defined as its
+-- field of a record built once, the knot, whose fields call the bodies,
+-- each given the knot as one more argument, first: in a body, a name of
+-- the block is its field of the knot given.  The knot's fields are
+-- lambdas, so the knot is built before any body runs (a definition that
+-- takes no argument is refused), and a body is checked as any
+-- definition's, its equations as written.
+--
+--   type M = { f1 : T1, ..., fn : Tn }    -- M, k, f1' ... fn' unspeakable
+--   f1' : M -> T1
+--   f1' k p ... = e                       -- f1 ... fn in e are k.f1 ... k.fn
+--   k : M
+--   k = { f1 = \x -> f1' k x, ... }
+--   f1 : T1
+--   f1 = k.f1
+--
+-- The names made are of the first definition's, `Mutual#f1`,
+-- `mutual#f1`, and of each definition's, `fi#mutual`: the same wherever
+-- the block is, and no name a text writes.
+
+-- | the record type of the block whose first definition is `f1`
+knotType : String -> String
+knotType f1 = "Mutual#" ^ f1
+
+-- | the knot of the block whose first definition is `f1`
+knotName : String -> String
+knotName f1 = "mutual#" ^ f1
+
+-- | the body of the definition `f`, given the knot
+bodyName : String -> String
+bodyName f = f ^ "#mutual"
+
+-- | the name of the block's first definition, the block's names made of
+firstSig : List CST.D -> Maybe String
+firstSig Nil = Nothing
+firstSig (Cons (DSig names cc ty) rest) = Just (declNameOf names).name
+firstSig (Cons _ rest) = firstSig rest
+
+-- | a definition of a `mutual` block, its signature met with its
+-- | equations: the name, where it is, its type, its equations, and its
+-- | span, from the signature to the last equation
+type MutualDef =
+  { name : String
+  , span : Params.Span
+  , ty : Presyntax.Expr
+  , eqns : List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+  , whole : Params.Span
+  }
+
+-- | is the type, past its implicit and instance arguments, a function's
+takesArgument : Presyntax.Expr -> Bool
+takesArgument (At (EPi (PiImplicit _ _ _ _ _) rest) _) = takesArgument rest
+takesArgument (At (EPi (PiInstance _ _ _ _) rest) _) = takesArgument rest
+takesArgument (At (EPi _ _) _) = True
+takesArgument _ = False
+
+-- | the block's definitions, in order (its items hold together: checked
+-- | before); a watch among them is kept where it is
+mutualDefs : List Item -> List (Either Item MutualDef)
+mutualDefs Nil = Nil
+mutualDefs (Cons (Sig _ f fsp ty sp) rest) = case eqnsUnder f rest of
+  Just es ->
+    Cons
+      (Right
+         { name = f
+         , span = fsp
+         , ty = ty
+         , eqns = es.eqns
+         , whole = mkSpan sp.start (maxI sp.end es.end)
+         })
+      (mutualDefs rest)
+  Nothing -> mutualDefs rest
+mutualDefs (Cons (Eqn _ _ _) rest) = mutualDefs rest
+mutualDefs (Cons it rest) = Cons (Left it) (mutualDefs rest)
+
+-- (a definition that takes no argument: its field of the knot would be
+-- computed while the knot is built)
+noArgumentDiag : Either Item MutualDef -> Maybe Diag
+noArgumentDiag (Right d) =
+  if takesArgument d.ty then Nothing
+  else Just
+      (diag
+         d.span
+         ("`"
+          ^ d.name
+          ^ "` takes no argument: a definition of a `mutual` block is a function, `"
+          ^ d.name
+          ^ " : A -> B`"))
+noArgumentDiag (Left _) = Nothing
+
+-- | the field of the record type a definition is
+mutualField : MutualDef
+            -> Params.Spanned
+              (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)
+mutualField d = At (DeclareField d.name d.span d.ty Nothing) d.whole
+
+-- (the equation, the knot its first pattern, of the body `f'`)
+knotEqn : String
+        -> String
+        -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+        -> Params.Spanned (Presyntax.Equation Presyntax.Expr)
+knotEqn k f' (At (MkEquation _ fsp pats body) sp) =
+  At (MkEquation f' fsp (Cons (At (PatVar k) fsp) pats) body) sp
+
+-- | the body of a definition, `f' : M -> T`, given the knot `k` first
+mutualBody : Presyntax.Expr -> String -> MutualDef -> Item
+mutualBody tyE k d =
+  Whole
+    (At
+       (DeclEquations
+          (bodyName d.name)
+          d.span
+          AsDefinition
+          (At (EPi (PiAnon tyE) d.ty) (Params.spanOf d.ty))
+          (List.map (\e -> knotEqn k (bodyName d.name) e) d.eqns))
+       d.whole)
+
+-- | a field of the knot: `f = \x -> f' k x`
+knotField : String
+          -> MutualDef
+          -> Params.Spanned (Presyntax.FieldSet Presyntax.Expr)
+knotField k d =
+  At
+    (SetField
+       d.name
+       d.span
+       (At
+          (ELam
+             (LamName "x#arg" d.span)
+             (Presyntax.app
+                (At (EVar (bodyName d.name)) d.span)
+                [At (EVar k) d.span, At (EVar "x#arg") d.span]))
+          d.span))
+    d.span
+
+-- | the knot, `k : M`, its fields calling the bodies
+mutualKnot : Presyntax.Expr -> String -> Params.Span -> List MutualDef -> Item
+mutualKnot tyE k bsp defs =
+  Whole
+    (At
+       (DeclEquations
+          k
+          bsp
+          AsDefinition
+          tyE
+          [ At
+            (MkEquation
+               k
+               bsp
+               Nil
+               (At (EStruct (List.map (knotField k) defs)) bsp))
+            bsp
+          ])
+       bsp)
+
+-- | the definition as the module has it, `f : T`, `f = k.f`; a watch as
+-- | it is
+mutualPublic : String -> Either Item MutualDef -> List Item
+mutualPublic k (Left it) = Cons it Nil
+mutualPublic k (Right d) =
+  [ Sig AsDefinition d.name d.span d.ty d.whole
+  , Eqn
+    d.name
+    (At
+       (MkEquation
+          d.name
+          d.span
+          Nil
+          (Presyntax.app (At (EVar k) d.span) [At (EProject d.name) d.span]))
+       d.whole)
+    d.whole
+  ]
+
+rightsOf : {a b : Type} -> List (Either a b) -> List b
+rightsOf Nil = Nil
+rightsOf (Cons (Right x) rest) = Cons x (rightsOf rest)
+rightsOf (Cons (Left _) rest) = rightsOf rest
+
+-- | the names a `mutual` block defines, each to its knot
+knotOf : String -> List CST.D -> Map.Map String String
+knotOf k Nil = Map.empty
+knotOf k (Cons (DSig names cc ty) rest) =
+  Map.insert (knotOf k rest) (declNameOf names).name k
+knotOf k (Cons _ rest) = knotOf k rest
+
+-- | the items of a `mutual` block, lowered with its names knotted
+mutualItems : Lw -> String -> List CST.D -> P (List Item)
+mutualItems r k ds = do
+  pModify (\s -> setKnot (knotOf k ds) s)
+  items <- block r.decl ds
+  pModify (\s -> setKnot Map.empty s)
+  at <- pGets (\s -> s.at)
+  case appendS
+      (twiceDiags at (concatMapS (\x -> x) items))
+      (assembleDiags Nil (concatMapS (\x -> x) items)) of
+    Cons d _ -> throwP d
+    Nil -> pure (concatMapS (\x -> x) items)
+
+-- | the block's items: the record type `m`, the bodies, the knot `k`,
+-- | then the definitions as the module has them (`ksp`: the keyword;
+-- | `bsp`: the block)
+mutualOut : Params.Span
+          -> Params.Span
+          -> String
+          -> String
+          -> List (Either Item MutualDef)
+          -> List Item
+mutualOut ksp bsp m k defs =
+  Cons
+    (Whole
+       (At
+          (DeclDefine
+             m
+             ksp
+             Nil
+             (At (EWord TypeWord) ksp)
+             (At (ESig (List.map mutualField (rightsOf defs))) bsp))
+          bsp))
+    (appendS
+       (List.map (mutualBody (At (EVar m) ksp) k) (rightsOf defs))
+       (Cons
+          (mutualKnot (At (EVar m) ksp) k bsp (rightsOf defs))
+          (concatMapS (mutualPublic k) defs)))
+
+-- | `mutual` and its definitions
+mutualL : Lw -> CST.T -> List CST.D -> P (List Item)
+mutualL r kw ds = case firstSig ds of
+  Nothing ->
+    throwP
+      (diag
+         (spanT kw)
+         "a `mutual` block holds definitions, each a signature and its equations")
+  Just f1 -> do
+    items <- mutualItems r (knotName f1) ds
+    case catMaybesS (List.map noArgumentDiag (mutualDefs items)) of
+      Cons d _ -> throwP d
+      Nil ->
+        pure
+          (mutualOut
+             (spanT kw)
+             (spanTE kw (lastDEnd ds kw.end))
+             (knotType f1)
+             (knotName f1)
+             (mutualDefs items))
+
 -- | a declaration, lowered: what it is before signatures meet equations
 declL : Lw -> CST.D -> P (List Item)
 declL r (DImport t) = pure Nil
@@ -2392,6 +2672,7 @@ declL r d@(DData kw name params universe alts) =
   dataL r d kw name params universe alts
 declL r (DType kw name params eq body) = typeL r kw name params body
 declL r d@(DTheory kw name params w fields) = theoryL r d kw name params fields
+declL r (DMutual kw ds) = mutualL r kw ds
 declL r (DPrimitive kw x cc ty) = primitiveL r kw x ty
 declL r (DTest kw x) =
   pure (Cons (Whole (At (DeclTest x.text (spanT x)) (spanTT kw x))) Nil)
@@ -2410,27 +2691,34 @@ lw =
 --------------------------------------------------------------------------------
 
 -- | the names a file defines (so that a capitalised one is not a tag)
-prescanGo : Array Lex.Tok -> Int -> List String -> List String
-prescanGo ts k acc = case Array.index ts k of
+-- (`inMutual`: under `mutual`, where a signature is indented)
+prescanGo : Array Lex.Tok -> Int -> Bool -> List String -> List String
+prescanGo ts k inMutual acc = case Array.index ts k of
   Nothing -> List.reverse acc
   Just t -> case Array.index ts (k + 1) of
-    Nothing -> prescanGo ts (k + 1) acc
+    Nothing -> prescanGo ts (k + 1) inMutual acc
     Just u ->
-      if t.first
-         && t.col == 0
-         && strEq t.kind "kw"
-         && List.elemBy strEq t.text ["data", "type", "theory", "instance"]
-      then prescanGo ts (k + 1) (Cons u.text acc)
+      if t.first && t.col == 0 && strEq t.kind "kw" && strEq t.text "mutual"
+      then prescanGo ts (k + 1) True acc
       else if t.first
               && t.col == 0
+              && strEq t.kind "kw"
+              && List.elemBy strEq t.text ["data", "type", "theory", "instance"]
+      then prescanGo ts (k + 1) False (Cons u.text acc)
+      else if t.first
+              && (t.col == 0 || inMutual)
               && (strEq t.kind "var" || strEq t.kind "con")
               && strEq u.kind "sym"
               && isAnnText u.text
-      then prescanGo ts (k + 1) (Cons t.text acc)
-      else prescanGo ts (k + 1) acc
+      then prescanGo ts (k + 1) (inMutual && t.col > 0) (Cons t.text acc)
+      else prescanGo
+          ts
+          (k + 1)
+          (inMutual && not (t.first && t.col == 0))
+          acc
 
 prescan : Array Lex.Tok -> List String
-prescan ts = prescanGo ts 0 Nil
+prescan ts = prescanGo ts 0 False Nil
 
 -- Fixity declarations, read before the rest
 --------------------------------------------------------------------------------
@@ -2891,6 +3179,7 @@ initialSt o at toks declared own =
     (Fixity.union o.fixities own)
     o.lenient
     at
+    Map.empty
 
 readPlaced : (Int -> String)
            -> List Diag
