@@ -648,6 +648,48 @@ writeOut outPath done o = do
           exit 1
     else exit 1
 
+-- | the runtime a C program is built with: its C, bundled into the
+-- | header every part includes, and its Zig, written beside the
+-- | program's C -- among the parts as `heff.zig`, or beside a program
+-- | of one file `F.c` as `F.zig` -- for zig to build into an object of
+-- | its own
+type RuntimeC = { c : String, zig : String }
+
+-- (where the runtime's Zig goes beside a program of one file: `F.zig`,
+-- for `F.c` or `F`)
+zigBeside : String -> String
+zigBeside path =
+  (if endsWith ".c" path then strSlice path 0 (strLength path - 2) else path)
+  ^ ".zig"
+
+-- (the runtime's Zig the compiler writes with `OUT`, a program of one
+-- file or of parts, `DIR/`)
+zigOf : String -> String
+zigOf outPath =
+  if endsWith "/" outPath then outPath ^ "heff.zig" else zigBeside outPath
+
+-- (a C program of one file written, its runtime's Zig beside it; then
+-- `done`)
+writeOutC : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> String
+          -> String
+          -> Co e Unit
+          -> Emit.Output
+          -> Co e Unit
+writeOutC outPath zig done o =
+  writeOut
+    outPath
+    (do
+     ok <- writeFile (zigBeside outPath) zig
+     if ok then done
+       else do
+         printErr ("cannot write " ^ zigBeside outPath)
+         exit 1)
+    o
+
 -- (a part written, unless it is there as it was: a C compiler that goes
 -- by when a file changed -- zig's -- builds it again only if it did)
 writeChanged : {e : HFunctor}
@@ -846,12 +888,13 @@ keptWritten : {e : HFunctor}
             -> BackIn
             -> String
             -> String
+            -> String
             -> List (Pair String String)
             -> Map.Map String BackCache.Back
             -> Co e Unit
             -> EmitC.PartsKept
             -> Co e Unit
-keptWritten bi dir id texts backs done out =
+keptWritten bi dir zig id texts backs done out =
   writeParts
     dir
     (if strEq id "" then done
@@ -869,7 +912,7 @@ keptWritten bi dir id texts backs done out =
               , jss = Nil
               })
        done)
-    (MkPair out.parts out.errors)
+    (MkPair (Cons (MkPair "heff.zig" zig) out.parts) out.errors)
 
 keptWith : {e : HFunctor}
          -> {{io : stdio <: e}}
@@ -877,7 +920,7 @@ keptWith : {e : HFunctor}
          -> {{disk : filesystem <: e}}
          -> BackIn
          -> String
-         -> String
+         -> RuntimeC
          -> Co e Unit
          -> Driver.Checked
          -> List Emit.Provider
@@ -886,16 +929,17 @@ keptWith : {e : HFunctor}
          -> List (Pair String String)
          -> Map.Map String BackCache.Back
          -> Co e Unit
-keptWith bi dir runtime done c available r id texts backs =
+keptWith bi dir rt done c available r id texts backs =
   keptWritten
     bi
     dir
+    rt.zig
     id
     texts
     backs
     done
     (EmitC.compileProgramPartsKept
-       runtime
+       rt.c
        available
        c.top.globals
        r.key
@@ -911,17 +955,17 @@ keptParts : {e : HFunctor}
           -> {{disk : filesystem <: e}}
           -> BackIn
           -> String
-          -> String
+          -> RuntimeC
           -> Co e Unit
           -> Driver.Checked
           -> List Emit.Provider
           -> Driver.Runnable
           -> Co e Unit
-keptParts bi dir runtime done c available r = do
+keptParts bi dir rt done c available r = do
   id <- selfHash bi.paths
   texts <-
     if strEq id "" then pure Nil else readBacks bi.paths (Cons "_" bi.modules)
-  keptWith bi dir runtime done c available r id texts (backsOf id texts)
+  keptWith bi dir rt done c available r id texts (backsOf id texts)
 
 -- (the JavaScript of the program running `r`, written -- then what the
 -- cache is to keep anew, `texts` the files as they were, `backs` what
@@ -1216,13 +1260,13 @@ compileFoundC : {e : HFunctor}
               -> String
               -> Maybe String
               -> String
-              -> String
+              -> RuntimeC
               -> (String -> Co e Unit)
               -> Co e Unit
               -> Driver.Checked
               -> List Emit.Provider
               -> Co e Unit
-compileFoundC bi file name outPath runtime failed done c available = case Driver.findRunnable
+compileFoundC bi file name outPath rt failed done c available = case Driver.findRunnable
     (List.filter (\k -> providesLeafC available k) (Driver.candidateLeaves c))
     c
     name of
@@ -1235,34 +1279,46 @@ compileFoundC bi file name outPath runtime failed done c available = case Driver
     then keptParts
         bi
         (strSlice outPath 0 (strLength outPath - 1))
-        runtime
+        rt
         done
         c
         available
         r
-    else writeOut
+    else writeOutC
         outPath
+        rt.zig
         done
-        (EmitC.compileProgramC runtime available c.top.globals r.key r.effect)
+        (EmitC.compileProgramC rt.c available c.top.globals r.key r.effect)
 
--- (the runtime, what a C program is bundled with)
+-- (a file of the runtime, the library's `c/NAME`: its text)
+readRuntimeFile : {e : HFunctor}
+                -> {{io : stdio <: e}}
+                -> {{sys : process <: e}}
+                -> {{disk : filesystem <: e}}
+                -> String
+                -> Co e String
+readRuntimeFile name = do
+  lib <- libDir
+  st <- styleNow
+  text <- readFile (Path.join st (Path.join st lib "c") name)
+  case text of
+    Nothing -> do
+      printErr
+          ("heff: no C runtime at " ^ Path.join st (Path.join st lib "c") name)
+      exit 1
+      pure ""
+    Just t -> pure t
+
+-- (the runtime, what a C program is bundled with: its C and its Zig)
 readRuntimeC : {e : HFunctor}
              -> {{io : stdio <: e}}
              -> {{sys : process <: e}}
              -> {{disk : filesystem <: e}}
-             -> Co e String
+             -> Co e RuntimeC
 readRuntimeC = do
-  lib <- libDir
-  st <- styleNow
-  runtime <- readFile (Path.join st (Path.join st lib "c") "runtime.c")
-  case runtime of
-    Nothing -> do
-      printErr
-          ("heff: no C runtime at "
-           ^ Path.join st (Path.join st lib "c") "runtime.c")
-      exit 1
-      pure ""
-    Just text -> pure text
+  c <- readRuntimeFile "runtime.c"
+  zig <- readRuntimeFile "runtime.zig"
+  pure { c = c, zig = zig }
 
 compileLastC : {e : HFunctor}
              -> {{io : stdio <: e}}
@@ -1288,17 +1344,18 @@ compileLastC bi sources file name outPath failed done cs = case Driver.lastCheck
         sources
         (nubStrM
            (List.map (\k -> Effect.moduleOfKey k) (Driver.candidateLeaves c)))
-    runtime <- readRuntimeC
+    rt <- readRuntimeC
     case name of
       -- (no computation named: each of the file's definitions, shown)
-      Nothing ->
+      Nothing -> do
+        ok <- writeFile (zigBeside outPath) rt.zig
         compileJsOut
-          outPath
-          False
-          (EmitC.compileCheckC
-             runtime
-             c.top.globals
-             (List.map (\(o : Driver.Own) -> MkPair o.name o.key) c.own))
+            outPath
+            (not ok)
+            (EmitC.compileCheckC
+               rt.c
+               c.top.globals
+               (List.map (\(o : Driver.Own) -> MkPair o.name o.key) c.own))
       -- (with the providers written by hand, the glue of the operations
       -- the effects' modules describe in C, made here)
       Just _ -> case Glue.gluesOf
@@ -1314,7 +1371,7 @@ compileLastC bi sources file name outPath failed done cs = case Driver.lastCheck
             file
             name
             outPath
-            runtime
+            rt
             failed
             done
             c
@@ -1404,9 +1461,11 @@ cCmd name outPath file =
     (print
        ("wrote "
         ^ outPath
-        ^ ": build it with `zig cc -O2 "
+        ^ ": build it with `zig build-obj -O ReleaseFast "
+        ^ zigOf outPath
+        ^ " -femit-bin=runtime.o` and `zig cc -O2 "
         ^ (if endsWith "/" outPath then outPath ^ "*.c" else outPath)
-        ^ " -o PROGRAM -lm`"))
+        ^ " runtime.o -o PROGRAM -lm`"))
 
 ranOut : Ran -> String
 ranOut r = r.out
@@ -1576,6 +1635,46 @@ wrote t path next = do
   print (t.said ^ " " ^ path)
   next
 
+-- (the files of `dir` among `names` whose names end so, each its path)
+endingIn : Path.Style -> String -> String -> List String -> List String
+endingIn st dir ending names =
+  List.map
+    (\n -> Path.join st dir n)
+    (List.filter (\n -> endsWith ending n) names)
+
+-- (zig's mode for the runtime's Zig, at the level the C is built at:
+-- `-O0` Debug and `-O1`, a build for the next change, ReleaseSafe, both
+-- with zig's checks of what the runtime does; `-Os` ReleaseSmall; `-O2`
+-- and `-O3` ReleaseFast)
+zigMode : List String -> String
+zigMode flags =
+  if List.any (\f -> strEq f "-O0") flags then "Debug"
+  else if List.any (\f -> strEq f "-O1") flags then "ReleaseSafe"
+  else if List.any (\f -> strEq f "-Os") flags then "ReleaseSmall"
+  else if List.any (\f -> strEq f "-O2" || strEq f "-O3") flags
+  then "ReleaseFast"
+  else "Debug"
+
+-- (each of the runtime's Zig files built by zig, in `mode`, into an
+-- object beside it, `F.o`, a task of `z`'s: the objects, or, where one
+-- could not be built, what zig said written, none)
+zigObjects : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> Progress.Task
+           -> String
+           -> List String
+           -> List String
+           -> Co e (Maybe (List String))
+zigObjects z mode Nil made = pure (Just (List.reverse made))
+zigObjects z mode (Cons f rest) made = do
+  o <- pure (strSlice f 0 (strLength f - 4) ^ ".o")
+  r <- Progress.runUnder z "zig" ["build-obj", f, "-O", mode, "-femit-bin=" ^ o]
+  if succeeded r then zigObjects z mode rest (Cons o made)
+    else do
+      writeErr (ranErr r)
+      pure Nothing
+
 -- (the C files of `dir`, a file a module, by `zig cc` given these flags
 -- (its level, and what else the program is built with) -- which builds
 -- them at once, and again only those that changed -- the program `out`:
@@ -1597,19 +1696,23 @@ zigBuildFlagsOr : {e : HFunctor}
                 -> Co e Unit
 zigBuildFlagsOr failed who st flags p dir out next = do
   names <- readDirectory dir
-  files <-
-    pure
-      (List.map
-         (\n -> Path.join st dir n)
-         (List.filter (\n -> endsWith ".c" n) (fromMaybe Nil names)))
-  z <- Progress.start p "zig cc" (List.length files + 1)
-  r <-
-    Progress.runUnder
-      z
-      "zig"
-      (Cons
-         "cc"
-         (List.append flags (Cons "-w" (List.append files ["-o", out, "-lm"]))))
+  files <- pure (endingIn st dir ".c" (fromMaybe Nil names))
+  zigs <- pure (endingIn st dir ".zig" (fromMaybe Nil names))
+  z <- Progress.start p "zig cc" (List.length files + List.length zigs + 1)
+  objects <- zigObjects z (zigMode flags) zigs Nil
+  r <- case objects of
+    Just os ->
+      Progress.runUnder
+        z
+        "zig"
+        (Cons
+           "cc"
+           (List.append
+              flags
+              (Cons
+                 "-w"
+                 (List.append files (List.append os ["-o", out, "-lm"])))))
+    Nothing -> pure { ended = NotRun, out = "", err = "" }
   Progress.end z
   if succeeded r then next
     else do
