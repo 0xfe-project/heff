@@ -2419,8 +2419,9 @@ watchItem w d = if strEq w.kind "doctest" then Doc d else Whole d
 -- field of a record built once, the knot, whose fields call the bodies,
 -- each given the knot as one more argument, first: in a body, a name of
 -- the block is its field of the knot given.  The knot's fields are
--- lambdas, so the knot is built before any body runs (a definition that
--- takes no argument is refused), and a body is checked as any
+-- lambdas, so the knot is built before any body runs (a definition whose
+-- type is no function's, so that its field's lambda is refused, is said
+-- by the elaborator to take no argument), and a body is checked as any
 -- definition's, its equations as written.
 --
 --   type M = { f1 : T1, ..., fn : Tn }    -- M, k, f1' ... fn' unspeakable
@@ -2433,19 +2434,8 @@ watchItem w d = if strEq w.kind "doctest" then Doc d else Whole d
 --
 -- The names made are of the first definition's, `Mutual#f1`,
 -- `mutual#f1`, and of each definition's, `fi#mutual`: the same wherever
--- the block is, and no name a text writes.
-
--- | the record type of the block whose first definition is `f1`
-knotType : String -> String
-knotType f1 = "Mutual#" ^ f1
-
--- | the knot of the block whose first definition is `f1`
-knotName : String -> String
-knotName f1 = "mutual#" ^ f1
-
--- | the body of the definition `f`, given the knot
-bodyName : String -> String
-bodyName f = f ^ "#mutual"
+-- the block is, and no name a text writes (the presyntax makes them, and
+-- says them as the text has them where one is shown).
 
 -- | the name of the block's first definition, the block's names made of
 firstSig : List CST.D -> Maybe String
@@ -2463,13 +2453,6 @@ type MutualDef =
   , eqns : List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
   , whole : Params.Span
   }
-
--- | is the type, past its implicit and instance arguments, a function's
-takesArgument : Presyntax.Expr -> Bool
-takesArgument (At (EPi (PiImplicit _ _ _ _ _) rest) _) = takesArgument rest
-takesArgument (At (EPi (PiInstance _ _ _ _) rest) _) = takesArgument rest
-takesArgument (At (EPi _ _) _) = True
-takesArgument _ = False
 
 -- | the block's definitions, in order (its items hold together: checked
 -- | before); a watch among them is kept where it is
@@ -2490,20 +2473,32 @@ mutualDefs (Cons (Sig _ f fsp ty sp) rest) = case eqnsUnder f rest of
 mutualDefs (Cons (Eqn _ _ _) rest) = mutualDefs rest
 mutualDefs (Cons it rest) = Cons (Left it) (mutualDefs rest)
 
--- (a definition that takes no argument: its field of the knot would be
--- computed while the knot is built)
-noArgumentDiag : Either Item MutualDef -> Maybe Diag
-noArgumentDiag (Right d) =
-  if takesArgument d.ty then Nothing
+-- | the equation of `f` whose patterns are not `n`, as its first's are
+unevenAt : String
+         -> Int
+         -> List (Params.Spanned (Presyntax.Equation Presyntax.Expr))
+         -> Maybe Diag
+unevenAt f n Nil = Nothing
+unevenAt f n (Cons (At (MkEquation _ _ pats _) sp) rest) =
+  if List.length pats == n then unevenAt f n rest
   else Just
       (diag
-         d.span
-         ("`"
-          ^ d.name
-          ^ "` takes no argument: a definition of a `mutual` block is a function, `"
-          ^ d.name
-          ^ " : A -> B`"))
-noArgumentDiag (Left _) = Nothing
+         sp
+         ("every equation of `"
+          ^ f
+          ^ "` has "
+          ^ show n
+          ^ " pattern(s), as its first: this one has "
+          ^ show (List.length pats)))
+
+-- (equations that differ in their patterns: refused as written, before
+-- the knot is each one's first pattern)
+unevenDiag : Either Item MutualDef -> Maybe Diag
+unevenDiag (Right d) = case d.eqns of
+  Nil -> Nothing
+  Cons (At (MkEquation _ _ pats _) _) rest ->
+    unevenAt d.name (List.length pats) rest
+unevenDiag (Left _) = Nothing
 
 -- | the field of the record type a definition is
 mutualField : MutualDef
@@ -2525,11 +2520,11 @@ mutualBody tyE k d =
   Whole
     (At
        (DeclEquations
-          (bodyName d.name)
+          (Presyntax.bodyName d.name)
           d.span
           AsDefinition
           (At (EPi (PiAnon tyE) d.ty) (Params.spanOf d.ty))
-          (List.map (\e -> knotEqn k (bodyName d.name) e) d.eqns))
+          (List.map (\e -> knotEqn k (Presyntax.bodyName d.name) e) d.eqns))
        d.whole)
 
 -- | a field of the knot: `f = \x -> f' k x`
@@ -2543,10 +2538,12 @@ knotField k d =
        d.span
        (At
           (ELam
-             (LamName "x#arg" d.span)
+             (LamName (Presyntax.argName d.name) d.span)
              (Presyntax.app
-                (At (EVar (bodyName d.name)) d.span)
-                [At (EVar k) d.span, At (EVar "x#arg") d.span]))
+                (At (EVar (Presyntax.bodyName d.name)) d.span)
+                [ At (EVar k) d.span
+                , At (EVar (Presyntax.argName d.name)) d.span
+                ]))
           d.span))
     d.span
 
@@ -2648,16 +2645,16 @@ mutualL r kw ds = case firstSig ds of
          (spanT kw)
          "a `mutual` block holds definitions, each a signature and its equations")
   Just f1 -> do
-    items <- mutualItems r (knotName f1) ds
-    case catMaybesS (List.map noArgumentDiag (mutualDefs items)) of
+    items <- mutualItems r (Presyntax.knotName f1) ds
+    case catMaybesS (List.map unevenDiag (mutualDefs items)) of
       Cons d _ -> throwP d
       Nil ->
         pure
           (mutualOut
              (spanT kw)
              (spanTE kw (lastDEnd ds kw.end))
-             (knotType f1)
-             (knotName f1)
+             (Presyntax.knotType f1)
+             (Presyntax.knotName f1)
              (mutualDefs items))
 
 -- | a declaration, lowered: what it is before signatures meet equations

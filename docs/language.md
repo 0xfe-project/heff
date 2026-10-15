@@ -106,9 +106,9 @@ mutual
 
 The block is a record of its definitions, built once before any of them
 runs, each called through it: so every definition of a block takes an
-argument, its signature a function's past its implicit and instance
-arguments (`ones : List Int` is refused), and a definition without a
-signature is an error.  A watch in the block is checked after the
+argument, its signature a function type, an alias of one as well
+(`ones : List Int` is refused), and a definition without a signature is
+an error.  A watch in the block is checked after the
 definitions above it; a doc test is of the definition under it.
 
 ## Records
