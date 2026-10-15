@@ -13,7 +13,13 @@ numbers, runes and strings, and effects.  How a project is laid out is in
 A module is a file under a project's `src/`, named by its path there:
 `src/parse/surface.hf` is `parse.surface`.  Modules are looked up there
 and in `lib/` (`std.io` is `lib/std/io.hf`); a file outside `src/` (a
-test) may also import files beside it, by their paths from the root.
+test) may also import files beside it, by their paths from the root
+(`test/helpers.hf` is `test.helpers`, `app/hello/main.hf` is
+`app.hello.main`).  Every file begins with a header naming its module
+so, first, before its imports: `module parse.surface` (E0156 where
+there is none, or it names the module otherwise).  A manifest --
+`package.hf`, a program's `build.hf` ([projects](projects.md)) -- is
+read as a literal, no module, and has none.
 A module found at more than one file -- a `list.hf` of the program's
 beside the library's -- is an error, and is loaded from neither: what
 is used of it is no error of its own, until one file is renamed.
@@ -57,10 +63,11 @@ code : Rune -> Int
 code r = Rune.toInt r   -- the module's `toInt`; `Rune` in the signature, the type
 ```
 
-A module may say what an importer sees of it by a header, first, before
-its imports: `module (x, T, U(..), (<+>))` lists some of its own
-definitions, each once (E0155), over as many lines as it takes.  With
-no header, a module exposes all it defines.  A name it does not list is
+A module may say what an importer sees of it by its header: `module
+parse.surface (x, T, U(..), (<+>))` lists some of its own definitions,
+each once (E0155), over as many lines as it takes.  A header that
+lists none, `module parse.surface`, exposes all the module defines.  A
+name it does not list is
 its own: an importer neither names it, as `x` or `M.x` (E0353, saying
 which module keeps it), nor finds it as an instance (an instance is
 found by the names in scope).  A data type listed bare, `T`, is seen
@@ -72,7 +79,7 @@ the type's, no name of the module's -- so `(..)` is only of a data type
 (E0155).  An operator is listed in parentheses.
 
 ```haskell
-module (Counter, counter, bump, count)
+module counter (Counter, counter, bump, count)
 
 data Counter = MkCounter Int   -- `MkCounter` is the module's alone
 
@@ -805,6 +812,8 @@ names the effects it needs as instance arguments, in any world that has
 them -- it can do nothing else -- and is given them where it runs:
 
 ```haskell
+module app.count.main
+
 import co
 import std.filesystem
 import std.io

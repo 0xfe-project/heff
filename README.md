@@ -17,6 +17,8 @@ distinction: types are computed at compile time, data at run time.
   tests and property tests, and packages fetched by git.
 
 ```haskell
+module hello
+
 import co
 import std.io
 

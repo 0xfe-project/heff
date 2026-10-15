@@ -1,7 +1,10 @@
--- The header of a file: what it exposes (`module (x, T, U(..))`, first,
--- if it says) and the `import m` lines, before its first declaration.
+-- The header of a file: its name and what it exposes (`module a.b (x,
+-- T, U(..))`, first; `module a.b` exposes all it defines) and the
+-- `import m` lines, before its first declaration.
 -- The text comes back with the header and the import lines blanked, so
 -- every offset stays where it was.
+
+module heff.syntax.import
 
 import heff.elab.params as Params
 
@@ -17,11 +20,17 @@ type Exposed = { name : String, tags : Bool, span : Params.Span }
 -- | what is wrong with a header, and where
 type HeaderError = { span : Params.Span, msg : String }
 
--- | what a module exposes, its header says: the names listed (with no
--- | header, all it defines), where the header is, and what is wrong
--- | with it
+-- | a module's header: its name, as the header says it (`module a.b`;
+-- | none where the header is a list alone, `module (x)`); what it
+-- | exposes, where `listed` -- the names listed, else all it defines;
+-- | where the header is, and what is wrong with it
 type Header =
-  { exposes : List Exposed, span : Params.Span, error : Maybe HeaderError }
+  { name : Maybe String
+  , listed : Bool
+  , exposes : List Exposed
+  , span : Params.Span
+  , error : Maybe HeaderError
+  }
 
 -- | the imports of a file: those it writes, after those it has without
 -- | writing them (`implicit`); its header; its text with the header and
@@ -242,9 +251,56 @@ entriesIn s open close =
   if skipWhite s (open + 1) close == close then MkPair Nil Nothing
   else entriesGo s (piecesGo s (open + 1) (open + 1) close 0 Nil) Nil
 
--- (a header from `i`, where a line starts `module`: up to the `)` that
--- closes its list, nothing after it on that line -- else no header, the
--- declarations' to read)
+-- (the end of the name from `i`: the characters a module's name is of)
+nameEnd : String -> Int -> Int
+nameEnd s i =
+  if i < strLength s && nameChar (byteAt s i) then nameEnd s (i + 1) else i
+
+-- (a header from `i`, named `name`, with its list at `open`, a `(`: up
+-- to the `)` that closes it, nothing after it on that line -- else no
+-- header, the declarations' to read)
+headerListed : String -> Int -> Maybe String -> Int -> Maybe Header
+headerListed src i name open = case closeOf src open 0 of
+  Just close ->
+    if strEq (trim (strSlice src (close + 1) (lineEndAt src (close + 1)))) ""
+    then case entriesIn src open close of
+      MkPair es err ->
+        Just
+          { name = name
+          , listed = True
+          , exposes = es
+          , span = { start = i, end = close + 1 }
+          , error = err
+          }
+    else Nothing
+  Nothing -> Nothing
+
+-- (a header from `i`, named: its list, where a `(` follows the name;
+-- else nothing after the name on its line, all the module defines
+-- exposed)
+headerNamed : String -> Int -> Int -> Int -> Maybe Header
+headerNamed src i j k =
+  withS
+    (strSlice src j k)
+    (\name ->
+       withI
+         (skipWhite src k (strLength src))
+         (\open ->
+            if open < strLength src && byteAt src open == 40
+            then headerListed src i (Just name) open
+            else if strEq (trim (strSlice src k (lineEndAt src k))) ""
+            then Just
+                { name = Just name
+                , listed = False
+                , exposes = Nil
+                , span = { start = i, end = k }
+                , error = Nothing
+                }
+            else Nothing))
+
+-- (a header from `i`, where a line starts `module`: its name, then its
+-- list if it has one, `module a.b (x, T)` -- or a list alone, `module
+-- (x, T)` -- else no header, the declarations' to read)
 headerAt : String -> Int -> Maybe Header
 headerAt src i =
   if strLength src > i + 6
@@ -252,29 +308,20 @@ headerAt src i =
      && not (identChar (byteAt src (i + 6)))
   then withI
       (skipWhite src (i + 6) (strLength src))
-      (\open ->
-         if open < strLength src && byteAt src open == 40
-         then case closeOf src open 0 of
-           Just close ->
-             if strEq
-                  (trim (strSlice src (close + 1) (lineEndAt src (close + 1))))
-                  ""
-             then case entriesIn src open close of
-               MkPair es err ->
-                 Just
-                   { exposes = es
-                   , span = { start = i, end = close + 1 }
-                   , error = err
-                   }
-             else Nothing
-           Nothing -> Nothing
-         else Nothing)
+      (\j ->
+         if j < strLength src && byteAt src j == 40
+         then headerListed src i Nothing j
+         else withI
+             (nameEnd src j)
+             (\k -> if k == j then Nothing else headerNamed src i j k))
   else Nothing
 
 -- (the header, but later than the first thing the file says)
 headerLate : Header -> Header
 headerLate h =
-  { exposes = h.exposes
+  { name = h.name
+  , listed = h.listed
+  , exposes = h.exposes
   , span = h.span
   , error =
       Just
@@ -356,23 +403,61 @@ errorSaid : Maybe HeaderError -> String
 errorSaid (Just err) = err.msg
 errorSaid Nothing = ""
 
--- | the names the header lists, if there is one
+-- | the names the header lists, if there is one (none listed, where it
+-- | names the module alone)
 -- | >>> headerNames (readImports "module (With, withFile, T (..), (<+>))\n\nimport co\n\nx : Int\nx = 1\n")
+-- | Just ["With", "withFile", "T", "<+>"]
+-- | >>> headerNames (readImports "module std.io (With, withFile, T (..), (<+>))\n\nimport co\n\nx : Int\nx = 1\n")
 -- | Just ["With", "withFile", "T", "<+>"]
 -- | >>> headerNames (readImports "-- a module\nmodule\n  ( a\n  , B(..)\n  )\nimport co\n")
 -- | Just ["a", "B"]
+-- | >>> headerNames (readImports "-- a module\nmodule a.b\n  ( a\n  , B(..)\n  )\nimport co\n")
+-- | Just ["a", "B"]
 -- | >>> headerNames (readImports "module ()\n")
 -- | Just []
+-- | >>> headerNames (readImports "module a.b\nimport co\n")
+-- | Just []
 -- | >>> headerNames (readImports "module = 1\n")
+-- | Nothing
+-- | >>> headerNames (readImports "module a.b = 1\n")
 -- | Nothing
 -- | >>> headerNames (readImports "module (x) = 1\n")
 -- | Nothing
 -- | >>> (readImports "module (a)\nimport co\nx = 1\n").text
 -- | "          \n         \nx = 1\n"
+-- | >>> (readImports "module a.b\nimport co\nx = 1\n").text
+-- | "          \n         \nx = 1\n"
 headerNames : Imports -> Maybe (List String)
 headerNames imps = case imps.header of
   Just h -> Just (List.map (\(x : Exposed) -> x.name) h.exposes)
   Nothing -> Nothing
+
+-- | the module's name, as its header says it, if it does
+-- | >>> headerName (readImports "module test.node.green-sockets (x)\n")
+-- | Just "test.node.green-sockets"
+-- | >>> headerName (readImports "module heff.build.load\n\nimport co\n")
+-- | Just "heff.build.load"
+-- | >>> headerName (readImports "module (x)\n")
+-- | Nothing
+-- | >>> headerName (readImports "import co\n")
+-- | Nothing
+headerName : Imports -> Maybe String
+headerName imps = case imps.header of
+  Just h -> h.name
+  Nothing -> Nothing
+
+-- | whether the header lists what the module exposes (else all it
+-- | defines is)
+-- | >>> headerLists (readImports "module a.b (x)\n")
+-- | True
+-- | >>> headerLists (readImports "module a.b\n")
+-- | False
+-- | >>> headerLists (readImports "x = 1\n")
+-- | False
+headerLists : Imports -> Bool
+headerLists imps = case imps.header of
+  Just h -> h.listed
+  Nothing -> False
 
 -- | what is wrong with the header, if anything
 -- | >>> headerError (readImports "module (a, , b)\n")

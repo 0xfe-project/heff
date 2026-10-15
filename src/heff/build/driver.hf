@@ -3,6 +3,8 @@
 -- there too, by key, but not in scope.  Sources are handed over in
 -- dependency order (`heff.build.load` finds them).
 
+module heff.build.driver
+
 import array as Array
 import heff.syntax.diagnostic
 import heff.util.dict as Dict
@@ -35,6 +37,7 @@ import std.map as Map
 -- | library's, the modules that declare primitives
 type Source =
   { module : String
+  , named : String
   , path : String
   , shown : String
   , source : String
@@ -96,6 +99,7 @@ elemStr x xs = List.elemBy strEq x xs
 givenAfter : List String -> String -> String -> String -> Bool -> Source
 givenAfter before m path src library =
   { module = m
+  , named = m
   , path = path
   , shown = path
   , source = src
@@ -212,10 +216,11 @@ exposedOwn c = exposedIn c.exposes c.own
 hiddenOwn : Checked -> List Own
 hiddenOwn c = hiddenIn c.exposes c.own
 
--- | the names a header lists, if the file has one
+-- | the names a header lists, if the file has one that lists them
+-- | (`module a.b (x, T)`; `module a.b` exposes all)
 exposesOf : Import.Imports -> Maybe (List Import.Exposed)
 exposesOf imps = case imps.header of
-  Just h -> Just h.exposes
+  Just h -> if h.listed then Just h.exposes else Nothing
   Nothing -> Nothing
 
 -- (the keys the module's header hides, and the data types whose tags it
@@ -945,11 +950,67 @@ headerErrorDiags : Maybe Import.HeaderError -> List Diag
 headerErrorDiags (Just err) = [headerDiag 154 err.span err.msg]
 headerErrorDiags Nothing = Nil
 
--- | what is wrong with a module's header
-headerDiags : Globals.Globals -> List Own -> Maybe Import.Header -> List Diag
-headerDiags g own (Just h) =
-  appendD (headerErrorDiags h.error) (exposedDiagsGo g own Nil h.exposes)
-headerDiags g own Nothing = Nil
+-- (the header names the module as its path does; one that names it
+-- otherwise, or not at all, is told the name)
+headerNameDiags : String -> Import.Header -> List Diag
+headerNameDiags modName h = case h.name of
+  Just n ->
+    if strEq n modName then Nil
+    else [ headerDiag
+           156
+           h.span
+           ("the header names the module `"
+            ^ n
+            ^ "`, but by its path it is `"
+            ^ modName
+            ^ "`: `module "
+            ^ modName
+            ^ "`")
+         ]
+  Nothing ->
+    [ headerDiag
+      156
+      h.span
+      ("a module's header names it, first: `module " ^ modName ^ "`")
+    ]
+
+-- | what is wrong with a module's header: no header, its name not the
+-- | module's, a name listed that is not its own or listed twice
+headerDiags : String
+            -> Globals.Globals
+            -> List Own
+            -> Maybe Import.Header
+            -> List Diag
+headerDiags modName g own (Just h) =
+  appendD
+    (headerErrorDiags h.error)
+    (appendD (headerNameDiags modName h) (exposedDiagsGo g own Nil h.exposes))
+headerDiags modName g own Nothing =
+  [ headerDiag
+    156
+    { start = 0, end = 0 }
+    ("no module header: a file begins with one, `module "
+     ^ modName
+     ^ "`, before its imports")
+  ]
+
+-- (a manifest -- package.hf, a program's build.hf -- is read as a
+-- literal, no module: it has no header)
+isManifest : String -> Bool
+isManifest path =
+  List.any
+    (\n -> strEq path n || endsWith ("/" ^ n) path)
+    ["package.hf", "build.hf"]
+
+-- | what is wrong with a module's header, unless the file is a manifest
+fileHeaderDiags : String
+                -> String
+                -> Globals.Globals
+                -> List Own
+                -> Maybe Import.Header
+                -> List Diag
+fileHeaderDiags path modName g own h =
+  if isManifest path then Nil else headerDiags modName g own h
 
 elabTop : Source
         -> Import.Imports
@@ -971,7 +1032,12 @@ elabTop s imps direct r t =
     (appendD
        (againDiags imps)
        (appendD
-          (headerDiags t.globals (ownOf s.module t.keys) imps.header)
+          (fileHeaderDiags
+             s.path
+             s.named
+             t.globals
+             (ownOf s.module t.keys)
+             imps.header)
           (List.map hint (appendD r.diags t.diags))))
     (ownOf s.module t.keys)
     (importNames imps.imports)
@@ -1305,7 +1371,7 @@ elabNext : List Checked -> Source -> Maybe Thawed -> Checked
 elabNext done s thaw = elabWith done s (importsOfSource s) thaw
 
 -- | the files of a program, each after what it imports, elaborated
--- | >>> List.length (checkProgram [{ module = "a", path = "a.hf", shown = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil, library = False }, { module = "b", path = "b.hf", shown = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil, library = False }])
+-- | >>> List.length (checkProgram [{ module = "a", named = "a", path = "a.hf", shown = "a.hf", source = "module a\n\none : Int\none = 1\n", renames = Nil, implicit = Nil, library = False }, { module = "b", named = "b", path = "b.hf", shown = "b.hf", source = "module b\n\nimport a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil, library = False }])
 -- | 2
 checkProgram : List Source -> List Checked
 checkProgram sources =
@@ -1418,7 +1484,7 @@ lastChecked (Cons c Nil) = Just c
 lastChecked (Cons c rest) = lastChecked rest
 
 -- | a definition's stored core, printed, from a checked program
--- | >>> programBody (checkProgram [{ module = "a", path = "a.hf", shown = "a.hf", source = "one : Int\none = 1\n", renames = Nil, implicit = Nil, library = False }, { module = "b", path = "b.hf", shown = "b.hf", source = "import a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil, library = False }]) "b" "b.two"
+-- | >>> programBody (checkProgram [{ module = "a", named = "a", path = "a.hf", shown = "a.hf", source = "module a\n\none : Int\none = 1\n", renames = Nil, implicit = Nil, library = False }, { module = "b", named = "b", path = "b.hf", shown = "b.hf", source = "module b\n\nimport a\n\ntwo : Int\ntwo = one\n", renames = Nil, implicit = Nil, library = False }]) "b" "b.two"
 -- | "(SIs (SGlobal \"a.one\"))"
 programBody : List Checked -> String -> String -> String
 programBody cs m k = case findChecked cs m of
@@ -2221,10 +2287,13 @@ importLines c =
        (\(a : AliasQ) -> "import " ^ a.module ^ " as " ^ a.alias ^ "\n")
        c.aliases)
 
--- (the header, as the file's interface lists it)
-headerLine : Maybe (List Import.Exposed) -> String
-headerLine (Just es) =
-  "module ("
+-- (the header, as the file's interface lists it: the module's name,
+-- and what it exposes where it lists it)
+headerLine : String -> Maybe (List Import.Exposed) -> String
+headerLine modName (Just es) =
+  "module "
+  ^ modName
+  ^ " ("
   ^ joinWith
     ", "
     (List.map
@@ -2232,7 +2301,7 @@ headerLine (Just es) =
           listedName e.name ^ (if e.tags then "(..)" else ""))
        es)
   ^ ")\n"
-headerLine Nothing = ""
+headerLine modName Nothing = "module " ^ modName ^ "\n"
 
 -- | a file's interface, what an importer sees: its header, imports and
 -- | fixity declarations, its types in full (`data`, `type`, `theory` --
@@ -2245,7 +2314,7 @@ interface c =
     "\n"
     (List.filter
        (\s -> not (strEq s ""))
-       [ headerLine c.exposes
+       [ headerLine c.module c.exposes
        , importLines c
        , fixityLines c.fixities 0 c.fixities.groups
        , (List.foldl
