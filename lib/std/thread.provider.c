@@ -70,12 +70,13 @@ static HEFF_TLS ThOpen *th_top;
 // (where a thread of a spread ends, its value left: at its start)
 static HEFF_TLS jmp_buf *th_end;
 
-typedef struct { V f, k; int i; ThSpread *sp; } ThStart;
+typedef struct { V f, k; int i; ThSpread *sp; char *dir; } ThStart;
 
 static void *th_spread_thread(void *u) {
   ThStart *s = u;
   ThSpread *sp = s->sp;
   int i = s->i;
+  heff_dir_take(s->dir);
   ThOpen o = { sp, i, NULL };
   th_top = &o;
   jmp_buf end;
@@ -109,6 +110,7 @@ static void th_spread(int n, V f, V k) {
   for (int i = 1; i < n; i++) {
     ThStart *s = heff_alloc(sizeof(ThStart));
     s->f = heff_dup(f); s->k = heff_dup(k); s->i = i; s->sp = sp;
+    s->dir = heff_dir_copy();
     if (heff_thread_start(&sp->tid[i], th_spread_thread, s) != 0) heff_fail("threads: cannot start a thread");
   }
 }
@@ -146,7 +148,7 @@ typedef struct {
   char **why;       // ... and why
 } ThJob;
 
-typedef struct { ThJob *j; int w; } ThSlot;
+typedef struct { ThJob *j; int w; char *dir; } ThSlot;
 
 static void th_work(ThJob *j, int w) {
   for (;;) {
@@ -167,6 +169,7 @@ static void th_work(ThJob *j, int w) {
 
 static void *th_work_thread(void *u) {
   ThSlot *s = u;
+  heff_dir_take(s->dir);
   th_work(s->j, s->w);
   heff_thread_end();
   return NULL;
@@ -211,7 +214,7 @@ static V th_pool(int64_t w, V f, V l) {
   pthread_t *tid = heff_alloc(sizeof(pthread_t) * (size_t)w);
   ThSlot *slots = heff_alloc(sizeof(ThSlot) * (size_t)w);
   for (i = 1; i < w; i++) {
-    slots[i].j = &j; slots[i].w = (int)i;
+    slots[i].j = &j; slots[i].w = (int)i; slots[i].dir = heff_dir_copy();
     if (heff_thread_start(&tid[i], th_work_thread, &slots[i]) != 0) heff_fail("threads: cannot start a thread");
   }
   th_work(&j, 0);

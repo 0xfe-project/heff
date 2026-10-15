@@ -537,6 +537,16 @@ waits for its other end, the whole program with it.  On Windows, links
 are not seen, a mode is only whether the owner may write, and every
 operation waits where it is.
 
+`std.process` is the program's process: its `args`, an environment
+variable (`getEnv`), its own path (`programPath`), its `platform` and
+how many `processors` the machine has, its end (`exit`), and its
+working directory -- `workingDir`, where every relative path the
+program gives the system is taken from, and `setWorkingDir`, which
+moves it (`True`, or `False` where there is no directory there).  The
+working directory is each place's own ([places](threads.md#places)):
+a place starts in its starter's, the main place in the process's, and
+moving one moves no other, nor the process's.
+
 `std.process` runs a command to its end (`run`), in the program's place
 (`exec`), or beside it, held by a `with` (`withProcess`).  `run`
 takes an `Invocation`, a record whose fields but `command` have
@@ -549,7 +559,8 @@ t <- run { command = "heff", args = ["test"], env = [MkPair "HEFF_TTY" "0"],
 ```
 
 - `args` (none), its arguments;
-- `dir` (`""`, the program's), the directory it runs in;
+- `dir` (`""`, the working directory), the directory it runs in, from
+  the working directory where it is relative;
 - `env` (none), environment variables set for it over the program's
   own, which it has too (the environment is never cleared);
 - `input` (`NoInput`), its standard input: `Given` a string, written

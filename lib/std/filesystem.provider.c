@@ -218,7 +218,7 @@ static V heff_fs_failed(V p) {
 // (an operation of whole files and paths: answered by a `Bool` or a
 // `Maybe`)
 static V heff_fs_whole(V p, V k) {
-  char *path = heff_cstr(heff_field(p, 0));
+  char *path = heff_path_in_place(heff_cstr(heff_field(p, 0)));
   V x;
   if (!path) {
     x = heff_fs_failed(p);
@@ -270,7 +270,7 @@ static V heff_fs_whole(V p, V k) {
     break;
   }
   case TAG_Copy: {
-    char *to = heff_cstr(heff_field(p, 1));
+    char *to = heff_path_in_place(heff_cstr(heff_field(p, 1)));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
     int ok = to && heff_nothing_at(to) && heff_copy_all(path, to);
@@ -279,7 +279,7 @@ static V heff_fs_whole(V p, V k) {
     break;
   }
   case TAG_Move: {
-    char *to = heff_cstr(heff_field(p, 1));
+    char *to = heff_path_in_place(heff_cstr(heff_field(p, 1)));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
     int ok = to && heff_nothing_at(to) && rename(path, to) == 0;
@@ -288,7 +288,7 @@ static V heff_fs_whole(V p, V k) {
     break;
   }
   case TAG_Replace: {
-    char *to = heff_cstr(heff_field(p, 1));
+    char *to = heff_path_in_place(heff_cstr(heff_field(p, 1)));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
     // (rename(2) puts a file in place of another at once; Windows' does
@@ -932,10 +932,12 @@ static V fs_answered(V p, int at, V x, V k) {
   return heff_tail(k, 1, &y);
 }
 
+// (a path given to the system is from this place's directory, which
+// is the place's own, not the process's)
 static V heff_provider_filesystem(V p, V k) {
   switch (heff_tag_of(p)) {
   case TAG_PathStatus: {
-    char *path = heff_cstr(heff_field(p, 0));
+    char *path = heff_path_in_place(heff_cstr(heff_field(p, 0)));
     int follow = heff_field(p, 1) == NTAG(TAG_True);
     V r;
     if (!path) r = fs_left(EINVAL);
@@ -948,14 +950,14 @@ static V heff_provider_filesystem(V p, V k) {
     return fs_answered(p, 2, r, k);
   }
   case TAG_SetMode: {
-    char *path = heff_cstr(heff_field(p, 0));
+    char *path = heff_path_in_place(heff_cstr(heff_field(p, 0)));
     int64_t mode;
     V r = !path || !fs_int(heff_field(p, 1), &mode) ? fs_left(EINVAL) : fs_set_mode(path, mode);
     free(path);
     return fs_answered(p, 2, r, k);
   }
   case TAG_RealPath: {
-    char *path = heff_cstr(heff_field(p, 0));
+    char *path = heff_path_in_place(heff_cstr(heff_field(p, 0)));
     V r = path ? fs_real_path(path) : fs_left(EINVAL);
     free(path);
     return fs_answered(p, 1, r, k);
@@ -965,7 +967,7 @@ static V heff_provider_filesystem(V p, V k) {
   case TAG_TemporaryFile:
     return fs_answered(p, 1, fs_temp(heff_field(p, 0), 1), k);
   case TAG_OpenPath: {
-    char *path = heff_cstr(heff_field(p, 0));
+    char *path = heff_path_in_place(heff_cstr(heff_field(p, 0)));
     int64_t access, mode;
     int ok = path && fs_int(heff_field(p, 1), &access) && fs_int(heff_field(p, 5), &mode);
     V r = !ok ? fs_left(EINVAL)

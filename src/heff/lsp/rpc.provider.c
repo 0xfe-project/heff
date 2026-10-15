@@ -135,8 +135,7 @@ static V rpc_await(int64_t ms) {
 
 static char *rpc_resolve(const char *p) {
   Buf b = {0};
-  char cwd[4096];
-  if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+  const char *cwd = heff_place_dir();
 #ifdef _WIN32
   int drive = p[0] && p[1] == ':';
   if (drive && rpc_is_sep(p[2])) buf_str(&b, p);

@@ -35,6 +35,7 @@
 // made where it is (`heff_call`), not through `heff_apply`.
 
 #ifdef _WIN32
+#include <direct.h>
 #include <fcntl.h>
 #include <io.h>
 #include <malloc.h>
@@ -43,8 +44,8 @@
 #include <windows.h>
 #else
 #include <alloca.h>
+#include <fcntl.h>
 #include <poll.h>
-#include <spawn.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -59,6 +60,7 @@ extern char **environ;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // (a float's operations each rounded, as JavaScript's are: none of them
 // fused into another, `a * b + c` into an FMA -- the program's own,
@@ -3669,6 +3671,141 @@ HEFF_FN void heff_put(FILE *f, V v) {
   if (s->len) fwrite(s->p, 1, (size_t)s->len, f);
 }
 
+// The working directory: each place's own (#97)
+// ---------------------------------------------------------------------
+//
+// The system has one working directory a process, and a place is one
+// thread of its process; so the runtime keeps a directory for each
+// thread (`heff_dir`): the process's own, asked for once, in the
+// program's thread; its starter's, copied, in a place or a thread a
+// provider starts (`heff_dir_copy`, given to the started thread by
+// `heff_dir_take`); another, by std.process's `setWorkingDir`, for
+// that place alone.  A provider gives the system every relative path
+// under it (`heff_path_in_place`), and never changes the process's --
+// but in a command started, between its fork and its exec
+// (`heff_exec_in_place`).
+HEFF_VAR(HEFF_TLS char *heff_dir);
+
+extern size_t heff_path_under(const uint8_t *dir, size_t dn, const uint8_t *path, size_t pn, int windows, uint8_t *out);
+
+#ifdef _WIN32
+#define HEFF_WINDOWS 1
+#else
+#define HEFF_WINDOWS 0
+#endif
+
+// (`s` copied, malloc'd)
+HEFF_FN char *heff_strdup(const char *s) {
+  size_t n = strlen(s) + 1;
+  char *c = heff_alloc(n);
+  memcpy(c, s, n);
+  return c;
+}
+
+// (this thread's working directory)
+HEFF_FN const char *heff_place_dir(void) {
+  if (!heff_dir) {
+    char buf[4096];
+#ifdef _WIN32
+    const char *d = _getcwd(buf, sizeof buf);
+#else
+    const char *d = getcwd(buf, sizeof buf);
+#endif
+    heff_dir = heff_strdup(d ? d : ".");
+  }
+  return heff_dir;
+}
+
+// (this thread's working directory, copied for a thread it starts)
+HEFF_FN char *heff_dir_copy(void) {
+  return heff_strdup(heff_place_dir());
+}
+
+// (`dir`, malloc'd, made this thread's working directory: its now)
+HEFF_FN void heff_dir_take(char *dir) {
+  free(heff_dir);
+  heff_dir = dir;
+}
+
+// (`path`, malloc'd, as the system is to be given it from this place:
+// under the place's directory where it is relative; `path` freed, the
+// path given back malloc'd -- NULL stays NULL)
+HEFF_FN char *heff_path_in_place(char *path) {
+  if (!path) return NULL;
+  const char *dir = heff_place_dir();
+  size_t dn = strlen(dir), pn = strlen(path);
+  char *out = heff_alloc(dn + pn + 2);
+  size_t n = heff_path_under((const uint8_t *)dir, dn, (const uint8_t *)path, pn, HEFF_WINDOWS, (uint8_t *)out);
+  out[n] = 0;
+  free(path);
+  return out;
+}
+
+// (`dir`, malloc'd, from this place, made the place's working
+// directory, as the system names it (its links resolved): 1; or 0
+// where it is no directory there, the place's as it was.  `dir`
+// consumed)
+HEFF_FN int heff_place_dir_set(char *dir) {
+  char *p = heff_path_in_place(dir);
+  struct stat st;
+  int ok = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+  if (!ok) { free(p); return 0; }
+#ifdef _WIN32
+  char *r = _fullpath(NULL, p, 0);
+#else
+  char *r = realpath(p, NULL);
+#endif
+  if (r) { free(p); p = r; }
+  heff_dir_take(p);
+  return 1;
+}
+
+#ifndef _WIN32
+// (the command `as` -- its name found on the PATH -- forked and exec'd
+// in this place's directory, its standard streams `in`, `out` and
+// `err` where each is not -1, the descriptors `closed` closed in it,
+// its environment `env` where not NULL: its pid, or -1 where it could
+// not be run -- not found, not a program, the directory gone -- `errno`
+// why, as the child says through a pipe its exec closes)
+HEFF_FN pid_t heff_exec_in_place(char **as, char **env, int in, int out, int err, const int *closed, int nclosed) {
+  int px[2];
+  if (pipe(px) != 0) return -1;
+  fcntl(px[0], F_SETFD, FD_CLOEXEC);
+  fcntl(px[1], F_SETFD, FD_CLOEXEC);
+  const char *dir = heff_place_dir();
+  fflush(stdout);
+  fflush(stderr);
+  pid_t pid = fork();
+  if (pid == 0) {
+    // (the child: nothing but what is safe after a fork)
+    int e;
+    if ((in >= 0 && dup2(in, 0) < 0) || (out >= 0 && dup2(out, 1) < 0) || (err >= 0 && dup2(err, 2) < 0)) goto failed;
+    for (int i = 0; i < nclosed; i++) close(closed[i]);
+    if (chdir(dir) != 0) goto failed;
+    if (env) environ = env;
+    execvp(as[0], as);
+  failed:
+    e = errno;
+    (void)!write(px[1], &e, sizeof e);
+    _exit(127);
+  }
+  close(px[1]);
+  int e = 0;
+  if (pid > 0) {
+    ssize_t got;
+    while ((got = read(px[0], &e, sizeof e)) < 0 && errno == EINTR) {}
+    if (got > 0) {
+      int st;
+      while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+      pid = -1;
+    }
+  } else e = errno;
+  close(px[0]);
+  if (pid < 0) errno = e;
+  return pid;
+}
+#endif
+
 // `Bytes` cross by these alone, as they are: in, `n` bytes copied, by
 // `heff_bytes_in`; out, read where they are kept, `*n` of them, by
 // `heff_bytes_data` (the value not consumed, its bytes there as long as
@@ -3840,6 +3977,8 @@ HEFF_FN void heff_thread_end(void) {
   free(heff_dead);
   heff_dead = NULL;
   heff_ndead = heff_cdead = 0;
+  free(heff_dir);
+  heff_dir = NULL;
 #ifdef HEFF_THREADS
   free(heff_open);
   heff_open = NULL;
@@ -4430,6 +4569,7 @@ HEFF_FN int heff_chan_fd(HeffChan *ch) {
 typedef struct {
   pthread_t tid;
   HeffMsg *in, *out;
+  char *dir;          // (its working directory, its starter's at first)
   char *why;
   int joined;
   int fd[2];          // (a pipe, a byte in it once the place has ended:
@@ -4444,6 +4584,8 @@ HEFF_FN V heff_kept(V self, V *a);
 // then given back or abandoned, as any thread's)
 HEFF_FN void *heff_place_run(void *u) {
   HeffPlace *p = u;
+  heff_dir_take(p->dir);
+  p->dir = NULL;
   V c = heff_msg_value(p->in);
   p->in = NULL;
   V r;
@@ -4481,6 +4623,7 @@ HEFF_FN V heff_place_start(V c) {
   HeffPlace *p = heff_alloc(sizeof *p);
   p->in = heff_msg_of(c);
   p->out = NULL;
+  p->dir = heff_dir_copy();
   p->why = NULL;
   p->joined = 0;
   p->fd[0] = p->fd[1] = -1;
@@ -5064,7 +5207,7 @@ HEFF_FN HANDLE heff_spawn(char **as, HANDLE out, HANDLE err) {
   si.hStdOutput = out;
   si.hStdError = err;
   PROCESS_INFORMATION pi;
-  int ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+  int ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, NULL, heff_place_dir(), &si, &pi);
   free(line);
   if (!ok) return 0;
   CloseHandle(pi.hThread);
@@ -5126,15 +5269,9 @@ HEFF_FN int64_t heff_capture(char **as, Buf *bo, Buf *be) {
 #else
   int po[2], pe[2];
   if (pipe(po) == 0 && pipe(pe) == 0) {
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, po[1], 1);
-    posix_spawn_file_actions_adddup2(&fa, pe[1], 2);
-    posix_spawn_file_actions_addclose(&fa, po[0]);
-    posix_spawn_file_actions_addclose(&fa, pe[0]);
-    pid_t pid;
-    int ok = posix_spawnp(&pid, as[0], &fa, NULL, as, environ) == 0;
-    posix_spawn_file_actions_destroy(&fa);
+    int closed[2] = { po[0], pe[0] };
+    pid_t pid = heff_exec_in_place(as, NULL, -1, po[1], pe[1], closed, 2);
+    int ok = pid > 0;
     close(po[1]);
     close(pe[1]);
     heff_read_both(po[0], pe[0], bo, be);

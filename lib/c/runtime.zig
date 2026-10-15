@@ -467,3 +467,63 @@ export fn heff_bits_little(u: u64, n: i64, out: c_int) u64 {
     }
     return w;
 }
+
+// A path under a place's working directory (#97)
+// ---------------------------------------------------------------------
+//
+// The system has one working directory a process, and a place is one
+// thread of its process; so the C half keeps a directory for each
+// place, and gives the system each relative path under it, joined by
+// `heff_path_under`: the join `std.path` does, less its tidying of `.`
+// and `..`, which the system does against the directories as they are,
+// links and all.
+
+fn isSep(c: u8, windows: bool) bool {
+    return c == '/' or (windows and c == '\\');
+}
+
+/// How much of `p` is its drive, in the Windows style: `C:`, or
+/// `//server/share` with either slash; 0 where it has none.
+fn driveLen(p: []const u8) usize {
+    if (p.len >= 2 and p[1] == ':' and std.ascii.isAlphabetic(p[0])) return 2;
+    if (p.len >= 3 and isSep(p[0], true) and isSep(p[1], true) and !isSep(p[2], true)) {
+        var i: usize = 2;
+        while (i < p.len and !isSep(p[i], true)) : (i += 1) {}
+        if (i == p.len) return 0;
+        i += 1;
+        while (i < p.len and !isSep(p[i], true)) : (i += 1) {}
+        return i;
+    }
+    return 0;
+}
+
+/// `path` as the system is to be given it from the directory `dir`,
+/// written to `out` (room for both and a separator): how much of it.
+/// `path` as it is where it is absolute, where it is empty (an error
+/// the system's) or, in the Windows style, where it names a drive --
+/// `C:x` too, which the system takes from that drive's own directory;
+/// `dir`'s drive before it where it starts at a root; else `dir`, a
+/// separator and `path`.
+export fn heff_path_under(dir: [*]const u8, dn: usize, path: [*]const u8, pn: usize, windows: c_int, out: [*]u8) usize {
+    const d = dir[0..dn];
+    const p = path[0..pn];
+    const win = windows != 0;
+    if (p.len == 0 or d.len == 0 or (win and driveLen(p) > 0) or (!win and p[0] == '/')) {
+        @memcpy(out[0..p.len], p);
+        return p.len;
+    }
+    if (win and isSep(p[0], true)) {
+        const k = driveLen(d);
+        @memcpy(out[0..k], d[0..k]);
+        @memcpy(out[k..][0..p.len], p);
+        return k + p.len;
+    }
+    @memcpy(out[0..d.len], d);
+    var n = d.len;
+    if (!isSep(d[d.len - 1], win)) {
+        out[n] = if (win) '\\' else '/';
+        n += 1;
+    }
+    @memcpy(out[n..][0..p.len], p);
+    return n + p.len;
+}
