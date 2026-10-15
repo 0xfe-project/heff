@@ -447,7 +447,11 @@ cpu = do
 
 -- (`handOver R W`: R rounds, each W lists of 100,000 made by W places
 -- and sent to this one, which sums them -- a round at a time, each place
--- told to go, as the pool of std.thread hands over round by round)
+-- told to go on a channel of its own, as the pool of std.thread hands
+-- over round by round.  Each told on its own channel: told on one for
+-- all, a quick place takes two turns of a round and a slow one none,
+-- and the sum is off by the difference of their lists, though every
+-- list crossed whole)
 madeThere : Int -> List Int
 madeThere i = List.range i (i + 99999)
 
@@ -463,16 +467,32 @@ sender go ch i = do
       sendPlace ch (madeThere i)
       sender go ch i
 
+-- (a sender: its place, and the channel it is told on)
+data Sender = MkSender (Place Unit) (PlaceChannel Int)
+
 senders : {{pl : places <: world}}
-        -> PlaceChannel Int
         -> PlaceChannel (List Int)
         -> Int
-        -> Co world (List (Place Unit))
-senders go ch 0 = pure Nil
-senders go ch w = do
+        -> Co world (List Sender)
+senders ch 0 = pure Nil
+senders ch w = do
+  go <- newPlaceChannel
   p <- spawnPlace (sender go ch (w - 1))
-  ps <- senders go ch (w - 1)
-  pure (p :: ps)
+  ps <- senders ch (w - 1)
+  pure (MkSender p go :: ps)
+
+-- (every sender told `r`)
+tellEach : {{pl : places <: world}} -> Int -> List Sender -> Co world Unit
+tellEach r Nil = pure MkUnit
+tellEach r (MkSender p go :: ss) = do
+  sendPlace go r
+  tellEach r ss
+
+joinSenders : {{pl : places <: world}} -> List Sender -> Co world Unit
+joinSenders Nil = pure MkUnit
+joinSenders (MkSender p go :: ss) = do
+  joinPlace p
+  joinSenders ss
 
 recvLists : {{pl : places <: world}}
           -> PlaceChannel (List Int)
@@ -485,30 +505,27 @@ recvLists ch n acc = do
   recvLists ch (n - 1) (acc + List.sum xs)
 
 rounds : {{pl : places <: world}}
-       -> PlaceChannel Int
+       -> List Sender
        -> PlaceChannel (List Int)
        -> Int
        -> Int
-       -> Int
        -> Co world Int
-rounds go ch w 0 acc = pure acc
-rounds go ch w r acc = do
-  sendEach go (List.replicate w r)
-  s <- recvLists ch w 0
-  rounds go ch w (r - 1) (acc + s)
+rounds ss ch 0 acc = pure acc
+rounds ss ch r acc = do
+  tellEach r ss
+  s <- recvLists ch (List.length ss) 0
+  rounds ss ch (r - 1) (acc + s)
 
 handArgs : {{io : stdio <: world}}
          -> {{pl : places <: world}}
          -> List String
          -> Co world Unit
 handArgs (r :: w :: _) = do
-  go <- newPlaceChannel
   ch <- newPlaceChannel
-  width <- pure (fromMaybe 2 (parseInt w))
-  ps <- senders go ch width
-  s <- rounds go ch width (fromMaybe 0 (parseInt r)) 0
-  sendEach go (List.replicate width 0)
-  joinEach ps
+  ss <- senders ch (fromMaybe 2 (parseInt w))
+  s <- rounds ss ch (fromMaybe 0 (parseInt r)) 0
+  tellEach 0 ss
+  joinSenders ss
   print ("handed over: " ^ show s)
 handArgs _ = print "handOver ROUNDS W"
 
@@ -516,6 +533,96 @@ handOver : Co world Unit
 handOver = do
   as <- args (ev := \p -> InR (InL p))
   handArgs (io := \p -> InL p) (pl := \p -> InR (InR (InR p))) as
+
+-- Stressed: many places sending on one channel at once ------------------------------------
+
+-- (`stress W K`: W places each sending K messages on one channel as
+-- fast as they can, this place receiving them all and checking each --
+-- its sender's number, its number from that sender, a list made of
+-- them and a string long enough to be moved, not copied -- so that a
+-- message duplicated, lost, out of order or changed in the channel or
+-- in the crossing shows, under load above all)
+data Msg = MkMsg Int Int (List Int) String
+
+-- | the string of message `n` of sender `w`: longer than the allocator
+-- | keeps in a page, so that it crosses moved where the sender held it
+-- | alone
+stressString : Int -> Int -> String
+stressString w n = joinWith "" (List.replicate (n % 7 + 40) (show (1000 + w)))
+
+stressSend : {{pl : places <: world}}
+           -> PlaceChannel Msg
+           -> Int
+           -> Int
+           -> Int
+           -> Co world Unit
+stressSend ch w k n =
+  if n == k then pure MkUnit
+  else do
+    sendPlace ch (MkMsg w n (List.range n (n + w)) (stressString w n))
+    stressSend ch w k (n + 1)
+
+stressSenders : {{pl : places <: world}}
+              -> PlaceChannel Msg
+              -> Int
+              -> Int
+              -> Co world (List (Place Unit))
+stressSenders ch k 0 = pure Nil
+stressSenders ch k w = do
+  p <- spawnPlace (stressSend ch (w - 1) k 0)
+  ps <- stressSenders ch k (w - 1)
+  pure (p :: ps)
+
+-- (`xs` with its `i`th made `v`)
+setAt : Int -> Int -> List Int -> List Int
+setAt i v Nil = Nil
+setAt i v (x :: xs) = if i == 0 then v :: xs else x :: setAt (i - 1) v xs
+
+-- | a message checked against the number last had from each sender:
+-- | what is wrong with it, or the numbers with its own
+checked : List Int -> Msg -> Either String (List Int)
+checked lasts (MkMsg w n xs s) =
+  if n /= nthOr w lasts + 1
+  then Left
+      ("sender " ^ show w ^ ": " ^ show n ^ " after " ^ show (nthOr w lasts))
+  else if not (strEq (showInts xs) (showInts (List.range n (n + w))))
+  then Left
+      ("sender " ^ show w ^ ", message " ^ show n ^ ": the list " ^ showInts xs)
+  else if not (strEq s (stressString w n))
+  then Left ("sender " ^ show w ^ ", message " ^ show n ^ ": the string " ^ s)
+  else Right (setAt w n lasts)
+
+-- (`n` messages received and checked: the first thing wrong, if any)
+stressRecv : {{pl : places <: world}}
+           -> PlaceChannel Msg
+           -> Int
+           -> List Int
+           -> Co world (Maybe String)
+stressRecv ch 0 lasts = pure Nothing
+stressRecv ch n lasts = do
+  m <- recvPlace ch
+  case checked lasts m of
+    Left why -> pure (Just why)
+    Right next -> stressRecv ch (n - 1) next
+
+stressArgs : {{io : stdio <: world}}
+           -> {{pl : places <: world}}
+           -> List String
+           -> Co world Unit
+stressArgs (w :: k :: _) = do
+  ch <- newPlaceChannel
+  width <- pure (fromMaybe 4 (parseInt w))
+  count <- pure (fromMaybe 100 (parseInt k))
+  ps <- stressSenders ch count width
+  wrong <- stressRecv ch (width * count) (List.replicate width (0 - 1))
+  joinEach ps
+  print (fromMaybe (show (width * count) ^ " messages, all as sent") wrong)
+stressArgs _ = print "stress W K"
+
+stress : Co world Unit
+stress = do
+  as <- args (ev := \p -> InR (InL p))
+  stressArgs (io := \p -> InL p) (pl := \p -> InR (InR (InR p))) as
 
 -- (`worker WORK N I W`: the tasks of WORK of N numbered I, I+W, ...,
 -- done here, their sum said -- one process a worker, for comparison)

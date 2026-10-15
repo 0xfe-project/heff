@@ -294,7 +294,50 @@ program = do
   std.reactor's (green threads scheduled by `Reactor.scheduled`): then
   it is pending, a wait of the reactor's, the other green threads of
   the place going on, and the thread that received runs on once
-  something is sent.
+  something is sent.  A join is the same: blocking, or pending until
+  the place has ended.
+
+### Green threads in a place
+
+The reactor is each thread's own, so each place has one, the main
+place included, and a place's scheduler drives it: a place that runs
+`Reactor.scheduled` runs green threads whose waits are all pending in
+that place's reactor -- a receive on a place channel, a place joined, a
+command of std.process waited for or read from, a socket of std.net, a
+request of std.http, a sleep of std.time -- the other green threads of
+the place going on meanwhile, and the place's OS thread blocked only
+when every thread of it waits, in one `poll` of everything they wait
+for.  Nothing of one place's reactor is touched by another: a send
+from another place wakes the receiver through the channel's pipe, a
+place ending wakes its joiner through its own, and the rest is the
+place's alone, so there is no lock on the way.  A place with no
+scheduler waits where it is, the whole place with it, as a program with
+no scheduler does.
+
+What a wait costs: a pending wait is a struct of its provider's, linked
+in the place's reactor, and one descriptor in the reactor's `poll` --
+a channel's pipe (made when a receive first pends on it, kept for the
+channel's life), a place's pipe (made with the place, closed at the
+join), a command's pipes and the descriptor that says it exited, a
+socket; a sleep has none, only a deadline, which bounds the poll.  A
+turn of the reactor is one `poll` and a walk over the pending waits:
+a thread that waits costs the others nothing until something comes for
+it.
+
+```haskell
+-- in a place's scheduler: three threads, each waiting for something
+-- else, and the rest going on
+spawn (do
+  sleep 600
+  print "slept")
+spawn (do
+  n <- recvPlace asks
+  print ("received " ^ show n))
+spawn (do
+  r <- withProcess { command = "sleep", args = ["1.2"] } (\p -> wait p)
+  print "the command ended")
+print "went on meanwhile"
+```
 
 ### How a value crosses
 
@@ -448,7 +491,11 @@ ms in a program not built for threads).
 `failing`, `failingTask`, `cpu` and `handOver`) and the places test
 beside it (places spawned, joined and nested; every kind of value over
 a channel; a pool over channels; long strings moved and copied; a place
-abandoning; a receive pending in green threads; `cpu`, `handOver`);
+abandoning; a receive pending in green threads; `cpu`, `handOver`;
+`stress`, eight places sending 2000 messages each on one channel,
+every one checked as sent) and the test of green threads in a place
+(a sleep, a receive, a command and a join, each pending in the place's
+reactor while the others go on);
 with `HEFF_SANITIZE=1` under
 AddressSanitizer (`make sanitize`), and with `HEFF_TSAN=1` again under
 ThreadSanitizer (`make tsan`), built by the system's clang.
