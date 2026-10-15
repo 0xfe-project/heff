@@ -26,11 +26,11 @@ import heff.syntax.import as Import
 import json as Json
 import regex as Regex
 import std.filesystem
-import std.handle
 import std.io
 import std.path as Path
 import std.process
 import std.progress as Progress
+import std.reactor as Reactor
 import std.time as Time
 import std.map as Map
 
@@ -3326,9 +3326,6 @@ subtestJobs sel j k (Cons n rest) =
       (subtestJobs sel j (k + 1) rest)
   else subtestJobs sel j (k + 1) rest
 
--- | an integration test running: its program, and its directory
-type Running = { job : Job, proc : Subprocess, dir : String }
-
 -- (what came of a test, of its file, at its place, and its subtests to
 -- run next)
 type Finished =
@@ -3338,127 +3335,122 @@ type Finished =
   , next : List Job
   }
 
--- (the test's program started, in a new directory of its own, given its
--- time limit, in a process group of its own, so that what it starts is
--- killed with it; else what came of it)
-startJob : {e : HFunctor}
-         -> {{sys : process <: e}}
-         -> {{disk : filesystem <: e}}
-         -> Job
-         -> Co e (Either Finished Running)
-startJob j = do
-  made <- temporaryDirectory "heff-test-"
-  case made of
-    Left err ->
-      pure
-        (Left
-           { owner = j.owner
-           , place = j.place
-           , outcome =
-               brokenTest (jobName j) ("no directory for it: " ^ err.message)
-           , next = Nil
-           })
-    Right dir -> do
-      started <-
-        start
-          { command = j.launch.program
-          , args = Cons j.top j.path
-          , dir = dir
-          , env = Cons (MkPair outcomeVariable (outcomeFile dir)) j.launch.env
-          , timeout = j.limit
-          , group = True
-          }
-      case started of
-        Nothing -> do
-          gone <- remove dir
-          pure
-              (Left
-                 { owner = j.owner
-                 , place = j.place
-                 , outcome =
-                     brokenTest (jobName j) "its program could not be run"
-                 , next = Nil
-                 })
-        Just proc -> pure (Right { job = j, proc = proc, dir = dir })
+-- (a test that could not be run: what came of it)
+brokenJob : Job -> String -> Finished
+brokenJob j why =
+  { owner = j.owner
+  , place = j.place
+  , outcome = brokenTest (jobName j) why
+  , next = Nil
+  }
 
-runningWith : Either Finished Running -> List Running -> List Running
-runningWith (Right r) rs = Cons r rs
-runningWith (Left f) rs = rs
-
-finishedWith : Either Finished Running -> List Finished -> List Finished
-finishedWith (Left f) fs = Cons f fs
-finishedWith (Right r) fs = fs
-
--- (the test whose program ended, its directory removed: what came of it,
--- and its subtests selected, to run next)
+-- (the test's program ended, its directory removed: what came of it, and
+-- its subtests selected, to run next)
 endedJob : {e : HFunctor}
          -> {{disk : filesystem <: e}}
          -> List Regex.Regex
-         -> List Running
-         -> Maybe (Pair Subprocess Ran)
-         -> Co e (List Finished)
-endedJob sel rs Nothing = pure Nil
-endedJob sel rs (Just (MkPair proc ran)) = case List.find
-    (\(r : Running) -> sameHandle r.proc proc)
-    rs of
-  Nothing -> pure Nil
-  Just r -> do
-    gone <- remove r.dir
-    said <- readFile (outcomeFile r.dir)
-    told <- remove (outcomeFile r.dir)
-    pure
-        [ { owner = r.job.owner
-          , place = r.job.place
-          , outcome = ranOutcome (jobName r.job) r.job.limit ran said
-          , next = subtestJobs sel r.job 0 (ranSubtests said)
-          }
-        ]
+         -> Job
+         -> String
+         -> Ran
+         -> Co e Finished
+endedJob sel j dir ran = do
+  gone <- remove dir
+  said <- readFile (outcomeFile dir)
+  told <- remove (outcomeFile dir)
+  pure
+      { owner = j.owner
+      , place = j.place
+      , outcome = ranOutcome (jobName j) j.limit ran said
+      , next = subtestJobs sel j 0 (ranSubtests said)
+      }
 
-stillRunning : List Running -> Maybe (Pair Subprocess Ran) -> List Running
-stillRunning rs Nothing = Nil
-stillRunning rs (Just (MkPair proc ran)) =
-  List.filter (\(r : Running) -> not (sameHandle r.proc proc)) rs
+-- (the test's program run in the directory, given its time limit, in a
+-- process group of its own, so that what it starts is killed with it:
+-- held by a `with`, waited for -- a wait pending in the reactor's group
+-- it is started in, the other tests going on -- then what came of it)
+ranJob : {e : HFunctor}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> List Regex.Regex
+       -> Job
+       -> String
+       -> Co e Finished
+ranJob sel j dir = do
+  ran <-
+    withProcess
+      { command = j.launch.program
+      , args = Cons j.top j.path
+      , dir = dir
+      , env = Cons (MkPair outcomeVariable (outcomeFile dir)) j.launch.env
+      , timeout = j.limit
+      , group = True
+      }
+      (\p -> wait p)
+  case ran of
+    Left err -> do
+      gone <- remove dir
+      pure (brokenJob j ("its program could not be run: " ^ err.message))
+    Right r -> endedJob sel j dir r
+
+-- (the test run, in a new directory of its own; else what came of it)
+runJob : {e : HFunctor}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> List Regex.Regex
+       -> Job
+       -> Co e Finished
+runJob sel j = do
+  made <- temporaryDirectory "heff-test-"
+  case made of
+    Left err -> pure (brokenJob j ("no directory for it: " ^ err.message))
+    Right dir -> ranJob sel j dir
 
 -- (the subtests the tests that ended named, to run next)
 nextJobs : List Finished -> List Job
 nextJobs fs = List.concatMap (\(f : Finished) -> f.next) fs
 
 -- | the integration tests run, of all the files, `jobs` at most at once,
--- | each its program in a directory of its own: as one ends, the next
--- | starts, and the subtests it named, those `sel` selects, wait after
--- | the others
+-- | each its program in a directory of its own, each a computation
+-- | started in the reactor's group `g` -- pending there while its
+-- | program runs, `pending` of them -- as one ends, the next starts, and
+-- | the subtests it named, those `sel` selects, wait after the others
 runJobs : {e : HFunctor}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{rx : Reactor.reactor <: e}}
         -> List Regex.Regex
         -> Int
+        -> Reactor.Group Finished
         -> List Job
-        -> List Running
+        -> Int
         -> List Finished
         -> Co e (List Finished)
-runJobs sel jobs Nil Nil done = pure done
-runJobs sel jobs Nil running done = do
-  w <- waitAny (List.map (\(r : Running) -> r.proc) running)
-  ended <- endedJob sel running w
+runJobs sel jobs g Nil 0 done = pure done
+runJobs sel jobs g Nil pending done = do
+  ended <- Reactor.finished g True
   runJobs
       sel
       jobs
+      g
       (nextJobs ended)
-      (stillRunning running w)
+      (pending - List.length ended)
       (List.append ended done)
-runJobs sel jobs (Cons j rest) running done =
-  if List.length running < jobs
+runJobs sel jobs g (Cons j rest) pending done =
+  if pending < jobs
   then do
-    s <- startJob j
-    runJobs sel jobs rest (runningWith s running) (finishedWith s done)
+    begun <- Reactor.start g (runJob sel j)
+    case begun of
+      Just f ->
+        runJobs sel jobs g (List.append rest f.next) pending (Cons f done)
+      Nothing -> runJobs sel jobs g rest (pending + 1) done
   else do
-    w <- waitAny (List.map (\(r : Running) -> r.proc) running)
-    ended <- endedJob sel running w
+    ended <- Reactor.finished g True
     runJobs
         sel
         jobs
+        g
         (List.append (Cons j rest) (nextJobs ended))
-        (stillRunning running w)
+        (pending - List.length ended)
         (List.append ended done)
 
 -- (the tests of a file to run, the `owner`th, each at its place)
@@ -3722,6 +3714,7 @@ runReady : {e : HFunctor}
          -> {{disk : filesystem <: e}}
          -> {{rep : Report.report <: e}}
          -> {{prog : Progress.progress <: e}}
+         -> {{rx : Reactor.reactor <: e}}
          -> TestOpts
          -> List Ready
          -> TestRes
@@ -3729,8 +3722,10 @@ runReady : {e : HFunctor}
 runReady opts Nil acc = pure acc
 runReady opts ready acc = do
   task <- Progress.start Progress.root "integration tests" 0
+  g <- Reactor.open
   done <-
-    runJobs (patternLevels opts.pattern) opts.jobs (readyJobs ready) Nil Nil
+    runJobs (patternLevels opts.pattern) opts.jobs g (readyJobs ready) 0 Nil
+  Reactor.close g
   Progress.end task
   reportReady opts done ready acc
 
@@ -3855,6 +3850,7 @@ testCmd : {e : HFunctor}
         -> {{disk : filesystem <: e}}
         -> {{rep : Report.report <: e}}
         -> {{prog : Progress.progress <: e}}
+        -> {{rx : Reactor.reactor <: e}}
         -> Progress.Task
         -> TestOpts
         -> List String
@@ -3886,6 +3882,7 @@ testsCmd : {e : HFunctor}
          -> {{disk : filesystem <: e}}
          -> {{rep : Report.report <: e}}
          -> {{prog : Progress.progress <: e}}
+         -> {{rx : Reactor.reactor <: e}}
          -> TestOpts
          -> List String
          -> Co e Unit
@@ -4004,19 +4001,19 @@ testedAgain as n = do
   changedSaid n
   self <- programPath
   c <-
-    start
+    withProcess
       { command = self
       , args = as
       , input = Inherited
       , output = Inherited
       , errors = Inherited
       }
+      (\p -> wait p)
   case c of
-    Nothing -> do
+    Left err -> do
       printErr "heff test: cannot run heff; tested again at the next change"
       pure (n + 1)
-    Just child -> do
-      r <- wait child
+    Right r -> do
       printErr
           ("heff test: tested ("
            ^ show (n + 1)

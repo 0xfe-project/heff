@@ -17,8 +17,8 @@ import check
 import co
 import regex as Regex
 import std.filesystem
-import std.handle
 import std.process
+import with
 
 -- (what the tests run by is given, else the test fails)
 given : {e : HFunctor}
@@ -1330,46 +1330,35 @@ ranWell r =
 keptIfBad : Ran -> List String -> List String
 keptIfBad r bad = if ranWell r then bad else Cons (said r) bad
 
--- (the install waited for, the program run again each time it ends,
--- until the install ends; the run then going waited for too)
+-- (the program run again each time it ends, until the install has
+-- ended: the run then going is to its end first)
 busyLoop : {e : HFunctor}
-         -> {{chk : check <: e}}
+         -> {s : Type}
          -> {{sys : process <: e}}
          -> String
-         -> Subprocess
-         -> Subprocess
+         -> With s Started
          -> Int
          -> List String
          -> Co e Busy
-busyLoop bin installer runner runs bad = do
-  ended <- waitAny [installer, runner]
-  case ended of
-    Nothing -> failure "the install and the program, both gone"
-    Just (MkPair s r) ->
-      if sameHandle s runner
-      then (do
-            next <- start { command = bin }
-            case next of
-              Nothing -> do
-                last <- wait installer
-                pure
-                    { installed = last
-                    , runs = runs + 1
-                    , bad = Cons "not run" (keptIfBad r bad)
-                    }
-              Just n -> busyLoop bin installer n (runs + 1) (keptIfBad r bad))
-      else (do
-            last <- wait runner
-            pure { installed = r, runs = runs + 1, bad = keptIfBad last bad })
+busyLoop bin installer runs bad = do
+  r <- run { command = bin }
+  done <- tryWait installer
+  case done of
+    Nothing -> busyLoop bin installer (runs + 1) (keptIfBad r bad)
+    Just last ->
+      pure { installed = last, runs = runs + 1, bad = keptIfBad r bad }
 
--- (the installer started; else the test fails)
+-- (what came of the command held; else the test fails, the command not
+-- started)
 started : {e : HFunctor}
+        -> {a : Type}
         -> {{chk : check <: e}}
         -> String
-        -> Maybe Subprocess
-        -> Co e Subprocess
-started what (Just s) = pure s
-started what Nothing = failure (what ^ " could not be started")
+        -> Either ProcessError a
+        -> Co e a
+started what (Right x) = pure x
+started what (Left err) =
+  failure (what ^ " could not be started: " ^ err.message)
 
 -- | install again, the program run over and over meanwhile: each run is
 -- | of the program as it was or as it is, never of one half written (it
@@ -1390,16 +1379,14 @@ running name =
       "busy/app/busy/main.hf"
       (replaced "greeting \"world\"" "greeting \"again\"" main)
   ready <- run { command = busyBin }
-  installer <-
-    start
+  held <-
+    withProcess
       { command = heff
       , args = ["install", "busy"]
       , env = List.append (envHere here) busyEnv
       }
-  installing <- started "the install" installer
-  runner <- start { command = busyBin }
-  firstRun <- started "the program" runner
-  busy <- busyLoop busyBin installing firstRun 0 Nil
+      (\installer -> busyLoop busyBin installer 0 Nil)
+  busy <- started "the install" held
   after <- ranSays busyBin
   inBin <- listing (busyHome ^ "/bin")
   holdsOf

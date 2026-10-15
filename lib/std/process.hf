@@ -1,10 +1,55 @@
 -- The process as an effect: its arguments, its environment,
 -- where its program is and where it runs, the commands it runs -- to
--- their end, or started beside it, spoken to and waited for later -- and
--- how it ends (process.provider.c).
+-- their end, or started beside it, held by a `with`, spoken to and
+-- waited for -- and how it ends.
+--
+-- A command started beside the program is the host's own thing, a
+-- `Started`, had only by a `with` (`withProcess`, the one use of its
+-- `Start` and `Release`, which the module keeps to itself): the body is
+-- given a `With s Started` in a region of its own, the operations on a
+-- started command take that, and when the body ends the command is
+-- ended, if it has not -- asked to (SIGTERM), then made to (SIGKILL)
+-- two seconds after -- and waited for.  So a body that is to see its command's end
+-- waits for it (`wait`); one that leaves is rid of it.  The `with` of
+-- several commands at once -- a pool -- is a green thread for each, each
+-- its own `with`, what came of them sent on a channel: `wait` and the
+-- reads and writes of a started command's pipes are outside operations
+-- of std.reactor's, pending while the other threads go on.
+
+module
+  ( Ended(..)
+  , Input(..)
+  , Output(..)
+  , Portion(..)
+  , Received(..)
+  , Invocation
+  , Ran
+  , succeeded
+  , Started
+  , ProcessError
+  , process
+  , args
+  , getEnv
+  , programPath
+  , workingDir
+  , platform
+  , processors
+  , exit
+  , exec
+  , run
+  , withProcess
+  , wait
+  , tryWait
+  , kill
+  , terminate
+  , writeInput
+  , closeInput
+  , readOutput
+  , readErrors
+  )
 
 import co
-import std.handle
+import with
 
 -- | How a command run ended: by itself, with its exit status (0: it
 -- | went well); by a signal, its number (never on Windows); killed at
@@ -85,13 +130,15 @@ endedWell _ = False
 succeeded : Ran -> Bool
 succeeded r = endedWell r.ended
 
--- | (`Handle Started`, std.handle: a command started beside the program,
--- | `start`'s; no value has it.)
+-- | A command started beside the program, the host's own, running
+-- | until it is waited for or its `with` ends: held by `withProcess`,
+-- | as a `With s Started`, and had by nothing else.
 data Started
 
--- | A command started beside the program, running until it is waited
--- | for: `start`'s.
-type Subprocess = Handle Started
+-- | Why a command was not started: it could not be run -- not found,
+-- | not a program, its directory not there -- the system's `code`, its
+-- | `name` (`ENOENT`), and what it says of it.
+type ProcessError = { code : Int, name : String, message : String }
 
 data ProcessF (m : Type -> Type) x
   = Args (List String -> x)
@@ -103,16 +150,16 @@ data ProcessF (m : Type -> Type) x
   | Exit Int x
   | Exec String (List String) x
   | Run Invocation (Ran -> x)
-  | Start Invocation (Maybe Subprocess -> x)
-  | Wait Subprocess (Ran -> x)
-  | WaitAny (List Subprocess) (Maybe (Pair Subprocess Ran) -> x)
-  | TryWait Subprocess (Maybe Ran -> x)
-  | Kill Subprocess x
-  | Terminate Subprocess (Ran -> x)
-  | WriteInput Subprocess Bytes (Bool -> x)
-  | CloseInput Subprocess x
-  | ReadOutput Subprocess Portion Int (Received -> x)
-  | ReadErrors Subprocess Portion Int (Received -> x)
+  | Start Invocation (Either ProcessError Started -> x)
+  | Release Started (Either ProcessError Unit -> x)
+  | Wait Started (Ran -> x)
+  | TryWait Started (Maybe Ran -> x)
+  | Kill Started x
+  | Terminate Started (Ran -> x)
+  | WriteInput Started Bytes (Bool -> x)
+  | CloseInput Started x
+  | ReadOutput Started Portion Int (Received -> x)
+  | ReadErrors Started Portion Int (Received -> x)
 
 -- | The process as an effect.
 process : HFunctor
@@ -129,8 +176,8 @@ process =
       Exec cmd as x -> Exec cmd as (g x)
       Run c k -> Run c (\r -> g (k r))
       Start c k -> Start c (\s -> g (k s))
+      Release s k -> Release s (\r -> g (k r))
       Wait s k -> Wait s (\r -> g (k r))
-      WaitAny ss k -> WaitAny ss (\r -> g (k r))
       TryWait s k -> TryWait s (\r -> g (k r))
       Kill s x -> Kill s (g x)
       Terminate s k -> Terminate s (\r -> g (k r))
@@ -149,8 +196,8 @@ process =
       Exec cmd as x -> Exec cmd as x
       Run c k -> Run c k
       Start c k -> Start c k
+      Release s k -> Release s k
       Wait s k -> Wait s k
-      WaitAny ss k -> WaitAny ss k
       TryWait s k -> TryWait s k
       Kill s x -> Kill s x
       Terminate s k -> Terminate s k
@@ -210,89 +257,110 @@ exec cmd as = op (ev (Exec cmd as MkUnit)) val
 run : {e : HFunctor} -> {{ev : process <: e}} -> Invocation -> Co e Ran
 run c = op (ev (Run c (\r -> r))) val
 
--- | Start the command, as `run` would run it, and go on beside it: the
--- | command, to wait for, or `Nothing` where it could not be run (its
--- | `run` `NotRun`).  What it writes is read, and its time limit kept,
--- | while the program waits for it (`wait`, `waitAny`, `tryWait`); a
+-- | The command started, as `run` would run it, and held by `body` in a
+-- | region of its own -- it is not kept past it -- the program going on
+-- | beside it; when `body` ends, the command is ended if it has not --
+-- | asked to (SIGTERM), then made to (SIGKILL) where it has not within
+-- | two seconds -- and waited for: what `body` came to, or why the
+-- | command could not be run (where `run` says `NotRun`).  What it
+-- | writes is read, its input written, and its time limit kept, while
+-- | the program waits on it (`wait`, `tryWait`, a read, a write); a
 -- | command writing more than a pipe holds (64 KiB, most often) waits
 -- | until then.  It runs in the program's process group (Ctrl-C ends
 -- | both); at the program's end, and where a signal ends it, a command
--- | started and not waited for is terminated.
-start : {e : HFunctor}
-      -> {{ev : process <: e}}
-      -> Invocation
-      -> Co e (Maybe Subprocess)
-start c = op (ev (Start c (\s -> s))) val
+-- | started and not ended is terminated.  Should `body` be left
+-- | otherwise -- a throw heard outside it, a handler between that drops
+-- | the continuation -- the command is ended where the program drops
+-- | its last reference to it.
+withProcess : {e : HFunctor}
+            -> {a : Type}
+            -> {{ev : process <: e}}
+            -> Invocation
+            -> ({s : Type} -> With s Started -> Co e a)
+            -> Co e (Either ProcessError a)
+withProcess c body =
+  scoped
+    (op (ev (Start c (\s -> s))) val)
+    (\s -> op (ev (Release s (\r -> r))) val)
+    body
 
 -- | The command waited for, to its end -- its input closed first, where
--- | it is `Piped` -- its `Ran`, and its handle let go of (an operation
--- | given it after that fails the program).
-wait : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Ran
-wait s = op (ev (Wait s (\r -> r))) val
+-- | it is `Piped` -- its `Ran`; asked again, its `Ran` again.  A green
+-- | thread's, scheduled by std.reactor, is pending while the other
+-- | threads go on; else it waits where it is, the program with it.
+wait : {e : HFunctor}
+     -> {s : Type}
+     -> {{ev : process <: e}}
+     -> With s Started
+     -> Co e Ran
+wait p = op (ev (Wait (inside p) (\r -> r))) val
 
--- | Whichever of the commands ends first, waited for: it and its `Ran`,
--- | its handle let go of, the others running still (`Nothing`: there
--- | are none).  An input `Piped` is left open: a command that reads it
--- | to its end does not end until it is closed.
-waitAny : {e : HFunctor}
-        -> {{ev : process <: e}}
-        -> List Subprocess
-        -> Co e (Maybe (Pair Subprocess Ran))
-waitAny ss = op (ev (WaitAny ss (\r -> r))) val
-
--- | The command's `Ran` if it has ended, its handle let go of, not
--- | waiting; else `Nothing`, and it runs still.
+-- | The command's `Ran` if it has ended, not waiting; else `Nothing`,
+-- | and it runs still.
 tryWait : {e : HFunctor}
+        -> {s : Type}
         -> {{ev : process <: e}}
-        -> Subprocess
+        -> With s Started
         -> Co e (Maybe Ran)
-tryWait s = op (ev (TryWait s (\r -> r))) val
+tryWait p = op (ev (TryWait (inside p) (\r -> r))) val
 
 -- | The command killed (SIGKILL; on Windows, TerminateProcess), if it
 -- | has not ended, not waited for: its `wait` says `Signalled 9`.
-kill : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Unit
-kill s = op (ev (Kill s MkUnit)) val
+kill : {e : HFunctor}
+     -> {s : Type}
+     -> {{ev : process <: e}}
+     -> With s Started
+     -> Co e Unit
+kill p = op (ev (Kill (inside p) MkUnit)) val
 
 -- | The command ended, if it has not: asked to (SIGTERM), then made to
 -- | (SIGKILL) where it has not within two seconds; waited for, its
--- | `Ran`, and its handle let go of.
-terminate : {e : HFunctor} -> {{ev : process <: e}} -> Subprocess -> Co e Ran
-terminate s = op (ev (Terminate s (\r -> r))) val
+-- | `Ran`.  (Its `with` ending does the same.)
+terminate : {e : HFunctor}
+          -> {s : Type}
+          -> {{ev : process <: e}}
+          -> With s Started
+          -> Co e Ran
+terminate p = op (ev (Terminate (inside p) (\r -> r))) val
 
 -- | The bytes written to the command's input, `Piped`, all of them,
 -- | waiting while its pipe is full (what it writes read meanwhile, so
 -- | that it never waits on the program): `False` where they could not
 -- | be, the input not `Piped`, closed, or no more read.
 writeInput : {e : HFunctor}
+           -> {s : Type}
            -> {{ev : process <: e}}
-           -> Subprocess
+           -> With s Started
            -> Bytes
            -> Co e Bool
-writeInput s b = op (ev (WriteInput s b (\r -> r))) val
+writeInput p b = op (ev (WriteInput (inside p) b (\r -> r))) val
 
 -- | The command's input, `Piped`, closed: it reads its end.
 closeInput : {e : HFunctor}
+           -> {s : Type}
            -> {{ev : process <: e}}
-           -> Subprocess
+           -> With s Started
            -> Co e Unit
-closeInput s = op (ev (CloseInput s MkUnit)) val
+closeInput p = op (ev (CloseInput (inside p) MkUnit)) val
 
 -- | Of what the command has written to its output, `Piped`, and the
 -- | program not yet read, the portion, waited for up to `ms`
 -- | milliseconds (0: as long as it takes).
 readOutput : {e : HFunctor}
+           -> {s : Type}
            -> {{ev : process <: e}}
-           -> Subprocess
+           -> With s Started
            -> Portion
            -> Int
            -> Co e Received
-readOutput s n ms = op (ev (ReadOutput s n ms (\r -> r))) val
+readOutput p n ms = op (ev (ReadOutput (inside p) n ms (\r -> r))) val
 
 -- | `readOutput`, of its error stream.
 readErrors : {e : HFunctor}
+           -> {s : Type}
            -> {{ev : process <: e}}
-           -> Subprocess
+           -> With s Started
            -> Portion
            -> Int
            -> Co e Received
-readErrors s n ms = op (ev (ReadErrors s n ms (\r -> r))) val
+readErrors p n ms = op (ev (ReadErrors (inside p) n ms (\r -> r))) val

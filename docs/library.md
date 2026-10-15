@@ -524,7 +524,7 @@ are not seen, a mode is only whether the owner may write, and every
 operation waits where it is.
 
 `std.process` runs a command to its end (`run`), in the program's place
-(`exec`), or beside it, started and waited for later (`start`).  `run`
+(`exec`), or beside it, held by a `with` (`withProcess`).  `run`
 takes an `Invocation`, a record whose fields but `command` have
 defaults, so that a call gives only what it changes:
 
@@ -564,48 +564,52 @@ signal's number (never on Windows), `TimedOut`, or `NotRun` -- not
 found, not a program, its directory not there, or a NUL in its name or
 an argument.  `succeeded r` is whether it exited with 0.
 
-`start` takes the same `Invocation` and goes on beside the command:
-`Just` a `Subprocess` (a handle, std.handle's), or `Nothing` where it
-could not be run (where `run` says `NotRun`).  `wait p` waits for it to
-end, its `Ran`; `waitAny ps` waits for whichever of several ends
-first, `Just` it and its `Ran` (`Nothing` for none), the others running
-still -- a pool starts the next as soon as one ends; `tryWait p` is
-`Just` its `Ran` if it has ended, without waiting; `kill p` kills it
-(SIGKILL; on Windows, TerminateProcess, and it exited with 1), not
-waiting; `terminate p` ends it -- SIGTERM, then SIGKILL two seconds
-later (on Windows, at once) -- and waits for it, its `Ran`.  Once its
-`Ran` is given, its handle is let go of: an operation given it after
-that fails the program.
+`withProcess` takes the same `Invocation` and a body, and goes on
+beside the command: the body is given it as a `With s Started`, in a
+region `s` of its own ([a thing held by a `with`](#a-thing-held-by-a-with):
+the command cannot leave the body, as a file held by `withFile`
+cannot), and when the body ends the command is ended, if it has not --
+asked to (SIGTERM), then made to (SIGKILL) two seconds later -- and
+waited for.  What the body came to is `Right`; `Left` a `ProcessError`
+-- the system's `code`, its `name` (`ENOENT`) and its `message` --
+where the command could not be run (where `run` says `NotRun`), the
+body not run.  In the body, `wait p` waits for the command to end, its
+`Ran` (its input closed first, where `Piped`; asked again, its `Ran`
+again); `tryWait p` is `Just` its `Ran` if it has ended, without
+waiting; `kill p` kills it (SIGKILL; on Windows, TerminateProcess, and
+it exited with 1), not waiting; `terminate p` ends it as the body's end
+would, and waits for it, its `Ran`.  A body that is to see how the
+command ended waits for it; one that leaves is rid of it.
 
 ```haskell
--- (two commands at once: the first to end said, then the other)
-race : {e : HFunctor}
-     -> {{io : stdio <: e}}
-     -> {{sys : process <: e}}
-     -> Subprocess
-     -> Subprocess
-     -> Co e Unit
-race a b = do
-  first <- waitAny [a, b]
-  case first of
-    Just (MkPair p r) -> do
-      print ((if sameHandle p a then "a: " else "b: ") ^ r.out)
-      rest <- wait (if sameHandle p a then b else a)
-      print ("then: " ^ rest.out)
-    Nothing -> pure MkUnit
+-- (a command run beside the program: what it wrote, once it has ended)
+said : {e : HFunctor} -> {{sys : process <: e}} -> Invocation -> Co e String
+said c = do
+  r <- withProcess c (\p -> wait p)
+  pure (case r of
+    Right ran -> ran.out
+    Left err -> "not run: " ^ err.name)
 ```
 
+Several commands at once -- a pool that starts the next as one ends,
+whichever that is -- are green threads ([green threads](#green-threads)),
+each with a `withProcess` of its own, scheduled by `Reactor.scheduled`:
+a thread's `wait`, and its reads and writes of the command's pipes
+(below), are pending while the other threads go on, and what came of
+each is sent on a channel.  Where no scheduler runs, a wait waits where
+it is, the program with it, as `run` does.
+
 What a started command writes is read, its input written and its time
-limit kept, while the program waits on it -- by `wait`, `waitAny`,
-`tryWait`, `terminate` -- and not between: one that writes more than a
-pipe holds (64 KiB, most often) waits until then, and one past its time
-limit is killed at the next.  A wait blocks where it is, every green
-thread with it, as `run` does.  It runs in the program's process group
-(Ctrl-C ends both); what a program started and has not waited for is
+limit kept, while the program waits on it -- by `wait`, `tryWait`,
+`terminate`, a read or a write -- and not between: one that writes more
+than a pipe holds (64 KiB, most often) waits until then, and one past
+its time limit is killed at the next.  It runs in the program's process
+group (Ctrl-C ends both); what a program started and has not ended is
 terminated at the program's end, and where a signal (SIGINT, SIGTERM,
 SIGHUP) ends it.  (`heff dev` runs a project's programs so, their
-streams `Inherited`.)  How many there are to run at once, a pool's
-size, is std.thread's `cores`, the machine's cores.
+streams `Inherited`, each held until the build after a change has made
+it anew.)  How many there are to run at once, a pool's size, is
+std.thread's `cores`, the machine's cores.
 
 A started command is spoken to where its streams are `Piped`: as an
 editor speaks to a language server, writing a request and reading the
@@ -614,7 +618,7 @@ input, all of them, waiting while its pipe is full (what it writes is
 read meanwhile, so that it never waits on the program while the program
 waits on it): `False` where they could not be written, the input not
 `Piped`, closed, or no more read.  `closeInput p` closes it, and the
-command reads its end (`wait` closes it too; `waitAny` does not).
+command reads its end (`wait` closes it too).
 `readOutput p portion ms` is of what it has written to its output and
 the program has not yet read, a `Portion`, waited for up to `ms`
 milliseconds (0: as long as it takes): `Available`, whatever there is,
@@ -639,21 +643,24 @@ framed body =
     (Bytes.fromString body)
 
 -- (the message the headers frame, read: as many bytes as they say)
-bodyOf : {e : HFunctor} -> {{sys : process <: e}} -> Subprocess -> Received -> Co e Received
+bodyOf : {e : HFunctor} -> {s : Type} -> {{sys : process <: e}}
+       -> With s Started -> Received -> Co e Received
 bodyOf p (Got headers) = case contentLength (Bytes.asString headers) of
   Just n -> readOutput p (Exactly n) 5000
   Nothing -> pure Closed
 bodyOf p r = pure r
 
 -- (a request to the server, and the next message from it)
-asked : {e : HFunctor} -> {{sys : process <: e}} -> Subprocess -> String -> Co e Received
+asked : {e : HFunctor} -> {s : Type} -> {{sys : process <: e}}
+      -> With s Started -> String -> Co e Received
 asked server request = do
   _ <- writeInput server (framed request)
   headers <- readOutput server (Through "\r\n\r\n") 5000
   bodyOf server headers
 ```
 
-(`contentLength` parses the headers; test/node/commands.hf has one.)
+(`contentLength` parses the headers.  A module that writes the type
+`With` imports `with`.)
 
 ## A thing held by a `with`
 
@@ -809,7 +816,9 @@ effect `Reactor.reactor` in the world) has them wait apart:
 a thread whose `Net.read`, `Net.accept`, `Net.withConnection` or
 `Net.write` would wait, whose read or write of a pipe, a terminal or a socket
 (std.filesystem's `readLine`, `readChunk`, `writeBytes`, `writeString`)
-would, or whose `Http.send` (`Http.get`, `Http.getText`) is under way, is pending while the other threads go on, and goes on with its answer once it is done --
+would, whose `wait` on a command started by `withProcess` (or its
+read or write of the command's pipes) would, or whose `Http.send`
+(`Http.get`, `Http.getText`) is under way, is pending while the other threads go on, and goes on with its answer once it is done --
 from the thread's own view the call returns its result, as it always
 did.  When no thread is ready, the scheduler waits for the first
 pending one to be done (the system's `poll`, of every socket waited
@@ -839,8 +848,10 @@ main = do
 
 How it is done -- an operation begun, pending, and finished later -- is
 the providers' ([providers.md](providers.md#outside-operations-done-later)):
-std.net's, std.http's and std.filesystem's of a pipe, a terminal or a
-socket are, others' wait where they are, every thread with them.  It is one reactor for each thread of the system: green
+std.net's, std.http's, std.filesystem's of a pipe, a terminal or a
+socket, and std.process's on a started command (its end waited for, a
+kqueue's or a pidfd's word; its pipes read and written) are, others'
+wait where they are, every thread with them.  It is one reactor for each thread of the system: green
 threads in a thread of std.thread's are that thread's own
 ([threads.md](threads.md#green-threads-in-threads)).
 

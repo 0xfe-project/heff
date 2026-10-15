@@ -279,7 +279,9 @@ answer is given to its function, now or later.
 
 A provider whose waits are done by something else -- libcurl's
 transfers, which have sockets of their own (lib/std/http.provider.c,
-its multi interface) -- is a `HeffSource`
+its multi interface); std.process's started commands, each with pipes
+and a descriptor that says when it exits (a kqueue's `NOTE_EXIT`, a
+pidfd), polled with a time limit's -- is a `HeffSource`
 (`heff_reactor_source`): `fds` says which descriptors it polls and how
 long at most to wait, `ready` is given them as polled, and it says
 which of its waits are done by `heff_wait_done(w)`.  A provider that

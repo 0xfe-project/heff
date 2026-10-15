@@ -21,6 +21,7 @@ import co
 import json as Json
 import std.filesystem
 import std.process
+import with
 
 -- (what the tests run by is given, else the test fails)
 given : {e : HFunctor}
@@ -209,12 +210,12 @@ resultOf m = fromMaybe JNull (Json.at ["result"] m)
 -- Speaking to the server
 --------------------------------------------------------------------------------
 
--- | the session: the server, the notes it said that were not yet waited
+-- | the session: the notes the server said that were not yet waited
 -- | for, the next request's id, how many checks were made, and what was
--- | said of each that did not hold
+-- | said of each that did not hold (the server itself is held by the
+-- | session's `with`)
 type Lsp =
-  { server : Subprocess
-  , notes : List Json.Json
+  { notes : List Json.Json
   , next : Int
   , checks : Int
   , failed : List String
@@ -238,12 +239,18 @@ report l =
   ^ " checks hold"
 
 -- (a message, framed as LSP's are, said to the server)
-send : {e : HFunctor} -> {{sys : process <: e}} -> Lsp -> Json.Json -> Co e Unit
-send l msg = do
+send : {e : HFunctor}
+     -> {s : Type}
+     -> {{sys : process <: e}}
+     -> With s Started
+     -> Lsp
+     -> Json.Json
+     -> Co e Unit
+send srv l msg = do
   let body = Json.stringify msg
   written <-
     writeInput
-      l.server
+      srv
       (Bytes.fromString
          ("Content-Length: " ^ show (strLength body) ^ "\r\n\r\n" ^ body))
   pure MkUnit
@@ -305,15 +312,17 @@ readJson l what (Left err) =
 
 -- (the next message the server says, waited for)
 receive : {e : HFunctor}
+        -> {s : Type}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
+        -> With s Started
         -> Lsp
         -> String
         -> Co e Json.Json
-receive l what = do
-  header <- readOutput l.server (Through "\r\n\r\n") waitLimit
+receive srv l what = do
+  header <- readOutput srv (Through "\r\n\r\n") waitLimit
   h <- readText l what header
-  body <- readOutput l.server (Exactly (lengthOf h)) waitLimit
+  body <- readOutput srv (Exactly (lengthOf h)) waitLimit
   b <- readText l what body
   readJson l what (Json.parse b)
 
@@ -323,18 +332,20 @@ isResponse id m = intAt ["id"] m == id && strEq (writtenAt ["method"] m) ""
 
 -- (the response to the request `id`, the notes said meanwhile kept)
 response : {e : HFunctor}
+         -> {s : Type}
          -> {{chk : check <: e}}
          -> {{sys : process <: e}}
+         -> With s Started
          -> Lsp
          -> Int
          -> String
          -> Co e Answer
-response l id what = do
-  m <- receive l what
+response srv l id what = do
+  m <- receive srv l what
   if isResponse id m then pure { lsp = l, msg = m }
     else response
-        { server = l.server
-        , notes = List.append l.notes [m]
+        srv
+        { notes = List.append l.notes [m]
         , next = l.next
         , checks = l.checks
         , failed = l.failed
@@ -350,8 +361,7 @@ withoutFirst p (Cons m ms) = if p m then ms else Cons m (withoutFirst p ms)
 -- (the session, its notes these)
 withNotes : Lsp -> List Json.Json -> Lsp
 withNotes l ns =
-  { server = l.server
-  , notes = ns
+  { notes = ns
   , next = l.next
   , checks = l.checks
   , failed = l.failed
@@ -359,28 +369,32 @@ withNotes l ns =
 
 -- (the next note that `p` holds of, waited for, the others kept)
 awaitNote : {e : HFunctor}
+          -> {s : Type}
           -> {{chk : check <: e}}
           -> {{sys : process <: e}}
+          -> With s Started
           -> Lsp
           -> (Json.Json -> Bool)
           -> String
           -> Co e Answer
-awaitNote l p what = do
-  m <- receive l what
+awaitNote srv l p what = do
+  m <- receive srv l what
   if p m then pure { lsp = l, msg = m }
-    else awaitNote (withNotes l (List.append l.notes [m])) p what
+    else awaitNote srv (withNotes l (List.append l.notes [m])) p what
 
 -- (the first note that `p` holds of: one kept, else the next)
 noted : {e : HFunctor}
+      -> {s : Type}
       -> {{chk : check <: e}}
       -> {{sys : process <: e}}
+      -> With s Started
       -> Lsp
       -> (Json.Json -> Bool)
       -> String
       -> Co e Answer
-noted l p what = case List.find p l.notes of
+noted srv l p what = case List.find p l.notes of
   Just m -> pure { lsp = withNotes l (withoutFirst p l.notes), msg = m }
-  Nothing -> awaitNote l p what
+  Nothing -> awaitNote srv l p what
 
 -- (a note of this method)
 isNote : String -> Json.Json -> Bool
@@ -401,8 +415,7 @@ type Check = Pair String (Json.Json -> Bool)
 -- (one check made)
 judgedOne : Lsp -> String -> Bool -> String -> Lsp
 judgedOne l name ok got =
-  { server = l.server
-  , notes = l.notes
+  { notes = l.notes
   , next = l.next
   , checks = l.checks + 1
   , failed =
@@ -451,14 +464,17 @@ quietly notes m =
 
 -- (the session after the step)
 stepOf : {e : HFunctor}
+       -> {s : Type}
        -> {{chk : check <: e}}
        -> {{sys : process <: e}}
        -> {{disk : filesystem <: e}}
+       -> With s Started
        -> Lsp
        -> Step
        -> Co e Lsp
-stepOf l (Open u text) = do
+stepOf srv l (Open u text) = do
   send
+      srv
       l
       (notification
          "textDocument/didOpen"
@@ -473,8 +489,9 @@ stepOf l (Open u text) = do
                  ])
             ]))
   pure l
-stepOf l (Change u text) = do
+stepOf srv l (Change u text) = do
   send
+      srv
       l
       (notification
          "textDocument/didChange"
@@ -488,25 +505,26 @@ stepOf l (Change u text) = do
               (JArray [Json.obj [Json.kv "text" (Json.jstr text)]])
             ]))
   pure l
-stepOf l (Close u) = do
+stepOf srv l (Close u) = do
   send
+      srv
       l
       (notification
          "textDocument/didClose"
          (Json.obj [Json.kv "textDocument" (document u)]))
   pure l
-stepOf l (Notify method params) = do
-  send l (notification method params)
+stepOf srv l (Notify method params) = do
+  send srv l (notification method params)
   pure l
-stepOf l (Diagnostics u checks) = do
-  a <- noted l (isDiagnosticsOf u) ("diagnostics of " ^ u)
+stepOf srv l (Diagnostics u checks) = do
+  a <- noted srv l (isDiagnosticsOf u) ("diagnostics of " ^ u)
   pure (judged a.lsp a.msg checks)
-stepOf l (Ask method params checks) = do
-  send l (request l.next method params)
+stepOf srv l (Ask method params checks) = do
+  send srv l (request l.next method params)
   a <-
     response
-      { server = l.server
-      , notes = l.notes
+      srv
+      { notes = l.notes
       , next = l.next + 1
       , checks = l.checks
       , failed = l.failed
@@ -514,12 +532,12 @@ stepOf l (Ask method params checks) = do
       l.next
       method
   pure (judged a.lsp a.msg checks)
-stepOf l (AskQuietly method params checks) = do
-  send l (request l.next method params)
+stepOf srv l (AskQuietly method params checks) = do
+  send srv l (request l.next method params)
   a <-
     response
-      { server = l.server
-      , notes = l.notes
+      srv
+      { notes = l.notes
       , next = l.next + 1
       , checks = l.checks
       , failed = l.failed
@@ -527,9 +545,11 @@ stepOf l (AskQuietly method params checks) = do
       l.next
       method
   pure (judged a.lsp (quietly a.lsp.notes a.msg) checks)
-stepOf l (Registered checks) = do
-  a <- noted l (isNote "client/registerCapability") "client/registerCapability"
+stepOf srv l (Registered checks) = do
+  a <-
+    noted srv l (isNote "client/registerCapability") "client/registerCapability"
   send
+      srv
       l
       (Json.obj
          [ Json.kv "jsonrpc" (Json.jstr "2.0")
@@ -537,15 +557,15 @@ stepOf l (Registered checks) = do
          , Json.kv "result" JNull
          ])
   pure (judged a.lsp a.msg checks)
-stepOf l (Put path text) = do
+stepOf srv l (Put path text) = do
   ok <- writeFile path text
   pure (judgedOne l ("writing " ^ path) ok "")
-stepOf l (Delete path) = do
+stepOf srv l (Delete path) = do
   ok <- remove path
   pure (judgedOne l ("deleting " ^ path) ok "")
-stepOf l (Exits name) = do
-  send l (notification "exit" JNull)
-  r <- wait l.server
+stepOf srv l (Exits name) = do
+  send srv l (notification "exit" JNull)
+  r <- wait srv
   pure
       (judgedOne
          l
@@ -557,24 +577,27 @@ stepOf l (Exits name) = do
 
 -- (the steps taken, in order)
 steps : {e : HFunctor}
+      -> {s : Type}
       -> {{chk : check <: e}}
       -> {{sys : process <: e}}
       -> {{disk : filesystem <: e}}
+      -> With s Started
       -> Lsp
       -> List Step
       -> Co e Lsp
-steps l Nil = pure l
-steps l (Cons s rest) = do
-  next <- stepOf l s
-  steps next rest
+steps srv l Nil = pure l
+steps srv l (Cons step rest) = do
+  next <- stepOf srv l step
+  steps srv next rest
 
--- (the server, started; else the test fails)
+-- (the session the steps came to; else the test fails, the server not
+-- started)
 startedOr : {e : HFunctor}
           -> {{chk : check <: e}}
-          -> Maybe Subprocess
-          -> Co e Subprocess
-startedOr (Just s) = pure s
-startedOr Nothing = failure "heff lsp could not be started"
+          -> Either ProcessError Lsp
+          -> Co e Lsp
+startedOr (Right l) = pure l
+startedOr (Left err) = failure "heff lsp could not be started"
 
 -- | a session: the server started (as vscode-languageclient starts it,
 -- | with `--stdio`; with a bounded heap: what it keeps must fit, on any
@@ -590,8 +613,8 @@ session : {e : HFunctor}
 session ss = do
   heff <- given "HEFF"
   root <- given "HEFF_TEST_ROOT"
-  started <-
-    start
+  held <-
+    withProcess
       { command = heff
       , args = ["lsp", "--stdio"]
       , dir = root
@@ -600,11 +623,8 @@ session ss = do
       , output = Piped
       , errors = Inherited
       }
-  server <- startedOr started
-  l <-
-    steps
-      { server = server, notes = Nil, next = 1, checks = 0, failed = Nil }
-      ss
+      (\srv -> steps srv { notes = Nil, next = 1, checks = 0, failed = Nil } ss)
+  l <- startedOr held
   if List.null l.failed then pure MkUnit else failure (report l)
 
 -- Requests

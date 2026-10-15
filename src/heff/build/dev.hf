@@ -3,8 +3,9 @@
 -- its files (package.hf, src/, app/), built again, and what runs started
 -- again.  heff is run as `heff build` for each build, so that a build
 -- that fails says why and is waited past, not the end of `heff dev`; the
--- programs it builds run beside it, their output the terminal's, until
--- a build after a change has made them anew (`start`, std.process).  A page
+-- programs it builds run beside it, their output the terminal's, each
+-- held by a `with` (std.process's `withProcess`) until a build after a
+-- change has made them anew.  A page
 -- is served by `heff dev-pages`, beside it too (std.http.server, by
 -- green threads): `/NAME/` the program NAME's page -- its
 -- app/NAME/index.html, or one made for it -- `/NAME/NAME.js` its script
@@ -33,21 +34,25 @@ import std.time as Time
 -- Running
 --------------------------------------------------------------------------------
 
--- | a program of the project's, running
-type Running = { name : String, child : Subprocess }
+-- | a program of the project's, running, held by a `with`: its name, and
+-- | whether it has ended, asked of the `with`
+type Running (e : HFunctor) = { name : String, ended : Co e (Maybe Ran) }
 
--- | where `heff dev` is: its programs running, the pages' server (once
--- | there are pages), how many builds there have been, the programs to
--- | run (all, where none is named), and the port the pages are served
--- | at, and where what is not theirs is sent (`--proxy`)
+-- | where `heff dev` is: how many builds there have been, the programs
+-- | to run (all, where none is named), the port the pages are served
+-- | at, where what is not theirs is sent (`--proxy`), and whether the
+-- | pages' server runs (once there are pages, to the end)
 type Dev =
-  { running : List Running
-  , pages : Maybe Subprocess
-  , builds : Int
+  { builds : Int
   , wanted : List String
   , port : String
   , proxy : Maybe String
+  , pages : Bool
   }
+
+-- | a build that went well: where `heff dev` is after it, the programs it
+-- | is to run, and the project's files as stamped
+type Built = { dev : Dev, apps : List Commands.App, stamp : String }
 
 -- | where a build that went well is said to have been made, for the
 -- | pages to see: `.heff/dev/built`, the number of the build
@@ -64,16 +69,6 @@ isRun wanted a =
 isPage : Commands.App -> Bool
 isPage a = strEq a.build.backend "page"
 
--- (the programs running, each ended)
-stopAll : {e : HFunctor}
-        -> {{sys : process <: e}}
-        -> List Running
-        -> Co e Unit
-stopAll Nil = pure MkUnit
-stopAll (r :: rest) = do
-  _ <- terminate r.child
-  stopAll rest
-
 -- (the command, to be started beside `heff dev`: its standard streams
 -- `heff dev`'s)
 beside : String -> List String -> Invocation
@@ -84,52 +79,6 @@ beside cmd as =
   , output = Inherited
   , errors = Inherited
   }
-
--- (the program, started from where `heff build` put it: running, or why
--- it is not said)
-started : {e : HFunctor}
-        -> {{io : stdio <: e}}
-        -> {{sys : process <: e}}
-        -> Path.Style
-        -> List Running
-        -> Commands.App
-        -> Co e (List Running)
-started st acc a = do
-  c <-
-    start
-      (beside
-         (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
-         Nil)
-  case c of
-    Just child -> pure (List.append acc [{ name = a.name, child = child }])
-    Nothing -> do
-      printErr ("heff dev: cannot run " ^ a.name)
-      pure acc
-
-startAll : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> Path.Style
-         -> List Running
-         -> List Commands.App
-         -> Co e (List Running)
-startAll st acc Nil = pure acc
-startAll st acc (a :: rest) = do
-  now <- started st acc a
-  startAll st now rest
-
--- (the pages' server started, where there are pages and it is not)
-pagesFor : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> {{sys : process <: e}}
-         -> Dev
-         -> Bool
-         -> Co e (Maybe Subprocess)
-pagesFor d False = pure d.pages
-pagesFor { pages = Just c } True = pure (Just c)
-pagesFor d True = do
-  self <- programPath
-  start (beside self ("dev-pages" :: d.port :: maybe Nil (\u -> [u]) d.proxy))
 
 -- (the programs, read from their build.hf: none where one cannot be)
 appsNow : {e : HFunctor}
@@ -168,57 +117,27 @@ namesSaid : List Commands.App -> String
 namesSaid Nil = "nothing to run"
 namesSaid as = joinWith ", " (List.map (\(a : Commands.App) -> a.name) as)
 
--- (a build that went well: what ran ended, what is to run started anew,
--- the pages' server started once there are pages, the build counted)
-builtWell : {e : HFunctor}
-          -> {{io : stdio <: e}}
-          -> {{sys : process <: e}}
-          -> {{disk : filesystem <: e}}
-          -> {{prog : Progress.progress <: e}}
-          -> Path.Style
-          -> Dev
-          -> Co e Dev
-builtWell st d = do
-  apps <- appsNow st
-  stopAll d.running
-  _ <- makeDirectory (Path.join st ".heff" "dev")
-  _ <- writeFile (builtFile st) (show (d.builds + 1))
-  printErr
-      ("heff dev: built ("
-       ^ show (d.builds + 1)
-       ^ "); running "
-       ^ namesSaid (List.filter (isRun d.wanted) apps))
-  running <- startAll st Nil (List.filter (isRun d.wanted) apps)
-  pages <- pagesFor d (List.any isPage apps)
-  pure
-      { running = running
-      , pages = pages
-      , builds = d.builds + 1
-      , wanted = d.wanted
-      , port = d.port
-      , proxy = d.proxy
-      }
-
 -- | the project built, as `heff build` builds it (heff run so, its
--- | output kept: said where it fails), and, where it went well, what is
--- | to run started anew
+-- | output kept: said where it fails): the programs, where it went well
 rebuilt : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
         -> {{prog : Progress.progress <: e}}
         -> Path.Style
-        -> Dev
-        -> Co e Dev
-rebuilt st d = do
+        -> Co e (Maybe (List Commands.App))
+rebuilt st = do
   self <- programPath
   task <- Progress.start Progress.root "building" 0
   r <- Progress.runUnder task self ["build"]
   Progress.end task
-  if succeeded r then builtWell st d
+  if succeeded r
+    then do
+      apps <- appsNow st
+      pure (Just apps)
     else do
       failedSaid r
-      pure d
+      pure Nothing
 
 -- (how a program ended, said)
 endedSaid : Ended -> String
@@ -227,32 +146,139 @@ endedSaid (Signalled n) = "signal " ^ show n
 endedSaid TimedOut = "timed out"
 endedSaid NotRun = "not run"
 
--- (the programs that have ended by themselves said, and let go of)
+-- (the programs that have ended by themselves said, and no more asked)
 stillRunning : {e : HFunctor}
              -> {{io : stdio <: e}}
-             -> {{sys : process <: e}}
-             -> List Running
-             -> List Running
-             -> Co e (List Running)
+             -> List (Running e)
+             -> List (Running e)
+             -> Co e (List (Running e))
 stillRunning acc Nil = pure acc
 stillRunning acc (r :: rest) = do
-  s <- tryWait r.child
+  s <- r.ended
   case s of
     Nothing -> stillRunning (List.append acc [r]) rest
     Just ran -> do
       printErr ("heff dev: " ^ r.name ^ " ended (" ^ endedSaid ran.ended ^ ")")
       stillRunning acc rest
 
--- (what ran that has ended said, and let go of: done at each look at
--- the project's files)
-ticked : {e : HFunctor}
-       -> {{io : stdio <: e}}
-       -> {{sys : process <: e}}
-       -> Dev
-       -> Co e Dev
-ticked d = do
-  running <- stillRunning Nil d.running
-  pure { d | running = running }
+-- (the project's files watched, every quarter of a second, the programs
+-- running looked at meanwhile; at a change, built again -- a build that
+-- fails said and waited past -- until a build goes well: what came of
+-- it, the build counted)
+watched : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> {{clock : Time.time <: e}}
+        -> Path.Style
+        -> Dev
+        -> String
+        -> List (Running e)
+        -> Co e Built
+watched st d stamp running = do
+  Time.sleep 250
+  still <- stillRunning Nil running
+  again <- Watch.stamped st Watch.project
+  if strEq again stamp then watched st d stamp still
+    else do
+      apps <- rebuilt st
+      case apps of
+        Nothing -> watched st d again still
+        Just as ->
+          pure { dev = { d | builds = d.builds + 1 }, apps = as, stamp = again }
+
+-- (the programs started, from where `heff build` put them, each held by
+-- a `with` -- one that cannot be run said, and left out -- and the
+-- project watched inside them all; when a build goes well, what came of
+-- it: the `with`s end, the programs with them)
+held : {e : HFunctor}
+     -> {{io : stdio <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> {{prog : Progress.progress <: e}}
+     -> {{clock : Time.time <: e}}
+     -> Path.Style
+     -> Dev
+     -> String
+     -> List (Running e)
+     -> List Commands.App
+     -> Co e Built
+held st d stamp running Nil = watched st d stamp running
+held st d stamp running (a :: rest) = do
+  r <-
+    withProcess
+      (beside
+         (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
+         Nil)
+      (\p ->
+         held
+           st
+           d
+           stamp
+           (List.append running [{ name = a.name, ended = tryWait p }])
+           rest)
+  case r of
+    Right next -> pure next
+    Left err -> do
+      printErr ("heff dev: cannot run " ^ a.name)
+      held st d stamp running rest
+
+-- (a build that went well, said: where it is said to have been made, for
+-- the pages, and what is run)
+builtSaid : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Path.Style
+          -> Dev
+          -> List Commands.App
+          -> Co e Unit
+builtSaid st d apps = do
+  _ <- makeDirectory (Path.join st ".heff" "dev")
+  _ <- writeFile (builtFile st) (show d.builds)
+  printErr
+      ("heff dev: built ("
+       ^ show d.builds
+       ^ "); running "
+       ^ namesSaid (List.filter (isRun d.wanted) apps))
+
+-- (the pages' server, to be started beside `heff dev`)
+pagesServer : String -> Dev -> Invocation
+pagesServer self d =
+  beside self ("dev-pages" :: d.port :: maybe Nil (\u -> [u]) d.proxy)
+
+-- | from a build that went well on: the pages' server started, held by a
+-- | `with` to the end, once there are pages; the build said, its programs
+-- | run, held by `with`s, until the next build that goes well; then that
+-- | one's, and so on -- until the program is ended
+cycle : {e : HFunctor}
+      -> {{io : stdio <: e}}
+      -> {{sys : process <: e}}
+      -> {{disk : filesystem <: e}}
+      -> {{prog : Progress.progress <: e}}
+      -> {{clock : Time.time <: e}}
+      -> Path.Style
+      -> Dev
+      -> String
+      -> List Commands.App
+      -> Co e Unit
+cycle st d stamp apps =
+  if List.any isPage apps && not d.pages
+  then do
+    self <- programPath
+    r <-
+      withProcess
+        (pagesServer self d)
+        (\pg -> cycle st { d | pages = True } stamp apps)
+    case r of
+      Right u -> pure u
+      Left err -> do
+        printErr "heff dev: cannot serve the pages"
+        cycle st { d | pages = True } stamp apps
+  else do
+    builtSaid st d apps
+    next <- held st d stamp Nil (List.filter (isRun d.wanted) apps)
+    cycle st next.dev next.stamp next.apps
 
 -- | `heff dev [APP...] [--port N] [--proxy URL]`, at the project's root
 devCmd : {e : HFunctor}
@@ -274,17 +300,19 @@ devCmd wanted port proxy = do
       exit 1
     Just _ -> do
       stamp <- Watch.stamped st Watch.project
-      first <-
-        rebuilt
-          st
-          { running = Nil
-          , pages = Nothing
-          , builds = 0
-          , wanted = wanted
-          , port = fromMaybe "8000" port
-          , proxy = proxy
-          }
-      Watch.watchOver st Watch.project ticked (rebuilt st) stamp first
+      let d : Dev =
+        { builds = 0
+        , wanted = wanted
+        , port = fromMaybe "8000" port
+        , proxy = proxy
+        , pages = False
+        }
+      first <- rebuilt st
+      case first of
+        Just apps -> cycle st { d | builds = 1 } stamp apps
+        Nothing -> do
+          next <- watched st d stamp Nil
+          cycle st next.dev next.stamp next.apps
 
 -- The pages
 --------------------------------------------------------------------------------

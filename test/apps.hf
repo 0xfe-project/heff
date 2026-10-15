@@ -18,6 +18,7 @@ import co
 import json as Json
 import std.filesystem
 import std.process
+import with
 
 -- (what the tests run by is given, else the test fails)
 given : {e : HFunctor}
@@ -294,8 +295,9 @@ pages = do
 
 -- (lines read from the page until it says to lose the server)
 readUntilLost : {e : HFunctor}
+              -> {s : Type}
               -> {{sys : process <: e}}
-              -> Subprocess
+              -> With s Started
               -> String
               -> Co e String
 readUntilLost p sofar = do
@@ -306,6 +308,16 @@ readUntilLost p sofar = do
       then pure (sofar ^ Bytes.asString b)
       else readUntilLost p (sofar ^ Bytes.asString b)
     _ -> pure sofar
+
+-- (what the page showed, served, the server gone, and after; else the
+-- test fails, the server or the page not run)
+shownOr : {e : HFunctor}
+        -> {{chk : check <: e}}
+        -> Either ProcessError (Either ProcessError String)
+        -> Co e String
+shownOr (Left err) = failure ("the server not run: " ^ err.message)
+shownOr (Right (Left err)) = failure "node: not run"
+shownOr (Right (Right all)) = pure all
 
 -- | the notes, a page and its server: its API's test first, the calls
 -- | through the wire with no network; then built, the server run, and
@@ -333,44 +345,45 @@ notes = do
   if not (succeeded tested) then failure ("heff test: " ^ said tested)
     else if not (succeeded built) then failure ("heff build: " ^ said built)
     else do
-      server <-
-        start
+      held <-
+        withProcess
           { command = dir ^ "/.heff/bin/server"
           , args = [port]
           , dir = dir
           , timeout = 120000
           }
-      page <-
-        start
-          { command = "node"
-          , args =
-              [root ^ "/test/page.mjs", "notes", "http://127.0.0.1:" ^ port]
-          , input = Piped
-          , output = Piped
-          , timeout = 120000
-          }
-      case page of
-        Nothing -> failure "node: not run"
-        Just p -> do
-          before <- readUntilLost p ""
-          gone <- case server of
-            Just s -> terminate s
-            Nothing -> pure { ended = NotRun, out = "", err = "" }
-          ok <- writeInput p (Bytes.fromString "\n")
-          r <- wait p
-          failingWith
-              (unlike
-                 [ MkPair "served" "true"
-                 , MkPair "as the server has them" "[ ] milk|[ ] bread"
-                 , MkPair "on another page" "[x] milk|[ ] bread"
-                 , MkPair "another build" "hw 1 2 1"
-                 , MkPair "why" "true"
-                 , MkPair "lose the server" ""
-                 , MkPair "a call to no server" "true"
-                 , MkPair "as they were" "[x] milk|[ ] bread"
-                 , MkPair "stray rejections" ""
-                 ]
-                 (shown (before ^ r.out)))
+          (\server ->
+             withProcess
+               { command = "node"
+               , args =
+                   [ root ^ "/test/page.mjs"
+                   , "notes"
+                   , "http://127.0.0.1:" ^ port
+                   ]
+               , input = Piped
+               , output = Piped
+               , timeout = 120000
+               }
+               (\page -> do
+                  before <- readUntilLost page ""
+                  gone <- terminate server
+                  ok <- writeInput page (Bytes.fromString "\n")
+                  r <- wait page
+                  pure (before ^ r.out)))
+      all <- shownOr held
+      failingWith
+          (unlike
+             [ MkPair "served" "true"
+             , MkPair "as the server has them" "[ ] milk|[ ] bread"
+             , MkPair "on another page" "[x] milk|[ ] bread"
+             , MkPair "another build" "hw 1 2 1"
+             , MkPair "why" "true"
+             , MkPair "lose the server" ""
+             , MkPair "a call to no server" "true"
+             , MkPair "as they were" "[x] milk|[ ] bread"
+             , MkPair "stray rejections" ""
+             ]
+             (shown all))
 
 -- | the first program: its tests, then built, through C, and run on
 -- | some numbers, what it printed held to what it should

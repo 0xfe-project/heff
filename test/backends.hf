@@ -32,6 +32,7 @@ import json as Json
 import state
 import std.filesystem
 import std.process
+import with
 
 -- (what the tests run by is given, else the test fails)
 given : {e : HFunctor}
@@ -1199,30 +1200,48 @@ freePorts n = do
       }
   if succeeded r then pure (lines r.out) else failure ("no ports: " ^ said r)
 
--- | a peer of Node.js's started (the tests' peers), and the first line
--- | it says
-peer : {e : HFunctor}
-     -> {{chk : check <: e}}
-     -> {{sys : process <: e}}
-     -> List String
-     -> Co e (Pair Subprocess String)
-peer arguments = do
+-- (what a command's `with` came to; where the command was not run, the
+-- test fails, saying why)
+ranWith : {e : HFunctor}
+        -> {a : Type}
+        -> {{chk : check <: e}}
+        -> String
+        -> Either ProcessError a
+        -> Co e a
+ranWith what (Right x) = pure x
+ranWith what (Left err) =
+  failure (what ^ ": not run, " ^ err.name ^ ", " ^ err.message)
+
+-- (the first line a peer said, trimmed; where it said none, the test
+-- fails)
+peerLine : {e : HFunctor} -> {{chk : check <: e}} -> Received -> Co e String
+peerLine (Got b) = pure (trim (Bytes.asString b))
+peerLine _ = failure "the peer said nothing"
+
+-- | a peer of Node.js's started (the tests' peers), held by `body` with
+-- | the first line it says, and ended when `body` is
+withPeer : {e : HFunctor}
+         -> {a : Type}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> List String
+         -> ({s : Type} -> With s Started -> String -> Co e a)
+         -> Co e a
+withPeer arguments body = do
   root <- given "HEFF_TEST_ROOT"
-  p <-
-    start
+  r <-
+    withProcess
       { command = "node"
       , args = Cons (root ^ "/test/peers.mjs") arguments
       , input = Piped
       , output = Piped
       , timeout = 120000
       }
-  case p of
-    Nothing -> failure "node: not run"
-    Just s -> do
-      line <- readOutput s (Through "\n") 30000
-      case line of
-        Got b -> pure (MkPair s (trim (Bytes.asString b)))
-        _ -> failure "the peer said nothing"
+      (\p -> do
+        line <- readOutput p (Through "\n") 30000
+        first <- peerLine line
+        body p first)
+  ranWith "node" r
 
 -- (the first of a list, or "")
 firstOf : List String -> String
@@ -1434,7 +1453,8 @@ heffRun = do
 
 -- | commands run to their end, std.process's `run`: each option of an
 -- | `Invocation` and each way a command ends; commands started and
--- | waited for later, `start`, `waitAny`, `kill`; commands spoken to,
+-- | waited for later, each held by a `withProcess`, `wait`, `kill`;
+-- | commands spoken to,
 -- | `writeInput` and `readOutput`, a Content-Length framed exchange
 -- | among them -- the commands sh's; given an input of its own, which
 -- | the commands run with none must not see
@@ -1476,16 +1496,15 @@ commands = do
                   , "kept: exited 0, out \"0123\", err \"abcd\""
                   , "written forever: timed out, out \"y\\ny\\ny\\n\", err \"\""
                   , "not there: not run, out \"\", err \"\""
-                  , "first, quick: exited 0, out \"quick\\n\", err \"\""
-                  , "second, slow: exited 0, out \"slow\\n\", err \"\""
-                  , "of none: none"
+                  , "quick: exited 0, out \"quick\\n\", err \"\""
+                  , "slow: exited 0, out \"slow\\n\", err \"\""
                   , "tried: running still"
                   , "killed: signal 9, out \"\", err \"\""
                   , "started, its time up: timed out, out \"before\\n\", err \"\""
                   , "terminated: signal 15, out \"\", err \"\""
                   , "shown"
                   , "inherited: exited 0, out \"\", err \"shown too\\n\""
-                  , "not started: nothing"
+                  , "not started: ENOENT"
                   , "nothing yet: timeout"
                   , "one: written"
                   , "a line: got \"one\\n\""
@@ -1653,22 +1672,19 @@ httpHeld how want r =
               ])
       (List.zip want (splitBy want r.out))
 
--- | the HTTP client, by C alone (std.http): a server of Node.js's, sent
--- | requests by libcurl in the process, by the curl spawned
--- | (`-DHEFF_HTTP_SPAWN`) and by libcurl's multi interface (a green
--- | thread of std.reactor's), the same from each -- a response, whatever
--- | its status; why none came, curl's code and what it says -- and each
--- | as wanted (where it is curl's version's to say, the start of it).
--- | Run again with no curl on the PATH, libcurl's the same still.
-http : {e : HFunctor}
-     -> {{chk : check <: e}}
-     -> {{sys : process <: e}}
-     -> {{disk : filesystem <: e}}
-     -> Co e Unit
-http = do
+-- (the HTTP client's requests to the peer's routes, its ports on its
+-- first line, each client built and run; the peer ended after)
+httpTo : {e : HFunctor}
+       -> {s : Type}
+       -> {{chk : check <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> With s Started
+       -> String
+       -> Co e Unit
+httpTo started portsLine = do
   here <- workingDir
-  started <- peer ["routes"]
-  ports <- pure (words (snd started))
+  ports <- pure (words portsLine)
   at <- pure ("http://127.0.0.1:" ^ firstOf ports)
   refused <- pure (firstOf (List.drop 1 ports))
   arguments <- pure [at, "http://127.0.0.1:" ^ refused ^ "/"]
@@ -1687,8 +1703,8 @@ http = do
       }
   bySpawn <- run { command = spawned, args = arguments, timeout = 60000 }
   byMulti <- run { command = multi, args = arguments, timeout = 60000 }
-  closeInput (fst started)
-  ended <- wait (fst started)
+  closeInput started
+  ended <- wait started
   failingWith
       (List.append
          (httpHeld "libcurl" want plain)
@@ -1712,6 +1728,20 @@ http = do
                      , MkPair "spawned" bySpawn
                      , MkPair "libcurl's multi, a green thread" byMulti
                      ])))))
+
+-- | the HTTP client, by C alone (std.http): a server of Node.js's, sent
+-- | requests by libcurl in the process, by the curl spawned
+-- | (`-DHEFF_HTTP_SPAWN`) and by libcurl's multi interface (a green
+-- | thread of std.reactor's), the same from each -- a response, whatever
+-- | its status; why none came, curl's code and what it says -- and each
+-- | as wanted (where it is curl's version's to say, the start of it).
+-- | Run again with no curl on the PATH, libcurl's the same still.
+http : {e : HFunctor}
+     -> {{chk : check <: e}}
+     -> {{sys : process <: e}}
+     -> {{disk : filesystem <: e}}
+     -> Co e Unit
+http = withPeer ["routes"] httpTo
 
 -- | files open, read and written a piece at a time (std.filesystem):
 -- | round trips, a large file in chunks and copied, lines, seek and
@@ -1797,8 +1827,9 @@ receivedText Closed = "(closed)"
 
 -- (each of the blocks written to the command's input: whether all were)
 writeTimes : {e : HFunctor}
+           -> {s : Type}
            -> {{sys : process <: e}}
-           -> Subprocess
+           -> With s Started
            -> Bytes
            -> Int
            -> Co e Bool
@@ -1821,8 +1852,8 @@ stdinLines : {e : HFunctor}
 stdinLines = do
   bin <- built "test/node/files.hf" "linesMain" Nil ""
   sanitized <- isSet "HEFF_SANITIZE"
-  p <-
-    start
+  held <-
+    withProcess
       { command = "sh"
       , args = ["-c", "echo $$ >&2; exec \"$0\"", bin]
       , input = Piped
@@ -1830,39 +1861,44 @@ stdinLines = do
       , errors = Piped
       , timeout = 120000
       }
-  s <- case p of
-    Just s -> pure s
-    Nothing -> failure "not run"
-  pid <- readErrors s (Through "\n") 30000
-  pinged <- writeInput s (Bytes.fromString "ping\n")
-  pong <- readOutput s (Through "\n") 30000
-  fed <-
-    writeTimes
-      s
-      (Bytes.fromString
-         (joinWith
-            ""
-            (List.replicate
-               16384
-               (joinWith "" (List.replicate 63 "x") ^ "\n"))))
-      64
-  rss <-
-    run { command = "ps", args = ["-o", "rss=", "-p", trim (receivedText pid)] }
-  closeInput s
-  r <- wait s
-  kib <- pure (fromMaybe 0 (parseInt (trim rss.out)))
-  failingWith
-      (List.append
-         (if strEq
-               (receivedText pong ^ r.out)
-               "pong\nlines 1048577 bytes 66060292\n"
-             && strEq r.err ""
-             && succeeded r
-          then Nil
-          else ["stdin a line at a time: " ^ receivedText pong ^ said r])
-         (if not sanitized && kib > 16384
-          then ["stdin a line at a time: " ^ show kib ^ " KiB held, 64 MiB in"]
-          else Nil))
+      (\s -> do
+        pid <- readErrors s (Through "\n") 30000
+        pinged <- writeInput s (Bytes.fromString "ping\n")
+        pong <- readOutput s (Through "\n") 30000
+        fed <-
+          writeTimes
+            s
+            (Bytes.fromString
+               (joinWith
+                  ""
+                  (List.replicate
+                     16384
+                     (joinWith "" (List.replicate 63 "x") ^ "\n"))))
+            64
+        rss <-
+          run
+            { command = "ps"
+            , args = ["-o", "rss=", "-p", trim (receivedText pid)]
+            }
+        closeInput s
+        r <- wait s
+        kib <- pure (fromMaybe 0 (parseInt (trim rss.out)))
+        failingWith
+            (List.append
+               (if strEq
+                     (receivedText pong ^ r.out)
+                     "pong\nlines 1048577 bytes 66060292\n"
+                   && strEq r.err ""
+                   && succeeded r
+                then Nil
+                else ["stdin a line at a time: " ^ receivedText pong ^ said r])
+               (if not sanitized && kib > 16384
+                then [ "stdin a line at a time: "
+                     ^ show kib
+                     ^ " KiB held, 64 MiB in"
+                     ]
+                else Nil)))
+  ranWith "stdin a line at a time" held
 
 -- | green threads, scheduled by std.reactor, by C alone: one reads the
 -- | standard input, a pipe, a line at a time, while another counts --
@@ -1875,22 +1911,42 @@ greenStdin : {e : HFunctor}
            -> Co e Unit
 greenStdin = do
   bin <- built "test/node/files.hf" "greenMain" Nil ""
-  p <- start { command = bin, input = Piped, output = Piped, timeout = 120000 }
-  s <- case p of
-    Just s -> pure s
-    Nothing -> failure "not run"
-  counted <-
-    readOutput s (Through "counted while the reader waits: 1000\n") 60000
-  written <- writeInput s (Bytes.fromString "one\ntwo\nthree\n")
-  closeInput s
-  r <- wait s
-  if strEq
-       (receivedText counted ^ r.out)
-       "counted while the reader waits: 1000\nread: 3 lines\nmain done\n"
-     && strEq r.err ""
-     && succeeded r
-    then pure MkUnit
-    else failure (receivedText counted ^ said r)
+  held <-
+    withProcess
+      { command = bin, input = Piped, output = Piped, timeout = 120000 }
+      (\s -> do
+        counted <-
+          readOutput s (Through "counted while the reader waits: 1000\n") 60000
+        written <- writeInput s (Bytes.fromString "one\ntwo\nthree\n")
+        closeInput s
+        r <- wait s
+        if strEq
+             (receivedText counted ^ r.out)
+             "counted while the reader waits: 1000\nread: 3 lines\nmain done\n"
+           && strEq r.err ""
+           && succeeded r
+          then pure MkUnit
+          else failure (receivedText counted ^ said r))
+  ranWith "green stdin" held
+
+-- | commands held by green threads, scheduled by std.reactor, by C
+-- | alone: three sleeps of a second each, a `withProcess` in a thread of
+-- | its own, waited for at once -- in about a second, as each wait is
+-- | pending while the others go on; one after the other, they would take
+-- | three, past the time limit
+greenProcess : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> Co e Unit
+greenProcess = do
+  bin <- built "test/node/green-process.hf" "main" Nil ""
+  r <- run { command = bin, timeout = 2500 }
+  failingWith
+      (against
+         "green process"
+         { out = Just "3 sleeps waited for at once\n", err = Just "" }
+         r)
 
 -- | TCP sockets, by C alone (std.net): a connection to a listener of
 -- | the program's own at the port the test picked, each side echoing
@@ -1987,28 +2043,28 @@ greenSockets = do
          })
   failingWith msgs
 
--- | std.http's requests from green threads, by C alone: ten at once, to
--- | a server of Node.js's that takes half a second over each -- at once
--- | as the server sees it, more than one of them in hand together -- and
--- | one refused while they wait; and ten asked of the program's own
--- | server, std.net's sockets and libcurl's waited on together
-greenHttp : {e : HFunctor}
-          -> {{chk : check <: e}}
-          -> {{sys : process <: e}}
-          -> {{disk : filesystem <: e}}
-          -> Co e Unit
-greenHttp = do
+-- (the requests to the slow peer, its port on its first line, and to
+-- the program's own server, each held to what it is to do; the peer
+-- ended after)
+greenHttpTo : {e : HFunctor}
+            -> {s : Type}
+            -> {{chk : check <: e}}
+            -> {{sys : process <: e}}
+            -> {{disk : filesystem <: e}}
+            -> With s Started
+            -> String
+            -> Co e Unit
+greenHttpTo started port = do
   ports <- freePorts 1
-  started <- peer ["slow", "500"]
   bin <- built "test/node/green-http.hf" "main" Nil ""
   r <-
     run
       { command = bin
-      , args = ["http://127.0.0.1:" ^ snd started, "10", firstOf ports]
+      , args = ["http://127.0.0.1:" ^ port, "10", firstOf ports]
       , timeout = 60000
       }
-  closeInput (fst started)
-  ended <- wait (fst started)
+  closeInput started
+  ended <- wait started
   most <-
     pure
       (fromMaybe
@@ -2038,6 +2094,18 @@ greenHttp = do
                , err = Just ""
                }
                own)))
+
+-- | std.http's requests from green threads, by C alone: ten at once, to
+-- | a server of Node.js's that takes half a second over each -- at once
+-- | as the server sees it, more than one of them in hand together -- and
+-- | one refused while they wait; and ten asked of the program's own
+-- | server, std.net's sockets and libcurl's waited on together
+greenHttp : {e : HFunctor}
+          -> {{chk : check <: e}}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> Co e Unit
+greenHttp = withPeer ["slow", "500"] greenHttpTo
 
 -- | std.http.server's `serveConcurrently`, by C alone: a green thread a
 -- | connection, forty clients holding theirs open at once, each
@@ -2194,16 +2262,21 @@ httpServer = do
       }
   ports <- freePorts 1
   bin <- built "test/node/served.hf" "main" Nil ""
-  p <- start { command = bin, args = List.take 1 ports, timeout = 60000 }
-  client <-
-    run
-      { command = "node"
-      , args = [root ^ "/test/peers.mjs", "client", firstOf ports]
-      , timeout = 120000
-      }
-  server <- case p of
-    Just s -> wait s
-    Nothing -> pure { ended = NotRun, out = "", err = "" }
+  served <-
+    withProcess
+      { command = bin, args = List.take 1 ports, timeout = 60000 }
+      (\p -> do
+        client <-
+          run
+            { command = "node"
+            , args = [root ^ "/test/peers.mjs", "client", firstOf ports]
+            , timeout = 120000
+            }
+        server <- wait p
+        pure (MkPair client server))
+  both <- ranWith "http server" served
+  client <- pure (fst both)
+  server <- pure (snd both)
   got <-
     pure
       (List.map
@@ -2750,6 +2823,7 @@ backends =
       , integration "files" files
       , integration "stdin a line at a time" stdinLines
       , integration "green stdin" greenStdin
+      , integration "green process" greenProcess
       , integration "sockets" sockets
       , integration "green sockets" greenSockets
       , integration "green http" greenHttp
