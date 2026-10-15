@@ -4482,6 +4482,9 @@ typedef struct {
   HeffMsg *in, *out;
   char *why;
   int joined;
+  int fd[2];          // (a pipe, a byte in it once the place has ended:
+                      //  for a join that is a wait of the reactor's;
+                      //  -1 where the system has none)
 } HeffPlace;
 
 HEFF_FN V heff_kept(V self, V *a);
@@ -4501,6 +4504,10 @@ HEFF_FN void *heff_place_run(void *u) {
     memcpy(p->why, why, n);
   } else p->out = heff_msg_of(r);
   heff_thread_end();
+#ifndef _WIN32
+  char b = 1;
+  if (p->fd[1] >= 0) while (write(p->fd[1], &b, 1) < 0 && errno == EINTR) {}
+#endif
   return NULL;
 }
 
@@ -4513,8 +4520,22 @@ HEFF_FN int64_t heff_place_start(V c) {
   p->out = NULL;
   p->why = NULL;
   p->joined = 0;
+  p->fd[0] = p->fd[1] = -1;
+#ifndef _WIN32
+  if (pipe(p->fd) == 0) {
+    fcntl(p->fd[0], F_SETFL, fcntl(p->fd[0], F_GETFL) | O_NONBLOCK);
+    fcntl(p->fd[1], F_SETFL, fcntl(p->fd[1], F_GETFL) | O_NONBLOCK);
+  } else p->fd[0] = p->fd[1] = -1;
+#endif
   if (heff_thread_start(&p->tid, heff_place_run, p) != 0) heff_fail("places: cannot start a place");
   return heff_hold(p, NULL);
+}
+
+// (a descriptor readable once place `i` has ended: for a join that is
+// a wait of the reactor's -- -1 where the system has none)
+HEFF_FN int heff_place_fd(int64_t i) {
+  HeffPlace *p = heff_held(i);
+  return p->fd[0];
 }
 
 // (place `i` joined: its value, made here; or its failure, this
@@ -4527,6 +4548,7 @@ HEFF_FN V heff_place_join(int64_t i) {
   heff_release(i);
   HeffMsg *out = p->out;
   char *why = p->why;
+  if (p->fd[0] >= 0) { close(p->fd[0]); close(p->fd[1]); }
   free(p);
   if (why) heff_fail_again(why);
   return heff_msg_value(out);
