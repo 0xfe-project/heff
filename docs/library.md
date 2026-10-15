@@ -165,15 +165,22 @@ What is above, in `lib/`, is pure, the same on every backend.
   ([a client and its server](remote.md));
 - `browser.js` (JavaScript's strings, `JSString`).
 
-`gpu` (lib/gpu.hf) is a GPU as an effect, `import gpu as Gpu`: a
-device opened (`Gpu.open`), buffers of bytes on it made, written, read
-and let go of (`newBuffer`, `writeBuffer`, `readBuffer`, `freeBuffer`),
-a kernel loaded from its code and its entry point (`load`), and run
-over a grid of workgroups with buffers bound, the first at
-`@binding(0)` (`dispatch`), each answered when the GPU is done, an
-`Either GpuError a`.  Its provider is WebGPU's, a page's, so a kernel
-is WGSL; the example page vecadd (`examples/pages/`) adds two vectors
-of Float32s by one.
+`gpu` is a GPU as an effect, `import gpu as Gpu`: a device held by a
+`with` at the top of the program (`withDevice body`, its body given a
+`With s Device`, the device closed when the body ends), buffers of
+bytes on it each held by a `with` of their own inside it (`withBuffer d
+n body`, a `With t Buffer`), written and read (`writeBuffer`,
+`readBuffer`), a kernel loaded from its code and its entry point
+(`load`, a `Pipeline`: the device's, nothing to let go of), and run
+over a grid of workgroups with its buffers bound in order, the first at
+`@binding(0)` (`dispatch1` to `dispatch3`: each buffer is in a region of
+its own, so a dispatch takes them one by one), each answered when the
+GPU is done, an `Either GpuError a` ([a thing held by a
+`with`](#a-thing-held-by-a-with)).  A device, a buffer and a pipeline
+are the host's own things, foreign values, and no `With` leaves its
+body: a buffer is let go of at its `with`'s end, never used after.
+Its provider is WebGPU's, a page's, so a kernel is WGSL; the example
+page vecadd adds two vectors of Float32s by one.
 
 A kernel is written in heff, by `gpu.kernel`'s combinators (`import
 gpu.kernel as Kernel`), not quoted: an expression of the kernel is an
@@ -196,12 +203,13 @@ the combinators -- the constructors under them are named `Unsafe...`,
 as heff has no module privacy.  `gpu.wgsl` (`import gpu.wgsl as Wgsl`)
 prints a kernel as WGSL (`source3 k`), its body by a handler of `stmt`
 whose state is a fresh-name counter and the lines; `gpu.run` (`import
-gpu.run as Run`) runs one: a `Typed a` is a buffer of `count` `a`s
-(`newTyped`, `writeTyped`, `readTyped`, `freeTyped`), and `run3 d k n
-x y z` loads `k` and dispatches it over `n` invocations, as many
-workgroups as they take.  The vecadd page's `vecAdd` is one, and its
-module's `do` runs the steps on the GPU, each an `Either GpuError`, by
-a `bind` of its own that stops at the first error; test/gpu/ pins each
+gpu.run as Run`) runs one: a `Typed t a` is a buffer of `count` `a`s
+held in the region `t` (`withTyped d n body`, `writeTyped`,
+`readTyped`), and `run3 d k n x y z` loads `k` and dispatches it over
+`n` invocations, as many workgroups as they take.  The vecadd page's
+`vecAdd` is one, and its module's `do` runs the steps on the GPU, each
+an `Either GpuError`, by a `bind` of its own that stops at the first
+error, its three buffers held one inside the next; test/gpu/ pins each
 statement's WGSL.
 
 A program imports only its own half: a C program that imports a module

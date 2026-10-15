@@ -1,71 +1,60 @@
 -- A kernel of gpu.kernel run on a GPU: printed as WGSL
 -- (gpu.wgsl), loaded, and dispatched over as many workgroups as `n`
 -- invocations take, its buffers bound in order.  A buffer of `count`
--- elements of a kernel's number type `a` is a `Typed a`, which a kernel
--- of an `Input a` or an `Output a` there takes.  Import it by a name,
--- `import gpu.run as Run`.
+-- elements of a kernel's number type `a` is a `Typed t a`, held by
+-- `withTyped`'s body in the region `t` as the buffer under it is, which
+-- a kernel of an `Input a` or an `Output a` there takes.  Import it by
+-- a name, `import gpu.run as Run`.
 --
 -- The type holds what a buffer is a buffer of, not what was written
 -- into it: its bytes are written and read as they are (`writeTyped`,
--- `readTyped`), and a `Typed a` is any record of a buffer and a count,
--- the one `newTyped` makes or not.
+-- `readTyped`), and a `Typed t a` is any record of a buffer and a
+-- count, the one `withTyped` makes or not.
 
 import co
 import gpu as Gpu
 import gpu.kernel as Kernel
 import gpu.wgsl as Wgsl
+import with
 
--- | A buffer on the device of `count` elements of the type `a`.
-type Typed a = { buffer : Gpu.Buffer, count : Int }
+-- | A buffer on the device of `count` elements of the type `a`, held in
+-- | the region `t`.
+type Typed (t : Type) a = { buffer : With t Gpu.Buffer, count : Int }
 
--- (the buffer made, typed)
-typedOf : {e : HFunctor}
-        -> {a : Type}
-        -> Int
-        -> Either Gpu.GpuError Gpu.Buffer
-        -> Co e (Either Gpu.GpuError (Typed a))
-typedOf n (Left err) = pure (Left err)
-typedOf n (Right b) = pure (Right { buffer = b, count = n })
-
--- | A buffer of `n` `a`s on the device, each 0.
-newTyped : {e : HFunctor}
-         -> {{ev : Gpu.gpu <: e}}
-         -> {a : Type}
-         -> {{numeric : Kernel.Numeric a}}
-         -> Gpu.Device
-         -> Int
-         -> Co e (Either Gpu.GpuError (Typed a))
-newTyped d n = bind (Gpu.newBuffer d (numeric.bytes * n)) (typedOf n)
+-- | A buffer of `n` `a`s on the device, each 0, held by `body` in a
+-- | region of its own and let go of when `body` ends.
+withTyped : {e : HFunctor}
+          -> {{ev : Gpu.gpu <: e}}
+          -> {s a r : Type}
+          -> {{numeric : Kernel.Numeric a}}
+          -> With s Gpu.Device
+          -> Int
+          -> ({t : Type} -> Typed t a -> Co e r)
+          -> Co e (Either Gpu.GpuError r)
+withTyped d n body =
+  Gpu.withBuffer d (numeric.bytes * n) (\b -> body { buffer = b, count = n })
 
 -- | The bytes written into the buffer from its start: the elements, as
 -- | the GPU has them (little-endian), one after another.
 writeTyped : {e : HFunctor}
            -> {{ev : Gpu.gpu <: e}}
-           -> {a : Type}
-           -> Gpu.Device
-           -> Typed a
+           -> {s t a : Type}
+           -> With s Gpu.Device
+           -> Typed t a
            -> Bytes
            -> Co e (Either Gpu.GpuError Unit)
-writeTyped d t bs = Gpu.writeBuffer d t.buffer 0 bs
+writeTyped d b bs = Gpu.writeBuffer d b.buffer 0 bs
 
 -- | The buffer's elements, as bytes, once what the GPU was given to do
 -- | before is done.
 readTyped : {e : HFunctor}
           -> {{ev : Gpu.gpu <: e}}
-          -> {a : Type}
+          -> {s t a : Type}
           -> {{numeric : Kernel.Numeric a}}
-          -> Gpu.Device
-          -> Typed a
+          -> With s Gpu.Device
+          -> Typed t a
           -> Co e (Either Gpu.GpuError Bytes)
-readTyped d t = Gpu.readBuffer d t.buffer 0 (numeric.bytes * t.count)
-
--- | The buffer let go of.
-freeTyped : {e : HFunctor}
-          -> {{ev : Gpu.gpu <: e}}
-          -> {a : Type}
-          -> Typed a
-          -> Co e Unit
-freeTyped t = Gpu.freeBuffer t.buffer
+readTyped d b = Gpu.readBuffer d b.buffer 0 (numeric.bytes * b.count)
 
 -- | How many workgroups of `size` invocations `n` take: `n / size`,
 -- | rounded up.
@@ -76,65 +65,72 @@ freeTyped t = Gpu.freeBuffer t.buffer
 workgroups : Int -> Int -> Int
 workgroups n size = (n + size - 1) / size
 
--- (the kernel loaded, dispatched)
-dispatched : {e : HFunctor}
-           -> {{ev : Gpu.gpu <: e}}
-           -> Gpu.Device
-           -> Int
-           -> List Gpu.Buffer
-           -> Either Gpu.GpuError Gpu.Pipeline
-           -> Co e (Either Gpu.GpuError Unit)
-dispatched d groups buffers (Left err) = pure (Left err)
-dispatched d groups buffers (Right pipeline) =
-  Gpu.dispatch d pipeline buffers groups 1 1
-
--- (a kernel run, its buffers given)
+-- (the kernel loaded, then dispatched by `go` over as many workgroups as
+-- `n` invocations take)
 launched : {e : HFunctor}
+         -> {s : Type}
          -> {{ev : Gpu.gpu <: e}}
-         -> Gpu.Device
+         -> With s Gpu.Device
          -> Kernel.Kernel
          -> Int
-         -> List Gpu.Buffer
+         -> (Gpu.Pipeline -> Int -> Co e (Either Gpu.GpuError Unit))
          -> Co e (Either Gpu.GpuError Unit)
-launched d kernel n buffers =
+launched d kernel n go =
   bind
     (Gpu.load d (Wgsl.source kernel) kernel.entry)
-    (dispatched d (workgroups n kernel.workgroup) buffers)
+    (either
+       (\err -> pure (Left err))
+       (\pipeline -> go pipeline (workgroups n kernel.workgroup)))
 
 -- | The kernel run for `n` invocations at least, over as many
 -- | workgroups as they take, given its buffer: done when the GPU is.
 run1 : {e : HFunctor}
      -> {{ev : Gpu.gpu <: e}}
-     -> {m a : Type}
-     -> Gpu.Device
+     -> {s t m a : Type}
+     -> With s Gpu.Device
      -> Kernel.Kernel1 (Kernel.Buf m a)
      -> Int
-     -> Typed a
+     -> Typed t a
      -> Co e (Either Gpu.GpuError Unit)
-run1 d k n x = launched d (Kernel.kernelOf1 k) n [x.buffer]
+run1 d k n x =
+  launched
+    d
+    (Kernel.kernelOf1 k)
+    n
+    (\pipeline groups -> Gpu.dispatch1 d pipeline x.buffer groups 1 1)
 
 -- | ... given its two buffers.
 run2 : {e : HFunctor}
      -> {{ev : Gpu.gpu <: e}}
-     -> {m1 m2 a b : Type}
-     -> Gpu.Device
+     -> {s t u m1 m2 a b : Type}
+     -> With s Gpu.Device
      -> Kernel.Kernel2 (Kernel.Buf m1 a) (Kernel.Buf m2 b)
      -> Int
-     -> Typed a
-     -> Typed b
+     -> Typed t a
+     -> Typed u b
      -> Co e (Either Gpu.GpuError Unit)
-run2 d k n x y = launched d (Kernel.kernelOf2 k) n [x.buffer, y.buffer]
+run2 d k n x y =
+  launched
+    d
+    (Kernel.kernelOf2 k)
+    n
+    (\pipeline groups -> Gpu.dispatch2 d pipeline x.buffer y.buffer groups 1 1)
 
 -- | ... given its three buffers.
 run3 : {e : HFunctor}
      -> {{ev : Gpu.gpu <: e}}
-     -> {m1 m2 m3 a b c : Type}
-     -> Gpu.Device
+     -> {s t u v m1 m2 m3 a b c : Type}
+     -> With s Gpu.Device
      -> Kernel.Kernel3 (Kernel.Buf m1 a) (Kernel.Buf m2 b) (Kernel.Buf m3 c)
      -> Int
-     -> Typed a
-     -> Typed b
-     -> Typed c
+     -> Typed t a
+     -> Typed u b
+     -> Typed v c
      -> Co e (Either Gpu.GpuError Unit)
 run3 d k n x y z =
-  launched d (Kernel.kernelOf3 k) n [x.buffer, y.buffer, z.buffer]
+  launched
+    d
+    (Kernel.kernelOf3 k)
+    n
+    (\pipeline groups ->
+       Gpu.dispatch3 d pipeline x.buffer y.buffer z.buffer groups 1 1)
