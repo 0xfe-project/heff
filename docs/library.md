@@ -133,8 +133,7 @@ What is above, in `lib/`, is pure, the same on every backend.
 
 `lib/std/` is the system's, for the C backend (`--backend=c`):
 
-- `std.io` (the standard streams), `std.filesystem` (and
-  `std.filesystem.held`, files held by a `with`), `std.process`,
+- `std.io` (the standard streams), `std.filesystem`, `std.process`,
   `std.http` (an HTTP client), `std.net` (TCP sockets), `std.progress`
   (what a program is doing, drawn on a terminal), `std.thread` (threads
   truly at once: a pool, spreads, and `Parallel` handled by them --
@@ -148,8 +147,7 @@ What is above, in `lib/`, is pure, the same on every backend.
 - `std.reference` (the world's cells) and `std.time`: effects needed on both
   sides, one module each with a provider in C and one in JavaScript,
   which a page's script has too;
-- `std.handle` (the world's things, which one effect hands out and
-  another takes), `std.path`, `std.cli` (command lines) and
+- `std.path`, `std.cli` (command lines) and
   `std.cli.interactive` (a program's commands as an app, to learn them
   by), `std.terminal.widget` (keys, screens and widgets, as values),
   `std.doc` (documents laid out) and `std.math` (a float's functions:
@@ -460,27 +458,36 @@ is a read bit); `realPath path` is the path with its links resolved
 the system keeps temporary ones (`TMPDIR`, else `/tmp`), named the
 prefix and six letters, and made only where nothing is, so that
 programs run at once never share one: its path; `temporaryFile prefix` a
-file so, open, `Pair` its path and it.  Both are the program's to
-remove.  Paths are put together and taken apart by `std.path`, which
-is pure.
+file so, made and empty: its path, for `withFile` to open.  Both are
+the program's to remove.  Paths are put together and taken apart by
+`std.path`, which is pure.
 
-An open file is a `File`, a handle (`Handle OpenFile`, std.handle).
-`openFile path { access = Read }` opens one for `Read`, `Write` (from
-its start), `Append` (each write at its end) or `ReadWrite`; the other
-fields of `OpenOptions` are as the access has them by default: whether
-the file is made where there is none (`create`, for writing and
-appending), with what `mode` (`0x1a4`, less the umask), whether it is
-emptied (`truncate`, for writing), and whether it must be new
-(`exclusive`, `False`).  `readChunk h n` is up to `n` bytes, `Bytes`
-(16 MiB at most), none at its end; `readLine h` the next line, `Maybe
-String`, `Nothing` at the end, without its `\n` or `\r\n`, and the last
-one too where no newline ends it -- a string, which holds any bytes, as
-a file's are, UTF-8 or not; `writeBytes h b` and `writeString h s`
-write them all; `seek h from n` (`FromStart`, `FromCurrent`, `FromEnd`)
-and `tell h` are where it is read and written next, from its start;
-`handleStatus h` is its `Status`; and `closeFile h` closes it and lets its
-handle go (an operation given it after that fails the program, as
-std.net's do).  A file reads ahead, a buffer at a time, and gives back
+An open file is the host's own thing, held by a `with` ([a thing held
+by a `with`](#a-thing-held-by-a-with)): `withFile path { access = Read
+} body` opens it for `Read`, `Write` (from its start), `Append` (each
+write at its end) or `ReadWrite`, runs `body` with it, a `With s
+OpenFile` in a region `s` of its own, and closes it when the body ends;
+it is what the body came to, `Either FileError a` (`Left` where the
+file did not open or close).  The other fields of `OpenOptions` are as
+the access has them by default: whether the file is made where there is
+none (`create`, for writing and appending), with what `mode` (`0x1a4`,
+less the umask), whether it is emptied (`truncate`, for writing), and
+whether it must be new (`exclusive`, `False`).  In the body, `readChunk
+f n` is up to `n` bytes, `Bytes` (16 MiB at most), none at its end;
+`readLine f` the next line, `Maybe String`, `Nothing` at the end,
+without its `\n` or `\r\n`, and the last one too where no newline ends
+it -- a string, which holds any bytes, as a file's are, UTF-8 or not;
+`writeBytes f b` and `writeString f s` write them all; `seek f from n`
+(`FromStart`, `FromCurrent`, `FromEnd`) and `tell f` are where it is
+read and written next, from its start; and `fileStatus f` is its
+`Status`.  `withFile path o (\f -> pure f)` does not type-check (a
+function that holds it can be: an operation on it after the body is
+`EBADF`).  Should the body be left otherwise -- a throw heard by a
+`catch` outside it, a handler between that drops the continuation --
+the file is closed where the program drops its last reference to it, at
+once (the count of it, in C, comes to naught before the `catch` arm
+runs).  What uses it needs only `filesystem`: no effect of scopes, nor
+`exception`.  A file reads ahead, a buffer at a time, and gives back
 what it read ahead before it is written, so that a file opened
 `ReadWrite` is written where the program has read up to; what is
 written is not held back, each write the system's.  What may fail gives
@@ -488,16 +495,16 @@ written is not held back, each write the system's.  What may fail gives
 on every system (`ENOENT`, `EACCES`, `EISDIR`), and its `message`
 (`showFileError`).
 
-`foldLines h acc step` folds `step` over the lines of an open file,
-from where it is to its end, one line held at a time, and `copyHandle
+`foldLines f acc step` folds `step` over the lines of an open file,
+from where it is to its end, one line held at a time, and `copyOpen
 from to` writes what is left of one to another, a chunk at a time.
-`stdin`, `stdout` and `stderr` are the standard streams as open files,
-the same handle each time: a program reads its input a line at a time,
-in as little memory as a line takes.  (std.io's `readStdin` reads it
-all, to its end: read it one way or the other, not both, as neither
-sees what the other read ahead.)  What std.io wrote is written out
-before a write of `stdout` or `stderr`; a standard stream's handle
-closed is let go of, and the stream left open.
+`withStdin body`, `withStdout body` and `withStderr body` give the body
+a standard stream as an open file, left open when the body ends, the
+same stream each time and what it read ahead kept: a program reads its
+input a line at a time, in as little memory as a line takes.  (std.io's
+`readStdin` reads it all, to its end: read it one way or the other, not
+both, as neither sees what the other read ahead.)  What std.io wrote is
+written out before a write of the standard output or error.
 
 ```haskell
 import std.filesystem
@@ -507,29 +514,13 @@ countWords : {e : HFunctor} -> Int -> String -> Co e Int
 countWords n line = pure (n + List.length (words line))
 
 -- (the words of the standard input, read a line at a time)
-wordsIn : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e (Either FileError Int)
-wordsIn = bind stdin (\i -> foldLines i 0 countWords)
-```
+wordsIn : {e : HFunctor} -> {{disk : filesystem <: e}}
+        -> Co e (Either FileError (Either FileError Int))
+wordsIn = withStdin (\i -> foldLines i 0 countWords)
 
-A file may instead be held by a `with`, closed however the program is
-done with it ([a thing held by a `with`](#a-thing-held-by-a-with)):
-std.filesystem.held's `withFile path { access = Read } body` opens it
-and runs `body` with it, a `With s OpenFile`, read by `readLineOf f` and
-written by `writeStringTo f s`; the body ended, it closes it, and is
-what the body came to, `Either FileError a` (`Left` where the file did
-not open or close).  `withFile path o (\f -> pure f)` does not
-type-check (a function that holds it can be: an operation on it after
-the body is `EBADF`).  Should the body be left otherwise -- a throw heard
-by a `catch` outside it, a handler between that drops the continuation
--- the file is closed where the program drops its last reference to it,
-at once (the count of it, in C, comes to naught before the `catch` arm
-runs).  What uses it needs only `filesystem`: no effect of scopes, nor
-`exception`.
-
-```haskell
 firstLine : {e : HFunctor} -> {{disk : filesystem <: e}} -> String
           -> Co e (Either FileError (Either FileError (Maybe String)))
-firstLine path = withFile path { access = Read } (\f -> readLineOf f)
+firstLine path = withFile path { access = Read } (\f -> readLine f)
 ```
 
 A regular file is read and written there and then, the whole program
@@ -720,10 +711,19 @@ withFile : {e : HFunctor} -> {a : Type} -> {{ev : filesystem <: e}}
          -> Co e (Either FileError a)
 withFile path o body = scoped (opened path o) closed body   -- `opened`, `closed`: the module's own
 
-readLineOf : {e : HFunctor} -> {s : Type} -> {{ev : filesystem <: e}}
-           -> With s OpenFile -> Co e (Either FileError (Maybe String))
-readLineOf f = op (ev (ReadLineHeld (inside f) (\r -> r))) val
+readLine : {e : HFunctor} -> {s : Type} -> {{ev : filesystem <: e}}
+         -> With s OpenFile -> Co e (Either FileError (Maybe String))
+readLine f = op (ev (ReadLine (inside f) (\r -> r))) val
 ```
+
+The thing itself is a value of a host type, which the library declares
+as a `data` of no constructors (`OpenFile`, `TcpStream`, `Element`):
+the host's own thing, a foreign value, which no program makes or takes
+apart ([host types](providers.md#host-types)).  What lives as long as
+the program -- a GPU's device, the page's document, a standard stream
+-- is had by a `with` at the top of `main`, and what is opened above is
+in scope for all that runs inside it: no table of the world's things
+holds them, and nothing has a number for one.
 
 ## The terminal
 

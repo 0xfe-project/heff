@@ -12,9 +12,9 @@
 // is, an integer of a fixed-width type of up to 32 bits a word of its
 // value, a Float32 a word of its bits (`heff_f32_of`, `heff_f32`), a Float64
 // boxed (`FLT_OF`, `heff_flt`); a Rune is a word of its code point.  It
-// is bundled after the runtime, whose functions it uses -- among
-// them the world's, which hold what every provider hands out
-// (`heff_hold`, `heff_held`, `heff_release`).
+// is bundled after the runtime, whose functions it uses -- among them
+// those of foreign values, the host's things a provider hands out and
+// another takes (`heff_foreign`, `heff_foreign_ptr`).
 // A string it is given, or gives, crosses to the system and back only
 // through the runtime's helpers, by what it is there -- content, a path,
 // a name or text: `heff_str_bytes`, `heff_put`, `heff_cstr`,

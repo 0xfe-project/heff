@@ -744,7 +744,7 @@ loadAll names = do
   began.
 - What is let go of however it is left is no part of `try`: a resource
   is held in a `with` of its own effect, its provider's to release
-  (std.filesystem.held's `withFile`, [the batteries](library.md#the-batteries)).
+  (std.filesystem's `withFile`, [the batteries](library.md#the-batteries)).
 
 Pure code is written as statements by `run do ...`: `run : Id a -> a`,
 of the identity monad (`type Id a = a`), whose `do` is taken apart by

@@ -1,18 +1,21 @@
--- A world of boxes (with tally.hf): a box is a
--- thing of the host's with an Int in it, held by the world for every
--- provider (std.handle).  Its provider, boxes.provider.c, makes boxes
--- and looks in them, and counts the boxes let go of -- by whichever
--- provider asked the world to.
+-- A world of boxes (with tally.hf): a box is a thing of the host's
+-- with an Int in it, held by a `with` (`withBox`), as any host's thing
+-- is: a foreign value, given by value to whichever provider's
+-- operation takes it.  Its provider, boxes.provider.c, makes boxes
+-- and looks in them, empties one as its `with` ends, and counts the
+-- boxes freed -- where the program dropped its last reference to them.
 
 import co
-import std.handle
+import with
 
--- | What a box is, as the kind of a handle: no value has it.
+-- | A box as the host has it: a foreign value; no value of the program
+-- | has it.
 data Box
 
 data BoxesF (m : Type -> Type) x
-  = NewBox Int (Handle Box -> x)
-  | Peek (Handle Box) (Int -> x)
+  = NewBox Int (Box -> x)
+  | Peek Box (Int -> x)
+  | Clear Box x
   | Freed (Int -> x)
 
 boxes : HFunctor
@@ -21,19 +24,45 @@ boxes =
   , hfmap = \m g p -> case p of
       NewBox n k -> NewBox n (\b -> g (k b))
       Peek b k -> Peek b (\n -> g (k n))
+      Clear b x -> Clear b (g x)
       Freed k -> Freed (\n -> g (k n))
   , hmap = \m n nt p -> case p of
       NewBox n k -> NewBox n k
       Peek b k -> Peek b k
+      Clear b x -> Clear b x
       Freed k -> Freed k
   }
 
-newBox : {e : HFunctor} -> {{ev : boxes <: e}} -> Int -> Co e (Handle Box)
-newBox n = op (ev (NewBox n (\b -> b))) val
+-- (a box made, holding `n`)
+made : {e : HFunctor} -> {{ev : boxes <: e}} -> Int -> Co e (Either Unit Box)
+made n = bind (op (ev (NewBox n (\b -> b))) val) (\b -> pure (Right b))
 
-peek : {e : HFunctor} -> {{ev : boxes <: e}} -> Handle Box -> Co e Int
-peek b = op (ev (Peek b (\n -> n))) val
+-- (a box emptied, as its `with` ends)
+emptied : {e : HFunctor}
+        -> {{ev : boxes <: e}}
+        -> Box
+        -> Co e (Either Unit Unit)
+emptied b =
+  bind (op (ev (Clear b (MkUnit : Unit))) val) (\u -> pure (Right MkUnit))
 
--- | how many boxes the world has let go of
+-- | A box holding `n`, had by `body` in a region of its own, and
+-- | emptied when `body` ends; freed where the program drops it.
+withBox : {e : HFunctor}
+        -> {a : Type}
+        -> {{ev : boxes <: e}}
+        -> Int
+        -> ({s : Type} -> With s Box -> Co e a)
+        -> Co e (Either Unit a)
+withBox n body = scoped (made n) emptied body
+
+-- | what the box holds
+peek : {e : HFunctor}
+     -> {s : Type}
+     -> {{ev : boxes <: e}}
+     -> With s Box
+     -> Co e Int
+peek b = op (ev (Peek (inside b) (\n -> n))) val
+
+-- | how many boxes have been freed
 freed : {e : HFunctor} -> {{ev : boxes <: e}} -> Co e Int
 freed = op (ev (Freed (\n -> n))) val

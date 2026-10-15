@@ -1,6 +1,7 @@
-// boxes.hf's world, for the C backend: an effect provider.  A box is an int64_t
-// of its own, held by the world, freed and counted
-// when the world lets it go -- whichever provider asked it to.
+// boxes.hf's world, for the C backend: an effect provider.  A box is an
+// int64_t of its own, handed out as a foreign value, freed and counted
+// when the program drops its last reference to it -- whichever
+// provider's operations it was given to meanwhile.
 
 static int64_t heff_boxes_freed = 0;
 
@@ -16,15 +17,21 @@ static V heff_provider_boxes(V p, V k) {
     *box = INT_OF(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    V i = MK_INT(heff_hold(box, heff_box_free));
-    V x = heff_answer(f, heff_tag(TAG_MkHandle, 1, &i));
+    V x = heff_answer(f, heff_foreign(box, heff_box_free));
     return heff_tail(k, 1, &x);
   }
   case TAG_Peek: {
-    int64_t *box = heff_held(INT_OF(heff_field(heff_field(p, 0), 0)));
+    int64_t *box = heff_foreign_ptr(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
     V x = heff_answer(f, MK_INT(*box));
+    return heff_tail(k, 1, &x);
+  }
+  case TAG_Clear: {
+    int64_t *box = heff_foreign_ptr(heff_field(p, 0));
+    *box = 0;
+    V x = heff_dup(heff_field(p, 1));
+    heff_drop(p);
     return heff_tail(k, 1, &x);
   }
   case TAG_Freed: {

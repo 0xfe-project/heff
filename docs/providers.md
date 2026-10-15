@@ -2,9 +2,9 @@
 
 An effect of the world is carried out by its provider: an effect's
 JavaScript side is in `M.provider.js` beside `M.hf`, its C side in
-`M.provider.c`; the things they hand out the world holds for them all.
-This is where a heff program meets its host, and so where how each
-backend keeps a value matters.  A C provider may run the program in
+`M.provider.c`; the things they hand out, the host's own, the program
+holds as values of host types (below).  This is where a heff program
+meets its host, and so where how each backend keeps a value matters.  A C provider may run the program in
 threads truly at once: see [threads.md](threads.md).
 
 ## Where each runs
@@ -34,8 +34,8 @@ the program's effect is looked at: by `heff compile --backend=c` (and
 (E0351); by `--backend=page`, an import of an effect of `lib/std/`
 with a provider in C and none in JavaScript, or of a module of
 `lib/std/` that imports one, itself or by the modules it imports
-(E0352; one that imports only pure modules, as `std.path` and
-`std.handle` do, is not refused).  The library's own imports are
+(E0352; one that imports only pure modules, as `std.path` does, is not
+refused).  The library's own imports are
 its own; a program's modules' are each said, at the import, naming the
 module and the backend, and in a note, for a module that reaches an
 effect by its imports, that effect and the imports by which it does.  An
@@ -164,15 +164,12 @@ with `errno`: `Either Errno Unit`); `Ffi.ownedString` is a result
 `char *` C malloc'd, copied and freed.  A string argument with a NUL in
 it fails the operation `EINVAL`, where it can fail, else the program.
 
-A foreign value is a pointer the program holds (`heff_foreign(p,
-let_go)` makes one, `heff_foreign_ptr(v)` reads it back), of whatever
-type the operation says it is -- a `data` of no constructors, `data
-Stream` -- the provider vouching for it at the boundary; the program
-drops its last reference, and the named function lets the thing go
-then, at once (Perceus: never while it is referenced).  In JavaScript
-a foreign value is to be the object itself, with a
-`FinalizationRegistry`; a description means nothing there yet: the
-module's `M.provider.js` is the whole of the effect.
+A pointer described crosses as a foreign value, a value of a host type
+(below), of whatever type the operation says it is -- a `data` of no
+constructors, `data Stream` -- the provider vouching for it at the
+boundary, and let go of by the named function when the program drops
+its last reference.  A description means nothing in JavaScript: the
+module's `M.provider.js` is the whole of the effect there.
 
 The compiler holds the description to the effect: a constructor that
 is none of the module's effects' operations, a field too many or too
@@ -208,20 +205,61 @@ streams as an effect, no C written for it).  Functions of no effect
 (libm's, a hash) are not described: they are primitives of the
 runtime or the library; C cannot be trusted to say a function is pure.
 
+## Host types
+
+A thing of the host's that the program holds -- an open file, a
+socket, a GPU's buffer, an element of a page -- is a value of a host
+type: the library declares it as a `data` of no constructors (`data
+OpenFile`, `data TcpStream`, `data Element`), so that no program makes
+one or takes one apart, and an operation's field of that type is the
+thing itself, a foreign value, which the runtime carries and the
+provider builds and reads at the boundary.  No table numbers them: an
+operation of one effect is given what another's handed out by the
+program, by value, as a `with` of the DOM hands the canvas it found to
+an operation of the GPU.
+
+In C, a provider makes one of a pointer and what lets it go,
+`heff_foreign(p, let_go)`, and reads the pointer back where an
+operation is given the value, `heff_foreign_ptr(v)`; a provider given
+another provider's thing checks it is one of its own (a magic word at
+the start of the struct, as std.filesystem's files carry) before it
+trusts the pointer.  The program drops its last reference, and
+`let_go(p)` runs then, at once (Perceus: never while it is referenced),
+so a provider whose thing a pending operation uses keeps the operation
+(its `p`) until it is done.  A thing that places may hold together --
+std.place's channels -- is made by `heff_foreign_shared(p, let_go,
+share)`: crossing to another place, `share(p)` holds it once more and
+the receiver has a foreign value of its own, each place letting it go
+as it drops its last reference, the thing freed by the provider when
+every place has; any other foreign value does not cross (sending one
+fails).  Operations described in C ([above](#operations-described-in-c))
+get all this from `Ffi.pointer`.
+
+In JavaScript a foreign value is the host's object itself, given to the
+program as it is and taken back as it is (`k(a[1](element))`), by this
+provider or another's.  The page owns what the host collects (its
+elements), so a provider of such things needs no finalizer; one whose
+thing the host does not let go of on its own (a GPU's buffer) registers
+what lets it go with a `FinalizationRegistry`, and marks the thing
+released when the `with` releases it, so that the finalizer frees only
+what holds it.
+
 ## Scoped operations
 
 A host's thing that must be let go of -- an open file, a socket, a
 canvas -- is handed out by a `with` of the effect's own, which is
 `with`'s `scoped` around the effect's operations acquiring and
-releasing it (std.filesystem.held's `withFile path options body`): the
+releasing it (std.filesystem's `withFile path options body`): the
 body has it as a `With s a`, polymorphic in the region `s` so that what
 it comes to cannot hold it, one `With` for every effect ([a thing held
 by a `with`](library.md#a-thing-held-by-a-with)).  The effect's
 operations on the thing take the `With s a` and give the thing to the
 provider by `with`'s `inside`; the module exposes its `with` and those
-operations, never the bare acquire.  What uses it needs no effect but
-the thing's own.  Its provider makes sure it is let go of, in two
-parts:
+operations, never the bare acquire.  What lives as long as the program
+(a device, the document, a standard stream) is had by a `with` at the
+top of `main`, in scope for all that runs inside it.  What uses it
+needs no effect but the thing's own.  Its provider makes sure it is let
+go of, in two parts:
 
 - the operation that acquires it gives a foreign value whose function
   letting it go is its release (`heff_foreign(p, let_go)`).  Where the
@@ -232,7 +270,7 @@ parts:
   `FinalizationRegistry`, when the collector finds it, if it does.  A
   drop lets go of what it held as it frees it, in no order promised;
 - the body ended, the `with` releases it by an operation of the
-  effect's own (std.filesystem's `ReleaseHeld`), which marks it
+  effect's own (std.filesystem's `CloseFile`), which marks it
   released: done once, its function letting go of it then frees only
   what holds it, and an operation given it after fails as the host does
   (`EBADF`).

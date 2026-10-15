@@ -2,8 +2,10 @@
 // provider.
 //
 // Whole files, directories and paths are done there and then.  An open
-// file is a `FsFile` the world holds, let go of --
-// closed -- by `CloseFile`; the program has its number.  It reads ahead
+// file is a `FsFile`, the host's own, which the program holds as a
+// foreign value (held by a `with`): closed by `CloseFile` when the
+// `with` ends, and let go of -- closed, unless the `with` closed it --
+// where the program drops its last reference to it.  It reads ahead
 // into a buffer of its own, from which lines and chunks are taken.
 //
 // A read or a write of an open file is a `FsOp`, done in steps as
@@ -376,7 +378,7 @@ static int fs_int(V v, int64_t *n) {
 // Open files
 // ---------------------------------------------------------------------
 
-// (the world's open files, told from what other providers hand out)
+// (this provider's open files, told from what other providers hand out)
 #define FS_MAGIC 0x66696c65u
 // (how much is read ahead at a time; a chunk's most)
 #define FS_BUF ((size_t)65536)
@@ -385,7 +387,8 @@ static int fs_int(V v, int64_t *n) {
 typedef struct {
   uint32_t magic;
   int fd;            // (-1 once closed)
-  int refs;          // (the world's, and each op's that has it)
+  int refs;          // (each foreign value's that is it, each op's that
+                     //  has it; and a standard stream's own)
   int standard;      // (a standard stream's number, 0 to 2: never closed;
                      //  else -1)
   int pollable;      // (a pipe, a terminal, a socket: polled, where a
@@ -397,8 +400,8 @@ typedef struct {
   uint64_t taken;    // (how many times something was taken from it)
 } FsFile;
 
-// (the standard streams' files, once asked for: one each, so that what
-// one has read ahead is the other's too)
+// (the standard streams' files, once asked for: one each, kept, so
+// that what one `with` read ahead is the next one's too)
 static FsFile *fs_standard[3];
 
 static void fs_unref(FsFile *h) {
@@ -408,12 +411,14 @@ static void fs_unref(FsFile *h) {
   free(h);
 }
 
-// (the world letting go of it: closed, unless it is a standard stream)
+// (the program's last reference to it dropped: closed, unless the
+// `with` closed it or it is a standard stream, which stays open)
 static void fs_let_go(void *x) {
   FsFile *h = x;
-  if (h->standard >= 0) fs_standard[h->standard] = NULL;
-  else if (h->fd >= 0) close(h->fd);
-  h->fd = -1;
+  if (h->standard < 0 && h->fd >= 0) {
+    close(h->fd);
+    h->fd = -1;
+  }
   fs_unref(h);
 }
 
@@ -422,7 +427,7 @@ static FsFile *fs_new(int fd, int standard) {
   memset(h, 0, sizeof *h);
   h->magic = FS_MAGIC;
   h->fd = fd;
-  h->refs = 1;
+  h->refs = standard >= 0;  // (a standard stream's own: kept)
   h->standard = standard;
   struct stat st;
   if (fstat(fd, &st) == 0) {
@@ -434,27 +439,14 @@ static FsFile *fs_new(int fd, int standard) {
   return h;
 }
 
-// (the file held by the world: `MkHandle i`)
-static V fs_handle(FsFile *h) {
-  V i = MK_INT(heff_hold(h, fs_let_go));
-  return heff_tag_n(TAG_MkHandle, 1, &i);
+// (the file as the program holds it: a foreign value, counted by `h`)
+static V fs_value(FsFile *h) {
+  h->refs++;
+  return heff_foreign(h, fs_let_go);
 }
-
-// (the file a handle is the number of, or the program failed: it is none)
-static FsFile *fs_file(V handle) {
-  FsFile *h = heff_held(INT_OF(heff_field(handle, 0)));
-  if (h->magic != FS_MAGIC) heff_fail("std.filesystem: the handle is no open file");
-  return h;
-}
-
-// (a file held by a `with`: the host's own, a foreign value, let go of
-// -- closed, unless the `with` closed it -- where the program drops its
-// last reference to it, a body left by a throw or a dropped continuation
-// as much as one that ended)
-static V fs_held_value(FsFile *h) { return heff_foreign(h, fs_let_go); }
 
 // (the file a foreign value is, or the program failed: it is none)
-static FsFile *fs_held(V v) {
+static FsFile *fs_file(V v) {
   FsFile *h = heff_foreign_ptr(v);
   if (h->magic != FS_MAGIC) heff_fail("std.filesystem: no open file");
   return h;
@@ -544,7 +536,8 @@ typedef struct {
   uint64_t taken;    //  while `h->taken` is this)
   const uint8_t *data;  // (a write's bytes, `len` of them, `done` written)
   int64_t len, done;
-  V held;            // (what holds them: a write's operation)
+  V held;            // (the operation, which holds the file, and a
+                     //  write's bytes)
   char *owned;       // (or a copy of them, a string's)
   V result;          // (its answer, once it is done and did not fail)
 } FsOp;
@@ -831,8 +824,8 @@ static void fs_letters(char *out) {
   out[6] = 0;
 }
 
-// (a new temporary directory, or file -- open, `Pair` its path and it --
-// its name `prefix` and six letters)
+// (a new temporary directory, or file -- made, empty, closed -- its name
+// `prefix` and six letters: its path)
 static V fs_temp(V prefix, int file) {
   char *pre = heff_cstr(prefix);
   if (!pre) return fs_left(EINVAL);
@@ -860,8 +853,8 @@ static V fs_temp(V prefix, int file) {
     } else {
       int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_BINARY, 0600);
       if (fd >= 0) {
-        V both[2] = { heff_str_bytes(path, (int64_t)strlen(path)), fs_handle(fs_new(fd, -1)) };
-        r = fs_right(heff_tag_n(TAG_MkPair, 2, both));
+        close(fd);
+        r = fs_right(heff_str_bytes(path, (int64_t)strlen(path)));
       } else if (errno != EEXIST) r = fs_left(errno);
     }
   }
@@ -895,9 +888,9 @@ static V fs_set_mode(const char *path, int64_t mode) {
   return r == 0 ? fs_done() : fs_left(errno);
 }
 
-// (`path` opened as `OpenPath` says: `Right` its handle, or held by a
-// `with`, the file itself; or `Left` why not -- a directory's, EISDIR)
-static V fs_open(const char *path, int64_t access, int create, int truncate, int exclusive, int64_t mode, int held) {
+// (`path` opened as `OpenPath` says: `Right` the file, the host's own;
+// or `Left` why not -- a directory's, EISDIR)
+static V fs_open(const char *path, int64_t access, int create, int truncate, int exclusive, int64_t mode) {
   int flags = access == 0 ? O_RDONLY : access == 1 ? O_WRONLY : access == 2 ? (O_WRONLY | O_APPEND) : O_RDWR;
   if (create) flags |= O_CREAT;
   if (truncate) flags |= O_TRUNC;
@@ -911,12 +904,12 @@ static V fs_open(const char *path, int64_t access, int create, int truncate, int
     close(fd);
     return fs_left(EISDIR);
   }
-  FsFile *h = fs_new(fd, -1);
-  return fs_right(held ? fs_held_value(h) : fs_handle(h));
+  return fs_right(fs_value(fs_new(fd, -1)));
 }
 
 // (a file closed, but a standard stream: what waits on it told so, not
-// polled closed; errno, where it failed)
+// polled closed; errno, where it failed.  Done once: closed, the file's
+// operations are `EBADF`, and letting it go frees only what holds it)
 static int fs_close(FsFile *h) {
   int err = 0;
   if (h->standard < 0 && h->fd >= 0) {
@@ -971,14 +964,13 @@ static V heff_provider_filesystem(V p, V k) {
     return fs_answered(p, 1, fs_temp(heff_field(p, 0), 0), k);
   case TAG_TemporaryFile:
     return fs_answered(p, 1, fs_temp(heff_field(p, 0), 1), k);
-  case TAG_OpenPath:
-  case TAG_OpenHeld: {
+  case TAG_OpenPath: {
     char *path = heff_cstr(heff_field(p, 0));
     int64_t access, mode;
     int ok = path && fs_int(heff_field(p, 1), &access) && fs_int(heff_field(p, 5), &mode);
     V r = !ok ? fs_left(EINVAL)
               : fs_open(path, access, heff_field(p, 2) == NTAG(TAG_True), heff_field(p, 3) == NTAG(TAG_True),
-                        heff_field(p, 4) == NTAG(TAG_True), mode, heff_tag_of(p) == TAG_OpenHeld);
+                        heff_field(p, 4) == NTAG(TAG_True), mode);
     free(path);
     return fs_answered(p, 6, r, k);
   }
@@ -986,30 +978,38 @@ static V heff_provider_filesystem(V p, V k) {
     int64_t i = INT_OF(heff_field(p, 0));
     if (i < 0 || i > 2) heff_fail("std.filesystem: no such standard stream");
     if (!fs_standard[i]) fs_standard[i] = fs_new((int)i, (int)i);
-    return fs_answered(p, 1, fs_handle(fs_standard[i]), k);
+    return fs_answered(p, 1, fs_value(fs_standard[i]), k);
   }
+  // (an operation of an open file: one that waits keeps `p`, and so the
+  // file, while it does, so that it is not let go of under it; after the
+  // `with` closed the file, each is `EBADF`)
   case TAG_ReadChunk: {
     FsFile *h = fs_file(heff_field(p, 0));
+    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
     int64_t n;
     if (!fs_int(heff_field(p, 1), &n)) n = FS_READ_MAX;
     V f = heff_dup(heff_field(p, 2));
-    heff_drop(p);
     if (n <= 0) {
+      heff_drop(p);
       V x = heff_answer(f, fs_right(heff_bytes_in("", 0)));
       return heff_tail(k, 1, &x);
     }
     FsOp *o = fs_op(FS_CHUNK, h);
     o->n = n > FS_READ_MAX ? FS_READ_MAX : n;
+    o->held = p;
     return fs_go(o, fs_chunk_step, f, k);
   }
   case TAG_ReadLine: {
     FsFile *h = fs_file(heff_field(p, 0));
+    if (h->fd < 0) return fs_answered(p, 1, fs_left(EBADF), k);
     V f = heff_dup(heff_field(p, 1));
-    heff_drop(p);
-    return fs_go(fs_op(FS_LINE, h), fs_line_step, f, k);
+    FsOp *o = fs_op(FS_LINE, h);
+    o->held = p;
+    return fs_go(o, fs_line_step, f, k);
   }
   case TAG_WriteBytes: {
     FsFile *h = fs_file(heff_field(p, 0));
+    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
     V f = heff_dup(heff_field(p, 2));
     int64_t n;
     // (the bytes are `p`'s, held until they are written)
@@ -1018,17 +1018,18 @@ static V heff_provider_filesystem(V p, V k) {
   }
   case TAG_WriteString: {
     FsFile *h = fs_file(heff_field(p, 0));
+    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
     V f = heff_dup(heff_field(p, 2));
     size_t n;
     char *data = heff_bytes(heff_field(p, 1), &n);
-    heff_drop(p);
-    return fs_write(h, (const uint8_t *)data, (int64_t)n, 0, data, f, k);
+    return fs_write(h, (const uint8_t *)data, (int64_t)n, p, data, f, k);
   }
   case TAG_Seek: {
     FsFile *h = fs_file(heff_field(p, 0));
     int64_t from, n;
     V r;
-    if (!fs_int(heff_field(p, 1), &from) || !fs_int(heff_field(p, 2), &n)) r = fs_left(EINVAL);
+    if (h->fd < 0) r = fs_left(EBADF);
+    else if (!fs_int(heff_field(p, 1), &from) || !fs_int(heff_field(p, 2), &n)) r = fs_left(EINVAL);
     else {
       // (from where the program has read up to, not where the file was
       // read ahead to)
@@ -1048,39 +1049,15 @@ static V heff_provider_filesystem(V p, V k) {
     }
     return fs_answered(p, 3, r, k);
   }
-  case TAG_HandleStatus: {
+  case TAG_FileStatus: {
     FsFile *h = fs_file(heff_field(p, 0));
+    if (h->fd < 0) return fs_answered(p, 1, fs_left(EBADF), k);
     struct stat st;
     int s = fstat(h->fd, &st);
     return fs_answered(p, 1, fs_status(s, &st), k);
   }
   case TAG_CloseFile: {
-    int64_t i = INT_OF(heff_field(heff_field(p, 0), 0));
     int err = fs_close(fs_file(heff_field(p, 0)));
-    heff_release(i);
-    return fs_answered(p, 1, err ? fs_left(err) : fs_done(), k);
-  }
-  // (a file held by a `with`: its operations keep `p`, and so the file,
-  // while they are, so that it is not let go of under them; closed, each
-  // is `EBADF`)
-  case TAG_ReadLineHeld: {
-    FsFile *h = fs_held(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 1, fs_left(EBADF), k);
-    V f = heff_dup(heff_field(p, 1));
-    FsOp *o = fs_op(FS_LINE, h);
-    o->held = p;
-    return fs_go(o, fs_line_step, f, k);
-  }
-  case TAG_WriteHeld: {
-    FsFile *h = fs_held(heff_field(p, 0));
-    if (h->fd < 0) return fs_answered(p, 2, fs_left(EBADF), k);
-    V f = heff_dup(heff_field(p, 2));
-    size_t n;
-    char *data = heff_bytes(heff_field(p, 1), &n);
-    return fs_write(h, (const uint8_t *)data, (int64_t)n, p, data, f, k);
-  }
-  case TAG_ReleaseHeld: {
-    int err = fs_close(fs_held(heff_field(p, 0)));
     return fs_answered(p, 1, err ? fs_left(err) : fs_done(), k);
   }
   default:
