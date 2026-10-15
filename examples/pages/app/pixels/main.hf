@@ -4,10 +4,12 @@
 -- where the two effects meet: the canvas is an element of the page's,
 -- given by value to the GPU's canvas effect, inside the `with`s that
 -- hold the document, the device and the buffer.  Where the browser has
--- no WebGPU, the page says so.
+-- no WebGPU, the page says so: `withDevice` throws it, and it is heard
+-- here.
 
 import co
 import browser.dom
+import exception
 import gpu as Gpu
 import gpu.canvas as Canvas
 import gpu.kernel as Kernel
@@ -62,14 +64,6 @@ shade px = do
 gradient : Kernel.Kernel1 (Kernel.Output UInt32)
 gradient = Kernel.kernel1 "shade" 64 shade
 
--- (what a `with` whose body is a step came to: the body's error, or the
--- `with`'s own)
-flattened : {a : Type}
-          -> Either Gpu.GpuError (Either Gpu.GpuError a)
-          -> Either Gpu.GpuError a
-flattened (Left err) = Left err
-flattened (Right r) = r
-
 -- (the kernel run, then the buffer shown on the canvas)
 shown : {e : HFunctor}
       -> {{card : Gpu.gpu <: e}}
@@ -89,13 +83,12 @@ shown d canvas px = do
 drawn : {e : HFunctor}
       -> {{card : Gpu.gpu <: e}}
       -> {{screen : Canvas.canvas <: e}}
+      -> {{ex : exception Gpu.GpuError <: e}}
       -> {s : Type}
       -> With s Gpu.Device
       -> Element
       -> Co e (Either Gpu.GpuError Unit)
-drawn d canvas = do
-  r <- Run.withTyped d (width * height) (\px -> shown d canvas px)
-  pure (flattened r)
+drawn d canvas = Run.withTyped d (width * height) (\px -> shown d canvas px)
 
 verdict : Either Gpu.GpuError Unit -> String
 verdict (Left err) = Gpu.showError err
@@ -105,23 +98,32 @@ program : {e : HFunctor}
         -> {{page : dom <: e}}
         -> {{card : Gpu.gpu <: e}}
         -> {{screen : Canvas.canvas <: e}}
+        -> {{ex : exception Gpu.GpuError <: e}}
         -> Co e Unit
-program = do
-  _ <-
-    withDocument (\doc -> do
-    place <- select doc "#pixels"
-    found place (\box -> do
-      canvas <- create doc "canvas"
-      append box canvas
-      label <- textIn doc box "p" "drawing"
+program =
+  withDocument (\doc -> do
+  place <- select doc "#pixels"
+  found place (\box -> do
+    canvas <- create doc "canvas"
+    append box canvas
+    label <- textIn doc box "p" "drawing"
+    try
       r <- Gpu.withDevice (\d -> drawn d canvas)
-      text label (verdict (flattened r))))
-  pure MkUnit
+      text label (verdict r)
+    catch (err : Gpu.GpuError) ->
+      text label (Gpu.showError err)))
 
--- where the world is: each sub-effect's evidence, given
+-- where the world is: each sub-effect's evidence, given; a throw no
+-- one heard ends the program
 main : Co world Unit
 main =
-  program
-    (page := \p -> InL p)
-    (card := \p -> InR (InL p))
-    (screen := \p -> InR (InR p))
+  bind
+    (attempt
+       Gpu.GpuError
+       world
+       (program
+          (page := \p -> InR (InL p))
+          (card := \p -> InR (InR (InL p)))
+          (screen := \p -> InR (InR (InR p)))
+          (ex := \p -> InL p)))
+    (\r -> pure MkUnit)

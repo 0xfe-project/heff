@@ -12,11 +12,13 @@
 -- in the body; should the body be left otherwise (a throw heard outside
 -- it, a continuation dropped), it is closed when the program drops its
 -- last reference to it.  The standard streams are had the same way
--- (`withStdin`, `withStdout`, `withStderr`), left open when their body
--- ends, so that a program reads its input a line at a time, in as
--- little memory as a line takes.  What fails is a value, an `Either
+-- (`withStdin`, `withStdout`, `withStderr`), by the shared `held`, as
+-- they are always there, and left open when their body ends, so that a
+-- program reads its input a line at a time, in as little memory as a
+-- line takes.  An operation that fails gives a value, an `Either
 -- FileError a`: the system's errno, its name and what the system says
--- of it.
+-- of it.  A file that does not open or close is no answer of the body
+-- `withFile` runs, so it is thrown, over the `exception` effect.
 --
 -- A regular file is read and written there and then: the system has
 -- it ready at once, as far as poll can tell, so even where green
@@ -76,6 +78,7 @@ module
   )
 
 import co
+import exception
 import int as Int
 import with
 
@@ -446,27 +449,31 @@ closed f = op (ev (CloseFile f (\r -> r))) val
 
 -- | `path` opened as `o` says (`withFile p { access = Read } body`),
 -- | held by `body` in a region of its own -- the file is not kept past
--- | it -- and closed when `body` ends: what it came to, or why the file
--- | did not open or close.  Should `body` be left otherwise -- a throw
+-- | it -- and closed when `body` ends: what it came to.  A file that
+-- | does not open is thrown (a `FileError`), the body not run; one that
+-- | does not close -- a write the disk did not take -- is thrown once
+-- | the body has ended.  Should `body` be left otherwise -- a throw
 -- | heard outside it, a handler between that drops the continuation --
 -- | the file is closed where the program drops its last reference to
 -- | it: at once, in C, as it is counted.
 withFile : {e : HFunctor}
          -> {a : Type}
          -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
          -> String
          -> OpenOptions
          -> ({s : Type} -> With s OpenFile -> Co e a)
-         -> Co e (Either FileError a)
+         -> Co e a
 withFile path o body = scoped (opened path o) closed body
 
 -- (a standard stream, as an open file: the same one each time, what it
 -- read ahead kept)
-standard : {e : HFunctor}
-         -> {{ev : filesystem <: e}}
-         -> Int
-         -> Co e (Either FileError OpenFile)
-standard i = bind (op (ev (Standard i (\h -> h))) val) (\h -> pure (Right h))
+standard : {e : HFunctor} -> {{ev : filesystem <: e}} -> Int -> Co e OpenFile
+standard i = op (ev (Standard i (\h -> h))) val
+
+-- (a standard stream is left open as its `with` ends)
+leftOpen : {e : HFunctor} -> OpenFile -> Co e Unit
+leftOpen f = pure MkUnit
 
 -- | The standard input, as an open file held by `body`: read it so, a
 -- | line at a time, or by std.io's `readStdin`, not both (what one has
@@ -476,8 +483,8 @@ withStdin : {e : HFunctor}
           -> {a : Type}
           -> {{ev : filesystem <: e}}
           -> ({s : Type} -> With s OpenFile -> Co e a)
-          -> Co e (Either FileError a)
-withStdin body = scoped (standard 0) closed body
+          -> Co e a
+withStdin body = held (standard 0) leftOpen body
 
 -- | The standard output, as an open file held by `body` (what std.io
 -- | wrote before is written out first), left open when `body` ends.
@@ -485,8 +492,8 @@ withStdout : {e : HFunctor}
            -> {a : Type}
            -> {{ev : filesystem <: e}}
            -> ({s : Type} -> With s OpenFile -> Co e a)
-           -> Co e (Either FileError a)
-withStdout body = scoped (standard 1) closed body
+           -> Co e a
+withStdout body = held (standard 1) leftOpen body
 
 -- | The standard error, as an open file held by `body`, left open when
 -- | `body` ends.
@@ -494,8 +501,8 @@ withStderr : {e : HFunctor}
            -> {a : Type}
            -> {{ev : filesystem <: e}}
            -> ({s : Type} -> With s OpenFile -> Co e a)
-           -> Co e (Either FileError a)
-withStderr body = scoped (standard 2) closed body
+           -> Co e a
+withStderr body = held (standard 2) leftOpen body
 
 -- | Up to `n` bytes of the file, from where it is: as many as there are,
 -- | waiting for one at least (from a pipe or a terminal, as many as have

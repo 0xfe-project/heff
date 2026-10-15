@@ -8,6 +8,7 @@
 
 import bytes as Bytes
 import co
+import exception
 import std.io
 import std.process
 import with
@@ -55,8 +56,7 @@ ranSaid what r =
   ^ ", err "
   ^ show r.err
 
--- (a `with` ended, or its command not started, which fails the test:
--- its commands are all there)
+-- (a command not started, thrown and heard by no one: the test failed)
 mustStart : {e : HFunctor}
           -> {{io : stdio <: e}}
           -> {{sys : process <: e}}
@@ -67,54 +67,48 @@ mustStart (Left err) = do
   printErr ("a command not started: " ^ err.name)
   exit 1
 
--- (`withProcess`, where the command not starting fails the test)
-held : {e : HFunctor}
-     -> {{io : stdio <: e}}
-     -> {{sys : process <: e}}
-     -> Invocation
-     -> ({s : Type} -> With s Started -> Co e Unit)
-     -> Co e Unit
-held c body = bind (withProcess c body) mustStart
-
--- (why a command was not started, or that it was)
-notStartedSaid : Either ProcessError Unit -> String
-notStartedSaid (Left err) = err.name
-notStartedSaid (Right u) = "started"
-
 -- (commands started and waited for later: two at once, each in a `with`
 -- of its own, the quick one waited for first; one killed, one past its
 -- time limit, one asked to end; one not started)
 startedOnes : {e : HFunctor}
             -> {{io : stdio <: e}}
             -> {{sys : process <: e}}
+            -> {{ex : exception ProcessError <: e}}
             -> Co e Unit
 startedOnes = do
-  held (sh "sleep 1; echo slow") (\slow ->
-    held (sh "sleep 0.1; echo quick") (\quick -> do
-      first <- wait quick
-      print (ranSaid "quick" first)
-      second <- wait slow
-      print (ranSaid "slow" second)))
-  held (sh "sleep 5") (\sleeper -> do
+  withProcess
+      (sh "sleep 1; echo slow")
+      (\slow ->
+         withProcess (sh "sleep 0.1; echo quick") (\quick -> do
+         first <- wait quick
+         print (ranSaid "quick" first)
+         second <- wait slow
+         print (ranSaid "slow" second)))
+  withProcess (sh "sleep 5") (\sleeper -> do
     running <- tryWait sleeper
     print ("tried: " ^ maybe "running still" (\r -> "ended too soon") running)
     kill sleeper
     killed <- wait sleeper
     print (ranSaid "killed" killed))
-  held { (sh "echo before; sleep 5") | timeout = 200 } (\late -> do
+  withProcess { (sh "echo before; sleep 5") | timeout = 200 } (\late -> do
     timed <- wait late
     print (ranSaid "started, its time up" timed))
-  held (sh "sleep 5") (\asked -> do
+  withProcess (sh "sleep 5") (\asked -> do
     ended <- terminate asked
     print (ranSaid "terminated" ended))
-  held
-    { (sh "echo shown; echo shown too >&2") | output = Inherited }
-    (\shown -> do
-      inherited <- wait shown
-      print (ranSaid "inherited" inherited))
-  missing <-
-    withProcess { command = "heff-no-such-command" } (\p -> pure MkUnit)
-  print ("not started: " ^ notStartedSaid missing)
+  withProcess
+      { (sh "echo shown; echo shown too >&2")
+      | output = Inherited
+      } (\shown -> do
+    inherited <- wait shown
+    print (ranSaid "inherited" inherited))
+  try
+    withProcess
+        { command = "heff-no-such-command" }
+        (\p -> (pure MkUnit : Co e Unit))
+    print "not started: started"
+  catch (err : ProcessError) ->
+    print ("not started: " ^ err.name)
 
 -- (what a read was given, said)
 receivedSaid : Received -> String
@@ -214,9 +208,10 @@ readFramed p = do
 spokenTo : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{sys : process <: e}}
+         -> {{ex : exception ProcessError <: e}}
          -> Co e Unit
 spokenTo = do
-  held { command = "cat", input = Piped, output = Piped } (\cat -> do
+  withProcess { command = "cat", input = Piped, output = Piped } (\cat -> do
     readSaid "nothing yet" cat Available 100
     writeSaid "one" cat "one\n"
     readSaid "a line" cat (Through "\n") 5000
@@ -231,7 +226,7 @@ spokenTo = do
     writeSaid "after its end" cat "lost\n"
     catRan <- wait cat
     print (ranSaid "cat" catRan))
-  held { command = "cat", input = Piped, output = Piped } (\server -> do
+  withProcess { command = "cat", input = Piped, output = Piped } (\server -> do
     writeSaid
         "two messages"
         server
@@ -247,18 +242,17 @@ spokenTo = do
     print ("none yet: " ^ none)
     serverRan <- wait server
     print (ranSaid "server" serverRan))
-  held
-    { (sh "echo one; echo two; echo oops >&2")
-    | output = Piped
-    , errors = Piped
-    }
-    (\lines -> do
-      readSaid "its output" lines (Through "\n") 5000
-      err <- readErrors lines (Through "\n") 5000
-      print ("its errors: " ^ receivedSaid err)
-      rest <- wait lines
-      print (ranSaid "unread" rest))
-  held { command = "cat", input = Given "given\n" } (\given -> do
+  withProcess
+      { (sh "echo one; echo two; echo oops >&2")
+      | output = Piped
+      , errors = Piped
+      } (\lines -> do
+    readSaid "its output" lines (Through "\n") 5000
+    err <- readErrors lines (Through "\n") 5000
+    print ("its errors: " ^ receivedSaid err)
+    rest <- wait lines
+    print (ranSaid "unread" rest))
+  withProcess { command = "cat", input = Given "given\n" } (\given -> do
     writeSaid "to a given input" given "more\n"
     readSaid "a collected output" given Available 100
     givenRan <- wait given
@@ -271,6 +265,7 @@ bytesOf n = joinWith "" (List.replicate (n / 10) "0123456789")
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
+        -> {{ex : exception ProcessError <: e}}
         -> Co e Unit
 program = do
   said "plain" (sh "echo out; echo err >&2")
@@ -302,4 +297,13 @@ program = do
   spokenTo
 
 main : Co world Unit
-main = program (io := \p -> InL p) (sys := \p -> InR p)
+main =
+  bind
+    (attempt
+       ProcessError
+       world
+       (program
+          (io := \p -> InR (InL p))
+          (sys := \p -> InR (InR p))
+          (ex := \p -> InL p)))
+    (mustStart (io := \p -> InL p) (sys := \p -> InR p))

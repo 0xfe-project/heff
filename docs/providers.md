@@ -255,7 +255,9 @@ what holds it.
 A host's thing that must be let go of -- an open file, a socket, a
 canvas -- is handed out by a `with` of the effect's own, which is
 `with`'s `scoped` around the effect's operations acquiring and
-releasing it (std.filesystem's `withFile path options body`): the
+releasing it (std.filesystem's `withFile path options body`), or
+`held` where the thing is always had (a standard stream, the page's
+document): the
 body has it as a `With s a`, polymorphic in the region `s` so that what
 it comes to cannot hold it, one `With` for every effect ([a thing held
 by a `with`](library.md#a-thing-held-by-a-with)).  The effect's
@@ -264,8 +266,9 @@ provider by `with`'s `inside`; the module exposes its `with` and those
 operations, never the bare acquire.  What lives as long as the program
 (a device, the document, a standard stream) is had by a `with` at the
 top of `main`, in scope for all that runs inside it.  What uses it
-needs no effect but the thing's own.  Its provider makes sure it is let
-go of, in two parts:
+needs the thing's own effect, and `exception err` for the thing not
+acquired, which `scoped` throws (`held` asks for none).  Its provider
+makes sure it is let go of, in two parts:
 
 - the operation that acquires it gives a foreign value whose function
   letting it go is its release (`heff_foreign(p, let_go)`).  Where the

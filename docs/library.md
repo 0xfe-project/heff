@@ -79,7 +79,7 @@ are imported by their names:
   written back, in heff, with no provider;
 - `with` ([a thing held by a `with`](#a-thing-held-by-a-with)), the
   one `With s a` every effect's scoped resources are had by, and
-  `scoped`, the bracket they are made of;
+  `scoped` and `held`, the brackets they are made of;
 - `bits`, the operations of `Bits`, a bitstring of any length
   ([bits](language.md#bits)): `length` (in bits), `index` (a bit, as a
   `Bool`), `toList` and `fromList`, `toBytes` (`Just` the bytes, of a
@@ -174,9 +174,10 @@ What is above, in `lib/`, is pure, the same on every backend.
 
 `gpu` is a GPU as an effect, `import gpu as Gpu`: a device held by a
 `with` at the top of the program (`withDevice body`, its body given a
-`With s Device`, the device closed when the body ends), buffers of
-bytes on it each held by a `with` of their own inside it (`withBuffer d
-n body`, a `With t Buffer`), written and read (`writeBuffer`,
+`With s Device`, the device closed when the body ends; no GPU here is
+thrown, a `GpuError`), buffers of bytes on it each held by a `with` of
+their own inside it (`withBuffer d n body`, a `With t Buffer`; one not
+made is thrown), written and read (`writeBuffer`,
 `readBuffer`), a kernel loaded from its code and its entry point
 (`load`, a `Pipeline`: the device's, nothing to let go of), and run
 over a grid of workgroups with its buffers bound in order, the first at
@@ -286,8 +287,9 @@ connects to the `Address` -- its `host` a name the system resolves
 (getaddrinfo), to IPv4 and IPv6 addresses, each tried in turn, or one
 written as it is (`127.0.0.1`, `::1`); its `port` -- and runs `body`
 with the connection, a `With s Net.TcpStream` in a region `s` of its
-own, shut down and closed when `body` ends: what the body came to, or
-why the connection was not made.  `Net.withListener address backlog
+own, shut down and closed when `body` ends: what the body came to (a
+connection not made is thrown, a `NetError`, the body not run).
+`Net.withListener address backlog
 body` has `body` a `With s Net.TcpListener` listening there -- the
 host `""` for all of this host's, the port 0 for one the system picks,
 which `Net.local l` says -- closed when `body` ends; and `Net.accept l
@@ -299,10 +301,14 @@ or shut down its side; `Net.write c b` writes them all; `Net.shutdown
 c` ends this side's writing; `Net.peer c` and `Net.thisSide c` are
 where each side is, an `Address`, its `host` numeric and its `port`.
 An operation given a connection whose `with` has ended -- by another
-thread, say -- is `EBADF`.  What may fail gives `Either NetError a`:
-the system's `code` (errno, or getaddrinfo's where a name was not
-resolved), its `name`, the same on every system (`ECONNREFUSED`,
-`EADDRINUSE`, `EAI_NONAME`), and its `message`, as the system says it
+thread, say -- is `EBADF`.  An operation that may fail gives `Either
+NetError a`; a `with` that fails -- a connection not made, a port not
+listened on, a connection not accepted -- throws the `NetError`, over
+the `exception` effect, as every `with` does ([a thing held by a
+`with`](#a-thing-held-by-a-with)): the system's `code` (errno, or
+getaddrinfo's where a name was not resolved), its `name`, the same on
+every system (`ECONNREFUSED`, `EADDRINUSE`, `EAI_NONAME`), and its
+`message`, as the system says it
 (`Net.showError`).  A read at the end is no error, but no bytes.
 
 A server of many connections at once accepts each in a green thread of
@@ -467,8 +473,9 @@ by a `with`](#a-thing-held-by-a-with)): `withFile path { access = Read
 } body` opens it for `Read`, `Write` (from its start), `Append` (each
 write at its end) or `ReadWrite`, runs `body` with it, a `With s
 OpenFile` in a region `s` of its own, and closes it when the body ends;
-it is what the body came to, `Either FileError a` (`Left` where the
-file did not open or close).  The other fields of `OpenOptions` are as
+it is what the body came to.  A file that does not open is thrown, a
+`FileError`, the body not run; one that does not close -- a write the
+disk did not take -- once the body has ended.  The other fields of `OpenOptions` are as
 the access has them by default: whether the file is made where there is
 none (`create`, for writing and appending), with what `mode` (`0x1a4`,
 less the umask), whether it is emptied (`truncate`, for writing), and
@@ -486,12 +493,12 @@ function that holds it can be: an operation on it after the body is
 `catch` outside it, a handler between that drops the continuation --
 the file is closed where the program drops its last reference to it, at
 once (the count of it, in C, comes to naught before the `catch` arm
-runs).  What uses it needs only `filesystem`: no effect of scopes, nor
-`exception`.  A file reads ahead, a buffer at a time, and gives back
+runs).  What uses it needs `filesystem`, and `exception FileError` for
+the file not opened: no effect of scopes.  A file reads ahead, a buffer at a time, and gives back
 what it read ahead before it is written, so that a file opened
 `ReadWrite` is written where the program has read up to; what is
-written is not held back, each write the system's.  What may fail gives
-`Either FileError a`: the system's `code`, errno, its `name`, the same
+written is not held back, each write the system's.  An operation that
+may fail gives `Either FileError a`: the system's `code`, errno, its `name`, the same
 on every system (`ENOENT`, `EACCES`, `EISDIR`), and its `message`
 (`showFileError`).
 
@@ -500,7 +507,8 @@ from where it is to its end, one line held at a time, and `copyOpen
 from to` writes what is left of one to another, a chunk at a time.
 `withStdin body`, `withStdout body` and `withStderr body` give the body
 a standard stream as an open file, left open when the body ends, the
-same stream each time and what it read ahead kept: a program reads its
+same stream each time and what it read ahead kept -- a thing always
+had, by `held`, so nothing is thrown: a program reads its
 input a line at a time, in as little memory as a line takes.  (std.io's
 `readStdin` reads it all, to its end: read it one way or the other, not
 both, as neither sees what the other read ahead.)  What std.io wrote is
@@ -515,11 +523,12 @@ countWords n line = pure (n + List.length (words line))
 
 -- (the words of the standard input, read a line at a time)
 wordsIn : {e : HFunctor} -> {{disk : filesystem <: e}}
-        -> Co e (Either FileError (Either FileError Int))
+        -> Co e (Either FileError Int)
 wordsIn = withStdin (\i -> foldLines i 0 countWords)
 
-firstLine : {e : HFunctor} -> {{disk : filesystem <: e}} -> String
-          -> Co e (Either FileError (Either FileError (Maybe String)))
+firstLine : {e : HFunctor} -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}} -> String
+          -> Co e (Either FileError (Maybe String))
 firstLine path = withFile path { access = Read } (\f -> readLine f)
 ```
 
@@ -595,10 +604,10 @@ region `s` of its own ([a thing held by a `with`](#a-thing-held-by-a-with):
 the command cannot leave the body, as a file held by `withFile`
 cannot), and when the body ends the command is ended, if it has not --
 asked to (SIGTERM), then made to (SIGKILL) two seconds later -- and
-waited for.  What the body came to is `Right`; `Left` a `ProcessError`
--- the system's `code`, its `name` (`ENOENT`) and its `message` --
-where the command could not be run (where `run` says `NotRun`), the
-body not run.  In the body, `wait p` waits for the command to end, its
+waited for: what the body came to.  A command that could not be run
+(where `run` says `NotRun`) is thrown, a `ProcessError` -- the system's
+`code`, its `name` (`ENOENT`) and its `message` -- over the `exception`
+effect, the body not run; a `try` hears it.  In the body, `wait p` waits for the command to end, its
 `Ran` (its input closed first, where `Piped`; asked again, its `Ran`
 again); `tryWait p` is `Just` its `Ran` if it has ended, without
 waiting; `kill p` kills it (SIGKILL; on Windows, TerminateProcess, and
@@ -608,12 +617,14 @@ command ended waits for it; one that leaves is rid of it.
 
 ```haskell
 -- (a command run beside the program: what it wrote, once it has ended)
-said : {e : HFunctor} -> {{sys : process <: e}} -> Invocation -> Co e String
+said : {e : HFunctor} -> {{sys : process <: e}}
+     -> {{ex : exception ProcessError <: e}} -> Invocation -> Co e String
 said c = do
-  r <- withProcess c (\p -> wait p)
-  pure (case r of
-    Right ran -> ran.out
-    Left err -> "not run: " ^ err.name)
+  try
+    r <- withProcess c (\p -> wait p)
+    pure r.out
+  catch (err : ProcessError) ->
+    pure ("not run: " ^ err.name)
 ```
 
 Several commands at once -- a pool that starts the next as one ends,
@@ -692,9 +703,14 @@ asked server request = do
 A host's thing that must be let go of -- an open file, a socket, a
 canvas -- is had by a `with`: `with`'s `scoped acquire release body`
 acquires it, runs `body` with it, a `With s r` in a region `s` of its
-own, and releases it when `body` ends, `Either err a`: what the body
-came to, or why the thing was not acquired (the body not run) or not
-released (the body's answer lost to it).  The body is polymorphic in
+own, and releases it when `body` ends: what the body came to, and
+nothing else.  A thing not acquired is no answer of the body's, so it
+is thrown, over the `exception` effect, the body not run; one not
+released is thrown once the body has ended, its answer lost to it.  So
+a `with` asks for `exception err` beside the thing's own effect, and a
+`try` hears what it throws.  `held acquire release body` is the `with`
+of a thing always had and let go of -- a standard stream, the page's
+document -- which asks for no exception.  The body is polymorphic in
 `s` and what it comes to is of a type bound outside it, so a `With s r`
 cannot leave the body (E0311), as Haskell's `ST` keeps its references:
 one `With` for every effect, so a `with` of one effect hands its thing
@@ -704,10 +720,10 @@ otherwise -- a throw heard outside it, a handler between that drops the
 continuation -- the thing is let go of where the program drops its last
 reference to it, as its provider says ([scoped
 operations](providers.md#scoped-operations)); `scoped` adds nothing for
-that, and what uses it needs no effect but the thing's own.
+that, and what uses it needs no effect of scopes.
 
 `With` is exposed without its tag: no program makes one, and `scoped`
-is the only `with`.  A library wraps `scoped` around its own operations
+and `held` are the only `with`s.  A library wraps one around its own operations
 acquiring and releasing the thing and exposes that `withX` alone, never
 the bare acquire: a bare host value given `scoped` is a use after its
 close.  Its operations on the thing take the `With s a` and give the
@@ -717,9 +733,10 @@ thing, as the operations take the `With`.
 
 ```haskell
 withFile : {e : HFunctor} -> {a : Type} -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
          -> String -> OpenOptions
          -> ({s : Type} -> With s OpenFile -> Co e a)
-         -> Co e (Either FileError a)
+         -> Co e a
 withFile path o body = scoped (opened path o) closed body   -- `opened`, `closed`: the module's own
 
 readLine : {e : HFunctor} -> {s : Type} -> {{ev : filesystem <: e}}

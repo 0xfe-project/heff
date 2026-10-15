@@ -7,10 +7,11 @@
 -- got said.  `crowded`, run with few descriptors: connected to until
 -- there is none left, each connection's `with` inside the one before,
 -- then served -- `serveUntil` and `serve` stop at the connection they
--- cannot accept, and say why.
+-- cannot accept, why thrown and said.
 
 import bytes as Bytes
 import co
+import exception
 import std.http as Http
 import std.http.server as Server
 import std.io
@@ -87,31 +88,23 @@ isStop r = strEq r.target "/stop"
 here : Int -> Net.Address
 here port = { host = "127.0.0.1", port = port }
 
--- (where the server stopped: asked to, or accepting failed)
-stopped : {e : HFunctor}
+-- (a throw no one heard -- the port not listened on, a connection not
+-- accepted -- said)
+unheard : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> Either Net.NetError Unit
         -> Co e Unit
-stopped (Left err) = printErr ("accept: " ^ Net.showError err)
-stopped (Right _) = pure MkUnit
-
--- (what the listener's `with` came to: it did not listen, why said; or
--- where the server stopped)
-listened : {e : HFunctor}
-         -> {{io : stdio <: e}}
-         -> Either Net.NetError (Either Net.NetError Unit)
-         -> Co e Unit
-listened (Left err) = printErr ("listen: " ^ Net.showError err)
-listened (Right r) = stopped r
+unheard (Left err) = printErr ("not heard: " ^ Net.showError err)
+unheard (Right u) = pure MkUnit
 
 serveAt : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
+        -> {{ex : exception Net.NetError <: e}}
         -> Int
         -> Co e Unit
-serveAt port = do
-  r <- Net.withListener (here port) 16 (\l -> Server.serveUntil isStop l said)
-  listened r
+serveAt port =
+  Net.withListener (here port) 16 (\l -> Server.serveUntil isStop l said)
 
 -- Out of descriptors --------------------------------------------------------------
 
@@ -126,52 +119,49 @@ noneLeft : {e : HFunctor}
          -> {s : Type}
          -> {{io : stdio <: e}}
          -> {{nt : Net.net <: e}}
+         -> {{ex : exception Net.NetError <: e}}
          -> With s Net.TcpListener
          -> Maybe Net.NetError
          -> Co e Unit
 noneLeft l failed = do
   print ("connect: " ^ errorName failed)
-  served <- Server.serveUntil (\r -> True) l (\r -> pure (routed r))
-  print
-      ("serveUntil: "
-       ^ either (\(e : Net.NetError) -> e.name) (\u -> "stopped") served)
-  err <- Server.serve l (\r -> pure (routed r))
-  print ("serve: " ^ err.name)
-
--- (where no connection more was made: the server tried, inside those
--- made)
-crowdOut : {e : HFunctor}
-         -> {s : Type}
-         -> {{io : stdio <: e}}
-         -> {{nt : Net.net <: e}}
-         -> With s Net.TcpListener
-         -> Either Net.NetError Unit
-         -> Co e Unit
-crowdOut l (Left err) = noneLeft l (Just err)
-crowdOut l (Right u) = pure MkUnit
+  try
+    Server.serveUntil (\r -> True) l (\r -> pure (routed r))
+    print "serveUntil: stopped"
+  catch (err : Net.NetError) ->
+    print ("serveUntil: " ^ err.name)
+  try
+    Server.serve l (\r -> pure (routed r))
+  catch (err : Net.NetError) ->
+    print ("serve: " ^ err.name)
 
 -- (connections made to the port, `made` so far, each had while the next
 -- is made and waiting to be accepted, until the program has no
--- descriptor left for one more, or a hundred are made: the server then
--- tried inside them all)
+-- descriptor left for one more -- the connection not made, thrown, heard
+-- inside those made -- or a hundred are made: the server then tried
+-- inside them all)
 crowd : {e : HFunctor}
       -> {s : Type}
       -> {{io : stdio <: e}}
       -> {{nt : Net.net <: e}}
+      -> {{ex : exception Net.NetError <: e}}
       -> Int
       -> With s Net.TcpListener
       -> Int
       -> Co e Unit
 crowd port l made =
   if made >= 100 then noneLeft l Nothing
-  else bind
-      (Net.withConnection (here port) (\c -> crowd port l (made + 1)))
-      (crowdOut l)
+  else do
+    try
+      Net.withConnection (here port) (\c -> crowd port l (made + 1))
+    catch (err : Net.NetError) ->
+      noneLeft l (Just err)
 
 crowdedAt : {e : HFunctor}
           -> {s : Type}
           -> {{io : stdio <: e}}
           -> {{nt : Net.net <: e}}
+          -> {{ex : exception Net.NetError <: e}}
           -> With s Net.TcpListener
           -> Co e Unit
 crowdedAt l = do
@@ -181,13 +171,9 @@ crowdedAt l = do
 crowdedProgram : {e : HFunctor}
                -> {{io : stdio <: e}}
                -> {{nt : Net.net <: e}}
+               -> {{ex : exception Net.NetError <: e}}
                -> Co e Unit
-crowdedProgram = do
-  r <- Net.withListener (here 0) 256 (\l -> crowdedAt l)
-  either
-      (\err -> printErr ("listen: " ^ Net.showError err))
-      (\u -> pure MkUnit)
-      r
+crowdedProgram = Net.withListener (here 0) 256 (\l -> crowdedAt l)
 
 -- std.http's client, a thread of its own --------------------------------------------
 
@@ -259,13 +245,17 @@ sides : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{nt : Net.net <: e}}
       -> {{web : Http.http <: e}}
+      -> {{ex : exception Net.NetError <: e}}
       -> With s Net.TcpListener
       -> String
       -> Int
       -> Co e (List String)
 sides l at 0 = do
-  served <- Server.serveUntil isStop l (\r -> pure (routed r))
-  pure (either (\err -> ["accept: " ^ Net.showError err]) (\u -> Nil) served)
+  try
+    Server.serveUntil isStop l (\r -> pure (routed r))
+    pure Nil
+  catch (err : Net.NetError) ->
+    pure ["accept: " ^ Net.showError err]
 sides l at _ = askAll at Nil requests
 
 selfAt : {e : HFunctor}
@@ -274,6 +264,7 @@ selfAt : {e : HFunctor}
        -> {{nt : Net.net <: e}}
        -> {{web : Http.http <: e}}
        -> {{th : threads <: e}}
+       -> {{ex : exception Net.NetError <: e}}
        -> With s Net.TcpListener
        -> Co e Unit
 selfAt l = do
@@ -290,6 +281,7 @@ program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{nt : Net.net <: e}}
         -> {{sys : process <: e}}
+        -> {{ex : exception Net.NetError <: e}}
         -> Co e Unit
 program = do
   as <- args
@@ -302,28 +294,45 @@ selfProgram : {e : HFunctor}
             -> {{nt : Net.net <: e}}
             -> {{web : Http.http <: e}}
             -> {{th : threads <: e}}
+            -> {{ex : exception Net.NetError <: e}}
             -> Co e Unit
-selfProgram = do
-  r <- Net.withListener (here 0) 16 (\l -> selfAt l)
-  either
-      (\err -> printErr ("listen: " ^ Net.showError err))
-      (\u -> pure MkUnit)
-      r
+selfProgram = Net.withListener (here 0) 16 (\l -> selfAt l)
 
 main : Co world Unit
 main =
-  program
-    (io := \p -> InL p)
-    (nt := \p -> InR (InL p))
-    (sys := \p -> InR (InR (InR (InR p))))
+  bind
+    (attempt
+       Net.NetError
+       world
+       (program
+          (io := \p -> InR (InL p))
+          (nt := \p -> InR (InR (InL p)))
+          (sys := \p -> InR (InR (InR (InR (InR p)))))
+          (ex := \p -> InL p)))
+    (unheard (io := \p -> InL p))
 
 self : Co world Unit
 self =
-  selfProgram
-    (io := \p -> InL p)
-    (nt := \p -> InR (InL p))
-    (web := \p -> InR (InR (InL p)))
-    (th := \p -> InR (InR (InR (InL p))))
+  bind
+    (attempt
+       Net.NetError
+       world
+       (selfProgram
+          (io := \p -> InR (InL p))
+          (nt := \p -> InR (InR (InL p)))
+          (web := \p -> InR (InR (InR (InL p))))
+          (th := \p -> InR (InR (InR (InR (InL p)))))
+          (ex := \p -> InL p)))
+    (unheard (io := \p -> InL p))
 
 crowded : Co world Unit
-crowded = crowdedProgram (io := \p -> InL p) (nt := \p -> InR (InL p))
+crowded =
+  bind
+    (attempt
+       Net.NetError
+       world
+       (crowdedProgram
+          (io := \p -> InR (InL p))
+          (nt := \p -> InR (InR (InL p)))
+          (ex := \p -> InL p)))
+    (unheard (io := \p -> InL p))

@@ -17,6 +17,7 @@
 import bytes as Bytes
 import check
 import co
+import exception
 import std.filesystem
 import std.process
 import with
@@ -25,6 +26,7 @@ import with
 given : {e : HFunctor}
       -> {{chk : check <: e}}
       -> {{sys : process <: e}}
+      -> {{ex : exception ProcessError <: e}}
       -> String
       -> Co e String
 given name = do
@@ -58,6 +60,7 @@ holds what False there = failure (what ^ "\n" ^ there)
 builtC : {e : HFunctor}
        -> {{chk : check <: e}}
        -> {{sys : process <: e}}
+       -> {{ex : exception ProcessError <: e}}
        -> String
        -> Co e String
 builtC name = do
@@ -123,6 +126,7 @@ project : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{ex : exception ProcessError <: e}}
         -> Co e Unit
 project = do
   heff <- given "HEFF"
@@ -151,6 +155,7 @@ type Dev = { pid : String, port : String }
 readUntil : {e : HFunctor}
           -> {s : Type}
           -> {{sys : process <: e}}
+          -> {{ex : exception ProcessError <: e}}
           -> With s Started
           -> (String -> Bool)
           -> Int
@@ -170,6 +175,7 @@ readUntil p ok ms said =
 saidOnce : {e : HFunctor}
          -> {s : Type}
          -> {{sys : process <: e}}
+         -> {{ex : exception ProcessError <: e}}
          -> With s Started
          -> (String -> Bool)
          -> String
@@ -184,34 +190,23 @@ firstLine s = fromMaybe "" (List.head (lines s))
 
 -- (what the body of a command held came to; else the test fails, the
 -- command not run)
-heldOr : {e : HFunctor}
-       -> {a : Type}
-       -> {{chk : check <: e}}
-       -> String
-       -> Either ProcessError a
-       -> Co e a
-heldOr what (Right x) = pure x
-heldOr what (Left err) = failure (what ^ " not run: " ^ err.message)
-
 -- | the server the tests send to, started and held by `body`, given it
 -- | and its port; ended when `body` ends
 withEchoing : {e : HFunctor}
             -> {a : Type}
             -> {{chk : check <: e}}
             -> {{sys : process <: e}}
+            -> {{ex : exception ProcessError <: e}}
             -> ({s : Type} -> With s Started -> String -> Co e a)
             -> Co e a
 withEchoing body = do
   echo <- builtC "echo"
-  r <-
-    withProcess
-      { command = echo, output = Piped, group = True }
-      (\p -> do
-         line <- readOutput p (Through "\n") 10000
-         case line of
-           Got b -> body p (trim (Bytes.asString b))
-           _ -> failure "echo said no port")
-  heldOr "echo" r
+  withProcess
+      { command = echo, output = Piped, group = True } (\p -> do
+    line <- readOutput p (Through "\n") 10000
+    case line of
+      Got b -> body p (trim (Bytes.asString b))
+      _ -> failure "echo said no port")
 
 -- | heff dev started in the project, its pages at a port no one listens
 -- | at, the rest sent on to `proxy`; its output and its errors one; held
@@ -221,6 +216,7 @@ withDev : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{ex : exception ProcessError <: e}}
         -> String
         -> ({s : Type} -> With s Started -> Dev -> Co e a)
         -> Co e a
@@ -230,8 +226,7 @@ withDev proxy body = do
   port <- pure (trim free.out)
   heff <- given "HEFF"
   project
-  r <-
-    withProcess
+  withProcess
       { command = "sh"
       , args =
           [ "-c"
@@ -245,19 +240,18 @@ withDev proxy body = do
           ]
       , dir = "proj"
       , output = Piped
-      }
-      (\p -> do
-         line <- readOutput p (Through "\n") 10000
-         case line of
-           Got b -> body p { pid = trim (Bytes.asString b), port = port }
-           _ -> failure "heff dev not started")
-  heldOr "heff dev" r
+      } (\p -> do
+    line <- readOutput p (Through "\n") 10000
+    case line of
+      Got b -> body p { pid = trim (Bytes.asString b), port = port }
+      _ -> failure "heff dev not started")
 
 -- | built, and run, the pages served: what it said by then
 started : {e : HFunctor}
         -> {s : Type}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
+        -> {{ex : exception ProcessError <: e}}
         -> With s Started
         -> Co e String
 started p = do
@@ -283,6 +277,7 @@ ended : {e : HFunctor}
       -> {s : Type}
       -> {{chk : check <: e}}
       -> {{sys : process <: e}}
+      -> {{ex : exception ProcessError <: e}}
       -> With s Started
       -> Dev
       -> String
@@ -315,6 +310,7 @@ type Answer = { status : Int, kind : String, text : String }
 asked : {e : HFunctor}
       -> {{sys : process <: e}}
       -> {{disk : filesystem <: e}}
+      -> {{ex : exception ProcessError <: e}}
       -> Dev
       -> List String
       -> String
@@ -348,6 +344,7 @@ asked d options path = do
 get : {e : HFunctor}
     -> {{sys : process <: e}}
     -> {{disk : filesystem <: e}}
+    -> {{ex : exception ProcessError <: e}}
     -> Dev
     -> String
     -> Co e Answer
@@ -365,62 +362,69 @@ pages : {e : HFunctor}
       -> {{chk : check <: e}}
       -> {{sys : process <: e}}
       -> {{disk : filesystem <: e}}
+      -> {{ex : exception ProcessError <: e}}
       -> Co e Unit
 pages =
-  withEchoing (\echo proxy ->
-  withDev proxy (\p d -> do
-  said <- started p
-  index <- get d "/"
-  holds
-      "the pages' index"
-      (index.status == 200 && contains "<a href=\"/page/\">page</a>" index.text)
-      (answered index)
-  page <- get d "/page/"
-  holds
-      "a page made for the program"
-      (page.status == 200
-       && contains "<div id=\"page\"></div>" page.text
-       && contains "<script src=\"page.js\"></script>" page.text
-       && contains "fetch(\"/.heff/built\"" page.text)
-      (answered page)
-  js <- get d "/page/page.js"
-  script <- readFile "proj/.heff/bin/page.js"
-  holds
-      "its script, as built"
-      (js.status == 200
-       && startsWith "text/javascript" js.kind
-       && strEq js.text (fromMaybe "(none)" script))
-      (show js.status ^ " " ^ js.kind)
-  css <- get d "/page/style.css"
-  holds
-      "a file of the program's"
-      (css.status == 200
-       && startsWith "text/css" css.kind
-       && strEq css.text "p { color: teal; }\n")
-      (answered css)
-  built <- get d "/.heff/built"
-  holds "built, said to the page" (strEq built.text "1") (answered built)
-  sent <- asked d ["-X", "POST", "--data", "hello", "-D", "head"] "/api/x?y=1"
-  head <- readFile "head"
-  holds
-      "what is not a page's, sent on"
-      (sent.status == 201
-       && List.any
-         (\h -> contains h (fromMaybe "" head))
-         ["X-Seen: yes", "x-seen: yes"]
-       && strEq sent.text "POST /api/x?y=1 hello")
-      (fromMaybe "" head ^ answered sent)
-  bare <- get d "/page"
-  holds "a name without its slash" (bare.status == 301) (answered bare)
-  missing <- get d "/page/missing.css"
-  holds "no file the program has not" (missing.status == 404) (answered missing)
-  escaped <- get d "/page/..%2f..%2fpackage.hf"
-  dotted <- get d "/page/../package.hf"
-  holds
-      "nothing outside the program's"
-      (escaped.status == 404 && dotted.status /= 200)
-      (answered escaped ^ "\n" ^ answered dotted)
-  ended p d said))
+  withEchoing
+    (\echo proxy ->
+       withDev proxy (\p d -> do
+       said <- started p
+       index <- get d "/"
+       holds
+           "the pages' index"
+           (index.status == 200
+            && contains "<a href=\"/page/\">page</a>" index.text)
+           (answered index)
+       page <- get d "/page/"
+       holds
+           "a page made for the program"
+           (page.status == 200
+            && contains "<div id=\"page\"></div>" page.text
+            && contains "<script src=\"page.js\"></script>" page.text
+            && contains "fetch(\"/.heff/built\"" page.text)
+           (answered page)
+       js <- get d "/page/page.js"
+       script <- readFile "proj/.heff/bin/page.js"
+       holds
+           "its script, as built"
+           (js.status == 200
+            && startsWith "text/javascript" js.kind
+            && strEq js.text (fromMaybe "(none)" script))
+           (show js.status ^ " " ^ js.kind)
+       css <- get d "/page/style.css"
+       holds
+           "a file of the program's"
+           (css.status == 200
+            && startsWith "text/css" css.kind
+            && strEq css.text "p { color: teal; }\n")
+           (answered css)
+       built <- get d "/.heff/built"
+       holds "built, said to the page" (strEq built.text "1") (answered built)
+       sent <-
+         asked d ["-X", "POST", "--data", "hello", "-D", "head"] "/api/x?y=1"
+       head <- readFile "head"
+       holds
+           "what is not a page's, sent on"
+           (sent.status == 201
+            && List.any
+              (\h -> contains h (fromMaybe "" head))
+              ["X-Seen: yes", "x-seen: yes"]
+            && strEq sent.text "POST /api/x?y=1 hello")
+           (fromMaybe "" head ^ answered sent)
+       bare <- get d "/page"
+       holds "a name without its slash" (bare.status == 301) (answered bare)
+       missing <- get d "/page/missing.css"
+       holds
+           "no file the program has not"
+           (missing.status == 404)
+           (answered missing)
+       escaped <- get d "/page/..%2f..%2fpackage.hf"
+       dotted <- get d "/page/../package.hf"
+       holds
+           "nothing outside the program's"
+           (escaped.status == 404 && dotted.status /= 200)
+           (answered escaped ^ "\n" ^ answered dotted)
+       ended p d said))
 
 -- | a change: built again, the program run anew; a change that does not
 -- | build: said, waited past, the program kept; mended, built again
@@ -428,57 +432,65 @@ changes : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{ex : exception ProcessError <: e}}
         -> Co e Unit
 changes =
-  withEchoing (\echo proxy ->
-  withDev proxy (\p d -> do
-  said <- started p
-  g <- pure "proj/src/proj/greeting.hf"
-  original <- readFile g
-  text <- pure (fromMaybe "" original)
-  writeAll [MkPair g (joinWith "\"Howdy, \"" (split "\"Hello, \"" text))]
-  again <-
-    saidOnce
-      p
-      (\s ->
-         contains "built (2); running proj\n" s
-         && contains "Howdy, server!\n" s)
-      said
-  holds
-      "a change, built and run again"
-      (contains "built (2); running proj\n" again
-       && contains "Howdy, server!\n" again)
-      again
-  built <- get d "/.heff/built"
-  holds "built again, said to the page" (strEq built.text "2") (answered built)
-  writeAll [MkPair g (joinWith "\"Hello, \" ^ 1" (split "\"Hello, \"" text))]
-  notBuilt <- pure "heff dev: not built; built again at the next change\n"
-  wrong <-
-    saidOnce
-      p
-      (\s ->
-         contains notBuilt (fromMaybe "" (List.last (split "error[E0311]" s)))
-         && contains "error[E0311]" s)
-      again
-  holds
-      "a change that does not build"
-      (contains "error[E0311]" wrong
-       && contains
-         notBuilt
-         (fromMaybe "" (List.last (split "error[E0311]" wrong))))
-      wrong
-  still <- get d "/.heff/built"
-  holds
-      "the program kept"
-      (not (contains "proj ended" wrong) && strEq still.text "2")
-      (wrong ^ answered still)
-  writeAll [MkPair g text]
-  mended <- saidOnce p (\s -> contains "built (3); running proj\n" s) wrong
-  holds
-      "mended, built again"
-      (contains "built (3); running proj\n" mended)
-      mended
-  ended p d mended))
+  withEchoing
+    (\echo proxy ->
+       withDev proxy (\p d -> do
+       said <- started p
+       g <- pure "proj/src/proj/greeting.hf"
+       original <- readFile g
+       text <- pure (fromMaybe "" original)
+       writeAll [MkPair g (joinWith "\"Howdy, \"" (split "\"Hello, \"" text))]
+       again <-
+         saidOnce
+           p
+           (\s ->
+              contains "built (2); running proj\n" s
+              && contains "Howdy, server!\n" s)
+           said
+       holds
+           "a change, built and run again"
+           (contains "built (2); running proj\n" again
+            && contains "Howdy, server!\n" again)
+           again
+       built <- get d "/.heff/built"
+       holds
+           "built again, said to the page"
+           (strEq built.text "2")
+           (answered built)
+       writeAll
+           [MkPair g (joinWith "\"Hello, \" ^ 1" (split "\"Hello, \"" text))]
+       notBuilt <- pure "heff dev: not built; built again at the next change\n"
+       wrong <-
+         saidOnce
+           p
+           (\s ->
+              contains
+                notBuilt
+                (fromMaybe "" (List.last (split "error[E0311]" s)))
+              && contains "error[E0311]" s)
+           again
+       holds
+           "a change that does not build"
+           (contains "error[E0311]" wrong
+            && contains
+              notBuilt
+              (fromMaybe "" (List.last (split "error[E0311]" wrong))))
+           wrong
+       still <- get d "/.heff/built"
+       holds
+           "the program kept"
+           (not (contains "proj ended" wrong) && strEq still.text "2")
+           (wrong ^ answered still)
+       writeAll [MkPair g text]
+       mended <- saidOnce p (\s -> contains "built (3); running proj\n" s) wrong
+       holds
+           "mended, built again"
+           (contains "built (3); running proj\n" mended)
+           mended
+       ended p d mended))
 
 -- | heff test --watch: the tests run, a source changed and they run
 -- | again (and fail), then ended by SIGTERM
@@ -486,13 +498,13 @@ watched : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{ex : exception ProcessError <: e}}
         -> Co e Unit
 watched = do
   heff <- given "HEFF"
   made <- run { command = heff, args = ["init", "proj"] }
   holds "heff init" (succeeded made) made.err
-  r <-
-    withProcess
+  withProcess
       { command = "sh"
       , args =
           [ "-c"
@@ -503,56 +515,56 @@ watched = do
           ]
       , dir = "proj"
       , output = Piped
-      }
-      (\p -> do
-         line <- readOutput p (Through "\n") 10000
-         pid <- case line of
-           Got b -> pure (trim (Bytes.asString b))
-           _ -> failure "heff test --watch not started"
-         d <- pure { pid = pid, port = "" }
-         first <-
-           saidOnce
-             p
-             (\t -> contains "heff test: tested (1), all held" t)
-             ""
-         holds
-             "the tests run"
-             (contains "1/1 tests hold" first
-              && contains "heff test: tested (1), all held" first)
-             first
-         g <- pure "proj/src/proj/greeting.hf"
-         original <- readFile g
-         writeAll
-             [ MkPair
-               g
-               (joinWith
-                  "\"Howdy there, \""
-                  (split "\"Hello, \"" (fromMaybe "" original)))
-             ]
-         again <-
-           saidOnce
-             p
-             (\t -> contains "heff test: tested (2), not all held" t)
-             first
-         holds
-             "a change, tested again"
-             (contains "heff test: a change; tested again" again
-              && contains "0/1 tests hold" again
-              && contains "heff test: tested (2), not all held" again)
-             again
-         ended p d again)
-  heldOr "heff test --watch" r
+      } (\p -> do
+    line <- readOutput p (Through "\n") 10000
+    pid <- case line of
+      Got b -> pure (trim (Bytes.asString b))
+      _ -> failure "heff test --watch not started"
+    d <- pure { pid = pid, port = "" }
+    first <-
+      saidOnce
+        p
+        (\t -> contains "heff test: tested (1), all held" t)
+        ""
+    holds
+        "the tests run"
+        (contains "1/1 tests hold" first
+         && contains "heff test: tested (1), all held" first)
+        first
+    g <- pure "proj/src/proj/greeting.hf"
+    original <- readFile g
+    writeAll
+        [ MkPair
+          g
+          (joinWith
+             "\"Howdy there, \""
+             (split "\"Hello, \"" (fromMaybe "" original)))
+        ]
+    again <-
+      saidOnce
+        p
+        (\t -> contains "heff test: tested (2), not all held" t)
+        first
+    holds
+        "a change, tested again"
+        (contains "heff test: a change; tested again" again
+         && contains "0/1 tests hold" again
+         && contains "heff test: tested (2), not all held" again)
+        again
+    ended p d again)
 
 -- (each test skipped on Windows)
 posix : ({e : HFunctor}
          -> {{chk : check <: e}}
          -> {{sys : process <: e}}
          -> {{disk : filesystem <: e}}
+         -> {{ex : exception ProcessError <: e}}
          -> Co e Unit)
       -> ({e : HFunctor}
           -> {{chk : check <: e}}
           -> {{sys : process <: e}}
           -> {{disk : filesystem <: e}}
+          -> {{ex : exception ProcessError <: e}}
           -> Co e Unit)
 posix body = do
   p <- platform

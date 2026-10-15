@@ -54,6 +54,7 @@
 -- list).
 
 import co
+import exception
 import generator as Generator
 import json as Json
 import regex as Regex
@@ -359,26 +360,52 @@ property name body =
     defaults
     (body (rnd := inl random check) (chk := inr random check))
 
+-- (a throw the test did not hear -- a command not run, a file not
+-- opened or closed -- fails it)
+thrownOutside : Either Process.ProcessError (Either Filesystem.FileError Unit)
+              -> Co integrated Unit
+thrownOutside (Right (Right u)) = pure MkUnit
+thrownOutside (Right (Left err)) =
+  failure
+    (chk := \p -> InL p)
+    ("a file could not be opened or closed: " ^ Filesystem.showFileError err)
+thrownOutside (Left err) =
+  failure (chk := \p -> InL p) ("a command could not be run: " ^ err.message)
+
 -- | An integration test: it checks, runs commands and reads and writes
 -- | files.  `heff test` runs it in a program of its own, built through
 -- | C, in a new directory of its own as its working directory (removed
 -- | after it), and kills it at its time limit (a minute; `within` says
--- | otherwise).
+-- | otherwise).  A command held by `withProcess` that could not be run,
+-- | a file held by `withFile` that did not open, is thrown; a throw the
+-- | test does not hear (`try`) fails it.
 integration : String
             -> ({e : HFunctor}
                 -> {{chk : check <: e}}
                 -> {{sys : Process.process <: e}}
                 -> {{disk : Filesystem.filesystem <: e}}
+                -> {{ex : exception Process.ProcessError <: e}}
+                -> {{fx : exception Filesystem.FileError <: e}}
                 -> Co e Unit)
             -> Test
 integration name body =
   IntegrationTest
     name
     defaultLimit
-    (body
-       (chk := \p -> InL p)
-       (sys := \p -> InR (InL p))
-       (disk := \p -> InR (InR p)))
+    (bind
+       (attempt
+          Process.ProcessError
+          integrated
+          (attempt
+             Filesystem.FileError
+             (exception Process.ProcessError <+> integrated)
+             (body
+                (chk := \p -> InR (InR (InL p)))
+                (sys := \p -> InR (InR (InR (InL p))))
+                (disk := \p -> InR (InR (InR (InR p))))
+                (ex := \p -> InR (InL p))
+                (fx := \p -> InL p))))
+       thrownOutside)
 
 -- | Tests under a name.
 group : String -> List Test -> Test

@@ -7,8 +7,15 @@
 -- hand its thing to an operation of another by value -- a canvas found
 -- by the DOM, drawn on by the GPU -- and neither keeps it.
 --
+-- A `with` comes to what its body came to, and nothing else: a thing
+-- not acquired, or not released, is no answer of the body's, so it is
+-- thrown, over the `exception` effect, the body not run (or run, and
+-- what it came to abandoned, where the release failed).  `held` is the
+-- `with` of a thing that is always had and let go of -- a standard
+-- stream, the page's document -- which asks for no exception.
+--
 -- `With` is exposed without its tag: no program makes one, and `scoped`
--- is the only `with`.  A library wraps `scoped` around its own
+-- and `held` are the only `with`s.  A library wraps one around its own
 -- operations acquiring and releasing the thing, exposes that `withX`
 -- alone -- never the bare acquire, as a bare host value given `scoped`
 -- is a use after its close -- and gives the thing to a provider
@@ -21,11 +28,13 @@
 -- that drops the continuation -- lets go of it where the program drops
 -- its last reference to it; `scoped` adds nothing for that.
 
-module (With, scoped, inside)
+module (With, scoped, held, inside)
 
 import co
+import exception
 
--- | A host's thing, held in the region `s` by a `with` (`scoped`).
+-- | A host's thing, held in the region `s` by a `with` (`scoped`,
+-- | `held`).
 data With (s : Type) a = MkWith a
 
 -- | The thing a `with` holds, for a provider operation given it: a
@@ -34,36 +43,68 @@ data With (s : Type) a = MkWith a
 inside : {s : Type} -> {a : Type} -> With s a -> a
 inside (MkWith x) = x
 
--- (what the body came to, or why the thing was not released)
-closedWith : {err a : Type} -> a -> Either err Unit -> Either err a
-closedWith x (Right _) = Right x
-closedWith x (Left err) = Left err
+-- (what the body came to, once the thing is released; a release that
+-- failed, thrown)
+releasedTo : {e : HFunctor}
+           -> {err a : Type}
+           -> {{ex : exception err <: e}}
+           -> a
+           -> Either err Unit
+           -> Co e a
+releasedTo v (Right u) = pure v
+releasedTo v (Left err) = throw err
 
--- (the body run with the thing, then the thing released; or why it was
--- not acquired)
+-- (the body run with the thing, then the thing released; a thing not
+-- acquired, thrown)
 heldBy : {e : HFunctor}
        -> {err r a : Type}
+       -> {{ex : exception err <: e}}
        -> (r -> Co e (Either err Unit))
        -> ({s : Type} -> With s r -> Co e a)
        -> Either err r
-       -> Co e (Either err a)
-heldBy release body (Left err) = pure (Left err)
+       -> Co e a
+heldBy release body (Left err) = throw err
 heldBy release body (Right x) =
   bind
     (body (s := r) (MkWith x))
-    (\v -> bind (release x) (\c -> pure (closedWith v c)))
+    (\v -> bind (release x) (releasedTo v))
 
 -- | The thing `acquire` gives, held by `body` in a region of its own --
 -- | it is not kept past it -- and released by `release` when `body`
--- | ends: what it came to, or why the thing was not acquired or not
--- | released.  Should `body` be left otherwise -- a throw heard outside
--- | it, a handler between that drops the continuation -- the thing is
--- | let go of where the program drops its last reference to it, as its
--- | provider says.
+-- | ends: what it came to.  A thing not acquired is thrown, the body
+-- | not run; one not released is thrown once the body has ended, what
+-- | it came to abandoned.  Should `body` be left otherwise -- a throw
+-- | heard outside it, a handler between that drops the continuation --
+-- | the thing is let go of where the program drops its last reference
+-- | to it, as its provider says.
 scoped : {e : HFunctor}
        -> {err r a : Type}
+       -> {{ex : exception err <: e}}
        -> Co e (Either err r)
        -> (r -> Co e (Either err Unit))
        -> ({s : Type} -> With s r -> Co e a)
-       -> Co e (Either err a)
+       -> Co e a
 scoped acquire release body = bind acquire (heldBy release body)
+
+-- (the body run with the thing, then the thing let go of)
+letGoAfter : {e : HFunctor}
+           -> {r a : Type}
+           -> (r -> Co e Unit)
+           -> ({s : Type} -> With s r -> Co e a)
+           -> r
+           -> Co e a
+letGoAfter release body x =
+  bind (body (s := r) (MkWith x)) (\v -> bind (release x) (\u -> pure v))
+
+-- | The thing `acquire` gives, which it always does, held by `body` in
+-- | a region of its own and let go of by `release` when `body` ends,
+-- | which always goes: what the body came to.  The `with` of a thing
+-- | the program is never without: a standard stream, the page's
+-- | document.
+held : {e : HFunctor}
+     -> {r a : Type}
+     -> Co e r
+     -> (r -> Co e Unit)
+     -> ({s : Type} -> With s r -> Co e a)
+     -> Co e a
+held acquire release body = bind acquire (letGoAfter release body)

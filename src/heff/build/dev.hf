@@ -15,6 +15,7 @@
 
 import bytes as Bytes
 import co
+import exception
 import green
 import heff.build.commands as Commands
 import heff.build.project as Project
@@ -198,6 +199,7 @@ held : {e : HFunctor}
      -> {{disk : filesystem <: e}}
      -> {{prog : Progress.progress <: e}}
      -> {{clock : Time.time <: e}}
+     -> {{ex : exception ProcessError <: e}}
      -> Path.Style
      -> Dev
      -> String
@@ -206,23 +208,21 @@ held : {e : HFunctor}
      -> Co e Built
 held st d stamp running Nil = watched st d stamp running
 held st d stamp running (a :: rest) = do
-  r <-
+  try
     withProcess
-      (beside
-         (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
-         Nil)
-      (\p ->
-         held
-           st
-           d
-           stamp
-           (List.append running [{ name = a.name, ended = tryWait p }])
-           rest)
-  case r of
-    Right next -> pure next
-    Left err -> do
-      printErr ("heff dev: cannot run " ^ a.name)
-      held st d stamp running rest
+        (beside
+           (Path.join st (Commands.binDir st) (Commands.programFile st a.name))
+           Nil)
+        (\p ->
+           held
+             st
+             d
+             stamp
+             (List.append running [{ name = a.name, ended = tryWait p }])
+             rest)
+  catch (err : ProcessError) ->
+    printErr ("heff dev: cannot run " ^ a.name)
+    held st d stamp running rest
 
 -- (a build that went well, said: where it is said to have been made, for
 -- the pages, and what is run)
@@ -257,6 +257,7 @@ cycle : {e : HFunctor}
       -> {{disk : filesystem <: e}}
       -> {{prog : Progress.progress <: e}}
       -> {{clock : Time.time <: e}}
+      -> {{ex : exception ProcessError <: e}}
       -> Path.Style
       -> Dev
       -> String
@@ -266,15 +267,13 @@ cycle st d stamp apps =
   if List.any isPage apps && not d.pages
   then do
     self <- programPath
-    r <-
+    try
       withProcess
-        (pagesServer self d)
-        (\pg -> cycle st { d | pages = True } stamp apps)
-    case r of
-      Right u -> pure u
-      Left err -> do
-        printErr "heff dev: cannot serve the pages"
-        cycle st { d | pages = True } stamp apps
+          (pagesServer self d)
+          (\pg -> cycle st { d | pages = True } stamp apps)
+    catch (err : ProcessError) ->
+      printErr "heff dev: cannot serve the pages"
+      cycle st { d | pages = True } stamp apps
   else do
     builtSaid st d apps
     next <- held st d stamp Nil (List.filter (isRun d.wanted) apps)
@@ -287,6 +286,7 @@ devCmd : {e : HFunctor}
        -> {{disk : filesystem <: e}}
        -> {{prog : Progress.progress <: e}}
        -> {{clock : Time.time <: e}}
+       -> {{ex : exception ProcessError <: e}}
        -> List String
        -> Maybe String
        -> Maybe String
@@ -556,21 +556,6 @@ served st (Just to) req = do
 
 -- (the pages no longer served: the program ended, or it could not
 -- listen at the port -- said, and the program failed)
-pagesEnded : {e : HFunctor}
-           -> {{io : stdio <: e}}
-           -> {{sys : process <: e}}
-           -> String
-           -> Either Net.NetError (Maybe Unit)
-           -> Co e Unit
-pagesEnded port (Right r) = pure MkUnit
-pagesEnded port (Left err) = do
-  printErr
-      ("heff dev: cannot serve the pages at port "
-       ^ port
-       ^ ": "
-       ^ Net.showError err)
-  exit 1
-
 -- | the pages served at the port, as `heff dev` has them served, what is
 -- | not theirs sent to `proxy` where it is given, until the program is
 -- | ended (`heff dev-pages PORT [PROXY]`)
@@ -581,29 +566,38 @@ pagesCmd : {e : HFunctor}
          -> {{nt : Net.net <: e}}
          -> {{rx : Reactor.reactor <: e}}
          -> {{web : Http.http <: e}}
+         -> {{nx : exception Net.NetError <: e}}
          -> String
          -> Maybe String
          -> Co e Unit
 pagesCmd port proxy = do
   st <- Commands.styleNow
-  r <-
-    Net.withListener
-      { host = "127.0.0.1", port = fromMaybe 8000 (parseInt port) }
-      64 (\listener -> do
+  try
+    r <-
+      Net.withListener
+        { host = "127.0.0.1", port = fromMaybe 8000 (parseInt port) }
+        64 (\listener -> do
+      printErr
+          ("heff dev: the pages at http://127.0.0.1:"
+           ^ port
+           ^ "/"
+           ^ maybe "" (\to -> ", the rest sent to " ^ to) proxy)
+      Reactor.scheduled
+          e
+          (Server.serveConcurrently
+             (gr := \p -> InL p)
+             (nt := \p -> InR (nt p))
+             listener
+             (served
+                (disk := \p -> InR (disk p))
+                (web := \p -> InR (web p))
+                st
+                proxy)))
+    pure MkUnit
+  catch (err : Net.NetError) ->
     printErr
-        ("heff dev: the pages at http://127.0.0.1:"
+        ("heff dev: cannot serve the pages at port "
          ^ port
-         ^ "/"
-         ^ maybe "" (\to -> ", the rest sent to " ^ to) proxy)
-    Reactor.scheduled
-        e
-        (Server.serveConcurrently
-           (gr := \p -> InL p)
-           (nt := \p -> InR (nt p))
-           listener
-           (served
-              (disk := \p -> InR (disk p))
-              (web := \p -> InR (web p))
-              st
-              proxy)))
-  pagesEnded port r
+         ^ ": "
+         ^ Net.showError err)
+    exit 1

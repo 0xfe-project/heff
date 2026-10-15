@@ -19,6 +19,7 @@
 
 import bytes as Bytes
 import co
+import exception
 import green
 import std.http as Http
 import std.net as Net
@@ -534,55 +535,44 @@ serveConnection : {e : HFunctor}
                 -> Co e Bool
 serveConnection last handle c = bind (Net.peer c) (closedWith last handle c)
 
--- (the next connection, `again`; or the server done: `last` said so, or
--- accepting failed)
-nextOr : {e : HFunctor}
-       -> (Unit -> Co e (Either Net.NetError Unit))
-       -> Either Net.NetError Bool
-       -> Co e (Either Net.NetError Unit)
-nextOr again (Left err) = pure (Left err)
-nextOr again (Right True) = pure (Right MkUnit)
-nextOr again (Right False) = again MkUnit
+-- (the next connection, `again`; or the server done, `last` said so)
+nextOr : {e : HFunctor} -> (Unit -> Co e Unit) -> Bool -> Co e Unit
+nextOr again True = pure MkUnit
+nextOr again False = again MkUnit
 
 -- | The listener's connections accepted, one at a time, and each one's
 -- | requests answered by `handle` (`serveConnection`), until `last` says
 -- | a request is the last: answered, its connection closed, and the
--- | listener left as it is, `Right`.  Where a connection fails to be
--- | accepted -- the system out of descriptors (`EMFILE`), say -- the
--- | server stops there, `Left` why, the listener left as it is: whether
--- | to wait and serve again is its caller's to say.
+-- | listener left as it is.  Where a connection fails to be accepted --
+-- | the system out of descriptors (`EMFILE`), say -- the server stops
+-- | there, why thrown (`Net.accept`'s `NetError`), the listener left as
+-- | it is: whether to wait and serve again is its caller's to say.
 serveUntil : {e : HFunctor}
            -> {s : Type}
            -> {{nt : Net.net <: e}}
+           -> {{ex : exception Net.NetError <: e}}
            -> (Request -> Bool)
            -> With s Net.TcpListener
            -> (Request -> Co e Http.Response)
-           -> Co e (Either Net.NetError Unit)
+           -> Co e Unit
 serveUntil last l handle =
   bind
     (Net.accept l (serveConnection last handle))
     (nextOr (\u -> serveUntil last l handle))
 
--- (the next connection, `again`; where accepting failed, why)
-nextFor : {e : HFunctor}
-        -> (Unit -> Co e Net.NetError)
-        -> Either Net.NetError Bool
-        -> Co e Net.NetError
-nextFor again (Left err) = pure err
-nextFor again (Right stop) = again MkUnit
-
 -- | The listener's connections served, until one fails to be accepted:
--- | why, the listener left as it is (`serveUntil`).
+-- | why thrown, the listener left as it is (`serveUntil`).
 serve : {e : HFunctor}
       -> {s : Type}
       -> {{nt : Net.net <: e}}
+      -> {{ex : exception Net.NetError <: e}}
       -> With s Net.TcpListener
       -> (Request -> Co e Http.Response)
-      -> Co e Net.NetError
+      -> Co e Unit
 serve l handle =
   bind
     (Net.accept l (serveConnection (\r -> False) handle))
-    (nextFor (\u -> serve l handle))
+    (\stop -> serve l handle)
 
 -- (where accepting failed: the server stopping, said on the channel)
 stoppedOn : {e : HFunctor}
@@ -595,7 +585,10 @@ stoppedOn stopped (Right served) = pure MkUnit
 
 -- (a thread accepting the listener's next connection: a thread spawned
 -- to accept the one after it, then the connection served, and closed as
--- the thread ends; where accepting failed, `stopped` told)
+-- the thread ends; where accepting failed, `stopped` told.  The throw
+-- is heard in this thread, by `attempt` -- not by a `try` of the
+-- scheduler's caller, which would run the body alone, its spawn
+-- dropped -- so no exception is asked for)
 acceptor : {e : HFunctor}
          -> {s : Type}
          -> {{gr : green <: e}}
@@ -606,9 +599,21 @@ acceptor : {e : HFunctor}
          -> Co e Unit
 acceptor stopped l handle =
   bind
-    (Net.accept l (\c -> do
-     spawn (acceptor stopped l handle)
-     serveConnection (\r -> False) handle c))
+    (attempt
+       Net.NetError
+       e
+       (Net.accept
+          (ev := \p -> InR (nt p))
+          (ex := \p -> InL p)
+          l (\c -> do
+        spawn
+            (ev := \p -> InR (gr p))
+            (lift (\p -> InR p) (acceptor stopped l handle))
+        serveConnection
+            (nt := \p -> InR (nt p))
+            (\r -> False)
+            (\r -> lift (\p -> InR p) (handle r))
+            c)))
     (stoppedOn stopped)
 
 -- | The listener's connections served at once, each by a green thread

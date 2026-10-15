@@ -5,7 +5,8 @@
 --                last one with no newline, one longer than a buffer),
 --                seek and tell, what the system says of a file, links,
 --                temporary files, modes, the standard output as a file,
---                and what fails, as values
+--                and what fails: an operation's, a value, a `with`'s,
+--                thrown and heard
 --   closed DIR   a file used after its `with` closed it, by a function
 --                that kept it: EBADF, a value
 --   lines        the standard input a line at a time: `ping` answered
@@ -15,6 +16,7 @@
 
 import bytes as Bytes
 import co
+import exception
 import green
 import int as Int
 import std.filesystem
@@ -57,18 +59,22 @@ octal n = if n < 8 then show n else octal (n / 8) ^ show (n % 8)
 -- Round trips
 --------------------------------------------------------------------------------
 
--- (what a `with` came to, flattened: a body's answer is a value of its
--- own, `Either FileError a` as the `with` is)
-within : {a : Type}
-       -> Either FileError (Either FileError a)
-       -> Either FileError a
-within (Right r) = r
-within (Left err) = Left err
+-- (a `with` that may fail, its throw heard, as a value)
+tried : {e : HFunctor}
+      -> {a : Type}
+      -> {{fx : exception FileError <: e}}
+      -> Co e a
+      -> Co e (Either FileError a)
+tried c =
+  recover
+    (bind c (\x -> pure (Right x)))
+    (\(err : FileError) -> pure (Left err))
 
 -- | A string and bytes written, read back whole; then appended to.
 roundTrip : {e : HFunctor}
           -> {{io : stdio <: e}}
           -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
           -> String
           -> Co e Unit
 roundTrip path = do
@@ -78,7 +84,7 @@ roundTrip path = do
     b <- writeBytes h b["world", 10]
     pure (failed a ^ " " ^ failed b))
   back <- readFile path
-  print ("written: " ^ must w ^ " " ^ failed w)
+  print ("written: " ^ w)
   print ("read back: " ^ show back)
   withFile path { access = Append } (\h -> writeString h "again\n")
   again <- readFile path
@@ -131,6 +137,7 @@ readAll h n size total chunks = do
 chunks : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
        -> String
        -> Co e Unit
 chunks path = do
@@ -139,9 +146,9 @@ chunks path = do
     writeTimes h block 3000
     writeString h "tail")
   s <- withFile path { access = Read } (\h -> readAll h 4096 0 0 0)
-  print ("in chunks of 4096: " ^ must s)
+  print ("in chunks of 4096: " ^ s)
   l <- withFile path { access = Read } (\h -> readAll h 1000000 0 0 0)
-  print ("in chunks of 1000000: " ^ must l)
+  print ("in chunks of 1000000: " ^ l)
   n <-
     withFile
       path
@@ -152,7 +159,7 @@ chunks path = do
   b <- readFile (path ^ ".copy")
   print
       ("copied: "
-       ^ show (must (within (must n)))
+       ^ show (must n)
        ^ " bytes, the same "
        ^ show (a == b))
 
@@ -162,6 +169,7 @@ chunks path = do
 -- (the lines of a file, from its start)
 linesOf : {e : HFunctor}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> String
         -> Co e (Either FileError (List String))
 linesOf path = do
@@ -170,13 +178,14 @@ linesOf path = do
       path
       { access = Read }
       (\h -> foldLines h Nil (\acc l -> pure (l :: acc)))
-  pure (either (\err -> Left err) (\l -> Right (List.reverse l)) (within ls))
+  pure (either (\err -> Left err) (\l -> Right (List.reverse l)) ls)
 
 -- | Lines ended by `\n` and `\r\n`, an empty one, the last one with no
 -- | newline; one longer than a buffer.
 lineReading : {e : HFunctor}
             -> {{io : stdio <: e}}
             -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
             -> String
             -> Co e Unit
 lineReading dir = do
@@ -204,6 +213,7 @@ textOf (Left err) = err.name
 seeking : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> String
         -> Co e Unit
 seeking dir = do
@@ -242,6 +252,7 @@ seeking dir = do
 status : {e : HFunctor}
        -> {{io : stdio <: e}}
        -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
        -> String
        -> Co e Unit
 status dir = do
@@ -269,9 +280,9 @@ status dir = do
   hs <- withFile path { access = Read } (\h -> fileStatus h)
   print
       ("an open file's: "
-       ^ showKindOf (within hs)
+       ^ showKindOf hs
        ^ " of "
-       ^ show (must (within hs)).size
+       ^ show (must hs).size
        ^ " bytes")
   again <- pathStatus path
   writeFile path "changed"
@@ -337,6 +348,7 @@ modes dir = do
 temporary : {e : HFunctor}
           -> {{io : stdio <: e}}
           -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
           -> Co e Unit
 temporary = do
   a <- temporaryDirectory "heff-files-"
@@ -360,7 +372,7 @@ temporary = do
     readChunk file 100)
   print
       ("a temporary file: "
-       ^ textOf (within r)
+       ^ textOf r
        ^ ", there "
        ^ show (contains "heff-file-" (must t)))
   remove (must a)
@@ -371,30 +383,35 @@ temporary = do
 -- What fails
 --------------------------------------------------------------------------------
 
--- | What fails is a value: its errno's name.
+-- | What fails: an operation's failure a value, a `with`'s thrown, each
+-- | its errno's name.
 failures : {e : HFunctor}
          -> {{io : stdio <: e}}
          -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
          -> String
          -> Co e Unit
 failures dir = do
   a <-
-    withFile
-      (dir ^ "/missing/file")
-      { access = Read }
-      (\h -> (pure MkUnit : Co e Unit))
-  b <- withFile dir { access = Write } (\h -> (pure MkUnit : Co e Unit))
-  c <- withFile dir { access = Read } (\h -> (pure MkUnit : Co e Unit))
+    tried
+      (withFile
+         (dir ^ "/missing/file")
+         { access = Read }
+         (\h -> (pure MkUnit : Co e Unit)))
+  b <- tried (withFile dir { access = Write } (\h -> (pure MkUnit : Co e Unit)))
+  c <- tried (withFile dir { access = Read } (\h -> (pure MkUnit : Co e Unit)))
   let secret = dir ^ "/secret"
   writeFile secret "no"
   setMode secret 0
-  d <- withFile secret { access = Read } (\h -> (pure MkUnit : Co e Unit))
+  d <-
+    tried (withFile secret { access = Read } (\h -> (pure MkUnit : Co e Unit)))
   setMode secret 0x1a4
   x <-
-    withFile
-      secret
-      { access = Write, exclusive = True }
-      (\h -> (pure MkUnit : Co e Unit))
+    tried
+      (withFile
+         secret
+         { access = Write, exclusive = True }
+         (\h -> (pure MkUnit : Co e Unit)))
   print
       ("failed: "
        ^ failed a
@@ -406,8 +423,7 @@ failures dir = do
        ^ failed d
        ^ " "
        ^ failed x)
-  w <- withFile secret { access = Write } (\h -> readChunk h 10)
-  let r = within w
+  r <- withFile secret { access = Write } (\h -> readChunk h 10)
   s <- pathStatus (dir ^ "/missing")
   m <- setMode (dir ^ "/missing") 0x1a4
   p <- realPath (dir ^ "/missing")
@@ -435,11 +451,12 @@ standard = do
   print "std.io before"
   w <- withStdout (\o -> writeString o "the standard output, a file\n")
   again <- withStdout (\o -> writeString o "and again\n")
-  print ("std.io after: " ^ failed (within w) ^ " " ^ failed (within again))
+  print ("std.io after: " ^ failed w ^ " " ^ failed again)
 
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> String
         -> Co e Unit
 program dir = do
@@ -472,12 +489,13 @@ keeper h = pure (\u -> writeString h "never")
 afterClose : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> String
            -> Co e Unit
 afterClose dir = do
   kept <- withFile (dir ^ "/closed.txt") { access = Write } keeper
   print "closed"
-  let f : Unit -> Co e (Either FileError Unit) = must kept
+  let f : Unit -> Co e (Either FileError Unit) = kept
   w <- f MkUnit
   print ("after the with: " ^ failed w)
 
@@ -514,7 +532,7 @@ stdinLines = do
          withStdout
            (\o ->
               foldLines i ({ lines = 0, bytes = 0 } : Counted) (countLine o)))
-  let c : Counted = must (within (must r))
+  let c : Counted = must r
   print ("lines " ^ show c.lines ^ " bytes " ^ show c.bytes)
 
 -- (a thread counting to n, a yield at each)
@@ -556,15 +574,41 @@ greenLines = do
 -- The programs
 --------------------------------------------------------------------------------
 
+-- (a throw no one heard: said)
+unheard : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> Either FileError Unit
+        -> Co e Unit
+unheard (Left err) = print ("not heard: " ^ showFileError err)
+unheard (Right u) = pure MkUnit
+
 main : Co world Unit
 main = do
   as <- args (ev := \p -> InR (InR (InR p)))
-  program (io := \p -> InL p) (disk := \p -> InR (InL p)) (firstArg as)
+  r <-
+    attempt
+      FileError
+      world
+      (program
+         (io := \p -> InR (InL p))
+         (disk := \p -> InR (InR (InL p)))
+         (fx := \p -> InL p)
+         (firstArg as))
+  unheard (io := \p -> InL p) r
 
 closed : Co world Unit
 closed = do
   as <- args (ev := \p -> InR (InR (InR p)))
-  afterClose (io := \p -> InL p) (disk := \p -> InR (InL p)) (firstArg as)
+  r <-
+    attempt
+      FileError
+      world
+      (afterClose
+         (io := \p -> InR (InL p))
+         (disk := \p -> InR (InR (InL p)))
+         (fx := \p -> InL p)
+         (firstArg as))
+  unheard (io := \p -> InL p) r
 
 linesMain : Co world Unit
 linesMain = stdinLines (io := \p -> InL p) (disk := \p -> InR (InL p))
