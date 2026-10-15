@@ -235,9 +235,11 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[]; } Str
 // static as a string is)
 #define HEFF_BYTES(name, n, bytes) HEFF_STATIC_STR(name, K_BYT, n, bytes)
 typedef struct { Obj h; double d; } Flt;
-// (a foreign value: a pointer of the host's, and the function that
-// lets it go, called when the program drops the last reference)
-typedef struct { Obj h; void *p; void (*let_go)(void *); } Fgn;
+// (a foreign value: a pointer of the host's, the function that lets it
+// go, called when the program drops the last reference, and, where the
+// thing may be held by another place too, the function that holds it
+// once more -- NULL where it may not cross)
+typedef struct { Obj h; void *p; void (*let_go)(void *); void (*share)(void *); } Fgn;
 // (an array: its elements, `n` of them, `V`s or flat -- a number's C
 // type, as its header's `tag` says, `HEFF_ARR_V` or another of these
 // ("Arrays", below))
@@ -3713,11 +3715,23 @@ HEFF_FN V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 // is whatever the operation says it is -- a `data` of no constructors --
 // and the provider vouches for it at the boundary; the compiler's
 // generated glue makes and reads them as an effect's module describes
-// its operations in C (the `ffi` module).
-HEFF_FN V heff_foreign(void *p, void (*let_go)(void *)) {
+// its operations in C (the `ffi` module).  One effect's provider takes
+// what another's handed out, the value given it by the program, as a
+// `with` of the one hands its thing to an operation of the other.  A
+// thing that places may hold together -- a channel between them -- is
+// made by `heff_foreign_shared`, with what holds it once more: the
+// value crosses to another place as a foreign value of its own, the
+// thing held once more, and is let go of by each place as it drops its
+// last reference; the thing is the provider's to free when every place
+// has.  Any other foreign value does not cross.
+HEFF_FN V heff_foreign_shared(void *p, void (*let_go)(void *), void (*share)(void *)) {
   Fgn *g = heff_obj_alloc(sizeof(Fgn));
-  g->h.rc = 1; g->h.kind = K_FGN; g->h.tag = 0; g->p = p; g->let_go = let_go;
+  g->h.rc = 1; g->h.kind = K_FGN; g->h.tag = 0; g->p = p; g->let_go = let_go; g->share = share;
   return (V)g;
+}
+
+HEFF_FN V heff_foreign(void *p, void (*let_go)(void *)) {
+  return heff_foreign_shared(p, let_go, NULL);
 }
 
 HEFF_FN void *heff_foreign_ptr(V v) {
@@ -3767,116 +3781,6 @@ HEFF_FN V heff_errno(int err, uint32_t *shape) {
   }
   V f[3] = { heff_int(err), heff_str_text(name), heff_str_text(strerror(err)) };
   return heff_rec(3, shape, f);
-}
-
-// The world: the things the providers hand out, held in one table for
-// them all, so that one effect's provider takes what another's handed
-// out (a `Handle` is `MkHandle i`, made and taken
-// apart by the provider), as the JavaScript backend's `$world` holds them.
-// `heff_hold(x, free)` is the number of `x`, the same while it is held;
-// `heff_held(i)` the thing numbered `i`; `heff_release(i)` lets it go
-// -- `free(x)`, if its holder gave a `free` -- and its number is no
-// one's again.  (Numbers by address, `heff_numbers`: open addressing, a
-// slot -1 where it is empty, never emptied but where all are numbered
-// again, the things released left out.)
-typedef struct { void *x; void (*free)(void *); } HeffThing;
-HEFF_VAR(HeffThing *heff_things);
-HEFF_VAR(int64_t heff_nthings);
-HEFF_VAR(int64_t heff_capthings);
-HEFF_VAR(int64_t *heff_numbers);
-HEFF_VAR(int64_t heff_capnumbers);
-HEFF_VAR(int64_t heff_usednumbers);
-
-// (the slot of `x`'s number, or the empty slot it would be in)
-HEFF_FN int64_t heff_number_slot(void *x) {
-  uint64_t h = (uint64_t)(uintptr_t)x;
-  h ^= h >> 33;
-  h *= 0xff51afd7ed558ccdULL;
-  h ^= h >> 33;
-  int64_t m = heff_capnumbers - 1, i = (int64_t)(h & (uint64_t)m);
-  while (heff_numbers[i] >= 0 && heff_things[heff_numbers[i]].x != x) i = (i + 1) & m;
-  return i;
-}
-
-// (the things held, numbered again: in four times as many slots, and more)
-HEFF_FN void heff_renumber(void) {
-  int64_t live = 0;
-  for (int64_t n = 0; n < heff_nthings; n++) live += heff_things[n].x != NULL;
-  int64_t cap = 16;
-  while (cap < live * 4) cap *= 2;
-  free(heff_numbers);
-  heff_numbers = heff_alloc(cap * sizeof(int64_t));
-  for (int64_t i = 0; i < cap; i++) heff_numbers[i] = -1;
-  heff_capnumbers = cap;
-  heff_usednumbers = live;
-  for (int64_t n = 0; n < heff_nthings; n++)
-    if (heff_things[n].x) heff_numbers[heff_number_slot(heff_things[n].x)] = n;
-}
-
-// (threads at once: the table theirs, each holding it while it looks
-// at it -- what a thing is, and when it is let go, still their own
-// providers' to say)
-#ifdef HEFF_THREADS
-#ifdef HEFF_PART
-extern pthread_mutex_t heff_world_mu;
-#else
-pthread_mutex_t heff_world_mu = PTHREAD_MUTEX_INITIALIZER;
-#endif
-#define HEFF_WORLD_LOCK() pthread_mutex_lock(&heff_world_mu)
-#define HEFF_WORLD_UNLOCK() pthread_mutex_unlock(&heff_world_mu)
-#else
-#define HEFF_WORLD_LOCK() ((void)0)
-#define HEFF_WORLD_UNLOCK() ((void)0)
-#endif
-
-HEFF_FN int64_t heff_hold(void *x, void (*let_go)(void *)) {
-  if (!x) heff_fail("the world holds nothing at NULL");
-  HEFF_WORLD_LOCK();
-  if (heff_usednumbers * 2 >= heff_capnumbers) heff_renumber();
-  int64_t s = heff_number_slot(x), n = heff_numbers[s];
-  if (n < 0) {
-    if (heff_nthings == heff_capthings) {
-      heff_capthings = heff_capthings ? heff_capthings * 2 : 16;
-      HeffThing *t = heff_alloc(heff_capthings * sizeof(HeffThing));
-      if (heff_nthings) memcpy(t, heff_things, heff_nthings * sizeof(HeffThing));
-      free(heff_things);
-      heff_things = t;
-    }
-    heff_things[heff_nthings].x = x;
-    heff_things[heff_nthings].free = let_go;
-    heff_numbers[s] = heff_nthings;
-    heff_usednumbers++;
-    n = heff_nthings++;
-  }
-  HEFF_WORLD_UNLOCK();
-  return n;
-}
-
-HEFF_FN void heff_held_none(int64_t i) {
-  static HEFF_TLS char why[64];
-  snprintf(why, sizeof why, "the world holds nothing numbered %lld", (long long)i);
-  heff_fail(why);
-}
-
-HEFF_FN void *heff_held(int64_t i) {
-  HEFF_WORLD_LOCK();
-  void *x = i < 0 || i >= heff_nthings ? NULL : heff_things[i].x;
-  HEFF_WORLD_UNLOCK();
-  if (!x) heff_held_none(i);
-  return x;
-}
-
-HEFF_FN void heff_release(int64_t i) {
-  HEFF_WORLD_LOCK();
-  void *x = i < 0 || i >= heff_nthings ? NULL : heff_things[i].x;
-  void (*let_go)(void *) = x ? heff_things[i].free : NULL;
-  if (x) {
-    heff_things[i].x = NULL;
-    heff_things[i].free = NULL;
-  }
-  HEFF_WORLD_UNLOCK();
-  if (!x) heff_held_none(i);
-  if (let_go) let_go(x);
 }
 
 // Threads a provider starts (#36): each runs what it
@@ -3994,8 +3898,10 @@ HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
 // in the receiver too, by a table of such objects, so that a copy is no
 // larger than what it copies.  An immortal object (a definition's value,
 // a string written in the program) is the program's, counted by none,
-// and crosses as its pointer.  A foreign value, the host's thing, does
-// not cross: sending one fails.
+// and crosses as its pointer.  A foreign value, the host's thing,
+// crosses only where its provider made it shared (`heff_foreign_shared`,
+// a channel's): the thing held once more, and a foreign value of the
+// receiver's own made of it; sending any other fails.
 //
 // A message's words: a slot is the value's word where it is no object
 // (an integer, a tag of no fields: its low bits set); 0 and then the
@@ -4197,9 +4103,16 @@ HEFF_FN void heff_msg_put(HeffPut *p, V v, int alone) {
       heff_msg_bytes(m, b->d, (size_t)b->n * sizeof(uint32_t));
       return;
     }
-    case K_FGN:
-      heff_fail("places: a foreign value cannot be sent to another place");
+    case K_FGN: {
+      Fgn *g = (Fgn *)v;
+      if (!g->share) heff_fail("places: a foreign value cannot be sent to another place");
+      g->share(g->p);
+      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_FGN, 0, 0));
+      heff_msg_word(m, (V)g->p);
+      heff_msg_word(m, (V)g->let_go);
+      heff_msg_word(m, (V)g->share);
       return;
+    }
     default:
       heff_fail("places: a value of a kind that cannot be sent");
       return;
@@ -4356,6 +4269,13 @@ HEFF_FN void heff_msg_get(HeffGet *g, V *at) {
       v = (V)b;
       break;
     }
+    case K_FGN: {
+      void *ptr = (void *)heff_get_word(g);
+      void (*let_go)(void *) = (void (*)(void *))heff_get_word(g);
+      void (*share)(void *) = (void (*)(void *))heff_get_word(g);
+      v = heff_foreign_shared(ptr, let_go, share);
+      break;
+    }
     default:
       heff_fail("places: a message holds a value of a kind that cannot be read");
       return;
@@ -4387,7 +4307,10 @@ HEFF_FN V heff_msg_value(HeffMsg *m) {
 // (a channel: the messages sent and not yet received, in order; and,
 // once asked for, a descriptor that is readable while there are any --
 // a pipe, a byte in it as long as the channel holds something, for a
-// wait of the reactor's to poll)
+// wait of the reactor's to poll.  Held by the places that have it, each
+// as a foreign value of its own -- `heff_chan_hold` as it crosses to
+// one, `heff_chan_drop` as one drops its last reference -- and freed,
+// what it still holds dropped, when none has it)
 #ifndef _WIN32
 #include <fcntl.h>
 #endif
@@ -4396,6 +4319,7 @@ typedef struct {
   pthread_cond_t cv;
   HeffMsg *first, *last;
   int fd[2];
+  int holders;
 } HeffChan;
 
 HEFF_FN HeffChan *heff_chan_new(void) {
@@ -4404,7 +4328,33 @@ HEFF_FN HeffChan *heff_chan_new(void) {
   pthread_cond_init(&ch->cv, NULL);
   ch->first = ch->last = NULL;
   ch->fd[0] = ch->fd[1] = -1;
+  ch->holders = 1;
   return ch;
+}
+
+HEFF_FN void heff_chan_hold(void *x) {
+  HeffChan *ch = x;
+  pthread_mutex_lock(&ch->mu);
+  ch->holders++;
+  pthread_mutex_unlock(&ch->mu);
+}
+
+HEFF_FN HeffMsg *heff_chan_take(HeffChan *ch, int wait);
+HEFF_FN V heff_msg_value(HeffMsg *m);
+
+HEFF_FN void heff_chan_drop(void *x) {
+  HeffChan *ch = x;
+  pthread_mutex_lock(&ch->mu);
+  int left = --ch->holders;
+  pthread_mutex_unlock(&ch->mu);
+  if (left > 0) return;
+  HeffMsg *m;
+  while ((m = heff_chan_take(ch, 0))) heff_drop(heff_msg_value(m));
+  if (ch->fd[0] >= 0) close(ch->fd[0]);
+  if (ch->fd[1] >= 0) close(ch->fd[1]);
+  pthread_cond_destroy(&ch->cv);
+  pthread_mutex_destroy(&ch->mu);
+  free(ch);
 }
 
 #ifndef _WIN32
@@ -4503,30 +4453,42 @@ HEFF_FN void *heff_place_run(void *u) {
   return NULL;
 }
 
+// (a place the program dropped: joined first, where it was not, its
+// value or its failure left unread; then freed)
+HEFF_FN void heff_place_let_go(void *x) {
+  HeffPlace *p = x;
+  if (!p->joined) {
+    pthread_join(p->tid, NULL);
+    if (p->out) heff_drop(heff_msg_value(p->out));
+  }
+  free(p->why);
+  free(p);
+}
+
 // (`c`, a computation of the world, run in a place of its own: the
-// place's number in the world's table; `c` consumed, crossing as a
+// place, a foreign value of the starter's; `c` consumed, crossing as a
 // message)
-HEFF_FN int64_t heff_place_start(V c) {
+HEFF_FN V heff_place_start(V c) {
   HeffPlace *p = heff_alloc(sizeof *p);
   p->in = heff_msg_of(c);
   p->out = NULL;
   p->why = NULL;
   p->joined = 0;
   if (heff_thread_start(&p->tid, heff_place_run, p) != 0) heff_fail("places: cannot start a place");
-  return heff_hold(p, NULL);
+  return heff_foreign(p, heff_place_let_go);
 }
 
-// (place `i` joined: its value, made here; or its failure, this
+// (the place `v` is joined: its value, made here; or its failure, this
 // thread's now -- a place is joined once)
-HEFF_FN V heff_place_join(int64_t i) {
-  HeffPlace *p = heff_held(i);
+HEFF_FN V heff_place_join(V v) {
+  HeffPlace *p = heff_foreign_ptr(v);
   if (p->joined) heff_fail("places: a place joined twice");
   p->joined = 1;
   pthread_join(p->tid, NULL);
-  heff_release(i);
   HeffMsg *out = p->out;
   char *why = p->why;
-  free(p);
+  p->out = NULL;
+  p->why = NULL;
   if (why) heff_fail_again(why);
   return heff_msg_value(out);
 }

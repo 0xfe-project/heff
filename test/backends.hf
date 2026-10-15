@@ -1236,11 +1236,10 @@ withPeer arguments body = do
       , input = Piped
       , output = Piped
       , timeout = 120000
-      }
-      (\p -> do
-        line <- readOutput p (Through "\n") 30000
-        first <- peerLine line
-        body p first)
+      } (\p -> do
+    line <- readOutput p (Through "\n") 30000
+    first <- peerLine line
+    body p first)
   ranWith "node" r
 
 -- (the first of a list, or "")
@@ -1260,7 +1259,10 @@ withTsan bin = do
   if not tsan then pure [bin]
     else do
       z <-
-        zigRuntime (bin ^ ".zig") (bin ^ "-tsan-runtime.o") ["-fsanitize-thread"]
+        zigRuntime
+          (bin ^ ".zig")
+          (bin ^ "-tsan-runtime.o")
+          ["-fsanitize-thread"]
       b <-
         run
           { command = "clang"
@@ -1748,7 +1750,8 @@ http = withPeer ["routes"] httpTo
 -- | tell, what the system says of a file, a directory and a link,
 -- | modes, temporary files, the standard output as a file, and what
 -- | fails, as values (EACCES not for root, whom no mode stops); and a
--- | file used after it is closed, failing the program
+-- | file used after its `with` closed it, by a function that kept it:
+-- | EBADF, a value
 files : {e : HFunctor}
       -> {{chk : check <: e}}
       -> {{sys : process <: e}}
@@ -1806,17 +1809,15 @@ files = do
                      , "said so: ENOENT: No such file or directory"
                      , "std.io before"
                      , "the standard output, a file"
-                     , "std.io after, the same handle True"
+                     , "and again"
+                     , "std.io after: ok ok"
                      ])
             , err = Just ""
             }
             r)
          (against
             "files, one used after it is closed"
-            { out = Just "closed\n"
-            , err = Just "heff: the world holds nothing numbered 0\n"
-            , status = Exited 1
-            }
+            { out = Just "closed\nafter the with: EBADF\n", err = Just "" }
             usedClosed))
 
 -- (the received, as a string)
@@ -1839,7 +1840,7 @@ writeTimes s b n =
     ok <- writeInput s b
     if ok then writeTimes s b (n - 1) else pure False
 
--- | the standard input a line at a time (std.filesystem's `stdin`), by C
+-- | the standard input a line at a time (std.filesystem's `withStdin`), by C
 -- | alone: the answer to its first line written before the rest of it is
 -- | (none is written until it is), then 64 MiB of lines, through a pipe,
 -- | the program holding a few MiB at most meanwhile (not under a
@@ -1860,44 +1861,43 @@ stdinLines = do
       , output = Piped
       , errors = Piped
       , timeout = 120000
-      }
-      (\s -> do
-        pid <- readErrors s (Through "\n") 30000
-        pinged <- writeInput s (Bytes.fromString "ping\n")
-        pong <- readOutput s (Through "\n") 30000
-        fed <-
-          writeTimes
-            s
-            (Bytes.fromString
-               (joinWith
-                  ""
-                  (List.replicate
-                     16384
-                     (joinWith "" (List.replicate 63 "x") ^ "\n"))))
-            64
-        rss <-
-          run
-            { command = "ps"
-            , args = ["-o", "rss=", "-p", trim (receivedText pid)]
-            }
-        closeInput s
-        r <- wait s
-        kib <- pure (fromMaybe 0 (parseInt (trim rss.out)))
-        failingWith
-            (List.append
-               (if strEq
-                     (receivedText pong ^ r.out)
-                     "pong\nlines 1048577 bytes 66060292\n"
-                   && strEq r.err ""
-                   && succeeded r
-                then Nil
-                else ["stdin a line at a time: " ^ receivedText pong ^ said r])
-               (if not sanitized && kib > 16384
-                then [ "stdin a line at a time: "
-                     ^ show kib
-                     ^ " KiB held, 64 MiB in"
-                     ]
-                else Nil)))
+      } (\s -> do
+    pid <- readErrors s (Through "\n") 30000
+    pinged <- writeInput s (Bytes.fromString "ping\n")
+    pong <- readOutput s (Through "\n") 30000
+    fed <-
+      writeTimes
+        s
+        (Bytes.fromString
+           (joinWith
+              ""
+              (List.replicate
+                 16384
+                 (joinWith "" (List.replicate 63 "x") ^ "\n"))))
+        64
+    rss <-
+      run
+        { command = "ps"
+        , args = ["-o", "rss=", "-p", trim (receivedText pid)]
+        }
+    closeInput s
+    r <- wait s
+    kib <- pure (fromMaybe 0 (parseInt (trim rss.out)))
+    failingWith
+        (List.append
+           (if strEq
+                 (receivedText pong ^ r.out)
+                 "pong\nlines 1048577 bytes 66060292\n"
+               && strEq r.err ""
+               && succeeded r
+            then Nil
+            else ["stdin a line at a time: " ^ receivedText pong ^ said r])
+           (if not sanitized && kib > 16384
+            then [ "stdin a line at a time: "
+                 ^ show kib
+                 ^ " KiB held, 64 MiB in"
+                 ]
+            else Nil)))
   ranWith "stdin a line at a time" held
 
 -- | green threads, scheduled by std.reactor, by C alone: one reads the
@@ -1913,20 +1913,23 @@ greenStdin = do
   bin <- built "test/node/files.hf" "greenMain" Nil ""
   held <-
     withProcess
-      { command = bin, input = Piped, output = Piped, timeout = 120000 }
-      (\s -> do
-        counted <-
-          readOutput s (Through "counted while the reader waits: 1000\n") 60000
-        written <- writeInput s (Bytes.fromString "one\ntwo\nthree\n")
-        closeInput s
-        r <- wait s
-        if strEq
-             (receivedText counted ^ r.out)
-             "counted while the reader waits: 1000\nread: 3 lines\nmain done\n"
-           && strEq r.err ""
-           && succeeded r
-          then pure MkUnit
-          else failure (receivedText counted ^ said r))
+      { command = bin
+      , input = Piped
+      , output = Piped
+      , timeout = 120000
+      } (\s -> do
+    counted <-
+      readOutput s (Through "counted while the reader waits: 1000\n") 60000
+    written <- writeInput s (Bytes.fromString "one\ntwo\nthree\n")
+    closeInput s
+    r <- wait s
+    if strEq
+         (receivedText counted ^ r.out)
+         "counted while the reader waits: 1000\nread: 3 lines\nmain done\n"
+       && strEq r.err ""
+       && succeeded r
+      then pure MkUnit
+      else failure (receivedText counted ^ said r))
   ranWith "green stdin" held
 
 -- | commands held by green threads, scheduled by std.reactor, by C
@@ -2264,16 +2267,15 @@ httpServer = do
   bin <- built "test/node/served.hf" "main" Nil ""
   served <-
     withProcess
-      { command = bin, args = List.take 1 ports, timeout = 60000 }
-      (\p -> do
-        client <-
-          run
-            { command = "node"
-            , args = [root ^ "/test/peers.mjs", "client", firstOf ports]
-            , timeout = 120000
-            }
-        server <- wait p
-        pure (MkPair client server))
+      { command = bin, args = List.take 1 ports, timeout = 60000 } (\p -> do
+    client <-
+      run
+        { command = "node"
+        , args = [root ^ "/test/peers.mjs", "client", firstOf ports]
+        , timeout = 120000
+        }
+    server <- wait p
+    pure (MkPair client server))
   both <- ranWith "http server" served
   client <- pure (fst both)
   server <- pure (snd both)
@@ -2436,21 +2438,22 @@ evidence = do
          { out = Just "0: one\n1: two\n2: three\ncounted 3\n" })
 
 -- | two worlds of the test's own, one's provider acting on the boxes the
--- | other's hands out, the world holding them for both (std.handle): held
--- | again, the same number; let go of, freed by their maker's provider
-handles : {e : HFunctor}
-        -> {{chk : check <: e}}
-        -> {{sys : process <: e}}
-        -> {{disk : filesystem <: e}}
-        -> Co e Unit
-handles =
+-- | other's hands out, each held by a `with` and given by value (a
+-- | foreign value): freed by their maker's provider as the program drops
+-- | them, each as its `with` ends
+hostThings : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Co e Unit
+hostThings =
   ran
     "test/node/tally.hf"
     "main"
     Nil
     { out =
         Just
-          "bumped: 42\nheld again: the same; another: not the same\nkept: 5050\nlet go of: 51\n"
+          "bumped: 42\nchurned: 50 freed\nkept: 5050, then 150 freed\nfreed: 151\n"
     }
 
 -- | an effect done by C's own functions, no provider written by hand: the
@@ -2729,7 +2732,7 @@ deepLoops = do
          (\bin -> { command = bin, timeout = 60000 })
          { out = Just deepWant })
 
--- | a file held by std.filesystem.held's `withFile`: closed where its body
+-- | a file held by std.filesystem's `withFile`: closed where its body
 -- | ends, where a throw leaves it for a `catch` outside, where a handler
 -- | drops the continuation, each before what follows; ten thousand
 -- | bodies left by a throw, no descriptor left open
@@ -2833,7 +2836,7 @@ backends =
       , integration "a module named main, as parts" mainParts
       , integration "an app is not a program" appNotProgram
       , integration "evidence" evidence
-      , integration "handles shared" handles
+      , integration "host things shared" hostThings
       , integration "described in C" described
       , integration "processes" processes
       , integration "threads" threads
