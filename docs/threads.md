@@ -249,6 +249,152 @@ A name std.net resolves under a scheduler is resolved by a thread of
 the system started for it, which touches nothing of heff's, in a
 program built for threads or not.
 
+## Places
+
+A place (#97, as Racket's) is a thread with a heap of its own that
+shares nothing: what a place makes stays on its own pages, counted by
+it alone, never atomically, and a value given to another place is
+copied -- or moved, where the sender held it alone -- never shared.
+Places and shared threads are two uses of one object model, not two
+runtimes: a place is a thread as `std.thread` starts one, with the
+pages every thread has (#66); what makes it a place is that its
+provider marks nothing `SHARED`.  The library's is `std.place`, whose
+provider builds the runtime for threads as `std.thread`'s does.
+
+```haskell
+import co
+import std.io
+import std.place
+
+world : HFunctor
+world = stdio <+> places
+
+program : {{io : stdio <: world}} -> {{pl : places <: world}} -> Co world Unit
+program = do
+  p <- spawnPlace (pure (fib 30))        -- run there, from now
+  ch <- newPlaceChannel                   -- a PlaceChannel (List Int)
+  q <- spawnPlace (sendPlace ch (List.range 1 100000))
+  xs <- recvPlace ch                      -- the list, made again here
+  n <- joinPlace p                        -- fib 30, copied back
+  ...
+```
+
+- `spawnPlace c`: `c`, a computation of the world, run in a place of
+  its own; the `Place a` it comes to.  `joinPlace p`: its value, waited
+  for, made the joiner's; a place is joined once.  A failure in a place
+  (`abandon`) is the joiner's at the join, as a thread's is: the place
+  ends alone, the program fails when it joins it.
+- `newPlaceChannel`: a `PlaceChannel a`; `sendPlace ch v` puts `v` on
+  it and goes on at once; `recvPlace ch` takes the next value sent,
+  waiting for one.  A channel is typed, and may carry any type -- a
+  record, a list, a function, a channel -- one effect for them all.
+  What a place is to hold (a channel, a table to look things up in) it
+  holds through the computation given to it, copied with it.
+- A receive blocks the whole place, unless it is in a group of
+  std.reactor's (green threads scheduled by `Reactor.scheduled`): then
+  it is pending, a wait of the reactor's, the other green threads of
+  the place going on, and the thread that received runs on once
+  something is sent.
+
+### How a value crosses
+
+What a place is given to run, what it is sent and what it gives back
+cross as a message: a flat buffer of words that is no heap's.  The
+sender walks the value once and writes it into the buffer -- each
+object a header word (its kind, its tag, how many fields) and its
+fields, an integer or a tag of no fields its word as it is, an
+immortal object (a definition's value, a string written in the
+program) its pointer, since it is the program's and counted by none --
+and then drops its own value as it would any other.  The receiver reads
+the message and makes a value of its own out of it, each object in its
+own pages, and frees the message.  So no object is ever held by two
+places, none is counted atomically, and no page holds another place's
+object.  What a value holds twice -- an object of count more than one
+-- is numbered in the message and made once in the receiver too, so
+that a copy is no bigger than its original.  A foreign value (a `FILE
+*` held by the world) does not cross: sending one fails.
+
+Copy against move: an object the sender holds alone -- its count 1,
+and so every object's above it in the value -- that is the system's,
+not a page's (a string, bytes, an array of numbers or a big integer of
+more than 128 bytes, which the allocator gives to `malloc`) is moved:
+its pointer goes in the message, its bytes are not copied, and the
+sender forgets it.  Everything else is copied, because a small object
+is in a page of its maker's, and the receiver's objects must be in the
+receiver's own pages: moving a list would leave its cells on the
+sender's pages, freed later by the receiver onto the pages' remote
+lists -- the shared threads' path, which places are there to avoid.
+A long string sent is thus free; a long list is made again.
+
+The other way -- the receiver reading the sender's objects where they
+are, allocating its own as it goes -- would walk the value once
+instead of twice, but the sender's value would have to stay, and stay
+unchanged, until the receiver was done with it: either a send waits for
+its receive, or the receiver hands back what to drop.  A buffer the
+sender fills and forgets keeps the two apart, lets a channel hold any
+number of messages, and makes a pending receive a wait on a
+descriptor: a channel asked for one keeps a pipe readable while it
+holds a message, and the reactor polls it with the rest.
+
+What a channel costs the program: it is held by the world for the
+program's life (there is no closing it yet).  A place's `exit` ends
+the process, as a thread's does.  Definitions' values are computed
+once and frozen, as in threads mode, so a place reading one copies
+nothing.  `std.reference`'s cells and the working directory are still
+the process's, not the place's.
+
+### Measured
+
+The same machine and build as below (`zig cc -O2`, each the fastest of
+5 runs by `/usr/bin/time`, which resolves to 10 ms).  The places test
+program's `cpu WORK N W` is a pool of W places over two channels (a
+task's number out, its answer back) against std.thread's `parFor`
+(`cpu` of the threads test) and against W processes of a worker
+program, each given a W-th of the tasks, started at once and waited
+for:
+
+| work | W | threads, parFor | places, a pool over channels | W processes |
+|---|---|---|---|---|
+| queens 12 | 1 | 190 ms | 200 ms | 200 ms |
+| | 2 | 90 ms | 100 ms | 100 ms |
+| | 4 | 50 ms | 50 ms | 50 ms |
+| | 8 | 20 ms | 20 ms | 30 ms |
+| | 14 | 20 ms | 20 ms | 30 ms |
+| primes below 5,000,000 | 1 | 900 ms | 910 ms | 930 ms |
+| | 4 | 230 ms | 230 ms | 250 ms |
+| | 14 | 90 ms | 90 ms | 100 ms |
+
+One process per task (144 processes for queens 12) takes 110 ms where
+a pool of 14 places takes 20 ms: a place is started as cheaply as a
+thread, isolated as a process is.  On work that crosses little, places
+cost nothing over threads: the tasks' numbers and answers are the
+message, a few words each.
+
+Made in one place and summed in another (`handOver R W`: R rounds,
+each W lists of 100,000 made by W places and sent to the main one,
+which sums them, a round at a time; the threads test's `handOver`, the
+same lists made by a pool's threads and summed by the caller), the time
+of the whole program and its peak memory:
+
+| rounds, W | threads | places |
+|---|---|---|
+| 100, W=1 | 40 ms, 5 MB | 190 ms, 11 MB |
+| 10, W=4 | 20 ms, 25 MB | 50 ms, 33 MB |
+| 100, W=4 | 180 ms, 26 MB | 490 ms, 44 MB |
+| 400, W=4 | 710 ms, 31 MB | 1960 ms, 46 MB |
+| 100, W=8 | 410 ms, 83 MB | 890 ms, 64 MB |
+
+With one thread, std.thread's pool runs in the caller, nothing crossing:
+40 ms is making and summing 100 lists.  The place's 190 ms is the same
+work and 100 lists crossing: some 1.5 ms a list of 100,000 -- 15 ns a
+cell to write, read, make again and free, four times what making the
+cell costs.  That is the price of isolation, paid per object that
+crosses, and paid by the receiver, one place reading what many sent:
+a program that hands over much should hand over little -- answers, not
+inputs -- or run on shared threads.  Memory does not grow with the
+rounds: a message is freed as it is read, the lists made in a place
+are freed in it, and nothing goes on a page's remote list.
+
 ## Measured
 
 On a 14-core Apple M-series machine, `test/node/threads.hf`'s
@@ -299,6 +445,10 @@ ms in a program not built for threads).
 ## Testing
 
 `heff test test/backends.hf` runs `test/node/threads.hf` (its `main`, `generic`,
-`failing`, `failingTask`, `cpu` and `handOver`); with `HEFF_SANITIZE=1` under
+`failing`, `failingTask`, `cpu` and `handOver`) and the places test
+beside it (places spawned, joined and nested; every kind of value over
+a channel; a pool over channels; long strings moved and copied; a place
+abandoning; a receive pending in green threads; `cpu`, `handOver`);
+with `HEFF_SANITIZE=1` under
 AddressSanitizer (`make sanitize`), and with `HEFF_TSAN=1` again under
 ThreadSanitizer (`make tsan`), built by the system's clang.
