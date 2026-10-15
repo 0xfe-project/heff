@@ -7,7 +7,9 @@
 -- a `Try e a`.  This module's `do`, after the definition of its own
 -- `bind` (below), stops at the first failure; before it, and as
 -- `Co.bind`, `bind` is co's.  (A module importing this one and co both
--- has two `bind`s: the page imports this one `as VecAdd`.)
+-- has two `bind`s: the page imports this one `as VecAdd`.)  The buffers
+-- are each held by a `with` (gpu.run's `withTyped`), one inside the
+-- next, and let go of as the sums come out.
 
 import co
 import co as Co
@@ -16,6 +18,7 @@ import gpu as Gpu
 import gpu.kernel as Kernel
 import gpu.run as Run
 import gpu.wgsl as Wgsl
+import with
 
 -- (each element of `c` the sum of `a`'s and `b`'s, where `c` has one)
 addInto : Kernel.Input Float32
@@ -70,17 +73,6 @@ unpackFloats : Bytes -> List Float64
 unpackFloats b[x::float-32-little, rest::binary] = Cons x (unpackFloats rest)
 unpackFloats _ = Nil
 
--- (the sums read, the buffers let go of)
-finish : {e : HFunctor}
-       -> {{card : Gpu.gpu <: e}}
-       -> List (Run.Typed Float32)
-       -> Bytes
-       -> Co e (Either Gpu.GpuError (List Float64))
-finish buffers out = do
-  for buffer in buffers do
-    Run.freeTyped buffer
-  pure (Right (unpackFloats out))
-
 -- | a step on the GPU, in `e`: its error, or its value
 type Try (e : HFunctor) a = Co e (Either Gpu.GpuError a)
 
@@ -102,28 +94,67 @@ bind c k = Co.bind c (orFail k)
 ok : {e : HFunctor} -> {a : Type} -> a -> Try e a
 ok x = pure (Right x)
 
--- (a buffer of the floats, on the device)
+-- | what a `with` whose body is a step came to: the body's error, or
+-- | the `with`'s own, is the whole's
+-- | >>> flattened (Right (Right 1))
+-- | Right 1
+-- | >>> flattened (a := Int) (Right (Left { message = "no" }))
+-- | Left { message = "no" }
+flattened : {a : Type}
+          -> Either Gpu.GpuError (Either Gpu.GpuError a)
+          -> Either Gpu.GpuError a
+flattened (Left err) = Left err
+flattened (Right r) = r
+
+-- | a `with` whose body is a step, as a step
+held : {e : HFunctor} -> {a : Type} -> Try e (Either Gpu.GpuError a) -> Try e a
+held c = Co.bind c (\r -> pure (flattened r))
+
+-- (the floats written into the buffer)
 upload : {e : HFunctor}
        -> {{card : Gpu.gpu <: e}}
-       -> Gpu.Device
+       -> {s t : Type}
+       -> With s Gpu.Device
+       -> Run.Typed t Float32
        -> List Float64
-       -> Try e (Run.Typed Float32)
-upload d fs = do
-  buffer <- Run.newTyped d (List.length fs)
-  Run.writeTyped d buffer (packFloats fs)
-  ok buffer
+       -> Try e Unit
+upload d buffer fs = Run.writeTyped d buffer (packFloats fs)
 
--- | the sums, computed on a device: the vectors uploaded, the kernel run,
--- | one invocation for each element, and the sums read back
-sums : {e : HFunctor} -> {{card : Gpu.gpu <: e}} -> Try e (List Float64)
-sums = do
-  d <- Gpu.open
-  a <- upload d xs
-  b <- upload d ys
-  c <- Run.newTyped d size
+-- (the kernel run over the vectors, the sums read back)
+added : {e : HFunctor}
+      -> {{card : Gpu.gpu <: e}}
+      -> {s t u v : Type}
+      -> With s Gpu.Device
+      -> Run.Typed t Float32
+      -> Run.Typed u Float32
+      -> Run.Typed v Float32
+      -> Try e (List Float64)
+added d a b c = do
+  upload d a xs
+  upload d b ys
   Run.run3 d vecAdd size a b c
   out <- Run.readTyped d c
-  finish [a, b, c] out
+  ok (unpackFloats out)
+
+-- | the sums, computed on the device: three buffers held one inside
+-- | the next, the vectors uploaded, the kernel run, one invocation for
+-- | each element, and the sums read back
+sums : {e : HFunctor}
+     -> {{card : Gpu.gpu <: e}}
+     -> {s : Type}
+     -> With s Gpu.Device
+     -> Try e (List Float64)
+sums d =
+  held
+    (Run.withTyped
+       d
+       size
+       (\a ->
+          held
+            (Run.withTyped
+               d
+               size
+               (\b -> held (Run.withTyped d size (\c -> added d a b c))))))
 
 -- (the first index, from `i`, where the two differ)
 firstMismatch : Int -> List Float64 -> List Float64 -> Maybe Int

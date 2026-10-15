@@ -1,35 +1,71 @@
--- The DOM world as an effect: its operations, each taking
--- the evidence that the DOM is in the program's effect (as
--- state's `get` does).  `heff compile --backend=page` compiles a
--- computation of this world -- `Co dom Unit`, or a sum of worlds -- to a
--- script for a page, each world's algebra from its provider (dom.provider.js).
+-- The DOM world as an effect: its operations, each taking the evidence
+-- that the DOM is in the program's effect (as state's `get` does).
+-- `heff compile --backend=page` compiles a computation of this world --
+-- `Co dom Unit`, or a sum of worlds -- to a script for a page, each
+-- world's algebra from its provider.
+--
+-- The page's document is had by `withDocument`, at the top of the
+-- program, as a `With s Document`: what finds and makes elements
+-- (`select`, `xpath`, `create`) takes it.  An element is the host's
+-- own, a foreign value, passed by value: to the operations on it here
+-- (`text`, `attr`, `append`, `on`), and to another effect's -- a
+-- `<canvas>` found here, drawn on by a GPU's effect inside the same
+-- `with`.  The page owns its elements, so there is nothing to let go
+-- of: an element the program drops is the collector's.  An app only
+-- gets elements from the operations -- it makes them, or finds them on
+-- the page: where one goes on the page is the app's to say.
+
+module
+  ( Document
+  , Element
+  , DomError
+  , DomF(..)
+  , dom
+  , withDocument
+  , create
+  , text
+  , attr
+  , append
+  , clear
+  , value
+  , on
+  , same
+  , select
+  , xpath
+  , found
+  , sleep
+  , fetchText
+  , textIn
+  , showDomError
+  )
 
 import co
-import std.handle
+import with
 
--- | What an element of the page is, as the kind of a handle
--- | (`Handle Element`, std.handle): no value has it.
+-- | The page's document: the host's own, had as a `With s Document` by
+-- | `withDocument`'s body.
+data Document
+
+-- | An element of the page: the host's own, passed by value.
 data Element
 
--- | An element of the page: the world's handle of it, which another
--- | effect's provider can take -- a `<canvas>` found here, drawn on by a
--- | GPU's.  (An app only gets nodes from the operations -- it makes
--- | them, or finds them on the page, `select` and `xpath`: where it goes
--- | on the page is the app's to say.)
-type Node = Handle Element
+-- | Why the page was not had: no document here (a worker, say).
+type DomError = { message : String }
 
 -- the operations: each takes what it needs, and says what it gives back by
 -- a function to the rest (`x`); `On` takes a computation, run at each event
 data DomF (m : Type -> Type) x
-  = Create String (Node -> x)
-  | Text Node String x
-  | Attr Node String String x
-  | Append Node Node x
-  | Clear Node x
-  | Value Node (String -> x)
-  | On Node String (String -> m Unit) x
-  | Select String (Maybe Node -> x)
-  | XPath String (Maybe Node -> x)
+  = Open (Either DomError Document -> x)
+  | Create Document String (Element -> x)
+  | Text Element String x
+  | Attr Element String String x
+  | Append Element Element x
+  | Clear Element x
+  | Value Element (String -> x)
+  | On Element String (String -> m Unit) x
+  | Same Element Element (Bool -> x)
+  | Select Document String (Maybe Element -> x)
+  | XPath Document String (Maybe Element -> x)
   | Sleep Int x
   | Fetch String (String -> x)
 
@@ -38,74 +74,121 @@ dom : HFunctor
 dom =
   { f = DomF
   , hfmap = \m g p -> case p of
-      Create t k -> Create t (\n -> g (k n))
+      Open k -> Open (\d -> g (k d))
+      Create d t k -> Create d t (\n -> g (k n))
       Text n str x -> Text n str (g x)
       Attr n a v x -> Attr n a v (g x)
       Append p c x -> Append p c (g x)
       Clear n x -> Clear n (g x)
       Value n k -> Value n (\v -> g (k v))
       On n e h x -> On n e h (g x)
-      Select q k -> Select q (\n -> g (k n))
-      XPath q k -> XPath q (\n -> g (k n))
+      Same n o k -> Same n o (\b -> g (k b))
+      Select d q k -> Select d q (\n -> g (k n))
+      XPath d q k -> XPath d q (\n -> g (k n))
       Sleep ms x -> Sleep ms (g x)
       Fetch url k -> Fetch url (\t -> g (k t))
   , hmap = \m n nt p -> case p of
-      Create t k -> Create t k
+      Open k -> Open k
+      Create d t k -> Create d t k
       Text n str x -> Text n str x
       Attr n a v x -> Attr n a v x
       Append p c x -> Append p c x
       Clear n x -> Clear n x
       Value n k -> Value n k
       On n e h x -> On n e (\v -> nt (h v)) x
-      Select q k -> Select q k
-      XPath q k -> XPath q k
+      Same n o k -> Same n o k
+      Select d q k -> Select d q k
+      XPath d q k -> XPath d q k
       Sleep ms x -> Sleep ms x
       Fetch url k -> Fetch url k
   }
 
-create : {e : HFunctor} -> {{ev : dom <: e}} -> String -> Co e Node
-create tag = op (ev (Create tag (\n -> n))) val
+-- (the page's document, or why there is none)
+opened : {e : HFunctor} -> {{ev : dom <: e}} -> Co e (Either DomError Document)
+opened = op (ev (Open (\d -> d))) val
 
-text : {e : HFunctor} -> {{ev : dom <: e}} -> Node -> String -> Co e Unit
+-- (a document is the page's: nothing to let go of)
+kept : {e : HFunctor} -> Document -> Co e (Either DomError Unit)
+kept d = pure (Right MkUnit)
+
+-- | The page's document, held by `body` in a region of its own: what it
+-- | came to, or why there is no document here.  A program has its page
+-- | once, at the top, and finds and makes its elements inside.
+withDocument : {e : HFunctor}
+             -> {a : Type}
+             -> {{ev : dom <: e}}
+             -> ({s : Type} -> With s Document -> Co e a)
+             -> Co e (Either DomError a)
+withDocument body = scoped opened kept body
+
+-- | An element made, of the tag: on no page until it is appended.
+create : {e : HFunctor}
+       -> {s : Type}
+       -> {{ev : dom <: e}}
+       -> With s Document
+       -> String
+       -> Co e Element
+create doc tag = op (ev (Create (inside doc) tag (\n -> n))) val
+
+text : {e : HFunctor} -> {{ev : dom <: e}} -> Element -> String -> Co e Unit
 text n str = op (ev (Text n str MkUnit)) val
 
 attr : {e : HFunctor}
      -> {{ev : dom <: e}}
-     -> Node
+     -> Element
      -> String
      -> String
      -> Co e Unit
 attr n a v = op (ev (Attr n a v MkUnit)) val
 
-append : {e : HFunctor} -> {{ev : dom <: e}} -> Node -> Node -> Co e Unit
+append : {e : HFunctor}
+       -> {{ev : dom <: e}}
+       -> Element
+       -> Element
+       -> Co e Unit
 append parent child = op (ev (Append parent child MkUnit)) val
 
-clear : {e : HFunctor} -> {{ev : dom <: e}} -> Node -> Co e Unit
+clear : {e : HFunctor} -> {{ev : dom <: e}} -> Element -> Co e Unit
 clear n = op (ev (Clear n MkUnit)) val
 
-value : {e : HFunctor} -> {{ev : dom <: e}} -> Node -> Co e String
+value : {e : HFunctor} -> {{ev : dom <: e}} -> Element -> Co e String
 value n = op (ev (Value n (\v -> v))) val
 
 on : {e : HFunctor}
    -> {{ev : dom <: e}}
-   -> Node
+   -> Element
    -> String
    -> (String -> Co e Unit)
    -> Co e Unit
 on n event h = op (ev (On n event h MkUnit)) val
 
+-- | Whether two elements are one: the same element of the page, found
+-- | twice, say.
+same : {e : HFunctor} -> {{ev : dom <: e}} -> Element -> Element -> Co e Bool
+same n o = op (ev (Same n o (\b -> b))) val
+
 -- | The first element of the page a CSS selector matches (`#out`,
 -- | `ul > li.done`), if one does.
-select : {e : HFunctor} -> {{ev : dom <: e}} -> String -> Co e (Maybe Node)
-select q = op (ev (Select q (\n -> n))) val
+select : {e : HFunctor}
+       -> {s : Type}
+       -> {{ev : dom <: e}}
+       -> With s Document
+       -> String
+       -> Co e (Maybe Element)
+select doc q = op (ev (Select (inside doc) q (\n -> n))) val
 
 -- | The first element of the page an XPath matches
 -- | (`//button[text()='Go']`), if one does.
-xpath : {e : HFunctor} -> {{ev : dom <: e}} -> String -> Co e (Maybe Node)
-xpath q = op (ev (XPath q (\n -> n))) val
+xpath : {e : HFunctor}
+      -> {s : Type}
+      -> {{ev : dom <: e}}
+      -> With s Document
+      -> String
+      -> Co e (Maybe Element)
+xpath doc q = op (ev (XPath (inside doc) q (\n -> n))) val
 
 -- | Go on with an element, if it was found.
-found : {e : HFunctor} -> Maybe Node -> (Node -> Co e Unit) -> Co e Unit
+found : {e : HFunctor} -> Maybe Element -> (Element -> Co e Unit) -> Co e Unit
 found Nothing _ = pure MkUnit
 found (Just n) k = k n
 
@@ -116,15 +199,23 @@ sleep ms = op (ev (Sleep ms MkUnit)) val
 fetchText : {e : HFunctor} -> {{ev : dom <: e}} -> String -> Co e String
 fetchText url = op (ev (Fetch url (\t -> t))) val
 
--- an element with some text in it, put in a parent
+-- | An element with some text in it, put in a parent.
 textIn : {e : HFunctor}
+       -> {s : Type}
        -> {{ev : dom <: e}}
-       -> Node
+       -> With s Document
+       -> Element
        -> String
        -> String
-       -> Co e Node
-textIn parent tag str = do
-  n <- create tag
+       -> Co e Element
+textIn doc parent tag str = do
+  n <- create doc tag
   text n str
   append parent n
   pure n
+
+-- | As the host says it.
+-- | >>> showDomError { message = "no document here" }
+-- | "dom: no document here"
+showDomError : DomError -> String
+showDomError err = "dom: " ^ err.message
