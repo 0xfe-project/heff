@@ -791,21 +791,56 @@ letSplit r x a b = do
 -- -- is what follows given each tag where it is built, `if c then (...
 -- case Left y of ...) else (... case Right f of ...)`: each match then
 -- chooses at once, and no tag is built.  What follows is copied into
--- each way out, so only when it is small.
+-- each way out, so only when that is small -- but where what follows
+-- is the match itself, each arm goes to the ways out that choose its
+-- tag, and where each tag is chosen by one way out nothing is copied,
+-- however big the arms: an iteration's step, `Just (MkPair a rest)` or
+-- `Nothing`, with the loop's body and what follows the loop as the arms.
 
--- | how big what follows may be, times the tags but one
+-- | how big what is copied may be, times the copies
 sumBudget : Int
 sumBudget = 100
 
--- (the tags it comes to, through the bindings and matches of its arms
--- -- an arm abandoned none -- and anything else very many)
-tagLeaves : IR.Expr -> Int
-tagLeaves (ETag _ _ _) = 1
-tagLeaves (ELet _ _ b) = tagLeaves b
-tagLeaves (EMatch _ arms) =
-  IR.sumI (List.map (\a -> tagLeaves (IR.armBody a)) arms)
-tagLeaves EAbandon = 0
-tagLeaves e = 1000000
+-- | the ways out of an expression: the tags it comes to, through its
+-- | bindings and the arms of its matches (an arm abandoned none), and
+-- | how many come to anything else
+type Ways = Pair (List String) Int
+
+bothWays : Ways -> Ways -> Ways
+bothWays (MkPair ts n) (MkPair us m) = MkPair (appendL ts us) (n + m)
+
+waysOut : IR.Expr -> Ways
+waysOut (ETag t _ _) = MkPair (Cons t Nil) 0
+waysOut (ELet _ _ b) = waysOut b
+waysOut (EMatch _ arms) =
+  List.foldl (\w a -> bothWays w (waysOut (IR.armBody a))) (MkPair Nil 0) arms
+waysOut EAbandon = MkPair Nil 0
+waysOut e = MkPair Nil 1
+
+waysCount : Ways -> Int
+waysCount (MkPair ts n) = List.length ts + n
+
+-- (whether any way out comes to a tag)
+anyTag : Ways -> Bool
+anyTag (MkPair ts n) = List.length ts > 0
+
+countTag : String -> List String -> Int
+countTag t ts = List.length (List.filter (\u -> strEq u t) ts)
+
+-- | an arm of a match on what comes out those ways is copied to every
+-- | way out that comes to its tag, and to every one that comes to no
+-- | tag (given the whole match), but the first: whether that is more
+-- | than the budget allows
+armOver : Int -> Ways -> IR.Arm -> Bool
+armOver budget (MkPair ts n) (MkArm t _ b) =
+  countTag t ts + n > 1 && IR.sizeAbove (budget / (countTag t ts + n - 1)) b
+
+-- | the arms of a match on what comes out of `a` may be given to the
+-- | ways out of `a`: some come to a tag, and no arm is copied more than
+-- | the budget allows -- none is where each tag is come to once
+armsPushable : Int -> IR.Expr -> List IR.Arm -> Bool
+armsPushable budget a arms =
+  anyTag (waysOut a) && not (List.any (armOver budget (waysOut a)) arms)
 
 -- (how many matches on `x` there are in the worklist)
 scrutW : String -> Int -> List IR.Expr -> Int
@@ -822,20 +857,34 @@ scrutW x n (Cons (EPrimCall _ as) rest) = scrutW x n (IR.appendI as rest)
 scrutW x n (Cons (ECall _ as) rest) = scrutW x n (IR.appendI as rest)
 scrutW x n (Cons _ rest) = scrutW x n rest
 
+-- (what follows, copied whole to every way out but the first: more
+-- than the budget allows)
+followOver : IR.Expr -> IR.Expr -> Bool
+followOver a b =
+  waysCount (waysOut a) > 1
+  && IR.sizeAbove (sumBudget / (waysCount (waysOut a) - 1)) b
+
+-- (... or, the match on `x` itself, its arms each to the ways out that
+-- choose it)
+sumOver : String -> IR.Expr -> IR.Expr -> Bool
+sumOver x a (EMatch (EVar y) arms) =
+  if strEq x y then not (armsPushable sumBudget a arms)
+  else followOver a (EMatch (EVar y) arms)
+sumOver x a b = followOver a b
+
 -- | `x`, bound to a match coming to tags, is only matched on in `b`,
--- | which is small enough to be copied to each
+-- | which may be given to each way out
 sumTakenApart : String -> IR.Expr -> IR.Expr -> Bool
 sumTakenApart x (EMatch s arms) b =
-  tagLeaves (EMatch s arms) >= 2
-  && tagLeaves (EMatch s arms) < 1000000
-  && not (IR.sizeAbove (sumBudget / (tagLeaves (EMatch s arms) - 1)) b)
+  anyTag (waysOut (EMatch s arms))
   && scrutW x 0 (Cons b Nil) > 0
   && scrutW x 0 (Cons b Nil) == occCountOf x b
+  && not (sumOver x (EMatch s arms) b)
 sumTakenApart x a b = False
 
 -- (each way out of `a` given what follows, `x` bound to its tag there:
 -- the tag's fields bound first, so that it is a value put where it is
--- matched on)
+-- matched on -- or, a way out that comes to no tag, bound to that)
 sumPushed : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
 sumPushed r x b (ETag t es ts) = do
   bound <- bindArgs es
@@ -848,7 +897,10 @@ sumPushed r x b (ELet y a c) = do
 sumPushed r x b (EMatch s arms) = do
   arms2 <- armsS (\a -> sumPushed r x b a) arms
   pure (EMatch s arms2)
-sumPushed r x b e = pure e
+sumPushed r x b EAbandon = pure EAbandon
+sumPushed r x b e = do
+  b2 <- copy b
+  r.simp (ELet x e b2)
 
 -- Tags taken apart, their fields computing: `let p = InR (InR (Catch
 -- (nt c) h)) in case p of ...` (an operation, its evidence applied,
@@ -2474,16 +2526,13 @@ findArm t (Cons (MkArm t2 vs b) rest) =
 
 -- A match on a match, `case (case a of True -> b; False -> False) of ...`
 -- (`&&`, inlined), is the inner match with the outer one in each arm:
--- where an arm is a tag, the outer match chooses at once.  The outer
--- arms are copied into each inner one, so only when they are small.
+-- where an arm is a tag, the outer match chooses at once.  An outer
+-- arm goes to the inner ways out that choose its tag: copied where
+-- more than one does, so only when it is small; moved where one does.
 
--- | how big the outer arms may be, times the inner arms but one
+-- | how big the outer arms copied may be, times the copies
 caseBudget : Int
 caseBudget = 40
-
-tagBody : IR.Arm -> Bool
-tagBody (MkArm _ _ (ETag _ _ _)) = True
-tagBody _ = False
 
 armsOf : IR.Expr -> List IR.Arm
 armsOf (EMatch _ arms) = arms
@@ -2496,10 +2545,14 @@ pushArm r arms (MkArm t vs b) = do
   b' <- r.match b (armsOf outer)
   pure (MkArm t vs b')
 
+-- | a match on a match, `case (if c then Just x else Nothing) of ...`
+-- | (a loop's step): the outer match given to the ways out of the
+-- | inner, where each chooses at once and no tag is built -- where its
+-- | arms are copied no more than the budget allows, which is not at all
+-- | where each tag is chosen by one way out (`armsPushable`)
 caseOfCase : SK -> IR.Expr -> List IR.Arm -> List IR.Arm -> M IR.Expr
 caseOfCase r s2 arms2 arms =
-  if List.any tagBody arms2
-     && IR.size (EMatch EAbandon arms) * (List.length arms2 - 1) <= caseBudget
+  if armsPushable caseBudget (EMatch s2 arms2) arms
   then do
     arms2' <- traverseS (pushArm r arms) arms2
     pure (EMatch s2 arms2')
