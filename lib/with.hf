@@ -1,0 +1,69 @@
+-- A host's thing held by a `with`, the same for every effect: an open
+-- file, a socket, a canvas.  `scoped acquire release body` acquires it,
+-- runs `body` with it, a `With s r` in a region `s` of its own, and
+-- releases it when `body` ends.  The body is polymorphic in `s`, and
+-- what it comes to is of a type bound outside it, so a `With s r`
+-- cannot leave the body (as Haskell's `ST`): a `with` of one effect may
+-- hand its thing to an operation of another by value -- a canvas found
+-- by the DOM, drawn on by the GPU -- and neither keeps it.
+--
+-- `With` is exposed without its tag: no program makes one, and `scoped`
+-- is the only `with`.  A library wraps `scoped` around its own
+-- operations acquiring and releasing the thing, exposes that `withX`
+-- alone -- never the bare acquire, as a bare host value given `scoped`
+-- is a use after its close -- and gives the thing to a provider
+-- operation by `inside`, which takes it out for that operation and
+-- nothing else: a program has no use for it, as the operations take the
+-- `With`.
+--
+-- The thing is the host's own, a foreign value with a finalizer, so a
+-- body left otherwise -- a throw heard outside it, a handler between
+-- that drops the continuation -- lets go of it where the program drops
+-- its last reference to it; `scoped` adds nothing for that.
+
+module (With, scoped, inside)
+
+import co
+
+-- | A host's thing, held in the region `s` by a `with` (`scoped`).
+data With (s : Type) a = MkWith a
+
+-- | The thing a `with` holds, for a provider operation given it: a
+-- | library's operation on a `With s a` takes it out here and gives it
+-- | to the operation, and nothing else does.
+inside : {s : Type} -> {a : Type} -> With s a -> a
+inside (MkWith x) = x
+
+-- (what the body came to, or why the thing was not released)
+closedWith : {err a : Type} -> a -> Either err Unit -> Either err a
+closedWith x (Right _) = Right x
+closedWith x (Left err) = Left err
+
+-- (the body run with the thing, then the thing released; or why it was
+-- not acquired)
+heldBy : {e : HFunctor}
+       -> {err r a : Type}
+       -> (r -> Co e (Either err Unit))
+       -> ({s : Type} -> With s r -> Co e a)
+       -> Either err r
+       -> Co e (Either err a)
+heldBy release body (Left err) = pure (Left err)
+heldBy release body (Right x) =
+  bind
+    (body (s := r) (MkWith x))
+    (\v -> bind (release x) (\c -> pure (closedWith v c)))
+
+-- | The thing `acquire` gives, held by `body` in a region of its own --
+-- | it is not kept past it -- and released by `release` when `body`
+-- | ends: what it came to, or why the thing was not acquired or not
+-- | released.  Should `body` be left otherwise -- a throw heard outside
+-- | it, a handler between that drops the continuation -- the thing is
+-- | let go of where the program drops its last reference to it, as its
+-- | provider says.
+scoped : {e : HFunctor}
+       -> {err r a : Type}
+       -> Co e (Either err r)
+       -> (r -> Co e (Either err Unit))
+       -> ({s : Type} -> With s r -> Co e a)
+       -> Co e (Either err a)
+scoped acquire release body = bind acquire (heldBy release body)

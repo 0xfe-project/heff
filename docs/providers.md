@@ -208,17 +208,20 @@ streams as an effect, no C written for it).  Functions of no effect
 (libm's, a hash) are not described: they are primitives of the
 runtime or the library; C cannot be trusted to say a function is pure.
 
-## Resources held by a `with`
+## Scoped operations
 
-A host's thing that must be let go of -- an open file -- is handed out
-by a `with` of the effect's own (std.filesystem.held's `withFile path
-options body`), which gives the body it as a `With s a`, the body
-polymorphic in the region `s` so that what it comes to cannot hold it.
-The module that has the `with` exposes `With` without its tag (see [the
-language's modules](language.md#modules)): only it makes one or takes
-the thing out of one, for the effect's operations.  What uses it needs
-no effect but the thing's own.  Its
-provider makes sure it is let go of, in two parts:
+A host's thing that must be let go of -- an open file, a socket, a
+canvas -- is handed out by a `with` of the effect's own, which is
+`with`'s `scoped` around the effect's operations acquiring and
+releasing it (std.filesystem.held's `withFile path options body`): the
+body has it as a `With s a`, polymorphic in the region `s` so that what
+it comes to cannot hold it, one `With` for every effect ([a thing held
+by a `with`](library.md#a-thing-held-by-a-with)).  The effect's
+operations on the thing take the `With s a` and give the thing to the
+provider by `with`'s `inside`; the module exposes its `with` and those
+operations, never the bare acquire.  What uses it needs no effect but
+the thing's own.  Its provider makes sure it is let go of, in two
+parts:
 
 - the operation that acquires it gives a foreign value whose function
   letting it go is its release (`heff_foreign(p, let_go)`).  Where the
@@ -236,11 +239,11 @@ provider makes sure it is let go of, in two parts:
 
 An operation of it that waits keeps the operation, so the thing, until
 it is done, so that it is not let go of under it.  The `with` is a
-function of the module's over these operations, not an operation
-holding the body: a computation an operation of the world holds is
-forwarded to it, by each handler between, by a natural transformation,
-which has nothing for a throw but `abandon` -- a throw out of such a
-body, heard outside it, would end the program.
+function over these operations, not an operation holding the body: a
+computation an operation of the world holds is forwarded to it, by each
+handler between, by a natural transformation, which has nothing for a
+throw but `abandon` -- a throw out of such a body, heard outside it,
+would end the program.
 
 ## Outside operations done later
 

@@ -77,6 +77,9 @@ are imported by their names:
   over it to another program ([a client and its server](remote.md));
 - `json` ([JSON](#json)), JSON's values, read from their text and
   written back, in heff, with no provider;
+- `with` ([a thing held by a `with`](#a-thing-held-by-a-with)), the
+  one `With s a` every effect's scoped resources are had by, and
+  `scoped`, the bracket they are made of;
 - `bits`, the operations of `Bits`, a bitstring of any length
   ([bits](language.md#bits)): `length` (in bits), `index` (a bit, as a
   `Bool`), `toList` and `fromList`, `toBytes` (`Just` the bytes, of a
@@ -448,22 +451,19 @@ wordsIn = bind stdin (\i -> foldLines i 0 countWords)
 ```
 
 A file may instead be held by a `with`, closed however the program is
-done with it: std.filesystem.held's `withFile path { access = Read }
-body` opens it and runs `body` with it, a `With s OpenFile` in a region
-`s` of its own -- exposed without its tag, so the file is had only by
-the module's operations -- read by `readLineOf f` and written by
-`writeStringTo f s`; the body
-ended, it closes it, and is what the body came to, `Either FileError
-a` (`Left` where the file did not open or close).  The body is
-polymorphic in `s` and what it comes to is of a type bound outside it,
-so the file cannot be kept past it: `withFile path o (\f -> pure f)`
-does not type-check (a function that holds it can be: an operation on
-it after the body is `EBADF`).  Should the body be left otherwise -- a throw
-heard by a `catch` outside it, a handler between that drops the
-continuation -- the file is closed where the program drops its last
-reference to it, at once (the count of it, in C, comes to naught before
-the `catch` arm runs).  What uses it needs only `filesystem`: no effect
-of scopes, nor `exception`.
+done with it ([a thing held by a `with`](#a-thing-held-by-a-with)):
+std.filesystem.held's `withFile path { access = Read } body` opens it
+and runs `body` with it, a `With s OpenFile`, read by `readLineOf f` and
+written by `writeStringTo f s`; the body ended, it closes it, and is
+what the body came to, `Either FileError a` (`Left` where the file did
+not open or close).  `withFile path o (\f -> pure f)` does not
+type-check (a function that holds it can be: an operation on it after
+the body is `EBADF`).  Should the body be left otherwise -- a throw heard
+by a `catch` outside it, a handler between that drops the continuation
+-- the file is closed where the program drops its last reference to it,
+at once (the count of it, in C, comes to naught before the `catch` arm
+runs).  What uses it needs only `filesystem`: no effect of scopes, nor
+`exception`.
 
 ```haskell
 firstLine : {e : HFunctor} -> {{disk : filesystem <: e}} -> String
@@ -616,6 +616,46 @@ asked server request = do
 ```
 
 (`contentLength` parses the headers; test/node/commands.hf has one.)
+
+## A thing held by a `with`
+
+A host's thing that must be let go of -- an open file, a socket, a
+canvas -- is had by a `with`: `with`'s `scoped acquire release body`
+acquires it, runs `body` with it, a `With s r` in a region `s` of its
+own, and releases it when `body` ends, `Either err a`: what the body
+came to, or why the thing was not acquired (the body not run) or not
+released (the body's answer lost to it).  The body is polymorphic in
+`s` and what it comes to is of a type bound outside it, so a `With s r`
+cannot leave the body (E0311), as Haskell's `ST` keeps its references:
+one `With` for every effect, so a `with` of one effect hands its thing
+to an operation of another by value -- a canvas found by the DOM, drawn
+on by the GPU -- and neither keeps it.  Should the body be left
+otherwise -- a throw heard outside it, a handler between that drops the
+continuation -- the thing is let go of where the program drops its last
+reference to it, as its provider says ([scoped
+operations](providers.md#scoped-operations)); `scoped` adds nothing for
+that, and what uses it needs no effect but the thing's own.
+
+`With` is exposed without its tag: no program makes one, and `scoped`
+is the only `with`.  A library wraps `scoped` around its own operations
+acquiring and releasing the thing and exposes that `withX` alone, never
+the bare acquire: a bare host value given `scoped` is a use after its
+close.  Its operations on the thing take the `With s a` and give the
+thing to the provider's operation by `with`'s `inside`, which takes it
+out for that and nothing else -- a program has no use for the bare
+thing, as the operations take the `With`.
+
+```haskell
+withFile : {e : HFunctor} -> {a : Type} -> {{ev : filesystem <: e}}
+         -> String -> OpenOptions
+         -> ({s : Type} -> With s OpenFile -> Co e a)
+         -> Co e (Either FileError a)
+withFile path o body = scoped (opened path o) closed body   -- `opened`, `closed`: the module's own
+
+readLineOf : {e : HFunctor} -> {s : Type} -> {{ev : filesystem <: e}}
+           -> With s OpenFile -> Co e (Either FileError (Maybe String))
+readLineOf f = op (ev (ReadLineHeld (inside f) (\r -> r))) val
+```
 
 ## The terminal
 
