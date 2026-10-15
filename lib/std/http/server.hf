@@ -4,8 +4,8 @@
 -- turn -- the request line, the headers, and a body of the length its
 -- `Content-Length` says -- each given to a handler, and its response
 -- written with its length, the connection kept for the next request
--- unless it is to be closed.  So it is the C backend's alone, as
--- std.net is.  Import it by a name, `import std.http.server as
+-- unless it is to be closed, and closed by the `with` holding it when
+-- it is done.  So it is the C backend's alone, as std.net is.  Import it by a name, `import std.http.server as
 -- Server`, beside `import std.http as Http`, whose `Response` a
 -- handler gives.
 --
@@ -23,6 +23,7 @@ import green
 import std.http as Http
 import std.net as Net
 import uint8 as UInt8
+import with
 
 -- | A request, as a server is sent it: its method (`GET`), its target as
 -- | the request line says it (`/items?id=3`), its version (`HTTP/1.1`),
@@ -194,8 +195,9 @@ data Head = HeadAt Bytes Int | HeadTooLong | HeadEnded
 
 -- (bytes read until `buf` has a head, looked for from `from` on)
 readHead : {e : HFunctor}
+         -> {s : Type}
          -> {{nt : Net.net <: e}}
-         -> Net.Connection
+         -> With s Net.TcpStream
          -> Bytes
          -> Int
          -> Co e Head
@@ -230,8 +232,9 @@ moreBody again got parts (Right b) =
 -- (bytes read until there are `n` at least, `got` of them in `parts`,
 -- the last first: all of them; none where the connection ends first)
 readBody : {e : HFunctor}
+         -> {s : Type}
          -> {{nt : Net.net <: e}}
-         -> Net.Connection
+         -> With s Net.TcpStream
          -> Int
          -> Int
          -> List Bytes
@@ -252,8 +255,9 @@ bodied r n (Just b) =
 
 -- (the request whose head ends at `i` of `buf`, its body read)
 withBody : {e : HFunctor}
+         -> {s : Type}
          -> {{nt : Net.net <: e}}
-         -> Net.Connection
+         -> With s Net.TcpStream
          -> Bytes
          -> Int
          -> Request
@@ -270,8 +274,9 @@ withBody c buf i r (Length n) = do
   pure (bodied r n got)
 
 parsed : {e : HFunctor}
+       -> {s : Type}
        -> {{nt : Net.net <: e}}
-       -> Net.Connection
+       -> With s Net.TcpStream
        -> Bytes
        -> Int
        -> Maybe Request
@@ -280,8 +285,9 @@ parsed c buf i Nothing = pure (Refused 400)
 parsed c buf i (Just r) = withBody c buf i r (bodyOf r)
 
 headed : {e : HFunctor}
+       -> {s : Type}
        -> {{nt : Net.net <: e}}
-       -> Net.Connection
+       -> With s Net.TcpStream
        -> Net.Address
        -> Head
        -> Co e Got
@@ -292,8 +298,9 @@ headed c peer HeadEnded = pure Ended
 
 -- (the next request of the connection, `buf` read of it already)
 readRequest : {e : HFunctor}
+            -> {s : Type}
             -> {{nt : Net.net <: e}}
-            -> Net.Connection
+            -> With s Net.TcpStream
             -> Net.Address
             -> Bytes
             -> Co e Got
@@ -433,8 +440,9 @@ drainedOn again got (Right b) =
 -- (what the client sends read and let go of, `got` bytes of it already,
 -- until it ends or there has been `drainMost` of it)
 drain : {e : HFunctor}
+      -> {s : Type}
       -> {{nt : Net.net <: e}}
-      -> Net.Connection
+      -> With s Net.TcpStream
       -> Int
       -> Co e Unit
 drain c got =
@@ -446,8 +454,9 @@ drain c got =
 -- connection closed with bytes unread -- a reset, which may come before
 -- the client has read the response -- is not what it is sent)
 lingered : {e : HFunctor}
+         -> {s : Type}
          -> {{nt : Net.net <: e}}
-         -> Net.Connection
+         -> With s Net.TcpStream
          -> Either Net.NetError Unit
          -> Co e Unit
 lingered c (Left err) = pure MkUnit
@@ -455,8 +464,9 @@ lingered c (Right _) = bind (Net.shutdown c) (\s -> drain c 0)
 
 -- (what was read, answered)
 answered : {e : HFunctor}
+         -> {s : Type}
          -> {{nt : Net.net <: e}}
-         -> Net.Connection
+         -> With s Net.TcpStream
          -> (Request -> Bool)
          -> (Request -> Co e Http.Response)
          -> Got
@@ -478,67 +488,51 @@ answered c last handle (Refused status) = do
   pure (Done False)
 answered c last handle Ended = pure (Done False)
 
--- (the connection's next request, `again`; or it closed)
-goOn : {e : HFunctor}
-     -> {{nt : Net.net <: e}}
-     -> (Bytes -> Co e Bool)
-     -> Net.Connection
-     -> After
-     -> Co e Bool
-goOn again c (Next rest) = again rest
-goOn again c (Done stop) = do
-  Net.close c
-  pure stop
+-- (the connection's next request, `again`; or it is done: whether the
+-- server stops)
+goOn : {e : HFunctor} -> (Bytes -> Co e Bool) -> After -> Co e Bool
+goOn again (Next rest) = again rest
+goOn again (Done stop) = pure stop
 
 -- (the connection's requests answered, `buf` read of them already)
 serveFrom : {e : HFunctor}
+          -> {s : Type}
           -> {{nt : Net.net <: e}}
           -> (Request -> Bool)
           -> (Request -> Co e Http.Response)
-          -> Net.Connection
+          -> With s Net.TcpStream
           -> Net.Address
           -> Bytes
           -> Co e Bool
 serveFrom last handle c peer buf = do
   got <- readRequest c peer buf
   after <- answered c last handle got
-  goOn (serveFrom last handle c peer) c after
+  goOn (serveFrom last handle c peer) after
 
 closedWith : {e : HFunctor}
+           -> {s : Type}
            -> {{nt : Net.net <: e}}
            -> (Request -> Bool)
            -> (Request -> Co e Http.Response)
-           -> Net.Connection
+           -> With s Net.TcpStream
            -> Either Net.NetError Net.Address
            -> Co e Bool
-closedWith last handle c (Left err) = do
-  Net.close c
-  pure False
+closedWith last handle c (Left err) = pure False
 closedWith last handle c (Right peer) = serveFrom last handle c peer Bytes.empty
 
 -- | A connection's requests answered by `handle`, one after another,
 -- | until it ends, a request asks for it to be closed, or `last` says
--- | the request is the last the server answers; then it is closed.
--- | Whether `last` said so.
+-- | the request is the last the server answers: whether `last` said so.
+-- | The connection is closed by the `with` holding it, `Net.accept`'s
+-- | or `Net.withConnection`'s, when its body ends.
 serveConnection : {e : HFunctor}
+                -> {s : Type}
                 -> {{nt : Net.net <: e}}
                 -> (Request -> Bool)
                 -> (Request -> Co e Http.Response)
-                -> Net.Connection
+                -> With s Net.TcpStream
                 -> Co e Bool
 serveConnection last handle c = bind (Net.peer c) (closedWith last handle c)
-
--- (a connection accepted, served: whether `last` said a request was the
--- last; where accepting failed, why)
-servedOn : {e : HFunctor}
-         -> {{nt : Net.net <: e}}
-         -> (Request -> Bool)
-         -> (Request -> Co e Http.Response)
-         -> Either Net.NetError Net.Connection
-         -> Co e (Either Net.NetError Bool)
-servedOn last handle (Left err) = pure (Left err)
-servedOn last handle (Right c) =
-  bind (serveConnection last handle c) (\stop -> pure (Right stop))
 
 -- (the next connection, `again`; or the server done: `last` said so, or
 -- accepting failed)
@@ -558,62 +552,82 @@ nextOr again (Right False) = again MkUnit
 -- | server stops there, `Left` why, the listener left as it is: whether
 -- | to wait and serve again is its caller's to say.
 serveUntil : {e : HFunctor}
+           -> {s : Type}
            -> {{nt : Net.net <: e}}
            -> (Request -> Bool)
-           -> Net.Listener
+           -> With s Net.TcpListener
            -> (Request -> Co e Http.Response)
            -> Co e (Either Net.NetError Unit)
-serveUntil last l handle = do
-  a <- Net.accept l
-  served <- servedOn last handle a
-  nextOr (\u -> serveUntil last l handle) served
+serveUntil last l handle =
+  bind
+    (Net.accept l (serveConnection last handle))
+    (nextOr (\u -> serveUntil last l handle))
 
--- (a connection accepted, served, then `again`; where accepting failed,
--- why)
-servedFor : {e : HFunctor}
-          -> {{nt : Net.net <: e}}
-          -> (Unit -> Co e Net.NetError)
-          -> (Request -> Co e Http.Response)
-          -> Either Net.NetError Net.Connection
-          -> Co e Net.NetError
-servedFor again handle (Left err) = pure err
-servedFor again handle (Right c) =
-  bind (serveConnection (\r -> False) handle c) (\stop -> again MkUnit)
+-- (the next connection, `again`; where accepting failed, why)
+nextFor : {e : HFunctor}
+        -> (Unit -> Co e Net.NetError)
+        -> Either Net.NetError Bool
+        -> Co e Net.NetError
+nextFor again (Left err) = pure err
+nextFor again (Right stop) = again MkUnit
 
 -- | The listener's connections served, until one fails to be accepted:
 -- | why, the listener left as it is (`serveUntil`).
 serve : {e : HFunctor}
+      -> {s : Type}
       -> {{nt : Net.net <: e}}
-      -> Net.Listener
+      -> With s Net.TcpListener
       -> (Request -> Co e Http.Response)
       -> Co e Net.NetError
-serve l handle = bind (Net.accept l) (servedFor (\u -> serve l handle) handle)
+serve l handle =
+  bind
+    (Net.accept l (serveConnection (\r -> False) handle))
+    (nextFor (\u -> serve l handle))
 
--- (a connection accepted, served by a thread of its own, and `again`;
--- where accepting failed, why)
-spawnedFor : {e : HFunctor}
-           -> {{gr : green <: e}}
-           -> {{nt : Net.net <: e}}
-           -> (Unit -> Co e Net.NetError)
-           -> (Request -> Co e Http.Response)
-           -> Either Net.NetError Net.Connection
-           -> Co e Net.NetError
-spawnedFor again handle (Left err) = pure err
-spawnedFor again handle (Right c) = do
-  spawn (bind (serveConnection (\r -> False) handle c) (\stop -> pure MkUnit))
-  again MkUnit
+-- (where accepting failed: the server stopping, said on the channel)
+stoppedOn : {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> Int
+          -> Either Net.NetError Bool
+          -> Co e Unit
+stoppedOn stopped (Left err) = send stopped err.code
+stoppedOn stopped (Right served) = pure MkUnit
+
+-- (a thread accepting the listener's next connection: a thread spawned
+-- to accept the one after it, then the connection served, and closed as
+-- the thread ends; where accepting failed, `stopped` told)
+acceptor : {e : HFunctor}
+         -> {s : Type}
+         -> {{gr : green <: e}}
+         -> {{nt : Net.net <: e}}
+         -> Int
+         -> With s Net.TcpListener
+         -> (Request -> Co e Http.Response)
+         -> Co e Unit
+acceptor stopped l handle =
+  bind
+    (Net.accept l (\c -> do
+     spawn (acceptor stopped l handle)
+     serveConnection (\r -> False) handle c))
+    (stoppedOn stopped)
 
 -- | The listener's connections served at once, each by a green thread
--- | of its own (`serveConnection`), until one fails to be
--- | accepted: why, the listener left as it is, the connections being
--- | served going on.  Run by a scheduler: std.reactor's
--- | (`Reactor.scheduled`) has each connection wait on its socket apart,
--- | the others served meanwhile.
+-- | of its own (`serveConnection`): the connection is had by `Net.accept`'s
+-- | body in that thread, closed as it ends, and the body spawns the
+-- | thread accepting the next, so that one is always waiting to
+-- | accept.  Until one fails to be accepted: the listener left as it
+-- | is, the connections being served going on.  Run by a scheduler:
+-- | std.reactor's (`Reactor.scheduled`) has each connection wait on its
+-- | socket apart, the others served meanwhile.
 serveConcurrently : {e : HFunctor}
+                  -> {s : Type}
                   -> {{gr : green <: e}}
                   -> {{nt : Net.net <: e}}
-                  -> Net.Listener
+                  -> With s Net.TcpListener
                   -> (Request -> Co e Http.Response)
-                  -> Co e Net.NetError
-serveConcurrently l handle =
-  bind (Net.accept l) (spawnedFor (\u -> serveConcurrently l handle) handle)
+                  -> Co e Unit
+serveConcurrently l handle = do
+  stopped <- newChan
+  spawn (acceptor stopped l handle)
+  _ <- recv stopped
+  pure MkUnit

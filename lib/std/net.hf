@@ -1,38 +1,64 @@
--- TCP sockets as an effect: a connection made to a host and
--- a port, or a port listened on and its connections accepted; bytes
--- read from a connection and written to it; a connection's ends and
--- where they are.  The C backend's alone: a
--- page has no sockets.  Import it by a name, `import std.net as Net`,
--- as its names are common ones: `Net.connect`, `Net.read`.
+-- TCP sockets as an effect: a connection made to a host and a port, or
+-- a port listened on and its connections accepted; bytes read from a
+-- connection and written to it; a connection's ends and where they
+-- are.  The C backend's alone: a page has no sockets.  Import it by a
+-- name, `import std.net as Net`, as its names are common ones:
+-- `Net.read`, `Net.accept`.
 --
--- A connection and a listener are handles, the
--- world's numbers for the sockets, held until they are closed.  What
--- fails is a value, an `Either NetError a`, the system's errno and
--- what it says of it -- never data: a read at the end of what the
--- other side sends is no error but no bytes.
+-- A connection and a listener are the host's own, had by a `with`:
+-- `withConnection address body` connects and runs `body` with the
+-- connection, a `With s TcpStream` in a region `s` of its own, and
+-- shuts it down and closes it when `body` ends; `withListener`, the
+-- same for a socket listening; `accept listener body`, for the next
+-- connection made to it.  So a connection is had only by the operations
+-- here, in its body, and never past it.  A server of many connections
+-- at once accepts each in a green thread of its own, its `with` inside
+-- that thread, the threads talking over channels.
+--
+-- What fails is a value, an `Either NetError a`, the system's errno and
+-- what it says of it -- never data: a read at the end of what the other
+-- side sends is no error but no bytes.
 --
 -- Each operation waits until it is done (a read, until there is
 -- something to read): one thing at a time, as the rest of a program's
 -- outside operations.
 
-import co
-import std.handle
+module
+  ( TcpStream
+  , TcpListener
+  , Address
+  , NetError
+  , NetF
+  , net
+  , withConnection
+  , read
+  , write
+  , shutdown
+  , peer
+  , thisSide
+  , withListener
+  , accept
+  , local
+  , showError
+  , showAddress
+  )
 
--- | (`Handle TcpStream`, std.handle: a TCP connection; no value has it.)
+import co
+import with
+
+-- | A TCP connection, the host's own (a foreign value; no value of the
+-- | program has it): had as a `With s TcpStream` by `withConnection`'s
+-- | or `accept`'s body.
 data TcpStream
 
--- | (`Handle TcpListener`: a socket listening for connections; no value
--- | has it.)
+-- | A socket listening for connections, the host's own: had as a `With
+-- | s TcpListener` by `withListener`'s body.
 data TcpListener
 
--- | A TCP connection: read from, written to, closed.
-type Connection = Handle TcpStream
-
--- | A socket listening on a port: its connections accepted, it closed.
-type Listener = Handle TcpListener
-
--- | Where a socket is: its host's address as it is written, numeric
--- | (`127.0.0.1`, `::1`), and its port.
+-- | Where a socket is, or is to be: its host, an address as it is
+-- | written (`127.0.0.1`, `::1`) -- given to `withConnection` or
+-- | `withListener`, a name the system resolves too, or `""` for all of
+-- | this host's -- and its port.
 type Address = { host : String, port : Int }
 
 -- | Why an operation failed: the system's number for it -- errno, or
@@ -42,15 +68,17 @@ type Address = { host : String, port : Int }
 type NetError = { code : Int, name : String, message : String }
 
 data NetF (m : Type -> Type) x
-  = Connect String Int (Either NetError Connection -> x)
-  | Listen String Int Int (Either NetError Listener -> x)
-  | Accept Listener (Either NetError Connection -> x)
-  | Read Connection Int (Either NetError Bytes -> x)
-  | Write Connection Bytes (Either NetError Unit -> x)
-  | Shutdown Connection (Either NetError Unit -> x)
-  | Close Int x
-  | Peer Connection (Either NetError Address -> x)
-  | Local Int (Either NetError Address -> x)
+  = Connect String Int (Either NetError TcpStream -> x)
+  | Listen String Int Int (Either NetError TcpListener -> x)
+  | Accept TcpListener (Either NetError TcpStream -> x)
+  | Read TcpStream Int (Either NetError Bytes -> x)
+  | Write TcpStream Bytes (Either NetError Unit -> x)
+  | Shutdown TcpStream (Either NetError Unit -> x)
+  | Peer TcpStream (Either NetError Address -> x)
+  | ThisSide TcpStream (Either NetError Address -> x)
+  | Local TcpListener (Either NetError Address -> x)
+  | Release TcpStream (Either NetError Unit -> x)
+  | ReleaseListener TcpListener (Either NetError Unit -> x)
 
 -- | TCP sockets as an effect.
 net : HFunctor
@@ -63,9 +91,11 @@ net =
       Read c n k -> Read c n (\r -> g (k r))
       Write c b k -> Write c b (\r -> g (k r))
       Shutdown c k -> Shutdown c (\r -> g (k r))
-      Close i x -> Close i (g x)
       Peer c k -> Peer c (\r -> g (k r))
-      Local i k -> Local i (\r -> g (k r))
+      ThisSide c k -> ThisSide c (\r -> g (k r))
+      Local l k -> Local l (\r -> g (k r))
+      Release c k -> Release c (\r -> g (k r))
+      ReleaseListener l k -> ReleaseListener l (\r -> g (k r))
   , hmap = \m n nt p -> case p of
       Connect h port k -> Connect h port k
       Listen h port b k -> Listen h port b k
@@ -73,107 +103,168 @@ net =
       Read c b k -> Read c b k
       Write c b k -> Write c b k
       Shutdown c k -> Shutdown c k
-      Close i x -> Close i x
       Peer c k -> Peer c k
-      Local i k -> Local i k
+      ThisSide c k -> ThisSide c k
+      Local l k -> Local l k
+      Release c k -> Release c k
+      ReleaseListener l k -> ReleaseListener l k
   }
-
--- (a handle's number)
-numberOf : {t : Type} -> Handle t -> Int
-numberOf (MkHandle i) = i
 
 -- Connections
 --------------------------------------------------------------------------------
 
--- | A connection to `host`'s `port`: the host a name (resolved by the
--- | system, getaddrinfo, to IPv4 and IPv6 addresses, each tried in the
--- | order it gives them until one connects) or an address
--- | (`127.0.0.1`, `::1`).
-connect : {e : HFunctor}
-        -> {{ev : net <: e}}
-        -> String
-        -> Int
-        -> Co e (Either NetError Connection)
-connect host port = op (ev (Connect host port (\r -> r))) val
+-- (a connection to `host`'s `port`, the host's own, or why none was
+-- made)
+connected : {e : HFunctor}
+          -> {{ev : net <: e}}
+          -> String
+          -> Int
+          -> Co e (Either NetError TcpStream)
+connected host port = op (ev (Connect host port (\r -> r))) val
+
+-- (a connection shut down and closed, or why it did not close)
+released : {e : HFunctor}
+         -> {{ev : net <: e}}
+         -> TcpStream
+         -> Co e (Either NetError Unit)
+released c = op (ev (Release c (\r -> r))) val
+
+-- | A connection to `address`'s host and port -- the host a name
+-- | (resolved by the system, getaddrinfo, to IPv4 and IPv6 addresses,
+-- | each tried in the order it gives them until one connects) or an
+-- | address (`127.0.0.1`, `::1`) -- held by `body` in a region of its
+-- | own, not kept past it, and shut down and closed when `body` ends:
+-- | what it came to, or why the connection was not made or not closed.
+-- | Should `body` be left otherwise -- a throw heard outside it, a
+-- | handler between that drops the continuation -- the connection is
+-- | closed where the program drops its last reference to it: at once,
+-- | in C, as it is counted.
+withConnection : {e : HFunctor}
+               -> {a : Type}
+               -> {{ev : net <: e}}
+               -> Address
+               -> ({s : Type} -> With s TcpStream -> Co e a)
+               -> Co e (Either NetError a)
+withConnection address body =
+  scoped (connected address.host address.port) released body
 
 -- | Up to `n` bytes of what the other side sent, as many as have come,
 -- | waiting for one at least; none at its end, where it has closed its
--- | side (or shut it down).  At most a mebibyte at a time.
+-- | side (or shut it down).  At most a mebibyte at a time.  After the
+-- | `with` closed the connection, `EBADF`.
 read : {e : HFunctor}
+     -> {s : Type}
      -> {{ev : net <: e}}
-     -> Connection
+     -> With s TcpStream
      -> Int
      -> Co e (Either NetError Bytes)
-read c n = op (ev (Read c n (\r -> r))) val
+read c n = op (ev (Read (inside c) n (\r -> r))) val
 
 -- | All the bytes written, waiting until the system has taken them.
 write : {e : HFunctor}
+      -> {s : Type}
       -> {{ev : net <: e}}
-      -> Connection
+      -> With s TcpStream
       -> Bytes
       -> Co e (Either NetError Unit)
-write c b = op (ev (Write c b (\r -> r))) val
+write c b = op (ev (Write (inside c) b (\r -> r))) val
 
 -- | This side done writing: the other side reads to its end, and may
 -- | still write, which this side reads.
 shutdown : {e : HFunctor}
+         -> {s : Type}
          -> {{ev : net <: e}}
-         -> Connection
+         -> With s TcpStream
          -> Co e (Either NetError Unit)
-shutdown c = op (ev (Shutdown c (\r -> r))) val
+shutdown c = op (ev (Shutdown (inside c) (\r -> r))) val
 
 -- | Where the other side is.
 peer : {e : HFunctor}
+     -> {s : Type}
      -> {{ev : net <: e}}
-     -> Connection
+     -> With s TcpStream
      -> Co e (Either NetError Address)
-peer c = op (ev (Peer c (\r -> r))) val
+peer c = op (ev (Peer (inside c) (\r -> r))) val
+
+-- | Where this side of the connection is.
+thisSide : {e : HFunctor}
+         -> {s : Type}
+         -> {{ev : net <: e}}
+         -> With s TcpStream
+         -> Co e (Either NetError Address)
+thisSide c = op (ev (ThisSide (inside c) (\r -> r))) val
 
 -- Listeners
 --------------------------------------------------------------------------------
 
--- | A socket listening on `address`'s `port`, at most `backlog`
--- | connections waiting to be accepted: the address one of the host's
--- | (`127.0.0.1`, `::1`, a name), or `""` for all of them; the port 0
--- | for one the system picks, which `local` says.
-listen : {e : HFunctor}
-       -> {{ev : net <: e}}
-       -> String
-       -> Int
-       -> Int
-       -> Co e (Either NetError Listener)
-listen address port backlog =
+-- (a socket listening on `address`'s `port`, the host's own, or why
+-- none is)
+listening : {e : HFunctor}
+          -> {{ev : net <: e}}
+          -> String
+          -> Int
+          -> Int
+          -> Co e (Either NetError TcpListener)
+listening address port backlog =
   op (ev (Listen address port backlog (\r -> r))) val
 
--- | The next connection made to the listener, waiting for one.
+-- (a listener closed, or why it did not close)
+listenerReleased : {e : HFunctor}
+                 -> {{ev : net <: e}}
+                 -> TcpListener
+                 -> Co e (Either NetError Unit)
+listenerReleased l = op (ev (ReleaseListener l (\r -> r))) val
+
+-- | A socket listening on `address`'s host and port, at most `backlog`
+-- | connections waiting to be accepted -- the host one of this host's
+-- | (`127.0.0.1`, `::1`, a name), or `""` for all of them; the port 0
+-- | for one the system picks, which `local` says -- held by `body` in a
+-- | region of its own, and closed when `body` ends: what it came to, or
+-- | why the socket did not listen or close.  A connection accepted from
+-- | it is had by `accept`'s body, not the listener's: the listener
+-- | closed, the connections stay.
+withListener : {e : HFunctor}
+             -> {a : Type}
+             -> {{ev : net <: e}}
+             -> Address
+             -> Int
+             -> ({s : Type} -> With s TcpListener -> Co e a)
+             -> Co e (Either NetError a)
+withListener address backlog body =
+  scoped (listening address.host address.port backlog) listenerReleased body
+
+-- (the next connection made to the listener, the host's own, waited
+-- for; or why none was accepted)
+accepted : {e : HFunctor}
+         -> {{ev : net <: e}}
+         -> TcpListener
+         -> Co e (Either NetError TcpStream)
+accepted l = op (ev (Accept l (\r -> r))) val
+
+-- | The next connection made to the listener, waiting for one, held by
+-- | `body` in a region of its own and shut down and closed when `body`
+-- | ends, as `withConnection`'s: what it came to, or why no connection
+-- | was accepted (the program out of descriptors, `EMFILE`; the
+-- | listener closed by its `with`, `EBADF`) or it was not closed.  A
+-- | server of many connections at once accepts each in a green thread
+-- | of its own: the body of one spawns the thread accepting the next,
+-- | then serves its connection, which is closed when it is done.
 accept : {e : HFunctor}
+       -> {s : Type}
+       -> {a : Type}
        -> {{ev : net <: e}}
-       -> Listener
-       -> Co e (Either NetError Connection)
-accept l = op (ev (Accept l (\r -> r))) val
+       -> With s TcpListener
+       -> ({s2 : Type} -> With s2 TcpStream -> Co e a)
+       -> Co e (Either NetError a)
+accept l body = scoped (accepted (inside l)) released body
 
--- Either
---------------------------------------------------------------------------------
-
--- | Where a connection or a listener is, on this side: a listener's
--- | port, where the system picked it.
+-- | Where the listener is: its port, where the system picked it.
 local : {e : HFunctor}
-      -> {t : Type}
+      -> {s : Type}
       -> {{ev : net <: e}}
-      -> Handle t
+      -> With s TcpListener
       -> Co e (Either NetError Address)
-local s = op (ev (Local (numberOf s) (\r -> r))) val
-
--- | A connection or a listener closed, and the handle let go of: the
--- | world holds nothing of that number after it (an operation given it
--- | fails the program, as std.handle says).  A handle that is no
--- | socket fails the program too.
-close : {e : HFunctor}
-      -> {t : Type}
-      -> {{ev : net <: e}}
-      -> Handle t
-      -> Co e Unit
-close s = op (ev (Close (numberOf s) MkUnit)) val
+local l = op (ev (Local (inside l) (\r -> r))) val
 
 -- Errors
 --------------------------------------------------------------------------------

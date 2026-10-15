@@ -1,6 +1,7 @@
 -- std.http.server's `serveConcurrently`, a green thread for each
--- connection, scheduled by std.reactor: many clients held open at once,
--- each answered in turn.  By C alone.
+-- connection, each had by a `with` in its own, scheduled by
+-- std.reactor: many clients held open at once, each answered in turn.
+-- By C alone.
 --
 --   main     n clients, each its connection kept: a first request each,
 --            all answered while every connection is held open -- which a
@@ -15,6 +16,7 @@ import std.http.server as Server
 import std.io
 import std.net as Net
 import std.reactor as Reactor
+import with
 
 world : HFunctor
 world = stdio <+> (Net.net <+> Reactor.reactor)
@@ -24,6 +26,10 @@ world = stdio <+> (Net.net <+> Reactor.reactor)
 must : {a : Type} -> Either Net.NetError a -> a
 must (Right x) = x
 must (Left err) = abandon
+
+-- (127.0.0.1's `port`)
+here : Int -> Net.Address
+here port = { host = "127.0.0.1", port = port }
 
 repeatG : {e : HFunctor} -> Int -> Co e Unit -> Co e Unit
 repeatG 0 c = pure MkUnit
@@ -38,8 +44,9 @@ recvSum ch n acc = do
 
 -- (n bytes read, in as many reads as they take)
 readN : {e : HFunctor}
+      -> {s : Type}
       -> {{nt : Net.net <: e}}
-      -> Net.Connection
+      -> With s Net.TcpStream
       -> Int
       -> Bytes
       -> Co e Bytes
@@ -56,18 +63,41 @@ answer r = pure (Server.plain 200 r.target)
 -- (a request for `target` sent on the connection, and its response read:
 -- 1 where it is the one wanted)
 asked : {e : HFunctor}
+      -> {s : Type}
       -> {{nt : Net.net <: e}}
-      -> Net.Connection
+      -> With s Net.TcpStream
       -> String
       -> Co e Int
 asked c target = do
-  w <- Net.write c (Bytes.fromString ("GET " ^ target ^ " HTTP/1.1\r\nHost: x\r\n\r\n"))
+  w <-
+    Net.write
+      c
+      (Bytes.fromString ("GET " ^ target ^ " HTTP/1.1\r\nHost: x\r\n\r\n"))
   let want = Server.responseBytes "" True (Server.plain 200 target)
   got <- readN c (Bytes.length want) Bytes.empty
   pure (if got == want then 1 else 0)
 
+-- (a client's connection: a first request, its answer said on `back`;
+-- then, once main says so on `go`, a second on the same connection:
+-- its answer)
+clientOn : {e : HFunctor}
+         -> {s : Type}
+         -> {{gr : green <: e}}
+         -> {{nt : Net.net <: e}}
+         -> Int
+         -> Int
+         -> Int
+         -> With s Net.TcpStream
+         -> Co e Int
+clientOn back go i c = do
+  first <- asked c ("/" ^ show i ^ "/first")
+  send back first
+  x <- recv go
+  asked c ("/" ^ show i ^ "/second")
+
 -- | A client: a first request, its answer said on `back`; then, once
--- | main says so on `go`, a second on the same connection.
+-- | main says so on `go`, a second on the same connection, which is
+-- | closed after, its answer said.
 client : {e : HFunctor}
        -> {{gr : green <: e}}
        -> {{nt : Net.net <: e}}
@@ -77,24 +107,21 @@ client : {e : HFunctor}
        -> Int
        -> Co e Unit
 client port back go i = do
-  c <- Net.connect "127.0.0.1" port
-  first <- asked (must c) ("/" ^ show i ^ "/first")
-  send back first
-  x <- recv go
-  second <- asked (must c) ("/" ^ show i ^ "/second")
-  Net.close (must c)
-  send back second
+  second <- Net.withConnection (here port) (\c -> clientOn back go i c)
+  send back (either (\err -> 0) (\v -> v) second)
 
-program : {e : HFunctor}
-        -> {{gr : green <: e}}
-        -> {{io : stdio <: e}}
-        -> {{nt : Net.net <: e}}
-        -> Int
-        -> Co e Unit
-program n = do
-  l <- Net.listen "127.0.0.1" 0 128
-  at <- Net.local (must l)
-  spawn (bind (Server.serveConcurrently (must l) answer) (\err -> pure MkUnit))
+-- (the server, a thread of its own, and n clients, each one too)
+served : {e : HFunctor}
+       -> {s : Type}
+       -> {{gr : green <: e}}
+       -> {{io : stdio <: e}}
+       -> {{nt : Net.net <: e}}
+       -> Int
+       -> With s Net.TcpListener
+       -> Co e Unit
+served n l = do
+  at <- Net.local l
+  spawn (Server.serveConcurrently l answer)
   back <- newChan
   go <- newChan
   repeatG n (bind newChan (\i -> spawn (client (must at).port back go i)))
@@ -103,6 +130,16 @@ program n = do
   repeatG n (send go 1)
   second <- recvSum back n 0
   print ("second requests answered, on the same connections: " ^ show second)
+
+program : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{io : stdio <: e}}
+        -> {{nt : Net.net <: e}}
+        -> Int
+        -> Co e Unit
+program n = do
+  r <- Net.withListener (here 0) 128 (\l -> served n l)
+  pure MkUnit
 
 main : Co world Unit
 main = do
