@@ -480,12 +480,12 @@ export fn heff_bits_little(u: u64, n: i64, out: c_int) u64 {
     return w;
 }
 
-// A path under a place's working directory (#97)
+// A path under a thread's working directory (#97)
 // ---------------------------------------------------------------------
 //
-// The system has one working directory a process, and a place is one
-// thread of its process; so the C half keeps a directory for each
-// place, and gives the system each relative path under it, joined by
+// The system has one working directory a process; the C half keeps a
+// directory for each thread, and gives the system each relative path
+// under it, joined by
 // `heff_path_under`: the join `std.path` does, less its tidying of `.`
 // and `..`, which the system does against the directories as they are,
 // links and all.

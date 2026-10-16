@@ -352,7 +352,7 @@ static int heff_st_capture(char **as, Buf *bo, Buf *be, V f, int64_t *code) {
   env[k] = NULL;
   int null = open("/dev/null", O_RDONLY);
   int closed[4] = { po[0], pe[0], null, pp[0] };
-  pid_t pid = heff_exec_in_place(as, env, null, po[1], pe[1], closed, f ? 4 : 3);
+  pid_t pid = heff_exec_in_dir(as, env, null, po[1], pe[1], closed, f ? 4 : 3);
   int ok = pid > 0;
   if (null >= 0) close(null);
   free(env);
