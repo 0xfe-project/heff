@@ -38,12 +38,12 @@ project's root: `lib/` is no different.
 root. A module found in two places is an error, and neither
 file is loaded.
 
-## The header
+## The module claim
 
-Every file starts with `module` and its name, before its imports. A
-missing module claim is E0156, and one with another name is E0157. `package.hf` and a
-program's `build.hf` are the exception: they are read as data, not
-loaded as modules, and have no header.
+Every file starts with its module claim, `module` and its name, before
+its imports. A missing module claim is E0156, and one with another name
+is E0157. `package.hf` and a program's `build.hf` are the exception: they are read as data, not
+loaded as modules, and have no module claim.
 
 ## Exports
 
@@ -63,7 +63,8 @@ The list after the name says what an importer sees:
 - An operator is written in parentheses.
 - Each name is listed once (E0155).
 
-A header without a list, `module parse.surface`, exposes everything.
+A module claim without a list, `module parse.surface`, exposes
+everything.
 
 ## Imports
 

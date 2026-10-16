@@ -79,7 +79,7 @@ async function start(context) {
   await client.start();
 }
 
-// A manifest is read as a literal, not a module: it has no header.
+// A manifest is read as a literal, not a module: it has no module claim.
 function isManifest(file) {
   return ["package.hf", "build.hf"].includes(path.basename(file));
 }
@@ -89,10 +89,10 @@ function isNew(doc) {
   return doc.languageId === "heff" && doc.uri.scheme === "file" && !isManifest(doc.uri.fsPath) && doc.getText() === "";
 }
 
-// A file just made gets its header, `module <name>`: the server says the
-// name (`heff/moduleName`, the one it asks a header for), or none where
-// no header can say it; a file not empty by then is left as it is.
-async function writeHeader(doc) {
+// A file just made gets its module claim, `module <name>`: the server
+// says the name (`heff/moduleName`, the one E0156 asks for), or none
+// where no claim can say it; a file not empty by then is left as it is.
+async function writeClaim(doc) {
   if (!client || !isNew(doc)) return;
   let name;
   try {
@@ -108,7 +108,7 @@ async function writeHeader(doc) {
 
 async function activate(context) {
   // (a file made in the editor is opened in it too)
-  context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(writeHeader));
+  context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(writeClaim));
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (e) => {
       if (!e.affectsConfiguration("heff")) return;
@@ -118,7 +118,7 @@ async function activate(context) {
     })
   );
   await start(context);
-  for (const doc of vscode.workspace.textDocuments) await writeHeader(doc);
+  for (const doc of vscode.workspace.textDocuments) await writeClaim(doc);
 }
 
 async function deactivate() {

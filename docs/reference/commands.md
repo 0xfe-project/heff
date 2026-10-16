@@ -63,7 +63,7 @@ See [Tests](tests.md) and [Benchmarks](benchmarks.md).
 name, the module's header comment (the comment above its `module`
 line), then each definition it exposes, in order, with its signature
 as `heff check` prints it and its doc comment, the doc tests shown as
-examples. What the header does not list has no entry.
+examples. What the module claim does not list has no entry.
 
 - Without `--out`, the pages are printed. With `--out DIR`, a module
   `std.path` is written to `DIR/std/path.md`, and `DIR/index.md`
@@ -139,12 +139,12 @@ len [] = 0
 len (x :: xs1) = 0
 ```
 
-A quick fix writes a file's module header where it is missing (E0156)
+A quick fix writes a file's module claim where it is missing (E0156)
 or names the module otherwise (E0157): `module` and the name the file's
 path gives it.  An editor asks for that name by `heff/moduleName`, whose
 `textDocument` is the file, and gets the name, or `null` for a manifest
-or a file no header can name; the VS Code extension writes the header
-of an empty `.hf` file this way when it is opened, as one just made is.
+or a file no module claim can name; the VS Code extension writes the
+module claim of an empty `.hf` file this way when it is opened, as one just made is.
 
 ## Progress
 
