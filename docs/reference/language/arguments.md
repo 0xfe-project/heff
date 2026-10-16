@@ -75,8 +75,8 @@ yourself, name it: `member (eq := myEquality) x xs`.
 ```haskell
 data Color = Red | Green
 
-instance showColor : Show Color
-showColor = { show = written }
+instance instanceShowColor : Show Color
+instanceShowColor = { show = written }
   where
   written : Color -> String
   written Red = "Red"
@@ -88,7 +88,9 @@ colors : List Color
 colors = [Red, Green]
 ```
 
-`instance x : T` declares the definition under it an instance. An
+`instance x : T` declares the definition under it an instance. Nobody
+calls an instance by its name, so it is long on purpose:
+`instance`, the theory, then the type. An
 instance argument in scope, `{{eq : Equality a}}`, is one too.
 
 An instance is in scope:
@@ -110,8 +112,8 @@ An instance may take implicit and instance arguments of its own:
 ```haskell
 data Pair3 a = MkPair3 a a
 
-instance equalityPair3 : {a : Type} -> {{eq : Equality a}} -> Equality (Pair3 a)
-equalityPair3 = { equal = \p q -> case p of
+instance instanceEqualityPair3 : {a : Type} -> {{eq : Equality a}} -> Equality (Pair3 a)
+instanceEqualityPair3 = { equal = \p q -> case p of
   MkPair3 a b -> case q of
     MkPair3 c d -> equal a c && equal b d }
 
@@ -140,18 +142,16 @@ The prelude has three theories most types have:
 
 | Theory | Use | `"hi"` | `'a'` |
 |---|---|---|---|
-| `Equality` | `==`, `/=`, `equal` | | |
-| `Show` | `show x`: the value as source code | `"\"hi\""` | `"'a'"` |
-| `ToString` | `toString x`: the value as text for a reader | `"hi"` | `"a"` |
+| [`Equality`](../../api/prelude.md#Equality) | `==`, `/=`, `equal` | | |
+| [`Show`](../../api/prelude.md#Show) | `show x`: the value as source code | `"\"hi\""` | `"'a'"` |
+| [`ToString`](../../api/prelude.md#ToString) | `toString x`: the value as text for a reader | `"hi"` | `"a"` |
 
 `Show` is what tests use to print values, so two different values never
 look the same. `ToString` is Rust's `Display`; `Show` is its `Debug`.
 
-They have instances for `Int`, `Float64`, `String`, `Rune`, `Bytes`,
-`Bool`, `Unit` and `Ordering`. `Equality` and `Show` also have them for
-`List`, `Maybe`, `Pair` and `Either` of types that have one. `ToString`
-does not, as a list has no one text. Each fixed-width number's module
-has its own.
+Which types have instances of them is on the
+[prelude's page](../../api/prelude.md); a fixed-width number's
+instances are in its module, such as [`int64`](../../api/int64.md).
 
 ## Errors
 

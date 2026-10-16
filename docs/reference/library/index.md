@@ -24,6 +24,10 @@ A program can only import what its backend has: a C program importing
 Only the library declares primitives, such as
 `primitive intAdd : Int -> Int -> Int`.
 
+An effect of the outside world, such as `std.io`'s `stdio`, is carried
+out by a provider: JavaScript and C code beside its module. See
+[Providers](../providers.md).
+
 ## Modules by topic
 
 | Topic | Modules | Page |

@@ -20,11 +20,8 @@ packet _ = Nothing
 `Bytes` are bytes that are not text: a request body, what a socket
 read, a file's content. They never change once made.
 
-The `bytes` module (`import bytes as Bytes`) has `length`, `index` (a
-`UInt8`, if there is one), `slice`, `append`, `concat`, `empty`,
-`fromList` and `toList` (of `UInt8`s), `fromString` and `asString` (a
-string's bytes as they are, and back), and `eq`. `==` works without
-importing it.
+What is done with them is in [`bytes`](../../api/bytes.md), imported as
+`import bytes as Bytes`; `==` works without importing it.
 
 `toString` of bytes is their UTF-8 text, with U+FFFD for what is not
 UTF-8. `show` writes them as a binary.
@@ -34,11 +31,8 @@ UTF-8. `show` writes them as a binary.
 `Bits` are a bitstring of any length. `Bytes` are the case of whole
 bytes, kept apart because it is the common one.
 
-The `bits` module (`import bits as Bits`) has `length` (in bits),
-`index` (a `Bool`), `toList` and `fromList` (of `Bool`s), `toBytes`
-(`Just` the bytes, when the length is a multiple of 8) and `ofBytes`,
-`ofInt` (an integer's low `n` bits), `slice`, `append`, `concat`,
-`empty` and `eq`.
+What is done with them is in [`bits`](../../api/bits.md), imported as
+`import bits as Bits`.
 
 `toString` of bits is each bit, `0` or `1`: `toString b[5::3]` is
 `"101"`.

@@ -63,10 +63,9 @@ A lambda cannot set the block's variables, and cannot use `(<- c)`,
 `return`, `break` or `continue`: its body runs later. It sees each
 variable's value at the time the lambda is made.
 
-`for` goes through anything with an `Iterate` instance: a list, a
-string (each `Rune`), `range a b` (the integers from `a` to `b`), an
-array, and `std.map` and `std.hashmap` maps (each key and value as a
-`Pair`).
+`for` goes through anything with an
+[`Iterate`](../../api/prelude.md#Iterate) instance, such as a list, a
+string (each `Rune`) or `range a b`.
 
 ## Pure code
 

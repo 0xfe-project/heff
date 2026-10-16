@@ -58,6 +58,10 @@ The C helpers are in `lib/c/runtime.c`, under "What providers share".
   not UTF-8 becomes U+FFFD.
 - A path with a NUL in it fails the operation.
 
+In C, a slice of 64 bytes or more, and at least a quarter of its string,
+shares the string's bytes instead of copying them. A shorter slice is a
+copy, so a small slice never keeps a large string alive.
+
 ### Bytes
 
 In JavaScript, `Bytes` are a `Uint8Array`, never changed once given.
