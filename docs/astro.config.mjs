@@ -81,6 +81,7 @@ export default defineConfig({
                 'reference/language/modules',
                 'reference/language/definitions',
                 'reference/language/data',
+                'reference/language/theories',
                 'reference/language/arguments',
                 'reference/language/operators',
                 'reference/language/numbers',
