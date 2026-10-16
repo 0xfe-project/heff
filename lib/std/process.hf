@@ -52,6 +52,7 @@ module std.process
 import co
 import exception
 import resource
+import std.path
 
 -- | How a command run ended: by itself, with its exit status (0: it
 -- | went well); by a signal, its number (never on Windows); killed at
@@ -91,7 +92,8 @@ data Received = Got Bytes | Timeout | Closed
 -- | `{ command = "make", args = ["all"], dir = d, timeout = 60000 }`.
 -- |
 -- | - `dir`: the directory it runs in, from the working directory
--- |   where it is relative (`""`: the working directory itself);
+-- |   where it is relative (`current`, std.path's: the working directory
+-- |   itself);
 -- | - `env`: environment variables set for it, each a name and a value,
 -- |   over the program's own, which it has too;
 -- | - `input`: its standard input (`NoInput`: none);
@@ -106,7 +108,7 @@ data Received = Got Bytes | Timeout | Closed
 type Invocation =
   { command : String
   , args : List String = Nil
-  , dir : String = ""
+  , dir : Path = current
   , env : List (Pair String String) = Nil
   , input : Input = NoInput
   , output : Output = Collected
@@ -114,6 +116,39 @@ type Invocation =
   , timeout : Int = 0
   , keep : Int = 0
   , group : Bool = False
+  }
+
+-- (an invocation as the system is given it: its directory written in
+-- the system's style, `""` for the working directory itself)
+type Spawn =
+  { command : String
+  , args : List String
+  , dir : String
+  , env : List (Pair String String)
+  , input : Input
+  , output : Output
+  , errors : Output
+  , timeout : Int
+  , keep : Int
+  , group : Bool
+  }
+
+-- (the directory as the system is given it)
+dirFor : Path -> String
+dirFor p = if p == current then "" else render p
+
+spawnOf : Invocation -> Spawn
+spawnOf c =
+  { command = c.command
+  , args = c.args
+  , dir = dirFor c.dir
+  , env = c.env
+  , input = c.input
+  , output = c.output
+  , errors = c.errors
+  , timeout = c.timeout
+  , keep = c.keep
+  , group = c.group
   }
 
 -- | a command run to its end: how it ended, and what it wrote to its
@@ -153,8 +188,8 @@ data ProcessF (m : Type -> Type) x
   | Processors (Int -> x)
   | Exit Int x
   | Exec String (List String) x
-  | Run Invocation (Ran -> x)
-  | Start Invocation (Either ProcessError Started -> x)
+  | Run Spawn (Ran -> x)
+  | Start Spawn (Either ProcessError Started -> x)
   | Release Started (Either ProcessError Unit -> x)
   | Wait Started (Ran -> x)
   | TryWait Started (Maybe Ran -> x)
@@ -225,16 +260,20 @@ getEnv : {e : HFunctor}
        -> Co e (Maybe String)
 getEnv name = op (ev (GetEnv name (\v -> v))) val
 
+-- (a path the system gave, read in its style)
+fromSystem : {e : HFunctor} -> String -> Co e Path
+fromSystem s = pure (parse s)
+
 -- | The path of the program's own file.
-programPath : {e : HFunctor} -> {{ev : process <: e}} -> Co e String
-programPath = op (ev (ProgramPath (\s -> s))) val
+programPath : {e : HFunctor} -> {{ev : process <: e}} -> Co e Path
+programPath = bind (op (ev (ProgramPath (\s -> s))) val) fromSystem
 
 -- | The working directory: every relative path the program gives the
 -- | system is under it.  It is each place's own (a place starts with
 -- | its starter's; the main place, with the process's), never the
 -- | process's.
-workingDir : {e : HFunctor} -> {{ev : process <: e}} -> Co e String
-workingDir = op (ev (WorkingDir (\s -> s))) val
+workingDir : {e : HFunctor} -> {{ev : process <: e}} -> Co e Path
+workingDir = bind (op (ev (WorkingDir (\s -> s))) val) fromSystem
 
 -- | `dir` (from the working directory, where it is relative) made this
 -- | place's working directory, as the system names it, its links
@@ -243,9 +282,9 @@ workingDir = op (ev (WorkingDir (\s -> s))) val
 -- | any other place's.
 setWorkingDir : {e : HFunctor}
               -> {{ev : process <: e}}
-              -> String
+              -> Path
               -> Co e Bool
-setWorkingDir dir = op (ev (SetWorkingDir dir (\ok -> ok))) val
+setWorkingDir dir = op (ev (SetWorkingDir (render dir) (\ok -> ok))) val
 
 -- | The platform the program runs on, as Node.js names it: `linux`,
 -- | `darwin`, `win32`, ...
@@ -274,7 +313,7 @@ exec cmd argv = op (ev (Exec cmd argv MkUnit)) val
 -- | Run the command, to its end, and go on: how it ended, and what it
 -- | wrote -- `run { command = "ls", args = ["-l"], dir = "/tmp" }`.
 run : {e : HFunctor} -> {{ev : process <: e}} -> Invocation -> Co e Ran
-run c = op (ev (Run c (\r -> r))) val
+run c = op (ev (Run (spawnOf c) (\r -> r))) val
 
 -- | The command started, as `run` would run it, and held by `body` in a
 -- | region of its own -- it is not kept past it -- the program going on
@@ -301,7 +340,7 @@ withProcess : {e : HFunctor}
             -> Co e a
 withProcess c body =
   scoped
-    (op (ev (Start c (\s -> s))) val)
+    (op (ev (Start (spawnOf c) (\s -> s))) val)
     (\s -> op (ev (Release s (\r -> r))) val)
     body
 

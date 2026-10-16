@@ -36,7 +36,7 @@ out by a provider: JavaScript and C code beside its module. See
 | collections | `array`, `std.map`, `std.set`, `std.hashmap` | [Collections](collections.md) |
 | numbers and text | `int8`…`uint64`, `float32`, `int`, `rune`, `bytes`, `bits`, `std.math` | [Numbers](../language/numbers.md), [Runes and strings](../language/text.md), [Binaries](../language/binaries.md) |
 | resources | `resource` | [Resources](resource.md) |
-| the system | `std.io`, `std.filesystem`, `std.process` | [Files and processes](system.md) |
+| the system | `std.io`, `std.filesystem`, `std.path`, `std.process` | [Files and processes](system.md) |
 | the network | `std.net`, `std.http`, `std.http.server` | [Network](network.md) |
 | concurrency (unstable) | `green`, `std.reactor`, `std.thread`, `std.place` | [Concurrency](concurrency.md) |
 | the terminal | `std.terminal`, `std.terminal.widget`, `std.cli.interactive` | [Terminal](terminal.md) |

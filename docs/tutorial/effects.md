@@ -51,12 +51,12 @@ stdio is part of `stdio`.
 
 ## Reading a file
 
-Add `import std.filesystem` to the imports, then:
+Add `import std.filesystem` and `import std.path` to the imports, then:
 
 ```haskell
 loadTodos : {e : HFunctor}
           -> {{disk : filesystem <: e}}
-          -> String
+          -> Path
           -> Co e (List Todo)
 loadTodos path = do
   text <- readFile path
@@ -65,8 +65,8 @@ loadTodos path = do
     Nothing -> pure []
 ```
 
-`loadTodos` reads the file at `path` and makes each of its lines an open
-todo. `text <- readFile path` runs `readFile` and names its result
+`loadTodos` reads the file at `path`, a `Path`, and makes each of its
+lines an open todo. `text <- readFile path` runs `readFile` and names its result
 `text`: `Just` the file's text, or `Nothing` if it cannot be read, and
 then there are no todos.
 
@@ -91,6 +91,10 @@ main =
     (io := inl stdio filesystem)
     (disk := inr stdio filesystem)
 ```
+
+`loadTodos "todos.txt"` gives it a string where a `Path` is expected:
+`std.path` takes a string as a path, read as the system the program runs
+on writes one.
 
 `program` needs both. `main`'s world, `stdio <+> filesystem`, has both,
 and `main` shows where each is: `inl stdio filesystem` shows stdio is on
