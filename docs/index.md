@@ -5,3 +5,16 @@ title: heff
 - [Tutorial](tutorial/first-program.md): heff, learned by writing it
 - [Reference](reference/language/modules.md): the language, its library,
   its commands
+
+## Examples
+
+Each directory of `examples/` in the repository is a project:
+
+- `collatz/`: a first C program, with an effect of its own, `do`
+  statements, unit tests and a property.
+- `todos/`: a terminal app; a cursor effect handled on a zipper.
+- `pages/`: four web pages: a counter, a clock, a greeting, and a sum
+  of vectors on the GPU. `heff dev` serves each at `/NAME/`.
+- `notes/`: a page and its server, in one project.
+- `testbridge/`: a Linux program that makes network devices by
+  rtnetlink, with a provider of its own.

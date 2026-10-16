@@ -2,9 +2,9 @@
 title: Effects
 ---
 
-Effects are a library, [`co`](../../api/co.md), after Yang and Wu's "Handling
-Higher-Order Effectful Operations with Judgemental Monadic Laws" (POPL
-2026). `import co` to use them.
+Effects are a library, [`co`](../../api/co.md): `import co` to use
+them. The idea is from Yang and Wu's "Handling Higher-Order Effectful
+Operations with Judgemental Monadic Laws" (POPL 2026).
 
 ## Computations
 
@@ -78,6 +78,32 @@ tickOnce = op (ev (Tick MkUnit)) val
    each `x`, and `hmap` returns each operation unchanged.
 3. Each operation is `op (ev (Tag ...)) val`, with `MkUnit` for an `x`,
    and the identity, `\t -> t`, for a function to `x`.
+
+### Operations that hold computations
+
+An operation may hold computations of the program, not only values:
+`recover c h` runs `c`, and `h` of what was thrown if `c` throws. Its
+tag holds them at `m`, the data type's first parameter:
+
+```haskell
+data ExceptionF err (m : Type -> Type) x
+  = Throw err
+  | Catch (m x) (err -> m x)
+```
+
+`m` is the computation type, and the one who maps the operation chooses
+it, so the maps have work to do here:
+
+- `hfmap` applies `g` to what comes after, and that is now inside the
+  held computations too:
+  `Catch c h -> Catch (m.fmap g c) (\s -> m.fmap g (h s))`.
+- `hmap` turns `m` into another computation type, `n`, by `nt`:
+  `Catch c h -> Catch (nt c) (\s -> nt (h s))`.
+
+By `hmap`, a handler gets an operation's computations as its own: when
+it meets `Catch c h`, `c` and `h` are already of its `M`, handled, and
+it says how they run. `attempt` runs `c`, and `h` on a throw
+([Handlers](#handlers)).
 
 ## Handlers
 

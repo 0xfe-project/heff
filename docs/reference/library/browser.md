@@ -1,5 +1,5 @@
 ---
-title: Browser and GPU
+title: Browser
 ---
 
 These are a page's effects, in JavaScript.

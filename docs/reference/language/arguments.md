@@ -110,20 +110,20 @@ search into an error, but never into a different answer.
 An instance may take implicit and instance arguments of its own:
 
 ```haskell
-data Pair3 a = MkPair3 a a
+data Duo a = MkDuo a a
 
-instance instanceEqualityPair3 : {a : Type} -> {{eq : Equality a}} -> Equality (Pair3 a)
-instanceEqualityPair3 = { equal = \p q -> case p of
-  MkPair3 a b -> case q of
-    MkPair3 c d -> equal a c && equal b d }
+instance instanceEqualityDuo : {a : Type} -> {{eq : Equality a}} -> Equality (Duo a)
+instanceEqualityDuo = { equal = \p q -> case p of
+  MkDuo a b -> case q of
+    MkDuo c d -> equal a c && equal b d }
 
 -- | >>> same
 -- | True
 same : Bool
-same = equal (MkPair3 1 2 : Pair3 Int) (MkPair3 1 2)
+same = equal (MkDuo 1 2 : Duo Int) (MkDuo 1 2)
 ```
 
-A search matches what the instance is for, `Equality (Pair3 a)`,
+A search matches what the instance is for, `Equality (Duo a)`,
 against the type wanted, which solves `a`. Then it finds the instance's
 own instance arguments, each by a search of its own. When one of those
 fails, the error says which instance wanted it.

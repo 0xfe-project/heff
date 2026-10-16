@@ -33,7 +33,8 @@ project, such as a test or a program, is named by its path from the
 project's root: `lib/` is no different.
 
 `import` looks for a module in the project's `src/`, then in the
-[library](../library/index.md) that comes with heff. A file outside
+[library](../../api/index.md) that comes with heff, of heff's own
+version: the `lib/` beside heff, or where `HEFF_LIB` says. A file outside
 `src/` can also import files of the project by their paths from the
 root. A module found in two places is an error, and neither
 file is loaded.

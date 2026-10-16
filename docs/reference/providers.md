@@ -13,6 +13,10 @@ the host beside the effect's module.
 
 `lib/browser/dom.provider.js` shows the shape of a JavaScript provider.
 
+Below the providers are the primitives, such as
+`primitive intAdd : Int -> Int -> Int`, which the runtime has; only the
+library declares them.
+
 ## Where each runs
 
 - `lib/std/`'s effects are the system's, with C providers: `std.io`,

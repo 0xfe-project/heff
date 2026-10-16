@@ -98,3 +98,16 @@ builds them to run fastest, into `~/.heff/bin/`, with what they ship.
 A project can have programs of both backends, such as a server through
 `C` and a page it serves, sharing an effect from `src/`: see
 `examples/notes/`.
+
+### What a program can import
+
+A program imports only what its backend has:
+
+| Modules | Backends |
+|---|---|
+| `lib/`'s own, such as `co`, `json`, `resource` | every backend |
+| `std.*` | `C`; but `std.reference`, `std.time`, `std.path`, `std.map`, `std.set`, `std.hashmap`, `std.cli`, `std.cli.interactive`, `std.terminal.widget`, `std.doc` and `std.math` work on every backend |
+| `browser.*` | `Page` |
+
+A C program importing a `browser.*` module is E0351, and a page
+importing an effect only C has is E0352.

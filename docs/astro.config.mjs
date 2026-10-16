@@ -93,7 +93,6 @@ export default defineConfig({
             {
               label: 'Library',
               items: [
-                'reference/library',
                 'reference/library/collections',
                 'reference/library/resource',
                 'reference/library/system',
