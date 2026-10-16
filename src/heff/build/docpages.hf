@@ -1,0 +1,218 @@
+-- A module's reference page, what `heff doc` writes: Markdown with a
+-- title, as a site of Starlight's reads it.  The module's header comment,
+-- then each definition it exposes, in the order it defines them: its
+-- signature as `heff check` prints it (a type in full), and its doc
+-- comment, its doc tests shown as examples.  The pages' index lists the
+-- modules, each with the first sentence of its header comment.
+
+module heff.build.docpages
+
+import heff.build.driver as Driver
+import heff.build.query as Query
+import heff.elab.params as Params
+
+-- The header comment
+--------------------------------------------------------------------------------
+
+-- (a line of the header comment, `-- text`: its text)
+-- | >>> headerText "-- Paths, in a style"
+-- | "Paths, in a style"
+-- | >>> headerText "--"
+-- | ""
+headerText : String -> String
+headerText l =
+  if startsWith "-- " l then strSlice l 3 (strLength l)
+  else strSlice l 2 (strLength l)
+
+-- (the lines of the comments at the top, up to the first line that is
+-- neither a comment's nor blank)
+headerGo : List String -> List String
+headerGo Nil = Nil
+headerGo (Cons l rest) =
+  if startsWith "--" l then Cons (headerText l) (headerGo rest)
+  else if strEq (trim l) "" then Cons "" (headerGo rest)
+  else Nil
+
+-- | the module's header comment, the comment above its `module` line,
+-- | its text
+-- | >>> headerComment "-- Lists.\n-- Their operations.\n\nmodule list\n-- no\n"
+-- | "Lists.\nTheir operations."
+headerComment : String -> String
+headerComment src = trim (joinWith "\n" (headerGo (split "\n" src)))
+
+-- (the first paragraph's lines, up to a blank one)
+firstParagraph : List String -> List String
+firstParagraph Nil = Nil
+firstParagraph (Cons l rest) =
+  if strEq (trim l) "" then Nil else Cons (trim l) (firstParagraph rest)
+
+-- (where the first sentence of the text ends, from `i`, a `. ` not in
+-- code, between backquotes)
+sentenceEnd : String -> Int -> Bool -> Maybe Int
+sentenceEnd s i code =
+  if i + 1 >= strLength s then Nothing
+  else if byteAt s i == 96 then sentenceEnd s (i + 1) (not code)
+  else if not code && byteAt s i == 46 && byteAt s (i + 1) == 32 then Just i
+  else sentenceEnd s (i + 1) code
+
+-- (a text up to its first sentence's end, the stop kept)
+sentenceIn : String -> Maybe Int -> String
+sentenceIn s (Just i) = strSlice s 0 (i + 1)
+sentenceIn s Nothing = s
+
+-- | the first sentence of a header comment, on one line
+-- | >>> firstSentence "JSON (RFC 8259): a value. Import it\nby a name."
+-- | "JSON (RFC 8259): a value."
+-- | >>> firstSentence "By `x /. y`, divided. More."
+-- | "By `x /. y`, divided."
+-- | >>> firstSentence "Lists\nof things\n\nMore."
+-- | "Lists of things"
+firstSentence : String -> String
+firstSentence header =
+  sentenceIn
+    (joinWith " " (firstParagraph (split "\n" header)))
+    (sentenceEnd (joinWith " " (firstParagraph (split "\n" header))) 0 False)
+
+-- The definitions
+--------------------------------------------------------------------------------
+
+-- (where the definition of this name is)
+spanNamed : String -> List (Pair String Params.Span) -> Maybe Params.Span
+spanNamed x Nil = Nothing
+spanNamed x (Cons (MkPair y sp) rest) =
+  if strEq x y then Just sp else spanNamed x rest
+
+-- (the doc comment above the definition there, as Markdown)
+docAbove : Driver.Checked -> Maybe Params.Span -> String
+docAbove c (Just sp) =
+  Query.docMarkdownIn
+    "haskell"
+    (Query.docLines c.source (Query.lineStartOf c.source sp.start))
+docAbove c Nothing = ""
+
+-- (a part of the page, a blank line after it, if it has any text)
+part : String -> String
+part text = if strEq (trim text) "" then "" else trim text ^ "\n\n"
+
+-- (a byte of an operator, as a word of its anchor)
+opWord : Int -> String
+opWord b =
+  if b == 60 then "lt"
+  else if b == 62 then "gt"
+  else if b == 43 then "plus"
+  else if b == 45 then "minus"
+  else if b == 42 then "star"
+  else if b == 47 then "slash"
+  else if b == 61 then "eq"
+  else if b == 58 then "colon"
+  else if b == 46 then "dot"
+  else if b == 124 then "bar"
+  else if b == 38 then "amp"
+  else if b == 94 then "caret"
+  else if b == 36 then "dollar"
+  else if b == 33 then "bang"
+  else if b == 63 then "question"
+  else if b == 126 then "tilde"
+  else if b == 37 then "percent"
+  else if b == 64 then "at"
+  else if b == 35 then "hash"
+  else if b == 92 then "backslash"
+  else show b
+
+-- (a name's first byte: a letter or `_`)
+nameStart : Int -> Bool
+nameStart b = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+
+-- | a definition's anchor on its page: its name; an operator's, `op`
+-- | and a word for each of its characters
+-- | >>> anchorOf "foldMap"
+-- | "foldMap"
+-- | >>> anchorOf "<+>"
+-- | "op-lt-plus-gt"
+-- | >>> anchorOf "::"
+-- | "op-colon-colon"
+anchorOf : String -> String
+anchorOf x =
+  if nameStart (byteAt x 0) then x
+  else "op-"
+    ^ joinWith
+      "-"
+      (List.map (\i -> opWord (byteAt x i)) (List.range 0 (strLength x - 1)))
+
+-- (a definition's entry, given its signature: a heading, its anchor
+-- given, `{#anchor}`, so that a link to it stays as the name is)
+entryWith : Driver.Checked -> Driver.Own -> Maybe String -> Maybe String
+entryWith c o (Just sig) =
+  Just
+    ("## `"
+     ^ o.name
+     ^ "` {#"
+     ^ anchorOf o.name
+     ^ "}\n\n```haskell\n"
+     ^ trim sig
+     ^ "\n```\n\n"
+     ^ part (docAbove c (spanNamed o.name c.top.spans)))
+entryWith c o Nothing = Nothing
+
+-- | a definition's entry on the page: its name, a heading; its
+-- | signature; its doc comment
+entryOf : Driver.Checked -> Driver.Own -> Maybe String
+entryOf c o = entryWith c o (Driver.signatureOf c o)
+
+-- (the entries that are something, in order)
+entriesOf : List (Maybe String) -> List String
+entriesOf Nil = Nil
+entriesOf (Cons (Just s) rest) = Cons s (entriesOf rest)
+entriesOf (Cons Nothing rest) = entriesOf rest
+
+-- The pages
+--------------------------------------------------------------------------------
+
+-- (a page's front matter: its title)
+frontMatter : String -> String
+frontMatter title = "---\ntitle: " ^ title ^ "\n---\n\n"
+
+-- | a module's page: its title the module's name, its header comment,
+-- | then each definition it exposes (those its header hides are not
+-- | there)
+page : Driver.Checked -> String
+page c =
+  trim
+    (frontMatter c.module
+     ^ part (headerComment c.source)
+     ^ joinWith
+       ""
+       (entriesOf
+          (List.map (\o -> entryOf c o) (Driver.exposedOwn c))))
+  ^ "\n"
+
+-- | where a module's page is, under the pages' directory: a directory a
+-- | level of its name, `std.path` at `std/path.md`
+-- | >>> pagePath "std.path"
+-- | "std/path.md"
+pagePath : String -> String
+pagePath m = joinWith "/" (split "." m) ^ ".md"
+
+-- (a module's line in the index)
+indexLine : Driver.Checked -> String
+indexLine c =
+  "- [`"
+  ^ c.module
+  ^ "`]("
+  ^ pagePath c.module
+  ^ ")"
+  ^ (if strEq (headerComment c.source) "" then ""
+     else ": " ^ firstSentence (headerComment c.source))
+  ^ "\n"
+
+-- (whether a module's name comes before another's)
+moduleBefore : Driver.Checked -> Driver.Checked -> Bool
+moduleBefore a b = strLt a.module b.module
+
+-- | the pages' index, `index.md`: each module, in the order of their
+-- | names, with the first sentence of its header comment
+indexPage : List Driver.Checked -> String
+indexPage cs =
+  "---\ntitle: API\nsidebar:\n  label: Modules\n---\n\n"
+  ^ "The modules, each a page: what it exposes, with its type and its documentation.\n\n"
+  ^ joinWith "" (List.map indexLine (List.sortBy moduleBefore cs))

@@ -11,6 +11,7 @@ import co
 import exception
 import heff.build.backcache as BackCache
 import heff.build.cache as Cache
+import heff.build.docpages as DocPages
 import heff.build.driver as Driver
 import heff.elab.effect as Effect
 import heff.compile.emit as Emit
@@ -4097,6 +4098,137 @@ checkCmd file = do
   badL <- printErrs "heff" l.errors 0
   cs <- Session.cachedProgram l
   checkLast (badL > 0) cs
+
+-- The reference pages
+--------------------------------------------------------------------------------
+
+-- (the files `heff doc` reads, none given: the `.hf` files under `src/`,
+-- if there is one here)
+docFilesIn : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Maybe (List String)
+           -> Co e (List String)
+docFilesIn (Just _) = testFilesGo [MkPair True "src"] Nil
+docFilesIn Nothing = do
+  printErr "heff doc: no src/ here: run it at the project's root, or give FILEs"
+  exit 1
+  pure Nil
+
+-- | the files `heff doc` reads: those given, a directory's `.hf` files
+-- | for it; none given, the project's here (those under `src/`)
+docFiles : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> List String
+         -> Co e (List String)
+docFiles Nil = do
+  src <- readDirectory "src"
+  docFilesIn src
+docFiles given = testFilesGo (List.map (\f -> MkPair True f) given) Nil
+
+-- (a file's module, kept if it and what it imports checked)
+docKept : Bool
+        -> Maybe Driver.Checked
+        -> List Driver.Checked
+        -> List Driver.Checked
+docKept False (Just c) acc = Cons c acc
+docKept bad found acc = acc
+
+-- (each file checked, after what it imports: the modules that checked,
+-- in order; each that did not, its diagnostics said)
+docChecked : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{rep : Report.report <: e}}
+           -> List String
+           -> List Driver.Checked
+           -> Co e (List Driver.Checked)
+docChecked Nil acc = pure (List.reverse acc)
+docChecked (Cons f rest) acc = do
+  l <- load f
+  badL <- printErrs "heff" l.errors 0
+  cs <- Session.cachedProgram l
+  if anyErrors cs then putFileDiags cs else pure MkUnit
+  docChecked
+      rest
+      (docKept (badL > 0 || anyErrors cs) (Driver.lastChecked cs) acc)
+
+-- (a page written, its directory made first)
+docPageWritten : {e : HFunctor}
+               -> {{io : stdio <: e}}
+               -> {{sys : process <: e}}
+               -> {{disk : filesystem <: e}}
+               -> String
+               -> String
+               -> Co e Unit
+docPageWritten path text = do
+  st <- styleNow
+  _ <- makeDirectory (Path.dirname st path)
+  ok <- writeFile path text
+  if ok then pure MkUnit
+    else do
+      printErr ("heff doc: cannot write " ^ path)
+      exit 1
+
+-- (each module's page, under the directory)
+docPagesWritten : {e : HFunctor}
+                -> {{io : stdio <: e}}
+                -> {{sys : process <: e}}
+                -> {{disk : filesystem <: e}}
+                -> String
+                -> List Driver.Checked
+                -> Co e Unit
+docPagesWritten dir Nil = pure MkUnit
+docPagesWritten dir (Cons c rest) = do
+  st <- styleNow
+  docPageWritten
+      (Path.join st dir (DocPages.pagePath c.module))
+      (DocPages.page c)
+  docPagesWritten dir rest
+
+-- (the pages: printed one after another, or written under the directory,
+-- with their index)
+docWritten : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> Maybe String
+           -> List Driver.Checked
+           -> Co e Unit
+docWritten Nothing cs = write (joinWith "\n" (List.map DocPages.page cs))
+docWritten (Just dir) cs = do
+  st <- styleNow
+  docPagesWritten dir cs
+  docPageWritten (Path.join st dir "index.md") (DocPages.indexPage cs)
+  print
+      ("heff doc: "
+       ^ show (List.length cs)
+       ^ " pages and their index, in "
+       ^ dir)
+
+-- | `heff doc`: a reference page of each module of the files (a
+-- | directory's `.hf` files), else of the project's here (`src/`): its
+-- | header comment, and each definition it exposes, its signature and
+-- | its doc comment; printed, or with `--out DIR`, each written under
+-- | DIR (`std.path` at DIR/std/path.md), with an index of them.  A module
+-- | that does not check has no page, and its errors are said
+docCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{rep : Report.report <: e}}
+       -> Maybe String
+       -> List String
+       -> Co e Unit
+docCmd out given = do
+  files <- docFiles given
+  cs <- docChecked files Nil
+  docWritten out cs
+  if List.length cs < List.length files then exit 1 else pure MkUnit
 
 -- | what the name at each OFFSET of FILE resolved to, and its type: a
 -- | line each, FILE checked once

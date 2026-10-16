@@ -15,6 +15,7 @@ title: Commands
 | `heff dev [APP...]` | build, run and serve the project, again at each change |
 | `heff fmt [--check] FILE...` | format files in place |
 | `heff check FILE` | print a file's interface and its errors |
+| `heff doc [FILE...] [--out DIR]` | write each module's reference page; no FILE: `src/` |
 | `heff promote FILE` | write each doc test's and watch's value as its expectation |
 | `heff compile FILE OUT --backend=MODE` | compile a file to `page`, `esm` or `c` |
 | `heff explain FILE` | print the type checker's trace |
@@ -55,6 +56,28 @@ Enter again to run it.
 | `--watch` | test again at each change |
 
 See [Tests](tests.md) and [Benchmarks](benchmarks.md).
+
+## Reference pages
+
+`heff doc` makes a Markdown page of each module: its title the module's
+name, the module's header comment (the comment above its `module`
+line), then each definition it exposes, in order, with its signature
+as `heff check` prints it and its doc comment, the doc tests shown as
+examples. What the header does not list has no entry.
+
+- Without `--out`, the pages are printed. With `--out DIR`, a module
+  `std.path` is written to `DIR/std/path.md`, and `DIR/index.md`
+  lists the modules, each with the first sentence of its header
+  comment.
+- Each definition's heading ends in `{#NAME}`, its anchor: the name
+  itself, `#foldMap`; an operator's is `op-` and a word for each of
+  its characters, `<+>` is `#op-lt-plus-gt`.
+- A module that does not check has no page; its errors are said, and
+  `heff doc` fails.
+
+The site's [API pages](https://dannypsnl.github.io/heff/api/) are
+`heff doc lib --out docs/api` (`make api`), made each time the site is
+published.
 
 ## heff dev
 

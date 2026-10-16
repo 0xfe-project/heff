@@ -35,7 +35,7 @@ BENCH ?=##       bench: bench/run.mjs's arguments, e.g. "--runs 5 pure"
 .NOTPARALLEL:
 .PHONY: help build build-seed boot native release test test-compiler test-lsp \
   test-backends test-fixpoint test-asan check golden sanitize tsan fmt \
-  fmt-check aliases aliases-check bat bat-check vsix install install-all bench clean
+  fmt-check aliases aliases-check api bat bat-check vsix install install-all bench clean
 
 help: ## this list
 	@echo "make TARGET [VARIABLE=VALUE...]"
@@ -115,6 +115,12 @@ aliases: ## each import's alias the word scripts/aliases.hf's table says (#60)
 
 aliases-check: ## which aliases are not yet the table's words, no file written
 	HEFF=$(HEFF) $(HEFF) run scripts/aliases.hf --check
+
+##@ Documentation
+
+api: ## the library's API pages, for the site: docs/api/, made anew by heff doc (not kept in git)
+	rm -rf docs/api
+	$(HEFF) doc lib --out docs/api
 
 ##@ Editors
 
