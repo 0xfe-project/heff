@@ -528,6 +528,36 @@ goalShown e mc goal =
        (Rename.displayName e.globals)
        (Readback.readbTyForced mc e.scope.len goal))
 
+-- | a value in a search's messages, as `goalShown` says a type
+valShown : ElabEnv -> Value.MetaCtx -> Value.V -> String
+valShown e mc v =
+  SurfacePrint.printEl
+    SurfacePrint.plainImplicits
+    0
+    e.scope.names
+    (Rename.renameEl
+       (Rename.displayName e.globals)
+       (Readback.readbElForced mc e.scope.len v))
+
+-- | a type, its specialisations taken off: a goal `Iterate (List a) @ {
+-- | Elem = a }` is searched for as `Iterate (List a)`, and an instance
+-- | declared of the one is a candidate as one of the other
+unspecForced : Value.Ty -> Value.Ty
+unspecForced (VDecode h (SpSpec sp x f) u described el) =
+  Value.decodeN (Value.unspecialize (Params.forceTh el))
+unspecForced t = t
+
+unspecTy : Value.MetaCtx -> Value.Ty -> Value.Ty
+unspecTy mc t = unspecForced (Value.forceTy mc t)
+
+-- (a goal's specialisations, `@ { x = v, ... }`, the first first)
+settingsForced : Value.Ty -> List (Pair String Value.V)
+settingsForced (VDecode h sp u described el) = Value.specializations sp Nil
+settingsForced t = Nil
+
+settingsWanted : Value.MetaCtx -> Value.Ty -> List (Pair String Value.V)
+settingsWanted mc t = settingsForced (Value.forceTy mc t)
+
 -- | an implicit argument not given, `x : dom`, of the function type `ty`
 -- | that takes it first: its default, where the type has one -- given as
 -- | it is, not inferred -- else a fresh metavariable, inferred
@@ -764,11 +794,18 @@ apartFrom mc goal conclusion = apartForced mc (Value.forceTy mc goal) conclusion
 fits : ElabEnv -> Params.Span -> Value.Ty -> Witness -> Elab (Maybe Fit)
 fits e sp goal w = do
   mc <- gets (\c -> c.metas)
-  if w.scheme && apartFrom mc goal (conclusionOf 0 w.ty) then pure Nothing
+  if w.scheme && apartFrom mc goal (unspecForced (conclusionOf 0 w.ty))
+    then pure Nothing
     else do
       before <- gets (\c -> c)
       inst <- instantiate e sp w
-      r <- Meta.unifyTy e.globals (shape e.scope) goal inst.conclusion
+      mc2 <- gets (\c -> c.metas)
+      r <-
+        Meta.unifyTy
+          e.globals
+          (shape e.scope)
+          goal
+          (unspecTy mc2 inst.conclusion)
       after <- gets (\c -> c)
       putSt before
       pure (fitOf w inst after r)
@@ -906,6 +943,56 @@ eachSubgoal find (Cons sg rest) = do
   find sg
   eachSubgoal find rest
 
+-- (the field `x` of the instance found, of the goal's theory)
+fieldFound : Value.MetaCtx -> Value.Ty -> Value.V -> String -> Value.V
+fieldFound mc goal found x =
+  Value.nom
+    (Value.projAt found x (Value.projTy (unspecTy mc goal) found x))
+
+-- | the instance found, `w` (`found`), for a goal specialised, `T args @
+-- | { x = v }`: its field `x` is to be `v`
+checkSetting : ElabEnv
+             -> Params.Span
+             -> Witness
+             -> Value.Ty
+             -> Value.V
+             -> Pair String Value.V
+             -> Elab Unit
+checkSetting e sp w goal found (MkPair x v) = do
+  mc <- gets (\c -> c.metas)
+  has <- pure (fieldFound mc goal found x)
+  r <- Meta.unifyEl e.globals (shape e.scope) has v
+  case r of
+    Right _ -> pure MkUnit
+    Left err ->
+      failWithNote
+        sp
+        54
+        ("the instance found for "
+         ^ goalShown e mc (unspecTy mc goal)
+         ^ ", "
+         ^ nameOf w
+         ^ ", has "
+         ^ x
+         ^ " = "
+         ^ valShown e mc has
+         ^ ", but "
+         ^ goalShown e mc goal
+         ^ " is wanted")
+        (prettyEqErr e.globals err)
+
+checkSettings : ElabEnv
+              -> Params.Span
+              -> Witness
+              -> Value.Ty
+              -> Value.V
+              -> List (Pair String Value.V)
+              -> Elab Unit
+checkSettings e sp w goal found Nil = pure MkUnit
+checkSettings e sp w goal found (Cons st rest) = do
+  checkSetting e sp w goal found st
+  checkSettings e sp w goal found rest
+
 -- | find the one witness in scope whose type is the goal, as Agda's
 -- | instance arguments are found: among the instance binders in scope
 -- | (`e.insts`) and the top-level instances in scope (`e.globals`'s), one
@@ -917,7 +1004,11 @@ eachSubgoal find (Cons sg rest) = do
 -- | one is refused (same-typed witnesses are definitionally equal here --
 -- | small values are opaque -- so no tie-break can tell them apart), so
 -- | an import that brings in another makes an error of a search, never
--- | another answer; none is refused too.
+-- | another answer; none is refused too.  Parameters decide, fields are
+-- | checked: a goal specialised, `T args @ { x = v }`, is searched for as
+-- | `T args`, and an instance declared specialised is a candidate as one
+-- | of its theory; the one found has then its field `x` unified with `v`
+-- | (E0354 where it is not).
 resolveWanted : ElabEnv
               -> Params.Span
               -> InstanceSearch
@@ -931,7 +1022,7 @@ resolveWanted e sp search hm holeVal goal final = do
   -- (an error already said leaves what it would have solved unsolved:
   -- an instance argument it leaves undetermined is no error of its own)
   earlier <- gets (\c -> not (List.null c.recovered))
-  if not (List.null (metasLeft e mc goal))
+  if not (List.null (metasLeft e mc (unspecTy mc goal)))
     then if final && earlier
       then failElsewhere
           sp
@@ -955,7 +1046,11 @@ resolveWanted e sp search hm holeVal goal final = do
         "an instance's instance arguments are found by searches of their own, and one that wants an instance of a type no smaller than its own may want them without end: give the argument explicitly, `(x := e)`"
     else do
       matches <-
-        witnessMatches e sp goal (List.append (instLocals e) (instGlobals e))
+        witnessMatches
+          e
+          sp
+          (unspecTy mc goal)
+          (List.append (instLocals e) (instGlobals e))
       case matches of
         Cons one Nil -> do
           inst <- committed e sp hm holeVal goal one
@@ -996,6 +1091,14 @@ resolveWanted e sp search hm holeVal goal final = do
                           sg.goal
                           later))
               inst.subgoals
+          mcNow <- gets (\c -> c.metas)
+          checkSettings
+              e
+              sp
+              one.witness
+              goal
+              (Memoed.valN inst.applied)
+              (settingsWanted mcNow goal)
           pure True
         Nil ->
           -- (not an error of its own where an instance that may have
