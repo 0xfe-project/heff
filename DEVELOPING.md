@@ -80,7 +80,6 @@ version `package.hf`'s, with `SHA256SUMS` of them.
 | `linux-arm64` | `aarch64-linux-musl` | `heff-VERSION-linux-arm64.tar.gz` |
 | `linux-x64`   | `x86_64-linux-musl`  | `heff-VERSION-linux-x64.tar.gz`   |
 | `macos-arm64` | `aarch64-macos`      | `heff-VERSION-macos-arm64.tar.gz` |
-| `macos-x64`   | `x86_64-macos`       | `heff-VERSION-macos-x64.tar.gz`   |
 | `windows-x64` | `x86_64-windows-gnu` | `heff-VERSION-windows-x64.zip`    |
 
 Linux's are linked statically, by musl.  Each archive is one directory,

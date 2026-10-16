@@ -761,7 +761,6 @@ const platforms = [_]Platform{
     .{ .name = "linux-arm64", .target = "aarch64-linux-musl" },
     .{ .name = "linux-x64", .target = "x86_64-linux-musl" },
     .{ .name = "macos-arm64", .target = "aarch64-macos" },
-    .{ .name = "macos-x64", .target = "x86_64-macos" },
     .{ .name = "windows-x64", .target = "x86_64-windows-gnu" },
 };
 const releaseDir = out ++ "/release";
