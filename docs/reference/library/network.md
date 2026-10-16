@@ -76,7 +76,7 @@ echo c = do
   its `name` (`ECONNREFUSED`), and its `message`. A `with` that fails
   throws its `NetError`.
 - Every operation waits, and the whole program with it, unless it runs
-  in a [green thread](green.md).
+  in a [green thread](concurrency.md).
 - Windows has no sockets yet.
 
 ## std.http.server

@@ -89,7 +89,7 @@ commitOf repo = do
 
 The program's own process: `args`, `getEnv`, `programPath`, `platform`,
 `processors`, `exit`, and `workingDir` and `setWorkingDir`. The working
-directory is each [place](../threads.md#stdplace)'s own.
+directory is each [place](concurrency.md#stdplace)'s own.
 
 ### Running commands
 

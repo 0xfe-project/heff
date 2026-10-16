@@ -34,8 +34,7 @@ Only the library declares primitives, such as
 | resources | `with` | [Resources](with.md) |
 | the system | `std.io`, `std.filesystem`, `std.process` | [Files and processes](system.md) |
 | the network | `std.net`, `std.http`, `std.http.server` | [Network](network.md) |
-| concurrency (unstable) | `green`, `std.reactor` | [Green threads](green.md) |
-| | `std.thread`, `std.place` | [Threads and places](../threads.md) |
+| concurrency (unstable) | `green`, `std.reactor`, `std.thread`, `std.place` | [Concurrency](concurrency.md) |
 | the terminal | `std.terminal`, `std.terminal.widget`, `std.cli.interactive` | [Terminal](terminal.md) |
 | data formats | `wire`, `json` | [Wire and JSON](formats.md) |
 | the browser | `browser.dom`, `browser.http`, `gpu` | [Browser and GPU](browser.md) |
