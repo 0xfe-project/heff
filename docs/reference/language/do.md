@@ -15,13 +15,16 @@ echo = do
 
 A `do` block is a computation written as statements:
 
-- `x <- e` runs `e` and names its result `x`;
+- `x <- e` runs `e` and names its result `x`; `(a, b) <- e` takes
+  the result apart;
 - a statement `e` runs `e`;
-- `let x = e` names `e` in the statements after it;
+- `let x = e` names `e` in the statements after it; `let (a, b) = e`
+  takes it apart;
 - the last statement is the block's result.
 
 `x <- e` is `bind e (\x -> ...)`, using whatever `bind` and `pure` are
-in scope. No `Monad` instance is needed.
+in scope. No `Monad` instance is needed. A pattern that binds must
+match every value ([Patterns that bind](definitions.md#patterns-that-bind)).
 
 ## Statements
 
@@ -142,7 +145,8 @@ lineCount path = do
 `with e as x do` runs the statements under it as the body of the
 [`with`](../../api/resource.md) `e`, such as `withFile path o`, with `x`
 the `With s r` it holds. It is `e (\x -> do ...)`, written as a
-statement.
+statement. Where `e` hands its body a tuple, `with e as (a, b) do`
+takes it apart: `e (\p -> case p of (a, b) -> do ...)`.
 
 - `x` is in scope in the statements under it alone, and cannot leave
   them (E0311).

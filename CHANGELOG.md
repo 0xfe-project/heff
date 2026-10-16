@@ -8,6 +8,7 @@
 - A theory's fields are fixed by named application, `Th (t := Bool)`, replacing `Th ~ { t = Bool }`. `~` is now an ordinary operator symbol.
 - `T @ { x = v, y = w }` specialises a theory again, decided at parse time. Named arguments name arguments only.
 - Instance search: a specialised goal is searched by its theory and parameters, then the found instance's fields are unified with the goal's (E0354). A field given by an instance argument not found yet waits for the search instead of failing with E0311.
+- Tuples: `()` is the unit and `(a, b)` a pair, `(a, b, c)` nesting right; each says its type (`Unit`, `Pair`), so `pure ()` needs no annotation. As types, `()` is `Unit` and `(A, B)` is `Pair A B`, and types print so. The same forms are patterns, and patterns now bind in `p <- e`, `with e as p` and `\p -> e` as well as `let p = e`; a pattern there that can fail is an error (E0355).
 
 ### Backends and performance
 

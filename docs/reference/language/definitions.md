@@ -22,6 +22,8 @@ A pattern is one of:
 - a name, which matches anything and binds it;
 - `_`, which matches anything;
 - a tag applied to patterns, `Just x`, `MkPair a b`;
+- a tuple of patterns, `(a, b)`, `(a, b, c)`, or the unit, `()`
+  ([Unit and pairs](data.md#unit-and-pairs));
 - a list: `[]` or `x :: xs` as usual, `[x, y]` for a list of that length;
 - a number, string or rune literal;
 - a binary, `b[...]` ([Binaries](binaries.md)).
@@ -71,12 +73,24 @@ increments = List.map (\x -> x + 1) [1, 2]
 - `case e of` matches `e` against patterns, one arm a line.
 - `if c then a else b` is `a` where `c` is `True`.
 - `let x = e in body` names `e` in `body`. A `let` does not generalise:
-  what it binds has one type for every use.
+  what it binds has one type for every use. `let p = e in body` takes
+  `e` apart by the pattern `p`: `let (a, b) = pair in a + b`.
 - `where` under an equation holds definitions only that equation sees.
   They can use the equation's arguments.
-- `\x -> e` is a function; `\(x : T) -> e` gives its argument a type.
+- `\x -> e` is a function; `\(x : T) -> e` gives its argument a type;
+  `\(a, b) -> e` takes its argument apart.
 
 `&&` and `||` evaluate their right side only when needed.
+
+### Patterns that bind
+
+A pattern that binds without a `case`, in `let p = e`, `\p -> e`, and
+a `do` block's `p <- e` and `with e as p`, must match every value of
+its type: names, `_`, tuples and units of them, and a tag that is its
+type's only one, such as `MkPair a b`. A pattern that can fail, `Just
+x` or a literal, is an error (E0355). Write a `case`, or `if let`
+([do](do.md#statements)), which says what happens when it does not
+match.
 
 ## Order
 

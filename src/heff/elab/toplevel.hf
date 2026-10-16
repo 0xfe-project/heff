@@ -581,6 +581,58 @@ infF tk (At (ILitEq x xsp eq lit) sp) = do
   pure (Rules.litEq sp x xsp eq j)
 infF tk (At (ILazy c) sp) = lazyInf tk sp c
 
+-- (what infers the scrutinee, as `see` sees it)
+seen : Maybe (Rules.Syn -> Rules.Syn) -> Rules.Syn -> Rules.Syn
+seen Nothing s = s
+seen (Just see) s = see s
+
+-- (a `case` whose patterns compile to no matches: so said, a binding's
+-- once its scrutinee is seen, a pattern that can fail said first)
+treeFailed : TK
+           -> Maybe (Rules.Syn -> Rules.Syn)
+           -> Presyntax.Inferable
+           -> Params.Span
+           -> String
+           -> Elab Rules.Chk
+treeFailed tk Nothing scrutN sp msg = failP sp 3 msg
+treeFailed tk (Just see) scrutN sp msg = do
+  scrut <- tk.infJ scrutN
+  pure
+      (MkChk (\e a -> do
+       pm <- Rules.runSyn (see scrut) e
+       failP sp 3 msg))
+
+-- | a `case` of `casesN` on `scrutN`, as `see` sees what it infers, if
+-- | given (`let p = e` refuses a pattern that can fail)
+matchF : TK
+       -> Params.Span
+       -> Maybe (Rules.Syn -> Rules.Syn)
+       -> Presyntax.Inferable
+       -> List (Params.Spanned (Presyntax.Alt Presyntax.Checkable))
+       -> Elab Rules.Chk
+matchF tk sp see scrutN casesN =
+  -- (a scrutinee `(e : T)`, `e` a tag or a record, is `e` in the core,
+  -- which does not say its type there: it is bound to a name, below)
+  if allL flatCaseAlt casesN && not (annotatesData scrutN)
+  then do
+    scrut <- tk.infJ scrutN
+    cases <- traverseEL (\m -> doCase tk m) casesN
+    pure
+        (Rules.sumElim
+           sp
+           (seen see scrut)
+           (tagSpans casesN)
+           (Dict.fromList cases))
+  -- extension: nested patterns, literals, a name for the whole value,
+  -- compiled into the flat matches above, on a name for the scrutinee,
+  -- bound once
+  else case Clauses.caseTree sp casesN of
+    Left err -> treeFailed tk see scrutN err.span err.msg
+    Right r -> do
+      scrut <- tk.infJ scrutN
+      body <- tk.chkJ r.tree
+      pure (Rules.caseLet r.scrutinee (seen see scrut) body)
+
 -- | a term checked against a type, as written (no implicit lambdas
 -- | around it)
 rawF : TK -> Presyntax.Checkable -> Elab Rules.Chk
@@ -611,32 +663,23 @@ rawF tk (At (CMatch scrutN casesN) sp) =
        casesN' <- traverseEL (\m -> opAlt e.globals m) casesN
        j <- tk.chkJ (At (CMatch scrutN casesN') sp)
        Rules.runChk j e a))
-  -- (a scrutinee `(e : T)`, `e` a tag or a record, is `e` in the core,
-  -- which does not say its type there: it is bound to a name, below)
-  else if allL flatCaseAlt casesN && not (annotatesData scrutN)
-  then do
-    scrut <- tk.infJ scrutN
-    cases <- traverseEL (\m -> doCase tk m) casesN
-    pure (Rules.sumElim sp scrut (tagSpans casesN) (Dict.fromList cases))
-  -- extension: nested patterns, literals, a name for the whole value,
-  -- compiled into the flat matches above, on a name for the scrutinee,
-  -- bound once
-  else do
-    case Clauses.caseTree sp casesN of
-      Left err -> failP err.span 3 err.msg
-      Right r -> do
-        scrut <- tk.infJ scrutN
-        body <- tk.chkJ r.tree
-        pure (Rules.caseLet r.scrutinee scrut body)
+  else matchF tk sp Nothing scrutN casesN
 -- extension: `let x = e in e'`, `e` inferring (`let x : T = e` if it
 -- does not), bound once by a beta-redex; `let p = e in e'`, a `case` of
--- one alternative, which must match every value
+-- one alternative, whose pattern must not fail to match
 rawF tk (At (CLetIn rhsN alt0) sp) = case alt0 of
   At (MkAlt (At (PatVar x) _) bodyN) _ -> do
     rhs <- tk.infJ rhsN
     body <- recoveringChk (tk.chkJ bodyN)
     pure (Rules.caseLet x rhs body)
-  _ -> tk.rawJ (At (CMatch rhsN (Cons alt0 Nil)) sp)
+  At (MkAlt p _) _ ->
+    if altHasOp alt0
+    then pure
+        (MkChk (\e a -> do
+         alt1 <- opAlt e.globals alt0
+         j <- tk.chkJ (At (CLetIn rhsN alt1) sp)
+         Rules.runChk j e a))
+    else matchF tk sp (Just (Rules.bindingSyn p)) rhsN (Cons alt0 Nil)
 -- extension: an equation's body and its local definitions (`where`)
 rawF tk (At (CLocal bodyN defs) sp) = do
   localsJ tk defs bodyN

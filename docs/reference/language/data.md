@@ -39,6 +39,35 @@ function it is given to, `paint Red` where `paint : Ink -> String`; or
 the tag itself, `(Red : Ink)`. A tag with nothing to say its type, as
 in `let x = Red`, will cause an error.
 
+## Unit and pairs
+
+```haskell
+-- | >>> swap (1, "one")
+-- | MkPair "one" 1
+swap : {a b : Type} -> (a, b) -> (b, a)
+swap (x, y) = (y, x)
+
+-- | >>> total (1, 2, 3)
+-- | 6
+total : (Int, Int, Int) -> Int
+total (a, b, c) = a + b + c
+
+done : ()
+done = ()
+```
+
+`()` is the unit, `MkUnit`, and `(a, b)` is a pair, `MkPair a b`.
+`(a, b, c)` nests to the right: `(a, (b, c))`. `(e)` is `e`, grouped.
+
+As a value, `()` is a `Unit` and `(a, b)` a `Pair`, so each says its
+type where a tag alone would not: `pure ()` needs nothing around it to
+say what it is. Written as a type, `()` is `Unit` and `(A, B)` is
+`Pair A B`; so is an argument of a type there, `List (String, Int)`.
+Elsewhere, a type given as an argument is written `Pair A B`.
+
+The same forms are patterns, nested as deep as needed: `(x, y)`,
+`((a, b), c)`, `()`.
+
 ## Type aliases
 
 ```haskell

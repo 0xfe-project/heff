@@ -91,12 +91,16 @@ data E
   | BVar T
   | BImp T T T
   | BAnn T T T E T
+  -- | `\(a, b) -> e`: a lambda's binder that is a pattern, `()`, `(p, q)`
+  -- | or `(p)`
+  | BPat Pat
   | Lam T (List E) T E
   | Case T E T (List E)
   | EAlt Pat T E
   | If T E T E T E
   | Do T (List E)
-  | ESBind T T E
+  -- | `p <- e`: the pattern (`x`, or `(a, b)`), `<-`, the action
+  | ESBind Pat T E
   -- | `let p : T = e in e'`, the annotation and the body each perhaps
   -- | not there (a `do` block's `let p = e` has no body)
   | ELet T Pat (Maybe (Pair T E)) T E (Maybe (Pair T E))
@@ -125,9 +129,9 @@ data E
   | ETry T (Maybe E) (List E) E
   -- | `catch x ->` and its statements
   | ECatch T E T (List E)
-  -- | `with e as x do` and its statements: `with`, the `with` given the
-  -- | statements, `as`, the name, `do`
-  | EWith T E T T T (List E)
+  -- | `with e as p do` and its statements: `with`, the `with` given the
+  -- | statements, `as`, the pattern (a name, or `(a, b)`), `do`
+  | EWith T E T Pat T (List E)
 
 -- | a theory's field, `x : A`, and its default, `= d`, if it has one
 data TF = MkTF T T E (Maybe (Pair T E))
@@ -753,14 +757,18 @@ listOfF item mk = do
     c <- expectPunct "]"
     pure (mk o xs c))
 
--- | `( e )`, `(a, b)`, `(x := e)` (a named argument), `(+)`
+-- | `( e )`, `(a, b)`, `()`, `(x := e)` (a named argument), `(+)`
 parensF : Gram -> P E
 parensF g = do
   o <- next
   inBrackets (do
     t <- peek
     t2 <- peekAt 1
-    if isOperator t && isText t2 ")"
+    if isKind t "punct" && isText t ")"
+      then do
+        c <- next
+        pure (Tup o Nil Nil c)
+      else if isOperator t && isText t2 ")"
       then do
         op <- next
         c <- next
@@ -899,14 +907,25 @@ atomF g = do
       base <- atomBase g t
       fieldsGo base
 
--- | `x`, `{x}`, `(x : T)`
+-- | `x`, `{x}`, `(x : T)`, and a pattern in parentheses, `(a, b)`
 lamBinderF : Gram -> P E
 lamBinderF g = do
   t <- peek
+  t2 <- peekAt 1
+  t3 <- peekAt 2
   if isKind t "var" || isKind t "con"
     then do
       x <- next
       pure (BVar x)
+    else if isKind t "punct"
+            && isText t "("
+            && not
+              ((isKind t2 "var" || isKind t2 "con")
+               && isKind t3 "sym"
+               && isAnnText t3.text)
+    then do
+      p <- g.patAtom
+      pure (BPat p)
     else if isKind t "punct" && isText t "{"
     then do
       o <- next
@@ -1179,13 +1198,21 @@ expectAs = do
            ("a `with` statement names what it holds: `with e as x do`, not "
             ^ shown t))
 
--- | `with e as x do` and its statements
+-- | `with e as p do` and its statements
 withF : Gram -> P E
 withF g = do
   kw <- next
   e <- g.head
   a <- expectAs
-  x <- expectKind "var" "the name of what the `with` holds"
+  t <- peek
+  x <-
+    if isKind t "var" || (isKind t "punct" && isText t "(")
+    then g.patAtom
+    else throwP
+        (diag
+           (spanOf t)
+           ("expected the name of what the `with` holds, or a pattern in parentheses, not "
+            ^ shown t))
   d <- expectKw "do"
   body <- block g.stmt
   pure (EWith kw e a x d body)
@@ -1204,9 +1231,29 @@ armF g = do
     else if isKw t "with" then withF g
     else g.expr
 
--- | a statement of a `do` block: `x <- e`, `let p = e`, `let mut x = e`,
--- | a loop, or an arm's (`x := e`, `if` and `case` of statements' arms,
--- | `break`, `continue`, `return e`, an action)
+-- (the index past the bracket the one at `i` opens closes, `depth`
+-- brackets open before it)
+closeAfter : Array T -> Int -> Int -> Int
+closeAfter toks i depth = case Array.index toks i of
+  Nothing -> i
+  Just t ->
+    if isKind t "eof" then i
+    else if isKind t "punct" && List.elemBy strEq t.text ["(", "[", "b[", "{"]
+    then closeAfter toks (i + 1) (depth + 1)
+    else if isKind t "punct" && List.elemBy strEq t.text [")", "]", "}"]
+    then (if depth <= 1 then i + 1 else closeAfter toks (i + 1) (depth - 1))
+    else closeAfter toks (i + 1) depth
+
+-- | the parentheses here are followed by `<-`: a statement `(a, b) <- e`
+parenBinds : P Bool
+parenBinds =
+  pGets (\s -> case Array.index s.toks (closeAfter s.toks s.i 0) of
+  Just u -> isKind u "sym" && isText u "<-"
+  Nothing -> False)
+
+-- | a statement of a `do` block: `x <- e`, `(a, b) <- e`, `let p = e`,
+-- | `let mut x = e`, a loop, or an arm's (`x := e`, `if` and `case` of
+-- | statements' arms, `break`, `continue`, `return e`, an action)
 stmtF : Gram -> P E
 stmtF g = do
   t <- peek
@@ -1220,7 +1267,17 @@ stmtF g = do
       x <- next
       arrow <- next
       e <- g.expr
-      pure (ESBind x arrow e)
+      pure (ESBind (PAtom x) arrow e)
+    else if isKind t "punct" && isText t "("
+    then do
+      bindsP <- parenBinds
+      if bindsP
+        then do
+          p <- g.patAtom
+          arrow <- expectSym "<-"
+          e <- g.expr
+          pure (ESBind p arrow e)
+        else armF g
     else armF g
 
 doExprF : Gram -> P E
@@ -1283,7 +1340,30 @@ patSegmentF g = do
       pure (PSeg p cc spec)
     else pure p
 
--- | `x`, `_`, `C` (with no arguments), a literal, `x@p`, `[...]`, `{...}`, `(p)`
+-- | `(p)`, and `()` and `(p, q)`, a unit and a pair
+parenPatF : Gram -> P Pat
+parenPatF g = do
+  o <- next
+  inBrackets (do
+    t <- peek
+    if isKind t "punct" && isText t ")"
+      then do
+        c <- next
+        pure (PList o Nil Nil c)
+      else do
+        p <- g.pattern
+        t' <- peek
+        if isText t' ","
+          then do
+            r <- sepGo "," g.pattern (Cons p Nil) Nil
+            c <- expectPunct ")"
+            pure (mkPList o r c)
+          else do
+            c <- expectPunct ")"
+            pure (PParen o p c))
+
+-- | `x`, `_`, `C` (with no arguments), a literal, `x@p`, `[...]`, `{...}`,
+-- | `(p)`, `()`, `(p, q)`
 patAtomF : Gram -> P Pat
 patAtomF g = do
   t <- peek
@@ -1311,13 +1391,7 @@ patAtomF g = do
     else if isKind t "punct" && isText t "b["
     then listOfF (patSegmentF g) mkPList
     else if isKind t "punct" && isText t "{" then recordPatF g
-    else if isKind t "punct" && isText t "("
-    then do
-      o <- next
-      inBrackets (do
-        p <- g.pattern
-        c <- expectPunct ")"
-        pure (PParen o p c))
+    else if isKind t "punct" && isText t "(" then parenPatF g
     else if isKind t "neg"
     then throwP
         (diag (spanOf t) "a pattern negates only a number, its sign: `-1`")
@@ -1790,12 +1864,13 @@ firstE (Ann e cc ty) = firstE e
 firstE (BVar t) = t
 firstE (BImp o x c) = o
 firstE (BAnn o x cc ty c) = o
+firstE (BPat p) = firstP p
 firstE (Lam bs binders arrow body) = bs
 firstE (Case kw scrut of2 alts) = kw
 firstE (EAlt p arrow body) = firstP p
 firstE (If kw c th a el b) = kw
 firstE (Do kw stmts) = kw
-firstE (ESBind x arrow e) = x
+firstE (ESBind x arrow e) = firstP x
 firstE (ELet kw p ann eq e body) = kw
 firstE (ELetMut kw m x ann eq e) = kw
 firstE (EAssign x k e) = x
@@ -1844,6 +1919,7 @@ lastE (Ann e cc ty) = lastE ty
 lastE (BVar t) = t
 lastE (BImp o x c) = c
 lastE (BAnn o x cc ty c) = c
+lastE (BPat p) = lastP p
 lastE (Lam bs binders arrow body) = lastE body
 lastE (Case kw scrut of2 alts) =
   (case List.last alts of
@@ -2005,6 +2081,7 @@ tsE (BVar t) = Cons t Nil
 tsE (BImp o x c) = Cons o (Cons x (Cons c Nil))
 tsE (BAnn o x cc ty c) =
   Cons o (Cons x (Cons cc (List.append (tsE ty) (Cons c Nil))))
+tsE (BPat p) = tsP p
 tsE (Lam bs binders arrow body) =
   Cons bs (List.append (List.concatMap tsE binders) (Cons arrow (tsE body)))
 tsE (Case kw scrut of2 alts) =
@@ -2015,7 +2092,7 @@ tsE (If kw c th a el b) =
     kw
     (List.append (tsE c) (Cons th (List.append (tsE a) (Cons el (tsE b)))))
 tsE (Do kw stmts) = Cons kw (List.concatMap tsE stmts)
-tsE (ESBind x arrow e) = Cons x (Cons arrow (tsE e))
+tsE (ESBind x arrow e) = List.append (tsP x) (Cons arrow (tsE e))
 tsE (ELet kw p ann eq e body) =
   Cons
     kw
@@ -2068,7 +2145,9 @@ tsE (ECatch kw b arrow body) =
 tsE (EWith kw e a x d body) =
   Cons
     kw
-    (List.append (tsE e) (Cons a (Cons x (Cons d (List.concatMap tsE body)))))
+    (List.append
+       (tsE e)
+       (Cons a (List.append (tsP x) (Cons d (List.concatMap tsE body)))))
 
 tsTF : TF -> List T
 tsTF (MkTF x cc ty Nothing) = Cons x (Cons cc (tsE ty))

@@ -3283,6 +3283,60 @@ sumElim sp scrutSyn tags casesChk =
                        18
                        ("cannot match against non-sum type " ^ tyStr e a))
 
+-- Binding a pattern
+--------------------------------------------------------------------------------
+
+-- (whether any of them holds, each run until one does)
+anyElab : List (Elab Bool) -> Elab Bool
+anyElab Nil = pure False
+anyElab (Cons m ms) = do
+  b <- m
+  if b then pure True else anyElab ms
+
+-- | whether the pattern `p` can fail to match a value of the type `a`,
+-- | where a pattern binds (`let p = e`, `p <- e`, `with e as p`, `\p ->
+-- | e`): a literal can; a tag can unless it is the only one of its type,
+-- | and its arguments' patterns cannot fail at theirs; a name cannot.
+-- | Where the type does not say (it is not known yet, or no sum), the
+-- | match itself finds what it leaves out
+patternCanFail : Value.Ty -> Presyntax.Pat -> Elab Bool
+patternCanFail a (At (PatVar _) _) = pure False
+patternCanFail a (At (PatAs _ _ p) _) = patternCanFail a p
+patternCanFail a0 (At (PatTag x _ ps) _) = do
+  a <- Meta.forceT a0
+  case Value.behavior a of
+    LikeSum vs -> case Dict.lookup vs x of
+      Just ts ->
+        if Dict.size vs > 1 then pure True
+        else anyElab
+            (List.zipWith
+               (\q t -> patternCanFail (Params.forceTh t) q)
+               ps
+               (Array.toList ts))
+      Nothing -> pure False
+    _ -> pure False
+patternCanFail a (At (PatInt _) _) = pure True
+patternCanFail a (At (PatFloat _) _) = pure True
+patternCanFail a (At (PatString _) _) = pure True
+patternCanFail a (At (PatRune _) _) = pure True
+patternCanFail a (At (PatBinary _) _) = pure True
+patternCanFail a _ = pure False
+
+-- | what a binding's pattern `p` takes apart, `s`: refused where `p` can
+-- | fail to match it
+bindingSyn : Presyntax.Pat -> Syn -> Syn
+bindingSyn p s =
+  MkSyn (\e -> do
+  pm <- runSyn s e
+  fails <- patternCanFail (snd pm) p
+  if fails
+    then failWithNote
+        (Params.spanOf p)
+        55
+        "the pattern can fail to match: a binding's pattern matches every value"
+        "take the value apart with `case`, or `if let`, which say what happens when it does not match"
+    else pure pm)
+
 -- | extension: a `case` of nested patterns is compiled
 -- | (`Clauses.caseTree`) into the matches above, on a name for the
 -- | scrutinee, bound once by a beta-redex; `lams` does not grow

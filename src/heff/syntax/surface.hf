@@ -1121,6 +1121,18 @@ listE sp xs =
     (At (ETag "Nil") sp)
     xs
 
+-- | `()`, `MkUnit`, and `(a, b, c)`, `MkPair a (MkPair b c)`
+tupleP : Params.Span -> List Presyntax.Pat -> Presyntax.Pat
+tupleP sp Nil = Presyntax.patTag "MkUnit" sp Nil
+tupleP sp (Cons p Nil) = p
+tupleP sp (Cons p (Cons q more)) =
+  At
+    (PatTag
+       "MkPair"
+       sp
+       [p, tupleP (Presyntax.spanning (Params.spanOf q) sp) (Cons q more)])
+    sp
+
 listP : Params.Span -> List Presyntax.Pat -> Presyntax.Pat
 listP sp xs =
   foldr
@@ -1245,30 +1257,64 @@ variantL r e = do
   e' <- r.e e
   pure (variantOf e')
 
--- | a lambda's binder, and where it starts
-type LamB = { binder : Presyntax.LamBinder Presyntax.Expr, span : Params.Span }
+-- | a lambda's binder, where it starts, and the pattern it takes its argument apart by,
+-- | if it is one (`\(a, b) -> e`: a name made for the argument)
+type LamB =
+  { binder : Presyntax.LamBinder Presyntax.Expr
+  , span : Params.Span
+  , pat : Maybe Presyntax.Pat
+  }
 
 lamBinderL : Lw -> CST.E -> P LamB
 lamBinderL r (BVar x) =
-  pure { binder = LamName x.text (spanT x), span = spanT x }
+  pure { binder = LamName x.text (spanT x), span = spanT x, pat = Nothing }
 lamBinderL r (BImp o x c) =
-  pure { binder = LamImplicit x.text (spanT x), span = spanTT o c }
+  pure
+    { binder = LamImplicit x.text (spanT x), span = spanTT o c, pat = Nothing }
 lamBinderL r (BAnn o x cc ty c) = do
   ty' <- r.e ty
   pure
       { binder = LamAnn x.text (spanT x) ty'
       , span = Presyntax.spanning (spanT x) (Params.spanOf ty')
+      , pat = Nothing
+      }
+lamBinderL r (BPat p) = do
+  p' <- r.pat p
+  -- (one name for every such argument: each is taken apart before
+  -- anything else is bound)
+  pure
+      { binder = LamName "pat#arg" (Params.spanOf p')
+      , span = Params.spanOf p'
+      , pat = Just p'
       }
 lamBinderL r e =
   throwP
     (diag (spanT (CST.firstE e)) ("unexpected `" ^ (CST.firstE e).text ^ "`"))
 
 lamBound : LamB -> List String
+lamBound { binder = LamName x _, pat = Just p } = Presyntax.patNames p
 lamBound { binder = LamName x _ } = Cons x Nil
 lamBound { binder = LamImplicit x _ } = Cons x Nil
 lamBound { binder = LamAnn x _ _ } = Cons x Nil
 
--- | `\x {y} _ -> e`
+-- | `x` bound to the pattern `p`, in `e`: `let p = x in e`
+bindPat : String
+        -> Params.Span
+        -> Presyntax.Pat
+        -> Presyntax.Expr
+        -> Presyntax.Expr
+bindPat x xsp p e =
+  At
+    (ELetIn (At (EVar x) xsp) (Presyntax.alt p e))
+    (Presyntax.spanning xsp (Params.spanOf e))
+
+-- | a lambda's body, under its binder (taking its argument apart, if a
+-- | pattern)
+lamBody : LamB -> Presyntax.Expr -> Presyntax.Expr
+lamBody { binder = LamName x xsp, pat = Just p } e = bindPat x xsp p e
+lamBody b e = e
+
+-- | `\x {y} _ (a, b) -> e`
 lambdaL : Lw -> List CST.E -> CST.E -> P Presyntax.Expr
 lambdaL r binders body = do
   bs <- traverseS (\b -> lamBinderL r b) binders
@@ -1278,7 +1324,7 @@ lambdaL r binders body = do
         (foldr
            (\(b : LamB) e ->
               At
-                (ELam b.binder e)
+                (ELam b.binder (lamBody b e))
                 (Presyntax.spanning b.span (Params.spanOf e)))
            body'
            bs))
@@ -1359,13 +1405,22 @@ letL r e =
 -- | a statement of a `do` block: `x <- e` (`x` bound in the statements
 -- | after it), `let p = e` (`p`'s variables bound in them), or `e`
 stmtL : Lw -> CST.E -> P (Params.Spanned (Presyntax.Stmt Presyntax.Expr))
-stmtL r (ESBind x arrow e) = do
+stmtL r (ESBind (PAtom x) arrow e) = do
   e' <- r.e e
   pModify (\s -> setScope (Cons x.text s.scope) s)
   pure
       (At
          (StmtBind x.text (spanT x) e')
          (Presyntax.spanning (spanT x) (Params.spanOf e')))
+-- (`p <- e` is `let p = (<- e)`)
+stmtL r (ESBind p arrow e) = do
+  e' <- r.e e
+  p' <- r.pat p
+  pModify (\s -> setScope (appendS (boundBy Nil p) s.scope) s)
+  pure
+      (At
+         (StmtLet p' (At (ENest e') (Params.spanOf e')))
+         (Presyntax.spanning (Params.spanOf p') (Params.spanOf e')))
 stmtL r (ELet kw p ann0 eq e Nothing) = do
   h <- letHeadL r p ann0 e
   pModify (\s -> setScope (appendS (boundBy Nil p) s.scope) s)
@@ -1979,11 +2034,7 @@ exprL r (Tup o es commas c) =
     pure (listE (spanTT o c) es')
   else do
     es' <- traverseS r.e es
-    pure
-        (At
-           (EInvalid
-              "heff has no tuples: a record holds values together, `{ x = a, y = b }`")
-           (spanTT o c))
+    pure (At (ETuple es') (spanTT o c))
 exprL r (Braces o fs commas c) = bracesL r o fs c
 exprL r (Update o rec bar fs commas c) = do
   rec' <- r.e rec
@@ -2027,10 +2078,27 @@ exprL r e0@(ETry kw ty body c) = do
   body' <- block (\m -> stmtL r m) body
   c' <- catchL r c
   pure (At (ETry (MkTry ty' body' c')) (spanTE kw (CST.lastE e0).end))
-exprL r e0@(EWith kw e a x d body) = do
+exprL r e0@(EWith kw e a (PAtom x) d body) = do
   e' <- r.e e
   body' <- withScope [x.text] (block (\m -> stmtL r m) body)
   pure (At (EWith e' x.text (spanT x) body') (spanTE kw (CST.lastE e0).end))
+-- (`with e as p do ss`: `with e as x do let p = x; ss`)
+exprL r e0@(EWith kw e a p d body) = do
+  e' <- r.e e
+  p' <- r.pat p
+  body' <- withScope (boundBy Nil p) (block (\m -> stmtL r m) body)
+  pure
+      (At
+         (EWith
+            e'
+            "with#arg"
+            (Params.spanOf p')
+            (Cons
+               (At
+                  (StmtLet p' (At (EVar "with#arg") (Params.spanOf p')))
+                  (Params.spanOf p'))
+               body'))
+         (spanTE kw (CST.lastE e0).end))
 exprL r (If kw c th a el b) = do
   c' <- r.e c
   a' <- r.e a
@@ -2114,6 +2182,10 @@ patL r (PList o ps commas c) =
   then do
     segs <- patSegmentsL r ps
     pure (At (PatBinary segs) (spanTT o c))
+  else if strEq o.text "("
+  then do
+    ps' <- traverseS r.pat ps
+    pure (tupleP (spanTT o c) ps')
   else do
     ps' <- traverseS r.pat ps
     pure (listP (spanTT o c) ps')
