@@ -21,9 +21,8 @@ the host beside the effect's module.
 - `std.reference` and `std.time` have both a C and a JavaScript
   provider.
 - `lib/browser/`'s are the browser's, JavaScript only: `browser.dom`,
-  `browser.http`, and `browser.js`, which has only a type.
-- `gpu` has a WebGPU provider in JavaScript. Where the browser has no
-  WebGPU, `open` gives `Left`.
+  `browser.http`, `browser.gpu` (WebGPU's; where the browser has no
+  WebGPU, `open` gives `Left`), and `browser.js`, which has only a type.
 
 A JavaScript provider that only runs in a page says so:
 `export const $host = "page"`.

@@ -55,10 +55,10 @@ API's client over it; see [Network](network.md#an-api-between-programs).
 `browser.js` has `JSString`, JavaScript's UTF-16 text: see
 [Providers](../providers.md#jsstring).
 
-## gpu
+## browser.gpu
 
-`gpu`, imported as `Gpu`, is a GPU. Its provider is WebGPU's, so it runs
-in pages, and kernels are WGSL. A browser without WebGPU throws a
+`browser.gpu`, imported as `Gpu`, is a GPU. Its provider is WebGPU's, so
+it runs in pages, and kernels are WGSL. A browser without WebGPU throws a
 `GpuError` at `withDevice`.
 
 | Function | What it does |
@@ -71,13 +71,13 @@ in pages, and kernels are WGSL. A browser without WebGPU throws a
 
 Each answer is an `Either GpuError a`, given when the GPU is done.
 
-`gpu.canvas`'s `present d canvas px w h` shows a buffer as RGBA pixels on
-a `<canvas>` that `browser.dom` found.
+`browser.gpu.canvas`'s `present d canvas px w h` shows a buffer as RGBA
+pixels on a `<canvas>` that `browser.dom` found.
 
 ### Kernels in heff
 
-A kernel is written in heff with `gpu.kernel`'s combinators, not as WGSL
-text:
+A kernel is written in heff with `browser.gpu.kernel`'s combinators, not
+as WGSL text:
 
 - an expression is an `Exp a`, `a` a `Float32`, `Int32`, `UInt32` or
   `Bool`, built with the prelude's operators and `lit`, `lessThan`,
@@ -90,9 +90,10 @@ text:
   body.
 
 A kernel has no functions, recursion or allocation: heff functions in a
-body run as the kernel is built, and leave straight code. `gpu.wgsl`'s
-`source3 k` prints the WGSL. `gpu.run`'s `run3 d k n x y z` runs a kernel
-over `n` invocations, with typed buffers from `withTyped`.
+body run as the kernel is built, and leave straight code.
+`browser.gpu.wgsl`'s `source3 k` prints the WGSL. `browser.gpu.run`'s
+`run3 d k n x y z` runs a kernel over `n` invocations, with typed buffers
+from `withTyped`.
 
 `examples/pages/` has `vecadd`, adding two vectors on the GPU, and
 `pixels`, drawing a gradient.

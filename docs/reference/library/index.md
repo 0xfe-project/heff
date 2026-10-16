@@ -41,7 +41,7 @@ out by a provider: JavaScript and C code beside its module. See
 | concurrency (unstable) | `green`, `std.reactor`, `std.thread`, `std.place` | [Concurrency](concurrency.md) |
 | the terminal | `std.terminal`, `std.terminal.widget`, `std.cli.interactive` | [Terminal](terminal.md) |
 | data formats | `wire`, `json` | [Wire and JSON](formats.md) |
-| the browser | `browser.dom`, `browser.http`, `gpu` | [Browser and GPU](browser.md) |
+| the browser | `browser.dom`, `browser.http`, `browser.gpu` | [Browser and GPU](browser.md) |
 | tests | `check`, `generator`, `bench` | [Tests](../tests.md), [Benchmarks](../benchmarks.md) |
 | projects | `manifest` | [Projects](../projects.md) |
 | providers | `ffi` | [Providers](../providers.md) |
