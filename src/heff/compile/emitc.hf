@@ -47,6 +47,7 @@ import heff.elab.globals as Globals
 import heff.compile.ir as IR
 import heff.compile.irtext as IRText
 import heff.compile.lower as Lower
+import heff.compile.owned as Owned
 import heff.compile.prims as Prims
 import heff.compile.ranges as Ranges
 import heff.compile.refcount as RefCount
@@ -930,60 +931,15 @@ updateText suffix x shape keep flats n vs changed =
 -- Lent operands
 --------------------------------------------------------------------------------
 
--- | the primitives that only read their operands, each with a `_lent`
--- | form in the runtime: given a mask of the operands given it, the
--- | others lent -- a string's or an array's (as borrowing has them), and
--- | an integer comparison
-lendingPrims : List String
-lendingPrims = List.append Borrow.lendingPrims ["intEq", "intLt", "intLe"]
-
--- (computed of words alone -- variables, literals, operations on words
--- (#79) -- so taking nothing)
-wordOnly : RefCount.Value -> Bool
-wordOnly (RLocal _) = True
-wordOnly (RFixU _ _) = True
-wordOnly (RPrimU p es) = Ranges.isWordPrim p && List.all wordOnly es
-wordOnly _ = False
-
--- (an operand that takes nothing another is given: a variable, a
--- reference taken of one, a literal, a word boxed)
-plainOperand : RefCount.Value -> Bool
-plainOperand (RLocal _) = True
-plainOperand (RDup _) = True
-plainOperand (RInt _) = True
-plainOperand (RStr _) = True
-plainOperand (RNTag _) = True
-plainOperand (RBox RepInt e) = wordOnly e
-plainOperand _ = False
-
-givesUp : String -> RefCount.Value -> Bool
-givesUp x (RLocal y) = strEq x y
-givesUp x _ = False
-
--- (an operand lent: a reference taken of a variable, which the variable
--- holds through the call, as no operand gives it up)
-lentOperand : List RefCount.Value -> RefCount.Value -> Bool
-lentOperand es (RDup x) = not (List.any (givesUp x) es)
-lentOperand es _ = False
-
--- | whether a primitive's call lends an operand: one of `lendingPrims`,
--- | its operands plain (none computed, which might give up what is lent
--- | before it is read), one of them lent
-lends : String -> List RefCount.Value -> Bool
-lends p es =
-  elemS p lendingPrims
-  && List.all plainOperand es
-  && List.any (lentOperand es) es
-
 -- (the mask of the operands given, from the one of `bit` on)
 givenMask : List RefCount.Value -> List RefCount.Value -> Int -> Int
 givenMask es Nil bit = 0
 givenMask es (Cons e rest) bit =
-  (if lentOperand es e then 0 else bit) + givenMask es rest (bit * 2)
+  (if Owned.lentOperand es e then 0 else bit) + givenMask es rest (bit * 2)
 
 -- (an operand as the `_lent` form takes it: lent, the variable itself)
 asLent : List RefCount.Value -> RefCount.Value -> RefCount.Value
-asLent es (RDup x) = if lentOperand es (RDup x) then RLocal x else RDup x
+asLent es (RDup x) = if Owned.lentOperand es (RDup x) then RLocal x else RDup x
 asLent es e = e
 
 -- | a call of a primitive's `_lent` form (`suffix` after its name: `_c`
@@ -1007,7 +963,7 @@ testC : CK -> RefCount.Test -> C String
 testC k CondTrue = pure "1"
 testC k CondFalse = pure "0"
 testC k (CondRel p es) =
-  if lends p es then lentPrimC k p "_c" es
+  if Owned.lends p es then lentPrimC k p "_c" es
   else bind
       (traverseC k.exp es)
       (\vs -> pure (primName p ^ "_c(" ^ joinWith ", " vs ^ ")"))
@@ -1136,7 +1092,7 @@ expF k (RTakeField x i) =
 expF k (RGetLabel e l) = wrapC k "heff_get(" (", " ^ lblName l ^ ")") e
 expF k (RPrimFn p) = primLit p
 expF k (RPrim p es) =
-  if lends p es then lentPrimC k p "" es
+  if Owned.lends p es then lentPrimC k p "" es
   else bind
       (traverseC k.exp es)
       (\vs -> pure (primName p ^ "(" ^ joinWith ", " vs ^ ")"))
@@ -1159,7 +1115,7 @@ expF k (RUnbox r e) = wrapC k ("heff_unbox_" ^ reprSuffix r ^ "(") ")" e
 expF k (RPeek r e) = wrapC k ("heff_peek_" ^ reprSuffix r ^ "(") ")" e
 expF k (RPrimU p es) = bind (traverseC k.exp es) (\vs -> pure (primU p vs))
 expF k (RPrimAt p r es) =
-  if lends p es then lentPrimC k p ("_" ^ reprSuffix r) es
+  if Owned.lends p es then lentPrimC k p ("_" ^ reprSuffix r) es
   else bind
       (traverseC k.exp es)
       (\vs ->

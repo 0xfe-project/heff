@@ -3164,6 +3164,67 @@ HEFF_ARR_SET(i8, int8_t, HEFF_ARR_I8)
 HEFF_ARR_SET(u8, uint8_t, HEFF_ARR_U8)
 HEFF_ARR_SET(f32, float, HEFF_ARR_F32)
 
+// A loop that threads an array through `set`, using it only so, checks
+// it held only there once, where it is entered (`heff_arrayOwn_f64`):
+// a copy where it is not, its elements kept as the loop's `set`s give
+// them; held only there, it stays so through the loop, and each `set`
+// writes in place, unchecked (`heff_arraySetOwned_f64`) -- the array the
+// same each round, which C can then see.
+
+// (a copy of the array, its elements kept as `kind` says: `a` counted
+// down)
+HEFF_FN __attribute__((noinline)) V heff_arr_own_slow(V a, unsigned kind) {
+  Arr *r = (Arr *)a;
+  Arr *s = heff_arr_alloc(r->n, kind);
+  heff_arr_move(s, 0, r, 0, r->n);
+  heff_drop(a);
+  return (V)s;
+}
+
+// (the array held only here: it, or a copy of it)
+HEFF_FAST V heff_arrayOwn(V a) {
+  if (HEFF_LIKELY(heff_unique(a))) return a;
+  return (V)heff_arr_copy(a);
+}
+
+// (`x` at `i` of an array held only here: out of range, the array as it
+// is)
+HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
+  Arr *r = (Arr *)a;
+  if (!HEFF_LIKELY(heff_arr_in(r, i))) {
+    heff_drop(i);
+    heff_drop(x);
+    return a;
+  }
+  int64_t k = INT_OF(i);
+  if (r->h.tag == HEFF_ARR_V) heff_drop(r->a[k]);
+  heff_arr_put(r, k, x);
+  return a;
+}
+
+// (... keeping its elements as `T`s, where the program knows them so)
+#define HEFF_ARR_OWN(S, T, K)                                                  \
+  HEFF_FAST V heff_arrayOwn_##S(V a) {                                         \
+    if (HEFF_LIKELY(heff_arr_mine((Arr *)a, K))) return a;                     \
+    return heff_arr_own_slow(a, K);                                            \
+  }                                                                            \
+  HEFF_FAST V heff_arraySetOwned_##S(V a, V i, T x) {                          \
+    Arr *r = (Arr *)a;                                                         \
+    if (HEFF_LIKELY(heff_arr_in(r, i))) HEFF_ARR_AT(r, T)[INT_OF(i)] = x;      \
+    else heff_drop(i);                                                         \
+    return a;                                                                  \
+  }
+HEFF_ARR_OWN(f64, double, HEFF_ARR_F64)
+HEFF_ARR_OWN(i64, int64_t, HEFF_ARR_I64)
+HEFF_ARR_OWN(u64, uint64_t, HEFF_ARR_U64)
+HEFF_ARR_OWN(i32, int32_t, HEFF_ARR_I32)
+HEFF_ARR_OWN(u32, uint32_t, HEFF_ARR_U32)
+HEFF_ARR_OWN(i16, int16_t, HEFF_ARR_I16)
+HEFF_ARR_OWN(u16, uint16_t, HEFF_ARR_U16)
+HEFF_ARR_OWN(i8, int8_t, HEFF_ARR_I8)
+HEFF_ARR_OWN(u8, uint8_t, HEFF_ARR_U8)
+HEFF_ARR_OWN(f32, float, HEFF_ARR_F32)
+
 // (`n` elements, each `x`: of `V`s, counted once for each -- flat if
 // `x` is a `Float64`)
 HEFF_FN V heff_arrayReplicate(V n, V x) {

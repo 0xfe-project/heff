@@ -1,0 +1,474 @@
+-- Arrays a loop holds alone (#102), for the C backend: a function going
+-- round a loop (`CLoop`) that threads an array through `set` checks, at
+-- each `set`, that the array is held only there and keeps its elements
+-- as the element given -- and copies it if not -- so that the array is
+-- another each round, as far as C can tell, and no loop of it is made
+-- vector operations.  But an array held only here stays so for as long
+-- as nothing takes another reference to it: so where the loop's parameter
+-- is used only so -- given up to a `set`, whose array is given round the
+-- loop again; read, lent; given up otherwise, its path leaving the loop
+-- -- the check is made once, where the function is entered
+-- (`heff_arrayOwn_f64`, copying it there if it must), and each `set` of
+-- it writes in place, unchecked (`heff_arraySetOwned_f64`).
+--
+-- What may hold it is told of the references counted: the parameter,
+-- and each variable bound or set only to it or to it set ("the chain"),
+-- each given up to a `set` or to the loop at its place, read where a
+-- primitive lends it (`lends`, as the emitter prints it), dropped, or
+-- given up to anything else -- never a reference taken of it, nor lent
+-- to a call.  A loop that sets it nowhere is left as it is: the check
+-- would copy a shared array the loop only reads.  The price: one that
+-- may set it, entered with a shared array, copies it even where it then
+-- sets nothing.
+
+module heff.compile.owned
+
+import heff.compile.borrow as Borrow
+import heff.compile.ranges as Ranges
+import heff.compile.refcount as RefCount
+import heff.compile.repr as Repr
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+-- Lent operands
+--------------------------------------------------------------------------------
+
+-- | the primitives that only read their operands, each with a `_lent`
+-- | form in the runtime: given a mask of the operands given it, the
+-- | others lent -- a string's or an array's (as borrowing has them), and
+-- | an integer comparison
+lendingPrims : List String
+lendingPrims = List.append Borrow.lendingPrims ["intEq", "intLt", "intLe"]
+
+-- (computed of words alone -- variables, literals, operations on words
+-- (#79) -- so taking nothing)
+wordOnly : RefCount.Value -> Bool
+wordOnly (RLocal _) = True
+wordOnly (RFixU _ _) = True
+wordOnly (RPrimU p es) = Ranges.isWordPrim p && List.all wordOnly es
+wordOnly _ = False
+
+-- (an operand that takes nothing another is given: a variable, a
+-- reference taken of one, a literal, a word boxed)
+plainOperand : RefCount.Value -> Bool
+plainOperand (RLocal _) = True
+plainOperand (RDup _) = True
+plainOperand (RInt _) = True
+plainOperand (RStr _) = True
+plainOperand (RNTag _) = True
+plainOperand (RBox RepInt e) = wordOnly e
+plainOperand _ = False
+
+givesUp : String -> RefCount.Value -> Bool
+givesUp x (RLocal y) = strEq x y
+givesUp x _ = False
+
+-- | an operand lent: a reference taken of a variable, which the variable
+-- | holds through the call, as no operand gives it up
+lentOperand : List RefCount.Value -> RefCount.Value -> Bool
+lentOperand es (RDup x) = not (List.any (givesUp x) es)
+lentOperand es _ = False
+
+-- | whether a primitive's call lends an operand: one of `lendingPrims`,
+-- | its operands plain (none computed, which might give up what is lent
+-- | before it is read), one of them lent
+lends : String -> List RefCount.Value -> Bool
+lends p es =
+  elemS p lendingPrims
+  && List.all plainOperand es
+  && List.any (lentOperand es) es
+
+-- What a value is made of
+--------------------------------------------------------------------------------
+
+-- (the values a condition is made of)
+condKids : RefCount.Test -> List RefCount.Value
+condKids (CondRel _ es) = es
+condKids (CondRelU _ es) = es
+condKids (CondBool e) = Cons e Nil
+condKids (CondNot c) = condKids c
+condKids (CondIf a b c) =
+  List.append (condKids a) (List.append (condKids b) (condKids c))
+condKids (CondLet _ e c _) = Cons e (condKids c)
+condKids _ = Nil
+
+argKids : RefCount.Operand -> List RefCount.Value
+argKids (Given e) = Cons e Nil
+argKids (GivenU _ e) = Cons e Nil
+argKids (LentValue e) = Cons e Nil
+argKids (LentVar _ _) = Nil
+
+-- | the values a value is made of (a lambda's: what its closure holds,
+-- | not its body)
+kids : RefCount.Value -> List RefCount.Value
+kids (RTag _ _ es) = es
+kids (RTagIn e _ _ es) = Cons e es
+kids (RRec _ _ es) = es
+kids (RRecIn _ _ _ _ _ _ fs _) = List.map snd fs
+kids (RField e _) = Cons e Nil
+kids (RDupE e) = Cons e Nil
+kids (RFieldV e _) = Cons e Nil
+kids (RGetN e _ _) = Cons e Nil
+kids (RFieldU _ _ e _) = Cons e Nil
+kids (RGetNU _ _ e _ _) = Cons e Nil
+kids (RWord _ e) = Cons e Nil
+kids (RGetLabel e _) = Cons e Nil
+kids (RPrim _ es) = es
+kids (RLam _ _ held _) = held
+kids (RCall _ _ _ args) = List.concatMap argKids args
+kids (RApply f es) = Cons f es
+kids (RBool c) = condKids c
+kids (RBox _ e) = Cons e Nil
+kids (RUnbox _ e) = Cons e Nil
+kids (RPeek _ e) = Cons e Nil
+kids (RPrimU _ es) = es
+kids (RPrimAt _ _ es) = es
+kids _ = Nil
+
+-- (the variable a value is, given up)
+localOf : RefCount.Value -> Maybe String
+localOf (RLocal a) = Just a
+localOf _ = Nothing
+
+firstLocal : List RefCount.Value -> Maybe String
+firstLocal (Cons e _) = localOf e
+firstLocal Nil = Nothing
+
+-- | the array a `set` is of, a variable given up to it
+setOf : RefCount.Value -> Maybe String
+setOf (RPrimAt p _ es) = if strEq p "arraySet" then firstLocal es else Nothing
+setOf (RPrim p es) = if strEq p "arraySet" then firstLocal es else Nothing
+setOf _ = Nothing
+
+-- (the variable a value holds the array of: itself given up, or set)
+heldOf : RefCount.Value -> Maybe String
+heldOf (RLocal a) = Just a
+heldOf e = setOf e
+
+heldIn : List String -> Maybe RefCount.Value -> Bool
+heldIn us (Just e) = maybe False (\a -> elemS a us) (heldOf e)
+heldIn us Nothing = False
+
+-- The chain
+--------------------------------------------------------------------------------
+
+-- (each variable bound or set, and to what, in front of `acc`: not in a
+-- lambda's body)
+defsSt : (List (Pair String RefCount.Value)
+          -> List RefCount.Statement
+          -> List (Pair String RefCount.Value))
+       -> List (Pair String RefCount.Value)
+       -> RefCount.Statement
+       -> List (Pair String RefCount.Value)
+defsSt go acc (CLet x e) = Cons (MkPair x e) acc
+defsSt go acc (CSet x e) = Cons (MkPair x e) acc
+defsSt go acc (CIf _ a b) = go (go acc a) b
+defsSt go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (RefCount.caseArmBody arm)) acc arms
+defsSt go acc s = acc
+
+defsOf : List (Pair String RefCount.Value)
+       -> List RefCount.Statement
+       -> List (Pair String RefCount.Value)
+defsOf acc ss = List.foldl (defsSt defsOf) acc ss
+
+valuesOf : String -> List (Pair String RefCount.Value) -> List RefCount.Value
+valuesOf x ds = List.map snd (List.keepIf (\d -> strEq x (fst d)) ds)
+
+-- (whether every value `x` is bound or set to holds one of `us`)
+heldBy : List String -> List (Pair String RefCount.Value) -> String -> Bool
+heldBy us ds x =
+  let vs = valuesOf x ds
+  in not (List.null vs) && List.all (\v -> heldIn us (Just v)) vs
+
+-- | the chain of `us`: each variable bound or set only to one of them,
+-- | or to one of them set, until none is
+chain : List (Pair String RefCount.Value) -> List String -> List String
+chain ds us =
+  let more =
+    List.keepIf
+      (\x -> not (elemS x us) && heldBy us ds x)
+      (List.map fst ds)
+  in if List.null more then us else chain ds (List.append more us)
+
+-- What is done with it
+--------------------------------------------------------------------------------
+
+-- (a primitive's operands, each as `ok` says or lent)
+okOperands : (RefCount.Value -> Bool) -> String -> List RefCount.Value -> Bool
+okOperands ok p es =
+  if lends p es then List.all (\e -> lentOperand es e || ok e) es
+  else List.all ok es
+
+okCond : (RefCount.Value -> Bool) -> RefCount.Test -> Bool
+okCond ok (CondRel p es) = okOperands ok p es
+okCond ok (CondNot c) = okCond ok c
+okCond ok (CondIf a b c) = okCond ok a && okCond ok b && okCond ok c
+okCond ok (CondLet _ e c _) = ok e && okCond ok c
+okCond ok c = List.all ok (condKids c)
+
+okArg : (RefCount.Value -> Bool) -> List String -> RefCount.Operand -> Bool
+okArg ok us (LentVar x _) = not (elemS x us)
+okArg ok us a = List.all ok (argKids a)
+
+-- | whether a value takes no reference to the chain `us`, nor lends one
+-- | to a call (`go`: a lambda's body, so)
+okExp : (List RefCount.Statement -> Bool)
+      -> List String
+      -> RefCount.Value
+      -> Bool
+okExp go us (RDup x) = not (elemS x us)
+okExp go us (RDupE e) =
+  not (maybe False (\a -> elemS a us) (localOf e)) && okExp go us e
+okExp go us (RPrim p es) = okOperands (okExp go us) p es
+okExp go us (RPrimAt p _ es) = okOperands (okExp go us) p es
+okExp go us (RCall _ _ _ args) = List.all (okArg (okExp go us) us) args
+okExp go us (RBool c) = okCond (okExp go us) c
+okExp go us (RLam _ _ held (MkCode body)) =
+  List.all (okExp go us) held && go body
+okExp go us e = List.all (okExp go us) (kids e)
+
+-- (the loop again, the chain given at `j`)
+okLoop : (RefCount.Value -> Bool)
+       -> List String
+       -> Int
+       -> List RefCount.Value
+       -> Bool
+okLoop ok us j es = heldIn us (RefCount.nthValue j es) && List.all ok es
+
+okSt : (List RefCount.Statement -> Bool)
+     -> List String
+     -> Int
+     -> RefCount.Statement
+     -> Bool
+okSt go us j (CLet _ e) = okExp go us e
+okSt go us j (CSet _ e) = okExp go us e
+okSt go us j (CIf c a b) = okCond (okExp go us) c && go a && go b
+okSt go us j (CSwitch e arms _) =
+  okExp go us e && List.all (\arm -> go (RefCount.caseArmBody arm)) arms
+okSt go us j (CReturn e) = okExp go us e
+okSt go us j (CInPlace f es) = List.all (okExp go us) (Cons f es)
+okSt go us j (CRoomed f es) = List.all (okExp go us) (Cons f es)
+okSt go us j (CTail f es) = List.all (okExp go us) (Cons f es)
+okSt go us j (CLoop _ es) = okLoop (okExp go us) us j es
+okSt go us j (CLoopTo _ _ es) = okLoop (okExp go us) us j es
+okSt go us j (CJump _ _ es) = List.all (okExp go us) es
+okSt go us j s = True
+
+-- | whether statements hold the chain `us` alone, each loop given it at
+-- | `j`
+okStmts : List String -> Int -> List RefCount.Statement -> Bool
+okStmts us j ss = List.all (okSt (okStmts us j) us j) ss
+
+-- (whether a statement goes round the loop, in front of `acc`)
+loopsSt : (Bool -> List RefCount.Statement -> Bool)
+        -> Bool
+        -> RefCount.Statement
+        -> Bool
+loopsSt go acc (CLoop _ _) = True
+loopsSt go acc (CLoopTo _ _ _) = True
+loopsSt go acc (CIf _ a b) = go (go acc a) b
+loopsSt go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (RefCount.caseArmBody arm)) acc arms
+loopsSt go acc s = acc
+
+loops : Bool -> List RefCount.Statement -> Bool
+loops acc ss = List.foldl (loopsSt loops) acc ss
+
+-- The sets
+--------------------------------------------------------------------------------
+
+-- (the repr a `set` of the chain gives its element as)
+setRepr : List String -> RefCount.Value -> List Repr.Repr
+setRepr us (RPrimAt p r es) =
+  if heldIn us (Just (RPrimAt p r es)) && strEq p "arraySet" then Cons r Nil
+  else Nil
+setRepr us (RPrim p es) =
+  if heldIn us (Just (RPrim p es)) && strEq p "arraySet" then Cons RepV Nil
+  else Nil
+setRepr us e = Nil
+
+-- | the reprs of the chain's `set`s in a value (not in a lambda's body)
+setsIn : List String -> RefCount.Value -> List Repr.Repr
+setsIn us e = List.append (setRepr us e) (List.concatMap (setsIn us) (kids e))
+
+setsSt : (List RefCount.Statement -> List Repr.Repr)
+       -> List String
+       -> RefCount.Statement
+       -> List Repr.Repr
+setsSt go us (CIf c a b) =
+  List.append
+    (List.concatMap (setsIn us) (condKids c))
+    (List.append (go a) (go b))
+setsSt go us (CSwitch e arms _) =
+  List.append
+    (setsIn us e)
+    (List.concatMap (\arm -> go (RefCount.caseArmBody arm)) arms)
+setsSt go us (CLet _ e) = setsIn us e
+setsSt go us (CSet _ e) = setsIn us e
+setsSt go us (CReturn e) = setsIn us e
+setsSt go us (CInPlace f es) = List.concatMap (setsIn us) (Cons f es)
+setsSt go us (CRoomed f es) = List.concatMap (setsIn us) (Cons f es)
+setsSt go us (CTail f es) = List.concatMap (setsIn us) (Cons f es)
+setsSt go us (CLoop _ es) = List.concatMap (setsIn us) es
+setsSt go us (CLoopTo _ _ es) = List.concatMap (setsIn us) es
+setsSt go us (CJump _ _ es) = List.concatMap (setsIn us) es
+setsSt go us s = Nil
+
+setsOf : List String -> List RefCount.Statement -> List Repr.Repr
+setsOf us ss = List.concatMap (setsSt (setsOf us) us) ss
+
+-- (the one repr of them all, if there is one)
+oneRepr : List Repr.Repr -> Maybe Repr.Repr
+oneRepr (Cons r rs) = if List.all (Repr.reprEq r) rs then Just r else Nothing
+oneRepr Nil = Nothing
+
+-- Written in place
+--------------------------------------------------------------------------------
+
+-- (a primitive of the chain's: its `set` made one in place, unchecked)
+ownedPrim : List String -> String -> List RefCount.Value -> String
+ownedPrim us p es =
+  if strEq p "arraySet" && heldIn us (Just (RPrim p es)) then "arraySetOwned"
+  else p
+
+mapCond : (RefCount.Value -> RefCount.Value) -> RefCount.Test -> RefCount.Test
+mapCond f (CondRel p es) = CondRel p (List.map f es)
+mapCond f (CondRelU p es) = CondRelU p (List.map f es)
+mapCond f (CondBool e) = CondBool (f e)
+mapCond f (CondNot c) = CondNot (mapCond f c)
+mapCond f (CondIf a b c) = CondIf (mapCond f a) (mapCond f b) (mapCond f c)
+mapCond f (CondLet x e c ds) = CondLet x (f e) (mapCond f c) ds
+mapCond f c = c
+
+mapArg : (RefCount.Value -> RefCount.Value)
+       -> RefCount.Operand
+       -> RefCount.Operand
+mapArg f (Given e) = Given (f e)
+mapArg f (GivenU r e) = GivenU r (f e)
+mapArg f (LentValue e) = LentValue (f e)
+mapArg f a = a
+
+-- | a value, the chain's `set`s in it made in place (not in a lambda's
+-- | body, where the array is the closure's)
+ownExp : List String -> RefCount.Value -> RefCount.Value
+ownExp us (RTag t b es) = RTag t b (List.map (ownExp us) es)
+ownExp us (RTagIn e t b es) = RTagIn (ownExp us e) t b (List.map (ownExp us) es)
+ownExp us (RRec ls b es) = RRec ls b (List.map (ownExp us) es)
+ownExp us (RRecIn x n k f s ls fs sure) =
+  RRecIn
+    x
+    n
+    k
+    f
+    s
+    ls
+    (List.map (\p -> MkPair (fst p) (ownExp us (snd p))) fs)
+    sure
+ownExp us (RField e i) = RField (ownExp us e) i
+ownExp us (RDupE e) = RDupE (ownExp us e)
+ownExp us (RFieldV e i) = RFieldV (ownExp us e) i
+ownExp us (RGetN e i n) = RGetN (ownExp us e) i n
+ownExp us (RFieldU r s e i) = RFieldU r s (ownExp us e) i
+ownExp us (RGetNU r s e i n) = RGetNU r s (ownExp us e) i n
+ownExp us (RWord r e) = RWord r (ownExp us e)
+ownExp us (RGetLabel e l) = RGetLabel (ownExp us e) l
+ownExp us (RPrim p es) = RPrim (ownedPrim us p es) (List.map (ownExp us) es)
+ownExp us (RPrimAt p r es) =
+  RPrimAt (ownedPrim us p es) r (List.map (ownExp us) es)
+ownExp us (RLam xs fv held body) = RLam xs fv (List.map (ownExp us) held) body
+ownExp us (RCall g tr w args) =
+  RCall g tr w (List.map (mapArg (ownExp us)) args)
+ownExp us (RApply f es) = RApply (ownExp us f) (List.map (ownExp us) es)
+ownExp us (RBool c) = RBool (mapCond (ownExp us) c)
+ownExp us (RBox r e) = RBox r (ownExp us e)
+ownExp us (RUnbox r e) = RUnbox r (ownExp us e)
+ownExp us (RPeek r e) = RPeek r (ownExp us e)
+ownExp us (RPrimU p es) = RPrimU p (List.map (ownExp us) es)
+ownExp us e = e
+
+ownArm : (List RefCount.Statement -> List RefCount.Statement)
+       -> RefCount.CaseArm
+       -> RefCount.CaseArm
+ownArm go (MkCArm t fs fl su pl tk body lv) =
+  MkCArm t fs fl su pl tk (go body) lv
+
+ownSt : (List RefCount.Statement -> List RefCount.Statement)
+      -> List String
+      -> RefCount.Statement
+      -> RefCount.Statement
+ownSt go us (CLet x e) = CLet x (ownExp us e)
+ownSt go us (CSet x e) = CSet x (ownExp us e)
+ownSt go us (CIf c a b) = CIf (mapCond (ownExp us) c) (go a) (go b)
+ownSt go us (CSwitch e arms r) =
+  CSwitch (ownExp us e) (List.map (ownArm go) arms) r
+ownSt go us (CReturn e) = CReturn (ownExp us e)
+ownSt go us (CInPlace f es) = CInPlace (ownExp us f) (List.map (ownExp us) es)
+ownSt go us (CRoomed f es) = CRoomed (ownExp us f) (List.map (ownExp us) es)
+ownSt go us (CTail f es) = CTail (ownExp us f) (List.map (ownExp us) es)
+ownSt go us (CLoop ps es) = CLoop ps (List.map (ownExp us) es)
+ownSt go us (CLoopTo t ps es) = CLoopTo t ps (List.map (ownExp us) es)
+ownSt go us (CJump g w es) = CJump g w (List.map (ownExp us) es)
+ownSt go us s = s
+
+ownStmts : List String -> List RefCount.Statement -> List RefCount.Statement
+ownStmts us ss = List.map (ownSt (ownStmts us) us) ss
+
+-- The function
+--------------------------------------------------------------------------------
+
+-- (the check, where the function is entered: the array held only here,
+-- keeping its elements as `r` says, a copy if it was not)
+ownCheck : String -> Repr.Repr -> RefCount.Statement
+ownCheck x RepV = CSet x (RPrim "arrayOwn" (Cons (RLocal x) Nil))
+ownCheck x r = CSet x (RPrimAt "arrayOwn" r (Cons (RLocal x) Nil))
+
+-- (the function, its parameter `x`, at `j`, held alone if it may be,
+-- the chain of it being `us` and the reprs of its sets `rs`)
+ownedWith : RefCount.Fun
+          -> String
+          -> List String
+          -> Maybe Repr.Repr
+          -> RefCount.Fun
+ownedWith f x us (Just r) =
+  { key = f.key
+  , params = f.params
+  , lent = f.lent
+  , entry = List.append f.entry (Cons (ownCheck x r) Nil)
+  , body = ownStmts us f.body
+  , reprs = f.reprs
+  , ret = f.ret
+  , wrapper = f.wrapper
+  }
+ownedWith f x us Nothing = f
+
+ownedChain : RefCount.Fun -> Int -> String -> List String -> RefCount.Fun
+ownedChain f j x us =
+  if okStmts us j f.body then ownedWith f x us (oneRepr (setsOf us f.body))
+  else f
+
+-- (the parameter at `j`, `x`: a `V` the function is given)
+ownedAt : RefCount.Fun -> Pair String Int -> RefCount.Fun
+ownedAt f (MkPair x j) =
+  if Repr.isBoxed (Repr.reprOf f.reprs x) && not (RefCount.elemI j f.lent)
+  then ownedChain f j x (chain (defsOf Nil f.body) (Cons x Nil))
+  else f
+
+-- | a function, each array it goes round its loop with, that it may hold
+-- | alone, checked once where it is entered
+ownedFun : RefCount.Fun -> RefCount.Fun
+ownedFun f =
+  if loops False f.body
+  then List.foldl
+      ownedAt
+      f
+      (List.zip f.params (List.range 0 (List.length f.params - 1)))
+  else f
+
+-- | a definition of the C backend's, its loops' arrays held alone where
+-- | they may be
+ownedDef : RefCount.Def -> RefCount.Def
+ownedDef (DFun f) = DFun (ownedFun f)
+ownedDef d = d
