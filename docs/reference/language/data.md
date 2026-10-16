@@ -17,6 +17,25 @@ areaOf (Rect w h) = w * h
 `data` lists a type's tags, each with the types of its fields. A data
 type may take parameters: `data Tree a = Node a (List (Tree a))`.
 
+### Tags
+
+A tag, such as `Just` or `MkPair`, has no type of its own. It is checked
+at the type it is wanted at, so two data types can share a tag's name.
+
+At a function type, a tag is the function that builds the value:
+
+```haskell
+data Box = MkBox Int
+
+boxes : List Box
+boxes = List.map MkBox [1, 2]
+```
+
+A tag does not infer its type. Where nothing says it, as in
+`let b = MkBox 1`, it is E0200: say it where the value is bound,
+`let b : Box = MkBox 1`, or in place, `(MkBox 1 : Box)`. A tag at a type
+that has no such tag is E0314.
+
 ## Type aliases
 
 ```haskell
@@ -49,7 +68,7 @@ it, and nothing else, so it means the same wherever it is used: above,
 
 A record type may take parameters: `type Pair2 a = { first : a, second : a }`.
 
-## Updating a record
+## Copying a record
 
 ```haskell
 type Point = { x : Float64, y : Float64 }
@@ -65,13 +84,14 @@ loud : Opts
 loud = { quiet | name = "loud" }
 ```
 
-`{ r | x = v }` is `r` with `x` replaced. Several fields can be set,
-each once, in any order. A path sets a field of a field:
-`{ s | pos.x = 1.0 }` is `{ s | pos = { s.pos | x = 1.0 } }`.
+`{ r | x = v }` is a new record: `r`'s fields, but `x` is `v`; `r` itself
+is unchanged. Several fields can be set, each once, in any order. A
+path sets a field of a field: `{ s | pos.x = 1.0 }` is
+`{ s | pos = { s.pos | x = 1.0 } }`.
 
-A field not set keeps `r`'s value, even if it has a default: `loud.label`
+A field not set takes `r`'s value, even if it has a default: `loud.label`
 is still `"quiet"`. Defaults apply when a record is built, not when it
-is updated.
+is copied.
 
 ## Theories
 
