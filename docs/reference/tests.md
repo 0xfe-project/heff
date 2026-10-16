@@ -84,6 +84,7 @@ this way.
 
 ```haskell
 import std.filesystem
+import std.path
 import std.process
 
 tool : Test

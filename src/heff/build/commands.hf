@@ -27,6 +27,7 @@ import heff.lsp.report as Report
 import heff.build.session as Session
 import heff.build.watch as Watch
 import heff.syntax.import as Import
+import heff.util.hostpath as HostPath
 import json as Json
 import regex as Regex
 import std.filesystem
@@ -44,6 +45,20 @@ styleNow = do
   p <- platform
   pure (Path.styleOf p)
 
+-- | the path of the heff running, in the platform's style
+selfPath : {e : HFunctor} -> {{sys : process <: e}} -> Co e String
+selfPath = do
+  st <- styleNow
+  p <- programPath
+  pure (Path.render (os := st) p)
+
+-- | the working directory, in the platform's style
+cwdNow : {e : HFunctor} -> {{sys : process <: e}} -> Co e String
+cwdNow = do
+  st <- styleNow
+  d <- workingDir
+  pure (Path.render (os := st) d)
+
 -- | the directory the compiler at `self` came with: the repository it is
 -- | built in (it is `.heff/out/heff` there), or a release or the heff
 -- | home (`bin/heff`, what it ships beside `bin/`)
@@ -53,12 +68,12 @@ styleNow = do
 -- | "/opt/heff-0.2.0"
 ownRoot : Path.Style -> String -> String
 ownRoot st self =
-  if strEq (Path.basename st (Path.dirname st self)) "out"
+  if strEq (HostPath.basename st (HostPath.dirname st self)) "out"
      && strEq
-       (Path.basename st (Path.dirname st (Path.dirname st self)))
+       (HostPath.basename st (HostPath.dirname st (HostPath.dirname st self)))
        ".heff"
-  then Path.dirname st (Path.dirname st (Path.dirname st self))
-  else Path.dirname st (Path.dirname st self)
+  then HostPath.dirname st (HostPath.dirname st (HostPath.dirname st self))
+  else HostPath.dirname st (HostPath.dirname st self)
 
 -- | where the standard library is: `HEFF_LIB`, else the `lib/` the
 -- | compiler came with
@@ -69,8 +84,8 @@ libDir = do
     Just lib -> pure lib
     Nothing -> do
       st <- styleNow
-      self <- programPath
-      pure (Path.join st (ownRoot st self) "lib")
+      self <- selfPath
+      pure (HostPath.join st (ownRoot st self) "lib")
 
 -- | where packages are fetched to: `HEFF_MODCACHE`, else
 -- | `~/.cache/heff/mod`
@@ -83,10 +98,10 @@ modDir = do
   pure (case v of
     Just d -> d
     Nothing ->
-      Path.join
+      HostPath.join
         st
-        (Path.join st (fromMaybe (fromMaybe "." profile) home) ".cache")
-        (Path.join st "heff" "mod"))
+        (HostPath.join st (fromMaybe (fromMaybe "." profile) home) ".cache")
+        (HostPath.join st "heff" "mod"))
 
 -- | where heff keeps what is the user's (`bin/`, the programs `heff
 -- | install` installs, and beside it what they ship): `HEFF_HOME`, else
@@ -99,20 +114,21 @@ heffHome = do
   st <- styleNow
   pure (case v of
     Just d -> d
-    Nothing -> Path.join st (fromMaybe (fromMaybe "." profile) home) ".heff")
+    Nothing ->
+      HostPath.join st (fromMaybe (fromMaybe "." profile) home) ".heff")
 
 -- | the package.hf of the heff running, which says its version: in the
 -- | directory it came with
 ownPackage : {e : HFunctor} -> {{sys : process <: e}} -> Co e String
 ownPackage = do
   st <- styleNow
-  self <- programPath
-  pure (Path.join st (ownRoot st self) "package.hf")
+  self <- selfPath
+  pure (HostPath.join st (ownRoot st self) "package.hf")
 
 -- | the file in the heff home that says the checkout it was installed
 -- | from: `heff install` of heff's own package writes it
 sourceFile : Path.Style -> String -> String
-sourceFile st home = Path.join st home "source"
+sourceFile st home = HostPath.join st home "source"
 
 -- (the checkout a heff home's `source` says)
 sourceSaid : Maybe String -> List String
@@ -130,9 +146,9 @@ hostNow : {e : HFunctor}
 hostNow = do
   lib <- libDir
   mod <- modDir
-  cwd <- workingDir
+  cwd <- cwdNow
   st <- styleNow
-  self <- programPath
+  self <- selfPath
   home <- heffHome
   came <- readFile (sourceFile st (ownRoot st self))
   source <- readFile (sourceFile st home)
@@ -717,8 +733,8 @@ writePartsGo : {e : HFunctor}
 writePartsGo dir Nil = pure True
 writePartsGo dir (Cons (MkPair name text) rest) = do
   st <- styleNow
-  was <- readFile (Path.join st dir name)
-  ok <- writeChanged (Path.join st dir name) text was
+  was <- readFile (HostPath.join st dir name)
+  ok <- writeChanged (HostPath.join st dir name) text was
   if ok then writePartsGo dir rest else pure False
 
 -- (what is in `dir` and is no part of the program -- a module no longer
@@ -736,7 +752,7 @@ removeStale dir parts (Cons n rest) = do
   st <- styleNow
   gone <-
     if List.any (\p -> strEq (fst p) n) parts then pure True
-    else remove (Path.join st dir n)
+    else remove (HostPath.join st dir n)
   removeStale dir parts rest
 
 -- | a C program as parts, in the directory `dir`: each part written
@@ -833,7 +849,7 @@ selfHash : {e : HFunctor}
          -> Load.Paths
          -> Co e String
 selfHash ps = do
-  p <- programPath
+  p <- selfPath
   t <- readFile p
   case t of
     Just b -> do
@@ -1304,11 +1320,12 @@ readRuntimeFile : {e : HFunctor}
 readRuntimeFile name = do
   lib <- libDir
   st <- styleNow
-  text <- readFile (Path.join st (Path.join st lib "c") name)
+  text <- readFile (HostPath.join st (HostPath.join st lib "c") name)
   case text of
     Nothing -> do
       printErr
-          ("heff: no C runtime at " ^ Path.join st (Path.join st lib "c") name)
+          ("heff: no C runtime at "
+           ^ HostPath.join st (HostPath.join st lib "c") name)
       exit 1
       pure ""
     Just t -> pure t
@@ -1479,7 +1496,7 @@ ranErr r = r.err
 
 -- | where `heff build` writes the project's programs: `.heff/bin/`
 binDir : Path.Style -> String
-binDir st = Path.join st ".heff" "bin"
+binDir st = HostPath.join st ".heff" "bin"
 
 -- | what a build makes, and where: the project at `root`, its programs
 -- | written to `bin`, each said as it is made (`wrote`, `installed`); a
@@ -1501,7 +1518,7 @@ type Target =
 buildTarget : Path.Style -> String -> Target
 buildTarget st root =
   { root = root
-  , bin = Path.join st root (binDir st)
+  , bin = HostPath.join st root (binDir st)
   , said = "wrote"
   , pages = True
   , shipTo = Nothing
@@ -1510,20 +1527,22 @@ buildTarget st root =
 
 -- (a path of the project)
 inProject : Path.Style -> Target -> String -> String
-inProject st t p = Path.join st t.root p
+inProject st t p = HostPath.join st t.root p
 
 -- (`app/X/F`, of the project)
 appFile : Path.Style -> Target -> String -> String -> String
-appFile st t x f = inProject st t (Path.join st (Path.join st "app" x) f)
+appFile st t x f =
+  inProject st t (HostPath.join st (HostPath.join st "app" x) f)
 
 -- (where the program X is built: `.heff/build/X/`, its C and what is
 -- made of it)
 partsDir : Path.Style -> Target -> String -> String
-partsDir st t x = inProject st t (Path.join st (Path.join st ".heff" "build") x)
+partsDir st t x =
+  inProject st t (HostPath.join st (HostPath.join st ".heff" "build") x)
 
 -- (`n`, made of the program X, in the project: `.heff/build/X/n`)
 builtAt : Path.Style -> Target -> String -> String -> String
-builtAt st t x n = Path.join st (partsDir st t x) n
+builtAt st t x n = HostPath.join st (partsDir st t x) n
 
 -- | a program of the project: `app/X/` with a build.hf is the program X,
 -- | built as its build.hf says
@@ -1643,7 +1662,7 @@ wrote t path next = do
 endingIn : Path.Style -> String -> String -> List String -> List String
 endingIn st dir ending names =
   List.map
-    (\n -> Path.join st dir n)
+    (\n -> HostPath.join st dir n)
     (List.filter (\n -> endsWith ending n) names)
 
 -- (zig's mode for the runtime's Zig, at the level the C is built at:
@@ -1782,7 +1801,7 @@ runDir paths file =
   Load.under
     paths
     (Load.under paths paths.root ".heff/run")
-    (joinWith "_" (Path.components paths.style file))
+    (joinWith "_" (HostPath.components paths.style file))
 
 -- (a program's file, named `n`, as the system names one: `n.exe` on
 -- Windows)
@@ -1935,17 +1954,17 @@ shipOne : {e : HFunctor}
         -> Co e Unit
 shipOne st t home sh next n = do
   it <- Progress.start sh n 0
-  fresh <- pure (Path.join st home ("." ^ n ^ ".new"))
-  old <- pure (Path.join st home ("." ^ n ^ ".old"))
+  fresh <- pure (HostPath.join st home ("." ^ n ^ ".new"))
+  old <- pure (HostPath.join st home ("." ^ n ^ ".old"))
   _ <- remove fresh
   _ <- remove old
   copied <- copy (inProject st t n) fresh
   if copied
     then do
       -- (nothing there, nothing moved aside)
-      _ <- move (Path.join st home n) old
-      moved <- move fresh (Path.join st home n)
-      shipMoved t fresh old (Path.join st home n) (ended it next) moved
+      _ <- move (HostPath.join st home n) old
+      moved <- move fresh (HostPath.join st home n)
+      shipMoved t fresh old (HostPath.join st home n) (ended it next) moved
     else do
       _ <- remove fresh
       shipFails ("cannot copy " ^ inProject st t n ^ " to " ^ fresh)
@@ -2024,18 +2043,19 @@ placeMade st t pl next x Nothing = do
   next
 placeMade st t pl next x (Just n) = do
   it <- Progress.start pl n 0
-  fresh <- pure (Path.join st t.bin ("." ^ n ^ ".new"))
+  fresh <- pure (HostPath.join st t.bin ("." ^ n ^ ".new"))
   _ <- remove fresh
   copied <- copy (builtAt st t x n) fresh
-  placed <- if copied then replace fresh (Path.join st t.bin n) else pure False
-  if placed then wrote t (Path.join st t.bin n) (ended it next)
+  placed <-
+    if copied then replace fresh (HostPath.join st t.bin n) else pure False
+  if placed then wrote t (HostPath.join st t.bin n) (ended it next)
     else do
       _ <- remove fresh
       shipFails
           ("cannot put "
            ^ builtAt st t x n
            ^ " in place of "
-           ^ Path.join st t.bin n)
+           ^ HostPath.join st t.bin n)
 
 placeAll : {e : HFunctor}
          -> {{io : stdio <: e}}
@@ -2087,7 +2107,7 @@ buildPrograms : {e : HFunctor}
               -> List App
               -> Co e Unit
 buildPrograms st t done progs = do
-  okC <- makeDirectory (inProject st t (Path.join st ".heff" "build"))
+  okC <- makeDirectory (inProject st t (HostPath.join st ".heff" "build"))
   bp <- Progress.start Progress.root "building programs" (List.length progs)
   buildEach
       st
@@ -2113,7 +2133,7 @@ hfFilesGo (Cons p rest) acc = do
       hfFilesGo
           (List.append
              (List.map
-                (\n -> Path.join st p n)
+                (\n -> HostPath.join st p n)
                 (List.filter (\n -> not (startsWith "." n)) ns))
              rest)
           acc
@@ -2295,7 +2315,7 @@ onPathHint st bin = do
   p <- platform
   path <- getEnv "PATH"
   if List.any
-       (\d -> strEq (Path.join st d ".") (Path.join st bin "."))
+       (\d -> strEq (HostPath.join st d ".") (HostPath.join st bin "."))
        (pathDirs p (fromMaybe "" path))
     then pure MkUnit
     else print
@@ -2326,11 +2346,11 @@ sourceSaved : {e : HFunctor}
             -> Co e Unit
             -> Co e Unit
 sourceSaved st t home dir next = do
-  cwd <- workingDir
+  cwd <- cwdNow
   ok <-
     writeFile
       (sourceFile st home)
-      (Path.normalize st (Path.join st cwd dir) ^ "\n")
+      (HostPath.normalize st (HostPath.join st cwd dir) ^ "\n")
   if ok then wrote t (sourceFile st home) next
     else shipFails ("cannot write " ^ sourceFile st home)
 
@@ -2350,11 +2370,11 @@ installCmd : {e : HFunctor}
 installCmd dir = do
   st <- styleNow
   home <- heffHome
-  text <- readFile (Path.join st dir "package.hf")
+  text <- readFile (HostPath.join st dir "package.hf")
   t <-
     pure
       { root = dir
-      , bin = Path.join st home "bin"
+      , bin = HostPath.join st home "bin"
       , said = "installed"
       , pages = False
       , shipTo = Just home
@@ -2926,7 +2946,7 @@ goldenName n = List.all goldenPart (split "/" n)
 -- | "test/check/golden.golden/hello"
 goldenPath : Path.Style -> String -> String -> String
 goldenPath st f name =
-  Path.join
+  HostPath.join
     st
     ((if endsWith ".hf" f then strSlice f 0 (strLength f - 3) else f)
      ^ ".golden")
@@ -3013,7 +3033,7 @@ goldenSaid update f (MkPair name text) =
     kept <- readFile (goldenPath st f name)
     goldenAgainst
         update
-        (Path.dirname st (goldenPath st f name))
+        (HostPath.dirname st (goldenPath st f name))
         (goldenPath st f name)
         text
         kept
@@ -3407,10 +3427,11 @@ runJob : {e : HFunctor}
        -> Job
        -> Co e Finished
 runJob sel j = do
+  st <- styleNow
   made <- temporaryDirectory "heff-test-"
   case made of
     Left err -> pure (brokenJob j ("no directory for it: " ^ err.message))
-    Right dir -> ranJob sel j dir
+    Right dir -> ranJob sel j (Path.render (os := st) dir)
 
 -- (the subtests the tests that ended named, to run next)
 nextJobs : List Finished -> List Job
@@ -3493,9 +3514,9 @@ patternLevels p =
     Right sel -> sel
 
 -- (a path made real, else the one given)
-pathOr : String -> Either FileError String -> String
-pathOr given (Left err) = given
-pathOr given (Right real) = real
+pathOr : Path.Style -> String -> Either FileError Path.Path -> String
+pathOr st given (Left err) = given
+pathOr st given (Right real) = Path.render (os := st) real
 
 -- (where `heff test` builds a file's integration tests: `.heff/test/F/`,
 -- F its path, its separators underscores)
@@ -3504,7 +3525,7 @@ testDir paths file =
   Load.under
     paths
     (Load.under paths paths.root ".heff/test")
-    (joinWith "_" (Path.components paths.style file))
+    (joinWith "_" (HostPath.components paths.style file))
 
 -- (a file tested to its end here, its integration tests not run: its
 -- golden texts held, and its line said)
@@ -3642,7 +3663,7 @@ buildIntegrations opts at p k = case integrationLoaded p of
                    l.paths
                    (testDir l.paths p.file)
                    (programFile l.paths.style "main"))
-            self <- programPath
+            self <- selfPath
             heff <- realPath self
             root <- realPath l.paths.root
             Progress.end task
@@ -3651,10 +3672,12 @@ buildIntegrations opts at p k = case integrationLoaded p of
                    { at = at
                    , pending = p
                    , launch =
-                       { program = pathOr "" real
+                       { program = pathOr l.paths.style "" real
                        , env =
-                           [ MkPair "HEFF" (pathOr self heff)
-                           , MkPair "HEFF_TEST_ROOT" (pathOr l.paths.root root)
+                           [ MkPair "HEFF" (pathOr l.paths.style self heff)
+                           , MkPair
+                             "HEFF_TEST_ROOT"
+                             (pathOr l.paths.style l.paths.root root)
                            , MkPair "HEFF_TEST_JOBS" "1"
                            ]
                        }
@@ -3792,7 +3815,7 @@ testFilesGo (Cons (MkPair top p) rest) acc = do
         else testFilesGo
             (List.append
                (List.map
-                  (\n -> MkPair False (Path.join st p n))
+                  (\n -> MkPair False (HostPath.join st p n))
                   (List.filter (\n -> not (startsWith "." n)) ns))
                rest)
             acc
@@ -4016,7 +4039,7 @@ testedAgain : {e : HFunctor}
             -> Co e Int
 testedAgain argv n = do
   changedSaid n
-  self <- programPath
+  self <- selfPath
   try
     r <-
       withProcess
@@ -4167,7 +4190,7 @@ docPageWritten : {e : HFunctor}
                -> Co e Unit
 docPageWritten path text = do
   st <- styleNow
-  _ <- makeDirectory (Path.dirname st path)
+  _ <- makeDirectory (HostPath.dirname st path)
   ok <- writeFile path text
   if ok then pure MkUnit
     else do
@@ -4186,7 +4209,7 @@ docPagesWritten dir Nil = pure MkUnit
 docPagesWritten dir (Cons c rest) = do
   st <- styleNow
   docPageWritten
-      (Path.join st dir (DocPages.pagePath c.module))
+      (HostPath.join st dir (DocPages.pagePath c.module))
       (DocPages.page c)
   docPagesWritten dir rest
 
@@ -4203,7 +4226,7 @@ docWritten Nothing cs = write (joinWith "\n" (List.map DocPages.page cs))
 docWritten (Just dir) cs = do
   st <- styleNow
   docPagesWritten dir cs
-  docPageWritten (Path.join st dir "index.md") (DocPages.indexPage cs)
+  docPageWritten (HostPath.join st dir "index.md") (DocPages.indexPage cs)
   print
       ("heff doc: "
        ^ show (List.length cs)
@@ -4494,8 +4517,8 @@ publishCmd v = case Project.version v of
 -- | the project's name: DIR's, or (DIR being `.`) that of the working
 -- | directory, CWD
 projectName : Path.Style -> String -> String -> String
-projectName st "." cwd = Path.basename st cwd
-projectName st dir _ = Path.basename st dir
+projectName st "." cwd = HostPath.basename st cwd
+projectName st dir _ = HostPath.basename st dir
 
 -- (the directory a project's name is of: DIR, or the working directory)
 nameSource : String -> String -> String
@@ -4690,7 +4713,7 @@ existing : {e : HFunctor}
 existing dir Nil = pure Nil
 existing dir (Cons (MkPair f text) rest) = do
   st <- styleNow
-  there <- readFile (Path.join st dir f)
+  there <- readFile (HostPath.join st dir f)
   others <- existing dir rest
   case there of
     Just _ -> pure (Cons f others)
@@ -4715,11 +4738,11 @@ writeAll : {e : HFunctor}
 writeAll dir Nil = pure True
 writeAll dir (Cons (MkPair f text) rest) = do
   st <- styleNow
-  made <- makeDirectory (Path.dirname st (Path.join st dir f))
-  ok <- writeFile (Path.join st dir f) (laidOut f text)
+  made <- makeDirectory (HostPath.dirname st (HostPath.join st dir f))
+  ok <- writeFile (HostPath.join st dir f) (laidOut f text)
   if made && ok then writeAll dir rest
     else do
-      printErr ("heff: cannot write " ^ Path.join st dir f)
+      printErr ("heff: cannot write " ^ HostPath.join st dir f)
       pure False
 
 -- | a new project in DIR, NAME being DIR's: its package.hf, a .gitignore,
@@ -4733,7 +4756,7 @@ initCmd : {e : HFunctor}
         -> String
         -> Co e Unit
 initCmd dir = do
-  cwd <- workingDir
+  cwd <- cwdNow
   v <- ownVersion
   st <- styleNow
   name <- pure (projectName st dir cwd)
@@ -4797,7 +4820,7 @@ fetched ps path v = do
     Just h -> pure (Right (trim h))
     Nothing -> do
       _ <- remove dir
-      _ <- makeDirectory (Path.dirname ps.style dir)
+      _ <- makeDirectory (HostPath.dirname ps.style dir)
       f <- Progress.start Progress.root ("fetching " ^ path ^ " " ^ v) 0
       cloned <-
         run
@@ -4838,7 +4861,7 @@ fetched ps path v = do
               , args = ["rev-parse", "HEAD^{tree}"]
               , dir = dir
               }
-          _ <- remove (Path.join ps.style dir ".git")
+          _ <- remove (HostPath.join ps.style dir ".git")
           sealed <- readOnly dir
           h <- pure ("tree:" ^ trim (ranOut tree))
           ok <- writeFile (dir ^ ".hash") (h ^ "\n")
@@ -4996,7 +5019,9 @@ getRequire ps text pk path v = case Project.majorMismatch path v of
         pure False
       Right _ -> do
         own <-
-          Load.ownDir ps (Path.join ps.style (Load.cachedDir ps path v) "src")
+          Load.ownDir
+            ps
+            (HostPath.join ps.style (Load.cachedDir ps path v) "src")
         case own of
           Left why -> do
             getFails why
