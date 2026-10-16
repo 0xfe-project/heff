@@ -20,8 +20,20 @@ pub const panic = std.debug.FullPanic(fault);
 
 fn fault(message: []const u8, _: ?usize) noreturn {
     @branchHint(.cold);
-    std.debug.print("heff: the runtime is at fault: {s}\n", .{message});
+    said("heff: the runtime is at fault: ");
+    said(message);
+    said("\n");
     std.process.abort();
+}
+
+// (the C library's, linked with every program: what the C half has)
+extern fn write(fd: c_int, bytes: [*]const u8, n: usize) isize;
+
+// (written to the standard error, as it is -- by the C library, not
+// std.debug.print, which brings Zig's formatting and its locked stderr
+// into every program's build, a second of zig's at each)
+fn said(text: []const u8) void {
+    _ = write(2, text.ptr, text.len);
 }
 
 // Values, as the C half lays them out
