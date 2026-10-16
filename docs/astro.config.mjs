@@ -85,7 +85,7 @@ export default defineConfig({
               items: [
                 'reference/library',
                 'reference/library/collections',
-                'reference/library/with',
+                'reference/library/resource',
                 'reference/library/system',
                 'reference/library/network',
                 'reference/library/concurrency',

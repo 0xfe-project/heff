@@ -169,7 +169,7 @@ A thing that must be let go of, such as an open file, is handed out by a
 `with` of the effect's own, such as `std.filesystem`'s `withFile`:
 
 - The body gets the thing as a `With s a`, with a region `s` that keeps
-  it from escaping. See [a thing held by a `with`](library/with.md).
+  it from escaping. See [a thing held by a `with`](library/resource.md).
 - The effect's operations on it take the `With s a`, and give the thing
   to the provider by `inside`.
 - The module exports its `with` and those operations, never the bare

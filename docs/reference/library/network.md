@@ -44,7 +44,7 @@ runs the `curl` command instead, with the same answers.
 ```haskell
 import bytes as Bytes
 import std.net as Net
-import with
+import resource
 
 -- | what the other side writes, written back until it closes
 echo : {e : HFunctor} -> {s : Type} -> {{nt : Net.net <: e}} -> With s Net.TcpStream -> Co e Unit

@@ -180,10 +180,10 @@ isSimple (EFixed _ _) = True
 isSimple (EFloat32 _) = True
 isSimple (EPrim _) = True
 isSimple (ELam _ _) = True
-isSimple (ETag _ as _) = allL isSimple as
+isSimple (ETag _ args _) = allL isSimple args
 isSimple (ERecord fs _) = allL (\f -> isSimple (snd f)) fs
 isSimple (EProj e _ _ _) = isSimple e
-isSimple (EPrimCall p as) = not (Simplify.primFails p) && allL isSimple as
+isSimple (EPrimCall p args) = not (Simplify.primFails p) && allL isSimple args
 isSimple _ = False
 
 -- | the function a body is a loop of, if it is one's own (not a lambda's)
@@ -399,8 +399,8 @@ simpleOf g (EPrim p) = pure (SPrimFn p)
 simpleOf g (ELam xs b) = do
   t <- g.tail Nothing b
   pure (SLam xs (MkBlock t))
-simpleOf g (ETag t as ts) = do
-  vs <- traverseN g.simple as
+simpleOf g (ETag t args ts) = do
+  vs <- traverseN g.simple args
   pure (STag t vs ts)
 simpleOf g (ERecord fs ts) = do
   vs <- traverseN (\f -> g.simple (snd f)) fs
@@ -408,8 +408,8 @@ simpleOf g (ERecord fs ts) = do
 simpleOf g (EProj e l sh t) = do
   v <- g.simple e
   pure (SProj v l sh t)
-simpleOf g (EPrimCall p as) = do
-  vs <- traverseN g.simple as
+simpleOf g (EPrimCall p args) = do
+  vs <- traverseN g.simple args
   pure (SPrim p vs)
 -- (not simple: no operand is made of it -- `isSimple` is asked first)
 simpleOf g e = pure (SPrim "$notSimple" Nil)
@@ -439,24 +439,24 @@ opWith (MkPair ss vs) k = MkPair ss (k vs)
 -- | what is computed in one step (not a binding, nor a match), its
 -- | operands bound before where they are not simple
 opOf : G -> IR.Expr -> N (Pair (List St) Comp)
-opOf g (ECall k as) = do
-  r <- atomsOf g as
+opOf g (ECall k args) = do
+  r <- atomsOf g args
   pure (opWith r (\vs -> OCall k vs))
-opOf g (EApp f as) = do
-  r <- atomsOf g (Cons f as)
+opOf g (EApp f args) = do
+  r <- atomsOf g (Cons f args)
   pure
       (opWith r (\vs -> case vs of
        Cons fv avs -> OApply fv avs
        Nil -> OAbandon))
-opOf g (EPrimCall p as) = do
-  r <- atomsOf g as
+opOf g (EPrimCall p args) = do
+  r <- atomsOf g args
   pure
       (opWith
          r
          (\vs ->
             if Simplify.primFails p then OPrim p vs else OSimple (SPrim p vs)))
-opOf g (ETag t as ts) = do
-  r <- atomsOf g as
+opOf g (ETag t args ts) = do
+  r <- atomsOf g args
   pure (opWith r (\vs -> OSimple (STag t vs ts)))
 opOf g (ERecord fs ts) = do
   r <- atomsOf g (List.map snd fs)
@@ -500,14 +500,14 @@ setOf (DLet x) = x
 caseSet : G -> String -> IR.Expr -> List IR.Arm -> N (List St)
 caseSet g x s arms = do
   sv <- g.atom s
-  as <-
+  args <-
     traverseN
       (\arm -> case arm of
        MkArm t vs b -> do
          sb <- g.setTo x b
          pure (MkArm t vs sb))
       arms
-  pure (appendL (fst sv) (Cons (SCase (snd sv) as) Nil))
+  pure (appendL (fst sv) (Cons (SCase (snd sv) args) Nil))
 
 -- (each arm setting `x`; a test, by its condition)
 matchSet : G -> String -> IR.Expr -> List IR.Arm -> N (List St)
@@ -564,8 +564,8 @@ toDest g d e = do
 --------------------------------------------------------------------------------
 
 isSelf : Maybe Self -> String -> List IR.Expr -> Bool
-isSelf (Just s) k as = strEq s.key k && List.length as == s.arity
-isSelf Nothing k as = False
+isSelf (Just s) k args = strEq s.key k && List.length args == s.arity
+isSelf Nothing k args = False
 
 tailSeq : List St -> Tl -> Tl
 tailSeq Nil t = t
@@ -584,14 +584,14 @@ opTail g e = do
 caseTail : G -> Maybe Self -> IR.Expr -> List IR.Arm -> N Tl
 caseTail g self s arms = do
   sv <- g.atom s
-  as <-
+  args <-
     traverseN
       (\arm -> case arm of
        MkArm t vs b -> do
          tb <- g.tail self b
          pure (MkArm t vs tb))
       arms
-  pure (tailSeq (fst sv) (TCase (snd sv) as))
+  pure (tailSeq (fst sv) (TCase (snd sv) args))
 
 -- (a test: by its condition, if it is one; else a match)
 testTail : G
@@ -629,10 +629,10 @@ tailOf g self e@(EMatch s arms) = case boolArms arms of
         Nothing -> testTail g self s t f arms
     else testTail g self s t f arms
   Nothing -> caseTail g self s arms
-tailOf g self e@(ECall k as) =
-  if isSelf self k as
+tailOf g self e@(ECall k args) =
+  if isSelf self k args
   then do
-    r <- atomsOf g as
+    r <- atomsOf g args
     pure (tailSeq (fst r) (TLoop (snd r)))
   else opTail g e
 tailOf g self e = opTail g e
@@ -658,7 +658,7 @@ tailSelf : String -> Int -> IR.Expr -> Bool
 tailSelf key n (ELet _ _ b) = tailSelf key n b
 tailSelf key n (EMatch _ arms) =
   List.any (\a -> tailSelf key n (IR.armBody a)) arms
-tailSelf key n (ECall k as) = strEq k key && List.length as == n
+tailSelf key n (ECall k args) = strEq k key && List.length args == n
 tailSelf key n e = False
 
 -- (the function, where it is a loop)
@@ -713,18 +713,19 @@ partsVals r vs acc = List.foldr (\v a -> r.val v a) acc vs
 -- (a value and what it is made of, inside a lambda too)
 partsVal : PK -> Val -> List Part -> List Part
 partsVal r v@(SLam _ (MkBlock t)) acc = Cons (PartVal v) (r.tl t acc)
-partsVal r v@(STag _ as _) acc = Cons (PartVal v) (partsVals r as acc)
+partsVal r v@(STag _ args _) acc = Cons (PartVal v) (partsVals r args acc)
 partsVal r v@(SRec fs _) acc =
   Cons (PartVal v) (partsVals r (List.map snd fs) acc)
 partsVal r v@(SProj w _ _ _) acc = Cons (PartVal v) (r.val w acc)
-partsVal r v@(SPrim _ as) acc = Cons (PartVal v) (partsVals r as acc)
+partsVal r v@(SPrim _ args) acc = Cons (PartVal v) (partsVals r args acc)
 partsVal r v acc = Cons (PartVal v) acc
 
 partsOp : PK -> Comp -> List Part -> List Part
 partsOp r o@(OSimple v) acc = Cons (PartOp o) (r.val v acc)
-partsOp r o@(OCall _ as) acc = Cons (PartOp o) (partsVals r as acc)
-partsOp r o@(OApply f as) acc = Cons (PartOp o) (partsVals r (Cons f as) acc)
-partsOp r o@(OPrim _ as) acc = Cons (PartOp o) (partsVals r as acc)
+partsOp r o@(OCall _ args) acc = Cons (PartOp o) (partsVals r args acc)
+partsOp r o@(OApply f args) acc =
+  Cons (PartOp o) (partsVals r (Cons f args) acc)
+partsOp r o@(OPrim _ args) acc = Cons (PartOp o) (partsVals r args acc)
 partsOp r o@(OBool c) acc = Cons (PartOp o) (r.cond c acc)
 partsOp r o acc = Cons (PartOp o) acc
 
@@ -804,18 +805,18 @@ namedIn x ps =
 -- (the names a value mentions, outside any lambda)
 valNamesTop : Val -> List String -> List String
 valNamesTop (SVar x) acc = Cons x acc
-valNamesTop (STag _ as _) acc = List.foldr valNamesTop acc as
+valNamesTop (STag _ args _) acc = List.foldr valNamesTop acc args
 valNamesTop (SRec fs _) acc = List.foldr valNamesTop acc (List.map snd fs)
 valNamesTop (SProj v _ _ _) acc = valNamesTop v acc
-valNamesTop (SPrim _ as) acc = List.foldr valNamesTop acc as
+valNamesTop (SPrim _ args) acc = List.foldr valNamesTop acc args
 valNamesTop v acc = acc
 
 -- (... of a step's operands: not a condition's, which may bind names)
 opNamesTop : Comp -> List String
 opNamesTop (OSimple v) = valNamesTop v Nil
-opNamesTop (OCall _ as) = List.foldr valNamesTop Nil as
-opNamesTop (OApply f as) = List.foldr valNamesTop Nil (Cons f as)
-opNamesTop (OPrim _ as) = List.foldr valNamesTop Nil as
+opNamesTop (OCall _ args) = List.foldr valNamesTop Nil args
+opNamesTop (OApply f args) = List.foldr valNamesTop Nil (Cons f args)
+opNamesTop (OPrim _ args) = List.foldr valNamesTop Nil args
 opNamesTop o = Nil
 
 -- | the names a statement mentions in what it computes first, before
