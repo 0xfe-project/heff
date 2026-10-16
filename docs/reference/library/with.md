@@ -17,7 +17,9 @@ firstLine path = withFile path { access = Read } (\f -> readLine f)
 
 A thing of the host that must be let go of, such as an open file, a
 socket or a process, is held by a `with`: `withFile`, `withProcess`,
-`Net.withConnection`, and so on. Each one:
+`Net.withConnection`, and so on. In a `do` block a `with` is a
+statement, `with withFile path o as f do`, the statements under it its
+body (see [do](../language/do.md#with)). Each one:
 
 1. acquires the thing;
 2. runs the body with it, as a `With s a`;

@@ -361,6 +361,10 @@ data ExprF
                                                                 (Params.Spanned
                                                                    ExprF))
   | ETry (TryF (Params.Spanned ExprF))
+  -- | `with e as x do ...`: the `with`, the name (where it is), the
+  -- | statements, its body
+  | EWith (Params.Spanned ExprF) String Params.Span (Stmts
+                                                       (Params.Spanned ExprF))
 
 type Expr = Params.Spanned ExprF
 
@@ -625,7 +629,11 @@ chkOf i = At (CInf i) (Params.spanOf i)
 --   Their end is `pure` of the call of what follows the `try` (a join
 --   point), and a jump out of `k` scopes `pure` of what to do once the
 --   next is left, `k` deep (`leaving`): each scope is left on the way
---   out, the innermost first, and the call made after, a tail call.
+--   out, the innermost first, and the call made after, a tail call;
+-- - `with w as x do ...` is a scope as `try` is, the `with` `w` given
+--   its statements as its body, `\x -> ...` (the region `s` of `x`'s
+--   `With s r` the elaborator's, as for any lambda given a `with`):
+--   their answer is what to do once it is left, which follows it.
 --
 -- A function's parameters are of its variables' types, `typeOf x`, and
 -- what it gives is left to be found, `inferred MkUnit` (both the
@@ -980,6 +988,13 @@ childrenAcc f st (At (EIfLet p s a b) sp) =
               (\st3 b' -> MkPair st3 (At (EIfLet p s' a' b') sp))))
 childrenAcc f st (At (ETry tr) sp) =
   pairK (tryAcc f st tr) (\st1 tr' -> MkPair st1 (At (ETry tr') sp))
+childrenAcc f st (At (EWith w x xsp body) sp) =
+  pairK
+    (f st w)
+    (\st1 w' ->
+       pairK
+         (accList (stmtAcc f) st1 body)
+         (\st2 body' -> MkPair st2 (At (EWith w' x xsp body') sp)))
 childrenAcc f st e = MkPair st e
 
 -- | the expressions an expression holds, each by `f`
@@ -993,6 +1008,7 @@ hasNest (At (ENest _) _) = True
 hasNest (At (ELam _ _) _) = False
 hasNest (At (EDo _) _) = False
 hasNest (At (ETry _) _) = False
+hasNest (At (EWith _ _ _ _) _) = False
 hasNest e = fst (childrenAcc (\b c -> MkPair (b || hasNest c) c) False e)
 
 -- What a closure may not do: in a lambda's body, `(<- c)`, `return`,
@@ -1142,6 +1158,8 @@ liftE l acc (At (ELetIn rhs (At (MkAlt p body) asp)) sp) =
               MkPair acc2 (At (ELetIn rhs' (At (MkAlt p body') asp)) sp)))
 liftE l acc (At (EIfLet p s a (Just b)) sp) = liftE l acc (ifLetOf sp p s a b)
 liftE l acc (At (ETry tr) sp) = MkPair acc (At (ETry tr) sp)
+liftE l acc (At (EWith w x xsp body) sp) =
+  MkPair acc (At (EWith w x xsp body) sp)
 liftE l acc e = childrenAcc (liftE l) acc e
 
 -- | `k` of the expression, its `(<- c)` bound before
@@ -1184,6 +1202,7 @@ isControl (At (EMatch _ alts) _) = List.any (armNeeds isControl) alts
 isControl (At (EIfLet _ _ _ Nothing) _) = True
 isControl (At (EIfLet p s a (Just b)) sp) = isControl (ifLetOf sp p s a b)
 isControl (At (ETry _) _) = True
+isControl (At (EWith _ _ _ _) _) = True
 isControl _ = False
 
 -- | an arm of an `if` or a `case` of statements: its pattern, its
@@ -1286,6 +1305,7 @@ stmtsFall ss = case List.last ss of
   exprFalls (At (EIfLet p s a (Just b)) sp) = exprFalls (ifLetOf sp p s a b)
   exprFalls (At (ETry (MkTry _ body c)) _) =
     stmtsFall body || stmtsFall (catchStmts c)
+  exprFalls (At (EWith _ _ _ body) _) = stmtsFall body
   exprFalls _ = True
 
 -- (an arm that reaches its end and binds nothing the statements after
@@ -1544,22 +1564,42 @@ tryScope t cx sp (MkTry err body h) end =
     , At (EVar "leaveScope") sp
     ]
 
--- (`try ...`, and the statements after it, a join point)
-tryJoin : DoT
-        -> DoCx
-        -> Params.Span
-        -> TryF Expr
-        -> List (Params.Spanned (Stmt Expr))
-        -> End
-        -> Expr
-tryJoin t cx sp tr rest end =
+-- | a `with` statement's scope: the `with` given its statements up to
+-- | `end` as its body, `x` what it holds, then what their answer says
+-- | to do (`leaveScope`): go on after it (`end`), or jump further out
+withScopeOf : DoT
+            -> DoCx
+            -> Params.Span
+            -> Expr
+            -> String
+            -> Params.Span
+            -> List (Params.Spanned (Stmt Expr))
+            -> End
+            -> Expr
+withScopeOf t cx sp w x xsp body end =
+  hoist
+    cx
+    w
+    (\w' ->
+       app
+         (At (EVar cx.names.bind) cx.sp)
+         [ app w' [lamName x xsp (t.stmts (inScope cx) body end)]
+         , At (EVar "leaveScope") sp
+         ])
+
+-- (a scope, `scope` of what follows it, and the statements after it, a
+-- join point)
+scopeJoin : DoT
+          -> DoCx
+          -> Params.Span
+          -> (End -> Expr)
+          -> List (Params.Spanned (Stmt Expr))
+          -> End
+          -> Expr
+scopeJoin t cx sp scope rest end =
   At
     (ELocal
-       (tryScope
-          t
-          cx
-          sp
-          tr
+       (scope
           (EndJump
              { head = At (EVar (madeName "join" sp)) sp
              , vars = cx.muts
@@ -1574,8 +1614,24 @@ tryJoin t cx sp tr rest end =
        ])
     sp
 
--- | `try ...`, and the statements after it, a join point (what follows
--- | it) where there are any (and it reaches its end)
+-- | a scope (`try`, `with`), `scope` of what follows it, and the
+-- | statements after it, a join point where there are any -- if it
+-- | reaches its end (`falls`), else what `stuck` says of them
+scopeT : DoT
+       -> DoCx
+       -> Params.Span
+       -> (End -> Expr)
+       -> Bool
+       -> String
+       -> List (Params.Spanned (Stmt Expr))
+       -> End
+       -> Expr
+scopeT t cx sp scope falls stuck Nil end = scope end
+scopeT t cx sp scope falls stuck (Cons s rest) end =
+  if falls then scopeJoin t cx sp scope (Cons s rest) end
+  else badE (Params.spanOf s) stuck
+
+-- | `try ...`, and the statements after it
 tryT : DoT
      -> DoCx
      -> Params.Span
@@ -1583,13 +1639,40 @@ tryT : DoT
      -> List (Params.Spanned (Stmt Expr))
      -> End
      -> Expr
-tryT t cx sp tr Nil end = tryScope t cx sp tr end
-tryT t cx sp tr (Cons s rest) end =
-  if stmtsFall [At (StmtExpr (At (ETry tr) sp)) sp]
-  then tryJoin t cx sp tr (Cons s rest) end
-  else badE
-      (Params.spanOf s)
-      "nothing after this `try` runs: neither its statements nor its `catch` arm reach their end"
+tryT t cx sp tr rest end =
+  scopeT
+    t
+    cx
+    sp
+    (tryScope t cx sp tr)
+    (stmtsFall [At (StmtExpr (At (ETry tr) sp)) sp])
+    "nothing after this `try` runs: neither its statements nor its `catch` arm reach their end"
+    rest
+    end
+
+-- | `with w as x do ...`, and the statements after it (unless `x` names
+-- | a variable of the block: then that, said)
+withT : DoT
+      -> DoCx
+      -> Params.Span
+      -> Expr
+      -> String
+      -> Params.Span
+      -> List (Params.Spanned (Stmt Expr))
+      -> List (Params.Spanned (Stmt Expr))
+      -> End
+      -> Expr
+withT t cx sp w x xsp body rest end =
+  if isMut cx x then badE xsp (mutClash x)
+  else scopeT
+      t
+      cx
+      sp
+      (withScopeOf t cx sp w x xsp body)
+      (stmtsFall body)
+      "nothing after this `with` runs: its statements do not reach their end"
+      rest
+      end
 
 -- (`try ...` and the statements after it, unless its `catch` arm's
 -- binder is wrong: then that, said)
@@ -1676,6 +1759,8 @@ controlT t cx (At (EIfLet p s a b) sp) rest end =
     end
 controlT t cx (At (ETry (MkTry err body h)) sp) rest end =
   tryOr t cx sp (MkTry err body h) rest end (catchWrong cx h)
+controlT t cx (At (EWith w x xsp body) sp) rest end =
+  withT t cx sp w x xsp body rest end
 controlT t cx e rest end =
   hoist cx e (\e' -> doBind cx e' "_" cx.sp (t.stmts cx rest end))
 
@@ -2279,6 +2364,12 @@ classifyTermF r (At (ETry _) sp) =
     (invalid
        3
        "a `try` is a statement of a `do` block (or an arm of its `if` or `case`)"
+       sp)
+classifyTermF r (At (EWith _ _ _ _) sp) =
+  IsInferable
+    (invalid
+       3
+       "a `with` is a statement of a `do` block (or an arm of its `if` or `case`)"
        sp)
 classifyTermF r (At (ENest _) sp) =
   IsInferable
