@@ -26,8 +26,12 @@
 -- A class all of whose evidence is of one type is unboxed where that
 -- costs no more than keeping it a `V` (`decide`): a box made where a
 -- `V` is wanted (an allocation, for a `Float64` or a 64-bit integer
--- beyond 62 bits), against an unbox where a `V` comes in.  A field a
--- match binds stays a `V` (`Pinned`), and is unboxed where it is used.
+-- beyond 62 bits), against an unbox where a `V` comes in.  What is done
+-- where the loop's next round may be reached is done on each round, and
+-- weighs `loopWeight` times what is done once, on the way in or out: a
+-- loop's accumulator handed to a closure when it is done is unboxed in
+-- the loop and boxed once, as it leaves.  A field a match binds stays a
+-- `V` (`Pinned`), and is unboxed where it is used.
 --
 -- An `Int` known to fit a word (heff.compile.ranges, #79) is kept as its
 -- `int64_t` (`RepInt`): its evidence is an operation on words, a
@@ -409,7 +413,7 @@ noKnow = { sigs = Map.empty, flat = Map.empty }
 -- | may be a big integer; given an unboxed value; given a literal;
 -- | used where the repr is wanted (a `V` by a uniform use); bound; a
 -- | field a match binds; kept as the repr, whatever else is seen (a
--- | worker's parameter, given so)
+-- | worker's parameter, given so); seen on each round of the loop
 data Event
   = Merge String String
   | Boxed String
@@ -421,6 +425,17 @@ data Event
   | Binds String
   | Pinned String
   | Kept String Repr
+  | Often Event
+
+-- | how many times what is seen on each round of a loop weighs what is
+-- | seen once, on the way in or out
+loopWeight : Int
+loopWeight = 8
+
+-- (seen on each round of the loop, if `lp`)
+atRound : Bool -> Event -> Event
+atRound True e = Often e
+atRound False e = e
 
 -- | what a function's body does with what it returns: wants it as the
 -- | repr (its worker's result, or a `V`); or gives it to `retName`, a
@@ -477,10 +492,11 @@ pushPrim p vs rest = pushElement (elementAt p) (argReprs p vs) vs rest
 
 -- (a name given what a step not simple computes: a `V`, but an array's
 -- element, as it comes)
-stepGives : String -> Imperative.Comp -> List Event -> List Event
-stepGives x (OPrim p _) acc =
-  if readsElement p then Cons (Element x) acc else Cons (Boxed x) acc
-stepGives x o acc = Cons (Boxed x) acc
+stepGives : Bool -> String -> Imperative.Comp -> List Event -> List Event
+stepGives lp x (OPrim p _) acc =
+  if readsElement p then Cons (atRound lp (Element x)) acc
+  else Cons (atRound lp (Boxed x)) acc
+stepGives lp x o acc = Cons (atRound lp (Boxed x)) acc
 
 -- (a label's place among a shape's labels)
 indexOfL : String -> Int -> List String -> Maybe Int
@@ -532,6 +548,7 @@ pinArms fl arms acc = List.foldl (pinArm fl) acc arms
 mentionedBy : Event -> List String
 mentionedBy (Wants x _) = Cons x Nil
 mentionedBy (Merge _ y) = Cons y Nil
+mentionedBy (Often e) = mentionedBy e
 mentionedBy e = Nil
 
 mentioned : List Event -> List String
@@ -552,12 +569,13 @@ freeGo bs (Cons x xs) acc =
   else freeGo (Map.insert bs x MkUnit) xs (Cons x acc)
 
 -- | a lambda: its parameters given `V`s; what its body mentions and does
--- | not bind (its closure's) wanted as a `V` where it is made and given
--- | as one where its body starts; its body's own events (`evs`)
-lamEvents : List String -> List Event -> List Event -> List Event
-lamEvents xs evs acc =
+-- | not bind (its closure's) wanted as a `V` where it is made (on each
+-- | round of the loop, if `lp`) and given as one where its body starts;
+-- | its body's own events (`evs`)
+lamEvents : Bool -> List String -> List Event -> List Event -> List Event
+lamEvents lp xs evs acc =
   List.foldl
-    (\a y -> Cons (Wants y RepV) (Cons (Boxed y) a))
+    (\a y -> Cons (atRound lp (Wants y RepV)) (Cons (Boxed y) a))
     (List.foldl
        (\a x -> Cons (Boxed x) (Cons (Binds x) a))
        (List.append evs acc)
@@ -604,86 +622,116 @@ returned (RetAs r) (OSimple v) rest = Cons (IVal r v) rest
 returned (RetAs r) o rest = Cons (IOp o) rest
 returned RetClass o rest = Cons (IBind retName o) rest
 
--- | the events of the worklist, last first
-walk : Know -> List Event -> List Item -> List Event
-walk sg acc Nil = acc
-walk sg acc (Cons (IVal r (SVar x)) rest) = walk sg (Cons (Wants x r) acc) rest
-walk sg acc (Cons (IVal r (SPrim p argv)) rest) =
-  walk sg acc (pushPrim p argv rest)
-walk sg acc (Cons (IVal r (STag _ argv ts)) rest) =
-  walk sg acc (pushArgs (tagSlots ts (List.length argv)) argv rest)
-walk sg acc (Cons (IVal r (SRec fs ts)) rest) =
-  walk sg acc (pushArgs (slotReprs ts) (List.map snd fs) rest)
-walk sg acc (Cons (IVal r (SProj v _ _ _)) rest) =
-  walk sg acc (Cons (IVal RepV v) rest)
-walk sg acc (Cons (IVal r (SLam xs (MkBlock t))) rest) =
+-- | whether the loop's next round may be reached from here
+loops : Imperative.Tl -> Bool
+loops (TSeq _ t) = loops t
+loops (TReturn _) = False
+loops (TLoop _) = True
+loops (TIf _ t e) = loops t || loops e
+loops (TCase _ arms) =
+  List.any
+    (\arm -> case arm of
+     MkArm _ _ t -> loops t)
+    arms
+
+-- | the events of the worklist, last first: what is seen where the loop's
+-- | next round may be reached (`lp`, as each tail says) seen on each
+-- | round
+walk : Know -> Bool -> List Event -> List Item -> List Event
+walk sg lp acc Nil = acc
+walk sg lp acc (Cons (IVal r (SVar x)) rest) =
+  walk sg lp (Cons (atRound lp (Wants x r)) acc) rest
+walk sg lp acc (Cons (IVal r (SPrim p argv)) rest) =
+  walk sg lp acc (pushPrim p argv rest)
+walk sg lp acc (Cons (IVal r (STag _ argv ts)) rest) =
+  walk sg lp acc (pushArgs (tagSlots ts (List.length argv)) argv rest)
+walk sg lp acc (Cons (IVal r (SRec fs ts)) rest) =
+  walk sg lp acc (pushArgs (slotReprs ts) (List.map snd fs) rest)
+walk sg lp acc (Cons (IVal r (SProj v _ _ _)) rest) =
+  walk sg lp acc (Cons (IVal RepV v) rest)
+walk sg lp acc (Cons (IVal r (SLam xs (MkBlock t))) rest) =
   walk
     sg
-    (lamEvents xs (walk sg Nil (Cons (ITl Nil (RetAs RepV) t) Nil)) acc)
+    lp
+    (lamEvents
+       lp
+       xs
+       (walk sg False Nil (Cons (ITl Nil (RetAs RepV) t) Nil))
+       acc)
     rest
-walk sg acc (Cons (IVal r _) rest) = walk sg acc rest
-walk sg acc (Cons (IAny (SVar _)) rest) = walk sg acc rest
-walk sg acc (Cons (IAny v) rest) = walk sg acc (Cons (IVal RepV v) rest)
-walk sg acc (Cons (IBind x (OSimple (SVar y))) rest) =
-  walk sg (Cons (Merge x y) acc) rest
-walk sg acc (Cons (IBind x (OSimple v)) rest) =
-  walk sg (Cons (sourceOf x v) acc) (Cons (IVal RepV v) rest)
-walk sg acc (Cons (IBind x OAbandon) rest) = walk sg acc rest
-walk sg acc (Cons (IBind x (OCall g argv)) rest) =
+walk sg lp acc (Cons (IVal r _) rest) = walk sg lp acc rest
+walk sg lp acc (Cons (IAny (SVar _)) rest) = walk sg lp acc rest
+walk sg lp acc (Cons (IAny v) rest) = walk sg lp acc (Cons (IVal RepV v) rest)
+walk sg lp acc (Cons (IBind x (OSimple (SVar y))) rest) =
+  walk sg lp (Cons (Merge x y) acc) rest
+walk sg lp acc (Cons (IBind x (OSimple v)) rest) =
+  walk sg lp (Cons (atRound lp (sourceOf x v)) acc) (Cons (IVal RepV v) rest)
+walk sg lp acc (Cons (IBind x OAbandon) rest) = walk sg lp acc rest
+walk sg lp acc (Cons (IBind x (OCall g argv)) rest) =
   walk
     sg
-    (Cons (givenAs x (resultIn sg.sigs g)) acc)
+    lp
+    (Cons (atRound lp (givenAs x (resultIn sg.sigs g))) acc)
     (Cons (IOp (OCall g argv)) rest)
-walk sg acc (Cons (IBind x o) rest) =
-  walk sg (stepGives x o acc) (Cons (IOp o) rest)
-walk sg acc (Cons (IOp (OSimple v)) rest) =
-  walk sg acc (Cons (IVal RepV v) rest)
-walk sg acc (Cons (IOp (OCall g argv)) rest) =
-  walk sg acc (pushArgs (paramReprsIn sg.sigs g argv) argv rest)
-walk sg acc (Cons (IOp (OApply f argv)) rest) =
-  walk sg acc (pushVals RepV (Cons f argv) rest)
-walk sg acc (Cons (IOp (OPrim _ argv)) rest) =
-  walk sg acc (pushVals RepV argv rest)
-walk sg acc (Cons (IOp (OBool c)) rest) = walk sg acc (Cons (ICond c) rest)
-walk sg acc (Cons (IOp _) rest) = walk sg acc rest
-walk sg acc (Cons (ICond (PRel p a b)) rest) =
-  walk sg acc (pushArgs (argReprs p [a, b]) [a, b] rest)
-walk sg acc (Cons (ICond (PBool v)) rest) =
-  walk sg acc (Cons (IVal RepV v) rest)
-walk sg acc (Cons (ICond (PNot c)) rest) = walk sg acc (Cons (ICond c) rest)
-walk sg acc (Cons (ICond (PIf a b c)) rest) =
-  walk sg acc (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
-walk sg acc (Cons (ICond (PLet x o c)) rest) =
-  walk sg (Cons (Binds x) acc) (Cons (IBind x o) (Cons (ICond c) rest))
-walk sg acc (Cons (ICond _) rest) = walk sg acc rest
-walk sg acc (Cons (ISts Nil) rest) = walk sg acc rest
-walk sg acc (Cons (ISts (Cons (SLet x o) ss)) rest) =
-  walk sg (Cons (Binds x) acc) (Cons (IBind x o) (Cons (ISts ss) rest))
-walk sg acc (Cons (ISts (Cons (SDecl x) ss)) rest) =
-  walk sg (Cons (Binds x) acc) (Cons (ISts ss) rest)
-walk sg acc (Cons (ISts (Cons (SSet x o) ss)) rest) =
-  walk sg acc (Cons (IBind x o) (Cons (ISts ss) rest))
-walk sg acc (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
+walk sg lp acc (Cons (IBind x o) rest) =
+  walk sg lp (stepGives lp x o acc) (Cons (IOp o) rest)
+walk sg lp acc (Cons (IOp (OSimple v)) rest) =
+  walk sg lp acc (Cons (IVal RepV v) rest)
+walk sg lp acc (Cons (IOp (OCall g argv)) rest) =
+  walk sg lp acc (pushArgs (paramReprsIn sg.sigs g argv) argv rest)
+walk sg lp acc (Cons (IOp (OApply f argv)) rest) =
+  walk sg lp acc (pushVals RepV (Cons f argv) rest)
+walk sg lp acc (Cons (IOp (OPrim _ argv)) rest) =
+  walk sg lp acc (pushVals RepV argv rest)
+walk sg lp acc (Cons (IOp (OBool c)) rest) =
+  walk sg lp acc (Cons (ICond c) rest)
+walk sg lp acc (Cons (IOp _) rest) = walk sg lp acc rest
+walk sg lp acc (Cons (ICond (PRel p a b)) rest) =
+  walk sg lp acc (pushArgs (argReprs p [a, b]) [a, b] rest)
+walk sg lp acc (Cons (ICond (PBool v)) rest) =
+  walk sg lp acc (Cons (IVal RepV v) rest)
+walk sg lp acc (Cons (ICond (PNot c)) rest) =
+  walk sg lp acc (Cons (ICond c) rest)
+walk sg lp acc (Cons (ICond (PIf a b c)) rest) =
+  walk sg lp acc (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
+walk sg lp acc (Cons (ICond (PLet x o c)) rest) =
+  walk sg lp (Cons (Binds x) acc) (Cons (IBind x o) (Cons (ICond c) rest))
+walk sg lp acc (Cons (ICond _) rest) = walk sg lp acc rest
+walk sg lp acc (Cons (ISts Nil) rest) = walk sg lp acc rest
+walk sg lp acc (Cons (ISts (Cons (SLet x o) ss)) rest) =
+  walk sg lp (Cons (Binds x) acc) (Cons (IBind x o) (Cons (ISts ss) rest))
+walk sg lp acc (Cons (ISts (Cons (SDecl x) ss)) rest) =
+  walk sg lp (Cons (Binds x) acc) (Cons (ISts ss) rest)
+walk sg lp acc (Cons (ISts (Cons (SSet x o) ss)) rest) =
+  walk sg lp acc (Cons (IBind x o) (Cons (ISts ss) rest))
+walk sg lp acc (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
   walk
     sg
+    lp
     acc
     (Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest))))
-walk sg acc (Cons (ISts (Cons (SCase v arms) ss)) rest) =
+walk sg lp acc (Cons (ISts (Cons (SCase v arms) ss)) rest) =
   walk
     sg
+    lp
     (pinArms sg.flat arms acc)
     (Cons (IVal RepV v) (armsSts arms (Cons (ISts ss) rest)))
-walk sg acc (Cons (ITl ps rt (TSeq ss t)) rest) =
-  walk sg acc (Cons (ISts ss) (Cons (ITl ps rt t) rest))
-walk sg acc (Cons (ITl ps rt (TReturn o)) rest) =
-  walk sg acc (returned rt o rest)
-walk sg acc (Cons (ITl ps rt (TLoop vs)) rest) =
-  walk sg acc (loopBinds ps vs rest)
-walk sg acc (Cons (ITl ps rt (TIf c t e)) rest) =
-  walk sg acc (Cons (ICond c) (Cons (ITl ps rt t) (Cons (ITl ps rt e) rest)))
-walk sg acc (Cons (ITl ps rt (TCase v arms)) rest) =
+walk sg lp acc (Cons (ITl ps rt (TSeq ss t)) rest) =
+  walk sg (loops t) acc (Cons (ISts ss) (Cons (ITl ps rt t) rest))
+walk sg lp acc (Cons (ITl ps rt (TReturn o)) rest) =
+  walk sg False acc (returned rt o rest)
+walk sg lp acc (Cons (ITl ps rt (TLoop vs)) rest) =
+  walk sg True acc (loopBinds ps vs rest)
+walk sg lp acc (Cons (ITl ps rt (TIf c t e)) rest) =
   walk
     sg
+    (loops t || loops e)
+    acc
+    (Cons (ICond c) (Cons (ITl ps rt t) (Cons (ITl ps rt e) rest)))
+walk sg lp acc (Cons (ITl ps rt (TCase v arms)) rest) =
+  walk
+    sg
+    (loops (TCase v arms))
     (pinArms sg.flat arms acc)
     (Cons (IVal RepV v) (armsTl ps rt arms rest))
 
@@ -701,14 +749,16 @@ defEvents : Know -> Imperative.Def -> List Event
 defEvents sg (MkDef key _ (DefFun xs (MkBlock t))) =
   walk
     sg
+    False
     (List.foldl entered Nil (List.zip xs (paramReprsIn sg.sigs key xs)))
     (Cons (ITl xs (RetAs (resultIn sg.sigs key)) t) Nil)
 defEvents sg (MkDef _ _ (DefVal (MkBlock t))) =
-  walk sg Nil (Cons (ITl Nil (RetAs RepV) t) Nil)
+  walk sg False Nil (Cons (ITl Nil (RetAs RepV) t) Nil)
 
 -- (a `V` given a parameter every call gives a word, `ws`: known one)
 asWord : Map.Map String Unit -> Event -> Event
 asWord ws (Boxed x) = if Map.member ws x then BoxedWord x else Boxed x
+asWord ws (Often e) = Often (asWord ws e)
 asWord ws e = e
 
 -- (the parameters at the places `is`, by name)
@@ -739,6 +789,7 @@ proposalEvents sg xs t =
     (Wants retName RepV)
     (walk
        sg
+       False
        (List.foldl entered Nil (List.map (\x -> MkPair x RepV) xs))
        (Cons (ITl xs RetClass t) Nil))
 
@@ -865,6 +916,7 @@ seen (Wants _ RepV) s = statsWith RepV 0 0 1 0 False s
 seen (Wants _ r) s = statsWith r 0 0 0 1 False s
 seen (Pinned _) s = statsWith RepV 0 0 0 0 True s
 seen (Kept _ r) s = keptTo r s
+seen (Often e) s = List.foldl (\acc _ -> seen e acc) s (List.range 1 loopWeight)
 seen e s = s
 
 eventName : Event -> String
@@ -878,6 +930,7 @@ eventName (Pinned x) = x
 eventName (Binds x) = x
 eventName (Merge x _) = x
 eventName (Kept x _) = x
+eventName (Often e) = eventName e
 
 -- (an event of the class `root`)
 seenIn : Map.Map String Stats -> Event -> String -> Map.Map String Stats
@@ -976,6 +1029,8 @@ eventsOf evs = unpinned (pinnedIn evs) evs
 -- | a definition's unboxed variables, the workers being `sg`
 -- | >>> Map.toList (reprsWith noKnow (MkDef "f" "f" (DefFun ["x"] (MkBlock (TReturn (OSimple (SPrim "int64Add" [SVar "x", SVar "x"])))))))
 -- | [MkPair "x" (RepFix I64)]
+-- | >>> Map.toList (reprsWith noKnow (MkDef "f" "f" (DefFun ["t"] (MkBlock (TIf (PRel "floatLt" (SVar "t") (SFloat 9.0)) (TLoop [SPrim "floatAdd" [SVar "t", SFloat 1.0]]) (TReturn (OSimple (SLam ["k"] (MkBlock (TReturn (OApply (SVar "k") [SVar "t"])))))))))))
+-- | [MkPair "t" RepF64]
 reprsWith : Know -> Imperative.Def -> Reprs
 reprsWith sg d = reprsFrom (eventsOf (defEvents sg d))
 
