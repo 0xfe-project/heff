@@ -26,13 +26,13 @@ import std.io
 -- | >>> map not [True, False]
 -- | [False, True]
 map : {a b : Type} -> (a -> b) -> List a -> List b
-map f Nil = Nil
+map f [] = []
 map f (y :: ys) = f y :: map f ys
 
 -- | each line printed: a computation that needs the standard streams,
 -- | in any world `e` that has them
 printAll : {e : HFunctor} -> {{io : stdio <: e}} -> List String -> Co e Unit
-printAll Nil = pure MkUnit
+printAll [] = pure MkUnit
 printAll (l :: ls) = do
   print l
   printAll ls
