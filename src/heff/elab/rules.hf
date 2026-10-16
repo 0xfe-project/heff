@@ -3814,3 +3814,83 @@ litEq sp x xsp eq lit =
 
 -- >>> (\(p : Pair Memoed.El Value.Ty) -> 1) (MkPair Memoed.abandonM VPrimInt)
 -- 1
+
+-- Lazy
+--------------------------------------------------------------------------------
+
+-- | the `A` of the builtin `Lazy A`, of a type that is one
+lazyOf : Value.Ty -> Maybe Value.V
+lazyOf (VDecode (HGlobal k) (SpApp SpId x) _ _ _) =
+  if strEq k "builtin.Lazy" then Just x else Nothing
+lazyOf _ = Nothing
+
+-- | the type `Lazy c`, `c` a type
+lazyType : Params.Span -> Chk -> Syn
+lazyType sp c = functionElim sp (findPrim sp "builtin.Lazy") c
+
+-- | `~e` made: the builtin `delay` (no name of anyone's) at the type
+-- | `a` (`Lazy a`'s), given `\_ -> e`
+delayAt : Params.Span -> Chk -> Chk -> Syn
+delayAt sp a thunk =
+  functionElim
+    sp
+    (functionElimNamed sp "a" (findPrim sp "builtin.delay") a)
+    thunk
+
+-- (a type known, as an argument: a code)
+givenCode : Value.V -> Chk
+givenCode x = MkChk (\e a -> pure (Memoed.fromVEl N e.scope.len x))
+
+givenType : Value.Ty -> Chk
+givenType t =
+  MkChk (\e a -> pure (Memoed.code (Memoed.fromVTy N e.scope.len t)))
+
+-- (`m`, elaborated where the lambda is, as its body: the lambda binds
+-- nothing it names)
+constLam : Memoed.El -> Chk
+constLam m =
+  MkChk
+    (\e a ->
+       pure
+         (Memoed.lam
+            (caseOf e.elabFor)
+            e.globals
+            e.scope.locals
+            (Memoed.fromVTy N e.scope.len a)
+            (AbsConst m)))
+
+-- | `~e`, `e` inferring (`s`): the type `Lazy e` where `e` is a type (of
+-- | a universe), else `e` delayed, a `Lazy` of its type
+lazySyn : Params.Span -> Syn -> Syn
+lazySyn sp s =
+  MkSyn (\e -> do
+  pm <- runSyn s e
+  a <- Meta.forceT (snd pm)
+  case Value.behavior a of
+    LikeU _ -> runSyn (lazyType sp (apply sp (MkSyn (\e2 -> pure pm)))) e
+    _ -> do
+      pi <- insertImplicits e sp (fst pm) a
+      runSyn (delayAt sp (givenType (snd pi)) (constLam (fst pi))) e)
+
+-- (`~e` where neither a `Lazy` nor a universe is expected: the type
+-- `Lazy e` where a universe is, else as it infers, `s`)
+lazyOther : Params.Span -> Chk -> Syn -> ElabEnv -> Value.Ty -> Elab Memoed.El
+lazyOther sp c s e a = case Value.behavior a of
+  LikeU _ -> runChk (apply sp (lazyType sp c)) e a
+  _ -> runChk (apply sp s) e a
+
+-- | `~e` checked (`c`, `e` checked; `s`, `~e` inferring): where a
+-- | `Lazy A` is expected, `e` checked at `A` and delayed; where a
+-- | universe is, the type `Lazy e`; else as it infers.  Nothing but
+-- | `~e` is delayed so: an `e` where a `Lazy A` is expected is no `~e`.
+lazyChk : Params.Span -> Chk -> Syn -> Chk
+lazyChk sp c s =
+  MkChk (\e a0 -> do
+  a <- Meta.forceT a0
+  case lazyOf a of
+    Just x ->
+      runChk
+        (apply sp (delayAt sp (givenCode x) (functionIntro sp "_" c)))
+        e
+        a
+    Nothing -> lazyOther sp c s e a)

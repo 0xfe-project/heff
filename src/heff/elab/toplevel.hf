@@ -524,6 +524,17 @@ updateNames : Params.Spanned (Presyntax.UpdateSet Presyntax.Checkable)
             -> List String
 updateNames (At (SetPath path v) _) = Clauses.identsOf v Nil
 
+-- | `~e` inferring: the type `Lazy e` of a type, else `e` delayed, `e`
+-- | inferring
+lazyInf : TK -> Params.Span -> Presyntax.Checkable -> Elab Rules.Syn
+lazyInf tk sp (At (CInf i) _) = do
+  s <- tk.infJ i
+  pure (Rules.lazySyn sp s)
+lazyInf tk sp c@(At (CType _) _) = do
+  j <- tk.chkJ c
+  pure (Rules.lazyType sp j)
+lazyInf tk sp c = tk.infJ (Presyntax.toInferable (IsCheckable c))
+
 -- | a term that infers its type
 infF : TK -> Presyntax.Inferable -> Elab Rules.Syn
 -- Variable rule
@@ -568,6 +579,7 @@ infF tk (At (INominal i) _) = do
 infF tk (At (ILitEq x xsp eq lit) sp) = do
   j <- tk.chkJ lit
   pure (Rules.litEq sp x xsp eq j)
+infF tk (At (ILazy c) sp) = lazyInf tk sp c
 
 -- | a term checked against a type, as written (no implicit lambdas
 -- | around it)
@@ -674,10 +686,38 @@ typeChk tk sp t = do
   a <- tk.typJ t
   pure (Rules.universeIntro sp a)
 
+markedIf : Bool -> Rules.Chk -> Rules.Chk
+markedIf True j = nominalChk j
+markedIf False j = j
+
+-- (what `~e` delays, if it is one)
+lazyOperand : Presyntax.Inferable -> Maybe Presyntax.Checkable
+lazyOperand (At (ILazy c) _) = Just c
+lazyOperand _ = Nothing
+
+-- | `~e` checked: by the type expected, delayed or the type `Lazy e`, or
+-- | else as it infers (in descriptive position, its result marked
+-- | nominal, as any term's that does not pass it on)
+lazyChkF : TK -> Bool -> Params.Span -> Presyntax.Checkable -> Elab Rules.Chk
+lazyChkF tk nominal sp c = do
+  j <- recoveringChk (tk.chkJ c)
+  pure
+      (Rules.implicitLams
+         (markedIf
+            nominal
+            (Rules.lazyChk
+               sp
+               j
+               (MkSyn (\e -> do
+                s <- lazyInf tk sp c
+                Rules.runSyn s e)))))
+
 -- | a term checked against a type, the implicit lambdas around it
 -- | inserted (`{x} => e` binds the implicit argument itself)
 chkF : TK -> Presyntax.Checkable -> Elab Rules.Chk
-chkF tk (At (CInf i) _) = chkInf tk i
+chkF tk (At (CInf i) _) = case lazyOperand (Presyntax.unNominal i) of
+  Just c -> lazyChkF tk (nominalInf i) (Params.spanOf i) c
+  Nothing -> chkInf tk i
 chkF tk (At (CType t) sp) = typeChk tk sp t
 chkF tk n = do
   j <- tk.rawJ n
