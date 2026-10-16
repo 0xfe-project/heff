@@ -96,39 +96,39 @@ tag's with `heff_tget_v`, never directly.
 ## Operations described in C
 
 ```haskell
-import ffi as Ffi
+import ffi as FFI
 
-threadsInC : Ffi.Described
+threadsInC : FFI.Described
 threadsInC =
-  Ffi.describe
+  FFI.describe
     []
-    [Ffi.operation "Cores" (Ffi.fun "th_cores" [] (Ffi.gives Ffi.int64))]
+    [FFI.operation "Cores" (FFI.fun "th_cores" [] (FFI.gives FFI.int64))]
 ```
 
 An operation that is one C call need not be written in the provider: a
 definition of type `Ffi.Described` in the effect's module describes it,
 and the compiler writes the glue.
 
-`Ffi.describe headers operations` lists the headers to include and the
+`FFI.describe headers operations` lists the headers to include and the
 operations. Each operation names its tag and a C function: the
 function's name, its arguments (the operation's fields but the last),
 and its result.
 
 | Argument type | heff type |
 |---|---|
-| `Ffi.int`, `Ffi.int64`, `Ffi.integer "mode_t"` | `Int` |
-| `Ffi.double` | `Float64` |
-| `Ffi.bool` | `Bool` |
-| `Ffi.string`, `Ffi.text` | `String`, as `const char *` |
-| `Ffi.pointer "FILE" "fclose"` | a host type; `fclose` lets it go |
-| `Ffi.sharedPointer T drop hold` | a host type that can cross places |
+| `FFI.int`, `FFI.int64`, `FFI.integer "mode_t"` | `Int` |
+| `FFI.double` | `Float64` |
+| `FFI.bool` | `Bool` |
+| `FFI.string`, `FFI.text` | `String`, as `const char *` |
+| `FFI.pointer "FILE" "fclose"` | a host type; `fclose` lets it go |
+| `FFI.sharedPointer T drop hold` | a host type that can cross places |
 
 | Result | heff type |
 |---|---|
-| `Ffi.gives t` | the value; `Ffi.void` gives `MkUnit` |
-| `Ffi.givesOrErrno t` | `Either Errno a`: `-1` or `NULL` with `errno` is `Left` |
-| `Ffi.doneOrErrno` | `Either Errno Unit` |
-| `Ffi.ownedString` | a `char *` from `malloc`, copied and freed |
+| `FFI.gives t` | the value; `FFI.void` gives `MkUnit` |
+| `FFI.givesOrErrno t` | `Either Errno a`: `-1` or `NULL` with `errno` is `Left` |
+| `FFI.doneOrErrno` | `Either Errno Unit` |
+| `FFI.ownedString` | a `char *` from `malloc`, copied and freed |
 
 - The compiler checks the description against the effect: a wrong tag,
   a wrong number of fields, or a field that cannot cross is an error.
