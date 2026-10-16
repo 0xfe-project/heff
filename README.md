@@ -83,15 +83,7 @@ heff dev                   # build, run and serve; again at each change
 
 ## Documentation
 
-- [The tutorial](docs/tutorial/first-program.md): heff, learned by
-  writing a program
-- [The language](docs/reference/language/modules.md): modules, data,
-  arguments, operators, numbers, text, `do`, effects
-- [The library](docs/reference/library/index.md): what `lib/` has, and
-  the examples
-- [Projects](docs/reference/projects.md), [Commands](docs/reference/commands.md),
-  [Tests](docs/reference/tests.md), [Providers](docs/reference/providers.md)
-- [Developing heff](DEVELOPING.md): the source, the seed, the tests
+The tutorial and the reference: <https://dannypsnl.github.io/heff/>.
 
 ## Developing
 
