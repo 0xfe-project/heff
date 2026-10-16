@@ -1794,6 +1794,54 @@ mismatch e sp a a' err = case escapeLevel err of
   Just l -> escapeAt e sp a a' err l (heldLocal l e.scope.names e.scope.ctx)
   Nothing -> plainMismatch e sp a a' (prettyEqErr e.globals err)
 
+-- | the prelude's `Coe from to`, of the types `from` and `to`, where the
+-- | prelude has it (not in the prelude before its `theory Coe`, nor in
+-- | builtin)
+coeGoal : ElabEnv -> Value.Ty -> Value.Ty -> Maybe Value.Ty
+coeGoal e from to = case Globals.keyedEntry e.globals "prelude.Coe" of
+  Just (MkPair key ge) ->
+    Just
+      (Memoed.tyN
+         (Memoed.decode
+            (Memoed.app
+               (Memoed.app
+                  (Memoed.global key ge.value)
+                  (Memoed.code (Memoed.fromVTy N e.scope.len from)))
+               (Memoed.code (Memoed.fromVTy N e.scope.len to)))))
+  Nothing -> Nothing
+
+-- | `m`, of the type `a'`, where `a` is expected and the two do not
+-- | unify: `coe m`, by the one instance of `Coe a' a` in scope, found as
+-- | an instance argument is -- where both types are known whole and one
+-- | fits; else the mismatch, as it is.  The coercion is put in once, its
+-- | result of `a` itself: never another after it.
+coerced : ElabEnv
+        -> Params.Span
+        -> Value.Ty
+        -> Value.Ty
+        -> Memoed.El
+        -> Conversion.EqErr
+        -> Maybe Value.Ty
+        -> Elab Memoed.El
+coerced e sp a a' m err Nothing = mismatch e sp a a' err
+coerced e sp a a' m err (Just goal) = do
+  mc <- gets (\c -> c.metas)
+  if not (List.null (metasLeft e mc a)) || not (List.null (metasLeft e mc a'))
+    then mismatch e sp a a' err
+    else do
+      found <-
+        witnessMatches e sp goal (List.append (instLocals e) (instGlobals e))
+      if List.null found then mismatch e sp a a' err
+        else do
+          hole <- freshMeta e.scope.len e.scope.locals goal "coe" sp
+          resolveWanted e sp topSearch (metaOf hole.stx) hole.val goal True
+          traceE
+              sp
+              "coerce"
+              (\u -> instShown e mc a' ^ "  ~>  " ^ instShown e mc a)
+          Meta.runDelayed False
+          pure (Memoed.app (Memoed.proj (mEl hole.stx hole.val) "coe") m)
+
 applyGo : Params.Span
         -> ElabEnv
         -> Value.Ty
@@ -1819,7 +1867,7 @@ applyGo sp e a (MkPair m a') = do
     Right _ -> do
       Meta.runDelayed False
       pure m
-    Left err -> mismatch e sp a a' err
+    Left err -> coerced e sp a a' m err (coeGoal e a' a)
 
 apply : Params.Span -> Syn -> Chk
 apply sp syn =

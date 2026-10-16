@@ -93,4 +93,6 @@ A theory is built and updated like a record. A field whose type depends
 on a field being set is set too.
 
 A theory declared again is a new type: a module's own `Equality` is not
-the prelude's.
+the prelude's. So only the prelude's `Coe` makes a
+[coercion](arguments.md#coercions), never a module's own theory of
+that name.
