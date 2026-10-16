@@ -2471,6 +2471,15 @@ FLT_CMP(heff_floatLt, <)
 FLT_CMP(heff_floatLe, <=)
 HEFF_FN V heff_floatFromInt(V a) { double d = heff_double_of_int(a); heff_drop(a); return heff_flt(d); }
 HEFF_FN V heff_floatSqrt(V a) { double x = FLT_OF(a); heff_drop(a); return heff_flt(sqrt(x)); }
+// (the target the program is built for)
+HEFF_FN V heff_onWindows(V u) {
+  heff_drop(u);
+#ifdef _WIN32
+  return heff_bool(1);
+#else
+  return heff_bool(0);
+#endif
+}
 
 // (std.math's: libm's, as JavaScript's `Math` has them)
 #define FLT1(name, f) \
