@@ -155,5 +155,5 @@ statement.
 - A `with` throws what it could not acquire or release: a `try` around
   it catches that.
 
-`with` starts a statement only: anywhere else it is a name like any
-other.
+`with` and `as` are [keywords](definitions.md#keywords): neither is a
+name.

@@ -28,6 +28,16 @@ A pattern is one of:
 
 Patterns nest: `Node x (c :: cs)`.
 
+## Keywords
+
+These words are keywords, and nothing is named by one:
+`data`, `type`, `theory`, `primitive`, `instance`, `mutual`, `import`,
+`as`, `case`, `of`, `if`, `then`, `else`, `do`, `where`, `let`, `in`,
+`mut`, `while`, `for`, `break`, `continue`, `return`, `try`, `catch`,
+`with`, `test`, `abandon`, `infixl`, `infixr`, `infix`; and the
+built-in types' names, `Type`, `Int`, `String`, `Rune`, `Array` and
+the sized numbers (`Int8` to `UInt64`, `Float32`, `Float64`).
+
 ## Expressions
 
 ```haskell

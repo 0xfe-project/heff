@@ -73,7 +73,8 @@ import rune as Rune
 ```
 
 `import m` brings in every name `m` exposes. `import m as M` brings them
-in qualified only: `M.x`.
+in qualified only: `M.x`. `as`, as `import` is, is a
+[keyword](definitions.md#keywords).
 
 Every module also has, without writing them:
 
