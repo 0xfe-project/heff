@@ -1135,6 +1135,47 @@ built file name cflags tag = do
     Left why -> failure ("not compiled: " ^ why)
     Right bin -> pure bin
 
+-- | the program `name` of a file of test/node/, compiled to C as parts
+-- | -- a file a module, and heff.h every one includes -- in a directory
+-- | of its own, outside any project, and built: where it is; else the
+-- | test fails
+builtParts : {e : HFunctor}
+           -> {{chk : check <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> String
+           -> String
+           -> Co e String
+builtParts m name = do
+  root <- given "HEFF_TEST_ROOT"
+  working <- workingDir
+  let here = toString working
+  let dir = here ^ "/" ^ m ^ "-parts"
+  made <- makeDirectory dir
+  text <- readFile (root ^ "/test/node/" ^ m ^ ".hf")
+  copied <-
+    writeFile
+      (dir ^ "/" ^ m ^ ".hf")
+      (joinWith
+         ("module " ^ m)
+         (split ("module test.node." ^ m) (fromMaybe "" text)))
+  r <-
+    heffIn dir ["compile", m ^ ".hf", "parts/", "--name", name, "--backend=c"]
+  names <- readDirectory (dir ^ "/parts")
+  parts <-
+    pure (List.sort (List.keepIf (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+  b <-
+    if succeeded r
+    then buildC
+        (List.map (\n -> dir ^ "/parts/" ^ n) parts)
+        (dir ^ "/parts/heff.zig")
+        (dir ^ "/" ^ name)
+        Nil
+    else pure (Just (said r))
+  case b of
+    Just why -> failure ("not compiled as parts: " ^ why)
+    Nothing -> pure (dir ^ "/" ^ name)
+
 -- | what a program is to do: write these to its output and its error
 -- | stream (each, if said) and end so
 type Want =
@@ -2692,6 +2733,33 @@ placesTest = do
                 ^ "the main place's threads all ended\n")
          })
 
+-- (what the threads' `main` says)
+threadsMain : String
+threadsMain =
+  "said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
+  ^ "a definition, shared: 333833500 333833501 333833502 333833503\n"
+  ^ "flat fields, frozen and shared: 2528 2529 2530\nworkers: 82810 92940 102988\n"
+  ^ "primes below 100000, by 4: 9592\n"
+  ^ "forced at once: 6765 6765 6765 6765\nfib 20, each Parallel a thread: 6765\n"
+
+-- (the threads' `main` compiled as parts, run: every part built for
+-- threads, as the one with the program's `main` is)
+threadsParts : {e : HFunctor}
+             -> {{chk : check <: e}}
+             -> {{sys : process <: e}}
+             -> {{disk : filesystem <: e}}
+             -> Co e Unit
+threadsParts = do
+  bin <- builtParts "threads" "main"
+  r <-
+    run
+      { command = bin
+      , env = [MkPair "ASAN_OPTIONS" "detect_leaks=0"]
+      , timeout = 60000
+      }
+  failingWith
+      (against "main, as parts" { out = Just threadsMain, err = Just "" } r)
+
 -- | threads truly at once (std.thread, the runtime built for threads):
 -- | the rest of the program run by each thread, shared by them, their
 -- | answers gathered in order; a definition every thread asks for,
@@ -2707,19 +2775,8 @@ threads : {e : HFunctor}
         -> {{disk : filesystem <: e}}
         -> Co e Unit
 threads = do
-  subtest
-      "main"
-      (threadRun
-         "main"
-         Nil
-         { out =
-             Just
-               ("said before the spread, once\nsquares: 0 1 4 9\nnested: 3 33\neach its own: 0 15 30\n"
-                ^ "a definition, shared: 333833500 333833501 333833502 333833503\n"
-                ^ "flat fields, frozen and shared: 2528 2529 2530\nworkers: 82810 92940 102988\n"
-                ^ "primes below 100000, by 4: 9592\n"
-                ^ "forced at once: 6765 6765 6765 6765\nfib 20, each Parallel a thread: 6765\n")
-         })
+  subtest "main" (threadRun "main" Nil { out = Just threadsMain })
+  subtest "parts" threadsParts
   subtest
       "generic"
       (threadRun
