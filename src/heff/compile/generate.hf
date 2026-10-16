@@ -1,0 +1,178 @@
+-- Arrays generated flat (#102), for the C backend: `generate` of a
+-- function builds an array of the `V`s the function gives -- flat only
+-- where they are `Float64`s, which the runtime can tell, and not where
+-- they are `Int64`s or another fixed-width number's, which it cannot
+-- tell from an `Int`'s -- so such an array is read an element at a
+-- time, each looked at, and no loop of it is made vector operations.
+-- But where the function is a lambda that gives every value it returns
+-- as a number's box (heff.compile.repr's), the array is of that number:
+-- built flat (`heff_arrayGenerate_i64`), each value unboxed as it comes,
+-- as `replicate` builds one of a number kept unboxed.
+
+module heff.compile.generate
+
+import heff.compile.owned as Owned
+import heff.compile.refcount as RefCount
+import heff.compile.repr as Repr
+
+-- What a lambda gives
+--------------------------------------------------------------------------------
+
+-- (a number an array keeps flat)
+flatRepr : Repr.Repr -> Bool
+flatRepr RepF64 = True
+flatRepr (RepFix _) = True
+flatRepr r = False
+
+-- (the number a value returned is the box of)
+boxedAs : RefCount.Value -> Maybe Repr.Repr
+boxedAs (RBox r _) = if flatRepr r then Just r else Nothing
+boxedAs e = Nothing
+
+-- (what a value returned is: abandoned, any type's; else the box of)
+returnedAs : RefCount.Value -> List (Maybe Repr.Repr) -> List (Maybe Repr.Repr)
+returnedAs RAbandon acc = acc
+returnedAs e acc = Cons (boxedAs e) acc
+
+-- (what each return gives, in front of `acc`: `Nothing` for what is not
+-- a number's box, or a call last, whose value is not seen)
+givesSt : (List (Maybe Repr.Repr)
+           -> List RefCount.Statement
+           -> List (Maybe Repr.Repr))
+        -> List (Maybe Repr.Repr)
+        -> RefCount.Statement
+        -> List (Maybe Repr.Repr)
+givesSt go acc (CReturn e) = returnedAs e acc
+givesSt go acc (CIf _ a b) = go (go acc a) b
+givesSt go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (RefCount.caseArmBody arm)) acc arms
+givesSt go acc (CInPlace _ _) = Cons Nothing acc
+givesSt go acc (CRoomed _ _) = Cons Nothing acc
+givesSt go acc (CTail _ _) = Cons Nothing acc
+givesSt go acc (CLoop _ _) = Cons Nothing acc
+givesSt go acc (CLoopTo _ _ _) = Cons Nothing acc
+givesSt go acc (CJump _ _ _) = Cons Nothing acc
+givesSt go acc s = acc
+
+gives : List (Maybe Repr.Repr)
+      -> List RefCount.Statement
+      -> List (Maybe Repr.Repr)
+gives acc ss = List.foldl (givesSt gives) acc ss
+
+sameNumber : Repr.Repr -> Maybe Repr.Repr -> Bool
+sameNumber r (Just s) = Repr.reprEq r s
+sameNumber r Nothing = False
+
+-- (the one number of them all, if they are all one's)
+oneNumber : List (Maybe Repr.Repr) -> Maybe Repr.Repr
+oneNumber (Cons (Just r) rest) =
+  if List.all (sameNumber r) rest then Just r else Nothing
+oneNumber rs = Nothing
+
+-- | the number a lambda gives, the box of, wherever it returns
+givenNumber : RefCount.Value -> Maybe Repr.Repr
+givenNumber (RLam _ _ _ (MkCode body)) = oneNumber (gives Nil body)
+givenNumber e = Nothing
+
+-- (the function a `generate` is given)
+secondOf : List RefCount.Value -> Maybe RefCount.Value
+secondOf (Cons _ (Cons f Nil)) = Just f
+secondOf es = Nothing
+
+-- | a primitive, `generate` made flat where its function gives a number
+flatPrim : String -> List RefCount.Value -> RefCount.Value
+flatPrim p es =
+  if strEq p "arrayGenerate"
+  then maybe
+      (RPrim p es)
+      (\r -> RPrimAt p r es)
+      (maybe Nothing givenNumber (secondOf es))
+  else RPrim p es
+
+-- Everywhere
+--------------------------------------------------------------------------------
+
+-- | a value, each `generate` in it flat where it may be (`go`: a
+-- | lambda's body, so)
+genExp : (List RefCount.Statement -> List RefCount.Statement)
+       -> RefCount.Value
+       -> RefCount.Value
+genExp go (RTag t b es) = RTag t b (List.map (genExp go) es)
+genExp go (RTagIn e t b es) = RTagIn (genExp go e) t b (List.map (genExp go) es)
+genExp go (RRec ls b es) = RRec ls b (List.map (genExp go) es)
+genExp go (RRecIn x n k f s ls fs sure) =
+  RRecIn
+    x
+    n
+    k
+    f
+    s
+    ls
+    (List.map (\p -> MkPair (fst p) (genExp go (snd p))) fs)
+    sure
+genExp go (RField e i) = RField (genExp go e) i
+genExp go (RDupE e) = RDupE (genExp go e)
+genExp go (RFieldV e i) = RFieldV (genExp go e) i
+genExp go (RGetN e i n) = RGetN (genExp go e) i n
+genExp go (RFieldU r s e i) = RFieldU r s (genExp go e) i
+genExp go (RGetNU r s e i n) = RGetNU r s (genExp go e) i n
+genExp go (RWord r e) = RWord r (genExp go e)
+genExp go (RGetLabel e l) = RGetLabel (genExp go e) l
+genExp go (RPrim p es) = flatPrim p (List.map (genExp go) es)
+genExp go (RPrimAt p r es) = RPrimAt p r (List.map (genExp go) es)
+genExp go (RLam xs fv held (MkCode body)) =
+  RLam xs fv (List.map (genExp go) held) (MkCode (go body))
+genExp go (RCall g tr w args) =
+  RCall g tr w (List.map (Owned.mapArg (genExp go)) args)
+genExp go (RApply f es) = RApply (genExp go f) (List.map (genExp go) es)
+genExp go (RBool c) = RBool (Owned.mapCond (genExp go) c)
+genExp go (RBox r e) = RBox r (genExp go e)
+genExp go (RUnbox r e) = RUnbox r (genExp go e)
+genExp go (RPeek r e) = RPeek r (genExp go e)
+genExp go (RPrimU p es) = RPrimU p (List.map (genExp go) es)
+genExp go e = e
+
+genArm : (List RefCount.Statement -> List RefCount.Statement)
+       -> RefCount.CaseArm
+       -> RefCount.CaseArm
+genArm go (MkCArm t fs fl su pl tk body lv) =
+  MkCArm t fs fl su pl tk (go body) lv
+
+genSt : (List RefCount.Statement -> List RefCount.Statement)
+      -> RefCount.Statement
+      -> RefCount.Statement
+genSt go (CLet x e) = CLet x (genExp go e)
+genSt go (CSet x e) = CSet x (genExp go e)
+genSt go (CIf c a b) = CIf (Owned.mapCond (genExp go) c) (go a) (go b)
+genSt go (CSwitch e arms r) =
+  CSwitch (genExp go e) (List.map (genArm go) arms) r
+genSt go (CReturn e) = CReturn (genExp go e)
+genSt go (CInPlace f es) = CInPlace (genExp go f) (List.map (genExp go) es)
+genSt go (CRoomed f es) = CRoomed (genExp go f) (List.map (genExp go) es)
+genSt go (CTail f es) = CTail (genExp go f) (List.map (genExp go) es)
+genSt go (CLoop ps es) = CLoop ps (List.map (genExp go) es)
+genSt go (CLoopTo t ps es) = CLoopTo t ps (List.map (genExp go) es)
+genSt go (CJump g w es) = CJump g w (List.map (genExp go) es)
+genSt go s = s
+
+-- | statements, each `generate` in them flat where it may be
+genStmts : List RefCount.Statement -> List RefCount.Statement
+genStmts ss = List.map (genSt genStmts) ss
+
+genFun : RefCount.Fun -> RefCount.Fun
+genFun f =
+  { key = f.key
+  , params = f.params
+  , lent = f.lent
+  , entry = genStmts f.entry
+  , body = genStmts f.body
+  , reprs = f.reprs
+  , ret = f.ret
+  , wrapper = f.wrapper
+  }
+
+-- | a definition of the C backend's, each `generate` in it flat where
+-- | its function gives a number
+generateDef : RefCount.Def -> RefCount.Def
+generateDef (DFun f) = DFun (genFun f)
+generateDef (DVal x ss rs) = DVal x (genStmts ss) rs

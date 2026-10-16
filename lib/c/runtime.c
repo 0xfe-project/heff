@@ -3120,15 +3120,20 @@ HEFF_FAST double heff_arrayIndexIn_f64_lent(V a, V i, int give) {
   return x;
 }
 HEFF_FAST double heff_arrayIndexIn_f64(V a, V i) { return heff_arrayIndexIn_f64_lent(a, i, 3); }
+// (... of a fixed-width number, the array checked once to keep them
+// flat (`heff_arrayKeeps_i64`): read as it keeps them, not looked at)
 #define HEFF_ARR_INDEX_IN(S, T, K)                                             \
   HEFF_FAST T heff_arrayIndexIn_##S##_lent(V a, V i, int give) {               \
-    Arr *r = (Arr *)a;                                                         \
-    int64_t k = INT_OF(i);                                                     \
-    T x = r->h.tag == K ? HEFF_ARR_AT(r, T)[k] : heff_peek_##S(r->a[k]);       \
+    T x = HEFF_ARR_AT((Arr *)a, T)[INT_OF(i)];                                 \
     HEFF_GIVEN(give, 0, a);                                                    \
     return x;                                                                  \
   }                                                                            \
-  HEFF_FAST T heff_arrayIndexIn_##S(V a, V i) { return heff_arrayIndexIn_##S##_lent(a, i, 3); }
+  HEFF_FAST T heff_arrayIndexIn_##S(V a, V i) { return heff_arrayIndexIn_##S##_lent(a, i, 3); } \
+  HEFF_FAST V heff_arrayKeeps_##S##_lent(V a, int give) {                      \
+    V b = heff_bool(((Arr *)a)->h.tag == K);                                   \
+    HEFF_GIVEN(give, 0, a);                                                    \
+    return b;                                                                  \
+  }
 #define HEFF_ARR_INDEXES(S, T, K) HEFF_ARR_INDEX(S, T, K) HEFF_ARR_INDEX_IN(S, T, K)
 HEFF_ARR_INDEXES(i64, int64_t, HEFF_ARR_I64)
 HEFF_ARR_INDEXES(u64, uint64_t, HEFF_ARR_U64)
@@ -3322,6 +3327,30 @@ HEFF_FN V heff_arrayGenerate(V n, V f) {
   heff_drop(f);
   return (V)r;
 }
+
+// (... of a function known to give numbers of one type, `T`s
+// (heff.compile.generate): flat, each unboxed as it comes)
+#define HEFF_ARR_GENERATE(S, T, K)                                             \
+  HEFF_FN V heff_arrayGenerate_##S(V n, V f) {                                 \
+    int64_t m = heff_arr_count(n);                                             \
+    Arr *r = heff_arr_alloc(m, K);                                             \
+    for (int64_t k = 0; k < m; k++) {                                          \
+      V x = heff_tr(heff_app1(heff_dup(f), MK_INT(k)));                        \
+      HEFF_ARR_AT(r, T)[k] = heff_unbox_##S(x);                                \
+    }                                                                          \
+    heff_drop(f);                                                              \
+    return (V)r;                                                               \
+  }
+HEFF_ARR_GENERATE(f64, double, HEFF_ARR_F64)
+HEFF_ARR_GENERATE(i64, int64_t, HEFF_ARR_I64)
+HEFF_ARR_GENERATE(u64, uint64_t, HEFF_ARR_U64)
+HEFF_ARR_GENERATE(i32, int32_t, HEFF_ARR_I32)
+HEFF_ARR_GENERATE(u32, uint32_t, HEFF_ARR_U32)
+HEFF_ARR_GENERATE(i16, int16_t, HEFF_ARR_I16)
+HEFF_ARR_GENERATE(u16, uint16_t, HEFF_ARR_U16)
+HEFF_ARR_GENERATE(i8, int8_t, HEFF_ARR_I8)
+HEFF_ARR_GENERATE(u8, uint8_t, HEFF_ARR_U8)
+HEFF_ARR_GENERATE(f32, float, HEFF_ARR_F32)
 
 // (a list's cell's element, a `V` counted: a flat one (#64) boxed)
 HEFF_FN V heff_arrayFromList(V l) {

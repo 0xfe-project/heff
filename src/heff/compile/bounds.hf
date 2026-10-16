@@ -233,8 +233,11 @@ split info env c = splitOn env (rangeTest info c)
 --------------------------------------------------------------------------------
 
 -- | a read or set known in range: its index, the array tested, the
--- | array read or set
-type Need = { index : String, tested : String, read : String }
+-- | array read or set, and the number it is read as from where the
+-- | array keeps it flat, if it is a fixed-width one's (an array of such
+-- | may keep `V`s, so it is read so only where it is checked flat)
+type Need =
+  { index : String, tested : String, read : String, flat : Maybe Repr.Repr }
 
 -- (the primitives read or set unchecked where they are known in range)
 uncheckedOf : String -> Maybe String
@@ -258,31 +261,53 @@ testedFor : String -> List Range -> Maybe String
 testedFor i env =
   maybe Nothing rangeArray (List.head (List.keepIf (isIndex i) env))
 
-needOf : Info -> List Range -> Maybe String -> Maybe String -> Maybe Need
-needOf info env (Just y) (Just i) =
+needOf : Info
+       -> List Range
+       -> Maybe Repr.Repr
+       -> Maybe String
+       -> Maybe String
+       -> Maybe Need
+needOf info env fl (Just y) (Just i) =
   maybe
     Nothing
     (\a ->
        maybe
          Nothing
-         (\b -> Just { index = i, tested = a, read = b })
+         (\b -> Just { index = i, tested = a, read = b, flat = fl })
          (baseOf info y))
     (testedFor i env)
-needOf info env y i = Nothing
+needOf info env fl y i = Nothing
 
-needIn : Info -> List Range -> List RefCount.Value -> Maybe Need
-needIn info env (Cons a (Cons i _)) = needOf info env (varOf a) (indexOf i)
-needIn info env es = Nothing
+needIn : Info
+       -> List Range
+       -> Maybe Repr.Repr
+       -> List RefCount.Value
+       -> Maybe Need
+needIn info env fl (Cons a (Cons i _)) =
+  needOf info env fl (varOf a) (indexOf i)
+needIn info env fl es = Nothing
 
 -- | a primitive's read or set, known in range where the ranges `env`
 -- | hold
-needAt : Info -> List Range -> String -> List RefCount.Value -> Maybe Need
-needAt info env p es = maybe Nothing (\_ -> needIn info env es) (uncheckedOf p)
+needAt : Info
+       -> List Range
+       -> String
+       -> Maybe Repr.Repr
+       -> List RefCount.Value
+       -> Maybe Need
+needAt info env p fl es =
+  maybe Nothing (\_ -> needIn info env fl es) (uncheckedOf p)
+
+-- (a read of a fixed-width number: the number)
+flatRead : String -> Repr.Repr -> Maybe Repr.Repr
+flatRead p (RepFix w) =
+  if strEq p "arrayIndex" then Just (RepFix w) else Nothing
+flatRead p r = Nothing
 
 -- (a value's own read or set, not its operands')
 ownNeed : Info -> List Range -> RefCount.Value -> Maybe Need
-ownNeed info env (RPrim p es) = needAt info env p es
-ownNeed info env (RPrimAt p _ es) = needAt info env p es
+ownNeed info env (RPrim p es) = needAt info env p Nothing es
+ownNeed info env (RPrimAt p r es) = needAt info env p (flatRead p r) es
 ownNeed info env e = Nothing
 
 -- | the reads and sets known in range in a value (not in a lambda's body)
@@ -375,7 +400,7 @@ mapExp f e = f e
 -- (a primitive's name, unchecked if it is known in range)
 renamed : Info -> List Range -> String -> List RefCount.Value -> String
 renamed info env p es =
-  maybe p (\_ -> fromMaybe p (uncheckedOf p)) (needAt info env p es)
+  maybe p (\_ -> fromMaybe p (uncheckedOf p)) (needAt info env p Nothing es)
 
 -- (a read or set made unchecked, where it is known in range)
 unchecked : Info -> List Range -> RefCount.Value -> RefCount.Value
@@ -446,6 +471,15 @@ longEnough n =
   if strEq n.tested n.read then Nil
   else Cons (CondRelU "wordLe" [lengthWord n.tested, lengthWord n.read]) Nil
 
+-- (the array read kept flat, of the number it is read as)
+keptFlat : Need -> List RefCount.Test
+keptFlat n =
+  maybe
+    Nil
+    (\r ->
+       Cons (CondBool (RPrimAt "arrayKeeps" r (Cons (RDup n.read) Nil))) Nil)
+    n.flat
+
 needIndex : Need -> String
 needIndex n = n.index
 
@@ -457,11 +491,14 @@ nubS acc (Cons x xs) = if elemS x acc then nubS acc xs else nubS (Cons x acc) xs
 pairKey : Need -> String
 pairKey n = n.tested ^ " " ^ n.read
 
-nubNeeds : List String -> List Need -> List Need
-nubNeeds seen Nil = Nil
-nubNeeds seen (Cons n ns) =
-  if elemS (pairKey n) seen then nubNeeds seen ns
-  else Cons n (nubNeeds (Cons (pairKey n) seen) ns)
+flatKey : Need -> String
+flatKey n = n.read ^ " " ^ maybe "" Repr.reprName n.flat
+
+nubNeeds : (Need -> String) -> List String -> List Need -> List Need
+nubNeeds key seen Nil = Nil
+nubNeeds key seen (Cons n ns) =
+  if elemS (key n) seen then nubNeeds key seen ns
+  else Cons n (nubNeeds key (Cons (key n) seen) ns)
 
 allOf : List RefCount.Test -> RefCount.Test
 allOf Nil = CondTrue
@@ -470,13 +507,16 @@ allOf (Cons c cs) = CondIf c (allOf cs) CondFalse
 
 -- | the check, where the function is entered, that every read and set
 -- | known in range is: each index at least 0, each array read at least
--- | as long as the one tested
+-- | as long as the one tested -- and each read as a fixed-width number
+-- | kept flat
 checkOf : List Need -> RefCount.Test
 checkOf ns =
   allOf
     (List.append
        (List.map atLeast0 (nubS Nil (List.map needIndex ns)))
-       (List.concatMap longEnough (nubNeeds Nil ns)))
+       (List.append
+          (List.concatMap longEnough (nubNeeds pairKey Nil ns))
+          (List.concatMap keptFlat (nubNeeds flatKey Nil ns))))
 
 -- The function
 --------------------------------------------------------------------------------
