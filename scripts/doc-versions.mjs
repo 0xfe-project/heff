@@ -1,8 +1,7 @@
 // The documentation's versions, from the release tags read on stdin
 // (`git tag`, or `git ls-remote --tags`: a line each, `vX.Y.Z` or
-// `refs/tags/vX.Y.Z`, after a hash or not).  A version is the newest
-// tag of each compatibility unit: under 0.x a minor, `0.N`, then a
-// major, `N`.  Tags with more than X.Y.Z (`v0.5.0-rc.1`) are not
+// `refs/tags/vX.Y.Z`, after a hash or not).  Each release is a version
+// of its own, `X.Y.Z`.  Tags with more than X.Y.Z (`v0.5.0-rc.1`) are not
 // releases, and v0.4.0 is none of the site's: it came before the site,
 // its documentation plain pages.  The newest version is the latest, the
 // site's root; main is `dev`, also the root while there is no release.
@@ -19,18 +18,14 @@ import { readFileSync } from 'node:fs';
 const before = new Set(['v0.4.0']);
 
 function versions(text) {
-  const newest = new Map();
+  const found = new Map();
   for (const line of text.split('\n')) {
     const tag = line.trim().split(/\s+/).at(-1)?.replace(/^refs\/tags\//, '');
-    const m = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(tag ?? '');
+    const m = /^v((0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*))$/.exec(tag ?? '');
     if (!m || before.has(tag)) continue;
-    const [major, minor, patch] = m.slice(1).map(Number);
-    const name = major === 0 ? `0.${minor}` : `${major}`;
-    const key = [major, minor, patch];
-    const old = newest.get(name);
-    if (!old || compare(key, old.key) > 0) newest.set(name, { name, tag, key });
+    found.set(m[1], { name: m[1], tag, key: m.slice(2).map(Number) });
   }
-  return [...newest.values()].sort((a, b) => compare(b.key, a.key)).map(({ name, tag }) => ({ name, tag }));
+  return [...found.values()].sort((a, b) => compare(b.key, a.key)).map(({ name, tag }) => ({ name, tag }));
 }
 
 function compare(a, b) {
