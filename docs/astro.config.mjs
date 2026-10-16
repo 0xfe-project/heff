@@ -20,12 +20,26 @@ const base = '/heff';
 // is written from the root, so it is the same page whether the page it
 // is on is asked for with its last `/` or without.  A ```haskell block
 // (as GitHub shows it) is heff's.
+// A GitHub alert, `> [!CAUTION]` and its lines, is a Starlight aside.
+const asides = { NOTE: 'note', TIP: 'tip', IMPORTANT: 'note', WARNING: 'caution', CAUTION: 'danger' };
+function aside(node) {
+  const text = node.children?.[0]?.children?.[0];
+  const alert = text?.type === 'text' && /^\[!(\w+)\]\s*/.exec(text.value);
+  if (!alert || !asides[alert[1]]) return;
+  const kind = asides[alert[1]];
+  text.value = text.value.slice(alert[0].length);
+  node.data = { hName: 'aside', hProperties: { 'aria-label': alert[1][0] + alert[1].slice(1).toLowerCase(), className: ['starlight-aside', `starlight-aside--${kind}`] } };
+  node.children = [{ type: 'paragraph', data: { hName: 'p', hProperties: { className: ['starlight-aside__title'] } }, children: [{ type: 'text', value: alert[1][0] + alert[1].slice(1).toLowerCase() }] },
+    { type: 'blockquote', data: { hName: 'div', hProperties: { className: ['starlight-aside__content'] } }, children: node.children }];
+}
+
 const root = fileURLToPath(new URL('.', import.meta.url));
 function pages() {
   return (tree, file) => {
     const dir = path.posix.dirname(path.relative(root, file.path).split(path.sep).join('/'));
     const walk = (node) => {
       if (node.type === 'code' && node.lang === 'haskell') node.lang = 'heff';
+      if (node.type === 'blockquote') aside(node);
       if (node.type === 'link' && !node.url.includes(':')) {
         const page = /^([\w./-]+?)(\/?index)?\.md(#.*)?$/.exec(node.url);
         if (page) {

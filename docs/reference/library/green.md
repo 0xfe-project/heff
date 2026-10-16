@@ -1,6 +1,14 @@
 ---
 title: Green threads
+sidebar:
+  badge:
+    text: unstable
+    variant: caution
 ---
+
+> [!CAUTION]
+> Unstable: concurrency in heff is not settled. What this page describes
+> may change, or go, in any release.
 
 ```haskell
 import co
