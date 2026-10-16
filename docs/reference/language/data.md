@@ -95,6 +95,10 @@ is copied.
 
 ## Theories
 
+A theory is a large record: its fields may be types as well as values.
+It is what an instance is of: `Equality`, `Show`, `Coe` are theories.
+It is declared with `theory`, one field a line:
+
 ```haskell
 theory Packed where
   t : Type
@@ -104,15 +108,30 @@ packed : Packed
 packed = { t = Int, size = 8 }
 ```
 
-A record's values exist at run time; types do not. So a record with a
-field that is a type, a function of types, or another theory is a
-theory, declared with `theory`, one field a line.
+It is a declaration of its own because a record is a value at run time,
+and a type is not. So where a field is a type, a function of types, or
+a theory, the record is large, and must be a theory:
 `type Packed = { t : Type, size : Int }` is refused.
 
-A theory is built and updated like a record. A field whose type depends
-on a field being set is set too.
+A theory is built and copied as a record is. Where a field's type
+mentions another field, a copy that sets that field sets the one that
+depends on it too:
 
-A theory declared again is a new type: a module's own `Equality` is not
-the prelude's. So only the prelude's `Coe` makes a
-[coercion](arguments.md#coercions), never a module's own theory of
-that name.
+```haskell
+theory Zero where
+  t : Type
+  zero : t
+
+intZero : Zero
+intZero = { t = Int, zero = 0 }
+
+floatZero : Zero
+floatZero = { intZero | t = Float64, zero = 0.0 }
+```
+
+`{ intZero | t = Float64 }` alone is refused: its `zero` would still be
+an `Int`.
+
+Each `theory` declaration is a type of its own, as each `data` is: a
+module that declares its own `Equality` has a theory unrelated to the
+prelude's, and an instance of one is no instance of the other.
