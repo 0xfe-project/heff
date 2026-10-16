@@ -35,7 +35,7 @@ fixed outside it. So a `With s a` cannot leave the body:
 
 There is one `With` for every effect, so a thing found by one effect
 can be given to another, inside the same `with`s: a `<canvas>` found
-by `browser.dom` is drawn on by `gpu`.
+by `browser.dom` is drawn on by `browser.gpu`.
 
 ## Failures
 
