@@ -6,13 +6,19 @@ title: Projects
 
 ```
 hello/
-  package.hf          the package
-  src/hello/*.hf      its modules
-  app/NAME/main.hf    a program
-  app/NAME/build.hf   how the program is built
-  test/*.hf           tests
-  bench/*.hf          benchmarks
-  .heff/              what heff makes: builds, caches
+├── package.hf          the package
+├── src/
+│   └── hello/
+│       └── *.hf        its modules
+├── app/
+│   └── NAME/
+│       ├── main.hf     a program
+│       └── build.hf    how the program is built
+├── test/
+│   └── *.hf            tests
+├── bench/
+│   └── *.hf            benchmarks
+└── .heff/              what heff makes: builds, caches
 ```
 
 `heff init NAME` makes a project with a module, a program and a test.
