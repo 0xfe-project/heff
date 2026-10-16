@@ -29,27 +29,8 @@ parentheses.
 
 ## The prelude's
 
-The prelude declares:
-
-```
-infixr ||
-infixr && above ||
-infix == /= < <= > >= above &&
-infixl + - above == /= < <= > >=
-infixl * / % /. above + -
-infixr ++ above == /= < <= > >=
-infixr ^ above == /= < <= > >=
-infixr :: above == /= < <= > >= below + - * / % ++ ^
-infixl >>= below ||
-infixr $ below
-```
-
-So arithmetic binds tighter than comparisons, which bind tighter than
-`&&` and `||`. `::` binds looser than arithmetic, `++` and `^`:
-`x + 1 :: xs` is `(x + 1) :: xs`. `++` and `^` are not related to `+`,
-so `a + b ^ c` needs parentheses.
-
-`f $ x` is `f x`, grouping to the right: `f $ g $ h x` is `f (g (h x))`.
+The prelude's operators, `+`, `==`, `&&`, `::`, `++`, `^`, `$` and the
+rest, and their fixities are on [its page](../../api/prelude.md).
 
 ## Operators are theories
 
@@ -58,15 +39,15 @@ in Lean:
 
 | Operator | Theory | Operation |
 |---|---|---|
-| `+` | `Addition` | `add` |
-| `-` | `Subtraction` | `sub` |
-| `*` | `Multiplication` | `mul` |
-| `/` | `Division` | `div` |
-| `%` | `Remainder` | `mod` |
-| `/.` | `FloatDivision` | `divide` |
-| `==` `/=` | `Equality` | `equal` |
-| `<` `<=` `>` `>=` | `Order` | `lt` `le` |
-| `-x` | `Negation` | `neg` |
+| `+` | [`Addition`](../../api/prelude.md#Addition) | `add` |
+| `-` | [`Subtraction`](../../api/prelude.md#Subtraction) | `sub` |
+| `*` | [`Multiplication`](../../api/prelude.md#Multiplication) | `mul` |
+| `/` | [`Division`](../../api/prelude.md#Division) | `div` |
+| `%` | [`Remainder`](../../api/prelude.md#Remainder) | `mod` |
+| `/.` | [`FloatDivision`](../../api/prelude.md#FloatDivision) | `divide` |
+| `==` `/=` | [`Equality`](../../api/prelude.md#Equality) | `equal` |
+| `<` `<=` `>` `>=` | [`Order`](../../api/prelude.md#Order) | `lt` `le` |
+| `-x` | [`Negation`](../../api/prelude.md#Negation) | `neg` |
 
 So `n + 1` finds the instance for `n`'s type, and a function can work
 for any type that has one:
@@ -78,11 +59,9 @@ twice : {a : Type} -> {{add : Addition a}} -> a -> a
 twice x = x + x
 ```
 
-Integer types have all of these but `/.`. Float types have no `/` and
-`%`; their division is `/.`.
-
-`Order` also has `compare`, `min` and `max`. `Bitwise` has `and`, `or`,
-`xor`, `complement`, `shiftL` and `shiftR`. `IsZero` has `isZero`.
+Which types have each theory, and a theory's other operations, such as
+`Order`'s `compare`, are with the theory on the prelude's page, linked
+above.
 
 The theories are named by whole words, so short names like `Add` are left
 for your own programs.

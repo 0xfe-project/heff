@@ -17,8 +17,8 @@ title: Numbers
 ```haskell
 import uint8 as UInt8
 
--- | >>> show (UInt8.add mask 255)
--- | "239"
+-- | >>> show mask
+-- | "240"
 mask : UInt8
 mask = 0xf0
 
@@ -53,27 +53,25 @@ A `-` right before a name or `(` negates it: `-p.x`, `-(f y)`. It is the
 `neg` in scope, so it works for any type with a `Negation`. `f -x` is
 `f (-x)`; `- x`, with a space, is not a negation.
 
-## Arithmetic
+## Operations
 
-```haskell
--- | >>> ([7 / 2, -7 / 2, 7 % -2] : List Int)
--- | [3, -4, -1]
--- | >>> ([7 / 0, 7 % 0] : List Int)
--- | [0, 7]
-divisions : List Int
-divisions = [7 / 2, -7 / 2]
-```
+Numbers are added, compared and divided by the prelude's operators,
+whose theories each number type has: see [Operators](operators.md).
+How each type divides, rounds and wraps around is with its instances:
 
-- An `Int` divides rounding down; its remainder has the divisor's sign.
-- A fixed-width integer wraps around as the machine does, divides
-  rounding toward zero, and shifts by the amount modulo its width.
-- Division by zero is 0, and the remainder is the dividend, so
-  `(x / y) * y + x % y` is always `x`. To fail instead, use
-  `exception`'s `divOrThrow` and `modOrThrow`.
-- Each `Float32` operation is rounded to a `Float32`.
-- A float divides with `/.`, by IEEE 754: by zero, an infinity.
+- `Int` and `Float64`: [`prelude`](../../api/prelude.md), and an
+  `Int`'s bits in [`int`](../../api/int.md);
+- the fixed-width integers: [`int8`](../../api/int8.md),
+  [`int16`](../../api/int16.md), [`int32`](../../api/int32.md),
+  [`int64`](../../api/int64.md), [`uint8`](../../api/uint8.md),
+  [`uint16`](../../api/uint16.md), [`uint32`](../../api/uint32.md),
+  [`uint64`](../../api/uint64.md);
+- `Float32`: [`float32`](../../api/float32.md).
 
-## Fixed-width modules
+A fixed-width type's module is imported by a name, as they share their
+names (`import int64 as Int64`), and brings in its instances, so the
+prelude's operators work at its type. One fixed-width type goes to
+another by way of an `Int`:
 
 ```haskell
 import int32 as Int32
@@ -82,20 +80,6 @@ import int8 as Int8
 narrow : Int32 -> Int8
 narrow x = Int8.fromInt (Int32.toInt x)
 ```
-
-Each fixed-width integer type has a module, imported by a name since
-they share their names: `add`, `sub`, `mul`, `div`, `rem`, `eq`, `lt`,
-`le`, `minBound`, `maxBound`, `fromInt` and `toInt`. `float32` has the
-arithmetic, `eq`, `lt`, `le`, `isNaN`, `fromInt`, `fromFloat`,
-`toFloat`, `floor` and `sqrt`.
-
-Importing a module also brings in its instances, so the prelude's
-operators work at its type: `x * c + d` at `Int64`.
-
-An `Int`'s bits are the prelude's `and`, `or`, `xor`, `complement`,
-`shiftL` and `shiftR`, with `import int as Int`. They act as two's
-complement with the sign extended forever; shifting by a negative count
-shifts the other way.
 
 How each backend stores numbers is in
 [Providers](../providers.md#numbers-and-runes).

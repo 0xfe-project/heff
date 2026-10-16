@@ -2,7 +2,7 @@
 title: Effects
 ---
 
-Effects are a library, `lib/co.hf`, after Yang and Wu's "Handling
+Effects are a library, [`co`](../../api/co.md), after Yang and Wu's "Handling
 Higher-Order Effectful Operations with Judgemental Monadic Laws" (POPL
 2026). `import co` to use them.
 
@@ -131,12 +131,9 @@ computation of the rest of the world, `Co e`, and leaves the rest
 untouched. The handler can ask for effects of `e` as instance arguments,
 as `printed` asks for stdio.
 
-The library has handlers ready:
-
-- `state`'s `runState s c` runs `c` from the state `s`, and gives back
-  its result and the final state;
-- `exception`'s `attempt err e c` gives `Left` what was thrown, or
-  `Right` the result.
+The library has handlers ready, such as `state`'s
+[`runState`](../../api/state.md#runState) and `exception`'s
+[`attempt`](../../api/exception.md#attempt).
 
 ## When work happens
 
@@ -148,8 +145,3 @@ the handler's monad.
 `later (\u -> e)` delays `e` until the handler's monad runs it. This
 matters for handlers that run part of a computation elsewhere, such as
 `parallel`'s.
-
-## Effects of the outside world
-
-An effect of the world, such as `stdio`, is carried out by a provider:
-JavaScript and C code beside its module. See [Providers](../providers.md).

@@ -3,12 +3,17 @@ title: Runes and strings
 ---
 
 ```haskell
-import rune as Rune
+-- | >>> greeting
+-- | "héllo, \"😀\"\n"
+greeting : String
+greeting = "h\u{E9}llo, \"" ^ "\u{1F600}\"\n"
 
--- | >>> initials "héllo"
--- | "Hé"
-initials : String -> String
-initials s = ofRunes (List.map Rune.toUpper (List.take 2 (runes s)))
+-- | >>> List.map vowel ['a', 'é', 'z']
+-- | [True, True, False]
+vowel : Rune -> Bool
+vowel 'a' = True
+vowel 'é' = True
+vowel _ = False
 ```
 
 ## Runes
@@ -24,17 +29,6 @@ A `Rune` is a Unicode code point, as Go's `rune` is.
 - A rune literal can be a pattern.
 - A rune is not an integer: `'a'` is no `Int`, and `97` is no `Rune`.
 
-The `rune` module (`import rune as Rune`) has:
-
-- comparisons: `eq`, `compare`;
-- `toInt`, and `fromInt`, which wraps to 32 bits as Go's `rune(n)`
-  does; `isValid` says whether a rune is a scalar value;
-- `width` (its bytes in UTF-8), `count` (a string's runes), `foldl`,
-  `validString`, and `toValid`, which turns what is not UTF-8 into
-  U+FFFD;
-- ASCII's classes and cases: `isDigit`, `isAlpha`, `isSpace`,
-  `isUpper`, `toUpper` and more. `isAlpha 'é'` is `False`.
-
 `show 'a'` is `"'a'"`; `toString 'a'` is `"a"`.
 
 ## Strings
@@ -43,17 +37,23 @@ A `String` is bytes, as Go's is. A literal is UTF-8 (`"é"` is two
 bytes), but a string may hold any bytes, such as what a file gave, or
 `"\xff"`.
 
-- `strLength`, `byteAt`, `strSlice` and `strLt` work on bytes. `byteAt`
-  gives -1 outside the string.
-- `runes` splits a string into its runes, and `ofRunes` joins them.
-- `runeAt s i` is the rune starting at byte `i`, and how many bytes it
-  takes.
-- What is not UTF-8 reads as U+FFFD, one for each longest broken start.
-- `^` joins strings; `joinWith`, `split` and `lines` are in the prelude.
+- A string literal is in double quotes, and can be a pattern.
+- Its escapes are `\n`, `\t`, `\r`, `\u{...}` (a code point, in UTF-8),
+  `\xHH` (one byte), and `\` before any other character, which is that
+  character: `\"`, `\\`.
 
-On the C backend, a slice of 64 bytes or more, and at least a quarter of
-its string, shares the string's bytes instead of copying them. A shorter
-slice is a copy, so a small slice never keeps a large string alive.
+`show "hi"` is `"\"hi\""`; `toString "hi"` is `"hi"`.
+
+## Operations
+
+What is done with them is in the library:
+
+- strings: the [prelude](../../api/prelude.md), such as
+  [`strLength`](../../api/prelude.md#strLength),
+  [`runes`](../../api/prelude.md#runes),
+  [`ofRunes`](../../api/prelude.md#ofRunes) and
+  [`split`](../../api/prelude.md#split); `^` joins two;
+- runes: [`rune`](../../api/rune.md), imported as `import rune as Rune`.
 
 JavaScript's own UTF-16 text is another type, `JSString`: see
 [Providers](../providers.md#jsstring).
