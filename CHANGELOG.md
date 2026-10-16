@@ -16,6 +16,7 @@
 - A loop reading and setting arrays at an index checks the bounds once on entry. `saxpy` 0.48 s to 0.30 s (#102).
 - `generate` of a lambda giving one fixed-width number builds the array flat, and in-range reads of it are unchecked. `Int64` sum 0.40 s to 0.13 s (#102).
 - New numeric array benchmarks: sums, dot product, `saxpy` and `Array.map` over ten million elements (#102).
+- In threads mode, a shared object whose count is back to one is reused in place again, as an owned one is. A fold over a shared 16M-node tree: 0.54 s to 0.39 s.
 - A program using threads built as parts (`heff build`, `heff compile DIR/`) no longer crashes: every C file now sees threads mode, not only the one with `main`.
 
 ### Docs

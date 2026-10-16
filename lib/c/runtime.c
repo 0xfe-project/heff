@@ -349,7 +349,30 @@ static inline void heff_drop(V v) {
   if (IS_OBJ(v) && heff_down(OBJ(v))) heff_free(v);
 }
 
-static inline int heff_unique(V v) { return heff_rc(OBJ(v)) == 1; }
+// (an object held by the caller alone, its count 1: its last reference,
+// to take apart or build in.  Threads: a shared one too, its count back
+// to 1 -- the other threads let it go, and none can take it again but
+// through a reference the caller holds.  It is read again, acquiring
+// what they did with it before they let it go, and unshared: counted by
+// this thread alone from then on, so that what is built in it may be
+// the thread's own, as a shared object's may not.  What it holds stays
+// as it is, shared or not.  Never an immortal one)
+#ifdef HEFF_THREADS
+HEFF_FN __attribute__((noinline)) int heff_unshare(Obj *o) {
+  if (__atomic_load_n(&o->rc, __ATOMIC_ACQUIRE) != (SHARED | 1)) return 0;
+  o->rc = 1;
+  return 1;
+}
+
+static inline int heff_alone(Obj *o) {
+  uint32_t rc = heff_rc(o);
+  return HEFF_LIKELY(rc == 1) || (rc == (SHARED | 1) && heff_unshare(o));
+}
+#else
+static inline int heff_alone(Obj *o) { return o->rc == 1; }
+#endif
+
+static inline int heff_unique(V v) { return heff_alone(OBJ(v)); }
 
 // (where a value is asked for that may fail -- `heff compile` without
 // `--name`, each definition printed -- a failure is caught there, and
@@ -771,7 +794,7 @@ HEFF_FN V heff_get(V v, uint32_t l) {
 static inline void heff_take(V v, uint64_t keep) {
   if (!IS_OBJ(v)) return;
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) {
+  if (heff_alone(&t->h)) {
     for (int64_t i = 0; i < t->n; i++)
       if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + t->n * sizeof(V));
@@ -787,7 +810,7 @@ static inline void heff_take(V v, uint64_t keep) {
 // taken or dropped and blanked; otherwise none, 0)
 static inline V heff_take_reuse(V v, uint64_t keep) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) {
+  if (heff_alone(&t->h)) {
     for (int64_t i = 0; i < t->n; i++) {
       if (!((keep >> i) & 1) && !heff_flat_kind(t->flat, i)) heff_drop(t->f[i]);
       t->f[i] = MK_INT(0);
@@ -826,7 +849,7 @@ HEFF_FN __attribute__((noinline)) void heff_tag_unset(Tag *t, uint64_t keep, int
 // (`heff_take`, of a tag of `n` fields)
 HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) {
+  if (heff_alone(&t->h)) {
     for (int64_t i = 0; i < n; i++)
       if (!((keep >> i) & 1)) heff_drop(t->f[i]);
     heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
@@ -842,7 +865,7 @@ HEFF_KNOWN void heff_take_n(V v, uint64_t keep, int64_t n) {
 // is a `V`)
 HEFF_KNOWN void heff_take_nf(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1 && t->flat) {
+  if (heff_alone(&t->h) && t->flat) {
     heff_tag_unset(t, keep, n);
     heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
   } else heff_take_n(v, keep, n);
@@ -853,7 +876,7 @@ HEFF_KNOWN void heff_take_nf(V v, uint64_t keep, int64_t n) {
 // freed as the cell it is (`heff_drop_cell`), never looked into)
 HEFF_KNOWN V heff_take_reuse_n(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) {
+  if (heff_alone(&t->h)) {
     for (int64_t i = 0; i < n; i++)
       if (!((keep >> i) & 1)) heff_drop(t->f[i]);
     return v;
@@ -869,7 +892,7 @@ HEFF_KNOWN V heff_take_reuse_n(V v, uint64_t keep, int64_t n) {
 // says its flat fields anew)
 HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1 && t->flat) {
+  if (heff_alone(&t->h) && t->flat) {
     heff_tag_unset(t, keep, n);
     t->flat = 0; t->h.kind = K_TAG;
     return v;
@@ -882,7 +905,7 @@ HEFF_KNOWN V heff_take_reuse_nf(V v, uint64_t keep, int64_t n) {
 // dropped, nothing looked for)
 HEFF_KNOWN void heff_take_na(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
+  if (heff_alone(&t->h)) heff_obj_free(t, sizeof(Tag) + n * sizeof(V));
   else {
     for (int64_t i = 0; i < n; i++)
       if ((keep >> i) & 1) heff_dup(t->f[i]);
@@ -892,7 +915,7 @@ HEFF_KNOWN void heff_take_na(V v, uint64_t keep, int64_t n) {
 
 HEFF_KNOWN V heff_take_reuse_na(V v, uint64_t keep, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) {
+  if (heff_alone(&t->h)) {
     t->flat = 0; t->h.kind = K_TAG;
     return v;
   }
@@ -903,7 +926,7 @@ HEFF_KNOWN V heff_take_reuse_na(V v, uint64_t keep, int64_t n) {
 // and its cell freed at once; otherwise counted down)
 HEFF_KNOWN void heff_drop_tag(V v, int64_t n) {
   Tag *t = (Tag *)v;
-  if (heff_rc(&t->h) == 1) {
+  if (heff_alone(&t->h)) {
     if (t->flat) heff_tag_unset(t, 0, n);
     else
       for (int64_t i = 0; i < n; i++) heff_drop(t->f[i]);
@@ -1061,7 +1084,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
   Rec *r = (Rec *)v;
   if (r->flat) return heff_get_flat(v, i);
   V x = r->f[i];
-  if (heff_rc(&r->h) == 1) {
+  if (heff_alone(&r->h)) {
     if (n > HEFF_FEW_FIELDS) heff_rec_give(v, i);
     else {
       for (int64_t j = 0; j < n; j++)
@@ -1083,7 +1106,7 @@ HEFF_KNOWN V heff_get_n(V v, int64_t i, int64_t n) {
 HEFF_KNOWN V heff_take_field(V v, int64_t i) {
   Rec *r = (Rec *)v;
   V x = r->f[i];
-  if (heff_rc(&r->h) == 1) r->f[i] = MK_INT(0);
+  if (heff_alone(&r->h)) r->f[i] = MK_INT(0);
   else heff_dup(x);
   return x;
 }
@@ -1123,7 +1146,7 @@ HEFF_FN __attribute__((noinline)) void heff_rec_unset(Rec *r, uint64_t keep) {
 
 HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
-  if (heff_rc(&r->h) != 1) {
+  if (!heff_alone(&r->h)) {
     if (n > HEFF_FEW_FIELDS || r->flat) return heff_rec_copy(v, keep, lbl, kept, flat);
     Rec *c = heff_obj_alloc(sizeof(Rec) + n * sizeof(V));
     c->h.rc = 1; c->h.kind = K_REC; c->h.tag = 0; c->n = (int32_t)n; c->flat = flat; c->lbl = lbl;
@@ -1153,7 +1176,7 @@ HEFF_KNOWN V heff_rec_reuse_nf(V v, uint64_t keep, int64_t n, uint32_t *lbl, uin
 // record's last reference, none dropped, nothing looked for)
 HEFF_KNOWN V heff_rec_reuse_na(V v, uint64_t keep, int64_t n, uint32_t *lbl, uint32_t kept, uint32_t flat) {
   Rec *r = (Rec *)v;
-  if (heff_rc(&r->h) == 1) {
+  if (heff_alone(&r->h)) {
     r->flat = (r->flat & kept) | flat;
     r->lbl = lbl;
     return v;
@@ -1178,7 +1201,7 @@ HEFF_KNOWN V heff_rec_reuse_n(V v, uint64_t keep, int64_t n, uint32_t *lbl) {
 // otherwise each counted.  `n` is a constant where it is called)
 static inline __attribute__((always_inline)) void heff_clo_take(V self, int64_t n) {
   Clo *c = (Clo *)self;
-  if (heff_rc(&c->h) == 1) {
+  if (heff_alone(&c->h)) {
     if (c->memo) heff_drop(c->memo);
     heff_obj_free(c, sizeof(Clo) + n * sizeof(V));
   } else {
@@ -1296,7 +1319,7 @@ __attribute__((noinline)) HEFF_FN void heff_free(V v) {
 // fields, by the walk; otherwise counted down)
 HEFF_KNOWN void heff_drop_rec(V v, int64_t n) {
   Rec *r = (Rec *)v;
-  if (heff_rc(&r->h) == 1) {
+  if (heff_alone(&r->h)) {
     // (a record of numbers, all flat: its cell, nothing in it)
     if (r->flat && n <= HEFF_FLAT_FIELDS && heff_flat_all(r->flat, heff_flat_lows(n)))
       heff_obj_free(r, sizeof(Rec) + n * sizeof(V));
@@ -1311,7 +1334,7 @@ HEFF_KNOWN void heff_drop_rec(V v, int64_t n) {
 // (a closure holding `n` dropped, as `heff_drop_rec` a record)
 HEFF_KNOWN void heff_drop_clo(V v, int64_t n) {
   Clo *c = (Clo *)v;
-  if (heff_rc(&c->h) == 1) {
+  if (heff_alone(&c->h)) {
     if (n > HEFF_FEW_FIELDS) heff_free(v);
     else {
       if (c->memo) heff_drop(c->memo);
@@ -2198,7 +2221,7 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
   int64_t n = x->len + y->len;
   // (a view has no room: its `len` is more than its `cap`, so that where
   // there is room it is no view, and that is not looked at)
-  if (heff_rc(&x->h) == 1 && (n <= x->cap || !HEFF_STR_VIEW(x))) {
+  if (heff_alone(&x->h) && (n <= x->cap || !HEFF_STR_VIEW(x))) {
     if (n > x->cap) {
       int64_t cap = n > 2 * x->cap ? n : 2 * x->cap;
       size_t was = (sizeof(Str) + x->cap + 7) / 8 * 8;
@@ -2988,7 +3011,7 @@ static inline int heff_arr_mine(Arr *r, unsigned kind) {
   memcpy(&h, &r->h, sizeof h);
   return h == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48);
 #else
-  return heff_rc(&r->h) == 1 && r->h.tag == kind;
+  return r->h.tag == kind && heff_alone(&r->h);
 #endif
 }
 
@@ -3660,7 +3683,7 @@ HEFF_FN V heff_bitsSlice(V a, V o, V n) {
 // abandoned): the same buffer where it is the last reference)
 HEFF_FN V heff_bitsOfBytes(V a) {
   Str *x = (Str *)a;
-  if (heff_rc(&x->h) == 1) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
+  if (heff_alone(&x->h)) { x->h.kind = K_BIT; x->h.tag = 0; return a; }
   Str *s = heff_bits_new(x->len * 8);
   if (x->len) memcpy(s->s, x->p, (size_t)x->len);
   heff_drop(a);
@@ -3670,7 +3693,7 @@ HEFF_FN V heff_bitsOfBytes(V a) {
 HEFF_FN V heff_bitsBytes(V a) {
   Str *x = (Str *)a;
   if (x->h.tag) return heff_abandon();
-  if (heff_rc(&x->h) == 1) { x->h.kind = K_BYT; return a; }
+  if (heff_alone(&x->h)) { x->h.kind = K_BYT; return a; }
   Str *s = heff_bytes_new(x->len);
   if (x->len) memcpy(s->s, x->p, (size_t)x->len);
   heff_drop(a);
@@ -4277,7 +4300,9 @@ HEFF_FN void heff_msg_put(HeffPut *p, V v, int alone) {
     Obj *o = OBJ(v);
     uint32_t rc = heff_rc(o);
     if (rc & IMMORTAL) { heff_msg_word(m, 0); heff_msg_word(m, v); return; }
-    int once = !(rc & SHARED) && HEFF_COUNT(rc) == 1;
+    // (held once: a shared one too where all above it is the sender's
+    // alone (`heff_alone`), else another thread may hold what is above it)
+    int once = rc == 1 || (alone && heff_alone(o));
     int numbered = 0;
     if (!once) {
       uint32_t num;
