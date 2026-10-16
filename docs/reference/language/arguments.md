@@ -192,6 +192,9 @@ Rules:
   error. Annotate to coerce one: `(3 : Int)`.
 - `coe x` says it explicitly.
 
+The prelude has one coercion, `Coe (Lazy a) a`: a delayed value given
+where its value is wanted is forced ([Lazy values](lazy.md)).
+
 ## Errors
 
 | Code | Meaning |

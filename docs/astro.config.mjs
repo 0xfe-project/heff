@@ -83,6 +83,7 @@ export default defineConfig({
                 'reference/language/data',
                 'reference/language/theories',
                 'reference/language/arguments',
+                'reference/language/lazy',
                 'reference/language/operators',
                 'reference/language/numbers',
                 'reference/language/text',
