@@ -65,7 +65,7 @@ readLine : {e : HFunctor} -> {s : Type} -> {{ev : filesystem <: e}}
 readLine f = op (ev (ReadLine (inside f) (\r -> r))) val
 ```
 
-`with`'s `scoped acquire release body` and `held acquire release body`
+`resource`'s `scoped acquire release body` and `held acquire release body`
 are the only ways to make a `With`.
 
 - A module exports its `withX`, never its bare acquire.

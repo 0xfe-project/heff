@@ -141,7 +141,7 @@ lineCount path = do
 ```
 
 `with e as x do` runs the statements under it as the body of the
-[`with`](../library/with.md) `e`, such as `withFile path o`, with `x`
+[`with`](../library/resource.md) `e`, such as `withFile path o`, with `x`
 the `With s r` it holds. It is `e (\x -> do ...)`, written as a
 statement.
 
@@ -155,5 +155,5 @@ statement.
 - A `with` throws what it could not acquire or release: a `try` around
   it catches that.
 
-`with` starts a statement only: anywhere else, and as a module's name
-(`import with`), it is a name like any other.
+`with` starts a statement only: anywhere else it is a name like any
+other.

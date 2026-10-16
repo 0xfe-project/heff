@@ -31,7 +31,7 @@ Only the library declares primitives, such as
 | effects | `co`, `state`, `exception`, `parallel` | [Effects](../language/effects.md) |
 | collections | `array`, `std.map`, `std.set`, `std.hashmap` | [Collections](collections.md) |
 | numbers and text | `int8`…`uint64`, `float32`, `int`, `rune`, `bytes`, `bits`, `std.math` | [Numbers](../language/numbers.md), [Runes and strings](../language/text.md), [Binaries](../language/binaries.md) |
-| resources | `with` | [Resources](with.md) |
+| resources | `resource` | [Resources](resource.md) |
 | the system | `std.io`, `std.filesystem`, `std.process` | [Files and processes](system.md) |
 | the network | `std.net`, `std.http`, `std.http.server` | [Network](network.md) |
 | concurrency | `green`, `std.reactor` | [Green threads](green.md) |
