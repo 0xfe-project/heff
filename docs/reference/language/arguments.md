@@ -153,6 +153,45 @@ Which types have instances of them is on the
 [prelude's page](../../api/prelude.md); a fixed-width number's
 instances are in its module, such as [`int64`](../../api/int64.md).
 
+## Coercions
+
+```haskell
+data Name = MkName String
+
+instance instanceCoeStringName : Coe String Name
+instanceCoeStringName = { coe = MkName }
+
+greet : Name -> String
+greet (MkName s) = "hi " ^ s
+
+-- | >>> hello
+-- | "hi ann"
+hello : String
+hello = greet "ann"
+```
+
+Where an expression of one type is given and another is expected, and
+the two do not unify, heff looks for an instance of the prelude's
+[`Coe`](../../api/prelude.md#Coe) of the two, `Coe String Name`, and
+puts its `coe` around the expression: `greet "ann"` is
+`greet (coe "ann")`. The instance is found as an instance argument is,
+among those in scope, by the same rules. Otherwise nothing changes:
+with no instance, the error is the mismatch it was.
+
+Rules:
+
+- Both types must be known whole where they meet. A type still waiting
+  for an implicit argument, such as the `List ?a` of `List.reverse Nil`,
+  is no coercion's.
+- One coercion, never two in a row: with `Coe A B` and `Coe B C`, an `A`
+  is no `C`.
+- Only an expression whose type is worked out first is coerced: a
+  variable, a call, a string literal. A number literal, a constructor
+  (`MkName`, `Nil`, `Just x`), a lambda and a record take the type
+  expected as their own, so `3` where a `Name` is wanted is still an
+  error. Annotate to coerce one: `(3 : Int)`.
+- `coe x` says it explicitly.
+
 ## Errors
 
 | Code | Meaning |
