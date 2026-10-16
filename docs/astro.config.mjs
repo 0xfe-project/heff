@@ -1,19 +1,19 @@
 // The documentation's site: the pages are the .md files of tutorial/ and
 // reference/, as they are read on GitHub, and the library's API pages,
 // api/, made by `make api` (not kept: the workflow makes them before
-// each build); `npm run build` makes the site in dist/.
+// each build); `npm run build` makes the site in dist/.  Each version
+// of the site is a build of its own, at its own base, which the
+// environment gives.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { base } from './src/site.mjs';
 
 const heff = JSON.parse(
   readFileSync(new URL('../editors/vscode/syntaxes/heff.tmLanguage.json', import.meta.url), 'utf8'),
 );
-
-// The site is the repository's GitHub Pages, under /heff/.
-const base = '/heff';
 
 // A GitHub alert, `> [!CAUTION]` and its lines, is a Starlight aside.
 const asides = { NOTE: 'note', TIP: 'tip', IMPORTANT: 'note', WARNING: 'caution', CAUTION: 'danger' };
@@ -68,6 +68,8 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'heff',
+      // (the version picker beside the title; main's notice above each page)
+      components: { SiteTitle: './src/components/SiteTitle.astro', Banner: './src/components/Banner.astro' },
       sidebar: [
         { label: 'Tutorial', items: ['tutorial/first-program', 'tutorial/data', 'tutorial/effects', 'tutorial/own-effects', 'tutorial/terminal', 'tutorial/packages', 'tutorial/tests'] },
         {
