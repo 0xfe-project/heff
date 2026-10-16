@@ -1,6 +1,7 @@
 -- A language server (the Language Server Protocol, over stdio) for `.hf`
 -- files: diagnostics, hover, go to definition, completion, formatting,
--- an outline, splitting a variable into cases;
+-- an outline, splitting a variable into cases, the module header's name
+-- (a quick fix, and `heff/moduleName` for an editor to write it);
 -- and, over the whole project, references and renaming, and the symbols
 -- of every file.
 --
@@ -512,10 +513,14 @@ capabilities =
          , kv "renameProvider" (obj [kv "prepareProvider" jtrue])
          , kv "documentSymbolProvider" jtrue
          , kv "workspaceSymbolProvider" jtrue
-         -- (splitting a variable into cases)
+         -- (splitting a variable into cases; the module header's name)
          , kv
            "codeActionProvider"
-           (obj [kv "codeActionKinds" (JArray [jstr "refactor.rewrite"])])
+           (obj
+              [ kv
+                "codeActionKinds"
+                (JArray [jstr "refactor.rewrite", jstr "quickfix"])
+              ])
          ])
     , kv "serverInfo" (obj [kv "name" (jstr "heff")])
     ]
@@ -1208,6 +1213,155 @@ codeActions a p = do
       Nothing -> pure Nil
     Nothing -> pure Nil
 
+-- The module header
+--------------------------------------------------------------------------------
+
+-- (the header `module n` reads back as naming `n`, nothing wrong with it)
+claimReads : String -> Maybe Import.Header -> Bool
+claimReads n (Just h@{ name = Just m, error = Nothing }) = strEq m n
+claimReads n _ = False
+
+-- (a name a header can say, else none)
+claimable : String -> Maybe String
+claimable n =
+  if claimReads n (Import.readImports ("module " ^ n ^ "\n")).header then Just n
+  else Nothing
+
+-- | the name a file's header is to say: the one the loader gives the
+-- | file (the one E0156 asks for), if a header can say it; none for a
+-- | manifest, which has no header
+claimOf : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> St
+        -> String
+        -> Co e (Maybe String)
+claimOf st f =
+  if Driver.isManifest f then pure Nothing
+  else do
+    ps <- Load.pathsFor st.lib f
+    pure (claimable (Load.moduleOf ps f))
+
+-- (where a header's name `m` is: the first thing after `module`)
+nameSpanIn : String -> Import.Header -> String -> Params.Span
+nameSpanIn src h m =
+  let from = h.span.start + 6
+  in let at = from + fromMaybe 1 (indexOf m (strSlice src from h.span.end))
+  in Query.mkSpan at (at + strLength m)
+
+-- (the header written anew: a whole one where there is none, the name
+-- after a `module (x)` that has none, the name for a wrong one)
+claimEdit : String
+          -> String
+          -> Maybe Import.Header
+          -> Maybe (Pair Params.Span String)
+claimEdit src n Nothing =
+  Just
+    (MkPair zeroSpan ("module " ^ n ^ (if strEq src "" then "\n" else "\n\n")))
+claimEdit src n (Just h@{ name = Nothing }) =
+  Just (MkPair (Query.mkSpan (h.span.start + 6) (h.span.start + 6)) (" " ^ n))
+claimEdit src n (Just h@{ name = Just m }) =
+  if strEq m n then Nothing else Just (MkPair (nameSpanIn src h m) n)
+
+-- (a diagnostic of the header's name: missing, E0156, or wrong, E0157)
+claimCode : Maybe String -> Bool
+claimCode (Just c) = strEq c "E0156" || strEq c "E0157"
+claimCode Nothing = False
+
+-- (the diagnostics a request for code actions is for, of the header's name)
+claimDiags : Json -> List Json
+claimDiags p =
+  List.filter
+    (\d -> claimCode (str ["code"] d))
+    (fromMaybe Nil (arr ["context", "diagnostics"] p))
+
+-- (a kind of code action asked for that a quick fix is of)
+quickfixKind : Json -> Bool
+quickfixKind (JString k) = startsWith k "quickfix"
+quickfixKind _ = False
+
+-- | whether a request for code actions takes a quick fix: it names no
+-- | kinds, or one a quick fix is of
+wantsQuickfix : Json -> Bool
+wantsQuickfix p = case arr ["context", "only"] p of
+  Just ks -> List.any quickfixKind ks
+  Nothing -> True
+
+claimAction : String
+            -> String
+            -> String
+            -> List Json
+            -> Pair Params.Span String
+            -> Json
+claimAction uri src n ds (MkPair sp text) =
+  obj
+    [ kv "title" (jstr ("Write the header `module " ^ n ^ "`"))
+    , kv "kind" (jstr "quickfix")
+    , kv "diagnostics" (JArray ds)
+    , kv "isPreferred" jtrue
+    , kv
+      "edit"
+      (obj
+         [ kv
+           "changes"
+           (JObject
+              [ MkPair
+                uri
+                (JArray
+                   [obj [kv "range" (range src sp), kv "newText" (jstr text)]])
+              ])
+         ])
+    ]
+
+-- (the quick fix for the document `d`, its header to say `n`)
+claimFix : Doc -> List Json -> Maybe String -> List Json
+claimFix d ds (Just n) = case claimEdit
+    d.text
+    n
+    (Import.readImports d.text).header of
+  Just x -> [claimAction d.uri d.text n ds x]
+  Nothing -> Nil
+claimFix d ds Nothing = Nil
+
+-- | the quick fix for a header that names the module otherwise, or not
+-- | at all, where the request is for that diagnostic: the header the
+-- | file is to have
+claimFixes : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{wire : Rpc.rpc <: e}}
+           -> St
+           -> Json
+           -> Co e (List Json)
+claimFixes st p = do
+  mf <- docPath p
+  case mf of
+    Just f -> case Map.lookup st.docs f of
+      Just d ->
+        if wantsQuickfix p && not (List.null (claimDiags p))
+        then do
+          mn <- claimOf st f
+          pure (claimFix d (claimDiags p) mn)
+        else pure Nil
+      Nothing -> pure Nil
+    Nothing -> pure Nil
+
+-- | `heff/moduleName`: the name a file's header is to say, else `null`
+-- | (for an editor to write the header of a file just made)
+moduleNamed : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> {{wire : Rpc.rpc <: e}}
+            -> St
+            -> Json
+            -> Co e Json
+moduleNamed st p = do
+  mf <- docPath p
+  case mf of
+    Just f -> do
+      mn <- claimOf st f
+      pure (case mn of
+        Just n -> jstr n
+        Nothing -> JNull)
+    Nothing -> pure JNull
+
 request : {e : HFunctor}
         -> {{disk : filesystem <: e}}
         -> {{wire : Rpc.rpc <: e}}
@@ -1310,8 +1464,14 @@ request st m id p =
   then do
     a <- withProgram st p
     js <- codeActions a p
-    reply id (JArray js)
+    fixes <- claimFixes a.st p
+    reply id (JArray (List.append fixes js))
     pure a.st
+  else if strEq m "heff/moduleName"
+  then do
+    n <- moduleNamed st p
+    reply id n
+    pure st
   else do
     replyError id (0 - 32601) ("no method " ^ m)
     pure st

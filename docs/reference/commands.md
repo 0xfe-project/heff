@@ -105,7 +105,7 @@ corners =
 completion, formatting, an outline, references, renaming and symbols
 across the project.
 
-Its one code action splits a variable of an equation into cases: the
+A code action splits a variable of an equation into cases: the
 equation is written again for each tag of the variable's type.
 
 ```haskell
@@ -115,6 +115,13 @@ len xs = 0
 len [] = 0
 len (x :: xs1) = 0
 ```
+
+A quick fix writes a file's module header where it is missing (E0156)
+or names the module otherwise (E0157): `module` and the name the file's
+path gives it.  An editor asks for that name by `heff/moduleName`, whose
+`textDocument` is the file, and gets the name, or `null` for a manifest
+or a file no header can name; the VS Code extension writes the header
+of an empty `.hf` file this way when it is opened, as one just made is.
 
 ## Progress
 

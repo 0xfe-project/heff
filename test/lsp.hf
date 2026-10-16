@@ -4,8 +4,9 @@
 -- and go to definition (across modules, past non-ASCII text),
 -- completion, an outline, references and renaming across the project,
 -- doc tests (their errors, shown in a hover), splitting a variable into
--- cases, formatting, shutdown.  The heff run is the one that runs the
--- tests (`HEFF`), a server for each test: one on the project's files
+-- cases, the module header's quick fix and name, formatting, shutdown.
+-- The heff run is the one that runs the tests (`HEFF`), a server for
+-- each test: one on the project's files
 -- (`HEFF_TEST_ROOT`), their texts given it unsaved, as an editor's, and
 -- never written; one on a copy of the modules' project, in the test's
 -- directory, where files are made and deleted on disk.  Each test is
@@ -762,10 +763,12 @@ shutDown =
 
 -- (texts of the modules' project)
 badB : String
-badB = "module b\n\nimport a\n\ntwice : Bool -> Bool\ntwice b = inv (inv \"x\")\n"
+badB =
+  "module b\n\nimport a\n\ntwice : Bool -> Bool\ntwice b = inv (inv \"x\")\n"
 
 goodB : String
-goodB = "module b\n\nimport a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} inv (inv b)\n"
+goodB =
+  "module b\n\nimport a\n\ntwice : Bool -> Bool\ntwice b = {- 😀 λ -} inv (inv b)\n"
 
 dotted : String
 dotted = "module lsp-dot\n\nimport a as A\n\nx : A.Bool\nx = A."
@@ -1639,6 +1642,126 @@ splitSteps root =
 
 -- | the session of files not saved, in the project's directories: their
 -- | texts given the server, as an editor's
+-- (a diagnostic of this code at the file's start, as an editor gives it
+-- back with a request for code actions)
+diagAtStart : String -> Json.Json
+diagAtStart code =
+  Json.obj
+    [ Json.kv
+      "range"
+      (Json.obj
+         [Json.kv "start" (posJson (at 0 0)), Json.kv "end" (posJson (at 0 0))])
+    , Json.kv "code" (Json.jstr code)
+    ]
+
+-- (the code actions asked for at the file's start, for these
+-- diagnostics, of these kinds only, if any are given)
+fixesFor : String -> List String -> List String -> List Check -> Step
+fixesFor u codes only checks =
+  Ask
+    "textDocument/codeAction"
+    (Json.obj
+       [ Json.kv "textDocument" (document u)
+       , Json.kv
+         "range"
+         (Json.obj
+            [ Json.kv "start" (posJson (at 0 0))
+            , Json.kv "end" (posJson (at 0 0))
+            ])
+       , Json.kv
+         "context"
+         (Json.obj
+            (Cons
+               (Json.kv "diagnostics" (JArray (List.map diagAtStart codes)))
+               (if List.null only then Nil
+                else [Json.kv "only" (JArray (List.map Json.jstr only))])))
+       ])
+    checks
+
+-- (fixed so: one quick fix, its one edit from `from` to `to`, the text)
+fixedTo : String -> String -> Pos -> Pos -> String -> List Check
+fixedTo u what from to text =
+  check1
+    what
+    (\m ->
+       holdsOfSome
+         (\act -> strEq (textAt ["kind"] act) "quickfix")
+         (List.head (results m))
+       && holdsOfSome
+         (\e ->
+            samePos (startOf e) from
+            && samePos (endOf e) to
+            && strEq (textAt ["newText"] e) text)
+         (splitEdit u m))
+
+-- (the name `heff/moduleName` answers for the file `u`)
+moduleNameOf : String -> String -> (Json.Json -> Bool) -> Step
+moduleNameOf what u ok =
+  Ask
+    "heff/moduleName"
+    (Json.obj [Json.kv "textDocument" (document u)])
+    (check1 what ok)
+
+-- | the module header: a quick fix for one missing (E0156), the whole
+-- | header written, and for one naming the module otherwise (E0157), the
+-- | name written; none unless asked for that diagnostic, or where only
+-- | another kind is asked for.  `heff/moduleName`: the name the header
+-- | is to say, none for a manifest or a file no header can name
+claimSteps : String -> List Step
+claimSteps root =
+  let u = uriIn root "test/surface/lsp-claim.hf"
+  in let body = "one : Int\none = 1\n"
+  in let name = "test.surface.lsp-claim"
+  in [ Open u body
+     , Diagnostics
+       u
+       (check1
+          "no header: E0156"
+          (\m -> holdsOfSome (\d -> True) (withCode "E0156" (diagnostics m))))
+     , fixesFor
+       u
+       ["E0156"]
+       Nil
+       (fixedTo
+          u
+          "the header written"
+          (at 0 0)
+          (at 0 0)
+          ("module " ^ name ^ "\n\n"))
+     , fixesFor u Nil Nil (check1 "no fix, no diagnostic" (actions 0))
+     , Change u ("module wrong\n\n" ^ body)
+     , Diagnostics
+       u
+       (check1
+          "a wrong name: E0157"
+          (\m -> holdsOfSome (\d -> True) (withCode "E0157" (diagnostics m))))
+     , fixesFor
+       u
+       ["E0157"]
+       ["quickfix"]
+       (fixedTo u "the name written" (at 0 7) (at 0 12) name)
+     , fixesFor
+       u
+       ["E0157"]
+       ["refactor"]
+       (check1 "no fix where only refactors are asked for" (actions 0))
+     , Change u ("module " ^ name ^ "\n\n" ^ body)
+     , Diagnostics u (check1 "the header right" clean)
+     , moduleNameOf
+       "the module's name"
+       u
+       (\m -> strEq (textAt ["result"] m) name)
+     , moduleNameOf
+       "a manifest: no name"
+       (uriIn root "package.hf")
+       (\m -> nullAt ["result"] m)
+     , moduleNameOf
+       "no name a header can say"
+       (uriIn root "test/surface/lsp%20claim.hf")
+       (\m -> nullAt ["result"] m)
+     , Close u
+     ]
+
 unsaved : String -> Test
 unsaved name =
   within
@@ -1657,6 +1780,7 @@ unsaved name =
             , completionSteps root (textIn texts)
             , expectationSteps root (textIn texts)
             , splitSteps root
+            , claimSteps root
             , shutDown
             ])))
 
