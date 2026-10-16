@@ -22,7 +22,7 @@ A pattern is one of:
 - a name, which matches anything and binds it;
 - `_`, which matches anything;
 - a tag applied to patterns, `Just x`, `MkPair a b`;
-- a list, `[]`, `[x, y]`, or `x :: rest`;
+- a list: `[]` or `x :: xs` as usual, `[x, y]` for a list of that length;
 - a number, string or rune literal;
 - a binary, `b[...]` ([Binaries](binaries.md)).
 
