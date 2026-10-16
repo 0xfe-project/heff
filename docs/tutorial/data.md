@@ -71,8 +71,8 @@ title : Todo -> String
 title t = t.title
 
 openTitles : List Todo -> List String
-openTitles ts = List.map title (List.filter isOpen ts)
+openTitles ts = List.map title (List.keepIf isOpen ts)
 ```
 
-`List.filter` keeps the todos that are open, and `List.map` takes the
+`List.keepIf` keeps the todos that are open, and `List.map` takes the
 title of each.
