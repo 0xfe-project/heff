@@ -19,22 +19,25 @@ type may take parameters: `data Tree a = Node a (List (Tree a))`.
 
 ### Tags
 
-A tag, such as `Just` or `MkPair`, has no type of its own. It is checked
-at the type it is wanted at, so two data types can share a tag's name.
-
-At a function type, a tag is the function that builds the value:
+A tag takes its type from where it is used, so two data types may have
+a tag of the same name:
 
 ```haskell
-data Box = MkBox Int
+data Light = Red | Amber | Green
 
-boxes : List Box
-boxes = List.map MkBox [1, 2]
+data Ink = Red | Black
+
+stop : Light
+stop = Red
+
+pen : Ink
+pen = Red
 ```
 
-A tag does not infer its type. Where nothing says it, as in
-`let b = MkBox 1`, it is E0200: say it where the value is bound,
-`let b : Box = MkBox 1`, or in place, `(MkBox 1 : Box)`. A tag at a type
-that has no such tag is E0314.
+So something around a tag must say its type: a signature, as above; a
+function it is given to, `List.map MkBox [1, 2]` where a `List Box` is
+wanted; or the tag itself, `(Red : Ink)`. With nothing to say it,
+`let x = Red`, it is an error.
 
 ## Type aliases
 
