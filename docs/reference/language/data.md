@@ -35,8 +35,8 @@ pen = Red
 ```
 
 So something around a tag must say its type: a signature, as above; a
-function it is given to, `List.map MkBox [1, 2]` where a `List Box` is
-wanted; or the tag itself, `(Red : Ink)`. With nothing to say it,
+function it is given to, `paint Red` where `paint : Ink -> String`; or
+the tag itself, `(Red : Ink)`. With nothing to say it,
 `let x = Red`, it is an error.
 
 ## Type aliases
