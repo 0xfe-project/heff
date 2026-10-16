@@ -785,6 +785,14 @@ static void heff_sub_free(HeffSub *s) {
   free(s);
 }
 
+// (the signals that end a program, held back by `heff_start` from
+// before a command is started until it is among those ended with the
+// program -- else one coming between would leave it running -- and the
+// signals as they were held before)
+static const int heff_ending[3] = { SIGINT, SIGTERM, SIGHUP };
+static HEFF_TLS int heff_spawn_held = 0;
+static HEFF_TLS sigset_t heff_spawn_mask;
+
 // (the command started, forked and exec'd as `v` says -- in its
 // directory, with its environment, its input -- or NULL where it could
 // not be: not found, not a program, its directory not there, as the
@@ -811,6 +819,16 @@ static HeffSub *heff_sub_spawn(HeffInvocation *v, int *err) {
     if (pid == 0) {
       // (the child: nothing but what is safe after a fork)
       int e;
+      if (heff_spawn_held) {
+        // (the program's handlers of the ending signals not the
+        // command's, and the signals held as the program held them)
+        for (int i = 0; i < 3; i++) {
+          struct sigaction was;
+          if (sigaction(heff_ending[i], NULL, &was) == 0 && was.sa_handler != SIG_IGN)
+            signal(heff_ending[i], SIG_DFL);
+        }
+        sigprocmask(SIG_SETMASK, &heff_spawn_mask, NULL);
+      }
       if (v->group) setpgid(0, 0);
       if (chdir(v->dir) != 0) goto failed;
       if ((pi[0] >= 0 && dup2(pi[0], 0) < 0) || (po[1] >= 0 && dup2(po[1], 1) < 0)
@@ -966,11 +984,23 @@ static void heff_subs_atexit(void) {
 }
 
 #ifndef _WIN32
+// (commands being started now, by any thread, and whether a signal is
+// ending the program: it waits for those being started to be among
+// those it ends -- two seconds at most, should a thread starting one
+// wait on the one it came to -- and none is started after it)
+static int heff_spawning = 0;
+static int heff_ending_now = 0;
+
 // (the program ended by a signal -- SIGINT, SIGTERM, SIGHUP, where
 // nothing else was to be done at it -- what it started and has not
 // ended asked to end too, then the signal as it was: ended as it would
 // have been)
 static void heff_subs_signal(int sig) {
+  __atomic_store_n(&heff_ending_now, 1, __ATOMIC_SEQ_CST);
+  for (int i = 0; i < 2000 && __atomic_load_n(&heff_spawning, __ATOMIC_SEQ_CST) > 0; i++) {
+    struct timespec a = { 0, 1000000 };
+    nanosleep(&a, NULL);
+  }
   for (HeffSub *s = heff_subs; s; s = s->next)
     heff_sub_signal(s, SIGTERM);
   signal(sig, SIG_DFL);
@@ -978,17 +1008,41 @@ static void heff_subs_signal(int sig) {
 }
 
 static void heff_subs_watch(void) {
-  static const int sigs[3] = { SIGINT, SIGTERM, SIGHUP };
   for (int i = 0; i < 3; i++) {
     struct sigaction before;
-    if (sigaction(sigs[i], NULL, &before) != 0 || before.sa_handler != SIG_DFL) continue;
+    if (sigaction(heff_ending[i], NULL, &before) != 0 || before.sa_handler != SIG_DFL) continue;
     struct sigaction a;
     memset(&a, 0, sizeof a);
     a.sa_handler = heff_subs_signal;
     sigemptyset(&a.sa_mask);
     a.sa_flags = SA_RESTART;
-    sigaction(sigs[i], &a, NULL);
+    sigaction(heff_ending[i], &a, NULL);
   }
+}
+
+// (a command about to be started: the ending signals held back from
+// this thread -- heard by another, the handler waits for it -- until
+// it is among those started; where the program is being ended,
+// nothing more is started: this thread waits for its end)
+static void heff_spawn_hold(void) {
+  sigset_t ending;
+  sigemptyset(&ending);
+  for (int i = 0; i < 3; i++) sigaddset(&ending, heff_ending[i]);
+  pthread_sigmask(SIG_BLOCK, &ending, &heff_spawn_mask);
+  heff_spawn_held = 1;
+  __atomic_fetch_add(&heff_spawning, 1, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&heff_ending_now, __ATOMIC_SEQ_CST)) {
+    __atomic_fetch_sub(&heff_spawning, 1, __ATOMIC_SEQ_CST);
+    for (;;) pause();
+  }
+}
+
+// (it is among those started, or was not started: the signals heard
+// again, one that came meanwhile now)
+static void heff_spawn_release(void) {
+  __atomic_fetch_sub(&heff_spawning, 1, __ATOMIC_SEQ_CST);
+  heff_spawn_held = 0;
+  pthread_sigmask(SIG_SETMASK, &heff_spawn_mask, NULL);
 }
 #endif
 
@@ -1012,12 +1066,8 @@ static uint32_t heff_error_shape[3] = { LBL_code, LBL_name, LBL_message };
 static V heff_start(V inv) {
   HeffInvocation v;
   int err = EINVAL;
-  HeffSub *s = heff_invocation(inv, &v) ? heff_sub_spawn(&v, &err) : NULL;
-  heff_invocation_free(&v);
-  if (!s) {
-    V x = heff_errno(err, heff_error_shape);
-    return heff_tag_n(TAG_Left, 1, &x);
-  }
+  // (those not ended at the end ended then, from before the first is
+  // started)
   HEFF_SUBS_LOCK();
   static int registered = 0;
   if (!registered) {
@@ -1027,9 +1077,25 @@ static V heff_start(V inv) {
     heff_subs_watch();
 #endif
   }
-  s->next = heff_subs;
-  heff_subs = s;
   HEFF_SUBS_UNLOCK();
+#ifndef _WIN32
+  heff_spawn_hold();
+#endif
+  HeffSub *s = heff_invocation(inv, &v) ? heff_sub_spawn(&v, &err) : NULL;
+  heff_invocation_free(&v);
+  if (s) {
+    HEFF_SUBS_LOCK();
+    s->next = heff_subs;
+    heff_subs = s;
+    HEFF_SUBS_UNLOCK();
+  }
+#ifndef _WIN32
+  heff_spawn_release();
+#endif
+  if (!s) {
+    V x = heff_errno(err, heff_error_shape);
+    return heff_tag_n(TAG_Left, 1, &x);
+  }
   V x = heff_foreign(s, heff_sub_let_go);
   return heff_tag_n(TAG_Right, 1, &x);
 }
