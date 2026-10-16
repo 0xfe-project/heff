@@ -133,7 +133,7 @@ program and a backend (`--run backends/programs/dollar.hf/c`,
 programs.  `make sanitize` (`HEFF_SANITIZE=1 heff test test/backends.hf`) builds the
 backends' C programs under AddressSanitizer, and `make tsan`
 (`HEFF_TSAN=1`) runs the threads test under ThreadSanitizer too
-([threads.md](docs/reference/threads.md)).  Among the tests, the golden ones hold the
+(see [std.thread](https://dannypsnl.github.io/heff/api/std/thread/)).  Among the tests, the golden ones hold the
 output of `check`, `explain`, `eval` and `type-at` on the library and
 test files (`heff test test/golden.hf`, `--run golden/nbe` for those
 of `test/nbe`); after an intended change, update them with `make golden`

@@ -140,7 +140,7 @@ lineCount path = do
 ```
 
 `with e as x do` runs the statements under it as the body of the
-[`with`](../library/resource.md) `e`, such as `withFile path o`, with `x`
+[`with`](../../api/resource.md) `e`, such as `withFile path o`, with `x`
 the `With s r` it holds. It is `e (\x -> do ...)`, written as a
 statement.
 

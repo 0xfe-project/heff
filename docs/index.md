@@ -3,8 +3,8 @@ title: heff
 ---
 
 - [Tutorial](tutorial/first-program.md): heff, learned by writing it
-- [Reference](reference/language/modules.md): the language, its library,
-  its commands
+- [Reference](reference/language/modules.md): the language, its commands
+- [API](api/index.md): the library, a page for each module
 
 ## Examples
 
