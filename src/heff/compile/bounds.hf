@@ -1,0 +1,528 @@
+-- Indices checked once (#102), for the C backend: a function going
+-- round a loop (`CLoop`) that reads or sets arrays at an index, where a
+-- test has found it below an array's length, checks each read and set
+-- against its own array's length again -- a way out of the loop that C
+-- cannot rule out, so that it makes no vector operations of it.  But
+-- where the index is a word that only grows (given itself, or itself
+-- and a step of at least 0, each round, and set nowhere else) and the
+-- arrays keep their lengths (given themselves, or themselves set, each
+-- round), what the test finds holds of every array at least as long as
+-- the one tested, on every round, once the index is at least 0 where
+-- the loop is entered.
+--
+-- So the function checks that, once, where it is entered -- the index
+-- at least 0, each array read or set at it at least as long as the one
+-- tested -- and if so goes round a copy of its loop of its own, whose
+-- reads and sets there are not checked (`arrayIndexIn`,
+-- `arraySetOwnedIn`); if not, round the loop as it was, so an index out
+-- of range fails as it did.
+
+module heff.compile.bounds
+
+import heff.compile.owned as Owned
+import heff.compile.refcount as RefCount
+import heff.compile.repr as Repr
+import heff.elab.fixed as Fixed
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+-- The loop
+--------------------------------------------------------------------------------
+
+-- | what goes round the loop again gives each parameter
+type Again = List (Pair String RefCount.Value)
+
+-- (each loop again, in front of `acc`, not in a lambda's body)
+againSt : (List Again -> List RefCount.Statement -> List Again)
+        -> List Again
+        -> RefCount.Statement
+        -> List Again
+againSt go acc (CLoop ps es) = Cons (List.zip ps es) acc
+againSt go acc (CIf _ a b) = go (go acc a) b
+againSt go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (RefCount.caseArmBody arm)) acc arms
+againSt go acc s = acc
+
+agains : List Again -> List RefCount.Statement -> List Again
+agains acc ss = List.foldl (againSt agains) acc ss
+
+-- (whether a statement goes to a label: a loop to an arm)
+labelledSt : (Bool -> List RefCount.Statement -> Bool)
+           -> Bool
+           -> RefCount.Statement
+           -> Bool
+labelledSt go acc (CLoopTo _ _ _) = True
+labelledSt go acc (CLabel _) = True
+labelledSt go acc (CIf _ a b) = go (go acc a) b
+labelledSt go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (RefCount.caseArmBody arm)) acc arms
+labelledSt go acc s = acc
+
+labelled : Bool -> List RefCount.Statement -> Bool
+labelled acc ss = List.foldl (labelledSt labelled) acc ss
+
+-- | the loop's parameters (a worker's own variables, where it is given
+-- | them boxed)
+loopParams : List Again -> List String
+loopParams (Cons ag _) = List.map fst ag
+loopParams Nil = Nil
+
+-- (what the loop gives the parameter `x`)
+givenTo : String -> Again -> Maybe RefCount.Value
+givenTo x Nil = Nothing
+givenTo x (Cons (MkPair y e) rest) =
+  if strEq x y then Just e else givenTo x rest
+
+-- (the variable a value is)
+varOf : RefCount.Value -> Maybe String
+varOf (RLocal x) = Just x
+varOf (RDup x) = Just x
+varOf e = Nothing
+
+isVar : String -> Maybe String -> Bool
+isVar x (Just y) = strEq x y
+isVar x Nothing = False
+
+-- The index
+--------------------------------------------------------------------------------
+
+-- (`x` and a literal of at least 0)
+stepSum : String -> List RefCount.Value -> Bool
+stepSum x (Cons (RFixU _ k) (Cons e Nil)) = k >= 0 && isVar x (varOf e)
+stepSum x (Cons e (Cons (RFixU _ k) Nil)) = k >= 0 && isVar x (varOf e)
+stepSum x es = False
+
+-- | a step of the index `x`: itself, or itself and at least 0
+stepOf : String -> RefCount.Value -> Bool
+stepOf x (RPrimU p es) = strEq p "wordAdd" && stepSum x es
+stepOf x e = isVar x (varOf e)
+
+-- (set nowhere but by the loop)
+unset : List (Pair String RefCount.Value) -> String -> Bool
+unset ds x = List.null (Owned.valuesOf x ds)
+
+-- | the function's indices: its words that only grow
+indices : RefCount.Fun
+        -> List (Pair String RefCount.Value)
+        -> List Again
+        -> List String
+indices f ds ags =
+  List.keepIf
+    (\x ->
+       Repr.reprEq RepInt (Repr.reprOf f.reprs x)
+       && unset ds x
+       && List.all (\ag -> maybe False (stepOf x) (givenTo x ag)) ags)
+    (loopParams ags)
+
+-- The arrays
+--------------------------------------------------------------------------------
+
+isSet : String -> Bool
+isSet p = strEq p "arraySet" || strEq p "arraySetOwned"
+
+-- | whether a value is the array `b`, or it set, through the variables
+-- | bound only to such (not those `seen`, looked through already)
+sameAs : List (Pair String RefCount.Value)
+       -> List String
+       -> String
+       -> RefCount.Value
+       -> Bool
+sameAs ds seen b (RLocal y) =
+  strEq y b
+  || (not (elemS y seen)
+      && not (List.null (Owned.valuesOf y ds))
+      && List.all (sameAs ds (Cons y seen) b) (Owned.valuesOf y ds))
+sameAs ds seen b (RDup y) = sameAs ds seen b (RLocal y)
+sameAs ds seen b (RPrim p es) =
+  isSet p && maybe False (sameAs ds seen b) (List.head es)
+sameAs ds seen b (RPrimAt p _ es) =
+  isSet p && maybe False (sameAs ds seen b) (List.head es)
+sameAs ds seen b e = False
+
+-- | the function's parameters that keep their lengths round the loop
+-- | (those not arrays never read so)
+kept : RefCount.Fun
+     -> List (Pair String RefCount.Value)
+     -> List Again
+     -> List String
+kept f ds ags =
+  List.keepIf
+    (\b ->
+       unset ds b
+       && List.all (\ag -> maybe False (sameAs ds Nil b) (givenTo b ag)) ags)
+    (loopParams ags)
+
+-- | what is known of a function: its indices, the arrays that keep their
+-- | lengths, and what its variables are bound or set to
+type Info =
+  { indices : List String
+  , arrays : List String
+  , defs : List (Pair String RefCount.Value)
+  }
+
+-- (the array of `arrays` that the variable is, if one is)
+baseOf : Info -> String -> Maybe String
+baseOf info y =
+  List.head
+    (List.keepIf (\b -> sameAs info.defs Nil b (RLocal y)) info.arrays)
+
+-- Tests
+--------------------------------------------------------------------------------
+
+-- | an index found below the length of an array (one of `arrays`)
+type Range = { index : String, array : String }
+
+-- (the array a length is of)
+lengthArray : RefCount.Value -> Maybe String
+lengthArray (RPrim p (Cons e Nil)) =
+  if strEq p "arrayLength" then varOf e else Nothing
+lengthArray e = Nothing
+
+-- (a length, as a word)
+lengthOf : RefCount.Value -> Maybe String
+lengthOf (RUnbox RepInt e) = lengthArray e
+lengthOf (RPeek RepInt e) = lengthArray e
+lengthOf e = Nothing
+
+rangeOf : Info -> Maybe String -> Maybe String -> Maybe Range
+rangeOf info (Just i) (Just a) =
+  if elemS i info.indices
+  then maybe Nothing (\b -> Just { index = i, array = b }) (baseOf info a)
+  else Nothing
+rangeOf info i a = Nothing
+
+-- (a range, and whether it holds where the test does, or where it does
+-- not)
+type Found = Pair Range Bool
+
+foundOf : Bool -> Maybe Range -> Maybe Found
+foundOf yes (Just r) = Just (MkPair r yes)
+foundOf yes Nothing = Nothing
+
+relTest : Info -> String -> List RefCount.Value -> Maybe Found
+relTest info p (Cons a (Cons b Nil)) =
+  if strEq p "wordLt" then foundOf True (rangeOf info (varOf a) (lengthOf b))
+  else if strEq p "wordLe"
+  then foundOf False (rangeOf info (varOf b) (lengthOf a))
+  else Nothing
+relTest info p es = Nothing
+
+flipped : Maybe Found -> Maybe Found
+flipped (Just (MkPair r yes)) = Just (MkPair r (not yes))
+flipped Nothing = Nothing
+
+-- | a test of an index against an array's length: `i < length a`, or
+-- | `length a <= i`, or either not
+rangeTest : Info -> RefCount.Test -> Maybe Found
+rangeTest info (CondRelU p es) = relTest info p es
+rangeTest info (CondNot c) = flipped (rangeTest info c)
+rangeTest info c = Nothing
+
+-- (the ranges holding where a test does, and where it does not)
+splitOn : List Range -> Maybe Found -> Pair (List Range) (List Range)
+splitOn env (Just (MkPair r True)) = MkPair (Cons r env) env
+splitOn env (Just (MkPair r False)) = MkPair env (Cons r env)
+splitOn env Nothing = MkPair env env
+
+split : Info -> List Range -> RefCount.Test -> Pair (List Range) (List Range)
+split info env c = splitOn env (rangeTest info c)
+
+-- Reads and sets in range
+--------------------------------------------------------------------------------
+
+-- | a read or set known in range: its index, the array tested, the
+-- | array read or set
+type Need = { index : String, tested : String, read : String }
+
+-- (the primitives read or set unchecked where they are known in range)
+uncheckedOf : String -> Maybe String
+uncheckedOf "arrayIndex" = Just "arrayIndexIn"
+uncheckedOf "arraySetOwned" = Just "arraySetOwnedIn"
+uncheckedOf "arrayPeek" = Just "arrayPeekIn"
+uncheckedOf p = Nothing
+
+-- (the index, a word boxed or a variable)
+indexOf : RefCount.Value -> Maybe String
+indexOf (RBox _ e) = varOf e
+indexOf e = varOf e
+
+rangeArray : Range -> Maybe String
+rangeArray r = Just r.array
+
+isIndex : String -> Range -> Bool
+isIndex i r = strEq r.index i
+
+testedFor : String -> List Range -> Maybe String
+testedFor i env =
+  maybe Nothing rangeArray (List.head (List.keepIf (isIndex i) env))
+
+needOf : Info -> List Range -> Maybe String -> Maybe String -> Maybe Need
+needOf info env (Just y) (Just i) =
+  maybe
+    Nothing
+    (\a ->
+       maybe
+         Nothing
+         (\b -> Just { index = i, tested = a, read = b })
+         (baseOf info y))
+    (testedFor i env)
+needOf info env y i = Nothing
+
+needIn : Info -> List Range -> List RefCount.Value -> Maybe Need
+needIn info env (Cons a (Cons i _)) = needOf info env (varOf a) (indexOf i)
+needIn info env es = Nothing
+
+-- | a primitive's read or set, known in range where the ranges `env`
+-- | hold
+needAt : Info -> List Range -> String -> List RefCount.Value -> Maybe Need
+needAt info env p es = maybe Nothing (\_ -> needIn info env es) (uncheckedOf p)
+
+-- (a value's own read or set, not its operands')
+ownNeed : Info -> List Range -> RefCount.Value -> Maybe Need
+ownNeed info env (RPrim p es) = needAt info env p es
+ownNeed info env (RPrimAt p _ es) = needAt info env p es
+ownNeed info env e = Nothing
+
+-- | the reads and sets known in range in a value (not in a lambda's body)
+needsIn : Info -> List Range -> RefCount.Value -> List Need
+needsIn info env e =
+  List.append
+    (maybe Nil (\n -> Cons n Nil) (ownNeed info env e))
+    (List.concatMap (needsIn info env) (Owned.kids e))
+
+-- (the values of a statement, each with the ranges holding there)
+type Scoped = Pair (List Range) RefCount.Value
+
+scopedAll : List Range -> List RefCount.Value -> List Scoped
+scopedAll env es = List.map (\e -> MkPair env e) es
+
+scopedSt : (List Range -> List RefCount.Statement -> List Scoped)
+         -> Info
+         -> List Range
+         -> RefCount.Statement
+         -> List Scoped
+scopedSt go info env (CLet _ e) = scopedAll env (Cons e Nil)
+scopedSt go info env (CSet _ e) = scopedAll env (Cons e Nil)
+scopedSt go info env (CReturn e) = scopedAll env (Cons e Nil)
+scopedSt go info env (CIf c a b) =
+  List.append
+    (scopedAll env (Owned.condKids c))
+    (List.append
+       (go (fst (split info env c)) a)
+       (go (snd (split info env c)) b))
+scopedSt go info env (CSwitch e arms _) =
+  Cons
+    (MkPair env e)
+    (List.concatMap (\arm -> go env (RefCount.caseArmBody arm)) arms)
+scopedSt go info env (CInPlace f es) = scopedAll env (Cons f es)
+scopedSt go info env (CRoomed f es) = scopedAll env (Cons f es)
+scopedSt go info env (CTail f es) = scopedAll env (Cons f es)
+scopedSt go info env (CLoop _ es) = scopedAll env es
+scopedSt go info env (CJump _ _ es) = scopedAll env es
+scopedSt go info env s = Nil
+
+scoped : Info -> List Range -> List RefCount.Statement -> List Scoped
+scoped info env ss = List.concatMap (scopedSt (scoped info) info env) ss
+
+-- | the reads and sets known in range in a body
+needsOf : Info -> List RefCount.Statement -> List Need
+needsOf info ss =
+  List.concatMap (\p -> needsIn info (fst p) (snd p)) (scoped info Nil ss)
+
+-- Unchecked
+--------------------------------------------------------------------------------
+
+-- | a value, made bottom up by `f` (not in a lambda's body)
+mapExp : (RefCount.Value -> RefCount.Value) -> RefCount.Value -> RefCount.Value
+mapExp f (RTag t b es) = f (RTag t b (List.map (mapExp f) es))
+mapExp f (RTagIn e t b es) =
+  f (RTagIn (mapExp f e) t b (List.map (mapExp f) es))
+mapExp f (RRec ls b es) = f (RRec ls b (List.map (mapExp f) es))
+mapExp f (RRecIn x n k g s ls fs sure) =
+  f
+    (RRecIn
+       x
+       n
+       k
+       g
+       s
+       ls
+       (List.map (\p -> MkPair (fst p) (mapExp f (snd p))) fs)
+       sure)
+mapExp f (RField e i) = f (RField (mapExp f e) i)
+mapExp f (RDupE e) = f (RDupE (mapExp f e))
+mapExp f (RFieldV e i) = f (RFieldV (mapExp f e) i)
+mapExp f (RGetN e i n) = f (RGetN (mapExp f e) i n)
+mapExp f (RFieldU r s e i) = f (RFieldU r s (mapExp f e) i)
+mapExp f (RGetNU r s e i n) = f (RGetNU r s (mapExp f e) i n)
+mapExp f (RWord r e) = f (RWord r (mapExp f e))
+mapExp f (RGetLabel e l) = f (RGetLabel (mapExp f e) l)
+mapExp f (RPrim p es) = f (RPrim p (List.map (mapExp f) es))
+mapExp f (RPrimAt p r es) = f (RPrimAt p r (List.map (mapExp f) es))
+mapExp f (RLam xs fv held body) = f (RLam xs fv (List.map (mapExp f) held) body)
+mapExp f (RCall g tr w args) =
+  f (RCall g tr w (List.map (Owned.mapArg (mapExp f)) args))
+mapExp f (RApply g es) = f (RApply (mapExp f g) (List.map (mapExp f) es))
+mapExp f (RBool c) = f (RBool (Owned.mapCond (mapExp f) c))
+mapExp f (RBox r e) = f (RBox r (mapExp f e))
+mapExp f (RUnbox r e) = f (RUnbox r (mapExp f e))
+mapExp f (RPeek r e) = f (RPeek r (mapExp f e))
+mapExp f (RPrimU p es) = f (RPrimU p (List.map (mapExp f) es))
+mapExp f e = f e
+
+-- (a primitive's name, unchecked if it is known in range)
+renamed : Info -> List Range -> String -> List RefCount.Value -> String
+renamed info env p es =
+  maybe p (\_ -> fromMaybe p (uncheckedOf p)) (needAt info env p es)
+
+-- (a read or set made unchecked, where it is known in range)
+unchecked : Info -> List Range -> RefCount.Value -> RefCount.Value
+unchecked info env (RPrim p es) = RPrim (renamed info env p es) es
+unchecked info env (RPrimAt p r es) = RPrimAt (renamed info env p es) r es
+unchecked info env e = e
+
+fixExp : Info -> List Range -> RefCount.Value -> RefCount.Value
+fixExp info env e = mapExp (unchecked info env) e
+
+-- | where the copy of the loop starts
+label : String
+label = "InRange"
+
+fixArm : (List RefCount.Statement -> List RefCount.Statement)
+       -> RefCount.CaseArm
+       -> RefCount.CaseArm
+fixArm go (MkCArm t fs fl su pl tk body lv) =
+  MkCArm t fs fl su pl tk (go body) lv
+
+-- | a statement of the copy of the loop: its reads and sets known in
+-- | range unchecked, going round the copy again
+fixSt : (List Range -> List RefCount.Statement -> List RefCount.Statement)
+      -> Info
+      -> List Range
+      -> RefCount.Statement
+      -> RefCount.Statement
+fixSt go info env (CLet x e) = CLet x (fixExp info env e)
+fixSt go info env (CSet x e) = CSet x (fixExp info env e)
+fixSt go info env (CReturn e) = CReturn (fixExp info env e)
+fixSt go info env (CIf c a b) =
+  CIf
+    (Owned.mapCond (fixExp info env) c)
+    (go (fst (split info env c)) a)
+    (go (snd (split info env c)) b)
+fixSt go info env (CSwitch e arms r) =
+  CSwitch (fixExp info env e) (List.map (fixArm (go env)) arms) r
+fixSt go info env (CInPlace f es) =
+  CInPlace (fixExp info env f) (List.map (fixExp info env) es)
+fixSt go info env (CRoomed f es) =
+  CRoomed (fixExp info env f) (List.map (fixExp info env) es)
+fixSt go info env (CTail f es) =
+  CTail (fixExp info env f) (List.map (fixExp info env) es)
+fixSt go info env (CLoop ps es) =
+  CLoopTo label ps (List.map (fixExp info env) es)
+fixSt go info env (CJump g w es) = CJump g w (List.map (fixExp info env) es)
+fixSt go info env s = s
+
+fixStmts : Info
+         -> List Range
+         -> List RefCount.Statement
+         -> List RefCount.Statement
+fixStmts info env ss = List.map (fixSt (fixStmts info) info env) ss
+
+-- The check
+--------------------------------------------------------------------------------
+
+lengthWord : String -> RefCount.Value
+lengthWord a = RUnbox RepInt (RPrim "arrayLength" (Cons (RDup a) Nil))
+
+-- (the index at least 0)
+atLeast0 : String -> RefCount.Test
+atLeast0 i = CondRelU "wordLe" [RFixU I64 0, RLocal i]
+
+-- (the array read at least as long as the one tested)
+longEnough : Need -> List RefCount.Test
+longEnough n =
+  if strEq n.tested n.read then Nil
+  else Cons (CondRelU "wordLe" [lengthWord n.tested, lengthWord n.read]) Nil
+
+needIndex : Need -> String
+needIndex n = n.index
+
+-- (each once)
+nubS : List String -> List String -> List String
+nubS acc Nil = List.reverse acc
+nubS acc (Cons x xs) = if elemS x acc then nubS acc xs else nubS (Cons x acc) xs
+
+pairKey : Need -> String
+pairKey n = n.tested ^ " " ^ n.read
+
+nubNeeds : List String -> List Need -> List Need
+nubNeeds seen Nil = Nil
+nubNeeds seen (Cons n ns) =
+  if elemS (pairKey n) seen then nubNeeds seen ns
+  else Cons n (nubNeeds (Cons (pairKey n) seen) ns)
+
+allOf : List RefCount.Test -> RefCount.Test
+allOf Nil = CondTrue
+allOf (Cons c Nil) = c
+allOf (Cons c cs) = CondIf c (allOf cs) CondFalse
+
+-- | the check, where the function is entered, that every read and set
+-- | known in range is: each index at least 0, each array read at least
+-- | as long as the one tested
+checkOf : List Need -> RefCount.Test
+checkOf ns =
+  allOf
+    (List.append
+       (List.map atLeast0 (nubS Nil (List.map needIndex ns)))
+       (List.concatMap longEnough (nubNeeds Nil ns)))
+
+-- The function
+--------------------------------------------------------------------------------
+
+-- (the function, a copy of its loop unchecked where `ns`, if any, are)
+checkedWith : RefCount.Fun -> Info -> List Need -> RefCount.Fun
+checkedWith f info Nil = f
+checkedWith f info ns =
+  { key = f.key
+  , params = f.params
+  , lent = f.lent
+  , entry =
+      List.append
+        f.entry
+        (Cons
+           (CIf
+              (checkOf ns)
+              (Cons (CLabel label) (fixStmts info Nil f.body))
+              Nil)
+           Nil)
+  , body = f.body
+  , reprs = f.reprs
+  , ret = f.ret
+  , wrapper = f.wrapper
+  }
+
+boundsWith : RefCount.Fun
+           -> List (Pair String RefCount.Value)
+           -> List Again
+           -> RefCount.Fun
+boundsWith f ds ags =
+  let info : Info =
+    { indices = indices f ds ags, arrays = kept f ds ags, defs = ds }
+  in if List.null info.indices then f
+  else checkedWith f info (needsOf info f.body)
+
+-- | a function going round a loop, its reads and sets in range checked
+-- | once where it is entered, where they may be
+boundsFun : RefCount.Fun -> RefCount.Fun
+boundsFun f =
+  let ags = agains Nil f.body
+  in if List.null ags || labelled False f.body then f
+  else boundsWith f (Owned.defsOf Nil f.body) ags
+
+-- | a definition of the C backend's, its loops' reads and sets in range
+-- | checked once where they may be
+boundsDef : RefCount.Def -> RefCount.Def
+boundsDef (DFun f) = DFun (boundsFun f)
+boundsDef d = d

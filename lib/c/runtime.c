@@ -3103,15 +3103,42 @@ HEFF_FAST double heff_arrayIndex_f64(V a, V i) { return heff_arrayIndex_f64_lent
     return x;                                                                  \
   }                                                                            \
   HEFF_FAST T heff_arrayIndex_##S(V a, V i) { return heff_arrayIndex_##S##_lent(a, i, 3); }
-HEFF_ARR_INDEX(i64, int64_t, HEFF_ARR_I64)
-HEFF_ARR_INDEX(u64, uint64_t, HEFF_ARR_U64)
-HEFF_ARR_INDEX(i32, int32_t, HEFF_ARR_I32)
-HEFF_ARR_INDEX(u32, uint32_t, HEFF_ARR_U32)
-HEFF_ARR_INDEX(i16, int16_t, HEFF_ARR_I16)
-HEFF_ARR_INDEX(u16, uint16_t, HEFF_ARR_U16)
-HEFF_ARR_INDEX(i8, int8_t, HEFF_ARR_I8)
-HEFF_ARR_INDEX(u8, uint8_t, HEFF_ARR_U8)
-HEFF_ARR_INDEX(f32, float, HEFF_ARR_F32)
+// (... known in range, where a loop checked its index once
+// (heff.compile.bounds): the index a word, at least 0, below the length)
+HEFF_FAST V heff_arrayIndexIn_lent(V a, V i, int give) {
+  Arr *r = (Arr *)a;
+  int64_t k = INT_OF(i);
+  V x = r->h.tag == HEFF_ARR_V ? heff_dup(r->a[k]) : heff_arr_get(r, k);
+  HEFF_GIVEN(give, 0, a);
+  return x;
+}
+HEFF_FAST V heff_arrayIndexIn(V a, V i) { return heff_arrayIndexIn_lent(a, i, 3); }
+HEFF_FAST V heff_arrayPeekIn(V a, V i) { return ((Arr *)a)->a[INT_OF(i)]; }
+HEFF_FAST double heff_arrayIndexIn_f64_lent(V a, V i, int give) {
+  double x = HEFF_ARR_AT((Arr *)a, double)[INT_OF(i)];
+  HEFF_GIVEN(give, 0, a);
+  return x;
+}
+HEFF_FAST double heff_arrayIndexIn_f64(V a, V i) { return heff_arrayIndexIn_f64_lent(a, i, 3); }
+#define HEFF_ARR_INDEX_IN(S, T, K)                                             \
+  HEFF_FAST T heff_arrayIndexIn_##S##_lent(V a, V i, int give) {               \
+    Arr *r = (Arr *)a;                                                         \
+    int64_t k = INT_OF(i);                                                     \
+    T x = r->h.tag == K ? HEFF_ARR_AT(r, T)[k] : heff_peek_##S(r->a[k]);       \
+    HEFF_GIVEN(give, 0, a);                                                    \
+    return x;                                                                  \
+  }                                                                            \
+  HEFF_FAST T heff_arrayIndexIn_##S(V a, V i) { return heff_arrayIndexIn_##S##_lent(a, i, 3); }
+#define HEFF_ARR_INDEXES(S, T, K) HEFF_ARR_INDEX(S, T, K) HEFF_ARR_INDEX_IN(S, T, K)
+HEFF_ARR_INDEXES(i64, int64_t, HEFF_ARR_I64)
+HEFF_ARR_INDEXES(u64, uint64_t, HEFF_ARR_U64)
+HEFF_ARR_INDEXES(i32, int32_t, HEFF_ARR_I32)
+HEFF_ARR_INDEXES(u32, uint32_t, HEFF_ARR_U32)
+HEFF_ARR_INDEXES(i16, int16_t, HEFF_ARR_I16)
+HEFF_ARR_INDEXES(u16, uint16_t, HEFF_ARR_U16)
+HEFF_ARR_INDEXES(i8, int8_t, HEFF_ARR_I8)
+HEFF_ARR_INDEXES(u8, uint8_t, HEFF_ARR_U8)
+HEFF_ARR_INDEXES(f32, float, HEFF_ARR_F32)
 
 // (`set` but where the array is held only here and keeps `x` as it is:
 // out of range, the array as it is; held elsewhere too, a copy, `x` at
@@ -3202,6 +3229,15 @@ HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
   return a;
 }
 
+// (... known in range (heff.compile.bounds))
+HEFF_FAST V heff_arraySetOwnedIn(V a, V i, V x) {
+  Arr *r = (Arr *)a;
+  int64_t k = INT_OF(i);
+  if (r->h.tag == HEFF_ARR_V) heff_drop(r->a[k]);
+  heff_arr_put(r, k, x);
+  return a;
+}
+
 // (... keeping its elements as `T`s, where the program knows them so)
 #define HEFF_ARR_OWN(S, T, K)                                                  \
   HEFF_FAST V heff_arrayOwn_##S(V a) {                                         \
@@ -3212,6 +3248,10 @@ HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
     Arr *r = (Arr *)a;                                                         \
     if (HEFF_LIKELY(heff_arr_in(r, i))) HEFF_ARR_AT(r, T)[INT_OF(i)] = x;      \
     else heff_drop(i);                                                         \
+    return a;                                                                  \
+  }                                                                            \
+  HEFF_FAST V heff_arraySetOwnedIn_##S(V a, V i, T x) {                        \
+    HEFF_ARR_AT((Arr *)a, T)[INT_OF(i)] = x;                                   \
     return a;                                                                  \
   }
 HEFF_ARR_OWN(f64, double, HEFF_ARR_F64)
