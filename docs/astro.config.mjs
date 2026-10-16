@@ -29,7 +29,10 @@ function pages() {
   };
 }
 
+// The site is the repository's GitHub Pages, under /heff/.
 export default defineConfig({
+  site: 'https://dannypsnl.github.io',
+  base: '/heff',
   markdown: { remarkPlugins: [pages] },
   integrations: [
     starlight({
