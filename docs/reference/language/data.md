@@ -36,8 +36,8 @@ pen = Red
 
 So something around a tag must say its type: a signature, as above; a
 function it is given to, `paint Red` where `paint : Ink -> String`; or
-the tag itself, `(Red : Ink)`. With nothing to say it,
-`let x = Red`, it is an error.
+the tag itself, `(Red : Ink)`. A tag with nothing to say its type, as
+in `let x = Red`, will cause an error.
 
 ## Type aliases
 
