@@ -122,6 +122,9 @@ data E
   | ETry T (Maybe E) (List E) E
   -- | `catch x ->` and its statements
   | ECatch T E T (List E)
+  -- | `with e as x do` and its statements: `with`, the `with` given the
+  -- | statements, `as`, the name, `do`
+  | EWith T E T T T (List E)
 
 -- | a theory's field, `x : A`, and its default, `= d`, if it has one
 data TF = MkTF T T E (Maybe (Pair T E))
@@ -452,6 +455,23 @@ manyGo p acc = do
 many : {a : Type} -> P a -> P (List a)
 many p = manyGo p Nil
 
+-- | as many as there are before a token `stop` says ends them
+manyBeforeGo : {a : Type} -> (T -> Bool) -> P a -> List a -> P (List a)
+manyBeforeGo stop p acc = do
+  b <- atBoundary
+  t <- peek
+  if b || stop t || not (startsItem t) then pure (List.reverse acc)
+    else do
+      x <- p
+      manyBeforeGo stop p (Cons x acc)
+
+manyBefore : {a : Type} -> (T -> Bool) -> P a -> P (List a)
+manyBefore stop p = manyBeforeGo stop p Nil
+
+-- | the name `as` (no keyword: a `with` statement's, an import's)
+isAs : T -> Bool
+isAs t = isKind t "var" && isText t "as"
+
 -- | items between separators, and the separators
 data Sep a = MkSep (List a) (List T)
 
@@ -531,9 +551,14 @@ type Gram =
   -- | `case` (a statement that binds nothing)
   , stmt : P E
   , arm : P E
+  -- | an expression `as` ends (a `with` statement's, before `as x do`)
+  , withHead : P E
   -- | whether a `do` block may be an application's last argument, `run
   -- | do ...` (not in a loop's head: its `do` is the loop's)
   , blockArg : Bool
+  -- | whether a name `as` ends an application (in a `with` statement's
+  -- | head: `as x` follows it)
+  , stopAs : Bool
   }
 
 exprHead : Gram -> T -> P E
@@ -620,7 +645,7 @@ userOpsF g = do
 appF : Gram -> P E
 appF g = do
   h <- g.atom
-  args <- many g.atom
+  args <- if g.stopAs then manyBefore isAs g.atom else many g.atom
   t <- peek
   b <- atBoundary
   if g.blockArg && isKw t "do" && not b
@@ -1155,9 +1180,33 @@ tryF g = do
   c <- tryPartF (catchF g)
   tryCaught kw ty body c
 
+-- | `as` after a `with` statement's head
+expectAs : P T
+expectAs = do
+  t <- peek
+  if isAs t then next
+    else throwP
+        (diag
+           (spanOf t)
+           ("a `with` statement names what it holds: `with e as x do`, not "
+            ^ shown t))
+
+-- | `with e as x do` and its statements
+withF : Gram -> P E
+withF g = do
+  kw <- next
+  e <- g.withHead
+  a <- expectAs
+  x <- expectKind "var" "the name of what the `with` holds"
+  d <- expectKw "do"
+  body <- block g.stmt
+  pure (EWith kw e a x d body)
+
 -- | an arm of a statement's `if` or `case`: a statement that binds
 -- | nothing (`x := e`, an `if` or `case` of such arms, `break`, `return
--- | e`, a `do` block of statements, an action)
+-- | e`, a `do` block of statements, `try`, `with`, an action).  A
+-- | statement starting with the name `with` is a `with` statement (no
+-- | keyword: `with` is a module's name too)
 armF : Gram -> P E
 armF g = do
   t <- peek
@@ -1166,6 +1215,7 @@ armF g = do
     else if isKw t "case" then caseStmtF g
     else if isKw t "try" then tryF g
     else if isKind t "var" && isKind t2 "sym" && isText t2 ":=" then assignF g
+    else if isKind t "var" && isText t "with" then withF g
     else g.expr
 
 -- | a statement of a `do` block: `x <- e`, `let p = e`, `let mut x = e`,
@@ -1287,6 +1337,31 @@ patAtomF g = do
         (diag (spanOf t) "a pattern negates only a number, its sign: `-1`")
     else throwP (diag (spanOf t) ("expected a pattern, not " ^ shown t))
 
+-- (a `with` statement's head: no `do` block an argument in it, `as`
+-- ending an application)
+withGram : Gram
+withGram =
+  { expr = \st -> exprF withGram st
+  , opExpr = \minPrec st -> opExprF withGram minPrec st
+  , userOps = \st -> userOpsF withGram st
+  , app = \st -> appF withGram st
+  , atom = \st -> atomF withGram st
+  , pattern = \st -> patternF withGram st
+  , patHead = \st -> patHeadF withGram st
+  , patAtom = \st -> patAtomF withGram st
+  , lambda = \st -> lambdaF withGram st
+  , caseE = \st -> caseExprF withGram st
+  , ifE = \st -> ifExprF withGram st
+  , doE = \st -> doExprF withGram st
+  , letE = \st -> letExprF withGram st
+  , head = \st -> exprF withGram st
+  , stmt = \st -> stmtF withGram st
+  , arm = \st -> armF withGram st
+  , withHead = \st -> exprF withGram st
+  , blockArg = False
+  , stopAs = True
+  }
+
 -- (a loop's head: no `do` block an argument in it)
 headGram : Gram
 headGram =
@@ -1306,7 +1381,9 @@ headGram =
   , head = \st -> exprF headGram st
   , stmt = \st -> stmtF headGram st
   , arm = \st -> armF headGram st
+  , withHead = \st -> exprF withGram st
   , blockArg = False
+  , stopAs = False
   }
 
 gram : Gram
@@ -1327,7 +1404,9 @@ gram =
   , head = \st -> exprF headGram st
   , stmt = \st -> stmtF gram st
   , arm = \st -> armF gram st
+  , withHead = \st -> exprF withGram st
   , blockArg = True
+  , stopAs = False
   }
 
 -- The declarations
@@ -1771,6 +1850,7 @@ firstE (IfThen kw c th a) = kw
 firstE (ELetCond kw p eq e) = kw
 firstE (ETry kw ty body c) = kw
 firstE (ECatch kw b arrow body) = kw
+firstE (EWith kw e a x d body) = kw
 
 lastE : E -> T
 lastE (Atom t) = t
@@ -1841,6 +1921,10 @@ lastE (ECatch kw b arrow body) =
   (case List.last body of
    Just e -> lastE e
    Nothing -> arrow)
+lastE (EWith kw e a x d body) =
+  (case List.last body of
+   Just s -> lastE s
+   Nothing -> d)
 
 -- (`lastE` of the element, if there is one; the fallback otherwise)
 lastEOr : T -> Maybe E -> T
@@ -2021,6 +2105,10 @@ tsE (ETry kw ty body c) =
        (List.append (List.concatMap tsE body) (tsE c)))
 tsE (ECatch kw b arrow body) =
   Cons kw (List.append (tsE b) (Cons arrow (List.concatMap tsE body)))
+tsE (EWith kw e a x d body) =
+  Cons
+    kw
+    (List.append (tsE e) (Cons a (Cons x (Cons d (List.concatMap tsE body)))))
 
 tsTF : TF -> List T
 tsTF (MkTF x cc ty Nothing) = Cons x (Cons cc (tsE ty))

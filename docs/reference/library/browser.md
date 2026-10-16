@@ -16,14 +16,12 @@ greeting name = if name == "" then "Hello, whoever you are." else "Hello, " ^ na
 -- | the paragraph greets whatever is typed into the input
 greeter : {e : HFunctor} -> {{page : dom <: e}} -> Co e Unit
 greeter = do
-  _ <-
-    withDocument (\doc -> do
-      out <- xpath doc "//p[@id='greeting']"
-      name <- select doc "#name"
-      found out (\o -> do
-        text o (greeting "")
-        found name (\n -> on n "input" (\v -> text o (greeting v)))))
-  pure MkUnit
+  with withDocument as doc do
+    out <- xpath doc "//p[@id='greeting']"
+    name <- select doc "#name"
+    found out (\o -> do
+      text o (greeting "")
+      found name (\n -> on n "input" (\v -> text o (greeting v))))
 ```
 
 `withDocument body` gives the body the page's document, at the top of

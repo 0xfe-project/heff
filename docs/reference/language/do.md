@@ -116,3 +116,44 @@ total words = do
 
 Releasing a resource is not `try`'s job: a resource is held by a `with`
 of its own effect, such as `std.filesystem`'s `withFile`.
+
+## with
+
+```haskell
+import exception
+import std.filesystem
+
+lineCount : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
+          -> String
+          -> Co e Int
+lineCount path = do
+  let mut n = 0
+  with withFile path { access = Read } as f do
+    let mut more : Bool = True
+    while more do
+      l <- readLine f
+      case l of
+        Right (Just _) -> n := n + 1
+        _ -> more := False
+  return n
+```
+
+`with e as x do` runs the statements under it as the body of the
+[`with`](../library/with.md) `e`, such as `withFile path o`, with `x`
+the `With s r` it holds. It is `e (\x -> do ...)`, written as a
+statement.
+
+- `x` is in scope in the statements under it alone, and cannot leave
+  them (E0311).
+- The statements belong to the block, as a `try`'s do: they can set
+  its variables, `break`, `continue` and `return`. The thing is let go
+  of on the way out.
+- As the block's last statement, its value is the block's; otherwise
+  it is dropped.
+- A `with` throws what it could not acquire or release: a `try` around
+  it catches that.
+
+`with` starts a statement only: anywhere else, and as a module's name
+(`import with`), it is a name like any other.
