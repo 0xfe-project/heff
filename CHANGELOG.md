@@ -12,6 +12,7 @@
 - E0317 says `non-exhaustive pattern: no case provided for ...`.
 - `let p = e else s` in a `do` block: `p` may fail to match, and `s` runs where it does; `s` must leave the block, by `return`, `break`, `continue` or `abandon` (E0203 otherwise).
 - `if let` is removed: write a `case`, or `let p = e else s`.
+- A signature may name more than one definition, `x, y, z : T`, at the top level, in `where` and `mutual`, and for a theory's or a record type's fields (`{ x, y : Int }`).
 
 ### Backends and performance
 

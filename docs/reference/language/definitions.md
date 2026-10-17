@@ -30,6 +30,30 @@ A pattern is one of:
 
 Patterns nest: `Node x (c :: cs)`.
 
+### More names, one type
+
+A signature may name more than one definition: `x, y, z : T` is
+`x : T`, `y : T` and `z : T`. Each name still needs its own equations,
+after the signature, each name's together, in any order:
+
+```haskell
+-- | the smaller and the larger of two
+smaller, larger : Int -> Int -> Int
+smaller a b = if a < b then a else b
+larger a b = if a < b then b else a
+```
+
+A name with no equations there has a type but no definition, said at
+that name; a name written twice in one signature is an error. The doc
+comment above the signature is each name's, as `heff doc` and a hover
+show. `heff fmt` keeps the signatures as they are written: it neither
+joins separate ones nor splits one of more names.
+
+The same works in a `where` and a `mutual` block, for a theory's
+fields (`first, second : a -> a`) and for a record type's
+(`{ x, y : Int }`, each with the type, and the default if one is
+given, of the field after it).
+
 ## Keywords
 
 These words are keywords, and nothing is named by one:

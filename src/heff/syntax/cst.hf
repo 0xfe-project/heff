@@ -134,15 +134,19 @@ data E
   -- | statements, `as`, the pattern (a name, or `(a, b)`), `do`
   | EWith T E T Pat T (List E)
 
--- | a theory's field, `x : A`, and its default, `= d`, if it has one
-data TF = MkTF T T E (Maybe (Pair T E))
+-- | a theory's field, `x : A`, and its default, `= d`, if it has one:
+-- | the names (`x, y : A` declares two, the commas between them), `:`,
+-- | the type, the default
+data TF = MkTF (List T) (List T) T E (Maybe (Pair T E))
 
 data DAlts = MkDAlts T (List E) (List T)
 
 data D
   = DImport T
   | DFixity T (List T)
-  | DSig (List T) T E
+  -- | `f : T`, or `f, g : T`: the names (each `f`, `C` or `(+)`), the
+  -- | commas between them, `:`, the type
+  | DSig (List (List T)) (List T) T E
   -- | `instance f : T`, the signature of an instance: the keyword, then
   -- | as a signature
   | DInstance T (List T) T E
@@ -1547,16 +1551,24 @@ fieldDefault = do
       pure (Just (MkPair eq d))
     else pure Nothing
 
-theoryField : P TF
-theoryField = do
+-- (a theory's field's name)
+theoryFieldName : P T
+theoryFieldName = do
   x <- next
   if not (isKind x "var" || isKind x "con")
     then throwP (diag (spanOf x) "a field is `name : Type`")
-    else do
-      cc <- expectAnn
-      ty <- gram.expr
-      d <- fieldDefault
-      pure (MkTF x cc ty d)
+    else pure x
+
+mkTF : Sep T -> T -> E -> Maybe (Pair T E) -> TF
+mkTF (MkSep xs commas) cc ty d = MkTF xs commas cc ty d
+
+theoryField : P TF
+theoryField = do
+  xs <- sepBy1 "," theoryFieldName
+  cc <- expectAnn
+  ty <- gram.expr
+  d <- fieldDefault
+  pure (mkTF xs cc ty d)
 
 -- | `theory T a where` and its fields
 theoryDecl : P D
@@ -1611,6 +1623,22 @@ instanceDecl = do
       ty <- gram.expr
       pure (DInstance kw name cc ty)
 
+-- | a name a signature declares, after a `,`: `f`, `C`, or `(+)`
+sigName : P (List T)
+sigName = do
+  t <- peek
+  t2 <- peekAt 1
+  t3 <- peekAt 2
+  if declNameLen t t2 t3 == 0
+    then throwP
+        (diag
+           (spanOf t)
+           "a signature's names are `f`, `C` or `(+)`: `f, g : T`")
+    else nextN (declNameLen t t2 t3)
+
+mkSig : Sep (List T) -> T -> E -> D
+mkSig (MkSep names commas) cc ty = DSig names commas cc ty
+
 -- | a signature, or an equation, perhaps followed by `where` and its
 -- | local declarations (each read by `item`)
 sigOrEqn : P D -> T -> P D
@@ -1622,12 +1650,12 @@ sigOrEqn item t = do
         (diag (spanOf t) ("a declaration cannot start with `" ^ t.text ^ "`"))
     else do
       u <- peekAt (declNameLen t t2 t3)
-      if isAnnText u.text
+      if isAnnText u.text || isText u ","
         then do
-          name <- nextN (declNameLen t t2 t3)
-          cc <- next
+          names <- sepBy1 "," sigName
+          cc <- expectAnn
           ty <- gram.expr
-          pure (DSig name cc ty)
+          pure (mkSig names cc ty)
         else do
           name <- nextN (declNameLen t t2 t3)
           pats <- many gram.patAtom
@@ -1769,6 +1797,26 @@ declaredAt s = case Array.index s.toks s.top of
     Just u -> declaredTwo t u
     Nothing -> declaredOne t
   Nothing -> Nothing
+
+-- (the names after the first of a signature, from the `,` at `k`, as
+-- far as it says)
+declaredMoreGo : St -> Int -> List String
+declaredMoreGo s k =
+  if not (isText (tokAt s k) ",") then Nil
+  else if isText (tokAt s (k + 1)) "(" && isText (tokAt s (k + 3)) ")"
+  then Cons (tokAt s (k + 2)).text (declaredMoreGo s (k + 4))
+  else if isKind (tokAt s (k + 1)) "var" || isKind (tokAt s (k + 1)) "con"
+  then Cons (tokAt s (k + 1)).text (declaredMoreGo s (k + 2))
+  else Nil
+
+-- | the names after the first of a signature starting at `top`, each
+-- | after a `,`: `g` and `h` of `f, g, h : T`
+declaredMore : St -> List String
+declaredMore s =
+  if isText (tokAt s s.top) "(" then declaredMoreGo s (s.top + 3)
+  else if isKind (tokAt s s.top) "var" || isKind (tokAt s s.top) "con"
+  then declaredMoreGo s (s.top + 1)
+  else Nil
 
 -- | why a text does not parse, as the formatter says it
 notParsing : Diag -> String
@@ -1970,10 +2018,14 @@ lastEOr t (Just e) = lastE e
 nmFirst : List T -> T
 nmFirst n = fromMaybe (eofAt 0) (List.head n)
 
+nmsFirst : List (List T) -> T
+nmsFirst (Cons n _) = nmFirst n
+nmsFirst Nil = eofAt 0
+
 firstD : D -> T
 firstD (DImport t) = t
 firstD (DFixity kw ts) = kw
-firstD (DSig n cc ty) = nmFirst n
+firstD (DSig ns commas cc ty) = nmsFirst ns
 firstD (DInstance kw n cc ty) = kw
 firstD (DEqn n pats eq rhs w) = nmFirst n
 firstD (DData kw name params universe alts) = kw
@@ -1985,8 +2037,8 @@ firstD (DTest kw x) = kw
 firstD (DWatch w e) = w
 
 tfLast : TF -> T
-tfLast (MkTF x cc ty Nothing) = lastE ty
-tfLast (MkTF x cc ty (Just (MkPair eq d))) = lastE d
+tfLast (MkTF xs commas cc ty Nothing) = lastE ty
+tfLast (MkTF xs commas cc ty (Just (MkPair eq d))) = lastE d
 
 dataLastPlain : T -> List E -> Maybe (Pair T E) -> T
 dataLastPlain name params (Just (MkPair cc u)) = lastE u
@@ -2004,7 +2056,7 @@ lastTF t (Just f) = tfLast f
 lastD : D -> T
 lastD (DImport t) = t
 lastD (DFixity kw ts) = fromMaybe kw (List.last ts)
-lastD (DSig n cc ty) = lastE ty
+lastD (DSig ns commas cc ty) = lastE ty
 lastD (DInstance kw n cc ty) = lastE ty
 lastD (DEqn n pats eq rhs (Just (MkPair kw ds))) = case List.last ds of
   Just d -> lastD d
@@ -2161,10 +2213,17 @@ tsE (EWith kw e a x d body) =
        (tsE e)
        (Cons a (List.append (tsP x) (Cons d (List.concatMap tsE body)))))
 
+-- (each name a list of its one token)
+oneEach : List T -> List (List T)
+oneEach xs = List.map (\x -> Cons x Nil) xs
+
 tsTF : TF -> List T
-tsTF (MkTF x cc ty Nothing) = Cons x (Cons cc (tsE ty))
-tsTF (MkTF x cc ty (Just (MkPair eq d))) =
-  Cons x (Cons cc (List.append (tsE ty) (Cons eq (tsE d))))
+tsTF (MkTF xs commas cc ty Nothing) =
+  List.append (interleaveT (oneEach xs) commas) (Cons cc (tsE ty))
+tsTF (MkTF xs commas cc ty (Just (MkPair eq d))) =
+  List.append
+    (interleaveT (oneEach xs) commas)
+    (Cons cc (List.append (tsE ty) (Cons eq (tsE d))))
 
 tsUniverse : Maybe (Pair T E) -> List T
 tsUniverse Nothing = Nil
@@ -2178,7 +2237,8 @@ tsDAlts (Just (MkDAlts eq alts bars)) =
 tsD : D -> List T
 tsD (DImport t) = Cons t Nil
 tsD (DFixity kw ts) = Cons kw ts
-tsD (DSig n cc ty) = List.append n (Cons cc (tsE ty))
+tsD (DSig ns commas cc ty) =
+  List.append (interleaveT ns commas) (Cons cc (tsE ty))
 tsD (DInstance kw n cc ty) = Cons kw (List.append n (Cons cc (tsE ty)))
 tsD (DEqn n pats eq rhs w) =
   List.append
@@ -2256,7 +2316,7 @@ roundtrip src = roundtripClaim src (Imports.readImports src)
 dKind : D -> String
 dKind (DImport t) = "import"
 dKind (DFixity kw ts) = "fixity"
-dKind (DSig n cc ty) = "sig"
+dKind (DSig ns commas cc ty) = "sig"
 dKind (DInstance kw n cc ty) = "instance"
 dKind (DEqn n pats eq rhs w) = "eqn"
 dKind (DData kw name params universe alts) = "data"
@@ -2292,6 +2352,12 @@ test reading
 -- >>> dKinds "mutual\n  even : Int -> Bool\n  even n = odd n\n\n  odd : Int -> Bool\n  odd n = even n\n\nf = 1"
 -- "mutual eqn"
 
+-- >>> dKinds "f, g : Int\nf = 1\ng = 2"
+-- "sig eqn eqn"
+
+-- >>> dKinds "theory M a where\n  m, n : a -> a"
+-- "theory"
+
 -- >>> dKinds "f = case x of\n  Nil -> 0\n  Cons y ys -> 1 + f ys"
 -- "eqn"
 
@@ -2306,6 +2372,12 @@ test reading
 
 -- >>> dKinds "f = ("
 -- "the file does not parse (at offset 5: expected an expression, not the end of the declaration)"
+
+-- >>> dKinds "f, : Int"
+-- "the file does not parse (at offset 3: a signature's names are `f`, `C` or `(+)`: `f, g : T`)"
+
+-- >>> roundtrip "f, (+), G : Int -> Int\n\ntheory M a where\n  m, n : a\n\nt : { x, y : Int }"
+-- "ok"
 
 -- >>> roundtrip "import a\n\nf : {a : Type} -> a -> Int\nf x = if p x then 1 else g (x := 2) r.y\n\ndata T = A | B Int\n\n-- >>> f Tag\n-- 1"
 -- "ok"

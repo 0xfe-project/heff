@@ -738,9 +738,9 @@ assembleDiagOne : Map.Map String Unit
                 -> Map.Map String Unit
                 -> Item
                 -> Maybe Diag
-assembleDiagOne broken sigs eqns (Sig _ f _ _ sp) =
+assembleDiagOne broken sigs eqns (Sig _ f fsp _ _) =
   if not (isIn eqns f) && not (isIn broken f)
-  then Just (diag sp ("`" ^ f ^ "` has a type but no definition"))
+  then Just (diag fsp ("`" ^ f ^ "` has a type but no definition"))
   else Nothing
 assembleDiagOne broken sigs eqns (Eqn f _ sp) =
   if not (isIn sigs f) && not (isIn broken f)
@@ -871,6 +871,125 @@ twiceDiags at items =
           (\(d : Defined) it -> definedStep at d (definesOf d.open it))
           { seen = Map.empty, prims = Map.empty, open = Nothing, diags = Nil }
           items))
+
+-- Signatures of more than one name
+--------------------------------------------------------------------------------
+
+-- A signature of more than one name, `f, g : T`, is lowered to a
+-- signature for each, `f : T` and `g : T`, one after another, each
+-- spanning the whole signature.  The equations after it are those of
+-- its names, each name's together, the names in any order: each
+-- signature is moved down to right above its name's equations, and
+-- then meets them as a one-name signature does.  A signature whose name
+-- has no equations there is left where they end, and is said to have no
+-- definition.  A doc test of the signature, placed after its first
+-- name's signature, is moved to where the equations end, so that it is
+-- checked with all its names defined.
+
+-- (a signature of the same `f, g : T` as the one spanning `sp`)
+sameSig : Params.Span -> Item -> Bool
+sameSig sp (Sig _ _ _ _ sp2) = sp.start == sp2.start && sp.end == sp2.end
+sameSig sp _ = False
+
+-- (an item the equations of a signature's names may go on past: a doc
+-- test, a test, a watch)
+passable : Item -> Bool
+passable (Doc _) = True
+passable (Whole d) = not (definesDecl d)
+passable _ = False
+
+-- | the signatures of the same `f, g : T` after its first, the items
+-- | passed over between them (doc tests), and what is after them
+type Group = { sigs : List Item, held : List Item, rest : List Item }
+
+groupSig : Item -> Group -> Group
+groupSig it g = { sigs = Cons it g.sigs, held = g.held, rest = g.rest }
+
+groupHeld : Item -> Group -> Group
+groupHeld it g = { sigs = g.sigs, held = Cons it g.held, rest = g.rest }
+
+groupEnd : List Item -> Group
+groupEnd items = { sigs = Nil, held = Nil, rest = items }
+
+-- (`it` passed over if a signature of the group is after it)
+groupPast : Item -> Group -> List Item -> Group
+groupPast it g items =
+  if List.null g.sigs then groupEnd items else groupHeld it g
+
+groupFrom : Params.Span -> List Item -> Group
+groupFrom sp Nil = groupEnd Nil
+groupFrom sp (Cons it rest) =
+  if sameSig sp it then groupSig it (groupFrom sp rest)
+  else if passable it then groupPast it (groupFrom sp rest) (Cons it rest)
+  else groupEnd (Cons it rest)
+
+-- (the group of the signature `it`; none of another item)
+groupOf : Item -> List Item -> Group
+groupOf (Sig _ _ _ _ sp) rest = groupFrom sp rest
+groupOf _ rest = groupEnd rest
+
+-- (the name of a signature, or of an equation; "" of another item)
+itemName : Item -> String
+itemName (Sig _ f _ _ _) = f
+itemName (Eqn f _ _) = f
+itemName _ = ""
+
+isEqn : Item -> Bool
+isEqn (Eqn _ _ _) = True
+isEqn _ = False
+
+pickCons : Item
+         -> Maybe (Pair Item (List Item))
+         -> Maybe (Pair Item (List Item))
+pickCons it (Just (MkPair s more)) = Just (MkPair s (Cons it more))
+pickCons it Nothing = Nothing
+
+-- (the signature of `f` among those waiting, and the others)
+pickSig : String -> List Item -> Maybe (Pair Item (List Item))
+pickSig f Nil = Nothing
+pickSig f (Cons it rest) =
+  if strEq (itemName it) f then Just (MkPair it rest)
+  else pickCons it (pickSig f rest)
+
+-- (`xs` onto `acc`, which is last first)
+revOnto : List Item -> List Item -> List Item
+revOnto Nil acc = acc
+revOnto (Cons x xs) acc = revOnto xs (Cons x acc)
+
+-- (the signatures still waiting, then the doc tests held, onto `acc`)
+flushed : List Item -> List Item -> List Item -> List Item
+flushed waiting held acc = revOnto held (revOnto waiting acc)
+
+-- (`waiting`: the signatures of a group not yet above their equations;
+-- `held`: the group's doc tests; `open`: the name whose equations are
+-- being passed; `acc`: the items so far, last first)
+spreadGo : List Item
+         -> List Item
+         -> Maybe String
+         -> List Item
+         -> List Item
+         -> List Item
+spreadGo waiting held open Nil acc = List.reverse (flushed waiting held acc)
+spreadGo Nil Nil open (Cons it rest) acc =
+  let g : Group = groupOf it rest
+  in if List.null g.sigs then spreadGo Nil Nil Nothing rest (Cons it acc)
+  else spreadGo (Cons it g.sigs) g.held Nothing g.rest acc
+spreadGo waiting held open (Cons it rest) acc =
+  if isEqn it && isOpen open (itemName it)
+  then spreadGo waiting held open rest (Cons it acc)
+  else if isEqn it
+  then (case pickSig (itemName it) waiting of
+        Just (MkPair s more) ->
+          spreadGo more held (Just (itemName it)) rest (Cons it (Cons s acc))
+        Nothing ->
+          spreadGo Nil Nil Nothing (Cons it rest) (flushed waiting held acc))
+  else if passable it then spreadGo waiting held open rest (Cons it acc)
+  else spreadGo Nil Nil Nothing (Cons it rest) (flushed waiting held acc)
+
+-- | the signatures of more than one name each right above its name's
+-- | equations
+spread : List Item -> List Item
+spread items = spreadGo Nil Nil Nothing items Nil
 
 -- Doc tests meet their definitions
 --------------------------------------------------------------------------------
@@ -1225,6 +1344,82 @@ bracedL r f sp = do
   e' <- declarationL r f
   pure (Braced e' Nothing sp)
 
+-- | `x, x : T`, a name written twice in one signature (of a definition,
+-- | a theory's field or a record type's), at the second
+namedTwice : String -> Params.Span -> Diag
+namedTwice x sp = diag sp ("`" ^ x ^ "` is named twice in one signature")
+
+-- (a name written twice in the names of one field of a record type, `{
+-- x, x : T }`: `seen`, the names alone before, the field ending them)
+repeatedField : List String
+              -> List
+                (Either
+                   CST.T
+                   (Params.Spanned
+                      (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)))
+              -> Maybe Diag
+repeatedField seen Nil = Nothing
+repeatedField seen (Cons (Left x) rest) =
+  if List.elemBy strEq x.text seen then Just (namedTwice x.text (spanT x))
+  else repeatedField (Cons x.text seen) rest
+repeatedField seen (Cons (Right (At (DeclareField f fsp _ _) _)) rest) =
+  if List.elemBy strEq f seen then Just (namedTwice f fsp)
+  else repeatedField Nil rest
+repeatedField seen (Cons (Right _) rest) = repeatedField Nil rest
+
+-- | a field of a record type as written: a name alone, `x` of `{ x, y :
+-- | T }`, or a field
+fieldOrName : Lw
+            -> CST.E
+            -> P
+              (Either
+                 CST.T
+                 (Params.Spanned
+                    (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)))
+fieldOrName r (Atom x) =
+  if strEq x.kind "var" then pure (Left x)
+  else do
+    f <- fieldL r (Atom x)
+    pure (Right f)
+fieldOrName r e = do
+  f <- fieldL r e
+  pure (Right f)
+
+-- (`x`, a name alone, given the type and the default of the field after
+-- it, `fs`'s first)
+sharedField : CST.T
+            -> List
+              (Params.Spanned
+                 (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr))
+            -> P
+              (Params.Spanned
+                 (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr))
+sharedField x (Cons (At (DeclareField _ _ t d) sp) _) =
+  pure
+    (At
+       (DeclareField x.text (spanT x) t d)
+       (Presyntax.spanning (spanT x) sp))
+sharedField x _ = throwP (diag (spanT x) "a field is `name : Type`")
+
+-- | the fields of a record type: `x, y : T` declares `x : T` and `y : T`
+sharedFields : List
+               (Either
+                  CST.T
+                  (Params.Spanned
+                     (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)))
+             -> P
+               (List
+                  (Params.Spanned
+                     (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)))
+sharedFields Nil = pure Nil
+sharedFields (Cons (Right f) rest) = do
+  rest' <- sharedFields rest
+  pure (Cons f rest')
+sharedFields (Cons (Left x) rest) = do
+  rest' <- sharedFields rest
+  f <- sharedField x rest'
+  pure (Cons f rest')
+
 bracesL : Lw -> CST.T -> List CST.E -> CST.T -> P Presyntax.Expr
 bracesL r o Nil c = pure (At (EStruct Nil) (spanTT o c))
 bracesL r o fs@(Cons f rest) c =
@@ -1233,8 +1428,12 @@ bracesL r o fs@(Cons f rest) c =
     fs' <- traverseS (\m -> settingL r m) fs
     pure (At (EStruct fs') (spanTT o c))
   else do
-    fs' <- traverseS (\m -> fieldL r m) fs
-    pure (At (ESig fs') (spanTT o c))
+    ws <- traverseS (\m -> fieldOrName r m) fs
+    case repeatedField Nil ws of
+      Just d -> throwP d
+      Nothing -> do
+        fs' <- sharedFields ws
+        pure (At (ESig fs') (spanTT o c))
 
 -- | `C x y`, a tag applied
 conL : Lw -> CST.T -> List CST.E -> P Presyntax.Expr
@@ -2192,6 +2391,10 @@ declNameOf (Cons t (Cons op (Cons c Nil))) = { name = op.text, span = spanT op }
 declNameOf (Cons t rest) = { name = t.text, span = spanT t }
 declNameOf Nil = { name = "", span = mkSpan 0 0 }
 
+-- (a name, one token)
+tokName : CST.T -> DeclName
+tokName x = { name = x.text, span = spanT x }
+
 firstStart : List CST.T -> Int
 firstStart (Cons t _) = t.start
 firstStart Nil = 0
@@ -2206,25 +2409,47 @@ addBinders b s =
     (Map.insert s.binders b.f (Cons b (bindersFor s b.f)))
     s
 
--- | a signature, of a definition or an instance (`declared`); `start`,
--- | where it starts -- an instance's, at `instance`
-sigL : Lw -> Presyntax.Declared -> Int -> List CST.T -> CST.E -> P (List Item)
-sigL r declared start names ty = do
-  ty' <- r.e ty
-  pModify
-      (\s ->
-         addBinders
-           (mkBinders (declNameOf names).name (piBinders ty') (piImplicits ty'))
-           s)
-  pure
-      (Cons
-         (Sig
-            declared
-            (declNameOf names).name
-            (declNameOf names).span
-            ty'
-            (mkSpan start (CST.lastE ty).end))
-         Nil)
+-- | a name written twice in one signature, at the second (`seen`: the
+-- | names before)
+repeatedIn : List String -> List DeclName -> Maybe Diag
+repeatedIn seen Nil = Nothing
+repeatedIn seen (Cons n rest) =
+  if List.elemBy strEq n.name seen then Just (namedTwice n.name n.span)
+  else repeatedIn (Cons n.name seen) rest
+
+-- (the binders of a signature's type `ty`, for the equations of `n`)
+sigBinders : Presyntax.Expr -> St -> DeclName -> St
+sigBinders ty s n =
+  addBinders (mkBinders n.name (piBinders ty) (piImplicits ty)) s
+
+-- (the signature of `n`, its type `ty`, the signature spanning `sp`)
+sigItem : Presyntax.Declared
+        -> Presyntax.Expr
+        -> Params.Span
+        -> DeclName
+        -> Item
+sigItem declared ty sp n = Sig declared n.name n.span ty sp
+
+-- | a signature, of a definition or an instance (`declared`): one for
+-- | each of its names, `f : T` and `g : T` of `f, g : T`, each spanning
+-- | it; `start`, where it starts -- an instance's, at `instance`
+sigL : Lw
+     -> Presyntax.Declared
+     -> Int
+     -> List (List CST.T)
+     -> CST.E
+     -> P (List Item)
+sigL r declared start names ty = case repeatedIn
+    Nil
+    (List.map declNameOf names) of
+  Just d -> throwP d
+  Nothing -> do
+    ty' <- r.e ty
+    pModify (\s -> List.foldl (sigBinders ty') s (List.map declNameOf names))
+    pure
+        (List.map
+           (sigItem declared ty' (mkSpan start (CST.lastE ty).end))
+           (List.map declNameOf names))
 
 lastDEnd : List CST.D -> Int -> Int
 lastDEnd ds e = case List.last ds of
@@ -2240,13 +2465,13 @@ whereL r kw ds rhs = do
   pModify (\s -> setBinders saved s)
   at <- pGets (\s -> s.at)
   case appendS
-      (twiceDiags at (concatMapS (\x -> x) items))
-      (assembleDiags Nil (concatMapS (\x -> x) items)) of
+      (twiceDiags at (spread (concatMapS (\x -> x) items)))
+      (assembleDiags Nil (spread (concatMapS (\x -> x) items))) of
     Cons d _ -> throwP d
     Nil ->
       pure
         (At
-           (ELocal rhs (assemble Nil (concatMapS (\x -> x) items)))
+           (ELocal rhs (assemble Nil (spread (concatMapS (\x -> x) items))))
            (mkSpan (Params.spanOf rhs).start (lastDEnd ds kw.end)))
 
 -- | `f p ... = e`, perhaps followed by `where`
@@ -2389,14 +2614,16 @@ defaultL r (Just (MkPair eq d)) = do
   d' <- r.e d
   pure (Just d')
 
--- | a field of a theory, and its default: in scope in the fields after
--- | it (not in its default)
-theoryFieldL : Lw
-             -> CST.TF
-             -> P
-               (Params.Spanned
-                  (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr))
-theoryFieldL r (MkTF x cc ty d) = do
+-- | a field of a theory, `x` of `x : A` (or of `x, y : A`), and its
+-- | default: in scope in the fields after it (not in its default)
+theoryFieldOne : Lw
+               -> CST.E
+               -> Maybe (Pair CST.T CST.E)
+               -> CST.T
+               -> P
+                 (Params.Spanned
+                    (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr))
+theoryFieldOne r ty d x = do
   ty' <- r.e ty
   d' <- defaultL r d
   pModify (\s -> setScope (Cons x.text s.scope) s)
@@ -2404,6 +2631,19 @@ theoryFieldL r (MkTF x cc ty d) = do
       (At
          (DeclareField x.text (spanT x) ty' d')
          (Presyntax.spanning (spanT x) (Params.spanOf (fromMaybe ty' d'))))
+
+-- | the fields of `x, y : A`, each `x : A` and `y : A`, one after another
+theoryFieldL : Lw
+             -> CST.TF
+             -> P
+               (List
+                  (Params.Spanned
+                     (Presyntax.FieldDecl Presyntax.Expr Presyntax.Expr)))
+theoryFieldL r (MkTF xs commas cc ty d) = case repeatedIn
+    Nil
+    (List.map tokName xs) of
+  Just e -> throwP e
+  Nothing -> traverseS (theoryFieldOne r ty d) xs
 
 -- | `theory T a where` and its fields
 theoryL : Lw
@@ -2425,7 +2665,9 @@ theoryL r d kw name params fields = do
                     name.text
                     (spanT name)
                     params'
-                    (At (ESig fields') (spanTE kw (CST.lastD d).end)))
+                    (At
+                       (ESig (concatMapS (\x -> x) fields'))
+                       (spanTE kw (CST.lastD d).end)))
                  (spanTE kw (CST.lastD d).end)))
            Nil))
 
@@ -2474,7 +2716,8 @@ watchItem w d = if strEq w.kind "doctest" then Doc d else Whole d
 -- | the name of the block's first definition, the block's names made of
 firstSig : List CST.D -> Maybe String
 firstSig Nil = Nothing
-firstSig (Cons (DSig names cc ty) rest) = Just (declNameOf names).name
+firstSig (Cons (DSig names commas cc ty) rest) =
+  Just (declNameOf (headOr Nil names)).name
 firstSig (Cons _ rest) = firstSig rest
 
 -- | a definition of a `mutual` block, its signature met with its
@@ -2627,8 +2870,11 @@ rightsOf (Cons (Left _) rest) = rightsOf rest
 -- | the names a `mutual` block defines, each to its knot
 knotOf : String -> List CST.D -> Map.Map String String
 knotOf k Nil = Map.empty
-knotOf k (Cons (DSig names cc ty) rest) =
-  Map.insert (knotOf k rest) (declNameOf names).name k
+knotOf k (Cons (DSig names commas cc ty) rest) =
+  List.foldl
+    (\m n -> Map.insert m (declNameOf n).name k)
+    (knotOf k rest)
+    names
 knotOf k (Cons _ rest) = knotOf k rest
 
 -- | the items of a `mutual` block, lowered with its names knotted
@@ -2639,10 +2885,10 @@ mutualItems r k ds = do
   pModify (\s -> setKnot Map.empty s)
   at <- pGets (\s -> s.at)
   case appendS
-      (twiceDiags at (concatMapS (\x -> x) items))
-      (assembleDiags Nil (concatMapS (\x -> x) items)) of
+      (twiceDiags at (spread (concatMapS (\x -> x) items)))
+      (assembleDiags Nil (spread (concatMapS (\x -> x) items))) of
     Cons d _ -> throwP d
-    Nil -> pure (concatMapS (\x -> x) items)
+    Nil -> pure (spread (concatMapS (\x -> x) items))
 
 -- | the block's items: the record type `m`, the bodies, the knot `k`,
 -- | then the definitions as the module has them (`ksp`: the keyword;
@@ -2696,8 +2942,10 @@ declL : Lw -> CST.D -> P (List Item)
 declL r (DImport t) = pure Nil
 -- (read before the rest, by `fixityDecls`)
 declL r (DFixity kw ts) = pure Nil
-declL r (DSig names cc ty) = sigL r AsDefinition (firstStart names) names ty
-declL r (DInstance kw names cc ty) = sigL r AsInstance kw.start names ty
+declL r (DSig names commas cc ty) =
+  sigL r AsDefinition (firstStart (headOr Nil names)) names ty
+declL r (DInstance kw names cc ty) =
+  sigL r AsInstance kw.start (Cons names Nil) ty
 declL r (DEqn names pats eq rhs w) = eqnL r names pats rhs w
 declL r d@(DData kw name params universe alts) =
   dataL r d kw name params universe alts
@@ -2721,6 +2969,26 @@ lw =
 -- The program
 --------------------------------------------------------------------------------
 
+-- (a name, onto `acc`: an operator's closing `)` is none)
+nameOnto : Lex.Tok -> List String -> List String
+nameOnto t acc = if strEq t.text ")" then acc else Cons t.text acc
+
+-- (the names of a signature from the token at `k`, the first: `f`, `g`
+-- and `h` of `f, g, h : T`, last first onto `acc`; none if it is no
+-- signature; an operator's `(+)` is passed over)
+sigNamesFrom : Array Lex.Tok -> Int -> List String -> List String
+sigNamesFrom ts k acc = case Array.index ts k of
+  Nothing -> Nil
+  Just t -> case Array.index ts (k + 1) of
+    Nothing -> Nil
+    Just u ->
+      if strEq t.text "(" then sigNamesFrom ts (k + 2) acc
+      else if not (strEq t.kind "var" || strEq t.kind "con" || strEq t.text ")")
+      then Nil
+      else if strEq u.kind "sym" && isAnnText u.text then nameOnto t acc
+      else if strEq u.text "," then sigNamesFrom ts (k + 2) (nameOnto t acc)
+      else Nil
+
 -- | the names a file defines (so that a capitalised one is not a tag)
 -- (`inMutual`: under `mutual`, where a signature is indented)
 prescanGo : Array Lex.Tok -> Int -> Bool -> List String -> List String
@@ -2742,6 +3010,15 @@ prescanGo ts k inMutual acc = case Array.index ts k of
               && strEq u.kind "sym"
               && isAnnText u.text
       then prescanGo ts (k + 1) (inMutual && t.col > 0) (Cons t.text acc)
+      else if t.first
+              && (t.col == 0 || inMutual)
+              && (strEq t.kind "var" || strEq t.kind "con")
+              && strEq u.text ","
+      then prescanGo
+          ts
+          (k + 1)
+          (inMutual && t.col > 0)
+          (appendS (sigNamesFrom ts k Nil) acc)
       else prescanGo
           ts
           (k + 1)
@@ -3094,9 +3371,14 @@ appendRev : {a : Type} -> List a -> List a -> List a
 appendRev Nil acc = acc
 appendRev (Cons x xs) acc = appendRev xs (Cons x acc)
 
-brokenPlus : Maybe String -> List String -> List String
-brokenPlus Nothing broken = broken
-brokenPlus (Just x) broken = Cons x broken
+brokenOne : Maybe String -> List String -> List String
+brokenOne Nothing broken = broken
+brokenOne (Just x) broken = Cons x broken
+
+-- (the names the declaration at `cs` would define: a signature's each)
+brokenPlus : CST.St -> List String -> List String
+brokenPlus cs broken =
+  appendRev (CST.declaredMore cs) (brokenOne (CST.declaredAt cs) broken)
 
 mkProgRes : List Item -> List Diag -> List String -> ProgRes
 mkProgRes items diags broken = { items = items, diags = diags, broken = broken }
@@ -3121,7 +3403,7 @@ progGo cs s items diags broken =
         s
         items
         (Cons d diags)
-        (brokenPlus (CST.declaredAt cs2) broken)
+        (brokenPlus cs2 broken)
     MkPair (Right dc) cs2 -> case lowerDecl dc s of
       MkPair (Left d) s2 ->
         progGo
@@ -3129,7 +3411,7 @@ progGo cs s items diags broken =
           s2
           items
           (Cons d diags)
-          (brokenPlus (CST.declaredAt cs2) broken)
+          (brokenPlus cs2 broken)
       MkPair (Right ds) s2 ->
         if strEq (CST.cur cs2).kind "eof"
         then progGo cs2 s2 (appendRev ds items) diags broken
@@ -3219,7 +3501,7 @@ readPlaced : (Int -> String)
            -> Placed
            -> Read
 readPlaced at lexDiags own r placed =
-  { decls = assemble r.broken (List.reverse placed.items)
+  { decls = assemble r.broken (spread (List.reverse placed.items))
   , diags =
       appendS
         lexDiags
@@ -3230,8 +3512,8 @@ readPlaced at lexDiags own r placed =
               (appendS
                  (List.reverse placed.diags)
                  (appendS
-                    (assembleDiags r.broken r.items)
-                    (twiceDiags at r.items)))))
+                    (assembleDiags r.broken (spread r.items))
+                    (twiceDiags at (spread r.items))))))
   , fixities = own.fixities
   , broken = r.broken
   }
