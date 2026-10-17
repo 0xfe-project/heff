@@ -13,6 +13,7 @@
 - `let p = e else s` in a `do` block: `p` may fail to match, and `s` runs where it does; `s` must leave the block, by `return`, `break`, `continue` or `abandon` (E0203 otherwise).
 - `if let` is removed: write a `case`, or `let p = e else s`.
 - In a `do` block, `then` and `else` may start a line under their `if`, as outside a block; an `else` under an `if` is that `if`'s, and in an `else if` chain, the first `if`'s. `heff fmt` lays them out so.
+- `if <- c then ...` and `case <- c of`: what an `if` tests or a `case` matches may be the value of an action, as `(<- c)`.
 - A signature may name more than one definition, `x, y, z : T`, at the top level, in `where` and `mutual`, and for a theory's or a record type's fields (`{ x, y : Int }`).
 
 ### Standard library
