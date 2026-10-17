@@ -360,7 +360,7 @@ data ExprF
   -- | `~e`: `e` delayed, or the type `Lazy e` where `e` is a type
   | ELazy (Params.Spanned ExprF)
   -- | `()` and `(a, b, c)`: a unit and a pair (`(a, (b, c))`), values of
-  -- | the types `Unit` and `Pair`; where a type is written, those types
+  -- | the types `Unit` and `Pair`; where a type is expected, those types
   | ETuple (List (Params.Spanned ExprF))
   | EIfLet Pat (Params.Spanned ExprF) (Params.Spanned ExprF) (Maybe
                                                                 (Params.Spanned
@@ -496,6 +496,9 @@ data InferableF c t
   -- | `~e`: the type `Lazy e` where `e` is a type, else `e` delayed, a
   -- | `Lazy` of `e`'s type
   | ILazy c
+  -- | `()`, `(a, b, c)`: the types `Unit` and `Pair A (Pair B C)` where a
+  -- | type is expected, else the values `MkUnit` and `MkPair a (b, c)`
+  | ITuple (List c)
 
 -- | a term checked against a type, over types `t`: `CInf`, a term that
 -- | infers its type, checked against it; `CType`, a type, as an element
@@ -695,11 +698,11 @@ thunkOf sp e = At (ELam (LamAnn "_" sp (At (EVar "Unit") sp)) e) sp
 -- | a type to be found: the prelude's `inferred MkUnit`, whose implicit
 -- | argument, the type, is left to the uses to solve
 holeE : Params.Span -> Expr
-holeE sp = app (At (EVar "inferred") sp) [At (ETag "MkUnit") sp]
+holeE sp = app (At (EVar "prelude.inferred") sp) [At (ETag "MkUnit") sp]
 
 -- | the type of the variable `x` in scope: the prelude's `typeOf x`
 typeOfE : Params.Span -> String -> Expr
-typeOfE sp x = app (At (EVar "typeOf") sp) [At (EVar x) sp]
+typeOfE sp x = app (At (EVar "prelude.typeOf") sp) [At (EVar x) sp]
 
 -- (the variables as parameters, each of its variable's type where the
 -- function is defined, or a `Unit`)
@@ -1879,39 +1882,6 @@ runArgs (At (EVar f) _) (Cons (At (EDo ss) dsp) Nil) =
   else [At (EDo ss) dsp]
 runArgs h args = args
 
--- Tuples: `()` the builtin `Unit`'s, `(a, b)` the prelude's `Pair`'s,
--- found by their keys (whatever names are in scope); `(a, b, c)` is
--- `(a, (b, c))`
-
--- (a type to be found, `prelude.inferred MkUnit`, as `holeE`)
-tupleHole : Params.Span -> Expr
-tupleHole sp = app (At (EVar "prelude.inferred") sp) [At (ETag "MkUnit") sp]
-
--- | `()` and `(a, b, c)` as a value: `(MkUnit : Unit)`, `(MkPair a (b, c) :
--- | Pair _ _)`, a tag of the type it says (a tag alone says none)
-tupleValue : Params.Span -> List Expr -> Expr
-tupleValue sp Nil = ann (At (ETag "MkUnit") sp) (At (EVar "builtin.Unit") sp)
-tupleValue sp (Cons a Nil) = a
-tupleValue sp (Cons a (Cons b more)) =
-  At
-    (EAnn
-       (app
-          (At (ETag "MkPair") sp)
-          [a, tupleValue (spanning (Params.spanOf b) sp) (Cons b more)])
-       (app (At (EVar "prelude.Pair") sp) [tupleHole sp, tupleHole sp]))
-    sp
-
--- | `()` and `(A, B, C)` as a type: `Unit`, `Pair A (Pair B C)`
-tupleType : Params.Span -> List Expr -> Expr
-tupleType sp Nil = At (EVar "builtin.Unit") sp
-tupleType sp (Cons a Nil) = a
-tupleType sp (Cons a (Cons b more)) =
-  At
-    (EApp
-       (At (EVar "prelude.Pair") sp)
-       [a, tupleType (spanning (Params.spanOf b) sp) (Cons b more)])
-    sp
-
 -- | a term in the judgment it is elaborated by
 data Classified
   = IsInferable Inferable
@@ -1979,14 +1949,8 @@ toTypeForm (IsInferable i) = At (TInf i) (Params.spanOf i)
 toTypeForm (IsCheckable c) = At (TChk c) (Params.spanOf c)
 toTypeForm (IsType t) = t
 
--- | the classifier, knotted: an expression, one where a type is written
--- | (`ty`: a signature's, an annotation's, a binder's, a field's, a
--- | definition's of a type, and their arguments), a declaration
-type Classifier =
-  { e : Expr -> Classified
-  , ty : Expr -> Classified
-  , decl : Decl -> Declaration
-  }
+-- | the classifier, knotted: an expression, a declaration
+type Classifier = { e : Expr -> Classified, decl : Decl -> Declaration }
 
 inferable : Classifier -> Expr -> Inferable
 inferable r e = toInferable (r.e e)
@@ -1995,7 +1959,7 @@ checkable : Classifier -> Expr -> Checkable
 checkable r e = toCheckable (r.e e)
 
 typeForm : Classifier -> Expr -> TypeForm
-typeForm r e = toTypeForm (r.ty e)
+typeForm r e = toTypeForm (r.e e)
 
 wordOf : SyntaxWord -> Params.Span -> Classified
 wordOf TypeWord sp = IsType (At TType sp)
@@ -2435,30 +2399,9 @@ classifyTermF r (At (ENest _) sp) =
        3
        "`(<- c)`, the value of an action, is in a statement of a `do` block"
        sp)
-classifyTermF r (At (ETuple es) sp) = r.e (tupleValue sp es)
+classifyTermF r (At (ETuple es) sp) =
+  IsInferable (At (ITuple (List.map (checkable r) es)) sp)
 classifyTermF r (At _ sp) = IsInferable (invalid 3 "unexpected notation" sp)
-
--- | an argument where a type is written: a type too
-argTypeOf : Classifier -> Expr -> Params.Spanned (Arg Checkable)
-argTypeOf r (At (ENamed x e) sp) = At (ArgNamed x (toCheckable (r.ty e))) sp
-argTypeOf r e@(At (EProject _) _) = argOf r e
-argTypeOf r e = At (ArgExplicit (toCheckable (r.ty e))) (Params.spanOf e)
-
--- | a term where a type is written: `()` and `(A, B)` are the types
--- | `Unit` and `Pair A B`, and so in the arguments of a function applied
--- | (`List (A, B)`), which are types too; any other as a term is
-classifyTypeF : Classifier -> Expr -> Classified
-classifyTypeF r (At (ETuple es) sp) = r.ty (tupleType sp es)
-classifyTypeF r (At (ELazy e) sp) =
-  IsInferable (At (ILazy (toCheckable (r.ty e))) sp)
-classifyTypeF r e@(At (EApp (At (ETag _) _) _) _) = classifyTermF r e
-classifyTypeF r e@(At (EApp (At (EWord _) _) _) _) = classifyTermF r e
-classifyTypeF r (At (EApp h args) sp) =
-  IsInferable
-    (At
-       (IApp (inferable r h) (List.map (argTypeOf r) (runArgs h args)))
-       sp)
-classifyTypeF r e = classifyTermF r e
 
 paramOf : Classifier
         -> Params.Spanned (Param Expr)
@@ -2498,7 +2441,7 @@ classifyDeclF r (At (DeclDefine x xsp ps u body) sp) =
        xsp
        (List.map (paramOf r) ps)
        (typeForm r u)
-       (toCheckable (r.ty body)))
+       (checkable r body))
     sp
 classifyDeclF r (At (DeclTheory x xsp ps body) sp) =
   At (DeclTheory x xsp (List.map (paramOf r) ps) (checkable r body)) sp
@@ -2510,7 +2453,6 @@ classifyDeclF r (At (DeclWatch e) sp) = At (DeclWatch (watchOf (r.e e))) sp
 classifier : Classifier
 classifier =
   { e = \e -> classifyTermF classifier e
-  , ty = \e -> classifyTypeF classifier e
   , decl = \d -> classifyDeclF classifier d
   }
 
@@ -2614,6 +2556,7 @@ infNode r (IUpdate a fs) =
 infNode r (IAnnLam x sp t b) = IAnnLam x sp (r.t N t) (r.i N b)
 infNode r (ILitEq x sp eq lit) = ILitEq x sp eq (r.c N lit)
 infNode r (ILazy c) = ILazy (r.c N c)
+infNode r (ITuple cs) = ITuple (List.map (r.c N) cs)
 infNode r n = n
 
 chkNode : MK -> CheckableF TypeForm -> CheckableF TypeForm

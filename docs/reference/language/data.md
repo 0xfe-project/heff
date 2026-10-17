@@ -59,11 +59,15 @@ done = ()
 `()` is the unit, `MkUnit`, and `(a, b)` is a pair, `MkPair a b`.
 `(a, b, c)` nests to the right: `(a, (b, c))`. `(e)` is `e`, grouped.
 
-As a value, `()` is a `Unit` and `(a, b)` a `Pair`, so each says its
-type where a tag alone would not: `pure ()` needs nothing around it to
-say what it is. Written as a type, `()` is `Unit` and `(A, B)` is
-`Pair A B`; so is an argument of a type there, `List (String, Int)`.
-Elsewhere, a type given as an argument is written `Pair A B`.
+What a tuple is depends on the type expected of it. Where a type is
+expected, `()` is the type `Unit` and `(A, B)` is `Pair A B`:
+`List (String, Int)`, `f (a := (Int, String))`, or the result of a
+function that gives a type. Anywhere else, `()` is a `Unit` and
+`(a, b)` a `Pair`, and each says its type where a tag alone would not:
+`pure ()` needs nothing around it to say what it is. A type may hold
+a pair as a value, `Indexed (0, 0)` where `Indexed : (Int, Int) ->
+Type`. Where nothing is expected, a tuple is a value, unless its first
+part is a type: `id (Int, String)` is the type.
 
 The same forms are patterns, nested as deep as needed: `(x, y)`,
 `((a, b), c)`, `()`.

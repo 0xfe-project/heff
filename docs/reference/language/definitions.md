@@ -88,9 +88,9 @@ A pattern that binds without a `case`, in `let p = e`, `\p -> e`, and
 a `do` block's `p <- e` and `with e as p`, must match every value of
 its type: names, `_`, tuples and units of them, and a tag that is its
 type's only one, such as `MkPair a b`. A pattern that can fail, `Just
-x` or a literal, is an error (E0355). Write a `case`, or `if let`
-([do](do.md#statements)), which says what happens when it does not
-match.
+x` or a literal, is non-exhaustive (E0317), as a `case` that leaves a
+value out is. Write a `case`, or `if let` ([do](do.md#statements)),
+which says what happens when it does not match.
 
 ## Order
 

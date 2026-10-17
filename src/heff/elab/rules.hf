@@ -3166,6 +3166,10 @@ recordTags e a vs (Cons (MkPair x tsp) rest) = do
   recordTagIn e a vs x tsp
   recordTags e a vs rest
 
+-- | E0317's message: what no case is provided for
+nonExhaustive : String -> String
+nonExhaustive what = "non-exhaustive pattern: no case provided for " ^ what
+
 caseArm : Params.Span
         -> ElabEnv
         -> Value.Ty
@@ -3207,7 +3211,7 @@ caseArm sp e b a x ts casesChk = case Dict.lookup casesChk x of
           (MkPair
              x
              (MkPair (Array.fromList (List.map (\t -> "_") ts)) body.stx))
-    Nothing -> failWith sp 17 ("no case provided for tag " ^ x)
+    Nothing -> failWith sp 17 (nonExhaustive ("tag " ^ x))
 
 casesAt : Params.Span
         -> ElabEnv
@@ -3286,56 +3290,67 @@ sumElim sp scrutSyn tags casesChk =
 -- Binding a pattern
 --------------------------------------------------------------------------------
 
--- (whether any of them holds, each run until one does)
-anyElab : List (Elab Bool) -> Elab Bool
-anyElab Nil = pure False
-anyElab (Cons m ms) = do
-  b <- m
-  if b then pure True else anyElab ms
+-- (what a literal leaves out)
+literalLeft : String
+literalLeft = "the values other than this literal"
+
+-- (the first of them that finds something, each run until one does)
+firstElab : {a : Type} -> List (Elab (Maybe a)) -> Elab (Maybe a)
+firstElab Nil = pure Nothing
+firstElab (Cons m ms) = do
+  r <- m
+  case r of
+    Just x -> pure (Just x)
+    Nothing -> firstElab ms
+
+-- (a tag of the sum `vs` other than `x`, if it has one)
+otherTag : String -> List String -> Maybe String
+otherTag x Nil = Nothing
+otherTag x (Cons y ys) = if strEq x y then otherTag x ys else Just y
 
 -- | whether the pattern `p` can fail to match a value of the type `a`,
 -- | where a pattern binds (`let p = e`, `p <- e`, `with e as p`, `\p ->
--- | e`): a literal can; a tag can unless it is the only one of its type,
--- | and its arguments' patterns cannot fail at theirs; a name cannot.
--- | Where the type does not say (it is not known yet, or no sum), the
--- | match itself finds what it leaves out
-patternCanFail : Value.Ty -> Presyntax.Pat -> Elab Bool
-patternCanFail a (At (PatVar _) _) = pure False
+-- | e`): where it can, the part that can and what it leaves out.  A
+-- | literal can; a tag can unless it is the only one of its type, and
+-- | its arguments' patterns cannot fail at theirs; a name cannot.  Where
+-- | the type does not say (it is not known yet, or no sum), the match
+-- | itself finds what it leaves out
+patternCanFail : Value.Ty
+               -> Presyntax.Pat
+               -> Elab (Maybe (Pair Params.Span String))
+patternCanFail a (At (PatVar _) _) = pure Nothing
 patternCanFail a (At (PatAs _ _ p) _) = patternCanFail a p
-patternCanFail a0 (At (PatTag x _ ps) _) = do
+patternCanFail a0 (At (PatTag x _ ps) sp) = do
   a <- Meta.forceT a0
   case Value.behavior a of
     LikeSum vs -> case Dict.lookup vs x of
-      Just ts ->
-        if Dict.size vs > 1 then pure True
-        else anyElab
+      Just ts -> case otherTag x (List.map fst (Dict.toList vs)) of
+        Just y -> pure (Just (MkPair sp ("tag " ^ y)))
+        Nothing ->
+          firstElab
             (List.zipWith
                (\q t -> patternCanFail (Params.forceTh t) q)
                ps
                (Array.toList ts))
-      Nothing -> pure False
-    _ -> pure False
-patternCanFail a (At (PatInt _) _) = pure True
-patternCanFail a (At (PatFloat _) _) = pure True
-patternCanFail a (At (PatString _) _) = pure True
-patternCanFail a (At (PatRune _) _) = pure True
-patternCanFail a (At (PatBinary _) _) = pure True
-patternCanFail a _ = pure False
+      Nothing -> pure Nothing
+    _ -> pure Nothing
+patternCanFail a (At (PatInt _) sp) = pure (Just (MkPair sp literalLeft))
+patternCanFail a (At (PatFloat _) sp) = pure (Just (MkPair sp literalLeft))
+patternCanFail a (At (PatString _) sp) = pure (Just (MkPair sp literalLeft))
+patternCanFail a (At (PatRune _) sp) = pure (Just (MkPair sp literalLeft))
+patternCanFail a (At (PatBinary _) sp) = pure (Just (MkPair sp literalLeft))
+patternCanFail a _ = pure Nothing
 
 -- | what a binding's pattern `p` takes apart, `s`: refused where `p` can
--- | fail to match it
+-- | fail to match it, as a `case` that leaves a value out is (E0317)
 bindingSyn : Presyntax.Pat -> Syn -> Syn
 bindingSyn p s =
   MkSyn (\e -> do
   pm <- runSyn s e
   fails <- patternCanFail (snd pm) p
-  if fails
-    then failWithNote
-        (Params.spanOf p)
-        55
-        "the pattern can fail to match: a binding's pattern matches every value"
-        "take the value apart with `case`, or `if let`, which say what happens when it does not match"
-    else pure pm)
+  case fails of
+    Just (MkPair sp what) -> failWith sp 17 (nonExhaustive what)
+    Nothing -> pure pm)
 
 -- | extension: a `case` of nested patterns is compiled
 -- | (`Clauses.caseTree`) into the matches above, on a name for the
@@ -3848,6 +3863,47 @@ findPrim sp p =
         }
     pure (MkPair (Memoed.global key ge.value) ge.type_)
   Nothing -> failWith sp 8 ("no such variable " ^ p ^ " in scope"))
+
+-- Tuples
+--------------------------------------------------------------------------------
+
+-- | `()`, `(a, b)` checked: where a universe is expected, the type `t`
+-- | (`Unit`, `Pair A B`); anywhere else, as the value `v` infers
+-- | (`MkUnit : Unit`, `MkPair a b : Pair _ _`)
+tupleChk : Params.Span -> Syn -> Syn -> Chk
+tupleChk sp t v =
+  MkChk (\e a0 -> do
+  a <- Meta.forceT a0
+  case Value.behavior a of
+    LikeU _ -> runChk (apply sp t) e a
+    _ -> runChk (apply sp v) e a)
+
+-- | `(a, b)` inferring, `a` inferring by `s`: the type `Pair a b` where
+-- | `a` is a type (the value would be no `Pair`, whose parts are small),
+-- | else the value `(MkPair a b : p)`; `b` checked by `rest`, at the
+-- | universe or at the type of the value's second part
+tupleSyn : Params.Span -> Syn -> Chk -> Typ -> Syn
+tupleSyn sp s rest p =
+  MkSyn (\e -> do
+  pm <- runSyn s e
+  a <- Meta.forceT (snd pm)
+  case Value.behavior a of
+    LikeU _ ->
+      runSyn
+        (functionElim
+           sp
+           (functionElim
+              sp
+              (findPrim sp "prelude.Pair")
+              (apply sp (MkSyn (\e2 -> pure pm))))
+           rest)
+        e
+    _ ->
+      runSyn
+        (annot
+           p
+           (sumIntro sp sp "MkPair" [apply sp (MkSyn (\e2 -> pure pm)), rest]))
+        e)
 
 -- | `x` matched by a literal pattern: whether it is equal to the literal,
 -- | checked at `x`'s type, by that type's equality, the primitive

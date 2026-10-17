@@ -312,6 +312,7 @@ isData c = False
 -- | not say its type
 annotatesData : Presyntax.Inferable -> Bool
 annotatesData (At (IAnn c _) _) = isData c
+annotatesData (At (ITuple _) _) = True
 annotatesData _ = False
 
 isVarP : Presyntax.Pat -> Bool
@@ -524,6 +525,91 @@ updateNames : Params.Spanned (Presyntax.UpdateSet Presyntax.Checkable)
             -> List String
 updateNames (At (SetPath path v) _) = Clauses.identsOf v Nil
 
+-- Tuples: `()` and `(a, b, c)`, by the type expected, the types `Unit`
+-- and `Pair a (b, c)` or their values; the builtin `Unit` and the
+-- prelude's `Pair`, found by their keys
+
+explicitArg : Presyntax.Checkable
+            -> Params.Spanned (Presyntax.Arg Presyntax.Checkable)
+explicitArg c = At (ArgExplicit c) (Params.spanOf c)
+
+-- (the prelude's `inferred MkUnit`: a type its uses decide)
+tupleHole : Params.Span -> Presyntax.Checkable
+tupleHole sp =
+  At
+    (CInf
+       (At
+          (IApp
+             (At (IVar "prelude.inferred") sp)
+             [explicitArg (At (CTag "MkUnit" sp Nil) sp)])
+          sp))
+    sp
+
+-- (what follows a tuple's first part: its second, or a tuple of the rest)
+tupleRest : Params.Span -> List Presyntax.Checkable -> Presyntax.Checkable
+tupleRest sp (Cons b Nil) = b
+tupleRest sp (Cons b more) =
+  At
+    (CInf
+       (At
+          (ITuple (Cons b more))
+          { start = (Params.spanOf b).start, end = sp.end }))
+    { start = (Params.spanOf b).start, end = sp.end }
+tupleRest sp Nil = At (CTag "MkUnit" sp Nil) sp
+
+-- | `()` and `(a, b, c)` as types: `Unit`, `Pair a (b, c)`
+tupleTypeOf : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
+tupleTypeOf sp Nil = At (IVar "builtin.Unit") sp
+tupleTypeOf sp (Cons a rest) =
+  At
+    (IApp
+       (At (IVar "prelude.Pair") sp)
+       [explicitArg a, explicitArg (tupleRest sp rest)])
+    sp
+
+-- | `Pair _ _`: what a pair is, its parts' types to be found
+pairOfHoles : Params.Span -> Presyntax.TypeForm
+pairOfHoles sp =
+  At
+    (TInf
+       (At
+          (IApp
+             (At (IVar "prelude.Pair") sp)
+             [explicitArg (tupleHole sp), explicitArg (tupleHole sp)])
+          sp))
+    sp
+
+-- | `()` and `(a, b, c)` as values: `(MkUnit : Unit)`, `(MkPair a (b, c)
+-- | : Pair _ _)`, each saying its type, as a tag alone does not
+tupleValueOf : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
+tupleValueOf sp Nil =
+  At
+    (IAnn
+       (At (CTag "MkUnit" sp Nil) sp)
+       (At (TInf (At (IVar "builtin.Unit") sp)) sp))
+    sp
+tupleValueOf sp (Cons a rest) =
+  At
+    (IAnn (At (CTag "MkPair" sp [a, tupleRest sp rest]) sp) (pairOfHoles sp))
+    sp
+
+-- | a tuple inferring, `cs` its parts (the first looked at): a value,
+-- | unless its first part is a type (`(Int, String)`, `(a, b)` of types
+-- | `a`, `b`): `MkPair Int String` would be no `Pair`, whose parts are
+-- | small, so it is the type
+tupleInf : TK
+         -> Params.Span
+         -> List Presyntax.Checkable
+         -> List Presyntax.Checkable
+         -> Elab Rules.Syn
+tupleInf tk sp (Cons (At (CType _) _) _) cs = tk.infJ (tupleTypeOf sp cs)
+tupleInf tk sp (Cons (At (CInf i) _) rest) cs = do
+  s <- tk.infJ i
+  r <- tk.chkJ (tupleRest sp rest)
+  p <- tk.typJ (pairOfHoles sp)
+  pure (Rules.tupleSyn sp s r p)
+tupleInf tk sp _ cs = tk.infJ (tupleValueOf sp cs)
+
 -- | `~e` inferring: the type `Lazy e` of a type, else `e` delayed, `e`
 -- | inferring
 lazyInf : TK -> Params.Span -> Presyntax.Checkable -> Elab Rules.Syn
@@ -580,6 +666,7 @@ infF tk (At (ILitEq x xsp eq lit) sp) = do
   j <- tk.chkJ lit
   pure (Rules.litEq sp x xsp eq j)
 infF tk (At (ILazy c) sp) = lazyInf tk sp c
+infF tk (At (ITuple cs) sp) = tupleInf tk sp cs cs
 
 -- (what infers the scrutinee, as `see` sees it)
 seen : Maybe (Rules.Syn -> Rules.Syn) -> Rules.Syn -> Rules.Syn
@@ -733,6 +820,23 @@ markedIf : Bool -> Rules.Chk -> Rules.Chk
 markedIf True j = nominalChk j
 markedIf False j = j
 
+-- | a tuple checked: by the type expected, the type or the value
+tupleChkF : TK
+          -> Bool
+          -> Params.Span
+          -> List Presyntax.Checkable
+          -> Elab Rules.Chk
+tupleChkF tk nominal sp cs = do
+  t <- tk.infJ (tupleTypeOf sp cs)
+  v <- tupleInf tk sp cs cs
+  pure (Rules.implicitLams (markedIf nominal (Rules.tupleChk sp t v)))
+
+-- (the parts of a tuple, if it is one)
+tupleOperand : Presyntax.Inferable
+             -> Maybe (Pair Params.Span (List Presyntax.Checkable))
+tupleOperand (At (ITuple cs) sp) = Just (MkPair sp cs)
+tupleOperand _ = Nothing
+
 -- (what `~e` delays, if it is one)
 lazyOperand : Presyntax.Inferable -> Maybe Presyntax.Checkable
 lazyOperand (At (ILazy c) _) = Just c
@@ -760,7 +864,9 @@ lazyChkF tk nominal sp c = do
 chkF : TK -> Presyntax.Checkable -> Elab Rules.Chk
 chkF tk (At (CInf i) _) = case lazyOperand (Presyntax.unNominal i) of
   Just c -> lazyChkF tk (nominalInf i) (Params.spanOf i) c
-  Nothing -> chkInf tk i
+  Nothing -> case tupleOperand (Presyntax.unNominal i) of
+    Just (MkPair sp cs) -> tupleChkF tk (nominalInf i) sp cs
+    Nothing -> chkInf tk i
 chkF tk (At (CType t) sp) = typeChk tk sp t
 chkF tk n = do
   j <- tk.rawJ n
@@ -786,9 +892,14 @@ typF tk (At (TFixed w) _) = pure (Rules.primFixed w)
 typF tk (At (TArray a0) _) = do
   a <- tk.typJ a0
   pure (Rules.primArray a)
-typF tk (At (TInf i) sp) = do
-  s <- tk.infJ i
-  pure (Rules.universeElimSyn sp s)
+typF tk (At (TInf i) sp) = case tupleOperand (Presyntax.unNominal i) of
+  -- (a tuple where a type is: checked at the universe)
+  Just (MkPair isp cs) -> do
+    j <- tupleChkF tk (nominalInf i) isp cs
+    pure (Rules.universeElim SmallU j)
+  Nothing -> do
+    s <- tk.infJ i
+    pure (Rules.universeElimSyn sp s)
 typF tk (At (TChk ch) _) = do
   j <- tk.rawJ ch
   pure (Rules.universeElim LargeU j)
