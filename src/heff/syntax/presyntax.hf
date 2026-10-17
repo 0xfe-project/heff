@@ -345,8 +345,7 @@ data ExprF
   -- it is, the value); `while c do ...`; `for p in e do ...`; `if c then
   -- s`, with no `else`; `break`; `continue`; `return e`; `try`.  And
   -- `(<- c)`, the value of an action where it is used, in a `do` block
-  -- only.  `if let p = e then a else b` is a value too, and a statement
-  -- without its `else`.
+  -- only.
   | EAssign String Params.Span (Params.Spanned ExprF)
   | EWhile (Params.Spanned ExprF) (List
                                      (Params.Spanned
@@ -364,9 +363,6 @@ data ExprF
   -- | `()` and `(a, b, c)`: a unit and a pair (`(a, (b, c))`), values of
   -- | the types `Unit` and `Pair`; where a type is expected, those types
   | ETuple (List (Params.Spanned ExprF))
-  | EIfLet Pat (Params.Spanned ExprF) (Params.Spanned ExprF) (Maybe
-                                                                (Params.Spanned
-                                                                   ExprF))
   | ETry (TryF (Params.Spanned ExprF))
   -- | `with e as x do ...`: the `with`, the name (where it is), the
   -- | statements, its body
@@ -634,8 +630,8 @@ chkOf i = At (CInf i) (Params.spanOf i)
 --   statement's `(<- ...)`.  In a lambda it is an error: its body runs
 --   later, so is `return`, `break`, and setting the block's variable
 --   (which the lambda holds the value of);
--- - `if let p = e then a else b` is a `case` of `e`, `p` and `_`, as a
---   statement too (with no `else`, its arm is none);
+-- - `let p = e else s` is a `case` of `e`: `p`, the statements after
+--   it, and `_`, `s`, which must leave;
 -- - `try` is a scope (the exception module's `recover`, its `catch` arm
 --   the handler): its statements are one scope further in, and their
 --   answer is what to do once it is left, which follows it (`leaveScope`).
@@ -754,10 +750,6 @@ ifOf sp c a b =
     sp
     (boolOf c)
     [alt (patTag "True" sp Nil) a, alt (patTag "False" sp Nil) b]
-
--- | `if let p = e then a else b`: a `case` of `e`, `p` and any other
-ifLetOf : Params.Span -> Pat -> Expr -> Expr -> Expr -> Expr
-ifLetOf sp p s a b = matchOf sp s [alt p a, alt (At (PatVar "_") sp) b]
 
 pureOf : DoCx -> Params.Span -> Expr -> Expr
 pureOf cx sp v = app (At (EVar cx.names.pure) sp) [v]
@@ -890,14 +882,6 @@ segmentAcc f st (At (MkSegment v ty size little signed) sp) =
     (f st v)
     (\st1 v' -> MkPair st1 (At (MkSegment v' ty size little signed) sp))
 
-maybeAcc : {s a : Type}
-         -> (s -> a -> Pair s a)
-         -> s
-         -> Maybe a
-         -> Pair s (Maybe a)
-maybeAcc f st Nothing = MkPair st Nothing
-maybeAcc f st (Just x) = pairK (f st x) (\st1 x' -> MkPair st1 (Just x'))
-
 catchAcc : {s : Type}
          -> (s -> Expr -> Pair s Expr)
          -> s
@@ -1000,16 +984,6 @@ childrenAcc f st (At (ELazy e) sp) =
   pairK (f st e) (\st1 e' -> MkPair st1 (At (ELazy e') sp))
 childrenAcc f st (At (ETuple es) sp) =
   pairK (accList f st es) (\st1 es' -> MkPair st1 (At (ETuple es') sp))
-childrenAcc f st (At (EIfLet p s a b) sp) =
-  pairK
-    (f st s)
-    (\st1 s' ->
-       pairK
-         (f st1 a)
-         (\st2 a' ->
-            pairK
-              (maybeAcc f st2 b)
-              (\st3 b' -> MkPair st3 (At (EIfLet p s' a' b') sp))))
 childrenAcc f st (At (ETry tr) sp) =
   pairK (tryAcc f st tr) (\st1 tr' -> MkPair st1 (At (ETry tr') sp))
 childrenAcc f st (At (EWith w x xsp body) sp) =
@@ -1186,7 +1160,6 @@ liftE l acc (At (ELetIn rhs (At (MkAlt p body) asp)) sp) =
            (liftE l acc1 body)
            (\acc2 body' ->
               MkPair acc2 (At (ELetIn rhs' (At (MkAlt p body') asp)) sp)))
-liftE l acc (At (EIfLet p s a (Just b)) sp) = liftE l acc (ifLetOf sp p s a b)
 liftE l acc (At (ETry tr) sp) = MkPair acc (At (ETry tr) sp)
 liftE l acc (At (EWith w x xsp body) sp) =
   MkPair acc (At (EWith w x xsp body) sp)
@@ -1230,8 +1203,6 @@ isControl (At EBreak _) = True
 isControl (At EContinue _) = True
 isControl (At (EReturn _) _) = True
 isControl (At (EMatch _ alts) _) = List.any (armNeeds isControl) alts
-isControl (At (EIfLet _ _ _ Nothing) _) = True
-isControl (At (EIfLet p s a (Just b)) sp) = isControl (ifLetOf sp p s a b)
 isControl (At (ETry _) _) = True
 isControl (At (EWith _ _ _ _) _) = True
 isControl _ = False
@@ -1333,7 +1304,6 @@ stmtsFall ss = case List.last ss of
   exprFalls (At (EMatch s alts) sp) =
     not (isControl (At (EMatch s alts) sp))
     || List.any (\a -> stmtsFall (snd (altStmts a))) alts
-  exprFalls (At (EIfLet p s a (Just b)) sp) = exprFalls (ifLetOf sp p s a b)
   exprFalls (At (ETry (MkTry _ body c)) _) =
     stmtsFall body || stmtsFall (catchStmts c)
   exprFalls (At (EWith _ _ _ body) _) = stmtsFall body
@@ -1718,11 +1688,6 @@ tryOr : DoT
 tryOr t cx sp tr rest end (Just wrong) = wrong
 tryOr t cx sp tr rest end Nothing = tryT t cx sp tr rest end
 
--- (an `if let`'s `else`, its statements: none, where there is none)
-elseStmts : Maybe Expr -> List (Params.Spanned (Stmt Expr))
-elseStmts Nothing = Nil
-elseStmts (Just b) = armStmts b
-
 -- | a statement of the block's own (`isControl`), and the statements
 -- | after it
 controlT : DoT
@@ -1779,15 +1744,6 @@ controlT t cx (At (EMatch s alts) sp) rest end =
     (List.map altStmts alts)
     rest
     end
-controlT t cx (At (EIfLet p s a b) sp) rest end =
-  condT
-    t
-    cx
-    sp
-    s
-    [MkPair p (armStmts a), MkPair (At (PatVar "_") sp) (elseStmts b)]
-    rest
-    end
 controlT t cx (At (ETry (MkTry err body h)) sp) rest end =
   tryOr t cx sp (MkTry err body h) rest end (catchWrong cx h)
 controlT t cx (At (EWith w x xsp body) sp) rest end =
@@ -1798,7 +1754,7 @@ controlT t cx e rest end =
 -- (an `else` that may go on past its `let`)
 elseFalls : String
 elseFalls =
-  "the `else` of `let p = e else ...` must leave the block: end it with `return`, `break`, `continue` or `abandon`; for a value, use `if let`"
+  "the `else` of `let p = e else ...` must leave the block: end it with `return`, `break`, `continue` or `abandon`; for a value, use `case`"
 
 -- | whether statements leave the block, the loop's turn or the loop:
 -- | they end with `return`, `break`, `continue` or `abandon`, or an `if`
@@ -1815,7 +1771,6 @@ stmtsLeave ss = case List.last ss of
   leaves (At (EWord AbandonWord) _) = True
   leaves (At (EMatch s alts) sp) =
     List.all (\a -> stmtsLeave (snd (altStmts a))) alts
-  leaves (At (EIfLet p s a (Just b)) sp) = leaves (ifLetOf sp p s a b)
   leaves (At (ETry (MkTry _ body c)) _) =
     stmtsLeave body && stmtsLeave (catchStmts c)
   leaves (At (EWith _ _ _ body) _) = stmtsLeave body
@@ -2434,13 +2389,6 @@ classifyTermF r (At (EReturn _) sp) =
     (invalid
        3
        "`return e` ends a `do` block as one of its statements (or an arm of its `if` or `case`), not as a value"
-       sp)
-classifyTermF r (At (EIfLet p s a (Just b)) sp) = r.e (ifLetOf sp p s a b)
-classifyTermF r (At (EIfLet _ _ _ Nothing) sp) =
-  IsInferable
-    (invalid
-       3
-       "an `if let` without `else` is a statement of a `do` block: a value's has an `else`"
        sp)
 classifyTermF r (At (ETry _) sp) =
   IsInferable

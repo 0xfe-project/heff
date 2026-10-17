@@ -57,14 +57,12 @@ firstLong ws = run do
 - `return e` ends the whole block with `e`.
 - An `if` among the statements may have no `else`. The arms of an `if`
   or `case` among the statements are statements too.
-- `if let p = e then a else b` runs `a` when `e` matches `p`, with its
-  names bound, and `b` otherwise.
 - `let p = e else s` binds `p`'s names for the statements after it when
   `e` matches `p`, and runs `s` otherwise. `s`, a statement or the
   statements under it, must leave the block: it ends with `return`,
   `break`, `continue` or `abandon`, or an `if` or `case` whose every
   arm does. An action does not leave: a throw is
-  `return (<- throw e)`, and for a value or to go on, write `if let`.
+  `return (<- throw e)`, and for a value or to go on, write a `case`.
   Here `p` may fail to match; a `p` that cannot is let be, its `else`
   never run.
   ```haskell
