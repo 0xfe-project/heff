@@ -26,6 +26,7 @@
 - `generate` of a lambda giving one fixed-width number builds the array flat, and in-range reads of it are unchecked. `Int64` sum 0.40 s to 0.13 s (#102).
 - New numeric array benchmarks: sums, dot product, `saxpy` and `Array.map` over ten million elements (#102).
 - In threads mode, a shared object whose count is back to one is reused in place again, as an owned one is. A fold over a shared 16M-node tree: 0.54 s to 0.39 s.
+- A stack overflow is an error, not a crash: a C program says `heff: stack overflow` and exits with 2, from any thread heff starts. Where a failure is caught, so is an overflow, as "stack overflow": a std.thread worker hands it to the thread that joins it, and a language server request fails alone. `heff check` on a file nested too deep says so, and the language server reports it on the file and keeps serving. Catching a failure no longer saves the signal mask.
 - A program using threads built as parts (`heff build`, `heff compile DIR/`) no longer crashes: every C file now sees threads mode, not only the one with `main`.
 
 ### Docs

@@ -374,19 +374,29 @@ static inline int heff_unique(V v) { return heff_alone(OBJ(v)); }
 
 // (where a value is asked for that may fail -- `heff compile` without
 // `--name`, each definition printed -- a failure is caught there, and
-// said; otherwise it ends the program)
+// said; otherwise it ends the program.  Jumped to by `_longjmp`, which
+// neither saves nor restores the signal mask: macOS's `setjmp` does, a
+// call of the system each time, a third of a fork's cost.  A stack that
+// overflowed comes back by a way of its own, which restores the mask)
 HEFF_VAR(HEFF_TLS jmp_buf *heff_catch);
 HEFF_VAR(HEFF_TLS const char *heff_caught);
+#ifdef _WIN32
+#define HEFF_SETJMP(b) setjmp(b)
+#define HEFF_LONGJMP(b) longjmp(b, 1)
+#else
+#define HEFF_SETJMP(b) _setjmp(b)
+#define HEFF_LONGJMP(b) _longjmp(b, 1)
+#endif
 
 HEFF_FN void heff_fail(const char *why) {
-  if (heff_catch) { heff_caught = why; longjmp(*heff_catch, 1); }
+  if (heff_catch) { heff_caught = why; HEFF_LONGJMP(*heff_catch); }
   fflush(stdout);
   fprintf(stderr, "heff: %s\n", why);
   exit(1);
 }
 
 HEFF_FN V heff_abandon(void) {
-  if (heff_catch) { heff_caught = "heff:abandon"; longjmp(*heff_catch, 1); }
+  if (heff_catch) { heff_caught = "heff:abandon"; HEFF_LONGJMP(*heff_catch); }
   fflush(stdout);
   fprintf(stderr, "heff:abandon\n");
   exit(1);
@@ -1690,6 +1700,14 @@ HEFF_VAR(HEFF_TLS size_t heff_capopen);
 
 HEFF_FN __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
   uintptr_t me = (uintptr_t)&heff_me;
+  // (room for its state among the open first: from its being marked
+  // until it is done, it is among them, a failure anywhere between --
+  // even a stack's overflow -- leaving it to be computed again)
+  if (heff_nopen == heff_capopen) {
+    heff_capopen = heff_capopen ? heff_capopen * 2 : 16;
+    heff_open = realloc(heff_open, heff_capopen * sizeof(HEFF_ONCE *));
+    if (!heff_open) heff_fail("out of memory");
+  }
   pthread_mutex_lock(&heff_once_mu);
   for (;;) {
     uintptr_t s = __atomic_load_n(st, __ATOMIC_ACQUIRE);
@@ -1699,19 +1717,14 @@ HEFF_FN __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)
     pthread_cond_wait(&heff_once_cv, &heff_once_mu);
   }
   __atomic_store_n(st, me, __ATOMIC_RELAXED);
-  pthread_mutex_unlock(&heff_once_mu);
-  if (heff_nopen == heff_capopen) {
-    heff_capopen = heff_capopen ? heff_capopen * 2 : 16;
-    heff_open = realloc(heff_open, heff_capopen * sizeof(HEFF_ONCE *));
-    if (!heff_open) heff_fail("out of memory");
-  }
   heff_open[heff_nopen++] = st;
+  pthread_mutex_unlock(&heff_once_mu);
   V v = heff_tr(init());
-  heff_nopen--;
   heff_freeze(v);
   pthread_mutex_lock(&heff_once_mu);
   *val = v;
   __atomic_store_n(st, 2, __ATOMIC_RELEASE);
+  heff_nopen--;
   pthread_cond_broadcast(&heff_once_cv);
   pthread_mutex_unlock(&heff_once_mu);
   return v;
@@ -1730,12 +1743,30 @@ HEFF_FN void heff_reopen(size_t base) {
 #define HEFF_ONCE int
 #define HEFF_DONE(st) HEFF_LIKELY((st) == 2)
 
+// (the states of what is being computed, the last innermost)
+HEFF_VAR(HEFF_ONCE **heff_open);
+HEFF_VAR(size_t heff_nopen);
+HEFF_VAR(size_t heff_capopen);
+
 HEFF_FN __attribute__((noinline)) V heff_global(V *val, HEFF_ONCE *st, V (*init)(void)) {
   if (*st == 1) heff_fail("defined by itself");
+  if (heff_nopen == heff_capopen) {
+    heff_capopen = heff_capopen ? heff_capopen * 2 : 16;
+    heff_open = realloc(heff_open, heff_capopen * sizeof(HEFF_ONCE *));
+    if (!heff_open) heff_fail("out of memory");
+  }
   *st = 1;
+  heff_open[heff_nopen++] = st;
   *val = heff_tr(init());
+  heff_nopen--;
   *st = 2;
   return *val;
+}
+
+// (what was being computed when a failure was caught, from the `base`th
+// on, to be computed again)
+HEFF_FN void heff_reopen(size_t base) {
+  while (heff_nopen > base) *heff_open[--heff_nopen] = 0;
 }
 #endif
 
@@ -4070,6 +4101,198 @@ HEFF_FN V heff_errno(int err, uint32_t *shape) {
   return heff_rec(3, shape, f);
 }
 
+// A stack that overflows
+// ---------------------------------------------------------------------
+//
+// heff's recursion is the C stack's, so a recursion deep enough runs
+// out of it: a fault in the guard below the stack, where the system
+// would end the process, saying nothing.  Instead each thread heff runs
+// in -- the program's own, and each a provider starts by
+// `heff_thread_start` -- is watched (`heff_watch_stack`): the bottom of
+// its stack known, and a stack of its own for the handler of faults
+// (`sigaltstack`).  A fault near the bottom of the stack is an
+// overflow; any other is the system's, as without the handler.
+//
+// The handler does not jump out itself: it has the thread go on at
+// `heff_overflowed`, on a stack of the thread's kept for it, once the
+// system has put back the signal's mask and taken the thread off the
+// handler's stack (macOS's `_longjmp` out of a handler would leave the
+// system thinking it still on it, and the next fault unhandled).  There
+// it fails as `heff_fail` does: caught by the innermost `heff_try`, why
+// "stack overflow"; else the program says `heff: stack overflow` and
+// exits with 2.  What the frames jumped over were doing is left undone,
+// as a failure leaves it: what they made leaked, a definition they were
+// computing computed again.  But a fault in code not the program's --
+// the system's `malloc`, a lock's -- may leave what that code holds
+// held for good: the program ends there, caught or not.
+//
+// Not on Windows, nor where a sanitizer handles faults itself; and said,
+// never caught, but on x86-64 and arm64.
+#define HEFF_OVERFLOW "stack overflow"
+#define HEFF_OVERFLOW_STATUS 2
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define HEFF_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define HEFF_SANITIZED 1
+#endif
+#if !defined(HEFF_SANITIZED) && (defined(__APPLE__) || defined(__linux__))
+#define HEFF_WATCHED 1
+#endif
+
+#ifdef HEFF_WATCHED
+#include <sys/ucontext.h>
+#ifdef __APPLE__
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#else
+extern int pthread_getattr_np(pthread_t, pthread_attr_t *);
+// (the program's code, from its start to the end of its text, as the
+// linker marks them)
+extern char __executable_start[] __attribute__((weak));
+extern char etext[] __attribute__((weak));
+#endif
+
+// (the guard below a stack heff starts, and how far below its bottom a
+// fault is taken for an overflow; the handler's stack, and the one the
+// thread goes on on)
+#define HEFF_GUARD ((size_t)1 << 20)
+#define HEFF_SIG_STACK ((size_t)1 << 16)
+
+// (where the fault was, and the thread made to go on at `f`, its stack
+// pointer `sp`, as if `f` were called -- by the system's view of the
+// thread's registers, `uc`)
+#if defined(__APPLE__) && defined(__aarch64__)
+#define HEFF_PC(uc) ((char *)__darwin_arm_thread_state64_get_pc((uc)->uc_mcontext->__ss))
+#define HEFF_GO_ON(uc, f, sp) do { \
+    __darwin_arm_thread_state64_set_pc_fptr((uc)->uc_mcontext->__ss, f); \
+    __darwin_arm_thread_state64_set_sp((uc)->uc_mcontext->__ss, sp); } while (0)
+#elif defined(__APPLE__) && defined(__x86_64__)
+#define HEFF_PC(uc) ((char *)(uc)->uc_mcontext->__ss.__rip)
+#define HEFF_GO_ON(uc, f, sp) do { \
+    (uc)->uc_mcontext->__ss.__rip = (uintptr_t)(f); \
+    (uc)->uc_mcontext->__ss.__rsp = (uintptr_t)(sp) - 8; } while (0)
+#elif defined(__linux__) && defined(__aarch64__)
+#define HEFF_PC(uc) ((char *)(uc)->uc_mcontext.pc)
+#define HEFF_GO_ON(uc, f, sp) do { \
+    (uc)->uc_mcontext.pc = (uintptr_t)(f); \
+    (uc)->uc_mcontext.sp = (uintptr_t)(sp); } while (0)
+#elif defined(__linux__) && defined(__x86_64__)
+// (`REG_RIP` and `REG_RSP`, 16 and 15, named only where `_GNU_SOURCE` is)
+#define HEFF_PC(uc) ((char *)(uc)->uc_mcontext.gregs[16])
+#define HEFF_GO_ON(uc, f, sp) do { \
+    (uc)->uc_mcontext.gregs[16] = (greg_t)(uintptr_t)(f); \
+    (uc)->uc_mcontext.gregs[15] = (greg_t)((uintptr_t)(sp) - 8); } while (0)
+#endif
+
+// (the program's code: where a fault in it may be recovered from)
+HEFF_VAR(char *heff_code_lo);
+HEFF_VAR(char *heff_code_hi);
+// (this thread's: the bottom of its stack, where it may go no lower; the
+// handler's stack, and above it the one to go on on; and whether the
+// fault was in code not the program's)
+HEFF_VAR(HEFF_TLS char *heff_stack_lo);
+HEFF_VAR(HEFF_TLS char *heff_sig_stack);
+HEFF_VAR(HEFF_TLS int heff_overflow_lost);
+
+// (where the thread goes on after its stack overflowed: failed, as
+// `heff_fail` fails, or the program ended)
+HEFF_FN __attribute__((noreturn)) void heff_overflowed(void) {
+  if (heff_catch && !heff_overflow_lost) {
+    heff_caught = HEFF_OVERFLOW;
+    HEFF_LONGJMP(*heff_catch);
+  }
+  static const char said[] = "heff: " HEFF_OVERFLOW "\n";
+  if (!heff_overflow_lost) fflush(stdout);
+  if (write(2, said, sizeof said - 1) < 0) _exit(HEFF_OVERFLOW_STATUS);
+  _exit(HEFF_OVERFLOW_STATUS);
+}
+
+HEFF_FN void heff_on_fault(int sig, siginfo_t *si, void *ctx) {
+  char *a = (char *)si->si_addr, *lo = heff_stack_lo;
+  if (!lo || a < lo - HEFF_GUARD || a >= lo + HEFF_GUARD) {
+    signal(sig, SIG_DFL);
+    return;
+  }
+#ifdef HEFF_GO_ON
+  ucontext_t *uc = ctx;
+  char *pc = HEFF_PC(uc);
+  heff_overflow_lost = !(pc >= heff_code_lo && pc < heff_code_hi);
+  uintptr_t sp = (uintptr_t)(heff_sig_stack + 2 * HEFF_SIG_STACK) & ~(uintptr_t)15;
+  HEFF_GO_ON(uc, heff_overflowed, sp);
+#else
+  (void)ctx;
+  heff_overflow_lost = 1;
+  heff_overflowed();
+#endif
+}
+
+// (the handler installed, for every thread, before any is watched)
+HEFF_FN void heff_watch_faults(void) {
+#ifdef __APPLE__
+  unsigned long n = 0;
+  heff_code_lo = (char *)getsegmentdata(&_mh_execute_header, "__TEXT", &n);
+  heff_code_hi = heff_code_lo ? heff_code_lo + n : NULL;
+#else
+  heff_code_lo = __executable_start;
+  heff_code_hi = etext;
+#endif
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = heff_on_fault;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGBUS, &sa, NULL);
+}
+
+// (this thread watched: its stack's bottom, and the handler's stack --
+// each of its own that the handler reads touched here, not first in the
+// handler, which may not allocate)
+HEFF_FN void heff_watch_stack(void) {
+  char *m = malloc(2 * HEFF_SIG_STACK);
+  if (!m) return;
+  stack_t ss;
+  ss.ss_sp = m;
+  ss.ss_size = HEFF_SIG_STACK;
+  ss.ss_flags = 0;
+  if (sigaltstack(&ss, NULL) != 0) { free(m); return; }
+  heff_sig_stack = m;
+  heff_overflow_lost = 0;
+  pthread_t me = pthread_self();
+#ifdef __APPLE__
+  heff_stack_lo = (char *)pthread_get_stackaddr_np(me) - pthread_get_stacksize_np(me);
+#else
+  pthread_attr_t attr;
+  void *at;
+  size_t n;
+  if (pthread_getattr_np(me, &attr) == 0) {
+    if (pthread_attr_getstack(&attr, &at, &n) == 0) heff_stack_lo = at;
+    pthread_attr_destroy(&attr);
+  }
+#endif
+}
+
+// (as the thread ends: no longer watched)
+HEFF_FN void heff_unwatch_stack(void) {
+  if (!heff_sig_stack) return;
+  stack_t ss;
+  memset(&ss, 0, sizeof ss);
+  ss.ss_flags = SS_DISABLE;
+  sigaltstack(&ss, NULL);
+  heff_stack_lo = NULL;
+  free(heff_sig_stack);
+  heff_sig_stack = NULL;
+}
+#else
+HEFF_FN void heff_watch_faults(void) {}
+HEFF_FN void heff_watch_stack(void) {}
+HEFF_FN void heff_unwatch_stack(void) {}
+#endif
+
 // Threads a provider starts (#36): each runs what it
 // is given -- shared, `heff_share` -- by `heff_try`, so
 // that a failure there is the thread's to hand back, not the end of the
@@ -4083,19 +4306,17 @@ HEFF_FN V heff_errno(int err, uint32_t *shape) {
 HEFF_FN const char *heff_try(V f, V x, V *out) {
   jmp_buf here;
   jmp_buf *volatile up = heff_catch;
-#ifdef HEFF_THREADS
+  volatile long dep = heff_dep;
   volatile size_t open = heff_nopen;
-#endif
   heff_catch = &here;
-  if (setjmp(here) == 0) {
+  if (HEFF_SETJMP(here) == 0) {
     *out = heff_tr(heff_app1(f, x));
     heff_catch = up;
     return NULL;
   }
   heff_catch = up;
-#ifdef HEFF_THREADS
+  heff_dep = dep;
   heff_reopen(open);
-#endif
   return heff_caught;
 }
 
@@ -4103,6 +4324,11 @@ HEFF_FN const char *heff_try(V f, V x, V *out) {
 // failed: `why` from `heff_try`, copied)
 HEFF_FN void heff_fail_again(const char *why) {
   if (strcmp(why, "heff:abandon") == 0) heff_abandon();
+  if (!heff_catch && strcmp(why, HEFF_OVERFLOW) == 0) {
+    fflush(stdout);
+    fputs("heff: " HEFF_OVERFLOW "\n", stderr);
+    exit(HEFF_OVERFLOW_STATUS);
+  }
   heff_fail(why);
 }
 
@@ -4140,12 +4366,32 @@ HEFF_FN void heff_thread_end(void) {
 #ifndef HEFF_THREAD_STACK
 #define HEFF_THREAD_STACK ((size_t)1 << 28)
 #endif
+typedef struct { void *(*run)(void *); void *u; } HeffStart;
+
+// (a thread heff starts, watched while it runs)
+HEFF_FN void *heff_started(void *u) {
+  HeffStart s = *(HeffStart *)u;
+  free(u);
+  heff_watch_stack();
+  void *r = s.run(s.u);
+  heff_unwatch_stack();
+  return r;
+}
+
 HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
+  HeffStart *s = malloc(sizeof(HeffStart));
+  if (!s) return ENOMEM;
+  s->run = run;
+  s->u = u;
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, HEFF_THREAD_STACK);
-  int r = pthread_create(t, &attr, run, u);
+#ifdef HEFF_WATCHED
+  pthread_attr_setguardsize(&attr, HEFF_GUARD);
+#endif
+  int r = pthread_create(t, &attr, heff_started, s);
   pthread_attr_destroy(&attr);
+  if (r != 0) free(s);
   return r;
 }
 
@@ -4959,7 +5205,7 @@ HEFF_FN void heff_check_one(Buf *out, const Global *g) {
   buf_str(out, "\"");
   buf_str(out, g->name);
   buf_str(out, "\": ");
-  if (setjmp(here) == 0) {
+  if (HEFF_SETJMP(here) == 0) {
     V v = heff_tr(g->get());
     heff_show(&b, v, 0);
     buf_str(out, "{\"value\": ");
@@ -4998,6 +5244,7 @@ static void heff_check_init(void);
 
 static void *heff_thread(void *u) {
   (void)u;
+  heff_watch_stack();
   heff_check_init();
   Buf out = {0};
   buf_str(&out, "{");
@@ -5016,53 +5263,6 @@ static void *heff_thread(void *u) {
 }
 #else
 static V heff_entry(void);
-
-// (where the program's stack ran out, said: a fault at the bottom of its
-// stack, on a stack of the handler's own, is an overflow -- any other
-// fault the system's, as without the handler.  Not where a sanitizer
-// handles faults itself)
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define HEFF_SANITIZED 1
-#endif
-#endif
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define HEFF_SANITIZED 1
-#endif
-#if !defined(_WIN32) && !defined(HEFF_SANITIZED)
-static char *heff_stack_lo;
-
-static void heff_on_fault(int sig, siginfo_t *si, void *ctx) {
-  (void)ctx;
-  char *a = (char *)si->si_addr;
-  if (heff_stack_lo && a >= heff_stack_lo - ((size_t)1 << 20) && a < heff_stack_lo + ((size_t)1 << 16)) {
-    static const char why[] = "heff: the stack overflowed\n";
-    fflush(stdout);
-    if (write(2, why, sizeof why - 1) < 0) _exit(1);
-    _exit(1);
-  }
-  signal(sig, SIG_DFL);
-}
-
-static void heff_watch_stack(void) {
-  char here;
-  heff_stack_lo = &here - HEFF_MAIN_STACK;
-  stack_t ss;
-  ss.ss_size = 1 << 16;
-  ss.ss_sp = malloc(ss.ss_size);
-  ss.ss_flags = 0;
-  if (!ss.ss_sp || sigaltstack(&ss, NULL) != 0) return;
-  struct sigaction sa;
-  memset(&sa, 0, sizeof sa);
-  sa.sa_sigaction = heff_on_fault;
-  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-  sigemptyset(&sa.sa_mask);
-  sigaction(SIGSEGV, &sa, NULL);
-  sigaction(SIGBUS, &sa, NULL);
-}
-#else
-static void heff_watch_stack(void) {}
-#endif
 
 // (the layout the runtime's Zig reads values by, held to the one here
 // where the program is not optimised: each offset and size it says)
@@ -5116,6 +5316,10 @@ int main(int argc, char **argv) {
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, HEFF_MAIN_STACK);
+#ifdef HEFF_WATCHED
+  pthread_attr_setguardsize(&attr, HEFF_GUARD);
+#endif
+  heff_watch_faults();
   pthread_t t;
   if (pthread_create(&t, &attr, heff_thread, NULL) != 0) heff_fail("cannot start");
   pthread_join(t, NULL);
