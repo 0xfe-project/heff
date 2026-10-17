@@ -11,7 +11,9 @@
 -- imports -- is elaborated when it is asked about, and kept until a
 -- document changes.  The server pulls: it awaits a
 -- message, or the time a document's check waits for, and its state goes
--- along the loop.
+-- along the loop.  A failure of heff's own -- elaborating a document,
+-- answering a message -- is caught: said of the document, or answered
+-- the request as an error, and the server serves on.
 
 module heff.lsp.lsp
 
@@ -346,7 +348,49 @@ keptOf program = case List.last program of
     List.append (List.map Driver.lean (dropLast program)) [Driver.traceless c]
   Nothing -> Nil
 
--- | elaborate a document open, and publish what is wrong with it
+-- | what a document's elaboration comes to: what is kept of the program,
+-- | and the diagnostics to publish
+type Analysed = { program : List Driver.Checked, diags : List Json }
+
+mkAnalysed : List Driver.Checked -> List Json -> Analysed
+mkAnalysed program diags = { program = program, diags = diags }
+
+analysed : {e : HFunctor}
+         -> {{disk : filesystem <: e}}
+         -> St
+         -> String
+         -> Doc
+         -> Co e Analysed
+analysed st f d = do
+  l <- Load.loadProgramWith (\p -> readOpen st p) st.lib f
+  full <- Session.cachedProgram l
+  -- (what is kept of it: the document's names with their types, for
+  -- hover; of what it imports, what a query over it needs)
+  program <- pure (keptOf full)
+  pure
+      (mkAnalysed
+         program
+         (List.map
+            (\x -> diagnostic d.text x)
+            (diagsOf d.text program l.errors)))
+
+-- | a bug of heff's, not the document's, said where it starts
+failureDiag : String -> String -> Json
+failureDiag src why =
+  diagnostic
+    src
+    (mkDiag
+       SError
+       zeroSpan
+       ("heff failed elaborating this file (" ^ why ^ "): a bug of heff's"))
+
+-- (an elaboration that failed: said, and nothing kept of it)
+analysisOf : String -> Either String Analysed -> Analysed
+analysisOf src (Right a) = a
+analysisOf src (Left why) = mkAnalysed Nil [failureDiag src why]
+
+-- | elaborate a document open, and publish what is wrong with it; an
+-- | elaboration that fails is a diagnostic too
 check : {e : HFunctor}
       -> {{disk : filesystem <: e}}
       -> {{wire : RPC.rpc <: e}}
@@ -356,17 +400,12 @@ check : {e : HFunctor}
 check st f = case Map.lookup st.docs f of
   Nothing -> pure st
   Just d -> do
-    l <- Load.loadProgramWith (\p -> readOpen st p) st.lib f
-    full <- Session.cachedProgram l
-    -- (what is kept of it: the document's names with their types, for
-    -- hover; of what it imports, what a query over it needs)
-    program <- pure (keptOf full)
-    publish
-        d.uri
-        (List.map (\x -> diagnostic d.text x) (diagsOf d.text program l.errors))
+    r <- RPC.attempt (\u -> analysed st f d)
+    a <- pure (analysisOf d.text r)
+    publish d.uri a.diags
     pure
         (withChecked
-           (Map.insert st.checked f (mkElaborated d.text program))
+           (Map.insert st.checked f (mkElaborated d.text a.program))
            st)
 
 checkAll : {e : HFunctor}
@@ -460,6 +499,12 @@ type WithProgram = { st : St, program : List Driver.Checked }
 mkWithProgram : St -> List Driver.Checked -> WithProgram
 mkWithProgram st program = { st = st, program = program }
 
+-- (a program, or none where its elaboration failed: what is asked of it
+-- answered empty)
+elaboratedOr : Either String (List Driver.Checked) -> List Driver.Checked
+elaboratedOr (Right program) = program
+elaboratedOr (Left why) = Nil
+
 projectAnew : {e : HFunctor}
             -> {{disk : filesystem <: e}}
             -> {{wire : RPC.rpc <: e}}
@@ -468,7 +513,8 @@ projectAnew : {e : HFunctor}
             -> String
             -> Co e WithProgram
 projectAnew st root f = do
-  program <- elabProject (\p -> readOpen st p) st.lib root f
+  r <- RPC.attempt (\u -> elabProject (\p -> readOpen st p) st.lib root f)
+  program <- pure (elaboratedOr r)
   pure (mkWithProgram (withProject (Just (mkProject root program)) st) program)
 
 -- | the project a document is in, every file of it elaborated, an open
@@ -789,6 +835,18 @@ renamedTarget t@{ target = { local = Nothing, member = Nothing } } new =
   Query.globalT
     (strSlice t.target.key 0 (strLength t.target.key - strLength t.name) ^ new)
 
+-- (a renaming whose program, elaborated again, failed: refused)
+renameFailed : Pointed -> String -> String -> Maybe String
+renameFailed t new why =
+  Just
+    ("renaming `"
+     ^ t.name
+     ^ "` to `"
+     ^ new
+     ^ "` would make heff fail elaborating ("
+     ^ why
+     ^ ")")
+
 renameVerdict : WithProgram
               -> Pointed
               -> String
@@ -852,25 +910,32 @@ renameChecked st t new = do
          (List.map (\(b : ByFile) -> b.path) (byFile t.occurrences))
          Nil
          before.program)
-  after <-
-    elabFiles
-      (\p -> case textOf
-         (List.map
-            (\(b : ByFile) -> MkPair b.path (renamedText new b.occurrences))
-            (byFile t.occurrences))
-         p of
-       Just txt -> pure (Just txt)
-       Nothing -> readOpen st p)
-      st.lib
-      affected
+  tried <-
+    RPC.attempt
+      (\u ->
+         elabFiles
+           (\p -> case textOf
+              (List.map
+                 (\(b : ByFile) ->
+                    MkPair b.path (renamedText new b.occurrences))
+                 (byFile t.occurrences))
+              p of
+            Just txt -> pure (Just txt)
+            Nothing -> readOpen st p)
+           st.lib
+           affected)
   pure
-      (renameVerdict
-         before
-         t
-         new
-         (errorCount (inPaths affected before.program))
-         (errorCount (inPaths affected after))
-         after)
+      (either
+         (\why -> MkPair before.st (renameFailed t new why))
+         (\after ->
+            renameVerdict
+              before
+              t
+              new
+              (errorCount (inPaths affected before.program))
+              (errorCount (inPaths affected after))
+              after)
+         tried)
 
 editOf : String -> Query.Occurrence -> Json
 editOf new o = obj [kv "range" (range o.source o.span), kv "newText" (jstr new)]
@@ -1096,8 +1161,26 @@ formatted st id p = do
 -- | the type of a variable of an equation that does not use it: the
 -- | document elaborated again, after what it imports as elaborated
 -- | already, with the equation's body the variable alone
+-- (the type of the variable, from the document probed)
+probedIn : List Driver.Checked
+         -> Split.Spot
+         -> Maybe Driver.Source
+         -> Maybe String
+probedIn program s (Just source) =
+  Split.typeUsedAt
+    (Driver.elabNext (dropLast program) source Nothing)
+    s.name
+    (Split.probeAt s)
+probedIn program s Nothing = Nothing
+
+-- (a type, or none where finding it failed)
+typeOr : Either String (Maybe String) -> Maybe String
+typeOr (Right t) = t
+typeOr (Left why) = Nothing
+
 probedType : {e : HFunctor}
            -> {{disk : filesystem <: e}}
+           -> {{wire : RPC.rpc <: e}}
            -> St
            -> String
            -> List Driver.Checked
@@ -1112,16 +1195,12 @@ probedType st f program c s = do
          else readOpen st q)
       st.lib
       f
-  pure (case List.last l.sources of
-    Just source ->
-      Split.typeUsedAt
-        (Driver.elabNext (dropLast program) source Nothing)
-        s.name
-        (Split.probeAt s)
-    Nothing -> Nothing)
+  r <- RPC.attempt (\u -> pure (probedIn program s (List.last l.sources)))
+  pure (typeOr r)
 
 splitType : {e : HFunctor}
           -> {{disk : filesystem <: e}}
+          -> {{wire : RPC.rpc <: e}}
           -> St
           -> String
           -> List Driver.Checked
@@ -1157,6 +1236,7 @@ splitAction uri src x =
 
 splitIn : {e : HFunctor}
         -> {{disk : filesystem <: e}}
+        -> {{wire : RPC.rpc <: e}}
         -> St
         -> String
         -> String
@@ -1647,6 +1727,42 @@ checkDue st (Cons f rest) = do
   st2 <- checkNow st f
   checkDue st2 rest
 
+-- (a request whose handling failed, answered with an error that says
+-- so; a notification, a response, nothing)
+failedReply : {e : HFunctor}
+            -> {{wire : RPC.rpc <: e}}
+            -> Maybe Json
+            -> Maybe String
+            -> String
+            -> Co e Unit
+failedReply (Just id) (Just m) why =
+  replyError id (0 - 32603) ("heff failed answering " ^ m ^ " (" ^ why ^ ")")
+failedReply _ _ why = pure MkUnit
+
+-- | the state after a message: a handling that failed -- a bug of
+-- | heff's -- is answered, if it was a request, and what it did undone
+handled : {e : HFunctor}
+        -> {{wire : RPC.rpc <: e}}
+        -> St
+        -> Json
+        -> Either String St
+        -> Co e St
+handled st msg (Right st2) = pure st2
+handled st msg (Left why) = do
+  failedReply (field "id" msg) (str ["method"] msg) why
+  pure st
+
+-- (the documents not due any more)
+undue : Map.Map String Int -> List String -> Map.Map String Int
+undue due Nil = due
+undue due (Cons f rest) = undue (Map.delete due f) rest
+
+-- | the state after the documents due are checked; where that failed,
+-- | they are not due any more, not checked again and again
+dueChecked : St -> List String -> Either String St -> St
+dueChecked st fs (Right st2) = st2
+dueChecked st fs (Left why) = withDue (undue st.due fs) st
+
 -- | serve, from a state: a message answered, or the documents due checked,
 -- | until the client says `exit` or goes away
 serveFrom : {e : HFunctor}
@@ -1659,12 +1775,13 @@ serveFrom st = do
   ev <- RPC.await (nextDue st t)
   case ev of
     Message msg -> do
-      st2 <- handle st msg
+      r <- RPC.attempt (\u -> handle st msg)
+      st2 <- handled st msg r
       serveFrom st2
     Timeout -> do
       t2 <- RPC.now
-      st2 <- checkDue st (dueBy st t2)
-      serveFrom st2
+      r <- RPC.attempt (\u -> checkDue st (dueBy st t2))
+      serveFrom (dueChecked st (dueBy st t2) r)
     -- (the client went away without `exit`)
     Closed -> RPC.quit 1
 
