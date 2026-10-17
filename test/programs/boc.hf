@@ -1,0 +1,404 @@
+-- std.boc's behaviours among green threads, on the uses it is for, each
+-- program's store a shape of its own: money moved between accounts, the
+-- total the same however the behaviours interleave; behaviours on a
+-- cown run in the order they were spawned; a behaviour spawning one on
+-- another's cown from inside it, each way, without deadlock (Listing 3
+-- and 4 of the paper); a log written in the order the behaviours were
+-- caused (Listing 8); five philosophers; cowns of two types in one
+-- behaviour; cowns that overlap, abandoned; and a behaviour that waits
+-- for good.  Each run on its store and nothing else (`runBoc`), in the
+-- language.
+
+module test.programs.boc
+
+import co
+import green
+import std.boc
+import std.store
+
+-- (the `i`th of the list)
+nth : {a : Type} -> List a -> Int -> a
+nth xs i = case List.head (List.drop i xs) of
+  Just x -> x
+  Nothing -> abandon
+
+-- (the next of a sequence of numbers that look random)
+nextRandom : Int -> Int
+nextRandom x = (x * 1103515245 + 12345) % 2147483648
+
+-- (what the store holds at the end, by `f`, or that every thread waits)
+endedAs : {s a : Type} -> (s -> String) -> Maybe (a, s) -> String
+endedAs f (Just (x, end)) = f end
+endedAs f Nothing = "every thread waits"
+
+-- (`n` turns of the others)
+yields : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Co e Unit
+yields 0 = pure ()
+yields n = do
+  yield
+  yields (n - 1)
+
+-- A bank
+--------------------------------------------------------------------------------
+
+-- | Four accounts.
+type Accounts = (Int, Int, Int, Int)
+
+accounts : List (Cown Accounts Int)
+accounts =
+  [ fstOf (fstOf (fstOf whole))
+  , sndOf (fstOf (fstOf whole))
+  , sndOf (fstOf whole)
+  , sndOf whole
+  ]
+
+-- | Up to `n` moved from `from` to `to`, as much as there is: one
+-- | behaviour on both, taking a turn of the others halfway.
+transfer : {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{bc : boc Accounts <: e}}
+         -> Cown Accounts Int
+         -> Cown Accounts Int
+         -> Int
+         -> Co e Unit
+transfer from to n =
+  when (from, to) (\(a, b) -> do
+  let moved = min a n
+  yield
+  pure (a - moved, b + moved))
+
+-- (transfers between accounts drawn from `seed`, `k` of them, none from
+-- an account to itself)
+transfers : {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> {{bc : boc Accounts <: e}}
+          -> Int
+          -> Int
+          -> Co e Unit
+transfers seed 0 = pure ()
+transfers seed k = do
+  let r = nextRandom seed
+  let from = r % 4
+  let to = (from + 1 + (r / 4) % 3) % 4
+  transfer (nth accounts from) (nth accounts to) ((r / 16) % 40)
+  transfers r (k - 1)
+
+-- (the accounts' total)
+totalOf : Accounts -> Int
+totalOf (a, b, c, d) = a + b + c + d
+
+-- | 500 transfers among four accounts of 100: the total at the end.
+-- | >>> bank
+-- | "400"
+bank : String
+bank =
+  endedAs
+    (\end -> show (totalOf end))
+    (runBoc (100, 100, 100, 100) (transfers 1 500))
+
+-- Spawn order
+--------------------------------------------------------------------------------
+
+-- | A cown, and a log of who ran.
+type Logged = (Int, List String)
+
+counter : Cown Logged Int
+counter = left
+
+ran : Cown Logged (List String)
+ran = right
+
+-- (a behaviour on the counter and the log, `f` of the count, taking
+-- `turns` turns of the others before it ends, and saying so)
+step : {e : HFunctor}
+     -> {{gr : green <: e}}
+     -> {{bc : boc Logged <: e}}
+     -> String
+     -> Int
+     -> (Int -> Int)
+     -> Co e Unit
+step name turns f =
+  when (counter, ran) (\(n, log) -> do
+  yields turns
+  pure (f n, log ++ [name]))
+
+-- | Three behaviours on the same cowns, the first taking the longest:
+-- | they run as they were spawned, each after the one before, and one on
+-- | the log alone, spawned last, after them all.
+-- | >>> ordered
+-- | "20 [\"set\", \"doubled\", \"one more\", \"logged\"]"
+ordered : String
+ordered =
+  endedAs
+    (\(n, log) -> show n ^ " " ^ show log)
+    (runBoc
+       (0, Nil) (do
+     step "set" 5 (\n -> 9)
+     step "doubled" 0 (\n -> n * 2)
+     step "one more" 2 (\n -> n + 2)
+     when ran (\log -> pure (log ++ ["logged"]))))
+
+-- | Of behaviours on cowns apart, one spawned later may end first: the
+-- | slow one on the counter, the quick one on the log alone.
+-- | >>> overtaken
+-- | "[\"quick\", \"slow\"]"
+overtaken : String
+overtaken =
+  endedAs
+    (\(n, log) -> show log)
+    (runBoc
+       (0, Nil) (do
+     ch <- newChan
+     when counter (\n -> do
+       _ <- recv ch
+       pure (n + 1))
+     when ran (\log -> do
+       send ch 0
+       pure (log ++ ["quick"]))
+     when (counter, ran) (\(n, log) -> pure (n, log ++ ["slow"]))))
+
+-- Nested behaviours
+--------------------------------------------------------------------------------
+
+-- | Two accounts.
+type Two = (Int, Int)
+
+-- | Listing 3 and 4 of the paper: `n` taken from `src`, where it has
+-- | it, and a behaviour depositing it on `dst` spawned from inside.  It
+-- | never waits for `dst`, so two of them, each way, cannot deadlock.
+withdrawThen : {e : HFunctor}
+             -> {{gr : green <: e}}
+             -> {{bc : boc Two <: e}}
+             -> Cown Two Int
+             -> Cown Two Int
+             -> Int
+             -> Co e Unit
+withdrawThen src dst n =
+  when
+    src
+    (\x ->
+       if x >= n
+       then do
+         when dst (\y -> pure (y + n))
+         pure (x - n)
+       else pure x)
+
+one : Cown Two Int
+one = left
+
+other : Cown Two Int
+other = right
+
+-- (both, said)
+showTwo : Two -> String
+showTwo (a, b) = show a ^ " " ^ show b
+
+-- | 1 from the first to the second and 2 back: the balances.
+-- | >>> nested
+-- | "101 99"
+nested : String
+nested =
+  endedAs
+    showTwo
+    (runBoc
+       (100, 100) (do
+     withdrawThen one other 1
+     withdrawThen other one 2))
+
+-- | A behaviour spawning one on its own cown: it runs after.
+-- | >>> again
+-- | "3 0"
+again : String
+again =
+  endedAs
+    showTwo
+    (runBoc
+       (0, 0)
+       (when one (\x -> do
+        when one (\y -> pure (y * 3))
+        pure (x + 1))))
+
+-- Causal order
+--------------------------------------------------------------------------------
+
+-- | A log and two cowns.
+type Causal = (List String, Int, Int)
+
+journal : Cown Causal (List String)
+journal = first
+
+src : Cown Causal Int
+src = second
+
+dst : Cown Causal Int
+dst = third
+
+-- (a behaviour writing `s` on the journal)
+note : {e : HFunctor}
+     -> {{gr : green <: e}}
+     -> {{bc : boc Causal <: e}}
+     -> String
+     -> Co e Unit
+note s = when journal (\log -> pure (log ++ [s]))
+
+-- | Listing 8: "begin" logged first; "withdraw", logged from a behaviour
+-- | on `src` spawned after; "deposit", from one on both spawned after
+-- | that.  Each was caused after the one before, so the log says them
+-- | in that order, however long each took.
+-- | >>> causal
+-- | "[\"begin\", \"withdraw\", \"deposit\"]"
+causal : String
+causal =
+  endedAs
+    (\(log, a, b) -> show log)
+    (runBoc
+       (Nil, 10, 0) (do
+     note "begin"
+     when src (\a -> do
+       yields 3
+       note "withdraw"
+       pure (a - 1))
+     when (src, dst) (\(a, b) -> do
+       note "deposit"
+       pure (a, b + 1))))
+
+-- Dining philosophers
+--------------------------------------------------------------------------------
+
+-- | Five forks, each the times it was used, and five philosophers, each
+-- | the meals they have left.
+type Table = ((Int, Int, Int, Int, Int), (Int, Int, Int, Int, Int))
+
+-- (the five of a quintuple)
+fiveOf : {s : Type}
+       -> Position s (Int, Int, Int, Int, Int)
+       -> List (Position s Int)
+fiveOf p =
+  [ fstOf (fstOf (fstOf (fstOf p)))
+  , sndOf (fstOf (fstOf (fstOf p)))
+  , sndOf (fstOf (fstOf p))
+  , sndOf (fstOf p)
+  , sndOf p
+  ]
+
+forks : List (Cown Table Int)
+forks = fiveOf left
+
+philosophers : List (Cown Table Int)
+philosophers = fiveOf right
+
+-- | A meal: one behaviour on both forks and the philosopher, which
+-- | spawns the next where meals are left.
+eat : {e : HFunctor}
+    -> {{gr : green <: e}}
+    -> {{bc : boc Table <: e}}
+    -> Cown Table Int
+    -> Cown Table Int
+    -> Cown Table Int
+    -> Co e Unit
+eat l r p =
+  when (l, r, p) (\(x, y, m) -> do
+  if m > 1 then eat l r p
+  yield
+  pure (x + 1, y + 1, m - 1))
+
+-- (each philosopher seated, between forks `i` and `i + 1`)
+seated : {e : HFunctor}
+       -> {{gr : green <: e}}
+       -> {{bc : boc Table <: e}}
+       -> List Int
+       -> Co e Unit
+seated Nil = pure ()
+seated (i :: rest) = do
+  eat (nth forks i) (nth forks ((i + 1) % 5)) (nth philosophers i)
+  seated rest
+
+-- | Five philosophers, 100 meals each: each fork used 200 times, no
+-- | meal left.
+-- | >>> dined
+-- | "[200, 200, 200, 200, 200, 0, 0, 0, 0, 0]"
+dined : String
+dined =
+  endedAs
+    (\end -> show (List.map (\c -> contents c end) (forks ++ philosophers)))
+    (runBoc
+       ((0, 0, 0, 0, 0), (100, 100, 100, 100, 100))
+       (seated [0, 1, 2, 3, 4]))
+
+-- Two types
+--------------------------------------------------------------------------------
+
+-- | A count and the names counted.
+type Roll = (Int, List String)
+
+count : Cown Roll Int
+count = left
+
+names : Cown Roll (List String)
+names = right
+
+-- (each name counted, by a behaviour of its own)
+rollCall : {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{bc : boc Roll <: e}}
+         -> List String
+         -> Co e Unit
+rollCall Nil = pure ()
+rollCall (name :: rest) = do
+  when (count, names) (\(n, ns) -> pure (n + 1, name :: ns))
+  rollCall rest
+
+-- (the roll, said)
+showRoll : Roll -> String
+showRoll (n, ns) = show n ^ " " ^ show ns
+
+-- | A behaviour on a `Cown Roll Int` and a `Cown Roll (List String)` at
+-- | once, given an `(Int, List String)`.
+-- | >>> rolled
+-- | "3 [\"c\", \"b\", \"a\"]"
+rolled : String
+rolled = endedAs showRoll (runBoc (0, Nil) (rollCall ["a", "b", "c"]))
+
+-- Overlapping, and waiting
+--------------------------------------------------------------------------------
+
+-- | The same cown twice in one behaviour: abandoned.
+-- | >>> twice
+-- | <abandoned>
+twice : String
+twice =
+  endedAs showTwo (runBoc (1, 2) (when (one, one) (\(a, b) -> pure (a, b))))
+
+-- | Both accounts, as one cown.
+joint : Cown Two Two
+joint = whole
+
+-- | A cown and one inside it: abandoned.
+-- | >>> inside
+-- | <abandoned>
+inside : String
+inside =
+  endedAs
+    showTwo
+    (runBoc (1, 2) (when (joint, other) (\(p, b) -> pure (p, b))))
+
+-- | A store of one cown.
+cell : Cown Int Int
+cell = whole
+
+-- | A behaviour waiting on a channel nobody sends on holds its cown:
+-- | the one behind it waits too, and the scheduler says every thread
+-- | waits.
+-- | >>> held
+-- | "every thread waits"
+held : String
+held =
+  endedAs
+    show
+    (runBoc
+       0 (do
+     ch <- newChan
+     when cell (\n -> do
+       _ <- recv ch
+       pure n)
+     when cell (\n -> pure (n + 1))))

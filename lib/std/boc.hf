@@ -1,0 +1,351 @@
+-- Behaviour-oriented concurrency (Cheeseman et al., OOPSLA 2023) over a
+-- typed store: the store is one value, of a shape the program declares
+-- (`(Int, Int, List String)`), and a cown is a position in it
+-- (`Cown s a`, an `a` in an `s`: std.store's).  `when c body` spawns a
+-- behaviour: later, once, with every cown of `c` its own at once, it is
+-- given what they hold and gives back what they are to hold after it.
+-- Behaviours whose cowns overlap run one after another, in the order
+-- they were spawned; the others run as they come, among green threads.
+-- A behaviour takes its cowns all at once, never one and then another,
+-- so behaviours do not deadlock on them.
+--
+-- > [!CAUTION]
+-- > Unstable: concurrency in heff is not settled. What this module offers
+-- > may change, or go, in any release.
+--
+-- ```haskell
+-- import co
+-- import green
+-- import std.boc
+-- import std.store
+--
+-- type Bank = (Int, Int, List String)
+--
+-- alice : Cown Bank Int
+-- alice = first
+--
+-- bob : Cown Bank Int
+-- bob = second
+--
+-- moves : Cown Bank (List String)
+-- moves = third
+--
+-- -- | `n` moved from alice to bob, where she has it, and said so: one
+-- -- | behaviour on all three
+-- paid : {e : HFunctor} -> {{gr : green <: e}} -> {{bc : boc Bank <: e}} -> Int -> Co e Unit
+-- paid n =
+--   when (alice, bob, moves) (\(a, b, ms) ->
+--     if a >= n then pure (a - n, b + n, ("paid " ^ show n) :: ms)
+--     else pure (a, b, ms))
+--
+-- -- | alice given 10, then 5 paid, on a store of nothing yet: what bob
+-- -- | has at the end, `Just 5`
+-- run : Maybe Int
+-- run =
+--   case runBoc (0, 0, Nil) (do
+--     when alice (\a -> pure (a + 10))
+--     paid 5) of
+--     Just (u, end) -> Just (contents bob end)
+--     Nothing -> Nothing
+-- ```
+--
+-- Operation | What it does
+-- --- | ---
+-- `when c body` | a behaviour spawned on the cown `c`, or a tuple of them; this one goes on
+-- `drained` | waits until no behaviour is left to run
+-- `runBoc st c` | `c` and its behaviours run on the store `st`, in the language
+--
+-- A behaviour's body is given what its cowns hold, a tuple as the cowns
+-- are (`(a, b, log)` hands it an `(x, y, l)`, nesting to the left), and
+-- gives back their new contents, the same shape: `Cowns` says what a
+-- cown or a tuple of them holds.  The body is a
+-- computation of the world like any other: it may spawn behaviours, on
+-- its own cowns too (they run after it), and nothing stops it doing
+-- what else its effects allow.  But a body that waits -- `recv` on a
+-- channel, a behaviour's end it hopes for -- holds its cowns while it
+-- waits, and every behaviour behind it on them waits too; where every
+-- thread waits, the scheduler says so (`runBoc`'s `Nothing`).
+--
+-- The cowns of one `when` are apart: the same cown twice, or one inside
+-- another (`whole` and `first`), is abandoned when the `when` runs.
+--
+-- Behaviours are green threads, the store and the queue of behaviours
+-- the world's state (`boc s`, handled in the language, as std.state's
+-- `runState` does).  `runBoc` runs a program and its behaviours on a
+-- store and nothing else, waiting for the last behaviour before it
+-- answers, on every backend.  A program of the world handles `boc s`
+-- itself, `runState (opening st)` around green's `scheduled`, and waits
+-- for `drained` before it reads the store.
+
+module std.boc
+  ( Cown
+  , Cowns
+  , instanceCownsPosition
+  , instanceCownsPair
+  , Behaviours
+  , boc
+  , when
+  , drained
+  , opening
+  , runBoc
+  )
+
+import co
+import green
+import state
+import std.store
+
+-- | A cown holding an `a`, in a store of shape `s`: a position in it.
+type Cown s a = Position s a
+
+-- (a behaviour spawned and not yet done: the parts of the store it
+-- holds, the channel it is told on that its turn has come, and whether
+-- it has come)
+type Pending = { parts : List Part, chan : Int, running : Bool }
+
+-- | The store behaviours share; those spawned and not yet done, in the
+-- | order they were spawned; and the channels of those waiting until
+-- | none is left.
+type Behaviours s = { now : s, pending : List Pending, idle : List Int }
+
+-- | ... as the world's state.
+boc : Type -> HFunctor
+boc s = state (Behaviours s)
+
+-- | The store `st`, no behaviour spawned.
+opening : {s : Type} -> s -> Behaviours s
+opening st = { now = st, pending = Nil, idle = Nil }
+
+-- (does any of `ps` overlap any of `qs`)
+anyOverlap : List Part -> List Part -> Bool
+anyOverlap ps qs = List.any (\p -> List.any (\q -> overlaps p q) qs) ps
+
+-- (none of the parts overlaps another)
+apart : List Part -> Bool
+apart Nil = True
+apart (p :: ps) = not (List.any (\q -> overlaps p q) ps) && apart ps
+
+-- (each told on its channel)
+wakeAll : {e : HFunctor} -> {{gr : green <: e}} -> List Int -> Co e Unit
+wakeAll Nil = pure ()
+wakeAll (ch :: rest) = do
+  send ch 0
+  wakeAll rest
+
+-- (a behaviour, `go` where its turn has come, before the rest as they
+-- were set)
+startedOne : Pending
+           -> Bool
+           -> (List Pending, List Int)
+           -> (List Pending, List Int)
+startedOne b True (rest, woken) =
+  ({ b | running = True } :: rest, b.chan :: woken)
+startedOne b False (rest, woken) = (b :: rest, woken)
+
+-- (the behaviours, `held` the parts of those spawned before them: each
+-- waiting one none of those overlaps set running; and the channels of
+-- those set so)
+started : List Part -> List Pending -> (List Pending, List Int)
+started held Nil = (Nil, Nil)
+started held (b :: bs) =
+  startedOne
+    b
+    (not b.running && not (anyOverlap b.parts held))
+    (started (held ++ b.parts) bs)
+
+-- (none of the behaviours overlapping the parts)
+clear : List Part -> List Pending -> Bool
+clear ps bs = not (List.any (\(b : Pending) -> anyOverlap b.parts ps) bs)
+
+-- (all but the behaviour told on `ch`)
+without : Int -> List Pending -> List Pending
+without ch bs = List.keepIf (\(b : Pending) -> b.chan /= ch) bs
+
+-- (waiting for its turn, unless it has come)
+turn : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Bool -> Co e Unit
+turn ch True = pure ()
+turn ch False = do
+  _ <- recv ch
+  pure ()
+
+-- (what the store holds)
+nowOf : {s : Type} -> Behaviours s -> s
+nowOf bs = bs.now
+
+-- (behaviours left to run)
+busy : {s : Type} -> Behaviours s -> Bool
+busy bs = not (List.null bs.pending)
+
+-- (... and the channel `ch` waiting until none is)
+idling : {s : Type} -> Int -> Behaviours s -> Behaviours s
+idling ch bs = { bs | idle = ch :: bs.idle }
+
+-- (... the behaviour on the channel `ch`, on the cowns `c`, spawned
+-- behind them: whether its turn has come at once)
+spawned : {s t : Type}
+        -> Int
+        -> Cown s t
+        -> Behaviours s
+        -> (Behaviours s, Bool)
+spawned ch c bs =
+  let ready = clear (parts c) bs.pending
+  in ( { bs
+       | pending =
+           bs.pending ++ [{ parts = parts c, chan = ch, running = ready }]
+       }
+     , ready
+     )
+
+-- (the store `now`, those waiting until no behaviour is left `idle`,
+-- and the behaviours left with the channels of those whose turn has
+-- come: the state after, and whom to tell)
+endedWith : {s : Type}
+          -> s
+          -> List Int
+          -> (List Pending, List Int)
+          -> (Behaviours s, List Int)
+endedWith now idle (Nil, woken) =
+  (({ now = now, pending = Nil, idle = Nil } : Behaviours s), woken ++ idle)
+endedWith now idle (rest, woken) =
+  (({ now = now, pending = rest, idle = idle } : Behaviours s), woken)
+
+-- (... the behaviour on the channel `ch` done, its cowns `c` holding
+-- `v`)
+afterEnd : {s t : Type}
+         -> Int
+         -> Cown s t
+         -> t
+         -> Behaviours s
+         -> (Behaviours s, List Int)
+afterEnd ch c v bs =
+  endedWith (replaced c v bs.now) bs.idle (started Nil (without ch bs.pending))
+
+-- (the behaviour on its channel `ch` done, its cowns `c` holding `v`:
+-- those whose turn it lets come told, and, where none is left, those
+-- waiting until then)
+ended : {s t : Type}
+      -> {e : HFunctor}
+      -> {{gr : green <: e}}
+      -> {{bc : boc s <: e}}
+      -> Int
+      -> Cown s t
+      -> t
+      -> Co e Unit
+ended ch c v = do
+  bs <- get (ev := bc)
+  let (next, woken) = afterEnd ch c v bs
+  put (ev := bc) next
+  wakeAll woken
+
+-- (a behaviour: its turn waited for, its body given what its cowns hold
+-- then, and what it gives back written)
+behaviour : {s t : Type}
+          -> {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> {{bc : boc s <: e}}
+          -> Int
+          -> Bool
+          -> Cown s t
+          -> (t -> Co e t)
+          -> Co e Unit
+behaviour ch ready c body = do
+  turn ch ready
+  bs <- get (ev := bc)
+  v <- body (contents c (nowOf bs))
+  ended ch c v
+
+-- (a behaviour on the cowns at the position `c`, spawned)
+spawnedOn : {s t : Type}
+          -> {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> {{bc : boc s <: e}}
+          -> Cown s t
+          -> (t -> Co e t)
+          -> Co e Unit
+spawnedOn c body =
+  if apart (parts c)
+  then do
+    ch <- newChan
+    bs <- get (ev := bc)
+    let (next, ready) = spawned ch c bs
+    put (ev := bc) next
+    spawn (behaviour ch ready c body)
+  else abandon
+
+-- | What a behaviour can be on, in a store of shape `s`: a cown, or a
+-- | tuple of them (`(a, b, c)`, nesting to the left); what they hold,
+-- | and the one position of it.
+theory Cowns (c : Type) where
+  Store : Type
+  Contents : Type
+  position : c -> Position Store Contents
+
+-- | A cown: what it holds.
+instance instanceCownsPosition : {s a : Type} -> Cowns (Position s a)
+instanceCownsPosition = { Store = s, Contents = a, position = \c -> c }
+
+-- | Two (each a cown or a tuple) of one store: the pair of what they
+-- | hold.
+instance instanceCownsPair : {c d : Type}
+                           -> {{l : Cowns c}}
+                           -> {{r : Cowns d @ { Store = l.Store }}}
+                           -> Cowns (c, d)
+instanceCownsPair =
+  { Store = l.Store
+  , Contents = (l.Contents, r.Contents)
+  , position = \p -> both (l.position (fst p)) (r.position (snd p))
+  }
+
+-- | A behaviour on the cowns `cs`, one or a tuple of them, spawned;
+-- | this one goes on.  Its turn comes once every behaviour spawned
+-- | before it on any of them is done; then `body` is given what they
+-- | hold, a tuple as `cs` is, and what it gives back is what they hold
+-- | after.  Cowns that overlap are abandoned.
+when : {c : Type}
+     -> {e : HFunctor}
+     -> c
+     -> {{cw : Cowns c}}
+     -> {{gr : green <: e}}
+     -> {{bc : boc cw.Store <: e}}
+     -> (cw.Contents -> Co e cw.Contents)
+     -> Co e Unit
+when cs body = spawnedOn (cw.position cs) body
+
+-- | Waiting until no behaviour is left to run: every one spawned, and
+-- | every one they spawn, done.
+drained : {s : Type}
+        -> {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{bc : boc s <: e}}
+        -> Co e Unit
+drained = do
+  bs <- get (ev := bc)
+  if busy bs
+    then do
+      ch <- newChan
+      put (ev := bc) (idling ch bs)
+      _ <- recv ch
+      drained (bc := bc)
+
+-- (main's answer and the store at the end)
+endOf : {s a : Type} -> (Maybe a, Behaviours s) -> Maybe (a, s)
+endOf (Just x, bs) = Just (x, bs.now)
+endOf (Nothing, bs) = Nothing
+
+-- | `c` and the behaviours it spawns, on the store `st` and nothing
+-- | else, in the language, the last of them waited for: main's answer
+-- | and the store they leave, or `Nothing` where every thread waits.
+runBoc : {s a : Type}
+       -> s
+       -> ({e : HFunctor}
+           -> {{gr : green <: e}}
+           -> {{bc : boc s <: e}}
+           -> Co e a)
+       -> Maybe (a, s)
+runBoc st c =
+  endOf
+    (greenWith
+       (opening st) (do
+     x <- c
+     drained (s := s)
+     pure x))
