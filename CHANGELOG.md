@@ -14,6 +14,10 @@
 - `if let` is removed: write a `case`, or `let p = e else s`.
 - A signature may name more than one definition, `x, y, z : T`, at the top level, in `where` and `mutual`, and for a theory's or a record type's fields (`{ x, y : Int }`).
 
+### Standard library
+
+- `Order` carries its type's `Equality`, the field `eq`: every `Order` instance gives one. `ord.eq.equal`, or `(==) (eq := ord.eq)`, compares by it; `==` still finds only an `Equality` in scope. `orderByCompare` takes the `Equality` as an instance argument.
+
 ### Backends and performance
 
 - Loop accumulators stay unboxed: a `Float64` total in a `do` loop is boxed once at exit. `doloops_float_do` 7.40 G to 0.42 G instructions.
