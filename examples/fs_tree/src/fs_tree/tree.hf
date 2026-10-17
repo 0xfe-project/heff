@@ -1,0 +1,176 @@
+-- A directory's tree, as UNIX `tree` (2.x, in a UTF-8 locale) draws it:
+-- what is in a directory under it, by name, `├── ` before each entry but
+-- the last and `└── ` before the last, and `│` down the side of what is
+-- in an entry that is not the last.
+
+module fs_tree.tree
+
+import co
+import exception
+import std.filesystem
+import std.path
+
+-- | What is at a path: a file, a directory and what is in it, a
+-- | directory that could not be read, a link (what it says, and whether
+-- | it is to a directory: not followed), or nothing.
+data Tree
+  = File String
+  | Dir String (List Tree)
+  | Unread String
+  | Link String String Bool
+  | Missing String
+
+-- | What is shown: entries whose names start with `.` too (`all`),
+-- | directories only (`dirsOnly`), and how many levels down (`level`;
+-- | `Nothing`, every level).
+type Options = { all : Bool, dirsOnly : Bool, level : Maybe Int }
+
+-- | Show every entry but the hidden ones, every level down.
+defaultOptions : Options
+defaultOptions = { all = False, dirsOnly = False, level = Nothing }
+
+-- | An entry's name.
+nameOf : Tree -> String
+nameOf (File n) = n
+nameOf (Dir n _) = n
+nameOf (Unread n) = n
+nameOf (Link n _ _) = n
+nameOf (Missing n) = n
+
+-- | What is in an entry: a directory's entries; nothing for the rest.
+entries : Tree -> List Tree
+entries (Dir _ kids) = kids
+entries _ = []
+
+-- | Whether an entry is a directory, or a link to one.
+isDirectoryish : Tree -> Bool
+isDirectoryish (Dir _ _) = True
+isDirectoryish (Unread _) = True
+isDirectoryish (Link _ _ toDir) = toDir
+isDirectoryish _ = False
+
+-- | Entries in the order `tree` lists them: by name, case not minded,
+-- | then as written.
+-- | >>> List.map nameOf (inOrder [File "b", File "README", File "a", File "B"])
+-- | ["a", "B", "b", "README"]
+inOrder : List Tree -> List Tree
+inOrder ts = List.sortBy before ts
+  where
+  before : Tree -> Tree -> Bool
+  before a b =
+    if strEq (lower (nameOf a)) (lower (nameOf b)) then nameOf a <= nameOf b
+    else lower (nameOf a) < lower (nameOf b)
+
+-- (whether an entry is shown: a hidden one only with `all`, a file not
+-- with `dirsOnly`)
+shown : Options -> Tree -> Bool
+shown o t =
+  (o.all || not (startsWith "." (nameOf t)))
+  && (not o.dirsOnly || isDirectoryish t)
+
+-- | The tree at `path`, `depth` levels down: a directory past
+-- | `o.level` without what is in it, one that cannot be read `Unread`,
+-- | and nothing there `Missing`.  A link is not followed, so a link to a
+-- | directory above it ends; but `path` itself is followed (`depth` 0),
+-- | as it was asked for.
+buildTree : {e : HFunctor}
+          -> {{fs : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
+          -> Options
+          -> Int
+          -> Path
+          -> Co e Tree
+buildTree o depth path = do
+  let name = basename path
+  try (err := FileError)
+    st <- if depth == 0 then pathStatus path else linkStatus path
+    case st.kind of
+      Directory ->
+        if maybe False (\l -> depth >= l) o.level then return (Dir name [])
+        else do
+          try (err := FileError)
+            kids <- for p in (<- readDirectory path) do
+              buildTree o (depth + 1) p
+            return (Dir name (inOrder (List.keepIf (shown o) kids)))
+          catch _ ->
+            return (Unread name)
+      Link ->
+        return (Link name (toString (<- readLink path)) (<- isDirectory path))
+      _ -> return (File name)
+  catch _ ->
+    return (Missing name)
+
+-- | The lines of what is in a directory, each after `prefix`: an entry,
+-- | then what is in it (`│` and two no-break spaces down the side, as
+-- | `tree` writes it).
+-- | >>> below "" [File "a", Dir "b" [File "c"], File "d"]
+-- | ["├── a", "├── b", "│\u{a0}\u{a0} └── c", "└── d"]
+below : String -> List Tree -> List String
+below prefix [] = []
+below prefix (t :: ts) =
+  let branch : String = if List.null ts then "└── " else "├── "
+  in let side : String = if List.null ts then "    " else "│\u{a0}\u{a0} "
+  in List.append
+    ((prefix ^ branch ^ label t) :: below (prefix ^ side) (entries t))
+    (below prefix ts)
+  where
+  label : Tree -> String
+  label (Unread n) = n ^ "  [error opening dir]"
+  label (Link n target _) = n ^ " -> " ^ target
+  label t = nameOf t
+
+-- | The tree's lines: its root as it was named, then what is in it.
+-- | >>> drawn "." (Dir "." [Dir "a" [File "b"], File "c"])
+-- | [".", "├── a", "│\u{a0}\u{a0} └── b", "└── c"]
+drawn : String -> Tree -> List String
+drawn root (Dir _ kids) = root :: below "" kids
+drawn root _ = [root ^ "  [error opening dir]"]
+
+-- | How many directories and files are in a directory: a link counted as
+-- | what it is to.
+-- | >>> counted [Dir "a" [File "b"], File "c", Unread "d", Link "e" "a" True]
+-- | MkPair 3 2
+counted : List Tree -> Pair Int Int
+counted [] = MkPair 0 0
+counted (t :: ts) =
+  let rest : Pair Int Int = counted ts
+  in let inner : Pair Int Int = counted (entries t)
+  in MkPair (fst rest + fst inner + dirs t) (snd rest + snd inner + files t)
+  where
+  dirs : Tree -> Int
+  dirs t = if isDirectoryish t then 1 else 0
+  files : Tree -> Int
+  files (File _) = 1
+  files (Link _ _ False) = 1
+  files _ = 0
+
+-- (`n` of a thing, its plural after any number but 1)
+some : Int -> String -> String -> String
+some n one many = show n ^ " " ^ (if n == 1 then one else many)
+
+-- | The line under the tree: how many directories, the root one too
+-- | where anything is in it, and files where they are shown.  A root that
+-- | is no directory to read is counted as a file; one that is not there,
+-- | as nothing.
+-- | >>> summary defaultOptions (Dir "." [Dir "a" [File "b"], File "c"])
+-- | "2 directories, 2 files"
+-- | >>> summary { defaultOptions | dirsOnly = True } (Dir "." [Dir "a" [], Dir "b" []])
+-- | "3 directories"
+-- | >>> summary defaultOptions (Missing "nope")
+-- | "0 directories, 0 files"
+-- | >>> summary defaultOptions (Dir "empty" [])
+-- | "0 directories, 0 files"
+summary : Options -> Tree -> String
+summary o t =
+  let n : Pair Int Int = rooted t
+  in if o.dirsOnly then some (fst n) "directory" "directories"
+  else some (fst n) "directory" "directories"
+    ^ ", "
+    ^ some (snd n) "file" "files"
+  where
+  rooted : Tree -> Pair Int Int
+  rooted (Dir _ []) = MkPair 0 0
+  rooted (Dir _ kids) = case counted kids of
+    MkPair d f -> MkPair (d + 1) f
+  rooted (Missing _) = MkPair 0 0
+  rooted _ = MkPair 0 1

@@ -1,0 +1,110 @@
+-- The program fs_tree: what is under a directory, as UNIX `tree` draws
+-- it, then how many directories and files there are.
+--
+--   fs_tree [DIR] [-a] [-d] [-L LEVEL]
+
+module app.fs_tree.main
+
+import co
+import exception
+import fs_tree.tree
+import std.cli as CLI
+import std.filesystem
+import std.io
+import std.path
+import std.process
+
+-- | What the command line asks.
+type Asked = { dir : String, all : Bool, dirsOnly : Bool, level : Maybe String }
+
+asked : CLI.Term Asked
+asked = \s ->
+    CLI.with4
+      s
+      (\d a o l ->
+         ({ dir = fromMaybe "." d, all = a, dirsOnly = o, level = l } : Asked))
+      (CLI.optional s "DIR" Dirs)
+      (CLI.switch s "all" "a" "every entry, those named .* too")
+      (CLI.switch s "dirs-only" "d" "directories only")
+      (CLI.option s "level" "L" "LEVEL" "at most LEVEL levels down")
+
+-- (how the program is called)
+called : String
+called = "usage: fs_tree " ^ CLI.synopsis (CLI.shapeOf asked)
+
+help : String
+help =
+  joinWith
+    "\n"
+    (called
+     :: ""
+     :: "what is under DIR (here, without it), as a tree"
+     :: ""
+     :: "flags:"
+     :: List.map CLI.flagLine (CLI.shapeOf asked).flags)
+
+-- (the levels asked for: every one, or at least 1)
+levelOf : Maybe String -> Either String (Maybe Int)
+levelOf Nothing = Right Nothing
+levelOf (Just w) = case parseInt w of
+  Just n -> if n >= 1 then Right (Just n) else Left w
+  Nothing -> Left w
+
+-- (what is wrong, said, and the program ended badly)
+failed : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> String
+       -> Co e Unit
+failed why = do
+  printErr ("fs_tree: " ^ why ^ "\n" ^ called)
+  exit 2
+
+-- | The tree of `dir`, and the line under it.
+shownTree : {e : HFunctor}
+          -> {{io : stdio <: e}}
+          -> {{fs : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
+          -> Options
+          -> String
+          -> Co e Unit
+shownTree o dir = do
+  t <-
+    recover (buildTree o 0 (parse dir)) (\(_ : FileError) -> pure (Unread dir))
+  print (joinWith "\n" (drawn dir t))
+  print ""
+  print (summary o t)
+
+program : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{fs : filesystem <: e}}
+        -> {{ex : exception FileError <: e}}
+        -> Co e Unit
+program = do
+  argv <- args
+  case CLI.parse asked argv of
+    Left Help -> print help
+    Left p -> failed (CLI.problemSaid p)
+    Right a -> case levelOf a.level of
+      Left w -> failed ("LEVEL is a number of at least 1, not " ^ w)
+      Right l ->
+        shownTree { all = a.all, dirsOnly = a.dirsOnly, level = l } a.dir
+
+-- | The world's evidence given, and a failure of the files nothing heard
+-- | said.
+main : Co (stdio <+> process <+> filesystem) Unit
+main = do
+  r <-
+    attempt
+      FileError
+      (stdio <+> process <+> filesystem)
+      (program
+         (io := \p -> InR (InL (InL p)))
+         (sys := \p -> InR (InL (InR p)))
+         (fs := \p -> InR (InR p))
+         (ex := \p -> InL p))
+  case r of
+    Left err ->
+      printErr (ev := \p -> InL (InL p)) ("fs_tree: " ^ showFileError err)
+    Right _ -> pure MkUnit
