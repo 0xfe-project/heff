@@ -2,7 +2,9 @@
 -- the syntax: every auxiliary former is parametric, `El` is
 -- parametric in the type it mentions, and `Ty` closes the knot
 -- (`V = El Ty`).  Fields are positional constructor arguments; lazy
--- ones are thunks (`Params.Th`, no memoization); `abandon` fires on
+-- ones are thunks (`Params.Th`, no memoization).  What did not
+-- elaborate is an error hole: computed, it is opaque; decoded, applied,
+-- projected, the error type or opaque again.  `abandon` fires on other
 -- ill-typed input only, which the elaborator never hands over.
 
 module heff.elab.value
@@ -219,9 +221,15 @@ coerceToFields v = case coerceToFieldsMaybe v of
   Just fields -> fields
   Nothing -> abandon
 
+-- (a field of fields, if they have it: else, as of what has no fields
+-- -- a value of an error type, used as a record -- opaque)
+fieldIn : Maybe (Dict.Dict (Ev V)) -> String -> Ev V
+fieldIn (Just fields) x = fromMaybe (Nom VOpaque) (Dict.lookup fields x)
+fieldIn Nothing x = Nom VOpaque
+
 proj : V -> String -> Ev V
 proj VOpaque x = Nom VOpaque
-proj v x = Dict.elemAt (coerceToFields v) x
+proj v x = fieldIn (coerceToFieldsMaybe v) x
 
 -- | `expandRecord` makes a neutral for each field not specialized, so it
 -- | takes `reflect` (they are mutually recursive, and definitions are
@@ -347,9 +355,16 @@ isErrorTy : Ty -> Bool
 isErrorTy (VDecode h sp u described el) = headIsError h
 isErrorTy _ = False
 
--- | decoding a description
+-- | the type an error hole of a universe decodes to
+errorTy : Params.Universe -> Ty
+errorTy u = VDecode HError SpId u (\x -> Nothing) (\x -> errorHole (VU u))
+
+-- | decoding a description; an opaque element -- an error hole computed,
+-- | as when what did not elaborate is applied -- decodes to the error
+-- | type, the error said where it was made
 decodeD : V -> Ev Ty
 decodeD (VCode a) = Describe a
+decodeD VOpaque = Nom (errorTy LargeU)
 decodeD _ = abandon
 
 -- | Encoding a type as an element of its universe.  A decoded neutral
@@ -377,33 +392,47 @@ decodeNeu h sp ty expansion desc u (Just (Nom dty)) = dty
 decodeNeu h sp ty expansion desc u Nothing =
   VDecode h sp u (\x -> Nothing) (\x -> VNeu h sp ty expansion desc)
 
--- | decoding an element of case N
+-- (a neutral decoded; one of an error type -- used as a type -- is the
+-- error type)
+decodeNeuOf : Head
+            -> Spine V
+            -> Params.Th Ty
+            -> Params.Th (Expansion V)
+            -> Params.Th (Maybe V)
+            -> Ty
+decodeNeuOf h sp ty expansion desc =
+  if isErrorTy (Params.forceTh ty) then errorTy LargeU
+  else decodeNeu
+      h
+      sp
+      ty
+      expansion
+      desc
+      (universeOfTy (Params.forceTh ty))
+      (mapMaybe decodeD (desc MkUnit))
+
+-- | decoding an element of case N; an opaque one, an error hole
+-- | computed, is the error type
 decodeN : V -> Ty
 decodeN (VCode a) = a
-decodeN (VNeu h sp ty expansion desc) =
-  decodeNeu
-    h
-    sp
-    ty
-    expansion
-    desc
-    (universeOfTy (Params.forceTh ty))
-    (mapMaybe decodeD (desc MkUnit))
+decodeN (VNeu h sp ty expansion desc) = decodeNeuOf h sp ty expansion desc
+decodeN VOpaque = errorTy LargeU
 decodeN _ = abandon
-
--- | the type an error hole of a universe decodes to
-errorTy : Params.Universe -> Ty
-errorTy u = decodeN (errorHole (VU u))
 
 decodeEv : Ev V -> Ev Ty
 decodeEv (Nom x) = Nom (decodeN x)
 decodeEv (Describe x) = decodeD x
 decodeEv (Become x) = Become (decodeN x)
 
+-- (a type no function's applied: an error type, as a value of it is
+-- used as a function, is one still)
+notAFunctionTy : Ty -> Ty
+notAFunctionTy t = if isErrorTy t then t else abandon
+
 appTy : Ty -> Params.Th V -> Ty
 appTy t arg = case behavior t of
   LikeFunction level dom cod implicit -> nom (appClo cod arg)
-  _ -> abandon
+  _ -> notAFunctionTy t
 
 -- | the type of a neutral applied; a metavariable's stays what it is
 -- | past its arity
@@ -454,6 +483,8 @@ specialize (VNeu h sp ty expansion desc) x f = case desc MkUnit of
       (\u ->
          Just (VCode (addSpecialization level capture fieldTypes defaults x f)))
   _ -> abandon
+-- (an opaque element specialized is one still, as one projected is)
+specialize VOpaque x f = VOpaque
 specialize v x f = abandon
 
 clearFieldValue : (Locals V -> Field) -> Locals V -> Field
