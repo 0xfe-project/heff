@@ -136,6 +136,53 @@ Rules:
 - An instance cannot take an explicit argument (E0348).
 - Each of its implicit arguments must appear in what it is for (E0350).
 
+### An instance for every type
+
+```haskell
+instance instanceAdditionGraph : {g : Type} -> {{m : Graph g}} -> Addition g
+```
+
+An instance whose type is its theory of a bare variable, `Addition g`,
+fits every search of that theory: `Addition Int` fits it, `g` being
+`Int`. The prelude's `instanceAdditionInt` fits too, so with both in
+scope, `1 + 2` finds more than one instance, and is E0342.
+
+The instance's own instance arguments, `{{m : Graph g}}`, are searched
+for only once it is chosen. They do not rule it out: `Int` having no
+`Graph` leaves it fitting `Addition Int`, and a search failing there
+does not go back to try another instance.
+
+Write a plain function instead, and an instance for each type it is
+for:
+
+```haskell
+data Adjacency = MkAdjacency (List (Int, Int))
+
+theory Graph (g : Type) where
+  edges : g -> List (Int, Int)
+  fromEdges : List (Int, Int) -> g
+
+instance instanceGraphAdjacency : Graph Adjacency
+instanceGraphAdjacency = { edges = \(MkAdjacency es) -> es, fromEdges = MkAdjacency }
+
+additionOfGraph : {g : Type} -> {{m : Graph g}} -> Addition g
+additionOfGraph = { add = \a b -> m.fromEdges (m.edges a ++ m.edges b) }
+
+instance instanceAdditionAdjacency : Addition Adjacency
+instanceAdditionAdjacency = additionOfGraph
+
+-- | >>> size (MkAdjacency [(1, 2)] + MkAdjacency [(2, 3)])
+-- | 2
+size : Adjacency -> Int
+size (MkAdjacency es) = List.length es
+```
+
+`additionOfGraph` is no instance, so no search finds it, and
+`Addition Int` is the prelude's alone. `Addition Adjacency` is
+`instanceAdditionAdjacency`, `additionOfGraph` at `Adjacency`. Or give
+it where it is wanted, with no instance at all:
+`(+) (add := additionOfGraph) x y`.
+
 ## Equality, Show and ToString
 
 The prelude has three theories most types have:
