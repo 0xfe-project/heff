@@ -355,6 +355,17 @@ type Analysed = { program : List Driver.Checked, diags : List Json }
 mkAnalysed : List Driver.Checked -> List Json -> Analysed
 mkAnalysed program diags = { program = program, diags = diags }
 
+-- (a document's elaboration, of the program loaded: what is kept of it
+-- -- the document's names with their types, for hover; of what it
+-- imports, what a query over it needs -- and what is wrong)
+analysisFrom : Doc -> Load.Loaded -> List Driver.Checked -> Analysed
+analysisFrom d l full =
+  mkAnalysed
+    (keptOf full)
+    (List.map
+       (\x -> diagnostic d.text x)
+       (diagsOf d.text (keptOf full) l.errors))
+
 analysed : {e : HFunctor}
          -> {{disk : filesystem <: e}}
          -> St
@@ -364,30 +375,247 @@ analysed : {e : HFunctor}
 analysed st f d = do
   l <- Load.loadProgramWith (\p -> readOpen st p) st.lib f
   full <- Session.cachedProgram l
-  -- (what is kept of it: the document's names with their types, for
-  -- hover; of what it imports, what a query over it needs)
-  program <- pure (keptOf full)
-  pure
-      (mkAnalysed
-         program
-         (List.map
-            (\x -> diagnostic d.text x)
-            (diagsOf d.text program l.errors)))
+  pure (analysisFrom d l full)
 
--- | a bug of heff's, not the document's, said where it starts
-failureDiag : String -> String -> Json
-failureDiag src why =
+-- A check that did not finish
+--------------------------------------------------------------------------------
+
+-- An elaboration that stops -- abandons, fails in the runtime -- leaves
+-- nothing of what it found.  The document's declarations before the
+-- one it stopped at are elaborated again, alone, to say what they have
+-- wrong, and to have them for a hover; which one it stopped at is
+-- searched for, halving.  (Each declaration is elaborated after those
+-- above it, so the text up to one elaborates if the whole did up to
+-- there.)
+
+-- | a declaration at the top level of a document: where it starts, the
+-- | comments right above it with it, and its name's span
+type TopDecl = { cut : Int, name : Params.Span }
+
+mkTopDecl : Int -> Params.Span -> TopDecl
+mkTopDecl cut name = { cut = cut, name = name }
+
+-- | a line of a text: its offset, and what it says
+type Line = { at : Int, text : String }
+
+linesFrom : String -> Int -> List Line
+linesFrom src i =
+  if i >= strLength src then Nil
+  else Cons
+      { at = i, text = strSlice src i (lineEnd src i) }
+      (linesFrom src (lineEnd src i + 1))
+
+-- (where the word of a line from `i` ends)
+wordEnd : String -> Int -> Int
+wordEnd l i =
+  if i >= strLength l || contains (strSlice l i (i + 1)) " \t\r(){}[]:,="
+  then i
+  else wordEnd l (i + 1)
+
+-- (where the spaces from `i` end)
+spaceEnd : String -> Int -> Int
+spaceEnd l i =
+  if i < strLength l && (byteAt l i == 32 || byteAt l i == 9)
+  then spaceEnd l (i + 1)
+  else i
+
+firstWord : String -> String
+firstWord l = strSlice l 0 (wordEnd l 0)
+
+-- (a word a declaration's name comes after)
+declKeyword : String -> Bool
+declKeyword w =
+  List.any
+    (\k -> strEq k w)
+    [ "data"
+    , "type"
+    , "theory"
+    , "instance"
+    , "mutual"
+    , "infix"
+    , "infixl"
+    , "infixr"
+    ]
+
+-- (the span of what a declaration's line names, in the line: a word, or
+-- the one after its keyword)
+namedIn : String -> Params.Span
+namedIn l =
+  if declKeyword (firstWord l)
+     && wordEnd l (spaceEnd l (wordEnd l 0)) > spaceEnd l (wordEnd l 0)
+  then Query.mkSpan
+      (spaceEnd l (wordEnd l 0))
+      (wordEnd l (spaceEnd l (wordEnd l 0)))
+  else Query.mkSpan 0 (max 1 (wordEnd l 0))
+
+-- (what tells a declaration from the next: its name, and its keyword)
+keyOf : String -> String
+keyOf l =
+  strSlice l (namedIn l).start (namedIn l).end
+  ^ " "
+  ^ (if declKeyword (firstWord l) then firstWord l else "")
+
+-- (a comment at the start of a line)
+commentLine : String -> Bool
+commentLine l = startsWith "--" l || startsWith "{-" l
+
+-- (a line a declaration starts with, or goes on with: at the start of
+-- its line, no comment, no claim or import)
+declLine : String -> Bool
+declLine l =
+  strLength l > 0
+  && not (byteAt l 0 == 32 || byteAt l 0 == 9 || byteAt l 0 == 13)
+  && not (commentLine l)
+  && not (strEq (firstWord l) "module" || strEq (firstWord l) "import")
+
+shiftedBy : Int -> Params.Span -> Params.Span
+shiftedBy n sp = Query.mkSpan (sp.start + n) (sp.end + n)
+
+-- (the declarations of the lines: the key of the one before, and where
+-- the comments right above began)
+declsGo : List Line -> String -> Maybe Int -> List TopDecl
+declsGo Nil key above = Nil
+declsGo (Cons l rest) key above =
+  if commentLine l.text then declsGo rest key (Just (fromMaybe l.at above))
+  else if declLine l.text && not (strEq (keyOf l.text) key)
+  then Cons
+      (mkTopDecl (fromMaybe l.at above) (shiftedBy l.at (namedIn l.text)))
+      (declsGo rest (keyOf l.text) Nothing)
+  else declsGo rest key Nothing
+
+-- | the declarations at the top level of a text, in order
+-- | >>> List.map (\(t : TopDecl) -> t.cut) (topDecls "module m\n\n-- | one\nx : Int\nx = 1\n\ndata T = A\n")
+-- | [10, 34]
+topDecls : String -> List TopDecl
+topDecls src = declsGo (linesFrom src 0) "" Nothing
+
+-- (where the text of the first `k` declarations ends)
+cutOf : String -> List TopDecl -> Int -> Int
+cutOf src ds k = case List.head (List.drop k ds) of
+  Just t -> t.cut
+  Nothing -> strLength src
+
+-- | a document elaborated as far as its text up to `cut` goes (not kept
+-- | in the cache)
+analysedUpTo : {e : HFunctor}
+             -> {{disk : filesystem <: e}}
+             -> St
+             -> String
+             -> Doc
+             -> Int
+             -> Co e Analysed
+analysedUpTo st f d cut = do
+  l <-
+    Load.loadProgramWith
+      (\p ->
+         if strEq p f then pure (Just (strSlice d.text 0 cut))
+         else readOpen st p)
+      st.lib
+      f
+  acc <- Session.cachedGo l.paths l.sources { done = Nil, hashes = Map.empty }
+  pure (analysisFrom d l acc.done)
+
+-- | where an elaboration stopped: what the declarations before have, and
+-- | the declaration, if it is known
+type Stopped = { analysis : Analysed, at : Maybe TopDecl }
+
+mkStopped : Analysed -> Maybe TopDecl -> Stopped
+mkStopped a t = { analysis = a, at = t }
+
+-- (the first `lo` declarations elaborate, as `a` says; the first `hi`
+-- do not)
+stoppedGo : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> {{wire : RPC.rpc <: e}}
+          -> St
+          -> String
+          -> Doc
+          -> List TopDecl
+          -> Int
+          -> Int
+          -> Analysed
+          -> Co e Stopped
+stoppedGo st f d ds lo hi a =
+  if hi - lo <= 1 then pure (mkStopped a (List.head (List.drop lo ds)))
+  else do
+    r <-
+      RPC.attempt
+        (\u -> analysedUpTo st f d (cutOf d.text ds ((lo + hi) / 2)))
+    either
+        (\why -> stoppedGo st f d ds lo ((lo + hi) / 2) a)
+        (\a2 -> stoppedGo st f d ds ((lo + hi) / 2) hi a2)
+        r
+
+-- | the diagnostic of an elaboration that stopped: at the declaration
+-- | it stopped at, else at the start
+stopDiag : String -> String -> Maybe TopDecl -> Json
+stopDiag src why (Just t) =
+  diagnostic
+    src
+    (mkDiag
+       SError
+       t.name
+       ("heff could not finish checking this file: it stopped here ("
+        ^ why
+        ^ "); what follows is not checked"))
+stopDiag src why Nothing =
   diagnostic
     src
     (mkDiag
        SError
        zeroSpan
-       ("heff failed elaborating this file (" ^ why ^ "): a bug of heff's"))
+       ("heff could not finish checking this file (" ^ why ^ ")"))
 
--- (an elaboration that failed: said, and nothing kept of it)
-analysisOf : String -> Either String Analysed -> Analysed
-analysisOf src (Right a) = a
-analysisOf src (Left why) = mkAnalysed Nil [failureDiag src why]
+-- (the declarations before where it stopped, with the stop said)
+stoppedAnalysis : String -> String -> Stopped -> Analysed
+stoppedAnalysis src why s =
+  mkAnalysed
+    s.analysis.program
+    (List.append s.analysis.diags [stopDiag src why s.at])
+
+-- (an elaboration that stopped, of none of the declarations: in what the
+-- document imports, or its text before them)
+stoppedFrom : {e : HFunctor}
+            -> {{disk : filesystem <: e}}
+            -> {{wire : RPC.rpc <: e}}
+            -> St
+            -> String
+            -> Doc
+            -> String
+            -> List TopDecl
+            -> Either String Analysed
+            -> Co e Analysed
+stoppedFrom st f d why ds (Left _) =
+  pure (mkAnalysed Nil [stopDiag d.text why Nothing])
+stoppedFrom st f d why ds (Right a) = do
+  s <- stoppedGo st f d ds 0 (List.length ds) a
+  pure (stoppedAnalysis d.text why s)
+
+-- | a document whose elaboration stopped: what can be said of it
+stoppedAt : {e : HFunctor}
+          -> {{disk : filesystem <: e}}
+          -> {{wire : RPC.rpc <: e}}
+          -> St
+          -> String
+          -> Doc
+          -> String
+          -> Co e Analysed
+stoppedAt st f d why = do
+  r <-
+    RPC.attempt (\u -> analysedUpTo st f d (cutOf d.text (topDecls d.text) 0))
+  stoppedFrom st f d why (topDecls d.text) r
+
+-- (a document's elaboration, finished or not)
+analysisOr : {e : HFunctor}
+           -> {{disk : filesystem <: e}}
+           -> {{wire : RPC.rpc <: e}}
+           -> St
+           -> String
+           -> Doc
+           -> Either String Analysed
+           -> Co e Analysed
+analysisOr st f d (Right a) = pure a
+analysisOr st f d (Left why) = stoppedAt st f d why
 
 -- | elaborate a document open, and publish what is wrong with it; an
 -- | elaboration that fails is a diagnostic too
@@ -401,7 +629,7 @@ check st f = case Map.lookup st.docs f of
   Nothing -> pure st
   Just d -> do
     r <- RPC.attempt (\u -> analysed st f d)
-    a <- pure (analysisOf d.text r)
+    a <- analysisOr st f d r
     publish d.uri a.diags
     pure
         (withChecked
