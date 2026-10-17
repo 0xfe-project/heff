@@ -348,6 +348,36 @@ static V rpc_project_files(const char *root) {
   return l;
 }
 
+// A computation tried
+// ---------------------------------------------------------------------
+
+// (what a tried holds -- its computation, and what is done with how it
+// came out -- where `rpc_open` puts it, as std.reactor's provider takes
+// a begun)
+static V rpc_held[2];
+
+static V rpc_open_fn(V self, V *a) {
+  rpc_held[0] = a[0];
+  rpc_held[1] = a[1];
+  heff_drop(self);
+  return NTAG(TAG_MkUnit);
+}
+
+// (`c`, a computation of the world, run to its end, a failure caught --
+// an abandon, a case not provided for, the runtime's: `Right` its value,
+// or `Left` why, said on stderr too.  What it made before failing is
+// leaked, as `heff_try` leaves it; the depth of calls last is put back)
+static V rpc_attempt(V c) {
+  long dep = heff_dep;
+  V r;
+  const char *why = heff_try(c, heff_clo(heff_kept, 1, 0, NULL), &r);
+  heff_dep = dep;
+  if (!why) return heff_tag_n(TAG_Right, 1, &r);
+  fprintf(stderr, "heff lsp: failed: %s\n", why);
+  V w = heff_str_text(why);
+  return heff_tag_n(TAG_Left, 1, &w);
+}
+
 // The provider
 // ---------------------------------------------------------------------
 
@@ -406,6 +436,14 @@ static V heff_provider_rpc(V p, V k) {
     }
     free(s);
     x = heff_answer(f, r);
+    break;
+  }
+  case TAG_Attempt: {
+    V b = heff_dup(heff_field(p, 0));
+    heff_drop(p);
+    heff_drop(heff_answer(b, heff_clo(rpc_open_fn, 2, 0, NULL)));
+    V c = rpc_held[0], f = rpc_held[1];
+    x = heff_answer(f, rpc_attempt(c));
     break;
   }
   case TAG_Quit: {

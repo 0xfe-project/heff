@@ -4,7 +4,8 @@
 -- and go to definition (across modules, past non-ASCII text),
 -- completion, an outline, references and renaming across the project,
 -- doc tests (their errors, shown in a hover), splitting a variable into
--- cases, the module claim's quick fix and name, formatting, shutdown.
+-- cases, the module claim's quick fix and name, formatting, shutdown;
+-- and a file heff fails elaborating, said, the server answering on.
 -- The heff run is the one that runs the tests (`HEFF`), a server for
 -- each test: one on the project's files
 -- (`HEFF_TEST_ROOT`), their texts given it unsaved, as an editor's, and
@@ -1054,6 +1055,142 @@ modules name =
      let dir = here ^ "/modules"
      texts <- readAll dir ["src/a.hf", "qualified.hf"]
      session (modulesSteps dir (textIn texts))))
+
+-- A failure of heff's
+--------------------------------------------------------------------------------
+
+-- (a text heff fails elaborating -- an argument's type computed from
+-- what did not elaborate -- the same mended, and one that imports it)
+failingText : String
+failingText =
+  "module lsp-fail\n\napplied : (M : Type -> Type) -> M Int -> Int\napplied M v = 1\n\nx : Int\nx = applied (\\a -> 3) 2\n"
+
+mendedText : String
+mendedText =
+  "module lsp-fail\n\napplied : (M : Type -> Type) -> M Int -> Int\napplied M v = 1\n\nx : Int\nx = applied (\\a -> a) 2\n"
+
+importsFailing : String
+importsFailing = "module lsp-fail-user\n\nimport lsp-fail\n\ny : Int\ny = x\n"
+
+-- (an error said)
+saysError : JSON.Json -> Bool
+saysError m = List.any (\d -> intAt ["severity"] d == 1) (diagnostics m)
+
+-- (a response, not an error)
+answered : JSON.Json -> Bool
+answered m = strEq (writtenAt ["error"] m) "" && not (strEq (writtenAt ["result"] m) "")
+
+-- (the files changed on disk, told of)
+diskChanged : String -> Int -> Step
+diskChanged u kind =
+  Notify
+    "workspace/didChangeWatchedFiles"
+    (JSON.obj
+       [ JSON.kv
+         "changes"
+         (JArray
+            [JSON.obj [JSON.kv "uri" (JSON.jstr u), JSON.kv "type" (JSON.num kind)]])
+       ])
+
+-- | the session with a file heff fails elaborating -- once a crash of
+-- | the server: it is an error said of the file, every request on it, or
+-- | on a file that imports it, or on its project, answered, and the
+-- | server answers on
+failureSteps : String -> (String -> String) -> List Step
+failureSteps dir disk =
+  let u = uriIn dir
+  in let f = u "lsp-fail.hf"
+  in let user = u "lsp-fail-user.hf"
+  in let a = u "src/a.hf"
+  in let diskA = disk "src/a.hf"
+  in let spot = pos failingText "applied ("
+  in List.concatMap
+    (\x -> x)
+    [ initialized ("file://" ^ dir)
+    , [ Open f failingText
+      , Diagnostics f (check1 "a file heff fails elaborating: an error" saysError)
+      , hover f spot (check1 "a hover on it" answered)
+      , definition f spot (check1 "a definition on it" answered)
+      , completion f spot (check1 "a completion on it" answered)
+      , outline f (check1 "its outline" answered)
+      , references f spot True (check1 "references on it" answered)
+      , prepareRename f spot (check1 "a rename prepared on it" answered)
+      , Ask
+        "textDocument/codeAction"
+        (JSON.obj
+           [ JSON.kv "textDocument" (document f)
+           , JSON.kv
+             "range"
+             (JSON.obj
+                [ JSON.kv "start" (posJson (pos failingText "v ="))
+                , JSON.kv "end" (posJson (pos failingText "v ="))
+                ])
+           , JSON.kv "context" (JSON.obj [JSON.kv "diagnostics" (JArray Nil)])
+           ])
+        (check1 "code actions on it" answered)
+      , Ask
+        "textDocument/formatting"
+        (JSON.obj
+           [ JSON.kv "textDocument" (document f)
+           , JSON.kv
+             "options"
+             (JSON.obj
+                [ JSON.kv "tabSize" (JSON.num 2)
+                , JSON.kv "insertSpaces" (JBool True)
+                ])
+           ])
+        (check1 "formatting it" answered)
+      , Change f mendedText
+      , Diagnostics f (check1 "mended: no diagnostics" clean)
+      , hover
+        f
+        (pos mendedText "applied (")
+        (check1 "a hover, mended" (hoverSays ["applied"]))
+      , Change f failingText
+      , Diagnostics f (check1 "failing again: an error" saysError)
+      , Open user importsFailing
+      , Diagnostics
+        user
+        (check1 "a file importing one heff fails elaborating: an error" saysError)
+      , hover user (pos importsFailing "x") (check1 "a hover on that file" answered)
+      , Put (dir ^ "/lsp-fail-disk.hf") failingText
+      , diskChanged (u "lsp-fail-disk.hf") 1
+      , references
+        a
+        (pos diskA "inv :")
+        True
+        (check1 "references, a file of the project failing" answered)
+      , rename
+        a
+        (pos diskA "inv :")
+        "neg"
+        (check1 "a rename, a file of the project failing" answered)
+      , Ask
+        "workspace/symbol"
+        (JSON.obj [JSON.kv "query" (JSON.jstr "inv")])
+        (check1 "symbols, a file of the project failing" answered)
+      , Delete (dir ^ "/lsp-fail-disk.hf")
+      , diskChanged (u "lsp-fail-disk.hf") 3
+      , Close user
+      , Close f
+      ]
+    , shutDown
+    ]
+
+-- | the session with a file heff fails elaborating, in a copy of the
+-- | modules' project
+failing : String -> Test
+failing name =
+  within
+    300000
+    (integration name (do
+     root <- given "HEFF_TEST_ROOT"
+     working <- workingDir
+     let here = toString working
+     copiedFrom (root ^ "/test/modules") "failing"
+     let dir = here ^ "/failing"
+     texts <- readAll dir ["src/a.hf"]
+     session (failureSteps dir (textIn texts))))
 
 -- Files not saved
 --------------------------------------------------------------------------------
@@ -2342,4 +2479,5 @@ lsp =
     [ modules "modules"
     , unsaved "files not saved"
     , repository "the repository's files"
+    , failing "a file heff fails elaborating"
     ]
