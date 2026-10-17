@@ -908,6 +908,34 @@ static V fs_real_path(const char *path) {
   return fs_right(s);
 }
 
+// (what the link at `path` says, as it was written: `Right` it, or
+// `Left` why not -- not a link, EINVAL; on Windows, where links are not
+// seen, EINVAL)
+static V fs_read_link(const char *path) {
+#ifdef _WIN32
+  (void)path;
+  return fs_left(EINVAL);
+#else
+  size_t cap = 256;
+  for (;;) {
+    char *b = heff_alloc(cap);
+    ssize_t n = readlink(path, b, cap);
+    if (n < 0) {
+      int err = errno;
+      free(b);
+      return fs_left(err);
+    }
+    if ((size_t)n < cap) {
+      V s = heff_str_bytes(b, (int64_t)n);
+      free(b);
+      return fs_right(s);
+    }
+    free(b);
+    cap *= 2;
+  }
+#endif
+}
+
 // (`path`'s mode set: `Right MkUnit`, or `Left` why not)
 static V fs_set_mode(const char *path, int64_t mode) {
 #ifdef _WIN32
@@ -989,6 +1017,12 @@ static V heff_provider_filesystem(V p, V k) {
   case TAG_RealPath: {
     char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
     V r = path ? fs_real_path(path) : fs_left(EINVAL);
+    free(path);
+    return fs_answered(p, 1, r, k);
+  }
+  case TAG_ReadLink: {
+    char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
+    V r = path ? fs_read_link(path) : fs_left(EINVAL);
     free(path);
     return fs_answered(p, 1, r, k);
   }
