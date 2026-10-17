@@ -10,6 +10,7 @@
 - Instance search: a specialised goal is searched by its theory and parameters, then the found instance's fields are unified with the goal's (E0354). A field given by an instance argument not found yet waits for the search instead of failing with E0311.
 - Tuples: `()` is the unit and `(a, b)` a pair, `(a, b, c)` nesting right; each says its type (`Unit`, `Pair`), so `pure ()` needs no annotation. Where a type is expected, `()` is `Unit` and `(A, B)` is `Pair A B`, and types print so. The same forms are patterns, and patterns now bind in `p <- e`, `with e as p` and `\p -> e` as well as `let p = e`; a pattern there that can fail is non-exhaustive (E0317).
 - E0317 says `non-exhaustive pattern: no case provided for ...`.
+- `let p = e else s` in a `do` block: `p` may fail to match, and `s` runs where it does; `s` must leave the block, by `return`, `break`, `continue` or `abandon` (E0203 otherwise).
 
 ### Backends and performance
 

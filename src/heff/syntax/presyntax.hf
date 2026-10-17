@@ -225,14 +225,16 @@ data PiBinder t c
 -- | `p -> e`
 data Alt e = MkAlt Pat e
 
--- | a statement of a `do` block: `x <- e`, `let p = e`, `e`, and `let
--- | mut x = e` (the name, where it is, what it is first; `let mut x : T =
--- | e` holds `(e : T)`)
+-- | a statement of a `do` block: `x <- e`, `let p = e`, `e`, `let mut x
+-- | = e` (the name, where it is, what it is first; `let mut x : T = e`
+-- | holds `(e : T)`), and `let p = e else s` (the statements where `e`
+-- | does not match `p`)
 data Stmt e
   = StmtBind String Params.Span e
   | StmtLet Pat e
   | StmtExpr e
   | StmtLetMut String Params.Span e
+  | StmtLetElse Pat e (List (Params.Spanned (Stmt e)))
 
 -- | statements, a block's or an arm's
 type Stmts e = List (Params.Spanned (Stmt e))
@@ -844,6 +846,13 @@ stmtAcc f st (At (StmtExpr e) sp) =
   pairK (f st e) (\st1 e' -> MkPair st1 (At (StmtExpr e') sp))
 stmtAcc f st (At (StmtLetMut x xsp e) sp) =
   pairK (f st e) (\st1 e' -> MkPair st1 (At (StmtLetMut x xsp e') sp))
+stmtAcc f st (At (StmtLetElse p e ss) sp) =
+  pairK
+    (f st e)
+    (\st1 e' ->
+       pairK
+         (accList (stmtAcc f) st1 ss)
+         (\st2 ss' -> MkPair st2 (At (StmtLetElse p e' ss') sp)))
 
 altAcc : {s : Type}
        -> (s -> Expr -> Pair s Expr)
@@ -1204,6 +1213,7 @@ stmtNeeds ctl (At (StmtExpr e) _) = ctl e || hasNest e
 stmtNeeds ctl (At (StmtBind _ _ e) _) = hasNest e
 stmtNeeds ctl (At (StmtLet _ e) _) = hasNest e
 stmtNeeds ctl (At (StmtLetMut _ _ _) _) = True
+stmtNeeds ctl (At (StmtLetElse _ _ _) _) = True
 
 armNeeds : (Expr -> Bool) -> Params.Spanned (Alt Expr) -> Bool
 armNeeds ctl (At (MkAlt _ b) _) = List.any (stmtNeeds ctl) (armStmts b)
@@ -1785,6 +1795,44 @@ controlT t cx (At (EWith w x xsp body) sp) rest end =
 controlT t cx e rest end =
   hoist cx e (\e' -> doBind cx e' "_" cx.sp (t.stmts cx rest end))
 
+-- (an `else` that may go on past its `let`)
+elseFalls : String
+elseFalls =
+  "the `else` of `let p = e else ...` must leave the block: end it with `return`, `break`, `continue` or `abandon`; for a value, use `if let`"
+
+-- | whether statements leave the block, the loop's turn or the loop:
+-- | they end with `return`, `break`, `continue` or `abandon`, or an `if`
+-- | or `case` (a `try`, a `with`) whose every way does
+stmtsLeave : List (Params.Spanned (Stmt Expr)) -> Bool
+stmtsLeave ss = case List.last ss of
+  Just (At (StmtExpr e) _) -> leaves e
+  _ -> False
+  where
+  leaves : Expr -> Bool
+  leaves (At EBreak _) = True
+  leaves (At EContinue _) = True
+  leaves (At (EReturn _) _) = True
+  leaves (At (EWord AbandonWord) _) = True
+  leaves (At (EMatch s alts) sp) =
+    List.all (\a -> stmtsLeave (snd (altStmts a))) alts
+  leaves (At (EIfLet p s a (Just b)) sp) = leaves (ifLetOf sp p s a b)
+  leaves (At (ETry (MkTry _ body c)) _) =
+    stmtsLeave body && stmtsLeave (catchStmts c)
+  leaves (At (EWith _ _ _ body) _) = stmtsLeave body
+  leaves _ = False
+
+-- | the statements of a `let ... else`, where its pattern does not
+-- | match: they must leave (`stmtsLeave`), never go on to what follows
+-- | the `let`; else refused, at the last of them
+elseLeaving : Params.Span
+            -> List (Params.Spanned (Stmt Expr))
+            -> List (Params.Spanned (Stmt Expr))
+elseLeaving sp ss =
+  if stmtsLeave ss then ss
+  else case List.last ss of
+    Just (At _ esp) -> [At (StmtExpr (badE esp elseFalls)) esp]
+    Nothing -> [At (StmtExpr (badE sp elseFalls)) sp]
+
 -- | the last statement, whose value is the block's
 lastT : DoT -> DoCx -> Params.Spanned (Stmt Expr) -> Expr
 lastT t cx (At (StmtExpr e) sp) =
@@ -1827,6 +1875,19 @@ stmtT t cx (At (StmtBind x xsp e) sp) rest end =
 stmtT t cx (At (StmtLet p e) lsp) rest end = case firstMut cx (patNames p) of
   Just x -> badE (Params.spanOf p) (mutClash x)
   Nothing -> hoist cx e (\e' -> letStmt lsp e' p (t.stmts cx rest end))
+stmtT t cx (At (StmtLetElse p e els) lsp) rest end = case firstMut
+    cx
+    (patNames p) of
+  Just x -> badE (Params.spanOf p) (mutClash x)
+  Nothing ->
+    condT
+      t
+      cx
+      lsp
+      e
+      [MkPair p rest, MkPair (At (PatVar "_") lsp) (elseLeaving lsp els)]
+      Nil
+      end
 stmtT t cx (At (StmtLetMut x xsp e) sp) rest end =
   if isMut cx x then badE xsp (mutClash x)
   else hoist
