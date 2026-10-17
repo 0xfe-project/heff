@@ -16,10 +16,11 @@
 -- Nothing else is read: no definition but `package`, no expression but
 -- a literal.  A field that has a default in the manifest's type may be left
 -- out, as there (`require` and `replace` are empty lists, a build.hf's
--- `ships` too).  What is read is checked: a version is `a.b.c`, a required
--- package's path ends in `/vN` when its version's major N is 2 or more
--- (and only then), names are not required twice, a replaced name is
--- required.
+-- `ships` too).  What is read is checked: a version is `a.b.c` (a
+-- required one may be a commit's pseudo-version, `N.0.0-TIME-COMMIT`), a
+-- required package's path ends in `/vN` when its version's major N is 2
+-- or more (and only then), names are not required twice, a replaced name
+-- is required.
 
 module heff.build.project
 
@@ -253,6 +254,65 @@ version v = case split "." v of
     else Nothing
   _ -> Nothing
 
+-- (the bytes of a pseudo-version's time, and of its commit)
+isDigit : Int -> Bool
+isDigit c = 48 <= c && c <= 57
+
+isHex : Int -> Bool
+isHex c = isDigit c || (97 <= c && c <= 102)
+
+allBytes : (Int -> Bool) -> String -> Bool
+allBytes ok s = List.all (\i -> ok (byteAt s i)) (rangeFrom 0 (strLength s))
+
+-- (a pseudo-version's base: `N.0.0`)
+isPseudoBase : Maybe (List Int) -> Bool
+isPseudoBase (Just (Cons _ (Cons b (Cons c Nil)))) = b == 0 && c == 0
+isPseudoBase _ = False
+
+pseudoParts : List String -> Maybe (Pair String String)
+pseudoParts (Cons base (Cons time (Cons commit Nil))) =
+  if isPseudoBase (version base)
+     && strLength time == 14
+     && allBytes isDigit time
+     && strLength commit == 12
+     && allBytes isHex commit
+  then Just (MkPair time commit)
+  else Nothing
+pseudoParts _ = Nothing
+
+-- | a pseudo-version's commit, if it is one: `N.0.0-TIME-COMMIT`, what
+-- | `heff get` records for a commit no tag is on -- its time (UTC,
+-- | `YYYYMMDDhhmmss`) and the first 12 hex digits of its hash
+pseudoCommit : String -> Maybe (Pair String String)
+pseudoCommit v = pseudoParts (split "-" v)
+
+-- (a version's numbers, and what orders versions of the same numbers:
+-- "" for a release, a pseudo-version's time and commit before it)
+keyFrom : String -> Maybe (Pair String String) -> Pair (List Int) String
+keyFrom v (Just (MkPair time commit)) =
+  MkPair
+    (fromMaybe Nil (version (strSlice v 0 (strFind "-" v 0))))
+    (time ^ "-" ^ commit)
+keyFrom v Nothing = MkPair (fromMaybe Nil (version v)) ""
+
+versionKey : String -> Pair (List Int) String
+versionKey v = keyFrom v (pseudoCommit v)
+
+-- | a version a package is required at: `a.b.c`, a release, or a
+-- | commit's pseudo-version
+-- | >>> isVersion "1.2.0"
+-- | True
+-- | >>> isVersion "0.0.0-20261017093000-3fa9c1e2b4d7"
+-- | True
+-- | >>> isVersion "0.1.0-20261017093000-3fa9c1e2b4d7"
+-- | False
+-- | >>> isVersion "0.0.0-20261017093000-3fa9c1e2b4"
+-- | False
+-- | >>> isVersion "main"
+-- | False
+isVersion : String -> Bool
+isVersion v = List.length (fst (versionKey v)) == 3
+
 -- | a heff of version `running` builds a project written for `wanted`:
 -- | the same major, and not older; under 1.0.0, the same minor
 -- | >>> compatible [0, 1, 0] [0, 1, 3]
@@ -430,7 +490,7 @@ nameOf x = case str x of
 -- | `/vN` and the version's major disagree
 majorMismatch : String -> String -> Maybe String
 majorMismatch path v = case majorSuffix
-    (fromMaybe 0 (headM (fromMaybe Nil (version v)))) of
+    (fromMaybe 0 (headM (fst (versionKey v)))) of
   Just suffix ->
     if strEq (lastPart path) suffix then Nothing
     else Just ("version " ^ v ^ " is fetched from a path ending in /" ^ suffix)
@@ -448,6 +508,17 @@ pathFor x v = case str x of
     Just why -> Left (problemAt (litTok x) why)
     Nothing -> Right path
 
+-- (a version required: a release, or a commit's pseudo-version)
+requiredOf : Lit -> Check String
+requiredOf x = case str x of
+  Left p -> Left p
+  Right v ->
+    if isVersion v then Right v
+    else Left
+        (problemAt
+           (litTok x)
+           ("`" ^ v ^ "` is no version: write `a.b.c`, three numbers"))
+
 requireOf : Lit -> Check Require
 requireOf x = case fieldsAre
     [required "name", required "path", required "version"]
@@ -455,7 +526,7 @@ requireOf x = case fieldsAre
   Left p -> Left p
   Right (Cons n (Cons p (Cons v Nil))) -> case nameOf n of
     Left e -> Left e
-    Right name -> case versionOf v of
+    Right name -> case requiredOf v of
       Left e -> Left e
       Right ver -> case pathFor p ver of
         Left e -> Left e
@@ -800,13 +871,51 @@ newerGo : List Int -> List Int -> Bool
 newerGo (Cons x xs) (Cons y ys) = x > y || (x == y && newerGo xs ys)
 newerGo _ _ = False
 
--- | version `a` is newer than `b`
+-- (of the same numbers: a release is newer than a pseudo-version, and
+-- pseudo-versions are ordered by time, then commit)
+laterOf : String -> String -> Bool
+laterOf a b =
+  if strEq a "" then not (strEq b "") else not (strEq b "") && strLt b a
+
+newerKey : Pair (List Int) String -> Pair (List Int) String -> Bool
+newerKey (MkPair xs a) (MkPair ys b) =
+  newerGo xs ys || (not (newerGo ys xs) && laterOf a b)
+
+-- | version `a` is newer than `b`; a pseudo-version `N.0.0-TIME-COMMIT`
+-- | is older than release `N.0.0`
 -- | >>> newer "1.10.0" "1.9.3"
 -- | True
 -- | >>> newer "1.2.0" "1.2.0"
 -- | False
+-- | >>> newer "0.0.1" "0.0.0-20261017093000-3fa9c1e2b4d7"
+-- | True
+-- | >>> newer "0.0.0" "0.0.0-20261017093000-3fa9c1e2b4d7"
+-- | True
+-- | >>> newer "0.0.0-20261017093000-3fa9c1e2b4d7" "0.0.0-20261016093000-ffffffffffff"
+-- | True
+-- | >>> newer "0.0.0-20261017093000-3fa9c1e2b4d7" "0.0.0-20261017093000-3fa9c1e2b4d8"
+-- | False
+-- | >>> newer "2.0.0-20261017093000-3fa9c1e2b4d7" "1.9.0"
+-- | True
 newer : String -> String -> Bool
-newer a b = newerGo (fromMaybe Nil (version a)) (fromMaybe Nil (version b))
+newer a b = newerKey (versionKey a) (versionKey b)
+
+-- | the pseudo-version of a commit of the package at `path`, by its time
+-- | (UTC, `YYYYMMDDhhmmss`) and hash: of the path's major, `N.0.0-...`
+-- | for a path ending in `/vN`, else `0.0.0-...`
+-- | >>> pseudoVersion "x.org/j" "20261017093000" "3fa9c1e2b4d7a0b1c2d3e4f5a6b7c8d9e0f1a2b3"
+-- | "0.0.0-20261017093000-3fa9c1e2b4d7"
+-- | >>> pseudoVersion "x.org/j/v2" "20261017093000" "3fa9c1e2b4d7a0b1c2d3e4f5a6b7c8d9e0f1a2b3"
+-- | "2.0.0-20261017093000-3fa9c1e2b4d7"
+pseudoVersion : String -> String -> String -> String
+pseudoVersion path time hash =
+  (if isMajorPart (lastPart path)
+   then strSlice (lastPart path) 1 (strLength (lastPart path))
+   else "0")
+  ^ ".0.0-"
+  ^ time
+  ^ "-"
+  ^ strSlice hash 0 12
 
 -- | the repository a package is fetched from: its path, without a `/vN`
 -- | (each major is a tag of the one repository)
@@ -821,9 +930,11 @@ repoOf path =
 -- heff.sum
 --------------------------------------------------------------------------------
 -- A line for each version of a package the project reaches, fetched (not
--- replaced): its path, its version, and the git tree its tag is of --
+-- replaced): its path, its version, and the git tree its tag (or, for a
+-- pseudo-version, its commit) is of --
 --
 --   github.com/x/json 1.2.0 tree:4b825dc642cb6eb9a060e54bf8d69288fbee4904
+--   github.com/x/yaml 0.0.0-20261017093000-3fa9c1e2b4d7 tree:9a0b...
 --
 -- A tag moved to another tree since is an error.
 
@@ -832,10 +943,9 @@ type Sum = { path : String, version : String, hash : String }
 sumLine : Int -> String -> Check (List Sum)
 sumLine at line = case words line of
   Nil -> Right Nil
-  Cons p (Cons v (Cons h Nil)) -> case version v of
-    Just _ -> Right [{ path = p, version = v, hash = h }]
-    Nothing ->
-      Left { at = at, msg = "`" ^ v ^ "` is no version: write `a.b.c`" }
+  Cons p (Cons v (Cons h Nil)) ->
+    if isVersion v then Right [{ path = p, version = v, hash = h }]
+    else Left { at = at, msg = "`" ^ v ^ "` is no version: write `a.b.c`" }
   _ ->
     Left
       { at = at

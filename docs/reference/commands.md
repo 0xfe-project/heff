@@ -10,7 +10,7 @@ title: Commands
 | `heff test [FILE...]` | check doc tests and watches, and run tests; no FILE: `src/` and `test/` |
 | `heff bench [FILE...]` | run benchmarks; no FILE: `bench/` |
 | `heff install [DIR]` | build the project to run fastest, into `~/.heff/bin/` |
-| `heff get [PATH[@VERSION]]` | fetch the packages required; with PATH, require it first |
+| `heff get [PATH[@VERSION]]` | fetch the packages required; with PATH, require it first: at VERSION, a branch's or a commit's pseudo-version, else its newest |
 | `heff publish VERSION` | check the project, tag it `vVERSION`, and push the tag |
 | `heff dev [APP...]` | build, run and serve the project, again at each change |
 | `heff fmt [--check] FILE...` | format files in place |

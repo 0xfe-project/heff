@@ -1134,6 +1134,187 @@ getting name =
        && contains "its tag has been moved" moved.err)
       [moved])
 
+-- | a commit of a package fetched from git, `https://PATH`, no tag on
+-- | it: these files written to its repository under `remotes/` (made on
+-- | a branch `trunk`), committed at `date`
+untagged : {e : HFunctor}
+         -> {{chk : check <: e}}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> String
+         -> List (Pair String String)
+         -> String
+         -> Co e Unit
+untagged path files date = do
+  let dir = "remotes/" ^ path
+  writeAll dir files
+  there <- exists (dir ^ "/.git")
+  made <-
+    if there then git dir ["status", "-s"]
+    else git dir ["init", "-q", "-b", "trunk"]
+  added <- git dir ["add", "-A"]
+  done <-
+    runIn
+      dir
+      [MkPair "GIT_COMMITTER_DATE" date, MkPair "GIT_AUTHOR_DATE" date]
+      "git"
+      ["commit", "-q", "-m", date]
+  holds
+      ("the remote " ^ path ^ " at " ^ date)
+      (succeeded done)
+      [made, added, done]
+
+-- (the first 12 hex digits of the commit a remote's `rev` is)
+commitOf : {e : HFunctor} -> {{sys : process <: e}} -> String -> String -> Co e String
+commitOf path rev = do
+  r <- git ("remotes/" ^ path) ["rev-parse", rev]
+  pure (strSlice (trim r.out) 0 12)
+
+-- (a package.hf's version of `path`)
+versionIn : String -> String -> String
+versionIn path pkg = between "version = \"" "\"" (between path "}" pkg)
+
+-- | get, where no tag is a version: the default branch's commit, a
+-- | branch's or a commit's, required at its pseudo-version
+-- | (`0.0.0-TIME-COMMIT`, `2.0.0-...` of a `/v2` path), older than every
+-- | release; heff.sum the commit's tree, checked when it is fetched again
+pseudoGetting : String -> Test
+pseudoGetting name =
+  integration name (do
+  v <- heffVersion
+  untagged
+      "x.org/pre"
+      [ MkPair "package.hf" (typed v "x.org/pre" Nil)
+      , MkPair "src/lib/encode.hf" (encodeAs "<" ">")
+      ]
+      "2026-10-17T17:30:00+08:00"
+  first <- commitOf "x.org/pre" "HEAD"
+  let firstV = "0.0.0-20261017093000-" ^ first
+  write "pre/package.hf" (typed v "x.org/user" Nil)
+  write
+      "pre/src/user/main.hf" "module user.main\n\nimport lib.encode\n\n-- >>> encode \"hi\"\n-- \"<hi>\"\n"
+  got <- heffIn "pre" ["get", "x.org/pre"]
+  pkg <- textOf "pre/package.hf"
+  sum <- textOf "pre/heff.sum"
+  gitThere <- exists ("mod/x.org/pre@" ^ firstV ^ "/.git")
+  tested <- heffIn "pre" ["test", "src/user/main.hf"]
+  holdsOf
+      "get PATH, no tag: the default branch's commit, at its pseudo-version"
+      (succeeded got
+       && contains ("package.hf requires x.org/pre " ^ firstV) got.out
+       && strEq (versionIn "x.org/pre" pkg) firstV
+       && matching ("^x\\.org/pre " ^ firstV ^ " tree:[0-9a-f]+\n$") sum
+       && not gitThere
+       && succeeded tested)
+      (said got ^ pkg ^ sum ^ said tested)
+  onDev <- git "remotes/x.org/pre" ["checkout", "-q", "-b", "dev"]
+  untagged
+      "x.org/pre"
+      [MkPair "src/lib/encode.hf" (encodeAs "[" "]")]
+      "2026-10-18T09:30:00Z"
+  dev <- commitOf "x.org/pre" "dev"
+  let devV = "0.0.0-20261018093000-" ^ dev
+  onTrunk <- git "remotes/x.org/pre" ["checkout", "-q", "trunk"]
+  getDev <- heffIn "pre" ["get", "x.org/pre@dev"]
+  devPkg <- textOf "pre/package.hf"
+  holds
+      "get PATH@BRANCH: the branch's commit"
+      (succeeded getDev && strEq (versionIn "x.org/pre" devPkg) devV)
+      [onDev, onTrunk, getDev]
+  getCommit <- heffIn "pre" ["get", "x.org/pre@" ^ strSlice first 0 7]
+  commitPkg <- textOf "pre/package.hf"
+  holds
+      "get PATH@COMMIT: the commit"
+      (succeeded getCommit && strEq (versionIn "x.org/pre" commitPkg) firstV)
+      [getCommit]
+  noBranch <- heffIn "pre" ["get", "x.org/pre@gone"]
+  noCommit <- heffIn "pre" ["get", "x.org/pre@abcdef0"]
+  noRepo <- heffIn "pre" ["get", "x.org/nowhere@dev"]
+  holds
+      "get PATH@REV, no such branch, commit or repository"
+      (exitedWith 1 noBranch
+       && contains "heff get: no branch gone of https://x.org/pre" noBranch.err
+       && exitedWith 1 noCommit
+       && contains
+         "heff get: no commit abcdef0 of https://x.org/pre"
+         noCommit.err
+       && exitedWith 1 noRepo
+       && contains
+         "heff get: cannot list the commits of https://x.org/nowhere"
+         noRepo.err)
+      [noBranch, noCommit, noRepo]
+  write "pre/heff.sum" (tampered ("x.org/pre " ^ firstV ^ " tree:") sum)
+  removed "mod"
+  refetched <- heffIn "pre" ["get"]
+  holds
+      "get: a pseudo-version fetched again, its tree what heff.sum says"
+      (exitedWith 1 refetched
+       && contains ("x.org/pre " ^ firstV ^ " is tree:") refetched.err
+       && contains "and heff.sum says tree:" refetched.err
+       && contains "its commit is another" refetched.err)
+      [refetched]
+  write "pre/heff.sum" sum
+  remote "x.org/pre" [MkPair "src/lib/encode.hf" (encodeAs "{" "}")] "v0.1.0"
+  getTag <- heffIn "pre" ["get", "x.org/pre"]
+  tagPkg <- textOf "pre/package.hf"
+  holds
+      "get PATH, a tag since: the tag"
+      (succeeded getTag && strEq (versionIn "x.org/pre" tagPkg) "0.1.0")
+      [getTag]
+  remote
+      "x.org/mid"
+      [ MkPair
+        "package.hf"
+        (typed v "x.org/mid" [fetched "lib" "x.org/pre" "0.1.0"])
+      , MkPair
+        "src/mid/m.hf" "module mid.m\n\nimport lib.encode\n\ntwice : String -> String\ntwice s = encode (encode s)\n"
+      ]
+      "v1.0.0"
+  write
+      "mvs/package.hf"
+      (typed
+         v
+         "x.org/mvs"
+         [fetched "lib" "x.org/pre" devV, fetched "mid" "x.org/mid" "1.0.0"])
+  write
+      "mvs/src/mvs/main.hf" "module mvs.main\n\nimport lib.encode\n\n-- >>> encode \"hi\"\n-- \"{hi}\"\n"
+  mvsGot <- heffIn "mvs" ["get"]
+  mvsSum <- textOf "mvs/heff.sum"
+  mvsTested <- heffIn "mvs" ["test", "src/mvs/main.hf"]
+  holdsOf
+      "get: a release newer than a pseudo-version"
+      (succeeded mvsGot
+       && contains "heff get: 2 packages, heff.sum written" mvsGot.out
+       && matching
+         ("^x\\.org/mid 1\\.0\\.0 tree:[0-9a-f]+\nx\\.org/pre "
+          ^ devV
+          ^ " tree:[0-9a-f]+\nx\\.org/pre 0\\.1\\.0 tree:[0-9a-f]+\n$")
+         mvsSum
+       && succeeded mvsTested)
+      (said mvsGot ^ mvsSum ^ said mvsTested)
+  untagged
+      "x.org/two"
+      [ MkPair "package.hf" (typed v "x.org/two/v2" Nil)
+      , MkPair "src/two/m.hf" "module two.m\n"
+      ]
+      "2026-10-17T09:30:00Z"
+  two <- commitOf "x.org/two" "HEAD"
+  getTwo <- heffIn "pre" ["get", "x.org/two/v2"]
+  twoPkg <- textOf "pre/package.hf"
+  holds
+      "get PATH/v2, no tag: a pseudo-version of major 2"
+      (succeeded getTwo
+       && strEq
+         (versionIn "x.org/two/v2" twoPkg)
+         ("2.0.0-20261017093000-" ^ two))
+      [getTwo]
+  getNotTwo <- heffIn "pre" ["get", "x.org/two"]
+  holds
+      "get PATH, its commit of another major"
+      (exitedWith 1 getNotTwo
+       && contains "is the package x.org/two/v2, not x.org/two" getNotTwo.err)
+      [getNotTwo])
+
 -- Building and installing
 --------------------------------------------------------------------------------
 
@@ -1594,6 +1775,7 @@ project =
     , packageErrors "packages that are wrong"
     , publishing "publish"
     , getting "get"
+    , pseudoGetting "get, pseudo-versions"
     , building "build and install"
     , running "install, the program running meanwhile"
     , installHeff "install heff"

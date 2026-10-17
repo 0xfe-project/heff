@@ -68,9 +68,22 @@ letters, digits and `_`.
 - `heff get` fetches each required package by git, from its path, into
   `~/.cache/heff/mod`, and records each version's git tree in
   `heff.sum`.
-- Versions are `a.b.c`. When several versions of a package are
-  required, heff picks as Go's minimal version selection does.
-- `heff get PATH[@VERSION]` adds a requirement and fetches it.
+- Versions are `a.b.c`, each a tag `va.b.c`. When several versions of
+  a package are required, heff picks as Go's minimal version selection
+  does.
+- `heff get PATH[@VERSION]` adds a requirement and fetches it. With no
+  VERSION it takes the newest tag of the path's major.
+- Where no tag is a version, `heff get PATH` takes the default branch's
+  latest commit, at a pseudo-version: `0.0.0-TIME-COMMIT`, the commit's
+  time (UTC, `YYYYMMDDhhmmss`) and the first 12 hex digits of its hash,
+  as `0.0.0-20261017093000-3fa9c1e2b4d7`. A path ending in `/vN` gets
+  `N.0.0-TIME-COMMIT`. `heff get PATH@BRANCH` and `heff get PATH@COMMIT`
+  (7 or more hex digits of its hash) take that commit the same way.
+- A pseudo-version is older than every release of its major, so
+  `0.0.0-...` is older than `0.0.1`; between pseudo-versions the later
+  commit is newer. Once the package is tagged, `heff get PATH` takes the
+  tag. `heff.sum` records a pseudo-version's tree as a tag's, and
+  fetching it checks out that very commit.
 - A replaced package is read from its directory. Its own `package.hf`
   must have the `module` its `require` names.
 
