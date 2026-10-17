@@ -1,0 +1,444 @@
+-- std.stm among green threads, on the uses it is for, each program's
+-- store a shape of its own: money moved between accounts, the total the
+-- same however the transfers interleave; a bounded queue whose take
+-- waits while it is empty and put while it is full, counting what it
+-- took in a position of another type, in the same transaction; a
+-- consumer taking from whichever of two queues has something
+-- (`orElse`); five philosophers sharing five forks; a table of counts
+-- many threads add to; what an `orElse` undid; every thread waiting;
+-- and a thread woken by the write it waits for.  Each scheduled on its
+-- store and nothing else (`runGreen`), in the language.
+
+module test.programs.stm
+
+import co
+import green
+import std.map as Map
+import std.stm
+
+-- (the `i`th of the list)
+nth : {a : Type} -> List a -> Int -> a
+nth xs i = case List.head (List.drop i xs) of
+  Just x -> x
+  Nothing -> abandon
+
+-- (`n` times, each a value)
+times : {e : HFunctor} -> {a : Type} -> Int -> Co e a -> Co e (List a)
+times 0 c = pure Nil
+times n c = do
+  x <- c
+  rest <- times (n - 1) c
+  pure (x :: rest)
+
+-- (`c i` for each `i` of 0 to n - 1, in a thread of its own)
+spawnEach : {e : HFunctor}
+          -> {{gr : green <: e}}
+          -> Int
+          -> (Int -> Co e Unit)
+          -> Co e Unit
+spawnEach n c = do
+  for i in List.range 0 (n - 1) do
+    spawn (c i)
+
+-- (the next of a sequence of numbers that look random)
+nextRandom : Int -> Int
+nextRandom x = (x * 1103515245 + 12345) % 2147483648
+
+-- (waits until `n` threads have said they are done on `ch`)
+joined : {e : HFunctor} -> {{gr : green <: e}} -> Int -> Int -> Co e Unit
+joined ch 0 = pure ()
+joined ch n = do
+  _ <- recv ch
+  joined ch (n - 1)
+
+-- (what came of it, or that every thread waits)
+shownOr : {a : Type} -> (a -> String) -> Maybe a -> String
+shownOr sh (Just x) = sh x
+shownOr sh Nothing = "every thread waits"
+
+-- A bank
+--------------------------------------------------------------------------------
+
+-- | Eight accounts.
+type Accounts = (Int, Int, Int, Int, Int, Int, Int, Int)
+
+accounts : List (TVar Accounts Int)
+accounts =
+  [ fstOf (fstOf (fstOf (fstOf (fstOf (fstOf (fstOf whole))))))
+  , sndOf (fstOf (fstOf (fstOf (fstOf (fstOf (fstOf whole))))))
+  , sndOf (fstOf (fstOf (fstOf (fstOf (fstOf whole)))))
+  , sndOf (fstOf (fstOf (fstOf (fstOf whole))))
+  , sndOf (fstOf (fstOf (fstOf whole)))
+  , sndOf (fstOf (fstOf whole))
+  , sndOf (fstOf whole)
+  , sndOf whole
+  ]
+
+-- | Each holding 100.
+opened : Accounts
+opened = (100, 100, 100, 100, 100, 100, 100, 100)
+
+-- | Up to `n` moved, as much as there is.
+transfer : {s : Type} -> TVar s Int -> TVar s Int -> Int -> Co (stm s) Unit
+transfer from to n = do
+  have <- readTVar from
+  let moved = min have n
+  writeTVar from (have - moved)
+  modifyTVar to (\m -> m + moved)
+
+-- | The total of the accounts.
+total : {s : Type} -> List (TVar s Int) -> Co (stm s) Int
+total Nil = pure 0
+total (t :: ts) = do
+  v <- readTVar t
+  rest <- total ts
+  pure (v + rest)
+
+-- (a clerk's transfers, between accounts drawn from `seed`)
+clerk : {e : HFunctor}
+      -> {{gr : green <: e}}
+      -> {{st : stored Accounts <: e}}
+      -> Int
+      -> Int
+      -> Co e Unit
+clerk seed 0 = pure ()
+clerk seed k = do
+  let r = nextRandom seed
+  atomically
+      (transfer
+         (nth accounts (r % 8))
+         (nth accounts ((r / 8) % 8))
+         ((r / 64) % 40))
+  yield
+  clerk r (k - 1)
+
+-- (an auditor, adding the accounts up `n` times between the clerks'
+-- transfers: how many totals were wrong)
+audit : {e : HFunctor}
+      -> {{gr : green <: e}}
+      -> {{st : stored Accounts <: e}}
+      -> Int
+      -> Int
+      -> Co e Int
+audit wrong 0 = pure wrong
+audit wrong n = do
+  t <- atomically (total accounts)
+  yield
+  audit (if t == 800 then wrong else wrong + 1) (n - 1)
+
+-- | Six clerks making 50 transfers each, an auditor adding the accounts
+-- | up meanwhile: the total, and how many of the auditor's were wrong.
+banking : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{st : stored Accounts <: e}}
+        -> Co e (Int, Int)
+banking = do
+  ch <- newChan
+  spawnEach 6 (\i -> do
+    clerk (i + 1) 50
+    send ch i)
+  wrong <- audit 0 100
+  joined ch 6
+  t <- atomically (total accounts)
+  pure (t, wrong)
+
+showPair : (Int, Int) -> String
+showPair (a, b) = show a ^ " " ^ show b
+
+-- | The total and the wrong totals.
+-- | >>> bank
+-- | "800 0"
+bank : String
+bank = shownOr showPair (runGreen opened banking)
+
+-- A bounded queue, and two
+--------------------------------------------------------------------------------
+
+-- | A queue of at most `cap` numbers: `x` put at its back, waiting while
+-- | it is full.
+put : {s : Type} -> Int -> TVar s (List Int) -> Int -> Co (stm s) Unit
+put cap q x = do
+  xs <- readTVar q
+  if List.length xs >= cap then retry else writeTVar q (xs ++ [x])
+
+taken : {s : Type}
+      -> TVar s (List Int)
+      -> TVar s Int
+      -> List Int
+      -> Co (stm s) Int
+taken q n Nil = retry
+taken q n (x :: rest) = do
+  writeTVar q rest
+  modifyTVar n (\k -> k + 1)
+  pure x
+
+-- | The front of the queue, waiting while it is empty; one more counted
+-- | taken.
+take : {s : Type} -> TVar s (List Int) -> TVar s Int -> Co (stm s) Int
+take q n = bind (readTVar q) (taken q n)
+
+-- (a producer putting `from` to `to`)
+producer : {s : Type}
+         -> {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{st : stored s <: e}}
+         -> TVar s (List Int)
+         -> Int
+         -> Int
+         -> Co e Unit
+producer q from to =
+  if from > to then pure ()
+  else do
+    atomically (put 3 q from)
+    producer q (from + 1) to
+
+-- (`n` taken by `c`, added up)
+consumed : {e : HFunctor} -> Int -> Co e Int -> Co e Int
+consumed n c = bind (times n c) (\xs -> pure (List.sum xs))
+
+-- | A queue, and how many were taken from it.
+type Queue = (List Int, Int)
+
+queue : TVar Queue (List Int)
+queue = left
+
+takenCount : TVar Queue Int
+takenCount = right
+
+-- | Three producers putting 20 each on a queue of three, main taking
+-- | them: their sum, how many were taken, and how many are left.
+queuing : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{st : stored Queue <: e}}
+        -> Co e (Int, Int, Int)
+queuing = do
+  spawnEach 3 (\i -> producer queue (i * 100 + 1) (i * 100 + 20))
+  s <- consumed 60 (atomically (take queue takenCount))
+  rest <- atomically (readTVar queue)
+  k <- atomically (readTVar takenCount)
+  pure (s, k, List.length rest)
+
+showQueued : (Int, Int, Int) -> String
+showQueued (s, k, rest) = show s ^ ", taken " ^ show k ^ ", left " ^ show rest
+
+-- | >>> queued
+-- | "6630, taken 60, left 0"
+queued : String
+queued = shownOr showQueued (runGreen (Nil, 0) queuing)
+
+-- | Two queues, and how many were taken from them.
+type Queues = (List Int, List Int, Int)
+
+queueA : TVar Queues (List Int)
+queueA = first
+
+queueB : TVar Queues (List Int)
+queueB = second
+
+takenAB : TVar Queues Int
+takenAB = third
+
+-- | Two queues, a producer on each, main taking from whichever has
+-- | something: the sum.
+eitherQueue : {e : HFunctor}
+            -> {{gr : green <: e}}
+            -> {{st : stored Queues <: e}}
+            -> Co e Int
+eitherQueue = do
+  spawn (producer queueA 1 10)
+  spawn (producer queueB 101 110)
+  consumed 20 (atomically (orElse (take queueA takenAB) (take queueB takenAB)))
+
+-- | >>> either
+-- | "1110"
+either : String
+either = shownOr show (runGreen (Nil, Nil, 0) eitherQueue)
+
+-- Dining philosophers
+--------------------------------------------------------------------------------
+
+-- | Five forks, each on the table (True) or not.
+type Forks = (Bool, Bool, Bool, Bool, Bool)
+
+forks : List (TVar Forks Bool)
+forks =
+  [ fstOf (fstOf (fstOf (fstOf whole)))
+  , sndOf (fstOf (fstOf (fstOf whole)))
+  , sndOf (fstOf (fstOf whole))
+  , sndOf (fstOf whole)
+  , sndOf whole
+  ]
+
+-- | Both forks, waiting until both are on the table.
+pickUp : {s : Type} -> TVar s Bool -> TVar s Bool -> Co (stm s) Unit
+pickUp l r = do
+  a <- readTVar l
+  b <- readTVar r
+  check (a && b)
+  writeTVar l False
+  writeTVar r False
+
+-- | Both forks back.
+putDown : {s : Type} -> TVar s Bool -> TVar s Bool -> Co (stm s) Unit
+putDown l r = do
+  writeTVar l True
+  writeTVar r True
+
+-- (a philosopher eating `k` meals, each over some turns)
+philosopher : {e : HFunctor}
+            -> {{gr : green <: e}}
+            -> {{st : stored Forks <: e}}
+            -> TVar Forks Bool
+            -> TVar Forks Bool
+            -> Int
+            -> Co e Unit
+philosopher l r 0 = pure ()
+philosopher l r k = do
+  atomically (pickUp l r)
+  yield
+  yield
+  atomically (putDown l r)
+  yield
+  philosopher l r (k - 1)
+
+-- (each fork on the table)
+allDown : {s : Type} -> List (TVar s Bool) -> Co (stm s) Bool
+allDown Nil = pure True
+allDown (t :: ts) = do
+  v <- readTVar t
+  rest <- allDown ts
+  pure (v && rest)
+
+-- | Five philosophers, twenty meals each: are the forks all on the table
+-- | after.
+dining : {e : HFunctor}
+       -> {{gr : green <: e}}
+       -> {{st : stored Forks <: e}}
+       -> Co e Bool
+dining = do
+  ch <- newChan
+  spawnEach 5 (\i -> do
+    philosopher (nth forks i) (nth forks ((i + 1) % 5)) 20
+    send ch i)
+  joined ch 5
+  atomically (allDown forks)
+
+-- | >>> dined
+-- | "True"
+dined : String
+dined = shownOr show (runGreen (True, True, True, True, True) dining)
+
+-- A table of counts
+--------------------------------------------------------------------------------
+
+-- | One more of `k`.
+counted : {s : Type} -> TVar s (Map.Map Int Int) -> Int -> Co (stm s) Unit
+counted t k = modifyTVar t (\m -> Map.update m k 1 (\new old -> new + old))
+
+-- (a counter adding its fifty keys)
+counter : {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{st : stored (Map.Map Int Int) <: e}}
+        -> Int
+        -> Int
+        -> Co e Unit
+counter i 0 = pure ()
+counter i j = do
+  atomically (counted whole ((i * 7 + j) % 10))
+  yield
+  counter i (j - 1)
+
+-- | Eight counters adding fifty keys each: the counts.
+counting : {e : HFunctor}
+         -> {{gr : green <: e}}
+         -> {{st : stored (Map.Map Int Int) <: e}}
+         -> Co e (List (Int, Int))
+counting = do
+  ch <- newChan
+  spawnEach 8 (\i -> do
+    counter i 50
+    send ch i)
+  joined ch 8
+  m <- atomically (readTVar whole)
+  pure (Map.toList m)
+
+-- | >>> counts
+-- | "[40, 40, 40, 40, 40, 40, 40, 40, 40, 40]"
+counts : String
+counts = shownOr (\ps -> show (List.map snd ps)) (runGreen Map.empty counting)
+
+-- Undone
+--------------------------------------------------------------------------------
+
+-- | What the left side of an `orElse` wrote, undone where it retries,
+-- | positions of two types: the right side reads them as they were;
+-- | where an inner `orElse` retries on both sides, the outer one's
+-- | right side runs.
+undoneTx : Co (stm (Int, String)) String
+undoneTx = do
+  x <-
+    orElse
+      (do
+       writeTVar left 5
+       writeTVar right "b"
+       retry) (do
+    v <- readTVar left
+    s <- readTVar right
+    pure (show v ^ s))
+  y <-
+    orElse
+      (orElse
+         (do
+          writeTVar left 7
+          retry) (do
+       writeTVar left 8
+       retry))
+      (readTVar left)
+  pure (x ^ " " ^ show y)
+
+-- | ... run on a store, in the language.
+-- | >>> undone
+-- | "1a 1"
+undone : String
+undone = case transacted (1, "a") undoneTx of
+  Committed x st wrote -> x
+  Retried -> "retried"
+
+-- Waiting
+--------------------------------------------------------------------------------
+
+-- | A thread waiting on a store nobody writes waits for good: the
+-- | scheduler says every thread waits.
+-- | >>> stuck
+-- | "every thread waits"
+stuck : String
+stuck =
+  shownOr
+    show
+    (runGreen
+       0
+       (atomically
+          (bind (readTVar whole) (\v -> if v == 0 then retry else pure v))))
+
+awaited : TVar (Int, Int) Int
+awaited = left
+
+other : TVar (Int, Int) Int
+other = right
+
+-- | A thread waiting is woken by the write it waits for.
+waking : {e : HFunctor}
+       -> {{gr : green <: e}}
+       -> {{st : stored (Int, Int) <: e}}
+       -> Co e Int
+waking = do
+  spawn (do
+    atomically (writeTVar other 1)
+    yield
+    atomically (writeTVar awaited 7))
+  atomically (bind (readTVar awaited) (\v -> if v == 0 then retry else pure v))
+
+-- | >>> woken
+-- | "7"
+woken : String
+woken = shownOr show (runGreen (0, 0) waking)

@@ -1,0 +1,351 @@
+-- Software transactional memory over a typed store: the store is one
+-- value, of a shape the program declares (`(Int, Int, List String)`),
+-- and a transactional variable is a position in it (`TVar s a`, an `a`
+-- in an `s`): how it is read and how it is written.  A transaction is a
+-- `Co (stm s)`; it reads and writes positions, and one that cannot go on
+-- yet (`retry`) waits until the store is written.  Running one is a
+-- handler's: in the language, on a store (`transacted`), or among green
+-- threads sharing one (`atomically`).
+--
+-- > [!CAUTION]
+-- > Unstable: concurrency in heff is not settled. What this module offers
+-- > may change, or go, in any release.
+--
+-- ```haskell
+-- import co
+-- import green
+-- import std.stm
+--
+-- type Bank = (Int, Int, List String)
+--
+-- alice : TVar Bank Int
+-- alice = first
+--
+-- bob : TVar Bank Int
+-- bob = second
+--
+-- moves : TVar Bank (List String)
+-- moves = third
+--
+-- -- | `n` moved from alice to bob, waiting until she has it, and said so
+-- paid : Int -> Co (stm Bank) Unit
+-- paid n = do
+--   have <- readTVar alice
+--   check (have >= n)
+--   writeTVar alice (have - n)
+--   modifyTVar bob (\m -> m + n)
+--   modifyTVar moves (\ms -> ("paid " ^ show n) :: ms)
+--
+-- -- | 5 paid by a thread waiting until alice has it; main giving her 10
+-- -- | and waiting until bob is paid
+-- paying : {e : HFunctor} -> {{gr : green <: e}} -> {{st : stored Bank <: e}} -> Co e Int
+-- paying = do
+--   spawn (atomically (paid 5))
+--   atomically (writeTVar alice 10)
+--   atomically (do
+--     m <- readTVar bob
+--     check (m > 0)
+--     pure m)
+--
+-- -- | ... on a store of nothing yet: `Just 5`
+-- run : Maybe Int
+-- run = runGreen (0, 0, Nil) paying
+-- ```
+--
+-- Operation | What it does
+-- --- | ---
+-- `readTVar t` | what the position holds
+-- `writeTVar t v` | ... and it holds `v` now
+-- `modifyTVar t f` | `f` of what it holds
+-- `retry` | the transaction undone, to run again once the store is written
+-- `orElse l r` | `l`; where `l` retries, `r` instead, from the store `l` began at
+-- `check b` | nothing where `b`, else `retry`
+--
+-- The shape is fixed: there is no `newTVar`.  A position is a part of
+-- it, made from its pairs: `whole`, `fstOf` and `sndOf`; a pair's `left`
+-- and `right`; a triple's `first`, `second` and `third` (`(a, b, c)` is
+-- `((a, b), c)`).  What grows while the program runs is a collection in
+-- the shape, a `Map` or a `List`, read and written whole.  A position
+-- fits every store of its shape, so a program names its own, at its
+-- store's type, and a position of one store is not another's: the types
+-- say so.
+--
+-- Green threads run transactions with `atomically`: the store is the
+-- world's state (`stored s`, handled in the language, as std.state's
+-- `runState` does), each transaction run on it at once, between two of
+-- the scheduler's turns, so no other thread sees it half done.  A
+-- thread whose transaction retries waits, taking no turns, until
+-- another commits a write, and runs it again then; where every thread
+-- waits, the scheduler says so, as it does for channels.  `runGreen`
+-- runs green threads on a store and nothing else, in the language, on
+-- every backend.
+
+module std.stm
+
+import co
+import green
+import state
+
+-- Positions
+--------------------------------------------------------------------------------
+
+-- | A position in a store of shape `s` holding an `a`: how it is read,
+-- | and how it is written.
+data TVar s a = MkTVar (s -> a) (a -> s -> s)
+
+-- | The whole store.
+whole : {s : Type} -> TVar s s
+whole = MkTVar (\st -> st) (\v st -> v)
+
+-- | The first part of the pair at `t`.
+fstOf : {s a b : Type} -> TVar s (a, b) -> TVar s a
+fstOf (MkTVar get set) =
+  MkTVar (\st -> fst (get st)) (\v st -> set (v, snd (get st)) st)
+
+-- | ... its second part.
+sndOf : {s a b : Type} -> TVar s (a, b) -> TVar s b
+sndOf (MkTVar get set) =
+  MkTVar (\st -> snd (get st)) (\v st -> set (fst (get st), v) st)
+
+-- | A pair's first component.
+left : {a b : Type} -> TVar (a, b) a
+left = fstOf whole
+
+-- | ... its second.
+right : {a b : Type} -> TVar (a, b) b
+right = sndOf whole
+
+-- | A triple's first component.
+first : {a b c : Type} -> TVar (a, b, c) a
+first = fstOf (fstOf whole)
+
+-- | ... its second.
+second : {a b c : Type} -> TVar (a, b, c) b
+second = sndOf (fstOf whole)
+
+-- | ... its third.
+third : {a b c : Type} -> TVar (a, b, c) c
+third = sndOf whole
+
+-- The effect
+--------------------------------------------------------------------------------
+
+-- | The operations: the store read (what is done with it), the store
+-- | changed (the change, and what comes after), a retry, and an
+-- | `orElse`'s two transactions.  A position is its reading and its
+-- | change of the store by the time it is an operation, so its type is
+-- | the operation's own, not the effect's.
+data StmF s (m : Type -> Type) x
+  = Look (s -> x)
+  | Change (s -> s) x
+  | Retry
+  | OrElse (m x) (m x)
+
+-- | Transactions on a store of shape `s`, as an effect.
+stm : Type -> HFunctor
+stm s =
+  { f = StmF s
+  , hfmap = \m g p -> case p of
+      Look k -> Look (\st -> g (k st))
+      Change f x -> Change f (g x)
+      Retry -> Retry
+      OrElse l r -> OrElse (m.fmap g l) (m.fmap g r)
+  , hmap = \m n nt p -> case p of
+      Look k -> Look k
+      Change f x -> Change f x
+      Retry -> Retry
+      OrElse l r -> OrElse (nt l) (nt r)
+  }
+
+-- | What the position holds.
+readTVar : {s a : Type} -> TVar s a -> Co (stm s) a
+readTVar (MkTVar get set) = op (Look (\st -> get st)) val
+
+-- | ... and it holds `v` now.
+writeTVar : {s a : Type} -> TVar s a -> a -> Co (stm s) Unit
+writeTVar (MkTVar get set) v = op (Change (\st -> set v st) ()) val
+
+-- | ... and it holds `f` of what it held.
+modifyTVar : {s a : Type} -> TVar s a -> (a -> a) -> Co (stm s) Unit
+modifyTVar (MkTVar get set) f = op (Change (\st -> set (f (get st)) st) ()) val
+
+-- | The transaction undone, to run again once the store is written.
+retry : {s a : Type} -> Co (stm s) a
+retry = op Retry val
+
+-- | `l`; where it retries, `r` instead, from the store as `l` found it
+-- | (what `l` wrote undone).  Where both retry, the whole retries.
+orElse : {s a : Type} -> Co (stm s) a -> Co (stm s) a -> Co (stm s) a
+orElse l r = op (OrElse l r) val
+
+-- | Nothing, where `b`; else the transaction retried.
+check : {s : Type} -> Bool -> Co (stm s) Unit
+check b = if b then pure () else retry
+
+-- On a store
+--------------------------------------------------------------------------------
+
+-- | What came of a transaction run on a store: its answer, the store it
+-- | leaves and whether it wrote; or a retry.
+data Ran s x = Committed x s Bool | Retried
+
+thenRan : {s x y : Type} -> Ran s x -> (x -> s -> Bool -> Ran s y) -> Ran s y
+thenRan (Committed x st w) k = k x st w
+thenRan Retried k = Retried
+
+-- (the right side of an `orElse`, from the store as the left found it,
+-- where the left retried)
+orElseRan : {s x : Type}
+          -> Ran s x
+          -> (s -> Bool -> Ran s x)
+          -> s
+          -> Bool
+          -> Ran s x
+orElseRan Retried r st w = r st w
+orElseRan done r st w = done
+
+storeAlg : {s x : Type}
+         -> StmF s (\y -> s -> Bool -> Ran s y) x
+         -> s
+         -> Bool
+         -> Ran s x
+storeAlg (Look k) st w = Committed (k st) st w
+storeAlg (Change f x) st w = Committed x (f st) True
+storeAlg Retry st w = Retried
+storeAlg (OrElse l r) st w = orElseRan (l st w) r st w
+
+-- | Transactions run on a store, in the language: the store threaded
+-- | through, an `orElse`'s right side run from the store its left began
+-- | at.
+onStore : (s : Type) -> Handler (stm s)
+onStore s =
+  { M = \x -> s -> Bool -> Ran s x
+  , ret = \x st w -> Committed x st w
+  , bind = \m k st w -> thenRan (m st w) k
+  , malg = \p -> storeAlg p
+  }
+
+-- | `c` run on the store `st`: committed, its answer, the store it
+-- | leaves and whether it wrote; or retried.
+transacted : {s a : Type} -> s -> Co (stm s) a -> Ran s a
+transacted st c = handle (onStore s) c st False
+
+-- Green threads
+--------------------------------------------------------------------------------
+
+-- | The store green threads share, and the channels of those waiting
+-- | for a write.
+type Shared s = { now : s, waiting : List Int }
+
+-- | ... as the world's state.
+stored : Type -> HFunctor
+stored s = state (Shared s)
+
+-- | The store `st`, no thread waiting.
+sharing : {s : Type} -> s -> Shared s
+sharing st = { now = st, waiting = Nil }
+
+-- (what the store holds)
+nowOf : {s : Type} -> Shared s -> s
+nowOf sh = sh.now
+
+-- (the threads woken, each told on its channel)
+wakeAll : {e : HFunctor} -> {{gr : green <: e}} -> List Int -> Co e ()
+wakeAll Nil = pure ()
+wakeAll (ch :: rest) = do
+  send ch 0
+  wakeAll rest
+
+-- (what came of it: committed, the store kept and the waiting woken
+-- where it wrote; or the thread waiting on its channel, made first
+-- where it has none, and `again` then)
+settled : {s : Type}
+        -> {e : HFunctor}
+        -> {{gr : green <: e}}
+        -> {{st : state (Shared s) <: e}}
+        -> {a : Type}
+        -> (Maybe Int -> Co e a)
+        -> Shared s
+        -> Maybe Int
+        -> Ran s a
+        -> Co e a
+settled again sh own (Committed x now False) = pure x
+settled again sh own (Committed x now True) = do
+  put (ev := st) { now = now, waiting = Nil }
+  wakeAll sh.waiting
+  pure x
+settled again sh (Just ch) Retried = do
+  put (ev := st) { sh | waiting = ch :: sh.waiting }
+  _ <- recv ch
+  again (Just ch)
+settled again sh Nothing Retried = do
+  ch <- newChan
+  again (Just ch)
+
+-- (... by a thread holding the channel `own`, if any)
+atomicallyHolding : {s : Type}
+                  -> {e : HFunctor}
+                  -> {{gr : green <: e}}
+                  -> {{st : state (Shared s) <: e}}
+                  -> {a : Type}
+                  -> Maybe Int
+                  -> Co (stm s) a
+                  -> Co e a
+atomicallyHolding own c = do
+  sh <- get (ev := st)
+  settled (\o -> atomicallyHolding o c) sh own (transacted (nowOf sh) c)
+
+-- | `c` run on the shared store as one step among green threads: its
+-- | answer.  Where it retries, this thread waits, taking no turns, until
+-- | another commits a write, and runs it again then.
+atomically : {s : Type}
+           -> {e : HFunctor}
+           -> {{gr : green <: e}}
+           -> {{st : state (Shared s) <: e}}
+           -> {a : Type}
+           -> Co (stm s) a
+           -> Co e a
+atomically c = atomicallyHolding Nothing c
+
+-- (no other effect: what a computation of none comes to)
+data NoneF (m : Type -> Type) x = NoneOf (NoneF m x)
+
+none : HFunctor
+none =
+  { f = NoneF
+  , hfmap = \m g p -> case p of
+      NoneOf q -> abandon
+  , hmap = \m n nt p -> case p of
+      NoneOf q -> abandon
+  }
+
+noneAlg : {x : Type} -> NoneF (\y -> y) x -> x
+noneAlg (NoneOf q) = noneAlg q
+
+ranAlone : Handler none
+ranAlone =
+  { M = \x -> x
+  , ret = \x -> x
+  , bind = \m k -> k m
+  , malg = \p -> noneAlg p
+  }
+
+-- | `c` and the green threads it spawns, scheduled on the store `st` and
+-- | nothing else, in the language: main's answer, or `Nothing` where
+-- | every thread waits.
+runGreen : {s a : Type}
+         -> s
+         -> ({e : HFunctor}
+             -> {{gr : green <: e}}
+             -> {{st : stored s <: e}}
+             -> Co e a)
+         -> Maybe a
+runGreen st c =
+  fst
+    (handle
+       ranAlone
+       (runState
+          (sharing st)
+          (scheduled
+             (stored s <+> none)
+             (c (gr := \p -> InL p) (st := \p -> InR (InL p))))))
