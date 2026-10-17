@@ -56,11 +56,10 @@ Released 2026-10-16.
 - `std.filesystem`: `withFile`, `withStdin`, `withStdout` and `withStderr` hold a file or a standard stream for a body.
 - `std.process`: `withProcess` holds a subprocess, which is ended (SIGTERM, then SIGKILL after two seconds) when the body ends. `run` takes an `Invocation` and gives a `Ran`. Waits and pipe reads are pending in the reactor, so they block no other green thread. `workingDir` and `setWorkingDir` are new.
 - `std.net`: `withConnection`, `withListener` and `accept` hold sockets. `std.http.server` has `serveConcurrently`, serving each connection in its own green thread.
-- `std.place`: places are threads with a heap of their own, started with `spawnPlace`, talking over channels (`newPlaceChannel`, `sendPlace`, `recvPlace`) and ended with `joinPlace`. A value crosses as a message: moved if large and unique, copied otherwise. Each place has its own working directory (#97). Concurrency is documented as unstable.
-- `std.reactor` waits may have a deadline, so a `sleep` in a place lets its other green threads run. A `join` is pending in the reactor (#97).
+- `std.reactor` waits may have a deadline, so a `sleep` lets the other green threads run (#97).
 - `browser.dom`: the document comes from `withDocument`, and elements are host values passed by value. `browser.gpu`'s `dispatch1` to `dispatch3` take buffers one by one.
 - Acronym aliases are written in capitals.
-- New `ffi` module: C types as values (`CType`, `CResult`, `Described`) and `CSharedPointer`, for host things that cross places. A provider can be described in C and the compiler writes its glue (#99, #97).
+- New `ffi` module: C types as values (`CType`, `CResult`, `Described`). A provider can be described in C and the compiler writes its glue (#99, #97).
 - `onWindows` says whether the program is built for Windows.
 
 ### Compiler and tools
@@ -90,5 +89,5 @@ Released 2026-10-16.
 
 - The documentation is a site: a tutorial from a first program to tests, and a reference split into the language and the library. The library reference is the `heff doc` API pages.
 - One site per release, with a version picker. `dev` is main, each release tag has its own `X.Y.Z`, and the latest is at the root. The release workflow publishes it.
-- New pages: concurrency (unstable), places and their costs (a pool of places matches `parFor` on queens and primes), host types and providers, lists, tags, records and theories.
+- New pages: concurrency (unstable), host types and providers, lists, tags, records and theories.
 - Examples: a first CLI program, a terminal todo app on a zipper, and the browser pages as one project built by `heff build` and served by `heff dev`.

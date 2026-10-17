@@ -98,7 +98,7 @@ enum { HEFF_OUT_COLLECTED, HEFF_OUT_PIPED, HEFF_OUT_INHERITED };
 // (an invocation, as the system is to be given it)
 typedef struct {
   char **as;     // its name, then its arguments: NULL if one has a NUL
-  char *dir;     // where it runs: the place's, unless it says
+  char *dir;     // where it runs: the thread's, unless it says
   char **env;    // its environment: NULL, the program's
   int in_mode;   // HEFF_IN_*: its input
   char *in;      // the input `Given`: NULL, none
@@ -173,9 +173,9 @@ static int heff_invocation(V v, HeffInvocation *r) {
   char *c = heff_cstr_text(cmd);
   r->as = c ? heff_argv_of(c, args) : NULL;
   if (!r->as) { free(c); ok = 0; }
-  // (where it runs: from this place's directory, or that itself)
+  // (where it runs: from this thread's directory, or that itself)
   if (((Str *)dir)->len > 0) {
-    r->dir = heff_path_in_place(heff_cstr(dir));
+    r->dir = heff_path_in_dir(heff_cstr(dir));
     if (!r->dir) ok = 0;
   } else r->dir = heff_dir_copy();
   int64_t n = 0;
@@ -1452,18 +1452,18 @@ static V heff_provider_process(V p, V k) {
     V x = heff_answer(f, heff_program_path());
     return heff_tail(k, 1, &x);
   }
-  // (the working directory is this place's own, never the process's)
+  // (the working directory is this thread's own, never the process's)
   case TAG_WorkingDir: {
     V f = heff_dup(heff_field(p, 0));
     heff_drop(p);
-    V x = heff_answer(f, heff_str_text(heff_place_dir()));
+    V x = heff_answer(f, heff_str_text(heff_working_dir()));
     return heff_tail(k, 1, &x);
   }
   case TAG_SetWorkingDir: {
     char *dir = heff_cstr(heff_field(p, 0));
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    V x = heff_answer(f, heff_bool(dir && heff_place_dir_set(dir)));
+    V x = heff_answer(f, heff_bool(dir && heff_working_dir_set(dir)));
     return heff_tail(k, 1, &x);
   }
   case TAG_Platform: {
@@ -1682,9 +1682,9 @@ static V heff_provider_process(V p, V k) {
       HANDLE h = heff_spawn(as, GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE));
       if (h) exit((int)heff_wait(h));
 #else
-      // (the program's place becomes the command's process: in the
-      // place's directory, as it would be between a fork and an exec)
-      if (chdir(heff_place_dir()) == 0) execvp(c, as);
+      // (the program's process becomes the command's: in this
+      // thread's directory, as it would be between a fork and an exec)
+      if (chdir(heff_working_dir()) == 0) execvp(c, as);
 #endif
     }
     fprintf(stderr, "%s: cannot run it\n", c ? c : "the command");

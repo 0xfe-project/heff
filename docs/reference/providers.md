@@ -121,7 +121,6 @@ and its result.
 | `FFI.bool` | `Bool` |
 | `FFI.string`, `FFI.text` | `String`, as `const char *` |
 | `FFI.pointer "FILE" "fclose"` | a host type; `fclose` lets it go |
-| `FFI.sharedPointer T drop hold` | a host type that can cross places |
 
 | Result | heff type |
 |---|---|
@@ -163,9 +162,6 @@ providers can.
   `heff_foreign_ptr(v)` reads it back. `let_go(p)` runs as soon as the
   program drops its last reference. A provider given another provider's
   thing should check it is its own before trusting the pointer.
-- `heff_foreign_shared(p, let_go, share)` makes a thing that can be sent
-  to another place: `share(p)` holds it once more. Any other foreign
-  value cannot cross places.
 - In JavaScript, a foreign value is the host's object itself. A thing
   the host does not collect on its own, such as a GPU buffer, should be
   let go of by a `FinalizationRegistry`.

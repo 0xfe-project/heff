@@ -239,10 +239,8 @@ typedef struct { Obj h; int64_t len; int64_t cap; uint8_t *p; uint8_t s[]; } Str
 #define HEFF_BYTES(name, n, bytes) HEFF_STATIC_STR(name, K_BYT, n, bytes)
 typedef struct { Obj h; double d; } Flt;
 // (a foreign value: a pointer of the host's, the function that lets it
-// go, called when the program drops the last reference, and, where the
-// thing may be held by another place too, the function that holds it
-// once more -- NULL where it may not cross)
-typedef struct { Obj h; void *p; void (*let_go)(void *); void (*share)(void *); } Fgn;
+// go, called when the program drops the last reference)
+typedef struct { Obj h; void *p; void (*let_go)(void *); } Fgn;
 // (an array: its elements, `n` of them, `V`s or flat -- a number's C
 // type, as its header's `tag` says, `HEFF_ARR_V` or another of these
 // ("Arrays", below))
@@ -3833,19 +3831,18 @@ HEFF_FN void heff_put(FILE *f, V v) {
   if (s->len) fwrite(s->p, 1, (size_t)s->len, f);
 }
 
-// The working directory: each place's own (#97)
+// The working directory: each thread's own (#97)
 // ---------------------------------------------------------------------
 //
-// The system has one working directory a process, and a place is one
-// thread of its process; so the runtime keeps a directory for each
-// thread (`heff_dir`): the process's own, asked for once, in the
-// program's thread; its starter's, copied, in a place or a thread a
+// The system has one working directory a process; the runtime keeps a
+// directory for each thread (`heff_dir`): the process's own, asked for
+// once, in the program's thread; its starter's, copied, in a thread a
 // provider starts (`heff_dir_copy`, given to the started thread by
 // `heff_dir_take`); another, by std.process's `setWorkingDir`, for
-// that place alone.  A provider gives the system every relative path
-// under it (`heff_path_in_place`), and never changes the process's --
+// that thread alone.  A provider gives the system every relative path
+// under it (`heff_path_in_dir`), and never changes the process's --
 // but in a command started, between its fork and its exec
-// (`heff_exec_in_place`).
+// (`heff_exec_in_dir`).
 HEFF_VAR(HEFF_TLS char *heff_dir);
 
 extern size_t heff_path_under(const uint8_t *dir, size_t dn, const uint8_t *path, size_t pn, int windows, uint8_t *out);
@@ -3865,7 +3862,7 @@ HEFF_FN char *heff_strdup(const char *s) {
 }
 
 // (this thread's working directory)
-HEFF_FN const char *heff_place_dir(void) {
+HEFF_FN const char *heff_working_dir(void) {
   if (!heff_dir) {
     char buf[4096];
 #ifdef _WIN32
@@ -3880,7 +3877,7 @@ HEFF_FN const char *heff_place_dir(void) {
 
 // (this thread's working directory, copied for a thread it starts)
 HEFF_FN char *heff_dir_copy(void) {
-  return heff_strdup(heff_place_dir());
+  return heff_strdup(heff_working_dir());
 }
 
 // (`dir`, malloc'd, made this thread's working directory: its now)
@@ -3889,12 +3886,12 @@ HEFF_FN void heff_dir_take(char *dir) {
   heff_dir = dir;
 }
 
-// (`path`, malloc'd, as the system is to be given it from this place:
-// under the place's directory where it is relative; `path` freed, the
+// (`path`, malloc'd, as the system is to be given it from this thread:
+// under the thread's directory where it is relative; `path` freed, the
 // path given back malloc'd -- NULL stays NULL)
-HEFF_FN char *heff_path_in_place(char *path) {
+HEFF_FN char *heff_path_in_dir(char *path) {
   if (!path) return NULL;
-  const char *dir = heff_place_dir();
+  const char *dir = heff_working_dir();
   size_t dn = strlen(dir), pn = strlen(path);
   char *out = heff_alloc(dn + pn + 2);
   size_t n = heff_path_under((const uint8_t *)dir, dn, (const uint8_t *)path, pn, HEFF_WINDOWS, (uint8_t *)out);
@@ -3903,12 +3900,12 @@ HEFF_FN char *heff_path_in_place(char *path) {
   return out;
 }
 
-// (`dir`, malloc'd, from this place, made the place's working
+// (`dir`, malloc'd, from this thread, made the thread's working
 // directory, as the system names it (its links resolved): 1; or 0
-// where it is no directory there, the place's as it was.  `dir`
+// where it is no directory there, the thread's as it was.  `dir`
 // consumed)
-HEFF_FN int heff_place_dir_set(char *dir) {
-  char *p = heff_path_in_place(dir);
+HEFF_FN int heff_working_dir_set(char *dir) {
+  char *p = heff_path_in_dir(dir);
   struct stat st;
   int ok = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
   if (!ok) { free(p); return 0; }
@@ -3924,17 +3921,17 @@ HEFF_FN int heff_place_dir_set(char *dir) {
 
 #ifndef _WIN32
 // (the command `as` -- its name found on the PATH -- forked and exec'd
-// in this place's directory, its standard streams `in`, `out` and
+// in this thread's directory, its standard streams `in`, `out` and
 // `err` where each is not -1, the descriptors `closed` closed in it,
 // its environment `env` where not NULL: its pid, or -1 where it could
 // not be run -- not found, not a program, the directory gone -- `errno`
 // why, as the child says through a pipe its exec closes)
-HEFF_FN pid_t heff_exec_in_place(char **as, char **env, int in, int out, int err, const int *closed, int nclosed) {
+HEFF_FN pid_t heff_exec_in_dir(char **as, char **env, int in, int out, int err, const int *closed, int nclosed) {
   int px[2];
   if (pipe(px) != 0) return -1;
   fcntl(px[0], F_SETFD, FD_CLOEXEC);
   fcntl(px[1], F_SETFD, FD_CLOEXEC);
-  const char *dir = heff_place_dir();
+  const char *dir = heff_working_dir();
   fflush(stdout);
   fflush(stderr);
   pid_t pid = fork();
@@ -4017,21 +4014,11 @@ HEFF_FN V heff_answer(V f, V x) { return heff_tr(heff_app1(f, x)); }
 // generated glue makes and reads them as an effect's module describes
 // its operations in C (the `ffi` module).  One effect's provider takes
 // what another's handed out, the value given it by the program, as a
-// `with` of the one hands its thing to an operation of the other.  A
-// thing that places may hold together -- a channel between them -- is
-// made by `heff_foreign_shared`, with what holds it once more: the
-// value crosses to another place as a foreign value of its own, the
-// thing held once more, and is let go of by each place as it drops its
-// last reference; the thing is the provider's to free when every place
-// has.  Any other foreign value does not cross.
-HEFF_FN V heff_foreign_shared(void *p, void (*let_go)(void *), void (*share)(void *)) {
-  Fgn *g = heff_obj_alloc(sizeof(Fgn));
-  g->h.rc = 1; g->h.kind = K_FGN; g->h.tag = 0; g->p = p; g->let_go = let_go; g->share = share;
-  return (V)g;
-}
-
+// `with` of the one hands its thing to an operation of the other.
 HEFF_FN V heff_foreign(void *p, void (*let_go)(void *)) {
-  return heff_foreign_shared(p, let_go, NULL);
+  Fgn *g = heff_obj_alloc(sizeof(Fgn));
+  g->h.rc = 1; g->h.kind = K_FGN; g->h.tag = 0; g->p = p; g->let_go = let_go;
+  return (V)g;
 }
 
 HEFF_FN void *heff_foreign_ptr(V v) {
@@ -4162,668 +4149,6 @@ HEFF_FN int heff_thread_start(pthread_t *t, void *(*run)(void *), void *u) {
   return r;
 }
 
-#ifdef HEFF_THREADS
-// Places (#97): a thread with a heap of its own, sharing nothing
-// ---------------------------------------------------------------------
-//
-// A place is a thread as any a provider starts, with the pages every
-// thread has (`heff_heap`); what makes it a place is that nothing of its
-// is ever shared.  What it is given to run, what it is sent and what it
-// gives back cross as a message (`HeffMsg`): a flat buffer of words that
-// is no heap's.  The sender writes the value into it, walking it once;
-// the receiver reads a value of its own out of it, each object of that
-// made in its own pages.  So no object is held by two places, none is
-// counted atomically, and no page holds another place's object.  A send
-// does not wait for the receive: the sender's own value is dropped as
-// any other, the message is memory anyone may free, a channel
-// (`HeffChan`) holds any number of them, and a receive takes the first,
-// waiting where there is none -- or, polled, a descriptor the channel
-// writes while it holds something (`heff_chan_fd`), so that a receive
-// can be a wait of the reactor's, a green thread's, the others of its
-// place going on.
-//
-// (The other way -- the receiver reading the sender's objects where they
-// are, allocating its own as it goes -- would walk once, not twice; but
-// the sender's value would have to stay, and stay still, until the
-// receiver was done with it: a send waiting for its receive, or the
-// receiver handing back what to drop.  A buffer the sender fills and
-// forgets keeps the two apart, and is a message anyone may hold.)
-//
-// Copy against move: an object the sender holds alone -- its count 1,
-// and so every object's above it in the value, none of them shared --
-// that is the system's, not a page's (a string, bytes, an array of
-// numbers or a big integer of more than `SMALL_MAX` bytes) is moved: its
-// pointer in the message, its bytes not copied, the sender forgetting
-// it.  Everything else is copied: a small object is in a page of its
-// maker's, and the receiver's objects must be in the receiver's own.
-// What a value holds twice (an object of count more than 1) is made once
-// in the receiver too, by a table of such objects, so that a copy is no
-// larger than what it copies.  An immortal object (a definition's value,
-// a string written in the program) is the program's, counted by none,
-// and crosses as its pointer.  A foreign value, the host's thing,
-// crosses only where its provider made it shared (`heff_foreign_shared`,
-// a channel's): the thing held once more, and a foreign value of the
-// receiver's own made of it; sending any other fails.
-//
-// A message's words: a slot is the value's word where it is no object
-// (an integer, a tag of no fields: its low bits set); 0 and then the
-// pointer, of an immortal object; else the object -- a header word (its
-// low bits clear, as a pointer's, and never 0: how it crosses, its kind
-// and tag, its count of fields or bytes, and whether it is numbered, for
-// what holds it again), and what the kind says.  An object held again is
-// a header alone, naming the number; one moved, a header and its
-// pointer.  An object's last slot is not written within it but after it,
-// as the next: a list's cells are a row, two words each, the walk never
-// deep.
-
-enum { HEFF_MSG_NEW, HEFF_MSG_AGAIN, HEFF_MSG_MOVED };
-#define HEFF_MSG_HEAD(how, numbered, memo, kind, tag, n) \
-  (((V)(numbered) << 2) | ((V)(memo) << 3) | ((V)(how) << 4) | (V)64 | ((V)(kind) << 8) | ((V)(tag) << 16) | ((V)(uint32_t)(n) << 32))
-#define HEFF_MSG_HOW(h) ((int)(((h) >> 4) & 3))
-#define HEFF_MSG_NUMBERED(h) ((int)(((h) >> 2) & 1))
-#define HEFF_MSG_MEMO(h) ((int)(((h) >> 3) & 1))
-#define HEFF_MSG_KIND(h) ((int)(((h) >> 8) & 0xff))
-#define HEFF_MSG_TAG(h) ((uint16_t)(((h) >> 16) & 0xffff))
-#define HEFF_MSG_N(h) ((int64_t)(uint32_t)((h) >> 32))
-
-typedef struct HeffMsg {
-  V *w;
-  size_t n, cap;
-  struct HeffMsg *next;   // (the channel's: the one sent after it)
-} HeffMsg;
-
-static inline void heff_msg_word(HeffMsg *m, V w) {
-  if (m->n == m->cap) {
-    m->cap = m->cap ? m->cap * 2 : 64;
-    m->w = realloc(m->w, m->cap * sizeof(V));
-    if (!m->w) heff_fail("out of memory");
-  }
-  m->w[m->n++] = w;
-}
-
-// (`n` bytes, as words)
-HEFF_FN void heff_msg_bytes(HeffMsg *m, const void *p, size_t n) {
-  size_t words = (n + 7) / 8;
-  while (m->n + words > m->cap) {
-    m->cap = m->cap ? m->cap * 2 : 64;
-    m->w = realloc(m->w, m->cap * sizeof(V));
-    if (!m->w) heff_fail("out of memory");
-  }
-  if (words) m->w[m->n + words - 1] = 0;
-  memcpy(m->w + m->n, p, n);
-  m->n += words;
-}
-
-// (the writer: the message, and the objects held more than once that
-// it has numbered, by address)
-typedef struct {
-  HeffMsg *m;
-  V *keys;
-  uint32_t *nums;
-  size_t cap, used;
-  uint32_t next;
-} HeffPut;
-
-// (`v`'s number if it has one; else numbered, and 0)
-HEFF_FN int heff_put_numbered(HeffPut *p, V v, uint32_t *num) {
-  if (p->used * 2 >= p->cap) {
-    size_t cap = p->cap ? p->cap * 2 : 64;
-    V *keys = calloc(cap, sizeof(V));
-    uint32_t *nums = heff_alloc(cap * sizeof(uint32_t));
-    if (!keys) heff_fail("out of memory");
-    for (size_t i = 0; i < p->cap; i++) {
-      if (!p->keys[i]) continue;
-      size_t j = (size_t)((p->keys[i] >> 4) * 0x9E3779B97F4A7C15ULL) & (cap - 1);
-      while (keys[j]) j = (j + 1) & (cap - 1);
-      keys[j] = p->keys[i];
-      nums[j] = p->nums[i];
-    }
-    free(p->keys); free(p->nums);
-    p->keys = keys; p->nums = nums; p->cap = cap;
-  }
-  size_t j = (size_t)((v >> 4) * 0x9E3779B97F4A7C15ULL) & (p->cap - 1);
-  while (p->keys[j] && p->keys[j] != v) j = (j + 1) & (p->cap - 1);
-  if (p->keys[j]) { *num = p->nums[j]; return 1; }
-  p->keys[j] = v;
-  p->nums[j] = p->next++;
-  p->used++;
-  return 0;
-}
-
-// (`v`, a slot's value, written -- `alone` where every object above it
-// in the value is held once and the sender lets the value go, so that
-// what of it is held once too may be moved)
-HEFF_FN void heff_msg_put(HeffPut *p, V v, int alone) {
-  HeffMsg *m = p->m;
-  for (;;) {
-    if (!IS_OBJ(v)) { heff_msg_word(m, v); return; }
-    Obj *o = OBJ(v);
-    uint32_t rc = heff_rc(o);
-    if (rc & IMMORTAL) { heff_msg_word(m, 0); heff_msg_word(m, v); return; }
-    // (held once: a shared one too where all above it is the sender's
-    // alone (`heff_alone`), else another thread may hold what is above it)
-    int once = rc == 1 || (alone && heff_alone(o));
-    int numbered = 0;
-    if (!once) {
-      uint32_t num;
-      if (heff_put_numbered(p, v, &num)) {
-        heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_AGAIN, 0, 0, 0, 0, num));
-        return;
-      }
-      numbered = 1;
-    }
-    alone = alone && once;
-    // (below, the system's -- `big`, of more than `SMALL_MAX` bytes --
-    // held alone and let go of by the sender: moved, and held once more
-    // meanwhile, so that the sender's drop of the value leaves it)
-    int big;
-    V *slots = NULL;
-    int64_t n = 0;
-    uint32_t flat = 0;
-    V last = 0;
-    int has_last = 0;
-    switch (o->kind) {
-    case K_TAG: case K_TAGF: {
-      Tag *t = (Tag *)v;
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, o->kind, o->tag, t->n));
-      if (o->kind == K_TAGF) heff_msg_word(m, t->flat);
-      slots = t->f; n = t->n; flat = o->kind == K_TAGF ? t->flat : 0;
-      break;
-    }
-    case K_REC: {
-      Rec *r = (Rec *)v;
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_REC, o->tag, r->n));
-      heff_msg_word(m, r->flat);
-      heff_msg_word(m, (V)r->lbl);
-      slots = r->f; n = r->n; flat = r->flat;
-      break;
-    }
-    case K_CLO: {
-      Clo *c = (Clo *)v;
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, c->memo != 0, K_CLO, o->tag, c->nenv));
-      heff_msg_word(m, (V)c->fn);
-      heff_msg_word(m, (V)c->arity);
-      if (c->memo) {
-        for (int32_t i = 0; i < c->nenv; i++) heff_msg_put(p, c->env[i], alone);
-        last = c->memo; has_last = 1;
-      } else { slots = c->env; n = c->nenv; }
-      break;
-    }
-    case K_PAP: case K_BNC: {
-      // (the same shape: `fun`, `n`, `a`)
-      Pap *q = (Pap *)v;
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, o->kind, o->tag, q->n));
-      for (int32_t i = 0; i < q->n; i++) heff_msg_put(p, q->a[i], alone);
-      last = q->fun; has_last = 1;
-      break;
-    }
-    case K_STR: case K_BYT: case K_BIT: {
-      Str *s = (Str *)v;
-      big = sizeof(Str) + (size_t)s->cap > SMALL_MAX;
-      if (alone && big && !HEFF_STR_VIEW(s)) {
-        heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_MOVED, 0, 0, o->kind, o->tag, 0));
-        heff_msg_word(m, v);
-        heff_dup(v);
-        return;
-      }
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, o->kind, o->tag, 0));
-      heff_msg_word(m, (V)s->len);
-      heff_msg_bytes(m, s->p, (size_t)s->len);
-      return;
-    }
-    case K_FLT:
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_FLT, o->tag, 0));
-      heff_msg_bytes(m, &((Flt *)v)->d, sizeof(double));
-      return;
-    case K_ARR: {
-      Arr *a = (Arr *)v;
-      if (a->h.tag != HEFF_ARR_V) {
-        big = heff_arr_bytes(a) > SMALL_MAX;
-        if (alone && big) {
-          heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_MOVED, 0, 0, K_ARR, o->tag, 0));
-          heff_msg_word(m, v);
-          heff_dup(v);
-          return;
-        }
-        heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_ARR, o->tag, a->n));
-        heff_msg_bytes(m, a->a, (size_t)a->n * heff_arr_width[a->h.tag]);
-        return;
-      }
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_ARR, o->tag, a->n));
-      slots = a->a; n = a->n;
-      break;
-    }
-    case K_BIG: {
-      Big *b = (Big *)v;
-      big = sizeof(Big) + (size_t)b->n * sizeof(uint32_t) > SMALL_MAX;
-      if (alone && big) {
-        heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_MOVED, 0, 0, K_BIG, o->tag, 0));
-        heff_msg_word(m, v);
-        heff_dup(v);
-        return;
-      }
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_BIG, o->tag, b->n));
-      heff_msg_word(m, (V)b->neg);
-      heff_msg_bytes(m, b->d, (size_t)b->n * sizeof(uint32_t));
-      return;
-    }
-    case K_FGN: {
-      Fgn *g = (Fgn *)v;
-      if (!g->share) heff_fail("places: a foreign value cannot be sent to another place");
-      g->share(g->p);
-      heff_msg_word(m, HEFF_MSG_HEAD(HEFF_MSG_NEW, numbered, 0, K_FGN, 0, 0));
-      heff_msg_word(m, (V)g->p);
-      heff_msg_word(m, (V)g->let_go);
-      heff_msg_word(m, (V)g->share);
-      return;
-    }
-    default:
-      heff_fail("places: a value of a kind that cannot be sent");
-      return;
-    }
-    // (the slots in order, each flat one its word; the last, where it is
-    // a value, the next object written, not within this one)
-    if (slots) {
-      for (int64_t i = 0; i < n; i++) {
-        if (heff_flat_kind(flat, i)) { heff_msg_word(m, slots[i]); continue; }
-        if (i == n - 1) { last = slots[i]; has_last = 1; break; }
-        heff_msg_put(p, slots[i], alone);
-      }
-    }
-    if (!has_last) return;
-    v = last;
-  }
-}
-
-// (`v` as a message, `v` consumed: whatever of it was moved is the
-// message's now, the rest dropped)
-HEFF_FN HeffMsg *heff_msg_of(V v) {
-  HeffMsg *m = calloc(1, sizeof *m);
-  if (!m) heff_fail("out of memory");
-  HeffPut p = { m, NULL, NULL, 0, 0, 0 };
-  heff_msg_put(&p, v, 1);
-  free(p.keys); free(p.nums);
-  heff_drop(v);
-  return m;
-}
-
-// (the reader: the message, where it is in it, and the objects made that
-// are numbered)
-typedef struct { HeffMsg *m; size_t at; V *made; size_t n, cap; } HeffGet;
-
-static inline V heff_get_word(HeffGet *g) {
-  if (g->at >= g->m->n) heff_fail("places: a message ends before its value does");
-  return g->m->w[g->at++];
-}
-
-HEFF_FN void heff_get_bytes(HeffGet *g, void *p, size_t n) {
-  size_t words = (n + 7) / 8;
-  if (g->at + words > g->m->n) heff_fail("places: a message ends before its value does");
-  memcpy(p, g->m->w + g->at, n);
-  g->at += words;
-}
-
-HEFF_FN void heff_get_made(HeffGet *g, V v) {
-  if (g->n == g->cap) {
-    g->cap = g->cap ? g->cap * 2 : 64;
-    g->made = realloc(g->made, g->cap * sizeof(V));
-    if (!g->made) heff_fail("out of memory");
-  }
-  g->made[g->n++] = v;
-}
-
-// (a slot read into `*at`: its object made here, in this thread's pages)
-HEFF_FN void heff_msg_get(HeffGet *g, V *at) {
-  for (;;) {
-    V h = heff_get_word(g);
-    if (h & 3) { *at = h; return; }
-    if (!h) { *at = heff_get_word(g); return; }
-    int kind = HEFF_MSG_KIND(h);
-    uint16_t tag = HEFF_MSG_TAG(h);
-    int64_t n = HEFF_MSG_N(h);
-    switch (HEFF_MSG_HOW(h)) {
-    case HEFF_MSG_AGAIN:
-      if ((size_t)n >= g->n) heff_fail("places: a message names an object it has not made");
-      *at = heff_dup(g->made[n]);
-      return;
-    case HEFF_MSG_MOVED:
-      *at = heff_get_word(g);
-      return;
-    default: break;
-    }
-    V *slots = NULL;
-    uint32_t flat = 0;
-    V *last = NULL;
-    V v;
-    switch (kind) {
-    case K_TAG: case K_TAGF: {
-      flat = kind == K_TAGF ? (uint32_t)heff_get_word(g) : 0;
-      Tag *t = heff_obj_alloc(sizeof(Tag) + (size_t)n * sizeof(V));
-      t->h.rc = 1; t->h.kind = (uint16_t)kind; t->h.tag = tag;
-      heff_tag_head(t, n, flat);
-      v = (V)t; slots = t->f;
-      break;
-    }
-    case K_REC: {
-      flat = (uint32_t)heff_get_word(g);
-      uint32_t *lbl = (uint32_t *)heff_get_word(g);
-      Rec *r = heff_obj_alloc(sizeof(Rec) + (size_t)n * sizeof(V));
-      r->h.rc = 1; r->h.kind = K_REC; r->h.tag = tag;
-      r->n = (int32_t)n; r->flat = flat; r->lbl = lbl;
-      v = (V)r; slots = r->f;
-      break;
-    }
-    case K_CLO: {
-      Fn fn = (Fn)heff_get_word(g);
-      int32_t arity = (int32_t)heff_get_word(g);
-      Clo *c = heff_obj_alloc(sizeof(Clo) + (size_t)n * sizeof(V));
-      c->h.rc = 1; c->h.kind = K_CLO; c->h.tag = tag;
-      c->fn = fn; c->arity = arity; c->nenv = (int32_t)n; c->memo = 0;
-      v = (V)c;
-      if (HEFF_MSG_MEMO(h)) {
-        if (HEFF_MSG_NUMBERED(h)) heff_get_made(g, v);
-        for (int64_t i = 0; i < n; i++) heff_msg_get(g, &c->env[i]);
-        *at = v;
-        at = &c->memo;
-        continue;
-      }
-      slots = c->env;
-      break;
-    }
-    case K_PAP: case K_BNC: {
-      Pap *q = heff_obj_alloc(sizeof(Pap) + (size_t)n * sizeof(V));
-      q->h.rc = 1; q->h.kind = (uint16_t)kind; q->h.tag = tag;
-      q->n = (int32_t)n; q->fun = 0;
-      v = (V)q;
-      if (HEFF_MSG_NUMBERED(h)) heff_get_made(g, v);
-      for (int64_t i = 0; i < n; i++) heff_msg_get(g, &q->a[i]);
-      *at = v;
-      at = &q->fun;
-      continue;
-    }
-    case K_STR: case K_BYT: case K_BIT: {
-      int64_t len = (int64_t)heff_get_word(g);
-      Str *s = heff_obj_alloc(sizeof(Str) + (size_t)len);
-      s->h.rc = 1; s->h.kind = (uint16_t)kind; s->h.tag = tag;
-      s->len = len; s->cap = len; s->p = s->s;
-      heff_get_bytes(g, s->s, (size_t)len);
-      v = (V)s;
-      break;
-    }
-    case K_FLT: {
-      double d;
-      heff_get_bytes(g, &d, sizeof d);
-      v = heff_flt(d);
-      break;
-    }
-    case K_ARR: {
-      Arr *a = heff_obj_alloc(sizeof(Arr) + (size_t)n * heff_arr_width[tag]);
-      a->h.rc = 1; a->h.kind = K_ARR; a->h.tag = tag; a->n = n;
-      v = (V)a;
-      if (tag != HEFF_ARR_V) heff_get_bytes(g, a->a, (size_t)n * heff_arr_width[tag]);
-      else slots = a->a;
-      break;
-    }
-    case K_BIG: {
-      int32_t neg = (int32_t)heff_get_word(g);
-      Big *b = heff_obj_alloc(sizeof(Big) + (size_t)n * sizeof(uint32_t));
-      b->h.rc = 1; b->h.kind = K_BIG; b->h.tag = tag;
-      b->neg = neg; b->n = (int32_t)n;
-      heff_get_bytes(g, b->d, (size_t)n * sizeof(uint32_t));
-      v = (V)b;
-      break;
-    }
-    case K_FGN: {
-      void *ptr = (void *)heff_get_word(g);
-      void (*let_go)(void *) = (void (*)(void *))heff_get_word(g);
-      void (*share)(void *) = (void (*)(void *))heff_get_word(g);
-      v = heff_foreign_shared(ptr, let_go, share);
-      break;
-    }
-    default:
-      heff_fail("places: a message holds a value of a kind that cannot be read");
-      return;
-    }
-    if (HEFF_MSG_NUMBERED(h)) heff_get_made(g, v);
-    *at = v;
-    if (!slots) return;
-    for (int64_t i = 0; i < n; i++) {
-      if (heff_flat_kind(flat, i)) { slots[i] = heff_get_word(g); continue; }
-      if (i == n - 1) { last = &slots[i]; break; }
-      heff_msg_get(g, &slots[i]);
-    }
-    if (!last) return;
-    at = last;
-  }
-}
-
-// (the message's value, made here; the message freed)
-HEFF_FN V heff_msg_value(HeffMsg *m) {
-  HeffGet g = { m, 0, NULL, 0, 0 };
-  V v = 0;
-  heff_msg_get(&g, &v);
-  free(g.made);
-  free(m->w);
-  free(m);
-  return v;
-}
-
-// (a channel: the messages sent and not yet received, in order; and,
-// once asked for, a descriptor that is readable while there are any --
-// a pipe, a byte in it as long as the channel holds something, for a
-// wait of the reactor's to poll.  Held by the places that have it, each
-// as a foreign value of its own -- `heff_chan_hold` as it crosses to
-// one, `heff_chan_drop` as one drops its last reference -- and freed,
-// what it still holds dropped, when none has it)
-#ifndef _WIN32
-#include <fcntl.h>
-#endif
-typedef struct {
-  pthread_mutex_t mu;
-  pthread_cond_t cv;
-  HeffMsg *first, *last;
-  int fd[2];
-  int holders;
-} HeffChan;
-
-HEFF_FN HeffChan *heff_chan_new(void) {
-  HeffChan *ch = heff_alloc(sizeof *ch);
-  pthread_mutex_init(&ch->mu, NULL);
-  pthread_cond_init(&ch->cv, NULL);
-  ch->first = ch->last = NULL;
-  ch->fd[0] = ch->fd[1] = -1;
-  ch->holders = 1;
-  return ch;
-}
-
-HEFF_FN void heff_chan_hold(void *x) {
-  HeffChan *ch = x;
-  pthread_mutex_lock(&ch->mu);
-  ch->holders++;
-  pthread_mutex_unlock(&ch->mu);
-}
-
-HEFF_FN HeffMsg *heff_chan_take(HeffChan *ch, int wait);
-HEFF_FN V heff_msg_value(HeffMsg *m);
-
-HEFF_FN void heff_chan_drop(void *x) {
-  HeffChan *ch = x;
-  pthread_mutex_lock(&ch->mu);
-  int left = --ch->holders;
-  pthread_mutex_unlock(&ch->mu);
-  if (left > 0) return;
-  HeffMsg *m;
-  while ((m = heff_chan_take(ch, 0))) heff_drop(heff_msg_value(m));
-  if (ch->fd[0] >= 0) close(ch->fd[0]);
-  if (ch->fd[1] >= 0) close(ch->fd[1]);
-  pthread_cond_destroy(&ch->cv);
-  pthread_mutex_destroy(&ch->mu);
-  free(ch);
-}
-
-#ifndef _WIN32
-HEFF_FN void heff_chan_mark(HeffChan *ch) {
-  char b = 1;
-  if (ch->fd[1] >= 0) while (write(ch->fd[1], &b, 1) < 0 && errno == EINTR) {}
-}
-
-HEFF_FN void heff_chan_unmark(HeffChan *ch) {
-  char b[64];
-  if (ch->fd[0] >= 0) while (read(ch->fd[0], b, sizeof b) > 0) {}
-}
-#else
-HEFF_FN void heff_chan_mark(HeffChan *ch) { (void)ch; }
-HEFF_FN void heff_chan_unmark(HeffChan *ch) { (void)ch; }
-#endif
-
-// (`v` sent on `ch`, consumed: as a message, made before the channel is
-// touched, so that what was moved is wholly the message's by then)
-HEFF_FN void heff_chan_send(HeffChan *ch, V v) {
-  HeffMsg *m = heff_msg_of(v);
-  pthread_mutex_lock(&ch->mu);
-  int was_empty = ch->first == NULL;
-  if (ch->last) ch->last->next = m;
-  else ch->first = m;
-  ch->last = m;
-  if (was_empty) heff_chan_mark(ch);
-  pthread_cond_signal(&ch->cv);
-  pthread_mutex_unlock(&ch->mu);
-}
-
-// (the first message of `ch`, taken: where `wait`, waiting for one;
-// else NULL where there is none)
-HEFF_FN HeffMsg *heff_chan_take(HeffChan *ch, int wait) {
-  pthread_mutex_lock(&ch->mu);
-  while (!ch->first && wait) pthread_cond_wait(&ch->cv, &ch->mu);
-  HeffMsg *m = ch->first;
-  if (m) {
-    ch->first = m->next;
-    if (!ch->first) { ch->last = NULL; heff_chan_unmark(ch); }
-  }
-  pthread_mutex_unlock(&ch->mu);
-  return m;
-}
-
-// (the next value sent on `ch`, waited for, made here)
-HEFF_FN V heff_chan_recv(HeffChan *ch) { return heff_msg_value(heff_chan_take(ch, 1)); }
-
-// (a descriptor readable while `ch` holds a message: for a receive that
-// is a wait of the reactor's -- -1 where the system has none)
-HEFF_FN int heff_chan_fd(HeffChan *ch) {
-#ifdef _WIN32
-  return -1;
-#else
-  pthread_mutex_lock(&ch->mu);
-  if (ch->fd[0] < 0) {
-    if (pipe(ch->fd) == 0) {
-      fcntl(ch->fd[0], F_SETFL, fcntl(ch->fd[0], F_GETFL) | O_NONBLOCK);
-      fcntl(ch->fd[1], F_SETFL, fcntl(ch->fd[1], F_GETFL) | O_NONBLOCK);
-      if (ch->first) heff_chan_mark(ch);
-    } else ch->fd[0] = ch->fd[1] = -1;
-  }
-  int fd = ch->fd[0];
-  pthread_mutex_unlock(&ch->mu);
-  return fd;
-#endif
-}
-
-// (a place: its thread, what it is to run -- a computation of the world,
-// a function of its continuation, as a message -- and, once it has run,
-// its value as a message, or why it failed)
-typedef struct {
-  pthread_t tid;
-  HeffMsg *in, *out;
-  char *dir;          // (its working directory, its starter's at first)
-  char *why;
-  int joined;
-  int fd[2];          // (a pipe, a byte in it once the place has ended:
-                      //  for a join that is a wait of the reactor's;
-                      //  -1 where the system has none)
-} HeffPlace;
-
-HEFF_FN V heff_kept(V self, V *a);
-
-// (the place's thread: its computation made its own, run to its end
-// under a catch, its value or its failure kept for the join; its pages
-// then given back or abandoned, as any thread's)
-HEFF_FN void *heff_place_run(void *u) {
-  HeffPlace *p = u;
-  heff_dir_take(p->dir);
-  p->dir = NULL;
-  V c = heff_msg_value(p->in);
-  p->in = NULL;
-  V r;
-  const char *why = heff_try(c, heff_clo(heff_kept, 1, 0, NULL), &r);
-  if (why) {
-    size_t n = strlen(why) + 1;
-    p->why = heff_alloc(n);
-    memcpy(p->why, why, n);
-  } else p->out = heff_msg_of(r);
-  heff_thread_end();
-#ifndef _WIN32
-  char b = 1;
-  if (p->fd[1] >= 0) while (write(p->fd[1], &b, 1) < 0 && errno == EINTR) {}
-#endif
-  return NULL;
-}
-
-// (a place the program dropped: joined first, where it was not, its
-// value or its failure left unread; then freed)
-HEFF_FN void heff_place_let_go(void *x) {
-  HeffPlace *p = x;
-  if (!p->joined) {
-    pthread_join(p->tid, NULL);
-    if (p->out) heff_drop(heff_msg_value(p->out));
-  }
-  free(p->why);
-  if (p->fd[0] >= 0) { close(p->fd[0]); close(p->fd[1]); }
-  free(p);
-}
-
-// (`c`, a computation of the world, run in a place of its own: the
-// place, a foreign value of the starter's; `c` consumed, crossing as a
-// message)
-HEFF_FN V heff_place_start(V c) {
-  HeffPlace *p = heff_alloc(sizeof *p);
-  p->in = heff_msg_of(c);
-  p->out = NULL;
-  p->dir = heff_dir_copy();
-  p->why = NULL;
-  p->joined = 0;
-  p->fd[0] = p->fd[1] = -1;
-#ifndef _WIN32
-  if (pipe(p->fd) == 0) {
-    fcntl(p->fd[0], F_SETFL, fcntl(p->fd[0], F_GETFL) | O_NONBLOCK);
-    fcntl(p->fd[1], F_SETFL, fcntl(p->fd[1], F_GETFL) | O_NONBLOCK);
-  } else p->fd[0] = p->fd[1] = -1;
-#endif
-  if (heff_thread_start(&p->tid, heff_place_run, p) != 0) heff_fail("places: cannot start a place");
-  return heff_foreign(p, heff_place_let_go);
-}
-
-// (a descriptor readable once the place `v` has ended: for a join that
-// is a wait of the reactor's -- -1 where the system has none)
-HEFF_FN int heff_place_fd(V v) {
-  HeffPlace *p = heff_foreign_ptr(v);
-  return p->fd[0];
-}
-
-// (the place `v` is joined: its value, made here; or its failure, this
-// thread's now -- a place is joined once)
-HEFF_FN V heff_place_join(V v) {
-  HeffPlace *p = heff_foreign_ptr(v);
-  if (p->joined) heff_fail("places: a place joined twice");
-  p->joined = 1;
-  pthread_join(p->tid, NULL);
-  HeffMsg *out = p->out;
-  char *why = p->why;
-  p->out = NULL;
-  p->why = NULL;
-  if (why) heff_fail_again(why);
-  return heff_msg_value(out);
-}
-#endif
-
 // Outside operations done later: the reactor (#43)
 // ---------------------------------------------------------------------
 //
@@ -4863,12 +4188,9 @@ HEFF_FN V heff_place_join(V v) {
 // the reactor waiting no longer than the nearest deadline.
 //
 // Each thread of the system has a reactor of its own (`HEFF_TLS`): its
-// waits are its own, waited for by it alone.  So each place has one
-// (#97), driven by the scheduler running in it: a green thread of a
-// place that waits -- on a channel, a command, a socket, a sleep, a
-// place it joins -- is pending in that place's reactor, the other
-// green threads of the place going on, and nothing of one place's
-// reactor is touched by another.
+// waits are its own, waited for by it alone, driven by the scheduler
+// running in it, and nothing of one thread's reactor is touched by
+// another.
 
 #include <errno.h>
 #include <time.h>
@@ -5371,7 +4693,7 @@ HEFF_FN HANDLE heff_spawn(char **as, HANDLE out, HANDLE err) {
   si.hStdOutput = out;
   si.hStdError = err;
   PROCESS_INFORMATION pi;
-  int ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, NULL, heff_place_dir(), &si, &pi);
+  int ok = CreateProcessA(NULL, line, NULL, NULL, TRUE, 0, NULL, heff_working_dir(), &si, &pi);
   free(line);
   if (!ok) return 0;
   CloseHandle(pi.hThread);
@@ -5434,7 +4756,7 @@ HEFF_FN int64_t heff_capture(char **as, Buf *bo, Buf *be) {
   int po[2], pe[2];
   if (pipe(po) == 0 && pipe(pe) == 0) {
     int closed[2] = { po[0], pe[0] };
-    pid_t pid = heff_exec_in_place(as, NULL, -1, po[1], pe[1], closed, 2);
+    pid_t pid = heff_exec_in_dir(as, NULL, -1, po[1], pe[1], closed, 2);
     int ok = pid > 0;
     close(po[1]);
     close(pe[1]);
