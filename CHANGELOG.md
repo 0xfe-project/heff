@@ -30,6 +30,10 @@
 - A stack overflow is an error, not a crash: a C program says `heff: stack overflow` and exits with 2, from any thread heff starts. Where a failure is caught, so is an overflow, as "stack overflow": a std.thread worker hands it to the thread that joins it, and a language server request fails alone. `heff check` on a file nested too deep says so, and the language server reports it on the file and keeps serving. Catching a failure no longer saves the signal mask.
 - A program using threads built as parts (`heff build`, `heff compile DIR/`) no longer crashes: every C file now sees threads mode, not only the one with `main`.
 
+### Compiler and tools
+
+- `heff get` takes a package no tag is a version of at a pseudo-version, `0.0.0-TIME-COMMIT`, of its default branch's commit, or with `PATH@BRANCH` or `PATH@COMMIT` of that commit. A pseudo-version is older than every release.
+
 ### Docs
 
 - New language reference pages for lazy values and for theories.
