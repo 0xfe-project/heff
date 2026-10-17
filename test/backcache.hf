@@ -18,6 +18,7 @@ module test.backcache
 
 import check
 import co
+import exception
 import std.filesystem
 import std.path as Path
 import std.process
@@ -44,34 +45,35 @@ statusOf _ = "null"
 said : Ran -> String
 said r = r.out ^ "--stderr--\n" ^ r.err ^ "--exit " ^ statusOf r.ended ^ "\n"
 
--- (files written, each a path and its text; else the test fails)
+-- (files written, each a path and its text)
 writeAll : {e : HFunctor}
-         -> {{chk : check <: e}}
          -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
          -> List (Pair String String)
          -> Co e Unit
 writeAll Nil = pure MkUnit
 writeAll (Cons (MkPair path text) rest) = do
-  ok <- writeFile path text
-  if ok then writeAll rest else failure ("could not write " ^ path)
+  writeFile path text
+  writeAll rest
 
 -- (these files of the project's library copied into `lib/`)
 copied : {e : HFunctor}
-       -> {{chk : check <: e}}
        -> {{disk : filesystem <: e}}
+       -> {{fx : exception FileError <: e}}
        -> String
        -> List String
        -> Co e Unit
 copied from Nil = pure MkUnit
 copied from (Cons n rest) = do
-  ok <- copy (from ^ "/" ^ n) ("lib/" ^ n)
-  if ok then copied from rest else failure ("could not copy " ^ n)
+  copy (from ^ "/" ^ n) ("lib/" ^ n)
+  copied from rest
 
 -- (a program of `backcache/`, its text)
 programText : {e : HFunctor}
             -> {{chk : check <: e}}
             -> {{sys : process <: e}}
             -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
             -> String
             -> String
             -> Co e String
@@ -81,7 +83,7 @@ programText name argList = do
   pure
       (joinWith
          ("module " ^ argList)
-         (split ("module test.backcache." ^ name) (fromMaybe "" text)))
+         (split ("module test.backcache." ^ name) text))
 
 -- The programs
 --------------------------------------------------------------------------------
@@ -133,6 +135,7 @@ project : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> Co e Unit
 project = do
   root <- given "HEFF_TEST_ROOT"
@@ -140,7 +143,7 @@ project = do
   made <- makeDirectory "lib"
   copied
       (root ^ "/lib")
-      (List.keepIf (\n -> endsWith ".hf" n) (fromMaybe Nil names))
+      (List.keepIf (\n -> endsWith ".hf" n) (List.map Path.basename names))
   writeAll
       [ MkPair "a.hf" (stepping 1)
       , MkPair "main.hf" printing
@@ -160,29 +163,41 @@ versioned n =
     (\i -> byteAt n i >= 48 && byteAt n i <= 57)
     (List.range 1 (strLength n - 1))
 
+-- (the names in a directory; none where there is no directory)
+namesIn : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> String
+        -> Co e (List String)
+namesIn dir =
+  recover
+    (bind (readDirectory dir) (\ps -> pure (List.map Path.basename ps)))
+    (\(_ : FileError) -> pure Nil)
+
 -- | the backend's cache directory (`.heff/bN/`)
-backDir : {e : HFunctor} -> {{disk : filesystem <: e}} -> Co e String
+backDir : {e : HFunctor}
+        -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
+        -> Co e String
 backDir = do
-  names <- readDirectory ".heff"
-  pure
-      (".heff/"
-       ^ fromMaybe "b?" (List.find versioned (fromMaybe Nil names)))
+  names <- namesIn ".heff"
+  pure (".heff/" ^ fromMaybe "b?" (List.find versioned names))
 
 -- | the cache's files, each a path, sorted
 cacheFiles : {e : HFunctor}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> Co e (List String)
 cacheFiles = do
   dir <- backDir
-  names <- readDirectory dir
+  names <- namesIn dir
   pure
       (List.map
          (\n -> dir ^ "/" ^ n)
-         (List.sort
-            (List.keepIf (\n -> endsWith ".hb" n) (fromMaybe Nil names))))
+         (List.sort (List.keepIf (\n -> endsWith ".hb" n) names)))
 
 -- (whether the cache has a module's file)
-kept : {e : HFunctor} -> {{disk : filesystem <: e}} -> String -> Co e Bool
+kept : {e : HFunctor} -> {{disk : filesystem <: e}} -> {{fx : exception FileError <: e}} -> String -> Co e Bool
 kept m = do
   files <- cacheFiles
   pure (List.any (\f -> endsWith ("/" ^ m ^ ".hb") f) files)
@@ -190,17 +205,22 @@ kept m = do
 -- (when each of these files was last written)
 modifiedAll : {e : HFunctor}
             -> {{disk : filesystem <: e}}
+            -> {{fx : exception FileError <: e}}
             -> List String
             -> Co e (List Int)
 modifiedAll Nil = pure Nil
 modifiedAll (Cons f rest) = do
-  status <- pathStatus f
+  m <-
+    recover
+      (bind (pathStatus f) (\s -> pure s.modified))
+      (\(_ : FileError) -> pure (0 - 1))
   others <- modifiedAll rest
-  pure (Cons (either (\_ -> 0 - 1) (\(s : Status) -> s.modified) status) others)
+  pure (Cons m others)
 
 -- (the cache's files removed)
 removedAll : {e : HFunctor}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> List String
            -> Co e Unit
 removedAll Nil = pure MkUnit
@@ -212,12 +232,13 @@ removedAll (Cons f rest) = do
 corrupted : {e : HFunctor}
           -> {{chk : check <: e}}
           -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
           -> List String
           -> Co e Unit
 corrupted Nil = pure MkUnit
 corrupted (Cons f rest) = do
   text <- readFile f
-  writeAll [MkPair f (strSlice (fromMaybe "" text) 0 100)]
+  writeAll [MkPair f (strSlice text 0 100)]
   corrupted rest
 
 -- (a run of the cache leaves its files alone: when each was written, the
@@ -225,6 +246,7 @@ corrupted (Cons f rest) = do
 leftAlone : {e : HFunctor}
           -> {{chk : check <: e}}
           -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
           -> String
           -> List String
           -> List Int
@@ -243,6 +265,7 @@ type Made = { ran : Ran, files : List (Pair String String) }
 -- (these files of a directory read, each a name and its text)
 readAll : {e : HFunctor}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> String
         -> List String
         -> Co e (List (Pair String String))
@@ -250,7 +273,7 @@ readAll dir Nil = pure Nil
 readAll dir (Cons n rest) = do
   text <- readFile (dir ^ "/" ^ n)
   others <- readAll dir rest
-  pure (Cons (MkPair n (fromMaybe "" text)) others)
+  pure (Cons (MkPair n text) others)
 
 -- (heff run in the test's directory)
 heffIn : {e : HFunctor}
@@ -267,12 +290,13 @@ compiled : {e : HFunctor}
          -> {{chk : check <: e}}
          -> {{sys : process <: e}}
          -> {{disk : filesystem <: e}}
+         -> {{fx : exception FileError <: e}}
          -> String
          -> Co e Made
 compiled out = do
   r <- heffIn ["compile", "main.hf", out ^ "/", "--name", "main", "--backend=c"]
   names <- readDirectory out
-  files <- readAll out (List.sort (fromMaybe Nil names))
+  files <- readAll out (List.sort (List.map Path.basename names))
   pure { ran = r, files = files }
 
 -- | the page's script compiled to `out`, through the cache
@@ -280,18 +304,20 @@ compiledJs : {e : HFunctor}
            -> {{chk : check <: e}}
            -> {{sys : process <: e}}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> String
            -> Co e Made
 compiledJs out = do
   r <- heffIn ["compile", "page.hf", out, "--name", "main", "--backend=page"]
   text <- readFile out
-  pure { ran = r, files = [MkPair "js" (fromMaybe "" text)] }
+  pure { ran = r, files = [MkPair "js" text] }
 
 -- | compiled cold: the cache's files removed first
 cold : {e : HFunctor}
      -> {{chk : check <: e}}
      -> {{sys : process <: e}}
      -> {{disk : filesystem <: e}}
+     -> {{fx : exception FileError <: e}}
      -> (String -> Co e Made)
      -> String
      -> Co e Made
@@ -326,6 +352,7 @@ runs : {e : HFunctor}
      -> {{chk : check <: e}}
      -> {{sys : process <: e}}
      -> {{disk : filesystem <: e}}
+     -> {{fx : exception FileError <: e}}
      -> String
      -> Co e String
 runs out = do
@@ -335,7 +362,7 @@ runs out = do
     pure
       (List.map
          (\n -> out ^ "/" ^ n)
-         (List.keepIf (\n -> endsWith ".c" n) (fromMaybe Nil names)))
+         (List.keepIf (\n -> endsWith ".c" n) (List.map Path.basename names)))
   runtime <-
     run
       { command = "zig"
@@ -395,6 +422,7 @@ viaC : {e : HFunctor}
      -> {{chk : check <: e}}
      -> {{sys : process <: e}}
      -> {{disk : filesystem <: e}}
+     -> {{fx : exception FileError <: e}}
      -> Co e Unit
 viaC = do
   project
@@ -436,6 +464,7 @@ javascript : {e : HFunctor}
            -> {{chk : check <: e}}
            -> {{sys : process <: e}}
            -> {{disk : filesystem <: e}}
+           -> {{fx : exception FileError <: e}}
            -> Co e Unit
 javascript = do
   project
@@ -481,6 +510,7 @@ newGlobal : {e : HFunctor}
           -> {{chk : check <: e}}
           -> {{sys : process <: e}}
           -> {{disk : filesystem <: e}}
+          -> {{fx : exception FileError <: e}}
           -> Co e Unit
 newGlobal = do
   project
@@ -504,6 +534,7 @@ ticking : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> Co e Unit
 ticking = do
   project
@@ -521,6 +552,7 @@ stacked : {e : HFunctor}
         -> {{chk : check <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> Co e Unit
 stacked = do
   project

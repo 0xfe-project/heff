@@ -13,17 +13,17 @@ import co
 import std.filesystem
 import std.io
 
-save : {e : HFunctor}
+look : {e : HFunctor}
      -> {{io : stdio <: e}}
      -> {{disk : filesystem <: e}}
      -> Co e Unit
-save = do
-  ok <- writeFile "hello.txt" "hello"
-  print (if ok then "written" else "not written")
+look = do
+  there <- exists "hello.txt"
+  print (if there then "hello.txt is there" else "no hello.txt")
 
 main : Co (stdio <+> filesystem) Unit
 main =
-  save
+  look
     (io := inl stdio filesystem)
     (disk := inr stdio filesystem)
 ```

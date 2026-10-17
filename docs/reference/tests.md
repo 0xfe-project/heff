@@ -94,7 +94,7 @@ tool =
     [ integration "writes its output where it is run" (do
         r <- run { command = "sh", args = ["-c", "echo hi > out.txt"] }
         out <- readFile "out.txt"
-        assertEqual out (Just "hi\n"))
+        assertEqual out "hi\n")
     , within 5000 (integration "answers quickly" (do
         r <- run { command = "true" }
         assert "it ended well" (succeeded r)))
@@ -102,7 +102,9 @@ tool =
 ```
 
 An integration test can also run commands and use files: it gets
-`std.process` and `std.filesystem` besides `check`.
+`std.process` and `std.filesystem` besides `check`, and what they throw
+(`exception ProcessError`, `exception FileError`). A throw the test does
+not hear fails it.
 
 - `heff test` builds the file's tests into a C program, and runs each
   integration test in a process of its own.
@@ -121,20 +123,21 @@ An integration test can also run commands and use files: it gets
 each : {e : HFunctor}
      -> {{chk : check <: e}}
      -> {{disk : filesystem <: e}}
+     -> {{fx : exception FileError <: e}}
      -> List String
      -> Co e Unit
 each [] = pure MkUnit
 each (n :: rest) = do
   subtest n (do
     text <- readFile ("inputs/" ^ n)
-    golden n (fromMaybe "" text))
+    golden n text)
   each rest
 
 inputs : Test
 inputs =
   integration "files" (do
-    names <- readDirectory "inputs"
-    each (List.sort (fromMaybe [] names)))
+    paths <- readDirectory "inputs"
+    each (List.sort (List.map basename paths)))
 ```
 
 `subtest NAME body`, as Go's `t.Run`, makes a test while an integration

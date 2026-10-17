@@ -9,6 +9,7 @@
 module test.node.bytes
 
 import co
+import exception
 import rune as Rune
 import std.filesystem
 import std.io
@@ -41,29 +42,51 @@ sameBack True input (Just back) = if strEq back input then "same" else "not same
 sameBack True input Nothing = "not read"
 sameBack False input back = "not written"
 
+-- | whether an operation of the files was done (what it threw heard)
+did : {e : HFunctor}
+    -> {{fx : exception FileError <: e}}
+    -> Co e Unit
+    -> Co e Bool
+did c = recover (bind c (\_ -> pure True)) (\(_ : FileError) -> pure False)
+
+-- | what an operation of the files gave, if it gave anything
+got : {e : HFunctor}
+    -> {a : Type}
+    -> {{fx : exception FileError <: e}}
+    -> Co e a
+    -> Co e (Maybe a)
+got c = recover (bind c (\x -> pure (Just x))) (\(_ : FileError) -> pure Nothing)
+
 -- | the input, into a file of `dir` and back; the directory's names; and
 -- | a path with a NUL in it
 files : {e : HFunctor}
       -> {{io : stdio <: e}}
       -> {{disk : filesystem <: e}}
+      -> {{fx : exception FileError <: e}}
       -> String
       -> String
       -> Co e Unit
 files dir input = do
-  written <- writeFile (dir ^ "/bytes-\u{e9}\u{1F600}.bin") input
-  back <- readFile (dir ^ "/bytes-é😀.bin")
+  written <- did (writeFile (dir ^ "/bytes-\u{e9}\u{1F600}.bin") input)
+  back <- got (readFile (dir ^ "/bytes-é😀.bin"))
   print ("file: " ^ sameBack written input back)
-  names <- readDirectory dir
-  print ("names: " ^ maybe "none" (\ns -> joinWith " " (List.map hexOf ns)) names)
-  nul <- writeFile (dir ^ "/a" ^ fromByte 0 ^ "b") input
+  names <- got (readDirectory dir)
+  print
+    ("names: "
+     ^ maybe
+         "none"
+         (\ps -> joinWith " " (List.map (\p -> hexOf (Path.basename p)) ps))
+         names)
+  nul <- did (writeFile (dir ^ "/a" ^ fromByte 0 ^ "b") input)
   print ("a NUL in a path, written: " ^ yes nul)
-  nulRead <- readFile (dir ^ "/bytes-é😀.bin" ^ fromByte 0)
+  nulRead <- got (readFile (dir ^ "/bytes-é😀.bin" ^ fromByte 0))
   print ("a NUL in a path, read: " ^ yes (maybe False (\_ -> True) nulRead))
 
 program : {e : HFunctor}
         -> {{io : stdio <: e}}
         -> {{sys : process <: e}}
         -> {{disk : filesystem <: e}}
+        -> {{fx : exception FileError <: e}}
         -> Co e Unit
 program = do
   input <- readStdin
@@ -85,10 +108,19 @@ program = do
   v <- getEnv "HEFF_BYTES"
   print ("environment: " ^ maybe "none" hexOf v)
 
--- where the world is: each sub-effect's evidence, given
+-- where the world is: each sub-effect's evidence, given, and a failure of
+-- the files no operation heard said
 main : Co world Unit
 main =
-  program
-    (io := \p -> InL (InL p))
-    (sys := \p -> InL (InR p))
-    (disk := \p -> InR p)
+  bind
+    (attempt
+       FileError
+       world
+       (program
+          (io := \p -> InR (InL (InL p)))
+          (sys := \p -> InR (InL (InR p)))
+          (disk := \p -> InR (InR p))
+          (fx := \p -> InL p)))
+    (either
+       (\err -> printErr (ev := \p -> InL (InL p)) (showFileError err))
+       (\_ -> pure MkUnit))

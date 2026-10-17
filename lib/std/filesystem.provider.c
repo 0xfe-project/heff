@@ -38,19 +38,29 @@
 #define heff_is_sep(c) ((c) == '/')
 #endif
 
-// (a file's text, if it can be read)
+// (what an operation answers, `Either FileError a`: below, with the open
+// files')
+static V fs_left(int err);
+static V fs_right(V x);
+static V fs_done(void);
+
+// (the errno a failure left, or EIO where it left none)
+static int fs_errno(void) { return errno ? errno : EIO; }
+
+// (a file's text, or why it could not be read)
 static V heff_read_file(const char *path) {
+  errno = 0;
   FILE *f = fopen(path, "rb");
-  if (!f) return heff_nothing;
+  if (!f) return fs_left(fs_errno());
   Buf b = {0};
   char chunk[65536];
   size_t got;
   while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_put(&b, chunk, got);
-  int bad = ferror(f);
+  int bad = ferror(f) ? fs_errno() : 0;
   fclose(f);
   V s = bad ? 0 : heff_str_bytes(b.s ? b.s : "", (int64_t)b.n);
   free(b.s);
-  return bad ? heff_nothing : heff_just(s);
+  return bad ? fs_left(bad) : fs_right(s);
 }
 
 static int heff_write_file(const char *path, V s) {
@@ -82,10 +92,11 @@ static int heff_mkdir_p(char *path) {
   return heff_mkdir(path) == 0 || (errno == EEXIST && heff_is_dir(path));
 }
 
-// (the names in a directory, sorted)
+// (the names in a directory, sorted, or why it could not be read)
 static V heff_read_dir(const char *path) {
+  errno = 0;
   DIR *d = opendir(path);
-  if (!d) return heff_nothing;
+  if (!d) return fs_left(fs_errno());
   int64_t n = 0, cap = 64;
   char **ns = heff_alloc(cap * sizeof(char *));
   struct dirent *e;
@@ -105,7 +116,7 @@ static V heff_read_dir(const char *path) {
   V l = heff_strs_bytes(ns, n);
   for (int64_t i = 0; i < n; i++) free(ns[i]);
   free(ns);
-  return heff_just(l);
+  return fs_right(l);
 }
 
 // (every file and directory under `p`, its mode's write bits off, or on:
@@ -206,17 +217,23 @@ static int heff_nothing_at(const char *p) {
 }
 
 // (what an operation answers where its path is none, a string with a NUL
-// in it: it fails -- `Nothing` where it reads, `False` where it does)
+// in it: EINVAL)
 static V heff_fs_failed(V p) {
   int tag = heff_tag_of(p);
   int at = tag == TAG_WriteFile || tag == TAG_Copy || tag == TAG_Move || tag == TAG_Replace ? 2 : 1;
   V f = heff_dup(heff_field(p, at));
   heff_drop(p);
-  return heff_answer(f, tag == TAG_ReadFile || tag == TAG_ReadDirectory ? heff_nothing : heff_bool(0));
+  return heff_answer(f, fs_left(EINVAL));
 }
 
-// (an operation of whole files and paths: answered by a `Bool` or a
-// `Maybe`)
+// (done, or the errno it failed with: `err` where it is known, else what
+// errno says)
+static V fs_did(int ok, int err) {
+  return ok ? fs_done() : fs_left(err ? err : fs_errno());
+}
+
+// (an operation of whole files and paths: answered by an `Either
+// FileError a`)
 static V heff_fs_whole(V p, V k) {
   char *path = heff_path_in_dir(heff_cstr(heff_field(p, 0)));
   V x;
@@ -232,16 +249,19 @@ static V heff_fs_whole(V p, V k) {
     break;
   }
   case TAG_WriteFile: {
+    errno = 0;
     int ok = heff_write_file(path, heff_field(p, 1));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
-    x = heff_answer(f, heff_bool(ok));
+    x = heff_answer(f, fs_did(ok, 0));
     break;
   }
   case TAG_MakeDirectory: {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    x = heff_answer(f, heff_bool(heff_mkdir_p(path)));
+    errno = 0;
+    int ok = heff_mkdir_p(path);
+    x = heff_answer(f, fs_did(ok, ok || errno ? 0 : ENOTDIR));
     break;
   }
   case TAG_ReadDirectory: {
@@ -253,38 +273,47 @@ static V heff_fs_whole(V p, V k) {
   case TAG_Remove: {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
+    errno = 0;
     int ok = heff_chmod_all(path, 1) != 0 && heff_remove_all(path);
-    x = heff_answer(f, heff_bool(ok));
+    x = heff_answer(f, fs_did(ok, 0));
     break;
   }
   case TAG_ReadOnly: {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    x = heff_answer(f, heff_bool(heff_chmod_all(path, 0) == 1));
+    errno = 0;
+    int r = heff_chmod_all(path, 0);
+    x = heff_answer(f, fs_did(r == 1, r == -1 ? ENOENT : 0));
     break;
   }
   case TAG_Writable: {
     V f = heff_dup(heff_field(p, 1));
     heff_drop(p);
-    x = heff_answer(f, heff_bool(heff_chmod_all(path, 1) == 1));
+    errno = 0;
+    int r = heff_chmod_all(path, 1);
+    x = heff_answer(f, fs_did(r == 1, r == -1 ? ENOENT : 0));
     break;
   }
   case TAG_Copy: {
     char *to = heff_path_in_dir(heff_cstr(heff_field(p, 1)));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
-    int ok = to && heff_nothing_at(to) && heff_copy_all(path, to);
+    int free_ = to && heff_nothing_at(to);
+    errno = 0;
+    int ok = free_ && heff_copy_all(path, to);
+    x = heff_answer(f, fs_did(ok, !to ? EINVAL : !free_ ? EEXIST : 0));
     free(to);
-    x = heff_answer(f, heff_bool(ok));
     break;
   }
   case TAG_Move: {
     char *to = heff_path_in_dir(heff_cstr(heff_field(p, 1)));
     V f = heff_dup(heff_field(p, 2));
     heff_drop(p);
-    int ok = to && heff_nothing_at(to) && rename(path, to) == 0;
+    int free_ = to && heff_nothing_at(to);
+    errno = 0;
+    int ok = free_ && rename(path, to) == 0;
+    x = heff_answer(f, fs_did(ok, !to ? EINVAL : !free_ ? EEXIST : 0));
     free(to);
-    x = heff_answer(f, heff_bool(ok));
     break;
   }
   case TAG_Replace: {
@@ -293,13 +322,14 @@ static V heff_fs_whole(V p, V k) {
     heff_drop(p);
     // (rename(2) puts a file in place of another at once; Windows' does
     // not over one there, MoveFileEx does)
+    errno = 0;
 #ifdef _WIN32
     int ok = to && MoveFileExA(path, to, MOVEFILE_REPLACE_EXISTING) != 0;
 #else
     int ok = to && rename(path, to) == 0;
 #endif
+    x = heff_answer(f, fs_did(ok, !to ? EINVAL : 0));
     free(to);
-    x = heff_answer(f, heff_bool(ok));
     break;
   }
   default:

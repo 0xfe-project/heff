@@ -15,14 +15,26 @@
 -- wordsIn = withStdin (\i -> foldLines i 0 (\n line -> pure (n + List.length (words line))))
 --
 -- -- | a file's text, with a line added
--- appended : {e : HFunctor} -> {{disk : filesystem <: e}} -> Path -> String -> Co e Bool
+-- appended : {e : HFunctor}
+--          -> {{disk : filesystem <: e}}
+--          -> {{ex : exception FileError <: e}}
+--          -> Path
+--          -> String
+--          -> Co e Unit
 -- appended path line = do
 --   text <- readFile path
---   writeFile path (fromMaybe "" text ^ line ^ "\n")
+--   writeFile path (text ^ line ^ "\n")
 --
--- -- | the log of a day, in a directory
--- logged : {e : HFunctor} -> {{disk : filesystem <: e}} -> Path -> String -> Co e Bool
--- logged dir line = appended (dir / "log.txt") line
+-- -- | the files under a directory, and under those in it
+-- filesUnder : {e : HFunctor}
+--            -> {{disk : filesystem <: e}}
+--            -> {{ex : exception FileError <: e}}
+--            -> Path
+--            -> Co e (List Path)
+-- filesUnder dir = do
+--   lists <- for p in (<- readDirectory dir) do
+--     if <- isDirectory p then filesUnder p else pure [p]
+--   pure (List.concatMap (\ps -> ps) lists)
 -- ```
 --
 -- A path is std.path's `Path`; a string is taken as one where one is
@@ -43,11 +55,12 @@
 -- open when their body ends, so that a program reads its input a line at a
 -- time, in as little memory as a line takes.
 --
--- An operation that fails gives a value, an `Either FileError a`: the
--- system's errno, its name and what the system says of it; a whole-file
--- one (`writeFile`, `remove`, ...) gives whether it worked.  A file that
--- does not open or close is no answer of the body `withFile` runs, so it
--- is thrown, over the `exception` effect.
+-- An operation on a path that fails throws why, a `FileError`, over the
+-- `exception` effect: the system's errno, its name and what the system
+-- says of it.  Whether something is at a path (`exists`, `isFile`,
+-- `isDirectory`, `kindAt`) is asked without a throw.  So is a file that
+-- does not open or close thrown, as no answer of the body `withFile`
+-- runs; an operation on a file open gives an `Either FileError a`.
 --
 -- A regular file is read and written there and then: the system has it
 -- ready at once, as far as poll can tell, so even where green threads are
@@ -163,16 +176,16 @@ type OpenOptions =
   }
 
 data FilesystemF (m : Type -> Type) x
-  = ReadFile String (Maybe String -> x)
-  | WriteFile String String (Bool -> x)
-  | MakeDirectory String (Bool -> x)
-  | ReadDirectory String (Maybe (List String) -> x)
-  | Remove String (Bool -> x)
-  | ReadOnly String (Bool -> x)
-  | Copy String String (Bool -> x)
-  | Move String String (Bool -> x)
-  | Replace String String (Bool -> x)
-  | Writable String (Bool -> x)
+  = ReadFile String (Either FileError String -> x)
+  | WriteFile String String (Either FileError Unit -> x)
+  | MakeDirectory String (Either FileError Unit -> x)
+  | ReadDirectory String (Either FileError (List String) -> x)
+  | Remove String (Either FileError Unit -> x)
+  | ReadOnly String (Either FileError Unit -> x)
+  | Copy String String (Either FileError Unit -> x)
+  | Move String String (Either FileError Unit -> x)
+  | Replace String String (Either FileError Unit -> x)
+  | Writable String (Either FileError Unit -> x)
   | PathStatus String Bool (Either FileError Status -> x)
   | SetMode String Int (Either FileError Unit -> x)
   | RealPath String (Either FileError String -> x)
@@ -247,99 +260,143 @@ filesystem =
 -- Whole files
 --------------------------------------------------------------------------------
 
--- | A file's text, if it could be read: in any effect the files are in,
--- | by the evidence.
+-- (what an operation answered, or what it failed with thrown)
+answered : {e : HFunctor}
+         -> {a : Type}
+         -> {{ex : exception FileError <: e}}
+         -> Either FileError a
+         -> Co e a
+answered (Left err) = throw err
+answered (Right x) = pure x
+
+-- | A file's text: in any effect the files are in, by the evidence; where
+-- | it cannot be read, why is thrown.
 readFile : {e : HFunctor}
          -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
          -> Path
-         -> Co e (Maybe String)
-readFile path = op (ev (ReadFile (render path) (\t -> t))) val
+         -> Co e String
+readFile path = bind (op (ev (ReadFile (render path) (\r -> r))) val) answered
 
--- | Write a file (a new one, or over what it had): whether it was written.
+-- | Write a file (a new one, or over what it had).
 writeFile : {e : HFunctor}
           -> {{ev : filesystem <: e}}
+          -> {{ex : exception FileError <: e}}
           -> Path
           -> String
-          -> Co e Bool
-writeFile path str = op (ev (WriteFile (render path) str (\ok -> ok))) val
+          -> Co e Unit
+writeFile path str =
+  bind (op (ev (WriteFile (render path) str (\r -> r))) val) answered
 
--- | Make a directory (and the ones above it): whether a directory is
--- | there (a file there is none).
+-- | Make a directory, and the ones above it, where there is none (a file
+-- | there is none: `EEXIST`).
 makeDirectory : {e : HFunctor}
               -> {{ev : filesystem <: e}}
+              -> {{ex : exception FileError <: e}}
               -> Path
-              -> Co e Bool
-makeDirectory path = op (ev (MakeDirectory (render path) (\ok -> ok))) val
+              -> Co e Unit
+makeDirectory path =
+  bind (op (ev (MakeDirectory (render path) (\r -> r))) val) answered
 
--- | The names in a directory, sorted, if it is one that could be read.
+-- | What a directory holds, each in it (`path / name`), sorted by name.
 readDirectory : {e : HFunctor}
               -> {{ev : filesystem <: e}}
+              -> {{ex : exception FileError <: e}}
               -> Path
-              -> Co e (Maybe (List String))
-readDirectory path = op (ev (ReadDirectory (render path) (\ns -> ns))) val
+              -> Co e (List Path)
+readDirectory path =
+  bind
+    (op (ev (ReadDirectory (render path) (\r -> r))) val)
+    (\r -> bind (answered r) (\ns -> pure (List.map (\n -> path / parse n) ns)))
 
 -- | Remove a file, or a directory and all it holds (read-only or not):
--- | whether it is gone.
-remove : {e : HFunctor} -> {{ev : filesystem <: e}} -> Path -> Co e Bool
-remove path = op (ev (Remove (render path) (\ok -> ok))) val
+-- | where nothing is, nothing is done.
+remove : {e : HFunctor}
+       -> {{ev : filesystem <: e}}
+       -> {{ex : exception FileError <: e}}
+       -> Path
+       -> Co e Unit
+remove path = bind (op (ev (Remove (render path) (\r -> r))) val) answered
 
--- | Make a file, or a directory and all it holds, read-only: whether it
--- | was made so.
-readOnly : {e : HFunctor} -> {{ev : filesystem <: e}} -> Path -> Co e Bool
-readOnly path = op (ev (ReadOnly (render path) (\ok -> ok))) val
+-- | Make a file, or a directory and all it holds, read-only.
+readOnly : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
+         -> Path
+         -> Co e Unit
+readOnly path = bind (op (ev (ReadOnly (render path) (\r -> r))) val) answered
 
 -- | Make a file, or a directory and all it holds, writable by its owner
--- | again (`readOnly` undone): whether it was made so.
-writable : {e : HFunctor} -> {{ev : filesystem <: e}} -> Path -> Co e Bool
-writable path = op (ev (Writable (render path) (\ok -> ok))) val
+-- | again (`readOnly` undone).
+writable : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
+         -> Path
+         -> Co e Unit
+writable path = bind (op (ev (Writable (render path) (\r -> r))) val) answered
 
 -- | Copy a file, or a directory and all it holds, to `to`, where nothing
--- | is (links followed, modes kept): whether it was copied.
+-- | is (links followed, modes kept; something there: `EEXIST`).
 copy : {e : HFunctor}
      -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
      -> Path
      -> Path
-     -> Co e Bool
-copy path to = op (ev (Copy (render path) (render to) (\ok -> ok))) val
+     -> Co e Unit
+copy path to =
+  bind (op (ev (Copy (render path) (render to) (\r -> r))) val) answered
 
 -- | Move a file, or a directory, to `to`, on the same disk, where nothing
--- | is: whether it was moved.
+-- | is (something there: `EEXIST`).
 move : {e : HFunctor}
      -> {{ev : filesystem <: e}}
+     -> {{ex : exception FileError <: e}}
      -> Path
      -> Path
-     -> Co e Bool
-move path to = op (ev (Move (render path) (render to) (\ok -> ok))) val
+     -> Co e Unit
+move path to =
+  bind (op (ev (Move (render path) (render to) (\r -> r))) val) answered
 
 -- | Move a file to `to`, on the same disk, in place of the file there if
 -- | there is one, at once: what opens `to` meanwhile opens the one or the
 -- | other, never neither nor a part of either, and what had the one open
--- | keeps it (on Windows, not in place of a program running): whether it
--- | was moved.
+-- | keeps it (on Windows, not in place of a program running).
 replace : {e : HFunctor}
         -> {{ev : filesystem <: e}}
+        -> {{ex : exception FileError <: e}}
         -> Path
         -> Path
-        -> Co e Bool
-replace path to = op (ev (Replace (render path) (render to) (\ok -> ok))) val
+        -> Co e Unit
+replace path to =
+  bind (op (ev (Replace (render path) (render to) (\r -> r))) val) answered
 
 -- What a path is
 --------------------------------------------------------------------------------
 
+-- (what the system says of the file at a path, or why it says nothing)
+statusOf : {e : HFunctor}
+         -> {{ev : filesystem <: e}}
+         -> Path
+         -> Co e (Either FileError Status)
+statusOf path = op (ev (PathStatus (render path) True (\r -> r))) val
+
 -- | What the system says of the file at a path, links followed.
 pathStatus : {e : HFunctor}
            -> {{ev : filesystem <: e}}
+           -> {{ex : exception FileError <: e}}
            -> Path
-           -> Co e (Either FileError Status)
-pathStatus path = op (ev (PathStatus (render path) True (\r -> r))) val
+           -> Co e Status
+pathStatus path = bind (statusOf path) answered
 
 -- | What the system says of the file at a path, a link itself where
 -- | there is one (its kind `Link`), not what it links to.
 linkStatus : {e : HFunctor}
            -> {{ev : filesystem <: e}}
+           -> {{ex : exception FileError <: e}}
            -> Path
-           -> Co e (Either FileError Status)
-linkStatus path = op (ev (PathStatus (render path) False (\r -> r))) val
+           -> Co e Status
+linkStatus path =
+  bind (op (ev (PathStatus (render path) False (\r -> r))) val) answered
 
 -- (a status's kind, where there is one)
 kindOf : Either FileError Status -> Maybe Kind
@@ -352,7 +409,7 @@ kindAt : {e : HFunctor}
        -> {{ev : filesystem <: e}}
        -> Path
        -> Co e (Maybe Kind)
-kindAt path = bind (pathStatus path) (\r -> pure (kindOf r))
+kindAt path = bind (statusOf path) (\r -> pure (kindOf r))
 
 -- (whether a kind is there, and is what `want` says)
 kindIs : (Kind -> Bool) -> Maybe Kind -> Bool
@@ -386,49 +443,41 @@ isDirectory path = bind (kindAt path) (\k -> pure (kindIs isDirectoryKind k))
 -- | write it is kept).
 setMode : {e : HFunctor}
         -> {{ev : filesystem <: e}}
+        -> {{ex : exception FileError <: e}}
         -> Path
         -> Int
-        -> Co e (Either FileError Unit)
-setMode path mode = op (ev (SetMode (render path) mode (\r -> r))) val
+        -> Co e Unit
+setMode path mode =
+  bind (op (ev (SetMode (render path) mode (\r -> r))) val) answered
 
 -- (a mode with the execute bits on where the read bits are)
 executableMode : Int -> Int
 executableMode mode = or mode (shiftR (and mode 0x124) 2)
 
--- (the mode set from the status, where there is one)
-executableFrom : {e : HFunctor}
-               -> {{ev : filesystem <: e}}
-               -> Path
-               -> Either FileError Status
-               -> Co e (Either FileError Unit)
-executableFrom path (Right s) = setMode path (executableMode s.mode)
-executableFrom path (Left err) = pure (Left err)
-
 -- | A file made executable by whoever may read it (`chmod +x`, as the
 -- | umask has it: `rw-r--r--` becomes `rwxr-xr-x`).
 makeExecutable : {e : HFunctor}
                -> {{ev : filesystem <: e}}
+               -> {{ex : exception FileError <: e}}
                -> Path
-               -> Co e (Either FileError Unit)
-makeExecutable path = bind (pathStatus path) (executableFrom path)
+               -> Co e Unit
+makeExecutable path =
+  bind (pathStatus path) (\st -> setMode path (executableMode st.mode))
 
--- (a path the system gave, read in its style)
-readIn : Either FileError String -> Either FileError Path
-readIn (Right s) = Right (parse s)
-readIn (Left err) = Left err
-
--- (the path the system gives, read in its style)
+-- (the path the system gives, read in its style, or why it gave none)
 fromSystem : {e : HFunctor}
+           -> {{ex : exception FileError <: e}}
            -> Co e (Either FileError String)
-           -> Co e (Either FileError Path)
-fromSystem c = bind c (\r -> pure (readIn r))
+           -> Co e Path
+fromSystem c = bind c (\r -> bind (answered r) (\s -> pure (parse s)))
 
 -- | A path with its links resolved, and `.` and `..` gone: absolute, of
 -- | something that is there.
 realPath : {e : HFunctor}
          -> {{ev : filesystem <: e}}
+         -> {{ex : exception FileError <: e}}
          -> Path
-         -> Co e (Either FileError Path)
+         -> Co e Path
 realPath path = fromSystem (op (ev (RealPath (render path) (\r -> r))) val)
 
 -- | A directory of its own, new and empty, where the system keeps
@@ -437,8 +486,9 @@ realPath path = fromSystem (op (ev (RealPath (render path) (\r -> r))) val)
 -- | remove.
 temporaryDirectory : {e : HFunctor}
                    -> {{ev : filesystem <: e}}
+                   -> {{ex : exception FileError <: e}}
                    -> String
-                   -> Co e (Either FileError Path)
+                   -> Co e Path
 temporaryDirectory prefix =
   fromSystem (op (ev (TemporaryDirectory prefix (\r -> r))) val)
 
@@ -447,8 +497,9 @@ temporaryDirectory prefix =
 -- | `withFile`.  It is the program's to remove.
 temporaryFile : {e : HFunctor}
               -> {{ev : filesystem <: e}}
+              -> {{ex : exception FileError <: e}}
               -> String
-              -> Co e (Either FileError Path)
+              -> Co e Path
 temporaryFile prefix = fromSystem (op (ev (TemporaryFile prefix (\r -> r))) val)
 
 -- Open files
