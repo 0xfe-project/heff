@@ -57,7 +57,7 @@ done = ()
 ```
 
 `()` is the unit, `MkUnit`, and `(a, b)` is a pair, `MkPair a b`.
-`(a, b, c)` nests to the right: `(a, (b, c))`. `(e)` is `e`, grouped.
+`(a, b, c)` nests to the left: `((a, b), c)`. `(e)` is `e`, grouped.
 
 What a tuple is depends on the type expected of it. Where a type is
 expected, `()` is the type `Unit` and `(A, B)` is `Pair A B`:
@@ -70,7 +70,7 @@ Type`. Where nothing is expected, a tuple is a value, unless its first
 part is a type: `id (Int, String)` is the type.
 
 The same forms are patterns, nested as deep as needed: `(x, y)`,
-`((a, b), c)`, `()`.
+`(a, (b, c))`, `()`.
 
 ## Type aliases
 

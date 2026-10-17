@@ -526,7 +526,7 @@ updateNames : Params.Spanned (Presyntax.UpdateSet Presyntax.Checkable)
 updateNames (At (SetPath path v) _) = Clauses.identsOf v Nil
 
 -- Tuples: `()` and `(a, b, c)`, by the type expected, the types `Unit`
--- and `Pair a (b, c)` or their values; the builtin `Unit` and the
+-- and `Pair (a, b) c` or their values; the builtin `Unit` and the
 -- prelude's `Pair`, found by their keys
 
 explicitArg : Presyntax.Checkable
@@ -545,27 +545,40 @@ tupleHole sp =
           sp))
     sp
 
--- (what follows a tuple's first part: its second, or a tuple of the rest)
-tupleRest : Params.Span -> List Presyntax.Checkable -> Presyntax.Checkable
-tupleRest sp (Cons b Nil) = b
-tupleRest sp (Cons b more) =
-  At
-    (CInf
-       (At
-          (ITuple (Cons b more))
-          { start = (Params.spanOf b).start, end = sp.end }))
-    { start = (Params.spanOf b).start, end = sp.end }
-tupleRest sp Nil = At (CTag "MkUnit" sp Nil) sp
+-- (the parts of a tuple before its last, `rs` last first: as a tuple
+-- starting where it does, or the one part)
+tupleFrontInf : Params.Span
+              -> List Presyntax.Checkable
+              -> Presyntax.Inferable
+tupleFrontInf sp rs = case rs of
+  Cons r _ ->
+    At
+      (ITuple (List.reverse rs))
+      { start = sp.start, end = (Params.spanOf r).end }
+  Nil -> At (ITuple Nil) sp
 
--- | `()` and `(a, b, c)` as types: `Unit`, `Pair a (b, c)`
-tupleTypeOf : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
-tupleTypeOf sp Nil = At (IVar "builtin.Unit") sp
-tupleTypeOf sp (Cons a rest) =
+inferredC : Presyntax.Inferable -> Presyntax.Checkable
+inferredC i = At (CInf i) (Params.spanOf i)
+
+-- (what precedes a tuple's last part, `rs` last first: its first, or a
+-- tuple of the parts before the last)
+tupleFront : Params.Span -> List Presyntax.Checkable -> Presyntax.Checkable
+tupleFront sp (Cons a Nil) = a
+tupleFront sp rs = inferredC (tupleFrontInf sp rs)
+
+-- (a tuple's types, `rs` its parts last first)
+tupleTypeRev : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
+tupleTypeRev sp Nil = At (IVar "builtin.Unit") sp
+tupleTypeRev sp (Cons z rs) =
   At
     (IApp
        (At (IVar "prelude.Pair") sp)
-       [explicitArg a, explicitArg (tupleRest sp rest)])
+       [explicitArg (tupleFront sp rs), explicitArg z])
     sp
+
+-- | `()` and `(a, b, c)` as types: `Unit`, `Pair (a, b) c`
+tupleTypeOf : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
+tupleTypeOf sp cs = tupleTypeRev sp (List.reverse cs)
 
 -- | `Pair _ _`: what a pair is, its parts' types to be found
 pairOfHoles : Params.Span -> Presyntax.TypeForm
@@ -579,19 +592,43 @@ pairOfHoles sp =
           sp))
     sp
 
--- | `()` and `(a, b, c)` as values: `(MkUnit : Unit)`, `(MkPair a (b, c)
--- | : Pair _ _)`, each saying its type, as a tag alone does not
-tupleValueOf : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
-tupleValueOf sp Nil =
+-- (a tuple's value, `rs` its parts last first)
+tupleValueRev : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
+tupleValueRev sp Nil =
   At
     (IAnn
        (At (CTag "MkUnit" sp Nil) sp)
        (At (TInf (At (IVar "builtin.Unit") sp)) sp))
     sp
-tupleValueOf sp (Cons a rest) =
+tupleValueRev sp (Cons z rs) =
   At
-    (IAnn (At (CTag "MkPair" sp [a, tupleRest sp rest]) sp) (pairOfHoles sp))
+    (IAnn (At (CTag "MkPair" sp [tupleFront sp rs, z]) sp) (pairOfHoles sp))
     sp
+
+-- | `()` and `(a, b, c)` as values: `(MkUnit : Unit)`, `(MkPair (a, b)
+-- | c : Pair _ _)`, each saying its type, as a tag alone does not
+tupleValueOf : Params.Span -> List Presyntax.Checkable -> Presyntax.Inferable
+tupleValueOf sp cs = tupleValueRev sp (List.reverse cs)
+
+-- (a tuple inferring, its first part `i` inferring, `rs` its parts last
+-- first: the first part of the pair, `i` or the tuple before the last,
+-- inferring, the last checked)
+tupleInfRev : TK
+            -> Params.Span
+            -> Presyntax.Inferable
+            -> List Presyntax.Checkable
+            -> Elab Rules.Syn
+tupleInfRev tk sp i (Cons z (Cons a Nil)) = do
+  s <- tk.infJ i
+  r <- tk.chkJ z
+  p <- tk.typJ (pairOfHoles sp)
+  pure (Rules.tupleSyn sp s r p)
+tupleInfRev tk sp i (Cons z rs) = do
+  s <- tk.infJ (tupleFrontInf sp rs)
+  r <- tk.chkJ z
+  p <- tk.typJ (pairOfHoles sp)
+  pure (Rules.tupleSyn sp s r p)
+tupleInfRev tk sp i Nil = tk.infJ i
 
 -- | a tuple inferring, `cs` its parts (the first looked at): a value,
 -- | unless its first part is a type (`(Int, String)`, `(a, b)` of types
@@ -603,11 +640,8 @@ tupleInf : TK
          -> List Presyntax.Checkable
          -> Elab Rules.Syn
 tupleInf tk sp (Cons (At (CType _) _) _) cs = tk.infJ (tupleTypeOf sp cs)
-tupleInf tk sp (Cons (At (CInf i) _) rest) cs = do
-  s <- tk.infJ i
-  r <- tk.chkJ (tupleRest sp rest)
-  p <- tk.typJ (pairOfHoles sp)
-  pure (Rules.tupleSyn sp s r p)
+tupleInf tk sp (Cons (At (CInf i) _) (Cons _ _)) cs =
+  tupleInfRev tk sp i (List.reverse cs)
 tupleInf tk sp _ cs = tk.infJ (tupleValueOf sp cs)
 
 -- | `~e` inferring: the type `Lazy e` of a type, else `e` delayed, `e`
