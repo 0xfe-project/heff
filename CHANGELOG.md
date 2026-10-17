@@ -16,7 +16,8 @@
 
 ### Standard library
 
-- std.stm: software transactional memory on a typed store. The store is one value of a shape the program declares, `(Int, Int, List String)`, and a `TVar s a` is a position in it (`left`, `right`, `first`, `second`, `third`, `fstOf`, `sndOf`). Transactions (`Co (stm s)`) read, write, `retry`, `orElse` and `check`; `atomically` runs them among green threads, the store the world's state, and `runGreen` runs threads on a store in the language, on every backend. There is no `newTVar`: what grows is a `Map` or a `List` in the shape.
+- std.stm: software transactional memory on a typed store. The store is one value of a shape the program declares, `(Int, Int, List String)`, and a `TVar s a` is a position in it, std.store's. Transactions (`Co (stm s)`) read, write, `retry`, `orElse` and `check`; `atomically` runs them among green threads, the store the world's state, and `runGreen` runs threads on a store in the language, on every backend. There is no `newTVar`: what grows is a `Map` or a `List` in the shape.
+- std.store: positions in a store, shared by std.stm and std.boc. `Position s a` is an `a` in a store of shape `s`, made from its pairs (`whole`, `fstOf`, `sndOf`, `left`, `right`, `first`, `second`, `third`), read with `contents` and written with `replaced`; `both p q` is one position of the pair. `greenWith` runs green threads sharing a state, in the language.
 - `Order` carries its type's `Equality`, the field `eq`: every `Order` instance gives one. `ord.eq.equal`, or `(==) (eq := ord.eq)`, compares by it; `==` still finds only an `Equality` in scope. `orderByCompare` takes the `Equality` as an instance argument.
 
 ### Backends and performance

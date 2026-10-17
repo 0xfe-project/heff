@@ -15,6 +15,7 @@
 -- import co
 -- import green
 -- import std.stm
+-- import std.store
 --
 -- type Bank = (Int, Int, List String)
 --
@@ -61,14 +62,14 @@
 -- `orElse l r` | `l`; where `l` retries, `r` instead, from the store `l` began at
 -- `check b` | nothing where `b`, else `retry`
 --
--- The shape is fixed: there is no `newTVar`.  A position is a part of
--- it, made from its pairs: `whole`, `fstOf` and `sndOf`; a pair's `left`
--- and `right`; a triple's `first`, `second` and `third` (`(a, b, c)` is
--- `((a, b), c)`).  What grows while the program runs is a collection in
--- the shape, a `Map` or a `List`, read and written whole.  A position
--- fits every store of its shape, so a program names its own, at its
--- store's type, and a position of one store is not another's: the types
--- say so.
+-- The shape is fixed: there is no `newTVar`.  A position is std.store's,
+-- a part of it made from its pairs: `whole`, `fstOf` and `sndOf`; a
+-- pair's `left` and `right`; a triple's `first`, `second` and `third`
+-- (`(a, b, c)` is `((a, b), c)`).  What grows while the program runs is
+-- a collection in the shape, a `Map` or a `List`, read and written
+-- whole.  A position fits every store of its shape, so a program names
+-- its own, at its store's type, and a position of one store is not
+-- another's: the types say so.
 --
 -- Green threads run transactions with `atomically`: the store is the
 -- world's state (`stored s`, handled in the language, as std.state's
@@ -85,47 +86,13 @@ module std.stm
 import co
 import green
 import state
+import std.store
 
 -- Positions
 --------------------------------------------------------------------------------
 
--- | A position in a store of shape `s` holding an `a`: how it is read,
--- | and how it is written.
-data TVar s a = MkTVar (s -> a) (a -> s -> s)
-
--- | The whole store.
-whole : {s : Type} -> TVar s s
-whole = MkTVar (\st -> st) (\v st -> v)
-
--- | The first part of the pair at `t`.
-fstOf : {s a b : Type} -> TVar s (a, b) -> TVar s a
-fstOf (MkTVar get set) =
-  MkTVar (\st -> fst (get st)) (\v st -> set (v, snd (get st)) st)
-
--- | ... its second part.
-sndOf : {s a b : Type} -> TVar s (a, b) -> TVar s b
-sndOf (MkTVar get set) =
-  MkTVar (\st -> snd (get st)) (\v st -> set (fst (get st), v) st)
-
--- | A pair's first component.
-left : {a b : Type} -> TVar (a, b) a
-left = fstOf whole
-
--- | ... its second.
-right : {a b : Type} -> TVar (a, b) b
-right = sndOf whole
-
--- | A triple's first component.
-first : {a b c : Type} -> TVar (a, b, c) a
-first = fstOf (fstOf whole)
-
--- | ... its second.
-second : {a b c : Type} -> TVar (a, b, c) b
-second = sndOf (fstOf whole)
-
--- | ... its third.
-third : {a b c : Type} -> TVar (a, b, c) c
-third = sndOf whole
+-- | A position in a store of shape `s` holding an `a`: std.store's.
+type TVar s a = Position s a
 
 -- The effect
 --------------------------------------------------------------------------------
@@ -159,15 +126,15 @@ stm s =
 
 -- | What the position holds.
 readTVar : {s a : Type} -> TVar s a -> Co (stm s) a
-readTVar (MkTVar get set) = op (Look (\st -> get st)) val
+readTVar t = op (Look (\st -> contents t st)) val
 
 -- | ... and it holds `v` now.
 writeTVar : {s a : Type} -> TVar s a -> a -> Co (stm s) Unit
-writeTVar (MkTVar get set) v = op (Change (\st -> set v st) ()) val
+writeTVar t v = op (Change (\st -> replaced t v st) ()) val
 
 -- | ... and it holds `f` of what it held.
 modifyTVar : {s a : Type} -> TVar s a -> (a -> a) -> Co (stm s) Unit
-modifyTVar (MkTVar get set) f = op (Change (\st -> set (f (get st)) st) ()) val
+modifyTVar t f = op (Change (\st -> replaced t (f (contents t st)) st) ()) val
 
 -- | The transaction undone, to run again once the store is written.
 retry : {s a : Type} -> Co (stm s) a
@@ -307,29 +274,6 @@ atomically : {s : Type}
            -> Co e a
 atomically c = atomicallyHolding Nothing c
 
--- (no other effect: what a computation of none comes to)
-data NoneF (m : Type -> Type) x = NoneOf (NoneF m x)
-
-none : HFunctor
-none =
-  { f = NoneF
-  , hfmap = \m g p -> case p of
-      NoneOf q -> abandon
-  , hmap = \m n nt p -> case p of
-      NoneOf q -> abandon
-  }
-
-noneAlg : {x : Type} -> NoneF (\y -> y) x -> x
-noneAlg (NoneOf q) = noneAlg q
-
-ranAlone : Handler none
-ranAlone =
-  { M = \x -> x
-  , ret = \x -> x
-  , bind = \m k -> k m
-  , malg = \p -> noneAlg p
-  }
-
 -- | `c` and the green threads it spawns, scheduled on the store `st` and
 -- | nothing else, in the language: main's answer, or `Nothing` where
 -- | every thread waits.
@@ -340,12 +284,4 @@ runGreen : {s a : Type}
              -> {{st : stored s <: e}}
              -> Co e a)
          -> Maybe a
-runGreen st c =
-  fst
-    (handle
-       ranAlone
-       (runState
-          (sharing st)
-          (scheduled
-             (stored s <+> none)
-             (c (gr := \p -> InL p) (st := \p -> InR (InL p))))))
+runGreen st c = fst (greenWith (sharing st) c)
