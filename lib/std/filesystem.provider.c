@@ -52,14 +52,13 @@ static V heff_read_file(const char *path) {
   errno = 0;
   FILE *f = fopen(path, "rb");
   if (!f) return fs_left(fs_errno());
-  Buf b = {0};
-  char chunk[65536];
-  size_t got;
-  while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_put(&b, chunk, got);
-  int bad = ferror(f) ? fs_errno() : 0;
+  // (a regular file read straight into the string, as long as it says)
+  struct stat st;
+  int64_t size =
+    fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) ? (int64_t)st.st_size : 0;
+  V s = heff_str_read(f, size);
+  int bad = s ? 0 : fs_errno();
   fclose(f);
-  V s = bad ? 0 : heff_str_bytes(b.s ? b.s : "", (int64_t)b.n);
-  free(b.s);
   return bad ? fs_left(bad) : fs_right(s);
 }
 

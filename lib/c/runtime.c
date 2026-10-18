@@ -160,6 +160,12 @@ uint64_t heff_int_hash(uintptr_t a);
 // U+FFFD, as WHATWG's decoder reads it; a code point's bytes written;
 // how long bytes are made text)
 int heff_u8_decode(const uint8_t *p, int64_t n, uint32_t *out);
+// (... a byte below 0x80 read here, where C inlines it: the decoder is
+// an object of its own)
+static inline int heff_u8_read(const uint8_t *p, int64_t n, uint32_t *out) {
+  if (p[0] < 0x80) { *out = p[0]; return 1; }
+  return heff_u8_decode(p, n, out);
+}
 int heff_u8_encode(uint8_t *o, uint32_t u);
 int64_t heff_u8_valid_len(const uint8_t *p, int64_t n, int *own);
 // (a float as JavaScript writes a number, at `out`, room for 32 bytes)
@@ -2912,7 +2918,7 @@ HEFF_FN V heff_strRunes(V a) {
   Str *x = (Str *)a;
   uint32_t *rs = heff_alloc((size_t)(x->len + 1) * sizeof(uint32_t));
   int64_t m = 0;
-  for (int64_t i = 0; i < x->len; m++) i += heff_u8_decode(x->p + i, x->len - i, &rs[m]);
+  for (int64_t i = 0; i < x->len; m++) i += heff_u8_read(x->p + i, x->len - i, &rs[m]);
   V l = NTAG(TAG_Nil);
   for (int64_t k = m - 1; k >= 0; k--) {
     V f[2] = { MK_INT((int64_t)rs[k]), l };
@@ -2950,7 +2956,7 @@ HEFF_FN V heff_strOfRunes(V l) {
 HEFF_FN uint32_t heff_str_rune_at(Str *x, int64_t i, int64_t *w) {
   if (i < 0 || i >= x->len) { *w = 0; return 0xFFFD; }
   uint32_t u;
-  *w = heff_u8_decode(x->p + i, x->len - i, &u);
+  *w = heff_u8_read(x->p + i, x->len - i, &u);
   return u;
 }
 
@@ -2974,7 +2980,7 @@ HEFF_FN V heff_strRuneCount(V a) {
   Str *x = (Str *)a;
   int64_t n = 0;
   uint32_t u;
-  for (int64_t i = 0; i < x->len; n++) i += heff_u8_decode(x->p + i, x->len - i, &u);
+  for (int64_t i = 0; i < x->len; n++) i += heff_u8_read(x->p + i, x->len - i, &u);
   heff_drop(a);
   return MK_INT(n);
 }
@@ -3785,8 +3791,9 @@ HEFF_FN V heff_cons(V x, V rest) {
 // it crosses by is what it is to the system:
 //
 // - content -- a file's, a stream's, a pipe's, what a command wrote,
-//   what was fetched -- is bytes, as they are: in by `heff_str_bytes`,
-//   out by `heff_put` or `heff_bytes`;
+//   what was fetched -- is bytes, as they are: in by `heff_str_bytes`
+//   (a file read to its end, `heff_str_read`), out by `heff_put` or
+//   `heff_bytes`;
 // - a path is bytes too: out as a C string (`heff_cstr`), and a
 //   directory's names in (`heff_strs_bytes`);
 // - a name -- an argument of the program, the environment's, the
@@ -4882,6 +4889,34 @@ HEFF_FN void buf_put(Buf *b, const char *c, size_t n) {
   memcpy(b->s + b->n, c, n);
   b->n += n;
   b->s[b->n] = 0;
+}
+
+// (content in, `f` read to its end, as a string: straight into it where
+// `size`, what the file says it holds, is all there is, else through a
+// buffer; 0, where a read failed)
+HEFF_FN V heff_str_read(FILE *f, int64_t size) {
+  Buf b = {0};
+  if (size > 0) {
+    Str *s = heff_str_new(size);
+    size_t got = fread(s->s, 1, (size_t)size, f);
+    int c = got == (size_t)size ? fgetc(f) : EOF;
+    if (c == EOF) {
+      if (ferror(f)) { heff_drop((V)s); return 0; }
+      s->len = (int64_t)got;
+      return (V)s;
+    }
+    // (more than it said: what was read, and the rest, through the buffer)
+    char more = (char)c;
+    buf_put(&b, (const char *)s->s, got);
+    buf_put(&b, &more, 1);
+    heff_drop((V)s);
+  }
+  char chunk[65536];
+  size_t got;
+  while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_put(&b, chunk, got);
+  V s = ferror(f) ? 0 : heff_str_bytes(b.s ? b.s : "", (int64_t)b.n);
+  free(b.s);
+  return s;
 }
 
 HEFF_FN void buf_str(Buf *b, const char *c) { buf_put(b, c, strlen(c)); }
