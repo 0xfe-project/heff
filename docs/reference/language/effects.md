@@ -49,7 +49,25 @@ A value of `h <: e` shows where `h` is in `e`:
 | `\p -> InR (InL p)` | the second of three, `k <: h <+> (k <+> j)` |
 
 Evidence is a function, so deeper places are written with `InL` and
-`InR` directly. `<+>` groups to the left.
+`InR` directly. `<+>` groups to the left, and `<:` binds looser than it:
+`h <: h <+> k` is `h <: (h <+> k)`.
+
+`(x := _)` lets heff find the evidence: where the world is a sum by
+`<+>`, known at the call (`main`'s, say), the one place of `h` in it,
+put there by `InL`s and `InR`s:
+
+```haskell
+main : Co (stdio <+> filesystem) Unit
+main = look (io := _) (disk := _)
+```
+
+A part of the world that is a world of its own, `e`, is reached through
+the evidence in scope that says where `h` is in `e`: in `attempt
+FileError e (c (io := _) (fx := _))`, `fx` is `\p -> InL p`, and `io`
+is `\p -> InR (io p)`, through the `io` in scope. An effect in no place
+of the world is E0355; in more than one, E0356 (give the evidence
+there); an argument that is no `h <: e`, or a world not known where the
+call is, E0357.
 
 ## Defining an effect
 

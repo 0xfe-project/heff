@@ -93,12 +93,9 @@ main = do
     attempt
       FileError
       (stdio <+> filesystem)
-      (program
-         (io := \p -> InR (InL p))
-         (disk := \p -> InR (InR p))
-         (ex := \p -> InL p))
+      (program (io := _) (disk := _) (ex := _))
   case r of
-    Left err -> print (ev := inl stdio filesystem) (showFileError err)
+    Left err -> print (ev := _) (showFileError err)
     Right _ -> pure MkUnit
 ```
 
@@ -111,12 +108,12 @@ stdio and the files; `attempt FileError` runs `program` in that world
 with `exception FileError` added on its left, and gives back `Left` what
 was thrown, or `Right` what `program` gave (see
 [handlers](../reference/language/effects.md#handlers) and
-[`attempt`](../api/exception.md#attempt)). `main` shows where each part
-is: `\p -> InL p` shows the exception is on the left, `\p -> InR (InL p)`
-that stdio is on the left of what is on the right, and `\p -> InR (InR p)`
-that the files are on the right of that. Where nothing heard a throw,
-`main` prints it, stdio on the left of its own world (`inl stdio
-filesystem`).
+[`attempt`](../api/exception.md#attempt)). Where nothing heard a throw,
+`main` prints it.
+
+`(io := _)` asks heff for the evidence: it finds where stdio is in the
+world, here in `attempt`'s, and shows it so (see
+[giving the evidence](../reference/language/effects.md#giving-the-evidence)).
 
 ```sh
 $ printf 'write the tutorial\nread the reference' > todos.txt

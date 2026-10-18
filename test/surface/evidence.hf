@@ -1,0 +1,106 @@
+-- `(x := _)`: evidence that an effect is in a world, found where the
+-- world is known -- the place of the effect among the world's `<+>`s
+-- (a definition seen through), its operations put there by `InL`s and
+-- `InR`s; and in a world one part of which is a world of its own, `e`,
+-- through the evidence in scope that says where it is in `e`.
+
+module test.surface.evidence
+
+import co
+import exception
+import state
+
+data AskF (m : Type -> Type) x = Ask (Int -> x)
+
+reader : HFunctor
+reader =
+  { f = AskF
+  , hfmap = \m g p -> case p of
+      Ask k -> Ask (\v -> g (k v))
+  , hmap = \m n nt p -> case p of
+      Ask k -> Ask k
+  }
+
+ask : {e : HFunctor} -> {{rd : reader <: e}} -> Co e Int
+ask = op (rd (Ask (\v -> v))) val
+
+world : HFunctor
+world = state Int <+> reader <+> exception String
+
+-- | asks, puts what it was told and what the state was, then throws
+-- | where they come to more than 10
+step : {e : HFunctor}
+     -> {{st : state Int <: e}}
+     -> {{rd : reader <: e}}
+     -> {{ex : exception String <: e}}
+     -> Co e Int
+step = do
+  k <- ask
+  s <- get
+  put (s + k)
+  if s + k > 10 then throw ("too much: " ^ show (s + k)) else pure (s + k)
+
+stepped : Co world Int
+stepped = step (st := _) (rd := _) (ex := _)
+
+-- | ... in a world of its own: the exception on the left, `e` on the
+-- | right, through the evidence in scope
+caught : {e : HFunctor}
+       -> {{st : state Int <: e}}
+       -> {{rd : reader <: e}}
+       -> Co e (Either String Int)
+caught = attempt String e (step (st := _) (rd := _) (ex := _))
+
+partly : Co (state Int <+> reader) (Either String Int)
+partly = caught (st := _) (rd := _)
+
+data Res a = Failed String Int | Done a Int
+
+said : {a : Type} -> (a -> String) -> Res a -> String
+said sh (Failed s n) = "failed " ^ s ^ " @" ^ show n
+said sh (Done x n) = sh x ^ " @" ^ show n
+
+-- | the state, the reader (`asked`) and the exception, handled at once
+handled : Int -> Handler world
+handled asked =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> Done x n
+  , bind = \m k n -> case m n of
+      Failed s n2 -> Failed s n2
+      Done x n2 -> k x n2
+  , malg = \p n -> case p of
+      InL (InL (Get k)) -> Done (k n) n
+      InL (InL (Put s x)) -> Done x s
+      InL (InR (Ask k)) -> Done (k asked) n
+      InR (Throw s) -> Failed s n
+      InR (Catch c h) -> case c n of
+        Failed s n2 -> h s n2
+        Done x n2 -> Done x n2
+  }
+
+-- | ... the state and the reader
+handledTwo : Int -> Handler (state Int <+> reader)
+handledTwo asked =
+  { M = \a -> Int -> Res a
+  , ret = \x n -> Done x n
+  , bind = \m k n -> case m n of
+      Failed s n2 -> Failed s n2
+      Done x n2 -> k x n2
+  , malg = \p n -> case p of
+      InL (Get k) -> Done (k n) n
+      InL (Put s x) -> Done x s
+      InR (Ask k) -> Done (k asked) n
+  }
+
+eitherSaid : Either String Int -> String
+eitherSaid (Left s) = "thrown " ^ s
+eitherSaid (Right n) = show n
+
+-- >>> said show (handle (handled 3) stepped 4)
+-- "7 @7"
+-- >>> said show (handle (handled 8) stepped 4)
+-- "failed too much: 12 @12"
+-- >>> said eitherSaid (handle (handledTwo 8) partly 4)
+-- "thrown too much: 12 @12"
+-- >>> said eitherSaid (handle (handledTwo 1) partly 4)
+-- "5 @5"

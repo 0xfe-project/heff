@@ -1626,6 +1626,244 @@ functionElimNamed sp x callee arg =
   case pc of
     MkPair ecallee a0 -> namedGo sp x arg e ecallee a0)
 
+-- Evidence found: `(x := _)`
+--------------------------------------------------------------------------------
+
+-- | a candidate for `(x := _)`'s evidence, by where it puts an operation
+-- | (`False` the left of a `<+>`, `True` the right) and the evidence it
+-- | goes through there, if any (`Presyntax.evidenceCandidate`)
+type Candidates = List Bool -> Maybe String -> Elab Chk
+
+-- | the paths from a world's root to its leaves, through its `<+>`s: a
+-- | definition seen through, as `heff.elab.effect` sees one
+sumPaths : Globals.Globals -> Syntax.Tm -> List (List Bool)
+sumPaths g (SIs t) = sumPaths g t
+sumPaths g (SApp (SApp (SGlobal k) a) b) =
+  if strEq k "co.<+>"
+  then List.append
+      (List.map (\p -> Cons False p) (sumPaths g a))
+      (List.map (\p -> Cons True p) (sumPaths g b))
+  else [Nil]
+sumPaths g (SGlobal k) = case Globals.lookupEntry g k of
+  Just entry -> sumPaths g entry.syntax
+  Nothing -> [Nil]
+sumPaths g t = [Nil]
+
+-- | the world `e` of a goal `h <: e`, as messages say the goal
+worldOf : Syntax.Ty -> Maybe Syntax.Tm
+worldOf (SDecode (SApp (SApp (SGlobal k) h) w)) =
+  if strEq k "co.<:" then Just w else Nothing
+worldOf t = Nothing
+
+-- | a candidate tried, the state put back whatever the answer: whether
+-- | it checks at the goal, nothing said wrong of it
+triedCandidate : ElabEnv -> Value.Ty -> Chk -> Elab Bool
+triedCandidate e goal c = do
+  saved <- gets (\st -> st)
+  waiting <- saveDelayed
+  ok <-
+    catchE
+      (do
+       el <- runChk c e goal
+       now <- gets (\st -> st)
+       pure (List.length now.recovered == List.length saved.recovered))
+      (\d -> pure False)
+  putSt saved
+  restoreWaiting waiting
+  pure ok
+
+-- (each candidate that checks, with where it puts an operation)
+checkingCandidates : ElabEnv
+                   -> Value.Ty
+                   -> List (Pair String Chk)
+                   -> Elab (List (Pair String Chk))
+checkingCandidates e goal Nil = pure Nil
+checkingCandidates e goal (Cons c rest) = do
+  ok <- triedCandidate e goal (snd c)
+  more <- checkingCandidates e goal rest
+  pure (if ok then Cons c more else more)
+
+-- (where a candidate puts an operation, said)
+pathSaid : List Bool -> Maybe String -> String
+pathSaid path w = "\\p -> " ^ down path
+  where
+  leaf : String
+  leaf = case w of
+    Just x -> x ^ " p"
+    Nothing -> "p"
+  down : List Bool -> String
+  down Nil = leaf
+  down (Cons b rest) =
+    (if b then "InR " else "InL ")
+    ^ (if List.null rest && w == Nothing then down rest
+       else "(" ^ down rest ^ ")")
+
+-- (each candidate: at each leaf of the world, the operation as it is, or
+-- through each instance argument in scope)
+candidatesOf : ElabEnv
+             -> Candidates
+             -> List (List Bool)
+             -> Elab (List (Pair String Chk))
+candidatesOf e cand Nil = pure Nil
+candidatesOf e cand (Cons path rest) = do
+  bare <- cand path Nothing
+  through <-
+    traverse
+      (mo := instanceMonadCo)
+      (\(w : Witness) -> do
+       c <- cand path (Just (nameOf w))
+       pure (MkPair (pathSaid path (Just (nameOf w))) c))
+      (instLocals e)
+  more <- candidatesOf e cand rest
+  pure (Cons (MkPair (pathSaid path Nothing) bare) (List.append through more))
+
+-- | `(x := _)`'s evidence found, once its goal `h <: e` is known: where
+-- | in the world `e` -- a sum by `<+>` -- `h` is, the operation put
+-- | there by `InL`s and `InR`s, through the instance argument in scope
+-- | that says where it is in a leaf that is a world of its own.  Exactly
+-- | one place: none is E0355, more than one E0356; a goal that is no
+-- | `h <: e` is E0357.
+evidenceFound : ElabEnv
+              -> Params.Span
+              -> Hole
+              -> Value.Ty
+              -> Candidates
+              -> Bool
+              -> Elab Bool
+evidenceFound e sp hole goal cand final = do
+  mc <- gets (\c -> c.metas)
+  if not (List.null (metasLeft e mc goal))
+  then if final
+    then failWithNote
+        (a := Bool)
+        sp
+        57
+        ("the world `_` finds evidence in is not determined here: "
+         ^ goalShown e mc goal)
+        "annotate where the world is said, as `main : Co (a <+> b) Unit`, or give the argument"
+    else pure False
+  else case worldOf (Readback.readbTyShownForced mc e.scope.len goal) of
+    Nothing ->
+      failWithNote
+        (a := Bool)
+        sp
+        57
+        ("`_` finds evidence that an effect is in a world, `h <: e`, but this argument is "
+         ^ goalShown e mc goal)
+        "give the argument"
+    Just w -> do
+      all <- candidatesOf e cand (sumPaths e.globals w)
+      ok <- checkingCandidates e goal all
+      case ok of
+        Cons one Nil -> do
+          el <- runChk (snd one) e goal
+          r <-
+            solveHole
+              e.globals
+              (shape e.scope)
+              (metaOf hole.stx)
+              hole.val
+              el.stx
+              (Memoed.valN el)
+          case r of
+            Right _ -> pure True
+            Left err ->
+              failWithNote
+                sp
+                11
+                "the evidence found does not fit how it is used"
+                (prettyEqErr e.globals err)
+        Nil ->
+          failWithNote
+            (a := Bool)
+            sp
+            55
+            ("the effect is in no place of the world: " ^ goalShown e mc goal)
+            "the world has each effect it is given, once: add it, or give the argument"
+        _ ->
+          failWithNote
+            (a := Bool)
+            sp
+            56
+            ("the effect is in more than one place of the world: "
+             ^ goalShown e mc goal
+             ^ ": "
+             ^ joinWith ", " (List.map fst ok))
+            "give the argument: the one place meant"
+
+-- | `(x := _)`: a hole, its evidence found once its goal is known
+evidenceArg : ElabEnv
+            -> Params.Span
+            -> Value.Ty
+            -> String
+            -> Candidates
+            -> Elab Memoed.El
+evidenceArg e sp goal name cand = do
+  hole <- freshMeta e.scope.len e.scope.locals goal name sp
+  want sp (\final -> evidenceFound e sp hole goal cand final)
+  pure (mEl hole.stx hole.val)
+
+-- | `f (x := _)`: as `namedGo`, the argument named `x` its evidence found
+evidenceGo : Params.Span
+           -> String
+           -> Candidates
+           -> ElabEnv
+           -> Memoed.El
+           -> Value.Ty
+           -> Elab (Pair Memoed.El Value.Ty)
+evidenceGo sp x cand e m ty0 = do
+  ty <- Meta.forceT ty0
+  case Value.behavior ty of
+    LikeFunction level dom cod implicit ->
+      if nameIs (Value.cloName cod) x
+      then do
+        earg <- evidenceArg e sp dom x cand
+        pure
+            (MkPair
+               (if Params.eqPlicity implicit Expl then Memoed.app m earg
+                else Memoed.iapp x m earg)
+               (Value.nom (Value.appClo cod (\u -> Memoed.valN earg))))
+      else if Params.eqPlicity implicit Impl
+      then do
+        iarg <- implicitArg e sp ty dom (cloNameOr cod)
+        evidenceGo
+            sp
+            x
+            cand
+            e
+            (Memoed.iapp (cloNameOr cod) m iarg)
+            (Value.nom (Value.appClo cod (\u -> Memoed.valN iarg)))
+      else if Params.eqPlicity implicit Inst
+      then do
+        earg <- insertInstance e sp dom (cloNameOr cod)
+        evidenceGo
+            sp
+            x
+            cand
+            e
+            (Memoed.iapp (cloNameOr cod) m earg)
+            (Value.nom (Value.appClo cod (\u -> Memoed.valN earg)))
+      else noArgNamed sp x
+    _ -> noArgNamed sp x
+  where
+  noArgNamed : Params.Span -> String -> Elab (Pair Memoed.El Value.Ty)
+  noArgNamed sp x =
+    failWith
+      sp
+      29
+      ("`("
+       ^ x
+       ^ " := _)` names an argument, but there is none named "
+       ^ x
+       ^ " here")
+
+functionElimEvidence : Params.Span -> String -> Syn -> Candidates -> Syn
+functionElimEvidence sp x callee cand =
+  MkSyn (\e -> do
+  pc <- runSyn callee e
+  case pc of
+    MkPair ecallee a0 -> evidenceGo sp x cand e ecallee a0)
+
 delayedCheck : ElabEnv
              -> Params.Span
              -> String

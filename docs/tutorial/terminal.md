@@ -95,7 +95,7 @@ program = do
     Nothing -> pure MkUnit
 
 main : Co (Terminal.console <+> stdio) Unit
-main = program (con := \p -> InL p) (io := \p -> InR p)
+main = program (con := _) (io := _)
 ```
 
 `Terminal.interact` runs the app on the terminal: it draws the view,
