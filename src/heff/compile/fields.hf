@@ -1,0 +1,234 @@
+-- A record read only field by field, its fields read where it is bound
+-- (#116).  A variable of a record never used whole, only read fields of
+-- at its shape, keeps the record -- and each field of it -- held until
+-- its last read: a field taken out and changed before that, an array
+-- set, is held twice there, and copied whole.
+--
+--   push v x =                          push v x =
+--     let s = if v.len == ... then        let s1 = v.slots in let n = v.len in
+--       ... else v.slots                  let s = if n == ... then ... else s1
+--     in { slots = Array.set s v.len x,   in { slots = Array.set s n x, len = n + 1 }
+--          len = v.len + 1 }
+--
+-- Each field it reads is read where it is bound, once, so the record is
+-- given up at the last of those reads -- its other fields' references
+-- given back with it -- and what is taken out of it is held alone after
+-- (heff.compile.refcount).  Reading a field of a record of a known shape
+-- cannot fail, and the record does not change: it is the same read
+-- there.  Only where it reads two fields or more, one of them not a
+-- number -- what a set may change in place.
+--
+-- Only the C backend counts references: this runs on what it is given
+-- (heff.compile.lower), before the monadic form.
+
+module heff.compile.fields
+
+import heff.compile.ir as IR
+import heff.compile.repr as Repr
+import std.map as Map
+
+-- | computations drawing fresh names
+type S a = IR.Supply -> Pair a IR.Supply
+
+bindTake : {a b : Type} -> (a -> S b) -> Pair a IR.Supply -> Pair b IR.Supply
+bindTake f (MkPair x n) = f x n
+
+-- `do` is this
+bind : {a b : Type} -> S a -> (a -> S b) -> S b
+bind m f = \n -> bindTake f (m n)
+
+pure : {a : Type} -> a -> S a
+pure x = \n -> MkPair x n
+
+instance instanceMonadS : Monad S
+instanceMonadS = { pure = pure, bind = bind }
+
+traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
+traverseS = traverse (mo := instanceMonadS)
+
+elemS : String -> List String -> Bool
+elemS x Nil = False
+elemS x (Cons y ys) = strEq x y || elemS x ys
+
+sameLabels : List String -> List String -> Bool
+sameLabels Nil Nil = True
+sameLabels (Cons a xs) (Cons b ys) = strEq a b && sameLabels xs ys
+sameLabels _ _ = False
+
+-- What is read
+--------------------------------------------------------------------------------
+
+-- | a field read of the variable: its label, its record's shape, its type
+type Read = { l : String, sh : List String, t : IR.FieldTy }
+
+-- (an arm's body, unless it binds `v` again)
+armOwn : String -> IR.Arm -> List IR.Expr -> List IR.Expr
+armOwn v (MkArm _ vs b) rest = if elemS v vs then rest else Cons b rest
+
+-- (the fields of `v` the worklist reads, onto `acc`: none where it uses
+-- `v` whole, or reads it at no shape known; not under a binding of `v`
+-- again)
+readsW : String -> List Read -> List IR.Expr -> Maybe (List Read)
+readsW v acc Nil = Just acc
+readsW v acc (Cons (EProj (EVar y) l sh t) rest) =
+  if not (strEq y v) then readsW v acc rest
+  else if List.null sh then Nothing
+  else readsW v (Cons { l = l, sh = sh, t = t } acc) rest
+readsW v acc (Cons (EVar y) rest) =
+  if strEq y v then Nothing else readsW v acc rest
+readsW v acc (Cons (ELam xs b) rest) =
+  readsW v acc (if elemS v xs then rest else Cons b rest)
+readsW v acc (Cons (EApp f argv) rest) =
+  readsW v acc (Cons f (IR.appendI argv rest))
+readsW v acc (Cons (ELet x a b) rest) =
+  readsW v acc (Cons a (if strEq x v then rest else Cons b rest))
+readsW v acc (Cons (ERecord fs _) rest) = readsW v acc (IR.pushFields fs rest)
+readsW v acc (Cons (EProj e _ _ _) rest) = readsW v acc (Cons e rest)
+readsW v acc (Cons (ETag _ argv _) rest) = readsW v acc (IR.appendI argv rest)
+readsW v acc (Cons (EMatch s arms) rest) =
+  readsW v acc (Cons s (List.foldr (armOwn v) rest arms))
+readsW v acc (Cons (EPrimCall _ argv) rest) =
+  readsW v acc (IR.appendI argv rest)
+readsW v acc (Cons (ECall _ argv) rest) = readsW v acc (IR.appendI argv rest)
+readsW v acc (Cons _ rest) = readsW v acc rest
+
+-- (each label once, in the order first read)
+labelsOnce : List Read -> List Read -> List Read
+labelsOnce acc Nil = List.reverse acc
+labelsOnce acc (Cons r rs) =
+  if List.any (\(q : Read) -> strEq q.l r.l) acc then labelsOnce acc rs
+  else labelsOnce (Cons r acc) rs
+
+-- (the fields of `v` to read where it is bound: of one shape, two of
+-- them or more, one not a number)
+toRead : List Read -> List Read
+toRead Nil = Nil
+toRead (Cons r rs) =
+  let once = labelsOnce Nil (List.reverse (Cons r rs))
+  in if List.all (\(q : Read) -> sameLabels q.sh r.sh) rs
+        && List.length once >= 2
+        && List.any
+          (\(q : Read) -> Repr.isBoxed (Repr.flatOf q.t))
+          once
+  then once
+  else Nil
+
+-- Reads put where it is bound
+--------------------------------------------------------------------------------
+
+-- | a field read where the variable is bound, and the variable it is bound to
+type Bound = { r : Read, x : String }
+
+boundOf : Read -> S Bound
+boundOf r = \n -> case IR.fresh r.l n of
+  MkPair x n2 -> MkPair { r = r, x = x } n2
+
+boundAt : List Bound -> String -> Maybe String
+boundAt Nil l = Nothing
+boundAt (Cons b bs) l = if strEq b.r.l l then Just b.x else boundAt bs l
+
+-- (`e`, each read of `v` the variable it is bound to; not under a
+-- binding of `v` again)
+readIn : String -> List Bound -> IR.Expr -> IR.Expr
+readIn v bs (EProj (EVar y) l sh t) =
+  if strEq y v
+  then case boundAt bs l of
+    Just x -> EVar x
+    Nothing -> EProj (EVar y) l sh t
+  else EProj (EVar y) l sh t
+readIn v bs (ELam xs b) =
+  if elemS v xs then ELam xs b else ELam xs (readIn v bs b)
+readIn v bs (EApp f argv) = EApp (readIn v bs f) (List.map (readIn v bs) argv)
+readIn v bs (ELet x a b) =
+  ELet x (readIn v bs a) (if strEq x v then b else readIn v bs b)
+readIn v bs (ERecord fs ts) =
+  ERecord (List.map (\p -> MkPair (fst p) (readIn v bs (snd p))) fs) ts
+readIn v bs (EProj e l sh t) = EProj (readIn v bs e) l sh t
+readIn v bs (ETag t argv ts) = ETag t (List.map (readIn v bs) argv) ts
+readIn v bs (EMatch s arms) =
+  EMatch
+    (readIn v bs s)
+    (List.map
+       (\a -> case a of
+        MkArm t vs b -> if elemS v vs then a else MkArm t vs (readIn v bs b))
+       arms)
+readIn v bs (EPrimCall p argv) = EPrimCall p (List.map (readIn v bs) argv)
+readIn v bs (ECall g argv) = ECall g (List.map (readIn v bs) argv)
+readIn v bs e = e
+
+-- (the reads, bound in front of `e`)
+letsOf : String -> List Bound -> IR.Expr -> IR.Expr
+letsOf v Nil e = e
+letsOf v (Cons b bs) e =
+  ELet b.x (EProj (EVar v) b.r.l b.r.sh b.r.t) (letsOf v bs e)
+
+-- (`b`, where `v` is bound: the fields it reads read there, if they are)
+readAt : IR.Expr -> String -> S IR.Expr
+readAt b v = case readsW v Nil (Cons b Nil) of
+  Just rs -> case toRead rs of
+    Nil -> pure b
+    once -> do
+      bs <- traverseS boundOf once
+      pure (letsOf v bs (readIn v bs b))
+  Nothing -> pure b
+
+-- (... where the variables `xs` are bound)
+readsAt : List String -> IR.Expr -> S IR.Expr
+readsAt Nil b = pure b
+readsAt (Cons x xs) b = do
+  b2 <- readAt b x
+  readsAt xs b2
+
+-- | an expression, each variable of a record read only field by field
+-- | read where it is bound, inner ones first
+go : IR.Expr -> S IR.Expr
+go (ELam xs b) = do
+  b2 <- go b
+  b3 <- readsAt xs b2
+  pure (ELam xs b3)
+go (ELet x a b) = do
+  a2 <- go a
+  b2 <- go b
+  b3 <- readAt b2 x
+  pure (ELet x a2 b3)
+go (EMatch s arms) = do
+  s2 <- go s
+  arms2 <-
+    traverseS
+      (\a -> case a of
+       MkArm t vs b -> do
+         b2 <- go b
+         b3 <- readsAt vs b2
+         pure (MkArm t vs b3))
+      arms
+  pure (EMatch s2 arms2)
+go (EApp f argv) = do
+  f2 <- go f
+  argv2 <- traverseS go argv
+  pure (EApp f2 argv2)
+go (ERecord fs ts) = do
+  es <- traverseS go (List.map snd fs)
+  pure (ERecord (List.zipWith (\p e -> MkPair (fst p) e) fs es) ts)
+go (EProj e l sh t) = do
+  e2 <- go e
+  pure (EProj e2 l sh t)
+go (ETag t argv ts) = do
+  argv2 <- traverseS go argv
+  pure (ETag t argv2 ts)
+go (EPrimCall p argv) = do
+  argv2 <- traverseS go argv
+  pure (EPrimCall p argv2)
+go (ECall g argv) = do
+  argv2 <- traverseS go argv
+  pure (ECall g argv2)
+go e = pure e
+
+defOf : IR.Def -> S IR.Def
+defOf d = do
+  b <- go d.body
+  pure (IR.mkDef d.key d.name b)
+
+-- | the program, each variable of a record read only field by field read
+-- | where it is bound; where fresh names go on from
+fieldsProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+fieldsProgram n defs = traverseS defOf defs n
