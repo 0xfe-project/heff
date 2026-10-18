@@ -1239,12 +1239,24 @@ altStmts (At (MkAlt p b) _) = MkPair p (armStmts b)
 -- | the statements, taken apart, knotted
 type DoT = { stmts : DoCx -> List (Params.Spanned (Stmt Expr)) -> End -> Expr }
 
--- (the variables given back: none, one, or `GivenBack`s of them)
-giveBackE : Params.Span -> List String -> Expr
-giveBackE sp Nil = At (ETag "MkUnit") sp
-giveBackE sp (Cons x Nil) = At (EVar x) sp
-giveBackE sp (Cons x xs) =
-  app (At (ETag "MkGivenBack") sp) [At (EVar x) sp, giveBackE sp xs]
+-- (the variables, given back as one value)
+packE : Params.Span -> List String -> Expr
+packE sp Nil = At (ETag "MkUnit") sp
+packE sp (Cons x Nil) = At (EVar x) sp
+packE sp (Cons x xs) = app (At (ETag "MkPair") sp) [At (EVar x) sp, packE sp xs]
+
+-- (... taken apart, each bound again)
+packPat : Params.Span -> List String -> Pat
+packPat sp Nil = At (PatVar "_") sp
+packPat sp (Cons x Nil) = At (PatVar x) sp
+packPat sp (Cons x xs) = patTag "MkPair" sp [At (PatVar x) sp, packPat sp xs]
+
+-- (... of the variables' types)
+packTy : Params.Span -> List String -> Expr
+packTy sp Nil = At (EVar "builtin.Unit") sp
+packTy sp (Cons x Nil) = typeOfE sp x
+packTy sp (Cons x xs) =
+  app (At (EVar "prelude.Pair") sp) [typeOfE sp x, packTy sp xs]
 
 -- | what the statements' end leads to
 endOf : DoCx -> Params.Span -> End -> Expr
@@ -1252,7 +1264,7 @@ endOf cx sp EndValue =
   leaving cx sp cx.depth (pureOf cx sp (At (ETag "MkUnit") sp))
 endOf cx sp (EndJump j) = jumpCall cx sp j
 endOf cx sp (EndGive vars d) =
-  leaving cx sp (cx.depth - d) (pureOf cx sp (giveBackE sp vars))
+  leaving cx sp (cx.depth - d) (pureOf cx sp (packE sp vars))
 
 withMut : DoCx -> String -> DoCx
 withMut cx x =
@@ -1411,16 +1423,9 @@ armsGive arms =
 -- In `run do`, an `if` or a `case` of statements whose arms each reach
 -- their end (and leave nowhere else) is no join point: each arm gives
 -- the variables back as they are there, and what follows it takes them
--- -- none, `MkUnit`; one, itself; more, the prelude's `GivenBack`s, which
--- the simplifier takes for the variables set in each arm (heff.compile.ir's
--- `ESet`), no `GivenBack` built.
-
--- (... of the variables' types)
-giveBackTy : Params.Span -> List String -> Expr
-giveBackTy sp Nil = At (EVar "builtin.Unit") sp
-giveBackTy sp (Cons x Nil) = typeOfE sp x
-giveBackTy sp (Cons x xs) =
-  app (At (EVar "prelude.GivenBack") sp) [typeOfE sp x, giveBackTy sp xs]
+-- -- none, `MkUnit`; one, itself; more, `MkPair`s, as a loop gives them
+-- back -- bound and taken apart at once, which the simplifier takes for
+-- the variables set in each arm (heff.compile.ir's `ESet`), no pair built.
 
 -- (... taken apart, `r` what holds them, each variable bound again)
 giveBackMatch : Params.Span -> String -> List String -> Expr -> Expr
@@ -1428,13 +1433,13 @@ giveBackMatch sp r (Cons x (Cons y Nil)) body =
   matchOf
     sp
     (At (EVar r) sp)
-    [alt (patTag "MkGivenBack" sp [At (PatVar x) sp, At (PatVar y) sp]) body]
+    [alt (patTag "MkPair" sp [At (PatVar x) sp, At (PatVar y) sp]) body]
 giveBackMatch sp r (Cons x xs) body =
   matchOf
     sp
     (At (EVar r) sp)
     [ alt
-      (patTag "MkGivenBack" sp [At (PatVar x) sp, At (PatVar (rest xs)) sp])
+      (patTag "MkPair" sp [At (PatVar x) sp, At (PatVar (rest xs)) sp])
       (giveBackMatch sp (rest xs) xs body)
     ]
   where
@@ -1487,7 +1492,7 @@ condT t cx sp s arms rest end =
                  sp
                  s'
                  (List.map (armT t cx (EndGive cx.muts cx.depth)) arms))
-              (giveBackTy sp cx.muts))
+              (packTy sp cx.muts))
            (t.stmts cx rest end))
   else hoist
       cx
@@ -1533,25 +1538,6 @@ condT t cx sp s arms rest end =
 -- back unbuilt, where they fit).  A loop whose statements may `return`
 -- gives back `Left` of what it returns, else `Right` of the variables,
 -- and where it is called, a `Left` is returned on.
-
--- (the variables, given back as one value)
-packE : Params.Span -> List String -> Expr
-packE sp Nil = At (ETag "MkUnit") sp
-packE sp (Cons x Nil) = At (EVar x) sp
-packE sp (Cons x xs) = app (At (ETag "MkPair") sp) [At (EVar x) sp, packE sp xs]
-
--- (... taken apart, each bound again)
-packPat : Params.Span -> List String -> Pat
-packPat sp Nil = At (PatVar "_") sp
-packPat sp (Cons x Nil) = At (PatVar x) sp
-packPat sp (Cons x xs) = patTag "MkPair" sp [At (PatVar x) sp, packPat sp xs]
-
--- (... of the variables' types)
-packTy : Params.Span -> List String -> Expr
-packTy sp Nil = At (EVar "builtin.Unit") sp
-packTy sp (Cons x Nil) = typeOfE sp x
-packTy sp (Cons x xs) =
-  app (At (EVar "prelude.Pair") sp) [typeOfE sp x, packTy sp xs]
 
 -- (what a loop gives back, `ret` whether a `return`'s value too: its
 -- type, and the variables)

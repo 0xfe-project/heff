@@ -30,7 +30,7 @@
 
 ### Backends and performance
 
-- In `run do`, an `if` or a `case` statement whose arms each reach their end is no join point: each arm gives the variables back to what follows (the prelude's `GivenBack`), which the simplifier copies into the arms or, past its budget, takes for the variables set in each arm (`ESet`), no tag built. A loop whose `if` and the loop called each other last was one `$cycle`, its numbers boxed: 3.7 s to 2.7 s over 300M turns.
+- In `run do`, an `if` or a `case` statement whose arms each reach their end is no join point: each arm gives the variables back to what follows, as a loop does (`MkPair`s). A match's value bound and taken apart at once, every way out building the tag taken apart, written so or by hand, is copied into the arms or, past the simplifier's budget, the names it binds set in each arm (`ESet`), no tag built. A loop whose `if` and the loop called each other last was one `$cycle`, its numbers boxed: 3.7 s to 2.7 s over 300M turns.
 - Conditions are a language of their own from the simplifier on (`EBool`: comparisons, `not`, `&&`, `||`, a `Bool` looked at): an `if` is a match on one and builds no `Bool`, and the passes after it take it as it is. The compiler's C 33.61 MB to 33.38 MB.
 - In `run do`, a loop is a function of its own that gives its variables back where it ends, what follows it after the call, not a function it calls last: a loop in a loop is a loop of its own, its numbers unboxed, not one function of them all. `matmul` (a `for` nest) 6.7 s to 1.07 s (#113).
 - Loop accumulators stay unboxed: a `Float64` total in a `do` loop is boxed once at exit. `doloops_float_do` 7.40 G to 0.42 G instructions.

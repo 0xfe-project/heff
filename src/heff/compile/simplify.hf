@@ -639,30 +639,55 @@ occCountOf x b = (IR.occurrences x b).count
 singletonM : String -> IR.Expr -> Map.Map String IR.Expr
 singletonM x a = Map.insert Map.empty x a
 
--- `run do`'s `if` and `case` of statements give their variables back
--- as the prelude's `GivenBack`s, right-nested (heff.syntax.presyntax),
--- which what follows takes apart at once: `let g = (if c then ...
--- MkGivenBack a1 (MkGivenBack b1 c1) else ...) in case g of MkGivenBack
--- x t -> case t of MkGivenBack y z -> ...`.  Where what follows is too
--- big to be given to each way out (`sumTakenApart`), the names are set
--- by each way out instead, `ESet [x, y, z]`, its ways the values they
--- give (`EValues`): no `GivenBack` built, no join point.
+-- A match's value bound and taken apart at once, every way out of the
+-- match building the tag taken apart: `let p = (if c then MkPair a1 b1
+-- else MkPair a2 b2) in case p of MkPair x y -> ...` -- what `run do`'s
+-- `if` and `case` of statements give their variables back as
+-- (heff.syntax.presyntax), and any code of that shape.  Where what
+-- follows is too big to be given to each way out (`sumTakenApart`), the
+-- names are set by each way out instead, `ESet [x, y]`, its ways the
+-- values they give (`EValues`): no tag built, no join point.  A last
+-- field taken apart at once again is the same, more names set (`MkPair
+-- a (MkPair b c)`, three variables).  Decided by the shape alone: no tag
+-- is special, but a `Lazy`'s box and a worker's tuple, never taken apart
+-- so.
 
--- (the names a match on `x` takes `GivenBack`s apart to, and what follows)
-givenMore : String
-          -> String
-          -> IR.Expr
-          -> Maybe (Pair (List String) IR.Expr)
-          -> Pair (List String) IR.Expr
-givenMore y w b (Just (MkPair ys body)) = MkPair (Cons y ys) body
-givenMore y w b Nothing = MkPair [y, w] b
+-- | what a match takes apart: each tag, level by level (each one's last
+-- | field the next one's), and how many fields it has; the names bound,
+-- | but those taken apart again; and what follows
+type Apart =
+  { tags : List (Pair String Int), names : List String, body : IR.Expr }
 
-givenNamesOf : String -> IR.Expr -> Maybe (Pair (List String) IR.Expr)
-givenNamesOf x (EMatch (EVar z) (Cons (MkArm t (Cons y (Cons w Nil)) b) Nil)) =
-  if strEq t "MkGivenBack" && strEq x z && occCountOf x b == 0
-  then Just (givenMore y w b (givenNamesOf w b))
+initL : {a : Type} -> List a -> List a
+initL Nil = Nil
+initL (Cons x Nil) = Nil
+initL (Cons x xs) = Cons x (initL xs)
+
+apartMore : String -> List String -> IR.Expr -> Maybe Apart -> Apart
+apartMore t vs b (Just ap) =
+  { tags = Cons (MkPair t (List.length vs)) ap.tags
+  , names = appendL (initL vs) ap.names
+  , body = ap.body
+  }
+apartMore t vs b Nothing =
+  { tags = [MkPair t (List.length vs)], names = vs, body = b }
+
+-- (a tag a value of which may be taken for its fields)
+apartTag : String -> Bool
+apartTag t = not (strEq t "MkLazy") && not (IR.isTupleTag t)
+
+-- (how `b` takes `x` apart at once, if it does, `x` named nowhere else)
+apartOf : String -> IR.Expr -> Maybe Apart
+apartOf x (EMatch (EVar z) (Cons (MkArm t vs b) Nil)) =
+  if strEq x z
+     && not (strEq x "_")
+     && not (List.null vs)
+     && apartTag t
+     && occCountOf x b == 0
+  then Just
+      (apartMore t vs b (maybe Nothing (\w -> apartOf w b) (List.last vs)))
   else Nothing
-givenNamesOf x e = Nothing
+apartOf x e = Nothing
 
 allJust : {a : Type} -> List (Maybe a) -> Maybe (List a)
 allJust Nil = Just Nil
@@ -670,25 +695,31 @@ allJust (Cons (Just x) rest) =
   maybe Nothing (\xs -> Just (Cons x xs)) (allJust rest)
 allJust (Cons Nothing rest) = Nothing
 
-consValue : IR.Expr -> Maybe (List IR.Expr) -> Maybe (List IR.Expr)
-consValue v (Just vs) = Just (Cons v vs)
-consValue v Nothing = Nothing
+appendValues : List IR.Expr -> Maybe (List IR.Expr) -> Maybe (List IR.Expr)
+appendValues vs (Just ws) = Just (appendL vs ws)
+appendValues vs Nothing = Nothing
 
--- (the `n` values a way out gives, `GivenBack`s of them)
-givenValues : Int -> IR.Expr -> Maybe (List IR.Expr)
-givenValues n (ETag t (Cons v (Cons w Nil)) _) =
-  if not (strEq t "MkGivenBack") then Nothing
-  else if n <= 2 then Just [v, w]
-  else consValue v (givenValues (n - 1) w)
-givenValues n e = Nothing
+-- (the values a way out gives: of the tags, level by level, as many
+-- fields each)
+valuesOf : List (Pair String Int) -> IR.Expr -> Maybe (List IR.Expr)
+valuesOf (Cons (MkPair t n) Nil) (ETag u args _) =
+  if strEq t u && List.length args == n then Just args else Nothing
+valuesOf (Cons (MkPair t n) rest) (ETag u args _) =
+  if strEq t u && List.length args == n
+  then appendValues
+      (initL args)
+      (valuesOf rest (fromMaybe EAbandon (List.last args)))
+  else Nothing
+valuesOf tags e = Nothing
 
--- (each way out the values it gives, if each is `GivenBack`s of `n`)
-toValues : Int -> IR.Expr -> Maybe IR.Expr
-toValues n (ELet y v b) =
-  maybe Nothing (\b2 -> Just (ELet y v b2)) (toValues n b)
-toValues n (ESet ys v b) =
-  maybe Nothing (\b2 -> Just (ESet ys v b2)) (toValues n b)
-toValues n (EMatch s arms) =
+-- (each way out the values it gives, if each builds the tags; one
+-- abandoned gives none)
+toValues : List (Pair String Int) -> IR.Expr -> Maybe IR.Expr
+toValues ts (ELet y v b) =
+  maybe Nothing (\b2 -> Just (ELet y v b2)) (toValues ts b)
+toValues ts (ESet ys v b) =
+  maybe Nothing (\b2 -> Just (ESet ys v b2)) (toValues ts b)
+toValues ts (EMatch s arms) =
   maybe
     Nothing
     (\bs ->
@@ -699,19 +730,29 @@ toValues n (EMatch s arms) =
                (\a b2 -> MkArm (IR.armTag a) (IR.armVars a) b2)
                arms
                bs)))
-    (allJust (List.map (\a -> toValues n (IR.armBody a)) arms))
-toValues n EAbandon = Just EAbandon
-toValues n e = maybe Nothing (\vs -> Just (EValues vs)) (givenValues n e)
+    (allJust (List.map (\a -> toValues ts (IR.armBody a)) arms))
+toValues ts EAbandon = Just EAbandon
+toValues ts e = maybe Nothing (\vs -> Just (EValues vs)) (valuesOf ts e)
 
--- | `let x = a in b`, `b` taking `x` apart as `GivenBack`s, each way out
--- | of `a` `GivenBack`s of as many: the names set by each way, then what follows
+-- (the names set: a field bound to none, `_`, a name of its own, of
+-- `x`'s, which is the program's alone)
+setNames : String -> List String -> List String
+setNames x ys =
+  List.zipWith
+    (\y i -> if strEq y "_" then x ^ "$_" ^ show i else y)
+    ys
+    (List.range 0 (List.length ys - 1))
+
+-- | `let x = a in b`, `b` taking `x` apart at once, each way out of `a`
+-- | building what it takes apart: the names set by each way, then what
+-- | follows
 givenSet : String -> IR.Expr -> IR.Expr -> Maybe IR.Expr
-givenSet x a b = case givenNamesOf x b of
-  Just (MkPair ys body) ->
+givenSet x a b = case apartOf x b of
+  Just ap ->
     maybe
       Nothing
-      (\a2 -> Just (ESet ys a2 body))
-      (toValues (List.length ys) a)
+      (\a2 -> Just (ESet (setNames x ap.names) a2 ap.body))
+      (toValues ap.tags a)
   Nothing -> Nothing
 
 -- (a binding, `b` simplified: the names set, where it is one of those)
