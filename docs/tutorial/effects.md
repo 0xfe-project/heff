@@ -89,11 +89,7 @@ program = do
 
 main : Co (stdio <+> filesystem) Unit
 main = do
-  r <-
-    attempt
-      FileError
-      (stdio <+> filesystem)
-      (program (io := _) (disk := _) (ex := _))
+  r <- attempt FileError (program (io := _) (disk := _) (ex := _))
   case r of
     Left err -> print (ev := _) (showFileError err)
     Right _ -> pure MkUnit
@@ -104,10 +100,10 @@ main = do
 on writes one.
 
 `program` needs all three. `main`'s world, `stdio <+> filesystem`, has
-stdio and the files; `attempt FileError` runs `program` in that world
-with `exception FileError` added on its left, and gives back `Left` what
-was thrown, or `Right` what `program` gave (see
-[handlers](../reference/language/effects.md#handlers) and
+stdio and the files; `attempt FileError` runs `program` in that world,
+as `main`'s type says it, with `exception FileError` added on its left,
+and gives back `Left` what was thrown, or `Right` what `program` gave
+(see [handlers](../reference/language/effects.md#handlers) and
 [`attempt`](../api/exception.md#attempt)). Where nothing heard a throw,
 `main` prints it.
 

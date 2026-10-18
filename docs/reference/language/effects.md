@@ -63,7 +63,8 @@ main = look (io := _) (disk := _)
 
 A part of the world that is a world of its own, `e`, is reached through
 the evidence in scope that says where `h` is in `e`: in `attempt
-FileError e (c (io := _) (fx := _))`, `fx` is `\p -> InL p`, and `io`
+FileError (c (io := _) (fx := _))`, whose world is `exception FileError
+<+> e`, `fx` is `\p -> InL p`, and `io`
 is `\p -> InR (io p)`, through the `io` in scope. An effect in no place
 of the world is E0355; in more than one, E0356 (give the evidence
 there); an argument that is no `h <: e`, or a world not known where the

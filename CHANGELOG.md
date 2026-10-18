@@ -15,6 +15,7 @@
 - In a `do` block, `then` and `else` may start a line under their `if`, as outside a block; an `else` under an `if` is that `if`'s, and in an `else if` chain, the first `if`'s. `heff fmt` lays them out so.
 - `if <- c then ...` and `case <- c of`: what an `if` tests or a `case` matches may be the value of an action, as `(<- c)`.
 - `(x := _)` finds evidence `h <: e`: where `e` is a sum by `<+>` known at the call, the one place of `h` in it (through the evidence in scope where a part of it is a world of its own). None is E0355, more than one E0356, no `h <: e` or no world known E0357.
+- exception's `attempt err c`: the rest of the world, `e`, is implicit, found from where the result is used, as `main`'s type.
 - `plus` is gone: effects are summed by `<+>` alone. `<:` binds looser than `<+>`, so `h <: h <+> k` is `h <: (h <+> k)`.
 - `xs <- for x in c do body` gathers each turn's value, what its last statement comes to, into a list, in order; a turn left by `continue` gives none, and `break` ends the gathering. A `for` alone runs for its effects, as before.
 - A signature may name more than one definition, `x, y, z : T`, at the top level, in `where` and `mutual`, and for a theory's or a record type's fields (`{ x, y : Int }`).
