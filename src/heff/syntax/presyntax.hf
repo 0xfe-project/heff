@@ -625,6 +625,9 @@ chkOf i = At (CInf i) (Params.spanOf i)
 --   the call of `after`, and the body's end the next turn; `return e`
 --   is `pure e`, anywhere: every function above is in tail position, so
 --   its answer is the block's;
+-- - in `run do`, a loop has no `after`: it gives its variables back
+--   where it ends, and what follows it comes after the call ("Loops
+--   giving their variables back", below);
 -- - an `if` or a `case` among the statements, whose arms are
 --   statements too (an arm's `do` block one of this block's statements),
 --   calls a join point of the variables, what follows it, at each arm's
@@ -657,14 +660,15 @@ chkOf i = At (CInf i) (Params.spanOf i)
 -- names, and the names bound for the values, are none the text can
 -- write (`loop#12`, by the offset of what they are of).
 
--- | the names a `do` block is taken apart through
-type DoNames = { bind : String, pure : String }
+-- | the names a `do` block is taken apart through, and whether its loops
+-- | give their variables back (`run do`'s, of the identity monad: below)
+type DoNames = { bind : String, pure : String, giveBack : Bool }
 
 coNames : DoNames
-coNames = { bind = "bind", pure = "pure" }
+coNames = { bind = "bind", pure = "pure", giveBack = False }
 
 idNames : DoNames
-idNames = { bind = "idBind", pure = "idPure" }
+idNames = { bind = "idBind", pure = "idPure", giveBack = True }
 
 -- | a call of a local function above (a loop's next turn, what follows a
 -- | loop, a join point), with the variables' values: the function (and
@@ -675,13 +679,15 @@ type Jump = { head : Expr, vars : List String, unit : Bool, depth : Int }
 
 -- | where the statements are: the names, the variables (`let mut`) in
 -- | scope, the innermost loop's `continue` and `break`, the block's span,
--- | and how many scopes (`try`) they are in
+-- | how many scopes (`try`) they are in, and, in a loop giving its
+-- | variables back, whether it may give back a `return`'s value too
 type DoCx =
   { names : DoNames
   , muts : List String
   , loop : Maybe (Pair Jump Jump)
   , sp : Params.Span
   , depth : Int
+  , giving : Maybe Bool
   }
 
 -- | what follows the statements' end: the last one's value is the
@@ -716,18 +722,26 @@ varParams sp True Nil = [MkPair (At (PatVar "_") sp) (At (EVar "Unit") sp)]
 varParams sp unit vars =
   List.map (\x -> MkPair (At (PatVar x) sp) (typeOfE sp x)) vars
 
--- | `f ps = body`, a local definition, its type to be found but for the
--- | number of its parameters
-localFun : String -> Params.Span -> List (Pair Pat Expr) -> Expr -> Decl
-localFun f sp ps body =
+-- | `f ps = body`, a local definition, of the type `ty` it gives
+localFunOf : String
+           -> Params.Span
+           -> List (Pair Pat Expr)
+           -> Expr
+           -> Expr
+           -> Decl
+localFunOf f sp ps ty body =
   At
     (DeclEquations
        f
        sp
        AsDefinition
-       (List.foldr (\p t -> At (EPi (PiAnon (snd p)) t) sp) (holeE sp) ps)
+       (List.foldr (\p t -> At (EPi (PiAnon (snd p)) t) sp) ty ps)
        [At (MkEquation f sp (List.map fst ps) body) sp])
     sp
+
+-- | ... its type to be found but for the number of its parameters
+localFun : String -> Params.Span -> List (Pair Pat Expr) -> Expr -> Decl
+localFun f sp ps body = localFunOf f sp ps (holeE sp) body
 
 -- | `let x = v in body`
 letVar : String -> Params.Span -> Expr -> Expr -> Expr
@@ -1236,6 +1250,7 @@ withMut cx x =
   , loop = cx.loop
   , sp = cx.sp
   , depth = cx.depth
+  , giving = cx.giving
   }
 
 withLoop : DoCx -> Jump -> Jump -> DoCx
@@ -1245,6 +1260,7 @@ withLoop cx cont brk =
   , loop = Just (MkPair cont brk)
   , sp = cx.sp
   , depth = cx.depth
+  , giving = cx.giving
   }
 
 -- | the statements of a scope (`try`), one further in
@@ -1255,6 +1271,7 @@ inScope cx =
   , loop = cx.loop
   , sp = cx.sp
   , depth = cx.depth + 1
+  , giving = cx.giving
   }
 
 -- | `break` or `continue`: the call it is, the last of its statements
@@ -1388,7 +1405,190 @@ condT t cx sp s arms rest end =
               ])
            sp)
 
+-- Loops giving their variables back
+--------------------------------------------------------------------------------
+
+-- In `run do` (#113), a loop is a function of the variables (and a
+-- `for`'s cursor) that calls only itself -- the next turn, `continue` --
+-- and gives the variables back where it ends, or `break`s: what follows
+-- it comes after the call, the variables bound again to what it gave,
+-- not in a function it calls last (a join point).  A loop in a loop is
+-- then called as any function is, and each is a loop of its own, its
+-- numbers kept unboxed apart -- not one function of them all, round a
+-- cycle of calls last (heff.compile.cycles), whose parameters no analysis
+-- sees through.  The variables are given back as one value: none,
+-- `MkUnit`; one, itself; more, in `MkPair`s (heff.compile.cpr gives them
+-- back unbuilt, where they fit).  A loop whose statements may `return`
+-- gives back `Left` of what it returns, else `Right` of the variables,
+-- and where it is called, a `Left` is returned on.
+
+-- (whether an expression may `return`: not in a lambda, where it is
+-- refused)
+hasReturn : Expr -> Bool
+hasReturn (At (EReturn _) _) = True
+hasReturn (At (ELam _ _) _) = False
+hasReturn e = fst (childrenAcc (\b c -> MkPair (b || hasReturn c) c) False e)
+
+-- (... statements)
+stmtsReturn : List (Params.Spanned (Stmt Expr)) -> Bool
+stmtsReturn ss =
+  List.any
+    (\st -> fst (stmtAcc (\b c -> MkPair (b || hasReturn c) c) False st))
+    ss
+
+-- (the variables, given back as one value)
+packE : Params.Span -> List String -> Expr
+packE sp Nil = At (ETag "MkUnit") sp
+packE sp (Cons x Nil) = At (EVar x) sp
+packE sp (Cons x xs) = app (At (ETag "MkPair") sp) [At (EVar x) sp, packE sp xs]
+
+-- (... taken apart, each bound again)
+packPat : Params.Span -> List String -> Pat
+packPat sp Nil = At (PatVar "_") sp
+packPat sp (Cons x Nil) = At (PatVar x) sp
+packPat sp (Cons x xs) = patTag "MkPair" sp [At (PatVar x) sp, packPat sp xs]
+
+-- (... of the variables' types)
+packTy : Params.Span -> List String -> Expr
+packTy sp Nil = At (EVar "builtin.Unit") sp
+packTy sp (Cons x Nil) = typeOfE sp x
+packTy sp (Cons x xs) =
+  app (At (EVar "prelude.Pair") sp) [typeOfE sp x, packTy sp xs]
+
+-- (what a loop gives back, `ret` whether a `return`'s value too: its
+-- type, and the variables)
+givenTy : Params.Span -> Bool -> List String -> Expr
+givenTy sp True vars =
+  app (At (EVar "prelude.Either") sp) [holeE sp, packTy sp vars]
+givenTy sp False vars = packTy sp vars
+
+givenE : Params.Span -> Bool -> List String -> Expr
+givenE sp True vars = app (At (ETag "Right") sp) [packE sp vars]
+givenE sp False vars = packE sp vars
+
+-- | `return v`: the block's answer -- in a loop giving its variables
+-- | back, `Left` of it, given back
+returnOf : DoCx -> Params.Span -> Expr -> Expr
+returnOf cx sp v = case cx.giving of
+  Just _ -> pureOf cx sp (app (At (ETag "Left") sp) [v])
+  Nothing -> pureOf cx sp v
+
+-- | the statements of a loop giving its variables back, `ret` whether a
+-- | `return`'s value too
+givingCx : DoCx -> Bool -> DoCx
+givingCx cx ret =
+  { names = cx.names
+  , muts = cx.muts
+  , loop = cx.loop
+  , sp = cx.sp
+  , depth = cx.depth
+  , giving = Just ret
+  }
+
+-- (what follows a loop, given what it gave back: the variables bound
+-- again; a `return`'s value returned on)
+afterArms : DoT
+          -> DoCx
+          -> Params.Span
+          -> Bool
+          -> List (Params.Spanned (Stmt Expr))
+          -> End
+          -> List (Params.Spanned (Alt Expr))
+afterArms t cx sp True rest end =
+  [ alt
+    (patTag "Left" sp [At (PatVar (madeName "returned" sp)) sp])
+    (leaving
+       cx
+       sp
+       cx.depth
+       (returnOf cx sp (At (EVar (madeName "returned" sp)) sp)))
+  , alt (patTag "Right" sp [packPat sp cx.muts]) (t.stmts cx rest end)
+  ]
+afterArms t cx sp False rest end =
+  [alt (packPat sp cx.muts) (t.stmts cx rest end)]
+
+-- | a loop giving its variables back: `exit`, where it ends or
+-- | `break`s, giving them back; `loop`, of the parameters `ps`, its body
+-- | made of where it is to end (`bodyOf`); what follows the loop, after
+-- | the call `call` of it
+givingLoop : DoT
+           -> DoCx
+           -> Params.Span
+           -> Bool
+           -> Expr
+           -> List (Pair Pat Expr)
+           -> (Jump -> Expr)
+           -> List (Params.Spanned (Stmt Expr))
+           -> End
+           -> Expr
+givingLoop t cx sp ret call ps bodyOf rest end =
+  At
+    (ELocal
+       (matchOf sp call (afterArms t cx sp ret rest end))
+       [ localFunOf
+         (madeName "exit" sp)
+         sp
+         (varParams sp True cx.muts)
+         (givenTy sp ret cx.muts)
+         (pureOf cx sp (givenE sp ret cx.muts))
+       , localFunOf
+         (madeName "loop" sp)
+         sp
+         ps
+         (givenTy sp ret cx.muts)
+         (bodyOf
+            { head = At (EVar (madeName "exit" sp)) sp
+            , vars = cx.muts
+            , unit = True
+            , depth = cx.depth
+            })
+       ])
+    sp
+
+-- | `while c do body`, a loop giving its variables back (`givingLoop`)
+whileGiving : DoT
+            -> DoCx
+            -> Params.Span
+            -> Expr
+            -> List (Params.Spanned (Stmt Expr))
+            -> List (Params.Spanned (Stmt Expr))
+            -> End
+            -> Expr
+whileGiving t cx sp c body rest end =
+  givingLoop
+    t
+    cx
+    sp
+    ret
+    (callJump sp loopJ)
+    (varParams sp True cx.muts)
+    (\exitJ ->
+       hoist
+         inner
+         c
+         (\c' ->
+            ifOf
+              sp
+              c'
+              (t.stmts (withLoop inner loopJ exitJ) body (EndJump loopJ))
+              (callJump sp exitJ)))
+    rest
+    end
+  where
+  ret : Bool
+  ret = hasReturn c || stmtsReturn body
+  inner : DoCx
+  inner = givingCx cx ret
+  loopJ : Jump
+  loopJ =
+    { head = At (EVar (madeName "loop" sp)) sp
+    , vars = cx.muts
+    , unit = True
+    , depth = cx.depth
+    }
+
 -- | `while c do body`: `loop`, the next turn, and `after`, what follows
+-- | -- in `run do`, a loop giving its variables back
 whileT : DoT
        -> DoCx
        -> Params.Span
@@ -1398,29 +1598,30 @@ whileT : DoT
        -> End
        -> Expr
 whileT t cx sp c body rest end =
-  At
-    (ELocal
-       (callJump sp loopJ)
-       [ localFun
-         (madeName "after" sp)
-         sp
-         (varParams sp True cx.muts)
-         (t.stmts cx rest end)
-       , localFun
-         (madeName "loop" sp)
-         sp
-         (varParams sp True cx.muts)
-         (hoist
-            cx
-            c
-            (\c' ->
-               ifOf
-                 sp
-                 c'
-                 (t.stmts (withLoop cx loopJ afterJ) body (EndJump loopJ))
-                 (callJump sp afterJ)))
-       ])
-    sp
+  if cx.names.giveBack then whileGiving t cx sp c body rest end
+  else At
+      (ELocal
+         (callJump sp loopJ)
+         [ localFun
+           (madeName "after" sp)
+           sp
+           (varParams sp True cx.muts)
+           (t.stmts cx rest end)
+         , localFun
+           (madeName "loop" sp)
+           sp
+           (varParams sp True cx.muts)
+           (hoist
+              cx
+              c
+              (\c' ->
+                 ifOf
+                   sp
+                   c'
+                   (t.stmts (withLoop cx loopJ afterJ) body (EndJump loopJ))
+                   (callJump sp afterJ)))
+         ])
+      sp
   where
   loopJ : Jump
   loopJ =
@@ -1438,7 +1639,8 @@ whileT t cx sp c body rest end =
     }
 
 -- | `for p in e do body`: `e` bound once, its `Iterate` found for it,
--- | `loop` of the cursor and the variables, `after` of the variables
+-- | `loop` of the cursor and the variables, `after` of the variables --
+-- | in `run do`, a loop giving its variables back
 forT : DoT
      -> DoCx
      -> Params.Span
@@ -1461,48 +1663,7 @@ forT t cx sp p coll body rest end =
             (madeName "next" sp)
             sp
             (app it [At (EProject "next") sp])
-            (At
-               (ELocal
-                  (app
-                     (var "loop")
-                     (Cons
-                        (app it [At (EProject "start") sp, var "coll"])
-                        (varArgs sp False cx.muts)))
-                  [ localFun
-                    (madeName "after" sp)
-                    sp
-                    (varParams sp True cx.muts)
-                    (t.stmts cx rest end)
-                  , localFun
-                    (madeName "loop" sp)
-                    sp
-                    (Cons
-                       (MkPair
-                          (At (PatVar (madeName "cursor" sp)) sp)
-                          (app it [At (EProject "Cursor") sp]))
-                       (varParams sp False cx.muts))
-                    (matchOf
-                       sp
-                       (app (var "next") [var "cursor"])
-                       [ alt (patTag "Nothing" sp Nil) (callJump sp afterJ)
-                       , alt
-                             (patTag
-                                "Just"
-                                sp
-                                [ patTag
-                                  "MkPair"
-                                  sp
-                                  [p, At (PatVar (madeName "rest" sp)) sp]
-                                ]) (case firstMut cx (patNames p) of
-                           Just x -> badE (Params.spanOf p) (mutClash x)
-                           Nothing ->
-                             t.stmts
-                               (withLoop cx nextJ afterJ)
-                               body
-                               (EndJump nextJ))
-                       ])
-                  ])
-               sp)))
+            (if cx.names.giveBack then given else joined)))
   where
   var : String -> Expr
   var what = At (EVar (madeName what sp)) sp
@@ -1520,6 +1681,68 @@ forT t cx sp p coll body rest end =
     , unit = False
     , depth = cx.depth
     }
+  -- (the loop's first call, and its parameters: the cursor, then the
+  -- variables)
+  first : Expr
+  first =
+    app
+      (var "loop")
+      (Cons
+         (app it [At (EProject "start") sp, var "coll"])
+         (varArgs sp False cx.muts))
+  params : List (Pair Pat Expr)
+  params =
+    Cons
+      (MkPair
+         (At (PatVar (madeName "cursor" sp)) sp)
+         (app it [At (EProject "Cursor") sp]))
+      (varParams sp False cx.muts)
+  -- (a turn, of the statements `inner`: the cursor's next element and
+  -- the body, else where the loop ends, `endJ`)
+  turn : Jump -> DoCx -> Expr
+  turn endJ inner =
+    matchOf
+      sp
+      (app (var "next") [var "cursor"])
+      [ alt (patTag "Nothing" sp Nil) (callJump sp endJ)
+      , alt
+            (patTag
+               "Just"
+               sp
+               [ patTag "MkPair" sp [p, At (PatVar (madeName "rest" sp)) sp]
+               ]) (case firstMut
+            cx
+            (patNames p) of
+          Just x -> badE (Params.spanOf p) (mutClash x)
+          Nothing -> t.stmts (withLoop inner nextJ endJ) body (EndJump nextJ))
+      ]
+  joined : Expr
+  joined =
+    At
+      (ELocal
+         first
+         [ localFun
+           (madeName "after" sp)
+           sp
+           (varParams sp True cx.muts)
+           (t.stmts cx rest end)
+         , localFun (madeName "loop" sp) sp params (turn afterJ cx)
+         ])
+      sp
+  ret : Bool
+  ret = stmtsReturn body
+  given : Expr
+  given =
+    givingLoop
+      t
+      cx
+      sp
+      ret
+      first
+      params
+      (\exitJ -> turn exitJ (givingCx cx ret))
+      rest
+      end
 
 -- (the names a `catch` arm's binder binds, and where it is)
 binderNames : LamBinder Expr -> List String
@@ -1728,7 +1951,7 @@ controlT t cx (At EContinue sp) rest end =
 controlT t cx (At (EReturn v) sp) (Cons s _) end =
   badE (Params.spanOf s) "nothing after `return` runs: it is the last statement"
 controlT t cx (At (EReturn v) sp) Nil end =
-  hoist cx v (\v' -> leaving cx sp cx.depth (pureOf cx sp v'))
+  hoist cx v (\v' -> leaving cx sp cx.depth (returnOf cx sp v'))
 controlT t cx (At (EWhile c body) sp) rest end = whileT t cx sp c body rest end
 controlT t cx (At (EFor p c body) sp) rest end = forT t cx sp p c body rest end
 controlT t cx (At (EIfThen c a) sp) rest end =
@@ -1961,6 +2184,7 @@ doBlock names sp stmts =
          , loop = Nothing
          , sp = sp
          , depth = 0
+         , giving = Nothing
          }
          stmts
          EndValue)

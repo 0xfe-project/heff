@@ -30,6 +30,7 @@
 
 ### Backends and performance
 
+- In `run do`, a loop is a function of its own that gives its variables back where it ends, what follows it after the call, not a function it calls last: a loop in a loop is a loop of its own, its numbers unboxed, not one function of them all. `matmul` (a `for` nest) 6.7 s to 1.07 s (#113).
 - Loop accumulators stay unboxed: a `Float64` total in a `do` loop is boxed once at exit. `doloops_float_do` 7.40 G to 0.42 G instructions.
 - `Array.set` in a loop that uses the array linearly checks uniqueness once on entry, then writes in place, so the C compiler vectorises the loop (#102).
 - A loop reading and setting arrays at an index checks the bounds once on entry. `saxpy` 0.48 s to 0.30 s (#102).
