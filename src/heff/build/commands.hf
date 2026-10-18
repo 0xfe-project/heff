@@ -4167,22 +4167,28 @@ docKept False (Just c) acc = Cons c acc
 docKept bad found acc = acc
 
 -- (each file checked, after what it imports: the modules that checked,
--- in order; each that did not, its diagnostics said)
+-- in order; each that did not, its diagnostics said.  Each one more of
+-- the task `chk`'s, a task under it meanwhile)
 docChecked : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
            -> {{disk : filesystem <: e}}
            -> {{rep : Report.report <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> Progress.Task
            -> List String
            -> List Driver.Checked
            -> Co e (List Driver.Checked)
-docChecked Nil acc = pure (List.reverse acc)
-docChecked (Cons f rest) acc = do
+docChecked chk Nil acc = pure (List.reverse acc)
+docChecked chk (Cons f rest) acc = do
+  m <- Progress.start chk f 0
   l <- load f
   badL <- printErrs "heff" l.errors 0
   cs <- Session.cachedProgram l
   if anyErrors cs then putFileDiags cs else pure MkUnit
+  Progress.end m
   docChecked
+      chk
       rest
       (docKept (badL > 0 || anyErrors cs) (Driver.lastChecked cs) acc)
 
@@ -4203,21 +4209,24 @@ docPageWritten path text = do
     printErr ("heff doc: cannot write " ^ path)
     exit 1
 
--- (each module's page, under the directory)
+-- (each module's page, under the directory: one more of the task `w`'s)
 docPagesWritten : {e : HFunctor}
                 -> {{io : stdio <: e}}
                 -> {{sys : process <: e}}
                 -> {{disk : filesystem <: e}}
+                -> {{prog : Progress.progress <: e}}
+                -> Progress.Task
                 -> String
                 -> List Driver.Checked
                 -> Co e Unit
-docPagesWritten dir Nil = pure MkUnit
-docPagesWritten dir (Cons c rest) = do
+docPagesWritten w dir Nil = pure MkUnit
+docPagesWritten w dir (Cons c rest) = do
   st <- styleNow
   docPageWritten
       (HostPath.join st dir (DocPages.pagePath c.module))
       (DocPages.page c)
-  docPagesWritten dir rest
+  Progress.complete w
+  docPagesWritten w dir rest
 
 -- (the pages: printed one after another, or written under the directory,
 -- with their index)
@@ -4225,14 +4234,17 @@ docWritten : {e : HFunctor}
            -> {{io : stdio <: e}}
            -> {{sys : process <: e}}
            -> {{disk : filesystem <: e}}
+           -> {{prog : Progress.progress <: e}}
            -> Maybe String
            -> List Driver.Checked
            -> Co e Unit
 docWritten Nothing cs = write (joinWith "\n" (List.map DocPages.page cs))
 docWritten (Just dir) cs = do
   st <- styleNow
-  docPagesWritten dir cs
+  w <- Progress.start Progress.root "writing pages" (List.length cs + 1)
+  docPagesWritten w dir cs
   docPageWritten (HostPath.join st dir "index.md") (DocPages.indexPage cs)
+  Progress.end w
   print
       ("heff doc: "
        ^ show (List.length cs)
@@ -4250,12 +4262,15 @@ docCmd : {e : HFunctor}
        -> {{sys : process <: e}}
        -> {{disk : filesystem <: e}}
        -> {{rep : Report.report <: e}}
+       -> {{prog : Progress.progress <: e}}
        -> Maybe String
        -> List String
        -> Co e Unit
 docCmd out given = do
   files <- docFiles given
-  cs <- docChecked files Nil
+  chk <- Progress.start Progress.root "checking modules" (List.length files)
+  cs <- docChecked chk files Nil
+  Progress.end chk
   docWritten out cs
   if List.length cs < List.length files then exit 1 else pure MkUnit
 
