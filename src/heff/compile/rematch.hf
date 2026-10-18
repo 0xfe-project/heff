@@ -1,0 +1,156 @@
+-- A tag matched again where its arms part (#117).  An arm that takes a
+-- tag apart and then looks at one of its fields, where some of the arms
+-- of that look want the tag whole and others do not:
+--
+--   case t of                          case t of
+--     Node c l k v r -> case c of        Node c l k v r -> case c of
+--       Red -> f l k v r                   Red -> case t of Node c2 l2 k2 v2 r2 -> f l2 k2 v2 r2
+--       Black -> g t                       Black -> g t
+--
+-- reads only the field it looks at, and each arm of the look that wants
+-- another field, or not the tag whole, takes the tag apart again there.
+-- Perceus decides what an arm does with what it matched for the arm as
+-- a whole (heff.compile.refcount): the tag wanted whole on some way
+-- through, each field was counted where the arm starts and given back
+-- where the tag was given up, its cell freed and a fresh one built; now,
+-- where it is given up, its fields are taken over and its cell kept for
+-- the tag built there (Koka's drop specialisation), and where it is
+-- wanted whole nothing is counted.  The tag is known there: matching it
+-- again cannot fail.
+--
+-- Only the C backend counts references: this runs on what it is given
+-- (heff.compile.lower), before the monadic form.
+
+module heff.compile.rematch
+
+import heff.compile.ir as IR
+import std.map as Map
+
+-- | computations drawing fresh names
+type S a = IR.Supply -> Pair a IR.Supply
+
+bindTake : {a b : Type} -> (a -> S b) -> Pair a IR.Supply -> Pair b IR.Supply
+bindTake f (MkPair x n) = f x n
+
+-- `do` is this
+bind : {a b : Type} -> S a -> (a -> S b) -> S b
+bind m f = \n -> bindTake f (m n)
+
+pure : {a : Type} -> a -> S a
+pure x = \n -> MkPair x n
+
+instance instanceMonadS : Monad S
+instanceMonadS = { pure = pure, bind = bind }
+
+traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
+traverseS = traverse (mo := instanceMonadS)
+
+-- (whether `x` occurs in `e`)
+mentions : String -> IR.Expr -> Bool
+mentions x e = (IR.occurrences x e).count > 0
+
+-- (a variable of an arm, named afresh: but `_`)
+freshVar : String -> S String
+freshVar v = if strEq v "_" then pure "_" else \n -> IR.fresh (IR.baseOf v) n
+
+-- (whether the arm `c`, of a look at the field `f` of `x` taken apart
+-- of `vs`, wants `x` whole and no field of it but `f`)
+keepsWhole : String -> List String -> String -> IR.Expr -> Bool
+keepsWhole x vs f c =
+  mentions x c
+  && not
+    (List.any (\v -> not (strEq v f) && not (strEq v "_") && mentions v c) vs)
+
+-- (... that arm, where it gives `x` up or wants a field but `f`: `x`,
+-- of the tag `t`, taken apart again there, its fields named afresh)
+again : String -> String -> List String -> String -> IR.Arm -> S IR.Arm
+again x t vs f (MkArm t2 ws c) =
+  if keepsWhole x vs f c then pure (MkArm t2 ws c)
+  else do
+    vs2 <- traverseS freshVar vs
+    pure
+        (MkArm
+           t2
+           ws
+           (EMatch
+              (EVar x)
+              [ MkArm
+                t
+                vs2
+                (IR.subst
+                   (Map.fromList
+                      (List.zipWith (\v w -> MkPair v (EVar w)) vs vs2))
+                   c)
+              ]))
+
+-- (whether the look's arms part: some want `x` whole, some do not)
+parts : String -> List IR.Arm -> Bool
+parts x inner =
+  List.any (\a -> mentions x (IR.armBody a)) inner
+  && List.any (\a -> not (mentions x (IR.armBody a))) inner
+
+-- (an arm of a match of `x`, its body gone through already)
+armOf : String -> IR.Arm -> S IR.Arm
+armOf x (MkArm t vs (EMatch (EVar f) inner)) =
+  if List.any (\v -> strEq v f) vs && parts x inner
+  then do
+    inner2 <- traverseS (again x t vs f) inner
+    pure (MkArm t vs (EMatch (EVar f) inner2))
+  else pure (MkArm t vs (EMatch (EVar f) inner))
+armOf x a = pure a
+
+-- (an arm's body gone through)
+inArm : (IR.Expr -> S IR.Expr) -> IR.Arm -> S IR.Arm
+inArm g (MkArm t vs b) = do
+  b2 <- g b
+  pure (MkArm t vs b2)
+
+-- | an expression, each arm of a match of a variable that looks at a
+-- | field so made, inner ones first
+go : IR.Expr -> S IR.Expr
+go (EMatch (EVar x) as0) = do
+  as1 <- traverseS (inArm go) as0
+  as2 <- traverseS (armOf x) as1
+  pure (EMatch (EVar x) as2)
+go (EMatch s as0) = do
+  s2 <- go s
+  as2 <- traverseS (inArm go) as0
+  pure (EMatch s2 as2)
+go (ELam xs b) = do
+  b2 <- go b
+  pure (ELam xs b2)
+go (EApp f argv) = do
+  f2 <- go f
+  argv2 <- traverseS go argv
+  pure (EApp f2 argv2)
+go (ELet x a b) = do
+  a2 <- go a
+  b2 <- go b
+  pure (ELet x a2 b2)
+go (ERecord fs ts) = do
+  es <- traverseS go (List.map snd fs)
+  pure (ERecord (List.zipWith (\p e -> MkPair (fst p) e) fs es) ts)
+go (EProj e l sh t) = do
+  e2 <- go e
+  pure (EProj e2 l sh t)
+go (ETag t argv ts) = do
+  argv2 <- traverseS go argv
+  pure (ETag t argv2 ts)
+go (EPrimCall p argv) = do
+  argv2 <- traverseS go argv
+  pure (EPrimCall p argv2)
+go (ECall g argv) = do
+  argv2 <- traverseS go argv
+  pure (ECall g argv2)
+go e = pure e
+
+-- (a definition gone through)
+defOf : IR.Def -> S IR.Def
+defOf d = do
+  b <- go d.body
+  pure (IR.mkDef d.key d.name b)
+
+-- | the program, each definition gone through; where fresh names go on
+-- | from
+rematchProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+rematchProgram n defs = traverseS defOf defs n
