@@ -1,0 +1,197 @@
+-- A cell given to the function called (#117), as Perceus's reuse
+-- tokens.  An arm that gives up the tag it matched keeps its cell for the
+-- first tag of its size built on each way through it
+-- (heff.compile.refcount); where none is built, the cell was freed -- and
+-- the function called there, building one, made one anew:
+--
+--   ins (Node Black a k v b) x = ... balance (ins a x) k v b
+--
+-- `balance` given the cell instead, a copy of it (`Facts.tokKey`, its
+-- first parameter the cell) builds the first tag of the size on each way
+-- through it in the cell, and frees it where it builds none.  A function
+-- is given such a copy where its call is what a way that builds no tag
+-- of that size gives back, in an arm giving up its tag, and itself builds
+-- one; not a
+-- function calling itself (whose own arms have cells of their own to
+-- build in), nor one above `cellMax` (each copy is the function again).
+-- Which call is given the cell is heff.compile.refcount's, which knows
+-- what an arm gives up; this makes the copies it may call.
+--
+-- Only the C backend counts references: this runs on what it is given
+-- (heff.compile.lower), before the monadic form.
+
+module heff.compile.tokens
+
+import heff.compile.facts as Facts
+import heff.compile.ir as IR
+import std.map as Map
+
+-- | how big a function may be to be copied for a cell
+cellMax : Int
+cellMax = 150
+
+-- (whether the worklist builds a tag of `n` fields -- not a tuple, which
+-- is no cell -- outside a lambda)
+buildsW : Int -> List IR.Expr -> Bool
+buildsW n Nil = False
+buildsW n (Cons (ETag t argv _) rest) =
+  (List.length argv == n && not (IR.isTupleTag t))
+  || buildsW n (IR.appendI argv rest)
+buildsW n (Cons (ELam _ _) rest) = buildsW n rest
+buildsW n (Cons (EApp f argv) rest) = buildsW n (Cons f (IR.appendI argv rest))
+buildsW n (Cons (ELet _ a b) rest) = buildsW n (Cons a (Cons b rest))
+buildsW n (Cons (ERecord fs _) rest) = buildsW n (IR.pushFields fs rest)
+buildsW n (Cons (EProj e _ _ _) rest) = buildsW n (Cons e rest)
+buildsW n (Cons (EMatch s arms) rest) =
+  buildsW n (Cons s (IR.pushArms arms rest))
+buildsW n (Cons (EPrimCall _ argv) rest) = buildsW n (IR.appendI argv rest)
+buildsW n (Cons (ECall _ argv) rest) = buildsW n (IR.appendI argv rest)
+buildsW n (Cons _ rest) = buildsW n rest
+
+builds : Int -> IR.Expr -> Bool
+builds n e = buildsW n (Cons e Nil)
+
+-- (whether `b` only gives `x` back, or puts it where it is to go -- a
+-- primitive of values, as a destination's field is set: heff.compile.trmc)
+givesBack : String -> IR.Expr -> Bool
+givesBack x (EVar y) = strEq x y
+givesBack x (EPrimCall _ argv) = List.all (\a -> IR.isValue a) argv
+givesBack x e = False
+
+-- (the functions whose call is what a way through `e` that builds no tag
+-- of `n` fields gives back: where a tag built in the cell would be what
+-- the arm gives, as `balance`'s)
+bareCalls : Int -> IR.Expr -> List String
+bareCalls n (EMatch s arms) =
+  if builds n s then Nil
+  else List.concatMap (\a -> bareCalls n (IR.armBody a)) arms
+bareCalls n (ELet x (ECall g argv) b) =
+  if List.any (builds n) argv || builds n b then Nil
+  else if givesBack x b then Cons g Nil
+  else bareCalls n b
+bareCalls n (ELet _ a b) = if builds n a then Nil else bareCalls n b
+bareCalls n (ECall g argv) =
+  if List.any (builds n) argv then Nil else Cons g Nil
+bareCalls n e = Nil
+
+-- | a function called where a cell of its size could be given it
+type Site = Pair String Int
+
+-- (whether `x` occurs in `e`)
+mentions : String -> IR.Expr -> Bool
+mentions x e = (IR.occurrences x e).count > 0
+
+-- (an arm giving up the tag `x` it took apart: the functions called on
+-- its ways building no tag of its size)
+armSites : String -> IR.Arm -> List Site
+armSites x (MkArm t vs b) =
+  if IR.isTupleTag t || List.null vs || mentions x b then Nil
+  else List.map (\g -> MkPair g (List.length vs)) (bareCalls (List.length vs) b)
+
+-- (the sites of the worklist, onto `acc`)
+sitesW : List Site -> List IR.Expr -> List Site
+sitesW acc Nil = acc
+sitesW acc (Cons (EMatch (EVar x) arms) rest) =
+  sitesW
+    (List.foldl (\a arm -> IR.appendI (armSites x arm) a) acc arms)
+    (IR.pushArms arms rest)
+sitesW acc (Cons (EMatch s arms) rest) =
+  sitesW acc (Cons s (IR.pushArms arms rest))
+sitesW acc (Cons (ELam _ b) rest) = sitesW acc (Cons b rest)
+sitesW acc (Cons (EApp f argv) rest) =
+  sitesW acc (Cons f (IR.appendI argv rest))
+sitesW acc (Cons (ELet _ a b) rest) = sitesW acc (Cons a (Cons b rest))
+sitesW acc (Cons (ERecord fs _) rest) = sitesW acc (IR.pushFields fs rest)
+sitesW acc (Cons (EProj e _ _ _) rest) = sitesW acc (Cons e rest)
+sitesW acc (Cons (ETag _ argv _) rest) = sitesW acc (IR.appendI argv rest)
+sitesW acc (Cons (EPrimCall _ argv) rest) = sitesW acc (IR.appendI argv rest)
+sitesW acc (Cons (ECall _ argv) rest) = sitesW acc (IR.appendI argv rest)
+sitesW acc (Cons _ rest) = sitesW acc rest
+
+-- (whether the definition may be copied for a cell of `n` fields: a
+-- function, not calling itself, building a tag of the size, not too big,
+-- not a worker giving back a tuple -- `tuples`, heff.compile.cpr's)
+copiable : Map.Map String Int -> Int -> IR.Def -> Bool
+copiable tuples n d@{ body = ELam _ b } =
+  not (Map.member tuples d.key)
+  && not (List.any (\g -> strEq g d.key) (IR.globalsIn b))
+  && builds n b
+  && not (IR.sizeAbove cellMax b)
+copiable tuples n d = False
+
+-- (the sites, each once, whose functions may be copied)
+copies : Map.Map String Int
+       -> Map.Map String IR.Def
+       -> List Site
+       -> List (Pair IR.Def Int)
+copies tuples byKey sites =
+  Map.values
+    (List.foldl
+       (\m (s : Site) -> case Map.lookup byKey (fst s) of
+        Just d ->
+          if copiable tuples (snd s) d
+          then Map.insert m (Facts.tokKey (fst s) (snd s)) (MkPair d (snd s))
+          else m
+        Nothing -> m)
+       Map.empty
+       sites)
+
+-- (a function's copy given a cell of `n` fields, first, named afresh)
+copyOf : IR.Def -> Int -> IR.Supply -> Pair IR.Def IR.Supply
+copyOf d n s = case d.body of
+  ELam xs b -> case IR.fresh "tok" s of
+    MkPair tok s2 ->
+      MkPair (IR.mkDef (Facts.tokKey d.key n) d.name (ELam (Cons tok xs) b)) s2
+  b -> MkPair d s
+
+-- | the program, with its functions' copies given a cell; where fresh
+-- | names go on from; the copies made
+type Tokened = { defs : List IR.Def, supply : IR.Supply, tokens : Facts.Tokens }
+
+tokensOf : List (Pair IR.Def Int) -> Facts.Tokens
+tokensOf cs =
+  { byFun =
+      List.foldl
+        (\m (p : Pair IR.Def Int) ->
+           Map.insert
+             m
+             (fst p).key
+             (Cons (snd p) (fromMaybe Nil (Map.lookup m (fst p).key))))
+        Map.empty
+        cs
+  , cells =
+      List.foldl
+        (\m (p : Pair IR.Def Int) ->
+           Map.insert m (Facts.tokKey (fst p).key (snd p)) (snd p))
+        Map.empty
+        cs
+  }
+
+made : List IR.Def
+     -> List (Pair IR.Def Int)
+     -> Pair (List IR.Def) IR.Supply
+     -> Tokened
+made defs cs (MkPair copied s) =
+  { defs = IR.appendI defs copied, supply = s, tokens = tokensOf cs }
+
+consDef : IR.Def -> Pair (List IR.Def) IR.Supply -> Pair (List IR.Def) IR.Supply
+consDef d (MkPair ds s) = MkPair (Cons d ds) s
+
+copiesOf : List (Pair IR.Def Int) -> IR.Supply -> Pair (List IR.Def) IR.Supply
+copiesOf Nil s = MkPair Nil s
+copiesOf (Cons (MkPair d n) cs) s = case copyOf d n s of
+  MkPair d2 s2 -> consDef d2 (copiesOf cs s2)
+
+-- | the program, each function called where it could be given a cell
+-- | copied to be given one (but the workers giving back tuples, `tuples`)
+tokensProgram : Map.Map String Int -> IR.Supply -> List IR.Def -> Tokened
+tokensProgram tuples s defs =
+  let cs =
+    copies
+      tuples
+      (List.foldl
+         (\m (d : IR.Def) -> Map.insert m d.key d)
+         Map.empty
+         defs)
+      (sitesW Nil (List.map (\(d : IR.Def) -> d.body) defs))
+  in made defs cs (copiesOf cs s)

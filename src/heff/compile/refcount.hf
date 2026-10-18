@@ -300,6 +300,7 @@ type CE =
   , flat : Repr.FlatTags
   , sure : Repr.FlatTags
   , sureRecs : Repr.FlatTags
+  , tokens : Facts.Tokens
   , ret : Repr.Repr
   }
 
@@ -326,6 +327,7 @@ withFrame s n ce =
   , flat = ce.flat
   , sure = ce.sure
   , sureRecs = ce.sureRecs
+  , tokens = ce.tokens
   , ret = retOf ce.sigs s
   }
 
@@ -346,6 +348,7 @@ withPath owned after ce =
   , flat = ce.flat
   , sure = ce.sure
   , sureRecs = ce.sureRecs
+  , tokens = ce.tokens
   , ret = ce.ret
   }
 
@@ -367,6 +370,7 @@ withBorrowed bs ce =
   , flat = ce.flat
   , sure = ce.sure
   , sureRecs = ce.sureRecs
+  , tokens = ce.tokens
   , ret = ce.ret
   }
 
@@ -387,6 +391,7 @@ withKnown x k ce =
   , flat = ce.flat
   , sure = ce.sure
   , sureRecs = ce.sureRecs
+  , tokens = ce.tokens
   , ret = ce.ret
   }
 
@@ -407,6 +412,7 @@ withTakes ts ce =
   , flat = ce.flat
   , sure = ce.sure
   , sureRecs = ce.sureRecs
+  , tokens = ce.tokens
   , ret = ce.ret
   }
 
@@ -429,6 +435,7 @@ ceOfFacts facts reprs =
   , flat = facts.flat
   , sure = facts.sure
   , sureRecs = facts.sureRecs
+  , tokens = facts.tokens
   , ret = RepV
   }
 
@@ -1936,25 +1943,181 @@ reusedAny ru n b (MkPair False _) = case reuseArm ru { n = n, tag = "" } b of
   MkPair True b2 -> MkPair (Just ru) b2
   MkPair False _ -> MkPair Nothing b
 
+-- Cells given (#117)
+--------------------------------------------------------------------------------
+
+-- A way through an arm whose scrutinee is given up that builds no tag of
+-- its size, but calls a function with a copy given a cell of it
+-- (heff.compile.tokens), calls the copy, given the cell: the first such
+-- call on the way.  A function's copy builds the first tag of the size
+-- on each way through it in the cell it is given (`tokenFun`).
+
+-- (a call of a function with a copy given a cell of `n` fields: the copy
+-- called, given the cell `ru`)
+tokenOp : Facts.Tokens
+        -> String
+        -> Int
+        -> Imperative.Comp
+        -> Pair Bool Imperative.Comp
+tokenOp tk ru n (OCall g argv) =
+  if Map.member tk.cells (Facts.tokKey g n)
+  then MkPair True (OCall (Facts.tokKey g n) (Cons (SVar ru) argv))
+  else MkPair False (OCall g argv)
+tokenOp tk ru n o = MkPair False o
+
+-- (whether the cell is built in there already)
+cellIn : String -> List Imperative.Part -> Bool
+cellIn ru ps = Imperative.namedIn ru ps
+
+-- | the walk, knotted, of what does not build in the cell at all: each
+-- | way's first call given it -- statements (then what follows where
+-- | none was), what is last
+type TokenK =
+  { sts : List Imperative.St -> Pair Bool (List Imperative.St)
+  , tl : Imperative.Tl -> Pair Bool Imperative.Tl
+  }
+
+tokenSt : TokenK
+        -> Facts.Tokens
+        -> String
+        -> Int
+        -> Imperative.St
+        -> Pair Bool Imperative.St
+tokenSt k tk ru n (SLet x o) = case tokenOp tk ru n o of
+  MkPair b o2 -> MkPair b (SLet x o2)
+tokenSt k tk ru n (SSet x o) = case tokenOp tk ru n o of
+  MkPair b o2 -> MkPair b (SSet x o2)
+tokenSt k tk ru n (SCase v arms) = case armsFound
+    (List.map
+       (\arm -> case arm of
+        MkArm t vs ss -> armFound t vs (k.sts ss))
+       arms) of
+  MkPair b as2 -> MkPair b (SCase v as2)
+tokenSt k tk ru n (SIf c ts fs) = case k.sts ts of
+  MkPair bt ts2 -> case k.sts fs of
+    MkPair bf fs2 -> MkPair (bt || bf) (SIf c ts2 fs2)
+tokenSt k tk ru n st = MkPair False st
+
+tokenThen : TokenK
+          -> List Imperative.St
+          -> Pair Bool Imperative.St
+          -> Pair Bool (List Imperative.St)
+tokenThen k rest (MkPair True st) = MkPair True (Cons st rest)
+tokenThen k rest (MkPair False st) = consSt st (k.sts rest)
+
+tokenSts : TokenK
+         -> Facts.Tokens
+         -> String
+         -> Int
+         -> List Imperative.St
+         -> Pair Bool (List Imperative.St)
+tokenSts k tk ru n Nil = MkPair False Nil
+tokenSts k tk ru n (Cons st rest) = tokenThen k rest (tokenSt k tk ru n st)
+
+tokenTl : TokenK
+        -> Facts.Tokens
+        -> String
+        -> Int
+        -> Imperative.Tl
+        -> Pair Bool Imperative.Tl
+tokenTl k tk ru n (TSeq ss t) = case k.sts ss of
+  MkPair True ss2 -> MkPair True (TSeq ss2 t)
+  MkPair False _ -> case k.tl t of
+    MkPair b t2 -> MkPair b (TSeq ss t2)
+tokenTl k tk ru n (TReturn o) = case tokenOp tk ru n o of
+  MkPair b o2 -> MkPair b (TReturn o2)
+tokenTl k tk ru n (TLoop vs) = MkPair False (TLoop vs)
+tokenTl k tk ru n (TIf c t e) = case k.tl t of
+  MkPair bt t2 -> case k.tl e of
+    MkPair be e2 -> MkPair (bt || be) (TIf c t2 e2)
+tokenTl k tk ru n (TCase v arms) = case armsFound
+    (List.map
+       (\arm -> case arm of
+        MkArm t vs b -> armFound t vs (k.tl b))
+       arms) of
+  MkPair b as2 -> MkPair b (TCase v as2)
+
+tokenK : Facts.Tokens -> String -> Int -> TokenK
+tokenK tk ru n =
+  { sts = \ss -> tokenSts (tokenK tk ru n) tk ru n ss
+  , tl = \t -> tokenTl (tokenK tk ru n) tk ru n t
+  }
+
+-- (what is last, where the cell may be built in already: where it is
+-- not at all, its ways' first calls given it; else, of each way it
+-- parts into, the same -- never a call on a way that builds in it after)
+tokenRound : Facts.Tokens
+           -> String
+           -> Int
+           -> Imperative.Tl
+           -> Pair Bool Imperative.Tl
+tokenRound tk ru n (TIf c a b) =
+  if not (cellIn ru (Imperative.tailParts (TIf c a b)))
+  then (tokenK tk ru n).tl (TIf c a b)
+  else let ra : Pair Bool Imperative.Tl = tokenRound tk ru n a
+       in let rb : Pair Bool Imperative.Tl = tokenRound tk ru n b
+       in MkPair (fst ra || fst rb) (TIf c (snd ra) (snd rb))
+tokenRound tk ru n (TCase v arms) =
+  if not (cellIn ru (Imperative.tailParts (TCase v arms)))
+  then (tokenK tk ru n).tl (TCase v arms)
+  else let rs : List (Pair Bool (Imperative.Arm Imperative.Tl)) =
+         List.map
+           (\arm -> case arm of
+            MkArm t vs b -> armFound t vs (tokenRound tk ru n b))
+           arms
+       in MkPair (List.any fst rs) (TCase v (List.map snd rs))
+tokenRound tk ru n (TSeq ss t) =
+  if not (cellIn ru (Imperative.tailParts (TSeq ss t)))
+  then (tokenK tk ru n).tl (TSeq ss t)
+  else if cellIn ru (Imperative.stmtsParts ss) then MkPair False (TSeq ss t)
+  else let rt : Pair Bool Imperative.Tl = tokenRound tk ru n t
+       in MkPair (fst rt) (TSeq ss (snd rt))
+tokenRound tk ru n t =
+  if cellIn ru (Imperative.tailParts t) then MkPair False t
+  else (tokenK tk ru n).tl t
+
+tokenArm : Facts.Tokens -> String -> Int -> ArmBody -> Pair Bool ArmBody
+tokenArm tk ru n (ATail t) = case tokenRound tk ru n t of
+  MkPair b t2 -> MkPair b (ATail t2)
+tokenArm tk ru n (ASts ss) =
+  if cellIn ru (Imperative.stmtsParts ss) then MkPair False (ASts ss)
+  else case (tokenK tk ru n).sts ss of
+    MkPair b ss2 -> MkPair b (ASts ss2)
+
+-- (... and where it builds none, given to a function called)
+tokensGiven : Facts.Tokens
+            -> String
+            -> Int
+            -> Pair (Maybe String) ArmBody
+            -> Pair (Maybe String) ArmBody
+tokensGiven tk ru n (MkPair m b) = case tokenArm tk ru n b of
+  MkPair True b2 -> MkPair (Just ru) b2
+  MkPair False _ -> MkPair m b
+
 -- (an arm whose scrutinee is given up: its cell kept, `ru`, where the
 -- arm builds a tag of its own tag -- a list's cell for the cell it
 -- rebuilds, not for another tag of its size built before it, in a
 -- match whose arms each rebuild their own -- else, if it builds none, of
 -- its size: the body, so built; a tuple, heff.compile.cpr's, is no cell
 -- to keep)
-reusing : Maybe String
+reusing : Facts.Tokens
+        -> Maybe String
         -> String
         -> List String
         -> ArmBody
         -> Pair (Maybe String) ArmBody
-reusing Nothing t vs b = MkPair Nothing b
-reusing (Just x) t vs b =
+reusing tk Nothing t vs b = MkPair Nothing b
+reusing tk (Just x) t vs b =
   if IR.isTupleTag t then MkPair Nothing b
-  else reusedAny
+  else tokensGiven
+      tk
       ("ru$" ^ x ^ "$" ^ t)
       (List.length vs)
-      b
-      (reuseArm ("ru$" ^ x ^ "$" ^ t) { n = List.length vs, tag = t } b)
+      (reusedAny
+         ("ru$" ^ x ^ "$" ^ t)
+         (List.length vs)
+         b
+         (reuseArm ("ru$" ^ x ^ "$" ^ t) { n = List.length vs, tag = t } b))
 
 -- Matches
 --------------------------------------------------------------------------------
@@ -2040,7 +2203,7 @@ armTaken : RcK
          -> Maybe String
          -> CaseArm
 armTaken r ce lent t vs b fb taken =
-  armKept r ce taken lent t vs fb (armLeaves b) (reusing taken t vs b)
+  armKept r ce taken lent t vs fb (armLeaves b) (reusing ce.tokens taken t vs b)
 
 armFb : RcK
       -> CE
@@ -2922,7 +3085,8 @@ funWith ce key xs b bi rps sg =
         threaded
           xs
           (List.append
-             (plainDrops
+             (dropsIn
+                ce
                 (boxedOnly ce (deadIn (Borrow.paramsAt False bi xs) (fvTl b))))
              (rcK.tail
                 (withPath
@@ -2943,8 +3107,8 @@ funWith ce key xs b bi rps sg =
         maybe Nothing (\(s : Repr.Sig) -> Just (wrapperOf ce key bi s xs)) sg
     }
 
-funRc : CE -> String -> List String -> Imperative.Tl -> Def
-funRc ce key xs b =
+funPlain : CE -> String -> List String -> Imperative.Tl -> Def
+funPlain ce key xs b =
   funWith
     ce
     key
@@ -2953,6 +3117,23 @@ funRc ce key xs b =
     (Borrow.borOf ce.bor key)
     (Repr.paramReprsIn ce.sigs key xs)
     (Repr.sigIn ce.sigs key)
+
+-- (a function's copy given a cell of `n` fields, its first parameter
+-- (#117, heff.compile.tokens): the first tag of the size on each way
+-- through it built in the cell, which is freed where none is)
+tokenFun : CE -> String -> List String -> Imperative.Tl -> Int -> Def
+tokenFun ce key (Cons tok xs) b n =
+  funPlain
+    (withKnown tok (KnownCell n) ce)
+    key
+    (Cons tok xs)
+    (snd (reuseK.tl tok { n = n, tag = "" } b))
+tokenFun ce key Nil b n = funPlain ce key Nil b
+
+funRc : CE -> String -> List String -> Imperative.Tl -> Def
+funRc ce key xs b = case Map.lookup ce.tokens.cells key of
+  Just n -> tokenFun ce key xs b n
+  Nothing -> funPlain ce key xs b
 
 valRc : CE -> String -> Imperative.Tl -> Def
 valRc ce key t =
