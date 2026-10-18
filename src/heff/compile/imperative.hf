@@ -189,6 +189,10 @@ isSimple _ = False
 -- | the function a body is a loop of, if it is one's own (not a lambda's)
 type Self = { key : String, arity : Int }
 
+-- | statements that end setting `x` (`set`) or binding it (`let`) to
+-- | what is computed, or setting each of `xs` to a value (`EValues`)
+data Dest = DSet String | DLet String | DSets (List String)
+
 -- | the code generator's judgments, knotted
 -- | (`full`: a condition made of any test of a `Bool`; else of a
 -- | comparison alone, looked at where it is made)
@@ -197,7 +201,7 @@ type G =
   , simple : IR.Expr -> N Val
   , tail : Maybe Self -> IR.Expr -> N Tl
   , bindTo : String -> IR.Expr -> N (List St)
-  , setTo : String -> IR.Expr -> N (List St)
+  , toDest : Dest -> IR.Expr -> N (List St)
   , atom : IR.Expr -> N (Pair (List St) Val)
   , op : IR.Expr -> N (Pair (List St) Comp)
   , pred : IR.Expr -> N (Maybe Cond)
@@ -497,58 +501,81 @@ boolOf g e = do
     Just c -> Just (OBool c)
     Nothing -> Nothing)
 
--- | statements that end setting `x` (`set`) or binding it (`let`) to
--- | what is computed
-data Dest = DSet String | DLet String
-
 destStmt : Dest -> Comp -> St
 destStmt (DSet x) o = SSet x o
 destStmt (DLet x) o = SLet x o
+destStmt (DSets xs) o = SLet "_" o
 
-setOf : Dest -> String
-setOf (DSet x) = x
-setOf (DLet x) = x
+-- (what an arm gives the destination: a binding's name is set there)
+armDest : Dest -> Dest
+armDest (DLet x) = DSet x
+armDest d = d
 
-caseSet : G -> String -> IR.Expr -> List IR.Arm -> N (List St)
-caseSet g x s arms = do
+caseSet : G -> Dest -> IR.Expr -> List IR.Arm -> N (List St)
+caseSet g d s arms = do
   sv <- g.atom s
   args <-
     traverseN
       (\arm -> case arm of
        MkArm t vs b -> do
-         sb <- g.setTo x b
+         sb <- g.toDest d b
          pure (MkArm t vs sb))
       arms
   pure (appendL (fst sv) (Cons (SCase (snd sv) args) Nil))
 
--- (each arm setting `x`; a test, by its condition)
-matchSet : G -> String -> IR.Expr -> List IR.Arm -> N (List St)
-matchSet g x s arms = case boolArms arms of
+-- (each arm setting the destination; a test, by its condition)
+matchSet : G -> Dest -> IR.Expr -> List IR.Arm -> N (List St)
+matchSet g d s arms = case boolArms arms of
   Just (MkPair t f) -> do
     p <- g.pred s
     case p of
       Just c -> do
-        st <- g.setTo x t
-        sf <- g.setTo x f
+        st <- g.toDest d t
+        sf <- g.toDest d f
         pure (Cons (SIf c st sf) Nil)
-      Nothing -> caseSet g x s arms
-  Nothing -> caseSet g x s arms
+      Nothing -> caseSet g d s arms
+  Nothing -> caseSet g d s arms
 
--- (`x` declared right before the statement that sets it, after what
+-- (`xs` declared right before the statement that sets them, after what
 -- that statement looks at is bound)
+declsBefore : List String -> List St -> List St
+declsBefore xs Nil = List.map (\x -> SDecl x) xs
+declsBefore xs (Cons st Nil) = appendL (List.map (\x -> SDecl x) xs) [st]
+declsBefore xs (Cons st rest) = Cons st (declsBefore xs rest)
+
 declBefore : String -> List St -> List St
-declBefore x Nil = Cons (SDecl x) Nil
-declBefore x (Cons st Nil) = Cons (SDecl x) (Cons st Nil)
-declBefore x (Cons st rest) = Cons st (declBefore x rest)
+declBefore x ss = declsBefore [x] ss
 
 -- | a match that sets the destination in each arm: where it is bound, it
 -- | is declared first
 matchTo : G -> Dest -> IR.Expr -> List IR.Arm -> N (List St)
 matchTo g d s arms = do
-  sw <- matchSet g (setOf d) s arms
+  sw <- matchSet g (armDest d) s arms
   pure (case d of
     DLet x -> declBefore x sw
-    DSet _ -> sw)
+    _ -> sw)
+
+-- | `xs` set by the way out of `a` taken (heff.compile.ir's `ESet`), each
+-- | way its values: declared before the statement that sets them; where
+-- | there is one way, each bound to its value
+setsOf : G -> List String -> IR.Expr -> N (List St)
+setsOf g xs (ELet y a b) = do
+  sa <- g.bindTo y a
+  sb <- setsOf g xs b
+  pure (appendL sa sb)
+setsOf g xs (ESet ys a b) = do
+  sa <- setsOf g ys a
+  sb <- setsOf g xs b
+  pure (appendL sa sb)
+setsOf g xs (EValues es) = do
+  ss <- traverseN (\p -> g.bindTo (fst p) (snd p)) (List.zip xs es)
+  pure (List.foldr appendL Nil ss)
+setsOf g xs (EMatch s arms) = do
+  sw <- matchSet g (DSets xs) s arms
+  pure (declsBefore xs sw)
+setsOf g xs e = do
+  sw <- g.toDest (DSets xs) e
+  pure (appendL (List.map (\x -> SDecl x) xs) sw)
 
 -- | `e`'s value, given to the destination
 toDest : G -> Dest -> IR.Expr -> N (List St)
@@ -558,6 +585,17 @@ toDest g d (ELet y a b) = case sinkTest y a b of
     sa <- g.bindTo y a
     sb <- toDest g d b
     pure (appendL sa sb)
+-- (the values of a way out, each set)
+toDest g (DSets xs) (EValues es) = do
+  r <- atomsOf g es
+  pure
+      (appendL
+         (fst r)
+         (List.zipWith (\x v -> SSet x (OSimple v)) xs (snd r)))
+toDest g d (ESet xs a b) = do
+  sa <- setsOf g xs a
+  sb <- toDest g d b
+  pure (appendL sa sb)
 -- (a condition: the `Bool` it is; else as the matches it is made of)
 toDest g d e@(EBool c) = do
   bo <- boolOf g e
@@ -574,6 +612,10 @@ toDest g d e@(EMatch s arms) = case boolArms arms of
         Nothing -> matchTo g d s arms
     else matchTo g d s arms
   Nothing -> matchTo g d s arms
+toDest g (DSets xs) e = do
+  r <- g.op e
+  t <- freshN "t"
+  pure (appendL (fst r) (Cons (SLet t (snd r)) Nil))
 toDest g d e = do
   r <- g.op e
   pure (appendL (fst r) (Cons (destStmt d (snd r)) Nil))
@@ -647,6 +689,10 @@ tailOf g self e@(EMatch s arms) = case boolArms arms of
         Nothing -> testTail g self s t f arms
     else testTail g self s t f arms
   Nothing -> caseTail g self s arms
+tailOf g self (ESet xs a b) = do
+  sa <- setsOf g xs a
+  tb <- g.tail self b
+  pure (tailSeq sa tb)
 tailOf g self e@(EBool c) = do
   bo <- boolOf g e
   case bo of
@@ -667,7 +713,7 @@ genOf full =
   , simple = \e -> simpleOf (genOf full) e
   , tail = \self e -> tailOf (genOf full) self e
   , bindTo = \x e -> toDest (genOf full) (DLet x) e
-  , setTo = \x e -> toDest (genOf full) (DSet x) e
+  , toDest = \d e -> toDest (genOf full) d e
   , atom = \e -> atomOf (genOf full) e
   , op = \e -> opOf (genOf full) e
   , pred = \e -> predOf (genOf full) e
@@ -679,6 +725,7 @@ genOf full =
 -- | whether it calls itself last somewhere: a loop
 tailSelf : String -> Int -> IR.Expr -> Bool
 tailSelf key n (ELet _ _ b) = tailSelf key n b
+tailSelf key n (ESet _ _ b) = tailSelf key n b
 tailSelf key n (EMatch _ arms) =
   List.any (\a -> tailSelf key n (IR.armBody a)) arms
 tailSelf key n (ECall k args) = strEq k key && List.length args == n

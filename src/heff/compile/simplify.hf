@@ -390,6 +390,9 @@ pureIn safe total (EMatch sc arms) =
   && IR.allI (List.map (\b -> pureIn safe total (IR.armBody b)) arms)
 pureIn safe total (EBool c) =
   IR.allI (List.map (\a -> pureIn safe total a) (IR.condParts c))
+pureIn safe total (ESet _ a b) = pureIn safe total a && pureIn safe total b
+pureIn safe total (EValues es) =
+  IR.allI (List.map (\a -> pureIn safe total a) es)
 pureIn safe total (EPrim _) = True
 pureIn safe total (EInt _) = True
 pureIn safe total (EFloat _) = True
@@ -608,6 +611,13 @@ substCopies x a (ECall g argv) = do
 substCopies x a (EBool c) = do
   c' <- condS (\q -> substCopies x a q) c
   pure (EBool c')
+substCopies x a (ESet ys e2 b) = do
+  e2' <- substCopies x a e2
+  b' <- substCopies x a b
+  pure (ESet ys e2' b')
+substCopies x a (EValues es) = do
+  es' <- traverseS (\q -> substCopies x a q) es
+  pure (EValues es')
 substCopies x a e = pure e
 
 -- | (lambdas in lambdas are one lambda)
@@ -628,6 +638,99 @@ occCountOf x b = (IR.occurrences x b).count
 
 singletonM : String -> IR.Expr -> Map.Map String IR.Expr
 singletonM x a = Map.insert Map.empty x a
+
+-- `run do`'s `if` and `case` of statements give their variables back
+-- as the prelude's `GivenBack`s, right-nested (heff.syntax.presyntax),
+-- which what follows takes apart at once: `let g = (if c then ...
+-- MkGivenBack a1 (MkGivenBack b1 c1) else ...) in case g of MkGivenBack
+-- x t -> case t of MkGivenBack y z -> ...`.  Where what follows is too
+-- big to be given to each way out (`sumTakenApart`), the names are set
+-- by each way out instead, `ESet [x, y, z]`, its ways the values they
+-- give (`EValues`): no `GivenBack` built, no join point.
+
+-- (the names a match on `x` takes `GivenBack`s apart to, and what follows)
+givenMore : String
+          -> String
+          -> IR.Expr
+          -> Maybe (Pair (List String) IR.Expr)
+          -> Pair (List String) IR.Expr
+givenMore y w b (Just (MkPair ys body)) = MkPair (Cons y ys) body
+givenMore y w b Nothing = MkPair [y, w] b
+
+givenNamesOf : String -> IR.Expr -> Maybe (Pair (List String) IR.Expr)
+givenNamesOf x (EMatch (EVar z) (Cons (MkArm t (Cons y (Cons w Nil)) b) Nil)) =
+  if strEq t "MkGivenBack" && strEq x z && occCountOf x b == 0
+  then Just (givenMore y w b (givenNamesOf w b))
+  else Nothing
+givenNamesOf x e = Nothing
+
+allJust : {a : Type} -> List (Maybe a) -> Maybe (List a)
+allJust Nil = Just Nil
+allJust (Cons (Just x) rest) =
+  maybe Nothing (\xs -> Just (Cons x xs)) (allJust rest)
+allJust (Cons Nothing rest) = Nothing
+
+consValue : IR.Expr -> Maybe (List IR.Expr) -> Maybe (List IR.Expr)
+consValue v (Just vs) = Just (Cons v vs)
+consValue v Nothing = Nothing
+
+-- (the `n` values a way out gives, `GivenBack`s of them)
+givenValues : Int -> IR.Expr -> Maybe (List IR.Expr)
+givenValues n (ETag t (Cons v (Cons w Nil)) _) =
+  if not (strEq t "MkGivenBack") then Nothing
+  else if n <= 2 then Just [v, w]
+  else consValue v (givenValues (n - 1) w)
+givenValues n e = Nothing
+
+-- (each way out the values it gives, if each is `GivenBack`s of `n`)
+toValues : Int -> IR.Expr -> Maybe IR.Expr
+toValues n (ELet y v b) =
+  maybe Nothing (\b2 -> Just (ELet y v b2)) (toValues n b)
+toValues n (ESet ys v b) =
+  maybe Nothing (\b2 -> Just (ESet ys v b2)) (toValues n b)
+toValues n (EMatch s arms) =
+  maybe
+    Nothing
+    (\bs ->
+       Just
+         (EMatch
+            s
+            (List.zipWith
+               (\a b2 -> MkArm (IR.armTag a) (IR.armVars a) b2)
+               arms
+               bs)))
+    (allJust (List.map (\a -> toValues n (IR.armBody a)) arms))
+toValues n EAbandon = Just EAbandon
+toValues n e = maybe Nothing (\vs -> Just (EValues vs)) (givenValues n e)
+
+-- | `let x = a in b`, `b` taking `x` apart as `GivenBack`s, each way out
+-- | of `a` `GivenBack`s of as many: the names set by each way, then what follows
+givenSet : String -> IR.Expr -> IR.Expr -> Maybe IR.Expr
+givenSet x a b = case givenNamesOf x b of
+  Just (MkPair ys body) ->
+    maybe
+      Nothing
+      (\a2 -> Just (ESet ys a2 body))
+      (toValues (List.length ys) a)
+  Nothing -> Nothing
+
+-- (a binding, `b` simplified: the names set, where it is one of those)
+bindOrSet : String -> IR.Expr -> IR.Expr -> IR.Expr
+bindOrSet x a b = fromMaybe (ELet x a b) (givenSet x a b)
+
+isJustS : {a : Type} -> Maybe a -> Bool
+isJustS (Just _) = True
+isJustS Nothing = False
+
+-- (the names set by `a`'s ways out, then what follows, simplified)
+setGiven : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
+setGiven r x a b = case givenSet x a b of
+  Just (ESet ys a2 body) -> do
+    body2 <- r.simp body
+    pure (ESet ys a2 body2)
+  _ -> do
+    b2 <- r.simp b
+    pure (ELet x a b2)
 
 -- | the most a known argument -- a closed lambda or record, one a copy
 -- | may be made for -- may be
@@ -703,6 +806,10 @@ handedW x kinds n (Cons (EPrimCall _ argv) rest) =
 handedW x kinds n (Cons (ECall _ argv) rest) =
   handedW x kinds n (IR.appendI argv rest)
 handedW x kinds n (Cons (EBool c) rest) = handedW x kinds n (IR.condOnto c rest)
+handedW x kinds n (Cons (ESet _ a b) rest) =
+  handedW x kinds n (Cons a (Cons b rest))
+handedW x kinds n (Cons (EValues es) rest) =
+  handedW x kinds n (IR.appendI es rest)
 handedW x kinds n (Cons _ rest) = handedW x kinds n rest
 
 -- | how big a function bound may be that is put where it is called, a
@@ -752,7 +859,7 @@ letPure r x a b o = do
     r.simp b'
   else do
     b' <- r.simp b
-    pure (ELet x a b')
+    pure (bindOrSet x a b')
 
 -- (a name of its own)
 freshName : String -> M String
@@ -843,6 +950,7 @@ bothWays (MkPair ts n) (MkPair us m) = MkPair (appendL ts us) (n + m)
 waysOut : IR.Expr -> Ways
 waysOut (ETag t _ _) = MkPair (Cons t Nil) 0
 waysOut (ELet _ _ b) = waysOut b
+waysOut (ESet _ _ b) = waysOut b
 waysOut (EMatch _ arms) =
   List.foldl (\w a -> bothWays w (waysOut (IR.armBody a))) (MkPair Nil 0) arms
 waysOut EAbandon = MkPair Nil 0
@@ -896,6 +1004,8 @@ scrutW x n (Cons (EPrimCall _ argv) rest) = scrutW x n (IR.appendI argv rest)
 scrutW x n (Cons (ECall _ argv) rest) = scrutW x n (IR.appendI argv rest)
 scrutW x n (Cons (EBool c) rest) =
   scrutW x (n + testsOf x c) (IR.condOnto c rest)
+scrutW x n (Cons (ESet _ a b) rest) = scrutW x n (Cons a (Cons b rest))
+scrutW x n (Cons (EValues es) rest) = scrutW x n (IR.appendI es rest)
 scrutW x n (Cons _ rest) = scrutW x n rest
 
 -- (what follows, copied whole to every way out but the first: more
@@ -935,6 +1045,9 @@ sumPushed r x b (ETag t es ts) = do
 sumPushed r x b (ELet y a c) = do
   c2 <- sumPushed r x b c
   pure (ELet y a c2)
+sumPushed r x b (ESet ys a c) = do
+  c2 <- sumPushed r x b c
+  pure (ESet ys a c2)
 sumPushed r x b (EMatch s arms) = do
   arms2 <- armsS (\a -> sumPushed r x b a) arms
   pure (EMatch s arms2)
@@ -1012,6 +1125,8 @@ projW x n (Cons (ETag _ argv _) rest) = projW x n (IR.appendI argv rest)
 projW x n (Cons (EPrimCall _ argv) rest) = projW x n (IR.appendI argv rest)
 projW x n (Cons (ECall _ argv) rest) = projW x n (IR.appendI argv rest)
 projW x n (Cons (EBool c) rest) = projW x n (IR.condOnto c rest)
+projW x n (Cons (ESet _ a b) rest) = projW x n (Cons a (Cons b rest))
+projW x n (Cons (EValues es) rest) = projW x n (IR.appendI es rest)
 projW x n (Cons _ rest) = projW x n rest
 
 -- | `x`, bound to a record some of whose fields compute, is used more
@@ -1059,6 +1174,7 @@ letIn r x a b = do
     b' <- r.simp b
     pure (ELet x a b')
   else if sumTakenApart x a b then sumPushed r x b a
+  else if isJustS (givenSet x a b) then setGiven r x a b
   else if tagApart x a b
   then do
     bound <- tagBound a
@@ -1069,7 +1185,7 @@ letIn r x a b = do
   else if partialApp s a then letSplit r x a b
   else do
     b' <- r.simp b
-    pure (ELet x a b')
+    pure (bindOrSet x a b')
 
 -- | `g` is a function known to take more than `n` arguments: given
 -- | `n`, it only builds a closure
@@ -1108,6 +1224,9 @@ letFloat : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
 letFloat r x (ELet y a1 a2) b = do
   rest <- letFloat r x a2 b
   pure (ELet y a1 rest)
+letFloat r x (ESet ys a1 a2) b = do
+  rest <- letFloat r x a2 b
+  pure (ESet ys a1 rest)
 letFloat r x a b = letIn r x a b
 
 -- | a number a word holds, which a global may be put where it is used
@@ -1178,6 +1297,17 @@ simpF r (EPrimCall p argv) = do
 simpF r (EBool c) = do
   c' <- condS (\a -> r.simp a) c
   pure (IR.boolOf (foldCond c'))
+-- (the values set, where there is but one way: each bound)
+simpF r (ESet xs a b) = do
+  a' <- r.simp a
+  case a' of
+    EValues es -> r.simp (letsOf (zipL xs es) b)
+    _ -> do
+      b' <- r.simp b
+      pure (ESet xs a' b')
+simpF r (EValues es) = do
+  es' <- traverseS (\a -> r.simp a) es
+  pure (EValues es')
 simpF r (EGlobal g) = do
   s <- get
   pure (globalLiteral g (Map.lookup s.defs g))
@@ -1354,6 +1484,8 @@ apartW x (Cons (EPrimCall _ argv) rest) = apartW x (IR.appendI argv rest)
 apartW x (Cons (ECall _ argv) rest) = apartW x (IR.appendI argv rest)
 apartW x (Cons (EBool c) rest) =
   testsOf x c > 0 || apartW x (IR.condOnto c rest)
+apartW x (Cons (ESet _ a b) rest) = apartW x (Cons a (Cons b rest))
+apartW x (Cons (EValues es) rest) = apartW x (IR.appendI es rest)
 apartW x (Cons _ rest) = apartW x rest
 
 -- (an argument that tells, its parameter taken apart in the body)
@@ -1751,6 +1883,8 @@ cheap safe all (EMatch sc arms) =
   && not (List.null arms)
   && IR.allI (List.map (cheap safe all) (List.map IR.armBody arms))
 cheap safe all (EBool c) = IR.allI (List.map (cheap safe all) (IR.condParts c))
+cheap safe all (ESet _ a b) = cheap safe all a && cheap safe all b
+cheap safe all (EValues es) = IR.allI (List.map (cheap safe all) es)
 cheap safe all _ = False
 
 minL : List Int -> Int
@@ -1772,6 +1906,8 @@ lamsOut : Map.Map String Unit -> Map.Map String IR.Expr -> IR.Expr -> Int
 lamsOut safe all (ELam ys _) = List.length ys
 lamsOut safe all (ELet _ a b) =
   if cheap safe all a then lamsOut safe all b else 0
+lamsOut safe all (ESet _ a b) =
+  if cheap safe all a then lamsOut safe all b else 0
 lamsOut safe all (EMatch sc arms) =
   if cheap safe all sc && not (List.null arms)
   then minL (List.map (lamsOut safe all) (List.map IR.armBody arms))
@@ -1790,6 +1926,7 @@ stripLams zs (ELam ys b) =
     (if List.length ys > List.length zs then ELam (dropL (List.length zs) ys) b
      else b)
 stripLams zs (ELet x a b) = ELet x a (stripLams zs b)
+stripLams zs (ESet xs a b) = ESet xs a (stripLams zs b)
 stripLams zs (EMatch sc arms) =
   EMatch sc (List.map (stripArm (stripLams zs)) arms)
 -- (a known function given fewer arguments: given the parameters too)
@@ -2516,6 +2653,9 @@ applyToF r f argv =
     ELet x a b -> do
       b' <- r.applyTo b argv
       pure (ELet x a b')
+    ESet xs a b -> do
+      b' <- r.applyTo b argv
+      pure (ESet xs a b')
     -- (the arguments go into every arm: only when that copies nothing
     -- but what a copy may be made for, a closed value -- a handler,
     -- which every arm is then made with)
@@ -2572,6 +2712,9 @@ projectF r l sh t (ERecord fs ts) = case findField l fs of
 projectF r l sh t (ELet x a b) = do
   b' <- r.project l sh t b
   pure (ELet x a b')
+projectF r l sh t (ESet xs a b) = do
+  b' <- r.project l sh t b
+  pure (ESet xs a b')
 projectF r l sh t e@(EGlobal g) = do
   mb <- known g
   case mb of
@@ -2619,7 +2762,12 @@ caseOfCase r s2 arms2 arms =
   then do
     arms2' <- traverseS (pushArm r arms) arms2
     pure (EMatch s2 arms2')
-  else pure (EMatch (EMatch s2 arms2) arms)
+  else do
+    g <- freshName "given"
+    pure
+        (fromMaybe
+           (EMatch (EMatch s2 arms2) arms)
+           (givenSet g (EMatch s2 arms2) (EMatch (EVar g) arms)))
 
 -- (a match not an `if` on a condition)
 matchOn : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
@@ -2630,6 +2778,9 @@ matchOn r s@(ETag t argv _) arms = case findArm t arms of
 matchOn r (ELet x a b) arms = do
   b' <- r.match b arms
   pure (ELet x a b')
+matchOn r (ESet xs a b) arms = do
+  b' <- r.match b arms
+  pure (ESet xs a b')
 matchOn r s@(EGlobal g) arms = do
   mb <- known g
   case mb of
@@ -2918,6 +3069,13 @@ tieGo h lam1 (ECall g argv) = do
 tieGo h lam1 (EBool c) = do
   c2 <- condS (tieGo h lam1) c
   pure (EBool c2)
+tieGo h lam1 (ESet xs a b) = do
+  a2 <- tieGo h lam1 a
+  b2 <- tieGo h lam1 b
+  pure (ESet xs a2 b2)
+tieGo h lam1 (EValues es) = do
+  es2 <- traverseS (tieGo h lam1) es
+  pure (EValues es2)
 tieGo h lam1 e = pure e
 
 -- (the copy `h`, made to `hb`, small and not calling itself, put where a

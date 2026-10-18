@@ -455,6 +455,11 @@ withRange env x r =
   if isAny r then env
   else { ranges = Map.insert env.ranges x r, tests = env.tests }
 
+-- (the names an `ESet` sets, each of the range of the values it is given)
+bindVals : Env -> List String -> List Range -> Env
+bindVals env xs rs =
+  List.foldl (\e p -> withRange e (fst p) (snd p)) env (List.zip xs rs)
+
 withTest : Env -> String -> IR.Expr -> Env
 withTest env x (EPrimCall p (Cons a (Cons b Nil))) =
   if isComparison p
@@ -639,25 +644,29 @@ paramEnv c key xs = case Map.lookup c.params key of
 -- As the walk above, giving back no expression: what the rounds and the
 -- narrowing walk, only for the calls (`St`).
 
--- | what is walked: its range, and what is gathered
-data Seen = MkSeen Range St
+-- | what is walked: its range, and what is gathered; or, of the first
+-- | part of an `ESet`, the range of each value it gives (`EValues`)
+data Seen = MkSeen Range St | MkSeenVals (List Range) St
 
 data Seens = MkSeens (List Range) St
 
 thenSeen : Seen -> (Range -> St -> Seen) -> Seen
 thenSeen (MkSeen r st) k = k r st
+thenSeen (MkSeenVals _ st) k = k anyRange st
 
 thenSeens : Seens -> (List Range -> St -> Seen) -> Seen
 thenSeens (MkSeens rs st) k = k rs st
 
 seenSt : Seen -> St
 seenSt (MkSeen _ st) = st
+seenSt (MkSeenVals _ st) = st
 
 consSeen : Range -> Seens -> Seens
 consSeen r (MkSeens rs st) = MkSeens (Cons r rs) st
 
 seensAfter : Seen -> (St -> Seens) -> Seens
 seensAfter (MkSeen r st) k = consSeen r (k st)
+seensAfter (MkSeenVals _ st) k = consSeen anyRange (k st)
 
 gatherMany : (Env -> St -> IR.Expr -> Seen)
            -> Env
@@ -668,8 +677,33 @@ gatherMany go env st Nil = MkSeens Nil st
 gatherMany go env st (Cons e es) =
   seensAfter (go env st e) (\st1 -> gatherMany go env st1 es)
 
+isUnreached : Range -> Bool
+isUnreached Unreached = True
+isUnreached r = False
+
+-- (each value's range, joined; a way that reaches nothing none)
+joinVals : List Range -> List Range -> List Range
+joinVals rs qs = List.zipWith join rs qs
+
 joinSeen : Range -> Seen -> Seen
 joinSeen r (MkSeen rr st) = MkSeen (join r rr) st
+joinSeen r (MkSeenVals qs st) =
+  if isUnreached r then MkSeenVals qs st else MkSeen anyRange st
+
+joinSeenVals : List Range -> Seen -> Seen
+joinSeenVals rs (MkSeen r st) =
+  if isUnreached r then MkSeenVals rs st else MkSeen anyRange st
+joinSeenVals rs (MkSeenVals qs st) = MkSeenVals (joinVals rs qs) st
+
+-- (an arm's, then the rest's, joined)
+armSeen : Seen -> (St -> Seen) -> Seen
+armSeen (MkSeen r st) k = joinSeen r (k st)
+armSeen (MkSeenVals rs st) k = joinSeenVals rs (k st)
+
+-- (the values' ranges, given to `k`; none known, none)
+valsThen : Seen -> (List Range -> St -> Seen) -> Seen
+valsThen (MkSeenVals rs st) k = k rs st
+valsThen (MkSeen _ st) k = k Nil st
 
 gatherArms : Ctx
            -> (Env -> St -> IR.Expr -> Seen)
@@ -680,9 +714,9 @@ gatherArms : Ctx
            -> Seen
 gatherArms c go env t st Nil = MkSeen Unreached st
 gatherArms c go env t st (Cons (MkArm tag vs b) rest) =
-  thenSeen
+  armSeen
     (go (armEnv c env t tag) st b)
-    (\r st1 -> joinSeen r (gatherArms c go env t st1 rest))
+    (\st1 -> gatherArms c go env t st1 rest)
 
 -- (what a condition calls with what: each of its arms where what it
 -- chooses by is known to hold, or not)
@@ -753,6 +787,13 @@ gatherGo c env st (ETag t args ts) =
   thenSeens
     (gatherMany (gatherGo c) env st args)
     (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st EAbandon = MkSeen Unreached st
+gatherGo c env st (EValues es) =
+  thenSeens (gatherMany (gatherGo c) env st es) (\rs st1 -> MkSeenVals rs st1)
+gatherGo c env st (ESet xs a b) =
+  valsThen
+    (gatherGo c env st a)
+    (\rs st1 -> gatherGo c (bindVals env xs rs) st1 b)
 gatherGo c env st (EBool k) =
   MkSeen anyRange (gatherCond c (gatherGo c) env st k)
 gatherGo c env st e = MkSeen anyRange st
@@ -767,27 +808,47 @@ gatherDef c d = seenSt (gatherGo c emptyEnv emptySt d.body)
 -- The walk that rewrites
 --------------------------------------------------------------------------------
 
--- | what is walked: its range, and itself with its operations on words
-data Res = MkRes Range IR.Expr
+-- | what is walked: its range, and itself with its operations on words;
+-- | or, of the first part of an `ESet`, the range of each value it gives
+data Res = MkRes Range IR.Expr | MkResVals (List Range) IR.Expr
 
 data Many = MkMany (List Range) (List IR.Expr)
 
-data Arms = MkArms Range (List IR.Arm)
+data Arms = MkArms Range (List IR.Arm) | MkArmsVals (List Range) (List IR.Arm)
 
 thenRes : Res -> (Range -> IR.Expr -> Res) -> Res
 thenRes (MkRes r e) k = k r e
+thenRes (MkResVals _ e) k = k anyRange e
+
+-- (... its range kept, of `f` of it)
+mapRes : (IR.Expr -> IR.Expr) -> Res -> Res
+mapRes f (MkRes r e) = MkRes r (f e)
+mapRes f (MkResVals rs e) = MkResVals rs (f e)
+
+-- (the values' ranges, given to `k`; none known, none)
+valsRes : Res -> (List Range -> IR.Expr -> Res) -> Res
+valsRes (MkResVals rs e) k = k rs e
+valsRes (MkRes _ e) k = k Nil e
+
+-- (a match of the arms walked, of what they come to)
+matchRes : IR.Expr -> Arms -> Res
+matchRes s (MkArms r arms) = MkRes r (EMatch s arms)
+matchRes s (MkArmsVals rs arms) = MkResVals rs (EMatch s arms)
 
 thenMany : Many -> (List Range -> List IR.Expr -> Res) -> Res
 thenMany (MkMany rs es) k = k rs es
 
 thenArms : Arms -> (Range -> List IR.Arm -> Res) -> Res
 thenArms (MkArms r arms) k = k r arms
+thenArms (MkArmsVals _ arms) k = k anyRange arms
 
 resExpr : Res -> IR.Expr
 resExpr (MkRes _ e) = e
+resExpr (MkResVals _ e) = e
 
 consMany : Res -> Many -> Many
 consMany (MkRes r e) (MkMany rs es) = MkMany (Cons r rs) (Cons e es)
+consMany (MkResVals _ e) (MkMany rs es) = MkMany (Cons anyRange rs) (Cons e es)
 
 walkMany : (Env -> IR.Expr -> Res) -> Env -> List IR.Expr -> Many
 walkMany go env Nil = MkMany Nil Nil
@@ -796,6 +857,14 @@ walkMany go env (Cons e es) = consMany (go env e) (walkMany go env es)
 consArm : String -> List String -> Res -> Arms -> Arms
 consArm tag vs (MkRes r b) (MkArms rr arms) =
   MkArms (join r rr) (Cons (MkArm tag vs b) arms)
+consArm tag vs (MkRes r b) (MkArmsVals qs arms) =
+  if isUnreached r then MkArmsVals qs (Cons (MkArm tag vs b) arms)
+  else MkArms anyRange (Cons (MkArm tag vs b) arms)
+consArm tag vs (MkResVals rs b) (MkArms rr arms) =
+  if isUnreached rr then MkArmsVals rs (Cons (MkArm tag vs b) arms)
+  else MkArms anyRange (Cons (MkArm tag vs b) arms)
+consArm tag vs (MkResVals rs b) (MkArmsVals qs arms) =
+  MkArmsVals (joinVals rs qs) (Cons (MkArm tag vs b) arms)
 
 walkArms : Ctx
          -> (Env -> IR.Expr -> Res)
@@ -840,17 +909,18 @@ walkGo c env (ELam xs b) =
 walkGo c env (ELet x a b) =
   thenRes
     (walkGo c env a)
-    (\ra a1 ->
-       thenRes
-         (walkGo c (bindVar env x ra a) b)
-         (\rb b1 -> MkRes rb (ELet x a1 b1)))
+    (\ra a1 -> mapRes (\b1 -> ELet x a1 b1) (walkGo c (bindVar env x ra a) b))
 walkGo c env (EMatch s arms) =
   thenRes
     (walkGo c env s)
-    (\_ s1 ->
-       thenArms
-         (walkArms c (walkGo c) env (testOf env s) arms)
-         (\r arms1 -> MkRes r (EMatch s1 arms1)))
+    (\_ s1 -> matchRes s1 (walkArms c (walkGo c) env (testOf env s) arms))
+walkGo c env EAbandon = MkRes Unreached EAbandon
+walkGo c env (EValues es) =
+  thenMany (walkMany (walkGo c) env es) (\rs es1 -> MkResVals rs (EValues es1))
+walkGo c env (ESet xs a b) =
+  valsRes
+    (walkGo c env a)
+    (\rs a1 -> mapRes (\b1 -> ESet xs a1 b1) (walkGo c (bindVals env xs rs) b))
 walkGo c env (EPrimCall p args) =
   thenMany
     (walkMany (walkGo c) env args)

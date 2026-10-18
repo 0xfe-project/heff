@@ -691,8 +691,10 @@ type DoCx =
   }
 
 -- | what follows the statements' end: the last one's value is the
--- | block's (`EndValue`), or a call (`EndJump`)
-data End = EndValue | EndJump Jump
+-- | block's (`EndValue`), a call (`EndJump`), or the variables given
+-- | back, as they are, to what follows an `if` or a `case` of statements
+-- | (`EndGive`, in `run do`: the variables, and how many scopes in)
+data End = EndValue | EndJump Jump | EndGive (List String) Int
 
 -- (the variables' values passed, or a `Unit` for none)
 varArgs : Params.Span -> Bool -> List String -> List Expr
@@ -1237,11 +1239,20 @@ altStmts (At (MkAlt p b) _) = MkPair p (armStmts b)
 -- | the statements, taken apart, knotted
 type DoT = { stmts : DoCx -> List (Params.Spanned (Stmt Expr)) -> End -> Expr }
 
+-- (the variables given back: none, one, or `GivenBack`s of them)
+giveBackE : Params.Span -> List String -> Expr
+giveBackE sp Nil = At (ETag "MkUnit") sp
+giveBackE sp (Cons x Nil) = At (EVar x) sp
+giveBackE sp (Cons x xs) =
+  app (At (ETag "MkGivenBack") sp) [At (EVar x) sp, giveBackE sp xs]
+
 -- | what the statements' end leads to
 endOf : DoCx -> Params.Span -> End -> Expr
 endOf cx sp EndValue =
   leaving cx sp cx.depth (pureOf cx sp (At (ETag "MkUnit") sp))
 endOf cx sp (EndJump j) = jumpCall cx sp j
+endOf cx sp (EndGive vars d) =
+  leaving cx sp (cx.depth - d) (pureOf cx sp (giveBackE sp vars))
 
 withMut : DoCx -> String -> DoCx
 withMut cx x =
@@ -1360,10 +1371,96 @@ armOn t cx rest end (MkPair p ss) =
   if stmtsFall ss then armT t cx end (MkPair p (List.append ss rest))
   else armT t cx end (MkPair p ss)
 
+-- (whether an expression may `return`: not in a lambda, where it is
+-- refused)
+hasReturn : Expr -> Bool
+hasReturn (At (EReturn _) _) = True
+hasReturn (At (ELam _ _) _) = False
+hasReturn e = fst (childrenAcc (\b c -> MkPair (b || hasReturn c) c) False e)
+
+-- (... statements)
+stmtsReturn : List (Params.Spanned (Stmt Expr)) -> Bool
+stmtsReturn ss =
+  List.any
+    (\st -> fst (stmtAcc (\b c -> MkPair (b || hasReturn c) c) False st))
+    ss
+
+-- (whether statements may leave other than at their end: by `break` or
+-- `continue`, of the loop around them, or `return` -- in a loop of their
+-- own, by its `return` alone)
+jumpE : Expr -> Bool
+jumpE (At EBreak _) = True
+jumpE (At EContinue _) = True
+jumpE (At (EReturn _) _) = True
+jumpE (At (ELam _ _) _) = False
+jumpE (At (EWhile c body) _) = hasReturn c || stmtsReturn body
+jumpE (At (EFor _ c body) _) = hasReturn c || stmtsReturn body
+jumpE e = fst (childrenAcc (\b c -> MkPair (b || jumpE c) c) False e)
+
+stmtsJump : List (Params.Spanned (Stmt Expr)) -> Bool
+stmtsJump ss =
+  List.any
+    (\st -> fst (stmtAcc (\b c -> MkPair (b || jumpE c) c) False st))
+    ss
+
+-- (each arm reaches its end, and leaves nowhere else)
+armsGive : List (Pair Pat (List (Params.Spanned (Stmt Expr)))) -> Bool
+armsGive arms =
+  List.all (\a -> stmtsFall (snd a) && not (stmtsJump (snd a))) arms
+
+-- In `run do`, an `if` or a `case` of statements whose arms each reach
+-- their end (and leave nowhere else) is no join point: each arm gives
+-- the variables back as they are there, and what follows it takes them
+-- -- none, `MkUnit`; one, itself; more, the prelude's `GivenBack`s, which
+-- the simplifier takes for the variables set in each arm (heff.compile.ir's
+-- `ESet`), no `GivenBack` built.
+
+-- (... of the variables' types)
+giveBackTy : Params.Span -> List String -> Expr
+giveBackTy sp Nil = At (EVar "builtin.Unit") sp
+giveBackTy sp (Cons x Nil) = typeOfE sp x
+giveBackTy sp (Cons x xs) =
+  app (At (EVar "prelude.GivenBack") sp) [typeOfE sp x, giveBackTy sp xs]
+
+-- (... taken apart, `r` what holds them, each variable bound again)
+giveBackMatch : Params.Span -> String -> List String -> Expr -> Expr
+giveBackMatch sp r (Cons x (Cons y Nil)) body =
+  matchOf
+    sp
+    (At (EVar r) sp)
+    [alt (patTag "MkGivenBack" sp [At (PatVar x) sp, At (PatVar y) sp]) body]
+giveBackMatch sp r (Cons x xs) body =
+  matchOf
+    sp
+    (At (EVar r) sp)
+    [ alt
+      (patTag "MkGivenBack" sp [At (PatVar x) sp, At (PatVar (rest xs)) sp])
+      (giveBackMatch sp (rest xs) xs body)
+    ]
+  where
+  rest : List String -> String
+  rest ys = madeName ("given" ^ show (List.length ys)) sp
+giveBackMatch sp r Nil body = body
+
+-- (what is given back, `e`, bound, and what follows: the identity
+-- monad's `idBind` is a binding, and one made so is never a call the
+-- simplifier may leave)
+giveBackLet : Params.Span -> List String -> Expr -> Expr -> Expr
+giveBackLet sp Nil e body = letVar "_" sp e body
+giveBackLet sp (Cons x Nil) e body = letVar x sp e body
+giveBackLet sp xs e body =
+  letVar
+    (madeName "given" sp)
+    sp
+    e
+    (giveBackMatch sp (madeName "given" sp) xs body)
+
 -- | an `if` or a `case` of statements: each arm up to what follows it, a
 -- | join point of the variables, called at the end of each arm that
 -- | reaches it -- but where one arm alone does, and binds nothing,
--- | what follows goes on in it (`if c then continue` is an `else`)
+-- | what follows goes on in it (`if c then continue` is an `else`); and
+-- | in `run do`, where every arm does and leaves nowhere else, each
+-- | gives the variables back to what follows
 condT : DoT
       -> DoCx
       -> Params.Span
@@ -1377,6 +1474,21 @@ condT t cx sp s arms Nil end =
 condT t cx sp s arms rest end =
   if oneFalls (List.keepIf (\a -> stmtsFall (snd a)) arms)
   then hoist cx s (\s' -> matchOf sp s' (List.map (armOn t cx rest end) arms))
+  else if cx.names.giveBack && armsGive arms
+  then hoist
+      cx
+      s
+      (\s' ->
+         giveBackLet
+           sp
+           cx.muts
+           (ann
+              (matchOf
+                 sp
+                 s'
+                 (List.map (armT t cx (EndGive cx.muts cx.depth)) arms))
+              (giveBackTy sp cx.muts))
+           (t.stmts cx rest end))
   else hoist
       cx
       s
@@ -1421,20 +1533,6 @@ condT t cx sp s arms rest end =
 -- back unbuilt, where they fit).  A loop whose statements may `return`
 -- gives back `Left` of what it returns, else `Right` of the variables,
 -- and where it is called, a `Left` is returned on.
-
--- (whether an expression may `return`: not in a lambda, where it is
--- refused)
-hasReturn : Expr -> Bool
-hasReturn (At (EReturn _) _) = True
-hasReturn (At (ELam _ _) _) = False
-hasReturn e = fst (childrenAcc (\b c -> MkPair (b || hasReturn c) c) False e)
-
--- (... statements)
-stmtsReturn : List (Params.Spanned (Stmt Expr)) -> Bool
-stmtsReturn ss =
-  List.any
-    (\st -> fst (stmtAcc (\b c -> MkPair (b || hasReturn c) c) False st))
-    ss
 
 -- (the variables, given back as one value)
 packE : Params.Span -> List String -> Expr
