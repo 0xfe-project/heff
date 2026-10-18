@@ -41,6 +41,7 @@ closedIn env (EMatch s arms) =
   closedIn env s && allS (armClosed closedIn env) arms
 closedIn env (EPrimCall _ args) = allS (closedIn env) args
 closedIn env (ECall _ args) = allS (closedIn env) args
+closedIn env (EBool c) = allS (closedIn env) (IR.condParts c)
 closedIn env (EFix _ _) = False
 closedIn env _ = True
 
@@ -61,6 +62,7 @@ callsNothing (ETag _ args _) = allS callsNothing args
 callsNothing (EMatch s arms) =
   callsNothing s && allS callsNothing (List.map IR.armBody arms)
 callsNothing (EPrimCall _ args) = allS callsNothing args
+callsNothing (EBool c) = allS callsNothing (IR.condParts c)
 callsNothing (EApp _ _) = False
 callsNothing (ECall _ _) = False
 callsNothing (EFix _ _) = False
@@ -95,6 +97,16 @@ armKey go env (MkArm t vs b) =
   ^ show (List.length vs)
   ^ ":"
   ^ go (appendS (List.reverse vs) env) b
+
+-- (a condition's key, of its expressions' keys)
+condKey : (IR.Expr -> String) -> IR.Cond -> String
+condKey go CTrue = "T"
+condKey go CFalse = "F"
+condKey go (CRel p a b) = "R" ^ p ^ "(" ^ go a ^ "," ^ go b ^ ")"
+condKey go (CTest e) = "S(" ^ go e ^ ")"
+condKey go (CNot c) = "N(" ^ condKey go c ^ ")"
+condKey go (CIf a b c) =
+  "I(" ^ condKey go a ^ "," ^ condKey go b ^ "," ^ condKey go c ^ ")"
 
 -- (a variable is where it was bound, counted from the nearest binder)
 keyGo : List String -> IR.Expr -> String
@@ -139,6 +151,7 @@ keyGo env (EFixed w n) = "x" ^ Fixed.showFixed w ^ ":" ^ show n
 keyGo env (EFloat32 x) = "y" ^ show x
 keyGo env EAbandon = "X"
 keyGo env (EFix _ _) = "F"
+keyGo env (EBool c) = "o(" ^ condKey (keyGo env) c ^ ")"
 
 -- | a closed value's key: alike for two copies of it
 -- | >>> strEq (key (ELam ["x"] (EVar "x"))) (key (ELam ["y"] (EVar "y")))
@@ -358,6 +371,34 @@ matchThen : ShapeGo
 matchThen go arms (MkPair sc st) = case shapeArms go arms st of
   MkPair arms2 st2 -> MkPair (EMatch sc arms2) st2
 
+withShapedC : {a : Type}
+            -> Pair IR.Cond ShapeSt
+            -> (IR.Cond -> ShapeSt -> a)
+            -> a
+withShapedC (MkPair c st) k = k c st
+
+-- (a condition shaped, its expressions in order)
+shapeCond : ShapeGo -> IR.Cond -> ShapeSt -> Pair IR.Cond ShapeSt
+shapeCond go CTrue st = MkPair CTrue st
+shapeCond go CFalse st = MkPair CFalse st
+shapeCond go (CRel p a b) st = case go a st of
+  MkPair a2 st1 -> case go b st1 of
+    MkPair b2 st2 -> MkPair (CRel p a2 b2) st2
+shapeCond go (CTest e) st = case go e st of
+  MkPair e2 st1 -> MkPair (CTest e2) st1
+shapeCond go (CNot c) st =
+  withShapedC (shapeCond go c st) (\c2 st1 -> MkPair (CNot c2) st1)
+shapeCond go (CIf a b c) st =
+  withShapedC
+    (shapeCond go a st)
+    (\a2 st1 ->
+       withShapedC
+         (shapeCond go b st1)
+         (\b2 st2 ->
+            withShapedC
+              (shapeCond go c st2)
+              (\c2 st3 -> MkPair (CIf a2 b2 c2) st3)))
+
 shapeGo : IR.Expr -> ShapeSt -> Pair IR.Expr ShapeSt
 shapeGo (EVar x) st =
   varIn
@@ -384,6 +425,8 @@ shapeGo (EPrimCall p args) st =
   manyTo (\es -> EPrimCall p es) (shapeMany shapeGo args st)
 shapeGo (ECall g args) st =
   manyTo (\es -> ECall g es) (shapeMany shapeGo args st)
+shapeGo (EBool c) st =
+  withShapedC (shapeCond shapeGo c st) (\c2 st1 -> MkPair (EBool c2) st1)
 shapeGo e st = MkPair e st
 
 shapedOf : Pair IR.Expr ShapeSt -> Shaped
@@ -439,6 +482,7 @@ usesOf g (ETag _ args _) = List.concatMap (usesOf g) args
 usesOf g (EMatch s arms) =
   appendS (usesOf g s) (List.concatMap (usesOf g) (List.map IR.armBody arms))
 usesOf g (EPrimCall _ args) = List.concatMap (usesOf g) args
+usesOf g (EBool c) = List.concatMap (usesOf g) (IR.condParts c)
 usesOf g (ECall h args) =
   appendS (callUse g (EGlobal h) args) (List.concatMap (usesOf g) args)
 usesOf g _ = Nil
@@ -520,4 +564,5 @@ selfTo g h pre ds (EMatch s arms) =
 selfTo g h pre ds (EPrimCall p args) =
   EPrimCall p (List.map (selfTo g h pre ds) args)
 selfTo g h pre ds (ECall k args) = ECall k (List.map (selfTo g h pre ds) args)
+selfTo g h pre ds (EBool c) = EBool (IR.condMap (selfTo g h pre ds) c)
 selfTo g h pre ds e = e

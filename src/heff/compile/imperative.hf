@@ -206,35 +206,10 @@ type G =
 -- Conditions
 --------------------------------------------------------------------------------
 
--- (a fixed-width type's comparison)
-fixedRel : Fixed.FixedPrim -> Bool
-fixedRel { op = OpEq } = True
-fixedRel { op = OpLt } = True
-fixedRel { op = OpLe } = True
-fixedRel p = False
-
 -- | the comparisons a condition is made of (the backends each have them
 -- | as an operator, or a test of their own)
-relPrims : List String
-relPrims =
-  [ "intEq"
-  , "intLt"
-  , "intLe"
-  , "floatEq"
-  , "floatLt"
-  , "floatLe"
-  , "strEq"
-  , "strLt"
-  , "runeEq"
-  , "runeLt"
-  , "runeLe"
-  ]
-
 isRel : String -> Bool
-isRel p =
-  List.any (\q -> strEq p q) relPrims
-  || maybe False fixedRel (Fixed.fixedPrimOf p)
-  || Ranges.isWordRel p
+isRel p = IR.isRel p
 
 armNamed : String -> List IR.Arm -> Maybe IR.Expr
 armNamed t Nil = Nothing
@@ -343,6 +318,36 @@ predValue g e =
     ss <- g.bindTo t e
     pure (predLets ss (PBool (SVar t)))
 
+-- (a comparison, its operands bound before where they are not simple)
+relPred : G -> String -> IR.Expr -> IR.Expr -> N (Maybe Cond)
+relPred g p a b = do
+  pa <- g.atom a
+  pb <- g.atom b
+  pure (predLets (appendL (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
+
+-- (each part a condition)
+ifPred : Maybe Cond -> Maybe Cond -> Maybe Cond -> Maybe Cond
+ifPred (Just a) (Just b) (Just c) = Just (condIf a b c)
+ifPred _ _ _ = Nothing
+
+-- | a condition (heff.compile.ir's), as one here: the same, its operands
+-- | bound where they are computed
+condPred : G -> IR.Cond -> N (Maybe Cond)
+condPred g CTrue = pure (Just PTrue)
+condPred g CFalse = pure (Just PFalse)
+condPred g (CRel p a b) = relPred g p a b
+condPred g (CTest e) = g.pred e
+condPred g (CNot c) = do
+  p <- condPred g c
+  pure (case p of
+    Just q -> Just (condIf q PFalse PTrue)
+    Nothing -> Nothing)
+condPred g (CIf a b c) = do
+  pa <- condPred g a
+  pb <- condPred g b
+  pc <- condPred g c
+  pure (ifPred pa pb pc)
+
 predAny : G -> IR.Expr -> N (Maybe Cond)
 predAny g (ETag t Nil _) =
   if strEq t "True" then pure (Just PTrue)
@@ -376,12 +381,19 @@ predAny g (ELet x a b) = case sinkTest x a b of
     pure (case pb of
       Just q -> predLets ss q
       Nothing -> Nothing)
+predAny g (EBool c) = condPred g c
 predAny g e = predValue g e
 
+isCondE : IR.Expr -> Bool
+isCondE (EBool _) = True
+isCondE e = False
+
 -- | a `Bool`, as a condition (none, where what computes it is not
--- | bindings alone; nor, not `full`, where it is not a comparison)
+-- | bindings alone; nor, not `full`, where it is not a comparison or a
+-- | condition)
 predOf : G -> IR.Expr -> N (Maybe Cond)
-predOf g e = if g.full || isRelCall e then predAny g e else pure Nothing
+predOf g e =
+  if g.full || isRelCall e || isCondE e then predAny g e else pure Nothing
 
 -- Statements
 --------------------------------------------------------------------------------
@@ -546,6 +558,12 @@ toDest g d (ELet y a b) = case sinkTest y a b of
     sa <- g.bindTo y a
     sb <- toDest g d b
     pure (appendL sa sb)
+-- (a condition: the `Bool` it is; else as the matches it is made of)
+toDest g d e@(EBool c) = do
+  bo <- boolOf g e
+  case bo of
+    Just o -> pure (Cons (destStmt d o) Nil)
+    Nothing -> toDest g d (IR.condExpr c)
 toDest g d e@(EMatch s arms) = case boolArms arms of
   Just (MkPair t f) ->
     if g.full && condShaped t && condShaped f
@@ -629,6 +647,11 @@ tailOf g self e@(EMatch s arms) = case boolArms arms of
         Nothing -> testTail g self s t f arms
     else testTail g self s t f arms
   Nothing -> caseTail g self s arms
+tailOf g self e@(EBool c) = do
+  bo <- boolOf g e
+  case bo of
+    Just o -> pure (TReturn o)
+    Nothing -> g.tail self (IR.condExpr c)
 tailOf g self e@(ECall k args) =
   if isSelf self k args
   then do

@@ -41,6 +41,15 @@ armsT k Nil rest = rest
 armsT k (Cons (MkArm t vs b) arms) rest =
   Cons (tok t) (manyT vs (k.go b (armsT k arms rest)))
 
+-- (a condition: a tag of its own for each of its forms)
+condT : EK -> IR.Cond -> List String -> List String
+condT k CTrue rest = Cons "T" rest
+condT k CFalse rest = Cons "F" rest
+condT k (CRel p a b) rest = Cons "R" (Cons (tok p) (k.go a (k.go b rest)))
+condT k (CTest e) rest = Cons "S" (k.go e rest)
+condT k (CNot c) rest = Cons "N" (condT k c rest)
+condT k (CIf a b c) rest = Cons "I" (condT k a (condT k b (condT k c rest)))
+
 encodeF : EK -> IR.Expr -> List String -> List String
 encodeF k (EVar x) rest = Cons "v" (Cons (tok x) rest)
 encodeF k (EGlobal g) rest = Cons "g" (Cons (tok g) rest)
@@ -82,6 +91,7 @@ encodeF k (EFixed w n) rest =
 encodeF k (EFloat32 x) rest = Cons "y" (Cons (tok (show x)) rest)
 encodeF k EAbandon rest = Cons "X" rest
 encodeF k (EFix f b) rest = Cons "F" (Cons (tok f) (k.go b rest))
+encodeF k (EBool c) rest = Cons "o" (condT k c rest)
 
 ek : EK
 ek = { go = \e rest -> encodeF ek e rest }
@@ -134,6 +144,32 @@ fieldTyD : Dec IR.FieldTy
 fieldTyD = do
   x <- str
   found (IR.fieldTyOfName x)
+
+type CK = { go : Dec IR.Cond }
+
+condOfTag : DK -> CK -> String -> Dec IR.Cond
+condOfTag k c "T" = pure CTrue
+condOfTag k c "F" = pure CFalse
+condOfTag k c "R" = do
+  p <- str
+  a <- k.go
+  b <- k.go
+  pure (CRel p a b)
+condOfTag k c "S" = do
+  e <- k.go
+  pure (CTest e)
+condOfTag k c "N" = do
+  x <- c.go
+  pure (CNot x)
+condOfTag k c "I" = do
+  a <- c.go
+  b <- c.go
+  x <- c.go
+  pure (CIf a b x)
+condOfTag k c _ = fail
+
+ckOf : DK -> CK
+ckOf k = { go = \s i -> bind word (condOfTag k (ckOf k)) s i }
 
 exprOf : DK -> String -> Dec IR.Expr
 exprOf k "v" = do
@@ -205,6 +241,9 @@ exprOf k "y" = do
   x <- str
   pure (EFloat32 (Surface.floatOfText x))
 exprOf k "X" = pure EAbandon
+exprOf k "o" = do
+  c <- (ckOf k).go
+  pure (EBool c)
 exprOf k "F" = do
   f <- str
   b <- k.go
@@ -236,7 +275,7 @@ stepB : Int -> Int -> Int
 stepB h c = (h * 999983 + c + 1) % 2147483629
 
 -- | what is still to be hashed: an expression, a string, a number
-data HItem = HE IR.Expr | HS String | HN Int
+data HItem = HE IR.Expr | HS String | HN Int | HC IR.Cond
 
 -- (a string's bytes, then its end)
 bytesH : String -> Int -> Int -> Int -> Pair Int Int
@@ -322,6 +361,18 @@ nodeH (EFloat32 x) rest = Cons (HN 17) (Cons (HS (show x)) rest)
 nodeH EAbandon rest = Cons (HN 18) rest
 nodeH (EFix f b) rest = Cons (HN 19) (Cons (HS f) (Cons (HE b) rest))
 nodeH (EBytes s) rest = Cons (HN 20) (Cons (HS s) rest)
+nodeH (EBool c) rest = Cons (HN 21) (Cons (HC c) rest)
+
+-- (a condition: its form's number, then its parts)
+condH : IR.Cond -> List HItem -> List HItem
+condH CTrue rest = Cons (HN 30) rest
+condH CFalse rest = Cons (HN 31) rest
+condH (CRel p a b) rest =
+  Cons (HN 32) (Cons (HS p) (Cons (HE a) (Cons (HE b) rest)))
+condH (CTest e) rest = Cons (HN 33) (Cons (HE e) rest)
+condH (CNot c) rest = Cons (HN 34) (Cons (HC c) rest)
+condH (CIf a b c) rest =
+  Cons (HN 35) (Cons (HC a) (Cons (HC b) (Cons (HC c) rest)))
 
 hashTake : (Int -> Int -> List HItem -> Pair Int Int)
          -> List HItem
@@ -335,6 +386,7 @@ hashW a b (Cons (HN n) rest) =
   hashW (stepA a (n + 300)) (stepB b (n + 300)) rest
 hashW a b (Cons (HS s) rest) = hashTake hashW rest (bytesH s 0 a b)
 hashW a b (Cons (HE e) rest) = hashW a b (nodeH e rest)
+hashW a b (Cons (HC c) rest) = hashW a b (condH c rest)
 
 -- | strings and expressions hashed, in order, into one hash
 -- | >>> strEq (hashOf [HE (ELam ["x"] (EVar "x"))]) (hashOf [HE (ELam ["x"] (EVar "x"))])

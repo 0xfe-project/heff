@@ -236,6 +236,10 @@ fieldsS f fs =
        pure (MkPair l e'))
     fs
 
+-- (each expression of a condition, by `f`)
+condS : (IR.Expr -> M IR.Expr) -> IR.Cond -> M IR.Cond
+condS f c = IR.condTraverse (mo := instanceMonadM) f c
+
 armsS : (IR.Expr -> M IR.Expr) -> List IR.Arm -> M (List IR.Arm)
 armsS f arms =
   traverseS
@@ -384,6 +388,8 @@ pureIn safe total (EMatch sc arms) =
   pureIn safe total sc
   && not (List.null arms)
   && IR.allI (List.map (\b -> pureIn safe total (IR.armBody b)) arms)
+pureIn safe total (EBool c) =
+  IR.allI (List.map (\a -> pureIn safe total a) (IR.condParts c))
 pureIn safe total (EPrim _) = True
 pureIn safe total (EInt _) = True
 pureIn safe total (EFloat _) = True
@@ -517,9 +523,25 @@ foldArgs p (Cons a Nil) = unOp p a
 foldArgs p (Cons a (Cons b Nil)) = binOp p a b
 foldArgs p _ = Nothing
 
--- | a primitive's call: its value, if its arguments are literals
+-- | a primitive's call: its value, if its arguments are literals; a
+-- | comparison, a condition
 foldPrim : String -> List IR.Expr -> IR.Expr
-foldPrim p argv = fromMaybe (EPrimCall p argv) (foldArgs p argv)
+foldPrim p argv = case foldArgs p argv of
+  Just v -> v
+  Nothing -> case argv of
+    Cons a (Cons b Nil) ->
+      if IR.isRel p then EBool (CRel p a b) else EPrimCall p argv
+    _ -> EPrimCall p argv
+
+-- | a condition made again of its parts, simplified: a comparison of
+-- | literals computed, each `Bool` looked at that is a condition taken
+-- | in, each `if` of them made as `IR.condIf` makes it
+foldCond : IR.Cond -> IR.Cond
+foldCond (CRel p a b) = IR.condOf (foldPrim p [a, b])
+foldCond (CTest e) = IR.condOf e
+foldCond (CNot c) = IR.notOf (foldCond c)
+foldCond (CIf a b c) = IR.condIf (foldCond a) (foldCond b) (foldCond c)
+foldCond c = c
 
 -- | a primitive given its arguments: a call of it, once they are all
 -- | there (what the other judgments know a primitive's computation by;
@@ -542,8 +564,8 @@ primApp p argv = primAppN p argv (Prims.primArity p)
 -- | simplifier makes is made by this, so no judgment need look for
 -- | another form (a primitive applied, not called: `cheap` would not
 -- | know it)
--- | >>> mkApp (EApp (EPrim "intLe") [EVar "n"]) [EInt 0]
--- | EPrimCall "intLe" [EVar "n", EInt 0]
+-- | >>> mkApp (EApp (EPrim "intAdd") [EVar "n"]) [EInt 0]
+-- | EPrimCall "intAdd" [EVar "n", EInt 0]
 mkApp : IR.Expr -> List IR.Expr -> IR.Expr
 mkApp f Nil = f
 mkApp (EApp g bs) argv = mkApp g (appendL bs argv)
@@ -583,6 +605,9 @@ substCopies x a (EPrimCall p argv) = do
 substCopies x a (ECall g argv) = do
   argv' <- traverseS (\q -> substCopies x a q) argv
   pure (ECall g argv')
+substCopies x a (EBool c) = do
+  c' <- condS (\q -> substCopies x a q) c
+  pure (EBool c')
 substCopies x a e = pure e
 
 -- | (lambdas in lambdas are one lambda)
@@ -677,6 +702,7 @@ handedW x kinds n (Cons (EPrimCall _ argv) rest) =
   handedW x kinds n (IR.appendI argv rest)
 handedW x kinds n (Cons (ECall _ argv) rest) =
   handedW x kinds n (IR.appendI argv rest)
+handedW x kinds n (Cons (EBool c) rest) = handedW x kinds n (IR.condOnto c rest)
 handedW x kinds n (Cons _ rest) = handedW x kinds n rest
 
 -- | how big a function bound may be that is put where it is called, a
@@ -847,6 +873,13 @@ armsPushable : Int -> IR.Expr -> List IR.Arm -> Bool
 armsPushable budget a arms =
   anyTag (waysOut a) && not (List.any (armOver budget (waysOut a)) arms)
 
+-- (how many times a condition looks at the `Bool` `x`: a match on it)
+testsOf : String -> IR.Cond -> Int
+testsOf x (CTest (EVar y)) = if strEq x y then 1 else 0
+testsOf x (CNot c) = testsOf x c
+testsOf x (CIf a b c) = testsOf x a + testsOf x b + testsOf x c
+testsOf x c = 0
+
 -- (how many matches on `x` there are in the worklist)
 scrutW : String -> Int -> List IR.Expr -> Int
 scrutW x n Nil = n
@@ -861,6 +894,8 @@ scrutW x n (Cons (ERecord fs _) rest) = scrutW x n (IR.pushFields fs rest)
 scrutW x n (Cons (ETag _ argv _) rest) = scrutW x n (IR.appendI argv rest)
 scrutW x n (Cons (EPrimCall _ argv) rest) = scrutW x n (IR.appendI argv rest)
 scrutW x n (Cons (ECall _ argv) rest) = scrutW x n (IR.appendI argv rest)
+scrutW x n (Cons (EBool c) rest) =
+  scrutW x (n + testsOf x c) (IR.condOnto c rest)
 scrutW x n (Cons _ rest) = scrutW x n rest
 
 -- (what follows, copied whole to every way out but the first: more
@@ -976,6 +1011,7 @@ projW x n (Cons (ERecord fs _) rest) = projW x n (IR.pushFields fs rest)
 projW x n (Cons (ETag _ argv _) rest) = projW x n (IR.appendI argv rest)
 projW x n (Cons (EPrimCall _ argv) rest) = projW x n (IR.appendI argv rest)
 projW x n (Cons (ECall _ argv) rest) = projW x n (IR.appendI argv rest)
+projW x n (Cons (EBool c) rest) = projW x n (IR.condOnto c rest)
 projW x n (Cons _ rest) = projW x n rest
 
 -- | `x`, bound to a record some of whose fields compute, is used more
@@ -1139,6 +1175,9 @@ simpF r (EMatch s arms) = do
 simpF r (EPrimCall p argv) = do
   argv' <- traverseS (\a -> r.simp a) argv
   pure (foldPrim p argv')
+simpF r (EBool c) = do
+  c' <- condS (\a -> r.simp a) c
+  pure (IR.boolOf (foldCond c'))
 simpF r (EGlobal g) = do
   s <- get
   pure (globalLiteral g (Map.lookup s.defs g))
@@ -1313,6 +1352,8 @@ apartW x (Cons (ERecord fs _) rest) = apartW x (IR.pushFields fs rest)
 apartW x (Cons (ETag _ argv _) rest) = apartW x (IR.appendI argv rest)
 apartW x (Cons (EPrimCall _ argv) rest) = apartW x (IR.appendI argv rest)
 apartW x (Cons (ECall _ argv) rest) = apartW x (IR.appendI argv rest)
+apartW x (Cons (EBool c) rest) =
+  testsOf x c > 0 || apartW x (IR.condOnto c rest)
 apartW x (Cons _ rest) = apartW x rest
 
 -- (an argument that tells, its parameter taken apart in the body)
@@ -1709,6 +1750,7 @@ cheap safe all (EMatch sc arms) =
   cheap safe all sc
   && not (List.null arms)
   && IR.allI (List.map (cheap safe all) (List.map IR.armBody arms))
+cheap safe all (EBool c) = IR.allI (List.map (cheap safe all) (IR.condParts c))
 cheap safe all _ = False
 
 minL : List Int -> Int
@@ -2579,22 +2621,36 @@ caseOfCase r s2 arms2 arms =
     pure (EMatch s2 arms2')
   else pure (EMatch (EMatch s2 arms2) arms)
 
-matchF : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
-matchF r (EMatch s2 arms2) arms = caseOfCase r s2 arms2 arms
-matchF r s@(ETag t argv _) arms = case findArm t arms of
+-- (a match not an `if` on a condition)
+matchOn : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
+matchOn r (EMatch s2 arms2) arms = caseOfCase r s2 arms2 arms
+matchOn r s@(ETag t argv _) arms = case findArm t arms of
   Just (MkArm _ vs b) -> r.simp (letsOf (zipL vs argv) b)
   Nothing -> pure (EMatch s arms)
-matchF r (ELet x a b) arms = do
+matchOn r (ELet x a b) arms = do
   b' <- r.match b arms
   pure (ELet x a b')
-matchF r s@(EGlobal g) arms = do
+matchOn r s@(EGlobal g) arms = do
   mb <- known g
   case mb of
     Just (ETag t2 as2 ts2) ->
       if IR.keepsValue (ETag t2 as2 ts2) then pure (EMatch s arms)
       else r.match (ETag t2 as2 ts2) arms
     _ -> pure (EMatch s arms)
-matchF r s arms = pure (EMatch s arms)
+matchOn r s arms = pure (EMatch s arms)
+
+-- | a match: an `if` whose arms are `Bool`s a condition is made of is a
+-- | condition (`&&`, `||`, `not`); any other `if` is on its scrutinee as
+-- | a condition (a comparison computes no `Bool` to be matched on)
+matchF : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
+matchF r s arms = case IR.boolArms arms of
+  Just (MkPair t f) ->
+    if IR.boolShaped t f
+    then pure
+        (IR.boolOf
+           (foldCond (IR.condIf (IR.condOf s) (IR.condOf t) (IR.condOf f))))
+    else matchOn r (IR.boolOf (foldCond (IR.condOf s))) arms
+  Nothing -> matchOn r s arms
 
 sk : SK
 sk =
@@ -2859,6 +2915,9 @@ tieGo h lam1 (EPrimCall p argv) = do
 tieGo h lam1 (ECall g argv) = do
   as2 <- traverseS (tieGo h lam1) argv
   pure (ECall g as2)
+tieGo h lam1 (EBool c) = do
+  c2 <- condS (tieGo h lam1) c
+  pure (EBool c2)
 tieGo h lam1 e = pure e
 
 -- (the copy `h`, made to `hb`, small and not calling itself, put where a

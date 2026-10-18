@@ -46,6 +46,124 @@ isTupleTag t = strLength t > 0 && byteAt t 0 == 35
 anyTys : {a : Type} -> List a -> List FieldTy
 anyTys args = List.map (\_ -> FtAny) args
 
+-- | a condition: the booleans' language of their own, so that a test is
+-- | never a `Bool` built to be matched on.  `CRel`, a comparison, a
+-- | primitive of two operands; `CTest`, a `Bool` computed, looked at;
+-- | `CIf a b c`, `b` where `a` holds, else `c` (`&&` and `||`): `b` and
+-- | `c` computed only where they are chosen
+data CondOf e
+  = CTrue
+  | CFalse
+  | CRel String e e
+  | CTest e
+  | CNot (CondOf e)
+  | CIf (CondOf e) (CondOf e) (CondOf e)
+
+-- | each expression of a condition, by `f`
+condMap : {a b : Type} -> (a -> b) -> CondOf a -> CondOf b
+condMap f CTrue = CTrue
+condMap f CFalse = CFalse
+condMap f (CRel p x y) = CRel p (f x) (f y)
+condMap f (CTest x) = CTest (f x)
+condMap f (CNot c) = CNot (condMap f c)
+condMap f (CIf a b c) = CIf (condMap f a) (condMap f b) (condMap f c)
+
+-- | ... each a computation, in the order they are written
+condTraverse : {m : Type -> Type}
+             -> {{mo : Monad m}}
+             -> {a b : Type}
+             -> (a -> m b)
+             -> CondOf a
+             -> m (CondOf b)
+condTraverse f CTrue = mo.pure CTrue
+condTraverse f CFalse = mo.pure CFalse
+condTraverse f (CRel p x y) =
+  mo.bind (f x) (\x2 -> mo.bind (f y) (\y2 -> mo.pure (CRel p x2 y2)))
+condTraverse f (CTest x) = mo.bind (f x) (\x2 -> mo.pure (CTest x2))
+condTraverse f (CNot c) =
+  mo.bind (condTraverse (mo := mo) f c) (\c2 -> mo.pure (CNot c2))
+condTraverse f (CIf a b c) =
+  mo.bind
+    (condTraverse (mo := mo) f a)
+    (\a2 ->
+       mo.bind
+         (condTraverse (mo := mo) f b)
+         (\b2 ->
+            mo.bind
+              (condTraverse (mo := mo) f c)
+              (\c2 -> mo.pure (CIf a2 b2 c2))))
+
+-- | the expressions of a condition, in the order they are written, onto
+-- | `rest`
+condOnto : {a : Type} -> CondOf a -> List a -> List a
+condOnto CTrue rest = rest
+condOnto CFalse rest = rest
+condOnto (CRel _ x y) rest = Cons x (Cons y rest)
+condOnto (CTest x) rest = Cons x rest
+condOnto (CNot c) rest = condOnto c rest
+condOnto (CIf a b c) rest = condOnto a (condOnto b (condOnto c rest))
+
+-- | ... alone
+condParts : {a : Type} -> CondOf a -> List a
+condParts c = condOnto c Nil
+
+fillWith : {b : Type}
+         -> Pair (Maybe (CondOf b)) (List b)
+         -> (CondOf b -> List b -> Pair (Maybe (CondOf b)) (List b))
+         -> Pair (Maybe (CondOf b)) (List b)
+fillWith (MkPair (Just c) es) k = k c es
+fillWith (MkPair Nothing es) k = MkPair Nothing es
+
+-- (a condition's expressions given again, in the order `condOnto` has
+-- them, and those left)
+condFillGo : {a b : Type}
+           -> CondOf a
+           -> List b
+           -> Pair (Maybe (CondOf b)) (List b)
+condFillGo CTrue es = MkPair (Just CTrue) es
+condFillGo CFalse es = MkPair (Just CFalse) es
+condFillGo (CRel p _ _) (Cons x (Cons y es)) = MkPair (Just (CRel p x y)) es
+condFillGo (CTest _) (Cons x es) = MkPair (Just (CTest x)) es
+condFillGo (CNot c) es =
+  fillWith (condFillGo c es) (\c2 es2 -> MkPair (Just (CNot c2)) es2)
+condFillGo (CIf a b c) es =
+  fillWith
+    (condFillGo a es)
+    (\a2 es1 ->
+       fillWith
+         (condFillGo b es1)
+         (\b2 es2 ->
+            fillWith
+              (condFillGo c es2)
+              (\c2 es3 -> MkPair (Just (CIf a2 b2 c2)) es3)))
+condFillGo c es = MkPair Nothing es
+
+-- | a condition of the same form, its expressions `es` (as many as
+-- | `condParts` gives, in that order)
+-- | >>> condFill (CIf (CTest 1) (CRel "intLt" 2 3) CFalse) ["a", "b", "c"]
+-- | CIf (CTest "a") (CRel "intLt" "b" "c") CFalse
+condFill : {a b : Type} -> CondOf a -> List b -> CondOf b
+condFill c es = case condFillGo c es of
+  MkPair (Just c2) _ -> c2
+  MkPair Nothing _ -> CFalse
+
+-- | the comparisons' primitives of a condition
+condRels : {a : Type} -> CondOf a -> List String
+condRels (CRel p _ _) = Cons p Nil
+condRels (CNot c) = condRels c
+condRels (CIf a b c) =
+  List.append (condRels a) (List.append (condRels b) (condRels c))
+condRels _ = Nil
+
+-- | the expressions computed whenever the condition is (not those of a
+-- | `CIf`'s arms, computed only where chosen), onto `rest`
+condFirst : {a : Type} -> CondOf a -> List a -> List a
+condFirst (CRel _ x y) rest = Cons x (Cons y rest)
+condFirst (CTest x) rest = Cons x rest
+condFirst (CNot c) rest = condFirst c rest
+condFirst (CIf a _ _) rest = condFirst a rest
+condFirst _ rest = rest
+
 data Expr
   = EVar String
   | EGlobal String
@@ -78,11 +196,16 @@ data Expr
   -- | a `Float32`: the float, rounded to one where it is computed
   | EFloat32 Float64
   | EAbandon
+  -- | a `Bool`, a condition's (`CondOf`): a match on it is an `if`, which
+  -- | builds no `Bool`; one is built only where it is a value
+  | EBool (CondOf Expr)
   -- | a local definition (`where`), the name bound in its body to itself:
   -- | only between erasure and `heff.compile.lift`, which makes it a global
   | EFix String Expr
 
 type Arm = ArmOf Expr
+
+type Cond = CondOf Expr
 
 armTag : Arm -> String
 armTag (MkArm t _ _) = t
@@ -186,6 +309,32 @@ freshFields r m n Nil = MkPair Nil n
 freshFields r m n (Cons (MkPair l e) rest) = case r.go m n e of
   MkPair e' n1 -> consPFS (MkPair l e') (freshFields r m n1 rest)
 
+-- (a condition binds nothing)
+withFC : {a : Type}
+       -> Pair (CondOf Expr) Supply
+       -> (CondOf Expr -> Supply -> a)
+       -> a
+withFC (MkPair c n) k = k c n
+
+freshCond : FK -> Ren -> Supply -> CondOf Expr -> Pair (CondOf Expr) Supply
+freshCond r m n CTrue = MkPair CTrue n
+freshCond r m n CFalse = MkPair CFalse n
+freshCond r m n (CRel p x y) = case r.go m n x of
+  MkPair x' n1 -> case r.go m n1 y of
+    MkPair y' n2 -> MkPair (CRel p x' y') n2
+freshCond r m n (CTest x) = case r.go m n x of
+  MkPair x' n1 -> MkPair (CTest x') n1
+freshCond r m n (CNot c) =
+  withFC (freshCond r m n c) (\c' n1 -> MkPair (CNot c') n1)
+freshCond r m n (CIf a b c) =
+  withFC
+    (freshCond r m n a)
+    (\a' n1 ->
+       withFC
+         (freshCond r m n1 b)
+         (\b' n2 ->
+            withFC (freshCond r m n2 c) (\c' n3 -> MkPair (CIf a' b' c') n3)))
+
 freshGo : FK -> Ren -> Supply -> Expr -> Pair Expr Supply
 freshGo r m n (EVar x) = MkPair (EVar (renOf m x)) n
 freshGo r m n (ELam xs b) =
@@ -211,6 +360,8 @@ freshGo r m n (EPrimCall p args) = case freshMany r m n args of
   MkPair args' n1 -> MkPair (EPrimCall p args') n1
 freshGo r m n (ECall g args) = case freshMany r m n args of
   MkPair args' n1 -> MkPair (ECall g args') n1
+freshGo r m n (EBool c) = case freshCond r m n c of
+  MkPair c' n1 -> MkPair (EBool c') n1
 freshGo r m n e = MkPair e n
 
 fk : FK
@@ -247,6 +398,7 @@ substGo m (EMatch s arms) =
        arms)
 substGo m (EPrimCall p args) = EPrimCall p (List.map (\a -> substGo m a) args)
 substGo m (ECall g args) = ECall g (List.map (\a -> substGo m a) args)
+substGo m (EBool c) = EBool (condMap (\a -> substGo m a) c)
 substGo m e = e
 
 subst : Map.Map String Expr -> Expr -> Expr
@@ -284,6 +436,7 @@ countW x n (Cons (EMatch s arms) rest) =
   countW x n (Cons s (pushArms arms rest))
 countW x n (Cons (EPrimCall _ args) rest) = countW x n (appendI args rest)
 countW x n (Cons (ECall _ args) rest) = countW x n (appendI args rest)
+countW x n (Cons (EBool c) rest) = countW x n (condOnto c rest)
 countW x n (Cons _ rest) = countW x n rest
 
 -- (whether `x` occurs under a lambda in the worklist: a lambda's body
@@ -299,6 +452,7 @@ lamW x (Cons (ETag _ args _) rest) = lamW x (appendI args rest)
 lamW x (Cons (EMatch s arms) rest) = lamW x (Cons s (pushArms arms rest))
 lamW x (Cons (EPrimCall _ args) rest) = lamW x (appendI args rest)
 lamW x (Cons (ECall _ args) rest) = lamW x (appendI args rest)
+lamW x (Cons (EBool c) rest) = lamW x (condOnto c rest)
 lamW x (Cons _ rest) = lamW x rest
 
 -- | how often a variable occurs, and whether any occurrence is under a
@@ -322,6 +476,7 @@ sizeW n (Cons (EMatch s arms) rest) =
   sizeW (n + 1) (Cons s (pushArms arms rest))
 sizeW n (Cons (EPrimCall _ args) rest) = sizeW (n + 1) (appendI args rest)
 sizeW n (Cons (ECall _ args) rest) = sizeW (n + 1) (appendI args rest)
+sizeW n (Cons (EBool c) rest) = sizeW (n + 1) (condOnto c rest)
 sizeW n (Cons _ rest) = sizeW (n + 1) rest
 
 -- | >>> size (ELam ["x"] (EApp (EVar "x") [EInt 1]))
@@ -344,6 +499,7 @@ sizeB lim n (Cons e rest) =
     EMatch sc arms -> sizeB lim (n + 1) (Cons sc (pushArms arms rest))
     EPrimCall _ args -> sizeB lim (n + 1) (appendI args rest)
     ECall _ args -> sizeB lim (n + 1) (appendI args rest)
+    EBool c -> sizeB lim (n + 1) (condOnto c rest)
     _ -> sizeB lim (n + 1) rest
 
 -- | whether the expression is bigger than `lim`: walked no further than
@@ -369,6 +525,7 @@ globalsGo (EMatch s arms) =
   appendI (globalsGo s) (concatMapI (\a -> globalsGo (armBody a)) arms)
 globalsGo (EPrimCall _ args) = concatMapI (\a -> globalsGo a) args
 globalsGo (ECall g args) = Cons g (concatMapI (\a -> globalsGo a) args)
+globalsGo (EBool c) = concatMapI (\a -> globalsGo a) (condParts c)
 globalsGo _ = Nil
 
 globalsIn : Expr -> List String
@@ -398,6 +555,7 @@ isValue (EStr _) = True
 isValue (EBytes _) = True
 isValue (EFixed _ _) = True
 isValue (EFloat32 _) = True
+isValue (EBool c) = allI (List.map (\a -> isValue a) (condParts c))
 isValue _ = False
 
 -- | a `Lazy`'s box, `MkLazy` of its thunk: the box keeps the value the
@@ -418,3 +576,173 @@ spineApp args (MkPair h bs) = MkPair h (appendI bs args)
 spine : Expr -> Pair Expr (List Expr)
 spine (EApp f args) = spineApp args (spine f)
 spine e = MkPair e Nil
+
+-- Conditions
+--------------------------------------------------------------------------------
+
+-- | the comparisons a condition is made of (each backend has them as an
+-- | operator, or a test of its own): of integers, floats, strings,
+-- | runes, a fixed-width type's, and words (heff.compile.ranges)
+relPrims : List String
+relPrims =
+  [ "intEq"
+  , "intLt"
+  , "intLe"
+  , "floatEq"
+  , "floatLt"
+  , "floatLe"
+  , "strEq"
+  , "strLt"
+  , "runeEq"
+  , "runeLt"
+  , "runeLe"
+  , "wordEq"
+  , "wordLt"
+  , "wordLe"
+  ]
+
+-- (a fixed-width type's comparison)
+fixedRel : FixedPrim -> Bool
+fixedRel { op = OpEq } = True
+fixedRel { op = OpLt } = True
+fixedRel { op = OpLe } = True
+fixedRel p = False
+
+-- | whether a primitive of two operands is a comparison
+-- | >>> List.map isRel ["intLt", "intAdd", "wordLe"]
+-- | [True, False, True]
+isRel : String -> Bool
+isRel p =
+  List.any (\q -> strEq p q) relPrims || maybe False fixedRel (fixedPrimOf p)
+
+-- (an arm of no fields, of the tag)
+armNamed : String -> List Arm -> Maybe Expr
+armNamed t Nil = Nothing
+armNamed t (Cons (MkArm t2 vs b) rest) =
+  if strEq t2 t && List.null vs then Just b else armNamed t rest
+
+-- | a match's arms, if it is an `if`: one for `True`, one for `False`
+boolArms : List Arm -> Maybe (Pair Expr Expr)
+boolArms (Cons a (Cons b Nil)) = case armNamed "True" [a, b] of
+  Just t -> case armNamed "False" [a, b] of
+    Just f -> Just (MkPair t f)
+    Nothing -> Nothing
+  Nothing -> Nothing
+boolArms arms = Nothing
+
+-- | the arms of an `if`
+ifArms : Expr -> Expr -> List Arm
+ifArms t f = [MkArm "True" Nil t, MkArm "False" Nil f]
+
+-- | whether a condition is a constant
+isConstant : CondOf Expr -> Bool
+isConstant CTrue = True
+isConstant CFalse = True
+isConstant c = False
+
+-- | `not c`: a constant turned, a `CNot` taken off
+notOf : CondOf Expr -> CondOf Expr
+notOf CTrue = CFalse
+notOf CFalse = CTrue
+notOf (CNot c) = c
+notOf c = CNot c
+
+-- | `if c then t else e` of conditions: a constant's arm; the arms
+-- | turned for a `not`; a test of a test whose arms are constants taken
+-- | apart (case of case, where that copies only constants); the test
+-- | itself, where the arms are `True` and `False`
+condIf : CondOf Expr -> CondOf Expr -> CondOf Expr -> CondOf Expr
+condIf CTrue t e = t
+condIf CFalse t e = e
+condIf (CNot c) t e = condIf c e t
+condIf (CIf a b c) t e =
+  if isConstant t && isConstant e then condIf a (condIf b t e) (condIf c t e)
+  else CIf (CIf a b c) t e
+condIf c CTrue CFalse = c
+condIf c CFalse CTrue = notOf c
+condIf c t e = CIf c t e
+
+-- | whether an arm of an `if` may be made part of a condition, computing
+-- | nothing it would not: a constant, a name, a comparison, a condition,
+-- | an `if` of them
+condShaped : Expr -> Bool
+condShaped (ETag t Nil _) = strEq t "True" || strEq t "False"
+condShaped (EVar _) = True
+condShaped (EBool _) = True
+condShaped (EPrimCall p (Cons _ (Cons _ Nil))) = isRel p
+condShaped (EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) -> condShaped t && condShaped f
+  Nothing -> False
+condShaped e = False
+
+-- | whether it is a `Bool`, by what it is (a name may be of any type)
+surelyBool : Expr -> Bool
+surelyBool (ETag t Nil _) = strEq t "True" || strEq t "False"
+surelyBool (EBool _) = True
+surelyBool (EPrimCall p (Cons _ (Cons _ Nil))) = isRel p
+surelyBool (EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) -> surelyBool t || surelyBool f
+  Nothing -> False
+surelyBool e = False
+
+-- | whether the arms of an `if` are `Bool`s it may be a condition of
+boolShaped : Expr -> Expr -> Bool
+boolShaped t f = condShaped t && condShaped f && (surelyBool t || surelyBool f)
+
+-- | a `Bool` as a condition: a constant, a comparison, an `if` of
+-- | conditions; else the `Bool` looked at
+-- | >>> condOf (EPrimCall "intLt" [EVar "i", EVar "n"])
+-- | CRel "intLt" (EVar "i") (EVar "n")
+condOf : Expr -> CondOf Expr
+condOf (ETag t Nil ts) =
+  if strEq t "True" then CTrue
+  else if strEq t "False" then CFalse
+  else CTest (ETag t Nil ts)
+condOf (EBool c) = c
+condOf (EPrimCall p (Cons a (Cons b Nil))) =
+  if isRel p then CRel p a b else CTest (EPrimCall p [a, b])
+condOf (EMatch s arms) = case boolArms arms of
+  Just (MkPair t f) ->
+    if boolShaped t f
+    then condIf (condOf s) (condOf t) (condOf f)
+    else CTest (EMatch s arms)
+  Nothing -> CTest (EMatch s arms)
+condOf e = CTest e
+
+-- | a condition as a `Bool`: a constant's tag, the `Bool` looked at,
+-- | else the condition's
+boolOf : CondOf Expr -> Expr
+boolOf CTrue = ETag "True" Nil Nil
+boolOf CFalse = ETag "False" Nil Nil
+boolOf (CTest e) = e
+boolOf c = EBool c
+
+-- | a condition made again of what it is made of: each `Bool` it looks
+-- | at that is a condition taken in, each `if` of them as `condIf` makes it
+condNorm : CondOf Expr -> CondOf Expr
+condNorm (CTest e) = condOf e
+condNorm (CNot c) = notOf (condNorm c)
+condNorm (CIf a b c) = condIf (condNorm a) (condNorm b) (condNorm c)
+condNorm c = c
+
+-- | `case s of True -> t; False -> f`, as conditions have it: a `Bool`
+-- | of a condition, where its arms are of them; else a match on the
+-- | condition
+-- | >>> ifOf (EVar "c") (EVar "d") (ETag "False" [] [])
+-- | EBool (CIf (CTest (EVar "c")) (CTest (EVar "d")) CFalse)
+ifOf : Expr -> Expr -> Expr -> Expr
+ifOf s t f =
+  if boolShaped t f
+  then boolOf (condIf (condOf s) (condOf t) (condOf f))
+  else EMatch (boolOf (condOf s)) (ifArms t f)
+
+-- | a condition as the matches on `Bool`s and the comparisons it is made
+-- | of, as they were before it was one
+condExpr : CondOf Expr -> Expr
+condExpr CTrue = ETag "True" Nil Nil
+condExpr CFalse = ETag "False" Nil Nil
+condExpr (CRel p a b) = EPrimCall p [a, b]
+condExpr (CTest e) = e
+condExpr (CNot c) =
+  EMatch (condExpr c) (ifArms (ETag "False" Nil Nil) (ETag "True" Nil Nil))
+condExpr (CIf a b c) = EMatch (condExpr a) (ifArms (condExpr b) (condExpr c))

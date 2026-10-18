@@ -462,6 +462,7 @@ withTest env x (EPrimCall p (Cons a (Cons b Nil))) =
        , tests = Map.insert env.tests x (MkTest p a b)
        }
   else env
+withTest env x (EBool (CRel p a b)) = withTest env x (EPrimCall p [a, b])
 withTest env x e = env
 
 -- (a name bound to what `a` computes, of the range `r`)
@@ -517,31 +518,70 @@ markRange ms (Within (Just lo) (Just hi)) =
   if lo == hi then markBound ms (Just lo) else ms
 markRange ms r = ms
 
+-- (the comparisons of a condition: each of its own, and each a `Bool` it
+-- looks at is bound to)
+condTests : Env -> IR.Cond -> List Test
+condTests env (CRel p a b) =
+  if isComparison p then Cons (MkTest p a b) Nil else Nil
+condTests env (CTest (EVar x)) = case Map.lookup env.tests x of
+  Just t -> Cons t Nil
+  Nothing -> Nil
+condTests env (CNot k) = condTests env k
+condTests env (CIf a b k) =
+  List.append
+    (condTests env a)
+    (List.append (condTests env b) (condTests env k))
+condTests env k = Nil
+
 -- (the constants a comparison compares with, marked, where the walk
 -- marks them: of a function whose parameters are worked out, as the
 -- rounds walk it)
-marked : Ctx -> Env -> Maybe Test -> St -> St
-marked c env (Just (MkTest p a b)) st =
+markedOne : Ctx -> Env -> St -> Test -> St
+markedOne c env st (MkTest p a b) =
+  { calls = st.calls
+  , marks =
+      markRange
+        (markRange st.marks (operandRange c env a))
+        (operandRange c env b)
+  }
+
+marked : Ctx -> Env -> Maybe IR.Cond -> St -> St
+marked c env (Just k) st =
   if not c.marking then st
-  else { calls = st.calls
-       , marks =
-           markRange
-             (markRange st.marks (operandRange c env a))
-             (operandRange c env b)
-       }
+  else List.foldl (markedOne c env) st (condTests env k)
 marked c env Nothing st = st
 
--- (what a match looks at, if it is a comparison)
-testOf : Env -> IR.Expr -> Maybe Test
-testOf env (EVar x) = Map.lookup env.tests x
+-- (what a match looks at, if it is a condition: a comparison, or a name
+-- bound to one)
+testOf : Env -> IR.Expr -> Maybe IR.Cond
+testOf env (EBool k) = Just k
+testOf env (EVar x) = case Map.lookup env.tests x of
+  Just (MkTest p a b) -> Just (CRel p a b)
+  Nothing -> Nothing
 testOf env (EPrimCall p (Cons a (Cons b Nil))) =
-  if isComparison p then Just (MkTest p a b) else Nothing
+  if isComparison p then Just (CRel p a b) else Nothing
 testOf env e = Nothing
 
--- (what is known in an arm of a match on a comparison)
-armEnv : Ctx -> Env -> Maybe Test -> String -> Env
-armEnv c env (Just t) "True" = refine c env t True
-armEnv c env (Just t) "False" = refine c env t False
+-- | what is known where a condition holds (`yes`), or does not: of a
+-- | comparison, of a `Bool` bound to one, and of `&&` holding and `||`
+-- | not
+condRefine : Ctx -> Env -> IR.Cond -> Bool -> Env
+condRefine c env (CRel p a b) yes =
+  if isComparison p then refine c env (MkTest p a b) yes else env
+condRefine c env (CTest (EVar x)) yes = case Map.lookup env.tests x of
+  Just t -> refine c env t yes
+  Nothing -> env
+condRefine c env (CNot k) yes = condRefine c env k (not yes)
+condRefine c env (CIf a b CFalse) True =
+  condRefine c (condRefine c env a True) b True
+condRefine c env (CIf a CTrue k) False =
+  condRefine c (condRefine c env a False) k False
+condRefine c env k yes = env
+
+-- (what is known in an arm of a match on a condition)
+armEnv : Ctx -> Env -> Maybe IR.Cond -> String -> Env
+armEnv c env (Just k) "True" = condRefine c env k True
+armEnv c env (Just k) "False" = condRefine c env k False
 armEnv c env t tag = env
 
 joinAll : List Range -> List Range -> List Range
@@ -634,7 +674,7 @@ joinSeen r (MkSeen rr st) = MkSeen (join r rr) st
 gatherArms : Ctx
            -> (Env -> St -> IR.Expr -> Seen)
            -> Env
-           -> Maybe Test
+           -> Maybe IR.Cond
            -> St
            -> List IR.Arm
            -> Seen
@@ -643,6 +683,30 @@ gatherArms c go env t st (Cons (MkArm tag vs b) rest) =
   thenSeen
     (go (armEnv c env t tag) st b)
     (\r st1 -> joinSeen r (gatherArms c go env t st1 rest))
+
+-- (what a condition calls with what: each of its arms where what it
+-- chooses by is known to hold, or not)
+gatherCond : Ctx
+           -> (Env -> St -> IR.Expr -> Seen)
+           -> Env
+           -> St
+           -> IR.Cond
+           -> St
+gatherCond c go env st (CRel p a b) =
+  seenSt
+    (thenSeens
+       (gatherMany go env st [a, b])
+       (\_ st1 -> MkSeen anyRange (marked c env (Just (CRel p a b)) st1)))
+gatherCond c go env st (CTest e) = seenSt (go env st e)
+gatherCond c go env st (CNot k) = gatherCond c go env st k
+gatherCond c go env st (CIf a b k) =
+  gatherCond
+    c
+    go
+    (condRefine c env a False)
+    (gatherCond c go (condRefine c env a True) (gatherCond c go env st a) b)
+    k
+gatherCond c go env st k = st
 
 -- | what an expression may be, where `env` is known, and what it calls
 -- | with what (`walkGo`'s, its expression not given back)
@@ -689,6 +753,8 @@ gatherGo c env st (ETag t args ts) =
   thenSeens
     (gatherMany (gatherGo c) env st args)
     (\_ st1 -> MkSeen anyRange st1)
+gatherGo c env st (EBool k) =
+  MkSeen anyRange (gatherCond c (gatherGo c) env st k)
 gatherGo c env st e = MkSeen anyRange st
 
 -- | what a definition calls with what, its parameters of the ranges `c`
@@ -734,12 +800,34 @@ consArm tag vs (MkRes r b) (MkArms rr arms) =
 walkArms : Ctx
          -> (Env -> IR.Expr -> Res)
          -> Env
-         -> Maybe Test
+         -> Maybe IR.Cond
          -> List IR.Arm
          -> Arms
 walkArms c go env t Nil = MkArms Unreached Nil
 walkArms c go env t (Cons (MkArm tag vs b) rest) =
   consArm tag vs (go (armEnv c env t tag) b) (walkArms c go env t rest)
+
+-- (a condition with its comparisons of words done on words, each of
+-- its arms walked where what it chooses by is known to hold, or not)
+walkCond : Ctx -> (Env -> IR.Expr -> Res) -> Env -> IR.Cond -> IR.Cond
+walkCond c go env (CRel p a b) =
+  IR.condOf
+    (resExpr
+       (thenMany
+          (walkMany go env [a, b]) (\rs es -> case es of
+        Cons a2 (Cons b2 Nil) ->
+          MkRes
+            anyRange
+            (EBool (CRel (fromMaybe p (wordOf p rs anyRange)) a2 b2))
+        _ -> MkRes anyRange (EBool (CRel p a b)))))
+walkCond c go env (CTest e) = CTest (resExpr (go env e))
+walkCond c go env (CNot k) = CNot (walkCond c go env k)
+walkCond c go env (CIf a b k) =
+  CIf
+    (walkCond c go env a)
+    (walkCond c go (condRefine c env a True) b)
+    (walkCond c go (condRefine c env a False) k)
+walkCond c go env k = k
 
 -- | what an expression may be, where `env` is known, and the expression
 -- | with its operations on words (`gatherGo`'s ranges)
@@ -785,6 +873,7 @@ walkGo c env (ETag t args ts) =
   thenMany
     (walkMany (walkGo c) env args)
     (\_ as1 -> MkRes anyRange (ETag t as1 ts))
+walkGo c env (EBool k) = MkRes anyRange (EBool (walkCond c (walkGo c) env k))
 walkGo c env e = MkRes anyRange e
 
 -- | a definition with its operations on words, its parameters of the
@@ -1067,6 +1156,13 @@ scanCall ar s g args =
       else Map.insert s.escapes g MkUnit
   }
 
+-- (the comparisons of a condition that are `Int` operations, scanned)
+scanCond : Scan -> IR.Cond -> Scan
+scanCond s (CRel p a b) = if isIntOp p then scanOp s [a, b] else s
+scanCond s (CNot k) = scanCond s k
+scanCond s (CIf a b k) = scanCond (scanCond (scanCond s a) b) k
+scanCond s k = s
+
 scanW : Map.Map String Int -> Scan -> List IR.Expr -> Scan
 scanW ar s Nil = s
 scanW ar s (Cons (EGlobal g) rest) = scanW ar (scanGlobal s g) rest
@@ -1084,6 +1180,7 @@ scanW ar s (Cons (ETag _ args _) rest) = scanW ar s (IR.appendI args rest)
 scanW ar s (Cons (EMatch e arms) rest) =
   scanW ar s (Cons e (IR.pushArms arms rest))
 scanW ar s (Cons (EFix _ b) rest) = scanW ar s (Cons b rest)
+scanW ar s (Cons (EBool c) rest) = scanW ar (scanCond s c) (IR.condOnto c rest)
 scanW ar s (Cons _ rest) = scanW ar s rest
 
 scanOf : Map.Map String Int -> IR.Def -> Scan
