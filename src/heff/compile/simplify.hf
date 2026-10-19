@@ -2654,6 +2654,120 @@ pushBound r s arms argv = do
   arms' <- armsS (\b -> applyArm r b (snd bound)) arms
   pure (letsOf (fst bound) (EMatch s arms'))
 
+-- What follows a choice of computations: `if c then tell x else pure
+-- MkUnit`, then more, given a known handler -- the match given the
+-- handler and what follows, `\x -> ...`, a function no arm may have a
+-- copy of.  Each arm is given the handler and a name for what follows,
+-- `k`; where each way out then comes to `k` called with as many values,
+-- and `k` is nowhere else, those values are set, and what follows is
+-- called once after the match, with them.  No function is bound for the
+-- arms to call.  Otherwise the application is as it was.
+
+-- (each way out a call of `k` given `n` values: those values)
+valuesCalled : String -> Int -> IR.Expr -> Maybe IR.Expr
+valuesCalled k n (ELet y v b) =
+  maybe Nothing (\b2 -> Just (ELet y v b2)) (valuesCalled k n b)
+valuesCalled k n (ESet ys v b) =
+  maybe Nothing (\b2 -> Just (ESet ys v b2)) (valuesCalled k n b)
+valuesCalled k n (EMatch s arms) =
+  maybe
+    Nothing
+    (\bs ->
+       Just
+         (EMatch
+            s
+            (List.zipWith
+               (\a b2 -> MkArm (IR.armTag a) (IR.armVars a) b2)
+               arms
+               bs)))
+    (allJust (List.map (\a -> valuesCalled k n (IR.armBody a)) arms))
+valuesCalled k n EAbandon = Just EAbandon
+valuesCalled k n (EApp (EVar k2) argv) =
+  if strEq k k2 && List.length argv == n then Just (EValues argv) else Nothing
+valuesCalled k n e = Nothing
+
+-- (how many values the first way out gives `k`)
+firstCalled : String -> IR.Expr -> Int
+firstCalled k (ELet _ _ b) = firstCalled k b
+firstCalled k (ESet _ _ b) = firstCalled k b
+firstCalled k (EMatch _ (Cons a _)) = firstCalled k (IR.armBody a)
+firstCalled k (EApp (EVar k2) argv) =
+  if strEq k k2 then List.length argv else 0
+firstCalled k e = 0
+
+consFollowed : IR.Expr
+             -> Maybe (Pair (List IR.Expr) IR.Expr)
+             -> Maybe (Pair (List IR.Expr) IR.Expr)
+consFollowed a (Just (MkPair argv f)) = Just (MkPair (Cons a argv) f)
+consFollowed a Nothing = Nothing
+
+-- (the arguments, what follows among them -- the one that may not go
+-- into every arm, a function -- named `k`; and what follows)
+followerNamed : String
+              -> List IR.Expr
+              -> Maybe (Pair (List IR.Expr) IR.Expr)
+followerNamed k Nil = Nothing
+followerNamed k (Cons (ELam xs b) rest) =
+  if pushable (ELam xs b) then consFollowed (ELam xs b) (followerNamed k rest)
+  else if IR.allI (List.map pushable rest)
+  then Just (MkPair (Cons (EVar k) rest) (ELam xs b))
+  else Nothing
+followerNamed k (Cons a rest) =
+  if pushable a then consFollowed a (followerNamed k rest) else Nothing
+
+freshNames : String -> Int -> M (List String)
+freshNames base n =
+  if n <= 0 then pure Nil
+  else do
+    x <- freshName base
+    xs <- freshNames base (n - 1)
+    pure (Cons x xs)
+
+-- (the arms given the handler and `k`: the values set, then what
+-- follows -- or, where they do not all come to `k`, `orig`)
+followerSet : SK
+            -> IR.Expr
+            -> String
+            -> IR.Expr
+            -> IR.Expr
+            -> List IR.Arm
+            -> List IR.Expr
+            -> M IR.Expr
+followerSet r orig k f s arms argv = do
+  saved <- get
+  arms2 <- armsS (\b -> applyArm r b argv) arms
+  let m : IR.Expr = EMatch s arms2
+  let n : Int = firstCalled k m
+  case valuesCalled k n m of
+    Just m2 ->
+      if n > 0 && occCountOf k m2 == 0
+      then do
+        xs <- freshNames "v" n
+        body <- r.applyTo f (List.map (\x -> EVar x) xs)
+        pure (ESet xs m2 body)
+      else do
+        st <- get
+        u <- put (restore saved st)
+        pure orig
+    Nothing -> do
+      st <- get
+      u <- put (restore saved st)
+      pure orig
+
+-- (a match given a known handler and what follows)
+followerPushed : SK -> IR.Expr -> List IR.Arm -> List IR.Expr -> M IR.Expr
+followerPushed r s arms argv = do
+  st <- get
+  k <- freshName "k"
+  let orig : IR.Expr = mkApp (EMatch s arms) argv
+  case followerNamed k argv of
+    Just (MkPair argv2 f) ->
+      if List.any (handlerArg st.sp.kinds) argv2
+         && pushInto arms (List.keepIf (\a -> not (isVar k a)) argv2)
+      then followerSet r orig k f s arms argv2
+      else pure orig
+    Nothing -> pure orig
+
 -- (a field of a copy that is a record -- a handler made for its algebra,
 -- `passing writer W3 alg` -- handed on with a handler: `handle hd c`'s
 -- `hd.ret`, a closed function a copy may be made for)
@@ -2707,7 +2821,7 @@ applyToF r f argv =
         pure (EMatch s arms')
       else if handlerPushed arms argv
       then pushBound r s arms argv
-      else pure (mkApp (EMatch s arms) argv)
+      else followerPushed r s arms argv
     EGlobal g -> do
       s <- get
       as1 <- handedFields s argv
