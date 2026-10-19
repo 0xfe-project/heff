@@ -3474,6 +3474,55 @@ HEFF_FN V heff_arrayAppend(V a, V b) {
   return (V)s;
 }
 
+// (a new array of `m`, kept as `kind` says: `a`'s elements before `k`,
+// then, `put` places on, those from `k` and `skip` past it -- moved over
+// by a copy of their bytes where nothing else holds `a`, its cell given
+// back, and counted otherwise, `a` counted down)
+HEFF_FN Arr *heff_arr_spread(V a, int64_t k, int64_t skip, int64_t put, int64_t m, unsigned kind) {
+  Arr *r = (Arr *)a;
+  int64_t rest = r->n - k - skip;
+  Arr *s = heff_arr_alloc(m, kind);
+  if (r->h.tag == kind && heff_alone(&r->h)) {
+    size_t w = heff_arr_width[kind];
+    memcpy(s->a, r->a, (size_t)k * w);
+    memcpy((char *)s->a + (size_t)(k + put) * w, (char *)r->a + (size_t)(k + skip) * w,
+           (size_t)rest * w);
+    heff_obj_free(r, heff_arr_bytes(r));
+    return s;
+  }
+  heff_arr_move(s, 0, r, 0, k);
+  heff_arr_move(s, k + put, r, k + skip, rest);
+  heff_drop(a);
+  return s;
+}
+
+// (`x` put in at `i`, clamped to 0 up to the length, the elements from
+// there on one further on)
+HEFF_FN V heff_arrayInsertAt(V a, V i, V x) {
+  Arr *r = (Arr *)a;
+  int64_t n = r->n, k = INT_OF(i);
+  if (!IS_INT(i)) k = ((Big *)i)->neg ? 0 : n;
+  else if (k < 0) k = 0;
+  else if (k > n) k = n;
+  heff_drop(i);
+  Arr *s = heff_arr_spread(a, k, 0, 1, n + 1, n == 0 ? heff_arr_kind_of(x) : r->h.tag);
+  heff_arr_put(s, k, x);
+  return (V)s;
+}
+
+// (the element at `i` taken out, those after it one nearer; out of
+// range, the array as it is)
+HEFF_FN V heff_arrayRemoveAt(V a, V i) {
+  Arr *r = (Arr *)a;
+  if (!heff_arr_in(r, i)) {
+    heff_drop(i);
+    return a;
+  }
+  int64_t k = INT_OF(i);
+  if (r->h.tag == HEFF_ARR_V && heff_alone(&r->h)) heff_drop(r->a[k]);
+  return (V)heff_arr_spread(a, k, 1, 0, r->n - 1, r->h.tag);
+}
+
 // Bytes
 // ---------------------------------------------------------------------
 
