@@ -249,7 +249,14 @@ typedef struct { Obj h; double d; } Flt;
 typedef struct { Obj h; void *p; void (*let_go)(void *); } Fgn;
 // (an array: its elements, `n` of them, `V`s or flat -- a number's C
 // type, as its header's `tag` says, `HEFF_ARR_V` or another of these
-// ("Arrays", below))
+// ("Arrays", below), in the low byte of the tag.  Its room is told by
+// the tag too, not by a field, so that the header stays 16 bytes and the
+// elements aligned to 16 as the block is (at 24, a vectorised loop over
+// `double`s splits its loads and stores across cache lines; at 32, a
+// hash map's nodes take a tenth more): bits 8 to 13, `e`, 0 where the
+// room is `n`, as an array is made, else the room is 2 to the `e`, `n`
+// or more -- an array grown in place, `push`ed or `append`ed to, its
+// room a power of 2, at least 4 (`heff_arr_cap`))
 typedef struct { Obj h; int64_t n; V a[]; } Arr;
 enum {
   HEFF_ARR_V, HEFF_ARR_F64, HEFF_ARR_I64, HEFF_ARR_U64, HEFF_ARR_I32, HEFF_ARR_U32,
@@ -257,9 +264,15 @@ enum {
 };
 // (the bytes an element of each takes)
 static const uint8_t heff_arr_width[] = { sizeof(V), 8, 8, 8, 4, 4, 2, 2, 1, 1, 4 };
-#define heff_arr_bytes(r) (sizeof(Arr) + (size_t)(r)->n * heff_arr_width[(r)->h.tag])
+// (how it keeps its elements, `HEFF_ARR_V` or another; its room's bits)
+#define HEFF_ARR_KIND(r) ((unsigned)(r)->h.tag & 0xffu)
+#define HEFF_ARR_ROOM 8
+// (how many elements it has room for)
+#define heff_arr_cap(r) \
+  ((r)->h.tag >> HEFF_ARR_ROOM ? (int64_t)1 << ((r)->h.tag >> HEFF_ARR_ROOM) : (r)->n)
+#define heff_arr_bytes(r) (sizeof(Arr) + (size_t)heff_arr_cap(r) * heff_arr_width[HEFF_ARR_KIND(r)])
 // (the elements an object's walk sees: a flat array's none)
-#define heff_arr_slots(r) ((r)->h.tag == HEFF_ARR_V ? (r)->n : 0)
+#define heff_arr_slots(r) (HEFF_ARR_KIND(r) == HEFF_ARR_V ? (r)->n : 0)
 typedef struct { Obj h; V fun; int32_t n; V a[]; } Bnc;
 typedef struct { Obj h; int32_t neg; int32_t n; uint32_t d[]; } Big;
 
@@ -2266,7 +2279,7 @@ HEFF_FN V heff_buf_append(V a, V b, uint16_t kind) {
       Str *g = heff_obj_alloc(sizeof(Str) + cap);
       memcpy(g, x, sizeof(Str) + x->len);
       heff_obj_free(x, was);
-      g->cap = cap;
+      g->cap = (int32_t)cap;
       g->p = g->s;
       x = g;
     }
@@ -3010,7 +3023,16 @@ HEFF_FN V heff_strRuneCount(V a) {
 // call (`heff_arr_set_slow`).  A read lends the array (`_lent`, as a
 // string's), so that a read of an array set after is not a count up and
 // down of it.
+//
+// An array grows the same way: `push`, `append`, `insertAt`, `reserve`
+// write into the room after its elements where it is held only there,
+// and where there is none it is grown, its room the next power of 2 (a
+// block the system gave, by `realloc`) -- so an array built a push at a
+// time is copied a logarithmic number of times, not once a push.  `pop`
+// lowers the length, the room kept.  Held elsewhere too, it is copied first,
+// with room to grow.
 
+// (an array of `n` elements, its room `n`)
 HEFF_FN Arr *heff_arr_alloc(int64_t n, unsigned kind) {
   Arr *r = heff_obj_alloc(sizeof(Arr) + (size_t)n * heff_arr_width[kind]);
   r->h.rc = 1; r->h.kind = K_ARR; r->h.tag = (uint16_t)kind; r->n = n;
@@ -3044,15 +3066,15 @@ static inline int heff_arr_mine(Arr *r, unsigned kind) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && !defined(HEFF_THREADS)
   uint64_t h;
   memcpy(&h, &r->h, sizeof h);
-  return h == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48);
+  return (h & ~((uint64_t)0xff00 << 48)) == (1u | (uint64_t)K_ARR << 32 | (uint64_t)kind << 48);
 #else
-  return r->h.tag == kind && heff_alone(&r->h);
+  return HEFF_ARR_KIND(r) == kind && heff_alone(&r->h);
 #endif
 }
 
 // (element `k` as a `V` counted: a flat one boxed)
 HEFF_FN V heff_arr_get(Arr *r, int64_t k) {
-  switch (r->h.tag) {
+  switch (HEFF_ARR_KIND(r)) {
   case HEFF_ARR_F64: return heff_box_f64(HEFF_ARR_AT(r, double)[k]);
   case HEFF_ARR_I64: return heff_box_i64(HEFF_ARR_AT(r, int64_t)[k]);
   case HEFF_ARR_U64: return heff_box_u64(HEFF_ARR_AT(r, uint64_t)[k]);
@@ -3070,7 +3092,7 @@ HEFF_FN V heff_arr_get(Arr *r, int64_t k) {
 // (`x`, consumed, stored at `k` as the array keeps it: what was there
 // not dropped)
 HEFF_FN void heff_arr_put(Arr *r, int64_t k, V x) {
-  switch (r->h.tag) {
+  switch (HEFF_ARR_KIND(r)) {
   case HEFF_ARR_F64: HEFF_ARR_AT(r, double)[k] = heff_unbox_f64(x); return;
   case HEFF_ARR_I64: HEFF_ARR_AT(r, int64_t)[k] = heff_unbox_i64(x); return;
   case HEFF_ARR_U64: HEFF_ARR_AT(r, uint64_t)[k] = heff_unbox_u64(x); return;
@@ -3094,12 +3116,12 @@ HEFF_FN unsigned heff_arr_kind_of(V x) {
 // (`r`'s elements from `from`, `n` of them, put at `at` of `s`, each
 // counted: as `s` keeps them, if it keeps them otherwise)
 HEFF_FN void heff_arr_move(Arr *s, int64_t at, Arr *r, int64_t from, int64_t n) {
-  if (s->h.tag == r->h.tag) {
-    if (r->h.tag == HEFF_ARR_V)
+  if (HEFF_ARR_KIND(s) == HEFF_ARR_KIND(r)) {
+    if (HEFF_ARR_KIND(r) == HEFF_ARR_V)
       for (int64_t j = 0; j < n; j++) s->a[at + j] = heff_dup(r->a[from + j]);
-    else memcpy((char *)s->a + at * heff_arr_width[r->h.tag],
-                (char *)r->a + from * heff_arr_width[r->h.tag],
-                (size_t)n * heff_arr_width[r->h.tag]);
+    else memcpy((char *)s->a + at * heff_arr_width[HEFF_ARR_KIND(r)],
+                (char *)r->a + from * heff_arr_width[HEFF_ARR_KIND(r)],
+                (size_t)n * heff_arr_width[HEFF_ARR_KIND(r)]);
   } else
     for (int64_t j = 0; j < n; j++) heff_arr_put(s, at + j, heff_arr_get(r, from + j));
 }
@@ -3107,7 +3129,47 @@ HEFF_FN void heff_arr_move(Arr *s, int64_t at, Arr *r, int64_t from, int64_t n) 
 // (a copy of the array `a`, held elsewhere too: `a` counted down)
 HEFF_FN __attribute__((noinline)) Arr *heff_arr_copy(V a) {
   Arr *r = (Arr *)a;
-  Arr *s = heff_arr_alloc(r->n, r->h.tag);
+  Arr *s = heff_arr_alloc(r->n, HEFF_ARR_KIND(r));
+  heff_arr_move(s, 0, r, 0, r->n);
+  heff_drop(a);
+  return s;
+}
+
+// (the bits of the room grown to, to hold `need` elements: the power of
+// 2 at least `need`, at least 4)
+HEFF_FN unsigned heff_arr_room(int64_t need) {
+  unsigned e = 2;
+  while (((int64_t)1 << e) < need) e++;
+  return e;
+}
+
+// (an array held only here, its room made 2 to the `e`, at least its
+// length: in place where the system gave both blocks (`realloc`), else
+// moved to a block of the allocator's, its own given back)
+HEFF_FN __attribute__((noinline)) Arr *heff_arr_regrow(Arr *r, unsigned e) {
+  size_t w = heff_arr_width[HEFF_ARR_KIND(r)];
+  size_t was = heff_arr_bytes(r), now = sizeof(Arr) + ((size_t)1 << e) * w;
+  Arr *g;
+  if ((was + 7) / 8 > SMALL_MAX / 8 && (now + 7) / 8 > SMALL_MAX / 8) {
+    HEFF_COUNTED((now + 7) / 8);
+    g = realloc(r, now);
+    if (!g) heff_fail("out of memory");
+  } else {
+    g = heff_obj_alloc(now);
+    memcpy(g, r, sizeof(Arr) + (size_t)r->n * w);
+    heff_obj_free(r, was);
+  }
+  g->h.tag = (uint16_t)(HEFF_ARR_KIND(g) | e << HEFF_ARR_ROOM);
+  return g;
+}
+
+// (a copy of the array `a`, held elsewhere too or kept otherwise than
+// `kind` says, kept so, its room 2 to the `e`: `a` counted down)
+HEFF_FN __attribute__((noinline)) Arr *heff_arr_fresh(V a, unsigned e, unsigned kind) {
+  Arr *r = (Arr *)a;
+  Arr *s = heff_arr_alloc((int64_t)1 << e, kind);
+  s->n = r->n;
+  s->h.tag = (uint16_t)(kind | e << HEFF_ARR_ROOM);
   heff_arr_move(s, 0, r, 0, r->n);
   heff_drop(a);
   return s;
@@ -3125,7 +3187,7 @@ HEFF_FAST V heff_arrayIndex_lent(V a, V i, int give) {
   Arr *r = (Arr *)a;
   if (!heff_arr_in(r, i)) heff_arr_out();
   int64_t k = INT_OF(i);
-  V x = r->h.tag == HEFF_ARR_V ? heff_dup(r->a[k]) : heff_arr_get(r, k);
+  V x = HEFF_ARR_KIND(r) == HEFF_ARR_V ? heff_dup(r->a[k]) : heff_arr_get(r, k);
   HEFF_GIVEN(give, 0, a);
   return x;
 }
@@ -3156,7 +3218,7 @@ HEFF_FAST double heff_arrayIndex_f64(V a, V i) { return heff_arrayIndex_f64_lent
     Arr *r = (Arr *)a;                                                         \
     if (!heff_arr_in(r, i)) heff_arr_out();                                    \
     int64_t k = INT_OF(i);                                                     \
-    T x = r->h.tag == K ? HEFF_ARR_AT(r, T)[k] : heff_peek_##S(r->a[k]);       \
+    T x = HEFF_ARR_KIND(r) == K ? HEFF_ARR_AT(r, T)[k] : heff_peek_##S(r->a[k]);       \
     HEFF_GIVEN(give, 0, a);                                                    \
     return x;                                                                  \
   }                                                                            \
@@ -3166,7 +3228,7 @@ HEFF_FAST double heff_arrayIndex_f64(V a, V i) { return heff_arrayIndex_f64_lent
 HEFF_FAST V heff_arrayIndexIn_lent(V a, V i, int give) {
   Arr *r = (Arr *)a;
   int64_t k = INT_OF(i);
-  V x = r->h.tag == HEFF_ARR_V ? heff_dup(r->a[k]) : heff_arr_get(r, k);
+  V x = HEFF_ARR_KIND(r) == HEFF_ARR_V ? heff_dup(r->a[k]) : heff_arr_get(r, k);
   HEFF_GIVEN(give, 0, a);
   return x;
 }
@@ -3188,7 +3250,7 @@ HEFF_FAST double heff_arrayIndexIn_f64(V a, V i) { return heff_arrayIndexIn_f64_
   }                                                                            \
   HEFF_FAST T heff_arrayIndexIn_##S(V a, V i) { return heff_arrayIndexIn_##S##_lent(a, i, 3); } \
   HEFF_FAST V heff_arrayKeeps_##S##_lent(V a, int give) {                      \
-    V b = heff_bool(((Arr *)a)->h.tag == K);                                   \
+    V b = heff_bool(HEFF_ARR_KIND(((Arr *)a)) == K);                                   \
     HEFF_GIVEN(give, 0, a);                                                    \
     return b;                                                                  \
   }
@@ -3215,7 +3277,7 @@ HEFF_FN __attribute__((noinline)) V heff_arr_set_slow(V a, V i, V x) {
   }
   int64_t k = INT_OF(i);
   if (!heff_unique(a)) r = heff_arr_copy(a);
-  if (r->h.tag == HEFF_ARR_V) heff_drop(r->a[k]);
+  if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
   heff_arr_put(r, k, x);
   return (V)r;
 }
@@ -3287,7 +3349,7 @@ HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
     return a;
   }
   int64_t k = INT_OF(i);
-  if (r->h.tag == HEFF_ARR_V) heff_drop(r->a[k]);
+  if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
   heff_arr_put(r, k, x);
   return a;
 }
@@ -3296,7 +3358,7 @@ HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
 HEFF_FAST V heff_arraySetOwnedIn(V a, V i, V x) {
   Arr *r = (Arr *)a;
   int64_t k = INT_OF(i);
-  if (r->h.tag == HEFF_ARR_V) heff_drop(r->a[k]);
+  if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
   heff_arr_put(r, k, x);
   return a;
 }
@@ -3337,7 +3399,7 @@ HEFF_FN V heff_arrayReplicate(V n, V x) {
     return (V)heff_arr_new(0);
   }
   Arr *r = heff_arr_alloc(m, heff_arr_kind_of(x));
-  if (r->h.tag == HEFF_ARR_F64) {
+  if (HEFF_ARR_KIND(r) == HEFF_ARR_F64) {
     double d = heff_unbox_f64(x);
     for (int64_t k = 0; k < m; k++) HEFF_ARR_AT(r, double)[k] = d;
     return (V)r;
@@ -3454,23 +3516,39 @@ HEFF_FN V heff_arraySlice(V a, V i, V j) {
   heff_drop(j);
   if (b == 0 && e == n) return a;
   int64_t m = e > b ? e - b : 0;
-  Arr *s = heff_arr_alloc(m, r->h.tag);
+  Arr *s = heff_arr_alloc(m, HEFF_ARR_KIND(r));
   heff_arr_move(s, 0, r, b, m);
   heff_drop(a);
   return (V)s;
 }
 
 // (one array's elements, then another's: kept as theirs are, or -- one
-// flat and the other of `V`s -- flat, the other's put so)
+// flat and the other of `V`s -- flat, the other's put so.  The first held
+// only here, the second's are put after its own, in its room, grown if
+// there is too little; the second held only here too, its elements are
+// moved over, not counted)
 HEFF_FN V heff_arrayAppend(V a, V b) {
   Arr *r = (Arr *)a, *t = (Arr *)b;
   if (t->n == 0) { heff_drop(b); return a; }
-  if (r->n == 0) { heff_drop(a); return b; }
-  Arr *s = heff_arr_alloc(r->n + t->n, r->h.tag != HEFF_ARR_V ? r->h.tag : t->h.tag);
-  heff_arr_move(s, 0, r, 0, r->n);
-  heff_arr_move(s, r->n, t, 0, t->n);
-  heff_drop(a);
-  heff_drop(b);
+  if (r->n == 0 && !(heff_alone(&r->h) && heff_arr_cap(r) >= t->n)) { heff_drop(a); return b; }
+  unsigned kind = HEFF_ARR_KIND(r) != HEFF_ARR_V ? HEFF_ARR_KIND(r) : HEFF_ARR_KIND(t);
+  int64_t k = r->n, n = r->n + t->n;
+  Arr *s;
+  if (heff_arr_mine(r, kind)) s = n > heff_arr_cap(r) ? heff_arr_regrow(r, heff_arr_room(n)) : r;
+  else {
+    s = heff_arr_alloc(n, kind);
+    heff_arr_move(s, 0, r, 0, k);
+    heff_drop(a);
+  }
+  if (HEFF_ARR_KIND(t) == kind && heff_alone(&t->h)) {
+    size_t w = heff_arr_width[kind];
+    memcpy((char *)s->a + (size_t)k * w, t->a, (size_t)t->n * w);
+    heff_obj_free(t, heff_arr_bytes(t));
+  } else {
+    heff_arr_move(s, k, t, 0, t->n);
+    heff_drop(b);
+  }
+  s->n = n;
   return (V)s;
 }
 
@@ -3482,7 +3560,7 @@ HEFF_FN Arr *heff_arr_spread(V a, int64_t k, int64_t skip, int64_t put, int64_t 
   Arr *r = (Arr *)a;
   int64_t rest = r->n - k - skip;
   Arr *s = heff_arr_alloc(m, kind);
-  if (r->h.tag == kind && heff_alone(&r->h)) {
+  if (HEFF_ARR_KIND(r) == kind && heff_alone(&r->h)) {
     size_t w = heff_arr_width[kind];
     memcpy(s->a, r->a, (size_t)k * w);
     memcpy((char *)s->a + (size_t)(k + put) * w, (char *)r->a + (size_t)(k + skip) * w,
@@ -3505,7 +3583,14 @@ HEFF_FN V heff_arrayInsertAt(V a, V i, V x) {
   else if (k < 0) k = 0;
   else if (k > n) k = n;
   heff_drop(i);
-  Arr *s = heff_arr_spread(a, k, 0, 1, n + 1, n == 0 ? heff_arr_kind_of(x) : r->h.tag);
+  unsigned kind = n == 0 ? heff_arr_kind_of(x) : HEFF_ARR_KIND(r);
+  Arr *s;
+  if (n < heff_arr_cap(r) && heff_arr_mine(r, kind)) {
+    size_t w = heff_arr_width[kind];
+    memmove((char *)r->a + (size_t)(k + 1) * w, (char *)r->a + (size_t)k * w, (size_t)(n - k) * w);
+    r->n = n + 1;
+    s = r;
+  } else s = heff_arr_spread(a, k, 0, 1, n + 1, kind);
   heff_arr_put(s, k, x);
   return (V)s;
 }
@@ -3519,8 +3604,83 @@ HEFF_FN V heff_arrayRemoveAt(V a, V i) {
     return a;
   }
   int64_t k = INT_OF(i);
-  if (r->h.tag == HEFF_ARR_V && heff_alone(&r->h)) heff_drop(r->a[k]);
-  return (V)heff_arr_spread(a, k, 1, 0, r->n - 1, r->h.tag);
+  if (HEFF_ARR_KIND(r) == HEFF_ARR_V && heff_alone(&r->h)) heff_drop(r->a[k]);
+  return (V)heff_arr_spread(a, k, 1, 0, r->n - 1, HEFF_ARR_KIND(r));
+}
+
+// (`x` after the last element: in the room after them where the array
+// is held only here, grown where there is none; held elsewhere too, a
+// copy with room.  An array of no elements, of `V`s, is kept as `x`
+// says, flat if it is a `Float64`)
+HEFF_FN __attribute__((noinline)) V heff_arr_push_slow(V a, V x) {
+  Arr *r = (Arr *)a;
+  int64_t n = r->n;
+  unsigned kind = n == 0 && HEFF_ARR_KIND(r) == HEFF_ARR_V ? heff_arr_kind_of(x) : HEFF_ARR_KIND(r);
+  if (heff_arr_mine(r, kind)) {
+    if (n == heff_arr_cap(r)) r = heff_arr_regrow(r, heff_arr_room(n + 1));
+  } else r = heff_arr_fresh(a, heff_arr_room(n + 1), kind);
+  heff_arr_put(r, n, x);
+  r->n = n + 1;
+  return (V)r;
+}
+
+// (... the path where there is room and the array, of `V`s, has an
+// element -- so `x` is no `Float64`, which would make it flat)
+HEFF_FAST V heff_arrayPush(V a, V x) {
+  Arr *r = (Arr *)a;
+  if (HEFF_LIKELY(r->n != 0 && r->n < heff_arr_cap(r) && heff_arr_mine(r, HEFF_ARR_V))) {
+    r->a[r->n++] = x;
+    return a;
+  }
+  return heff_arr_push_slow(a, x);
+}
+
+// (the last element and the others, `Just` the pair of them -- the
+// array's length lowered where it is held only here, its room kept, else
+// a copy; of no elements, `Nothing`.  Room is kept as a power of 2, not
+// as the length, which a pop lowers: so an array whose room is its
+// length, popped in place, is given a power of 2 first, the one at
+// least its length -- its own, if its length is one, else by
+// `heff_arr_regrow`.  A pop never shrinks the room)
+HEFF_FN V heff_arrayPop(V a) {
+  Arr *r = (Arr *)a;
+  int64_t n = r->n;
+  if (n == 0) {
+    heff_drop(a);
+    return NTAG(TAG_Nothing);
+  }
+  V x;
+  if (heff_alone(&r->h)) {
+    if (!(r->h.tag >> HEFF_ARR_ROOM)) {
+      unsigned e = heff_arr_room(n);
+      if ((int64_t)1 << e == n) r->h.tag = (uint16_t)(HEFF_ARR_KIND(r) | e << HEFF_ARR_ROOM);
+      else r = heff_arr_regrow(r, e);
+    }
+    x = HEFF_ARR_KIND(r) == HEFF_ARR_V ? r->a[n - 1] : heff_arr_get(r, n - 1);
+    r->n = n - 1;
+  } else {
+    x = heff_arr_get(r, n - 1);
+    Arr *s = heff_arr_alloc(n - 1, HEFF_ARR_KIND(r));
+    heff_arr_move(s, 0, r, 0, n - 1);
+    heff_drop(a);
+    r = s;
+  }
+  V f[2] = { (V)r, x };
+  V p = heff_tag_n(TAG_MkPair, 2, f);
+  return heff_tag_n(TAG_Just, 1, &p);
+}
+
+// (room for `k` more elements: grown in place where the array is held
+// only here, else a copy with that room; fewer than none, none)
+HEFF_FN V heff_arrayReserve(V a, V k) {
+  Arr *r = (Arr *)a;
+  int64_t more = heff_arr_count(k);
+  heff_drop(k);
+  int alone = heff_alone(&r->h);
+  if (more == 0 || (alone && more <= heff_arr_cap(r) - r->n)) return a;
+  int64_t need = r->n + more;
+  if (alone) return (V)heff_arr_regrow(r, heff_arr_room(need));
+  return (V)heff_arr_fresh(a, heff_arr_room(need), HEFF_ARR_KIND(r));
 }
 
 // Bytes
