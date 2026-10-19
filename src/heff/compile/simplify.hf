@@ -846,35 +846,33 @@ handlerArg : Map.Map String Unit -> IR.Expr -> Bool
 handlerArg kinds (EGlobal g) = Map.member kinds g
 handlerArg kinds e = handlerLike e
 
+-- (how many calls of `x` in the worklist are given arguments `p` holds of)
+callsW : String -> (List IR.Expr -> Bool) -> Int -> List IR.Expr -> Int
+callsW x p n Nil = n
+callsW x p n (Cons (EApp f argv) rest) =
+  callsW
+    x
+    p
+    (if isVar x f && p argv then n + 1 else n)
+    (Cons f (IR.appendI argv rest))
+callsW x p n (Cons (EMatch sc arms) rest) =
+  callsW x p n (Cons sc (IR.pushArms arms rest))
+callsW x p n (Cons (EProj e _ _ _) rest) = callsW x p n (Cons e rest)
+callsW x p n (Cons (ELam _ b) rest) = callsW x p n (Cons b rest)
+callsW x p n (Cons (ELet _ a b) rest) = callsW x p n (Cons a (Cons b rest))
+callsW x p n (Cons (ERecord fs _) rest) = callsW x p n (IR.pushFields fs rest)
+callsW x p n (Cons (ETag _ argv _) rest) = callsW x p n (IR.appendI argv rest)
+callsW x p n (Cons (EPrimCall _ argv) rest) =
+  callsW x p n (IR.appendI argv rest)
+callsW x p n (Cons (ECall _ argv) rest) = callsW x p n (IR.appendI argv rest)
+callsW x p n (Cons (EBool c) rest) = callsW x p n (IR.condOnto c rest)
+callsW x p n (Cons (ESet _ a b) rest) = callsW x p n (Cons a (Cons b rest))
+callsW x p n (Cons (EValues es) rest) = callsW x p n (IR.appendI es rest)
+callsW x p n (Cons _ rest) = callsW x p n rest
+
 -- (how many calls of `x` in the worklist are given a handler)
 handedW : String -> Map.Map String Unit -> Int -> List IR.Expr -> Int
-handedW x kinds n Nil = n
-handedW x kinds n (Cons (EApp f argv) rest) =
-  handedW
-    x
-    kinds
-    (if isVar x f && List.any (handlerArg kinds) argv then n + 1 else n)
-    (Cons f (IR.appendI argv rest))
-handedW x kinds n (Cons (EMatch sc arms) rest) =
-  handedW x kinds n (Cons sc (IR.pushArms arms rest))
-handedW x kinds n (Cons (EProj e _ _ _) rest) = handedW x kinds n (Cons e rest)
-handedW x kinds n (Cons (ELam _ b) rest) = handedW x kinds n (Cons b rest)
-handedW x kinds n (Cons (ELet _ a b) rest) =
-  handedW x kinds n (Cons a (Cons b rest))
-handedW x kinds n (Cons (ERecord fs _) rest) =
-  handedW x kinds n (IR.pushFields fs rest)
-handedW x kinds n (Cons (ETag _ argv _) rest) =
-  handedW x kinds n (IR.appendI argv rest)
-handedW x kinds n (Cons (EPrimCall _ argv) rest) =
-  handedW x kinds n (IR.appendI argv rest)
-handedW x kinds n (Cons (ECall _ argv) rest) =
-  handedW x kinds n (IR.appendI argv rest)
-handedW x kinds n (Cons (EBool c) rest) = handedW x kinds n (IR.condOnto c rest)
-handedW x kinds n (Cons (ESet _ a b) rest) =
-  handedW x kinds n (Cons a (Cons b rest))
-handedW x kinds n (Cons (EValues es) rest) =
-  handedW x kinds n (IR.appendI es rest)
-handedW x kinds n (Cons _ rest) = handedW x kinds n rest
+handedW x kinds = callsW x (List.any (handlerArg kinds))
 
 -- | how big a function bound may be that is put where it is called, a
 -- | copy each time, each call given a handler
@@ -891,6 +889,19 @@ handedOn kinds x (ELam ys body) b o =
   && not (IR.sizeAbove handedSize (ELam ys body))
   && handedW x kinds 0 (Cons b Nil) == o
 handedOn kinds x a b o = False
+
+-- | a function bound and called at most twice that runs what it is
+-- | given -- an effect's `hmap` given `\c -> handle hd c`, which calls it
+-- | on `Catch`'s computation and on what its catch gives -- put where
+-- | it is called, a copy each time: the computation is run by the
+-- | handler where it is built, no closure between
+runsGiven : String -> IR.Expr -> IR.Expr -> Int -> Bool
+runsGiven x (ELam (Cons c cs) body) b o =
+  o <= 2
+  && not (IR.sizeAbove handedSize (ELam (Cons c cs) body))
+  && callsW c (\argv -> True) 0 (Cons body Nil) > 0
+  && callsW x (\argv -> True) 0 (Cons b Nil) == o
+runsGiven x a b o = False
 
 -- | how many uses of a closed value bound may each be given a copy of it
 closedUses : Int
@@ -917,7 +928,8 @@ letPure r x a b o = do
           && (not (IR.sizeAbove 12 a)
               || (o <= closedUses && closedKnown a)
               || (o <= handlerUses && handlerLike a)
-              || handedOn s.sp.kinds x a b o)
+              || handedOn s.sp.kinds x a b o
+              || runsGiven x a b o)
   then do
     b' <- substCopies x a b
     r.simp b'
@@ -2997,6 +3009,20 @@ builtApplied r f l e argv = do
       r.applyTo (prunedCopy h argv) argv
     Nothing -> pure (mkApp f argv)
 
+-- | a match applied: the arguments into every arm, if they may go
+-- | there -- a field of a copy handed on with a handler, `hd.ret`, the
+-- | function it is (`handedFields`) -- else as a choice of computations
+-- | given a handler, its values, or what follows
+matchApplied : SK -> IR.Expr -> List IR.Arm -> List IR.Expr -> M IR.Expr
+matchApplied r s arms argv =
+  if pushInto arms argv
+  then do
+    arms' <- armsS (\b -> applyArm r b argv) arms
+    pure (EMatch s arms')
+  else if handlerPushed arms argv
+  then pushBound r s arms argv
+  else followerPushed r s arms argv
+
 -- | an application of simplified parts
 applyToF : SK -> IR.Expr -> List IR.Expr -> M IR.Expr
 applyToF r f argv =
@@ -3022,14 +3048,10 @@ applyToF r f argv =
     -- (the arguments go into every arm: only when that copies nothing
     -- but what a copy may be made for, a closed value -- a handler,
     -- which every arm is then made with)
-    EMatch s arms ->
-      if pushInto arms argv
-      then do
-        arms' <- armsS (\b -> applyArm r b argv) arms
-        pure (EMatch s arms')
-      else if handlerPushed arms argv
-      then pushBound r s arms argv
-      else followerPushed r s arms argv
+    EMatch s arms -> do
+      st <- get
+      as1 <- handedFields st argv
+      matchApplied r s arms as1
     EGlobal g -> do
       s <- get
       as1 <- handedFields s argv
