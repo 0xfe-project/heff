@@ -27,7 +27,7 @@
 --   and a closure of known size.
 --
 -- And besides: a function's parameter lent, not given (heff.compile.borrow,
--- `lent`), and an `Int` read of an array lent, lent too ("Elements
+-- `lent`), and an element read of an array lent, lent too ("Elements
 -- lent"); a tag built in the cell of the one a match took apart, where
 -- that was its last reference (`RTagIn`); a record built of the same shape
 -- as one it reads fields of, in that one's cell (`RRecIn`); a field taken
@@ -271,9 +271,9 @@ data Def = DFun Fun | DVal String Statements Repr.Reprs
 -- What is known where
 --------------------------------------------------------------------------------
 
--- | a definition being made that calls itself last: its key and
--- | parameters (the loop's)
-type Self = { key : String, params : List String }
+-- | a definition being made that calls itself last: its key,
+-- | parameters (the loop's) and body
+type Self = { key : String, params : List String, body : Imperative.Tl }
 
 -- (`owned`: the variables this code holds a reference to, to consume or
 -- drop; `after`: those wanted after what is being made, by what comes
@@ -2587,9 +2587,11 @@ bindThen r ce x fa binding known takes rest after =
 -- held by what lent it through all of the code, and so is each of its
 -- elements -- `x` is lent too, as the fields a match on what is lent
 -- binds are: read not counted (`peekPrim`), a reference taken only where
--- it is given, never dropped.  Only of an `Int` (an operand of one of
--- `intPrims`, somewhere): an array keeps another number flat, its
--- element made anew where it is read.
+-- it is given, never dropped.  Only where `x` is known to be no number
+-- an array keeps flat, its element made anew where it is read: an `Int`
+-- (an operand of one of `intPrims`, somewhere), or of a type of tags (a
+-- match looks at it, or the loop is given it at a parameter a match
+-- looks at -- as heff.compile.borrow lends it on).
 
 -- | the primitives each of whose operands is an `Int`
 intPrims : List String
@@ -2619,56 +2621,84 @@ peekPrim = "arrayPeek"
 intOperand : String -> String -> List Imperative.Val -> Bool
 intOperand x p argv = elemS p intPrims && List.any (varIs x) argv
 
--- (whether `x`, in the worklist, is somewhere an operand of one of
--- `intPrims`)
-intW : String -> List Item -> Bool
-intW x Nil = False
-intW x (Cons (IVal (SPrim p argv)) rest) =
-  intOperand x p argv || intW x (pushVals argv rest)
-intW x (Cons (IVal (STag _ argv _)) rest) = intW x (pushVals argv rest)
-intW x (Cons (IVal (SRec fs _)) rest) = intW x (pushVals (List.map snd fs) rest)
-intW x (Cons (IVal (SProj e _ _ _)) rest) = intW x (Cons (IVal e) rest)
-intW x (Cons (IVal (SLam _ (MkBlock t))) rest) = intW x (Cons (ITl t) rest)
-intW x (Cons (IVal _) rest) = intW x rest
-intW x (Cons (IOp (OSimple v)) rest) = intW x (Cons (IVal v) rest)
-intW x (Cons (IOp (OCall _ argv)) rest) = intW x (pushVals argv rest)
-intW x (Cons (IOp (OApply f argv)) rest) = intW x (pushVals (Cons f argv) rest)
-intW x (Cons (IOp (OPrim p argv)) rest) =
-  intOperand x p argv || intW x (pushVals argv rest)
-intW x (Cons (IOp (OBool c)) rest) = intW x (Cons (ICond c) rest)
-intW x (Cons (IOp _) rest) = intW x rest
-intW x (Cons (ICond (PRel p a b)) rest) =
-  intOperand x p [a, b] || intW x (Cons (IVal a) (Cons (IVal b) rest))
-intW x (Cons (ICond (PBool v)) rest) = intW x (Cons (IVal v) rest)
-intW x (Cons (ICond (PNot c)) rest) = intW x (Cons (ICond c) rest)
-intW x (Cons (ICond (PIf a b c)) rest) =
-  intW x (Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest)))
-intW x (Cons (ICond (PLet _ o c)) rest) =
-  intW x (Cons (IOp o) (Cons (ICond c) rest))
-intW x (Cons (ICond _) rest) = intW x rest
-intW x (Cons (ISts Nil) rest) = intW x rest
-intW x (Cons (ISts (Cons (SLet _ o) ss)) rest) =
-  intW x (Cons (IOp o) (Cons (ISts ss) rest))
-intW x (Cons (ISts (Cons (SDecl _) ss)) rest) = intW x (Cons (ISts ss) rest)
-intW x (Cons (ISts (Cons (SSet _ o) ss)) rest) =
-  intW x (Cons (IOp o) (Cons (ISts ss) rest))
-intW x (Cons (ISts (Cons (SIf c ts fs) ss)) rest) =
-  intW
-    x
-    (Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest))))
-intW x (Cons (ISts (Cons (SCase v arms) ss)) rest) =
-  intW x (Cons (IVal v) (pushStArms arms (Cons (ISts ss) rest)))
-intW x (Cons (ITl (TSeq ss t)) rest) =
-  intW x (Cons (ISts ss) (Cons (ITl t) rest))
-intW x (Cons (ITl (TReturn o)) rest) = intW x (Cons (IOp o) rest)
-intW x (Cons (ITl (TLoop vs)) rest) = intW x (pushVals vs rest)
-intW x (Cons (ITl (TIf c t e)) rest) =
-  intW x (Cons (ICond c) (Cons (ITl t) (Cons (ITl e) rest)))
-intW x (Cons (ITl (TCase v arms)) rest) =
-  intW x (Cons (IVal v) (pushTlArms arms rest))
+-- (an item's parts, before the rest of the worklist)
+partsThen : Item -> List Item -> List Item
+partsThen (IVal (SPrim _ argv)) rest = pushVals argv rest
+partsThen (IVal (STag _ argv _)) rest = pushVals argv rest
+partsThen (IVal (SRec fs _)) rest = pushVals (List.map snd fs) rest
+partsThen (IVal (SProj e _ _ _)) rest = Cons (IVal e) rest
+partsThen (IVal (SLam _ (MkBlock t))) rest = Cons (ITl t) rest
+partsThen (IVal _) rest = rest
+partsThen (IOp (OSimple v)) rest = Cons (IVal v) rest
+partsThen (IOp (OCall _ argv)) rest = pushVals argv rest
+partsThen (IOp (OApply f argv)) rest = pushVals (Cons f argv) rest
+partsThen (IOp (OPrim _ argv)) rest = pushVals argv rest
+partsThen (IOp (OBool c)) rest = Cons (ICond c) rest
+partsThen (IOp _) rest = rest
+partsThen (ICond (PRel _ a b)) rest = Cons (IVal a) (Cons (IVal b) rest)
+partsThen (ICond (PBool v)) rest = Cons (IVal v) rest
+partsThen (ICond (PNot c)) rest = Cons (ICond c) rest
+partsThen (ICond (PIf a b c)) rest =
+  Cons (ICond a) (Cons (ICond b) (Cons (ICond c) rest))
+partsThen (ICond (PLet _ o c)) rest = Cons (IOp o) (Cons (ICond c) rest)
+partsThen (ICond _) rest = rest
+partsThen (ISts Nil) rest = rest
+partsThen (ISts (Cons (SLet _ o) ss)) rest = Cons (IOp o) (Cons (ISts ss) rest)
+partsThen (ISts (Cons (SDecl _) ss)) rest = Cons (ISts ss) rest
+partsThen (ISts (Cons (SSet _ o) ss)) rest = Cons (IOp o) (Cons (ISts ss) rest)
+partsThen (ISts (Cons (SIf c ts fs) ss)) rest =
+  Cons (ICond c) (Cons (ISts ts) (Cons (ISts fs) (Cons (ISts ss) rest)))
+partsThen (ISts (Cons (SCase v arms) ss)) rest =
+  Cons (IVal v) (pushStArms arms (Cons (ISts ss) rest))
+partsThen (ITl (TSeq ss t)) rest = Cons (ISts ss) (Cons (ITl t) rest)
+partsThen (ITl (TReturn o)) rest = Cons (IOp o) rest
+partsThen (ITl (TLoop vs)) rest = pushVals vs rest
+partsThen (ITl (TIf c t e)) rest =
+  Cons (ICond c) (Cons (ITl t) (Cons (ITl e) rest))
+partsThen (ITl (TCase v arms)) rest = Cons (IVal v) (pushTlArms arms rest)
 
--- (an element read of an array lent, `x` an `Int` kept as a `V`: the
--- array and the index)
+-- (whether `f` holds of an item of the worklist, or of a part of one)
+anyW : (Item -> Bool) -> List Item -> Bool
+anyW f Nil = False
+anyW f (Cons it rest) = f it || anyW f (partsThen it rest)
+
+-- (`x` an operand of one of `intPrims`)
+intAt : String -> Item -> Bool
+intAt x (IVal (SPrim p argv)) = intOperand x p argv
+intAt x (IOp (OPrim p argv)) = intOperand x p argv
+intAt x (ICond (PRel p a b)) = intOperand x p [a, b]
+intAt x _ = False
+
+-- (a match looking at `x`)
+matchAt : String -> Item -> Bool
+matchAt x (ISts (Cons (SCase v _) _)) = varIs x v
+matchAt x (ITl (TCase v _)) = varIs x v
+matchAt x _ = False
+
+-- (whether `x` is given at one of the parameters a match in `b` looks at)
+taggedArg : Imperative.Tl
+          -> String
+          -> List String
+          -> List Imperative.Val
+          -> Bool
+taggedArg b x (Cons p ps) (Cons v vs) =
+  (varIs x v && anyW (matchAt p) (Cons (ITl b) Nil)) || taggedArg b x ps vs
+taggedArg b x _ _ = False
+
+-- (the loop, or a call of itself, given `x` where a match looks at it)
+loopAt : Self -> String -> Item -> Bool
+loopAt s x (ITl (TLoop vs)) = taggedArg s.body x s.params vs
+loopAt s x (IOp (OCall g argv)) =
+  strEq g s.key && taggedArg s.body x s.params argv
+loopAt s x _ = False
+
+-- (whether the item says `x` is no number an array keeps flat)
+notFlatAt : Maybe Self -> String -> Item -> Bool
+notFlatAt (Just s) x it = intAt x it || matchAt x it || loopAt s x it
+notFlatAt Nothing x it = intAt x it || matchAt x it
+
+-- (an element read of an array lent, `x` kept as a `V` and known to be no
+-- number kept flat: the array and the index)
 peekArgs : CE
          -> String
          -> List Imperative.Val
@@ -2677,7 +2707,7 @@ peekArgs : CE
 peekArgs ce x (Cons (SVar a) (Cons i Nil)) rest =
   if elemS a ce.borrowed
      && Repr.isBoxed (Repr.reprOf ce.reprs x)
-     && intW x rest
+     && anyW (notFlatAt ce.self x) rest
   then Just (MkPair a i)
   else Nothing
 peekArgs ce x argv rest = Nothing
@@ -3159,7 +3189,7 @@ funWith ce key xs b bi rps sg =
                    (withBorrowed
                       (Borrow.paramsAt True bi xs)
                       (withFrame
-                         (Just { key = key, params = xs })
+                         (Just { key = key, params = xs, body = b })
                          0
                          (knowingShapes b ce))))
                 b))

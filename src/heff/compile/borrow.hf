@@ -103,10 +103,12 @@ onlyLent bor p (ESet _ a b) = onlyLent bor p a && onlyLent bor p b
 onlyLent bor p (EValues es) = List.all (onlyLent bor p) es
 onlyLent bor p _ = True
 
--- (whether it builds a tag of `n` fields)
+-- (whether it builds a tag of `n` fields -- not a tuple, which is no
+-- cell, heff.compile.cpr)
 buildsSize : Int -> IR.Expr -> Bool
-buildsSize n (ETag _ args _) =
-  List.length args == n || List.any (buildsSize n) args
+buildsSize n (ETag t args _) =
+  (List.length args == n && not (IR.isTupleTag t))
+  || List.any (buildsSize n) args
 buildsSize n (ELam _ b) = buildsSize n b
 buildsSize n (EApp f args) = List.any (buildsSize n) (Cons f args)
 buildsSize n (ELet _ a b) = buildsSize n a || buildsSize n b
@@ -147,20 +149,70 @@ scrutLent : List String -> IR.Expr -> Bool
 scrutLent ds (EVar x) = elemS x ds
 scrutLent ds _ = False
 
--- (the variables lent with `ds`: the fields of matches on them)
-lentVars : List String -> IR.Expr -> List String
-lentVars ds (EMatch s arms) =
+-- Elements lent: `let x = arrayIndex a i`, `a` lent, is lent too -- the
+-- array holds it while it is lent -- where `x` is known to be no number
+-- an array may keep flat (heff.compile.refcount's "Elements lent", which
+-- reads it so): a match (not an `if`) looks at it, or the function is
+-- given it, calling itself, at a parameter a match looks at.  So a walk
+-- down nested arrays, a trie's lookup, lends each level on to the next.
+
+-- | a function, as it calls itself: its key, its parameters, its body
+type Loop = { key : String, params : List String, body : IR.Expr }
+
+-- (whether some node of the worklist is one `f` holds of)
+anyW : (IR.Expr -> Bool) -> List IR.Expr -> Bool
+anyW f Nil = False
+anyW f (Cons e rest) = f e || anyW f (IR.partsOnto e rest)
+
+-- (whether a match's arms, as `IR.boolArms` has them, are no `if`'s)
+notIf : Maybe (Pair IR.Expr IR.Expr) -> Bool
+notIf Nothing = True
+notIf (Just _) = False
+
+-- (a match, not an `if`, looking at `x`)
+matchOn : String -> IR.Expr -> Bool
+matchOn x (EMatch s arms) = isVar x s && notIf (IR.boolArms arms)
+matchOn x _ = False
+
+-- (whether `x` is given at one of the parameters a match in `b` looks at)
+taggedArg : IR.Expr -> String -> List String -> List IR.Expr -> Bool
+taggedArg b x (Cons p ps) (Cons a rest) =
+  (isVar x a && anyW (matchOn p) (Cons b Nil)) || taggedArg b x ps rest
+taggedArg b x _ _ = False
+
+-- (a call of the function itself giving `x` where a match looks at it)
+loopOn : Loop -> String -> IR.Expr -> Bool
+loopOn lp x (ECall g args) =
+  strEq g lp.key && taggedArg lp.body x lp.params args
+loopOn lp x _ = False
+
+-- (`let x = a`, an element of an array lent with `ds`, lent too)
+peeks : Loop -> List String -> String -> IR.Expr -> IR.Expr -> Bool
+peeks lp ds x (EPrimCall q (Cons a _)) b =
+  strEq q "arrayIndex"
+  && scrutLent ds a
+  && anyW (\e -> matchOn x e || loopOn lp x e) (Cons b Nil)
+peeks lp ds x _ b = False
+
+-- (the variables lent with `ds`: the fields of matches on them, and
+-- their elements (above))
+lentVars : Loop -> List String -> IR.Expr -> List String
+lentVars lp ds (EMatch s arms) =
   List.concatMap
     (\a ->
        if scrutLent ds s
        then List.append
            (IR.armVars a)
-           (lentVars (List.append (IR.armVars a) ds) (IR.armBody a))
-       else lentVars ds (IR.armBody a))
+           (lentVars lp (List.append (IR.armVars a) ds) (IR.armBody a))
+       else lentVars lp ds (IR.armBody a))
     arms
-lentVars ds (ELet _ a b) = List.append (lentVars ds a) (lentVars ds b)
-lentVars ds (ESet _ a b) = List.append (lentVars ds a) (lentVars ds b)
-lentVars ds _ = Nil
+lentVars lp ds (ELet x a b) =
+  List.append
+    (lentVars lp ds a)
+    (if peeks lp ds x a b then Cons x (lentVars lp (Cons x ds) b)
+     else lentVars lp ds b)
+lentVars lp ds (ESet _ a b) = List.append (lentVars lp ds a) (lentVars lp ds b)
+lentVars lp ds _ = Nil
 
 -- (each call of `key` given at `i` one of `ds`)
 loopLent : String -> Int -> List String -> IR.Expr -> Bool
@@ -204,7 +256,10 @@ borDef bor d@{ body = ELam xs b } =
           b
           (List.append
              (paramsAt True (borOf bor d.key) xs)
-             (lentVars (paramsAt True (borOf bor d.key) xs) b)))
+             (lentVars
+                { key = d.key, params = xs, body = b }
+                (paramsAt True (borOf bor d.key) xs)
+                b)))
        (borOf bor d.key))
 borDef bor d = bor
 
