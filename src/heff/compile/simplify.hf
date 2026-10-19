@@ -808,6 +808,29 @@ handlerLike (ERecord fs ts) =
   && not (IR.sizeAbove specArgSize (ERecord fs ts))
 handlerLike _ = False
 
+-- (a function whose body is a record of functions, taking `n`
+-- parameters -- not one that builds itself again in them, a knot of
+-- judgments, `substOf idxs`)
+builds : String -> Int -> Maybe IR.Expr -> Bool
+builds g n (Just (ELam xs (ERecord fs ts))) =
+  List.length xs == n
+  && not (List.null fs)
+  && IR.allI (List.map lamField fs)
+  && not (elemStr g (IR.globalsIn (ERecord fs ts)))
+builds g n _ = False
+
+-- | a handler built by a global, `feeding m`: a function whose body is a
+-- | record of functions, given all its parameters, each a variable or a
+-- | literal.  Whatever its size, it is known as a global handler is: a
+-- | copy may be made for it, given the variables and literals
+-- | (`Spec.shapeOf`), a field of it taken is that field (`projectF`).
+-- | Building it computes nothing and cannot fail
+builtBy : Map.Map String IR.Expr -> IR.Expr -> Bool
+builtBy all (EApp (EGlobal g) argv) =
+  IR.allI (List.map atomic argv)
+  && builds g (List.length argv) (Map.lookup all g)
+builtBy all _ = False
+
 -- (the field, if it is a closed function)
 closedField : IR.Expr -> Maybe IR.Expr -> IR.Expr
 closedField e (Just v) = if closedKnown v then v else e
@@ -1222,6 +1245,12 @@ letIn r x a b = do
     e <- letIn r x (snd bound) b
     pure (letsOf (fst bound) e)
   else if recordTakenApart x a b then recordSplit r x a b
+  -- (a handler built by a global, bound and used a few times: put where
+  -- it is used, known to each use, as a record of functions is)
+  else if builtBy s.sp.all a && occCountOf x b <= handlerUses
+  then do
+    b' <- substCopies x a b
+    r.simp b'
   else if p then letPure r x a b (occCountOf x b)
   else if partialApp s a then letSplit r x a b
   else do
@@ -2463,6 +2492,11 @@ orMarks : List Bool -> List Bool -> List Bool
 orMarks (Cons m ms) (Cons n ns) = Cons (m || n) (orMarks ms ns)
 orMarks ms _ = ms
 
+-- (an argument known besides `knownArg`'s: a continuation back into a
+-- loop (`backFor`), a handler built by a global (`builtBy`))
+knownMore : St -> List IR.Expr -> String -> IR.Expr -> Bool
+knownMore s argv g e = builtBy s.sp.all e || backFor s argv g e
+
 -- (... the arguments `made` lambdas of partial applications known too)
 specKnown : SK
           -> String
@@ -2474,7 +2508,7 @@ specKnown : SK
 specKnown r g xs b argv made = do
   s <- get
   if not
-       (anyKnown s.sp.kinds (backFor s argv g) g b argv
+       (anyKnown s.sp.kinds (knownMore s argv g) g b argv
         || List.any (\m -> m) made)
   then pure (mkApp (EGlobal g) argv)
   else specMarked
@@ -2483,7 +2517,7 @@ specKnown r g xs b argv made = do
       xs
       b
       argv
-      (orMarks (marksOf s.sp.kinds (backFor s argv g) g xs b argv) made)
+      (orMarks (marksOf s.sp.kinds (knownMore s argv g) g xs b argv) made)
 
 -- Partial applications given to a loop: a known function given fewer
 -- arguments than it takes, `scale f`, handed to a loop at a parameter it
@@ -2824,8 +2858,29 @@ freshNames base n =
     xs <- freshNames base (n - 1)
     pure (Cons x xs)
 
+-- (... where they do not all come to `k` -- a way that goes on no more,
+-- `stop`'s, among those that do -- what follows put where `k` is, a
+-- copy each time, if the code grows by no more than a function bound
+-- and handed a handler may: each copy is given what its way gives it,
+-- a tag known.  Otherwise `orig`)
+followerCopied : SK
+               -> St
+               -> IR.Expr
+               -> String
+               -> IR.Expr
+               -> IR.Expr
+               -> M IR.Expr
+followerCopied r saved orig k f m = do
+  m2 <- substCopies k f m
+  e <- r.simp m2
+  if not (IR.sizeAbove (IR.size orig + handedSize) e) then pure e
+  else do
+    st <- get
+    u <- put (restore saved st)
+    pure orig
+
 -- (the arms given the handler and `k`: the values set, then what
--- follows -- or, where they do not all come to `k`, `orig`)
+-- follows -- or, where they do not all come to `k`, what follows copied)
 followerSet : SK
             -> IR.Expr
             -> String
@@ -2846,14 +2901,8 @@ followerSet r orig k f s arms argv = do
         xs <- freshNames "v" n
         body <- r.applyTo f (List.map (\x -> EVar x) xs)
         pure (ESet xs m2 body)
-      else do
-        st <- get
-        u <- put (restore saved st)
-        pure orig
-    Nothing -> do
-      st <- get
-      u <- put (restore saved st)
-      pure orig
+      else followerCopied r saved orig k f m
+    Nothing -> followerCopied r saved orig k f m
 
 -- (a match given a known handler and what follows)
 followerPushed : SK -> IR.Expr -> List IR.Arm -> List IR.Expr -> M IR.Expr
@@ -2889,6 +2938,42 @@ handedFields s argv =
   if List.any copyField argv && List.any (handlerArg s.sp.kinds) argv
   then traverseS (handedField s) argv
   else pure argv
+
+-- (that field of what `g` is, its parameters given the arguments)
+builtFieldOf : String -> List IR.Expr -> Maybe IR.Expr -> Maybe IR.Expr
+builtFieldOf l argv (Just (ELam xs (ERecord fs _))) =
+  maybe Nothing (\v -> Just (letsOf (zipL xs argv) v)) (fieldIn l fs)
+builtFieldOf l argv _ = Nothing
+
+-- | a field of a handler built by a global (`builtBy`), `(g as).l`: that
+-- | field of a copy of `g`'s body, its parameters given `as` (variables
+-- | or literals: nothing computed twice).  The other fields are
+-- | functions, built for nothing
+builtField : String -> IR.Expr -> M (Maybe IR.Expr)
+builtField l (EApp (EGlobal g) argv) = do
+  s <- get
+  mb <- fueled (Map.lookup s.sp.all g)
+  pure (builtFieldOf l argv mb)
+builtField l e = pure Nothing
+
+-- (... simplified, or `orig`)
+builtProj : SK -> IR.Expr -> String -> IR.Expr -> M IR.Expr
+builtProj r orig l e = do
+  mv <- builtField l e
+  case mv of
+    Just v -> r.simp v
+    Nothing -> pure orig
+
+-- (... applied: judged by what the application comes to, as a known
+-- global handler's field is)
+builtApplied : SK -> IR.Expr -> String -> IR.Expr -> List IR.Expr -> M IR.Expr
+builtApplied r f l e argv = do
+  mv <- builtField l e
+  case mv of
+    Just v -> do
+      h <- r.simp v
+      r.applyTo (prunedCopy h argv) argv
+    Nothing -> pure (mkApp f argv)
 
 -- | an application of simplified parts
 applyToF : SK -> IR.Expr -> List IR.Expr -> M IR.Expr
@@ -2944,6 +3029,15 @@ applyToF r f argv =
             Just v ->
               attemptBy (clauseBudget argv) (mkApp f argv) (r.applyTo v argv)
             Nothing -> pure (mkApp f argv)
+    -- (... and of a handler built by a global, the same way)
+    EProj (EApp (EGlobal g) bs) l sh t -> do
+      s <- get
+      if builtBy s.sp.all (EApp (EGlobal g) bs)
+      then attemptBy
+          (clauseBudget argv)
+          (mkApp f argv)
+          (builtApplied r f l (EApp (EGlobal g) bs) argv)
+      else pure (mkApp f argv)
     _ -> pure (mkApp f argv)
 
 findField : String -> List (Pair String IR.Expr) -> Maybe IR.Expr
@@ -2977,6 +3071,11 @@ projectF r l sh t e@(EGlobal g) = do
   case mb of
     Just b -> attempt (EProj e l sh t) (r.project l sh t b)
     Nothing -> pure (EProj e l sh t)
+projectF r l sh t e@(EApp (EGlobal g) argv) = do
+  s <- get
+  if builtBy s.sp.all e
+  then attempt (EProj e l sh t) (builtProj r (EProj e l sh t) l e)
+  else pure (EProj e l sh t)
 projectF r l sh t e = pure (EProj e l sh t)
 
 -- Case of case
