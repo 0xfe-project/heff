@@ -1408,20 +1408,122 @@ copyBudget kinds (Just b) argv =
   if handedPast kinds b argv then handedSize else budget
 copyBudget kinds Nothing argv = budget
 
+-- (the arm of the tag)
+findArm : String -> List IR.Arm -> Maybe IR.Arm
+findArm t Nil = Nothing
+findArm t (Cons (MkArm t2 vs b) rest) =
+  if strEq t2 t then Just (MkArm t2 vs b) else findArm t rest
+
+-- (the parameters given a tag, each known by it)
+tagsGiven : List String
+          -> List IR.Expr
+          -> Map.Map String IR.Expr
+          -> Map.Map String IR.Expr
+tagsGiven (Cons x xs) (Cons a argv) m =
+  tagsGiven xs argv (if tagged a then Map.insert m x a else m)
+tagsGiven _ _ m = m
+
+-- (what a match is on, if it is a tag known)
+tagKnown : Map.Map String IR.Expr -> IR.Expr -> Maybe IR.Expr
+tagKnown known (EVar x) = Map.lookup known x
+tagKnown known _ = Nothing
+
+-- (the arm a tag known chooses, what it holds known by the arm's names)
+armChosen : Map.Map String IR.Expr
+          -> List IR.Arm
+          -> Maybe IR.Expr
+          -> Maybe (Pair IR.Expr (Map.Map String IR.Expr))
+armChosen known arms (Just (ETag t argv _)) = case findArm t arms of
+  Just (MkArm _ vs b) -> Just (MkPair b (tagsGiven vs argv known))
+  Nothing -> Nothing
+armChosen known arms _ = Nothing
+
+-- (a match on a tag known: the arm it chooses)
+matchChosen : Map.Map String IR.Expr
+            -> IR.Expr
+            -> Maybe (Pair IR.Expr (Map.Map String IR.Expr))
+matchChosen known (EMatch sc arms) = armChosen known arms (tagKnown known sc)
+matchChosen known _ = Nothing
+
+-- (as `IR.sizeAbove`'s count, a match on a tag known counting the arm
+-- it chooses alone)
+prunedB : Int -> Map.Map String IR.Expr -> Int -> List IR.Expr -> Int
+prunedB lim known n Nil = n
+prunedB lim known n (Cons e rest) =
+  if n > lim then n
+  else case matchChosen known e of
+    Just (MkPair b known2) -> prunedB lim known2 (n + 1) (Cons b rest)
+    Nothing -> prunedB lim known (n + 1) (IR.partsOnto e rest)
+
+-- (an arm of a match on a tag known: the arm it chooses, pruned in turn;
+-- any other, nothing)
+prunedArm : (Map.Map String IR.Expr -> IR.Expr -> IR.Expr)
+          -> Map.Map String IR.Expr
+          -> Maybe IR.Expr
+          -> IR.Arm
+          -> IR.Arm
+prunedArm go known (Just (ETag t argv _)) (MkArm t2 vs b) =
+  if strEq t t2 then MkArm t2 vs (go (tagsGiven vs argv known) b)
+  else MkArm t2 vs EAbandon
+prunedArm go known _ (MkArm t2 vs b) = MkArm t2 vs (go known b)
+
+-- (an expression, a match on a tag known in it left the arm it chooses)
+prunedFor : Map.Map String IR.Expr -> IR.Expr -> IR.Expr
+prunedFor known (ELam xs b) = ELam xs (prunedFor known b)
+prunedFor known (ELet x a b) = ELet x (prunedFor known a) (prunedFor known b)
+prunedFor known (ESet xs a b) = ESet xs (prunedFor known a) (prunedFor known b)
+prunedFor known (EApp f argv) =
+  EApp (prunedFor known f) (List.map (\a -> prunedFor known a) argv)
+prunedFor known (EMatch sc arms) =
+  EMatch
+    sc
+    (List.map (\a -> prunedArm prunedFor known (tagKnown known sc) a) arms)
+prunedFor known e = e
+
+-- | a copy where it is called: a match on a parameter given a tag left
+-- | the arm that tag chooses, and so on into what the tag holds (`op`,
+-- | made for a handler of two effects and given `InL (Get k)`, is a
+-- | match on the operation, each arm a match on what it holds: one arm
+-- | of each is all that inlining it leaves).  The other arms are not
+-- | copied to be thrown away
+prunedCopy : IR.Expr -> List IR.Expr -> IR.Expr
+prunedCopy (ELam xs b) argv =
+  if List.any tagged argv
+  then prunedFor (tagsGiven xs argv Map.empty) (ELam xs b)
+  else ELam xs b
+prunedCopy b argv = b
+
+-- (whether a copy is bigger than `lim` where it is called, counting the
+-- arms a tag given chooses alone)
+prunedAbove : Int -> IR.Expr -> List IR.Expr -> Bool
+prunedAbove lim (ELam xs b) argv =
+  prunedB lim (tagsGiven xs argv Map.empty) 0 (Cons (ELam xs b) Nil) > lim
+prunedAbove lim b argv = True
+
+-- (how big such a copy may be: as a copy may, and no bigger than the call
+-- with what inlining may add to it, which `attemptBy` holds it to -- a
+-- copy of the arms chosen bigger than that seldom comes to less)
+prunedMax : Map.Map String Unit -> String -> IR.Expr -> List IR.Expr -> Int
+prunedMax kinds g b argv =
+  min
+    (copyMax kinds b argv)
+    (IR.size (EApp (EGlobal g) argv) + copyBudget kinds (Just b) argv)
+
 -- | a copy (Specialisation, below), to inline: what it is known by --
 -- | simplified with what it was made for, a handler's `bind` and `malg`
 -- | known -- if it does not call itself and is no bigger than a
--- | definition inlined may be.  (`op`, made for a handler, comes to a
--- | match on the operation, each arm a few lines of the handler's
--- | `malg`.)
+-- | definition inlined may be, as it is or where it is called
+-- | (`prunedCopy`).  (`op`, made for a handler, comes to a match on the
+-- | operation, each arm a few lines of the handler's `malg`.)
 knownCopy : St -> String -> List IR.Expr -> Maybe IR.Expr
 knownCopy s g argv =
   if Map.member s.sp.recipes g
   then case Map.lookup s.sp.all g of
     Just b ->
-      if not (IR.sizeAbove (copyMax s.sp.kinds b argv) b)
+      if (not (IR.sizeAbove (copyMax s.sp.kinds b argv) b)
+          || not (prunedAbove (prunedMax s.sp.kinds g b argv) b argv))
          && not (elemStr g (IR.globalsIn b))
-      then Just b
+      then Just (prunedCopy b argv)
       else Nothing
     Nothing -> Nothing
   else Nothing
@@ -2691,8 +2793,7 @@ firstCalled : String -> IR.Expr -> Int
 firstCalled k (ELet _ _ b) = firstCalled k b
 firstCalled k (ESet _ _ b) = firstCalled k b
 firstCalled k (EMatch _ (Cons a _)) = firstCalled k (IR.armBody a)
-firstCalled k (EApp (EVar k2) argv) =
-  if strEq k k2 then List.length argv else 0
+firstCalled k (EApp (EVar k2) argv) = if strEq k k2 then List.length argv else 0
 firstCalled k e = 0
 
 consFollowed : IR.Expr
@@ -2876,11 +2977,6 @@ projectF r l sh t e@(EGlobal g) = do
     Just b -> attempt (EProj e l sh t) (r.project l sh t b)
     Nothing -> pure (EProj e l sh t)
 projectF r l sh t e = pure (EProj e l sh t)
-
-findArm : String -> List IR.Arm -> Maybe IR.Arm
-findArm t Nil = Nothing
-findArm t (Cons (MkArm t2 vs b) rest) =
-  if strEq t2 t then Just (MkArm t2 vs b) else findArm t rest
 
 -- Case of case
 --------------------------------------------------------------------------------
