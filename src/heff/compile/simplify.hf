@@ -912,6 +912,61 @@ closedUses = 4
 handlerUses : Int
 handlerUses = 8
 
+-- A computation used once is put where it is used, but not past a last
+-- use of a variable it reads.  That use may give the value away -- an
+-- array set, a map's key deleted, in place where nothing else holds it,
+-- else a copy -- and the computation put after it would hold the value
+-- on, so each change copies: `let n = Array.length a`, then a loop
+-- setting `a`'s elements, `n` used after it.  A value built (a tag, a
+-- closure) holds what it is built of wherever it is, and is moved.
+
+-- (the variables of the worklist, onto `acc`)
+varsW : List String -> List IR.Expr -> List String
+varsW acc Nil = acc
+varsW acc (Cons (EVar y) rest) = varsW (Cons y acc) rest
+varsW acc (Cons e rest) = varsW acc (IR.partsOnto e rest)
+
+occursIn : String -> IR.Expr -> Bool
+occursIn x e = IR.countW x 0 (Cons e Nil) > 0
+
+-- (the arm `x` occurs in, if it is in one)
+armWith : String -> List IR.Arm -> Maybe IR.Expr
+armWith x Nil = Nothing
+armWith x (Cons b bs) =
+  if occursIn x (IR.armBody b) then Just (IR.armBody b) else armWith x bs
+
+-- (a match's arms in front of `rest`: the one the way goes through, if
+-- it is known, else all)
+armsOnto : Maybe IR.Expr -> List IR.Arm -> List IR.Expr -> List IR.Expr
+armsOnto (Just e) arms rest = Cons e rest
+armsOnto Nothing arms rest = IR.pushArms arms rest
+
+-- | the worklist, in the order it computes, on the way to `x`'s one
+-- | occurrence: whether a variable of `ys` is used before it (`seen`,
+-- | those used so far) and not after it
+lastUseW : List String -> String -> List String -> List IR.Expr -> Bool
+lastUseW ys x seen Nil = False
+lastUseW ys x seen (Cons (EVar y) rest) =
+  if strEq y x then List.any (\z -> IR.countW z 0 rest == 0) seen
+  else lastUseW ys x (if elemStr y ys then Cons y seen else seen) rest
+lastUseW ys x seen (Cons (EMatch sc arms) rest) =
+  lastUseW ys x seen (Cons sc (armsOnto (armWith x arms) arms rest))
+lastUseW ys x seen (Cons e rest) = lastUseW ys x seen (IR.partsOnto e rest)
+
+-- | `a`, bound to `x` and used once in `b`, put there would read a
+-- | variable on past its last use: one used on the way there and not
+-- | after -- or, `x` in a lambda (which holds what it reads, until it is
+-- | called), one used anywhere in `b`
+pastLastUse : String -> IR.Expr -> IR.Expr -> Bool
+pastLastUse x a b =
+  if (IR.occurrences x b).underLam
+  then List.any (\y -> occursIn y b) (varsW Nil (Cons a Nil))
+  else lastUseW (varsW Nil (Cons a Nil)) x Nil (Cons b Nil)
+
+-- (moved there, a computation of `a`: not a value, nor a closure built)
+heldPast : St -> String -> IR.Expr -> IR.Expr -> Bool
+heldPast s x a b = not (IR.isValue a || partialIn s a) && pastLastUse x a b
+
 -- (a value bound and used more than once is put where it is used, a
 -- copy each time, if it is small -- or, used a few times, if it is
 -- closed and a copy may be made for it: a handler, `{ ret = ..., bind =
@@ -923,7 +978,8 @@ letPure : SK -> String -> IR.Expr -> IR.Expr -> Int -> M IR.Expr
 letPure r x a b o = do
   s <- get
   if o == 0 then r.simp b
-  else if atomic a || o == 1 then r.simp (IR.subst (singletonM x a) b)
+  else if atomic a || (o == 1 && not (heldPast s x a b))
+  then r.simp (IR.subst (singletonM x a) b)
   else if IR.isValue a
           && (not (IR.sizeAbove 12 a)
               || (o <= closedUses && closedKnown a)
@@ -1174,6 +1230,10 @@ tagBound (ETag t argv ts) = do
   pure (MkPair (fst fs) (ETag t (snd fs) ts))
 tagBound e = pure (MkPair Nil e)
 
+isTagE : IR.Expr -> Bool
+isTagE (ETag _ _ _) = True
+isTagE _ = False
+
 -- (a tag not a value, matched on)
 tagApart : String -> IR.Expr -> IR.Expr -> Bool
 tagApart x (ETag t argv ts) b =
@@ -1263,6 +1323,13 @@ letIn r x a b = do
   then do
     b' <- substCopies x a b
     r.simp b'
+  -- (a tag whose fields compute, used once past a last use of what they
+  -- read: the fields computed here, the tag, a value then, put there)
+  else if p && isTagE a && occCountOf x b == 1 && heldPast s x a b
+  then do
+    bound <- tagBound a
+    e <- letIn r x (snd bound) b
+    pure (letsOf (fst bound) e)
   else if p then letPure r x a b (occCountOf x b)
   else if partialApp s a then letSplit r x a b
   else do
