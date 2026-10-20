@@ -3359,8 +3359,21 @@ HEFF_FAST V heff_arrayOwn(V a) {
   return (V)heff_arr_copy(a);
 }
 
-// (`x` at `i` of an array held only here: out of range, the array as it
-// is)
+// (`x` at `i` of an array held only here, known in range
+// (heff.compile.bounds): written here where the array keeps `V`s, the
+// way of each other kind only where it is another)
+HEFF_FAST V heff_arraySetOwnedIn(V a, V i, V x) {
+  Arr *r = (Arr *)a;
+  int64_t k = INT_OF(i);
+  if (HEFF_LIKELY(HEFF_ARR_KIND(r) == HEFF_ARR_V)) {
+    V old = r->a[k];
+    r->a[k] = x;
+    heff_drop(old);
+  } else heff_arr_put(r, k, x);
+  return a;
+}
+
+// (... out of range, the array as it is)
 HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
   Arr *r = (Arr *)a;
   if (!HEFF_LIKELY(heff_arr_in(r, i))) {
@@ -3368,19 +3381,7 @@ HEFF_FAST V heff_arraySetOwned(V a, V i, V x) {
     heff_drop(x);
     return a;
   }
-  int64_t k = INT_OF(i);
-  if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
-  heff_arr_put(r, k, x);
-  return a;
-}
-
-// (... known in range (heff.compile.bounds))
-HEFF_FAST V heff_arraySetOwnedIn(V a, V i, V x) {
-  Arr *r = (Arr *)a;
-  int64_t k = INT_OF(i);
-  if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
-  heff_arr_put(r, k, x);
-  return a;
+  return heff_arraySetOwnedIn(a, i, x);
 }
 
 // (... keeping its elements as `T`s, where the program knows them so)
