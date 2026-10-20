@@ -1,0 +1,237 @@
+-- Functions called once: a function the program calls at one place
+-- alone -- given all its arguments there, not one of the roots, and up
+-- to half again as big as the simplifier inlines (`onceMax`) -- is put
+-- where it is called, its parameters bound to the arguments in order, as
+-- the call binds them.  Nothing else reaches it then, so it is gone and
+-- no code is copied, which is what the simplifier's limit on the size of
+-- what it inlines (heff.compile.simplify) is for.  The call's cost goes,
+-- and what the two did with a value between them is one piece of code:
+-- a record built by one and updated by the other is updated in the cell
+-- it was built in (heff.compile.refcount).
+--
+-- The simplifier decides by a definition and what it mentions alone, as
+-- the backend's cache keeps it; how many places call a function is the
+-- whole program's to say, so this runs after it, on what is reached,
+-- before fusion copies what it fuses (heff.compile.lower), for both
+-- backends.  A body put where it is called is moved, not copied, and
+-- named afresh: it captures nothing.
+
+module heff.compile.once
+
+import heff.compile.ir as IR
+import std.map as Map
+
+elemO : String -> List String -> Bool
+elemO x Nil = False
+elemO x (Cons y ys) = strEq x y || elemO x ys
+
+-- What may be put where it is called
+--------------------------------------------------------------------------------
+
+-- | a function: its parameters and its body
+type Callee = { xs : List String, b : IR.Expr }
+
+-- | the most a function called once may be to be put where it is
+-- | called: a caller made one function of many big ones, the passes
+-- | after this one slower on it than on its parts (the compiler compiling
+-- | itself 1% slower so, 1.5% at 100), and copied whole where a pass
+-- | makes two of a function (heff.compile.trmc)
+onceMax : Int
+onceMax = 75
+
+-- (the definition, if it is a function no bigger than that, not a root)
+smallOf : List String -> String -> IR.Expr -> Maybe Callee
+smallOf roots g (ELam xs b) =
+  if not (IR.sizeAbove onceMax b) && not (elemO g roots)
+  then Just { xs = xs, b = b }
+  else Nothing
+smallOf roots g e = Nothing
+
+insertJust : Map.Map String Callee
+           -> String
+           -> Maybe Callee
+           -> Map.Map String Callee
+insertJust m g (Just c) = Map.insert m g c
+insertJust m g Nothing = m
+
+smallsOf : List String -> List IR.Def -> Map.Map String Callee
+smallsOf roots defs =
+  List.foldl
+    (\m (d : IR.Def) -> insertJust m d.key (smallOf roots d.key d.body))
+    Map.empty
+    defs
+
+-- Calls counted
+--------------------------------------------------------------------------------
+
+-- | how a function is mentioned: how many times, and how many arguments
+-- | the last was given (-1: none, mentioned as a value)
+type Uses = { n : Int, args : Int }
+
+usedOnce : Int -> Maybe Uses -> Uses
+usedOnce k (Just u) = { n = u.n + 1, args = k }
+usedOnce k Nothing = { n = 1, args = k }
+
+-- (`g` mentioned, given `k` arguments: counted if it may be put where
+-- it is called)
+used : Map.Map String Callee
+     -> Map.Map String Uses
+     -> String
+     -> Int
+     -> Map.Map String Uses
+used small m g k =
+  if Map.member small g then Map.insert m g (usedOnce k (Map.lookup m g))
+  else m
+
+-- (the functions the worklist mentions, onto `m`)
+usesW : Map.Map String Callee
+      -> Map.Map String Uses
+      -> List IR.Expr
+      -> Map.Map String Uses
+usesW small m Nil = m
+usesW small m (Cons (EApp (EGlobal g) argv) rest) =
+  usesW small (used small m g (List.length argv)) (IR.appendI argv rest)
+usesW small m (Cons (ECall g argv) rest) =
+  usesW small (used small m g (List.length argv)) (IR.appendI argv rest)
+usesW small m (Cons (EGlobal g) rest) =
+  usesW small (used small m g (0 - 1)) rest
+usesW small m (Cons e rest) = usesW small m (IR.partsOnto e rest)
+
+usesOf : Map.Map String Callee -> List IR.Def -> Map.Map String Uses
+usesOf small defs =
+  List.foldl
+    (\m (d : IR.Def) -> usesW small m (Cons d.body Nil))
+    Map.empty
+    defs
+
+-- What is put where it is called
+--------------------------------------------------------------------------------
+
+calledOnce : Callee -> Maybe Uses -> Bool
+calledOnce c (Just u) = u.n == 1 && u.args == List.length c.xs
+calledOnce c Nothing = False
+
+-- (... the function, if it is called once, given all its arguments, and
+-- not by itself)
+withOnce : Map.Map String Uses
+         -> Map.Map String Callee
+         -> Pair String Callee
+         -> Map.Map String Callee
+withOnce uses m (MkPair g c) =
+  if calledOnce c (Map.lookup uses g) && not (elemO g (IR.globalsGo c.b))
+  then Map.insert m g c
+  else m
+
+calleesOf : List String -> List IR.Def -> Map.Map String Callee
+calleesOf roots defs =
+  let small = smallsOf roots defs
+  in List.foldl (withOnce (usesOf small defs)) Map.empty (Map.toList small)
+
+-- (... named afresh: a function lifted out of another keeps the names
+-- it had there, heff.compile.lift, and is put back among them here)
+calleeFresh : Map.Map String Callee
+            -> String
+            -> Pair IR.Expr IR.Supply
+            -> Pair (Map.Map String Callee) IR.Supply
+calleeFresh m g (MkPair (ELam xs b) n) =
+  MkPair (Map.insert m g { xs = xs, b = b }) n
+calleeFresh m g (MkPair e n) = MkPair m n
+
+freshCallee : Pair (Map.Map String Callee) IR.Supply
+            -> Pair String Callee
+            -> Pair (Map.Map String Callee) IR.Supply
+freshCallee (MkPair m n) (MkPair g c) =
+  calleeFresh m g (IR.freshen n (ELam c.xs c.b))
+
+freshCallees : IR.Supply
+             -> Map.Map String Callee
+             -> Pair (Map.Map String Callee) IR.Supply
+freshCallees n cs = List.foldl freshCallee (MkPair Map.empty n) (Map.toList cs)
+
+-- (the parameters bound to the arguments, in order, around the body)
+bound : List String -> List IR.Expr -> IR.Expr -> IR.Expr
+bound (Cons x xs) (Cons a argv) b = ELet x a (bound xs argv b)
+bound _ _ b = b
+
+-- (the call, made of its arguments `argv` by `call`, or the body of the
+-- function called once, put through `go`)
+calledAs : (IR.Expr -> IR.Expr)
+         -> List IR.Expr
+         -> (List IR.Expr -> IR.Expr)
+         -> Maybe Callee
+         -> IR.Expr
+calledAs go argv call (Just c) = bound c.xs argv (go c.b)
+calledAs go argv call Nothing = call argv
+
+-- (the function called once, unless it is being put where it is called
+-- already)
+calleeAt : Map.Map String Callee -> List String -> String -> Maybe Callee
+calleeAt cs going g = if elemO g going then Nothing else Map.lookup cs g
+
+-- | an expression, each function called once in it put where it is
+-- | called, and so on into it (`going`: those being put so)
+inlined : Map.Map String Callee -> List String -> IR.Expr -> IR.Expr
+inlined cs going (EApp (EGlobal g) argv) =
+  calledAs
+    (\b -> inlined cs (Cons g going) b)
+    (List.map (\a -> inlined cs going a) argv)
+    (\argv2 -> EApp (EGlobal g) argv2)
+    (calleeAt cs going g)
+inlined cs going (ECall g argv) =
+  calledAs
+    (\b -> inlined cs (Cons g going) b)
+    (List.map (\a -> inlined cs going a) argv)
+    (\argv2 -> ECall g argv2)
+    (calleeAt cs going g)
+inlined cs going (ELam xs b) = ELam xs (inlined cs going b)
+inlined cs going (EApp f argv) =
+  EApp (inlined cs going f) (List.map (\a -> inlined cs going a) argv)
+inlined cs going (ELet x a b) = ELet x (inlined cs going a) (inlined cs going b)
+inlined cs going (ERecord fs ts) =
+  ERecord
+    (List.map (\p -> MkPair (fst p) (inlined cs going (snd p))) fs)
+    ts
+inlined cs going (EProj e l sh t) = EProj (inlined cs going e) l sh t
+inlined cs going (ETag t argv ts) =
+  ETag t (List.map (\a -> inlined cs going a) argv) ts
+inlined cs going (EMatch s arms) =
+  EMatch
+    (inlined cs going s)
+    (List.map
+       (\a ->
+          MkArm (IR.armTag a) (IR.armVars a) (inlined cs going (IR.armBody a)))
+       arms)
+inlined cs going (EPrimCall p argv) =
+  EPrimCall p (List.map (\a -> inlined cs going a) argv)
+inlined cs going (EBool c) = EBool (IR.condMap (\a -> inlined cs going a) c)
+inlined cs going (ESet xs a b) =
+  ESet xs (inlined cs going a) (inlined cs going b)
+inlined cs going (EValues es) = EValues (List.map (\a -> inlined cs going a) es)
+inlined cs going e = e
+
+-- (the definitions but those put where they are called, each with
+-- those in it put so)
+inlinedDefs : List IR.Def
+            -> Map.Map String Callee
+            -> Pair (Map.Map String Callee) IR.Supply
+            -> Pair (List IR.Def) IR.Supply
+inlinedDefs defs cs (MkPair fresh n) =
+  MkPair
+    (List.map
+       (\(d : IR.Def) -> IR.mkDef d.key d.name (inlined fresh Nil d.body))
+       (List.keepIf (\(d : IR.Def) -> not (Map.member cs d.key)) defs))
+    n
+
+-- | the program, each function called once put where it is called, named
+-- | afresh, and gone: what reaches its call reaches it so, the caller
+-- | from the roots or put where it is called in turn; where fresh names
+-- | go on from
+-- | >>> List.map (\(d : IR.Def) -> d.body) (fst (inlineOnce ["m"] 7 [IR.mkDef "f" "f" (ELam ["x"] (EPrimCall "intAdd" [EVar "x", EInt 1])), IR.mkDef "m" "m" (EApp (EGlobal "f") [EInt 2])]))
+-- | [ELet "x$7" (EInt 2) (EPrimCall "intAdd" [EVar "x$7", EInt 1])]
+inlineOnce : List String
+           -> IR.Supply
+           -> List IR.Def
+           -> Pair (List IR.Def) IR.Supply
+inlineOnce roots n defs =
+  let cs = calleesOf roots defs
+  in inlinedDefs defs cs (freshCallees n cs)
