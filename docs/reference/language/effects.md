@@ -180,6 +180,66 @@ The library has handlers ready, such as `state`'s
 [`runState`](../../api/state.md#runState) and `exception`'s
 [`attempt`](../../api/exception.md#attempt).
 
+### Resuming more than once
+
+```haskell
+data ChooseF (m : Type -> Type) x = Choose (Bool -> x)
+
+choice : HFunctor
+choice =
+  { f = ChooseF
+  , hfmap = \m g p -> case p of
+      Choose k -> Choose (\b -> g (k b))
+  , hmap = \m n nt p -> case p of
+      Choose k -> Choose k
+  }
+
+choose : {e : HFunctor} -> {{ev : choice <: e}} -> Co e Bool
+choose = op (ev (Choose (\b -> b))) val
+
+-- | how many of `n` coins come up heads
+heads : {e : HFunctor} -> {{ev : choice <: e}} -> Int -> Co e Int
+heads n =
+  if n == 0 then pure 0
+  else do
+    b <- choose
+    rest <- heads (n - 1)
+    pure (if b then rest + 1 else rest)
+
+-- | every way the coins fall: each choice resumed with True, then False
+every : Handler choice
+every =
+  { M = \a -> (a -> List Int) -> List Int
+  , ret = \x c -> c x
+  , bind = \m k c -> m (\x -> k x c)
+  , malg = \p c -> case p of
+      Choose k -> c (k True) ++ c (k False)
+  }
+
+-- | >>> handle every (heads (ev := here choice) 2) (\n -> [n])
+-- | [2, 1, 1, 0]
+```
+
+`malg` is not given the rest of the computation: an operation's `x` is
+its answer (`k True` is `True`). The rest belongs to `M`. Make `M` a
+continuation monad, `\a -> (a -> R) -> R`, and a value of it is given
+the rest, `c`, which `malg` may call as often as it likes: here twice,
+the answers appended. `handle every c` is then a function, given what
+each answer comes to, `\n -> [n]`.
+
+`R` may be a computation of the rest of the world, run later by a
+handler outside. For a handler of `choice <+> state Int`, `M` is `\a ->
+(a -> Co (state Int) (List Int)) -> Co (state Int) (List Int)`, and
+`malg` chooses by `bind (c (k True)) (\xs -> bind (c (k False)) (\ys ->
+val (xs ++ ys)))`, and does each operation of the state again:
+
+```haskell
+InR (Get k) -> bind (get (ev := here (state Int))) (\s -> c (k s))
+InR (Put s x) -> bind (put (ev := here (state Int)) s) (\u -> c x)
+```
+
+The state, handled outside, is not restored between the two ways.
+
 ## When work happens
 
 Pure work runs where it is reached: an argument when the computation is

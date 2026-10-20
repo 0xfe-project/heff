@@ -340,3 +340,71 @@ zipSum _ _ sum above = MkPair sum above
 generated : Pair Int Int
 generated =
   zipSum (handle streaming (squares 3000 0)) (handle streaming (randoms 3000 0 42)) 0 0
+
+-- a choice resumed twice, a state outside it -----------------------------------------
+
+data FlipF (m : Type -> Type) x = Flip (Bool -> x)
+
+flips : HFunctor
+flips =
+  { f = FlipF
+  , hfmap = \m g p -> case p of
+      Flip k -> Flip (\b -> g (k b))
+  , hmap = \m n nt p -> case p of
+      Flip k -> Flip k
+  }
+
+flipC : {e : HFunctor} -> {{ch : flips <: e}} -> Co e Bool
+flipC = op (ch (Flip (\b -> b))) val
+
+-- | `d` choices, each path a number; at its end the state got and put
+paths : {e : HFunctor}
+      -> {{ch : flips <: e}}
+      -> {{st : state Int <: e}}
+      -> Int
+      -> Int
+      -> Co e Int
+paths d acc =
+  if d == 0
+  then (do
+        s <- get
+        put ((s * 31 + acc) % 1009)
+        pure acc)
+  else (do
+        b <- flipC
+        paths (d - 1) (if b then acc * 2 + 1 else acc * 2))
+
+getKept : Co (state Int) Int
+getKept = get (ev := here (state Int))
+
+putKept : Int -> Co (state Int) Unit
+putKept s = put (ev := here (state Int)) s
+
+-- | each choice resumed with True, then False, what the two collect
+-- | appended; the state's operations done again, out to `passing`
+everyPath : Handler (flips <+> state Int)
+everyPath =
+  { M = \a -> (a -> Co (state Int) (List Int)) -> Co (state Int) (List Int)
+  , ret = \x c -> c x
+  , bind = \m k c -> m (\x -> k x c)
+  , malg = \p c -> case p of
+      InL (Flip k) ->
+        bind (c (k True)) (\xs -> bind (c (k False)) (\ys -> val (xs ++ ys)))
+      InR (Get k) -> bind getKept (\s -> c (k s))
+      InR (Put s x) -> bind (putKept s) (\u -> c x)
+  }
+
+sumPaths : Int -> List Int -> Int
+sumPaths a Nil = a
+sumPaths a (x :: xs) = sumPaths (a + x) xs
+
+-- | the paths' sum, and the state they leave
+explored : Pair Int Int
+explored = case handle
+    passing
+    (handle
+       everyPath
+       (paths (ch := \p -> InL p) (st := \p -> InR p) 9 0)
+       (\x -> val [x]))
+    1 of
+  MkOut xs s -> MkPair (sumPaths 0 xs) s
