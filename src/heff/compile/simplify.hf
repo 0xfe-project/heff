@@ -96,6 +96,7 @@ type St =
   , plain : Map.Map String Plain
   , sp : Specs
   , kp : Keep
+  , unrolled : Map.Map String Int
   }
 
 withSp : Specs -> St -> St
@@ -109,6 +110,7 @@ withSp p s =
   , plain = s.plain
   , sp = p
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withSupply : Int -> St -> St
@@ -122,6 +124,7 @@ withSupply n s =
   , plain = s.plain
   , sp = s.sp
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withFuel : Int -> St -> St
@@ -135,6 +138,7 @@ withFuel f s =
   , plain = s.plain
   , sp = s.sp
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withSafe : String -> St -> St
@@ -148,6 +152,7 @@ withSafe k s =
   , plain = s.plain
   , sp = s.sp
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withBase : String -> St -> St
@@ -161,6 +166,7 @@ withBase k s =
   , plain = s.plain
   , sp = s.sp
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withPlain : String -> Plain -> St -> St
@@ -174,6 +180,7 @@ withPlain k p s =
   , plain = Map.insert s.plain k p
   , sp = s.sp
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withDefs : Map.Map String IR.Expr -> St -> St
@@ -187,6 +194,7 @@ withDefs d s =
   , plain = s.plain
   , sp = s.sp
   , kp = s.kp
+  , unrolled = s.unrolled
   }
 
 withKp : Keep -> St -> St
@@ -200,6 +208,21 @@ withKp k s =
   , plain = s.plain
   , sp = s.sp
   , kp = k
+  , unrolled = s.unrolled
+  }
+
+withUnrolled : Map.Map String Int -> St -> St
+withUnrolled u s =
+  { supply = s.supply
+  , fuel = s.fuel
+  , defs = s.defs
+  , safe = s.safe
+  , base = s.base
+  , total = s.total
+  , plain = s.plain
+  , sp = s.sp
+  , kp = s.kp
+  , unrolled = u
   }
 
 type M a = St -> Pair a St
@@ -290,6 +313,7 @@ restore saved st =
   , plain = st.plain
   , sp = st.sp
   , kp = st.kp
+  , unrolled = st.unrolled
   }
 
 copyTake : St -> Pair IR.Expr Int -> Pair IR.Expr St
@@ -1821,13 +1845,84 @@ copyCall r f g argv = do
   mb <- fueled (worthIt s.sp.kinds argv (knownCopy s g argv))
   copyInlined r (copyBudget s.sp.kinds mb argv) f argv mb
 
--- | a known definition called: inlined if it may be -- or a copy
+-- Unrolling: a definition calling itself is not inlined -- but called
+-- with a tag for a parameter it matches on, one round of it is: the arm
+-- the tag chooses (`prunedCopy`), its calls of itself left calls, each
+-- unrolled in turn if it is given a tag too.  A stream's `bind` given
+-- the stream a handler's clause has just built, `bind (More v rest) k`,
+-- comes to `More v (\u -> bind (rest u) k)`, `rest` known: the tag built
+-- to be taken apart at once is not built.  How big the round may be,
+-- and how many times one definition is unrolled in what is simplified
+-- (a definition, a copy), are held small: a round of a bigger loop
+-- copied seldom pays.
+
+-- | the most a definition's round may be, counting the arms the tags
+-- | given choose alone; and the most times one definition is unrolled
+-- | in what is simplified
+unrollMax : Int
+unrollMax = 40
+
+unrollsEach : Int
+unrollsEach = 8
+
+-- (the body's first computation is a match on `x`, past bindings)
+matchesFirst : String -> IR.Expr -> Bool
+matchesFirst x (EMatch sc _) = isVar x sc
+matchesFirst x (ELet _ _ b) = matchesFirst x b
+matchesFirst x _ = False
+
+-- (a parameter given a tag, the body a match on it)
+tagMatched : IR.Expr -> List String -> List IR.Expr -> Bool
+tagMatched b (Cons x xs) (Cons a argv) =
+  (tagged a && matchesFirst x b) || tagMatched b xs argv
+tagMatched b _ _ = False
+
+unrollsOf : St -> String -> Int
+unrollsOf s g = fromMaybe 0 (Map.lookup s.unrolled g)
+
+-- (`g`, `b`, to unroll where it is called so: it calls itself, and is
+-- given all it takes, a tag for a parameter it matches on)
+unrollOf : St -> String -> List IR.Expr -> Maybe IR.Expr -> Maybe IR.Expr
+unrollOf s g argv (Just (ELam xs b)) =
+  if List.length argv >= List.length xs
+     && unrollsOf s g < unrollsEach
+     && tagMatched b xs argv
+     && elemStr g (IR.globalsIn b)
+     && not (prunedAbove unrollMax (ELam xs b) argv)
+  then Just (ELam xs b)
+  else Nothing
+unrollOf s g argv _ = Nothing
+
+-- (one more unrolling of `g`)
+unrolledOne : String -> M Unit
+unrolledOne g = \s ->
+    MkPair
+      MkUnit
+      (withUnrolled (Map.insert s.unrolled g (unrollsOf s g + 1)) s)
+
+-- (a round unrolled, if no bigger than a little; or a copy called)
+unrolled : SK -> IR.Expr -> String -> List IR.Expr -> Maybe IR.Expr -> M IR.Expr
+unrolled r f g argv (Just b) = do
+  u <- unrolledOne g
+  attempt (mkApp f argv) (r.applyTo (prunedCopy b argv) argv)
+unrolled r f g argv Nothing = copyCall r f g argv
+
+-- | a definition not inlined, called: a round of it unrolled, if it
+-- | may be -- or a copy
+unrollCall : SK -> IR.Expr -> String -> List IR.Expr -> M IR.Expr
+unrollCall r f g argv = do
+  s <- get
+  mb <- fueled (unrollOf s g argv (Map.lookup s.sp.all g))
+  unrolled r f g argv mb
+
+-- | a known definition called: inlined if it may be -- or unrolled, or
+-- | a copy
 callOf : SK -> IR.Expr -> String -> List IR.Expr -> Maybe IR.Expr -> M IR.Expr
 callOf r f g argv (Just (ELam xs _)) =
   if allOpaque argv && List.length xs == List.length argv
   then plainCall r f g argv
   else inlineCall r f g argv
-callOf r f g argv Nothing = copyCall r f g argv
+callOf r f g argv Nothing = unrollCall r f g argv
 callOf r f g argv _ = inlineCall r f g argv
 
 -- | a lambda applied: its parameters bound to the arguments (not
@@ -2300,8 +2395,9 @@ depthOf ds g args =
     (Cons g (List.concatMap IR.globalsIn args))
 
 -- What a definition is simplified with is its own: its fuel, the calls
--- found plain (`plain`) and how many copies it may ask for are made anew
--- for each definition and each copy -- so that what it comes to depends
+-- found plain (`plain`), how many copies it may ask for and how many
+-- times it may unroll each definition are made anew for each definition
+-- and each copy -- so that what it comes to depends
 -- on what it uses, not on what was simplified before it.
 
 -- (a definition's own: fuel, no call found plain for another, and no
@@ -2327,6 +2423,7 @@ ownSt = \s ->
           , off = s.sp.off
           }
       , kp = s.kp
+      , unrolled = Map.empty
       }
 
 -- (asking for copies off, or on again)
@@ -2346,8 +2443,8 @@ setOff o = \s ->
          s)
 
 -- (back to what `saved` was simplifying: its fuel, the calls it found
--- plain, how many copies it asked for and whether it asks for more --
--- the rest learnt kept)
+-- plain, how many copies it asked for and whether it asks for more, what
+-- it unrolled -- the rest learnt kept)
 backTo : St -> M Unit
 backTo saved = \s ->
     MkPair
@@ -2369,6 +2466,7 @@ backTo saved = \s ->
           , off = saved.sp.off
           }
       , kp = s.kp
+      , unrolled = saved.unrolled
       }
 
 -- The cache
@@ -4119,6 +4217,7 @@ initSt n0 sg kp =
       , off = False
       }
   , kp = kp
+  , unrolled = Map.empty
   }
 
 -- | each definition, in order, simplified; what is inlined is taken
