@@ -228,13 +228,54 @@ liftGo k d acc e = MkPair e acc
 lk : LiftK
 lk = { go = \d acc e -> liftGo lk d acc e }
 
--- | a definition, and the globals of its local definitions
+-- Which come first
+--------------------------------------------------------------------------------
+
+-- A definition is simplified knowing those before it.  A local loop --
+-- one calling itself, `for`'s and `while`'s -- comes before the
+-- definition it is of, with what it calls of the others: so that where
+-- it is called it is known, and a copy of it made for what it is given
+-- there (`for`'s `next`, the step of what it goes through), the step
+-- then put in it.  The others come after, as they were.
+
+-- (whether one of `keys` is called in it)
+callsAny : List String -> IR.Def -> Bool
+callsAny keys ld =
+  List.any (\g -> List.elemBy strEq g keys) (IR.globalsIn ld.body)
+
+-- (the keys of the local definitions that come first: a loop, and those
+-- one calls; each is after what it calls, so the last first)
+earlyGo : List String -> List IR.Def -> List String
+earlyGo keys Nil = keys
+earlyGo keys (ld :: rest) =
+  if List.elemBy strEq ld.key keys || callsAny [ld.key] ld
+  then earlyGo (ld.key :: IR.appendI (IR.globalsIn ld.body) keys) rest
+  else earlyGo keys rest
+
+isEarly : List String -> IR.Def -> Bool
+isEarly keys ld = List.elemBy strEq ld.key keys
+
+-- | the local definitions (the last first) and the definition, in the
+-- | order they are simplified: the loops and what they call, the
+-- | definition, the others
+-- | >>> List.map (\(d : IR.Def) -> d.key) (ordered [IR.mkDef "f.go$1" "go" (EApp (EGlobal "f.go$1") Nil), IR.mkDef "f.h$0" "h" (EInt 1)] (IR.mkDef "f" "f" (EInt 0)))
+-- | ["f.go$1", "f", "f.h$0"]
+ordered : List IR.Def -> IR.Def -> List IR.Def
+ordered out d =
+  IR.appendI
+    (List.reverse (List.keepIf (isEarly (earlyGo Nil out)) out))
+    (d
+     :: List.reverse
+       (List.keepIf (\ld -> not (isEarly (earlyGo Nil out) ld)) out))
+
+-- | a definition, and the globals of its local definitions, in the order
+-- | they are simplified (`ordered`)
 liftDef : IR.Def -> List IR.Def
 liftDef d = case lk.go d { out = Nil, n = 0 } d.body of
-  MkPair b acc -> IR.mkDef d.key d.name b :: List.reverse acc.out
+  MkPair b acc -> ordered acc.out (IR.mkDef d.key d.name b)
 
 -- | every local definition of the program a global of its own
 -- | >>> List.map (\(d : IR.Def) -> d.body) (liftProgram [IR.mkDef "m.f" "f" (ELam ["n"] (ELet "go" (EFix "go" (ELam ["i"] (EApp (EVar "go") [EVar "n"]))) (EApp (EVar "go") [EInt 0])))])
--- | Cons (ELam (Cons "n" Nil) (ELet "go" (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (EApp (EVar "go") (Cons (EInt 0) Nil)))) (Cons (ELam (Cons "n" (Cons "i" Nil)) (EApp (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (Cons (EVar "n") Nil))) Nil)
+-- | Cons (ELam (Cons "n" (Cons "i" Nil)) (EApp (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (Cons (EVar "n") Nil))) (Cons (ELam (Cons "n" Nil) (ELet "go" (EApp (EGlobal "m.f.go$0") (Cons (EVar "n") Nil)) (EApp (EVar "go") (Cons (EInt 0) Nil)))) Nil)
 liftProgram : List IR.Def -> List IR.Def
 liftProgram defs = List.concatMap liftDef defs
