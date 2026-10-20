@@ -3113,6 +3113,17 @@ HEFF_FN unsigned heff_arr_kind_of(V x) {
   return IS_OBJ(x) && OBJ(x)->kind == K_FLT ? HEFF_ARR_F64 : HEFF_ARR_V;
 }
 
+// (whether the array keeps its elements as one built of `x` would: a
+// `map` of it may write each element where it read it, of the same
+// kind (heff.compile.arrayloops))
+HEFF_FAST V heff_arrayKeepsAs_lent(V a, V x, int give) {
+  V b = heff_bool(HEFF_ARR_KIND((Arr *)a) == heff_arr_kind_of(x));
+  HEFF_GIVEN(give, 0, a);
+  HEFF_GIVEN(give, 1, x);
+  return b;
+}
+HEFF_FN V heff_arrayKeepsAs(V a, V x) { return heff_arrayKeepsAs_lent(a, x, 3); }
+
 // (`r`'s elements from `from`, `n` of them, put at `at` of `s`, each
 // counted: as `s` keeps them, if it keeps them otherwise)
 HEFF_FN void heff_arr_move(Arr *s, int64_t at, Arr *r, int64_t from, int64_t n) {
@@ -3253,7 +3264,8 @@ HEFF_FAST double heff_arrayIndexIn_f64(V a, V i) { return heff_arrayIndexIn_f64_
     V b = heff_bool(HEFF_ARR_KIND(((Arr *)a)) == K);                                   \
     HEFF_GIVEN(give, 0, a);                                                    \
     return b;                                                                  \
-  }
+  }                                                                            \
+  HEFF_FAST V heff_arrayKeeps_##S(V a) { return heff_arrayKeeps_##S##_lent(a, 1); }
 #define HEFF_ARR_INDEXES(S, T, K) HEFF_ARR_INDEX(S, T, K) HEFF_ARR_INDEX_IN(S, T, K)
 HEFF_ARR_INDEXES(i64, int64_t, HEFF_ARR_I64)
 HEFF_ARR_INDEXES(u64, uint64_t, HEFF_ARR_U64)
@@ -3264,6 +3276,14 @@ HEFF_ARR_INDEXES(u16, uint16_t, HEFF_ARR_U16)
 HEFF_ARR_INDEXES(i8, int8_t, HEFF_ARR_I8)
 HEFF_ARR_INDEXES(u8, uint8_t, HEFF_ARR_U8)
 HEFF_ARR_INDEXES(f32, float, HEFF_ARR_F32)
+// (... of `Float64`s: whether it keeps them flat, as one built of them
+// does, if it has an element (heff.compile.arrayloops))
+HEFF_FAST V heff_arrayKeeps_f64_lent(V a, int give) {
+  V b = heff_bool(HEFF_ARR_KIND((Arr *)a) == HEFF_ARR_F64);
+  HEFF_GIVEN(give, 0, a);
+  return b;
+}
+HEFF_FAST V heff_arrayKeeps_f64(V a) { return heff_arrayKeeps_f64_lent(a, 1); }
 
 // (`set` but where the array is held only here and keeps `x` as it is:
 // out of range, the array as it is; held elsewhere too, a copy, `x` at
