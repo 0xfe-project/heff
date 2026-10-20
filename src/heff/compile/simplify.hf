@@ -831,6 +831,18 @@ builtBy all (EApp (EGlobal g) argv) =
   && builds g (List.length argv) (Map.lookup all g)
 builtBy all _ = False
 
+-- (a record of functions, every field a lambda)
+recordOfFns : Maybe IR.Expr -> Bool
+recordOfFns (Just (ERecord fs _)) =
+  not (List.null fs) && IR.allI (List.map lamField fs)
+recordOfFns _ = False
+
+-- | a handler: a record of functions, a global that is one, or one
+-- | built by a global -- not any function a global is
+handlerOf : Map.Map String IR.Expr -> IR.Expr -> Bool
+handlerOf all (EGlobal g) = recordOfFns (Map.lookup all g)
+handlerOf all e = handlerLike e || builtBy all e
+
 -- (the field, if it is a closed function)
 closedField : IR.Expr -> Maybe IR.Expr -> IR.Expr
 closedField e (Just v) = if closedKnown v then v else e
@@ -1295,6 +1307,26 @@ recordSplit r x a b = do
   b' <- r.simp b
   pure (ELet x a b')
 
+-- A computation whose value is a function, bound and called at once
+-- given a handler -- `c = explore n z`, then `c hd k s`, only values
+-- built between -- is put where it is called: the computation and the
+-- call computed in the same order, and the call seen whole, a
+-- definition given more than it takes, a handler past its parameters
+-- (Calls handed a handler, below).
+
+-- (`b`'s first computation is `x` called given a handler, every
+-- argument a value: past values bound, in a value bound, or in what is
+-- matched on)
+calledFirst : Map.Map String IR.Expr -> String -> IR.Expr -> Bool
+calledFirst all x (EApp (EVar y) argv) =
+  strEq x y
+  && List.any (handlerOf all) argv
+  && IR.allI (List.map IR.isValue argv)
+calledFirst all x (ELet _ a b) =
+  calledFirst all x a || (IR.isValue a && calledFirst all x b)
+calledFirst all x (EMatch sc _) = calledFirst all x sc
+calledFirst all x _ = False
+
 -- | a binding, its value simplified: what could fail is computed where
 -- | it was, used or not.  A known function given fewer arguments than it
 -- | takes, some computing (`c = lPing (intOr 100000 rest)`), has those
@@ -1332,6 +1364,8 @@ letIn r x a b = do
     pure (letsOf (fst bound) e)
   else if p then letPure r x a b (occCountOf x b)
   else if partialApp s a then letSplit r x a b
+  else if calledFirst s.sp.all x b && occCountOf x b == 1
+  then r.simp (IR.subst (singletonM x a) b)
   else do
     b' <- r.simp b
     pure (bindOrSet x a b')
@@ -2056,20 +2090,39 @@ askedFor h b0 d = \s ->
          }
          s)
 
+-- (its calls of `g` as calls of the copy `h`, if they are of what it is
+-- a copy of -- not of a definition given more than it takes, whose
+-- calls of itself are given fewer: Calls handed a handler, below)
+selfOf : Bool
+       -> String
+       -> String
+       -> List IR.Expr
+       -> List Bool
+       -> IR.Expr
+       -> IR.Expr
+selfOf True g h pre marks b = Spec.selfTo g h pre marks b
+selfOf False g h pre marks b = b
+
 -- | the copy's body: its literals and the parameters left, the calls of
 -- | itself of it
-specBody : String -> String -> List Bool -> Shapes -> IR.Expr -> M IR.Expr
-specBody g h marks sh (ELam xs1 b1) = do
+specBody : Bool
+         -> String
+         -> String
+         -> List Bool
+         -> Shapes
+         -> IR.Expr
+         -> M IR.Expr
+specBody own g h marks sh (ELam xs1 b1) = do
   b2 <-
     substMarked
       marks
       xs1
       sh.args
-      (Spec.selfTo g h (List.map (\v -> EVar v) sh.vars) marks b1)
+      (selfOf own g h (List.map (\v -> EVar v) sh.vars) marks b1)
   pure
       (if List.null (appendL sh.vars (keepParams marks xs1)) then b2
        else ELam (appendL sh.vars (keepParams marks xs1)) b2)
-specBody g h marks sh lam1 = pure lam1
+specBody own g h marks sh lam1 = pure lam1
 
 -- Arity
 --------------------------------------------------------------------------------
@@ -2477,6 +2530,7 @@ knowing r b0 = do
 -- | known by kept (to make it from, too) -- as the cache keeps it, if it
 -- | does
 ask : SK
+    -> Bool
     -> String
     -> List String
     -> IR.Expr
@@ -2485,7 +2539,7 @@ ask : SK
     -> String
     -> Int
     -> M Unit
-ask r g xs b marks sh h d = do
+ask r own g xs b marks sh h d = do
   s <- get
   u0 <- touch h (copyVer s.kp.vers h g (markedOf marks sh.args))
   if Map.member s.sp.recipes h then pure MkUnit
@@ -2494,7 +2548,7 @@ ask r g xs b marks sh h d = do
     if hit then pure MkUnit
     else do
       lam1 <- copy (ELam xs b)
-      b0 <- specBody g h marks sh lam1
+      b0 <- specBody own g h marks sh lam1
       b1 <- knowing r b0
       u <- askedFor h b1 d
       u2 <- keepWith (freshTo h)
@@ -2502,6 +2556,7 @@ ask r g xs b marks sh h d = do
 
 -- (... named `h`, `d` deep in copies of copies)
 specNamed : SK
+          -> Bool
           -> String
           -> List String
           -> IR.Expr
@@ -2511,10 +2566,10 @@ specNamed : SK
           -> String
           -> Int
           -> M IR.Expr
-specNamed r g xs b argv marks sh h d =
+specNamed r own g xs b argv marks sh h d =
   if d > specDepth then pure (mkApp (EGlobal g) argv)
   else do
-    u <- ask r g xs b marks sh h d
+    u <- ask r own g xs b marks sh h d
     -- (the copy called, and a copy of it asked for if it may be, for
     -- what it takes now)
     r.applyTo (EGlobal h) (appendL sh.holes (Spec.dropAt marks argv))
@@ -2523,6 +2578,7 @@ specNamed r g xs b argv marks sh h d =
 -- for is not made: what it computes, once, would be computed at each
 -- call)
 specShaped : SK
+           -> Bool
            -> String
            -> List String
            -> IR.Expr
@@ -2530,11 +2586,12 @@ specShaped : SK
            -> List Bool
            -> Shapes
            -> M IR.Expr
-specShaped r g xs b argv marks sh = \s ->
+specShaped r own g xs b argv marks sh = \s ->
     if List.null (keepParams marks xs) && not (List.null sh.vars)
     then MkPair (mkApp (EGlobal g) argv) s
     else specNamed
         r
+        own
         g
         xs
         b
@@ -2546,13 +2603,14 @@ specShaped r g xs b argv marks sh = \s ->
         s
 
 specMarked : SK
+           -> Bool
            -> String
            -> List String
            -> IR.Expr
            -> List IR.Expr
            -> List Bool
            -> M IR.Expr
-specMarked r g xs b argv marks =
+specMarked r own g xs b argv marks =
   if not (List.any (\m -> m) marks)
      -- (a copy taking nothing is a value: calling itself, only where that
      -- is under a lambda -- a knot of judgments, `uk w ms uf` -- not one
@@ -2563,7 +2621,7 @@ specMarked r g xs b argv marks =
   then pure (mkApp (EGlobal g) argv)
   else do
     sh <- shapesOf marks argv
-    specShaped r g xs b argv marks sh
+    specShaped r own g xs b argv marks sh
 
 -- (the marks, and those of the arguments made lambdas, as many as the
 -- marks)
@@ -2592,6 +2650,7 @@ specKnown r g xs b argv made = do
   then pure (mkApp (EGlobal g) argv)
   else specMarked
       r
+      True
       g
       xs
       b
@@ -2780,19 +2839,94 @@ specLam r g xs b argv = do
     bound <- etaFor r g xs b argv
     specBound r g xs b argv bound
 
+-- | whether it is still the call of `g` it was
+stillCall : String -> IR.Expr -> Bool
+stillCall g (EApp (EGlobal h) _) = strEq g h
+stillCall g _ = False
+
+-- Calls handed a handler
+--------------------------------------------------------------------------------
+
+-- A definition not inlined -- it calls itself, or is too big -- given
+-- more arguments than it takes, a handler among those past its
+-- parameters: `explore n z hd k s`, the computation `explore n z` built
+-- and run at once by the handler outside, `hd`.  A copy of `explore`
+-- for what it takes knows nothing of `hd`: what it comes to is a
+-- closure, run by `hd`'s clauses called as closures in turn.  Called
+-- instead is a copy of `\xs ys -> b ys`, made for the known arguments
+-- as any copy is, the handler among them: it is given what the body
+-- comes to where that is built, its clauses known there.  It computes
+-- what the call did, in the same order.
+--
+-- So a handler outside is fused through one inside it whose clause
+-- calls its continuation more than once (#112): each call of the
+-- continuation builds the rest of the computation, run by the handler
+-- outside -- in the copy, a call of the definition handed the handler,
+-- which is a call of the same copy.  (The copy's calls of the
+-- definition are given fewer arguments than the copy takes: not of the
+-- copy, `selfOf`, but each found again where the handler is handed to
+-- it.)
+--
+-- Only where no copy is made for what the definition takes: one that
+-- is, and takes the handler (`raise`), is asked for a copy of its own
+-- for it -- a second copy for both would copy the definition, and all
+-- it calls, twice over.  And only of a definition no bigger than one
+-- put where a handler is handed it (`handedSize`): every bigger one, a
+-- judgment of a knot, copied for each handler, was the elaborator
+-- copied whole, for no speed.
+
+-- (... made for the marked arguments: not for every one, a copy taking
+-- nothing being a value, the computation run once where it is defined)
+pastMarked : SK
+           -> String
+           -> List String
+           -> IR.Expr
+           -> List IR.Expr
+           -> List Bool
+           -> M IR.Expr
+pastMarked r g xs b argv marks =
+  if List.all (\m -> m) marks then pure (mkApp (EGlobal g) argv)
+  else specMarked r False g xs b argv marks
+
+-- (a copy for the handler past the parameters, the parameters marked as
+-- a copy's are; or the call as it was)
+specPast : SK -> String -> List String -> IR.Expr -> List IR.Expr -> M IR.Expr
+specPast r g xs b argv = do
+  s <- get
+  if s.sp.off || s.sp.count >= specLimit then pure (mkApp (EGlobal g) argv)
+  else do
+    ys <- freshParams (List.length argv - List.length xs)
+    pastMarked
+        r
+        g
+        (appendL xs ys)
+        (EApp b (List.map (\y -> EVar y) ys))
+        argv
+        (appendL
+           (marksOf s.sp.kinds (knownMore s argv g) g xs b argv)
+           (List.map (handlerOf s.sp.all) (dropL (List.length xs) argv)))
+
+-- (... handed a handler: a copy for what it takes, as for any call;
+-- where none is made, a copy taking the handler too)
+specHanded : SK -> String -> List String -> IR.Expr -> List IR.Expr -> M IR.Expr
+specHanded r g xs b argv = do
+  e <- specLam r g xs b argv
+  s <- get
+  if stillCall g e
+     && not (IR.sizeAbove handedSize b)
+     && List.length argv > List.length xs
+     && List.any (handlerOf s.sp.all) (dropL (List.length xs) argv)
+  then specPast r g xs b argv
+  else pure e
+
 -- | a call of a definition not inlined: of a copy of it, if one may be
 -- | made
 trySpec : SK -> String -> List IR.Expr -> M IR.Expr
 trySpec r g argv = do
   s <- get
   case Map.lookup s.sp.all g of
-    Just (ELam xs b) -> specLam r g xs b argv
+    Just (ELam xs b) -> specHanded r g xs b argv
     _ -> pure (mkApp (EGlobal g) argv)
-
--- | whether it is still the call of `g` it was
-stillCall : String -> IR.Expr -> Bool
-stillCall g (EApp (EGlobal h) _) = strEq g h
-stillCall g _ = False
 
 specAfter : SK -> String -> List IR.Expr -> IR.Expr -> M IR.Expr
 specAfter r g argv e = if stillCall g e then trySpec r g argv else pure e
