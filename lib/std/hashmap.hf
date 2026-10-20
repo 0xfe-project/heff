@@ -135,11 +135,13 @@ collisionOf h ps = Collision h ps
 
 -- A walk down the trie gives back the trie changed and how many keys it
 -- gained (1, none, or -1), or the value it took out, so that the map's
--- count is kept in the same walk.  A node's child walked into is taken out of its array first,
--- `Vacant` put there, so that nothing but the walk holds it and it is
--- changed in place; the node's bitmap and children so holed are handed
--- down with it, and the child changed is put back in them below, where
--- the walk gives back.
+-- count is kept in the same walk.  A node's child walked into is taken
+-- out of its array first, `Vacant` put there, so that nothing but the
+-- walk holds it and it is changed in place: the children so holed are
+-- handed down with it, and back, and the child changed is put back in
+-- them where the walk gives back, the node built again in its own cell
+-- and each step's result taken apart where it is given -- so that a
+-- value changed builds nothing.
 
 -- (the pairs of one hash, as a node, `n` of them before)
 pairsGrown : {k v : Type}
@@ -148,17 +150,6 @@ pairsGrown : {k v : Type}
            -> List (Pair k v)
            -> Pair (Trie k v) Int
 pairsGrown h n ps = MkPair (collisionOf h ps) (List.length ps - n)
-
--- (a node of the bitmap `bm` and the children `holed`, `Vacant` at `i`,
--- the trie changed put there)
-placed : {k v a : Type}
-       -> Int
-       -> Array (Trie k v)
-       -> Int
-       -> Pair (Trie k v) a
-       -> Pair (Trie k v) a
-placed bm holed i (MkPair child d) =
-  MkPair (Branch bm (arraySet holed i child)) d
 
 -- (the pairs of one hash, `key` bound to `value` or to `f value old`)
 pairsWith : {k v : Type}
@@ -211,8 +202,14 @@ budded h s i key (Just v) bm children =
     (Branch (or bm (bitAt h s)) (Array.insertAt children i (Leaf h key v)))
     1
 
--- (`update` at a node `s` bits down, the child at `i` of a node of the
--- bitmap `pbm` and the children `holed`, `Vacant` there)
+-- (what a walk gives back: the node it was given, changed; what it found
+-- (how many keys it gained, the value it took out); and the array it was
+-- handed, as it was)
+data Walked k v a = MkWalked (Trie k v) a (Array (Trie k v))
+
+-- (`update` at a node `s` bits down, `holed` handed down and back: the
+-- children of the node above, this node taken out of them, so that they
+-- are taken out before the walk goes down, not where it gives back)
 insertAt : {k v : Type}
          -> (k -> k -> Bool)
          -> (v -> v -> v)
@@ -220,53 +217,26 @@ insertAt : {k v : Type}
          -> Int
          -> k
          -> v
-         -> Int
-         -> Array (Trie k v)
-         -> Int
          -> Trie k v
-         -> Pair (Trie k v) Int
-insertAt eq f h s key value pbm holed i (Branch bm children) =
+         -> Array (Trie k v)
+         -> Walked k v Int
+insertAt eq f h s key value (Branch bm children) holed =
   let j = trieSlot bm h s
   in if j < 0
-  then placed pbm holed i (budded h s (-1 - j) key (Just value) bm children)
+  then MkWalked
+      (Branch
+         (or bm (bitAt h s))
+         (Array.insertAt children (-1 - j) (Leaf h key value)))
+      1
+      holed
   else (let child = arrayIndex children j
-        in placed
-          pbm
-          holed
-          i
-          (insertAt
-             eq
-             f
-             h
-             (s + 5)
-             key
-             value
-             bm
-             (arraySet children j Vacant)
-             j
-             child))
-insertAt eq f h s key value pbm holed i node =
-  placed pbm holed i (putAt eq f h s key value node)
-
--- (`update` at the root)
-insertAtRoot : {k v : Type}
-             -> (k -> k -> Bool)
-             -> (v -> v -> v)
-             -> Int
-             -> k
-             -> v
-             -> Trie k v
-             -> Pair (Trie k v) Int
-insertAtRoot eq f h key value (Branch bm children) =
-  let j = trieSlot bm h 0
-  in if j < 0 then budded h 0 (-1 - j) key (Just value) bm children
-  else (let child = arrayIndex children j
-        in insertAt eq f h 5 key value bm (arraySet children j Vacant) j child)
-insertAtRoot eq f h key value node = putAt eq f h 0 key value node
-
--- (a map of `n` keys, its trie as a walk changed it)
-counted : {k v : Type} -> Int -> Pair (Trie k v) Int -> HashMap k v
-counted n (MkPair t d) = MkHashMap (n + d) t
+        in let walked : Walked k v Int =
+          insertAt eq f h (s + 5) key value child (arraySet children j Vacant)
+        in (case walked of
+            MkWalked changed d rest ->
+              MkWalked (Branch bm (arraySet rest j changed)) d holed))
+insertAt eq f h s key value node holed = case putAt eq f h s key value node of
+  MkPair changed d -> MkWalked changed d holed
 
 -- | The map with `k` bound to `v`, or, where it is bound, to `f v old`
 -- | (Haskell's `insertWith`): a value changed in one walk down the trie.
@@ -279,7 +249,10 @@ update : {k v : Type}
        -> (v -> v -> v)
        -> HashMap k v
 update (MkHashMap n t) key value f =
-  counted n (insertAtRoot equal f (hash key) key value t)
+  let walked : Walked k v Int =
+    insertAt equal f (hash key) 0 key value t Array.empty
+  in (case walked of
+      MkWalked changed d _ -> MkHashMap (n + d) changed)
 
 -- | The map with `k` bound to `v` (instead of what it was, if it was).
 insert : {k v : Type}
@@ -290,7 +263,10 @@ insert : {k v : Type}
        -> v
        -> HashMap k v
 insert (MkHashMap n t) key value =
-  counted n (insertAtRoot equal (\new old -> new) (hash key) key value t)
+  let walked : Walked k v Int =
+    insertAt equal (\new old -> new) (hash key) 0 key value t Array.empty
+  in (case walked of
+      MkWalked changed d _ -> MkHashMap (n + d) changed)
 
 -- (the value of `key` among the pairs of one hash)
 pairsLookup : {k v : Type}
@@ -319,6 +295,11 @@ lookupAt eq h s key (Branch bm children) =
   in if i < 0 then Nothing
   else lookupAt eq h (s + 5) key (arrayIndex children i)
 
+-- (a map's trie: a `lookup`'s walk given it as an argument, so that a
+-- match on what the walk finds takes it apart where it is given)
+trieOf : {k v : Type} -> HashMap k v -> Trie k v
+trieOf (MkHashMap n t) = t
+
 -- | What `k` is bound to, if it is.
 lookup : {k v : Type}
        -> {{hashing : Hash k}}
@@ -326,7 +307,7 @@ lookup : {k v : Type}
        -> HashMap k v
        -> k
        -> Maybe v
-lookup (MkHashMap n t) key = lookupAt equal (hash key) 0 key t
+lookup m key = lookupAt equal (hash key) 0 key (trieOf m)
 
 -- (the one child of a node: a leaf or keys of one hash, which may stand
 -- for the node, at any level; or a node, which may not, its bits being
@@ -344,21 +325,10 @@ shrunk bm children =
   then lone (arrayIndex children 0) (Branch bm children)
   else Branch bm children
 
--- (a node `s` bits down of the bitmap `bm` and the children `holed`,
--- `Vacant` at `i`, where the hash `h` led, the trie changed put there:
--- gone where it is `Vacant`, and only then its bit worked out)
-rebranched : {k v a : Type}
-           -> Int
-           -> Int
-           -> Int
-           -> Array (Trie k v)
-           -> Int
-           -> Pair (Trie k v) a
-           -> Pair (Trie k v) a
-rebranched h s bm holed i (MkPair Vacant d) =
-  MkPair (shrunk (xor bm (bitAt h s)) (Array.removeAt holed i)) d
-rebranched h s bm holed i (MkPair child d) =
-  MkPair (Branch bm (arraySet holed i child)) d
+-- (whether a node is none: a child the walk emptied)
+vacant : {k v : Type} -> Trie k v -> Bool
+vacant Vacant = True
+vacant node = False
 
 -- (the pairs of one hash, `key`'s gone)
 pairsWithout : {k v : Type}
@@ -389,55 +359,33 @@ removedFrom eq h key (Collision h2 ps) =
   else MkPair (Collision h2 ps) Nothing
 removedFrom eq h key node = MkPair node Nothing
 
--- (`remove` at a node `s` bits down, the child at `i` of a node of the
--- bitmap `pbm` and the children `holed`, `Vacant` there)
+-- (`remove` at a node `s` bits down, `holed` handed down and back as
+-- `insertAt`'s: a child emptied is gone from the node, and only then its
+-- bit worked out)
 deleteAt : {k v : Type}
          -> (k -> k -> Bool)
          -> Int
          -> Int
          -> k
-         -> Int
-         -> Array (Trie k v)
-         -> Int
          -> Trie k v
-         -> Pair (Trie k v) (Maybe v)
-deleteAt eq h s key pbm holed i (Branch bm children) =
+         -> Array (Trie k v)
+         -> Walked k v (Maybe v)
+deleteAt eq h s key (Branch bm children) holed =
   let j = trieSlot bm h s
-  in if j < 0
-  then rebranched h (s - 5) pbm holed i (MkPair (Branch bm children) Nothing)
+  in if j < 0 then MkWalked (Branch bm children) Nothing holed
   else (let child = arrayIndex children j
-        in rebranched
-          h
-          (s - 5)
-          pbm
-          holed
-          i
-          (deleteAt eq h (s + 5) key bm (arraySet children j Vacant) j child))
-deleteAt eq h s key pbm holed i node =
-  rebranched h (s - 5) pbm holed i (removedFrom eq h key node)
-
--- (`remove` at the root)
-deleteAtRoot : {k v : Type}
-             -> (k -> k -> Bool)
-             -> Int
-             -> k
-             -> Trie k v
-             -> Pair (Trie k v) (Maybe v)
-deleteAtRoot eq h key (Branch bm children) =
-  let j = trieSlot bm h 0
-  in if j < 0 then MkPair (Branch bm children) Nothing
-  else (let child = arrayIndex children j
-        in deleteAt eq h 5 key bm (arraySet children j Vacant) j child)
-deleteAtRoot eq h key node = removedFrom eq h key node
-
--- (a map of `n` keys, a key's binding taken out of its trie, if it was
--- there)
-taken : {k v : Type}
-      -> Int
-      -> Pair (Trie k v) (Maybe v)
-      -> Pair (Maybe v) (HashMap k v)
-taken n (MkPair t Nothing) = MkPair Nothing (MkHashMap n t)
-taken n (MkPair t (Just v)) = MkPair (Just v) (MkHashMap (n - 1) t)
+        in let walked : Walked k v (Maybe v) =
+          deleteAt eq h (s + 5) key child (arraySet children j Vacant)
+        in (case walked of
+            MkWalked changed taken rest ->
+              if vacant changed
+              then MkWalked
+                  (shrunk (xor bm (bitAt h s)) (Array.removeAt rest j))
+                  taken
+                  holed
+              else MkWalked (Branch bm (arraySet rest j changed)) taken holed))
+deleteAt eq h s key node holed = case removedFrom eq h key node of
+  MkPair changed taken -> MkWalked changed taken holed
 
 -- | What `k` was bound to, if it was, and the map without it (Rust's
 -- | `remove`): a delete that says whether the key was there, in one walk
@@ -448,7 +396,13 @@ remove : {k v : Type}
        -> HashMap k v
        -> k
        -> Pair (Maybe v) (HashMap k v)
-remove (MkHashMap n t) key = taken n (deleteAtRoot equal (hash key) key t)
+remove (MkHashMap n t) key =
+  let walked : Walked k v (Maybe v) =
+    deleteAt equal (hash key) 0 key t Array.empty
+  in (case walked of
+      MkWalked changed Nothing _ -> MkPair Nothing (MkHashMap n changed)
+      MkWalked changed (Just v) _ ->
+        MkPair (Just v) (MkHashMap (n - 1) changed))
 
 -- | The map without `k` (as it was, if `k` was not in it; `remove` says
 -- | which).
@@ -504,54 +458,35 @@ alteredAt eq f h s key (Collision h2 ps) =
   else pairsGrown h2 (List.length ps) (pairsAltered eq f key ps)
 alteredAt eq f h s key node = MkPair node 0
 
--- (`alter` at a node `s` bits down, the child at `i` of a node of the
--- bitmap `pbm` and the children `holed`, `Vacant` there)
+-- (`alter` at a node `s` bits down, `holed` handed down and back as
+-- `insertAt`'s)
 alterAt : {k v : Type}
         -> (k -> k -> Bool)
         -> (Maybe v -> Maybe v)
         -> Int
         -> Int
         -> k
-        -> Int
-        -> Array (Trie k v)
-        -> Int
         -> Trie k v
-        -> Pair (Trie k v) Int
-alterAt eq f h s key pbm holed i (Branch bm children) =
+        -> Array (Trie k v)
+        -> Walked k v Int
+alterAt eq f h s key (Branch bm children) holed =
   let j = trieSlot bm h s
   in if j < 0
-  then rebranched
-      h
-      (s - 5)
-      pbm
-      holed
-      i
-      (budded h s (-1 - j) key (f Nothing) bm children)
+  then (case budded h s (-1 - j) key (f Nothing) bm children of
+        MkPair changed d -> MkWalked changed d holed)
   else (let child = arrayIndex children j
-        in rebranched
-          h
-          (s - 5)
-          pbm
-          holed
-          i
-          (alterAt eq f h (s + 5) key bm (arraySet children j Vacant) j child))
-alterAt eq f h s key pbm holed i node =
-  rebranched h (s - 5) pbm holed i (alteredAt eq f h s key node)
-
--- (`alter` at the root)
-alterAtRoot : {k v : Type}
-            -> (k -> k -> Bool)
-            -> (Maybe v -> Maybe v)
-            -> Int
-            -> k
-            -> Trie k v
-            -> Pair (Trie k v) Int
-alterAtRoot eq f h key (Branch bm children) =
-  let j = trieSlot bm h 0
-  in if j < 0 then budded h 0 (-1 - j) key (f Nothing) bm children
-  else (let child = arrayIndex children j
-        in alterAt eq f h 5 key bm (arraySet children j Vacant) j child)
-alterAtRoot eq f h key node = alteredAt eq f h 0 key node
+        in let walked : Walked k v Int =
+          alterAt eq f h (s + 5) key child (arraySet children j Vacant)
+        in (case walked of
+            MkWalked changed d rest ->
+              if vacant changed
+              then MkWalked
+                  (shrunk (xor bm (bitAt h s)) (Array.removeAt rest j))
+                  d
+                  holed
+              else MkWalked (Branch bm (arraySet rest j changed)) d holed))
+alterAt eq f h s key node holed = case alteredAt eq f h s key node of
+  MkPair changed d -> MkWalked changed d holed
 
 -- | The map with `k` bound as `f` says, given what it is bound to, if it
 -- | is: to `f`'s value, or (`Nothing`) to none (Haskell's `alter`), in
@@ -563,7 +498,10 @@ alter : {k v : Type}
       -> k
       -> (Maybe v -> Maybe v)
       -> HashMap k v
-alter (MkHashMap n t) key f = counted n (alterAtRoot equal f (hash key) key t)
+alter (MkHashMap n t) key f =
+  let walked : Walked k v Int = alterAt equal f (hash key) 0 key t Array.empty
+  in (case walked of
+      MkWalked changed d _ -> MkHashMap (n + d) changed)
 
 -- (each key and its value in a trie, from `z`)
 foldlTrie : {k v b : Type} -> (b -> k -> v -> b) -> b -> Trie k v -> b
