@@ -3650,17 +3650,43 @@ HEFF_FN V heff_arrayInsertAt(V a, V i, V x) {
   return (V)s;
 }
 
-// (the element at `i` taken out, those after it one nearer; out of
-// range, the array as it is)
-HEFF_FN V heff_arrayRemoveAt(V a, V i) {
+// (the element at `i` taken out, those after it one nearer: moved down
+// in place where the array is held only here, its room kept, else a
+// copy; out of range, the array as it is.  Room is kept as a power of 2,
+// not as the length, which this lowers: so an array whose room is its
+// length is given a power of 2 first, the one at least its length -- its
+// own, if its length is one, else by `heff_arr_regrow`.  It never
+// shrinks the room)
+HEFF_FN __attribute__((noinline)) V heff_arr_remove_slow(V a, V i) {
   Arr *r = (Arr *)a;
   if (!heff_arr_in(r, i)) {
     heff_drop(i);
     return a;
   }
-  int64_t k = INT_OF(i);
-  if (HEFF_ARR_KIND(r) == HEFF_ARR_V && heff_alone(&r->h)) heff_drop(r->a[k]);
-  return (V)heff_arr_spread(a, k, 1, 0, r->n - 1, HEFF_ARR_KIND(r));
+  int64_t n = r->n, k = INT_OF(i);
+  if (!heff_alone(&r->h)) return (V)heff_arr_spread(a, k, 1, 0, n - 1, HEFF_ARR_KIND(r));
+  if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[k]);
+  if (!(r->h.tag >> HEFF_ARR_ROOM)) {
+    unsigned e = heff_arr_room(n);
+    if ((int64_t)1 << e == n) r->h.tag = (uint16_t)(HEFF_ARR_KIND(r) | e << HEFF_ARR_ROOM);
+    else r = heff_arr_regrow(r, e);
+  }
+  size_t w = heff_arr_width[HEFF_ARR_KIND(r)];
+  memmove((char *)r->a + (size_t)k * w, (char *)r->a + (size_t)(k + 1) * w, (size_t)(n - k - 1) * w);
+  r->n = n - 1;
+  return (V)r;
+}
+
+// (... the path where it is the last element of an array held only here
+// whose room is a power of 2 already: the length lowered)
+HEFF_FAST V heff_arrayRemoveAt(V a, V i) {
+  Arr *r = (Arr *)a;
+  if (r->n != 0 && i == MK_INT(r->n - 1) && (r->h.tag >> HEFF_ARR_ROOM) && heff_alone(&r->h)) {
+    r->n--;
+    if (HEFF_ARR_KIND(r) == HEFF_ARR_V) heff_drop(r->a[r->n]);
+    return a;
+  }
+  return heff_arr_remove_slow(a, i);
 }
 
 // (`x` after the last element: in the room after them where the array
@@ -3688,41 +3714,6 @@ HEFF_FAST V heff_arrayPush(V a, V x) {
     return a;
   }
   return heff_arr_push_slow(a, x);
-}
-
-// (the last element and the others, `Just` the pair of them -- the
-// array's length lowered where it is held only here, its room kept, else
-// a copy; of no elements, `Nothing`.  Room is kept as a power of 2, not
-// as the length, which a pop lowers: so an array whose room is its
-// length, popped in place, is given a power of 2 first, the one at
-// least its length -- its own, if its length is one, else by
-// `heff_arr_regrow`.  A pop never shrinks the room)
-HEFF_FN V heff_arrayPop(V a) {
-  Arr *r = (Arr *)a;
-  int64_t n = r->n;
-  if (n == 0) {
-    heff_drop(a);
-    return NTAG(TAG_Nothing);
-  }
-  V x;
-  if (heff_alone(&r->h)) {
-    if (!(r->h.tag >> HEFF_ARR_ROOM)) {
-      unsigned e = heff_arr_room(n);
-      if ((int64_t)1 << e == n) r->h.tag = (uint16_t)(HEFF_ARR_KIND(r) | e << HEFF_ARR_ROOM);
-      else r = heff_arr_regrow(r, e);
-    }
-    x = HEFF_ARR_KIND(r) == HEFF_ARR_V ? r->a[n - 1] : heff_arr_get(r, n - 1);
-    r->n = n - 1;
-  } else {
-    x = heff_arr_get(r, n - 1);
-    Arr *s = heff_arr_alloc(n - 1, HEFF_ARR_KIND(r));
-    heff_arr_move(s, 0, r, 0, n - 1);
-    heff_drop(a);
-    r = s;
-  }
-  V f[2] = { (V)r, x };
-  V p = heff_tag_n(TAG_MkPair, 2, f);
-  return heff_tag_n(TAG_Just, 1, &p);
 }
 
 // (room for `k` more elements: grown in place where the array is held
