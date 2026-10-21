@@ -2440,6 +2440,40 @@ HEFF_FAST V heff_strHash_lent(V a, int give) {
 }
 HEFF_FN V heff_strHash(V a) { return heff_strHash_lent(a, 1); }
 
+// (the bytes of `x` from `i` up to `j`, clamped as `strSlice` clamps
+// them: where they start, and how many, read in place, not copied)
+static inline int64_t heff_str_range(Str *x, V i, V j, int64_t *len) {
+  int64_t n = x->len, b = INT_OF(i), e = INT_OF(j);
+  if (b < 0) b = b + n < 0 ? 0 : b + n;
+  if (e < 0) e = e + n < 0 ? 0 : e + n;
+  if (b > n) b = n;
+  if (e > n) e = n;
+  if (e < b) e = b;
+  *len = e - b;
+  return b;
+}
+
+// (the hash of `strSlice a i j`, no slice made)
+HEFF_FAST V heff_strHashRange_lent(V a, V i, V j, int give) {
+  Str *x = (Str *)a;
+  int64_t m, b = heff_str_range(x, i, j, &m);
+  V r = MK_INT((int64_t)(heff_hash_bytes(x->p + b, m) >> 2));
+  HEFF_GIVEN(give, 0, a);
+  return r;
+}
+HEFF_FN V heff_strHashRange(V a, V i, V j) { return heff_strHashRange_lent(a, i, j, 1); }
+
+// (whether `t` is `strSlice s i j`, no slice made)
+HEFF_FAST V heff_strEqRange_lent(V t, V s, V i, V j, int give) {
+  Str *x = (Str *)t, *y = (Str *)s;
+  int64_t m, b = heff_str_range(y, i, j, &m);
+  int c = x->len == m && memcmp(x->p, y->p + b, (size_t)m) == 0;
+  HEFF_GIVEN(give, 0, t);
+  HEFF_GIVEN(give, 1, s);
+  return heff_bool(c);
+}
+HEFF_FN V heff_strEqRange(V t, V s, V i, V j) { return heff_strEqRange_lent(t, s, i, j, 3); }
+
 HEFF_FN V heff_intHash(V a) {
   uint64_t h = heff_int_hash(a);
   if (!IS_INT(a)) heff_drop(a);
