@@ -95,7 +95,7 @@ tool =
         r <- run { command = "sh", args = ["-c", "echo hi > out.txt"] }
         out <- readFile "out.txt"
         assertEqual out "hi\n")
-    , within 5000 (integration "answers quickly" (do
+    , withinTime 5000 (integration "answers quickly" (do
         r <- run { command = "true" }
         assert "it ended well" (succeeded r)))
     ]
@@ -109,7 +109,7 @@ not hear fails it.
 - `heff test` builds the file's tests into a C program, and runs each
   integration test in a process of its own.
 - Each runs in a new, empty directory, removed afterwards.
-- Each has a time limit, a minute unless `within MS` says otherwise. At
+- Each has a time limit, a minute unless `withinTime MS` says otherwise. At
   the limit, it and every process it started are killed.
 - They run at once, up to `--jobs N`, else `HEFF_TEST_JOBS`, else half
   the machine's cores.
