@@ -168,6 +168,68 @@ calledAs go argv call Nothing = call argv
 calleeAt : Map.Map String Callee -> List String -> String -> Maybe Callee
 calleeAt cs going g = if elemO g going then Nothing else Map.lookup cs g
 
+-- A match on what a body put here gives -- each way out of it building
+-- a tag no other way builds, a lookup's `Nothing` and `Just` -- is given
+-- to those ways: each arm moved to the one way that chooses it, none
+-- copied, and no tag built.  It is the case of case the simplifier
+-- makes, which ran before the body was put here.
+
+-- (the tags the ways out of the worklist build, onto `acc`, if each
+-- builds one or is abandoned)
+waysW : List IR.Expr -> List String -> Maybe (List String)
+waysW Nil acc = Just acc
+waysW (Cons (ETag t _ _) rest) acc = waysW rest (Cons t acc)
+waysW (Cons (ELet _ _ b) rest) acc = waysW (Cons b rest) acc
+waysW (Cons (ESet _ _ b) rest) acc = waysW (Cons b rest) acc
+waysW (Cons (EMatch _ arms) rest) acc =
+  waysW (IR.appendI (List.map IR.armBody arms) rest) acc
+waysW (Cons EAbandon rest) acc = waysW rest acc
+waysW (Cons e rest) acc = Nothing
+
+armOf : String -> List IR.Arm -> Maybe IR.Arm
+armOf t Nil = Nothing
+armOf t (Cons a rest) = if strEq (IR.armTag a) t then Just a else armOf t rest
+
+isJustO : {a : Type} -> Maybe a -> Bool
+isJustO (Just _) = True
+isJustO Nothing = False
+
+-- (each tag built by one way out alone, and matched by an arm)
+eachOnce : List IR.Arm -> List String -> Bool
+eachOnce arms Nil = True
+eachOnce arms (Cons t ts) =
+  not (elemO t ts) && isJustO (armOf t arms) && eachOnce arms ts
+
+movable : List IR.Arm -> Maybe (List String) -> Bool
+movable arms (Just ts) = eachOnce arms ts
+movable arms Nothing = False
+
+-- (the arm chosen by the tag a way out builds, there: its fields bound)
+chosen : List IR.Arm -> String -> List IR.Expr -> List IR.FieldTy -> IR.Expr
+chosen arms t argv ts = case armOf t arms of
+  Just a -> bound (IR.armVars a) argv (IR.armBody a)
+  Nothing -> ETag t argv ts
+
+-- (the arms given to the ways out of `e`)
+moved : List IR.Arm -> IR.Expr -> IR.Expr
+moved arms (ETag t argv ts) = chosen arms t argv ts
+moved arms (ELet x a b) = ELet x a (moved arms b)
+moved arms (ESet xs a b) = ESet xs a (moved arms b)
+moved arms (EMatch s inner) =
+  EMatch
+    s
+    (List.map
+       (\a -> MkArm (IR.armTag a) (IR.armVars a) (moved arms (IR.armBody a)))
+       inner)
+moved arms e = e
+
+-- | a match on `s`, given to its ways out where it may be
+-- | >>> matchOn (EMatch (EVar "c") [MkArm "True" Nil (ETag "Nothing" Nil Nil), MkArm "False" Nil (ETag "Just" [EVar "x"] [FtAny])]) [MkArm "Just" ["y"] (EVar "y"), MkArm "Nothing" Nil (EInt 0)]
+-- | EMatch (EVar "c") [MkArm "True" [] (EInt 0), MkArm "False" [] (ELet "y" (EVar "x") (EVar "y"))]
+matchOn : IR.Expr -> List IR.Arm -> IR.Expr
+matchOn s arms =
+  if movable arms (waysW (Cons s Nil) Nil) then moved arms s else EMatch s arms
+
 -- | an expression, each function called once in it put where it is
 -- | called, and so on into it (`going`: those being put so)
 inlined : Map.Map String Callee -> List String -> IR.Expr -> IR.Expr
@@ -195,7 +257,7 @@ inlined cs going (EProj e l sh t) = EProj (inlined cs going e) l sh t
 inlined cs going (ETag t argv ts) =
   ETag t (List.map (\a -> inlined cs going a) argv) ts
 inlined cs going (EMatch s arms) =
-  EMatch
+  matchOn
     (inlined cs going s)
     (List.map
        (\a ->
