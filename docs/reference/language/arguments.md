@@ -13,6 +13,9 @@ identity x = x
 
 An argument in braces, `{a : Type}`, is implicit: heff infers it where
 the function is used. To give it yourself, name it: `identity (a := Int) 3`.
+Named arguments go in the order of the function's type: of
+`{a : Type} -> {b : Type} -> ...`, `(a := ...)` is written before
+`(b := ...)`, and either may be left out.
 
 ### Defaults
 
