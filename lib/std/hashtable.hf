@@ -520,3 +520,102 @@ instance instanceShowHashTable : {k v : Type}
                                -> {{showsValue : Show v}}
                                -> Show (HashTable k v)
 instanceShowHashTable = { show = \t -> "fromList " ^ show (toList t) }
+
+-- Keys looked up by a view of them (std.hashmap's `KeyView`): a part of
+-- a string (`HashMap.slice`), say, hashed and compared where it is, and
+-- the key made of it only where it is new to the table.
+
+-- (the slot of the key `query` stands for, its stored hash `s`, or the
+-- empty slot it would be put in: from `i` on)
+viewSlotOf : {k q : Type}
+           -> (k -> q -> Bool)
+           -> Array Int
+           -> Array k
+           -> Int
+           -> Int
+           -> q
+           -> Int
+           -> Int
+viewSlotOf matching hs ks mask s query i =
+  let t = arrayIndex hs i
+  in if t == 0 then i
+  else if t == s && matching (arrayIndex ks i) query then i
+  else viewSlotOf matching hs ks mask s query (and (i + 1) mask)
+
+-- (`updateBy` of a key whose stored hash is `s`)
+updateByAt : {k v q : Type}
+           -> (k -> q -> Bool)
+           -> (q -> k)
+           -> (v -> v -> v)
+           -> Int
+           -> q
+           -> v
+           -> HashTable k v
+           -> HashTable k v
+updateByAt matching keyed f s query value (MkHashTable n hs ks vs) =
+  if arrayLength hs == 0
+  then updateByAt
+      matching
+      keyed
+      f
+      s
+      query
+      value
+      (grown (MkHashTable n hs ks vs))
+  else (let mask = arrayLength hs - 1
+        in let i = viewSlotOf matching hs ks mask s query (homeOf s mask)
+        in if arrayIndex hs i /= 0
+        then MkHashTable n hs ks (arraySet vs i (f value (arrayIndex vs i)))
+        else if (n + 1) * 8 > arrayLength hs * 7
+        then updateByAt
+            matching
+            keyed
+            f
+            s
+            query
+            value
+            (grown (MkHashTable n hs ks vs))
+        else placed n hs ks vs i s (keyed query) value)
+
+-- | `update` of the key a view stands for (std.hashmap's `KeyView`):
+-- | the key made of it only where it is new to the table, so that
+-- | counting the parts of a string (`HashMap.slice`), most of them
+-- | there already, makes no string for those.
+-- | >>> lookup (updateBy (fromList [MkPair "ab" 1]) (HashMap.slice "xaby" 1 3) 5 (\new old -> new + old)) "ab"
+-- | Just 6
+-- | >>> toList (updateBy (empty : HashTable String Int) (HashMap.slice "xaby" 1 3) 5 (\new old -> new + old))
+-- | Cons (MkPair "ab" 5) Nil
+updateBy : {k v q : Type}
+         -> {{view : HashMap.KeyView k q}}
+         -> HashTable k v
+         -> q
+         -> v
+         -> (v -> v -> v)
+         -> HashTable k v
+updateBy t query value f =
+  updateByAt
+    view.matches
+    view.keyOf
+    f
+    (stored (view.hashOf query))
+    query
+    value
+    t
+
+-- | `lookup` of the key a view stands for (std.hashmap's `KeyView`), no
+-- | key made.
+-- | >>> lookupBy (fromList [MkPair "ab" 1]) (HashMap.slice "xaby" 1 3)
+-- | Just 1
+-- | >>> lookupBy (fromList [MkPair "ab" 1]) (HashMap.slice "xaby" 1 2)
+-- | Nothing
+lookupBy : {k v q : Type}
+         -> {{view : HashMap.KeyView k q}}
+         -> HashTable k v
+         -> q
+         -> Maybe v
+lookupBy (MkHashTable n hs ks vs) query =
+  if arrayLength hs == 0 then Nothing
+  else (let mask = arrayLength hs - 1
+        in let s = stored (view.hashOf query)
+        in let i = viewSlotOf view.matches hs ks mask s query (homeOf s mask)
+        in if arrayIndex hs i == 0 then Nothing else Just (arrayIndex vs i))
