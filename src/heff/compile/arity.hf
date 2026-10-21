@@ -17,65 +17,40 @@ arityOne m d = m
 arities : List IR.Def -> OrdMap.OrdMap String Int
 arities defs = List.foldl arityOne OrdMap.empty defs
 
-takeA : {a : Type} -> Int -> List a -> List a
-takeA n Nil = Nil
-takeA n (Cons x xs) = if n <= 0 then Nil else Cons x (takeA (n - 1) xs)
-
-dropA : {a : Type} -> Int -> List a -> List a
-dropA n Nil = Nil
-dropA n (Cons x xs) = if n <= 0 then Cons x xs else dropA (n - 1) xs
-
 restOf : IR.Expr -> List IR.Expr -> IR.Expr
 restOf f args = if List.length args == 0 then f else EApp f args
 
-type SK = { go : IR.Expr -> IR.Expr }
-
-callOf : SK -> OrdMap.OrdMap String Int -> IR.Expr -> List IR.Expr -> IR.Expr
-callOf r ar h@(EGlobal g) args = case OrdMap.lookup ar g of
-  Just n ->
-    if List.length args >= n then restOf (ECall g (takeA n args)) (dropA n args)
-    else EApp (r.go h) args
-  Nothing -> EApp (r.go h) args
-callOf r ar h@(EPrim p) args = case Prims.primArity p of
+callOf : (IR.Expr -> IR.Expr)
+       -> OrdMap.OrdMap String Int
+       -> IR.Expr
+       -> List IR.Expr
+       -> IR.Expr
+callOf go ar h@(EGlobal g) args = case OrdMap.lookup ar g of
   Just n ->
     if List.length args >= n
-    then restOf (EPrimCall p (takeA n args)) (dropA n args)
-    else EApp (r.go h) args
-  Nothing -> EApp (r.go h) args
-callOf r ar h args = EApp (r.go h) args
+    then restOf (ECall g (List.take n args)) (List.drop n args)
+    else EApp (go h) args
+  Nothing -> EApp (go h) args
+callOf go ar h@(EPrim p) args = case Prims.primArity p of
+  Just n ->
+    if List.length args >= n
+    then restOf (EPrimCall p (List.take n args)) (List.drop n args)
+    else EApp (go h) args
+  Nothing -> EApp (go h) args
+callOf go ar h args = EApp (go h) args
 
-satGo : SK -> OrdMap.OrdMap String Int -> IR.Expr -> IR.Expr
-satGo r ar (EApp f as0) = case IR.spine (EApp f as0) of
-  MkPair h args -> callOf r ar h (List.map (\a -> r.go a) args)
-satGo r ar (ELam xs b) = ELam xs (r.go b)
-satGo r ar (ELet x a b) = ELet x (r.go a) (r.go b)
-satGo r ar (ERecord fs ts) =
-  ERecord
-    (List.map
-       (\p -> case p of
-        MkPair l e2 -> MkPair l (r.go e2))
-       fs)
-    ts
-satGo r ar (EProj e2 l sh t) = EProj (r.go e2) l sh t
-satGo r ar (ETag t args ts) = ETag t (List.map (\a -> r.go a) args) ts
-satGo r ar (EMatch s arms) =
-  EMatch
-    (r.go s)
-    (List.map
-       (\a -> case a of
-        MkArm t vs b -> MkArm t vs (r.go b))
-       arms)
-satGo r ar (EPrimCall p args) = EPrimCall p (List.map (\a -> r.go a) args)
-satGo r ar (ECall g args) = ECall g (List.map (\a -> r.go a) args)
-satGo r ar (EBool c) = EBool (IR.condMap (\a -> r.go a) c)
-satGo r ar (ESet xs a b) = ESet xs (r.go a) (r.go b)
-satGo r ar (EValues es) = EValues (List.map (\a -> r.go a) es)
-satGo r ar e = e
+-- (an application taken apart: its head, its arguments gone through)
+spineOf : (IR.Expr -> IR.Expr)
+        -> OrdMap.OrdMap String Int
+        -> Pair IR.Expr (List IR.Expr)
+        -> IR.Expr
+spineOf go ar (MkPair h args) = callOf go ar h (List.map go args)
 
-satOf : OrdMap.OrdMap String Int -> SK
-satOf ar = { go = \e -> satGo (satOf ar) ar e }
+satGo : OrdMap.OrdMap String Int -> IR.Expr -> IR.Expr
+satGo ar (EApp f args) = spineOf (satGo ar) ar (IR.spine (EApp f args))
+satGo ar e = IR.mapParts (\_ p -> satGo ar p) e
 
 -- | >>> (saturate (arities [{ key = "f", name = "f", body = ELam ["x", "y"] (EVar "x") }]) { key = "g", name = "g", body = EApp (EGlobal "f") [EInt 1, EInt 2] }).body
 -- | ECall "f" [EInt 1, EInt 2]
 saturate : OrdMap.OrdMap String Int -> IR.Def -> IR.Def
-saturate ar d = { key = d.key, name = d.name, body = (satOf ar).go d.body }
+saturate ar d = { key = d.key, name = d.name, body = satGo ar d.body }

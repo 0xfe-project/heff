@@ -24,26 +24,8 @@
 module heff.compile.rematch
 
 import heff.compile.ir as IR
+import heff.compile.supply
 import std.ordmap as OrdMap
-
--- | computations drawing fresh names
-type S a = IR.Supply -> Pair a IR.Supply
-
-bindTake : {a b : Type} -> (a -> S b) -> Pair a IR.Supply -> Pair b IR.Supply
-bindTake f (MkPair x n) = f x n
-
--- `do` is this
-bind : {a b : Type} -> S a -> (a -> S b) -> S b
-bind m f = \n -> bindTake f (m n)
-
-pure : {a : Type} -> a -> S a
-pure x = \n -> MkPair x n
-
-instance instanceMonadS : Monad S
-instanceMonadS = { pure = pure, bind = bind }
-
-traverseS : {a b : Type} -> (a -> S b) -> List a -> S (List b)
-traverseS = traverse (mo := instanceMonadS)
 
 -- (whether `x` occurs in `e`)
 mentions : String -> IR.Expr -> Bool
@@ -51,7 +33,7 @@ mentions x e = (IR.occurrences x e).count > 0
 
 -- (a variable of an arm, named afresh: but `_`)
 freshVar : String -> S String
-freshVar v = if strEq v "_" then pure "_" else \n -> IR.fresh (IR.baseOf v) n
+freshVar v = if strEq v "_" then pure "_" else freshS (IR.baseOf v)
 
 -- (whether the arm `c`, of a look at the field `f` of `x` taken apart
 -- of `vs`, wants `x` whole and no field of it but `f`)
@@ -92,67 +74,24 @@ parts x inner =
 -- (an arm of a match of `x`, its body gone through already)
 armOf : String -> IR.Arm -> S IR.Arm
 armOf x (MkArm t vs (EMatch (EVar f) inner)) =
-  if List.any (\v -> strEq v f) vs && parts x inner
+  if List.elemBy strEq f vs && parts x inner
   then do
     inner2 <- traverseS (again x t vs f) inner
     pure (MkArm t vs (EMatch (EVar f) inner2))
   else pure (MkArm t vs (EMatch (EVar f) inner))
 armOf x a = pure a
 
--- (an arm's body gone through)
-inArm : (IR.Expr -> S IR.Expr) -> IR.Arm -> S IR.Arm
-inArm g (MkArm t vs b) = do
-  b2 <- g b
-  pure (MkArm t vs b2)
+-- (a match of a variable, its arms gone through already)
+matchOf : IR.Expr -> S IR.Expr
+matchOf (EMatch (EVar x) arms) = do
+  arms2 <- traverseS (armOf x) arms
+  pure (EMatch (EVar x) arms2)
+matchOf e = pure e
 
 -- | an expression, each arm of a match of a variable that looks at a
 -- | field so made, inner ones first
 go : IR.Expr -> S IR.Expr
-go (EMatch (EVar x) as0) = do
-  as1 <- traverseS (inArm go) as0
-  as2 <- traverseS (armOf x) as1
-  pure (EMatch (EVar x) as2)
-go (EMatch s as0) = do
-  s2 <- go s
-  as2 <- traverseS (inArm go) as0
-  pure (EMatch s2 as2)
-go (ELam xs b) = do
-  b2 <- go b
-  pure (ELam xs b2)
-go (EApp f argv) = do
-  f2 <- go f
-  argv2 <- traverseS go argv
-  pure (EApp f2 argv2)
-go (ELet x a b) = do
-  a2 <- go a
-  b2 <- go b
-  pure (ELet x a2 b2)
-go (ERecord fs ts) = do
-  es <- traverseS go (List.map snd fs)
-  pure (ERecord (List.zipWith (\p e -> MkPair (fst p) e) fs es) ts)
-go (EProj e l sh t) = do
-  e2 <- go e
-  pure (EProj e2 l sh t)
-go (ETag t argv ts) = do
-  argv2 <- traverseS go argv
-  pure (ETag t argv2 ts)
-go (EPrimCall p argv) = do
-  argv2 <- traverseS go argv
-  pure (EPrimCall p argv2)
-go (ECall g argv) = do
-  argv2 <- traverseS go argv
-  pure (ECall g argv2)
-go (EBool c) = do
-  c2 <- IR.condTraverse (mo := instanceMonadS) go c
-  pure (EBool c2)
-go (ESet xs a b) = do
-  a2 <- go a
-  b2 <- go b
-  pure (ESet xs a2 b2)
-go (EValues es) = do
-  es2 <- traverseS go es
-  pure (EValues es2)
-go e = pure e
+go e = bind (IR.traverseParts (\_ p -> go p) e) matchOf
 
 -- (a definition gone through)
 defOf : IR.Def -> S IR.Def
