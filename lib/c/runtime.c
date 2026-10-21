@@ -2503,10 +2503,25 @@ HEFF_FAST V heff_strEqRange_lent(V t, V s, V i, V j, int give) {
 }
 HEFF_FN V heff_strEqRange(V t, V s, V i, V j) { return heff_strEqRange_lent(t, s, i, j, 3); }
 
-HEFF_FN V heff_intHash(V a) {
+HEFF_SLOW V heff_intHash_big(V a) {
   uint64_t h = heff_int_hash(a);
-  if (!IS_INT(a)) heff_drop(a);
+  heff_drop(a);
   return MK_INT((int64_t)(h >> 2));
+}
+
+// (a word's, inlined: murmur3's finish of its 64 bits, as the Zig's
+// does it; a big one's, the call)
+HEFF_FAST V heff_intHash(V a) {
+  if (HEFF_LIKELY(IS_INT(a))) {
+    uint64_t h = (uint64_t)INT_OF(a);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return MK_INT((int64_t)(h >> 2));
+  }
+  return heff_intHash_big(a);
 }
 
 // (a trie's step: the 5 bits of the hash `h` from bit `s` on choose one of
