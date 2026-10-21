@@ -637,12 +637,6 @@ apartOf x (EMatch (EVar z) (Cons (MkArm t vs b) Nil)) =
   else Nothing
 apartOf x e = Nothing
 
-allJust : {a : Type} -> List (Maybe a) -> Maybe (List a)
-allJust Nil = Just Nil
-allJust (Cons (Just x) rest) =
-  maybe Nothing (\xs -> Just (Cons x xs)) (allJust rest)
-allJust (Cons Nothing rest) = Nothing
-
 appendValues : List IR.Expr -> Maybe (List IR.Expr) -> Maybe (List IR.Expr)
 appendValues vs (Just ws) = Just (List.append vs ws)
 appendValues vs Nothing = Nothing
@@ -660,27 +654,11 @@ valuesOf (Cons (MkPair t n) rest) (ETag u args _) =
   else Nothing
 valuesOf tags e = Nothing
 
--- (each way out the values it gives, if each builds the tags; one
--- abandoned gives none)
-toValues : List (Pair String Int) -> IR.Expr -> Maybe IR.Expr
-toValues ts (ELet y v b) =
-  maybe Nothing (\b2 -> Just (ELet y v b2)) (toValues ts b)
-toValues ts (ESet ys v b) =
-  maybe Nothing (\b2 -> Just (ESet ys v b2)) (toValues ts b)
-toValues ts (EMatch s arms) =
-  maybe
-    Nothing
-    (\bs ->
-       Just
-         (EMatch
-            s
-            (List.zipWith
-               (\a b2 -> MkArm (IR.armTag a) (IR.armVars a) b2)
-               arms
-               bs)))
-    (allJust (List.map (\a -> toValues ts (IR.armBody a)) arms))
-toValues ts EAbandon = Just EAbandon
-toValues ts e = maybe Nothing (\vs -> Just (EValues vs)) (valuesOf ts e)
+-- (a way out, the values it gives, if it builds the tags; one abandoned
+-- gives none)
+valuesAt : List (Pair String Int) -> IR.Expr -> Maybe IR.Expr
+valuesAt ts EAbandon = Just EAbandon
+valuesAt ts e = maybe Nothing (\vs -> Just (EValues vs)) (valuesOf ts e)
 
 -- (the names set: a field bound to none, `_`, a name of its own, of
 -- `x`'s, which is the program's alone)
@@ -700,7 +678,7 @@ givenSet x a b = case apartOf x b of
     maybe
       Nothing
       (\a2 -> Just (ESet (setNames x ap.names) a2 ap.body))
-      (toValues ap.tags a)
+      (IR.waysM (mo := instanceMonadMaybe) (valuesAt ap.tags) a)
   Nothing -> Nothing
 
 -- (a binding, `b` simplified: the names set, where it is one of those)
@@ -1042,28 +1020,11 @@ letSplit r x a b = do
 sumBudget : Int
 sumBudget = 100
 
--- | the ways out of an expression: the tags it comes to, through its
--- | bindings and the arms of its matches (an arm abandoned none), and
--- | how many come to anything else
-type Ways = Pair (List String) Int
-
-bothWays : Ways -> Ways -> Ways
-bothWays (MkPair ts n) (MkPair us m) = MkPair (List.append ts us) (n + m)
-
-waysOut : IR.Expr -> Ways
-waysOut (ETag t _ _) = MkPair (Cons t Nil) 0
-waysOut (ELet _ _ b) = waysOut b
-waysOut (ESet _ _ b) = waysOut b
-waysOut (EMatch _ arms) =
-  List.foldl (\w a -> bothWays w (waysOut (IR.armBody a))) (MkPair Nil 0) arms
-waysOut EAbandon = MkPair Nil 0
-waysOut e = MkPair Nil 1
-
-waysCount : Ways -> Int
+waysCount : IR.Ways -> Int
 waysCount (MkPair ts n) = List.length ts + n
 
 -- (whether any way out comes to a tag)
-anyTag : Ways -> Bool
+anyTag : IR.Ways -> Bool
 anyTag (MkPair ts n) = List.length ts > 0
 
 countTag : String -> List String -> Int
@@ -1073,7 +1034,7 @@ countTag t ts = List.length (List.keepIf (\u -> strEq u t) ts)
 -- | way out that comes to its tag, and to every one that comes to no
 -- | tag (given the whole match), but the first: whether that is more
 -- | than the budget allows
-armOver : Int -> Ways -> IR.Arm -> Bool
+armOver : Int -> IR.Ways -> IR.Arm -> Bool
 armOver budget (MkPair ts n) (MkArm t _ b) =
   countTag t ts + n > 1 && IR.sizeAbove (budget / (countTag t ts + n - 1)) b
 
@@ -1082,7 +1043,7 @@ armOver budget (MkPair ts n) (MkArm t _ b) =
 -- | the budget allows -- none is where each tag is come to once
 armsPushable : Int -> IR.Expr -> List IR.Arm -> Bool
 armsPushable budget a arms =
-  anyTag (waysOut a) && not (List.any (armOver budget (waysOut a)) arms)
+  anyTag (IR.waysOut a) && not (List.any (armOver budget (IR.waysOut a)) arms)
 
 -- (how many times a condition looks at the `Bool` `x`: a match on it)
 testsOf : String -> IR.Cond -> Int
@@ -1104,8 +1065,8 @@ scrutW x n (Cons e rest) = scrutW x n (IR.partsOnto e rest)
 -- than the budget allows)
 followOver : IR.Expr -> IR.Expr -> Bool
 followOver a b =
-  waysCount (waysOut a) > 1
-  && IR.sizeAbove (sumBudget / (waysCount (waysOut a) - 1)) b
+  waysCount (IR.waysOut a) > 1
+  && IR.sizeAbove (sumBudget / (waysCount (IR.waysOut a) - 1)) b
 
 -- (... or, the match on `x` itself, its arms each to the ways out that
 -- choose it)
@@ -1119,30 +1080,21 @@ sumOver x a b = followOver a b
 -- | which may be given to each way out
 sumTakenApart : String -> IR.Expr -> IR.Expr -> Bool
 sumTakenApart x (EMatch s arms) b =
-  anyTag (waysOut (EMatch s arms))
+  anyTag (IR.waysOut (EMatch s arms))
   && scrutW x 0 (Cons b Nil) > 0
   && scrutW x 0 (Cons b Nil) == occCountOf x b
   && not (sumOver x (EMatch s arms) b)
 sumTakenApart x a b = False
 
--- (each way out of `a` given what follows, `x` bound to its tag there:
--- the tag's fields bound first, so that it is a value put where it is
--- matched on -- or, a way out that comes to no tag, bound to that)
+-- (a way out given what follows, `x` bound to its tag there: the tag's
+-- fields bound first, so that it is a value put where it is matched on
+-- -- or, a way out that comes to no tag, bound to that)
 sumPushed : SK -> String -> IR.Expr -> IR.Expr -> M IR.Expr
 sumPushed r x b (ETag t es ts) = do
   bound <- bindArgs es
   b2 <- copy b
   e <- r.simp (ELet x (ETag t (snd bound) ts) b2)
   pure (letsOf (fst bound) e)
-sumPushed r x b (ELet y a c) = do
-  c2 <- sumPushed r x b c
-  pure (ELet y a c2)
-sumPushed r x b (ESet ys a c) = do
-  c2 <- sumPushed r x b c
-  pure (ESet ys a c2)
-sumPushed r x b (EMatch s arms) = do
-  arms2 <- armsS (\a -> sumPushed r x b a) arms
-  pure (EMatch s arms2)
 sumPushed r x b EAbandon = pure EAbandon
 sumPushed r x b e = do
   b2 <- copy b
@@ -1277,7 +1229,8 @@ letIn r x a b = do
   then do
     b' <- r.simp b
     pure (ELet x a b')
-  else if sumTakenApart x a b then sumPushed r x b a
+  else if sumTakenApart x a b
+  then IR.waysM (mo := instanceMonadM) (sumPushed r x b) a
   else if isJustS (givenSet x a b) then setGiven r x a b
   else if tagApart x a b
   then do
@@ -2213,10 +2166,7 @@ lamsOut safe all (EMatch sc arms) =
 lamsOut safe all (EApp (EGlobal g) argv) = partialMore safe all g argv
 lamsOut safe all _ = 0
 
--- | each way out without its first lambdas, their parameters `zs`
-stripArm : (IR.Expr -> IR.Expr) -> IR.Arm -> IR.Arm
-stripArm go (MkArm t vs b) = MkArm t vs (go b)
-
+-- | a way out without its first lambdas, their parameters `zs`
 stripLams : List String -> IR.Expr -> IR.Expr
 stripLams zs (ELam ys b) =
   IR.subst
@@ -2224,17 +2174,13 @@ stripLams zs (ELam ys b) =
     (if List.length ys > List.length zs
      then ELam (List.drop (List.length zs) ys) b
      else b)
-stripLams zs (ELet x a b) = ELet x a (stripLams zs b)
-stripLams zs (ESet xs a b) = ESet xs a (stripLams zs b)
-stripLams zs (EMatch sc arms) =
-  EMatch sc (List.map (stripArm (stripLams zs)) arms)
 -- (a known function given fewer arguments: given the parameters too)
 stripLams zs (EApp (EGlobal g) argv) =
   EApp (EGlobal g) (List.append argv (List.map (\z -> EVar z) zs))
 stripLams zs e = e
 
 raiseWith : List String -> IR.Expr -> List String -> IR.Expr
-raiseWith xs b zs = ELam (List.append xs zs) (stripLams zs b)
+raiseWith xs b zs = ELam (List.append xs zs) (IR.waysMap (stripLams zs) b)
 
 -- | a function, taking the parameters every way out of it does.  A
 -- | definition that is not a function but whose every way out is a
@@ -2254,7 +2200,7 @@ raise e = do
   if lamsOut s.safe s.sp.all e == 0 then pure e
   else do
     zs <- freshParams (lamsOut s.safe s.sp.all e)
-    pure (ELam zs (stripLams zs e))
+    pure (ELam zs (IR.waysMap (stripLams zs) e))
 
 -- (the arguments a copy is made for)
 markedOf : List Bool -> List IR.Expr -> List IR.Expr
@@ -3271,24 +3217,8 @@ pushBound r s arms argv = do
 -- called once after the match, with them.  No function is bound for the
 -- arms to call.  Otherwise the application is as it was.
 
--- (each way out a call of `k` given `n` values: those values)
+-- (a way out a call of `k` given `n` values: those values)
 valuesCalled : String -> Int -> IR.Expr -> Maybe IR.Expr
-valuesCalled k n (ELet y v b) =
-  maybe Nothing (\b2 -> Just (ELet y v b2)) (valuesCalled k n b)
-valuesCalled k n (ESet ys v b) =
-  maybe Nothing (\b2 -> Just (ESet ys v b2)) (valuesCalled k n b)
-valuesCalled k n (EMatch s arms) =
-  maybe
-    Nothing
-    (\bs ->
-       Just
-         (EMatch
-            s
-            (List.zipWith
-               (\a b2 -> MkArm (IR.armTag a) (IR.armVars a) b2)
-               arms
-               bs)))
-    (allJust (List.map (\a -> valuesCalled k n (IR.armBody a)) arms))
 valuesCalled k n EAbandon = Just EAbandon
 valuesCalled k n (EApp (EVar k2) argv) =
   if strEq k k2 && List.length argv == n then Just (EValues argv) else Nothing
@@ -3366,7 +3296,7 @@ followerSet r orig k f s arms argv = do
   arms2 <- armsS (\b -> applyArm r b argv) arms
   let m : IR.Expr = EMatch s arms2
   let n : Int = firstCalled k m
-  case valuesCalled k n m of
+  case IR.waysM (mo := instanceMonadMaybe) (valuesCalled k n) m of
     Just m2 ->
       if n > 0 && occCountOf k m2 == 0
       then do
