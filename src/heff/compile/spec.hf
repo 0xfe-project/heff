@@ -10,22 +10,13 @@ import heff.elab.fixed as Fixed
 import heff.compile.ir as IR
 import std.ordmap as OrdMap
 
--- (an arm's body, its variables bound)
-armClosed : (List String -> IR.Expr -> Bool) -> List String -> IR.Arm -> Bool
-armClosed go env (MkArm _ vs b) = go (List.append vs env) b
-
 -- | whether every variable it mentions is bound in it or in `env`
 -- | >>> closedIn Nil (ELam ["x"] (EVar "y"))
 -- | False
 closedIn : List String -> IR.Expr -> Bool
 closedIn env (EVar x) = List.elemBy strEq x env
-closedIn env (ELam xs b) = closedIn (List.append xs env) b
-closedIn env (ELet x a b) = closedIn env a && closedIn (Cons x env) b
-closedIn env (EMatch s arms) =
-  closedIn env s && List.all (armClosed closedIn env) arms
-closedIn env (ESet xs a b) = closedIn env a && closedIn (List.append xs env) b
 closedIn env (EFix _ _) = False
-closedIn env e = List.all (closedIn env) (IR.partsOnto e Nil)
+closedIn env e = IR.allParts (\xs p -> closedIn (IR.appendI xs env) p) e
 
 -- | whether it computes without calling anything -- primitives, fields,
 -- | tags, matches -- and so is little more than the call of its closure
@@ -205,6 +196,21 @@ type Shaped = { e : IR.Expr, vars : List String, holes : List IR.Expr, n : Int }
 
 type ShapeGo = IR.Expr -> ShapeSt -> Pair IR.Expr ShapeSt
 
+-- (shaping, as a computation)
+type Shape a = ShapeSt -> Pair a ShapeSt
+
+bindTake : {a b : Type} -> (a -> Shape b) -> Pair a ShapeSt -> Pair b ShapeSt
+bindTake f (MkPair x st) = f x st
+
+bindShape : {a b : Type} -> Shape a -> (a -> Shape b) -> Shape b
+bindShape m f = \st -> bindTake f (m st)
+
+pureShape : {a : Type} -> a -> Shape a
+pureShape x = \st -> MkPair x st
+
+instance instanceMonadShape : Monad Shape
+instanceMonadShape = { pure = pureShape, bind = bindShape }
+
 -- (a literal taken out, a variable in its place)
 holeOf : IR.Expr -> ShapeSt -> Pair IR.Expr ShapeSt
 holeOf lit st =
@@ -267,26 +273,6 @@ unbound ren (MkPair e st) =
 withFst : (IR.Expr -> IR.Expr) -> Pair IR.Expr ShapeSt -> Pair IR.Expr ShapeSt
 withFst f (MkPair e st) = MkPair (f e) st
 
-manyTo : (List IR.Expr -> IR.Expr)
-       -> Pair (List IR.Expr) ShapeSt
-       -> Pair IR.Expr ShapeSt
-manyTo f (MkPair es st) = MkPair (f es) st
-
-consShaped : IR.Expr
-           -> Pair (List IR.Expr) ShapeSt
-           -> Pair (List IR.Expr) ShapeSt
-consShaped e (MkPair es st) = MkPair (Cons e es) st
-
--- (`e` shaped, then the rest after it)
-manyThen : (ShapeSt -> Pair (List IR.Expr) ShapeSt)
-         -> Pair IR.Expr ShapeSt
-         -> Pair (List IR.Expr) ShapeSt
-manyThen more (MkPair e st) = consShaped e (more st)
-
-shapeMany : ShapeGo -> List IR.Expr -> ShapeSt -> Pair (List IR.Expr) ShapeSt
-shapeMany go Nil st = MkPair Nil st
-shapeMany go (Cons e rest) st = manyThen (shapeMany go rest) (go e st)
-
 -- (a binding's body, its binders renamed)
 boundThen : ShapeGo
           -> IR.Expr
@@ -295,13 +281,6 @@ boundThen : ShapeGo
           -> Pair (List String) ShapeSt
           -> Pair IR.Expr ShapeSt
 boundThen go b f ren (MkPair ys st) = withFst (f ys) (unbound ren (go b st))
-
--- (an application's head, then its arguments)
-appThen : ShapeGo
-        -> List IR.Expr
-        -> Pair IR.Expr ShapeSt
-        -> Pair IR.Expr ShapeSt
-appThen go args (MkPair f st) = manyTo (\es -> EApp f es) (shapeMany go args st)
 
 -- (the name a binder was given)
 oneName : String -> List String -> String
@@ -325,12 +304,6 @@ setThen : ShapeGo
         -> Pair IR.Expr ShapeSt
 setThen go xs b (MkPair a st) =
   boundThen go b (\ys b2 -> ESet ys a b2) st.ren (bindAll xs st)
-
-labelsTo : List (Pair String IR.Expr)
-         -> List IR.Expr
-         -> List (Pair String IR.Expr)
-labelsTo (Cons (MkPair l _) fs) (Cons e es) = Cons (MkPair l e) (labelsTo fs es)
-labelsTo _ _ = Nil
 
 consArm : IR.Arm -> Pair (List IR.Arm) ShapeSt -> Pair (List IR.Arm) ShapeSt
 consArm a (MkPair args st) = MkPair (Cons a args) st
@@ -361,34 +334,6 @@ matchThen : ShapeGo
 matchThen go arms (MkPair sc st) = case shapeArms go arms st of
   MkPair arms2 st2 -> MkPair (EMatch sc arms2) st2
 
-withShapedC : {a : Type}
-            -> Pair IR.Cond ShapeSt
-            -> (IR.Cond -> ShapeSt -> a)
-            -> a
-withShapedC (MkPair c st) k = k c st
-
--- (a condition shaped, its expressions in order)
-shapeCond : ShapeGo -> IR.Cond -> ShapeSt -> Pair IR.Cond ShapeSt
-shapeCond go CTrue st = MkPair CTrue st
-shapeCond go CFalse st = MkPair CFalse st
-shapeCond go (CRel p a b) st = case go a st of
-  MkPair a2 st1 -> case go b st1 of
-    MkPair b2 st2 -> MkPair (CRel p a2 b2) st2
-shapeCond go (CTest e) st = case go e st of
-  MkPair e2 st1 -> MkPair (CTest e2) st1
-shapeCond go (CNot c) st =
-  withShapedC (shapeCond go c st) (\c2 st1 -> MkPair (CNot c2) st1)
-shapeCond go (CIf a b c) st =
-  withShapedC
-    (shapeCond go a st)
-    (\a2 st1 ->
-       withShapedC
-         (shapeCond go b st1)
-         (\b2 st2 ->
-            withShapedC
-              (shapeCond go c st2)
-              (\c2 st3 -> MkPair (CIf a2 b2 c2) st3)))
-
 shapeGo : IR.Expr -> ShapeSt -> Pair IR.Expr ShapeSt
 shapeGo (EVar x) st =
   varIn
@@ -401,25 +346,11 @@ shapeGo (EFloat x) st = holeOf (EFloat x) st
 shapeGo (EStr t) st = holeOf (EStr t) st
 shapeGo (ELam xs b) st =
   boundThen shapeGo b (\ys b2 -> ELam ys b2) st.ren (bindAll xs st)
-shapeGo (EApp f args) st = appThen shapeGo args (shapeGo f st)
 shapeGo (ELet x a b) st = letThen shapeGo x b (shapeGo a st)
-shapeGo (ERecord fs ts) st =
-  manyTo
-    (\es -> ERecord (labelsTo fs es) ts)
-    (shapeMany shapeGo (List.map snd fs) st)
-shapeGo (EProj e l sh t) st = withFst (\e2 -> EProj e2 l sh t) (shapeGo e st)
-shapeGo (ETag t args ts) st =
-  manyTo (\es -> ETag t es ts) (shapeMany shapeGo args st)
 shapeGo (EMatch sc arms) st = matchThen shapeGo arms (shapeGo sc st)
-shapeGo (EPrimCall p args) st =
-  manyTo (\es -> EPrimCall p es) (shapeMany shapeGo args st)
-shapeGo (ECall g args) st =
-  manyTo (\es -> ECall g es) (shapeMany shapeGo args st)
 shapeGo (ESet xs a b) st = setThen shapeGo xs b (shapeGo a st)
-shapeGo (EValues es) st = manyTo (\es2 -> EValues es2) (shapeMany shapeGo es st)
-shapeGo (EBool c) st =
-  withShapedC (shapeCond shapeGo c st) (\c2 st1 -> MkPair (EBool c2) st1)
-shapeGo e st = MkPair e st
+shapeGo e st =
+  IR.traversePartsM (mo := instanceMonadShape) (\_ p -> shapeGo p) e st
 
 shapedOf : Pair IR.Expr ShapeSt -> Shaped
 shapedOf (MkPair e st) =
