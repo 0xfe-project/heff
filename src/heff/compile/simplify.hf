@@ -1028,20 +1028,30 @@ anyTag (MkPair ts n) = List.length ts > 0
 countTag : String -> List String -> Int
 countTag t ts = List.length (List.keepIf (\u -> strEq u t) ts)
 
+-- (how many of the tags come to the arm: its tag, or for the default,
+-- each tag no arm of `arms` names)
+countArm : List IR.Arm -> IR.Arm -> List String -> Int
+countArm arms a ts =
+  if IR.isDefault a
+  then List.length (List.keepIf (\u -> not (IR.namesTag u arms)) ts)
+  else countTag (IR.armTag a) ts
+
 -- | an arm of a match on what comes out those ways is copied to every
 -- | way out that comes to its tag, and to every one that comes to no
 -- | tag (given the whole match), but the first: whether that is more
 -- | than the budget allows
-armOver : Int -> IR.Ways -> IR.Arm -> Bool
-armOver budget (MkPair ts n) (MkArm t _ b) =
-  countTag t ts + n > 1 && IR.sizeAbove (budget / (countTag t ts + n - 1)) b
+armOver : Int -> IR.Ways -> List IR.Arm -> IR.Arm -> Bool
+armOver budget (MkPair ts n) arms a =
+  countArm arms a ts + n > 1
+  && IR.sizeAbove (budget / (countArm arms a ts + n - 1)) (IR.armBody a)
 
 -- | the arms of a match on what comes out of `a` may be given to the
 -- | ways out of `a`: some come to a tag, and no arm is copied more than
 -- | the budget allows -- none is where each tag is come to once
 armsPushable : Int -> IR.Expr -> List IR.Arm -> Bool
 armsPushable budget a arms =
-  anyTag (IR.waysOut a) && not (List.any (armOver budget (IR.waysOut a)) arms)
+  anyTag (IR.waysOut a)
+  && not (List.any (armOver budget (IR.waysOut a) arms) arms)
 
 -- (how many times a condition looks at the `Bool` `x`: a match on it)
 testsOf : String -> IR.Cond -> Int
@@ -1397,9 +1407,14 @@ allOpaque argv = IR.allI (List.map (\a -> opaque a) argv)
 inlineMax : Int
 inlineMax = 50
 
+-- | a definition not inlined: one bigger than that, or one with a match
+-- | with a default arm, which stands for each tag it does not name.
+-- | (When the default was copied into the arm of each tag, such a
+-- | definition was too big; inlined, it made the compiler compiling
+-- | itself do half as much work again, and run no faster, #123)
 tooBig : String -> St -> Bool
 tooBig g s = case OrdMap.lookup s.defs g of
-  Just b -> IR.sizeAbove inlineMax b
+  Just b -> IR.sizeAbove inlineMax b || IR.hasDefault b
   Nothing -> False
 
 -- (a tag, an operation)
@@ -1431,11 +1446,9 @@ copyBudget kinds (Just b) argv =
   if handedPast kinds b argv then handedSize else budget
 copyBudget kinds Nothing argv = budget
 
--- (the arm of the tag)
+-- (the arm of the tag: its own, else the default)
 findArm : String -> List IR.Arm -> Maybe IR.Arm
-findArm t Nil = Nothing
-findArm t (Cons (MkArm t2 vs b) rest) =
-  if strEq t2 t then Just (MkArm t2 vs b) else findArm t rest
+findArm t arms = IR.armFor t arms
 
 -- (the parameters given a tag, each known by it)
 tagsGiven : List String
@@ -1480,15 +1493,19 @@ prunedB lim known n (Cons e rest) =
 
 -- (an arm of a match on a tag known: the arm it chooses, pruned in turn;
 -- any other, nothing)
+-- (the default chooses a tag no other arm names)
 prunedArm : (OrdMap.OrdMap String IR.Expr -> IR.Expr -> IR.Expr)
           -> OrdMap.OrdMap String IR.Expr
+          -> List IR.Arm
           -> Maybe IR.Expr
           -> IR.Arm
           -> IR.Arm
-prunedArm go known (Just (ETag t argv _)) (MkArm t2 vs b) =
+prunedArm go known arms (Just (ETag t argv _)) (MkArm t2 vs b) =
   if strEq t t2 then MkArm t2 vs (go (tagsGiven vs argv known) b)
+  else if strEq t2 IR.defaultTag && not (IR.namesTag t arms)
+  then MkArm t2 vs (go known b)
   else MkArm t2 vs EAbandon
-prunedArm go known _ (MkArm t2 vs b) = MkArm t2 vs (go known b)
+prunedArm go known arms _ (MkArm t2 vs b) = MkArm t2 vs (go known b)
 
 -- (an expression, a match on a tag known in it left the arm it chooses)
 prunedFor : OrdMap.OrdMap String IR.Expr -> IR.Expr -> IR.Expr
@@ -1500,7 +1517,9 @@ prunedFor known (EApp f argv) =
 prunedFor known (EMatch sc arms) =
   EMatch
     sc
-    (List.map (\a -> prunedArm prunedFor known (tagKnown known sc) a) arms)
+    (List.map
+       (\a -> prunedArm prunedFor known arms (tagKnown known sc) a)
+       arms)
 prunedFor known e = e
 
 -- | a copy where it is called: a match on a parameter given a tag left
@@ -3556,7 +3575,13 @@ caseOfCase r s2 arms2 arms =
 matchOn : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
 matchOn r (EMatch s2 arms2) arms = caseOfCase r s2 arms2 arms
 matchOn r s@(ETag t argv _) arms = case findArm t arms of
-  Just (MkArm _ vs b) -> r.simp (letsOf (List.zip vs argv) b)
+  -- (the default: the tag built, its fields computed, but bound whole)
+  Just (MkArm t2 vs b) ->
+    if strEq t2 IR.defaultTag && not (List.null argv)
+    then do
+      x <- freshName "matched"
+      r.simp (ELet x s b)
+    else r.simp (letsOf (List.zip vs argv) b)
   Nothing -> pure (EMatch s arms)
 matchOn r (ELet x a b) arms = do
   b' <- r.match b arms
