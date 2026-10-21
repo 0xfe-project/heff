@@ -7,14 +7,6 @@ module heff.compile.borrow
 import heff.compile.ir as IR
 import std.ordmap as OrdMap
 
-elemS : String -> List String -> Bool
-elemS x Nil = False
-elemS x (Cons y ys) = strEq x y || elemS x ys
-
-elemI : Int -> List Int -> Bool
-elemI i Nil = False
-elemI i (Cons j js) = i == j || elemI i js
-
 borOf : OrdMap.OrdMap String (List Int) -> String -> List Int
 borOf bor g = fromMaybe Nil (OrdMap.lookup bor g)
 
@@ -23,7 +15,9 @@ paramsAt want bi xs =
   List.map
     fst
     (List.keepIf
-       (\p -> if want then elemI (snd p) bi else not (elemI (snd p) bi))
+       (\p ->
+          if want then List.elemBy (\i j -> i == j) (snd p) bi
+          else not (List.elemBy (\i j -> i == j) (snd p) bi))
        (List.zipWith
           (\x i -> MkPair x i)
           xs
@@ -71,14 +65,19 @@ indexedE es =
 -- `Bool` looked at as a match's)
 onlyLentCond : (IR.Expr -> Bool) -> String -> IR.Cond -> Bool
 onlyLentCond go p (CRel q a b) =
-  List.all (\x -> (isVar p x && elemS q lendingPrims) || go x) [a, b]
+  List.all
+    (\x -> (isVar p x && List.elemBy strEq q lendingPrims) || go x)
+    [a, b]
 onlyLentCond go p (CTest e) = isVar p e || go e
 onlyLentCond go p (CNot c) = onlyLentCond go p c
 onlyLentCond go p (CIf a b c) =
   onlyLentCond go p a && onlyLentCond go p b && onlyLentCond go p c
 onlyLentCond go p c = True
 
--- (each use of `p` in it only looked at or lent)
+-- (each use of `p` in it only looked at or lent: written out, as
+-- `loopLent` is, not by `IR.partsOnto` -- each is asked of each
+-- parameter of each function, round after round, and so the compiler
+-- compiling itself took a few in a thousand more instructions)
 onlyLent : OrdMap.OrdMap String (List Int) -> String -> IR.Expr -> Bool
 onlyLent bor p (EVar x) = not (strEq p x)
 onlyLent bor p (EMatch s arms) =
@@ -87,7 +86,7 @@ onlyLent bor p (EMatch s arms) =
 onlyLent bor p (ECall g args) =
   List.all
     (\pr ->
-       (isVar p (fst pr) && elemI (snd pr) (borOf bor g))
+       (isVar p (fst pr) && List.elemBy (\i j -> i == j) (snd pr) (borOf bor g))
        || onlyLent bor p (fst pr))
     (indexedE args)
 onlyLent bor p (ELam _ b) = onlyLent bor p b
@@ -98,57 +97,42 @@ onlyLent bor p (EProj e _ _ _) = onlyLent bor p e
 onlyLent bor p (ETag _ args _) = List.all (onlyLent bor p) args
 onlyLent bor p (EPrimCall q args) =
   List.all
-    (\a -> (isVar p a && elemS q lendingPrims) || onlyLent bor p a)
+    (\a -> (isVar p a && List.elemBy strEq q lendingPrims) || onlyLent bor p a)
     args
 onlyLent bor p (EBool c) = onlyLentCond (onlyLent bor p) p c
 onlyLent bor p (ESet _ a b) = onlyLent bor p a && onlyLent bor p b
 onlyLent bor p (EValues es) = List.all (onlyLent bor p) es
 onlyLent bor p _ = True
 
--- (whether it builds a tag of `n` fields -- not a tuple, which is no
--- cell, heff.compile.cpr)
+-- (whether some node of the worklist is one `f` holds of)
+anyW : (IR.Expr -> Bool) -> List IR.Expr -> Bool
+anyW f Nil = False
+anyW f (Cons e rest) = f e || anyW f (IR.partsOnto e rest)
+
+-- (a tag of `n` fields -- not a tuple, which is no cell,
+-- heff.compile.cpr)
+buildsHere : Int -> IR.Expr -> Bool
+buildsHere n (ETag t args _) = List.length args == n && not (IR.isTupleTag t)
+buildsHere n _ = False
+
+-- (whether it builds one)
 buildsSize : Int -> IR.Expr -> Bool
-buildsSize n (ETag t args _) =
-  (List.length args == n && not (IR.isTupleTag t))
-  || List.any (buildsSize n) args
-buildsSize n (ELam _ b) = buildsSize n b
-buildsSize n (EApp f args) = List.any (buildsSize n) (Cons f args)
-buildsSize n (ELet _ a b) = buildsSize n a || buildsSize n b
-buildsSize n (ERecord fs _) = List.any (\f -> buildsSize n (snd f)) fs
-buildsSize n (EProj e _ _ _) = buildsSize n e
-buildsSize n (EMatch s arms) =
-  buildsSize n s || List.any (\a -> buildsSize n (IR.armBody a)) arms
-buildsSize n (ECall _ args) = List.any (buildsSize n) args
-buildsSize n (EPrimCall _ args) = List.any (buildsSize n) args
-buildsSize n (EBool c) = List.any (buildsSize n) (IR.condParts c)
-buildsSize n (ESet _ a b) = buildsSize n a || buildsSize n b
-buildsSize n (EValues es) = List.any (buildsSize n) es
-buildsSize n _ = False
+buildsSize n e = anyW (buildsHere n) (Cons e Nil)
 
 armReuses : IR.Arm -> Bool
 armReuses (MkArm _ vs b) = not (List.null vs) && buildsSize (List.length vs) b
 
--- (whether a match on `p` may reuse its cell)
+-- (a match on `p` that may reuse its cell)
+reusesHere : String -> IR.Expr -> Bool
+reusesHere p (EMatch s arms) = isVar p s && List.any armReuses arms
+reusesHere p _ = False
+
+-- (whether a match in it may reuse the cell of `p`)
 reuses : String -> IR.Expr -> Bool
-reuses p (EMatch s arms) =
-  (isVar p s && List.any armReuses arms)
-  || reuses p s
-  || List.any (\a -> reuses p (IR.armBody a)) arms
-reuses p (ELam _ b) = reuses p b
-reuses p (EApp f args) = List.any (reuses p) (Cons f args)
-reuses p (ELet _ a b) = reuses p a || reuses p b
-reuses p (ERecord fs _) = List.any (\f -> reuses p (snd f)) fs
-reuses p (EProj e _ _ _) = reuses p e
-reuses p (ETag _ args _) = List.any (reuses p) args
-reuses p (ECall _ args) = List.any (reuses p) args
-reuses p (EPrimCall _ args) = List.any (reuses p) args
-reuses p (EBool c) = List.any (reuses p) (IR.condParts c)
-reuses p (ESet _ a b) = reuses p a || reuses p b
-reuses p (EValues es) = List.any (reuses p) es
-reuses p _ = False
+reuses p e = anyW (reusesHere p) (Cons e Nil)
 
 scrutLent : List String -> IR.Expr -> Bool
-scrutLent ds (EVar x) = elemS x ds
+scrutLent ds (EVar x) = List.elemBy strEq x ds
 scrutLent ds _ = False
 
 -- Elements lent: `let x = arrayIndex a i`, `a` lent, is lent too -- the
@@ -160,11 +144,6 @@ scrutLent ds _ = False
 
 -- | a function, as it calls itself: its key, its parameters, its body
 type Loop = { key : String, params : List String, body : IR.Expr }
-
--- (whether some node of the worklist is one `f` holds of)
-anyW : (IR.Expr -> Bool) -> List IR.Expr -> Bool
-anyW f Nil = False
-anyW f (Cons e rest) = f e || anyW f (IR.partsOnto e rest)
 
 -- (whether a match's arms, as `IR.boolArms` has them, are no `if`'s)
 notIf : Maybe (Pair IR.Expr IR.Expr) -> Bool

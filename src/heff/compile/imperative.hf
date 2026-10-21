@@ -29,6 +29,7 @@ module heff.compile.imperative
 import heff.compile.ir as IR
 import heff.compile.ranges as Ranges
 import heff.compile.simplify as Simplify
+import heff.compile.supply
 import heff.elab.fixed as Fixed
 import std.ordmap as OrdMap
 
@@ -127,40 +128,8 @@ defKey (MkDef k _ _) = k
 defBody : Def -> Body
 defBody (MkDef _ _ b) = b
 
--- Fresh names
---------------------------------------------------------------------------------
-
--- | computations drawing fresh names
-type N a = Int -> Pair a Int
-
-bindTake : {a b : Type} -> (a -> N b) -> Pair a Int -> Pair b Int
-bindTake f (MkPair x n) = f x n
-
--- `do` is this
-bind : {a b : Type} -> N a -> (a -> N b) -> N b
-bind m f = \n -> bindTake f (m n)
-
-pure : {a : Type} -> a -> N a
-pure x = \n -> MkPair x n
-
-instance instanceMonadN : Monad N
-instanceMonadN = { pure = pure, bind = bind }
-
-traverseN : {a b : Type} -> (a -> N b) -> List a -> N (List b)
-traverseN = traverse (mo := instanceMonadN)
-
-freshN : String -> N String
-freshN base = \n -> IR.fresh base n
-
-appendL : {a : Type} -> List a -> List a -> List a
-appendL xs ys = List.append xs ys
-
 -- What is simple
 --------------------------------------------------------------------------------
-
-allL : {a : Type} -> (a -> Bool) -> List a -> Bool
-allL p Nil = True
-allL p (Cons x xs) = p x && allL p xs
 
 -- | whether it is simple: computed where it is or before, the same
 isSimple : IR.Expr -> Bool
@@ -174,10 +143,11 @@ isSimple (EFixed _ _) = True
 isSimple (EFloat32 _) = True
 isSimple (EPrim _) = True
 isSimple (ELam _ _) = True
-isSimple (ETag _ args _) = allL isSimple args
-isSimple (ERecord fs _) = allL (\f -> isSimple (snd f)) fs
+isSimple (ETag _ args _) = List.all isSimple args
+isSimple (ERecord fs _) = List.all (\f -> isSimple (snd f)) fs
 isSimple (EProj e _ _ _) = isSimple e
-isSimple (EPrimCall p args) = not (Simplify.primFails p) && allL isSimple args
+isSimple (EPrimCall p args) =
+  not (Simplify.primFails p) && List.all isSimple args
 isSimple _ = False
 
 -- | the function a body is a loop of, if it is one's own (not a lambda's)
@@ -192,13 +162,13 @@ data Dest = DSet String | DLet String | DSets (List String)
 -- | comparison alone, looked at where it is made)
 type G =
   { full : Bool
-  , simple : IR.Expr -> N Val
-  , tail : Maybe Self -> IR.Expr -> N Tl
-  , bindTo : String -> IR.Expr -> N (List St)
-  , toDest : Dest -> IR.Expr -> N (List St)
-  , atom : IR.Expr -> N (Pair (List St) Val)
-  , op : IR.Expr -> N (Pair (List St) Comp)
-  , pred : IR.Expr -> N (Maybe Cond)
+  , simple : IR.Expr -> S Val
+  , tail : Maybe Self -> IR.Expr -> S Tl
+  , bindTo : String -> IR.Expr -> S (List St)
+  , toDest : Dest -> IR.Expr -> S (List St)
+  , atom : IR.Expr -> S (Pair (List St) Val)
+  , op : IR.Expr -> S (Pair (List St) Comp)
+  , pred : IR.Expr -> S (Maybe Cond)
   }
 
 -- Conditions
@@ -302,23 +272,23 @@ predLets (Cons (SLet x o) rest) p = letIn x o (predLets rest p)
 predLets _ p = Nothing
 
 -- | a `Bool` computed, looked at
-predValue : G -> IR.Expr -> N (Maybe Cond)
+predValue : G -> IR.Expr -> S (Maybe Cond)
 predValue g e =
   if isSimple e
   then do
     v <- g.simple e
     pure (Just (PBool v))
   else do
-    t <- freshN "c"
+    t <- freshS "c"
     ss <- g.bindTo t e
     pure (predLets ss (PBool (SVar t)))
 
 -- (a comparison, its operands bound before where they are not simple)
-relPred : G -> String -> IR.Expr -> IR.Expr -> N (Maybe Cond)
+relPred : G -> String -> IR.Expr -> IR.Expr -> S (Maybe Cond)
 relPred g p a b = do
   pa <- g.atom a
   pb <- g.atom b
-  pure (predLets (appendL (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
+  pure (predLets (List.append (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
 
 -- (each part a condition)
 ifPred : Maybe Cond -> Maybe Cond -> Maybe Cond -> Maybe Cond
@@ -327,7 +297,7 @@ ifPred _ _ _ = Nothing
 
 -- | a condition (heff.compile.ir's), as one here: the same, its operands
 -- | bound where they are computed
-condPred : G -> IR.Cond -> N (Maybe Cond)
+condPred : G -> IR.Cond -> S (Maybe Cond)
 condPred g CTrue = pure (Just PTrue)
 condPred g CFalse = pure (Just PFalse)
 condPred g (CRel p a b) = relPred g p a b
@@ -343,7 +313,7 @@ condPred g (CIf a b c) = do
   pc <- condPred g c
   pure (ifPred pa pb pc)
 
-predAny : G -> IR.Expr -> N (Maybe Cond)
+predAny : G -> IR.Expr -> S (Maybe Cond)
 predAny g (ETag t Nil _) =
   if strEq t "True" then pure (Just PTrue)
   else if strEq t "False" then pure (Just PFalse)
@@ -353,7 +323,7 @@ predAny g e@(EPrimCall p (Cons a (Cons b Nil))) =
   then do
     pa <- g.atom a
     pb <- g.atom b
-    pure (predLets (appendL (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
+    pure (predLets (List.append (fst pa) (fst pb)) (PRel p (snd pa) (snd pb)))
   else predValue g e
 predAny g e@(EMatch s arms) = case boolArms arms of
   Just (MkPair t f) -> do
@@ -386,14 +356,14 @@ isCondE e = False
 -- | a `Bool`, as a condition (none, where what computes it is not
 -- | bindings alone; nor, not `full`, where it is not a comparison or a
 -- | condition)
-predOf : G -> IR.Expr -> N (Maybe Cond)
+predOf : G -> IR.Expr -> S (Maybe Cond)
 predOf g e =
   if g.full || isRelCall e || isCondE e then predAny g e else pure Nothing
 
 -- Statements
 --------------------------------------------------------------------------------
 
-simpleOf : G -> IR.Expr -> N Val
+simpleOf : G -> IR.Expr -> S Val
 simpleOf g (EVar x) = pure (SVar x)
 simpleOf g (EGlobal k) = pure (SGlobal k)
 simpleOf g (EInt i) = pure (SInt i)
@@ -407,45 +377,45 @@ simpleOf g (ELam xs b) = do
   t <- g.tail Nothing b
   pure (SLam xs (MkBlock t))
 simpleOf g (ETag t args ts) = do
-  vs <- traverseN g.simple args
+  vs <- traverseS g.simple args
   pure (STag t vs ts)
 simpleOf g (ERecord fs ts) = do
-  vs <- traverseN (\f -> g.simple (snd f)) fs
+  vs <- traverseS (\f -> g.simple (snd f)) fs
   pure (SRec (List.zipWith (\f v -> MkPair (fst f) v) fs vs) ts)
 simpleOf g (EProj e l sh t) = do
   v <- g.simple e
   pure (SProj v l sh t)
 simpleOf g (EPrimCall p args) = do
-  vs <- traverseN g.simple args
+  vs <- traverseS g.simple args
   pure (SPrim p vs)
 -- (not simple: no operand is made of it -- `isSimple` is asked first)
 simpleOf g e = pure (SPrim "$notSimple" Nil)
 
 -- | an operand: simple, or bound before by the statements given
-atomOf : G -> IR.Expr -> N (Pair (List St) Val)
+atomOf : G -> IR.Expr -> S (Pair (List St) Val)
 atomOf g e =
   if isSimple e
   then do
     v <- g.simple e
     pure (MkPair Nil v)
   else do
-    t <- freshN "t"
+    t <- freshS "t"
     ss <- g.bindTo t e
     pure (MkPair ss (SVar t))
 
-atomsOf : G -> List IR.Expr -> N (Pair (List St) (List Val))
+atomsOf : G -> List IR.Expr -> S (Pair (List St) (List Val))
 atomsOf g Nil = pure (MkPair Nil Nil)
 atomsOf g (Cons e es) = do
   a <- g.atom e
   rest <- atomsOf g es
-  pure (MkPair (appendL (fst a) (fst rest)) (Cons (snd a) (snd rest)))
+  pure (MkPair (List.append (fst a) (fst rest)) (Cons (snd a) (snd rest)))
 
 opWith : Pair (List St) (List Val) -> (List Val -> Comp) -> Pair (List St) Comp
 opWith (MkPair ss vs) k = MkPair ss (k vs)
 
 -- | what is computed in one step (not a binding, nor a match), its
 -- | operands bound before where they are not simple
-opOf : G -> IR.Expr -> N (Pair (List St) Comp)
+opOf : G -> IR.Expr -> S (Pair (List St) Comp)
 opOf g (ECall k args) = do
   r <- atomsOf g args
   pure (opWith r (\vs -> OCall k vs))
@@ -485,7 +455,7 @@ opOf g e = do
   pure (MkPair Nil (OSimple v))
 
 -- | a test whose arms are `Bool`s too: the `Bool` the whole is
-boolOf : G -> IR.Expr -> N (Maybe Comp)
+boolOf : G -> IR.Expr -> S (Maybe Comp)
 boolOf g e = do
   p <- g.pred e
   pure (case p of
@@ -502,20 +472,20 @@ armDest : Dest -> Dest
 armDest (DLet x) = DSet x
 armDest d = d
 
-caseSet : G -> Dest -> IR.Expr -> List IR.Arm -> N (List St)
+caseSet : G -> Dest -> IR.Expr -> List IR.Arm -> S (List St)
 caseSet g d s arms = do
   sv <- g.atom s
   args <-
-    traverseN
+    traverseS
       (\arm -> case arm of
        MkArm t vs b -> do
          sb <- g.toDest d b
          pure (MkArm t vs sb))
       arms
-  pure (appendL (fst sv) (Cons (SCase (snd sv) args) Nil))
+  pure (List.append (fst sv) (Cons (SCase (snd sv) args) Nil))
 
 -- (each arm setting the destination; a test, by its condition)
-matchSet : G -> Dest -> IR.Expr -> List IR.Arm -> N (List St)
+matchSet : G -> Dest -> IR.Expr -> List IR.Arm -> S (List St)
 matchSet g d s arms = case boolArms arms of
   Just (MkPair t f) -> do
     p <- g.pred s
@@ -531,7 +501,7 @@ matchSet g d s arms = case boolArms arms of
 -- that statement looks at is bound)
 declsBefore : List String -> List St -> List St
 declsBefore xs Nil = List.map (\x -> SDecl x) xs
-declsBefore xs (Cons st Nil) = appendL (List.map (\x -> SDecl x) xs) [st]
+declsBefore xs (Cons st Nil) = List.append (List.map (\x -> SDecl x) xs) [st]
 declsBefore xs (Cons st rest) = Cons st (declsBefore xs rest)
 
 declBefore : String -> List St -> List St
@@ -539,7 +509,7 @@ declBefore x ss = declsBefore [x] ss
 
 -- | a match that sets the destination in each arm: where it is bound, it
 -- | is declared first
-matchTo : G -> Dest -> IR.Expr -> List IR.Arm -> N (List St)
+matchTo : G -> Dest -> IR.Expr -> List IR.Arm -> S (List St)
 matchTo g d s arms = do
   sw <- matchSet g (armDest d) s arms
   pure (case d of
@@ -549,44 +519,44 @@ matchTo g d s arms = do
 -- | `xs` set by the way out of `a` taken (heff.compile.ir's `ESet`), each
 -- | way its values: declared before the statement that sets them; where
 -- | there is one way, each bound to its value
-setsOf : G -> List String -> IR.Expr -> N (List St)
+setsOf : G -> List String -> IR.Expr -> S (List St)
 setsOf g xs (ELet y a b) = do
   sa <- g.bindTo y a
   sb <- setsOf g xs b
-  pure (appendL sa sb)
+  pure (List.append sa sb)
 setsOf g xs (ESet ys a b) = do
   sa <- setsOf g ys a
   sb <- setsOf g xs b
-  pure (appendL sa sb)
+  pure (List.append sa sb)
 setsOf g xs (EValues es) = do
-  ss <- traverseN (\p -> g.bindTo (fst p) (snd p)) (List.zip xs es)
-  pure (List.foldr appendL Nil ss)
+  ss <- traverseS (\p -> g.bindTo (fst p) (snd p)) (List.zip xs es)
+  pure (List.foldr List.append Nil ss)
 setsOf g xs (EMatch s arms) = do
   sw <- matchSet g (DSets xs) s arms
   pure (declsBefore xs sw)
 setsOf g xs e = do
   sw <- g.toDest (DSets xs) e
-  pure (appendL (List.map (\x -> SDecl x) xs) sw)
+  pure (List.append (List.map (\x -> SDecl x) xs) sw)
 
 -- | `e`'s value, given to the destination
-toDest : G -> Dest -> IR.Expr -> N (List St)
+toDest : G -> Dest -> IR.Expr -> S (List St)
 toDest g d (ELet y a b) = case sinkTest y a b of
   Just e2 -> toDest g d e2
   Nothing -> do
     sa <- g.bindTo y a
     sb <- toDest g d b
-    pure (appendL sa sb)
+    pure (List.append sa sb)
 -- (the values of a way out, each set)
 toDest g (DSets xs) (EValues es) = do
   r <- atomsOf g es
   pure
-      (appendL
+      (List.append
          (fst r)
          (List.zipWith (\x v -> SSet x (OSimple v)) xs (snd r)))
 toDest g d (ESet xs a b) = do
   sa <- setsOf g xs a
   sb <- toDest g d b
-  pure (appendL sa sb)
+  pure (List.append sa sb)
 -- (a condition: the `Bool` it is; else as the matches it is made of)
 toDest g d e@(EBool c) = do
   bo <- boolOf g e
@@ -605,11 +575,11 @@ toDest g d e@(EMatch s arms) = case boolArms arms of
   Nothing -> matchTo g d s arms
 toDest g (DSets xs) e = do
   r <- g.op e
-  t <- freshN "t"
-  pure (appendL (fst r) (Cons (SLet t (snd r)) Nil))
+  t <- freshS "t"
+  pure (List.append (fst r) (Cons (SLet t (snd r)) Nil))
 toDest g d e = do
   r <- g.op e
-  pure (appendL (fst r) (Cons (destStmt d (snd r)) Nil))
+  pure (List.append (fst r) (Cons (destStmt d (snd r)) Nil))
 
 -- Tails
 --------------------------------------------------------------------------------
@@ -620,23 +590,23 @@ isSelf Nothing k args = False
 
 tailSeq : List St -> Tl -> Tl
 tailSeq Nil t = t
-tailSeq ss (TSeq ss2 t) = TSeq (appendL ss ss2) t
+tailSeq ss (TSeq ss2 t) = TSeq (List.append ss ss2) t
 tailSeq ss t = TSeq ss t
 
 isNothingM : {a : Type} -> Maybe a -> Bool
 isNothingM Nothing = True
 isNothingM (Just _) = False
 
-opTail : G -> IR.Expr -> N Tl
+opTail : G -> IR.Expr -> S Tl
 opTail g e = do
   r <- g.op e
   pure (tailSeq (fst r) (TReturn (snd r)))
 
-caseTail : G -> Maybe Self -> IR.Expr -> List IR.Arm -> N Tl
+caseTail : G -> Maybe Self -> IR.Expr -> List IR.Arm -> S Tl
 caseTail g self s arms = do
   sv <- g.atom s
   args <-
-    traverseN
+    traverseS
       (\arm -> case arm of
        MkArm t vs b -> do
          tb <- g.tail self b
@@ -651,7 +621,7 @@ testTail : G
          -> IR.Expr
          -> IR.Expr
          -> List IR.Arm
-         -> N Tl
+         -> S Tl
 testTail g self s t f arms = do
   p <- g.pred s
   case p of
@@ -663,7 +633,7 @@ testTail g self s t f arms = do
 
 -- | what is last, in a function's body (`self`, the function, where a
 -- | call of it is the next round) or a lambda's
-tailOf : G -> Maybe Self -> IR.Expr -> N Tl
+tailOf : G -> Maybe Self -> IR.Expr -> S Tl
 tailOf g self (ELet y a b) = case sinkTest y a b of
   Just e2 -> g.tail self e2
   Nothing -> do
@@ -729,7 +699,7 @@ loopOf key xs b =
   then Just ({ key = key, arity = List.length xs } : Self)
   else Nothing
 
-defOf : G -> IR.Def -> N Def
+defOf : G -> IR.Def -> S Def
 defOf g d = case d.body of
   ELam xs b -> do
     t <- g.tail (loopOf d.key xs b) b

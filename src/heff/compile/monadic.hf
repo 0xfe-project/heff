@@ -22,32 +22,11 @@ module heff.compile.monadic
 
 import heff.compile.ir as IR
 import heff.compile.simplify as Simplify
+import heff.compile.supply
 
--- | computations drawing fresh names
-type N a = Int -> Pair a Int
-
-bindTake : {a b : Type} -> (a -> N b) -> Pair a Int -> Pair b Int
-bindTake f (MkPair x n) = f x n
-
--- `do` is this
-bind : {a b : Type} -> N a -> (a -> N b) -> N b
-bind m f = \n -> bindTake f (m n)
-
-pure : {a : Type} -> a -> N a
-pure x = \n -> MkPair x n
-
-fresh : N String
-fresh = \n -> MkPair ("t$" ^ show n) (n + 1)
-
-instance instanceMonadN : Monad N
-instanceMonadN = { pure = pure, bind = bind }
-
-traverseN : {a b : Type} -> (a -> N b) -> List a -> N (List b)
-traverseN = traverse (mo := instanceMonadN)
-
-allA : {a : Type} -> (a -> Bool) -> List a -> Bool
-allA p Nil = True
-allA p (Cons x xs) = p x && allA p xs
+-- (a name of the operands it binds)
+fresh : S String
+fresh = freshS "t"
 
 -- | a name or a literal
 atom : IR.Expr -> Bool
@@ -70,15 +49,15 @@ value e = atom e
 -- | an operand that may stay where it is
 inPlace : IR.Expr -> Bool
 inPlace (ELam _ _) = True
-inPlace (ETag _ args _) = allA value args
-inPlace (ERecord fs _) = allA value (List.map snd fs)
+inPlace (ETag _ args _) = List.all value args
+inPlace (ERecord fs _) = List.all value (List.map snd fs)
 inPlace (EProj e _ _ _) = atom e
-inPlace (EPrimCall p args) = not (Simplify.primFails p) && allA atom args
+inPlace (EPrimCall p args) = not (Simplify.primFails p) && List.all atom args
 inPlace e = atom e
 
 -- | an operand, normal (by `go`), given to `k`: bound first unless it may
 -- | stay; the bindings it made on the way bound before it
-bindAs : IR.Expr -> (IR.Expr -> N IR.Expr) -> N IR.Expr
+bindAs : IR.Expr -> (IR.Expr -> S IR.Expr) -> S IR.Expr
 bindAs (ELet y c d) k = do
   r <- bindAs d k
   pure (ELet y c r)
@@ -95,7 +74,7 @@ bindAs e k =
 -- | ... bound unless it is a name or a literal: what a match looks at
 -- | (its arms then see what it looked at by a name, and the C backend's
 -- | reference counts know it)
-bindAtom : IR.Expr -> (IR.Expr -> N IR.Expr) -> N IR.Expr
+bindAtom : IR.Expr -> (IR.Expr -> S IR.Expr) -> S IR.Expr
 bindAtom (ELet y c d) k = do
   r <- bindAtom d k
   pure (ELet y c r)
@@ -109,18 +88,18 @@ bindAtom e k =
     body <- k (EVar t)
     pure (ELet t e body)
 
-operandWith : (IR.Expr -> N IR.Expr)
+operandWith : (IR.Expr -> S IR.Expr)
             -> IR.Expr
-            -> (IR.Expr -> N IR.Expr)
-            -> N IR.Expr
+            -> (IR.Expr -> S IR.Expr)
+            -> S IR.Expr
 operandWith go e k = do
   e' <- go e
   bindAs e' k
 
-operandsWith : (IR.Expr -> N IR.Expr)
+operandsWith : (IR.Expr -> S IR.Expr)
              -> List IR.Expr
-             -> (List IR.Expr -> N IR.Expr)
-             -> N IR.Expr
+             -> (List IR.Expr -> S IR.Expr)
+             -> S IR.Expr
 operandsWith go Nil k = k Nil
 operandsWith go (Cons a rest) k =
   operandWith go a (\a' -> operandsWith go rest (\rest' -> k (Cons a' rest')))
@@ -131,10 +110,10 @@ flatLet x (ELet y c d) b = ELet y c (flatLet x d b)
 flatLet x (ESet ys c d) b = ESet ys c (flatLet x d b)
 flatLet x a b = ELet x a b
 
-fieldN : (IR.Expr -> N IR.Expr)
+fieldN : (IR.Expr -> S IR.Expr)
        -> List (Pair String IR.Expr)
        -> List IR.FieldTy
-       -> N IR.Expr
+       -> S IR.Expr
 fieldN go fs ts =
   operandsWith
     go
@@ -143,7 +122,7 @@ fieldN go fs ts =
 
 -- | ... what a match looks at, a condition kept where it is (an `if`
 -- | on it builds no `Bool`)
-bindScrut : IR.Expr -> (IR.Expr -> N IR.Expr) -> N IR.Expr
+bindScrut : IR.Expr -> (IR.Expr -> S IR.Expr) -> S IR.Expr
 bindScrut (ELet y c d) k = do
   r <- bindScrut d k
   pure (ELet y c r)
@@ -157,10 +136,10 @@ bindScrut e k = bindAtom e k
 -- | it is computed bound before it as an operand is; what an arm of a
 -- | `CIf` computes, computed only where it is chosen, in monadic form in
 -- | its place
-condN : (IR.Expr -> N IR.Expr)
+condN : (IR.Expr -> S IR.Expr)
       -> IR.Cond
-      -> (IR.Cond -> N IR.Expr)
-      -> N IR.Expr
+      -> (IR.Cond -> S IR.Expr)
+      -> S IR.Expr
 condN go (CRel p a b) k =
   operandsWith go [a, b] (\vs -> case vs of
   Cons a2 (Cons b2 Nil) -> k (CRel p a2 b2)
@@ -171,21 +150,13 @@ condN go (CIf a b c) k =
   condN
     go
     a (\a2 -> do
-  b2 <- IR.condTraverse (mo := instanceMonadN) go b
-  c2 <- IR.condTraverse (mo := instanceMonadN) go c
+  b2 <- IR.condTraverse (mo := instanceMonadS) go b
+  c2 <- IR.condTraverse (mo := instanceMonadS) go c
   k (CIf a2 b2 c2))
 condN go c k = k c
 
-armN : (IR.Expr -> N IR.Expr) -> IR.Arm -> N IR.Arm
-armN go (MkArm t vs b) = do
-  b' <- go b
-  pure (MkArm t vs b')
-
 -- | an expression in monadic form
-norm : IR.Expr -> N IR.Expr
-norm (ELam xs b) = do
-  b' <- norm b
-  pure (ELam xs b')
+norm : IR.Expr -> S IR.Expr
 norm (EApp f args) =
   operandWith
     norm
@@ -205,17 +176,13 @@ norm (ELet x a b) = do
 norm (EMatch s arms) = do
   s0 <- norm s
   bindScrut s0 (\s' -> do
-    arms' <- traverseN (armN norm) arms
+    arms' <- traverseS (IR.traverseArm (\_ b -> norm b)) arms
     pure (EMatch s' arms'))
 norm (EBool c) = condN norm c (\c2 -> pure (EBool c2))
-norm (ESet xs a b) = do
-  a' <- norm a
-  b' <- norm b
-  pure (ESet xs a' b')
 norm (EValues es) = operandsWith norm es (\es' -> pure (EValues es'))
-norm e = pure e
+norm e = IR.traverseParts (\_ p -> norm p) e
 
-defN : IR.Def -> N IR.Def
+defN : IR.Def -> S IR.Def
 defN d = do
   b <- norm d.body
   pure (IR.mkDef d.key d.name b)
@@ -224,8 +191,8 @@ defN d = do
 -- | >>> monadicProgram 0 [IR.mkDef "f" "f" (ELam ["x"] (ECall "g" [ECall "h" [EVar "x"], EInt 1]))]
 -- | [IR.mkDef "f" "f" (ELam ["x"] (ELet "t$0" (ECall "h" [EVar "x"]) (ECall "g" [EVar "t$0", EInt 1])))]
 monadicProgram : Int -> List IR.Def -> List IR.Def
-monadicProgram supply defs = fst (traverseN defN defs supply)
+monadicProgram supply defs = fst (traverseS defN defs supply)
 
 -- | ... and where fresh names go on from
 monadicFrom : Int -> List IR.Def -> Pair (List IR.Def) Int
-monadicFrom supply defs = traverseN defN defs supply
+monadicFrom supply defs = traverseS defN defs supply
