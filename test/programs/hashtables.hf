@@ -1,0 +1,205 @@
+-- Hash tables held to hash maps: the same operations, at random, on a
+-- std.hashtable and a std.hashmap, and what each says compared --
+-- keys of a hash of their own that collide (a key's last digit, or
+-- none at all), many removed, the table grown -- and the order of the
+-- slots, the same on every backend.
+
+module test.programs.hashtables
+
+import std.hashmap as HashMap
+import std.hashtable as HashTable
+
+-- (keys whose hash is their last digit, or one hash for all of them)
+data Digit = MkDigit Int
+
+data Same = MkSame Int
+
+instance instanceEqualityDigit : Equality Digit
+instanceEqualityDigit = { equal = \a b -> same a b }
+  where
+  same : Digit -> Digit -> Bool
+  same (MkDigit x) (MkDigit y) = x == y
+
+instance instanceHashDigit : HashMap.Hash Digit
+instanceHashDigit = { hash = \d -> lastDigit d }
+  where
+  lastDigit : Digit -> Int
+  lastDigit (MkDigit x) = x % 10
+
+instance instanceEqualitySame : Equality Same
+instanceEqualitySame = { equal = \a b -> same a b }
+  where
+  same : Same -> Same -> Bool
+  same (MkSame x) (MkSame y) = x == y
+
+instance instanceHashSame : HashMap.Hash Same
+instanceHashSame = { hash = \d -> 7 }
+
+digit : Int -> Digit
+digit i = MkDigit i
+
+sameOf : Int -> Same
+sameOf i = MkSame i
+
+-- (MINSTD's next)
+next : Int -> Int
+next x = (x * 48271) % 2147483647
+
+-- (an operation: insert, update, remove, alter, each 1 in 4, of a key
+-- below `range`)
+data Op = Insert Int Int | Update Int Int | Remove Int | Alter Int Int
+
+opOf : Int -> Int -> Op
+opOf range x =
+  if x % 4 == 0 then Insert ((x / 4) % range) (x % 1000)
+  else if x % 4 == 1 then Update ((x / 4) % range) (x % 1000)
+  else if x % 4 == 2 then Remove ((x / 4) % range)
+  else Alter ((x / 4) % range) (x % 1000)
+
+ops : Int -> Int -> Int -> List Op
+ops n range x =
+  if n == 0 then Nil else Cons (opOf range x) (ops (n - 1) range (next x))
+
+-- (what both are, and whether they have agreed so far: on each removed
+-- value)
+data Both k = MkBoth (HashTable.HashTable k Int) (HashMap.HashMap k Int) Bool
+
+-- (an alter's function: removes an odd value, else adds)
+altering : Int -> Maybe Int -> Maybe Int
+altering v Nothing = Just v
+altering v (Just old) = if old % 2 == 1 then Nothing else Just (old + v)
+
+applied : {k : Type}
+        -> {{hashing : HashMap.Hash k}}
+        -> {{eq : Equality k}}
+        -> (Int -> k)
+        -> Both k
+        -> Op
+        -> Both k
+applied key (MkBoth t m ok) (Insert k v) =
+  MkBoth (HashTable.insert t (key k) v) (HashMap.insert m (key k) v) ok
+applied key (MkBoth t m ok) (Update k v) =
+  MkBoth
+    (HashTable.update t (key k) v (\new old -> new + old))
+    (HashMap.update m (key k) v (\new old -> new + old))
+    ok
+applied key (MkBoth t m ok) (Remove k) =
+  let a = HashTable.remove t (key k)
+  in let b = HashMap.remove m (key k)
+  in MkBoth (snd a) (snd b) (ok && equal (fst a) (fst b))
+applied key (MkBoth t m ok) (Alter k v) =
+  MkBoth
+    (HashTable.alter t (key k) (altering v))
+    (HashMap.alter m (key k) (altering v))
+    ok
+
+-- (whether they bind the same: the same size, each key of either found
+-- in the other, bound to the same, and the same pairs by `for`)
+agree : {k : Type}
+      -> {{hashing : HashMap.Hash k}}
+      -> {{eq : Equality k}}
+      -> (Int -> k)
+      -> Int
+      -> Both k
+      -> List Bool
+agree key range (MkBoth t m ok) =
+  [ ok
+  , HashTable.size t == HashMap.size m
+  , HashTable.foldl (\n k v -> n + 1) 0 t == HashTable.size t
+  , List.all
+    (\i -> equal (HashTable.lookup t (key i)) (HashMap.lookup m (key i)))
+    (List.range 0 (range + 5))
+  , HashMap.foldl
+    (\b k v -> b && equal (HashTable.lookup t k) (Just v))
+    True
+    m
+  , List.length (HashTable.toList t) == HashTable.size t
+  , run do
+    let mut n = 0
+    let mut sum = 0
+    for p in t do
+      n := n + 1
+      sum := sum + snd p
+    n == HashTable.size t && sum == HashMap.foldl (\s k v -> s + v) 0 m
+  ]
+
+final : {k : Type}
+      -> {{hashing : HashMap.Hash k}}
+      -> {{eq : Equality k}}
+      -> (Int -> k)
+      -> Int
+      -> Int
+      -> Int
+      -> Both k
+final key n range seed =
+  List.foldl
+    (applied key)
+    (MkBoth HashTable.empty HashMap.empty True)
+    (ops n range seed)
+
+-- (many keys, a few removed: the table grown)
+ints : List Bool
+ints = agree (\i -> i) 3000 (final (\i -> i) 4000 3000 42)
+
+-- (a few keys, many removed and bound again)
+churned : List Bool
+churned = agree (\i -> i) 60 (final (\i -> i) 3000 60 7)
+
+strings : List Bool
+strings =
+  agree (\i -> showInt i) 500 (final (\i -> showInt i) 2000 500 11)
+
+-- (ten hashes for all the keys)
+digits : List Bool
+digits = agree digit 300 (final digit 2000 300 5)
+
+-- (one hash for all the keys)
+sames : List Bool
+sames = agree sameOf 40 (final sameOf 600 40 3)
+
+-- (every key removed: the table empty, and bound again)
+drained : List Int
+drained = run do
+  let mut t : HashTable.HashTable Int Int = HashTable.empty
+  for i in range 0 99 do
+    t := HashTable.insert t i i
+  for i in range 0 99 do
+    t := HashTable.delete t i
+  let n = HashTable.size t
+  t := HashTable.insert t 5 50
+  [n, HashTable.size t, fromMaybe 0 (HashTable.lookup t 5)]
+
+-- (the slots' order, the same on every backend)
+slots : List (Pair Int String)
+slots =
+  HashTable.toList
+    (HashTable.delete
+       (HashTable.fromList
+          (List.map (\i -> MkPair (i * 37 % 101) (showInt i)) (List.range 0 30)))
+       37)
+
+sized : List Int
+sized =
+  [ HashTable.size (HashTable.withCapacity 1000 : HashTable.HashTable Int Int)
+  , HashTable.size
+    (List.foldl
+       (\t i -> HashTable.insert t i i)
+       (HashTable.withCapacity 1000)
+       (List.range 1 1000))
+  ]
+
+equalities : List Bool
+equalities =
+  [ equal
+    (HashTable.fromList (List.map (\i -> MkPair i i) (List.range 0 50)))
+    (HashTable.fromList (List.map (\i -> MkPair i i) (List.reverse (List.range 0 50))))
+  , equal
+    (HashTable.delete (HashTable.fromList [MkPair 1 1, MkPair 2 2]) 2)
+    (HashTable.fromList [MkPair 1 1])
+  , equal
+    (HashTable.fromList [MkPair 1 1, MkPair 2 2])
+    (HashTable.fromList [MkPair 1 1, MkPair 2 3])
+  ]
+
+shown : String
+shown = show (HashTable.fromList [MkPair "b" 2, MkPair "a" 1])

@@ -1,0 +1,522 @@
+-- Maps from keys to values by the keys' hashes, in flat arrays: open
+-- addressing, as Rust's, Go's and Python's tables are.  Import it by a
+-- name, `import std.hashtable as HashTable` (`HashTable.insert`); its
+-- names and their shapes are std.hashmap's, so that one is changed for
+-- the other by the import.
+--
+-- ```haskell
+-- import std.hashmap as HashMap
+-- import std.hashtable as HashTable
+--
+-- -- | >>> HashTable.lookup (counted ["a", "b", "a"]) "a"
+-- -- | Just 2
+-- counted : List String -> HashTable.HashTable String Int
+-- counted ws =
+--   List.foldl (\t w -> HashTable.update t w 1 (\new old -> new + old)) HashTable.empty ws
+-- ```
+--
+-- A table is three arrays as long as its slots, a power of 2: each
+-- slot's key's hash (0 where the slot is empty), its key and its value.
+-- A key starts at the slot its hash's bits choose and goes on to the
+-- next while that one is taken (linear probing); a slot's hash is
+-- compared before its key, so that another key is seldom looked at.
+-- Past 7/8 of the slots taken, the table doubles; `withCapacity` makes
+-- room at once.  A key removed takes the keys after it, that started
+-- before it, back a slot, so that removing leaves nothing behind.
+--
+-- Where nothing else holds the table, a change is made in its arrays in
+-- place, a key found in one or two slots, side by side in memory: for a
+-- table one owner fills and reads (counting, an index), it is faster
+-- than std.hashmap's trie, and smaller.  But where something else holds
+-- it -- an old version kept, the table put in two places -- a change
+-- copies all its slots first, where std.hashmap's copies one path.
+-- Keep the old versions of a map in std.hashmap.
+--
+-- The keys' type has a `Hash` (std.hashmap's: strings, integers, runes,
+-- booleans, pairs, lists and `Maybe`s of them) and an `Equality`, each
+-- found as an instance argument is: import std.hashmap too, for its
+-- instances of `Hash` to be in scope.  The order of `toList`, `foldl` and
+-- `for` is the slots': the same on every backend, but of how the table
+-- came to be (what was bound and removed, in which order, and how many
+-- slots it has), not of what it binds: two tables of the same keys may
+-- list them in two orders, and are equal all the same.  std.hashmap's
+-- order is of the keys' hashes alone.
+
+module std.hashtable
+
+import array as Array
+import int as Int
+import std.hashmap as HashMap
+
+-- | A table: how many keys it binds; each slot's key's hash, made odd
+-- | (0: an empty slot); each slot's key, and value.  (A slot that is
+-- | empty holds a key and a value of the table's, the first it was
+-- | given, kept after the last slot as well, so that removing a key lets
+-- | it go.)
+data HashTable k v = MkHashTable Int (Array Int) (Array k) (Array v)
+
+-- | The table of no keys (and no slots: the first key bound makes 8).
+empty : {k v : Type} -> HashTable k v
+empty = MkHashTable 0 Array.empty Array.empty Array.empty
+
+-- (the slots for `n` keys, at most 7/8 of them taken: a power of 2, from
+-- `c`)
+slotsFor : Int -> Int -> Int
+slotsFor c n = if n * 8 <= c * 7 then c else slotsFor (c * 2) n
+
+-- | The table of no keys, with slots enough for `n`, so that so many
+-- | keys bound do not grow it.
+withCapacity : {k v : Type} -> Int -> HashTable k v
+withCapacity n =
+  MkHashTable 0 (Array.replicate (slotsFor 8 n) 0) Array.empty Array.empty
+
+-- (a hash as its slot keeps it: odd, so never 0)
+stored : Int -> Int
+stored h = or h 1
+
+-- (the slot a stored hash starts at, `mask` the slots less 1)
+homeOf : Int -> Int -> Int
+homeOf s mask = and (shiftR s 1) mask
+
+-- (the slot of `key`, its stored hash `s`, or the empty slot it would be
+-- put in: from `i` on)
+slotOf : {k : Type}
+       -> (k -> k -> Bool)
+       -> Array Int
+       -> Array k
+       -> Int
+       -> Int
+       -> k
+       -> Int
+       -> Int
+slotOf eq hs ks mask s key i =
+  let t = arrayIndex hs i
+  in if t == 0 then i
+  else if t == s && eq key (arrayIndex ks i) then i
+  else slotOf eq hs ks mask s key (and (i + 1) mask)
+
+-- (the empty slot, from `i` on)
+emptyFrom : Array Int -> Int -> Int -> Int
+emptyFrom hs mask i =
+  if arrayIndex hs i == 0 then i else emptyFrom hs mask (and (i + 1) mask)
+
+-- (what an empty slot holds: what is after the last)
+filler : {a : Type} -> Array a -> a
+filler xs = arrayIndex xs (arrayLength xs - 1)
+
+-- (the slots of `cap` slots' keys or values, each holding the filler of
+-- `xs`, the old ones; none, if `xs` has none)
+refilled : {a : Type} -> Int -> Array a -> Array a
+refilled cap xs =
+  if arrayLength xs == 0 then xs else Array.replicate (cap + 1) (filler xs)
+
+-- (keys or values, `x` the filler of each slot where there is none yet:
+-- the first key bound)
+filledWith : {a : Type} -> Int -> a -> Array a -> Array a
+filledWith cap x xs =
+  if arrayLength xs == 0 then Array.replicate (cap + 1) x else xs
+
+-- (a key put in the first empty slot from where it starts: as the slots
+-- are grown, no key compared)
+movedIn : {k v : Type} -> Int -> k -> v -> HashTable k v -> HashTable k v
+movedIn s key value (MkHashTable n hs ks vs) =
+  let i = emptyFrom hs (arrayLength hs - 1) (homeOf s (arrayLength hs - 1))
+  in MkHashTable
+    (n + 1)
+    (arraySet hs i s)
+    (arraySet ks i key)
+    (arraySet vs i value)
+
+-- (the keys of the slots from `i` on moved into the table `t`)
+moved : {k v : Type}
+      -> Int
+      -> Array Int
+      -> Array k
+      -> Array v
+      -> HashTable k v
+      -> HashTable k v
+moved i hs ks vs t =
+  if i == arrayLength hs then t
+  else if arrayIndex hs i == 0 then moved (i + 1) hs ks vs t
+  else moved
+      (i + 1)
+      hs
+      ks
+      vs
+      (movedIn (arrayIndex hs i) (arrayIndex ks i) (arrayIndex vs i) t)
+
+-- (the table in twice as many slots, 8 at least)
+grown : {k v : Type} -> HashTable k v -> HashTable k v
+grown (MkHashTable n hs ks vs) =
+  let cap = max 8 (arrayLength hs * 2)
+  in moved
+    0
+    hs
+    ks
+    vs
+    (MkHashTable
+       0
+       (Array.replicate cap 0)
+       (refilled cap ks)
+       (refilled cap vs))
+
+-- (a key new to the table put in the empty slot `i`)
+placed : {k v : Type}
+       -> Int
+       -> Array Int
+       -> Array k
+       -> Array v
+       -> Int
+       -> Int
+       -> k
+       -> v
+       -> HashTable k v
+placed n hs ks vs i s key value =
+  MkHashTable
+    (n + 1)
+    (arraySet hs i s)
+    (arraySet (filledWith (arrayLength hs) key ks) i key)
+    (arraySet (filledWith (arrayLength hs) value vs) i value)
+
+-- (`update` of a key whose stored hash is `s`: the table grown first
+-- where the key is new and would take more than 7/8 of the slots)
+updateAt : {k v : Type}
+         -> (k -> k -> Bool)
+         -> (v -> v -> v)
+         -> Int
+         -> k
+         -> v
+         -> HashTable k v
+         -> HashTable k v
+updateAt eq f s key value (MkHashTable n hs ks vs) =
+  if arrayLength hs == 0
+  then updateAt eq f s key value (grown (MkHashTable n hs ks vs))
+  else (let mask = arrayLength hs - 1
+        in let i = slotOf eq hs ks mask s key (homeOf s mask)
+        in if arrayIndex hs i /= 0
+        then MkHashTable n hs ks (arraySet vs i (f value (arrayIndex vs i)))
+        else if (n + 1) * 8 > arrayLength hs * 7
+        then updateAt eq f s key value (grown (MkHashTable n hs ks vs))
+        else placed n hs ks vs i s key value)
+
+-- | The table with `k` bound to `v`, or, where it is bound, to `f v old`
+-- | (Haskell's `insertWith`): a value changed in its slot.
+update : {k v : Type}
+       -> {{hashing : HashMap.Hash k}}
+       -> {{equality : Equality k}}
+       -> HashTable k v
+       -> k
+       -> v
+       -> (v -> v -> v)
+       -> HashTable k v
+update t key value f = updateAt equal f (stored (HashMap.hash key)) key value t
+
+-- | The table with `k` bound to `v` (instead of what it was, if it was).
+insert : {k v : Type}
+       -> {{hashing : HashMap.Hash k}}
+       -> {{equality : Equality k}}
+       -> HashTable k v
+       -> k
+       -> v
+       -> HashTable k v
+insert t key value =
+  updateAt equal (\new old -> new) (stored (HashMap.hash key)) key value t
+
+-- (`lookup` of a key whose stored hash is `s`)
+lookupAt : {k v : Type}
+         -> (k -> k -> Bool)
+         -> Int
+         -> k
+         -> HashTable k v
+         -> Maybe v
+lookupAt eq s key (MkHashTable n hs ks vs) =
+  if arrayLength hs == 0 then Nothing
+  else (let mask = arrayLength hs - 1
+        in let i = slotOf eq hs ks mask s key (homeOf s mask)
+        in if arrayIndex hs i == 0 then Nothing else Just (arrayIndex vs i))
+
+-- | What `k` is bound to, if it is.
+lookup : {k v : Type}
+       -> {{hashing : HashMap.Hash k}}
+       -> {{equality : Equality k}}
+       -> HashTable k v
+       -> k
+       -> Maybe v
+lookup t key = lookupAt equal (stored (HashMap.hash key)) key t
+
+-- (whether a key that starts at `h` may be in the slot `j`, but not in
+-- `i`, before it: whether `h` is after `i`, up to `j`, round the end)
+startsBetween : Int -> Int -> Int -> Bool
+startsBetween h i j = if i <= j then i < h && h <= j else i < h || h <= j
+
+-- (the slot `i` emptied: each key after it, up to an empty slot, that
+-- may be in `i` -- it starts there or before -- moved there, the slot it
+-- leaves emptied in turn; the last one given the filler, so that the key
+-- and the value it held are let go.  `j` is the slot looked at.)
+shifted : {k v : Type}
+        -> Int
+        -> Int
+        -> Int
+        -> Array Int
+        -> Array k
+        -> Array v
+        -> HashTable k v
+shifted n i j hs ks vs =
+  let t = arrayIndex hs j
+  in if t == 0
+  then MkHashTable
+      n
+      (arraySet hs i 0)
+      (arraySet ks i (filler ks))
+      (arraySet vs i (filler vs))
+  else if startsBetween (homeOf t (arrayLength hs - 1)) i j
+  then shifted n i (and (j + 1) (arrayLength hs - 1)) hs ks vs
+  else shifted
+      n
+      j
+      (and (j + 1) (arrayLength hs - 1))
+      (arraySet hs i t)
+      (arraySet ks i (arrayIndex ks j))
+      (arraySet vs i (arrayIndex vs j))
+
+-- (a table, its fillers let go where it binds no key)
+emptied : {k v : Type} -> HashTable k v -> HashTable k v
+emptied (MkHashTable 0 hs ks vs) = MkHashTable 0 hs Array.empty Array.empty
+emptied t = t
+
+-- (`remove` of a key whose stored hash is `s`)
+removeAt : {k v : Type}
+         -> (k -> k -> Bool)
+         -> Int
+         -> k
+         -> HashTable k v
+         -> Pair (Maybe v) (HashTable k v)
+removeAt eq s key (MkHashTable n hs ks vs) =
+  if arrayLength hs == 0 then MkPair Nothing (MkHashTable n hs ks vs)
+  else (let mask = arrayLength hs - 1
+        in let i = slotOf eq hs ks mask s key (homeOf s mask)
+        in if arrayIndex hs i == 0 then MkPair Nothing (MkHashTable n hs ks vs)
+        else MkPair
+            (Just (arrayIndex vs i))
+            (emptied (shifted (n - 1) i (and (i + 1) mask) hs ks vs)))
+
+-- | What `k` was bound to, if it was, and the table without it (Rust's
+-- | `remove`): a delete that says whether the key was there.
+remove : {k v : Type}
+       -> {{hashing : HashMap.Hash k}}
+       -> {{equality : Equality k}}
+       -> HashTable k v
+       -> k
+       -> Pair (Maybe v) (HashTable k v)
+remove t key = removeAt equal (stored (HashMap.hash key)) key t
+
+-- | The table without `k` (as it was, if `k` was not in it; `remove`
+-- | says which).
+delete : {k v : Type}
+       -> {{hashing : HashMap.Hash k}}
+       -> {{equality : Equality k}}
+       -> HashTable k v
+       -> k
+       -> HashTable k v
+delete t key = snd (remove t key)
+
+-- (a key not in the table bound as `f` said, given nothing: to a value,
+-- or not at all)
+added : {k v : Type}
+      -> (k -> k -> Bool)
+      -> Int
+      -> k
+      -> Maybe v
+      -> HashTable k v
+      -> HashTable k v
+added eq s key Nothing t = t
+added eq s key (Just v) t = updateAt eq (\new old -> new) s key v t
+
+-- (the key at the slot `i` bound as `f` said, given its value: to
+-- another, or not at all)
+kept : {k v : Type}
+     -> Int
+     -> Int
+     -> Array Int
+     -> Array k
+     -> Array v
+     -> Maybe v
+     -> HashTable k v
+kept n i hs ks vs Nothing =
+  emptied (shifted (n - 1) i (and (i + 1) (arrayLength hs - 1)) hs ks vs)
+kept n i hs ks vs (Just v) = MkHashTable n hs ks (arraySet vs i v)
+
+-- (`alter` of a key whose stored hash is `s`)
+alterAt : {k v : Type}
+        -> (k -> k -> Bool)
+        -> (Maybe v -> Maybe v)
+        -> Int
+        -> k
+        -> HashTable k v
+        -> HashTable k v
+alterAt eq f s key (MkHashTable n hs ks vs) =
+  if arrayLength hs == 0
+  then added eq s key (f Nothing) (MkHashTable n hs ks vs)
+  else (let mask = arrayLength hs - 1
+        in let i = slotOf eq hs ks mask s key (homeOf s mask)
+        in if arrayIndex hs i == 0
+        then added eq s key (f Nothing) (MkHashTable n hs ks vs)
+        else kept n i hs ks vs (f (Just (arrayIndex vs i))))
+
+-- | The table with `k` bound as `f` says, given what it is bound to, if
+-- | it is: to `f`'s value, or (`Nothing`) to none (Haskell's `alter`).
+alter : {k v : Type}
+      -> {{hashing : HashMap.Hash k}}
+      -> {{equality : Equality k}}
+      -> HashTable k v
+      -> k
+      -> (Maybe v -> Maybe v)
+      -> HashTable k v
+alter t key f = alterAt equal f (stored (HashMap.hash key)) key t
+
+-- (each key and its value in the slots from `i` on, into `z`)
+foldlFrom : {k v b : Type}
+          -> (b -> k -> v -> b)
+          -> Int
+          -> b
+          -> Array Int
+          -> Array k
+          -> Array v
+          -> b
+foldlFrom f i z hs ks vs =
+  if i == arrayLength hs then z
+  else if arrayIndex hs i == 0 then foldlFrom f (i + 1) z hs ks vs
+  else foldlFrom f (i + 1) (f z (arrayIndex ks i) (arrayIndex vs i)) hs ks vs
+
+-- | Each key and its value, from `z`, in the slots' order.
+foldl : {k v b : Type} -> (b -> k -> v -> b) -> b -> HashTable k v -> b
+foldl f z (MkHashTable n hs ks vs) = foldlFrom f 0 z hs ks vs
+
+-- | How many keys are bound: kept as they are bound and removed, not
+-- | counted.
+size : {k v : Type} -> HashTable k v -> Int
+size (MkHashTable n hs ks vs) = n
+
+-- (the keys and their values of the slots before `i`, before `acc`)
+listBefore : {k v : Type}
+           -> Int
+           -> Array Int
+           -> Array k
+           -> Array v
+           -> List (Pair k v)
+           -> List (Pair k v)
+listBefore i hs ks vs acc =
+  if i == 0 then acc
+  else if arrayIndex hs (i - 1) == 0 then listBefore (i - 1) hs ks vs acc
+  else listBefore
+      (i - 1)
+      hs
+      ks
+      vs
+      (Cons (MkPair (arrayIndex ks (i - 1)) (arrayIndex vs (i - 1))) acc)
+
+-- | The keys and their values, in the slots' order (of how the table came
+-- | to be, not of the keys): sort them for another.
+toList : {k v : Type} -> HashTable k v -> List (Pair k v)
+toList (MkHashTable n hs ks vs) = listBefore (arrayLength hs) hs ks vs Nil
+
+-- (a walk through a table's slots: where it is, and the table's arrays)
+data Slots k v = MkSlots Int (Array Int) (Array k) (Array v)
+
+-- (the first slot from `i` on that is taken, or the end)
+takenFrom : Array Int -> Int -> Int
+takenFrom hs i =
+  if i == arrayLength hs then i
+  else if arrayIndex hs i /= 0 then i
+  else takenFrom hs (i + 1)
+
+-- | A hash table, each key and its value in the slots' order, as
+-- | `toList` has them: `for p in t` goes through the slots.
+instance instanceIterateHashTable : {k v : Type} -> Iterate (HashTable k v)
+instanceIterateHashTable =
+  { Elem = Pair k v, Cursor = Slots k v, start = begin, next = step }
+  where
+  begin : HashTable k v -> Slots k v
+  begin (MkHashTable n hs ks vs) = MkSlots (takenFrom hs 0) hs ks vs
+  step : Slots k v -> Maybe (Pair (Pair k v) (Slots k v))
+  step (MkSlots i hs ks vs) =
+    if i == arrayLength hs then Nothing
+    else Just
+        (MkPair
+           (MkPair (arrayIndex ks i) (arrayIndex vs i))
+           (MkSlots (takenFrom hs (i + 1)) hs ks vs))
+
+-- | The table of the pairs, a later one's value for a key twice.
+-- | >>> lookup (fromList [MkPair "a" 1, MkPair "b" 2]) "b"
+-- | Just 2
+-- | >>> lookup (fromList [MkPair "a" 1, MkPair "b" 2]) "c"
+-- | Nothing
+-- | >>> lookup (insert (fromList [MkPair 2 "deux"]) 2 "two") 2
+-- | Just "two"
+-- | >>> size (fromList [MkPair "a" 1, MkPair "b" 2, MkPair "a" 3])
+-- | 2
+-- | >>> foldl (\n k v -> n + k * v) 0 (fromList [MkPair 2 3, MkPair 4 5])
+-- | 26
+-- | >>> List.sortBy (\a b -> compareString (fst a) (fst b) /= GT) (toList (fromList [MkPair "b" 2, MkPair "a" 1]))
+-- | Cons (MkPair "a" 1) (Cons (MkPair "b" 2) Nil)
+-- | >>> toList (update (fromList [MkPair "a" 2]) "a" 1 (\new old -> new + old))
+-- | Cons (MkPair "a" 3) Nil
+-- | >>> lookup (update (fromList [MkPair "a" 2]) "b" 5 (\new old -> new + old)) "b"
+-- | Just 5
+-- | >>> toList (delete (fromList [MkPair "a" 1, MkPair "b" 2]) "a")
+-- | Cons (MkPair "b" 2) Nil
+-- | >>> size (delete (fromList [MkPair 1 "one"]) 7)
+-- | 1
+-- | >>> size (delete (fromList [MkPair 1 "one", MkPair 2 "two"]) 1)
+-- | 1
+-- | >>> fst (remove (fromList [MkPair "a" 1, MkPair "b" 2]) "a")
+-- | Just 1
+-- | >>> fst (remove (fromList [MkPair "a" 1]) "c")
+-- | Nothing
+-- | >>> toList (snd (remove (fromList [MkPair "a" 1, MkPair "b" 2]) "a"))
+-- | Cons (MkPair "b" 2) Nil
+-- | >>> size (alter (fromList [MkPair 1 "one"]) 2 (\old -> Just "two"))
+-- | 2
+-- | >>> toList (alter (fromList [MkPair "a" 2]) "a" (\old -> Just (maybe 1 (\n -> n + 1) old)))
+-- | Cons (MkPair "a" 3) Nil
+-- | >>> toList (alter (fromList [MkPair 1 "one"]) 1 (\old -> Nothing))
+-- | Nil
+-- | >>> lookup (alter (fromList [MkPair 1 "one"]) 3 (\old -> Just "three")) 3
+-- | Just "three"
+-- | >>> size (insert (withCapacity 100) "a" 1)
+-- | 1
+fromList : {k v : Type}
+         -> {{hashing : HashMap.Hash k}}
+         -> {{equality : Equality k}}
+         -> List (Pair k v)
+         -> HashTable k v
+fromList ps = List.foldl (\t p -> insert t (fst p) (snd p)) empty ps
+
+-- | Two tables are equal where they bind the same keys, each to equal
+-- | values, in whatever order their slots have them.
+-- | >>> equal (fromList [MkPair 1 "a", MkPair 2 "b"]) (fromList [MkPair 2 "b", MkPair 1 "a"])
+-- | True
+-- | >>> equal (fromList [MkPair 1 "a"]) (fromList [MkPair 1 "b"])
+-- | False
+-- | >>> equal (fromList [MkPair 1 "a"]) (fromList [MkPair 1 "a", MkPair 2 "b"])
+-- | False
+instance instanceEqualityHashTable : {k v : Type}
+                                   -> {{hashing : HashMap.Hash k}}
+                                   -> {{eqKey : Equality k}}
+                                   -> {{eqValue : Equality v}}
+                                   -> Equality (HashTable k v)
+instanceEqualityHashTable = { equal = same }
+  where
+  holds : HashTable k v -> Bool -> k -> v -> Bool
+  holds t ok key value = ok && maybe False (\w -> equal value w) (lookup t key)
+  same : HashTable k v -> HashTable k v -> Bool
+  same a b = size a == size b && foldl (holds b) True a
+
+-- | A table as `fromList` of its pairs, in the slots' order.
+-- | >>> show (fromList [MkPair "a" 1])
+-- | "fromList [MkPair (\"a\") (1)]"
+instance instanceShowHashTable : {k v : Type}
+                               -> {{showsKey : Show k}}
+                               -> {{showsValue : Show v}}
+                               -> Show (HashTable k v)
+instanceShowHashTable = { show = \t -> "fromList " ^ show (toList t) }
