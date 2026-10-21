@@ -1,0 +1,347 @@
+-- Reads where the index was tested, for the C backend: `index a i`
+-- tests `0 <= i && i < length a`, and reads `a` at `i` only where that
+-- holds -- a read the runtime checks again, failing where it would not
+-- hold.  So where a test has found an index, a word or a literal, at
+-- least 0 and below an array's length -- in the branch where it holds,
+-- in what is tested after it, in what follows a branch that leaves where
+-- it does not -- each read and set of that array at that index is not
+-- checked again (`arrayIndexIn`, `arraySetOwnedIn`; a fixed-width
+-- number's read `arrayIndexInAny`, how the array keeps its elements
+-- still looked at).  What a test finds is of the index and the array as
+-- variables: it holds until either is bound or set again, and not where
+-- a loop goes back to.
+
+module heff.compile.tested
+
+import heff.compile.bounds as Bounds
+import heff.compile.refcount as RefCount
+import heff.compile.repr as Repr
+
+-- What a test finds
+--------------------------------------------------------------------------------
+
+-- | an index, a word: a variable, or a literal
+data Index = AtVar String | AtWord Int
+
+sameIndex : Index -> Index -> Bool
+sameIndex (AtVar x) (AtVar y) = strEq x y
+sameIndex (AtWord m) (AtWord n) = m == n
+sameIndex i j = False
+
+-- | what is known of an index: at least 0, or below an array's length
+-- | (the array's variable)
+data Fact = AtLeast0 Index | Below Index String
+
+-- | what is known where: the facts, and the variables bound to an
+-- | array's length (each with its array)
+type Known = { facts : List Fact, lengths : List (Pair String String) }
+
+nothingKnown : Known
+nothingKnown = { facts = Nil, lengths = Nil }
+
+isVarIndex : String -> Index -> Bool
+isVarIndex x (AtVar y) = strEq x y
+isVarIndex x (AtWord _) = False
+
+-- (whether a fact is of the variable)
+factOf : String -> Fact -> Bool
+factOf x (AtLeast0 i) = isVarIndex x i
+factOf x (Below i a) = isVarIndex x i || strEq x a
+
+lengthOfVar : String -> Pair String String -> Bool
+lengthOfVar x (MkPair n a) = strEq x n || strEq x a
+
+-- | what is still known once `x` is bound or set again
+forget : String -> Known -> Known
+forget x k =
+  { facts = List.keepIf (\f -> not (factOf x f)) k.facts
+  , lengths = List.keepIf (\p -> not (lengthOfVar x p)) k.lengths
+  }
+
+forgetAll : List String -> Known -> Known
+forgetAll xs k = List.foldl (\acc x -> forget x acc) k xs
+
+knowing : List Fact -> Known -> Known
+knowing fs k = { facts = List.append fs k.facts, lengths = k.lengths }
+
+-- (a literal word)
+literal : RefCount.Value -> Maybe Int
+literal (RFixU _ n) = Just n
+literal e = Nothing
+
+-- (a word's variable, or one looked at in its box)
+wordVar : RefCount.Value -> Maybe String
+wordVar (RPeek RepInt e) = Bounds.varOf e
+wordVar e = Bounds.varOf e
+
+-- (a word compared, as an index)
+testIndex : RefCount.Value -> Maybe Index
+testIndex (RFixU _ n) = Just (AtWord n)
+testIndex e = maybe Nothing (\x -> Just (AtVar x)) (wordVar e)
+
+lengthVar : Known -> Maybe String -> Maybe String
+lengthVar k (Just n) = List.lookupBy strEq n k.lengths
+lengthVar k Nothing = Nothing
+
+orElse : Maybe String -> Maybe String -> Maybe String
+orElse (Just x) y = Just x
+orElse Nothing y = y
+
+-- (the array a word is the length of: computed there, or bound to it)
+lengthArray : Known -> RefCount.Value -> Maybe String
+lengthArray k e = orElse (Bounds.lengthOf e) (lengthVar k (wordVar e))
+
+-- (`lo <= i`, of `d` 0, or `lo < i`, of `d` 1: `i` at least 0 where
+-- `lo + d` is)
+atLeast : Int -> Maybe Int -> Maybe String -> List Fact
+atLeast d (Just lo) (Just i) = if lo + d >= 0 then [AtLeast0 (AtVar i)] else Nil
+atLeast d lo i = Nil
+
+below : Maybe Index -> Maybe String -> List Fact
+below (Just i) (Just a) = [Below i a]
+below i a = Nil
+
+-- (where `x <= y` holds, and where `x < y` does)
+leHolds : Known -> RefCount.Value -> RefCount.Value -> List Fact
+leHolds k x y = atLeast 0 (literal x) (wordVar y)
+
+ltHolds : Known -> RefCount.Value -> RefCount.Value -> List Fact
+ltHolds k x y =
+  List.append
+    (atLeast 1 (literal x) (wordVar y))
+    (below (testIndex x) (lengthArray k y))
+
+-- (a comparison of words, where it holds (`yes`) or not: not `x <= y`
+-- is `y < x`, not `x < y` is `y <= x`)
+relFacts : Known -> Bool -> String -> List RefCount.Value -> List Fact
+relFacts k yes p (Cons x (Cons y Nil)) =
+  if strEq p "wordLe" then (if yes then leHolds k x y else ltHolds k y x)
+  else if strEq p "wordLt" then (if yes then ltHolds k x y else leHolds k y x)
+  else Nil
+relFacts k yes p es = Nil
+
+-- | what a test finds where it holds (`yes`), or where it does not
+found : Known -> Bool -> RefCount.Test -> List Fact
+found k yes (CondRelU p es) = relFacts k yes p es
+found k yes (CondNot c) = found k (not yes) c
+found k True (CondIf a b CondFalse) =
+  List.append (found k True a) (found k True b)
+found k False (CondIf a CondTrue c) =
+  List.append (found k False a) (found k False c)
+found k yes c = Nil
+
+-- Reads in range
+--------------------------------------------------------------------------------
+
+-- (the index of a read: a word boxed, or a literal)
+readIndex : RefCount.Value -> Maybe Index
+readIndex (RBox RepInt (RFixU _ n)) = Just (AtWord n)
+readIndex (RBox RepInt e) =
+  maybe Nothing (\x -> Just (AtVar x)) (Bounds.varOf e)
+readIndex (RInt n) = Just (AtWord n)
+readIndex e = Nothing
+
+isAtLeast0 : Index -> Fact -> Bool
+isAtLeast0 i (AtLeast0 j) = sameIndex i j
+isAtLeast0 i f = False
+
+isBelow : Index -> String -> Fact -> Bool
+isBelow i a (Below j b) = sameIndex i j && strEq a b
+isBelow i a f = False
+
+atLeast0 : Known -> Index -> Bool
+atLeast0 k (AtWord n) = n >= 0
+atLeast0 k i = List.any (isAtLeast0 i) k.facts
+
+knownIn : Known -> Maybe String -> Maybe Index -> Bool
+knownIn k (Just a) (Just i) = atLeast0 k i && List.any (isBelow i a) k.facts
+knownIn k a i = False
+
+-- | whether a read or set of `a` at `i` (its first operands) is known in
+-- | range
+inRange : Known -> List RefCount.Value -> Bool
+inRange k (Cons a (Cons i _)) = knownIn k (Bounds.varOf a) (readIndex i)
+inRange k es = False
+
+-- (a number an array may keep flat)
+flat : Repr.Repr -> Bool
+flat RepF64 = True
+flat (RepFix _) = True
+flat r = False
+
+-- (a read of a fixed-width number, known in range: an array of such may
+-- keep `V`s, so how it keeps them is looked at -- one of `Float64`s, of
+-- an element, keeps them flat)
+indexAt : Repr.Repr -> Maybe String
+indexAt (RepFix _) = Just "arrayIndexInAny"
+indexAt RepF64 = Just "arrayIndexIn"
+indexAt r = Nothing
+
+-- | a read or set's primitive where it is known in range, of a `V`
+uncheckedOf : String -> Maybe String
+uncheckedOf "arrayIndex" = Just "arrayIndexIn"
+uncheckedOf "arrayPeek" = Just "arrayPeekIn"
+uncheckedOf "arraySetOwned" = Just "arraySetOwnedIn"
+uncheckedOf p = Nothing
+
+-- | ... of a number, as the repr
+uncheckedAt : String -> Repr.Repr -> Maybe String
+uncheckedAt "arrayIndex" r = indexAt r
+uncheckedAt "arraySetOwned" r =
+  if flat r then Just "arraySetOwnedIn" else Nothing
+uncheckedAt p r = Nothing
+
+renamed : Known -> Maybe String -> String -> List RefCount.Value -> String
+renamed k (Just q) p es = if inRange k es then q else p
+renamed k Nothing p es = p
+
+-- (a value's own read or set, unchecked where it is known in range; a
+-- lambda's body, by what it knows itself)
+step : (Known -> List RefCount.Statement -> List RefCount.Statement)
+     -> Known
+     -> RefCount.Value
+     -> RefCount.Value
+step go k (RPrim p es) = RPrim (renamed k (uncheckedOf p) p es) es
+step go k (RPrimAt p r es) = RPrimAt (renamed k (uncheckedAt p r) p es) r es
+step go k (RLam xs fv held (MkCode body)) =
+  RLam xs fv held (MkCode (go nothingKnown body))
+step go k e = e
+
+fixExp : (Known -> List RefCount.Statement -> List RefCount.Statement)
+       -> Known
+       -> RefCount.Value
+       -> RefCount.Value
+fixExp go k e = Bounds.mapExp (step go k) e
+
+-- | a test, each part after another by what that one finds
+fixCond : (Known -> List RefCount.Statement -> List RefCount.Statement)
+        -> Known
+        -> RefCount.Test
+        -> RefCount.Test
+fixCond go k (CondRel p es) = CondRel p (List.map (fixExp go k) es)
+fixCond go k (CondRelU p es) = CondRelU p (List.map (fixExp go k) es)
+fixCond go k (CondBool e) = CondBool (fixExp go k e)
+fixCond go k (CondNot c) = CondNot (fixCond go k c)
+fixCond go k (CondIf a b c) =
+  CondIf
+    (fixCond go k a)
+    (fixCond go (knowing (found k True a) k) b)
+    (fixCond go (knowing (found k False a) k) c)
+fixCond go k (CondLet x e c ds) =
+  CondLet x (fixExp go k e) (fixCond go (forget x k) c) ds
+fixCond go k c = c
+
+-- Statements
+--------------------------------------------------------------------------------
+
+-- (whether statements leave, never going on after them: returning,
+-- going round the loop again, calling last, abandoned)
+leavesSt : (List RefCount.Statement -> Bool) -> RefCount.Statement -> Bool
+leavesSt go (CReturn _) = True
+leavesSt go (CInPlace _ _) = True
+leavesSt go (CRoomed _ _) = True
+leavesSt go (CTail _ _) = True
+leavesSt go (CLoop _ _) = True
+leavesSt go (CLoopTo _ _ _) = True
+leavesSt go (CJump _ _ _) = True
+leavesSt go CAbandon = True
+leavesSt go (CIf _ a b) = go a && go b
+leavesSt go s = False
+
+leaves : List RefCount.Statement -> Bool
+leaves ss = maybe False (leavesSt leaves) (List.last ss)
+
+-- (the variables statements bind or set, in front of `acc`, not in a
+-- lambda's body)
+boundSt : (List String -> List RefCount.Statement -> List String)
+        -> List String
+        -> RefCount.Statement
+        -> List String
+boundSt go acc (CLet x _) = Cons x acc
+boundSt go acc (CSet x _) = Cons x acc
+boundSt go acc (CDecl x) = Cons x acc
+boundSt go acc (CIf _ a b) = go (go acc a) b
+boundSt go acc (CSwitch _ arms _) =
+  List.foldl (\a arm -> go a (RefCount.caseArmBody arm)) acc arms
+boundSt go acc s = acc
+
+bound : List String -> List RefCount.Statement -> List String
+bound acc ss = List.foldl (boundSt bound) acc ss
+
+-- (bound to a length)
+lengthBound : String -> Maybe String -> Known -> Known
+lengthBound x (Just a) k =
+  { facts = k.facts, lengths = Cons (MkPair x a) k.lengths }
+lengthBound x Nothing k = k
+
+-- (where a branch leaves, what the test finds the other way holds after)
+afterIf : Known
+        -> RefCount.Test
+        -> RefCount.Statements
+        -> RefCount.Statements
+        -> Known
+afterIf k c a b =
+  if leaves a then knowing (found k False c) k
+  else if leaves b then knowing (found k True c) k
+  else k
+
+-- | what is known after a statement: nothing where a loop goes back to
+after : Known -> RefCount.Statement -> Known
+after k (CLet x e) = lengthBound x (Bounds.lengthOf e) (forget x k)
+after k (CSet x _) = forget x k
+after k (CDecl x) = forget x k
+after k (CIf c a b) = forgetAll (bound (bound Nil a) b) (afterIf k c a b)
+after k (CSwitch e arms r) =
+  forgetAll (bound Nil (Cons (CSwitch e arms r) Nil)) k
+after k (CLabel _) = nothingKnown
+after k s = k
+
+fixSt : (Known -> List RefCount.Statement -> List RefCount.Statement)
+      -> Known
+      -> RefCount.Statement
+      -> RefCount.Statement
+fixSt go k (CLet x e) = CLet x (fixExp go k e)
+fixSt go k (CSet x e) = CSet x (fixExp go k e)
+fixSt go k (CReturn e) = CReturn (fixExp go k e)
+fixSt go k (CIf c a b) =
+  CIf
+    (fixCond go k c)
+    (go (knowing (found k True c) k) a)
+    (go (knowing (found k False c) k) b)
+fixSt go k (CSwitch e arms r) =
+  CSwitch (fixExp go k e) (List.map (Bounds.fixArm (go k)) arms) r
+fixSt go k (CInPlace f es) =
+  CInPlace (fixExp go k f) (List.map (fixExp go k) es)
+fixSt go k (CRoomed f es) = CRoomed (fixExp go k f) (List.map (fixExp go k) es)
+fixSt go k (CTail f es) = CTail (fixExp go k f) (List.map (fixExp go k) es)
+fixSt go k (CLoop ps es) = CLoop ps (List.map (fixExp go k) es)
+fixSt go k (CLoopTo l ps es) = CLoopTo l ps (List.map (fixExp go k) es)
+fixSt go k (CJump g w es) = CJump g w (List.map (fixExp go k) es)
+fixSt go k s = s
+
+-- | statements, their reads and sets unchecked where they are known in
+-- | range
+fixStmts : Known -> List RefCount.Statement -> List RefCount.Statement
+fixStmts k Nil = Nil
+fixStmts k (Cons s rest) = Cons (fixSt fixStmts k s) (fixStmts (after k s) rest)
+
+-- The definition
+--------------------------------------------------------------------------------
+
+testedFun : RefCount.Fun -> RefCount.Fun
+testedFun f =
+  { key = f.key
+  , params = f.params
+  , lent = f.lent
+  , entry = fixStmts nothingKnown f.entry
+  , body = fixStmts nothingKnown f.body
+  , reprs = f.reprs
+  , ret = f.ret
+  , wrapper = f.wrapper
+  }
+
+-- | a definition of the C backend's, its reads and sets where their
+-- | index was tested in range not checked again
+testedDef : RefCount.Def -> RefCount.Def
+testedDef (DFun f) = DFun (testedFun f)
+testedDef (DVal k ss rs) = DVal k (fixStmts nothingKnown ss) rs

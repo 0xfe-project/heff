@@ -3296,9 +3296,19 @@ HEFF_FAST double heff_arrayIndex_f64(V a, V i) { return heff_arrayIndex_f64_lent
     HEFF_GIVEN(give, 0, a);                                                    \
     return x;                                                                  \
   }                                                                            \
-  HEFF_FAST T heff_arrayIndex_##S(V a, V i) { return heff_arrayIndex_##S##_lent(a, i, 3); }
+  HEFF_FAST T heff_arrayIndex_##S(V a, V i) { return heff_arrayIndex_##S##_lent(a, i, 3); } \
+  HEFF_FAST T heff_arrayIndexInAny_##S##_lent(V a, V i, int give) {           \
+    Arr *r = (Arr *)a;                                                         \
+    int64_t k = INT_OF(i);                                                     \
+    T x = HEFF_ARR_KIND(r) == K ? HEFF_ARR_AT(r, T)[k] : heff_peek_##S(r->a[k]);       \
+    HEFF_GIVEN(give, 0, a);                                                    \
+    return x;                                                                  \
+  }                                                                            \
+  HEFF_FAST T heff_arrayIndexInAny_##S(V a, V i) { return heff_arrayIndexInAny_##S##_lent(a, i, 3); }
 // (... known in range, where a loop checked its index once
-// (heff.compile.bounds): the index a word, at least 0, below the length)
+// (heff.compile.bounds), or a test found it so (heff.compile.tested): the
+// index a word, at least 0, below the length -- a fixed-width number's,
+// `arrayIndexInAny_i64` above, how the array keeps it still looked at)
 HEFF_FAST V heff_arrayIndexIn_lent(V a, V i, int give) {
   Arr *r = (Arr *)a;
   int64_t k = INT_OF(i);
