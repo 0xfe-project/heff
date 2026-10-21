@@ -623,19 +623,6 @@ calledIn c g rs st = case OrdMap.lookup c.params g of
 primOn : String -> List Range -> List IR.Expr -> IR.Expr
 primOn p rs args = EPrimCall (fromMaybe p (wordOf p rs (primRange p rs))) args
 
-fieldsOf : List (Pair String IR.Expr) -> List IR.Expr
-fieldsOf fs = List.map snd fs
-
-relabel : List (Pair String IR.Expr)
-        -> List IR.Expr
-        -> List (Pair String IR.Expr)
-relabel fs es = List.zipWith (\f e -> MkPair (fst f) e) fs es
-
--- (the head of an application walked, and its operands)
-applied : IR.Expr -> List IR.Expr -> IR.Expr
-applied f (Cons g args) = EApp g args
-applied f Nil = f
-
 -- (each parameter of the function `key`, of its range)
 paramEnv : Ctx -> String -> List String -> Env
 paramEnv c key xs = case OrdMap.lookup c.params key of
@@ -756,8 +743,6 @@ gatherGo : Ctx -> Env -> St -> IR.Expr -> Seen
 gatherGo c env st (EVar x) = MkSeen (rangeOfVar env x) st
 gatherGo c env st (EInt n) = MkSeen (point n) st
 gatherGo c env st (EGlobal g) = MkSeen (constRange c g) st
-gatherGo c env st (ELam xs b) =
-  thenSeen (gatherGo c env st b) (\_ st1 -> MkSeen anyRange st1)
 gatherGo c env st (ELet x a b) =
   thenSeen
     (gatherGo c env st a)
@@ -781,20 +766,6 @@ gatherGo c env st (ECall g args) =
   thenSeens
     (gatherMany (gatherGo c) env st args)
     (\rs st1 -> MkSeen anyRange (calledIn c g rs st1))
-gatherGo c env st (EApp f args) =
-  thenSeens
-    (gatherMany (gatherGo c) env st (Cons f args))
-    (\_ st1 -> MkSeen anyRange st1)
-gatherGo c env st (ERecord fs ts) =
-  thenSeens
-    (gatherMany (gatherGo c) env st (fieldsOf fs))
-    (\_ st1 -> MkSeen anyRange st1)
-gatherGo c env st (EProj a l sh t) =
-  thenSeen (gatherGo c env st a) (\_ st1 -> MkSeen anyRange st1)
-gatherGo c env st (ETag t args ts) =
-  thenSeens
-    (gatherMany (gatherGo c) env st args)
-    (\_ st1 -> MkSeen anyRange st1)
 gatherGo c env st EAbandon = MkSeen Unreached st
 gatherGo c env st (EValues es) =
   thenSeens (gatherMany (gatherGo c) env st es) (\rs st1 -> MkSeenVals rs st1)
@@ -804,7 +775,10 @@ gatherGo c env st (ESet xs a b) =
     (\rs st1 -> gatherGo c (bindVals env xs rs) st1 b)
 gatherGo c env st (EBool k) =
   MkSeen anyRange (gatherCond c (gatherGo c) env st k)
-gatherGo c env st e = MkSeen anyRange st
+gatherGo c env st e =
+  thenSeens
+    (gatherMany (gatherGo c) env st (IR.partsOnto e Nil))
+    (\_ st1 -> MkSeen anyRange st1)
 
 -- | what a definition calls with what, its parameters of the ranges `c`
 -- | says
@@ -908,8 +882,6 @@ walkGo : Ctx -> Env -> IR.Expr -> Res
 walkGo c env (EVar x) = MkRes (rangeOfVar env x) (EVar x)
 walkGo c env (EInt n) = MkRes (point n) (EInt n)
 walkGo c env (EGlobal g) = MkRes (constRange c g) (EGlobal g)
-walkGo c env (ELam xs b) =
-  thenRes (walkGo c env b) (\_ b1 -> MkRes anyRange (ELam xs b1))
 walkGo c env (ELet x a b) =
   thenRes
     (walkGo c env a)
@@ -929,26 +901,9 @@ walkGo c env (EPrimCall p args) =
   thenMany
     (walkMany (walkGo c) env args)
     (\rs as1 -> MkRes (primRange p rs) (primOn p rs as1))
-walkGo c env (ECall g args) =
-  thenMany
-    (walkMany (walkGo c) env args)
-    (\rs as1 -> MkRes anyRange (ECall g as1))
-walkGo c env (EApp f args) =
-  thenMany
-    (walkMany (walkGo c) env (Cons f args))
-    (\_ es1 -> MkRes anyRange (applied f es1))
-walkGo c env (ERecord fs ts) =
-  thenMany
-    (walkMany (walkGo c) env (fieldsOf fs))
-    (\_ es1 -> MkRes anyRange (ERecord (relabel fs es1) ts))
-walkGo c env (EProj a l sh t) =
-  thenRes (walkGo c env a) (\_ a1 -> MkRes anyRange (EProj a1 l sh t))
-walkGo c env (ETag t args ts) =
-  thenMany
-    (walkMany (walkGo c) env args)
-    (\_ as1 -> MkRes anyRange (ETag t as1 ts))
 walkGo c env (EBool k) = MkRes anyRange (EBool (walkCond c (walkGo c) env k))
-walkGo c env e = MkRes anyRange e
+walkGo c env e =
+  MkRes anyRange (IR.mapParts (\_ p -> resExpr (walkGo c env p)) e)
 
 -- | a definition with its operations on words, its parameters of the
 -- | ranges `c` says
@@ -1251,18 +1206,11 @@ scanW ar s (Cons (EPrimCall p args) rest) =
   scanW ar (if isIntOp p then scanOp s args else s) (IR.appendI args rest)
 scanW ar s (Cons (ECall g args) rest) =
   scanW ar (scanCall ar s g args) (IR.appendI args rest)
-scanW ar s (Cons (ELam _ b) rest) = scanW ar s (Cons b rest)
-scanW ar s (Cons (EApp f args) rest) =
-  scanW ar s (Cons f (IR.appendI args rest))
-scanW ar s (Cons (ELet _ a b) rest) = scanW ar s (Cons a (Cons b rest))
-scanW ar s (Cons (ERecord fs _) rest) = scanW ar s (IR.pushFields fs rest)
-scanW ar s (Cons (EProj e _ _ _) rest) = scanW ar s (Cons e rest)
-scanW ar s (Cons (ETag _ args _) rest) = scanW ar s (IR.appendI args rest)
-scanW ar s (Cons (EMatch e arms) rest) =
-  scanW ar s (Cons e (IR.pushArms arms rest))
-scanW ar s (Cons (EFix _ b) rest) = scanW ar s (Cons b rest)
 scanW ar s (Cons (EBool c) rest) = scanW ar (scanCond s c) (IR.condOnto c rest)
-scanW ar s (Cons _ rest) = scanW ar s rest
+-- (what an `ESet` sets, and what follows it, are not scanned)
+scanW ar s (Cons (ESet _ _ _) rest) = scanW ar s rest
+scanW ar s (Cons (EValues _) rest) = scanW ar s rest
+scanW ar s (Cons e rest) = scanW ar s (IR.partsOnto e rest)
 
 scanOf : OrdMap.OrdMap String Int -> IR.Def -> Scan
 scanOf ar d = scanW ar emptyScan (Cons d.body Nil)
