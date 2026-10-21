@@ -145,7 +145,10 @@ The format tests format each `.hf` file of the repository, and the
 cases of `test/format/`, each held to its golden text (`heff test
 test/format.hf`, `--run format/cases/spacing` for one;
 `heff test --update --run format/cases test/format.hf` after an
-intended change).  The cache tests hold the compiler's cache and the
+intended change).  The syntax tests hold the reading's pieces on a
+few texts each: the module claim, the tokens, the comments attached,
+the declarations, no token lost (`heff test test/syntax.hf`).  The
+cache tests hold the compiler's cache and the
 backend's, each scenario in a directory of its own (`heff test
 test/cache.hf test/backcache.hf`, `--run cache/instances` for one).
 The command line's tests are `heff test test/cli.hf` (`--run
