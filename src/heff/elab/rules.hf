@@ -3456,6 +3456,136 @@ caseArm sp e b a x ts casesChk = case Dict.lookup casesChk x of
              (MkPair (Array.fromList (List.map (\t -> "_") ts)) body.stx))
     Nothing -> failWith sp 17 (nonExhaustive ("tag " ^ x))
 
+-- (whether a case names the tag)
+namedIn : {a : Type}
+        -> Dict.Dict (Pair (Array String) Chk)
+        -> Pair String a
+        -> Bool
+namedIn casesChk (MkPair x _) = case Dict.lookup casesChk x of
+  Just _ -> True
+  Nothing -> False
+
+defaultBody : Maybe (Pair (Array String) Chk) -> Maybe Chk
+defaultBody (Just (MkPair _ c)) = Just c
+defaultBody Nothing = Nothing
+
+-- (the default case, `_ => e`, where it stands for two tags or more and
+-- another case names a tag)
+sharedDefault : {a : Type}
+              -> Dict.Dict (Pair (Array String) Chk)
+              -> List (Pair String a)
+              -> List (Pair String a)
+              -> Maybe Chk
+sharedDefault casesChk every named =
+  if List.length every - List.length named > 1 && not (List.null named)
+  then defaultBody (Dict.lookup casesChk "_")
+  else Nothing
+
+-- (a term's parts, onto `rest`)
+termParts : Syntax.Tm -> List Syntax.Tm -> List Syntax.Tm
+termParts (SApp f x) rest = Cons f (Cons x rest)
+termParts (SLam _ (MkAbs _ x)) rest = Cons x rest
+termParts (SLam _ (AbsConst x)) rest = Cons x rest
+termParts (SCons d) rest = appendP (List.map snd (Dict.toList d)) rest
+termParts (SProj x _) rest = Cons x rest
+termParts (STag _ xs) rest = appendP (Array.toList xs) rest
+termParts (SMatch x cs) rest =
+  Cons x (appendP (List.map (\c -> snd (snd c)) (Dict.toList cs)) rest)
+termParts (SSpecialize x _ y) rest = Cons x (Cons y rest)
+termParts (SIs x) rest = Cons x rest
+termParts (SRec x) rest = Cons x rest
+termParts (SFix _ (MkAbs _ x)) rest = Cons x rest
+termParts (SFix _ (AbsConst x)) rest = Cons x rest
+termParts (SImplicit _ x) rest = Cons x rest
+termParts _ rest = rest
+
+-- (how big the terms are, counted until more than `lim`)
+termSizeGo : Int -> Int -> List Syntax.Tm -> Int
+termSizeGo lim n Nil = n
+termSizeGo lim n (Cons t rest) =
+  if n > lim then n else termSizeGo lim (n + 1) (termParts t rest)
+
+-- | how big all the copies of a default case may be, the tags it stands
+-- | for each given one: a default bigger than that is kept once
+copiesMax : Int
+copiesMax = 100
+
+-- (a copy of the default, `body`, of a context of `n` locals, for the
+-- tag `x`: under its arguments, bound to no name)
+defaultCopy : Int
+            -> Syntax.Tm
+            -> Pair String (Array (Params.Th Value.Ty))
+            -> Pair String (Pair (Array String) Syntax.Tm)
+defaultCopy n body (MkPair x ts) =
+  MkPair
+    x
+    (MkPair
+       (Array.fromList (List.map (\t -> "_") (Array.toList ts)))
+       (weaken n (Array.length ts) body))
+
+-- (the cases in the sum's order: those `done` of the tags a case names,
+-- a copy of the default for each other)
+inOrder : Int
+        -> Syntax.Tm
+        -> Dict.Dict (Pair (Array String) Chk)
+        -> List (Pair String (Array (Params.Th Value.Ty)))
+        -> List (Pair String (Pair (Array String) Syntax.Tm))
+        -> List (Pair String (Pair (Array String) Syntax.Tm))
+inOrder n body casesChk Nil done = Nil
+inOrder n body casesChk (Cons p rest) (Cons c done) =
+  if namedIn casesChk p then Cons c (inOrder n body casesChk rest done)
+  else Cons (defaultCopy n body p) (inOrder n body casesChk rest (Cons c done))
+inOrder n body casesChk (Cons p rest) Nil =
+  Cons (defaultCopy n body p) (inOrder n body casesChk rest Nil)
+
+-- (the default, checked: kept once, keyed `_` -- the case of the tags no
+-- other names, binding none of their arguments -- where its copies would
+-- be too big; else copied, for each of those tags)
+defaultCases : Int
+             -> Syntax.Tm
+             -> Dict.Dict (Pair (Array String) Chk)
+             -> List (Pair String (Array (Params.Th Value.Ty)))
+             -> List (Pair String (Array (Params.Th Value.Ty)))
+             -> List (Pair String (Pair (Array String) Syntax.Tm))
+             -> List (Pair String (Pair (Array String) Syntax.Tm))
+defaultCases n body casesChk every named cases =
+  if termSizeGo
+       copiesMax
+       0
+       (List.map (\p -> body) (List.drop (List.length named) every))
+     > copiesMax
+  then appendP cases (Cons (MkPair "_" (MkPair (Array.fromList Nil) body)) Nil)
+  else inOrder n body casesChk every cases
+
+-- (the cases of the tags a case names, then the default, `d`, checked
+-- once)
+casesWith : Params.Span
+          -> ElabEnv
+          -> Value.Ty
+          -> Memoed.El
+          -> Value.Ty
+          -> List (Pair String (Array (Params.Th Value.Ty)))
+          -> List (Pair String (Array (Params.Th Value.Ty)))
+          -> Dict.Dict (Pair (Array String) Chk)
+          -> Chk
+          -> Elab Memoed.El
+casesWith sp e b scrut a every named casesChk d = do
+  cases <-
+    traverseE
+      (\p -> case p of
+       MkPair x fs -> caseArm sp e b a x (Array.toList fs) casesChk)
+      named
+  body <- runChk d e b
+  pure
+      (Memoed.matchM
+         scrut
+         (Dict.fromList
+            (defaultCases e.scope.len body.stx casesChk every named cases)))
+
+-- | the cases of a match: each tag's -- a default case, `_ => e`, that
+-- | stands for two tags or more, where another case names a tag, checked
+-- | once and copied for each tag it stands for, or kept once where the
+-- | copies would be big (#123)
 casesAt : Params.Span
         -> ElabEnv
         -> Value.Ty
@@ -3468,12 +3598,17 @@ casesAt : Params.Span
 casesAt sp e b scrut a vs tags casesChk = do
   recordTags e a vs tags
   tagsExposed e a vs tags
-  cases <-
-    traverseE
-      (\p -> case p of
-       MkPair x ts -> caseArm sp e b a x (Array.toList ts) casesChk)
-      (Dict.toList vs)
-  pure (Memoed.matchM scrut (Dict.fromList cases))
+  let every = Dict.toList vs
+  let named = List.keepIf (\p -> namedIn casesChk p) every
+  case sharedDefault casesChk every named of
+    Just d -> casesWith sp e b scrut a every named casesChk d
+    Nothing -> do
+      cases <-
+        traverseE
+          (\p -> case p of
+           MkPair x fs -> caseArm sp e b a x (Array.toList fs) casesChk)
+          every
+      pure (Memoed.matchM scrut (Dict.fromList cases))
 
 matchLater : Params.Span
            -> Memoed.El
