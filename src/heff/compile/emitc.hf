@@ -49,7 +49,6 @@ import heff.compile.irtext as IRText
 import heff.compile.lower as Lower
 import heff.compile.owned as Owned
 import heff.elab.primitive
-import heff.compile.ranges as Ranges
 import heff.compile.refcount as RefCount
 import heff.compile.repr as Repr
 import heff.compile.simplify as Simplify
@@ -521,33 +520,6 @@ opSymbol OpLt = "<"
 opSymbol OpLe = "<="
 opSymbol o = ""
 
--- (`Float64`'s primitives done as C's operators, and as libm's functions)
-floatSymbol : Prim -> String
-floatSymbol FloatAdd = "+"
-floatSymbol FloatSub = "-"
-floatSymbol FloatMul = "*"
-floatSymbol FloatDiv = "/"
-floatSymbol FloatEq = "=="
-floatSymbol FloatLt = "<"
-floatSymbol FloatLe = "<="
-floatSymbol _ = ""
-
-libmName : Prim -> String
-libmName FloatSqrt = "sqrt"
-libmName FloatSin = "sin"
-libmName FloatCos = "cos"
-libmName FloatTan = "tan"
-libmName FloatAsin = "asin"
-libmName FloatAcos = "acos"
-libmName FloatAtan = "atan"
-libmName FloatExp = "exp"
-libmName FloatLog = "log"
-libmName FloatAtan2 = "atan2"
-libmName FloatPow = "pow"
-libmName FloatFromInt = "heff_from_int_f64"
-libmName FloatFloor = "heff_floor_f64"
-libmName p = primName p
-
 arg0 : List String -> String
 arg0 vs = fromMaybe "0" (List.head vs)
 
@@ -610,50 +582,74 @@ fixedU w op vs =
   else if Fixed.isFloat32 w then float32U op vs
   else intU w op vs
 
--- | ... of a `Float64`: C's operator, or libm's function
-float64U : Prim -> List String -> String
-float64U FloatEq vs = "heff_bool(" ^ infixC (floatSymbol FloatEq) vs ^ ")"
-float64U FloatLt vs = "heff_bool(" ^ infixC (floatSymbol FloatLt) vs ^ ")"
-float64U FloatLe vs = "heff_bool(" ^ infixC (floatSymbol FloatLe) vs ^ ")"
-float64U p vs =
-  if strLength (floatSymbol p) > 0 then infixC (floatSymbol p) vs
-  else callOf (libmName p) vs
+-- | how C does a primitive on unboxed operands (heff.compile.repr's
+-- | `primShape`): a fixed-width type's; a comparison, an operator, a
+-- | function (libm's, the runtime's), a conversion to `double` -- of
+-- | `Float64`s, or of words (heff.compile.ranges: `int64_t`s that neither
+-- | overflow nor divide by 0, it is known)
+data Unboxed
+  = UFixed Fixed.Fixed Fixed.FixedOp
+  | URel String
+  | UOp String
+  | UFn String
+  | UToDouble
 
--- (an operation on words, heff.compile.ranges's, as C's operator: of
--- `int64_t`s that neither overflow nor divide by 0, it is known)
-wordSymbol : Prim -> String
-wordSymbol WordAdd = "+"
-wordSymbol WordSub = "-"
-wordSymbol WordMul = "*"
-wordSymbol WordQuot = "/"
-wordSymbol WordRem = "%"
-wordSymbol WordEq = "=="
-wordSymbol WordLt = "<"
-wordSymbol WordLe = "<="
-wordSymbol _ = ""
+unboxed : Prim -> Unboxed
+unboxed (OfFixed w op) = UFixed w op
+unboxed FloatAdd = UOp "+"
+unboxed FloatSub = UOp "-"
+unboxed FloatMul = UOp "*"
+unboxed FloatDiv = UOp "/"
+unboxed FloatEq = URel "=="
+unboxed FloatLt = URel "<"
+unboxed FloatLe = URel "<="
+unboxed FloatSqrt = UFn "sqrt"
+unboxed FloatSin = UFn "sin"
+unboxed FloatCos = UFn "cos"
+unboxed FloatTan = UFn "tan"
+unboxed FloatAsin = UFn "asin"
+unboxed FloatAcos = UFn "acos"
+unboxed FloatAtan = UFn "atan"
+unboxed FloatExp = UFn "exp"
+unboxed FloatLog = UFn "log"
+unboxed FloatAtan2 = UFn "atan2"
+unboxed FloatPow = UFn "pow"
+unboxed FloatFromInt = UFn "heff_from_int_f64"
+unboxed FloatFloor = UFn "heff_floor_f64"
+unboxed WordAdd = UOp "+"
+unboxed WordSub = UOp "-"
+unboxed WordMul = UOp "*"
+unboxed WordQuot = UOp "/"
+unboxed WordRem = UOp "%"
+unboxed WordEq = URel "=="
+unboxed WordLt = URel "<"
+unboxed WordLe = URel "<="
+-- (rounded down, the runtime's)
+unboxed WordDiv = UFn "heff_word_div"
+unboxed WordMod = UFn "heff_word_mod"
+unboxed WordToFloat = UToDouble
+unboxed p = UFn (primName p)
 
--- | ... as C has it: an operator; a division or a remainder rounded
--- | down, the runtime's; a `Float64` made
-wordU : Prim -> List String -> String
-wordU WordDiv vs = callOf "heff_word_div" vs
-wordU WordMod vs = callOf "heff_word_mod" vs
-wordU WordToFloat vs = "((double)" ^ arg0 vs ^ ")"
-wordU p vs =
-  if Ranges.isWordRel p then "heff_bool(" ^ infixC (wordSymbol p) vs ^ ")"
-  else infixC (wordSymbol p) vs
+unboxedC : Unboxed -> List String -> String
+unboxedC (UFixed w op) vs = fixedU w op vs
+unboxedC (URel op) vs = "heff_bool(" ^ infixC op vs ^ ")"
+unboxedC (UOp op) vs = infixC op vs
+unboxedC (UFn f) vs = callOf f vs
+unboxedC UToDouble vs = "((double)" ^ arg0 vs ^ ")"
 
--- | a primitive done on unboxed operands (heff.compile.repr's `primShape`)
+-- | a primitive done on unboxed operands
 primU : Prim -> List String -> String
-primU (OfFixed w op) vs = fixedU w op vs
-primU p vs = if Ranges.isWordPrim p then wordU p vs else float64U p vs
+primU p vs = unboxedC (unboxed p) vs
 
-relSymbol : Prim -> String
-relSymbol (OfFixed _ op) = opSymbol op
-relSymbol p = if Ranges.isWordRel p then wordSymbol p else floatSymbol p
+-- (a comparison's operator)
+relSymbol : Unboxed -> String
+relSymbol (UFixed _ op) = opSymbol op
+relSymbol (URel op) = op
+relSymbol u = ""
 
 -- | a comparison of unboxed operands, as C's condition
 relU : Prim -> List String -> String
-relU p vs = infixC (relSymbol p) vs
+relU p vs = infixC (relSymbol (unboxed p)) vs
 
 argsArr : List String -> String
 argsArr vs = if List.null vs then "NULL" else "(V[]){" ^ joinWith ", " vs ^ "}"
