@@ -2023,9 +2023,12 @@ HEFF_FN V twos_make(uint32_t *t, int n) {
   return big_make(neg, t, n);
 }
 
+// (as the sum is: both words, inlined -- the words' operation on `2x + 1`
+// and `2y + 1` is `2(x op y) + 1`'s, the low bit set again after `^` --
+// else a call, on as many 32-bit words as the longer has, and one more
+// for the sign)
 #define INT_BITS(name, op)                                                  \
-  HEFF_FN V name(V a, V b) {                                                 \
-    if (IS_INT(a) && IS_INT(b)) return MK_INT(INT_OF(a) op INT_OF(b));      \
+  HEFF_SLOW V name##_big(V a, V b) {                                        \
     Num x, y;                                                               \
     num_of(a, &x);                                                          \
     num_of(b, &y);                                                          \
@@ -2039,6 +2042,10 @@ HEFF_FN V twos_make(uint32_t *t, int n) {
     heff_drop(a);                                                           \
     heff_drop(b);                                                           \
     return r;                                                               \
+  }                                                                         \
+  HEFF_FAST V name(V a, V b) {                                              \
+    if (BOTH_INT(a, b)) return (a op b) | 1;                                \
+    return name##_big(a, b);                                                \
   }
 INT_BITS(heff_intAnd, &)
 INT_BITS(heff_intOr, |)
@@ -2046,12 +2053,12 @@ INT_BITS(heff_intXor, ^)
 
 HEFF_FN int heff_int_neg(V v) { return IS_INT(v) ? INT_OF(v) < 0 : ((Big *)v)->neg; }
 
-HEFF_FN V heff_intShr(V a, V b);
+HEFF_SLOW V heff_intShr_big(V a, V b);
 
 // (`a` times 2^`b`; by a negative count, a shift right by its size; one
 // beyond memory fails)
-HEFF_FN V heff_intShl(V a, V b) {
-  if (heff_int_neg(b)) return heff_intShr(a, heff_intSub(MK_INT(0), b));
+HEFF_SLOW V heff_intShl_big(V a, V b) {
+  if (heff_int_neg(b)) return heff_intShr_big(a, heff_intSub(MK_INT(0), b));
   int bbig = !IS_INT(b);
   heff_drop(b);
   if (IS_INT(a) && INT_OF(a) == 0) return a;
@@ -2077,10 +2084,21 @@ HEFF_FN V heff_intShl(V a, V b) {
   return r;
 }
 
+// (a word by a count from 0 below 62 to a word, inlined: `x << k` is one
+// where shifting it back gives `x`, and `2x + 1`'s bits shifted so, the
+// low bit set again, are its; else the call)
+HEFF_FAST V heff_intShl(V a, V b) {
+  if (BOTH_INT(a, b) && b < MK_INT(62)) {
+    int64_t k = INT_OF(b), x = (int64_t)a - 1, r = (int64_t)((uint64_t)x << k);
+    if ((r >> k) == x) return (V)r | 1;
+  }
+  return heff_intShl_big(a, b);
+}
+
 // (`a` divided by 2^`b`, rounding down: its bits shifted out, the sign
 // shifted in; by a negative count, a shift left by its size)
-HEFF_FN V heff_intShr(V a, V b) {
-  if (heff_int_neg(b)) return heff_intShl(a, heff_intSub(MK_INT(0), b));
+HEFF_SLOW V heff_intShr_big(V a, V b) {
+  if (heff_int_neg(b)) return heff_intShl_big(a, heff_intSub(MK_INT(0), b));
   int bbig = !IS_INT(b);
   heff_drop(b);
   int aneg = heff_int_neg(a);
@@ -2113,6 +2131,17 @@ HEFF_FN V heff_intShr(V a, V b) {
   V r = big_make(x.neg, o, n + 1);
   heff_drop(a);
   return r;
+}
+
+// (a word by a count from 0 to a word, inlined: its bits shifted out, the
+// sign shifted in -- by 63 or more, all of them; `2x + 1`'s, the low bit
+// set again; else the call)
+HEFF_FAST V heff_intShr(V a, V b) {
+  if (BOTH_INT(a, b) && (int64_t)b >= 0) {
+    int64_t k = INT_OF(b);
+    return (V)((int64_t)a >> (k < 63 ? k : 63)) | 1;
+  }
+  return heff_intShr_big(a, b);
 }
 
 // (an integer's decimal digits, a '-' before a negative one: malloc'd)
