@@ -2792,6 +2792,234 @@ orMarks ms _ = ms
 knownMore : St -> List IR.Expr -> String -> IR.Expr -> Bool
 knownMore s argv g e = builtBy s.sp.all e || backFor s argv g e
 
+-- Calls given a tag: a definition not inlined, given a tag built of
+-- values -- `MkSlice s i j`, a view of a key built where it is looked up
+-- -- at a parameter it takes apart, is called as a copy made for the
+-- tag (`Spec.shapeOf`): the values its parameters, each match on the
+-- tag in it the arm the tag chooses, no tag built.  To take it apart is
+-- to match on it, take a field of it, or hand it as it is to what takes
+-- it apart in turn -- a definition, a known argument (`matching k
+-- query`, `matching` known), itself at the same place -- and to do
+-- nothing else with it: a tag used as a value in the copy would be
+-- built again there, at each use.  Only of a definition no bigger than
+-- `tagSpecSize`, followed into others as big, `tagDepth` deep; for a
+-- loop, only at a parameter it hands on unchanged, as any copy.
+
+-- | the most a definition may be that a copy is made of for a tag, or
+-- | that a tag handed on is followed into; and how deep
+tagSpecSize : Int
+tagSpecSize = 400
+
+tagDepth : Int
+tagDepth = 3
+
+-- (a field of a tag of values: a variable, a literal, a tag of values)
+fieldValue : IR.Expr -> Bool
+fieldValue (EVar _) = True
+fieldValue (EInt _) = True
+fieldValue (EFloat _) = True
+fieldValue (EStr _) = True
+fieldValue (ETag _ argv _) = List.all fieldValue argv
+fieldValue _ = False
+
+-- | a tag built of values, no bigger than a known argument may be
+valueTag : IR.Expr -> Bool
+valueTag (ETag t argv ts) =
+  not (List.null argv)
+  && List.all fieldValue argv
+  && not (IR.sizeAbove specArgSize (ETag t argv ts))
+valueTag _ = False
+
+-- (what an argument is known as where a tag is followed: a global, a
+-- closed lambda, a parameter known so)
+knownBy : Map.Map String IR.Expr -> IR.Expr -> Maybe IR.Expr
+knownBy env (EVar p) = Map.lookup env p
+knownBy env (EGlobal h) = Just (EGlobal h)
+knownBy env (ELam ys b) =
+  if Spec.closedIn Nil (ELam ys b) then Just (ELam ys b) else Nothing
+knownBy env _ = Nothing
+
+envCons : String
+        -> Maybe IR.Expr
+        -> Map.Map String IR.Expr
+        -> Map.Map String IR.Expr
+envCons y (Just k) m = Map.insert m y k
+envCons y Nothing m = m
+
+-- (the parameters known by their arguments)
+envOf : Map.Map String IR.Expr
+      -> List String
+      -> List IR.Expr
+      -> Map.Map String IR.Expr
+envOf env (Cons y ys) (Cons a argv) =
+  envCons y (knownBy env a) (envOf env ys argv)
+envOf env _ _ = Map.empty
+
+-- | where a tag is followed: how much deeper it may be, the parameters
+-- | known, and the definition it is in (`self`), the tag its
+-- | parameter at `at`
+type Follow =
+  { deeper : Int, env : Map.Map String IR.Expr, self : String, at : Int }
+
+-- (where the tag is among the arguments)
+posOf : String -> Int -> List IR.Expr -> List Int
+posOf x i Nil = Nil
+posOf x i (Cons a argv) =
+  if isVar x a then Cons i (posOf x (i + 1) argv) else posOf x (i + 1) argv
+
+-- (the arguments but the tag)
+othersOf : String -> List IR.Expr -> List IR.Expr
+othersOf x Nil = Nil
+othersOf x (Cons a argv) =
+  if isVar x a then othersOf x argv else Cons a (othersOf x argv)
+
+nameAt : Int -> List String -> String
+nameAt k ys = fromMaybe "" (Spec.nthS k ys)
+
+-- (a body whose parameter at `k` is given the tag, taking it apart, as
+-- `go` finds)
+bodyTakes : (Follow -> String -> List IR.Expr -> Int)
+          -> Follow
+          -> String
+          -> List IR.Expr
+          -> Int
+          -> Maybe IR.Expr
+          -> Bool
+bodyTakes go fo h argv k (Just (ELam ys hb)) =
+  fo.deeper > 0
+  && List.length ys > k
+  && not (IR.sizeAbove tagSpecSize hb)
+  && go
+    { deeper = fo.deeper - 1, env = envOf fo.env ys argv, self = h, at = k }
+    (nameAt k ys)
+    (Cons hb Nil)
+  > 0
+bodyTakes go fo h argv k _ = False
+
+-- (... a known argument's, called)
+calledTakes : (Follow -> String -> List IR.Expr -> Int)
+            -> St
+            -> Follow
+            -> List IR.Expr
+            -> Int
+            -> Maybe IR.Expr
+            -> Bool
+calledTakes go s fo argv k (Just (EGlobal h)) =
+  bodyTakes go fo h argv k (Map.lookup s.sp.all h)
+calledTakes go s fo argv k (Just (ELam ys b)) =
+  bodyTakes go fo "" argv k (Just (ELam ys b))
+calledTakes go s fo argv k _ = False
+
+-- (the tag handed, at `k`, to what takes it apart: itself, at the
+-- same place, or another)
+handedTo : (Follow -> String -> List IR.Expr -> Int)
+         -> St
+         -> Follow
+         -> IR.Expr
+         -> List IR.Expr
+         -> Int
+         -> Bool
+handedTo go s fo (EGlobal h) argv k =
+  if strEq h fo.self then k == fo.at
+  else bodyTakes go fo h argv k (Map.lookup s.sp.all h)
+handedTo go s fo (EVar p) argv k =
+  calledTakes go s fo argv k (Map.lookup fo.env p)
+handedTo go s fo f argv k = False
+
+-- | how many times `x`, the tag, is taken apart in the worklist (`n` so
+-- | far) -- or -1, where it is used as a value
+takenW : St -> Follow -> String -> Int -> List IR.Expr -> Int
+takenW s fo x n Nil = n
+takenW s fo x n (Cons (EVar y) rest) =
+  if strEq x y then 0 - 1 else takenW s fo x n rest
+takenW s fo x n (Cons (EMatch sc arms) rest) =
+  if isVar x sc then takenW s fo x (n + 1) (IR.pushArms arms rest)
+  else takenW s fo x n (Cons sc (IR.pushArms arms rest))
+takenW s fo x n (Cons (EProj e l sh t) rest) =
+  if isVar x e then takenW s fo x (n + 1) rest
+  else takenW s fo x n (Cons e rest)
+takenW s fo x n (Cons (EApp f argv) rest) =
+  if List.null (posOf x 0 argv)
+  then takenW s fo x n (Cons f (IR.appendI argv rest))
+  else if List.all
+            (handedTo (\fo2 y w -> takenW s fo2 y 0 w) s fo f argv)
+            (posOf x 0 argv)
+  then takenW
+      s
+      fo
+      x
+      (n + 1)
+      (Cons f (IR.appendI (othersOf x argv) rest))
+  else 0 - 1
+takenW s fo x n (Cons e rest) = takenW s fo x n (IR.partsOnto e rest)
+
+-- (each parameter given a tag of values it takes apart, and may be made
+-- a copy for -- `sts`)
+tagGo : St
+      -> String
+      -> Map.Map String IR.Expr
+      -> IR.Expr
+      -> List Bool
+      -> List String
+      -> List IR.Expr
+      -> Int
+      -> List Bool
+tagGo s g env b (Cons st sts) (Cons x xs) (Cons a argv) i =
+  Cons
+    (st
+     && valueTag a
+     && takenW
+       s
+       { deeper = tagDepth, env = env, self = g, at = i }
+       x
+       0
+       (Cons b Nil)
+     > 0)
+    (tagGo s g env b sts xs argv (i + 1))
+tagGo s g env b _ _ _ i = Nil
+
+-- | the parameters a copy is made for, given a tag
+tagMarks : St -> String -> List String -> IR.Expr -> List IR.Expr -> List Bool
+tagMarks s g xs b argv =
+  if List.any valueTag argv && not (IR.sizeAbove tagSpecSize b)
+  then tagGo
+      s
+      g
+      (envOf Map.empty xs argv)
+      b
+      (if loops g b then Spec.statics g xs b else List.map (\x -> True) xs)
+      xs
+      argv
+      0
+  else Nil
+
+-- (... the parameters given a tag of values they take apart, `tags`)
+specTagged : SK
+           -> String
+           -> List String
+           -> IR.Expr
+           -> List IR.Expr
+           -> List Bool
+           -> List Bool
+           -> M IR.Expr
+specTagged r g xs b argv made tags = do
+  s <- get
+  if not
+       (anyKnown s.sp.kinds (knownMore s argv g) g b argv
+        || List.any (\m -> m) made
+        || List.any (\m -> m) tags)
+  then pure (mkApp (EGlobal g) argv)
+  else specMarked
+      r
+      True
+      g
+      xs
+      b
+      argv
+      (orMarks
+         (orMarks (marksOf s.sp.kinds (knownMore s argv g) g xs b argv) made)
+         tags)
+
 -- (... the arguments `made` lambdas of partial applications known too)
 specKnown : SK
           -> String
@@ -2802,18 +3030,7 @@ specKnown : SK
           -> M IR.Expr
 specKnown r g xs b argv made = do
   s <- get
-  if not
-       (anyKnown s.sp.kinds (knownMore s argv g) g b argv
-        || List.any (\m -> m) made)
-  then pure (mkApp (EGlobal g) argv)
-  else specMarked
-      r
-      True
-      g
-      xs
-      b
-      argv
-      (orMarks (marksOf s.sp.kinds (knownMore s argv g) g xs b argv) made)
+  specTagged r g xs b argv made (tagMarks s g xs b argv)
 
 -- Partial applications given to a loop: a known function given fewer
 -- arguments than it takes, `scale f`, handed to a loop at a parameter it
