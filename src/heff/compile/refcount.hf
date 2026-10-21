@@ -44,6 +44,7 @@ import heff.compile.facts as Facts
 import heff.elab.fixed as Fixed
 import heff.compile.imperative as Imperative
 import heff.compile.ir as IR
+import heff.elab.primitive
 import heff.compile.repr as Repr
 import std.ordmap as OrdMap
 
@@ -88,8 +89,8 @@ data Arg e
 data Cond e
   = CondTrue
   | CondFalse
-  | CondRel String (List e)
-  | CondRelU String (List e)
+  | CondRel Prim (List e)
+  | CondRelU Prim (List e)
   | CondBool e
   | CondNot (Cond e)
   | CondIf (Cond e) (Cond e) (Cond e)
@@ -147,8 +148,8 @@ data Exp b
   | RTakeField String Int
   -- | a field looked for by its label
   | RGetLabel (Exp b) String
-  | RPrimFn String
-  | RPrim String (List (Exp b))
+  | RPrimFn Prim
+  | RPrim Prim (List (Exp b))
   -- | a lambda's closure: its parameters, what it holds (the names in
   -- | its body, the values given), its body (its parameters not wanted
   -- | dropped first)
@@ -167,10 +168,10 @@ data Exp b
   | RBox Repr.Repr (Exp b)
   | RUnbox Repr.Repr (Exp b)
   | RPeek Repr.Repr (Exp b)
-  | RPrimU String (List (Exp b))
+  | RPrimU Prim (List (Exp b))
   -- | an array's primitive at a number's repr (#61, `Repr.elementAt`):
   -- | its element read as one (`arrayIndex`), or given as one
-  | RPrimAt String Repr.Repr (List (Exp b))
+  | RPrimAt Prim Repr.Repr (List (Exp b))
   | RFixU Fixed.Fixed Int
   | RF32U Float64
   | RF64U Float64
@@ -993,8 +994,8 @@ lamVal r ce live xs t = lamWith r ce live xs t (freeOf xs t)
 
 -- (the primitive a tag built in a kept cell is, while it is made: see
 -- `reusing`)
-reusePrim : String
-reusePrim = "$reuse"
+reusePrim : Prim
+reusePrim = Reuse
 
 -- (field `i` of a record, counted, the record not touched: one that may
 -- be flat (#39) boxed if it is)
@@ -1311,7 +1312,7 @@ elementReprs e rp vs =
 elementVal : RcK
            -> CE
            -> List String
-           -> String
+           -> Prim
            -> List Imperative.Val
            -> Int
            -> Repr.Repr
@@ -1326,7 +1327,7 @@ elementVal r ce live p argv e rp =
 primVal : RcK
         -> CE
         -> List String
-        -> String
+        -> Prim
         -> List Imperative.Val
         -> Maybe Int
         -> Value
@@ -1339,9 +1340,8 @@ primVal r ce live p argv (Just e) =
     argv
     e
     (elementRepr ce (fromMaybe (SInt 0) (List.head (List.drop e argv))))
-primVal r ce live p argv Nothing =
-  if strEq p reusePrim then reuseVal r ce live argv
-  else RPrim p (operandsF r ce live argv)
+primVal r ce live Reuse argv Nothing = reuseVal r ce live argv
+primVal r ce live p argv Nothing = RPrim p (operandsF r ce live argv)
 
 valF : RcK -> CE -> List String -> Imperative.Val -> Value
 valF r ce live (SVar x) = varUse ce live x
@@ -1396,7 +1396,7 @@ primAs : RcK
        -> CE
        -> List String
        -> Repr.Repr
-       -> String
+       -> Prim
        -> List Imperative.Val
        -> Maybe Repr.Shape
        -> Value
@@ -1473,7 +1473,7 @@ lentTo ce = withTakes Nil (withBorrowed (List.append ce.owned ce.borrowed) ce)
 relWith : RcK
         -> CE
         -> List String
-        -> String
+        -> Prim
         -> List Imperative.Val
         -> Maybe Repr.Shape
         -> Test
@@ -1482,7 +1482,7 @@ relWith r ce live p args (Just sh) =
 relWith r ce live p args Nothing = CondRel p (operandsF r ce live args)
 
 -- | a comparison: of unboxed operands, where it is done so
-relTest : RcK -> CE -> List String -> String -> List Imperative.Val -> Test
+relTest : RcK -> CE -> List String -> Prim -> List Imperative.Val -> Test
 relTest r ce live p args = relWith r ce live p args (Repr.primShape p)
 
 -- | a condition, its operands lent (`ce` as `lentTo` makes it); a name
@@ -1793,7 +1793,7 @@ withTag : String
 withTag t ts (MkPair b argv) = MkPair b (STag t argv ts)
 
 -- (a tag built in another cell already, its operands searched)
-claimedWith : String
+claimedWith : Prim
             -> Imperative.Val
             -> String
             -> List IR.FieldTy
@@ -1812,10 +1812,8 @@ reuseV ru n (STag t argv ts) =
       True
       (SPrim reusePrim (Cons (SVar ru) (Cons (STag t argv ts) Nil)))
   else withTag t ts (reuseArgs (\v -> reuseV ru n v) argv)
-reuseV ru n (SPrim p (Cons cell (Cons (STag t argv ts) Nil))) =
-  if strEq p reusePrim
-  then claimedWith p cell t ts (reuseArgs (\v -> reuseV ru n v) argv)
-  else MkPair False (SPrim p (Cons cell (Cons (STag t argv ts) Nil)))
+reuseV ru n (SPrim Reuse (Cons cell (Cons (STag t argv ts) Nil))) =
+  claimedWith Reuse cell t ts (reuseArgs (\v -> reuseV ru n v) argv)
 reuseV ru n v = MkPair False v
 
 reuseVals : String
@@ -2303,8 +2301,7 @@ builtOf (OSimple (STag _ argv _)) = Just (KnownTag (List.length argv))
 builtOf (OSimple (SRec fs _)) = Just (KnownRec (List.length fs))
 builtOf (OSimple (SLam xs (MkBlock t))) =
   Just (KnownClo (List.length (freeOf xs t)))
-builtOf (OSimple (SPrim p argv)) =
-  if strEq p reusePrim then reusedOf argv else Nothing
+builtOf (OSimple (SPrim Reuse argv)) = reusedOf argv
 builtOf _ = Nothing
 
 knownLet : String -> Maybe Known -> CE -> CE
@@ -2334,7 +2331,7 @@ condArm r ce b =
 -- after want: the comparison's operands, then the test, then each arm)
 condWith : RcK
          -> CE
-         -> String
+         -> Prim
          -> List Imperative.Val
          -> ArmBody
          -> ArmBody
@@ -2358,7 +2355,7 @@ condWith r ce p args yes no fa wb =
 
 condOf : RcK
        -> CE
-       -> String
+       -> Prim
        -> List Imperative.Val
        -> ArmBody
        -> ArmBody
@@ -2606,37 +2603,36 @@ bindThen r ce x fa binding known takes rest after =
 -- binds are: read not counted (`peekPrim`), a reference taken only where
 -- it is given, never dropped.  Only where `x` is known to be no number
 -- an array keeps flat, its element made anew where it is read: an `Int`
--- (an operand of one of `intPrims`, somewhere), or of a type of tags (a
+-- (an operand of an `intPrim`, somewhere), or of a type of tags (a
 -- match looks at it, or the loop is given it at a parameter a match
 -- looks at -- as heff.compile.borrow lends it on).
 
--- | the primitives each of whose operands is an `Int`
-intPrims : List String
-intPrims =
-  [ "intAdd"
-  , "intSub"
-  , "intMul"
-  , "intDiv"
-  , "intMod"
-  , "intEq"
-  , "intLt"
-  , "intLe"
-  , "intAnd"
-  , "intOr"
-  , "intXor"
-  , "intShl"
-  , "intShr"
-  , "intShow"
-  , "intHash"
-  ]
+-- | whether each of a primitive's operands is an `Int`
+intPrim : Prim -> Bool
+intPrim IntAdd = True
+intPrim IntSub = True
+intPrim IntMul = True
+intPrim IntDiv = True
+intPrim IntMod = True
+intPrim IntEq = True
+intPrim IntLt = True
+intPrim IntLe = True
+intPrim IntAnd = True
+intPrim IntOr = True
+intPrim IntXor = True
+intPrim IntShl = True
+intPrim IntShr = True
+intPrim IntShow = True
+intPrim IntHash = True
+intPrim _ = False
 
 -- | an array's element read, not counted
-peekPrim : String
-peekPrim = "arrayPeek"
+peekPrim : Prim
+peekPrim = ArrayPeek
 
--- (whether `x` is one of the operands of `p`, one of `intPrims`)
-intOperand : String -> String -> List Imperative.Val -> Bool
-intOperand x p argv = elemS p intPrims && List.any (varIs x) argv
+-- (whether `x` is one of the operands of `p`, an `intPrim`)
+intOperand : String -> Prim -> List Imperative.Val -> Bool
+intOperand x p argv = intPrim p && List.any (varIs x) argv
 
 -- (an item's parts, before the rest of the worklist)
 partsThen : Item -> List Item -> List Item
@@ -2680,7 +2676,7 @@ anyW : (Item -> Bool) -> List Item -> Bool
 anyW f Nil = False
 anyW f (Cons it rest) = f it || anyW f (partsThen it rest)
 
--- (`x` an operand of one of `intPrims`)
+-- (`x` an operand of an `intPrim`)
 intAt : String -> Item -> Bool
 intAt x (IVal (SPrim p argv)) = intOperand x p argv
 intAt x (IOp (OPrim p argv)) = intOperand x p argv
@@ -2737,10 +2733,8 @@ peekOf : CE
        -> Imperative.Comp
        -> List Item
        -> Maybe (Pair String Imperative.Val)
-peekOf ce x (OPrim p argv) rest =
-  if strEq p "arrayIndex" then peekArgs ce x argv rest else Nothing
-peekOf ce x (OSimple (SPrim p argv)) rest =
-  if strEq p "arrayIndex" then peekArgs ce x argv rest else Nothing
+peekOf ce x (OPrim ArrayIndex argv) rest = peekArgs ce x argv rest
+peekOf ce x (OSimple (SPrim ArrayIndex argv)) rest = peekArgs ce x argv rest
 peekOf ce x o rest = Nothing
 
 -- (`let x = arrayIndex a i`, `x` lent: what is held and wanted neither by

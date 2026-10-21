@@ -36,6 +36,7 @@ module heff.compile.arrayloops
 import heff.compile.ir as IR
 import heff.compile.lift as Lift
 import std.ordmap as OrdMap
+import heff.elab.primitive
 
 -- Going through, drawing names and making loops
 --------------------------------------------------------------------------------
@@ -88,7 +89,7 @@ bodyLimit : Int
 bodyLimit = 100
 
 -- | whether it calls a function it does not know: a variable's
--- | >>> List.map callsUnknown [EApp (EVar "f") [EInt 1], EPrimCall "intAdd" [EVar "x", EInt 1]]
+-- | >>> List.map callsUnknown [EApp (EVar "f") [EInt 1], EPrimCall IntAdd [EVar "x", EInt 1]]
 -- | [True, False]
 callsUnknown : IR.Expr -> Bool
 callsUnknown (EApp (EVar _) _) = True
@@ -101,13 +102,13 @@ worthALoop EAbandon = False
 worthALoop e = not (callsUnknown e) && not (IR.sizeAbove bodyLimit e)
 
 -- (whether a primitive's call reads `xs` at `i`)
-readsAt : String -> String -> String -> List IR.Expr -> Bool
-readsAt xs i p (Cons (EVar a) (Cons (EVar j) Nil)) =
-  strEq p "arrayIndex" && strEq a xs && strEq j i
+readsAt : String -> String -> Prim -> List IR.Expr -> Bool
+readsAt xs i ArrayIndex (Cons (EVar a) (Cons (EVar j) Nil)) =
+  strEq a xs && strEq j i
 readsAt xs i p es = False
 
 -- | whether `e` mentions `xs` only to read it at `i`
--- | >>> List.map (readOnlyAt "xs" "i") [EPrimCall "arrayIndex" [EVar "xs", EVar "i"], EPrimCall "arrayIndex" [EVar "xs", EInt 0]]
+-- | >>> List.map (readOnlyAt "xs" "i") [EPrimCall ArrayIndex [EVar "xs", EVar "i"], EPrimCall ArrayIndex [EVar "xs", EInt 0]]
 -- | [True, False]
 readOnlyAt : String -> String -> IR.Expr -> Bool
 readOnlyAt xs i (EVar y) = not (strEq y xs)
@@ -117,8 +118,7 @@ readOnlyAt xs i e = List.all (readOnlyAt xs i) (IR.partsOnto e Nil)
 
 -- | the array a `generate` of its length maps, if it is one
 mapped : IR.Expr -> Maybe String
-mapped (EPrimCall p (Cons (EVar xs) Nil)) =
-  if strEq p "arrayLength" then Just xs else Nothing
+mapped (EPrimCall ArrayLength (Cons (EVar xs) Nil)) = Just xs
 mapped e = Nothing
 
 -- The loops
@@ -132,13 +132,13 @@ vars xs = List.map (\x -> EVar x) xs
 loopBody : String -> List String -> String -> String -> IR.Expr -> IR.Expr
 loopBody key ps i a e =
   IR.ifOf
-    (EPrimCall "intLt" [EVar i, EPrimCall "arrayLength" [EVar a]])
+    (EPrimCall IntLt [EVar i, EPrimCall ArrayLength [EVar a]])
     (EApp
        (EGlobal key)
        (List.append
           (vars ps)
-          [ EPrimCall "intAdd" [EVar i, EInt 1]
-          , EPrimCall "arraySet" [EVar a, EVar i, e]
+          [ EPrimCall IntAdd [EVar i, EInt 1]
+          , EPrimCall ArraySet [EVar a, EVar i, e]
           ]))
     (EVar a)
 
@@ -182,7 +182,7 @@ freshCall g =
   fromOne
     (g.key ^ "$generate" ^ show g.k)
     g.ps
-    (EPrimCall "arrayReplicate" [EVar g.m, EVar g.y])
+    (EPrimCall ArrayReplicate [EVar g.m, EVar g.y])
 
 -- | of a `map` of `xs`: the loop writing into `xs` where it keeps its
 -- | elements as the first, `y`, would be kept, `y` set at 0 first; else
@@ -199,11 +199,11 @@ inPlace g xs = do
       (IR.subst (OrdMap.insert OrdMap.empty xs (EVar a)) g.e)
   pure
       (IR.ifOf
-         (EPrimCall "arrayKeepsAs" [EVar xs, EVar g.y])
+         (EPrimCall ArrayKeepsAs [EVar xs, EVar g.y])
          (fromOne
             (g.key ^ "$map" ^ show g.k)
             (List.keepIf (\p -> not (strEq p xs)) g.ps)
-            (EPrimCall "arraySet" [EVar xs, EInt 0, EVar g.y]))
+            (EPrimCall ArraySet [EVar xs, EInt 0, EVar g.y]))
          (freshCall g))
 
 -- (the loops, the first element built: in place too, of a `map`)
@@ -225,8 +225,8 @@ withFirst g n = do
          g.m
          n
          (IR.ifOf
-            (EPrimCall "intLe" [EVar g.m, EInt 0])
-            (EPrimCall "arrayGenerate" [EVar g.m, ELam [u] EAbandon])
+            (EPrimCall IntLe [EVar g.m, EInt 0])
+            (EPrimCall ArrayGenerate [EVar g.m, ELam [u] EAbandon])
             (ELet g.y first rest)))
 
 -- | `generate n (\i -> e)` as a loop, of the definition `key` known as
@@ -252,14 +252,12 @@ asLoop key name n i e = do
 generated : String -> String -> IR.Expr -> IR.Expr -> S IR.Expr
 generated key name n (ELam (Cons i Nil) e) =
   if worthALoop e then asLoop key name n i e
-  else pure (EPrimCall "arrayGenerate" [n, ELam [i] e])
-generated key name n f = pure (EPrimCall "arrayGenerate" [n, f])
+  else pure (EPrimCall ArrayGenerate [n, ELam [i] e])
+generated key name n f = pure (EPrimCall ArrayGenerate [n, f])
 
 -- (a primitive's call, its operands gone through already)
-primOf : String -> String -> String -> List IR.Expr -> S IR.Expr
-primOf key name p (Cons n (Cons f Nil)) =
-  if strEq p "arrayGenerate" then generated key name n f
-  else pure (EPrimCall p [n, f])
+primOf : String -> String -> Prim -> List IR.Expr -> S IR.Expr
+primOf key name ArrayGenerate (Cons n (Cons f Nil)) = generated key name n f
 primOf key name p es = pure (EPrimCall p es)
 
 -- Everywhere
@@ -295,7 +293,7 @@ defsOnto (MkPair acc n) d = case defOf n d of
 
 -- | the program, each `generate` worth a loop made one, the loops after
 -- | the definition they are of; where fresh names go on from
--- | >>> List.map (\(d : IR.Def) -> d.key) (fst (loopsProgram 10 [IR.mkDef "m.f" "f" (ELam ["xs"] (EPrimCall "arrayGenerate" [EPrimCall "arrayLength" [EVar "xs"], ELam ["i"] (EPrimCall "floatAdd" [EPrimCall "arrayIndex" [EVar "xs", EVar "i"], EFloat 1.0])]))]))
+-- | >>> List.map (\(d : IR.Def) -> d.key) (fst (loopsProgram 10 [IR.mkDef "m.f" "f" (ELam ["xs"] (EPrimCall ArrayGenerate [EPrimCall ArrayLength [EVar "xs"], ELam ["i"] (EPrimCall FloatAdd [EPrimCall ArrayIndex [EVar "xs", EVar "i"], EFloat 1.0])]))]))
 -- | ["m.f", "m.f$generate0", "m.f$map0"]
 loopsProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
 loopsProgram n defs = case List.foldl defsOnto (MkPair Nil n) defs of

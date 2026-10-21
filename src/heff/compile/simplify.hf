@@ -12,7 +12,7 @@ module heff.compile.simplify
 
 import heff.compile.ir as IR
 import heff.compile.irtext as IRText
-import heff.compile.prims as Prims
+import heff.elab.primitive
 import heff.compile.spec as Spec
 import std.ordmap as OrdMap
 
@@ -334,22 +334,24 @@ attempt orig m = attemptBy budget orig m
 
 type SG = { safe : OrdMap.OrdMap String Unit, total : OrdMap.OrdMap String Int }
 
--- | what cannot fail: evaluating it gives a value, at once.  A
--- | projection is of a record, always there; an application of a
--- | `total` function up to its arity builds a closure or its pure body
--- | the primitives that may fail (abandon, or a shift beyond memory), or
+-- | whether a primitive may fail (abandon, or a shift beyond memory), or
 -- | call what may: no fixed-width type's operation is among them (a
 -- | division by zero is 0, the floor of what is not finite 0).  And
 -- | bench's `keep`, taken as one that may: so that no pass drops it, its
 -- | result unused, nor moves it, nor what is made of it, out of where
 -- | it is -- what a benchmark's work is kept by
-failing : List String
-failing = ["intShl", "intShr", "arrayIndex", "arrayGenerate", "perform", "keep"]
+primFails : Prim -> Bool
+primFails IntShl = True
+primFails IntShr = True
+primFails ArrayIndex = True
+primFails ArrayGenerate = True
+primFails Perform = True
+primFails Keep = True
+primFails _ = False
 
--- | whether a primitive may fail
-primFails : String -> Bool
-primFails p = List.elemBy strEq p failing
-
+-- | what cannot fail: evaluating it gives a value, at once.  A
+-- | projection is of a record, always there; an application of a
+-- | `total` function up to its arity builds a closure or its pure body
 pureIn : OrdMap.OrdMap String Unit
        -> OrdMap.OrdMap String Int
        -> IR.Expr
@@ -473,45 +475,42 @@ boolE : Bool -> IR.Expr
 boolE b = ETag (if b then "True" else "False") Nil Nil
 
 -- | a primitive of two integers, computed (those that cannot fail)
-intOp : String -> Int -> Int -> Maybe IR.Expr
-intOp p a b =
-  if strEq p "intAdd" then Just (EInt (a + b))
-  else if strEq p "intSub" then Just (EInt (a - b))
-  else if strEq p "intMul" then Just (EInt (a * b))
-  else if strEq p "intEq" then Just (boolE (a == b))
-  else if strEq p "intLt" then Just (boolE (a < b))
-  else if strEq p "intLe" then Just (boolE (a <= b))
-  else Nothing
+intOp : Prim -> Int -> Int -> Maybe IR.Expr
+intOp IntAdd a b = Just (EInt (a + b))
+intOp IntSub a b = Just (EInt (a - b))
+intOp IntMul a b = Just (EInt (a * b))
+intOp IntEq a b = Just (boolE (a == b))
+intOp IntLt a b = Just (boolE (a < b))
+intOp IntLe a b = Just (boolE (a <= b))
+intOp p a b = Nothing
 
 -- | ... of two strings
-strOp : String -> String -> String -> Maybe IR.Expr
-strOp p a b =
-  if strEq p "strAppend" then Just (EStr (a ^ b))
-  else if strEq p "strEq" then Just (boolE (strEq a b))
-  else Nothing
+strOp : Prim -> String -> String -> Maybe IR.Expr
+strOp StrAppend a b = Just (EStr (a ^ b))
+strOp StrEq a b = Just (boolE (strEq a b))
+strOp p a b = Nothing
 
 -- | ... of one (a string's length its bytes, as every backend's is)
--- | >>> unOp "strLength" (EStr "\u{e9}\u{1F600}")
+-- | >>> unOp StrLength (EStr "\u{e9}\u{1F600}")
 -- | Just (EInt 6)
-unOp : String -> IR.Expr -> Maybe IR.Expr
-unOp p (EInt a) = if strEq p "intShow" then Just (EStr (show a)) else Nothing
-unOp p (EStr a) =
-  if strEq p "strLength" then Just (EInt (strLength a)) else Nothing
+unOp : Prim -> IR.Expr -> Maybe IR.Expr
+unOp IntShow (EInt a) = Just (EStr (show a))
+unOp StrLength (EStr a) = Just (EInt (strLength a))
 unOp p _ = Nothing
 
-binOp : String -> IR.Expr -> IR.Expr -> Maybe IR.Expr
+binOp : Prim -> IR.Expr -> IR.Expr -> Maybe IR.Expr
 binOp p (EInt a) (EInt b) = intOp p a b
 binOp p (EStr a) (EStr b) = strOp p a b
 binOp p _ _ = Nothing
 
-foldArgs : String -> List IR.Expr -> Maybe IR.Expr
+foldArgs : Prim -> List IR.Expr -> Maybe IR.Expr
 foldArgs p (Cons a Nil) = unOp p a
 foldArgs p (Cons a (Cons b Nil)) = binOp p a b
 foldArgs p _ = Nothing
 
 -- | a primitive's call: its value, if its arguments are literals; a
 -- | comparison, a condition
-foldPrim : String -> List IR.Expr -> IR.Expr
+foldPrim : Prim -> List IR.Expr -> IR.Expr
 foldPrim p argv = case foldArgs p argv of
   Just v -> v
   Nothing -> case argv of
@@ -533,16 +532,15 @@ foldCond c = c
 -- | there (what the other judgments know a primitive's computation by;
 -- | `heff.compile.callarity` does the same for the definitions, whose parameters are
 -- | not known until the simplifier is done)
-primAppN : String -> List IR.Expr -> Maybe Int -> IR.Expr
-primAppN p argv (Just n) =
+primAppN : Prim -> List IR.Expr -> Int -> IR.Expr
+primAppN p argv n =
   if List.length argv == n then foldPrim p argv
   else if List.length argv > n
   then EApp (foldPrim p (List.take n argv)) (List.drop n argv)
   else EApp (EPrim p) argv
-primAppN p argv Nothing = EApp (EPrim p) argv
 
-primApp : String -> List IR.Expr -> IR.Expr
-primApp p argv = primAppN p argv (Prims.primArity p)
+primApp : Prim -> List IR.Expr -> IR.Expr
+primApp p argv = primAppN p argv (primArity p)
 
 -- | an application, in the form the simplifier keeps every one in:
 -- | its head not an application (`(f a) b` is `f a b`), and a primitive
@@ -550,8 +548,8 @@ primApp p argv = primAppN p argv (Prims.primArity p)
 -- | simplifier makes is made by this, so no judgment need look for
 -- | another form (a primitive applied, not called: `cheap` would not
 -- | know it)
--- | >>> mkApp (EApp (EPrim "intAdd") [EVar "n"]) [EInt 0]
--- | EPrimCall "intAdd" [EVar "n", EInt 0]
+-- | >>> mkApp (EApp (EPrim IntAdd) [EVar "n"]) [EInt 0]
+-- | EPrimCall IntAdd [EVar "n", EInt 0]
 mkApp : IR.Expr -> List IR.Expr -> IR.Expr
 mkApp f Nil = f
 mkApp (EApp g bs) argv = mkApp g (List.append bs argv)
@@ -4278,12 +4276,12 @@ initSt n0 sg kp =
 -- |
 -- | another name for a tag, given a call: the tag given it, no binding
 -- | between, so a loop can build the value
--- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "c" "c" (ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"] [FtAny, FtOther])), IR.mkDef "f" "f" (ELam ["z"] (EApp (EApp (EGlobal "c") [EPrimCall "add" [EVar "z"]]) [EApp (EGlobal "f") [EVar "z"]]))]).defs
--- | [ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"] [FtAny, FtOther]), ELam ["z"] (ETag "Cons" [EPrimCall "add" [EVar "z"], EApp (EGlobal "f") [EVar "z"]] [FtAny, FtOther])]
+-- | >>> List.map (\(d : IR.Def) -> d.body) (simplifyProgram 0 [IR.mkDef "c" "c" (ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"] [FtAny, FtOther])), IR.mkDef "f" "f" (ELam ["z"] (EApp (EApp (EGlobal "c") [EPrimCall IntAdd [EVar "z"]]) [EApp (EGlobal "f") [EVar "z"]]))]).defs
+-- | [ELam ["x", "y"] (ETag "Cons" [EVar "x", EVar "y"] [FtAny, FtOther]), ELam ["z"] (ETag "Cons" [EPrimCall IntAdd [EVar "z"], EApp (EGlobal "f") [EVar "z"]] [FtAny, FtOther])]
 -- |
 -- | two arguments alike but for a number in them: one copy, the number
 -- | given it where it is called
--- | >>> List.length (List.keepIf (\(d : IR.Def) -> strEq (Spec.rootOf d.key) "m" && not (strEq d.key "m")) (simplifyProgram 0 [IR.mkDef "m" "m" (ELam ["f", "xs"] (EMatch (EVar "xs") [MkArm "Nil" [] (ETag "Nil" [] []), MkArm "Cons" ["x", "r"] (ETag "Cons" [EApp (EVar "f") [EVar "x"], EApp (EGlobal "m") [EVar "f", EVar "r"]] [FtAny, FtOther])])), IR.mkDef "a" "a" (ELam ["us"] (EApp (EGlobal "m") [ELam ["u"] (EPrimCall "intAdd" [EVar "u", EInt 1]), EVar "us"])), IR.mkDef "b" "b" (ELam ["vs"] (EApp (EGlobal "m") [ELam ["v"] (EPrimCall "intAdd" [EVar "v", EInt 2]), EVar "vs"]))]).defs)
+-- | >>> List.length (List.keepIf (\(d : IR.Def) -> strEq (Spec.rootOf d.key) "m" && not (strEq d.key "m")) (simplifyProgram 0 [IR.mkDef "m" "m" (ELam ["f", "xs"] (EMatch (EVar "xs") [MkArm "Nil" [] (ETag "Nil" [] []), MkArm "Cons" ["x", "r"] (ETag "Cons" [EApp (EVar "f") [EVar "x"], EApp (EGlobal "m") [EVar "f", EVar "r"]] [FtAny, FtOther])])), IR.mkDef "a" "a" (ELam ["us"] (EApp (EGlobal "m") [ELam ["u"] (EPrimCall IntAdd [EVar "u", EInt 1]), EVar "us"])), IR.mkDef "b" "b" (ELam ["vs"] (EApp (EGlobal "m") [ELam ["v"] (EPrimCall IntAdd [EVar "v", EInt 2]), EVar "vs"]))]).defs)
 -- | 1
 simplifyProgram : Int -> List IR.Def -> Simplified
 simplifyProgram n0 defs =

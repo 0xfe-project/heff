@@ -48,7 +48,7 @@ import heff.compile.ir as IR
 import heff.compile.irtext as IRText
 import heff.compile.lower as Lower
 import heff.compile.owned as Owned
-import heff.compile.prims as Prims
+import heff.elab.primitive
 import heff.compile.ranges as Ranges
 import heff.compile.refcount as RefCount
 import heff.compile.repr as Repr
@@ -387,10 +387,10 @@ shapeLit ls = \s ->
       }
 
 -- | a primitive, as a value: a closure of it
-primLit : String -> C String
+primLit : Prim -> C String
 primLit p = \s ->
     MkPair
-      ("((V)&prim_" ^ p ^ "_clo)")
+      ("((V)&prim_" ^ primName p ^ "_clo)")
       { owner = s.owner
       , nlam = s.nlam
       , lams = s.lams
@@ -398,7 +398,7 @@ primLit p = \s ->
       , nstr = s.nstr
       , strs = s.strs
       , shapes = s.shapes
-      , prims = ownAdd s.owner p s.prims
+      , prims = ownAdd s.owner (primName p) s.prims
       }
 
 newLam : C String
@@ -522,36 +522,31 @@ opSymbol OpLe = "<="
 opSymbol o = ""
 
 -- (`Float64`'s primitives done as C's operators, and as libm's functions)
-floatSymbols : List (Pair String String)
-floatSymbols =
-  [ MkPair "floatAdd" "+"
-  , MkPair "floatSub" "-"
-  , MkPair "floatMul" "*"
-  , MkPair "floatDiv" "/"
-  , MkPair "floatEq" "=="
-  , MkPair "floatLt" "<"
-  , MkPair "floatLe" "<="
-  ]
+floatSymbol : Prim -> String
+floatSymbol FloatAdd = "+"
+floatSymbol FloatSub = "-"
+floatSymbol FloatMul = "*"
+floatSymbol FloatDiv = "/"
+floatSymbol FloatEq = "=="
+floatSymbol FloatLt = "<"
+floatSymbol FloatLe = "<="
+floatSymbol _ = ""
 
-floatSymbol : String -> String
-floatSymbol p = fromMaybe "" (List.lookupBy strEq p floatSymbols)
-
-libmNames : List (Pair String String)
-libmNames =
-  [ MkPair "floatSqrt" "sqrt"
-  , MkPair "floatSin" "sin"
-  , MkPair "floatCos" "cos"
-  , MkPair "floatTan" "tan"
-  , MkPair "floatAsin" "asin"
-  , MkPair "floatAcos" "acos"
-  , MkPair "floatAtan" "atan"
-  , MkPair "floatExp" "exp"
-  , MkPair "floatLog" "log"
-  , MkPair "floatAtan2" "atan2"
-  , MkPair "floatPow" "pow"
-  , MkPair "floatFromInt" "heff_from_int_f64"
-  , MkPair "floatFloor" "heff_floor_f64"
-  ]
+libmName : Prim -> String
+libmName FloatSqrt = "sqrt"
+libmName FloatSin = "sin"
+libmName FloatCos = "cos"
+libmName FloatTan = "tan"
+libmName FloatAsin = "asin"
+libmName FloatAcos = "acos"
+libmName FloatAtan = "atan"
+libmName FloatExp = "exp"
+libmName FloatLog = "log"
+libmName FloatAtan2 = "atan2"
+libmName FloatPow = "pow"
+libmName FloatFromInt = "heff_from_int_f64"
+libmName FloatFloor = "heff_floor_f64"
+libmName p = primName p
 
 arg0 : List String -> String
 arg0 vs = fromMaybe "0" (List.head vs)
@@ -609,66 +604,56 @@ isRelOp OpLt = True
 isRelOp OpLe = True
 isRelOp o = False
 
-fixedU : Fixed.FixedPrim -> List String -> String
-fixedU fp vs =
-  if isRelOp fp.op then "heff_bool(" ^ infixC (opSymbol fp.op) vs ^ ")"
-  else if Fixed.isFloat32 fp.fixed then float32U fp.op vs
-  else intU fp.fixed fp.op vs
+fixedU : Fixed.Fixed -> Fixed.FixedOp -> List String -> String
+fixedU w op vs =
+  if isRelOp op then "heff_bool(" ^ infixC (opSymbol op) vs ^ ")"
+  else if Fixed.isFloat32 w then float32U op vs
+  else intU w op vs
 
 -- | ... of a `Float64`: C's operator, or libm's function
-float64U : String -> List String -> String
+float64U : Prim -> List String -> String
+float64U FloatEq vs = "heff_bool(" ^ infixC (floatSymbol FloatEq) vs ^ ")"
+float64U FloatLt vs = "heff_bool(" ^ infixC (floatSymbol FloatLt) vs ^ ")"
+float64U FloatLe vs = "heff_bool(" ^ infixC (floatSymbol FloatLe) vs ^ ")"
 float64U p vs =
-  if strEq p "floatEq" || strEq p "floatLt" || strEq p "floatLe"
-  then "heff_bool(" ^ infixC (floatSymbol p) vs ^ ")"
-  else if strLength (floatSymbol p) > 0 then infixC (floatSymbol p) vs
-  else callOf (fromMaybe p (List.lookupBy strEq p libmNames)) vs
-
-primUOf : String -> Maybe Fixed.FixedPrim -> List String -> String
-primUOf p (Just fp) vs = fixedU fp vs
-primUOf p Nothing vs = float64U p vs
+  if strLength (floatSymbol p) > 0 then infixC (floatSymbol p) vs
+  else callOf (libmName p) vs
 
 -- (an operation on words, heff.compile.ranges's, as C's operator: of
 -- `int64_t`s that neither overflow nor divide by 0, it is known)
-wordSymbols : List (Pair String String)
-wordSymbols =
-  [ MkPair "wordAdd" "+"
-  , MkPair "wordSub" "-"
-  , MkPair "wordMul" "*"
-  , MkPair "wordQuot" "/"
-  , MkPair "wordRem" "%"
-  , MkPair "wordEq" "=="
-  , MkPair "wordLt" "<"
-  , MkPair "wordLe" "<="
-  ]
-
-wordSymbol : String -> String
-wordSymbol p = fromMaybe "" (List.lookupBy strEq p wordSymbols)
+wordSymbol : Prim -> String
+wordSymbol WordAdd = "+"
+wordSymbol WordSub = "-"
+wordSymbol WordMul = "*"
+wordSymbol WordQuot = "/"
+wordSymbol WordRem = "%"
+wordSymbol WordEq = "=="
+wordSymbol WordLt = "<"
+wordSymbol WordLe = "<="
+wordSymbol _ = ""
 
 -- | ... as C has it: an operator; a division or a remainder rounded
 -- | down, the runtime's; a `Float64` made
-wordU : String -> List String -> String
-wordU "wordDiv" vs = callOf "heff_word_div" vs
-wordU "wordMod" vs = callOf "heff_word_mod" vs
-wordU "wordToFloat" vs = "((double)" ^ arg0 vs ^ ")"
+wordU : Prim -> List String -> String
+wordU WordDiv vs = callOf "heff_word_div" vs
+wordU WordMod vs = callOf "heff_word_mod" vs
+wordU WordToFloat vs = "((double)" ^ arg0 vs ^ ")"
 wordU p vs =
   if Ranges.isWordRel p then "heff_bool(" ^ infixC (wordSymbol p) vs ^ ")"
   else infixC (wordSymbol p) vs
 
 -- | a primitive done on unboxed operands (heff.compile.repr's `primShape`)
-primU : String -> List String -> String
-primU p vs =
-  if Ranges.isWordPrim p then wordU p vs
-  else primUOf p (Fixed.fixedPrimOf p) vs
+primU : Prim -> List String -> String
+primU (OfFixed w op) vs = fixedU w op vs
+primU p vs = if Ranges.isWordPrim p then wordU p vs else float64U p vs
 
-relSymbol : String -> Maybe Fixed.FixedPrim -> String
-relSymbol p (Just fp) = opSymbol fp.op
-relSymbol p Nothing = floatSymbol p
+relSymbol : Prim -> String
+relSymbol (OfFixed _ op) = opSymbol op
+relSymbol p = if Ranges.isWordRel p then wordSymbol p else floatSymbol p
 
 -- | a comparison of unboxed operands, as C's condition
-relU : String -> List String -> String
-relU p vs =
-  if Ranges.isWordRel p then infixC (wordSymbol p) vs
-  else infixC (relSymbol p (Fixed.fixedPrimOf p)) vs
+relU : Prim -> List String -> String
+relU p vs = infixC (relSymbol p) vs
 
 argsArr : List String -> String
 argsArr vs = if List.null vs then "NULL" else "(V[]){" ^ joinWith ", " vs ^ "}"
@@ -694,8 +679,9 @@ fixedLit : Fixed.Fixed -> Int -> String
 fixedLit w n =
   if Fixed.fixedBits w == 64 then intLit n else "MK_INT(" ^ show n ^ "LL)"
 
-primName : String -> String
-primName p = "heff_" ^ p
+-- (the runtime's)
+runtimeName : Prim -> String
+runtimeName p = "heff_" ^ primName p
 
 -- (a drop, as what is dropped is known to be: a tag given back as one
 -- (`heff_drop_tag`), not looked at by `heff_drop`; a cell kept and not
@@ -940,11 +926,11 @@ asLent es e = e
 
 -- | a call of a primitive's `_lent` form (`suffix` after its name: `_c`
 -- | for a condition's)
-lentPrimC : CK -> String -> String -> List RefCount.Value -> C String
+lentPrimC : CK -> Prim -> String -> List RefCount.Value -> C String
 lentPrimC k p suffix es = do
   vs <- traverseC k.exp (List.map (asLent es) es)
   pure
-      (primName p
+      (runtimeName p
        ^ suffix
        ^ "_lent("
        ^ joinWith ", " vs
@@ -962,7 +948,7 @@ testC k (CondRel p es) =
   if Owned.lends p es then lentPrimC k p "_c" es
   else bind
       (traverseC k.exp es)
-      (\vs -> pure (primName p ^ "_c(" ^ joinWith ", " vs ^ ")"))
+      (\vs -> pure (runtimeName p ^ "_c(" ^ joinWith ", " vs ^ ")"))
 testC k (CondRelU p es) = bind (traverseC k.exp es) (\vs -> pure (relU p vs))
 testC k (CondBool e) =
   bind (k.exp e) (\v -> pure ("(" ^ v ^ " == NTAG(TAG_True))"))
@@ -1091,7 +1077,7 @@ expF k (RPrim p es) =
   if Owned.lends p es then lentPrimC k p "" es
   else bind
       (traverseC k.exp es)
-      (\vs -> pure (primName p ^ "(" ^ joinWith ", " vs ^ ")"))
+      (\vs -> pure (runtimeName p ^ "(" ^ joinWith ", " vs ^ ")"))
 expF k (RLam xs fv held (MkCode body)) = lamC k xs fv held body
 expF k (RCall g tr w args) = callC k g tr w args
 expF k (RApply f es) = do
@@ -1115,7 +1101,13 @@ expF k (RPrimAt p r es) =
   else bind
       (traverseC k.exp es)
       (\vs ->
-         pure (primName p ^ "_" ^ reprSuffix r ^ "(" ^ joinWith ", " vs ^ ")"))
+         pure
+           (runtimeName p
+            ^ "_"
+            ^ reprSuffix r
+            ^ "("
+            ^ joinWith ", " vs
+            ^ ")"))
 expF k (RFixU w n) = pure (fixedConst w n)
 expF k (RF32U x) = pure ("((float)" ^ doubleConst x ^ ")")
 expF k (RF64U x) = pure (doubleConst x)
@@ -2133,27 +2125,29 @@ glueProvider gl =
 -- The program
 --------------------------------------------------------------------------------
 
+-- (a primitive's closure, by its name, as `primLit` keeps it)
+primCloOf : Prim -> List String
+primCloOf q =
+  [ "static V prim_"
+  ^ primName q
+  ^ "_entry(V self, V *a) { (void)self; return "
+  ^ runtimeName q
+  ^ "("
+  ^ joinWith
+    ", "
+    (List.map (\i -> "a[" ^ show i ^ "]") (List.range 0 (primArity q - 1)))
+  ^ "); }"
+  , "static Clo prim_"
+  ^ primName q
+  ^ "_clo = {{0x80000000u, K_CLO, 0}, prim_"
+  ^ primName q
+  ^ "_entry, "
+  ^ show (primArity q)
+  ^ ", 0};"
+  ]
+
 primCloDef : String -> List String
-primCloDef p = case Prims.primArity p of
-  Just n ->
-    [ "static V prim_"
-    ^ p
-    ^ "_entry(V self, V *a) { (void)self; return "
-    ^ primName p
-    ^ "("
-    ^ joinWith
-      ", "
-      (List.map (\i -> "a[" ^ show i ^ "]") (List.range 0 (n - 1)))
-    ^ "); }"
-    , "static Clo prim_"
-    ^ p
-    ^ "_clo = {{0x80000000u, K_CLO, 0}, prim_"
-    ^ p
-    ^ "_entry, "
-    ^ show n
-    ^ ", 0};"
-    ]
-  Nothing -> Nil
+primCloDef p = maybe Nil primCloOf (primOfName p)
 
 shapeDef : String -> String
 shapeDef name =

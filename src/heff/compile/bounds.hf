@@ -33,6 +33,7 @@
 module heff.compile.bounds
 
 import heff.compile.owned as Owned
+import heff.elab.primitive
 import heff.compile.refcount as RefCount
 import heff.compile.repr as Repr
 import heff.elab.fixed as Fixed
@@ -109,7 +110,7 @@ stepSum x es = False
 
 -- | a step of the index `x`: itself, or itself and at least 0
 stepOf : String -> RefCount.Value -> Bool
-stepOf x (RPrimU p es) = strEq p "wordAdd" && stepSum x es
+stepOf x (RPrimU WordAdd es) = stepSum x es
 stepOf x e = isVar x (varOf e)
 
 -- (set nowhere but by the loop)
@@ -132,9 +133,11 @@ indices f ds ags =
 -- The arrays
 --------------------------------------------------------------------------------
 
-isSet : String -> Bool
-isSet p =
-  strEq p "arraySet" || strEq p "arraySetOwned" || strEq p "arraySetOwnedIn"
+isSet : Prim -> Bool
+isSet ArraySet = True
+isSet ArraySetOwned = True
+isSet ArraySetOwnedIn = True
+isSet _ = False
 
 -- | whether a value is the array `b`, or it set, through the variables
 -- | bound only to such (not those `seen`, looked through already)
@@ -190,8 +193,7 @@ type Range = { index : String, array : String }
 
 -- (the array a length is of)
 lengthArray : RefCount.Value -> Maybe String
-lengthArray (RPrim p (Cons e Nil)) =
-  if strEq p "arrayLength" then varOf e else Nothing
+lengthArray (RPrim ArrayLength (Cons e Nil)) = varOf e
 lengthArray e = Nothing
 
 -- (a length, as a word)
@@ -215,12 +217,11 @@ foundOf : Bool -> Maybe Range -> Maybe Found
 foundOf yes (Just r) = Just (MkPair r yes)
 foundOf yes Nothing = Nothing
 
-relTest : Info -> String -> List RefCount.Value -> Maybe Found
-relTest info p (Cons a (Cons b Nil)) =
-  if strEq p "wordLt" then foundOf True (rangeOf info (varOf a) (lengthOf b))
-  else if strEq p "wordLe"
-  then foundOf False (rangeOf info (varOf b) (lengthOf a))
-  else Nothing
+relTest : Info -> Prim -> List RefCount.Value -> Maybe Found
+relTest info WordLt (Cons a (Cons b Nil)) =
+  foundOf True (rangeOf info (varOf a) (lengthOf b))
+relTest info WordLe (Cons a (Cons b Nil)) =
+  foundOf False (rangeOf info (varOf b) (lengthOf a))
 relTest info p es = Nothing
 
 flipped : Maybe Found -> Maybe Found
@@ -254,10 +255,10 @@ type Need =
   { index : String, tested : String, read : String, flat : Maybe Repr.Repr }
 
 -- (the primitives read or set unchecked where they are known in range)
-uncheckedOf : String -> Maybe String
-uncheckedOf "arrayIndex" = Just "arrayIndexIn"
-uncheckedOf "arraySetOwned" = Just "arraySetOwnedIn"
-uncheckedOf "arrayPeek" = Just "arrayPeekIn"
+uncheckedOf : Prim -> Maybe Prim
+uncheckedOf ArrayIndex = Just ArrayIndexIn
+uncheckedOf ArraySetOwned = Just ArraySetOwnedIn
+uncheckedOf ArrayPeek = Just ArrayPeekIn
 uncheckedOf p = Nothing
 
 -- (the index, a word boxed or a variable)
@@ -305,7 +306,7 @@ needIn info env fl es = Nothing
 -- | hold
 needAt : Info
        -> List Range
-       -> String
+       -> Prim
        -> Maybe Repr.Repr
        -> List RefCount.Value
        -> Maybe Need
@@ -313,9 +314,8 @@ needAt info env p fl es =
   maybe Nothing (\_ -> needIn info env fl es) (uncheckedOf p)
 
 -- (a read of a fixed-width number: the number)
-flatRead : String -> Repr.Repr -> Maybe Repr.Repr
-flatRead p (RepFix w) =
-  if strEq p "arrayIndex" then Just (RepFix w) else Nothing
+flatRead : Prim -> Repr.Repr -> Maybe Repr.Repr
+flatRead ArrayIndex (RepFix w) = Just (RepFix w)
 flatRead p r = Nothing
 
 -- (a value's own read or set, not its operands')
@@ -391,7 +391,7 @@ baseOfVar info Nothing = Nothing
 -- (a read of a fixed-width number where its index was tested, of one of
 -- `arrays`)
 anyRead : Info -> RefCount.Value -> List Read
-anyRead info (RPrimAt "arrayIndexInAny" r (Cons a _)) =
+anyRead info (RPrimAt ArrayIndexInAny r (Cons a _)) =
   maybe Nil (\b -> Cons (MkPair b r) Nil) (baseOfVar info (varOf a))
 anyRead info e = Nil
 
@@ -406,7 +406,7 @@ needRead n = maybe Nil (\r -> Cons (MkPair n.read r) Nil) n.flat
 -- | the arrays held alone where the function is entered, each kept flat
 -- | as the number (heff.compile.owned)
 ownedSt : RefCount.Statement -> List Read
-ownedSt (CSet x (RPrimAt "arrayOwn" r (Cons (RLocal y) Nil))) =
+ownedSt (CSet x (RPrimAt ArrayOwn r (Cons (RLocal y) Nil))) =
   if strEq x y then Cons (MkPair x r) Nil else Nil
 ownedSt s = Nil
 
@@ -452,24 +452,24 @@ mapExp f (RPrimU p es) = f (RPrimU p (List.map (mapExp f) es))
 mapExp f e = f e
 
 -- (a primitive's name, unchecked if it is known in range)
-renamed : Info -> List Range -> String -> List RefCount.Value -> String
+renamed : Info -> List Range -> Prim -> List RefCount.Value -> Prim
 renamed info env p es =
   maybe p (\_ -> fromMaybe p (uncheckedOf p)) (needAt info env p Nothing es)
 
 -- (a read of an array known flat, one of `flat`, not looking how it
 -- keeps its elements)
-flatName : Info -> List Read -> Repr.Repr -> List RefCount.Value -> String
+flatName : Info -> List Read -> Repr.Repr -> List RefCount.Value -> Prim
 flatName info flat r (Cons a _) =
   if maybe False (\b -> isRead flat (MkPair b r)) (baseOfVar info (varOf a))
-  then "arrayIndexIn"
-  else "arrayIndexInAny"
-flatName info flat r es = "arrayIndexInAny"
+  then ArrayIndexIn
+  else ArrayIndexInAny
+flatName info flat r es = ArrayIndexInAny
 
 -- (a read or set made unchecked, where it is known in range, and a read
 -- of an array known flat not looking)
 unchecked : Info -> List Read -> List Range -> RefCount.Value -> RefCount.Value
 unchecked info flat env (RPrim p es) = RPrim (renamed info env p es) es
-unchecked info flat env (RPrimAt "arrayIndexInAny" r es) =
+unchecked info flat env (RPrimAt ArrayIndexInAny r es) =
   RPrimAt (flatName info flat r es) r es
 unchecked info flat env (RPrimAt p r es) = RPrimAt (renamed info env p es) r es
 unchecked info flat env e = e
@@ -541,21 +541,21 @@ fixStmts info flat toCopy env ss =
 --------------------------------------------------------------------------------
 
 lengthWord : String -> RefCount.Value
-lengthWord a = RUnbox RepInt (RPrim "arrayLength" (Cons (RDup a) Nil))
+lengthWord a = RUnbox RepInt (RPrim ArrayLength (Cons (RDup a) Nil))
 
 -- (the index at least 0)
 atLeast0 : String -> RefCount.Test
-atLeast0 i = CondRelU "wordLe" [RFixU I64 0, RLocal i]
+atLeast0 i = CondRelU WordLe [RFixU I64 0, RLocal i]
 
 -- (the array read at least as long as the one tested)
 longEnough : Need -> List RefCount.Test
 longEnough n =
   if strEq n.tested n.read then Nil
-  else Cons (CondRelU "wordLe" [lengthWord n.tested, lengthWord n.read]) Nil
+  else Cons (CondRelU WordLe [lengthWord n.tested, lengthWord n.read]) Nil
 
 -- (the array read kept flat, of the number it is read as)
 keepsFlat : Read -> RefCount.Test
-keepsFlat (MkPair b r) = CondBool (RPrimAt "arrayKeeps" r (Cons (RDup b) Nil))
+keepsFlat (MkPair b r) = CondBool (RPrimAt ArrayKeeps r (Cons (RDup b) Nil))
 
 needIndex : Need -> String
 needIndex n = n.index
