@@ -21,10 +21,6 @@ module heff.compile.once
 import heff.compile.ir as IR
 import std.ordmap as OrdMap
 
-elemO : String -> List String -> Bool
-elemO x Nil = False
-elemO x (Cons y ys) = strEq x y || elemO x ys
-
 -- What may be put where it is called
 --------------------------------------------------------------------------------
 
@@ -42,7 +38,7 @@ onceMax = 75
 -- (the definition, if it is a function no bigger than that, not a root)
 smallOf : List String -> String -> IR.Expr -> Maybe Callee
 smallOf roots g (ELam xs b) =
-  if not (IR.sizeAbove onceMax b) && not (elemO g roots)
+  if not (IR.sizeAbove onceMax b) && not (List.elemBy strEq g roots)
   then Just { xs = xs, b = b }
   else Nothing
 smallOf roots g e = Nothing
@@ -119,7 +115,8 @@ withOnce : OrdMap.OrdMap String Uses
          -> Pair String Callee
          -> OrdMap.OrdMap String Callee
 withOnce uses m (MkPair g c) =
-  if calledOnce c (OrdMap.lookup uses g) && not (elemO g (IR.globalsGo c.b))
+  if calledOnce c (OrdMap.lookup uses g)
+     && not (List.elemBy strEq g (IR.globalsGo c.b))
   then OrdMap.insert m g c
   else m
 
@@ -171,7 +168,8 @@ calledAs go argv call Nothing = call argv
 -- (the function called once, unless it is being put where it is called
 -- already)
 calleeAt : OrdMap.OrdMap String Callee -> List String -> String -> Maybe Callee
-calleeAt cs going g = if elemO g going then Nothing else OrdMap.lookup cs g
+calleeAt cs going g =
+  if List.elemBy strEq g going then Nothing else OrdMap.lookup cs g
 
 -- A match on what a body put here gives -- each way out of it building
 -- a tag no other way builds, a lookup's `Nothing` and `Just` -- is given
@@ -192,8 +190,7 @@ waysW (Cons EAbandon rest) acc = waysW rest acc
 waysW (Cons e rest) acc = Nothing
 
 armOf : String -> List IR.Arm -> Maybe IR.Arm
-armOf t Nil = Nothing
-armOf t (Cons a rest) = if strEq (IR.armTag a) t then Just a else armOf t rest
+armOf t arms = List.find (\a -> strEq (IR.armTag a) t) arms
 
 isJustO : {a : Type} -> Maybe a -> Bool
 isJustO (Just _) = True
@@ -203,7 +200,7 @@ isJustO Nothing = False
 eachOnce : List IR.Arm -> List String -> Bool
 eachOnce arms Nil = True
 eachOnce arms (Cons t ts) =
-  not (elemO t ts) && isJustO (armOf t arms) && eachOnce arms ts
+  not (List.elemBy strEq t ts) && isJustO (armOf t arms) && eachOnce arms ts
 
 movable : List IR.Arm -> Maybe (List String) -> Bool
 movable arms (Just ts) = eachOnce arms ts
@@ -221,11 +218,7 @@ moved arms (ETag t argv ts) = chosen arms t argv ts
 moved arms (ELet x a b) = ELet x a (moved arms b)
 moved arms (ESet xs a b) = ESet xs a (moved arms b)
 moved arms (EMatch s inner) =
-  EMatch
-    s
-    (List.map
-       (\a -> MkArm (IR.armTag a) (IR.armVars a) (moved arms (IR.armBody a)))
-       inner)
+  EMatch s (List.map (IR.mapArm (\_ b -> moved arms b)) inner)
 moved arms e = e
 
 -- | a match on `s`, given to its ways out where it may be
@@ -234,6 +227,12 @@ moved arms e = e
 matchOn : IR.Expr -> List IR.Arm -> IR.Expr
 matchOn s arms =
   if movable arms (waysW (Cons s Nil) Nil) then moved arms s else EMatch s arms
+
+-- (a match, its parts gone through: given to its ways out where it may
+-- be)
+matchOnOf : IR.Expr -> IR.Expr
+matchOnOf (EMatch s arms) = matchOn s arms
+matchOnOf e = e
 
 -- | an expression, each function called once in it put where it is
 -- | called, and so on into it (`going`: those being put so)
@@ -250,31 +249,9 @@ inlined cs going (ECall g argv) =
     (List.map (\a -> inlined cs going a) argv)
     (\argv2 -> ECall g argv2)
     (calleeAt cs going g)
-inlined cs going (ELam xs b) = ELam xs (inlined cs going b)
-inlined cs going (EApp f argv) =
-  EApp (inlined cs going f) (List.map (\a -> inlined cs going a) argv)
-inlined cs going (ELet x a b) = ELet x (inlined cs going a) (inlined cs going b)
-inlined cs going (ERecord fs ts) =
-  ERecord
-    (List.map (\p -> MkPair (fst p) (inlined cs going (snd p))) fs)
-    ts
-inlined cs going (EProj e l sh t) = EProj (inlined cs going e) l sh t
-inlined cs going (ETag t argv ts) =
-  ETag t (List.map (\a -> inlined cs going a) argv) ts
 inlined cs going (EMatch s arms) =
-  matchOn
-    (inlined cs going s)
-    (List.map
-       (\a ->
-          MkArm (IR.armTag a) (IR.armVars a) (inlined cs going (IR.armBody a)))
-       arms)
-inlined cs going (EPrimCall p argv) =
-  EPrimCall p (List.map (\a -> inlined cs going a) argv)
-inlined cs going (EBool c) = EBool (IR.condMap (\a -> inlined cs going a) c)
-inlined cs going (ESet xs a b) =
-  ESet xs (inlined cs going a) (inlined cs going b)
-inlined cs going (EValues es) = EValues (List.map (\a -> inlined cs going a) es)
-inlined cs going e = e
+  matchOnOf (IR.mapParts (\_ p -> inlined cs going p) (EMatch s arms))
+inlined cs going e = IR.mapParts (\_ p -> inlined cs going p) e
 
 -- (the definitions but those put where they are called, each with
 -- those in it put so)

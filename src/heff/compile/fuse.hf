@@ -44,10 +44,6 @@ import std.ordmap as OrdMap
 -- Lists
 --------------------------------------------------------------------------------
 
-elemF : String -> List String -> Bool
-elemF x Nil = False
-elemF x (Cons y ys) = strEq x y || elemF x ys
-
 nthF : {a : Type} -> Int -> List a -> Maybe a
 nthF i Nil = Nothing
 nthF i (Cons x xs) = if i == 0 then Just x else nthF (i - 1) xs
@@ -72,11 +68,6 @@ insertAt : {a : Type} -> Int -> a -> List a -> List a
 insertAt i y Nil = Cons y Nil
 insertAt i y (Cons x xs) =
   if i == 0 then Cons y (Cons x xs) else Cons x (insertAt (i - 1) y xs)
-
-lastF : {a : Type} -> List a -> Maybe a
-lastF Nil = Nothing
-lastF (Cons x Nil) = Just x
-lastF (Cons x xs) = lastF xs
 
 initF : {a : Type} -> List a -> List a
 initF Nil = Nil
@@ -108,7 +99,7 @@ onceIn x e =
   (IR.occurrences x e).count == 1 && not (IR.occurrences x e).underLam
 
 mentions : String -> IR.Expr -> Bool
-mentions g e = elemF g (IR.globalsIn e)
+mentions g e = List.elemBy strEq g (IR.globalsIn e)
 
 -- | the arguments of a call of `g`, given its `n`
 callOf : String -> Int -> IR.Expr -> Maybe (List IR.Expr)
@@ -237,27 +228,15 @@ pathCalls me (EApp (EGlobal g) args) =
 pathCalls me (ECall g args) =
   if strEq g me.key then selfCalls me g args
   else sumM (List.map (pathCalls me) args)
-pathCalls me (EApp f args) = sumM (List.map (pathCalls me) (Cons f args))
 pathCalls me (EGlobal g) = if strEq g me.key then Nothing else Just 0
 pathCalls me (ELam _ b) =
   if mentions me.key b || occurs me.rest b then Nothing else Just 0
-pathCalls me (ELet _ a b) = addM (pathCalls me a) (pathCalls me b)
 pathCalls me (EMatch s arms) =
   addM
     (pathCalls me s)
     (sameM (List.map (\a -> pathCalls me (IR.armBody a)) arms))
-pathCalls me (ETag _ args _) = sumM (List.map (pathCalls me) args)
-pathCalls me (EPrimCall _ args) = sumM (List.map (pathCalls me) args)
-pathCalls me (ERecord fs _) = sumM (List.map (\p -> pathCalls me (snd p)) fs)
-pathCalls me (EProj e _ _ _) = pathCalls me e
 pathCalls me (EBool c) = condCalls (pathCalls me) c
-pathCalls me (ESet _ a b) = addM (pathCalls me a) (pathCalls me b)
-pathCalls me (EValues es) = sumM (List.map (pathCalls me) es)
-pathCalls me _ = Just 0
-
--- (an arm's body, `f` done to it)
-armMap : (IR.Expr -> IR.Expr) -> IR.Arm -> IR.Arm
-armMap f (MkArm t vs b) = MkArm t vs (f b)
+pathCalls me e = sumM (List.map (pathCalls me) (IR.partsOnto e Nil))
 
 -- | each call of itself on the rest as what it is given but the rest
 -- | (a tag, `$self`): what is left is the work done at a cell
@@ -270,20 +249,7 @@ selfOut me (ECall g args) =
   if isSelf me g args
   then ETag "$self" (removeAt me.at args) (IR.anyTys (removeAt me.at args))
   else ECall g (List.map (selfOut me) args)
-selfOut me (ELam xs b) = ELam xs (selfOut me b)
-selfOut me (EApp f args) = EApp (selfOut me f) (List.map (selfOut me) args)
-selfOut me (ELet x a b) = ELet x (selfOut me a) (selfOut me b)
-selfOut me (ERecord fs ts) =
-  ERecord (List.map (\p -> MkPair (fst p) (selfOut me (snd p))) fs) ts
-selfOut me (EProj e l sh t) = EProj (selfOut me e) l sh t
-selfOut me (ETag t args ts) = ETag t (List.map (selfOut me) args) ts
-selfOut me (EMatch s arms) =
-  EMatch (selfOut me s) (List.map (armMap (selfOut me)) arms)
-selfOut me (EPrimCall p args) = EPrimCall p (List.map (selfOut me) args)
-selfOut me (EBool c) = EBool (IR.condMap (selfOut me) c)
-selfOut me (ESet xs a b) = ESet xs (selfOut me a) (selfOut me b)
-selfOut me (EValues es) = EValues (List.map (selfOut me) es)
-selfOut me e = e
+selfOut me e = IR.mapParts (\_ p -> selfOut me p) e
 
 -- | the arguments of each call of `g` (of `n`) in it
 selfArgs : String -> Int -> IR.Expr -> List (List IR.Expr)
@@ -293,21 +259,7 @@ selfArgs g n (EApp (EGlobal h) args) =
 selfArgs g n (ECall h args) =
   if strEq g h && List.length args == n then Cons args Nil
   else List.concatMap (selfArgs g n) args
-selfArgs g n (ELam _ b) = selfArgs g n b
-selfArgs g n (EApp f args) = List.concatMap (selfArgs g n) (Cons f args)
-selfArgs g n (ELet _ a b) = List.append (selfArgs g n a) (selfArgs g n b)
-selfArgs g n (ERecord fs _) = List.concatMap (\p -> selfArgs g n (snd p)) fs
-selfArgs g n (EProj e _ _ _) = selfArgs g n e
-selfArgs g n (ETag _ args _) = List.concatMap (selfArgs g n) args
-selfArgs g n (EMatch s arms) =
-  List.append
-    (selfArgs g n s)
-    (List.concatMap (\a -> selfArgs g n (IR.armBody a)) arms)
-selfArgs g n (EPrimCall _ args) = List.concatMap (selfArgs g n) args
-selfArgs g n (EBool c) = List.concatMap (selfArgs g n) (IR.condParts c)
-selfArgs g n (ESet _ a b) = List.append (selfArgs g n a) (selfArgs g n b)
-selfArgs g n (EValues es) = List.concatMap (selfArgs g n) es
-selfArgs g n _ = Nil
+selfArgs g n e = List.concatMap (selfArgs g n) (IR.partsOnto e Nil)
 
 -- | a consumer: its parameters, the one it takes apart, the match's
 -- | arms, the tags of those that go on (calling themselves on the rest),
@@ -339,7 +291,7 @@ armKind key n at l (MkArm t vs b) =
   else maybe
       Nothing
       (\r -> armKindR { key = key, arity = n, at = at, rest = r } b)
-      (lastF vs)
+      (List.last vs)
 
 -- (whether the `k`th parameter, `x`, is handed on unchanged)
 fixedGo : List (List IR.Expr) -> Int -> List String -> List Bool
@@ -420,7 +372,7 @@ tagOf _ = Nil
 
 -- (a tag whose last field is a call of itself)
 consRec : String -> Int -> IR.Expr -> Bool
-consRec key n (ETag _ args _) = case lastF args of
+consRec key n (ETag _ args _) = case List.last args of
   Just l -> isJustF (callOf key n l)
   Nothing -> False
 consRec key n _ = False
@@ -643,9 +595,14 @@ armGiven : Fuse
          -> F IR.Expr
 armGiven fu t hs ts (ELam vs b) =
   if List.length vs /= List.length hs then pure (unfused fu (ETag t hs ts))
-  else if elemF t fu.goes
+  else if List.elemBy strEq t fu.goes
   then do
-    b' <- recall fu (fromMaybe "" (lastF vs)) (fromMaybe (EInt 0) (lastF hs)) b
+    b' <-
+      recall
+        fu
+        (fromMaybe "" (List.last vs))
+        (fromMaybe (EInt 0) (List.last hs))
+        b
     pure (bindsOf (initF vs) (initF hs) b')
   else pure (bindsOf vs hs b)
 armGiven fu t hs ts e = pure (unfused fu (ETag t hs ts))
@@ -661,9 +618,7 @@ armCopy fu t hs ts (MkArm _ vs b) = do
   armGiven fu t hs ts l
 
 findArm : String -> List IR.Arm -> Maybe IR.Arm
-findArm t Nil = Nothing
-findArm t (Cons a args) =
-  if strEq (IR.armTag a) t then Just a else findArm t args
+findArm t arms = List.find (\a -> strEq (IR.armTag a) t) arms
 
 -- (a tag the producer ends in, put through the consumer's arm for it)
 tagEnd : Fuse -> String -> List IR.Expr -> List IR.FieldTy -> F IR.Expr
@@ -770,8 +725,10 @@ armWorks : Simplify.SG
          -> IR.Arm
          -> Bool
 armWorks sg c cs m (MkArm t vs b) =
-  not (elemF t cs.goes)
-  || workPure sg (IR.subst m (selfOut (meOf c cs (fromMaybe "" (lastF vs))) b))
+  not (List.elemBy strEq t cs.goes)
+  || workPure
+    sg
+    (IR.subst m (selfOut (meOf c cs (fromMaybe "" (List.last vs))) b))
 
 -- | whether the call of the consumer `c`, given `as`, may be fused with
 -- | the producer: what it is given but the list, and its work at each
