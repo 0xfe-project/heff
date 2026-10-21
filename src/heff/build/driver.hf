@@ -248,30 +248,6 @@ withHiddenOne g c =
 withHidden : List Checked -> Globals.Globals -> Globals.Globals
 withHidden needed g = List.foldl withHiddenOne g needed
 
--- | (a name of a module imported without being written (`unwritten`)
--- | gives way to the same name of a module that is: they do not clash)
-givesWay : List String -> List Imported -> Imported -> Bool
-givesWay unwritten imported o =
-  elemStr o.module unwritten
-  && anyD
-    (\(p : Imported) -> strEq p.name o.name && not (elemStr p.module unwritten))
-    imported
-
-withoutGiven : List String -> List Imported -> List Imported
-withoutGiven unwritten all =
-  List.keepIf (\(o : Imported) -> not (givesWay unwritten all o)) all
-
-importedOf : List String -> List Checked -> List Imported
-importedOf unwritten direct =
-  withoutGiven
-    unwritten
-    (concatMapD
-       (\(c : Checked) ->
-          List.map
-            (\(o : Own) -> mkImported o.name o.key c.module)
-            (exposedOwn c))
-       direct)
-
 brokenName : Checked -> String -> Maybe Imported
 brokenName c k =
   if startsWith (c.module ^ ".") k
@@ -291,39 +267,38 @@ brokenIn c =
     (catMaybesD
        (List.map (\k -> brokenName c k) (Map.keys c.top.globals.broken)))
 
-nubByName : List Imported -> List Imported
-nubByName Nil = Nil
-nubByName (Cons o rest) =
-  Cons
-    o
-    (nubByName
-       (List.keepIf (\(p : Imported) -> not (strEq p.name o.name)) rest))
+-- | what the open imports bring in, by name: what each module exposes,
+-- | and what of that did not elaborate
+importedOf : List Checked -> List Imported
+importedOf direct =
+  concatMapD
+    (\(c : Checked) ->
+       appendD
+         (List.map
+            (\(o : Own) -> mkImported o.name o.key c.module)
+            (exposedOwn c))
+         (brokenIn c))
+    direct
 
--- (each name imported: the key it first came with, and whether another
--- key came with it too)
-clashMap : Map.Map String (Pair String Bool)
-         -> List Imported
-         -> Map.Map String (Pair String Bool)
-clashMap m Nil = m
-clashMap m (Cons o rest) =
-  clashMap
-    (case Map.lookup m o.name of
-     Nothing -> Map.insert m o.name (MkPair o.key False)
-     Just (MkPair k c) ->
-       if c || strEq k o.key then m
-       else Map.insert m o.name (MkPair k True))
-    rest
+-- (the imports of a name, `o` among them: one for each key)
+withImport : Maybe (List Imported) -> Imported -> List Imported
+withImport Nothing o = [o]
+withImport (Just os) o =
+  if anyD (\(p : Imported) -> strEq p.key o.key) os then os
+  else appendD os [o]
 
-clashedIn : Map.Map String (Pair String Bool) -> Imported -> Bool
-clashedIn m o = case Map.lookup m o.name of
-  Just (MkPair _ c) -> c
-  Nothing -> False
+-- (each name imported, and its imports, in the order they came)
+importsByName : Map.Map String (List Imported)
+              -> List Imported
+              -> Map.Map String (List Imported)
+importsByName m Nil = m
+importsByName m (Cons o rest) =
+  importsByName (Map.insert m o.name (withImport (Map.lookup m o.name) o)) rest
 
--- | a name two modules imported define, each its own way: in scope as
--- | neither, a use of it unqualified is an error
-clashesOf : List Imported -> List Imported
-clashesOf imported =
-  nubByName (List.keepIf (clashedIn (clashMap Map.empty imported)) imported)
+-- (the imports written, if any: else all)
+writtenOr : List Imported -> List Imported -> List Imported
+writtenOr Nil all = all
+writtenOr written all = written
 
 spanOfName : List (Pair String Params.Span) -> String -> Maybe Params.Span
 spanOfName Nil x = Nothing
@@ -356,25 +331,46 @@ withPlace done o g = case findChecked done o.module of
   Just c -> Globals.addPlace o.key (placeIn c o.name) g
   Nothing -> g
 
--- | the open imports' names, aliased in -- unless clashed: ambiguous then,
--- | each key's place said -- or already the key, a primitive's: found by
--- | it where no name of the module's own, or another import's, is
--- | (`Globals.lookupKey`)
+-- (a name and the imports it stands for: one, an alias of its key --
+-- or already the key, a primitive's: found by it where no name of the
+-- module's own, or another import's, is (`Globals.lookupKey`) -- more,
+-- ambiguous, each key's place said)
+aliasName : List Checked -> Globals.Globals -> List Imported -> Globals.Globals
+aliasName done g Nil = g
+aliasName done g [o] =
+  if strEq o.key o.name then g else Globals.addAlias o.name o.key g
+aliasName done g (Cons o rest) =
+  List.foldl
+    (\g2 (p : Imported) -> withPlace done p g2)
+    (Globals.addAmbiguous
+       o.name
+       (List.map (\(p : Imported) -> p.key) (Cons o rest))
+       g)
+    (Cons o rest)
+
+-- | The open imports' names, each decided here, and only here: of the
+-- | imports of a name, a module imported without being written
+-- | (`unwritten`) gives way to one that is; one key left, the name is
+-- | its alias; more, two imports define it each its own way, and a use
+-- | of it unqualified is an error
 aliasOpen : List Checked
-          -> List Imported
+          -> List String
           -> Globals.Globals
-          -> List Imported
+          -> List Checked
           -> Globals.Globals
-aliasOpen done clashes g Nil = g
-aliasOpen done clashes g (Cons o rest) =
-  aliasOpen
-    done
-    clashes
-    (if anyD (\(cl : Imported) -> strEq cl.name o.name) clashes
-     then withPlace done o (Globals.addAmbiguous o.name [o.key] g)
-     else if strEq o.key o.name then g
-     else Globals.addAlias o.name o.key g)
-    rest
+aliasOpen done unwritten g direct =
+  List.foldl
+    (\g2 os ->
+       aliasName
+         done
+         g2
+         (writtenOr
+            (List.keepIf
+               (\(o : Imported) -> not (elemStr o.module unwritten))
+               os)
+            os))
+    g
+    (Map.values (importsByName Map.empty (importedOf direct)))
 
 -- (`M`, the module itself, a value -- unless `M` names something
 -- already, as `List` does, builtin's type, where `list` is `List`)
@@ -1120,16 +1116,14 @@ elabFrom : List Checked
 elabFrom done s imps (Just th) direct g0 = elabThawed s imps th g0
 elabFrom done s imps Nothing direct g0 = elabEnv done s imps direct g0
 
-elabClashed : List Checked
-            -> Source
-            -> Import.Imports
-            -> Maybe Thawed
-            -> List Checked
-            -> List Checked
-            -> List Imported
-            -> List Imported
-            -> Checked
-elabClashed done s imps thaw direct needed imported clashes =
+elabDirect : List Checked
+           -> Source
+           -> Import.Imports
+           -> Maybe Thawed
+           -> List Checked
+           -> List Checked
+           -> Checked
+elabDirect done s imps thaw direct needed =
   elabFrom
     done
     s
@@ -1143,43 +1137,10 @@ elabClashed done s imps thaw direct needed imported clashes =
           done
           (aliasOpen
              done
-             clashes
-             (aliasOpen
-                done
-                clashes
-                (withHidden needed (envOf done needed))
-                imported)
-             (concatMapD (\(c : Checked) -> brokenIn c) direct))
+             (implicitNames imps)
+             (withHidden needed (envOf done needed))
+             direct)
           (aliasPairs imps.imports)))
-
--- (what is imported, and which of it clashes, reckoned once)
-elabAliased : List Checked
-            -> Source
-            -> Import.Imports
-            -> Maybe Thawed
-            -> List Checked
-            -> List Checked
-            -> List Imported
-            -> Checked
-elabAliased done s imps thaw direct needed imported =
-  elabClashed done s imps thaw direct needed imported (clashesOf imported)
-
-elabDirect : List Checked
-           -> Source
-           -> Import.Imports
-           -> Maybe Thawed
-           -> List Checked
-           -> List Checked
-           -> Checked
-elabDirect done s imps thaw direct needed =
-  elabAliased
-    done
-    s
-    imps
-    thaw
-    direct
-    needed
-    (importedOf (implicitNames imps) direct)
 
 -- A primitive is declared once.  One declared again -- by a module made
 -- of one that declares it, or twice by one -- is an error where it is
