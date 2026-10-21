@@ -1,9 +1,11 @@
--- A record carried round a loop, kept as its fields (#81, scalar
--- replacement of aggregates).  A function calling itself last only --
--- a loop -- whose parameter is given, at each call of itself, a record
--- built there (or the parameter as it is), and is otherwise only read
--- fields of, but where the loop ends, is given a worker (`f$scalars`)
--- taking the record's fields instead, each a parameter of its own:
+-- A record or a tag carried round a loop, kept as its fields (#81,
+-- scalar replacement of aggregates; for tags, a little of GHC's
+-- constructor specialisation).  Two passes, one way: a function calling
+-- itself whose parameter is given, at each call of itself, a record (or
+-- a tag) built there, or the parameter as it is, and is otherwise only
+-- read fields of (taken apart, as that one tag, before anything else),
+-- but where the loop ends, is given a worker taking the fields instead,
+-- each a parameter of its own:
 --
 --   loop k a = if k == 0 then a          loop$scalars k s c =
 --     else loop (k - 1)                    if k == 0 then { s = s, c = c }
@@ -11,28 +13,49 @@
 --                                              (s + c) (c * 0.5)
 --                                        loop k a = loop$scalars k a.s a.c
 --
--- so that no record is built, nor read, round the loop: where it ends, a
--- record of the fields is built (once, heff.compile.cpr may give its
+--   loop cur = case cur of               loop$unbox arr i =
+--     MkPair arr i ->                      if i < arrayLength arr then
+--       if i < arrayLength arr then          loop$unbox arr (i + 1)
+--         loop (MkPair arr (i + 1))        else Nothing
+--       else Nothing                     loop cur = case cur of
+--                                          MkPair arr i -> loop$unbox arr i
+--
+-- so that no record or tag is built, nor read, round the loop, and a
+-- number among its fields is kept unboxed as any other parameter is:
+-- where it ends, it is built again (once, heff.compile.cpr may give its
 -- fields back unbuilt).  The function itself is its wrapper, which reads
--- the fields of the record it is given: what a closure, or a call from
--- elsewhere, calls.
+-- the fields of what it is given: what a closure, or a call from
+-- elsewhere, calls -- but a call from elsewhere given the tag built there
+-- calls the worker, given its fields (so that the loop's start, `loop
+-- (MkPair arr 0)`, builds no tag, and a number given it is known as
+-- such).
+--
+-- A tag is taken apart in the wrapper, so the function must take it
+-- apart first, whatever it is given (else a tag of another of its type's
+-- tags, given where the function would not look at it, would be taken
+-- apart where it was not): its body a match on the parameter of that one
+-- tag, or a match on another variable each of whose arms is, through
+-- bindings of values.
 --
 -- Only where every call of itself is a call last: a function calling
 -- itself and doing more after it (nbody's `pull`) builds the record anew
 -- at every way out, not once a loop, where Perceus would have built it in
 -- the cell of the one it is given (measured: slower).  Nor where the
--- record is used whole (passed on, kept) other than where the loop ends,
--- or in a lambda, nor of more than `maxFields` fields.
+-- parameter is used whole (passed on, kept, matched on more than one
+-- tag) other than where the loop ends, or in a lambda, nor of more than
+-- `maxFields` fields.
 --
 -- This runs on what is lowered (heff.compile.lower), each call at its
 -- arity, for both backends, after heff.compile.cycles (functions calling
--- one another last made one loop) and before heff.compile.cpr.
+-- one another last made one loop) and before heff.compile.cpr: the
+-- records first, then the tags.
 
 module heff.compile.scalars
 
 import heff.compile.ir as IR
 import heff.compile.repr as Repr
 import heff.compile.supply
+import std.ordmap as OrdMap
 
 sameLabels : List String -> List String -> Bool
 sameLabels Nil Nil = True
@@ -43,16 +66,48 @@ isVar : String -> IR.Expr -> Bool
 isVar x (EVar y) = strEq x y
 isVar x _ = False
 
-hasLabel : List String -> String -> Bool
-hasLabel ls l = List.any (\k -> strEq k l) ls
+isVarExpr : IR.Expr -> Bool
+isVarExpr (EVar _) = True
+isVarExpr e = False
 
--- | how many fields a record kept as its fields may have
+-- | how many fields a record or tag kept as its fields may have
 maxFields : Int
 maxFields = 8
 
+-- | what a pass keeps as their fields: a loop's record parameters, or
+-- | its tag parameters
+data Kind = OfRecords | OfTags
+
 -- | a loop's worker
-workerKey : String -> String
-workerKey g = g ^ "$scalars"
+workerKey : Kind -> String -> String
+workerKey OfRecords g = g ^ "$scalars"
+workerKey OfTags g = g ^ "$unbox"
+
+-- | what a parameter kept as its fields is: a record of the labels, or
+-- | the tag of so many fields
+data Shape = ShapeRecord (List String) | ShapeTag String Int
+
+labelsOf : Shape -> List String
+labelsOf (ShapeRecord ls) = ls
+labelsOf sh = Nil
+
+hasLabel : Shape -> String -> Bool
+hasLabel sh l = List.any (\k -> strEq k l) (labelsOf sh)
+
+tagIs : String -> Shape -> Bool
+tagIs t (ShapeTag t2 _) = strEq t t2
+tagIs t sh = False
+
+sameShape : Shape -> Shape -> Bool
+sameShape (ShapeRecord ls) (ShapeRecord ls2) = sameLabels ls ls2
+sameShape (ShapeTag t k) (ShapeTag t2 k2) = strEq t t2 && k == k2
+sameShape a b = False
+
+-- (whether a pass keeps parameters of the shape)
+keeps : Kind -> Shape -> Bool
+keeps OfRecords (ShapeRecord _) = True
+keeps OfTags (ShapeTag _ _) = True
+keeps kind sh = False
 
 -- Calls of itself
 --------------------------------------------------------------------------------
@@ -67,163 +122,250 @@ selfLast f acc (EMatch _ arms) =
 selfLast f acc (ECall g args) = if strEq g f then Cons args acc else acc
 selfLast f acc e = acc
 
--- (how many calls of `f` the worklist makes, last or not, onto `n`)
-callsW : String -> Int -> List IR.Expr -> Int
-callsW f n Nil = n
-callsW f n (Cons (ECall g args) rest) =
-  callsW f (if strEq g f then n + 1 else n) (IR.appendI args rest)
-callsW f n (Cons e rest) = callsW f n (IR.partsOnto e rest)
+-- (the arguments of each call of `f` the worklist makes, last or not,
+-- onto `acc`)
+callsW : String -> List (List IR.Expr) -> List IR.Expr -> List (List IR.Expr)
+callsW f acc Nil = acc
+callsW f acc (Cons (ECall g args) rest) =
+  callsW f (if strEq g f then Cons args acc else acc) (IR.appendI args rest)
+callsW f acc (Cons e rest) = callsW f acc (IR.partsOnto e rest)
 
 -- (an argument, by its place)
 argAt : Int -> List IR.Expr -> IR.Expr
 argAt i args = fromMaybe EAbandon (List.head (List.drop i args))
 
--- Uses of the record
+-- Uses of the parameter
 --------------------------------------------------------------------------------
 
--- (how often the worklist uses `p`, a record of the labels `ls`, other
--- than to read one of those fields of it, onto `n`)
-wholeW : String -> List String -> Int -> List IR.Expr -> Int
-wholeW p ls n Nil = n
-wholeW p ls n (Cons (EVar y) rest) =
-  wholeW p ls (if strEq y p then n + 1 else n) rest
-wholeW p ls n (Cons (EProj e l _ _) rest) =
-  if isVar p e && hasLabel ls l then wholeW p ls n rest
-  else wholeW p ls n (Cons e rest)
-wholeW p ls n (Cons e rest) = wholeW p ls n (IR.partsOnto e rest)
+-- (whether the arms are the one of the tag `t`, of `k` fields)
+oneArm : String -> Int -> List IR.Arm -> Bool
+oneArm t k (Cons (MkArm t2 vs _) Nil) = strEq t t2 && List.length vs == k
+oneArm t k arms = False
+
+-- (whether a match of `s` on the arms takes `p` apart as its tag)
+takesApart : String -> Shape -> IR.Expr -> List IR.Arm -> Bool
+takesApart p (ShapeTag t k) s arms = isVar p s && oneArm t k arms
+takesApart p sh s arms = False
+
+-- (how often the worklist uses `p`, of the shape, other than to read
+-- one of its fields or take it apart as its tag, onto `n`)
+wholeW : String -> Shape -> Int -> List IR.Expr -> Int
+wholeW p sh n Nil = n
+wholeW p sh n (Cons (EVar y) rest) =
+  wholeW p sh (if strEq y p then n + 1 else n) rest
+wholeW p sh n (Cons (EProj e l _ _) rest) =
+  if isVar p e && hasLabel sh l then wholeW p sh n rest
+  else wholeW p sh n (Cons e rest)
+wholeW p sh n (Cons (EMatch s arms) rest) =
+  if takesApart p sh s arms then wholeW p sh n (IR.pushArms arms rest)
+  else wholeW p sh n (Cons s (IR.pushArms arms rest))
+wholeW p sh n (Cons e rest) = wholeW p sh n (IR.partsOnto e rest)
 
 -- (... of those, how many are in a lambda)
-lamWholeW : String -> List String -> Int -> List IR.Expr -> Int
-lamWholeW p ls n Nil = n
-lamWholeW p ls n (Cons (ELam _ b) rest) =
-  lamWholeW p ls (wholeW p ls n (Cons b Nil)) rest
-lamWholeW p ls n (Cons e rest) = lamWholeW p ls n (IR.partsOnto e rest)
+lamWholeW : String -> Shape -> Int -> List IR.Expr -> Int
+lamWholeW p sh n Nil = n
+lamWholeW p sh n (Cons (ELam _ b) rest) =
+  lamWholeW p sh (wholeW p sh n (Cons b Nil)) rest
+lamWholeW p sh n (Cons e rest) = lamWholeW p sh n (IR.partsOnto e rest)
 
 -- (... of those, how many are where the loop `f` ends: in what it gives
 -- back where it does not call itself)
-exitsWhole : String -> String -> List String -> IR.Expr -> Int
-exitsWhole f p ls (ELet _ _ b) = exitsWhole f p ls b
-exitsWhole f p ls (ESet _ _ b) = exitsWhole f p ls b
-exitsWhole f p ls (EMatch _ arms) =
-  List.foldl (\n arm -> n + exitsWhole f p ls (IR.armBody arm)) 0 arms
-exitsWhole f p ls (ECall g args) =
-  if strEq g f then 0 else wholeW p ls 0 (Cons (ECall g args) Nil)
-exitsWhole f p ls e = wholeW p ls 0 (Cons e Nil)
+exitsWhole : String -> String -> Shape -> IR.Expr -> Int
+exitsWhole f p sh (ELet _ _ b) = exitsWhole f p sh b
+exitsWhole f p sh (ESet _ _ b) = exitsWhole f p sh b
+exitsWhole f p sh (EMatch _ arms) =
+  List.foldl (\n arm -> n + exitsWhole f p sh (IR.armBody arm)) 0 arms
+exitsWhole f p sh (ECall g args) =
+  if strEq g f then 0 else wholeW p sh 0 (Cons (ECall g args) Nil)
+exitsWhole f p sh e = wholeW p sh 0 (Cons e Nil)
+
+-- (whether the body takes `p` apart, as its tag, before anything else:
+-- on every way through it, past bindings of values and matches of
+-- variables, so that taking it apart in the wrapper changes nothing)
+firstApart : String -> Shape -> IR.Expr -> Bool
+firstApart p sh (EMatch s arms) =
+  takesApart p sh s arms
+  || (isVarExpr s
+      && not (List.null arms)
+      && List.all (\a -> firstApart p sh (IR.armBody a)) arms)
+firstApart p sh (ELet _ a b) = IR.isValue a && firstApart p sh b
+firstApart p sh e = False
+
+-- (... a tag: a record, read field by field, need not be)
+apartFirst : String -> Shape -> IR.Expr -> Bool
+apartFirst p (ShapeRecord _) b = True
+apartFirst p sh b = firstApart p sh b
+
+isOneArm : List IR.Arm -> Bool
+isOneArm (Cons _ Nil) = True
+isOneArm arms = False
+
+-- (... as some tag: of a function not, it has no slot, and its calls of
+-- itself are not looked for)
+someApart : String -> IR.Expr -> Bool
+someApart p (EMatch s arms) =
+  (isVar p s && isOneArm arms)
+  || (isVarExpr s
+      && not (List.null arms)
+      && List.all (\a -> someApart p (IR.armBody a)) arms)
+someApart p (ELet _ a b) = IR.isValue a && someApart p b
+someApart p e = False
 
 -- What is passed round
 --------------------------------------------------------------------------------
 
--- | what a call of itself passes for a parameter: a record built, of
--- | its labels and its fields' types; the parameter as it is; anything
--- | else
-data Passed
-  = PassedRecord (List String) (List IR.FieldTy)
-  | PassedSame
-  | PassedOther
+-- | what a call of itself passes for a parameter: a record or tag built,
+-- | of its fields' types; the parameter as it is; anything else
+data Given = GivenBuilt Shape (List IR.FieldTy) | GivenSame | GivenOther
 
 -- (each field's type, as many as there are fields)
 tysOf : List IR.Expr -> List IR.FieldTy -> List IR.FieldTy
 tysOf args ts =
   List.map (\i -> Repr.tyIn i ts) (List.range 0 (List.length args - 1))
 
-passedOf : String -> IR.Expr -> Passed
-passedOf p (ERecord fs ts) =
-  PassedRecord (List.map fst fs) (tysOf (List.map snd fs) ts)
-passedOf p (EVar y) = if strEq y p then PassedSame else PassedOther
-passedOf p e = PassedOther
+givenOf : String -> IR.Expr -> Given
+givenOf p (ERecord fs ts) =
+  GivenBuilt (ShapeRecord (List.map fst fs)) (tysOf (List.map snd fs) ts)
+givenOf p (ETag t args ts) =
+  GivenBuilt (ShapeTag t (List.length args)) (tysOf args ts)
+givenOf p (EVar y) = if strEq y p then GivenSame else GivenOther
+givenOf p e = GivenOther
 
-isSame : Passed -> Bool
-isSame PassedSame = True
-isSame q = False
+isGivenSame : Given -> Bool
+isGivenSame GivenSame = True
+isGivenSame g = False
 
--- | what the calls of itself pass for a parameter, all told: no record
--- | yet; records of the labels, of the fields' types; not only records
-data Passing = NoRecord | Records (List String) (List IR.FieldTy) | Mixed
+-- | what the calls of itself pass for a parameter, all told: nothing
+-- | built yet; the one shape, of its fields' types; not only that
+data Giving = NoneGiven | GivenOne Shape (List IR.FieldTy) | GivenMany
 
 -- (two types of a field as one: the same, else of any other type)
 mergeTy : IR.FieldTy -> IR.FieldTy -> IR.FieldTy
 mergeTy a b = if strEq (IR.fieldTyName a) (IR.fieldTyName b) then a else FtOther
 
-passingWith : List String
-            -> List IR.FieldTy
-            -> List String
-            -> List IR.FieldTy
-            -> Passing
-passingWith ls ts ls2 ts2 =
-  if sameLabels ls ls2 then Records ls (List.zipWith mergeTy ts ts2) else Mixed
+givingWith : Shape -> List IR.FieldTy -> Shape -> List IR.FieldTy -> Giving
+givingWith sh ts sh2 ts2 =
+  if sameShape sh sh2 then GivenOne sh (List.zipWith mergeTy ts ts2)
+  else GivenMany
 
-addPassed : Passing -> Passed -> Passing
-addPassed s PassedSame = s
-addPassed s PassedOther = Mixed
-addPassed NoRecord (PassedRecord ls ts) = Records ls ts
-addPassed (Records ls ts) (PassedRecord ls2 ts2) = passingWith ls ts ls2 ts2
-addPassed Mixed q = Mixed
+addGiven : Giving -> Given -> Giving
+addGiven s GivenSame = s
+addGiven s GivenOther = GivenMany
+addGiven NoneGiven (GivenBuilt sh ts) = GivenOne sh ts
+addGiven (GivenOne sh ts) (GivenBuilt sh2 ts2) = givingWith sh ts sh2 ts2
+addGiven GivenMany g = GivenMany
 
 -- Loops
 --------------------------------------------------------------------------------
 
--- | a parameter kept as its fields: its place, its name, the record's
--- | labels and its fields' types, and a variable for each field
+-- | a parameter kept as its fields: its place, its name, its shape and
+-- | its fields' types, and a variable for each field
 type Slot =
   { at : Int
   , param : String
-  , labels : List String
+  , shape : Shape
   , tys : List IR.FieldTy
   , vars : List String
   }
 
--- (a slot, where the record is read only as it may be: whole only where
--- the loop ends (`sames` times passed on as it is), never in a lambda)
-slotWith : String -> IR.Expr -> Int -> String -> Int -> Passing -> Maybe Slot
-slotWith f b i p sames (Records ls ts) =
-  if List.length ls <= maxFields
-     && not (List.null ls)
-     && lamWholeW p ls 0 (Cons b Nil) == 0
-     && wholeW p ls 0 (Cons b Nil) == sames + exitsWhole f p ls b
-  then Just { at = i, param = p, labels = ls, tys = ts, vars = Nil }
-  else Nothing
-slotWith f b i p sames q = Nothing
+-- | what is known of a loop's calls of itself: the loop, its body,
+-- | whether every call is last, and their arguments
+type Calls =
+  { key : String, body : IR.Expr, last : Bool, args : List (List IR.Expr) }
 
-slotFrom : String -> IR.Expr -> Int -> String -> List Passed -> Maybe Slot
-slotFrom f b i p qs =
+-- (whole uses where the loop ends, when they may be: every call last)
+exitsOf : Calls -> String -> Shape -> Int
+exitsOf c p sh = if c.last then exitsWhole c.key p sh c.body else 0
+
+-- (a slot, where the parameter is used only as it may be: a tag taken
+-- apart first, whole only where the loop ends (`sames` times passed on
+-- as it is), never in a lambda)
+slotWith : Kind -> Calls -> Int -> String -> Int -> Giving -> Maybe Slot
+slotWith kind c i p sames (GivenOne sh ts) =
+  if keeps kind sh
+     && List.length ts <= maxFields
+     && not (List.null ts)
+     && apartFirst p sh c.body
+     && lamWholeW p sh 0 (Cons c.body Nil) == 0
+     && wholeW p sh 0 (Cons c.body Nil) == sames + exitsOf c p sh
+  then Just { at = i, param = p, shape = sh, tys = ts, vars = Nil }
+  else Nothing
+slotWith kind c i p sames g = Nothing
+
+slotFrom : Kind -> Calls -> Int -> String -> List Given -> Maybe Slot
+slotFrom kind c i p gs =
   slotWith
-    f
-    b
+    kind
+    c
     i
     p
-    (List.length (List.keepIf isSame qs))
-    (List.foldl addPassed NoRecord qs)
+    (List.length (List.keepIf isGivenSame gs))
+    (List.foldl addGiven NoneGiven gs)
 
--- (the parameter `p`, in place `i`, of the loop `f`: a slot, if it is
--- one)
-slotFor : String
-        -> IR.Expr
-        -> List (List IR.Expr)
-        -> String
-        -> Int
-        -> Maybe Slot
-slotFor f b calls p i =
-  slotFrom f b i p (List.map (\args -> passedOf p (argAt i args)) calls)
+-- (the parameter `p`, in place `i`, of the loop: a slot, if it is one)
+slotFor : Kind -> Calls -> String -> Int -> Maybe Slot
+slotFor kind c p i =
+  slotFrom kind c i p (List.map (\args -> givenOf p (argAt i args)) c.args)
 
 justsOf : List (Maybe Slot) -> List Slot
 justsOf Nil = Nil
 justsOf (Cons (Just s) ms) = Cons s (justsOf ms)
 justsOf (Cons Nothing ms) = justsOf ms
 
-slotsIn : String -> List String -> IR.Expr -> List (List IR.Expr) -> List Slot
-slotsIn f xs b calls =
-  if List.null calls || callsW f 0 (Cons b Nil) /= List.length calls then Nil
+slotsIn : Kind -> List String -> Calls -> List Slot
+slotsIn kind xs c =
+  if List.null c.args then Nil
   else justsOf
-      (List.zipWith
-         (slotFor f b calls)
-         xs
-         (List.range 0 (List.length xs - 1)))
+      (List.zipWith (slotFor kind c) xs (List.range 0 (List.length xs - 1)))
+
+-- (the calls of itself a pass looks at, of the calls last and all of
+-- them: of records, the calls last, where every call is; of tags, every
+-- call, where each is given every parameter)
+callsWith : Kind
+          -> List String
+          -> String
+          -> IR.Expr
+          -> List (List IR.Expr)
+          -> List (List IR.Expr)
+          -> Calls
+callsWith OfRecords xs f b lasts all =
+  { key = f
+  , body = b
+  , last = True
+  , args = if List.length all == List.length lasts then lasts else Nil
+  }
+callsWith OfTags xs f b lasts all =
+  { key = f
+  , body = b
+  , last = List.length lasts == List.length all
+  , args =
+      if List.any (\args -> List.length args /= List.length xs) all then Nil
+      else all
+  }
+
+-- (whether a pass looks at the loop at all: for tags, only where a
+-- parameter is taken apart first, as some tag)
+looks : Kind -> List String -> IR.Expr -> Bool
+looks OfRecords xs b = True
+looks OfTags xs b = List.any (\x -> someApart x b) xs
 
 -- | a loop's parameters kept as their fields (none: it is not a loop,
 -- | or none is)
-slotsOf : IR.Def -> List Slot
-slotsOf d@{ body = ELam xs b } = slotsIn d.key xs b (selfLast d.key Nil b)
-slotsOf d = Nil
+slotsOf : Kind -> IR.Def -> List Slot
+slotsOf kind d@{ body = ELam xs b } =
+  if looks kind xs b
+  then slotsIn
+      kind
+      xs
+      (callsWith
+         kind
+         xs
+         d.key
+         b
+         (selfLast d.key Nil b)
+         (callsW d.key Nil (Cons b Nil)))
+  else Nil
+slotsOf kind d = Nil
 
 -- Workers
 --------------------------------------------------------------------------------
@@ -234,13 +376,19 @@ slotOf ss x = List.find (\(s : Slot) -> strEq s.param x) ss
 slotAt : List Slot -> Int -> Maybe Slot
 slotAt ss i = List.find (\(s : Slot) -> s.at == i) ss
 
--- (the record a slot's fields make)
-builtOf : Slot -> IR.Expr
-builtOf s =
-  ERecord (List.zipWith (\l v -> MkPair l (EVar v)) s.labels s.vars) s.tys
+-- (the slot a scrutinee is the parameter of)
+scrutSlot : List Slot -> IR.Expr -> Maybe Slot
+scrutSlot ss (EVar x) = slotOf ss x
+scrutSlot ss e = Nothing
+
+-- (the record or tag a slot's fields make)
+builtWith : Shape -> Slot -> IR.Expr
+builtWith (ShapeRecord ls) s =
+  ERecord (List.zipWith (\l v -> MkPair l (EVar v)) ls s.vars) s.tys
+builtWith (ShapeTag t _) s = ETag t (List.map (\v -> EVar v) s.vars) s.tys
 
 varRw : String -> Maybe Slot -> IR.Expr
-varRw x (Just s) = builtOf s
+varRw x (Just s) = builtWith s.shape s
 varRw x Nothing = EVar x
 
 labelVar : String -> List String -> List String -> Maybe String
@@ -249,7 +397,7 @@ labelVar l (Cons k ks) (Cons v vs) =
 labelVar l ks vs = Nothing
 
 fieldVarIn : String -> Maybe Slot -> Maybe String
-fieldVarIn l (Just s) = labelVar l s.labels s.vars
+fieldVarIn l (Just s) = labelVar l (labelsOf s.shape) s.vars
 fieldVarIn l Nothing = Nothing
 
 -- (the variable a field read is, of a slot's record)
@@ -267,10 +415,27 @@ projRw : (IR.Expr -> IR.Expr)
 projRw go e l sh t (Just v) = EVar v
 projRw go e l sh t Nothing = EProj (go e) l sh t
 
--- (what a call of itself passes for a slot: the fields of the record
--- built, else the parameter's own)
+-- (the arm's variables, each the slot's own)
+bindsOf : List String -> List String -> OrdMap.OrdMap String IR.Expr
+bindsOf vs ws = OrdMap.fromList (List.zipWith (\v w -> MkPair v (EVar w)) vs ws)
+
+-- (a match: of a slot's parameter, its arm's body with the slot's
+-- variables for the arm's; else as it is)
+matchRw : (IR.Expr -> IR.Expr)
+        -> IR.Expr
+        -> List IR.Arm
+        -> Maybe Slot
+        -> IR.Expr
+matchRw go s (Cons (MkArm t vs b) Nil) (Just sl) =
+  if tagIs t sl.shape then go (IR.subst (bindsOf vs sl.vars) b)
+  else IR.mapParts (\_ p -> go p) (EMatch s (Cons (MkArm t vs b) Nil))
+matchRw go s arms m = IR.mapParts (\_ p -> go p) (EMatch s arms)
+
+-- (what a call of itself passes for a slot: the fields of the record or
+-- tag built, else the parameter's own)
 spread : (IR.Expr -> IR.Expr) -> Slot -> IR.Expr -> List IR.Expr
 spread go s (ERecord fs _) = List.map (\p -> go (snd p)) fs
+spread go s (ETag _ args _) = List.map go args
 spread go s e = List.map (\v -> EVar v) s.vars
 
 argRw : (IR.Expr -> IR.Expr) -> IR.Expr -> Maybe Slot -> List IR.Expr
@@ -286,15 +451,16 @@ argsRw go ss i Nil = Nil
 argsRw go ss i (Cons a args) =
   IR.appendI (argRw go a (slotAt ss i)) (argsRw go ss (i + 1) args)
 
--- | a loop and its slots
-type Loop = { key : String, slots : List Slot }
+-- | a loop, its worker and its slots
+type Loop = { key : String, worker : String, slots : List Slot }
 
--- | the loop's body, its slots' records kept as their fields
+-- | the loop's body, its slots kept as their fields
 rw : Loop -> IR.Expr -> IR.Expr
 rw lp (EVar x) = varRw x (slotOf lp.slots x)
 rw lp (EProj e l sh t) = projRw (rw lp) e l sh t (fieldVarOf lp.slots e l)
+rw lp (EMatch s arms) = matchRw (rw lp) s arms (scrutSlot lp.slots s)
 rw lp (ECall g args) =
-  if strEq g lp.key then ECall (workerKey g) (argsRw (rw lp) lp.slots 0 args)
+  if strEq g lp.key then ECall lp.worker (argsRw (rw lp) lp.slots 0 args)
   else ECall g (List.map (rw lp) args)
 rw lp e = IR.mapParts (\_ p -> rw lp p) e
 
@@ -308,15 +474,21 @@ paramsRw ss i (Cons x xs) =
   IR.appendI (paramRw x (slotAt ss i)) (paramsRw ss (i + 1) xs)
 
 -- (the fields of the record `y` is, read)
-readsOf : Slot -> String -> List IR.Expr
-readsOf s y =
+readsOf : List String -> Slot -> String -> List IR.Expr
+readsOf ls s y =
   List.zipWith
-    (\l i -> EProj (EVar y) l s.labels (Repr.tyIn i s.tys))
-    s.labels
-    (List.range 0 (List.length s.labels - 1))
+    (\l i -> EProj (EVar y) l ls (Repr.tyIn i s.tys))
+    ls
+    (List.range 0 (List.length ls - 1))
+
+-- (the wrapper's arguments for a slot: a record's fields read, a tag's
+-- variables its match binds)
+wrapWith : Shape -> Slot -> String -> List IR.Expr
+wrapWith (ShapeRecord ls) s y = readsOf ls s y
+wrapWith sh s y = List.map (\v -> EVar v) s.vars
 
 wrapArg : String -> Maybe Slot -> List IR.Expr
-wrapArg y (Just s) = readsOf s y
+wrapArg y (Just s) = wrapWith s.shape s y
 wrapArg y Nothing = Cons (EVar y) Nil
 
 wrapArgs : List Slot -> Int -> List String -> List IR.Expr
@@ -324,39 +496,168 @@ wrapArgs ss i Nil = Nil
 wrapArgs ss i (Cons y ys) =
   IR.appendI (wrapArg y (slotAt ss i)) (wrapArgs ss (i + 1) ys)
 
+-- (a slot's parameter taken apart round `e`, of a tag)
+apartRound : List String -> Slot -> Shape -> IR.Expr -> IR.Expr
+apartRound ys s (ShapeTag t _) e =
+  EMatch
+    (EVar (fromMaybe "" (List.head (List.drop s.at ys))))
+    (Cons (MkArm t s.vars e) Nil)
+apartRound ys s sh e = e
+
+-- (the wrapper's body: each tag slot's parameter taken apart, then the
+-- call)
+wrapBody : List String -> List Slot -> IR.Expr -> IR.Expr
+wrapBody ys ss call =
+  List.foldr (\(s : Slot) e -> apartRound ys s s.shape e) call ss
+
+-- (the names a slot's variables are drawn of)
+namesOf : Shape -> Slot -> List String
+namesOf (ShapeRecord ls) s = ls
+namesOf sh s = List.map (\_ -> IR.baseOf s.param) s.tys
+
 withVars : Slot -> S Slot
 withVars s = do
-  vs <- traverseS freshS s.labels
-  pure { at = s.at, param = s.param, labels = s.labels, tys = s.tys, vars = vs }
+  vs <- traverseS freshS (namesOf s.shape s)
+  pure { at = s.at, param = s.param, shape = s.shape, tys = s.tys, vars = vs }
+
+-- (the wrapper's slots: a tag's given variables of its own, for its
+-- match; a record's read where it is passed)
+wrapVars : Shape -> Slot -> S Slot
+wrapVars (ShapeRecord _) s = pure s
+wrapVars sh s = withVars s
 
 -- | a loop given its worker: the worker, and the loop itself its wrapper
-loopDefs : IR.Def -> List String -> IR.Expr -> List Slot -> S (List IR.Def)
-loopDefs d xs b ss0 = do
+loopDefs : Kind
+         -> IR.Def
+         -> List String
+         -> IR.Expr
+         -> List Slot
+         -> S (List IR.Def)
+loopDefs kind d xs b ss0 = do
   ss <- traverseS withVars ss0
+  ws <- traverseS (\(s : Slot) -> wrapVars s.shape s) ss0
   ys <- traverseS (\x -> freshS (IR.baseOf x)) xs
   pure
       [ IR.mkDef
-        (workerKey d.key)
+        (workerKey kind d.key)
         d.name
-        (ELam (paramsRw ss 0 xs) (rw { key = d.key, slots = ss } b))
+        (ELam
+           (paramsRw ss 0 xs)
+           (rw { key = d.key, worker = workerKey kind d.key, slots = ss } b))
       , IR.mkDef
         d.key
         d.name
-        (ELam ys (ECall (workerKey d.key) (wrapArgs ss 0 ys)))
+        (ELam
+           ys
+           (wrapBody ys ws (ECall (workerKey kind d.key) (wrapArgs ws 0 ys))))
       ]
 
-defWith : IR.Def -> List Slot -> S (List IR.Def)
-defWith d Nil = pure (Cons d Nil)
-defWith d@{ body = ELam xs b } ss = loopDefs d xs b ss
-defWith d ss = pure (Cons d Nil)
+defWith : Kind -> IR.Def -> List Slot -> S (List IR.Def)
+defWith kind d Nil = pure (Cons d Nil)
+defWith kind d@{ body = ELam xs b } ss = loopDefs kind d xs b ss
+defWith kind d ss = pure (Cons d Nil)
 
-defScalars : IR.Def -> S (List IR.Def)
-defScalars d = defWith d (slotsOf d)
+-- Calls from elsewhere
+--------------------------------------------------------------------------------
+
+isBuilt : Slot -> IR.Expr -> Bool
+isBuilt s (ETag t fs _) = tagIs t s.shape && List.length fs == List.length s.tys
+isBuilt s e = False
+
+-- (whether a call gives a slot its tag, built there)
+builtArg : List IR.Expr -> Slot -> Bool
+builtArg args s = isBuilt s (argAt s.at args)
+
+-- (a call of a loop given its tags built calls the worker, the tags'
+-- fields its arguments: else, the wrapper)
+callerCall : (IR.Expr -> IR.Expr)
+           -> String
+           -> List IR.Expr
+           -> Maybe (List Slot)
+           -> IR.Expr
+callerCall go g args (Just ss) =
+  if List.all (builtArg args) ss
+  then ECall (workerKey OfTags g) (argsRw go ss 0 args)
+  else ECall g (List.map go args)
+callerCall go g args Nothing = ECall g (List.map go args)
+
+-- | an expression, each call of a loop given its tags built a call of
+-- | its worker (the loops by key, with their slots)
+callersRw : OrdMap.OrdMap String (List Slot) -> IR.Expr -> IR.Expr
+callersRw m (ECall g args) = callerCall (callersRw m) g args (OrdMap.lookup m g)
+callersRw m e = IR.mapParts (\_ p -> callersRw m p) e
+
+-- (whether the worklist calls one of the loops)
+callsLoopW : OrdMap.OrdMap String (List Slot) -> List IR.Expr -> Bool
+callsLoopW m Nil = False
+callsLoopW m (Cons (ECall g args) rest) =
+  OrdMap.member m g || callsLoopW m (IR.appendI args rest)
+callsLoopW m (Cons e rest) = callsLoopW m (IR.partsOnto e rest)
+
+-- (a definition calling none of the loops is left as it is, not built
+-- again)
+callersDef : OrdMap.OrdMap String (List Slot) -> IR.Def -> IR.Def
+callersDef m d =
+  if callsLoopW m (Cons d.body Nil)
+  then IR.mkDef d.key d.name (callersRw m d.body)
+  else d
+
+-- | a definition and its slots
+type Found = { def : IR.Def, slots : List Slot }
+
+-- (the loops with slots, by key)
+loopsOf : List Found -> OrdMap.OrdMap String (List Slot)
+loopsOf fs =
+  List.foldl
+    (\m (f : Found) ->
+       if List.null f.slots then m else OrdMap.insert m f.def.key f.slots)
+    OrdMap.empty
+    fs
+
+callersOf : OrdMap.OrdMap String (List Slot) -> List IR.Def -> List IR.Def
+callersOf m ds = if OrdMap.size m == 0 then ds else List.map (callersDef m) ds
+
+-- (the definitions, calls of the loops given their tags built made
+-- calls of their workers: of records, left as they are)
+callersIn : Kind -> List Found -> List IR.Def -> List IR.Def
+callersIn OfRecords fs ds = ds
+callersIn OfTags fs ds = callersOf (loopsOf fs) ds
+
+programOf : Kind
+          -> List Found
+          -> Pair (List (List IR.Def)) IR.Supply
+          -> Pair (List IR.Def) IR.Supply
+programOf kind fs (MkPair dss n) =
+  MkPair (callersIn kind fs (List.concatMap (\ds -> ds) dss)) n
+
+foundOf : Kind -> IR.Def -> Found
+foundOf kind d = { def = d, slots = slotsOf kind d }
+
+programWith : Kind -> List Found -> S (List IR.Def)
+programWith kind fs n =
+  programOf
+    kind
+    fs
+    (traverseS (\(f : Found) -> defWith kind f.def f.slots) fs n)
+
+-- (the program, each loop carrying what the pass keeps round given a
+-- worker carrying its fields)
+keptProgram : Kind -> IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+keptProgram kind supply defs =
+  programWith kind (List.map (foundOf kind) defs) supply
 
 -- | the program, each loop carrying a record round given a worker
 -- | carrying its fields; fresh names from `supply` on
 -- | >>> List.map (\(d : IR.Def) -> d.key) (fst (scalarsProgram 0 [IR.mkDef "f" "f" (ELam ["k", "a"] (EMatch (EVar "k") [MkArm "True" Nil (EProj (EVar "a") "s" ["s"] FtFloat), MkArm "False" Nil (ECall "f" [EVar "k", ERecord [MkPair "s" (EProj (EVar "a") "s" ["s"] FtFloat)] [FtFloat]])]))]))
 -- | ["f$scalars", "f"]
 scalarsProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
-scalarsProgram supply defs = case traverseS defScalars defs supply of
-  MkPair dss n -> MkPair (List.concatMap (\ds -> ds) dss) n
+scalarsProgram supply defs = keptProgram OfRecords supply defs
+
+-- | the program, each loop carrying a tag round given a worker carrying
+-- | its fields, and called so where it is given its tags built; fresh
+-- | names from `supply` on: not where the parameter
+-- | is not taken apart before anything else
+-- | >>> List.length (fst (unboxProgram 0 [IR.mkDef "f" "f" (ELam ["k", "c"] (EMatch (EVar "k") [MkArm "True" Nil (EVar "c"), MkArm "False" Nil (EMatch (EVar "c") [MkArm "MkPair" ["a", "i"] (ECall "f" [EVar "k", ETag "MkPair" [EVar "i", EVar "a"] [FtAny, FtAny]])])]))]))
+-- | 1
+unboxProgram : IR.Supply -> List IR.Def -> Pair (List IR.Def) IR.Supply
+unboxProgram supply defs = keptProgram OfTags supply defs
