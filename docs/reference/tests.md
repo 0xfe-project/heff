@@ -77,7 +77,7 @@ Values are compared and printed by their `Show`. A type of your own needs
 an instance: see [Implicit and instance arguments](language/arguments.md#declaring-an-instance).
 
 `agree` runs a program of commands on a system and on a model of it, and
-compares them. `test/check/map.hf` holds `std.map` to a list of pairs
+compares them. `test/check/ordmap.hf` holds `std.ordmap` to a list of pairs
 this way.
 
 ## Integration tests

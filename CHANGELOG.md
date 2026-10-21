@@ -22,6 +22,8 @@
 
 ### Standard library
 
+- std.map is renamed std.ordmap, and its type `Map` `OrdMap`: the name says what it asks of the keys, an `Order`.
+- std.map: the theory `Mapping c` of a map of any kind, with `Key` and `Value` as its fields: `empty`, `insert`, `lookup`, `remove`, `size` and `foldl`, and an instance for std.ordmap, std.hashmap and std.hashtable, so that one definition serves all three and a program picks one by its type.
 - check: `within ms t` is now `withinTime ms t`, `within` being co's.
 - co: `within h e alg c` runs `c` with what `h` does said within the handler of the rest: `alg` is given that handler and answers in its monad, so no `Co e` stands between `h` and `e` as in `through`. A query handed on through many such layers builds nothing at each (handler_sieve 4.9 s to 0.48 s). The answer is the outer handler's to bind: the same as `through`'s where that handler keeps the monad laws.
 - array: `push`, `pop` and `reserve`, and `insertAt` and `removeAt`: pure functions like `set`, changing an array in place where nothing else holds it and copying it first where something does. An array keeps room past its length, doubled when it runs out, so pushes are amortised O(1); `append` grows a unique left array in place. `pop` gives `Maybe (Pair (Array a) a)`. (#115).

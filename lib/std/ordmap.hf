@@ -1,0 +1,316 @@
+-- Maps from keys to values, by an order of the keys: a balanced (AVL) tree,
+-- so a lookup, an insertion or a deletion takes as many steps as the log of
+-- the size.  The keys' order is their type's `Order`, found as an instance
+-- argument is (the prelude's of `Int`, `String`, `Rune`, ..., or one of
+-- your own), and a map must always be given the same one.  Import it by a
+-- name, `import std.ordmap as OrdMap`, as the prelude has a `map` and a
+-- `lookupBy`.  The map comes first: `OrdMap.insert m k v`, `OrdMap.lookup m k`.
+--
+-- ```haskell
+-- import std.ordmap as OrdMap
+--
+-- -- | how many times each word appears
+-- -- | >>> OrdMap.toList (counts ["a", "b", "a"])
+-- -- | [MkPair "a" 2, MkPair "b" 1]
+-- counts : List String -> OrdMap.OrdMap String Int
+-- counts ws = List.foldl (\m w -> OrdMap.update m w 1 (\new old -> new + old)) OrdMap.empty ws
+-- ```
+
+module std.ordmap
+
+-- | A map, as a tree: each node with its height, a key, its value, and the
+-- | smaller keys left, the greater right.
+data OrdMap k v = Tip | Bin Int k v (OrdMap k v) (OrdMap k v)
+
+-- | The map of no keys.
+empty : {k v : Type} -> OrdMap k v
+empty = Tip
+
+-- | The map of one key, `k`, bound to `v`.
+singleton : {k v : Type} -> k -> v -> OrdMap k v
+singleton k v = Bin 1 k v Tip Tip
+
+height : {k v : Type} -> OrdMap k v -> Int
+height Tip = 0
+height (Bin h _ _ _ _) = h
+
+-- (a node over two trees whose heights differ by one at most)
+node : {k v : Type} -> k -> v -> OrdMap k v -> OrdMap k v -> OrdMap k v
+node k v l r = Bin (1 + max (height l) (height r)) k v l r
+
+-- (a node whose subtrees' heights differ by two at most, rotated so that
+-- they differ by one at most: built in its own cell and its child's, where
+-- nothing else holds them)
+rotated : {k v : Type} -> OrdMap k v -> OrdMap k v
+rotated Tip = Tip
+rotated (Bin _ k v l r) =
+  if height l > height r + 1
+  then (case l of
+        Tip -> abandon
+        Bin _ lk lv ll lr ->
+          if height ll >= height lr then node lk lv ll (node k v lr r)
+          else (case lr of
+                Tip -> abandon
+                Bin _ mk mv ml mr ->
+                  node mk mv (node lk lv ll ml) (node k v mr r)))
+  else if height r > height l + 1
+  then (case r of
+        Tip -> abandon
+        Bin _ rk rv rl rr ->
+          if height rr >= height rl then node rk rv (node k v l rl) rr
+          else (case rl of
+                Tip -> abandon
+                Bin _ mk mv ml mr ->
+                  node mk mv (node k v l ml) (node rk rv mr rr)))
+  else node k v l r
+
+-- (the height of a node over subtrees `a` and `b` high, if they are
+-- balanced, else 0)
+heightOver : Int -> Int -> Int
+heightOver a b = if a > b + 1 || b > a + 1 then 0 else 1 + max a b
+
+-- (a node over `l` and `r` of height `h`, or, where `h` is 0, rotated.  Where a subtree has changed, by one in height at most,
+-- `nodeOf (heightOver (height l) (height r)) k v l r` is written out
+-- where the node was taken apart (not a function of its own, which is
+-- too big to be inlined): so it is built in the cell of the node it
+-- replaces, if nothing else holds that, and a path changed down the
+-- tree is changed in place)
+nodeOf : {k v : Type} -> Int -> k -> v -> OrdMap k v -> OrdMap k v -> OrdMap k v
+nodeOf 0 k v l r = rotated (Bin 0 k v l r)
+nodeOf h k v l r = Bin h k v l r
+
+-- | `m` with `k` bound to `v` (instead of what it was, if it was).
+insert : {k v : Type} -> {{ord : Order k}} -> OrdMap k v -> k -> v -> OrdMap k v
+insert Tip key value = singleton key value
+insert (Bin h k' v' l r) key value = case compare key k' of
+  LT ->
+    (let l2 : OrdMap k v = insert l key value
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : OrdMap k v = insert r key value
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> Bin h key value l r
+
+-- | What `k` is bound to, if it is.
+-- | >>> lookup (insert empty "a" 1) "a"
+-- | Just 1
+lookup : {k v : Type} -> {{ord : Order k}} -> OrdMap k v -> k -> Maybe v
+lookup Tip k = Nothing
+lookup (Bin _ k' v' l r) k = case compare k k' of
+  LT -> lookup l k
+  GT -> lookup r k
+  EQ -> Just v'
+
+-- | Whether `k` is bound.
+member : {k v : Type} -> {{ord : Order k}} -> OrdMap k v -> k -> Bool
+member m k = maybe False (\_ -> True) (lookup m k)
+
+-- | The least key, and its value, if the map is not empty.
+-- | >>> findMin (insert (insert empty 2 "b") 1 "a")
+-- | Just (MkPair 1 "a")
+findMin : {k v : Type} -> OrdMap k v -> Maybe (Pair k v)
+findMin Tip = Nothing
+findMin (Bin _ k v Tip _) = Just (MkPair k v)
+findMin (Bin _ _ _ l _) = findMin l
+
+-- | The map without its least key (as it was, if it is empty).
+deleteMin : {k v : Type} -> OrdMap k v -> OrdMap k v
+deleteMin Tip = Tip
+deleteMin (Bin _ _ _ Tip r) = r
+deleteMin (Bin h k' v' l r) =
+  let l2 : OrdMap k v = deleteMin l
+  in nodeOf (heightOver (height l2) (height r)) k' v' l2 r
+
+-- (the least node of a tree, alone, and the tree without it: a leaf of
+-- the tree, in its cell, so that the node it is moved to is built there)
+leastSplit : {k v : Type} -> OrdMap k v -> Pair (OrdMap k v) (OrdMap k v)
+leastSplit Tip = MkPair Tip Tip
+leastSplit (Bin _ k v Tip r) = MkPair (Bin 1 k v Tip Tip) r
+leastSplit (Bin h k' v' l r) =
+  let split : Pair (OrdMap k v) (OrdMap k v) = leastSplit l
+  in (case split of
+      MkPair least l2 ->
+        MkPair least (nodeOf (heightOver (height l2) (height r)) k' v' l2 r))
+
+-- (two trees, the keys of the first less than the second's, as one: the
+-- least of the second over both, built in its cell)
+glue : {k v : Type} -> OrdMap k v -> OrdMap k v -> OrdMap k v
+glue l r = case leastSplit r of
+  MkPair (Bin _ k v _ _) r2 ->
+    nodeOf (heightOver (height l) (height r2)) k v l r2
+  MkPair Tip r2 -> l
+
+-- | The map without `k` (as it was, if `k` was not in it).
+delete : {k v : Type} -> {{ord : Order k}} -> OrdMap k v -> k -> OrdMap k v
+delete Tip key = Tip
+delete (Bin _ k' v' l r) key = case compare key k' of
+  LT ->
+    (let l2 : OrdMap k v = delete l key
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : OrdMap k v = delete r key
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> glue l r
+
+-- (the pairs of `m`, in order, before `acc`)
+toListOnto : {k v : Type} -> OrdMap k v -> List (Pair k v) -> List (Pair k v)
+toListOnto Tip acc = acc
+toListOnto (Bin _ k v l r) acc =
+  toListOnto l (Cons (MkPair k v) (toListOnto r acc))
+
+-- | The keys and their values, the keys in order.
+toList : {k v : Type} -> OrdMap k v -> List (Pair k v)
+toList m = toListOnto m Nil
+
+-- (the nodes down the left of a tree, onto the stack: the leftmost on
+-- top)
+leftSpine : {k v : Type} -> OrdMap k v -> List (OrdMap k v) -> List (OrdMap k v)
+leftSpine Tip acc = acc
+leftSpine (Bin h k v l r) acc = leftSpine l (Cons (Bin h k v l r) acc)
+
+-- (the next key and value of the stack, and the stack after it)
+nextOfSpine : {k v : Type}
+            -> List (OrdMap k v)
+            -> Maybe (Pair (Pair k v) (List (OrdMap k v)))
+nextOfSpine (Cons (Bin _ k v _ r) rest) =
+  Just (MkPair (MkPair k v) (leftSpine r rest))
+nextOfSpine _ = Nothing
+
+-- | A map, each key and its value in the keys' order: `for p in m` goes
+-- | through it by a stack of the nodes yet to be reached, built as it
+-- | goes.
+instance instanceIterateOrdMap : {k v : Type} -> Iterate (OrdMap k v)
+instanceIterateOrdMap =
+  { Elem = Pair k v
+  , Cursor = List (OrdMap k v)
+  , start = \m -> leftSpine m Nil
+  , next = nextOfSpine
+  }
+
+-- (`m` with each of the pairs inserted, in order)
+insertAll : {k v : Type}
+          -> {{ord : Order k}}
+          -> OrdMap k v
+          -> List (Pair k v)
+          -> OrdMap k v
+insertAll m ps = List.foldl (\acc p -> insert acc (fst p) (snd p)) m ps
+
+-- | The map of the pairs, a later one's value for a key twice.
+fromList : {k v : Type} -> {{ord : Order k}} -> List (Pair k v) -> OrdMap k v
+fromList ps = insertAll Tip ps
+
+-- | The map with `k` bound to `v`, or, where it is bound, to `f v old`
+-- | (Haskell's `insertWith`): a value changed in one walk down the tree,
+-- | where a `lookup` and an `insert` take two.
+-- | >>> toList (update (fromList [MkPair "a" 2, MkPair "b" 5]) "a" 1 (\new old -> new + old))
+-- | Cons (MkPair "a" 3) (Cons (MkPair "b" 5) Nil)
+-- | >>> toList (update empty 7 1 (\new old -> new + old))
+-- | Cons (MkPair 7 1) Nil
+update : {k v : Type}
+       -> {{ord : Order k}}
+       -> OrdMap k v
+       -> k
+       -> v
+       -> (v -> v -> v)
+       -> OrdMap k v
+update Tip key value f = singleton key value
+update (Bin h k' v' l r) key value f = case compare key k' of
+  LT ->
+    (let l2 : OrdMap k v = update l key value f
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : OrdMap k v = update r key value f
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> Bin h k' (f value v') l r
+
+-- (where `f` said a key's new value: the tree with it, or without it)
+planted : {k v : Type} -> k -> Maybe v -> OrdMap k v
+planted k Nothing = Tip
+planted k (Just v) = singleton k v
+
+-- (a node of height `h` over `l` and `r`, its key `k` now bound as `f`
+-- said: to its new value, or the node gone)
+replanted : {k v : Type}
+          -> Int
+          -> k
+          -> Maybe v
+          -> OrdMap k v
+          -> OrdMap k v
+          -> OrdMap k v
+replanted h k Nothing l r = glue l r
+replanted h k (Just v) l r = Bin h k v l r
+
+-- | The map with `k` bound as `f` says, given what it is bound to, if it
+-- | is: to `f`'s value, or (`Nothing`) to none (Haskell's `alter`).
+-- | >>> toList (alter (fromList [MkPair "a" 2]) "a" (\old -> Just (maybe 1 (\n -> n + 1) old)))
+-- | Cons (MkPair "a" 3) Nil
+-- | >>> toList (alter (fromList [MkPair 1 "one", MkPair 2 "two"]) 1 (\old -> Nothing))
+-- | Cons (MkPair 2 "two") Nil
+-- | >>> toList (alter (fromList [MkPair 1 "one"]) 3 (\old -> Just "three"))
+-- | Cons (MkPair 1 "one") (Cons (MkPair 3 "three") Nil)
+alter : {k v : Type}
+      -> {{ord : Order k}}
+      -> OrdMap k v
+      -> k
+      -> (Maybe v -> Maybe v)
+      -> OrdMap k v
+alter Tip key f = planted key (f Nothing)
+alter (Bin h k' v' l r) key f = case compare key k' of
+  LT ->
+    (let l2 : OrdMap k v = alter l key f
+     in nodeOf (heightOver (height l2) (height r)) k' v' l2 r)
+  GT ->
+    (let r2 : OrdMap k v = alter r key f
+     in nodeOf (heightOver (height l) (height r2)) k' v' l r2)
+  EQ -> replanted h k' (f (Just v')) l r
+
+-- | The keys, in order.
+keys : {k v : Type} -> OrdMap k v -> List k
+keys m = List.map (\p -> fst p) (toList m)
+
+-- | The values, in their keys' order.
+values : {k v : Type} -> OrdMap k v -> List v
+values m = List.map (\p -> snd p) (toList m)
+
+-- | How many keys are bound.
+size : {k v : Type} -> OrdMap k v -> Int
+size Tip = 0
+size (Bin _ _ _ l r) = size l + 1 + size r
+
+-- | Each value, `f` of it.
+mapValues : {k v w : Type} -> (v -> w) -> OrdMap k v -> OrdMap k w
+mapValues f Tip = Tip
+mapValues f (Bin h k v l r) = Bin h k (f v) (mapValues f l) (mapValues f r)
+
+-- | The keys of both; a key of both with its value in `a`.
+union : {k v : Type}
+      -> {{ord : Order k}}
+      -> OrdMap k v
+      -> OrdMap k v
+      -> OrdMap k v
+union a b = insertAll b (toList a)
+
+balanced : {k v : Type} -> OrdMap k v -> Bool
+balanced Tip = True
+balanced (Bin h _ _ l r) =
+  List.all
+    (\b -> b)
+    [ h == 1 + max (height l) (height r)
+    , height l <= height r + 1
+    , height r <= height l + 1
+    , balanced l
+    , balanced r
+    ]
+
+ascending : {k : Type} -> {{ord : Order k}} -> List k -> Bool
+ascending (Cons a (Cons b rest)) =
+  (case compare a b of
+   LT -> ascending (Cons b rest)
+   EQ -> False
+   GT -> False)
+ascending xs = True
+
+-- | Whether it is balanced and in order: every node's subtrees differ in
+-- | height by one at most, its height is right, and its keys go up.
+valid : {k v : Type} -> {{ord : Order k}} -> OrdMap k v -> Bool
+valid m = balanced m && ascending (keys m)
