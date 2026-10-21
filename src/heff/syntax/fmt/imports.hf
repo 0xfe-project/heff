@@ -1,128 +1,14 @@
--- The module claim of a file: its name and what it exposes (`module a.b (x,
--- T(..))`) and the
--- `import m` lines, before its first declaration.  They are read off,
--- and the text is returned with them blanked out (spaces, so every
--- offset stays where it was); the formatter then puts an `import`
--- pseudo-token at each one's place, the module claim's laid out.
+-- The module claim and the `import` lines among the tokens the
+-- formatter lays out: each, as the imports' reading found it, an
+-- `import` pseudo-token at its place, the module claim's laid out.
 
 module heff.syntax.fmt.imports
 
 import heff.syntax.fmt.lex as Lex
 import heff.syntax.import as Import
 
-type Span = { start : Int, end : Int }
-
-type Import = { name : String, alias : Maybe String, span : Span }
-
-type Claim =
-  { imports : List Import
-  , exposing : Maybe Import.Claim
-  , text : String
-  }
-
-lineEndFrom : String -> Int -> Int
-lineEndFrom s i =
-  if i >= strLength s then i
-  else if byteAt s i == 10 then i
-  else lineEndFrom s (i + 1)
-
-nameC : Int -> Bool
-nameC c =
-  c == 46
-  || c == 95
-  || c == 45
-  || c >= 97 && c <= 122
-  || c >= 65 && c <= 90
-  || c >= 48 && c <= 57
-
-allNameC : String -> Int -> Bool
-allNameC s i =
-  if i >= strLength s then True else nameC (byteAt s i) && allNameC s (i + 1)
-
-isName : String -> Bool
-isName x = strLength x > 0 && allNameC x 0
-
--- (a module's alias is capitalised, a name of its own: `M`)
-isAlias : String -> Bool
-isAlias x =
-  strLength x > 0
-  && byteAt x 0 >= 65
-  && byteAt x 0 <= 90
-  && not (contains "." x)
-  && isName x
-
-spacesOf : Int -> String
-spacesOf n = if n <= 0 then "" else " " ^ spacesOf (n - 1)
-
-blankOne : String -> Import -> String
-blankOne s imp =
-  strSlice s 0 imp.span.start
-  ^ spacesOf (imp.span.end - imp.span.start)
-  ^ strSlice s imp.span.end (strLength s)
-
--- (the words of an import line after `import `, empties dropped)
-importWords : String -> List String
-importWords rest = List.keepIf (\w -> strLength w > 0) (split " " (trim rest))
-
-oneImport : Int -> Int -> List String -> Maybe Import
-oneImport i e (Cons m Nil) =
-  if isName m
-  then Just { name = m, alias = Nothing, span = { start = i, end = e } }
-  else Nothing
-oneImport i e (Cons m (Cons kw (Cons a Nil))) =
-  if strEq kw "as" && isName m && isAlias a
-  then Just { name = m, alias = Just a, span = { start = i, end = e } }
-  else Nothing
-oneImport i e ws = Nothing
-
-emptyOrComment : String -> Bool
-emptyOrComment line =
-  strLength (trim line) == 0 || strEq (strSlice (trim line) 0 2) "--"
-
-readGo : String -> Int -> List Import -> List Import
-readGo src i acc =
-  if i >= strLength src then List.reverse acc
-  else if emptyOrComment (strSlice src i (lineEndFrom src i))
-  then readGo src (min (strLength src) (lineEndFrom src i + 1)) acc
-  else if strEq (strSlice src i (i + 7)) "import "
-  then (case oneImport
-          i
-          (lineEndFrom src i)
-          (importWords (strSlice src (i + 7) (lineEndFrom src i))) of
-        Just imp ->
-          readGo
-            src
-            (min (strLength src) (lineEndFrom src i + 1))
-            (Cons imp acc)
-        Nothing -> List.reverse acc)
-  else List.reverse acc
-
-mkClaim : Maybe Import.Claim -> String -> List Import -> Claim
-mkClaim claim src imps =
-  { imports = imps, exposing = claim, text = List.foldl blankOne src imps }
-
--- (the text with the module claim blanked out)
-blankExposing : Maybe Import.Claim -> String -> String
-blankExposing (Just h) s =
-  strSlice s 0 h.span.start
-  ^ spacesOf (h.span.end - h.span.start)
-  ^ strSlice s h.span.end (strLength s)
-blankExposing Nothing s = s
-
--- (the imports of the text, its module claim blanked out)
-readBlanked : Maybe Import.Claim -> String -> Claim
-readBlanked claim t = mkClaim claim t (readGo t 0 Nil)
-
--- | The imports of a file, and its text with the module claim and the import
--- | lines blanked out.
-readImports : String -> Claim
-readImports src =
-  readBlanked
-    (Import.readImports src).claim
-    (blankExposing (Import.readImports src).claim src)
-
 -- (an `import` pseudo-token at each import's place, among the tokens)
-importTok : Import -> Lex.Tok
+importTok : Import.Import -> Lex.Tok
 importTok imp =
   { kind = "import"
   , text = ""
@@ -178,41 +64,17 @@ exposingToks Nothing = Nil
 
 -- | The tokens with the claim's pseudo-tokens in place, in source
 -- | order.
-withImports : Claim -> List Lex.Tok -> List Lex.Tok
-withImports claim toks =
+withImports : Import.Imports -> List Lex.Tok -> List Lex.Tok
+withImports imps toks =
   List.sortBy
     tokLe
     (List.append
        (List.append
-          (exposingToks claim.exposing)
-          (List.map importTok claim.imports))
+          (exposingToks imps.claim)
+          (List.map importTok imps.imports))
        toks)
 
-importName : Import -> String
-importName imp = imp.name
-
-importNames : Claim -> List String
-importNames h = List.map importName h.imports
-
-claimText : Claim -> String
-claimText h = h.text
-
 test claims
-
--- >>> importNames (readImports "import a\nimport b as B\n\nf = 1")
--- Cons "a" (Cons "b" Nil)
-
--- >>> claimText (readImports "import a\nf = 1")
--- "        \nf = 1"
-
--- >>> importNames (readImports "-- c\nimport a.b\nf = 1")
--- Cons "a.b" Nil
-
--- >>> importNames (readImports "f = 1\nimport a")
--- Nil
-
--- >>> importNames (readImports "-- c\nmodule (x, T(..))\n\nimport a\nf = 1")
--- Cons "a" Nil
 
 -- >>> exposingText Nothing True ["With", "withFile"]
 -- "module (With, withFile)"
