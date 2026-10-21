@@ -274,26 +274,6 @@ armsS f arms =
        pure (MkArm t vs b'))
     arms
 
-appendL : {a : Type} -> List a -> List a -> List a
-appendL Nil ys = ys
-appendL (Cons x xs) ys = Cons x (appendL xs ys)
-
-elemStr : String -> List String -> Bool
-elemStr x Nil = False
-elemStr x (Cons y ys) = strEq x y || elemStr x ys
-
-zipL : {a b : Type} -> List a -> List b -> List (Pair a b)
-zipL (Cons x xs) (Cons y ys) = Cons (MkPair x y) (zipL xs ys)
-zipL _ _ = Nil
-
-takeL : {a : Type} -> Int -> List a -> List a
-takeL n Nil = Nil
-takeL n (Cons x xs) = if n <= 0 then Nil else Cons x (takeL (n - 1) xs)
-
-dropL : {a : Type} -> Int -> List a -> List a
-dropL n Nil = Nil
-dropL n (Cons x xs) = if n <= 0 then Cons x xs else dropL (n - 1) xs
-
 minI : Int -> Int -> Int
 minI a b = if a <= b then a else b
 
@@ -379,24 +359,14 @@ failing = ["intShl", "intShr", "arrayIndex", "arrayGenerate", "perform", "keep"]
 
 -- | whether a primitive may fail
 primFails : String -> Bool
-primFails p = elemStr p failing
+primFails p = List.elemBy strEq p failing
 
 pureIn : OrdMap.OrdMap String Unit
        -> OrdMap.OrdMap String Int
        -> IR.Expr
        -> Bool
-pureIn safe total (EVar _) = True
 pureIn safe total (EGlobal g) = OrdMap.member safe g
 pureIn safe total (ELam _ _) = True
-pureIn safe total (ERecord fs _) =
-  IR.allI
-    (List.map
-       (\p -> case p of
-        MkPair _ e2 -> pureIn safe total e2)
-       fs)
-pureIn safe total (ETag _ argv _) =
-  IR.allI (List.map (\a -> pureIn safe total a) argv)
-pureIn safe total (EProj e2 _ _ _) = pureIn safe total e2
 pureIn safe total (EApp (EGlobal g) argv) = case OrdMap.lookup
     total
     g of
@@ -417,24 +387,17 @@ pureIn safe total (EMatch sc arms) =
   pureIn safe total sc
   && not (List.null arms)
   && IR.allI (List.map (\b -> pureIn safe total (IR.armBody b)) arms)
-pureIn safe total (EBool c) =
-  IR.allI (List.map (\a -> pureIn safe total a) (IR.condParts c))
-pureIn safe total (ESet _ a b) = pureIn safe total a && pureIn safe total b
-pureIn safe total (EValues es) =
-  IR.allI (List.map (\a -> pureIn safe total a) es)
-pureIn safe total (EPrim _) = True
-pureIn safe total (EInt _) = True
-pureIn safe total (EFloat _) = True
-pureIn safe total (EStr _) = True
-pureIn safe total (EBytes _) = True
-pureIn safe total (EFixed _ _) = True
-pureIn safe total (EFloat32 _) = True
-pureIn safe total e = False
+pureIn safe total (EApp _ _) = False
+pureIn safe total (ELet _ _ _) = False
+pureIn safe total EAbandon = False
+pureIn safe total (EFix _ _) = False
+pureIn safe total e =
+  IR.allI (List.map (\a -> pureIn safe total a) (IR.partsOnto e Nil))
 
 flatCons : List String
          -> Pair (List String) IR.Expr
          -> Pair (List String) IR.Expr
-flatCons xs (MkPair ys b) = MkPair (appendL xs ys) b
+flatCons xs (MkPair ys b) = MkPair (List.append xs ys) b
 
 -- (lambdas in lambdas, one parameter list)
 flat : IR.Expr -> Pair (List String) IR.Expr
@@ -444,14 +407,16 @@ flat b = MkPair Nil b
 sgFlat : SG -> String -> Pair (List String) IR.Expr -> SG
 sgFlat acc key (MkPair xs b) =
   if List.length xs > 0
-  then if pureIn acc.safe acc.total b && not (elemStr key (IR.globalsIn b))
+  then if pureIn acc.safe acc.total b
+          && not (List.elemBy strEq key (IR.globalsIn b))
     then { safe = OrdMap.insert acc.safe key MkUnit
          , total = OrdMap.insert acc.total key (List.length xs)
          }
     else { safe = OrdMap.insert acc.safe key MkUnit
          , total = acc.total
          }
-  else if pureIn acc.safe acc.total b && not (elemStr key (IR.globalsIn b))
+  else if pureIn acc.safe acc.total b
+          && not (List.elemBy strEq key (IR.globalsIn b))
   then { safe = OrdMap.insert acc.safe key MkUnit
        , total = acc.total
        }
@@ -583,7 +548,7 @@ primAppN : String -> List IR.Expr -> Maybe Int -> IR.Expr
 primAppN p argv (Just n) =
   if List.length argv == n then foldPrim p argv
   else if List.length argv > n
-  then EApp (foldPrim p (takeL n argv)) (dropL n argv)
+  then EApp (foldPrim p (List.take n argv)) (List.drop n argv)
   else EApp (EPrim p) argv
 primAppN p argv Nothing = EApp (EPrim p) argv
 
@@ -600,7 +565,7 @@ primApp p argv = primAppN p argv (Prims.primArity p)
 -- | EPrimCall "intAdd" [EVar "n", EInt 0]
 mkApp : IR.Expr -> List IR.Expr -> IR.Expr
 mkApp f Nil = f
-mkApp (EApp g bs) argv = mkApp g (appendL bs argv)
+mkApp (EApp g bs) argv = mkApp g (List.append bs argv)
 mkApp (EPrim p) argv = primApp p argv
 mkApp f argv = EApp f argv
 
@@ -651,7 +616,7 @@ substCopies x a e = pure e
 
 -- | (lambdas in lambdas are one lambda)
 lam : List String -> IR.Expr -> IR.Expr
-lam xs (ELam ys b) = ELam (appendL xs ys) b
+lam xs (ELam ys b) = ELam (List.append xs ys) b
 lam xs e = ELam xs e
 
 -- | the judgments, knotted
@@ -695,7 +660,7 @@ initL (Cons x xs) = Cons x (initL xs)
 apartMore : String -> List String -> IR.Expr -> Maybe Apart -> Apart
 apartMore t vs b (Just ap) =
   { tags = Cons (MkPair t (List.length vs)) ap.tags
-  , names = appendL (initL vs) ap.names
+  , names = List.append (initL vs) ap.names
   , body = ap.body
   }
 apartMore t vs b Nothing =
@@ -725,7 +690,7 @@ allJust (Cons (Just x) rest) =
 allJust (Cons Nothing rest) = Nothing
 
 appendValues : List IR.Expr -> Maybe (List IR.Expr) -> Maybe (List IR.Expr)
-appendValues vs (Just ws) = Just (appendL vs ws)
+appendValues vs (Just ws) = Just (List.append vs ws)
 appendValues vs Nothing = Nothing
 
 -- (the values a way out gives: of the tags, level by level, as many
@@ -864,7 +829,7 @@ builds g n (Just (ELam xs (ERecord fs ts))) =
   List.length xs == n
   && not (List.null fs)
   && IR.allI (List.map lamField fs)
-  && not (elemStr g (IR.globalsIn (ERecord fs ts)))
+  && not (List.elemBy strEq g (IR.globalsIn (ERecord fs ts)))
 builds g n _ = False
 
 -- | a handler built by a global, `feeding m`: a function whose body is a
@@ -915,20 +880,7 @@ callsW x p n (Cons (EApp f argv) rest) =
     p
     (if isVar x f && p argv then n + 1 else n)
     (Cons f (IR.appendI argv rest))
-callsW x p n (Cons (EMatch sc arms) rest) =
-  callsW x p n (Cons sc (IR.pushArms arms rest))
-callsW x p n (Cons (EProj e _ _ _) rest) = callsW x p n (Cons e rest)
-callsW x p n (Cons (ELam _ b) rest) = callsW x p n (Cons b rest)
-callsW x p n (Cons (ELet _ a b) rest) = callsW x p n (Cons a (Cons b rest))
-callsW x p n (Cons (ERecord fs _) rest) = callsW x p n (IR.pushFields fs rest)
-callsW x p n (Cons (ETag _ argv _) rest) = callsW x p n (IR.appendI argv rest)
-callsW x p n (Cons (EPrimCall _ argv) rest) =
-  callsW x p n (IR.appendI argv rest)
-callsW x p n (Cons (ECall _ argv) rest) = callsW x p n (IR.appendI argv rest)
-callsW x p n (Cons (EBool c) rest) = callsW x p n (IR.condOnto c rest)
-callsW x p n (Cons (ESet _ a b) rest) = callsW x p n (Cons a (Cons b rest))
-callsW x p n (Cons (EValues es) rest) = callsW x p n (IR.appendI es rest)
-callsW x p n (Cons _ rest) = callsW x p n rest
+callsW x p n (Cons e rest) = callsW x p n (IR.partsOnto e rest)
 
 -- (how many calls of `x` in the worklist are given a handler)
 handedW : String -> OrdMap.OrdMap String Unit -> Int -> List IR.Expr -> Int
@@ -1013,7 +965,7 @@ lastUseW : List String -> String -> List String -> List IR.Expr -> Bool
 lastUseW ys x seen Nil = False
 lastUseW ys x seen (Cons (EVar y) rest) =
   if strEq y x then List.any (\z -> IR.countW z 0 rest == 0) seen
-  else lastUseW ys x (if elemStr y ys then Cons y seen else seen) rest
+  else lastUseW ys x (if List.elemBy strEq y ys then Cons y seen else seen) rest
 lastUseW ys x seen (Cons (EMatch sc arms) rest) =
   lastUseW ys x seen (Cons sc (armsOnto (armWith x arms) arms rest))
 lastUseW ys x seen (Cons e rest) = lastUseW ys x seen (IR.partsOnto e rest)
@@ -1142,7 +1094,7 @@ sumBudget = 100
 type Ways = Pair (List String) Int
 
 bothWays : Ways -> Ways -> Ways
-bothWays (MkPair ts n) (MkPair us m) = MkPair (appendL ts us) (n + m)
+bothWays (MkPair ts n) (MkPair us m) = MkPair (List.append ts us) (n + m)
 
 waysOut : IR.Expr -> Ways
 waysOut (ETag t _ _) = MkPair (Cons t Nil) 0
@@ -1190,20 +1142,9 @@ scrutW : String -> Int -> List IR.Expr -> Int
 scrutW x n Nil = n
 scrutW x n (Cons (EMatch sc arms) rest) =
   scrutW x (if isVar x sc then n + 1 else n) (Cons sc (IR.pushArms arms rest))
-scrutW x n (Cons (EApp f argv) rest) =
-  scrutW x n (Cons f (IR.appendI argv rest))
-scrutW x n (Cons (EProj e _ _ _) rest) = scrutW x n (Cons e rest)
-scrutW x n (Cons (ELam _ b) rest) = scrutW x n (Cons b rest)
-scrutW x n (Cons (ELet _ a b) rest) = scrutW x n (Cons a (Cons b rest))
-scrutW x n (Cons (ERecord fs _) rest) = scrutW x n (IR.pushFields fs rest)
-scrutW x n (Cons (ETag _ argv _) rest) = scrutW x n (IR.appendI argv rest)
-scrutW x n (Cons (EPrimCall _ argv) rest) = scrutW x n (IR.appendI argv rest)
-scrutW x n (Cons (ECall _ argv) rest) = scrutW x n (IR.appendI argv rest)
 scrutW x n (Cons (EBool c) rest) =
   scrutW x (n + testsOf x c) (IR.condOnto c rest)
-scrutW x n (Cons (ESet _ a b) rest) = scrutW x n (Cons a (Cons b rest))
-scrutW x n (Cons (EValues es) rest) = scrutW x n (IR.appendI es rest)
-scrutW x n (Cons _ rest) = scrutW x n rest
+scrutW x n (Cons e rest) = scrutW x n (IR.partsOnto e rest)
 
 -- (what follows, copied whole to every way out but the first: more
 -- than the budget allows)
@@ -1265,7 +1206,7 @@ consFielded : Fielded
             -> Pair (List (Pair String IR.Expr)) (List IR.Expr)
             -> Pair (List (Pair String IR.Expr)) (List IR.Expr)
 consFielded (MkPair bs e) (MkPair rest es) =
-  MkPair (appendL bs rest) (Cons e es)
+  MkPair (List.append bs rest) (Cons e es)
 
 -- (a field: a value as it is; a tag, its fields so; a binding, bound
 -- first; anything else bound to a name of its own)
@@ -1316,19 +1257,7 @@ projW : String -> Int -> List IR.Expr -> Int
 projW x n Nil = n
 projW x n (Cons (EProj e _ _ _) rest) =
   if isVar x e then projW x (n + 1) rest else projW x n (Cons e rest)
-projW x n (Cons (EMatch sc arms) rest) =
-  projW x n (Cons sc (IR.pushArms arms rest))
-projW x n (Cons (EApp f argv) rest) = projW x n (Cons f (IR.appendI argv rest))
-projW x n (Cons (ELam _ b) rest) = projW x n (Cons b rest)
-projW x n (Cons (ELet _ a b) rest) = projW x n (Cons a (Cons b rest))
-projW x n (Cons (ERecord fs _) rest) = projW x n (IR.pushFields fs rest)
-projW x n (Cons (ETag _ argv _) rest) = projW x n (IR.appendI argv rest)
-projW x n (Cons (EPrimCall _ argv) rest) = projW x n (IR.appendI argv rest)
-projW x n (Cons (ECall _ argv) rest) = projW x n (IR.appendI argv rest)
-projW x n (Cons (EBool c) rest) = projW x n (IR.condOnto c rest)
-projW x n (Cons (ESet _ a b) rest) = projW x n (Cons a (Cons b rest))
-projW x n (Cons (EValues es) rest) = projW x n (IR.appendI es rest)
-projW x n (Cons _ rest) = projW x n rest
+projW x n (Cons e rest) = projW x n (IR.partsOnto e rest)
 
 -- | `x`, bound to a record some of whose fields compute, is used more
 -- | than once in `b`, each time a field of it taken
@@ -1440,7 +1369,7 @@ paramsAre _ _ = False
 -- variable, or a definition made already -- not the one being made,
 -- `f x = f x`, which as `f = f` would be a value defined by itself)
 etaHead : OrdMap.OrdMap String Unit -> List String -> IR.Expr -> Bool
-etaHead kinds xs (EVar y) = not (elemStr y xs)
+etaHead kinds xs (EVar y) = not (List.elemBy strEq y xs)
 etaHead kinds xs (EGlobal g) = OrdMap.member kinds g
 etaHead kinds xs _ = False
 
@@ -1498,7 +1427,7 @@ simpF r (ELam xs b) = do
 simpF r (EApp (EApp (EGlobal g) bs) argv) = do
   s <- get
   if takesMore s g (List.length bs)
-  then r.simp (EApp (EGlobal g) (appendL bs argv))
+  then r.simp (EApp (EGlobal g) (List.append bs argv))
   else do
     f' <- r.simp (EApp (EGlobal g) bs)
     argv' <- traverseS (\a -> r.simp a) argv
@@ -1537,7 +1466,7 @@ simpF r (EBool c) = do
 simpF r (ESet xs a b) = do
   a' <- r.simp a
   case a' of
-    EValues es -> r.simp (letsOf (zipL xs es) b)
+    EValues es -> r.simp (letsOf (List.zip xs es) b)
     _ -> do
       b' <- r.simp b
       pure (ESet xs a' b')
@@ -1585,7 +1514,7 @@ tagged _ = False
 handedPast : OrdMap.OrdMap String Unit -> IR.Expr -> List IR.Expr -> Bool
 handedPast kinds (ELam xs _) argv =
   List.length argv > List.length xs
-  && List.any (handlerArg kinds) (dropL (List.length xs) argv)
+  && List.any (handlerArg kinds) (List.drop (List.length xs) argv)
 handedPast kinds b argv = False
 
 -- (how big such a copy may be)
@@ -1721,7 +1650,7 @@ knownCopy s g argv =
     Just b ->
       if (not (IR.sizeAbove (copyMax s.sp.kinds b argv) b)
           || not (prunedAbove (prunedMax s.sp.kinds g b argv) b argv))
-         && not (elemStr g (IR.globalsIn b))
+         && not (List.elemBy strEq g (IR.globalsIn b))
       then Just (prunedCopy b argv)
       else Nothing
     Nothing -> Nothing
@@ -1743,7 +1672,7 @@ paramsTo xs argv =
   List.foldl
     (\m p -> OrdMap.insert m (fst p) (snd p))
     OrdMap.empty
-    (zipL xs argv)
+    (List.zip xs argv)
 
 freshParam : String -> Pair (List String) Int -> Pair (List String) Int
 freshParam base (MkPair xs n) = case IR.fresh base n of
@@ -1818,17 +1747,9 @@ apartW x (Cons (EMatch sc arms) rest) =
 apartW x (Cons (EApp f argv) rest) =
   isVar x f || apartW x (Cons f (IR.appendI argv rest))
 apartW x (Cons (EProj e _ _ _) rest) = isVar x e || apartW x (Cons e rest)
-apartW x (Cons (ELam _ b) rest) = apartW x (Cons b rest)
-apartW x (Cons (ELet _ a b) rest) = apartW x (Cons a (Cons b rest))
-apartW x (Cons (ERecord fs _) rest) = apartW x (IR.pushFields fs rest)
-apartW x (Cons (ETag _ argv _) rest) = apartW x (IR.appendI argv rest)
-apartW x (Cons (EPrimCall _ argv) rest) = apartW x (IR.appendI argv rest)
-apartW x (Cons (ECall _ argv) rest) = apartW x (IR.appendI argv rest)
 apartW x (Cons (EBool c) rest) =
   testsOf x c > 0 || apartW x (IR.condOnto c rest)
-apartW x (Cons (ESet _ a b) rest) = apartW x (Cons a (Cons b rest))
-apartW x (Cons (EValues es) rest) = apartW x (IR.appendI es rest)
-apartW x (Cons _ rest) = apartW x rest
+apartW x (Cons e rest) = apartW x (IR.partsOnto e rest)
 
 -- (an argument that tells, its parameter taken apart in the body)
 toldTo : IR.Expr -> List String -> List IR.Expr -> Bool
@@ -1904,7 +1825,7 @@ unrollOf s g argv (Just (ELam xs b)) =
   if List.length argv >= List.length xs
      && unrollsOf s g < unrollsEach
      && tagMatched b xs argv
-     && elemStr g (IR.globalsIn b)
+     && List.elemBy strEq g (IR.globalsIn b)
      && not (prunedAbove unrollMax (ELam xs b) argv)
   then Just (ELam xs b)
   else Nothing
@@ -1950,13 +1871,13 @@ applyLam r xs b argv = do
   red <-
     r.simp
       (letsOf
-         (zipL
-            (takeL (minI (List.length xs) (List.length argv)) xs)
-            (takeL (minI (List.length xs) (List.length argv)) argv))
+         (List.zip
+            (List.take (minI (List.length xs) (List.length argv)) xs)
+            (List.take (minI (List.length xs) (List.length argv)) argv))
          (if List.length xs > minI (List.length xs) (List.length argv)
-          then ELam (dropL (minI (List.length xs) (List.length argv)) xs) b
+          then ELam (List.drop (minI (List.length xs) (List.length argv)) xs) b
           else b))
-  r.applyTo red (dropL (minI (List.length xs) (List.length argv)) argv)
+  r.applyTo red (List.drop (minI (List.length xs) (List.length argv)) argv)
 
 -- (the expressions are the variables, in order)
 varsAre : List String -> List IR.Expr -> Bool
@@ -2016,7 +1937,7 @@ capturing (ELam xs b) =
 capturing _ = False
 
 loops : String -> IR.Expr -> Bool
-loops g b = elemStr g (IR.globalsIn b)
+loops g b = List.elemBy strEq g (IR.globalsIn b)
 
 -- Continuations back into a loop: `loop i acc = do r <- step i; loop
 -- (i + 1) (acc + r)` hands `step` a continuation calling `loop`, through
@@ -2126,7 +2047,7 @@ specKey g marks vars argv =
     (List.zipWith
        (\m a -> if m then Spec.keyIn vars a else "_")
        marks
-       (takeL (List.length marks) argv))
+       (List.take (List.length marks) argv))
   ^ ")"
 
 keepParams : List Bool -> List String -> List String
@@ -2153,8 +2074,8 @@ type Shapes = { args : List IR.Expr, vars : List String, holes : List IR.Expr }
 shapeCons : IR.Expr -> List String -> List IR.Expr -> Shapes -> Shapes
 shapeCons a vs hs rest =
   { args = Cons a rest.args
-  , vars = appendL vs rest.vars
-  , holes = appendL hs rest.holes
+  , vars = List.append vs rest.vars
+  , holes = List.append hs rest.holes
   }
 
 shapedTo : Spec.Shaped -> St -> Pair Spec.Shaped St
@@ -2250,8 +2171,8 @@ specBody own g h marks sh (ELam xs1 b1) = do
       sh.args
       (selfOf own g h (List.map (\v -> EVar v) sh.vars) marks b1)
   pure
-      (if List.null (appendL sh.vars (keepParams marks xs1)) then b2
-       else ELam (appendL sh.vars (keepParams marks xs1)) b2)
+      (if List.null (List.append sh.vars (keepParams marks xs1)) then b2
+       else ELam (List.append sh.vars (keepParams marks xs1)) b2)
 specBody own g h marks sh lam1 = pure lam1
 
 -- Arity
@@ -2292,25 +2213,13 @@ cheap : OrdMap.OrdMap String Unit
       -> OrdMap.OrdMap String IR.Expr
       -> IR.Expr
       -> Bool
-cheap safe all (EVar _) = True
 cheap safe all (EGlobal g) = OrdMap.member safe g
 cheap safe all (ELam _ _) = True
-cheap safe all (EPrim _) = True
-cheap safe all (EInt _) = True
-cheap safe all (EFloat _) = True
-cheap safe all (EStr _) = True
-cheap safe all (EBytes _) = True
-cheap safe all (EFixed _ _) = True
-cheap safe all (EFloat32 _) = True
 -- (a `Lazy`'s box is no such: a lambda raised past it would make it
 -- again at each call, and compute its value again)
 cheap safe all (ETag t argv ts) =
   not (IR.keepsValue (ETag t argv ts))
   && IR.allI (List.map (cheap safe all) argv)
-cheap safe all (ERecord fs _) =
-  IR.allI (List.map (cheap safe all) (List.map snd fs))
-cheap safe all (EProj e _ _ _) = cheap safe all e
-cheap safe all (ELet _ a b) = cheap safe all a && cheap safe all b
 cheap safe all (EPrimCall p argv) =
   not (primFails p) && IR.allI (List.map (cheap safe all) argv)
 cheap safe all (EApp (EGlobal g) argv) =
@@ -2319,10 +2228,11 @@ cheap safe all (EMatch sc arms) =
   cheap safe all sc
   && not (List.null arms)
   && IR.allI (List.map (cheap safe all) (List.map IR.armBody arms))
-cheap safe all (EBool c) = IR.allI (List.map (cheap safe all) (IR.condParts c))
-cheap safe all (ESet _ a b) = cheap safe all a && cheap safe all b
-cheap safe all (EValues es) = IR.allI (List.map (cheap safe all) es)
-cheap safe all _ = False
+cheap safe all (EApp _ _) = False
+cheap safe all (ECall _ _) = False
+cheap safe all EAbandon = False
+cheap safe all (EFix _ _) = False
+cheap safe all e = IR.allI (List.map (cheap safe all) (IR.partsOnto e Nil))
 
 minL : List Int -> Int
 minL Nil = 0
@@ -2363,7 +2273,8 @@ stripLams : List String -> IR.Expr -> IR.Expr
 stripLams zs (ELam ys b) =
   IR.subst
     (paramsTo ys (List.map (\z -> EVar z) zs))
-    (if List.length ys > List.length zs then ELam (dropL (List.length zs) ys) b
+    (if List.length ys > List.length zs
+     then ELam (List.drop (List.length zs) ys) b
      else b)
 stripLams zs (ELet x a b) = ELet x a (stripLams zs b)
 stripLams zs (ESet xs a b) = ESet xs a (stripLams zs b)
@@ -2371,11 +2282,11 @@ stripLams zs (EMatch sc arms) =
   EMatch sc (List.map (stripArm (stripLams zs)) arms)
 -- (a known function given fewer arguments: given the parameters too)
 stripLams zs (EApp (EGlobal g) argv) =
-  EApp (EGlobal g) (appendL argv (List.map (\z -> EVar z) zs))
+  EApp (EGlobal g) (List.append argv (List.map (\z -> EVar z) zs))
 stripLams zs e = e
 
 raiseWith : List String -> IR.Expr -> List String -> IR.Expr
-raiseWith xs b zs = ELam (appendL xs zs) (stripLams zs b)
+raiseWith xs b zs = ELam (List.append xs zs) (stripLams zs b)
 
 -- | a function, taking the parameters every way out of it does.  A
 -- | definition that is not a function but whose every way out is a
@@ -2755,7 +2666,7 @@ specNamed r own g xs b argv marks sh h d =
     u <- ask r own g xs b marks sh h d
     -- (the copy called, and a copy of it asked for if it may be, for
     -- what it takes now)
-    r.applyTo (EGlobal h) (appendL sh.holes (Spec.dropAt marks argv))
+    r.applyTo (EGlobal h) (List.append sh.holes (Spec.dropAt marks argv))
 
 -- (a copy that would take nothing but the literals of what it is made
 -- for is not made: what it computes, once, would be computed at each
@@ -2799,7 +2710,7 @@ specMarked r own g xs b argv marks =
      -- is under a lambda -- a knot of judgments, `uk w ms uf` -- not one
      -- computed by itself)
      || (List.null (keepParams marks xs)
-         && elemStr g (IR.globalsIn b)
+         && List.elemBy strEq g (IR.globalsIn b)
          && not (IR.isValue b))
   then pure (mkApp (EGlobal g) argv)
   else do
@@ -3101,13 +3012,13 @@ etaOne r (EApp h bs) k = do
   saved <- get
   bound <- bindArgs bs
   ys <- freshParams k
-  body <- r.applyTo h (appendL (snd bound) (List.map (\y -> EVar y) ys))
+  body <- r.applyTo h (List.append (snd bound) (List.map (\y -> EVar y) ys))
   etaKept saved bound (ELam ys body)
 etaOne r e k = pure Nothing
 
 etaCons : IR.Expr -> Eta -> Bound -> Bound
 etaCons a (Just (MkPair bds lam1)) (MkPair rest argv) =
-  MkPair (appendL bds rest) (Cons lam1 argv)
+  MkPair (List.append bds rest) (Cons lam1 argv)
 etaCons a Nothing (MkPair rest argv) = MkPair rest (Cons a argv)
 
 etaAt : SK -> Bool -> IR.Expr -> Int -> M Eta
@@ -3130,7 +3041,7 @@ letsOut (ELet x a e) = consLet x a (letsOut e)
 letsOut e = MkPair Nil e
 
 withLets : List (Pair String IR.Expr) -> Bound -> Bound
-withLets bds (MkPair rest argv) = MkPair (appendL bds rest) argv
+withLets bds (MkPair rest argv) = MkPair (List.append bds rest) argv
 
 etaArg : SK -> Bool -> IR.Expr -> Bound -> M Bound
 etaArg r st a rest = do
@@ -3299,12 +3210,12 @@ specPast r g xs b argv = do
     pastMarked
         r
         g
-        (appendL xs ys)
+        (List.append xs ys)
         (EApp b (List.map (\y -> EVar y) ys))
         argv
-        (appendL
+        (List.append
            (marksOf s.sp.kinds (knownMore s argv g) g xs b argv)
-           (List.map (handlerOf s.sp.all) (dropL (List.length xs) argv)))
+           (List.map (handlerOf s.sp.all) (List.drop (List.length xs) argv)))
 
 -- (... handed a handler: a copy for what it takes, as for any call;
 -- where none is made, a copy taking the handler too)
@@ -3315,7 +3226,7 @@ specHanded r g xs b argv = do
   if stillCall g e
      && not (IR.sizeAbove handedSize b)
      && List.length argv > List.length xs
-     && List.any (handlerOf s.sp.all) (dropL (List.length xs) argv)
+     && List.any (handlerOf s.sp.all) (List.drop (List.length xs) argv)
   then specPast r g xs b argv
   else pure e
 
@@ -3577,7 +3488,7 @@ handedFields s argv =
 -- (that field of what `g` is, its parameters given the arguments)
 builtFieldOf : String -> List IR.Expr -> Maybe IR.Expr -> Maybe IR.Expr
 builtFieldOf l argv (Just (ELam xs (ERecord fs _))) =
-  maybe Nothing (\v -> Just (letsOf (zipL xs argv) v)) (fieldIn l fs)
+  maybe Nothing (\v -> Just (letsOf (List.zip xs argv) v)) (fieldIn l fs)
 builtFieldOf l argv _ = Nothing
 
 -- | a field of a handler built by a global (`builtBy`), `(g as).l`: that
@@ -3630,7 +3541,7 @@ applyToF r f argv =
   if List.length argv == 0 then pure f
   else case f of
     EPrim p -> pure (mkApp f argv)
-    EApp g bs -> r.applyTo g (appendL bs argv)
+    EApp g bs -> r.applyTo g (List.append bs argv)
     -- (another name for a tag, given all its arguments: the tag given
     -- them, with no bindings between -- the tag computes its fields in
     -- order, as the bindings would, and a call in a field stays where
@@ -3769,7 +3680,7 @@ caseOfCase r s2 arms2 arms =
 matchOn : SK -> IR.Expr -> List IR.Arm -> M IR.Expr
 matchOn r (EMatch s2 arms2) arms = caseOfCase r s2 arms2 arms
 matchOn r s@(ETag t argv _) arms = case findArm t arms of
-  Just (MkArm _ vs b) -> r.simp (letsOf (zipL vs argv) b)
+  Just (MkArm _ vs b) -> r.simp (letsOf (List.zip vs argv) b)
   Nothing -> pure (EMatch s arms)
 matchOn r (ELet x a b) arms = do
   b' <- r.match b arms
@@ -3797,7 +3708,7 @@ givesItBack : IR.Expr -> IR.Arm -> Bool
 givesItBack s (MkArm t vs (ETag t2 argv _)) =
   strEq t t2
   && List.length vs == List.length argv
-  && List.all sameField (zipL vs argv)
+  && List.all sameField (List.zip vs argv)
 givesItBack (EVar x) (MkArm _ _ (EVar y)) = strEq x y
 givesItBack s a = False
 
@@ -3861,7 +3772,7 @@ recordDef key b = \s ->
       (recordAll
          key
          b
-         (if elemStr key (IR.globalsIn b) then s
+         (if List.elemBy strEq key (IR.globalsIn b) then s
           else withDefs (OrdMap.insert s.defs key b) s))
 
 -- | the copy named `h` taken as made
@@ -3975,7 +3886,7 @@ settleCopy more n h b = do
   then do
     b2 <- makeAgain h b
     rest <- settleCopy more (n - 1) h b2
-    pure (MkPair (fst rest) (appendL deps (snd rest)))
+    pure (MkPair (fst rest) (List.append deps (snd rest)))
   else pure (MkPair b deps)
 
 -- (the copies among `hs` asked for, in front of `t`)
@@ -4042,7 +3953,7 @@ settleKept more Nothing h b = settleCopy more settleRounds h b
 
 -- (a lambda's body, its parameters bound to the arguments)
 unLam : IR.Expr -> List IR.Expr -> IR.Expr
-unLam (ELam ys b) argv = letsOf (zipL ys argv) b
+unLam (ELam ys b) argv = letsOf (List.zip ys argv) b
 unLam e argv = mkApp e argv
 
 -- (a call of `h`, `\xs -> b`: a copy of `b`, the arguments bound to its
@@ -4106,7 +4017,7 @@ tieGo h lam1 e = pure e
 -- copy it calls calls it back)
 tieOne : String -> List String -> IR.Expr -> IR.Def -> M IR.Def
 tieOne h calls hb d =
-  if elemStr d.key calls && elemStr h (IR.globalsIn d.body)
+  if List.elemBy strEq d.key calls && List.elemBy strEq h (IR.globalsIn d.body)
   then do
     b2 <- tieGo h hb d.body
     u <- refsRetied d.key b2
@@ -4117,7 +4028,7 @@ tieDeps : String -> IR.Expr -> List IR.Def -> M (List IR.Def)
 tieDeps h (ELam xs b) deps =
   if not (List.null deps)
      && not (IR.sizeAbove inlineMax (ELam xs b))
-     && not (elemStr h (IR.globalsIn b))
+     && not (List.elemBy strEq h (IR.globalsIn b))
   then traverseS (tieOne h (IR.globalsIn b) (ELam xs b)) deps
   else pure deps
 tieDeps h hb deps = pure deps
@@ -4136,7 +4047,7 @@ makeOne more h b0 = do
   u1 <- refsMade kb h (fst done)
   u2 <- knownMade h (fst done)
   deps <- tieDeps h (fst done) (snd done)
-  pure (appendL deps (Cons (IR.mkDef h h (fst done)) Nil))
+  pure (List.append deps (Cons (IR.mkDef h h (fst done)) Nil))
 
 makeIf : (List String -> M (List IR.Def))
        -> String
@@ -4153,7 +4064,7 @@ makeEach (Cons h rest) = do
   s <- get
   here <- makeIf makeEach h (pendingOf s h)
   others <- makeEach rest
-  pure (appendL here others)
+  pure (List.append here others)
 
 -- | a definition simplified here, as the cache is to keep it: what it
 -- | came to, whether it is safe, and the copies it asked for, each by
@@ -4287,7 +4198,7 @@ settleDef n key b = do
     b1 <- sk.simp b
     b2 <- raise b1
     rest <- settleDef (n - 1) key b2
-    pure (MkPair (fst rest) (appendL made (snd rest)))
+    pure (MkPair (fst rest) (List.append made (snd rest)))
   else pure (MkPair b made)
 
 oneDef : IR.Def -> M (Pair (List IR.Def) (List Done))
@@ -4305,7 +4216,7 @@ oneDef d = do
   s <- get
   pure
       (MkPair
-         (appendL made (Cons (IR.mkDef d.key d.name (fst done)) Nil))
+         (List.append made (Cons (IR.mkDef d.key d.name (fst done)) Nil))
          (Cons (doneOf s d (fst done) t) Nil))
 
 -- | a definition as the cache keeps it, simplified: what it came to
@@ -4339,7 +4250,7 @@ replayBody k b0 = do
   u2 <- safeAs k.safe k.key
   made0 <- makeEach (IR.globalsIn b)
   made <- inOrder b made0
-  pure (appendL made (Cons (IR.mkDef k.key k.name b) Nil))
+  pure (List.append made (Cons (IR.mkDef k.key k.name b) Nil))
 
 replayed : KeptDef -> Maybe IR.Expr -> M (Maybe (List IR.Def))
 replayed k (Just b0) = do
@@ -4404,7 +4315,7 @@ type Simplified =
 
 concatDefs : {a : Type} -> List (List a) -> List a
 concatDefs Nil = Nil
-concatDefs (Cons ds rest) = appendL ds (concatDefs rest)
+concatDefs (Cons ds rest) = List.append ds (concatDefs rest)
 
 allVersKnown : List (Pair String String) -> Bool
 allVersKnown ps = List.all (\p -> not (strEq (snd p) "")) ps
