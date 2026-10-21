@@ -147,7 +147,9 @@ test/format.hf`, `--run format/cases/spacing` for one;
 `heff test --update --run format/cases test/format.hf` after an
 intended change).  The syntax tests hold the reading's pieces on a
 few texts each: the module claim, the tokens, the comments attached,
-the declarations, no token lost (`heff test test/syntax.hf`).  The
+the declarations, no token lost (`heff test test/syntax.hf`); the
+elaborator's and the passes' tests, likewise, those that need a helper
+of their own (`heff test test/elab.hf test/compile.hf`).  The
 cache tests hold the compiler's cache and the
 backend's, each scenario in a directory of its own (`heff test
 test/cache.hf test/backcache.hf`, `--run cache/instances` for one).
