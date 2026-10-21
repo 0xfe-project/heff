@@ -1,0 +1,565 @@
+-- `heff get`: the packages a project requires, fetched from their git
+-- repositories (a version's tag, else a commit) and their sums written
+-- to heff.sum; given a path, the project first requires it.
+
+module heff.build.fetch
+
+import co
+import heff.build.commands
+import heff.build.load as Load
+import heff.build.project as Project
+import heff.util.files as Files
+import heff.util.hostpath as HostPath
+import std.filesystem
+import std.io
+import std.path as Path
+import std.process
+import std.progress as Progress
+
+getFails : {e : HFunctor}
+         -> {{io : stdio <: e}}
+         -> {{sys : process <: e}}
+         -> String
+         -> Co e Unit
+getFails why = do
+  printErr ("heff get: " ^ why)
+  exit 1
+
+-- | where the package at `path` is fetched from
+urlOf : String -> String
+urlOf path = "https://" ^ Project.repoOf path
+
+-- (a commit's time, UTC, `YYYYMMDDhhmmss`, and its hash, as git says
+-- them)
+commitSaid : List String -> Maybe (Pair String String)
+commitSaid (Cons time (Cons hash Nil)) = Just (MkPair time hash)
+commitSaid _ = Nothing
+
+-- | the commit `rev` names in the git repository at `dir`: its time
+-- | (UTC, `YYYYMMDDhhmmss`) and its hash, if there is one
+commitAt : {e : HFunctor}
+         -> {{sys : process <: e}}
+         -> String
+         -> String
+         -> Co e (Maybe (Pair String String))
+commitAt dir rev = do
+  r <-
+    run
+      { command = "git"
+      , args =
+          [ "log"
+          , "-1"
+          , "--date=format-local:%Y%m%d%H%M%S"
+          , "--format=%cd %H"
+          , rev ^ "^{commit}"
+          , "--"
+          ]
+      , dir = dir
+      , env = [MkPair "TZ" "UTC0"]
+      }
+  pure (if succeeded r then commitSaid (words (ranOut r)) else Nothing)
+
+-- (the tag of version `v` of `path` cloned to `dir`; what is wrong)
+tagCloned : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> String
+          -> String
+          -> String
+          -> Co e (Maybe String)
+tagCloned path v dir = do
+  cloned <-
+    run
+      { command = "git"
+      , args =
+          [ "-c"
+          , "advice.detachedHead=false"
+          , "clone"
+          , "--quiet"
+          , "--depth"
+          , "1"
+          , "--branch"
+          , "v" ^ v
+          , urlOf path
+          , dir
+          ]
+      }
+  pure
+      (if succeeded cloned then Nothing
+       else Just
+           ("cannot fetch "
+            ^ path
+            ^ " "
+            ^ v
+            ^ " (tag v"
+            ^ v
+            ^ " of "
+            ^ urlOf path
+            ^ "): "
+            ^ trim (ranErr cloned)))
+
+-- (the commit of pseudo-version `v` of `path`, its time `time` and its
+-- hash's first digits `hash`, cloned to `dir` and checked out: the
+-- commit of that time; what is wrong)
+commitCloned : {e : HFunctor}
+             -> {{sys : process <: e}}
+             -> String
+             -> String
+             -> String
+             -> String
+             -> String
+             -> Co e (Maybe String)
+commitCloned path v time hash dir = do
+  cannot <-
+    pure
+      ("cannot fetch "
+       ^ path
+       ^ " "
+       ^ v
+       ^ " (commit "
+       ^ hash
+       ^ " of "
+       ^ urlOf path
+       ^ "): ")
+  cloned <-
+    run
+      { command = "git"
+      , args =
+          [ "clone"
+          , "--quiet"
+          , "--no-checkout"
+          , "--filter=blob:none"
+          , urlOf path
+          , dir
+          ]
+      }
+  if not (succeeded cloned) then pure (Just (cannot ^ trim (ranErr cloned)))
+  else do
+    out <-
+      run
+        { command = "git"
+        , args =
+            [ "-c"
+            , "advice.detachedHead=false"
+            , "checkout"
+            , "--quiet"
+            , "--detach"
+            , hash ^ "^{commit}"
+            ]
+        , dir = dir
+        }
+    at <- commitAt dir "HEAD"
+    pure
+        (if not (succeeded out) then Just (cannot ^ trim (ranErr out))
+         else case at of
+           Just (MkPair t _) ->
+             if strEq t time then Nothing
+             else Just (cannot ^ "the commit is of " ^ t ^ ", not " ^ time)
+           Nothing -> Just (cannot ^ "no such commit"))
+
+-- (version `v` of `path` cloned to `dir`: its tag, or the commit its
+-- pseudo-version names; what is wrong)
+versionCloned : {e : HFunctor}
+              -> {{sys : process <: e}}
+              -> String
+              -> String
+              -> String
+              -> Co e (Maybe String)
+versionCloned path v dir = case Project.pseudoCommit v of
+  Just (MkPair time hash) -> commitCloned path v time hash dir
+  Nothing -> tagCloned path v dir
+
+-- | version `v` of the package at `path`, in the cache: fetched there
+-- | (its tag cloned, or for a pseudo-version its commit, its .git
+-- | removed, made read-only, then the tree it is of written beside it)
+-- | unless it is there already; the tree, or what is wrong.  A task
+-- | while it is cloned.
+fetched : {e : HFunctor}
+        -> {{io : stdio <: e}}
+        -> {{sys : process <: e}}
+        -> {{disk : filesystem <: e}}
+        -> {{prog : Progress.progress <: e}}
+        -> Load.Paths
+        -> String
+        -> String
+        -> Co e (Either String String)
+fetched ps path v = do
+  dir <- pure (Load.cachedDir ps path v)
+  hash <- Files.readFile (dir ^ ".hash")
+  case hash of
+    Just h -> pure (Right (trim h))
+    Nothing -> do
+      _ <- Files.remove dir
+      _ <- Files.makeDirectory (HostPath.dirname ps.style dir)
+      f <- Progress.start Progress.root ("fetching " ^ path ^ " " ^ v) 0
+      cloned <- versionCloned path v dir
+      Progress.end f
+      case cloned of
+        Just why -> do
+          _ <- Files.remove dir
+          pure (Left why)
+        Nothing -> do
+          tree <-
+            run
+              { command = "git"
+              , args = ["rev-parse", "HEAD^{tree}"]
+              , dir = dir
+              }
+          _ <- Files.remove (HostPath.join ps.style dir ".git")
+          sealed <- Files.readOnly dir
+          h <- pure ("tree:" ^ trim (ranOut tree))
+          ok <- Files.writeFile (dir ^ ".hash") (h ^ "\n")
+          if succeeded tree && sealed && ok
+          then do
+            print ("heff get: fetched " ^ path ^ " " ^ v)
+            pure (Right h)
+          else pure (Left ("cannot keep " ^ path ^ " " ^ v ^ " in " ^ dir))
+
+-- | the package.hf of version `v` of `path`, required by `by`, fetched
+-- | (unless the project replaces it); its tree must be what heff.sum
+-- | said, if it said one
+fetchedPkg : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> Load.Paths
+           -> Project.Package
+           -> List Project.Sum
+           -> String
+           -> String
+           -> String
+           -> Co e (Either String Project.Package)
+fetchedPkg ps root sums by path v = case Load.replacedDir root path of
+  Just d -> Load.readPkgAt ps (Load.under ps ps.root d) path
+  Nothing -> do
+    got <- fetched ps path v
+    case got of
+      Left why -> pure (Left (by ^ " requires " ^ path ^ " " ^ v ^ ": " ^ why))
+      Right h -> case Project.sumOf sums path v of
+        Just want ->
+          if strEq h want then Load.readPkgAt ps (Load.cachedDir ps path v) path
+          else pure
+              (Left
+                 (path
+                  ^ " "
+                  ^ v
+                  ^ " is "
+                  ^ h
+                  ^ ", and heff.sum says "
+                  ^ want
+                  ^ (case Project.pseudoCommit v of
+                     Just _ -> ": its commit is another"
+                     Nothing -> ": its tag has been moved")))
+        Nothing -> Load.readPkgAt ps (Load.cachedDir ps path v) path
+
+-- (the trees of the versions fetched, as heff.sum's lines)
+sumsOf : {e : HFunctor}
+       -> {{disk : filesystem <: e}}
+       -> Load.Paths
+       -> Project.Package
+       -> List Load.Visit
+       -> Co e (List Project.Sum)
+sumsOf ps root Nil = pure Nil
+sumsOf ps root (Cons x rest) = do
+  others <- sumsOf ps root rest
+  h <- Files.readFile (Load.cachedDir ps x.path x.version ^ ".hash")
+  pure (case Load.replacedDir root x.path of
+    Just _ -> others
+    Nothing -> case h of
+      Just t ->
+        Cons { path = x.path, version = x.version, hash = trim t } others
+      Nothing -> others)
+
+-- (the newer of `best` and the version a line of `git ls-remote --tags`
+-- names, if its tag is a version of `path`)
+newerTagged : String -> Maybe String -> String -> Maybe String
+newerTagged path best line = case split "refs/tags/v" line of
+  Cons _ (Cons v Nil) -> case Project.version (trim v) of
+    Just _ -> case Project.majorMismatch path (trim v) of
+      Nothing -> case best of
+        Just b -> if Project.newer (trim v) b then Just (trim v) else best
+        Nothing -> Just (trim v)
+      Just _ -> best
+    Nothing -> best
+  _ -> best
+
+-- | the newest version tagged in the repository of `path` that it is
+-- | the path of (its major), Nothing if no tag is; or what is wrong.  A
+-- | task while it is asked.
+newestTag : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> {{prog : Progress.progress <: e}}
+          -> String
+          -> Co e (Either String (Maybe String))
+newestTag path = do
+  t <- Progress.start Progress.root ("finding the newest version of " ^ path) 0
+  r <-
+    run
+      { command = "git", args = ["ls-remote", "--tags", "--refs", urlOf path] }
+  Progress.end t
+  pure
+      (if not (succeeded r)
+       then Left
+           ("cannot list the tags of " ^ urlOf path ^ ": " ^ trim (ranErr r))
+       else Right (List.foldl (newerTagged path) Nothing (lines (ranOut r))))
+
+-- (`rev` is a commit's first hex digits, 7 or more)
+isCommitPrefix : String -> Bool
+isCommitPrefix rev =
+  strLength rev >= 7
+  && strLength rev <= 40
+  && Project.allBytes Project.isHex rev
+
+-- (what git names the commit `rev` by: HEAD, the default branch's; a
+-- commit's first hex digits; else a branch)
+revNamed : String -> String
+revNamed rev =
+  if strEq rev "HEAD" || isCommitPrefix rev then rev else "refs/heads/" ^ rev
+
+-- (the commit `rev`, said)
+revSaid : String -> String
+revSaid rev =
+  if strEq rev "HEAD" then "commit on the default branch"
+  else if isCommitPrefix rev then "commit " ^ rev
+  else "branch " ^ rev
+
+-- | the commit `rev` names in the repository of `path` -- HEAD, the
+-- | default branch's; a commit, by 7 or more hex digits of its hash;
+-- | else a branch -- as the pseudo-version of the path's major; or what
+-- | is wrong.  A task while the repository's commits are fetched.
+commitVersion : {e : HFunctor}
+              -> {{sys : process <: e}}
+              -> {{disk : filesystem <: e}}
+              -> {{prog : Progress.progress <: e}}
+              -> Load.Paths
+              -> String
+              -> String
+              -> Co e (Either String String)
+commitVersion ps path rev = do
+  dir <- pure (Load.cachedDir ps path "commits")
+  _ <- Files.remove dir
+  _ <- Files.makeDirectory (HostPath.dirname ps.style dir)
+  t <-
+    Progress.start
+      Progress.root
+      ("finding the " ^ revSaid rev ^ " of " ^ path)
+      0
+  cloned <-
+    run
+      { command = "git"
+      , args =
+          ["clone", "--quiet", "--bare", "--filter=tree:0", urlOf path, dir]
+      }
+  at <- if succeeded cloned then commitAt dir (revNamed rev) else pure Nothing
+  _ <- Files.remove dir
+  Progress.end t
+  pure
+      (if not (succeeded cloned)
+       then Left
+           ("cannot list the commits of "
+            ^ urlOf path
+            ^ ": "
+            ^ trim (ranErr cloned))
+       else case at of
+         Just (MkPair time hash) -> Right (Project.pseudoVersion path time hash)
+         Nothing -> Left ("no " ^ revSaid rev ^ " of " ^ urlOf path))
+
+-- | the version `heff get PATH` requires: the newest tag of the path's
+-- | major, else the pseudo-version of the default branch's commit
+newestOf : {e : HFunctor}
+         -> {{sys : process <: e}}
+         -> {{disk : filesystem <: e}}
+         -> {{prog : Progress.progress <: e}}
+         -> Load.Paths
+         -> String
+         -> Co e (Either String String)
+newestOf ps path = do
+  tagged <- newestTag path
+  case tagged of
+    Left why -> pure (Left why)
+    Right (Just v) -> pure (Right v)
+    Right Nothing -> commitVersion ps path "HEAD"
+
+-- | the version `heff get PATH@REV` requires: REV if it is a version,
+-- | else the pseudo-version of the commit it names
+versionAt : {e : HFunctor}
+          -> {{sys : process <: e}}
+          -> {{disk : filesystem <: e}}
+          -> {{prog : Progress.progress <: e}}
+          -> Load.Paths
+          -> String
+          -> String
+          -> Co e (Either String String)
+versionAt ps path rev =
+  if Project.isVersion rev then pure (Right rev) else commitVersion ps path rev
+
+-- | PATH@VERSION, PATH@REV, PATH: the path, and the version or the
+-- | commit (Nothing: the newest)
+specOf : String -> Pair String (Maybe String)
+specOf spec = case split "@" spec of
+  Cons path (Cons v Nil) -> MkPair path (Just v)
+  _ -> MkPair spec Nothing
+
+-- (`r`, of version `v` if it is of `path`)
+retarget : String -> String -> Project.Require -> Project.Require
+retarget path v r =
+  if strEq r.path path then { name = r.name, path = path, version = v } else r
+
+-- | the project `pk`, requiring version `v` of `path`: in place of the
+-- | version it required, else by the name the package's src/ gives it
+requiring : Project.Package -> String -> String -> String -> Project.Package
+requiring pk name path v =
+  { module = pk.module
+  , heff = pk.heff
+  , require =
+      if List.any (\(r : Project.Require) -> strEq r.path path) pk.require
+      then List.map (retarget path v) pk.require
+      else List.append pk.require [{ name = name, path = path, version = v }]
+  , replace = pk.replace
+  }
+
+-- (the name a package fetched is imported by, its src/'s, unless its
+-- package.hf does not read or is of another path)
+fetchedName : Either String Project.Package
+            -> Either String String
+            -> Either String String
+fetchedName (Left why) own = Left why
+fetchedName (Right _) own = own
+
+-- | write the project's package.hf, requiring version `v` of `path`
+-- | (fetched, to know its name)
+getRequire : {e : HFunctor}
+           -> {{io : stdio <: e}}
+           -> {{sys : process <: e}}
+           -> {{disk : filesystem <: e}}
+           -> {{prog : Progress.progress <: e}}
+           -> Load.Paths
+           -> String
+           -> Project.Package
+           -> String
+           -> String
+           -> Co e Bool
+getRequire ps text pk path v = case Project.majorMismatch path v of
+  Just why -> do
+    getFails (path ^ ": " ^ why)
+    pure False
+  Nothing -> do
+    got <- fetched ps path v
+    case got of
+      Left why -> do
+        getFails why
+        pure False
+      Right _ -> do
+        theirs <- Load.readPkgAt ps (Load.cachedDir ps path v) path
+        own <-
+          Load.ownDir
+            ps
+            (HostPath.join ps.style (Load.cachedDir ps path v) "src")
+        case fetchedName theirs own of
+          Left why -> do
+            getFails why
+            pure False
+          Right name ->
+            if not
+                 (List.any
+                    (\(r : Project.Require) -> strEq r.path path)
+                    pk.require)
+               && List.any
+                 (\(r : Project.Require) -> strEq r.name name)
+                 pk.require
+            then do
+              getFails
+                  ("`"
+                   ^ name
+                   ^ "` is required already: add "
+                   ^ path
+                   ^ " to package.hf by another name")
+              pure False
+            else do
+              ok <-
+                Files.writeFile
+                  "package.hf"
+                  (laidOut
+                     "package.hf"
+                     (Project.withPackage text (requiring pk name path v)))
+              if ok
+              then do
+                print ("heff get: package.hf requires " ^ path ^ " " ^ v)
+                pure True
+              else do
+                getFails "cannot write package.hf"
+                pure False
+
+-- | fetch every version the project's package.hf reaches, then write
+-- | heff.sum, and load the project's packages, as a program would
+getAll : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{prog : Progress.progress <: e}}
+       -> Co e Unit
+getAll = do
+  h <- hostNow
+  ps <- Load.pathsFor h "package.hf"
+  text <- Files.readFile "package.hf"
+  case Project.readPackage (fromMaybe "" text) of
+    Right root -> do
+      old <- Load.readSumAt ps
+      case old of
+        Left why -> getFails why
+        Right sums -> do
+          reached <-
+            Load.versionsOf
+              (\by path v -> fetchedPkg ps root sums by path v)
+              root
+          news <- sumsOf ps root (fst reached)
+          wrote <-
+            if strEq (Project.showSum news) "" then pure True
+            else Files.writeFile "heff.sum" (Project.showSum news)
+          bad <- printErrs "heff get" (snd reached) 0
+          if bad > 0 then exit 1
+          else if not wrote then getFails "cannot write heff.sum"
+          else do
+            l <- load "package.hf"
+            badL <- printErrs "heff get" l.errors 0
+            if badL > 0 then exit 1
+            else print
+                ("heff get: "
+                 ^ show (List.length (Load.selected (fst reached)))
+                 ^ (if strEq (Project.showSum news) ""
+                    then " packages, none fetched: no heff.sum"
+                    else " packages, heff.sum written"))
+    _ -> getFails "package.hf does not read: get at the project's root"
+
+-- | fetch what the project requires, writing heff.sum; with PATH, first
+-- | require it, at VERSION, or the commit REV names, else its newest
+-- | (its default branch's commit, where no tag is a version)
+getCmd : {e : HFunctor}
+       -> {{io : stdio <: e}}
+       -> {{sys : process <: e}}
+       -> {{disk : filesystem <: e}}
+       -> {{prog : Progress.progress <: e}}
+       -> Maybe String
+       -> Co e Unit
+getCmd spec = do
+  text <- Files.readFile "package.hf"
+  case text of
+    Nothing -> getFails "no package.hf here: get at the project's root"
+    Just t -> case Project.readPackage t of
+      Left _ -> getFails "package.hf does not read"
+      Right pk -> case spec of
+        Nothing -> getAll
+        Just s ->
+          if strEq (fst (specOf s)) Project.heffModule
+          then getFails Project.requireMsg
+          else do
+            h <- hostNow
+            ps <- Load.pathsFor h "package.hf"
+            v <- case snd (specOf s) of
+              Just rev -> versionAt ps (fst (specOf s)) rev
+              Nothing -> newestOf ps (fst (specOf s))
+            case v of
+              Left why -> getFails why
+              Right ver -> do
+                ok <- getRequire ps t pk (fst (specOf s)) ver
+                if ok then getAll else pure MkUnit
